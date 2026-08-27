@@ -14,7 +14,7 @@
  *
  * 与「批量创单」并存：批量创单服务票务整班散客；本弹窗服务单笔多产品录单。
  */
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   ApiError,
@@ -85,15 +85,36 @@ const SETTLEMENT_TIER_ZH: Record<SettlementTier, string> = {
   INTL_5STAR: '国际五星',
 };
 
-// 结算价档次 → 对应星级（用于套餐「指定酒店」星级错配提醒）。
-// ⚠️ INTL_5STAR 与 CITY_5STAR 都对应 5 星——随机档只分 3/4/5 星，没有单独的「国际五星」随机档，
-// 这是已知口径缺口，这里按 5 星比对，不发明新档次。
+// 结算价档次 → 对应星级（仅用于给运营看的提示文案「（N 星）」）。
+// ⚠️ INTL_5STAR 与 CITY_5STAR 都对应 5 星——星级数字不足以区分这两档，
+// 判定错配一律走下面的 resolveHotelSettlementTier（按档次比，不按星级数字比）。
 const SETTLEMENT_TIER_STAR: Record<SettlementTier, number> = {
   CITY_3STAR: 3,
   CITY_4STAR: 4,
   CITY_5STAR: 5,
   INTL_5STAR: 5,
 };
+
+/**
+ * 酒店 → 它属于哪个结算档次（port of backend resolveHotelSettlementTier，口径必须一字不差）。
+ * 映射不到任何档次（星级缺失 / 1、2 星 / 标了国际五星却不是 5 星）返回 null，按「不匹配」处理。
+ * 前端照抄这份口径，是为了让「提交时会不会被服务端星级闸拦下」在界面上先算得准 ——
+ * 只按星级数字比会把「市区五星 vs 国际五星」当成匹配，运营一路填到提交才吃 400。
+ */
+function resolveHotelSettlementTier(hotel: {
+  starRating?: number | null;
+  intlFiveStar?: boolean | null;
+}): SettlementTier | null {
+  if (hotel.starRating == null) return null;
+  if (hotel.intlFiveStar === true) return hotel.starRating === 5 ? 'INTL_5STAR' : null;
+  if (hotel.starRating === 3) return 'CITY_3STAR';
+  if (hotel.starRating === 4) return 'CITY_4STAR';
+  if (hotel.starRating === 5) return 'CITY_5STAR';
+  return null;
+}
+
+/** 星级不匹配的放行原因长度上限（镜像后端 zod .max(200)，超长先在前端说清楚）。 */
+const STAR_MISMATCH_REASON_MAX = 200;
 
 /**
  * 签证状态默认值按本单产品派生（反馈：单机票/纯酒店/纯接送不可能需要签证台跟进）：
@@ -499,10 +520,18 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     }
   }, [token, isBundleOrder, bundleId, flights]);
 
-  // 切换套餐后清空运营手选的航班号：不同套餐的绑定/候选航班不同，避免带入上一套餐的选择。
+  // 切换套餐 = 换了另一件商品：上一套餐的「档次相关选择」一律不能带过来。
+  //   · 手选航班号 —— 不同套餐的绑定/候选航班不同；
+  //   · 指定酒店 + 房型 —— 指定加价与档次星级都按套餐算，残留会按新套餐重新收费、或错配星级；
+  //   · 去/回程升舱人数 —— 升舱费率随套餐走，新套餐费率为 0 时也不该残留勾选。
+  // 与批量创单侧同口径（批量换套餐同样清升舱与指定酒店）。
   useEffect(() => {
     setBundleGoFlightId('');
     setBundleRetFlightId('');
+    setDesignatedHotelId('');
+    setDesignatedRoomTypeId('');
+    setBusinessCountOutbound(0);
+    setBusinessCountReturn(0);
   }, [bundleId]);
 
   // 酒店列表
@@ -542,12 +571,24 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 套餐结算档次对应的星级（CITY_3STAR→3 / CITY_4STAR→4 / CITY_5STAR→5 / INTL_5STAR→5）；
   // 套餐不走结算价日历（settlementTier 为空）时为 null，不显示档次、也不比对星级。
   const bundleSettlementStar = bundle?.settlementTier ? SETTLEMENT_TIER_STAR[bundle.settlementTier] : null;
-  // 指定了真实酒店（非占位）且星级与套餐档次不一致 → 非阻断提醒，不拦提交。
+  // 指定酒店自己属于哪个档次（null = 映射不到档次：星级缺失 / 1、2 星 / 国际五星标记与星级打架）。
+  const designatedHotelTier = designatedHotel ? resolveHotelSettlementTier(designatedHotel) : null;
+  /**
+   * 指定了真实酒店（非占位）且档次与套餐档次对不上 → 提交闸（代理拦死，运营需填放行原因）。
+   * 与服务端星级闸同口径：按**档次**比而非星级数字比（市区五星 ≠ 国际五星），
+   * 占位酒店与未配 settlementTier 的老套餐都不判（无基准可比，不是「放行」）。
+   */
   const designatedHotelStarMismatch =
     !designatedHotelIsPlaceholder &&
     designatedHotel != null &&
-    bundleSettlementStar != null &&
-    designatedHotel.starRating !== bundleSettlementStar;
+    bundle?.settlementTier != null &&
+    designatedHotelTier !== bundle.settlementTier;
+  /** 指定酒店档次的中文名；映射不到档次时退回「N 星」，再不行只说「该酒店」。 */
+  const designatedHotelTierLabel = designatedHotelTier
+    ? SETTLEMENT_TIER_ZH[designatedHotelTier]
+    : designatedHotel?.starRating != null
+      ? `${designatedHotel.starRating} 星`
+      : '未标星级';
 
   // 套餐 SearchSelect 选项：label 有编号时带 `[code] name`，方便按编号搜；
   // priceLabel 用折后起价/人 = originalPerPaxCny ×(1−discountPct/100)，与套餐页卡片「¥X 起/人」
@@ -678,11 +719,14 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   //   否则订单照样生成签证任务、签证台挂一条「待处理」（公测反馈）。
   const showRoomingCol = isBundleOrder;
   const bundleHasVisaComponent = !!bundle?.items?.some((it) => it.kind === 'VISA');
+  // 含签证产品区块的单（纯签证单、机票+签证混挂…）同样要能逐位选「随单办签 / 自备签」：
+  // 自备签是**乘客级**事实，决定这个人进不进签证台；此前只有套餐单给得出这个口子，
+  // 纯签证单只能整单选「不需要」——要么全员送签、要么整单不办，中间态无处表达。
+  // 语义与后端 visa-need.ts 一致：至少一位非自备签才建签证任务。
+  const hasVisaProductBlock = blockKinds.includes('VISA');
   const showVisaExemptCol =
-    isBundleOrder && (bundleHasVisaComponent || (bundle?.selfVisaDeductCny ?? 0) > 0);
-  // 出行人表格总列数（姓名/护照号/出生日期/中文姓名/性别/签发日期/签发地点/有效期/护照图/操作 10 列 +
-  //   可选的住宿/签证列）；AI 核对提示行需要 colSpan 撑满整行。
-  const passengerColCount = 10 + (showRoomingCol ? 1 : 0) + (showVisaExemptCol ? 1 : 0);
+    (isBundleOrder && (bundleHasVisaComponent || (bundle?.selfVisaDeductCny ?? 0) > 0)) ||
+    hasVisaProductBlock;
   // 注：单住 / 自备签的勾选人数不再单列派生 —— 试算依赖已改为「请求体指纹」，
   // 逐位勾选的变化直接体现在 quotePassengersSignature 里（见下方 quote effect）。
   // 每人构成小字用的费率（展示口径，与后端 computeBundleAddOn 一致）：
@@ -691,10 +735,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const singleSupplementPerPax = bundle ? (bundle.singleSupplementCnyPerNight ?? 0) * bundleNightsForHint : 0;
   const selfVisaDeductPerPax = bundle?.selfVisaDeductCny ?? 0;
 
-  // 整单签证「不需要」→ 出行人自备签的单向联动开关（仅套餐单 + 签证列在显示时才生效）。
+  // 整单签证「不需要」→ 出行人自备签的单向联动开关（签证列在显示时才生效：套餐单或含签证产品单）。
   // 单向：只在选中「不需要」时把现有/新增出行人批量置为自备签；订单级改回其它值不做任何反向还原，
   // 不动用户已经逐位调整过的选择（公测反馈：整单选了不需要还要逐个人再选一遍）。
-  const autoVisaExemptForBundle = showVisaExemptCol && visaStatus === 'NOT_NEEDED';
+  const autoVisaExempt = showVisaExemptCol && visaStatus === 'NOT_NEEDED';
 
   // 调价有效性：金额为非 0 整数即视为「要调价」；「其它」原因必须补说明。
   const adjustIsInteger = adjustAmount !== null && Number.isInteger(adjustAmount) && adjustAmount !== 0;
@@ -758,7 +802,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   function addPassenger(): void {
     setPassengers((prev) => {
       // 整单「不需要签证」联动生效时，新增行默认也是自备签（与已有行一致，用户仍可逐位改回）。
-      const row = autoVisaExemptForBundle ? { ...emptyPassenger(), visaExempt: true } : emptyPassenger();
+      const row = autoVisaExempt ? { ...emptyPassenger(), visaExempt: true } : emptyPassenger();
       const next = [...prev, row];
       passengersRef.current = next;
       return next;
@@ -851,7 +895,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     if (appendCount > 0) {
       // 整单「不需要签证」联动生效时，批量识别新增的行同样默认自备签（与手动加一位同口径）。
       const toAppend = Array.from({ length: appendCount }, () =>
-        autoVisaExemptForBundle ? { ...emptyPassenger(), visaExempt: true } : emptyPassenger(),
+        autoVisaExempt ? { ...emptyPassenger(), visaExempt: true } : emptyPassenger(),
       );
       setPassengers((prev) => [...prev, ...toAppend]);
       // ref 同步前置：并发 worker 会立即按这些末尾索引写入，别等 effect 回灌。
@@ -1183,7 +1227,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       return;
     }
     // 各产品区块的订单行已合并成一张单（套餐单本身也是「机票航段 + 地面套餐」多行）。
-    const orderItems = built.items;
+    // 下方星级闸可能给 BUNDLE 行补一个放行原因字段，故用 let。
+    let orderItems = built.items;
 
     if (passengersRequired && validPassengers.length === 0) {
       setErr('该产品类型需至少一位完整出行人（姓名 + 护照号 + 出生日期）');
@@ -1252,6 +1297,39 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       return;
     }
 
+    // 指定酒店星级 ≠ 套餐档次星级：block-with-override（此前只是琥珀色提醒，照样能提交，
+    // 于是「四星档的单指到五星店」不声不响地过去，成本对不上账才被发现）。
+    //   · 代理：一律拦下（服务端对 AGENT 直接 400，前端先把话说清楚，省一次必败提交）；
+    //   · 运营：必须写明放行原因，原因随 BUNDLE 行上送，服务端据此放行并留痕。
+    if (designatedHotelStarMismatch) {
+      const tierZh = bundle?.settlementTier ? SETTLEMENT_TIER_ZH[bundle.settlementTier] : '';
+      const hotelLabel = designatedHotel?.name ?? '所选酒店';
+      if (isAgentUser) {
+        setErr(
+          `本套餐档次为「${tierZh}」（${bundleSettlementStar} 星），「${hotelLabel}」属${designatedHotelTierLabel}，两者对不上。请改选同档次酒店，或改选对应档次的套餐。`,
+        );
+        return;
+      }
+      const reason = window.prompt(
+        `「${hotelLabel}」属${designatedHotelTierLabel}，与本套餐档次「${tierZh}」（${bundleSettlementStar} 星）不一致。\n` +
+          `确认按此酒店成交，请填写放行原因（必填，${STAR_MISMATCH_REASON_MAX} 字以内，随订单留档备查）：`,
+        '',
+      );
+      if (reason === null) return; // 取消 = 放弃本次提交，不报错
+      const reasonText = reason.trim();
+      if (!reasonText) {
+        setErr('档次不匹配的指定酒店需要填写放行原因才能提交；如选错酒店请改回同档次的店');
+        return;
+      }
+      if (reasonText.length > STAR_MISMATCH_REASON_MAX) {
+        setErr(`放行原因最多 ${STAR_MISMATCH_REASON_MAX} 字，请精简后重新提交`);
+        return;
+      }
+      orderItems = orderItems.map((it) =>
+        it.kind === 'BUNDLE' ? { ...it, designatedHotelStarMismatchReason: reasonText } : it,
+      );
+    }
+
     const passengerPayload: OrderPassengerInput[] = validPassengers.map((p) => ({
       fullName: p.fullName.trim(),
       documentNumber: p.documentNumber.trim(),
@@ -1268,8 +1346,15 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       ...(p.passportIssuePlace?.trim() ? { passportIssuePlace: p.passportIssuePlace.trim() } : {}),
       ...(p.passportExpiry?.trim() ? { passportExpiry: parseDob(p.passportExpiry) ?? p.passportExpiry.trim() } : {}),
       // 签证出签日/生效日/有效期不在录单时采集：改由签证台在出签后补录（见 PassengerRow 类型定义注释）。
-      // 套餐乘客级选项（购物车模式）：仅套餐单显式发送；后端据此逐位派生权威定价 + 签证台过滤。
-      ...(isBundleOrder ? { visaExempt: !!p.visaExempt, singleRoom: !!p.singleRoom } : {}),
+      // 乘客级选项：
+      //   · 套餐单发两项（购物车模式）——后端据此逐位派生权威定价 + 签证台过滤；
+      //   · 含签证产品的非套餐单只发 visaExempt——单住是套餐概念，不适用；自备签是乘客级
+      //     事实（决定这个人进不进签证台），纯签证单同样要逐位表达。
+      ...(isBundleOrder
+        ? { visaExempt: !!p.visaExempt, singleRoom: !!p.singleRoom }
+        : showVisaExemptCol
+          ? { visaExempt: !!p.visaExempt }
+          : {}),
     }));
     // 纯酒店/接送且未填出行人：后端 passengers 至少 1 条，用联系人（或录入人）占位一位出行人。
     if (passengerPayload.length === 0) {
@@ -1463,6 +1548,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   }
 
   const inputCls = 'mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm';
+  // 出行人卡片的紧凑网格：标签 + 输入框基类。边框色由各字段按校验/AI 核对状态自己接在后面
+  // （rose = 格式不对，amber = AI 建议人工核对，slate = 正常），所以这里不带 border-*。
+  const paxLabelCls = 'block text-[11px] text-slate-500';
+  const paxInputCls = 'mt-0.5 w-full rounded border px-1.5 py-1 text-sm';
 
   return (
     <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="录单" tabIndex={-1} className="fixed inset-0 z-50 flex items-start justify-center overflow-y-auto bg-black/40 p-4">
@@ -1692,7 +1781,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   </div>
                   {/* 商务舱升级：去程 / 回程分开填 —— 只升去程、或两程升的人数不同都很常见，
                       合成一个数字会按「两程都升」收钱。单程套餐（legs=1）只显示去程。
-                      单住 / 自备签已改为「逐位选择」，见下方出行人表两列。 */}
+                      单住 / 自备签已改为「逐位选择」，见下方出行人卡片两项。 */}
                   <div className={`grid gap-2 md:col-span-2 ${(bundle?.legs ?? 2) >= 2 ? 'grid-cols-2' : 'grid-cols-1'}`}>
                     <label className="text-xs text-slate-500">
                       去程升舱人数
@@ -1794,15 +1883,20 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                         「{designatedHotel?.name}」是星级随机档的占位记录，不是真实酒店，不会真的落到这家店。套餐要走随机档，请把上面的「酒店」清空（选「随机（不指定酒店）」）。
                       </p>
                     )}
+                    {/* 档次不匹配不再只是提醒：代理直接拦下，运营必须在提交时写明放行原因（留档备查）。
+                        按档次比而非星级数字比——市区五星与国际五星是两档，另行报价。 */}
                     {designatedHotelStarMismatch && bundle?.settlementTier && (
-                      <p className="col-span-2 text-[11px] text-amber-600">
-                        「{designatedHotel?.name}」是{designatedHotel?.starRating}星，与本套餐档次「{SETTLEMENT_TIER_ZH[bundle.settlementTier]}」（{bundleSettlementStar}星）不一致，确认是否选错酒店。
+                      <p className={`col-span-2 text-[11px] ${isAgentUser ? 'text-rose-600' : 'text-amber-600'}`}>
+                        「{designatedHotel?.name}」属{designatedHotelTierLabel}，与本套餐档次「{SETTLEMENT_TIER_ZH[bundle.settlementTier]}」（{bundleSettlementStar}星）不一致。
+                        {isAgentUser
+                          ? '请改选同档次酒店，或改选对应档次的套餐（此组合不能提交）。'
+                          : '提交时需填写放行原因并留档备查；如选错酒店请改回同档次的店。'}
                       </p>
                     )}
                   </div>
                   <p className="md:col-span-2 text-[11px] text-slate-400">
                     成人 + 儿童 + 婴儿都是出行人（都需护照，下方逐位填）。
-                    <span className="text-slate-500">住宿（拼房/单住）与签证（随套餐/自备签）在下方出行人表里每人各选</span>，
+                    <span className="text-slate-500">住宿（拼房/单住）与签证（随套餐/自备签）在下方每位出行人卡片里各选</span>，
                     机票/房/价格由系统按套餐权威重算。
                   </p>
                 </div>
@@ -1976,9 +2070,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               </p>
               {showVisaExemptCol && (
                 <p className="mt-1 text-[11px] text-slate-400">
-                  选「不需要」会把当前及新增出行人自动设为「自备签」（下方出行人表可逐位改回「随套餐」）；
-                  反向不联动——单个乘客选自备签不会改变本订单级签证状态，自备签乘客不进签证台
-                  {selfVisaDeductPerPax > 0 ? '、套餐价按人扣减' : ''}。
+                  选「不需要」会把当前及新增出行人自动设为「自备签」（下方每位出行人卡片里可逐位改回
+                  「{isBundleOrder ? '随套餐' : '随单办签'}」）；反向不联动——单个乘客选自备签不会改变本订单级签证状态，
+                  自备签乘客不进签证台{selfVisaDeductPerPax > 0 ? '、套餐价按人扣减' : ''}。
                 </p>
               )}
             </div>
@@ -2017,7 +2111,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   <button className="text-sm text-brand hover:text-brand-dark" onClick={addPassenger} type="button">＋ 加一位</button>
                 </div>
               </div>
-              {autoVisaExemptForBundle && (
+              {autoVisaExempt && (
                 <p className="mb-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
                   整单不需要签证 → 每位出行人已标为自备签（不进签证台
                   {selfVisaDeductPerPax > 0
@@ -2026,284 +2120,287 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   ），可逐位改回
                 </p>
               )}
-              <div className="scrollbar-visible max-h-[28rem] overflow-x-auto overflow-y-auto rounded-md border border-slate-200">
-                {/* 列宽用固定 min-width 直接标在每个 th/td 上（不用 col min-width——部分浏览器
-                    的 auto-layout 表格不认 <col> 上的 min-width，只认 width，等于没生效）。
-                    日期列需完整显示 YYYY-MM-DD 不被截断成「2026-」，姓名类列需够宽可读；
-                    表格允许超过容器宽度，靠外层 overflow-x-auto 横向滚动兜底，不挤压/不截断任何一列。 */}
-                <table className="min-w-max text-sm">
-                  <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
-                    <tr>
-                      <th className="min-w-[140px] whitespace-nowrap px-2 py-1.5 text-left font-normal">姓名</th>
-                      {showRoomingCol && <th className="min-w-[150px] whitespace-nowrap px-2 py-1.5 text-left font-normal">住宿</th>}
-                      {showVisaExemptCol && <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">签证</th>}
-                      <th className="min-w-[140px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照号</th>
-                      <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">出生日期</th>
-                      <th className="min-w-[140px] whitespace-nowrap px-2 py-1.5 text-left font-normal">中文姓名</th>
-                      <th className="min-w-[90px] whitespace-nowrap px-2 py-1.5 text-left font-normal">
-                        性别<span className="text-rose-500"> *</span>
-                      </th>
-                      <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照签发日期</th>
-                      <th className="min-w-[160px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照签发地点</th>
-                      <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">
-                        护照有效期{passengersRequired && <span className="text-rose-500"> *必填</span>}
-                      </th>
-                      {/* 签证出签日/生效日/有效期不在此处录入：这三项是签证岗出签后才拿得到的信息，
-                          录单时无法预先知道（票务岗反馈：录单时不需要），改由签证台在出签后补录。 */}
-                      <th className="min-w-[110px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照图</th>
-                      <th className="min-w-[40px] px-2 py-1.5"></th>
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {passengers.map((p, i) => {
-                      const dobTouched = p.dateOfBirth.trim().length > 0;
-                      const dobBad = dobTouched && parseDob(p.dateOfBirth) === null;
-                      const issueTouched = (p.passportIssueDate ?? '').trim().length > 0;
-                      const issueBad = issueTouched && parseDob(p.passportIssueDate ?? '') === null;
-                      const ppExpiryTouched = (p.passportExpiry ?? '').trim().length > 0;
-                      const ppExpiryBad = ppExpiryTouched && parseDob(p.passportExpiry ?? '') === null;
-                      const isOcring = p.ocrPct !== null && p.ocrPct !== undefined && p.ocrPct < 100;
-                      const reviewHint = ocrReviewHint(p);
-                      return (
-                        <Fragment key={i}>
-                        <tr className="border-t border-slate-100">
-                          <td
-                            className="min-w-[140px] px-2 py-1 align-top"
-                            onBlur={() => {
-                              // 姓名脏格式（如 `ZHENG,/QINQIN`）在此边界统一规范化，避免污染导出名单。
-                              const normalized = normalizePassengerFullName(p.fullName);
-                              if (normalized !== p.fullName) setPassenger(i, { fullName: normalized });
+              {/* 出行人：一位一张紧凑卡片，字段按「三列网格」铺（窄屏自动降到 2 列 / 1 列）。
+                  此前是一张十余列的横向滚动表：核对 OCR 识别结果得左右拖，护照上半段和下半段
+                  永远不在同一屏。改成卡片后每位出行人只占三四行，常规屏幕一次能看两三位，
+                  照着护照逐项核对不用再来回滚。字段、校验与 OCR 回填逻辑一律照旧，只动排版。 */}
+              <div className="scrollbar-visible max-h-[32rem] space-y-2 overflow-y-auto rounded-md border border-slate-200 bg-slate-50/40 p-2">
+                {passengers.map((p, i) => {
+                  const dobTouched = p.dateOfBirth.trim().length > 0;
+                  const dobBad = dobTouched && parseDob(p.dateOfBirth) === null;
+                  const issueTouched = (p.passportIssueDate ?? '').trim().length > 0;
+                  const issueBad = issueTouched && parseDob(p.passportIssueDate ?? '') === null;
+                  const ppExpiryTouched = (p.passportExpiry ?? '').trim().length > 0;
+                  const ppExpiryBad = ppExpiryTouched && parseDob(p.passportExpiry ?? '') === null;
+                  const isOcring = p.ocrPct !== null && p.ocrPct !== undefined && p.ocrPct < 100;
+                  const reviewHint = ocrReviewHint(p);
+                  return (
+                    <div key={i} className="rounded-md border border-slate-200 bg-white p-2.5 shadow-sm">
+                      {/* 卡头：序号 · 护照图/OCR 入口 · 删除。照片区保持原有全部交互（识别进度 / 预览 / 移除 / 引擎标签）。 */}
+                      <div className="mb-2 flex items-center justify-between gap-2 border-b border-slate-100 pb-1.5">
+                        <span className="text-xs font-medium text-slate-600">出行人 {i + 1}</span>
+                        <div className="flex items-center gap-2">
+                          {/* 隐藏 file input（单张 OCR） */}
+                          <input
+                            type="file"
+                            accept="image/*"
+                            className="hidden"
+                            ref={(el) => { ocrInputRefs.current[i] = el; }}
+                            onChange={(e) => {
+                              const f = e.target.files?.[0];
+                              e.target.value = '';
+                              if (f) void handleOcrFile(i, f);
                             }}
-                          >
-                            {/* 姓名联想：≥2 字符调常旅客 suggest，点选整行回填（AGENT 无联想） */}
-                            <PassengerSuggestInput
-                              className={`w-full rounded border px-1.5 py-1 text-sm ${hasFieldReview(p, 'fullName') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
-                              value={p.fullName}
-                              onChange={(v) => {
-                                setPassenger(i, { fullName: v });
-                                clearReviewField(i, 'fullName');
-                              }}
-                              onPick={(s) => applyProfileSuggestion(i, s)}
-                            />
-                          </td>
-                          {/* 套餐乘客级：住宿方式（拼房默认/单住）+ 本人构成小字（能算则显示） */}
-                          {showRoomingCol && (
-                            <td className="min-w-[150px] px-2 py-1 align-top">
-                              <select
-                                className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
-                                value={p.singleRoom ? 'single' : 'share'}
-                                onChange={(e) => setPassenger(i, { singleRoom: e.target.value === 'single' })}
-                              >
-                                <option value="share">拼房</option>
-                                <option value="single">单住</option>
-                              </select>
-                              {(() => {
-                                const parts: string[] = ['套餐价'];
-                                if (p.singleRoom && singleSupplementPerPax > 0) parts.push(`+单房差¥${singleSupplementPerPax.toLocaleString('zh-CN')}`);
-                                if (p.visaExempt && selfVisaDeductPerPax > 0) parts.push(`−自备签¥${selfVisaDeductPerPax.toLocaleString('zh-CN')}`);
-                                return parts.length > 1 ? (
-                                  <span className="mt-0.5 block whitespace-nowrap text-[11px] text-slate-400">本人构成：{parts.join(' ')}</span>
-                                ) : null;
-                              })()}
-                            </td>
-                          )}
-                          {/* 套餐乘客级：签证（随套餐默认/自备签）——套餐含签证组件或配了自备签减免额时显示 */}
-                          {showVisaExemptCol && (
-                            <td className="min-w-[120px] px-2 py-1 align-top">
-                              <select
-                                className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
-                                value={p.visaExempt ? 'self' : 'bundle'}
-                                onChange={(e) => setPassenger(i, { visaExempt: e.target.value === 'self' })}
-                              >
-                                <option value="bundle">随套餐</option>
-                                <option value="self">自备签</option>
-                              </select>
-                            </td>
-                          )}
-                          <td className="min-w-[140px] px-2 py-1 align-top">
-                            {/* 证件号联想：与姓名共用同一联想组件与整行回填 */}
-                            <PassengerSuggestInput
-                              className={`w-full rounded border px-1.5 py-1 text-sm ${hasFieldReview(p, 'documentNumber') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
-                              value={p.documentNumber}
-                              onChange={(v) => {
-                                setPassenger(i, { documentNumber: v });
-                                clearReviewField(i, 'documentNumber');
-                              }}
-                              onPick={(s) => applyProfileSuggestion(i, s)}
-                            />
-                          </td>
-                          <td className="min-w-[120px] px-2 py-1 align-top">
-                            <input
-                              type="text"
-                              inputMode="numeric"
-                              className={`w-full rounded border px-1.5 py-1 text-sm ${dobBad ? 'border-rose-400 bg-rose-50' : hasFieldReview(p, 'dateOfBirth') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
-                              placeholder="YYYY-MM-DD"
-                              value={p.dateOfBirth}
-                              onChange={(e) => {
-                                setPassenger(i, { dateOfBirth: e.target.value });
-                                clearReviewField(i, 'dateOfBirth');
-                              }}
-                              onBlur={() => {
-                                // 失焦即规范化显示值（如 2033/8/24 → 2033-08-24），让录入人看到即将提交的真实格式。
-                                const normalized = parseDob(p.dateOfBirth);
-                                if (normalized && normalized !== p.dateOfBirth) setPassenger(i, { dateOfBirth: normalized });
-                              }}
-                            />
-                            {dobBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 1990-01-01</span>}
-                          </td>
-                          <td className="min-w-[140px] px-2 py-1 align-top">
-                            <input
-                              type="text"
-                              className={`w-full rounded border px-1.5 py-1 text-sm ${hasFieldReview(p, 'chineseName') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
-                              placeholder="中文姓名（选填）"
-                              value={p.chineseName ?? ''}
-                              onChange={(e) => {
-                                setPassenger(i, { chineseName: e.target.value });
-                                clearReviewField(i, 'chineseName');
-                              }}
-                            />
-                          </td>
-                          <td className="min-w-[90px] px-2 py-1 align-top">
-                            <select
-                              className={`w-full rounded border px-1.5 py-1 text-sm ${hasFieldReview(p, 'gender') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
-                              value={p.gender ?? ''}
-                              onChange={(e) => {
-                                setPassenger(i, { gender: (e.target.value || undefined) as 'M' | 'F' | 'X' | undefined });
-                                clearReviewField(i, 'gender');
-                              }}
-                            >
-                              <option value="">未选</option>
-                              <option value="M">男 (M)</option>
-                              <option value="F">女 (F)</option>
-                              <option value="X">其他 (X)</option>
-                            </select>
-                          </td>
-                          <td className="min-w-[120px] px-2 py-1 align-top">
-                            <input
-                              type="text"
-                              inputMode="numeric"
-                              className={`w-full rounded border px-1.5 py-1 text-sm ${issueBad ? 'border-rose-400 bg-rose-50' : hasFieldReview(p, 'passportIssueDate') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
-                              placeholder="YYYY-MM-DD（选填）"
-                              value={p.passportIssueDate ?? ''}
-                              onChange={(e) => {
-                                setPassenger(i, { passportIssueDate: e.target.value });
-                                clearReviewField(i, 'passportIssueDate');
-                              }}
-                              onBlur={() => {
-                                const normalized = parseDob(p.passportIssueDate ?? '');
-                                if (normalized && normalized !== p.passportIssueDate) setPassenger(i, { passportIssueDate: normalized });
-                              }}
-                            />
-                            {issueBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 2018-01-01</span>}
-                          </td>
-                          <td className="min-w-[160px] px-2 py-1 align-top">
-                            <input
-                              type="text"
-                              className={`w-full rounded border px-1.5 py-1 text-sm ${hasFieldReview(p, 'passportIssuePlace') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
-                              placeholder="如 广东省广州市（选填）"
-                              value={p.passportIssuePlace ?? ''}
-                              onChange={(e) => {
-                                setPassenger(i, { passportIssuePlace: e.target.value });
-                                clearReviewField(i, 'passportIssuePlace');
-                              }}
-                            />
-                          </td>
-                          <td className="min-w-[120px] px-2 py-1 align-top">
-                            <input
-                              type="text"
-                              inputMode="numeric"
-                              className={`w-full rounded border px-1.5 py-1 text-sm ${ppExpiryBad ? 'border-rose-400 bg-rose-50' : hasFieldReview(p, 'passportExpiry') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
-                              placeholder="YYYY-MM-DD（选填）"
-                              value={p.passportExpiry ?? ''}
-                              onChange={(e) => {
-                                setPassenger(i, { passportExpiry: e.target.value });
-                                clearReviewField(i, 'passportExpiry');
-                              }}
-                              onBlur={() => {
-                                const normalized = parseDob(p.passportExpiry ?? '');
-                                if (normalized && normalized !== p.passportExpiry) setPassenger(i, { passportExpiry: normalized });
-                              }}
-                            />
-                            {ppExpiryBad && <span className="mt-0.5 block whitespace-nowrap text-[11px] text-rose-500">格式如 2030-01-01</span>}
-                          </td>
-                          {/* 签证出签日/生效日/有效期不在此处录入：改由签证台在出签后补录（见表头注释） */}
-                          <td className="min-w-[110px] px-2 py-1 align-top">
-                            {/* 隐藏 file input */}
-                            <input
-                              type="file"
-                              accept="image/*"
-                              className="hidden"
-                              ref={(el) => { ocrInputRefs.current[i] = el; }}
-                              onChange={(e) => {
-                                const f = e.target.files?.[0];
-                                e.target.value = '';
-                                if (f) void handleOcrFile(i, f);
-                              }}
-                            />
-                            {isOcring ? (
-                              <div className="space-y-0.5">
-                                <div className="h-1.5 w-20 overflow-hidden rounded-full bg-slate-200">
-                                  <div
-                                    className="h-full rounded-full bg-brand transition-all"
-                                    style={{ width: `${p.ocrPct ?? 0}%` }}
-                                  />
-                                </div>
-                                <span className="block text-[10px] text-slate-400 truncate max-w-[5rem]">{p.ocrStage}</span>
+                          />
+                          {isOcring ? (
+                            <div className="flex items-center gap-1.5">
+                              <div className="h-1.5 w-20 overflow-hidden rounded-full bg-slate-200">
+                                <div
+                                  className="h-full rounded-full bg-brand transition-all"
+                                  style={{ width: `${p.ocrPct ?? 0}%` }}
+                                />
                               </div>
-                            ) : p.passportPhotoUrl ? (
-                              <div className="flex flex-col items-start gap-1">
-                                <div className="flex items-center gap-1">
-                                  <ProofImageViewer
-                                    src={p.passportPhotoUrl}
-                                    alt="护照"
-                                    thumbClassName="h-7 w-10 rounded object-cover ring-1 ring-slate-200"
-                                  />
-                                  <button
-                                    type="button"
-                                    className="btn-ghost-danger px-1 py-0.5 text-[10px]"
-                                    onClick={() => setPassenger(i, { passportPhotoUrl: undefined, ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null, ocrFailed: false, reviewFields: undefined, mrzValid: null, localOcrCaveat: false })}
-                                    title="移除图片"
-                                  ><Icon name="close" /></button>
-                                </div>
-                                {/* OCR 引擎标签：max-w-full + truncate，长模型名不撑宽列；完整名进 title */}
-                                {p.ocrEngine === 'ai' && (
-                                  <span
-                                    className="block max-w-full truncate rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium leading-tight text-emerald-700 ring-1 ring-emerald-200"
-                                    title={p.ocrModel ? `AI识别 · ${p.ocrModel}` : 'AI识别'}
-                                  >
-                                    AI识别{p.ocrModel ? ` · ${p.ocrModel}` : ''}
-                                  </span>
-                                )}
-                              </div>
-                            ) : (
+                              <span className="max-w-[8rem] truncate text-[10px] text-slate-400">{p.ocrStage}</span>
+                            </div>
+                          ) : p.passportPhotoUrl ? (
+                            <div className="flex items-center gap-1">
+                              <ProofImageViewer
+                                src={p.passportPhotoUrl}
+                                alt="护照"
+                                thumbClassName="h-7 w-10 rounded object-cover ring-1 ring-slate-200"
+                              />
+                              {/* OCR 引擎标签：max-w + truncate，长模型名不撑破卡头；完整名进 title */}
+                              {p.ocrEngine === 'ai' && (
+                                <span
+                                  className="max-w-[10rem] truncate rounded bg-emerald-50 px-1.5 py-0.5 text-[10px] font-medium leading-tight text-emerald-700 ring-1 ring-emerald-200"
+                                  title={p.ocrModel ? `AI识别 · ${p.ocrModel}` : 'AI识别'}
+                                >
+                                  AI识别{p.ocrModel ? ` · ${p.ocrModel}` : ''}
+                                </span>
+                              )}
                               <button
                                 type="button"
-                                className="rounded border border-slate-300 px-1.5 py-0.5 text-[11px] text-slate-600 hover:border-brand hover:text-brand"
-                                onClick={() => ocrInputRefs.current[i]?.click()}
-                              >
-                                OCR
-                              </button>
-                            )}
-                          </td>
-                          <td className="px-2 py-1 text-right align-top">
-                            <button className="btn-ghost-danger px-1 py-0.5 text-xs" onClick={() => removePassenger(i)} disabled={passengers.length <= 1} type="button" aria-label={`删除第 ${i + 1} 位乘客`}><Icon name="trash" /></button>
-                          </td>
-                        </tr>
-                        {reviewHint && (
-                          <tr className="border-t-0">
-                            <td colSpan={passengerColCount} className={`${p.ocrFailed ? 'bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200' : 'bg-amber-50 text-amber-700'} px-2 py-1 text-[11px]`}>
-                              <Icon name="alert" /> {reviewHint}
-                            </td>
-                          </tr>
+                                className="btn-ghost-danger px-1 py-0.5 text-[10px]"
+                                onClick={() => setPassenger(i, { passportPhotoUrl: undefined, ocrPct: null, ocrStage: undefined, ocrEngine: null, ocrModel: null, ocrFailed: false, reviewFields: undefined, mrzValid: null, localOcrCaveat: false })}
+                                title="移除图片"
+                              ><Icon name="close" /></button>
+                            </div>
+                          ) : (
+                            <button
+                              type="button"
+                              className="rounded border border-slate-300 px-1.5 py-0.5 text-[11px] text-slate-600 hover:border-brand hover:text-brand"
+                              onClick={() => ocrInputRefs.current[i]?.click()}
+                            >
+                              <Icon name="camera" size={12} /> 传护照识别
+                            </button>
+                          )}
+                          <button
+                            className="btn-ghost-danger px-1 py-0.5 text-xs"
+                            onClick={() => removePassenger(i)}
+                            disabled={passengers.length <= 1}
+                            type="button"
+                            aria-label={`删除第 ${i + 1} 位出行人`}
+                          ><Icon name="trash" /></button>
+                        </div>
+                      </div>
+
+                      {/* 字段网格：按「姓名组 / 证件组 / 签发组」分行，顺序对得上护照版面，便于逐项核对 */}
+                      <div className="grid grid-cols-1 gap-x-3 gap-y-2 sm:grid-cols-2 lg:grid-cols-3">
+                        <label
+                          className={paxLabelCls}
+                          onBlur={() => {
+                            // 姓名脏格式（如 `ZHENG,/QINQIN`）在此边界统一规范化，避免污染导出名单。
+                            const normalized = normalizePassengerFullName(p.fullName);
+                            if (normalized !== p.fullName) setPassenger(i, { fullName: normalized });
+                          }}
+                        >
+                          姓名<span className="text-rose-500"> *</span>
+                          {/* 姓名联想：≥2 字符调常旅客 suggest，点选整行回填（AGENT 无联想） */}
+                          <PassengerSuggestInput
+                            className={`${paxInputCls} ${hasFieldReview(p, 'fullName') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
+                            value={p.fullName}
+                            onChange={(v) => {
+                              setPassenger(i, { fullName: v });
+                              clearReviewField(i, 'fullName');
+                            }}
+                            onPick={(s) => applyProfileSuggestion(i, s)}
+                          />
+                        </label>
+
+                        <label className={paxLabelCls}>
+                          性别<span className="text-rose-500"> *</span>
+                          <select
+                            className={`${paxInputCls} ${hasFieldReview(p, 'gender') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
+                            value={p.gender ?? ''}
+                            onChange={(e) => {
+                              setPassenger(i, { gender: (e.target.value || undefined) as 'M' | 'F' | 'X' | undefined });
+                              clearReviewField(i, 'gender');
+                            }}
+                          >
+                            <option value="">未选</option>
+                            <option value="M">男 (M)</option>
+                            <option value="F">女 (F)</option>
+                            <option value="X">其他 (X)</option>
+                          </select>
+                        </label>
+
+                        <label className={paxLabelCls}>
+                          中文姓名（选填）
+                          <input
+                            type="text"
+                            className={`${paxInputCls} ${hasFieldReview(p, 'chineseName') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
+                            placeholder="中文姓名"
+                            value={p.chineseName ?? ''}
+                            onChange={(e) => {
+                              setPassenger(i, { chineseName: e.target.value });
+                              clearReviewField(i, 'chineseName');
+                            }}
+                          />
+                        </label>
+
+                        <label className={paxLabelCls}>
+                          护照号<span className="text-rose-500"> *</span>
+                          {/* 证件号联想：与姓名共用同一联想组件与整行回填 */}
+                          <PassengerSuggestInput
+                            className={`${paxInputCls} ${hasFieldReview(p, 'documentNumber') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
+                            value={p.documentNumber}
+                            onChange={(v) => {
+                              setPassenger(i, { documentNumber: v });
+                              clearReviewField(i, 'documentNumber');
+                            }}
+                            onPick={(s) => applyProfileSuggestion(i, s)}
+                          />
+                        </label>
+
+                        <label className={paxLabelCls}>
+                          出生日期<span className="text-rose-500"> *</span>
+                          <input
+                            type="text"
+                            inputMode="numeric"
+                            className={`${paxInputCls} ${dobBad ? 'border-rose-400 bg-rose-50' : hasFieldReview(p, 'dateOfBirth') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
+                            placeholder="YYYY-MM-DD"
+                            value={p.dateOfBirth}
+                            onChange={(e) => {
+                              setPassenger(i, { dateOfBirth: e.target.value });
+                              clearReviewField(i, 'dateOfBirth');
+                            }}
+                            onBlur={() => {
+                              // 失焦即规范化显示值（如 2033/8/24 → 2033-08-24），让录入人看到即将提交的真实格式。
+                              const normalized = parseDob(p.dateOfBirth);
+                              if (normalized && normalized !== p.dateOfBirth) setPassenger(i, { dateOfBirth: normalized });
+                            }}
+                          />
+                          {dobBad && <span className="mt-0.5 block text-[11px] text-rose-500">格式如 1990-01-01</span>}
+                        </label>
+
+                        <label className={paxLabelCls}>
+                          护照有效期{passengersRequired && <span className="text-rose-500"> *</span>}
+                          <input
+                            type="text"
+                            inputMode="numeric"
+                            className={`${paxInputCls} ${ppExpiryBad ? 'border-rose-400 bg-rose-50' : hasFieldReview(p, 'passportExpiry') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
+                            placeholder="YYYY-MM-DD"
+                            value={p.passportExpiry ?? ''}
+                            onChange={(e) => {
+                              setPassenger(i, { passportExpiry: e.target.value });
+                              clearReviewField(i, 'passportExpiry');
+                            }}
+                            onBlur={() => {
+                              const normalized = parseDob(p.passportExpiry ?? '');
+                              if (normalized && normalized !== p.passportExpiry) setPassenger(i, { passportExpiry: normalized });
+                            }}
+                          />
+                          {ppExpiryBad && <span className="mt-0.5 block text-[11px] text-rose-500">格式如 2030-01-01</span>}
+                        </label>
+
+                        <label className={paxLabelCls}>
+                          护照签发日期（选填）
+                          <input
+                            type="text"
+                            inputMode="numeric"
+                            className={`${paxInputCls} ${issueBad ? 'border-rose-400 bg-rose-50' : hasFieldReview(p, 'passportIssueDate') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
+                            placeholder="YYYY-MM-DD"
+                            value={p.passportIssueDate ?? ''}
+                            onChange={(e) => {
+                              setPassenger(i, { passportIssueDate: e.target.value });
+                              clearReviewField(i, 'passportIssueDate');
+                            }}
+                            onBlur={() => {
+                              const normalized = parseDob(p.passportIssueDate ?? '');
+                              if (normalized && normalized !== p.passportIssueDate) setPassenger(i, { passportIssueDate: normalized });
+                            }}
+                          />
+                          {issueBad && <span className="mt-0.5 block text-[11px] text-rose-500">格式如 2018-01-01</span>}
+                        </label>
+
+                        <label className={paxLabelCls}>
+                          护照签发地点（选填）
+                          <input
+                            type="text"
+                            className={`${paxInputCls} ${hasFieldReview(p, 'passportIssuePlace') ? 'border-amber-400 bg-amber-50' : 'border-slate-300'}`}
+                            placeholder="如 广东省广州市"
+                            value={p.passportIssuePlace ?? ''}
+                            onChange={(e) => {
+                              setPassenger(i, { passportIssuePlace: e.target.value });
+                              clearReviewField(i, 'passportIssuePlace');
+                            }}
+                          />
+                        </label>
+                        {/* 签证出签日/生效日/有效期不在此处录入：这三项是签证岗出签后才拿得到的信息，
+                            录单时无法预先知道（票务岗反馈：录单时不需要），改由签证台在出签后补录。 */}
+
+                        {/* 套餐乘客级：住宿方式（拼房默认/单住）+ 本人构成小字（能算则显示） */}
+                        {showRoomingCol && (
+                          <label className={paxLabelCls}>
+                            住宿
+                            <select
+                              className={`${paxInputCls} border-slate-300`}
+                              value={p.singleRoom ? 'single' : 'share'}
+                              onChange={(e) => setPassenger(i, { singleRoom: e.target.value === 'single' })}
+                            >
+                              <option value="share">拼房</option>
+                              <option value="single">单住</option>
+                            </select>
+                            {(() => {
+                              const parts: string[] = ['套餐价'];
+                              if (p.singleRoom && singleSupplementPerPax > 0) parts.push(`+单房差¥${singleSupplementPerPax.toLocaleString('zh-CN')}`);
+                              if (p.visaExempt && selfVisaDeductPerPax > 0) parts.push(`−自备签¥${selfVisaDeductPerPax.toLocaleString('zh-CN')}`);
+                              return parts.length > 1 ? (
+                                <span className="mt-0.5 block text-[11px] text-slate-400">本人构成：{parts.join(' ')}</span>
+                              ) : null;
+                            })()}
+                          </label>
                         )}
-                        </Fragment>
-                      );
-                    })}
-                  </tbody>
-                </table>
+
+                        {/* 乘客级签证：套餐单 = 随套餐 / 自备签；含签证产品的非套餐单 = 随单办签 / 自备签。
+                            自备签的乘客不进签证台（后端 visa-need 口径：至少一位非自备签才建签证任务）。 */}
+                        {showVisaExemptCol && (
+                          <label className={paxLabelCls}>
+                            签证
+                            <select
+                              className={`${paxInputCls} border-slate-300`}
+                              value={p.visaExempt ? 'self' : 'included'}
+                              onChange={(e) => setPassenger(i, { visaExempt: e.target.value === 'self' })}
+                            >
+                              <option value="included">{isBundleOrder ? '随套餐' : '随单办签'}</option>
+                              <option value="self">自备签</option>
+                            </select>
+                          </label>
+                        )}
+                      </div>
+
+                      {/* AI 核对提示：整卡一条，紧贴字段网格下方 */}
+                      {reviewHint && (
+                        <p className={`${p.ocrFailed ? 'bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200' : 'bg-amber-50 text-amber-700'} mt-2 rounded px-2 py-1 text-[11px]`}>
+                          <Icon name="alert" /> {reviewHint}
+                        </p>
+                      )}
+                    </div>
+                  );
+                })}
               </div>
               <p className="mt-1 text-[11px] text-slate-400">
-                <Icon name="camera" />「批量传护照」可一次多选，自动逐张识别并生成出行人；护照图最多 {MAX_PHOTO_PASSENGERS} 张/单，超出请分单录入。识别有需人工核对的字段时会在对应行下方标黄提示。
+                <Icon name="camera" />「批量传护照」可一次多选，自动逐张识别并生成出行人；护照图最多 {MAX_PHOTO_PASSENGERS} 张/单，超出请分单录入。识别有需人工核对的字段时会在对应出行人卡片下方标黄提示。
               </p>
               {!passengersRequired && (
                 <p className="mt-1 text-[11px] text-slate-400">纯酒店/接送可不填出行人；留空时系统用联系人占位一位出行人。</p>

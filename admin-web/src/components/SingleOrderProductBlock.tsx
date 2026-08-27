@@ -152,6 +152,12 @@ export interface ProductBlock {
   visaId: string;
   visaQty: number | null;
   visaExpressTierLabel: string;
+  /**
+   * 预计出行日期（可空，YYYY-MM-DD）：纯签证单的业务日期锚点。
+   * 签证单既没有航班行也没有酒店入住日，订单「出发日」派生与按出发日期区间导出/筛选
+   * 全靠它兜底；留空 = 行程尚未定（不影响下单，行为与扩展前一致）。
+   */
+  visaIntendedDate: string;
 
   // ── TRANSFER ──
   transferId: string;
@@ -189,6 +195,7 @@ export function createProductBlock(kind: ProductBlockKind): ProductBlock {
     visaId: '',
     visaQty: 1,
     visaExpressTierLabel: '',
+    visaIntendedDate: '',
     transferId: '',
     transferDate: '',
     transferQty: 1,
@@ -331,6 +338,9 @@ function buildVisaItems(block: ProductBlock, ctx: ProductBlockBuildContext): Bui
         quantity: qty,
         visaId: block.visaId,
         unitPrice: Number(visa?.basePrice ?? 0) + (tier?.surchargeCny ?? 0),
+        // 预计出行日期：填了才发（留空 = 行程未定，后端字段本身可空）。
+        // 纯签证单没有航班/酒店日期，订单「出发日」派生与按出发日期导出全靠它。
+        ...(block.visaIntendedDate ? { visaIntendedDate: block.visaIntendedDate } : {}),
         ...(tier ? { metadata: { expressTierLabel: tier.label } } : {}),
       },
     ],
@@ -782,6 +792,20 @@ export function ProductBlockFields({
             </span>
           </label>
         )}
+        {/* 预计出行日期：签证业务的日期锚点。纯签证单没有航班行、也没有酒店入住日，
+            不填这个日期，这单在「按出发日期」的导出/筛选里永远捞不出来。留空不影响下单。 */}
+        <label className="text-xs text-slate-500 md:col-span-2">
+          预计出行日期（可空）
+          <input
+            type="date"
+            className={inputCls}
+            value={block.visaIntendedDate}
+            onChange={(e) => onPatch({ visaIntendedDate: e.target.value })}
+          />
+          <span className="mt-0.5 block text-[11px] text-slate-400">
+            纯签证单的业务日期锚点：签证没有航班和住宿，本单的「出发日」按它派生，按出发日期区间导出/筛选也靠它。行程还没定就留空。
+          </span>
+        </label>
         <p className="md:col-span-2 text-[11px] text-slate-400">签证含送签材料，下方每位出行人须填写护照有效期（必填）。份数应与出行人数一致。</p>
       </div>
     );

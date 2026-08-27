@@ -142,6 +142,21 @@ describe('buildProductBlockItems', () => {
     });
   });
 
+  it('签证行填了预计出行日期就随行上送（纯签证单的出发日锚点）', () => {
+    const built = buildProductBlockItems(
+      { ...createProductBlock('VISA'), visaId: 'visa-1', visaIntendedDate: '2026-09-15' },
+      ctx,
+    );
+    if (!('items' in built)) throw new Error(built.error);
+    expect(built.items[0]).toMatchObject({ kind: 'VISA', visaIntendedDate: '2026-09-15' });
+  });
+
+  it('签证行留空预计出行日期时不发该字段（行程未定，后端字段本就可空）', () => {
+    const built = buildProductBlockItems({ ...createProductBlock('VISA'), visaId: 'visa-1' }, ctx);
+    if (!('items' in built)) throw new Error(built.error);
+    expect(built.items[0]).not.toHaveProperty('visaIntendedDate');
+  });
+
   it('接送行带用车日期，单价取产品现价', () => {
     const block: ProductBlock = {
       ...createProductBlock('TRANSFER'),
