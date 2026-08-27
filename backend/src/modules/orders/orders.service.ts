@@ -3428,6 +3428,9 @@ export class OrderService {
           items: {
             select: {
               hotelCheckIn: true,
+              // 纯签证单的第三级日期锚点：漏了这个字段，deriveOrderDepartDate 在精筛时
+              // 拿不到签证预计出行日期 → 派生 null → 整单被丢，DB 召回白做。
+              visaIntendedDate: true,
               flightSchedule: { select: { departureTime: true, departureTz: true } },
             },
           },
