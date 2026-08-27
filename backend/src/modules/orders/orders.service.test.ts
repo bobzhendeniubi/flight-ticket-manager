@@ -5107,6 +5107,12 @@ describe('filterOrderIdsByDepartDate · 按整单出发日精确细筛', () => {
     hotelCheckIn: new Date(isoCheckIn),
     flightSchedule: null,
   });
+  // 签证行的「预计出行日期」——出发日派生的第三级回退（航班 → 酒店入住 → 本列）。
+  const visaItem = (isoIntended: string) => ({
+    hotelCheckIn: null,
+    flightSchedule: null,
+    visaIntendedDate: new Date(isoIntended),
+  });
 
   it('往返单（去程 7/10、回程 7/11），travelFrom=7/11 → 不命中（整单出发日=去程 7/10 < 7/11）', () => {
     const roundTrip = {
@@ -5131,11 +5137,55 @@ describe('filterOrderIdsByDepartDate · 按整单出发日精确细筛', () => {
     expect(ids).toEqual(['f', 't']);
   });
 
-  it('无航班的纯地面单回退酒店入住日；既无航班也无酒店 → 不命中', () => {
+  it('无航班的纯地面单回退酒店入住日；三级锚点全空 → 不命中', () => {
     const hotelOnly = { id: 'h', items: [hotelItem('2026-07-11T00:00:00Z')] };
     const empty = { id: 'e', items: [] };
     const ids = filterOrderIdsByDepartDate([hotelOnly, empty], '2026-07-11', '2026-07-11');
     expect(ids).toEqual(['h']);
+  });
+
+  // ── 第三级回退：纯签证单的「预计出行日期」（反馈：签证岗）──────────────────
+  it('纯签证单回退 visaIntendedDate → 命中（此前无出发日、永远筛不出来）', () => {
+    const visaOnly = { id: 'v', items: [visaItem('2026-07-11T00:00:00Z')] };
+    expect(filterOrderIdsByDepartDate([visaOnly], '2026-07-11', '2026-07-11')).toEqual(['v']);
+  });
+
+  it('多张签证行取最早的 visaIntendedDate（与航班/酒店同为「最早」口径）', () => {
+    const multi = {
+      id: 'vm',
+      // 顺序刻意先晚后早，验证取的是「最早」而非「第一条」。
+      items: [visaItem('2026-07-20T00:00:00Z'), visaItem('2026-07-11T00:00:00Z')],
+    };
+    expect(filterOrderIdsByDepartDate([multi], '2026-07-11', '2026-07-11')).toEqual(['vm']);
+    expect(filterOrderIdsByDepartDate([multi], '2026-07-20', '2026-07-20')).toEqual([]);
+  });
+
+  it('回退是分级的：有航班就不看签证日期，有酒店也优先于签证日期', () => {
+    // 航班 7/10 + 签证预计 7/20 → 整单出发日 = 7/10（航班优先）
+    const withFlight = {
+      id: 'wf',
+      items: [flightItem('2026-07-10T08:00:00Z'), visaItem('2026-07-20T00:00:00Z')],
+    };
+    expect(filterOrderIdsByDepartDate([withFlight], '2026-07-10', '2026-07-10')).toEqual(['wf']);
+    expect(filterOrderIdsByDepartDate([withFlight], '2026-07-20', '2026-07-20')).toEqual([]);
+
+    // 无航班，酒店入住 7/12 + 签证预计 7/20 → 整单出发日 = 7/12（酒店优先于签证）
+    const withHotel = {
+      id: 'wh',
+      items: [hotelItem('2026-07-12T00:00:00Z'), visaItem('2026-07-20T00:00:00Z')],
+    };
+    expect(filterOrderIdsByDepartDate([withHotel], '2026-07-12', '2026-07-12')).toEqual(['wh']);
+    expect(filterOrderIdsByDepartDate([withHotel], '2026-07-20', '2026-07-20')).toEqual([]);
+  });
+
+  it('签证行没填预计出行日期 → 仍无锚点，列表口径不命中（导出口径才保留，见 export-depart-filter）', () => {
+    const noDate = {
+      id: 'vn',
+      items: [{ hotelCheckIn: null, flightSchedule: null, visaIntendedDate: null }],
+    };
+    expect(filterOrderIdsByDepartDate([noDate], '2026-07-11', '2026-07-11')).toEqual([]);
+    // 不给窗口也一样不命中——「无锚点」是订单自身属性，与窗口无关。
+    expect(filterOrderIdsByDepartDate([noDate], undefined, undefined)).toEqual([]);
   });
 });
 

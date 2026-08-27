@@ -206,6 +206,8 @@ describe('listDeletedOrders · search 分词（与主列表同口径：词间 AN
           },
         },
       },
+      // 产品名（订单项名称）：回收站与主列表同口径，一起吃这一支。
+      { items: { some: { description: { contains: term, mode: 'insensitive' } } } },
     ],
   });
 

@@ -605,11 +605,16 @@ export async function buildMasterExportWorkbook(
   // 按出发日期区间选单：复用 buildOrderFilterWhere 的 travelFrom/travelTo 口径，
   // 再强制排除释放型状态。与整班/全岗导出选单方式一致。
   // 勾选导出：orderIds 给了就以 id 集合为准（buildOrderFilterWhere 内部忽略 from/to）。
-  const where = buildOrderFilterWhere({
-    travelFrom: query.from,
-    travelTo: query.to,
-    orderIds: query.orderIds,
-  } as Parameters<typeof buildOrderFilterWhere>[0]);
+  // includeAnchorless：导出口径要「无锚点单也取回」（没有任何日期的纯签证单同样得交到岗位手上），
+  // 取回后由下面的 filterExportOrdersByDepartDate 按导出口径兜底保留。列表路径不传，维持排除。
+  const where = buildOrderFilterWhere(
+    {
+      travelFrom: query.from,
+      travelTo: query.to,
+      orderIds: query.orderIds,
+    } as Parameters<typeof buildOrderFilterWhere>[0],
+    { includeAnchorless: true },
+  );
   const and = Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : [];
   and.push({ status: { in: COUNTED_STATUSES } });
   where.AND = and;

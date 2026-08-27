@@ -529,9 +529,14 @@ describe('OrderService.swapPassenger · 真 DB E2E', () => {
     const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
     expect(reloaded.invoiceStatus).toBe(InvoiceStatus.NONE);
 
-    // resetVisa → VISA 任务回 PENDING（completedAt 清空）
+    // resetVisa → VISA 任务先回 PENDING（completedAt 清空，见下方 result.audit.visaTasksReset=1），
+    // 随后被同一事务里的签证任务同步收尾成 CANCELLED —— 本例换入的是**自备签**出行人
+    // （visaExempt: true），且本单是纯机票单（无 VISA 行、订单级也未标需签），按权威口径
+    // （visa-need.ts）已经没有一位乘客要我方代办：留着这条待处理任务，签证岗点进去是零乘客的
+    // 空壳（签证台按 visaExempt=false 过滤乘客）。「自备签」与「重置签证」两个意图冲突时，
+    // 以重算结果为准。同步只动 PENDING，IN_PROGRESS/CONFIRMED 的任务不受影响。
     const task = await prisma.fulfillmentTask.findUniqueOrThrow({ where: { id: visaTask.id } });
-    expect(task.status).toBe(FulfillmentStatus.PENDING);
+    expect(task.status).toBe(FulfillmentStatus.CANCELLED);
     expect(task.completedAt).toBeNull();
 
     // 换人费 → adjustmentCny + 流水 SWAP_FEE

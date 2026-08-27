@@ -1008,6 +1008,14 @@ describe('filterExportOrdersByDepartDate（出发日精确细筛）', () => {
     flightSchedule: null,
     hotelCheckIn: new Date(`${checkIn}T00:00:00.000Z`),
   });
+  // 纯签证行：没有航班也没有入住日，「预计出行日期」就是它唯一的出发日锚点。
+  // 与 hotelCheckIn 同为 @db.Date，存 UTC 零点。
+  const visa = (intendedDate: string) => ({
+    kind: 'VISA',
+    flightSchedule: null,
+    hotelCheckIn: null,
+    visaIntendedDate: new Date(`${intendedDate}T00:00:00.000Z`),
+  });
   const mkOrder = (id: string, items: unknown[]) => ({ id, items });
 
   it('去程 21 号、返程 22 号的往返单 → 按 22 号导出时被排除（整单出发日=21）', () => {
@@ -1037,13 +1045,26 @@ describe('filterExportOrdersByDepartDate（出发日精确细筛）', () => {
     expect(kept.map((o) => o.id)).toEqual(['hotel-in-22']);
   });
 
-  it('纯签证单（既无航班也无入住日）→ 无出发日，带出发区间导出时维持现状口径被排除', () => {
+  it('纯签证单填了预计出行日期 → 按该日期归日（22 号命中、21 号排除）', () => {
     const orders = [
-      mkOrder('visa-only', [{ kind: 'VISA', flightSchedule: null, hotelCheckIn: null }]),
-      mkOrder('depart-22', [flight('2026-07-22T09:00:00.000Z')]),
+      mkOrder('visa-intend-22', [visa('2026-07-22')]),
+      mkOrder('visa-intend-21', [visa('2026-07-21')]),
     ];
     const kept = filterExportOrdersByDepartDate(orders, '2026-07-22', '2026-07-22');
-    expect(kept.map((o) => o.id)).toEqual(['depart-22']);
+    expect(kept.map((o) => o.id)).toEqual(['visa-intend-22']);
+  });
+
+  it('纯签证单没填预计出行日期 → 无锚点，导出口径保留（不再被静默剔除）', () => {
+    const orders = [
+      mkOrder('visa-no-date', [
+        { kind: 'VISA', flightSchedule: null, hotelCheckIn: null, visaIntendedDate: null },
+      ]),
+      mkOrder('depart-22', [flight('2026-07-22T09:00:00.000Z')]),
+      // 有锚点但不在窗口内的单照旧剔除 ——「保留」只针对无锚点单，不是放弃过滤。
+      mkOrder('depart-21', [flight('2026-07-21T09:00:00.000Z')]),
+    ];
+    const kept = filterExportOrdersByDepartDate(orders, '2026-07-22', '2026-07-22');
+    expect(kept.map((o) => o.id)).toEqual(['visa-no-date', 'depart-22']);
   });
 
   it('未给 travelFrom/travelTo（如勾选/整班导出）→ 原样放行，不过滤', () => {

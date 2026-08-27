@@ -1534,6 +1534,11 @@ model OrderItem {
   hotelCheckOut    DateTime?     @db.Date
   transferId       String?
   visaId           String?
+  // 签证预计出行日期（可空）：纯签证单的业务日期锚点。
+  // 签证业务本身没有航班行、也没有酒店入住日，但办签一定有个「打算什么时候走」——录单时填这个
+  // 日期，订单「出发日」派生就有了第三级回退（最早航班 → 最早酒店入住 → 本列），按出发日期
+  // 区间导出不再把纯签证单静默漏掉。可空：老数据、以及行程尚未定的单继续留空。
+  visaIntendedDate DateTime?     @db.Date
   bundleId         String?
   // 按乘客调价（0722 公测反馈）：非空 = 本调整行只作用于该乘客的应收份额（金额明细逐人可解释）；
   // NULL = 整单调价（现行为不变）。仅对 metadata.priceAdjustment 行有意义；其它商品行一律 NULL。

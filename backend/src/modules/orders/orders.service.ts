@@ -893,6 +893,8 @@ type PricedOrderItem = {
   hotelCheckOut?: Date;
   transferId?: string;
   visaId?: string;
+  /** 签证预计出行日期（VISA 行专用，可空）：纯签证单的出发日锚点，见 deriveOrderDepartDate 第三级回退。 */
+  visaIntendedDate?: Date;
   bundleId?: string;
   roomsBilled?: number;
   settlementAddOnCny?: number;
@@ -1524,6 +1526,8 @@ export class OrderService {
               hotelCheckOut: p.hotelCheckOut ?? null,
               transferId: p.transferId ?? null,
               visaId: p.visaId ?? null,
+              // 签证预计出行日期：纯签证单的出发日锚点（非 VISA 行恒 null）
+              visaIntendedDate: p.visaIntendedDate ?? null,
               bundleId: p.bundleId ?? null,
               // 计费房间数（支持 0.5 间）：套餐/酒店行解析后落库，供房控读取。
               roomsBilled: p.roomsBilled != null ? new Prisma.Decimal(p.roomsBilled) : null,
@@ -2703,6 +2707,9 @@ export class OrderService {
           unitPrice,
           amount: Math.round(unitPrice * item.quantity),
           visaId: item.visaId,
+          // 预计出行日期（可空）：纯签证单的出发日锚点。与 hotelCheckIn 同款解析——
+          // 'YYYY-MM-DD' → UTC 零点，落 @db.Date 列不会被时区推前/推后一天。
+          visaIntendedDate: item.visaIntendedDate ? new Date(item.visaIntendedDate) : undefined,
           unitCostCny: visaUnitCost,
           totalCostCny:
             visaUnitCost != null ? Math.round(visaUnitCost * item.quantity) : undefined,
@@ -7576,6 +7583,17 @@ export class OrderService {
         visaTasksReset = reset.count;
       }
 
+      // ── 3b. 自备签变更 → 签证任务事件驱动同步（条10）────────────────────────
+      // 换人通道是「乘客级自备签」在存量订单上的唯一写入口（改自备签的 PATCH 会被
+      // resolvePassengerPatchChannel 判成换人语义、走到这里；证件号变化的真换人也会把
+      // visaExempt 强制回落 false）。旧行为只补不删：全员改成自备签之后，那条 PENDING
+      // 签证任务还挂在签证台上永远办不掉；反过来最后一位自备签客人换成随团办签时，
+      // 又没人给他补任务。这里按权威口径重算一次，把任务对齐到最新需求。
+      // 只在自备签真的变了时才跑——没变就没有新事件，不给每次换人平白加几次查询。
+      if (oldVisaExempt !== newVisaExempt) {
+        await syncVisaTasksForOrder(tx, orderId, { userId: actor.userId, role: actor.role });
+      }
+
       // ── 4. 售后费用流水：换人价回滚（SWAP_VISA_DEDUCT_REVERSAL）+ 换人费（SWAP_FEE）合并写一次 ──
       // 两项都进 adjustmentCny，合并成一次 order.update（避免先后两写彼此覆盖 adjustments 数组）。
       const swapAdjustments: OrderAdjustmentEntry[] = [];
@@ -8734,6 +8752,9 @@ export class OrderService {
       let description: string;
       let hotelCheckIn: Date | null = null;
       let hotelCheckOut: Date | null = null;
+      // 签证行的「预计出行日期」锚点（可空）：纯签证单派生整单出发日的第三级回退，
+      // 与建单路径落的是同一列，按出发日期区间导出才捞得到后补的签证单。
+      let visaIntendedDate: Date | null = null;
       let visaTaskCreated = false;
 
       if (input.kind === 'VISA') {
@@ -8761,6 +8782,16 @@ export class OrderService {
         quantity = input.quantity ?? (await tx.passenger.count({ where: { orderId } }));
         if (quantity < 1) throw new BadRequestError('该订单没有乘客，无法按人数补录签证');
         description = `${productName} × ${quantity}人`;
+        // @db.Date 列：按 UTC 零点写入（与建单路径、hotelCheckIn 同款），不折时区。
+        if (input.visaIntendedDate) {
+          visaIntendedDate = new Date(`${input.visaIntendedDate}T00:00:00.000Z`);
+          if (
+            Number.isNaN(visaIntendedDate.getTime()) ||
+            visaIntendedDate.toISOString().slice(0, 10) !== input.visaIntendedDate
+          ) {
+            throw new BadRequestError('预计出行日期无效');
+          }
+        }
       } else {
         const roomType = await tx.hotelRoomType.findUnique({
           where: { id: input.hotelRoomTypeId },
@@ -8845,6 +8876,7 @@ export class OrderService {
           hotelCheckIn,
           hotelCheckOut,
           visaId: input.kind === 'VISA' ? input.visaId : null,
+          visaIntendedDate,
           roomsBilled: input.kind === 'HOTEL' ? new Prisma.Decimal(rooms!) : null,
           metadata: {
             source: 'ORDER_GROUND_ITEM',
@@ -9403,7 +9435,10 @@ export function splitSearchTerms(search: string): string[] {
  * - 订单号 / 联系人 / 联系电话（历史字段，保持原语义）；
  * - 乘客中/英文名（公测反馈：搜索框要能按乘客姓名搜到订单）；
  * - 乘客护照号 documentNumber（运营需求：按证件号定位订单）；
- * - 订单级备注六栏 notes/internalNotes/noteHotel/noteVisa/notePayment/noteSpecial。
+ * - 订单级备注六栏 notes/internalNotes/noteHotel/noteVisa/notePayment/noteSpecial；
+ * - 订单项名称 OrderItem.description（公测反馈：搜产品名/酒店名/签证名要能搜到订单）——
+ *   运营记得住「客人买的是哪个产品」的次数，不比记得住订单号少；此前搜索只认订单号/人/备注，
+ *   按产品名搜一律空手而归。与乘客子查询同构（items.some.description），词间 AND 语义不变。
  * 导出：主列表与回收站（listDeletedOrders）共用本口径，另供单测断言 where 形状。
  */
 export function buildSearchTermClause(term: string): Prisma.OrderWhereInput {
@@ -9429,6 +9464,8 @@ export function buildSearchTermClause(term: string): Prisma.OrderWhereInput {
           },
         },
       },
+      // 产品名（航段/酒店/签证/套餐的行描述）——任一订单项命中即命中该订单。
+      { items: { some: { description: { contains: term, mode: 'insensitive' } } } },
     ],
   };
 }
@@ -9443,8 +9480,14 @@ export const GUEST_RECORDED_BY_LABEL = '散客';
  * 把列表/导出共用的筛选参数转成 Prisma where。
  * listOrders 与 orders.export-templates.ts 三模板导出共用，避免两处过滤逻辑漂移。
  * 注意：不含 RBAC（userId/可见代理集合）、claimedById/unclaimedOnly、分页 —— 由调用方叠加。
+ *
+ * @param options.includeAnchorless 仅导出路径传 true —— 出行日期筛选时把「一个日期锚点都没有」
+ *   的订单也召回（详见下方 travelFrom/travelTo 分支）。列表路径保持默认 false。
  */
-export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWhereInput {
+export function buildOrderFilterWhere(
+  query: OrderListFilters,
+  options?: { includeAnchorless?: boolean },
+): Prisma.OrderWhereInput {
   // 勾选导出：给了 orderIds 就以「勾选的 id 集合」为准，忽略其余筛选条件
   //（导出=用户勾了哪些就导哪些；不计数状态的 COUNTED_STATUSES 保护由各导出入口叠加）。
   // deletedAt: null —— 已软删的订单即便被显式勾中也不导出（从所有列表/导出里消失）。
@@ -9481,28 +9524,51 @@ export function buildOrderFilterWhere(query: OrderListFilters): Prisma.OrderWher
     const end = query.travelTo
       ? new Date(new Date(`${query.travelTo}T23:59:59Z`).getTime() + DAY_MS)
       : undefined;
-    andClauses.push({
+    const withinWindow = {
+      ...(start ? { gte: start } : {}),
+      ...(end ? { lte: end } : {}),
+    };
+    const anchoredInWindow: Prisma.OrderWhereInput = {
       items: {
         some: {
           OR: [
-            {
-              flightSchedule: {
-                departureTime: {
-                  ...(start ? { gte: start } : {}),
-                  ...(end ? { lte: end } : {}),
-                },
-              },
-            },
-            {
-              hotelCheckIn: {
-                ...(start ? { gte: start } : {}),
-                ...(end ? { lte: end } : {}),
-              },
-            },
+            { flightSchedule: { departureTime: withinWindow } },
+            { hotelCheckIn: withinWindow },
+            // 签证行的「预计出行日期」—— 纯签证单（无航班、无住宿）唯一的日期锚点。
+            // 缺了这一支，填了预计出行日期的签证单照样取不回来，
+            // 与「出发日期」列的派生口径（deriveOrderDepartDate 第三级回退）也对不上。
+            { visaIntendedDate: withinWindow },
           ],
         },
       },
-    });
+    };
+    // ── 无锚点单：仅导出路径召回 ────────────────────────────────────────────
+    // 「锚点」= 能派生出整单出发日的字段，三选一：航段出发时间 / 酒店入住日 / 签证预计出行日期。
+    // 一条锚点都没有的单（典型：还没填预计出行日期的纯签证单）在上面的 some 里必然落空。
+    //   导出 —— 要召回：导出是「把这批单交出去办事」，静默漏掉等于签证岗整批看不到自己的单；
+    //     召回后由 orders.export-depart-filter.ts 的内存过滤按「无锚点保留」口径兜底。
+    //   列表 —— 不召回：列表的日期筛选是「找某天走的单」，无日期单若无条件保留就会出现在
+    //     每一个日期区间里，筛选失效（口径详见 filterOrderIdsByDepartDate 注释）。
+    andClauses.push(
+      options?.includeAnchorless
+        ? {
+            OR: [
+              anchoredInWindow,
+              {
+                items: {
+                  none: {
+                    OR: [
+                      { flightScheduleId: { not: null } },
+                      { hotelCheckIn: { not: null } },
+                      { visaIntendedDate: { not: null } },
+                    ],
+                  },
+                },
+              },
+            ],
+          }
+        : anchoredInWindow,
+    );
   }
   // 精确按班次：订单需含该班次的 FLIGHT 行。整班·全岗导出专用——比 travelFrom/travelTo 精确，
   // 不受出行日期窗口 ±1 天放宽影响，保证只导该班次当天的订单。
@@ -10866,17 +10932,27 @@ function formatDateOnly(d: Date, tz?: string | null): string {
 
 /**
  * 订单「出发日期」派生（列表列展示用；YYYY-MM-DD 或 null）。
- * 口径：本单 FLIGHT 行里最早班次的当地出发日；无航班的纯地面单回退到最早的酒店入住日；
- * 两者都没有 → null（前端显示「—」）。
+ * 口径（三级回退，依次取第一个有值的）：
+ *   1. 本单 FLIGHT 行里最早班次的当地出发日；
+ *   2. 无航班的纯地面单 → 最早的酒店入住日；
+ *   3. 既无航班也无酒店（纯签证单）→ 最早 VISA 行的「预计出行日期」visaIntendedDate。
+ * 三级都没有 → null（前端显示「—」）。
+ *
+ * 第三级的由来（反馈：签证岗）：签证业务必有「预计出行日期」这个业务锚点，只是从前没有字段可落，
+ * 于是纯签证单永远派生不出出发日、被带出发日期区间的导出静默漏掉。字段可空 —— 老数据和行程
+ * 未定的单仍回落 null，行为与扩展前一致。
+ *
  * 依赖已联查的行数据，不另发查询；未联查 flightSchedule（如扁平 items:true）时航班部分
- * 安全落空，仅按酒店入住日回退。
+ * 安全落空，按后两级回退。
  */
+// 注：导出在文件末尾的 `export { createCommissionsForOrder, deriveOrderDepartDate }` 统一给出。
 function deriveOrderDepartDate(items: ReadonlyArray<Record<string, unknown>>): string | null {
   let earliestFlight: Date | null = null;
   // 最早那段航班的出发地时区——出发日要按它折，不是按 UTC（当地凌晨起飞的红眼班次
   // UTC 还停在前一天，按 UTC 算会把出发日期写早一天）。未联查 tz 时为 null → 回退 UTC。
   let earliestFlightTz: string | null = null;
   let earliestHotel: Date | null = null;
+  let earliestVisa: Date | null = null;
   for (const i of items) {
     const schedule = i.flightSchedule as
       | { departureTime?: Date | string; departureTz?: string | null }
@@ -10896,18 +10972,36 @@ function deriveOrderDepartDate(items: ReadonlyArray<Record<string, unknown>>): s
         earliestHotel = d;
       }
     }
+    // 签证行的「预计出行日期」——第三级回退用；只有前两级都落空时才会被采纳。
+    const visaDate = i.visaIntendedDate as Date | string | null | undefined;
+    if (visaDate) {
+      const d = new Date(visaDate);
+      if (!Number.isNaN(d.getTime()) && (earliestVisa === null || d < earliestVisa)) {
+        earliestVisa = d;
+      }
+    }
   }
-  // 航班优先按出发地当地日；回退到酒店入住日时用 UTC（@db.Date 存的就是 UTC 零点）
+  // 航班优先按出发地当地日；回退到酒店入住日 / 签证预计出行日时用 UTC
+  // （两者都是 @db.Date，存的就是 UTC 零点，再折时区反而会漂一天）
   if (earliestFlight) return formatDateOnly(earliestFlight, earliestFlightTz);
-  return earliestHotel ? formatDateOnly(earliestHotel) : null;
+  if (earliestHotel) return formatDateOnly(earliestHotel);
+  return earliestVisa ? formatDateOnly(earliestVisa) : null;
 }
 
 /**
  * 出行日期精确细筛：把「粗窗口候选订单」按整单出发日（deriveOrderDepartDate 同口径）精确
  * 过滤到 [travelFrom, travelTo] 内，返回命中的订单 id。
  * 口径复用 deriveOrderDepartDate（列表「出发日期」列同一函数）——保证「列表所见 = 筛选所得」。
- *   无出发日（既无航班也无酒店）→ 不命中；YYYY-MM-DD 字符串按字典序即日期序，可直接比较。
+ *   无出发日（航班/酒店/签证预计出行日三级全空）→ **不命中**；
+ *   YYYY-MM-DD 字符串按字典序即日期序，可直接比较。
  * 两端半闭区间含边界（travelFrom/travelTo 各自可选）。导出供 listOrders 调用 + 单测。
+ *
+ * ⚠️ 与导出侧口径**故意不同**，别顺手统一：
+ *   本函数（列表筛选）—— 无锚点单**排除**。列表的日期筛选是「找某天走的单」，一张没有任何
+ *     日期的单若无条件保留，就会出现在**每一个**日期区间的结果里，等于筛选失效。
+ *   filterExportOrdersByDepartDate（导出，见 orders.export-depart-filter.ts）—— 无锚点单**保留**。
+ *     导出是「把这批单交出去办事」，宁可多带一张也不能让签证岗的单整批消失；且与签证台看板
+ *     （fulfillment.service 对纯签证单的保护）口径一致。
  */
 export function filterOrderIdsByDepartDate(
   candidates: ReadonlyArray<{ id: string; items: ReadonlyArray<Record<string, unknown>> }>,
@@ -11556,7 +11650,7 @@ function maskedItemTravelDate(it: {
 void PaymentMethod;
 
 // ── Fulfillment 任务生成（PAID 时触发） ─────────────────────────
-import { FulfillmentStatus, FulfillmentType } from '@prisma/client';
+import { FulfillmentStatus, FulfillmentType, type VisaRequirement } from '@prisma/client';
 
 // 非套餐订单项：一行 → 一个对应岗任务。
 const KIND_TO_FULFILLMENT_TYPE: Partial<Record<OrderItemKind, FulfillmentType>> = {
@@ -11723,6 +11817,39 @@ async function createFulfillmentTasks(tx: Prisma.TransactionClient, orderId: str
 }
 
 /**
+ * 签证任务锚点解析 —— 回答两件事：「本单商品级涉不涉签」+「签证任务该挂在哪一行」。
+ *
+ * FulfillmentTask 只有 orderItemId 外键、没有 Order 直挂，所以订单级需签的单也得找一行挂着。
+ * 优先级（建单路径与事件驱动同步共用，保证同一单永远挑同一行，不会挂出两条锚点不同的任务）：
+ *   1. VISA 订单项；
+ *   2. 含签证组件的 BUNDLE 订单项；
+ *   3. 订单级 visaStatus 需签时的首个订单项（兜底）。
+ *
+ * `hasVisaScope` 只表示**商品级**涉签（前两级命中）——订单级那根轴由调用方把 visaStatus
+ * 一并交给 orderNeedsVisaTask 判定，两根轴不在此处提前合流，免得口径糊在一起。
+ */
+async function resolveVisaTaskAnchor(
+  tx: Prisma.TransactionClient,
+  items: ReadonlyArray<{ id: string; kind: OrderItemKind; bundleId: string | null }>,
+  visaStatus: VisaRequirement | null | undefined,
+): Promise<{ anchorItemId: string | null; hasVisaScope: boolean }> {
+  if (items.length === 0) return { anchorItemId: null, hasVisaScope: false };
+  const visaItem = items.find((item) => item.kind === OrderItemKind.VISA);
+  if (visaItem) return { anchorItemId: visaItem.id, hasVisaScope: true };
+  for (const item of items) {
+    if (item.kind !== OrderItemKind.BUNDLE) continue;
+    const types = await resolveBundleFulfillmentTypes(tx, item.bundleId);
+    if (types.includes(FulfillmentType.VISA_APPLICATION)) {
+      return { anchorItemId: item.id, hasVisaScope: true };
+    }
+  }
+  if (orderVisaStatusRequiresVisa(visaStatus)) {
+    return { anchorItemId: items[0].id, hasVisaScope: false };
+  }
+  return { anchorItemId: null, hasVisaScope: false };
+}
+
+/**
  * 下单（CREATE）时即建签证任务 —— 让「录进去但还没付款」的需签证单也能进签证台。
  *
  * 背景：完整履约任务（机票/酒店/接送/签证）在 PAID 时才由 createFulfillmentTasks 生成，
@@ -11764,26 +11891,7 @@ async function createVisaTaskAtCreation(
   if (alreadyHasVisaTask) return [];
 
   // 锚点选择（与 PAID 路径一致）：优先 VISA 项 → 含签证套餐项 → 订单级需签时首个订单项
-  let anchorItemId: string | null = null;
-  const visaItem = items.find((item) => item.kind === OrderItemKind.VISA);
-  if (visaItem) {
-    anchorItemId = visaItem.id;
-  } else {
-    for (const item of items) {
-      if (item.kind !== OrderItemKind.BUNDLE) continue;
-      const types = await resolveBundleFulfillmentTypes(tx, item.bundleId);
-      if (types.includes(FulfillmentType.VISA_APPLICATION)) {
-        anchorItemId = item.id;
-        break;
-      }
-    }
-  }
-  // 订单级「需要签证」兜底：挂到首个订单项。判定与 PAID 路径（createFulfillmentTasks）
-  // 共用 visa-need.ts 的 orderNeedsVisaTask，保证两条路径触发条件相同、重跑 PAID 幂等、
-  // 不产生不对称的兜底缺口。
-  if (!anchorItemId && orderVisaStatusRequiresVisa(order?.visaStatus)) {
-    anchorItemId = items[0].id;
-  }
+  const { anchorItemId } = await resolveVisaTaskAnchor(tx, items, order?.visaStatus);
   if (!anchorItemId) return [];
 
   // 乘客级一票否决：全员自备签 → 不建（与 PAID 路径同一判定）。
@@ -11812,7 +11920,171 @@ async function createVisaTaskAtCreation(
   return [task.id];
 }
 
-export { createFulfillmentTasks, resolveBundleFulfillmentTypes, createVisaTaskAtCreation };
+/** 某订单「签证任务该是什么样」的只读快照（判定 + 现状），见 evaluateOrderVisaTaskState。 */
+export interface OrderVisaTaskState {
+  orderNumber: string;
+  visaStatus: VisaRequirement | null;
+  /** 权威判定（visa-need.ts 的 orderNeedsVisaTask）：本单还要不要我方代办签证。 */
+  needed: boolean;
+  /** 需要建任务时该挂的订单项；null = 无处可挂（如空订单项的单）。 */
+  anchorItemId: string | null;
+  passengerCount: number;
+  /** 本单现存的全部签证任务（含各自状态，CANCELLED 也在内）。 */
+  visaTasks: Array<{ id: string; status: FulfillmentStatus }>;
+}
+
+/**
+ * 只读重算「本单的签证任务该是什么样」—— 判定与现状一并返回，一行库都不写。
+ *
+ * syncVisaTasksForOrder（写侧）与存量清理脚本的 dry-run 共用本函数：
+ * 预览看到的判定，就是 --apply 会依据的那个判定，两边不会各算一套。
+ * 订单不存在 → null。
+ */
+async function evaluateOrderVisaTaskState(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+): Promise<OrderVisaTaskState | null> {
+  const order = await tx.order.findUnique({
+    where: { id: orderId },
+    select: { visaStatus: true, orderNumber: true },
+  });
+  if (!order) return null;
+
+  const items = await tx.orderItem.findMany({
+    where: { orderId },
+    select: {
+      id: true,
+      kind: true,
+      bundleId: true,
+      fulfillmentTasks: { select: { id: true, type: true, status: true } },
+    },
+  });
+  const passengers = await tx.passenger.findMany({
+    where: { orderId },
+    select: { visaExempt: true },
+  });
+  const { anchorItemId, hasVisaScope } = await resolveVisaTaskAnchor(tx, items, order.visaStatus);
+  return {
+    orderNumber: order.orderNumber,
+    visaStatus: order.visaStatus,
+    needed: orderNeedsVisaTask({ visaStatus: order.visaStatus, hasVisaScope, passengers }),
+    anchorItemId,
+    passengerCount: passengers.length,
+    visaTasks: items.flatMap((item) =>
+      item.fulfillmentTasks
+        .filter((t) => t.type === FulfillmentType.VISA_APPLICATION)
+        .map((t) => ({ id: t.id, status: t.status })),
+    ),
+  };
+}
+
+/** syncVisaTasksForOrder 的执行结果（供调用方审计/回显，脚本按此打印清单）。 */
+export interface VisaTaskSyncResult {
+  /** 重算后的权威判定：本单还要不要我方代办签证。 */
+  needed: boolean;
+  /** 本次被自动撤销（PENDING → CANCELLED）的签证任务 id。 */
+  cancelledTaskIds: string[];
+  /** 本次被自动补建（PENDING）的签证任务 id。 */
+  createdTaskIds: string[];
+}
+
+/**
+ * 签证任务事件驱动同步 —— 「需求变了，任务跟着变」。
+ *
+ * 背景：建任务的三条路径（建单 createVisaTaskAtCreation / PAID createFulfillmentTasks /
+ * 补录地面项 addGroundItem）全是**只补不删**。于是把订单改成「不需要签证」、或把乘客全部
+ * 改成自备签之后，早先建的那条 PENDING 任务还挂在签证台上，签证岗看到的是一条永远办不掉的
+ * 「待处理」——点进去还是零乘客（签证台按 visaExempt=false 过滤乘客展示）。
+ *
+ * 本函数按 visa-need.ts 的权威口径（orderNeedsVisaTask：订单级需签 或 商品级涉签，且至少
+ * 一位乘客要我方代办）重算，并把任务对齐到这个结论：
+ *   - 不需要 → 该单**仅 PENDING（还没人动手）**的签证任务置 CANCELLED；
+ *     IN_PROGRESS / CONFIRMED / FAILED 一律不碰（已经在办、或已出结果的活不能被系统悄悄抹掉，
+ *     要撤得由签证岗自己判断）；CANCELLED 本就是终态，同样不碰。
+ *   - 需要但一条「活动」任务都没有 → 按与建单同一套锚点逻辑补建一条 PENDING。
+ *
+ * 幂等：结论与现状一致时零写入；重复调用不会重复建、也不会把同一条任务撤两次
+ *（updateMany 的 where 二次卡 status=PENDING，与并发的签证岗接单严格串行）。
+ *
+ * 事务：接受 tx（挂接点都在各自事务内调用，判定与写入之间没有窗口）。审计走全局 prisma
+ * 的 fire-and-forget（与本文件其它审计同款），**不进业务事务**——事务回滚时审计不回滚，
+ * 宁可多一条「系统撤了任务」的记录，也不要主流程被审计写入拖挂。
+ */
+async function syncVisaTasksForOrder(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  actor?: { userId?: string; label?: string; role?: UserRole | 'SYSTEM' },
+): Promise<VisaTaskSyncResult> {
+  const empty: VisaTaskSyncResult = { needed: false, cancelledTaskIds: [], createdTaskIds: [] };
+  const state = await evaluateOrderVisaTaskState(tx, orderId);
+  if (!state) return empty;
+  const { needed, anchorItemId, visaTasks, passengerCount } = state;
+
+  if (!needed) {
+    const pendingIds = visaTasks
+      .filter((t) => t.status === FulfillmentStatus.PENDING)
+      .map((t) => t.id);
+    if (pendingIds.length === 0) return { ...empty, needed: false };
+    await tx.fulfillmentTask.updateMany({
+      // where 再卡一次 PENDING：判定与写入之间若有签证岗并发接单（PENDING→IN_PROGRESS），
+      // 这条 update 自然落空，绝不把「已经在办」的活撤掉。
+      where: { id: { in: pendingIds }, status: FulfillmentStatus.PENDING },
+      data: { status: FulfillmentStatus.CANCELLED },
+    });
+    void writeAudit({
+      actor: { role: 'SYSTEM', ...actor },
+      action: 'VISA_TASK_AUTO_CANCELLED',
+      targetType: AuditTargetType.ORDER,
+      targetId: orderId,
+      targetLabel: state.orderNumber,
+      after: {
+        reason: '订单已不需要我方代办签证（订单级签证状态改为不需要 / 全员自备签）',
+        taskIds: pendingIds,
+        visaStatus: state.visaStatus,
+        passengerCount,
+      },
+      severity: AuditSeverity.INFO,
+    });
+    return { needed: false, cancelledTaskIds: pendingIds, createdTaskIds: [] };
+  }
+
+  // 需要签证：已有任一「活动」任务（非 CANCELLED）就什么都不做——幂等，且不与
+  // 签证岗手上正在办的那条抢。CANCELLED 视为不存在（可能正是上一轮本函数撤的），
+  // 需求改回来时按锚点重新补建一条 PENDING，而不是去复活终态任务。
+  const hasActiveVisaTask = visaTasks.some((t) => t.status !== FulfillmentStatus.CANCELLED);
+  if (hasActiveVisaTask || !anchorItemId) return { ...empty, needed: true };
+
+  const task = await tx.fulfillmentTask.create({
+    data: {
+      orderItemId: anchorItemId,
+      type: FulfillmentType.VISA_APPLICATION,
+      status: FulfillmentStatus.PENDING,
+    },
+  });
+  void writeAudit({
+    actor: { role: 'SYSTEM', ...actor },
+    action: 'VISA_TASK_AUTO_RECREATED',
+    targetType: AuditTargetType.ORDER,
+    targetId: orderId,
+    targetLabel: state.orderNumber,
+    after: {
+      reason: '订单重新需要我方代办签证，已补建待处理签证任务',
+      taskIds: [task.id],
+      visaStatus: state.visaStatus,
+      passengerCount,
+    },
+    severity: AuditSeverity.INFO,
+  });
+  return { needed: true, cancelledTaskIds: [], createdTaskIds: [task.id] };
+}
+
+export {
+  createFulfillmentTasks,
+  resolveBundleFulfillmentTypes,
+  createVisaTaskAtCreation,
+  evaluateOrderVisaTaskState,
+  syncVisaTasksForOrder,
+};
 
 // ════════════════════════════════════════════════════════════════════
 // 佣金链路计算 — 当订单转 PAID 时调用，为卖家代理 + 所有上级代理创建 CommissionRecord

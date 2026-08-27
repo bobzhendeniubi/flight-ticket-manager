@@ -10,7 +10,13 @@ import type { FastifyPluginAsync } from 'fastify';
 import { localDateISO } from '../../lib/flight-time.js';
 import { z } from 'zod';
 import { Prisma, UserRole, type Passenger } from '@prisma/client';
-import { buildStayNightDates, OrderService, resolveOrderAgentId, type OrderRequester } from './orders.service.js';
+import {
+  buildStayNightDates,
+  OrderService,
+  resolveOrderAgentId,
+  syncVisaTasksForOrder,
+  type OrderRequester,
+} from './orders.service.js';
 import { assertHotelPhysicalFitWithinTx } from '../hotel-control/hotel-control.service.js';
 import {
   batchCreateOrdersBodySchema,
@@ -1304,6 +1310,14 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       },
       after: body,
     });
+    // 订单级签证状态变更 → 签证任务事件驱动同步（条10）。
+    // 改成「不需要签证 / 客人已有签证」之后，早先建的那条 PENDING 签证任务不会自己消失，
+    // 签证台上会永远挂着一条办不掉的「待处理」；改回需签则要把任务补回来。
+    // 只在 visaStatus 真的变了时才跑（幂等，且不给纯改备注的请求平白加几次查询）；
+    // 批量改备注走的是同一个端点逐单调用，因此一并受益。
+    if (body.visaStatus !== undefined && body.visaStatus !== before.visaStatus) {
+      await syncVisaTasksForOrder(prisma, id, { userId: req.user.sub, role });
+    }
     return { ok: true };
   });
 

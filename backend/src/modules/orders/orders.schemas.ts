@@ -395,6 +395,10 @@ export const visaItemSchema = baseItemSchema.extend({
   kind: z.literal('VISA'),
   visaId: z.string().min(1).optional(),
   unitPrice: z.number().nonnegative(),
+  // 预计出行日期（可选，YYYY-MM-DD，与 hotelItemSchema.checkIn 同款校验）：签证业务的日期锚点。
+  // 纯签证单没有航班行、也没有酒店入住日；填了它，订单「出发日」派生才有得回退，
+  // 按出发日期区间导出才捞得到这单。留空 = 行程尚未定，行为与扩展前一致。
+  visaIntendedDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
 });
 
 export const bundleItemSchema = baseItemSchema.extend({
@@ -1171,6 +1175,13 @@ export const addGroundItemBodySchema = z.discriminatedUnion('kind', [
     kind: z.literal('VISA'),
     visaId: z.string().min(1, 'visaId 必填'),
     quantity: z.number().int().min(1).max(99).optional(),
+    // 预计出行日期（可选，YYYY-MM-DD）：与建单 visaItemSchema 同款字段与校验。
+    // 补录的签证行同样是订单「出发日」的第三级锚点——建单能填、补录填不了的话，
+    // 「先建单后补签证」的纯签证单按出发日期导出时仍旧派生不出日期。
+    visaIntendedDate: z
+      .string()
+      .regex(/^\d{4}-\d{2}-\d{2}$/u, '预计出行日期格式应为 YYYY-MM-DD')
+      .optional(),
   }),
   groundItemCommonSchema.extend({
     kind: z.literal('HOTEL'),
