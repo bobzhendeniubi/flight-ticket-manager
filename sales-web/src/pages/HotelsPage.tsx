@@ -1,6 +1,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
 import { api, type Hotel } from '../lib/api';
+import { businessToday } from '../lib/datetime';
 import { useCart } from '../stores/cart';
 import { Icon } from '../components/Icon';
 import { Img } from '../components/Img';
@@ -39,10 +40,9 @@ function basePriceNum(h: Hotel): number {
   return Number(h.basePrice ?? 0);
 }
 
+/** 入住/退房日默认值。按北京口径取「今天」再加天数，见 lib/datetime.ts。 */
 function todayISO(offsetDays = 0) {
-  const d = new Date();
-  d.setDate(d.getDate() + offsetDays);
-  return d.toISOString().slice(0, 10);
+  return businessToday(offsetDays);
 }
 
 export function HotelsPage() {

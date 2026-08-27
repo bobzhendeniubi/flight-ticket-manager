@@ -6,6 +6,7 @@ import { EmptyState } from '../components/EmptyState';
 import { RefundBadge } from '../components/RefundBadge';
 import { TrustBadges } from '../components/TrustBadges';
 import { localYmd } from '../lib/airports';
+import { formatDateTimeCn } from '../lib/datetime';
 
 /** 购物车条目按 kind 映射统一线性图标（取代存储的 emoji 渲染；不改 store 里的 emoji 字段） */
 const CART_KIND_ICON: Record<CartItem['kind'], IconName> = {
@@ -132,7 +133,7 @@ export function CartPage() {
                     </div>
                   )}
                   <p className="mt-1 text-xs text-ink-muted">
-                    加入时间 {new Date(i.addedAt).toLocaleString('zh-CN')}
+                    加入时间 {formatDateTimeCn(i.addedAt)}
                   </p>
                 </div>
                 {/* 手机端：qty/价格/删除 整体换到下一行（占满宽度，end 对齐） */}

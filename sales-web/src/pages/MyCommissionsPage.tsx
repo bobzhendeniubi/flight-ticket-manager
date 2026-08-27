@@ -23,6 +23,7 @@ import {
   type SettlementDetail,
   type SettlementStatus,
 } from '../lib/api';
+import { formatDateTimeCn } from '../lib/datetime';
 import { useAuth } from '../stores/auth';
 import { Icon } from '../components/Icon';
 
@@ -418,13 +419,9 @@ export function MyCommissionsPage() {
                 </section>
 
                 <section className="space-y-0.5 text-xs text-ink-muted">
-                  <div>生成于：{new Date(detail.generatedAt).toLocaleString('zh-CN')}</div>
-                  {detail.approvedAt && (
-                    <div>核准于：{new Date(detail.approvedAt).toLocaleString('zh-CN')}</div>
-                  )}
-                  {detail.paidAt && (
-                    <div>支付于：{new Date(detail.paidAt).toLocaleString('zh-CN')}</div>
-                  )}
+                  <div>生成于：{formatDateTimeCn(detail.generatedAt)}</div>
+                  {detail.approvedAt && <div>核准于：{formatDateTimeCn(detail.approvedAt)}</div>}
+                  {detail.paidAt && <div>支付于：{formatDateTimeCn(detail.paidAt)}</div>}
                   {detail.notes && <div>备注：{detail.notes}</div>}
                 </section>
 

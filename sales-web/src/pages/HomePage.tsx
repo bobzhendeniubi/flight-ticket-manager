@@ -10,6 +10,7 @@ import {
   formatLocalTime,
 } from '../lib/airports';
 import { DANANG_HIGHLIGHTS } from '../lib/content';
+import { businessToday } from '../lib/datetime';
 import { useDebouncedValue } from '../lib/useDebouncedValue';
 import { BenefitsStrip } from '../components/BenefitsStrip';
 import { FlightSeatCard } from '../components/FlightSeatCard';
@@ -51,10 +52,9 @@ function minSellablePrice(flight: FlightSearchResult, passengers: number): numbe
     );
 }
 
+/** 出发日/返程日的默认值。按北京口径取「今天」再加天数，见 lib/datetime.ts。 */
 function todayISO(offsetDays = 1): string {
-  const d = new Date();
-  d.setDate(d.getDate() + offsetDays);
-  return d.toISOString().slice(0, 10);
+  return businessToday(offsetDays);
 }
 
 export function HomePage() {

@@ -7,6 +7,7 @@ import {
   type HotelRoomType,
   type Review,
 } from '../lib/api';
+import { businessToday } from '../lib/datetime';
 import { useCart } from '../stores/cart';
 import { Icon } from '../components/Icon';
 import { Seo } from '../components/Seo';
@@ -38,10 +39,9 @@ const TIER_SCARCITY: Record<HotelAvailabilityTier, ScarcityKind> = {
 
 const REVIEWS_PER_PAGE = 5;
 
+/** 入住/退房日默认值。按北京口径取「今天」再加天数，见 lib/datetime.ts。 */
 function todayISO(offsetDays = 0): string {
-  const d = new Date();
-  d.setDate(d.getDate() + offsetDays);
-  return d.toISOString().slice(0, 10);
+  return businessToday(offsetDays);
 }
 
 function nightsBetween(checkIn: string, checkOut: string): number {

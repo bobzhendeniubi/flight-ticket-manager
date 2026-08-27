@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, type SellableDateReason } from './api';
+import { businessToday } from './datetime';
 
 /**
  * 单个套餐的可售日期窗口 —— 按 航班 + 酒店库存 逐日算，可设 blackout 封盘。
@@ -32,8 +33,12 @@ export interface BundleSellableDates {
   reasonOf: (iso: string) => SellableDateReason;
 }
 
+/**
+ * 可售日窗口的起点 = 北京口径的「今天」。
+ * 用 UTC 日会让北京时间早上 8 点前整体早一天，把已经飞掉的日期算成可订。
+ */
 function todayISO(): string {
-  return new Date().toISOString().slice(0, 10);
+  return businessToday();
 }
 
 function addDaysISO(iso: string, days: number): string {

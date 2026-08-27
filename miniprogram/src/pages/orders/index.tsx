@@ -6,6 +6,7 @@ import Taro, { useDidShow } from '@tarojs/taro';
 import { View, Text, ScrollView } from '@tarojs/components';
 import { api, ApiError } from '../../lib/api';
 import type { OrderSummary, OrderStatus } from '../../lib/types';
+import { formatDateCn } from '../../lib/datetime';
 import { useAuth } from '../../stores/auth';
 import './index.scss';
 
@@ -110,7 +111,7 @@ export default function OrdersPage() {
               {o.items.length > 2 && <Text className='more'>+{o.items.length - 2} 项</Text>}
             </View>
             <View className='order-footer'>
-              <Text className='order-date'>{o.createdAt.slice(0, 10)}</Text>
+              <Text className='order-date'>{formatDateCn(o.createdAt)}</Text>
               <Text className='text-price'>¥{Number(o.total).toLocaleString()}</Text>
             </View>
           </View>

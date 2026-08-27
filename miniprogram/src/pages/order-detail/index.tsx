@@ -15,6 +15,7 @@ import Taro from '@tarojs/taro';
 import { View, Text, ScrollView } from '@tarojs/components';
 import { api, ApiError } from '../../lib/api';
 import type { OrderSummary, OrderStatus } from '../../lib/types';
+import { formatDateTimeCn } from '../../lib/datetime';
 import { useAuth } from '../../stores/auth';
 import './index.scss';
 
@@ -141,7 +142,7 @@ export default function OrderDetailPage() {
         </View>
         <View className='line'>
           <Text className='k'>下单时间</Text>
-          <Text className='v'>{order.createdAt.slice(0, 19).replace('T', ' ')}</Text>
+          <Text className='v'>{formatDateTimeCn(order.createdAt)}</Text>
         </View>
         <View className='line'>
           <Text className='k'>联系人</Text>

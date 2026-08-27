@@ -12,6 +12,7 @@ import { Seo } from '../components/Seo';
 import { Breadcrumb } from '../components/Breadcrumb';
 import { PaymentPanel } from '../components/PaymentPanel';
 import { Icon, type IconName } from '../components/Icon';
+import { formatDateCn, formatPlainDate } from '../lib/datetime';
 
 // 订单状态中文标签（与 MyOrdersPage 保持一致）
 const STATUS_LABEL: Record<OrderStatus, string> = {
@@ -66,12 +67,14 @@ function fmt(v: unknown): string {
   return Number.isFinite(n) ? n.toLocaleString() : '0';
 }
 
-/** 出行日期格式化（null/非法时显示 '—'） */
-function fmtDate(iso: string | null): string {
-  if (!iso) return '—';
-  const d = new Date(iso);
-  return Number.isNaN(d.getTime()) ? '—' : d.toLocaleDateString('zh-CN');
-}
+/**
+ * 出行日期格式化（null/非法时显示 '—'）。
+ *
+ * travelDate 是后端已折算好的纯日期串（酒店入住日按 @db.Date 切、航班出发日按出发地时区折），
+ * 不能再交给 new Date(...).toLocaleDateString() 按设备时区渲染 —— 那会把 '2026-08-26'
+ * 当成 UTC 午夜，在负时区设备（如美西 UTC−7）上整单出行日集体早一天。
+ */
+const fmtTravelDate = (iso: string | null) => formatPlainDate(iso);
 
 type QueryState =
   | { kind: 'idle' }
@@ -247,7 +250,7 @@ function MaskedOrderCard({ order }: { order: MaskedOrder }) {
         <div className="text-right">
           <div className="price text-lg">¥{fmt(order.total)}</div>
           <div className="text-xs text-ink-muted">
-            下单于 {fmtDate(order.createdAt)}
+            下单于 {formatDateCn(order.createdAt)}
           </div>
         </div>
       </header>
@@ -275,7 +278,7 @@ function MaskedOrderCard({ order }: { order: MaskedOrder }) {
                 <div className="flex items-center gap-3">
                   {it.travelDate && (
                     <span className="inline-flex items-center gap-1 text-xs text-ink-soft">
-                      <Icon name="calendar" className="h-3.5 w-3.5" /> {fmtDate(it.travelDate)}
+                      <Icon name="calendar" className="h-3.5 w-3.5" /> {fmtTravelDate(it.travelDate)}
                     </span>
                   )}
                   <span className="font-semibold text-ink nums">¥{fmt(it.amount)}</span>
@@ -284,7 +287,7 @@ function MaskedOrderCard({ order }: { order: MaskedOrder }) {
               {it.flightChanged && (
                 <div className="mt-1.5 rounded-lg bg-rose-50 px-2.5 py-1.5 text-xs leading-relaxed text-rose-700">
                   航班有调整，请留意新的起飞时间
-                  {it.travelDate && <>：<span className="font-semibold">{fmtDate(it.travelDate)}</span></>}
+                  {it.travelDate && <>：<span className="font-semibold">{fmtTravelDate(it.travelDate)}</span></>}
                 </div>
               )}
             </li>

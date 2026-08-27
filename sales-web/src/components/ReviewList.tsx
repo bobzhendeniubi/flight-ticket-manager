@@ -1,6 +1,7 @@
 import { StarRating } from './StarRating';
 import { EmptyState } from './EmptyState';
 import { Icon } from './Icon';
+import { businessYmd } from '../lib/datetime';
 
 /**
  * 评价列表（对标 Klook/携程 单条评价卡）。
@@ -49,7 +50,8 @@ function relativeTime(iso: string): string {
   if (days === 1) return '昨天';
   if (days < 30) return `${days} 天前`;
   if (days < 365) return `${Math.floor(days / 30)} 个月前`;
-  return then.toISOString().slice(0, 10);
+  // 一年以上退回绝对日期：按北京时间切，别用 toISOString（那是 UTC，晚 8 点后会显示成前一天）
+  return businessYmd(then);
 }
 
 function ReviewSkeleton() {

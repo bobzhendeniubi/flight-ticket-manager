@@ -1,5 +1,6 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError } from '../lib/api';
+import { formatDateTimeCn } from '../lib/datetime';
 import { useAuth } from '../stores/auth';
 import { Icon } from '../components/Icon';
 import { Link } from 'react-router-dom';
@@ -82,8 +83,8 @@ export function ProfilePage() {
             ['手机号', user.phone ?? '—'],
             ['角色', ROLE_LABEL[user.role] ?? user.role],
             ['邮箱已验证', user.emailVerified ? '是' : '否'],
-            ['注册时间', new Date(user.createdAt).toLocaleString('zh-CN')],
-            ['上次登录', user.lastLoginAt ? new Date(user.lastLoginAt).toLocaleString('zh-CN') : '—'],
+            ['注册时间', formatDateTimeCn(user.createdAt)],
+            ['上次登录', formatDateTimeCn(user.lastLoginAt)],
           ].map(([label, value]) => (
             <div key={label} className="flex items-center justify-between gap-3 py-2.5 text-sm">
               <dt className="font-medium text-ink-muted">{label}</dt>

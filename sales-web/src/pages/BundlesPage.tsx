@@ -19,6 +19,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Link, useNavigate, useSearchParams } from 'react-router-dom';
 import { api, type Bundle as ApiBundle, type Hotel, type AvailabilityTier, type FlightSearchResult, type ProductRating } from '../lib/api';
 import { formatLocalTime } from '../lib/airports';
+import { businessToday } from '../lib/datetime';
 import { BED_TYPE_NOTE } from '../lib/notices';
 import { useDebouncedValue } from '../lib/useDebouncedValue';
 import { useFlightSearchCache, type FlightSearchCache, type FlightLeg } from '../lib/useFlightSearchCache';
@@ -217,10 +218,9 @@ function sortBundles(list: BundleView[], sort: SortKey): BundleView[] {
   return withIndex.map((w) => w.b);
 }
 
+/** 出发日默认值 / 日期选择器下限。按北京口径取「今天」再加天数，见 lib/datetime.ts。 */
 function todayISO(offset = 3) {
-  const d = new Date();
-  d.setDate(d.getDate() + offset);
-  return d.toISOString().slice(0, 10);
+  return businessToday(offset);
 }
 
 /** 在 YYYY-MM-DD 上加 n 天（按 UTC 零点，避开时区漂移）。*/

@@ -29,6 +29,7 @@ import {
   type WaitlistStatus,
 } from '../lib/api';
 import { CABIN_LABEL, formatLocalDate, formatLocalTime } from '../lib/airports';
+import { formatDateTimeCn } from '../lib/datetime';
 import { useAuth } from '../stores/auth';
 import { Icon, type IconName } from '../components/Icon';
 import { Modal } from '../components/Modal';
@@ -465,7 +466,7 @@ export function MyOrdersPage() {
                   ¥{(Number(o.total) || 0).toLocaleString()}
                 </div>
                 <div className="text-xs text-ink-muted">
-                  {new Date(o.createdAt).toLocaleString('zh-CN')}
+                  {formatDateTimeCn(o.createdAt)}
                 </div>
               </div>
             </header>
