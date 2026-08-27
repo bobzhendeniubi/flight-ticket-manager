@@ -8,9 +8,14 @@
  *     真正少掉的座位在这一列。转正成订单后从占位挪进已售，不会两头重复计。
  *   - 余票 = available = capacity − sold − locked − held（后端权威口径，与前台一致）
  *   - 总座 = capacity
- *   - 占用率 = sold / capacity（超售时 > 100%，进度条封顶显示但标红）
+ *   - 总占用率 = (已售 + 占位) / 总座 —— 全页唯一口径（KPI 卡与进度条百分比都走
+ *     totalOccupancyRate）。占位压住的座位一样卖不出去，只算已售会把「被占位压满的
+ *     班次」画成 1.1% 这种数字，容易被读成"没卖"。进度条按两段分色：实心 = 已售，
+ *     斜纹琥珀 = 占位，两段相加封顶 100%；超售时百分比如实 > 100%（条封顶但标红）。
  *   - 超售 = 余票为负时的欠座数（航司减配 / 换机型把容量压到已售之下）。
  *     销售侧照旧按容量拒卖，这里标红是提醒去与航司 / 操作部协调。
+ *   - 行底色只区分航向（去程 = 澳门出发，默认白底；回程 = 淡靛蓝底），不带状态语义——
+ *     状态色（超售红 / 占位琥珀）留给行内文字，底色不去抢它们。
  *   - 日期区间为闭区间（between 起始/截止），服务端按 from/to 过滤
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
@@ -35,6 +40,17 @@ function seatTone(remaining: number, capacity: number): { text: string; low: boo
   const amberCut = Math.min(capacity - 1, Math.max(10, Math.ceil(capacity * 0.2)));
   if (remaining <= amberCut) return { text: 'text-amber-600', low: false };
   return { text: 'text-emerald-600', low: false };
+}
+
+// 总占用率的唯一入口：(已售 + 占位) / 总座。KPI 卡与进度条都调这一个，
+// 避免"卡片一个口径、进度条另一个口径"的漂移。超售时 > 1，不封顶（封顶交给画条的人）。
+function totalOccupancyRate(sold: number, held: number, capacity: number): number {
+  return capacity > 0 ? (sold + held) / capacity : 0;
+}
+
+// 业务上澳门（MFM）出发 = 去程，其余 = 回程。排序与行底色共用这一个判断。
+function isOutbound(originCode: string): boolean {
+  return originCode === 'MFM';
 }
 
 // 本地日期 YYYY-MM-DD（用 getFullYear/getMonth/getDate，避免 toISOString 的 UTC 偏移）
@@ -64,7 +80,8 @@ interface ScheduleStat {
   // 逐舱累加而不是看 totalAvailable：一舱超售、另一舱有余时净值可能仍为正，
   // 那也必须报出来。
   oversoldSeats: number;
-  occupancy: number; // 0..1（超售时 > 1）
+  // 占用率不再存成派生字段：总占用率 = (已售 + 占位) / 总座，
+  // 由 totalOccupancyRate 按需算（KPI 卡、进度条同一个函数），避免两处各存一份走岔。
 }
 
 export function SeatStatsPage() {
@@ -121,11 +138,10 @@ export function SeatStatsPage() {
         totalHeld,
         totalAvailable,
         oversoldSeats,
-        occupancy: totalCapacity > 0 ? totalSold / totalCapacity : 0,
       };
     });
-    // 业务上澳门（MFM）出发 = 去程，其余 = 回程；同一天内统一「先去后回」排列
-    const directionRank = (originCode: string) => (originCode === 'MFM' ? 0 : 1);
+    // 同一天内统一「先去后回」排列
+    const directionRank = (originCode: string) => (isOutbound(originCode) ? 0 : 1);
     return result.sort(
       (a, b) =>
         // 主键用含年份的本地日期 YYYY-MM-DD，跨月/跨年才不会乱序（formatLocalDate 无年份）
@@ -153,8 +169,11 @@ export function SeatStatsPage() {
   const summary = useMemo(() => {
     const totalCap = filtered.reduce((s, x) => s + x.totalCapacity, 0);
     const totalSold = filtered.reduce((s, x) => s + x.totalSold, 0);
-    const avgOcc = totalCap > 0 ? totalSold / totalCap : 0;
-    return { totalCap, totalSold, avgOcc, count: filtered.length };
+    const totalHeld = filtered.reduce((s, x) => s + x.totalHeld, 0);
+    // 与进度条同一个口径：含占位。空舱率夹到 0——占位把班次压过满时算出负数没意义。
+    const avgOcc = totalOccupancyRate(totalSold, totalHeld, totalCap);
+    const avgEmpty = Math.max(0, 1 - avgOcc);
+    return { totalCap, totalSold, totalHeld, avgOcc, avgEmpty, count: filtered.length };
   }, [filtered]);
 
   const setNext30 = () => {
@@ -172,14 +191,24 @@ export function SeatStatsPage() {
           只看已售会以为位置没少，少掉的座位在占位列。
           余票为负即<strong className="text-rose-700">超售</strong>（容量被调到已售之下，如航司减配 / 换机型），
           标红提醒协调；销售侧照旧按容量拒卖。
+          占用率按<strong>总占用 =（已售 + 占位）÷ 总座</strong>算，进度条实心段是已售、斜纹段是占位，
+          被占位压住的班次不会再显示成「几乎没卖」。
         </p>
       </section>
 
       <section className="grid gap-3 md:grid-cols-4">
         <KpiCard label="班次数" value={summary.count.toString()} />
         <KpiCard label="总座位数" value={summary.totalCap.toLocaleString()} />
-        <KpiCard label="已售座位" value={summary.totalSold.toLocaleString()} sub={`平均占用率 ${(summary.avgOcc * 100).toFixed(1)}%`} />
-        <KpiCard label="平均空舱率" value={`${((1 - summary.avgOcc) * 100).toFixed(1)}%`} sub="(1 - 平均占用率)" />
+        <KpiCard
+          label="已售座位"
+          value={summary.totalSold.toLocaleString()}
+          sub={`平均总占用率 ${(summary.avgOcc * 100).toFixed(1)}%（含占位 ${summary.totalHeld.toLocaleString()} 座）`}
+        />
+        <KpiCard
+          label="平均空舱率"
+          value={`${(summary.avgEmpty * 100).toFixed(1)}%`}
+          sub="1 − 平均总占用率（已扣占位，即真正还能卖的比例）"
+        />
       </section>
 
       <section className="card">
@@ -224,7 +253,18 @@ export function SeatStatsPage() {
             </button>
           </div>
         </div>
-        <p className="mt-2 text-sm text-slate-500">显示 {filtered.length} 条</p>
+        {/* 行底色图例：底色只表航向，不表状态，图例摆在表格上方免得被当成告警色 */}
+        <p className="mt-2 flex flex-wrap items-center gap-x-4 gap-y-1 text-sm text-slate-500">
+          <span>显示 {filtered.length} 条</span>
+          <span className="inline-flex items-center gap-1.5">
+            <span className="inline-block h-3 w-3 rounded-sm border border-slate-300 bg-surface" aria-hidden />
+            去程（澳门出发）
+          </span>
+          <span className="inline-flex items-center gap-1.5">
+            <span className="inline-block h-3 w-3 rounded-sm border border-brand-200 bg-brand-50" aria-hidden />
+            回程
+          </span>
+        </p>
       </section>
 
       {error && <div className="card border-rose-200 bg-rose-50 text-rose-700">{error}</div>}
@@ -241,7 +281,9 @@ export function SeatStatsPage() {
                 <th className="text-right">已售</th>
                 <th className="text-right" title="占位单压住的座位：团队留位 / 代理切位，还没转成订单，所以不计入已售">占位</th>
                 <th className="text-right">余票</th>
-                <th className="w-48">占用率</th>
+                <th className="w-48" title="总占用率 =（已售 + 占位）÷ 总座；实心段为已售，斜纹段为占位">
+                  总占用率
+                </th>
               </tr>
             </thead>
             <tbody>
@@ -254,7 +296,14 @@ export function SeatStatsPage() {
               )}
               {!loading &&
                 filtered.map((s) => (
-                  <tr key={s.id}>
+                  // 回程整行淡靛蓝底（Console 的品牌色系，避免另起一套颜色）。
+                  // 只到 brand-50 这个浓度，行内 rose/amber 语义色照旧压得住；
+                  // hover 用 ! 提权，否则被 .table-admin tbody tr:hover 的 slate 底盖掉、
+                  // 鼠标一扫底色就没了。
+                  <tr
+                    key={s.id}
+                    className={isOutbound(s.origin) ? undefined : 'bg-brand-50/70 hover:!bg-brand-100/60'}
+                  >
                     <td>
                       <div className="font-medium text-ink">
                         {formatLocalDate(s.departureTime, s.departureTz)}
@@ -326,7 +375,12 @@ export function SeatStatsPage() {
                       );
                     })()}
                     <td>
-                      <OccupancyBar occupancy={s.occupancy} oversold={s.oversoldSeats > 0} />
+                      <OccupancyBar
+                        sold={s.totalSold}
+                        held={s.totalHeld}
+                        capacity={s.totalCapacity}
+                        oversold={s.oversoldSeats > 0}
+                      />
                     </td>
                   </tr>
                 ))}
@@ -355,26 +409,54 @@ function KpiCard({ label, value, sub }: { label: string; value: string; sub?: st
   );
 }
 
-// 超售时 occupancy > 1：进度条封顶 100%（条本身没有"超过满"的画法），
-// 但配超售红 + 百分比如实显示 >100%，不把这件事糊过去。
-function OccupancyBar({ occupancy, oversold }: { occupancy: number; oversold: boolean }) {
+// 占位段的斜纹：琥珀色系与行内「占N」标签一致，斜纹表示"暂占、还没转成订单"，
+// 也免得和已售段 60–80% 档的琥珀糊成一条看不出分界。
+// （amber-400 / amber-200，写死十六进制是因为 Tailwind 生不出重复渐变。）
+const HELD_STRIPES = {
+  backgroundImage: 'repeating-linear-gradient(45deg, #fbbf24 0 3px, #fde68a 3px 6px)',
+} as const;
+
+// 双色分段条：实心 = 已售，斜纹琥珀 = 占位，两段相加封顶 100%
+// （条本身没有"超过满"的画法）。百分比走总占用口径，超售时如实显示 > 100% 并标红，
+// 不把这件事糊过去。
+function OccupancyBar({
+  sold,
+  held,
+  capacity,
+  oversold,
+}: {
+  sold: number;
+  held: number;
+  capacity: number;
+  oversold: boolean;
+}) {
+  const occupancy = totalOccupancyRate(sold, held, capacity);
   const pct = occupancy * 100;
-  const barPct = Math.min(100, Math.max(pct, 2));
-  const color = oversold
+  const soldPct = capacity > 0 ? (sold / capacity) * 100 : 0;
+  const heldPct = capacity > 0 ? (held / capacity) * 100 : 0;
+  // 非 0 的极小占比给 2% 地板，否则一条几乎看不见的线等于没画；真 0 就画 0，不骗人。
+  const soldWidth = soldPct > 0 ? Math.min(100, Math.max(soldPct, 2)) : 0;
+  const heldWidth = heldPct > 0 ? Math.min(100 - soldWidth, Math.max(heldPct, 2)) : 0;
+  // 已售段沿用原三档热度色（>80% 红 / >60% 琥珀 / 其余绿），档位按总占用判定——
+  // 决定"这班还剩多少可卖"的是已售 + 占位，不是已售一项。
+  const soldColor = oversold
     ? 'bg-rose-600'
     : occupancy > 0.8
       ? 'bg-red-500'
       : occupancy > 0.6
         ? 'bg-amber-500'
         : 'bg-green-500';
+  const title =
+    `总占用 ${pct.toFixed(1)}%：已售 ${sold} · 占位 ${held} / 总座 ${capacity}` +
+    (oversold ? '（已超容量，条封顶 100%）' : '');
   return (
-    <div className="flex items-center gap-2">
-      <div className="flex-1 h-2 bg-slate-100 rounded-full overflow-hidden">
-        <div className={`h-full ${color}`} style={{ width: `${barPct}%` }} />
+    <div className="flex items-center gap-2" title={title}>
+      <div className="flex h-2 flex-1 overflow-hidden rounded-full bg-slate-100">
+        <div className={`h-full shrink-0 ${soldColor}`} style={{ width: `${soldWidth}%` }} />
+        <div className="h-full shrink-0" style={{ ...HELD_STRIPES, width: `${heldWidth}%` }} />
       </div>
       <span
-        className={`text-xs tabular-nums w-12 text-right ${oversold ? 'font-bold text-rose-700' : 'text-slate-700'}`}
-        title={pct > 100 ? '已售超过容量，占用率大于 100%' : undefined}
+        className={`w-12 text-right text-xs tabular-nums ${oversold ? 'font-bold text-rose-700' : 'text-slate-700'}`}
       >
         {pct.toFixed(1)}%
       </span>
