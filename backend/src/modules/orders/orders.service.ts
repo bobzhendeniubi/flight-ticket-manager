@@ -307,7 +307,6 @@ const ITINERARY_READY_STATUSES: OrderStatus[] = [
 const PRICE_TOLERANCE_CNY = 1.0;
 
 // 护照有效期规则（相对出发日）— 反馈：签证岗
-const PASSPORT_EXPIRY_BLOCK_DAYS = 90; // 不足 90 天禁止下单
 const PASSPORT_EXPIRY_SURCHARGE_DAYS = 180; // 不足 6 个月加收附加费
 const NEAR_EXPIRY_SURCHARGE_CNY = 200; // 每位临期乘客附加费
 // 升舱差价兜底（¥/程/座）：套餐 businessUpgradeCnyPerLeg=null（跟随航班）但两趟都没绑到航班时使用，
@@ -1989,9 +1988,9 @@ export class OrderService {
   /**
    * 护照有效期业务规则（反馈：签证岗）。仅对有出发日的订单（含 FLIGHT）生效，
    * 且只检查填了 passportExpiry 的乘客（OCR/手填得到）。
-   *   - 距出发日不足 90 天 → 禁止下单（抛 BadRequestError）
    *   - 距出发日不足 6 个月（180 天）→ 每位 +200 临期附加费（FEE 行）
    * 通过 push 到 pricedItems 让附加费自然进入 subtotal/total/items。
+   * 不足 90 天不再拒单（业务口径：临期护照也可开票）——录单端只做提示，由录入人自行确认。
    */
   /**
    * 本单最早 FLIGHT 行出发时间（服务端权威来源，直接查 DB，客户端改不了）。
@@ -2031,21 +2030,14 @@ export class OrderService {
     );
 
     const DAY = 24 * 60 * 60 * 1000;
-    const blocked: string[] = [];
     let surchargeCount = 0;
     for (const px of body.passengers) {
       if (!px.passportExpiry) continue; // 没填有效期 → 无法判定，跳过
       const expiry = new Date(px.passportExpiry);
       const days = Math.floor((expiry.getTime() - departure.getTime()) / DAY);
-      if (days < PASSPORT_EXPIRY_BLOCK_DAYS) blocked.push(px.fullName);
-      else if (days < PASSPORT_EXPIRY_SURCHARGE_DAYS) surchargeCount += 1;
+      if (days < PASSPORT_EXPIRY_SURCHARGE_DAYS) surchargeCount += 1;
     }
 
-    if (blocked.length > 0) {
-      throw new BadRequestError(
-        `护照有效期不足 ${PASSPORT_EXPIRY_BLOCK_DAYS} 天（相对出发日），禁止下单：${blocked.join('、')}。请更换护照后再订。`,
-      );
-    }
     if (surchargeCount > 0) {
       pricedItems.push({
         kind: 'FEE',

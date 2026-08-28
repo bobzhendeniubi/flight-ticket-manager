@@ -230,6 +230,9 @@ function ocrReviewHint(p: PassengerRow): string | null {
 
 const emptyPassenger = (): PassengerRow => ({ fullName: '', documentNumber: '', dateOfBirth: '' });
 
+/** 护照有效期距出发日不足此天数 → 录单提示（不拦截；业务口径：临期护照也可开票）。 */
+const PASSPORT_EXPIRY_HINT_DAYS = 90;
+
 /** 宽松生日解析 → YYYY-MM-DD；接受 1990-01-01 / 1990/1/1 / 1990.1.1，非法返回 null。 */
 function parseDob(raw: string): string | null {
   const s = raw.trim();
@@ -711,6 +714,34 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const validPassengers = passengers.filter(
     (p) => p.fullName.trim() && p.documentNumber.trim() && parseDob(p.dateOfBirth),
   );
+
+  // 护照有效期不足 90 天（相对出发日）：仅提示、不拦截——业务口径是临期护照也可开票，
+  // 由录入人与客人确认后照常下单（服务端同款硬闸已撤；不足 6 个月仍自动加收临期附加费）。
+  const passportExpiryHint = useMemo(() => {
+    const departYmds: string[] = [];
+    if (isBundleOrder) {
+      if (departDate) departYmds.push(departDate);
+    } else {
+      for (const b of blocks) {
+        if (b.kind === 'FLIGHT' && b.scheduleDate) departYmds.push(b.scheduleDate);
+      }
+    }
+    if (departYmds.length === 0) return null;
+    const earliest = departYmds.reduce((min, d) => (d < min ? d : min));
+    const departMs = Date.parse(`${earliest}T00:00:00Z`);
+    if (Number.isNaN(departMs)) return null;
+    const DAY = 24 * 60 * 60 * 1000;
+    const names = passengers
+      .filter((p) => {
+        if (!p.fullName.trim() || !p.documentNumber.trim()) return false;
+        const expiry = parseDob(p.passportExpiry ?? '');
+        if (!expiry) return false;
+        return Math.floor((Date.parse(`${expiry}T00:00:00Z`) - departMs) / DAY) < PASSPORT_EXPIRY_HINT_DAYS;
+      })
+      .map((p) => p.fullName.trim());
+    if (names.length === 0) return null;
+    return `护照有效期不足 ${PASSPORT_EXPIRY_HINT_DAYS} 天（相对出发日 ${earliest}）：${names.join('、')}。仍可下单开票，请先与客人确认目的地的护照有效期要求；有效期不足 6 个月会自动加收临期附加费。`;
+  }, [isBundleOrder, departDate, blocks, passengers]);
 
   // ── 套餐乘客级「住宿方式 + 签证」（购物车模式）──
   // 住宿列：套餐单都显示；签证列：套餐含签证组件，或配了自备签减免额（selfVisaDeductCny>0）时显示。
@@ -1620,6 +1651,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
         ) : (
           <div className="space-y-4 p-5">
             {err && <div className="rounded-md bg-rose-50 px-4 py-2 text-sm text-rose-700">{err}</div>}
+            {/* 护照临期提示：琥珀色、不拦截提交 */}
+            {passportExpiryHint && (
+              <div className="rounded-md bg-amber-50 px-4 py-2 text-sm text-amber-800">{passportExpiryHint}</div>
+            )}
 
             {/* 产品类型选择（第一个产品）；套餐独占一张订单，多产品时禁用 */}
             <div>
