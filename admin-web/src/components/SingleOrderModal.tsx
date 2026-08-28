@@ -1576,6 +1576,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     setAdjustAmount(null);
     setAdjustReason('DISCOUNT');
     setAdjustText('');
+    // 结算总价同款复位：带到下一单会把新单总额静默收敛到上一单的结算价。
+    setSettlementPrice(null);
   }
 
   const inputCls = 'mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm';
