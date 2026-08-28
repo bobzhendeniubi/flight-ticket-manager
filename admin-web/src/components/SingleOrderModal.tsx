@@ -155,6 +155,12 @@ interface PassengerRow {
   visaExempt?: boolean;
   /** 单住（不拼房，按人收单房差）。缺省 false = 拼房。 */
   singleRoom?: boolean;
+  /**
+   * 每人结算价（CNY；仅「按人填结算价」模式使用，随有效出行人同序提交为
+   * perPassengerSettlementCny）。挂在乘客行上而非独立数组：增删乘客行时价格跟人走，
+   * 不会因索引错位把钱挂错人。
+   */
+  settlementCny?: number | null;
   /** OCR 识别进度 0-100；null = 未识别 */
   ocrPct?: number | null;
   /** OCR 识别阶段描述 */
@@ -387,6 +393,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 服务端按「结算价 − 权威合计」自动生成一条「代理结算价」（SETTLEMENT）差额行——不改任何
   // 明细行价格，原价/差额留痕可审计。与下方手工「调整金额」互斥（服务端 400，前端也阻断提交）。
   const [settlementPrice, setSettlementPrice] = useState<number | null>(null);
+  // 按人填结算价（票务反馈：同单多人结算价不同，不想先均摊再逐人补差）。开启后逐人填价，
+  // 提交为 perPassengerSettlementCny（与 settlementTotalCny 互斥；开启时清空整单结算价）。
+  // 服务端仍走差额模型落库（min 基准 + 按乘客 SETTLEMENT 差额行），不是手填行价的口子。
+  const [perPaxSettlementOn, setPerPaxSettlementOn] = useState(false);
 
   // ── 产品目录（各区块共用一份，按本单用到的类型按需加载）──
   // hotels 里的星级随机池是哨兵项（见 poolOptionValue）——客人买「N 星随机」，
@@ -809,6 +819,43 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const settlementConflict =
     settlementPrice !== null && adjustIsInteger
       ? '「本单结算总价」与「调整金额」不能同时填写（两者互斥）；请清空其中一个'
+      : null;
+
+  // ── 按人填结算价派生（仅 ADMIN/STAFF；≥2 位有效出行人才有意义）──
+  // 带原始行索引的有效出行人（与 validPassengers 同一过滤口径）：渲染逐人输入框时要写回
+  // passengers 原数组的对应行（setPassenger 按原始索引），不能用过滤后的索引。
+  const validPassengerEntries = passengers
+    .map((p, idx) => ({ p, idx }))
+    .filter(({ p }) => p.fullName.trim() && p.documentNumber.trim() && parseDob(p.dateOfBirth));
+  const perPaxEligible = isStaffUser && validPassengerEntries.length >= 2;
+  const perPaxActive = perPaxSettlementOn && perPaxEligible;
+  const perPaxPrices = validPassengerEntries.map(({ p }) => p.settlementCny ?? null);
+  const perPaxAllFilled = perPaxPrices.every((v) => v !== null && v >= 0);
+  const perPaxDecimalBad = perPaxPrices.some(
+    (v) => v !== null && Number(v.toFixed(2)) !== v,
+  );
+  // 合计（对齐到分）：提交后订单总额按此收敛；系统价可用时给出差额预览。
+  const perPaxSumCny =
+    perPaxActive && perPaxAllFilled
+      ? Math.round(perPaxPrices.reduce((s: number, v) => s + (v as number), 0) * 100) / 100
+      : null;
+  const perPaxDiff =
+    perPaxSumCny !== null && quoteTotal !== null
+      ? Math.round((perPaxSumCny - quoteTotal) * 100) / 100
+      : null;
+  const perPaxError = !perPaxActive
+    ? null
+    : perPaxDecimalBad
+      ? '每人结算价最多两位小数'
+      : !perPaxAllFilled
+        ? '已开启按人填结算价：每位有效出行人都需填写结算价（或取消勾选该模式）'
+        : perPaxDiff !== null && Math.abs(perPaxDiff) > SETTLEMENT_DIFF_CAP_CNY
+          ? `每人结算价合计与系统价差额超出调价上限（±¥${SETTLEMENT_DIFF_CAP_CNY.toLocaleString('zh-CN')}），请复核`
+          : null;
+  // 与手工调价互斥（同 settlementConflict 口径；服务端也会 400）。
+  const perPaxConflict =
+    perPaxActive && adjustIsInteger
+      ? '「按人填结算价」与「调整金额」不能同时填写（两者互斥）；请清空其中一个'
       : null;
 
   function setPassenger(i: number, patch: Partial<PassengerRow>): void {
@@ -1361,6 +1408,12 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       );
     }
 
+    // 按人填结算价：开启即要求逐人填齐（缺一个都可能把差额挂错人），错误/冲突同款阻断。
+    if (perPaxActive && (perPaxError || perPaxConflict)) {
+      setErr(perPaxError ?? perPaxConflict);
+      return;
+    }
+
     const passengerPayload: OrderPassengerInput[] = validPassengers.map((p) => ({
       fullName: p.fullName.trim(),
       documentNumber: p.documentNumber.trim(),
@@ -1420,9 +1473,15 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
             },
           }
         : {}),
-      // 本单结算总价（仅 ADMIN/STAFF；与 priceAdjustment 互斥，上方已阻断同时填写）：
-      // 服务端按「结算价 − 权威合计」自动生成「代理结算价」差额行，系统照此收钱。
-      ...(isStaffUser && settlementPrice !== null ? { settlementTotalCny: settlementPrice } : {}),
+      // 结算价通道（仅 ADMIN/STAFF；与 priceAdjustment 互斥，上方已阻断同时填写）二选一：
+      //   · 按人填结算价：与 passengerPayload（=validPassengers）同序等长的逐人价数组，
+      //     服务端按差额模型落库（min 基准 + 按乘客 SETTLEMENT 差额行挂 passengerId）。
+      //   · 本单结算总价：服务端按「结算价 − 权威合计」自动生成「代理结算价」差额行，系统照此收钱。
+      ...(perPaxActive && perPaxSumCny !== null
+        ? { perPassengerSettlementCny: perPaxPrices as number[] }
+        : isStaffUser && settlementPrice !== null
+          ? { settlementTotalCny: settlementPrice }
+          : {}),
     };
 
     setSubmitting(true);
@@ -1576,8 +1635,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     setAdjustAmount(null);
     setAdjustReason('DISCOUNT');
     setAdjustText('');
-    // 结算总价同款复位：带到下一单会把新单总额静默收敛到上一单的结算价。
+    // 结算价通道同款复位：整单结算总价带到下一单会把总额静默收敛到上一单的价；
+    // 每人结算价数值随 setPassengers([emptyPassenger()]) 清空，这里只复位模式开关。
     setSettlementPrice(null);
+    setPerPaxSettlementOn(false);
   }
 
   const inputCls = 'mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm';
@@ -2518,30 +2579,80 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 </p>
                 {isStaffUser && (
                   <>
-                    <label className="mb-2 block text-xs text-slate-500">
-                      本单结算总价（¥，选填：与代理谈定的一口价，系统照此收钱）
-                      <NumberInput
-                        className={inputCls}
-                        value={settlementPrice}
-                        onChange={setSettlementPrice}
-                        placeholder={quoteTotal !== null ? `如 ${Math.round(quoteTotal)}` : '如 1500'}
-                      />
-                    </label>
-                    {settlementPrice !== null && !settlementError && (
-                      <div className="mb-1.5 flex items-center justify-between rounded-md bg-slate-50 px-2.5 py-1.5">
-                        <span className="text-xs text-slate-500">结算价预览</span>
-                        <span className="text-xs font-medium text-slate-700">
-                          {settlementDiff !== null && quoteTotal !== null
-                            ? `系统价 ¥${quoteTotal.toLocaleString('zh-CN')} · 结算价 ¥${settlementPrice.toLocaleString('zh-CN')} · 差额 ${settlementDiff >= 0 ? '+' : '−'}¥${Math.abs(settlementDiff).toLocaleString('zh-CN')}`
-                            : `结算价 ¥${settlementPrice.toLocaleString('zh-CN')}（系统价试算中/不可用，差额以提交后服务端权威价为准）`}
-                        </span>
-                      </div>
+                    {perPaxEligible && (
+                      <label className="mb-2 flex items-center gap-1.5 text-xs text-slate-600">
+                        <input
+                          type="checkbox"
+                          checked={perPaxSettlementOn}
+                          onChange={(e) => {
+                            setPerPaxSettlementOn(e.target.checked);
+                            // 与整单结算总价互斥：切到按人填时清掉整单价，避免两个通道同时在场。
+                            if (e.target.checked) setSettlementPrice(null);
+                          }}
+                        />
+                        按人填结算价（同单多人结算价不同时逐人填，系统自动按差额留痕落账）
+                      </label>
                     )}
-                    {settlementError && <p className="mb-1.5 text-[11px] text-rose-500">{settlementError}</p>}
-                    {settlementConflict && <p className="mb-1.5 text-[11px] text-rose-500">{settlementConflict}</p>}
-                    <p className="mb-1.5 text-[11px] text-slate-400">
-                      填写后系统按「结算价 − 系统价」自动生成一条「代理结算价」调价行（不改明细行价格，留痕可审计）；与下方「调整金额」互斥，二选一。
-                    </p>
+                    {perPaxActive ? (
+                      <div className="mb-2 space-y-1.5">
+                        {validPassengerEntries.map(({ p, idx }) => (
+                          <label key={idx} className="flex items-center gap-2 text-xs text-slate-500">
+                            <span className="w-28 shrink-0 truncate text-slate-700">
+                              {p.chineseName?.trim() || p.fullName.trim()}
+                            </span>
+                            <NumberInput
+                              className={inputCls}
+                              value={p.settlementCny ?? null}
+                              onChange={(v) => setPassenger(idx, { settlementCny: v })}
+                              placeholder="该乘客结算价 ¥"
+                            />
+                          </label>
+                        ))}
+                        {perPaxSumCny !== null && !perPaxError && (
+                          <div className="flex items-center justify-between rounded-md bg-slate-50 px-2.5 py-1.5">
+                            <span className="text-xs text-slate-500">合计（提交后订单总额按此收敛）</span>
+                            <span className="text-xs font-medium text-slate-700">
+                              ¥{perPaxSumCny.toLocaleString('zh-CN')}
+                              {perPaxDiff !== null && quoteTotal !== null
+                                ? `（系统价 ¥${quoteTotal.toLocaleString('zh-CN')} · 差额 ${perPaxDiff >= 0 ? '+' : '−'}¥${Math.abs(perPaxDiff).toLocaleString('zh-CN')}）`
+                                : ''}
+                            </span>
+                          </div>
+                        )}
+                        {perPaxError && <p className="text-[11px] text-rose-500">{perPaxError}</p>}
+                        {perPaxConflict && <p className="text-[11px] text-rose-500">{perPaxConflict}</p>}
+                        <p className="text-[11px] text-slate-400">
+                          逐人价落库仍走差额留痕：整单按最低每人价收敛，价高的乘客各挂一条「代理结算价」差额行；订单详情「每人结算价」表即为此处所填逐人价。与下方「调整金额」互斥。
+                        </p>
+                      </div>
+                    ) : (
+                      <>
+                        <label className="mb-2 block text-xs text-slate-500">
+                          本单结算总价（¥，选填：与代理谈定的一口价，系统照此收钱）
+                          <NumberInput
+                            className={inputCls}
+                            value={settlementPrice}
+                            onChange={setSettlementPrice}
+                            placeholder={quoteTotal !== null ? `如 ${Math.round(quoteTotal)}` : '如 1500'}
+                          />
+                        </label>
+                        {settlementPrice !== null && !settlementError && (
+                          <div className="mb-1.5 flex items-center justify-between rounded-md bg-slate-50 px-2.5 py-1.5">
+                            <span className="text-xs text-slate-500">结算价预览</span>
+                            <span className="text-xs font-medium text-slate-700">
+                              {settlementDiff !== null && quoteTotal !== null
+                                ? `系统价 ¥${quoteTotal.toLocaleString('zh-CN')} · 结算价 ¥${settlementPrice.toLocaleString('zh-CN')} · 差额 ${settlementDiff >= 0 ? '+' : '−'}¥${Math.abs(settlementDiff).toLocaleString('zh-CN')}`
+                                : `结算价 ¥${settlementPrice.toLocaleString('zh-CN')}（系统价试算中/不可用，差额以提交后服务端权威价为准）`}
+                            </span>
+                          </div>
+                        )}
+                        {settlementError && <p className="mb-1.5 text-[11px] text-rose-500">{settlementError}</p>}
+                        {settlementConflict && <p className="mb-1.5 text-[11px] text-rose-500">{settlementConflict}</p>}
+                        <p className="mb-1.5 text-[11px] text-slate-400">
+                          填写后系统按「结算价 − 系统价」自动生成一条「代理结算价」调价行（不改明细行价格，留痕可审计）；与下方「调整金额」互斥，二选一。
+                        </p>
+                      </>
+                    )}
                   </>
                 )}
                 <div className="grid gap-2 md:grid-cols-3">

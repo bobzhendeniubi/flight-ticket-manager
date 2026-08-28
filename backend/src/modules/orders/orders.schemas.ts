@@ -511,6 +511,22 @@ export const createOrderBodySchema = z.object({
     .min(0, '结算总价不能为负')
     .refine((v) => Number(v.toFixed(2)) === v, { message: '结算总价最多两位小数（元）' })
     .optional(),
+  // 每人结算价（CNY，≥0，最多两位小数；仅 ADMIN/STAFF 录单生效，服务端按认证身份判权限）。
+  // 业务场景（票务反馈）：同单多人结算价不同，录单时逐人填价。**不是手填每人价格的口子**——
+  // 落库仍走差额模型：服务端取 min 为基准生成整单 SETTLEMENT 差额行，再逐人生成
+  // 「该人结算价 − min」的按乘客 SETTLEMENT 差额行（挂 passengerId），订单详情
+  // 「每人结算价」表按既有派生口径还原出逐人价。数组与 passengers 同序等长（createOrder 校验）；
+  // 与 settlementTotalCny / priceAdjustment 互斥（同时传 400，见 createOrder）。
+  perPassengerSettlementCny: z
+    .array(
+      z
+        .number()
+        .min(0, '每人结算价不能为负')
+        .refine((v) => Number(v.toFixed(2)) === v, { message: '每人结算价最多两位小数（元）' }),
+    )
+    .min(1)
+    .max(20)
+    .optional(),
   // 允许重复乘客强录（仅 ADMIN/STAFF 后台录入生效）。客人重复订票且已付款场景：
   // 同班次同证件号本会被拦，运营确认后带此 flag 放行，服务端写审计 + 订单备注留痕。
   // 服务端按认证身份判权限：散客/AGENT 携带此字段无效，照旧拦（见 createOrder）。

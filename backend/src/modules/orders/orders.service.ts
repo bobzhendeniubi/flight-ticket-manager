@@ -722,6 +722,50 @@ export function buildSettlementTotalItem(input: {
 }
 
 /**
+ * 每人结算价 → 该乘客名下的 SETTLEMENT 差额行（计入 subtotal/total，事务内回填 passengerId）。
+ *   - 业务（票务反馈）：同单多人结算价不同，录单逐人填价。落库仍走差额模型，不是手填价：
+ *     服务端取「min(每人结算价) × 人数」走整单 SETTLEMENT 收敛，本行只挂「该人价 − min」的
+ *     非负差额（=0 的乘客不生成行），订单详情「每人结算价」表按既有派生口径还原逐人价。
+ *   - metadata 打标同整单 SETTLEMENT（priceAdjustment + reasonCode='SETTLEMENT' + settlementPrice）
+ *     外加 perPassenger=true + 该人结算价/基准价快照 + perPaxIndex（乘客在提交数组中的序号，
+ *     事务内据此把行挂到对应 passengerId 上）。
+ * 导出供单测复用。
+ */
+export function buildPerPassengerSettlementItem(input: {
+  diffCny: number;
+  settlementPerPaxCny: number;
+  basePerPaxCny: number;
+  perPaxIndex: number;
+}): {
+  kind: OrderItemKind;
+  description: string;
+  quantity: number;
+  unitPrice: number;
+  amount: number;
+  totalCostCny: number;
+  metadata: Record<string, unknown>;
+} {
+  return {
+    kind: OrderItemKind.FEE,
+    description: `价格调整：${PRICE_ADJUSTMENT_REASON_LABEL.SETTLEMENT}（+¥${input.diffCny}）`,
+    quantity: 1,
+    unitPrice: input.diffCny,
+    amount: input.diffCny,
+    // 与整单 SETTLEMENT 行同口径：纯价格收敛，无成本侧 → 显式落 0。
+    totalCostCny: 0,
+    metadata: {
+      priceAdjustment: true,
+      reasonCode: 'SETTLEMENT',
+      settlementPrice: true,
+      perPassenger: true,
+      settlementPerPaxCny: input.settlementPerPaxCny,
+      basePerPaxCny: input.basePerPaxCny,
+      perPaxIndex: input.perPaxIndex,
+    },
+  };
+}
+
+/**
  * 前台展示价兜底校验（S1）：expectedTotalCny 存在且与「服务端权威商品价」偏差 > 容差（PRICE_TOLERANCE_CNY，
  * 1 元，容忍逐行取整）→ 抛 PRICE_CHANGED（前台提示刷新重下，绝不静默按新价多收）。
  * 缺省（admin/批量/quote 不带 expectedTotalCny）→ 直接返回，跳过比对（录单路径不受影响）。
@@ -754,12 +798,14 @@ export function shouldApplyRetailSettlementDiscount(input: {
   agentId?: string | null;
   priceAdjustment?: unknown;
   settlementTotalCny?: number | null;
+  perPassengerSettlementCny?: number[] | null;
   flightSettlementPriceCny?: number | null;
 }): boolean {
   if (input.agentId) return false;
   return (
     input.priceAdjustment === undefined &&
     input.settlementTotalCny === undefined &&
+    input.perPassengerSettlementCny === undefined &&
     input.flightSettlementPriceCny === undefined
   );
 }
@@ -1205,6 +1251,7 @@ export class OrderService {
     if (
       body.priceAdjustment ||
       body.settlementTotalCny !== undefined ||
+      body.perPassengerSettlementCny !== undefined ||
       body.flightSettlementPriceCny !== undefined
     ) {
       const role = isGuest ? undefined : requester.role;
@@ -1214,6 +1261,21 @@ export class OrderService {
       // 两个改价通道互斥：结算总价本身就是「把总额收敛到一个数」，再叠加手工调价会双重砸价。
       if (body.priceAdjustment && body.settlementTotalCny !== undefined) {
         throw new BadRequestError('「本单结算总价」与「价格调整」不能同时填写（两者互斥，避免双重调价）');
+      }
+      // 每人结算价与整单结算总价/手工调价同为「把应收收敛到谈定价」的通道，两两互斥；
+      // 数组必须与 passengers 一一对应（同序等长），否则钱会挂错人。
+      if (body.perPassengerSettlementCny !== undefined) {
+        if (body.settlementTotalCny !== undefined) {
+          throw new BadRequestError('「每人结算价」与「本单结算总价」不能同时填写（两者互斥）');
+        }
+        if (body.priceAdjustment) {
+          throw new BadRequestError('「每人结算价」与「价格调整」不能同时填写（两者互斥，避免双重调价）');
+        }
+        if (body.perPassengerSettlementCny.length !== body.passengers.length) {
+          throw new BadRequestError(
+            `每人结算价需与出行人一一对应：应填 ${body.passengers.length} 项，实收 ${body.perPassengerSettlementCny.length} 项`,
+          );
+        }
       }
     }
 
@@ -1373,13 +1435,45 @@ export class OrderService {
       pricedItems.push(buildPriceAdjustmentItem(body.priceAdjustment));
     }
 
+    // 每人结算价（权限/互斥/与 passengers 等长已在入口断言）：差额模型分解，不手填任何行价。
+    // 取 min(每人价) 为基准：逐人挂「该人价 − min」的非负 SETTLEMENT 差额行（=0 不生成；
+    // passengerId 于事务内回填），整单再按「Σ每人价」走下方既有 SETTLEMENT 收敛。
+    // 派生口径（订单详情「每人结算价」表）恰好还原所填值：
+    //   基准每人 = (total − Σ按乘客净额)/人数 = min；每人价 = min + (该人价 − min)。
+    let perPaxSettlementTotalCny: number | undefined;
+    if (body.perPassengerSettlementCny !== undefined) {
+      const prices = body.perPassengerSettlementCny;
+      const minCny = Math.min(...prices);
+      let diffSumCny = 0;
+      prices.forEach((priceCny, i) => {
+        const diffCny = Math.round((priceCny - minCny) * 100) / 100;
+        if (diffCny === 0) return;
+        if (diffCny > PRICE_ADJUSTMENT_CAP_CNY) {
+          throw new BadRequestError(
+            `第 ${i + 1} 位出行人结算价与最低每人价差额 ¥${diffCny} 超出调价上限（±¥${PRICE_ADJUSTMENT_CAP_CNY}），请复核`,
+          );
+        }
+        diffSumCny = Math.round((diffSumCny + diffCny) * 100) / 100;
+        pricedItems.push(
+          buildPerPassengerSettlementItem({
+            diffCny,
+            settlementPerPaxCny: priceCny,
+            basePerPaxCny: minCny,
+            perPaxIndex: i,
+          }),
+        );
+      });
+      perPaxSettlementTotalCny = Math.round((minCny * prices.length + diffSumCny) * 100) / 100;
+    }
+
     // 结算价日历自动取价（已拍板 B）：代理单 + 套餐已配日历键（档次+晚数）→ 按去程出发日期查每人结算价，
     // 结算总价 = 每人价 × 乘客数，喂给下方既有「结算总价 → SETTLEMENT 差额行」机制落价（服务端权威定价）。
     //   · 手工 settlementTotalCny（ADMIN/STAFF 通道，已在入口鉴权）优先，日历不覆盖。
     //   · 已配日历的套餐当日无价 → resolveBundleSettlementCalendarTotal 内抛 400 拒单。
     //   · 未配日历的套餐 / 非代理单 → 返回 null，现状不变（不进结算收敛）。
     // 说明：与 0723「结算价锁」不冲突——锁只在核对后写保护改价，日历只在创建时定价，两者时序不重叠。
-    let effectiveSettlementTotalCny = body.settlementTotalCny;
+    // 每人结算价在场时其合计即本单结算总价（与 settlementTotalCny 互斥，入口已断言）。
+    let effectiveSettlementTotalCny = body.settlementTotalCny ?? perPaxSettlementTotalCny;
     let settlementCalendarAudit: Record<string, unknown> | null = null;
     // 机票结算价日历**明确放弃**自动取价的原因（如含非经济舱航段）；null = 没发生这回事。
     // 只留痕不拒单：本单照常按动态价成交，同业价交给人工结算价通道。
@@ -1388,7 +1482,7 @@ export class OrderService {
     // 才允许日历价与调整行叠加；普通 DISCOUNT 调价保持既有语义。
     const stackableCalendarAdjustment = body.priceAdjustment?.stackWithSettlementCalendar === true;
     let agentAutoDiscount: AutoDiscountSummary | null = null;
-    if (body.settlementTotalCny === undefined && agentId) {
+    if (effectiveSettlementTotalCny === undefined && agentId) {
       // BUNDLE 行加项净额（与 body.items 的 BUNDLE 行同序）：日历价 + 加项 才是本单结算价，
       // 否则升舱/单房差/指定酒店加价会被下方 SETTLEMENT 差额行收敛吞掉。
       const calendar = await this.resolveBundleSettlementCalendarTotal(
@@ -1687,6 +1781,34 @@ export class OrderService {
       // 都经此），故在同一事务内按订单行真实结构落列，单程单落 false、往返单落 true。
       await syncOrderHasReturnLeg(tx, created.id);
 
+      // 每人结算价差额行 → 回填 passengerId（嵌套 create 建行时乘客 id 尚不存在）。
+      // 提交数组与 body.passengers 同序；落库乘客按「fullName|documentNumber」多重集与输入
+      // 双射匹配（嵌套 create 每个输入恰好落一行；重名重证件的两人可互换，不影响金额归属）。
+      if (body.perPassengerSettlementCny !== undefined) {
+        const idQueueByKey = new Map<string, string[]>();
+        for (const px of created.passengers) {
+          const key = `${px.fullName}|${px.documentNumber}`;
+          const queue = idQueueByKey.get(key);
+          if (queue) queue.push(px.id);
+          else idQueueByKey.set(key, [px.id]);
+        }
+        const passengerIdByIndex = body.passengers.map(
+          (px) => idQueueByKey.get(`${px.fullName}|${px.documentNumber}`)?.shift() ?? null,
+        );
+        for (const it of created.items) {
+          const meta = it.metadata as Record<string, unknown> | null;
+          const idx =
+            meta && meta.perPassenger === true && typeof meta.perPaxIndex === 'number'
+              ? meta.perPaxIndex
+              : null;
+          if (idx === null) continue;
+          const pid = passengerIdByIndex[idx] ?? null;
+          if (!pid) continue; // 理论不可达：乘客与差额行同源自同一提交数组
+          await tx.orderItem.update({ where: { id: it.id }, data: { passengerId: pid } });
+          it.passengerId = pid; // 同步内存副本，创建响应即带归属，无需重查
+        }
+      }
+
       // 座位已在订单 create 之前原子扣减；此处无需再动库存
       return created;
     });
@@ -1755,7 +1877,10 @@ export class OrderService {
     // await（非 fire-and-forget）：与录单调价同口径，落审计后再返回，便于对账与追责。
     if (
       settlementDiffCny !== null &&
-      (settlementDiffCny !== 0 || agentAutoDiscount !== null) &&
+      // 每人结算价通道：整单差额恰为 0 也要留痕——逐人差额行已经改变了每个人的应收份额。
+      (settlementDiffCny !== 0 ||
+        agentAutoDiscount !== null ||
+        body.perPassengerSettlementCny !== undefined) &&
       !isGuest
     ) {
       await writeAudit({
@@ -1771,6 +1896,8 @@ export class OrderService {
           diffCny: settlementDiffCny,
           reasonCode: 'SETTLEMENT',
           reasonLabel: PRICE_ADJUSTMENT_REASON_LABEL.SETTLEMENT,
+          // 每人结算价通道留痕（与 passengers 同序的逐人价）；整单结算总价/日历取价时为 null。
+          perPassengerSettlementCny: body.perPassengerSettlementCny ?? null,
           // 结算价日历自动取价来源留痕（档次/晚数/出发日期/每人价/人数）；手工结算价时为 null。
           settlementCalendar: settlementCalendarAudit,
         },

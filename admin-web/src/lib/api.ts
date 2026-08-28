@@ -843,6 +843,14 @@ export interface CreateOrderInput extends OrderStructuredNotes {
    */
   settlementTotalCny?: number;
   /**
+   * 每人结算价（CNY，≥0，最多两位小数；ADMIN/STAFF 录单专用，与 passengers 同序等长）。
+   * 同单多人结算价不同场景：逐人填价，服务端按差额模型落库——取 min 为基准生成整单
+   * SETTLEMENT 差额行 + 逐人「该人价 − min」的按乘客 SETTLEMENT 差额行（挂 passengerId），
+   * 订单详情「每人结算价」表按既有派生口径还原逐人价。
+   * 与 settlementTotalCny / priceAdjustment 互斥（同时传服务端 400）。
+   */
+  perPassengerSettlementCny?: number[];
+  /**
    * 代为某代理录单（ADMIN/STAFF 用）。直客/无代理 = 不传。
    * 注：服务端创单接口对 agentId 的归属支持为后端配套改动；本字段为前向兼容透传，
    * 服务端未启用时会被静默忽略（不报错）。
