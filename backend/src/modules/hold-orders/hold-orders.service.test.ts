@@ -320,3 +320,69 @@ describe('HoldOrderService.updateInfo', () => {
     expect(prismaMock.holdOrder.update).not.toHaveBeenCalled();
   });
 });
+
+describe('HoldOrderService.updateAgent', () => {
+  it('占座中改归属代理成功，并写入前后代理审计', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold());
+    prismaMock.agent.findUnique.mockResolvedValue({ id: 'agent_2', isActive: true });
+
+    const result = await service.updateAgent('hold_1', { agentId: 'agent_2' }, { userId: 'user_1' });
+
+    expect(prismaMock.holdOrder.update).toHaveBeenCalledWith({
+      where: { id: 'hold_1' },
+      data: { agentId: 'agent_2' },
+    });
+    expect(result).toEqual({ id: 'hold_1', agentId: 'agent_2', seatsConverted: 0 });
+    expect(auditMock).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'UPDATE_HOLD_ORDER_AGENT',
+      before: { agentId: 'agent_1' },
+      after: { agentId: 'agent_2', seatsConverted: 0 },
+    }));
+  });
+
+  it('已部分转正的单允许改归属，返回 seatsConverted 供前端提示已转正座位不跟随', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ seatsConverted: 8 }));
+    prismaMock.agent.findUnique.mockResolvedValue({ id: 'agent_2', isActive: true });
+
+    const result = await service.updateAgent('hold_1', { agentId: 'agent_2' }, { userId: 'user_1' });
+
+    expect(result.seatsConverted).toBe(8);
+    expect(prismaMock.holdOrder.update).toHaveBeenCalledWith({
+      where: { id: 'hold_1' },
+      data: { agentId: 'agent_2' },
+    });
+  });
+
+  it('终态占位单（已转正/已释放/已取消）不能改归属', async () => {
+    for (const status of [HoldOrderStatus.CONVERTED, HoldOrderStatus.RELEASED, HoldOrderStatus.CANCELLED]) {
+      prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ status }));
+
+      await expect(service.updateAgent('hold_1', { agentId: 'agent_2' }, { userId: 'user_1' })).rejects.toThrow('当前状态不可更改归属');
+    }
+    expect(prismaMock.holdOrder.update).not.toHaveBeenCalled();
+  });
+
+  it('直客占位不支持改归属代理', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ ownerType: HoldOwnerType.CUSTOMER, agentId: null, groupName: '直客团' }));
+
+    await expect(service.updateAgent('hold_1', { agentId: 'agent_2' }, { userId: 'user_1' })).rejects.toThrow('直客占位不支持');
+    expect(prismaMock.holdOrder.update).not.toHaveBeenCalled();
+  });
+
+  it('目标代理与当前归属相同被拒', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold());
+
+    await expect(service.updateAgent('hold_1', { agentId: 'agent_1' }, { userId: 'user_1' })).rejects.toThrow('与当前归属相同');
+    expect(prismaMock.holdOrder.update).not.toHaveBeenCalled();
+  });
+
+  it('目标代理不存在或已停用被拒', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold());
+    prismaMock.agent.findUnique.mockResolvedValue(null);
+    await expect(service.updateAgent('hold_1', { agentId: 'agent_x' }, { userId: 'user_1' })).rejects.toThrow('代理不存在');
+
+    prismaMock.agent.findUnique.mockResolvedValue({ id: 'agent_2', isActive: false });
+    await expect(service.updateAgent('hold_1', { agentId: 'agent_2' }, { userId: 'user_1' })).rejects.toThrow('已停用');
+    expect(prismaMock.holdOrder.update).not.toHaveBeenCalled();
+  });
+});

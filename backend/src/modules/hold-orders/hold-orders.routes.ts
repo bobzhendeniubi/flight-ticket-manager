@@ -18,6 +18,7 @@ import {
   reduceHoldSeatsBodySchema,
   reverseHoldAllocationBodySchema,
   updateHoldInstallmentBodySchema,
+  updateHoldOrderAgentBodySchema,
   updateHoldOrderConfigBodySchema,
   updateHoldOrderInfoBodySchema,
   updateHoldOrderPriceBodySchema,
@@ -143,5 +144,12 @@ export const holdOrderRoutes: FastifyPluginAsync = async (app) => {
     const { id } = req.params as { id: string };
     const body = updateHoldOrderInfoBodySchema.parse(req.body);
     return { result: await service.updateInfo(id, body, actorFromRequest(req)) };
+  });
+
+  // 改归属代理：建单选错代理的订正通道；已转正座位的归属不跟随（正式订单侧走批量改代理）。
+  app.patch('/:id/agent', pre, async (req) => {
+    const { id } = req.params as { id: string };
+    const body = updateHoldOrderAgentBodySchema.parse(req.body);
+    return { result: await service.updateAgent(id, body, actorFromRequest(req)) };
   });
 };

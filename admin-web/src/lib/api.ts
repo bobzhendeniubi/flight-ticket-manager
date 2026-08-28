@@ -3561,6 +3561,13 @@ export const api = {
       token,
       body,
     }),
+  // 改归属代理（仅代理 → 代理）：已转正座位的归属不跟随，seatsConverted 供前端提示。
+  updateHoldOrderAgent: (token: string, id: string, body: { agentId: string }) =>
+    apiFetch<{ result: { id: string; agentId: string; seatsConverted: number } }>(`/hold-orders/${id}/agent`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
   allocateHoldInstallment: (token: string, holdId: string, installmentId: string, body: { receiptId: string; amountCny: number }) =>
     apiFetch<{ result: { allocation: HoldReceiptAllocation; receiptNo: string; installmentPaid: boolean; holdStatus: HoldOrderStatus; warning: string | null } }>(
       `/hold-orders/${holdId}/installments/${installmentId}/allocate`, { method: 'POST', token, body }),

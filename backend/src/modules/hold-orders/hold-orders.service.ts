@@ -51,6 +51,7 @@ import type {
   ListHoldOrdersQuery,
   ReduceHoldSeatsBody,
   UpdateHoldInstallmentBody,
+  UpdateHoldOrderAgentBody,
   UpdateHoldOrderConfigBody,
   UpdateHoldOrderInfoBody,
   UpdateHoldOrderPriceBody,
@@ -1039,6 +1040,35 @@ export class HoldOrderService {
       groupName: result.data.groupName !== undefined ? result.data.groupName : result.hold.groupName,
       notes: result.data.notes !== undefined ? result.data.notes : result.hold.notes,
     };
+  }
+
+  /**
+   * 改归属代理（建单时选错代理的订正通道；仅代理 → 代理，直客互转暂不开）。
+   * 终态单拒改；已部分转正的单允许改，但已转正座位生成的正式订单归属不跟随——
+   * 那部分要调整得去订单侧走批量改代理，前端据返回的 seatsConverted 提示。
+   */
+  async updateAgent(id: string, body: UpdateHoldOrderAgentBody, actor?: AuditActor) {
+    const result = await prisma.$transaction(async (tx) => {
+      await lockHold(tx, id);
+      const existing = await findHold(tx, id);
+      if (!existing) throw new NotFoundError('占位单不存在');
+      const terminalStatuses: HoldOrderStatus[] = [HoldOrderStatus.CONVERTED, HoldOrderStatus.RELEASED, HoldOrderStatus.CANCELLED];
+      if (terminalStatuses.includes(existing.status)) {
+        throw new ConflictError(`占位单当前状态不可更改归属（${HOLD_STATUS_LABEL[existing.status]}）`);
+      }
+      if (existing.ownerType !== HoldOwnerType.AGENT) throw new BadRequestError('直客占位不支持更改归属代理');
+      if (existing.agentId === body.agentId) throw new BadRequestError('目标代理与当前归属相同');
+      const agent = await tx.agent.findUnique({ where: { id: body.agentId }, select: { id: true, isActive: true } });
+      if (!agent) throw new NotFoundError('代理不存在');
+      if (!agent.isActive) throw new BadRequestError('目标代理已停用，不能接收占位单');
+      await tx.holdOrder.update({ where: { id }, data: { agentId: body.agentId } });
+      return { hold: existing };
+    });
+    auditHold(actor, 'UPDATE_HOLD_ORDER_AGENT', result.hold, {
+      before: { agentId: result.hold.agentId },
+      after: { agentId: body.agentId, seatsConverted: result.hold.seatsConverted },
+    });
+    return { id, agentId: body.agentId, seatsConverted: result.hold.seatsConverted };
   }
 
   async allocateInstallment(id: string, installmentId: string, body: AllocateHoldInstallmentBody, actor: AuditActor) {

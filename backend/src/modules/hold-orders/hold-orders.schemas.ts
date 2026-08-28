@@ -168,6 +168,10 @@ export const updateHoldOrderInfoBodySchema = z
   });
 export type UpdateHoldOrderInfoBody = z.infer<typeof updateHoldOrderInfoBodySchema>;
 
+// 改归属代理：建单时选错代理的订正通道（仅代理 → 代理，直客互转暂不开）。
+export const updateHoldOrderAgentBodySchema = z.object({ agentId: z.string().min(1) }).strict();
+export type UpdateHoldOrderAgentBody = z.infer<typeof updateHoldOrderAgentBodySchema>;
+
 export const allocateHoldInstallmentBodySchema = z.object({
   receiptId: z.string().min(1),
   amountCny: z.number().int().min(1),

@@ -456,15 +456,19 @@ export function HoldOrdersPage() {
       {infoOrder && (
         <InfoModal
           order={infoOrder}
+          agents={agents}
           onCancel={() => setInfoOrder(null)}
-          onSubmit={async (groupName, notes) => {
+          onSubmit={async (groupName, notes, agentId) => {
             if (!tokens) return;
             setBusy(true);
             try {
+              // 先改团名/备注，再改归属：任一步失败弹窗留在原地展示后端原因。
               await api.updateHoldOrderInfo(tokens.accessToken, infoOrder.id, { groupName, notes });
+              const agentChanged = infoOrder.ownerType === 'AGENT' && !!agentId && agentId !== infoOrder.agentId;
+              if (agentChanged) await api.updateHoldOrderAgent(tokens.accessToken, infoOrder.id, { agentId });
               setInfoOrder(null);
               await reload();
-              notify('团名 / 备注已更新');
+              notify(agentChanged ? '归属代理与占位单信息已更新' : '团名 / 备注已更新');
             } finally {
               setBusy(false);
             }
@@ -1115,21 +1119,38 @@ function PriceModal({ order, onCancel, onSubmit }: { order: HoldOrderListItem; o
   );
 }
 
-function InfoModal({ order, onCancel, onSubmit }: { order: HoldOrderListItem; onCancel: () => void; onSubmit: (groupName: string, notes: string) => Promise<void> }) {
+function InfoModal({ order, agents, onCancel, onSubmit }: { order: HoldOrderListItem; agents: AgentListItem[]; onCancel: () => void; onSubmit: (groupName: string, notes: string, agentId: string) => Promise<void> }) {
   const dialogRef = useDialogA11y(onCancel);
   const [groupName, setGroupName] = useState(order.groupName ?? '');
   const [notes, setNotes] = useState(order.notes ?? '');
+  const [agentId, setAgentId] = useState(order.agentId ?? '');
   const [error, setError] = useState<string | null>(null);
+  // 当前归属的代理可能已停用而不在可选列表里：补一个占位选项，避免下拉显示成空白。
+  const currentAgentMissing = order.ownerType === 'AGENT' && !!order.agentId && !agents.some((a) => a.id === order.agentId);
+  const agentChanged = order.ownerType === 'AGENT' && agentId !== (order.agentId ?? '');
   const submit = async () => {
     if (order.ownerType === 'CUSTOMER' && !groupName.trim()) { setError('直客占位团名不能清空'); return; }
-    try { await onSubmit(groupName.trim(), notes.trim()); } catch (err) { setError(err instanceof Error ? err.message : '保存失败'); }
+    if (order.ownerType === 'AGENT' && !agentId) { setError('代理占位必须选择归属代理'); return; }
+    try { await onSubmit(groupName.trim(), notes.trim(), agentId); } catch (err) { setError(err instanceof Error ? err.message : '保存失败'); }
   };
   return (
-    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="编辑团名 / 备注" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}>
+    <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="编辑占位单" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}>
       <div className="w-full max-w-md rounded-lg bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
-        <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3"><h2 className="text-lg font-semibold">编辑团名 / 备注</h2><button onClick={onCancel} className="text-xl text-slate-400">×</button></div>
+        <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3"><h2 className="text-lg font-semibold">编辑占位单</h2><button onClick={onCancel} className="text-xl text-slate-400">×</button></div>
         <div className="space-y-4 px-5 py-4">
           <p className="text-sm text-ink-muted">占位单 {order.holdNo}</p>
+          {order.ownerType === 'AGENT' && (
+            <div>
+              <label className="label">归属代理</label>
+              <select className="input" value={agentId} onChange={(e) => setAgentId(e.target.value)}>
+                {currentAgentMissing && <option value={order.agentId!}>{order.agent ? `${order.agent.companyName ?? order.agent.contactName}（已停用）` : '当前代理（已停用）'}</option>}
+                {agents.map((a) => <option key={a.id} value={a.id}>{agentLabel(a)}</option>)}
+              </select>
+              {agentChanged && order.seatsConverted > 0 && (
+                <p className="mt-2 rounded bg-amber-50 px-3 py-2 text-xs text-amber-800">已转正的 {order.seatsConverted} 座不会跟着变更；如需调整，请到订单页用「批量改代理」处理对应正式订单。</p>
+              )}
+            </div>
+          )}
           <div><label className="label">团名{order.ownerType === 'CUSTOMER' ? '（必填）' : ''}</label><input className="input" maxLength={120} value={groupName} onChange={(e) => setGroupName(e.target.value)} /></div>
           <div><label className="label">备注</label><textarea className="input min-h-24" maxLength={500} value={notes} onChange={(e) => setNotes(e.target.value)} /></div>
           {error && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}
