@@ -1796,6 +1796,12 @@ export interface ListOrdersParams {
   to?: string; // 下单日期止
   travelFrom?: string; // 出行日期起
   travelTo?: string; // 出行日期止
+  /**
+   * 返程日期筛选 —— 与出行日期是两个独立维度：出行日期恒指整单出发日区间，本字段另开一维，
+   * 按整单返程日（往返单的回程航段）匹配。可只填一端（开区间）；无回程腿的单不命中。
+   */
+  returnFrom?: string; // 返程日期起
+  returnTo?: string; // 返程日期止
   claimedById?: string;
   unclaimedOnly?: string; // '1' = 只看未接单
   flightNumber?: string; // 订单含该航班号的 FLIGHT 行（不区分大小写）

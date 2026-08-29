@@ -175,6 +175,8 @@ import {
   resolveHasReturnLeg,
   splitSearchTerms,
   filterOrderIdsByDepartDate,
+  deriveOrderReturnDate,
+  filterOrderIdsByReturnDate,
   assertDisplayedTotalMatches,
   computeGroundItemAmounts,
   resolveGroundItemUnitPrice,
@@ -5186,6 +5188,57 @@ describe('filterOrderIdsByDepartDate · 按整单出发日精确细筛', () => {
     expect(filterOrderIdsByDepartDate([noDate], '2026-07-11', '2026-07-11')).toEqual([]);
     // 不给窗口也一样不命中——「无锚点」是订单自身属性，与窗口无关。
     expect(filterOrderIdsByDepartDate([noDate], undefined, undefined)).toEqual([]);
+  });
+});
+
+// ── 返程日期精确细筛（整单返程日 = deriveOrderReturnDate 同口径；无回程腿不命中）──────
+describe('filterOrderIdsByReturnDate · 按整单返程日精确细筛', () => {
+  // 带班次的 FLIGHT 行：determineFlightLegItems 按 departureTime 升序取第 2 段 = 回程。
+  const flightLeg = (isoDepart: string, tz?: string | null) => ({
+    flightScheduleId: `sched-${isoDepart}`,
+    flightSchedule: { departureTime: new Date(isoDepart), departureTz: tz ?? null },
+  });
+
+  it('往返单（去程 7/10、回程 7/11），returnFrom=7/11 → 命中（回程=第 2 段，含起始边界）', () => {
+    const roundTrip = {
+      id: 'rt',
+      // 顺序刻意先回程后去程，验证按 departureTime 排序取「第 2 段」而非「第二条」。
+      items: [flightLeg('2026-07-11T09:00:00Z'), flightLeg('2026-07-10T08:00:00Z')],
+    };
+    expect(filterOrderIdsByReturnDate([roundTrip], '2026-07-11', undefined)).toEqual(['rt']);
+  });
+
+  it('区间 [7/11, 7/12] 同时筛掉早于起始与晚于结束者，保留区间内（含边界）', () => {
+    const before = { id: 'b', items: [flightLeg('2026-07-01T00:00:00Z'), flightLeg('2026-07-10T00:00:00Z')] }; // 回程 7/10 < 7/11
+    const onFrom = { id: 'f', items: [flightLeg('2026-07-01T00:00:00Z'), flightLeg('2026-07-11T02:00:00Z')] }; // 回程 7/11 边界
+    const onTo = { id: 't', items: [flightLeg('2026-07-01T00:00:00Z'), flightLeg('2026-07-12T22:00:00Z')] }; // 回程 7/12 边界
+    const after = { id: 'z', items: [flightLeg('2026-07-01T00:00:00Z'), flightLeg('2026-07-13T01:00:00Z')] }; // 回程 7/13 > 7/12
+    const ids = filterOrderIdsByReturnDate([before, onFrom, onTo, after], '2026-07-11', '2026-07-12');
+    expect(ids).toEqual(['f', 't']);
+  });
+
+  it('单程单（只有 1 段带班次的 FLIGHT 行）→ 无回程腿，不命中', () => {
+    const oneway = { id: 'ow', items: [flightLeg('2026-07-10T08:00:00Z')] };
+    expect(filterOrderIdsByReturnDate([oneway], '2026-07-10', '2026-07-10')).toEqual([]);
+    // 不给窗口也一样不命中——「无回程腿」是订单自身属性，与窗口无关。
+    expect(filterOrderIdsByReturnDate([oneway], undefined, undefined)).toEqual([]);
+  });
+
+  it('纯地面单（无航班）→ 无回程腿，不命中；与出发日期不同，返程日期没有酒店/签证兜底', () => {
+    const hotelOnly = { id: 'h', items: [{ flightScheduleId: null, flightSchedule: null }] };
+    expect(filterOrderIdsByReturnDate([hotelOnly], '2026-07-10', '2026-07-10')).toEqual([]);
+  });
+
+  it('回程腿按 departureTz 折算当地日期，不是 UTC 分量', () => {
+    // 澳门（UTC+8）当地 7/12 00:30 起飞的回程班次，UTC 分量还停在 7/11 16:30——
+    // 不按 tz 折算会把返程日期错判成 7/11。
+    const roundTrip = {
+      id: 'tz',
+      items: [flightLeg('2026-07-10T08:00:00Z'), flightLeg('2026-07-11T16:30:00Z', 'Asia/Macau')],
+    };
+    expect(deriveOrderReturnDate(roundTrip.items)).toBe('2026-07-12');
+    expect(filterOrderIdsByReturnDate([roundTrip], '2026-07-12', '2026-07-12')).toEqual(['tz']);
+    expect(filterOrderIdsByReturnDate([roundTrip], '2026-07-11', '2026-07-11')).toEqual([]);
   });
 });
 

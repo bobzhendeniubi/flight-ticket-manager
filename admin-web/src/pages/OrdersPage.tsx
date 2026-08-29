@@ -711,6 +711,10 @@ export function OrdersPage() {
   // 5/20 反馈：按出行日期筛 + 是否已认领
   const [travelFrom, setTravelFrom] = useState('');
   const [travelTo, setTravelTo] = useState('');
+  // 返程日期筛选 —— 与出行日期是两个独立维度：出行日期恒指整单出发日区间，本筛选另开一维，
+  // 按整单返程日（往返单的回程航段）匹配；无回程腿的单不命中。
+  const [returnFrom, setReturnFrom] = useState('');
+  const [returnTo, setReturnTo] = useState('');
   const [claimFilter, setClaimFilter] = useState<'' | 'unclaimed' | 'mine'>('');
   // ops 确认的筛选（航班号 / 乘客姓名 / 六态开票）— 后端过滤
   const [flightNumberFilter, setFlightNumberFilter] = useState('');
@@ -765,6 +769,9 @@ export function OrdersPage() {
     const resolvedTravel = travelDateRange(travelFrom, travelTo);
     if (resolvedTravel.travelFrom) q.travelFrom = resolvedTravel.travelFrom;
     if (resolvedTravel.travelTo) q.travelTo = resolvedTravel.travelTo;
+    // 返程日期：与出行日期同一套「两个框各自独立生效」的开区间口径，见 travelDateRange 注释。
+    if (returnFrom) q.returnFrom = returnFrom;
+    if (returnTo) q.returnTo = returnTo;
     if (claimFilter === 'unclaimed') q.unclaimedOnly = '1';
     if (debouncedFlightNumber.trim()) q.flightNumber = debouncedFlightNumber.trim();
     if (debouncedPassengerName.trim()) q.passengerName = debouncedPassengerName.trim();
@@ -782,7 +789,7 @@ export function OrdersPage() {
     if (tripTypeFilter) q.tripType = tripTypeFilter;
     if (debouncedSearch.trim()) q.search = debouncedSearch.trim();
     return q;
-  }, [kindFilter, createdFromParam, createdToParam, travelFrom, travelTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, debouncedRecordedBy, invoiceLegFilter, visaFilterCode, tripTypeFilter, debouncedSearch]);
+  }, [kindFilter, createdFromParam, createdToParam, travelFrom, travelTo, returnFrom, returnTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, debouncedRecordedBy, invoiceLegFilter, visaFilterCode, tripTypeFilter, debouncedSearch]);
   // 三模板筛选导出（全岗可用/票务专用/签证专用）
   const [exportTemplate, setExportTemplate] = useState<OrderExportTemplate>('full');
   const [exporting, setExporting] = useState(false);
@@ -2063,7 +2070,7 @@ export function OrdersPage() {
             // 始终等于 orders.length，徽标误报「未筛选」，让人以为筛选没生效。这里把后端筛选参数
             // 也纳入判定，只要任一条件生效就高亮显示「已筛选」。
             const hasBackendFilter = Boolean(
-              kindFilter || createdFrom || createdTo || travelFrom || travelTo ||
+              kindFilter || createdFrom || createdTo || travelFrom || travelTo || returnFrom || returnTo ||
               flightNumberFilter.trim() || passengerNameFilter.trim() || recordedByFilter.trim() ||
               invoiceLegFilter || visaFilterCode || tripTypeFilter || claimFilter,
             );
@@ -2507,6 +2514,42 @@ export function OrdersPage() {
             </button>
           </div>
           <div>
+            <label className="label">返程日期（从）</label>
+            <input
+              type="date"
+              className="input"
+              value={returnFrom}
+              max={returnTo || undefined}
+              onChange={(e) => setReturnFrom(e.target.value)}
+              title="按整单返程日筛选（往返单的回程航段，与出行日期是两个独立维度）。只填这一项＝这天起的全部订单；无回程腿的单不命中"
+            />
+          </div>
+          <div>
+            <label className="label">返程日期（到）</label>
+            <input
+              type="date"
+              className="input"
+              value={returnTo}
+              min={returnFrom || undefined}
+              onChange={(e) => setReturnTo(e.target.value)}
+              title="按整单返程日筛选（往返单的回程航段）。只填这一项＝这天及之前的全部订单；无回程腿的单不命中"
+            />
+            <button
+              type="button"
+              className="mt-1 text-xs text-brand hover:text-brand-dark disabled:cursor-not-allowed disabled:text-slate-300"
+              disabled={!returnFrom && !returnTo}
+              title={returnFrom || returnTo ? '把「从」和「到」都设成这一天，只看当天返程的订单' : '先在「从」或「到」里选一个日期'}
+              onClick={() => {
+                const day = returnFrom || returnTo;
+                if (!day) return;
+                setReturnFrom(day);
+                setReturnTo(day);
+              }}
+            >
+              只看某一天
+            </button>
+          </div>
+          <div>
             <label className="label">接单状态</label>
             <select
               className="input"
@@ -2662,7 +2705,7 @@ export function OrdersPage() {
             />
           </div>
         </div>
-        {(statusFilter || kindFilter || tripTypeFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || recordedByFilter || invoiceLegFilter || visaFilterCode || createdFrom || createdTo || travelFrom || travelTo) && (
+        {(statusFilter || kindFilter || tripTypeFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || recordedByFilter || invoiceLegFilter || visaFilterCode || createdFrom || createdTo || travelFrom || travelTo || returnFrom || returnTo) && (
           <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
             {/* 日期筛选回显 — 两个框各自独立生效，只填一个就是开区间；把当前生效的条件和命中单数
                 摊开写清楚，填了「从」却看到更晚的订单时一眼就知道为什么，不用猜。 */}
@@ -2675,6 +2718,7 @@ export function OrdersPage() {
               )}
               {(() => {
                 const travelEcho = describeDateRange(travelFrom, travelTo);
+                const returnEcho = describeDateRange(returnFrom, returnTo);
                 const createdEcho = describeDateRange(createdFrom, createdTo);
                 return (
                   <>
@@ -2682,6 +2726,11 @@ export function OrdersPage() {
                       <span className="rounded bg-brand-50 px-1.5 py-0.5 font-medium text-brand">
                         出行日期：{travelEcho} · 命中 {filtered.length}
                         {ordersTruncated ? '+' : ''} 单
+                      </span>
+                    )}
+                    {returnEcho && (
+                      <span className="rounded bg-brand-50 px-1.5 py-0.5 font-medium text-brand">
+                        返程日期：{returnEcho}
                       </span>
                     )}
                     {createdEcho && (
@@ -2698,7 +2747,7 @@ export function OrdersPage() {
               onClick={() => {
                 setStatusFilter(''); setKindFilter(''); setChannelFilter(''); setAgentFilter(''); setSearch('');
                 setFlightNumberFilter(''); setPassengerNameFilter(''); setRecordedByFilter(''); setInvoiceLegFilter(''); setVisaFilterCode(''); setTripTypeFilter('');
-                setCreatedFrom(''); setCreatedTo(''); setCreatedFromTime(''); setCreatedToTime(''); setTravelFrom(''); setTravelTo('');
+                setCreatedFrom(''); setCreatedTo(''); setCreatedFromTime(''); setCreatedToTime(''); setTravelFrom(''); setTravelTo(''); setReturnFrom(''); setReturnTo('');
               }}
             >
               清除所有过滤

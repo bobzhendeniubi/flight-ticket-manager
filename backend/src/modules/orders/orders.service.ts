@@ -3532,13 +3532,15 @@ export class OrderService {
     if (query.claimedById) where.claimedById = query.claimedById;
     if (query.unclaimedOnly) where.claimedById = null;
 
-    // 出行日期精确细筛（两段式）：buildOrderFilterWhere 的 travelFrom/travelTo 只做 ±1 天粗窗口
-    //（防 UTC/本地日边界漏单），会把「去程 7/10、回程 7/11」这类整单出发日在窗口外的往返单也粗召回。
-    // 这里在分页/计数之前，先按粗窗口 + 全部筛选 + RBAC 圈出候选订单的最早航段/酒店时间（只取必要字段），
-    // 在 JS 里按整单出发日（deriveOrderDepartDate 同口径，= 列表「出发日期」列）精确判定，
-    // 再把命中 id 作为 id in (...) 并回 where —— 保证分页 take/skip 与总数都在精确过滤之后计算，
-    // 且「列表所见 = 筛选所得」。orderIds 勾选导出不走 listOrders，此处无需考虑。
-    if (query.travelFrom || query.travelTo) {
+    // 出行日期 / 返程日期精确细筛（两段式）：buildOrderFilterWhere 的 travelFrom/travelTo、
+    // returnFrom/returnTo 都只做 ±1 天粗窗口（防 UTC/本地日边界漏单），会把「去程 7/10、回程
+    // 7/11」这类整单出发日/返程日在窗口外的往返单也粗召回。
+    // 这里在分页/计数之前，先按粗窗口 + 全部筛选 + RBAC 圈出候选订单的最早/回程航段与酒店时间
+    //（只取必要字段），在 JS 里按整单出发日（deriveOrderDepartDate）与整单返程日
+    //（deriveOrderReturnDate）精确判定，再把命中 id 作为 id in (...) 并回 where —— 保证分页
+    // take/skip 与总数都在精确过滤之后计算，且「列表所见 = 筛选所得」。两个筛选可同时给出，
+    // 精确结果取交集。orderIds 勾选导出不走 listOrders，此处无需考虑。
+    if (query.travelFrom || query.travelTo || query.returnFrom || query.returnTo) {
       const candidates = await prisma.order.findMany({
         where,
         select: {
@@ -3549,12 +3551,24 @@ export class OrderService {
               // 纯签证单的第三级日期锚点：漏了这个字段，deriveOrderDepartDate 在精筛时
               // 拿不到签证预计出行日期 → 派生 null → 整单被丢，DB 召回白做。
               visaIntendedDate: true,
+              // 回程精筛（deriveOrderReturnDate → determineFlightLegItems）按 departureTime
+              // 升序取第 2 段，需要 flightScheduleId 才能判定该行是不是「带班次的 FLIGHT 行」。
+              flightScheduleId: true,
               flightSchedule: { select: { departureTime: true, departureTz: true } },
             },
           },
         },
       });
-      const preciseIds = filterOrderIdsByDepartDate(candidates, query.travelFrom, query.travelTo);
+      let preciseIds = candidates.map((c) => c.id);
+      if (query.travelFrom || query.travelTo) {
+        preciseIds = filterOrderIdsByDepartDate(candidates, query.travelFrom, query.travelTo);
+      }
+      if (query.returnFrom || query.returnTo) {
+        const returnMatched = new Set(
+          filterOrderIdsByReturnDate(candidates, query.returnFrom, query.returnTo),
+        );
+        preciseIds = preciseIds.filter((id) => returnMatched.has(id));
+      }
       where.id = { in: preciseIds };
     }
 
@@ -10412,6 +10426,8 @@ export type OrderListFilters = Pick<
   | 'to'
   | 'travelFrom'
   | 'travelTo'
+  | 'returnFrom'
+  | 'returnTo'
   | 'flightNumber'
   | 'passengerName'
   | 'recordedBy'
@@ -10623,6 +10639,32 @@ export function buildOrderFilterWhere(
     andClauses.push(
       options?.includeAnchorless ? { OR: [anchoredInWindow, anchorlessVisaOnly] } : anchoredInWindow,
     );
+  }
+  // 按返程日期筛选 — 两段式的 DB 粗窗口（精筛在 listOrders 里用 filterOrderIdsByReturnDate）。
+  // 与出发日期同一套 ±1 天安全余量口径；但只看 FLIGHT 行的班次出发时间——返程日期没有酒店/签证
+  // 兜底（只对「确实买了回程机票」的单有意义），粗窗口只需保证真正的回程腿落在窗口内的订单
+  // 被召回即可，允许多召回去程腿恰好落在窗口内的单（JS 精筛会按 determineFlightLegItems 的
+  // 第 2 段口径把它们筛掉）。
+  if (query.returnFrom || query.returnTo) {
+    const start = query.returnFrom
+      ? new Date(new Date(`${query.returnFrom}T00:00:00Z`).getTime() - DAY_MS)
+      : undefined;
+    const end = query.returnTo
+      ? new Date(new Date(`${query.returnTo}T23:59:59Z`).getTime() + DAY_MS)
+      : undefined;
+    andClauses.push({
+      items: {
+        some: {
+          kind: OrderItemKind.FLIGHT,
+          flightSchedule: {
+            departureTime: {
+              ...(start ? { gte: start } : {}),
+              ...(end ? { lte: end } : {}),
+            },
+          },
+        },
+      },
+    });
   }
   // 精确按班次：订单需含该班次的 FLIGHT 行。整班·全岗导出专用——比 travelFrom/travelTo 精确，
   // 不受出行日期窗口 ±1 天放宽影响，保证只导该班次当天的订单。
@@ -12110,6 +12152,52 @@ export function filterOrderIdsByDepartDate(
     if (departDate === null) continue;
     if (travelFrom && departDate < travelFrom) continue;
     if (travelTo && departDate > travelTo) continue;
+    result.push(o.id);
+  }
+  return result;
+}
+
+/** deriveOrderReturnDate / filterOrderIdsByReturnDate 入参：determineFlightLegItems 的最小字段集，外加 departureTz。 */
+interface ReturnLegItem extends FlightLegItem {
+  flightSchedule?: { departureTime: Date | string; departureTz?: string | null } | null;
+}
+
+/**
+ * 订单「返程日期」派生（返程日期筛选用；YYYY-MM-DD 或 null）。
+ * 口径与 deriveOrderDepartDate 同源但只认回程航段、无兜底：
+ *   带班次的 FLIGHT 行按 departureTime 升序，第 2 段 = 回程（与 determineFlightLegItems /
+ *   Order.hasReturnLeg 物化列同一判定），当地日期按该腿 departureTz 折算。
+ * 单程单 / 纯地面单没有回程腿 → null —— **不像出发日期那样回落酒店入住日或签证预计出行日**：
+ * 返程日期只对「确实买了回程机票」的订单有意义，没有回程票就没有「无处归日」这回事。
+ */
+export function deriveOrderReturnDate(items: ReadonlyArray<ReturnLegItem>): string | null {
+  const { return: returnItem } = determineFlightLegItems(items);
+  const schedule = returnItem?.flightSchedule;
+  if (!schedule?.departureTime) return null;
+  const d = new Date(schedule.departureTime);
+  if (Number.isNaN(d.getTime())) return null;
+  return formatDateOnly(d, schedule.departureTz ?? null);
+}
+
+/**
+ * 返程日期精确细筛：把「粗窗口候选订单」（buildOrderFilterWhere 的 returnFrom/returnTo 分支，
+ * 按 FLIGHT 行 departureTime ±1 天粗召回）按整单返程日（deriveOrderReturnDate 同口径）精确过滤到
+ * [returnFrom, returnTo] 内，返回命中的订单 id。两端半闭区间含边界（returnFrom/returnTo 各自可选）。
+ * 无回程腿的单（单程/纯地面/纯签证单）→ **不命中**：与出发日期筛选的「无锚点不命中」同一立场
+ * ——筛选是「找某天回的单」，没有回程票的单填了返程筛选就该被筛掉，不该无条件出现在每个区间里。
+ * 导出供 listOrders 调用 + 单测。
+ */
+export function filterOrderIdsByReturnDate(
+  candidates: ReadonlyArray<{ id: string; items: ReadonlyArray<ReturnLegItem> }>,
+  returnFrom?: string,
+  returnTo?: string,
+): string[] {
+  const result: string[] = [];
+  for (const o of candidates) {
+    const returnDate = deriveOrderReturnDate(o.items);
+    if (returnDate === null) continue;
+    if (returnFrom && returnDate < returnFrom) continue;
+    if (returnTo && returnDate > returnTo) continue;
     result.push(o.id);
   }
   return result;

@@ -626,6 +626,11 @@ export const listOrdersQuerySchema = z.object({
   // 按出行日期筛选（票务/签证流程按日期批量处理，反馈高优需求）
   travelFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   travelTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  // 按返程日期筛选（出行日期语义不变 = 整单出发日区间；本参数另开一维 = 整单返程日区间）。
+  // 只对有回程航段的往返单有意义——无回程腿的单程/纯地面单在填了本筛选时不命中，见
+  // filterOrderIdsByReturnDate。口径与 travelFrom/travelTo 对称：可只填一端，单填一端即开区间。
+  returnFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  returnTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   // 接单状态过滤
   claimedById: z.string().optional(),   // 指定 ops
   unclaimedOnly: z.coerce.boolean().optional(),
