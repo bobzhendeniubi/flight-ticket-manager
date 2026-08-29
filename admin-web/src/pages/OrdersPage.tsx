@@ -3778,7 +3778,14 @@ export function OrdersPage() {
               {!loading && filtered.length === 0 && (
                 <tr>
                   <td colSpan={tableColSpan} className="py-8 text-center text-ink-muted">
-                    没有符合条件的订单
+                    <div>没有符合条件的订单</div>
+                    {/* 大搜索框是词间 AND（找同一张单），多个不同订单的乘客姓名一起填必然 0 条——
+                        提示改用「乘客姓名」筛选（逗号分隔多个名字，是 OR 语义）。 */}
+                    {splitSearchTerms(search).length >= 2 && (
+                      <div className="mt-1 text-xs text-ink-soft">
+                        大搜索框要求这些词命中同一张订单；想把多位客人各自的订单都列出来，请用上方「乘客姓名」筛选（逗号分隔多个名字）。
+                      </div>
+                    )}
                   </td>
                 </tr>
               )}
