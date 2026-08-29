@@ -30,6 +30,7 @@ import {
   changeRequestBodySchema,
   createOrderBodySchema,
   orderPriceAdjustmentBodySchema,
+  PRICE_ADJUSTMENT_REASON_LABEL,
   roomSupplementBodySchema,
   exportRoomAllocationQuerySchema,
   exportTemplatesQuerySchema,
@@ -2194,6 +2195,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         total: audit.after.total,
         amountCny: audit.amountCny,
         reasonCode: audit.reasonCode,
+        reasonLabel: PRICE_ADJUSTMENT_REASON_LABEL[audit.reasonCode as keyof typeof PRICE_ADJUSTMENT_REASON_LABEL],
+        // 对齐录单路径（ADJUST_ORDER_PRICE）审计键名：补齐说明文本，非 OTHER 原因常为 null。
+        reasonText: body.reasonText?.trim() || null,
         // 归属乘客（整单调价为 null）；只记 id/姓名用于审计可读，不落证件级敏感数据。
         passengerId: audit.passengerId,
         passengerName: audit.passengerName,

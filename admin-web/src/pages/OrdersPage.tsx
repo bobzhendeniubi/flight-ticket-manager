@@ -7150,18 +7150,18 @@ function PriceAdjustmentSection({
               className="input mt-0.5 w-full"
             />
           </label>
-          {reasonCode === 'OTHER' && (
-            <label className="block">
-              <span className="text-[11px] font-medium text-ink-muted">原因说明（「其它」必填）</span>
-              <input
-                className="input mt-0.5 w-full"
-                value={reasonText}
-                onChange={(e) => setReasonText(e.target.value)}
-                maxLength={200}
-                placeholder="简述调整原因"
-              />
-            </label>
-          )}
+          <label className="block">
+            <span className="text-[11px] font-medium text-ink-muted">
+              原因说明（选「其它」必填，其余选填）
+            </span>
+            <input
+              className="input mt-0.5 w-full"
+              value={reasonText}
+              onChange={(e) => setReasonText(e.target.value)}
+              maxLength={200}
+              placeholder={reasonCode === 'OTHER' ? '必填：简述调整原因' : '如补杂费，请写明具体杂费名目'}
+            />
+          </label>
           <p className="text-[11px] leading-snug text-ink-muted">
             只在系统权威价上加减一笔差额并留审计记录；不会改动机票/酒店等基础项价格。订单总额 = 系统价 + Σ调整。
           </p>
