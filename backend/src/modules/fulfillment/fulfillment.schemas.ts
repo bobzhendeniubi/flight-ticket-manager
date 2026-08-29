@@ -3,6 +3,7 @@ import {
   FulfillmentStatus,
   FulfillmentType,
   VisaIssuanceMethod,
+  VisaRequirement,
   VisaSubmissionStatus,
 } from '@prisma/client';
 
@@ -35,6 +36,25 @@ export const listFulfillmentQuerySchema = z.object({
   assigneeUserId: z.string().optional(),
   // 备注文本筛选（不区分大小写子串匹配）；省略/空串 = 不筛
   notesQuery: z.string().max(100).optional(),
+  /**
+   * 客人筛选（乘客姓名 / 中文名 / 护照号，不区分大小写子串匹配）；省略/空串 = 不筛。
+   * 命中口径是「这一单里有这个人」——**不要求该乘客非自备签**：签证岗拿着一个名字来找单，
+   * 要的是"这人在哪张单上"，不是"这人要不要我们办"。
+   * 与订单搜索的乘客子句同构（见 orders.service 的 buildSearchTermClause）。
+   */
+  passengerQuery: z.string().max(100).optional(),
+  /**
+   * 签证口径筛选（签证台「签证口径」下拉）—— 前四档逐字对应订单级 Order.visaStatus：
+   * NEEDED=需要签证 / E_VISA=电子签 / HAS_VISA=已签证 / NOT_NEEDED=未签证（不需要·自备签），
+   * 外加 'UNSET'=未标注（visaStatus 为 NULL，录单从没填过签证状态）。省略 = 不筛（全部）。
+   *
+   * 用字面量 union 而不是 nativeEnum：'未标注' 在库里是 NULL，本就不是枚举的一个成员，
+   * 硬塞进枚举会让"没填"和"填了某个值"混成一档。字面量取 'UNSET' 而非 'NONE'，是为了
+   * 不与同为四档之一的 NOT_NEEDED（不需要）在读代码时撞脸——两者语义完全不同：
+   * NOT_NEEDED = 录单明确说了「这单不需要办」，UNSET = 录单压根没表态。
+   * （形状与下方 issuanceMethod 的 union 同款。）
+   */
+  visaRequirement: z.union([z.nativeEnum(VisaRequirement), z.literal('UNSET')]).optional(),
   /**
    * 签发方式筛选（签证台「签证类型」）；'NONE' = 未标注。
    * 口径与 effectiveVisaClassification 的**有效签发方式**逐字对齐

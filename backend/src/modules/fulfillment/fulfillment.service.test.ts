@@ -26,7 +26,9 @@ import {
   deriveVisaTaskStatus,
   effectiveVisaClassification,
   issuanceMethodWhere,
+  passengerQueryWhere,
   resolveVisaUnitCost,
+  visaRequirementWhere,
 } from './fulfillment.service.js';
 
 describe('FulfillmentService.batchUpdateStatus', () => {
@@ -1221,5 +1223,175 @@ describe('FulfillmentService.batchUpdateVisaPassengerStatus', () => {
     expect(updateMany).not.toHaveBeenCalled();
     expect(rederive).not.toHaveBeenCalled();
     expect(res).toMatchObject({ successCount: 0, failureCount: 1, affectedOrderIds: [] });
+  });
+});
+
+// ── 签证台「签证口径」四档 + 「客人搜索」的 where 下沉 ───────────────────────────
+
+describe('visaRequirementWhere — 签证口径四档直比订单级 visaStatus', () => {
+  /**
+   * 四档逐字对应 Order.visaStatus 枚举，无推断无回退（与 issuanceMethodWhere 的
+   * 「产品字段 ?? 录单回退」是两根不同的轴，别互相串味）。
+   */
+  const cases: Array<{ label: string; filter: VisaRequirement }> = [
+    { label: '需要签证', filter: VisaRequirement.NEEDED },
+    { label: '电子签', filter: VisaRequirement.E_VISA },
+    { label: '已签证', filter: VisaRequirement.HAS_VISA },
+    { label: '未签证（不需要·自备签）', filter: VisaRequirement.NOT_NEEDED },
+  ];
+
+  for (const c of cases) {
+    it(`${c.label} → order.visaStatus = ${c.filter}`, () => {
+      expect(visaRequirementWhere(c.filter)).toEqual({ order: { visaStatus: c.filter } });
+    });
+  }
+
+  it('四档互不重叠：每档只认自己那一个枚举值（等值比对，不是集合/范围）', () => {
+    const produced = cases.map((c) => visaRequirementWhere(c.filter).order);
+    const statuses = produced.map((o) => (o as { visaStatus: VisaRequirement }).visaStatus);
+    expect(new Set(statuses).size).toBe(4);
+  });
+
+  it('不做任何回退：已签证/未签证两档不会被改写成签发方式口径', () => {
+    // 这两档在 ORDER_STATUS_ISSUANCE_FALLBACK 里没有回退来源，本函数也不该去碰那张表
+    expect(visaRequirementWhere(VisaRequirement.HAS_VISA)).toEqual({
+      order: { visaStatus: VisaRequirement.HAS_VISA },
+    });
+    expect(visaRequirementWhere(VisaRequirement.NOT_NEEDED)).toEqual({
+      order: { visaStatus: VisaRequirement.NOT_NEEDED },
+    });
+  });
+
+  it("'UNSET'（未标注）→ order.visaStatus = null（IS NULL），不是某个枚举值", () => {
+    const where = visaRequirementWhere('UNSET');
+    expect(where).toEqual({ order: { visaStatus: null } });
+    // 显式钉住 null 而非 undefined：undefined 在 Prisma 里等于「这个条件不存在」，
+    // 会把「未标注」悄悄退化成「全部」——正是这一档要防的静默失效。
+    const { visaStatus } = (where.order ?? {}) as { visaStatus?: unknown };
+    expect(visaStatus).toBeNull();
+    expect(visaStatus).not.toBeUndefined();
+  });
+
+  it("'UNSET' 与「未签证(NOT_NEEDED)」是两档，不可互相顶替", () => {
+    // 录单没表态（NULL） ≠ 录单明确说了「不需要办」；混成一档会让两批单互相污染
+    expect(visaRequirementWhere('UNSET')).not.toEqual(
+      visaRequirementWhere(VisaRequirement.NOT_NEEDED),
+    );
+  });
+
+  it('五档两两不同：四个枚举值 + 一个 NULL', () => {
+    const all = [...cases.map((c) => c.filter), 'UNSET' as const];
+    const serialized = all.map((f) => JSON.stringify(visaRequirementWhere(f)));
+    expect(new Set(serialized).size).toBe(5);
+  });
+});
+
+describe('passengerQueryWhere — 客人搜索（姓名 / 中文名 / 护照号）', () => {
+  it('三字段 OR 模糊匹配，姓名与护照号都不区分大小写', () => {
+    expect(passengerQueryWhere('张三')).toEqual({
+      order: {
+        passengers: {
+          some: {
+            OR: [
+              { fullName: { contains: '张三', mode: 'insensitive' } },
+              { chineseName: { contains: '张三', mode: 'insensitive' } },
+              { documentNumber: { contains: '张三', mode: 'insensitive' } },
+            ],
+          },
+        },
+      },
+    });
+  });
+
+  it('不附加 visaExempt 条件：命中口径是「这一单里有这个人」，不是「这人要我方代办」', () => {
+    const some = (
+      passengerQueryWhere('E1234567').order as {
+        passengers: { some: Record<string, unknown> };
+      }
+    ).passengers.some;
+    // some 里只有 OR 一把钥匙——多一个 visaExempt 就会让自备签客人搜不出他所在的单
+    expect(Object.keys(some)).toEqual(['OR']);
+  });
+});
+
+describe('FulfillmentService.list — 新筛选下沉到 where（count 与列表共用同一 where）', () => {
+  /** 把 list() 需要的 prisma 面装好；返回 findMany / count 的 spy 供断言 where。 */
+  function mockListPrisma() {
+    const findMany = vi.fn().mockResolvedValue([]);
+    const count = vi.fn().mockResolvedValue(0);
+    const p = prisma as unknown as {
+      fulfillmentTask: { findMany: typeof findMany; count: typeof count };
+      $transaction: (ops: unknown[]) => Promise<unknown[]>;
+    };
+    p.fulfillmentTask = { findMany, count };
+    p.$transaction = async (ops: unknown[]) => Promise.all(ops as Promise<unknown>[]);
+    return { findMany, count };
+  }
+
+  /** list() 的必填分页参数（schema 有默认值，这里显式给） */
+  const paging = { page: 1, pageSize: 50 } as const;
+
+  it('visaRequirement 下沉为 orderItem.AND 里的 order.visaStatus 等值条件', async () => {
+    const { findMany } = mockListPrisma();
+    await new FulfillmentService().list({
+      ...paging,
+      visaRequirement: VisaRequirement.HAS_VISA,
+    } as never);
+
+    const { where } = findMany.mock.calls[0][0] as {
+      where: { orderItem: { AND?: unknown[] } };
+    };
+    expect(where.orderItem.AND).toContainEqual({
+      order: { visaStatus: VisaRequirement.HAS_VISA },
+    });
+  });
+
+  it('passengerQuery 下沉为 orderItem.AND 里的乘客子查询', async () => {
+    const { findMany } = mockListPrisma();
+    await new FulfillmentService().list({ ...paging, passengerQuery: '李四' } as never);
+
+    const { where } = findMany.mock.calls[0][0] as {
+      where: { orderItem: { AND?: unknown[] } };
+    };
+    expect(where.orderItem.AND).toContainEqual(passengerQueryWhere('李四'));
+  });
+
+  it('两者同时给 = AND（既是这一档口径、单里又有这个人）', async () => {
+    const { findMany } = mockListPrisma();
+    await new FulfillmentService().list({
+      ...paging,
+      visaRequirement: VisaRequirement.NEEDED,
+      passengerQuery: 'E1234567',
+    } as never);
+
+    const { where } = findMany.mock.calls[0][0] as {
+      where: { orderItem: { AND?: unknown[] } };
+    };
+    expect(where.orderItem.AND).toHaveLength(2);
+    expect(where.orderItem.AND).toContainEqual({ order: { visaStatus: VisaRequirement.NEEDED } });
+    expect(where.orderItem.AND).toContainEqual(passengerQueryWhere('E1234567'));
+  });
+
+  it('count 与列表共用同一个 where 对象 —— 总数与能翻到的行数不会对不上', async () => {
+    const { findMany, count } = mockListPrisma();
+    await new FulfillmentService().list({
+      ...paging,
+      visaRequirement: VisaRequirement.E_VISA,
+      passengerQuery: '王五',
+    } as never);
+
+    const listWhere = (findMany.mock.calls[0][0] as { where: unknown }).where;
+    const countWhere = (count.mock.calls[0][0] as { where: unknown }).where;
+    expect(countWhere).toBe(listWhere);
+  });
+
+  it('两个参数都不给时不产生任何附加条件（不影响现有调用）', async () => {
+    const { findMany } = mockListPrisma();
+    await new FulfillmentService().list({ ...paging } as never);
+
+    const { where } = findMany.mock.calls[0][0] as {
+      where: { orderItem: { AND?: unknown[] } };
+    };
+    expect(where.orderItem.AND).toBeUndefined();
   });
 });

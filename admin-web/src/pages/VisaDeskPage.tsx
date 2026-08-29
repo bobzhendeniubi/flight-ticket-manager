@@ -123,16 +123,34 @@ const FILTER_OPTIONS: Array<{ value: StatusFilter; label: string }> = [
   { value: 'ALL', label: '全部状态' },
 ];
 
-// 签证签发方式筛选（走后端 issuanceMethod 参数；'NONE' = 未标注，'' = 全部不筛）
-type IssuanceFilter = '' | 'E_VISA' | 'STICKER' | 'ARRIVAL' | 'NONE';
+/**
+ * 签证口径筛选（走后端 visaRequirement 参数）——逐字对应订单级录单「签证状态」四档；
+ * '' = 全部（默认，不筛）。录单没填签证状态的单不属于任何一档，只在「全部」下可见。
+ *
+ * 注：签发方式（电子签/贴纸签/落地签）是另一根轴，后端 issuanceMethod 参数仍在，
+ * 只是界面上先不暴露——要加回来把下拉接上即可。
+ */
+type VisaRequirementFilter = '' | 'NEEDED' | 'E_VISA' | 'HAS_VISA' | 'NOT_NEEDED' | 'UNSET';
 
-const ISSUANCE_FILTER_OPTIONS: Array<{ value: IssuanceFilter; label: string }> = [
+const VISA_REQUIREMENT_OPTIONS: Array<{ value: VisaRequirementFilter; label: string }> = [
   { value: '', label: '全部' },
+  { value: 'NEEDED', label: '需要签证' },
   { value: 'E_VISA', label: '电子签' },
-  { value: 'STICKER', label: '贴纸签' },
-  { value: 'ARRIVAL', label: '落地签' },
-  { value: 'NONE', label: '未标注' },
+  { value: 'HAS_VISA', label: '已签证' },
+  { value: 'NOT_NEEDED', label: '未签证（不需要·自备签）' },
+  // 未标注放最后：它不是一种签证口径，是「录单没填」——单独一档才捞得着这批单
+  { value: 'UNSET', label: '未标注（录单未填）' },
 ];
+
+/**
+ * 这两档在「待办」视图下必然空手而归 —— 订单不需要我方代办签证时，系统会把还没人动手的
+ * 签证任务自动置成「已取消」，而「待办」只看待处理 + 材料准备。
+ * 选中即自动切「全部状态」并在下方说明原因；切回其它档时把用户原来的状态选择还回去。
+ *
+ * 「未标注」**不在此列**：录单没填签证状态不影响任务该不该办，这批单的任务照常走
+ * 待处理 / 材料准备，状态筛选正常联动即可，不该被顶到「全部状态」。
+ */
+const FORCE_ALL_STATUS_REQUIREMENTS: VisaRequirementFilter[] = ['HAS_VISA', 'NOT_NEEDED'];
 
 /**
  * 类型徽章的证据档位（后端 visaIssuanceSource/visaEntrySource 随任务下发）：
@@ -1136,19 +1154,35 @@ export function VisaDeskPage() {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('OPEN');
-  const [issuanceFilter, setIssuanceFilter] = useState<IssuanceFilter>('');
+  // 签证口径（走后端 visaRequirement）；'' = 全部
+  const [visaRequirementFilter, setVisaRequirementFilter] = useState<VisaRequirementFilter>('');
+  /**
+   * 被「已签证 / 未签证」两档顶掉之前，用户自己选的那个状态筛选。
+   * 切回其它档时还回去；用户在被顶期间又手动改了状态 → 以他的新选择为准，暂存作废。
+   */
+  const stashedStatusRef = useRef<StatusFilter | null>(null);
   // 出发日期区间（走后端 departureDateFrom/To）；空 = 不按出发日过滤
   const [departureFrom, setDepartureFrom] = useState('');
   const [departureTo, setDepartureTo] = useState('');
   // 备注搜索（走后端 notesQuery）；400ms 防抖
   const [notesQueryInput, setNotesQueryInput] = useState('');
   const [debouncedNotesQuery, setDebouncedNotesQuery] = useState('');
+  // 客人搜索（走后端 passengerQuery：乘客姓名 / 护照号）；防抖与备注搜索一致
+  const [passengerQueryInput, setPassengerQueryInput] = useState('');
+  const [debouncedPassengerQuery, setDebouncedPassengerQuery] = useState('');
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
   const [currentPage, setCurrentPage] = useState(1);
   useEffect(() => {
     const t = setTimeout(() => setDebouncedNotesQuery(notesQueryInput.trim()), 400);
     return () => clearTimeout(t);
   }, [notesQueryInput]);
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedPassengerQuery(passengerQueryInput.trim()), 400);
+    return () => clearTimeout(t);
+  }, [passengerQueryInput]);
+
+  // 当前口径是否属于「任务多已自动取消」的两档 → 状态筛选被顶到「全部状态」并给出说明
+  const statusForcedAll = FORCE_ALL_STATUS_REQUIREMENTS.includes(visaRequirementFilter);
 
   const [rosterDownloading, setRosterDownloading] = useState(false);
   const [passportsDownloading, setPassportsDownloading] = useState(false);
@@ -1211,10 +1245,11 @@ export function VisaDeskPage() {
     const query: ListFulfillmentParams = {
       type: 'VISA_APPLICATION',
       status: STATUS_FILTER_PARAM[statusFilter],
-      issuanceMethod: issuanceFilter || undefined,
+      visaRequirement: visaRequirementFilter || undefined,
       departureDateFrom: departureFrom || undefined,
       departureDateTo: departureTo || undefined,
       notesQuery: debouncedNotesQuery || undefined,
+      passengerQuery: debouncedPassengerQuery || undefined,
       pageSize: PAGE_SIZE,
     };
     api
@@ -1233,12 +1268,31 @@ export function VisaDeskPage() {
     return () => {
       cancelled = true;
     };
-  }, [token, statusFilter, issuanceFilter, departureFrom, departureTo, debouncedNotesQuery, refreshNonce]);
+  }, [
+    token,
+    statusFilter,
+    visaRequirementFilter,
+    departureFrom,
+    departureTo,
+    debouncedNotesQuery,
+    debouncedPassengerQuery,
+    refreshNonce,
+  ]);
 
-  // 筛选/每页数变化时回到第 1 页；备注输入变化时立即重置，防抖后也覆盖后端筛选生效的时点。
+  // 筛选/每页数变化时回到第 1 页；搜索框输入变化时立即重置，防抖后也覆盖后端筛选生效的时点。
   useEffect(() => {
     setCurrentPage(1);
-  }, [statusFilter, issuanceFilter, departureFrom, departureTo, notesQueryInput, debouncedNotesQuery, pageSize]);
+  }, [
+    statusFilter,
+    visaRequirementFilter,
+    departureFrom,
+    departureTo,
+    notesQueryInput,
+    debouncedNotesQuery,
+    passengerQueryInput,
+    debouncedPassengerQuery,
+    pageSize,
+  ]);
 
   // 客户端按任务（订单）粒度分页；服务端仍一次最多返回 PAGE_SIZE 条任务。
   const totalPages = Math.max(1, Math.ceil(tasks.length / pageSize));
@@ -1298,6 +1352,28 @@ export function VisaDeskPage() {
     setSelectedPassengerIds(new Set());
     setBatchResults(null);
   }, []);
+
+  /**
+   * 切换签证口径 —— 顺带管好状态筛选，避免「选了档位永远空列表还不说话」：
+   * 进入「已签证 / 未签证」两档时暂存用户原来的状态选择并切到「全部状态」（这两档的任务
+   * 多已被系统自动取消，留在「待办」下必然空手），离开时原样还回去。
+   */
+  const changeVisaRequirement = useCallback(
+    (next: VisaRequirementFilter) => {
+      const nextForces = FORCE_ALL_STATUS_REQUIREMENTS.includes(next);
+      if (nextForces && !statusForcedAll) {
+        stashedStatusRef.current = statusFilter;
+        setStatusFilter('ALL');
+      } else if (!nextForces && statusForcedAll) {
+        const restored = stashedStatusRef.current;
+        stashedStatusRef.current = null;
+        if (restored) setStatusFilter(restored);
+      }
+      setVisaRequirementFilter(next);
+      clearSelection();
+    },
+    [clearSelection, statusFilter, statusForcedAll],
+  );
 
   // 勾选乘客 → 去重订单 id（下载名单/护照用）
   const selectedOrderIds = useMemo(
@@ -1613,6 +1689,8 @@ export function VisaDeskPage() {
               className="input max-w-[16rem] py-1.5"
               value={statusFilter}
               onChange={(e) => {
+                // 被顶到「全部状态」期间用户又自己改了状态 → 以他的新选择为准，暂存作废
+                stashedStatusRef.current = null;
                 setStatusFilter(e.target.value as StatusFilter);
                 clearSelection();
               }}
@@ -1626,22 +1704,28 @@ export function VisaDeskPage() {
             <p className="mt-1 text-xs text-ink-muted">新录入的待送签单在『待处理』里</p>
           </div>
           <div>
-            <label className="label">签证类型</label>
+            <label className="label">签证口径</label>
             <select
-              className="input max-w-[10rem] py-1.5"
-              value={issuanceFilter}
-              onChange={(e) => {
-                setIssuanceFilter(e.target.value as IssuanceFilter);
-                clearSelection();
-              }}
+              className="input max-w-[14rem] py-1.5"
+              value={visaRequirementFilter}
+              onChange={(e) => changeVisaRequirement(e.target.value as VisaRequirementFilter)}
             >
-              {ISSUANCE_FILTER_OPTIONS.map((o) => (
+              {VISA_REQUIREMENT_OPTIONS.map((o) => (
                 <option key={o.value} value={o.value}>
                   {o.label}
                 </option>
               ))}
             </select>
-            <p className="mt-1 text-xs text-ink-muted">按签发方式筛选</p>
+            {statusForcedAll ? (
+              <p className="mt-1 max-w-[14rem] text-xs text-amber-600">
+                已自动切到「全部状态」：这档的单我方不代办签证，任务多已被系统置为「已取消」，
+                留在「待办」下会是空列表。换回其它档即恢复原来的状态筛选。
+              </p>
+            ) : (
+              <p className="mt-1 max-w-[14rem] text-xs text-ink-muted">
+                按录单「签证状态」筛选；录单没填的单归在「未标注」档
+              </p>
+            )}
           </div>
           <div>
             <label className="label">出发日期区间</label>
@@ -1710,6 +1794,36 @@ export function VisaDeskPage() {
               )}
             </div>
             <p className="mt-1 text-xs text-ink-muted">服务端按备注模糊匹配（不受 200 条截断影响）</p>
+          </div>
+          <div>
+            <label className="label">客人搜索</label>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                className="input max-w-[14rem] py-1.5"
+                value={passengerQueryInput}
+                placeholder="姓名 / 护照号…"
+                onChange={(e) => {
+                  setPassengerQueryInput(e.target.value);
+                  clearSelection();
+                }}
+              />
+              {passengerQueryInput && (
+                <button
+                  type="button"
+                  className="btn-ghost py-1.5 text-xs"
+                  onClick={() => {
+                    setPassengerQueryInput('');
+                    clearSelection();
+                  }}
+                >
+                  清除
+                </button>
+              )}
+            </div>
+            <p className="mt-1 max-w-[14rem] text-xs text-ink-muted">
+              服务端按乘客姓名 / 护照号模糊匹配；命中的是整张单，同行人会一并带出
+            </p>
           </div>
         </div>
       </section>

@@ -187,6 +187,53 @@ export function issuanceMethodWhere(
 }
 
 /**
+ * 「客人搜索」下沉到查询层 —— 按乘客姓名 / 中文名 / 护照号模糊命中，任一乘客命中即命中该任务。
+ *
+ * 口径要点：命中的是「**这一单里有这个人**」，不附加 visaExempt 条件。拿着一个名字来找单，
+ * 问的是"这人在哪张单上"，不是"这人要不要我方代办"；若在这里再卡自备签，自备签客人的名字
+ * 就永远搜不出他所在的那张单（而那张单可能正因为别的同行人要送签而挂在签证台上）。
+ * 列表展示侧仍按 visaExempt=false 过滤乘客明细，两者互不干扰。
+ *
+ * 子句形状与订单搜索的乘客子句同构（orders.service 的 buildSearchTermClause）：
+ * 姓名 / 中文名不区分大小写，护照号同样放开大小写（护照号里的字母录入时大小写不一）。
+ */
+export function passengerQueryWhere(term: string): Prisma.OrderItemWhereInput {
+  return {
+    order: {
+      passengers: {
+        some: {
+          OR: [
+            { fullName: { contains: term, mode: 'insensitive' } },
+            { chineseName: { contains: term, mode: 'insensitive' } },
+            { documentNumber: { contains: term, mode: 'insensitive' } },
+          ],
+        },
+      },
+    },
+  };
+}
+
+/**
+ * 「签证口径」筛选下沉到查询层 —— 直接比订单级 Order.visaStatus，不做任何推断或回退。
+ *
+ * 这与上面的 issuanceMethodWhere（签发方式，带「产品字段 ?? 录单回退」）是**两根不同的轴**：
+ * 本函数问的是"录单当时把这单的签证口径记成了什么"，一个字段一个答案，没有二义。
+ *
+ * 'UNSET' = 未标注：录单从没填过签证状态（库里 visaStatus IS NULL）。这一档必须显式存在——
+ * 四档是枚举的四个成员，NULL 不在其中，没有这一档时这批单在任何一档下都不出现，
+ * 只有「全部」能看到，签证岗一筛就会以为单少了（**这不是小数**：清查时开发库 171 条签证
+ * 任务里 107 条 visaStatus 为空）。「未标注」与「未签证(NOT_NEEDED)」是两回事：
+ * 后者是录单明确表态「不需要办」，前者是录单压根没表态。
+ */
+export function visaRequirementWhere(
+  filter: VisaRequirement | 'UNSET',
+): Prisma.OrderItemWhereInput {
+  // 未标注 = 订单级签证状态为 NULL；Prisma 的 `visaStatus: null` 生成 IS NULL（可空列上正确）
+  if (filter === 'UNSET') return { order: { visaStatus: null } };
+  return { order: { visaStatus: filter } };
+}
+
+/**
  * 送签进度的推进次序（低→高）——派生任务级状态时取「最早（最低）」那一档。
  */
 const VISA_SUBMISSION_RANK: Record<VisaSubmissionStatus, number> = {
@@ -430,11 +477,15 @@ export class FulfillmentService {
     };
     if (query.orderId) orderItemWhere.orderId = query.orderId;
 
-    // 签证台三个筛选（状态 / 签发方式 / 出发日期）全部下沉到 where —— 必须与 count 共用同一个
-    // where，分页和 total 才有意义。任何一个退回前端过滤，都会让「总数」和「实际能翻到的行数」
-    // 对不上，并且跨页的匹配项永远凑不齐（签证岗按「待办」翻页会漏单）。
+    // 签证台的筛选（状态 / 签发方式 / 签证口径 / 出发日期 / 客人）全部下沉到 where —— 必须与
+    // count 共用同一个 where，分页和 total 才有意义。任何一个退回前端过滤，都会让「总数」和
+    // 「实际能翻到的行数」对不上，并且跨页的匹配项永远凑不齐（按「待办」翻页会漏单）。
     const orderItemAnd: Prisma.OrderItemWhereInput[] = [];
     if (query.issuanceMethod) orderItemAnd.push(issuanceMethodWhere(query.issuanceMethod));
+    // 签证口径（订单级 visaStatus 四档）；与签发方式是两根轴，同时给就是 AND
+    if (query.visaRequirement) orderItemAnd.push(visaRequirementWhere(query.visaRequirement));
+    // 客人搜索（乘客姓名 / 中文名 / 护照号）——与备注搜索各管一头，同时给就是 AND
+    if (query.passengerQuery) orderItemAnd.push(passengerQueryWhere(query.passengerQuery));
     // 出发日期筛选：优先区间 from/to（任一侧可缺），向后兼容旧单日参数 departureDate（= from=to=该日）。
     const depFrom = query.departureDateFrom ?? query.departureDate;
     const depTo = query.departureDateTo ?? query.departureDate;

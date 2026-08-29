@@ -2175,6 +2175,11 @@ export interface FulfillmentTask {
     notes?: string | null;
     /** 所属代理名（公司名优先，回退联系人名）；null = 直客（无代理） */
     agentName?: string | null;
+    /**
+     * 订单级录单签证状态（签证台「签证口径」四档的取数字段）；null / 缺省 = 录单未填写。
+     * 与 visaIssuanceMethod（签发方式，带产品字段 ?? 录单回退）是两根不同的轴。
+     */
+    visaStatus?: VisaStatusInput | null;
     /** 出发时间（ISO）；纯签证单无航班 → null */
     departureTime?: string | null;
     /** 出发机场时区（IANA）；用于本地化出发日期 */
@@ -2241,7 +2246,22 @@ export interface ListFulfillmentParams {
   assigneeUserId?: string;
   /** 备注文本筛选（不区分大小写子串匹配）；省略/空串 = 不筛 */
   notesQuery?: string;
-  /** 签发方式筛选（签证台「签证类型」）；'NONE'=未标注 */
+  /**
+   * 客人筛选（乘客姓名 / 中文名 / 护照号，不区分大小写子串匹配）；省略/空串 = 不筛。
+   * 命中口径是「这一单里有这个人」，不要求该乘客非自备签。
+   */
+  passengerQuery?: string;
+  /**
+   * 签证口径筛选（签证台「签证口径」）——前四档逐字对应订单级 Order.visaStatus：
+   * NEEDED=需要签证 / E_VISA=电子签 / HAS_VISA=已签证 / NOT_NEEDED=未签证（不需要·自备签），
+   * 外加 'UNSET'=未标注（录单从没填过签证状态，库里为空）。省略 = 全部。
+   * 注意 'UNSET'（没表态）与 'NOT_NEEDED'（明确说了不需要办）是两回事。
+   */
+  visaRequirement?: VisaStatusInput | 'UNSET';
+  /**
+   * 签发方式筛选（产品结构化字段 ?? 录单回退）；'NONE'=未标注。
+   * 与 visaRequirement 是两根不同的轴；当前签证台界面不暴露此项，参数保留备用。
+   */
   issuanceMethod?: VisaIssuanceMethod | 'NONE';
   /** 出发日期单日筛选（YYYY-MM-DD，向后兼容；新前端用区间 from/to） */
   departureDate?: string;

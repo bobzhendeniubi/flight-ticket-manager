@@ -192,3 +192,54 @@ describe('listFulfillmentQuerySchema — issuanceMethod / departureDate', () => 
     expect(parsed.departureDate).toBeUndefined();
   });
 });
+
+describe('listFulfillmentQuerySchema — 客人搜索 / 签证口径', () => {
+  it('passengerQuery 接受 ≤100 字，超长拒绝', () => {
+    expect(listFulfillmentQuerySchema.parse({ passengerQuery: '张三' }).passengerQuery).toBe('张三');
+    expect(listFulfillmentQuerySchema.parse({ passengerQuery: 'E1234567' }).passengerQuery).toBe(
+      'E1234567',
+    );
+    expect(listFulfillmentQuerySchema.safeParse({ passengerQuery: 'x'.repeat(101) }).success).toBe(
+      false,
+    );
+  });
+
+  it('passengerQuery 省略 → undefined（不筛）', () => {
+    expect(listFulfillmentQuerySchema.parse({}).passengerQuery).toBeUndefined();
+  });
+
+  it('visaRequirement 只收订单级签证状态四档', () => {
+    for (const v of ['NEEDED', 'E_VISA', 'HAS_VISA', 'NOT_NEEDED']) {
+      expect(listFulfillmentQuerySchema.parse({ visaRequirement: v }).visaRequirement).toBe(v);
+    }
+  });
+
+  it('visaRequirement 非法值 / 空串 → 拒绝（空串走前端不传，不静默当成某一档）', () => {
+    expect(listFulfillmentQuerySchema.safeParse({ visaRequirement: 'BOGUS' }).success).toBe(false);
+    expect(listFulfillmentQuerySchema.safeParse({ visaRequirement: '' }).success).toBe(false);
+  });
+
+  it('visaRequirement 省略 → undefined（全部，不筛）', () => {
+    expect(listFulfillmentQuerySchema.parse({}).visaRequirement).toBeUndefined();
+  });
+});
+
+describe('listFulfillmentQuerySchema — 签证口径「未标注」档', () => {
+  it("接受 'UNSET'（未标注 = 订单级签证状态为空）", () => {
+    expect(listFulfillmentQuerySchema.parse({ visaRequirement: 'UNSET' }).visaRequirement).toBe(
+      'UNSET',
+    );
+  });
+
+  it("'UNSET' 与四个枚举值并存，五档全收", () => {
+    for (const v of ['NEEDED', 'E_VISA', 'HAS_VISA', 'NOT_NEEDED', 'UNSET']) {
+      expect(listFulfillmentQuerySchema.parse({ visaRequirement: v }).visaRequirement).toBe(v);
+    }
+  });
+
+  it("只多收 'UNSET' 这一个字面量，别的自造值仍拒绝", () => {
+    for (const bad of ['NONE', 'NULL', 'null', 'UNKNOWN', '']) {
+      expect(listFulfillmentQuerySchema.safeParse({ visaRequirement: bad }).success).toBe(false);
+    }
+  });
+});
