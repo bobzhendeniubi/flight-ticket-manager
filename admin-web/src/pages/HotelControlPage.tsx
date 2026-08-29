@@ -14,7 +14,7 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link } from 'react-router-dom';
 import { Icon } from '../components/Icon';
-import { formatInBusinessTz } from '../lib/datetime';
+import { businessTzParts, formatInBusinessTz } from '../lib/datetime';
 import {
   api,
   ApiError,
@@ -1133,10 +1133,31 @@ function fmtChangeTrip(departDate: string | null, returnDate: string | null): st
   return returnDate ? `${fmtChangeDate(departDate)}–${fmtChangeDate(returnDate)}` : fmtChangeDate(departDate);
 }
 
+/**
+ * 北京时间「明天」的日期串（YYYY-MM-DD），与 departDate 同格式，用于「近期用房变更」默认只看
+ * 明日出行的过滤。用 businessTzParts 取北京时间的今天 Y/M/D 后按 UTC 整日加一天再取值，
+ * 不受浏览器时区、月末/年末进位影响（中国不用夏令时，UTC 日历加减是安全的）。
+ */
+function tomorrowBusinessYmd(): string {
+  const today = businessTzParts(new Date());
+  if (!today) return '';
+  const todayUtcMidnight = Date.UTC(Number(today.year), Number(today.month) - 1, Number(today.day));
+  const tomorrow = new Date(todayUtcMidnight + 24 * 60 * 60 * 1000);
+  const y = tomorrow.getUTCFullYear();
+  const m = String(tomorrow.getUTCMonth() + 1).padStart(2, '0');
+  const d = String(tomorrow.getUTCDate()).padStart(2, '0');
+  return `${y}-${m}-${d}`;
+}
+
+type RecentChangesViewMode = 'tomorrow' | 'all';
+
 function RecentChangesPanel({ token }: { token: string }) {
   const [data, setData] = useState<HotelRecentRoomChanges | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [open, setOpen] = useState(false);
+  // 运营原话：「近期用房变更只需要显示第二天的就行」——默认只看明日出行，保留「近7天全部」
+  // 的切换，避免把改期这类变更（departDate 可能已经不是原计划、或查不到订单为 null）静默藏死。
+  const [viewMode, setViewMode] = useState<RecentChangesViewMode>('tomorrow');
 
   useEffect(() => {
     if (!token) return;
@@ -1154,42 +1175,73 @@ function RecentChangesPanel({ token }: { token: string }) {
     };
   }, [token]);
 
-  const count = data?.count ?? 0;
-  const hasChanges = count > 0;
+  const allChanges = data?.changes ?? [];
+  const totalCount = data?.count ?? 0;
+  const tomorrowYmd = tomorrowBusinessYmd();
+  // departDate 为 null（查不到订单/无航段，或本来就是改期类变更）在明日档也照样显示——
+  // 宁可多看见，不许因为凑不上日期就把它从默认视图里静默滤掉。
+  const tomorrowChanges = allChanges.filter((c) => c.departDate === null || c.departDate === tomorrowYmd);
+  const displayedChanges = viewMode === 'tomorrow' ? tomorrowChanges : allChanges;
+  const hasDisplayedChanges = displayedChanges.length > 0;
 
   return (
     <section className="card">
-      <div className="flex items-center justify-between">
-        <h2 className="flex items-center gap-2 text-sm font-semibold text-ink">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <h2 className="flex flex-wrap items-center gap-2 text-sm font-semibold text-ink">
           近期用房变更
           <span className="text-xs font-normal text-ink-muted">
             （订单侧改分房 / 换酒店 / 补房差）
           </span>
-          {data != null && (
-            <span className={hasChanges ? 'badge-warning' : 'badge-neutral'}>
-              近 {RECENT_CHANGES_DAYS} 天 {count} 条变更
-            </span>
-          )}
+          {data != null &&
+            (viewMode === 'tomorrow' ? (
+              <span className={tomorrowChanges.length > 0 ? 'badge-warning' : 'badge-neutral'}>
+                明日出行 {tomorrowChanges.length} 条 / 近 {RECENT_CHANGES_DAYS} 天共 {totalCount} 条
+              </span>
+            ) : (
+              <span className={totalCount > 0 ? 'badge-warning' : 'badge-neutral'}>
+                近 {RECENT_CHANGES_DAYS} 天 {totalCount} 条变更
+              </span>
+            ))}
         </h2>
-        <button
-          type="button"
-          onClick={() => setOpen((v) => !v)}
-          className="btn-ghost px-2 py-1 text-xs"
-          disabled={!hasChanges}
-        >
-          {open ? '收起 ▲' : '展开 ▼'}
-        </button>
+        <div className="flex items-center gap-2">
+          <div className="flex items-center gap-1">
+            <button
+              type="button"
+              onClick={() => setViewMode('tomorrow')}
+              className={viewMode === 'tomorrow' ? 'btn-primary px-2 py-1 text-xs' : 'btn-ghost px-2 py-1 text-xs'}
+            >
+              明日出行
+            </button>
+            <button
+              type="button"
+              onClick={() => setViewMode('all')}
+              className={viewMode === 'all' ? 'btn-primary px-2 py-1 text-xs' : 'btn-ghost px-2 py-1 text-xs'}
+            >
+              近{RECENT_CHANGES_DAYS}天全部
+            </button>
+          </div>
+          <button
+            type="button"
+            onClick={() => setOpen((v) => !v)}
+            className="btn-ghost px-2 py-1 text-xs"
+            disabled={!hasDisplayedChanges}
+          >
+            {open ? '收起 ▲' : '展开 ▼'}
+          </button>
+        </div>
       </div>
       {err ? (
         <div className="mt-3 text-sm text-rose-600">{err}</div>
       ) : data == null ? (
         <div className="mt-3 text-sm text-ink-muted">加载用房变更…</div>
-      ) : !hasChanges ? (
-        <div className="mt-3 text-sm text-ink-muted">近 {RECENT_CHANGES_DAYS} 天暂无用房变更</div>
+      ) : !hasDisplayedChanges ? (
+        <div className="mt-3 text-sm text-ink-muted">
+          {viewMode === 'tomorrow' ? '明日暂无用房变更' : `近 ${RECENT_CHANGES_DAYS} 天暂无用房变更`}
+        </div>
       ) : (
         open && (
           <ul className="mt-3 divide-y divide-slate-100">
-            {data.changes.map((c) => (
+            {displayedChanges.map((c) => (
               <li key={c.id} className="flex flex-wrap items-baseline gap-x-2 gap-y-1 py-2 text-sm">
                 <span className="w-24 shrink-0 text-xs text-ink-muted nums">
                   {fmtChangeTime(c.at)}
@@ -1214,6 +1266,9 @@ function RecentChangesPanel({ token }: { token: string }) {
                 <span className="shrink-0 text-xs text-ink-muted nums">
                   {fmtChangeTrip(c.departDate, c.returnDate)}
                 </span>
+                {viewMode === 'tomorrow' && c.departDate == null && (
+                  <span className="shrink-0 text-[10px] text-ink-muted/70">（未关联出发日期）</span>
+                )}
                 <span className="shrink-0 text-xs text-ink-muted nums">
                   {c.orderAmountCny != null ? fmtCny(c.orderAmountCny) : '—'}
                 </span>
