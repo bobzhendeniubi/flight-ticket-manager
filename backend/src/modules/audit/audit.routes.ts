@@ -39,12 +39,21 @@ export const auditRoutes: FastifyPluginAsync = async (app) => {
         orderBy: { createdAt: 'desc' },
         take: q.pageSize,
         skip: (q.page - 1) * q.pageSize,
+        include: { actor: { select: { displayName: true, email: true } } },
       }),
       prisma.auditLog.count({ where }),
     ]);
 
+    // actorLabel 是写入时缓存的快照，很多写入路径压根没填（见 lib/audit.ts actorFromRequest
+    // 不设 label）；这里回退到关联账号的 displayName/email，账号已删/系统任务时才落 null
+    // （前端兜底显示"系统"）。响应字段形状不变（仍叫 actorLabel），前端零改动即受益。
+    const logs = rows.map(({ actor, ...log }) => ({
+      ...log,
+      actorLabel: log.actorLabel ?? actor?.displayName ?? actor?.email ?? null,
+    }));
+
     return {
-      logs: rows,
+      logs,
       pagination: { page: q.page, pageSize: q.pageSize, total },
     };
   });

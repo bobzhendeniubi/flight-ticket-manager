@@ -93,6 +93,48 @@ const FIELD_DICT: Record<string, string> = {
   ruleId: '规则 ID',
   toRate: '新佣金率',
   fromRate: '原佣金率',
+  // ── 代理 ──
+  agentName: '代理',
+  agentBalanceAfter: '代理余额（变更后）',
+  usedAgentBalance: '使用代理余额',
+  targetAgentId: '目标代理',
+  // ── 调价 / 结算价 ──
+  amountCny: '金额',
+  reasonCode: '原因',
+  reasonText: '原因说明',
+  reasonLabel: '原因',
+  passengerId: '乘客',
+  passengerName: '乘客',
+  itemId: '行项 ID',
+  orderItemId: '订单行 ID',
+  discountCny: '优惠金额',
+  subtotalCny: '小计',
+  settlementTotalCny: '结算总价',
+  settlementPriceCny: '结算价',
+  diffCny: '差额',
+  revokedCny: '撤销金额',
+  feeCny: '费用',
+  // ── 收款 / 进账 ──
+  method: '收款方式',
+  fullyPaid: '已付清',
+  hasProof: '含凭证',
+  creditedToOrder: '入账本单',
+  movedToPool: '转入挂账池',
+  poolReceiptNo: '挂账单号',
+  receiptNo: '进账单号',
+  receiptId: '进账 ID',
+  receiptStatus: '进账状态',
+  paymentId: '支付 ID',
+  reversedAmount: '冲销金额',
+  reversalId: '冲销 ID',
+  orderBalanceDue: '应收余额',
+  orderPaidAmount: '订单已收',
+  orderFullyPaid: '订单已付清',
+  orderStatus: '订单状态',
+  newPaidAmount: '新已收金额',
+  expectedAmountCny: '预期到账金额',
+  confirmedAmountCny: '确认金额',
+  receivedAmount: '实收金额',
 };
 
 /** OrderStatus / SettlementStatus / 其他后端枚举 → 中文 */
@@ -147,6 +189,10 @@ export function formatAction(code: string): ActionEntry {
   return { label: fallback, icon: 'info' };
 }
 
+// 金额字段名后缀：本体（amount/total/...）后面可以再跟一个 Cny（amountCny/feeCny/diffCny 等
+// 新代码的记账惯例），两种写法都按人民币格式化。
+const MONEY_KEY_RE = /(amount|total|payable|price|balance|offset|revenue|commission|fee|diff|due|discount)(cny)?$/i;
+
 /** 把任意标量值翻译成易读字符串 */
 function formatScalar(key: string, value: unknown): string {
   if (value === null || value === undefined) return '—';
@@ -155,7 +201,7 @@ function formatScalar(key: string, value: unknown): string {
     return value ? '是' : '否';
   }
   if (typeof value === 'number') {
-    if (/(amount|total|payable|price|balance|offset|revenue|commission)$/i.test(key)) {
+    if (MONEY_KEY_RE.test(key)) {
       return `¥${value.toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`;
     }
     if (key === 'rate' || key === 'toRate' || key === 'fromRate') {
@@ -167,7 +213,7 @@ function formatScalar(key: string, value: unknown): string {
     if (/^[A-Z][A-Z_]{1,30}$/.test(value) && ENUM_DICT[value]) {
       return ENUM_DICT[value];
     }
-    if (/^-?\d+(\.\d+)?$/.test(value) && /(amount|total|payable|price|balance|offset|revenue|commission)$/i.test(key)) {
+    if (/^-?\d+(\.\d+)?$/.test(value) && MONEY_KEY_RE.test(key)) {
       return `¥${Number(value).toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`;
     }
     return value;
@@ -179,18 +225,38 @@ function formatScalar(key: string, value: unknown): string {
   }
 }
 
-/** 把单边 payload（before 或 after）转成 ["原因: 客户超时未付", ...] 这样的行 */
+// 某键以 Id 结尾（agentId/passengerId/...），且同一份 payload 里存在对应的 xxxName/xxxLabel
+// 键时，Id 行只是噪音——真正有用的名字已经单独一行了，跳过它别把摘要行挤成一堆裸 id。
+function isIdKey(key: string): boolean {
+  return key.length > 2 && key.endsWith('Id');
+}
+
+function hasCompanionLabel(obj: Record<string, unknown> | undefined, key: string): boolean {
+  if (!obj || !isIdKey(key)) return false;
+  const base = key.slice(0, -2); // 去掉尾部 "Id"
+  for (const suffix of ['Name', 'Label']) {
+    const v = obj[`${base}${suffix}`];
+    if (v !== undefined && v !== null && v !== '') return true;
+  }
+  return false;
+}
+
+/** 把单边 payload（before 或 after）转成 ["原因: 客户超时未付", ...] 这样的行。
+ * 非 Id 行在前；没有对应 name/label 的裸 Id 行保留但放到最后；有对应 name/label 的 Id 行整条跳过。 */
 function formatSide(payload: unknown): string[] {
   if (payload === null || payload === undefined) return [];
   if (typeof payload !== 'object') return [String(payload)];
   const obj = payload as Record<string, unknown>;
-  const lines: string[] = [];
+  const otherLines: string[] = [];
+  const idLines: string[] = [];
   for (const [k, v] of Object.entries(obj)) {
     if (v === null || v === undefined || v === '') continue;
+    if (hasCompanionLabel(obj, k)) continue;
     const label = FIELD_DICT[k] ?? k;
-    lines.push(`${label}: ${formatScalar(k, v)}`);
+    const line = `${label}: ${formatScalar(k, v)}`;
+    (isIdKey(k) ? idLines : otherLines).push(line);
   }
-  return lines;
+  return [...otherLines, ...idLines];
 }
 
 export interface DiffLine {
@@ -219,28 +285,33 @@ export function formatPayloadDiff(before: unknown, after: unknown): DiffLine[] {
     const beforeObj = before as Record<string, unknown>;
     const afterObj = after as Record<string, unknown>;
     const allKeys = new Set([...Object.keys(beforeObj), ...Object.keys(afterObj)]);
-    const lines: DiffLine[] = [];
+    // 非 Id 行在前，裸 Id（无对应 name/label）行放最后——摘要只取第一行时才不会被 id 抢位。
+    const otherLines: DiffLine[] = [];
+    const idLines: DiffLine[] = [];
     for (const k of allKeys) {
       const beforeVal = beforeObj[k];
       const afterVal = afterObj[k];
       if (JSON.stringify(beforeVal) === JSON.stringify(afterVal)) continue;
+      // 有对应 xxxName/xxxLabel 键（任一边）时，这条 Id 行是噪音，跳过——真正有用的名字自成一行。
+      if (hasCompanionLabel(beforeObj, k) || hasCompanionLabel(afterObj, k)) continue;
       const label = FIELD_DICT[k] ?? k;
       const beforeFilled = beforeVal !== undefined && beforeVal !== null && beforeVal !== '';
       const afterFilled = afterVal !== undefined && afterVal !== null && afterVal !== '';
+      const bucket = isIdKey(k) ? idLines : otherLines;
       if (beforeFilled && afterFilled) {
-        lines.push({
+        bucket.push({
           prefix: '·',
           text: `${label}: ${formatScalar(k, beforeVal)} → ${formatScalar(k, afterVal)}`,
         });
         continue;
       }
       if (afterFilled) {
-        lines.push({ prefix: '+', text: `${label}: ${formatScalar(k, afterVal)}`, isAdded: true });
+        bucket.push({ prefix: '+', text: `${label}: ${formatScalar(k, afterVal)}`, isAdded: true });
       } else if (beforeFilled) {
-        lines.push({ prefix: '−', text: `${label}: ${formatScalar(k, beforeVal)}`, isRemoved: true });
+        bucket.push({ prefix: '−', text: `${label}: ${formatScalar(k, beforeVal)}`, isRemoved: true });
       }
     }
-    return lines;
+    return [...otherLines, ...idLines];
   }
 
   return [
