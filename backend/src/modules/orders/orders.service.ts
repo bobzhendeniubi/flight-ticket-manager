@@ -3581,7 +3581,18 @@ export class OrderService {
           items: {
             include: {
               fulfillmentTasks: { select: { type: true, status: true } },
-              flightSchedule: { select: { departureTime: true, departureTz: true } },
+              // 联查航班号（flight.flightNumber）——列表「出发日期」列旁的往返航班号展示要用它；
+              // 此前只 select 了 departureTime/departureTz，序列化里的 flightNumber 恒为 null，
+              // 前端 deriveFlightLegs 只能退化用正则从 description 里捞第一个航班号，往返单两条腿
+              // 共用同一段批量建单 description，于是去程/回程两行都显示成了去程号（对比 getOrder，
+              // 3618-3627 行早就带了这个 select）。
+              flightSchedule: {
+                select: {
+                  departureTime: true,
+                  departureTz: true,
+                  flight: { select: { flightNumber: true } },
+                },
+              },
             },
           },
           passengers: { select: { id: true, fullName: true, chineseName: true, gender: true, documentNumber: true } },

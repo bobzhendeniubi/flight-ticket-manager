@@ -31,6 +31,9 @@ const {
       findUniqueOrThrow: vi.fn(),
       create: vi.fn(),
       update: vi.fn(),
+      // findMany/count：只有 listOrders 测试用（$transaction 数组形态见下方 mock）。
+      findMany: vi.fn(),
+      count: vi.fn(),
     },
     passenger: {
       findMany: vi.fn(),
@@ -99,7 +102,13 @@ const {
       findMany: vi.fn(),
       updateMany: vi.fn(),
     },
-    $transaction: vi.fn(async (fn: (tx: unknown) => Promise<unknown>) => fn(mockTx)),
+    // listOrders 用数组形态 $transaction([findMany, count])；其余既有调用点全是回调形态
+    // $transaction(fn)。两种都要支持，否则新增 listOrders 测试会打断已有用例。
+    $transaction: vi.fn(async (fnOrOps: unknown) =>
+      Array.isArray(fnOrOps)
+        ? Promise.all(fnOrOps)
+        : (fnOrOps as (tx: unknown) => Promise<unknown>)(mockTx),
+    ),
     // R2：rescheduleOrderItem 事务开头对 Order 行 FOR UPDATE（tx.$queryRaw）。默认返回一行（订单存在）
     // → 锁通过、继续走占座守卫；具体守卫用例仍由 order.findUnique 决定拒绝原因。
     // swapPassenger 的锁行还顺带回 adjustmentCny/adjustments/status/deletedAt（换人的有效订单守卫
@@ -4102,8 +4111,10 @@ describe('OrderService.createOrder · settlement discount guardrails', () => {
         statusEvents: [],
       }),
     );
-    mockPrisma.$transaction.mockImplementation(
-      async (fn: (tx: unknown) => Promise<unknown>) => fn(mockTx),
+    // 本用例只走回调形态 $transaction(fn)；参数类型收窄成 unknown 后转型，与共享 mock 的
+    // 数组/回调两态签名（见顶部 hoisted 声明）保持类型兼容。
+    mockPrisma.$transaction.mockImplementation(async (fn: unknown) =>
+      (fn as (tx: unknown) => Promise<unknown>)(mockTx),
     );
   }
 
@@ -5239,6 +5250,75 @@ describe('filterOrderIdsByReturnDate · 按整单返程日精确细筛', () => {
     expect(deriveOrderReturnDate(roundTrip.items)).toBe('2026-07-12');
     expect(filterOrderIdsByReturnDate([roundTrip], '2026-07-12', '2026-07-12')).toEqual(['tz']);
     expect(filterOrderIdsByReturnDate([roundTrip], '2026-07-11', '2026-07-11')).toEqual([]);
+  });
+});
+
+// ── listOrders 列表序列化必须带出真实航班号（不能只在 getOrder 详情联查）─────────────
+// 根因：此前 listOrders 的 items include 只 select 了 flightSchedule.departureTime/departureTz，
+// 没带 flight.flightNumber，序列化恒为 null；前端 deriveFlightLegs 只能退化用正则从 description
+// 里捞号——批量建单的往返单两条腿共用同一段 description，于是列表「出发日期」列旁去程/回程两行
+// 都显示成了去程号。断言列表序列化里 item.flightNumber 是联查回来的真实值，且去程/回程各自独立。
+describe('OrderService.listOrders · 列表序列化透出航班号', () => {
+  const service = new OrderService();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    // 显式重置为「函数/数组两态都支持」——vi.clearAllMocks() 只清调用记录，不清别的 describe
+    // 用 mockImplementation 换上的自定义实现（如只认回调形态的那个），会跨文件残留污染本用例。
+    mockPrisma.$transaction.mockImplementation(async (fnOrOps: unknown) =>
+      Array.isArray(fnOrOps)
+        ? Promise.all(fnOrOps)
+        : (fnOrOps as (tx: unknown) => Promise<unknown>)(mockTx),
+    );
+  });
+
+  it('往返单两条 FLIGHT 行各自带出真实 flightNumber（不是共用 description 正则出的去程号）', async () => {
+    const order = fakeFullOrder({
+      items: [
+        {
+          id: 'itm-out',
+          kind: 'FLIGHT',
+          description: '澳门-岘港 QH9589', // 批量建单往返单两条腿共用同一段 description
+          quantity: 1,
+          unitPrice: dec(2100),
+          amount: dec(2100),
+          flightCabin: 'ECONOMY',
+          fulfillmentTasks: [],
+          flightSchedule: {
+            departureTime: new Date('2026-07-10T08:00:00Z'),
+            departureTz: 'Asia/Macau',
+            flight: { flightNumber: 'QH9589' },
+          },
+        },
+        {
+          id: 'itm-ret',
+          kind: 'FLIGHT',
+          description: '澳门-岘港 QH9589', // 与去程行共用同一段文案——正则回退会把两行都读成 QH9589
+          quantity: 1,
+          unitPrice: dec(2100),
+          amount: dec(2100),
+          flightCabin: 'ECONOMY',
+          fulfillmentTasks: [],
+          flightSchedule: {
+            departureTime: new Date('2026-07-11T09:00:00Z'),
+            departureTz: 'Asia/Macau',
+            flight: { flightNumber: 'QH9588' }, // 回程真实航班号，与去程不同
+          },
+        },
+      ],
+    });
+
+    mockPrisma.order.findMany.mockResolvedValue([order]);
+    mockPrisma.order.count.mockResolvedValue(1);
+
+    const result = await service.listOrders(
+      { page: 1, pageSize: 50 },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(result.orders[0].items[0].flightNumber).toBe('QH9589');
+    // 关键断言：回程行拿到自己的真实航班号，不是被正则从共用 description 里捞出的去程号。
+    expect(result.orders[0].items[1].flightNumber).toBe('QH9588');
   });
 });
 
