@@ -312,6 +312,50 @@ describe('orderToMasterRows', () => {
     expect(r1.notes).toContain('蜜月');
   });
 
+  // ── 签证备注：单独一列，不再揉进通用「备注」列（运营反馈：签证台任务备注 + 订单
+  // 「签证情况」备注此前被 baseNotes 一起拼进「备注」，与其它岗位的备注混在一起）。
+  describe('签证备注（单独列，不进通用备注）', () => {
+    it('= [签证任务备注, 订单签证情况备注] 去空去重拼接（任务备注在前），且不出现在通用备注列', () => {
+      const order = fixtureRoundTripBundle();
+      (order as unknown as { noteVisa: string }).noteVisa = '需要加急处理';
+      const visaItem = order.items.find(
+        (it) => (it as { kind: string }).kind === 'VISA',
+      ) as unknown as { fulfillmentTasks: { type: string; status: string; notes?: string }[] };
+      visaItem.fulfillmentTasks[0].notes = '代办渠道甲 31.5美金/人';
+      const [r1] = orderToMasterRows(order);
+      expect(r1.visaNote).toBe('代办渠道甲 31.5美金/人 / 需要加急处理');
+      expect(r1.notes).not.toContain('需要加急处理');
+      expect(r1.notes).not.toContain('代办渠道甲 31.5美金/人');
+    });
+
+    it('任务备注与订单签证备注内容相同 → 去重只保留一份', () => {
+      const order = fixtureRoundTripBundle();
+      (order as unknown as { noteVisa: string }).noteVisa = '同一句备注';
+      const visaItem = order.items.find(
+        (it) => (it as { kind: string }).kind === 'VISA',
+      ) as unknown as { fulfillmentTasks: { type: string; status: string; notes?: string }[] };
+      visaItem.fulfillmentTasks[0].notes = '同一句备注';
+      const [r1] = orderToMasterRows(order);
+      expect(r1.visaNote).toBe('同一句备注');
+    });
+
+    it('任务备注、订单签证备注都缺失 → 留空', () => {
+      const [r1] = orderToMasterRows(fixtureRoundTripBundle());
+      expect(r1.visaNote).toBe('');
+    });
+
+    it('套餐单签证任务盖在 BUNDLE 行上（无独立 VISA 行）→ 同样能取到任务备注', () => {
+      const order = fixtureBundleHotelStampedOnBundleItem();
+      (
+        order.items[0] as unknown as {
+          fulfillmentTasks: { type: string; status: string; notes?: string }[];
+        }
+      ).fulfillmentTasks[0].notes = '套餐内签证代办备注';
+      const [r1] = orderToMasterRows(order);
+      expect(r1.visaNote).toBe('套餐内签证代办备注');
+    });
+  });
+
   it('游客单（无录单账号）录入人员记「散客」，不拿客人自己的名字冒充', () => {
     const order = fixtureRoundTripBundle();
     order.user = null;
@@ -620,7 +664,7 @@ describe('酒店中文名称跟房控实际数据（乘客行级）', () => {
 });
 
 describe('visibleColumns（role 裁列）', () => {
-  it('all（默认）= 全部列，含结算价格/分房情况/订单成本/酒店中文名称/在订未飞/可用次数', () => {
+  it('all（默认）= 全部列，含结算价格/分房情况/订单成本/酒店中文名称/在订未飞/可用次数/签证备注', () => {
     const headers = visibleColumns('all').map((c) => c.header);
     expect(headers).toContain('结算价格');
     expect(headers).toContain('分房情况');
@@ -628,26 +672,29 @@ describe('visibleColumns（role 裁列）', () => {
     expect(headers).toContain('酒店中文名称');
     expect(headers).toContain('在订未飞');
     expect(headers).toContain('可用次数');
+    expect(headers).toContain('签证备注');
   });
 
-  it('ticketing（票务）隐藏财务/分房列，保留航班/证件/在订未飞/可用次数列（与飞行次数同角色可见性）', () => {
+  it('ticketing（票务）隐藏财务/分房/签证备注列，保留航班/证件/在订未飞/可用次数列（与飞行次数同角色可见性）', () => {
     const headers = visibleColumns('ticketing').map((c) => c.header);
     expect(headers).toContain('航班号');
     expect(headers).toContain('飞行次数');
     expect(headers).toContain('在订未飞');
     expect(headers).toContain('可用次数');
     expect(headers).toContain('证件编号');
-    // 财务/分房列隐藏
+    // 财务/分房/签证备注列隐藏（签证备注 roles 与签证状态一致：['all','visa']）
     expect(headers).not.toContain('结算价格');
     expect(headers).not.toContain('分房情况');
     expect(headers).not.toContain('订单成本');
+    expect(headers).not.toContain('签证备注');
   });
 
-  it('visa（签证）保留酒店/签证/证件列，隐藏航班/财务/在订未飞/可用次数列（与飞行次数同角色可见性）', () => {
+  it('visa（签证）保留酒店/签证/证件/签证备注列，隐藏航班/财务/在订未飞/可用次数列（与飞行次数同角色可见性）', () => {
     const headers = visibleColumns('visa').map((c) => c.header);
     expect(headers).toContain('酒店中文名称');
     expect(headers).toContain('签证金额');
     expect(headers).toContain('签证公司');
+    expect(headers).toContain('签证备注');
     expect(headers).toContain('护照签发地');
     expect(headers).toContain('证件有效期');
     // 航班/财务/在订未飞/可用次数列隐藏（roles 与飞行次数一致：['all','ticketing']）

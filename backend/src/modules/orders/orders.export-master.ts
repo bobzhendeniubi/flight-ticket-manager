@@ -170,6 +170,7 @@ export interface MasterRow {
   visaAmount: number; // 签证金额（人均）
   visaSupplier: string; // 签证公司（供应商/代办渠道，多签证去重逗号拼接）— 财务对账用，缺失留空
   visaStatus: string; // 签证状态（订单级 + 履约任务，取更具体者）
+  visaNote: string; // 签证备注 = [签证任务备注, 订单「签证情况」备注] 去空去重后 " / " 拼接（任务备注在前）
   invoiceStatus: string; // 开票状态：三布尔（去程/回程/系统）组合文案，'/' 连接；都未开 = "未开"
   settled: string; // 是否清账（结清）
   refundAmount: number; // 退款金额（人均，已完成退款）
@@ -260,6 +261,13 @@ const MASTER_COLUMNS: MasterColumn[] = [
   { header: '签证金额', key: 'visaAmount', width: 10, roles: ['all', 'visa'] },
   { header: '签证公司', key: 'visaSupplier', width: 16, roles: ['all', 'visa'] },
   { header: '签证状态', key: 'visaStatus', width: 10, roles: ['all', 'visa'] },
+  {
+    header: '签证备注',
+    key: 'visaNote',
+    width: 22,
+    note: '签证任务备注 + 订单「签证情况」备注去重拼接（" / "），任务备注在前。',
+    roles: ['all', 'visa'],
+  },
   { header: '开票状态', key: 'invoiceStatus', width: 10, roles: ['all'] },
   { header: '是否清账', key: 'settled', width: 8, roles: ['all'] },
   { header: '退款金额', key: 'refundAmount', width: 10, roles: ['all'] },
@@ -306,7 +314,8 @@ export const MASTER_EXPORT_INCLUDE = {
       visa: { select: { visaName: true, visaType: true, supplier: true } },
       // 套餐(BUNDLE)行关联的套餐定义：取 items JSON 以捞出签证组件的挂牌价（qty×unitPrice）。
       bundle: { select: { items: true } },
-      fulfillmentTasks: { select: { type: true, status: true } },
+      // notes：签证任务备注（运营在签证台给任务填的备注）——「签证备注」列取数用。
+      fulfillmentTasks: { select: { type: true, status: true, notes: true } },
     },
   },
 } satisfies Prisma.OrderInclude;
@@ -454,6 +463,16 @@ export function orderToMasterRows(
     : visaTask
       ? FULFILLMENT_STATUS_LABEL[visaTask.status] ?? visaTask.status
       : '';
+  // 签证备注（运营要求单列）：签证任务备注（签证台手填，如代办渠道/价格）在前，
+  // 订单「签证情况」结构化备注（noteVisa）在后，去空去重后 " / " 拼接。两者常年被揉进
+  // 通用「备注」列，导致签证相关信息淹没在其它岗位的备注里——单列后从 baseNotes 移除，避免重复。
+  const visaNote = Array.from(
+    new Set(
+      [visaTask?.notes, order.noteVisa]
+        .map((v) => (typeof v === 'string' ? v.trim() : ''))
+        .filter(Boolean),
+    ),
+  ).join(' / ');
   // 签证公司（财务反馈：需清晰核对某笔签证金额属于哪家供应商）：取独立 VISA 行关联产品的 supplier，
   // 多签证产品去重后逗号拼接；无 supplier 留空。套餐内签证组件无独立供应商字段，故只认 VISA 行。
   const visaSupplier = Array.from(
@@ -481,14 +500,9 @@ export function orderToMasterRows(
     .map((c) => `${COST_CATEGORY_LABEL[c.category] ?? c.category} ${round2(dec(c.amountCny))}`)
     .join(' + ');
 
-  // ── 备注：结构化四栏 + 自由文本 ──
-  const baseNotes = [
-    order.noteSpecial,
-    order.noteHotel,
-    order.noteVisa,
-    order.notePayment,
-    order.notes,
-  ]
+  // ── 备注：结构化三栏 + 自由文本 ──
+  // noteVisa 不在此列：已单独拆到「签证备注」列（见 visaNote），避免同一内容两列重复。
+  const baseNotes = [order.noteSpecial, order.noteHotel, order.notePayment, order.notes]
     .filter(Boolean)
     .join(' / ');
 
@@ -569,6 +583,7 @@ export function orderToMasterRows(
       visaAmount: round2(visaAmountOrder / paxCount),
       visaSupplier,
       visaStatus,
+      visaNote,
       invoiceStatus,
       settled,
       refundAmount: round2(refundTotal / paxCount),
