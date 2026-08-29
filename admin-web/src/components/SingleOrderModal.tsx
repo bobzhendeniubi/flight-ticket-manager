@@ -781,6 +781,24 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 不动用户已经逐位调整过的选择（公测反馈：整单选了不需要还要逐个人再选一遍）。
   const autoVisaExempt = showVisaExemptCol && visaStatus === 'NOT_NEEDED';
 
+  // 联动补一刀 —— 签证列从「不显示」变成「显示」的那一下，若整单已经是「不需要」，把现有
+  // 出行人补齐为自备签。下拉那条联动只在改状态的当下生效：先把签证状态改成「不需要」、再挑
+  // 具体套餐（签证列此时才出现），联动整条错过，下方琥珀横幅却已经在说「每位出行人已标为
+  // 自备签」——说着标了实际一个没标，套餐价还照收签证钱。
+  // 只在 false→true 这一次跳变时批量置位（逐位改回不触发跳变，不会被再次覆盖）；
+  // 建签证任务那一层另有服务端收口（backend visa-need.ts），不靠这条联动兜底。
+  const visaExemptColShownRef = useRef(showVisaExemptCol);
+  useEffect(() => {
+    const justAppeared = showVisaExemptCol && !visaExemptColShownRef.current;
+    visaExemptColShownRef.current = showVisaExemptCol;
+    if (!justAppeared || visaStatus !== 'NOT_NEEDED') return;
+    setPassengers((prev) => {
+      const updated = prev.map((r) => (r.visaExempt ? r : { ...r, visaExempt: true }));
+      passengersRef.current = updated;
+      return updated;
+    });
+  }, [showVisaExemptCol, visaStatus]);
+
   // 调价有效性：金额为非 0 整数即视为「要调价」；「其它」原因必须补说明。
   const adjustIsInteger = adjustAmount !== null && Number.isInteger(adjustAmount) && adjustAmount !== 0;
   const adjustNeedsText = adjustReason === 'OTHER' && adjustText.trim().length === 0;

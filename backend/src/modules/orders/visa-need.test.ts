@@ -10,6 +10,7 @@ import {
   passengerNeedsVisa,
   anyPassengerNeedsVisa,
   orderVisaStatusRequiresVisa,
+  orderVisaStatusExplicitlyNotNeeded,
   orderNeedsVisaTask,
 } from './visa-need.js';
 
@@ -56,6 +57,20 @@ describe('orderVisaStatusRequiresVisa — 订单级', () => {
   });
 });
 
+describe('orderVisaStatusExplicitlyNotNeeded — 订单级一票否决', () => {
+  it('只有 NOT_NEEDED 算「明说不需要」', () => {
+    expect(orderVisaStatusExplicitlyNotNeeded(VisaRequirement.NOT_NEEDED)).toBe(true);
+    expect(orderVisaStatusExplicitlyNotNeeded(VisaRequirement.NEEDED)).toBe(false);
+    expect(orderVisaStatusExplicitlyNotNeeded(VisaRequirement.E_VISA)).toBe(false);
+    expect(orderVisaStatusExplicitlyNotNeeded(VisaRequirement.HAS_VISA)).toBe(false);
+  });
+
+  it('没表态（null / undefined）≠ 不需要', () => {
+    expect(orderVisaStatusExplicitlyNotNeeded(null)).toBe(false);
+    expect(orderVisaStatusExplicitlyNotNeeded(undefined)).toBe(false);
+  });
+});
+
 describe('orderNeedsVisaTask — 三根轴收口', () => {
   it('混合单（一位自备签 + 一位要代办）+ 订单级需签 → 建任务', () => {
     expect(
@@ -83,6 +98,37 @@ describe('orderNeedsVisaTask — 三根轴收口', () => {
         passengers: [{ visaExempt: true }],
       }),
     ).toBe(false);
+  });
+
+  // ── 订单级「不需要」压过商品级涉签（签证岗实测：套餐含签证组件的单选了「不需要」仍挂待处理）──
+  it('订单级「不需要」+ 含签证组件套餐 + 乘客都没置自备签 → 不建（不依赖前端联动）', () => {
+    expect(
+      orderNeedsVisaTask({
+        visaStatus: VisaRequirement.NOT_NEEDED,
+        hasVisaScope: true,
+        passengers: [{ visaExempt: false }, { visaExempt: false }],
+      }),
+    ).toBe(false);
+  });
+
+  it('订单级「不需要」+ 未录乘客 → 也不建（空名单回落只在没明说不需要时生效）', () => {
+    expect(
+      orderNeedsVisaTask({
+        visaStatus: VisaRequirement.NOT_NEEDED,
+        hasVisaScope: true,
+        passengers: [],
+      }),
+    ).toBe(false);
+  });
+
+  it('已签证（HAS_VISA）+ 商品级涉签 → 仍建（本次只收 NOT_NEEDED，HAS_VISA 口径未变）', () => {
+    expect(
+      orderNeedsVisaTask({
+        visaStatus: VisaRequirement.HAS_VISA,
+        hasVisaScope: true,
+        passengers: [{ visaExempt: false }],
+      }),
+    ).toBe(true);
   });
 
   it('商品级涉签 + 有人要代办 → 建（订单级 visaStatus 未标也算数）', () => {

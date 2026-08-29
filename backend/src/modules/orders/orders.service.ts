@@ -49,7 +49,6 @@ import { splitPassengerFullName } from '../../lib/passenger-name.js';
 import { localHHMM, localDateISO, localToUtc } from '../../lib/flight-time.js';
 import { BUSINESS_TZ } from '../../lib/business-time.js';
 import {
-  anyPassengerNeedsVisa,
   orderNeedsVisaTask,
   orderVisaStatusRequiresVisa,
 } from './visa-need.js';
@@ -12868,10 +12867,16 @@ async function createFulfillmentTasks(tx: Prisma.TransactionClient, orderId: str
     );
     for (const type of desiredTypes) {
       if (existingTypes.has(type)) continue;
-      // 商品级涉签（VISA 行 / 含签证组件套餐）也要过乘客级这一关。
+      // 商品级涉签（VISA 行 / 含签证组件套餐）也要过订单级与乘客级这两关：
+      // 判定整条交给 orderNeedsVisaTask（visa-need.ts 的单一口径），别在这里手抄半条——
+      // 录单选了「不需要签证」的单，商品级涉签压不过订单级的一票否决。
       if (
         type === FulfillmentType.VISA_APPLICATION &&
-        !anyPassengerNeedsVisa(await loadPaxForVisa())
+        !orderNeedsVisaTask({
+          visaStatus: order?.visaStatus,
+          hasVisaScope: true, // 走到这里说明本行商品级确已涉签
+          passengers: await loadPaxForVisa(),
+        })
       ) {
         continue;
       }
@@ -12957,6 +12962,8 @@ async function resolveVisaTaskAnchor(
  *   - 订单级 visaStatus = NEEDED / E_VISA
  *   - 含 VISA 订单项
  *   - 含 BUNDLE 订单项，且该套餐组件含 VISA
+ * 但订单级 visaStatus = NOT_NEEDED 一票否决以上三条（口径见 visa-need.ts 的 orderNeedsVisaTask）：
+ * 录单明说「不需要签证」的单，含签证组件的套餐也不建任务，不再依赖录单弹窗的前端联动。
  *
  * 任务锚点与 PAID 路径保持一致（VISA 项 → 该项；含签证套餐 → 该套餐项；
  * 否则订单级需签 → 首个订单项），并按「已存在 VISA 任务即跳过」幂等：
