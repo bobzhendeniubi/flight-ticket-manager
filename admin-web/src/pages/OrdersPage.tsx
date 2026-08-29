@@ -11101,6 +11101,10 @@ function ConfirmPaymentSection({
   // 挂账池里疑似归属本单、且还没认完的进账（财务反馈：锁定收款前得先知道池子里还压着本单的钱）。
   // 纯信息化提示，不阻断锁定；接口无权限（非 ADMIN/STAFF）时静默留空。
   const [pendingReceipts, setPendingReceipts] = useState<Receipt[]>([]);
+  // 就地核销「挂账池待核销」某一笔到本单：receiptId 标记正在核销的那一行（禁用其按钮），
+  // allocateErr 只展示这次核销失败的报错（后端会在文案里给出最多能认多少）。
+  const [allocatingReceiptId, setAllocatingReceiptId] = useState<string | null>(null);
+  const [allocateErr, setAllocateErr] = useState<string | null>(null);
 
   // 尾款 = 应收 − 已付 − 预存抵扣（与后端 serializeOrder.balanceDue 一字一致）。
   // 漏掉 prepaymentOffset 会让本卡片显示「欠 ¥X」而收款对账台显示「已结清」。
@@ -11169,6 +11173,40 @@ function ConfirmPaymentSection({
       overpayCount: pendingReceipts.filter((r) => r.source === 'ORDER_OVERPAY').length,
     };
   }, [pendingReceipts]);
+
+  // 就地把挂账池里的一笔核销到本单——运营嫌跳去收款对账台麻烦，这里复用与「对账台核销」
+  // 同一条后端入账路径（POST /receipts/:id/allocate，verified:true），超收会被后端硬拒
+  // 并在报错文案里给出最多能认多少，原样透出即可。
+  async function allocateToOrder(receipt: Receipt): Promise<void> {
+    if (!token || allocatingReceiptId) return;
+    const owed = balance > 0 ? Math.round(balance * 100) / 100 : 0;
+    const remaining = Number(receipt.remainingCny);
+    if (owed <= 0 || !Number.isFinite(remaining) || remaining <= 0) return;
+    const amt = Math.round(Math.min(remaining, owed) * 100) / 100;
+    const ref = receipt.externalTxnId || receipt.receiptNo;
+    const ok = await askConfirm({
+      title: '核销到本单',
+      body: `流水 ${ref}，核销 ¥${amt.toLocaleString()} 到本单？`,
+    });
+    if (!ok) return;
+    setAllocateErr(null);
+    setAllocatingReceiptId(receipt.id);
+    try {
+      await api.allocateReceipt(token, receipt.id, { orderId, amountCny: amt });
+      await refreshPaymentState();
+      try {
+        const pool = await api.listReceipts(token, { orderHintId: orderId, unallocatedOnly: '1' });
+        setPendingReceipts(pool.receipts);
+      } catch {
+        /* 只读提示，拉取失败不影响核销结果 */
+      }
+      onChanged?.();
+    } catch (e: unknown) {
+      setAllocateErr(e instanceof ApiError ? e.message : '核销失败');
+    } finally {
+      setAllocatingReceiptId(null);
+    }
+  }
 
   function onFile(e: React.ChangeEvent<HTMLInputElement>): void {
     const f = e.target.files?.[0];
@@ -11454,6 +11492,39 @@ function ConfirmPaymentSection({
               <span className="ml-1 text-amber-700">
                 其中 {pendingHint.overpayCount} 笔是本单多付转入的。
               </span>
+            )}
+            {/* 逐笔就地核销：省得跳页——每笔最多认到 min(该笔剩余, 本单欠款)；本单已结清/多付时禁用。 */}
+            <div className="mt-1.5 space-y-1">
+              {pendingReceipts.map((r) => {
+                const remaining = Number(r.remainingCny);
+                const owed = balance > 0 ? Math.round(balance * 100) / 100 : 0;
+                const allocAmt = Math.round(Math.min(remaining, owed) * 100) / 100;
+                const ref = r.externalTxnId || r.receiptNo;
+                const disabled = owed <= 0 || allocatingReceiptId !== null;
+                return (
+                  <div
+                    key={r.id}
+                    className="flex flex-wrap items-center justify-between gap-2 rounded border border-amber-200 bg-white/60 px-1.5 py-1"
+                  >
+                    <span>
+                      流水 <span className="font-mono">{ref}</span>
+                      <span className="ml-1 text-amber-700">剩余 ¥{remaining.toLocaleString()}</span>
+                    </span>
+                    <button
+                      type="button"
+                      className="btn-secondary text-xs px-2 py-0.5 disabled:opacity-50"
+                      onClick={() => void allocateToOrder(r)}
+                      disabled={disabled}
+                      title={owed <= 0 ? '本单已无应收' : `核销 ¥${allocAmt.toLocaleString()} 到本单`}
+                    >
+                      {allocatingReceiptId === r.id ? '核销中…' : '核销到本单'}
+                    </button>
+                  </div>
+                );
+              })}
+            </div>
+            {allocateErr && (
+              <div className="mt-1 rounded bg-rose-100 px-1.5 py-1 text-rose-700">{allocateErr}</div>
             )}
             <div className="mt-1.5">
               <button
