@@ -10479,16 +10479,25 @@ function resolveCreatedAtBoundary(value: string, edge: 'from' | 'to'): Date {
 // ── 搜索分词（多词 AND 匹配）────────────────────────────────────────
 // 分隔符：空格（含全角/换行）、英文逗号、中文逗号、顿号 —— 覆盖录单员常见的姓名串写法。
 const SEARCH_TERM_SEPARATORS = /[\s,，、]+/;
-// 词数上限：防滥用（每个词都会展开成一组跨表 OR 子查询，词数不设限会被超长输入拖垮查询）。
+// 词数上限（query.search 专用）：词间 AND 语义——每个词都会展开成一组跨表 OR 子查询，
+// 词数不设限会被超长输入拖垮查询，故这里保持 5 不动。
 const MAX_SEARCH_TERMS = 5;
+// 乘客姓名筛选专用上限（运营反馈：一次要贴一整团几十人的名单，5 个卡得太死）。
+// 词间是 OR、且只在 passengers 一张表上 contains（不像 search 要跨表展开 AND），
+// 放宽到 50 代价可控，覆盖绝大多数团组名单规模。
+export const MAX_PASSENGER_NAME_TERMS = 50;
 
-/** search 输入 → 规整后的词列表（trim、去空词、截断到上限）。导出供单测使用。 */
-export function splitSearchTerms(search: string): string[] {
+/**
+ * 输入串 → 规整后的词列表（trim、去空词、截断到上限）。导出供单测使用。
+ * @param limit 词数上限，默认 MAX_SEARCH_TERMS（5，query.search / recordedBy 用）；
+ *   乘客姓名筛选传 MAX_PASSENGER_NAME_TERMS（50）。
+ */
+export function splitSearchTerms(search: string, limit: number = MAX_SEARCH_TERMS): string[] {
   return search
     .split(SEARCH_TERM_SEPARATORS)
     .map((term) => term.trim())
     .filter((term) => term.length > 0)
-    .slice(0, MAX_SEARCH_TERMS);
+    .slice(0, limit);
 }
 
 /**
@@ -10781,8 +10790,10 @@ export function buildOrderFilterWhere(
   // 多词间同样 OR（运营需求：姓名框填多个人名要把这些人的订单都列出来——"列出这些乘客的订单"而非
   // "同一订单里凑齐这些乘客"，故不复用 query.search 的词间 AND 语义）；任一乘客命中任一词即命中该订单。
   // 单词输入退化为原语义（fullName/chineseName 任一命中该词）。
+  // 词数上限用 MAX_PASSENGER_NAME_TERMS（50）而非 search 的 5——运营反馈：一次要贴一整团
+  // 几十人的名单，5 个名字卡不住整团人数；这里只在 passengers 一张表上 contains，代价可控。
   if (query.passengerName) {
-    const terms = splitSearchTerms(query.passengerName);
+    const terms = splitSearchTerms(query.passengerName, MAX_PASSENGER_NAME_TERMS);
     where.passengers = {
       some: {
         OR: terms.flatMap((term) => [

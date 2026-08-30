@@ -636,7 +636,9 @@ export const listOrdersQuerySchema = z.object({
   unclaimedOnly: z.coerce.boolean().optional(),
   // ops 确认的三个筛选（航班号 / 乘客姓名 / 开票状态）
   flightNumber: z.string().max(20).optional(),    // 订单含该航班号的 FLIGHT 行（不区分大小写）
-  passengerName: z.string().max(120).optional(),  // 乘客姓名模糊匹配
+  // 乘客姓名模糊匹配——上限 600 字符：运营反馈要能一次贴一整团（几十人）的名单，
+  // 与 orders.service.ts 的 MAX_PASSENGER_NAME_TERMS（50 词）配套，留够分隔符空间。
+  passengerName: z.string().max(600).optional(),
   // 录入人员模糊匹配 —— 口径与导出「录入人员」列同源（下单账号 user.displayName → email；
   // 游客单无录单账号，整类记作「散客」，搜该标签即捞出全部游客单）。多词之间 OR：一次填几个
   // 人名＝列出这几位录入的订单（与 passengerName 同语义，不是 search 的词间 AND）。

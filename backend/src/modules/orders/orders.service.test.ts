@@ -183,6 +183,7 @@ import {
   GUEST_RECORDED_BY_LABEL,
   resolveHasReturnLeg,
   splitSearchTerms,
+  MAX_PASSENGER_NAME_TERMS,
   filterOrderIdsByDepartDate,
   deriveOrderReturnDate,
   filterOrderIdsByReturnDate,
@@ -5424,6 +5425,16 @@ describe('buildOrderFilterWhere · 搜索/乘客姓名含中文名（公测反�
     });
   });
 
+  it('passengerName 一次贴一整团（超过 search 的 5 词上限）：全部保留不截断', () => {
+    // 运营反馈：姓名框要能一次贴几十人的名单，不能像 search 那样卡在 5 个词。
+    const names = Array.from({ length: 30 }, (_, i) => `团员${i + 1}`);
+    const where = buildOrderFilterWhere({ passengerName: names.join(' ') });
+    const or = (where.passengers as { some: { OR: unknown[] } }).some.OR;
+    // 30 个词 × 2 个字段（fullName/chineseName）= 60 个候选
+    expect(or).toHaveLength(60);
+    expect(or).toContainEqual({ fullName: { contains: '团员30', mode: 'insensitive' } });
+  });
+
   it('recordedBy → 下单账号显示名/邮箱任一命中；普通人名不牵连游客单', () => {
     const where = buildOrderFilterWhere({ recordedBy: '王操作' });
     const clause = ((where.AND ?? []) as Array<Record<string, unknown>>).find((c) => 'OR' in c);
@@ -5470,8 +5481,23 @@ describe('splitSearchTerms · 搜索分词', () => {
     expect(splitSearchTerms('   ')).toEqual([]);
   });
 
-  it('词数上限 5：超出部分截断防滥用', () => {
+  it('词数上限 5（默认，search/recordedBy 用）：超出部分截断防滥用', () => {
     expect(splitSearchTerms('a b c d e f g')).toEqual(['a', 'b', 'c', 'd', 'e']);
+  });
+
+  it('传自定义 limit=MAX_PASSENGER_NAME_TERMS（50）：整团 50 人名单一个不截断', () => {
+    const names = Array.from({ length: MAX_PASSENGER_NAME_TERMS }, (_, i) => `乘客${i + 1}`);
+    const result = splitSearchTerms(names.join(' '), MAX_PASSENGER_NAME_TERMS);
+    expect(result).toHaveLength(MAX_PASSENGER_NAME_TERMS);
+    expect(result).toEqual(names);
+  });
+
+  it('传自定义 limit=MAX_PASSENGER_NAME_TERMS（50）：第 51 个人名被截断', () => {
+    const names = Array.from({ length: MAX_PASSENGER_NAME_TERMS + 1 }, (_, i) => `乘客${i + 1}`);
+    const result = splitSearchTerms(names.join(' '), MAX_PASSENGER_NAME_TERMS);
+    expect(result).toHaveLength(MAX_PASSENGER_NAME_TERMS);
+    expect(result).toEqual(names.slice(0, MAX_PASSENGER_NAME_TERMS));
+    expect(result).not.toContain(`乘客${MAX_PASSENGER_NAME_TERMS + 1}`);
   });
 });
 
