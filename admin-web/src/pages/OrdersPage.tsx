@@ -11822,6 +11822,8 @@ interface BatchPayRow {
   orderId: string;
   orderNumber: string;
   customerName: string;
+  /** 乘客姓名（中文名优先，缺失回退证件姓名）：运营对着收款记录核对认的是这个，不是订单号 */
+  passengerNames: string[];
   /** 客户应付（含售后费；= 后端 effectivePayable） */
   payable: number;
   paid: number;
@@ -11831,6 +11833,13 @@ interface BatchPayRow {
   balance: number;
   /** 本次到账金额（默认 = 尾款）；null = 空 */
   amount: number | null;
+}
+
+/** 乘客姓名：中文名优先，缺失回退证件姓名（与回收站列表同一口径）。核对到账水单认的是乘客名，不是订单号。 */
+function batchPayPassengerNames(o: OrderSummary): string[] {
+  return (o.passengers ?? [])
+    .map((p) => p.chineseName ?? p.fullName)
+    .filter((n): n is string => !!n && n.trim().length > 0);
 }
 
 function BatchPayModal({
@@ -11854,6 +11863,7 @@ function BatchPayModal({
         orderId: o.id,
         orderNumber: o.orderNumber,
         customerName,
+        passengerNames: batchPayPassengerNames(o),
         payable,
         paid,
         prepaid,
@@ -11984,7 +11994,7 @@ function BatchPayModal({
             <table className="w-full text-sm">
               <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
                 <tr>
-                  <th className="px-3 py-1.5 text-left font-normal">订单 / 客户</th>
+                  <th className="px-3 py-1.5 text-left font-normal">乘客 / 订单</th>
                   <th className="px-3 py-1.5 text-right font-normal">应收</th>
                   <th className="px-3 py-1.5 text-right font-normal">已付</th>
                   <th className="px-3 py-1.5 text-right font-normal">尾款</th>
@@ -11998,8 +12008,18 @@ function BatchPayModal({
                   return (
                     <tr key={r.orderId} className="border-t border-slate-100">
                       <td className="px-3 py-1.5">
-                        <div className="font-mono text-xs text-ink-soft">{r.orderNumber}</div>
-                        <div className="text-xs text-ink-muted">{r.customerName}</div>
+                        {/* 运营对着微信收款记录核对认的是乘客姓名，不是订单号——乘客名做主行，订单号/客户名退居次要 */}
+                        <div
+                          className="max-w-[200px] truncate text-sm font-medium text-ink"
+                          title={r.passengerNames.length > 0 ? r.passengerNames.join('、') : undefined}
+                        >
+                          {r.passengerNames.length > 0 ? r.passengerNames.join('、') : '（无乘客信息）'}
+                        </div>
+                        <div className="mt-0.5 flex items-center gap-1 text-[11px] text-ink-muted">
+                          <span className="font-mono">{r.orderNumber}</span>
+                          <span>·</span>
+                          <span className="truncate">{r.customerName}</span>
+                        </div>
                       </td>
                       <td className="nums px-3 py-1.5 text-right text-slate-600">¥{r.payable.toLocaleString()}</td>
                       <td className="nums px-3 py-1.5 text-right text-slate-600">
