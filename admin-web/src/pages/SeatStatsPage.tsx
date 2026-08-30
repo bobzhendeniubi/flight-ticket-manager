@@ -140,15 +140,15 @@ export function SeatStatsPage() {
         oversoldSeats,
       };
     });
-    // 同一天内统一「先去后回」排列
-    const directionRank = (originCode: string) => (isOutbound(originCode) ? 0 : 1);
+    // 同一天内按实际起飞时刻先后排列（公测反馈口径：不再固定「先去后回」）。
+    // departureTime 是 ISO UTC 串，直接 localeCompare 即为跨时区的瞬时先后序——
+    // 例如岘港 12:00 越南时间 = UTC 05:00，早于澳门 15:45 = UTC 07:45，前者排前面。
     return result.sort(
       (a, b) =>
         // 主键用含年份的本地日期 YYYY-MM-DD，跨月/跨年才不会乱序（formatLocalDate 无年份）
         localYmd(a.departureTime, a.departureTz).localeCompare(
           localYmd(b.departureTime, b.departureTz),
         ) ||
-        directionRank(a.origin) - directionRank(b.origin) ||
         a.departureTime.localeCompare(b.departureTime) ||
         a.flightNumber.localeCompare(b.flightNumber),
     );
