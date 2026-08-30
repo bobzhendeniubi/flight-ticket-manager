@@ -19,7 +19,7 @@
  * 后端报错就地内联展示。
  */
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useSearchParams } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import {
   api,
   ApiError,
@@ -27,6 +27,7 @@ import {
   RECEIPT_SOURCE_LABEL,
   RECEIPT_STATUS_LABEL,
   type LedgerEntry,
+  type OrderSummary,
   type PaymentMethod,
   type Receipt,
   type ReceiptStatus,
@@ -558,6 +559,132 @@ function TabBtn({
   );
 }
 
+// 订单号格式（generateOrderNumber：FTM + 年月日 + 序号，如 FTM2026070800005）；
+// 备注里出现的订单号一律长这样，用来从「超收自动拆分」这类备注文本里抠出完整单号。
+const ORDER_NUMBER_RE = /FTM[A-Z0-9]+/g;
+
+/**
+ * 从进账备注 + 疑似归属订单号里抠出「完整订单号」集合（去重，保序）。
+ * 备注里的号（如「超收自动拆分 · 订单 FTM2026XXXXXXXX」）与服务端 join 出的 hintOrderNumber
+ * 经常指向同一张单——只在这里去重一次，调用方不用各自记一遍谁包含谁。
+ */
+function extractPayerNoteOrderNumbers(
+  payerNote: string | null | undefined,
+  hintOrderNumber: string | null | undefined,
+): string[] {
+  const found: string[] = [];
+  const seen = new Set<string>();
+  const push = (no: string) => {
+    if (!seen.has(no)) {
+      seen.add(no);
+      found.push(no);
+    }
+  };
+  if (payerNote) {
+    for (const m of payerNote.match(ORDER_NUMBER_RE) ?? []) push(m);
+  }
+  if (hintOrderNumber) push(hintOrderNumber);
+  return found;
+}
+
+/**
+ * 复制到剪贴板，带兼容兜底：非安全上下文 / 权限被拒时 navigator.clipboard 会抛错或干脆不存在，
+ * 退化到隐藏 textarea + execCommand（老浏览器 / http 内网访问的常见坑）。
+ */
+async function copyToClipboard(text: string): Promise<boolean> {
+  if (typeof navigator !== 'undefined' && navigator.clipboard?.writeText) {
+    try {
+      await navigator.clipboard.writeText(text);
+      return true;
+    } catch {
+      // 权限不可用时走下面的兼容分支
+    }
+  }
+  if (typeof document === 'undefined') return false;
+  const textarea = document.createElement('textarea');
+  textarea.value = text;
+  textarea.setAttribute('readonly', '');
+  textarea.style.position = 'fixed';
+  textarea.style.opacity = '0';
+  document.body.appendChild(textarea);
+  textarea.select();
+  let ok = false;
+  try {
+    ok = document.execCommand('copy');
+  } catch {
+    ok = false;
+  }
+  textarea.remove();
+  return ok;
+}
+
+/** 订单号 chip：完整号可见、可点复制、可跳订单页——备注截断后唯独订单号不能跟着糊。 */
+function OrderNumberChip({ orderNumber }: { orderNumber: string }) {
+  const [feedback, setFeedback] = useState<'copied' | 'failed' | null>(null);
+  const timerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+
+  useEffect(() => () => {
+    if (timerRef.current) clearTimeout(timerRef.current);
+  }, []);
+
+  async function handleCopy() {
+    const ok = await copyToClipboard(orderNumber);
+    setFeedback(ok ? 'copied' : 'failed');
+    if (timerRef.current) clearTimeout(timerRef.current);
+    timerRef.current = setTimeout(() => setFeedback(null), 1500);
+  }
+
+  return (
+    <span className="inline-flex items-center gap-1 rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 font-mono text-[11px] text-ink">
+      <Link to={`/orders?q=${encodeURIComponent(orderNumber)}`} className="hover:underline" title="跳转到订单页">
+        {orderNumber}
+      </Link>
+      <button
+        type="button"
+        className="text-ink-muted hover:text-ink"
+        onClick={() => void handleCopy()}
+        title="复制订单号"
+      >
+        <Icon name={feedback === 'copied' ? 'check' : 'clipboard'} size={12} />
+      </button>
+      {feedback === 'copied' && <span className="text-emerald-700">已复制</span>}
+      {feedback === 'failed' && <span className="text-rose-700">复制失败</span>}
+    </span>
+  );
+}
+
+/**
+ * 「付款人 / 备注」列：订单号单独摘出来渲染成不参与 truncate 的 chip（可见全、可复制、可跳转），
+ * 备注正文仍然截断 + title 展全；orderHintId 查不到 hintOrderNumber（如原单已删）时没有真实单号
+ * 可复制/跳转，退回旧的纯文本提示。
+ */
+function PayerNoteCell({ receipt }: { receipt: Receipt }) {
+  const orderNumbers = extractPayerNoteOrderNumbers(receipt.payerNote, receipt.hintOrderNumber);
+  const rawHintOnly = receipt.orderHintId && !receipt.hintOrderNumber ? receipt.orderHintId : null;
+  const hasText = Boolean(receipt.payerNote) || Boolean(rawHintOnly);
+  return (
+    <div className="flex flex-col gap-1">
+      {orderNumbers.length > 0 && (
+        <div className="flex flex-wrap items-center gap-1">
+          {orderNumbers.map((no) => (
+            <OrderNumberChip key={no} orderNumber={no} />
+          ))}
+        </div>
+      )}
+      {hasText ? (
+        <div className="max-w-[200px] truncate text-xs text-ink-muted" title={receipt.payerNote ?? ''}>
+          {receipt.payerNote}
+          {rawHintOnly && (
+            <span title={`订单 id ${rawHintOnly}`}>（提示订单 {rawHintOnly.slice(0, 8)}）</span>
+          )}
+        </div>
+      ) : (
+        orderNumbers.length === 0 && <span className="text-xs text-ink-muted">—</span>
+      )}
+    </div>
+  );
+}
+
 // ── 进账表（待核销 / 已核销 / 已退款） ───────────────────────────────────────
 function ReceiptTable({
   rows,
@@ -689,13 +816,8 @@ function ReceiptRow({
         <td className="nums text-right text-ink">{fmtCny(receipt.amountCny)}</td>
         <td className="nums text-right font-medium text-amber-700">{fmtCny(receipt.remainingCny)}</td>
         <td>{PAYMENT_METHOD_LABEL[receipt.method] ?? receipt.method}</td>
-        <td className="max-w-[200px] truncate" title={receipt.payerNote ?? ''}>
-          {receipt.payerNote || '—'}
-          {receipt.orderHintId && (
-            <span className="ml-1 text-xs text-ink-muted" title={`订单 id ${receipt.orderHintId}`}>
-              （提示订单 {receipt.hintOrderNumber ?? receipt.orderHintId.slice(0, 8)}）
-            </span>
-          )}
+        <td className="max-w-[240px]">
+          <PayerNoteCell receipt={receipt} />
         </td>
         <td>
           <span className="badge-neutral">{RECEIPT_SOURCE_LABEL[receipt.source] ?? receipt.source}</span>
@@ -833,7 +955,42 @@ function ReceiptRow({
   );
 }
 
-// ── 认领：按订单号搜订单 + 金额（默认 = 剩余） ───────────────────────────────
+/**
+ * 应收 / 尾款：后端权威口径 balanceDue（= effectivePayable − paidAmount − prepaymentOffset）。
+ * 不要在前端自己按「total − paidAmount」算——那样会漏掉售后调整行与代理预存抵扣，同一张单
+ * 在订单页和这里会显示两个不一样的尾款。旧后端没下发 balanceDue 时才回落到应付减已付。
+ */
+function orderBalanceInfo(order: OrderSummary): { payable: number; due: number } {
+  const payable =
+    order.effectivePayable != null
+      ? Number(order.effectivePayable)
+      : Number(order.total) + (order.adjustmentCny ?? 0);
+  const due =
+    order.balanceDue != null
+      ? Number(order.balanceDue)
+      : Math.round((payable - Number(order.paidAmount) - Number(order.prepaymentOffset ?? 0)) * 100) / 100;
+  return { payable, due };
+}
+
+/**
+ * 乘客姓名（中文名优先，缺失回退证件姓名），多人用「、」连——与后端回收站列表
+ * （orders.service.ts serializeDeletedOrder）同一口径，只是这里没有现成的 passengerNames
+ * 字段（那是 DeletedOrderSummary 专属），改用 listOrders 已联查的 passengers[] 自己拼。
+ */
+function orderPassengerNamesLabel(order: OrderSummary): string {
+  return order.passengers.map((p) => p.chineseName?.trim() || p.fullName).join('、');
+}
+
+/** 认领候选订单摘要行（搜索结果单条命中，或候选列表里一条）共用的文案。 */
+function formatOrderMatchLabel(order: OrderSummary): string {
+  const { payable, due } = orderBalanceInfo(order);
+  return (
+    `${order.orderNumber} · ${order.contactName} · 应收 ¥${payable.toLocaleString()} · ` +
+    (due < 0 ? `已多收 ¥${Math.abs(due).toLocaleString()}` : `尾款 ¥${due.toLocaleString()}`)
+  );
+}
+
+// ── 认领：按订单号 / 乘客姓名搜订单 + 金额（默认 = 剩余） ───────────────────────
 function AllocateForm({
   token,
   receiptId,
@@ -853,12 +1010,24 @@ function AllocateForm({
   const [orderNo, setOrderNo] = useState(() => searchParams.get('order')?.trim() ?? '');
   const [matchedOrderId, setMatchedOrderId] = useState<string | null>(null);
   const [matchedLabel, setMatchedLabel] = useState<string | null>(null);
+  // 多命中（比如按姓名搜到好几张单）→ 摆出来让人点选，绝不替客户猜是哪一单——这是钱的操作。
+  const [candidates, setCandidates] = useState<OrderSummary[]>([]);
   const [searching, setSearching] = useState(false);
   const [amount, setAmount] = useState<number | null>(remaining > 0 ? remaining : null);
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // 按订单号搜出 orderId（认领需要订单内部 id）
+  function selectOrder(pick: OrderSummary) {
+    setMatchedOrderId(pick.id);
+    setMatchedLabel(formatOrderMatchLabel(pick));
+    setCandidates([]);
+    setErr(null);
+  }
+
+  // 按订单号 / 乘客姓名搜出 orderId（认领需要订单内部 id）。
+  // 后端 search 本就支持乘客中英文名/护照号/联系人（buildSearchTermClause），
+  // 精确单号命中才直接选中；否则一律摆出候选列表让人点，不再悄悄摘 orders[0]——
+  // 按姓名搜到同名多单时静默选错单，核销的可是真金白银。
   async function search() {
     const term = orderNo.trim();
     if (!term || searching) return;
@@ -866,33 +1035,23 @@ function AllocateForm({
     setSearching(true);
     setMatchedOrderId(null);
     setMatchedLabel(null);
+    setCandidates([]);
     try {
-      const r = await api.listOrders(token, { search: term, pageSize: 5 });
+      const r = await api.listOrders(token, { search: term, pageSize: 8 });
       const exact = r.orders.find((o) => o.orderNumber.toLowerCase() === term.toLowerCase());
-      const pick = exact ?? r.orders[0];
-      if (!pick) {
-        setErr('没找到匹配的订单，请核对订单号');
+      if (exact) {
+        selectOrder(exact);
         return;
       }
-      setMatchedOrderId(pick.id);
-      // 尾款用后端权威口径 balanceDue（= total + adjustmentCny − paidAmount − prepaymentOffset）。
-      // 之前这里自己按「total − paidAmount」算，漏掉售后调整行与代理预存抵扣——
-      // 同一张单在订单页和这里会显示两个不一样的尾款，认款金额就照着错的数填。
-      // 旧后端没下发 balanceDue 时才回落到应付减已付（仍带上 adjustmentCny/prepaymentOffset）。
-      const payable =
-        pick.effectivePayable != null
-          ? Number(pick.effectivePayable)
-          : Number(pick.total) + (pick.adjustmentCny ?? 0);
-      const due =
-        pick.balanceDue != null
-          ? Number(pick.balanceDue)
-          : Math.round((payable - Number(pick.paidAmount) - Number(pick.prepaymentOffset ?? 0)) * 100) / 100;
-      setMatchedLabel(
-        `${pick.orderNumber} · ${pick.contactName} · 应收 ¥${payable.toLocaleString()} · ` +
-          (due < 0
-            ? `已多收 ¥${Math.abs(due).toLocaleString()}`
-            : `尾款 ¥${due.toLocaleString()}`),
-      );
+      if (r.orders.length === 0) {
+        setErr('没找到匹配的订单，请核对订单号或乘客姓名');
+        return;
+      }
+      if (r.orders.length === 1) {
+        selectOrder(r.orders[0]);
+        return;
+      }
+      setCandidates(r.orders);
     } catch (e: unknown) {
       setErr(e instanceof ApiError ? e.message : '查订单失败');
     } finally {
@@ -934,13 +1093,21 @@ function AllocateForm({
       {err && <div className="rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>}
       <div className="flex flex-wrap items-end gap-2">
         <label className="text-xs text-ink-soft">
-          订单号
+          订单号 / 乘客姓名
           <div className="mt-1 flex gap-1.5">
             <input
-              className="input w-48 py-1.5"
-              placeholder="如 ORD20260619..."
+              className="input w-56 py-1.5"
+              placeholder="订单号或乘客姓名"
               value={orderNo}
-              onChange={(e) => setOrderNo(e.target.value)}
+              onChange={(e) => {
+                setOrderNo(e.target.value);
+                // 改了搜索词，之前选中的/候选的都作废，别让人对着旧结果误点确认核销。
+                if (matchedOrderId || candidates.length > 0) {
+                  setMatchedOrderId(null);
+                  setMatchedLabel(null);
+                  setCandidates([]);
+                }
+              }}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') search();
               }}
@@ -979,6 +1146,39 @@ function AllocateForm({
           取消
         </button>
       </div>
+      {candidates.length > 0 && (
+        <div className="rounded-md border border-slate-200 bg-white shadow-sm">
+          <div className="border-b border-slate-100 px-2 py-1 text-xs text-ink-muted">
+            找到 {candidates.length} 张匹配订单，请核对后点选：
+          </div>
+          <ul className="max-h-56 divide-y divide-slate-100 overflow-y-auto">
+            {candidates.map((o) => {
+              const { due } = orderBalanceInfo(o);
+              const names = orderPassengerNamesLabel(o);
+              return (
+                <li key={o.id}>
+                  <button
+                    type="button"
+                    className="flex w-full flex-col items-start gap-0.5 px-2 py-1.5 text-left text-xs hover:bg-brand-50"
+                    onClick={() => selectOrder(o)}
+                  >
+                    <span className="flex flex-wrap items-center gap-x-2">
+                      <span className="font-mono text-ink">{o.orderNumber}</span>
+                      <span className="text-ink-soft">{o.contactName}</span>
+                    </span>
+                    <span className="text-ink-muted">
+                      {names || '（未录乘客）'} ·{' '}
+                      {due < 0
+                        ? `已多收 ¥${Math.abs(due).toLocaleString()}`
+                        : `尾款 ¥${due.toLocaleString()}`}
+                    </span>
+                  </button>
+                </li>
+              );
+            })}
+          </ul>
+        </div>
+      )}
       {matchedLabel && (
         <div className="rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1 text-xs text-emerald-800">
           <Icon name="check" /> {matchedLabel}
