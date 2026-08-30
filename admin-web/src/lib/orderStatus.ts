@@ -10,7 +10,8 @@ export const ORDER_STATUS_META: Record<OrderStatus, { label: string; tone: 'neut
   TICKETED: { label: '出票完成', tone: 'success' },
   COMPLETED: { label: '已完成', tone: 'neutral' },
   PAYMENT_TIMEOUT: { label: '超时', tone: 'warning' },
-  CANCELLED: { label: '已取消', tone: 'neutral' },
+  // 公测反馈：已取消要一眼看出来（灰色和已完成/已退款混在一起容易看漏），用红色醒目标出
+  CANCELLED: { label: '已取消', tone: 'danger' },
   REFUND_REQUESTED: { label: '退款申请中', tone: 'warning' },
   REFUNDED: { label: '已退款', tone: 'neutral' },
   CHANGE_REQUESTED: { label: '改期申请中', tone: 'warning' },
