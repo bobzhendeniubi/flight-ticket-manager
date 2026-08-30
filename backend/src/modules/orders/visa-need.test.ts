@@ -58,11 +58,11 @@ describe('orderVisaStatusRequiresVisa — 订单级', () => {
 });
 
 describe('orderVisaStatusExplicitlyNotNeeded — 订单级一票否决', () => {
-  it('只有 NOT_NEEDED 算「明说不需要」', () => {
+  it('NOT_NEEDED 与 HAS_VISA 都算「明说不用我方办」（已签证客人签证岗完全不用管）', () => {
     expect(orderVisaStatusExplicitlyNotNeeded(VisaRequirement.NOT_NEEDED)).toBe(true);
+    expect(orderVisaStatusExplicitlyNotNeeded(VisaRequirement.HAS_VISA)).toBe(true);
     expect(orderVisaStatusExplicitlyNotNeeded(VisaRequirement.NEEDED)).toBe(false);
     expect(orderVisaStatusExplicitlyNotNeeded(VisaRequirement.E_VISA)).toBe(false);
-    expect(orderVisaStatusExplicitlyNotNeeded(VisaRequirement.HAS_VISA)).toBe(false);
   });
 
   it('没表态（null / undefined）≠ 不需要', () => {
@@ -121,14 +121,14 @@ describe('orderNeedsVisaTask — 三根轴收口', () => {
     ).toBe(false);
   });
 
-  it('已签证（HAS_VISA）+ 商品级涉签 → 仍建（本次只收 NOT_NEEDED，HAS_VISA 口径未变）', () => {
+  it('已签证（HAS_VISA）+ 商品级涉签 → 不建（客人已自持签证，与「不需要」同权否决）', () => {
     expect(
       orderNeedsVisaTask({
         visaStatus: VisaRequirement.HAS_VISA,
         hasVisaScope: true,
         passengers: [{ visaExempt: false }],
       }),
-    ).toBe(true);
+    ).toBe(false);
   });
 
   it('商品级涉签 + 有人要代办 → 建（订单级 visaStatus 未标也算数）', () => {

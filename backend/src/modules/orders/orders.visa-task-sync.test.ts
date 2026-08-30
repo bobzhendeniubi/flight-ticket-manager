@@ -125,6 +125,22 @@ describe('syncVisaTasksForOrder · 不再需要签证 → 撤销待处理任务'
     expect((await run()).cancelledTaskIds).toEqual(['task_pending']);
   });
 
+  // HAS_VISA 与 NOT_NEEDED 同权否决商品级涉签（运营口径 2026-08-30）：
+  // 客人已自持签证的单，含签证组件的套餐也不该在签证台挂任务。
+  it('含签证组件的套餐 + 订单级「已签证」+ 乘客都没置自备签 → 照样撤销', async () => {
+    seed({
+      visaStatus: VisaRequirement.HAS_VISA,
+      items: [
+        { id: 'itm_bundle', kind: 'BUNDLE', bundleId: 'bdl_visa', tasks: [pendingVisaTask()] },
+      ],
+      bundleItems: [{ kind: 'HOTEL' }, { kind: 'VISA' }],
+      passengers: [{ visaExempt: false }, { visaExempt: false }],
+    });
+    const result = await run();
+    expect(result.needed).toBe(false);
+    expect(result.cancelledTaskIds).toEqual(['task_pending']);
+  });
+
   // 订单级「不需要」压过商品级涉签：含签证组件的套餐 hasVisaScope 恒为 true，此前只有把乘客
   // 全置自备签才消得掉，于是漏掉前端联动的单在签证台上挂着办不掉的「待处理」（签证岗实测）。
   it('含签证组件的套餐 + 订单级「不需要」+ 乘客都没置自备签 → 照样撤销', async () => {

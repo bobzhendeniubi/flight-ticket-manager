@@ -13072,8 +13072,9 @@ async function resolveVisaTaskAnchor(
  *   - 订单级 visaStatus = NEEDED / E_VISA
  *   - 含 VISA 订单项
  *   - 含 BUNDLE 订单项，且该套餐组件含 VISA
- * 但订单级 visaStatus = NOT_NEEDED 一票否决以上三条（口径见 visa-need.ts 的 orderNeedsVisaTask）：
- * 录单明说「不需要签证」的单，含签证组件的套餐也不建任务，不再依赖录单弹窗的前端联动。
+ * 但订单级 visaStatus = NOT_NEEDED / HAS_VISA 一票否决以上三条（口径见 visa-need.ts 的
+ * orderNeedsVisaTask）：录单明说「不需要签证」或「已签证」的单，含签证组件的套餐也不建任务，
+ * 不再依赖录单弹窗的前端联动。
  *
  * 任务锚点与 PAID 路径保持一致（VISA 项 → 该项；含签证套餐 → 该套餐项；
  * 否则订单级需签 → 首个订单项），并按「已存在 VISA 任务即跳过」幂等：

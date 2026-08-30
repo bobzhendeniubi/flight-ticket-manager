@@ -5,7 +5,8 @@
  *
  * 背景：「要不要办签证」散在三根轴上，各处自行手抄组合，口径容易漂：
  *   1. 订单级 —— Order.visaStatus = NEEDED / E_VISA（电子签同样要送签，签证台按类型筛）；
- *      反向的 NOT_NEEDED 是**一票否决**，压过下面两根轴（录单人已经明说这单不用我们办）
+ *      反向的 NOT_NEEDED / HAS_VISA 是**一票否决**，压过下面两根轴
+ *      （录单人已经明说这单不用我们办：不需要签证，或客人已自持签证）
  *   2. 商品级 —— 含 VISA 订单项，或含 VISA 组件的套餐
  *   3. 乘客级 —— Passenger.visaExempt（客人自备签证，无需送签）
  *
@@ -44,15 +45,19 @@ export function orderVisaStatusRequiresVisa(
 }
 
 /**
- * 订单级「明确不需要我方代办」—— 录单时显式选了「不需要签证」。
+ * 订单级「明确不需要我方代办」—— 录单时显式选了「不需要签证」或「已签证」。
  *
+ * HAS_VISA（已签证）与 NOT_NEEDED 同权否决：客人已自持签证，签证岗完全无事可做
+ * （运营口径，2026-08-30 拍板）。
  * 与 `visaStatus = null`（没表态）区别对待：没表态时商品级涉签照常建任务（不漏单）；
- * 显式选了「不需要」是录单人给出的结论，压过商品级涉签（见 orderNeedsVisaTask）。
+ * 显式选了这两档是录单人给出的结论，压过商品级涉签（见 orderNeedsVisaTask）。
  */
 export function orderVisaStatusExplicitlyNotNeeded(
   visaStatus: VisaRequirement | null | undefined,
 ): boolean {
-  return visaStatus === VisaRequirement.NOT_NEEDED;
+  return (
+    visaStatus === VisaRequirement.NOT_NEEDED || visaStatus === VisaRequirement.HAS_VISA
+  );
 }
 
 /**
@@ -69,7 +74,7 @@ export function orderVisaStatusExplicitlyNotNeeded(
  * 那一瞬生效：先把签证状态改成「不需要」、再挑具体套餐（签证列此时才出现），联动整条错过，
  * 任务照建。判定收在这里之后，「不需要签证」不再依赖任何前端时序。
  *
- * 只认 NOT_NEEDED，不含 HAS_VISA（已签证）：后者语义上也无需送签，但改动面更大，留待拍板。
+ * 否决档含 NOT_NEEDED 与 HAS_VISA（已签证）两档——已签证的客人签证岗同样完全不用管。
  * 乘客级 visaExempt 一概不碰 —— 它同时是**定价**输入（套餐按人扣减自备签减免、签证组件按
  * 办签人数计费），服务端替客人勾自备签 = 静默改价。
  */
