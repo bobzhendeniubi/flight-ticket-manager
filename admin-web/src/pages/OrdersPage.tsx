@@ -8963,11 +8963,12 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   }, [productType]);
   const [noteHotel, setNoteHotel] = useState('');
 
-  // 整批签证「不需要」→ 乘客行自备签的单向联动（与单笔录单 SingleOrderModal 同口径）。
+  // 整批签证「不需要 / 已签证」→ 乘客行自备签的单向联动（与单笔录单 SingleOrderModal 同口径）。
   // 套餐含签证组件时，订单级「不需要」压不掉商品级涉签——只有乘客级 visaExempt 才能免建签证任务；
   // 不联动的话整批子单会每张都挂进签证台「待处理」。单向：选中「不需要」时批量置为自备签 +
   // 新增/导入行默认自备签；改回其它值不做反向还原，不动用户逐行调整过的勾选。
-  const batchAutoVisaExempt = productType === 'BUNDLE' && visaStatus === 'NOT_NEEDED';
+  const batchAutoVisaExempt =
+    productType === 'BUNDLE' && (visaStatus === 'NOT_NEEDED' || visaStatus === 'HAS_VISA');
   /** 导入/粘贴整批替换名单时，给未显式带 visaExempt 的行补联动默认值（联动未激活时原样返回）。 */
   function applyBatchVisaExemptDefault(list: BatchRow[]): BatchRow[] {
     if (!batchAutoVisaExempt) return list;
@@ -10940,9 +10941,10 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                     visaStatusTouchedRef.current = true;
                     const next = e.target.value as VisaStatusInput;
                     setVisaStatus(next);
-                    // 单向联动（与单笔录单同口径）：套餐批改成「不需要」→ 现有乘客行批量置自备签；
+                    // 单向联动（与单笔录单同口径）：套餐批改成「不需要 / 已签证」→ 现有乘客行
+                    // 批量置自备签（两档同权，客人自持签证同样不该收签证钱）；
                     // 改回其它值不做反向还原，不动用户逐行调整过的勾选。
-                    if (next === 'NOT_NEEDED' && productType === 'BUNDLE') {
+                    if ((next === 'NOT_NEEDED' || next === 'HAS_VISA') && productType === 'BUNDLE') {
                       setRows((prev) => {
                         const updated = prev.map((r) => ({ ...r, visaExempt: true }));
                         rowsRef.current = updated;
@@ -10957,7 +10959,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 </select>
                 <span className="mt-1 block text-[11px] leading-tight text-slate-400">
                   默认按产品类型：套餐默认「需要」，机票默认「不需要」；手动改过后不再自动跟随。
-                  {productType === 'BUNDLE' && '套餐批选「不需要」会把名单全员标为自备签（不进签证台），可逐行改回。'}
+                  {productType === 'BUNDLE' && '套餐批选「不需要」或「已签证」会把名单全员标为自备签（不进签证台），可逐行改回。'}
                 </span>
               </label>
             </div>

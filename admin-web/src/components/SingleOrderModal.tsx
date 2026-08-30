@@ -776,13 +776,15 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const singleSupplementPerPax = bundle ? (bundle.singleSupplementCnyPerNight ?? 0) * bundleNightsForHint : 0;
   const selfVisaDeductPerPax = bundle?.selfVisaDeductCny ?? 0;
 
-  // 整单签证「不需要」→ 出行人自备签的单向联动开关（签证列在显示时才生效：套餐单或含签证产品单）。
-  // 单向：只在选中「不需要」时把现有/新增出行人批量置为自备签；订单级改回其它值不做任何反向还原，
+  // 整单签证「不需要 / 已签证」→ 出行人自备签的单向联动开关（签证列在显示时才生效：套餐单或含签证产品单）。
+  // 两档同权（运营口径 2026-08-30）：「已签证」= 客人自持签证，同样无人要我方办签、不该收签证钱。
+  // 单向：只在选中这两档时把现有/新增出行人批量置为自备签；订单级改回其它值不做任何反向还原，
   // 不动用户已经逐位调整过的选择（公测反馈：整单选了不需要还要逐个人再选一遍）。
-  const autoVisaExempt = showVisaExemptCol && visaStatus === 'NOT_NEEDED';
+  const visaStatusImpliesSelfVisa = visaStatus === 'NOT_NEEDED' || visaStatus === 'HAS_VISA';
+  const autoVisaExempt = showVisaExemptCol && visaStatusImpliesSelfVisa;
 
-  // 联动补一刀 —— 签证列从「不显示」变成「显示」的那一下，若整单已经是「不需要」，把现有
-  // 出行人补齐为自备签。下拉那条联动只在改状态的当下生效：先把签证状态改成「不需要」、再挑
+  // 联动补一刀 —— 签证列从「不显示」变成「显示」的那一下，若整单已经是「不需要 / 已签证」，
+  // 把现有出行人补齐为自备签。下拉那条联动只在改状态的当下生效：先把签证状态改成这两档、再挑
   // 具体套餐（签证列此时才出现），联动整条错过，下方琥珀横幅却已经在说「每位出行人已标为
   // 自备签」——说着标了实际一个没标，套餐价还照收签证钱。
   // 只在 false→true 这一次跳变时批量置位（逐位改回不触发跳变，不会被再次覆盖）；
@@ -791,7 +793,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   useEffect(() => {
     const justAppeared = showVisaExemptCol && !visaExemptColShownRef.current;
     visaExemptColShownRef.current = showVisaExemptCol;
-    if (!justAppeared || visaStatus !== 'NOT_NEEDED') return;
+    if (!justAppeared || !visaStatusImpliesSelfVisa) return;
     setPassengers((prev) => {
       const updated = prev.map((r) => (r.visaExempt ? r : { ...r, visaExempt: true }));
       passengersRef.current = updated;
@@ -2147,10 +2149,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       visaStatusTouchedRef.current = true;
                       const next = e.target.value as VisaStatusInput;
                       setVisaStatus(next);
-                      // 单向联动（公测反馈：整单选了不需要还要逐个人再选一遍）：改成「不需要」时，
+                      // 单向联动（公测反馈：整单选了不需要还要逐个人再选一遍）：改成「不需要」
+                      // 或「已签证」（两档同权，客人自持签证同样不该收签证钱）时，
                       // 若当前是套餐单且签证列在显示，把现有出行人一次性批量置为自备签；
                       // 改回其它值不做任何反向还原，不动用户已经逐位调整过的选择。
-                      if (next === 'NOT_NEEDED' && showVisaExemptCol) {
+                      if ((next === 'NOT_NEEDED' || next === 'HAS_VISA') && showVisaExemptCol) {
                         setPassengers((prev) => {
                           const updated = prev.map((r) => ({ ...r, visaExempt: true }));
                           passengersRef.current = updated;
@@ -2186,7 +2189,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               </p>
               {showVisaExemptCol && (
                 <p className="mt-1 text-[11px] text-slate-400">
-                  选「不需要」会把当前及新增出行人自动设为「自备签」（下方每位出行人卡片里可逐位改回
+                  选「不需要」或「已签证」会把当前及新增出行人自动设为「自备签」（下方每位出行人卡片里可逐位改回
                   「{isBundleOrder ? '随套餐' : '随单办签'}」）；反向不联动——单个乘客选自备签不会改变本订单级签证状态，
                   自备签乘客不进签证台{selfVisaDeductPerPax > 0 ? '、套餐价按人扣减' : ''}。
                 </p>
@@ -2229,7 +2232,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               </div>
               {autoVisaExempt && (
                 <p className="mb-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-700">
-                  整单不需要签证 → 每位出行人已标为自备签（不进签证台
+                  {visaStatus === 'HAS_VISA' ? '整单已签证' : '整单不需要签证'} → 每位出行人已标为自备签（不进签证台
                   {selfVisaDeductPerPax > 0
                     ? `，每人 −¥${selfVisaDeductPerPax.toLocaleString('zh-CN')}`
                     : ''}
