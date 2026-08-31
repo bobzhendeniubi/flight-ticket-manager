@@ -1,5 +1,13 @@
 import { useEffect, useState } from 'react';
-import { api, ApiError, type DashboardKpi, type DashboardWeeklyPoint, type DashboardTopAgent } from '../lib/api';
+import { Link } from 'react-router-dom';
+import {
+  api,
+  ApiError,
+  type DashboardKpi,
+  type DashboardWeeklyPoint,
+  type DashboardTopAgent,
+  type DashboardAlertsSummary,
+} from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { formatInBusinessTz } from '../lib/datetime';
 import { RealtimeActivity } from '../components/RealtimeActivity';
@@ -11,6 +19,7 @@ export function DashboardPage() {
   const [kpi, setKpi] = useState<DashboardKpi | null>(null);
   const [weekly, setWeekly] = useState<DashboardWeeklyPoint[]>([]);
   const [topAgents, setTopAgents] = useState<DashboardTopAgent[]>([]);
+  const [alerts, setAlerts] = useState<DashboardAlertsSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -33,6 +42,11 @@ export function DashboardPage() {
         if (!cancelled) setError(e instanceof ApiError ? e.message : '加载失败');
       })
       .finally(() => { if (!cancelled) setLoading(false); });
+    // 预警汇总独立加载：失败只静默不渲染，不挡 KPI 区
+    api
+      .getDashboardAlertsSummary(tokens.accessToken)
+      .then((r) => { if (!cancelled) setAlerts(r.summary); })
+      .catch(() => {});
     return () => { cancelled = true; };
   }, [tokens?.accessToken]);
 
@@ -54,6 +68,8 @@ export function DashboardPage() {
       {error && (
         <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">{error}</div>
       )}
+
+      <AlertsSummaryBar alerts={alerts} />
 
       <section className="grid gap-4 md:grid-cols-4">
         <KpiCard
@@ -171,5 +187,60 @@ function KpiCard({
       </p>
       <p className="mt-0.5 text-xs text-ink-muted">{sub}</p>
     </div>
+  );
+}
+
+/**
+ * 今日预警条：把散在各页的预警数聚成一眼可见的一条（提醒中心待办 + 房控四类）。
+ * 全为 0 时渲染一条安静的绿色状态；加载失败/未返回时整条不渲染（不挡仪表盘）。
+ * 数字点击即跳对应页面看明细——这里只做汇总，不重复各页口径。
+ */
+function AlertsSummaryBar({ alerts }: { alerts: DashboardAlertsSummary | null }) {
+  if (!alerts) return null;
+  const chips: Array<{ label: string; count: number; to: string; critical?: boolean }> = [
+    { label: '紧急待办', count: alerts.reminders.critical, to: '/reminders', critical: true },
+    // 普通待办 = 总待办 − 紧急，两枚 chip 相加即总数（不重复计数）
+    { label: '待办提醒', count: alerts.reminders.pending - alerts.reminders.critical, to: '/reminders' },
+    { label: '超卖加房', count: alerts.hotel.oversold, to: '/hotel-control', critical: true },
+    { label: '富余退房', count: alerts.hotel.surplusSoon, to: '/hotel-control' },
+    { label: '班次超员', count: alerts.hotel.overCapacitySchedules, to: '/hotel-control', critical: true },
+    { label: '拼房落单', count: alerts.hotel.sharedOddNear, to: '/hotel-control' },
+  ];
+  const active = chips.filter((c) => c.count > 0);
+  const hasCritical = active.some((c) => c.critical);
+  if (active.length === 0) {
+    return (
+      <section className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-sm text-emerald-700">
+        <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
+        今日预警：暂无 —— 待办与房控预警均已清零。
+        <Link to="/reminders" className="ml-auto text-xs text-emerald-700 underline underline-offset-2 hover:text-emerald-900">
+          去提醒中心生成今日提醒
+        </Link>
+      </section>
+    );
+  }
+  return (
+    <section
+      className={`flex flex-wrap items-center gap-2 rounded-lg border px-4 py-2.5 text-sm ${
+        hasCritical ? 'border-rose-200 bg-rose-50 text-rose-700' : 'border-amber-200 bg-amber-50 text-amber-800'
+      }`}
+    >
+      <span className="font-medium">今日预警</span>
+      {active.map((c) => (
+        <Link
+          key={c.label}
+          to={c.to}
+          className={`inline-flex items-center gap-1 rounded-full px-2.5 py-0.5 text-xs font-medium ring-1 transition hover:opacity-80 ${
+            c.critical
+              ? 'bg-rose-100 text-rose-700 ring-rose-300'
+              : 'bg-amber-100 text-amber-800 ring-amber-300'
+          }`}
+        >
+          {c.label}
+          <span className="font-semibold">{c.count}</span>
+        </Link>
+      ))}
+      <span className="ml-auto text-xs opacity-70">点击数字进对应页面处理</span>
+    </section>
   );
 }

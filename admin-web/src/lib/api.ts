@@ -2803,6 +2803,17 @@ export interface DashboardKpi {
   asOf: string;
 }
 
+/** 统一预警汇总（仪表盘「今日预警」条）：提醒中心待办数 + 房控四类预警数。*/
+export interface DashboardAlertsSummary {
+  reminders: { pending: number; critical: number };
+  hotel: {
+    oversold: number;
+    surplusSoon: number;
+    overCapacitySchedules: number;
+    sharedOddNear: number;
+  };
+}
+
 export interface DashboardWeeklyPoint { date: string; revenue: number; orders: number }
 export interface DashboardTopAgent {
   agentId: string;
@@ -4547,6 +4558,8 @@ export const api = {
   // Dashboard
   getDashboardKpi: (token: string) =>
     apiFetch<{ kpi: DashboardKpi }>('/dashboard/kpi', { token }),
+  getDashboardAlertsSummary: (token: string) =>
+    apiFetch<{ summary: DashboardAlertsSummary }>('/dashboard/alerts-summary', { token }),
   getDashboardWeekly: (token: string, days = 7) =>
     apiFetch<{ series: DashboardWeeklyPoint[] }>(`/dashboard/weekly?days=${days}`, { token }),
   getDashboardTopAgents: (token: string) =>

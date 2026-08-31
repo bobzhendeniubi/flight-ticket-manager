@@ -14,12 +14,15 @@ import {
   addMonthsUtc,
   buildOrderCandidates,
   buildHoldInstallmentCandidates,
+  buildReceiptVerifyCandidates,
   buildVisaCandidates,
+  buildVisaSubmissionCandidates,
   computeBalance,
   dateInTz,
   deriveDepartureDate,
   formatAmount,
   generateRuleReminders,
+  hasRoomAssignment,
   utcDateStr,
   type RuleOrder,
 } from './reminders.rules.js';
@@ -477,5 +480,161 @@ describe('generateRuleReminders 幂等', () => {
       const after = await generateRuleReminders(mock, 'user_sys', beijingEarlyMorning);
       expect(after).toMatchObject({ created: 0, skipped: 1 });
     });
+  });
+});
+
+// ── 规则 6：临近出发未出票 ───────────────────────────────────────────────────
+describe('TICKET_MISSING 出票提醒规则', () => {
+  const paxNoTicket = { id: 'p1', fullName: '张三', passportExpiry: null, eticketNumber: null };
+
+  it('出发 5 天内 + 有航段 + 乘客缺票号 → HIGH；2 天内升级 CRITICAL', () => {
+    const high = buildOrderCandidates(
+      fakeOrder({ items: [flightItem('2026-07-12T02:00:00Z')], passengers: [paxNoTicket] }),
+      TODAY,
+    ).filter((c) => c.rule === 'TICKET_MISSING');
+    expect(high).toHaveLength(1);
+    expect(high[0]).toMatchObject({
+      priority: ReminderPriority.HIGH,
+      ruleKey: 'TICKET:ord_1:2026-07-12',
+    });
+    expect(high[0].title).toContain('未出票');
+
+    const critical = buildOrderCandidates(
+      fakeOrder({ items: [flightItem('2026-07-10T02:00:00Z')], passengers: [paxNoTicket] }),
+      TODAY,
+    ).filter((c) => c.rule === 'TICKET_MISSING');
+    expect(critical[0]).toMatchObject({ priority: ReminderPriority.CRITICAL });
+  });
+
+  it('票号齐 / 出发超窗 / 纯酒店单（无航段）→ 不触发', () => {
+    const has = (order: RuleOrder) =>
+      buildOrderCandidates(order, TODAY).some((c) => c.rule === 'TICKET_MISSING');
+    expect(
+      has(fakeOrder({ items: [flightItem('2026-07-12T02:00:00Z')], passengers: [{ ...paxNoTicket, eticketNumber: '999-1234567890' }] })),
+    ).toBe(false);
+    expect(
+      has(fakeOrder({ items: [flightItem('2026-07-20T02:00:00Z')], passengers: [paxNoTicket] })),
+    ).toBe(false);
+    expect(
+      has(fakeOrder({ items: [hotelItem('2026-07-12')], passengers: [paxNoTicket] })),
+    ).toBe(false);
+  });
+
+  it('老口径没取 eticketNumber 字段（undefined）→ 不判该乘客（没查字段 ≠ 没出票）', () => {
+    const order = fakeOrder({
+      items: [flightItem('2026-07-12T02:00:00Z')],
+      passengers: [{ id: 'p1', fullName: '张三', passportExpiry: null }],
+    });
+    expect(buildOrderCandidates(order, TODAY).some((c) => c.rule === 'TICKET_MISSING')).toBe(false);
+  });
+});
+
+// ── 规则 8：临近入住未分房 ───────────────────────────────────────────────────
+describe('ROOM_UNASSIGNED 分房提醒规则', () => {
+  it('最早入住 3 天内 + 分房表空 → HIGH；1 天内升级 CRITICAL；ruleKey 按订单+首入住日', () => {
+    const high = buildOrderCandidates(
+      fakeOrder({ items: [hotelItem('2026-07-12')], roomAssignment: null }),
+      TODAY,
+    ).filter((c) => c.rule === 'ROOM_UNASSIGNED');
+    expect(high).toHaveLength(1);
+    expect(high[0]).toMatchObject({
+      priority: ReminderPriority.HIGH,
+      ruleKey: 'ROOMASSIGN:ord_1:2026-07-12',
+    });
+
+    const critical = buildOrderCandidates(
+      fakeOrder({ items: [hotelItem('2026-07-10')], roomAssignment: null }),
+      TODAY,
+    ).filter((c) => c.rule === 'ROOM_UNASSIGNED');
+    expect(critical[0]).toMatchObject({ priority: ReminderPriority.CRITICAL });
+  });
+
+  it('已分房 / 入住超窗 / 无酒店行 / 老口径没取字段 → 不触发', () => {
+    const fires = (order: RuleOrder) =>
+      buildOrderCandidates(order, TODAY).some((c) => c.rule === 'ROOM_UNASSIGNED');
+    expect(
+      fires(
+        fakeOrder({
+          items: [hotelItem('2026-07-12')],
+          roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] },
+        }),
+      ),
+    ).toBe(false);
+    expect(fires(fakeOrder({ items: [hotelItem('2026-07-20')], roomAssignment: null }))).toBe(false);
+    expect(fires(fakeOrder({ items: [flightItem('2026-07-12T02:00:00Z')], roomAssignment: null }))).toBe(false);
+    expect(fires(fakeOrder({ items: [hotelItem('2026-07-12')] }))).toBe(false);
+  });
+
+  it('hasRoomAssignment：空表 / 全空组视同未分房', () => {
+    expect(hasRoomAssignment(null)).toBe(false);
+    expect(hasRoomAssignment({ roomGroups: [] })).toBe(false);
+    expect(hasRoomAssignment({ roomGroups: [{ passengerIds: [] }] })).toBe(false);
+    expect(hasRoomAssignment({ roomGroups: [{ passengerIds: ['p1'] }] })).toBe(true);
+  });
+});
+
+// ── 规则 7：临近出发未送签 ───────────────────────────────────────────────────
+describe('VISA_NOT_SUBMITTED 送签提醒规则', () => {
+  const base = {
+    orderId: 'ord_1',
+    orderNumber: 'FTM2026070900001',
+    items: [flightItem('2026-07-14T02:00:00Z')], // 距 TODAY 5 天，7 天窗口内
+    pendingPassengerNames: ['张三', '李四'],
+  };
+
+  it('出发 7 天内有人未完成送签 → HIGH，点名乘客；3 天内升级 CRITICAL', () => {
+    const high = buildVisaSubmissionCandidates(base, TODAY);
+    expect(high).toHaveLength(1);
+    expect(high[0]).toMatchObject({
+      rule: 'VISA_NOT_SUBMITTED',
+      priority: ReminderPriority.HIGH,
+      ruleKey: 'VISASUBMIT:ord_1:2026-07-14',
+    });
+    expect(high[0].body).toContain('张三');
+
+    const critical = buildVisaSubmissionCandidates(
+      { ...base, items: [flightItem('2026-07-11T02:00:00Z')] },
+      TODAY,
+    );
+    expect(critical[0]).toMatchObject({ priority: ReminderPriority.CRITICAL });
+  });
+
+  it('全员已送签 / 出发超窗 / 已出发 → 不触发', () => {
+    expect(buildVisaSubmissionCandidates({ ...base, pendingPassengerNames: [] }, TODAY)).toEqual([]);
+    expect(
+      buildVisaSubmissionCandidates({ ...base, items: [flightItem('2026-07-20T02:00:00Z')] }, TODAY),
+    ).toEqual([]);
+    expect(
+      buildVisaSubmissionCandidates({ ...base, items: [flightItem('2026-07-01T02:00:00Z')] }, TODAY),
+    ).toEqual([]);
+  });
+});
+
+// ── 规则 9：到账核实队列积压 ─────────────────────────────────────────────────
+describe('RECEIPT_UNVERIFIED 到账核实提醒规则', () => {
+  const receipt = (createdAtISO: string) => ({
+    id: 'rcp_1',
+    receiptNo: 'RCP2026070700001',
+    amountCny: new Prisma.Decimal('8888.00'),
+    createdAt: new Date(createdAtISO),
+  });
+
+  it('挂满 2 天 → HIGH；满 7 天升级 CRITICAL；ruleKey 只含 receipt id（不按天重发）', () => {
+    // 北京 07-07 登记，TODAY 07-09 → 挂 2 天
+    const high = buildReceiptVerifyCandidates(receipt('2026-07-07T04:00:00Z'), TODAY);
+    expect(high).toHaveLength(1);
+    expect(high[0]).toMatchObject({
+      rule: 'RECEIPT_UNVERIFIED',
+      priority: ReminderPriority.HIGH,
+      ruleKey: 'CLAIMVERIFY:rcp_1',
+    });
+    expect(high[0].title).toContain('8888');
+
+    const critical = buildReceiptVerifyCandidates(receipt('2026-07-01T04:00:00Z'), TODAY);
+    expect(critical[0]).toMatchObject({ priority: ReminderPriority.CRITICAL });
+  });
+
+  it('挂账不足 2 天 → 不触发（给财务留正常处理时间）', () => {
+    expect(buildReceiptVerifyCandidates(receipt('2026-07-08T04:00:00Z'), TODAY)).toEqual([]);
   });
 });

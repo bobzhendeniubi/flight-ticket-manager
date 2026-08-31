@@ -2,6 +2,7 @@
  * 仪表盘路由 — 仅 ADMIN/STAFF
  *
  * GET /dashboard/kpi                    今日/本月 KPI + 变化率
+ * GET /dashboard/alerts-summary         统一预警汇总（提醒中心待办 + 房控预警计数）
  * GET /dashboard/weekly                 最近 7 天时间序列
  * GET /dashboard/top-agents             本月 Top 5 代理
  * GET /dashboard/pending-aging          待支付订单账龄分桶（含无支付时限单数）
@@ -37,6 +38,11 @@ export const dashboardRoutes: FastifyPluginAsync = async (app) => {
 
   app.get('/kpi', pre, async () => {
     return { kpi: await service.getKpi() };
+  });
+
+  // 统一预警入口：提醒中心待办数 + 房控四类预警数（超卖加房/富余退房/班次超员/拼房落单）。
+  app.get('/alerts-summary', pre, async () => {
+    return { summary: await service.getAlertsSummary() };
   });
 
   app.get('/weekly', pre, async (req) => {

@@ -30,9 +30,12 @@ import {
   FulfillmentType,
   OrderStatus,
   Prisma,
+  ReceiptSource,
+  ReceiptStatus,
   ReminderPriority,
   HoldOrderStatus,
   HoldInstallmentStatus,
+  VisaSubmissionStatus,
   type PrismaClient,
 } from '@prisma/client';
 import { businessDateISO } from '../../lib/business-time.js';
@@ -68,6 +71,20 @@ const BALANCE_DUE_WINDOW_DAYS = 14;
 const BALANCE_CRITICAL_DAYS = 3;
 const DEPARTURE_SOON_WINDOW_DAYS = 3;
 const PASSPORT_MIN_VALID_MONTHS = 6;
+// 规则 6 出票提醒：出发 5 天内还有乘客缺票号就催（≤2 天升级 CRITICAL）——
+// 防「单子标了已出票、票号却没回填/根本没出」的假票号缺口。
+const TICKET_MISSING_WINDOW_DAYS = 5;
+const TICKET_CRITICAL_DAYS = 2;
+// 规则 7 送签提醒：出发 7 天内还有非自备签乘客未完成送签就催（≤3 天升级 CRITICAL）——
+// 签证缺件规则只管「缺材料」，这条管「材料齐了没人送」。
+const VISA_SUBMIT_WINDOW_DAYS = 7;
+const VISA_SUBMIT_CRITICAL_DAYS = 3;
+// 规则 8 分房提醒：入住 3 天内订单还没进分房表就提醒房控（≤1 天升级 CRITICAL）。
+const ROOM_UNASSIGNED_WINDOW_DAYS = 3;
+const ROOM_UNASSIGNED_CRITICAL_DAYS = 1;
+// 规则 9 到账核实积压：OPS_CLAIM 手工登记的到账挂 ≥2 天未经财务核实就催（≥7 天升级 CRITICAL）。
+const RECEIPT_VERIFY_AGE_DAYS = 2;
+const RECEIPT_VERIFY_CRITICAL_AGE_DAYS = 7;
 
 // ── 日期纯函数（可单测）────────────────────────────────────────────────────
 /**
@@ -164,7 +181,16 @@ export function deriveDepartureDate(items: DepartureSourceItem[]): string | null
 }
 
 // ── 候选构建（纯函数，可单测）───────────────────────────────────────────────
-export type RuleName = 'BALANCE_DUE' | 'DEPARTURE_SOON' | 'PASSPORT_EXPIRY' | 'VISA_MISSING' | 'HOLD_INSTALLMENT_DUE';
+export type RuleName =
+  | 'BALANCE_DUE'
+  | 'DEPARTURE_SOON'
+  | 'PASSPORT_EXPIRY'
+  | 'VISA_MISSING'
+  | 'HOLD_INSTALLMENT_DUE'
+  | 'TICKET_MISSING'
+  | 'VISA_NOT_SUBMITTED'
+  | 'ROOM_UNASSIGNED'
+  | 'RECEIPT_UNVERIFIED';
 
 export interface ReminderCandidate {
   rule: RuleName;
@@ -186,8 +212,30 @@ export interface RuleOrder {
   paidAmount: Prisma.Decimal;
   prepaymentOffset: Prisma.Decimal;
   adjustmentCny: number;
+  /** 分房表 JSON（{ roomGroups: [...] }）；可选 = 老调用方不传时规则 8 不触发。*/
+  roomAssignment?: unknown;
   items: DepartureSourceItem[];
-  passengers: { id: string; fullName: string; passportExpiry: Date | null }[];
+  passengers: {
+    id: string;
+    fullName: string;
+    passportExpiry: Date | null;
+    /** 票号；可选 = 老调用方不传时规则 6 不判该乘客（undefined ≠ 缺票号）。*/
+    eticketNumber?: string | null;
+  }[];
+}
+
+/**
+ * 分房表是否已有实际分房（任一房组里有人）。空 roomGroups / 全空组视同未分房——
+ * 保存过一张空表不该让「未分房」提醒哑掉。
+ */
+export function hasRoomAssignment(roomAssignment: unknown): boolean {
+  if (!roomAssignment || typeof roomAssignment !== 'object') return false;
+  const groups = (roomAssignment as { roomGroups?: unknown }).roomGroups;
+  if (!Array.isArray(groups)) return false;
+  return groups.some((g) => {
+    const ids = (g as { passengerIds?: unknown }).passengerIds;
+    return Array.isArray(ids) && ids.length > 0;
+  });
 }
 
 export interface RuleVisaTask {
@@ -282,6 +330,59 @@ export function buildOrderCandidates(order: RuleOrder, today: string): ReminderC
     }
   }
 
+  // 6) 出票提醒：有机票航段、出发 5 天内（含今天）、仍有乘客缺票号。
+  //    eticketNumber === undefined 表示调用方没取这个字段（老口径）→ 不判该乘客，
+  //    避免「没查字段」被当成「没出票」误报；null / 空串才是真缺票号。
+  if (
+    DEPARTURE_SOON_STATUSES.includes(order.status) &&
+    days >= 0 &&
+    days <= TICKET_MISSING_WINDOW_DAYS &&
+    order.items.some((item) => item.flightSchedule)
+  ) {
+    const missing = order.passengers.filter(
+      (p) => p.eticketNumber !== undefined && (p.eticketNumber ?? '').trim() === '',
+    );
+    if (missing.length > 0) {
+      out.push({
+        rule: 'TICKET_MISSING',
+        ruleKey: `TICKET:${order.id}:${departure}`,
+        orderId: order.id,
+        title: `【临近出发未出票】${order.orderNumber} ${missing.length}人缺票号`,
+        body: `出发 ${departure}，尚未录入票号乘客：${missing.map((p) => p.fullName).join('，')}。请票务确认出票并回填票号。`,
+        priority: days <= TICKET_CRITICAL_DAYS ? ReminderPriority.CRITICAL : ReminderPriority.HIGH,
+        dueAt: today,
+      });
+    }
+  }
+
+  // 8) 分房提醒：有酒店入住、最早入住日 3 天内（含今天）、分房表还没分人。
+  //    roomAssignment === undefined 表示调用方没取这个字段（老口径）→ 不判，同规则 6 哲学。
+  if (order.roomAssignment !== undefined && DEPARTURE_SOON_STATUSES.includes(order.status)) {
+    const checkIns = order.items
+      .filter((item): item is DepartureSourceItem & { hotelCheckIn: Date } =>
+        Boolean(item.hotelCheckIn),
+      )
+      .map((item) => item.hotelCheckIn.getTime());
+    if (checkIns.length > 0 && !hasRoomAssignment(order.roomAssignment)) {
+      const firstCheckIn = utcDateStr(new Date(Math.min(...checkIns)));
+      const daysToCheckIn = diffDays(today, firstCheckIn);
+      if (daysToCheckIn >= 0 && daysToCheckIn <= ROOM_UNASSIGNED_WINDOW_DAYS) {
+        out.push({
+          rule: 'ROOM_UNASSIGNED',
+          ruleKey: `ROOMASSIGN:${order.id}:${firstCheckIn}`,
+          orderId: order.id,
+          title: `【临近入住未分房】${order.orderNumber} ${firstCheckIn}入住`,
+          body: `最早入住 ${firstCheckIn}，该单还没进分房表。请房控完成分房（随机档单需先落位到具体酒店）。`,
+          priority:
+            daysToCheckIn <= ROOM_UNASSIGNED_CRITICAL_DAYS
+              ? ReminderPriority.CRITICAL
+              : ReminderPriority.HIGH,
+          dueAt: today,
+        });
+      }
+    }
+  }
+
   return out;
 }
 
@@ -300,6 +401,79 @@ export function buildVisaCandidates(task: RuleVisaTask, today: string): Reminder
       title: `【签证缺件】${task.orderNumber} 缺护照照片${count}人`,
       body: `缺护照照片乘客：${task.missingPassengerNames.join('，')}。请尽快收齐并上传。`,
       priority: ReminderPriority.HIGH,
+      dueAt: today,
+    },
+  ];
+}
+
+/** 规则 7 的输入：有在办签证任务的订单 + 尚未完成送签（CONFIRMED 之外）的非自备签乘客名单。*/
+export interface RuleVisaSubmissionOrder {
+  orderId: string;
+  orderNumber: string;
+  items: DepartureSourceItem[];
+  /** visaExempt=false 且 visaSubmissionStatus ≠ CONFIRMED 的乘客姓名（库内过滤）。*/
+  pendingPassengerNames: string[];
+}
+
+/**
+ * 规则 7：临近出发签证未送签完成。签证缺件（规则 4）只管「缺材料」，这条管
+ * 「材料齐了没人送」——出发 7 天内还有非自备签乘客送签进度不到「已送签」（CONFIRMED）就催。
+ */
+export function buildVisaSubmissionCandidates(
+  order: RuleVisaSubmissionOrder,
+  today: string,
+): ReminderCandidate[] {
+  const departure = deriveDepartureDate(order.items);
+  if (!departure) return [];
+  const days = diffDays(today, departure);
+  if (days < 0 || days > VISA_SUBMIT_WINDOW_DAYS) return [];
+  const count = order.pendingPassengerNames.length;
+  if (count === 0) return [];
+  return [
+    {
+      rule: 'VISA_NOT_SUBMITTED',
+      ruleKey: `VISASUBMIT:${order.orderId}:${departure}`,
+      orderId: order.orderId,
+      title: `【临近出发未送签】${order.orderNumber} ${count}人未完成送签`,
+      body: `出发 ${departure}，未完成送签乘客：${order.pendingPassengerNames.join('，')}（自备签乘客已排除）。请签证岗尽快送签或更新送签进度。`,
+      priority:
+        days <= VISA_SUBMIT_CRITICAL_DAYS ? ReminderPriority.CRITICAL : ReminderPriority.HIGH,
+      dueAt: today,
+    },
+  ];
+}
+
+/** 规则 9 的输入：OPS_CLAIM 手工登记、财务尚未核实的到账。*/
+export interface RuleUnverifiedReceipt {
+  id: string;
+  receiptNo: string;
+  amountCny: Prisma.Decimal;
+  createdAt: Date;
+}
+
+/**
+ * 规则 9：到账核实队列积压。运营凭客户水单手工登记的到账（source=OPS_CLAIM）
+ * 挂 ≥2 天还没经财务对流水核实（verifiedAt 空）就催——钱到没到账不能一直悬着。
+ * ruleKey 只含 receipt id：同一笔只提醒一次，财务处理完 resolve 即消；不按天重发刷屏。
+ */
+export function buildReceiptVerifyCandidates(
+  receipt: RuleUnverifiedReceipt,
+  today: string,
+): ReminderCandidate[] {
+  const claimedOn = businessDateISO(receipt.createdAt);
+  const ageDays = diffDays(claimedOn, today);
+  if (ageDays < RECEIPT_VERIFY_AGE_DAYS) return [];
+  return [
+    {
+      rule: 'RECEIPT_UNVERIFIED',
+      ruleKey: `CLAIMVERIFY:${receipt.id}`,
+      orderId: null,
+      title: `【到账待核实】${receipt.receiptNo} ¥${formatAmount(receipt.amountCny)} 已挂${ageDays}天`,
+      body: `运营手工登记的到账（${claimedOn}）尚未经财务核实，请对照收款平台流水确认后在收款台核实。`,
+      priority:
+        ageDays >= RECEIPT_VERIFY_CRITICAL_AGE_DAYS
+          ? ReminderPriority.CRITICAL
+          : ReminderPriority.HIGH,
       dueAt: today,
     },
   ];
@@ -364,6 +538,8 @@ export async function generateRuleReminders(
         paidAmount: true,
         prepaymentOffset: true,
         adjustmentCny: true,
+        // 分房表 JSON（规则 8 判是否已分房；只有 roomGroups/passengerIds，无大字段）
+        roomAssignment: true,
         // 只取推导出发时间需要的行（有机票班次或酒店入住日的）
         items: {
           where: { OR: [{ flightScheduleId: { not: null } }, { hotelCheckIn: { not: null } }] },
@@ -372,7 +548,9 @@ export async function generateRuleReminders(
             flightSchedule: { select: { departureTime: true, departureTz: true } },
           },
         },
-        passengers: { select: { id: true, fullName: true, passportExpiry: true } },
+        passengers: {
+          select: { id: true, fullName: true, passportExpiry: true, eticketNumber: true },
+        },
       },
     }),
     prisma.fulfillmentTask.findMany({
@@ -453,6 +631,70 @@ export async function generateRuleReminders(
   for (const hold of holdOrders) {
     const holdToday = dateInTz(now, hold.flightSchedule?.departureTz);
     candidates.push(...buildHoldInstallmentCandidates(hold, holdToday));
+  }
+
+  // ── 规则 7：临近出发未送签（订单级；范围 = 有在办签证任务的订单）─────────────
+  // 一条按 orderId in 的轻量查询取「非自备签且送签进度 ≠ 已送签」的乘客名单——
+  // 不能塞进上面的 visaTasks select：那里的 passengers 已按「缺照片」过滤，同一关系
+  // 一个 select 里不能带两套 where。防御式取 delegate 与 holdOrder 同哲学（旧测试 mock 没有它）。
+  const visaOrderById = new Map<string, { orderNumber: string; items: DepartureSourceItem[] }>();
+  for (const task of visaTasks) {
+    const order = task.orderItem.order;
+    if (order.deletedAt) continue;
+    visaOrderById.set(order.id, { orderNumber: order.orderNumber, items: order.items });
+  }
+  const passengerDelegate = (
+    prisma as unknown as {
+      passenger?: {
+        findMany: (args: unknown) => Promise<Array<{ orderId: string; fullName: string }>>;
+      };
+    }
+  ).passenger;
+  if (passengerDelegate && visaOrderById.size > 0) {
+    const pendingPax = await passengerDelegate.findMany({
+      where: {
+        orderId: { in: [...visaOrderById.keys()] },
+        visaExempt: false,
+        visaSubmissionStatus: { not: VisaSubmissionStatus.CONFIRMED },
+      },
+      select: { orderId: true, fullName: true },
+    });
+    const namesByOrder = new Map<string, string[]>();
+    for (const pax of pendingPax) {
+      const list = namesByOrder.get(pax.orderId) ?? [];
+      list.push(pax.fullName);
+      namesByOrder.set(pax.orderId, list);
+    }
+    for (const [orderId, names] of namesByOrder) {
+      const order = visaOrderById.get(orderId)!;
+      candidates.push(
+        ...buildVisaSubmissionCandidates(
+          {
+            orderId,
+            orderNumber: order.orderNumber,
+            items: order.items,
+            pendingPassengerNames: names,
+          },
+          today,
+        ),
+      );
+    }
+  }
+
+  // ── 规则 9：到账核实队列积压（OPS_CLAIM 未核实；量级小，全取后在内存按挂账天数过滤）──
+  const receiptDelegate = (
+    prisma as unknown as {
+      receipt?: { findMany: (args: unknown) => Promise<RuleUnverifiedReceipt[]> };
+    }
+  ).receipt;
+  if (receiptDelegate) {
+    const unverified = await receiptDelegate.findMany({
+      where: { source: ReceiptSource.OPS_CLAIM, verifiedAt: null, status: { not: ReceiptStatus.REFUNDED } },
+      select: { id: true, receiptNo: true, amountCny: true, createdAt: true },
+    });
+    for (const receipt of unverified) {
+      candidates.push(...buildReceiptVerifyCandidates(receipt, today));
+    }
   }
 
   // 批内去重（同一 ruleKey 只留第一条）

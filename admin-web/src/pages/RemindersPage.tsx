@@ -53,6 +53,11 @@ const RULE_LABEL: Record<string, string> = {
   DEPARTURE_SOON: '出行提醒',
   PASSPORT_EXPIRY: '护照有效期',
   VISA_MISSING: '签证缺件',
+  HOLD_INSTALLMENT_DUE: '占位单催款',
+  TICKET_MISSING: '临近出发未出票',
+  VISA_NOT_SUBMITTED: '临近出发未送签',
+  ROOM_UNASSIGNED: '临近入住未分房',
+  RECEIPT_UNVERIFIED: '到账待核实',
 };
 
 function ruleLabel(key: string): string {

@@ -6,15 +6,44 @@
  * - 变化率：本期 vs 上期（昨天 / 上月）
  * - 活跃代理：最近 30 天有订单的代理数
  */
-import { OrderStatus, Prisma } from '@prisma/client';
+import { OrderStatus, Prisma, ReminderStatus, ReminderPriority } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { businessDateISO, startOfBusinessDayUtc } from '../../lib/business-time.js';
+import { getAlerts } from '../hotel-control/hotel-control.service.js';
 
 const PAID_LIKE_STATUSES: OrderStatus[] = [
   'PAID', 'PROCESSING', 'TICKETED', 'COMPLETED', 'CHANGE_REQUESTED', 'CHANGED',
 ];
 
 export class DashboardService {
+  /**
+   * 统一预警入口（仪表盘「今日预警」条）：把散在各页的预警数聚成一眼可见的汇总。
+   * 只做计数不重复口径——提醒数直接数 OperationalReminder（PENDING），房控四类
+   * 复用 getAlerts（14 天窗，与房控页横幅同参数），点进各页看明细。
+   * 注意：提醒是「生成今日提醒」按钮/规则扫描落库后的数字，没人生成时不为负也不报假 0 ——
+   * pendingReminders=0 且当天没跑过生成 ≠ 没有风险，前端在条上带「生成」入口。
+   */
+  async getAlertsSummary() {
+    // 「待办」= 未完成（新建待处理 + 已认领处理中）；DONE/SKIPPED 不算。
+    const openStatuses = [ReminderStatus.OPEN, ReminderStatus.IN_PROGRESS];
+    const [pending, critical, hotelAlerts] = await Promise.all([
+      prisma.operationalReminder.count({ where: { status: { in: openStatuses } } }),
+      prisma.operationalReminder.count({
+        where: { status: { in: openStatuses }, priority: ReminderPriority.CRITICAL },
+      }),
+      getAlerts(14),
+    ]);
+    return {
+      reminders: { pending, critical },
+      hotel: {
+        oversold: hotelAlerts.oversold.length,
+        surplusSoon: hotelAlerts.surplusSoon.length,
+        overCapacitySchedules: hotelAlerts.overCapacitySchedules.length,
+        sharedOddNear: hotelAlerts.sharedOddNear.length,
+      },
+    };
+  }
+
   async getKpi() {
     const now = new Date();
     const todayStart = startOfBusinessDayUtc(now);
