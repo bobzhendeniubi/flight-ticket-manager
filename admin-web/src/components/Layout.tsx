@@ -1,4 +1,4 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import { Link, Navigate, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../stores/auth';
 import { api, ApiError, AUTH_REFRESH_UNAVAILABLE_CODE } from '../lib/api';
@@ -65,6 +65,37 @@ export function Layout() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const closeDrawer = () => setDrawerOpen(false);
   const drawerDialogRef = useDialogA11y(closeDrawer, drawerOpen);
+
+  // 桌面端（≥1024px）侧栏收起：查数据时把侧栏收成细条，给表格腾宽度。
+  // 状态记在 localStorage，刷新/明天再开还保持；隐私模式下存取会抛错，降级为不记忆。
+  const [collapsed, setCollapsed] = useState(() => {
+    try {
+      return localStorage.getItem('ftm.sidebarCollapsed') === '1';
+    } catch {
+      return false;
+    }
+  });
+  // 收起/展开按钮互为替身（切换时旧按钮会卸载）：切换后把焦点交给对面那颗，
+  // 否则焦点掉回 body，键盘用户丢失位置。
+  const collapseBtnRef = useRef<HTMLButtonElement | null>(null);
+  const expandBtnRef = useRef<HTMLButtonElement | null>(null);
+  const shouldRefocusToggle = useRef(false);
+  const toggleCollapsed = () => {
+    shouldRefocusToggle.current = true;
+    setCollapsed((prev) => !prev);
+  };
+  useEffect(() => {
+    try {
+      localStorage.setItem('ftm.sidebarCollapsed', collapsed ? '1' : '0');
+    } catch {
+      // 存不进去就只影响记忆，不影响本次收起
+    }
+  }, [collapsed]);
+  useEffect(() => {
+    if (!shouldRefocusToggle.current) return;
+    shouldRefocusToggle.current = false;
+    (collapsed ? expandBtnRef : collapseBtnRef).current?.focus();
+  }, [collapsed]);
 
   // 点击"当前所在页"的菜单项时 react-router 不会触发导航（路径未变），
   // 页面组件也就不会重挂、不会重新拉数。这里用一个自增 tick 强制 Outlet
@@ -201,13 +232,60 @@ export function Layout() {
 
   return (
     <div className="min-h-screen bg-canvas text-ink">
-      {/* ── 桌面端：固定左侧栏（≥1024px） ─────────────────────── */}
-      <aside className="fixed inset-y-0 left-0 z-30 hidden w-[232px] flex-col border-r border-slate-200 bg-surface lg:flex">
-        <div className="flex h-14 items-center border-b border-slate-200 px-4">
-          {brandLockup}
-        </div>
-        {sidebarNav}
-        {user ? (
+      {/* ── 桌面端：固定左侧栏（≥1024px），可收成细条腾出屏宽 ── */}
+      <aside
+        id="app-sidebar"
+        className={`fixed inset-y-0 left-0 z-30 hidden flex-col border-r border-slate-200 bg-surface transition-[width] duration-200 lg:flex ${
+          collapsed ? 'w-[52px]' : 'w-[232px]'
+        }`}
+      >
+        {collapsed ? (
+          <>
+            <div className="flex h-14 items-center justify-center border-b border-slate-200">
+              <Link
+                to={homeTo}
+                aria-label="世途旅行 · 回首页"
+                title="世途旅行"
+                className="flex h-8 w-8 items-center justify-center rounded-lg bg-brand text-sm font-bold text-white"
+              >
+                世
+              </Link>
+            </div>
+            {/* 细条整条都是展开热区，不用瞄准小箭头 */}
+            <button
+              ref={expandBtnRef}
+              type="button"
+              onClick={toggleCollapsed}
+              className="group flex flex-1 flex-col items-center pt-3 text-ink-muted transition hover:bg-slate-50 hover:text-ink"
+              aria-label="展开侧栏"
+              aria-expanded={false}
+              aria-controls="app-sidebar"
+              title="展开侧栏"
+            >
+              <span className="flex h-8 w-8 items-center justify-center rounded-lg transition group-hover:bg-slate-100">
+                <Icon name="chevronRight" />
+              </span>
+            </button>
+          </>
+        ) : (
+          <div className="flex h-14 items-center justify-between border-b border-slate-200 pl-4 pr-2">
+            {brandLockup}
+            <button
+              ref={collapseBtnRef}
+              type="button"
+              onClick={toggleCollapsed}
+              className="flex h-8 w-8 shrink-0 items-center justify-center rounded-lg text-ink-muted transition hover:bg-slate-100 hover:text-ink"
+              aria-label="收起侧栏"
+              aria-expanded
+              aria-controls="app-sidebar"
+              title="收起侧栏"
+            >
+              <Icon name="chevronLeft" />
+            </button>
+          </div>
+        )}
+        {!collapsed && sidebarNav}
+        {!collapsed && user ? (
           <div className="border-t border-slate-200 p-3">
             <div className="flex items-center gap-2 rounded-lg px-2 py-1.5">
               <span className="flex h-8 w-8 shrink-0 items-center justify-center rounded-full bg-brand-50 text-xs font-semibold text-brand-700">
@@ -246,8 +324,12 @@ export function Layout() {
         </div>
       )}
 
-      {/* ── 内容区（桌面端给侧栏让出 232px） ──────────────────── */}
-      <div className="flex min-h-screen flex-col lg:pl-[232px]">
+      {/* ── 内容区（桌面端给侧栏让出宽度，随收起状态联动） ──── */}
+      <div
+        className={`flex min-h-screen flex-col transition-[padding] duration-200 ${
+          collapsed ? 'lg:pl-[52px]' : 'lg:pl-[232px]'
+        }`}
+      >
         {/* 内容区顶栏：左侧汉堡 + 页面上下文，右侧用户菜单 / 退出 */}
         <header className="sticky top-0 z-20 flex h-14 items-center gap-3 border-b border-slate-200 bg-surface/90 px-4 backdrop-blur md:px-6">
           <button
