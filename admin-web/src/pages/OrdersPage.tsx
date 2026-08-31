@@ -11576,6 +11576,21 @@ function ConfirmPaymentSection({
       setErr('金额需为正数');
       return;
     }
+    // 金额留空 = 后端默认按尾款全额入账、可能直接结清（口径见 payments.service confirmManualPayment）。
+    // 财务逐单收齐靠这个默认省事，但对误触是零门槛，先弹一道人为确认。
+    // 已结清后再留空提交没有可默认的尾款，就地拦下，别让后端报「金额必须大于 0」绕一圈。
+    if (amt === undefined && !confirmDuplicate) {
+      if (balance <= 0) {
+        setErr('本单已无尾款，追加收款请填写实际到账金额');
+        return;
+      }
+      const okToSettle = await askConfirm({
+        title: '按尾款全额入账',
+        body: `未填收款金额，将默认按尾款 ¥${balance.toLocaleString()} 入账并结清本单。确认已实际收到这笔钱？`,
+        tone: 'danger',
+      });
+      if (!okToSettle) return;
+    }
     setSubmitting(true);
     try {
       const res = await api.confirmPayment(token, {
