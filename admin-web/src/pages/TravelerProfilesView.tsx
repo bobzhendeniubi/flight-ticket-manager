@@ -217,7 +217,7 @@ export function TravelerProfilesView() {
 
       <section className="grid gap-3 md:grid-cols-3">
         <Kpi label="旅客总数" value={kpi.totalProfiles.toLocaleString()} sub="全量订单去重（含游客单）" />
-        <Kpi label="累计飞行人次" value={kpi.totalTrips.toLocaleString()} sub="已起飞行程 × 人" />
+        <Kpi label="累计飞行人次" value={kpi.totalTrips.toLocaleString()} sub="新系统已飞 + 老系统历史飞行" />
         <Kpi
           label="当前筛选"
           value={total.toLocaleString()}
@@ -307,6 +307,9 @@ export function TravelerProfilesView() {
                     </td>
                     <td className="text-center">
                       <span className="font-semibold text-ink nums">{p.tripCount}</span>
+                      {p.legacyTripCount > 0 && (
+                        <div className="text-[10px] text-ink-muted">含老系统 {p.legacyTripCount} 次</div>
+                      )}
                       {p.tripCount >= 2 && (
                         <div className="text-[10px] text-emerald-600 font-medium">回头客</div>
                       )}
@@ -563,6 +566,9 @@ function ProfileDrawer({
             {profile && profile.tripCount >= 2 && (
               <span className="text-xs font-medium text-emerald-600">回头客 · 飞过 {profile.tripCount} 次</span>
             )}
+            {profile && profile.legacyTripCount > 0 && (
+              <div className="text-xs text-slate-500">含老系统 {profile.legacyTripCount} 次</div>
+            )}
           </div>
           <button className="btn-ghost px-2 py-1 text-xl" onClick={onClose} aria-label="关闭旅客详情"><Icon name="close" /></button>
         </div>
@@ -575,7 +581,11 @@ function ProfileDrawer({
             <>
               {/* 出行统计 */}
               <section className="grid grid-cols-3 gap-2">
-                <MiniStat label="已飞行程" value={String(profile.tripCount)} />
+                <MiniStat
+                  label="已飞行程"
+                  value={String(profile.tripCount)}
+                  title={profile.legacyTripCount > 0 ? `含老系统 ${profile.legacyTripCount} 次` : undefined}
+                />
                 <MiniStat label="在订未飞" value={String(profile.pendingTripCount)} />
                 <MiniStat label="有效订单" value={String(profile.orderCount)} />
                 <MiniStat label="已核销" value={String(profile.redeemedTrips)} />

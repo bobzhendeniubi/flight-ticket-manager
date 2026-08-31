@@ -12,15 +12,16 @@
  * 导出的工具函数，反向 import 会形成模块环。
  *
  * 诚实口径：
- *   - 飞行次数 = 该乘客的常旅客历史飞行次数（按证件号归拢，只计去程已起飞的行程），
- *     取自 TravelerProfile.tripCount —— 是「这个人跟我们飞过几次」，与本单航段数无关，
+ *   - 飞行次数 = 该乘客的常旅客合计飞行次数（新系统已飞 + 老系统历史飞行（已去重、退票不计）），
+ *     按档案全部证件号归拢，只计去程已起飞的行程；取自 TravelerProfile.tripCount ——
+ *     是「这个人跟我们飞过几次」，与本单航段数无关，
  *     故同一订单不同乘客的飞行次数互不相同。匹配不到档案（新客/证件号对不上）→ 留空。
  *     该列读自档案快照表（值是上次重建时的，见 TravelerProfile.refreshedAt）；快照表一条
  *     都没有时（新环境 / 从没人开过档案页）会导致整列全部留空，导出会先同步做一次全量首建
  *     兜底。非空但过期的快照不归导出管——那由档案页自身访问时的后台重建负责刷新，导出不为
  *     此额外重建（全量重建太慢，不能挂在每次导出请求上）。
- *   - 在订未飞 = TravelerProfile.pendingTripCount（同一条快照重算链路回写，快照口径同飞行次数）。
- *   - 可用次数 = 飞行次数（已飞）− 已核销权益次数（TravelerBenefitRedemption 流水 sum，
+ *   - 在订未飞 = TravelerProfile.pendingTripCount（不含老系统未来日期未重录单；同一条快照重算链路回写）。
+ *   - 可用次数 = 飞行次数（含老系统历史飞行（已去重、退票不计））− 已核销权益次数（TravelerBenefitRedemption 流水 sum，
  *     核销/冲正同一档案），可为负——核销后订单又被退改导致已飞回落时如实透出，不截断也不臆造。
  *     核销流水挂在合并链的主档案上，取值前已沿 mergedIntoId 解析到主档案。
  */
@@ -30,7 +31,7 @@ import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 import { TravelerProfilesService } from '../travelers/traveler-profiles.service.js';
 
-/** 一位旅客的三项快照口径数字：飞行次数（已飞）/ 在订未飞 / 可用次数（已飞−已核销，可为负）。*/
+/** 一位旅客的三项快照口径数字：合计飞行次数（含老系统）/ 在订未飞 / 可用次数（合计飞行−已核销，可为负）。*/
 export interface TripStats {
   tripCount: number;
   pendingTripCount: number;

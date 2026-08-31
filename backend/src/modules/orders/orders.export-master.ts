@@ -13,7 +13,7 @@
  * 无论 role 如何，都是同一份数据、同一个端点 —— role 仅做列可见性裁剪。
  *
  * 诚实口径：
- *   - 飞行次数 / 在订未飞 / 可用次数：口径与取数见 orders.export-trip-stats.ts（分房表、
+ *   - 飞行次数 / 在订未飞 / 可用次数：飞行次数含老系统历史飞行（已去重、退票不计），口径与取数见 orders.export-trip-stats.ts（分房表、
  *     《全岗可用》模板共用同一份，同一位乘客在三张表里的数字必然相同）。
  *   - 金额列（结算价/到账/尾款/单房差/签证/退款/订单成本）均为「每位出行人」均摊，
  *     与《全岗可用》模板同口径，避免按订单总额被误读为每人都付了全款。
@@ -149,11 +149,12 @@ export interface MasterRow {
   chineseName: string;
   passengerName: string; // 拼音/PNR：LAST/FIRST + 称谓（航司口径）
   cleanName: string; // 纯拼音名 LAST/FIRST（无 MR/MS 称谓）— 财务对数/名单匹配用
-  // 常旅客历史飞行次数（TravelerProfile.tripCount 快照）：按证件号归拢、只计去程已起飞的行程。
+  // 常旅客合计飞行次数（TravelerProfile.tripCount 快照）：含老系统历史飞行（已去重、退票不计），
+  // 按档案全部证件号归拢，只计去程已起飞的行程。
   // 每位乘客各不相同；匹配不到档案 → 留空。与本单航段数无关。
   flightCount: string;
   // 在订未飞（TravelerProfile.pendingTripCount 快照，同一条重算链路回写）：有去程航班且
-  // 尚未起飞的有效订单数。匹配不到档案 → 留空，口径同飞行次数。
+  // 尚未起飞的有效订单数，不含老系统未来日期未重录单。匹配不到档案 → 留空。
   pendingTripCount: string;
   // 可用次数 = 飞行次数（已飞）− 已核销权益次数（TravelerBenefitRedemption 流水 sum）。
   // 可为负——核销后订单又被退改导致已飞回落时如实透出。匹配不到档案 → 留空。
@@ -218,7 +219,8 @@ const MASTER_COLUMNS: MasterColumn[] = [
     key: 'flightCount',
     width: 8,
     note:
-      '常旅客历史飞行次数：按证件号归拢，只计去程已起飞的行程（不是本单航段数）。\n' +
+      '常旅客合计飞行次数：新系统已飞 + 老系统历史飞行（已去重、退票不计），按档案全部证件号归拢，\n' +
+      '只计去程已起飞的行程（不是本单航段数）。\n' +
       '匹配不到旅客档案（新客/证件号对不上）留空。\n' +
       '数据为旅客档案快照，非导出时实时重算。',
     roles: ['all', 'ticketing'],
@@ -228,7 +230,7 @@ const MASTER_COLUMNS: MasterColumn[] = [
     key: 'pendingTripCount',
     width: 10,
     note:
-      '已下单但去程尚未起飞的有效订单数（快照口径同飞行次数）。\n' +
+      '已下单但去程尚未起飞的有效订单数（不含老系统未来日期未重录单）。\n' +
       '匹配不到旅客档案（新客/证件号对不上）留空。\n' +
       '数据为旅客档案快照，非导出时实时重算。',
     roles: ['all', 'ticketing'],
@@ -238,7 +240,7 @@ const MASTER_COLUMNS: MasterColumn[] = [
     key: 'availableTrips',
     width: 10,
     note:
-      '= 已飞次数 − 已核销权益次数；负数=核销后订单退改导致已飞回落，请到旅客档案页核对。\n' +
+      '= 含老系统历史飞行（已去重、退票不计）的合计飞行次数 − 已核销权益次数；负数=核销后订单退改导致已飞回落，请到旅客档案页核对。\n' +
       '匹配不到旅客档案（新客/证件号对不上）留空。\n' +
       '数据为旅客档案快照，非导出时实时重算。',
     roles: ['all', 'ticketing'],

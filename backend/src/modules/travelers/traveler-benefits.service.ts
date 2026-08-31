@@ -2,12 +2,13 @@
  * 常旅客权益核销台账 —— append-only 流水，永不删改。
  *
  * 口径：
- *   可用次数 availableTrips = 已飞 tripCount − 本档案流水 sum(tripsUsed)
+ *   可用次数 availableTrips = 合计已飞 tripCount（含老系统历史飞行）− 本档案流水 sum(tripsUsed)
  *   核销 tripsUsed > 0（扣减可用次数）；录错走冲正（compensating entry）：
  *   插入一条 tripsUsed = −原值、reversalOfId 指向原条目的补偿流水，原条目原样留存。
  *   reversalOfId 唯一约束 ⇒ 一条核销最多冲正一次（并发下由数据库兜底）。
  *
- * tripCount 是「订单重算出来的快照」，退订/删单会让它掉下去 ⇒ availableTrips 可能为负。
+ * tripCount 是「新系统订单已飞 + 老系统历史飞行」的快照，退订/删单会让新系统部分掉下去
+ * ⇒ availableTrips 可能为负。
  * 这里不截断，如实返回负数（展示层自行提示），截断会掩盖账实不符。
  *
  * 这只是台账记录：不碰订单金额、不碰任何折扣字段、不进定价与结算路径。
@@ -82,7 +83,7 @@ export class TravelerBenefitsService {
   /**
    * 核销：扣减可用次数，写一条正数流水。
    *
-   * tripCount 以订单为真值 —— 先走详情实时重算（顺带把快照回写成最新值），
+   * tripCount 以订单与老系统历史次数为真值 —— 先走详情实时重算（顺带把快照回写成最新值），
    * 事务内再从 TravelerProfile 重读一次 tripCount 快照并复核「已核销合计」后插入。
    * Serializable 隔离的保护范围：并发双扣（两个事务读到同一个 sum 各插一条 ⇒ 后提交的
    * 序列化冲突回滚），以及事务内读到的 tripCount 快照与流水的一致性。它防不住的是

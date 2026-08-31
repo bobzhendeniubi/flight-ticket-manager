@@ -7,7 +7,8 @@
  *
  * 口径（proposal 拍板前的默认值，见 docs/常旅客计划-proposal.md 第七节）：
  *   - 行程（trip）按订单计：一张含机票的订单 = 1 次行程，取最早起飞的航段为「去程」；
- *     tripCount 只数去程已起飞的行程（「飞过多少次」）；
+ *     tripCount 只数新系统去程已起飞的行程（「飞过多少次」）；老系统历史次数由 service
+ *     层按档案全部证件号批量查好后加到快照，不在本纯函数内访问数据库；
  *     pendingTripCount 只数去程未起飞的行程（「在订未飞多少次」）。
  *   - 人均消费 = 订单实付 ÷ 乘机人数，平摊（含儿童/婴儿）。
  *   - 偏好取最近值（床型/餐食/单住）或众数（舱位）；轮椅任一次为真即真。
@@ -95,8 +96,9 @@ export interface TravelerAggregate {
   dateOfBirth: Date | null;
   nationality: string | null;
   passportExpiry: Date | null;
+  /** 纯聚合结果中的新系统已飞次数；service 写快照时再加 legacyTripCount。 */
   tripCount: number;
-  /** 在订未飞：有去程航班且去程尚未起飞的有效订单数（与 tripCount 互补；无航段单两边都不计） */
+  /** 在订未飞：有去程航班且去程尚未起飞的有效订单数（与新系统已飞互补；无航段单两边都不计） */
   pendingTripCount: number;
   orderCount: number;
   firstTripAt: Date | null;

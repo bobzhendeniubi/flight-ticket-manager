@@ -157,8 +157,11 @@ model TravelerProfile {
   dateOfBirth     DateTime?
   nationality     String?
   passportExpiry  DateTime?    @db.Date
+  /// 合计飞行次数 = 新系统去程已起飞行程数 + legacyTripCount。
   tripCount       Int          @default(0)
-  /// 在订未飞：有去程航班且尚未起飞的有效订单数（快照，与 tripCount 同一条重算链路回写）
+  /// 老系统历史飞行次数：按档案全部证件号归拢，已去重且退票不计。
+  legacyTripCount Int          @default(0)
+  /// 在订未飞：有去程航班且尚未起飞的有效订单数（不含老系统未来日期未重录单）。
   pendingTripCount Int         @default(0)
   orderCount      Int          @default(0)
   firstTripAt     DateTime?

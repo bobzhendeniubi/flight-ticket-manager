@@ -3,12 +3,13 @@
  *
  * 架构：订单是真值，快照表只是缓存。
  *   - 列表读快照（可排序/分页）；空表惰性 bootstrap，过期(>6h)后台自动重建。
- *   - 详情实时从订单重算（永远准确）并回写快照。
+ *   - 详情实时从订单重算（永远准确）并回写快照；快照写入同时并入老系统历史飞行次数。
  *   - 重建绝不覆盖 notes（运营手工输入）。
  * 不 hook 订单写路径 —— 纯读侧聚合，对钱路径零风险。
  */
-import { OrderStatus, Prisma, type DocumentType } from '@prisma/client';
+import { OrderStatus, Prisma, type DocumentType, type PrismaClient } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
+import { businessDateISO } from '../../lib/business-time.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import {
   buildTravelerAggregates,
@@ -66,6 +67,145 @@ export interface TravelerLookupResult {
   pendingTripCount: number;
   redeemedTrips: number;
   availableTrips: number;
+}
+
+export interface LegacyTripCountScope {
+  /** 结果 Map 的 key；重建时用主档案 id，详情时也用主档案 id。 */
+  key: string;
+  /** 主证件号 + 合并链上的全部旧证件号，按 norm 匹配且不区分证件类型。 */
+  documentNumbers: readonly string[];
+  /** 该档案新系统已飞行程的去程业务日（UTC+8）。 */
+  flownBusinessDates: readonly string[];
+}
+
+interface LegacyTripCountRow {
+  documentNumberNorm: string | null;
+  outboundDate: Date | null;
+}
+
+const BUSINESS_DAY_MS = 24 * 60 * 60 * 1000;
+
+function toUtcBusinessDay(isoDate: string): number | null {
+  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate);
+  if (!match) return null;
+  const year = Number(match[1]);
+  const month = Number(match[2]);
+  const day = Number(match[3]);
+  const timestamp = Date.UTC(year, month - 1, day);
+  const date = new Date(timestamp);
+  return date.getUTCFullYear() === year &&
+      date.getUTCMonth() === month - 1 &&
+      date.getUTCDate() === day
+    ? timestamp
+    : null;
+}
+
+/**
+ * 老系统票与新系统已飞行程的活体去重：去程业务日相差不超过 1 天即视为同一重录行程。
+ * LegacyTicket.outboundDate 是 @db.Date，按 UTC 日期读取；新系统日期由 departAt 折成 UTC+8 业务日。
+ */
+export function isLegacyTripMatchedByFlownDate(
+  outboundDate: Date | null,
+  flownBusinessDates: readonly string[],
+): boolean {
+  if (!outboundDate) return false;
+  const legacyDay = Date.UTC(
+    outboundDate.getUTCFullYear(),
+    outboundDate.getUTCMonth(),
+    outboundDate.getUTCDate(),
+  );
+  return flownBusinessDates.some((businessDate) => {
+    const flownDay = toUtcBusinessDay(businessDate);
+    return flownDay !== null && Math.abs(legacyDay - flownDay) <= BUSINESS_DAY_MS;
+  });
+}
+
+/**
+ * 老系统历史飞行次数的唯一口径：
+ *   - documentNumberNorm 命中档案全部证件号（trim + upper，不区分证件类型）；
+ *   - isDeleted=false、supersededByOrderId IS NULL、stateRaw != 2（stateRaw 为 NULL 也计入）；
+ *   - outboundDate IS NULL 或不晚于今天。老系统封笔后无日期的记录按历史购买计入；
+ *   - 命中新系统该档案任一已飞去程业务日 ±1 天的老系统票活体去重，不依赖静态重录标记。
+ *
+ * 所有档案一次 findMany 批量查回两列，再按档案在内存过滤计数，不能在档案循环内逐人查询。
+ */
+export async function loadLegacyTripCounts(
+  scopes: readonly LegacyTripCountScope[],
+  today = new Date(),
+  client: Pick<PrismaClient, 'legacyTicket'> = prisma,
+): Promise<Map<string, number>> {
+  const normalizedNumbers = [
+    ...new Set(
+      scopes.flatMap((scope) =>
+        scope.documentNumbers.map((documentNumber) => documentNumber.trim().toUpperCase()),
+      ).filter(Boolean),
+    ),
+  ];
+  if (normalizedNumbers.length === 0) return new Map();
+
+  const rows: LegacyTripCountRow[] = await client.legacyTicket.findMany({
+    where: {
+      documentNumberNorm: { in: normalizedNumbers },
+      isDeleted: false,
+      supersededByOrderId: null,
+      // 显式保留 stateRaw=NULL；Prisma 的 not: 2 单独使用时不会命中 SQL NULL。
+      OR: [{ stateRaw: null }, { stateRaw: { not: 2 } }],
+      AND: [{ OR: [{ outboundDate: null }, { outboundDate: { lte: today } }] }],
+    },
+    select: { documentNumberNorm: true, outboundDate: true },
+  });
+
+  const rowsByNorm = new Map<string, LegacyTripCountRow[]>();
+  for (const row of rows) {
+    if (!row.documentNumberNorm) continue;
+    const norm = row.documentNumberNorm.trim().toUpperCase();
+    const matchingRows = rowsByNorm.get(norm);
+    if (matchingRows) matchingRows.push(row);
+    else rowsByNorm.set(norm, [row]);
+  }
+
+  return new Map(
+    scopes.map((scope) => {
+      const documentNorms = new Set(
+        scope.documentNumbers
+          .map((documentNumber) => documentNumber.trim().toUpperCase())
+          .filter(Boolean),
+      );
+      let count = 0;
+      for (const norm of documentNorms) {
+        for (const row of rowsByNorm.get(norm) ?? []) {
+          if (!isLegacyTripMatchedByFlownDate(row.outboundDate, scope.flownBusinessDates)) {
+            count += 1;
+          }
+        }
+      }
+      return [scope.key, count] as const;
+    }),
+  );
+}
+
+/** 把档案的主证件与合并别名证件次数相加；同一 norm 只加一次。 */
+export function sumLegacyTripCounts(
+  documentNumbers: readonly string[],
+  countsByNorm: ReadonlyMap<string, number>,
+): number {
+  let total = 0;
+  const seen = new Set<string>();
+  for (const documentNumber of documentNumbers) {
+    const norm = documentNumber.trim().toUpperCase();
+    if (!norm || seen.has(norm)) continue;
+    seen.add(norm);
+    total += countsByNorm.get(norm) ?? 0;
+  }
+  return total;
+}
+
+/** 唯一的快照加数 helper：聚合结果是新系统已飞，写入 tripCount 时统一加老系统次数。 */
+export function addLegacyTripCount(
+  aggregate: Pick<TravelerAggregate, 'tripCount'>,
+  legacyTripCount: number,
+): number {
+  return aggregate.tripCount + legacyTripCount;
 }
 
 const orderSelect = {
@@ -132,8 +272,12 @@ function toAggOrder(o: OrderRow): AggOrder {
   };
 }
 
-/** 聚合 → 快照行（不含 notes：重建/回写永不覆盖运营备注） */
-function toProfileData(agg: TravelerAggregate, linkedUserId: string | null) {
+/** 聚合 + 老系统次数 → 快照行（不含 notes：重建/回写永不覆盖运营备注）。 */
+function toProfileData(
+  agg: TravelerAggregate,
+  legacyTripCount: number,
+  linkedUserId: string | null,
+) {
   return {
     documentType: agg.documentType,
     documentNumber: agg.documentNumber,
@@ -143,7 +287,8 @@ function toProfileData(agg: TravelerAggregate, linkedUserId: string | null) {
     dateOfBirth: agg.dateOfBirth,
     nationality: agg.nationality,
     passportExpiry: agg.passportExpiry,
-    tripCount: agg.tripCount,
+    tripCount: addLegacyTripCount(agg, legacyTripCount),
+    legacyTripCount,
     pendingTripCount: agg.pendingTripCount,
     orderCount: agg.orderCount,
     firstTripAt: agg.firstTripAt,
@@ -160,6 +305,12 @@ function toProfileData(agg: TravelerAggregate, linkedUserId: string | null) {
     linkedUserId,
     refreshedAt: new Date(),
   };
+}
+
+function aggregateFlownBusinessDates(aggregate: TravelerAggregate): string[] {
+  return aggregate.trips
+    .filter((trip) => trip.flown && trip.departAt !== null)
+    .map((trip) => businessDateISO(trip.departAt!));
 }
 
 /** 证件号脱敏（前2后2）：E12345678 → E1*****78；过短(≤4)全打码。列表/导出用。 */
@@ -262,22 +413,52 @@ export class TravelerProfilesService {
       passengers: { some: { OR: docPairs } },
     });
     const key = docKey(master.documentType, master.documentNumber);
-    const agg = buildTravelerAggregates(orders, new Date(), aliasMap).get(key);
+    const now = new Date();
+    const agg = buildTravelerAggregates(orders, now, aliasMap).get(key);
 
-    // 订单已全部失效/删除 → 快照保留旧值展示，不臆造
-    // 台账照常返回：订单没了不等于核销没发生过（此时 availableTrips 可能为负，如实透出）
+    // 订单已全部失效/删除 → 不臆造新系统聚合，但仍刷新老系统次数。
+    // 台账照常返回：订单没了不等于核销没发生过（此时 availableTrips 可能为负，如实透出）。
     if (!agg) {
+      const legacyDocuments = docPairs.map((pair) => pair.documentNumber);
+      const legacyTripCount = (
+        await loadLegacyTripCounts(
+          [{ key: master.id, documentNumbers: legacyDocuments, flownBusinessDates: [] }],
+          now,
+        )
+      ).get(master.id) ?? 0;
+      const newSystemTripCount = Math.max(0, master.tripCount - master.legacyTripCount);
+      const updated = await prisma.travelerProfile.update({
+        where: { id: master.id },
+        data: {
+          tripCount: newSystemTripCount + legacyTripCount,
+          legacyTripCount,
+          refreshedAt: now,
+        },
+      });
       return {
-        profile: await this.attachBenefitTotals(master),
+        profile: await this.attachBenefitTotals(updated),
         trips: [] as TripSummary[],
         redemptions: await loadRedemptions(master.id),
       };
     }
 
     const linkedUserId = await this.resolveLinkedUser(master.documentType, master.documentNumber);
+    const legacyDocuments = docPairs.map((pair) => pair.documentNumber);
+    const legacyTripCount = (
+      await loadLegacyTripCounts(
+        [
+          {
+            key: master.id,
+            documentNumbers: legacyDocuments,
+            flownBusinessDates: aggregateFlownBusinessDates(agg),
+          },
+        ],
+        now,
+      )
+    ).get(master.id) ?? 0;
     // 证件字段钉死为主档案现值：防聚合取到旧证/大小写变体后，update 撞指针行的唯一键
     const data = {
-      ...toProfileData(agg, linkedUserId),
+      ...toProfileData(agg, legacyTripCount, linkedUserId),
       documentType: master.documentType,
       documentNumber: master.documentNumber,
     };
@@ -540,7 +721,7 @@ export class TravelerProfilesService {
   private async doRebuildAll(): Promise<{ built: number; removed: number }> {
     // 先从指针行构建别名映射：旧证订单归拢进主档案，而不是重建出一个新档案
     const refs = await this.loadProfileRefs();
-    const { aliasMap } = buildAliasIndex(refs);
+    const { aliasMap, docPairsByMasterId } = buildAliasIndex(refs);
     const masterByKey = new Map<string, ProfileRef>();
     for (const ref of refs.values()) {
       if (ref.mergedIntoId === null) {
@@ -549,7 +730,56 @@ export class TravelerProfilesService {
     }
 
     const orders = await this.loadValidOrders();
-    const aggregates = buildTravelerAggregates(orders, new Date(), aliasMap);
+    const now = new Date();
+    const aggregates = buildTravelerAggregates(orders, now, aliasMap);
+
+    // 这些主档案没有新系统聚合，但因有权益台账会被 prune 保留；也要刷新老系统次数。
+    // 只取本轮不会被聚合 upsert 的 canonical 行，避免覆盖正常聚合结果。
+    const aggregateMasterIds = new Set(
+      [...aggregates.keys()]
+        .map((key) => masterByKey.get(key)?.id)
+        .filter((id): id is string => id !== undefined),
+    );
+    const preservedWhere: Prisma.TravelerProfileWhereInput = {
+      mergedIntoId: null,
+      redemptions: { some: {} },
+    };
+    if (aggregateMasterIds.size > 0) {
+      preservedWhere.id = { notIn: [...aggregateMasterIds] };
+    }
+    const preservedWithoutAggregate = await prisma.travelerProfile.findMany({
+      where: preservedWhere,
+      select: { id: true, tripCount: true, legacyTripCount: true },
+    });
+
+    const legacyScopes = new Map<string, LegacyTripCountScope>();
+    for (const [key, aggregate] of aggregates) {
+      const master = masterByKey.get(key);
+      const identity: DocPair = {
+        documentType: master?.documentType ?? aggregate.documentType,
+        documentNumber: master?.documentNumber ?? aggregate.documentNumber,
+      };
+      const documentPairs = master
+        ? docPairsByMasterId.get(master.id) ?? [identity]
+        : [identity];
+      const scopeKey = master?.id ?? key;
+      legacyScopes.set(scopeKey, {
+        key: scopeKey,
+        documentNumbers: documentPairs.map((pair) => pair.documentNumber),
+        flownBusinessDates: aggregateFlownBusinessDates(aggregate),
+      });
+    }
+    for (const preserved of preservedWithoutAggregate) {
+      const master = refs.get(preserved.id);
+      if (!master) continue;
+      const documentPairs = docPairsByMasterId.get(master.id) ?? [master];
+      legacyScopes.set(preserved.id, {
+        key: preserved.id,
+        documentNumbers: documentPairs.map((pair) => pair.documentNumber),
+        flownBusinessDates: [],
+      });
+    }
+    const legacyCounts = await loadLegacyTripCounts([...legacyScopes.values()], now);
 
     // SavedPassenger 证件号 → 唯一归属账号（多账号存同一证件时不猜，置空）
     const savedRows = await prisma.savedPassenger.findMany({
@@ -570,8 +800,9 @@ export class TravelerProfilesService {
         documentType: master?.documentType ?? agg.documentType,
         documentNumber: master?.documentNumber ?? agg.documentNumber,
       };
+      const legacyTripCount = legacyCounts.get(master?.id ?? key) ?? 0;
       const data = {
-        ...toProfileData(agg, linkMap.get(key) ?? null),
+        ...toProfileData(agg, legacyTripCount, linkMap.get(key) ?? null),
         ...identity,
       };
       const row = await prisma.travelerProfile.upsert({
@@ -581,6 +812,19 @@ export class TravelerProfilesService {
         select: { id: true },
       });
       keptIds.push(row.id);
+    }
+
+    for (const preserved of preservedWithoutAggregate) {
+      const legacyTripCount = legacyCounts.get(preserved.id) ?? 0;
+      const newSystemTripCount = Math.max(0, preserved.tripCount - preserved.legacyTripCount);
+      await prisma.travelerProfile.update({
+        where: { id: preserved.id },
+        data: {
+          tripCount: newSystemTripCount + legacyTripCount,
+          legacyTripCount,
+          refreshedAt: now,
+        },
+      });
     }
 
     // prune 只清 canonical 行：指针行没有对应聚合（订单都归拢进主档案了），必须保留合并关系。
@@ -772,6 +1016,7 @@ function serializeProfile(row: ProfileRow) {
     nationality: row.nationality,
     passportExpiry: row.passportExpiry,
     tripCount: row.tripCount,
+    legacyTripCount: row.legacyTripCount,
     pendingTripCount: row.pendingTripCount,
     orderCount: row.orderCount,
     firstTripAt: row.firstTripAt,

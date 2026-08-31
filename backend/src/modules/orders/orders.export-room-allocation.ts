@@ -17,7 +17,7 @@
  * （人工分房结果），否则回落到 correlate 到的 item 上 hotelRoomType.hotel.name。
  *
  * 列序对齐旧系统（0713 房控反馈）：旧系统 16 列原序 + 当前系统特有 3 列（房间号/升级原因/
- * 当日余房）追加在末尾，见 COLUMNS。「飞行次数」列取常旅客档案快照（口径与全岗总表 /
+ * 当日余房）追加在末尾，见 COLUMNS。「飞行次数」列取常旅客档案合计快照，含老系统历史飞行（已去重、退票不计）（口径与全岗总表 /
  * 《全岗可用》完全一致，见 orders.export-trip-stats.ts）；仍暂无数据的列（升级原因）保留表头、
  * 内容留空；「酒店类型」列拼法（酒店名 · 房型名）口径缓办，维持现状不动。
  */
@@ -59,8 +59,8 @@ export interface RoomAllocationRow {
   chineseName: string;
   pnrName: string;
   /**
-   * 飞行次数 = 该乘客的常旅客历史飞行次数（TravelerProfile.tripCount 快照，按证件号归拢、
-   * 只计去程已起飞的行程）。与全岗总表 /《全岗可用》同一取数与渲染入口，同一位乘客在三张表里
+   * 飞行次数 = 该乘客的常旅客合计飞行次数（TravelerProfile.tripCount 快照，含老系统历史飞行（已去重、
+   * 退票不计），按档案全部证件号归拢，只计去程已起飞的行程）。与全岗总表 /《全岗可用》同一取数与渲染入口，同一位乘客在三张表里
    * 的数字必然相同；匹配不到档案（新客/证件号对不上）→ 留空，不臆造 0。见 orders.export-trip-stats.ts。
    */
   flightCount: string;
@@ -89,14 +89,28 @@ export interface RoomAllocationRow {
  * 后 3 列（房间号/升级原因/当日余房）= 当前系统特有列，追加在旧表末位之后。
  * 导出为便于测试直接断言列序，无其他消费方引用。
  */
-export const COLUMNS: Array<{ header: string; key: keyof RoomAllocationRow; width: number }> = [
+export const COLUMNS: Array<{
+  header: string;
+  key: keyof RoomAllocationRow;
+  width: number;
+  note?: string;
+}> = [
   { header: '序号', key: 'seq', width: 6 },
   { header: '代理机构', key: 'agency', width: 16 },
   { header: '备注', key: 'notes', width: 24 },
   { header: '酒店类型', key: 'hotelType', width: 26 },
   { header: '中文名称', key: 'chineseName', width: 12 },
   { header: '乘客姓名', key: 'pnrName', width: 20 },
-  { header: '飞行次数', key: 'flightCount', width: 10 },
+  {
+    header: '飞行次数',
+    key: 'flightCount',
+    width: 10,
+    note:
+      '常旅客合计飞行次数：新系统已飞 + 老系统历史飞行（已去重、退票不计），按档案全部证件号归拢，' +
+      '只计去程已起飞的行程（不是本单航段数）。\n' +
+      '匹配不到旅客档案（新客/证件号对不上）留空。\n' +
+      '数据为旅客档案快照，非导出时实时重算。',
+  },
   { header: '出发(往返)日期', key: 'travelDates', width: 26 },
   { header: '结算价格', key: 'settlePrice', width: 12 },
   { header: '乘客生日', key: 'dateOfBirth', width: 12 },
@@ -841,7 +855,7 @@ async function buildWorkbookFromItems(
   // 飞行次数：一次性批量拉回本次导出全部乘客的档案快照（无 N+1，见 orders.export-trip-stats.ts），
   // 与全岗总表 /《全岗可用》同一入口 → 同一位乘客在三张表里的数字必然相同。
   // 同一订单跨多条占房 item 时乘客会重复出现，loadExportTripStats 内部按证件对去重，不重复查。
-  const { tripStats } = await loadExportTripStats(
+  const { tripStats, oldestRefreshedAt } = await loadExportTripStats(
     items.flatMap((it) => it.order.passengers),
     client,
   );
@@ -852,11 +866,11 @@ async function buildWorkbookFromItems(
   wb.created = new Date();
 
   for (const sheet of sheets) {
-    addSheet(wb, sheet.name, sheet.rows);
+    addSheet(wb, sheet.name, sheet.rows, oldestRefreshedAt);
   }
   // 没有任何占房数据 — 仍出一个带表头的空 sheet（无 sheet 的 xlsx 非法）
   if (sheets.length === 0) {
-    addSheet(wb, '无数据', []);
+    addSheet(wb, '无数据', [], oldestRefreshedAt);
   }
 
   const buf = await wb.xlsx.writeBuffer();
@@ -884,13 +898,25 @@ export async function buildRoomAllocationWorkbook(
 const SHEET_FONT = { name: 'Arial', size: 10 } as const;
 const SHEET_ROW_HEIGHT = 25;
 
-function addSheet(wb: ExcelJS.Workbook, name: string, rows: RoomAllocationRow[]): void {
+function addSheet(
+  wb: ExcelJS.Workbook,
+  name: string,
+  rows: RoomAllocationRow[],
+  oldestRefreshedAt: Date | null = null,
+): void {
   const ws = wb.addWorksheet(name);
   ws.columns = COLUMNS.map((c) => ({ header: c.header, key: c.key, width: c.width }));
 
   const headerRow = ws.getRow(1);
   headerRow.font = { ...SHEET_FONT, bold: true };
   headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
+  const flightCountColumn = COLUMNS.findIndex((c) => c.key === 'flightCount');
+  const flightCountNote = COLUMNS[flightCountColumn]?.note;
+  if (flightCountColumn >= 0 && flightCountNote) {
+    headerRow.getCell(flightCountColumn + 1).note = oldestRefreshedAt
+      ? `${flightCountNote}\n档案快照时间：${businessDateTimeSec(oldestRefreshedAt)}（北京时间）`
+      : flightCountNote;
+  }
 
   for (const r of rows) ws.addRow(r);
   // 逐行盖字体/行高/居中（表头行 font 已带 bold，跳过重盖以免丢加粗）

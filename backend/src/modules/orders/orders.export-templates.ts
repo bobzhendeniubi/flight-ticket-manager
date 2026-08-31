@@ -7,7 +7,7 @@
  *
  * 注意：系统暂无数据的列（单房差/抵扣人员等）保留表头、内容留空，
  * 绝不编造数据 —— 这些列是线下手工台账的占位，等后续字段补齐再填。
- * 《全岗可用》的「飞行次数」列已有真实数据：取常旅客档案快照，与全岗总表/分房表同一取数与
+ * 《全岗可用》的「飞行次数」列已有真实数据：取含老系统历史飞行（已去重、退票不计）的常旅客档案快照，与全岗总表/分房表同一取数与
  * 渲染入口（orders.export-trip-stats.ts），同一位乘客在三张表里的数字必然相同。
  */
 import ExcelJS from 'exceljs';
@@ -364,8 +364,8 @@ interface FullRow {
   chineseName: string; // 中文名称
   passengerName: string; // 乘客姓名 LAST/FIRST + 称谓（航司口径）
   cleanName: string; // 纯拼音名 LAST/FIRST（无 MR/MS 称谓）— 财务对数/名单匹配用
-  // 飞行次数 = 该乘客的常旅客历史飞行次数（TravelerProfile.tripCount 快照，按证件号归拢、
-  // 只计去程已起飞的行程）。与全岗总表/分房表同一取数与渲染入口（orders.export-trip-stats.ts），
+  // 飞行次数 = 该乘客的常旅客合计飞行次数（TravelerProfile.tripCount 快照，含老系统历史飞行（已去重、
+  // 退票不计），按档案全部证件号归拢，只计去程已起飞的行程）。与全岗总表/分房表同一取数与渲染入口（orders.export-trip-stats.ts），
   // 同一位乘客在三张表里的数字必然相同；匹配不到档案（新客/证件号对不上）→ 留空，不臆造 0。
   flightCount: string;
   travelDates: string; // 出发(往返)日期
@@ -417,7 +417,12 @@ interface FullRow {
   costAmount: string; // 订单成本·金额 — 留空
 }
 
-export const FULL_COLUMNS: Array<{ header: string; key: keyof FullRow; width: number }> = [
+export const FULL_COLUMNS: Array<{
+  header: string;
+  key: keyof FullRow;
+  width: number;
+  note?: string;
+}> = [
   { header: '序号', key: 'seq', width: 6 },
   { header: '是否是原订单', key: 'isOriginalOrder', width: 12 },
   { header: '代理机构', key: 'agency', width: 16 },
@@ -426,7 +431,16 @@ export const FULL_COLUMNS: Array<{ header: string; key: keyof FullRow; width: nu
   { header: '中文名称', key: 'chineseName', width: 12 },
   { header: '乘客姓名', key: 'passengerName', width: 18 },
   { header: '纯拼音名', key: 'cleanName', width: 16 },
-  { header: '飞行次数', key: 'flightCount', width: 8 },
+  {
+    header: '飞行次数',
+    key: 'flightCount',
+    width: 8,
+    note:
+      '常旅客合计飞行次数：新系统已飞 + 老系统历史飞行（已去重、退票不计），按档案全部证件号归拢，' +
+      '只计去程已起飞的行程（不是本单航段数）。\n' +
+      '匹配不到旅客档案（新客/证件号对不上）留空。\n' +
+      '数据为旅客档案快照，非导出时实时重算。',
+  },
   { header: '出发(往返)日期', key: 'travelDates', width: 24 },
   { header: '航班号', key: 'flightNumbers', width: 18 },
   { header: '订单类型', key: 'orderType', width: 10 },
@@ -634,7 +648,7 @@ export function orderToFullRows(
 }
 
 /** 《全岗可用》两行表头：0..N-4 单列纵向合并两行；末尾 3 列并入「订单成本」分组（首行横向合并）。*/
-function applyFullHeader(ws: ExcelJS.Worksheet): void {
+function applyFullHeader(ws: ExcelJS.Worksheet, oldestRefreshedAt: Date | null = null): void {
   const leafBeforeGroup = FULL_COLUMNS.length - FULL_COST_GROUP_SPAN;
   const row1 = ws.getRow(1);
   const row2 = ws.getRow(2);
@@ -652,6 +666,13 @@ function applyFullHeader(ws: ExcelJS.Worksheet): void {
     r.font = { bold: true };
     r.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
     r.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
+  }
+  const flightCountColumn = FULL_COLUMNS.findIndex((c) => c.key === 'flightCount');
+  const flightCountNote = FULL_COLUMNS[flightCountColumn]?.note;
+  if (flightCountColumn >= 0 && flightCountNote) {
+    row1.getCell(flightCountColumn + 1).note = oldestRefreshedAt
+      ? `${flightCountNote}\n档案快照时间：${businessDateTimeSec(oldestRefreshedAt)}（北京时间）`
+      : flightCountNote;
   }
 }
 
@@ -866,10 +887,11 @@ export async function buildOrderTemplateExportWorkbook(
   // 「飞行次数」列只在《全岗可用》有（票务/签证模板无此列），故只在 full 时才拉档案快照 ——
   // 一次性批量拉回本次导出全部乘客（无 N+1，见 orders.export-trip-stats.ts），与全岗总表/
   // 分房表同一入口 → 同一位乘客在三张表里的数字必然相同。
-  const tripStats: TripStatsMap =
+  const tripStatsLookup =
     query.template === 'full'
-      ? (await loadExportTripStats(orders.flatMap((o) => o.passengers), client)).tripStats
-      : new Map();
+      ? await loadExportTripStats(orders.flatMap((o) => o.passengers), client)
+      : { tripStats: new Map() as TripStatsMap, oldestRefreshedAt: null };
+  const { tripStats, oldestRefreshedAt } = tripStatsLookup;
 
   const wb = new ExcelJS.Workbook();
   wb.creator = `Citur Travel · 订单导出（${ORDER_TEMPLATE_LABEL[query.template]}）`;
@@ -880,7 +902,7 @@ export async function buildOrderTemplateExportWorkbook(
   if (query.template === 'full') {
     // 只设列 key/宽度，表头由 applyFullHeader 手工写两行（含合并）。
     ws.columns = FULL_COLUMNS.map((c) => ({ key: c.key, width: c.width }));
-    applyFullHeader(ws);
+    applyFullHeader(ws, oldestRefreshedAt);
   } else if (query.template === 'ticketing') {
     // 《票务专用》对齐航司 PNR 原版样例的朴素样式（票务反馈「改成原版，表格看起来简洁一些」）：
     // 列名/列序/日期格式（DDMonYY）本就与样例一致，此处只去掉加粗/底色/居中换行等装饰 ——

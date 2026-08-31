@@ -2002,12 +2002,14 @@ export interface TravelerProfile {
   dateOfBirth: string | null;
   nationality: string | null;
   passportExpiry: string | null;
+  /** 合计飞行次数中的老系统历史飞行次数（已去重、退票不计） */
+  legacyTripCount: number;
   tripCount: number;
   orderCount: number;
   firstTripAt: string | null;
   lastTripAt: string | null;
   nextTripAt: string | null;
-  /** 在订未飞：去程还没起飞的行程数（不计入已飞 tripCount） */
+  /** 在订未飞：去程还没起飞的行程数（不计入新系统已飞部分；老系统未来日期未重录单也不计入） */
   pendingTripCount: number;
   /** 已核销次数：本档案权益台账 sum(tripsUsed) 的净值（冲正条目已抵扣） */
   redeemedTrips: number;
