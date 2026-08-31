@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<title>签证就按你说的改</title>
+<style>
+  @page { size: A4; margin: 16mm 15mm; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body {
+    font-family: "PingFang SC", "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+    color: #1a2233; font-size: 13px; line-height: 1.75; background: #fff;
+  }
+  .page { max-width: 740px; margin: 0 auto; padding: 8px 0 30px; }
+  h1 { font-size: 22px; letter-spacing: 1px; margin-bottom: 4px; }
+  .sub { color: #667085; font-size: 12px; margin-bottom: 18px; }
+  h2 {
+    font-size: 15px; margin: 24px 0 10px; padding-left: 10px;
+    border-left: 4px solid #2f6fed;
+  }
+  p { margin-bottom: 8px; }
+  .quote {
+    background: #f4f7ff; border-left: 3px solid #9db8f5; border-radius: 4px;
+    padding: 9px 14px; margin: 8px 0 12px; color: #33415c; font-size: 12.5px;
+  }
+  .flow { display: flex; align-items: stretch; gap: 0; margin: 12px 0 6px; }
+  .flow .step {
+    flex: 1; text-align: center; padding: 9px 6px; border: 1.5px solid #cbd5e1;
+    border-radius: 8px; background: #fafcff;
+  }
+  .flow .step b { display: block; font-size: 14px; margin-bottom: 2px; }
+  .flow .step span { font-size: 11px; color: #667085; }
+  .flow .arrow { align-self: center; padding: 0 7px; color: #94a3b8; font-size: 16px; }
+  .step.green { border-color: #34a06a; background: #f2fbf6; }
+  .step.green b { color: #1d7a4c; }
+  .step.blue { border-color: #2f6fed; background: #f4f7ff; }
+  .step.blue b { color: #2f6fed; }
+  figure { margin: 10px 0 4px; page-break-inside: avoid; }
+  figure img {
+    width: 100%; border: 1px solid #d8dee9; border-radius: 8px; display: block;
+  }
+  figure.narrow img { width: 68%; }
+  figcaption { font-size: 12px; color: #55627a; margin-top: 6px; line-height: 1.6; }
+  figcaption b { color: #1a2233; }
+  .tag {
+    display: inline-block; border-radius: 10px; padding: 1px 9px; font-size: 11px;
+    font-weight: 600; white-space: nowrap;
+  }
+  .tag.amber { background: #fff4dc; color: #9a6700; }
+  .tag.purple { background: #f1e8ff; color: #6b3fd1; }
+  .tag.teal { background: #dff7f0; color: #0e7a5f; }
+  .tag.green { background: #dcf5e6; color: #1d7a4c; }
+  .strike { color: #b42318; text-decoration: line-through; }
+  .keep { color: #1d7a4c; font-weight: 700; }
+  .ask {
+    background: #fffdf2; border: 1.5px solid #e8d48b; border-radius: 8px;
+    padding: 12px 16px; margin-top: 8px; page-break-inside: avoid;
+  }
+  .ask li { margin: 6px 0 6px 18px; }
+  .foot { margin-top: 24px; color: #98a2b3; font-size: 11px; text-align: center; }
+  .pagebreak { page-break-before: always; }
+</style>
+</head>
+<body>
+<div class="page">
+
+  <h1>签证就按你说的改</h1>
+  <div class="sub">2026-08-30 · 改之前你过一遍，对就开工，不对圈出来</div>
+
+  <div class="quote">
+    你说的：「客人进单是需要签证就进需要签证，自备签单机票就进不需要，送了签的只要确认了就进已签证。」
+    「只要是办签证都是需要签证，除开 15 天单次或者单办签证的特殊情况，有颜色区分或者提示就可以。」<br>
+    就按这个做，一条流水线：
+  </div>
+
+  <div class="flow">
+    <div class="step"><b>录单</b><span>只选两个：<br>需要签证 / 不需要</span></div>
+    <div class="arrow">→</div>
+    <div class="step blue"><b>签证台</b><span>需要签证的自动进来<br>按日期导表送签</span></div>
+    <div class="arrow">→</div>
+    <div class="step"><b>标已送签</b><span>勾人、一键标记<br>跟你现在的操作一样</span></div>
+    <div class="arrow">→</div>
+    <div class="step green"><b>已签证</b><span>整单人都送完<br>系统自动变，不用谁去点</span></div>
+  </div>
+
+  <h2>一、录单砍成两个选项</h2>
+  <figure class="narrow">
+    <img src="操作手册/shots-2026-08-30-签证确认/01-录单-签证状态五档.png" alt="录单签证状态下拉现状">
+    <figcaption>
+      现在录单这里四个选项，代理经常选岔。改完只留
+      <span class="keep">需要</span> 和 <span class="keep">不需要</span> 两个：
+      <span class="strike">电子签</span> <span class="strike">已签证</span> 都拿掉。<br>
+      客人自己有签证、自备签、单机票免签——全选<b>不需要</b>。
+      只要是我们办的，一律<b>需要</b>，电子签不用单独选。
+    </figcaption>
+  </figure>
+
+  <h2>二、签证台你怎么用还怎么用，最后一步系统替你点</h2>
+  <figure>
+    <img src="操作手册/shots-2026-08-30-签证确认/02-签证台-现状.png" alt="签证台现状">
+    <figcaption>需要签证的单自动进签证台，按出发日期筛、导表送签，都不变。</figcaption>
+  </figure>
+  <figure>
+    <img src="操作手册/shots-2026-08-30-签证确认/03-签证台-批量标记已送签.png" alt="批量标记已送签">
+    <figcaption>
+      勾人、批量标 <b>已送签</b>，还是现在这个操作。区别在后面：整单的人都标完，
+      订单<b>自动</b>变 <span class="tag green">已签证</span>，你不用再去改订单，别人也改不动这个标。<br>
+      <b>系统里已签证的人数 = 你送签的人数</b>，自带签证的客人全在「不需要」里，混不进你的数。
+    </figcaption>
+  </figure>
+
+  <h2>三、特殊情况看颜色，不靠脑子记</h2>
+  <p>
+    默认都按 15 天单次。特殊的，签证台上自动亮标：
+    <span class="tag purple">电子签</span>
+    <span class="tag amber">非15天单次</span>
+    <span class="tag teal">纯签证单</span>
+    ——从签证产品上带出来，录单的人选不了也选不错。
+  </p>
+
+  <h2>四、钱的两条规矩</h2>
+  <figure class="narrow">
+    <img src="操作手册/shots-2026-08-30-签证确认/04-签证加急档位.png" alt="签证加急档位配置">
+    <figcaption>
+      <b>1. 价格改一处就生效。</b>不加急 240、加急 350 配在签证产品上（就是上图这里），
+      改一次全站跟着变，不用挨个套餐改。节假日价照旧走补收。<br>
+      <b>2. 已送签不退钱。</b>人送签了客人又说不办——240 不退，批文成本已经花了。
+      系统会拦，特殊情况只有管理员能例外退。
+    </figcaption>
+  </figure>
+
+  <h2>五、三件事你定</h2>
+  <div class="ask">
+    <ol>
+      <li><b>已签证打在哪个时刻</b>——材料送出去就算，还是等出签才算？你对数按哪个口径，系统就按哪个。</li>
+      <li><b>颜色标几种够不够</b>——电子签、非 15 天单次、纯签证单。加急要不要也单独一个色？</li>
+      <li><b>一单里有人办有人自备</b>（三个人两个办一个自备）——签证台只显示要办的人、人数只算要办的。对吧？</li>
+    </ol>
+  </div>
+
+  <p style="margin-top:12px">对就回个可以，马上开工。哪条不对直接圈。</p>
+
+  <div class="foot">内部流程确认 · 2026-08-30</div>
+</div>
+</body>
+</html>
