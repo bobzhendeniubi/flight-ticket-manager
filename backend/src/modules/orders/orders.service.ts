@@ -85,6 +85,9 @@ import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
 import { OPERATION_FEE_CNY_PER_ORDER } from './order-cost-items.service.js';
 import { bundleItemMetadataSchema } from './orders.schemas.js';
 import { derivePtcByAge, earliestFlightDeparture } from './pnr-export.js';
+// 按人送签的任务级状态派生（纯函数）：与签证台同一口径。依赖方向安全——
+// fulfillment.service 只 import prisma/errors/自身 schemas，不回头 import orders 模块，无环。
+import { deriveVisaTaskStatus } from '../fulfillment/fulfillment.service.js';
 import {
   assertOrderAllowsInvoicing,
   assertTicketingCap,
@@ -8014,6 +8017,336 @@ export class OrderService {
   }
 
   /**
+   * 建单后按人改自备签（专用端点，不复用换人通道）。
+   *
+   * 为什么不走换人通道：swapPassenger 的 visaExempt 透传语义有洞——false→true 不减钱、
+   * true→false 走 SWAP_VISA_DEDUCT_REVERSAL 调整行且按乘客一次性幂等（反复切换会少收）、
+   * BUNDLE 行 metadata.addOns 快照永不更新（套餐改档读快照会算错差额）、不碰送签进度、
+   * 审计记成换人。本方法把「同一个人改办签方式」做成对称、可逆、快照同步的专用动作：
+   *
+   *   · 钱**不走调整行**，走「行重算」：对唯一含自备签减免的 BUNDLE 行，以翻转后的乘客现势
+   *     重算 addOns breakdown 与行金额 —— 其余维度（晚数/间数/单住/升舱/儿童婴儿）一律沿用
+   *     原快照口径，绝不重读现价配置；总额变化必须恰等于 ±selfVisaDeductCny（建单快照费率）×1，
+   *     对不上即抛错回滚（fail-closed，交人工走调价通道）。
+   *   · 两个方向都把该乘客 visaSubmissionStatus 置回 PENDING（true→false 防旧 CONFIRMED 复活
+   *     污染任务派生；false→true 本就应为 PENDING，写了幂等）。
+   *   · 任务联动：syncVisaTasksForOrder 对齐任务的有无，再按「按人送签」口径重派生任务状态
+   *     （仅动 PENDING/IN_PROGRESS；CONFIRMED/FAILED/CANCELLED 不碰）。
+   *
+   * 守卫（依序）：占座态 + 未软删 → 幂等短路 → false→true 需送签进度仍为 PENDING（已在办理
+   * 则批文成本已发生）→ 换人通道补过钱的乘客拒绝（防两套钱法叠加双计）→ 有钱语义时
+   * 结算锁 / 开票闸 / 多条钱行拒绝。非 BUNDLE 单（纯机票/签证单等）纯改标记，不动钱。
+   */
+  async setPassengerVisaExempt(
+    orderId: string,
+    passengerId: string,
+    input: { visaExempt: boolean; note?: string },
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    warning: string | null;
+    /** 幂等短路（目标值与现值相同）：不写审计、不动钱。 */
+    idempotent: boolean;
+    /** 幂等短路时为 null（路由层据此跳过审计）。 */
+    audit: {
+      orderNumber: string;
+      passengerId: string;
+      before: { visaExempt: boolean; visaSubmissionStatus: string };
+      after: { visaExempt: boolean; visaSubmissionStatus: string };
+      /** 本次应收变化（CNY；非 BUNDLE 单恒 0）。 */
+      totalDeltaCny: number;
+    } | null;
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可改乘客自备签');
+    }
+
+    const scratch = await prisma.$transaction(async (tx) => {
+      // Order 行锁（与换人/改结算价同一把 FOR UPDATE）：翻转要读-改-写 BUNDLE 行金额与
+      // subtotal/total，无锁会与并发改价/换人 lost-update。
+      const orderRows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          orderNumber: string;
+          status: OrderStatus;
+          deletedAt: Date | null;
+          adjustments: Prisma.JsonValue;
+          settlementLocked: boolean;
+          outboundInvoiced: boolean;
+          returnInvoiced: boolean;
+          systemInvoiced: boolean;
+        }>
+      >`SELECT id, "orderNumber", status, "deletedAt", adjustments, "settlementLocked", "outboundInvoiced", "returnInvoiced", "systemInvoiced" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      const order = orderRows[0];
+      if (!order) throw new NotFoundError('订单不存在');
+
+      // ── 1. 有效订单守卫（与换人同款双闸）──────────────────────────────
+      if (order.deletedAt) {
+        throw new BadRequestError('订单在回收站（已软删），不可改自备签；如需操作请先恢复');
+      }
+      if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
+        throw new BadRequestError(
+          `订单当前状态（${zhStatus(order.status)}）不可改自备签：仅占座中的有效订单可改（已取消/已退款/超时订单请勿改）`,
+        );
+      }
+
+      const passenger = await tx.passenger.findUnique({
+        where: { id: passengerId },
+        select: {
+          id: true,
+          orderId: true,
+          visaExempt: true,
+          visaSubmissionStatus: true,
+        },
+      });
+      if (!passenger || passenger.orderId !== orderId) {
+        throw new NotFoundError('出行人不存在或不属于该订单');
+      }
+
+      // ── 2. 幂等短路：目标值与现值相同 → no-op（不写审计不动钱）──────────
+      if (passenger.visaExempt === input.visaExempt) {
+        return { noop: true as const };
+      }
+      const before = {
+        visaExempt: passenger.visaExempt,
+        visaSubmissionStatus: passenger.visaSubmissionStatus as string,
+      };
+
+      // ── 3. false→true 门槛：送签已在办理（材料准备/已送签）则批文成本已发生 ──
+      if (input.visaExempt && passenger.visaSubmissionStatus !== VisaSubmissionStatus.PENDING) {
+        throw new ConflictError(
+          '该乘客送签已在办理（材料准备/已送签），批文成本已发生，不能直接改自备签；如需退改请联系签证岗与财务处理',
+        );
+      }
+
+      // ── 4. 历史冲突闸（fail-closed）：换人通道时代已给该乘客补过自备签减免的钱 ──
+      // 两套钱法（调整行 vs 行重算）叠加会双计，这里直接拒，交人工核对。
+      const priorAdjustments = Array.isArray(order.adjustments)
+        ? (order.adjustments as unknown as OrderAdjustmentEntry[])
+        : [];
+      const hasSwapReversal = priorAdjustments.some(
+        (e) => e?.type === 'SWAP_VISA_DEDUCT_REVERSAL' && e?.passengerId === passengerId,
+      );
+      if (hasSwapReversal) {
+        throw new ConflictError(
+          '该乘客此前经换人通道调整过自备签减免，请人工核对后走调价通道处理',
+        );
+      }
+
+      // ── 5. 钱（仅 BUNDLE 行有钱的语义）：预检 → 翻标记 → 行重算 ────────────
+      const bundleItems = await tx.orderItem.findMany({
+        where: { orderId, kind: OrderItemKind.BUNDLE },
+        select: { id: true, quantity: true, amount: true, metadata: true },
+      });
+      const readAddOnSnapshot = (raw: unknown): Partial<BundleAddOnBreakdown> | null => {
+        const meta =
+          raw != null && typeof raw === 'object' && !Array.isArray(raw)
+            ? (raw as Record<string, unknown>)
+            : null;
+        const addOns = meta?.addOns;
+        return addOns != null && typeof addOns === 'object' && !Array.isArray(addOns)
+          ? (addOns as Partial<BundleAddOnBreakdown>)
+          : null;
+      };
+      const snapshotRate = (raw: unknown): number => {
+        const s = readAddOnSnapshot(raw);
+        return Math.max(0, Math.trunc(Number(s?.selfVisaDeductCny ?? 0) || 0));
+      };
+      // 有钱语义的行：建单快照里配了自备签减免费率（>0）。费率=0 或无快照 → 纯改标记。
+      const moneyLines = bundleItems.filter((it) => snapshotRate(it.metadata) > 0);
+      if (moneyLines.length > 0) {
+        if (order.settlementLocked) {
+          throw new ConflictError('结算价已锁定，改自备签会变更套餐应收，请先解锁结算价再操作');
+        }
+        // 开票闸（与改结算价同口径）：发票是已交付下游的凭证，改价必须先冲开票状态再改。
+        if (order.outboundInvoiced || order.returnInvoiced || order.systemInvoiced) {
+          throw new ConflictError(
+            '该订单已有开票记录（去程/回程/系统任一已开），改自备签会使发票与订单金额不一致。' +
+              '请先在票务台把对应开票状态改回「未开」，改完后如需可重新开票。',
+          );
+        }
+        if (moneyLines.length > 1) {
+          throw new ConflictError(
+            '本单存在多条含自备签减免的套餐行，系统无法自动分摊差额，请人工核对后走调价通道处理',
+          );
+        }
+      }
+
+      // ── 6. 写乘客标记；两个方向都把送签进度置回待处理 ─────────────────────
+      // true→false：防旧 CONFIRMED 复活污染任务派生（人已换办签方式，进度从头来）；
+      // false→true：门槛已保证本就是 PENDING，写入幂等。
+      await tx.passenger.update({
+        where: { id: passengerId },
+        data: {
+          visaExempt: input.visaExempt,
+          visaSubmissionStatus: VisaSubmissionStatus.PENDING,
+        },
+      });
+
+      // ── 5b. 行重算（唯一钱行）：以翻转后的乘客现势重算自备签人数，其余维度沿用原快照 ──
+      let totalDeltaCny = 0;
+      if (moneyLines.length === 1) {
+        const line = moneyLines[0];
+        const snapshot = readAddOnSnapshot(line.metadata)!;
+        const rate = snapshotRate(line.metadata);
+        const num = (v: unknown): number => Number(v ?? 0) || 0;
+        const intNN = (v: unknown): number => Math.max(0, Math.trunc(num(v)));
+        // 占座三计数从快照回放（缺失时回落行 quantity 的旧口径，与改档同源）。
+        const occupancy = resolveBundleOccupancy(
+          snapshot.adultCount != null || snapshot.childCount != null || snapshot.infantCount != null
+            ? {
+                adultCount: intNN(snapshot.adultCount),
+                childCount: intNN(snapshot.childCount),
+                infantCount: intNN(snapshot.infantCount),
+                quantity: line.quantity,
+              }
+            : { quantity: line.quantity },
+        );
+        const resolvedNights = Math.max(1, Math.trunc(num(snapshot.nights) || 1));
+        const bundleCfg = {
+          hotelNights: resolvedNights,
+          singleSupplementCnyPerNight: intNN(snapshot.singleSupplementCnyPerNight),
+          businessUpgradeCnyPerLeg: intNN(snapshot.businessUpgradeCnyPerLeg),
+          childSeatDiscountCnyPerPerson: intNN(snapshot.childSeatDiscountCnyPerPerson),
+          infantPriceCny: intNN(snapshot.infantPriceCny),
+          selfVisaDeductCny: rate,
+          legs: Math.max(1, Math.trunc(num(snapshot.legs) || 1)),
+        };
+        const singleCount = intNN(snapshot.singleCount);
+        const businessSplit: BundleBusinessUpgradeSplit = {
+          outbound: intNN(snapshot.businessCountOutbound),
+          return: intNN(snapshot.businessCountReturn),
+        };
+        const oldCount = intNN(snapshot.selfProvidedVisaCount);
+        // 翻转后的乘客现势 → 权威自备签人数（与录单 priceAndValidateItems 同一纯函数）。
+        const paxNow = await tx.passenger.findMany({
+          where: { orderId },
+          select: { visaExempt: true },
+        });
+        const { selfProvidedVisaCount: newCount } = derivePerPaxBundleOptions({}, paxNow);
+
+        // hotelStamp 传 null、晚数用快照 nights：绝不重读现价配置/现房型，重算只反映
+        // 「自备签人数变了」这一件事。
+        const oldAddOn = computeBundleAddOn(
+          bundleCfg, null, singleCount, businessSplit, occupancy, resolvedNights, oldCount,
+        );
+        const newAddOn = computeBundleAddOn(
+          bundleCfg, null, singleCount, businessSplit, occupancy, resolvedNights, newCount,
+        );
+        totalDeltaCny = round2(newAddOn.total - oldAddOn.total);
+
+        // 守恒断言：翻一个人 = 恰好一份快照费率。对不上（快照与乘客现势漂移、clamp 生效等）
+        // 说明这单的钱不能自动算，抛错回滚交人工。
+        const expectedDelta = input.visaExempt ? -rate : rate;
+        if (totalDeltaCny !== expectedDelta) {
+          throw new ConflictError(
+            `自备签减免重算与建单快照不符（重算差额 ¥${totalDeltaCny}，应为 ¥${expectedDelta}），` +
+              '请人工核对该单套餐快照后走调价通道处理',
+          );
+        }
+
+        const oldAmount = Number(line.amount.toString());
+        const newAmount = round2(oldAmount + totalDeltaCny);
+        if (newAmount < 0) {
+          throw new ConflictError('重算后套餐行金额为负，请人工核对后走调价通道处理');
+        }
+        const lineMeta = (line.metadata ?? {}) as Record<string, unknown>;
+        await tx.orderItem.update({
+          where: { id: line.id },
+          data: {
+            amount: new Prisma.Decimal(newAmount),
+            // 快照同步：套餐改档等下游读 metadata.addOns.selfProvidedVisaCount，必须跟上现势。
+            metadata: {
+              ...lineMeta,
+              addOns: newAddOn.breakdown,
+            } as unknown as Prisma.InputJsonValue,
+          },
+        });
+        // 锁内重新聚合最新 items 算 subtotal/total（与改结算价同款，天然吃到并发已提交的改动）。
+        const sumAgg = await tx.orderItem.aggregate({ where: { orderId }, _sum: { amount: true } });
+        const newSubtotal = round2(
+          Number((sumAgg._sum.amount ?? new Prisma.Decimal(0)).toString()),
+        );
+        await tx.order.update({
+          where: { id: orderId },
+          data: {
+            subtotal: new Prisma.Decimal(newSubtotal),
+            total: new Prisma.Decimal(newSubtotal),
+          },
+        });
+      }
+
+      // ── 7. 任务联动：先对齐任务的有无（补建/撤 PENDING），再按人重派生任务状态 ──
+      await syncVisaTasksForOrder(tx, orderId, { userId: actor.userId, role: actor.role });
+
+      const nonExempt = await tx.passenger.findMany({
+        where: { orderId, visaExempt: false },
+        select: { visaSubmissionStatus: true },
+      });
+      let warning: string | null = null;
+      if (nonExempt.length > 0) {
+        // 重派生范围：仅 PENDING/IN_PROGRESS（CONFIRMED/FAILED/CANCELLED 不动——已出结果
+        // 或已终态的任务不被系统悄悄改写）。
+        const derived = deriveVisaTaskStatus(nonExempt.map((p) => p.visaSubmissionStatus));
+        await tx.fulfillmentTask.updateMany({
+          where: {
+            orderItem: { orderId },
+            type: FulfillmentType.VISA_APPLICATION,
+            status: { in: [FulfillmentStatus.PENDING, FulfillmentStatus.IN_PROGRESS] },
+          },
+          data: {
+            status: derived,
+            completedAt: derived === FulfillmentStatus.CONFIRMED ? new Date() : null,
+          },
+        });
+      } else {
+        // ── 8. 全员自备签但仍有非 PENDING 的签证任务（sync 按设计只撤 PENDING）→ 警示 ──
+        const stuckTasks = await tx.fulfillmentTask.count({
+          where: {
+            orderItem: { orderId },
+            type: FulfillmentType.VISA_APPLICATION,
+            status: { in: [FulfillmentStatus.IN_PROGRESS, FulfillmentStatus.CONFIRMED] },
+          },
+        });
+        if (stuckTasks > 0) {
+          warning =
+            '本单乘客现已全部自备签，但仍有正在办理/已办结的签证任务未撤销（系统只自动撤「待处理」的任务），请签证岗人工处置该任务及相关费用。';
+        }
+      }
+
+      return {
+        noop: false as const,
+        orderNumber: order.orderNumber,
+        before,
+        totalDeltaCny,
+        warning,
+      };
+    });
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+    const serialized = serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role));
+
+    if (scratch.noop) {
+      return { order: serialized, warning: null, idempotent: true, audit: null };
+    }
+    return {
+      order: serialized,
+      warning: scratch.warning,
+      idempotent: false,
+      audit: {
+        orderNumber: scratch.orderNumber,
+        passengerId,
+        before: scratch.before,
+        after: { visaExempt: input.visaExempt, visaSubmissionStatus: VisaSubmissionStatus.PENDING },
+        totalDeltaCny: scratch.totalDeltaCny,
+      },
+    };
+  }
+
+  /**
    * 换酒店：把订单里某条 HOTEL 行（或已盖章酒店的 BUNDLE 行）就地换到另一个房型/酒店，
    * 并（可选）加/减「换酒店差价」。
    *
@@ -12875,7 +13208,7 @@ function maskedItemTravelDate(it: {
 void PaymentMethod;
 
 // ── Fulfillment 任务生成（PAID 时触发） ─────────────────────────
-import { FulfillmentStatus, FulfillmentType, type VisaRequirement } from '@prisma/client';
+import { FulfillmentStatus, FulfillmentType, VisaSubmissionStatus, type VisaRequirement } from '@prisma/client';
 
 // 非套餐订单项：一行 → 一个对应岗任务。
 const KIND_TO_FULFILLMENT_TYPE: Partial<Record<OrderItemKind, FulfillmentType>> = {

@@ -1072,6 +1072,19 @@ export const swapPassengerBodySchema = z
 export type SwapPassengerBody = z.infer<typeof swapPassengerBodySchema>;
 
 /**
+ * PATCH /orders/:id/passengers/:passengerId/visa-exempt —— 建单后按人改自备签（专用端点）。
+ *
+ * 与换人通道（swapPassengerBodySchema 的 visaExempt 透传）不同：这里是「同一个人改办签方式」，
+ * 钱走 BUNDLE 行按建单快照费率的对称重算（服务端权威，body 不收任何金额），不走换人的
+ * SWAP_VISA_DEDUCT_REVERSAL 调整行。
+ */
+export const setPassengerVisaExemptBodySchema = z.object({
+  visaExempt: z.boolean(),
+  note: z.string().max(500).optional(),
+});
+export type SetPassengerVisaExemptBody = z.infer<typeof setPassengerVisaExemptBodySchema>;
+
+/**
  * PATCH /orders/:id/passengers/:passengerId 的「换人语义字段」——只出现在换人（swap）语义里、
  * 补录 schema（selfUpdatePassengerBodySchema）里没有的键。请求体带其中任一，即表达「换成另一个人 /
  * 重置开票或签证 / 收换人费」的意图，唯一指向换人分支。

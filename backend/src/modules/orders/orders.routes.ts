@@ -46,6 +46,7 @@ import {
   rescheduleItemHotelBodySchema,
   swapItemHotelBodySchema,
   swapPassengerBodySchema,
+  setPassengerVisaExemptBodySchema,
   updateItemSettlementPriceBodySchema,
   updatePassengerVisaDatesBodySchema,
   updateStatusBodySchema,
@@ -1946,6 +1947,50 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         after: result.after,
       });
       return { passenger: result.passenger };
+    },
+  );
+
+  // ── 建单后按人改自备签（ADMIN/STAFF）──
+  // PATCH /orders/:id/passengers/:passengerId/visa-exempt  body: { visaExempt, note? }
+  // 与换人通道分离的专用动作：同一个人改办签方式。套餐单由服务端按建单快照费率对称重算应收
+  // （行重算，不走调整行）；送签进度重置为待处理；签证任务同步对齐 + 按人重派生状态。
+  app.patch(
+    '/:id/passengers/:passengerId/visa-exempt',
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      const role = req.user.role;
+      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+        return reply.status(403).send({ error: '仅运营/管理员可改乘客自备签' });
+      }
+      const { id, passengerId } = req.params as { id: string; passengerId: string };
+      const body = setPassengerVisaExemptBodySchema.parse(req.body);
+      const { order, warning, audit } = await service.setPassengerVisaExempt(id, passengerId, body, {
+        userId: req.user.sub,
+        role,
+      });
+      // 幂等短路（目标值与现值相同）不写审计——什么都没发生。
+      if (audit) {
+        void writeAudit({
+          actor: actorFromRequest(req),
+          action: 'SET_PASSENGER_VISA_EXEMPT',
+          targetType: 'ORDER',
+          targetId: id,
+          targetLabel: audit.orderNumber,
+          before: {
+            passengerId: audit.passengerId,
+            visaExempt: audit.before.visaExempt,
+            visaSubmissionStatus: audit.before.visaSubmissionStatus,
+          },
+          after: {
+            visaExempt: audit.after.visaExempt,
+            visaSubmissionStatus: audit.after.visaSubmissionStatus,
+            totalDelta: audit.totalDeltaCny,
+            note: body.note,
+          },
+          severity: 'WARNING',
+        });
+      }
+      return { order, warning };
     },
   );
 

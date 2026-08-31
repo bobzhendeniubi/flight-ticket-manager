@@ -4142,6 +4142,20 @@ export const api = {
       body,
     }),
 
+  // 建单后按人改自备签（仅 ADMIN/STAFF）：与换人通道分离的专用端点。
+  // 套餐单由服务端按建单时的快照费率对称重算应收（前端不传任何金额）；
+  // 该乘客送签进度重置为待处理，签证任务同步对齐。返回更新后的订单 + 可选警示。
+  setPassengerVisaExempt: (
+    token: string,
+    orderId: string,
+    passengerId: string,
+    body: { visaExempt: boolean; note?: string },
+  ) =>
+    apiFetch<{ order: OrderSummary; warning?: string | null }>(
+      `/orders/${orderId}/passengers/${passengerId}/visa-exempt`,
+      { method: 'PATCH', token, body },
+    ),
+
   // 签证台：出签后补录出行人的 出签日/生效日/有效期（仅 ADMIN/STAFF）。
   // 这三项是签证岗出签后才拿得到的信息，录单时无法预先知道（票务岗反馈：录单时不需要，
   // 已从录单表单移除），改由签证台在出签后调用本端点补录。

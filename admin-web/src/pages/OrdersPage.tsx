@@ -7452,6 +7452,39 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
   // B1：签证日期内联编辑（订单侧入口——HAS_VISA/全员自备签的单进不了签证台，这里是它们唯一可达的录入口）
   const [visaEditId, setVisaEditId] = useState<string | null>(null);
 
+  // 建单后按人改自备签（专用端点，非换人通道）：仅内部可编辑角色可见（AGENT 不给）。
+  const role = useAuth((s) => s.user?.role);
+  const canToggleVisaExempt = role === 'ADMIN' || role === 'STAFF';
+  const confirm = useConfirm();
+  const [visaExemptBusyId, setVisaExemptBusyId] = useState<string | null>(null);
+  const [visaExemptErr, setVisaExemptErr] = useState<string | null>(null);
+  const toggleVisaExempt = async (p: OrderSummary['passengers'][number]) => {
+    if (visaExemptBusyId) return;
+    const token = useAuth.getState().tokens?.accessToken;
+    if (!token) return;
+    const next = !p.visaExempt;
+    const ok = await confirm({
+      title: next ? `确认把 ${p.fullName} 改为自备签？` : `确认把 ${p.fullName} 改回随团办签？`,
+      body: next
+        ? '套餐单将按建单时的自备签减免费率自动重算应收（每人减一份减免）；该乘客送签进度将重置为「待处理」，签证任务同步对齐。'
+        : '套餐单将按建单时的自备签减免费率自动重算应收（加回一份减免）；该乘客送签进度将重置为「待处理」，签证任务同步对齐。',
+      tone: 'danger',
+    });
+    if (!ok) return;
+    setVisaExemptErr(null);
+    setVisaExemptBusyId(p.id);
+    try {
+      const res = await api.setPassengerVisaExempt(token, order.id, p.id, { visaExempt: next });
+      onOrderUpdated?.(res.order);
+      if (res.warning) window.alert(res.warning);
+    } catch (e) {
+      // 失败把后端错误文案原样展示（结算锁/开票闸/送签已在办理等都有明确指引）。
+      setVisaExemptErr(e instanceof ApiError ? e.message : '改自备签失败，请稍后重试');
+    } finally {
+      setVisaExemptBusyId(null);
+    }
+  };
+
   // 换人历史：读订单维度的 SWAP_ORDER_PASSENGER 审计（before/after 已含旧/新姓名+证件号、经手、时间）。
   // 复用已有 audit 数据源，无需后端改动；按 before.passengerId 归到各乘客卡下方。
   const token = useAuth((s) => s.tokens)?.accessToken ?? '';
@@ -7491,6 +7524,11 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
   return (
     <section>
       <h3 className="text-sm font-medium text-slate-700">乘客 ({order.passengers.length})</h3>
+      {visaExemptErr && (
+        <div className="mt-1 rounded border border-red-200 bg-red-50 px-2 py-1 text-[11px] text-red-700">
+          {visaExemptErr}
+        </div>
+      )}
       <ul className="mt-2 space-y-2 text-xs">
         {order.passengers.map((p) => {
           const passDaysLeft = daysUntil(p.passportExpiry);
@@ -7587,6 +7625,20 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                     >
                       签证日期
                     </button>
+                    {canToggleVisaExempt && (
+                      <button
+                        className="ml-2 text-[11px] font-normal text-amber-700 hover:text-amber-900 disabled:opacity-50"
+                        disabled={visaExemptBusyId !== null}
+                        onClick={() => void toggleVisaExempt(p)}
+                        title={
+                          p.visaExempt
+                            ? '改回随团办签：套餐单按建单快照费率自动加回一份自备签减免；送签进度重置为待处理'
+                            : '改自备签：套餐单按建单快照费率自动减一份自备签减免；送签进度重置为待处理'
+                        }
+                      >
+                        {visaExemptBusyId === p.id ? '保存中…' : p.visaExempt ? '改回随团' : '改自备签'}
+                      </button>
+                    )}
                   </div>
                   {!p.chineseName && (
                     <div className="mt-0.5 text-xs">
