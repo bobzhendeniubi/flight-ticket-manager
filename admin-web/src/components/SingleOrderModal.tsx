@@ -349,6 +349,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 由 visaStatusTouchedRef 记住，产品再变也不会覆盖用户的手动选择。
   const [visaStatus, setVisaStatus] = useState<VisaStatusInput>('NOT_NEEDED');
   const visaStatusTouchedRef = useRef(false);
+  // 签证列隐藏时用户先选「不需要 / 已签证」的意图，只消费一次，避免切换产品后反复覆盖逐位选择。
+  const pendingAutoVisaExemptRef = useRef(false);
   const [noteHotel, setNoteHotel] = useState('');
   const [noteVisa, setNoteVisa] = useState('');
   const [notePayment, setNotePayment] = useState('');
@@ -757,8 +759,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     return `护照有效期不足 ${PASSPORT_EXPIRY_HINT_DAYS} 天（相对出发日 ${earliest}）：${names.join('、')}。仍可下单开票，请先与客人确认目的地的护照有效期要求；有效期不足 6 个月会自动加收临期附加费。`;
   }, [isBundleOrder, departDate, blocks, passengers]);
 
-  // ── 套餐乘客级「住宿方式 + 签证」（购物车模式）──
-  // 住宿列：套餐单都显示；签证列：套餐含签证组件，或配了自备签减免额（selfVisaDeductCny>0）时显示。
+  // ── 套餐乘客级「住法 + 签证」（购物车模式）──
+  // 住法列：套餐单都显示；签证列：套餐含签证组件，或配了自备签减免额（selfVisaDeductCny>0）时显示。
   //   旧口径只看减免额（「无价差 = 展示无意义」），但自备签同时决定该乘客**进不进签证台**——
   //   含签证组件的套餐即使没配减免额，整单选「不需要」也必须能落到乘客级 visaExempt，
   //   否则订单照样生成签证任务、签证台挂一条「待处理」（公测反馈）。
@@ -787,7 +789,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const visaStatusImpliesSelfVisa = visaStatus === 'NOT_NEEDED' || visaStatus === 'HAS_VISA';
   const autoVisaExempt = showVisaExemptCol && visaStatusImpliesSelfVisa;
 
-  // 联动补一刀 —— 签证列从「不显示」变成「显示」的那一下，若整单已经是「不需要 / 已签证」，
+  // 联动补一刀 —— 签证列从「不显示」变成「显示」的那一下，若用户此前在隐藏列时选过「不需要 / 已签证」，
   // 把现有出行人补齐为自备签。下拉那条联动只在改状态的当下生效：先把签证状态改成这两档、再挑
   // 具体套餐（签证列此时才出现），联动整条错过，下方琥珀横幅却已经在说「每位出行人已标为
   // 自备签」——说着标了实际一个没标，套餐价还照收签证钱。
@@ -797,7 +799,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   useEffect(() => {
     const justAppeared = showVisaExemptCol && !visaExemptColShownRef.current;
     visaExemptColShownRef.current = showVisaExemptCol;
-    if (!justAppeared || !visaStatusImpliesSelfVisa) return;
+    if (!justAppeared || !pendingAutoVisaExemptRef.current) return;
+    pendingAutoVisaExemptRef.current = false;
+    if (!visaStatusImpliesSelfVisa) return;
     setPassengers((prev) => {
       const updated = prev.map((r) => (r.visaExempt ? r : { ...r, visaExempt: true }));
       passengersRef.current = updated;
@@ -805,18 +809,27 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     });
   }, [showVisaExemptCol, visaStatus]);
 
-  // 矛盾组合防呆（公测两单事故：需要签证 + 全员自备签 → 签证台看不到、送签对不上数）：
-  // 签证状态选了需签档，但全部有效出行人都被标成自备签 —— 按口径本单不会建签证任务。
-  // 不拦截提交（组合可能是刻意的），但必须看得见。
+  // 矛盾组合防呆：需签档下只要有出行人自备签，就明确提示其不会进入签证台。
+  // 全员自备签时保留更重提示；混合状态是正式支持的能力，不拦截提交。
   const visaContradictionHint = useMemo(() => {
     if (visaStatus !== 'NEEDED' && visaStatus !== 'E_VISA') return null;
-    const valid = passengers.filter((p) => p.fullName.trim());
-    if (valid.length === 0 || !valid.every((p) => p.visaExempt)) return null;
-    return (
-      '注意：签证状态选了「需要」，但全部出行人都是「自备签」——本单不会生成签证任务、不会出现在签证台。' +
-      '若确实要我方送签，请把至少一位出行人改回「随套餐」。'
-    );
-  }, [visaStatus, passengers]);
+    const valid = passengers
+      .map((p, index) => ({ passenger: p, index }))
+      .filter(({ passenger }) => passenger.fullName.trim());
+    const selfVisaPassengers = valid.filter(({ passenger }) => passenger.visaExempt);
+    if (selfVisaPassengers.length === 0) return null;
+    const includedLabel = isBundleOrder ? '随套餐' : '随单办签';
+    if (selfVisaPassengers.length === valid.length) {
+      return (
+        '注意：签证状态选了「需要」，但全部出行人都是「自备签」——本单不会生成签证任务、不会出现在签证台。' +
+        `若确实要我方送签，请把至少一位出行人改回「${includedLabel}」。`
+      );
+    }
+    const names = selfVisaPassengers
+      .map(({ passenger, index }) => passenger.fullName.trim() || `第${index + 1}位`)
+      .join('、');
+    return `注意：以下出行人已标「自备签」，不会进入签证台：${names}。若需我方送签请改回「${includedLabel}」。`;
+  }, [isBundleOrder, passengers, visaStatus]);
 
   // 调价有效性：金额为非 0 整数即视为「要调价」；「其它」原因必须补说明。
   const adjustIsInteger = adjustAmount !== null && Number.isInteger(adjustAmount) && adjustAmount !== 0;
@@ -1277,7 +1290,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 迟早漏掉某一块的某个字段（漏了就是「改了产品但系统价没跟着变」的静默错价）。
   const quoteBuilt = buildOrderItems();
   const quoteItemsSignature = 'error' in quoteBuilt ? '' : JSON.stringify(quoteBuilt.items);
-  // 套餐乘客级住宿/签证选项：让系统价随每人「拼房/单住 · 随套餐/自备签」选择实时变化。
+  // 套餐乘客级住法/签证选项：让系统价随每人「拼房/单住 · 随套餐/自备签」选择实时变化。
   // 仅套餐单发送（其余产品与乘客级选项无关，后端也只在 BUNDLE 分支读取）。
   const quotePassengersSignature = isBundleOrder
     ? JSON.stringify(validPassengers.map((p) => ({ visaExempt: !!p.visaExempt, singleRoom: !!p.singleRoom })))
@@ -1668,7 +1681,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     setRoomingSaved(false);
     setPassengers([emptyPassenger()]);
     setNotes('');
-    setVisaStatus('NEEDED');
+    visaStatusTouchedRef.current = false;
+    pendingAutoVisaExemptRef.current = false;
+    setVisaStatus(defaultVisaStatusFor(blockKinds));
     setNoteHotel('');
     setNoteVisa('');
     setNotePayment('');
@@ -2042,7 +2057,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   </div>
                   <p className="md:col-span-2 text-[11px] text-slate-400">
                     成人 + 儿童 + 婴儿都是出行人（都需护照，下方逐位填）。
-                    <span className="text-slate-500">住宿（拼房/单住）与签证（随套餐/自备签）在下方每位出行人卡片里各选</span>，
+                    <span className="text-slate-500">「指定酒店」选住哪家店；每位出行人卡片里的「住法」选拼房还是单住、「签证」选是否自备签——默认跟随整单签证状态，无需逐位选择。</span>
                     机票/房/价格由系统按套餐权威重算。
                   </p>
                 </div>
@@ -2177,6 +2192,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       visaStatusTouchedRef.current = true;
                       const next = e.target.value as VisaStatusInput;
                       setVisaStatus(next);
+                      if (!showVisaExemptCol) {
+                        pendingAutoVisaExemptRef.current = next === 'NOT_NEEDED' || next === 'HAS_VISA';
+                        return;
+                      }
+                      pendingAutoVisaExemptRef.current = false;
                       // 单向联动（公测反馈：整单选了不需要还要逐个人再选一遍）：改成「不需要」
                       // 或「已签证」（两档同权，客人自持签证同样不该收签证钱）时，
                       // 若当前是套餐单且签证列在显示，把现有出行人一次性批量置为自备签；
@@ -2496,10 +2516,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                         {/* 签证出签日/生效日/有效期不在此处录入：这三项是签证岗出签后才拿得到的信息，
                             录单时无法预先知道（票务岗反馈：录单时不需要），改由签证台在出签后补录。 */}
 
-                        {/* 套餐乘客级：住宿方式（拼房默认/单住）+ 本人构成小字（能算则显示） */}
+                        {/* 套餐乘客级：住法（拼房默认/单住）+ 本人构成小字（能算则显示） */}
                         {showRoomingCol && (
                           <label className={paxLabelCls}>
-                            住宿
+                            住法（拼房/单住）
                             <select
                               className={`${paxInputCls} border-slate-300`}
                               value={p.singleRoom ? 'single' : 'share'}
