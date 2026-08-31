@@ -3648,7 +3648,14 @@ export class OrderService {
     //（deriveOrderReturnDate）精确判定，再把命中 id 作为 id in (...) 并回 where —— 保证分页
     // take/skip 与总数都在精确过滤之后计算，且「列表所见 = 筛选所得」。两个筛选可同时给出，
     // 精确结果取交集。orderIds 勾选导出不走 listOrders，此处无需考虑。
-    if (query.travelFrom || query.travelTo || query.returnFrom || query.returnTo) {
+    if (
+      query.travelFrom ||
+      query.travelTo ||
+      query.returnFrom ||
+      query.returnTo ||
+      query.flightDateFrom ||
+      query.flightDateTo
+    ) {
       const candidates = await prisma.order.findMany({
         where,
         select: {
@@ -3662,7 +3669,14 @@ export class OrderService {
               // 回程精筛（deriveOrderReturnDate → determineFlightLegItems）按 departureTime
               // 升序取第 2 段，需要 flightScheduleId 才能判定该行是不是「带班次的 FLIGHT 行」。
               flightScheduleId: true,
-              flightSchedule: { select: { departureTime: true, departureTz: true } },
+              // 航班日期精筛在「航班号+日期同段」组合时要核对段上的航班号，故联查 flightNumber。
+              flightSchedule: {
+                select: {
+                  departureTime: true,
+                  departureTz: true,
+                  flight: { select: { flightNumber: true } },
+                },
+              },
             },
           },
         },
@@ -3676,6 +3690,30 @@ export class OrderService {
           filterOrderIdsByReturnDate(candidates, query.returnFrom, query.returnTo),
         );
         preciseIds = preciseIds.filter((id) => returnMatched.has(id));
+      }
+      if (query.flightDateFrom || query.flightDateTo) {
+        const flightMatched = new Set(
+          filterOrderIdsByFlightDate(
+            candidates,
+            query.flightDateFrom,
+            query.flightDateTo,
+            query.flightNumber,
+          ),
+        );
+        preciseIds = preciseIds.filter((id) => flightMatched.has(id));
+      }
+      // 航班号 × 日期维度绑定（0831 票务反馈）：航班号与出行/返程日期同时给出时，航班号
+      // 收口到**对应航段**——「出行日期+QH9588」=去程段就是 QH9588（岘港→澳门当天出发的单），
+      // 而不是「订单里任何一段含 QH9588」（那会把当天出发、回程才坐 QH9588 的往返单全捞进来）。
+      // 航班号单独使用时维持任一段命中（DB 粗筛即终态，不进本精筛块）。
+      if (query.flightNumber?.trim() && (query.travelFrom || query.travelTo || query.returnFrom || query.returnTo)) {
+        const legDims: Array<'outbound' | 'return'> = [];
+        if (query.travelFrom || query.travelTo) legDims.push('outbound');
+        if (query.returnFrom || query.returnTo) legDims.push('return');
+        const legBound = new Set(
+          filterOrderIdsByLegFlightNumber(candidates, query.flightNumber, legDims),
+        );
+        preciseIds = preciseIds.filter((id) => legBound.has(id));
       }
       where.id = { in: preciseIds };
     }
@@ -12432,6 +12470,8 @@ export type OrderListFilters = Pick<
   | 'travelTo'
   | 'returnFrom'
   | 'returnTo'
+  | 'flightDateFrom'
+  | 'flightDateTo'
   | 'flightNumber'
   | 'passengerName'
   | 'recordedBy'
@@ -12764,17 +12804,35 @@ export function buildOrderFilterWhere(
   if (query.visaRequirement) {
     andClauses.push({ visaStatus: query.visaRequirement });
   }
-  // 航班号筛选 — 订单需含该航班号的 FLIGHT 行（同样走 AND 叠加，可与 kind/出行日期组合）
-  if (query.flightNumber) {
+  // 航班号 / 航班日期筛选 — 订单需含命中的 FLIGHT 行（同样走 AND 叠加，可与 kind/出行日期组合）。
+  // 航班日期是**航段级**维度：该航段（不分去程/回程）的当地起飞日落在区间内；与航班号同时给出时
+  // 两个条件落在**同一个 some 里 = 同一段**同时满足——这正是「某天的某一班」的语义。
+  // 日期侧沿用 travelFrom/travelTo 的 ±1 天粗窗口（UTC 与当地日跨午夜防漏单），
+  // 精筛在 listOrders 里用 filterOrderIdsByFlightDate 按 departureTz 折当地日收口。
+  if (query.flightNumber || query.flightDateFrom || query.flightDateTo) {
+    const scheduleWhere: Prisma.FlightScheduleWhereInput = {};
+    if (query.flightNumber) {
+      scheduleWhere.flight = {
+        flightNumber: { equals: query.flightNumber, mode: 'insensitive' },
+      };
+    }
+    if (query.flightDateFrom || query.flightDateTo) {
+      const start = query.flightDateFrom
+        ? new Date(new Date(`${query.flightDateFrom}T00:00:00Z`).getTime() - DAY_MS)
+        : undefined;
+      const end = query.flightDateTo
+        ? new Date(new Date(`${query.flightDateTo}T23:59:59Z`).getTime() + DAY_MS)
+        : undefined;
+      scheduleWhere.departureTime = {
+        ...(start ? { gte: start } : {}),
+        ...(end ? { lte: end } : {}),
+      };
+    }
     andClauses.push({
       items: {
         some: {
           kind: OrderItemKind.FLIGHT,
-          flightSchedule: {
-            flight: {
-              flightNumber: { equals: query.flightNumber, mode: 'insensitive' },
-            },
-          },
+          flightSchedule: scheduleWhere,
         },
       },
     });
@@ -14239,6 +14297,97 @@ export function filterOrderIdsByReturnDate(
     if (returnFrom && returnDate < returnFrom) continue;
     if (returnTo && returnDate > returnTo) continue;
     result.push(o.id);
+  }
+  return result;
+}
+
+/** filterOrderIdsByFlightDate 入参：航段行的最小字段集（班次出发时间 + 时区 + 航班号）。 */
+interface FlightDateItem {
+  flightSchedule?: {
+    departureTime: Date | string;
+    departureTz?: string | null;
+    flight?: { flightNumber?: string | null } | null;
+  } | null;
+}
+
+/**
+ * 航班日期精确细筛：把「粗窗口候选订单」（buildOrderFilterWhere 的 flightDateFrom/flightDateTo
+ * 分支，按 FLIGHT 行 departureTime ±1 天粗召回）按**航段当地起飞日**精确过滤，返回命中的订单 id。
+ * 这是航段级口径，与出行日期（整单去程日）/返程日期（整单回程日）不同：任一带班次的航段命中即可，
+ * 不看它是第几段——「某天飞的这一班」既可能是别人的去程也可能是别人的回程。
+ *   · flightNumber 给出时：**同一段**须同时满足「航班号相等（不区分大小写）+ 当地日在区间内」，
+ *     与 buildOrderFilterWhere 把两个条件放进同一个 some 的语义一致（"9/3 的 QH9588"）。
+ *   · 当地日按该段 departureTz 折算（formatDateOnly，与出发/返程精筛同一函数）；
+ *   · 两端半闭区间含边界，单填一端即开区间；无任何带班次航段的单（纯地面/纯签证）不命中。
+ * 导出供 listOrders 调用 + 单测。
+ */
+export function filterOrderIdsByFlightDate(
+  candidates: ReadonlyArray<{ id: string; items: ReadonlyArray<FlightDateItem> }>,
+  flightDateFrom?: string,
+  flightDateTo?: string,
+  flightNumber?: string,
+): string[] {
+  const wantedFlightNo = flightNumber?.trim().toLowerCase() || null;
+  const result: string[] = [];
+  for (const o of candidates) {
+    const hit = o.items.some((i) => {
+      const schedule = i.flightSchedule;
+      if (!schedule?.departureTime) return false;
+      if (
+        wantedFlightNo &&
+        (schedule.flight?.flightNumber ?? '').trim().toLowerCase() !== wantedFlightNo
+      ) {
+        return false;
+      }
+      const d = new Date(schedule.departureTime);
+      if (Number.isNaN(d.getTime())) return false;
+      const localDay = formatDateOnly(d, schedule.departureTz ?? null);
+      if (!localDay) return false;
+      if (flightDateFrom && localDay < flightDateFrom) return false;
+      if (flightDateTo && localDay > flightDateTo) return false;
+      return true;
+    });
+    if (hit) result.push(o.id);
+  }
+  return result;
+}
+
+/** filterOrderIdsByLegFlightNumber 入参：determineFlightLegItems 的最小字段集 + 段上的航班号。 */
+interface LegFlightNumberItem extends FlightLegItem {
+  flightSchedule?: {
+    departureTime: Date | string;
+    flight?: { flightNumber?: string | null } | null;
+  } | null;
+}
+
+/**
+ * 航班号 × 日期维度绑定精筛（0831 票务反馈）：航班号与出行/返程日期筛选同时给出时，
+ * 航班号收口到**对应航段**，而不是「订单里任何一段含该航班号」——
+ *   · 出行日期在用（legs 含 'outbound'）：整单**去程段**（determineFlightLegItems 第 1 段，
+ *     与列表出发日期列/hasReturnLeg 同一判定）的航班号须相等；
+ *   · 返程日期在用（legs 含 'return'）：整单**回程段**（第 2 段）的航班号须相等；
+ *   · 两个日期维度都在用：任一段命中即可（同一航班号不可能同时是去回两段，取 AND 恒空集）。
+ * 没有这层绑定，「出行日期=8/31 + QH9588」会把 8/31 出发、回程才坐 QH9588 的往返单全部
+ * 捞进来——用户要的其实是「8/31 当天坐 QH9588 出发的单」。航班号**单独**使用时不走本函数，
+ * 维持任一段命中的宽口径。匹配不区分大小写、容忍首尾空格（与 DB 侧 insensitive 一致）。
+ * 导出供 listOrders 与三模板导出（orders.export-templates.ts）共用 + 单测。
+ */
+export function filterOrderIdsByLegFlightNumber(
+  candidates: ReadonlyArray<{ id: string; items: ReadonlyArray<LegFlightNumberItem> }>,
+  flightNumber: string,
+  legs: ReadonlyArray<'outbound' | 'return'>,
+): string[] {
+  const wanted = flightNumber.trim().toLowerCase();
+  if (!wanted || legs.length === 0) return candidates.map((c) => c.id);
+  const result: string[] = [];
+  for (const o of candidates) {
+    const legItems = determineFlightLegItems(o.items);
+    const hit = legs.some((leg) => {
+      const item = leg === 'outbound' ? legItems.outbound : legItems.return;
+      const legFlightNo = item?.flightSchedule?.flight?.flightNumber ?? '';
+      return legFlightNo.trim().toLowerCase() === wanted;
+    });
+    if (hit) result.push(o.id);
   }
   return result;
 }

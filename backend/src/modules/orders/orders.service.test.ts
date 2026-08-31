@@ -190,6 +190,8 @@ import {
   MAX_PASSENGER_NAME_TERMS,
   filterOrderIdsByDepartDate,
   deriveOrderReturnDate,
+  filterOrderIdsByFlightDate,
+  filterOrderIdsByLegFlightNumber,
   filterOrderIdsByReturnDate,
   assertDisplayedTotalMatches,
   computeGroundItemAmounts,
@@ -5371,6 +5373,137 @@ describe('filterOrderIdsByReturnDate · 按整单返程日精确细筛', () => {
     expect(deriveOrderReturnDate(roundTrip.items)).toBe('2026-07-12');
     expect(filterOrderIdsByReturnDate([roundTrip], '2026-07-12', '2026-07-12')).toEqual(['tz']);
     expect(filterOrderIdsByReturnDate([roundTrip], '2026-07-11', '2026-07-11')).toEqual([]);
+  });
+});
+
+// ── 航班日期精确细筛（航段级口径：任一带班次航段的当地起飞日命中即可，不分去/回程）──────
+describe('filterOrderIdsByFlightDate · 按航段当地起飞日精确细筛', () => {
+  const leg = (flightNo: string | null, isoDepart: string, tz?: string | null) => ({
+    flightSchedule: {
+      departureTime: new Date(isoDepart),
+      departureTz: tz ?? null,
+      flight: flightNo ? { flightNumber: flightNo } : null,
+    },
+  });
+
+  it('不给航班号：任一航段当地日落在区间内即命中，去程/回程段一视同仁', () => {
+    // 往返单：去程 9/1、回程 9/3 —— 按 9/3 筛，回程段命中整单。
+    const roundTrip = {
+      id: 'rt',
+      items: [leg('QH9589', '2026-09-01T02:00:00Z'), leg('QH9588', '2026-09-03T08:00:00Z')],
+    };
+    // 单程单：9/3 当天起飞。
+    const oneway = { id: 'ow', items: [leg('QH9588', '2026-09-03T09:00:00Z')] };
+    // 两段都不在 9/3。
+    const other = {
+      id: 'x',
+      items: [leg('QH9589', '2026-09-05T02:00:00Z'), leg('QH9588', '2026-09-08T08:00:00Z')],
+    };
+    expect(
+      filterOrderIdsByFlightDate([roundTrip, oneway, other], '2026-09-03', '2026-09-03'),
+    ).toEqual(['rt', 'ow']);
+  });
+
+  it('给了航班号：须**同一段**既是该航班号又在区间内——"9/3 出发坐别的航班、回程才是 QH9588" 的单不命中', () => {
+    // 去程 QH9589 恰在 9/3、回程 QH9588 在 9/8：订单虽含 QH9588，但 QH9588 那段不在 9/3。
+    const departOnly = {
+      id: 'dep',
+      items: [leg('QH9589', '2026-09-03T02:00:00Z'), leg('QH9588', '2026-09-08T08:00:00Z')],
+    };
+    // 回程 QH9588 恰在 9/3：命中。
+    const returnHit = {
+      id: 'ret',
+      items: [leg('QH9589', '2026-09-01T02:00:00Z'), leg('QH9588', '2026-09-03T08:00:00Z')],
+    };
+    // 单程 QH9588 在 9/3：命中（这批正是「返程日期+航班号」两次搜法会漏掉的）。
+    const onewayHit = { id: 'ow', items: [leg('QH9588', '2026-09-03T09:00:00Z')] };
+    expect(
+      filterOrderIdsByFlightDate(
+        [departOnly, returnHit, onewayHit],
+        '2026-09-03',
+        '2026-09-03',
+        'QH9588',
+      ),
+    ).toEqual(['ret', 'ow']);
+    // 航班号匹配不区分大小写、容忍首尾空格。
+    expect(
+      filterOrderIdsByFlightDate([returnHit], '2026-09-03', '2026-09-03', ' qh9588 '),
+    ).toEqual(['ret']);
+  });
+
+  it('当地日按 departureTz 折算，不是 UTC 分量——胡志明 +7 的凌晨班 UTC 还停在前一天', () => {
+    // 岘港（UTC+7）当地 9/3 00:30 起飞，UTC 分量是 9/2 17:30——不折时区会错判成 9/2。
+    const redEye = { id: 'tz', items: [leg('QH9588', '2026-09-02T17:30:00Z', 'Asia/Ho_Chi_Minh')] };
+    expect(filterOrderIdsByFlightDate([redEye], '2026-09-03', '2026-09-03')).toEqual(['tz']);
+    expect(filterOrderIdsByFlightDate([redEye], '2026-09-02', '2026-09-02')).toEqual([]);
+  });
+
+  it('区间含边界、单填一端即开区间；纯地面单（无带班次航段）不命中', () => {
+    const d0902 = { id: 'a', items: [leg('QH9588', '2026-09-02T08:00:00Z')] };
+    const d0903 = { id: 'b', items: [leg('QH9588', '2026-09-03T08:00:00Z')] };
+    const d0905 = { id: 'c', items: [leg('QH9588', '2026-09-05T08:00:00Z')] };
+    const hotelOnly = { id: 'h', items: [{ flightSchedule: null }] };
+    expect(
+      filterOrderIdsByFlightDate([d0902, d0903, d0905, hotelOnly], '2026-09-03', '2026-09-05'),
+    ).toEqual(['b', 'c']);
+    expect(filterOrderIdsByFlightDate([d0902, d0903, d0905], undefined, '2026-09-02')).toEqual([
+      'a',
+    ]);
+    expect(filterOrderIdsByFlightDate([d0902, d0903, d0905], '2026-09-05', undefined)).toEqual([
+      'c',
+    ]);
+  });
+});
+
+// ── 航班号 × 日期维度绑定（0831 票务反馈：「出行日期+航班号」＝去程段就是这一班）──────
+describe('filterOrderIdsByLegFlightNumber · 航班号收口到对应航段', () => {
+  const leg = (flightNo: string, isoDepart: string) => ({
+    flightScheduleId: `sched-${flightNo}-${isoDepart}`,
+    flightSchedule: {
+      departureTime: new Date(isoDepart),
+      flight: { flightNumber: flightNo },
+    },
+  });
+  // 0831 出发的典型往返单：去程 QH9589（澳门→岘港）、回程 QH9588（岘港→澳门）。
+  const roundTrip = {
+    id: 'rt',
+    // 顺序刻意先回程后去程，验证按 departureTime 排序取段、不是按行序。
+    items: [leg('QH9588', '2026-09-02T08:00:00Z'), leg('QH9589', '2026-08-31T02:00:00Z')],
+  };
+  // 0831 的单程岘港→澳门（QH9588 是它的第 1 段）。
+  const onewayBack = { id: 'ow', items: [leg('QH9588', '2026-08-31T09:00:00Z')] };
+
+  it("出行日期在用（legs=['outbound']）：QH9588 只命中「去程段就是 QH9588」的单——0831 出发的往返单（回程才坐 QH9588）被筛掉", () => {
+    expect(filterOrderIdsByLegFlightNumber([roundTrip, onewayBack], 'QH9588', ['outbound'])).toEqual(
+      ['ow'],
+    );
+    // 同一天筛 QH9589：命中往返单（去程段），不命中单程回程单。
+    expect(filterOrderIdsByLegFlightNumber([roundTrip, onewayBack], 'QH9589', ['outbound'])).toEqual(
+      ['rt'],
+    );
+  });
+
+  it("返程日期在用（legs=['return']）：QH9588 命中回程段是 QH9588 的往返单；单程单无回程段不命中", () => {
+    expect(filterOrderIdsByLegFlightNumber([roundTrip, onewayBack], 'QH9588', ['return'])).toEqual([
+      'rt',
+    ]);
+  });
+
+  it('两个日期维度都在用：任一段命中即可（AND 会恒为空集）；匹配不区分大小写、容忍空格', () => {
+    expect(
+      filterOrderIdsByLegFlightNumber([roundTrip, onewayBack], ' qh9588 ', ['outbound', 'return']),
+    ).toEqual(['rt', 'ow']);
+  });
+
+  it('legs 为空或航班号为空白 → 不过滤（原样返回），与「航班号单独使用＝任一段命中」的宽口径衔接', () => {
+    expect(filterOrderIdsByLegFlightNumber([roundTrip, onewayBack], 'QH9588', [])).toEqual([
+      'rt',
+      'ow',
+    ]);
+    expect(filterOrderIdsByLegFlightNumber([roundTrip, onewayBack], '   ', ['outbound'])).toEqual([
+      'rt',
+      'ow',
+    ]);
   });
 });
 

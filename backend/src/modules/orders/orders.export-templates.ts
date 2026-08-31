@@ -25,7 +25,11 @@ import {
   type PnrRow,
   PNR_COLUMNS,
 } from './pnr-export.js';
-import { buildOrderFilterWhere, GUEST_RECORDED_BY_LABEL } from './orders.service.js';
+import {
+  buildOrderFilterWhere,
+  filterOrderIdsByLegFlightNumber,
+  GUEST_RECORDED_BY_LABEL,
+} from './orders.service.js';
 import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
 import {
   excludeOnewayFromReturnLegExport,
@@ -829,15 +833,33 @@ export async function buildOrderTemplateExportWorkbook(
       ? fetched
       : filterExportOrdersByDepartDate(fetched, query.travelFrom, query.travelTo);
 
+  // 航班号 × 出行日期绑定（0831 票务反馈，与列表 listOrders 精筛同口径）：航班号与出行日期
+  // 同时给出时，航班号收口到**去程段**——「出行日期=8/31 + QH9588」只导 8/31 当天坐 QH9588
+  // 出发的单，而不是把 8/31 出发、回程才坐 QH9588 的往返单也带上。绑定不做会出现
+  // 「列表筛出 N 条、导出多于 N 条」的口径漂移。航班号单独给出时不绑定（任一段命中，维持现状）；
+  // scheduleId（整班导出）与 orderIds（勾选导出）沿用上面的短路原则，不二次过滤。
+  const legBound =
+    query.scheduleId ||
+    (query.orderIds && query.orderIds.length > 0) ||
+    !query.flightNumber?.trim() ||
+    !(query.travelFrom || query.travelTo)
+      ? departFiltered
+      : (() => {
+          const keep = new Set(
+            filterOrderIdsByLegFlightNumber(departFiltered, query.flightNumber, ['outbound']),
+          );
+          return departFiltered.filter((o) => keep.has(o.id));
+        })();
+
   // 单程单排除 + 行程类型筛选（票务岗反馈）：查询层的航段守卫排不掉单程单（见
   // orders.service.ts buildOrderFilterWhere 中该守卫的注释），只能在取回内存后按
   // determineFlightLegs 二次收口。勾选导出（orderIds）不走这两个过滤——用户勾了哪些就导哪些，
   // 与 filterExportOrdersByDepartDate 对 orderIds 的处理同一原则。
   const orders =
     query.orderIds && query.orderIds.length > 0
-      ? departFiltered
+      ? legBound
       : filterExportOrdersByTripType(
-          excludeOnewayFromReturnLegExport(departFiltered, query.invoiceLeg),
+          excludeOnewayFromReturnLegExport(legBound, query.invoiceLeg),
           query.tripType,
         );
 

@@ -631,11 +631,24 @@ export const listOrdersQuerySchema = z.object({
   // filterOrderIdsByReturnDate。口径与 travelFrom/travelTo 对称：可只填一端，单填一端即开区间。
   returnFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   returnTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  // 按航班日期筛选（票务需求：按「某天的某一班」搜整班订单）。这是**航段级**维度：
+  // 匹配「任一带班次的 FLIGHT 行的当地起飞日」落在区间内，不区分该段是去程还是回程；
+  // 与 flightNumber 同时给出时要求**同一段**既是该航班号、又在区间内——"9/3 的 QH9588"
+  // 一次搜全，不必再拆成「返程日期+航班号」和「出行日期+单程」两次搜。
+  // 与出行日期（整单去程日）/ 返程日期（整单回程日）是不同维度，互不替代。
+  flightDateFrom: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  flightDateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   // 接单状态过滤
   claimedById: z.string().optional(),   // 指定 ops
   unclaimedOnly: z.coerce.boolean().optional(),
   // ops 确认的三个筛选（航班号 / 乘客姓名 / 开票状态）
-  flightNumber: z.string().max(20).optional(),    // 订单含该航班号的 FLIGHT 行（不区分大小写）
+  // 航班号（不区分大小写）。口径随同时给出的日期维度收口（0831 票务反馈，精筛见
+  // filterOrderIdsByLegFlightNumber / filterOrderIdsByFlightDate）：
+  //   · 单独给出：订单任一段含该航班号即命中（宽口径，维持历史行为）；
+  //   · 与 travelFrom/travelTo 同给：整单**去程段**须是该航班号；
+  //   · 与 returnFrom/returnTo 同给：整单**回程段**须是该航班号；
+  //   · 与 flightDateFrom/flightDateTo 同给：**同一段**该航班号且当天起飞（整班名单）。
+  flightNumber: z.string().max(20).optional(),
   // 乘客姓名模糊匹配——上限 600 字符：运营反馈要能一次贴一整团（几十人）的名单，
   // 与 orders.service.ts 的 MAX_PASSENGER_NAME_TERMS（50 词）配套，留够分隔符空间。
   passengerName: z.string().max(600).optional(),

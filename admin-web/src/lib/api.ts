@@ -1809,9 +1809,21 @@ export interface ListOrdersParams {
    */
   returnFrom?: string; // 返程日期起
   returnTo?: string; // 返程日期止
+  /**
+   * 航班日期筛选 —— **航段级**维度：任一带班次航段的当地起飞日落在区间内即命中，不分去程/回程；
+   * 与 flightNumber 同时给出时要求同一段既是该航班号又在区间内（「9/3 的 QH9588」一次搜全）。
+   * 与出行日期（整单去程日）/ 返程日期（整单回程日）互不替代。可只填一端（开区间）。
+   */
+  flightDateFrom?: string; // 航班日期起
+  flightDateTo?: string; // 航班日期止
   claimedById?: string;
   unclaimedOnly?: string; // '1' = 只看未接单
-  flightNumber?: string; // 订单含该航班号的 FLIGHT 行（不区分大小写）
+  /**
+   * 航班号（不区分大小写）。口径随同时给出的日期维度收口：单独给出＝任一段含该航班号；
+   * 与出行日期同给＝去程段是这一班；与返程日期同给＝回程段是这一班；
+   * 与航班日期同给＝同一段该航班号且当天起飞（整班名单）。
+   */
+  flightNumber?: string;
   passengerName?: string; // 乘客姓名模糊匹配
   /**
    * 录入人员模糊匹配 —— 与导出「录入人员」列同源（下单账号 displayName → email；游客单无录单

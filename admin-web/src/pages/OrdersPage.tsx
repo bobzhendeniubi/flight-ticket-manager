@@ -722,6 +722,10 @@ export function OrdersPage() {
   // 按整单返程日（往返单的回程航段）匹配；无回程腿的单不命中。
   const [returnFrom, setReturnFrom] = useState('');
   const [returnTo, setReturnTo] = useState('');
+  // 航班日期筛选（票务需求：搜「某天的某一班」）—— 航段级维度，任一航段当天起飞即命中，
+  // 不分去程/回程；与航班号同填时要求同一段既是该航班号又在这天（"9/3 的 QH9588"一次搜全）。
+  const [flightDateFrom, setFlightDateFrom] = useState('');
+  const [flightDateTo, setFlightDateTo] = useState('');
   const [claimFilter, setClaimFilter] = useState<'' | 'unclaimed' | 'mine'>('');
   // ops 确认的筛选（航班号 / 乘客姓名 / 六态开票）— 后端过滤
   const [flightNumberFilter, setFlightNumberFilter] = useState('');
@@ -779,6 +783,9 @@ export function OrdersPage() {
     // 返程日期：与出行日期同一套「两个框各自独立生效」的开区间口径，见 travelDateRange 注释。
     if (returnFrom) q.returnFrom = returnFrom;
     if (returnTo) q.returnTo = returnTo;
+    // 航班日期（航段级）：任一航段当天起飞即命中；与航班号同填＝同一段同时满足。
+    if (flightDateFrom) q.flightDateFrom = flightDateFrom;
+    if (flightDateTo) q.flightDateTo = flightDateTo;
     if (claimFilter === 'unclaimed') q.unclaimedOnly = '1';
     if (debouncedFlightNumber.trim()) q.flightNumber = debouncedFlightNumber.trim();
     if (debouncedPassengerName.trim()) q.passengerName = debouncedPassengerName.trim();
@@ -796,7 +803,7 @@ export function OrdersPage() {
     if (tripTypeFilter) q.tripType = tripTypeFilter;
     if (debouncedSearch.trim()) q.search = debouncedSearch.trim();
     return q;
-  }, [kindFilter, createdFromParam, createdToParam, travelFrom, travelTo, returnFrom, returnTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, debouncedRecordedBy, invoiceLegFilter, visaFilterCode, tripTypeFilter, debouncedSearch]);
+  }, [kindFilter, createdFromParam, createdToParam, travelFrom, travelTo, returnFrom, returnTo, flightDateFrom, flightDateTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, debouncedRecordedBy, invoiceLegFilter, visaFilterCode, tripTypeFilter, debouncedSearch]);
   // 三模板筛选导出（全岗可用/票务专用/签证专用）
   const [exportTemplate, setExportTemplate] = useState<OrderExportTemplate>('full');
   const [exporting, setExporting] = useState(false);
@@ -2425,20 +2432,15 @@ export function OrdersPage() {
       </section>
 
       <section className="card">
-        <div className="grid gap-4 md:grid-cols-5">
+        {/* 筛选区按类型分组（运营反馈：一屏十八个控件平铺难找）——时间 / 航班 / 订单 / 找人
+            四组；组内控件与口径不变，只重排位置。各组标题旁的小字写清该组维度的含义。 */}
+        <div className="space-y-4">
           <div>
-            <label className="label">状态</label>
-            <select
-              className="input"
-              value={statusFilter}
-              onChange={(e) => setStatusFilter(e.target.value as '' | OrderStatus)}
-            >
-              <option value="">全部状态</option>
-              {FILTER_STATUSES.map((s) => (
-                <option key={s} value={s}>{orderStatusLabel(s)}</option>
-              ))}
-            </select>
+          <div className="mb-2 flex flex-wrap items-baseline gap-x-2 text-xs">
+            <span className="font-semibold text-ink-soft">时间</span>
+            <span className="text-ink-muted">下单＝录单时间；出行/返程＝整单的去程日/回程日</span>
           </div>
+          <div className="grid gap-4 md:grid-cols-6">
           <div>
             <label className="label">下单时间 · 起始</label>
             <div className="flex gap-1">
@@ -2556,6 +2558,116 @@ export function OrdersPage() {
               只看某一天
             </button>
           </div>
+          </div>
+          </div>
+          <div className="border-t border-slate-100 pt-4">
+          <div className="mb-2 flex flex-wrap items-baseline gap-x-2 text-xs">
+            <span className="font-semibold text-ink-soft">航班</span>
+            <span className="text-ink-muted">
+              航班日期＝该航段当天起飞（不分去/回程）；配上航班号＝某天的某一班一次搜全。
+              航班号与出行/返程日期同用时，指的是对应那一段（出行＝去程段、返程＝回程段）
+            </span>
+          </div>
+          <div className="grid gap-4 md:grid-cols-5">
+          <div>
+            <label className="label">航班号</label>
+            <div className="relative">
+              <input
+                className="input"
+                placeholder="如 VJ527"
+                value={flightNumberFilter}
+                onChange={(e) => setFlightNumberFilter(e.target.value)}
+                title="单独填＝订单任一段含该航班号；与出行日期同填＝去程段是这一班；与返程日期同填＝回程段是这一班；与航班日期同填＝该段当天起飞（整班名单）"
+              />
+              {flightNumberFilter !== debouncedFlightNumber && (
+                <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-ink-muted">
+                  搜索中…
+                </span>
+              )}
+            </div>
+          </div>
+          <div>
+            <label className="label">航班日期（从）</label>
+            <input
+              type="date"
+              className="input"
+              value={flightDateFrom}
+              max={flightDateTo || undefined}
+              onChange={(e) => setFlightDateFrom(e.target.value)}
+              title="按「该航段当天起飞」筛选，不分去程/回程；配上航班号＝某天的某一班（如 9/3 的 QH9588）一次搜全，去程在这班和回程在这班的单都出来。只填这一项＝这天起有航段起飞的全部订单"
+            />
+          </div>
+          <div>
+            <label className="label">航班日期（到）</label>
+            <input
+              type="date"
+              className="input"
+              value={flightDateTo}
+              min={flightDateFrom || undefined}
+              onChange={(e) => setFlightDateTo(e.target.value)}
+              title="按「该航段当天起飞」筛选，不分去程/回程。只填这一项＝这天及之前有航段起飞的全部订单"
+            />
+            <button
+              type="button"
+              className="mt-1 text-xs text-brand hover:text-brand-dark disabled:cursor-not-allowed disabled:text-slate-300"
+              disabled={!flightDateFrom && !flightDateTo}
+              title={flightDateFrom || flightDateTo ? '把「从」和「到」都设成这一天，只看当天起飞的航段' : '先在「从」或「到」里选一个日期'}
+              onClick={() => {
+                const day = flightDateFrom || flightDateTo;
+                if (!day) return;
+                setFlightDateFrom(day);
+                setFlightDateTo(day);
+              }}
+            >
+              只看某一天
+            </button>
+          </div>
+          <div>
+            <label className="label">机票行程</label>
+            <select
+              className="input"
+              value={tripTypeFilter}
+              onChange={(e) => setTripTypeFilter(e.target.value as '' | 'oneway' | 'roundtrip')}
+            >
+              <option value="">全部</option>
+              <option value="oneway">单程</option>
+              <option value="roundtrip">往返</option>
+            </select>
+          </div>
+          <div>
+            <label className="label">开票筛选</label>
+            <select
+              className="input"
+              value={invoiceLegFilter}
+              onChange={(e) => setInvoiceLegFilter(e.target.value)}
+              title="按航段/系统的开票状态筛选（六态）：可筛「去程/回程/系统 × 已开/未开」。票务岗「出行日期 + 去程未开」即用此项。"
+            >
+              {INVOICE_LEG_FILTER_OPTIONS.map((o) => (
+                <option key={o.value || 'all'} value={o.value}>{o.label}</option>
+              ))}
+            </select>
+          </div>
+          </div>
+          </div>
+          <div className="border-t border-slate-100 pt-4">
+          <div className="mb-2 flex flex-wrap items-baseline gap-x-2 text-xs">
+            <span className="font-semibold text-ink-soft">订单</span>
+            <span className="text-ink-muted">状态、类型与归属</span>
+          </div>
+          <div className="grid gap-4 md:grid-cols-5">
+          <div>
+            <label className="label">状态</label>
+            <select
+              className="input"
+              value={statusFilter}
+              onChange={(e) => setStatusFilter(e.target.value as '' | OrderStatus)}
+            >
+              <option value="">全部状态</option>
+              {FILTER_STATUSES.map((s) => (
+                <option key={s} value={s}>{orderStatusLabel(s)}</option>
+              ))}
+            </select>
+          </div>
           <div>
             <label className="label">接单状态</label>
             <select
@@ -2580,18 +2692,6 @@ export function OrdersPage() {
               {(['FLIGHT', 'HOTEL', 'BUNDLE', 'TRANSFER', 'VISA'] as OrderItemKindLabel[]).map((k) => (
                 <option key={k} value={k}>{KIND_LABEL[k]}</option>
               ))}
-            </select>
-          </div>
-          <div>
-            <label className="label">机票行程</label>
-            <select
-              className="input"
-              value={tripTypeFilter}
-              onChange={(e) => setTripTypeFilter(e.target.value as '' | 'oneway' | 'roundtrip')}
-            >
-              <option value="">全部</option>
-              <option value="oneway">单程</option>
-              <option value="roundtrip">往返</option>
             </select>
           </div>
           <div>
@@ -2620,38 +2720,6 @@ export function OrdersPage() {
             </select>
           </div>
           <div>
-            <label className="label">航班号</label>
-            <div className="relative">
-              <input
-                className="input"
-                placeholder="如 VJ527"
-                value={flightNumberFilter}
-                onChange={(e) => setFlightNumberFilter(e.target.value)}
-              />
-              {flightNumberFilter !== debouncedFlightNumber && (
-                <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-ink-muted">
-                  搜索中…
-                </span>
-              )}
-            </div>
-          </div>
-          <div>
-            <label className="label">乘客姓名</label>
-            <div className="relative">
-              <input
-                className="input"
-                placeholder="模糊匹配"
-                value={passengerNameFilter}
-                onChange={(e) => setPassengerNameFilter(e.target.value)}
-              />
-              {passengerNameFilter !== debouncedPassengerName && (
-                <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-ink-muted">
-                  搜索中…
-                </span>
-              )}
-            </div>
-          </div>
-          <div>
             <label className="label">录入人员</label>
             <div className="relative">
               <input
@@ -2667,19 +2735,6 @@ export function OrdersPage() {
                 </span>
               )}
             </div>
-          </div>
-          <div>
-            <label className="label">开票筛选</label>
-            <select
-              className="input"
-              value={invoiceLegFilter}
-              onChange={(e) => setInvoiceLegFilter(e.target.value)}
-              title="按航段/系统的开票状态筛选（六态）：可筛「去程/回程/系统 × 已开/未开」。票务岗「出行日期 + 去程未开」即用此项。"
-            >
-              {INVOICE_LEG_FILTER_OPTIONS.map((o) => (
-                <option key={o.value || 'all'} value={o.value}>{o.label}</option>
-              ))}
-            </select>
           </div>
           <div>
             <label className="label">签证状态</label>
@@ -2702,7 +2757,31 @@ export function OrdersPage() {
               </optgroup>
             </select>
           </div>
-          <div className="md:col-span-5">
+          </div>
+          </div>
+          <div className="border-t border-slate-100 pt-4">
+          <div className="mb-2 flex flex-wrap items-baseline gap-x-2 text-xs">
+            <span className="font-semibold text-ink-soft">找人</span>
+            <span className="text-ink-muted">乘客姓名可一次贴整团名单；大搜索框全字段模糊匹配</span>
+          </div>
+          <div className="grid gap-4 md:grid-cols-5">
+          <div>
+            <label className="label">乘客姓名</label>
+            <div className="relative">
+              <input
+                className="input"
+                placeholder="模糊匹配"
+                value={passengerNameFilter}
+                onChange={(e) => setPassengerNameFilter(e.target.value)}
+              />
+              {passengerNameFilter !== debouncedPassengerName && (
+                <span className="pointer-events-none absolute right-3 top-1/2 -translate-y-1/2 text-xs text-ink-muted">
+                  搜索中…
+                </span>
+              )}
+            </div>
+          </div>
+          <div className="md:col-span-4">
             <label className="label">搜索（订单号 / 客户 / 乘客中英文名 / 护照号 / 代理）</label>
             <input
               className="input"
@@ -2711,8 +2790,10 @@ export function OrdersPage() {
               onChange={(e) => setSearch(e.target.value)}
             />
           </div>
+          </div>
+          </div>
         </div>
-        {(statusFilter || kindFilter || tripTypeFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || recordedByFilter || invoiceLegFilter || visaFilterCode || createdFrom || createdTo || travelFrom || travelTo || returnFrom || returnTo) && (
+        {(statusFilter || kindFilter || tripTypeFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || recordedByFilter || invoiceLegFilter || visaFilterCode || createdFrom || createdTo || travelFrom || travelTo || returnFrom || returnTo || flightDateFrom || flightDateTo) && (
           <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
             {/* 日期筛选回显 — 两个框各自独立生效，只填一个就是开区间；把当前生效的条件和命中单数
                 摊开写清楚，填了「从」却看到更晚的订单时一眼就知道为什么，不用猜。 */}
@@ -2727,6 +2808,7 @@ export function OrdersPage() {
                 const travelEcho = describeDateRange(travelFrom, travelTo);
                 const returnEcho = describeDateRange(returnFrom, returnTo);
                 const createdEcho = describeDateRange(createdFrom, createdTo);
+                const flightDateEcho = describeDateRange(flightDateFrom, flightDateTo);
                 return (
                   <>
                     {travelEcho && (
@@ -2738,6 +2820,12 @@ export function OrdersPage() {
                     {returnEcho && (
                       <span className="rounded bg-brand-50 px-1.5 py-0.5 font-medium text-brand">
                         返程日期：{returnEcho}
+                      </span>
+                    )}
+                    {flightDateEcho && (
+                      <span className="rounded bg-brand-50 px-1.5 py-0.5 font-medium text-brand">
+                        航班日期：{flightDateEcho}
+                        {flightNumberFilter.trim() ? `（${flightNumberFilter.trim().toUpperCase()} 当天飞的那一段）` : '（任一航段当天起飞）'}
                       </span>
                     )}
                     {createdEcho && (
@@ -2754,7 +2842,7 @@ export function OrdersPage() {
               onClick={() => {
                 setStatusFilter(''); setKindFilter(''); setChannelFilter(''); setAgentFilter(''); setSearch('');
                 setFlightNumberFilter(''); setPassengerNameFilter(''); setRecordedByFilter(''); setInvoiceLegFilter(''); setVisaFilterCode(''); setTripTypeFilter('');
-                setCreatedFrom(''); setCreatedTo(''); setCreatedFromTime(''); setCreatedToTime(''); setTravelFrom(''); setTravelTo(''); setReturnFrom(''); setReturnTo('');
+                setCreatedFrom(''); setCreatedTo(''); setCreatedFromTime(''); setCreatedToTime(''); setTravelFrom(''); setTravelTo(''); setReturnFrom(''); setReturnTo(''); setFlightDateFrom(''); setFlightDateTo('');
               }}
             >
               清除所有过滤
