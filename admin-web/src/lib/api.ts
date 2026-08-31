@@ -3269,6 +3269,34 @@ function holdOrderQuery(filter?: HoldOrderFilter): string {
   return qs ? `?${qs}` : '';
 }
 
+// ── 拆单 v1（split PNR 售后逃生门；ADMIN/STAFF）─────────────────────────────
+export interface SplitOrderPreviewResult {
+  /** 全部准入闸通过（blockers 为空）才可执行拆单 */
+  eligible: boolean;
+  /** 不满足的准入闸（人话，每条一个）——非空时禁提交 */
+  blockers: string[];
+  /** 拆出乘客的每人份额（与详情页「每人结算价」同一权威口径） */
+  shares: Array<{ passengerId: string; fullName: string; shareCny: number }>;
+  /** 将转移到新单的应收合计（= Σ shares.shareCny） */
+  movedShareCny: number;
+  /** 将转移到新单的已收（= min(movedShare, 已收 − 已完成退款)） */
+  movedPaidCny: number;
+  /** 本单酒店行（供运营填「随拆搬走的间数」；可全 0 = 酒店全留原单） */
+  hotelItems: Array<{ itemId: string; description: string; roomsBilled: number | null }>;
+}
+
+export interface SplitOrderExecResult {
+  sourceOrderId: string;
+  sourceOrderNumber: string;
+  targetOrderId: string;
+  targetOrderNumber: string;
+  movedShareCny: number;
+  movedPaidCny: number;
+  passengerCount: number;
+  /** true = 同 requestToken 幂等回放（此前已拆过，本次没有新写入） */
+  replayed: boolean;
+}
+
 export const api = {
   login: (email: string, password: string) =>
     apiFetch<AuthResult>('/auth/login', {
@@ -4201,6 +4229,30 @@ export const api = {
       token,
       body,
     }),
+
+  // 拆单预检（ADMIN/STAFF；只读）：跑全部准入闸 + 每人份额计算。blockers 非空时禁提交。
+  splitOrderPreview: (token: string, orderId: string, body: { passengerIds: string[] }) =>
+    apiFetch<SplitOrderPreviewResult>(`/orders/${orderId}/split-preview`, {
+      method: 'POST',
+      token,
+      body,
+    }),
+
+  // 执行拆单（ADMIN/STAFF）：把选中乘客拆出成新订单（学航司 split PNR 的售后逃生门）。
+  // 服务端权威算钱：前端不传任何金额，roomSplit 只传间数（0.5 网格）。
+  // requestToken 为幂等键（crypto.randomUUID）：同 (源单, token) 重试只回放既有结果，不二次拆。
+  // 拆单不可撤销 —— 提交前必须让运营在确认页看清两侧金额。
+  splitOrder: (
+    token: string,
+    orderId: string,
+    body: {
+      passengerIds: string[];
+      roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
+      note?: string;
+      requestToken: string;
+    },
+  ) =>
+    apiFetch<SplitOrderExecResult>(`/orders/${orderId}/split`, { method: 'POST', token, body }),
 
   // 按房组拆分酒店行（ADMIN/STAFF）：把分房表里的一个房组从某条 HOTEL 行拆成独立 0 元行
   // （「按房组换酒店」的前置步骤——拆完对新行走现成换酒店）。钱不动：新行 0 元、源行金额冻结，

@@ -44,6 +44,8 @@ import {
   resolvePassengerPatchChannel,
   selfUpdatePassengerBodySchema,
   rescheduleItemHotelBodySchema,
+  splitOrderBodySchema,
+  splitOrderPreviewBodySchema,
   splitRoomGroupBodySchema,
   swapItemHotelBodySchema,
   swapPassengerBodySchema,
@@ -2238,6 +2240,34 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       severity: 'WARNING',
     });
     return { order, warning };
+  });
+
+  // ── 拆单 v1（split PNR 售后逃生门；ADMIN/STAFF）──────────────────────────
+  // POST /orders/:id/split-preview  body: { passengerIds }
+  //   只读预检：跑全部准入闸 + 每人份额计算，返回 blockers（人话逐条）/ shares /
+  //   movedShareCny / movedPaidCny / hotelItems（供 UI 让运营填 roomSplit）。
+  app.post('/:id/split-preview', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可拆单' });
+    }
+    const { id } = req.params as { id: string };
+    const body = splitOrderPreviewBodySchema.parse(req.body);
+    return service.previewOrderSplit(id, body, { userId: req.user.sub, role });
+  });
+
+  // POST /orders/:id/split  body: { passengerIds, roomSplit?, note?, requestToken }
+  //   执行拆单（服务端权威算钱：前端不传金额，roomSplit 只传间数）。
+  //   幂等：同 (源单, requestToken) 重试只回放既有结果。审计（SPLIT_ORDER×2，CRITICAL）
+  //   与守恒断言在 service 内完成。
+  app.post('/:id/split', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可拆单' });
+    }
+    const { id } = req.params as { id: string };
+    const body = splitOrderBodySchema.parse(req.body);
+    return service.splitOrder(id, body, { userId: req.user.sub, role });
   });
 
   // ── 事后补收单房差（ADMIN/STAFF）──

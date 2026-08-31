@@ -25,6 +25,7 @@ import {
   type RoomingPassenger,
 } from '../components/RoomingEditor';
 import { HotelSwapModal } from '../components/HotelSwapModal';
+import { SplitOrderModal } from '../components/SplitOrderModal';
 import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
 import { ProofImageViewer } from '../components/ProofImageViewer';
 import type { RoomGroup, Receipt, DocumentType, TravelerProfileLookupRow, BatchConfirmResultItem } from '../lib/api';
@@ -4158,6 +4159,8 @@ function OrderDrawer({
   // 运营专属（ADMIN/STAFF）：更改归属代理 + 事后补收单房差。复用上面已解析的 role。
   const isOps = role === 'ADMIN' || role === 'STAFF';
   const [agentEditOpen, setAgentEditOpen] = useState(false);
+  // 拆单（split PNR 售后逃生门）：仅 ADMIN/STAFF 且乘客 ≥ 2 时 OpsToolbar 才给入口。
+  const [splitOpen, setSplitOpen] = useState(false);
   const [roomSupplementOpen, setRoomSupplementOpen] = useState(false);
   const [groundItemKind, setGroundItemKind] = useState<'VISA' | 'HOTEL' | null>(null);
   const roomingDialogRef = useDialogA11y(() => setRoomingOpen(false), roomingOpen);
@@ -4467,7 +4470,25 @@ function OrderDrawer({
 
           <AdjustmentsSection order={o} />
 
-          <OpsToolbar order={o} onAdvance={onAdvance} />
+          <OpsToolbar
+            order={o}
+            onAdvance={onAdvance}
+            onSplit={
+              isOps && (o.passengers?.length ?? 0) >= 2 ? () => setSplitOpen(true) : undefined
+            }
+          />
+
+          {/* 拆单弹窗：预检/份额/roomSplit/确认全在组件内；成功后就地刷新抽屉 + 冒泡刷新列表 */}
+          {splitOpen && (
+            <SplitOrderModal
+              order={o}
+              onClose={() => setSplitOpen(false)}
+              onSplitDone={() => {
+                hydrate();
+                onChanged?.();
+              }}
+            />
+          )}
 
           {/* 客户（含归属代理 + 更改；运营排序需求置底部区）*/}
           <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
@@ -8480,7 +8501,15 @@ function formatDdMon(isoDate: string | null | undefined): string | null {
   return `${m[3]}${MON_ABBR_EN[month - 1]}`;
 }
 
-function OpsToolbar({ order }: { order: OrderSummary; onAdvance: (next: OrderStatus, reason?: string) => void }) {
+function OpsToolbar({
+  order,
+  onSplit,
+}: {
+  order: OrderSummary;
+  onAdvance: (next: OrderStatus, reason?: string) => void;
+  /** 拆单入口（仅 ADMIN/STAFF 且乘客 ≥ 2 时由父级传入；缺省不渲染按钮） */
+  onSplit?: () => void;
+}) {
   const tokens = useAuth((s) => s.tokens);
   const [busy, setBusy] = useState<string | null>(null);
   const [claimed, setClaimed] = useState(order.claimedBy ?? null);
@@ -8575,6 +8604,16 @@ function OpsToolbar({ order }: { order: OrderSummary; onAdvance: (next: OrderSta
         >
           {busy === 'zip' ? '打包中…' : <><Icon name="package" /> 打包护照图片</>}
         </button>
+        {onSplit && (
+          <button
+            className="col-span-2 rounded bg-violet-600 px-2 py-1.5 text-xs text-white hover:bg-violet-700 disabled:opacity-50"
+            onClick={onSplit}
+            disabled={busy !== null}
+            title="把选中乘客拆出成新订单（份额与已收款随人转移，座位库存不动）"
+          >
+            <Icon name="users" /> 拆单（拆出部分乘客）
+          </button>
+        )}
       </div>
       <p className="mt-2 text-[10px] text-slate-500">
         PNR Excel = 航司提交格式（25 列）；护照 zip 含 README 列出缺照片的乘客。

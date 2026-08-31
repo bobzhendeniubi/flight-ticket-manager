@@ -1270,3 +1270,33 @@ export const addGroundItemBodySchema = z.discriminatedUnion('kind', [
   }),
 ]);
 export type AddGroundItemBody = z.infer<typeof addGroundItemBodySchema>;
+
+// ── 拆单 v1（split PNR 售后逃生门；ADMIN/STAFF）─────────────────────────────
+// POST /orders/:id/split-preview：只读预检 —— 跑全部准入闸 + 每人份额计算，返回
+// blockers（人话，每条一个不满足的闸）与 shares/movedShareCny/movedPaidCny/hotelItems。
+// POST /orders/:id/split：执行拆单。requestToken 为幂等键（同源单同 token 重试只回放既有结果）。
+// roomSplit 只传间数（0.5 网格），金额由服务端按间数比例权威拆分 —— 前端不传任何金额。
+export const splitOrderPreviewBodySchema = z.object({
+  passengerIds: z.array(z.string().min(1)).min(1, '至少选择 1 位乘客').max(99),
+});
+export type SplitOrderPreviewBody = z.infer<typeof splitOrderPreviewBodySchema>;
+
+export const splitOrderBodySchema = z.object({
+  passengerIds: z.array(z.string().min(1)).min(1, '至少选择 1 位乘客').max(99),
+  roomSplit: z
+    .array(
+      z.object({
+        itemId: z.string().min(1, 'itemId 必填'),
+        roomsBilledToMove: z
+          .number()
+          .multipleOf(0.5, '随拆搬走的间数必须是 0.5 的整数倍')
+          .min(0.5, '随拆搬走的间数至少 0.5'),
+      }),
+    )
+    .max(50)
+    .optional(),
+  note: z.string().max(200).optional(),
+  // 与占位单转正同款幂等键口径（uuid）：同 (源单, token) 重试只回放既有结果。
+  requestToken: z.string().min(8).max(64).uuid(),
+});
+export type SplitOrderBody = z.infer<typeof splitOrderBodySchema>;

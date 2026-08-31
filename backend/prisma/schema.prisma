@@ -850,6 +850,29 @@ model HoldConversionRecord {
   @@unique([holdOrderId, requestToken])
 }
 
+// 拆单流水：一条记录对应一次「把选中乘客从源订单拆出成新订单」（学航司 split PNR 的售后逃生门）。
+// snapshot 存拆单当刻的每人份额 rows[] 全量快照，事后复算/对账依据。
+// (sourceOrderId, requestToken) 唯一 = 执行端点的幂等键：同 token 重试只回放既有结果。
+model OrderSplitRecord {
+  id             String   @id @default(cuid())
+  sourceOrderId  String
+  targetOrderId  String
+  passengerCount Int
+  movedShareCny  Decimal  @db.Decimal(12, 2)
+  movedPaidCny   Decimal  @db.Decimal(12, 2)
+  snapshot       Json // 每人份额 rows[] 全量快照，事后复算依据
+  requestToken   String
+  createdById    String
+  createdAt      DateTime @default(now())
+
+  sourceOrder Order @relation("SplitSource", fields: [sourceOrderId], references: [id], onDelete: Restrict)
+  targetOrder Order @relation("SplitTarget", fields: [targetOrderId], references: [id], onDelete: Restrict)
+
+  @@unique([sourceOrderId, requestToken])
+  @@index([sourceOrderId])
+  @@index([targetOrderId])
+}
+
 model HoldOrderConfig {
   id                     String            @id @default(cuid())
   installments           Json
@@ -1497,6 +1520,8 @@ model Order {
   notifications     NotificationLog[]
   reminders         OperationalReminder[]
   holdConversions   HoldConversionRecord[]
+  splitsOut         OrderSplitRecord[]     @relation("SplitSource")
+  splitsIn          OrderSplitRecord[]     @relation("SplitTarget")
 
   @@index([userId, createdAt])
   @@index([agentId, createdAt])
