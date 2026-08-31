@@ -14536,6 +14536,10 @@ function serializePaymentRecord(p: NonNullable<OrderLike['payments']>[number]): 
   externalTxnId: string | null;
   verified: boolean;
   verifiedAt: Date | null;
+  transferredOut?: boolean;
+  transferredIn?: boolean;
+  transferredToOrderNumber?: string | null;
+  transferredFromOrderNumber?: string | null;
 } {
   const payload =
     p.gatewayPayload && typeof p.gatewayPayload === 'object' && !Array.isArray(p.gatewayPayload)
@@ -14544,6 +14548,12 @@ function serializePaymentRecord(p: NonNullable<OrderLike['payments']>[number]): 
   let reconciled = false;
   let receiptNo: string | null = null;
   let externalTxnId: string | null = null;
+  const transferredOut = payload?.transferredOut === true;
+  const transferredIn = payload?.transferredIn === true;
+  const transferredToOrderNumber =
+    typeof payload?.transferredToOrderNumber === 'string' ? payload.transferredToOrderNumber : null;
+  const transferredFromOrderNumber =
+    typeof payload?.transferredFromOrderNumber === 'string' ? payload.transferredFromOrderNumber : null;
   if (payload) {
     if (payload.source === 'reconciliation') {
       reconciled = true;
@@ -14569,6 +14579,12 @@ function serializePaymentRecord(p: NonNullable<OrderLike['payments']>[number]): 
     // 到账双状态：财务核过流水才算 verified（认款/网关创建即核实；人工录入待财务核实）。
     verified: p.verifiedAt != null,
     verifiedAt: p.verifiedAt ?? null,
+    ...(transferredOut
+      ? { transferredOut: true, transferredToOrderNumber }
+      : {}),
+    ...(transferredIn
+      ? { transferredIn: true, transferredFromOrderNumber }
+      : {}),
   };
 }
 

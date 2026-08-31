@@ -11482,6 +11482,8 @@ function ConfirmPaymentSection({
   onChanged?: () => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
+  const role = useAuth((s) => s.user?.role);
+  const canTransferPayment = role === 'ADMIN' || role === 'STAFF';
   const token = tokens?.accessToken ?? '';
   const navigate = useNavigate();
   // 跳收款对账台并带上本单订单号，那边据此预填核销表单的订单搜索框。
@@ -11779,6 +11781,53 @@ function ConfirmPaymentSection({
     if (reverseWarning) window.alert(reverseWarning);
   }
 
+  async function transferPayment(p: OrderPayment): Promise<void> {
+    if (!token || submitting || !canTransferPayment || p.status !== 'SUCCEEDED') return;
+    const targetOrderNumber = window.prompt(
+      `转移这笔收款 ¥${Number(p.amount).toLocaleString()}？\n\n请输入目标订单号：`,
+    );
+    if (targetOrderNumber === null) return;
+    const trimmedTargetOrderNumber = targetOrderNumber.trim();
+    if (!trimmedTargetOrderNumber) {
+      window.alert('请输入目标订单号');
+      return;
+    }
+    const reason = window.prompt(
+      `收款将从本单转到订单 ${trimmedTargetOrderNumber}。\n\n` +
+        '请填写转移原因（必填，至少 4 个字，记入双方审计）：',
+    );
+    if (reason === null) return;
+    const trimmedReason = reason.trim();
+    if (trimmedReason.length < 4) {
+      window.alert('请填写转移原因（至少 4 个字）');
+      return;
+    }
+
+    setErr(null);
+    setSubmitting(true);
+    let transferred = false;
+    try {
+      await api.transferPayment(
+        p.id,
+        { targetOrderNumber: trimmedTargetOrderNumber, reason: trimmedReason },
+        token,
+      );
+      transferred = true;
+    } catch (e: unknown) {
+      // ApiError.message 就是后端给运营的具体守卫文案，原样展示，避免丢掉下一步指引。
+      setErr(e instanceof ApiError ? e.message : '转移收款失败');
+    } finally {
+      setSubmitting(false);
+    }
+    if (!transferred) return;
+    try {
+      const refreshed = await refreshPaymentState();
+      if (refreshed) onChanged?.();
+    } catch {
+      setErr('已转移这笔收款，但页面刷新失败，请手动刷新页面查看最新收款状态（不要重复转移）。');
+    }
+  }
+
   // 收款复核锁：财务/出纳对账无误后锁定本单收款（锁定后禁止人工录新收款）；解锁需二次确认。
   async function toggleLock(): Promise<void> {
     if (!token || lockBusy) return;
@@ -12049,7 +12098,21 @@ function ConfirmPaymentSection({
                 <span>{PAYMENT_METHOD_LABEL[p.method] ?? p.method}</span>
                 <span className="font-medium">¥{Number(p.amount).toLocaleString()}</span>
                 <span className="text-slate-400">{p.paidAt ? formatDateCn(p.paidAt) : ''}</span>
-                {p.status === 'REFUNDED' ? (
+                {p.transferredOut ? (
+                  <span
+                    className="inline-flex items-center rounded bg-amber-100 px-1.5 py-0.5 font-medium text-amber-700 no-underline"
+                    title="这笔收款已转移到另一张订单"
+                  >
+                    已转出至 {p.transferredToOrderNumber || '目标订单'}
+                  </span>
+                ) : p.transferredIn ? (
+                  <span
+                    className="inline-flex items-center rounded bg-sky-100 px-1.5 py-0.5 font-medium text-sky-700"
+                    title="这笔收款从另一张订单转入"
+                  >
+                    由 {p.transferredFromOrderNumber || '其他订单'} 转入
+                  </span>
+                ) : p.status === 'REFUNDED' ? (
                   <span
                     className="inline-flex items-center rounded bg-slate-200 px-1.5 py-0.5 font-medium text-slate-600 no-underline"
                     title="这笔收款已冲销，不再计入本单已付"
@@ -12081,31 +12144,67 @@ function ConfirmPaymentSection({
                   )}
                   {p.status === 'SUCCEEDED' && (
                     paymentsLocked ? (
-                      <button
-                        type="button"
-                        className="btn-ghost-danger px-1.5 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-50"
-                        disabled
-                        title="收款已锁定（财务复核完成），请先解锁"
-                      >
-                        撤销
-                      </button>
+                      <>
+                        {canTransferPayment && (
+                          <button
+                            type="button"
+                            className="btn-secondary px-1.5 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-50"
+                            disabled
+                            title="收款已锁定（财务复核完成），请先解锁"
+                          >
+                            转移
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="btn-ghost-danger px-1.5 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-50"
+                          disabled
+                          title="收款已锁定（财务复核完成），请先解锁"
+                        >
+                          撤销
+                        </button>
+                      </>
                     ) : p.reconciled === true ? (
-                      <button
-                        type="button"
-                        className="btn-ghost-danger px-1.5 py-0.5 text-[11px]"
-                        onClick={() => void reversePayment(p)}
-                      >
-                        去对账台撤销
-                      </button>
+                      <>
+                        {canTransferPayment && (
+                          <button
+                            type="button"
+                            className="btn-secondary px-1.5 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-50"
+                            onClick={() => void transferPayment(p)}
+                            disabled={submitting}
+                          >
+                            转移
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="btn-ghost-danger px-1.5 py-0.5 text-[11px]"
+                          onClick={() => void reversePayment(p)}
+                        >
+                          去对账台撤销
+                        </button>
+                      </>
                     ) : (
-                      <button
-                        type="button"
-                        className="btn-ghost-danger px-1.5 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-50"
-                        onClick={() => void reversePayment(p)}
-                        disabled={submitting}
-                      >
-                        撤销
-                      </button>
+                      <>
+                        {canTransferPayment && (
+                          <button
+                            type="button"
+                            className="btn-secondary px-1.5 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-50"
+                            onClick={() => void transferPayment(p)}
+                            disabled={submitting}
+                          >
+                            转移
+                          </button>
+                        )}
+                        <button
+                          type="button"
+                          className="btn-ghost-danger px-1.5 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-50"
+                          onClick={() => void reversePayment(p)}
+                          disabled={submitting}
+                        >
+                          撤销
+                        </button>
+                      </>
                     )
                   )}
                 </div>

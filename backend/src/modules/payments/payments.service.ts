@@ -13,6 +13,7 @@
  *   - 订单已 CANCELLED：标记 REFUNDED（资金原路退回）
  */
 import {
+  CommissionStatus,
   OrderStatus,
   PaymentMethod,
   PaymentStatus,
@@ -1108,6 +1109,416 @@ export class PaymentsService {
   }
 
   /**
+   * 把一笔已成功收款从源订单整笔转到目标订单。
+   *
+   * 这不是退款：源 Payment 保留为 REFUNDED 作为「已转出」的原始凭证，目标订单
+   * 另建一笔 SUCCEEDED Payment，两边通过 gatewayPayload 与审计日志互相引用。
+   * 两张订单始终按 id 顺序逐行加锁，避免 A→B 与 B→A 并发时形成死锁。
+   */
+  async transferManualPayment(
+    paymentId: string,
+    input: { targetOrderNumber: string; reason: string },
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    paymentId: string;
+    sourceOrder: { id: string; orderNumber: string; paidAmount: number };
+    targetOrder: { id: string; orderNumber: string; paidAmount: number };
+    newPaymentId: string;
+    amount: number;
+  }> {
+    const pendingFulfillmentTaskIds: string[] = [];
+    const result = await prisma.$transaction(async (tx) => {
+      const payment = await tx.payment.findUnique({
+        where: { id: paymentId },
+        include: {
+          order: {
+            select: { id: true, orderNumber: true, status: true, deletedAt: true },
+          },
+        },
+      });
+      if (!payment) throw new NotFoundError('收款记录不存在');
+
+      const holdConversion = await tx.holdConversionRecord.findFirst({
+        where: { paymentId },
+        select: { holdOrder: { select: { holdNo: true } } },
+      });
+      if (holdConversion) {
+        throw new ConflictError(
+          `这笔收款是占位单 ${holdConversion.holdOrder.holdNo} 的结转款，需回占位单侧处理，不能直接转移。`,
+        );
+      }
+
+      const targetOrderNumber = input.targetOrderNumber.trim();
+      const target = await tx.order.findUnique({
+        where: { orderNumber: targetOrderNumber },
+        select: { id: true, orderNumber: true, status: true, deletedAt: true },
+      });
+      if (!target || target.deletedAt) {
+        throw new BadRequestError(
+          '目标订单不存在或已在回收站，不能转移收款。请核对目标订单号并先恢复订单。',
+        );
+      }
+      if (target.id === payment.orderId) {
+        throw new BadRequestError('不能转移到同一张订单');
+      }
+
+      type LockedOrder = {
+        id: string;
+        orderNumber: string;
+        total: Prisma.Decimal;
+        adjustmentCny: number;
+        paidAmount: Prisma.Decimal;
+        prepaymentOffset: Prisma.Decimal;
+        status: OrderStatus;
+        deletedAt: Date | null;
+        paymentsLocked: boolean;
+      };
+      const lockedOrders = new Map<string, LockedOrder>();
+      for (const id of [payment.orderId, target.id].sort()) {
+        const rows = await tx.$queryRaw<LockedOrder[]>`
+          SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset",
+                 status, "deletedAt", "paymentsLocked"
+          FROM "Order"
+          WHERE id = ${id}
+          FOR UPDATE
+        `;
+        const order = rows[0];
+        if (!order) {
+          throw new BadRequestError(
+            id === target.id
+              ? '目标订单不存在或已在回收站，不能转移收款。请核对目标订单号并先恢复订单。'
+              : '该收款对应的源订单不存在，不能转移收款。',
+          );
+        }
+        lockedOrders.set(id, order);
+      }
+
+      const sourceOrder = lockedOrders.get(payment.orderId);
+      const targetOrder = lockedOrders.get(target.id);
+      if (!sourceOrder || !targetOrder) {
+        throw new BadRequestError('源订单或目标订单不存在，不能转移收款。');
+      }
+
+      // 订单行锁定后再锁定并重读 Payment：状态、金额、核实信息和来源载荷都必须来自同一
+      // 个并发一致性点，不能沿用锁订单前的快照。Payment CAS 仍保留，作为最终一次性转移闸。
+      const lockedPaymentRows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          orderId: string;
+          method: PaymentMethod;
+          amount: Prisma.Decimal;
+          status: PaymentStatus;
+          paidAt: Date | null;
+          verifiedAt: Date | null;
+          verifiedById: string | null;
+          proofUrl: string | null;
+          gatewayPayload: Prisma.JsonValue | null;
+        }>
+      >`SELECT id, "orderId", method, amount, status, "paidAt", "verifiedAt", "verifiedById", "proofUrl", "gatewayPayload" FROM "Payment" WHERE id = ${paymentId} FOR UPDATE`;
+      const lockedPayment = lockedPaymentRows[0];
+      if (!lockedPayment) throw new NotFoundError('收款记录不存在');
+      if (lockedPayment.orderId !== payment.orderId) {
+        throw new ConflictError('该笔收款所属订单已变更，请刷新后重试');
+      }
+      if (lockedPayment.method === PaymentMethod.AGENT_PREPAYMENT) {
+        throw new BadRequestError('代理预存款有独立资金账本，不能通过收款转移。请走预存款流程处理。');
+      }
+      if (lockedPayment.status !== PaymentStatus.SUCCEEDED) {
+        throw new BadRequestError('该笔收款不可转移（仅已成功的收款可转移）');
+      }
+
+      // 源侧沿用撤销收款的资金闸：退款义务窗口、回收站、收款复核锁都不能绕过。
+      // 源单归零后刻意不改状态、不改开票标记、不释放座位；关单由运营后续走退款/取消流程。
+      assertOrderAllowsFundsReversal(sourceOrder, '转移收款');
+      if (sourceOrder.paymentsLocked) {
+        throw new ConflictError(
+          `订单 ${sourceOrder.orderNumber} 收款已锁定（财务复核完成），请先在订单收款区解锁再转移该笔收款`,
+        );
+      }
+
+      // 目标侧明确拦住失效/退款/取消订单；其余目标资金闸与超收闸由 _creditOrderPaymentWithinTx 复用。
+      const blockedTargetStatuses: OrderStatus[] = [
+        OrderStatus.CANCELLED,
+        OrderStatus.REFUNDED,
+        OrderStatus.PAYMENT_TIMEOUT,
+        OrderStatus.FAILED,
+      ];
+      if (blockedTargetStatuses.includes(targetOrder.status)) {
+        throw new BadRequestError(
+          '不能把收款转移到已取消/已退款/已失效的订单。请先恢复目标订单到可收款状态后再转移。',
+        );
+      }
+      // 先复用统一收款闸挡住草稿/退款申请中等不能接款的目标单；入账内核还会再次校验，
+      // 以防未来调用方绕过这里时改变目标资金口径。
+      assertOrderAcceptsFunds(targetOrder);
+
+      const amount = round2(Number(lockedPayment.amount));
+      if (amount <= 0) throw new BadRequestError('收款金额必须大于 0，不能转移。');
+      const sourcePaidBefore = Number(sourceOrder.paidAmount);
+      const targetPaidBefore = Number(targetOrder.paidAmount);
+      const sourcePaidAfter = round2(sourcePaidBefore - amount);
+      if (sourcePaidAfter < -0.001) {
+        throw new BadRequestError(
+          `订单 ${sourceOrder.orderNumber} 当前已付 ¥${sourcePaidBefore.toFixed(2)}，不足以转移本笔收款 ¥${amount.toFixed(2)}（转移后会变负），已拒绝。`,
+        );
+      }
+
+      const refundedTotal = await sumCompletedRefundsWithinTx(tx, sourceOrder.id);
+      if (refundedTotal > 0 && sourcePaidAfter + 0.001 < refundedTotal) {
+        throw new BadRequestError(
+          `订单 ${sourceOrder.orderNumber} 已完成退款 ¥${refundedTotal.toFixed(2)}，转移本笔收款后已付将降到 ¥${Math.max(0, sourcePaidAfter).toFixed(2)}，低于已退金额（账目倒挂），已拒绝。请先处理退款再转移收款。`,
+        );
+      }
+
+      // 佣金净额口径：正数 REVERSED 是 ACCRUED 翻牌后的死行要剔除；负数 REVERSED 是补偿行要保留。
+      const commissionAgg = await tx.commissionRecord.aggregate({
+        where: {
+          orderId: sourceOrder.id,
+          OR: [
+            { status: { not: CommissionStatus.REVERSED } },
+            { amount: { lt: 0 } },
+          ],
+        },
+        _sum: { amount: true },
+      });
+      const commissionNet = round2(Number(commissionAgg._sum.amount ?? 0));
+      if (commissionNet > 0.001) {
+        throw new BadRequestError(
+          `订单 ${sourceOrder.orderNumber} 已计提代理佣金 ¥${commissionNet.toFixed(2)}（尚未冲销），` +
+            '转移收款会让佣金失去依据。请先按退款流程处理佣金后再转移。',
+        );
+      }
+
+      const sourcePayload =
+        lockedPayment.gatewayPayload &&
+        typeof lockedPayment.gatewayPayload === 'object' &&
+        !Array.isArray(lockedPayment.gatewayPayload)
+          ? (lockedPayment.gatewayPayload as Record<string, unknown>)
+          : {};
+      // 若源收款来自对账认款，同一笔 ReceiptAllocation 也要跟随订单归属移动；否则
+      // 收款对账台仍会把流水显示在旧单，Payment 与 Receipt 账面会分叉。手工收款没有此链接。
+      const reconciliationLike =
+        sourcePayload.source === 'reconciliation' ||
+        typeof sourcePayload.allocationId === 'string' ||
+        (typeof sourcePayload.note === 'string' && sourcePayload.note.startsWith(RECONCILE_NOTE_PREFIX));
+      let receiptAllocation: {
+        id: string;
+        amountCny: Prisma.Decimal;
+        receipt: { receiptNo: string; externalTxnId: string | null };
+      } | null = null;
+      if (reconciliationLike) {
+        const allocationId =
+          typeof sourcePayload.allocationId === 'string' ? sourcePayload.allocationId : null;
+        const receiptNo =
+          typeof sourcePayload.receiptNo === 'string'
+            ? sourcePayload.receiptNo
+            : typeof sourcePayload.note === 'string' && sourcePayload.note.startsWith(RECONCILE_NOTE_PREFIX)
+              ? sourcePayload.note.slice(RECONCILE_NOTE_PREFIX.length).trim()
+              : null;
+        let linked: {
+          id: string;
+          orderId: string;
+          amountCny: Prisma.Decimal;
+          receipt: { receiptNo: string; externalTxnId: string | null };
+        } | null = allocationId
+          ? await tx.receiptAllocation.findUnique({
+              where: { id: allocationId },
+              include: { receipt: { select: { receiptNo: true, externalTxnId: true } } },
+            })
+          : null;
+        if (!allocationId && receiptNo) {
+          const candidates = await tx.receiptAllocation.findMany({
+            where: {
+              orderId: sourceOrder.id,
+              amountCny: new Prisma.Decimal(amount),
+              receipt: { receiptNo },
+            },
+            include: { receipt: { select: { receiptNo: true, externalTxnId: true } } },
+          });
+          // 历史数据没有 allocationId 时也必须一一对应；零条或多条都 fail-closed，
+          // 让运营回收款对账台处理，不能靠金额猜中一条。
+          linked = candidates.length === 1 ? candidates[0] : null;
+        }
+        if (
+          !linked ||
+          linked.orderId !== sourceOrder.id ||
+          round2(Number(linked.amountCny)) !== amount
+        ) {
+          throw new BadRequestError(
+            `订单 ${sourceOrder.orderNumber} 的对账认款明细缺失、重复或金额不一致，不能转移收款。请先到收款对账台核对认领记录。`,
+          );
+        }
+        receiptAllocation = linked;
+      }
+
+      const transferredAt = new Date().toISOString();
+      const cas = await tx.payment.updateMany({
+        where: { id: paymentId, status: PaymentStatus.SUCCEEDED },
+        data: {
+          status: PaymentStatus.REFUNDED,
+          gatewayPayload: {
+            ...sourcePayload,
+            transferredOut: true,
+            transferredToOrderId: targetOrder.id,
+            transferredToOrderNumber: targetOrder.orderNumber,
+            transferReason: input.reason,
+            transferredBy: actor.userId,
+            transferredAt,
+          } as Prisma.InputJsonValue,
+        },
+      });
+      if (cas.count !== 1) {
+        throw new ConflictError('该笔收款已被转移或状态已变更，请刷新后重试');
+      }
+
+      await tx.order.update({
+        where: { id: sourceOrder.id },
+        data: { paidAmount: new Prisma.Decimal(Math.max(0, sourcePaidAfter)) },
+      });
+
+      const targetPaymentPayload: Record<string, unknown> = {};
+      for (const field of ['manual', 'note', 'confirmedBy'] as const) {
+        if (Object.prototype.hasOwnProperty.call(sourcePayload, field)) {
+          targetPaymentPayload[field] = sourcePayload[field];
+        }
+      }
+      if (receiptAllocation) {
+        Object.assign(targetPaymentPayload, {
+          source: 'reconciliation',
+          receiptNo: receiptAllocation.receipt.receiptNo,
+          externalTxnId: receiptAllocation.receipt.externalTxnId,
+          allocationId: receiptAllocation.id,
+        });
+      }
+      Object.assign(targetPaymentPayload, {
+        transferredIn: true,
+        transferredFromOrderId: sourceOrder.id,
+        transferredFromOrderNumber: sourceOrder.orderNumber,
+        sourcePaymentId: lockedPayment.id,
+        transferReason: input.reason,
+        transferredBy: actor.userId,
+        transferredAt,
+      });
+      const credited = await this._creditOrderPaymentWithinTx(
+        tx,
+        targetOrder.id,
+        {
+          amount,
+          method: lockedPayment.method,
+          proofUrl: lockedPayment.proofUrl,
+          paidAt: lockedPayment.paidAt,
+          verified: lockedPayment.verifiedAt != null,
+          verifiedAt: lockedPayment.verifiedAt,
+          verifiedById: lockedPayment.verifiedById,
+          gatewayPayload: targetPaymentPayload as Prisma.InputJsonValue,
+          overchargeHint: '请先调整目标单价格再转移。',
+        },
+        actor,
+        pendingFulfillmentTaskIds,
+      );
+
+      if (receiptAllocation) {
+        await tx.receiptAllocation.update({
+          where: { id: receiptAllocation.id },
+          data: { orderId: targetOrder.id },
+        });
+      }
+
+      const sourcePaid = Math.max(0, sourcePaidAfter);
+      const targetPaid = round2(credited.paidAmount);
+      if (toCents(sourcePaidBefore + targetPaidBefore) !== toCents(sourcePaid + targetPaid)) {
+        throw new Error('款项转移金额守恒校验失败，事务已回滚');
+      }
+
+      return {
+        paymentId: payment.id,
+        amount,
+        sourceOrder: {
+          id: sourceOrder.id,
+          orderNumber: sourceOrder.orderNumber,
+          paidAmount: sourcePaid,
+        },
+        targetOrder: {
+          id: targetOrder.id,
+          orderNumber: targetOrder.orderNumber,
+          paidAmount: targetPaid,
+        },
+        newPaymentId: credited.paymentId,
+        sourcePaidBefore,
+        targetPaidBefore,
+        sourceStatus: sourceOrder.status,
+        targetStatus: credited.status,
+      };
+    });
+
+    if (pendingFulfillmentTaskIds.length > 0 && process.env.ENABLE_AUTO_FULFILLMENT === 'true') {
+      const { fulfillmentQueue } = await import('../../queues/queue.js');
+      for (const taskId of pendingFulfillmentTaskIds) {
+        void fulfillmentQueue.add('auto-fulfill', { taskId }, { jobId: taskId, delay: 1000 }).catch((e) => {
+          // eslint-disable-next-line no-console
+          console.error('[payments] failed to enqueue fulfillment task:', e);
+        });
+      }
+    }
+
+    void writeAudit({
+      actor: { userId: actor.userId, role: actor.role },
+      action: 'TRANSFER_PAYMENT_OUT',
+      targetType: 'ORDER',
+      targetId: result.sourceOrder.id,
+      targetLabel: result.sourceOrder.orderNumber,
+      before: { paidAmount: result.sourcePaidBefore },
+      after: {
+        paymentId: result.paymentId,
+        newPaymentId: result.newPaymentId,
+        amount: result.amount,
+        reason: input.reason,
+        sourcePaidAmount: result.sourceOrder.paidAmount,
+        targetOrderId: result.targetOrder.id,
+        targetOrderNumber: result.targetOrder.orderNumber,
+        targetPaidAmount: result.targetOrder.paidAmount,
+        sourceStatus: result.sourceStatus,
+      },
+      severity: 'CRITICAL',
+    }).catch((error: unknown) => {
+      // 审计不放进资金事务；记录失败，避免 CRITICAL 审计 rejection 变成未处理异常。
+      // eslint-disable-next-line no-console
+      console.error('[payments] transfer-out audit failed:', error);
+    });
+    void writeAudit({
+      actor: { userId: actor.userId, role: actor.role },
+      action: 'TRANSFER_PAYMENT_IN',
+      targetType: 'ORDER',
+      targetId: result.targetOrder.id,
+      targetLabel: result.targetOrder.orderNumber,
+      before: { paidAmount: result.targetPaidBefore },
+      after: {
+        paymentId: result.newPaymentId,
+        sourcePaymentId: result.paymentId,
+        amount: result.amount,
+        reason: input.reason,
+        targetPaidAmount: result.targetOrder.paidAmount,
+        sourceOrderId: result.sourceOrder.id,
+        sourceOrderNumber: result.sourceOrder.orderNumber,
+        sourcePaidAmount: result.sourceOrder.paidAmount,
+        targetStatus: result.targetStatus,
+      },
+      severity: 'CRITICAL',
+    }).catch((error: unknown) => {
+      // eslint-disable-next-line no-console
+      console.error('[payments] transfer-in audit failed:', error);
+    });
+
+    return {
+      paymentId: result.paymentId,
+      sourceOrder: result.sourceOrder,
+      targetOrder: result.targetOrder,
+      newPaymentId: result.newPaymentId,
+      amount: result.amount,
+    };
+  }
+
+  /**
    * 财务核实一笔人工录入的收款（到账双状态的第二段）。
    *
    * 人工确认收款（含批量到账）只是「业务已收」——运营/客服凭客户水单录的账；财务在银行/收单
@@ -1144,10 +1555,13 @@ export class PaymentsService {
         throw new ConflictError('不能核实自己录入的到账，请由财务或其他同事核实。');
       }
       const verifiedAt = new Date();
-      await tx.payment.update({
-        where: { id: paymentId },
+      const cas = await tx.payment.updateMany({
+        where: { id: paymentId, status: PaymentStatus.SUCCEEDED, verifiedAt: null },
         data: { verifiedAt, verifiedById: actor.userId },
       });
+      if (cas.count !== 1) {
+        throw new ConflictError('该笔收款状态已变更或已经核实，请刷新列表。');
+      }
       return { paymentId, orderNumber: payment.order.orderNumber, amount: Number(payment.amount), verifiedAt };
     });
 
@@ -1267,6 +1681,13 @@ export class PaymentsService {
       // 不靠金额猜。调用方（receipts.allocate）先建 ReceiptAllocation 再入账，故恒可拿到 id；
       // 历史数据无此键，撤销侧按 receiptNo + 金额兜底匹配。
       reconciliation?: { receiptNo: string; externalTxnId?: string | null; allocationId?: string };
+      // 转移通道沿用原收款的到账时间、核实信息和结构化转移留痕；普通调用方不传时走原有默认值。
+      paidAt?: Date | null;
+      verifiedAt?: Date | null;
+      verifiedById?: string | null;
+      gatewayPayload?: Prisma.InputJsonValue;
+      // 目标单超收时仍沿用既有拒绝口径，但允许调用方补充具体下一步指引。
+      overchargeHint?: string;
       /**
        * 财务核实标记（到账双状态）：true = 创建即已核实（对账认款——财务亲手认的；或结转来源
        * 全部已核实），false = 待财务核实（占位单结转款里含未核实的运营水单登记）。
@@ -1322,7 +1743,8 @@ export class PaymentsService {
       throw new BadRequestError(
         `订单 ${order.orderNumber} 应收 ¥${round2(effectivePayable).toFixed(2)}、已收净额 ` +
           `¥${round2(already - refundedTotal).toFixed(2)}，本笔 ¥${round2(amount).toFixed(2)} 会超出应收。` +
-          `最多只能认领 ¥${creditable.toFixed(2)}，超出部分请留在挂账池另行处置。`,
+          `最多只能认领 ¥${creditable.toFixed(2)}，超出部分请留在挂账池另行处置。` +
+          (input.overchargeHint ? ` ${input.overchargeHint}` : ''),
       );
     }
 
@@ -1335,11 +1757,19 @@ export class PaymentsService {
         method: input.method,
         amount: new Prisma.Decimal(amount),
         status: PaymentStatus.SUCCEEDED,
-        paidAt: new Date(),
-        verifiedAt: input.verified ? new Date() : null,
-        verifiedById: input.verified ? actor.userId : null,
+        paidAt: input.paidAt === undefined ? new Date() : input.paidAt,
+        verifiedAt: input.verified
+          ? input.verifiedAt === undefined
+            ? new Date()
+            : input.verifiedAt
+          : null,
+        verifiedById: input.verified
+          ? input.verifiedById === undefined
+            ? actor.userId
+            : input.verifiedById
+          : null,
         proofUrl: input.proofUrl ?? null,
-        gatewayPayload: {
+        gatewayPayload: input.gatewayPayload ?? ({
           manual: true,
           note: input.note ?? null,
           confirmedBy: actor.userId,
@@ -1356,7 +1786,7 @@ export class PaymentsService {
                   : {}),
               }
             : {}),
-        } as Prisma.InputJsonValue,
+        } as Prisma.InputJsonValue),
       },
     });
     await tx.order.update({
@@ -1374,13 +1804,15 @@ export class PaymentsService {
       );
     }
 
+    const statusAfter =
+      fullyPaid && order.status === OrderStatus.PENDING_PAYMENT ? OrderStatus.PAID : order.status;
     return {
       paymentId: payment.id,
       paidAmount: newPaid,
       total,
       fullyPaid,
       orderNumber: order.orderNumber,
-      status: fullyPaid ? OrderStatus.PAID : order.status,
+      status: statusAfter,
     };
   }
 

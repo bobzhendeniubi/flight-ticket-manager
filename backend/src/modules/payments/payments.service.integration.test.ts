@@ -14,7 +14,7 @@
  *   2. npm run test:integration
  */
 import { describe, it, expect } from 'vitest';
-import { OrderStatus, PaymentMethod, Prisma, ReceiptSource, ReceiptStatus, UserRole, PaymentStatus } from '@prisma/client';
+import { HoldOwnerType, OrderStatus, PaymentMethod, Prisma, ReceiptSource, ReceiptStatus, UserRole, PaymentStatus } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { PaymentsService } from './payments.service.js';
 
@@ -915,5 +915,226 @@ describe('PaymentsService · 收款复核锁守卫（只拦人工录入）', () 
     expect(res.status).toBe(OrderStatus.PAID);
     const dbOrder = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
     expect(Number(dbOrder.paidAmount)).toBe(1000);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 收款转移 · 真 DB 集成测试：资金、对账认领和不可绕过的特殊账本守卫
+// ══════════════════════════════════════════════════════════════════════════
+describe('PaymentsService.transferManualPayment · 真 DB 守卫与对账联动', () => {
+  const service = new PaymentsService();
+
+  function uniq(prefix: string): string {
+    return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
+  }
+
+  async function createSucceededPayment(
+    orderId: string,
+    amount: number,
+    opts: {
+      method?: PaymentMethod;
+      gatewayPayload?: Record<string, unknown>;
+    } = {},
+  ) {
+    return prisma.payment.create({
+      data: {
+        orderId,
+        method: opts.method ?? PaymentMethod.BANK_CARD,
+        amount: new Prisma.Decimal(amount),
+        status: PaymentStatus.SUCCEEDED,
+        paidAt: new Date('2026-08-30T09:00:00.000Z'),
+        verifiedAt: new Date('2026-08-30T09:05:00.000Z'),
+        verifiedById: 'finance-test',
+        gatewayPayload: opts.gatewayPayload as Prisma.InputJsonValue | undefined,
+      },
+    });
+  }
+
+  it('成功转移且 ReceiptAllocation 跟随目标订单，双侧金额守恒', async () => {
+    const ADMIN = await createAdminActor();
+    const sourceCustomer = await createCustomer();
+    const targetCustomer = await createCustomer();
+    const source = await createPendingOrder(sourceCustomer.id, 1000);
+    const target = await createPendingOrder(targetCustomer.id, 1000);
+    await prisma.order.update({ where: { id: source.id }, data: { paidAmount: new Prisma.Decimal(300) } });
+
+    const receiptNo = uniq('RCP-TRANSFER');
+    const receipt = await prisma.receipt.create({
+      data: {
+        receiptNo,
+        amountCny: new Prisma.Decimal(300),
+        allocatedCny: new Prisma.Decimal(300),
+        method: PaymentMethod.BANK_CARD,
+        receivedAt: new Date('2026-08-30T08:00:00.000Z'),
+        source: ReceiptSource.STAFF_ENTRY,
+        status: ReceiptStatus.ALLOCATED,
+        createdById: ADMIN.userId,
+      },
+    });
+    const allocation = await prisma.receiptAllocation.create({
+      data: {
+        receiptId: receipt.id,
+        orderId: source.id,
+        amountCny: new Prisma.Decimal(300),
+        createdById: ADMIN.userId,
+      },
+    });
+    const payment = await createSucceededPayment(source.id, 300, {
+      gatewayPayload: {
+        manual: true,
+        note: `对账认领 ${receiptNo}`,
+        source: 'reconciliation',
+        receiptNo,
+        allocationId: allocation.id,
+      },
+    });
+
+    const result = await service.transferManualPayment(
+      payment.id,
+      { targetOrderNumber: target.orderNumber, reason: '换人后对账认款归属调整' },
+      ADMIN,
+    );
+
+    expect(result.sourceOrder.paidAmount).toBe(0);
+    expect(result.targetOrder.paidAmount).toBe(300);
+    expect(result.amount).toBe(300);
+    const [sourceAfter, targetAfter, sourcePaymentAfter, targetPayments, allocationAfter] = await Promise.all([
+      prisma.order.findUniqueOrThrow({ where: { id: source.id } }),
+      prisma.order.findUniqueOrThrow({ where: { id: target.id } }),
+      prisma.payment.findUniqueOrThrow({ where: { id: payment.id } }),
+      prisma.payment.findMany({ where: { orderId: target.id } }),
+      prisma.receiptAllocation.findUniqueOrThrow({ where: { id: allocation.id } }),
+    ]);
+    expect(Number(sourceAfter.paidAmount) + Number(targetAfter.paidAmount)).toBe(300);
+    expect(sourcePaymentAfter.status).toBe(PaymentStatus.REFUNDED);
+    expect((sourcePaymentAfter.gatewayPayload as Record<string, unknown>).transferredToOrderNumber).toBe(target.orderNumber);
+    expect(targetPayments).toHaveLength(1);
+    expect((targetPayments[0].gatewayPayload as Record<string, unknown>).transferredFromOrderNumber).toBe(source.orderNumber);
+    expect((targetPayments[0].gatewayPayload as Record<string, unknown>).allocationId).toBe(allocation.id);
+    expect(allocationAfter.orderId).toBe(target.id);
+  });
+
+  it('AGENT_PREPAYMENT 收款拒绝转移', async () => {
+    const ADMIN = await createAdminActor();
+    const sourceCustomer = await createCustomer();
+    const targetCustomer = await createCustomer();
+    const source = await createPendingOrder(sourceCustomer.id, 1000);
+    const target = await createPendingOrder(targetCustomer.id, 1000);
+    await prisma.order.update({ where: { id: source.id }, data: { paidAmount: new Prisma.Decimal(300) } });
+    const payment = await createSucceededPayment(source.id, 300, { method: PaymentMethod.AGENT_PREPAYMENT });
+
+    await expect(
+      service.transferManualPayment(
+        payment.id,
+        { targetOrderNumber: target.orderNumber, reason: '预存款误转保护' },
+        ADMIN,
+      ),
+    ).rejects.toThrow(/代理预存款有独立资金账本.*预存款流程/);
+    expect((await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } })).status).toBe(PaymentStatus.SUCCEEDED);
+    expect(Number((await prisma.order.findUniqueOrThrow({ where: { id: source.id } })).paidAmount)).toBe(300);
+    expect(await prisma.payment.count({ where: { orderId: target.id } })).toBe(0);
+  });
+
+  it('占位单结转款拒绝转移', async () => {
+    const ADMIN = await createAdminActor();
+    const sourceCustomer = await createCustomer();
+    const targetCustomer = await createCustomer();
+    const source = await createPendingOrder(sourceCustomer.id, 1000);
+    const target = await createPendingOrder(targetCustomer.id, 1000);
+    await prisma.order.update({ where: { id: source.id }, data: { paidAmount: new Prisma.Decimal(300) } });
+
+    const flight = await prisma.flight.create({
+      data: { flightNumber: uniq('HOLD-FLT'), originCode: 'MFM', destinationCode: 'DAD' },
+    });
+    const schedule = await prisma.flightSchedule.create({
+      data: {
+        flightId: flight.id,
+        departureTime: new Date(Date.now() + 7 * 24 * 3600 * 1000),
+        arrivalTime: new Date(Date.now() + 7 * 24 * 3600 * 1000 + 90 * 60 * 1000),
+        departureTz: 'Asia/Macau',
+        arrivalTz: 'Asia/Ho_Chi_Minh',
+      },
+    });
+    const seatClass = await prisma.flightSeatClass.create({
+      data: {
+        scheduleId: schedule.id,
+        cabin: 'ECONOMY',
+        capacity: 20,
+        basePrice: new Prisma.Decimal(300),
+      },
+    });
+    const holdOrder = await prisma.holdOrder.create({
+      data: {
+        holdNo: uniq('HOLD'),
+        flightScheduleId: schedule.id,
+        seatClassId: seatClass.id,
+        ownerType: HoldOwnerType.CUSTOMER,
+        seats: 1,
+        perSeatPriceCny: 300,
+        createdById: ADMIN.userId,
+      },
+    });
+    const payment = await createSucceededPayment(source.id, 300);
+    await prisma.holdConversionRecord.create({
+      data: {
+        holdOrderId: holdOrder.id,
+        orderId: source.id,
+        seats: 1,
+        carryCny: 300,
+        paymentId: payment.id,
+        requestToken: uniq('CONVERSION'),
+        createdById: ADMIN.userId,
+      },
+    });
+
+    await expect(
+      service.transferManualPayment(
+        payment.id,
+        { targetOrderNumber: target.orderNumber, reason: '占位结转误转保护' },
+        ADMIN,
+      ),
+    ).rejects.toThrow(/占位单 .* 的结转款.*不能直接转移/);
+    expect((await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } })).status).toBe(PaymentStatus.SUCCEEDED);
+    expect(await prisma.payment.count({ where: { orderId: target.id } })).toBe(0);
+  });
+
+  it('历史认款匹配到多条 Allocation 时拒绝，不猜选任一明细', async () => {
+    const ADMIN = await createAdminActor();
+    const sourceCustomer = await createCustomer();
+    const targetCustomer = await createCustomer();
+    const source = await createPendingOrder(sourceCustomer.id, 1000);
+    const target = await createPendingOrder(targetCustomer.id, 1000);
+    await prisma.order.update({ where: { id: source.id }, data: { paidAmount: new Prisma.Decimal(300) } });
+    const receipt = await prisma.receipt.create({
+      data: {
+        receiptNo: uniq('RCP-MULTI'),
+        amountCny: new Prisma.Decimal(600),
+        allocatedCny: new Prisma.Decimal(600),
+        method: PaymentMethod.BANK_CARD,
+        receivedAt: new Date('2026-08-30T08:00:00.000Z'),
+        source: ReceiptSource.STAFF_ENTRY,
+        status: ReceiptStatus.ALLOCATED,
+        createdById: ADMIN.userId,
+      },
+    });
+    await prisma.receiptAllocation.createMany({
+      data: [
+        { receiptId: receipt.id, orderId: source.id, amountCny: new Prisma.Decimal(300), createdById: ADMIN.userId },
+        { receiptId: receipt.id, orderId: source.id, amountCny: new Prisma.Decimal(300), createdById: ADMIN.userId },
+      ],
+    });
+    const payment = await createSucceededPayment(source.id, 300, {
+      gatewayPayload: { source: 'reconciliation', receiptNo: receipt.receiptNo },
+    });
+
+    await expect(
+      service.transferManualPayment(
+        payment.id,
+        { targetOrderNumber: target.orderNumber, reason: '多条认款明细保护' },
+        ADMIN,
+      ),
+    ).rejects.toThrow(/缺失、重复或金额不一致.*收款对账台/);
+    expect((await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } })).status).toBe(PaymentStatus.SUCCEEDED);
+    expect(await prisma.payment.count({ where: { orderId: target.id } })).toBe(0);
   });
 });

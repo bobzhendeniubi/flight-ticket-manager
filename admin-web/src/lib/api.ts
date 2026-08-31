@@ -1891,6 +1891,10 @@ export interface OrderPayment {
   // 到账双状态：财务核过流水才 verified=true（人工录入的到账在核实前为 false，出票前提示用）。
   verified?: boolean;
   verifiedAt?: string | null;
+  transferredOut?: boolean;
+  transferredIn?: boolean;
+  transferredToOrderNumber?: string | null;
+  transferredFromOrderNumber?: string | null;
 }
 
 // ── Audit / Customers / Travelers / Fulfillment ──────────────────────────
@@ -3190,6 +3194,15 @@ export interface ReverseManualPaymentResult {
   warning: string | null;
 }
 
+/** POST /payments/:paymentId/transfer 返回（把已成功收款转到另一订单） */
+export interface TransferPaymentResult {
+  paymentId: string;
+  sourceOrder: { id: string; orderNumber: string; paidAmount: number };
+  targetOrder: { id: string; orderNumber: string; paidAmount: number };
+  newPaymentId: string;
+  amount: number;
+}
+
 /**
  * 一笔手工到账被「超收自动拆分」后的明细。
  * 超收不再被硬闸拦下：应收部分照常核销进本单，超出部分自动落一笔挂账池进账（RCP…），
@@ -3958,6 +3971,18 @@ export const api = {
       method: 'POST',
       token,
       body: { reason },
+    }),
+
+  // 将一笔已成功收款整笔转到另一订单（仅 ADMIN/STAFF）。
+  transferPayment: (
+    paymentId: string,
+    body: { targetOrderNumber: string; reason: string },
+    token: string,
+  ) =>
+    apiFetch<TransferPaymentResult>(`/payments/${paymentId}/transfer`, {
+      method: 'POST',
+      token,
+      body,
     }),
 
   // 批量到账（选多笔订单 → 逐单录入到账金额 + 共享水单）ADMIN/STAFF。

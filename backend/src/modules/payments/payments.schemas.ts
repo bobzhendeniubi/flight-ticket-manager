@@ -29,3 +29,9 @@ export const sandboxConfirmBodySchema = z.object({
   // 可选标记失败，用来测 FAILED 分支
   shouldFail: z.boolean().default(false),
 });
+
+/** 已入账收款转移到另一张订单：目标订单号 + 可追溯原因。 */
+export const transferManualPaymentBodySchema = z.object({
+  targetOrderNumber: z.string().trim().min(1).max(100),
+  reason: z.string().trim().min(4).max(200),
+});

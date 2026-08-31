@@ -3,6 +3,7 @@
  *   POST /payments                         创建支付（登录用户）
  *   POST /payments/webhook/:provider        支付网关回调（公共，靠签名验证）
  *   POST /payments/:id/sandbox-confirm      仅 sandbox 模式下用于测试回调
+ *   POST /payments/:paymentId/transfer      ADMIN/STAFF 转移已成功收款
  *   GET  /payments/:id                      查询支付状态（登录用户）
  */
 import type { FastifyPluginAsync } from 'fastify';
@@ -18,6 +19,7 @@ import {
   cnyAmountSchema,
   createPaymentBodySchema,
   sandboxConfirmBodySchema,
+  transferManualPaymentBodySchema,
 } from './payments.schemas.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { appPublicUrl } from '../../config/env.js';
@@ -124,6 +126,21 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     return service.reverseManualPayment(
       paymentId,
       { reason: body.reason },
+      { userId: req.user.sub, role: req.user.role },
+    );
+  });
+
+  // ── 已成功收款转移到另一订单 ADMIN/STAFF ──
+  // POST /payments/:paymentId/transfer
+  app.post('/:paymentId/transfer', { preHandler: [app.authenticate] }, async (req, reply) => {
+    if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可转移收款' });
+    }
+    const { paymentId } = req.params as { paymentId: string };
+    const body = transferManualPaymentBodySchema.parse(req.body);
+    return service.transferManualPayment(
+      paymentId,
+      { targetOrderNumber: body.targetOrderNumber, reason: body.reason },
       { userId: req.user.sub, role: req.user.role },
     );
   });
