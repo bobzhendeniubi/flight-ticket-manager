@@ -19,7 +19,7 @@ const { mockPrisma, mockTx, writeAuditMock } = vi.hoisted(() => {
     },
     holdConversionRecord: { findFirst: vi.fn() },
     refund: { aggregate: vi.fn() },
-    commissionRecord: { aggregate: vi.fn() },
+    commissionRecord: { aggregate: vi.fn(), groupBy: vi.fn() },
     $queryRaw: vi.fn(),
   };
   return {
@@ -142,6 +142,13 @@ function configure({
   mockTx.commissionRecord.aggregate.mockResolvedValue({
     _sum: { amount: commissionAmount === 0 ? null : new Prisma.Decimal(commissionAmount) },
   });
+  // 佣金闸走 lib/commission-net 的按代理分组净额：0 = 无存活佣金（空分组），
+  // 非 0 = 单代理一组正净额。
+  mockTx.commissionRecord.groupBy.mockResolvedValue(
+    commissionAmount === 0
+      ? []
+      : [{ agentId: 'agent-1', _sum: { amount: new Prisma.Decimal(commissionAmount) } }],
+  );
   mockTx.payment.updateMany.mockResolvedValue({ count: casCount });
   mockTx.payment.create.mockResolvedValue({ id: 'payment-target' });
   mockTx.order.update.mockResolvedValue({});
@@ -356,7 +363,8 @@ describe('PaymentsService.transferManualPayment · 收款整笔转移', () => {
     await expect(
       service.transferManualPayment('payment-source', { targetOrderNumber: 'ORD-TGT', reason: '佣金翻牌后转移' }, ACTOR),
     ).resolves.toMatchObject({ newPaymentId: 'payment-target' });
-    expect(mockTx.commissionRecord.aggregate).toHaveBeenCalledWith({
+    expect(mockTx.commissionRecord.groupBy).toHaveBeenCalledWith({
+      by: ['agentId'],
       where: {
         orderId: 'order-source',
         OR: [
