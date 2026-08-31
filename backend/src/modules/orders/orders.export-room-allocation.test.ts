@@ -547,6 +547,111 @@ describe('buildRoomAllocationSheets 多 item 订单（回归：曾经 item×乘�
   });
 });
 
+/**
+ * 归属版 fixture：同订单两行分住两家店，房组带 orderItemId 归属（split-room-group /
+ * 新版分房保存写入）。gY 的 hotelName 故意留成「旧酒店名」——模拟文本没跟上（手误/历史数据），
+ * 归属在时展示与余量都必须以行上 FK 为准，不看文本。
+ */
+function attributedTwoHotelFixture(overrides?: { gYOrderItemId?: string }): RoomItemForExport[] {
+  const order = {
+    notes: null,
+    roomAssignment: {
+      roomGroups: [
+        {
+          id: 'gX',
+          hotelName: '酒店X',
+          roomType: '大床房',
+          passengerIds: ['p1'],
+          orderItemId: 'item-x',
+        },
+        {
+          id: 'gY',
+          hotelName: '旧酒店名',
+          roomType: '双床房',
+          passengerIds: ['p2'],
+          orderItemId: overrides?.gYOrderItemId ?? 'item-y',
+        },
+      ],
+    },
+    agent: null,
+    items: [{ kind: 'HOTEL', flightSchedule: null }],
+    passengers: ['p1', 'p2'].map((id, i) => ({
+      id,
+      fullName: `客${id}`,
+      lastName: null,
+      firstName: null,
+      gender: null,
+      dateOfBirth: D('1990-01-01'),
+      documentNumber: `A${i}`,
+      passportExpiry: null,
+      bedPref: null,
+    })),
+  };
+  const itemX = {
+    id: 'item-x',
+    orderId: 'ord-attr',
+    hotelCheckIn: D('2026-09-01'),
+    hotelRoomType: {
+      hotelId: 'hx',
+      name: '大床房',
+      bedType: '大床',
+      capacity: 2,
+      hotel: { name: '酒店X' },
+    },
+    order,
+  };
+  const itemY = {
+    id: 'item-y',
+    orderId: 'ord-attr',
+    hotelCheckIn: D('2026-09-02'),
+    hotelRoomType: {
+      hotelId: 'hy',
+      name: '双床房',
+      bedType: '双床',
+      capacity: 2,
+      hotel: { name: '酒店Y' },
+    },
+    order,
+  };
+  return [itemX, itemY] as unknown as RoomItemForExport[];
+}
+
+describe('buildRoomAllocationSheets 房组 orderItemId 归属（跨店订单精确对行）', () => {
+  const remainingLookup = new Map<string, string>([
+    ['hx|2026-09-01', '3'],
+    ['hy|2026-09-02', '5'],
+  ]);
+
+  it('带归属的组精确对到该行：酒店名/入住日/余量都以行上 FK 为准，分房组旧文本不串账', () => {
+    const sheets = buildRoomAllocationSheets(attributedTwoHotelFixture(), remainingLookup);
+
+    // p1 归属 item-x（9-1 入住）、p2 归属 item-y（9-2 入住）→ 各归各的 sheet
+    expect(sheets.map((s) => s.name)).toEqual(['9-1', '9-2']);
+    const rowX = sheets[0].rows[0];
+    const rowY = sheets[1].rows[0];
+    expect(rowX.hotelType).toBe('酒店X · 大床房');
+    // 归属命中：酒店名以行上 FK（酒店Y）为准，不用分房组的旧文本「旧酒店名」
+    expect(rowY.hotelType).toBe('酒店Y · 双床房');
+    // 归属命中 → 归属可信，当日余房照常取数（旧口径会因文本 ≠ FK 标「—」）
+    expect(rowX.dailyRemaining).toBe('3');
+    expect(rowY.dailyRemaining).toBe('5');
+  });
+
+  it('orderItemId 指向不存在的行（异常数据）→ 回退文本匹配兜底，不丢行、余量不瞎标', () => {
+    const sheets = buildRoomAllocationSheets(
+      attributedTwoHotelFixture({ gYOrderItemId: 'item-deleted' }),
+      remainingLookup,
+    );
+    // p2 的组 id 失配、hotelName「旧酒店名」也匹配不到 → 兜底第一条 item（9-1），只出 1 个 sheet
+    const allRows = sheets.flatMap((s) => s.rows);
+    expect(allRows).toHaveLength(2);
+    const p2Row = allRows.find((r) => r.chineseName === '客p2');
+    expect(p2Row).toBeDefined();
+    // 兜底归属不可信：当日余房标「—」（绝不拿兜底行的酒店余量冒充）
+    expect(p2Row!.dailyRemaining).toBe('—');
+  });
+});
+
 /** 单乘客极简 item（专测「中文名称」列取值优先级：chineseName → fullName 含中文 → 留空）。*/
 function chineseNameItem(passenger: { fullName: string; chineseName?: string | null }): RoomItemForExport {
   return {

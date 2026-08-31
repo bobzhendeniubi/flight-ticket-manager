@@ -50,7 +50,11 @@ import { NumberInput } from './NumberInput';
 import { Icon } from './Icon';
 import { PassengerSuggestInput } from './PassengerSuggestInput';
 import { ProofImageViewer } from './ProofImageViewer';
-import { RoomingEditor, type RoomingPassenger } from './RoomingEditor';
+import {
+  RoomingEditor,
+  roomingHotelItemsFromOrder,
+  type RoomingPassenger,
+} from './RoomingEditor';
 import { SearchSelect, type SearchSelectOption } from './SearchSelect';
 import { useDialogA11y } from './Modal';
 import {
@@ -1577,6 +1581,12 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     };
   }, [createdOrder]);
 
+  // 可归属酒店行清单（房组归属订单行）：单条自动归属、多条出下拉，见 RoomingEditor JSDoc。
+  const roomingHotelItems = useMemo(
+    () => roomingHotelItemsFromOrder(createdOrder?.items ?? []),
+    [createdOrder],
+  );
+
   // 房量档位（只回档位不回原始数字，与六档余位同纪律）；null = 未配置/查询失败 → 不展示。
   const [hotelTier, setHotelTier] = useState<HotelAvailabilityTier | null>(null);
   useEffect(() => {
@@ -1689,6 +1699,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   passengers={roomingPassengers}
                   initial={createdOrder?.roomAssignment?.roomGroups}
                   hotelName={roomingHotel?.hotelName}
+                  hotelItems={roomingHotelItems}
                   hotelTier={hotelTier}
                   hotelRoomTypeId={roomingHotel?.hotelRoomTypeId}
                   checkIn={roomingHotel?.checkIn}

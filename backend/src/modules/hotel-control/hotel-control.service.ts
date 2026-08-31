@@ -682,6 +682,32 @@ export function assignedPhysicalRooms(roomAssignment: unknown): number | null {
   return withPassengers > 0 ? withPassengers : null;
 }
 
+/**
+ * 某条占房行在「本行所在酒店」的分房间数（占房下钻明细行用，归属过滤尺与
+ * expandAssignedPhysicalByDate 完全同一把）：分房表存在**任一**带 orderItemId 归属的房组时，
+ * 本行间数 = 归属本行的组 + 无归属但 hotelName 匹配本行所在酒店的组（都只数有乘客的盒子）；
+ * 一单房组分住两家店时，每家下钻只看到自己组的数，可为 0（组都在别的行/别的酒店）。
+ * 整单房组都无归属（旧数据）/ 无有效分房表 → 返回 null，调用方回退整单口径
+ * （assignedPhysicalRooms → itemRoomCount，现行为不变）。
+ */
+export function assignedRoomsForItem(
+  roomAssignment: unknown,
+  itemId: string,
+  hotelName: string | null,
+): number | null {
+  const groups = parseRoomGroups(roomAssignment);
+  if (!groups) return null;
+  if (!groups.some((g) => groupOrderItemId(g) != null)) return null;
+  const own = groups.filter((g) => groupHasPassengers(g) && groupOrderItemId(g) === itemId).length;
+  const byName =
+    hotelName == null
+      ? 0
+      : groups.filter(
+          (g) => groupHasPassengers(g) && groupOrderItemId(g) == null && g.hotelName === hotelName,
+        ).length;
+  return own + byName;
+}
+
 /** 占房行（物理口径拆分用）：订单级分房表 + 拼房性别 fallback 所需字段。*/
 export interface PhysicalOccupancyItem {
   /** 行 id（可选）：房组归属过滤的坐标系。调用方不带 id 时归属过滤自动退化为整单口径。*/
@@ -2008,9 +2034,10 @@ export interface HotelOccupantDto {
    */
   passengerNames: string[];
   /**
-   * 该占房行的间数。有权威分房表（Order.roomAssignment.roomGroups）的订单按
-   * 「有乘客的房间盒子数」展示（物理间数，覆盖被塌缩的 roomsBilled）；
-   * 否则与销控板「用房」同口径（见 itemRoomCount）。
+   * 该占房行的间数。分房表房组带 orderItemId 归属时按归属过滤（本行只计归属本行的组 +
+   * 无归属但酒店名匹配本行酒店的组——一单两店时每家只显示自己组的数，可为 0）；
+   * 整单无归属的旧数据按「有乘客的房间盒子数」整单展示（物理间数，覆盖被塌缩的
+   * roomsBilled）；无有效分房表回落销控板「用房」口径（见 itemRoomCount）。
    */
   rooms: number;
   checkIn: string; // YYYY-MM-DD（该行入住日）
@@ -2041,10 +2068,13 @@ export async function getOccupyingOrders(
     },
     orderBy: { hotelCheckIn: 'asc' },
     select: {
+      // id + 酒店名：房组归属过滤（assignedRoomsForItem）的坐标系
+      id: true,
       roomsBilled: true,
       metadata: true,
       hotelCheckIn: true,
       hotelCheckOut: true,
+      hotelRoomType: { select: { hotel: { select: { name: true } } } },
       order: {
         select: {
           id: true,
@@ -2070,7 +2100,16 @@ export async function getOccupyingOrders(
       passengerNames: it.order.passengers
         .filter((p) => p.documentNumber !== 'N/A')
         .map((p) => p.chineseName?.trim() || p.fullName),
-      rooms: assignedPhysicalRooms(it.order.roomAssignment) ?? itemRoomCount(it),
+      // 归属口径优先（一单两店时本行只显示自己组的数，与合计口径同一把尺）；
+      // 整单无归属（旧数据）回退整单盒子数，再回退行级 roomsBilled/metadata。
+      rooms:
+        assignedRoomsForItem(
+          it.order.roomAssignment,
+          it.id,
+          it.hotelRoomType?.hotel?.name ?? null,
+        ) ??
+        assignedPhysicalRooms(it.order.roomAssignment) ??
+        itemRoomCount(it),
       checkIn: fmtDateOnly(it.hotelCheckIn!),
       checkOut: fmtDateOnly(it.hotelCheckOut!),
       agentName: it.order.agent?.companyName ?? '直客',

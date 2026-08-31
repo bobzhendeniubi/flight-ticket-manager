@@ -1430,6 +1430,11 @@ export interface RoomGroup {
   notes?: string;
   /** 占房间数：整间=1（缺省），拼房半间=0.5。例：7人3.5间。 */
   roomFraction?: number;
+  /**
+   * 房组归属的订单行 id（本单 HOTEL/BUNDLE 行；服务端校验）。带归属时房控/导出按该行
+   * 计酒店与间数，「拆房组 → 按组换酒店」也靠它。缺省 = 旧口径（整单计数）。
+   */
+  orderItemId?: string;
 }
 
 export interface RoomAssignment {
@@ -4187,6 +4192,8 @@ export const api = {
       feeCny?: number;
       feeLabel?: string;
       note?: string;
+      /** 星级不匹配放行原因（BUNDLE 行换入酒店星级 ≠ 套餐结算档次时必填，审计留痕） */
+      designatedHotelStarMismatchReason?: string;
     },
   ) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/items/${itemId}/hotel`, {
@@ -4194,6 +4201,20 @@ export const api = {
       token,
       body,
     }),
+
+  // 按房组拆分酒店行（ADMIN/STAFF）：把分房表里的一个房组从某条 HOTEL 行拆成独立 0 元行
+  // （「按房组换酒店」的前置步骤——拆完对新行走现成换酒店）。钱不动：新行 0 元、源行金额冻结，
+  // 订单总额恒等；库存对称：源行/新行 roomsBilled 此消彼长，Σ 恒等。BUNDLE 行后端会拒（400）。
+  splitRoomGroup: (
+    token: string,
+    orderId: string,
+    itemId: string,
+    body: { roomGroupId: string; note?: string },
+  ) =>
+    apiFetch<{ order: OrderSummary; newItemId: string }>(
+      `/orders/${orderId}/items/${itemId}/split-room-group`,
+      { method: 'POST', token, body },
+    ),
 
   // 酒店改期：把某条 HOTEL 行的入住/退房日期整体挪到新区间（占房随之从旧区间转到新区间，
   // 新区间余量不足会被拒绝）。行价冻结：晚数变化不会自动改价，差额请填 feeCny

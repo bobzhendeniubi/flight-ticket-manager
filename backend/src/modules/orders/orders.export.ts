@@ -19,6 +19,7 @@ import {
   correlateItem,
   describeRoomItem,
   formatRoomNo,
+  isAttributedTo,
   parseRoomGroups,
   type RoomNumberEntry,
 } from './orders.export-room-allocation.js';
@@ -228,16 +229,20 @@ function computeRoomColumns(
     for (const p of order.passengers) {
       const group = roomGroups.find((g) => g.passengerIds.includes(p.id));
       const it = correlateItem(group, occupancy);
+      // 归属精确命中（房组 orderItemId == 该行，口径同分房表导出）：酒店名/余量以该行 FK 为准
+      const attributed = isAttributedTo(group, it);
       // 已落位 = FK 酒店/房型；未落位（星级随机档）= 「X星随机（待落位）」，容量回落 2 人/间
       const placement = describeRoomItem(it);
       const checkInStr = fmtDate(it.hotelCheckIn);
       const fkHotelName = placement.hotelName;
-      const hotelName = group?.hotelName || fkHotelName;
+      const hotelName =
+        attributed && !placement.pending ? fkHotelName : group?.hotelName || fkHotelName;
       const capacity = placement.capacity && placement.capacity > 0 ? placement.capacity : 2;
 
       // 三态口径同分房表：人工分房酒店名与 FK 关联酒店不一致 → 归属不确定，"—"；
+      // 归属精确命中时归属本就确定，人工文本过期与否不影响可信，照常取数。
       // 未落位随机档没有具体酒店（hotelId 为 null）→ 同样 "—"：还没定店，谈不上哪家的余量。
-      const hotelNameTrusted = !group?.hotelName || group.hotelName === fkHotelName;
+      const hotelNameTrusted = attributed || !group?.hotelName || group.hotelName === fkHotelName;
       const dailyRemaining =
         hotelNameTrusted && placement.hotelId
           ? remainingLookup.get(`${placement.hotelId}|${checkInStr}`) ?? '—'

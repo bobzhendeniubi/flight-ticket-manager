@@ -921,6 +921,82 @@ describe('getOccupyingOrders', () => {
     expect(occupants).toHaveLength(2);
     expect(occupants.map((o) => o.rooms)).toEqual([1, 2]);
   });
+
+  it('房组带归属：一单两店时每家明细只显示自己组的数（不再每行都记整单房组总数）', async () => {
+    const order = {
+      id: 'o5',
+      orderNumber: 'ST-0005',
+      status: 'PAID',
+      contactName: '赵六',
+      agent: null,
+      roomAssignment: {
+        roomGroups: [
+          { id: 'g1', hotelName: '酒店A', roomType: '标间', passengerIds: ['p1'], orderItemId: 'item-a' },
+          { id: 'g2', hotelName: '酒店B', roomType: '标间', passengerIds: ['p2'], orderItemId: 'item-b' },
+        ],
+      },
+      passengers: [
+        { documentNumber: 'E1', chineseName: null, fullName: 'ZHAO/LIU' },
+        { documentNumber: 'E2', chineseName: null, fullName: 'QIAN/QI' },
+      ],
+    };
+    // 酒店A 的下钻：只有 item-a 这行被选中（scopeItemWhere 按 hotelId 过滤）
+    const client = occupantsClient([
+      {
+        id: 'item-a',
+        roomsBilled: 2, // 分房保存前的旧塌缩值——归属口径必须压过它
+        metadata: null,
+        hotelCheckIn: day(0),
+        hotelCheckOut: day(1),
+        hotelRoomType: { hotel: { name: '酒店A' } },
+        order,
+      },
+    ]);
+    const occupants = await getOccupyingOrders('h1', dayStr(0), client);
+    // 旧口径 assignedPhysicalRooms 会显示整单 2 组；归属过滤后只显示归属本行的 1 组
+    expect(occupants[0]!.rooms).toBe(1);
+  });
+
+  it('房组部分归属：本行 = 归属本行的组 + 无归属但酒店名匹配本行的组；组都在别行 → 0', async () => {
+    const order = {
+      id: 'o6',
+      orderNumber: 'ST-0006',
+      status: 'PAID',
+      contactName: '孙七',
+      agent: null,
+      roomAssignment: {
+        roomGroups: [
+          { id: 'g1', hotelName: '酒店A', roomType: '标间', passengerIds: ['p1'], orderItemId: 'item-a' },
+          { id: 'g2', hotelName: '酒店A', roomType: '标间', passengerIds: ['p2'] }, // 无归属，按名匹配 A
+          { id: 'g3', hotelName: '酒店A', roomType: '标间', passengerIds: [] }, // 空盒子不计
+        ],
+      },
+      passengers: [{ documentNumber: 'E1', chineseName: null, fullName: 'SUN/QI' }],
+    };
+    const rowA = {
+      id: 'item-a',
+      roomsBilled: 1,
+      metadata: null,
+      hotelCheckIn: day(0),
+      hotelCheckOut: day(1),
+      hotelRoomType: { hotel: { name: '酒店A' } },
+      order,
+    };
+    const rowB = {
+      id: 'item-b',
+      roomsBilled: 1,
+      metadata: null,
+      hotelCheckIn: day(0),
+      hotelCheckOut: day(1),
+      hotelRoomType: { hotel: { name: '酒店B' } },
+      order,
+    };
+    const atA = await getOccupyingOrders('h1', dayStr(0), occupantsClient([rowA]));
+    expect(atA[0]!.rooms).toBe(2); // 归属 1 + 按名匹配 1
+    // B 店行：组都归属在 A 行 / 名字也不匹配 → 0（真实占房就是 0，不能显示整单数）
+    const atB = await getOccupyingOrders('h2', dayStr(0), occupantsClient([rowB]));
+    expect(atB[0]!.rooms).toBe(0);
+  });
 });
 
 describe('getNightlyRemainingForRoomType', () => {

@@ -19,7 +19,11 @@ import { RefundSplitCard } from '../components/RefundSplitCard';
 import { readRefundSplit, refundApprovalUnknownWarning, refundApprovalWarning } from '../lib/refundSplit';
 import { OrderAuditTrail } from '../components/OrderAuditTrail';
 import { SingleOrderModal } from '../components/SingleOrderModal';
-import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEditor';
+import {
+  RoomingEditor,
+  roomingHotelItemsFromOrder,
+  type RoomingPassenger,
+} from '../components/RoomingEditor';
 import { HotelSwapModal } from '../components/HotelSwapModal';
 import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
 import { ProofImageViewer } from '../components/ProofImageViewer';
@@ -4419,6 +4423,11 @@ function OrderDrawer({
                           canChangeBundle={isOps}
                           canOperate={isOps}
                           settlementLocked={o.settlementLocked === true}
+                          roomGroups={o.roomAssignment?.roomGroups}
+                          passengers={(o.passengers ?? []).map((p) => ({
+                            id: p.id,
+                            name: p.chineseName?.trim() || p.fullName,
+                          }))}
                         />
                       ))}
                     </ul>
@@ -4437,6 +4446,11 @@ function OrderDrawer({
                     canChangeBundle={isOps}
                     canOperate={isOps}
                     settlementLocked={o.settlementLocked === true}
+                    roomGroups={o.roomAssignment?.roomGroups}
+                    passengers={(o.passengers ?? []).map((p) => ({
+                      id: p.id,
+                      name: p.chineseName?.trim() || p.fullName,
+                    }))}
                   />
                 ))}
               </ul>
@@ -4640,6 +4654,7 @@ function OrderDrawer({
               passengers={toRoomingPassengers(o)}
               initial={o.roomAssignment?.roomGroups}
               hotelName={hotelName ?? undefined}
+              hotelItems={roomingHotelItemsFromOrder(o.items ?? [])}
               onSave={saveRooming}
               onClose={() => setRoomingOpen(false)}
             />
@@ -5166,7 +5181,12 @@ function RoomSupplementForm({
         idempotencyKey,
         ...(passengerId ? { passengerId } : {}),
       });
-      if (res.roomControl) alert(res.roomControl); // 房控联动结果（谁转单住、计费房数变化）
+      // 房控联动结果（谁转单住、计费房数变化）+ 按组换酒店引导（选了转单住乘客时才相关）
+      const splitGuide = passengerId
+        ? '如该乘客需单独换酒店：先到分房把 TA 单独成组并归属酒店行，再用金额明细该酒店行上的「拆房组」，拆出后对新行换酒店。'
+        : '';
+      const successNotes = [res.roomControl, splitGuide].filter(Boolean);
+      if (successNotes.length > 0) alert(successNotes.join('\n\n'));
       onSaved();
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : '补收失败');
@@ -5962,6 +5982,8 @@ function OrderItemRow({
   canChangeBundle,
   canOperate,
   settlementLocked,
+  roomGroups,
+  passengers,
 }: {
   orderId: string;
   item: OrderItem;
@@ -5970,9 +5992,13 @@ function OrderItemRow({
   canEditSettlementPrice?: boolean;
   /** 套餐改档：后端 POST /orders/:id/change-bundle 仅 ADMIN/STAFF，代理不给入口 */
   canChangeBundle?: boolean;
-  /** 售后行级操作（改期/升舱/换酒店/酒店改期）：后端全部仅 ADMIN/STAFF，非运营不渲染按钮（点了必 403） */
+  /** 售后行级操作（改期/升舱/换酒店/酒店改期/拆房组）：后端全部仅 ADMIN/STAFF，非运营不渲染按钮（点了必 403） */
   canOperate?: boolean;
   settlementLocked?: boolean;
+  /** 本单分房表房组（「拆房组」入口用；未分房不传） */
+  roomGroups?: RoomGroup[];
+  /** 本单出行人（拆房组弹窗展示组内乘客名用） */
+  passengers?: Array<{ id: string; name: string }>;
 }) {
   const [rescheduling, setRescheduling] = useState(false);
   const [editingPrice, setEditingPrice] = useState(false);
@@ -5980,6 +6006,7 @@ function OrderItemRow({
   const [reschedulingHotel, setReschedulingHotel] = useState(false);
   const [upgradingCabin, setUpgradingCabin] = useState(false);
   const [changingBundle, setChangingBundle] = useState(false);
+  const [splittingGroup, setSplittingGroup] = useState(false);
   const isFlight = item.kind === 'FLIGHT';
   // 套餐改档：换绑到另一张套餐（档次/晚数是 Bundle 自身的属性，改档=换 bundleId）。
   const isBundleRow = item.kind === 'BUNDLE' && Boolean(item.bundleId);
@@ -5990,6 +6017,20 @@ function OrderItemRow({
   // 单订酒店行（非套餐）：可改结算价（每间每晚价）与改期（挪住宿区间）。
   // 套餐的住宿日期跟着行程走，不从这里单独挪，故 BUNDLE 行不给这两个入口（后端也会拒）。
   const isPlainHotelRow = item.kind === 'HOTEL';
+  // 拆房组（按房组换酒店的前置步骤）：把一个房组从本 HOTEL 行拆成独立 0 元行。
+  // 仅 HOTEL 行（BUNDLE 行后端 400，不给入口）；须 ≥2 个有乘客的房组、且组间数 < 行计费房数
+  // （等于全额 = 无需拆，直接换酒店）。可拆的组 = 归属本行的 + 无归属的（归属别行的不动）。
+  const roomsBilledNum = item.roomsBilled != null ? Number(item.roomsBilled) : null;
+  const groupsWithPax = (roomGroups ?? []).filter((g) => (g.passengerIds?.length ?? 0) > 0);
+  const splittableGroups =
+    isPlainHotelRow && roomsBilledNum != null && roomsBilledNum > 0 && groupsWithPax.length >= 2
+      ? groupsWithPax.filter(
+          (g) =>
+            (!g.orderItemId || g.orderItemId === item.id) &&
+            (g.roomFraction ?? 1) < roomsBilledNum,
+        )
+      : [];
+  const canSplitRoomGroup = Boolean(canOperate) && splittableGroups.length > 0;
   const canRescheduleHotel =
     isPlainHotelRow && Boolean(item.hotelCheckIn) && Boolean(item.hotelCheckOut);
   // 改结算价：机票行改每张票价，单订酒店行改每间每晚价（后端按各自口径重算行金额）。
@@ -6097,6 +6138,15 @@ function OrderItemRow({
               换酒店
             </button>
           )}
+          {canSplitRoomGroup && (
+            <button
+              className="text-[11px] font-medium text-indigo-600 hover:text-indigo-800"
+              onClick={() => setSplittingGroup(true)}
+              title="把一个房组从本行拆成独立 0 元行（钱不动、库存对称）；拆完可对新行单独换酒店"
+            >
+              拆房组
+            </button>
+          )}
           {canOperate && canRescheduleHotel && !reschedulingHotel && !editingPrice && (
             <button
               className="text-[11px] font-medium text-brand hover:text-brand-dark"
@@ -6197,7 +6247,136 @@ function OrderItemRow({
           }}
         />
       )}
+      {canSplitRoomGroup && splittingGroup && (
+        <SplitRoomGroupModal
+          orderId={orderId}
+          itemId={item.id}
+          itemLabel={item.description}
+          groups={splittableGroups}
+          passengers={passengers ?? []}
+          onClose={() => setSplittingGroup(false)}
+          onDone={(updated) => {
+            setSplittingGroup(false);
+            onOrderUpdated?.(updated);
+          }}
+        />
+      )}
     </li>
+  );
+}
+
+// ── 拆房组：把分房表的一个房组从某条 HOTEL 行拆成独立 0 元行（ADMIN/STAFF）──────
+// 「按房组换酒店」的前置步骤：钱不动（新行 0 元、源行金额冻结，总额恒等）、库存对称
+// （源行/新行 roomsBilled 此消彼长）。拆完对新行用行上现成的「换酒店」即可，只挪这一组人。
+function SplitRoomGroupModal({
+  orderId,
+  itemId,
+  itemLabel,
+  groups,
+  passengers,
+  onClose,
+  onDone,
+}: {
+  orderId: string;
+  itemId: string;
+  /** 源行描述，摆在弹窗顶部让运营确认拆的是哪一行 */
+  itemLabel: string;
+  /** 可拆的房组（归属本行或无归属、间数小于行计费房数），由调用方筛好 */
+  groups: RoomGroup[];
+  passengers: Array<{ id: string; name: string }>;
+  onClose: () => void;
+  onDone: (order: OrderSummary) => void;
+}) {
+  const token = useAuth((s) => s.tokens)?.accessToken ?? '';
+  const dialogRef = useDialogA11y(onClose);
+  const [selectedId, setSelectedId] = useState<string | null>(
+    groups.length === 1 ? groups[0].id : null,
+  );
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const nameById = new Map(passengers.map((p) => [p.id, p.name]));
+
+  const submit = async () => {
+    if (!token || !selectedId || submitting) return;
+    setErr(null);
+    setSubmitting(true);
+    try {
+      const res = await api.splitRoomGroup(token, orderId, itemId, { roomGroupId: selectedId });
+      onDone(res.order);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '拆分失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div
+      ref={dialogRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label="拆房组"
+      tabIndex={-1}
+      className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/50 p-4"
+      onClick={onClose}
+    >
+      <div
+        className="max-h-[90vh] w-full max-w-md space-y-3 overflow-auto rounded-2xl bg-white p-5 text-sm shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="text-base font-semibold text-ink">拆房组</div>
+        <p className="text-xs text-ink-muted">
+          源行：{itemLabel}
+        </p>
+        <p className="text-xs text-ink-muted">
+          选一个房组拆成独立 0 元行：<b>钱不动</b>（应收留在源行，订单总额不变）、
+          <b>库存对称</b>（间数从源行挪到新行）。拆完可在金额明细对新行单独「换酒店」。
+        </p>
+        <div className="space-y-2">
+          {groups.map((g) => {
+            const names = g.passengerIds.map((id) => nameById.get(id) ?? '?').join('、');
+            const rooms = g.roomFraction === 0.5 ? '半间(拼房)' : `${g.roomFraction ?? 1} 间`;
+            return (
+              <label
+                key={g.id}
+                className={`flex cursor-pointer items-start gap-2 rounded-lg border p-2.5 transition ${
+                  selectedId === g.id
+                    ? 'border-brand bg-brand-50'
+                    : 'border-slate-200 bg-white hover:border-brand/40'
+                }`}
+              >
+                <input
+                  type="radio"
+                  name="split-room-group"
+                  className="mt-0.5"
+                  checked={selectedId === g.id}
+                  onChange={() => setSelectedId(g.id)}
+                />
+                <span>
+                  <span className="font-medium text-ink">{names || '（无名单）'}</span>
+                  <span className="ml-2 text-xs text-ink-muted">{rooms}</span>
+                  {g.roomType && <span className="ml-2 text-xs text-ink-muted">{g.roomType}</span>}
+                </span>
+              </label>
+            );
+          })}
+        </div>
+        {err && <div className="rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-700">{err}</div>}
+        <div className="flex justify-end gap-2 border-t border-slate-200 pt-3">
+          <button type="button" className="btn-ghost text-sm" onClick={onClose} disabled={submitting}>
+            取消
+          </button>
+          <button
+            type="button"
+            className="btn-primary text-sm disabled:opacity-50"
+            onClick={submit}
+            disabled={submitting || !selectedId}
+          >
+            {submitting ? '拆分中…' : '确认拆分'}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 

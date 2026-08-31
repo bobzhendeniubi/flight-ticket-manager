@@ -12,8 +12,9 @@
  * （同订单多条占房 item 时旧实现会做 item × 乘客笛卡尔积，产生重复行 + 张冠李戴的房型/酒店组合，
  * 已修复，回归覆盖见 orders.export-room-allocation.test.ts）。
  * hotelCheckIn 落在 [from, to] 即归入当日 sheet（同订单多条 item 入住日不同则分归不同 sheet）。
- * 酒店归属优先 order.roomAssignment.roomGroups 的 hotelName（人工分房结果），
- * 否则回落到 correlate 到的 item 上 hotelRoomType.hotel.name。
+ * 酒店归属：房组带 orderItemId（split-room-group / 新版分房保存写入）时按 id 精确对行，
+ * 酒店名/区间/余量以该行 FK 为准；无归属回退旧口径 —— 优先 roomGroups 的 hotelName
+ * （人工分房结果），否则回落到 correlate 到的 item 上 hotelRoomType.hotel.name。
  *
  * 列序对齐旧系统（0713 房控反馈）：旧系统 16 列原序 + 当前系统特有 3 列（房间号/升级原因/
  * 当日余房）追加在末尾，见 COLUMNS。「飞行次数」列取常旅客档案快照（口径与全岗总表 /
@@ -119,6 +120,11 @@ export interface RoomGroup {
   notes?: string;
   /** 该组占房间数：0.5 = 半间/拼房（与他人合住一间），1 = 整间。缺省视为整间。*/
   roomFraction?: number;
+  /**
+   * 房组归属的订单行 id（split-room-group / 新版分房保存写入）。带归属时该组的酒店/房型/
+   * 区间/余量以归属行为准（correlateItem 按 id 精确对行）；缺省 = 旧数据，走文本匹配兜底。
+   */
+  orderItemId?: string;
 }
 
 function fmtDate(d: Date | null | undefined): string {
@@ -359,6 +365,8 @@ function isAllocatable(it: RoomItemForExport): it is AllocatableItem {
  * correlateItem 所需的最小形状（导出供整班机订单导出复用同一套乘客 ↔ 占房 item 关联口径）。
  */
 export interface CorrelatableRoomItem {
+  /** 订单行 id（可选）：房组带 orderItemId 归属时按它精确对行；调用方不带 id 则归属匹配不命中，走文本兜底。*/
+  id?: string;
   /** 未落位的星级随机行没有 FK 房型 —— 允许为空，此时按酒店名/房型匹配一律不命中，走兜底。*/
   hotelRoomType: { name: string; bedType: string | null; hotel: { name: string } } | null;
 }
@@ -367,6 +375,9 @@ export interface CorrelatableRoomItem {
  * 把一位乘客 correlate 到「他实际占用的那条占房 item」——同订单可能有多条占房 item
  * （如两种房型 / 跨酒店），不能对每条 item 都遍历全部乘客（会产生重复行 + 张冠李戴，
  * 见本文件顶部 JSDoc 的回归说明）。
+ *   - 房组带 orderItemId 归属（split-room-group / 新版分房保存写入）：按 id 精确对行——
+ *     数据模型上百分百的「这组人就是这一行的客人」，跨酒店/同酒店多行都不串；
+ *     id 在本单占房 item 里找不到（行已被删等异常数据）→ 落回下面的文本匹配兜底。
  *   - 单条 item 的订单：无歧义，直接用它（兼容未分房乘客的老口径——单房型订单里
  *     谁都在这一间/这一批房源里，不需要 roomGroup 也能归属）。
  *   - 多条 item 的订单：优先用 roomGroup.hotelName（+ roomType 更精确）匹配到对应 item；
@@ -378,6 +389,10 @@ export function correlateItem<T extends CorrelatableRoomItem>(
   group: RoomGroup | undefined,
   orderItems: readonly T[],
 ): T {
+  if (group?.orderItemId) {
+    const byId = orderItems.find((it) => it.id === group.orderItemId);
+    if (byId) return byId;
+  }
   if (orderItems.length === 1) return orderItems[0];
   if (group) {
     const exact = orderItems.find(
@@ -392,6 +407,18 @@ export function correlateItem<T extends CorrelatableRoomItem>(
     if (byHotelOnly) return byHotelOnly;
   }
   return orderItems[0];
+}
+
+/**
+ * correlateItem 是否按 orderItemId 归属**精确**命中了该 item。命中 = 该行就是这组人的行，
+ * 展示（酒店名）与余量归属（dailyRemaining）以行上 FK 为准，分房组的 hotelName 文本
+ * （可能是换酒店前的旧名/手误）不再参与「归属可信」判定。分房表导出与整班机导出共用。
+ */
+export function isAttributedTo(
+  group: RoomGroup | undefined,
+  item: CorrelatableRoomItem,
+): boolean {
+  return !!group?.orderItemId && group.orderItemId === item.id;
 }
 
 /**
@@ -451,11 +478,15 @@ export function buildRoomAllocationSheets(
     for (const p of order.passengers) {
       const group = roomGroups.find((g) => g.passengerIds.includes(p.id));
       const it = correlateItem(group, orderItems);
+      // 归属精确命中（房组 orderItemId == 该行）：酒店名/区间/余量以该行为准——
+      // 分房组的 hotelName 文本可能是换酒店前的旧名，不再压过行上 FK。
+      const attributed = isAttributedTo(group, it);
       // 已落位 = FK 酒店/房型；未落位（星级随机档）= 「X星随机（待落位）」+ 房型「待落位」
       const placement = describeRoomItem(it);
       const checkInStr = fmtDate(it.hotelCheckIn);
       const fkHotelName = placement.hotelName;
-      const hotelName = group?.hotelName || fkHotelName;
+      const hotelName =
+        attributed && !placement.pending ? fkHotelName : group?.hotelName || fkHotelName;
       // 未落位行仍按分房组酒店名归组（房控已人工排房时以房控为准），只有回落到随机档名时才算待落位
       const pendingPlacement = placement.pending && !group?.hotelName;
       // 房型容量（未分房乘客打包用）；fixture/缺数据/未落位随机档回落 2 人/间
@@ -476,8 +507,9 @@ export function buildRoomAllocationSheets(
 
       // 当日余房：分房组人工填的酒店名与 correlate 到的 item FK 关联酒店不一致时，
       // 无法确定该按哪家酒店的余量算——绝不瞎标，直接 "—"（见文件顶部 JSDoc 归属优先级说明）。
+      // 归属精确命中（orderItemId）时归属本就确定，人工文本过期与否不影响可信，照常取数。
       // 未落位随机档没有具体酒店（hotelId 为 null）→ 同样 "—"：还没定店，谈不上哪家的余量。
-      const hotelNameTrusted = !group?.hotelName || group.hotelName === fkHotelName;
+      const hotelNameTrusted = attributed || !group?.hotelName || group.hotelName === fkHotelName;
       const dailyRemaining =
         hotelNameTrusted && placement.hotelId
           ? (remainingLookup.get(`${placement.hotelId}|${checkInStr}`) ?? '—')

@@ -21,10 +21,28 @@ export interface RoomingPassenger {
   gender?: string | null;
 }
 
+/** 本单可归属的酒店行（HOTEL / 已盖章酒店的 BUNDLE 行），供房组选「归属酒店行」。 */
+export interface RoomingHotelItemOption {
+  /** 订单行 id（写入房组 orderItemId，服务端校验须属本单） */
+  id: string;
+  /** 展示名：酒店 · 房型 · 入住~退房 */
+  label: string;
+  /** 该行酒店中文名（保存时作为归属组的 hotelName） */
+  hotelName: string;
+}
+
 interface RoomingEditorProps {
   passengers: RoomingPassenger[];
   initial?: RoomGroup[];
   hotelName?: string;
+  /**
+   * 本单酒店行清单（可选，由调用方传入）：传了才启用「房组归属订单行」。
+   *   - 恰好 1 条：保存时所有房组自动归属它（无需选择）；
+   *   - ≥2 条：每组出一个归属下拉，默认留空 = 不归属（旧口径合并记首行），选了归属
+   *     才支持行上的「拆房组 → 按组换酒店」；
+   *   - 不传（旧调用方）：行为与现状一致，已有归属原样保留透传，不清不改。
+   */
+  hotelItems?: RoomingHotelItemOption[];
   /** 该酒店在住宿区间的房量档位（只显档位不显数字，与六档余位同纪律）；null = 不展示。 */
   hotelTier?: HotelAvailabilityTier | null;
   /** 当日余房徽标上下文（可选，仅用于展示/tooltip，不参与保存）。 */
@@ -116,6 +134,8 @@ interface RoomBox {
   passengerIds: string[];
   notes: string;
   roomFraction: number;
+  /** 归属的订单行 id；null = 不归属（旧口径）。seed 时保留既有归属不丢。 */
+  orderItemId: string | null;
 }
 
 const FULL_ROOM = 1;
@@ -152,7 +172,7 @@ function genderBadge(gender?: string | null): string | null {
 /** 把 initial RoomGroup[] 转编辑期盒子；缺省给一个空盒子。 */
 function seedBoxes(initial: RoomGroup[] | undefined): RoomBox[] {
   if (!initial || initial.length === 0) {
-    return [{ id: newId(), roomType: '', passengerIds: [], notes: '', roomFraction: FULL_ROOM }];
+    return [emptyBox()];
   }
   return initial.map((g) => ({
     id: g.id || newId(),
@@ -160,7 +180,52 @@ function seedBoxes(initial: RoomGroup[] | undefined): RoomBox[] {
     passengerIds: Array.isArray(g.passengerIds) ? [...g.passengerIds] : [],
     notes: g.notes ?? '',
     roomFraction: g.roomFraction === HALF_ROOM ? HALF_ROOM : FULL_ROOM,
+    // 既有归属（split-room-group / 上次保存写入）保留——重存分房不能把归属静默清掉
+    orderItemId: g.orderItemId ?? null,
   }));
+}
+
+function emptyBox(): RoomBox {
+  return {
+    id: newId(),
+    roomType: '',
+    passengerIds: [],
+    notes: '',
+    roomFraction: FULL_ROOM,
+    orderItemId: null,
+  };
+}
+
+/**
+ * 从订单行派生「可归属酒店行清单」（调用方传给 hotelItems）：HOTEL 行 + 已盖章酒店房型的
+ * BUNDLE 行（服务端归属校验就认这两类）。展示名 = 酒店 · 房型 · 入住~退房；酒店名优先
+ * 联查落的 item.hotelName，回退 description 首段（「酒店名 · 房型 · …」拼串）。
+ */
+export function roomingHotelItemsFromOrder(
+  items: ReadonlyArray<{
+    id: string;
+    kind?: string;
+    description: string;
+    hotelName?: string | null;
+    roomTypeName?: string | null;
+    hotelRoomTypeId?: string | null;
+    hotelCheckIn?: string | null;
+    hotelCheckOut?: string | null;
+  }>,
+): RoomingHotelItemOption[] {
+  return items
+    .filter((it) => it.kind === 'HOTEL' || (it.kind === 'BUNDLE' && it.hotelRoomTypeId))
+    .map((it) => {
+      const itemHotelName = it.hotelName?.trim() || it.description.split(' · ')[0]?.trim() || '';
+      const range =
+        it.hotelCheckIn && it.hotelCheckOut
+          ? `${dateOnly(it.hotelCheckIn)}~${dateOnly(it.hotelCheckOut)}`
+          : '';
+      const label = [itemHotelName || '酒店行', it.roomTypeName?.trim(), range]
+        .filter((s): s is string => !!s)
+        .join(' · ');
+      return { id: it.id, label, hotelName: itemHotelName };
+    });
 }
 
 // ── 组件 ─────────────────────────────────────────────────────────────────
@@ -168,6 +233,7 @@ export function RoomingEditor({
   passengers,
   initial,
   hotelName,
+  hotelItems,
   hotelTier,
   checkIn,
   checkOut,
@@ -233,8 +299,17 @@ export function RoomingEditor({
   }
 
   // ── 房间盒子增删 / 半间 / 房型 / 备注 ──────────────────────────────────
+  // 归属酒店行：≥2 条时每组出下拉；恰好 1 条保存时自动归属；未传清单 = 旧行为（原样透传既有归属）。
+  const hotelItemById = useMemo(() => {
+    const m = new Map<string, RoomingHotelItemOption>();
+    for (const h of hotelItems ?? []) m.set(h.id, h);
+    return m;
+  }, [hotelItems]);
+  const soleHotelItem = hotelItems && hotelItems.length === 1 ? hotelItems[0] : null;
+  const showItemSelect = (hotelItems?.length ?? 0) > 1;
+
   function addBox(): void {
-    setBoxes((prev) => [...prev, { id: newId(), roomType: '', passengerIds: [], notes: '', roomFraction: FULL_ROOM }]);
+    setBoxes((prev) => [...prev, emptyBox()]);
   }
   function removeBox(boxId: string): void {
     setBoxes((prev) => (prev.length <= 1 ? prev : prev.filter((b) => b.id !== boxId)));
@@ -244,7 +319,10 @@ export function RoomingEditor({
       prev.map((b) => (b.id === boxId ? { ...b, roomFraction: b.roomFraction === HALF_ROOM ? FULL_ROOM : HALF_ROOM } : b)),
     );
   }
-  function patchBox(boxId: string, patch: Partial<Pick<RoomBox, 'roomType' | 'notes'>>): void {
+  function patchBox(
+    boxId: string,
+    patch: Partial<Pick<RoomBox, 'roomType' | 'notes' | 'orderItemId'>>,
+  ): void {
     setBoxes((prev) => prev.map((b) => (b.id === boxId ? { ...b, ...patch } : b)));
   }
 
@@ -252,14 +330,27 @@ export function RoomingEditor({
   async function handleSave(): Promise<void> {
     const groups: RoomGroup[] = boxes
       .filter((b) => b.passengerIds.length > 0)
-      .map((b) => ({
-        id: b.id,
-        hotelName: hotelName ?? '',
-        roomType: b.roomType.trim(),
-        passengerIds: b.passengerIds,
-        ...(b.notes.trim() ? { notes: b.notes.trim() } : {}),
-        ...(b.roomFraction === HALF_ROOM ? { roomFraction: HALF_ROOM } : {}),
-      }));
+      .map((b) => {
+        // 归属解析：传了酒店行清单 → 单条自动归属 / 多条按下拉；下拉里已不存在的旧归属
+        // （行被删等异常）不透传，避免整次保存被服务端校验 400。
+        // 未传清单（旧调用方）→ 保留既有归属原样透传，行为与现状一致。
+        const attributed = hotelItems
+          ? b.orderItemId
+            ? hotelItemById.get(b.orderItemId) ?? null
+            : soleHotelItem
+          : null;
+        const orderItemId = hotelItems ? attributed?.id : b.orderItemId ?? undefined;
+        return {
+          id: b.id,
+          // 归属组的酒店名取归属行的酒店名；无归属沿用旧 prop（单一酒店名）口径
+          hotelName: attributed?.hotelName ?? hotelName ?? '',
+          roomType: b.roomType.trim(),
+          passengerIds: b.passengerIds,
+          ...(b.notes.trim() ? { notes: b.notes.trim() } : {}),
+          ...(b.roomFraction === HALF_ROOM ? { roomFraction: HALF_ROOM } : {}),
+          ...(orderItemId ? { orderItemId } : {}),
+        };
+      });
     setSaving(true);
     setErr(null);
     try {
@@ -321,6 +412,12 @@ export function RoomingEditor({
           <p className="mt-0.5 text-xs text-ink-muted">
             把出行人拖到右侧房间盒子，决定谁和谁一起住。拼房可切「半间」。
           </p>
+          {showItemSelect && (
+            <p className="mt-0.5 text-xs text-amber-700">
+              本单有 {hotelItems!.length} 条酒店行：给房组选「归属酒店行」后，才支持在该行上
+              「拆房组 → 按组换酒店」；不选则按旧口径合并记在首条酒店行。
+            </p>
+          )}
         </div>
         <div className="text-xs text-ink-soft">
           占用 <b className="text-ink">{physicalRooms}</b> 间
@@ -364,11 +461,17 @@ export function RoomingEditor({
               <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
                 <span className="flex flex-wrap items-center gap-2 text-sm font-medium text-ink">
                   房间 {idx + 1}
-                  {hotelName && (
-                    <span className="inline-flex items-center gap-1 text-xs font-normal text-ink-soft">
-                      <Icon name="hotel" /> {hotelName}
-                    </span>
-                  )}
+                  {(() => {
+                    // 已归属的盒子显示归属行的酒店名，其余沿用单一酒店名 prop
+                    const boxHotel =
+                      (b.orderItemId ? hotelItemById.get(b.orderItemId)?.hotelName : undefined) ??
+                      hotelName;
+                    return boxHotel ? (
+                      <span className="inline-flex items-center gap-1 text-xs font-normal text-ink-soft">
+                        <Icon name="hotel" /> {boxHotel}
+                      </span>
+                    ) : null;
+                  })()}
                   <NightlyRemainingBadge data={nightlyRemaining} checkIn={checkIn} checkOut={checkOut} compact />
                   {b.roomFraction === HALF_ROOM && <span className="badge-warning">½ 半间</span>}
                   <span className="text-xs font-normal text-ink-muted">{b.passengerIds.length} 人</span>
@@ -411,6 +514,23 @@ export function RoomingEditor({
                   </div>
                 )}
               </div>
+
+              {/* 归属酒店行（多酒店行时才出；选了才支持按组拆行/换酒店） */}
+              {showItemSelect && (
+                <select
+                  className="input mt-2 w-full py-1.5 text-sm"
+                  value={b.orderItemId ?? ''}
+                  onChange={(e) => patchBox(b.id, { orderItemId: e.target.value || null })}
+                  title="归属后房控/导出按该行计酒店与间数；「拆房组 → 按组换酒店」也需要归属"
+                >
+                  <option value="">不归属（旧口径：合并记在首条酒店行）</option>
+                  {hotelItems!.map((h) => (
+                    <option key={h.id} value={h.id}>
+                      归属：{h.label}
+                    </option>
+                  ))}
+                </select>
+              )}
 
               {/* 房型 + 备注 */}
               <div className="mt-2 grid gap-2 sm:grid-cols-2">
