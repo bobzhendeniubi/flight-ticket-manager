@@ -5083,6 +5083,15 @@ export const api = {
   // 提醒线（超卖加房 / 富余退房 / 班次超开票上限；按需计算，无 cron）
   getHotelAlerts: (token: string, days = 14) =>
     apiFetch<HotelControlAlerts>(`/hotel-control/alerts?days=${days}`, { token }),
+  // 超售容忍上限（运营可调）：销控售罄后内部录单最多允许打到负几间
+  getHotelOversellCap: (token: string) =>
+    apiFetch<{ rooms: number; max: number }>('/hotel-control/oversell-cap', { token }),
+  updateHotelOversellCap: (token: string, rooms: number) =>
+    apiFetch<{ rooms: number; max: number }>('/hotel-control/oversell-cap', {
+      method: 'PUT',
+      token,
+      body: { rooms },
+    }),
 
   // 近期用房变更（读审计流：订单侧改了分房/换酒店/补房差 → 房控可见性；倒序近 N 天，上限 100）
   getHotelRecentChanges: (token: string, days = 7) =>

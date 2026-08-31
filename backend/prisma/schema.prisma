@@ -2119,6 +2119,15 @@ model AiOcrConfig {
   updatedAt   DateTime @updatedAt
 }
 
+// 运营可自调的系统开关（通用键值）。首个键 = 酒店超售容忍上限（房控页可改，
+// 无记录回落 env.HOTEL_MAX_OVERSELL_ROOMS 缺省）；后续同类小开关复用此表，别再开专表。
+model SystemSetting {
+  key         String   @id
+  value       String
+  updatedById String? // 最后修改人 userId
+  updatedAt   DateTime @updatedAt
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 营销中心 · 海报 —— AI 生成的航线宣传图 + 配套文案
 //

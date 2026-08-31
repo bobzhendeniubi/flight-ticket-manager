@@ -44,6 +44,7 @@ import {
   assertHotelPhysicalFit,
   assertHotelPhysicalFitWithinTx,
   lockHotelBlockPeriodsWithinTx,
+  getHotelOversellCapRooms,
   getRandomTierAggregate,
   assertRandomTierFit,
   assertRandomTierFitWithinTx,
@@ -2335,5 +2336,34 @@ describe('listBlockPeriods：已停用标记（不计入余量的存量周期）
       ]),
     );
     expect(p).toMatchObject({ disabled: true, hotelName: '随机三星' });
+  });
+});
+
+// ── 超售容忍上限（运营可调）：DB 配置优先，无/非法回落 env 缺省 ────────────────
+describe('getHotelOversellCapRooms', () => {
+  const withSetting = (value: string | null) =>
+    ({
+      systemSetting: {
+        findUnique: vi.fn().mockResolvedValue(value == null ? null : { value }),
+      },
+    }) as unknown as PrismaClient;
+
+  it('DB 有合法配置 → 用 DB 值（房控页改完即刻生效）', async () => {
+    await expect(getHotelOversellCapRooms(withSetting('5'))).resolves.toBe(5);
+    await expect(getHotelOversellCapRooms(withSetting('0'))).resolves.toBe(0);
+  });
+
+  it('无记录 / 非法值（非整数、负数、超上限）→ 回落 env 缺省 3', async () => {
+    await expect(getHotelOversellCapRooms(withSetting(null))).resolves.toBe(3);
+    await expect(getHotelOversellCapRooms(withSetting('abc'))).resolves.toBe(3);
+    await expect(getHotelOversellCapRooms(withSetting('2.5'))).resolves.toBe(3);
+    await expect(getHotelOversellCapRooms(withSetting('-1'))).resolves.toBe(3);
+    await expect(getHotelOversellCapRooms(withSetting('999'))).resolves.toBe(3);
+  });
+
+  it('client 没有 systemSetting delegate（测试 mock/事务子集）→ 回落 env 缺省不炸', async () => {
+    await expect(
+      getHotelOversellCapRooms({} as unknown as PrismaClient),
+    ).resolves.toBe(3);
   });
 });

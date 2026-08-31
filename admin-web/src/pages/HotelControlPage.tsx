@@ -210,6 +210,9 @@ export function HotelControlPage() {
         </div>
       </section>
 
+      {/* ── 超售容忍上限（运营可调）────────────────────────────── */}
+      <OversellCapSetting token={token} />
+
       {/* ── 提醒线横幅（超卖加房 / 富余退房 / 班次超开票上限）────────── */}
       <RecentChangesPanel token={token} />
 
@@ -1995,5 +1998,100 @@ function BlockPeriodRow({
         {err && <div className="mt-0.5 text-xs text-rose-600">{err}</div>}
       </td>
     </tr>
+  );
+}
+
+/**
+ * 超售容忍上限（运营可调）：销控售罄后内部录单最多允许打到负几间。
+ * 房控/运营在这里自己改，不用找开发；0 = 关掉超售口子；后端有 20 间硬上限防呆。
+ * 改动走 WARNING 审计（谁在什么时候从几改到几）。
+ */
+function OversellCapSetting({ token }: { token: string }) {
+  const [cap, setCap] = useState<number | null>(null);
+  const [max, setMax] = useState(20);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getHotelOversellCap(token)
+      .then((r) => {
+        if (cancelled) return;
+        setCap(r.rooms);
+        setMax(r.max);
+      })
+      .catch(() => {});
+    return () => { cancelled = true; };
+  }, [token]);
+
+  if (cap == null) return null;
+
+  const save = async () => {
+    const rooms = Number(draft);
+    if (!Number.isInteger(rooms) || rooms < 0 || rooms > max) {
+      setError(`请填 0 ~ ${max} 的整数`);
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      const r = await api.updateHotelOversellCap(token, rooms);
+      setCap(r.rooms);
+      setEditing(false);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <section className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-200 bg-surface px-4 py-2.5 text-sm">
+      <span className="text-ink-soft">内部录单超售上限</span>
+      {editing ? (
+        <>
+          <input
+            type="number"
+            min={0}
+            max={max}
+            step={1}
+            className="input w-20 py-1 text-right"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            autoFocus
+          />
+          <span className="text-ink-muted">间</span>
+          <button type="button" className="btn-primary px-3 py-1 text-xs" onClick={save} disabled={saving}>
+            {saving ? '保存中…' : '保存'}
+          </button>
+          <button
+            type="button"
+            className="btn-ghost px-2 py-1 text-xs"
+            onClick={() => { setEditing(false); setError(null); }}
+            disabled={saving}
+          >
+            取消
+          </button>
+          {error && <span className="text-xs text-rose-600">{error}</span>}
+        </>
+      ) : (
+        <>
+          <span className="nums font-semibold text-ink">{cap} 间</span>
+          <button
+            type="button"
+            className="btn-ghost px-2 py-1 text-xs"
+            onClick={() => { setDraft(String(cap)); setEditing(true); }}
+          >
+            修改
+          </button>
+        </>
+      )}
+      <span className="ml-auto text-xs text-ink-muted">
+        销控售罄后录单最多允许打到负这么多间（0 = 没房就不能录）；改动会留审计。
+      </span>
+    </section>
   );
 }

@@ -36,6 +36,39 @@ import type { CreateBlockPeriodBody, UpdateBlockPeriodBody } from './hotel-contr
 // 读模型既可运行在默认 PrismaClient，也可运行在订单状态事务的 TransactionClient 内。
 type HotelControlDbClient = PrismaClient | Prisma.TransactionClient;
 
+// ── 超售容忍上限（运营可调）──────────────────────────────────────────────────
+/** SystemSetting 键：酒店超售容忍上限（间）。房控页可改；无记录回落 env 缺省。*/
+export const HOTEL_OVERSELL_CAP_SETTING_KEY = 'hotelMaxOversellRooms';
+/** 上限的上限：防止把口子改成事实上不设防（要放更大得改 env 或来找开发）。*/
+export const HOTEL_OVERSELL_CAP_MAX = 20;
+
+/**
+ * 当前生效的超售容忍上限：DB 配置（房控页可改）优先，无记录/非法值回落
+ * env.HOTEL_MAX_OVERSELL_ROOMS。录单放行闸与包房下调守卫共用同一读数。
+ * 测试 mock 没有 systemSetting delegate 时同样回落缺省（与规则引擎 delegate 防御同哲学）；
+ * 配置读挂了也回落缺省而不是让下单跟着炸——上限是防呆参数，不是业务前提。
+ */
+export async function getHotelOversellCapRooms(
+  client: HotelControlDbClient = defaultPrisma,
+): Promise<number> {
+  const delegate = (
+    client as unknown as {
+      systemSetting?: {
+        findUnique: (args: { where: { key: string } }) => Promise<{ value: string } | null>;
+      };
+    }
+  ).systemSetting;
+  if (!delegate) return env.HOTEL_MAX_OVERSELL_ROOMS;
+  const row = await delegate
+    .findUnique({ where: { key: HOTEL_OVERSELL_CAP_SETTING_KEY } })
+    .catch(() => null);
+  const parsed = row ? Number(row.value) : NaN;
+  if (!Number.isInteger(parsed) || parsed < 0 || parsed > HOTEL_OVERSELL_CAP_MAX) {
+    return env.HOTEL_MAX_OVERSELL_ROOMS;
+  }
+  return parsed;
+}
+
 /** 房控有效订单：退款申请中的订单已释放占房，不计入销控、分房与名单。*/
 export const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
@@ -411,10 +444,11 @@ export async function updateBlockPeriod(
       client,
     );
     if (violations.length > 0) {
-      if (maxShortfall > env.HOTEL_MAX_OVERSELL_ROOMS) {
+      const oversellCap = await getHotelOversellCapRooms(client);
+      if (maxShortfall > oversellCap) {
         const v = violations[0];
         throw new BadRequestError(
-          `该酒店房量下调后 ${v.date} 起将短缺 ${v.shortfall} 间（已占用 ${v.occupied} 间 > 新包房 ${v.block} 间），超过超卖上限 ${env.HOTEL_MAX_OVERSELL_ROOMS} 间，请先处理相关订单再调整`,
+          `该酒店房量下调后 ${v.date} 起将短缺 ${v.shortfall} 间（已占用 ${v.occupied} 间 > 新包房 ${v.block} 间），超过超卖上限 ${oversellCap} 间，请先处理相关订单再调整`,
         );
       }
       // 未超阈值但确实形成超占（航司/酒店减配的真实场景同款处理）—— 放行但留痕，

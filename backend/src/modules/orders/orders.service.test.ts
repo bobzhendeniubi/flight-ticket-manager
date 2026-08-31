@@ -143,6 +143,8 @@ vi.mock('../../lib/cancellation.js', () => ({
 
 vi.mock('../hotel-control/hotel-control.service.js', () => ({
   getHotelNightlyRemaining: mockGetHotelNightlyRemaining,
+  // 超售容忍上限：这些用例只关心立减/结算护栏，上限给 env 缺省同款常数即可
+  getHotelOversellCapRooms: async () => 3,
 }));
 
 vi.mock('../../queues/queue.js', () => ({

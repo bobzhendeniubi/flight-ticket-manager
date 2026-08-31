@@ -76,6 +76,7 @@ import {
   assertRandomTierFitWithinTx,
   checkHotelPhysicalFit,
   getHotelNightlyRemaining,
+  getHotelOversellCapRooms,
   getRandomTierAggregate,
   lockHotelBlockPeriodsWithinTx,
   randomStarTierLabel,
@@ -1405,7 +1406,7 @@ export class OrderService {
     // 酒店限额内超售豁免：仅内部 ADMIN/STAFF 录单（销控售罄后当天临时加房是常态业务，
     // 缺口 ≤ 上限放行并写 WARNING 审计）；前台散客/代理下单缺省 = 硬闸。
     const hotelOversellCapRooms = isStaffEnteredOrder(requester)
-      ? env.HOTEL_MAX_OVERSELL_ROOMS
+      ? await getHotelOversellCapRooms()
       : undefined;
     const pricedItems = await this.priceAndValidateItems(
       body.items,
@@ -2001,9 +2002,9 @@ export class OrderService {
         action: 'CREATE_ORDER_HOTEL_OVERSOLD',
         targetType: 'ORDER',
         targetId: order.id,
-        targetLabel: `${order.orderNumber} 超售放行（${parts.join('、')}，上限 ${env.HOTEL_MAX_OVERSELL_ROOMS} 间）`,
+        targetLabel: `${order.orderNumber} 超售放行（${parts.join('、')}，上限 ${hotelOversellCapRooms ?? env.HOTEL_MAX_OVERSELL_ROOMS} 间）`,
         after: {
-          maxOversellRooms: env.HOTEL_MAX_OVERSELL_ROOMS,
+          maxOversellRooms: hotelOversellCapRooms ?? env.HOTEL_MAX_OVERSELL_ROOMS,
           hotels: oversoldHotelStays.map((r) => ({
             hotelId: r.hotelId,
             hotelName: hotelNameById.get(r.hotelId) ?? null,
@@ -2078,7 +2079,7 @@ export class OrderService {
       starGate,
       // 内部 ADMIN/STAFF 试算与 createOrder 同口径吃限额内超售豁免（否则录单弹窗试算
       // 先被友好预检拒掉，实下单反而能成）；AGENT 试算仍硬闸。
-      isOperator ? env.HOTEL_MAX_OVERSELL_ROOMS : undefined,
+      isOperator ? await getHotelOversellCapRooms() : undefined,
     );
     // 散客立减与结算价日历是两条独立规则链：先按每个套餐行命中 RETAIL，
     // 即使日历价未维护，quote 的商品总价也必须与 createOrder 保持一致。

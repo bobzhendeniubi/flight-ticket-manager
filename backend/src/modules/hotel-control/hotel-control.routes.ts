@@ -47,13 +47,19 @@ import {
   getAlerts,
   getBoard,
   getForward,
+  getHotelOversellCapRooms,
   getNightlyRemainingForRoomType,
   getOccupyingOrders,
   getRecentRoomChanges,
   listBlockPeriods,
   randomPoolGroupKey,
   updateBlockPeriod,
+  HOTEL_OVERSELL_CAP_MAX,
+  HOTEL_OVERSELL_CAP_SETTING_KEY,
 } from './hotel-control.service.js';
+import { z } from 'zod';
+import { prisma } from '../../db/prisma.js';
+import { AuditSeverity } from '@prisma/client';
 
 export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
   const requireStaff = {
@@ -129,6 +135,45 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
   app.get('/alerts', requireStaff, async (req) => {
     const q = alertsQuerySchema.parse(req.query);
     return getAlerts(q.days);
+  });
+
+  // ── 超售容忍上限（运营可调）：销控售罄后内部录单最多允许打到负几间 ─────────
+  // 房控/运营自己改，不用找开发；改动写 WARNING 审计可追溯。0 = 关掉超售口子。
+  app.get('/oversell-cap', requireStaff, async () => {
+    return { rooms: await getHotelOversellCapRooms(), max: HOTEL_OVERSELL_CAP_MAX };
+  });
+
+  app.put('/oversell-cap', requireStaff, async (req) => {
+    const body = z
+      .object({
+        rooms: z
+          .number()
+          .int('超售上限必须是整数（间）')
+          .min(0, '超售上限不能为负')
+          .max(HOTEL_OVERSELL_CAP_MAX, `超售上限最多 ${HOTEL_OVERSELL_CAP_MAX} 间（再大请联系开发调整）`),
+      })
+      .parse(req.body);
+    const before = await getHotelOversellCapRooms();
+    await prisma.systemSetting.upsert({
+      where: { key: HOTEL_OVERSELL_CAP_SETTING_KEY },
+      create: {
+        key: HOTEL_OVERSELL_CAP_SETTING_KEY,
+        value: String(body.rooms),
+        updatedById: req.user.sub,
+      },
+      update: { value: String(body.rooms), updatedById: req.user.sub },
+    });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'UPDATE_HOTEL_OVERSELL_CAP',
+      targetType: 'PRODUCT',
+      targetId: HOTEL_OVERSELL_CAP_SETTING_KEY,
+      targetLabel: `酒店超售容忍上限 ${before} → ${body.rooms} 间`,
+      before: { rooms: before },
+      after: { rooms: body.rooms },
+      severity: AuditSeverity.WARNING,
+    });
+    return { rooms: body.rooms, max: HOTEL_OVERSELL_CAP_MAX };
   });
 
   // ── 近期用房变更（读审计流；订单侧改了分房/换酒店/补房差 → 房控可见性）────
