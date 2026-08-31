@@ -1426,7 +1426,7 @@ function RoomAllocationExport({ token }: { token: string }) {
           <p className="mt-1 text-xs text-ink-muted">
             {mode === 'depart'
               ? '按出发日：选该日出发的订单，导出其整段入住晚（每入住日一个 sheet）。'
-              : '成都格式 xlsx：每入住日期一个 sheet，按酒店分组（区间最长 14 天）。'}
+              : '成都格式 xlsx：每入住日期一个 sheet，新录的单在最上（区间最长 14 天）。'}
           </p>
           <div className="mt-2 flex gap-3 text-xs">
             <label className="inline-flex items-center gap-1">

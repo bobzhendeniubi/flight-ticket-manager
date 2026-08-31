@@ -1,6 +1,6 @@
 /**
  * 分房表导出（成都格式）— 每个入住日期一个 sheet（名 'M-D'，如 '7-10'），
- * sheet 内按酒店分组（自然按酒店名排序，组间不插空行），一行/乘客。
+ * sheet 内按录入时间倒序（新录的单在最上，对齐旧系统导出；拼房关系看「房间号」列），一行/乘客。
  *
  * 行来源：占房订单行（OrderItem 带 hotelCheckIn，且 hotelRoomTypeId 与 randomStarTier 二者之一
  * 非空，含已盖章酒店明细的 BUNDLE 行）。「星级随机」买了但还没落到具体酒店的行（hotelRoomTypeId
@@ -554,9 +554,15 @@ export function buildRoomAllocationSheets(
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([date, entries]) => {
       assignRoomNumbers(entries);
-      // 按酒店名（zh-CN）→ 房间号排序：同房乘客相邻；再编 per-sheet 序号
+      // 行序 = 录入时间倒序（0830 公测反馈，对齐旧系统导出：新录的单在最上面）。
+      // enteredAt 是 'YYYY-MM-DD HH:mm:ss' 定长格式，字符串比较即时间比较。
+      // 同一订单的乘客 enteredAt 相同 → 自然相邻；并列再按酒店名（zh-CN）→ 房间号兜底定序。
+      // 拼房关系不再靠行相邻表达，看「房间号」列（assignRoomNumbers 的编号口径不变）。
       const sorted = [...entries].sort(
-        (a, b) => a.hotelName.localeCompare(b.hotelName, 'zh-CN') || a.roomOrder - b.roomOrder,
+        (a, b) =>
+          b.row.enteredAt.localeCompare(a.row.enteredAt) ||
+          a.hotelName.localeCompare(b.hotelName, 'zh-CN') ||
+          a.roomOrder - b.roomOrder,
       );
       return {
         name: sheetNameForDate(date),
@@ -874,16 +880,25 @@ export async function buildRoomAllocationWorkbook(
   return buildWorkbookFromItems(items, client);
 }
 
+/** 全表字体/行高（0830 公测反馈）：对齐旧系统导出的 Arial 10 号、行高 25、整表居中。*/
+const SHEET_FONT = { name: 'Arial', size: 10 } as const;
+const SHEET_ROW_HEIGHT = 25;
+
 function addSheet(wb: ExcelJS.Workbook, name: string, rows: RoomAllocationRow[]): void {
   const ws = wb.addWorksheet(name);
   ws.columns = COLUMNS.map((c) => ({ header: c.header, key: c.key, width: c.width }));
 
   const headerRow = ws.getRow(1);
-  headerRow.font = { bold: true };
+  headerRow.font = { ...SHEET_FONT, bold: true };
   headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
-  headerRow.alignment = { vertical: 'middle', horizontal: 'center' };
 
   for (const r of rows) ws.addRow(r);
+  // 逐行盖字体/行高/居中（表头行 font 已带 bold，跳过重盖以免丢加粗）
+  ws.eachRow((row, rowNumber) => {
+    row.height = SHEET_ROW_HEIGHT;
+    if (rowNumber > 1) row.font = { ...SHEET_FONT };
+    row.alignment = { vertical: 'middle', horizontal: 'center' };
+  });
   ws.views = [{ state: 'frozen', ySplit: 1 }];
 }
 

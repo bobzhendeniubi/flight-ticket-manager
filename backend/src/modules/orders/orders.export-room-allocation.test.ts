@@ -3,7 +3,7 @@
  *
  * 只测纯函数 buildRoomAllocationSheets 的映射口径：
  *   - 按入住日期分 sheet，名 'M-D'，日期升序
- *   - roomGroup.hotelName 优先归组；行按酒店名排序、序号 per-sheet 重编
+ *   - roomGroup.hotelName 优先归组；行按录入时间倒序（并列回落酒店名→房号）、序号 per-sheet 重编
  *   - 姓名/生日/性别/有效期/出发日期/房型/备注的格式与回落规则
  * 取数 SQL（COUNTED_STATUSES、入住区间）由集成环境验证，不在此 mock prisma 查询。
  */
@@ -132,18 +132,58 @@ function fixtureItems(): RoomItemForExport[] {
 }
 
 describe('buildRoomAllocationSheets', () => {
-  it('按入住日期分 sheet（名 M-D、升序），酒店名排序后 per-sheet 编号', () => {
+  it('按入住日期分 sheet（名 M-D、升序），同录入时间并列回落酒店名排序、per-sheet 编号', () => {
     const sheets = buildRoomAllocationSheets(fixtureItems());
 
     expect(sheets.map((s) => s.name)).toEqual(['7-10', '7-11']);
     expect(sheets[0].date).toBe('2026-07-10');
 
+    // p1/p2 同订单（录入时间相同）→ 并列回落酒店名排序：
     // p1 分到 A酒店（roomGroup 覆盖行上 B酒店），排在 B酒店的 p2 前面
     const [r1, r2] = sheets[0].rows;
     expect(sheets[0].rows).toHaveLength(2);
     expect([r1.seq, r2.seq]).toEqual([1, 2]);
     expect(r1.hotelType).toBe('A酒店 · 标准双床');
     expect(r2.hotelType).toBe('B酒店 · 标准双床');
+  });
+
+  it('sheet 内行序 = 录入时间倒序（0830 公测反馈：新录的单在最上面，对齐旧系统导出）', () => {
+    // 两单同一入住日：早录的 early 单（07-01）与晚录的 late 单（07-03）——晚录的必须排前面
+    const mk = (orderId: string, createdAt: string, docNo: string): RoomItemForExport =>
+      ({
+        orderId,
+        hotelCheckIn: D('2026-07-10'),
+        hotelRoomType: { name: '标准房', bedType: '双床', hotel: { name: 'Z酒店' } },
+        order: {
+          notes: null,
+          roomAssignment: null,
+          agent: null,
+          total: 1000,
+          createdAt: D2(createdAt),
+          items: [{ kind: 'HOTEL', flightSchedule: null }],
+          passengers: [
+            {
+              id: `${orderId}-p`,
+              fullName: `客${orderId}`,
+              lastName: null,
+              firstName: null,
+              gender: null,
+              dateOfBirth: D('1990-01-01'),
+              documentNumber: docNo,
+              passportExpiry: null,
+              bedPref: null,
+            },
+          ],
+        },
+      }) as unknown as RoomItemForExport;
+
+    const [sheet] = buildRoomAllocationSheets([
+      mk('early', '2026-07-01T02:00:00.000Z', 'E1'),
+      mk('late', '2026-07-03T02:00:00.000Z', 'L1'),
+    ]);
+    expect(sheet.rows.map((r) => r.documentNumber)).toEqual(['L1', 'E1']);
+    // 序号仍按新行序 per-sheet 重编
+    expect(sheet.rows.map((r) => r.seq)).toEqual([1, 2]);
   });
 
   it('字段口径：姓名大写 LAST/FIRST、dd-mm-yyyy、M/F、往返日期、房型与备注回落', () => {
