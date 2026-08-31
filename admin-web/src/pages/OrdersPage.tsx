@@ -226,7 +226,8 @@ function KindBadge({ kind }: { kind: OrderItemKindLabel }) {
 // 需要佣金口径请到结算/报表页看后端算好的数。
 
 // 客户端分页每页条数（票务反馈）：默认 50 —— 开票一次最多 50 张的口径，一页正好一批。
-const PAGE_SIZE_OPTIONS = [20, 30, 40, 50] as const;
+// 上限 200 = 单次拉取上限（ORDERS_FETCH_LIMIT），选 200 即一页看全本次拉到的所有单。
+const PAGE_SIZE_OPTIONS = [20, 30, 40, 50, 100, 200] as const;
 const DEFAULT_PAGE_SIZE = 50;
 
 // 主列表单次拉取上限 —— 后端 listOrdersQuerySchema.pageSize 的硬上限就是 200，本页不翻页。
@@ -3356,7 +3357,7 @@ export function OrdersPage() {
       )}
 
       <section className="card p-0 overflow-hidden">
-        {/* 分页工具条（票务反馈）：每页 20/30/40/50（默认 50 = 一次开票上限口径）+ 上一页/下一页
+        {/* 分页工具条（票务反馈）：每页 20/30/40/50/100/200（默认 50 = 一次开票上限口径）+ 上一页/下一页
             + 「第 x-y 条 / 共 N 条」。数据仍一次拉全（≤200），只是渲染分页。 */}
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 px-4 py-2 text-sm text-ink-soft">
           <div className="flex items-center gap-2">
