@@ -2279,6 +2279,11 @@ export interface ListFulfillmentParams {
    */
   passengerQuery?: string;
   /**
+   * 代理筛选（所属代理公司名 / 联系人名，不区分大小写子串匹配）；省略/空串 = 不筛。
+   * 口径与列表回传的 order.agentName 同源；直客单（无代理）恒不命中。
+   */
+  agentQuery?: string;
+  /**
    * 签证口径筛选（签证台「签证口径」）——前四档逐字对应订单级 Order.visaStatus：
    * NEEDED=需要签证 / E_VISA=电子签 / HAS_VISA=已签证 / NOT_NEEDED=未签证（不需要·自备签），
    * 外加 'UNSET'=未标注（录单从没填过签证状态，库里为空）。省略 = 全部。

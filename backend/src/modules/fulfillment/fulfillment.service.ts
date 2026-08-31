@@ -216,6 +216,28 @@ export function passengerQueryWhere(term: string): Prisma.OrderItemWhereInput {
 }
 
 /**
+ * 「代理搜索」下沉到查询层 —— 按所属代理的公司名 / 联系人名模糊命中。
+ *
+ * 口径与列表回传的 order.agentName 同源（公司名优先、回退联系人名），两处不许分叉：
+ * 签证岗看到哪个代理徽章，就该能照着那几个字搜回来。
+ *
+ * 直客单（agent 为 NULL）恒不命中：关系过滤 `agent: { ... }` 对空关系天然为假 ——
+ * 这是想要的，输入了代理名却把没有代理的单一并捞出来只会更难对。
+ */
+export function agentQueryWhere(term: string): Prisma.OrderItemWhereInput {
+  return {
+    order: {
+      agent: {
+        OR: [
+          { companyName: { contains: term, mode: 'insensitive' } },
+          { contactName: { contains: term, mode: 'insensitive' } },
+        ],
+      },
+    },
+  };
+}
+
+/**
  * 「签证口径」筛选下沉到查询层 —— 直接比订单级 Order.visaStatus，不做任何推断或回退。
  *
  * 这与上面的 issuanceMethodWhere（签发方式，带「产品字段 ?? 录单回退」）是**两根不同的轴**：
@@ -488,6 +510,8 @@ export class FulfillmentService {
     if (query.visaRequirement) orderItemAnd.push(visaRequirementWhere(query.visaRequirement));
     // 客人搜索（乘客姓名 / 中文名 / 护照号）——与备注搜索各管一头，同时给就是 AND
     if (query.passengerQuery) orderItemAnd.push(passengerQueryWhere(query.passengerQuery));
+    // 代理搜索（所属代理公司名 / 联系人名）——与客人/备注搜索各管一头，同时给就是 AND
+    if (query.agentQuery) orderItemAnd.push(agentQueryWhere(query.agentQuery));
     // 出发日期筛选：优先区间 from/to（任一侧可缺），向后兼容旧单日参数 departureDate（= from=to=该日）。
     const depFrom = query.departureDateFrom ?? query.departureDate;
     const depTo = query.departureDateTo ?? query.departureDate;

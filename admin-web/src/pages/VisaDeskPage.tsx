@@ -1198,6 +1198,9 @@ export function VisaDeskPage() {
   // 客人搜索（走后端 passengerQuery：乘客姓名 / 护照号）；防抖与备注搜索一致
   const [passengerQueryInput, setPassengerQueryInput] = useState('');
   const [debouncedPassengerQuery, setDebouncedPassengerQuery] = useState('');
+  // 代理搜索（走后端 agentQuery：代理公司名 / 联系人名）；防抖与另两个搜索框一致
+  const [agentQueryInput, setAgentQueryInput] = useState('');
+  const [debouncedAgentQuery, setDebouncedAgentQuery] = useState('');
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
   const [currentPage, setCurrentPage] = useState(1);
   useEffect(() => {
@@ -1208,6 +1211,10 @@ export function VisaDeskPage() {
     const t = setTimeout(() => setDebouncedPassengerQuery(passengerQueryInput.trim()), 400);
     return () => clearTimeout(t);
   }, [passengerQueryInput]);
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedAgentQuery(agentQueryInput.trim()), 400);
+    return () => clearTimeout(t);
+  }, [agentQueryInput]);
 
   // 当前口径是否属于「任务多已自动取消」的两档 → 状态筛选被顶到「全部状态」并给出说明
   const statusForcedAll = FORCE_ALL_STATUS_REQUIREMENTS.includes(visaRequirementFilter);
@@ -1278,6 +1285,7 @@ export function VisaDeskPage() {
       departureDateTo: departureTo || undefined,
       notesQuery: debouncedNotesQuery || undefined,
       passengerQuery: debouncedPassengerQuery || undefined,
+      agentQuery: debouncedAgentQuery || undefined,
       pageSize: PAGE_SIZE,
     };
     api
@@ -1305,6 +1313,7 @@ export function VisaDeskPage() {
     departureTo,
     debouncedNotesQuery,
     debouncedPassengerQuery,
+    debouncedAgentQuery,
     refreshNonce,
   ]);
 
@@ -1320,6 +1329,8 @@ export function VisaDeskPage() {
     debouncedNotesQuery,
     passengerQueryInput,
     debouncedPassengerQuery,
+    agentQueryInput,
+    debouncedAgentQuery,
     pageSize,
   ]);
 
@@ -1852,6 +1863,36 @@ export function VisaDeskPage() {
             </div>
             <p className="mt-1 max-w-[14rem] text-xs text-ink-muted">
               服务端按乘客姓名 / 护照号模糊匹配；命中的是整张单，同行人会一并带出
+            </p>
+          </div>
+          <div>
+            <label className="label">代理搜索</label>
+            <div className="flex items-center gap-2">
+              <input
+                type="text"
+                className="input max-w-[14rem] py-1.5"
+                value={agentQueryInput}
+                placeholder="代理公司 / 联系人…"
+                onChange={(e) => {
+                  setAgentQueryInput(e.target.value);
+                  clearSelection();
+                }}
+              />
+              {agentQueryInput && (
+                <button
+                  type="button"
+                  className="btn-ghost py-1.5 text-xs"
+                  onClick={() => {
+                    setAgentQueryInput('');
+                    clearSelection();
+                  }}
+                >
+                  清除
+                </button>
+              )}
+            </div>
+            <p className="mt-1 max-w-[14rem] text-xs text-ink-muted">
+              按订单行上的代理徽章模糊匹配；直客单（无代理）不会被搜出
             </p>
           </div>
         </div>

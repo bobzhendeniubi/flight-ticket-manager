@@ -44,6 +44,12 @@ export const listFulfillmentQuerySchema = z.object({
    */
   passengerQuery: z.string().max(100).optional(),
   /**
+   * 代理筛选（所属代理公司名 / 联系人名，不区分大小写子串匹配）；省略/空串 = 不筛。
+   * 口径与列表回传的 agentName 同源（公司名优先、回退联系人名），所以签证岗看到什么徽章
+   * 就能按什么去搜；直客单（无代理）恒不命中——搜代理名时本就不该把直客捞出来。
+   */
+  agentQuery: z.string().max(100).optional(),
+  /**
    * 签证口径筛选（签证台「签证口径」下拉）—— 前四档逐字对应订单级 Order.visaStatus：
    * NEEDED=需要签证 / E_VISA=电子签 / HAS_VISA=已签证 / NOT_NEEDED=未签证（不需要·自备签），
    * 外加 'UNSET'=未标注（visaStatus 为 NULL，录单从没填过签证状态）。省略 = 不筛（全部）。

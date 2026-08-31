@@ -26,6 +26,7 @@ import {
   deriveVisaTaskStatus,
   effectiveVisaClassification,
   issuanceMethodWhere,
+  agentQueryWhere,
   passengerQueryWhere,
   resolveVisaUnitCost,
   visaRequirementWhere,
@@ -1287,6 +1288,27 @@ describe('visaRequirementWhere — 签证口径四档直比订单级 visaStatus'
     const all = [...cases.map((c) => c.filter), 'UNSET' as const];
     const serialized = all.map((f) => JSON.stringify(visaRequirementWhere(f)));
     expect(new Set(serialized).size).toBe(5);
+  });
+});
+
+describe('agentQueryWhere — 代理搜索（公司名 / 联系人名）', () => {
+  it('两字段 OR 模糊匹配，均不区分大小写', () => {
+    expect(agentQueryWhere('世途')).toEqual({
+      order: {
+        agent: {
+          OR: [
+            { companyName: { contains: '世途', mode: 'insensitive' } },
+            { contactName: { contains: '世途', mode: 'insensitive' } },
+          ],
+        },
+      },
+    });
+  });
+
+  it('只落在 agent 关系上：直客单（无代理）恒不命中', () => {
+    const orderWhere = agentQueryWhere('abc').order as Record<string, unknown>;
+    // order 上只有 agent 一把钥匙——多挂 OR/直客兜底就会把没有代理的单一并捞出来
+    expect(Object.keys(orderWhere)).toEqual(['agent']);
   });
 });
 
