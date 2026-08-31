@@ -15,7 +15,7 @@ import {
   exportTemplatesQuerySchema,
   MAX_EXPORT_ORDER_IDS,
 } from './orders.schemas.js';
-import { buildOrderFilterWhere } from './orders.service.js';
+import { applyExportAgentScope, buildOrderFilterWhere } from './orders.service.js';
 
 describe('orderIdsQuerySchema — 勾选 id 规整', () => {
   it('逗号分隔字符串 → 去重后的数组', () => {
@@ -250,5 +250,40 @@ describe('buildOrderFilterWhere — 航段守卫（B7：「回程未开」假阳
     const where = build({ travelFrom: '2026-07-10', travelTo: '2026-07-10', invoiceLeg: 'outbound', invoiced: false });
     expect(where.outboundInvoiced).toBe(false);
     expect(Array.isArray(where.AND)).toBe(true);
+  });
+});
+
+describe('applyExportAgentScope — 代理导出圈定（0831 代理反馈：导出与列表同权）', () => {
+  it('scope=null/undefined（ADMIN/STAFF）→ 原样返回，不加过滤', () => {
+    const where = buildOrderFilterWhere({ orderIds: ['a', 'b'] } as never);
+    expect(applyExportAgentScope(where, null)).toBe(where);
+    expect(applyExportAgentScope(where, undefined)).toBe(where);
+  });
+
+  it('勾选导出（orderIds 圈单）也叠 agentId in —— 越权勾选的单被交集排除', () => {
+    const where = buildOrderFilterWhere({ orderIds: ['a', 'b'] } as never);
+    const scoped = applyExportAgentScope(where, ['ag1', 'ag2']);
+    expect(scoped.id).toEqual({ in: ['a', 'b'] });
+    expect(scoped.AND).toContainEqual({ agentId: { in: ['ag1', 'ag2'] } });
+  });
+
+  it('筛选导出：保留既有 AND 条件，再叠 agentId in（不覆盖）', () => {
+    const where = buildOrderFilterWhere({ kind: 'FLIGHT' } as never);
+    const before = Array.isArray(where.AND) ? where.AND.length : where.AND ? 1 : 0;
+    const scoped = applyExportAgentScope(where, ['ag1']);
+    const and = scoped.AND as unknown[];
+    expect(and).toHaveLength(before + 1);
+    expect(and).toContainEqual({ agentId: { in: ['ag1'] } });
+  });
+
+  it('空 scope（AGENT 无 agentId 的脏账号）→ agentId in [] = 什么都导不出（fail-closed）', () => {
+    const scoped = applyExportAgentScope({ deletedAt: null }, []);
+    expect(scoped.AND).toContainEqual({ agentId: { in: [] } });
+  });
+
+  it('不可变：原 where 对象不被修改', () => {
+    const where = { deletedAt: null } as const;
+    applyExportAgentScope(where, ['ag1']);
+    expect(where).toEqual({ deletedAt: null });
   });
 });

@@ -15,7 +15,11 @@ import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderItemKind, OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
-import { buildOrderFilterWhere, type OrderListFilters } from './orders.service.js';
+import {
+  applyExportAgentScope,
+  buildOrderFilterWhere,
+  type OrderListFilters,
+} from './orders.service.js';
 import { earliestFlightDeparture } from './pnr-export.js';
 
 /** 运营进单统计：退款申请中的订单已释放库存，不再计入。*/
@@ -162,6 +166,8 @@ const INTAKE_COLUMNS: Array<{ header: string; key: keyof IntakeRow; width: numbe
 export async function buildIntakeExportWorkbook(
   query: OrderListFilters,
   client: PrismaClient = defaultPrisma,
+  // agentScope 由路由从登录身份解析（AGENT=自己+下级；ADMIN/STAFF=null），绝不从 query 读。
+  opts?: { agentScope?: string[] | null },
 ): Promise<Buffer> {
   // 与列表完全一致的筛选 + 强制排除不计数状态（已取消/超时/失败等）。
   const where = buildOrderFilterWhere(query);
@@ -170,7 +176,7 @@ export async function buildIntakeExportWorkbook(
   where.AND = and;
 
   const orders = (await client.order.findMany({
-    where,
+    where: applyExportAgentScope(where, opts?.agentScope),
     include: {
       passengers: { select: { id: true } },
       items: {

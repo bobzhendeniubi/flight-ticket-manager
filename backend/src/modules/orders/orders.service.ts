@@ -6959,6 +6959,16 @@ export class OrderService {
     }
   }
 
+  /**
+   * 导出口径的代理可见集合：AGENT → 自己 + 全部下级代理 id（与 listOrders RBAC 同源）；
+   * ADMIN/STAFF → null（不设限）。各导出路由拿它交给 applyExportAgentScope 叠 where，
+   * 让「导出=列表所见」在代理视角同样成立。AGENT 无 agentId（脏账号）→ 空数组，fail-closed。
+   */
+  async resolveExportAgentScope(requester: OrderRequester): Promise<string[] | null> {
+    if (requester.role !== UserRole.AGENT) return null;
+    return this.getDescendantAgentIds(requester.agentId);
+  }
+
   // 查自己 + 所有后代代理 id — 用 PostgreSQL 递归 CTE 一次查完
   // 之前是按层 BFS 每层一次 findMany，代理树深就会放大 N 倍
   private async getDescendantAgentIds(agentId: string | undefined): Promise<string[]> {
@@ -12578,6 +12588,21 @@ export function buildSearchTermClause(term: string): Prisma.OrderWhereInput {
  * 列表筛选与各导出的「录入人员」列共用本常量，避免两处各写各的字面量漂移。
  */
 export const GUEST_RECORDED_BY_LABEL = '散客';
+
+/**
+ * 把「代理可见集合」叠进导出 where（AND agentId in）。
+ * scope=null/undefined（ADMIN/STAFF 不设限）时原样返回；空数组=什么都看不到（fail-closed）。
+ * 关键在勾选导出：buildOrderFilterWhere 的 orderIds 路径只按 id 圈单，本函数叠加后
+ * 越权勾选的订单会被 AND 交集静默排除，而不是跟着 id 集合被带出去。
+ */
+export function applyExportAgentScope(
+  where: Prisma.OrderWhereInput,
+  agentScope: string[] | null | undefined,
+): Prisma.OrderWhereInput {
+  if (!agentScope) return where;
+  const and = Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : [];
+  return { ...where, AND: [...and, { agentId: { in: agentScope } }] };
+}
 
 /**
  * 把列表/导出共用的筛选参数转成 Prisma where。

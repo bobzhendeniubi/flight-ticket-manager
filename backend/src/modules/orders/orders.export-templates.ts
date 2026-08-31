@@ -26,6 +26,7 @@ import {
   PNR_COLUMNS,
 } from './pnr-export.js';
 import {
+  applyExportAgentScope,
   buildOrderFilterWhere,
   filterOrderIdsByLegFlightNumber,
   GUEST_RECORDED_BY_LABEL,
@@ -805,6 +806,9 @@ export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext
 export async function buildOrderTemplateExportWorkbook(
   query: ExportTemplatesQuery,
   client: PrismaClient = defaultPrisma,
+  // agentScope 由路由从登录身份解析（AGENT=自己+下级；ADMIN/STAFF=null），绝不从 query 读——
+  // query 是客户端可控的，走参数进来会被伪造成别家代理的集合。
+  opts?: { agentScope?: string[] | null },
 ): Promise<Buffer> {
   // 与列表完全一致的筛选 + 强制排除不计数状态（已取消/超时/失败等）。
   // includeAnchorless：唯一与列表不同的一处——导出要把「一个日期锚点都没有的**签证单**」也取回
@@ -820,7 +824,7 @@ export async function buildOrderTemplateExportWorkbook(
   where.AND = and;
 
   const fetched = (await client.order.findMany({
-    where,
+    where: applyExportAgentScope(where, opts?.agentScope),
     // 名单按录入倒序（最新录入在最上），对标旧系统
     orderBy: { createdAt: 'desc' },
     include: {

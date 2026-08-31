@@ -704,8 +704,19 @@ describe('visibleColumns（role 裁列）', () => {
     expect(headers).not.toContain('可用次数');
   });
 
+  it('agent（代理）= 全岗结构仅裁「订单成本」（真实进价）；结算价/立减/到账是代理自己的账，保留', () => {
+    const headers = visibleColumns('agent').map((c) => c.header);
+    expect(headers).not.toContain('订单成本');
+    expect(headers).toContain('结算价格');
+    expect(headers).toContain('立减金额');
+    expect(headers).toContain('已到账金额');
+    expect(headers).toContain('分房情况');
+    // 唯一差异就是订单成本一列：agent 列数 = all 列数 - 1
+    expect(visibleColumns('agent')).toHaveLength(visibleColumns('all').length - 1);
+  });
+
   it('所有视图都保留通用列（序号/代理机构/乘客中文名/订单编号）', () => {
-    for (const role of ['all', 'ticketing', 'visa'] as const) {
+    for (const role of ['all', 'ticketing', 'visa', 'agent'] as const) {
       const headers = visibleColumns(role).map((c) => c.header);
       expect(headers).toContain('序号');
       expect(headers).toContain('代理机构');

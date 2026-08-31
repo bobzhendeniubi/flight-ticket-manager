@@ -33,12 +33,17 @@ import { parseRoomGroups, resolveExportHotelName } from './orders.export-room-al
 import { nameWithTitle, pnrName, VISA_REQUIREMENT_LABEL } from './orders.export-templates.js';
 import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
 import { appendHoldOrderSheet, loadHoldExportRows } from './orders.export-hold-orders.js';
-import { buildOrderFilterWhere, GUEST_RECORDED_BY_LABEL } from './orders.service.js';
+import {
+  applyExportAgentScope,
+  buildOrderFilterWhere,
+  GUEST_RECORDED_BY_LABEL,
+} from './orders.service.js';
 import { determineFlightLegs } from './ticketing-cap.js';
 
 // ── 岗位视图 ──────────────────────────────────────────────────────────────
-/** 岗位视图：all=完整全岗（默认）；ticketing=票务；visa=签证。仅裁列，不改数据/取数。*/
-export type MasterExportRole = 'all' | 'ticketing' | 'visa';
+/** 岗位视图：all=完整全岗（默认）；ticketing=票务；visa=签证；agent=代理（路由按登录身份
+ * 强制，不接受 query 传入——代理改参数也拿不到 all 视图）。仅裁列，不改数据/取数。*/
+export type MasterExportRole = 'all' | 'ticketing' | 'visa' | 'agent';
 
 export interface MasterExportQuery {
   /** 出发日期起（YYYY-MM-DD，含）*/
@@ -293,6 +298,9 @@ const MASTER_COLUMNS: MasterColumn[] = [
 /** 按岗位视图筛出可见列（role=all/缺省 → 全部；否则保留 roles 命中或未限定 role 的列）。*/
 export function visibleColumns(role: MasterExportRole): MasterColumn[] {
   if (role === 'all') return MASTER_COLUMNS;
+  // 代理视角：结构同全岗，仅裁「订单成本」——那是我方真实进价（OrderCostItem），
+  // 与详情页逐项拆价同一条脱敏红线；结算价/立减/到账是代理自己的应付账目，保留。
+  if (role === 'agent') return MASTER_COLUMNS.filter((c) => c.key !== 'orderCost');
   return MASTER_COLUMNS.filter((c) => !c.roles || c.roles.includes(role));
 }
 
@@ -616,6 +624,8 @@ export function orderToMasterRows(
 export async function buildMasterExportWorkbook(
   query: MasterExportQuery,
   client: PrismaClient = defaultPrisma,
+  // agentScope 由路由从登录身份解析（AGENT=自己+下级；ADMIN/STAFF=null），绝不从 query 读。
+  opts?: { agentScope?: string[] | null },
 ): Promise<Buffer> {
   const role: MasterExportRole = query.role ?? 'all';
 
@@ -638,7 +648,7 @@ export async function buildMasterExportWorkbook(
   where.AND = and;
 
   const fetched = (await client.order.findMany({
-    where,
+    where: applyExportAgentScope(where, opts?.agentScope),
     orderBy: { createdAt: 'desc' },
     include: MASTER_EXPORT_INCLUDE,
   })) as OrderForMasterExport[];
