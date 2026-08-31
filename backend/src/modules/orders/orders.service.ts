@@ -3595,7 +3595,26 @@ export class OrderService {
               },
             },
           },
-          passengers: { select: { id: true, fullName: true, chineseName: true, gender: true, documentNumber: true } },
+          // 列表乘客窄 select：身份字段之外补齐每人子行的徽标位（自备签/单住/送签进度）
+          // 与票号（pnr/eticketNumber）、子行身份补充（生日/国籍/护照有效期），
+          // 仍不带护照照片等重字段。
+          passengers: {
+            select: {
+              id: true,
+              fullName: true,
+              chineseName: true,
+              gender: true,
+              documentNumber: true,
+              dateOfBirth: true,
+              nationality: true,
+              passportExpiry: true,
+              visaExempt: true,
+              singleRoom: true,
+              visaSubmissionStatus: true,
+              pnr: true,
+              eticketNumber: true,
+            },
+          },
           agent: { select: { id: true, companyName: true, contactName: true, settlementMode: true, prepaymentBalance: true } },
           user: { select: { id: true, displayName: true, email: true } },
           claimedBy: { select: { id: true, displayName: true, email: true } },

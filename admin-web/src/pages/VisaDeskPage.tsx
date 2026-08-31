@@ -26,6 +26,8 @@ import {
   type VisaTaskPassenger,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+// 乘客送签进度文案 / 徽章（三档）：与订单列表共用，见 lib/visaSubmission
+import { SUBMISSION_BADGE, SUBMISSION_LABEL } from '../lib/visaSubmission';
 import { localYmd } from '../lib/airports';
 import { useConfirm } from '../components/ConfirmDialog';
 import { useDialogA11y } from '../components/Modal';
@@ -45,18 +47,6 @@ const VISA_STATUS_BADGE: Record<FulfillmentStatus, string> = {
   CONFIRMED: 'badge-success',
   CANCELLED: 'badge-neutral',
   FAILED: 'badge-danger',
-};
-
-// 乘客送签进度文案 / 徽章（三档）
-const SUBMISSION_LABEL: Record<VisaSubmissionStatus, string> = {
-  PENDING: '待处理',
-  IN_PROGRESS: '材料准备',
-  CONFIRMED: '已送签',
-};
-const SUBMISSION_BADGE: Record<VisaSubmissionStatus, string> = {
-  PENDING: 'badge-neutral',
-  IN_PROGRESS: 'badge-info',
-  CONFIRMED: 'badge-success',
 };
 
 // 按人批量标记的目标进度（签证台只做「材料准备 / 已送签」两档）

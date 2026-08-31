@@ -1311,6 +1311,8 @@ export interface OrderPassenger {
   passportExpiry?: string | null;
 
   // 签证（出签日/生效日/有效期由签证台在出签后补录，见 updatePassengerVisaDates）
+  /** 送签进度（签证台按人流转）；列表接口回传，展示侧缺省按 PENDING */
+  visaSubmissionStatus?: VisaSubmissionStatus;
   visaNumber?: string | null;
   visaType?: string | null;
   visaIssueDate?: string | null;

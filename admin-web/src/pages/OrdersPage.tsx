@@ -27,6 +27,7 @@ import type { RoomGroup, Receipt, DocumentType, TravelerProfileLookupRow, BatchC
 import { countryIso3ToIso2 } from '../lib/passportOcr';
 import { runPassportOcr, ocrReviewHintText } from '../lib/passportOcrRunner';
 import { ORDER_STATUS_META, orderStatusBadgeClass, orderStatusLabel } from '../lib/orderStatus';
+import { SUBMISSION_BADGE, SUBMISSION_LABEL } from '../lib/visaSubmission';
 import { useConfirm } from '../components/ConfirmDialog';
 import { useDialogA11y } from '../components/Modal';
 
@@ -3401,7 +3402,8 @@ export function OrdersPage() {
             </thead>
             <tbody>
               {paged.map(({ order, view }, idx) => (
-                <tr key={order.id} className={`group ${selectedIds.has(order.id) ? 'bg-brand-50' : ''}`}>
+                <Fragment key={order.id}>
+                <tr className={`group ${selectedIds.has(order.id) ? 'bg-brand-50' : ''}`}>
                   <td className="text-center">
                     <input
                       type="checkbox"
@@ -3542,55 +3544,6 @@ export function OrdersPage() {
                         </div>
                       );
                     })()}
-                    {/* 乘客明细展开面板（行内，不撑开表格结构）：列表接口的乘客只带
-                        姓名/中文名/性别/证件号，其余字段（出生日期/国籍/证件类型/护照有效期）
-                        列表本就没有，缺就不显示——不为了凑格子发额外请求，也不臆造空值。
-                        证件号一律脱敏（maskDocumentNumber），看全号请进详情抽屉。 */}
-                    {expandedPassengerOrderIds.has(order.id) && order.passengers.length > 0 && (
-                      <div className="mt-1 rounded-md border border-slate-200 bg-slate-50/70 p-1.5">
-                        <div className="mb-1 flex items-center justify-between text-[10px] text-ink-muted">
-                          <span>乘客明细（护照号已脱敏，完整证件号见订单详情）</span>
-                          <button
-                            type="button"
-                            className="text-brand hover:text-brand-dark"
-                            onClick={() => togglePassengerPanel(order.id)}
-                          >
-                            收起
-                          </button>
-                        </div>
-                        <div className="space-y-1">
-                          {order.passengers.map((p, pIdx) => {
-                            const masked = maskDocumentNumber(p.documentNumber);
-                            const gender = p.gender ? GENDER_TEXT[p.gender] : null;
-                            return (
-                              <div
-                                key={p.id}
-                                className="flex flex-wrap items-baseline gap-x-2 gap-y-0.5 text-[11px] leading-snug"
-                              >
-                                <span className="nums w-4 shrink-0 text-ink-muted">{pIdx + 1}</span>
-                                <span className="font-medium text-ink">{p.fullName}</span>
-                                {p.chineseName ? <span className="text-ink-soft">{p.chineseName}</span> : null}
-                                {gender ? <span className="text-ink-muted">{gender}</span> : null}
-                                {p.dateOfBirth ? (
-                                  <span className="nums text-ink-muted">{p.dateOfBirth}</span>
-                                ) : null}
-                                {p.nationality ? <span className="text-ink-muted">{p.nationality}</span> : null}
-                                {masked ? (
-                                  <span className="nums font-mono text-ink-soft" title="中段已脱敏">
-                                    {masked}
-                                  </span>
-                                ) : null}
-                                {p.passportExpiry ? (
-                                  <span className="nums text-ink-muted" title="护照有效期">
-                                    至 {p.passportExpiry}
-                                  </span>
-                                ) : null}
-                              </div>
-                            );
-                          })}
-                        </div>
-                      </div>
-                    )}
                   </td>
                   {columnVisibility.departDate && (
                   <td className="nums whitespace-nowrap text-left text-xs text-ink-soft">
@@ -3774,6 +3727,79 @@ export function OrdersPage() {
                     </div>
                   </td>
                 </tr>
+                {/* 乘客子行（展开态）：每人一整行（colSpan 贯穿全表），承接原行内面板的
+                    全部字段；另补签证徽标（自备签 / 送签进度）、单住、票号（PNR/票号有值
+                    才显示）。列表接口没有的字段（出生日期/国籍/护照有效期）缺就不显示，
+                    不为凑格子发额外请求，也不臆造空值。证件号一律脱敏（maskDocumentNumber），
+                    看全号进详情抽屉——子行只作展示，不挂详情点击。 */}
+                {expandedPassengerOrderIds.has(order.id) &&
+                  order.passengers.map((p, pIdx) => {
+                    const masked = maskDocumentNumber(p.documentNumber);
+                    const mark = genderMark(p.gender);
+                    const displayName = p.chineseName?.trim() || p.fullName;
+                    const submission = p.visaSubmissionStatus ?? 'PENDING';
+                    // 送签进度只在本单真有签证任务时显示（与签证筛选同源）——
+                    // 纯机票/不需要签证的单不给每人挂「待处理」，避免误读成有签证在等。
+                    const orderHasVisaTask = deriveVisaStatus(order) !== null;
+                    return (
+                      <tr key={p.id} className="bg-slate-50">
+                        <td colSpan={tableColSpan} className="!py-1.5 pl-16">
+                          <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-0.5 text-[11px] leading-snug">
+                            <span className="nums w-4 shrink-0 text-ink-muted">{pIdx + 1}</span>
+                            <span className="font-medium text-ink">{displayName}</span>
+                            {displayName !== p.fullName ? (
+                              <span className="text-ink-soft">{p.fullName}</span>
+                            ) : null}
+                            {mark ? (
+                              <span
+                                className="text-[10px] text-ink-soft"
+                                title={p.gender ? GENDER_TEXT[p.gender] : undefined}
+                              >
+                                {mark}
+                              </span>
+                            ) : null}
+                            {p.dateOfBirth ? (
+                              <span className="nums text-ink-muted">{p.dateOfBirth.slice(0, 10)}</span>
+                            ) : null}
+                            {p.nationality ? <span className="text-ink-muted">{p.nationality}</span> : null}
+                            {masked ? (
+                              <span className="nums font-mono text-ink-soft" title="中段已脱敏，完整证件号见订单详情">
+                                {masked}
+                              </span>
+                            ) : null}
+                            {p.passportExpiry ? (
+                              <span className="nums text-ink-muted" title="护照有效期">
+                                至 {p.passportExpiry.slice(0, 10)}
+                              </span>
+                            ) : null}
+                            {/* 签证：自备签乘客不进送签流程，只标「自备签」；其余仅在本单
+                                有签证任务时按送签进度标（无签证的单不挂进度徽章） */}
+                            {p.visaExempt ? (
+                              <span className="rounded bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 ring-1 ring-sky-200">
+                                自备签
+                              </span>
+                            ) : orderHasVisaTask ? (
+                              <span className={`${SUBMISSION_BADGE[submission]} text-[10px]`} title="送签进度">
+                                {SUBMISSION_LABEL[submission]}
+                              </span>
+                            ) : null}
+                            {p.singleRoom ? (
+                              <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-amber-200">
+                                单住
+                              </span>
+                            ) : null}
+                            {p.pnr ? (
+                              <span className="font-mono tabular-nums text-ink-soft">PNR {p.pnr}</span>
+                            ) : null}
+                            {p.eticketNumber ? (
+                              <span className="font-mono tabular-nums text-ink-soft">票号 {p.eticketNumber}</span>
+                            ) : null}
+                          </div>
+                        </td>
+                      </tr>
+                    );
+                  })}
+                </Fragment>
               ))}
               {!loading && filtered.length === 0 && (
                 <tr>
