@@ -1081,6 +1081,15 @@ export type SwapPassengerBody = z.infer<typeof swapPassengerBodySchema>;
 export const setPassengerVisaExemptBodySchema = z.object({
   visaExempt: z.boolean(),
   note: z.string().max(500).optional(),
+  // 送签已在办理（材料准备/已送签）时改自备签的「人为确认」（签证岗 2026-08-30 口径：
+  // 退不退、退多少由人当场定，系统不硬拦也不自动退）。缺省不带 → 服务端拒并提示确认；
+  // refundCny = 本次退给客人的金额（0 = 不退，上限为该单自备签减免费率，服务端钳位校验）。
+  submittedOverride: z
+    .object({
+      refundCny: z.number().int().min(0),
+      reason: z.string().trim().min(1, '请填写退费/不退费的原因').max(200),
+    })
+    .optional(),
 });
 export type SetPassengerVisaExemptBody = z.infer<typeof setPassengerVisaExemptBodySchema>;
 

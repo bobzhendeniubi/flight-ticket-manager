@@ -4184,7 +4184,13 @@ export const api = {
     token: string,
     orderId: string,
     passengerId: string,
-    body: { visaExempt: boolean; note?: string },
+    body: {
+      visaExempt: boolean;
+      note?: string;
+      // 送签已在办理时的人为确认（后端返回 [NEED_CONFIRM_SUBMITTED] 时补传重试）：
+      // refundCny=本次退客人的金额（0=不退，上限=该单自备签减免费率），reason 必填记审计。
+      submittedOverride?: { refundCny: number; reason: string };
+    },
   ) =>
     apiFetch<{ order: OrderSummary; warning?: string | null }>(
       `/orders/${orderId}/passengers/${passengerId}/visa-exempt`,

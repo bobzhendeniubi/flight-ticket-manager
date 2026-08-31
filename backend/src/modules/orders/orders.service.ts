@@ -89,6 +89,7 @@ import { derivePtcByAge, earliestFlightDeparture } from './pnr-export.js';
 // 按人送签的任务级状态派生（纯函数）：与签证台同一口径。依赖方向安全——
 // fulfillment.service 只 import prisma/errors/自身 schemas，不回头 import orders 模块，无环。
 import { deriveVisaTaskStatus } from '../fulfillment/fulfillment.service.js';
+import { syncOrderVisaCompletion } from '../fulfillment/visa-completion.js';
 import {
   assertOrderAllowsInvoicing,
   assertTicketingCap,
@@ -8185,7 +8186,12 @@ export class OrderService {
   async setPassengerVisaExempt(
     orderId: string,
     passengerId: string,
-    input: { visaExempt: boolean; note?: string },
+    input: {
+      visaExempt: boolean;
+      note?: string;
+      /** 送签已在办理时的人为确认：退多少（0=不退）+ 原因。见 orders.schemas 同名字段注释。 */
+      submittedOverride?: { refundCny: number; reason: string };
+    },
     actor: { userId: string; role: UserRole },
   ): Promise<{
     order: ReturnType<typeof serializeOrder>;
@@ -8200,6 +8206,10 @@ export class OrderService {
       after: { visaExempt: boolean; visaSubmissionStatus: string };
       /** 本次应收变化（CNY；非 BUNDLE 单恒 0）。 */
       totalDeltaCny: number;
+      /** 已送签人为确认路径：实退客人金额（其余路径 null）。 */
+      refundCny: number | null;
+      /** 已送签人为确认路径：批文成本留存金额（其余路径 0）。 */
+      retainCny: number;
     } | null;
   }> {
     if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
@@ -8216,12 +8226,13 @@ export class OrderService {
           status: OrderStatus;
           deletedAt: Date | null;
           adjustments: Prisma.JsonValue;
+          adjustmentCny: number;
           settlementLocked: boolean;
           outboundInvoiced: boolean;
           returnInvoiced: boolean;
           systemInvoiced: boolean;
         }>
-      >`SELECT id, "orderNumber", status, "deletedAt", adjustments, "settlementLocked", "outboundInvoiced", "returnInvoiced", "systemInvoiced" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      >`SELECT id, "orderNumber", status, "deletedAt", adjustments, "adjustmentCny", "settlementLocked", "outboundInvoiced", "returnInvoiced", "systemInvoiced" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
       const order = orderRows[0];
       if (!order) throw new NotFoundError('订单不存在');
 
@@ -8257,10 +8268,15 @@ export class OrderService {
         visaSubmissionStatus: passenger.visaSubmissionStatus as string,
       };
 
-      // ── 3. false→true 门槛：送签已在办理（材料准备/已送签）则批文成本已发生 ──
-      if (input.visaExempt && passenger.visaSubmissionStatus !== VisaSubmissionStatus.PENDING) {
+      // ── 3. false→true 门槛：送签已在办理（材料准备/已送签）→ 人为确认（签证岗 0830 口径）──
+      // 不硬拦也不自动退：批文成本已发生，退不退/退多少由操作人当场定（默认 0）。缺确认参数时
+      // 抛带 [NEED_CONFIRM_SUBMITTED] 标记的冲突错，前端据此弹退费确认框后重试。
+      const submittedInProcess =
+        input.visaExempt && passenger.visaSubmissionStatus !== VisaSubmissionStatus.PENDING;
+      if (submittedInProcess && !input.submittedOverride) {
         throw new ConflictError(
-          '该乘客送签已在办理（材料准备/已送签），批文成本已发生，不能直接改自备签；如需退改请联系签证岗与财务处理',
+          '[NEED_CONFIRM_SUBMITTED] 该乘客送签已在办理（材料准备/已送签），批文成本已发生。' +
+            '请确认退费金额（0 = 不退）与原因后重试。',
         );
       }
 
@@ -8316,6 +8332,17 @@ export class OrderService {
           );
         }
       }
+      // 已送签人为确认 + 本单没有减免费率行：翻标记本就不动钱，没有"从减免里退"的来源。
+      if (
+        submittedInProcess &&
+        input.submittedOverride &&
+        moneyLines.length === 0 &&
+        input.submittedOverride.refundCny > 0
+      ) {
+        throw new ConflictError(
+          '本单套餐未配自备签减免费率，改自备签不产生退费；如需退款请走收款/调价通道',
+        );
+      }
 
       // ── 6. 写乘客标记；两个方向都把送签进度置回待处理 ─────────────────────
       // true→false：防旧 CONFIRMED 复活污染任务派生（人已换办签方式，进度从头来）；
@@ -8330,6 +8357,9 @@ export class OrderService {
 
       // ── 5b. 行重算（唯一钱行）：以翻转后的乘客现势重算自备签人数，其余维度沿用原快照 ──
       let totalDeltaCny = 0;
+      // 已送签人为确认的钱结果（仅 submittedOverride 路径有值）：客人实退 / 批文成本留存。
+      let refundCnyApplied: number | null = null;
+      let retainCny = 0;
       if (moneyLines.length === 1) {
         const line = moneyLines[0];
         const snapshot = readAddOnSnapshot(line.metadata)!;
@@ -8419,6 +8449,33 @@ export class OrderService {
             total: new Prisma.Decimal(newSubtotal),
           },
         });
+
+        // ── 5c. 已送签人为确认的钱收口：行重算已把整份减免退了（−rate），实际只该退 refund，
+        // 差额（rate−refund）作为「批文成本留存」补回应收（adjustments 流水，财务可见可查）。
+        // 净效果 = 应收只降 refund。refund 超过费率直接拒（不是静默钳位——填错要看得见）。
+        if (submittedInProcess && input.submittedOverride) {
+          const refund = Math.trunc(input.submittedOverride.refundCny);
+          if (refund > rate) {
+            throw new ConflictError(`退费金额不能超过该单自备签减免费率 ¥${rate}`);
+          }
+          refundCnyApplied = refund;
+          retainCny = rate - refund;
+          if (retainCny > 0) {
+            const log = appendAdjustment(order.adjustments, {
+              type: 'VISA_SUBMITTED_COST_RETAIN',
+              label: '已送签批文成本留存（改自备签少退）',
+              amountCny: retainCny,
+              at: new Date().toISOString(),
+              by: actor.userId,
+              note: input.submittedOverride.reason,
+              passengerId,
+            });
+            await tx.order.update({
+              where: { id: orderId },
+              data: { adjustmentCny: order.adjustmentCny + retainCny, adjustments: log },
+            });
+          }
+        }
       }
 
       // ── 7. 任务联动：先对齐任务的有无（补建/撤 PENDING），再按人重派生任务状态 ──
@@ -8464,9 +8521,17 @@ export class OrderService {
         orderNumber: order.orderNumber,
         before,
         totalDeltaCny,
+        refundCnyApplied,
+        retainCny,
         warning,
       };
     });
+
+    // 办结派生对齐：进度被重置回待处理后，若订单的「已签证」是系统办结写的要对称撤销
+    // （录单手选的已签证没有办结审计，不受影响）。放在事务外，与派生模块的调用点约定一致。
+    if (!scratch.noop) {
+      await syncOrderVisaCompletion(orderId, { userId: actor.userId, role: actor.role });
+    }
 
     const finalOrder = await prisma.order.findUniqueOrThrow({
       where: { id: orderId },
@@ -8487,6 +8552,9 @@ export class OrderService {
         before: scratch.before,
         after: { visaExempt: input.visaExempt, visaSubmissionStatus: VisaSubmissionStatus.PENDING },
         totalDeltaCny: scratch.totalDeltaCny,
+        // 已送签人为确认（非该路径时为 null/0）：实退给客人 / 批文成本留存
+        refundCny: scratch.refundCnyApplied,
+        retainCny: scratch.retainCny,
       },
     };
   }

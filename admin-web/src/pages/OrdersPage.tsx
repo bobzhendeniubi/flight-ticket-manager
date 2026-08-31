@@ -7678,7 +7678,44 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
       onOrderUpdated?.(res.order);
       if (res.warning) window.alert(res.warning);
     } catch (e) {
-      // 失败把后端错误文案原样展示（结算锁/开票闸/送签已在办理等都有明确指引）。
+      // 送签已在办理 → 人为确认（签证岗口径：退不退/退多少当场定，系统不硬拦也不自动退）。
+      // 后端用 [NEED_CONFIRM_SUBMITTED] 标记这类冲突；确认后带 submittedOverride 重试一次。
+      if (e instanceof ApiError && e.message.includes('[NEED_CONFIRM_SUBMITTED]')) {
+        const amountStr = window.prompt(
+          `${p.fullName} 送签已在办理（材料准备/已送签），批文成本已发生。\n` +
+            '本次退给客人多少元？（0 = 不退，上限为该单自备签减免费率）',
+          '0',
+        );
+        if (amountStr === null) return;
+        const refundCny = Math.trunc(Number(amountStr));
+        if (!Number.isFinite(refundCny) || refundCny < 0) {
+          setVisaExemptErr('退费金额须为不小于 0 的整数');
+          return;
+        }
+        const reason = window.prompt('请填写退费/不退费的原因（必填，记入审计）', '');
+        if (reason === null) return;
+        if (!reason.trim()) {
+          setVisaExemptErr('原因必填：这笔钱退多少是人为决定，要留痕');
+          return;
+        }
+        try {
+          const res = await api.setPassengerVisaExempt(token, order.id, p.id, {
+            visaExempt: next,
+            submittedOverride: { refundCny, reason: reason.trim() },
+          });
+          onOrderUpdated?.(res.order);
+          window.alert(
+            refundCny > 0
+              ? `已改自备签：本次退客人 ¥${refundCny}，其余按批文成本留存。`
+              : '已改自备签：签证费不退（批文成本留存），已记入审计。',
+          );
+          if (res.warning) window.alert(res.warning);
+        } catch (e2) {
+          setVisaExemptErr(e2 instanceof ApiError ? e2.message : '改自备签失败，请稍后重试');
+        }
+        return;
+      }
+      // 其余失败把后端错误文案原样展示（结算锁/开票闸等都有明确指引）。
       setVisaExemptErr(e instanceof ApiError ? e.message : '改自备签失败，请稍后重试');
     } finally {
       setVisaExemptBusyId(null);

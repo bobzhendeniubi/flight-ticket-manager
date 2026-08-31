@@ -98,6 +98,7 @@ function mount(opts: MountOptions = {}): void {
       status: opts.status ?? 'PAID',
       deletedAt: opts.deletedAt ?? null,
       adjustments: opts.adjustments ?? [],
+      adjustmentCny: 0,
       settlementLocked: opts.settlementLocked ?? false,
       outboundInvoiced: opts.invoiced ?? false,
       returnInvoiced: false,
@@ -431,5 +432,134 @@ describe('OrderService.setPassengerVisaExempt · 非 BUNDLE 单与送签进度�
         (c[0] as { where: { type?: string } }).where.type === 'VISA_APPLICATION',
     );
     expect(rederive).toBeUndefined();
+  });
+});
+
+describe('OrderService.setPassengerVisaExempt · 已送签人为确认（submittedOverride）', () => {
+  const bundleLine = (amountCny: number, snapshotCount: number) => ({
+    id: 'item-b1',
+    quantity: 2,
+    amount: new Prisma.Decimal(amountCny),
+    metadata: { addOns: baseSnapshot(snapshotCount) },
+  });
+  const submittedMount = (extra: Parameters<typeof mount>[0] = {}) =>
+    mount({
+      passenger: { visaExempt: false, visaSubmissionStatus: 'CONFIRMED' },
+      bundleLines: [bundleLine(5000, 0)],
+      passengersAfterFlip: [{ visaExempt: true }, { visaExempt: false }],
+      nonExemptAfterFlip: [{ visaSubmissionStatus: 'PENDING' }],
+      aggregateAfterCny: 4700,
+      ...extra,
+    });
+
+  it('无 override → ConflictError 带 [NEED_CONFIRM_SUBMITTED] 标记（前端据此弹确认框）', async () => {
+    submittedMount();
+    await expect(
+      service.setPassengerVisaExempt('o1', 'p1', { visaExempt: true }, actor),
+    ).rejects.toThrow(/\[NEED_CONFIRM_SUBMITTED\]/);
+    expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+
+  it('override 退 100（费率 300）→ 行重算 −300 + 批文留存 200 补回应收，净退 100', async () => {
+    submittedMount();
+    const res = await service.setPassengerVisaExempt(
+      'o1',
+      'p1',
+      { visaExempt: true, submittedOverride: { refundCny: 100, reason: '客人临时不办，材料费已发生' } },
+      actor,
+    );
+    // 行重算照旧退整份费率
+    expect(res.audit?.totalDeltaCny).toBe(-300);
+    // 留存调整行：adjustmentCny += 200，流水带乘客与原因
+    const retainUpdate = mockPrisma.order.update.mock.calls.find(
+      (c) => (c[0] as { data: { adjustmentCny?: number } }).data.adjustmentCny !== undefined,
+    );
+    expect(retainUpdate).toBeDefined();
+    const data = (retainUpdate![0] as { data: { adjustmentCny: number; adjustments: unknown[] } }).data;
+    expect(data.adjustmentCny).toBe(200);
+    expect(data.adjustments).toEqual([
+      expect.objectContaining({
+        type: 'VISA_SUBMITTED_COST_RETAIN',
+        amountCny: 200,
+        passengerId: 'p1',
+        note: '客人临时不办，材料费已发生',
+      }),
+    ]);
+    expect(res.audit?.refundCny).toBe(100);
+    expect(res.audit?.retainCny).toBe(200);
+  });
+
+  it('override 退 0 → 全额留存 300（不退），有流水可查', async () => {
+    submittedMount();
+    const res = await service.setPassengerVisaExempt(
+      'o1',
+      'p1',
+      { visaExempt: true, submittedOverride: { refundCny: 0, reason: '批文已出，不退' } },
+      actor,
+    );
+    const retainUpdate = mockPrisma.order.update.mock.calls.find(
+      (c) => (c[0] as { data: { adjustmentCny?: number } }).data.adjustmentCny !== undefined,
+    );
+    expect((retainUpdate![0] as { data: { adjustmentCny: number } }).data.adjustmentCny).toBe(300);
+    expect(res.audit?.refundCny).toBe(0);
+    expect(res.audit?.retainCny).toBe(300);
+  });
+
+  it('override 退 400 > 费率 300 → ConflictError（显式拒绝，不静默钳位）', async () => {
+    submittedMount();
+    await expect(
+      service.setPassengerVisaExempt(
+        'o1',
+        'p1',
+        { visaExempt: true, submittedOverride: { refundCny: 400, reason: '填错了' } },
+        actor,
+      ),
+    ).rejects.toThrow(/不能超过/);
+  });
+
+  it('非钱单（无减免费率行）+ override 退 >0 → ConflictError（无退费来源）', async () => {
+    submittedMount({ bundleLines: [], aggregateAfterCny: 0 });
+    await expect(
+      service.setPassengerVisaExempt(
+        'o1',
+        'p1',
+        { visaExempt: true, submittedOverride: { refundCny: 50, reason: '想退点' } },
+        actor,
+      ),
+    ).rejects.toThrow(/未配自备签减免费率/);
+  });
+
+  it('非钱单 + override 退 0 → 放行纯改标记（不动钱）', async () => {
+    submittedMount({ bundleLines: [], aggregateAfterCny: 0 });
+    const res = await service.setPassengerVisaExempt(
+      'o1',
+      'p1',
+      { visaExempt: true, submittedOverride: { refundCny: 0, reason: '客人自带，材料自理' } },
+      actor,
+    );
+    expect(res.audit?.totalDeltaCny).toBe(0);
+    expect(res.audit?.retainCny).toBe(0);
+    expect(mockPrisma.orderItem.update).not.toHaveBeenCalled();
+  });
+
+  it('schema：submittedOverride.reason 必填非空、refundCny 非负整数', () => {
+    expect(
+      setPassengerVisaExemptBodySchema.safeParse({
+        visaExempt: true,
+        submittedOverride: { refundCny: 100, reason: '  ' },
+      }).success,
+    ).toBe(false);
+    expect(
+      setPassengerVisaExemptBodySchema.safeParse({
+        visaExempt: true,
+        submittedOverride: { refundCny: -1, reason: 'x' },
+      }).success,
+    ).toBe(false);
+    expect(
+      setPassengerVisaExemptBodySchema.safeParse({
+        visaExempt: true,
+        submittedOverride: { refundCny: 0, reason: '不退' },
+      }).success,
+    ).toBe(true);
   });
 });

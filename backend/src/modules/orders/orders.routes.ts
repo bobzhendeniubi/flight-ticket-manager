@@ -2057,6 +2057,10 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
             visaSubmissionStatus: audit.after.visaSubmissionStatus,
             totalDelta: audit.totalDeltaCny,
             note: body.note,
+            // 已送签人为确认路径（其余为 null/0）：实退客人 / 批文成本留存 / 操作人填的原因
+            refundCny: audit.refundCny,
+            retainCny: audit.retainCny,
+            overrideReason: body.submittedOverride?.reason ?? null,
           },
           severity: 'WARNING',
         });
