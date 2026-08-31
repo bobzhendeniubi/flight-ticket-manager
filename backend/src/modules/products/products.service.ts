@@ -9,6 +9,7 @@ import { prisma } from '../../db/prisma.js';
 import { NotFoundError, BadRequestError } from '../../lib/errors.js';
 import { ReviewsService, type ProductRatingAggregate } from '../reviews/reviews.service.js';
 import { firstHotelQty, resolveBundleNights } from './bundle-nights.js';
+import { resolveSelfVisaDeductCny, resolveSelfVisaDeductCnyBatch } from './self-visa-deduct.js';
 import {
   getCheapestRoundTripEconomyCny,
   computeBundleOriginalAllInCny,
@@ -580,11 +581,14 @@ export class ProductsService {
         flightRefByKey.set(key, await getCheapestRoundTripEconomyCny(now, binding));
       }),
     );
+    // 自备签减免有效值（null=跟随签证组件产品价）：整表一次批量解析，避免逐套餐 N+1。
+    const selfVisaEffective = await resolveSelfVisaDeductCnyBatch(rows);
     return rows.map((b) =>
       serializeBundle(
         b,
         ratings.get(b.id) ?? ZERO_RATING,
         flightRefByKey.get(bindingKey(b.outboundFlightId, b.returnFlightId)) ?? null,
+        selfVisaEffective.get(b.id) ?? null,
       ),
     );
   }
@@ -601,7 +605,12 @@ export class ProductsService {
       outboundFlightId: b.outboundFlightId,
       returnFlightId: b.returnFlightId,
     });
-    return serializeBundle(b, ratings.get(id) ?? ZERO_RATING, flightRef);
+    return serializeBundle(
+      b,
+      ratings.get(id) ?? ZERO_RATING,
+      flightRef,
+      await resolveSelfVisaDeductCny(b),
+    );
   }
 
   /**
@@ -667,8 +676,9 @@ export class ProductsService {
             ? { childSeatDiscountCnyPerPerson: body.childSeatDiscountCnyPerPerson }
             : {}),
           ...(body.infantPriceCny != null ? { infantPriceCny: body.infantPriceCny } : {}),
-          // 自备签证可减额：省略 / null 时落 DB 默认（0 = 不减）
-          ...(body.selfVisaDeductCny != null ? { selfVisaDeductCny: body.selfVisaDeductCny } : {}),
+          // 自备签证可减额：省略/null 落 null = 「跟随签证组件产品价」（Visa.basePrice 合计，
+          // 一处改价全站生效）。显式传数值 = 套餐自有覆盖（含 0 = 不减，特价团用）。
+          selfVisaDeductCny: body.selfVisaDeductCny ?? null,
           // 每人操作费：省略 / null 时落 DB 默认 ¥20
           ...(body.operationFeeCny != null ? { operationFeeCny: body.operationFeeCny } : {}),
           ...(body.legs != null ? { legs: body.legs } : {}),
@@ -693,7 +703,7 @@ export class ProductsService {
       outboundFlightId: b.outboundFlightId,
       returnFlightId: b.returnFlightId,
     });
-    return serializeBundle(b, ZERO_RATING, flightRef);
+    return serializeBundle(b, ZERO_RATING, flightRef, await resolveSelfVisaDeductCny(b));
   }
 
   async updateBundle(id: string, body: UpdateBundleBody) {
@@ -752,7 +762,8 @@ export class ProductsService {
     if (body.infantPriceCny != null) {
       data.infantPriceCny = body.infantPriceCny;
     }
-    if (body.selfVisaDeductCny != null) {
+    // 自备签证可减额：undefined = 不动；null = 改回「跟随签证组件产品价」；数值 = 显式覆盖（含 0）。
+    if (body.selfVisaDeductCny !== undefined) {
       data.selfVisaDeductCny = body.selfVisaDeductCny;
     }
     if (body.operationFeeCny != null) {
@@ -779,7 +790,7 @@ export class ProductsService {
       outboundFlightId: b.outboundFlightId,
       returnFlightId: b.returnFlightId,
     });
-    return serializeBundle(b, ZERO_RATING, flightRef);
+    return serializeBundle(b, ZERO_RATING, flightRef, await resolveSelfVisaDeductCny(b));
   }
 
   /** 校验套餐关联的酒店房型存在（null/undefined 跳过） */
@@ -905,6 +916,9 @@ function serializeBundle(
   b: BundleWithRoom,
   rating: ProductRatingAggregate = ZERO_RATING,
   flightRefRoundTripCny: number | null = null,
+  // 自备签减免的**有效**费率：null=跟随签证组件产品价时由调用方经 resolveSelfVisaDeductCny
+  // 解析后传入；不传则回落显式覆盖值 ?? 0（仅无签证组件的路径，语义等价）。
+  selfVisaDeductEffectiveCny: number | null = null,
 ) {
   const { hotelRoomType, outboundFlight, returnFlight, ...rest } = b;
   const bItems = Array.isArray(b.items) ? (b.items as Array<{ kind: string; qty: number; unitPrice: number }>) : [];
@@ -949,8 +963,11 @@ function serializeBundle(
     // 占座儿童折扣 / 婴儿价（CNY，整数，server-priced）；前端据此报价儿童/婴儿
     childSeatDiscountCnyPerPerson: b.childSeatDiscountCnyPerPerson,
     infantPriceCny: b.infantPriceCny,
-    // 自备签证可减额（CNY，整数）；admin 表单读回
-    selfVisaDeductCny: b.selfVisaDeductCny,
+    // 自备签证可减额（CNY，整数）——**有效值**（null=跟随时已解析为签证组件产品价合计）；
+    // 录单弹窗按人 hint、签证列显示条件等消费方拿到的始终是真正会扣的数。
+    selfVisaDeductCny: selfVisaDeductEffectiveCny ?? b.selfVisaDeductCny ?? 0,
+    // 原始覆盖值（admin 编辑表单读回）：null = 跟随签证组件产品价；非 null = 套餐自有覆盖（含 0）。
+    selfVisaDeductOverrideCny: b.selfVisaDeductCny,
     legs: b.legs,
     // 运营封盘日（按出发日 D；admin 读回）+ 前台默认出发日（仅影响初始选中）
     blackoutDates: b.blackoutDates,

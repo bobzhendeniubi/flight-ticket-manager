@@ -2548,8 +2548,11 @@ export interface Bundle {
   infantPriceCny: number;
   /** 计费航段数（来回 = 2，单程 = 1）；升舱加价 = businessUpgradeCnyPerLeg × legs × 人数 */
   legs: number;
-  /** 客人自备签证可扣减金额（CNY/单，整数，每张套餐减一次）；>0 时录单/前台显示"自备签证"勾选 */
+  /** 客人自备签证可扣减金额（CNY/单，整数，每张套餐减一次）——**有效值**：
+   * 套餐未覆盖时服务端已按签证组件产品价合计解析；>0 时录单/前台显示"自备签证"勾选 */
   selfVisaDeductCny: number;
+  /** 自备签减免的原始覆盖值：null = 跟随签证组件产品价（admin 表单读回编辑用）；非 null 含 0 = 套餐自有覆盖 */
+  selfVisaDeductOverrideCny?: number | null;
   /** 每人操作费（CNY/人，整数，DB 默认 ¥20）：计入起价/人，下单按占座人头收（卖价侧，非财务成本口径） */
   operationFeeCny: number;
   /** 按出发日的不可售日期（单套餐粒度）；缺省/空 = 不限制 */

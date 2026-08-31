@@ -1312,8 +1312,10 @@ model Bundle {
   childSeatDiscountCnyPerPerson Int      @default(30)
   infantPriceCny                Int      @default(0)
   // 自备签证可减额（CNY）：套餐含签证费时，客人自备签证（不需要送签）则从套餐价减此额。
-  // 运营在后台改；0 = 不允许减。录单勾"客人自备签证"时由 computeBundleAddOn 扣减。
-  selfVisaDeductCny             Int      @default(0)
+  // null = 跟随签证组件产品价（Visa.basePrice 合计；一处改价全站生效，2026-08-30 价格收敛拍板）；
+  // 非 null = 套餐自有覆盖（含 0 = 显式不减，特价团用）。存量数据保持原显式值不迁移，行为不变。
+  // 与 businessUpgradeCnyPerLeg 的「null = 跟随航班」同一套语义。
+  selfVisaDeductCny             Int?
   // 机票航段数（来回 = 2，单程 = 1）— 升舱加价 = businessUpgradeCnyPerLeg × legs × businessCount
   legs                          Int      @default(2)
   // 运营封盘日（按出发日 D）：该日整套餐不可售，优先级高于库存判定。

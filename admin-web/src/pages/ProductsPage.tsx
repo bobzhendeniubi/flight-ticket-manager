@@ -45,6 +45,8 @@ type MockBundleWithServiceNotes = MockBundle & {
   /** 结算价日历取价键：酒店档次 + 住宿晚数（都配了才走日历取价；null = 不走日历） */
   settlementTier?: SettlementTier | null;
   settlementNights?: number | null;
+  /** 自备签减免**有效值**（跟随时已按签证产品价解析）；仅表单占位提示用，保存回传的是覆盖值。 */
+  selfVisaDeductEffectiveCny?: number;
 };
 
 /** 加急档位数量上限（与后端 products.schemas VISA_EXPRESS_TIER_MAX 同值）。 */
@@ -215,7 +217,11 @@ function bundleApiToMock(b: ApiBundle): MockBundleWithServiceNotes {
     singleSupplementCnyPerNight: b.singleSupplementCnyPerNight,
     businessUpgradeCnyPerLeg: b.businessUpgradeCnyPerLeg,
     childSeatDiscountCnyPerPerson: b.childSeatDiscountCnyPerPerson,
-    selfVisaDeductCny: b.selfVisaDeductCny ?? null,
+    // 本地模型存**覆盖值**（null=跟随签证产品价）：存有效值的话，没动过的套餐一保存
+    // 就会把「跟随」固化成显式数值，签证改价从此追不上这张套餐。
+    selfVisaDeductCny: b.selfVisaDeductOverrideCny ?? null,
+    // 有效值只用于表单占位提示（「当前跟随价 ¥X」），不参与保存回传。
+    selfVisaDeductEffectiveCny: b.selfVisaDeductCny ?? 0,
     // 每人操作费（服务端恒返回 number，DB 默认 ¥20）；?? 20 只防老缓存缺字段。
     operationFeeCny: b.operationFeeCny ?? 20,
     infantPriceCny: b.infantPriceCny,
@@ -1120,7 +1126,7 @@ function BundleCard({
   onToggle,
   onDelete,
 }: {
-  bundle: MockBundle;
+  bundle: MockBundleWithServiceNotes;
   onEdit: () => void;
   onToggle: () => void;
   onDelete: () => void;
@@ -1267,7 +1273,7 @@ function BundleCard({
         </div>
       )}
 
-      {(bundle.childSeatDiscountCnyPerPerson != null || bundle.infantPriceCny != null || (bundle.selfVisaDeductCny != null && bundle.selfVisaDeductCny > 0)) && (
+      {(bundle.childSeatDiscountCnyPerPerson != null || bundle.infantPriceCny != null || (bundle.selfVisaDeductEffectiveCny ?? bundle.selfVisaDeductCny ?? 0) > 0) && (
         <div className="mt-1 text-xs text-ink-soft">
           <span className="mr-1 rounded bg-slate-100 px-1 py-0.5 text-[10px] font-medium text-ink-muted">可选加项 · 不计入起价</span>
           {bundle.childSeatDiscountCnyPerPerson != null && (
@@ -1277,9 +1283,9 @@ function BundleCard({
           {bundle.infantPriceCny != null && (
             <><Icon name="user" /> 婴儿价 ¥{bundle.infantPriceCny.toLocaleString()}/人</>
           )}
-          {(bundle.childSeatDiscountCnyPerPerson != null || bundle.infantPriceCny != null) && bundle.selfVisaDeductCny != null && bundle.selfVisaDeductCny > 0 && ' · '}
-          {bundle.selfVisaDeductCny != null && bundle.selfVisaDeductCny > 0 && (
-            <><Icon name="visa" /> 自备签证 −¥{bundle.selfVisaDeductCny.toLocaleString()}/单</>
+          {(bundle.childSeatDiscountCnyPerPerson != null || bundle.infantPriceCny != null) && (bundle.selfVisaDeductEffectiveCny ?? bundle.selfVisaDeductCny ?? 0) > 0 && ' · '}
+          {(bundle.selfVisaDeductEffectiveCny ?? bundle.selfVisaDeductCny ?? 0) > 0 && (
+            <><Icon name="visa" /> 自备签证 −¥{(bundle.selfVisaDeductEffectiveCny ?? bundle.selfVisaDeductCny ?? 0).toLocaleString()}/单</>
           )}
         </div>
       )}
@@ -1864,11 +1870,18 @@ function NewBundleWizard({
                 min={0}
                 max={1000000}
                 className="input"
-                placeholder="留空 = 0（不减）"
+                placeholder={
+                  initial?.selfVisaDeductEffectiveCny != null && initial.selfVisaDeductEffectiveCny > 0
+                    ? `留空 = 跟随签证产品价（当前 ¥${initial.selfVisaDeductEffectiveCny.toLocaleString()}）`
+                    : '留空 = 跟随签证产品价（签证改价一处生效）'
+                }
                 value={selfVisaDeduct}
                 onChange={(n) => setSelfVisaDeduct(n)}
                 integerOnly
               />
+              <p className="mt-0.5 text-[11px] text-slate-400">
+                留空 = 跟随本套餐签证组件的产品价（签证产品改价全站生效）；填 0 = 显式不减；填数值 = 本套餐固定覆盖。
+              </p>
             </div>
             <div>
               <label className="label">每人操作费（¥/人，计入起价，下单按占座人头收）</label>

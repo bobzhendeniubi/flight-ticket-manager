@@ -90,6 +90,7 @@ import { derivePtcByAge, earliestFlightDeparture } from './pnr-export.js';
 // fulfillment.service 只 import prisma/errors/自身 schemas，不回头 import orders 模块，无环。
 import { deriveVisaTaskStatus } from '../fulfillment/fulfillment.service.js';
 import { syncOrderVisaCompletion } from '../fulfillment/visa-completion.js';
+import { resolveSelfVisaDeductCny } from '../products/self-visa-deduct.js';
 import {
   assertOrderAllowsInvoicing,
   assertTicketingCap,
@@ -3296,6 +3297,10 @@ export class OrderService {
         //   两趟都没绑到航班时兜底 DEFAULT_BUSINESS_UPGRADE_CNY_PER_LEG，绝不派生出 0/裸价。
         //   非 null → 套餐自有覆盖（含 0 = 显式不提供升舱），行为不变。
         const effectiveBusinessUpgradeCnyPerLeg = resolveBundleBusinessUpgradeRate(bundle);
+        // 自备签减免单一配置源（与升舱同构）：套餐 selfVisaDeductCny=null → 跟随签证组件产品价
+        //   （Visa.basePrice 合计）；非 null → 套餐自有覆盖（含 0 = 显式不减）。
+        //   解析后的数落进订单行快照，下游改档/改自备签仍读快照，口径不变。
+        const effectiveSelfVisaDeductCny = await resolveSelfVisaDeductCny(bundle);
         const businessUpgradeInput = resolveBundleBusinessUpgradeInput(item);
         // 本单是否有 BUNDLE 行用了分程口径 —— 只有分程口径才启用「回程升舱却没有回程航段」的硬闸，
         // 旧整程入参一律沿用扩展前的宽松行为（回程那份人数无处落座时不拒单），历史调用零回归。
@@ -3303,7 +3308,11 @@ export class OrderService {
           hasSplitBusinessUpgradeInput = true;
         }
         const addOn = computeBundleAddOn(
-          { ...bundle, businessUpgradeCnyPerLeg: effectiveBusinessUpgradeCnyPerLeg },
+          {
+            ...bundle,
+            businessUpgradeCnyPerLeg: effectiveBusinessUpgradeCnyPerLeg,
+            selfVisaDeductCny: effectiveSelfVisaDeductCny,
+          },
           hotelStamp,
           derivedSingleCount,
           // 升舱口径：分程字段任一显式提供 → 去/回程各算；都省略 → 回落旧整程 businessCount。
@@ -10732,8 +10741,10 @@ export class OrderService {
         locked.items as unknown as Array<Record<string, unknown>>,
       );
 
+      // 自备签减免单一配置源：null = 跟随签证组件产品价（与录单计价同一解析，改档不例外）。
+      const changedSelfVisaDeductCny = await resolveSelfVisaDeductCny(newBundle, tx);
       const priced = computeChangedBundleLine({
-        bundle: newBundle,
+        bundle: { ...newBundle, selfVisaDeductCny: changedSelfVisaDeductCny },
         occupancy,
         singleCount,
         businessSplit,
