@@ -13,7 +13,6 @@
  *   - 订单已 CANCELLED：标记 REFUNDED（资金原路退回）
  */
 import {
-  CommissionStatus,
   OrderStatus,
   PaymentMethod,
   PaymentStatus,
@@ -1270,18 +1269,9 @@ export class PaymentsService {
         );
       }
 
-      // 佣金净额口径：正数 REVERSED 是 ACCRUED 翻牌后的死行要剔除；负数 REVERSED 是补偿行要保留。
-      const commissionAgg = await tx.commissionRecord.aggregate({
-        where: {
-          orderId: sourceOrder.id,
-          OR: [
-            { status: { not: CommissionStatus.REVERSED } },
-            { amount: { lt: 0 } },
-          ],
-        },
-        _sum: { amount: true },
-      });
-      const commissionNet = round2(Number(commissionAgg._sum.amount ?? 0));
+      // 佣金净额口径与撤销收款/认款同源（lib/commission-net）：按代理分组净额，
+      // 正数 REVERSED 死行剔除、负数补偿行保留，不同代理不得互相抵消。
+      const commissionNet = await outstandingCommissionNetWithinTx(tx, sourceOrder.id);
       if (commissionNet > 0.001) {
         throw new BadRequestError(
           `订单 ${sourceOrder.orderNumber} 已计提代理佣金 ¥${commissionNet.toFixed(2)}（尚未冲销），` +
