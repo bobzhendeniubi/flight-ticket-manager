@@ -136,12 +136,16 @@ const EnvSchema = z.object({
   FLIGHT_MAX_OVERSELL_SEATS: z.coerce.number().int().min(0).default(5),
 
   // ═══════════════════════════════════════════════════════════
-  // 酒店库存：包房间数下调守卫（同 FLIGHT_MAX_OVERSELL_SEATS 哲学）
-  // 允许把包房周期的 rooms（或缩小日期区间）改到低于当晚已占用的物理间数
-  // （真实退房场景），但缺口（已占用 − 新包房）超过此上限就拒绝写入——防止
-  // 手滑把周期改小或删错，把大量在住订单甩成账面超卖。删除周期无豁免（零容忍）。
+  // 酒店库存：账面超卖容忍上限（同 FLIGHT_MAX_OVERSELL_SEATS 哲学），管两个方向：
+  //   1) 包房间数下调守卫 —— 允许把包房周期的 rooms（或缩小日期区间）改到低于当晚
+  //      已占用的物理间数（真实退房场景），缺口超上限拒绝写入，防手滑把周期改小/删错。
+  //      删除周期无豁免（零容忍）。
+  //   2) 内部录单限额内超售 —— 销控售罄后运营仍可录单（当天临时向酒店加房是常态业务），
+  //      每晚累计缺口 ≤ 上限放行并写 WARNING 审计、销控板显示负数；超上限拒单，
+  //      防手滑（如大团录错日期一次打穿负十几间）。仅后台 ADMIN/STAFF 录单享有，
+  //      前台散客/代理下单仍是硬闸。
   // ═══════════════════════════════════════════════════════════
-  HOTEL_MAX_OVERSELL_ROOMS: z.coerce.number().int().min(0).default(2),
+  HOTEL_MAX_OVERSELL_ROOMS: z.coerce.number().int().min(0).default(3),
 });
 
 export type Env = z.infer<typeof EnvSchema>;

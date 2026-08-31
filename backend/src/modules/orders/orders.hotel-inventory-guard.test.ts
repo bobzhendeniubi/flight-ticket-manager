@@ -34,6 +34,8 @@ const { mockPrisma } = vi.hoisted(() => ({
     fulfillmentTask: { create: vi.fn(), findMany: vi.fn(), updateMany: vi.fn() },
     agent: { findUnique: vi.fn() },
     visa: { findUnique: vi.fn(), findMany: vi.fn() },
+    hotel: { findMany: vi.fn() },
+    auditLog: { create: vi.fn() },
     $transaction: vi.fn(),
     $queryRaw: vi.fn(),
     $executeRaw: vi.fn(),
@@ -52,6 +54,7 @@ import { BadRequestError } from '../../lib/errors.js';
 
 const service = new OrderService();
 const ADMIN = { userId: 'admin-1', role: UserRole.ADMIN } as const;
+const CUSTOMER = { userId: 'cust-1', role: UserRole.CUSTOMER } as const;
 
 /** 调用顺序留痕：房量闸必须**先加行锁再读占房**，否则锁毫无意义。*/
 const callTrace: string[] = [];
@@ -150,7 +153,7 @@ describe('assertHotelStaysFitWithinTx · 事务内带行锁的物理房量闸', 
 
     await expect(
       assertHotelStaysFitWithinTx(tx as never, [{ ...STAY, roomsBilled: 1 }], []),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual([]);
   });
 
   it('未配包房周期（未纳入管控）→ 不拦截（房控哲学：未配包房 ≠ 售罄）', async () => {
@@ -158,7 +161,7 @@ describe('assertHotelStaysFitWithinTx · 事务内带行锁的物理房量闸', 
 
     await expect(
       assertHotelStaysFitWithinTx(tx as never, [{ ...STAY, roomsBilled: 5 }], []),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual([]);
   });
 
   it('必须先 FOR UPDATE 锁包房周期行、再读包房量/占房 —— 判定与落库之间不能有窗口', async () => {
@@ -202,7 +205,7 @@ describe('assertHotelStaysFitWithinTx · 事务内带行锁的物理房量闸', 
 
     await expect(
       assertHotelStaysFitWithinTx(tx as never, [{ ...STAY, roomsBilled: 3 }], []),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual([]);
     expect(callTrace).not.toContain('LOCK_BLOCK_PERIODS');
   });
 
@@ -299,10 +302,42 @@ describe('createOrder · 指定房型 HOTEL 行的房量闸（CRITICAL）', () =
     return tx;
   }
 
-  it('目标酒店当晚已售罄 → 拒单（中性话术），且订单绝不落库', async () => {
+  it('目标酒店当晚已售罄 → 前台散客拒单（中性话术），且订单绝不落库（超售口子只对内部录单开）', async () => {
     const tx = mountCreateOrder({ blockRooms: 2, existingRooms: [1, 1] });
 
-    await expect(service.createOrder(body as never, ADMIN)).rejects.toThrow(HOTEL_SOLD_OUT_MESSAGE);
+    await expect(service.createOrder(body as never, CUSTOMER)).rejects.toThrow(
+      HOTEL_SOLD_OUT_MESSAGE,
+    );
+    expect(tx.order.create).not.toHaveBeenCalled();
+  });
+
+  it('已售罄但缺口在超售上限内 → 内部 ADMIN/STAFF 录单放行落库，并写 WARNING 超售审计', async () => {
+    // block 2、已占 2、再录 1 间 → 缺口 1 ≤ 上限（默认 3）→ 放行（当天临时向酒店加房是常态业务）
+    const tx = mountCreateOrder({ blockRooms: 2, existingRooms: [1, 1] });
+    mockPrisma.hotel.findMany.mockResolvedValue([{ id: 'hotel-1', name: '明月酒店' }]);
+    mockPrisma.auditLog.create.mockResolvedValue({});
+
+    await service.createOrder(body as never, ADMIN);
+
+    expect(tx.order.create).toHaveBeenCalled();
+    const auditCalls = mockPrisma.auditLog.create.mock.calls.map(
+      (c) => (c[0] as { data: { action: string } }).data,
+    );
+    const oversoldAudit = auditCalls.find((d) => d.action === 'CREATE_ORDER_HOTEL_OVERSOLD');
+    expect(oversoldAudit).toBeDefined();
+    expect(oversoldAudit).toMatchObject({ severity: 'WARNING' });
+  });
+
+  it('已售罄且缺口超过超售上限 → 内部录单也拒（防手滑打穿），订单不落库', async () => {
+    // block 2、已占 2、再录 5 间 → 缺口 5 > 上限（默认 3）
+    const tx = mountCreateOrder({ blockRooms: 2, existingRooms: [1, 1] });
+
+    await expect(
+      service.createOrder(
+        { ...body, items: [{ ...body.items[0], roomsBilled: 5 }] } as never,
+        ADMIN,
+      ),
+    ).rejects.toThrow(/超售容忍上限/);
     expect(tx.order.create).not.toHaveBeenCalled();
   });
 
@@ -463,7 +498,7 @@ describe('assertRandomTierStaysFitWithinTx · 事务内带行锁的随机档聚�
 
     await expect(
       assertRandomTierStaysFitWithinTx(tx as never, [{ ...RANDOM_STAY, roomsBilled: 1 }]),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual([]);
   });
 
   it('同星级包房 2 间、已占 1 间，再来 2 间 → 拒，且回中性话术（不泄露合计余量）', async () => {
@@ -481,7 +516,7 @@ describe('assertRandomTierStaysFitWithinTx · 事务内带行锁的随机档聚�
 
     await expect(
       assertRandomTierStaysFitWithinTx(tx as never, [{ ...RANDOM_STAY, roomsBilled: 5 }]),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual([]);
   });
 
   it('必须先 FOR UPDATE 锁该档次全部真酒店的包房周期行、再读余量', async () => {
@@ -544,7 +579,7 @@ describe('assertRandomTierStaysFitWithinTx · 事务内带行锁的随机档聚�
           roomsBilled: 9,
         },
       ]),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual([]);
     expect(callTrace).not.toContain('LOCK_BLOCK_PERIODS');
   });
 

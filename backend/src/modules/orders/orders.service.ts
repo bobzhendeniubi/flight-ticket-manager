@@ -79,8 +79,11 @@ import {
   getRandomTierAggregate,
   lockHotelBlockPeriodsWithinTx,
   randomStarTierLabel,
+  type PhysicalFitViolation,
   type ProspectiveOccupancy,
+  type RandomTierFitViolation,
 } from '../hotel-control/hotel-control.service.js';
+import { env } from '../../config/env.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
 import { OPERATION_FEE_CNY_PER_ORDER } from './order-cost-items.service.js';
@@ -1399,6 +1402,11 @@ export class OrderService {
     // body.flightSettlementPriceCny 存在 → 团队议价结算价覆盖机票价（鉴权在路由/批量层完成）。
     // 指定酒店星级不匹配的放行留痕（ADMIN/STAFF 带原因放行时才有内容）→ 建单成功后写审计。
     const starMismatchOverrides: DesignatedHotelStarMismatchOverride[] = [];
+    // 酒店限额内超售豁免：仅内部 ADMIN/STAFF 录单（销控售罄后当天临时加房是常态业务，
+    // 缺口 ≤ 上限放行并写 WARNING 审计）；前台散客/代理下单缺省 = 硬闸。
+    const hotelOversellCapRooms = isStaffEnteredOrder(requester)
+      ? env.HOTEL_MAX_OVERSELL_ROOMS
+      : undefined;
     const pricedItems = await this.priceAndValidateItems(
       body.items,
       body.flightSettlementPriceCny,
@@ -1408,6 +1416,7 @@ export class OrderService {
       isStaffEnteredOrder(requester),
       // 星级闸按认证身份判权限（不信前端）：游客无角色 → null，与 AGENT/CUSTOMER 同样硬拒。
       { role: requesterRole ?? null, overrides: starMismatchOverrides },
+      hotelOversellCapRooms,
     );
 
     // 散客 RETAIL 立减判定与 quote 共用 shouldApplyRetailSettlementDiscount，两边不会再分叉。
@@ -1593,6 +1602,9 @@ export class OrderService {
     // 事务：原子扣座位（CAS 防超卖）→ 写订单 → 写事件 → 消费本人锁位
     // 事务提交后要移除已消费锁位的到期任务（jobId seatlock:<id>），先收集 id
     const consumedLockIds: string[] = [];
+    // 建单事务里被限额容忍的酒店超卖明细（仅内部录单可能非空）→ 事务提交后写 WARNING 审计。
+    let oversoldHotelStays: HotelStayOversellRecord[] = [];
+    let oversoldRandomTiers: RandomTierOversellRecord[] = [];
     const order = await prisma.$transaction(async (tx) => {
       // 用 updateMany 的 where 条件做原子"检查+扣减"一步到位，避免 TOCTOU
       // where: `sold + qty + lockedByOthers + heldQty <= capacity` 等价于
@@ -1668,17 +1680,22 @@ export class OrderService {
       // （priceAndValidateItems 里那道事务外的判定保留为「友好预检」：它能在长事务开始前就
       //  拒掉明显售罄的单，也服务于 quote 试算；权威判定以这里为准。）
       // 未落位随机档行（无房型 / 占位酒店房型）不走这里，它们由下面那道随机档聚合闸把关。
-      await assertHotelStaysFitWithinTx(tx, pricedItems, body.passengers, {
-        // 前台散客/游客也走这条路径 → 中性话术，不暴露包房间数等内部库存数字。
-        buildMessage: () => HOTEL_SOLD_OUT_MESSAGE,
+      // 内部录单（hotelOversellCapRooms 非空）：限额内超售放行，明细收进 oversold* 供事务后
+      // 写 WARNING 审计；超上限用带数字文案拒（运营要看得见差多少间）。对外端点仍中性话术硬闸。
+      oversoldHotelStays = await assertHotelStaysFitWithinTx(tx, pricedItems, body.passengers, {
+        maxOversellRooms: hotelOversellCapRooms,
+        buildMessage:
+          hotelOversellCapRooms != null ? undefined : () => HOTEL_SOLD_OUT_MESSAGE,
       });
 
       // ── 随机档聚合余量闸（同一事务、同一把锁语义）────────────────────────────
       // 与上面那道真酒店闸互补：未落位的随机档行占的是「同星级酒店合计余量」。
       // priceAndValidateItems 里那两处事务外判定同样保留为友好预检（也服务于 quote 试算），
       // 权威判定以这里为准 —— 先锁该档次全部真酒店的包房周期行，判定与落库之间不留窗口。
-      await assertRandomTierStaysFitWithinTx(tx, pricedItems, {
-        buildMessage: () => HOTEL_SOLD_OUT_MESSAGE,
+      oversoldRandomTiers = await assertRandomTierStaysFitWithinTx(tx, pricedItems, {
+        maxOversellRooms: hotelOversellCapRooms,
+        buildMessage:
+          hotelOversellCapRooms != null ? undefined : () => HOTEL_SOLD_OUT_MESSAGE,
       });
 
       // 初始状态直接 PENDING_PAYMENT（MVP 阶段没有 DRAFT 保存流）
@@ -1956,6 +1973,61 @@ export class OrderService {
       });
     }
 
+    // 酒店限额内超售放行留痕（哪家/哪档、哪几晚、缺口几间 + 操作人）。仅内部录单可能非空
+    // （豁免按 isStaffEnteredOrder 收口 → 走到这里必为 ADMIN/STAFF）。
+    // WARNING 级：销控已是负数，需要有人当天去向酒店加房——与机票容量超售审计同哲学。
+    // await（非 fire-and-forget）：与上面各财务敏感审计同口径，落审计后再返回。
+    if ((oversoldHotelStays.length > 0 || oversoldRandomTiers.length > 0) && !isGuest) {
+      const hotelNameById = new Map<string, string>();
+      if (oversoldHotelStays.length > 0) {
+        const hotels = await prisma.hotel.findMany({
+          where: { id: { in: oversoldHotelStays.map((r) => r.hotelId) } },
+          select: { id: true, name: true },
+        });
+        for (const h of hotels) hotelNameById.set(h.id, h.name);
+      }
+      const parts = [
+        ...oversoldHotelStays.map((r) => {
+          const worst = r.violations.reduce((a, b) => (b.shortfall > a.shortfall ? b : a));
+          return `${hotelNameById.get(r.hotelId) ?? r.hotelId} ${worst.date} 起缺 ${worst.shortfall} 间`;
+        }),
+        ...oversoldRandomTiers.map((r) => {
+          const worst = r.violations.reduce((a, b) => (b.shortfall > a.shortfall ? b : a));
+          return `${randomStarTierLabel(r.tier)} ${worst.date} 起缺 ${worst.shortfall} 间`;
+        }),
+      ];
+      await writeAudit({
+        actor: { userId: requester.userId, role: requester.role },
+        action: 'CREATE_ORDER_HOTEL_OVERSOLD',
+        targetType: 'ORDER',
+        targetId: order.id,
+        targetLabel: `${order.orderNumber} 超售放行（${parts.join('、')}，上限 ${env.HOTEL_MAX_OVERSELL_ROOMS} 间）`,
+        after: {
+          maxOversellRooms: env.HOTEL_MAX_OVERSELL_ROOMS,
+          hotels: oversoldHotelStays.map((r) => ({
+            hotelId: r.hotelId,
+            hotelName: hotelNameById.get(r.hotelId) ?? null,
+            nights: r.violations.map((v) => ({
+              date: v.date,
+              block: v.block,
+              physicalUsed: v.physicalUsed,
+              shortfall: v.shortfall,
+            })),
+          })),
+          randomTiers: oversoldRandomTiers.map((r) => ({
+            tier: r.tier,
+            nights: r.violations.map((v) => ({
+              date: v.date,
+              remaining: v.remaining,
+              rooms: v.rooms,
+              shortfall: v.shortfall,
+            })),
+          })),
+        },
+        severity: AuditSeverity.WARNING,
+      });
+    }
+
     return order;
   }
 
@@ -2004,6 +2076,9 @@ export class OrderService {
       body.passengers,
       true,
       starGate,
+      // 内部 ADMIN/STAFF 试算与 createOrder 同口径吃限额内超售豁免（否则录单弹窗试算
+      // 先被友好预检拒掉，实下单反而能成）；AGENT 试算仍硬闸。
+      isOperator ? env.HOTEL_MAX_OVERSELL_ROOMS : undefined,
     );
     // 散客立减与结算价日历是两条独立规则链：先按每个套餐行命中 RETAIL，
     // 即使日历价未维护，quote 的商品总价也必须与 createOrder 保持一致。
@@ -2729,6 +2804,10 @@ export class OrderService {
     //   传了才启用「套餐档次 ↔ 指定酒店星级」校验，AGENT/CUSTOMER/游客不匹配即拒单，
     //   ADMIN/STAFF 须带非空放行原因，放行明细推进 overrides 供调用方写审计。
     starGate?: DesignatedHotelStarGate,
+    // 酒店限额内超售豁免（间）：仅内部 ADMIN/STAFF 录单/试算传入（销控售罄后仍可录单，
+    // 当天临时向酒店加房是常态业务）。缺省 = 硬闸——前台散客/代理必须缺省。
+    // 这里只影响**事务外友好预检**；权威判定与 WARNING 审计在建单事务内（createOrder）。
+    hotelOversellCapRooms?: number,
   ) {
     const priced: PricedOrderItem[] = [];
 
@@ -2853,7 +2932,10 @@ export class OrderService {
           // 该档次整段无任何同星级包房周期 → 视为未管控，不拦截（房控哲学：未配包房 ≠ 售罄）。
           const stayNights = buildStayNightDates(new Date(item.checkIn), new Date(item.checkOut));
           if (stayNights.length > 0) {
-            await assertRandomTierFit(item.randomStarTier, stayNights, rooms);
+            // 这条分支必为后台录单（上面已按 allowClientPricedGround 拒掉对外角色）→ 直接吃豁免。
+            await assertRandomTierFit(item.randomStarTier, stayNights, rooms, {
+              maxOversellRooms: hotelOversellCapRooms,
+            });
           }
         }
         if (item.hotelRoomTypeId) {
@@ -3269,18 +3351,28 @@ export class OrderService {
         if (hotelStamp && fitHotelId) {
           const nightDates = buildStayNightDates(hotelStamp.hotelCheckIn, hotelStamp.hotelCheckOut);
           if (nightDates.length > 0) {
+            // 带豁免 = 内部 ADMIN/STAFF 录单：用默认的带数字文案（要看得见差多少间/超没超上限）；
+            // 对外端点（豁免缺省）：中性话术，不暴露包房间数等内部库存数字。
             if (fitPlaceholderTier != null) {
               await assertRandomTierFit(fitPlaceholderTier, nightDates, rooms, {
-                // 对外端点：与具体酒店闸同款中性话术，不暴露合计余量等内部库存数字。
-                buildMessage: () => '该出发日期酒店可用房量不足，请更换日期或联系客服',
+                maxOversellRooms: hotelOversellCapRooms,
+                buildMessage:
+                  hotelOversellCapRooms != null
+                    ? undefined
+                    : () => '该出发日期酒店可用房量不足，请更换日期或联系客服',
               });
             } else {
               await assertHotelPhysicalFit(
                 fitHotelId,
                 nightDates,
                 toProspectiveOccupancy(rooms, passengers),
-                // 对外端点：只回中性话术，不暴露包房间数等内部库存数字。
-                { buildMessage: () => '该出发日期酒店可用房量不足，请更换日期或联系客服' },
+                {
+                  maxOversellRooms: hotelOversellCapRooms,
+                  buildMessage:
+                    hotelOversellCapRooms != null
+                      ? undefined
+                      : () => '该出发日期酒店可用房量不足，请更换日期或联系客服',
+                },
               );
             }
           }
@@ -12866,16 +12958,22 @@ export interface ProspectiveHotelStay {
  * 归并同样是必需的：同一单两条随机档行各判一次会双双通过（它们都还没落库、彼此看不见）。
  * 加锁顺序按归并键排序，避免并发事务以不同顺序锁同一批档次造成死锁。
  */
+/** 建单事务闸容忍的随机档超卖明细（按档次归并后逐组）。*/
+export interface RandomTierOversellRecord {
+  tier: number;
+  violations: RandomTierFitViolation[];
+}
+
 export async function assertRandomTierStaysFitWithinTx(
   tx: Prisma.TransactionClient,
   stays: ReadonlyArray<ProspectiveHotelStay>,
-  opts: { excludeOrderId?: string; buildMessage?: () => string } = {},
-): Promise<void> {
+  opts: { excludeOrderId?: string; maxOversellRooms?: number; buildMessage?: () => string } = {},
+): Promise<RandomTierOversellRecord[]> {
   const dated = stays.filter(
     (s): s is ProspectiveHotelStay & { hotelCheckIn: Date; hotelCheckOut: Date } =>
       Boolean(s.hotelCheckIn && s.hotelCheckOut),
   );
-  if (dated.length === 0) return;
+  if (dated.length === 0) return [];
 
   // 占位酒店房型 → 档次：只对「有房型 id 且无显式 randomStarTier」的行查一次库。
   const placeholderLookupIds = [
@@ -12920,10 +13018,19 @@ export async function assertRandomTierStaysFitWithinTx(
     }
   }
 
+  const tolerated: RandomTierOversellRecord[] = [];
   for (const key of [...groups.keys()].sort()) {
     const group = groups.get(key)!;
-    await assertRandomTierFitWithinTx(tx, group.tier, group.nightDates, group.rooms, opts);
+    const violations = await assertRandomTierFitWithinTx(
+      tx,
+      group.tier,
+      group.nightDates,
+      group.rooms,
+      opts,
+    );
+    if (violations.length > 0) tolerated.push({ tier: group.tier, violations });
   }
+  return tolerated;
 }
 
 /**
@@ -12949,12 +13056,18 @@ export async function assertRandomTierStaysFitWithinTx(
  *   · 房型挂在**随机档占位酒店**上（randomTierPlaceholder 非空）—— 那不是真房源，
  *     这类行走随机档聚合闸（assertRandomTierFit），与本闸互斥不重叠。
  */
+/** 建单事务闸容忍的具体酒店超卖明细（按酒店×区间归并后逐组）。*/
+export interface HotelStayOversellRecord {
+  hotelId: string;
+  violations: PhysicalFitViolation[];
+}
+
 export async function assertHotelStaysFitWithinTx(
   tx: Prisma.TransactionClient,
   stays: ReadonlyArray<ProspectiveHotelStay>,
   passengers: ReadonlyArray<{ gender?: 'M' | 'F' | 'X' }> | undefined,
-  opts: { excludeOrderId?: string; buildMessage?: () => string } = {},
-): Promise<void> {
+  opts: { excludeOrderId?: string; maxOversellRooms?: number; buildMessage?: () => string } = {},
+): Promise<HotelStayOversellRecord[]> {
   const rows = stays.filter(
     (s): s is ProspectiveHotelStay & {
       hotelRoomTypeId: string;
@@ -12962,7 +13075,7 @@ export async function assertHotelStaysFitWithinTx(
       hotelCheckOut: Date;
     } => Boolean(s.hotelRoomTypeId && s.hotelCheckIn && s.hotelCheckOut),
   );
-  if (rows.length === 0) return;
+  if (rows.length === 0) return [];
 
   const roomTypes = await tx.hotelRoomType.findMany({
     where: { id: { in: [...new Set(rows.map((r) => r.hotelRoomTypeId))] } },
@@ -13000,21 +13113,25 @@ export async function assertHotelStaysFitWithinTx(
     }
   }
 
+  const tolerated: HotelStayOversellRecord[] = [];
   for (const key of [...groups.keys()].sort()) {
     const group = groups.get(key)!;
-    await assertHotelPhysicalFitWithinTx(
+    const violations = await assertHotelPhysicalFitWithinTx(
       tx,
       group.hotelId,
       group.nightDates,
       { wholeRooms: group.wholeRooms, solos: group.solos },
       {
         excludeOrderId: opts.excludeOrderId,
+        maxOversellRooms: opts.maxOversellRooms,
         // 不传 → 用 assertHotelPhysicalFit 自带的带数字文案（后台录单要看得见差多少间）；
         // 对外可达的端点（前台下单）显式传中性话术，别把包房间数回给客人。
         buildMessage: opts.buildMessage,
       },
     );
+    if (violations.length > 0) tolerated.push({ hotelId: group.hotelId, violations });
   }
+  return tolerated;
 }
 
 /**

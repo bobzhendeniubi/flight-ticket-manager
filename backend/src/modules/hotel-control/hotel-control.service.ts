@@ -1053,7 +1053,12 @@ export async function checkHotelPhysicalFit(
  * @param opts.allowNonWorsening 只拦「让某晚更差」的操作。存量单可能**已经**物理超卖
  *   （切闸前累积的），运营重排分房去补救时不该被自己造成的存量超卖挡在门外 —— 这类
  *   「改完不比改前差」的操作放行。新增占房（下单/换酒店）不应开这个豁免。
+ * @param opts.maxOversellRooms 限额内超售放行（内部录单专用口子）：售罄后运营仍可录单
+ *   （当天临时向酒店加房是常态业务），每晚**累计**缺口 ≤ 此值时不抛错、把被容忍的
+ *   超卖明细作为返回值交给调用方写 WARNING 审计；任一晚缺口超上限仍拒（防手滑打穿）。
+ *   缺省 = 硬闸（前台散客/代理下单必须缺省）。
  * @param opts.buildMessage 定制错误文案（对外端点用中性话术，后台可回明细）。
+ * @returns 被 maxOversellRooms 容忍的超卖明细（未开豁免或装得下 → 空数组）。
  */
 export async function assertHotelPhysicalFit(
   hotelId: string,
@@ -1063,10 +1068,11 @@ export async function assertHotelPhysicalFit(
     excludeOrderId?: string;
     excludeOrderItemIds?: readonly string[];
     allowNonWorsening?: boolean;
+    maxOversellRooms?: number;
     buildMessage?: (violations: readonly PhysicalFitViolation[]) => string;
   } = {},
   client: HotelControlDbClient = defaultPrisma,
-): Promise<void> {
+): Promise<PhysicalFitViolation[]> {
   const fit = await checkHotelPhysicalFit(
     hotelId,
     nightDates,
@@ -1074,16 +1080,23 @@ export async function assertHotelPhysicalFit(
     { excludeOrderId: opts.excludeOrderId, excludeOrderItemIds: opts.excludeOrderItemIds },
     client,
   );
-  if (!fit.hasBlock || fit.violations.length === 0) return;
+  if (!fit.hasBlock || fit.violations.length === 0) return [];
   if (
     opts.allowNonWorsening &&
     fit.violations.every((v) => fit.physicalUsedAfter[v.index] <= fit.physicalUsedBefore[v.index])
   ) {
-    return;
+    return [];
+  }
+  if (
+    opts.maxOversellRooms != null &&
+    fit.violations.every((v) => v.shortfall <= opts.maxOversellRooms!)
+  ) {
+    return fit.violations;
   }
   const message = opts.buildMessage
     ? opts.buildMessage(fit.violations)
-    : `酒店实际房间不足（${fit.violations[0].date} 包房 ${fit.violations[0].block} 间，本次操作后需 ${fit.violations[0].physicalUsed} 间）`;
+    : `酒店实际房间不足（${fit.violations[0].date} 包房 ${fit.violations[0].block} 间，本次操作后需 ${fit.violations[0].physicalUsed} 间）` +
+      (opts.maxOversellRooms != null ? `，缺口已超出超售容忍上限 ${opts.maxOversellRooms} 间` : '');
   throw new BadRequestError(message);
 }
 
@@ -1145,11 +1158,12 @@ export async function assertHotelPhysicalFitWithinTx(
     excludeOrderId?: string;
     excludeOrderItemIds?: readonly string[];
     allowNonWorsening?: boolean;
+    maxOversellRooms?: number;
     buildMessage?: (violations: readonly PhysicalFitViolation[]) => string;
   } = {},
-): Promise<void> {
+): Promise<PhysicalFitViolation[]> {
   await lockHotelBlockPeriodsWithinTx(tx, hotelId, nightDates);
-  await assertHotelPhysicalFit(hotelId, nightDates, prospective, opts, tx);
+  return assertHotelPhysicalFit(hotelId, nightDates, prospective, opts, tx);
 }
 
 // ── 随机档聚合余量（派生视图；下单闸 + 销控板共用同一公式）─────────────────
@@ -1253,27 +1267,48 @@ export async function getRandomTierAggregate(
  *
  * `buildMessage`：对外端点（前台下单）传中性话术，别把包房间数/合计余量这些内部库存数字
  * 回给客人；后台录单不传，用默认的带数字文案，方便运营直接判断差多少间。
+ *
+ * `maxOversellRooms`：限额内超售放行（内部录单专用口子，语义同 assertHotelPhysicalFit）：
+ * 每晚**累计**缺口（本次落库后合计余量的负数）≤ 此值时不抛错、把被容忍的超卖明细
+ * 作为返回值交给调用方写 WARNING 审计；任一晚超上限仍拒。缺省 = 硬闸。
  */
+export interface RandomTierFitViolation {
+  date: string; // YYYY-MM-DD
+  remaining: number; // 本次落库前的合计余量（可能已为负 = 存量超卖）
+  rooms: number; // 本次要新增的间数（床位口径，可为 0.5）
+  shortfall: number; // 落库后的累计缺口 = rooms − remaining（> 0）
+}
+
 export async function assertRandomTierFit(
   tier: number,
   nightDates: readonly string[],
   rooms: number,
-  opts: { excludeOrderId?: string; buildMessage?: () => string } = {},
+  opts: { excludeOrderId?: string; maxOversellRooms?: number; buildMessage?: () => string } = {},
   client: HotelControlDbClient = defaultPrisma,
-): Promise<void> {
+): Promise<RandomTierFitViolation[]> {
   const agg = await getRandomTierAggregate(tier, nightDates, opts, client);
-  if (!agg.hasBlock) return;
+  if (!agg.hasBlock) return [];
+  const tolerated: RandomTierFitViolation[] = [];
   for (let i = 0; i < nightDates.length; i++) {
     // block[i] === 0 = 该晚同星级酒店都没切房 → 未管控，不拦截
     if (agg.block[i] <= 0) continue;
     const after = round2(agg.remaining[i] - rooms);
     if (after < 0) {
+      const shortfall = round2(-after);
+      if (opts.maxOversellRooms != null && shortfall <= opts.maxOversellRooms) {
+        tolerated.push({ date: nightDates[i], remaining: agg.remaining[i], rooms, shortfall });
+        continue;
+      }
       throw new BadRequestError(
         opts.buildMessage?.() ??
-          `${randomStarTierLabel(tier)}余量不足（${nightDates[i]} 同星级酒店合计余量 ${agg.remaining[i]} 间，本次需 ${rooms} 间）`,
+          `${randomStarTierLabel(tier)}余量不足（${nightDates[i]} 同星级酒店合计余量 ${agg.remaining[i]} 间，本次需 ${rooms} 间）` +
+            (opts.maxOversellRooms != null
+              ? `，缺口已超出超售容忍上限 ${opts.maxOversellRooms} 间`
+              : ''),
       );
     }
   }
+  return tolerated;
 }
 
 /**
@@ -1326,10 +1361,10 @@ export async function assertRandomTierFitWithinTx(
   tier: number,
   nightDates: readonly string[],
   rooms: number,
-  opts: { excludeOrderId?: string; buildMessage?: () => string } = {},
-): Promise<void> {
+  opts: { excludeOrderId?: string; maxOversellRooms?: number; buildMessage?: () => string } = {},
+): Promise<RandomTierFitViolation[]> {
   await lockRandomTierBlockPeriodsWithinTx(tx, tier, nightDates);
-  await assertRandomTierFit(tier, nightDates, rooms, opts, tx);
+  return assertRandomTierFit(tier, nightDates, rooms, opts, tx);
 }
 
 // ── 销控板（按酒店 × 日期）────────────────────────────────────────────────

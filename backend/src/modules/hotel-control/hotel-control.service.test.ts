@@ -1141,7 +1141,7 @@ describe('checkHotelPhysicalFit（物理房间口径前瞻闸）', () => {
     expect(fit.violations).toEqual([]);
     await expect(
       assertHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 99, solos: [] }, {}, client),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual([]);
   });
 
   it('excludeOrderId 透传到查询：改存量单时排除该单自身既有占房，避免算两遍', async () => {
@@ -1236,7 +1236,42 @@ describe('checkHotelPhysicalFit（物理房间口径前瞻闸）', () => {
     // 不新增占房（重排）→ after == before → allowNonWorsening 放行，运营才能去补救存量超卖
     await expect(
       assertHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 0, solos: [] }, { allowNonWorsening: true }, client),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual([]);
+  });
+
+  // ── 限额内超售放行（内部录单口子）：销控售罄后运营仍可录单，当天临时向酒店加房是常态业务 ──
+  it('maxOversellRooms：累计缺口 ≤ 上限 → 放行并返回被容忍的超卖明细（供调用方写 WARNING 审计）', async () => {
+    // 包房 2 间、要录 3 间 → 缺口 1 ≤ 上限 3 → 放行，销控板显示 -1
+    const client = fitClient([], 2);
+    const tolerated = await assertHotelPhysicalFit(
+      'h1',
+      [dayStr(0)],
+      { wholeRooms: 3, solos: [] },
+      { maxOversellRooms: 3 },
+      client,
+    );
+    expect(tolerated).toHaveLength(1);
+    expect(tolerated[0]).toMatchObject({ date: dayStr(0), block: 2, physicalUsed: 3, shortfall: 1 });
+  });
+
+  it('maxOversellRooms：任一晚累计缺口超上限 → 仍拒（防手滑大团录错日期一次打穿），文案点名上限', async () => {
+    const client = fitClient([], 2);
+    await expect(
+      assertHotelPhysicalFit(
+        'h1',
+        [dayStr(0)],
+        { wholeRooms: 6, solos: [] }, // 缺口 4 > 上限 3
+        { maxOversellRooms: 3 },
+        client,
+      ),
+    ).rejects.toThrow(/超售容忍上限 3 间/);
+  });
+
+  it('maxOversellRooms 缺省（前台散客/代理下单）→ 缺口 1 间也硬拒，口子只对内部录单开', async () => {
+    const client = fitClient([], 2);
+    await expect(
+      assertHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 3, solos: [] }, {}, client),
+    ).rejects.toThrow(/房间不足/);
   });
 });
 
@@ -1910,7 +1945,7 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
       periods: [{ dateFrom: day(0), dateTo: day(1), rooms: 3 }],
       pendingItems: [stay()],
     });
-    await expect(assertRandomTierFit(4, [dayStr(0)], 2, {}, ok)).resolves.toBeUndefined();
+    await expect(assertRandomTierFit(4, [dayStr(0)], 2, {}, ok)).resolves.toEqual([]);
 
     const tight = aggClient({
       hotelIds: ['h1'],
@@ -1924,10 +1959,10 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
 
   it('该档次一家酒店都没切房 → 未管控，不拦截（未配包房 ≠ 售罄）', async () => {
     const noHotels = aggClient({ hotelIds: [], periods: [] });
-    await expect(assertRandomTierFit(3, [dayStr(0)], 99, {}, noHotels)).resolves.toBeUndefined();
+    await expect(assertRandomTierFit(3, [dayStr(0)], 99, {}, noHotels)).resolves.toEqual([]);
 
     const noPeriods = aggClient({ hotelIds: ['h1'], periods: [] });
-    await expect(assertRandomTierFit(3, [dayStr(0)], 99, {}, noPeriods)).resolves.toBeUndefined();
+    await expect(assertRandomTierFit(3, [dayStr(0)], 99, {}, noPeriods)).resolves.toEqual([]);
   });
 
   it('拼房半间按床位口径吃 0.5：余 0.5 时还能再塞一位拼房客', async () => {
@@ -1936,7 +1971,30 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
       periods: [{ dateFrom: day(0), dateTo: day(1), rooms: 2 }],
       pendingItems: [stay({ roomsBilled: 1.5 })],
     });
-    await expect(assertRandomTierFit(3, [dayStr(0)], 0.5, {}, client)).resolves.toBeUndefined();
+    await expect(assertRandomTierFit(3, [dayStr(0)], 0.5, {}, client)).resolves.toEqual([]);
+  });
+
+  // ── 限额内超售放行（内部录单口子，语义同 assertHotelPhysicalFit.maxOversellRooms）──
+  it('maxOversellRooms：累计缺口 ≤ 上限 → 放行并返回被容忍的超卖明细；超上限仍拒', async () => {
+    // 合计包房 3、已占 1 → 余 2；录 4 间 → 缺口 2 ≤ 上限 3 → 放行
+    const within = aggClient({
+      hotelIds: ['h1'],
+      periods: [{ dateFrom: day(0), dateTo: day(1), rooms: 3 }],
+      pendingItems: [stay()],
+    });
+    const tolerated = await assertRandomTierFit(4, [dayStr(0)], 4, { maxOversellRooms: 3 }, within);
+    expect(tolerated).toHaveLength(1);
+    expect(tolerated[0]).toMatchObject({ date: dayStr(0), remaining: 2, rooms: 4, shortfall: 2 });
+
+    // 录 6 间 → 缺口 4 > 上限 3 → 仍拒，文案点名上限
+    const beyond = aggClient({
+      hotelIds: ['h1'],
+      periods: [{ dateFrom: day(0), dateTo: day(1), rooms: 3 }],
+      pendingItems: [stay()],
+    });
+    await expect(
+      assertRandomTierFit(4, [dayStr(0)], 6, { maxOversellRooms: 3 }, beyond),
+    ).rejects.toThrow(/超售容忍上限 3 间/);
   });
 });
 
@@ -2143,7 +2201,7 @@ describe('updateBlockPeriod / deleteBlockPeriod：占用守卫', () => {
 
     it('改小到阈值内的超占（缺口 <= HOTEL_MAX_OVERSELL_ROOMS）→ 放行但写 WARNING 审计', async () => {
       const client = guardClient({ existing: existingPeriod(), items: fourWholeRoomItems() });
-      // occupied=4，新包房=3 → 缺口 1（<= 默认阈值 2）
+      // occupied=4，新包房=3 → 缺口 1（<= 默认阈值 3）
       const period = await updateBlockPeriod('bp1', { rooms: 3 } as never, client);
       expect(period.rooms).toBe(3);
       expect(auditMock).toHaveBeenCalledWith(
@@ -2157,8 +2215,8 @@ describe('updateBlockPeriod / deleteBlockPeriod：占用守卫', () => {
 
     it('改小超过阈值（缺口 > HOTEL_MAX_OVERSELL_ROOMS）→ 400 拒绝，不落库', async () => {
       const client = guardClient({ existing: existingPeriod(), items: fourWholeRoomItems() });
-      // occupied=4，新包房=1 → 缺口 3（> 默认阈值 2）
-      await expect(updateBlockPeriod('bp1', { rooms: 1 } as never, client)).rejects.toThrow(
+      // occupied=4，新包房=0 → 缺口 4（> 默认阈值 3）
+      await expect(updateBlockPeriod('bp1', { rooms: 0 } as never, client)).rejects.toThrow(
         /超过超卖上限/,
       );
       expect((client.hotelBlockPeriod.update as ReturnType<typeof vi.fn>)).not.toHaveBeenCalled();

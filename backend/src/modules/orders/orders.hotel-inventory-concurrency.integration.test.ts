@@ -34,6 +34,14 @@ async function adminActor() {
   return { userId: admin.id, role: UserRole.ADMIN as const };
 }
 
+/** 前台散客：无限额内超售豁免（硬闸），并发互斥语义用它来钉。*/
+async function customerActor() {
+  const customer = await prisma.user.create({
+    data: { email: `${uniq('c')}@test.com`, role: UserRole.CUSTOMER },
+  });
+  return { userId: customer.id, role: UserRole.CUSTOMER as const };
+}
+
 /** 建酒店 + 房型 + 包房周期（rooms 间/晚，覆盖整个住宿区间）。*/
 async function createHotelWithBlock(rooms: number) {
   const hotel = await prisma.hotel.create({
@@ -111,8 +119,8 @@ async function committedRooms(hotelId: string): Promise<number> {
 }
 
 describe('酒店房量闸 · 并发互斥', () => {
-  it('包房 1 间、两笔并发各抢 1 间 → 恰好 1 成 1 败，落库占房恒为 1 间', async () => {
-    const actor = await adminActor();
+  it('包房 1 间、两笔并发各抢 1 间（前台散客硬闸）→ 恰好 1 成 1 败，落库占房恒为 1 间', async () => {
+    const actor = await customerActor();
     const { hotel, roomType } = await createHotelWithBlock(1);
 
     // 同时发出：不 await 第一笔就发第二笔，两条连接真的重叠
@@ -150,8 +158,8 @@ describe('酒店房量闸 · 并发互斥', () => {
     expect(await committedRooms(hotel.id)).toBe(2);
   });
 
-  it('串行第二笔（包房 1 间、第一笔已提交）→ 明确被拒，不留残行', async () => {
-    const actor = await adminActor();
+  it('串行第二笔（包房 1 间、第一笔已提交、前台散客硬闸）→ 明确被拒，不留残行', async () => {
+    const actor = await customerActor();
     const { hotel, roomType } = await createHotelWithBlock(1);
 
     await service.createOrder(orderBody(roomType.id, 5) as never, actor);
@@ -160,5 +168,37 @@ describe('酒店房量闸 · 并发互斥', () => {
       SOLD_OUT_MESSAGE,
     );
     expect(await committedRooms(hotel.id)).toBe(1);
+  });
+
+  // ── 内部录单限额内超售（销控售罄后仍可录单，当天临时向酒店加房是常态业务）──────
+  it('包房 1 间已占满，内部 ADMIN 再录 1 间 → 缺口 1 在上限内放行落库，并写 WARNING 超售审计', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithBlock(1);
+
+    await service.createOrder(orderBody(roomType.id, 7) as never, actor);
+    const oversold = await service.createOrder(orderBody(roomType.id, 8) as never, actor);
+
+    // 两单都落库：该晚占 2 间 > 包房 1 间（销控板显示 -1，提醒线报「超卖加房」）
+    expect(await committedRooms(hotel.id)).toBe(2);
+    const audit = await prisma.auditLog.findFirst({
+      where: { action: 'CREATE_ORDER_HOTEL_OVERSOLD', targetId: oversold.id },
+    });
+    expect(audit).not.toBeNull();
+    expect(audit?.severity).toBe('WARNING');
+  });
+
+  it('缺口超过超售上限（默认 3）→ 内部 ADMIN 录单也拒（防手滑打穿），不留残行', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithBlock(1);
+
+    const body = orderBody(roomType.id, 9);
+    // 一次要 5 间 → 缺口 4 > 上限 3
+    await expect(
+      service.createOrder(
+        { ...body, items: [{ ...body.items[0], roomsBilled: 5 }] } as never,
+        actor,
+      ),
+    ).rejects.toThrow(/超售容忍上限/);
+    expect(await committedRooms(hotel.id)).toBe(0);
   });
 });
