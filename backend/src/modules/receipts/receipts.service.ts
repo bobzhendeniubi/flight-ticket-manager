@@ -34,6 +34,7 @@ import {
   sumCompletedRefundsWithinTx,
 } from '../../lib/funds-guard.js';
 import { writeAudit } from '../../lib/audit.js';
+import { outstandingCommissionNetWithinTx, round2 } from '../../lib/commission-net.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { PaymentsService } from '../payments/payments.service.js';
 import type {
@@ -53,11 +54,6 @@ import {
   type StatementExportEntry,
   type StatementPlatform,
 } from './receipts.statement.js';
-
-/** 金额保留 2 位小数（CNY，避免浮点累计误差）。 */
-function round2(n: number): number {
-  return Math.round(n * 100) / 100;
-}
 
 /** 「还挂在池子里、等着认款」的状态集合（挂账余额与待认领页签的唯一口径）。 */
 const UNALLOCATED_STATUSES: ReceiptStatus[] = [
@@ -989,11 +985,7 @@ export class ReceiptsService {
       // 已计提佣金闸：认款入账会把订单推到 PAID 并计提整条代理链佣金；撤销认款只减 paidAmount、
       // 不回退佣金，冲销后佣金会挂在一张已无实收依据的订单上照常结算。与 reverseManualPayment 同口径：
       // 净佣金 > 0（尚未冲销）即拒绝，请走退款流程让佣金按比例冲销。
-      const commissionAgg = await tx.commissionRecord.aggregate({
-        where: { orderId: order.id },
-        _sum: { amount: true },
-      });
-      const commissionNet = round2(Number(commissionAgg._sum.amount ?? 0));
+      const commissionNet = await outstandingCommissionNetWithinTx(tx, order.id);
       if (commissionNet > 0.001) {
         throw new BadRequestError(
           `订单 ${order.orderNumber} 已计提代理佣金 ¥${commissionNet.toFixed(2)}（尚未冲销），` +

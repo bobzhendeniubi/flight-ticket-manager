@@ -14,7 +14,7 @@ const { mockPrisma, mockTx, writeAuditMock } = vi.hoisted(() => {
       update: vi.fn(),
     },
     commissionRecord: {
-      aggregate: vi.fn(),
+      groupBy: vi.fn(),
     },
     refund: {
       aggregate: vi.fn(),
@@ -42,7 +42,7 @@ function configure({
   refundedTotal = 0,
   casCount = 1,
   paymentStatus = PaymentStatus.SUCCEEDED,
-  commissionAmount = null,
+  commissionGroups = [],
 }: {
   payload: unknown;
   order?: Partial<{
@@ -57,7 +57,7 @@ function configure({
   refundedTotal?: number;
   casCount?: number;
   paymentStatus?: PaymentStatus;
-  commissionAmount?: number | null;
+  commissionGroups?: Array<{ agentId: string; amount: number }>;
 }) {
   mockTx.payment.findUnique.mockResolvedValue({
     id: 'payment-1',
@@ -83,11 +83,12 @@ function configure({
   mockTx.refund.aggregate.mockResolvedValue({
     _sum: { amount: new Prisma.Decimal(refundedTotal) },
   });
-  mockTx.commissionRecord.aggregate.mockResolvedValue({
-    _sum: {
-      amount: commissionAmount === null ? null : new Prisma.Decimal(commissionAmount),
-    },
-  });
+  mockTx.commissionRecord.groupBy.mockResolvedValue(
+    commissionGroups.map((group) => ({
+      agentId: group.agentId,
+      _sum: { amount: new Prisma.Decimal(group.amount) },
+    })),
+  );
   mockTx.payment.updateMany.mockResolvedValue({ count: casCount });
   mockTx.order.update.mockResolvedValue({});
   mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockTx) => unknown) => fn(mockTx));
@@ -146,26 +147,63 @@ describe('PaymentsService.reverseManualPayment · 手工收款冲销', () => {
     );
   });
 
-  it('有效佣金净额大于 0 时拒绝冲销，且零写', async () => {
-    configure({ payload: { manual: true }, commissionAmount: 120 });
-
-    await expect(
-      service.reverseManualPayment('payment-1', { reason: '佣金仍有效' }, ACTOR),
-    ).rejects.toThrow(/已计提代理佣金/);
-    expect(mockTx.payment.updateMany).not.toHaveBeenCalled();
-    expect(mockTx.order.update).not.toHaveBeenCalled();
-  });
-
-  it('佣金净额已被负额补偿抵平时正常冲销', async () => {
-    configure({ payload: { manual: true }, commissionAmount: 0 });
+  it('同一代理 SETTLED 正数加 REVERSED 负数补偿抵平时正常冲销', async () => {
+    configure({
+      payload: { manual: true },
+      commissionGroups: [{ agentId: 'agent-a', amount: 0 }],
+    });
 
     await expect(
       service.reverseManualPayment('payment-1', { reason: '佣金已冲平' }, ACTOR),
     ).resolves.toMatchObject({ ok: true, reversedAmount: 300 });
   });
 
+  it('代理A 有存活佣金、代理B 有孤立负数时仍拒绝冲销', async () => {
+    configure({
+      payload: { manual: true },
+      commissionGroups: [
+        { agentId: 'agent-a', amount: 50 },
+        { agentId: 'agent-b', amount: -50 },
+      ],
+    });
+
+    await expect(
+      service.reverseManualPayment('payment-1', { reason: '跨代理不能抵消' }, ACTOR),
+    ).rejects.toThrow(/已计提代理佣金 ¥50\.00/);
+    expect(mockTx.payment.updateMany).not.toHaveBeenCalled();
+    expect(mockTx.order.update).not.toHaveBeenCalled();
+  });
+
+  it('只有孤立负数 REVERSED 行时正常冲销', async () => {
+    configure({
+      payload: { manual: true },
+      commissionGroups: [{ agentId: 'agent-b', amount: -50 }],
+    });
+
+    await expect(
+      service.reverseManualPayment('payment-1', { reason: '仅有负数补偿' }, ACTOR),
+    ).resolves.toMatchObject({ ok: true, reversedAmount: 300 });
+  });
+
+  it('ACCRUED 翻牌为 REVERSED 后正数被剔除，正常冲销', async () => {
+    configure({ payload: { manual: true }, commissionGroups: [] });
+
+    await expect(
+      service.reverseManualPayment('payment-1', { reason: '佣金已翻牌冲销' }, ACTOR),
+    ).resolves.toMatchObject({ ok: true, reversedAmount: 300 });
+
+    expect(mockTx.commissionRecord.groupBy).toHaveBeenCalledWith({
+      by: ['agentId'],
+      where: {
+        orderId: 'order-1',
+        OR: [{ status: { not: 'REVERSED' } }, { amount: { lt: 0 } }],
+      },
+      _sum: { amount: true },
+    });
+  });
+
   it('无佣金记录时正常冲销', async () => {
-    configure({ payload: { manual: true }, commissionAmount: null });
+    configure({ payload: { manual: true }, commissionGroups: [] });
 
     await expect(
       service.reverseManualPayment('payment-1', { reason: '无佣金记录' }, ACTOR),

@@ -37,6 +37,7 @@ import {
   sumCompletedRefundsWithinTx,
 } from '../../lib/funds-guard.js';
 import { writeAudit } from '../../lib/audit.js';
+import { outstandingCommissionNetWithinTx, round2 } from '../../lib/commission-net.js';
 // 超收拆分要在同一事务里建挂账进账。receipts.service 反向 import 本模块的 PaymentsService，
 // 构成模块环——但两侧都只在「方法体 / 类字段初始化」里用到对方，且 createOpenReceiptWithinTx 是
 // 函数声明（ESM 实例化阶段即提升可用），故静态 import 安全，与 orders.service 的用法一致。
@@ -66,11 +67,6 @@ const AMOUNT_MATCH_EPSILON_CNY = 0.01;
 const DUPLICATE_AMOUNT_WINDOW_MS = 10 * 60 * 1000;
 /** 认款生成的 Payment 在旧数据中只能靠此备注前缀识别来源。 */
 const RECONCILE_NOTE_PREFIX = '对账认领 ';
-
-/** 金额保留 2 位小数（CNY，避免浮点累计误差）。 */
-function round2(n: number): number {
-  return Math.round(n * 100) / 100;
-}
 
 /**
  * 元 → 分（整数）。金额判定一律换算到分再比大小：
@@ -1021,11 +1017,7 @@ export class PaymentsService {
         );
       }
 
-      const commissionAgg = await tx.commissionRecord.aggregate({
-        where: { orderId: order.id },
-        _sum: { amount: true },
-      });
-      const commissionNet = round2(Number(commissionAgg._sum.amount ?? 0));
+      const commissionNet = await outstandingCommissionNetWithinTx(tx, order.id);
       if (commissionNet > 0.001) {
         throw new BadRequestError(
           `订单 ${order.orderNumber} 已计提代理佣金 ¥${commissionNet.toFixed(2)}（尚未冲销），` +
