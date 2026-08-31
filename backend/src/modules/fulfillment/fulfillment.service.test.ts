@@ -1142,8 +1142,12 @@ describe('FulfillmentService.batchUpdateVisaPassengerStatus', () => {
     const updateMany = vi.fn().mockResolvedValue({ count: rows.length });
     const p = prisma as unknown as {
       passenger: { findMany: typeof findMany; updateMany: typeof updateMany };
+      order: { findUnique: ReturnType<typeof vi.fn> };
     };
     p.passenger = { findMany, updateMany };
+    // 办结派生（syncOrderVisaCompletion）读订单：返回 null = 订单不存在 → 派生零写入，
+    // 不干扰本组用例对「标记 + 重派生」主路径的断言（办结派生有专属测试文件）。
+    p.order = { findUnique: vi.fn().mockResolvedValue(null) };
     return { findMany, updateMany };
   }
 

@@ -858,7 +858,13 @@ function OrderGroup({
 
   // 类型徽章（签发方式 / 入境次数，带证据出处）
   const visaName = task.visaName ?? '';
-  const typeBadges: Array<{ key: string; text: string; evidence: BadgeEvidence }> = [];
+  const typeBadges: Array<{
+    key: string;
+    text: string;
+    evidence: BadgeEvidence;
+    /** 特殊情况彩色徽标（电子签紫/非15天单次琥珀/纯签证单青）；缺省沿用证据档位灰阶。 */
+    colorClass?: string;
+  }> = [];
   const entryLabel =
     task.visaEntryType === 'SINGLE' ? '单次' : task.visaEntryType === 'MULTIPLE' ? '多次' : null;
   if (entryLabel) {
@@ -884,7 +890,28 @@ function OrderGroup({
       key: 'issuance',
       text: issuanceLabel,
       evidence: task.visaIssuanceSource === 'ORDER_STATUS' ? 'ORDER_STATUS' : 'PRODUCT',
+      // 特殊情况看颜色（签证岗 0830 口径）：电子签亮紫，一眼与默认 15 天单次区分。
+      colorClass: task.visaIssuanceMethod === 'E_VISA' ? 'badge-purple' : undefined,
     });
+  }
+  // 「非15天单次」特殊情况徽标——只认产品结构化字段（多次入境，或停留天数≠15），
+  // 不从名字/录单猜（弱证据不装权威）。默认 15 天单次不亮任何标。
+  const nonStandardStay =
+    (task.visaEntrySource === 'PRODUCT' && task.visaEntryType === 'MULTIPLE') ||
+    (task.visaStayDays != null && task.visaStayDays !== 15);
+  if (nonStandardStay) {
+    typeBadges.push({
+      key: 'non-standard',
+      text: task.visaStayDays != null && task.visaStayDays !== 15
+        ? `非15天单次·停留${task.visaStayDays}天`
+        : '非15天单次',
+      evidence: 'PRODUCT',
+      colorClass: 'badge-warning',
+    });
+  }
+  // 「纯签证单」特殊情况徽标：无航班（出发日期为空）的单办签证单，送签排期没有机票锚点。
+  if (!task.order?.departureTime) {
+    typeBadges.push({ key: 'visa-only', text: '纯签证单', evidence: 'PRODUCT', colorClass: 'badge-teal' });
   }
 
   const saveNote = async () => {
@@ -1043,7 +1070,11 @@ function OrderGroup({
               {typeBadges.map((b) => {
                 const style = EVIDENCE_STYLE[b.evidence];
                 return (
-                  <span key={b.key} className={style.className} title={style.title}>
+                  <span
+                    key={b.key}
+                    className={b.colorClass ? `${b.colorClass} text-[10px]` : style.className}
+                    title={style.title}
+                  >
                     {b.text}
                     {style.suffix}
                   </span>
@@ -1141,6 +1172,13 @@ export function VisaDeskPage() {
 
   const [tasks, setTasks] = useState<FulfillmentTask[]>([]);
   const [totalCount, setTotalCount] = useState<number | null>(null);
+  // 对数条：当前筛选范围内非自备签乘客的送签进度人数（服务端全量口径，不受分页影响）。
+  // 「已送签 x 人」= 签证岗线下送签总数——两边对不上就是有单漏了/混了（对数恒等式）。
+  const [passengerStats, setPassengerStats] = useState<{
+    pending: number;
+    inProgress: number;
+    confirmed: number;
+  } | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('OPEN');
@@ -1248,6 +1286,7 @@ export function VisaDeskPage() {
         if (cancelled) return;
         setTasks(res.tasks);
         setTotalCount(res.pagination?.total ?? res.tasks.length);
+        setPassengerStats(res.passengerStats ?? null);
       })
       .catch((e: unknown) => {
         if (!cancelled) setError(e instanceof ApiError ? e.message : '签证任务加载失败');
@@ -2053,6 +2092,15 @@ export function VisaDeskPage() {
           <span>
             共 <span className="font-semibold text-ink">{totalCount}</span> 条签证任务
           </span>
+          {passengerStats && (
+            <span className="text-ink-muted">
+              · 当前筛选范围送签进度：
+              <span className="badge-success mx-1">已送签 {passengerStats.confirmed} 人</span>
+              <span className="badge-info mx-1">材料准备 {passengerStats.inProgress} 人</span>
+              <span className="badge-neutral mx-1">待送 {passengerStats.pending} 人</span>
+              <span className="opacity-70">（自备签乘客不计入；已送签人数应与送签台账一致）</span>
+            </span>
+          )}
           {totalCount > tasks.length && (
             <span className="badge-warning">仅显示前 {tasks.length} 条，请用筛选缩小范围</span>
           )}

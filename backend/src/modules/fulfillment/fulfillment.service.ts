@@ -24,6 +24,8 @@ import {
 } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
+import type { AuditActor } from '../../lib/audit.js';
+import { syncOrderVisaCompletion, type VisaCompletionOutcome } from './visa-completion.js';
 import type { ListFulfillmentQuery, UpdateFulfillmentBody } from './fulfillment.schemas.js';
 
 export const REFUND_REQUESTED_FULFILLMENT_ERROR =
@@ -512,8 +514,9 @@ export class FulfillmentService {
         include: {
           orderItem: {
             include: {
-              // 本签证 item 关联的签证产品（用于 #7：单次/多次签名称 + 结构化签发方式/入境次数分类）
-              visa: { select: { visaName: true, issuanceMethod: true, entryType: true } },
+              // 本签证 item 关联的签证产品（用于 #7：单次/多次签名称 + 结构化签发方式/入境次数分类
+              // + stayDays：非 15 天单次的特殊情况徽标）
+              visa: { select: { visaName: true, issuanceMethod: true, entryType: true, stayDays: true } },
               order: {
                 select: {
                   id: true,
@@ -622,7 +625,34 @@ export class FulfillmentService {
       }
     }
 
+    // 送签人数统计（签证台对数条）：按**整个筛选范围**算（不是当前页），乘客级口径——
+    // 只数非自备签乘客（签证岗的数=要办的人，自备签的人不显示也不计入）。
+    // 「已送签人数」即签证岗线下送签总数，两边必须恒等（2026-08-30 拍板的对数恒等式）。
+    let passengerStats: { pending: number; inProgress: number; confirmed: number } | null = null;
+    if (query.type === FulfillmentType.VISA_APPLICATION) {
+      const matchedTaskOrders = await prisma.fulfillmentTask.findMany({
+        where,
+        select: { orderItem: { select: { orderId: true } } },
+      });
+      const statOrderIds = [...new Set(matchedTaskOrders.map((t) => t.orderItem.orderId))];
+      const grouped = statOrderIds.length
+        ? await prisma.passenger.groupBy({
+            by: ['visaSubmissionStatus'],
+            where: { orderId: { in: statOrderIds }, visaExempt: false },
+            _count: { _all: true },
+          })
+        : [];
+      const countOf = (s: VisaSubmissionStatus) =>
+        grouped.find((g) => g.visaSubmissionStatus === s)?._count._all ?? 0;
+      passengerStats = {
+        pending: countOf(VisaSubmissionStatus.PENDING),
+        inProgress: countOf(VisaSubmissionStatus.IN_PROGRESS),
+        confirmed: countOf(VisaSubmissionStatus.CONFIRMED),
+      };
+    }
+
     return {
+      passengerStats,
       tasks: rows.map((t) => {
         const order = t.orderItem.order;
         // 最早一段机票的出发时间/时区（无机票则 null）— 供签证台显示出发日期
@@ -641,6 +671,8 @@ export class FulfillmentService {
           // 签证结构化分类（签发方式/入境次数）；产品与订单级都未标注 = null
           visaIssuanceMethod: visaClass.issuanceMethod,
           visaEntryType: visaClass.entryType,
+          // 单次最多停留天数（产品结构化字段；null=未标注）→ 「非15天单次」特殊情况徽标
+          visaStayDays: t.orderItem.visa?.stayDays ?? null,
           // 出处标：PRODUCT=产品结构化标注（确证）/ ORDER_STATUS=录单回退（推断）
           visaIssuanceSource: visaClass.issuanceSource,
           visaEntrySource: visaClass.entrySource,
@@ -679,7 +711,7 @@ export class FulfillmentService {
     };
   }
 
-  async update(id: string, body: UpdateFulfillmentBody) {
+  async update(id: string, body: UpdateFulfillmentBody, actor?: AuditActor) {
     const existing = await prisma.fulfillmentTask.findUnique({
       where: { id },
       include: { orderItem: { include: { order: { select: { status: true, deletedAt: true } } } } },
@@ -809,6 +841,8 @@ export class FulfillmentService {
         where: { orderId: updated.orderItem.orderId, visaExempt: false },
         data: { visaSubmissionStatus: asVisaSubmissionStatus(body.status) },
       });
+      // 订单级办结派生：整单推到「已送签」→ 订单自动已签证；从已送签退回 → 对称撤销。
+      await this.syncCompletionForOrders([updated.orderItem.orderId], actor);
     }
 
     // FLIGHT 完成时，把 PNR / e-ticket 同步到 Passenger（全订单的乘客都标）
@@ -923,6 +957,22 @@ export class FulfillmentService {
    * completedAt：派生为「已送签」时置当前时间，否则清空（与任务级 update 的完成时间语义一致）。
    * startedAt 不在此管理（更新多行无法逐行保留旧值；签证台不展示该字段）。
    */
+  /**
+   * 送签进度落库后的订单级办结派生（拆出来供各写入口共用：任务级 update 的整单联动、
+   * 按人批量标记；orders 侧改自备签走 visa-completion 模块直调）。actor 缺省记 SYSTEM。
+   */
+  private async syncCompletionForOrders(
+    orderIds: Iterable<string>,
+    actor: AuditActor | undefined,
+  ): Promise<Array<Exclude<VisaCompletionOutcome, { changed: false }>>> {
+    const outcomes: Array<Exclude<VisaCompletionOutcome, { changed: false }>> = [];
+    for (const orderId of orderIds) {
+      const o = await syncOrderVisaCompletion(orderId, actor ?? { role: 'SYSTEM' });
+      if (o.changed) outcomes.push(o);
+    }
+    return outcomes;
+  }
+
   private async rederiveVisaTasksForOrder(orderId: string): Promise<FulfillmentStatus> {
     const passengers = await prisma.passenger.findMany({
       where: { orderId, visaExempt: false },
@@ -953,11 +1003,14 @@ export class FulfillmentService {
   async batchUpdateVisaPassengerStatus(
     passengerIds: string[],
     toStatus: VisaSubmissionStatus,
+    actor?: AuditActor,
   ): Promise<{
     successCount: number;
     failureCount: number;
     failures: Array<{ id: string; error: string }>;
     affectedOrderIds: string[];
+    /** 本次触发的订单级办结变化（自动已签证 / 撤销办结），供前端回显。 */
+    visaCompletion: Array<Exclude<VisaCompletionOutcome, { changed: false }>>;
   }> {
     const passengers = await prisma.passenger.findMany({
       where: { id: { in: passengerIds } },
@@ -994,6 +1047,7 @@ export class FulfillmentService {
       affectedOrders.add(p.orderId);
     }
 
+    let visaCompletion: Array<Exclude<VisaCompletionOutcome, { changed: false }>> = [];
     if (okIds.length > 0) {
       await prisma.passenger.updateMany({
         where: { id: { in: okIds } },
@@ -1003,6 +1057,8 @@ export class FulfillmentService {
       for (const orderId of affectedOrders) {
         await this.rederiveVisaTasksForOrder(orderId);
       }
+      // 订单级办结派生：整单推满「已送签」→ 自动已签证；退回 → 对称撤销。
+      visaCompletion = await this.syncCompletionForOrders(affectedOrders, actor);
     }
 
     return {
@@ -1010,6 +1066,7 @@ export class FulfillmentService {
       failureCount: failures.length,
       failures,
       affectedOrderIds: [...affectedOrders],
+      visaCompletion,
     };
   }
 
@@ -1019,8 +1076,9 @@ export class FulfillmentService {
   async updateVisaPassengerStatus(
     passengerId: string,
     toStatus: VisaSubmissionStatus,
+    actor?: AuditActor,
   ): Promise<{ passengerId: string; status: VisaSubmissionStatus; orderId: string | null }> {
-    const res = await this.batchUpdateVisaPassengerStatus([passengerId], toStatus);
+    const res = await this.batchUpdateVisaPassengerStatus([passengerId], toStatus, actor);
     if (res.failureCount > 0) {
       const msg = res.failures[0].error;
       if (msg === '乘客不存在') throw new NotFoundError(msg);

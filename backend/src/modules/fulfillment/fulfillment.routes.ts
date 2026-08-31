@@ -51,7 +51,7 @@ export const fulfillmentRoutes: FastifyPluginAsync = async (app) => {
   app.patch('/:id', pre, async (req) => {
     const { id } = req.params as { id: string };
     const body = updateFulfillmentBodySchema.parse(req.body);
-    const task = await service.update(id, body);
+    const task = await service.update(id, body, actorFromRequest(req));
 
     // 签证金额/签证公司变更单列审计动作（与状态/备注变更区分，便于财务追溯成本来源）
     const isVisaCostChange =
@@ -176,7 +176,7 @@ export const fulfillmentRoutes: FastifyPluginAsync = async (app) => {
   app.patch('/visa-passengers/:passengerId/status', pre, async (req) => {
     const { passengerId } = req.params as { passengerId: string };
     const body = updateVisaPassengerStatusBodySchema.parse(req.body);
-    const result = await service.updateVisaPassengerStatus(passengerId, body.status);
+    const result = await service.updateVisaPassengerStatus(passengerId, body.status, actorFromRequest(req));
 
     void writeAudit({
       actor: actorFromRequest(req),
@@ -199,7 +199,11 @@ export const fulfillmentRoutes: FastifyPluginAsync = async (app) => {
    */
   app.post('/visa-passengers/batch-status', pre, async (req) => {
     const body = batchVisaPassengerStatusBodySchema.parse(req.body);
-    const result = await service.batchUpdateVisaPassengerStatus(body.passengerIds, body.toStatus);
+    const result = await service.batchUpdateVisaPassengerStatus(
+      body.passengerIds,
+      body.toStatus,
+      actorFromRequest(req),
+    );
 
     void writeAudit({
       actor: actorFromRequest(req),

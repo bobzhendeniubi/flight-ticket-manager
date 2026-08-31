@@ -2198,6 +2198,8 @@ export interface FulfillmentTask {
   visaIssuanceMethod?: VisaIssuanceMethod | null;
   /** 签证产品入境次数（结构化分类）；非签证任务/未设置/缺失 → null */
   visaEntryType?: VisaEntryType | null;
+  /** 签证产品单次最多停留天数（结构化字段）；未标注 → null。「非15天单次」特殊情况徽标用 */
+  visaStayDays?: number | null;
   /** 签发方式分类出处：PRODUCT=产品结构化标注 / ORDER_STATUS=录单回退；缺省=按 PRODUCT 处理 */
   visaIssuanceSource?: 'PRODUCT' | 'ORDER_STATUS' | null;
   /** 入境次数分类出处（同上）；入境次数无回退来源，有值即 PRODUCT */
@@ -4677,6 +4679,8 @@ export const api = {
     return apiFetch<{
       tasks: FulfillmentTask[];
       pagination: { page: number; pageSize: number; total: number };
+      /** 签证台对数条：当前筛选范围内非自备签乘客的送签进度人数（仅 type=VISA_APPLICATION 时下发） */
+      passengerStats?: { pending: number; inProgress: number; confirmed: number } | null;
     }>(`/fulfillment-tasks/${qs.toString() ? '?' + qs.toString() : ''}`, { token });
   },
   listFulfillmentByOrder: (token: string, orderId: string) =>
