@@ -115,6 +115,7 @@ import type {
   SettlementPreview,
   RescheduleItemHotelBody,
   SelfUpdatePassengerBody,
+  SplitRoomGroupBody,
   SwapItemHotelBody,
   UpdateItemSettlementPriceBody,
   UpdatePassengerVisaDatesBody,
@@ -8376,8 +8377,10 @@ export class OrderService {
    *      description 本就不含酒店名——由 serializer 实时联查 hotelRoomTypeId 得到，不用重建）。
    *      amount/unitPrice/quantity/hotelCheckIn/hotelCheckOut/roomsBilled 一律不动（冻结）。
    *   2. feeCny≠0 → order.adjustmentCny += feeCny，并 push 一条 adjustments 流水（HOTEL_SWAP_FEE）。
-   *   3. Order.roomAssignment.roomGroups 里 hotelName 等于旧酒店名的组 → 改成新酒店名（人工填的
-   *      其它酒店名不动——可能是老单据手填值，不该被这次换酒店误伤）。
+   *   3. Order.roomAssignment.roomGroups 里属于本行的组 → 改成新酒店名+新房型名：优先按
+   *      orderItemId == 本行精确匹配（split-room-group / 分房保存写入的归属），无归属组回退
+   *      (hotelName, roomType) 二元组匹配（人工填的其它酒店名不动——可能是老单据手填值，
+   *      不该被这次换酒店误伤）。
    *
    * 返回值联查与 getOrder 同款富 include（hotelRoomType/bundle.hotelRoomType 等），确保响应
    * 里的 hotelName/roomTypeName 立即正确，调用方不用再刷一次详情。
@@ -8632,8 +8635,9 @@ export class OrderService {
       // 性别桶里重算物理间数 —— 床位口径看不见「异性不能拼一间」这一维。
       // 必须在事务内、且先锁目标酒店该区间的包房周期行：判定与占房落库（下方第 1 步写
       // hotelRoomTypeId）之间不能有窗口，否则两笔并发换酒店会各自读到「还剩 1 间」的旧快照双双通过。
-      // excludeOrderId：本单当前挂在原酒店，理论上不该被目标酒店的占房查询选中；仍显式排除，
-      // 防御同一单在目标酒店已有其他酒店行时被算两遍。
+      // excludeOrderItemIds（行级排除）：只排本次要挪走的这一行 —— 它当前挂在原酒店，理论上
+      // 不该被目标酒店的占房查询选中，显式排除是防御同酒店异常数据被算两遍。同单**另一条行**
+      // 在目标酒店的占用是真实存量，必须照常计入（旧版 excludeOrderId 把整单排掉 → 放行超卖）。
       // 拼房单（roomsBilled=0.5）要按性别配对判定 → 取本单出行人性别（口径同房控 pickSoloGender）。
       let untrackedNights: string[] = [];
       if (needsHotelFitCheck) {
@@ -8649,7 +8653,7 @@ export class OrderService {
             roomsBilled,
             swapPassengers.map((p) => ({ gender: p.gender ?? undefined })),
           ),
-          { excludeOrderId: orderId },
+          { excludeOrderItemIds: [item.id] },
           tx,
         );
         if (fit.hasBlock) {
@@ -8718,29 +8722,37 @@ export class OrderService {
         });
       }
 
-      // ── 3. 分房表里属于本行（旧酒店+旧房型）的组 → 改名到新酒店+新房型（HIGH 修复）──
-      // RoomGroup 没有 orderItemId 字段（Passenger 挂在 Order 上，不挂具体 OrderItem），所以本来就
-      // 没法从数据模型上百分百确认"这组人是不是这一行的客人"。旧版只用 hotelName 一个维度匹配——
-      // 一个订单有 2 条 HOTEL 行都住"同一家酒店"（不同房型/不同批客人）时，只换其中一行，会把另一
-      // 行的组也误伤改名，把它的客人错误地"送去"了目标酒店。
-      // 用 (hotelName, roomType) 二元组匹配，精确到"这一行原来的房型"——两条同酒店的 HOTEL 行几乎
-      // 必然是不同房型（否则本就是同一份预订，误伤后果也无实际差异），比单凭酒店名更贴近"这条订单
-      // 行"的身份。同时把 roomType 也一并改写到新房型名（旧版只改 hotelName，遗留一个在目标酒店根本
+      // ── 3. 分房表里属于本行的组 → 改名到新酒店+新房型（HIGH 修复 + 归属精确匹配）──
+      // 优先按 orderItemId == 本行精确匹配（split-room-group / 分房保存写入的归属字段）——
+      // 这是数据模型上百分百的"这组人就是这一行的客人"，跨酒店/同酒店多行都不会误伤。
+      // 无任何组归属到本行时回退旧口径：(hotelName, roomType) 二元组匹配 —— 一个订单有 2 条
+      // HOTEL 行都住"同一家酒店"（不同房型/不同批客人）时，只换其中一行，二元组比单凭酒店名
+      // 更贴近"这条订单行"的身份；已归属到**其它行**的组绝不参与二元组匹配（名字撞上也不改）。
+      // 同时把 roomType 也一并改写到新房型名（旧版只改 hotelName，遗留一个在目标酒店根本
       // 不存在的旧房型名，分房表看着货不对板）。
-      // 随机单落位没有「旧酒店名」可匹配（本就没落过酒店）→ 整段跳过，绝不拿 undefined 去比对
-      // 分房组的 hotelName（那会把所有没填酒店名的组一并误改）。
-      const roomAssignmentRaw = oldRoomType ? order.roomAssignment : null;
+      // 随机单落位（无 oldRoomType）没有「旧酒店名」可匹配 → 只走 orderItemId 精确匹配，
+      // 绝不拿 undefined 去比对分房组的 hotelName（那会把所有没填酒店名的组一并误改）。
+      const roomAssignmentRaw = order.roomAssignment;
       if (roomAssignmentRaw && typeof roomAssignmentRaw === 'object' && !Array.isArray(roomAssignmentRaw)) {
         const groups = (roomAssignmentRaw as { roomGroups?: unknown }).roomGroups;
         if (Array.isArray(groups)) {
+          const groupItemId = (g: unknown): string | null => {
+            if (g == null || typeof g !== 'object') return null;
+            const v = (g as { orderItemId?: unknown }).orderItemId;
+            return typeof v === 'string' && v.length > 0 ? v : null;
+          };
+          const hasOwnAttribution = groups.some((g) => groupItemId(g) === item.id);
           let changed = false;
           const newGroups = groups.map((g) => {
-            if (
-              g != null &&
-              typeof g === 'object' &&
-              (g as { hotelName?: unknown }).hotelName === oldRoomType!.hotel.name &&
-              (g as { roomType?: unknown }).roomType === oldRoomType!.name
-            ) {
+            if (g == null || typeof g !== 'object') return g;
+            const attributedTo = groupItemId(g);
+            const matched = hasOwnAttribution
+              ? attributedTo === item.id
+              : oldRoomType != null &&
+                attributedTo == null &&
+                (g as { hotelName?: unknown }).hotelName === oldRoomType.hotel.name &&
+                (g as { roomType?: unknown }).roomType === oldRoomType.name;
+            if (matched) {
               changed = true;
               return {
                 ...(g as Record<string, unknown>),
@@ -8846,6 +8858,275 @@ export class OrderService {
   }
 
   /**
+   * 按房组拆分酒店行：把分房表（Order.roomAssignment）里的一个房组，从某条 HOTEL 行
+   * 拆成一条独立的 HOTEL 行 —— 「按房组换酒店」的前置步骤：拆完对新行用现成的
+   * 「换酒店」按钮（swapItemHotel）即可，只挪这一组人，不动同行其他房组。
+   *
+   * 钱的哲学（与换酒店「价格冻结」同一套）：**拆行只拆库存归属，不拆应收** ——
+   * 新行 amount = 0，源行 amount 一个字不动 → order.subtotal/total 拆前后恒等；
+   * 换酒店产生的差价照旧走换酒店端点的 feeCny（adjustmentCny 机制）。
+   * 成本侧走真账：totalCostCny 按拆出间数比例从源行挪到新行（Σ 成本守恒），
+   * unitCostCny 快照原样复制。
+   *
+   * 库存对称铁律：源行 roomsBilled -= 拆出数、新行 roomsBilled = 拆出数，Σ 恒等 ——
+   * 房控占用由 (hotelRoomTypeId|randomStarTier, hotelCheckIn/Out, roomsBilled) 派生，
+   * 本操作绝不隐式增减占用。事务尾对 Σ roomsBilled / Σ totalCostCny / order.total
+   * 各做一次守恒断言，不平整体回滚。
+   *
+   * 房组归属：目标房组的 orderItemId 写成新行 id；本单其余**无归属**的房组顺手回填为
+   * 源行 id —— 本单从此每组有归属，房控的归属过滤（expandAssignedPhysicalByDate）即刻生效。
+   *
+   * 守卫：仅 ADMIN/STAFF；订单占座态且未软删；itemId 必须是本单 kind=HOTEL 行
+   * （BUNDLE 行 400 —— 套餐行的钱覆盖整包、无法按间拆成本，请先经「补录房费」加独立
+   * 酒店行再拆）；房组必须存在且未归属到其它行；拆出数（roomFraction，缺省 1）与
+   * 源行剩余数都必须是 0.5 的整数倍且 > 0（等于源行全额 → 无需拆分，直接换酒店）。
+   */
+  async splitHotelItemByRoomGroup(
+    orderId: string,
+    itemId: string,
+    input: SplitRoomGroupBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    audit: {
+      orderNumber: string;
+      fromItemId: string;
+      newItemId: string;
+      roomGroupId: string;
+      before: { fromRoomsBilled: number; fromTotalCostCny: number | null };
+      after: {
+        fromRoomsBilled: number;
+        newRoomsBilled: number;
+        fromTotalCostCny: number | null;
+        newTotalCostCny: number | null;
+      };
+    };
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可拆分房组');
+    }
+
+    const scratch = await prisma.$transaction(async (tx) => {
+      // Order 行锁：与换酒店/补房差同款 —— 拆行要读-改-写 roomsBilled/roomAssignment，
+      // 与并发的分房保存 / 换酒店 / 状态流转严格串行。
+      const lockRows = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE
+      `;
+      if (lockRows.length === 0) throw new NotFoundError('订单不存在');
+
+      const order = await tx.order.findUnique({
+        where: { id: orderId },
+        select: {
+          id: true,
+          orderNumber: true,
+          status: true,
+          deletedAt: true,
+          roomAssignment: true,
+          total: true,
+        },
+      });
+      if (!order) throw new NotFoundError('订单不存在');
+      if (order.deletedAt) {
+        throw new BadRequestError('订单在回收站（已软删），不可拆分房组；如需操作请先恢复');
+      }
+      if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
+        throw new BadRequestError(
+          `订单当前状态（${zhStatus(order.status)}）不可拆分房组：仅占座中的有效订单可操作`,
+        );
+      }
+
+      const item = await tx.orderItem.findUnique({
+        where: { id: itemId },
+        select: {
+          id: true,
+          orderId: true,
+          kind: true,
+          description: true,
+          quantity: true,
+          unitPrice: true,
+          unitCostCny: true,
+          totalCostCny: true,
+          hotelRoomTypeId: true,
+          randomStarTier: true,
+          hotelCheckIn: true,
+          hotelCheckOut: true,
+          roomsBilled: true,
+        },
+      });
+      if (!item || item.orderId !== orderId) {
+        throw new NotFoundError('订单项不存在或不属于该订单');
+      }
+      if (item.kind === OrderItemKind.BUNDLE) {
+        throw new BadRequestError(
+          '套餐行不能直接拆分房组：请先经「补录房费」补一条独立酒店行，再对该行拆分/换酒店',
+        );
+      }
+      if (item.kind !== OrderItemKind.HOTEL) {
+        throw new BadRequestError('该行不是酒店行，无法拆分房组');
+      }
+
+      // ── 分房表 & 目标房组（防御式解析，形状不符按缺失处理）──
+      const raw = order.roomAssignment;
+      const rawGroups =
+        raw != null && typeof raw === 'object' && !Array.isArray(raw)
+          ? (raw as { roomGroups?: unknown }).roomGroups
+          : null;
+      if (!Array.isArray(rawGroups) || rawGroups.length === 0) {
+        throw new BadRequestError('本单尚无分房表，请先在分房里保存房组，再按房组拆分');
+      }
+      const target = rawGroups.find(
+        (g) => g != null && typeof g === 'object' && (g as { id?: unknown }).id === input.roomGroupId,
+      ) as Record<string, unknown> | undefined;
+      if (!target) {
+        throw new BadRequestError('分房表中不存在该房组，请刷新分房后重试');
+      }
+      const targetAttribution = target.orderItemId;
+      if (
+        typeof targetAttribution === 'string' &&
+        targetAttribution.length > 0 &&
+        targetAttribution !== itemId
+      ) {
+        throw new BadRequestError('该房组已归属其它订单行，不能从本行拆出');
+      }
+
+      // ── 数量守卫（0.5 网格；Σ roomsBilled 守恒的前提）──
+      const movedRaw = target.roomFraction == null ? 1 : Number(target.roomFraction);
+      if (!Number.isFinite(movedRaw) || movedRaw <= 0) {
+        throw new BadRequestError('房组间数（roomFraction）无效，请先修正分房表');
+      }
+      const movedHalf = Math.round(movedRaw * 2);
+      if (movedHalf <= 0 || Math.abs(movedRaw * 2 - movedHalf) > 1e-9) {
+        throw new BadRequestError('房组间数必须是 0.5 的整数倍');
+      }
+      const srcRooms = item.roomsBilled != null ? Number(item.roomsBilled) : null;
+      if (srcRooms == null || srcRooms <= 0) {
+        throw new BadRequestError('源行未记录计费房数（roomsBilled），请先保存分房表再拆分');
+      }
+      const srcHalf = Math.round(srcRooms * 2);
+      if (Math.abs(srcRooms * 2 - srcHalf) > 1e-9) {
+        throw new BadRequestError('源行计费房数不是 0.5 的整数倍，请先核对分房表');
+      }
+      if (movedHalf === srcHalf) {
+        throw new BadRequestError('该房组已占满源行全部房数，无需拆分 —— 直接对源行换酒店即可');
+      }
+      if (movedHalf > srcHalf) {
+        throw new BadRequestError('该房组间数超过源行计费房数，无法拆分，请先核对分房表');
+      }
+      const moved = movedHalf / 2;
+      const remaining = (srcHalf - movedHalf) / 2; // > 0（movedHalf < srcHalf）
+
+      // ── 成本按间数比例挪（Σ 守恒）；钱（amount）全留源行 ──
+      const srcTotalCost = item.totalCostCny != null ? Number(item.totalCostCny.toString()) : null;
+      const movedCost = srcTotalCost == null ? null : round2((srcTotalCost * movedHalf) / srcHalf);
+      const keptCost = srcTotalCost == null || movedCost == null ? null : round2(srcTotalCost - movedCost);
+
+      const created = await tx.orderItem.create({
+        data: {
+          orderId,
+          kind: OrderItemKind.HOTEL,
+          description: item.description,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice,
+          // 拆行只拆库存归属不拆应收：新行 0 元，源行 amount 不动 → subtotal/total 恒等
+          amount: new Prisma.Decimal(0),
+          unitCostCny: item.unitCostCny,
+          totalCostCny: movedCost == null ? null : new Prisma.Decimal(movedCost),
+          hotelRoomTypeId: item.hotelRoomTypeId,
+          randomStarTier: item.randomStarTier,
+          hotelCheckIn: item.hotelCheckIn,
+          hotelCheckOut: item.hotelCheckOut,
+          roomsBilled: new Prisma.Decimal(moved),
+          idempotencyKey: null,
+          metadata: {
+            splitRoomGroup: {
+              fromItemId: item.id,
+              roomGroupId: input.roomGroupId,
+              at: new Date().toISOString(),
+            },
+            ...(input.note ? { note: input.note } : {}),
+          } as Prisma.InputJsonValue,
+        },
+      });
+      await tx.orderItem.update({
+        where: { id: item.id },
+        data: {
+          roomsBilled: new Prisma.Decimal(remaining),
+          totalCostCny: keptCost == null ? null : new Prisma.Decimal(keptCost),
+        },
+      });
+
+      // ── 房组归属：目标组指到新行；其余无归属组回填为源行（本单从此每组有归属）──
+      const newGroups = rawGroups.map((g) => {
+        if (g == null || typeof g !== 'object') return g;
+        const rec = g as Record<string, unknown>;
+        if (rec.id === input.roomGroupId) return { ...rec, orderItemId: created.id };
+        const existing = rec.orderItemId;
+        if (typeof existing === 'string' && existing.length > 0) return rec;
+        return { ...rec, orderItemId: item.id };
+      });
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          roomAssignment: {
+            ...(raw as Record<string, unknown>),
+            roomGroups: newGroups,
+          } as Prisma.InputJsonValue,
+        },
+      });
+
+      // ── 守恒断言（不平整体回滚）：Σ roomsBilled、Σ totalCostCny、order.total 拆前后一致 ──
+      const [afterSrc, afterNew, afterOrder] = await Promise.all([
+        tx.orderItem.findUniqueOrThrow({
+          where: { id: item.id },
+          select: { roomsBilled: true, totalCostCny: true },
+        }),
+        tx.orderItem.findUniqueOrThrow({
+          where: { id: created.id },
+          select: { roomsBilled: true, totalCostCny: true },
+        }),
+        tx.order.findUniqueOrThrow({ where: { id: orderId }, select: { total: true } }),
+      ]);
+      const halfOf = (v: Prisma.Decimal | null): number =>
+        v == null ? 0 : Math.round(Number(v.toString()) * 2);
+      const centsOf = (v: Prisma.Decimal | null): number =>
+        v == null ? 0 : Math.round(Number(v.toString()) * 100);
+      if (halfOf(afterSrc.roomsBilled) + halfOf(afterNew.roomsBilled) !== srcHalf) {
+        throw new Error('拆分守恒校验未通过（Σ roomsBilled 与拆前不符），已回滚');
+      }
+      const costBeforeCents = srcTotalCost == null ? 0 : Math.round(srcTotalCost * 100);
+      if (centsOf(afterSrc.totalCostCny) + centsOf(afterNew.totalCostCny) !== costBeforeCents) {
+        throw new Error('拆分守恒校验未通过（Σ totalCostCny 与拆前不符），已回滚');
+      }
+      if (afterOrder.total.toString() !== order.total.toString()) {
+        throw new Error('拆分守恒校验未通过（order.total 被改动），已回滚');
+      }
+
+      return {
+        orderNumber: order.orderNumber,
+        fromItemId: item.id,
+        newItemId: created.id,
+        roomGroupId: input.roomGroupId,
+        before: { fromRoomsBilled: srcRooms, fromTotalCostCny: srcTotalCost },
+        after: {
+          fromRoomsBilled: remaining,
+          newRoomsBilled: moved,
+          fromTotalCostCny: keptCost,
+          newTotalCostCny: movedCost,
+        },
+      };
+    });
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+    return {
+      order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
+      audit: scratch,
+    };
+  }
+
+  /**
    * 酒店改期：把某条 HOTEL 行的入住/退房日期整体挪到新区间。
    *
    * 与「换酒店」是一对姊妹能力：换酒店改的是「住哪」，改期改的是「住哪几晚」。房控占房本就
@@ -8867,8 +9148,8 @@ export class OrderService {
    * 房控库存（新区间必须装得下，否则整体拒绝）：
    *   - 具体酒店行（有 hotelRoomTypeId）：先锁目标酒店该区间的包房周期行（并发互斥的唯一正解），
    *     再走物理房间口径前瞻闸。`excludeOrderId` 排除本单自身占房 —— 对同酒店改期而言，这正是
-   *     「先释放旧区间」的效果（口径与换酒店一致；本单在该酒店的其它 HOTEL 行也会被一并排除，
-   *     与换酒店同一已知口径）。
+   *     「先释放旧区间」的效果（本单在该酒店的其它 HOTEL 行也会被一并排除，属已知口径；
+   *     换酒店已升级为行级排除 excludeOrderItemIds，改期后续可跟进）。
    *   - 未落位随机档行（randomStarTier 非空、无房型）：走随机档聚合余量闸（Σ同星级真酒店余量 −
    *     未落位占用），口径与下单/落位一致。
    *

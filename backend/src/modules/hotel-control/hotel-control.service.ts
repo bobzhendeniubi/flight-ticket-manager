@@ -347,10 +347,13 @@ async function computeHotelOversellAfterPeriodChange(
       order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
     },
     select: {
+      // id + 酒店名：房组归属过滤（expandAssignedPhysicalByDate）的坐标系
+      id: true,
       hotelCheckIn: true,
       hotelCheckOut: true,
       roomsBilled: true,
       metadata: true,
+      hotelRoomType: { select: { hotel: { select: { name: true } } } },
       order: {
         select: { id: true, roomAssignment: true, passengers: { select: { gender: true } } },
       },
@@ -640,6 +643,27 @@ export function computePhysicalUsed(
 }
 
 // ── 权威分房表（Order.roomAssignment）────────────────────────────────────
+
+/** 防御式解析 roomAssignment.roomGroups：形状不符 / 空数组返回 null，非对象条目剔除。*/
+function parseRoomGroups(roomAssignment: unknown): Array<Record<string, unknown>> | null {
+  if (roomAssignment == null || typeof roomAssignment !== 'object') return null;
+  const groups = (roomAssignment as { roomGroups?: unknown }).roomGroups;
+  if (!Array.isArray(groups) || groups.length === 0) return null;
+  return groups.filter((g): g is Record<string, unknown> => g != null && typeof g === 'object');
+}
+
+/** 房组里至少 1 名出行人（空盒子不占物理间数）。*/
+function groupHasPassengers(g: Record<string, unknown>): boolean {
+  const ids = g.passengerIds;
+  return Array.isArray(ids) && ids.length > 0;
+}
+
+/** 房组归属的订单行 id（split-room-group / 分房保存写入）；无归属 / 形状不符返回 null。*/
+function groupOrderItemId(g: Record<string, unknown>): string | null {
+  const v = g.orderItemId;
+  return typeof v === 'string' && v.length > 0 ? v : null;
+}
+
 /**
  * 权威分房表的物理间数：Order.roomAssignment.roomGroups（orders 模块分房保存的 JSON）中
  * 「至少 1 名出行人」的房间盒子数量。返回 null = 无有效分房表（未分房 / 形状不符 /
@@ -647,25 +671,27 @@ export function computePhysicalUsed(
  *
  * 背景：分房保存把 Σ roomFraction 塌缩写进首个酒店行的 roomsBilled（床位/计费口径），
  * "男+女各半间分 2 房"会塌缩成 1.0——物理间数必须回读分房表，不能只看 roomsBilled。
+ *
+ * ⚠ 这是**整单**口径（不看房组住哪家店）。逐酒店统计请走 expandAssignedPhysicalByDate ——
+ * 它对带 orderItemId 归属的房组按归属过滤，一单房组分住两家店不会两边各记整单数。
  */
 export function assignedPhysicalRooms(roomAssignment: unknown): number | null {
-  if (roomAssignment == null || typeof roomAssignment !== 'object') return null;
-  const groups = (roomAssignment as { roomGroups?: unknown }).roomGroups;
-  if (!Array.isArray(groups) || groups.length === 0) return null;
-  const withPassengers = groups.filter((g) => {
-    if (g == null || typeof g !== 'object') return false;
-    const ids = (g as { passengerIds?: unknown }).passengerIds;
-    return Array.isArray(ids) && ids.length > 0;
-  }).length;
+  const groups = parseRoomGroups(roomAssignment);
+  if (!groups) return null;
+  const withPassengers = groups.filter(groupHasPassengers).length;
   return withPassengers > 0 ? withPassengers : null;
 }
 
 /** 占房行（物理口径拆分用）：订单级分房表 + 拼房性别 fallback 所需字段。*/
 export interface PhysicalOccupancyItem {
+  /** 行 id（可选）：房组归属过滤的坐标系。调用方不带 id 时归属过滤自动退化为整单口径。*/
+  id?: string;
   hotelCheckIn: Date | null;
   hotelCheckOut: Date | null;
   roomsBilled?: Prisma.Decimal | number | null;
   metadata?: unknown;
+  /** 行所在酒店名（可选）：无 orderItemId 的房组按 hotelName 匹配归属时用。*/
+  hotelRoomType?: { hotel?: { name?: string | null } | null } | null;
   order?: {
     id?: string;
     roomAssignment?: unknown;
@@ -679,9 +705,16 @@ export interface PhysicalOccupancyItem {
  * + computePhysicalUsed）。分房表订单不再参与 isHalfRoom / 性别配对 / 整间推算，
  * 也不进「拼」落单口径（sharedUnpaired）。
  *
- * 订单级去重：分房是订单级、占房行是行级——同一订单在同酒店的多行（两种房型 / 分段住）
- * 只按分房表间数计一次/晚：对该单所有行的 [checkIn, checkOut) 取并集覆盖，
- * 覆盖到的每晚 += 分房表间数（日期展开方式对齐 expandUsedByDate 的半开区间）。
+ * 房组归属过滤（split-room-group 后的正确账）：分房表的房组若带 orderItemId 归属，
+ * 只有「归属 ∈ 本批行 id」的组才计入 —— 一单房组分住 A/B 两家店时，A 店只记归属到
+ * A 店行的组，不再两家各记整单数（双算）。无 orderItemId 的组按 hotelName 匹配本行
+ * 所在酒店（整单去重、区间并集，防同单多行重复计）。**整单房组都无归属信息**（旧数据）
+ * 或本批行不带 id（调用方未升级）→ 回退整单计数的现行为，兼容旧账。
+ *
+ * 订单级去重（无归属口径）：分房是订单级、占房行是行级——同一订单在同酒店的多行
+ * （两种房型 / 分段住）只按分房表间数计一次/晚：对该单所有行的 [checkIn, checkOut)
+ * 取并集覆盖，覆盖到的每晚 += 分房表间数（日期展开方式对齐 expandUsedByDate 的半开区间）。
+ * 带归属的组则按**归属行自己的住宿区间**逐晚计（比并集更准）。
  */
 export function expandAssignedPhysicalByDate<T extends PhysicalOccupancyItem>(
   items: ReadonlyArray<T>,
@@ -689,27 +722,76 @@ export function expandAssignedPhysicalByDate<T extends PhysicalOccupancyItem>(
 ): { assignedPhysical: number[]; fallbackItems: T[] } {
   const assignedPhysical = new Array<number>(dates.length).fill(0);
   const fallbackItems: T[] = [];
-  const byOrder = new Map<string, { rooms: number; covered: boolean[] }>();
+  // 本批行 id 集合：调用方（销控板/余量/前瞻闸）传进来的 items 已按「一家酒店」分好组，
+  // 这就是归属过滤的坐标系；一个 id 都没有 = 调用方未升级，整单口径兜底。
+  const batchItemIds = new Set<string>();
+  for (const it of items) {
+    if (typeof it.id === 'string' && it.id.length > 0) batchItemIds.add(it.id);
+  }
+  // 整单口径的订单级去重（旧数据 / 未升级调用方 / 无归属的按名匹配组）
+  const legacyByOrder = new Map<string, { rooms: number; covered: boolean[] }>();
+  const namedByOrder = new Map<string, { rooms: number; covered: boolean[] }>();
+  const cover = (covered: boolean[], checkInD: Date, checkOutD: Date): void => {
+    const checkIn = fmtDateOnly(checkInD);
+    const checkOut = fmtDateOnly(checkOutD);
+    for (let i = 0; i < dates.length; i++) {
+      if (checkIn <= dates[i] && dates[i] < checkOut) covered[i] = true;
+    }
+  };
+
   items.forEach((it, idx) => {
-    const rooms = assignedPhysicalRooms(it.order?.roomAssignment);
-    if (rooms == null || !it.hotelCheckIn || !it.hotelCheckOut) {
+    const groups = parseRoomGroups(it.order?.roomAssignment);
+    if (!groups || !it.hotelCheckIn || !it.hotelCheckOut) {
       fallbackItems.push(it);
       return;
     }
     // 订单 id 缺失（异常兜底）按行独立计，避免静默丢占房
     const key = it.order?.id ?? `__row_${idx}`;
-    const entry = byOrder.get(key) ?? {
-      rooms,
-      covered: new Array<boolean>(dates.length).fill(false),
-    };
-    if (!byOrder.has(key)) byOrder.set(key, entry);
-    const checkIn = fmtDateOnly(it.hotelCheckIn);
-    const checkOut = fmtDateOnly(it.hotelCheckOut);
-    for (let i = 0; i < dates.length; i++) {
-      if (checkIn <= dates[i] && dates[i] < checkOut) entry.covered[i] = true;
+    const hasAttribution = groups.some((g) => groupOrderItemId(g) != null);
+
+    if (!hasAttribution || batchItemIds.size === 0) {
+      // 整单口径（现行为）：有乘客的盒子数 × 区间并集；全盒子无人 → 性别推算 fallback。
+      const rooms = groups.filter(groupHasPassengers).length;
+      if (rooms === 0) {
+        fallbackItems.push(it);
+        return;
+      }
+      const entry =
+        legacyByOrder.get(key) ?? { rooms, covered: new Array<boolean>(dates.length).fill(false) };
+      if (!legacyByOrder.has(key)) legacyByOrder.set(key, entry);
+      cover(entry.covered, it.hotelCheckIn, it.hotelCheckOut);
+      return;
     }
+
+    // 归属口径：orderItemId == 本行的组按本行区间逐晚直计
+    const own = groups.filter((g) => groupHasPassengers(g) && groupOrderItemId(g) === it.id).length;
+    if (own > 0) {
+      const checkIn = fmtDateOnly(it.hotelCheckIn);
+      const checkOut = fmtDateOnly(it.hotelCheckOut);
+      for (let i = 0; i < dates.length; i++) {
+        if (checkIn <= dates[i] && dates[i] < checkOut) assignedPhysical[i] += own;
+      }
+    }
+    // 无 orderItemId 的组按 hotelName 匹配到本行所在酒店（整单去重 + 区间并集，防多行重复计）
+    const hotelName = it.hotelRoomType?.hotel?.name ?? null;
+    const unattributed =
+      hotelName == null
+        ? 0
+        : groups.filter(
+            (g) => groupHasPassengers(g) && groupOrderItemId(g) == null && g.hotelName === hotelName,
+          ).length;
+    if (unattributed > 0) {
+      const entry =
+        namedByOrder.get(key) ??
+        { rooms: unattributed, covered: new Array<boolean>(dates.length).fill(false) };
+      if (!namedByOrder.has(key)) namedByOrder.set(key, entry);
+      cover(entry.covered, it.hotelCheckIn, it.hotelCheckOut);
+    }
+    // 有权威分房表的行一律不进 fallback：即便本行在本酒店归属 0 组（组都归属在别的行 /
+    // 别的酒店），也绝不能按性别推算把它计回来 —— 那正是本口径要修的双算。
   });
-  for (const { rooms, covered } of byOrder.values()) {
+
+  for (const { rooms, covered } of [...legacyByOrder.values(), ...namedByOrder.values()]) {
     for (let i = 0; i < dates.length; i++) {
       if (covered[i]) assignedPhysical[i] += rooms;
     }
@@ -755,10 +837,13 @@ export async function getHotelNightlyRemaining(
       order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
     },
     select: {
+      // id + 酒店名：房组归属过滤（expandAssignedPhysicalByDate）的坐标系
+      id: true,
       hotelCheckIn: true,
       hotelCheckOut: true,
       roomsBilled: true,
       metadata: true,
+      hotelRoomType: { select: { hotel: { select: { name: true } } } },
       // 物理房间口径 physicalRemaining 需要（口径同 getBoard）：
       //   roomAssignment = 权威分房表（优先直计物理间数）；passengers.gender = fallback 性别推算
       order: {
@@ -858,13 +943,16 @@ function computePhysicalUsedForItems<T extends PhysicalOccupancyItem>(
  * 「还剩 1 间」的旧快照双双通过。要真正互斥，调用方必须在事务里改用
  * `assertHotelPhysicalFitWithinTx(tx, …)`（它会先对包房周期行加 FOR UPDATE 行锁）。
  *
- * @param excludeOrderId 改存量单（换酒店 / 重排分房）时排除该单自身的既有占房，避免把自己算两遍。
+ * @param excludeOrderId 改存量单（重排分房 / 酒店改期）时排除该单自身的既有占房，避免把自己算两遍。
+ *   ⚠ 排除的是**整单**：同单在目标酒店的其它行也会被一并排掉（放行超卖的已知口径）。
+ * @param excludeOrderItemIds 精确到行的排除（换酒店传本行 id）：只排本次要挪走的那条行，
+ *   同单另一条行在目标酒店的真实占用照常计入 —— excludeOrderId 的行级升级版。两参数可并存。
  */
 export async function checkHotelPhysicalFit(
   hotelId: string,
   nightDates: readonly string[],
   prospective: ProspectiveOccupancy,
-  opts: { excludeOrderId?: string } = {},
+  opts: { excludeOrderId?: string; excludeOrderItemIds?: readonly string[] } = {},
   client: HotelControlDbClient = defaultPrisma,
 ): Promise<PhysicalFitResult> {
   const empty: PhysicalFitResult = {
@@ -888,6 +976,9 @@ export async function checkHotelPhysicalFit(
   const items = await client.orderItem.findMany({
     where: {
       ...scopeItemWhere({ hotelId }),
+      ...(opts.excludeOrderItemIds && opts.excludeOrderItemIds.length > 0
+        ? { id: { notIn: [...opts.excludeOrderItemIds] } }
+        : {}),
       hotelCheckIn: { lte: toD },
       hotelCheckOut: { gt: fromD },
       order: {
@@ -897,10 +988,13 @@ export async function checkHotelPhysicalFit(
       },
     },
     select: {
+      // id + 酒店名：房组归属过滤（expandAssignedPhysicalByDate）的坐标系
+      id: true,
       hotelCheckIn: true,
       hotelCheckOut: true,
       roomsBilled: true,
       metadata: true,
+      hotelRoomType: { select: { hotel: { select: { name: true } } } },
       order: {
         select: { id: true, roomAssignment: true, passengers: { select: { gender: true } } },
       },
@@ -941,6 +1035,7 @@ export async function assertHotelPhysicalFit(
   prospective: ProspectiveOccupancy,
   opts: {
     excludeOrderId?: string;
+    excludeOrderItemIds?: readonly string[];
     allowNonWorsening?: boolean;
     buildMessage?: (violations: readonly PhysicalFitViolation[]) => string;
   } = {},
@@ -950,7 +1045,7 @@ export async function assertHotelPhysicalFit(
     hotelId,
     nightDates,
     prospective,
-    { excludeOrderId: opts.excludeOrderId },
+    { excludeOrderId: opts.excludeOrderId, excludeOrderItemIds: opts.excludeOrderItemIds },
     client,
   );
   if (!fit.hasBlock || fit.violations.length === 0) return;
@@ -1022,6 +1117,7 @@ export async function assertHotelPhysicalFitWithinTx(
   prospective: ProspectiveOccupancy,
   opts: {
     excludeOrderId?: string;
+    excludeOrderItemIds?: readonly string[];
     allowNonWorsening?: boolean;
     buildMessage?: (violations: readonly PhysicalFitViolation[]) => string;
   } = {},
@@ -1320,6 +1416,8 @@ export async function getBoard(
       order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
     },
     select: {
+      // id：房组归属过滤（expandAssignedPhysicalByDate）的坐标系；酒店名已在 hotelRoomType 里
+      id: true,
       hotelCheckIn: true,
       hotelCheckOut: true,
       roomsBilled: true,

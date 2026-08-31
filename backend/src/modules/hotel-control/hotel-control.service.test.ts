@@ -551,6 +551,114 @@ describe('expandAssignedPhysicalByDate（拆分 + 订单级去重）', () => {
   });
 });
 
+describe('expandAssignedPhysicalByDate 房组归属过滤（一单两酒店不双算）', () => {
+  const dates = [dayStr(0), dayStr(1), dayStr(2)];
+
+  /** 带归属的分房表：groups[i] = { orderItemId?, hotelName?, size }。*/
+  const attributedAssignment = (
+    groups: Array<{ orderItemId?: string; hotelName?: string; size?: number }>,
+  ) => ({
+    roomGroups: groups.map((g, i) => ({
+      id: `g${i + 1}`,
+      hotelName: g.hotelName ?? '美溪海滩酒店',
+      roomType: '标间',
+      passengerIds: Array.from({ length: g.size ?? 1 }, (_, j) => `p${i + 1}-${j + 1}`),
+      ...(g.orderItemId ? { orderItemId: g.orderItemId } : {}),
+    })),
+  });
+
+  it('两行分住 A/B 两店、房组各有归属 → 各酒店只记自己组的数（双算修复的回归锚）', () => {
+    const order = {
+      id: 'o1',
+      roomAssignment: attributedAssignment([
+        { orderItemId: 'item-a', hotelName: '酒店A' },
+        { orderItemId: 'item-b', hotelName: '酒店B' },
+      ]),
+      passengers: [],
+    };
+    const itemA = {
+      id: 'item-a',
+      hotelCheckIn: day(0),
+      hotelCheckOut: day(2),
+      roomsBilled: 1,
+      hotelRoomType: { hotel: { name: '酒店A' } },
+      order,
+    };
+    const itemB = {
+      id: 'item-b',
+      hotelCheckIn: day(0),
+      hotelCheckOut: day(1),
+      roomsBilled: 1,
+      hotelRoomType: { hotel: { name: '酒店B' } },
+      order,
+    };
+    // A 店只统计 A 店的行：只计归属 item-a 的那 1 组（旧口径会记整单 2 组 → 双算）
+    const atA = expandAssignedPhysicalByDate([itemA], dates);
+    expect(atA.assignedPhysical).toEqual([1, 1, 0]);
+    expect(atA.fallbackItems).toEqual([]);
+    // B 店同理，且区间按 B 行自己的住宿区间
+    const atB = expandAssignedPhysicalByDate([itemB], dates);
+    expect(atB.assignedPhysical).toEqual([1, 0, 0]);
+    expect(atB.fallbackItems).toEqual([]);
+  });
+
+  it('无 orderItemId 的组按 hotelName 匹配归属；组都归属在别的行/别的酒店 → 本店记 0 且不进性别 fallback', () => {
+    const order = {
+      id: 'o1',
+      roomAssignment: attributedAssignment([
+        { orderItemId: 'item-a', hotelName: '酒店A' },
+        { hotelName: '酒店A' }, // 无归属，按酒店名匹配到 A 店
+      ]),
+      passengers: [{ gender: 'M' as Gender }],
+    };
+    const itemA = {
+      id: 'item-a',
+      hotelCheckIn: day(0),
+      hotelCheckOut: day(1),
+      roomsBilled: 2,
+      hotelRoomType: { hotel: { name: '酒店A' } },
+      order,
+    };
+    const itemB = {
+      id: 'item-b',
+      hotelCheckIn: day(0),
+      hotelCheckOut: day(1),
+      roomsBilled: 1,
+      hotelRoomType: { hotel: { name: '酒店B' } },
+      order,
+    };
+    const atA = expandAssignedPhysicalByDate([itemA], dates);
+    expect(atA.assignedPhysical).toEqual([2, 0, 0]); // 归属 1 + 按名匹配 1
+    // B 店：组都在 A（按 id / 按名都不命中）→ 0，且绝不能落回性别推算（那正是双算）
+    const atB = expandAssignedPhysicalByDate([itemB], dates);
+    expect(atB.assignedPhysical).toEqual([0, 0, 0]);
+    expect(atB.fallbackItems).toEqual([]);
+  });
+
+  it('旧数据（整单房组都无归属）→ 回退现行为：每家店都记整单数', () => {
+    const order = { id: 'o1', roomAssignment: roomAssignmentOf([1, 1]), passengers: [] };
+    const itemA = {
+      id: 'item-a',
+      hotelCheckIn: day(0),
+      hotelCheckOut: day(1),
+      roomsBilled: 1,
+      hotelRoomType: { hotel: { name: '酒店A' } },
+      order,
+    };
+    expect(expandAssignedPhysicalByDate([itemA], dates).assignedPhysical).toEqual([2, 0, 0]);
+  });
+
+  it('调用方未升级（本批行不带 id）→ 即便房组带归属也回退整单口径，兼容旧调用', () => {
+    const order = {
+      id: 'o1',
+      roomAssignment: attributedAssignment([{ orderItemId: 'item-a' }, { orderItemId: 'item-b' }]),
+      passengers: [],
+    };
+    const legacyRow = { hotelCheckIn: day(0), hotelCheckOut: day(1), roomsBilled: 1, order };
+    expect(expandAssignedPhysicalByDate([legacyRow], dates).assignedPhysical).toEqual([2, 0, 0]);
+  });
+});
+
 describe('getBoard 权威分房表优先（物理口径）', () => {
   const rt = { hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } } };
 
@@ -965,6 +1073,81 @@ describe('checkHotelPhysicalFit（物理房间口径前瞻闸）', () => {
     await checkHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 1, solos: [] }, { excludeOrderId: 'o9' }, client);
     const where = (client.orderItem.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
     expect(where.order.id).toEqual({ not: 'o9' });
+  });
+
+  it('excludeOrderItemIds（行级排除）：只排指定行、不排整单 —— 同单另一行在目标酒店的占用照常计入', async () => {
+    const client = fitClient([], 5);
+    await checkHotelPhysicalFit(
+      'h1',
+      [dayStr(0)],
+      { wholeRooms: 1, solos: [] },
+      { excludeOrderItemIds: ['item-swap'] },
+      client,
+    );
+    const where = (client.orderItem.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
+    expect(where.id).toEqual({ notIn: ['item-swap'] });
+    // 关键差异：订单级排除**不**出现 —— 同单其它行的真实占用不再被误排（旧口径放行超卖）
+    expect(where.order.id).toBeUndefined();
+  });
+
+  it('excludeOrderItemIds 语义：同单另一行占掉最后 1 间 → 换酒店挪 1 间进来被拒（整单排除法会误放行）', async () => {
+    // 包房 1 间；目标酒店已有「同一订单的另一条行」占 1 整间（无分房表 → 床位口径直计）。
+    const client = fitClient(
+      [
+        {
+          id: 'item-other',
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 1,
+          order: { id: 'o1', roomAssignment: null, passengers: [] },
+        },
+      ],
+      1,
+    );
+    const fit = await checkHotelPhysicalFit(
+      'h1',
+      [dayStr(0)],
+      { wholeRooms: 1, solos: [] },
+      { excludeOrderItemIds: ['item-swap'] },
+      client,
+    );
+    // 1（另一行存量）+ 1（挪进来）= 2 > 包房 1 → 拒。excludeOrderId: 'o1' 的旧口径会把
+    // 存量排掉 → 1 <= 1 误放行 —— 这正是行级排除要修的超卖口子。
+    expect(fit.physicalUsedAfter).toEqual([2]);
+    expect(fit.violations).toHaveLength(1);
+  });
+
+  it('归属过滤走进前瞻闸：同单房组分住两店，目标店只计归属到目标店行的组', async () => {
+    // 订单 o1 有两行：item-b 在目标酒店 h1（归属 1 组）；item-a 在别的酒店（归属 1 组）。
+    // 目标店存量应只算 item-b 的 1 间，而不是整单 2 间。
+    const order = {
+      id: 'o1',
+      roomAssignment: {
+        roomGroups: [
+          { id: 'g1', hotelName: '酒店A', roomType: '标间', passengerIds: ['p1'], orderItemId: 'item-a' },
+          { id: 'g2', hotelName: '酒店B', roomType: '标间', passengerIds: ['p2'], orderItemId: 'item-b' },
+        ],
+      },
+      passengers: [],
+    };
+    const client = fitClient(
+      [
+        {
+          id: 'item-b',
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 1,
+          hotelRoomType: { hotel: { name: '酒店B' } },
+          order,
+        },
+      ],
+      2,
+    );
+    const fit = await checkHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 1, solos: [] }, {}, client);
+    // 存量 1（仅 g2）+ 新增 1 = 2 <= 包房 2 → 放行；整单口径会算存量 2 → 3 > 2 误拒
+    expect(fit.physicalUsedBefore).toEqual([1]);
+    expect(fit.physicalUsedAfter).toEqual([2]);
+    expect(fit.violations).toEqual([]);
   });
 
   it('assertHotelPhysicalFit：装不下抛 BadRequestError；allowNonWorsening 放行「改完不比改前差」的重排', async () => {

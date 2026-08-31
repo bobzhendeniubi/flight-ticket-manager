@@ -9,7 +9,7 @@
 import type { FastifyPluginAsync } from 'fastify';
 import { localDateISO } from '../../lib/flight-time.js';
 import { z } from 'zod';
-import { Prisma, UserRole, type Passenger } from '@prisma/client';
+import { OrderItemKind, Prisma, UserRole, type Passenger } from '@prisma/client';
 import {
   buildStayNightDates,
   OrderService,
@@ -44,6 +44,7 @@ import {
   resolvePassengerPatchChannel,
   selfUpdatePassengerBodySchema,
   rescheduleItemHotelBodySchema,
+  splitRoomGroupBodySchema,
   swapItemHotelBodySchema,
   swapPassengerBodySchema,
   setPassengerVisaExemptBodySchema,
@@ -1108,6 +1109,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
             // 半间/拼房：0.5 = 占半间（与他人拼），默认 1 间。Σ roomFraction = 该单实际占房间数。
             // 只允许 0.5 步进（Decimal(4,1)），拒绝脏小数被静默四舍五入；0 间组不入此校验。
             roomFraction: z.number().multipleOf(0.5).min(0.5).max(20).optional(),
+            // 房组归属的订单行（可选，split-room-group / 新版前端写入）：房控按它把房组
+            // 计到该行所在酒店，roomsBilled 也按它分行落。缺省 = 旧口径（整单计数 + 塌缩首行）。
+            orderItemId: z.string().min(1).optional(),
           }),
         ),
       })
@@ -1117,6 +1121,30 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       select: { orderNumber: true, roomAssignment: true },
     });
     if (!before) return reply.status(404).send({ error: '订单不存在' });
+
+    // orderItemId 归属校验：必须是本单的 HOTEL/BUNDLE 行 id，否则 400（防串单/脏引用）。
+    const attributedIds = [
+      ...new Set(
+        body.roomGroups
+          .map((g) => g.orderItemId)
+          .filter((v): v is string => typeof v === 'string' && v.length > 0),
+      ),
+    ];
+    if (attributedIds.length > 0) {
+      const ownedCount = await prisma.orderItem.count({
+        where: {
+          id: { in: attributedIds },
+          orderId: id,
+          kind: { in: [OrderItemKind.HOTEL, OrderItemKind.BUNDLE] },
+        },
+      });
+      if (ownedCount !== attributedIds.length) {
+        return reply
+          .status(400)
+          .send({ error: '房组归属的订单行不存在或不属于本单（仅可归属本单的酒店/套餐行）' });
+      }
+    }
+    const hasAttribution = attributedIds.length > 0;
 
     // 本次分房的物理间数 = 有乘客的房间盒子数。真正的房量判定在下方写 roomAssignment 的
     // 那个事务里做（带包房周期行锁），见那里的注释。
@@ -1145,6 +1173,18 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
 
     // 分房总间数（含 0.5 拼房）→ 写回酒店订单行的 roomsBilled，房控据此按真实间数计（如 7 人 3.5 间）。
     const totalRooms = body.roomGroups.reduce((s, g) => s + (g.roomFraction ?? 1), 0);
+    // Σ roomFraction 按房组归属分行落（解除「全部塌缩进首行」）：带 orderItemId 的组记到
+    // 各自订单行；无归属的组维持旧口径 —— 合并进首个带房型的行。
+    const roomsByItem = new Map<string, number>();
+    let unattachedRooms = 0;
+    for (const g of body.roomGroups) {
+      const fraction = g.roomFraction ?? 1;
+      if (g.orderItemId) {
+        roomsByItem.set(g.orderItemId, (roomsByItem.get(g.orderItemId) ?? 0) + fraction);
+      } else {
+        unattachedRooms += fraction;
+      }
+    }
     // 金额分叉提示（B10）：roomsBilled 是房控口径也是计价参照——拖拽改它不会重算订单金额。
     // 把「计费房数变了但钱没变」明示给运营，需要调价走补房差 / 改结算价通道，别让两本账静默漂移。
     const prevAgg = await prisma.orderItem.aggregate({
@@ -1168,26 +1208,43 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         const hotelItems = await tx.orderItem.findMany({
           where: { orderId: id, hotelRoomTypeId: { not: null } },
           select: {
+            id: true,
             hotelCheckIn: true,
             hotelCheckOut: true,
-            hotelRoomType: { select: { hotelId: true } },
+            hotelRoomType: { select: { hotelId: true, hotel: { select: { name: true } } } },
           },
         });
-        const nightsByHotel = new Map<string, Set<string>>();
+        const byHotel = new Map<string, { nights: Set<string>; itemIds: Set<string>; name: string }>();
         for (const it of hotelItems) {
           const hotelId = it.hotelRoomType?.hotelId;
           if (!hotelId || !it.hotelCheckIn || !it.hotelCheckOut) continue;
-          const nights = nightsByHotel.get(hotelId) ?? new Set<string>();
-          if (!nightsByHotel.has(hotelId)) nightsByHotel.set(hotelId, nights);
-          for (const d of buildStayNightDates(it.hotelCheckIn, it.hotelCheckOut)) nights.add(d);
+          const agg =
+            byHotel.get(hotelId) ??
+            {
+              nights: new Set<string>(),
+              itemIds: new Set<string>(),
+              name: it.hotelRoomType?.hotel?.name ?? '',
+            };
+          if (!byHotel.has(hotelId)) byHotel.set(hotelId, agg);
+          agg.itemIds.add(it.id);
+          for (const d of buildStayNightDates(it.hotelCheckIn, it.hotelCheckOut)) agg.nights.add(d);
         }
+        // 逐酒店的本单新物理间数：带归属的分房按房组归属分酒店计（orderItemId ∈ 该酒店行 ∪
+        // 无归属组按酒店名匹配）；整单无归属（旧数据/旧前端）回退整单口径 —— 每家都按总数判。
+        const groupsWithPax = body.roomGroups.filter((g) => g.passengerIds.length > 0);
         // 按酒店 id 排序加锁，避免并发分房以不同顺序锁同一批酒店造成死锁。
-        for (const hotelId of [...nightsByHotel.keys()].sort()) {
+        for (const hotelId of [...byHotel.keys()].sort()) {
+          const agg = byHotel.get(hotelId)!;
+          const roomsForHotel = hasAttribution
+            ? groupsWithPax.filter((g) =>
+                g.orderItemId ? agg.itemIds.has(g.orderItemId) : g.hotelName === agg.name,
+              ).length
+            : assignedRooms;
           await assertHotelPhysicalFitWithinTx(
             tx,
             hotelId,
-            [...nightsByHotel.get(hotelId)!].sort(),
-            { wholeRooms: assignedRooms, solos: [] },
+            [...agg.nights].sort(),
+            { wholeRooms: roomsForHotel, solos: [] },
             {
               excludeOrderId: id,
               allowNonWorsening: true,
@@ -1209,19 +1266,25 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         where: { orderId: id, hotelRoomTypeId: { not: null } },
         data: { roomsBilled: null },
       });
-      if (totalRooms > 0) {
-        // 落到首个带房型的订单行（套餐/酒店行）；多酒店行的复杂分摊本期不处理。
+      // 带归属的间数落到各自行；无归属的间数落首个带房型的行（旧口径兜底）。
+      // 任何行合计为 0 → 保持 null（上面已清空），不留 0。Σ 各行 = totalRooms（间数守恒）。
+      const writes = new Map(roomsByItem);
+      if (unattachedRooms > 0) {
         const hotelItem = await tx.orderItem.findFirst({
           where: { orderId: id, hotelRoomTypeId: { not: null } },
           orderBy: { createdAt: 'asc' },
           select: { id: true },
         });
         if (hotelItem) {
-          await tx.orderItem.update({
-            where: { id: hotelItem.id },
-            data: { roomsBilled: totalRooms },
-          });
+          writes.set(hotelItem.id, (writes.get(hotelItem.id) ?? 0) + unattachedRooms);
         }
+      }
+      for (const [rowId, rooms] of writes) {
+        if (rooms <= 0) continue;
+        await tx.orderItem.update({
+          where: { id: rowId },
+          data: { roomsBilled: rooms },
+        });
       }
     });
     if (prevRooms !== null && totalRooms > 0 && Math.abs(totalRooms - prevRooms) >= 0.5) {
@@ -1229,9 +1292,13 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         `计费房数由 ${prevRooms} 变为 ${totalRooms}，订单金额不会自动重算——如需按新房数调价，请走「补收单房差」或改结算价通道。`,
       );
     }
-    if (hotelItemCount > 1) {
+    // 多酒店行 + 存在无归属房组 → 无归属那部分仍按旧口径塌缩进首行，明示给运营。
+    // 全部房组都带归属时间数已按行分落，不再提示。
+    if (hotelItemCount > 1 && unattachedRooms > 0) {
       warnings.push(
-        `本单有 ${hotelItemCount} 条酒店行，分房间数已合并记在首条酒店行（房控合计口径不受影响，按行看会有偏差）。`,
+        hasAttribution
+          ? `本单有 ${hotelItemCount} 条酒店行，其中无归属房组的 ${unattachedRooms} 间已合并记在首条酒店行（房控合计口径不受影响，按行看会有偏差）。`
+          : `本单有 ${hotelItemCount} 条酒店行，分房间数已合并记在首条酒店行（房控合计口径不受影响，按行看会有偏差）。`,
       );
     }
     void writeAudit({
@@ -2071,6 +2138,39 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     });
     return { order };
   });
+
+  // ── 售后改单：按房组拆分酒店行（ADMIN/STAFF）──
+  // POST /orders/:id/items/:itemId/split-room-group  body: { roomGroupId, note? }
+  // 把分房表里的一个房组从某条 HOTEL 行拆成独立酒店行（「按房组换酒店」的前置步骤）。
+  // 钱不动：新行 0 元、源行 amount 冻结 → order.total 恒等；库存对称：Σ roomsBilled 恒等。
+  app.post(
+    '/:id/items/:itemId/split-room-group',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req) => {
+      const { id, itemId } = req.params as { id: string; itemId: string };
+      const body = splitRoomGroupBodySchema.parse(req.body);
+      const { order, audit } = await service.splitHotelItemByRoomGroup(id, itemId, body, {
+        userId: req.user.sub,
+        role: req.user.role,
+      });
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'SPLIT_ROOM_GROUP',
+        targetType: 'ORDER',
+        targetId: id,
+        targetLabel: audit.orderNumber,
+        before: { orderItemId: audit.fromItemId, ...audit.before },
+        after: {
+          ...audit.after,
+          newItemId: audit.newItemId,
+          roomGroupId: audit.roomGroupId,
+          note: body.note,
+        },
+        severity: 'WARNING',
+      });
+      return { order, newItemId: audit.newItemId };
+    },
+  );
 
   // ── 售后改单：套餐改档（ADMIN/STAFF）──
   // POST /orders/:id/change-bundle  body: { bundleId, note? }

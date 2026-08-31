@@ -1183,6 +1183,16 @@ export const rescheduleItemHotelBodySchema = z.object({
 });
 export type RescheduleItemHotelBody = z.infer<typeof rescheduleItemHotelBodySchema>;
 
+// ── 售后改单：按房组拆分酒店行（split room group）───────────────────────────
+// POST /orders/:id/items/:itemId/split-room-group（ADMIN/STAFF）：把分房表里的一个房组从
+// 某条 HOTEL 行拆成独立酒店行 —— 「按房组换酒店」的前置步骤（拆完对新行走现成换酒店端点）。
+// 钱不动（新行 0 元、源行 amount 冻结），只挪库存归属与成本比例；守卫与守恒断言见 service。
+export const splitRoomGroupBodySchema = z.object({
+  roomGroupId: z.string().min(1, 'roomGroupId 必填'),
+  note: z.string().max(200).optional(),
+});
+export type SplitRoomGroupBody = z.infer<typeof splitRoomGroupBodySchema>;
+
 // ── 售后改单：套餐改档（change bundle）──────────────────────────────────────
 // POST /orders/:id/change-bundle（ADMIN/STAFF）：把本单的套餐行换绑到另一张套餐
 // （行业口径 amendment：改档 → 按新档重新计价 → 差价入账 → 审计）。
