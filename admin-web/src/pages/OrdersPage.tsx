@@ -35,6 +35,7 @@ import { ORDER_STATUS_META, orderStatusBadgeClass, orderStatusLabel } from '../l
 import { SUBMISSION_BADGE, SUBMISSION_LABEL } from '../lib/visaSubmission';
 import { useConfirm } from '../components/ConfirmDialog';
 import { useDialogA11y } from '../components/Modal';
+import { groupHotelsByBundleTier } from '../lib/settlement-tier';
 
 // 批量开票下拉的六个选项（票务岗 0715 反馈）：按航段/系统三个布尔位各自「标已开/标未开」，
 // 对应逐单调用 setInvoiceFlags 时传的 flags 字段。
@@ -9561,6 +9562,12 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   }, [returnSchedules, pendingReturnSchedDate, returnScheduleId]);
   const cabinOptions = outboundSchedule?.seatClasses ?? [];
   const selectedBundle = bundles.find((b) => b.id === bundleId);
+  // 下拉只展示在售酒店；批量名单中若已有行选中下架店，仍保留这些选项，避免值悬空。
+  const batchHotelGroups = useMemo(() => {
+    const selectedHotelIds = new Set(rows.map((row) => row.designatedHotelId).filter(Boolean));
+    const visibleHotels = bundleHotels.filter((hotel) => hotel.isActive || selectedHotelIds.has(hotel.id));
+    return groupHotelsByBundleTier(visibleHotels, selectedBundle?.settlementTier);
+  }, [bundleHotels, rows, selectedBundle?.settlementTier]);
   const canOfferBundleBusiness = Boolean(
     selectedBundle &&
       (selectedBundle.businessUpgradeCnyPerLeg == null || selectedBundle.businessUpgradeCnyPerLeg > 0),
@@ -10780,10 +10787,10 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                         护照有效期 <span className="text-rose-500">*必填</span>
                       </th>
                       {productType === 'BUNDLE' && (
-                        <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">套餐选项</th>
+                        <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">住法 / 签证 / 升舱</th>
                       )}
                       {productType === 'BUNDLE' && (
-                        <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">酒店</th>
+                        <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">指定酒店</th>
                       )}
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">备注（选填）</th>
                       <th className="min-w-[110px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照 OCR</th>
@@ -10961,12 +10968,34 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                               }}
                               disabled={bundleHotels.length === 0}
                             >
-                              <option value="">随机</option>
-                              {bundleHotels.map((hotel) => (
-                                <option key={hotel.id} value={hotel.id}>
-                                  {hotel.name}
-                                </option>
-                              ))}
+                              <option value="">随机（不指定酒店）</option>
+                              {batchHotelGroups.sameTier.length > 0 && (
+                                <optgroup label={selectedBundle?.settlementTier ? '本档次酒店' : '具体酒店'}>
+                                  {batchHotelGroups.sameTier.map((hotel) => (
+                                    <option key={hotel.id} value={hotel.id}>
+                                      {hotel.name}（{'★'.repeat(hotel.starRating)}）{!hotel.isActive && '（已下架）'}
+                                    </option>
+                                  ))}
+                                </optgroup>
+                              )}
+                              {selectedBundle?.settlementTier && batchHotelGroups.otherTier.length > 0 && (
+                                <optgroup label="其它档次（批量不支持跨档，请用单笔录单）">
+                                  {batchHotelGroups.otherTier.map((hotel) => (
+                                    <option key={hotel.id} value={hotel.id} disabled={hotel.id !== r.designatedHotelId}>
+                                      {hotel.name}（{'★'.repeat(hotel.starRating)}）{!hotel.isActive && '（已下架）'}
+                                    </option>
+                                  ))}
+                                </optgroup>
+                              )}
+                              {batchHotelGroups.placeholders.length > 0 && (
+                                <optgroup label="星级随机档占位（不是真实酒店，走随机档请留空）">
+                                  {batchHotelGroups.placeholders.map((hotel) => (
+                                    <option key={hotel.id} value={hotel.id}>
+                                      {hotel.name}（{'★'.repeat(hotel.starRating)} · 占位，非真实酒店）{!hotel.isActive && '（已下架）'}
+                                    </option>
+                                  ))}
+                                </optgroup>
+                              )}
                             </select>
                             {r.designatedHotelId && (() => {
                               const hotel = selectedBatchHotel(r);

@@ -74,20 +74,13 @@ import {
 } from './SingleOrderProductBlock';
 import { formatLocalTime } from '../lib/airports';
 import { composePassengerFullName, normalizePassengerFullName } from '../lib/passengerName';
+import { groupHotelsByBundleTier, resolveHotelSettlementTier, SETTLEMENT_TIER_ZH } from '../lib/settlement-tier';
 
 /**
  * 一张订单最多挂几个产品区块。后端 items 上限 20 条，往返机票区块一块就是 2 行，
  * 再加调价/结算差额行仍有富余 —— 取 8 是「够用且绝不会撞上限」的保守值。
  */
 const MAX_PRODUCT_BLOCKS = 8;
-
-// 结算价档次中文名（与 SettlementRatesPage / ProductsPage 同一份口径）。
-const SETTLEMENT_TIER_ZH: Record<SettlementTier, string> = {
-  CITY_3STAR: '市区三星',
-  CITY_4STAR: '市区四星',
-  CITY_5STAR: '市区五星',
-  INTL_5STAR: '国际五星',
-};
 
 // 结算价档次 → 对应星级（仅用于给运营看的提示文案「（N 星）」）。
 // ⚠️ INTL_5STAR 与 CITY_5STAR 都对应 5 星——星级数字不足以区分这两档，
@@ -98,24 +91,6 @@ const SETTLEMENT_TIER_STAR: Record<SettlementTier, number> = {
   CITY_5STAR: 5,
   INTL_5STAR: 5,
 };
-
-/**
- * 酒店 → 它属于哪个结算档次（port of backend resolveHotelSettlementTier，口径必须一字不差）。
- * 映射不到任何档次（星级缺失 / 1、2 星 / 标了国际五星却不是 5 星）返回 null，按「不匹配」处理。
- * 前端照抄这份口径，是为了让「提交时会不会被服务端星级闸拦下」在界面上先算得准 ——
- * 只按星级数字比会把「市区五星 vs 国际五星」当成匹配，运营一路填到提交才吃 400。
- */
-function resolveHotelSettlementTier(hotel: {
-  starRating?: number | null;
-  intlFiveStar?: boolean | null;
-}): SettlementTier | null {
-  if (hotel.starRating == null) return null;
-  if (hotel.intlFiveStar === true) return hotel.starRating === 5 ? 'INTL_5STAR' : null;
-  if (hotel.starRating === 3) return 'CITY_3STAR';
-  if (hotel.starRating === 4) return 'CITY_4STAR';
-  if (hotel.starRating === 5) return 'CITY_5STAR';
-  return null;
-}
 
 /** 星级不匹配的放行原因长度上限（镜像后端 zod .max(200)，超长先在前端说清楚）。 */
 const STAR_MISMATCH_REASON_MAX = 200;
@@ -580,12 +555,12 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
 
   const bundle = bundles.find((b) => b.id === bundleId);
 
-  // 套餐「指定酒店」下拉分组：真实酒店 / 星级随机档占位酒店（randomTierPlaceholder != null）。
-  // 占位酒店不从列表里删——服务端显式支持指到占位酒店（房量闸走随机档聚合闸），删了会弄坏
-  // 存量落位流程；这里只做分组 + 选中时提醒，见下方 designatedHotelIsPlaceholder。
-  const bundleRealHotels = useMemo(() => hotels.filter((h) => h.randomTierPlaceholder == null), [hotels]);
-  const bundlePlaceholderHotels = useMemo(() => hotels.filter((h) => h.randomTierPlaceholder != null), [hotels]);
   const designatedHotel = hotels.find((h) => h.id === designatedHotelId);
+  // 下拉只展示在售酒店；编辑回填若已选中下架店，仍保留该选项，避免 select 值悬空。
+  const bundleHotelGroups = useMemo(() => {
+    const visibleHotels = hotels.filter((hotel) => hotel.isActive || hotel.id === designatedHotelId);
+    return groupHotelsByBundleTier(visibleHotels, bundle?.settlementTier);
+  }, [bundle?.settlementTier, designatedHotelId, hotels]);
   const designatedHotelIsPlaceholder = designatedHotel?.randomTierPlaceholder != null;
   // 套餐结算档次对应的星级（CITY_3STAR→3 / CITY_4STAR→4 / CITY_5STAR→5 / INTL_5STAR→5）；
   // 套餐不走结算价日历（settlementTier 为空）时为 null，不显示档次、也不比对星级。
@@ -1973,7 +1948,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       </label>
                     )}
                   </div>
-                  {/* 指定酒店（0805）：不指定 = 随机（现状）；指定 → 占该店房 + 按该店配置的每人加价收 */}
+                  {/* 指定酒店（0805）：不指定 = 按套餐档次随机；指定 → 占该店房 + 按该店配置的每人加价收 */}
                   <div className="grid grid-cols-2 gap-2 md:col-span-2">
                     {bundle?.settlementTier && (
                       <p className="col-span-2 text-[11px] text-slate-500">
@@ -1982,7 +1957,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       </p>
                     )}
                     <label className="text-xs text-slate-500">
-                      酒店（不选 = 随机）
+                      指定酒店（不选 = 按档次随机）
                       <select
                         className={inputCls}
                         value={designatedHotelId}
@@ -1995,21 +1970,36 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                         }}
                       >
                         <option value="">随机（不指定酒店）</option>
-                        <optgroup label="具体酒店">
-                          {bundleRealHotels.map((h) => (
-                            <option key={h.id} value={h.id}>
-                              {h.name}（{'★'.repeat(h.starRating)}
-                              {h.designationSurchargeCnyPerPerson > 0 ? ` · 指定+¥${h.designationSurchargeCnyPerPerson}/人` : ''}）
-                            </option>
-                          ))}
-                        </optgroup>
-                        {/* 星级随机档占位记录（randomTierPlaceholder != null）：不是真酒店，不删/不 disabled——
-                            服务端显式支持指到占位酒店（房量闸走随机档聚合闸）；套餐要走随机档应把上面留空。 */}
-                        {bundlePlaceholderHotels.length > 0 && (
+                        {bundleHotelGroups.sameTier.length > 0 && (
+                          <optgroup label={bundle?.settlementTier ? '本档次酒店' : '具体酒店'}>
+                            {bundleHotelGroups.sameTier.map((h) => (
+                              <option key={h.id} value={h.id}>
+                                {h.name}（{'★'.repeat(h.starRating)}
+                                {h.designationSurchargeCnyPerPerson > 0 ? ` · 指定+¥${h.designationSurchargeCnyPerPerson}/人` : ''}）
+                                {!h.isActive && '（已下架）'}
+                              </option>
+                            ))}
+                          </optgroup>
+                        )}
+                        {bundle?.settlementTier && bundleHotelGroups.otherTier.length > 0 && (
+                          <optgroup label="其它档次（跨档指定需填放行原因）">
+                            {bundleHotelGroups.otherTier.map((h) => (
+                              <option key={h.id} value={h.id}>
+                                {h.name}（{'★'.repeat(h.starRating)}
+                                {h.designationSurchargeCnyPerPerson > 0 ? ` · 指定+¥${h.designationSurchargeCnyPerPerson}/人` : ''}）
+                                {!h.isActive && '（已下架）'}
+                              </option>
+                            ))}
+                          </optgroup>
+                        )}
+                        {/* 星级随机档占位记录（randomTierPlaceholder != null）：不是真酒店，服务端显式支持指到占位酒店；
+                            套餐要走随机档应把上面留空，下架项只在当前已选中时保留。 */}
+                        {bundleHotelGroups.placeholders.length > 0 && (
                           <optgroup label="星级随机档占位（不是真实酒店，走随机档请留空）">
-                            {bundlePlaceholderHotels.map((h) => (
+                            {bundleHotelGroups.placeholders.map((h) => (
                               <option key={h.id} value={h.id}>
                                 {h.name}（{'★'.repeat(h.starRating)} · 占位，非真实酒店）
+                                {!h.isActive && '（已下架）'}
                               </option>
                             ))}
                           </optgroup>
@@ -2041,7 +2031,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                     })()}
                     {designatedHotelIsPlaceholder && (
                       <p className="col-span-2 text-[11px] text-amber-600">
-                        「{designatedHotel?.name}」是星级随机档的占位记录，不是真实酒店，不会真的落到这家店。套餐要走随机档，请把上面的「酒店」清空（选「随机（不指定酒店）」）。
+                        「{designatedHotel?.name}」是星级随机档的占位记录，不是真实酒店，不会真的落到这家店。套餐要走随机档，请把上面的「指定酒店」清空（选「随机（不指定酒店）」）。
                       </p>
                     )}
                     {/* 档次不匹配不再只是提醒：代理直接拦下，运营必须在提交时写明放行原因（留档备查）。
