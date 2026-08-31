@@ -805,6 +805,19 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     });
   }, [showVisaExemptCol, visaStatus]);
 
+  // 矛盾组合防呆（公测两单事故：需要签证 + 全员自备签 → 签证台看不到、送签对不上数）：
+  // 签证状态选了需签档，但全部有效出行人都被标成自备签 —— 按口径本单不会建签证任务。
+  // 不拦截提交（组合可能是刻意的），但必须看得见。
+  const visaContradictionHint = useMemo(() => {
+    if (visaStatus !== 'NEEDED' && visaStatus !== 'E_VISA') return null;
+    const valid = passengers.filter((p) => p.fullName.trim());
+    if (valid.length === 0 || !valid.every((p) => p.visaExempt)) return null;
+    return (
+      '注意：签证状态选了「需要」，但全部出行人都是「自备签」——本单不会生成签证任务、不会出现在签证台。' +
+      '若确实要我方送签，请把至少一位出行人改回「随套餐」。'
+    );
+  }, [visaStatus, passengers]);
+
   // 调价有效性：金额为非 0 整数即视为「要调价」；「其它」原因必须补说明。
   const adjustIsInteger = adjustAmount !== null && Number.isInteger(adjustAmount) && adjustAmount !== 0;
   const adjustNeedsText = adjustReason === 'OTHER' && adjustText.trim().length === 0;
@@ -1748,6 +1761,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
             {/* 护照临期提示：琥珀色、不拦截提交 */}
             {passportExpiryHint && (
               <div className="rounded-md bg-amber-50 px-4 py-2 text-sm text-amber-800">{passportExpiryHint}</div>
+            )}
+            {/* 矛盾组合防呆：需要签证 + 全员自备签 → 不进签证台（琥珀提示，不拦截提交） */}
+            {visaContradictionHint && (
+              <div className="rounded-md bg-amber-50 px-4 py-2 text-sm text-amber-800">{visaContradictionHint}</div>
             )}
 
             {/* 产品类型选择（第一个产品）；套餐独占一张订单，多产品时禁用 */}
