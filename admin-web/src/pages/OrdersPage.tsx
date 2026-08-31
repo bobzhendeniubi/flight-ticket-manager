@@ -6744,7 +6744,7 @@ function RescheduleForm({
     if (!token || submitting) return;
     setErr(null);
     if (!newScheduleId) { setErr('请选择新班次'); return; }
-    if (!confirm('确认改期？座位会移动到新班次（新班次售罄会被拒绝），如填了改期差价将计入订单应收（可正可负）。')) return;
+    if (!confirm('确认改期？座位会移动到新班次（新班次售罄会被拒绝）；出发日期变动时本单酒店入住/离店日期会同步平移（新日期房量不足会整体拒绝），如填了改期差价将计入订单应收（可正可负）。')) return;
     setSubmitting(true);
     try {
       const res = await api.rescheduleOrder(token, orderId, {

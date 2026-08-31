@@ -7001,6 +7001,14 @@ export class OrderService {
       toDeparture: Date | null;
       feeCny: number;
       statusChanged: boolean;
+      /** 随出发日平移自动同步的酒店行（未平移/无酒店行 = 空数组），日期为 YYYY-MM-DD。 */
+      hotelDateSync: Array<{
+        orderItemId: string;
+        fromCheckIn: string;
+        toCheckIn: string;
+        fromCheckOut: string | null;
+        toCheckOut: string | null;
+      }>;
     };
   }> {
     if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
@@ -7058,7 +7066,7 @@ export class OrderService {
         flightScheduleId: true,
         flightCabin: true,
         metadata: true,
-        flightSchedule: { select: { departureTime: true } },
+        flightSchedule: { select: { departureTime: true, departureTz: true } },
       } as const;
       const item = input.orderItemId
         ? await tx.orderItem.findUnique({ where: { id: input.orderItemId }, select: itemSelect })
@@ -7203,6 +7211,13 @@ export class OrderService {
       // 只在真的换了班次时做（同班次改舱/无变化不动票）；纠错批量入口（correction）同样适用——
       // 那正是「录错班次」的场景，原票号更不该留。
       // 幂等：updateMany + 定值写，重复改期不会出问题。
+      const hotelDateSync: Array<{
+        orderItemId: string;
+        fromCheckIn: string;
+        toCheckIn: string;
+        fromCheckOut: string | null;
+        toCheckOut: string | null;
+      }> = [];
       if (scheduleChanged) {
         await tx.passenger.updateMany({
           where: { orderId },
@@ -7213,15 +7228,18 @@ export class OrderService {
         // 再按 departureTime 排序可能已经换位），故用行 id 与改期前那份排序结果比对。
         const legItemsBefore = await tx.orderItem.findMany({
           where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
-          select: { id: true, flightScheduleId: true, flightSchedule: { select: { departureTime: true } } },
+          select: {
+            id: true,
+            flightScheduleId: true,
+            flightSchedule: { select: { departureTime: true, departureTz: true } },
+          },
         });
-        const legsBefore = determineFlightLegItems(
-          legItemsBefore.map((row) =>
-            row.id === item.id
-              ? { ...row, flightScheduleId: oldScheduleId, flightSchedule: item.flightSchedule }
-              : row,
-          ),
+        const rowsBefore = legItemsBefore.map((row) =>
+          row.id === item.id
+            ? { ...row, flightScheduleId: oldScheduleId, flightSchedule: item.flightSchedule }
+            : row,
         );
+        const legsBefore = determineFlightLegItems(rowsBefore);
         const invoiceReset =
           legsBefore.return?.id === item.id
             ? { returnInvoiced: false }
@@ -7230,6 +7248,122 @@ export class OrderService {
               : null;
         if (invoiceReset) {
           await tx.order.update({ where: { id: orderId }, data: invoiceReset });
+        }
+
+        // ── 3c. 酒店入住日期随出发日平移（0830 公测反馈）────────────────────────
+        // 改期只搬机票行，酒店行的 hotelCheckIn/hotelCheckOut 原地不动 → 分房表按入住日
+        // 归 sheet，客人仍挂在旧日期下（导旧日期有他、导新日期没他）。口径：整单「最早航段
+        // 的出发地当地日」平移了 N 天（≠0），同单全部占房行的入住/离店同步平移 N 天——
+        // 晚数不变、行价/间数一律冻结（与酒店改期的甲案同哲学，晚数没变也无差价可谈）。
+        // 只改回程不动最早出发日 → 不平移（离店是否顺延涉及晚数与差价，留给「酒店改期」人工办）。
+        // 新日期房量装不下 → 抛错整事务回滚，改期不成立（先协调房再改）。
+        // 纠错入口（correction）同样适用：录错班次连带盖错的入住日期一并归位。
+        const earliestLocalDate = (
+          rows: Array<{ flightSchedule: { departureTime: Date; departureTz?: string | null } | null }>,
+        ): string | null => {
+          const days = rows
+            .filter((r) => r.flightSchedule?.departureTime)
+            .map((r) => localDateISO(r.flightSchedule!.departureTime, r.flightSchedule!.departureTz));
+          return days.length > 0 ? days.sort()[0] : null;
+        };
+        const departBefore = earliestLocalDate(rowsBefore);
+        const departAfter = earliestLocalDate(legItemsBefore);
+        const deltaDays =
+          departBefore && departAfter
+            ? Math.round(
+                (new Date(`${departAfter}T00:00:00.000Z`).getTime() -
+                  new Date(`${departBefore}T00:00:00.000Z`).getTime()) /
+                  (24 * 60 * 60 * 1000),
+              )
+            : 0;
+        if (deltaDays !== 0) {
+          const hotelRows = (
+            await tx.orderItem.findMany({
+              where: {
+                orderId,
+                hotelCheckIn: { not: null },
+                OR: [{ hotelRoomTypeId: { not: null } }, { randomStarTier: { not: null } }],
+              },
+              select: {
+                id: true,
+                description: true,
+                hotelRoomTypeId: true,
+                randomStarTier: true,
+                hotelCheckIn: true,
+                hotelCheckOut: true,
+                roomsBilled: true,
+              },
+            })
+          ) // 防御性复筛（与 where 同条件）：单测 mock 的 findMany 不认 where，会把机票行也吐回来
+            .filter((r) => r.hotelCheckIn && (r.hotelRoomTypeId || r.randomStarTier != null));
+          if (hotelRows.length > 0) {
+            const shiftDay = (d: Date): Date => new Date(d.getTime() + deltaDays * 24 * 60 * 60 * 1000);
+            const shifted = hotelRows.map((row) => ({
+              row,
+              newCheckIn: shiftDay(row.hotelCheckIn!),
+              newCheckOut: row.hotelCheckOut ? shiftDay(row.hotelCheckOut) : null,
+            }));
+            // 新区间房量闸（与建单/改档同一对闸，自带同酒店/同档归并防「各判各的」漏判）：
+            // excludeOrderId 排除本单现占房 = 先释放旧区间，再按新区间前瞻判定。
+            const prospectiveStays = shifted.map((s) => ({
+              hotelRoomTypeId: s.row.hotelRoomTypeId,
+              hotelCheckIn: s.newCheckIn,
+              hotelCheckOut: s.newCheckOut,
+              roomsBilled: s.row.roomsBilled == null ? null : Number(s.row.roomsBilled.toString()),
+              randomStarTier: s.row.randomStarTier,
+            }));
+            const orderPassengers = await tx.passenger.findMany({
+              where: { orderId },
+              select: { gender: true },
+            });
+            try {
+              await assertHotelStaysFitWithinTx(
+                tx,
+                prospectiveStays,
+                orderPassengers.map((p) => ({ gender: p.gender ?? undefined })),
+                { excludeOrderId: orderId },
+              );
+              await assertRandomTierStaysFitWithinTx(tx, prospectiveStays, {
+                excludeOrderId: orderId,
+              });
+            } catch (err) {
+              if (err instanceof BadRequestError) {
+                throw new BadRequestError(
+                  `改期需同步酒店入住日期（随出发日平移 ${deltaDays > 0 ? '+' : ''}${deltaDays} 天），新日期房量不足，本次改期已整体取消：${err.message}`,
+                );
+              }
+              throw err;
+            }
+            for (const s of shifted) {
+              const nights = s.newCheckOut
+                ? buildStayNightDates(s.newCheckIn, s.newCheckOut).length
+                : 0;
+              await tx.orderItem.update({
+                where: { id: s.row.id },
+                data: {
+                  hotelCheckIn: s.newCheckIn,
+                  ...(s.newCheckOut ? { hotelCheckOut: s.newCheckOut } : {}),
+                  // description 里的日期/晚数段就地改写（自由文本无该段则原样保留）
+                  ...(s.newCheckOut && nights > 0
+                    ? {
+                        description: rewriteHotelStayDescription(s.row.description, {
+                          checkIn: formatDateOnly(s.newCheckIn),
+                          checkOut: formatDateOnly(s.newCheckOut),
+                          nights,
+                        }),
+                      }
+                    : {}),
+                },
+              });
+              hotelDateSync.push({
+                orderItemId: s.row.id,
+                fromCheckIn: formatDateOnly(s.row.hotelCheckIn!),
+                toCheckIn: formatDateOnly(s.newCheckIn),
+                fromCheckOut: s.row.hotelCheckOut ? formatDateOnly(s.row.hotelCheckOut) : null,
+                toCheckOut: s.newCheckOut ? formatDateOnly(s.newCheckOut) : null,
+              });
+            }
+          }
         }
       }
 
@@ -7335,7 +7469,15 @@ export class OrderService {
 
       // 把审计需要的「原/新」明细返回到 tx 外（出发时间另查）。
       // 直接 return 而非写模块级单例，避免并发改期互相覆盖。
-      return { orderItemId: item.id, oldScheduleId, oldCabin, newScheduleId, newCabin, statusChanged };
+      return {
+        orderItemId: item.id,
+        oldScheduleId,
+        oldCabin,
+        newScheduleId,
+        newCabin,
+        statusChanged,
+        hotelDateSync,
+      };
     });
 
     try {
@@ -7366,6 +7508,7 @@ export class OrderService {
           toDeparture: toSched?.departureTime ?? null,
           feeCny,
           statusChanged: scratch.statusChanged,
+          hotelDateSync: scratch.hotelDateSync,
         },
       };
     } catch (err) {

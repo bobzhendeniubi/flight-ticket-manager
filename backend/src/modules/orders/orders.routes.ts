@@ -1840,6 +1840,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         feeCny: audit.feeCny,
         statusChanged: audit.statusChanged,
         note: body.note,
+        // 酒店入住随出发日平移的同步明细（空数组 = 本次未平移/无酒店行）
+        hotelDateSync: audit.hotelDateSync,
       },
       severity: 'WARNING',
     });

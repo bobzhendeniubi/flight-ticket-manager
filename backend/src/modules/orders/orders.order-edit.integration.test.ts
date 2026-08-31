@@ -348,6 +348,61 @@ describe('OrderService.rescheduleOrderItem · 真 DB E2E', () => {
     expect(result.order.adjustmentCny).toBe(300);
   });
 
+  it('出发日平移 −4 天 → 同单酒店行入住/离店同步平移（0830 公测反馈：改期后分房表挂旧日期）', async () => {
+    const actor = await adminActor();
+    // from 出发 ~300h 后、to 恰好早 96h（4 天）→ 出发地当地日平移 −4 天
+    const from = await createScheduleWithSeats({ cabin: CabinClass.ECONOMY, departureHoursFromNow: 300 });
+    const to = await createScheduleWithSeats({ cabin: CabinClass.ECONOMY, departureHoursFromNow: 204 });
+
+    const hotel = await prisma.hotel.create({
+      data: { name: uniq('测试酒店'), cityCode: 'DAD', address: 'Test Rd 1', starRating: 4 },
+    });
+    const roomType = await prisma.hotelRoomType.create({
+      data: { hotelId: hotel.id, name: '标准房', capacity: 2, basePrice: new Prisma.Decimal(500) },
+    });
+
+    const order = await createPaidFlightOrder({ scheduleId: from.schedule.id, cabin: CabinClass.ECONOMY });
+    const hotelItem = await prisma.orderItem.create({
+      data: {
+        orderId: order.id,
+        kind: OrderItemKind.HOTEL,
+        description: `${hotel.name} · 标准房 · 2026-09-05~2026-09-06 · 1晚 × 1间`,
+        quantity: 1,
+        unitPrice: new Prisma.Decimal(500),
+        amount: new Prisma.Decimal(500),
+        hotelRoomTypeId: roomType.id,
+        hotelCheckIn: new Date('2026-09-05T00:00:00.000Z'),
+        hotelCheckOut: new Date('2026-09-06T00:00:00.000Z'),
+        roomsBilled: new Prisma.Decimal(1),
+      },
+    });
+
+    const result = await service.rescheduleOrderItem(
+      order.id,
+      { orderItemId: order.items[0].id, newScheduleId: to.schedule.id },
+      actor,
+    );
+
+    // 酒店行入住/离店随出发日平移 −4 天；金额/间数冻结
+    const reloaded = await prisma.orderItem.findUniqueOrThrow({ where: { id: hotelItem.id } });
+    expect(reloaded.hotelCheckIn).toEqual(new Date('2026-09-01T00:00:00.000Z'));
+    expect(reloaded.hotelCheckOut).toEqual(new Date('2026-09-02T00:00:00.000Z'));
+    expect(reloaded.description).toBe(`${hotel.name} · 标准房 · 2026-09-01~2026-09-02 · 1晚 × 1间`);
+    expect(Number(reloaded.amount)).toBe(500);
+    expect(Number(reloaded.roomsBilled)).toBe(1);
+
+    // 审计留痕
+    expect(result.audit.hotelDateSync).toEqual([
+      {
+        orderItemId: hotelItem.id,
+        fromCheckIn: '2026-09-05',
+        toCheckIn: '2026-09-01',
+        fromCheckOut: '2026-09-06',
+        toCheckOut: '2026-09-02',
+      },
+    ]);
+  });
+
   it('改期到「售罄」新班次 → 抛错 AND 旧座保持原样（无泄漏、无超售）', async () => {
     const actor = await adminActor();
     const from = await createScheduleWithSeats({ cabin: CabinClass.ECONOMY, capacity: 50, sold: 1 });
