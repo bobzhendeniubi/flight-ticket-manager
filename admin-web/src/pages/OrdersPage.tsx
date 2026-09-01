@@ -2577,7 +2577,7 @@ export function OrdersPage() {
             <div className="relative">
               <input
                 className="input"
-                placeholder="如 VJ527"
+                placeholder="如 QH9588"
                 value={flightNumberFilter}
                 onChange={(e) => setFlightNumberFilter(e.target.value)}
                 title="单独填＝订单任一段含该航班号；与出行日期同填＝去程段是这一班；与返程日期同填＝回程段是这一班；与航班日期同填＝该段当天起飞（整班名单）"
@@ -3528,7 +3528,9 @@ export function OrdersPage() {
                   <td>
                     {/* 客户名 / 代理名都可能很长（尤其代理机构全称），加 max-width + truncate
                         防止撑宽整表；悬浮看全文。 */}
-                    <div className="max-w-[11rem] truncate font-medium text-ink" title={view.customerName}>
+                    {/* 客户名弱化（运营原话：主角是乘客和航班，不是客户/录单人）：
+                        字重 font-medium→常规、颜色 text-ink→text-ink-soft，不再抢眼。 */}
+                    <div className="max-w-[11rem] truncate text-ink-soft" title={view.customerName}>
                       {view.customerName}
                     </div>
                     <div className="text-xs text-ink-muted">{order.contactPhone}</div>
@@ -3552,7 +3554,63 @@ export function OrdersPage() {
                   </td>
                   )}
                   <td>
-                    <div className="max-w-xs truncate text-ink" title={view.itemSummary}>
+                    {/* 乘客姓名放列首＋放大一档（text-xs→text-sm，与下方航段摘要相当）：
+                        运营原话「内容的名字放前面，放大点，主要是体现乘客的名字和航班」。
+                        以下三处行为全部保留，未改动：搜索命中优先展示命中者/未命中平铺前3位+「等N人」/
+                        性别小标独立淡色 span/悬浮看全部姓名/truncate 截断。 */}
+                    {order.passengers.length > 0 && (() => {
+                      // 姓名提亮（加粗+正文色，一眼可见）+ 性别小标（M/F；列表接口未回传性别时
+                      // 自然不标，不占位）。字母紧贴姓名会糊成一团（"张三M"），用独立小号淡色 span 隔开。
+                      const names = order.passengers.map((p) => p.chineseName?.trim() || p.fullName);
+                      const genders = order.passengers.map((p) => genderMark(p.gender));
+                      const titleText = names
+                        .map((n, i) => (genders[i] ? `${n}（${genders[i]}）` : n))
+                        .join('、');
+                      const nameNode = (idx: number, emphasized: boolean) => (
+                        <span key={idx} className={emphasized ? 'font-semibold text-brand' : 'font-semibold text-ink'}>
+                          {names[idx]}
+                          {genders[idx] ? (
+                            <span className="ml-0.5 text-[10px] font-normal text-ink-soft">{genders[idx]}</span>
+                          ) : null}
+                        </span>
+                      );
+                      const terms = splitSearchTerms(search);
+                      // 搜索命中某乘客时优先展示命中者（「张三 +3 同行」），不再平铺全部同行人。
+                      // 分词后任一词命中即算命中（与 filtered 的 AND 口径不同：这里只挑「展示谁」）。
+                      const hitIdx = terms.length
+                        ? order.passengers.findIndex((p) =>
+                            terms.some(
+                              (t) =>
+                                (p.chineseName?.toLowerCase().includes(t) ?? false) ||
+                                p.fullName.toLowerCase().includes(t) ||
+                                (p.documentNumber?.toLowerCase().includes(t) ?? false),
+                            ),
+                          )
+                        : -1;
+                      if (hitIdx >= 0) {
+                        const companions = names.length - 1;
+                        return (
+                          <div className="max-w-xs truncate text-sm" title={titleText}>
+                            {nameNode(hitIdx, true)}
+                            {companions > 0 ? <span className="text-ink-muted"> +{companions} 同行</span> : null}
+                          </div>
+                        );
+                      }
+                      const shownCount = Math.min(names.length, 3);
+                      const hasMore = names.length > shownCount;
+                      return (
+                        <div className="max-w-xs truncate text-sm" title={titleText}>
+                          {Array.from({ length: shownCount }, (_, i) => (
+                            <span key={i}>
+                              {i > 0 ? <span className="text-ink-muted">、</span> : null}
+                              {nameNode(i, false)}
+                            </span>
+                          ))}
+                          {hasMore ? <span className="text-ink-muted"> 等{names.length}人</span> : null}
+                        </div>
+                      );
+                    })()}
+                    <div className="mt-0.5 max-w-xs truncate text-ink" title={view.itemSummary}>
                       {view.itemSummary}
                     </div>
                     <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-xs text-ink-muted">
@@ -3588,58 +3646,6 @@ export function OrdersPage() {
                           <Icon name="hotel" size={12} /> {hotelLine}
                         </div>
                       ) : null;
-                    })()}
-                    {order.passengers.length > 0 && (() => {
-                      // 姓名提亮（录单岗反馈：加粗+正文色，一眼可见）+ 性别小标（M/F；列表接口未回传性别时
-                      // 自然不标，不占位）。字母紧贴姓名会糊成一团（"张三M"），用独立小号淡色 span 隔开。
-                      const names = order.passengers.map((p) => p.chineseName?.trim() || p.fullName);
-                      const genders = order.passengers.map((p) => genderMark(p.gender));
-                      const titleText = names
-                        .map((n, i) => (genders[i] ? `${n}（${genders[i]}）` : n))
-                        .join('、');
-                      const nameNode = (idx: number, emphasized: boolean) => (
-                        <span key={idx} className={emphasized ? 'font-medium text-brand' : 'font-medium text-ink'}>
-                          {names[idx]}
-                          {genders[idx] ? (
-                            <span className="ml-0.5 text-[10px] font-normal text-ink-soft">{genders[idx]}</span>
-                          ) : null}
-                        </span>
-                      );
-                      const terms = splitSearchTerms(search);
-                      // 搜索命中某乘客时优先展示命中者（「张三 +3 同行」），不再平铺全部同行人。
-                      // 分词后任一词命中即算命中（与 filtered 的 AND 口径不同：这里只挑「展示谁」）。
-                      const hitIdx = terms.length
-                        ? order.passengers.findIndex((p) =>
-                            terms.some(
-                              (t) =>
-                                (p.chineseName?.toLowerCase().includes(t) ?? false) ||
-                                p.fullName.toLowerCase().includes(t) ||
-                                (p.documentNumber?.toLowerCase().includes(t) ?? false),
-                            ),
-                          )
-                        : -1;
-                      if (hitIdx >= 0) {
-                        const companions = names.length - 1;
-                        return (
-                          <div className="mt-0.5 max-w-xs truncate text-xs" title={titleText}>
-                            {nameNode(hitIdx, true)}
-                            {companions > 0 ? <span className="text-ink-muted"> +{companions} 同行</span> : null}
-                          </div>
-                        );
-                      }
-                      const shownCount = Math.min(names.length, 3);
-                      const hasMore = names.length > shownCount;
-                      return (
-                        <div className="mt-0.5 max-w-xs truncate text-xs" title={titleText}>
-                          {Array.from({ length: shownCount }, (_, i) => (
-                            <span key={i}>
-                              {i > 0 ? <span className="text-ink-muted">、</span> : null}
-                              {nameNode(i, false)}
-                            </span>
-                          ))}
-                          {hasMore ? <span className="text-ink-muted"> 等{names.length}人</span> : null}
-                        </div>
-                      );
                     })()}
                   </td>
                   {columnVisibility.departDate && (
