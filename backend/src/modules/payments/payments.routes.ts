@@ -4,7 +4,6 @@
  *   POST /payments/webhook/:provider        支付网关回调（公共，靠签名验证）
  *   POST /payments/:id/sandbox-confirm      仅 sandbox 模式下用于测试回调
  *   POST /payments/:paymentId/transfer      ADMIN/STAFF 转移已成功收款
- *   POST /payments/orders/:id/swap-transfer ADMIN/STAFF 换人转出订单余额
  *   GET  /payments/:id                      查询支付状态（登录用户）
  */
 import type { FastifyPluginAsync } from 'fastify';
@@ -20,7 +19,6 @@ import {
   cnyAmountSchema,
   createPaymentBodySchema,
   sandboxConfirmBodySchema,
-  swapTransferBodySchema,
   transferManualPaymentBodySchema,
 } from './payments.schemas.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
@@ -144,24 +142,6 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
       paymentId,
       { targetOrderNumber: body.targetOrderNumber, reason: body.reason },
       { userId: req.user.sub, role: req.user.role },
-    );
-  });
-
-  // ── 换人转出：源单留存换人费，其余净收款转入新订单 ADMIN/STAFF ──
-  // POST /payments/orders/:id/swap-transfer
-  // 权限闸放在 service 内，保证任何非运营调用方都统一收到 ForbiddenError。
-  app.post('/orders/:id/swap-transfer', { preHandler: [app.authenticate] }, async (req) => {
-    const { id } = req.params as { id: string };
-    const body = swapTransferBodySchema.parse(req.body);
-    const actor = actorFromRequest(req);
-    return service.swapTransfer(
-      id,
-      {
-        targetOrderNumber: body.targetOrderNumber,
-        transferFeeCny: body.transferFeeCny,
-        reason: body.reason,
-      },
-      actor,
     );
   });
 

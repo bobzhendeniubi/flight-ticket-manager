@@ -239,23 +239,6 @@ describe('PaymentsService.transferManualPayment · 收款整笔转移', () => {
     }));
   });
 
-  it('换人转出的转入款不能再次整笔转移', async () => {
-    configure({
-      sourceGatewayPayload: { manual: true, swapTransfer: true, transferredIn: true },
-    });
-
-    await expect(
-      service.transferManualPayment(
-        'payment-source',
-        { targetOrderNumber: 'ORD-TGT', reason: '尝试再次转移转入款' },
-        ACTOR,
-      ),
-    ).rejects.toThrow('这笔收款是换人转出的转入款，不能再次整笔转移');
-
-    expect(mockTx.payment.updateMany).not.toHaveBeenCalled();
-    expect(mockTx.payment.create).not.toHaveBeenCalled();
-  });
-
   it('目标单取消时拒绝且不写源侧账目', async () => {
     configure({ targetStatus: OrderStatus.CANCELLED });
 
