@@ -4283,7 +4283,26 @@ function OrderDrawer({
   const confirm = useConfirm();
   const highRiskConfirmRef = useRef(false);
   const token = tokens?.accessToken ?? '';
-  const dialogRef = useDialogA11y(onClose);
+  // 备注/签证状态区块（NotesSection）把未保存改动上报到这里；抽屉所有关闭入口（Esc/遮罩/×）
+  // 统一走 requestClose，有未保存改动时先确认，避免运营改完往下翻找不到保存、一关就丢。
+  const [notesDirty, setNotesDirty] = useState(false);
+  const requestClose = useCallback(() => {
+    if (!notesDirty) {
+      onClose();
+      return;
+    }
+    void (async () => {
+      const confirmed = await confirm({
+        title: '有未保存的改动',
+        body: '备注 / 签证状态有未保存的改动，确定关闭？',
+        tone: 'danger',
+        confirmText: '关闭',
+        cancelText: '继续编辑',
+      });
+      if (confirmed) onClose();
+    })();
+  }, [notesDirty, confirm, onClose]);
+  const dialogRef = useDialogA11y(requestClose);
   const role = useAuth((s) => s.user?.role);
   const bumpSeats = useFlightSeats((s) => s.bumpSeats);
   // 内部角色（ADMIN/STAFF）才看逐项拆价折叠区；AGENT/CUSTOMER 只看「产品内容 + 订单总价」，不露内部金额明细。
@@ -4508,7 +4527,7 @@ function OrderDrawer({
       aria-label="订单详情"
       tabIndex={-1}
       className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4"
-      onClick={onClose}
+      onClick={requestClose}
     >
       <div
         className="flex max-h-[92vh] w-full max-w-2xl flex-col overflow-hidden rounded-2xl bg-white shadow-2xl"
@@ -4541,7 +4560,7 @@ function OrderDrawer({
               <BalanceBadge balance={bal.balance} settlementMode={o.agent?.settlementMode} />
             </div>
           </div>
-          <button className="btn-ghost px-2 py-1 text-xl leading-none" onClick={onClose}>×</button>
+          <button className="btn-ghost px-2 py-1 text-xl leading-none" onClick={requestClose}>×</button>
         </div>
 
         <div className="flex-1 space-y-5 overflow-auto px-6 py-5">
@@ -4632,6 +4651,7 @@ function OrderDrawer({
             key={`${o.id}:${hydrated ? 'h' : 'l'}`}
             order={o}
             onOrderUpdated={handleOrderUpdated}
+            onDirtyChange={setNotesDirty}
           />
 
           {/* ── 付款：付款情况卡 + 收款操作（相邻摆放，运营排序需求）── */}
@@ -9275,10 +9295,13 @@ function InvoiceFlagsSection({
 function NotesSection({
   order,
   onOrderUpdated,
+  onDirtyChange,
 }: {
   order: OrderSummary;
   /** 保存成功后把回读的整单冒泡给抽屉（同步 hydrated + 列表行），与其它区块一致 */
   onOrderUpdated?: (order: OrderSummary) => void;
+  /** 把本区块「有没有未保存改动」上报给抽屉壳，用于关闭前拦截提示 */
+  onDirtyChange?: (dirty: boolean) => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
   const role = useAuth((s) => s.user?.role);
@@ -9308,6 +9331,13 @@ function NotesSection({
         structured.noteVisa !== (order.noteVisa ?? '') ||
         structured.notePayment !== (order.notePayment ?? '') ||
         structured.noteSpecial !== (order.noteSpecial ?? '')));
+
+  // 上报给抽屉壳，供关闭前的未保存改动拦截使用；卸载时归零，避免残留 true 挡住下次打开的关闭。
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+    return () => onDirtyChange?.(false);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [dirty]);
 
   const save = async () => {
     if (!tokens?.accessToken) return;
@@ -9419,20 +9449,19 @@ function NotesSection({
             />
           </div>
         )}
-        {(dirty || saved) && (
-          <div className="flex items-center gap-2">
-            {dirty && (
-              <button
-                className="rounded bg-brand px-3 py-1 text-xs text-white disabled:opacity-50"
-                onClick={save}
-                disabled={saving}
-              >
-                {saving ? '保存中…' : '保存备注'}
-              </button>
-            )}
-            {saved && <span className="inline-flex items-center gap-1 text-xs text-green-600"><Icon name="check" size={14} /> 已保存</span>}
-          </div>
-        )}
+        <div className="flex items-center gap-2">
+          <button
+            className="rounded bg-brand px-3 py-1 text-xs text-white disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={save}
+            disabled={!dirty || saving}
+          >
+            {saving ? '保存中…' : '保存备注'}
+          </button>
+          {!dirty && !saved && (
+            <span className="text-[11px] text-ink-muted">改动需点保存才生效</span>
+          )}
+          {saved && <span className="inline-flex items-center gap-1 text-xs text-green-600"><Icon name="check" size={14} /> 已保存</span>}
+        </div>
       </div>
     </section>
   );
