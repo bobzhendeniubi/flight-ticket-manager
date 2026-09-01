@@ -451,6 +451,46 @@ describe('buildVisaPassportsZip — 仅护照图 zip（不含 xlsx 名单）', (
     expect(readme).toContain('护照图缺失/失败：1');
   });
 
+  // 2026-08-31 签证岗口径：自备签的人护照包里也不要有（我方不送签）。与合并名单、
+  // 签证台乘客列表三处同口径；被排掉的人在 README 点名，不静默少人。
+  it('自备签乘客的护照图不打包，且在 README 点名', async () => {
+    const orders = [
+      makeOrder('FTM2026083100002', [
+        pax({
+          id: 'a1',
+          lastName: 'WANG',
+          firstName: 'LIANBO',
+          passportPhotoUrl: 'data:image/jpeg;base64,AQIDBA==',
+        }),
+        pax({
+          id: 'a2',
+          lastName: 'ZI',
+          firstName: 'BEI',
+          visaExempt: true,
+          passportPhotoUrl: 'data:image/jpeg;base64,AQIDBA==',
+        }),
+      ]),
+    ];
+    const findMany = vi.fn().mockResolvedValue(orders);
+    const client = { order: { findMany } } as unknown as Parameters<typeof buildVisaPassportsZip>[1];
+
+    const zipBuf = await buildVisaPassportsZip(['id_FTM2026083100002'], client);
+    const zip = await JSZip.loadAsync(zipBuf);
+    const names = Object.keys(zip.files);
+
+    // 需送签的照打包，自备签的有图也不打包
+    expect(names).toContain('FTM2026083100002-WANG_LIANBO.jpg');
+    expect(names.some((n) => n.includes('ZI_BEI'))).toBe(false);
+
+    const readme = await zip.file('README.txt')!.async('string');
+    expect(readme).toContain('乘客总数：2');
+    expect(readme).toContain('自备签（不需送签，未打包）：1');
+    expect(readme).toContain('护照图成功：1');
+    // 缺图统计不把自备签算进去（他不是"缺图"，是"不用送"）
+    expect(readme).toContain('护照图缺失/失败：0');
+    expect(readme).toContain('自备签，不需送签，未打包');
+  });
+
   it('被勾选但状态不合格的单跳过、不打包护照图，并在 README 点名（连同查不到的 id）', async () => {
     const paid = makeOrder('FTM2026071000001', [
       pax({ id: 'a1', lastName: 'WANG', firstName: 'LIANBO', passportPhotoUrl: null }),

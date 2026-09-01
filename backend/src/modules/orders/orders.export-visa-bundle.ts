@@ -265,7 +265,11 @@ export function visaRosterXlsxFilename(orderCount: number): string {
 }
 
 /**
- * 护照图 zip（不含 xlsx 名单）：勾选订单的全部乘客护照图，按订单号前缀分组打包。
+ * 护照图 zip（不含 xlsx 名单）：勾选订单里**需我方送签**的乘客护照图，按订单号前缀分组打包。
+ *
+ * 自备签乘客（visaExempt=true）不打包 —— 与签证名单 xlsx、签证台乘客列表同口径
+ * （2026-08-31 签证岗口径：自备签的人护照包里也不要有，我方不需要）。被排掉的人在
+ * README.txt 里点名，不静默少人。
  * 文件名：`{订单号}-{LASTNAME}_{FIRSTNAME}[_序号].{ext}`（订单号前缀避免跨单撞名；
  * 同单同名再加序号后缀）。护照图逐个 fetch → 立即写入 zip，沿用 passport-zip.ts 的取图口径。
  *
@@ -287,11 +291,17 @@ export async function buildVisaPassportsZip(
   const usedNames = new Set<string>();
   const missing: string[] = [];
   const ok: string[] = [];
+  const exempted: string[] = [];
   let paxTotal = 0;
 
   for (const order of orders) {
     for (const p of order.passengers) {
       paxTotal += 1;
+      // 自备签：客人自行办妥签证，我方不送 → 不打包护照图，只在 README 点名
+      if (p.visaExempt === true) {
+        exempted.push(`${order.orderNumber} · ${pnrName(p)}`);
+        continue;
+      }
       // 文件名前缀：订单号 + 护照姓名（LAST_FIRST，回落 fullName），同单同名再补序号避免覆盖
       const nameSlug = sanitize(
         p.lastName || p.firstName ? `${p.lastName ?? ''}_${p.firstName ?? ''}` : p.fullName,
@@ -325,6 +335,7 @@ export async function buildVisaPassportsZip(
     `勾选订单数：${orderIds.length}`,
     `已打包订单数：${orders.length}`,
     `乘客总数：${paxTotal}`,
+    `自备签（不需送签，未打包）：${exempted.length}`,
     `护照图成功：${ok.length}`,
     `护照图缺失/失败：${missing.length}`,
     '',
@@ -342,6 +353,9 @@ export async function buildVisaPassportsZip(
       ? ['⚠ 已跳过（订单不存在或已删除）：', ...notFoundIds.map((id) => `  · ${id}`), '']
       : []),
     ...(ok.length ? ['✓ 已打包护照图：', ...ok.map((s) => `  · ${s}`), ''] : []),
+    ...(exempted.length
+      ? ['— 自备签，不需送签，未打包：', ...exempted.map((s) => `  · ${s}`), '']
+      : []),
     ...(missing.length ? ['⚠ 缺护照图：', ...missing.map((s) => `  · ${s}`)] : []),
   ].join('\n');
   zip.file('README.txt', readme);

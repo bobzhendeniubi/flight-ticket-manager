@@ -131,9 +131,12 @@ const VISA_SHEET_COLUMNS: Array<{ header: string; key: string; width: number }> 
  *
  * 自备签乘客（visaExempt=true）不上这张表：客人已自行办妥签证，无需送签，与签证台过滤
  * 同口径（fulfillment.service.ts 的 listByOrder 同样排除 visaExempt=true 的乘客）——
- * 送签表是签证岗拿去申请的名单，混入自备签客人只会让签证岗多余核对/误送签。护照图片
- * 本身仍打包进 zip（见 buildPassportPhotoZip 的乘客循环，用的是未过滤的入参 passengers），
- * 只有这张「送签表」名单排除（P1-13）。
+ * 送签表是签证岗拿去申请的名单，混入自备签客人只会让签证岗多余核对/误送签。
+ *
+ * 2026-08-31 起**护照图也一并排除**（见 buildPassportPhotoZip 的乘客循环）：签证岗反馈
+ * 「自备签的这种签证台下载护照也不要有他，我们不需要」。原先只排名单不排图，导致同一个包里
+ * 图比表多出一个人，签证岗每次都得回去确认是不是漏了。现在整个包统一按「要我方送签的人」口径，
+ * 被排掉的人在 README.txt 里点名（不静默少人）。
  */
 async function buildVisaSheetBuffer(passengers: Passenger[]): Promise<Buffer> {
   // 出发日期 + 备注为订单级信息（全订单乘客共用）—— 只查一次；orderId 从未过滤的入参取，
@@ -218,7 +221,13 @@ export async function buildPassportPhotoZip(args: {
   const missing: string[] = [];
   const ok: string[] = [];
 
-  for (const p of args.passengers) {
+  // 自备签乘客不进护照包（与包内送签表同口径）；名字仍写进 README，让签证岗看得见"这人是
+  // 自备签、不是漏了"。传给 buildVisaSheetBuffer 的仍是未过滤的入参（它自己再过滤，并靠
+  // 首个乘客拿订单上下文——全员自备签时也才查得到）。
+  const exempted = args.passengers.filter((p) => p.visaExempt === true);
+  const sendable = args.passengers.filter((p) => p.visaExempt !== true);
+
+  for (const p of sendable) {
     const slug = sanitize(`${p.lastName ?? ''}_${p.firstName ?? p.fullName}_${p.documentNumber}`);
     if (!p.passportPhotoUrl) {
       missing.push(`${slug}  — 该乘客没传护照照片`);
@@ -237,10 +246,21 @@ export async function buildPassportPhotoZip(args: {
     `订单：${args.orderNumber}`,
     `打包时间：${businessDateTimeSec(new Date())}（北京时间）`,
     `乘客总数：${args.passengers.length}`,
+    `需我方送签：${sendable.length}`,
+    `自备签（不需送签，未打包）：${exempted.length}`,
     `成功打包：${ok.length}`,
     `缺失/失败：${missing.length}`,
     '',
     ...(ok.length ? ['✓ 已打包：', ...ok.map((s) => `  · ${s}`), ''] : []),
+    ...(exempted.length
+      ? [
+          '— 自备签，不需送签，未打包：',
+          ...exempted.map(
+            (p) => `  · ${sanitize(`${p.lastName ?? ''}_${p.firstName ?? p.fullName}`)}`,
+          ),
+          '',
+        ]
+      : []),
     ...(missing.length ? ['⚠ 缺照片：', ...missing.map((s) => `  · ${s}`)] : []),
   ].join('\n');
   folder.file('README.txt', readme);

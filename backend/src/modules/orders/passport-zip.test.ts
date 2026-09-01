@@ -132,11 +132,12 @@ describe('extFromUrl', () => {
   });
 });
 
-describe('buildPassportPhotoZip — 送签表排除自备签乘客（P1-13）', () => {
+describe('buildPassportPhotoZip — 自备签乘客整包排除（表与图口径统一）', () => {
   // 自备签乘客（visaExempt=true）已自行办妥签证，不需要送签——与签证台
-  // fulfillment.service.ts 同口径。护照 zip 图片本身仍打包（业务上护照图可能仍有用途），
-  // 只有"送签表"这张名单排除，避免签证岗把自备签客人也当送签对象核对/催材料。
-  it('自备签乘客不出现在送签表，但其护照图仍打包进 zip', async () => {
+  // fulfillment.service.ts 同口径。2026-08-31 起护照图**也一并排除**（签证岗口径：
+  // 自备签的人护照包里也不要有）：原先只排名单不排图，同一个包里图比表多一个人，
+  // 每次都得回头确认是不是漏人。被排掉的人写进 README.txt 点名，不静默少人。
+  it('自备签乘客既不出现在送签表，护照图也不打包，且 README 点名', async () => {
     const orderNumber = 'FTM2026070800005';
     const passengers = [
       makePassenger({
@@ -158,10 +159,44 @@ describe('buildPassportPhotoZip — 送签表排除自备签乘客（P1-13）', 
     expect(rows).toHaveLength(1);
     expect(rows[0]['中文名']).toBe('李四');
 
-    // 护照图 zip：自备签乘客「张三」的图仍打包（不受送签表过滤影响）
+    // 护照图 zip：自备签乘客「张三」的图不再打包
     const zip = await JSZip.loadAsync(zipBuf);
     const names = Object.keys(zip.files);
-    expect(names.some((n) => n.includes('ZHANG'))).toBe(true);
+    expect(names.some((n) => n.includes('ZHANG'))).toBe(false);
+
+    // README 点名，让签证岗看得出「这人是自备签、不是漏了」
+    const readme = await zip.file(`${orderNumber}/README.txt`)!.async('string');
+    expect(readme).toContain('自备签（不需送签，未打包）：1');
+    expect(readme).toContain('自备签，不需送签，未打包');
+    expect(readme).toContain('ZHANG');
+  });
+
+  it('全员自备签：不打包任何护照图，送签表为空，README 如实写明人数', async () => {
+    const orderNumber = 'FTM2026083100001';
+    const passengers = [
+      makePassenger({
+        id: 'p1',
+        fullName: 'ZHANG SAN',
+        visaExempt: true,
+        passportPhotoUrl: 'data:image/jpeg;base64,AQIDBA==',
+      }),
+      makePassenger({
+        id: 'p2',
+        fullName: 'LI SI',
+        visaExempt: true,
+        passportPhotoUrl: 'data:image/jpeg;base64,AQIDBA==',
+      }),
+    ];
+
+    const zipBuf = await buildPassportPhotoZip({ orderNumber, passengers });
+
+    expect(await readVisaSheetRows(zipBuf, orderNumber)).toHaveLength(0);
+    const zip = await JSZip.loadAsync(zipBuf);
+    const readme = await zip.file(`${orderNumber}/README.txt`)!.async('string');
+    expect(readme).toContain('乘客总数：2');
+    expect(readme).toContain('需我方送签：0');
+    expect(readme).toContain('自备签（不需送签，未打包）：2');
+    expect(readme).toContain('成功打包：0');
   });
 });
 
