@@ -221,6 +221,17 @@ describe('PaymentsService.reverseManualPayment · 手工收款冲销', () => {
     expect(mockTx.order.update).not.toHaveBeenCalled();
   });
 
+  it('换人转出的转入款不能从通用人工收款入口单独撤销', async () => {
+    configure({ payload: { manual: true, swapTransfer: true, transferredIn: true } });
+
+    await expect(
+      service.reverseManualPayment('payment-1', { reason: '尝试回退转入款' }, ACTOR),
+    ).rejects.toThrow('这笔收款是换人转出的转入款，不能单独撤销');
+
+    expect(mockTx.payment.updateMany).not.toHaveBeenCalled();
+    expect(mockTx.order.update).not.toHaveBeenCalled();
+  });
+
   it.each([
     ['allocationId', { manual: true, allocationId: 'alloc-1' }],
     ['大写 source', { manual: true, source: 'RECONCILIATION' }],

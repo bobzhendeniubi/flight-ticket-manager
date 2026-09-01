@@ -35,3 +35,11 @@ export const transferManualPaymentBodySchema = z.object({
   targetOrderNumber: z.string().trim().min(1).max(100),
   reason: z.string().trim().min(4).max(200),
 });
+
+/** 换人转出：源单留存手填换人费，其余净收款转入新订单。 */
+export const swapTransferBodySchema = z.object({
+  targetOrderNumber: z.string().trim().min(1, '请填写转入的订单号').max(64),
+  // 换人费按单手填，每单金额可能不同；不做枚举或规则表约束。
+  transferFeeCny: z.number().int().min(0),
+  reason: z.string().trim().min(1, '请填写换人转出原因').max(500),
+});
