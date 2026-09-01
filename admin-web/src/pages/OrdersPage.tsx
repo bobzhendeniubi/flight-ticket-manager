@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelReturnLegPreview } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -4953,6 +4953,7 @@ function OrderDrawer({
                             id: p.id,
                             name: p.chineseName?.trim() || p.fullName,
                           }))}
+                          returnLegItemId={returnFlightLegId(o)}
                         />
                       ))}
                     </ul>
@@ -4977,6 +4978,7 @@ function OrderDrawer({
                       id: p.id,
                       name: p.chineseName?.trim() || p.fullName,
                     }))}
+                    returnLegItemId={returnFlightLegId(o)}
                   />
                 ))}
               </ul>
@@ -6517,6 +6519,25 @@ function signedCny(amountCny: number): string {
   return `${sign}¥${Math.abs(amountCny).toLocaleString()}`;
 }
 
+/**
+ * 取消回程（改单去程）：判定本单哪一条 FLIGHT 行是「回程」。
+ * 口径：本单有航班班次的 FLIGHT 行，按出发日期+时间升序排，第 2 条即回程腿
+ * （往返订单必然是「去程早、回程晚」）。少于 2 条（单程/纯地面单）没有回程，返回 null。
+ */
+function returnFlightLegId(o: OrderSummary): string | null {
+  const flights = (o.items ?? [])
+    .filter((it) => it.kind === 'FLIGHT' && it.flightScheduleId)
+    .map((it) => ({ id: it.id, key: `${it.departureDate ?? '9999-99-99'} ${it.departureTime ?? '99:99'}` }))
+    .sort((a, b) => a.key.localeCompare(b.key));
+  return flights.length >= 2 ? flights[1].id : null;
+}
+
+/** 回程行是否已被取消（后端 metadata.returnLegCancelled 打标；结构不符视为未取消）。 */
+function readReturnLegCancelled(metadata: unknown): boolean {
+  if (!metadata || typeof metadata !== 'object') return false;
+  return (metadata as { returnLegCancelled?: unknown }).returnLegCancelled === true;
+}
+
 // ── 产品内容行：FLIGHT 项可「改期」（换班次/日期 + 改舱位 + 改期费）──────
 function OrderItemRow({
   orderId,
@@ -6529,6 +6550,7 @@ function OrderItemRow({
   settlementLocked,
   roomGroups,
   passengers,
+  returnLegItemId,
 }: {
   orderId: string;
   item: OrderItem;
@@ -6546,6 +6568,8 @@ function OrderItemRow({
   roomGroups?: RoomGroup[];
   /** 本单出行人（拆房组弹窗展示组内乘客名用；改期乘客勾选列表复用同一份） */
   passengers?: Array<{ id: string; name: string }>;
+  /** 本单回程 FLIGHT 行的 orderItemId（returnFlightLegId 派生）；本行匹配即渲染「取消回程」入口 */
+  returnLegItemId?: string | null;
 }) {
   const [rescheduling, setRescheduling] = useState(false);
   const [editingPrice, setEditingPrice] = useState(false);
@@ -6554,7 +6578,11 @@ function OrderItemRow({
   const [upgradingCabin, setUpgradingCabin] = useState(false);
   const [changingBundle, setChangingBundle] = useState(false);
   const [splittingGroup, setSplittingGroup] = useState(false);
+  const [cancelingReturnLeg, setCancelingReturnLeg] = useState(false);
   const isFlight = item.kind === 'FLIGHT';
+  // 取消回程（改单去程）：本行是回程 FLIGHT 行、且尚未被取消过才给入口；已取消过的显示徽标。
+  const isReturnLeg = isFlight && returnLegItemId === item.id;
+  const returnLegCancelled = isReturnLeg && readReturnLegCancelled(item.metadata);
   // 套餐改档：换绑到另一张套餐（档次/晚数是 Bundle 自身的属性，改档=换 bundleId）。
   const isBundleRow = item.kind === 'BUNDLE' && Boolean(item.bundleId);
   // 升舱入口：只有**经济舱**机票行能一键升商务舱；套餐机票腿（带 bundleId）走套餐自身的升舱份数模型，后端也会拒。
@@ -6655,6 +6683,23 @@ function OrderItemRow({
               改期
             </button>
           )}
+          {isReturnLeg && returnLegCancelled && (
+            <span
+              className="inline-flex items-center rounded border border-slate-300 bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-500"
+              title="回程座位已放回库存重新销售，本单已改为单去程"
+            >
+              回程已取消
+            </span>
+          )}
+          {canOperate && isReturnLeg && !returnLegCancelled && !rescheduling && !editingPrice && !upgradingCabin && !cancelingReturnLeg && (
+            <button
+              className="text-[11px] font-medium text-red-600 hover:text-red-800"
+              onClick={() => setCancelingReturnLeg(true)}
+              title="按取消政策收手续费，回程座位放回库存重新销售，订单变为单去程"
+            >
+              取消回程（改单去程）
+            </button>
+          )}
           {canOperate && canUpgradeCabin && !rescheduling && !editingPrice && !upgradingCabin && (
             <button
               className="text-[11px] font-medium text-indigo-600 hover:text-indigo-800"
@@ -6726,6 +6771,16 @@ function OrderItemRow({
             onOrderUpdated?.(updated);
           }}
           onRefreshOnly={(updated) => {
+            onOrderUpdated?.(updated);
+          }}
+        />
+      )}
+      {isReturnLeg && !returnLegCancelled && cancelingReturnLeg && (
+        <CancelReturnLegForm
+          orderId={orderId}
+          onCancel={() => setCancelingReturnLeg(false)}
+          onSaved={(updated) => {
+            setCancelingReturnLeg(false);
             onOrderUpdated?.(updated);
           }}
         />
@@ -7480,6 +7535,243 @@ function RescheduleForm({
           disabled={submitting || !newScheduleId || selectedIds.size === 0 || Boolean(splitFailure)}
         >
           {submitting ? '改期中…' : '确认改期'}
+        </button>
+        <button
+          className="rounded bg-slate-100 px-3 py-1.5 text-slate-700 disabled:opacity-50"
+          onClick={onCancel}
+          disabled={submitting}
+        >
+          取消
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── 取消回程（改单去程）：回程座位放回库存重新销售，本单变单去程，手续费按取消政策算
+// （运营可手动覆盖但须填覆盖原因）。打开即 preview：不合格列 blockers 且禁用确认；
+// 合格展示回程航段/手续费/降额，确认前 useConfirm() 二次确认。────────────────
+function CancelReturnLegForm({
+  orderId,
+  onCancel,
+  onSaved,
+}: {
+  orderId: string;
+  onCancel: () => void;
+  onSaved: (order: OrderSummary) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const confirm = useConfirm();
+  // 幂等键：本面板打开期间只生成一次，提交失败重试复用同一个 token，避免网络抖动重复取消。
+  const requestTokenRef = useRef<string>(crypto.randomUUID());
+  const [previewLoading, setPreviewLoading] = useState(true);
+  const [previewErr, setPreviewErr] = useState<string | null>(null);
+  const [preview, setPreview] = useState<CancelReturnLegPreview | null>(null);
+  const [feeMode, setFeeMode] = useState<'POLICY' | 'MANUAL'>('POLICY');
+  const [manualFeeCny, setManualFeeCny] = useState<number | null>(null);
+  const [overrideReason, setOverrideReason] = useState('');
+  const [note, setNote] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    setPreviewLoading(true);
+    setPreviewErr(null);
+    api
+      .previewCancelReturnLeg(token, orderId)
+      .then((res) => {
+        if (cancelled) return;
+        setPreview(res);
+        // 无适用取消政策时默认落到手动填写，不给一个假装能选的「按政策」选项。
+        setFeeMode(res.policyFee ? 'POLICY' : 'MANUAL');
+      })
+      .catch((e) => {
+        if (cancelled) return;
+        setPreviewErr(e instanceof ApiError ? e.message : '取消回程预检失败');
+      })
+      .finally(() => {
+        if (!cancelled) setPreviewLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [orderId, token]);
+
+  const returnItem = preview?.returnItem ?? null;
+  const policyFee = preview?.policyFee ?? null;
+  const hasPolicyFee = policyFee != null;
+  // 本地估算展示用（权威数字来自提交后返回的 audit）：按当前选中的手续费口径重算降额/多付。
+  const effectiveFeeCny = feeMode === 'POLICY' ? policyFee?.feeAmountCny ?? 0 : manualFeeCny ?? 0;
+  const effectiveNetReduction = returnItem ? returnItem.amountCny - effectiveFeeCny : 0;
+  const projectedTotal = preview ? preview.currentTotalCny - effectiveNetReduction : null;
+  const projectedOverpay =
+    preview && projectedTotal != null ? Math.max(0, preview.paidAmountCny - projectedTotal) : 0;
+  const manualFeeInvalid =
+    feeMode === 'MANUAL' &&
+    (manualFeeCny == null ||
+      manualFeeCny < 0 ||
+      !Number.isInteger(manualFeeCny) ||
+      (returnItem != null && manualFeeCny > returnItem.amountCny) ||
+      !overrideReason.trim());
+
+  const submit = async () => {
+    if (!token || submitting || !preview?.eligible || !returnItem || projectedTotal == null) return;
+    setErr(null);
+    if (manualFeeInvalid) {
+      setErr('请填写有效的手续费（整数、不超过回程行金额）与覆盖原因');
+      return;
+    }
+    const confirmed = await confirm({
+      title: '取消回程（改单去程）',
+      body: `回程座位将立即放回库存重新销售，本单变为单去程，不可撤销。\n\n手续费 ¥${effectiveFeeCny.toLocaleString()}，本单应收将从 ¥${preview.currentTotalCny.toLocaleString()} 降到 ¥${projectedTotal.toLocaleString()}。${
+        projectedOverpay > 0
+          ? `\n\n客户已多付 ¥${projectedOverpay.toLocaleString()}，确认后请到付款情况处理多收（转预存款/退款）。`
+          : ''
+      }`,
+      tone: 'danger',
+      confirmText: '确认取消回程',
+    });
+    if (!confirmed) return;
+    setSubmitting(true);
+    try {
+      const res = await api.cancelReturnLeg(token, orderId, {
+        requestToken: requestTokenRef.current,
+        feeMode,
+        manualFeeCny: feeMode === 'MANUAL' ? manualFeeCny ?? undefined : undefined,
+        overrideReason: feeMode === 'MANUAL' ? overrideReason.trim() : undefined,
+        note: note.trim() || undefined,
+      });
+      alert(
+        `已取消回程，应收 ¥${res.audit.totalBefore.toLocaleString()} → ¥${res.audit.totalAfter.toLocaleString()}，手续费 ¥${res.audit.feeCny.toLocaleString()}`,
+      );
+      onSaved(res.order);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '取消回程失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="mt-3 space-y-2 rounded-md border border-red-300 bg-white p-3 text-xs">
+      <div className="font-medium text-red-600">取消回程（改单去程）</div>
+
+      {previewLoading && <div className="text-slate-500">正在核对是否可以取消回程…</div>}
+      {previewErr && <div className="rounded bg-red-50 px-2 py-1 text-red-700">{previewErr}</div>}
+
+      {preview && !preview.eligible && (
+        <div className="space-y-1 rounded bg-red-50 px-2 py-1 text-red-700">
+          <div className="font-medium">不满足取消回程条件：</div>
+          <ul className="list-disc space-y-0.5 pl-4">
+            {preview.blockers.map((b) => (
+              <li key={b}>{b}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {preview && preview.eligible && returnItem && (
+        <>
+          <div className="space-y-0.5 rounded border border-slate-200 bg-slate-50/60 p-2">
+            <div className="text-ink">回程：{returnItem.description}</div>
+            <div className="text-slate-500">
+              {returnItem.flightNumber && <>{returnItem.flightNumber} · </>}
+              {returnItem.departDate && <>{returnItem.departDate} · </>}
+              {returnItem.cabin && <>{CABIN_ZH[returnItem.cabin] ?? returnItem.cabin} · </>}
+              数量 {returnItem.quantity} · ¥{returnItem.amountCny.toLocaleString()}
+            </div>
+          </div>
+
+          <div className="space-y-1">
+            <label className="flex items-center gap-1.5">
+              <input
+                type="radio"
+                name={`cancel-return-fee-mode-${orderId}`}
+                checked={feeMode === 'POLICY'}
+                disabled={!hasPolicyFee || submitting}
+                onChange={() => setFeeMode('POLICY')}
+              />
+              <span>
+                按取消政策
+                {hasPolicyFee
+                  ? ` ¥${policyFee!.feeAmountCny.toLocaleString()}（${policyFee!.policyName} · ${policyFee!.feePercent}% · 距起飞 ${policyFee!.hoursLeft} 小时）`
+                  : '（无适用政策，请手动填写）'}
+              </span>
+            </label>
+            <label className="flex items-center gap-1.5">
+              <input
+                type="radio"
+                name={`cancel-return-fee-mode-${orderId}`}
+                checked={feeMode === 'MANUAL'}
+                disabled={submitting}
+                onChange={() => setFeeMode('MANUAL')}
+              />
+              <span>手动填写</span>
+            </label>
+          </div>
+
+          {feeMode === 'MANUAL' && (
+            <div className="space-y-2 rounded border border-amber-200 bg-amber-50/60 p-2">
+              <label className="block">
+                <span className="text-slate-500">手续费（¥，整数，≤ 回程行金额 ¥{returnItem.amountCny.toLocaleString()}）</span>
+                <NumberInput
+                  value={manualFeeCny}
+                  onChange={setManualFeeCny}
+                  integerOnly
+                  max={returnItem.amountCny}
+                  disabled={submitting}
+                  placeholder="请输入手续费金额"
+                  className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+                />
+              </label>
+              <label className="block">
+                <span className="text-slate-500">覆盖原因（必填）</span>
+                <input
+                  className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+                  value={overrideReason}
+                  onChange={(e) => setOverrideReason(e.target.value)}
+                  disabled={submitting}
+                  placeholder="如：客户提前告知 / 特殊约定"
+                />
+              </label>
+            </div>
+          )}
+
+          <label className="block">
+            <span className="text-slate-500">备注（可选）</span>
+            <input
+              className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              disabled={submitting}
+            />
+          </label>
+
+          <div className="rounded bg-slate-50 px-2 py-1.5 text-slate-700">
+            本单应收将从 ¥{preview.currentTotalCny.toLocaleString()} 降到 ¥
+            {(projectedTotal ?? preview.currentTotalCny).toLocaleString()}（手续费 ¥
+            {effectiveFeeCny.toLocaleString()}）
+            {projectedOverpay > 0 && (
+              <div className="mt-1 text-amber-700">
+                客户已多付 ¥{projectedOverpay.toLocaleString()}，确认后请到付款情况处理多收（转预存款/退款）。
+              </div>
+            )}
+          </div>
+        </>
+      )}
+
+      {err && <div className="rounded bg-red-50 px-2 py-1 text-red-700">{err}</div>}
+
+      <div className="flex gap-2 pt-1">
+        <button
+          className="flex-1 rounded bg-red-600 px-2 py-1.5 font-medium text-white disabled:opacity-50"
+          onClick={submit}
+          disabled={submitting || previewLoading || !preview?.eligible || manualFeeInvalid}
+        >
+          {submitting ? '提交中…' : '确认取消回程'}
         </button>
         <button
           className="rounded bg-slate-100 px-3 py-1.5 text-slate-700 disabled:opacity-50"

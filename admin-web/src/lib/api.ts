@@ -3401,6 +3401,51 @@ export interface ReschedulePassengersResult {
   splitPerformed: boolean;
 }
 
+// ── 取消回程（改单去程；ADMIN/STAFF）─────────────────────────────────────
+// 按航司标准做「取消回程」：回程座位放回库存重新销售，订单变单去程，手续费按取消政策算
+// （运营可手动覆盖但须填覆盖原因）。先 preview 判定是否合格 + 算出手续费/降额，
+// 再带幂等 requestToken 提交。
+export interface CancelReturnLegPreview {
+  eligible: boolean;
+  /** 不合格原因（逐条），如「已出票」「已过起飞时间」等；eligible=false 时非空 */
+  blockers: string[];
+  /** 回程航段（FLIGHT 行）；无回程或已被取消过时为 null */
+  returnItem: {
+    orderItemId: string;
+    description: string;
+    flightNumber: string | null;
+    departDate: string | null;
+    cabin: CabinClass | null;
+    quantity: number;
+    amountCny: number;
+  } | null;
+  /** 按取消政策算出的手续费；无适用政策时为 null（此时只能走手动填写） */
+  policyFee: {
+    policyName: string;
+    feePercent: number;
+    feeAmountCny: number;
+    hoursLeft: number;
+  } | null;
+  /** 本单应收降幅 = 回程行金额 − 手续费 */
+  netReductionCny: number;
+  currentTotalCny: number;
+  paidAmountCny: number;
+  /** > 0 = 应收降低后客户已多付这么多，需要到付款情况处理多收（转预存款/退款） */
+  overpayAfterCny: number;
+}
+
+export interface CancelReturnLegResult {
+  order: OrderSummary;
+  audit: {
+    feeCny: number;
+    netReductionCny: number;
+    totalBefore: number;
+    totalAfter: number;
+    overpayAfterCny: number;
+    releasedSeats: number;
+  };
+}
+
 export const api = {
   login: (email: string, password: string) =>
     apiFetch<AuthResult>('/auth/login', {
@@ -4315,6 +4360,33 @@ export const api = {
       failed: number;
       results: Array<{ id: string; orderNumber?: string; ok: boolean; error?: string; notice?: string }>;
     }>('/orders/batch-reschedule', {
+      method: 'POST',
+      token,
+      body,
+    }),
+  // 取消回程（改单去程）预检：只读，不改任何数据。回不合格给 blockers，合格给回程行金额 +
+  // 政策手续费 + 应收降幅，供确认前展示。
+  previewCancelReturnLeg: (token: string, orderId: string) =>
+    apiFetch<CancelReturnLegPreview>(`/orders/${orderId}/cancel-return-leg/preview`, {
+      method: 'POST',
+      token,
+      body: {},
+    }),
+  // 取消回程（改单去程）提交：回程座位放回库存重新销售，订单变单去程。手续费默认按取消政策
+  // 自动算（feeMode:'POLICY'），运营也可手动覆盖（feeMode:'MANUAL' + manualFeeCny + 必填
+  // overrideReason）。requestToken 幂等键（crypto.randomUUID，同一次表单提交内复用同一个 token）。
+  cancelReturnLeg: (
+    token: string,
+    orderId: string,
+    body: {
+      requestToken: string;
+      feeMode: 'POLICY' | 'MANUAL';
+      manualFeeCny?: number;
+      overrideReason?: string;
+      note?: string;
+    },
+  ) =>
+    apiFetch<CancelReturnLegResult>(`/orders/${orderId}/cancel-return-leg`, {
       method: 'POST',
       token,
       body,
