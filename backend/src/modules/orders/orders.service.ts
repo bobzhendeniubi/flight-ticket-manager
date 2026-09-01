@@ -12280,9 +12280,18 @@ export class OrderService {
 
     // 承接 Payment：movedPaid > 0 才建。核实状态继承来源——源单全部成功收款均已核实才算核实，
     // 钱没被财务对过流水，不因搬到新单就洗白（与占位单结转同哲学）。
+    //
+    // 成对落两条：新单一条**正额**承接行，源单一条**等额负额**对冲行。
+    // 少了源单那条会造币：拆单只减 order.paidAmount，源单台账一行没动，于是源单下一次进 PAID
+    // （_updateStatusWithinTx 的 `if (paymentsSum > currentPaid) paidAmount = paymentsSum`，
+    // 本是给迟到的网关回调补记用的）就会把随拆转走的 movedPaid 重新灌回源单——同一笔钱在
+    // 两张单上各算一次。对冲行的字段与口径与「多付处置」对冲行
+    //（_recordOverpayDisposalPayment）逐字一致，不另起一套。
     if (movedPaidCny > 0) {
       const sourcePayments = await tx.payment.findMany({
-        where: { orderId, status: PaymentStatus.SUCCEEDED },
+        // 只看真实进账：对冲行金额为负、创建即视同已核实，算进来会把「财务还没对过流水」
+        // 的账洗白（多次拆单时尤甚）。
+        where: { orderId, status: PaymentStatus.SUCCEEDED, amount: { gt: 0 } },
         select: { verifiedAt: true },
       });
       const allVerified =
@@ -12306,6 +12315,36 @@ export class OrderService {
               by: actor.userId,
             },
             manual: false,
+          } as Prisma.InputJsonValue,
+        },
+      });
+      await tx.payment.create({
+        data: {
+          orderId,
+          // 与配对的承接行同一支付方式，两条一眼看得出是一对（对冲行不是新钱进账，
+          // 方式本身不承载业务含义）。
+          method: PaymentMethod.BANK_CARD,
+          amount: new Prisma.Decimal(-movedPaidCny),
+          status: PaymentStatus.SUCCEEDED,
+          transactionId: null,
+          idempotencyKey: `split-out:${order.id}:${input.requestToken}`,
+          // paidAt 留空 → 导出的「最近一笔成功收款」（按 paidAt 过滤排序）不会把对冲行误当收款。
+          paidAt: null,
+          // 内部记账（负额），不是新钱进账，创建即视同已核实，不进待核实队列。
+          verifiedAt: new Date(),
+          gatewayPayload: {
+            source: 'split-transfer',
+            targetOrderId: target.id,
+            targetOrderNumber: target.orderNumber,
+            requestToken: input.requestToken,
+            amountCny: movedPaidCny,
+            splitAt: nowIso,
+            by: actor.userId,
+            manual: false,
+            // 收款区徽标：复用既有「已转出至 X」标注（serializePaymentRecord 已认这两个字段），
+            // 不为拆单另造一个 label。
+            transferredOut: true,
+            transferredToOrderNumber: target.orderNumber,
           } as Prisma.InputJsonValue,
         },
       });

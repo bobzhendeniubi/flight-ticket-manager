@@ -499,8 +499,12 @@ describe('拆单 · 执行（纯机票 2 人拆 1 人）', () => {
     expect(tgtUpdate.data.adjustments[0]).toMatchObject({ type: 'SPLIT_IN', amountCny: 1000 });
 
     // 承接 Payment 形状：幂等键 split:{源id}:{token}、来源载荷、核实继承（源单全核实 → 非空）
-    expect(mockPrisma.payment.create).toHaveBeenCalledTimes(1);
-    const paymentData = mockPrisma.payment.create.mock.calls[0][0].data;
+    // 成对两条：新单正额承接行 + 源单等额负额对冲行（对冲行形状另有专用用例）
+    expect(mockPrisma.payment.create).toHaveBeenCalledTimes(2);
+    const paymentData = mockPrisma.payment.create.mock.calls
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .map((c: any[]) => c[0].data)
+      .find((d) => d.orderId === 'o2');
     expect(paymentData).toMatchObject({
       orderId: 'o2',
       status: 'SUCCEEDED',
@@ -569,10 +573,90 @@ describe('拆单 · 执行（纯机票 2 人拆 1 人）', () => {
 
     // 新单继承源单状态（已付款），不会被 advanceOrderToPaid 再推一次
     expect(mockPrisma.order.create.mock.calls[0][0].data.status).toBe('PAID');
-    // 承接 Payment = 全额份额
-    expect(Number(mockPrisma.payment.create.mock.calls[0][0].data.amount)).toBe(1000);
+    // 承接 Payment = 全额份额，源单等额负额对冲（两侧台账合计不变）
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const paymentRows = mockPrisma.payment.create.mock.calls.map((c: any[]) => c[0].data);
+    expect(Number(paymentRows.find((d) => d.orderId === 'o2').amount)).toBe(1000);
+    expect(Number(paymentRows.find((d) => d.orderId === 'o1').amount)).toBe(-1000);
     // 守恒断言通过 → 拆单流水落库
     expect(mockPrisma.orderSplitRecord.create).toHaveBeenCalledTimes(1);
+  });
+
+  it('源单台账对称：随拆转出登记等额负额对冲行（Σ源单成功收款 = 拆后已收）', async () => {
+    // 前提：源单拆前 paidAmount 500，且这 500 就是台账里唯一一笔 SUCCEEDED 收款。
+    const PRE_LEDGER_CNY = 500;
+    armExecute({
+      order: baseOrder(),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 0 },
+      finalTarget: { total: 1000, paidAmount: 500 },
+    });
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const created = mockPrisma.payment.create.mock.calls.map((c: any[]) => c[0].data);
+    const sourceRows = created.filter((d) => d.orderId === 'o1');
+    expect(sourceRows).toHaveLength(1);
+    const offset = sourceRows[0];
+    // 形状与「多付处置」对冲行同一口径：负额 SUCCEEDED、paidAt 留空、创建即视同已核实
+    expect(Number(offset.amount)).toBe(-500);
+    expect(offset.status).toBe('SUCCEEDED');
+    expect(offset.paidAt).toBeNull();
+    expect(offset.verifiedAt).not.toBeNull();
+    expect(offset.idempotencyKey).toBe(`split-out:o1:${TOKEN}`);
+    expect(offset.gatewayPayload).toMatchObject({
+      source: 'split-transfer',
+      targetOrderId: 'o2',
+      requestToken: TOKEN,
+      transferredOut: true,
+    });
+
+    // 台账合计与订单已收对齐：500 + (−500) = 0 = 拆后源单 paidAmount
+    const ledgerAfter =
+      PRE_LEDGER_CNY + sourceRows.reduce((sum, d) => sum + Number(d.amount), 0);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const srcUpdate = mockPrisma.order.update.mock.calls
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .map((c: any[]) => c[0])
+      .find((u) => u.where.id === 'o1');
+    expect(ledgerAfter).toBe(Number(srcUpdate.data.paidAmount));
+  });
+
+  it('拆后源单再收一笔款，进 PAID 时不会被台账把已收抬回去', async () => {
+    // 病灶复现：拆单只减 order.paidAmount、源单台账原封不动 → 源单下次进 PAID 时
+    // _updateStatusWithinTx 的 `if (paymentsSum > currentPaid) paidAmount = paymentsSum`
+    // 会把随拆转走的钱重新灌回源单，同一笔钱在两张单上各算一次。
+    const PRE_LEDGER_CNY = 500;
+    armExecute({
+      order: baseOrder(),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 0 },
+      finalTarget: { total: 1000, paidAmount: 500 },
+    });
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const created = mockPrisma.payment.create.mock.calls.map((c: any[]) => c[0].data);
+    const sourceLedgerAfterSplit =
+      PRE_LEDGER_CNY +
+      created.filter((d) => d.orderId === 'o1').reduce((sum, d) => sum + Number(d.amount), 0);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const srcUpdate = mockPrisma.order.update.mock.calls
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .map((c: any[]) => c[0])
+      .find((u) => u.where.id === 'o1');
+
+    // 拆后再确认一笔 300 的收款：台账 +300、order.paidAmount +300（两边同步加）
+    const LATER_PAYMENT_CNY = 300;
+    const paymentsSum = sourceLedgerAfterSplit + LATER_PAYMENT_CNY;
+    const currentPaid = Number(srcUpdate.data.paidAmount) + LATER_PAYMENT_CNY;
+
+    // PAID 分支的重写条件必须为假，否则源单已收凭空多出随拆转走的那份
+    expect(paymentsSum).toBeLessThanOrEqual(currentPaid);
   });
 
   it('执行前重跑准入闸：锁内发现结算价已锁 → BadRequestError，不建新单', async () => {
