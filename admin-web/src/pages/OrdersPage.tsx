@@ -35,6 +35,11 @@ import { SplitOrderModal } from '../components/SplitOrderModal';
 import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
 import { ProofImageViewer } from '../components/ProofImageViewer';
 import type { RoomGroup, Receipt, DocumentType, TravelerProfileLookupRow, BatchConfirmResultItem } from '../lib/api';
+import {
+  settlementRequestsApi,
+  type SettlementRequest,
+  type SettlementRequestStatus,
+} from '../lib/api';
 import { countryIso3ToIso2 } from '../lib/passportOcr';
 import { runPassportOcr, ocrReviewHintText } from '../lib/passportOcrRunner';
 import { ORDER_STATUS_META, orderStatusBadgeClass, orderStatusLabel } from '../lib/orderStatus';
@@ -955,6 +960,11 @@ export function OrdersPage() {
   const [showBatchCreate, setShowBatchCreate] = useState(false);
   const [showSingleCreate, setShowSingleCreate] = useState(false);
   const [refreshNonce, setRefreshNonce] = useState(0);
+  // 议价申请队列弹窗（ADMIN/STAFF）+ 待处理数徽标；代理不能手填结算价，只能提申请，
+  // 运营在这里集中确认/驳回。徽标只拉一次 total（pageSize=1，不取列表内容），队列内确认/驳回
+  // 或列表刷新时（同一 refreshNonce）重拉一次，避免徽标数长期滞后。
+  const [showSettlementRequestQueue, setShowSettlementRequestQueue] = useState(false);
+  const [settlementRequestPendingCount, setSettlementRequestPendingCount] = useState<number | null>(null);
 
   // 拉取订单 — 下单日期/出行日期/claimFilter/航班号/乘客姓名/开票状态 变化时重拉（后端过滤）
   useEffect(() => {
@@ -977,6 +987,19 @@ export function OrdersPage() {
       });
     return () => { cancelled = true; };
   }, [tokens?.accessToken, filterQuery, refreshNonce]);
+
+  // 议价申请待处理数（仅 ADMIN/STAFF 拉；代理看不到这个入口）。
+  useEffect(() => {
+    if (!isOps) return;
+    const t = tokens?.accessToken;
+    if (!t) return;
+    let cancelled = false;
+    settlementRequestsApi
+      .listSettlementRequests(t, { status: 'PENDING', pageSize: 1 })
+      .then((res) => { if (!cancelled) setSettlementRequestPendingCount(res.pagination.total); })
+      .catch(() => { /* 徽标拉取失败静默：不影响主列表，按钮本身仍可点开队列核实 */ });
+    return () => { cancelled = true; };
+  }, [isOps, tokens?.accessToken, refreshNonce]);
 
   // 勾选随后端筛选结果收敛（票务反馈 T2）：筛选变化重新拉单后，勾选集合里若还留着不在新结果中的
   // id，会被悄悄带进导出（例如先宽筛选全选，再收窄筛选，导出仍按旧勾选出全团期订单，含已开票的）。
@@ -2167,6 +2190,20 @@ export function OrdersPage() {
           >
             ＋ 批量创单
           </button>
+          {isOps && (
+            <button
+              className="btn-secondary relative text-sm"
+              onClick={() => setShowSettlementRequestQueue(true)}
+              title="代理提交的议价申请（想按别的价结算），在这里集中确认/驳回"
+            >
+              议价申请
+              {!!settlementRequestPendingCount && (
+                <span className="ml-1.5 rounded-full bg-amber-500 px-1.5 py-0.5 text-[11px] font-semibold text-white">
+                  {settlementRequestPendingCount}
+                </span>
+              )}
+            </button>
+          )}
           <button
             className="btn-secondary text-sm"
             disabled={loading}
@@ -4061,6 +4098,30 @@ export function OrdersPage() {
         />
       )}
 
+      {showSettlementRequestQueue && (
+        <SettlementRequestQueueModal
+          onClose={() => setShowSettlementRequestQueue(false)}
+          onDecided={() => setRefreshNonce((n) => n + 1)}
+          onOpenOrder={(orderId) => {
+            const local = orders.find((o) => o.id === orderId);
+            if (local) {
+              setSelected(local);
+              setShowSettlementRequestQueue(false);
+              return;
+            }
+            const t = tokens?.accessToken;
+            if (!t) return;
+            api
+              .getOrder(t, orderId)
+              .then((r) => {
+                setSelected(r.order);
+                setShowSettlementRequestQueue(false);
+              })
+              .catch(() => alert('打开订单详情失败，请到列表搜索该订单号'));
+          }}
+        />
+      )}
+
       {/* 回收站（仅 ADMIN）：已软删订单表 + 每行恢复 */}
       {showRecycleBin && (
         <div
@@ -4652,6 +4713,15 @@ function OrderDrawer({
             order={o}
             onOrderUpdated={handleOrderUpdated}
             onDirtyChange={setNotesDirty}
+          />
+
+          {/* 议价申请：代理不能手填结算价，只能对本单提申请、运营确认后才生效 —— key 同 NotesSection
+              含补水态，补水完成后按权威 order 重新拉一次该单的申请列表。 */}
+          <SettlementRequestSection
+            key={`${o.id}:${hydrated ? 'h' : 'l'}`}
+            order={o}
+            role={role}
+            onOrderUpdated={handleOrderUpdated}
           />
 
           {/* ── 付款：付款情况卡 + 收款操作（相邻摆放，运营排序需求）── */}
@@ -9689,6 +9759,455 @@ function InvoiceFlagsSection({
         去程 / 回程按航段分别开票；翻为「已开」时会校验该班次开票上限。
       </p>
     </section>
+  );
+}
+
+// ── 议价申请（代理不能手填结算价；改走「提交议价申请 → 运营确认后生效」）───────────
+const SETTLEMENT_REQUEST_STATUS_LABEL: Record<SettlementRequestStatus, string> = {
+  PENDING: '待确认',
+  APPROVED: '已确认',
+  REJECTED: '已驳回',
+};
+
+function SettlementRequestStatusBadge({ status }: { status: SettlementRequestStatus }) {
+  const cls =
+    status === 'PENDING'
+      ? 'bg-amber-100 text-amber-700'
+      : status === 'APPROVED'
+        ? 'bg-emerald-100 text-emerald-700'
+        : 'bg-rose-100 text-rose-700';
+  return (
+    <span className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${cls}`}>
+      {SETTLEMENT_REQUEST_STATUS_LABEL[status]}
+    </span>
+  );
+}
+
+/**
+ * 订单详情里的议价申请区块。代理：看自己对本单提过的申请（全部状态）+ 没有待处理申请时给
+ * 提交表单。运营（ADMIN/STAFF）：待处理申请高亮卡片带确认/驳回，历史申请折叠。
+ * 其它角色（含未登录/CUSTOMER）不渲染——议价是代理与运营之间的口径，不对客户露出。
+ */
+function SettlementRequestSection({
+  order,
+  role,
+  onOrderUpdated,
+}: {
+  order: OrderSummary;
+  role?: string;
+  /** 运营确认成功后，用服务端返回的整单刷新抽屉 + 列表（与其它售后区块同一约定） */
+  onOrderUpdated?: (order: OrderSummary) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const confirm = useConfirm();
+  const isAgentUser = role === 'AGENT';
+  const isOpsUser = role === 'ADMIN' || role === 'STAFF';
+
+  const [requests, setRequests] = useState<SettlementRequest[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    if (!token) return () => {};
+    let cancelled = false;
+    setLoading(true);
+    setLoadError(null);
+    settlementRequestsApi
+      .listOrderSettlementRequests(token, order.id)
+      .then((r) => { if (!cancelled) setRequests(r.requests); })
+      .catch((e: unknown) => {
+        if (!cancelled) setLoadError(e instanceof ApiError ? e.message : '议价申请加载失败');
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [token, order.id]);
+  useEffect(() => load(), [load]);
+
+  // 当前应收占位：只给代理表单的输入框占位数字用（下单参考），不用来算差额——差额一律读后端
+  // 随每条申请一起下发的 currentTotalCny/diffCny（服务端按「确认那一刻」重算，前端自算会与
+  // 其它并发调价动作（改期费/补房差）脱节）。与「付款情况」卡同口径（effectivePayable 优先）。
+  const currentPayable = deriveBalance(order).payable;
+  // 申请人展示名：后端 requestedById 是原始 userId、没有解析成姓名；议价申请事实上只由订单
+  // 归属代理本人提交，直接用订单自己的 agent 名代表申请人（与订单列表导出同一取名口径）。
+  const orderAgentName = order.agent?.companyName?.trim() || order.agent?.contactName?.trim() || '—';
+
+  // 代理提交表单
+  const [amount, setAmount] = useState<number | null>(null);
+  const [note, setNote] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [submitError, setSubmitError] = useState<string | null>(null);
+  const submitRequest = async () => {
+    if (!token || submitting || amount === null) return;
+    setSubmitting(true);
+    setSubmitError(null);
+    try {
+      const r = await settlementRequestsApi.createSettlementRequest(token, order.id, {
+        requestedTotalCny: amount,
+        note: note.trim() || undefined,
+      });
+      setRequests((prev) => [r.request, ...prev]);
+      setAmount(null);
+      setNote('');
+    } catch (e: unknown) {
+      setSubmitError(e instanceof ApiError ? e.message : '提交失败，请稍后重试');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // 运营确认/驳回
+  const [decidingId, setDecidingId] = useState<string | null>(null);
+  const [decisionNoteById, setDecisionNoteById] = useState<Record<string, string>>({});
+  const decide = async (req: SettlementRequest, action: 'approve' | 'reject') => {
+    if (!token || decidingId) return;
+    const noteText = (decisionNoteById[req.id] ?? '').trim();
+    // 差额/当前应收读后端随申请下发的值（服务端在「确认那一刻」重算，比前端自算更权威）；
+    // 理论上 currentTotalCny/diffCny 只在订单已被删除等极端情形为 null，兜底显示「—」。
+    const requestedCny = Number(req.requestedTotalCny);
+    const currentCny = req.currentTotalCny !== null ? Number(req.currentTotalCny) : null;
+    const diffCny = req.diffCny !== null ? Number(req.diffCny) : null;
+    const confirmed = await confirm({
+      title: action === 'approve' ? '确认这条议价申请？' : '驳回这条议价申请？',
+      body:
+        action === 'approve'
+          ? `确认后订单结算总价将改为 ¥${requestedCny.toLocaleString('zh-CN')}` +
+            (currentCny !== null && diffCny !== null
+              ? `（当前应收 ¥${currentCny.toLocaleString('zh-CN')}，差额 ${diffCny >= 0 ? '+' : '−'}¥${Math.abs(diffCny).toLocaleString('zh-CN')}）。`
+              : '。')
+          : '驳回后订单价格不变，代理会看到驳回状态与备注。',
+      tone: action === 'approve' ? 'default' : 'danger',
+      confirmText: action === 'approve' ? '确认' : '驳回',
+      cancelText: '取消',
+    });
+    if (!confirmed) return;
+    setDecidingId(req.id);
+    try {
+      if (action === 'approve') {
+        const r = await settlementRequestsApi.approveSettlementRequest(token, req.id, noteText || undefined);
+        setRequests((prev) => prev.map((x) => (x.id === r.request.id ? r.request : x)));
+        // order 在差额为 0（应收已被别的操作调到申请价）时后端回 null——订单本就没变，不必刷新。
+        if (r.order) onOrderUpdated?.(r.order);
+      } else {
+        const r = await settlementRequestsApi.rejectSettlementRequest(token, req.id, noteText || undefined);
+        setRequests((prev) => prev.map((x) => (x.id === r.request.id ? r.request : x)));
+      }
+    } catch (e: unknown) {
+      alert(e instanceof ApiError ? e.message : '操作失败，请稍后重试');
+    } finally {
+      setDecidingId(null);
+    }
+  };
+
+  if (!isAgentUser && !isOpsUser) return null;
+
+  const sortedDesc = [...requests].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const pending = sortedDesc.filter((r) => r.status === 'PENDING');
+  const history = sortedDesc.filter((r) => r.status !== 'PENDING');
+
+  return (
+    <section className="space-y-2">
+      <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">议价申请</div>
+      {loading && requests.length === 0 && <div className="text-xs text-ink-muted">加载中…</div>}
+      {loadError && <div className="text-xs text-rose-600">{loadError}</div>}
+
+      {isOpsUser && pending.map((req) => {
+        // 展示值一律读后端下发的字符串金额（Decimal 序列化），Number() 转换后再格式化。
+        const requestedCny = Number(req.requestedTotalCny);
+        const currentCny = req.currentTotalCny !== null ? Number(req.currentTotalCny) : null;
+        const diffCny = req.diffCny !== null ? Number(req.diffCny) : null;
+        return (
+          <div key={req.id} className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm">
+            <div className="font-medium text-amber-900">
+              代理议价申请：申请 ¥{requestedCny.toLocaleString('zh-CN')}
+              {currentCny !== null && ` · 当前应收 ¥${currentCny.toLocaleString('zh-CN')}`}
+              {diffCny !== null && ` · 差额 ${diffCny >= 0 ? '+' : '−'}¥${Math.abs(diffCny).toLocaleString('zh-CN')}`}
+            </div>
+            <div className="mt-1 text-xs text-amber-700">
+              申请人：{orderAgentName} · {formatDateTimeSecCn(req.createdAt)}
+            </div>
+            {req.note && <div className="mt-1 text-xs text-amber-800">备注：{req.note}</div>}
+            <input
+              className="input mt-2 w-full text-xs"
+              placeholder="确认/驳回备注（选填）"
+              value={decisionNoteById[req.id] ?? ''}
+              onChange={(e) => setDecisionNoteById((prev) => ({ ...prev, [req.id]: e.target.value }))}
+              disabled={decidingId === req.id}
+            />
+            <div className="mt-2 flex gap-2">
+              <button
+                type="button"
+                className="btn-primary text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={decidingId === req.id}
+                onClick={() => void decide(req, 'approve')}
+              >
+                确认
+              </button>
+              <button
+                type="button"
+                className="btn-danger text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={decidingId === req.id}
+                onClick={() => void decide(req, 'reject')}
+              >
+                驳回
+              </button>
+            </div>
+          </div>
+        );
+      })}
+
+      {isAgentUser && sortedDesc.map((req) => (
+        <div key={req.id} className="rounded-xl border border-slate-200 bg-white p-3 text-sm">
+          <div className="flex items-center gap-2">
+            <SettlementRequestStatusBadge status={req.status} />
+            <span className="font-medium text-slate-800">¥{Number(req.requestedTotalCny).toLocaleString('zh-CN')}</span>
+            <span className="text-[11px] text-slate-400">{formatDateTimeSecCn(req.createdAt)}</span>
+          </div>
+          {req.note && <div className="mt-1 text-xs text-slate-600">备注：{req.note}</div>}
+          {req.status === 'REJECTED' && req.decisionNote && (
+            <div className="mt-1 text-xs text-rose-600">驳回原因：{req.decisionNote}</div>
+          )}
+          {req.status === 'APPROVED' && req.decisionNote && (
+            <div className="mt-1 text-xs text-emerald-700">确认备注：{req.decisionNote}</div>
+          )}
+          {req.status === 'PENDING' && (
+            <div className="mt-1 text-[11px] text-amber-600">等待运营确认，确认前不影响订单价格</div>
+          )}
+        </div>
+      ))}
+
+      {isAgentUser && pending.length === 0 && (
+        <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3 text-sm">
+          <div className="text-xs text-slate-500">本单想按别的价结算？提交申请，运营确认后才生效。</div>
+          <label className="mt-2 block text-xs text-slate-500">
+            申请结算总价（¥）
+            <NumberInput
+              className="input mt-1 w-full"
+              value={amount}
+              onChange={setAmount}
+              placeholder={`如 ${Math.round(currentPayable)}`}
+            />
+          </label>
+          <label className="mt-2 block text-xs text-slate-500">
+            备注（选填）
+            <input
+              className="input mt-1 w-full"
+              value={note}
+              maxLength={200}
+              onChange={(e) => setNote(e.target.value)}
+              placeholder="如：客人同业价 ¥1500，麻烦按此价结算"
+            />
+          </label>
+          {submitError && <div className="mt-1 text-xs text-rose-600">{submitError}</div>}
+          <button
+            type="button"
+            className="btn-primary mt-2 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+            disabled={submitting || amount === null}
+            onClick={() => void submitRequest()}
+          >
+            {submitting ? '提交中…' : '提交议价申请'}
+          </button>
+        </div>
+      )}
+
+      {isOpsUser && history.length > 0 && (
+        <details className="text-xs text-slate-500">
+          <summary className="cursor-pointer select-none">历史申请（{history.length}）</summary>
+          <div className="mt-1.5 space-y-1.5">
+            {history.map((req) => (
+              <div key={req.id} className="rounded-lg border border-slate-200 bg-white p-2">
+                <div className="flex items-center gap-2">
+                  <SettlementRequestStatusBadge status={req.status} />
+                  <span className="font-medium text-slate-700">¥{Number(req.requestedTotalCny).toLocaleString('zh-CN')}</span>
+                  <span className="text-slate-400">{formatDateTimeSecCn(req.createdAt)}</span>
+                </div>
+                <div className="mt-0.5 text-slate-500">申请人：{orderAgentName}</div>
+                {req.note && <div className="mt-0.5">申请备注：{req.note}</div>}
+                {req.decisionNote && (
+                  <div className="mt-0.5 text-slate-600">
+                    {req.status === 'REJECTED' ? '驳回原因' : '确认备注'}：{req.decisionNote}
+                  </div>
+                )}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+    </section>
+  );
+}
+
+/**
+ * 议价申请队列（ADMIN/STAFF；列表页工具栏「议价申请」按钮打开）—— 集中列出全部待处理申请，
+ * 逐行可直接确认/驳回，或点单号跳订单详情核对。确认/驳回成功后调 onDecided 让列表页刷新
+ * 待处理数徽标；打开抽屉走 onOpenOrder（页面自己决定用已加载订单还是补拉）。
+ */
+function SettlementRequestQueueModal({
+  onClose,
+  onDecided,
+  onOpenOrder,
+}: {
+  onClose: () => void;
+  onDecided?: () => void;
+  onOpenOrder: (orderId: string) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const confirm = useConfirm();
+
+  const [items, setItems] = useState<SettlementRequest[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+
+  const load = useCallback(() => {
+    if (!token) return;
+    setLoading(true);
+    setLoadError(null);
+    settlementRequestsApi
+      .listSettlementRequests(token, { status: 'PENDING', page: 1, pageSize: 50 })
+      .then((res) => {
+        setItems(res.requests);
+        setTotal(res.pagination.total);
+      })
+      .catch((e: unknown) => setLoadError(e instanceof ApiError ? e.message : '加载失败'))
+      .finally(() => setLoading(false));
+  }, [token]);
+  useEffect(() => { load(); }, [load]);
+
+  const [decidingId, setDecidingId] = useState<string | null>(null);
+  const [decisionNoteById, setDecisionNoteById] = useState<Record<string, string>>({});
+  const decide = async (item: SettlementRequest, action: 'approve' | 'reject') => {
+    if (!token || decidingId) return;
+    const noteText = (decisionNoteById[item.id] ?? '').trim();
+    // 金额字段是后端下发的字符串（Decimal 序列化），先转 number 再格式化/比较。
+    const requestedCny = Number(item.requestedTotalCny);
+    const currentCny = item.currentTotalCny !== null ? Number(item.currentTotalCny) : null;
+    const diffCny = item.diffCny !== null ? Number(item.diffCny) : null;
+    const confirmed = await confirm({
+      title: action === 'approve' ? '确认这条议价申请？' : '驳回这条议价申请？',
+      body:
+        action === 'approve'
+          ? `订单 ${item.orderNumber ?? item.orderId}：确认后结算总价将改为 ¥${requestedCny.toLocaleString('zh-CN')}` +
+            (currentCny !== null && diffCny !== null
+              ? `（当前应收 ¥${currentCny.toLocaleString('zh-CN')}，差额 ${diffCny >= 0 ? '+' : '−'}¥${Math.abs(diffCny).toLocaleString('zh-CN')}）。`
+              : '。')
+          : `订单 ${item.orderNumber ?? item.orderId}：驳回后订单价格不变，代理会看到驳回状态与备注。`,
+      tone: action === 'approve' ? 'default' : 'danger',
+      confirmText: action === 'approve' ? '确认' : '驳回',
+      cancelText: '取消',
+    });
+    if (!confirmed) return;
+    setDecidingId(item.id);
+    try {
+      if (action === 'approve') {
+        await settlementRequestsApi.approveSettlementRequest(token, item.id, noteText || undefined);
+      } else {
+        await settlementRequestsApi.rejectSettlementRequest(token, item.id, noteText || undefined);
+      }
+      setItems((prev) => prev.filter((x) => x.id !== item.id));
+      setTotal((n) => Math.max(0, n - 1));
+      onDecided?.();
+    } catch (e: unknown) {
+      alert(e instanceof ApiError ? e.message : '操作失败，请稍后重试');
+    } finally {
+      setDecidingId(null);
+    }
+  };
+
+  return (
+    <Modal open onClose={onClose} title={`议价申请 · 待处理 ${total}`} size="xl">
+      <div className="max-h-[70vh] overflow-auto px-5 py-4">
+        {loading && items.length === 0 && <div className="text-sm text-ink-muted">加载中…</div>}
+        {loadError && <div className="text-sm text-rose-600">{loadError}</div>}
+        {!loading && !loadError && items.length === 0 && (
+          <div className="text-sm text-ink-muted">当前没有待处理的议价申请。</div>
+        )}
+        {items.length > 0 && (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[860px] text-left text-sm">
+              <thead className="text-xs uppercase tracking-wide text-ink-muted">
+                <tr>
+                  <th className="pb-2 pr-3">订单号</th>
+                  <th className="pb-2 pr-3">代理</th>
+                  <th className="pb-2 pr-3">人数</th>
+                  <th className="pb-2 pr-3">申请价</th>
+                  <th className="pb-2 pr-3">当前应收</th>
+                  <th className="pb-2 pr-3">差额</th>
+                  <th className="pb-2 pr-3">申请人 / 时间</th>
+                  <th className="pb-2 pr-3">备注</th>
+                  <th className="pb-2 pr-3">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {items.map((item) => {
+                  // 金额字段是后端下发的字符串（Decimal 序列化），先转 number 再格式化。
+                  const requestedCny = Number(item.requestedTotalCny);
+                  const currentCny = item.currentTotalCny !== null ? Number(item.currentTotalCny) : null;
+                  const diffCny = item.diffCny !== null ? Number(item.diffCny) : null;
+                  return (
+                    <tr key={item.id} className="border-t border-slate-100 align-top">
+                      <td className="py-2 pr-3">
+                        <button
+                          type="button"
+                          className="font-mono text-xs font-medium text-brand hover:text-brand-dark"
+                          onClick={() => onOpenOrder(item.orderId)}
+                        >
+                          {item.orderNumber ?? item.orderId}
+                        </button>
+                      </td>
+                      <td className="py-2 pr-3 text-xs text-ink-soft">{item.agentName ?? '直客'}</td>
+                      <td className="py-2 pr-3 text-xs text-ink-soft">{item.passengerCount ?? '—'}</td>
+                      <td className="py-2 pr-3 text-xs font-medium text-ink">¥{requestedCny.toLocaleString('zh-CN')}</td>
+                      <td className="py-2 pr-3 text-xs text-ink-soft">{currentCny !== null ? `¥${currentCny.toLocaleString('zh-CN')}` : '—'}</td>
+                      <td className={`py-2 pr-3 text-xs font-medium ${diffCny === null ? 'text-ink-soft' : diffCny >= 0 ? 'text-emerald-700' : 'text-rose-600'}`}>
+                        {diffCny !== null ? `${diffCny >= 0 ? '+' : '−'}¥${Math.abs(diffCny).toLocaleString('zh-CN')}` : '—'}
+                      </td>
+                      <td className="py-2 pr-3 text-xs text-ink-soft">
+                        {/* 后端 requestedById 是原始 userId、未解析成姓名；议价申请只由订单归属代理
+                            本人提交，直接用「代理」列同一个 agentName 代表申请人。 */}
+                        {item.agentName ?? '直客'}
+                        <div className="text-[11px] text-slate-400">{formatDateTimeSecCn(item.createdAt)}</div>
+                      </td>
+                      <td className="py-2 pr-3 text-xs text-ink-soft">
+                        <div className="max-w-[160px] truncate" title={item.note ?? undefined}>{item.note ?? '—'}</div>
+                        <input
+                          className="input mt-1 w-36 text-[11px]"
+                          placeholder="确认/驳回备注"
+                          value={decisionNoteById[item.id] ?? ''}
+                          onChange={(e) => setDecisionNoteById((prev) => ({ ...prev, [item.id]: e.target.value }))}
+                          disabled={decidingId === item.id}
+                        />
+                      </td>
+                      <td className="py-2 pr-3">
+                        <div className="flex gap-1.5">
+                          <button
+                            type="button"
+                            className="btn-primary px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                            disabled={decidingId === item.id}
+                            onClick={() => void decide(item, 'approve')}
+                          >
+                            确认
+                          </button>
+                          <button
+                            type="button"
+                            className="btn-danger px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                            disabled={decidingId === item.id}
+                            onClick={() => void decide(item, 'reject')}
+                          >
+                            驳回
+                          </button>
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </Modal>
   );
 }
 

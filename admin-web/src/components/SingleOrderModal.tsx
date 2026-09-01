@@ -44,6 +44,7 @@ import {
   PRICE_ADJUSTMENT_REASON_LABEL,
   PRICE_ADJUSTMENT_REASON_OPTIONS,
   VISA_STATUS_LABEL,
+  settlementRequestsApi,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from './NumberInput';
@@ -384,6 +385,19 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 提交为 perPassengerSettlementCny（与 settlementTotalCny 互斥；开启时清空整单结算价）。
   // 服务端仍走差额模型落库（min 基准 + 按乘客 SETTLEMENT 差额行），不是手填行价的口子。
   const [perPaxSettlementOn, setPerPaxSettlementOn] = useState(false);
+
+  // ── 议价申请（仅 AGENT；不开手填结算价口子）──────────────────────────────
+  // 代理不能直接改结算价，只能对「本单」提交一个「想按这个价结算」的申请，运营确认后才生效；
+  // 不影响本次下单价格/流程——下单仍按系统结算价（或既有结算价日历）走，申请是下单成功后
+  // 额外挂一条 PENDING 记录。折叠默认收起，避免多数不议价的单也要看这一坨。
+  const [bargainRequestOpen, setBargainRequestOpen] = useState(false);
+  const [bargainRequestAmount, setBargainRequestAmount] = useState<number | null>(null);
+  const [bargainRequestNote, setBargainRequestNote] = useState('');
+  const [bargainRequestSubmitting, setBargainRequestSubmitting] = useState(false);
+  // 下单成功后议价申请的提交结果（订单已经建成，这里只是告知申请有没有递上去）。
+  const [bargainRequestResult, setBargainRequestResult] = useState<
+    { ok: true } | { ok: false; message: string } | null
+  >(null);
 
   // ── 产品目录（各区块共用一份，按本单用到的类型按需加载）──
   // hotels 里的星级随机池是哨兵项（见 poolOptionValue）——客人买「N 星随机」，
@@ -928,6 +942,20 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       ? '「按人填结算价」与「调整金额」不能同时填写（两者互斥）；请清空其中一个'
       : null;
 
+  // ── 议价申请派生（仅 AGENT）── 对照的「系统结算价」与页面头部金额同一口径（agentHeaderTotal）。
+  const bargainRequestDiff =
+    bargainRequestAmount !== null && agentHeaderTotal !== null
+      ? Math.round((bargainRequestAmount - agentHeaderTotal) * 100) / 100
+      : null;
+  const bargainRequestError =
+    bargainRequestAmount === null
+      ? null
+      : Number(bargainRequestAmount.toFixed(2)) !== bargainRequestAmount
+        ? '申请结算总价最多两位小数'
+        : bargainRequestAmount <= 0
+          ? '申请结算总价需大于 0'
+          : null;
+
   function setPassenger(i: number, patch: Partial<PassengerRow>): void {
     setPassengers((prev) => {
       const next = prev.map((r, idx) => (idx === i ? { ...r, ...patch } : r));
@@ -1455,6 +1483,12 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       return;
     }
 
+    // 议价申请：格式错误也阻断提交（订单还没建，让代理先把申请价填对，避免建单后申请再报错）。
+    if (bargainRequestError) {
+      setErr(bargainRequestError);
+      return;
+    }
+
     // 指定酒店星级 ≠ 套餐档次星级：block-with-override（此前只是琥珀色提醒，照样能提交，
     // 于是「四星档的单指到五星店」不声不响地过去，成本对不上账才被发现）。
     //   · 代理：一律拦下（服务端对 AGENT 直接 400，前端先把话说清楚，省一次必败提交）；
@@ -1592,6 +1626,32 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       setShowRooming(false);
       setIdemKey(makeIdemKey());
       onCreated();
+
+      // 议价申请：订单已经建成，这一步失败绝不能倒回去污染「录单成功」——单独 try/catch，
+      // 只落一个提交结果供成功页展示，不进外层 catch（那会误报「录单失败」）。
+      // 只在真填了申请价、且与系统结算价不同（对齐到分）时才提交；相等 = 后端也会 400，白提交一次。
+      if (isAgentUser && bargainRequestAmount !== null && !bargainRequestError) {
+        const sameAsSystem =
+          agentHeaderTotal !== null &&
+          Math.round((bargainRequestAmount - agentHeaderTotal) * 100) === 0;
+        if (!sameAsSystem) {
+          setBargainRequestSubmitting(true);
+          try {
+            await settlementRequestsApi.createSettlementRequest(token, res.order.id, {
+              requestedTotalCny: bargainRequestAmount,
+              note: bargainRequestNote.trim() || undefined,
+            });
+            setBargainRequestResult({ ok: true });
+          } catch (e: unknown) {
+            setBargainRequestResult({
+              ok: false,
+              message: e instanceof ApiError ? e.message : '提交失败，请稍后重试',
+            });
+          } finally {
+            setBargainRequestSubmitting(false);
+          }
+        }
+      }
     } catch (e: unknown) {
       setErr(e instanceof ApiError ? e.message : '录单失败');
     } finally {
@@ -1727,6 +1787,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     // 每人结算价数值随 setPassengers([emptyPassenger()]) 清空，这里只复位模式开关。
     setSettlementPrice(null);
     setPerPaxSettlementOn(false);
+    // 议价申请同款复位：金额/备注/折叠态/上一单的提交结果都不该带到下一单。
+    setBargainRequestOpen(false);
+    setBargainRequestAmount(null);
+    setBargainRequestNote('');
+    setBargainRequestResult(null);
   }
 
   const inputCls = 'mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm';
@@ -1749,6 +1814,21 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               <Icon name="check" size={14} /> 录单成功 · 订单号 <b className="font-mono">{okOrderNumber}</b>
               {roomingSaved && <span className="ml-2 text-emerald-700">· 分房已保存</span>}
             </div>
+
+            {/* 议价申请提交结果：订单已经建成，这里只是告知申请有没有递上去，不影响上面的成功状态。 */}
+            {bargainRequestSubmitting && (
+              <div className="rounded-md bg-slate-50 px-4 py-2 text-xs text-slate-500">议价申请提交中…</div>
+            )}
+            {bargainRequestResult?.ok === true && (
+              <div className="rounded-md bg-brand-50 px-4 py-2 text-xs text-brand-800">
+                <Icon name="check" size={12} /> 议价申请已提交，运营确认后结算价才会更新，可到订单详情查看进度。
+              </div>
+            )}
+            {bargainRequestResult?.ok === false && (
+              <div className="rounded-md bg-rose-50 px-4 py-2 text-xs text-rose-700">
+                订单已建立，议价申请提交失败：{bargainRequestResult.message}，可到订单详情里再提。
+              </div>
+            )}
 
             {/* 录单后分房：进入分房编辑器 */}
             {showRooming && roomingPassengers.length > 0 ? (
@@ -2842,6 +2922,66 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 </p>
               </div>}
             </div>
+
+            {/* 议价申请（仅 AGENT）：代理不能手填结算价，只能对本单提交「想按这个价结算」的申请，
+                运营确认后才生效；不影响本次下单——提交/不提交都不改变上面的结算价与下单流程。 */}
+            {isAgentUser && (
+              <div className="rounded-lg border border-slate-200 p-3">
+                <button
+                  type="button"
+                  className="flex w-full items-center justify-between text-left"
+                  onClick={() => setBargainRequestOpen((v) => !v)}
+                >
+                  <span className="text-sm font-medium text-slate-700">
+                    本单想按别的价结算？提交议价申请
+                  </span>
+                  <span className="text-xs text-slate-400">{bargainRequestOpen ? '收起 ▲' : '展开 ▼'}</span>
+                </button>
+                {bargainRequestOpen && (
+                  <div className="mt-2 space-y-2">
+                    <p className="text-[11px] text-slate-400">
+                      提交后不会改变本次下单的价格与流程，仍按上方结算价下单；运营确认这条申请后，订单结算价才会改成申请价。
+                    </p>
+                    <div className="flex items-center justify-between rounded-md bg-slate-50 px-2.5 py-1.5 text-xs text-slate-500">
+                      <span>当前结算价</span>
+                      <span className="font-medium text-slate-700">
+                        {agentHeaderTotal !== null ? `¥${agentHeaderTotal.toLocaleString('zh-CN')}` : '—'}
+                      </span>
+                    </div>
+                    <label className="block text-xs text-slate-500">
+                      申请结算总价（¥）
+                      <NumberInput
+                        className={inputCls}
+                        value={bargainRequestAmount}
+                        onChange={setBargainRequestAmount}
+                        placeholder={agentHeaderTotal !== null ? `如 ${Math.round(agentHeaderTotal)}` : '如 1500'}
+                      />
+                    </label>
+                    <label className="block text-xs text-slate-500">
+                      备注（选填）
+                      <input
+                        className={inputCls}
+                        value={bargainRequestNote}
+                        maxLength={200}
+                        onChange={(e) => setBargainRequestNote(e.target.value)}
+                        placeholder="如：客人同业价 ¥1500，麻烦按此价结算"
+                      />
+                    </label>
+                    {bargainRequestAmount !== null && !bargainRequestError && (
+                      <div className="flex items-center justify-between rounded-md bg-slate-50 px-2.5 py-1.5">
+                        <span className="text-xs text-slate-500">差额</span>
+                        <span className="text-xs font-medium text-slate-700">
+                          {bargainRequestDiff !== null
+                            ? `${bargainRequestDiff >= 0 ? '+' : '−'}¥${Math.abs(bargainRequestDiff).toLocaleString('zh-CN')}`
+                            : '结算价试算中/不可用，提交后由运营核实'}
+                        </span>
+                      </div>
+                    )}
+                    {bargainRequestError && <p className="text-[11px] text-rose-500">{bargainRequestError}</p>}
+                  </div>
+                )}
+              </div>
+            )}
 
             <div className="flex items-center justify-between border-t border-slate-200 pt-3">
               <span className="text-xs text-slate-500">

@@ -6244,3 +6244,119 @@ export const hotelControlOpsApi = {
       { token },
     ),
 };
+
+// ── 议价申请（代理不能手填结算价；改走「提交议价申请 → 运营确认后生效」）── 独立命名空间，
+// 不改动上方既有 `api` 对象字面量（并发改动风险，同 hotelControlOpsApi 一带的写法）。
+// 对应 backend/src/modules/settlement-requests/*（已核对实际服务端代码，口径以此为准，
+// 与本模块最初约定的契约有几处出入，均在下面各字段/方法注释里点明）：
+//   POST /orders/:id/settlement-requests           代理（或代提的运营）对该单提议价申请
+//   GET  /orders/:id/settlement-requests            该单的议价申请列表（代理只看自己 + 下级名下）
+//   GET  /settlement-requests?status&page&pageSize  待处理队列（ADMIN/STAFF；代理调用只回自己
+//                                                    + 下级名下的，当前前端未使用这条）
+//   POST /settlement-requests/:id/approve|reject    运营确认/驳回（ADMIN/STAFF）
+
+export type SettlementRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
+
+/**
+ * 议价申请 —— 详情页「本单申请列表」与运营待办队列共用同一份序列化形状（后端
+ * serializeSettlementRequest 一处出货，未按端点拆两种）。
+ *
+ * 金额字段是 Prisma Decimal 序列化出来的**字符串**（与订单其它金额字段同口径），
+ * 前端展示前一律先 `Number(...)` 再格式化，不能直接当 number 用。
+ */
+export interface SettlementRequest {
+  id: string;
+  orderId: string;
+  /** 订单号（订单被删/查不到时为 null，正常情况恒有值） */
+  orderNumber: string | null;
+  /** 归属代理 id；直客单（运营代提）为 null */
+  agentId: string | null;
+  /** 归属代理展示名（companyName 优先，无则 contactName）；直客单为 null */
+  agentName: string | null;
+  passengerCount: number | null;
+  /**
+   * 提交人 userId（代理本人，或代提的运营）—— 后端未解析成可读姓名（服务层字段就叫
+   * requestedById，没有 requestedByName）。前端展示「申请人」一律落回 agentName
+   * （议价申请事实上只由订单归属代理本人提交，agentName 已经代表「谁」）。
+   */
+  requestedById: string;
+  requestedTotalCny: string;
+  /** 提交时的应收快照（留痕；确认时后端按当下应收重算，不吃这份可能已过期的值） */
+  systemTotalCny: string;
+  /** 当前应收（后端用**当下**订单重算，可能已被别的调价动作改变；订单查不到时为 null） */
+  currentTotalCny: string | null;
+  /** = requestedTotalCny − currentTotalCny（订单查不到时为 null） */
+  diffCny: string | null;
+  note: string | null;
+  status: SettlementRequestStatus;
+  decidedById: string | null;
+  decidedAt: string | null;
+  decisionNote: string | null;
+  /** 确认后落的差额行 OrderItem id；差额为 0（应收已被别的操作调到申请价）不生成行，留空 */
+  appliedAdjustmentItemId: string | null;
+  createdAt: string;
+}
+
+function settlementRequestQuery(params?: {
+  status?: SettlementRequestStatus;
+  page?: number;
+  pageSize?: number;
+}): string {
+  const usp = new URLSearchParams();
+  if (params?.status) usp.set('status', params.status);
+  if (params?.page) usp.set('page', String(params.page));
+  if (params?.pageSize) usp.set('pageSize', String(params.pageSize));
+  const qs = usp.toString();
+  return qs ? `?${qs}` : '';
+}
+
+export const settlementRequestsApi = {
+  /** 代理对自家单提交议价申请（服务端校验归属自家；已有待处理申请 409；与当前应收相等 400）。 */
+  createSettlementRequest: (
+    token: string,
+    orderId: string,
+    body: { requestedTotalCny: number; note?: string },
+  ) =>
+    apiFetch<{ request: SettlementRequest }>(`/orders/${orderId}/settlement-requests`, {
+      method: 'POST',
+      token,
+      body,
+    }),
+
+  /** 该订单的议价申请列表（代理端只会看到自己 + 下级名下的，服务端按归属过滤）。 */
+  listOrderSettlementRequests: (token: string, orderId: string) =>
+    apiFetch<{ requests: SettlementRequest[] }>(`/orders/${orderId}/settlement-requests`, { token }),
+
+  /**
+   * 议价申请待处理队列（ADMIN/STAFF）；不传 status 则查全部状态。
+   * 响应信封为 `{ requests, pagination: { page, pageSize, total } }`（与 listOrderSettlementRequests
+   * 共用 requests 字段名；服务端 list() 原样透出 `{ requests, pagination }`，不是 `{ items, total }`）。
+   */
+  listSettlementRequests: (
+    token: string,
+    params?: { status?: SettlementRequestStatus; page?: number; pageSize?: number },
+  ) =>
+    apiFetch<{ requests: SettlementRequest[]; pagination: { page: number; pageSize: number; total: number } }>(
+      `/settlement-requests${settlementRequestQuery(params)}`,
+      { token },
+    ),
+
+  /**
+   * 运营确认：按申请价收敛订单结算总价（ADMIN/STAFF）。
+   * `order` 在差额为 0（应收已被别的操作调到申请价，无需再生成差额行）时为 **null**——
+   * 这种情况订单本就没变，调用方不必刷新；非 null 时用它就地刷新抽屉与列表。
+   */
+  approveSettlementRequest: (token: string, id: string, note?: string) =>
+    apiFetch<{ request: SettlementRequest; order: OrderSummary | null }>(
+      `/settlement-requests/${id}/approve`,
+      { method: 'POST', token, body: note ? { note } : {} },
+    ),
+
+  /** 运营驳回（ADMIN/STAFF），不改动订单价格（响应不带 order 字段）。 */
+  rejectSettlementRequest: (token: string, id: string, note?: string) =>
+    apiFetch<{ request: SettlementRequest }>(`/settlement-requests/${id}/reject`, {
+      method: 'POST',
+      token,
+      body: note ? { note } : {},
+    }),
+};
