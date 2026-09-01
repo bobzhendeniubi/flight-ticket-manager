@@ -335,6 +335,7 @@ model Agent {
   seatAllocations        SeatAllocation[]
   holdOrders             HoldOrder[]
   settlementDiscountRules SettlementDiscountRule[]
+  settlementRequests      SettlementRequest[]
 
   @@index([isActive])
   @@index([parentAgentId])
@@ -874,6 +875,54 @@ model OrderSplitRecord {
   @@unique([sourceOrderId, requestToken])
   @@index([sourceOrderId])
   @@index([targetOrderId])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 结算价议价申请 —— 代理提申请、运营确认后才生效
+//
+// 背景：代理录单只看结算价（日历自动取价），很多单最终价要人工谈。放开「代理直接手填结算价」
+// 等于让代理自己给自己打折，故不开这个口子：代理只能**提交一个想要的整单价**，落在这张表里；
+// 订单金额一分不动。运营确认时才由服务端走既有调价通道（addPriceAdjustment）生成一条差额行，
+// 服务端权威定价这条底线不破。
+//
+// 「同一订单同时只能有一条 PENDING」由迁移里手写的部分唯一索引兜底（Prisma @@unique 不支持
+// WHERE 子句，口径同 CancellationPolicy_one_default_per_kind）；应用层另有订单行锁 + 查重，
+// 用来回一个能读懂的 409，而不是把裸约束错误抛给前端。
+// ─────────────────────────────────────────────────────────────────────────────
+enum SettlementRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model SettlementRequest {
+  id                      String                  @id @default(cuid())
+  orderId                 String
+  // 归属代理；直客单（运营代提）为空
+  agentId                 String?
+  // 提交人 userId（代理账号本人，或代提的运营）
+  requestedById           String
+  // 代理申请的整单价（申请人希望这一单收多少）
+  requestedTotalCny       Decimal                 @db.Decimal(12, 2)
+  // 提交当时的应收快照（= Order.total + Order.adjustmentCny，与订单详情「应收」/尾款同口径）。
+  // 只作留痕：确认时一律按**确认那一刻**重读的应收重算差额，不吃这份可能已过期的快照。
+  systemTotalCny          Decimal                 @db.Decimal(12, 2)
+  // 申请理由（代理填）
+  note                    String?
+  status                  SettlementRequestStatus @default(PENDING)
+  // 决定人 userId / 时间 / 决定备注（确认或驳回都写）
+  decidedById             String?
+  decidedAt               DateTime?
+  decisionNote            String?
+  // 确认后由既有调价通道生成的差额行 OrderItem id；差额为 0 时不生成行，此列留空
+  appliedAdjustmentItemId String?
+  createdAt               DateTime                @default(now())
+
+  order Order  @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  agent Agent? @relation(fields: [agentId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@index([status, createdAt])
 }
 
 model HoldOrderConfig {
@@ -1533,6 +1582,7 @@ model Order {
   holdConversions   HoldConversionRecord[]
   splitsOut         OrderSplitRecord[]     @relation("SplitSource")
   splitsIn          OrderSplitRecord[]     @relation("SplitTarget")
+  settlementRequests SettlementRequest[]
 
   @@index([userId, createdAt])
   @@index([agentId, createdAt])

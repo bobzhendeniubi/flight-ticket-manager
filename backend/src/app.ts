@@ -39,6 +39,10 @@ import { reminderRoutes } from './modules/reminders/reminders.routes.js';
 import { financesRoutes } from './modules/finances/finances.routes.js';
 import { aiRoutes } from './modules/ai/ai.routes.js';
 import { reviewRoutes, orderReviewRoutes } from './modules/reviews/reviews.routes.js';
+import {
+  settlementRequestRoutes,
+  orderSettlementRequestRoutes,
+} from './modules/settlement-requests/settlement-requests.routes.js';
 import { marketingRoutes } from './modules/marketing/marketing.routes.js';
 import { ocrRoutes } from './modules/ocr/ocr.routes.js';
 import { settingsRoutes } from './modules/settings/settings.routes.js';
@@ -97,6 +101,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(agentRoutes, { prefix: '/agents' });
   await app.register(orderRoutes, { prefix: '/orders' });
   await app.register(orderReviewRoutes, { prefix: '/orders' });
+  await app.register(orderSettlementRequestRoutes, { prefix: '/orders' });
   await app.register(orderCostItemRoutes, { prefix: '/orders' });
   await app.register(seatLockRoutes, { prefix: '/seat-locks' });
   await app.register(seatAllocationRoutes, { prefix: '/seat-allocations' });
@@ -106,6 +111,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(settlementRoutes, { prefix: '/settlements' });
   await app.register(settlementRateRoutes, { prefix: '/settlement-rates' });
   await app.register(settlementDiscountRoutes, { prefix: '/settlement-discounts' });
+  await app.register(settlementRequestRoutes, { prefix: '/settlement-requests' });
   await app.register(flightSettlementRateRoutes, { prefix: '/flight-settlement-rates' });
   await app.register(productRoutes, { prefix: '/products' });
   await app.register(dashboardRoutes, { prefix: '/dashboard' });
