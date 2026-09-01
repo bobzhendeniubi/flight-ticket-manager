@@ -4718,7 +4718,7 @@ function OrderDrawer({
           {/* 议价申请：代理不能手填结算价，只能对本单提申请、运营确认后才生效 —— key 同 NotesSection
               含补水态，补水完成后按权威 order 重新拉一次该单的申请列表。 */}
           <SettlementRequestSection
-            key={`${o.id}:${hydrated ? 'h' : 'l'}`}
+            key={`${o.id}:sr:${hydrated ? 'h' : 'l'}`}
             order={o}
             role={role}
             onOrderUpdated={handleOrderUpdated}
