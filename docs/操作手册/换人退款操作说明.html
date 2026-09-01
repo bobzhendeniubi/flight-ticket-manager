@@ -1,0 +1,172 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>换人退款 操作说明 — 世途旅行·运营控制台</title>
+<style>
+  :root{
+    --indigo:#4F46E5; --indigo-dark:#4338CA; --indigo-50:#EEF2FF;
+    --ink:#0F172A; --ink-soft:#334155; --muted:#64748B;
+    --bg:#F1F5F9; --card:#FFFFFF; --line:#E2E8F0;
+    --amber-bg:#FFFBEB; --amber-line:#FDE68A;
+    --green:#059669; --green-bg:#ECFDF5;
+    --red-bg:#FEF2F2;
+    --blue-bg:#EFF6FF;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Inter','PingFang SC','Hiragino Sans GB','Microsoft YaHei',system-ui,-apple-system,sans-serif;color:var(--ink-soft);background:var(--bg);line-height:1.85;font-size:15px}
+  .page{max-width:900px;margin:0 auto;background:var(--card);padding:40px 44px 72px;box-shadow:0 0 24px rgba(15,23,42,.06)}
+  h1,h2,h3{color:var(--ink);line-height:1.35}
+  h1{font-size:26px;margin:0 0 6px}
+  h2{font-size:20px;margin:40px 0 12px;padding:10px 14px;background:var(--indigo-50);border-left:5px solid var(--indigo);border-radius:0 8px 8px 0}
+  h3{font-size:16.5px;margin:24px 0 8px;color:var(--indigo-dark)}
+  p{margin:10px 0}
+  .sub{color:var(--muted);font-size:13.5px;margin:0 0 4px}
+  .cover{border-bottom:3px solid var(--indigo);padding-bottom:18px;margin-bottom:22px}
+  .cover .brand{display:inline-block;background:var(--indigo);color:#fff;font-weight:700;font-size:13px;padding:3px 12px;border-radius:999px;letter-spacing:.5px;margin-bottom:12px}
+  .lead{font-size:15.5px;background:#F8FAFC;border:1px solid var(--line);border-radius:12px;padding:14px 18px;margin:16px 0}
+  ol.steps{counter-reset:st;list-style:none;padding-left:0;margin:10px 0}
+  ol.steps>li{counter-increment:st;position:relative;padding:4px 0 4px 40px;margin:10px 0}
+  ol.steps>li::before{content:counter(st);position:absolute;left:0;top:9px;width:26px;height:26px;border-radius:50%;background:var(--indigo);color:#fff;font-weight:700;font-size:13.5px;line-height:26px;text-align:center}
+  .tip,.warn,.info{border-radius:10px;padding:12px 16px;margin:14px 0;font-size:14.5px}
+  .tip{background:var(--green-bg);border:1px solid #A7F3D0}
+  .warn{background:var(--amber-bg);border:1px solid var(--amber-line)}
+  .info{background:var(--blue-bg);border:1px solid #BFDBFE}
+  .danger{background:var(--red-bg);border:1px solid #FECACA;border-radius:10px;padding:12px 16px;margin:14px 0;font-size:14.5px}
+  table.doc{width:100%;border-collapse:collapse;margin:14px 0;font-size:14px}
+  table.doc th{background:var(--indigo-50);color:var(--indigo-dark);text-align:left;padding:9px 11px;border:1px solid var(--line)}
+  table.doc td{padding:9px 11px;border:1px solid var(--line);vertical-align:top}
+  table.doc tr:nth-child(even) td{background:#FAFBFF}
+  .shot{margin:16px 0 6px;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
+  .shot img{display:block;width:100%}
+  .shot.tall{max-width:400px;margin-left:auto;margin-right:auto}
+  .cap{color:var(--muted);font-size:13px;margin:0 0 20px;text-align:center}
+  .money{border-collapse:collapse;width:100%;font-size:14.5px;margin:12px 0}
+  .money td{padding:9px 12px;border-bottom:1px solid var(--line)}
+  .money td:last-child{text-align:right;font-weight:700;color:var(--ink)}
+  .money tr:last-child td{border-bottom:none}
+  @media print{ body{background:#fff} .page{box-shadow:none;max-width:none;padding:0 8mm} h2{break-after:avoid} .shot{break-inside:avoid} table.doc{break-inside:avoid} }
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="cover">
+  <span class="brand">运营控制台</span>
+  <h1>换人退款 操作说明</h1>
+  <p class="sub">客人临时去不了、位子转让给别人时怎么在系统里走　·　2026-09-01</p>
+</div>
+
+<div class="lead">
+一句话：原来那张单扣一笔换人费，剩下的钱退给原来那位客人（财务核账时打款），
+接手的新客人另开一张单按当天价正常收。两张单在钱上完全分开。
+</div>
+
+<h2>一、什么时候用这个</h2>
+
+<p>客人下了单也付了钱，临时告诉你去不了，让你帮忙把位子代卖出去。找到接手的人之后，他按当天的价另开一张全新的单。</p>
+
+<p>公司对原来那位客人收一笔换人费，剩下的钱退给他。比如他当初交了一千，换人费扣四百五，就退五百五给他。</p>
+
+<div class="info">
+两张单是分开的。新客人那张单该收多少收多少，跟原单没有任何转账关系。原单退的钱是真的退给原客人，不是顶到新单上。
+</div>
+
+<div class="tip">
+如果只是同一个价、同一个代理，单纯把某位乘客换成另一个人，那不用走这条路——订单详情里每位乘客旁边的换人 / 编辑就够了，位子不动、单子也不关。
+</div>
+
+<h2>二、怎么操作</h2>
+
+<h3>第一步　打开原来那张单，找到付款那块</h3>
+
+<p>订单详情里往下拉到付款情况，已付 / 应收那张卡片下面就是换人退款。</p>
+
+<div class="shot"><img src="shots-2026-09-01-换人退款/01-入口.png"></div>
+<p class="cap">付款卡片里的换人退款入口</p>
+
+<p>按钮点不动的话，鼠标停上去会告诉你为什么，一般是这单已经取消或退过款了、这单没收到过钱、或者详情还没加载完。</p>
+
+<h3>第二步　填三样东西</h3>
+
+<div class="shot tall"><img src="shots-2026-09-01-换人退款/02-弹窗-未填.png"></div>
+<p class="cap">刚打开的样子</p>
+
+<table class="doc">
+  <tr><th style="width:150px">填什么</th><th>说明</th></tr>
+  <tr><td>换人费</td><td>这次扣多少，直接填数字。每单可以不一样，不收就填 0。</td></tr>
+  <tr><td>接手订单号</td><td>选填。新客人那张单的单号，只作记录用。新单还没录可以先空着，之后在订单详情里再补。</td></tr>
+  <tr><td>原因</td><td>写清楚怎么回事，这句话会留在单子备注里，以后谁来查都看得到。</td></tr>
+</table>
+
+<h3>第三步　看清楚数字再提交</h3>
+
+<p>填的时候它会当场把账算给你看：这单净收多少、扣掉多少换人费、最后退给客人多少。</p>
+
+<div class="shot tall"><img src="shots-2026-09-01-换人退款/03-填好-预览.png"></div>
+<p class="cap">净收一千、换人费四百五，退给客人五百五</p>
+
+<p>数字对了再点提交，还会再问你一次。</p>
+
+<h2>三、提交之后会怎样</h2>
+
+<table class="money">
+  <tr><td>原单状态</td><td>退款申请中</td></tr>
+  <tr><td>原单座位</td><td>当场放出来</td></tr>
+  <tr><td>钱什么时候到客人手上</td><td>等财务核账批准后打款，不是立刻</td></tr>
+  <tr><td>公司留下的</td><td>¥450，就是那笔换人费</td></tr>
+  <tr><td>新客人那张单</td><td>不受影响，照常收款</td></tr>
+</table>
+
+<div class="warn">
+这单的代理佣金会<strong>全部冲掉</strong>。换人费这笔钱不算佣金。
+</div>
+
+<div class="danger">
+提交之后座位就放出去了。要撤只能走退款驳回，客人的位子不一定还抢得回来，所以提交前把三行数字看清楚。
+</div>
+
+<h3>财务这边注意</h3>
+
+<p>退款那张卡片改过了。以前上面显示的金额是按退改规则当场算的，跟实际该打的钱可能对不上；现在直接显示这笔退款申请<strong>冻结的金额</strong>，那个才是该打的数，照着打就行。换人退款还会单独标出「换人费（不退）／应退」两行。</p>
+
+<h2>四、填不进去的几种情况</h2>
+
+<table class="doc">
+  <tr><th style="width:230px">情况</th><th>怎么办</th></tr>
+  <tr><td>换人费填得比净收款还多</td><td>不能超过这单实际收到的钱，改小一点。</td></tr>
+  <tr><td>这单没收到过钱</td><td>没钱可退，直接取消就行。</td></tr>
+  <tr><td>这单已经有一笔退款申请挂着</td><td>先把那笔处理完。</td></tr>
+  <tr><td>接手订单号填了但查无此单</td><td>核对一下单号，或者先留空、等新单录好再补。</td></tr>
+  <tr><td>接手订单号填成本单自己</td><td>填新客人那张单的号。</td></tr>
+</table>
+
+<p>换人费填得跟净收款一样多是<strong>允许</strong>的，意思是全扣、一分不退，界面会明确显示退给客人 ¥0。</p>
+
+<div class="shot tall"><img src="shots-2026-09-01-换人退款/04-换人费吃满全款.png"></div>
+<p class="cap">换人费吃满全款，退给客人显示 ¥0</p>
+
+<h2>五、以后怎么查</h2>
+
+<p>换人退的单跟客人自己要退的单，现在在系统里分得开：</p>
+
+<ol class="steps">
+  <li>订单列表里，换人退的单在状态旁边有一个<strong>换人</strong>小标签，鼠标停上去能看到换人费和接手单号。</li>
+  <li>订单 CSV 和财务那两张表都多了三列：<strong>退款类型</strong>（换人退款 / 普通退款）、<strong>换人费</strong>、<strong>接手订单号</strong>。</li>
+  <li>想统计一个月换了几个人、一共收了多少换人费，按退款类型筛一下就出来了。</li>
+</ol>
+
+<div class="info">
+几张名单表（全岗总表、票务、签证、进单统计）不受影响——那些表本来就不含已退款的单。
+</div>
+
+<p>被换掉的那位客人一直留在系统里，原单没有删，随时查得到。</p>
+
+<p style="margin-top:44px;color:#94A3B8;font-size:12.5px;border-top:1px solid #E2E8F0;padding-top:12px">
+世途旅行 · 运营控制台　|　换人退款操作说明　|　2026-09-01　|　文中金额与单号为演示数据
+</p>
+
+</div>
+</body>
+</html>
