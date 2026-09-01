@@ -133,10 +133,8 @@ const VISA_SHEET_COLUMNS: Array<{ header: string; key: string; width: number }> 
  * 同口径（fulfillment.service.ts 的 listByOrder 同样排除 visaExempt=true 的乘客）——
  * 送签表是签证岗拿去申请的名单，混入自备签客人只会让签证岗多余核对/误送签。
  *
- * 2026-08-31 起**护照图也一并排除**（见 buildPassportPhotoZip 的乘客循环）：签证岗反馈
- * 「自备签的这种签证台下载护照也不要有他，我们不需要」。原先只排名单不排图，导致同一个包里
- * 图比表多出一个人，签证岗每次都得回去确认是不是漏了。现在整个包统一按「要我方送签的人」口径，
- * 被排掉的人在 README.txt 里点名（不静默少人）。
+ * 送签表的这条排除口径**与包的 scope 无关**：不管谁下的包，这张表都是拿去递交的名单。
+ * 护照图排不排自备签则看 scope（见 buildPassportPhotoZip）。
  */
 async function buildVisaSheetBuffer(passengers: Passenger[]): Promise<Buffer> {
   // 出发日期 + 备注为订单级信息（全订单乘客共用）—— 只查一次；orderId 从未过滤的入参取，
@@ -211,23 +209,41 @@ export async function fetchPhoto(url: string): Promise<Buffer | null> {
   return fetchImageSafely(url);
 }
 
+/**
+ * 护照包的两种用途 —— **按入口分，不按人分**。
+ *
+ * 签证岗与操作岗在系统里都是 STAFF（UserRole 只有 CUSTOMER/AGENT/STAFF/ADMIN 四档），
+ * 服务端分不出谁是谁；同一个人也可能两种包都要。所以由**调用入口**声明要哪种包，
+ * 谁点哪个按钮就拿哪种，不必记自己是什么岗。
+ *
+ *   'visa' —— 送签包（签证台行内「下载护照」/ 勾选批量）：只含**要我方送签**的乘客，
+ *             自备签的人图和表都没有，被排掉的人在 README 点名。
+ *   'all'  —— 全员资料包（订单详情「打包护照」，默认）：护照图打包整单乘客。
+ *             包内送签表仍按送签口径排除自备签（2026-07-14 起如此，操作岗一直这么用）。
+ */
+export type PassportZipScope = 'visa' | 'all';
+
 export async function buildPassportPhotoZip(args: {
   orderNumber: string;
   passengers: Passenger[];
+  /** 省略 = 'all'（全员资料包），保持订单详情既有行为不变 */
+  scope?: PassportZipScope;
 }): Promise<Buffer> {
+  const scope: PassportZipScope = args.scope ?? 'all';
   const zip = new JSZip();
   const folder = zip.folder(args.orderNumber) ?? zip;
 
   const missing: string[] = [];
   const ok: string[] = [];
 
-  // 自备签乘客不进护照包（与包内送签表同口径）；名字仍写进 README，让签证岗看得见"这人是
-  // 自备签、不是漏了"。传给 buildVisaSheetBuffer 的仍是未过滤的入参（它自己再过滤，并靠
+  // scope='visa' 时自备签乘客不进护照包（与包内送签表同口径）；名字仍写进 README，
+  // 让签证岗看得见"这人是自备签、不是漏了"。scope='all' 照旧全员打包。
+  // 传给 buildVisaSheetBuffer 的**始终**是未过滤的入参（它自己按送签口径再过滤，并靠
   // 首个乘客拿订单上下文——全员自备签时也才查得到）。
   const exempted = args.passengers.filter((p) => p.visaExempt === true);
-  const sendable = args.passengers.filter((p) => p.visaExempt !== true);
+  const packable = scope === 'visa' ? args.passengers.filter((p) => p.visaExempt !== true) : args.passengers;
 
-  for (const p of sendable) {
+  for (const p of packable) {
     const slug = sanitize(`${p.lastName ?? ''}_${p.firstName ?? p.fullName}_${p.documentNumber}`);
     if (!p.passportPhotoUrl) {
       missing.push(`${slug}  — 该乘客没传护照照片`);
@@ -245,14 +261,16 @@ export async function buildPassportPhotoZip(args: {
   const readme = [
     `订单：${args.orderNumber}`,
     `打包时间：${businessDateTimeSec(new Date())}（北京时间）`,
+    `包类型：${scope === 'visa' ? '送签包（仅需我方送签的乘客）' : '全员资料包（整单乘客护照图）'}`,
     `乘客总数：${args.passengers.length}`,
-    `需我方送签：${sendable.length}`,
-    `自备签（不需送签，未打包）：${exempted.length}`,
+    ...(scope === 'visa'
+      ? [`需我方送签：${packable.length}`, `自备签（不需送签，未打包）：${exempted.length}`]
+      : [`其中自备签：${exempted.length}（护照图已打包；送签表按送签口径不含他们）`]),
     `成功打包：${ok.length}`,
     `缺失/失败：${missing.length}`,
     '',
     ...(ok.length ? ['✓ 已打包：', ...ok.map((s) => `  · ${s}`), ''] : []),
-    ...(exempted.length
+    ...(scope === 'visa' && exempted.length
       ? [
           '— 自备签，不需送签，未打包：',
           ...exempted.map(

@@ -4031,9 +4031,19 @@ export const api = {
     if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
     return res.blob();
   },
-  // 一键打包护照图片 zip
-  downloadPassportsZip: async (token: string, orderId: string): Promise<Blob> => {
-    const res = await fetch(`${API_BASE}/orders/${orderId}/passport-photos.zip`, {
+  /**
+   * 一键打包护照图片 zip。
+   * scope='visa'（签证台）= 送签包，自备签乘客的图和表都不含；
+   * 省略（订单详情）= 全员资料包，护照图打包整单乘客。按**入口**分，不按角色
+   * （签证岗/操作岗同为 STAFF，服务端分不出谁是谁）。
+   */
+  downloadPassportsZip: async (
+    token: string,
+    orderId: string,
+    scope?: 'visa',
+  ): Promise<Blob> => {
+    const qs = scope ? `?scope=${scope}` : '';
+    const res = await fetch(`${API_BASE}/orders/${orderId}/passport-photos.zip${qs}`, {
       headers: { Authorization: `Bearer ${token}` },
     });
     if (!res.ok) throw new ApiError(res.status, { code: 'ZIP_FAILED', message: await res.text() });

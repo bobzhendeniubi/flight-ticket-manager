@@ -62,7 +62,11 @@ import { businessDateISO } from '../../lib/business-time.js';
 import { computeCancellationQuote } from '../../lib/cancellation.js';
 import { BadRequestError } from '../../lib/errors.js';
 import { buildPnrWorkbook, pnrExportFilename, earliestFlightDeparture } from './pnr-export.js';
-import { buildPassportPhotoZip, passportZipFilename } from './passport-zip.js';
+import {
+  buildPassportPhotoZip,
+  passportZipFilename,
+  type PassportZipScope,
+} from './passport-zip.js';
 import { buildOrdersBySchedule, ordersExportFilename } from './orders.export.js';
 import {
   buildOrderTemplateExportWorkbook,
@@ -1003,6 +1007,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
     async (req, reply) => {
       const { id } = req.params as { id: string };
+      // 包类型按**入口**声明，不按角色（签证岗/操作岗同为 STAFF，服务端分不出谁是谁）：
+      // 签证台传 scope=visa 拿送签包（自备签的人图和表都不含）；订单详情不传 → 'all' 全员资料包。
+      // 非法/缺省一律落 'all'，绝不因为参数写错就悄悄少打包人。
+      const scope: PassportZipScope =
+        (req.query as { scope?: string } | undefined)?.scope === 'visa' ? 'visa' : 'all';
       const requester = await buildRequester(req.user.sub, req.user.role);
       const order = await service.getOrder(id, requester);
       // 出行人一律取 getOrder 已按角色脱敏的 order.passengers —— 绝不另起 prisma.passenger.findMany
@@ -1016,7 +1025,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           .status(400)
           .send({ error: '该订单暂无出行人信息，无法生成出行人资料表' });
       }
-      const zipBuf = await buildPassportPhotoZip({ orderNumber: order.orderNumber, passengers });
+      const zipBuf = await buildPassportPhotoZip({
+        orderNumber: order.orderNumber,
+        passengers,
+        scope,
+      });
 
       void writeAudit({
         actor: actorFromRequest(req),
@@ -1025,6 +1038,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         targetId: id,
         targetLabel: order.orderNumber,
         after: {
+          scope,
           passengerCount: passengers.length,
           photoCount: passengers.filter((p) => p.passportPhotoUrl).length,
         },

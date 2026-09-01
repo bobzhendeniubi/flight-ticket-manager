@@ -132,12 +132,11 @@ describe('extFromUrl', () => {
   });
 });
 
-describe('buildPassportPhotoZip — 自备签乘客整包排除（表与图口径统一）', () => {
-  // 自备签乘客（visaExempt=true）已自行办妥签证，不需要送签——与签证台
-  // fulfillment.service.ts 同口径。2026-08-31 起护照图**也一并排除**（签证岗口径：
-  // 自备签的人护照包里也不要有）：原先只排名单不排图，同一个包里图比表多一个人，
-  // 每次都得回头确认是不是漏人。被排掉的人写进 README.txt 点名，不静默少人。
-  it('自备签乘客既不出现在送签表，护照图也不打包，且 README 点名', async () => {
+describe('buildPassportPhotoZip — scope 决定护照图是否排自备签（按入口分，不按角色）', () => {
+  // 签证岗与操作岗同为 STAFF，服务端分不出谁是谁 → 由调用入口声明要哪种包：
+  //   scope='visa'（签证台）送签包：自备签的人图和表都不含，README 点名，不静默少人
+  //   省略/'all'（订单详情）全员资料包：护照图整单打包，送签表仍按送签口径排自备签
+  it('scope=visa：自备签乘客既不出现在送签表，护照图也不打包，且 README 点名', async () => {
     const orderNumber = 'FTM2026070800005';
     const passengers = [
       makePassenger({
@@ -152,7 +151,7 @@ describe('buildPassportPhotoZip — 自备签乘客整包排除（表与图口�
       makePassenger({ id: 'p2', fullName: 'LI SI', chineseName: '李四', visaExempt: false }),
     ];
 
-    const zipBuf = await buildPassportPhotoZip({ orderNumber, passengers });
+    const zipBuf = await buildPassportPhotoZip({ orderNumber, passengers, scope: 'visa' });
 
     // 送签表：只剩非自备签的「李四」
     const rows = await readVisaSheetRows(zipBuf, orderNumber);
@@ -171,7 +170,36 @@ describe('buildPassportPhotoZip — 自备签乘客整包排除（表与图口�
     expect(readme).toContain('ZHANG');
   });
 
-  it('全员自备签：不打包任何护照图，送签表为空，README 如实写明人数', async () => {
+  it('省略 scope（订单详情全员资料包）：自备签乘客的护照图照常打包，送签表仍不含他', async () => {
+    const orderNumber = 'FTM2026083100003';
+    const passengers = [
+      makePassenger({
+        id: 'p1',
+        fullName: 'ZHANG SAN',
+        chineseName: '张三',
+        visaExempt: true,
+        passportPhotoUrl: 'data:image/jpeg;base64,AQIDBA==',
+      }),
+      makePassenger({ id: 'p2', fullName: 'LI SI', chineseName: '李四', visaExempt: false }),
+    ];
+
+    // 不传 scope = 操作岗那个「打包护照」按钮的行为，必须与 2026-08-31 改动前逐字一致
+    const zipBuf = await buildPassportPhotoZip({ orderNumber, passengers });
+
+    const rows = await readVisaSheetRows(zipBuf, orderNumber);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]['中文名']).toBe('李四');
+
+    const zip = await JSZip.loadAsync(zipBuf);
+    expect(Object.keys(zip.files).some((n) => n.includes('ZHANG'))).toBe(true);
+
+    const readme = await zip.file(`${orderNumber}/README.txt`)!.async('string');
+    expect(readme).toContain('全员资料包');
+    // 全员包不写「未打包」名单——没人被排掉
+    expect(readme).not.toContain('自备签，不需送签，未打包');
+  });
+
+  it('scope=visa 全员自备签：不打包任何护照图，送签表为空，README 如实写明人数', async () => {
     const orderNumber = 'FTM2026083100001';
     const passengers = [
       makePassenger({
@@ -188,7 +216,7 @@ describe('buildPassportPhotoZip — 自备签乘客整包排除（表与图口�
       }),
     ];
 
-    const zipBuf = await buildPassportPhotoZip({ orderNumber, passengers });
+    const zipBuf = await buildPassportPhotoZip({ orderNumber, passengers, scope: 'visa' });
 
     expect(await readVisaSheetRows(zipBuf, orderNumber)).toHaveLength(0);
     const zip = await JSZip.loadAsync(zipBuf);

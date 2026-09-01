@@ -5,7 +5,7 @@
  *   GET   /fulfillment-tasks?type=VISA_APPLICATION&status=          任务列表（含 passengers[]）
  *   POST  /fulfillment-tasks/visa-passengers/batch-status          按人批量标记送签进度
  *   POST  /fulfillment-tasks/batch-notes                           批量改备注（部分失败返回 failures）
- *   GET   /orders/:id/passport-photos.zip                          下载护照包（送签用）
+ *   GET   /orders/:id/passport-photos.zip?scope=visa               下载护照包（送签用，排自备签）
  *
  * 交互要点（签证岗反馈）：
  *   · 乘客默认平铺展示（姓名 / 护照号 / 护照有效期 / 缺照徽标），不必逐单点开，避免漏/误点。
@@ -941,7 +941,9 @@ function OrderGroup({
     if (!orderId) return;
     setDownloading(true);
     try {
-      const blob = await api.downloadPassportsZip(token, orderId);
+      // 签证台一律拿「送签包」：自备签乘客的护照图和送签表行都不含（订单详情那个按钮
+      // 走同一接口但不传 scope → 全员资料包，两边互不影响）
+      const blob = await api.downloadPassportsZip(token, orderId, 'visa');
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
