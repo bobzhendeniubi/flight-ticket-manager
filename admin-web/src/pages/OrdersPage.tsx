@@ -3682,7 +3682,26 @@ export function OrdersPage() {
                   )}
                   {columnVisibility.amount && (
                   <td className="nums text-right font-medium text-ink">
-                    ¥{view.totalNum.toLocaleString()}
+                    {/* 应收口径（含售后费：改期费/换人费），与详情抽屉「应收」同源——
+                        只显示裸 total 会让改期后的单在列表上看着还是旧价（公测反馈）。
+                        有售后费时挂角标提醒，鼠标悬停见拆分。 */}
+                    {(() => {
+                      const bal = deriveBalance(order);
+                      return (
+                        <span
+                          title={
+                            bal.adjustment
+                              ? `订单价 ¥${bal.total.toLocaleString()} + 售后费 ¥${bal.adjustment.toLocaleString()}（改期/换人等）`
+                              : undefined
+                          }
+                        >
+                          ¥{bal.payable.toLocaleString()}
+                          {bal.adjustment ? (
+                            <span className="ml-0.5 align-top text-[10px] text-amber-600">含售后</span>
+                          ) : null}
+                        </span>
+                      );
+                    })()}
                   </td>
                   )}
                   {columnVisibility.balance && (
