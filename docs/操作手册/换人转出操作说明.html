@@ -1,0 +1,169 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>换人转出 操作说明 — 世途旅行·运营控制台</title>
+<style>
+  :root{
+    --indigo:#4F46E5; --indigo-dark:#4338CA; --indigo-50:#EEF2FF;
+    --ink:#0F172A; --ink-soft:#334155; --muted:#64748B;
+    --bg:#F1F5F9; --card:#FFFFFF; --line:#E2E8F0;
+    --amber:#D97706; --amber-bg:#FFFBEB; --amber-line:#FDE68A;
+    --green:#059669; --green-bg:#ECFDF5;
+    --red:#DC2626; --red-bg:#FEF2F2;
+    --blue:#2563EB; --blue-bg:#EFF6FF;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Inter','PingFang SC','Hiragino Sans GB','Microsoft YaHei',system-ui,-apple-system,sans-serif;color:var(--ink-soft);background:var(--bg);line-height:1.85;font-size:15px}
+  .page{max-width:900px;margin:0 auto;background:var(--card);padding:40px 44px 72px;box-shadow:0 0 24px rgba(15,23,42,.06)}
+  h1,h2,h3{color:var(--ink);line-height:1.35}
+  h1{font-size:26px;margin:0 0 6px}
+  h2{font-size:20px;margin:40px 0 12px;padding:10px 14px;background:var(--indigo-50);border-left:5px solid var(--indigo);border-radius:0 8px 8px 0}
+  h3{font-size:16.5px;margin:24px 0 8px;color:var(--indigo-dark)}
+  p{margin:10px 0}
+  .sub{color:var(--muted);font-size:13.5px;margin:0 0 4px}
+  .cover{border-bottom:3px solid var(--indigo);padding-bottom:18px;margin-bottom:22px}
+  .cover .brand{display:inline-block;background:var(--indigo);color:#fff;font-weight:700;font-size:13px;padding:3px 12px;border-radius:999px;letter-spacing:.5px;margin-bottom:12px}
+  .lead{font-size:15.5px;color:var(--ink-soft);background:#F8FAFC;border:1px solid var(--line);border-radius:12px;padding:14px 18px;margin:16px 0}
+  ol.steps{counter-reset:st;list-style:none;padding-left:0;margin:10px 0}
+  ol.steps>li{counter-increment:st;position:relative;padding:4px 0 4px 40px;margin:10px 0}
+  ol.steps>li::before{content:counter(st);position:absolute;left:0;top:9px;width:26px;height:26px;border-radius:50%;background:var(--indigo);color:#fff;font-weight:700;font-size:13.5px;line-height:26px;text-align:center}
+  .tip,.warn,.info{border-radius:10px;padding:12px 16px;margin:14px 0;font-size:14.5px}
+  .tip{background:var(--green-bg);border:1px solid #A7F3D0}
+  .warn{background:var(--amber-bg);border:1px solid var(--amber-line)}
+  .info{background:var(--blue-bg);border:1px solid #BFDBFE}
+  .danger{background:var(--red-bg);border:1px solid #FECACA;border-radius:10px;padding:12px 16px;margin:14px 0;font-size:14.5px}
+  table.doc{width:100%;border-collapse:collapse;margin:14px 0;font-size:14px}
+  table.doc th{background:var(--indigo-50);color:var(--indigo-dark);text-align:left;padding:9px 11px;border:1px solid var(--line)}
+  table.doc td{padding:9px 11px;border:1px solid var(--line);vertical-align:top}
+  table.doc tr:nth-child(even) td{background:#FAFBFF}
+  .shot{margin:16px 0 6px;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
+  .shot img{display:block;width:100%}
+  /* 弹窗那几张是竖长图，铺满宽度会一张吃掉一整页、把前面的正文挤出大片空白 —— 收窄居中 */
+  .shot.tall{max-width:400px;margin-left:auto;margin-right:auto}
+  .cap{color:var(--muted);font-size:13px;margin:0 0 20px;text-align:center}
+  .money{border-collapse:collapse;width:100%;font-size:14.5px;margin:12px 0}
+  .money td{padding:9px 12px;border-bottom:1px solid var(--line)}
+  .money td:last-child{text-align:right;font-weight:700;color:var(--ink)}
+  .money tr:last-child td{border-bottom:none}
+  @media print{ body{background:#fff} .page{box-shadow:none;max-width:none;padding:0 8mm} h2{break-after:avoid} .shot{break-inside:avoid} table.doc{break-inside:avoid} }
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="cover">
+  <span class="brand">运营控制台</span>
+  <h1>换人转出 操作说明</h1>
+  <p class="sub">客人临时去不了、位子转让给别人时怎么在系统里走　·　2026-09-01</p>
+</div>
+
+<div class="lead">
+一句话：客人不去了、位子让给别人，新客人另开一张单，原来那张单只留一笔换人费，剩下的钱直接顶到新单上，原单当场关掉、座位放出来。
+</div>
+
+<h2>一、什么时候用这个</h2>
+
+<p>就是之前说的那个情况。客人下了单也付了钱，临时告诉你去不了，让你帮忙把位子代卖出去。找到接手的人之后，他按当天的价另开一张全新的单。</p>
+
+<p>为什么不能直接在原单上把名字改掉——因为新客人多半不是同一个价，甚至可能不是同一个代理，硬套在原单上两边的账都是歪的。所以就是两张单：原单关掉留换人费，新单正常录。</p>
+
+<div class="info">
+如果只是同一个价、同一个代理，单纯把某位乘客换成另一个人，那不用走这条路，订单详情里每位乘客旁边的换人 / 编辑就够了，位子不动、单子也不关。
+</div>
+
+<h2>二、开始之前要有的东西</h2>
+
+<ol class="steps">
+  <li>新客人的那张单<strong>先录好</strong>，因为你要往里填它的单号。</li>
+  <li>新单的应收要<strong>装得下</strong>要转过去的钱。比如原单要转四千五过去，新单只卖三千，那就转不进去，得先把新单的价改对。</li>
+  <li>这次收多少换人费，心里有个数。每单可以不一样，系统不管你填多少。</li>
+</ol>
+
+<h2>三、怎么操作</h2>
+
+<h3>第一步　打开原来那张单，找到付款那块</h3>
+
+<p>订单详情里往下拉到付款情况，已付 / 应收那张卡片下面有一条黄色的提示，右边就是换人转出。</p>
+
+<div class="shot"><img src="shots-2026-09-01-换人转出/01-入口.png"></div>
+<p class="cap">付款卡片里的换人转出入口</p>
+
+<p>要是这个按钮点不动，鼠标停在上面它会告诉你为什么，一般就是这单已经取消了、退过款了，或者这单根本没收到钱。</p>
+
+<h3>第二步　填三样东西</h3>
+
+<div class="shot tall"><img src="shots-2026-09-01-换人转出/02-弹窗-未填.png"></div>
+<p class="cap">刚打开的样子</p>
+
+<table class="doc">
+  <tr><th style="width:150px">填什么</th><th>说明</th></tr>
+  <tr><td>转入订单号</td><td>钱要转到哪张单，填新客人那张单的单号。</td></tr>
+  <tr><td>换人费</td><td>这次收多少，直接填数字。每单可以不一样，不收就填 0。</td></tr>
+  <tr><td>原因</td><td>写清楚是怎么回事，这句话会同时留在两张单的备注里，以后谁来查都看得到。</td></tr>
+</table>
+
+<h3>第三步　看清楚数字再提交</h3>
+
+<p>填的时候它会当场把账算给你看。比如这单净收一千、换人费填四百五，它就显示这单留四百五、转出五百五十到那张单。</p>
+
+<div class="shot tall"><img src="shots-2026-09-01-换人转出/03-填好-预览.png"></div>
+<p class="cap">填好之后的样子，三行数字自己会跟着变</p>
+
+<p>数字对了再点确认，还会再问你一次。</p>
+
+<h2>四、提交之后账是怎么走的</h2>
+
+<p>拿上面那单举例，原单收了一千，换人费四百五：</p>
+
+<table class="money">
+  <tr><td>原单状态</td><td>已退款（单子还在，能查到）</td></tr>
+  <tr><td>原单座位</td><td>当场放出来</td></tr>
+  <tr><td>原单这一单的收入</td><td>¥450，就是那笔换人费</td></tr>
+  <tr><td>转到新单上的钱</td><td>¥550</td></tr>
+  <tr><td>要不要退现金给客人</td><td>不用，钱直接记到新单上了</td></tr>
+</table>
+
+<p>原单显示已退款，但钱并没有真的退出去，是转到新单上了。所以<strong>财务不用去打这笔款</strong>——退款记录里会写明白这笔已经转进哪张单、不要再打款。</p>
+
+<div class="warn">
+这单的代理佣金会<strong>全部冲掉</strong>。换人费这笔钱不算佣金。
+</div>
+
+<div class="danger">
+提交之后不能撤销。原单一旦关掉就回不去了，那笔转过去的钱也没法单独退回来。所以提交前一定把三行数字看清楚。
+</div>
+
+<h2>五、填不进去的几种情况</h2>
+
+<p>下面这几种它会直接拦住，屏幕上会告诉你为什么、该去哪儿弄，照着提示走就行。</p>
+
+<table class="doc">
+  <tr><th style="width:230px">情况</th><th>怎么办</th></tr>
+  <tr><td>换人费填得跟净收一样多，或者更多</td><td>那就没钱可转了，这种情况直接走退款，别走这条路。</td></tr>
+  <tr><td>新单的应收装不下要转的钱</td><td>先把新单的价改对，再回来转。</td></tr>
+  <tr><td>这单用过代理的预存余额抵扣</td><td>走不了这条路，走退款。余额那边是另一本账，混着走会出问题。</td></tr>
+  <tr><td>这单已经有一笔退款申请挂着</td><td>先把那笔退款处理完。</td></tr>
+  <tr><td>这单的收款被财务锁了</td><td>让财务先解锁。</td></tr>
+  <tr><td>新单已经取消 / 已退款</td><td>钱不能转进一张死单，换一张或者先恢复。</td></tr>
+</table>
+
+<div class="shot tall"><img src="shots-2026-09-01-换人转出/04-换人费过大-被拦.png"></div>
+<p class="cap">换人费填成跟净收一样多，整块标红、确认按钮点不动</p>
+
+<h2>六、几句提醒</h2>
+
+<p>转过去的那笔钱在新单上是一条正常的收款记录，但<strong>不能单独撤销</strong>。因为原单已经关掉了、账也封了，一旦把新单这笔撤掉，这笔钱两边都找不着。真要退，得整体重新处理，找技术。</p>
+
+<p>两张单的备注里都会自动留一行，写清楚哪天、转了多少、跟哪张单对着的、什么原因。以后对账翻出来能看明白。</p>
+
+<p>这个功能只有运营和管理员能用，代理自己看不到。</p>
+
+<p style="margin-top:44px;color:#94A3B8;font-size:12.5px;border-top:1px solid #E2E8F0;padding-top:12px">
+世途旅行 · 运营控制台　|　换人转出操作说明　|　2026-09-01　|　文中金额与单号为演示数据
+</p>
+
+</div>
+</body>
+</html>
