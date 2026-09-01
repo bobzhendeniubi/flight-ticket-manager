@@ -284,6 +284,40 @@ describe('serializeOrder · AGENT/CUSTOMER 视角（脱敏）', () => {
     expect(out.agent.companyName).toBe('某代理公司');
     expect(out.agent.settlementMode).toBe('MONTHLY');
   });
+
+  it('内部角色保留换人标记，但对外角色不下发换人标记或 Refund 内部操作人', () => {
+    const order = {
+      ...buildOrder(),
+      swapRefundedAt: new Date('2026-08-20T00:00:00.000Z'),
+      swapFeeCny: 450,
+      swapReplacementOrderNumber: 'ORDER-B',
+      refunds: [
+        {
+          id: 'refund-1',
+          gatewayPayload: {
+            swapRefund: true,
+            swapFeeCny: 450,
+            requestedBy: 'internal-user-id',
+          },
+        },
+      ],
+    };
+
+    const internal = serializeOrder(order, orderSerializeRoleCtx(UserRole.ADMIN)) as Record<string, any>;
+    expect(internal.swapRefundedAt).toEqual(order.swapRefundedAt);
+    expect(internal.swapFeeCny).toBe(450);
+    expect(internal.swapReplacementOrderNumber).toBe('ORDER-B');
+    expect(internal.refunds[0].gatewayPayload.swapRefund).toBe(true);
+    expect(internal.refunds[0].gatewayPayload.requestedBy).toBeUndefined();
+
+    for (const role of [UserRole.AGENT, UserRole.CUSTOMER]) {
+      const external = serializeOrder(order, orderSerializeRoleCtx(role)) as Record<string, any>;
+      expect(external.swapRefundedAt).toBeUndefined();
+      expect(external.swapFeeCny).toBeUndefined();
+      expect(external.swapReplacementOrderNumber).toBeUndefined();
+      expect(external.refunds[0].gatewayPayload.requestedBy).toBeUndefined();
+    }
+  });
 });
 
 // ── B2：派生结清口径纳入 prepaymentOffset（与 reports/reminders/导出全局清账公式一字一致）──

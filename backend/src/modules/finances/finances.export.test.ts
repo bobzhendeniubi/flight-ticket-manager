@@ -37,6 +37,9 @@ interface OrderFixture {
   prepaymentOffset: number;
   createdAt: Date;
   notes: string | null;
+  swapRefundedAt: Date | null;
+  swapFeeCny: number | null;
+  swapReplacementOrderNumber: string | null;
   agent: null;
   passengers: { id: string; fullName: string; lastName: string | null; firstName: string | null }[];
   costItems: unknown[];
@@ -56,6 +59,9 @@ function makeOrder(overrides: Partial<OrderFixture> & { orderNumber: string }): 
     prepaymentOffset: 0,
     createdAt: new Date('2026-01-05T00:00:00.000Z'),
     notes: null,
+    swapRefundedAt: null,
+    swapFeeCny: null,
+    swapReplacementOrderNumber: null,
     agent: null,
     passengers: [{ id: 'p1', fullName: '张三', lastName: null, firstName: null }],
     costItems: [],
@@ -201,5 +207,39 @@ describe('buildFinanceExportWorkbook — 已收净额扣已完成退款', () => 
     const ws = (await loadWorkbook(buf)).getWorksheet('财务核对收入明细')!;
 
     expect(ws.getRow(2).getCell(SETTLED_COL).value).toBe('是');
+  });
+});
+
+describe('buildFinanceExportWorkbook — 退款类型结构化列', () => {
+  it('换人退款、普通退款和非退款订单分别写入三列', async () => {
+    const orders = [
+      makeOrder({
+        orderNumber: 'FTM-SWAP',
+        status: 'REFUND_REQUESTED',
+        swapRefundedAt: new Date('2026-01-10T00:00:00.000Z'),
+        swapFeeCny: 450,
+        swapReplacementOrderNumber: 'FTM-NEW',
+      }),
+      makeOrder({ orderNumber: 'FTM-REFUND', status: 'REFUND_REQUESTED' }),
+      makeOrder({ orderNumber: 'FTM-PAID', status: 'PAID' }),
+    ];
+    const wb = await loadWorkbook(await buildFinanceExportWorkbook(RANGE, fakeClient(orders)));
+    const ws = wb.getWorksheet('财务核对收入明细')!;
+    const headers = ws.getRow(1).values as unknown[];
+    const col = (header: string): number => {
+      const index = headers.indexOf(header);
+      expect(index).toBeGreaterThan(0);
+      return index;
+    };
+    const refundTypeCol = col('退款类型');
+    const feeCol = col('换人费(元)');
+    const replacementCol = col('接手订单号');
+
+    expect(ws.getRow(2).getCell(refundTypeCol).value).toBe('换人退款');
+    expect(ws.getRow(2).getCell(feeCol).value).toBe(450);
+    expect(ws.getRow(2).getCell(replacementCol).value).toBe('FTM-NEW');
+    expect(ws.getRow(3).getCell(refundTypeCol).value).toBe('普通退款');
+    expect(ws.getRow(3).getCell(feeCol).value).toBe('');
+    expect(ws.getRow(4).getCell(refundTypeCol).value).toBe('');
   });
 });

@@ -765,6 +765,18 @@ export const updateStatusBodySchema = z.object({
 });
 export type UpdateStatusBody = z.infer<typeof updateStatusBodySchema>;
 
+export const swapRefundBodySchema = z.object({
+  swapFeeCny: z.number().int().min(0),
+  replacementOrderNumber: z.string().trim().max(64).optional(),
+  reason: z.string().trim().min(1, '请填写换人退款原因').max(500),
+});
+export type SwapRefundBody = z.infer<typeof swapRefundBodySchema>;
+
+export const updateSwapReplacementOrderBodySchema = z.object({
+  replacementOrderNumber: z.string().trim().max(64).nullable(),
+});
+export type UpdateSwapReplacementOrderBody = z.infer<typeof updateSwapReplacementOrderBodySchema>;
+
 // ── 批量状态流转（ADMIN/STAFF）──────────────────────────────────────────
 export const batchUpdateStatusBodySchema = z.object({
   ids: z.array(z.string().min(1)).min(1).max(100),

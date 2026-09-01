@@ -1473,6 +1473,12 @@ model Order {
   idempotencyKey       String?          @unique
   notes                String? // 客户填写的特殊说明（兼容保留：老的自由文本备注框）
   internalNotes        String? // 运营/客服内部备忘（客户看不到）
+  /// 换人退款标记：非空 = 这单是因为换人而退的（区别于客人自己要求的普通退票）
+  swapRefundedAt             DateTime?
+  /// 本次换人费（CNY 整数）：从净收款里扣下、不退给客人的那部分
+  swapFeeCny                 Int?
+  /// 接手这个位子的新订单号（选填，纯记录；不做外键，新单可能后补或被改）
+  swapReplacementOrderNumber String?
   // 订单级签证状态（录单时选择）
   visaStatus           VisaRequirement?
   // 结构化备注四栏（取代「一个框 + 手工排序」的老做法）；与 notes 并存，互不影响

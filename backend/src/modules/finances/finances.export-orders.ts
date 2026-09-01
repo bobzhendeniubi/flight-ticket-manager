@@ -26,6 +26,8 @@ const STATUS_LABEL: Record<string, string> = {
   CHANGED: '已改期',
 };
 
+const REFUND_FAMILY_STATUSES = new Set(['REFUND_REQUESTED', 'REFUNDED']);
+
 // 导出取全量（区间内所有订单，不受列表 100 条上限影响）——财务对账需完整数据
 const EXPORT_LIMIT = 100_000;
 
@@ -41,6 +43,9 @@ interface OrderExportRow {
   grossMarginCny: number | '';
   marginPct: number | ''; // 百分比数值（如 0.23 → 23%），缺成本 → 空
   missingCostItemCount: number;
+  refundType: string;
+  swapFeeCny: number | '';
+  replacementOrderNumber: string;
 }
 
 const COLUMNS: Array<{ header: string; key: keyof OrderExportRow; width: number }> = [
@@ -55,11 +60,17 @@ const COLUMNS: Array<{ header: string; key: keyof OrderExportRow; width: number 
   { header: '毛利(RMB)', key: 'grossMarginCny', width: 14 },
   { header: '毛利率', key: 'marginPct', width: 10 },
   { header: '缺成本项数', key: 'missingCostItemCount', width: 10 },
+  { header: '退款类型', key: 'refundType', width: 12 },
+  { header: '换人费(元)', key: 'swapFeeCny', width: 12 },
+  { header: '接手订单号', key: 'replacementOrderNumber', width: 20 },
 ];
 
 interface OrderMeta {
   agency: string;
   departDate: string;
+  swapRefundedAt: Date | null;
+  swapFeeCny: number | null;
+  swapReplacementOrderNumber: string | null;
 }
 
 interface DepartureLeg {
@@ -89,6 +100,9 @@ async function loadOrderMeta(
     where: { id: { in: orderIds } },
     select: {
       id: true,
+      swapRefundedAt: true,
+      swapFeeCny: true,
+      swapReplacementOrderNumber: true,
       agent: { select: { companyName: true, contactName: true } },
       items: {
         where: { kind: 'FLIGHT' },
@@ -105,9 +119,18 @@ async function loadOrderMeta(
     map.set(o.id, {
       agency: o.agent?.companyName ?? o.agent?.contactName ?? '直销',
       departDate: fmtDepartDate(departs[0]),
+      swapRefundedAt: o.swapRefundedAt,
+      swapFeeCny: o.swapFeeCny,
+      swapReplacementOrderNumber: o.swapReplacementOrderNumber,
     });
   }
   return map;
+}
+
+function refundType(status: string, swapRefundedAt: Date | null): string {
+  if (swapRefundedAt) return '换人退款';
+  if (REFUND_FAMILY_STATUSES.has(status)) return '普通退款';
+  return '';
 }
 
 function toExportRow(pnl: OrderPnlRow, meta: OrderMeta | undefined): OrderExportRow {
@@ -123,6 +146,9 @@ function toExportRow(pnl: OrderPnlRow, meta: OrderMeta | undefined): OrderExport
     grossMarginCny: pnl.grossMarginCny ?? '',
     marginPct: pnl.marginPct ?? '',
     missingCostItemCount: pnl.missingCostItemCount,
+    refundType: refundType(pnl.status, meta?.swapRefundedAt ?? null),
+    swapFeeCny: meta?.swapFeeCny ?? '',
+    replacementOrderNumber: meta?.swapReplacementOrderNumber ?? '',
   };
 }
 

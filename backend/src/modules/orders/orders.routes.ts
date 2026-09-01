@@ -49,6 +49,8 @@ import {
   splitOrderBodySchema,
   splitOrderPreviewBodySchema,
   splitRoomGroupBodySchema,
+  swapRefundBodySchema,
+  updateSwapReplacementOrderBodySchema,
   swapItemHotelBodySchema,
   swapPassengerBodySchema,
   setPassengerVisaExemptBodySchema,
@@ -554,6 +556,73 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       });
 
       return result;
+    },
+  );
+
+  /**
+   * POST /orders/:id/swap-refund
+   * 运营手填换人费发起退款申请；接手订单号只作记录，资金不在订单间转移。
+   */
+  app.post(
+    '/:id/swap-refund',
+    { preHandler: [app.authenticate] },
+    async (req) => {
+      const { id } = req.params as { id: string };
+      const body = swapRefundBodySchema.parse(req.body);
+      // 审计的 before.status 取业务方法执行前的快照；实际校验、金额计算和写入仍全部在 service 的事务内完成。
+      const before = await prisma.order.findUnique({ where: { id }, select: { status: true } });
+      const requester = await buildRequester(req.user.sub, req.user.role);
+      const result = await service.swapRefund(id, body, requester);
+
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'SWAP_REFUND_ORDER',
+        targetType: 'ORDER',
+        targetId: result.order.id,
+        targetLabel: result.order.orderNumber,
+        before: { status: before?.status ?? null, netPaidCny: result.netPaidCny },
+        after: {
+          swapFeeCny: result.swapFeeCny,
+          refundAmountCny: result.refundAmountCny,
+          replacementOrderNumber: result.order.swapReplacementOrderNumber ?? null,
+          reason: body.reason,
+        },
+        severity: 'WARNING',
+      });
+
+      return result;
+    },
+  );
+
+  /**
+   * PATCH /orders/:id/swap-replacement-order
+   * 补填/修改换人退款的接手订单号；只改源单记录，不发生资金动作。
+   */
+  app.patch(
+    '/:id/swap-replacement-order',
+    { preHandler: [app.authenticate] },
+    async (req) => {
+      const { id } = req.params as { id: string };
+      const body = updateSwapReplacementOrderBodySchema.parse(req.body);
+      const requester = await buildRequester(req.user.sub, req.user.role);
+      const result = await service.updateSwapReplacementOrderNumber(
+        id,
+        body.replacementOrderNumber,
+        requester,
+      );
+
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'UPDATE_SWAP_REPLACEMENT_ORDER',
+        targetType: 'ORDER',
+        targetId: result.order.id,
+        targetLabel: result.order.orderNumber,
+        before: { replacementOrderNumber: result.beforeReplacementOrderNumber },
+        after: { replacementOrderNumber: result.replacementOrderNumber },
+        severity: 'WARNING',
+      });
+
+      return { order: result.order };
     },
   );
 

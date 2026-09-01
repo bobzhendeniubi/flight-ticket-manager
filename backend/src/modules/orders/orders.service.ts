@@ -51,7 +51,8 @@ import {
   splitPassengerFullName,
 } from '../../lib/passenger-name.js';
 import { localHHMM, localDateISO, localToUtc } from '../../lib/flight-time.js';
-import { BUSINESS_TZ } from '../../lib/business-time.js';
+import { BUSINESS_TZ, businessDateTime } from '../../lib/business-time.js';
+import { CANCELLABLE_STATUSES } from '../../lib/cancellation.js';
 import {
   orderNeedsVisaTask,
   orderVisaStatusRequiresVisa,
@@ -5938,6 +5939,37 @@ export class OrderService {
     // 触发时 fail-closed：抛错回滚，Refund 留在 REQUESTED 等人工按最新口径重新报价，绝不擅自少退。
     // 转 REFUNDED 时需要在事务后半段回补的代理预存余额（口径见下方注释）。null = 无需回补。
     let prepaymentRestore: { agentId: string; amountCny: number } | null = null;
+    const rejectRequestedRefunds = async (): Promise<void> => {
+      let requestedRefunds: Array<{ gatewayPayload: Prisma.JsonValue }> = [];
+      if (order.status === OrderStatus.REFUND_REQUESTED) {
+        requestedRefunds = (await tx.refund.findMany({
+          where: { orderId: id, status: RefundStatus.REQUESTED },
+          select: { gatewayPayload: true },
+        })) ?? [];
+      }
+      await tx.refund.updateMany({
+        where: { orderId: id, status: 'REQUESTED' },
+        data: { status: 'REJECTED', processedAt: new Date() },
+      });
+
+      const hasSwapRefund = requestedRefunds.some((refund) => {
+        const payload = refund.gatewayPayload;
+        return payload !== null && typeof payload === 'object' && !Array.isArray(payload) &&
+          (payload as Record<string, unknown>).swapRefund === true;
+      });
+      if (hasSwapRefund) {
+        // 驳回后订单回到可处理状态，换人标记必须一并撤销，否则后续普通退款仍会被误标为换人退款。
+        await tx.order.update({
+          where: { id },
+          data: {
+            swapRefundedAt: null,
+            swapFeeCny: null,
+            swapReplacementOrderNumber: null,
+          },
+        });
+      }
+    };
+
     if (toStatus === 'REFUNDED') {
       // FOR UPDATE 行锁：与多付转存/挂账池/到账入账（均先对 Order 行 FOR UPDATE）串行——
       // 并发的多付处置要么排在本事务前（paidAmount 已降低 → 本断言拦下），
@@ -6433,20 +6465,14 @@ export class OrderService {
         }
       }
     } else if (toStatus === 'CANCELLED') {
-      await tx.refund.updateMany({
-        where: { orderId: id, status: 'REQUESTED' },
-        data: { status: 'REJECTED', processedAt: new Date() },
-      });
+      await rejectRequestedRefunds();
     } else if (order.status === 'REFUND_REQUESTED') {
       // 退款申请被拒 → 订单从 REFUND_REQUESTED 退回其它态（状态机允许 →PROCESSING；admin force 也可能
       // 拉到别处）。若不把停在 REQUESTED 的 Refund 置 REJECTED，会永久卡死：
       //   · requestCancellation 的幂等分支（order.refunds status=REQUESTED）会一直命中陈旧 Refund，
       //     客户再也无法发起新的取消申请；
       //   · 未来真退款时又会用这条陈旧快照算佣金冲销比例，账目错乱。
-      await tx.refund.updateMany({
-        where: { orderId: id, status: 'REQUESTED' },
-        data: { status: 'REJECTED', processedAt: new Date() },
-      });
+      await rejectRequestedRefunds();
     }
 
     // 履约任务终态化（取消族）：订单落 CANCELLED/REFUNDED/PAYMENT_TIMEOUT/FAILED 时，把该订单
@@ -7108,6 +7134,280 @@ export class OrderService {
     });
     // 申请取消是 AGENT/CUSTOMER 自助动作，返回订单按角色脱敏（与幂等分支同口径）。
     return { order: serializeOrder(finalOrder, orderSerializeRoleCtx(requester.role)), refund: result.refund, quote, isNew: true };
+  }
+
+  /**
+   * 换人退款：原订单只做一次退款申请，换人费由运营手填留存，其余净收款待财务批准后退回。
+   * 接手订单号只作审计记录，不能把任何 Payment 或 paidAmount 转到另一张订单。
+   */
+  async swapRefund(
+    orderId: string,
+    input: {
+      swapFeeCny: number;
+      replacementOrderNumber?: string;
+      reason: string;
+    },
+    requester: OrderRequester,
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    netPaidCny: number;
+    swapFeeCny: number;
+    refundAmountCny: number;
+    refundId: string;
+  }> {
+    if (requester.role !== UserRole.ADMIN && requester.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可做换人退款');
+    }
+    const reason = input.reason.trim();
+    if (!reason) throw new BadRequestError('请填写换人退款原因');
+
+    const pendingFulfillmentTaskIds: string[] = [];
+    const releasedSeatClassIds: string[] = [];
+
+    const result = await prisma.$transaction(async (tx) => {
+      // 订单锁必须先于金额读取和所有写入，避免并发收款/退款申请看到同一笔旧净收款。
+      const lockedRows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          orderNumber: string;
+          paidAmount: Prisma.Decimal;
+          status: OrderStatus;
+          deletedAt: Date | null;
+          internalNotes: string | null;
+        }>
+      >`
+        SELECT id, "orderNumber", "paidAmount", status, "deletedAt", "internalNotes"
+        FROM "Order"
+        WHERE id = ${orderId}
+        FOR UPDATE
+      `;
+      const locked = lockedRows[0];
+      if (!locked) throw new NotFoundError('订单不存在');
+
+      if (locked.deletedAt) {
+        throw new BadRequestError('订单在回收站（已软删），不可换人退款；如需操作请先恢复');
+      }
+      if (!SEAT_HOLDING_STATUSES.includes(locked.status)) {
+        throw new BadRequestError(
+          `订单当前不在占座中的有效状态（当前为「${zhStatus(locked.status)}」），仅占座中的有效订单可做换人退款；如需操作请先恢复订单`,
+        );
+      }
+      if (!CANCELLABLE_STATUSES.has(locked.status)) {
+        throw new BadRequestError(
+          `订单当前状态「${zhStatus(locked.status)}」不可做换人退款，仅有效的已支付/处理中/出票完成/改期申请中/已改期订单可操作；请按正常退款流程处理`,
+        );
+      }
+
+      const pendingRefund = await tx.refund.count({
+        where: {
+          orderId,
+          status: {
+            in: [RefundStatus.REQUESTED, RefundStatus.APPROVED, RefundStatus.PROCESSING],
+          },
+        },
+      });
+      if (pendingRefund > 0) {
+        throw new ConflictError('该订单已有待处理退款申请，请先处理该单待办退款申请后再做换人退款');
+      }
+
+      const refundedTotal = await sumCompletedRefundsWithinTx(tx, orderId);
+      const netPaidCny = round2(Number(locked.paidAmount.toString()) - refundedTotal);
+      if (netPaidCny <= 0) {
+        throw new BadRequestError(`该订单没有可退的已收款（净收款 ¥${netPaidCny.toFixed(2)}）`);
+      }
+      if (!Number.isInteger(input.swapFeeCny) || input.swapFeeCny < 0) {
+        throw new BadRequestError('换人费必须是大于等于 0 的整数 CNY');
+      }
+      if (input.swapFeeCny > netPaidCny) {
+        throw new BadRequestError(
+          `换人费 ¥${input.swapFeeCny.toFixed(2)} 超过净收款 ¥${netPaidCny.toFixed(2)}，请填写不超过净收款的金额`,
+        );
+      }
+      const refundAmountCny = round2(netPaidCny - input.swapFeeCny);
+
+      const replacementOrderNumber = input.replacementOrderNumber?.trim() || undefined;
+      if (replacementOrderNumber) {
+        const replacement = await tx.order.findUnique({
+          where: { orderNumber: replacementOrderNumber },
+          select: { id: true, deletedAt: true },
+        });
+        if (!replacement || replacement.deletedAt) {
+          throw new BadRequestError(
+            '填写的新订单号不存在，请核对；如果新单还没录，可以先留空，之后再补',
+          );
+        }
+        if (replacement.id === orderId) {
+          throw new BadRequestError('新订单号不能填本单自己');
+        }
+      }
+
+      const requestedAt = new Date();
+      const refundReason =
+        `换人退款（换人费 ¥${input.swapFeeCny}${replacementOrderNumber ? `，接手订单 ${replacementOrderNumber}` : ''}）：${reason}`;
+      const refund = await tx.refund.create({
+        data: {
+          orderId,
+          amount: new Prisma.Decimal(refundAmountCny),
+          reason: refundReason,
+          status: RefundStatus.REQUESTED,
+          // 不写 quoteSnapshot：换人费是售后罚金，佣金冲销按无快照的整单全额冲销。
+          gatewayPayload: {
+            swapRefund: true,
+            swapFeeCny: input.swapFeeCny,
+            netPaidCny,
+            refundAmountCny,
+            replacementOrderNumber: replacementOrderNumber ?? null,
+            requestedAt: requestedAt.toISOString(),
+          } as Prisma.InputJsonValue,
+        },
+      });
+
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          swapRefundedAt: requestedAt,
+          swapFeeCny: input.swapFeeCny,
+          swapReplacementOrderNumber: replacementOrderNumber ?? null,
+        },
+      });
+
+      await this._updateStatusWithinTx(
+        tx,
+        orderId,
+        OrderStatus.REFUND_REQUESTED,
+        requester,
+        reason,
+        pendingFulfillmentTaskIds,
+        undefined,
+        releasedSeatClassIds,
+      );
+
+      const noteLine =
+        `【换人退款】${businessDateTime(requestedAt)} 换人费 ¥${input.swapFeeCny}，应退 ¥${refundAmountCny}` +
+        `${replacementOrderNumber ? `，接手订单 ${replacementOrderNumber}` : ''}。原因：${reason}`;
+      const existingNotes = locked.internalNotes ?? '';
+      const internalNotes = existingNotes.trim() ? `${existingNotes}\n${noteLine}` : noteLine;
+      await tx.order.update({ where: { id: orderId }, data: { internalNotes } });
+
+      const order = await tx.order.findUniqueOrThrow({
+        where: { id: orderId },
+        include: ORDER_FULL_INCLUDE,
+      });
+      return { order, netPaidCny, refundAmountCny, refundId: refund.id };
+    });
+
+    // 事务提交后再入队，避免 worker / 候补检查在提交前读不到新状态和座位账。
+    if (pendingFulfillmentTaskIds.length > 0 && process.env.ENABLE_AUTO_FULFILLMENT === 'true') {
+      const { fulfillmentQueue } = await import('../../queues/queue.js');
+      for (const taskId of pendingFulfillmentTaskIds) {
+        void fulfillmentQueue.add('auto-fulfill', { taskId }, { jobId: taskId, delay: 1000 }).catch((e) => {
+          // eslint-disable-next-line no-console
+          console.error('[orders] failed to enqueue fulfillment task:', e);
+        });
+      }
+    }
+
+    // 换人退款会当场释放座位，也要清掉可能尚存的占座自动释放兜底任务。
+    try {
+      const { cancelSeatHoldRelease } = await import('../../queues/queue.js');
+      await cancelSeatHoldRelease(orderId);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('[orders] failed to cancel seat-hold job for', orderId, err);
+    }
+
+    if (releasedSeatClassIds.length > 0) {
+      try {
+        const { enqueueWaitlistCheck } = await import('../../queues/queue.js');
+        await Promise.all(
+          [...new Set(releasedSeatClassIds)].map((seatClassId) => enqueueWaitlistCheck(seatClassId)),
+        );
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[orders] failed to enqueue waitlist-check for', orderId, err);
+      }
+    }
+
+    return {
+      order: serializeOrder(result.order, orderSerializeRoleCtx(requester.role)),
+      netPaidCny: result.netPaidCny,
+      swapFeeCny: input.swapFeeCny,
+      refundAmountCny: result.refundAmountCny,
+      refundId: result.refundId,
+    };
+  }
+
+  /**
+   * 补填/修改换人退款接手订单号：只更新源订单的记录字段，不创建 Payment、不改任何订单的 paidAmount。
+   */
+  async updateSwapReplacementOrderNumber(
+    orderId: string,
+    replacementOrderNumber: string | null,
+    requester: OrderRequester,
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    beforeReplacementOrderNumber: string | null;
+    replacementOrderNumber: string | null;
+  }> {
+    if (requester.role !== UserRole.ADMIN && requester.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可补填接手订单号');
+    }
+
+    const normalizedReplacementOrderNumber = replacementOrderNumber?.trim() || null;
+    const result = await prisma.$transaction(async (tx) => {
+      const lockedRows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          orderNumber: string;
+          deletedAt: Date | null;
+          swapReplacementOrderNumber: string | null;
+        }>
+      >`
+        SELECT id, "orderNumber", "deletedAt", "swapReplacementOrderNumber"
+        FROM "Order"
+        WHERE id = ${orderId}
+        FOR UPDATE
+      `;
+      const locked = lockedRows[0];
+      if (!locked) throw new NotFoundError('订单不存在');
+      if (locked.deletedAt) {
+        throw new BadRequestError('订单在回收站（已软删），不可修改接手订单号；如需操作请先恢复');
+      }
+
+      if (normalizedReplacementOrderNumber) {
+        const replacement = await tx.order.findUnique({
+          where: { orderNumber: normalizedReplacementOrderNumber },
+          select: { id: true, deletedAt: true },
+        });
+        if (!replacement || replacement.deletedAt) {
+          throw new BadRequestError(
+            '填写的新订单号不存在，请核对；如果新单还没录，可以先留空，之后再补',
+          );
+        }
+        if (replacement.id === orderId) {
+          throw new BadRequestError('新订单号不能填本单自己');
+        }
+      }
+
+      await tx.order.update({
+        where: { id: orderId },
+        data: { swapReplacementOrderNumber: normalizedReplacementOrderNumber },
+      });
+      const order = await tx.order.findUniqueOrThrow({
+        where: { id: orderId },
+        include: ORDER_FULL_INCLUDE,
+      });
+      return {
+        order,
+        beforeReplacementOrderNumber: locked.swapReplacementOrderNumber,
+      };
+    });
+
+    return {
+      order: serializeOrder(result.order, orderSerializeRoleCtx(requester.role)),
+      beforeReplacementOrderNumber: result.beforeReplacementOrderNumber,
+      replacementOrderNumber: normalizedReplacementOrderNumber,
+    };
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -14186,6 +14486,8 @@ async function generateOrderNumber(): Promise<string> {
 // 注意：list() 和 get() 的 passengers select 不同，所以 serialize 用宽松类型
 // 只处理我们关心的 Decimal 字段 → string。其他字段原样透传。
 interface OrderLike {
+  id: string;
+  orderNumber: string;
   // 状态：serializeOrder 据此下发 allowedTransitions（状态机真源，前端不再手抄）。
   status: OrderStatus;
   subtotal: Prisma.Decimal;
@@ -14203,6 +14505,9 @@ interface OrderLike {
   //   内部备注 + 结构化四栏备注 + 出纳期望到账 + 售后审计流水 + 接单运营 + 运营待办。
   //   声明为可选是为了让 serializeOrder 能安全读取并按角色覆盖（listOrders/getOrder 都联查了这些）。
   internalNotes?: string | null;
+  swapRefundedAt?: Date | null;
+  swapFeeCny?: number | null;
+  swapReplacementOrderNumber?: string | null;
   noteHotel?: string | null;
   noteVisa?: string | null;
   notePayment?: string | null;
@@ -14229,6 +14534,9 @@ interface OrderLike {
     createdAt: Date;
     gatewayPayload?: Prisma.JsonValue;
   }>;
+  refunds?: Array<{
+    gatewayPayload?: Prisma.JsonValue;
+  } & Record<string, unknown>>;
   adjustments?: Prisma.JsonValue;
   claimedById?: string | null;
   claimedBy?: Record<string, unknown> | null;
@@ -14836,6 +15144,17 @@ function serializePaymentRecord(p: NonNullable<OrderLike['payments']>[number]): 
   };
 }
 
+/** 退款记录仍按既有形状透传，但移除不应进入订单响应的内部操作人 id。 */
+function serializeRefundRecord<T extends { gatewayPayload?: Prisma.JsonValue }>(refund: T): T {
+  const payload = refund.gatewayPayload;
+  if (payload === null || typeof payload !== 'object' || Array.isArray(payload)) return refund;
+  if (!Object.prototype.hasOwnProperty.call(payload, 'requestedBy')) return refund;
+  const safePayload = Object.fromEntries(
+    Object.entries(payload as Record<string, unknown>).filter(([key]) => key !== 'requestedBy'),
+  );
+  return { ...refund, gatewayPayload: safePayload as Prisma.JsonObject } as T;
+}
+
 // 导出供单测直接验证脱敏口径（redactForExternal）；运行时仍由本模块内部各读取/流转处调用。
 export function serializeOrder<T extends OrderLike>(
   order: T,
@@ -14891,6 +15210,9 @@ export function serializeOrder<T extends OrderLike>(
     total: order.total.toString(),
     paidAmount: order.paidAmount.toString(),
     prepaymentOffset: order.prepaymentOffset.toString(),
+    swapRefundedAt: redact ? undefined : (order.swapRefundedAt ?? null),
+    swapFeeCny: redact ? undefined : (order.swapFeeCny ?? null),
+    swapReplacementOrderNumber: redact ? undefined : (order.swapReplacementOrderNumber ?? null),
     // 售后费用派生口径（前端用 effectivePayable / balanceDue 取代「total − paidAmount」）
     adjustmentCny,
     effectivePayable: effectivePayable.toString(),
@@ -14953,6 +15275,9 @@ export function serializeOrder<T extends OrderLike>(
     claimedById: redact ? undefined : order.claimedById,
     claimedBy: redact ? undefined : order.claimedBy,
     reminders: redact ? [] : order.reminders,
+    ...(Array.isArray(order.refunds)
+      ? { refunds: order.refunds.map(serializeRefundRecord) }
+      : {}),
     // 出行人：客户/代理侧剥离 passportPhotoUrl 大图（详情响应瘦身），以 hasPassportPhoto
     // 布尔代替；后台详情保留大图（订单抽屉护照缩略图依赖）。窄 select 无该字段时原样透传。
     passengers: (order.passengers ?? []).map((p) =>

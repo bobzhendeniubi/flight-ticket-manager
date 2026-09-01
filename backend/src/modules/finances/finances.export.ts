@@ -66,6 +66,11 @@ const STATUS_LABEL: Record<string, string> = {
   CHANGED: '已改期',
 };
 
+const REFUND_FAMILY_STATUSES: Set<OrderStatus> = new Set([
+  OrderStatus.REFUND_REQUESTED,
+  OrderStatus.REFUNDED,
+]);
+
 interface FinanceRow {
   agency: string;
   orderNumber: string;
@@ -107,6 +112,9 @@ interface FinanceRow {
   totalCost: number;
   grossMargin: number;
   note: string;
+  refundType: string;
+  swapFeeCny: number | '';
+  replacementOrderNumber: string;
 }
 
 const COLUMNS: Array<{ header: string; key: keyof FinanceRow; width: number }> = [
@@ -150,6 +158,9 @@ const COLUMNS: Array<{ header: string; key: keyof FinanceRow; width: number }> =
   { header: '总成本', key: 'totalCost', width: 12 },
   { header: '毛利', key: 'grossMargin', width: 12 },
   { header: '备注', key: 'note', width: 20 },
+  { header: '退款类型', key: 'refundType', width: 12 },
+  { header: '换人费(元)', key: 'swapFeeCny', width: 12 },
+  { header: '接手订单号', key: 'replacementOrderNumber', width: 20 },
 ];
 
 function dec(v: Prisma.Decimal | number | null | undefined): number {
@@ -159,6 +170,12 @@ function dec(v: Prisma.Decimal | number | null | undefined): number {
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
+}
+
+function refundType(status: OrderStatus, swapRefundedAt: Date | null): string {
+  if (swapRefundedAt) return '换人退款';
+  if (REFUND_FAMILY_STATUSES.has(status)) return '普通退款';
+  return '';
 }
 
 function fmtDate(d: Date | null | undefined): string {
@@ -395,6 +412,9 @@ function orderToRows(order: OrderForExport, periodsMap: PeriodsMap): FinanceRow[
       totalCost: 0,
       grossMargin: 0,
       note: order.notes ?? '',
+      refundType: refundType(order.status, order.swapRefundedAt),
+      swapFeeCny: order.swapFeeCny ?? '',
+      replacementOrderNumber: order.swapReplacementOrderNumber ?? '',
     };
   });
 
