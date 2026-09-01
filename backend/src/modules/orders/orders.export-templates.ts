@@ -40,7 +40,7 @@ import { determineFlightLegs } from './ticketing-cap.js';
 import {
   parseRoomGroups,
   randomStarTierLabel,
-  resolveExportHotelInfo,
+  resolveExportHotelName,
 } from './orders.export-room-allocation.js';
 import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats.js';
 import type { TripStatsMap } from './orders.export-trip-stats.js';
@@ -248,7 +248,7 @@ interface OrderContext {
   paxCount: number;
   agency: string;
   notes: string;
-  // 酒店类型 = 酒店名 + 房型名；未落位的星级随机行 = 「X星随机（待落位）」
+  // 酒店类型 = 酒店名（0901 运营反馈：不拼房型）；未落位的星级随机行 = 「X星随机（待落位）」
   hotelInfo: string;
   hotelNames: string; // 酒店名称 = 各酒店名去重，' / ' 连接
   travelDates: string; // 'YYYY-MM-DD / YYYY-MM-DD'（单段只有一个日期）
@@ -306,21 +306,18 @@ export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
     orderType = kind ? ORDER_KIND_LABEL[kind] : '';
   }
 
-  // 酒店类型 = 酒店名 + 房型名。任何「关联了酒店房型」的订单行都算（不限 kind）：
-  // 套餐(BUNDLE)把房型盖在 BUNDLE 行上、无独立 HOTEL 行，只认 kind==='HOTEL' 会让
-  // 套餐单的酒店列整列空白（0720 公测反馈：导出缺酒店信息）。Set 去重防同名重复。
-  // 「星级随机」还没落到具体酒店的行（hotelRoomTypeId 为空、randomStarTier 非空）同样要出内容 ——
-  // 标「X星随机（待落位）」，与分房表共用同一文案（randomStarTierLabel），否则这类单的酒店列整列空白。
-  const hotelPartSet = new Set<string>();
+  // 酒店类型 = 酒店名（0901 运营反馈：这列只要酒店名，不要房型——房型走各表独立的「房型」列）。
+  // 任何「关联了酒店房型」的订单行都算（不限 kind）：套餐(BUNDLE)把房型盖在 BUNDLE 行上、
+  // 无独立 HOTEL 行，只认 kind==='HOTEL' 会让套餐单的酒店列整列空白（0720 公测反馈：导出缺酒店信息）。
+  // Set 去重防同名重复。「星级随机」还没落到具体酒店的行（hotelRoomTypeId 为空、randomStarTier
+  // 非空）同样要出内容 —— 标「X星随机（待落位）」，与分房表共用同一文案（randomStarTierLabel），
+  // 否则这类单的酒店列整列空白。
   const hotelNameSet = new Set<string>();
   for (const it of order.items) {
     if (it.hotelRoomType) {
-      hotelPartSet.add(`${it.hotelRoomType.hotel.name} ${it.hotelRoomType.name}`);
       hotelNameSet.add(it.hotelRoomType.hotel.name);
     } else if (it.randomStarTier != null) {
-      const pending = randomStarTierLabel(it.randomStarTier);
-      hotelPartSet.add(pending);
-      hotelNameSet.add(pending);
+      hotelNameSet.add(randomStarTierLabel(it.randomStarTier));
     }
   }
   const hotelNames = Array.from(hotelNameSet).join(' / ');
@@ -338,7 +335,7 @@ export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
     // 公司名可能是空串（历史空名代理）：trim + `||` 兜底到联系人名，双空才算直客。
     agency: order.agent?.companyName?.trim() || order.agent?.contactName?.trim() || '直客',
     notes: order.notes ?? '',
-    hotelInfo: Array.from(hotelPartSet).join(' + '),
+    hotelInfo: Array.from(hotelNameSet).join(' + '),
     hotelNames,
     travelDates,
     flightNumbers,
@@ -362,13 +359,14 @@ interface FullRow {
   isOriginalOrder: string; // 是否是原订单 — 暂无对应字段，留空
   agency: string; // 代理机构
   notes: string; // 备注
-  hotelInfo: string; // 酒店类型（酒店名 + 房型）
+  hotelInfo: string; // 酒店类型（仅酒店名，0901 运营反馈不拼房型）
   chineseName: string; // 中文名称
   passengerName: string; // 乘客姓名 LAST/FIRST + 称谓（航司口径）
   cleanName: string; // 纯拼音名 LAST/FIRST（无 MR/MS 称谓）— 财务对数/名单匹配用
-  // 飞行次数 = 该乘客的常旅客合计飞行次数（TravelerProfile.tripCount 快照，含老系统历史飞行（已去重、
-  // 退票不计），按档案全部证件号归拢，只计去程已起飞的行程）。与全岗总表/分房表同一取数与渲染入口（orders.export-trip-stats.ts），
-  // 同一位乘客在三张表里的数字必然相同；匹配不到档案（新客/证件号对不上）→ 留空，不臆造 0。
+  // 飞行次数 = 该乘客的合计飞行次数（新系统已飞 + 老系统历史飞行（已去重、退票不计），
+  // 按档案全部证件号归拢，只计去程已起飞的行程）。优先读 TravelerProfile.tripCount 快照，
+  // 快照没命中（刚下单的新客）→ 按证件号现算同口径的合计补上。与全岗总表/分房表同一取数与渲染入口
+  // （orders.export-trip-stats.ts），同一位乘客在三张表里的数字必然相同；只有证件号缺失/占位出行人才留空。
   flightCount: string;
   travelDates: string; // 出发(往返)日期
   flightNumbers: string; // 航班号
@@ -587,9 +585,10 @@ export function orderToFullRows(
     isOriginalOrder: '',
     agency: ctx.agency,
     notes,
-    // 酒店类型（乘客行级，0722 财务反馈）：优先该乘客分房组的酒店名+房型（房控排房结果，
-    // 房型也跟房控），无分房组 → 回退订单项口径 ctx.hotelInfo（现状值），绝不留空。
-    hotelInfo: resolveExportHotelInfo(group, ctx.hotelInfo),
+    // 酒店类型（乘客行级，0722 财务反馈；0901 运营反馈只出酒店名不拼房型）：
+    // 优先该乘客分房组的实际酒店（房控排房结果），无分房组 → 回退订单项口径 ctx.hotelInfo
+    // （现状值），绝不留空。
+    hotelInfo: resolveExportHotelName(group, ctx.hotelInfo),
     chineseName: p.chineseName ?? p.fullName,
     passengerName: nameWithTitle(p, departureDate),
     cleanName: pnrName(p),
@@ -776,9 +775,10 @@ export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext
     return {
     agency: ctx.agency,
     notes: ctx.notes,
-    // 酒店类型（乘客行级，0722 财务反馈）：优先该乘客分房组的酒店名+房型（房控），
-    // 无分房组 → 回退订单项口径 ctx.hotelInfo（现状值），绝不留空。
-    hotelInfo: resolveExportHotelInfo(group, ctx.hotelInfo),
+    // 酒店类型（乘客行级，0722 财务反馈；0901 运营反馈只出酒店名不拼房型）：
+    // 优先该乘客分房组的实际酒店（房控），无分房组 → 回退订单项口径 ctx.hotelInfo
+    // （现状值），绝不留空。
+    hotelInfo: resolveExportHotelName(group, ctx.hotelInfo),
     visaNote: '',
     settlePrice: ctx.settlePerPax,
     paidAmount: ctx.paidPerPax,

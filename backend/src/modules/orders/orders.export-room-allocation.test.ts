@@ -143,8 +143,8 @@ describe('buildRoomAllocationSheets', () => {
     const [r1, r2] = sheets[0].rows;
     expect(sheets[0].rows).toHaveLength(2);
     expect([r1.seq, r2.seq]).toEqual([1, 2]);
-    expect(r1.hotelType).toBe('A酒店 · 标准双床');
-    expect(r2.hotelType).toBe('B酒店 · 标准双床');
+    expect(r1.hotelType).toBe('A酒店');
+    expect(r2.hotelType).toBe('B酒店');
   });
 
   it('sheet 内行序 = 录入时间倒序（0830 公测反馈：新录的单在最上面，对齐旧系统导出）', () => {
@@ -246,7 +246,7 @@ describe('buildRoomAllocationSheets', () => {
     expect(r3.gender).toBe('');
     expect(r3.roomType).toBe('');
     expect(r3.notes).toBe('');
-    expect(r3.hotelType).toBe('C酒店 · 高级房');
+    expect(r3.hotelType).toBe('C酒店');
     // o2：total=1000，1 位乘客 → 人均 1000；录入时间取自己订单的 createdAt
     expect(r3.settlePrice).toBe(1000);
     expect(r3.enteredAt).toBe('2026-07-02 17:30:00');
@@ -574,10 +574,10 @@ describe('buildRoomAllocationSheets 多 item 订单（回归：曾经 item×乘�
 
     const byName = new Map(sheets[0].rows.map((r) => [r.chineseName, r]));
     // p1/p2 → 酒店X · 大床房；p3/p4 → 酒店Y · 双床房（不是 Frankenstein 组合）
-    expect(byName.get('客p1')?.hotelType).toBe('酒店X · 大床房');
-    expect(byName.get('客p2')?.hotelType).toBe('酒店X · 大床房');
-    expect(byName.get('客p3')?.hotelType).toBe('酒店Y · 双床房');
-    expect(byName.get('客p4')?.hotelType).toBe('酒店Y · 双床房');
+    expect(byName.get('客p1')?.hotelType).toBe('酒店X');
+    expect(byName.get('客p2')?.hotelType).toBe('酒店X');
+    expect(byName.get('客p3')?.hotelType).toBe('酒店Y');
+    expect(byName.get('客p4')?.hotelType).toBe('酒店Y');
 
     // 同组共号，且两家酒店各自独立编号
     expect(byName.get('客p1')?.roomNo).toBe('房1');
@@ -669,9 +669,9 @@ describe('buildRoomAllocationSheets 房组 orderItemId 归属（跨店订单精�
     expect(sheets.map((s) => s.name)).toEqual(['9-1', '9-2']);
     const rowX = sheets[0].rows[0];
     const rowY = sheets[1].rows[0];
-    expect(rowX.hotelType).toBe('酒店X · 大床房');
+    expect(rowX.hotelType).toBe('酒店X');
     // 归属命中：酒店名以行上 FK（酒店Y）为准，不用分房组的旧文本「旧酒店名」
-    expect(rowY.hotelType).toBe('酒店Y · 双床房');
+    expect(rowY.hotelType).toBe('酒店Y');
     // 归属命中 → 归属可信，当日余房照常取数（旧口径会因文本 ≠ FK 标「—」）
     expect(rowX.dailyRemaining).toBe('3');
     expect(rowY.dailyRemaining).toBe('5');
@@ -828,7 +828,7 @@ describe('buildRoomAllocationSheets — 星级随机未落位行', () => {
     expect(sheets).toHaveLength(1);
     const types = sheets[0].rows.map((r) => r.hotelType);
     expect(types).toContain('四星随机（待落位）');
-    expect(types).toContain('G酒店 · 双床');
+    expect(types).toContain('G酒店');
   });
 
   it('房控已人工排房（分房组填了真实酒店名）→ 跟房控走，不再标待落位', () => {
@@ -842,7 +842,7 @@ describe('buildRoomAllocationSheets — 星级随机未落位行', () => {
       }),
     ]);
 
-    expect(sheet.rows[0].hotelType).toBe('椰岛湾度假村 · 待落位');
+    expect(sheet.rows[0].hotelType).toBe('椰岛湾度假村');
     expect(sheet.rows[0].roomType).toBe('海景大床');
   });
 });

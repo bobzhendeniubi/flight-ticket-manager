@@ -252,8 +252,9 @@ export function parseRoomGroups(roomAssignment: unknown): RoomGroup[] {
 }
 
 /**
- * 导出「酒店中文名称」列（乘客行级）取数（0722 财务反馈：导出酒店名与房控实际数据相连，
- * 省去人工匹配客户入住酒店的步骤）。优先级：
+ * 导出「酒店」列（乘客行级）取数 —— 各表「酒店中文名称」/「酒店类型」列共用同一口径（0722
+ * 财务反馈：导出酒店名与房控实际数据相连，省去人工匹配客户入住酒店的步骤；0901 运营反馈：这些
+ * 列只出酒店名，不拼房型——房型走各表各自独立的「房型」列，不在此处重复）。优先级：
  *   1. 该乘客所在分房组的实际酒店 group.hotelName —— 房控人工排房结果（可能是自由文本），
  *      原样返回、不做匹配清洗（房控换过酒店时，导出跟房控走）；
  *   2. 无分房组 / 分房组没填酒店名 → 回退订单项酒店口径 fallbackHotelName（录单时选的房型所属
@@ -266,21 +267,6 @@ export function resolveExportHotelName(
 ): string {
   const fromRoomControl = group?.hotelName;
   return fromRoomControl && fromRoomControl.trim() ? fromRoomControl : fallbackHotelName;
-}
-
-/**
- * 导出「酒店类型」列（= 酒店名 + 房型，乘客行级）取数。与 resolveExportHotelName 同一优先级，
- * 但本列含房型：乘客在分房组内时，酒店名与房型**都**取分房组的（group.hotelName + group.roomType，
- * 房控排房结果，原样不清洗；组内房型为空则只出酒店名）；无分房组 / 分房组没填酒店名 → 回退订单项
- * 口径 fallbackHotelInfo（现状「酒店名 房型名」拼串），绝不留空。
- */
-export function resolveExportHotelInfo(
-  group: RoomGroup | undefined,
-  fallbackHotelInfo: string,
-): string {
-  const hotelName = group?.hotelName;
-  if (!hotelName || !hotelName.trim()) return fallbackHotelInfo;
-  return [hotelName, group?.roomType].filter((s): s is string => !!s && !!s.trim()).join(' ');
 }
 
 export type RoomItemForExport = Prisma.OrderItemGetPayload<{
@@ -503,8 +489,6 @@ export function buildRoomAllocationSheets(
       const fkHotelName = placement.hotelName;
       const hotelName =
         attributed && !placement.pending ? fkHotelName : group?.hotelName || fkHotelName;
-      // 未落位行仍按分房组酒店名归组（房控已人工排房时以房控为准），只有回落到随机档名时才算待落位
-      const pendingPlacement = placement.pending && !group?.hotelName;
       // 房型容量（未分房乘客打包用）；fixture/缺数据/未落位随机档回落 2 人/间
       const capacity = placement.capacity && placement.capacity > 0 ? placement.capacity : 2;
       const travelDates = flightDates.length > 0 ? flightDates.join(' / ') : checkInStr;
@@ -534,8 +518,9 @@ export function buildRoomAllocationSheets(
       const row: Omit<RoomAllocationRow, 'seq' | 'roomNo'> = {
         agency,
         notes,
-        // 未落位：「X星随机（待落位）」本身已说明酒店与房型都未定，不再拼「· 待落位」
-        hotelType: pendingPlacement ? hotelName : `${hotelName} · ${placement.roomTypeName}`,
+        // 酒店类型列只出酒店名（0901 运营反馈）；未落位时 hotelName 本身就是
+        // 「X星随机（待落位）」，房型另走独立的「房型」列（roomType，见下）。
+        hotelType: hotelName,
         chineseName: resolveChineseName(p),
         pnrName: pnrName(p),
         flightCount: flightCountCell(p, tripStats),

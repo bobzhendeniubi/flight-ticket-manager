@@ -488,8 +488,8 @@ describe('《全岗可用》full 模版 — 套餐单酒店/签证/备注取值'
   const order = fixtureBundle();
   const [r1] = orderToFullRows(order, buildOrderContext(order));
 
-  it('酒店类型：BUNDLE 行上的房型也算（酒店名 + 房型名）', () => {
-    expect(r1.hotelInfo).toBe('岘港五星 高级双床');
+  it('酒店类型：BUNDLE 行上关联的酒店也算，只出酒店名', () => {
+    expect(r1.hotelInfo).toBe('岘港五星');
   });
 
   it('签证状态：回落 BUNDLE 行上的签证履约任务', () => {
@@ -512,18 +512,18 @@ describe('《全岗可用》full 模版 — 套餐单酒店/签证/备注取值'
   });
 });
 
-// ── 酒店类型跟房控实际数据（0722 财务反馈）─────────────────────────────────────
-// 「酒店类型」列（酒店名 + 房型）改乘客行级：乘客在分房组内时酒店名与房型都跟房控排房结果，
-// 无分房组回退订单项口径 ctx.hotelInfo（现状值，绝不留空）。fixtureRoundTrip 订单项酒店=岘港四星 三床房。
+// ── 酒店类型跟房控实际数据（0722 财务反馈；0901 运营反馈只出酒店名不拼房型）─────────────
+// 「酒店类型」列（仅酒店名）改乘客行级：乘客在分房组内时酒店名跟房控排房结果，
+// 无分房组回退订单项口径 ctx.hotelInfo（现状值，绝不留空）。fixtureRoundTrip 订单项酒店=岘港四星（房型三床房，不出现在本列）。
 describe('《全岗可用》full 模版 — 酒店类型跟房控实际数据（乘客行级）', () => {
-  it('乘客有分房组 → 酒店类型取房控分房组酒店名+房型（房型也跟房控）；无分房组回退订单项', () => {
+  it('乘客有分房组 → 酒店类型取房控分房组酒店名；无分房组回退订单项酒店名', () => {
     const order = fixtureRoundTrip();
     (order as unknown as { roomAssignment: unknown }).roomAssignment = {
       roomGroups: [{ id: 'g1', hotelName: '岘港五星海景', roomType: '海景大床', passengerIds: ['p1'] }],
     };
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows[0].hotelInfo).toBe('岘港五星海景 海景大床'); // p1 跟房控
-    expect(rows[1].hotelInfo).toBe('岘港四星 三床房'); // p2 无分房组 → 回退订单项
+    expect(rows[0].hotelInfo).toBe('岘港五星海景'); // p1 跟房控
+    expect(rows[1].hotelInfo).toBe('岘港四星'); // p2 无分房组 → 回退订单项
   });
 
   it('分房组只填酒店名（房型空）→ 酒店类型只出酒店名，自由文本原样', () => {
@@ -538,26 +538,26 @@ describe('《全岗可用》full 模版 — 酒店类型跟房控实际数据（
   it('无分房组（roomAssignment=null）→ 回退订单项口径，绝不留空', () => {
     const order = fixtureRoundTrip();
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows[0].hotelInfo).toBe('岘港四星 三床房');
-    expect(rows[1].hotelInfo).toBe('岘港四星 三床房');
+    expect(rows[0].hotelInfo).toBe('岘港四星');
+    expect(rows[1].hotelInfo).toBe('岘港四星');
   });
 });
 
 describe('《签证专用》visa 行 — 酒店类型跟房控实际数据（乘客行级）', () => {
-  it('乘客有分房组 → 酒店类型取房控分房组酒店名+房型；无分房组回退订单项', () => {
+  it('乘客有分房组 → 酒店类型取房控分房组酒店名；无分房组回退订单项酒店名', () => {
     const order = fixtureRoundTrip();
     (order as unknown as { roomAssignment: unknown }).roomAssignment = {
       roomGroups: [{ id: 'g1', hotelName: '椰岛湾', roomType: '家庭房', passengerIds: ['p1'] }],
     };
     const rows = orderToVisaRows(order, buildOrderContext(order));
-    expect(rows[0].hotelInfo).toBe('椰岛湾 家庭房'); // p1 跟房控
-    expect(rows[1].hotelInfo).toBe('岘港四星 三床房'); // p2 无分房组 → 回退订单项
+    expect(rows[0].hotelInfo).toBe('椰岛湾'); // p1 跟房控
+    expect(rows[1].hotelInfo).toBe('岘港四星'); // p2 无分房组 → 回退订单项
   });
 
   it('无分房组 → 回退订单项口径，绝不留空', () => {
     const order = fixtureRoundTrip();
     const rows = orderToVisaRows(order, buildOrderContext(order));
-    expect(rows[0].hotelInfo).toBe('岘港四星 三床房');
+    expect(rows[0].hotelInfo).toBe('岘港四星');
   });
 });
 
@@ -610,7 +610,7 @@ describe('酒店类型列 — 星级随机未落位行', () => {
       roomGroups: [{ id: 'g1', hotelName: '椰岛湾', roomType: '家庭房', passengerIds: ['p1'] }],
     };
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows[0].hotelInfo).toBe('椰岛湾 家庭房'); // p1 跟房控
+    expect(rows[0].hotelInfo).toBe('椰岛湾'); // p1 跟房控
     expect(rows[1].hotelInfo).toBe('五星随机（待落位）'); // p2 无分房组 → 回退未落位标识
   });
 });
