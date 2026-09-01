@@ -6,7 +6,7 @@
  * GET    /orders/:id           详情
  * PATCH  /orders/:id/status    状态流转（ADMIN/STAFF；客户可取消待支付）
  */
-import type { FastifyPluginAsync } from 'fastify';
+import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { localDateISO } from '../../lib/flight-time.js';
 import { z } from 'zod';
 import { OrderItemKind, Prisma, UserRole, type Passenger } from '@prisma/client';
@@ -49,7 +49,8 @@ import {
   rescheduleItemHotelBodySchema,
   splitOrderBodySchema,
   splitOrderPreviewBodySchema,
-  cancelReturnLegBodySchema,
+  cancelLegBodySchema,
+  cancelLegPreviewBodySchema,
   splitRoomGroupBodySchema,
   swapRefundBodySchema,
   updateSwapReplacementOrderBodySchema,
@@ -2413,69 +2414,86 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     return service.splitOrder(id, body, { userId: req.user.sub, role });
   });
 
-  // ── 取消回程（partial cancellation；ADMIN/STAFF）────────────────────────────
-  // POST /orders/:id/cancel-return-leg/preview
-  //   只读预检：跑全部准入闸 + 按取消政策给回程行报价，返回 blockers（人话逐条）/
+  // ── 取消航段（partial cancellation；ADMIN/STAFF）────────────────────────────
+  // 往返单的客人只飞其中一段，另一段放回给系统继续销售：
+  //   leg=RETURN   取消回程 → 单去程单；leg=OUTBOUND 取消去程 → 单回程单。
+  // 老路径 /cancel-return-leg[/preview] 保留为 leg=RETURN 的别名（老前端与集成方不受影响）。
+  //
+  // POST /orders/:id/cancel-leg/preview   body: { leg? }
+  //   只读预检：跑全部准入闸 + 按取消政策给该航段行报价，返回 leg / blockers（人话逐条）/
   //   returnItem / policyFee / netReductionCny / overpayAfterCny，供运营在弹窗里逐条看。
+  const previewCancelLegHandler =
+    (fixedLeg?: 'OUTBOUND' | 'RETURN') =>
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      const role = req.user.role;
+      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+        return reply.status(403).send({ error: '仅运营/管理员可取消航段' });
+      }
+      const { id } = req.params as { id: string };
+      const leg = fixedLeg ?? cancelLegPreviewBodySchema.parse(req.body ?? {}).leg;
+      return service.previewCancelLeg(id, leg, { userId: req.user.sub, role });
+    };
+
+  app.post('/:id/cancel-leg/preview', { preHandler: [app.authenticate] }, previewCancelLegHandler());
   app.post(
     '/:id/cancel-return-leg/preview',
     { preHandler: [app.authenticate] },
-    async (req, reply) => {
-      const role = req.user.role;
-      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
-        return reply.status(403).send({ error: '仅运营/管理员可取消回程' });
-      }
-      const { id } = req.params as { id: string };
-      return service.previewCancelReturnLeg(id, { userId: req.user.sub, role });
-    },
+    previewCancelLegHandler('RETURN'),
   );
 
-  // POST /orders/:id/cancel-return-leg  body: { requestToken, feeMode, manualFeeCny?, overrideReason?, note? }
-  //   执行取消回程：回程座位放回库存、订单变单去程、手续费按取消政策（或带原因的手工覆盖）
+  // POST /orders/:id/cancel-leg  body: { requestToken, leg?, feeMode, manualFeeCny?, overrideReason?, note? }
+  //   执行取消航段：该段座位放回库存、订单变单程、手续费按取消政策（或带原因的手工覆盖）
   //   落一条调价行。服务端权威定价：请求体不接受「应退多少」，本端点也不打款——
   //   降完应收后的多收走既有多付/退款流程。幂等：同 (订单, requestToken) 重试只回放。
-  app.post('/:id/cancel-return-leg', { preHandler: [app.authenticate] }, async (req, reply) => {
-    const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
-      return reply.status(403).send({ error: '仅运营/管理员可取消回程' });
-    }
-    const { id } = req.params as { id: string };
-    const body = cancelReturnLegBodySchema.parse(req.body);
-    const { order, audit } = await service.cancelReturnLeg(id, body, {
-      userId: req.user.sub,
-      role,
-    });
+  const cancelLegHandler =
+    (fixedLeg?: 'OUTBOUND' | 'RETURN') =>
+    async (req: FastifyRequest, reply: FastifyReply) => {
+      const role = req.user.role;
+      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+        return reply.status(403).send({ error: '仅运营/管理员可取消航段' });
+      }
+      const { id } = req.params as { id: string };
+      const parsed = cancelLegBodySchema.parse(req.body);
+      const body = fixedLeg ? { ...parsed, leg: fixedLeg } : parsed;
+      const { order, audit } = await service.cancelLeg(id, body, {
+        userId: req.user.sub,
+        role,
+      });
 
-    void writeAudit({
-      actor: actorFromRequest(req),
-      action: 'CANCEL_RETURN_LEG',
-      targetType: 'ORDER',
-      targetId: id,
-      targetLabel: audit.orderNumber,
-      before: {
-        returnItemId: audit.returnItemId,
-        originalAmountCny: audit.originalAmountCny,
-        totalCny: audit.totalBefore,
-      },
-      after: {
-        feeCny: audit.feeCny,
-        feeMode: audit.feeMode,
-        policyName: audit.policyName,
-        // 手工覆盖取消政策是最需要事后复核的一步：原因原文进审计。
-        overrideReason: body.overrideReason ?? null,
-        note: body.note ?? null,
-        releasedSeats: audit.releasedSeats,
-        netReductionCny: audit.netReductionCny,
-        totalCny: audit.totalAfter,
-        overpayAfterCny: audit.overpayAfterCny,
-        replayed: audit.replayed,
-      },
-      // 手工覆盖服务端政策报价 = 人为改动金额，按最高等级留痕；按政策走记 WARNING。
-      severity: audit.feeMode === 'MANUAL' ? 'CRITICAL' : 'WARNING',
-    });
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: audit.leg === 'OUTBOUND' ? 'CANCEL_OUTBOUND_LEG' : 'CANCEL_RETURN_LEG',
+        targetType: 'ORDER',
+        targetId: id,
+        targetLabel: audit.orderNumber,
+        before: {
+          returnItemId: audit.returnItemId,
+          originalAmountCny: audit.originalAmountCny,
+          totalCny: audit.totalBefore,
+        },
+        after: {
+          leg: audit.leg,
+          feeCny: audit.feeCny,
+          feeMode: audit.feeMode,
+          policyName: audit.policyName,
+          // 手工覆盖取消政策是最需要事后复核的一步：原因原文进审计。
+          overrideReason: body.overrideReason ?? null,
+          note: body.note ?? null,
+          releasedSeats: audit.releasedSeats,
+          netReductionCny: audit.netReductionCny,
+          totalCny: audit.totalAfter,
+          overpayAfterCny: audit.overpayAfterCny,
+          replayed: audit.replayed,
+        },
+        // 手工覆盖服务端政策报价 = 人为改动金额，按最高等级留痕；按政策走记 WARNING。
+        severity: audit.feeMode === 'MANUAL' ? 'CRITICAL' : 'WARNING',
+      });
 
-    return { order, audit };
-  });
+      return { order, audit };
+    };
+
+  app.post('/:id/cancel-leg', { preHandler: [app.authenticate] }, cancelLegHandler());
+  app.post('/:id/cancel-return-leg', { preHandler: [app.authenticate] }, cancelLegHandler('RETURN'));
 
   // ── 按人改期（ADMIN/STAFF）────────────────────────────────────────────────
   // POST /orders/:id/reschedule-passengers

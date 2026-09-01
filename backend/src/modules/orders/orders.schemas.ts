@@ -56,9 +56,11 @@ export const PRICE_ADJUSTMENT_REASON_ENDPOINT_ONLY = [
   // 代理结算价：录单填「本单结算总价」（settlementTotalCny）时由系统按「结算价 − 权威合计」
   // 自动生成的差额行。**只能系统生成**，不进人工调价下拉（PRICE_ADJUSTMENT_REASON 不含它）。
   'SETTLEMENT',
-  // 取消回程手续费：由「取消回程」端点（POST /orders/:id/cancel-return-leg）按取消政策
-  // （或带原因的手工覆盖）生成。**只能系统生成**，不进人工调价下拉。
+  // 取消航段手续费：由「取消航段」端点（POST /orders/:id/cancel-leg）按取消政策
+  // （或带原因的手工覆盖）生成。去程/回程各一个码，好让行 label 直接说清取消的是哪一段。
+  // **只能系统生成**，不进人工调价下拉。
   'RETURN_LEG_CANCEL_FEE',
+  'OUTBOUND_LEG_CANCEL_FEE',
 ] as const;
 
 export type PriceAdjustmentReasonDisplay =
@@ -77,6 +79,7 @@ export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReasonDisplay,
   ROOM_DIFF: '补收单房差',
   SETTLEMENT: '代理结算价',
   RETURN_LEG_CANCEL_FEE: '取消回程手续费',
+  OUTBOUND_LEG_CANCEL_FEE: '取消去程手续费',
 };
 
 // 调价金额校验（录单调价与「按乘客/整单事后调价」共用同一口径，避免两处漂移）：
@@ -1339,20 +1342,33 @@ export const splitOrderBodySchema = z.object({
 });
 export type SplitOrderBody = z.infer<typeof splitOrderBodySchema>;
 
-// ── 取消回程（POST /orders/:id/cancel-return-leg；ADMIN/STAFF）────────────────────
-// 场景：往返单（含套餐单）的客人只飞去程，回程不要了 —— 按航司/包机行业标准的
-// 「取消航段（partial cancellation）」处理：回程座位放回库存重卖、订单变单去程、
+// ── 取消航段（POST /orders/:id/cancel-leg；ADMIN/STAFF）──────────────────────────
+// 场景：往返单（含套餐单）的客人只飞其中一段 —— 另一段不要了。按航司/包机行业标准的
+// 「取消航段（partial cancellation）」处理：被取消那一段的座位放回库存重卖、订单变单程、
 // 手续费按取消政策计算。
+//   leg=RETURN   取消回程，保留去程 → 单去程单（老路径 /cancel-return-leg 即此语义）；
+//   leg=OUTBOUND 取消去程，保留回程 → 单回程单（客人去程 noshow、只留回程的场景）。
+// leg 缺省为 RETURN：老前端与老调用方不带该字段时行为完全不变。
 //
 // 金额口径（服务端权威定价，请求体不接受任何「应退多少」）：
-//   feeMode=POLICY  → 手续费由服务端按取消政策对**回程行**报价得出，请求体不带金额；
+//   feeMode=POLICY  → 手续费由服务端按取消政策对**被取消那一行**报价，请求体不带金额；
 //   feeMode=MANUAL  → 运营手工覆盖，必须同时给出金额与原因（原因进审计与调价行文案）。
-// 上限：手工金额 ≤ 回程行金额（由 service 校验，schema 只管格式与调价行通用上限）。
+// 上限：手工金额 ≤ 被取消航段行金额（由 service 校验，schema 只管格式与调价行通用上限）。
 // 退多少钱不由本端点决定：它只把应收降下来，多收部分走既有多收/退款流程。
 // requestToken 为幂等键：同 (订单, token) 重试只回放既有结果，绝不二次放座、二次收手续费。
-export const cancelReturnLegBodySchema = z
+export const flightLegSideSchema = z.enum(['OUTBOUND', 'RETURN']);
+export type FlightLegSide = z.infer<typeof flightLegSideSchema>;
+
+/** 预检请求体：只有 leg（缺省 RETURN），空 body 即老口径的「取消回程预检」。 */
+export const cancelLegPreviewBodySchema = z.object({
+  leg: flightLegSideSchema.default('RETURN'),
+});
+export type CancelLegPreviewBody = z.infer<typeof cancelLegPreviewBodySchema>;
+
+export const cancelLegBodySchema = z
   .object({
     requestToken: z.string().min(8).max(64).uuid(),
+    leg: flightLegSideSchema.default('RETURN'),
     feeMode: z.enum(['POLICY', 'MANUAL']),
     manualFeeCny: z
       .number()
@@ -1371,7 +1387,12 @@ export const cancelReturnLegBodySchema = z
     message: '手工覆盖取消政策手续费时必须填写原因',
     path: ['overrideReason'],
   });
-export type CancelReturnLegBody = z.infer<typeof cancelReturnLegBodySchema>;
+export type CancelLegBody = z.infer<typeof cancelLegBodySchema>;
+
+// 老路径 POST /orders/:id/cancel-return-leg 的请求体 = 同一张 schema（leg 缺省 RETURN），
+// 保留别名让既有调用方与用例不必改动。
+export const cancelReturnLegBodySchema = cancelLegBodySchema;
+export type CancelReturnLegBody = Omit<CancelLegBody, 'leg'>;
 
 // ── 按人改期（POST /orders/:id/reschedule-passengers；ADMIN/STAFF）──────────────
 // 场景：三人一单，只给其中一位客人改航班。一单一行程是全站硬约束（去/回程各一条 FLIGHT 行），

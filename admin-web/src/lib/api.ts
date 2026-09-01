@@ -788,7 +788,12 @@ type PriceAdjustmentReasonLegacy = 'UPGRADE_CABIN' | 'UPGRADE_HOTEL' | 'VISA_MUL
 // 专用通道（POST /orders/:id/room-supplement），不进录单调价下拉（PRICE_ADJUSTMENT_REASON_OPTIONS）。
 // SETTLEMENT 由录单「本单结算总价」（settlementTotalCny）触发、服务端自动生成差额行——
 // **只能系统生成**，同样不进人工调价下拉。
-type PriceAdjustmentReasonEndpointOnly = 'ROOM_DIFF' | 'SETTLEMENT';
+type PriceAdjustmentReasonEndpointOnly =
+  | 'ROOM_DIFF'
+  | 'SETTLEMENT'
+  // 取消航段手续费：由「取消航段」端点按取消政策（或带原因的手工覆盖）生成，同样只能系统生成。
+  | 'RETURN_LEG_CANCEL_FEE'
+  | 'OUTBOUND_LEG_CANCEL_FEE';
 type PriceAdjustmentReasonDisplay =
   | PriceAdjustmentReason
   | PriceAdjustmentReasonLegacy
@@ -804,6 +809,8 @@ export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReasonDisplay,
   VISA_MULTI: '签证改多签',
   ROOM_DIFF: '补收单房差',
   SETTLEMENT: '代理结算价',
+  RETURN_LEG_CANCEL_FEE: '取消回程手续费',
+  OUTBOUND_LEG_CANCEL_FEE: '取消去程手续费',
 };
 
 export interface PriceAdjustmentInput {
@@ -3401,15 +3408,25 @@ export interface ReschedulePassengersResult {
   splitPerformed: boolean;
 }
 
-// ── 取消回程（改单去程；ADMIN/STAFF）─────────────────────────────────────
-// 按航司标准做「取消回程」：回程座位放回库存重新销售，订单变单去程，手续费按取消政策算
-// （运营可手动覆盖但须填覆盖原因）。先 preview 判定是否合格 + 算出手续费/降额，
-// 再带幂等 requestToken 提交。
-export interface CancelReturnLegPreview {
+// ── 取消航段（ADMIN/STAFF）───────────────────────────────────────────────
+// 按航司标准做「取消航段」：被取消那一段的座位放回库存重新销售，订单变单程，
+// 手续费按取消政策算（运营可手动覆盖但须填覆盖原因）。
+//   leg='RETURN'   取消回程 → 单去程单；leg='OUTBOUND' 取消去程 → 单回程单。
+// 先 preview 判定是否合格 + 算出手续费/降额，再带幂等 requestToken 提交。
+export type FlightLegSide = 'OUTBOUND' | 'RETURN';
+
+export const FLIGHT_LEG_ZH: Record<FlightLegSide, string> = {
+  OUTBOUND: '去程',
+  RETURN: '回程',
+};
+
+export interface CancelLegPreview {
+  /** 本次预检的航段方向 */
+  leg: FlightLegSide;
   eligible: boolean;
   /** 不合格原因（逐条），如「已出票」「已过起飞时间」等；eligible=false 时非空 */
   blockers: string[];
-  /** 回程航段（FLIGHT 行）；无回程或已被取消过时为 null */
+  /** 待取消的那一段航段行；字段名沿用 returnItem（去程/回程共用），方向看 leg。无该段时为 null */
   returnItem: {
     orderItemId: string;
     description: string;
@@ -3426,7 +3443,7 @@ export interface CancelReturnLegPreview {
     feeAmountCny: number;
     hoursLeft: number;
   } | null;
-  /** 本单应收降幅 = 回程行金额 − 手续费 */
+  /** 本单应收降幅 = 该航段行金额 − 手续费 */
   netReductionCny: number;
   currentTotalCny: number;
   paidAmountCny: number;
@@ -3434,9 +3451,10 @@ export interface CancelReturnLegPreview {
   overpayAfterCny: number;
 }
 
-export interface CancelReturnLegResult {
+export interface CancelLegResult {
   order: OrderSummary;
   audit: {
+    leg: FlightLegSide;
     feeCny: number;
     netReductionCny: number;
     totalBefore: number;
@@ -3445,6 +3463,10 @@ export interface CancelReturnLegResult {
     releasedSeats: number;
   };
 }
+
+/** 老名字的兼容别名（取消回程是 leg='RETURN' 的特例）。 */
+export type CancelReturnLegPreview = CancelLegPreview;
+export type CancelReturnLegResult = CancelLegResult;
 
 export const api = {
   login: (email: string, password: string) =>
@@ -4364,29 +4386,31 @@ export const api = {
       token,
       body,
     }),
-  // 取消回程（改单去程）预检：只读，不改任何数据。回不合格给 blockers，合格给回程行金额 +
-  // 政策手续费 + 应收降幅，供确认前展示。
-  previewCancelReturnLeg: (token: string, orderId: string) =>
-    apiFetch<CancelReturnLegPreview>(`/orders/${orderId}/cancel-return-leg/preview`, {
+  // 取消航段预检：只读，不改任何数据。不合格给 blockers，合格给该航段行金额 +
+  // 政策手续费 + 应收降幅，供确认前展示。leg 缺省 'RETURN'（取消回程）。
+  previewCancelLeg: (token: string, orderId: string, leg: FlightLegSide = 'RETURN') =>
+    apiFetch<CancelLegPreview>(`/orders/${orderId}/cancel-leg/preview`, {
       method: 'POST',
       token,
-      body: {},
+      body: { leg },
     }),
-  // 取消回程（改单去程）提交：回程座位放回库存重新销售，订单变单去程。手续费默认按取消政策
-  // 自动算（feeMode:'POLICY'），运营也可手动覆盖（feeMode:'MANUAL' + manualFeeCny + 必填
-  // overrideReason）。requestToken 幂等键（crypto.randomUUID，同一次表单提交内复用同一个 token）。
-  cancelReturnLeg: (
+  // 取消航段提交：该段座位放回库存重新销售，订单变单程（取消回程→单去程，取消去程→单回程）。
+  // 手续费默认按取消政策自动算（feeMode:'POLICY'），运营也可手动覆盖（feeMode:'MANUAL' +
+  // manualFeeCny + 必填 overrideReason）。requestToken 幂等键（crypto.randomUUID，
+  // 同一次表单提交内复用同一个 token）。
+  cancelLeg: (
     token: string,
     orderId: string,
     body: {
       requestToken: string;
+      leg: FlightLegSide;
       feeMode: 'POLICY' | 'MANUAL';
       manualFeeCny?: number;
       overrideReason?: string;
       note?: string;
     },
   ) =>
-    apiFetch<CancelReturnLegResult>(`/orders/${orderId}/cancel-return-leg`, {
+    apiFetch<CancelLegResult>(`/orders/${orderId}/cancel-leg`, {
       method: 'POST',
       token,
       body,

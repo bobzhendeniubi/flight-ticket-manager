@@ -1,7 +1,11 @@
 /**
- * 取消回程（partial cancellation）· 服务级单测（vitest，mock Prisma，不依赖真 DB）
+ * 取消航段（partial cancellation）· 服务级单测（vitest，mock Prisma，不依赖真 DB）
  *
- * 覆盖运营诉求「客人只飞去程，回程放回给系统继续销售」的全部硬口径：
+ * 覆盖运营诉求「客人只飞其中一段，另一段放回给系统继续销售」的全部硬口径。
+ * 第 1–8 组是取消回程（leg=RETURN，老路径 /cancel-return-leg 同义），
+ * 第 9 组是镜像的取消去程（leg=OUTBOUND，客人去程 noshow 只留回程）+ 请求体契约。
+ *
+ * 取消回程部分：
  *   1. 权限：仅 ADMIN/STAFF。
  *   2. 准入闸一次性全列（单程 / 回程已开票 / 已出票 / 结算价锁 / 收款复核锁 / 退款中）。
  *   3. POLICY 模式手续费 = 取消政策引擎（lib/cancellation）对**回程行**的报价，
@@ -32,7 +36,11 @@ const { mockPrisma } = vi.hoisted(() => ({
 vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
 
 import { OrderService } from './orders.service.js';
-import { cancelReturnLegBodySchema } from './orders.schemas.js';
+import {
+  cancelLegBodySchema,
+  cancelLegPreviewBodySchema,
+  cancelReturnLegBodySchema,
+} from './orders.schemas.js';
 import { BadRequestError, ForbiddenError } from '../../lib/errors.js';
 
 const service = new OrderService();
@@ -159,15 +167,29 @@ const serializableOrder = () => ({
  *   带 flightScheduleId 条件 = syncOrderHasReturnLeg 的自愈查询（取消后只剩去程）；
  *   不带 = 幂等回放扫描（全部 FLIGHT 行 + metadata）。
  */
-function mountTx(opts: { snapshot?: ReturnType<typeof orderSnapshot>; flightMeta?: unknown[] } = {}) {
+function mountTx(
+  opts: {
+    snapshot?: ReturnType<typeof orderSnapshot>;
+    flightMeta?: unknown[];
+    /** 被取消的那一段（默认回程 leg-ret；取消去程用 leg-out）。 */
+    targetId?: string;
+  } = {},
+) {
   const snapshot = opts.snapshot ?? orderSnapshot();
+  const targetId = opts.targetId ?? 'leg-ret';
+  const targetDepart = targetId === 'leg-out' ? OUT_DEPART : RET_DEPART;
+  // syncOrderHasReturnLeg 的自愈查询只看得到「还带班次」的行 = 取消后幸存的那一段。
+  const survivor =
+    targetId === 'leg-out'
+      ? { flightScheduleId: 'sch-ret', flightSchedule: { departureTime: RET_DEPART, departureTz: 'Asia/Shanghai' } }
+      : { flightScheduleId: 'sch-out', flightSchedule: { departureTime: OUT_DEPART, departureTz: 'Asia/Shanghai' } };
   const flightMeta =
     opts.flightMeta ??
     [
       { id: 'leg-out', metadata: null },
       { id: 'leg-ret', metadata: null },
     ];
-  const returnItem = snapshot.items.find((it) => it.id === 'leg-ret');
+  const returnItem = snapshot.items.find((it) => it.id === targetId);
   const tx = {
     $queryRaw: vi.fn(async () => [{ id: 'ord-1' }]),
     $executeRaw: vi.fn(async () => 1),
@@ -182,14 +204,12 @@ function mountTx(opts: { snapshot?: ReturnType<typeof orderSnapshot>; flightMeta
     },
     orderItem: {
       findMany: vi.fn(async (args: { where?: { flightScheduleId?: unknown } }) =>
-        args?.where?.flightScheduleId !== undefined
-          ? [{ flightScheduleId: 'sch-out', flightSchedule: { departureTime: OUT_DEPART, departureTz: 'Asia/Shanghai' } }]
-          : flightMeta,
+        args?.where?.flightScheduleId !== undefined ? [survivor] : flightMeta,
       ),
       findUnique: vi.fn(async () => ({
         ...returnItem,
         fulfillmentTasks: [],
-        flightSchedule: { departureTime: RET_DEPART },
+        flightSchedule: { departureTime: targetDepart },
       })),
       update: vi.fn(async () => ({})),
       create: vi.fn(async () => ({ id: 'fee-1' })),
@@ -203,16 +223,17 @@ function mountTx(opts: { snapshot?: ReturnType<typeof orderSnapshot>; flightMeta
   return tx;
 }
 
-/** preview 走裸 prisma（非事务），单独装配。 */
-function mountPreview(snapshot = orderSnapshot()) {
-  const returnItem = snapshot.items.find((it) => it.id === 'leg-ret');
+/** preview 走裸 prisma（非事务），单独装配。targetId 指定被取消的那一段。 */
+function mountPreview(snapshot = orderSnapshot(), targetId = 'leg-ret') {
+  const returnItem = snapshot.items.find((it) => it.id === targetId);
+  const targetDepart = targetId === 'leg-out' ? OUT_DEPART : RET_DEPART;
   mockPrisma.order.findUnique.mockResolvedValue(snapshot);
   mockPrisma.fulfillmentTask.count.mockResolvedValue(0);
   mockPrisma.refund.count.mockResolvedValue(0);
   mockPrisma.cancellationPolicy.findMany.mockResolvedValue([FLIGHT_POLICY]);
   mockPrisma.orderItem.findUnique.mockResolvedValue(
     returnItem
-      ? { ...returnItem, fulfillmentTasks: [], flightSchedule: { departureTime: RET_DEPART } }
+      ? { ...returnItem, fulfillmentTasks: [], flightSchedule: { departureTime: targetDepart } }
       : null,
   );
 }
@@ -612,5 +633,204 @@ describe('取消回程 · 套餐单', () => {
     expect(audit.releasedSeats).toEqual([
       { scheduleId: 'sch-ret', cabin: 'ECONOMY', quantity: 2 },
     ]);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 9. 取消去程（leg=OUTBOUND）：与取消回程完全镜像的另一半
+//    场景：客人去程 noshow 没飞，只留回程 —— 去程座位放回系统继续销售。
+// ══════════════════════════════════════════════════════════════════════════
+describe('取消去程 · 准入闸', () => {
+  it('去程已开票 → 拒绝，并指到票务台改回未开（不看回程开票位）', async () => {
+    mountPreview(orderSnapshot({ outboundInvoiced: true, returnInvoiced: true }), 'leg-out');
+    const preview = await service.previewCancelLeg('ord-1', 'OUTBOUND', ADMIN);
+    expect(preview.eligible).toBe(false);
+    expect(preview.blockers.join('')).toContain('去程已开票');
+    expect(preview.blockers.join('')).toContain('票务台');
+  });
+
+  it('回程已开票不挡取消去程（那张票的行程还在飞）', async () => {
+    mountPreview(orderSnapshot({ returnInvoiced: true }), 'leg-out');
+    const preview = await service.previewCancelLeg('ord-1', 'OUTBOUND', ADMIN);
+    expect(preview.eligible).toBe(true);
+  });
+
+  it('去程有确认出票任务 → 拒绝，指向改签/退票流程', async () => {
+    mountPreview(orderSnapshot(), 'leg-out');
+    mockPrisma.fulfillmentTask.count.mockResolvedValue(1);
+    const preview = await service.previewCancelLeg('ord-1', 'OUTBOUND', ADMIN);
+    expect(preview.eligible).toBe(false);
+    expect(preview.blockers.join('')).toContain('去程已出票');
+  });
+
+  it('乘客已有票号 → 拒绝', async () => {
+    mountPreview(
+      orderSnapshot({
+        passengers: [
+          { pnr: 'ABC123', eticketNumber: null },
+          { pnr: null, eticketNumber: null },
+        ],
+      }),
+      'leg-out',
+    );
+    const preview = await service.previewCancelLeg('ord-1', 'OUTBOUND', ADMIN);
+    expect(preview.blockers.join('')).toContain('去程已出票');
+  });
+
+  it('单程单取消去程 → 拒绝：取消唯一一段等于取消整单', async () => {
+    const oneWay = orderSnapshot({
+      items: orderSnapshot().items.filter((it) => it.id !== 'leg-ret'),
+    });
+    mountPreview(oneWay, 'leg-out');
+    const preview = await service.previewCancelLeg('ord-1', 'OUTBOUND', ADMIN);
+    expect(preview.eligible).toBe(false);
+    expect(preview.blockers.join('')).toContain('取消唯一一段等于取消整单');
+
+    const tx = mountTx({ snapshot: oneWay, targetId: 'leg-out', flightMeta: [{ id: 'leg-out', metadata: null }] });
+    await expect(
+      service.cancelLeg('ord-1', { ...body(), leg: 'OUTBOUND' }, ADMIN),
+    ).rejects.toBeInstanceOf(BadRequestError);
+    expect(tx.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('代理不能取消去程', async () => {
+    await expect(service.previewCancelLeg('ord-1', 'OUTBOUND', AGENT)).rejects.toBeInstanceOf(
+      ForbiddenError,
+    );
+  });
+});
+
+describe('取消去程 · 手续费与航段', () => {
+  it('POLICY 手续费按**去程行**报价（预检指向去程航段，不是回程）', async () => {
+    mountPreview(orderSnapshot(), 'leg-out');
+    const preview = await service.previewCancelLeg('ord-1', 'OUTBOUND', ADMIN);
+    expect(preview.leg).toBe('OUTBOUND');
+    expect(preview.returnItem).toMatchObject({
+      orderItemId: 'leg-out',
+      flightNumber: 'QH9589',
+      amountCny: OUT_AMOUNT,
+    });
+    expect(preview.policyFee).toMatchObject({ feePercent: 20, feeAmountCny: 600 });
+    expect(preview.netReductionCny).toBe(2400);
+  });
+
+  it('放回的是**去程班次**的座位，作废的是去程行，剩下的是原回程行', async () => {
+    const tx = mountTx({ targetId: 'leg-out' });
+    const { audit } = await service.cancelLeg('ord-1', { ...body(), leg: 'OUTBOUND' }, ADMIN);
+
+    expect(audit.leg).toBe('OUTBOUND');
+    // releaseSeatFloored 的 tagged template 值序：[qty, scheduleId, cabin]
+    const releases = tx.$executeRaw.mock.calls.map((c: unknown[]) => c.slice(1));
+    expect(releases).toEqual([[2, 'sch-out', 'ECONOMY']]);
+    expect(audit.releasedSeats).toEqual([
+      { scheduleId: 'sch-out', cabin: 'ECONOMY', quantity: 2 },
+    ]);
+
+    // 只作废去程那一行；回程行分毫不动（班次仍在 → 它就是幸存的那一段）
+    expect(tx.orderItem.update).toHaveBeenCalledTimes(1);
+    const call = tx.orderItem.update.mock.calls[0][0];
+    expect(call.where).toEqual({ id: 'leg-out' });
+    expect(call.data.flightScheduleId).toBeNull();
+    expect(call.data.amount).toEqual(new Prisma.Decimal(0));
+    expect(call.data.description).toContain('已取消去程');
+    expect(call.data.metadata.returnLegCancelled).toMatchObject({
+      leg: 'OUTBOUND',
+      originalScheduleId: 'sch-out',
+      originalAmountCny: OUT_AMOUNT,
+      feeCny: 600,
+    });
+
+    // 去程票务任务终态化
+    expect(tx.fulfillmentTask.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({ where: expect.objectContaining({ orderItemId: 'leg-out' }) }),
+    );
+  });
+
+  it('hasReturnLeg 回落 false（只剩原回程一段，全站按单程看）', async () => {
+    const tx = mountTx({ targetId: 'leg-out' });
+    await service.cancelLeg('ord-1', { ...body(), leg: 'OUTBOUND' }, ADMIN);
+    const legUpdate = tx.order.update.mock.calls.find(
+      (c: [{ data: Record<string, unknown> }]) => c[0].data.hasReturnLeg !== undefined,
+    );
+    expect(legUpdate?.[0].data).toEqual({ hasReturnLeg: false });
+  });
+
+  it('手续费调价行用去程专属原因码，行文案写「取消去程手续费」', async () => {
+    const tx = mountTx({ targetId: 'leg-out' });
+    await service.cancelLeg('ord-1', { ...body(), leg: 'OUTBOUND' }, ADMIN);
+    const feeCall = tx.orderItem.create.mock.calls[0][0];
+    expect(feeCall.data.metadata).toMatchObject({ reasonCode: 'OUTBOUND_LEG_CANCEL_FEE' });
+    expect(feeCall.data.description).toContain('取消去程手续费');
+    expect(feeCall.data.description).not.toContain('取消回程手续费');
+  });
+
+  it('手工手续费超过去程行金额 → 400，整事务不成立', async () => {
+    const tx = mountTx({ targetId: 'leg-out' });
+    await expect(
+      service.cancelLeg(
+        'ord-1',
+        { ...body(), leg: 'OUTBOUND', feeMode: 'MANUAL', manualFeeCny: OUT_AMOUNT + 1, overrideReason: '航司特批' },
+        ADMIN,
+      ),
+    ).rejects.toBeInstanceOf(BadRequestError);
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+  });
+
+  it('开票位随航段改判搬家：原回程的已开票位落到 outboundInvoiced', async () => {
+    // 取消去程后，幸存的原回程行在全站位置判定里变成「去程」；它的开票位必须跟着搬，
+    // 否则出票上限漏计、导出显示完全未开、还会掉进「去程未开」的票务待办。
+    const tx = mountTx({ snapshot: orderSnapshot({ returnInvoiced: true }), targetId: 'leg-out' });
+    await service.cancelLeg('ord-1', { ...body(), leg: 'OUTBOUND' }, ADMIN);
+    const totalUpdate = tx.order.update.mock.calls.find(
+      (c: [{ data: Record<string, unknown> }]) => c[0].data.total !== undefined,
+    );
+    expect(totalUpdate?.[0].data).toMatchObject({
+      outboundInvoiced: true,
+      returnInvoiced: false,
+    });
+  });
+
+  it('回程未开票时搬家是无害的定值写（两个开票位都落 false）', async () => {
+    const tx = mountTx({ targetId: 'leg-out' });
+    await service.cancelLeg('ord-1', { ...body(), leg: 'OUTBOUND' }, ADMIN);
+    const totalUpdate = tx.order.update.mock.calls.find(
+      (c: [{ data: Record<string, unknown> }]) => c[0].data.total !== undefined,
+    );
+    expect(totalUpdate?.[0].data).toMatchObject({
+      outboundInvoiced: false,
+      returnInvoiced: false,
+      total: new Prisma.Decimal(5600),
+    });
+  });
+});
+
+describe('取消航段 · 请求体契约', () => {
+  it('不带 leg 的老请求体默认取消回程（老前端与集成方行为不变）', () => {
+    const parsed = cancelLegBodySchema.safeParse({ requestToken: TOKEN, feeMode: 'POLICY' });
+    expect(parsed.success).toBe(true);
+    expect(parsed.success && parsed.data.leg).toBe('RETURN');
+  });
+
+  it('leg=OUTBOUND 可解析；非法方向被拒', () => {
+    expect(
+      cancelLegBodySchema.safeParse({ requestToken: TOKEN, feeMode: 'POLICY', leg: 'OUTBOUND' })
+        .success,
+    ).toBe(true);
+    expect(
+      cancelLegBodySchema.safeParse({ requestToken: TOKEN, feeMode: 'POLICY', leg: 'MIDDLE' })
+        .success,
+    ).toBe(false);
+  });
+
+  it('预检请求体：空 body = 回程；显式 OUTBOUND 生效', () => {
+    expect(cancelLegPreviewBodySchema.parse({}).leg).toBe('RETURN');
+    expect(cancelLegPreviewBodySchema.parse({ leg: 'OUTBOUND' }).leg).toBe('OUTBOUND');
+  });
+
+  it('老别名 cancelReturnLeg 恒等于 leg=RETURN', async () => {
+    const tx = mountTx();
+    const { audit } = await service.cancelReturnLeg('ord-1', body(), ADMIN);
+    expect(audit.leg).toBe('RETURN');
+    expect(tx.orderItem.update.mock.calls[0][0].where).toEqual({ id: 'leg-ret' });
   });
 });

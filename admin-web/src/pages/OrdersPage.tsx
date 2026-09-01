@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelReturnLegPreview } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -5023,6 +5023,7 @@ function OrderDrawer({
                             id: p.id,
                             name: p.chineseName?.trim() || p.fullName,
                           }))}
+                          outboundLegItemId={outboundFlightLegId(o)}
                           returnLegItemId={returnFlightLegId(o)}
                         />
                       ))}
@@ -5048,6 +5049,7 @@ function OrderDrawer({
                       id: p.id,
                       name: p.chineseName?.trim() || p.fullName,
                     }))}
+                    outboundLegItemId={outboundFlightLegId(o)}
                     returnLegItemId={returnFlightLegId(o)}
                   />
                 ))}
@@ -6590,24 +6592,38 @@ function signedCny(amountCny: number): string {
 }
 
 /**
- * 取消回程（改单去程）：判定本单哪一条 FLIGHT 行是「回程」。
- * 口径：本单有航班班次的 FLIGHT 行，按出发日期+时间升序排，第 2 条即回程腿
- * （往返订单必然是「去程早、回程晚」）。少于 2 条（单程/纯地面单）没有回程，返回 null。
+ * 取消航段：本单有效航段行按出发日期+时间升序排，第 1 条=去程、第 2 条=回程
+ * （往返订单必然是「去程早、回程晚」；有效 = 还挂着班次，作废行已被后端置空班次）。
+ * 少于 2 条（单程/纯地面单）不给任何取消航段入口——取消唯一一段等于取消整单。
  */
-function returnFlightLegId(o: OrderSummary): string | null {
-  const flights = (o.items ?? [])
+function sortedFlightLegIds(o: OrderSummary): string[] {
+  return (o.items ?? [])
     .filter((it) => it.kind === 'FLIGHT' && it.flightScheduleId)
     .map((it) => ({ id: it.id, key: `${it.departureDate ?? '9999-99-99'} ${it.departureTime ?? '99:99'}` }))
-    .sort((a, b) => a.key.localeCompare(b.key));
-  return flights.length >= 2 ? flights[1].id : null;
+    .sort((a, b) => a.key.localeCompare(b.key))
+    .map((f) => f.id);
+}
+/** 本单去程 FLIGHT 行的 orderItemId；单程单返回 null（不给「取消去程」入口）。 */
+function outboundFlightLegId(o: OrderSummary): string | null {
+  const legs = sortedFlightLegIds(o);
+  return legs.length >= 2 ? legs[0] : null;
+}
+/** 本单回程 FLIGHT 行的 orderItemId；单程单返回 null。 */
+function returnFlightLegId(o: OrderSummary): string | null {
+  const legs = sortedFlightLegIds(o);
+  return legs.length >= 2 ? legs[1] : null;
 }
 
-/** 回程行是否已被取消：后端在 metadata.returnLegCancelled 落一个快照对象（at/feeCny/原班次…），
- *  对象存在即视为已取消；也兼容布尔 true。结构不符视为未取消。 */
-function readReturnLegCancelled(metadata: unknown): boolean {
-  if (!metadata || typeof metadata !== 'object') return false;
+/** 本行是否已被「取消航段」作废：后端在 metadata.returnLegCancelled 落一个快照对象
+ *  （at/leg/feeCny/原班次…），对象存在即视为已取消；也兼容布尔 true。结构不符视为未取消。
+ *  返回被取消的方向，供徽标写「去程已取消 / 回程已取消」；老数据无 leg 字段一律按回程读
+ *  （本功能上线之初只做回程）。 */
+function readCancelledLeg(metadata: unknown): FlightLegSide | null {
+  if (!metadata || typeof metadata !== 'object') return null;
   const v = (metadata as { returnLegCancelled?: unknown }).returnLegCancelled;
-  return v === true || (typeof v === 'object' && v !== null);
+  if (v === true) return 'RETURN';
+  if (typeof v !== 'object' || v === null) return null;
+  return (v as { leg?: unknown }).leg === 'OUTBOUND' ? 'OUTBOUND' : 'RETURN';
 }
 
 // ── 产品内容行：FLIGHT 项可「改期」（换班次/日期 + 改舱位 + 改期费）──────
@@ -6622,6 +6638,7 @@ function OrderItemRow({
   settlementLocked,
   roomGroups,
   passengers,
+  outboundLegItemId,
   returnLegItemId,
 }: {
   orderId: string;
@@ -6640,6 +6657,9 @@ function OrderItemRow({
   roomGroups?: RoomGroup[];
   /** 本单出行人（拆房组弹窗展示组内乘客名用；改期乘客勾选列表复用同一份） */
   passengers?: Array<{ id: string; name: string }>;
+  /** 本单去程 FLIGHT 行的 orderItemId（outboundFlightLegId 派生）；本行匹配即渲染「取消去程」入口。
+   *  单程单为 null——取消唯一一段等于取消整单，不给入口 */
+  outboundLegItemId?: string | null;
   /** 本单回程 FLIGHT 行的 orderItemId（returnFlightLegId 派生）；本行匹配即渲染「取消回程」入口 */
   returnLegItemId?: string | null;
 }) {
@@ -6650,13 +6670,22 @@ function OrderItemRow({
   const [upgradingCabin, setUpgradingCabin] = useState(false);
   const [changingBundle, setChangingBundle] = useState(false);
   const [splittingGroup, setSplittingGroup] = useState(false);
-  const [cancelingReturnLeg, setCancelingReturnLeg] = useState(false);
+  /** 正在取消的航段方向（null = 面板未展开）。 */
+  const [cancelingLeg, setCancelingLeg] = useState<FlightLegSide | null>(null);
   const isFlight = item.kind === 'FLIGHT';
-  // 取消回程（改单去程）：本行是回程 FLIGHT 行、且尚未被取消过才给入口。
-  // 已取消的回程行后端会把班次置空（退出航段判定），所以「已取消」只看 metadata 打标、
-  // 不依赖 returnLegItemId——否则作废行会失去徽标、还继续露出改期/升舱/改结算价。
-  const isReturnLeg = isFlight && returnLegItemId === item.id;
-  const returnLegCancelled = isFlight && readReturnLegCancelled(item.metadata);
+  // 取消航段：本行是去程/回程 FLIGHT 行、且尚未被取消过才给入口。两个入口都只在本单有
+  // ≥2 条有效 FLIGHT 行时出现（单程单的 outboundLegItemId/returnLegItemId 都是 null）。
+  // 已取消的行后端会把班次置空（退出航段判定），所以「已取消」只看 metadata 打标、
+  // 不依赖这两个 id——否则作废行会失去徽标、还继续露出改期/升舱/改结算价。
+  const legEntry: FlightLegSide | null = !isFlight
+    ? null
+    : outboundLegItemId === item.id
+      ? 'OUTBOUND'
+      : returnLegItemId === item.id
+        ? 'RETURN'
+        : null;
+  const cancelledLeg = isFlight ? readCancelledLeg(item.metadata) : null;
+  const legCancelled = cancelledLeg != null;
   // 套餐改档：换绑到另一张套餐（档次/晚数是 Bundle 自身的属性，改档=换 bundleId）。
   const isBundleRow = item.kind === 'BUNDLE' && Boolean(item.bundleId);
   // 升舱入口：只有**经济舱**机票行能一键升商务舱；套餐机票腿（带 bundleId）走套餐自身的升舱份数模型，后端也会拒。
@@ -6749,7 +6778,7 @@ function OrderItemRow({
           {item.amount != null && (
             <div className="nums text-sm font-medium text-ink">¥{Number(item.amount).toLocaleString()}</div>
           )}
-          {canOperate && isFlight && !returnLegCancelled && !rescheduling && !editingPrice && !upgradingCabin && (
+          {canOperate && isFlight && !legCancelled && !rescheduling && !editingPrice && !upgradingCabin && (
             <button
               className="text-[11px] font-medium text-brand hover:text-brand-dark"
               onClick={() => setRescheduling(true)}
@@ -6757,24 +6786,28 @@ function OrderItemRow({
               改期
             </button>
           )}
-          {returnLegCancelled && (
+          {cancelledLeg && (
             <span
               className="inline-flex items-center rounded border border-slate-300 bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-500"
-              title="回程座位已放回库存重新销售，本单已改为单去程"
+              title={`${FLIGHT_LEG_ZH[cancelledLeg]}座位已放回库存重新销售，本单已改为单${
+                cancelledLeg === 'OUTBOUND' ? '回程' : '去程'
+              }`}
             >
-              回程已取消
+              {FLIGHT_LEG_ZH[cancelledLeg]}已取消
             </span>
           )}
-          {canOperate && isReturnLeg && !returnLegCancelled && !rescheduling && !editingPrice && !upgradingCabin && !cancelingReturnLeg && (
+          {canOperate && legEntry && !legCancelled && !rescheduling && !editingPrice && !upgradingCabin && !cancelingLeg && (
             <button
               className="text-[11px] font-medium text-red-600 hover:text-red-800"
-              onClick={() => setCancelingReturnLeg(true)}
-              title="按取消政策收手续费，回程座位放回库存重新销售，订单变为单去程"
+              onClick={() => setCancelingLeg(legEntry)}
+              title={`按取消政策收手续费，${FLIGHT_LEG_ZH[legEntry]}座位放回库存重新销售，订单变为单${
+                legEntry === 'OUTBOUND' ? '回程' : '去程'
+              }`}
             >
-              取消回程（改单去程）
+              取消{FLIGHT_LEG_ZH[legEntry]}（改单{legEntry === 'OUTBOUND' ? '回程' : '去程'}）
             </button>
           )}
-          {canOperate && canUpgradeCabin && !returnLegCancelled && !rescheduling && !editingPrice && !upgradingCabin && (
+          {canOperate && canUpgradeCabin && !legCancelled && !rescheduling && !editingPrice && !upgradingCabin && (
             <button
               className="text-[11px] font-medium text-indigo-600 hover:text-indigo-800"
               onClick={() => setUpgradingCabin(true)}
@@ -6783,7 +6816,7 @@ function OrderItemRow({
               升舱
             </button>
           )}
-          {canEditPrice && !returnLegCancelled && !rescheduling && !editingPrice && (
+          {canEditPrice && !legCancelled && !rescheduling && !editingPrice && (
             <>
               <button
                 className="text-[11px] font-medium text-amber-600 hover:text-amber-800 disabled:cursor-not-allowed disabled:text-slate-400"
@@ -6849,12 +6882,13 @@ function OrderItemRow({
           }}
         />
       )}
-      {isReturnLeg && !returnLegCancelled && cancelingReturnLeg && (
-        <CancelReturnLegForm
+      {legEntry && !legCancelled && cancelingLeg && (
+        <CancelLegForm
           orderId={orderId}
-          onCancel={() => setCancelingReturnLeg(false)}
+          leg={cancelingLeg}
+          onCancel={() => setCancelingLeg(null)}
           onSaved={(updated) => {
-            setCancelingReturnLeg(false);
+            setCancelingLeg(null);
             onOrderUpdated?.(updated);
           }}
         />
@@ -7622,15 +7656,19 @@ function RescheduleForm({
   );
 }
 
-// ── 取消回程（改单去程）：回程座位放回库存重新销售，本单变单去程，手续费按取消政策算
-// （运营可手动覆盖但须填覆盖原因）。打开即 preview：不合格列 blockers 且禁用确认；
-// 合格展示回程航段/手续费/降额，确认前 useConfirm() 二次确认。────────────────
-function CancelReturnLegForm({
+// ── 取消航段：被取消那一段的座位放回库存重新销售，本单变单程（取消回程→单去程、
+// 取消去程→单回程），手续费按取消政策算（运营可手动覆盖但须填覆盖原因）。
+// 打开即 preview：不合格列 blockers 且禁用确认；合格展示该航段/手续费/降额，
+// 确认前 useConfirm() 二次确认。────────────────────────────────────────────
+function CancelLegForm({
   orderId,
+  leg,
   onCancel,
   onSaved,
 }: {
   orderId: string;
+  /** 要取消的航段方向；决定标题/文案/确认语与提交给后端的 leg。 */
+  leg: FlightLegSide;
   onCancel: () => void;
   onSaved: (order: OrderSummary) => void;
 }) {
@@ -7641,7 +7679,10 @@ function CancelReturnLegForm({
   const requestTokenRef = useRef<string>(crypto.randomUUID());
   const [previewLoading, setPreviewLoading] = useState(true);
   const [previewErr, setPreviewErr] = useState<string | null>(null);
-  const [preview, setPreview] = useState<CancelReturnLegPreview | null>(null);
+  const [preview, setPreview] = useState<CancelLegPreview | null>(null);
+  const legZh = FLIGHT_LEG_ZH[leg];
+  /** 取消这一段后本单剩下的那一段（文案用）：取消回程→单去程，取消去程→单回程。 */
+  const survivorZh = leg === 'OUTBOUND' ? '回程' : '去程';
   const [feeMode, setFeeMode] = useState<'POLICY' | 'MANUAL'>('POLICY');
   const [manualFeeCny, setManualFeeCny] = useState<number | null>(null);
   const [overrideReason, setOverrideReason] = useState('');
@@ -7655,7 +7696,7 @@ function CancelReturnLegForm({
     setPreviewLoading(true);
     setPreviewErr(null);
     api
-      .previewCancelReturnLeg(token, orderId)
+      .previewCancelLeg(token, orderId, leg)
       .then((res) => {
         if (cancelled) return;
         setPreview(res);
@@ -7664,7 +7705,7 @@ function CancelReturnLegForm({
       })
       .catch((e) => {
         if (cancelled) return;
-        setPreviewErr(e instanceof ApiError ? e.message : '取消回程预检失败');
+        setPreviewErr(e instanceof ApiError ? e.message : `取消${legZh}预检失败`);
       })
       .finally(() => {
         if (!cancelled) setPreviewLoading(false);
@@ -7672,14 +7713,15 @@ function CancelReturnLegForm({
     return () => {
       cancelled = true;
     };
-  }, [orderId, token]);
+  }, [orderId, token, leg, legZh]);
 
-  const returnItem = preview?.returnItem ?? null;
+  // 后端字段名沿用 returnItem（去程/回程共用），装的是本次要取消的那一段。
+  const legItem = preview?.returnItem ?? null;
   const policyFee = preview?.policyFee ?? null;
   const hasPolicyFee = policyFee != null;
   // 本地估算展示用（权威数字来自提交后返回的 audit）：按当前选中的手续费口径重算降额/多付。
   const effectiveFeeCny = feeMode === 'POLICY' ? policyFee?.feeAmountCny ?? 0 : manualFeeCny ?? 0;
-  const effectiveNetReduction = returnItem ? returnItem.amountCny - effectiveFeeCny : 0;
+  const effectiveNetReduction = legItem ? legItem.amountCny - effectiveFeeCny : 0;
   const projectedTotal = preview ? preview.currentTotalCny - effectiveNetReduction : null;
   const projectedOverpay =
     preview && projectedTotal != null ? Math.max(0, preview.paidAmountCny - projectedTotal) : 0;
@@ -7688,42 +7730,43 @@ function CancelReturnLegForm({
     (manualFeeCny == null ||
       manualFeeCny < 0 ||
       !Number.isInteger(manualFeeCny) ||
-      (returnItem != null && manualFeeCny > returnItem.amountCny) ||
+      (legItem != null && manualFeeCny > legItem.amountCny) ||
       !overrideReason.trim());
 
   const submit = async () => {
-    if (!token || submitting || !preview?.eligible || !returnItem || projectedTotal == null) return;
+    if (!token || submitting || !preview?.eligible || !legItem || projectedTotal == null) return;
     setErr(null);
     if (manualFeeInvalid) {
-      setErr('请填写有效的手续费（整数、不超过回程行金额）与覆盖原因');
+      setErr(`请填写有效的手续费（整数、不超过${legZh}行金额）与覆盖原因`);
       return;
     }
     const confirmed = await confirm({
-      title: '取消回程（改单去程）',
-      body: `回程座位将立即放回库存重新销售，本单变为单去程，不可撤销。\n\n手续费 ¥${effectiveFeeCny.toLocaleString()}，本单应收将从 ¥${preview.currentTotalCny.toLocaleString()} 降到 ¥${projectedTotal.toLocaleString()}。${
+      title: `取消${legZh}（改单${survivorZh}）`,
+      body: `${legZh}座位将立即放回库存重新销售，本单变为单${survivorZh}，不可撤销。\n\n手续费 ¥${effectiveFeeCny.toLocaleString()}，本单应收将从 ¥${preview.currentTotalCny.toLocaleString()} 降到 ¥${projectedTotal.toLocaleString()}。${
         projectedOverpay > 0
           ? `\n\n客户已多付 ¥${projectedOverpay.toLocaleString()}，确认后请到付款情况处理多收（转预存款/退款）。`
           : ''
       }`,
       tone: 'danger',
-      confirmText: '确认取消回程',
+      confirmText: `确认取消${legZh}`,
     });
     if (!confirmed) return;
     setSubmitting(true);
     try {
-      const res = await api.cancelReturnLeg(token, orderId, {
+      const res = await api.cancelLeg(token, orderId, {
         requestToken: requestTokenRef.current,
+        leg,
         feeMode,
         manualFeeCny: feeMode === 'MANUAL' ? manualFeeCny ?? undefined : undefined,
         overrideReason: feeMode === 'MANUAL' ? overrideReason.trim() : undefined,
         note: note.trim() || undefined,
       });
       alert(
-        `已取消回程，应收 ¥${res.audit.totalBefore.toLocaleString()} → ¥${res.audit.totalAfter.toLocaleString()}，手续费 ¥${res.audit.feeCny.toLocaleString()}`,
+        `已取消${legZh}，应收 ¥${res.audit.totalBefore.toLocaleString()} → ¥${res.audit.totalAfter.toLocaleString()}，手续费 ¥${res.audit.feeCny.toLocaleString()}`,
       );
       onSaved(res.order);
     } catch (e) {
-      setErr(e instanceof ApiError ? e.message : '取消回程失败');
+      setErr(e instanceof ApiError ? e.message : `取消${legZh}失败`);
     } finally {
       setSubmitting(false);
     }
@@ -7731,14 +7774,16 @@ function CancelReturnLegForm({
 
   return (
     <div className="mt-3 space-y-2 rounded-md border border-red-300 bg-white p-3 text-xs">
-      <div className="font-medium text-red-600">取消回程（改单去程）</div>
+      <div className="font-medium text-red-600">
+        取消{legZh}（改单{survivorZh}）
+      </div>
 
-      {previewLoading && <div className="text-slate-500">正在核对是否可以取消回程…</div>}
+      {previewLoading && <div className="text-slate-500">正在核对是否可以取消{legZh}…</div>}
       {previewErr && <div className="rounded bg-red-50 px-2 py-1 text-red-700">{previewErr}</div>}
 
       {preview && !preview.eligible && (
         <div className="space-y-1 rounded bg-red-50 px-2 py-1 text-red-700">
-          <div className="font-medium">不满足取消回程条件：</div>
+          <div className="font-medium">不满足取消{legZh}条件：</div>
           <ul className="list-disc space-y-0.5 pl-4">
             {preview.blockers.map((b) => (
               <li key={b}>{b}</li>
@@ -7747,15 +7792,17 @@ function CancelReturnLegForm({
         </div>
       )}
 
-      {preview && preview.eligible && returnItem && (
+      {preview && preview.eligible && legItem && (
         <>
           <div className="space-y-0.5 rounded border border-slate-200 bg-slate-50/60 p-2">
-            <div className="text-ink">回程：{returnItem.description}</div>
+            <div className="text-ink">
+              {legZh}：{legItem.description}
+            </div>
             <div className="text-slate-500">
-              {returnItem.flightNumber && <>{returnItem.flightNumber} · </>}
-              {returnItem.departDate && <>{returnItem.departDate} · </>}
-              {returnItem.cabin && <>{CABIN_ZH[returnItem.cabin] ?? returnItem.cabin} · </>}
-              数量 {returnItem.quantity} · ¥{returnItem.amountCny.toLocaleString()}
+              {legItem.flightNumber && <>{legItem.flightNumber} · </>}
+              {legItem.departDate && <>{legItem.departDate} · </>}
+              {legItem.cabin && <>{CABIN_ZH[legItem.cabin] ?? legItem.cabin} · </>}
+              数量 {legItem.quantity} · ¥{legItem.amountCny.toLocaleString()}
             </div>
           </div>
 
@@ -7763,7 +7810,7 @@ function CancelReturnLegForm({
             <label className="flex items-center gap-1.5">
               <input
                 type="radio"
-                name={`cancel-return-fee-mode-${orderId}`}
+                name={`cancel-leg-fee-mode-${orderId}-${leg}`}
                 checked={feeMode === 'POLICY'}
                 disabled={!hasPolicyFee || submitting}
                 onChange={() => setFeeMode('POLICY')}
@@ -7778,7 +7825,7 @@ function CancelReturnLegForm({
             <label className="flex items-center gap-1.5">
               <input
                 type="radio"
-                name={`cancel-return-fee-mode-${orderId}`}
+                name={`cancel-leg-fee-mode-${orderId}-${leg}`}
                 checked={feeMode === 'MANUAL'}
                 disabled={submitting}
                 onChange={() => setFeeMode('MANUAL')}
@@ -7790,12 +7837,14 @@ function CancelReturnLegForm({
           {feeMode === 'MANUAL' && (
             <div className="space-y-2 rounded border border-amber-200 bg-amber-50/60 p-2">
               <label className="block">
-                <span className="text-slate-500">手续费（¥，整数，≤ 回程行金额 ¥{returnItem.amountCny.toLocaleString()}）</span>
+                <span className="text-slate-500">
+                  手续费（¥，整数，≤ {legZh}行金额 ¥{legItem.amountCny.toLocaleString()}）
+                </span>
                 <NumberInput
                   value={manualFeeCny}
                   onChange={setManualFeeCny}
                   integerOnly
-                  max={returnItem.amountCny}
+                  max={legItem.amountCny}
                   disabled={submitting}
                   placeholder="请输入手续费金额"
                   className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
@@ -7845,7 +7894,7 @@ function CancelReturnLegForm({
           onClick={submit}
           disabled={submitting || previewLoading || !preview?.eligible || manualFeeInvalid}
         >
-          {submitting ? '提交中…' : '确认取消回程'}
+          {submitting ? '提交中…' : `确认取消${legZh}`}
         </button>
         <button
           className="rounded bg-slate-100 px-3 py-1.5 text-slate-700 disabled:opacity-50"
