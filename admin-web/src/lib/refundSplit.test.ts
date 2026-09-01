@@ -1,10 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import {
   fmtRefundCny,
+  readRequestedRefund,
   readRefundSplit,
   refundApprovalUnknownWarning,
+  refundApprovalFrozenWarning,
   refundApprovalWarning,
 } from './refundSplit';
+import type { OrderSummary } from './api';
 
 describe('readRefundSplit', () => {
   it('原样读出后端三个金额，不做任何二次运算', () => {
@@ -88,6 +91,29 @@ describe('refundApprovalUnknownWarning', () => {
     expect(text).toContain('ORD-2');
     expect(text).toContain('网络错误');
     expect(text).toContain('重复退钱');
+  });
+});
+
+describe('退款申请冻结金额', () => {
+  it('换人退款批准提示以 Refund 冻结金额为主，并显示换人费', () => {
+    const order = {
+      refunds: [{
+        status: 'REQUESTED',
+        amount: '550',
+        gatewayPayload: { swapRefund: true, swapFeeCny: 450 },
+      }],
+    } as unknown as OrderSummary;
+    const frozen = readRequestedRefund(order);
+    expect(frozen).toEqual({ amountCny: 550, isSwapRefund: true, swapFeeCny: 450 });
+
+    const text = refundApprovalFrozenWarning(
+      'ORD-SWAP',
+      frozen!,
+      readRefundSplit({ totalRefund: 1000, refundToCashCny: 1000, refundToBalanceCny: 0 }),
+    );
+    expect(text).toContain('冻结金额 ¥550');
+    expect(text).toContain('换人费 ¥450（不退）／应退 ¥550');
+    expect(text).toContain('当前政策报价 ¥1,000 仅作参考');
   });
 });
 

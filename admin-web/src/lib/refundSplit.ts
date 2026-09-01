@@ -10,7 +10,7 @@
  * 前端用减法「补」出来的数字一旦与后端口径漂移，就是又一次重复退钱。
  * 后端没给拆分（老部署/字段缺失）→ 返回 available:false，界面如实说「拆分未知」，不猜。
  */
-import type { RefundQuote } from './api';
+import type { OrderRefund, OrderSummary, RefundQuote } from './api';
 
 /** 后端给了完整拆分 */
 export interface RefundSplitAvailable {
@@ -60,6 +60,26 @@ export function readRefundSplit(
   };
 }
 
+export interface FrozenRefundInfo {
+  amountCny: number;
+  isSwapRefund: boolean;
+  swapFeeCny: number | null;
+}
+
+/** 退款申请已存在时，读取真正会被批准的冻结金额，而不是重新计算政策报价。 */
+export function readRequestedRefund(
+  order: Pick<OrderSummary, 'refunds'>,
+): FrozenRefundInfo | null {
+  const refund: OrderRefund | undefined = order.refunds?.find((item) => item.status === 'REQUESTED');
+  if (!refund) return null;
+  const amountCny = Number(refund.amount);
+  if (!Number.isFinite(amountCny)) return null;
+  const payload = refund.gatewayPayload;
+  const isSwapRefund = payload?.swapRefund === true;
+  const swapFeeCny = finiteOrNull(payload?.swapFeeCny);
+  return { amountCny, isSwapRefund, swapFeeCny };
+}
+
 /** ¥ 金额展示：整数不带小数，有零头显示两位。 */
 export function fmtRefundCny(n: number): string {
   return `¥${n.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}`;
@@ -81,13 +101,47 @@ export function refundApprovalWarning(orderNumber: string, split: RefundSplit): 
   );
 }
 
+/** 退款申请已冻结时的批准提示：冻结金额是付款义务，实时政策报价只能作为参考。 */
+export function refundApprovalFrozenWarning(
+  orderNumber: string,
+  frozen: FrozenRefundInfo,
+  split: RefundSplit,
+): string {
+  const lines = [
+    `订单 ${orderNumber}：本次按退款申请冻结金额 ${fmtRefundCny(frozen.amountCny)} 结算，不按实时政策报价打款。`,
+  ];
+  if (frozen.isSwapRefund) {
+    const fee = frozen.swapFeeCny === null ? '未知' : fmtRefundCny(frozen.swapFeeCny);
+    lines.push(`换人费 ${fee}（不退）／应退 ${fmtRefundCny(frozen.amountCny)}`);
+  }
+  if (split.available) {
+    lines.push(`当前政策报价 ${fmtRefundCny(split.totalRefundCny)} 仅作参考，不作为本次打款依据。`);
+    if (split.hasBalanceRefund) {
+      lines.push(
+        `当前政策参考拆分：退现金 ${fmtRefundCny(split.refundToCashCny)}，退回代理预存余额 ${fmtRefundCny(split.refundToBalanceCny)}。`,
+      );
+    }
+  } else {
+    lines.push('当前政策报价不可用；仍以退款申请上的冻结金额为准。');
+  }
+  lines.push('确认批准退款？');
+  return lines.join('\n\n');
+}
+
 /**
  * 读不到报价时的确认弹窗正文：不阻断退款，但把风险如实说清楚。
  * （拆分取不到就默默放行，等于把「是否重复打款」交给运气。）
  */
-export function refundApprovalUnknownWarning(orderNumber: string, errorText: string): string {
+export function refundApprovalUnknownWarning(
+  orderNumber: string,
+  errorText: string,
+  frozen?: FrozenRefundInfo | null,
+): string {
+  const frozenLine = frozen
+    ? `本次应按退款申请冻结金额 ${fmtRefundCny(frozen.amountCny)} 结算。${frozen.isSwapRefund && frozen.swapFeeCny !== null ? `换人费 ${fmtRefundCny(frozen.swapFeeCny)}（不退）。` : ''}\n\n`
+    : '';
   return (
-    `订单 ${orderNumber}：暂时读不到退款拆分（${errorText}）。\n\n` +
+    `订单 ${orderNumber}：${frozenLine}暂时读不到退款拆分（${errorText}）。\n\n` +
     `若这单用过代理预存余额抵扣，批准后余额部分会自动退回代理账户、无需人工打款；` +
     `此时按应退合计全额打现金会重复退钱。\n\n` +
     `建议稍后重试并核对拆分。仍要继续批准退款吗？`
