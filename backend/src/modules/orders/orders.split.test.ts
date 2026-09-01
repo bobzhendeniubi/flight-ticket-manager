@@ -3,8 +3,8 @@
  *
  * 覆盖：
  *   1. 权限：非 ADMIN/STAFF 调 preview/execute → ForbiddenError（未触库）。
- *   2. 准入闸矩阵：回收站/状态/两把锁/开票/佣金/退款/售后费/套餐/升舱/已出票/已结清/
- *      人数选择/同房组 —— preview 逐条返回人话 blocker。
+ *   2. 准入闸矩阵：回收站/状态/两把锁/开票/佣金/退款/售后费/套餐/升舱/已出票/
+ *      人数选择/同房组 —— preview 逐条返回人话 blocker；已结清单（原闸 13）已放开，另有放行用例。
  *   3. 纯机票 2 人拆 1 人：份额计算、行拆分（quantity/amount/成本比例）、乘客物理转移、
  *      两侧金额收口、承接 Payment 形状、拆单流水与审计。
  *   4. 按人调整行跟人走 / 整单调整行留守 + 两侧 SPLIT 平账行（±50 对称）。
@@ -253,9 +253,19 @@ describe('拆单 · 准入闸矩阵（preview 返回人话 blocker）', () => {
     expect(r.blockers.join()).toContain('已出票');
   });
 
-  it('已结清单', async () => {
+  it('已结清单（闸 13 已放开）→ 不再拦，movedPaid 按份额全额随拆', async () => {
     const r = await previewWith({ paidAmount: 2000 });
-    expect(r.blockers.join()).toContain('已结清');
+    expect(r.blockers).toEqual([]);
+    expect(r.eligible).toBe(true);
+    expect(r.movedShareCny).toBe(1000);
+    expect(r.movedPaidCny).toBe(1000); // 已结清 → min(份额 1000, 已收 2000) = 份额
+  });
+
+  it('多付单同样放行：只搬份额，多出来的钱留在源单', async () => {
+    const r = await previewWith({ paidAmount: 2600 });
+    expect(r.blockers).toEqual([]);
+    expect(r.movedShareCny).toBe(1000);
+    expect(r.movedPaidCny).toBe(1000);
   });
 
   it('拆出全员', async () => {
@@ -524,6 +534,45 @@ describe('拆单 · 执行（纯机票 2 人拆 1 人）', () => {
         data: expect.objectContaining({ orderId: 'o2', category: 'OPERATION_FEE' }),
       }),
     );
+  });
+
+  it('已结清单拆单（闸 13 放开后）：两侧各自结清，paid/total 守恒', async () => {
+    armExecute({
+      order: baseOrder({ status: 'PAID', paidAmount: 2000 }),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 1000 },
+      finalTarget: { total: 1000, paidAmount: 1000 },
+    });
+
+    const result = await service.splitOrder(
+      'o1',
+      { passengerIds: ['p1'], requestToken: TOKEN },
+      admin,
+    );
+
+    // 已结清 → 随拆已收 = 份额（不是被已收余额夹住的部分额）
+    expect(result.movedShareCny).toBe(1000);
+    expect(result.movedPaidCny).toBe(1000);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const orderUpdates = mockPrisma.order.update.mock.calls.map((c: any[]) => c[0]);
+    const srcUpdate = orderUpdates.find((u) => u.where.id === 'o1');
+    const tgtUpdate = orderUpdates.find((u) => u.where.id === 'o2');
+    // 源单仍结清（1000/1000）、新单也结清（1000/1000）；合计 total 2000、合计 paid 2000 = 拆前
+    expect(Number(srcUpdate.data.total)).toBe(1000);
+    expect(Number(srcUpdate.data.paidAmount)).toBe(1000);
+    expect(Number(tgtUpdate.data.total)).toBe(1000);
+    expect(Number(tgtUpdate.data.paidAmount)).toBe(1000);
+    expect(Number(srcUpdate.data.total) + Number(tgtUpdate.data.total)).toBe(2000);
+    expect(Number(srcUpdate.data.paidAmount) + Number(tgtUpdate.data.paidAmount)).toBe(2000);
+
+    // 新单继承源单状态（已付款），不会被 advanceOrderToPaid 再推一次
+    expect(mockPrisma.order.create.mock.calls[0][0].data.status).toBe('PAID');
+    // 承接 Payment = 全额份额
+    expect(Number(mockPrisma.payment.create.mock.calls[0][0].data.amount)).toBe(1000);
+    // 守恒断言通过 → 拆单流水落库
+    expect(mockPrisma.orderSplitRecord.create).toHaveBeenCalledTimes(1);
   });
 
   it('执行前重跑准入闸：锁内发现结算价已锁 → BadRequestError，不建新单', async () => {

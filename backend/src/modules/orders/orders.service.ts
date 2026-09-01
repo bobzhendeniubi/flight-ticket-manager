@@ -11645,12 +11645,18 @@ export class OrderService {
       blockers.push('订单已有确认出票记录（或乘客已有 PNR/票号）。已出票请走改签流程，不能拆单。');
     }
 
-    // ── 闸 13：已结清单 v1 拒绝 ──
+    // ── 闸 13（已放开）：已结清单同样可拆 ────────────────────────────────────
+    // v1 一律拒绝「已收 ≥ 应收」的单，于是三人单付清后想单独给一个人改期就彻底没路可走
+    //（拆单是按人改期的唯一通道）。复核搬款口径后放开：
+    //   · movedPaid = max(0, min(movedShare, 已收 − 已完成退款))：已结清单必然
+    //     movedPaid == movedShare（份额 ≤ 应收 ≤ 已收），
+    //     → 新单 paid == total（结清）、源单 paid−movedShare == total−movedShare（仍结清）；
+    //   · 两条守恒断言（total / paidAmount 拆前后合计相等）与座位数量断言恒成立；
+    //   · 既不产生负应收，也不制造多收：多付单（已收 > 应收）只搬份额，多出来的钱留在源单原处。
+    // 真正会对不上的是「已结清 + 代理单 → 佣金早已计提」，那由闸 7（已计提佣金）独立拦着，
+    // 与本闸无关，放开本闸不会放过它。开票（闸 6）、退款（闸 8）、售后费（闸 9）同理各拦各的。
     const preTotalCny = round2(Number(order.total));
     const prePaidCny = round2(Number(order.paidAmount));
-    if (prePaidCny >= round2(preTotalCny + order.adjustmentCny)) {
-      blockers.push('该订单已结清（已收 ≥ 应收），拆单 v1 暂不支持已结清订单。');
-    }
 
     // ── 闸 14：拆出人数 1 ≤ k < 全员，且全部属于本单 ──
     const allPaxIds = order.passengers.map((p) => p.id);
@@ -12424,6 +12430,304 @@ export class OrderService {
       })),
     };
   }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 按人改期（拆单 + 改期的组合闸口）：POST /orders/:id/reschedule-passengers
+  //
+  // 要解决的事：三人一单，只给其中一位客人改航班。
+  // 为什么不能就地改：一单一行程是全站硬约束 —— 去程/回程各一条 FLIGHT 行，开票占额、
+  // 座位统计、导出、hasReturnLeg 物化列全按「第 1 段=去程、第 2 段=回程」判。同一订单里
+  // 塞两条同航段不同班次的 FLIGHT 行，这些派生账会集体错乱。
+  // 于是走行业标准的 Split PNR：**先拆单、再对新单改期**。
+  //
+  // 两步刻意不套在同一个事务里（拆单与改期各自有自己的 $transaction、各自的行锁与守恒断言，
+  // 硬套嵌套会把两套锁序绞在一起）。因此存在「拆成了、改期没成」的中间态 —— 这是**可接受**的：
+  // 拆出来的新单本身是一张合法订单（钱与座位都守恒），不回滚；接口抛结构化 409 让运营到新单上
+  // 重试改期。同 requestToken 重试：拆单幂等回放 → 若新单已在目标班次则视为已完成（不重复收差价）。
+  // ════════════════════════════════════════════════════════════════════
+
+  /**
+   * 按人改期：把选中乘客拆成新单后对新单改期；勾选全员则等价于整单改期（不拆单）。
+   *
+   * 金额：只透传 feeCny（改期差价，±上限由 schema 把关），份额/已收转移全由拆单服务端权威计算。
+   * 座位：本方法自己不动座位 —— 拆单不动库存（两单加起来占同一批座），改期的「先放旧再原子拿新」
+   *       守卫原样生效。
+   */
+  async reschedulePassengers(
+    orderId: string,
+    input: {
+      passengerIds: string[];
+      orderItemId: string;
+      newScheduleId: string;
+      newCabin?: CabinClass;
+      feeCny?: number;
+      feeLabel?: string;
+      note?: string;
+      roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
+      requestToken: string;
+    },
+    actor: { userId: string; role: UserRole },
+  ): Promise<ReschedulePassengersResult> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可按人改期');
+    }
+
+    // ── 1. 读源单：乘客名册 + 带班次的机票行（判去程/回程用）──
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        orderNumber: true,
+        passengers: { select: { id: true } },
+        items: {
+          where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+          select: {
+            id: true,
+            flightScheduleId: true,
+            flightSchedule: { select: { departureTime: true } },
+          },
+        },
+      },
+    });
+    if (!order) throw new NotFoundError('订单不存在');
+
+    const allPaxIds = new Set(order.passengers.map((p) => p.id));
+    const movedIds = [...new Set(input.passengerIds)];
+    if (movedIds.length === 0) throw new BadRequestError('请至少选择 1 位乘客');
+    const unknownIds = movedIds.filter((id) => !allPaxIds.has(id));
+    if (unknownIds.length > 0) {
+      throw new BadRequestError('所选乘客不属于本订单（可能已被换人/拆走），请刷新后重试');
+    }
+
+    // ── 2. 把 orderItemId 解成航段（OUTBOUND / RETURN）──
+    // 拆单后新单的订单行是**新 id**（整行搬走的行 id 不变、被拆的行是新建行），源单的行 id 在
+    // 新单上不一定存在。所以这里在源单上一次性把「哪一段」定下来，改期时对新单按航段定位
+    // （rescheduleOrderItem 的 leg 入口，与批量改航班同一条路径）。
+    // 三段及以上的罕见单只认前两段（与开票六态、导出、hasReturnLeg 全站同口径）。
+    const sourceLegs = determineFlightLegItems(order.items);
+    const leg: 'OUTBOUND' | 'RETURN' | null =
+      sourceLegs.outbound?.id === input.orderItemId
+        ? 'OUTBOUND'
+        : sourceLegs.return?.id === input.orderItemId
+          ? 'RETURN'
+          : null;
+    if (!leg) {
+      throw new BadRequestError(
+        '所选航段不是本订单的去程/回程机票行，无法按人改期，请刷新订单后重试',
+      );
+    }
+
+    // ── 3. 全员勾选 → 没什么好拆的，直接走整单改期（与 PATCH /orders/:id/reschedule 同一条路径）──
+    if (movedIds.length >= allPaxIds.size) {
+      const { order: serialized, audit } = await this.rescheduleOrderItem(
+        orderId,
+        {
+          orderItemId: input.orderItemId,
+          newScheduleId: input.newScheduleId,
+          newCabin: input.newCabin,
+          feeCny: input.feeCny,
+          feeLabel: input.feeLabel,
+          note: input.note,
+        },
+        actor,
+      );
+      const result: ReschedulePassengersResult = {
+        order: serialized,
+        newOrder: null,
+        splitPerformed: false,
+        audit: {
+          orderNumber: audit.orderNumber,
+          newOrderId: null,
+          newOrderNumber: null,
+          passengerCount: movedIds.length,
+          leg,
+          orderItemId: input.orderItemId,
+          toScheduleId: input.newScheduleId,
+          feeCny: Math.trunc(input.feeCny ?? 0),
+          splitReplayed: false,
+          rescheduleSkipped: false,
+          reschedule: audit,
+          split: null,
+        },
+      };
+      await this._auditReschedulePassengers(result, actor, movedIds);
+      return result;
+    }
+
+    // ── 4. 部分乘客：先拆单（幂等，服务端权威算钱），失败则整体失败、什么都没发生 ──
+    const split = await this.splitOrder(
+      orderId,
+      {
+        passengerIds: movedIds,
+        roomSplit: input.roomSplit,
+        note: input.note,
+        requestToken: input.requestToken,
+      },
+      actor,
+    );
+
+    // ── 5. 对新单改期 ──
+    // 幂等回放（同 token 重试）时先看新单是否已经落在目标班次上：已落 = 上一轮已改成，
+    // 直接视为成功，绝不二次调用（否则 feeCny 会被再记一次流水，客人被重复收差价）。
+    // 判定用「新单上任一机票行的班次 == 目标班次」而不是重新解航段：改到更晚的日期会让
+    // 去/回程按出发时刻的排序对调，按航段回判会认错行。
+    const targetFlightRows = await prisma.orderItem.findMany({
+      where: {
+        orderId: split.targetOrderId,
+        kind: OrderItemKind.FLIGHT,
+        flightScheduleId: { not: null },
+      },
+      select: { id: true, flightScheduleId: true },
+    });
+    const alreadyRescheduled =
+      split.replayed && targetFlightRows.some((r) => r.flightScheduleId === input.newScheduleId);
+
+    let rescheduleAudit: RescheduleOrderItemAudit | null = null;
+    let newOrderSerialized: ReturnType<typeof serializeOrder> | null = null;
+    if (!alreadyRescheduled) {
+      try {
+        const rescheduled = await this.rescheduleOrderItem(
+          split.targetOrderId,
+          {
+            leg,
+            newScheduleId: input.newScheduleId,
+            newCabin: input.newCabin,
+            feeCny: input.feeCny,
+            feeLabel: input.feeLabel,
+            note: input.note,
+          },
+          actor,
+        );
+        newOrderSerialized = rescheduled.order;
+        rescheduleAudit = rescheduled.audit;
+      } catch (err) {
+        // 拆单已提交、改期失败：**不回滚拆单**（新单是一张钱与座位都守恒的合法订单，
+        // 回滚它反而要再搬一次钱）。抛结构化 409，前端据 code 提示「已拆出新单 X，
+        // 改期未成功：原因；请到新单上重试改期」。同 requestToken 重试会走上面的回放分支。
+        const reason = err instanceof Error ? err.message : '未知错误';
+        throw new AppError(
+          `已拆出新订单 ${split.targetOrderNumber}（${split.passengerCount} 人），但对新单改期未成功：${reason}。` +
+            `拆单不会回滚，请到订单 ${split.targetOrderNumber} 上重试改期。`,
+          {
+            statusCode: 409,
+            code: 'SPLIT_DONE_RESCHEDULE_FAILED',
+            details: {
+              splitPerformed: true,
+              newOrderId: split.targetOrderId,
+              newOrderNumber: split.targetOrderNumber,
+              passengerCount: split.passengerCount,
+              reason,
+            },
+          },
+        );
+      }
+    }
+
+    // ── 6. 回读两侧订单（改期返回的是新单；源单被拆过，须重读）──
+    const [sourceRow, targetRow] = await Promise.all([
+      prisma.order.findUniqueOrThrow({ where: { id: orderId }, include: ORDER_FULL_INCLUDE }),
+      newOrderSerialized
+        ? Promise.resolve(null)
+        : prisma.order.findUniqueOrThrow({
+            where: { id: split.targetOrderId },
+            include: ORDER_FULL_INCLUDE,
+          }),
+    ]);
+    const roleCtx = orderSerializeRoleCtx(actor.role);
+    const result: ReschedulePassengersResult = {
+      order: serializeOrder(sourceRow, roleCtx),
+      newOrder: newOrderSerialized ?? (targetRow ? serializeOrder(targetRow, roleCtx) : null),
+      splitPerformed: true,
+      audit: {
+        orderNumber: order.orderNumber,
+        newOrderId: split.targetOrderId,
+        newOrderNumber: split.targetOrderNumber,
+        passengerCount: split.passengerCount,
+        leg,
+        orderItemId: input.orderItemId,
+        toScheduleId: input.newScheduleId,
+        feeCny: Math.trunc(input.feeCny ?? 0),
+        splitReplayed: split.replayed,
+        rescheduleSkipped: alreadyRescheduled,
+        reschedule: rescheduleAudit,
+        split: { movedShareCny: split.movedShareCny, movedPaidCny: split.movedPaidCny },
+      },
+    };
+    await this._auditReschedulePassengers(result, actor, movedIds);
+    return result;
+  }
+
+  /**
+   * 按人改期的汇总审计（拆单的 SPLIT_ORDER×2 与改期的 RESCHEDULE_ORDER_ITEM 各自照记，
+   * 这条只补「谁把哪几个人从哪张单挪到哪张单、改到哪个班次」的一览）。
+   */
+  private async _auditReschedulePassengers(
+    result: ReschedulePassengersResult,
+    actor: { userId: string; role: UserRole },
+    movedPassengerIds: string[],
+  ): Promise<void> {
+    await writeAudit({
+      actor: { userId: actor.userId, role: actor.role },
+      action: 'RESCHEDULE_PASSENGERS',
+      targetType: AuditTargetType.ORDER,
+      targetId: result.audit.newOrderId ?? undefined,
+      targetLabel: result.audit.newOrderNumber ?? result.audit.orderNumber,
+      before: {
+        sourceOrderNumber: result.audit.orderNumber,
+        orderItemId: result.audit.orderItemId,
+        leg: result.audit.leg,
+        fromScheduleId: result.audit.reschedule?.fromScheduleId ?? null,
+        movedPassengerIds,
+      },
+      after: {
+        newOrderId: result.audit.newOrderId,
+        newOrderNumber: result.audit.newOrderNumber,
+        passengerCount: result.audit.passengerCount,
+        toScheduleId: result.audit.toScheduleId,
+        feeCny: result.audit.feeCny,
+        splitPerformed: result.splitPerformed,
+        splitReplayed: result.audit.splitReplayed,
+        rescheduleSkipped: result.audit.rescheduleSkipped,
+        movedShareCny: result.audit.split?.movedShareCny ?? null,
+        movedPaidCny: result.audit.split?.movedPaidCny ?? null,
+      },
+      severity: AuditSeverity.CRITICAL,
+    });
+  }
+}
+
+/** 单条改期的审计明细（按人改期把它原样透出，供路由记 RESCHEDULE_ORDER_ITEM）。 */
+export type RescheduleOrderItemAudit = Awaited<
+  ReturnType<OrderService['rescheduleOrderItem']>
+>['audit'];
+
+/** 按人改期的统一响应形状（POST /orders/:id/reschedule-passengers）。 */
+export interface ReschedulePassengersResult {
+  /** 源订单（部分乘客时 = 留守那张；全员改期时 = 改完期的本单）。 */
+  order: ReturnType<typeof serializeOrder>;
+  /** 拆出的新订单；全员改期（未拆单）时为 null。 */
+  newOrder: ReturnType<typeof serializeOrder> | null;
+  /** true = 走了拆单（部分乘客）；false = 全员改期，等价整单改期。 */
+  splitPerformed: boolean;
+  audit: {
+    /** 源单号。 */
+    orderNumber: string;
+    newOrderId: string | null;
+    newOrderNumber: string | null;
+    passengerCount: number;
+    leg: 'OUTBOUND' | 'RETURN';
+    orderItemId: string;
+    toScheduleId: string;
+    feeCny: number;
+    /** true = 同 requestToken 重试，拆单是幂等回放（本次没有拆出新单）。 */
+    splitReplayed: boolean;
+    /** true = 回放时新单已在目标班次，本次未再调用改期（不重复计改期差价）。 */
+    rescheduleSkipped: boolean;
+    /** 改期审计明细；rescheduleSkipped 时为 null。 */
+    reschedule: RescheduleOrderItemAudit | null;
+    /** 拆单搬走的份额与已收；未拆单时为 null。 */
+    split: { movedShareCny: number; movedPaidCny: number } | null;
+  };
 }
 
 // ── 拆单 v1 · 模块级辅助（类型 / 加载 / 纯函数）─────────────────────────────

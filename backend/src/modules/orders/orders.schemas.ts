@@ -1334,3 +1334,32 @@ export const splitOrderBodySchema = z.object({
   requestToken: z.string().min(8).max(64).uuid(),
 });
 export type SplitOrderBody = z.infer<typeof splitOrderBodySchema>;
+
+// ── 按人改期（POST /orders/:id/reschedule-passengers；ADMIN/STAFF）──────────────
+// 场景：三人一单，只给其中一位客人改航班。一单一行程是全站硬约束（去/回程各一条 FLIGHT 行），
+// 同一订单里塞不下「两个人飞 A 班次、一个人飞 B 班次」，所以走行业标准的 Split PNR：
+//   先按所选乘客把订单拆成新单（既有拆单 v1，服务端权威算钱），再对**新单**改期。
+// 勾选全员 = 没什么好拆的，等价于现有整单改期（不拆单）。
+//
+// 金额口径：只透传 feeCny（改期差价，可正可负，±上限同 rescheduleFeeSchema），
+// 拆单侧的份额/已收转移一律由服务端按人头权威计算 —— 本请求体不接受任何金额覆盖。
+// roomSplit 与拆单同形（只传间数，0.5 网格）：拆出的人占着酒店房时需显式说明搬走几间。
+// requestToken 为幂等键：同 (源单, token) 重试只回放既有拆单，不会拆出第二张新单。
+export const reschedulePassengersBodySchema = z.object({
+  passengerIds: z
+    .array(z.string().min(1))
+    .min(1, '至少选择 1 位乘客')
+    .max(99)
+    .refine((ids) => new Set(ids).size === ids.length, { message: '所选乘客不得重复' }),
+  // 要改的航段行（源单上的 FLIGHT 行 id）：服务端据此判定去程/回程，再在新单上按航段定位。
+  orderItemId: z.string().min(1, 'orderItemId 必填'),
+  newScheduleId: z.string().min(1, 'newScheduleId 必填'),
+  newCabin: z.nativeEnum(CabinClass).optional(), // 缺省沿用原舱位（改期不许改舱，同单条改期口径）
+  feeCny: rescheduleFeeSchema, // 改期差价（CNY，整数，可正可负；0/缺省=不调整价格）
+  feeLabel: z.string().max(120).optional(),
+  // 与拆单 note 同上限（本字段同时带给拆单流水与改期流水）
+  note: z.string().max(200).optional(),
+  roomSplit: splitOrderBodySchema.shape.roomSplit,
+  requestToken: z.string().min(8).max(64).uuid(),
+});
+export type ReschedulePassengersBody = z.infer<typeof reschedulePassengersBodySchema>;

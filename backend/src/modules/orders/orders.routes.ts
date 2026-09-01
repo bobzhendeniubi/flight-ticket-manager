@@ -42,6 +42,7 @@ import {
   publicOrderLookupQuerySchema,
   quoteOrderBodySchema,
   rescheduleOrderBodySchema,
+  reschedulePassengersBodySchema,
   upgradeItemCabinBodySchema,
   resolvePassengerPatchChannel,
   selfUpdatePassengerBodySchema,
@@ -2409,6 +2410,69 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     const { id } = req.params as { id: string };
     const body = splitOrderBodySchema.parse(req.body);
     return service.splitOrder(id, body, { userId: req.user.sub, role });
+  });
+
+  // ── 按人改期（ADMIN/STAFF）────────────────────────────────────────────────
+  // POST /orders/:id/reschedule-passengers
+  //   body: { passengerIds, orderItemId, newScheduleId, newCabin?, feeCny?, feeLabel?,
+  //           note?, roomSplit?, requestToken }
+  //
+  // 多人单只给其中一位客人改航班。一单一行程是全站硬约束（同单塞不下两个班次的同一航段），
+  // 所以走 Split PNR：**先按所选乘客拆单、再对新单改期**；勾选全员则不拆单，等价整单改期。
+  // 拆单与改期各自是独立事务：拆成了但改期失败 → 新单保留（它本身合法），接口回 409 且
+  // code=SPLIT_DONE_RESCHEDULE_FAILED、details 带 newOrderId/newOrderNumber，
+  // 前端提示运营到新单上重试；同 requestToken 重试幂等（拆单回放 + 已改则不重复收差价）。
+  app.post('/:id/reschedule-passengers', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可按人改期' });
+    }
+    const { id } = req.params as { id: string };
+    const body = reschedulePassengersBodySchema.parse(req.body);
+    const result = await service.reschedulePassengers(id, body, {
+      userId: req.user.sub,
+      role,
+    });
+
+    // 改期审计与单条改期口径一致（挂在**实际被改期的那张单**上：拆过则是新单）；
+    // 拆单的 SPLIT_ORDER×2 与本次的 RESCHEDULE_PASSENGERS 汇总由 service 内部照记。
+    const fmt = (d: Date | null) => (d ? d.toISOString() : null);
+    const detail = result.audit.reschedule;
+    if (detail) {
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'RESCHEDULE_ORDER_ITEM',
+        targetType: 'ORDER',
+        targetId: result.audit.newOrderId ?? id,
+        targetLabel: detail.orderNumber,
+        before: {
+          orderItemId: detail.orderItemId,
+          scheduleId: detail.fromScheduleId,
+          cabin: detail.fromCabin,
+          departure: fmt(detail.fromDeparture),
+        },
+        after: {
+          scheduleId: detail.toScheduleId,
+          cabin: detail.toCabin,
+          departure: fmt(detail.toDeparture),
+          feeCny: detail.feeCny,
+          statusChanged: detail.statusChanged,
+          note: body.note,
+          hotelDateSync: detail.hotelDateSync,
+          // 按人改期专属：这次改的是从源单拆出来的新单
+          splitFromOrderNumber: result.splitPerformed ? result.audit.orderNumber : null,
+          passengerCount: result.audit.passengerCount,
+        },
+        severity: 'WARNING',
+      });
+    }
+
+    return {
+      order: result.order,
+      newOrder: result.newOrder,
+      splitPerformed: result.splitPerformed,
+      audit: result.audit,
+    };
   });
 
   // ── 事后补收单房差（ADMIN/STAFF）──
