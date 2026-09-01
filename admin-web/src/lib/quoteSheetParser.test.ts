@@ -231,6 +231,52 @@ describe('parseOtaQuoteSheet 机票报价表', () => {
     ]);
   });
 
+  // 0901 反馈：没有「易达OTA结算」列的 5 列版报价表，右半张表整列没导进来（日历里留着旧价）
+  it('每半张只有 5 列（无「易达」列）时，右表照样出条目', () => {
+    const text = sheet(
+      row('日期', '星期', '航段', '航班号', 'OTA结算', '日期', '星期', '航段', '航班号', 'OTA结算'),
+      row('2026年9月1日', '星期二', '澳门-岘港', 'QH9589', '720', '2026年9月1日', '星期二', '岘港澳门', 'QH9588', '850'),
+      row('2026年9月3日', '星期四', '澳门-岘港', 'QH9589', '700', '2026年9月3日', '星期四', '岘港澳门', 'QH9588', '750'),
+    );
+
+    const { entries, skipped } = parseOtaQuoteSheet(text, '2026-09');
+
+    expect(skipped).toEqual([]);
+    expect(entries).toEqual([
+      { departDate: '2026-09-01', flightNumber: 'QH9588', pricePerPersonCny: 850 },
+      { departDate: '2026-09-01', flightNumber: 'QH9589', pricePerPersonCny: 720 },
+      { departDate: '2026-09-03', flightNumber: 'QH9588', pricePerPersonCny: 750 },
+      { departDate: '2026-09-03', flightNumber: 'QH9589', pricePerPersonCny: 700 },
+    ]);
+  });
+
+  it('5 列版里右表的「1100余2」进跳过明细，注明右表与原文', () => {
+    const text = row(
+      '2026年9月2日', '星期三', '澳门-岘港', 'QH9589', '680',
+      '2026年9月2日', '星期三', '岘港澳门', 'QH9588', '1100余2',
+    );
+
+    const { entries, skipped } = parseOtaQuoteSheet(text, '2026-09');
+
+    expect(entries).toEqual([
+      { departDate: '2026-09-02', flightNumber: 'QH9589', pricePerPersonCny: 680 },
+    ]);
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0].reason).toContain('右表');
+    expect(skipped[0].reason).toContain('1100余2');
+  });
+
+  it('航段列与航班号列都带航班号时算一块数据，价格仍取航班号右边一格', () => {
+    const text = row('2026-09-01', '星期二', 'QH9589澳门-岘港', 'QH9589', '720');
+
+    const { entries, skipped } = parseOtaQuoteSheet(text, '2026-09');
+
+    expect(skipped).toEqual([]);
+    expect(entries).toEqual([
+      { departDate: '2026-09-01', flightNumber: 'QH9589', pricePerPersonCny: 720 },
+    ]);
+  });
+
   it('日期认不出但有航班号的行不静默丢弃', () => {
     const text = row('待定', '星期六', '澳门-岘港', 'QH9589', '900', '900');
 

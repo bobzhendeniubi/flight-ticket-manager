@@ -225,24 +225,41 @@ export function parseGroundQuoteSheet(
   return { entries, skipped };
 }
 
-/** OTA sheet 半张表的列序：日期 星期 航段 航班号 OTA结算 易达OTA结算。 */
-const OTA_HALF_WIDTH = 6;
-const OTA_DATE_COL = 0;
-const OTA_FLIGHT_COL = 3;
-const OTA_PRICE_COL = 4;
+/**
+ * OTA sheet 一块数据的列序：日期 星期 航段 航班号 OTA结算 [易达OTA结算]。
+ *
+ * 「易达OTA结算」列有的表有、有的表没有，所以半张表宽度**不写死**——0901 反馈：每半张只有
+ * 5 列的报价表被按 6 列切，右半张表整体错位一格（第 4 格切到价格数字上），匹配不到航班号后
+ * 整列静默丢弃，日历里留着上一次的旧价，看着像「识别错了」。
+ *
+ * 改成认航班号列本身：一行里每个含航班号的单元格 = 一块数据，价格取它右边一格（永远是
+ * 「OTA结算」，不会串到「易达」），日期从航班号列往左找、找到本块起点为止（不会串到左边那
+ * 张表的日期）。「航段」与「航班号」两列都带同一航班号时（如「QH9589澳门-岘港」+「QH9589」）
+ * 只认右边那列。
+ */
+const OTA_BLOCK_LABELS = ['左表', '右表'];
+
+/** 一行里第 k 块数据的称呼（用于跳过明细，让运营知道是左边还是右边那张表）。 */
+function otaBlockLabel(index: number): string {
+  return OTA_BLOCK_LABELS[index] ?? `第 ${index + 1} 张表`;
+}
+
+/** 单元格里的航班号（大写后匹配），没有返回 null。 */
+function flightInCell(cell: string | undefined): string | null {
+  const m = FLIGHT_IN_CELL.exec((cell ?? '').toUpperCase());
+  return m ? m[0] : null;
+}
 
 /**
  * OTA sheet（左右两张并排表）→ 机票结算价条目。
  *
- * 一行 12 列 = 左表 6 列 + 右表 6 列：
- *   日期 星期 航段 航班号 OTA结算 易达OTA结算 | 日期 星期 航段 航班号 OTA结算 易达OTA结算
- *   2026-08-08 星期六 澳门-岘港 QH9589 900 900 | 2026-08-08 星期六 岘港澳门 QH9588 售罄 955余1
+ * 一行 = 并排的若干块数据，每块「日期 星期 航段 航班号 OTA结算 [易达OTA结算]」：
+ *   2026-09-01 星期二 澳门-岘港 QH9589 720 | 2026-09-01 星期二 岘港澳门 QH9588 850
  *
- * 每行拆成左右两条候选各自解析：
- *   • 权威价取「OTA结算」列（各半第 5 列），不取「易达」列；
- *   • 「售罄」「765余7」「1200结算余1」等非纯数字 → 该条跳过并列入跳过明细；
- *   • 右表日期可能是 Excel 序列号（如 46243），也可能与左表同格式，都兼容；
- *   • 只复制半张表（≥6 列不足 12 列）时按单表解析。
+ *   • 权威价取航班号右边一格的「OTA结算」，不取「易达」列；
+ *   • 「售罄」「765余7」「1100余2」等非纯数字 → 该条跳过并列入跳过明细（不写、不清空既有值）；
+ *   • 日期可能是 Excel 序列号（如 46243），也可能是 YYYY-MM-DD / M/D，都兼容；
+ *   • 只复制半张表、或某行只有右表有内容，都照样解析。
  * 同一 (出发日, 航班号) 重复出现时取最后一次。
  */
 export function parseOtaQuoteSheet(
@@ -253,39 +270,51 @@ export function parseOtaQuoteSheet(
   const byKey = new Map<string, OtaQuoteEntry>();
 
   for (const { line, cells } of toLines(text)) {
-    const halves: Array<{ label: string; cells: string[] }> = [
-      { label: '左表', cells: cells.slice(0, OTA_HALF_WIDTH) },
-    ];
-    if (cells.length > OTA_HALF_WIDTH) {
-      halves.push({ label: '右表', cells: cells.slice(OTA_HALF_WIDTH, OTA_HALF_WIDTH * 2) });
-    }
+    // 航班号列 = 「这里有一块数据」的标志；表头/公告/空行都没有，静默跳过
+    const anchors: number[] = [];
+    cells.forEach((c, i) => {
+      if (flightInCell(c)) anchors.push(i);
+    });
+    // 「航段 + 航班号」相邻两列带同一航班号时只留右边那列，避免同一块数据认成两块
+    const blocks = anchors.filter((idx, k) => {
+      const next = anchors[k + 1];
+      return !(next === idx + 1 && flightInCell(cells[next]) === flightInCell(cells[idx]));
+    });
 
-    for (const half of halves) {
-      // 航班号 = 「这是一条数据行」的标志；表头/公告/空白半边都没有，静默跳过
-      const flightMatch = FLIGHT_IN_CELL.exec((half.cells[OTA_FLIGHT_COL] ?? '').toUpperCase());
-      if (!flightMatch) continue;
-      const flightNumber = flightMatch[0];
+    blocks.forEach((flightIdx, k) => {
+      const flightNumber = flightInCell(cells[flightIdx]) as string;
+      const label = otaBlockLabel(k);
+      const blockStart = k === 0 ? 0 : blocks[k - 1] + 1;
+      const nextBlockStart = blocks[k + 1] ?? cells.length;
+      const raw = rawPreview(cells.slice(blockStart, Math.min(flightIdx + 3, nextBlockStart)));
 
-      const dateRaw = half.cells[OTA_DATE_COL] ?? '';
-      const departDate = parseQuoteDate(dateRaw, baseMonth);
+      const priceRaw = cells[flightIdx + 1] ?? '';
+      const price = parsePrice(priceRaw);
+
+      let departDate: string | null = null;
+      for (let i = flightIdx - 1; i >= blockStart; i -= 1) {
+        departDate = parseQuoteDate(cells[i], baseMonth);
+        if (departDate) break;
+      }
       if (!departDate) {
+        // 日期与价格都不成立 = 表头/小标题行（如「澳门-岘港QH9589 15:45-16:30（去程）」），
+        // 静默跳过，别把噪声灌进跳过清单
+        if (price === null) return;
         skipped.push({
           line,
-          reason: `${half.label} ${flightNumber} 的日期「${dateRaw || '空'}」认不出来`,
-          raw: rawPreview(half.cells),
+          reason: `${label} ${flightNumber} 的日期「${cells[blockStart] || '空'}」认不出来`,
+          raw,
         });
-        continue;
+        return;
       }
 
-      const priceRaw = half.cells[OTA_PRICE_COL] ?? '';
-      const price = parsePrice(priceRaw);
       if (price === null) {
         skipped.push({
           line,
-          reason: `${half.label} ${departDate} ${flightNumber} 的 OTA结算「${priceRaw || '空'}」不是纯数字`,
-          raw: rawPreview(half.cells),
+          reason: `${label} ${departDate} ${flightNumber} 的 OTA结算「${priceRaw || '空'}」不是纯数字`,
+          raw,
         });
-        continue;
+        return;
       }
 
       byKey.set(`${departDate}__${flightNumber}`, {
@@ -293,7 +322,7 @@ export function parseOtaQuoteSheet(
         flightNumber,
         pricePerPersonCny: price,
       });
-    }
+    });
   }
 
   const entries = [...byKey.values()].sort(
