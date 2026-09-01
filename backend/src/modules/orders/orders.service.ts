@@ -45,7 +45,11 @@ import {
 } from '../../lib/errors.js';
 import type { ItineraryData } from '../../lib/itinerary-pdf.js';
 import { writeAudit } from '../../lib/audit.js';
-import { splitPassengerFullName } from '../../lib/passenger-name.js';
+import {
+  composePassengerFullName,
+  normalizePassengerFullName,
+  splitPassengerFullName,
+} from '../../lib/passenger-name.js';
 import { localHHMM, localDateISO, localToUtc } from '../../lib/flight-time.js';
 import { BUSINESS_TZ } from '../../lib/business-time.js';
 import {
@@ -14044,6 +14048,20 @@ export function passengerToData(
 ) {
   // 自动拆 fullName → lastName/firstName，如果客户端没传（斜线优先，见 splitPassengerFullName）
   const { lastName: autoLast, firstName: autoFirst } = splitPassengerFullName(p.fullName);
+  // 拆名截断兜底（0831 公测反馈：LAM/MENG IEONG 入库成 LAM+MENG）：名单解析入口可能产出
+  // 「全名是全的、拆名却截断」的组合——散行解析吃不满多词名，录单员手动改全名时解析残留的
+  // 隐藏拆名没跟着改。只纠**截断**（拆名拼回去是全名的前缀但更短）→ 按全名重拆；
+  // 显式传入的、与全名整体不同的姓/名维持优先（既有口径，见 orders.service.test.ts）。
+  // 中文全名不带斜线不受影响（orders.import「中文姓名 + 拉丁 PNR 拆名」组合照旧放行）。
+  const composedProvided =
+    p.lastName || p.firstName ? composePassengerFullName(p.lastName, p.firstName) : null;
+  const normalizedFull = normalizePassengerFullName(p.fullName);
+  const trustProvidedSplit = !(
+    p.fullName.includes('/') &&
+    composedProvided !== null &&
+    composedProvided !== normalizedFull &&
+    normalizedFull.startsWith(composedProvided)
+  );
   const dateOfBirth = new Date(p.dateOfBirth);
   const hasValidDob = Boolean(p.dateOfBirth) && !Number.isNaN(dateOfBirth.getTime());
   // 乘客类型服务端权威派生（覆盖客户端传值）：入口层（前台下单页/批量导入解析层）已尽量按
@@ -14056,8 +14074,8 @@ export function passengerToData(
       : p.passengerType;
   return {
     fullName: p.fullName,
-    lastName: p.lastName ?? (autoLast || null),
-    firstName: p.firstName ?? (autoFirst || null),
+    lastName: trustProvidedSplit ? (p.lastName ?? (autoLast || null)) : autoLast || null,
+    firstName: trustProvidedSplit ? (p.firstName ?? (autoFirst || null)) : autoFirst || null,
     title: p.title ?? null,
     gender: p.gender ?? null,
     documentType: p.documentType,

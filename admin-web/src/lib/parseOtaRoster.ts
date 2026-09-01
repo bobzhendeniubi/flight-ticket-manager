@@ -439,8 +439,25 @@ function parseLoosePassengerLine(line: string, dmy = false): WorkPassenger | nul
   const stripped = line.replace(/^\d{1,3}\s*[.、)]?\s+/, '');
   const nameMatch = stripped.match(/^([A-Za-z]+)\/([A-Za-z]+)\b\s*(.*)$/);
   if (!nameMatch) return null;
-  const [, last, first, restRaw] = nameMatch;
+  const [, last, firstHead, restRaw] = nameMatch;
   const tokens = restRaw.split(' ').map((t) => t.trim()).filter(Boolean);
+  if (tokens.length === 0) return null;
+
+  // 多词名吸收（0831 公测反馈：LAM/MENG IEONG 被截成 LAM/MENG）：港澳台/外籍名常有多个
+  // 词（MENG IEONG、MEI LING），紧跟名后的纯字母 token 若既不是性别词也不是国籍词就并入名。
+  // 单字母（M/F 性别码）与含数字 token（证件号）天然不吸收；吸收在性别/证件识别前进行，
+  // 消费掉的 token 不再参与后续字段判定。
+  const firstParts = [firstHead];
+  while (tokens.length > 0) {
+    const t = tokens[0];
+    if (!/^[A-Za-z]{2,}$/.test(t)) break;
+    if (/^(?:MR|MRS|MS|MISS|MSTR|MASTER|CHD|INF)$/iu.test(t)) break; // 称谓/类型码不是名
+    if (parseGender(t) !== null) break;
+    if (parseCountry(t) !== null) break;
+    firstParts.push(t);
+    tokens.shift();
+  }
+  const first = firstParts.join(' ');
   if (tokens.length === 0) return null;
 
   const genderToken = tokens.find((t) => parseGender(t) !== null);

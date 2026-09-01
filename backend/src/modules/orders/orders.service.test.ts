@@ -1502,6 +1502,41 @@ describe('passengerToData — 套餐乘客级选项落库', () => {
     expect(data.lastName).toBe('LI');
     expect(data.firstName).toBe('SI');
   });
+
+  // 拆名截断兜底（0831 公测反馈）：名单解析残留的截断拆名（LAM+MENG）跟着改好的全名
+  //（LAM/MENG IEONG）一起提交时，按全名重拆，多词名不丢。
+  it('拆名是全名的截断前缀 → 弃用，按全名重拆（IEONG 不丢）', () => {
+    const data = passengerToData({
+      ...base,
+      fullName: 'LAM/MENG IEONG',
+      lastName: 'LAM',
+      firstName: 'MENG',
+    });
+    expect(data.lastName).toBe('LAM');
+    expect(data.firstName).toBe('MENG IEONG');
+  });
+
+  it('拆名与全名一致 → 原样落库（非截断不干预）', () => {
+    const data = passengerToData({
+      ...base,
+      fullName: 'LAM/MENG IEONG',
+      lastName: 'LAM',
+      firstName: 'MENG IEONG',
+    });
+    expect(data.lastName).toBe('LAM');
+    expect(data.firstName).toBe('MENG IEONG');
+  });
+
+  it('中文全名（无斜线）+ 拉丁拆名 → 拆名保留（表格导入组合不受影响）', () => {
+    const data = passengerToData({
+      ...base,
+      fullName: '王明',
+      lastName: 'WANG',
+      firstName: 'MING',
+    });
+    expect(data.lastName).toBe('WANG');
+    expect(data.firstName).toBe('MING');
+  });
 });
 
 // ── 乘客字段落库映射：passengerToData 出行人类型服务端权威派生（覆盖客户端传值）──────

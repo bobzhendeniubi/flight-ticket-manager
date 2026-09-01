@@ -148,3 +148,27 @@ describe('冒号多行 · 日-月-年（dateOrder: DMY）', () => {
     expect(withoutOpts.warnings.some((w) => w.includes('歧义'))).toBe(true);
   });
 });
+
+describe('散行乘客 · 多词名（0831 公测反馈：LAM/MENG IEONG 被截成 LAM/MENG）', () => {
+  it('名后的纯字母 token 并入名，性别/证件/日期照常识别', () => {
+    const r = parseOtaRoster(
+      'QH9588 DAD-MFM 2026-09-01\nLAM/MENG IEONG M 普通 MC1234567 中国澳门 1988-05-02 2030-01-15',
+    );
+    expect(r.passengers).toHaveLength(1);
+    expect(r.passengers[0]).toMatchObject({
+      fullName: 'LAM/MENG IEONG',
+      lastName: 'LAM',
+      firstName: 'MENG IEONG',
+      gender: 'M',
+      documentNumber: 'MC1234567',
+    });
+  });
+
+  it('称谓 MR 不并入名；单词名行为不变', () => {
+    const r = parseOtaRoster(
+      'QH9588 DAD-MFM 2026-09-01\nFANG/BIN MR M 普通 EM9441432 中国大陆 1983-11-25 2034-07-08',
+    );
+    expect(r.passengers).toHaveLength(1);
+    expect(r.passengers[0]).toMatchObject({ fullName: 'FANG/BIN', gender: 'M' });
+  });
+});
