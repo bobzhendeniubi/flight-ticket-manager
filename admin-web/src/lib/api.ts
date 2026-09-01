@@ -1545,6 +1545,12 @@ export interface OrderSummary {
   // 新增字段（5/20 反馈）
   notes?: string | null;
   internalNotes?: string | null;
+  /** 非空 = 本单因换人退款；列表/导出用来区分普通退款。 */
+  swapRefundedAt?: string | null;
+  /** 换人费（CNY 整数），从净收款中扣留。 */
+  swapFeeCny?: number | null;
+  /** 接手位子的订单号，仅作记录，不发生订单间资金转移。 */
+  swapReplacementOrderNumber?: string | null;
 
   // 签证状态 + 结构化备注（详情 getOrder 带出；列表可能为空）
   visaStatus?: VisaStatusInput | null;
@@ -1564,7 +1570,8 @@ export interface OrderSummary {
   /**
    * 订单详情(getOrder)带出的退款记录（列表不含）。
    * ⚠️ amount 是**申请时冻结的应退总额**，含「会自动退回代理预存余额」的部分——
-   * 不能当成财务要打的现金额。打款金额看退款拆分（GET /orders/:id/refund-quote 的 refundToCashCny）。
+   * 存在 REQUESTED 申请时，批准主数字必须以它为准；GET /orders/:id/refund-quote 只作实时政策参考。
+   * 若有代理预存余额拆分，实际现金/余额分配仍按后端批准流程处理。
    */
   refunds?: OrderRefund[];
 
@@ -1729,13 +1736,20 @@ export type RefundRecordStatus = 'REQUESTED' | 'APPROVED' | 'PROCESSING' | 'COMP
 export interface OrderRefund {
   id: string;
   orderId: string;
-  /** 申请时冻结的应退**总额**（含自动退回代理余额的部分），不是打款金额 */
+  /** 申请时冻结的应退金额；存在 REQUESTED 申请时，批准主数字以此为准。普通退款的余额拆分另行参考报价。 */
   amount: string;
   reason: string | null;
   status: RefundRecordStatus;
   processedAt: string | null;
   createdAt: string;
   updatedAt: string;
+  gatewayPayload?: {
+    swapRefund?: boolean;
+    swapFeeCny?: number;
+    refundAmountCny?: number;
+    replacementOrderNumber?: string | null;
+    [key: string]: unknown;
+  } | null;
 }
 
 // ── 退款报价（GET /orders/:id/refund-quote）────────────────────────────────
@@ -3783,6 +3797,32 @@ export const api = {
       `/orders/${id}/cancel`,
       { method: 'POST', token, body: reason ? { reason } : {} },
     ),
+  /**
+   * 换人退款：手填换人费，生成待财务批准的退款申请并释放源订单座位。
+   * replacementOrderNumber 只作记录，钱不会转到接手订单。
+   */
+  swapRefund: (
+    token: string,
+    id: string,
+    body: { swapFeeCny: number; replacementOrderNumber?: string; reason: string },
+  ) =>
+    apiFetch<{
+      order: OrderSummary;
+      netPaidCny: number;
+      swapFeeCny: number;
+      refundAmountCny: number;
+      refundId: string;
+    }>(`/orders/${id}/swap-refund`, { method: 'POST', token, body }),
+  updateSwapReplacementOrderNumber: (
+    token: string,
+    id: string,
+    replacementOrderNumber: string | null,
+  ) =>
+    apiFetch<{ order: OrderSummary }>(`/orders/${id}/swap-replacement-order`, {
+      method: 'PATCH',
+      token,
+      body: { replacementOrderNumber },
+    }),
   updateOrderStatus: (token: string, id: string, toStatus: OrderStatus, reason?: string, force?: boolean) =>
     apiFetch<{
       order: OrderSummary & {

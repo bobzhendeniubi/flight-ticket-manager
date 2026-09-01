@@ -16,7 +16,13 @@ import { computePerPaxSettlement } from '../lib/perPaxSettlement';
 import type { AgentListItem, OrderImportParseResult } from '../lib/api';
 import { OrderFinanceSection } from '../components/OrderFinanceSection';
 import { RefundSplitCard } from '../components/RefundSplitCard';
-import { readRefundSplit, refundApprovalUnknownWarning, refundApprovalWarning } from '../lib/refundSplit';
+import {
+  readRefundSplit,
+  readRequestedRefund,
+  refundApprovalFrozenWarning,
+  refundApprovalUnknownWarning,
+  refundApprovalWarning,
+} from '../lib/refundSplit';
 import { OrderAuditTrail } from '../components/OrderAuditTrail';
 import { SingleOrderModal } from '../components/SingleOrderModal';
 import {
@@ -34,7 +40,7 @@ import { runPassportOcr, ocrReviewHintText } from '../lib/passportOcrRunner';
 import { ORDER_STATUS_META, orderStatusBadgeClass, orderStatusLabel } from '../lib/orderStatus';
 import { SUBMISSION_BADGE, SUBMISSION_LABEL } from '../lib/visaSubmission';
 import { useConfirm } from '../components/ConfirmDialog';
-import { useDialogA11y } from '../components/Modal';
+import { Modal, useDialogA11y } from '../components/Modal';
 import { groupHotelsByBundleTier } from '../lib/settlement-tier';
 
 // 批量开票下拉的六个选项（票务岗 0715 反馈）：按航段/系统三个布尔位各自「标已开/标未开」，
@@ -105,6 +111,30 @@ const REFUND_REQUESTABLE_STATUSES = new Set<OrderStatus>([
   'CHANGE_REQUESTED',
   'CHANGED',
 ]);
+
+// 换人退款入口只对仍持有有效机位的订单开放；用枚举值判断，避免 UI 标签改写后静默放错入口。
+const SWAP_REFUND_SEAT_HOLDING_STATUSES = new Set<OrderStatus>([
+  'PENDING_PAYMENT',
+  'PAID',
+  'PROCESSING',
+  'TICKETED',
+  'COMPLETED',
+  'CHANGE_REQUESTED',
+  'CHANGED',
+]);
+const SWAP_REFUND_CANCELLABLE_STATUSES = new Set<OrderStatus>([
+  'PAID',
+  'PROCESSING',
+  'TICKETED',
+  'CHANGE_REQUESTED',
+  'CHANGED',
+  'FAILED',
+]);
+const REFUND_FAMILY_STATUSES = new Set<OrderStatus>(['REFUND_REQUESTED', 'REFUNDED']);
+
+function roundCny(value: number): number {
+  return Math.round(value * 100) / 100;
+}
 
 // 理由必填的场景：强制改状态（绕过状态机，需要留痕解释为什么）、或目标态本身是
 // 不可逆/影响资金的（取消、退款）。其余标准流转不强制，避免运营被迫为每次正常
@@ -1183,9 +1213,18 @@ export function OrdersPage() {
    */
   const confirmRefundApproval = async (order: OrderSummary): Promise<boolean> => {
     if (!tokens?.accessToken) return false;
+    let approvalOrder = order;
     try {
+      // 列表行不带 refunds；批准前必须补水读取 REQUESTED Refund，否则会把实时政策报价误当成冻结义务。
+      if (approvalOrder.refunds === undefined) {
+        approvalOrder = (await api.getOrder(tokens.accessToken, order.id)).order;
+      }
+      const frozen = readRequestedRefund(approvalOrder);
       const { quote } = await api.refundQuote(tokens.accessToken, order.id);
-      const warning = refundApprovalWarning(order.orderNumber, readRefundSplit(quote));
+      const split = readRefundSplit(quote);
+      const warning = frozen
+        ? refundApprovalFrozenWarning(order.orderNumber, frozen, split)
+        : refundApprovalWarning(order.orderNumber, split);
       return warning === null
         ? true
         : confirm({ title: '确认同意退款？', body: warning, tone: 'danger' });
@@ -1193,7 +1232,7 @@ export function OrdersPage() {
       const text = err instanceof ApiError ? err.message : '读取失败';
       return confirm({
         title: '无法读取退款拆分，仍要继续？',
-        body: refundApprovalUnknownWarning(order.orderNumber, text),
+        body: refundApprovalUnknownWarning(order.orderNumber, text, readRequestedRefund(approvalOrder)),
         tone: 'danger',
       });
     }
@@ -2147,6 +2186,13 @@ export function OrdersPage() {
                   paid: deriveBalance(order).paid,
                   balance: deriveBalance(order).balance,
                   status: orderStatusLabel(order.status),
+                  refundType: order.swapRefundedAt
+                    ? '换人退款'
+                    : REFUND_FAMILY_STATUSES.has(order.status)
+                      ? '普通退款'
+                      : '',
+                  swapFeeCny: order.swapFeeCny ?? '',
+                  replacementOrderNumber: order.swapReplacementOrderNumber ?? '',
                   createdAt: formatDateTimeSecCn(order.createdAt),
                 })),
                 [
@@ -2162,6 +2208,9 @@ export function OrdersPage() {
                   { key: 'paid', label: '已付(元)', format: csvNumber },
                   { key: 'balance', label: '尾款(元)', format: csvNumber },
                   { key: 'status', label: '状态' },
+                  { key: 'refundType', label: '退款类型' },
+                  { key: 'swapFeeCny', label: '换人费(元)', format: csvNumber },
+                  { key: 'replacementOrderNumber', label: '接手订单号' },
                   { key: 'createdAt', label: '下单时间' },
                 ],
               )
@@ -3717,9 +3766,19 @@ export function OrdersPage() {
                   )}
                   {columnVisibility.status && (
                   <td className="text-center">
-                    <span className={orderStatusBadgeClass(order.status)}>
-                      {orderStatusLabel(order.status)}
-                    </span>
+                    <div className="flex flex-wrap items-center justify-center gap-1">
+                      <span className={orderStatusBadgeClass(order.status)}>
+                        {orderStatusLabel(order.status)}
+                      </span>
+                      {order.swapRefundedAt && (
+                        <span
+                          className="badge-warning text-[10px]"
+                          title={`因换人退款，换人费 ¥${order.swapFeeCny ?? 0}，接手订单${order.swapReplacementOrderNumber ? ` ${order.swapReplacementOrderNumber}` : ' 未填写'}`}
+                        >
+                          换人
+                        </span>
+                      )}
+                    </div>
                   </td>
                   )}
                   {columnVisibility.visa && (
@@ -4226,6 +4285,7 @@ function OrderDrawer({
   const token = tokens?.accessToken ?? '';
   const dialogRef = useDialogA11y(onClose);
   const role = useAuth((s) => s.user?.role);
+  const bumpSeats = useFlightSeats((s) => s.bumpSeats);
   // 内部角色（ADMIN/STAFF）才看逐项拆价折叠区；AGENT/CUSTOMER 只看「产品内容 + 订单总价」，不露内部金额明细。
   const canSeeInternal = role === 'ADMIN' || role === 'STAFF';
   // 删单同为内部员工权限；与 isAdmin（强制改状态）分开判断。
@@ -4262,10 +4322,133 @@ function OrderDrawer({
   const o = hydrated ?? order;
   const view = deriveView(o);
   const bal = deriveBalance(o);
+  // 换人退款必须等详情补水拿到 refunds 后才能计算净收款；列表快照只有 paidAmount，不能拿它冒充净收款。
+  const swapRefundNetPaidCny = useMemo(() => {
+    const refunds = hydrated?.refunds;
+    if (!hydrated || !refunds) return null;
+    const paid = Number(hydrated.paidAmount);
+    if (!Number.isFinite(paid)) return null;
+    const completedRefunds = refunds.reduce((sum, refund) => {
+      if (refund.status !== 'COMPLETED') return sum;
+      const amount = Number(refund.amount);
+      return Number.isFinite(amount) ? sum + amount : sum;
+    }, 0);
+    return roundCny(paid - completedRefunds);
+  }, [hydrated]);
+  const [swapRefundOpen, setSwapRefundOpen] = useState(false);
+  const [swapFeeInput, setSwapFeeInput] = useState('');
+  const [swapReplacementOrderNumber, setSwapReplacementOrderNumber] = useState('');
+  const [swapRefundReason, setSwapRefundReason] = useState('');
+  const [swapRefundSubmitting, setSwapRefundSubmitting] = useState(false);
+  const [swapRefundError, setSwapRefundError] = useState<string | null>(null);
+  const [replacementEditOpen, setReplacementEditOpen] = useState(false);
+  const [replacementEditValue, setReplacementEditValue] = useState('');
+  const [replacementEditSubmitting, setReplacementEditSubmitting] = useState(false);
+  const [replacementEditError, setReplacementEditError] = useState<string | null>(null);
+  const swapFeePreview = swapFeeInput.trim() === '' ? null : Number(swapFeeInput);
+  const swapFeePreviewValid = swapFeePreview !== null && Number.isInteger(swapFeePreview) && swapFeePreview >= 0;
+  const swapRefundPreview =
+    swapRefundNetPaidCny !== null && swapFeePreviewValid
+      ? roundCny(swapRefundNetPaidCny - swapFeePreview)
+      : null;
+  const swapRefundDisabledReason = !hydrated
+    ? '详情尚未补水完成，无法读取已完成退款并计算净收款'
+    : !SWAP_REFUND_SEAT_HOLDING_STATUSES.has(o.status)
+      ? '本单不在占座态，座位已释放，不能做换人退款'
+      : !SWAP_REFUND_CANCELLABLE_STATUSES.has(o.status)
+        ? '当前订单状态不可做换人退款，请按正常退款流程处理'
+        : swapRefundNetPaidCny === null
+          ? '退款记录尚未加载完成，无法计算净收款'
+          : swapRefundNetPaidCny <= 0
+            ? '该订单没有可退的已收款（净收款 ≤ 0）'
+            : null;
   // 子组件（改期/换人/改价）拿到更新后的整单 → 同步抽屉本地 hydrated + 冒泡给父级刷列表。
   const handleOrderUpdated = (updated: OrderSummary) => {
     setHydrated(updated);
     onOrderUpdated?.(updated);
+  };
+
+  const submitSwapRefund = async (): Promise<void> => {
+    if (!token || swapRefundSubmitting || swapRefundDisabledReason) return;
+    const swapFeeCny = Number(swapFeeInput);
+    if (!Number.isInteger(swapFeeCny) || swapFeeCny < 0) {
+      setSwapRefundError('换人费必须填写为大于等于 0 的整数 CNY');
+      return;
+    }
+    if (swapRefundNetPaidCny === null) {
+      setSwapRefundError('退款记录尚未加载完成，无法计算净收款');
+      return;
+    }
+    if (swapFeeCny > swapRefundNetPaidCny) {
+      setSwapRefundError(
+        `换人费 ¥${swapFeeCny.toFixed(2)} 超过净收款 ¥${swapRefundNetPaidCny.toFixed(2)}，请填写不超过净收款的金额`,
+      );
+      return;
+    }
+    const reason = swapRefundReason.trim();
+    if (!reason) {
+      setSwapRefundError('请填写换人退款原因');
+      return;
+    }
+    if (highRiskConfirmRef.current) return;
+    highRiskConfirmRef.current = true;
+    const refundAmountCny = roundCny(swapRefundNetPaidCny - swapFeeCny);
+    const confirmed = await confirm({
+      title: '确认提交换人退款？',
+      body:
+        `扣 ¥${swapFeeCny} 换人费、退 ¥${refundAmountCny} 给客人，本单进入退款申请中。
+
+提交后座位当场释放；退款要等财务核账批准后才真正打款，不是立刻到账。
+本单代理佣金将全额冲销。接手订单号只作记录用，这笔钱不会转到那张单上。`,
+      tone: 'danger',
+    });
+    if (!confirmed) {
+      highRiskConfirmRef.current = false;
+      return;
+    }
+    setSwapRefundSubmitting(true);
+    setSwapRefundError(null);
+    try {
+      const result = await api.swapRefund(token, o.id, {
+        swapFeeCny,
+        replacementOrderNumber: swapReplacementOrderNumber.trim() || undefined,
+        reason,
+      });
+      handleOrderUpdated(result.order);
+      setSwapRefundOpen(false);
+      setSwapFeeInput('');
+      setSwapReplacementOrderNumber('');
+      setSwapRefundReason('');
+      onChanged?.();
+      bumpSeats();
+    } catch (err) {
+      // 后端中文错误是运营处理订单所需的具体指引，ApiError 原样保留并让弹窗继续打开。
+      setSwapRefundError(err instanceof ApiError ? err.message : '操作失败，请稍后重试');
+    } finally {
+      setSwapRefundSubmitting(false);
+      highRiskConfirmRef.current = false;
+    }
+  };
+
+  const submitReplacementEdit = async (): Promise<void> => {
+    if (!token || replacementEditSubmitting) return;
+    setReplacementEditSubmitting(true);
+    setReplacementEditError(null);
+    try {
+      const result = await api.updateSwapReplacementOrderNumber(
+        token,
+        o.id,
+        replacementEditValue.trim() || null,
+      );
+      handleOrderUpdated(result.order);
+      setReplacementEditOpen(false);
+      onChanged?.();
+    } catch (err) {
+      // 后端原样返回目标订单校验原因，弹窗保持打开方便运营修正。
+      setReplacementEditError(err instanceof ApiError ? err.message : '操作失败，请稍后重试');
+    } finally {
+      setReplacementEditSubmitting(false);
+    }
   };
 
   // #4/#5 分房：应分房未分房 → 显示「分房」按钮；已分房 → 摘要 + 「调整分房」。
@@ -4455,7 +4638,40 @@ function OrderDrawer({
           <section className="space-y-3">
             {/* 付款情况（与列表尾款/状态一致；抵扣读 notePayment）*/}
             <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
-              <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">付款情况</div>
+              <div className="flex items-center justify-between gap-2">
+                <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">付款情况</div>
+                {isOps && (
+                  <button
+                    type="button"
+                    className="btn-danger px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                    disabled={swapRefundDisabledReason !== null}
+                    title={swapRefundDisabledReason ?? '手填换人费并提交换人退款申请'}
+                    onClick={() => {
+                      setSwapFeeInput('');
+                      setSwapReplacementOrderNumber('');
+                      setSwapRefundReason('');
+                      setSwapRefundError(null);
+                      setSwapRefundOpen(true);
+                    }}
+                  >
+                    换人退款
+                  </button>
+                )}
+                {isOps && o.swapRefundedAt && (
+                  <button
+                    type="button"
+                    className="text-[11px] font-medium text-brand hover:text-brand-dark"
+                    onClick={() => {
+                      setReplacementEditValue(o.swapReplacementOrderNumber ?? '');
+                      setReplacementEditError(null);
+                      setReplacementEditOpen(true);
+                    }}
+                    title="补填或修改接手订单号（只作记录，不发生订单间资金转移）"
+                  >
+                    {o.swapReplacementOrderNumber ? '修改接手订单号' : '补填接手订单号'}
+                  </button>
+                )}
+              </div>
               <div className="mt-1.5 flex items-baseline gap-1 text-sm">
                 <span className="nums text-lg font-semibold text-emerald-700">¥{bal.paid.toLocaleString()}</span>
                 <span className="text-ink-muted"> / 应收 ¥{bal.payable.toLocaleString()}</span>
@@ -4499,6 +4715,174 @@ function OrderDrawer({
                 防止财务照应退合计全额打款、与系统自动回补重复退钱。 */}
             <RefundSplitCard order={o} />
           </section>
+
+          {isOps && (
+            <Modal
+              open={swapRefundOpen}
+              onClose={() => {
+                if (!swapRefundSubmitting) setSwapRefundOpen(false);
+              }}
+              title="换人退款"
+              size="md"
+              footer={(
+                <div className="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    disabled={swapRefundSubmitting}
+                    onClick={() => setSwapRefundOpen(false)}
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-danger disabled:cursor-not-allowed disabled:opacity-50"
+                    disabled={swapRefundSubmitting || swapRefundDisabledReason !== null || !swapFeePreviewValid || swapRefundPreview === null || swapRefundPreview < 0}
+                    onClick={() => void submitSwapRefund()}
+                  >
+                    {swapRefundSubmitting ? '提交中…' : '提交换人退款'}
+                  </button>
+                </div>
+              )}
+            >
+              <div className="space-y-4 px-5 py-4">
+                <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs leading-5 text-amber-800">
+                  <div>提交后本单进入「退款申请中」，座位当场释放。</div>
+                  <div>退款要等财务核账批准后才真正打款，不是立刻到账。</div>
+                  <div>本单代理佣金将全额冲销。</div>
+                  <div>接手订单号选填，只作记录用；这笔钱不会转到那张单上。</div>
+                </div>
+
+                <label className="block text-sm">
+                  <span className="mb-1 block font-medium text-ink">换人费（元）</span>
+                  <input
+                    type="number"
+                    min="0"
+                    step="1"
+                    inputMode="numeric"
+                    className="input w-full"
+                    value={swapFeeInput}
+                    onChange={(e) => {
+                      setSwapFeeInput(e.target.value);
+                      setSwapRefundError(null);
+                    }}
+                    placeholder="请输入整数金额"
+                  />
+                </label>
+
+                <label className="block text-sm">
+                  <span className="mb-1 block font-medium text-ink">接手订单号（选填）</span>
+                  <input
+                    type="text"
+                    maxLength={64}
+                    className="input w-full"
+                    value={swapReplacementOrderNumber}
+                    onChange={(e) => {
+                      setSwapReplacementOrderNumber(e.target.value);
+                      setSwapRefundError(null);
+                    }}
+                    placeholder="新单还没录可留空，之后再补"
+                  />
+                </label>
+
+                <label className="block text-sm">
+                  <span className="mb-1 block font-medium text-ink">原因（必填）</span>
+                  <textarea
+                    rows={3}
+                    maxLength={500}
+                    className="input w-full resize-y"
+                    value={swapRefundReason}
+                    onChange={(e) => {
+                      setSwapRefundReason(e.target.value);
+                      setSwapRefundError(null);
+                    }}
+                    placeholder="请填写换人退款原因"
+                  />
+                </label>
+
+                <div className="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm">
+                  <div className="flex justify-between gap-3">
+                    <span className="text-ink-muted">本单净收款</span>
+                    <span className="nums font-medium text-ink">¥{swapRefundNetPaidCny?.toLocaleString() ?? '—'}</span>
+                  </div>
+                  <div className="mt-1 flex justify-between gap-3">
+                    <span className="text-ink-muted">扣换人费</span>
+                    <span className={`nums font-medium ${swapFeePreview !== null && (!swapFeePreviewValid || (swapRefundNetPaidCny !== null && swapFeePreview > swapRefundNetPaidCny)) ? 'text-red-600' : 'text-ink'}`}>
+                      ¥{swapFeePreviewValid ? swapFeePreview.toLocaleString() : '—'}
+                    </span>
+                  </div>
+                  <div className="mt-1 flex justify-between gap-3 border-t border-slate-200 pt-1 font-medium">
+                    <span className="text-ink-muted">退给客人</span>
+                    <span className={`nums ${swapRefundPreview !== null && swapRefundPreview >= 0 ? 'text-emerald-700' : 'text-red-600'}`}>
+                      {swapRefundPreview !== null ? `¥${swapRefundPreview.toLocaleString()}` : '—'}
+                    </span>
+                  </div>
+                  {swapRefundPreview === 0 && (
+                    <div className="mt-1 text-right text-xs font-medium text-emerald-700">换人费吃满全款，本次退给客人 ¥0</div>
+                  )}
+                </div>
+
+                {swapRefundError && (
+                  <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                    {swapRefundError}
+                  </div>
+                )}
+              </div>
+            </Modal>
+          )}
+
+          {isOps && (
+            <Modal
+              open={replacementEditOpen}
+              onClose={() => {
+                if (!replacementEditSubmitting) setReplacementEditOpen(false);
+              }}
+              title="接手订单号"
+              size="sm"
+              footer={(
+                <div className="flex justify-end gap-2">
+                  <button
+                    type="button"
+                    className="btn-secondary"
+                    disabled={replacementEditSubmitting}
+                    onClick={() => setReplacementEditOpen(false)}
+                  >
+                    取消
+                  </button>
+                  <button
+                    type="button"
+                    className="btn-primary disabled:cursor-not-allowed disabled:opacity-50"
+                    disabled={replacementEditSubmitting}
+                    onClick={() => void submitReplacementEdit()}
+                  >
+                    {replacementEditSubmitting ? '保存中…' : '保存'}
+                  </button>
+                </div>
+              )}
+            >
+              <div className="space-y-3 px-5 py-4">
+                <p className="text-xs leading-5 text-ink-muted">
+                  可填写、修改或清空接手订单号。只作换人退款记录，钱不会转到接手订单。
+                </p>
+                <input
+                  type="text"
+                  maxLength={64}
+                  className="input w-full"
+                  value={replacementEditValue}
+                  onChange={(e) => {
+                    setReplacementEditValue(e.target.value);
+                    setReplacementEditError(null);
+                  }}
+                  placeholder="填写已存在的新订单号，留空可清空"
+                />
+                {replacementEditError && (
+                  <div className="rounded-lg border border-red-200 bg-red-50 px-3 py-2 text-sm text-red-700">
+                    {replacementEditError}
+                  </div>
+                )}
+              </div>
+            </Modal>
+          )}
 
           {/* 财务/出纳：预期到账金额 + 订单杂项成本（仅 ADMIN/STAFF 可见，组件内做权限判断） */}
           <OrderFinanceSection
