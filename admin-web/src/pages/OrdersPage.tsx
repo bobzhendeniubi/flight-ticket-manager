@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -4943,6 +4943,7 @@ function OrderDrawer({
                           orderId={o.id}
                           item={it}
                           onOrderUpdated={handleOrderUpdated}
+                          onChanged={onChanged}
                           canEditSettlementPrice={isOps}
                           canChangeBundle={isOps}
                           canOperate={isOps}
@@ -4966,6 +4967,7 @@ function OrderDrawer({
                     orderId={o.id}
                     item={it}
                     onOrderUpdated={handleOrderUpdated}
+                    onChanged={onChanged}
                     canEditSettlementPrice={isOps}
                     canChangeBundle={isOps}
                     canOperate={isOps}
@@ -6520,6 +6522,7 @@ function OrderItemRow({
   orderId,
   item,
   onOrderUpdated,
+  onChanged,
   canEditSettlementPrice,
   canChangeBundle,
   canOperate,
@@ -6530,6 +6533,8 @@ function OrderItemRow({
   orderId: string;
   item: OrderItem;
   onOrderUpdated?: (order: OrderSummary) => void;
+  /** 按人改期把勾选乘客拆成新单后，用于让列表刷出新单那一行（源单就地刷新走 onOrderUpdated） */
+  onChanged?: () => void;
   /** 改结算价：后端 PATCH settlement-price 放行 ADMIN/STAFF，这里同口径（非纯 ADMIN） */
   canEditSettlementPrice?: boolean;
   /** 套餐改档：后端 POST /orders/:id/change-bundle 仅 ADMIN/STAFF，代理不给入口 */
@@ -6539,7 +6544,7 @@ function OrderItemRow({
   settlementLocked?: boolean;
   /** 本单分房表房组（「拆房组」入口用；未分房不传） */
   roomGroups?: RoomGroup[];
-  /** 本单出行人（拆房组弹窗展示组内乘客名用） */
+  /** 本单出行人（拆房组弹窗展示组内乘客名用；改期乘客勾选列表复用同一份） */
   passengers?: Array<{ id: string; name: string }>;
 }) {
   const [rescheduling, setRescheduling] = useState(false);
@@ -6713,9 +6718,14 @@ function OrderItemRow({
         <RescheduleForm
           orderId={orderId}
           item={item}
+          passengers={passengers ?? []}
+          onChanged={onChanged}
           onCancel={() => setRescheduling(false)}
           onSaved={(updated) => {
             setRescheduling(false);
+            onOrderUpdated?.(updated);
+          }}
+          onRefreshOnly={(updated) => {
             onOrderUpdated?.(updated);
           }}
         />
@@ -7235,13 +7245,22 @@ function CabinUpgradePanel({
 function RescheduleForm({
   orderId,
   item,
+  passengers,
+  onChanged,
   onCancel,
   onSaved,
+  onRefreshOnly,
 }: {
   orderId: string;
   item: OrderItem;
+  /** 本单出行人（勾选改期对象）；≥2 人才展示勾选列表，默认全选=整单改期（不拆） */
+  passengers: Array<{ id: string; name: string }>;
+  /** 勾了部分人拆出新单后，用它让列表刷出新单那一行（源单本身走 onSaved/onRefreshOnly） */
+  onChanged?: () => void;
   onCancel: () => void;
   onSaved: (order: OrderSummary) => void;
+  /** 已拆单但改期未成功：只刷新源单数据，不关闭表单（红字提示要留着让运营看见新单号） */
+  onRefreshOnly?: (order: OrderSummary) => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
@@ -7252,6 +7271,12 @@ function RescheduleForm({
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // 默认全选＝整单改期；取消勾选部分人＝拆成新单单独改期。
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set(passengers.map((p) => p.id)));
+  // 已拆单但改期失败：留在表单上的红字提示，不随下一次操作自动消失（除非取消关闭）。
+  const [splitFailure, setSplitFailure] = useState<{ newOrderNumber: string; message: string } | null>(null);
+  // 幂等键：本表单打开期间只生成一次，提交失败重试复用同一个 token，避免网络抖动二次拆单。
+  const requestTokenRef = useRef<string>(crypto.randomUUID());
   const { flights, schedules, loadingSchedules, error: optionsError } = useFlightScheduleOptions(token, flightId);
 
   useEffect(() => {
@@ -7260,15 +7285,31 @@ function RescheduleForm({
 
   const selectedSchedule = schedules.find((s) => s.id === newScheduleId);
   const cabinOptions = selectedSchedule?.seatClasses ?? [];
+  const showPassengerPicker = passengers.length >= 2;
+  const isPartialSelection = showPassengerPicker && selectedIds.size < passengers.length;
+
+  const togglePassenger = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
 
   const submit = async () => {
-    if (!token || submitting) return;
+    if (!token || submitting || splitFailure) return;
     setErr(null);
     if (!newScheduleId) { setErr('请选择新班次'); return; }
-    if (!confirm('确认改期？座位会移动到新班次（新班次售罄会被拒绝）；出发日期变动时本单酒店入住/离店日期会同步平移（新日期房量不足会整体拒绝），如填了改期差价将计入订单应收（可正可负）。')) return;
+    if (selectedIds.size === 0) { setErr('请至少勾选 1 位改期乘客'); return; }
+    const confirmMsg = isPartialSelection
+      ? `将把勾选的 ${selectedIds.size} 位乘客拆成新订单并改期到 ${selectedSchedule ? scheduleLabel(selectedSchedule) : '新班次'}；原单其余乘客不变。`
+      : '确认改期？座位会移动到新班次（新班次售罄会被拒绝）；出发日期变动时本单酒店入住/离店日期会同步平移（新日期房量不足会整体拒绝），如填了改期差价将计入订单应收（可正可负）。';
+    if (!confirm(confirmMsg)) return;
     setSubmitting(true);
     try {
-      const res = await api.rescheduleOrder(token, orderId, {
+      const res = await api.reschedulePassengers(token, orderId, {
+        passengerIds: [...selectedIds],
         orderItemId: item.id,
         newScheduleId,
         newCabin: newCabin || undefined,
@@ -7276,10 +7317,32 @@ function RescheduleForm({
         feeCny: feeCny != null && feeCny !== 0 ? feeCny : undefined,
         feeLabel: feeCny != null && feeCny !== 0 ? '改期差价' : undefined,
         note: note.trim() || undefined,
+        requestToken: requestTokenRef.current,
       });
+      if (res.splitPerformed && res.newOrder) {
+        alert(`已拆出新单 ${res.newOrder.orderNumber} 并改期`);
+        onChanged?.();
+      }
       onSaved(res.order);
     } catch (e) {
-      setErr(e instanceof ApiError ? e.message : '改期失败');
+      const splitInfo = reschedulePassengersSplitFailure(e);
+      if (splitInfo) {
+        // 后端 message 已是完整可读文案（已拆出新单 X，改期未成功：原因，请到新单上重试），原样展示。
+        setSplitFailure({
+          newOrderNumber: splitInfo.newOrderNumber,
+          message: e instanceof ApiError ? e.message : '已拆单，但改期未成功，请到新单上重试改期',
+        });
+        // 已经拆出了新单：列表得刷出这一行，源单也得刷成拆完后的样子（哪怕改期没成功）。
+        onChanged?.();
+        try {
+          const fresh = await api.getOrder(token, orderId);
+          onRefreshOnly?.(fresh.order);
+        } catch {
+          // 源单补刷失败不影响已展示的错误提示；运营关闭抽屉重开即可看到最新状态。
+        }
+      } else {
+        setErr(e instanceof ApiError ? e.message : '改期失败');
+      }
     } finally {
       setSubmitting(false);
     }
@@ -7288,6 +7351,47 @@ function RescheduleForm({
   return (
     <div className="mt-3 space-y-2 rounded-md border border-brand/40 bg-white p-3 text-xs">
       <div className="font-medium text-brand">改期 · 当前：{item.description}{item.flightCabin && ` · ${CABIN_ZH[item.flightCabin] ?? item.flightCabin}`}</div>
+
+      {showPassengerPicker && (
+        <div className="rounded border border-slate-200 bg-slate-50/60 p-2">
+          <div className="mb-1 flex items-center justify-between">
+            <span className="text-slate-500">改期乘客（默认全选＝整单改期；取消部分＝拆新单单独改期）</span>
+            <span className="flex shrink-0 gap-2">
+              <button
+                type="button"
+                className="text-[11px] font-medium text-brand hover:text-brand-dark"
+                onClick={() => setSelectedIds(new Set(passengers.map((p) => p.id)))}
+                disabled={submitting || Boolean(splitFailure)}
+              >
+                全选
+              </button>
+              <button
+                type="button"
+                className="text-[11px] font-medium text-slate-500 hover:text-slate-700"
+                onClick={() => setSelectedIds(new Set())}
+                disabled={submitting || Boolean(splitFailure)}
+              >
+                清空
+              </button>
+            </span>
+          </div>
+          <ul className="max-h-32 space-y-0.5 overflow-y-auto">
+            {passengers.map((p) => (
+              <li key={p.id}>
+                <label className="flex cursor-pointer items-center gap-2 rounded px-1 py-0.5 hover:bg-white">
+                  <input
+                    type="checkbox"
+                    checked={selectedIds.has(p.id)}
+                    onChange={() => togglePassenger(p.id)}
+                    disabled={submitting || Boolean(splitFailure)}
+                  />
+                  <span>{p.name}</span>
+                </label>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       <label className="block">
         <span className="text-slate-500">选航班</span>
@@ -7364,12 +7468,16 @@ function RescheduleForm({
       </label>
 
       {err && <div className="rounded bg-red-50 px-2 py-1 text-red-700">{err}</div>}
+      {/* 拆单不回滚：message 已是后端给的完整文案（含新单号 + 失败原因 + 去哪重试），原样展示。 */}
+      {splitFailure && (
+        <div className="rounded bg-red-50 px-2 py-1 text-red-700">{splitFailure.message}</div>
+      )}
 
       <div className="flex gap-2 pt-1">
         <button
           className="flex-1 rounded bg-brand px-2 py-1.5 font-medium text-white disabled:opacity-50"
           onClick={submit}
-          disabled={submitting || !newScheduleId}
+          disabled={submitting || !newScheduleId || selectedIds.size === 0 || Boolean(splitFailure)}
         >
           {submitting ? '改期中…' : '确认改期'}
         </button>

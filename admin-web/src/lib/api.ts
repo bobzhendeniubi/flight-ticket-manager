@@ -74,6 +74,39 @@ export function duplicatePassengerConflictOrderNumbers(err: unknown): string[] {
   return [...orderNumbers];
 }
 
+/**
+ * 按人改期（reschedulePassengers）「已拆单但改期未成功」的稳定 code（后端 orders.service.ts
+ * reschedulePassengers）：服务端已经把勾选的乘客拆成新订单，随后对新单改期这一步失败了
+ * （如新班次售罄）。拆单不回滚——新单是钱与座位都守恒的合法订单。前端按 code 判，命中即
+ * 引导运营去新单上重试改期，绝不能当普通失败静默丢弃已拆出的新单号。
+ */
+export const SPLIT_DONE_RESCHEDULE_FAILED_CODE = 'SPLIT_DONE_RESCHEDULE_FAILED';
+
+/** reschedulePassengers「已拆单但改期未成功」错误的 details 结构（后端原样透出）。 */
+export interface ReschedulePassengersSplitFailureDetails {
+  newOrderId: string;
+  newOrderNumber: string;
+  passengerCount?: number;
+  reason?: string;
+}
+
+/** 从 reschedulePassengers 的失败里取「已拆单但改期未成功」的新单信息；非该情形 → null。 */
+export function reschedulePassengersSplitFailure(
+  err: unknown,
+): ReschedulePassengersSplitFailureDetails | null {
+  if (!(err instanceof ApiError) || err.code !== SPLIT_DONE_RESCHEDULE_FAILED_CODE) return null;
+  const d = err.details;
+  if (!d || typeof d !== 'object') return null;
+  const { newOrderId, newOrderNumber, passengerCount, reason } = d as Record<string, unknown>;
+  if (typeof newOrderId !== 'string' || typeof newOrderNumber !== 'string') return null;
+  return {
+    newOrderId,
+    newOrderNumber,
+    passengerCount: typeof passengerCount === 'number' ? passengerCount : undefined,
+    reason: typeof reason === 'string' ? reason : undefined,
+  };
+}
+
 type ApiRequestInit = Omit<RequestInit, 'body'> & {
   body?: unknown;
   token?: string | null;
@@ -3359,6 +3392,15 @@ export interface SplitOrderExecResult {
   replayed: boolean;
 }
 
+// ── 按人改期（reschedule-passengers；ADMIN/STAFF）───────────────────────────
+// 勾全员 = 整单改期（不拆，newOrder 为 null）；勾部分 = 先把勾选乘客拆成新单，
+// 再对新单改期，改期差价落新单（order 为改期后的源单，newOrder 为拆出的新单）。
+export interface ReschedulePassengersResult {
+  order: OrderSummary;
+  newOrder: OrderSummary | null;
+  splitPerformed: boolean;
+}
+
 export const api = {
   login: (email: string, password: string) =>
     apiFetch<AuthResult>('/auth/login', {
@@ -4228,6 +4270,32 @@ export const api = {
   ) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/reschedule`, {
       method: 'PATCH',
+      token,
+      body,
+    }),
+  // 按人改期：批量单里只给部分乘客改期。勾全员 = 整单改期（服务端判定，不拆，newOrder 为 null）；
+  // 勾部分 = 服务端先把这些人拆成新单，再对新单改期，改期差价落新单。
+  // requestToken 为幂等键（crypto.randomUUID，同一次表单提交内重试复用同一个 token）：
+  // 拆单已提交但改期失败时后端**不回滚拆单**，同 token 重试会先走拆单幂等回放、再重试改期。
+  // 走标准错误信封：拆单成功但改期未成功时后端回 409，code=SPLIT_DONE_RESCHEDULE_FAILED，
+  // details 带 { splitPerformed:true, newOrderId, newOrderNumber, passengerCount, reason }，
+  // message 已是可直接展示的完整文案；调用方用 reschedulePassengersSplitFailure(err) 取新单号。
+  reschedulePassengers: (
+    token: string,
+    orderId: string,
+    body: {
+      passengerIds: string[];
+      orderItemId: string;
+      newScheduleId: string;
+      newCabin?: CabinClass;
+      feeCny?: number;
+      feeLabel?: string;
+      note?: string;
+      requestToken: string;
+    },
+  ) =>
+    apiFetch<ReschedulePassengersResult>(`/orders/${orderId}/reschedule-passengers`, {
+      method: 'POST',
       token,
       body,
     }),
