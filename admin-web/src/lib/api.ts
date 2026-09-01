@@ -3222,6 +3222,27 @@ export interface TransferPaymentResult {
   amount: number;
 }
 
+/** POST /payments/orders/:id/swap-transfer 返回（换人转出整单净收款） */
+export interface SwapTransferResult {
+  sourceOrder: {
+    id: string;
+    orderNumber: string;
+    paidAmount: number;
+    netPaidAmount: number;
+    status: OrderStatus;
+  };
+  targetOrder: {
+    id: string;
+    orderNumber: string;
+    paidAmount: number;
+    status: OrderStatus;
+  };
+  transferFeeCny: number;
+  transferredAmount: number;
+  refundId: string;
+  newPaymentId: string;
+}
+
 /**
  * 一笔手工到账被「超收自动拆分」后的明细。
  * 超收不再被硬闸拦下：应收部分照常核销进本单，超出部分自动落一笔挂账池进账（RCP…），
@@ -4003,6 +4024,15 @@ export const api = {
       token,
       body,
     }),
+
+  // 换人转出：源单留存换人费，其余净收款整笔转入另一订单，源单随即关闭（仅 ADMIN/STAFF）。
+  swapTransfer: (
+    orderId: string,
+    body: { targetOrderNumber: string; transferFeeCny: number; reason: string },
+    token: string,
+  ) => apiFetch<SwapTransferResult>(`/payments/orders/${orderId}/swap-transfer`, {
+    method: 'POST', token, body,
+  }),
 
   // 批量到账（选多笔订单 → 逐单录入到账金额 + 共享水单）ADMIN/STAFF。
   // 逐单入账：单条失败不影响其它（每条返回 ok / error + 最新 paidAmount/status）。

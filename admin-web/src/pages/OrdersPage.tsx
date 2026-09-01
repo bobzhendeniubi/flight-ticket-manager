@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type SwapTransferResult } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -514,6 +514,23 @@ function deriveBalance(o: OrderSummary): {
     ? Math.round(backendBalance * 100) / 100
     : Math.round((payable - paid - prepaid) * 100) / 100;
   return { total, adjustment, paid, prepaid, payable, balance };
+}
+
+// 占座状态族——必须与后端 SEAT_HOLDING_STATUSES 逐项一致（orders.service.ts）。
+// 刻意比对**状态枚举值**而非中文标签：标签是 UI 文案、随时可能被改写，
+// 一旦改了，用标签做的判断会静默失效（按钮永久变灰且不报错），枚举值则是稳定契约。
+const SEAT_HOLDING_STATUSES: ReadonlySet<OrderStatus> = new Set<OrderStatus>([
+  'PENDING_PAYMENT',
+  'PAID',
+  'PROCESSING',
+  'TICKETED',
+  'COMPLETED',
+  'CHANGE_REQUESTED',
+  'CHANGED',
+]);
+
+function isSeatHoldingOrderStatus(status: OrderStatus): boolean {
+  return SEAT_HOLDING_STATUSES.has(status);
 }
 
 // 尾款徽标：少付=琥珀(欠款)、结清=绿、多付=蓝(highlight)。
@@ -4256,6 +4273,20 @@ function OrderDrawer({
   const o = hydrated ?? order;
   const view = deriveView(o);
   const bal = deriveBalance(o);
+  // 换人转出的净收款口径 = 已付 − 已完成退款（与后端 sumCompletedRefundsWithinTx 同源）。
+  // refunds 只在详情补水（ORDER_FULL_INCLUDE）后才有；列表行没有这个字段。
+  // 此时**绝不能拿已付当净收兜底**：那会在一笔动钱操作的预览里显示偏大的可转出额，
+  // 而预览正是运营据以填换人费的依据。未补水 → netPaid 给 null，由下游禁用入口。
+  const netPaid =
+    o.refunds === undefined
+      ? null
+      : Math.round(
+          (bal.paid -
+            o.refunds
+              .filter((refund) => refund.status === 'COMPLETED')
+              .reduce((sum, refund) => sum + (Number(refund.amount) || 0), 0)) *
+            100,
+        ) / 100;
   // 子组件（改期/换人/改价）拿到更新后的整单 → 同步抽屉本地 hydrated + 冒泡给父级刷列表。
   const handleOrderUpdated = (updated: OrderSummary) => {
     setHydrated(updated);
@@ -4481,9 +4512,11 @@ function OrderDrawer({
                 key={o.id}
                 orderId={o.id}
                 orderNumber={o.orderNumber}
+                status={o.status}
                 total={bal.payable}
                 paidAmount={bal.paid}
                 prepaymentOffset={bal.prepaid}
+                netPaidAmount={netPaid}
                 agent={o.agent}
                 onChanged={onChanged}
               />
@@ -11574,20 +11607,25 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
 function ConfirmPaymentSection({
   orderId,
   orderNumber,
+  status,
   total,
   paidAmount,
   prepaymentOffset,
+  netPaidAmount,
   agent,
   onChanged,
 }: {
   orderId: string;
   /** 订单号：跳收款对账台时带上（?order=…），让那边直接预填订单搜索框 */
   orderNumber: string;
+  status: OrderStatus;
   /** 客户应付（= effectivePayable，含售后费） */
   total: number;
   paidAmount: number;
   /** 代理预存抵扣（视同已付；算尾款必须扣，否则与后端 balanceDue 对不上） */
   prepaymentOffset: number;
+  /** 后端口径的净收款 = 已付 − 已完成退款；null = 详情尚未补水（退款明细未知，不可据此动钱） */
+  netPaidAmount: number | null;
   agent: OrderSummary['agent'];
   onChanged?: () => void;
 }) {
@@ -11616,6 +11654,7 @@ function ConfirmPaymentSection({
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  const [swapTransferOpen, setSwapTransferOpen] = useState(false);
   // 超收自动拆分的结果提示：录入额 > 本单应收时，后端把应收部分核销进本单、超出部分转挂账池，
   // 这里把「多少进了本单 / 多少进了池子 / 池子里的进账号」如实摆给运营看。
   const [splitNotice, setSplitNotice] = useState<string | null>(null);
@@ -11634,6 +11673,17 @@ function ConfirmPaymentSection({
   // 漏掉 prepaymentOffset 会让本卡片显示「欠 ¥X」而收款对账台显示「已结清」。
   // 正=欠款(少付)、0=已结清、负=多付（不再 clamp，多付要看得见）。
   const balance = Math.round((total - paid - prepaid) * 100) / 100;
+  const seatHolding = isSeatHoldingOrderStatus(status);
+  // 父级传入详情中的已完成退款扣减额；付款区刷新后用最新 paid 重新得到净收款。
+  // netPaidAmount 为 null = 详情未补水、退款明细未知 → 净收款一并置 null，绝不用已付冒充。
+  const completedRefundAmount =
+    netPaidAmount === null
+      ? null
+      : Math.max(0, Math.round((paidAmount - netPaidAmount) * 100) / 100);
+  const currentNetPaidAmount =
+    completedRefundAmount === null
+      ? null
+      : Math.round((paid - completedRefundAmount) * 100) / 100;
 
   const paymentRefreshRef = useRef({ requestId: 0, orderId });
   paymentRefreshRef.current.orderId = orderId;
@@ -11938,6 +11988,23 @@ function ConfirmPaymentSection({
     }
   }
 
+  async function finishSwapTransfer(result: SwapTransferResult): Promise<void> {
+    // 与逐笔转移一致：成功后先刷新本单收款状态，再通知父级刷新订单列表。
+    let refreshFailed = false;
+    try {
+      const refreshed = await refreshPaymentState();
+      if (refreshed) onChanged?.();
+    } catch {
+      refreshFailed = true;
+    }
+    setSwapTransferOpen(false);
+    window.alert(
+      refreshFailed
+        ? `本单已留存换人费 ¥${result.transferFeeCny.toLocaleString()}，¥${result.transferredAmount.toLocaleString()} 已转入订单 ${result.targetOrder.orderNumber}。页面刷新失败，请手动刷新查看最新状态。`
+        : `本单已留存换人费 ¥${result.transferFeeCny.toLocaleString()}，¥${result.transferredAmount.toLocaleString()} 已转入订单 ${result.targetOrder.orderNumber}。`,
+    );
+  }
+
   // 收款复核锁：财务/出纳对账无误后锁定本单收款（锁定后禁止人工录新收款）；解锁需二次确认。
   async function toggleLock(): Promise<void> {
     if (!token || lockBusy) return;
@@ -12033,6 +12100,18 @@ function ConfirmPaymentSection({
     }
   }
 
+  const swapTransferDisabledReason = !seatHolding
+    ? `当前状态「${orderStatusLabel(status)}」不是占座态，不能换人转出`
+    : currentNetPaidAmount === null
+      ? '订单详情加载中，请稍候再做换人转出'
+      : currentNetPaidAmount <= 0
+      ? '本单净收款≤0，不能换人转出'
+      : swapTransferOpen
+        ? '换人转出处理中，请稍候'
+        : submitting
+          ? '当前有收款操作处理中，请稍候'
+          : undefined;
+
   return (
     <section>
       <div className="flex items-center justify-between">
@@ -12064,6 +12143,24 @@ function ConfirmPaymentSection({
             </span>
           </span>
         </div>
+
+        {canTransferPayment && (
+          <div className="mt-2 flex items-center justify-between gap-2 rounded-md border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs">
+            <span className="text-amber-800">订单级换人转出：留存换人费，其余净收款转入另一订单</span>
+            <button
+              type="button"
+              className="btn-ghost-danger whitespace-nowrap px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+              onClick={() => {
+                setErr(null);
+                setSwapTransferOpen(true);
+              }}
+              disabled={swapTransferDisabledReason !== undefined}
+              title={swapTransferDisabledReason ?? '按本单净收款做换人转出'}
+            >
+              换人转出
+            </button>
+          </div>
+        )}
 
         {/* 挂账池疑似本单待核销：财务锁定收款前先看见池子里还压着本单的钱（提示，不阻断） */}
         {pendingHint && (
@@ -12404,7 +12501,249 @@ function ConfirmPaymentSection({
         </div>
         )}
       </div>
+      {/* currentNetPaidAmount 为 null 时入口已禁用，这里再收敛一次类型：宁可不弹窗，也不拿未知净收款算钱。 */}
+      {swapTransferOpen && currentNetPaidAmount !== null && (
+        <SwapTransferModal
+          orderId={orderId}
+          sourceOrderNumber={orderNumber}
+          netPaidAmount={currentNetPaidAmount}
+          onClose={() => setSwapTransferOpen(false)}
+          onSuccess={finishSwapTransfer}
+        />
+      )}
     </section>
+  );
+}
+
+// ── 换人转出（整单净收款 → 新订单；源单留存换人费）──────────────────────
+function SwapTransferModal({
+  orderId,
+  sourceOrderNumber,
+  netPaidAmount,
+  onClose,
+  onSuccess,
+}: {
+  orderId: string;
+  sourceOrderNumber: string;
+  netPaidAmount: number;
+  onClose: () => void;
+  onSuccess: (result: SwapTransferResult) => Promise<void> | void;
+}) {
+  const token = useAuth((s) => s.tokens)?.accessToken ?? '';
+  const askConfirm = useConfirm();
+  const highRiskConfirmRef = useRef(false);
+  const [targetOrderNumber, setTargetOrderNumber] = useState('');
+  const [transferFeeCny, setTransferFeeCny] = useState<number | null>(null);
+  const [reason, setReason] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const handleClose = () => {
+    if (!submitting) onClose();
+  };
+  const dialogRef = useDialogA11y(handleClose);
+
+  const trimmedTargetOrderNumber = targetOrderNumber.trim();
+  const trimmedReason = reason.trim();
+  const previewFee = transferFeeCny ?? 0;
+  const transferredAmount = Math.round((netPaidAmount - previewFee) * 100) / 100;
+  const previewInvalid = netPaidAmount <= 0 || (transferFeeCny != null && transferredAmount <= 0);
+  const feeInvalid =
+    transferFeeCny == null ||
+    !Number.isInteger(transferFeeCny) ||
+    transferFeeCny < 0;
+  const canSubmit =
+    Boolean(token) &&
+    trimmedTargetOrderNumber.length > 0 &&
+    !feeInvalid &&
+    trimmedReason.length > 0 &&
+    trimmedReason.length <= 500 &&
+    netPaidAmount > 0 &&
+    transferredAmount > 0 &&
+    !submitting;
+
+  async function submit(): Promise<void> {
+    if (submitting || highRiskConfirmRef.current) return;
+    if (!trimmedTargetOrderNumber) {
+      setErr('请填写转入订单号');
+      return;
+    }
+    if (feeInvalid) {
+      setErr('请填写不小于 0 的整数换人费；不收费请填 0');
+      return;
+    }
+    if (!trimmedReason) {
+      setErr('请填写换人转出原因');
+      return;
+    }
+    if (trimmedReason.length > 500) {
+      setErr('原因最长 500 字');
+      return;
+    }
+    if (previewInvalid) {
+      setErr('换人费不能等于或超过本单净收款；如只是要关单请走退款流程');
+      return;
+    }
+
+    const fee = transferFeeCny;
+    if (fee == null) return;
+    highRiskConfirmRef.current = true;
+    const confirmed = await askConfirm({
+      title: '确认换人转出？',
+      body: `本单留存 ¥${fee.toLocaleString()}、转出 ¥${transferredAmount.toLocaleString()} 至订单 ${trimmedTargetOrderNumber}，本单将关闭`,
+      tone: 'danger',
+    });
+    if (!confirmed) {
+      highRiskConfirmRef.current = false;
+      return;
+    }
+
+    setErr(null);
+    setSubmitting(true);
+    try {
+      const result = await api.swapTransfer(
+        orderId,
+        {
+          targetOrderNumber: trimmedTargetOrderNumber,
+          transferFeeCny: fee,
+          reason: trimmedReason,
+        },
+        token,
+      );
+      await onSuccess(result);
+    } catch (e: unknown) {
+      // 后端 message 包含运营下一步指引，必须原样展示。
+      setErr(e instanceof ApiError ? e.message : '换人转出失败');
+    } finally {
+      setSubmitting(false);
+      highRiskConfirmRef.current = false;
+    }
+  }
+
+  return (
+    <div
+      ref={dialogRef}
+      role="dialog"
+      aria-modal="true"
+      aria-label="换人转出"
+      tabIndex={-1}
+      className="fixed inset-0 z-[70] flex items-center justify-center bg-slate-900/50 p-4"
+      onClick={handleClose}
+    >
+      <div
+        className="max-h-[90vh] w-full max-w-md space-y-3 overflow-auto rounded-2xl bg-white p-5 text-sm shadow-2xl"
+        onClick={(e) => e.stopPropagation()}
+      >
+        <div className="flex items-center justify-between gap-3">
+          <div>
+            <div className="text-base font-semibold text-ink">换人转出</div>
+            <div className="mt-0.5 text-xs text-ink-muted">源单：{sourceOrderNumber}</div>
+          </div>
+          <button
+            type="button"
+            className="btn-ghost px-2 py-1 text-xl leading-none"
+            onClick={handleClose}
+            disabled={submitting}
+            aria-label="关闭换人转出"
+          >
+            ×
+          </button>
+        </div>
+
+        {err && <div className="rounded-md bg-rose-50 px-3 py-2 text-xs text-rose-700">{err}</div>}
+
+        <div className="space-y-2">
+          <label className="block text-xs text-slate-500">
+            转入订单号 <span className="text-rose-600">*</span>
+            <input
+              type="text"
+              value={targetOrderNumber}
+              onChange={(e) => {
+                setTargetOrderNumber(e.target.value);
+                setErr(null);
+              }}
+              maxLength={64}
+              required
+              disabled={submitting}
+              className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+              placeholder="填写接收这笔钱的订单号"
+            />
+          </label>
+          <label className="block text-xs text-slate-500">
+            换人费（¥） <span className="text-rose-600">*</span>
+            <NumberInput
+              value={transferFeeCny}
+              onChange={(n) => {
+                setTransferFeeCny(n);
+                setErr(null);
+              }}
+              min={0}
+              step={1}
+              integerOnly
+              required
+              disabled={submitting}
+              className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+              placeholder="不收费请填 0"
+            />
+          </label>
+          <label className="block text-xs text-slate-500">
+            原因 <span className="text-rose-600">*</span>
+            <textarea
+              value={reason}
+              onChange={(e) => {
+                setReason(e.target.value);
+                setErr(null);
+              }}
+              maxLength={500}
+              required
+              disabled={submitting}
+              rows={3}
+              className="mt-1 block w-full resize-y rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+              placeholder="说明客人无法出行及换人转出的原因"
+            />
+            <span className="mt-0.5 block text-right text-[11px] text-slate-400">{reason.length}/500</span>
+          </label>
+        </div>
+
+        <div className={`rounded-md border px-3 py-2 text-xs ${previewInvalid ? 'border-rose-300 bg-rose-50 text-rose-800' : 'border-slate-200 bg-slate-50 text-slate-700'}`}>
+          <div className="flex items-center justify-between"><span>本单净收款</span><b>¥{netPaidAmount.toLocaleString()}</b></div>
+          <div className="mt-1 flex items-center justify-between"><span>本单留存换人费</span><b>¥{previewFee.toLocaleString()}</b></div>
+          <div className="mt-1 flex items-center justify-between">
+            <span>转出至 {trimmedTargetOrderNumber || '（待填写）'}</span>
+            <b>¥{transferredAmount.toLocaleString()}</b>
+          </div>
+          {previewInvalid && (
+            <div className="mt-1.5 font-medium">
+              {netPaidAmount <= 0
+                ? '本单没有可转出的净收款'
+                : '换人费不能等于或超过本单净收款；如只是要关单请走退款流程'}
+            </div>
+          )}
+        </div>
+
+        <div className="rounded-md border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-900">
+          <ul className="list-disc space-y-1 pl-4">
+            <li>提交后本单立即关闭并落「已退款」，座位当场释放，此操作不可撤销</li>
+            <li>转出的钱会记到转入订单上，不会退现金给客户</li>
+            <li>本单代理佣金将全额冲销</li>
+            <li>转入订单的应收必须装得下转入金额，否则整笔操作会被拒绝</li>
+          </ul>
+        </div>
+
+        <div className="flex justify-end gap-2 border-t border-slate-200 pt-3">
+          <button type="button" className="btn-ghost text-sm" onClick={handleClose} disabled={submitting}>
+            取消
+          </button>
+          <button
+            type="button"
+            className="btn-primary text-sm disabled:cursor-not-allowed disabled:opacity-50"
+            onClick={() => void submit()}
+            disabled={!canSubmit}
+          >
+            {submitting ? '提交中…' : '确认换人转出'}
+          </button>
+        </div>
+      </div>
+    </div>
   );
 }
 
