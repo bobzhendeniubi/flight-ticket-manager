@@ -4,12 +4,12 @@
  * 架构：订单是真值，快照表只是缓存。
  *   - 列表读快照（可排序/分页）；空表惰性 bootstrap，过期(>6h)后台自动重建。
  *   - 详情实时从订单重算（永远准确）并回写快照；快照写入同时并入老系统历史飞行次数。
+ *   - 批量查次数（lookupByDocuments）读快照，快照没有的证件号现算兜底（见 traveler-trip-count.ts）。
  *   - 重建绝不覆盖 notes（运营手工输入）。
  * 不 hook 订单写路径 —— 纯读侧聚合，对钱路径零风险。
  */
-import { OrderStatus, Prisma, type DocumentType, type PrismaClient } from '@prisma/client';
+import { Prisma, type DocumentType } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
-import { businessDateISO } from '../../lib/business-time.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import {
   buildTravelerAggregates,
@@ -19,24 +19,35 @@ import {
   type TripSummary,
 } from './traveler-profiles.aggregate.js';
 import {
+  addLegacyTripCount,
+  aggregateFlownBusinessDates,
+  computeCombinedTripCounts,
+  EXCLUDED_ORDER_STATUSES,
+  loadLegacyTripCounts,
+  orderSelect,
+  toAggOrder,
+  type CombinedTripCount,
+  type LegacyTripCountScope,
+} from './traveler-trip-count.js';
+import {
   loadRedeemedTripsByProfile,
   loadRedemptions,
   withBenefitTotals,
 } from './traveler-benefits.service.js';
 import type { ListTravelerProfilesQuery } from './travelers.schemas.js';
 
-/** 有效订单口径：排除未成交/已取消/全退（proposal 拍板清单的默认值） */
-const EXCLUDED_ORDER_STATUSES: OrderStatus[] = [
-  OrderStatus.DRAFT,
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAYMENT_TIMEOUT,
-  OrderStatus.CANCELLED,
-  OrderStatus.FAILED,
-  OrderStatus.REFUNDED,
-];
+// 有效订单口径、老系统次数与「合计」加法都搬到了 traveler-trip-count.ts（导出侧也要用，
+// 留在本文件会成模块环）；这里原样再导出一次，历史调用方不必分叉。
+export {
+  addLegacyTripCount,
+  isLegacyTripMatchedByFlownDate,
+  loadLegacyTripCounts,
+  sumLegacyTripCounts,
+} from './traveler-trip-count.js';
+export type { LegacyTripCountScope } from './traveler-trip-count.js';
 
 /** 快照过期阈值：超过后列表访问会触发后台重建（不阻塞本次响应） */
-const SNAPSHOT_STALE_MS = 6 * 60 * 60 * 1000;
+export const SNAPSHOT_STALE_MS = 6 * 60 * 60 * 1000;
 
 /** 常旅客号展示格式：CT- + 6 位补零（服务端统一格式化，前端不拼） */
 export function formatTravelerNo(no: number): string {
@@ -57,219 +68,23 @@ interface DocPair {
   documentNumber: string;
 }
 
+/** 现算兜底行的常旅客号占位：这人还没档案，别让界面显示一个不存在的 CT- 号。 */
+const UNFILED_TRAVELER_NO = '未建档';
+
 /** 批量查常旅客次数（lookupByDocuments）的单条结果 —— 订单详情抽屉「已飞/在订/可用」用 */
 export interface TravelerLookupResult {
   documentType: DocumentType;
   documentNumber: string;
+  /** 现算兜底行（还没建档）为空串 */
   profileId: string;
+  /** 现算兜底行为「未建档」 */
   travelerNo: string;
+  /** false = 数字是本次实时算的（新系统已飞 + 老系统历史），不是档案快照 */
+  hasProfile: boolean;
   tripCount: number;
   pendingTripCount: number;
   redeemedTrips: number;
   availableTrips: number;
-}
-
-export interface LegacyTripCountScope {
-  /** 结果 Map 的 key；重建时用主档案 id，详情时也用主档案 id。 */
-  key: string;
-  /** 主证件号 + 合并链上的全部旧证件号，按 norm 匹配且不区分证件类型。 */
-  documentNumbers: readonly string[];
-  /** 该档案新系统已飞行程的去程业务日（UTC+8）。 */
-  flownBusinessDates: readonly string[];
-}
-
-interface LegacyTripCountRow {
-  documentNumberNorm: string | null;
-  outboundDate: Date | null;
-}
-
-const BUSINESS_DAY_MS = 24 * 60 * 60 * 1000;
-
-function toUtcBusinessDay(isoDate: string): number | null {
-  const match = /^(\d{4})-(\d{2})-(\d{2})$/.exec(isoDate);
-  if (!match) return null;
-  const year = Number(match[1]);
-  const month = Number(match[2]);
-  const day = Number(match[3]);
-  const timestamp = Date.UTC(year, month - 1, day);
-  const date = new Date(timestamp);
-  return date.getUTCFullYear() === year &&
-      date.getUTCMonth() === month - 1 &&
-      date.getUTCDate() === day
-    ? timestamp
-    : null;
-}
-
-/**
- * 老系统票与新系统已飞行程的活体去重：去程业务日相差不超过 1 天即视为同一重录行程。
- * LegacyTicket.outboundDate 是 @db.Date，按 UTC 日期读取；新系统日期由 departAt 折成 UTC+8 业务日。
- */
-export function isLegacyTripMatchedByFlownDate(
-  outboundDate: Date | null,
-  flownBusinessDates: readonly string[],
-): boolean {
-  if (!outboundDate) return false;
-  const legacyDay = Date.UTC(
-    outboundDate.getUTCFullYear(),
-    outboundDate.getUTCMonth(),
-    outboundDate.getUTCDate(),
-  );
-  return flownBusinessDates.some((businessDate) => {
-    const flownDay = toUtcBusinessDay(businessDate);
-    return flownDay !== null && Math.abs(legacyDay - flownDay) <= BUSINESS_DAY_MS;
-  });
-}
-
-/**
- * 老系统历史飞行次数的唯一口径：
- *   - documentNumberNorm 命中档案全部证件号（trim + upper，不区分证件类型）；
- *   - isDeleted=false、supersededByOrderId IS NULL、stateRaw != 2（stateRaw 为 NULL 也计入）；
- *   - outboundDate IS NULL 或不晚于今天。老系统封笔后无日期的记录按历史购买计入；
- *   - 命中新系统该档案任一已飞去程业务日 ±1 天的老系统票活体去重，不依赖静态重录标记。
- *
- * 所有档案一次 findMany 批量查回两列，再按档案在内存过滤计数，不能在档案循环内逐人查询。
- */
-export async function loadLegacyTripCounts(
-  scopes: readonly LegacyTripCountScope[],
-  today = new Date(),
-  client: Pick<PrismaClient, 'legacyTicket'> = prisma,
-): Promise<Map<string, number>> {
-  const normalizedNumbers = [
-    ...new Set(
-      scopes.flatMap((scope) =>
-        scope.documentNumbers.map((documentNumber) => documentNumber.trim().toUpperCase()),
-      ).filter(Boolean),
-    ),
-  ];
-  if (normalizedNumbers.length === 0) return new Map();
-
-  const rows: LegacyTripCountRow[] = await client.legacyTicket.findMany({
-    where: {
-      documentNumberNorm: { in: normalizedNumbers },
-      isDeleted: false,
-      supersededByOrderId: null,
-      // 显式保留 stateRaw=NULL；Prisma 的 not: 2 单独使用时不会命中 SQL NULL。
-      OR: [{ stateRaw: null }, { stateRaw: { not: 2 } }],
-      AND: [{ OR: [{ outboundDate: null }, { outboundDate: { lte: today } }] }],
-    },
-    select: { documentNumberNorm: true, outboundDate: true },
-  });
-
-  const rowsByNorm = new Map<string, LegacyTripCountRow[]>();
-  for (const row of rows) {
-    if (!row.documentNumberNorm) continue;
-    const norm = row.documentNumberNorm.trim().toUpperCase();
-    const matchingRows = rowsByNorm.get(norm);
-    if (matchingRows) matchingRows.push(row);
-    else rowsByNorm.set(norm, [row]);
-  }
-
-  return new Map(
-    scopes.map((scope) => {
-      const documentNorms = new Set(
-        scope.documentNumbers
-          .map((documentNumber) => documentNumber.trim().toUpperCase())
-          .filter(Boolean),
-      );
-      let count = 0;
-      for (const norm of documentNorms) {
-        for (const row of rowsByNorm.get(norm) ?? []) {
-          if (!isLegacyTripMatchedByFlownDate(row.outboundDate, scope.flownBusinessDates)) {
-            count += 1;
-          }
-        }
-      }
-      return [scope.key, count] as const;
-    }),
-  );
-}
-
-/** 把档案的主证件与合并别名证件次数相加；同一 norm 只加一次。 */
-export function sumLegacyTripCounts(
-  documentNumbers: readonly string[],
-  countsByNorm: ReadonlyMap<string, number>,
-): number {
-  let total = 0;
-  const seen = new Set<string>();
-  for (const documentNumber of documentNumbers) {
-    const norm = documentNumber.trim().toUpperCase();
-    if (!norm || seen.has(norm)) continue;
-    seen.add(norm);
-    total += countsByNorm.get(norm) ?? 0;
-  }
-  return total;
-}
-
-/** 唯一的快照加数 helper：聚合结果是新系统已飞，写入 tripCount 时统一加老系统次数。 */
-export function addLegacyTripCount(
-  aggregate: Pick<TravelerAggregate, 'tripCount'>,
-  legacyTripCount: number,
-): number {
-  return aggregate.tripCount + legacyTripCount;
-}
-
-const orderSelect = {
-  id: true,
-  orderNumber: true,
-  status: true,
-  createdAt: true,
-  paidAmount: true,
-  passengers: {
-    select: {
-      fullName: true,
-      chineseName: true,
-      gender: true,
-      documentType: true,
-      documentNumber: true,
-      dateOfBirth: true,
-      nationality: true,
-      passportExpiry: true,
-      mealPreference: true,
-      bedPref: true,
-      needsWheelchair: true,
-      singleRoom: true,
-    },
-  },
-  items: {
-    select: {
-      kind: true,
-      flightCabin: true,
-      hotelCheckIn: true,
-      hotelCheckOut: true,
-      flightSchedule: {
-        select: {
-          departureTime: true,
-          flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
-        },
-      },
-      hotelRoomType: { select: { name: true, hotel: { select: { name: true } } } },
-    },
-  },
-} satisfies Prisma.OrderSelect;
-
-type OrderRow = Prisma.OrderGetPayload<{ select: typeof orderSelect }>;
-
-function toAggOrder(o: OrderRow): AggOrder {
-  return {
-    id: o.id,
-    orderNumber: o.orderNumber,
-    status: o.status,
-    createdAt: o.createdAt,
-    paidAmountCny: Number(o.paidAmount),
-    passengers: o.passengers,
-    items: o.items.map((i) => ({
-      kind: i.kind,
-      flightCabin: i.flightCabin,
-      departureTime: i.flightSchedule?.departureTime ?? null,
-      flightNumber: i.flightSchedule?.flight.flightNumber ?? null,
-      originCode: i.flightSchedule?.flight.originCode ?? null,
-      destinationCode: i.flightSchedule?.flight.destinationCode ?? null,
-      hotelName: i.hotelRoomType?.hotel.name ?? null,
-      roomTypeName: i.hotelRoomType?.name ?? null,
-      hotelCheckIn: i.hotelCheckIn,
-      hotelCheckOut: i.hotelCheckOut,
-    })),
-  };
 }
 
 /** 聚合 + 老系统次数 → 快照行（不含 notes：重建/回写永不覆盖运营备注）。 */
@@ -305,12 +120,6 @@ function toProfileData(
     linkedUserId,
     refreshedAt: new Date(),
   };
-}
-
-function aggregateFlownBusinessDates(aggregate: TravelerAggregate): string[] {
-  return aggregate.trips
-    .filter((trip) => trip.flown && trip.departAt !== null)
-    .map((trip) => businessDateISO(trip.departAt!));
 }
 
 /** 证件号脱敏（前2后2）：E12345678 → E1*****78；过短(≤4)全打码。列表/导出用。 */
@@ -638,12 +447,19 @@ export class TravelerProfilesService {
 
   /**
    * 批量查常旅客次数（按证件号，供订单详情抽屉一次拉「已飞/在订/可用」）。
-   * 只读快照值，不触发重算/重建。命中指针行（mergedIntoId 非空）时取主档案的值——
+   * 有档案的读快照值，不触发重算/重建。命中指针行（mergedIntoId 非空）时取主档案的值——
    * merge() 只允许并入 canonical 行（不许把档案并进指针行，见该方法），所以 mergedIntoId
    * 保证最多一跳，这里不必像 getDetail 那样拉全表走 resolveMasterRef 的链解析。
+   *
+   * 没有档案的证件号（刚录进来的新客，还没赶上下一次快照重建）不再直接放弃 ——
+   * 走 computeCombinedTripCounts 现算一份合计（新系统已飞 + 老系统历史），
+   * 一录护照号就能看出这人在老系统飞过几次。现算行没有档案，故 profileId 留空、
+   * travelerNo 给「未建档」，已核销恒为 0（核销流水只挂在档案上）。
+   *
    * 返回的 documentType/documentNumber 保持请求里的原证件（前端按它对回乘客）；
-   * 没有匹配到档案的证件不出现在结果里。一次 findMany（命中指针行时再补一次主档案 findMany，
-   * 按去重后的主档案 id 数一次性批量查，不随证件数增长）+ 一次 redemption groupBy，无 N+1。
+   * 占位出行人（N/A / 空证件号）仍不出现在结果里。查询数固定：一次档案 findMany
+   * （命中指针行时再补一次主档案 findMany）+ 一次 redemption groupBy + 现算的两条批量查询，
+   * 都不随证件数增长，无 N+1。
    */
   async lookupByDocuments(documents: DocPair[]): Promise<TravelerLookupResult[]> {
     if (documents.length === 0) return [];
@@ -658,7 +474,6 @@ export class TravelerProfilesService {
         })),
       },
     });
-    if (hits.length === 0) return [];
 
     const hitByKey = new Map<string, ProfileRow>();
     const rowById = new Map<string, ProfileRow>();
@@ -684,12 +499,38 @@ export class TravelerProfilesService {
       row.mergedIntoId ? (rowById.get(row.mergedIntoId) ?? row) : row;
 
     const masterIds = [...new Set(hits.map((h) => masterOf(h).id))];
-    const redeemedByProfile = await loadRedeemedTripsByProfile(masterIds);
+    const redeemedByProfile = masterIds.length
+      ? await loadRedeemedTripsByProfile(masterIds)
+      : new Map<string, number>();
+
+    // 没档案的证件号一次性现算（批量，不在下面的循环里逐人查库）
+    const missing = documents.filter(
+      (doc) => !hitByKey.has(docKey(doc.documentType, doc.documentNumber)),
+    );
+    const computed: Map<string, CombinedTripCount> = missing.length
+      ? await computeCombinedTripCounts(missing)
+      : new Map();
 
     const results: TravelerLookupResult[] = [];
     for (const doc of documents) {
-      const hit = hitByKey.get(docKey(doc.documentType, doc.documentNumber));
-      if (!hit) continue;
+      const key = docKey(doc.documentType, doc.documentNumber);
+      const hit = hitByKey.get(key);
+      if (!hit) {
+        const live = computed.get(key);
+        if (!live) continue; // 占位出行人 / 空证件号：现算也不给条目
+        results.push({
+          documentType: doc.documentType,
+          documentNumber: doc.documentNumber,
+          profileId: '',
+          travelerNo: UNFILED_TRAVELER_NO,
+          hasProfile: false,
+          tripCount: live.tripCount,
+          pendingTripCount: live.pendingTripCount,
+          redeemedTrips: 0,
+          availableTrips: live.tripCount,
+        });
+        continue;
+      }
       const master = masterOf(hit);
       const redeemedTrips = redeemedByProfile.get(master.id) ?? 0;
       results.push({
@@ -697,6 +538,7 @@ export class TravelerProfilesService {
         documentNumber: doc.documentNumber,
         profileId: master.id,
         travelerNo: formatTravelerNo(master.travelerNo),
+        hasProfile: true,
         tripCount: master.tripCount,
         pendingTripCount: master.pendingTripCount,
         redeemedTrips,

@@ -10,10 +10,14 @@
  *     tripCount 只数新系统去程已起飞的行程（「飞过多少次」）；老系统历史次数由 service
  *     层按档案全部证件号批量查好后加到快照，不在本纯函数内访问数据库；
  *     pendingTripCount 只数去程未起飞的行程（「在订未飞多少次」）。
+ *   - 待支付单也进本聚合（后台单/代理单永不自动退位，待支付是能挂很久的正常业务状态），
+ *     但只进「人存不存在 + 飞行次数」口径；订单数 / 累计消费 / 首次·末次出行这些已消费
+ *     语义的字段只认已付款单，见 countsTowardSpend。
  *   - 人均消费 = 订单实付 ÷ 乘机人数，平摊（含儿童/婴儿）。
  *   - 偏好取最近值（床型/餐食/单住）或众数（舱位）；轮椅任一次为真即真。
  */
-import type { CabinClass, DocumentType, Gender, OrderItemKind, OrderStatus } from '@prisma/client';
+import { OrderStatus } from '@prisma/client';
+import type { CabinClass, DocumentType, Gender, OrderItemKind } from '@prisma/client';
 
 // ── 输入形状（service 从 prisma 查询后映射；测试直接构造）──
 
@@ -100,7 +104,9 @@ export interface TravelerAggregate {
   tripCount: number;
   /** 在订未飞：有去程航班且去程尚未起飞的有效订单数（与新系统已飞互补；无航段单两边都不计） */
   pendingTripCount: number;
+  /** 订单数：只数已付款单（待支付单不进已消费口径） */
   orderCount: number;
+  /** 首次/末次出行：只数已付款单里已飞的行程（同上，已消费语义） */
   firstTripAt: Date | null;
   lastTripAt: Date | null;
   nextTripAt: Date | null;
@@ -117,6 +123,25 @@ export interface TravelerAggregate {
 
 const HOTEL_HISTORY_CAP = 20;
 const COMPANIONS_CAP = 12;
+
+/**
+ * 未付款状态：这些单进得了档案与飞行次数口径，但不进「已消费」口径。
+ * DRAFT / PAYMENT_TIMEOUT 在 service 层就被排除了，这里一并列出只是防御 ——
+ * 判断留在纯函数里，才好被单测直接驱动。
+ */
+const UNPAID_STATUSES: ReadonlySet<OrderStatus> = new Set<OrderStatus>([
+  OrderStatus.DRAFT,
+  OrderStatus.PENDING_PAYMENT,
+  OrderStatus.PAYMENT_TIMEOUT,
+]);
+
+/**
+ * 已消费口径的唯一判据：订单数 / 累计消费 / 首次·末次出行只认已付款单。
+ * 待支付单挂很久是正常业务状态，把它算进消费会让「累计消费」凭空长出没收到的钱。
+ */
+export function countsTowardSpend(status: OrderStatus): boolean {
+  return !UNPAID_STATUSES.has(status);
+}
 
 export function docKey(documentType: DocumentType, documentNumber: string): string {
   return `${documentType}|${documentNumber.trim().toUpperCase()}`;
@@ -308,13 +333,17 @@ export function buildTravelerAggregates(
       .map((o) => summaries.get(o.id)!)
       .sort((a, b) => (b.departAt?.getTime() ?? 0) - (a.departAt?.getTime() ?? 0));
 
+    // 飞行次数 / 在订未飞：含待支付单（在订就是在订，飞过就是飞过）
     const flown = trips.filter((t) => t.flown && t.departAt);
     const upcoming = trips.filter((t) => !t.flown && t.departAt && t.departAt > now);
-    const firstTripAt = flown.length
-      ? new Date(Math.min(...flown.map((t) => t.departAt!.getTime())))
+    // 已消费口径：订单数 / 累计消费 / 首末次出行只认已付款单
+    const paidTrips = trips.filter((t) => countsTowardSpend(t.status));
+    const paidFlown = paidTrips.filter((t) => t.flown && t.departAt);
+    const firstTripAt = paidFlown.length
+      ? new Date(Math.min(...paidFlown.map((t) => t.departAt!.getTime())))
       : null;
-    const lastTripAt = flown.length
-      ? new Date(Math.max(...flown.map((t) => t.departAt!.getTime())))
+    const lastTripAt = paidFlown.length
+      ? new Date(Math.max(...paidFlown.map((t) => t.departAt!.getTime())))
       : null;
     const nextTripAt = upcoming.length
       ? new Date(Math.min(...upcoming.map((t) => t.departAt!.getTime())))
@@ -359,11 +388,11 @@ export function buildTravelerAggregates(
       passportExpiry: idDoc.passportExpiry,
       tripCount: flown.length,
       pendingTripCount: upcoming.length,
-      orderCount: acc.orders.length,
+      orderCount: paidTrips.length,
       firstTripAt,
       lastTripAt,
       nextTripAt,
-      totalSpendCny: round2(trips.reduce((s, t) => s + t.spendShareCny, 0)),
+      totalSpendCny: round2(paidTrips.reduce((s, t) => s + t.spendShareCny, 0)),
       prefCabin,
       prefBed: acc.latestBed?.v ?? null,
       prefMeal: acc.latestMeal?.v ?? null,

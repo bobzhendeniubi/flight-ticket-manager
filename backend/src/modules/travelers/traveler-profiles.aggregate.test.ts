@@ -563,3 +563,66 @@ describe('酒店历史', () => {
     ]);
   });
 });
+
+// 待支付单纳入档案后的口径切分（2026-09-01）：后台单/代理单永不自动退位，待支付是能挂很久的
+// 正常业务状态，这类单要让人建得出档案、飞行次数算得上；但订单数/累计消费/首末次出行是
+// 「已消费」语义，绝不能被没收到的钱撑大。
+describe('待支付单：进飞行次数口径，不进已消费口径', () => {
+  it('已起飞的待支付单计入 tripCount，但不计 orderCount / 累计消费 / 首末次出行', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'o1',
+        status: 'PENDING_PAYMENT',
+        paidAmountCny: 8000, // 待支付单万一挂着定金，也不许进累计消费
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-03-01T02:00:00Z')],
+      }),
+    ];
+    const agg = buildTravelerAggregates(orders, NOW).get(KEY)!;
+    expect(agg.tripCount).toBe(1);
+    expect(agg.orderCount).toBe(0);
+    expect(agg.totalSpendCny).toBe(0);
+    expect(agg.firstTripAt).toBeNull();
+    expect(agg.lastTripAt).toBeNull();
+  });
+
+  it('未起飞的待支付单计入 pendingTripCount 与 nextTripAt', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'o1',
+        status: 'PENDING_PAYMENT',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-09-01T02:00:00Z')],
+      }),
+    ];
+    const agg = buildTravelerAggregates(orders, NOW).get(KEY)!;
+    expect(agg.pendingTripCount).toBe(1);
+    expect(agg.nextTripAt).toEqual(new Date('2026-09-01T02:00:00Z'));
+  });
+
+  it('已付款单与待支付单混合：飞行次数两张都算，消费只算已付款那张', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'paid',
+        status: 'PAID',
+        paidAmountCny: 5000,
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-02-01T02:00:00Z')],
+      }),
+      order({
+        id: 'pending',
+        status: 'PENDING_PAYMENT',
+        paidAmountCny: 8000,
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-06-01T02:00:00Z')],
+      }),
+    ];
+    const agg = buildTravelerAggregates(orders, NOW).get(KEY)!;
+    expect(agg.tripCount).toBe(2);
+    expect(agg.orderCount).toBe(1);
+    expect(agg.totalSpendCny).toBe(5000);
+    // 首末次出行都锁在已付款那张单上，不被待支付的 6 月那趟顶掉
+    expect(agg.firstTripAt).toEqual(new Date('2026-02-01T02:00:00Z'));
+    expect(agg.lastTripAt).toEqual(new Date('2026-02-01T02:00:00Z'));
+  });
+});

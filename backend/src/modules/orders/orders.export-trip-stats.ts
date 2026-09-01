@@ -12,24 +12,36 @@
  * 导出的工具函数，反向 import 会形成模块环。
  *
  * 诚实口径：
- *   - 飞行次数 = 该乘客的常旅客合计飞行次数（新系统已飞 + 老系统历史飞行（已去重、退票不计）），
+ *   - 飞行次数 = 该乘客的合计飞行次数（新系统已飞 + 老系统历史飞行（已去重、退票不计）），
  *     按档案全部证件号归拢，只计去程已起飞的行程；取自 TravelerProfile.tripCount ——
  *     是「这个人跟我们飞过几次」，与本单航段数无关，
- *     故同一订单不同乘客的飞行次数互不相同。匹配不到档案（新客/证件号对不上）→ 留空。
- *     该列读自档案快照表（值是上次重建时的，见 TravelerProfile.refreshedAt）；快照表一条
- *     都没有时（新环境 / 从没人开过档案页）会导致整列全部留空，导出会先同步做一次全量首建
- *     兜底。非空但过期的快照不归导出管——那由档案页自身访问时的后台重建负责刷新，导出不为
- *     此额外重建（全量重建太慢，不能挂在每次导出请求上）。
+ *     故同一订单不同乘客的飞行次数互不相同。
+ *     **快照没命中的乘客不再留空**：按证件号现算一份同口径的合计补上（新系统已飞 + 老系统历史，
+ *     见 travelers/traveler-trip-count.ts 的 computeCombinedTripCounts）——刚下单的新客还赶不上
+ *     下一次快照重建，而他在老系统里很可能早就是老客，留空等于把这半张历史藏起来。
+ *     只有证件号缺失/占位出行人（N/A）才留空。
+ *     该列读自档案快照表（值是上次重建时的，见 TravelerProfile.refreshedAt）；导出前会同步
+ *     兜底重建一次——快照表一条记录都没有（新环境 / 从没人开过档案页），或最新一条快照已
+ *     超过档案页自身用的过期阈值 SNAPSHOT_STALE_MS（traveler-profiles.service.ts，当前 6
+ *     小时），两种情况都触发。此前的口径是「过期不归导出管，交给档案页后台刷新」——
+ *     2026-08-31 老系统历史飞行次数并档上线时，迁移把全部快照的 refreshedAt 打成过期标记
+ *     等待重建，但快照表非空，导出从未触发过重建，运营导出出来「飞行次数」整列是空的/0。
+ *     导出是运营离线核对用的报表，本次就该给对的数——不能指望运营意识到"先去开一次档案页
+ *     刷新、再回来重导一遍"，因此改为同步重建而非丢给后台。实测全量重建（274 档案 / 老系统
+ *     109677 条历史票据）是秒级，挂在导出请求上可接受。
  *   - 在订未飞 = TravelerProfile.pendingTripCount（不含老系统未来日期未重录单；同一条快照重算链路回写）。
+ *     现算兜底行同口径实时算（老系统已封笔，没有未来的单）。
  *   - 可用次数 = 飞行次数（含老系统历史飞行（已去重、退票不计））− 已核销权益次数（TravelerBenefitRedemption 流水 sum，
  *     核销/冲正同一档案），可为负——核销后订单又被退改导致已飞回落时如实透出，不截断也不臆造。
- *     核销流水挂在合并链的主档案上，取值前已沿 mergedIntoId 解析到主档案。
+ *     核销流水挂在合并链的主档案上，取值前已沿 mergedIntoId 解析到主档案；
+ *     现算兜底行还没有档案，核销流水挂不上去，故可用次数 = 飞行次数。
  */
 import type { DocumentType, PrismaClient } from '@prisma/client';
 import { Prisma } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
-import { TravelerProfilesService } from '../travelers/traveler-profiles.service.js';
+import { SNAPSHOT_STALE_MS, TravelerProfilesService } from '../travelers/traveler-profiles.service.js';
+import { computeCombinedTripCounts } from '../travelers/traveler-trip-count.js';
 
 /** 一位旅客的三项快照口径数字：合计飞行次数（含老系统）/ 在订未飞 / 可用次数（合计飞行−已核销，可为负）。*/
 export interface TripStats {
@@ -41,7 +53,8 @@ export interface TripStats {
 /** docKey(证件类型|证件号) → 该旅客的三项快照数字。渲染纯函数只认这张 Map，不碰 DB。*/
 export type TripStatsMap = Map<string, TripStats>;
 
-/** 快照新鲜度：本次导出用到的档案里最旧的一条重建时间（null = 一条都没匹配上）。*/
+/** 快照新鲜度：本次导出用到的**档案**里最旧的一条重建时间（null = 一条都没匹配上）。
+ *  现算兜底行是本次实时算的，不参与这个「有多旧」的判断。*/
 export interface TripCountLookup {
   tripStats: TripStatsMap;
   /** 表头批注用：让读表的人知道这几列是快照、有多旧。*/
@@ -193,14 +206,18 @@ function resolveMaster(start: ProfileRef, byId: Map<string, ProfileRef>): Profil
 }
 
 /**
- * 空表首建兜底：若本次导出确实有乘客、但快照表一条记录都没有（新环境 / 从没人开过档案页），
- * 直接读 loadTripCountMap 只会拿到空 Map → 整列留空。这里同步做一次全量重建把表填起来。
+ * 首建 + 过期，双重兜底：若本次导出确实有乘客——
+ *   - 快照表一条记录都没有（新环境 / 从没人开过档案页）→ 全量首建；
+ *   - 快照表非空，但最新一条快照已超过 SNAPSHOT_STALE_MS（与档案页 ensureFresh 同一阈值，
+ *     traveler-profiles.service.ts）→ 视为整表过期，同样重建。
+ * 两种情况下直接读 loadTripCountMap 都会取到错的数字（前者整列留空；后者是批量迁移强制
+ * 打过期标记后的非空旧值，例如 2026-08-31 老系统历史飞行次数并档上线那次）。
  *
- * 只处理「空表」这一种情况——非空但过期的快照不归导出管，那是档案页自身访问时
- * （traveler-profiles.service.ts 的 ensureFresh）负责的后台刷新；导出依旧不为过期快照
- * 触发重建（全量重建太慢，不能挂在每次导出请求上，见文件头部口径说明）。
+ * 同步重建（而非丢给后台）：导出是运营离线核对用的报表，本次就该给对的数——不能指望运营
+ * 意识到"先去开一次档案页刷新、再回来重导一遍"。实测全量重建（274 档案 / 老系统 109677
+ * 条历史票据）是秒级，挂在导出请求上可接受，见文件头部口径说明。
  *
- * rebuild 参数化：便于单测在不真正跑全量重建的前提下断言「空表触发/非空不触发」。
+ * rebuild 参数化：便于单测在不真正跑全量重建的前提下断言「触发/不触发」。
  */
 export async function bootstrapTripCountProfilesIfEmpty(
   passengerCount: number,
@@ -209,14 +226,21 @@ export async function bootstrapTripCountProfilesIfEmpty(
 ): Promise<void> {
   if (passengerCount === 0) return;
   const existing = await client.travelerProfile.count();
-  if (existing > 0) return;
-  await rebuild();
+  if (existing === 0) {
+    await rebuild();
+    return;
+  }
+  const newest = await client.travelerProfile.aggregate({ _max: { refreshedAt: true } });
+  const newestRefreshedAt = newest._max.refreshedAt;
+  if (newestRefreshedAt && Date.now() - newestRefreshedAt.getTime() > SNAPSHOT_STALE_MS) {
+    await rebuild();
+  }
 }
 
 /**
- * 导出取数的统一入口：空表首建兜底 + 拉快照，一步到位。
+ * 导出取数的统一入口：首建 + 过期双重兜底 + 拉快照，一步到位。
  * 三张表（全岗总表 / 分房表 /《全岗可用》）都走这里 —— 谁也别再自己拼「先 bootstrap 再 load」，
- * 否则漏掉兜底的那张表在新环境里会整列留空，同一位乘客在三张表里就出现两个答案。
+ * 否则漏掉兜底的那张表在新环境 / 快照过期后会整列留空或出脏值，同一位乘客在三张表里就出现两个答案。
  */
 export async function loadExportTripStats(
   passengers: readonly TripStatsPassenger[],
@@ -224,13 +248,51 @@ export async function loadExportTripStats(
   rebuild: () => Promise<unknown> = () => new TravelerProfilesService().rebuildAll(),
 ): Promise<TripCountLookup> {
   await bootstrapTripCountProfilesIfEmpty(passengers.length, client, rebuild);
-  return loadTripCountMap(passengers, client);
+  const fromSnapshot = await loadTripCountMap(passengers, client);
+  return fillMissingWithLiveCounts(passengers, fromSnapshot, client);
+}
+
+/**
+ * 快照没命中的乘客 → 按证件号现算一份合计补上（新系统已飞 + 老系统历史，同一份口径函数）。
+ *
+ * 为什么必须有这一步：快照是上一次重建的产物，刚录进来的客人不在里面；而他在老系统里
+ * 很可能早就飞过很多次。此前这类乘客整行留空，导出的「飞行次数」列对新客永远是空的。
+ *
+ * 加法不在这里发生 —— computeCombinedTripCounts 内部走的是全站唯一的 addLegacyTripCount，
+ * 导出与录单徽章共用同一个函数，同一个人在两处不可能出现两个数字。
+ * 现算行没有档案 → 核销流水挂不上（TravelerBenefitRedemption 按 profileId 记账），可用次数 = 飞行次数。
+ * 一次批量调用覆盖全部未命中乘客（内部两条查询），不在行循环里逐人查库。
+ */
+async function fillMissingWithLiveCounts(
+  passengers: readonly TripStatsPassenger[],
+  fromSnapshot: TripCountLookup,
+  client: PrismaClient,
+): Promise<TripCountLookup> {
+  const missing = new Map<string, TripStatsPassenger>();
+  for (const p of passengers) {
+    if (!p.documentNumber) continue; // 证件号缺失 → 无从匹配，留空
+    const key = docKey(p.documentType, p.documentNumber);
+    if (fromSnapshot.tripStats.has(key)) continue;
+    missing.set(key, { documentType: p.documentType, documentNumber: p.documentNumber });
+  }
+  if (missing.size === 0) return fromSnapshot;
+
+  const computed = await computeCombinedTripCounts([...missing.values()], client);
+  const tripStats: TripStatsMap = new Map(fromSnapshot.tripStats);
+  for (const [key, live] of computed) {
+    tripStats.set(key, {
+      tripCount: live.tripCount,
+      pendingTripCount: live.pendingTripCount,
+      availableTrips: live.tripCount,
+    });
+  }
+  return { tripStats, oldestRefreshedAt: fromSnapshot.oldestRefreshedAt };
 }
 
 /**
  * 「飞行次数」单元格渲染（三张表唯一入口，纯函数、不碰 DB）。
- * 匹配不到档案（新客 / 证件号对不上 / 证件号缺失）→ 留空，不臆造 0
- * （0 会被读成"从没飞过"的结论）。
+ * Map 里没有这位乘客（证件号缺失 / 占位出行人）→ 留空，不臆造 0
+ * （0 会被读成"从没飞过"的结论）。真算出来的 0 照常出 0 —— 那是算过的结论，不是没查到。
  */
 export function flightCountCell(p: TripStatsPassenger, tripStats: TripStatsMap): string {
   const stats = p.documentNumber

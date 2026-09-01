@@ -26,6 +26,7 @@ import {
 import { flightCountCell } from './orders.export-trip-stats.js';
 import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
+import { SNAPSHOT_STALE_MS } from '../travelers/traveler-profiles.service.js';
 
 const D = (s: string): Date => new Date(`${s}T00:00:00.000Z`);
 
@@ -1004,42 +1005,65 @@ describe('loadTripCountMap', () => {
   });
 });
 
-// ── 空表首建兜底：新环境/从没人开过档案页时快照表是空的，直读会让飞行次数整列留空 ──────
+// ── 首建 + 过期双重兜底：新环境/从没人开过档案页时快照表是空的，或批量迁移把快照打过期后
+// 非空但全是旧值——两种情况直读都会让飞行次数整列错（留空 / 陈旧），导出前先同步补建 ──────
 describe('bootstrapTripCountProfilesIfEmpty', () => {
-  /** 假 client：count() 返回预置值，记录是否被调用。*/
-  function fakeCountClient(count: number) {
+  const ONE_HOUR_MS = 60 * 60 * 1000;
+
+  /**
+   * 假 client：count() 返回预置的快照条数；非空分支还会读 aggregate() 的最新 refreshedAt
+   * 判断是否过期，默认给一个刚刚重建过的新鲜时间戳（不触发）。
+   */
+  function fakeCountClient(count: number, newestRefreshedAt: Date = new Date()) {
     const countFn = vi.fn(async () => count);
-    const client = { travelerProfile: { count: countFn } };
-    return { client, countFn };
+    const aggregateFn = vi.fn(async () => ({ _max: { refreshedAt: newestRefreshedAt } }));
+    const client = { travelerProfile: { count: countFn, aggregate: aggregateFn } };
+    return { client, countFn, aggregateFn };
   }
 
   it('快照表为空 + 本次导出有乘客 → 触发一次重建', async () => {
-    const { client, countFn } = fakeCountClient(0);
+    const { client, countFn, aggregateFn } = fakeCountClient(0);
     const rebuild = vi.fn(async () => ({ built: 0, removed: 0 }));
 
     await bootstrapTripCountProfilesIfEmpty(2, client as never, rebuild);
 
     expect(countFn).toHaveBeenCalledTimes(1);
+    expect(aggregateFn).not.toHaveBeenCalled(); // 空表已经决定重建，用不着再查最新时间
     expect(rebuild).toHaveBeenCalledTimes(1);
   });
 
-  it('快照表非空 → 不触发重建（过期账不归导出管，交给档案页自身的后台刷新）', async () => {
-    const { client, countFn } = fakeCountClient(5);
+  it('快照表非空但已过期（超过 SNAPSHOT_STALE_MS）→ 触发一次重建', async () => {
+    const staleRefreshedAt = new Date(Date.now() - (SNAPSHOT_STALE_MS + ONE_HOUR_MS));
+    const { client, countFn, aggregateFn } = fakeCountClient(5, staleRefreshedAt);
     const rebuild = vi.fn(async () => ({ built: 0, removed: 0 }));
 
     await bootstrapTripCountProfilesIfEmpty(2, client as never, rebuild);
 
     expect(countFn).toHaveBeenCalledTimes(1);
+    expect(aggregateFn).toHaveBeenCalledTimes(1);
+    expect(rebuild).toHaveBeenCalledTimes(1);
+  });
+
+  it('快照表非空且新鲜（未超过 SNAPSHOT_STALE_MS）→ 不触发重建', async () => {
+    const freshRefreshedAt = new Date(Date.now() - ONE_HOUR_MS);
+    const { client, countFn, aggregateFn } = fakeCountClient(5, freshRefreshedAt);
+    const rebuild = vi.fn(async () => ({ built: 0, removed: 0 }));
+
+    await bootstrapTripCountProfilesIfEmpty(2, client as never, rebuild);
+
+    expect(countFn).toHaveBeenCalledTimes(1);
+    expect(aggregateFn).toHaveBeenCalledTimes(1);
     expect(rebuild).not.toHaveBeenCalled();
   });
 
   it('本次导出一位乘客都没有 → 不查表、不触发重建', async () => {
-    const { client, countFn } = fakeCountClient(0);
+    const { client, countFn, aggregateFn } = fakeCountClient(0);
     const rebuild = vi.fn(async () => ({ built: 0, removed: 0 }));
 
     await bootstrapTripCountProfilesIfEmpty(0, client as never, rebuild);
 
     expect(countFn).not.toHaveBeenCalled();
+    expect(aggregateFn).not.toHaveBeenCalled();
     expect(rebuild).not.toHaveBeenCalled();
   });
 });

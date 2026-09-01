@@ -992,19 +992,35 @@ describe('buildRoomAllocationWorkbook 飞行次数取数', () => {
   function tripStatsClient(items: RoomItemForExport[]): {
     client: PrismaClient;
     profileFindMany: ReturnType<typeof vi.fn>;
+    orderFindMany: ReturnType<typeof vi.fn>;
+    legacyFindMany: ReturnType<typeof vi.fn>;
   } {
     const profileFindMany = vi.fn().mockResolvedValue([]);
+    // 快照一个都没命中 → 走现算兜底：order/legacyTicket 各查一次（这里都返回空，
+    // 兜底出 0；本 describe 只锁「批量取数」这件事，合计口径由
+    // travelers/traveler-trip-count.test.ts 覆盖）
+    const orderFindMany = vi.fn().mockResolvedValue([]);
+    const legacyFindMany = vi.fn().mockResolvedValue([]);
     const client = {
       orderItem: { findMany: vi.fn().mockResolvedValue(items) },
-      // count > 0 → 不触发空表首建兜底（那是新环境才走的分支）
-      travelerProfile: { count: vi.fn().mockResolvedValue(42), findMany: profileFindMany },
+      order: { findMany: orderFindMany },
+      legacyTicket: { findMany: legacyFindMany },
+      // count > 0 且 aggregate 给出刚重建过的新鲜时间戳 → 不触发首建/过期兜底（那两个是
+      // 新环境 / 快照过期才走的分支，见 orders.export-trip-stats.ts）
+      travelerProfile: {
+        count: vi.fn().mockResolvedValue(42),
+        aggregate: vi.fn().mockResolvedValue({ _max: { refreshedAt: new Date() } }),
+        findMany: profileFindMany,
+      },
       travelerBenefitRedemption: { groupBy: vi.fn().mockResolvedValue([]) },
     } as unknown as PrismaClient;
-    return { client, profileFindMany };
+    return { client, profileFindMany, orderFindMany, legacyFindMany };
   }
 
   it('批量取数：本次导出全部乘客一条 findMany 拉回，不在行循环里逐个查库', async () => {
-    const { client, profileFindMany } = tripStatsClient(fixtureItems());
+    const { client, profileFindMany, orderFindMany, legacyFindMany } = tripStatsClient(
+      fixtureItems(),
+    );
     await buildRoomAllocationWorkbook({ from: '2026-07-10', to: '2026-07-12' }, client);
 
     expect(profileFindMany).toHaveBeenCalledTimes(1);
@@ -1014,12 +1030,16 @@ describe('buildRoomAllocationWorkbook 飞行次数取数', () => {
       'E12345678',
       'E87654321',
     ]);
+    // 三位乘客都没命中快照 → 现算兜底也是一次性批量，不按人逐个查
+    expect(orderFindMany).toHaveBeenCalledTimes(1);
+    expect(legacyFindMany).toHaveBeenCalledTimes(1);
   });
 
-  it('没有任何占房行 → 不去拉档案（空导出不该白查一次库）', async () => {
-    const { client, profileFindMany } = tripStatsClient([]);
+  it('没有任何占房行 → 不去拉档案、也不现算（空导出不该白查一次库）', async () => {
+    const { client, profileFindMany, orderFindMany } = tripStatsClient([]);
     await buildRoomAllocationWorkbook({ from: '2026-07-10', to: '2026-07-12' }, client);
     expect(profileFindMany).not.toHaveBeenCalled();
+    expect(orderFindMany).not.toHaveBeenCalled();
   });
 });
 

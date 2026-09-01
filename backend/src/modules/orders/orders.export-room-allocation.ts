@@ -59,9 +59,10 @@ export interface RoomAllocationRow {
   chineseName: string;
   pnrName: string;
   /**
-   * 飞行次数 = 该乘客的常旅客合计飞行次数（TravelerProfile.tripCount 快照，含老系统历史飞行（已去重、
-   * 退票不计），按档案全部证件号归拢，只计去程已起飞的行程）。与全岗总表 /《全岗可用》同一取数与渲染入口，同一位乘客在三张表里
-   * 的数字必然相同；匹配不到档案（新客/证件号对不上）→ 留空，不臆造 0。见 orders.export-trip-stats.ts。
+   * 飞行次数 = 该乘客的合计飞行次数（新系统已飞 + 老系统历史飞行（已去重、退票不计），
+   * 按档案全部证件号归拢，只计去程已起飞的行程）。优先读 TravelerProfile.tripCount 快照，
+   * 快照没命中（刚下单的新客）→ 按证件号现算同口径的合计补上。与全岗总表 /《全岗可用》同一取数与渲染
+   * 入口，同一位乘客在三张表里的数字必然相同；只有证件号缺失/占位出行人才留空。见 orders.export-trip-stats.ts。
    */
   flightCount: string;
   travelDates: string; // 'YYYY-MM-DD / YYYY-MM-DD'
@@ -108,8 +109,8 @@ export const COLUMNS: Array<{
     note:
       '常旅客合计飞行次数：新系统已飞 + 老系统历史飞行（已去重、退票不计），按档案全部证件号归拢，' +
       '只计去程已起飞的行程（不是本单航段数）。\n' +
-      '匹配不到旅客档案（新客/证件号对不上）留空。\n' +
-      '数据为旅客档案快照，非导出时实时重算。',
+      '还没建档的（刚下单的新客）按证件号实时计算同一口径的合计补上；只有证件号缺失才留空。\n' +
+      '有档案的取旅客档案快照，非导出时实时重算。',
   },
   { header: '出发(往返)日期', key: 'travelDates', width: 26 },
   { header: '结算价格', key: 'settlePrice', width: 12 },

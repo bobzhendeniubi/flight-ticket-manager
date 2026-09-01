@@ -991,18 +991,40 @@ describe('buildOrderTemplateExportWorkbook 飞行次数取数', () => {
     };
   }
 
+  /**
+   * 假 client。order.findMany 会被调用两次且语义不同，按 where 形态分流：
+   *   - 导出自己的取数（无 passengers 条件）→ 返回 orders；
+   *   - 快照未命中乘客的现算兜底（带 passengers.some 条件）→ 返回 legacyOrders（默认空）。
+   * legacyTickets = 现算兜底里老系统那半边。
+   */
   function fakeClient(
     orders: OrderForTemplateExport[],
     profiles: ProfileRow[],
-  ): { client: PrismaClient; profileFindMany: ReturnType<typeof vi.fn> } {
+    live: { orders?: unknown[]; tickets?: unknown[] } = {},
+  ): {
+    client: PrismaClient;
+    profileFindMany: ReturnType<typeof vi.fn>;
+    orderFindMany: ReturnType<typeof vi.fn>;
+    legacyFindMany: ReturnType<typeof vi.fn>;
+  } {
     const profileFindMany = vi.fn().mockResolvedValue(profiles);
+    const orderFindMany = vi.fn(async (args?: { where?: Record<string, unknown> }) =>
+      args?.where?.passengers ? live.orders ?? [] : orders,
+    );
+    const legacyFindMany = vi.fn().mockResolvedValue(live.tickets ?? []);
     const client = {
-      order: { findMany: vi.fn().mockResolvedValue(orders) },
-      // count > 0 → 不触发空表首建兜底（那是新环境才走的分支）
-      travelerProfile: { count: vi.fn().mockResolvedValue(42), findMany: profileFindMany },
+      order: { findMany: orderFindMany },
+      legacyTicket: { findMany: legacyFindMany },
+      // count > 0 且 aggregate 给出刚重建过的新鲜时间戳 → 不触发首建/过期兜底（那两个是
+      // 新环境 / 快照过期才走的分支，见 orders.export-trip-stats.ts）
+      travelerProfile: {
+        count: vi.fn().mockResolvedValue(42),
+        aggregate: vi.fn().mockResolvedValue({ _max: { refreshedAt: new Date() } }),
+        findMany: profileFindMany,
+      },
       travelerBenefitRedemption: { groupBy: vi.fn().mockResolvedValue([]) },
     } as unknown as PrismaClient;
-    return { client, profileFindMany };
+    return { client, profileFindMany, orderFindMany, legacyFindMany };
   }
 
   /** 读《全岗可用》第 n 条数据行的「飞行次数」单元格（两行表头 → 数据从第 3 行起）。*/
@@ -1021,19 +1043,37 @@ describe('buildOrderTemplateExportWorkbook 飞行次数取数', () => {
     travelTo: '2026-07-13',
   } as Parameters<typeof buildOrderTemplateExportWorkbook>[0];
 
-  it('有档案的乘客在 xlsx 里出数字、无档案的留空（此前整列恒空）', async () => {
-    const { client } = fakeClient([fixtureRoundTrip()], [profile('EN7208993', 9)]);
+  it('有档案的乘客读快照数字；没档案的现算兜底补上老系统次数（此前整列恒空）', async () => {
+    const { client } = fakeClient([fixtureRoundTrip()], [profile('EN7208993', 9)], {
+      // 第二位乘客（E87654321）没有档案：新系统查不到订单，老系统有两条历史票
+      tickets: [
+        { documentNumberNorm: 'E87654321', outboundDate: D('2019-05-01T00:00:00.000') },
+        { documentNumberNorm: 'E87654321', outboundDate: D('2020-06-01T00:00:00.000') },
+      ],
+    });
     const cells = await flightCountCells(await buildOrderTemplateExportWorkbook(fullQuery, client));
     expect(cells[0]).toBe('9');
-    expect(cells[1] ?? '').toBe(''); // 第二位乘客无档案 → 空单元格
+    expect(cells[1]).toBe('2'); // 老客认得出来，不再是空单元格
+  });
+
+  it('没档案又查不到任何历史 → 现算出 0，那是算过的结论', async () => {
+    const { client } = fakeClient([fixtureRoundTrip()], [profile('EN7208993', 9)]);
+    const cells = await flightCountCells(await buildOrderTemplateExportWorkbook(fullQuery, client));
+    expect(cells[1]).toBe('0');
   });
 
   it('批量取数：全部乘客一条 findMany 拉回，不在行循环里逐个查库', async () => {
-    const { client, profileFindMany } = fakeClient([fixtureRoundTrip()], []);
+    const { client, profileFindMany, orderFindMany, legacyFindMany } = fakeClient(
+      [fixtureRoundTrip()],
+      [],
+    );
     await buildOrderTemplateExportWorkbook(fullQuery, client);
     expect(profileFindMany).toHaveBeenCalledTimes(1);
     const or = profileFindMany.mock.calls[0][0].where.OR as { documentNumber: { equals: string } }[];
     expect(or.map((c) => c.documentNumber.equals).sort()).toEqual(['E87654321', 'EN7208993']);
+    // 两位乘客都没档案 → 现算兜底也是批量：导出自己的取数 1 次 + 兜底订单查询 1 次
+    expect(orderFindMany).toHaveBeenCalledTimes(2);
+    expect(legacyFindMany).toHaveBeenCalledTimes(1);
   });
 
   it('票务/签证模板无「飞行次数」列 → 压根不去拉档案', async () => {
