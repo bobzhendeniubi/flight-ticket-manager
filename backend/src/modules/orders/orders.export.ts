@@ -357,7 +357,8 @@ function orderToRows(
     }
   }
 
-  const agency = order.agent?.companyName ?? order.agent?.contactName ?? '直销';
+  // 公司名可能是空串（历史空名代理）：`??` 不认 ''，须 trim + `||` 兜底到联系人名。
+  const agency = order.agent?.companyName?.trim() || order.agent?.contactName?.trim() || '直销';
   const statusLabel = STATUS_LABEL[order.status] ?? order.status;
   const flightStr = Array.from(new Set(legs.map((l) => l.flightNumber))).join(' / ');
   const routeStr = Array.from(new Set(legs.map((l) => l.route))).join(' / ');

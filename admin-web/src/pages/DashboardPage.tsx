@@ -144,7 +144,7 @@ export function DashboardPage() {
                           {i + 1}
                         </span>
                       )}
-                      {a.companyName ?? a.contactName}
+                      {a.companyName?.trim() || a.contactName}
                       <span className="ml-1 text-xs text-ink-muted">T{a.tier}</span>
                     </span>
                     <span className="nums font-medium text-ink">¥{a.revenue.toLocaleString()}</span>

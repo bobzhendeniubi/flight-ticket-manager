@@ -373,7 +373,7 @@ function AgentTableView({
                   </button>
                   <div className="text-xs text-ink-muted">
                     {a.contactName}
-                    {a.parent && <span className="ml-2 text-ink-muted">↑ {a.parent.companyName ?? a.parent.contactName}</span>}
+                    {a.parent && <span className="ml-2 text-ink-muted">↑ {a.parent.companyName?.trim() || a.parent.contactName}</span>}
                   </div>
                   <div className="mt-0.5">
                     <span className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${a.settlementMode === 'MONTHLY' ? 'bg-blue-100 text-blue-700' : 'bg-slate-100 text-slate-500'}`}>
@@ -834,7 +834,7 @@ function InfoTab({
           <Row label="邮箱" value={agent.email ?? '—'} />
           <Row label="层级" value={TIER_LABEL[agent.tier]} />
           <Row label="预存余额" value={<span className="font-semibold text-emerald-700">¥{Number(agent.prepaymentBalance).toLocaleString()}</span>} />
-          <Row label="上级" value={agent.parent ? (agent.parent.companyName ?? agent.parent.contactName) : '无（顶级）'} />
+          <Row label="上级" value={agent.parent ? (agent.parent.companyName?.trim() || agent.parent.contactName) : '无（顶级）'} />
           <Row label="下级数" value={agent.childCount.toString()} />
           <Row label="订单数" value={agent.orderCount.toString()} />
           <Row label="状态" value={agent.isActive ? <><Icon name="check" /> 在用</> : <><Icon name="pause" /> 停用</>} />

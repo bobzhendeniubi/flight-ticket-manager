@@ -295,7 +295,7 @@ export type RoomItemForExport = Prisma.OrderItemGetPayload<{
     };
     order: {
       include: {
-        agent: { select: { companyName: true } };
+        agent: { select: { companyName: true; contactName: true } };
         passengers: true;
         items: {
           select: {
@@ -468,7 +468,8 @@ export function buildRoomAllocationSheets(
   for (const orderItems of itemsByOrder.values()) {
     const order = orderItems[0].order;
     const roomGroups = parseRoomGroups(order.roomAssignment);
-    const agency = order.agent?.companyName ?? '直客';
+    // 公司名可能是空串（历史空名代理）：trim + `||` 兜底到联系人名，双空才算直客。
+    const agency = order.agent?.companyName?.trim() || order.agent?.contactName?.trim() || '直客';
 
     // 结算价格（人均）：订单总价 / 乘客数，与 orders.export-master.ts 的 settlePerPax 同口径；
     // 除零保护 —— 乘客数至少按 1 算，避免空乘客订单除以 0。
@@ -732,7 +733,7 @@ const ROOM_ITEM_INCLUDE = {
   },
   order: {
     include: {
-      agent: { select: { companyName: true } },
+      agent: { select: { companyName: true, contactName: true } },
       passengers: true,
       items: {
         select: {

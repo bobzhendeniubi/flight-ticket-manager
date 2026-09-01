@@ -307,7 +307,7 @@ export function visibleColumns(role: MasterExportRole): MasterColumn[] {
 // ── 取数形态 ────────────────────────────────────────────────────────────────
 /** Prisma include（取数 + 测试类型共享）。*/
 export const MASTER_EXPORT_INCLUDE = {
-  agent: { select: { companyName: true } },
+  agent: { select: { companyName: true, contactName: true } },
   user: { select: { displayName: true, email: true } },
   passengers: true,
   payments: true,
@@ -516,7 +516,9 @@ export function orderToMasterRows(
     .filter(Boolean)
     .join(' / ');
 
-  const agency = order.agent?.companyName ?? '直客';
+  // 公司名可能是空串（历史空名代理）：`??` 不认 ''，会把有归属的单导成空白代理机构——
+  // trim + `||` 落到联系人名，双空才算直客。
+  const agency = order.agent?.companyName?.trim() || order.agent?.contactName?.trim() || '直客';
   // 开票状态（P2-15a）：六态开票只写三布尔（outboundInvoiced/returnInvoiced/systemInvoiced），
   // 旧字段 order.invoiceStatus 不再回写 → 读旧字段会让已开票订单恒显示"未开"。改读三布尔，
   // 文案与 orders.export-templates.ts 的 full 模板（invoiceStatusSys/invoiceStatusManual，

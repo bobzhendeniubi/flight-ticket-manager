@@ -19,7 +19,7 @@ function customerApiToMock(c: CustomerSummary): MockCustomer {
     idNumber: c.profile.idNumber,
     agentId: c.profile.primaryAgentId,
     agentName: c.profile.primaryAgent
-      ? (c.profile.primaryAgent.companyName ?? c.profile.primaryAgent.contactName)
+      ? (c.profile.primaryAgent.companyName?.trim() || c.profile.primaryAgent.contactName)
       : null,
     createdAt: c.createdAt,
     totalOrders: c.totalOrders,

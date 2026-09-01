@@ -221,7 +221,7 @@ function deriveTitleByAge(dob: Date | null, gender: string | null, departDate: D
 // ── 取数 ────────────────────────────────────────────────────────────────
 export type OrderForTemplateExport = Prisma.OrderGetPayload<{
   include: {
-    agent: { select: { companyName: true } };
+    agent: { select: { companyName: true; contactName: true } };
     user: { select: { displayName: true; email: true } };
     passengers: true;
     payments: true;
@@ -335,7 +335,8 @@ export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
 
   return {
     paxCount,
-    agency: order.agent?.companyName ?? '直客',
+    // 公司名可能是空串（历史空名代理）：trim + `||` 兜底到联系人名，双空才算直客。
+    agency: order.agent?.companyName?.trim() || order.agent?.contactName?.trim() || '直客',
     notes: order.notes ?? '',
     hotelInfo: Array.from(hotelPartSet).join(' + '),
     hotelNames,
@@ -828,7 +829,7 @@ export async function buildOrderTemplateExportWorkbook(
     // 名单按录入倒序（最新录入在最上），对标旧系统
     orderBy: { createdAt: 'desc' },
     include: {
-      agent: { select: { companyName: true } },
+      agent: { select: { companyName: true, contactName: true } },
       user: { select: { displayName: true, email: true } },
       passengers: true,
       payments: true,

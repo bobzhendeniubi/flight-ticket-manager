@@ -354,7 +354,9 @@ function deriveView(o: OrderSummary) {
   );
   const itemSummary = summaryParts.join(' + ');
   const customerName = o.user?.displayName ?? o.contactName;
-  const agentName = o.agent?.companyName ?? o.agent?.contactName ?? null;
+  // 公司名可能是空串（历史空名代理）：`??` 只认 null 不认 ''，空串会吞掉联系人名兜底，
+  // 把明明有归属的单显示成「直客」——必须 trim + `||` 双兜底。
+  const agentName = (o.agent?.companyName?.trim() || o.agent?.contactName?.trim()) ?? null;
   const totalNum = Number(o.total);
   return { itemKind, itemKinds, itemSummary, customerName, agentName, totalNum };
 }
@@ -1396,7 +1398,7 @@ export function OrdersPage() {
   const bulkAgentOptions: SearchSelectOption[] = useMemo(
     () => bulkAgents.map((agent) => ({
       id: agent.id,
-      label: `${agent.companyName ?? '未填写公司名'} · ${agent.contactName}`,
+      label: `${agent.companyName?.trim() || '未填写公司名'} · ${agent.contactName}`,
       priceLabel: '',
     })),
     [bulkAgents],
@@ -10079,7 +10081,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   function importOtaRoster(): void {
     setErr(null);
     const agentDisplayName = (a: AgentListItem | undefined): string =>
-      a ? (a.companyName ?? a.contactName) : '未知代理';
+      a ? (a.companyName?.trim() || a.contactName) : '未知代理';
     const selectedAgent = agents.find((a) => a.id === agentId);
     const dateOrder =
       selectedAgent?.rosterFormat === 'COLON_MULTILINE_DMY'
@@ -12108,7 +12110,7 @@ function ConfirmPaymentSection({
           <div className={`mt-2 rounded-md border p-2 text-xs ${isMonthly ? 'border-blue-200 bg-blue-50' : 'border-slate-200 bg-slate-50'}`}>
             <div className="flex items-center justify-between">
               <span className="text-slate-600">
-                代理 <b className="text-slate-800">{agent.companyName ?? agent.contactName}</b>
+                代理 <b className="text-slate-800">{agent.companyName?.trim() || agent.contactName}</b>
               </span>
               <span className={`rounded px-1.5 py-0.5 font-medium ${isMonthly ? 'bg-blue-100 text-blue-700' : 'bg-slate-200 text-slate-600'}`}>
                 {SETTLEMENT_MODE_LABEL[agent.settlementMode]}

@@ -1143,7 +1143,7 @@ function InfoModal({ order, agents, onCancel, onSubmit }: { order: HoldOrderList
             <div>
               <label className="label">归属代理</label>
               <select className="input" value={agentId} onChange={(e) => setAgentId(e.target.value)}>
-                {currentAgentMissing && <option value={order.agentId!}>{order.agent ? `${order.agent.companyName ?? order.agent.contactName}（已停用）` : '当前代理（已停用）'}</option>}
+                {currentAgentMissing && <option value={order.agentId!}>{order.agent ? `${order.agent.companyName?.trim() || order.agent.contactName}（已停用）` : '当前代理（已停用）'}</option>}
                 {agents.map((a) => <option key={a.id} value={a.id}>{agentLabel(a)}</option>)}
               </select>
               {agentChanged && order.seatsConverted > 0 && (
