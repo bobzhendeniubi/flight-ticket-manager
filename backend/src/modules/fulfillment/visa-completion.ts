@@ -19,6 +19,7 @@
 import { FulfillmentStatus, FulfillmentType, VisaRequirement, VisaSubmissionStatus } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { writeAudit, type AuditActor } from '../../lib/audit.js';
+import { isVisaContradiction } from '../orders/visa-need.js';
 
 /** 办结派生审计动作名（写/回退共用，回退时按最近一条判断来源）。 */
 export const VISA_AUTO_COMPLETE_ACTION = 'AUTO_COMPLETE_VISA';
@@ -43,10 +44,12 @@ export async function syncOrderVisaCompletion(
   // 回收站单不派生：签证台本就看不见它，别在暗处翻状态。
   if (!order || order.deletedAt) return { changed: false };
 
-  const [passengers, ourVisaTaskCount] = await Promise.all([
+  const [roster, ourVisaTaskCount] = await Promise.all([
+    // 取全名单（不在 where 里滤 visaExempt）：办结判定只看非自备签那部分，但下面的
+    // 回退矛盾闸要区分「全员自备签」与「一位乘客都没录」，得看得见整张名单。
     prisma.passenger.findMany({
-      where: { orderId, visaExempt: false },
-      select: { visaSubmissionStatus: true },
+      where: { orderId },
+      select: { visaSubmissionStatus: true, visaExempt: true },
     }),
     // 「确有我方签证任务」：全员自备签/录单已签证的单不建任务，也就永远不会被这里翻状态。
     prisma.fulfillmentTask.count({
@@ -58,6 +61,7 @@ export async function syncOrderVisaCompletion(
     }),
   ]);
 
+  const passengers = roster.filter((p) => !p.visaExempt);
   const allConfirmed =
     passengers.length > 0 &&
     passengers.every((p) => p.visaSubmissionStatus === VisaSubmissionStatus.CONFIRMED);
@@ -98,6 +102,14 @@ export async function syncOrderVisaCompletion(
     beforeStatus && (Object.values(VisaRequirement) as string[]).includes(beforeStatus)
       ? (beforeStatus as VisaRequirement)
       : VisaRequirement.NEEDED;
+  // 回退前的矛盾闸：本单现在已全员自备签时，把订单级恢复成「需要签证 / 电子签」会造出
+  // 「订单说要我方办、却没有一位出行人要办」的矛盾单 —— 不建任务、签证台看不见（判定见
+  // visa-need.ts 的 isVisaContradiction），正是要根治的漏签形态。此时保留「已签证」不回退：
+  // 全员自备签下客人签证已自持，签证岗本就无事可做。乘客级 visaExempt 一概不碰。
+  // （常规回退——名单里还有人随团办签、只是进度退回——不受影响。）
+  if (isVisaContradiction({ visaStatus: restoredTo, passengers: roster })) {
+    return { changed: false };
+  }
   await prisma.order.update({
     where: { id: orderId },
     data: { visaStatus: restoredTo },

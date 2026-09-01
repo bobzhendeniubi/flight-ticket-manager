@@ -12,6 +12,8 @@ import {
   orderVisaStatusRequiresVisa,
   orderVisaStatusExplicitlyNotNeeded,
   orderNeedsVisaTask,
+  isVisaContradiction,
+  VISA_CONTRADICTION_MESSAGE,
 } from './visa-need.js';
 
 describe('passengerNeedsVisa — 乘客级', () => {
@@ -155,5 +157,79 @@ describe('orderNeedsVisaTask — 三根轴收口', () => {
     expect(
       orderNeedsVisaTask({ visaStatus: VisaRequirement.NEEDED, passengers: [] }),
     ).toBe(true);
+  });
+});
+
+describe('isVisaContradiction — 订单级需签 × 全员自备签 的矛盾组合', () => {
+  it('NEEDED + 全员自备签 → 矛盾（不建任务，签证台看不见 → 漏签）', () => {
+    expect(
+      isVisaContradiction({
+        visaStatus: VisaRequirement.NEEDED,
+        passengers: [{ visaExempt: true }, { visaExempt: true }],
+      }),
+    ).toBe(true);
+  });
+
+  it('E_VISA + 全员自备签 → 同样矛盾（电子签一样要送签）', () => {
+    expect(
+      isVisaContradiction({
+        visaStatus: VisaRequirement.E_VISA,
+        passengers: [{ visaExempt: true }],
+      }),
+    ).toBe(true);
+  });
+
+  it('混合名单（部分自备签）→ 不矛盾（其余人照常送签）', () => {
+    expect(
+      isVisaContradiction({
+        visaStatus: VisaRequirement.NEEDED,
+        passengers: [{ visaExempt: true }, { visaExempt: false }],
+      }),
+    ).toBe(false);
+  });
+
+  it('空名单 → 不矛盾（先建单后补乘客是正常流程）', () => {
+    expect(
+      isVisaContradiction({ visaStatus: VisaRequirement.NEEDED, passengers: [] }),
+    ).toBe(false);
+  });
+
+  it('订单级不要求送签的三档（NOT_NEEDED / HAS_VISA / 未标注）+ 全员自备签 → 不矛盾', () => {
+    for (const visaStatus of [
+      VisaRequirement.NOT_NEEDED,
+      VisaRequirement.HAS_VISA,
+      null,
+      undefined,
+    ]) {
+      expect(isVisaContradiction({ visaStatus, passengers: [{ visaExempt: true }] })).toBe(false);
+    }
+  });
+
+  it('visaExempt 缺省 / null 按随团办签算 → 不矛盾', () => {
+    expect(
+      isVisaContradiction({ visaStatus: VisaRequirement.NEEDED, passengers: [{}] }),
+    ).toBe(false);
+    expect(
+      isVisaContradiction({
+        visaStatus: VisaRequirement.NEEDED,
+        passengers: [{ visaExempt: null }],
+      }),
+    ).toBe(false);
+  });
+
+  // 与权威判定的关系：矛盾成立 ⇔ 订单级说要办、但 orderNeedsVisaTask 判不建。
+  it('矛盾成立时 orderNeedsVisaTask 恒判「不建任务」（这正是漏签的机制）', () => {
+    const input = {
+      visaStatus: VisaRequirement.NEEDED,
+      passengers: [{ visaExempt: true }, { visaExempt: true }],
+    };
+    expect(isVisaContradiction(input)).toBe(true);
+    expect(orderNeedsVisaTask(input)).toBe(false);
+  });
+
+  it('报错文案给出两条出路，且不含内部人名', () => {
+    expect(VISA_CONTRADICTION_MESSAGE).toContain('自备签');
+    expect(VISA_CONTRADICTION_MESSAGE).toContain('不需要签证');
+    expect(VISA_CONTRADICTION_MESSAGE).toContain('已签证');
   });
 });

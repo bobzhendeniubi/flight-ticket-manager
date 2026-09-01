@@ -9183,6 +9183,12 @@ interface BatchRow {
   note?: string;
   /** 套餐行级选项：只作用于该乘客自己的子单。 */
   visaExempt?: boolean;
+  /**
+   * true = 本行的自备签是整批签证状态**联动置的**，不是用户在本行亲手勾的。
+   * 只给反向恢复认人用：整批改回「需要 / 电子签」时，只把联动置的这些行还原成「随套餐」，
+   * 用户亲手勾的自备签一概不动。用户勾/取消本行的「自备签」一次即清除本标记。
+   */
+  visaExemptAuto?: boolean;
   singleRoom?: boolean;
   businessUpgrade?: boolean;
   /** 行级指定酒店（前端展示选择）；提交只发送解析后的房型 id。 */
@@ -9409,17 +9415,21 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   }, [productType]);
   const [noteHotel, setNoteHotel] = useState('');
 
-  // 整批签证「不需要 / 已签证」→ 乘客行自备签的单向联动（与单笔录单 SingleOrderModal 同口径）。
+  // 整批签证「不需要 / 已签证」→ 乘客行自备签的联动（与单笔录单 SingleOrderModal 同口径）。
   // 套餐含签证组件时，订单级「不需要」压不掉商品级涉签——只有乘客级 visaExempt 才能免建签证任务；
-  // 不联动的话整批子单会每张都挂进签证台「待处理」。单向：选中「不需要」时批量置为自备签 +
-  // 新增/导入行默认自备签；改回其它值不做反向还原，不动用户逐行调整过的勾选。
+  // 不联动的话整批子单会每张都挂进签证台「待处理」。选中「不需要」时批量置为自备签 +
+  // 新增/导入行默认自备签；改回「需要 / 电子签」由下方反向恢复 effect 还原**联动置的**那些行，
+  // 用户逐行手动勾过的一律不动。
   const batchAutoVisaExempt =
     productType === 'BUNDLE' &&
     (visaStatus === 'NOT_NEEDED' || visaStatus === 'HAS_VISA');
   /** 导入/粘贴整批替换名单时，给未显式带 visaExempt 的行补联动默认值（联动未激活时原样返回）。 */
   function applyBatchVisaExemptDefault(list: BatchRow[]): BatchRow[] {
     if (!batchAutoVisaExempt) return list;
-    return list.map((r) => (r.visaExempt === undefined ? { ...r, visaExempt: true } : r));
+    // 联动补上的行打 visaExemptAuto 标记，供反向恢复认人（见下方 visaStatus 反向恢复 effect）。
+    return list.map((r) =>
+      r.visaExempt === undefined ? { ...r, visaExempt: true, visaExemptAuto: true } : r,
+    );
   }
 
   // ── 名单 ──────────────────────────────────────────────────────────────────
@@ -9433,13 +9443,44 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     if (!justAppeared || !pendingBatchAutoVisaExemptRef.current) return;
     pendingBatchAutoVisaExemptRef.current = false;
     setRows((prev) => {
-      const updated = prev.map((row) => (row.visaExempt === undefined ? { ...row, visaExempt: true } : row));
+      const updated = prev.map((row) =>
+        row.visaExempt === undefined ? { ...row, visaExempt: true, visaExemptAuto: true } : row,
+      );
       rowsRef.current = updated;
       return updated;
     });
   }, [productType]);
-  // 需签档下点名提示自备签乘客；混合状态允许提交，但这些乘客不会进入签证台。
-  const batchVisaContradictionHint = useMemo(() => {
+
+  // 反向恢复 —— 整批签证状态从「不需要 / 已签证」改回「需要 / 电子签」时，把**联动置的**自备签还原。
+  // 正向联动此前是单向的：改回需签档，行级仍留着一片自备签 → 后端判「没有一位要我们办」→
+  // 整批子单都不建签证任务 → 签证台看不见（漏签）。只动 visaExemptAuto 标记过的行：
+  // 用户亲手勾的自备签是行级事实（同时也是定价输入），任何情况下都不替用户改回去。
+  // 还原成 undefined（= 未显式设置）而非 false：与本弹窗既有「未设置」语义一致，
+  // 后续再切回「不需要」时联动仍能重新补上。价格由后端按新的 passengers 重算。
+  const prevBatchVisaStatusRef = useRef(visaStatus);
+  useEffect(() => {
+    const prevStatus = prevBatchVisaStatusRef.current;
+    prevBatchVisaStatusRef.current = visaStatus;
+    const wasSelfVisaImplied = prevStatus === 'NOT_NEEDED' || prevStatus === 'HAS_VISA';
+    const nowNeedsVisa = visaStatus === 'NEEDED' || visaStatus === 'E_VISA';
+    if (!wasSelfVisaImplied || !nowNeedsVisa) return;
+    // 挂起的正向意图作废：还没切到套餐就先改回需签档，那一刀不该再补。
+    pendingBatchAutoVisaExemptRef.current = false;
+    setRows((prev) => {
+      if (!prev.some((row) => row.visaExemptAuto)) return prev;
+      const updated = prev.map((row) =>
+        row.visaExemptAuto ? { ...row, visaExempt: undefined, visaExemptAuto: undefined } : row,
+      );
+      rowsRef.current = updated;
+      return updated;
+    });
+  }, [visaStatus]);
+  // 需签档下点名提示自备签乘客：
+  //   · 全员自备签 = **硬拦**（blocking）：琥珀软提示拦不住，仍有整批带着「需要签证 + 全员自备签」
+  //     提交成功，签证台看不见 → 漏签。这一档不让过。
+  //   · 部分自备签（混合）是正式支持的能力，只点名提示，不拦。
+  //   · 空名单不拦：一位有效乘客都还没填时不成立（selfVisaRows 为空直接返回 null）。
+  const batchVisaContradiction = useMemo<{ text: string; blocking: boolean } | null>(() => {
     if (productType !== 'BUNDLE' || (visaStatus !== 'NEEDED' && visaStatus !== 'E_VISA')) return null;
     const valid = rows
       .map((row, index) => ({ row, index }))
@@ -9447,11 +9488,21 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     const selfVisaRows = valid.filter(({ row }) => row.visaExempt === true);
     if (selfVisaRows.length === 0) return null;
     if (selfVisaRows.length === valid.length) {
-      return '注意：签证状态选了「需要」，但全部出行人都是「自备签」——本单不会生成签证任务、不会出现在签证台。若确实要我方送签，请把至少一位出行人改回「随套餐」。';
+      return {
+        text:
+          '签证状态选了「需要」，但全部出行人都是「自备签」——这批单不会生成签证任务、不会进签证台。' +
+          '要我方送签请把至少一位出行人改回「随套餐」；' +
+          '确实全员自备签请把签证状态改成「不需要」或「已签证」。',
+        blocking: true,
+      };
     }
     const names = selfVisaRows.map(({ row, index }) => row.fullName.trim() || `第${index + 1}位`).join('、');
-    return `注意：以下出行人已标「自备签」，不会进入签证台：${names}。若需我方送签请改回「随套餐」。`;
+    return {
+      text: `注意：以下出行人已标「自备签」，不会进入签证台：${names}。若需我方送签请改回「随套餐」。`,
+      blocking: false,
+    };
   }, [productType, rows, visaStatus]);
+  const batchVisaSubmitBlocked = batchVisaContradiction?.blocking === true;
   // 批量传护照：多选 → 逐张识别（并发 BATCH_BULK_OCR_CONCURRENCY）进度；null = 未在跑。
   const [bulkOcr, setBulkOcr] = useState<{ done: number; total: number } | null>(null);
   const bulkOcrInputRef = useRef<HTMLInputElement | null>(null);
@@ -9984,7 +10035,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
           documentNumber: '',
           dateOfBirth: '',
           nationality: 'CN',
-          ...(batchAutoVisaExempt ? { visaExempt: true } : {}),
+          ...(batchAutoVisaExempt ? { visaExempt: true, visaExemptAuto: true } : {}),
         },
       ];
       rowsRef.current = next;
@@ -10043,7 +10094,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         dateOfBirth: '',
         nationality: 'CN',
         // 整批「不需要签证」联动生效时，批量识别追加的行同样默认自备签（与手动加一行同口径）。
-        ...(batchAutoVisaExempt ? { visaExempt: true as const } : {}),
+        ...(batchAutoVisaExempt ? { visaExempt: true as const, visaExemptAuto: true as const } : {}),
       }));
       setRows((prev) => [...prev, ...toAppend]);
       rowsRef.current = [...current, ...toAppend]; // ref 同步前置：并发 worker 立即按这些末尾索引写入
@@ -10343,6 +10394,12 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     setErr(null);
     if (validRows.length === 0) { setErr('至少要有一位完整乘客（姓名 + 护照号 + 出生日期）'); return; }
 
+    // 需要签证 + 全员自备签 = 整批永远进不了签证台，硬拦（按钮也已禁用，这里兜住程序化提交）。
+    if (batchVisaSubmitBlocked && batchVisaContradiction) {
+      setErr(batchVisaContradiction.text);
+      return;
+    }
+
     // 性别必填（业务拍板）：姓名/护照号/出生日期均已填的有效行不许缺性别，阻断提交并指明具体行号。
     const missingGenderLines = rows
       .map((r, idx) => ({ r, line: idx + 1 }))
@@ -10581,7 +10638,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                     documentNumber: '',
                     dateOfBirth: '',
                     nationality: 'CN',
-                    ...(batchAutoVisaExempt ? { visaExempt: true } : {}),
+                    ...(batchAutoVisaExempt ? { visaExempt: true, visaExemptAuto: true } : {}),
                   }];
                   setRows(freshRows);
                   rowsRef.current = freshRows;
@@ -11036,7 +11093,10 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                                 <input
                                   type="checkbox"
                                   checked={r.visaExempt === true}
-                                  onChange={(e) => setRow(i, { visaExempt: e.target.checked })}
+                                  // 本行亲手勾过 → 清除联动标记，此后整批签证状态怎么改都不再自动动这一行。
+                                  onChange={(e) =>
+                                    setRow(i, { visaExempt: e.target.checked, visaExemptAuto: false })
+                                  }
                                 />
                                 自备签
                               </label>
@@ -11455,12 +11515,17 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       return;
                     }
                     pendingBatchAutoVisaExemptRef.current = false;
-                    // 单向联动（与单笔录单同口径）：套餐批改成「不需要 / 已签证」→ 现有乘客行
+                    // 联动（与单笔录单同口径）：套餐批改成「不需要 / 已签证」→ 现有乘客行
                     // 批量置自备签（两档同权，客人自持签证同样不该收签证钱）；
-                    // 改回其它值不做反向还原，不动用户逐行调整过的勾选。
+                    // 改回「需要 / 电子签」由下方 visaStatus 的反向恢复 effect 统一还原
+                    // （只还原联动置的行，用户逐行勾过的一律不动）。
                     if ((next === 'NOT_NEEDED' || next === 'HAS_VISA') && productType === 'BUNDLE') {
                       setRows((prev) => {
-                        const updated = prev.map((r) => ({ ...r, visaExempt: true }));
+                        // 联动置位的行打 visaExemptAuto 标记；已经勾了自备签的行原样保留
+                        // （那是用户亲手勾的，反向恢复不该动它）。
+                        const updated = prev.map((r) =>
+                          r.visaExempt === true ? r : { ...r, visaExempt: true, visaExemptAuto: true },
+                        );
                         rowsRef.current = updated;
                         return updated;
                       });
@@ -11473,14 +11538,21 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 </select>
                 <span className="mt-1 block text-[11px] leading-tight text-slate-400">
                   默认按产品类型：套餐默认「需要」，机票默认「不需要」；手动改过后不再自动跟随。
-                  {productType === 'BUNDLE' && '套餐批选「不需要」或「已签证」会把名单全员标为自备签（不进签证台），可逐行改回。'}
+                  {productType === 'BUNDLE' &&
+                    '套餐批选「不需要」或「已签证」会把名单全员标为自备签（不进签证台），可逐行改回；改回「需要 / 电子签」会把这些自动标上的行还原成随套餐，逐行手动勾过的不动。'}
                 </span>
               </label>
             </div>
 
-            {batchVisaContradictionHint && (
-              <p className="rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
-                {batchVisaContradictionHint}
+            {batchVisaContradiction && (
+              <p
+                className={`rounded-md border px-3 py-2 text-xs ${
+                  batchVisaContradiction.blocking
+                    ? 'border-rose-200 bg-rose-50 text-rose-700'
+                    : 'border-amber-200 bg-amber-50 text-amber-800'
+                }`}
+              >
+                {batchVisaContradiction.text}
               </p>
             )}
 
@@ -11558,7 +11630,12 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
               <span className="text-xs text-slate-500">将创建 {validRows.length} 张{orderCountLabel}（1/人）</span>
               <div className="flex gap-2">
                 <button className="btn-secondary text-sm" onClick={onClose}>取消</button>
-                <button className="btn-primary text-sm disabled:opacity-50" onClick={() => void submit()} disabled={submitting}>
+                <button
+                  className="btn-primary text-sm disabled:opacity-50"
+                  onClick={() => void submit()}
+                  disabled={submitting || batchVisaSubmitBlocked}
+                  title={batchVisaSubmitBlocked ? batchVisaContradiction?.text : undefined}
+                >
                   {submitting ? '创建中…' : `批量创建 ${validRows.length} 单`}
                 </button>
               </div>

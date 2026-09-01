@@ -55,6 +55,8 @@ import { BUSINESS_TZ } from '../../lib/business-time.js';
 import {
   orderNeedsVisaTask,
   orderVisaStatusRequiresVisa,
+  isVisaContradiction,
+  VISA_CONTRADICTION_MESSAGE,
 } from './visa-need.js';
 import { computePerPaxShares } from './per-pax-share.js';
 import {
@@ -295,7 +297,8 @@ export const SEAT_RELEASING_STATUSES: OrderStatus[] = [
 // 隐藏式过滤的问题：任务仍是 PENDING/IN_PROGRESS，force 把订单拉回占座态即"复活"，且统计口径数不到。
 // 注意与 DRAFT 区分：DRAFT 虽在 SEAT_RELEASING_STATUSES 里（座位账口径），但不是取消族终态，
 // 不应把履约任务一并终态化（force H→DRAFT→PAID 的座位来回搬移不涉及"订单被取消"语义）。
-const FULFILLMENT_TERMINATING_STATUSES: OrderStatus[] = [
+// 导出：路由层的签证矛盾硬闸要用同一份「不参与履约」口径判豁免，不另立一套。
+export const FULFILLMENT_TERMINATING_STATUSES: OrderStatus[] = [
   'CANCELLED',
   'REFUNDED',
   'PAYMENT_TIMEOUT',
@@ -1343,6 +1346,15 @@ export class OrderService {
       throw new BadRequestError(
         `本次行程共需 ${requiredPax} 位出行人，当前填了 ${body.passengers.length} 位`,
       );
+    }
+
+    // 签证矛盾组合硬闸：订单级「需要签证 / 电子签」+ 已录出行人全部自备签 → 拒绝落库。
+    // 这种单不会生成签证任务（判定见 visa-need.ts 的 orderNeedsVisaTask），签证台看不见，
+    // 到期漏送签。录单页的软提示拦不住（提示上线后仍有新单落进来），故收在服务端。
+    // 空名单 / 部分自备签一律放行（豁免口径见 isVisaContradiction）。
+    // 批量创单（batchCreateOrders）逐单调用本方法，一并受本闸约束。
+    if (isVisaContradiction({ visaStatus: body.visaStatus, passengers: body.passengers })) {
+      throw new BadRequestError(VISA_CONTRADICTION_MESSAGE);
     }
 
     // 护照有效期必填（业务拍板，2026-07）：后台（ADMIN/STAFF）新建订单且含按人产品
@@ -7985,8 +7997,10 @@ export class OrderService {
           adjustments: Prisma.JsonValue;
           status: OrderStatus;
           deletedAt: Date | null;
+          // 订单级签证状态：矛盾组合硬闸要读（见下方「1b3」）。
+          visaStatus: VisaRequirement | null;
         }>
-      >`SELECT id, "adjustmentCny", adjustments, status, "deletedAt" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      >`SELECT id, "adjustmentCny", adjustments, status, "deletedAt", "visaStatus" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
       const order = orderRows[0];
       if (!order) throw new NotFoundError('订单不存在');
 
@@ -8095,6 +8109,27 @@ export class OrderService {
         // 说明：nationality 是必填非空列，无法「置空」；请求带了新值即用新值（上面已赋），
         // 未带时只能保留旧值（不猜默认国籍——猜错会污染出票/签证）。彻底根治需 schema 层在真换人时
         // 强制 nationality，留待拥有 orders.schemas.ts 的下一棒收口。
+      }
+
+      // ── 1b·闸. 签证矛盾组合硬闸：换人把最后一位随团办签的人也带成自备签 ─────────
+      // 订单级仍是「需要签证 / 电子签」时，本单会再没有人要我方送签 → 签证任务被撤、
+      // 签证台看不见这单（判定见 visa-need.ts）。只拒绝、不替客人改任何标记。
+      // 只在本次结果为「自备签」时才查名单（换回随团办签、或本就不是自备签的请求零额外开销）。
+      // 上方已拦掉取消族终态与回收站单，故此处无需再判「不参与履约」。
+      // 放在 1b 之后：证件号变化时 1b 已把未显式带值的 visaExempt 回落 false，此处读到的是最终值。
+      const resolvedVisaExempt =
+        data.visaExempt !== undefined ? data.visaExempt === true : passenger.visaExempt === true;
+      if (resolvedVisaExempt && orderVisaStatusRequiresVisa(order.visaStatus)) {
+        const roster = await tx.passenger.findMany({
+          where: { orderId },
+          select: { id: true, visaExempt: true },
+        });
+        const projected = roster.map((p) =>
+          p.id === passengerId ? { visaExempt: true } : { visaExempt: p.visaExempt },
+        );
+        if (isVisaContradiction({ visaStatus: order.visaStatus, passengers: projected })) {
+          throw new BadRequestError(VISA_CONTRADICTION_MESSAGE);
+        }
       }
 
       // ── 1b2. 出行人类型服务端权威派生（覆盖客户端传值）：出生日期变化（改错别字或真换人都算）时，
@@ -8385,8 +8420,10 @@ export class OrderService {
           outboundInvoiced: boolean;
           returnInvoiced: boolean;
           systemInvoiced: boolean;
+          // 订单级签证状态：矛盾组合硬闸要读（见下方「2b」）。
+          visaStatus: VisaRequirement | null;
         }>
-      >`SELECT id, "orderNumber", status, "deletedAt", adjustments, "adjustmentCny", "settlementLocked", "outboundInvoiced", "returnInvoiced", "systemInvoiced" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      >`SELECT id, "orderNumber", status, "deletedAt", adjustments, "adjustmentCny", "settlementLocked", "outboundInvoiced", "returnInvoiced", "systemInvoiced", "visaStatus" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
       const order = orderRows[0];
       if (!order) throw new NotFoundError('订单不存在');
 
@@ -8421,6 +8458,25 @@ export class OrderService {
         visaExempt: passenger.visaExempt,
         visaSubmissionStatus: passenger.visaSubmissionStatus as string,
       };
+
+      // ── 2b. 签证矛盾组合硬闸：把最后一位随团办签的人也改成自备签 ─────────────
+      // 订单级仍是「需要签证 / 电子签」时，这一改会让本单再没有人要我方送签 →
+      // 签证任务被撤（syncVisaTasksForOrder 按 orderNeedsVisaTask 判 false），签证台看不见这单。
+      // 只拒绝、不替客人改任何标记（visaExempt 同时是定价输入，服务端翻它 = 静默改价）。
+      // 已在上方拦掉取消族终态与回收站单，故此处无需再判「不参与履约」。
+      if (input.visaExempt && orderVisaStatusRequiresVisa(order.visaStatus)) {
+        const roster = await tx.passenger.findMany({
+          where: { orderId },
+          select: { id: true, visaExempt: true },
+        });
+        // 以「本次翻转已生效」的名单做判定：拒的是改完之后的那个矛盾状态。
+        const projected = roster.map((p) =>
+          p.id === passengerId ? { visaExempt: true } : { visaExempt: p.visaExempt },
+        );
+        if (isVisaContradiction({ visaStatus: order.visaStatus, passengers: projected })) {
+          throw new BadRequestError(VISA_CONTRADICTION_MESSAGE);
+        }
+      }
 
       // ── 3. false→true 门槛：送签已在办理（材料准备/已送签）→ 人为确认（签证岗 0830 口径）──
       // 不硬拦也不自动退：批文成本已发生，退不退/退多少由操作人当场定（默认 0）。缺确认参数时

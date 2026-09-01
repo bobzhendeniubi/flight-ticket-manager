@@ -73,14 +73,19 @@ type MountOptions = {
   passenger?: { visaExempt: boolean; visaSubmissionStatus: string };
   /** 订单锁行字段。 */
   status?: string;
+  /** 订单级签证状态（矛盾组合硬闸读它；缺省 null=未标注 → 闸不触发）。 */
+  visaStatus?: string | null;
   deletedAt?: Date | null;
   adjustments?: unknown[];
   settlementLocked?: boolean;
   invoiced?: boolean;
   /** kind=BUNDLE 的行（钱路径读取）。 */
   bundleLines?: Array<Record<string, unknown>>;
-  /** 翻转**之后**的全体乘客 visaExempt 现势（钱路径 + 任务同步共用）。 */
-  passengersAfterFlip?: Array<{ visaExempt: boolean }>;
+  /**
+   * 全体乘客 visaExempt 现势（钱路径 + 任务同步读「翻转之后」；矛盾组合硬闸在翻转之前读，
+   * 按 id 把本次要改的那位投影成目标值——带 id 才能被投影到）。
+   */
+  passengersAfterFlip?: Array<{ id?: string; visaExempt: boolean }>;
   /** 翻转之后的非自备签乘客送签进度（任务重派生用）。 */
   nonExemptAfterFlip?: Array<{ visaSubmissionStatus: string }>;
   /** 钱路径改行后聚合出来的 Σ items。 */
@@ -103,6 +108,7 @@ function mount(opts: MountOptions = {}): void {
       outboundInvoiced: opts.invoiced ?? false,
       returnInvoiced: false,
       systemInvoiced: false,
+      visaStatus: opts.visaStatus ?? null,
     },
   ]);
   mockPrisma.passenger.findUnique.mockResolvedValue({
@@ -561,5 +567,71 @@ describe('OrderService.setPassengerVisaExempt · 已送签人为确认（submitt
         submittedOverride: { refundCny: 0, reason: '不退' },
       }).success,
     ).toBe(true);
+  });
+});
+
+describe('OrderService.setPassengerVisaExempt · 签证矛盾组合硬闸', () => {
+  it('订单级「需要签证」+ 把最后一位随团办签的人改成自备签 → BadRequestError，不写乘客', async () => {
+    mount({
+      visaStatus: 'NEEDED',
+      passenger: { visaExempt: false, visaSubmissionStatus: 'PENDING' },
+      // 翻转前名单：p1（本次要改的人）是唯一一位随团办签的
+      passengersAfterFlip: [{ id: 'p1', visaExempt: false }, { id: 'p2', visaExempt: true }],
+    });
+    await expect(
+      service.setPassengerVisaExempt('o1', 'p1', { visaExempt: true }, actor),
+    ).rejects.toThrow(/全部标了自备签/);
+    expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+
+  it('订单级「电子签」同样拦（电子签一样要送签）', async () => {
+    mount({
+      visaStatus: 'E_VISA',
+      passenger: { visaExempt: false, visaSubmissionStatus: 'PENDING' },
+      passengersAfterFlip: [{ id: 'p1', visaExempt: false }],
+    });
+    await expect(
+      service.setPassengerVisaExempt('o1', 'p1', { visaExempt: true }, actor),
+    ).rejects.toThrow(/签证台看不到这单/);
+    expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+
+  it('名单里还有别人随团办签 → 放行（部分自备签不拦）', async () => {
+    mount({
+      visaStatus: 'NEEDED',
+      passenger: { visaExempt: false, visaSubmissionStatus: 'PENDING' },
+      passengersAfterFlip: [
+        { id: 'p1', visaExempt: false },
+        { id: 'p2', visaExempt: false },
+      ],
+      nonExemptAfterFlip: [{ visaSubmissionStatus: 'PENDING' }],
+    });
+    const res = await service.setPassengerVisaExempt('o1', 'p1', { visaExempt: true }, actor);
+    expect(res.idempotent).toBe(false);
+    expect(mockPrisma.passenger.update).toHaveBeenCalled();
+  });
+
+  it('改回随团办签（visaExempt=false）永不受本闸影响', async () => {
+    mount({
+      visaStatus: 'NEEDED',
+      passenger: { visaExempt: true, visaSubmissionStatus: 'PENDING' },
+      passengersAfterFlip: [{ id: 'p1', visaExempt: false }],
+      nonExemptAfterFlip: [{ visaSubmissionStatus: 'PENDING' }],
+    });
+    const res = await service.setPassengerVisaExempt('o1', 'p1', { visaExempt: false }, actor);
+    expect(res.idempotent).toBe(false);
+  });
+
+  it('订单级「不需要签证 / 已签证 / 未标注」+ 全员自备签 → 放行', async () => {
+    for (const visaStatus of ['NOT_NEEDED', 'HAS_VISA', null]) {
+      vi.clearAllMocks();
+      mount({
+        visaStatus,
+        passenger: { visaExempt: false, visaSubmissionStatus: 'PENDING' },
+        passengersAfterFlip: [{ id: 'p1', visaExempt: false }],
+      });
+      const res = await service.setPassengerVisaExempt('o1', 'p1', { visaExempt: true }, actor);
+      expect(res.idempotent).toBe(false);
+    }
   });
 });

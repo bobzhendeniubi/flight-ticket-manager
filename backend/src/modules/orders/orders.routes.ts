@@ -12,11 +12,13 @@ import { z } from 'zod';
 import { OrderItemKind, Prisma, UserRole, type Passenger } from '@prisma/client';
 import {
   buildStayNightDates,
+  FULFILLMENT_TERMINATING_STATUSES,
   OrderService,
   resolveOrderAgentId,
   syncVisaTasksForOrder,
   type OrderRequester,
 } from './orders.service.js';
+import { isVisaContradiction, VISA_CONTRADICTION_MESSAGE } from './visa-need.js';
 import { assertHotelPhysicalFitWithinTx } from '../hotel-control/hotel-control.service.js';
 import {
   batchCreateOrdersBodySchema,
@@ -1400,9 +1402,29 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         noteVisa: true,
         notePayment: true,
         noteSpecial: true,
+        // 签证矛盾硬闸要读：订单是否还参与履约 + 本单出行人的自备签现势
+        status: true,
+        deletedAt: true,
+        passengers: { select: { visaExempt: true } },
       },
     });
     if (!before) return reply.status(404).send({ error: '订单不存在' });
+
+    // ── 签证矛盾组合硬闸：改成「需要签证 / 电子签」但本单出行人全是自备签 → 拒绝 ──
+    // 这种组合不会生成签证任务（判定见 visa-need.ts 的 orderNeedsVisaTask），签证台看不见
+    // 这单，到期漏送签。只拒绝、不替客人翻 visaExempt（它同时是定价输入，改它 = 静默改价）。
+    // 豁免：未录乘客（先建单后补人是正常流程）、部分自备签、取消族终态 / 回收站单
+    //   —— 后者不参与履约，对它们做状态收尾不该被这条闸挡住（口径同 evaluateOrderVisaTaskState）。
+    const orderInactive =
+      Boolean(before.deletedAt) || FULFILLMENT_TERMINATING_STATUSES.includes(before.status);
+    if (
+      body.visaStatus !== undefined &&
+      !orderInactive &&
+      isVisaContradiction({ visaStatus: body.visaStatus, passengers: before.passengers })
+    ) {
+      return reply.status(400).send({ error: VISA_CONTRADICTION_MESSAGE });
+    }
+
     await prisma.order.update({
       where: { id },
       data: {

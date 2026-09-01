@@ -88,3 +88,40 @@ export function orderNeedsVisaTask(input: {
   if (!inScope) return false;
   return anyPassengerNeedsVisa(input.passengers);
 }
+
+/**
+ * 矛盾组合判定：订单级说「要我方办签」，乘客级说「一个都不用办」。
+ *
+ * `visaStatus ∈ {NEEDED, E_VISA}` 且**已录乘客全部** `visaExempt=true` 时，
+ * orderNeedsVisaTask 会按乘客级判 false —— 不建任务、签证台看不见这单，最终漏送签。
+ * 录单页的软提示挡不住（提示上线后仍有新单落进来），因此服务端在写入路径上硬拒。
+ *
+ * 两条豁免（缺一会误伤正常流程）：
+ *   · **空名单不拦** —— 「先建单、后补乘客」是正常流程；查无乘客证明不了「无人需要」
+ *     （与 anyPassengerNeedsVisa 的空名单口径同源，那里回落 true）。
+ *   · **部分自备签不拦** —— 混合名单本就正常：自备签的人不进签证台，其余人照常送签。
+ *
+ * 「取消族终态 / 已软删」的豁免不在这里 —— 那是订单是否参与履约的口径（见
+ * evaluateOrderVisaTaskState 的 inactive），由调用方在调用前判掉，本函数只看三根轴。
+ *
+ * 只判定、不修数据：乘客级 visaExempt 同时是**定价**输入（套餐按人扣自备签减免），
+ * 服务端替客人翻这个标记 = 静默改价，绝不做（口径同 orderNeedsVisaTask 的注释）。
+ */
+export function isVisaContradiction(input: {
+  visaStatus?: VisaRequirement | null;
+  passengers: ReadonlyArray<{ visaExempt?: boolean | null }>;
+}): boolean {
+  if (!orderVisaStatusRequiresVisa(input.visaStatus)) return false;
+  if (input.passengers.length === 0) return false;
+  return !anyPassengerNeedsVisa(input.passengers);
+}
+
+/**
+ * 矛盾组合的统一报错文案 —— 说清「会发生什么」+「两条出路」，运营照着做就能解。
+ * 各写入路径共用一份，避免各处自己编一句导致口径漂移。
+ */
+export const VISA_CONTRADICTION_MESSAGE =
+  '本单签证状态是「需要签证 / 电子签」，但已录出行人全部标了自备签 —— ' +
+  '这种组合不会生成签证任务，签证台看不到这单，会漏送签。' +
+  '要我方送签：请把至少一位出行人的「自备签」取消（改回随团办签）；' +
+  '确实全员自备签：请把订单签证状态改成「不需要签证」或「已签证」。';

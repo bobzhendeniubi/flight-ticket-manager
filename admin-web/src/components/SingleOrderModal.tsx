@@ -132,6 +132,12 @@ interface PassengerRow {
   // ── 套餐乘客级选项（购物车模式：每人各选自己的住宿方式 + 签证；价差全部系统算）──
   /** 客人自备签证（无需送签；套餐价按人扣减 selfVisaDeductCny）。缺省 false = 随套餐办签。 */
   visaExempt?: boolean;
+  /**
+   * true = 本行的自备签是订单级签证状态**联动置的**，不是用户在本行亲手选的。
+   * 只给反向恢复认人用：订单级改回「需要 / 电子签」时，只把联动置的这些行还原成「随套餐」，
+   * 用户亲手勾的自备签一概不动。用户在本行的签证下拉改过一次即清除本标记。
+   */
+  visaExemptAuto?: boolean;
   /** 单住（不拼房，按人收单房差）。缺省 false = 拼房。 */
   singleRoom?: boolean;
   /**
@@ -778,15 +784,47 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     pendingAutoVisaExemptRef.current = false;
     if (!visaStatusImpliesSelfVisa) return;
     setPassengers((prev) => {
-      const updated = prev.map((r) => (r.visaExempt ? r : { ...r, visaExempt: true }));
+      // 联动置位的行打 visaExemptAuto 标记；已经是自备签的行原样保留（那是用户亲手选的，
+      // 不该被反向恢复顺手改掉）。
+      const updated = prev.map((r) => (r.visaExempt ? r : { ...r, visaExempt: true, visaExemptAuto: true }));
       passengersRef.current = updated;
       return updated;
     });
   }, [showVisaExemptCol, visaStatus]);
 
+  // 反向恢复 —— 订单级从「不需要 / 已签证」改回「需要 / 电子签」时，把**联动置的**自备签还原。
+  // 正向联动此前是单向的：改回需签档，人级仍留着一片自备签 → 后端判「没有一位要我们办」→
+  // 不建签证任务 → 签证台看不见这单（漏签）。只动 visaExemptAuto 标记过的行：用户亲手勾的
+  // 自备签是逐位事实（同时也是定价输入），任何情况下都不替用户改回去。
+  // 价格不在这里算：恢复后由后端 quote 按新的 passengers 数组重算（现有机制）。
+  const prevVisaStatusRef = useRef(visaStatus);
+  useEffect(() => {
+    const prevStatus = prevVisaStatusRef.current;
+    prevVisaStatusRef.current = visaStatus;
+    const wasSelfVisaImplied = prevStatus === 'NOT_NEEDED' || prevStatus === 'HAS_VISA';
+    const nowNeedsVisa = visaStatus === 'NEEDED' || visaStatus === 'E_VISA';
+    if (!wasSelfVisaImplied || !nowNeedsVisa) return;
+    // 挂起的正向意图作废：签证列还没出现就先改回需签档，那一刀不该再补。
+    pendingAutoVisaExemptRef.current = false;
+    setPassengers((prev) => {
+      if (!prev.some((r) => r.visaExemptAuto)) return prev;
+      const updated = prev.map((r) =>
+        r.visaExemptAuto ? { ...r, visaExempt: false, visaExemptAuto: false } : r,
+      );
+      passengersRef.current = updated;
+      return updated;
+    });
+  }, [visaStatus]);
+
   // 矛盾组合防呆：需签档下只要有出行人自备签，就明确提示其不会进入签证台。
-  // 全员自备签时保留更重提示；混合状态是正式支持的能力，不拦截提交。
-  const visaContradictionHint = useMemo(() => {
+  //   · 全员自备签 = **硬拦**（blocking）：琥珀软提示 2026-08-30 就上线了，之后仍有单子带着
+  //     「需要签证 + 全员自备签」提交成功，签证台看不见 → 漏签。这一档不让过。
+  //   · 部分自备签（混合）是正式支持的能力，只点名提示，不拦。
+  //   · 空名单不拦：先建单后补人是正常流程（后端 anyPassengerNeedsVisa 对空名单也回落 true）。
+  // blocking 只在 visaExempt 真会随本单提交时成立（套餐单恒发；其余仅在签证列显示时发）——
+  // 否则那是切换产品后留在行上的陈旧勾选，压根不影响后端判定，拦了就是假警报。
+  const visaExemptSubmitted = isBundleOrder || showVisaExemptCol;
+  const visaContradiction = useMemo<{ text: string; blocking: boolean } | null>(() => {
     if (visaStatus !== 'NEEDED' && visaStatus !== 'E_VISA') return null;
     const valid = passengers
       .map((p, index) => ({ passenger: p, index }))
@@ -795,16 +833,23 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     if (selfVisaPassengers.length === 0) return null;
     const includedLabel = isBundleOrder ? '随套餐' : '随单办签';
     if (selfVisaPassengers.length === valid.length) {
-      return (
-        '注意：签证状态选了「需要」，但全部出行人都是「自备签」——本单不会生成签证任务、不会出现在签证台。' +
-        `若确实要我方送签，请把至少一位出行人改回「${includedLabel}」。`
-      );
+      return {
+        text:
+          '签证状态选了「需要」，但全部出行人都是「自备签」——这单不会生成签证任务、不会进签证台。' +
+          `要我方送签请把至少一位出行人改回「${includedLabel}」；` +
+          '确实全员自备签请把签证状态改成「不需要」或「已签证」。',
+        blocking: visaExemptSubmitted,
+      };
     }
     const names = selfVisaPassengers
       .map(({ passenger, index }) => passenger.fullName.trim() || `第${index + 1}位`)
       .join('、');
-    return `注意：以下出行人已标「自备签」，不会进入签证台：${names}。若需我方送签请改回「${includedLabel}」。`;
-  }, [isBundleOrder, passengers, visaStatus]);
+    return {
+      text: `注意：以下出行人已标「自备签」，不会进入签证台：${names}。若需我方送签请改回「${includedLabel}」。`,
+      blocking: false,
+    };
+  }, [isBundleOrder, passengers, visaExemptSubmitted, visaStatus]);
+  const visaSubmitBlocked = visaContradiction?.blocking === true;
 
   // 调价有效性：金额为非 0 整数即视为「要调价」；「其它」原因必须补说明。
   const adjustIsInteger = adjustAmount !== null && Number.isInteger(adjustAmount) && adjustAmount !== 0;
@@ -905,7 +950,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   function addPassenger(): void {
     setPassengers((prev) => {
       // 整单「不需要签证」联动生效时，新增行默认也是自备签（与已有行一致，用户仍可逐位改回）。
-      const row = autoVisaExempt ? { ...emptyPassenger(), visaExempt: true } : emptyPassenger();
+      const row = autoVisaExempt
+        ? { ...emptyPassenger(), visaExempt: true, visaExemptAuto: true }
+        : emptyPassenger();
       const next = [...prev, row];
       passengersRef.current = next;
       return next;
@@ -998,7 +1045,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     if (appendCount > 0) {
       // 整单「不需要签证」联动生效时，批量识别新增的行同样默认自备签（与手动加一位同口径）。
       const toAppend = Array.from({ length: appendCount }, () =>
-        autoVisaExempt ? { ...emptyPassenger(), visaExempt: true } : emptyPassenger(),
+        autoVisaExempt
+          ? { ...emptyPassenger(), visaExempt: true, visaExemptAuto: true }
+          : emptyPassenger(),
       );
       setPassengers((prev) => [...prev, ...toAppend]);
       // ref 同步前置：并发 worker 会立即按这些末尾索引写入，别等 effect 回灌。
@@ -1335,6 +1384,12 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
 
     if (passengersRequired && validPassengers.length === 0) {
       setErr('该产品类型需至少一位完整出行人（姓名 + 护照号 + 出生日期）');
+      return;
+    }
+
+    // 需要签证 + 全员自备签 = 这单永远进不了签证台，硬拦（按钮也已禁用，这里兜住回车/程序化提交）。
+    if (visaSubmitBlocked && visaContradiction) {
+      setErr(visaContradiction.text);
       return;
     }
 
@@ -1752,9 +1807,17 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
             {passportExpiryHint && (
               <div className="rounded-md bg-amber-50 px-4 py-2 text-sm text-amber-800">{passportExpiryHint}</div>
             )}
-            {/* 矛盾组合防呆：需要签证 + 全员自备签 → 不进签证台（琥珀提示，不拦截提交） */}
-            {visaContradictionHint && (
-              <div className="rounded-md bg-amber-50 px-4 py-2 text-sm text-amber-800">{visaContradictionHint}</div>
+            {/* 矛盾组合防呆：全员自备签 = 红条 + 禁用提交；部分自备签 = 琥珀点名提示，可提交 */}
+            {visaContradiction && (
+              <div
+                className={`rounded-md px-4 py-2 text-sm ${
+                  visaContradiction.blocking
+                    ? 'border border-rose-200 bg-rose-50 text-rose-700'
+                    : 'bg-amber-50 text-amber-800'
+                }`}
+              >
+                {visaContradiction.text}
+              </div>
             )}
 
             {/* 产品类型选择（第一个产品）；套餐独占一张订单，多产品时禁用 */}
@@ -2189,11 +2252,16 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       pendingAutoVisaExemptRef.current = false;
                       // 单向联动（公测反馈：整单选了不需要还要逐个人再选一遍）：改成「不需要」
                       // 或「已签证」（两档同权，客人自持签证同样不该收签证钱）时，
-                      // 若当前是套餐单且签证列在显示，把现有出行人一次性批量置为自备签；
-                      // 改回其它值不做任何反向还原，不动用户已经逐位调整过的选择。
+                      // 若当前是套餐单且签证列在显示，把现有出行人一次性批量置为自备签。
+                      // 反向（改回「需要 / 电子签」）由 visaStatus 的反向恢复 effect 统一处理：
+                      // 只还原联动置的行，用户已经逐位调整过的选择一律不动。
                       if ((next === 'NOT_NEEDED' || next === 'HAS_VISA') && showVisaExemptCol) {
                         setPassengers((prev) => {
-                          const updated = prev.map((r) => ({ ...r, visaExempt: true }));
+                          // 联动置位的行打 visaExemptAuto 标记，供反向恢复认人；
+                          // 已经是自备签的行原样保留（那是用户亲手选的，反向恢复不该动它）。
+                          const updated = prev.map((r) =>
+                            r.visaExempt ? r : { ...r, visaExempt: true, visaExemptAuto: true },
+                          );
                           passengersRef.current = updated;
                           return updated;
                         });
@@ -2228,8 +2296,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               {showVisaExemptCol && (
                 <p className="mt-1 text-[11px] text-slate-400">
                   选「不需要」或「已签证」会把当前及新增出行人自动设为「自备签」（下方每位出行人卡片里可逐位改回
-                  「{isBundleOrder ? '随套餐' : '随单办签'}」）；反向不联动——单个乘客选自备签不会改变本订单级签证状态，
-                  自备签乘客不进签证台{selfVisaDeductPerPax > 0 ? '、套餐价按人扣减' : ''}。
+                  「{isBundleOrder ? '随套餐' : '随单办签'}」）；改回「需要 / 电子签」会把这些自动标上的行还原成
+                  「{isBundleOrder ? '随套餐' : '随单办签'}」，逐位手动改过的行一律不动。
+                  单个乘客选自备签不会改变本订单级签证状态；自备签乘客不进签证台
+                  {selfVisaDeductPerPax > 0 ? '、套餐价按人扣减' : ''}。
                 </p>
               )}
             </div>
@@ -2537,7 +2607,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                             <select
                               className={`${paxInputCls} border-slate-300`}
                               value={p.visaExempt ? 'self' : 'included'}
-                              onChange={(e) => setPassenger(i, { visaExempt: e.target.value === 'self' })}
+                              // 本行亲手选过 → 清除联动标记，此后订单级怎么改都不再自动动这一行。
+                              onChange={(e) =>
+                                setPassenger(i, {
+                                  visaExempt: e.target.value === 'self',
+                                  visaExemptAuto: false,
+                                })
+                              }
                             >
                               <option value="included">{isBundleOrder ? '随套餐' : '随单办签'}</option>
                               <option value="self">自备签</option>
@@ -2775,7 +2851,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               </span>
               <div className="flex gap-2">
                 <button className="btn-secondary text-sm" onClick={onClose} type="button">取消</button>
-                <button className="btn-primary text-sm disabled:opacity-50" onClick={submit} disabled={submitting} type="button">
+                <button
+                  className="btn-primary text-sm disabled:opacity-50"
+                  onClick={submit}
+                  disabled={submitting || visaSubmitBlocked}
+                  title={visaSubmitBlocked ? visaContradiction?.text : undefined}
+                  type="button"
+                >
                   {submitting ? '提交中…' : '提交录单'}
                 </button>
               </div>

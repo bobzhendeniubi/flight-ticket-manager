@@ -26,7 +26,8 @@ const actor = { userId: 'u1', role: 'STAFF' as const };
 
 function mount(opts: {
   order?: { visaStatus: string | null; deletedAt?: Date | null } | null;
-  passengers?: Array<{ visaSubmissionStatus: string }>;
+  // 全名单（不带 visaExempt 视为随团办签）：办结判定只看非自备签那部分。
+  passengers?: Array<{ visaSubmissionStatus: string; visaExempt?: boolean }>;
   taskCount?: number;
   lastAudit?: { action: string; before: unknown } | null;
 }) {
@@ -163,5 +164,63 @@ describe('syncOrderVisaCompletion · 对称回退', () => {
   it('非 HAS_VISA 现值 → 无事可回退', async () => {
     mount({ order: { visaStatus: 'NEEDED' }, passengers: [{ visaSubmissionStatus: 'PENDING' }] });
     expect(await syncOrderVisaCompletion('o1', actor)).toEqual({ changed: false });
+  });
+});
+
+describe('syncOrderVisaCompletion · 回退时的签证矛盾闸', () => {
+  it('全员已改成自备签 → 不回退成「需要签证」（否则造出矛盾单，签证台看不见）', async () => {
+    mount({
+      order: { visaStatus: 'HAS_VISA' },
+      passengers: [{ visaSubmissionStatus: 'PENDING', visaExempt: true }],
+      lastAudit: { action: VISA_AUTO_COMPLETE_ACTION, before: { visaStatus: 'NEEDED' } },
+    });
+    expect(await syncOrderVisaCompletion('o1', actor)).toEqual({ changed: false });
+    expect(mockPrisma.order.update).not.toHaveBeenCalled();
+  });
+
+  it('全员自备签但原档是「不需要签证」→ 照常回退（不构成矛盾）', async () => {
+    mount({
+      order: { visaStatus: 'HAS_VISA' },
+      passengers: [{ visaSubmissionStatus: 'PENDING', visaExempt: true }],
+      lastAudit: { action: VISA_AUTO_COMPLETE_ACTION, before: { visaStatus: 'NOT_NEEDED' } },
+    });
+    expect(await syncOrderVisaCompletion('o1', actor)).toEqual({
+      changed: true,
+      kind: 'REVERTED',
+      orderNumber: 'ORD-1',
+      restoredTo: 'NOT_NEEDED',
+    });
+  });
+
+  it('名单里仍有人随团办签、只是进度退回 → 常规回退不受影响', async () => {
+    mount({
+      order: { visaStatus: 'HAS_VISA' },
+      passengers: [
+        { visaSubmissionStatus: 'PENDING', visaExempt: false },
+        { visaSubmissionStatus: 'CONFIRMED', visaExempt: true },
+      ],
+      lastAudit: { action: VISA_AUTO_COMPLETE_ACTION, before: { visaStatus: 'NEEDED' } },
+    });
+    expect(await syncOrderVisaCompletion('o1', actor)).toEqual({
+      changed: true,
+      kind: 'REVERTED',
+      orderNumber: 'ORD-1',
+      restoredTo: 'NEEDED',
+    });
+  });
+
+  it('自备签乘客不参与办结判定：非自备签那位已送签 → 照常办结', async () => {
+    mount({
+      order: { visaStatus: 'NEEDED' },
+      passengers: [
+        { visaSubmissionStatus: 'CONFIRMED', visaExempt: false },
+        { visaSubmissionStatus: 'PENDING', visaExempt: true },
+      ],
+    });
+    expect(await syncOrderVisaCompletion('o1', actor)).toEqual({
+      changed: true,
+      kind: 'COMPLETED',
+      orderNumber: 'ORD-1',
+    });
   });
 });
