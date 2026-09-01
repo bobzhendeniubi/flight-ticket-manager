@@ -1,0 +1,252 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>反馈表（9）五项新功能 操作说明 — 世途旅行·运营控制台</title>
+<style>
+  :root{
+    --indigo:#4F46E5; --indigo-dark:#4338CA; --indigo-50:#EEF2FF;
+    --ink:#0F172A; --ink-soft:#334155; --muted:#64748B;
+    --bg:#F1F5F9; --card:#FFFFFF; --line:#E2E8F0;
+    --amber-bg:#FFFBEB; --amber-line:#FDE68A;
+    --green:#059669; --green-bg:#ECFDF5;
+    --red-bg:#FEF2F2;
+    --blue-bg:#EFF6FF;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Inter','PingFang SC','Hiragino Sans GB','Microsoft YaHei',system-ui,-apple-system,sans-serif;color:var(--ink-soft);background:var(--bg);line-height:1.85;font-size:15px}
+  .page{max-width:900px;margin:0 auto;background:var(--card);padding:40px 44px 72px;box-shadow:0 0 24px rgba(15,23,42,.06)}
+  h1,h2,h3{color:var(--ink);line-height:1.35}
+  h1{font-size:26px;margin:0 0 6px}
+  h2{font-size:20px;margin:40px 0 12px;padding:10px 14px;background:var(--indigo-50);border-left:5px solid var(--indigo);border-radius:0 8px 8px 0}
+  h3{font-size:16.5px;margin:24px 0 8px;color:var(--indigo-dark)}
+  p{margin:10px 0}
+  .sub{color:var(--muted);font-size:13.5px;margin:0 0 4px}
+  .cover{border-bottom:3px solid var(--indigo);padding-bottom:18px;margin-bottom:22px}
+  .cover .brand{display:inline-block;background:var(--indigo);color:#fff;font-weight:700;font-size:13px;padding:3px 12px;border-radius:999px;letter-spacing:.5px;margin-bottom:10px}
+  .lead{background:var(--indigo-50);border-radius:10px;padding:14px 18px;margin:16px 0 8px;color:var(--ink);font-size:15.5px}
+  .shot{margin:14px 0 4px;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
+  .shot img{display:block;width:100%;height:auto}
+  .shot.narrow{max-width:560px}
+  .cap{color:var(--muted);font-size:13px;margin:4px 0 16px;text-align:center}
+  .tip,.info,.warn,.danger{border-radius:10px;padding:12px 16px;margin:14px 0}
+  .tip{background:var(--green-bg);border:1px solid #A7F3D0}
+  .info{background:var(--blue-bg);border:1px solid #BFDBFE}
+  .warn{background:var(--amber-bg);border:1px solid var(--amber-line)}
+  .danger{background:var(--red-bg);border:1px solid #FECACA}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14.5px}
+  table.doc th,table.doc td{border:1px solid var(--line);padding:8px 12px;text-align:left;vertical-align:top}
+  table.doc th{background:#F8FAFC;color:var(--ink)}
+  table.money td{border-bottom:1px solid var(--line);padding:8px 12px}
+  table.money td:first-child{color:var(--muted);width:220px}
+  ol.steps{padding-left:22px}
+  ol.steps li{margin:6px 0}
+  .toc{background:#F8FAFC;border:1px solid var(--line);border-radius:10px;padding:12px 18px 12px 34px;margin:14px 0 6px}
+  .toc li{margin:3px 0}
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="cover">
+  <span class="brand">运营控制台</span>
+  <h1>反馈表（9）五项新功能 操作说明</h1>
+  <p class="sub">多人单单独改期 · 名单表签证状态按人 · 代理议价申请 · 改单去程/单回程 · 备注保存　·　2026-09-01</p>
+</div>
+
+<div class="lead">
+这次反馈表里的 5 条都做了，下面按条说怎么用。每条先说一句「解决了什么」，再给操作步骤和截图。
+</div>
+
+<ol class="toc">
+  <li><a href="#s1">多人单只给其中几个人改期</a></li>
+  <li><a href="#s2">全岗总表 / 全岗可用：签证状态一人一个</a></li>
+  <li><a href="#s3">代理议价申请（代替代理手改结算价）</a></li>
+  <li><a href="#s4">往返 / 套餐改成单去程或单回程</a></li>
+  <li><a href="#s5">备注和签证状态的保存</a></li>
+</ol>
+
+<h2 id="s1">一、多人单只给其中几个人改期</h2>
+
+<p><strong>解决了什么：</strong>三人一张单，以前改期只能整单一起改。现在改期弹窗里能勾人，勾几个改几个。</p>
+
+<h3>怎么操作</h3>
+
+<ol class="steps">
+  <li>打开订单详情，找到机票那一行，点「改期」（套餐单要先点开「金额明细」）。</li>
+  <li>弹窗最上面是<strong>改期乘客</strong>，默认全选。全选着不动就是整单改期，跟以前一样。</li>
+  <li>只想改某几个人，把不改的人取消勾选。</li>
+  <li>下面照旧选航班、班次、舱位、差价，点「确认改期」。</li>
+</ol>
+
+<div class="shot"><img src="shots-2026-09-01-反馈表9/01-改期-勾人.png"></div>
+<p class="cap">改期弹窗最上面多了乘客勾选，默认全选</p>
+
+<div class="shot"><img src="shots-2026-09-01-反馈表9/02-改期-只勾一人.png"></div>
+<p class="cap">只勾一个人：这个人会被拆成一张新单再改期</p>
+
+<h3>只勾部分人时系统做了什么</h3>
+
+<table class="money">
+  <tr><td>勾的人</td><td>自动拆成一张<strong>新订单</strong>，新单号当场弹出，列表里能看到</td></tr>
+  <tr><td>新单</td><td>按你选的班次改期，改期差价记在新单上</td></tr>
+  <tr><td>原单</td><td>剩下的人不动，班次不变</td></tr>
+  <tr><td>钱</td><td>已收款按人头份额跟着人走，两张单各自对得上</td></tr>
+  <tr><td>已付清的单</td><td>也能这样拆了（以前付清的单不让拆）</td></tr>
+</table>
+
+<div class="warn">
+有酒店分房的单：拆之前要先在「拆单（拆出部分乘客）」里把房间分好，否则会提示先处理房组。已开票 / 有进行中退款 / 结算价锁定的单也拆不了，提示会写清楚原因。
+</div>
+
+<div class="info">
+万一拆成了但改期没成功（比如新班次刚好卖完），红字会告诉你新单号，到新单上重新改期就行，拆单不会退回去。
+</div>
+
+<h2 id="s2">二、全岗总表 / 全岗可用：签证状态一人一个</h2>
+
+<p><strong>解决了什么：</strong>同一张单里自备签的客人，导出来以前也写「需要」；一个人送签了，全员都亮「已送签」。现在一人一个状态，复查的同事能直接看。</p>
+
+<p>操作没变，还是订单管理页上方的「导出全岗总表」和《全岗可用》导出。</p>
+
+<div class="shot"><img src="shots-2026-09-01-反馈表9/10-导出-入口.png"></div>
+<p class="cap">导出入口没变</p>
+
+<div class="shot narrow"><img src="shots-2026-09-01-反馈表9/11-导出-签证状态按人.png"></div>
+<p class="cap">导出后「签证状态」列的样子（示意）</p>
+
+<table class="doc">
+  <tr><th style="width:200px">这位客人的情况</th><th>导出来写什么</th></tr>
+  <tr><td>自备签</td><td>自备签</td></tr>
+  <tr><td>签证台已送签</td><td>已送签</td></tr>
+  <tr><td>签证台材料准备中</td><td>材料准备</td></tr>
+  <tr><td>还没动</td><td>跟整单一样：需要 / 电子签</td></tr>
+  <tr><td>整单选了「不需要」或「已签证」</td><td>全员写整单的值，不看个人</td></tr>
+</table>
+
+<div class="info">
+《签证专用》那张表本来就不含自备签的人，没有变化。
+</div>
+
+<h2 id="s3">三、代理议价申请</h2>
+
+<p><strong>解决了什么：</strong>代理谈好的价跟系统算的不一样时，以前得找运营改。现在代理自己提「议价申请」，运营点一下确认就生效，不用运营手动改数。</p>
+
+<div class="warn">
+代理<strong>不能</strong>自己改结算价，申请提了也不改单价。只有运营点了确认，系统才按差额生成调价。
+</div>
+
+<h3>代理那边：录单时顺手提</h3>
+
+<ol class="steps">
+  <li>代理录单时，结算价卡片下面有一行「本单想按别的价结算？提交议价申请」，点开。</li>
+  <li>填申请结算总价（整单的价）和备注，然后正常下单。</li>
+  <li>单建好后申请自动提交。也可以之后在订单详情里再提。</li>
+</ol>
+
+<div class="shot"><img src="shots-2026-09-01-反馈表9/09-议价-代理录单申请.png"></div>
+<p class="cap">代理录单弹窗里的议价申请</p>
+
+<h3>运营这边：两个地方能处理</h3>
+
+<p><strong>订单列表上方</strong>有「议价申请」按钮，橙色数字是待处理的条数。点开是队列，每行能直接确认或驳回，点单号可以打开那张单。</p>
+
+<div class="shot"><img src="shots-2026-09-01-反馈表9/06-议价-列表入口.png"></div>
+<p class="cap">列表上方的入口，带待处理数</p>
+
+<div class="shot"><img src="shots-2026-09-01-反馈表9/07-议价-待处理队列.png"></div>
+<p class="cap">待处理队列：申请价、当前应收、差额一目了然</p>
+
+<p><strong>订单详情</strong>里也有一块「议价申请」，黄色卡片就是待处理的。</p>
+
+<div class="shot"><img src="shots-2026-09-01-反馈表9/08-议价-详情确认驳回.png"></div>
+<p class="cap">订单详情里的议价申请卡片</p>
+
+<table class="doc">
+  <tr><th style="width:120px">点什么</th><th>发生什么</th></tr>
+  <tr><td>确认</td><td>按「申请价 − 当前应收」生成一条调价，订单应收变成申请价。差额为正是补收，为负是优惠。</td></tr>
+  <tr><td>驳回</td><td>申请标为已驳回，可写原因，代理在订单详情里能看到。</td></tr>
+</table>
+
+<div class="info">
+确认时用的是<strong>当时的</strong>应收，不是申请那一刻的。中间加过改期费、补过房差，这些不会被抹掉。一张单同时只能有一条待处理申请。
+</div>
+
+<h2 id="s4">四、往返 / 套餐改成单去程或单回程</h2>
+
+<p><strong>解决了什么：</strong>客人只飞一段（比如去程 noshow、或者回程不坐了），以前没法把不要的那一段放回去卖。现在订单详情里每一段旁边都有取消按钮，取消后座位当场放回库存，订单变单程。</p>
+
+<h3>怎么操作</h3>
+
+<ol class="steps">
+  <li>打开订单详情（套餐单先点开「金额明细」）。</li>
+  <li>去程那行旁边是「取消去程（改单回程）」，回程那行旁边是「取消回程（改单去程）」，点你要取消的那一段。</li>
+  <li>面板打开会先<strong>预检</strong>：不合格的会逐条写原因，合格的显示这段的金额、按取消政策算出的手续费、本单应收会从多少降到多少。</li>
+  <li>手续费默认按取消政策；要手动填的话选「手动填写」，金额不能超过这段的价，并且<strong>必须写原因</strong>。</li>
+  <li>点「确认取消」，再确认一次就生效。</li>
+</ol>
+
+<div class="shot"><img src="shots-2026-09-01-反馈表9/12-取消航段-入口.png"></div>
+<p class="cap">去程 / 回程两行各自的取消按钮</p>
+
+<div class="shot"><img src="shots-2026-09-01-反馈表9/13-取消航段-预检面板.png"></div>
+<p class="cap">预检面板：这一段的金额、手续费、应收降幅</p>
+
+<h3>确认之后</h3>
+
+<table class="money">
+  <tr><td>被取消那一段的座位</td><td>当场放回库存重新销售</td></tr>
+  <tr><td>订单</td><td>变成单程，只剩另一段</td></tr>
+  <tr><td>应收</td><td>减去这段的金额，再加上手续费</td></tr>
+  <tr><td>手续费</td><td>作为一条「取消去程/回程手续费」的调价行留在单上</td></tr>
+  <tr><td>被取消的那行</td><td>还在明细里，金额 ¥0，标着「已取消」，方便以后查</td></tr>
+  <tr><td>客人多付的钱</td><td><strong>不会自动退</strong>，面板会提示多付了多少，到付款情况里走多收转预存款或退款</td></tr>
+</table>
+
+<div class="shot"><img src="shots-2026-09-01-反馈表9/14-取消航段-已取消徽标.png"></div>
+<p class="cap">取消后那一行的样子</p>
+
+<h3>点不了的几种情况</h3>
+
+<table class="doc">
+  <tr><th style="width:230px">情况</th><th>怎么办</th></tr>
+  <tr><td>这段已经开票</td><td>先在票务台把对应航段改回「未开」</td></tr>
+  <tr><td>这段已经出票（有 PNR / 票号）</td><td>走改签或退票流程，不能直接取消航段</td></tr>
+  <tr><td>结算价锁定 / 收款复核锁定</td><td>先解锁</td></tr>
+  <tr><td>有进行中的退款</td><td>先处理完退款</td></tr>
+  <tr><td>只想给部分人取消</td><td>先用「拆单」把这几个人拆出去，再对新单取消</td></tr>
+</table>
+
+<div class="danger">
+座位放回去就抢不回来了，确认前把面板上的数字看清楚。手动填手续费的原因会进审计记录。
+</div>
+
+<div class="warn">
+代理单取消一段之后应收下降，<strong>佣金不会自动重算</strong>，需要财务手工冲销。
+</div>
+
+<h2 id="s5">五、备注和签证状态的保存</h2>
+
+<p><strong>解决了什么：</strong>改完备注往下翻找不到保存按钮。其实按钮一直在备注块正下方，只是以前改了字才出现。现在它一直在。</p>
+
+<div class="shot"><img src="shots-2026-09-01-反馈表9/03-备注-保存按钮常驻.png"></div>
+<p class="cap">没改动时按钮是灰的，旁边写着「改动需点保存才生效」</p>
+
+<div class="shot"><img src="shots-2026-09-01-反馈表9/04-备注-有改动可保存.png"></div>
+<p class="cap">改了字按钮就亮起来，点一下保存</p>
+
+<p>签证状态那个下拉也是靠这个按钮保存的。乘客旁边的「改自备签 / 改回随团」是点了当场生效，不用再保存。</p>
+
+<p>改了字没保存就关窗口，会拦一下：</p>
+
+<div class="shot narrow"><img src="shots-2026-09-01-反馈表9/05-备注-关窗拦截.png"></div>
+<p class="cap">关窗口前的提醒，点「继续编辑」回去保存</p>
+
+<p style="margin-top:44px;color:#94A3B8;font-size:12.5px;border-top:1px solid #E2E8F0;padding-top:12px">
+世途旅行 · 运营控制台　|　反馈表（9）五项新功能操作说明　|　2026-09-01　|　文中金额与单号为演示数据
+</p>
+
+</div>
+</body>
+</html>
