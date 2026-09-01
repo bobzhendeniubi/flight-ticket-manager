@@ -7818,7 +7818,7 @@ function CancelLegForm({
               <span>
                 按取消政策
                 {hasPolicyFee
-                  ? ` ¥${policyFee!.feeAmountCny.toLocaleString()}（${policyFee!.policyName} · ${policyFee!.feePercent}% · 距起飞 ${policyFee!.hoursLeft} 小时）`
+                  ? ` ¥${policyFee!.feeAmountCny.toLocaleString()}（${policyFee!.policyName} · ${policyFee!.feePercent}% · 距起飞 ${Math.round(policyFee!.hoursLeft)} 小时）`
                   : '（无适用政策，请手动填写）'}
               </span>
             </label>
