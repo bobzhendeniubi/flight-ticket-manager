@@ -49,7 +49,11 @@ export async function sendItineraryEmail(orderId: string): Promise<ItineraryResu
   }
 
   // 仅当所有 FLIGHT item 的 ticketing task 都 CONFIRMED 才发
-  const flightItems = order.items.filter((i) => i.kind === 'FLIGHT');
+  // 「有效航段」= 带班次的 FLIGHT 行 —— 与下方组装 PDF 的过滤（.filter(i => i.flightSchedule)）
+  // 统一口径。无班次的 FLIGHT 行不该参与「是否全部出票」判定：取消航段后作废保留的那条行
+  // （班次已置空、金额已归零、票务任务已终态化）永远拿不到确认出票任务，
+  // 算进来会让分母恒大于分子，行程单永久卡在 not_all_ticketed 发不出去。
+  const flightItems = order.items.filter((i) => i.kind === 'FLIGHT' && i.flightSchedule);
   if (flightItems.length === 0) return { status: 'no_flights' };
   const ticketedCount = flightItems.filter((i) =>
     i.fulfillmentTasks.some(

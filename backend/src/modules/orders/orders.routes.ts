@@ -49,6 +49,7 @@ import {
   rescheduleItemHotelBodySchema,
   splitOrderBodySchema,
   splitOrderPreviewBodySchema,
+  cancelReturnLegBodySchema,
   splitRoomGroupBodySchema,
   swapRefundBodySchema,
   updateSwapReplacementOrderBodySchema,
@@ -2410,6 +2411,70 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     const { id } = req.params as { id: string };
     const body = splitOrderBodySchema.parse(req.body);
     return service.splitOrder(id, body, { userId: req.user.sub, role });
+  });
+
+  // ── 取消回程（partial cancellation；ADMIN/STAFF）────────────────────────────
+  // POST /orders/:id/cancel-return-leg/preview
+  //   只读预检：跑全部准入闸 + 按取消政策给回程行报价，返回 blockers（人话逐条）/
+  //   returnItem / policyFee / netReductionCny / overpayAfterCny，供运营在弹窗里逐条看。
+  app.post(
+    '/:id/cancel-return-leg/preview',
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      const role = req.user.role;
+      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+        return reply.status(403).send({ error: '仅运营/管理员可取消回程' });
+      }
+      const { id } = req.params as { id: string };
+      return service.previewCancelReturnLeg(id, { userId: req.user.sub, role });
+    },
+  );
+
+  // POST /orders/:id/cancel-return-leg  body: { requestToken, feeMode, manualFeeCny?, overrideReason?, note? }
+  //   执行取消回程：回程座位放回库存、订单变单去程、手续费按取消政策（或带原因的手工覆盖）
+  //   落一条调价行。服务端权威定价：请求体不接受「应退多少」，本端点也不打款——
+  //   降完应收后的多收走既有多付/退款流程。幂等：同 (订单, requestToken) 重试只回放。
+  app.post('/:id/cancel-return-leg', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可取消回程' });
+    }
+    const { id } = req.params as { id: string };
+    const body = cancelReturnLegBodySchema.parse(req.body);
+    const { order, audit } = await service.cancelReturnLeg(id, body, {
+      userId: req.user.sub,
+      role,
+    });
+
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'CANCEL_RETURN_LEG',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: audit.orderNumber,
+      before: {
+        returnItemId: audit.returnItemId,
+        originalAmountCny: audit.originalAmountCny,
+        totalCny: audit.totalBefore,
+      },
+      after: {
+        feeCny: audit.feeCny,
+        feeMode: audit.feeMode,
+        policyName: audit.policyName,
+        // 手工覆盖取消政策是最需要事后复核的一步：原因原文进审计。
+        overrideReason: body.overrideReason ?? null,
+        note: body.note ?? null,
+        releasedSeats: audit.releasedSeats,
+        netReductionCny: audit.netReductionCny,
+        totalCny: audit.totalAfter,
+        overpayAfterCny: audit.overpayAfterCny,
+        replayed: audit.replayed,
+      },
+      // 手工覆盖服务端政策报价 = 人为改动金额，按最高等级留痕；按政策走记 WARNING。
+      severity: audit.feeMode === 'MANUAL' ? 'CRITICAL' : 'WARNING',
+    });
+
+    return { order, audit };
   });
 
   // ── 按人改期（ADMIN/STAFF）────────────────────────────────────────────────

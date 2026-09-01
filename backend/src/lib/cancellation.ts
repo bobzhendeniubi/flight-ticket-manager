@@ -310,6 +310,31 @@ export function computeRefundBreakdown(input: {
   };
 }
 
+/** quoteItem 的入参形状（导出供按行报价的调用方组装查询）。 */
+export type CancellationQuoteItem = OrderItem & {
+  flightSchedule: { departureTime: Date } | null;
+  fulfillmentTasks: Pick<FulfillmentTask, 'status' | 'type'>[];
+};
+
+/**
+ * 单行取消报价（公开入口）——「只取消其中一段航段」这类**部分取消**的手续费口径。
+ *
+ * 与整单报价 computeCancellationQuote 共用同一个 quoteItem，绝不另写一份费率算法：
+ * 政策匹配、已履约强制 100%、时间档命中全部同源，改政策两处同时生效。
+ * 区别只在基数：整单报价会再乘 feeScale（把毛价折算到实收口径），部分取消没有「整单实收」
+ * 这个概念，手续费就按**这一行自己的金额**算 —— 返回的正是折算前的毛价口径行报价。
+ *
+ * db 可传事务客户端，让报价与执行落在同一事务快照里（政策表在事务中途被改也不会分叉）。
+ */
+export async function quoteCancellationForItem(
+  item: CancellationQuoteItem,
+  cancelAt: Date = new Date(),
+  db: Pick<Prisma.TransactionClient, 'cancellationPolicy'> = prisma,
+): Promise<GrossItemQuote> {
+  const policies = await db.cancellationPolicy.findMany({ where: { isActive: true } });
+  return quoteItem(item, policies, cancelAt);
+}
+
 // ── 单个 item 的费率计算 ─────────────────────────────────────
 async function quoteItem(
   item: OrderItem & {

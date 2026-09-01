@@ -1,0 +1,616 @@
+/**
+ * 取消回程（partial cancellation）· 服务级单测（vitest，mock Prisma，不依赖真 DB）
+ *
+ * 覆盖运营诉求「客人只飞去程，回程放回给系统继续销售」的全部硬口径：
+ *   1. 权限：仅 ADMIN/STAFF。
+ *   2. 准入闸一次性全列（单程 / 回程已开票 / 已出票 / 结算价锁 / 收款复核锁 / 退款中）。
+ *   3. POLICY 模式手续费 = 取消政策引擎（lib/cancellation）对**回程行**的报价，
+ *      订单总额 = 原总额 − (回程行金额 − 手续费)。
+ *   4. MANUAL 模式：缺原因/缺金额被 schema 拒；超过回程行金额被服务拒；正常覆盖成功。
+ *   5. 座位释放参数正确（含套餐升舱拆座镜像：商务/经济各退各舱）。
+ *   6. hasReturnLeg 物化列回落 false；回程行作废保留（班次置空、金额归零、快照留痕）。
+ *   7. 幂等：同 requestToken 重放不二次放座、不二次收手续费。
+ *   8. 套餐单可取消回程，BUNDLE 行分毫不动。
+ */
+import { describe, it, expect, vi, beforeEach } from 'vitest';
+import { OrderItemKind, Prisma, UserRole } from '@prisma/client';
+
+const { mockPrisma } = vi.hoisted(() => ({
+  mockPrisma: {
+    order: { findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), update: vi.fn() },
+    orderItem: { findUnique: vi.fn(), findMany: vi.fn(), update: vi.fn(), create: vi.fn() },
+    fulfillmentTask: { count: vi.fn(), updateMany: vi.fn() },
+    refund: { count: vi.fn() },
+    cancellationPolicy: { findMany: vi.fn() },
+    auditLog: { create: vi.fn() },
+    $transaction: vi.fn(),
+    $queryRaw: vi.fn(),
+    $executeRaw: vi.fn(),
+  },
+}));
+
+vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
+
+import { OrderService } from './orders.service.js';
+import { cancelReturnLegBodySchema } from './orders.schemas.js';
+import { BadRequestError, ForbiddenError } from '../../lib/errors.js';
+
+const service = new OrderService();
+const ADMIN = { userId: 'admin-1', role: UserRole.ADMIN } as const;
+const STAFF = { userId: 'staff-1', role: UserRole.STAFF } as const;
+const AGENT = { userId: 'agent-1', role: UserRole.AGENT } as const;
+const TOKEN = '00000000-0000-4000-8000-0000000cafe1';
+
+// 现在起 10 天后出发 → 稳稳落在「>=72h」档（20% 手续费），不受跑测时刻影响。
+const OUT_DEPART = new Date(Date.now() + 10 * 24 * 3600_000);
+const RET_DEPART = new Date(Date.now() + 15 * 24 * 3600_000);
+
+/** 一条 20%/100% 两档的机票默认取消政策（引擎按真算，不 mock lib/cancellation）。 */
+const FLIGHT_POLICY = {
+  id: 'pol-flight',
+  productKind: 'FLIGHT',
+  scope: null,
+  name: '机票默认取消政策',
+  tiers: [
+    { hoursBeforeDeparture: 72, feePercent: 20 },
+    { hoursBeforeDeparture: -1, feePercent: 100 },
+  ],
+  isDefault: true,
+  isActive: true,
+};
+
+const OUT_AMOUNT = 3000;
+const RET_AMOUNT = 3000;
+const HOTEL_AMOUNT = 2000;
+const TOTAL_BEFORE = OUT_AMOUNT + RET_AMOUNT + HOTEL_AMOUNT; // 8000
+
+function flightRow(over: Record<string, unknown> = {}) {
+  return {
+    id: 'leg-ret',
+    kind: OrderItemKind.FLIGHT,
+    description: '机票 QH9588 经济舱 × 2',
+    quantity: 2,
+    amount: new Prisma.Decimal(RET_AMOUNT),
+    flightCabin: 'ECONOMY',
+    flightScheduleId: 'sch-ret',
+    metadata: null,
+    flightSchedule: {
+      departureTime: RET_DEPART,
+      departureTz: 'Asia/Shanghai',
+      flight: { flightNumber: 'QH9588' },
+    },
+    ...over,
+  };
+}
+
+/** 订单快照（loadOrderForReturnLegCancel 的 select 形状）。 */
+function orderSnapshot(over: Record<string, unknown> = {}) {
+  return {
+    id: 'ord-1',
+    orderNumber: 'FTM20260901-001',
+    status: 'PAID',
+    deletedAt: null,
+    subtotal: new Prisma.Decimal(TOTAL_BEFORE),
+    total: new Prisma.Decimal(TOTAL_BEFORE),
+    paidAmount: new Prisma.Decimal(TOTAL_BEFORE),
+    adjustmentCny: 0,
+    adjustments: [],
+    outboundInvoiced: false,
+    returnInvoiced: false,
+    systemInvoiced: false,
+    settlementLocked: false,
+    paymentsLocked: false,
+    items: [
+      {
+        id: 'leg-out',
+        kind: OrderItemKind.FLIGHT,
+        description: '机票 QH9589 经济舱 × 2',
+        quantity: 2,
+        amount: new Prisma.Decimal(OUT_AMOUNT),
+        flightCabin: 'ECONOMY',
+        flightScheduleId: 'sch-out',
+        metadata: null,
+        flightSchedule: {
+          departureTime: OUT_DEPART,
+          departureTz: 'Asia/Shanghai',
+          flight: { flightNumber: 'QH9589' },
+        },
+      },
+      flightRow(),
+      {
+        id: 'hotel-1',
+        kind: OrderItemKind.HOTEL,
+        description: '酒店 2 晚',
+        quantity: 2,
+        amount: new Prisma.Decimal(HOTEL_AMOUNT),
+        flightCabin: null,
+        flightScheduleId: null,
+        metadata: null,
+        flightSchedule: null,
+      },
+    ],
+    passengers: [
+      { pnr: null, eticketNumber: null },
+      { pnr: null, eticketNumber: null },
+    ],
+    ...over,
+  };
+}
+
+/** 序列化用的最小订单（回读时用，避免 serializeOrder 抛错吞掉 audit）。 */
+const serializableOrder = () => ({
+  id: 'ord-1',
+  orderNumber: 'FTM20260901-001',
+  status: 'PAID',
+  subtotal: new Prisma.Decimal(5600),
+  taxesAndFees: new Prisma.Decimal(0),
+  discountTotal: new Prisma.Decimal(0),
+  total: new Prisma.Decimal(5600),
+  paidAmount: new Prisma.Decimal(TOTAL_BEFORE),
+  prepaymentOffset: new Prisma.Decimal(0),
+  adjustmentCny: 0,
+  items: [],
+  passengers: [],
+  payments: [],
+});
+
+/**
+ * 事务客户端 mock。orderItem.findMany 按 where 分流：
+ *   带 flightScheduleId 条件 = syncOrderHasReturnLeg 的自愈查询（取消后只剩去程）；
+ *   不带 = 幂等回放扫描（全部 FLIGHT 行 + metadata）。
+ */
+function mountTx(opts: { snapshot?: ReturnType<typeof orderSnapshot>; flightMeta?: unknown[] } = {}) {
+  const snapshot = opts.snapshot ?? orderSnapshot();
+  const flightMeta =
+    opts.flightMeta ??
+    [
+      { id: 'leg-out', metadata: null },
+      { id: 'leg-ret', metadata: null },
+    ];
+  const returnItem = snapshot.items.find((it) => it.id === 'leg-ret');
+  const tx = {
+    $queryRaw: vi.fn(async () => [{ id: 'ord-1' }]),
+    $executeRaw: vi.fn(async () => 1),
+    order: {
+      findUnique: vi.fn(async () => snapshot),
+      findUniqueOrThrow: vi.fn(async () => ({
+        orderNumber: snapshot.orderNumber,
+        total: snapshot.total,
+        paidAmount: snapshot.paidAmount,
+      })),
+      update: vi.fn(async () => ({})),
+    },
+    orderItem: {
+      findMany: vi.fn(async (args: { where?: { flightScheduleId?: unknown } }) =>
+        args?.where?.flightScheduleId !== undefined
+          ? [{ flightScheduleId: 'sch-out', flightSchedule: { departureTime: OUT_DEPART, departureTz: 'Asia/Shanghai' } }]
+          : flightMeta,
+      ),
+      findUnique: vi.fn(async () => ({
+        ...returnItem,
+        fulfillmentTasks: [],
+        flightSchedule: { departureTime: RET_DEPART },
+      })),
+      update: vi.fn(async () => ({})),
+      create: vi.fn(async () => ({ id: 'fee-1' })),
+    },
+    fulfillmentTask: { count: vi.fn(async () => 0), updateMany: vi.fn(async () => ({ count: 1 })) },
+    refund: { count: vi.fn(async () => 0) },
+    cancellationPolicy: { findMany: vi.fn(async () => [FLIGHT_POLICY]) },
+  };
+  mockPrisma.$transaction.mockImplementation(async (fn: (t: unknown) => unknown) => fn(tx));
+  mockPrisma.order.findUniqueOrThrow.mockResolvedValue(serializableOrder());
+  return tx;
+}
+
+/** preview 走裸 prisma（非事务），单独装配。 */
+function mountPreview(snapshot = orderSnapshot()) {
+  const returnItem = snapshot.items.find((it) => it.id === 'leg-ret');
+  mockPrisma.order.findUnique.mockResolvedValue(snapshot);
+  mockPrisma.fulfillmentTask.count.mockResolvedValue(0);
+  mockPrisma.refund.count.mockResolvedValue(0);
+  mockPrisma.cancellationPolicy.findMany.mockResolvedValue([FLIGHT_POLICY]);
+  mockPrisma.orderItem.findUnique.mockResolvedValue(
+    returnItem
+      ? { ...returnItem, fulfillmentTasks: [], flightSchedule: { departureTime: RET_DEPART } }
+      : null,
+  );
+}
+
+const body = (over: Record<string, unknown> = {}) => ({
+  requestToken: TOKEN,
+  feeMode: 'POLICY' as const,
+  ...over,
+});
+
+beforeEach(() => {
+  vi.clearAllMocks();
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 1. 权限
+// ══════════════════════════════════════════════════════════════════════════
+describe('取消回程 · 权限', () => {
+  it('代理不能预检取消回程（且不触库）', async () => {
+    await expect(service.previewCancelReturnLeg('ord-1', AGENT)).rejects.toBeInstanceOf(
+      ForbiddenError,
+    );
+    expect(mockPrisma.order.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('代理不能执行取消回程（且不开事务）', async () => {
+    await expect(service.cancelReturnLeg('ord-1', body(), AGENT)).rejects.toBeInstanceOf(
+      ForbiddenError,
+    );
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('运营（STAFF）可以预检', async () => {
+    mountPreview();
+    const res = await service.previewCancelReturnLeg('ord-1', STAFF);
+    expect(res.eligible).toBe(true);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 2. 准入闸
+// ══════════════════════════════════════════════════════════════════════════
+describe('取消回程 · 准入闸', () => {
+  it('单程单：预检给出「本单是单程」，执行被拒且不放座', async () => {
+    const oneWay = orderSnapshot({
+      items: orderSnapshot().items.filter((it) => it.id !== 'leg-ret'),
+    });
+    mountPreview(oneWay);
+    const preview = await service.previewCancelReturnLeg('ord-1', ADMIN);
+    expect(preview.eligible).toBe(false);
+    expect(preview.blockers.join('')).toContain('单程');
+    expect(preview.returnItem).toBeNull();
+
+    const tx = mountTx({ snapshot: oneWay, flightMeta: [{ id: 'leg-out', metadata: null }] });
+    await expect(service.cancelReturnLeg('ord-1', body(), ADMIN)).rejects.toBeInstanceOf(
+      BadRequestError,
+    );
+    expect(tx.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('回程已开票 → 拒绝，并指到票务台改回未开', async () => {
+    mountPreview(orderSnapshot({ returnInvoiced: true }));
+    const preview = await service.previewCancelReturnLeg('ord-1', ADMIN);
+    expect(preview.eligible).toBe(false);
+    expect(preview.blockers.join('')).toContain('回程已开票');
+    expect(preview.blockers.join('')).toContain('票务台');
+  });
+
+  it('乘客已有票号 → 拒绝，指向改签/退票流程', async () => {
+    mountPreview(
+      orderSnapshot({
+        passengers: [
+          { pnr: 'ABC123', eticketNumber: '880-1234567890' },
+          { pnr: null, eticketNumber: null },
+        ],
+      }),
+    );
+    const preview = await service.previewCancelReturnLeg('ord-1', ADMIN);
+    expect(preview.eligible).toBe(false);
+    expect(preview.blockers.join('')).toContain('已出票');
+  });
+
+  it('回程有确认出票任务 → 拒绝（即便乘客还没回填票号）', async () => {
+    mountPreview();
+    mockPrisma.fulfillmentTask.count.mockResolvedValue(1);
+    const preview = await service.previewCancelReturnLeg('ord-1', ADMIN);
+    expect(preview.eligible).toBe(false);
+    expect(preview.blockers.join('')).toContain('已出票');
+  });
+
+  it('结算价锁 / 收款复核锁 → 两条闸各自成条列出（不是命中一条就停）', async () => {
+    mountPreview(orderSnapshot({ settlementLocked: true, paymentsLocked: true }));
+    const preview = await service.previewCancelReturnLeg('ord-1', ADMIN);
+    expect(preview.eligible).toBe(false);
+    expect(preview.blockers.some((b) => b.includes('结算价已锁定'))).toBe(true);
+    expect(preview.blockers.some((b) => b.includes('收款已复核锁定'))).toBe(true);
+  });
+
+  it('进行中的退款 → 拒绝', async () => {
+    mountPreview();
+    mockPrisma.refund.count.mockResolvedValue(1);
+    const preview = await service.previewCancelReturnLeg('ord-1', ADMIN);
+    expect(preview.blockers.join('')).toContain('进行中的退款');
+  });
+
+  it('已取消的死单 → 拒绝（座位早已释放，再放会把库存账打乱）', async () => {
+    mountPreview(orderSnapshot({ status: 'CANCELLED' }));
+    const preview = await service.previewCancelReturnLeg('ord-1', ADMIN);
+    expect(preview.eligible).toBe(false);
+    expect(preview.blockers.join('')).toContain('不可取消回程');
+  });
+
+  it('回收站单 → 拒绝', async () => {
+    mountPreview(orderSnapshot({ deletedAt: new Date() }));
+    const preview = await service.previewCancelReturnLeg('ord-1', ADMIN);
+    expect(preview.blockers.join('')).toContain('回收站');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 3. POLICY 模式：手续费与总额
+// ══════════════════════════════════════════════════════════════════════════
+describe('取消回程 · POLICY 模式手续费', () => {
+  it('预检按取消政策报价：¥3000 的回程行 × 20% = ¥600，应收降 ¥2400', async () => {
+    mountPreview();
+    const preview = await service.previewCancelReturnLeg('ord-1', ADMIN);
+    expect(preview.policyFee).toMatchObject({
+      policyName: '机票默认取消政策',
+      feePercent: 20,
+      feeAmountCny: 600,
+    });
+    expect(preview.netReductionCny).toBe(2400);
+    expect(preview.currentTotalCny).toBe(TOTAL_BEFORE);
+    // 已收 8000、取消后应收 5600 → 多收 2400（由既有多付/退款流程处置，本端点不打款）
+    expect(preview.overpayAfterCny).toBe(2400);
+    expect(preview.returnItem).toMatchObject({
+      orderItemId: 'leg-ret',
+      flightNumber: 'QH9588',
+      cabin: 'ECONOMY',
+      quantity: 2,
+      amountCny: RET_AMOUNT,
+    });
+  });
+
+  it('执行后订单总额 = 原总额 − (回程行金额 − 手续费)，手续费落一条调价行', async () => {
+    const tx = mountTx();
+    const { audit } = await service.cancelReturnLeg('ord-1', body(), ADMIN);
+
+    expect(audit.feeMode).toBe('POLICY');
+    expect(audit.feeCny).toBe(600);
+    expect(audit.originalAmountCny).toBe(RET_AMOUNT);
+    expect(audit.netReductionCny).toBe(2400);
+    expect(audit.totalBefore).toBe(TOTAL_BEFORE);
+    expect(audit.totalAfter).toBe(5600);
+    expect(audit.overpayAfterCny).toBe(2400);
+    expect(audit.replayed).toBe(false);
+
+    // 手续费调价行：正金额 → FEE，原因码是 endpoint-only 的 RETURN_LEG_CANCEL_FEE
+    const feeCall = tx.orderItem.create.mock.calls[0][0];
+    expect(feeCall.data.kind).toBe(OrderItemKind.FEE);
+    expect(feeCall.data.amount).toEqual(new Prisma.Decimal(600));
+    expect(feeCall.data.description).toContain('取消回程手续费');
+    expect(feeCall.data.metadata).toMatchObject({
+      priceAdjustment: true,
+      reasonCode: 'RETURN_LEG_CANCEL_FEE',
+      returnLegCancelFee: true,
+    });
+
+    // 订单总额重算：8000 − 3000 + 600 = 5600
+    const totalUpdate = tx.order.update.mock.calls.find(
+      (c: [{ data: Record<string, unknown> }]) => c[0].data.total !== undefined,
+    );
+    expect(totalUpdate?.[0].data).toMatchObject({
+      subtotal: new Prisma.Decimal(5600),
+      total: new Prisma.Decimal(5600),
+      returnInvoiced: false,
+    });
+  });
+
+  it('手续费为 0 时不生成空调价行（政策免费退档）', async () => {
+    const tx = mountTx();
+    tx.cancellationPolicy.findMany.mockResolvedValue([
+      { ...FLIGHT_POLICY, tiers: [{ hoursBeforeDeparture: 72, feePercent: 0 }] },
+    ]);
+    const { audit } = await service.cancelReturnLeg('ord-1', body(), ADMIN);
+    expect(audit.feeCny).toBe(0);
+    expect(tx.orderItem.create).not.toHaveBeenCalled();
+    expect(audit.totalAfter).toBe(TOTAL_BEFORE - RET_AMOUNT);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 4. MANUAL 模式
+// ══════════════════════════════════════════════════════════════════════════
+describe('取消回程 · MANUAL 手工覆盖', () => {
+  it('手工模式缺原因 → schema 拒收', () => {
+    const parsed = cancelReturnLegBodySchema.safeParse({
+      requestToken: TOKEN,
+      feeMode: 'MANUAL',
+      manualFeeCny: 500,
+    });
+    expect(parsed.success).toBe(false);
+    expect(JSON.stringify(parsed)).toContain('必须填写原因');
+  });
+
+  it('手工模式缺金额 → schema 拒收', () => {
+    const parsed = cancelReturnLegBodySchema.safeParse({
+      requestToken: TOKEN,
+      feeMode: 'MANUAL',
+      overrideReason: '航司特批',
+    });
+    expect(parsed.success).toBe(false);
+  });
+
+  it('手工金额超过回程行金额 → 400，且座位未被释放（整事务不成立）', async () => {
+    const tx = mountTx();
+    await expect(
+      service.cancelReturnLeg(
+        'ord-1',
+        body({ feeMode: 'MANUAL', manualFeeCny: RET_AMOUNT + 1, overrideReason: '航司特批' }),
+        ADMIN,
+      ),
+    ).rejects.toBeInstanceOf(BadRequestError);
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+  });
+
+  it('正常手工覆盖：调价行按手工金额，原因只进快照不进行描述', async () => {
+    const tx = mountTx();
+    const { audit } = await service.cancelReturnLeg(
+      'ord-1',
+      body({ feeMode: 'MANUAL', manualFeeCny: 100, overrideReason: '航司特批全免大部分退改费' }),
+      ADMIN,
+    );
+    expect(audit.feeMode).toBe('MANUAL');
+    expect(audit.feeCny).toBe(100);
+    expect(audit.totalAfter).toBe(TOTAL_BEFORE - RET_AMOUNT + 100);
+
+    const feeCall = tx.orderItem.create.mock.calls[0][0];
+    expect(feeCall.data.amount).toEqual(new Prisma.Decimal(100));
+    // 覆盖原因是内部口径：只进 metadata 快照与审计，不进客户可见的行描述
+    expect(feeCall.data.description).not.toContain('航司特批全免大部分退改费');
+    expect(feeCall.data.description).toContain('手工核定');
+
+    const snapshot = tx.orderItem.update.mock.calls[0][0].data.metadata.returnLegCancelled;
+    expect(snapshot.feeMode).toBe('MANUAL');
+    expect(snapshot.overrideReason).toBe('航司特批全免大部分退改费');
+    // 政策报价照旧留档，供事后复核「手工覆盖了多少」
+    expect(snapshot.policySnapshot).toMatchObject({ feePercent: 20, feeAmountCny: 600 });
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 5. 座位释放 / 6. 作废保留与 hasReturnLeg
+// ══════════════════════════════════════════════════════════════════════════
+describe('取消回程 · 座位与航段', () => {
+  it('普通经济舱回程：只放经济舱，张数 = 该行人数', async () => {
+    const tx = mountTx();
+    await service.cancelReturnLeg('ord-1', body(), ADMIN);
+    // releaseSeatFloored 的 tagged template 值序：[qty, scheduleId, cabin]；qty<=0 直接跳过
+    const releases = tx.$executeRaw.mock.calls.map((c: unknown[]) => c.slice(1));
+    expect(releases).toEqual([[2, 'sch-ret', 'ECONOMY']]);
+  });
+
+  it('套餐升舱拆座：商务 1 + 经济 1 各退各舱（与下单时的拆座镜像一致）', async () => {
+    const snapshot = orderSnapshot();
+    const ret = snapshot.items.find((it) => it.id === 'leg-ret')!;
+    ret.metadata = { businessUpgradeCount: 1 };
+    const tx = mountTx({ snapshot });
+    await service.cancelReturnLeg('ord-1', body(), ADMIN);
+    const releases = tx.$executeRaw.mock.calls.map((c: unknown[]) => c.slice(1));
+    expect(releases).toEqual([
+      [1, 'sch-ret', 'BUSINESS'],
+      [1, 'sch-ret', 'ECONOMY'],
+    ]);
+  });
+
+  it('回程行作废保留：班次置空、金额与成本归零、描述打标、快照留痕', async () => {
+    const tx = mountTx();
+    await service.cancelReturnLeg('ord-1', body(), ADMIN);
+    const data = tx.orderItem.update.mock.calls[0][0].data;
+    expect(data.flightScheduleId).toBeNull();
+    expect(data.amount).toEqual(new Prisma.Decimal(0));
+    expect(data.unitPrice).toEqual(new Prisma.Decimal(0));
+    expect(data.totalCostCny).toEqual(new Prisma.Decimal(0));
+    expect(data.description).toContain('已取消回程');
+    expect(data.metadata.returnLegCancelled).toMatchObject({
+      requestToken: TOKEN,
+      originalScheduleId: 'sch-ret',
+      originalAmountCny: RET_AMOUNT,
+      feeCny: 600,
+      byUserId: 'admin-1',
+    });
+  });
+
+  it('回程票务任务终态化（只动仍活着的任务）', async () => {
+    const tx = mountTx();
+    await service.cancelReturnLeg('ord-1', body(), ADMIN);
+    expect(tx.fulfillmentTask.updateMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ orderItemId: 'leg-ret' }),
+        data: expect.objectContaining({ status: 'CANCELLED' }),
+      }),
+    );
+  });
+
+  it('hasReturnLeg 物化列回落 false（取消后只剩去程一段）', async () => {
+    const tx = mountTx();
+    await service.cancelReturnLeg('ord-1', body(), ADMIN);
+    const legUpdate = tx.order.update.mock.calls.find(
+      (c: [{ data: Record<string, unknown> }]) => c[0].data.hasReturnLeg !== undefined,
+    );
+    expect(legUpdate?.[0].data).toEqual({ hasReturnLeg: false });
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 7. 幂等
+// ══════════════════════════════════════════════════════════════════════════
+describe('取消回程 · 幂等', () => {
+  it('同 requestToken 重放：不二次放座、不二次收手续费，原样回放结果', async () => {
+    const tx = mountTx({
+      flightMeta: [
+        { id: 'leg-out', metadata: null },
+        {
+          id: 'leg-ret',
+          metadata: {
+            returnLegCancelled: {
+              requestToken: TOKEN,
+              originalAmountCny: RET_AMOUNT,
+              feeCny: 600,
+              feeMode: 'POLICY',
+              policyName: '机票默认取消政策',
+              totalBeforeCny: TOTAL_BEFORE,
+              releasedSeats: [{ scheduleId: 'sch-ret', cabin: 'ECONOMY', quantity: 2 }],
+            },
+          },
+        },
+      ],
+    });
+    tx.order.findUniqueOrThrow.mockResolvedValue({
+      orderNumber: 'FTM20260901-001',
+      total: new Prisma.Decimal(5600),
+      paidAmount: new Prisma.Decimal(TOTAL_BEFORE),
+    });
+
+    const { audit } = await service.cancelReturnLeg('ord-1', body(), ADMIN);
+
+    expect(audit.replayed).toBe(true);
+    expect(audit.feeCny).toBe(600);
+    expect(audit.netReductionCny).toBe(2400);
+    expect(audit.totalAfter).toBe(5600);
+    expect(audit.releasedSeats).toEqual([
+      { scheduleId: 'sch-ret', cabin: 'ECONOMY', quantity: 2 },
+    ]);
+    // 一分座位都不许再放，一条行都不许再改
+    expect(tx.$executeRaw).not.toHaveBeenCalled();
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+    expect(tx.orderItem.create).not.toHaveBeenCalled();
+    expect(tx.order.update).not.toHaveBeenCalled();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 8. 套餐单
+// ══════════════════════════════════════════════════════════════════════════
+describe('取消回程 · 套餐单', () => {
+  it('套餐单可取消回程：只作废回程 FLIGHT 行，BUNDLE 行分毫不动', async () => {
+    const base = orderSnapshot();
+    const snapshot = orderSnapshot({
+      items: [
+        ...base.items,
+        {
+          id: 'bundle-1',
+          kind: OrderItemKind.BUNDLE,
+          description: '海岛 5 日套餐 × 2',
+          quantity: 2,
+          amount: new Prisma.Decimal(4000),
+          flightCabin: null,
+          flightScheduleId: null,
+          metadata: null,
+          flightSchedule: null,
+        },
+      ],
+      total: new Prisma.Decimal(TOTAL_BEFORE + 4000),
+      subtotal: new Prisma.Decimal(TOTAL_BEFORE + 4000),
+      paidAmount: new Prisma.Decimal(TOTAL_BEFORE + 4000),
+    });
+    const tx = mountTx({ snapshot });
+
+    const { audit } = await service.cancelReturnLeg('ord-1', body(), ADMIN);
+
+    // 只改了回程那一行
+    expect(tx.orderItem.update).toHaveBeenCalledTimes(1);
+    expect(tx.orderItem.update.mock.calls[0][0].where).toEqual({ id: 'leg-ret' });
+    // 12000 − 3000 + 600 = 9600
+    expect(audit.totalAfter).toBe(9600);
+    expect(audit.releasedSeats).toEqual([
+      { scheduleId: 'sch-ret', cabin: 'ECONOMY', quantity: 2 },
+    ]);
+  });
+});

@@ -124,6 +124,8 @@ import type {
   OrderPriceAdjustmentBody,
   PassengerInput,
   PriceAdjustmentInput,
+  PriceAdjustmentReasonDisplay,
+  CancelReturnLegBody,
   PublicOrderLookupQuery,
   QuoteOrderBody,
   SettlementPreview,
@@ -629,7 +631,16 @@ export function buildBatchItems(
  *     PRICE_ADJUSTMENT_REASON_LABEL（覆盖历史三个已下线原因值，避免旧订单行 label 缺失）。
  * 导出供单测复用。
  */
-export function buildPriceAdjustmentItem(adj: PriceAdjustmentInput): {
+export function buildPriceAdjustmentItem(adj: {
+  amountCny: number;
+  /**
+   * 人工可录入的四类 + 专用端点自己产生的 endpoint-only 原因码（ROOM_DIFF / SETTLEMENT /
+   * RETURN_LEG_CANCEL_FEE …）。收窄仍然发生在**入口**：面向 HTTP 的 priceAdjustmentSchema /
+   * orderPriceAdjustmentBodySchema 只认四类，运营下拉里永远看不到 endpoint-only 的码。
+   */
+  reasonCode: PriceAdjustmentReasonDisplay;
+  reasonText?: string;
+}): {
   kind: OrderItemKind;
   description: string;
   quantity: number;
@@ -12733,6 +12744,596 @@ export class OrderService {
       severity: AuditSeverity.CRITICAL,
     });
   }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 取消回程（partial cancellation）：POST /orders/:id/cancel-return-leg
+  //
+  // 运营诉求：往返单（含套餐单）的客人只飞去程，回程不要了 —— 要让「系统里只剩单去程，
+  // 回程放回给系统继续销售」。按航司/包机行业标准的「取消航段」办：
+  //   · 回程座位当场放回库存（按下单时的升舱拆座镜像各退各舱），可立即重卖；
+  //   · 订单变单去程（hasReturnLeg 物化列同步为 false，回程票务任务终态化）；
+  //   · 手续费按取消政策对**回程行**报价（运营可手工覆盖，但必须写原因、记 CRITICAL 审计）；
+  //   · 应收降下来即止 —— **本端点不打款**：降完 total 后的多收由既有「多付转预存款 /
+  //     转挂账池 / 退款」流程处置，退多少钱不由这里决定。
+  //
+  // 只做「取消回程」。「只留回程、取消去程」业务没提，不做（去程是行程锚点，牵动出发日
+  // 派生、酒店随出发日平移、开票占额，另案）。
+  // 部分乘客只飞去程 → 运营先用拆单把人拆出去、再对新单取消回程（本端点不做拆人）。
+  //
+  // 回程行「作废保留」而不物理删（行业惯例：已取消航段要留痕，原班次/原金额快照是事后
+  // 对账与申诉的唯一依据）。实现口径：
+  //   amount/unitPrice/成本归零 + flightScheduleId 置空 + metadata 落 returnLegCancelled 快照。
+  //   全站「有效航段」的判定统一是 **flightScheduleId 非空**（determineFlightLegItems、
+  //   syncOrderHasReturnLeg、ticketing-cap、各导出、护照包、房控、履约筛选皆然），
+  //   置空即退出座位/开票/回程列统计，与物理删等效而多了留痕。
+  // ════════════════════════════════════════════════════════════════════
+
+  /** 取消回程的准入评估（preview 与 execute 共用同一口径，杜绝预检放行、执行另算）。 */
+  private async _assessCancelReturnLeg(
+    db: Prisma.TransactionClient,
+    orderId: string,
+  ): Promise<{
+    order: CancelReturnLegOrderSnapshot;
+    returnItem: CancelReturnLegItemSnapshot | null;
+    blockers: string[];
+  }> {
+    const order = await loadOrderForReturnLegCancel(db, orderId);
+    if (!order) throw new NotFoundError('订单不存在');
+
+    const blockers: string[] = [];
+
+    // ── 闸 1-3：存活 / 占座中 / 资金处置闸 ──────────────────────────────────
+    // 前两条通过才跑处置闸（同因不重复报）。取消回程会改 total（应收下降），语义上属于
+    // 「处置订单资金」，与拆单/改结算价同一把闸：退款审批中、取消族终态、回收站单一律拒绝。
+    if (order.deletedAt) {
+      blockers.push('订单在回收站（已软删），不能取消回程；如需操作请先恢复订单。');
+    } else if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
+      blockers.push(
+        `订单当前状态（${zhStatus(order.status)}）不可取消回程：仅占座中的有效订单可操作` +
+          `（已取消/已退款/支付超时的单不再持有座位，再放一次会把库存账打乱）。`,
+      );
+    } else {
+      try {
+        assertOrderAllowsFundsDisposal(order, '取消回程');
+      } catch (err) {
+        blockers.push(err instanceof Error ? err.message : '订单当前状态不允许取消回程。');
+      }
+    }
+
+    // ── 闸 4：本单必须真的有回程 ────────────────────────────────────────────
+    // 「有效航段」= flightScheduleId 非空且班次有出发时刻，与 determineFlightLegItems 同源。
+    const legRows = order.items.filter(
+      (it) =>
+        it.kind === OrderItemKind.FLIGHT &&
+        it.flightScheduleId != null &&
+        it.flightSchedule?.departureTime != null,
+    );
+    const legs = determineFlightLegItems(legRows);
+    const returnRow = legs.return;
+    if (legRows.length < 2 || !returnRow) {
+      blockers.push('本单是单程（没有回程航段），无需取消回程。');
+    }
+    if (legRows.length > 2) {
+      // 六态开票模型只表达去程/回程两维，三段以上单的「哪一段是回程」没有权威口径，
+      // 猜错就会放错座、清错开票位。宁可不做，交人工按航段逐条处理。
+      blockers.push(
+        `本单有 ${legRows.length} 段航段（超过去程+回程两段），系统无法自动判定哪一段是回程，` +
+          `请人工逐段处理或先拆单。`,
+      );
+    }
+
+    // ── 闸 5-6：结算价锁 / 收款复核锁（都会被本操作改动的应收挡住）──
+    if (order.settlementLocked) {
+      blockers.push('该订单结算价已锁定，取消回程会改动应收。请先解锁结算价再操作。');
+    }
+    if (order.paymentsLocked) {
+      blockers.push('该订单收款已复核锁定，取消回程会改动应收。请先解锁收款再操作。');
+    }
+
+    // ── 闸 7：回程已开票（发票金额与订单金额不能脱钩）──
+    if (order.returnInvoiced) {
+      blockers.push(
+        '回程已开票，请先在票务台把回程开票状态改回「未开」，取消回程后再按新金额重开。',
+      );
+    }
+
+    // ── 闸 8：回程已出票 → 走改签/退票，不走取消航段（与拆单闸 12 同口径）──
+    const confirmedReturnTicketing = returnRow
+      ? await db.fulfillmentTask.count({
+          where: {
+            orderItemId: returnRow.id,
+            type: FulfillmentType.FLIGHT_TICKETING,
+            status: FulfillmentStatus.CONFIRMED,
+          },
+        })
+      : 0;
+    const ticketedPax = order.passengers.some(
+      (p) => (p.pnr && p.pnr.trim() !== '') || (p.eticketNumber && p.eticketNumber.trim() !== ''),
+    );
+    if (confirmedReturnTicketing > 0 || ticketedPax) {
+      blockers.push(
+        '回程已出票（有确认出票记录，或乘客已有 PNR/票号）。已出票请走改签/退票流程，' +
+          '不能直接取消航段。',
+      );
+    }
+
+    // ── 闸 9：进行中的退款（应退额是按申请当刻的报价快照算的，改应收会把它算错）──
+    const inflightRefunds = await db.refund.count({
+      where: {
+        orderId: order.id,
+        status: { in: [RefundStatus.REQUESTED, RefundStatus.APPROVED, RefundStatus.PROCESSING] },
+      },
+    });
+    if (inflightRefunds > 0) {
+      blockers.push('该订单有进行中的退款，请先完成或驳回退款流程再取消回程。');
+    }
+
+    return { order, returnItem: returnRow ?? null, blockers };
+  }
+
+  /**
+   * 回程行的取消手续费报价（政策口径）。
+   *
+   * 复用 lib/cancellation 的按行报价入口 quoteCancellationForItem，绝不另写一份费率算法。
+   * 动态 import 与本文件既有的 computeCancellationQuote 调用同因：两个单测文件用
+   * vi.mock('../../lib/cancellation.js') 做了部分工厂，静态引用在那里会变成 undefined。
+   *
+   * 金额取整到元（调价行是整数 CNY 口径），并夹到 [0, 回程行金额]：
+   * 取消一段航段收的手续费不可能比这段本身还贵。
+   */
+  private async _quoteReturnLegCancelFee(
+    db: Prisma.TransactionClient,
+    itemId: string,
+    returnAmountCny: number,
+    at: Date,
+  ): Promise<ReturnLegCancelPolicyFee | null> {
+    const { quoteCancellationForItem } = await import('../../lib/cancellation.js');
+    const full = await db.orderItem.findUnique({
+      where: { id: itemId },
+      include: {
+        flightSchedule: { select: { departureTime: true } },
+        fulfillmentTasks: { select: { status: true, type: true } },
+      },
+    });
+    if (!full) return null;
+    const quote = await quoteCancellationForItem(full, at, db);
+    return {
+      policyName: quote.policyName,
+      feePercent: quote.feePercent,
+      feeAmountCny: Math.min(
+        Math.max(0, Math.round(quote.feeAmount)),
+        Math.max(0, Math.round(returnAmountCny)),
+      ),
+      hoursLeft: quote.hoursLeft,
+    };
+  }
+
+  /** 回程行 → 预检/审计用的可读快照。 */
+  private _describeReturnLeg(item: CancelReturnLegItemSnapshot): CancelReturnLegItemView {
+    const sched = item.flightSchedule;
+    return {
+      orderItemId: item.id,
+      description: item.description,
+      flightNumber: sched?.flight?.flightNumber ?? null,
+      // 出发日按出发地时区折算成当地日（全站口径；naive timestamp 直接切串会差 8 小时）。
+      departDate: sched?.departureTime ? localDateISO(sched.departureTime, sched.departureTz) : null,
+      cabin: item.flightCabin,
+      quantity: item.quantity,
+      amountCny: round2(Number(item.amount)),
+    };
+  }
+
+  /**
+   * 取消回程 · 预检（只读）：POST /orders/:id/cancel-return-leg/preview。
+   *
+   * 一次性返回**全部**不满足的闸（blockers），而不是命中第一条就停 —— 运营要在一个弹窗里
+   * 看完所有待清障项，而不是修一条试一次。
+   */
+  async previewCancelReturnLeg(
+    orderId: string,
+    actor: { userId: string; role: UserRole },
+  ): Promise<CancelReturnLegPreview> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可取消回程');
+    }
+    const { order, returnItem, blockers } = await this._assessCancelReturnLeg(prisma, orderId);
+
+    const currentTotalCny = round2(Number(order.total));
+    const paidAmountCny = round2(Number(order.paidAmount));
+    const returnAmountCny = returnItem ? round2(Number(returnItem.amount)) : 0;
+
+    // 有 blocker 也照报价：运营要先看到「清障后大约收多少手续费、应收降多少」再决定做不做。
+    const policyFee = returnItem
+      ? await this._quoteReturnLegCancelFee(prisma, returnItem.id, returnAmountCny, new Date())
+      : null;
+
+    const netReductionCny = returnItem ? round2(returnAmountCny - (policyFee?.feeAmountCny ?? 0)) : 0;
+    const totalAfterCny = round2(currentTotalCny - netReductionCny);
+
+    return {
+      eligible: blockers.length === 0,
+      blockers,
+      returnItem: returnItem ? this._describeReturnLeg(returnItem) : null,
+      policyFee,
+      netReductionCny,
+      currentTotalCny,
+      paidAmountCny,
+      overpayAfterCny: round2(Math.max(0, paidAmountCny - totalAfterCny)),
+    };
+  }
+
+  /**
+   * 取消回程 · 执行：POST /orders/:id/cancel-return-leg。
+   *
+   * 单事务内：锁订单行（FOR UPDATE，与改期/超时 worker 抢同一把锁 → 座位账严格串行）
+   *   → 幂等回放检查 → 重跑全部准入闸 → 放回程座位（复用 releaseSeatFloored +
+   *   computeBundleSeatSplit，与改期「释放旧座」逐行同镜像）→ 回程行作废保留
+   *   → 回程履约任务终态化 → hasReturnLeg 同步 → 手续费调价行 → 重算 subtotal/total。
+   *
+   * 幂等：同 (订单, requestToken) 重试只回放既有结果 —— 标记写在回程行的
+   * metadata.returnLegCancelled 里，与作废动作同一次写入、同一事务，不可能出现
+   * 「座放了、标记没落」。座位因此**只会被放一次**。
+   */
+  async cancelReturnLeg(
+    orderId: string,
+    input: CancelReturnLegBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{ order: ReturnType<typeof serializeOrder>; audit: CancelReturnLegAudit }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可取消回程');
+    }
+
+    const audit = await prisma.$transaction(async (tx) => {
+      // 与 rescheduleOrderItem / 超时 worker 同一把行锁：谁先拿锁谁先提交，杜绝
+      // 「改期正在搬这条行」与「本端点正在放这条行的座」交错导致的双放 / 幽灵持有。
+      const lockRows = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE
+      `;
+      if (lockRows.length === 0) throw new NotFoundError('订单不存在');
+
+      // ── 0. 幂等回放：同 token 已取消过 → 原样回放，绝不二次放座 / 二次收手续费 ──
+      const flightRows = await tx.orderItem.findMany({
+        where: { orderId, kind: OrderItemKind.FLIGHT },
+        select: { id: true, metadata: true },
+      });
+      const replayRow = flightRows.find(
+        (row) =>
+          readJsonObject(readJsonObject(row.metadata).returnLegCancelled).requestToken ===
+          input.requestToken,
+      );
+      if (replayRow) {
+        const snap = readJsonObject(readJsonObject(replayRow.metadata).returnLegCancelled);
+        const current = await tx.order.findUniqueOrThrow({
+          where: { id: orderId },
+          select: { orderNumber: true, total: true, paidAmount: true },
+        });
+        const totalAfter = round2(Number(current.total));
+        const originalAmountCny = Number(snap.originalAmountCny ?? 0);
+        const feeCny = Number(snap.feeCny ?? 0);
+        return {
+          orderNumber: current.orderNumber,
+          returnItemId: replayRow.id,
+          feeItemId: null,
+          releasedSeats: Array.isArray(snap.releasedSeats)
+            ? (snap.releasedSeats as CancelReturnLegAudit['releasedSeats'])
+            : [],
+          originalAmountCny,
+          feeCny,
+          feeMode: (snap.feeMode === 'MANUAL' ? 'MANUAL' : 'POLICY') as 'POLICY' | 'MANUAL',
+          policyName: typeof snap.policyName === 'string' ? snap.policyName : null,
+          netReductionCny: round2(originalAmountCny - feeCny),
+          totalBefore: Number(snap.totalBeforeCny ?? totalAfter),
+          totalAfter,
+          overpayAfterCny: round2(Math.max(0, Number(current.paidAmount) - totalAfter)),
+          replayed: true,
+        };
+      }
+
+      // ── 1. 重跑准入闸（预检放行到执行之间世界可能已经变了）──
+      const { order, returnItem, blockers } = await this._assessCancelReturnLeg(tx, orderId);
+      if (blockers.length > 0 || !returnItem) {
+        throw new BadRequestError(blockers.join('；') || '本单没有可取消的回程航段。');
+      }
+
+      const returnAmountCny = round2(Number(returnItem.amount));
+      const totalBeforeCny = round2(Number(order.total));
+
+      // ── 2. 手续费：服务端权威定价 ──────────────────────────────────────────
+      // POLICY = 按取消政策对回程行报价；MANUAL = 手工覆盖，必须带原因（schema 已强制）
+      // 且不超过回程行金额。请求体里其它任何金额一律不认，退款金额也不由本端点决定。
+      const now = new Date();
+      const policyFee = await this._quoteReturnLegCancelFee(tx, returnItem.id, returnAmountCny, now);
+      let feeCny: number;
+      if (input.feeMode === 'MANUAL') {
+        const manual = Math.trunc(input.manualFeeCny ?? 0);
+        if (manual > Math.round(returnAmountCny)) {
+          throw new BadRequestError(
+            `手工手续费 ¥${manual} 超过回程航段金额 ¥${returnAmountCny}：` +
+              `取消一段航段收的手续费不能比这段本身还贵。`,
+          );
+        }
+        feeCny = manual;
+      } else {
+        feeCny = policyFee?.feeAmountCny ?? 0;
+      }
+      const netReductionCny = round2(returnAmountCny - feeCny);
+
+      // ── 3. 放回程座位（按下单时的升舱拆座镜像各退各舱，与改期「释放旧座」同一 helper）──
+      // 只在事务内、只对占座态订单（闸 2 已断言）、只放一次（闸 0 幂等）——座位账三条对称约束。
+      const releasedSeats: CancelReturnLegAudit['releasedSeats'] = [];
+      const returnScheduleId = returnItem.flightScheduleId;
+      const returnCabin = returnItem.flightCabin;
+      if (returnScheduleId && returnCabin) {
+        const meta = readJsonObject(returnItem.metadata);
+        const rawUpgrade =
+          typeof meta.businessUpgradeCount === 'number' ? meta.businessUpgradeCount : 0;
+        const split = computeBundleSeatSplit(returnCabin, returnItem.quantity, rawUpgrade);
+        await releaseSeatFloored(tx, returnScheduleId, 'BUSINESS', split.business);
+        await releaseSeatFloored(tx, returnScheduleId, returnCabin, split.sameCabin);
+        if (split.business > 0) {
+          releasedSeats.push({
+            scheduleId: returnScheduleId,
+            cabin: 'BUSINESS',
+            quantity: split.business,
+          });
+        }
+        if (split.sameCabin > 0) {
+          releasedSeats.push({
+            scheduleId: returnScheduleId,
+            cabin: returnCabin,
+            quantity: split.sameCabin,
+          });
+        }
+      }
+
+      // ── 4. 回程行「作废保留」：金额/成本归零 + 班次置空 + 快照落 metadata ──────
+      // 不物理删行：已取消航段要留痕（原班次、原金额、谁在什么时候按什么政策取消的）。
+      // flightScheduleId 置空 = 全站「有效航段」判定的统一口径，置空即退出座位/开票/回程列统计。
+      // quantity 保持不变（留痕这段原本几个人），金额已归零故不影响任何合计。
+      // 成本一并归零：座位已还回库存，这段不再产生采购成本；留着会让本单毛利凭空变负。
+      const preservedMeta = readJsonObject(returnItem.metadata);
+      const cancelSnapshot = {
+        at: now.toISOString(),
+        byUserId: actor.userId,
+        requestToken: input.requestToken,
+        originalDescription: returnItem.description,
+        originalAmountCny: returnAmountCny,
+        originalScheduleId: returnScheduleId,
+        originalCabin: returnCabin,
+        feeCny,
+        feeMode: input.feeMode,
+        overrideReason: input.overrideReason?.trim() || null,
+        note: input.note?.trim() || null,
+        policyName: policyFee?.policyName ?? null,
+        policySnapshot: policyFee,
+        releasedSeats,
+        totalBeforeCny,
+        totalAfterCny: round2(totalBeforeCny - netReductionCny),
+      };
+      await tx.orderItem.update({
+        where: { id: returnItem.id },
+        data: {
+          description: returnItem.description.startsWith(RETURN_LEG_CANCELLED_PREFIX)
+            ? returnItem.description
+            : `${RETURN_LEG_CANCELLED_PREFIX}${returnItem.description}`,
+          flightScheduleId: null,
+          unitPrice: new Prisma.Decimal(0),
+          amount: new Prisma.Decimal(0),
+          unitCostCny: new Prisma.Decimal(0),
+          totalCostCny: new Prisma.Decimal(0),
+          metadata: {
+            ...preservedMeta,
+            returnLegCancelled: cancelSnapshot,
+          } as Prisma.InputJsonValue,
+        },
+      });
+
+      // ── 5. 回程履约任务终态化（口径同订单落取消族：只动仍活着的任务，幂等）──
+      await tx.fulfillmentTask.updateMany({
+        where: {
+          orderItemId: returnItem.id,
+          status: { in: [FulfillmentStatus.PENDING, FulfillmentStatus.IN_PROGRESS] },
+        },
+        data: { status: FulfillmentStatus.CANCELLED, completedAt: now },
+      });
+
+      // ── 6. 物化列 hasReturnLeg 同步（此刻回程行已无班次 → 必然回落 false）──
+      await syncOrderHasReturnLeg(tx, orderId);
+
+      // ── 7. 手续费调价行（endpoint-only 原因码；费为 0 就不留空行）──────────────
+      // 走与录单调价/事后调价完全同一条路径：一条独立 FEE 行进 subtotal/total，
+      // 不去动 adjustmentCny（那是改期费/换人费的整单口径，与调价行是两套账，混用会双记）。
+      let feeItemId: string | null = null;
+      if (feeCny > 0) {
+        // 覆盖原因是内部口径（航司特批/议价等），只落 metadata 快照与审计，不进行描述——
+        // 行描述会出现在客户可见的导出/行程单里，内部原因不外露。
+        const reasonText =
+          input.feeMode === 'MANUAL' ? '手工核定' : (policyFee?.policyName ?? '按取消政策');
+        const row = buildPriceAdjustmentItem({
+          amountCny: feeCny,
+          reasonCode: 'RETURN_LEG_CANCEL_FEE',
+          reasonText,
+        });
+        const created = await tx.orderItem.create({
+          data: {
+            orderId,
+            kind: row.kind,
+            description: row.description,
+            quantity: 1,
+            unitPrice: new Prisma.Decimal(row.unitPrice),
+            amount: new Prisma.Decimal(row.amount),
+            totalCostCny: new Prisma.Decimal(row.totalCostCny),
+            metadata: {
+              ...row.metadata,
+              returnLegCancelFee: true,
+              returnItemId: returnItem.id,
+              feeMode: input.feeMode,
+            } as Prisma.InputJsonValue,
+          },
+        });
+        feeItemId = created.id;
+      }
+
+      // ── 8. 重算 subtotal/total（口径同事后调价：Σ 全部行金额；当前 total = subtotal）──
+      // 回程行已归零、手续费行已入账，故等价于「旧合计 − 回程行金额 + 手续费」。
+      const newSubtotal = round2(
+        order.items.reduce((sum, it) => sum + Number(it.amount), 0) - returnAmountCny + feeCny,
+      );
+      const log = appendAdjustment(order.adjustments, {
+        type: 'RETURN_LEG_CANCEL',
+        label: `取消回程${feeCny > 0 ? `（手续费 ¥${feeCny}）` : '（不收手续费）'}`,
+        // 本流水只作留痕：钱走 total（手续费调价行），不进 adjustmentCny，避免同一笔费双记。
+        amountCny: 0,
+        at: now.toISOString(),
+        by: actor.userId,
+        note: input.note?.trim() || input.overrideReason?.trim() || undefined,
+      });
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          subtotal: new Prisma.Decimal(newSubtotal),
+          total: new Prisma.Decimal(newSubtotal),
+          // 回程没了，回程开票位必须是「未开」（闸 7 已保证为 false，这里是自愈式定值写）。
+          returnInvoiced: false,
+          adjustments: log,
+        },
+      });
+
+      const paidAmountCny = round2(Number(order.paidAmount));
+      return {
+        orderNumber: order.orderNumber,
+        returnItemId: returnItem.id,
+        feeItemId,
+        releasedSeats,
+        originalAmountCny: returnAmountCny,
+        feeCny,
+        feeMode: input.feeMode,
+        policyName: policyFee?.policyName ?? null,
+        netReductionCny,
+        totalBefore: totalBeforeCny,
+        totalAfter: newSubtotal,
+        overpayAfterCny: round2(Math.max(0, paidAmountCny - newSubtotal)),
+        replayed: false,
+      };
+    });
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+    return {
+      order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
+      audit,
+    };
+  }
+}
+
+// ── 取消回程：订单快照加载 + 对外契约类型 ──────────────────────────────────────
+
+/** 被取消的回程行在描述前打的留痕前缀（幂等：已带前缀不再叠加）。 */
+const RETURN_LEG_CANCELLED_PREFIX = '【已取消回程】';
+
+/** 取消回程准入评估要读的订单快照（select 与类型同源，改一处即改两处）。 */
+async function loadOrderForReturnLegCancel(db: Prisma.TransactionClient, orderId: string) {
+  return db.order.findUnique({
+    where: { id: orderId },
+    select: {
+      id: true,
+      orderNumber: true,
+      status: true,
+      deletedAt: true,
+      subtotal: true,
+      total: true,
+      paidAmount: true,
+      adjustmentCny: true,
+      adjustments: true,
+      outboundInvoiced: true,
+      returnInvoiced: true,
+      systemInvoiced: true,
+      settlementLocked: true,
+      paymentsLocked: true,
+      items: {
+        select: {
+          id: true,
+          kind: true,
+          description: true,
+          quantity: true,
+          amount: true,
+          flightCabin: true,
+          flightScheduleId: true,
+          metadata: true,
+          flightSchedule: {
+            select: {
+              departureTime: true,
+              departureTz: true,
+              flight: { select: { flightNumber: true } },
+            },
+          },
+        },
+      },
+      passengers: { select: { pnr: true, eticketNumber: true } },
+    },
+  });
+}
+type CancelReturnLegOrderSnapshot = NonNullable<
+  Awaited<ReturnType<typeof loadOrderForReturnLegCancel>>
+>;
+type CancelReturnLegItemSnapshot = CancelReturnLegOrderSnapshot['items'][number];
+
+/** 回程航段的可读快照（预检展示 / 审计留痕）。 */
+export interface CancelReturnLegItemView {
+  orderItemId: string;
+  description: string;
+  flightNumber: string | null;
+  /** 出发地当地日 YYYY-MM-DD（按班次 departureTz 折算）。 */
+  departDate: string | null;
+  cabin: CabinClass | null;
+  quantity: number;
+  amountCny: number;
+}
+
+/** 取消政策对回程行的报价（POLICY 模式直接采用；MANUAL 模式仍返回，供运营对照）。 */
+export interface ReturnLegCancelPolicyFee {
+  policyName: string;
+  feePercent: number;
+  /** 已取整到元并夹到 [0, 回程行金额]。 */
+  feeAmountCny: number;
+  /** 距回程起飞小时数；null = 无参考时间。 */
+  hoursLeft: number | null;
+}
+
+/** POST /orders/:id/cancel-return-leg/preview 的响应契约。 */
+export interface CancelReturnLegPreview {
+  eligible: boolean;
+  /** 全部不满足的闸（人话逐条），空数组 = 可取消。 */
+  blockers: string[];
+  returnItem: CancelReturnLegItemView | null;
+  policyFee: ReturnLegCancelPolicyFee | null;
+  /** 应收下降额 = 回程行金额 − 手续费。 */
+  netReductionCny: number;
+  currentTotalCny: number;
+  paidAmountCny: number;
+  /** 取消后的多收额 = max(0, 已收 − 取消后应收)；由既有多收/退款流程处置，本端点不打款。 */
+  overpayAfterCny: number;
+}
+
+/** 取消回程的审计明细（路由据此记 CANCEL_RETURN_LEG）。 */
+export interface CancelReturnLegAudit {
+  orderNumber: string;
+  returnItemId: string;
+  /** 生成的手续费调价行 id；手续费为 0 或幂等回放时为 null。 */
+  feeItemId: string | null;
+  releasedSeats: Array<{ scheduleId: string; cabin: CabinClass; quantity: number }>;
+  originalAmountCny: number;
+  feeCny: number;
+  feeMode: 'POLICY' | 'MANUAL';
+  policyName: string | null;
+  netReductionCny: number;
+  totalBefore: number;
+  totalAfter: number;
+  overpayAfterCny: number;
+  /** true = 同 requestToken 重试，本次没有任何写入（座位不会被二次释放）。 */
+  replayed: boolean;
 }
 
 /** 单条改期的审计明细（按人改期把它原样透出，供路由记 RESCHEDULE_ORDER_ITEM）。 */
