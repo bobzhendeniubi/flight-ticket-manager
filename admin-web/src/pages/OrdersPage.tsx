@@ -6602,10 +6602,12 @@ function returnFlightLegId(o: OrderSummary): string | null {
   return flights.length >= 2 ? flights[1].id : null;
 }
 
-/** 回程行是否已被取消（后端 metadata.returnLegCancelled 打标；结构不符视为未取消）。 */
+/** 回程行是否已被取消：后端在 metadata.returnLegCancelled 落一个快照对象（at/feeCny/原班次…），
+ *  对象存在即视为已取消；也兼容布尔 true。结构不符视为未取消。 */
 function readReturnLegCancelled(metadata: unknown): boolean {
   if (!metadata || typeof metadata !== 'object') return false;
-  return (metadata as { returnLegCancelled?: unknown }).returnLegCancelled === true;
+  const v = (metadata as { returnLegCancelled?: unknown }).returnLegCancelled;
+  return v === true || (typeof v === 'object' && v !== null);
 }
 
 // ── 产品内容行：FLIGHT 项可「改期」（换班次/日期 + 改舱位 + 改期费）──────
@@ -6650,9 +6652,11 @@ function OrderItemRow({
   const [splittingGroup, setSplittingGroup] = useState(false);
   const [cancelingReturnLeg, setCancelingReturnLeg] = useState(false);
   const isFlight = item.kind === 'FLIGHT';
-  // 取消回程（改单去程）：本行是回程 FLIGHT 行、且尚未被取消过才给入口；已取消过的显示徽标。
+  // 取消回程（改单去程）：本行是回程 FLIGHT 行、且尚未被取消过才给入口。
+  // 已取消的回程行后端会把班次置空（退出航段判定），所以「已取消」只看 metadata 打标、
+  // 不依赖 returnLegItemId——否则作废行会失去徽标、还继续露出改期/升舱/改结算价。
   const isReturnLeg = isFlight && returnLegItemId === item.id;
-  const returnLegCancelled = isReturnLeg && readReturnLegCancelled(item.metadata);
+  const returnLegCancelled = isFlight && readReturnLegCancelled(item.metadata);
   // 套餐改档：换绑到另一张套餐（档次/晚数是 Bundle 自身的属性，改档=换 bundleId）。
   const isBundleRow = item.kind === 'BUNDLE' && Boolean(item.bundleId);
   // 升舱入口：只有**经济舱**机票行能一键升商务舱；套餐机票腿（带 bundleId）走套餐自身的升舱份数模型，后端也会拒。
@@ -6745,7 +6749,7 @@ function OrderItemRow({
           {item.amount != null && (
             <div className="nums text-sm font-medium text-ink">¥{Number(item.amount).toLocaleString()}</div>
           )}
-          {canOperate && isFlight && !rescheduling && !editingPrice && !upgradingCabin && (
+          {canOperate && isFlight && !returnLegCancelled && !rescheduling && !editingPrice && !upgradingCabin && (
             <button
               className="text-[11px] font-medium text-brand hover:text-brand-dark"
               onClick={() => setRescheduling(true)}
@@ -6753,7 +6757,7 @@ function OrderItemRow({
               改期
             </button>
           )}
-          {isReturnLeg && returnLegCancelled && (
+          {returnLegCancelled && (
             <span
               className="inline-flex items-center rounded border border-slate-300 bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-500"
               title="回程座位已放回库存重新销售，本单已改为单去程"
@@ -6770,7 +6774,7 @@ function OrderItemRow({
               取消回程（改单去程）
             </button>
           )}
-          {canOperate && canUpgradeCabin && !rescheduling && !editingPrice && !upgradingCabin && (
+          {canOperate && canUpgradeCabin && !returnLegCancelled && !rescheduling && !editingPrice && !upgradingCabin && (
             <button
               className="text-[11px] font-medium text-indigo-600 hover:text-indigo-800"
               onClick={() => setUpgradingCabin(true)}
@@ -6779,7 +6783,7 @@ function OrderItemRow({
               升舱
             </button>
           )}
-          {canEditPrice && !rescheduling && !editingPrice && (
+          {canEditPrice && !returnLegCancelled && !rescheduling && !editingPrice && (
             <>
               <button
                 className="text-[11px] font-medium text-amber-600 hover:text-amber-800 disabled:cursor-not-allowed disabled:text-slate-400"
@@ -8136,9 +8140,14 @@ function AdjustmentsSection({ order }: { order: OrderSummary }) {
                 {a.note && <div className="mt-0.5 text-xs text-ink-muted">{a.note}</div>}
                 <div className="mt-0.5 text-[11px] text-ink-muted">{formatDateTimeSecCn(a.at)}</div>
               </div>
-              <div className="nums text-sm font-medium text-amber-700">
-                {sign}¥{Math.abs(amountCny).toLocaleString()}
-              </div>
+              {amountCny === 0 ? (
+                // 留痕型条目（如取消回程：手续费已作为独立调价行计入应收，这里只记事件），不显示 +¥0 误导
+                <div className="text-[11px] text-ink-muted">金额见价格调整</div>
+              ) : (
+                <div className="nums text-sm font-medium text-amber-700">
+                  {sign}¥{Math.abs(amountCny).toLocaleString()}
+                </div>
+              )}
             </li>
           );
         })}
