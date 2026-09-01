@@ -4088,6 +4088,23 @@ export const api = {
     if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
     return res.blob();
   },
+  // 销售控位表导出（座位统计页 · 余位/上座率，0831 公测反馈按老系统样表）；ADMIN/STAFF only。
+  // GET /flights/schedules/export-seat-stats?from&to&flightNumber → xlsx Blob。
+  exportSeatStats: async (
+    token: string,
+    params?: { from?: string; to?: string; flightNumber?: string },
+  ): Promise<Blob> => {
+    const qs = new URLSearchParams();
+    if (params?.from) qs.set('from', params.from);
+    if (params?.to) qs.set('to', params.to);
+    if (params?.flightNumber) qs.set('flightNumber', params.flightNumber);
+    const suffix = qs.toString() ? `?${qs.toString()}` : '';
+    const res = await fetch(`${API_BASE}/flights/schedules/export-seat-stats${suffix}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
+    return res.blob();
+  },
   // 进单统计导出（公测反馈·票务）；ADMIN/STAFF only。
   // GET /orders/export/intake + listOrders 同款筛选（尤其 from/to 下单时间窗口，可带时间到分钟）。
   // 按「出发日期 × 产品/团期」聚合，返回 Blob 直接下载。

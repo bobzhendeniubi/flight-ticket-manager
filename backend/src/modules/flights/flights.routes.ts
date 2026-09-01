@@ -8,6 +8,11 @@ import {
 } from './flights.service.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import { actorFromRequest } from '../../lib/audit.js';
+import {
+  buildSeatStatsWorkbook,
+  scheduleToSeatStatsRow,
+  seatStatsExportFilename,
+} from './flights.export-seat-stats.js';
 import { ForbiddenError, UnauthorizedError } from '../../lib/errors.js';
 import { priceQuerySchema } from '../pricing/pricing.schemas.js';
 import {
@@ -134,6 +139,39 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
         .parse(req.query);
       const schedules = await service.listSchedulesInRange(q);
       return { schedules };
+    },
+  );
+
+  // ── 销售控位表导出（座位统计页 · 余位/上座率，0831 公测反馈按老系统样表）──
+  // GET /flights/schedules/export-seat-stats?from&to&flightNumber → xlsx
+  // 取数与上面 /schedules 完全同源（listSchedulesInRange），保证「导出=页面所见」；
+  // flightNumber 选填 = 页面上的航班筛选。权限与座位统计页一致：ADMIN/STAFF。
+  app.get(
+    '/schedules/export-seat-stats',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req, reply) => {
+      const q = z
+        .object({
+          from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, 'from 格式应为 YYYY-MM-DD').optional(),
+          to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, 'to 格式应为 YYYY-MM-DD').optional(),
+          flightNumber: z.string().trim().max(10).optional(),
+        })
+        .parse(req.query);
+      const schedules = await service.listSchedulesInRange({ from: q.from, to: q.to });
+      const rows = schedules
+        .filter((s) => !q.flightNumber || s.flightNumber === q.flightNumber)
+        .map(scheduleToSeatStatsRow);
+      const buf = await buildSeatStatsWorkbook(rows);
+      return reply
+        .header(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        .header(
+          'Content-Disposition',
+          `attachment; filename="${encodeURIComponent(seatStatsExportFilename(q.from, q.to))}"`,
+        )
+        .send(buf);
     },
   );
 

@@ -181,6 +181,33 @@ export function SeatStatsPage() {
     setTo(daysFromTodayStr(30));
   };
 
+  // 销售控位表导出（0831 公测反馈：余位/上座率要能导出发给航司/内部对表）。
+  // 后端与本页取数同源（listSchedulesInRange），筛选口径 = 页面当前航班 + 日期区间。
+  const [exporting, setExporting] = useState(false);
+  const handleExport = async () => {
+    if (!tokens?.accessToken) return;
+    setExporting(true);
+    try {
+      const blob = await api.exportSeatStats(tokens.accessToken, {
+        from: from || undefined,
+        to: to || undefined,
+        flightNumber: flightFilter || undefined,
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `销售控位表_${from || '全部'}_${to || from || '全部'}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      alert(err instanceof ApiError ? `导出失败：${err.message}` : '导出失败');
+    } finally {
+      setExporting(false);
+    }
+  };
+
   return (
     <div className="space-y-5">
       <section>
@@ -250,6 +277,15 @@ export function SeatStatsPage() {
             </button>
             <button type="button" className="btn-secondary text-sm" onClick={() => load()}>
               刷新
+            </button>
+            <button
+              type="button"
+              className="btn-primary text-sm"
+              disabled={loading || exporting}
+              onClick={() => void handleExport()}
+              title="按当前航班/日期筛选导出销售控位表（班期×航段，Y/C舱 机位/确定/预留/余位 + 客座率，对齐老系统样表）"
+            >
+              <Icon name="download" /> {exporting ? '导出中…' : '导出控位表'}
             </button>
           </div>
         </div>
