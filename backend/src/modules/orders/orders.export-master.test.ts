@@ -1167,3 +1167,68 @@ describe('filterExportOrdersByDepartDate（出发日精确细筛）', () => {
     expect(kept.map((o) => o.id)).toEqual(['d22']);
   });
 });
+
+// ── 签证状态按乘客（0901 运营反馈）────────────────────────────────────────────
+// 反馈原话：需要签证的单里，自备签的客人导出来也写「需要」，有一位已送签整单就都写
+// 已送签 —— 复查的同事没法从表上分辨谁办到哪一步。
+// 口径与《全岗可用》模板共用同一个纯函数（passengerVisaStatusCell），两张表不各写一份。
+describe('全岗总表 — 签证状态按乘客取值', () => {
+  /**
+   * 三人单（订单级「需要签证」）：
+   *   p1 自备签、p2 已送签（CONFIRMED）、p3 待处理（PENDING）。
+   */
+  function fixtureMixedVisa(): OrderForMasterExport {
+    const order = fixtureRoundTripBundle();
+    const o = order as unknown as {
+      visaStatus: string | null;
+      passengers: Array<Record<string, unknown>>;
+    };
+    o.visaStatus = 'NEEDED';
+    const [a, b] = o.passengers;
+    o.passengers = [
+      { ...a, visaExempt: true, visaSubmissionStatus: 'PENDING' },
+      { ...b, visaExempt: false, visaSubmissionStatus: 'CONFIRMED' },
+      { ...b, id: 'p3', fullName: '王五', chineseName: '王五', documentNumber: 'E11112222',
+        visaExempt: false, visaSubmissionStatus: 'PENDING' },
+    ];
+    return order;
+  }
+
+  it('需要签证的三人单：自备签 / 已送签 / 待处理 → 三行三个不同值', () => {
+    const order = fixtureMixedVisa();
+    const rows = orderToMasterRows(order);
+    expect(rows.map((r) => r.visaStatus)).toEqual(['自备签', '已送签', '需要']);
+  });
+
+  it('送签进度「材料准备」用签证台同一份文案', () => {
+    const order = fixtureMixedVisa();
+    (order.passengers[2] as unknown as { visaSubmissionStatus: string }).visaSubmissionStatus =
+      'IN_PROGRESS';
+    expect(orderToMasterRows(order)[2].visaStatus).toBe('材料准备');
+  });
+
+  it('订单级「不需要签证」→ 全员「不需要」，乘客级标记不盖过订单结论', () => {
+    const order = fixtureMixedVisa();
+    (order as unknown as { visaStatus: string }).visaStatus = 'NOT_NEEDED';
+    expect(orderToMasterRows(order).map((r) => r.visaStatus)).toEqual([
+      '不需要',
+      '不需要',
+      '不需要',
+    ]);
+  });
+
+  it('订单级「已签证」同样一票否决 → 全员「已签证」', () => {
+    const order = fixtureMixedVisa();
+    (order as unknown as { visaStatus: string }).visaStatus = 'HAS_VISA';
+    expect(orderToMasterRows(order).map((r) => r.visaStatus)).toEqual([
+      '已签证',
+      '已签证',
+      '已签证',
+    ]);
+  });
+
+  it('老数据（乘客无送签字段）→ 整列沿用订单级文案，与改动前一致', () => {
+    const order = fixtureRoundTripBundle(); // 乘客不带 visaExempt / visaSubmissionStatus
+    expect(orderToMasterRows(order).map((r) => r.visaStatus)).toEqual(['电子签', '电子签']);
+  });
+});

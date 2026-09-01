@@ -30,7 +30,12 @@ import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats
 import type { TripStatsMap } from './orders.export-trip-stats.js';
 import { toAlpha3 } from './nationality.js';
 import { parseRoomGroups, resolveExportHotelName } from './orders.export-room-allocation.js';
-import { nameWithTitle, pnrName, VISA_REQUIREMENT_LABEL } from './orders.export-templates.js';
+import {
+  nameWithTitle,
+  orderVisaStatusLabel,
+  passengerVisaStatusCell,
+  pnrName,
+} from './orders.export-templates.js';
 import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
 import { appendHoldOrderSheet, loadHoldExportRows } from './orders.export-hold-orders.js';
 import {
@@ -73,15 +78,8 @@ const COUNTED_STATUSES: OrderStatus[] = [
 // 读它会让「去程已开」等新状态在这张表上恒显示"未开"（P2-15a）。开票状态改由
 // orderToMasterRows 内联拼三布尔文案，与 orders.export-templates.ts 的 full 模板同口径。
 
-const FULFILLMENT_STATUS_LABEL: Record<string, string> = {
-  PENDING: '待处理',
-  IN_PROGRESS: '处理中',
-  CONFIRMED: '已确认',
-  CANCELLED: '已取消',
-  FAILED: '失败',
-};
-
-// 注：订单级签证状态标签表（VISA_REQUIREMENT_LABEL）与三模板导出共用，见 orders.export-templates.ts。
+// 注：签证状态（订单级文案 + 按乘客取值）整套口径与三模板导出共用，
+// 见 orders.export-templates.ts 的 orderVisaStatusLabel / passengerVisaStatusCell。
 
 const PASSENGER_TYPE_LABEL: Record<string, string> = {
   ADULT: '成人',
@@ -177,7 +175,7 @@ export interface MasterRow {
   singleRoomDiff: number; // 单房差（人均）
   visaAmount: number; // 签证金额（人均）
   visaSupplier: string; // 签证公司（供应商/代办渠道，多签证去重逗号拼接）— 财务对账用，缺失留空
-  visaStatus: string; // 签证状态（订单级 + 履约任务，取更具体者）
+  visaStatus: string; // 签证状态（按乘客：自备签 / 送签进度，回落订单级 + 履约任务）
   visaNote: string; // 签证备注 = [签证任务备注, 订单「签证情况」备注] 去空去重后 " / " 拼接（任务备注在前）
   invoiceStatus: string; // 开票状态：三布尔（去程/回程/系统）组合文案，'/' 连接；都未开 = "未开"
   settled: string; // 是否清账（结清）
@@ -464,17 +462,14 @@ export function orderToMasterRows(
     return s + bundleVisa;
   }, 0);
   const visaAmountOrder = visaAmountStandalone + visaAmountBundle;
-  // 状态：订单级签证状态优先，回落到任意订单行的签证履约任务。
+  // 状态：订单级文案（visaStatus 优先，缺省回落任意订单行的签证履约任务）在循环外算一次，
+  // 每行再按本乘客取值（自备签 / 送签进度）—— 见 passengerVisaStatusCell。
   // 不限 kind —— 套餐(BUNDLE)含签证时 VISA_APPLICATION 任务挂在 BUNDLE 行上（无独立 VISA 行），
   // 只从 VISA 行找会让套餐含签证单的签证状态漏显；跨全部行找可覆盖套餐单。
   const visaTask = order.items
     .flatMap((it) => it.fulfillmentTasks)
     .find((t) => t.type === 'VISA_APPLICATION');
-  const visaStatus = order.visaStatus
-    ? VISA_REQUIREMENT_LABEL[order.visaStatus] ?? order.visaStatus
-    : visaTask
-      ? FULFILLMENT_STATUS_LABEL[visaTask.status] ?? visaTask.status
-      : '';
+  const orderVisaLabel = orderVisaStatusLabel(order.visaStatus, visaTask?.status);
   // 签证备注（运营要求单列）：签证任务备注（签证台手填，如代办渠道/价格）在前，
   // 订单「签证情况」结构化备注（noteVisa）在后，去空去重后 " / " 拼接。两者常年被揉进
   // 通用「备注」列，导致签证相关信息淹没在其它岗位的备注里——单列后从 baseNotes 移除，避免重复。
@@ -596,7 +591,11 @@ export function orderToMasterRows(
       singleRoomDiff: round2(singleRoomDiffOrder / paxCount),
       visaAmount: round2(visaAmountOrder / paxCount),
       visaSupplier,
-      visaStatus,
+      visaStatus: passengerVisaStatusCell({
+        orderVisaStatus: order.visaStatus,
+        orderVisaLabel,
+        passenger: p,
+      }),
       visaNote,
       invoiceStatus,
       settled,

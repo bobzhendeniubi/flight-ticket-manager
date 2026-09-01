@@ -15,6 +15,8 @@ import { localDateISO } from '../../lib/flight-time.js';
 import { businessDateISO, businessDateTimeSec } from '../../lib/business-time.js';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderItemKind, OrderStatus } from '@prisma/client';
+import type { VisaRequirement } from '@prisma/client';
+import { orderVisaStatusExplicitlyNotNeeded } from './visa-need.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import type { BundleItemJson } from '../../lib/json-types.js';
 import { toAlpha3 } from './nationality.js';
@@ -87,6 +89,74 @@ export const VISA_REQUIREMENT_LABEL: Record<string, string> = {
   E_VISA: '电子签',
   HAS_VISA: '已签证',
 };
+
+/**
+ * 乘客级送签进度的中文文案（三档）——必须与签证台/订单列表子行完全一致
+ *（前端同名映射在 admin-web/src/lib/visaSubmission.ts）。改档位文案两处一起改，
+ * 否则同一位乘客在页面上是「材料准备」、导出表里是别的词，复查的同事没法对。
+ */
+const VISA_SUBMISSION_LABEL: Record<string, string> = {
+  PENDING: '待处理',
+  IN_PROGRESS: '材料准备',
+  CONFIRMED: '已送签',
+};
+
+/** 乘客级「自备签」的导出文案：客人自行办妥签证，不进送签名单。 */
+const VISA_EXEMPT_LABEL = '自备签';
+
+/**
+ * 订单级签证状态文案（现状口径）：录单时选的订单级 visaStatus 优先，
+ * 缺省时回落到任意订单行的 VISA_APPLICATION 履约任务状态。
+ *
+ * 不限 kind —— 套餐(BUNDLE)含签证时任务挂在 BUNDLE 行上（无独立 VISA 行），
+ * 只从 VISA 行找会让套餐含签证单的签证状态漏显。
+ *
+ * 这是**整单**的口径，导出表里每行是一位乘客，别直接往每行塞（见 passengerVisaStatusCell）。
+ */
+export function orderVisaStatusLabel(
+  visaStatus: string | null | undefined,
+  visaTaskStatus: string | null | undefined,
+): string {
+  if (visaStatus) return VISA_REQUIREMENT_LABEL[visaStatus] ?? visaStatus;
+  if (visaTaskStatus) return FULFILLMENT_STATUS_LABEL[visaTaskStatus] ?? visaTaskStatus;
+  return '';
+}
+
+/**
+ * 「签证状态」列的**按乘客**取值 —— 全岗总表与《全岗可用》共用的唯一口径。
+ *
+ * 为什么不能整单一个值（运营反馈）：一张需要签证的单里，自备签的客人导出来也写「需要」、
+ * 只要有一位已送签就整单都写成已送签，复查的同事没法从表上分辨谁办到哪一步。
+ *
+ * 判定顺序（先否决、再按人）：
+ *   1. 订单级明确「不需要办」（不需要签证 / 已签证）→ 全员沿用订单级文案。
+ *      这两档是录单人给出的结论，签证岗完全无事可做（口径同 orderVisaStatusExplicitlyNotNeeded），
+ *      此时乘客级的自备签标记与残留的送签进度都是噪音，不该盖过订单结论。
+ *   2. 该乘客 visaExempt=true → 「自备签」（不进送签名单，与签证台过滤同口径）。
+ *   3. 该乘客送签进度已推进（材料准备 / 已送签）→ 用签证台同一份文案。
+ *   4. 其余（待处理 / 老数据无该字段）→ 沿用订单级文案，与改动前完全一致。
+ */
+export function passengerVisaStatusCell(input: {
+  /** 订单级 visaStatus 原值（判断是否一票否决用）。*/
+  orderVisaStatus: string | null | undefined;
+  /** 订单级文案（由 orderVisaStatusLabel 在行循环外算好传入）。*/
+  orderVisaLabel: string;
+  passenger: { visaExempt?: boolean | null; visaSubmissionStatus?: string | null };
+}): string {
+  if (
+    orderVisaStatusExplicitlyNotNeeded(
+      (input.orderVisaStatus ?? null) as VisaRequirement | null,
+    )
+  ) {
+    return input.orderVisaLabel;
+  }
+  if (input.passenger.visaExempt === true) return VISA_EXEMPT_LABEL;
+  const submission = input.passenger.visaSubmissionStatus;
+  if (submission && submission !== 'PENDING') {
+    return VISA_SUBMISSION_LABEL[submission] ?? input.orderVisaLabel;
+  }
+  return input.orderVisaLabel;
+}
 
 // 注：《全岗可用》模版对齐旧系统口径 —— 乘客类型/性别/证件类型均按旧模版原样
 // 输出枚举/代码（ADULT、M、P），不译中文。
@@ -524,8 +594,10 @@ export function orderToFullRows(
   // 签证：金额合计 / 选项（产品名）/ 状态。
   // 套餐(BUNDLE)含签证时没有独立 VISA 行：签证履约任务挂在 BUNDLE 行上、签证组件名
   // 在套餐定义 items JSON 里 —— 只认 VISA 行会让套餐单的签证状态/选项整列空白
-  //（0720 公测反馈：导出缺签证信息）。选项补套餐签证组件名；任务跨全部行找；
-  // 状态优先订单级录单签证状态 —— 与全岗总表（orders.export-master.ts）同口径。
+  //（0720 公测反馈：导出缺签证信息）。选项补套餐签证组件名；任务跨全部行找。
+  // 状态是**按乘客**的（0901 运营反馈：整单一个值时自备签的客人也写「需要」、
+  // 一位已送签就整单写已送签）—— 订单级文案在循环外算好，逐行走 passengerVisaStatusCell，
+  // 与全岗总表（orders.export-master.ts）共用同一个函数。
   const visaItems = order.items.filter((it) => it.kind === 'VISA');
   const visaAmountOrder = visaItems.reduce((s, it) => s + dec(it.amount), 0);
   const bundleVisaNames = order.items.flatMap((it) => {
@@ -544,11 +616,7 @@ export function orderToFullRows(
   const visaTask = order.items
     .flatMap((it) => it.fulfillmentTasks)
     .find((t) => t.type === 'VISA_APPLICATION');
-  const visaStatus = order.visaStatus
-    ? VISA_REQUIREMENT_LABEL[order.visaStatus] ?? order.visaStatus
-    : visaTask
-      ? FULFILLMENT_STATUS_LABEL[visaTask.status] ?? visaTask.status
-      : '';
+  const orderVisaLabel = orderVisaStatusLabel(order.visaStatus, visaTask?.status);
 
   // 是否清账：已付 + 预付款抵扣 ≥ 应付（total + adjustmentCny），与上面 ctx.balancePerPax 同口径。
   // 不含 adjustmentCny 会出现"尾款>0 但已清账"的自相矛盾（P2-15b 连带修）；漏 prepaymentOffset
@@ -616,7 +684,11 @@ export function orderToFullRows(
     orderStatus: ORDER_STATUS_LABEL[order.status] ?? order.status,
     invoiceStatusSys,
     invoiceStatusManual,
-    visaStatus,
+    visaStatus: passengerVisaStatusCell({
+      orderVisaStatus: order.visaStatus,
+      orderVisaLabel,
+      passenger: p,
+    }),
     visaOption,
     visaSupplier: visaSupplierOf(order),
     visaNote: order.noteVisa ?? '',
