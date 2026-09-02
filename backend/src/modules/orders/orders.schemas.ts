@@ -695,10 +695,18 @@ export const listOrdersQuerySchema = z.object({
   //   NO_SHOW         去程标了 no-show，但回程没释放（单程单，或勾了不释放）
   //   RETURN_RELEASED 回程座位当前处于「已释放」态 —— 票务要盯的就是这一批（可恢复、可重卖）
   //   RETURN_RESTORED 释放过、已恢复回原班次
-  //   RETURN_VOIDED   释放后原班次已飞完、终局作废
+  //   RETURN_VOIDED   回程终局作废（释放后原班次已飞完，或走取消航段取消了回程）
+  //   OUTBOUND_VOIDED 去程终局作废（走取消航段取消了去程）
   //   NONE            没有任何此类留痕（绝大多数单）
   legFlag: z
-    .enum(['NONE', 'NO_SHOW', 'RETURN_RELEASED', 'RETURN_RESTORED', 'RETURN_VOIDED'])
+    .enum([
+      'NONE',
+      'NO_SHOW',
+      'RETURN_RELEASED',
+      'RETURN_RESTORED',
+      'RETURN_VOIDED',
+      'OUTBOUND_VOIDED',
+    ])
     .optional(),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(200).default(50),

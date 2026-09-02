@@ -262,6 +262,55 @@ describe('OrderService._updateStatusWithinTx · 非占座 → 占座 重新占�
     const qtysRequested = mockPrisma.$executeRaw.mock.calls.map((c) => c[1]);
     expect(qtysRequested).toEqual([1, 2]); // BUSINESS 拿升舱的 1 人，ECONOMY 拿剩下的 2 人
   });
+
+  it('已起飞的航段不重新占座（与放座分支严格对称）：去程已飞的取消单强制回拉 → 只 retake 回程', async () => {
+    // 最常见的走法：客人去程 no-show → 单被取消（去程已飞，放座分支跳过它，只放了回程）
+    // → 运营 force 拉回 PAID。若这里把去程也占回来，就是给一个飞过去的班次凭空加一份 sold，
+    // 此后没有任何路径会释放它（再落取消族仍被这道闸跳过），永久卡账。
+    const order = buildOrder({
+      status: OrderStatus.CANCELLED,
+      items: [
+        flightItem({
+          id: 'leg-out',
+          flightScheduleId: 'sched-out',
+          flightSchedule: { departureTime: new Date(Date.now() - 3 * 24 * 3600_000) },
+        }),
+        flightItem({
+          id: 'leg-ret',
+          flightScheduleId: 'sched-ret',
+          flightSchedule: { departureTime: new Date(Date.now() + 7 * 24 * 3600_000) },
+        }),
+      ],
+    });
+    mockPrisma.order.findUnique
+      .mockResolvedValueOnce(order)
+      .mockResolvedValueOnce({ visaStatus: null });
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.seatLock.aggregate.mockResolvedValue({ _sum: { qty: null } });
+    mockPrisma.$executeRaw.mockResolvedValue(1);
+    mockPrisma.orderItem.findMany.mockResolvedValueOnce([]);
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.PAID });
+
+    await service._updateStatusWithinTx(
+      tx,
+      'ord1',
+      OrderStatus.PAID,
+      adminRequester,
+      undefined,
+      [],
+      true, // force
+      [],
+    );
+
+    // 只占了回程那一段（去程被「已起飞」闸跳过）。
+    expect(mockPrisma.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.$executeRaw.mock.calls[0][2]).toBe('sched-ret');
+    const scheduleIdsLocked = mockPrisma.seatLock.aggregate.mock.calls.map(
+      (c) => c[0].where.seatClass.scheduleId,
+    );
+    expect(scheduleIdsLocked).toEqual(['sched-ret']);
+  });
 });
 
 describe('OrderService._updateStatusWithinTx · 既有释放/占座路径不受影响', () => {

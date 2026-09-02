@@ -53,6 +53,8 @@ type TxOverrides = {
   itemDescription?: string;
   itemBundleId?: string | null;
   itemMetadata?: Record<string, unknown> | null;
+  /** 该航段的出发时刻（默认 30 天后 = 还没飞）。 */
+  itemDepartureTime?: Date;
   upgradeCnyPerLeg?: number;
   /** 拿商务舱座的 CAS 是否成功（false = 余位不足） */
   businessSeatAvailable?: boolean;
@@ -96,6 +98,11 @@ function buildTx(o: TxOverrides = {}) {
         flightCabin: o.itemCabin === undefined ? 'ECONOMY' : o.itemCabin,
         bundleId: o.itemBundleId ?? null,
         metadata: o.itemMetadata ?? null,
+        // 升舱有「已起飞不许升舱」硬闸：默认给一个未来时刻，用例要测那道闸时传过去的时刻。
+        flightSchedule: {
+          departureTime: o.itemDepartureTime ?? new Date(Date.now() + 30 * 24 * 3600_000),
+          departureTz: 'Asia/Shanghai',
+        },
       }),
       update: vi.fn(),
       create: vi.fn().mockResolvedValue({ id: 'it-upgrade-1' }),
@@ -350,5 +357,30 @@ describe('OrderService.upgradeOrderItemCabin · 拒绝的入口（都不搬座�
       BadRequestError,
     );
     expect(tx.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('该段已标 no-show（客人未登机）→ 拒绝升舱，一座不动', async () => {
+    // no-show 的口径是钱与成本一分不动。给这一段升舱会真搬座位、真抬 total —— 客人没上飞机
+    // 却被收了升舱差价，与取消航段闸 11、改期同一道闸。
+    const tx = buildTx({ itemMetadata: { noShow: { at: new Date().toISOString() } } });
+    mountTx(tx);
+
+    await expect(service.upgradeOrderItemCabin('o1', 'it-1', {}, ADMIN)).rejects.toThrow(
+      /已标 no-show/,
+    );
+    expect(tx.$executeRaw).not.toHaveBeenCalled();
+    expect(tx.orderItem.create).not.toHaveBeenCalled();
+    expect(tx.order.update).not.toHaveBeenCalled();
+  });
+
+  it('该段已起飞 → 拒绝升舱（放旧座会让过去的班次凭空多出余位）', async () => {
+    const tx = buildTx({ itemDepartureTime: new Date(Date.now() - 3 * 24 * 3600_000) });
+    mountTx(tx);
+
+    await expect(service.upgradeOrderItemCabin('o1', 'it-1', {}, ADMIN)).rejects.toThrow(
+      /已起飞/,
+    );
+    expect(tx.$executeRaw).not.toHaveBeenCalled();
+    expect(tx.orderItem.create).not.toHaveBeenCalled();
   });
 });

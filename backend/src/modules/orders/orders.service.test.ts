@@ -3598,6 +3598,80 @@ describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
     expect(mockPrisma.flightSeatClass.findFirst).not.toHaveBeenCalled();
   });
 
+  it('该段已标 no-show（客人未登机）→ 拒绝改期，不搬座位', async () => {
+    // 与取消航段闸 11 对称：no-show 的口径是钱与成本一分不动。把这一段改期 = 把一次已经发生的
+    // 未登机搬到未来的班次上，座位真被搬走、快照还挂在同一行，之后恢复/取消/退款全对不上账。
+    const service = new OrderService();
+    // mockReset 而非 Once：本文件的 beforeEach 用 clearAllMocks，不清 mockResolvedValueOnce 队列，
+    // 前面用例排队没消费完的值会被这里先吃掉。
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue({
+      id: 'ord1',
+      status: 'PAID',
+      deletedAt: null,
+      adjustmentCny: 0,
+      adjustments: [],
+    });
+    mockPrisma.orderItem.findUnique.mockReset().mockResolvedValue({
+      id: 'it1',
+      orderId: 'ord1',
+      kind: 'FLIGHT',
+      quantity: 1,
+      bundleId: null,
+      flightScheduleId: 'sched1',
+      flightCabin: 'ECONOMY',
+      metadata: { noShow: { at: new Date().toISOString() } },
+      flightSchedule: {
+        departureTime: new Date(Date.now() + 30 * 24 * 3600_000),
+        departureTz: 'Asia/Shanghai',
+      },
+    });
+
+    await expect(
+      service.rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'it1', newScheduleId: 'sched2' },
+        { userId: 'admin1', role: 'ADMIN' },
+      ),
+    ).rejects.toThrow(/已标 no-show/);
+    expect(mockPrisma.flightSeatClass.findFirst).not.toHaveBeenCalled();
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('该段已起飞 → 拒绝改期（放旧座会让过去的班次凭空多出余位）', async () => {
+    const service = new OrderService();
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue({
+      id: 'ord1',
+      status: 'PAID',
+      deletedAt: null,
+      adjustmentCny: 0,
+      adjustments: [],
+    });
+    mockPrisma.orderItem.findUnique.mockReset().mockResolvedValue({
+      id: 'it1',
+      orderId: 'ord1',
+      kind: 'FLIGHT',
+      quantity: 1,
+      bundleId: null,
+      flightScheduleId: 'sched1',
+      flightCabin: 'ECONOMY',
+      metadata: {},
+      flightSchedule: {
+        departureTime: new Date(Date.now() - 3 * 24 * 3600_000),
+        departureTz: 'Asia/Shanghai',
+      },
+    });
+
+    await expect(
+      service.rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'it1', newScheduleId: 'sched2' },
+        { userId: 'admin1', role: 'ADMIN' },
+      ),
+    ).rejects.toThrow(/已起飞/);
+    expect(mockPrisma.flightSeatClass.findFirst).not.toHaveBeenCalled();
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+  });
+
   it('软删单（deletedAt 非空）→ 拒绝改期（400，提示先恢复）', async () => {
     const service = new OrderService();
     mockPrisma.order.findUnique.mockResolvedValueOnce({
@@ -3657,7 +3731,8 @@ describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
         flightScheduleId: 'same-schedule',
         flightCabin: 'ECONOMY',
         metadata: {},
-        flightSchedule: { departureTime: new Date('2026-08-30T01:00:00.000Z') },
+        // 相对「今天」取未来日期：改期有「已起飞不能改期」硬闸，写死日期会让用例随时间失效。
+        flightSchedule: { departureTime: new Date(Date.now() + 37 * 24 * 3600_000) },
       },
       {
         id: 'outbound-item',
@@ -3668,7 +3743,7 @@ describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
         flightScheduleId: 'same-schedule',
         flightCabin: 'ECONOMY',
         metadata: {},
-        flightSchedule: { departureTime: new Date('2026-08-25T01:00:00.000Z') },
+        flightSchedule: { departureTime: new Date(Date.now() + 30 * 24 * 3600_000) },
       },
     ];
     mockPrisma.order.findUnique.mockReset().mockResolvedValue({
@@ -3690,7 +3765,9 @@ describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
     mockPrisma.$executeRaw.mockReset().mockResolvedValue(1);
     mockPrisma.orderItem.update.mockReset().mockResolvedValue({});
     mockPrisma.order.update.mockReset().mockResolvedValue({});
-    mockPrisma.flightSchedule.findUnique.mockReset().mockResolvedValue({ departureTime: new Date('2026-08-30T01:00:00.000Z') });
+    mockPrisma.flightSchedule.findUnique
+      .mockReset()
+      .mockResolvedValue({ departureTime: new Date(Date.now() + 37 * 24 * 3600_000) });
     mockPrisma.order.findUniqueOrThrow.mockReset().mockResolvedValue(fakeFullOrder());
 
     await service.rescheduleOrderItem(
@@ -4020,8 +4097,10 @@ describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
 // 改期的票务语义：换班次 = 原票作废（清票号 + 翻回该航段开票位）+ 差价可负
 // ══════════════════════════════════════════════════════════════════════════
 describe('OrderService.rescheduleOrderItem · 换班次即作废原票', () => {
-  const OUT_ISO = '2026-09-01T01:00:00.000Z';
-  const RET_ISO = '2026-09-08T01:00:00.000Z';
+  // 相对「今天」取未来日期：改期端点有「已起飞的段不能改期」硬闸，写死的日期一过就会让整组
+  // 用例随时间失效（曾经就是这么烂掉的）。这里只关心「去程早于回程且都没飞」。
+  const OUT_ISO = new Date(Date.now() + 30 * 24 * 3600_000).toISOString();
+  const RET_ISO = new Date(Date.now() + 37 * 24 * 3600_000).toISOString();
 
   /** 一张往返单：outbound-item（去程）+ return-item（回程）。 */
   function mountRoundTrip(targetItemId: 'outbound-item' | 'return-item', opts: { adjustmentCny?: number } = {}) {

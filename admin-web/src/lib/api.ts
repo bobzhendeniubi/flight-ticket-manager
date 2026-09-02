@@ -1855,10 +1855,16 @@ export interface RefundQuote {
 }
 
 /**
- * 航段状态筛选值（no-show / 回程释放·恢复·作废）。与订单行 metadata 上的打标同源，
+ * 航段状态筛选值（no-show / 回程释放·恢复·作废 / 去程作废）。与订单行 metadata 上的打标同源，
  * 后端派生成订单级标记后收口筛选，前端不再在窗口内二次过滤。
+ * OUTBOUND_VOIDED / RETURN_VOIDED 各自只表示对应方向的作废或按取消政策取消。
  */
-export type OrderLegFlagFilter = 'NO_SHOW' | 'RETURN_RELEASED' | 'RETURN_RESTORED' | 'RETURN_VOIDED';
+export type OrderLegFlagFilter =
+  | 'NO_SHOW'
+  | 'RETURN_RELEASED'
+  | 'RETURN_RESTORED'
+  | 'RETURN_VOIDED'
+  | 'OUTBOUND_VOIDED';
 /** 订单级航段状态标记：NONE = 本单没有任何 no-show/回程释放打标。 */
 export type OrderLegFlag = 'NONE' | OrderLegFlagFilter;
 
@@ -3653,6 +3659,11 @@ export interface NoShowPreview {
    *  此时只要 blockers 为空即可提交，等价于一次「只释放回程」。 */
   alreadyNoShow: boolean;
   /**
+   * true = 本次是「只释放回程」：去程早已标过 no-show、当前回程还挂在班次上
+   * （首次处理时漏勾释放，或释放后又恢复回来）。面板据此收敛成去程只读 + 只释放回程。
+   */
+  isRerelease: boolean;
+  /**
    * true = 回程航班已经起飞：座位不可能再放回库存重新卖，勾「同时释放回程」会被 blocker 拒。
    * 此时只能单纯记录去程 no-show（取消勾选后即可提交）。
    */
@@ -3700,6 +3711,19 @@ export function splitDoneNoShowFailedOrderId(err: unknown): string | null {
   return typeof id === 'string' ? id : null;
 }
 
+/** 恢复回程的逐舱超售明细（before/after 为该舱超售座数，负数表示还有余位）。 */
+export interface OversellSeatDetail {
+  cabin: CabinClass;
+  /** 本次要占回该舱几座 */
+  quantity: number;
+  /** 占座**前**该舱超售几座（负数 = 还有余位） */
+  before: number;
+  /** 占座**后**该舱超售几座 */
+  after: number;
+  /** 本次**新增**的超售座数 = max(0, after) − max(0, before)，恒 ≥ 0 */
+  increment: number;
+}
+
 export interface RestoreReturnLegPreview {
   eligible: boolean;
   blockers: string[];
@@ -3717,8 +3741,12 @@ export interface RestoreReturnLegPreview {
   available: number;
   /** true = 余位不够，恢复要走超售确认 */
   needsOversell: boolean;
-  /** 需要超售的座位数（needsOversell=false 时为 0） */
+  /** 本次**新增**的超售座数（Σ 逐舱 increment）——「这一次会多卖几座」。needsOversell=false 时为 0 */
   oversellBy: number;
+  /** 恢复**之后**这些舱一共超出几座（Σ max(0, after)）。上限判定看的是它，不是本次新增 */
+  oversoldAfter: number;
+  /** 逐舱超售三值：多舱（升舱拆座）时逐舱展示，别把几个舱的数字揉成一个总数 */
+  oversellDetail: OversellSeatDetail[];
   /** 系统允许的超售上限（超过它后端也会拒） */
   maxOversell: number;
   /** true = 原班次已起飞（不可恢复） */
@@ -3751,6 +3779,16 @@ export const OVERSELL_CONFIRMATION_REQUIRED_CODE = 'OVERSELL_CONFIRMATION_REQUIR
  * 与 OVERSELL_CONFIRMATION_REQUIRED 不同：这条不是二次确认能过的，属于硬阻断。
  */
 export const OVERSELL_LIMIT_EXCEEDED_CODE = 'OVERSELL_LIMIT_EXCEEDED';
+
+/**
+ * 同一个 requestToken 换了参数重提时后端拒绝的稳定 code（409）。
+ * 幂等键与首次提交的入参绑定：换了参数就不是同一次操作，回放旧结果会写错东西。
+ * 前端处理 = 提示 + 换一个新 token + 按当前参数重新预检，别拿旧判定继续提交。
+ */
+export const TOKEN_PAYLOAD_MISMATCH_CODE = 'TOKEN_PAYLOAD_MISMATCH';
+
+/** TOKEN_PAYLOAD_MISMATCH 的统一提示语（三个提交点共用，口径不分叉）。 */
+export const TOKEN_PAYLOAD_MISMATCH_HINT = '这个请求编号已用于另一次操作，请刷新后重试。';
 
 export const api = {
   login: (email: string, password: string) =>

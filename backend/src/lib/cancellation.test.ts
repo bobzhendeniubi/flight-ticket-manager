@@ -621,8 +621,11 @@ describe('quoteCancellationForItem — 已释放航段不参与退款', () => {
     expect(q.feePercent).toBe(100);
     expect(q.refundAmount).toBe(0);
     expect(q.feeAmount).toBe(5_000);
-    expect(q.policyName).toBe('（该航段已释放/已作废）');
-    expect(q.reason).toBe('该航段座位已释放回库存重新销售，不参与退款');
+    expect(q.policyName).toBe('（该航段不在本单行程内）');
+    // 对外中性文案：报价单是给代理/客户看的，不露我方内部怎么处置的座位。
+    expect(q.reason).toBe('该航段已不在本单行程内，不参与退款');
+    // 行描述上的内部留痕前缀（[回程已释放]）同样剥掉。
+    expect(q.description).toBe('HKG → PVG');
     expect(q.policyId).toBeNull();
   });
 
@@ -638,7 +641,7 @@ describe('quoteCancellationForItem — 已释放航段不参与退款', () => {
     expect(q.matchedTier).toBeNull();
   });
 
-  it('已作废航段（金额归零 + returnLegCancelled 快照）：文案区分于"已释放"', async () => {
+  it('已作废航段（金额归零 + returnLegCancelled 快照）：同样 0 退、同一条中性文案', async () => {
     const q = await quoteCancellationForItem(
       flightItem({
         scheduleId: null,
@@ -650,7 +653,36 @@ describe('quoteCancellationForItem — 已释放航段不参与退款', () => {
     );
     expect(q.refundAmount).toBe(0);
     expect(q.feeAmount).toBe(0);
-    expect(q.reason).toBe('该航段已释放/已作废（无有效班次），不参与退款');
+    expect(q.reason).toBe('该航段已不在本单行程内，不参与退款');
+  });
+
+  it('天生就没绑班次的 FLIGHT 行（无任何释放/作废留痕）→ 不进 0 退分支，按最严档兜底', async () => {
+    // 手工补录 / 导入的历史单常见：机票行没有班次。把它们一并判成「已释放/已作废、0 退」，
+    // 等于客人交的钱一分不退，且报价上写着查无实据的理由。这类行维持本分支加进来之前的行为：
+    // hoursLeft=null → 「无出发时间取最严档」，LOOSE_FLIGHT_POLICY 最严档 50% → 退一半。
+    const q = await quoteCancellationForItem(
+      flightItem({ scheduleId: null, metadata: null, amount: 8_000 }),
+      new Date('2026-09-02T04:00:00.000Z'),
+      fakeDb([LOOSE_FLIGHT_POLICY]),
+    );
+    expect(q.feePercent).toBe(50);
+    expect(q.refundAmount).toBe(4_000);
+    expect(q.policyId).toBe(LOOSE_FLIGHT_POLICY.id);
+  });
+
+  it('已作废（起飞后 returnVoidedFinal）同样进 0 退分支', async () => {
+    const q = await quoteCancellationForItem(
+      flightItem({
+        scheduleId: null,
+        amount: 5_000,
+        metadata: { returnVoidedFinal: { at: '2026-09-10T00:00:00.000Z' } },
+      }),
+      new Date('2026-09-02T04:00:00.000Z'),
+      fakeDb([LOOSE_FLIGHT_POLICY]),
+    );
+    expect(q.refundAmount).toBe(0);
+    expect(q.feePercent).toBe(100);
+    expect(q.reason).toBe('该航段已不在本单行程内，不参与退款');
   });
 
   it('已恢复回程（班次写回）不受影响：照常走时间档', async () => {

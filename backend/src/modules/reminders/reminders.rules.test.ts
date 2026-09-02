@@ -934,6 +934,23 @@ describe('generateRuleReminders — 规则 11 单独取数，不动其它规则�
     expect(orderArgs.select.items.select).not.toHaveProperty('metadata');
   });
 
+  it('扫单状态含 PENDING_PAYMENT：尾款没收齐、人又没登机的单最该跟进，不能漏', async () => {
+    const { mock, raw } = makePrisma();
+    await generateRuleReminders(mock, 'user_sys', NOW);
+    // 规则 11 的取数是「flightScheduleId === null」那一支。
+    const releasedCall = raw.orderItem.findMany.mock.calls.find(
+      (c: unknown[]) =>
+        (c[0] as { where?: { flightScheduleId?: unknown } }).where?.flightScheduleId === null,
+    ) as [{ where: { order: { status: { in: string[] } } } }];
+    const statuses = releasedCall[0].where.order.status.in;
+    // no-show 与释放回程都不看订单收没收钱（本操作一分不动），故未付款单同样会出现在这一批里。
+    expect(statuses).toContain('PENDING_PAYMENT');
+    // 取消 / 退款 / 失败族仍然排除（那些单的座位早已按别的口径处置过）。
+    for (const excluded of ['CANCELLED', 'REFUNDED', 'PAYMENT_TIMEOUT', 'FAILED']) {
+      expect(statuses).not.toContain(excluded);
+    }
+  });
+
   it('第二遍全部 skipped（ruleKey 幂等）', async () => {
     const { mock } = makePrisma();
     await generateRuleReminders(mock, 'user_sys', NOW);

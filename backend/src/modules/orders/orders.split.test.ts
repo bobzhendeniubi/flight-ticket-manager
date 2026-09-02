@@ -252,6 +252,51 @@ describe('拆单 · 准入闸矩阵（preview 返回人话 blocker）', () => {
     expect(r.blockers.join()).toContain('升舱');
   });
 
+  it('回程座位当前处于「已释放」态 → 拒拆（释放快照与两侧人数必然对不上）', async () => {
+    const releasedAt = new Date().toISOString();
+    const r = await previewWith({
+      items: [
+        flightItem(),
+        flightItem({
+          id: 'i-ret',
+          description: '【回程座位已释放】测试机票 回程',
+          // 释放态的三要素：FLIGHT + 班次为空 + returnReleased 晚于最近一次恢复。
+          flightScheduleId: null,
+          metadata: {
+            returnReleased: {
+              at: releasedAt,
+              releasedSeats: [{ scheduleId: 'sch1', cabin: 'ECONOMY', quantity: 2 }],
+            },
+          },
+        }),
+      ],
+    });
+    expect(r.eligible).toBe(false);
+    expect(r.blockers.join()).toContain('已释放');
+    expect(r.blockers.join()).toContain('恢复回程');
+  });
+
+  it('释放过、但已经恢复回来 → 不拦（快照还在，状态却已不是已释放）', async () => {
+    const releasedAt = '2026-09-01T00:00:00.000Z';
+    const restoredAt = '2026-09-02T00:00:00.000Z';
+    const r = await previewWith({
+      items: [
+        flightItem(),
+        flightItem({
+          id: 'i-ret',
+          description: '测试机票 回程',
+          flightScheduleId: 'sch2',
+          metadata: {
+            returnReleased: { at: releasedAt },
+            returnRestored: { at: restoredAt },
+          },
+        }),
+      ],
+    });
+    expect(r.eligible).toBe(true);
+    expect(r.blockers).toEqual([]);
+  });
+
   it('乘客已有 PNR/票号（闸 12 已放开）→ eligible，提示票随人走', async () => {
     const r = await previewWith({
       passengers: [pax('p1', { pnr: 'ABC123', eticketNumber: '999-1234567890' }), pax('p2')],

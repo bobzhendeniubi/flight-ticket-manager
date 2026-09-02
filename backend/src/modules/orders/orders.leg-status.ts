@@ -15,8 +15,65 @@
  * 避免同一个状态在四个地方各写一套判断然后慢慢漂移。
  */
 
-/** 航段状态四态（导出列直接落这些中文值；无状态 = 空串）。 */
-export type LegStatus = '去程未登机' | '回程座位已释放' | '回程已恢复' | '回程已作废';
+/** 航段状态五态（导出列直接落这些中文值；无状态 = 空串）。 */
+export type LegStatus =
+  | '去程未登机'
+  | '回程座位已释放'
+  | '回程已恢复'
+  | '回程已作废'
+  | '去程已作废';
+
+// ── 内部留痕前缀（唯一定义处）────────────────────────────────────────────────
+//
+// 这些前缀是**内部岗位的操作留痕**，写在 OrderItem.description 上给内部一眼看清这段的状态。
+// 代理与客户不该看到我们内部怎么标，对外一律剥掉（见 stripInternalLegPrefix）。
+//
+// 常量与剥前缀函数放在本文件（而不是 orders.service）：退款报价引擎 lib/cancellation.ts 也要剥，
+// 而 lib 层 import service 会形成 lib → service 的反向依赖。本文件零依赖，两边都能安全 import。
+
+/** 被标 no-show 的去程行前缀。 */
+export const NO_SHOW_PREFIX = '【去程未登机】';
+/** 被 no-show 释放座位的回程行前缀。 */
+export const RETURN_RELEASED_PREFIX = '【回程座位已释放】';
+/** 取消航段（去程）的行前缀。 */
+export const LEG_CANCELLED_OUTBOUND_PREFIX = '【已取消去程】';
+/** 取消航段（回程）的行前缀。 */
+export const LEG_CANCELLED_RETURN_PREFIX = '【已取消回程】';
+/** 半角旧写法（只用于剥前缀，让存量行也剥得干净；新数据一律用全角写法）。 */
+export const LEGACY_NO_SHOW_PREFIX = '[去程 no-show] ';
+/** 半角旧写法（同上）。 */
+export const LEGACY_RETURN_RELEASED_PREFIX = '[回程已释放] ';
+
+/** 内部留痕前缀全集（no-show / 释放 / 取消航段，含两种半角旧写法）。 */
+export const INTERNAL_LEG_PREFIXES: readonly string[] = [
+  NO_SHOW_PREFIX,
+  RETURN_RELEASED_PREFIX,
+  LEG_CANCELLED_OUTBOUND_PREFIX,
+  LEG_CANCELLED_RETURN_PREFIX,
+  LEGACY_NO_SHOW_PREFIX,
+  LEGACY_RETURN_RELEASED_PREFIX,
+];
+
+/**
+ * 剥掉行描述上的内部留痕前缀（可能叠加过多次，循环剥到干净）。
+ * ADMIN/STAFF 视角保留前缀（内部要一眼看出这段的状态）；AGENT/CUSTOMER 视角与退款报价一律剥。
+ */
+export function stripInternalLegPrefix(description: string): string {
+  if (typeof description !== 'string' || description === '') return description;
+  let out = description;
+  let matched = true;
+  while (matched) {
+    matched = false;
+    for (const prefix of INTERNAL_LEG_PREFIXES) {
+      if (out.startsWith(prefix)) {
+        out = out.slice(prefix.length);
+        matched = true;
+        break;
+      }
+    }
+  }
+  return out;
+}
 
 /** 派生所需的最小行形状（导出侧的 select 只要带上这三样即可）。 */
 export interface LegStatusItemLike {
@@ -79,16 +136,33 @@ export function restoredOversoldSeats(item: LegStatusItemLike): number {
 }
 
 /**
+ * 该行是否被打了「去程未登机」标（metadata.noShow 存在即为真）。
+ *
+ * 形状不符（null / 非对象 / 数组）一律按未打标处理 —— 快照是历史数据，读侧不许因脏 JSON 抛错。
+ * 打标不动 flightScheduleId（那趟航班真飞了），所以光看班次判断不出客人到底上没上飞机。
+ * 旅客档案的飞行次数（travelers/traveler-trip-count.ts）与本文件的状态派生共用这一份判据。
+ */
+export function hasNoShowMark(metadata: unknown): boolean {
+  return readObject(metadata).noShow != null;
+}
+
+/**
  * 单行航段状态（无任何痕迹 → null）。
  *
  * 优先级：作废 > 当前已释放 > 已恢复 > 去程未登机。
- * 「回程已作废」既包含起飞后自动作废（returnVoidedFinal），也包含取消航段
+ * 「作废」既包含起飞后自动作废（returnVoidedFinal，只发生在回程），也包含取消航段
  * （returnLegCancelled，金额已归零）—— 对运营是同一件事：这段没了。
+ * 取消航段**去程/回程都能取消**，故按快照里的 leg 分成「去程已作废」「回程已作废」两态：
+ * 一律写成「回程已作废」会让取消了去程的单在列表/导出里显示成回程没了，方向正好反。
  */
 export function deriveLegStatus(item: LegStatusItemLike): LegStatus | null {
   if (item.kind !== 'FLIGHT') return null;
   const meta = readObject(item.metadata);
-  if (meta.returnVoidedFinal != null || meta.returnLegCancelled != null) return '回程已作废';
+  if (meta.returnVoidedFinal != null) return '回程已作废';
+  if (meta.returnLegCancelled != null) {
+    // 快照缺 leg（早期数据）时按回程处理：取消航段功能上线初期只做过回程。
+    return readObject(meta.returnLegCancelled).leg === 'OUTBOUND' ? '去程已作废' : '回程已作废';
+  }
   if (isReturnCurrentlyReleased(item)) return '回程座位已释放';
   if (snapshotAt(meta.returnRestored) != null) return '回程已恢复';
   if (meta.noShow != null) return '去程未登机';

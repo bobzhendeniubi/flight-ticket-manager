@@ -72,8 +72,13 @@ const PASSPORT_ACTIVE_STATUSES: OrderStatus[] = [
 /**
  * 规则 11 回程已释放：去程飞过之后订单常常已经 COMPLETED，不能沿用 SCAN_STATUSES
  *（那套排除 COMPLETED），否则最该跟进的单反而扫不到。只排掉取消/退款/失败族。
+ *
+ * PENDING_PAYMENT 也在内：no-show 与释放回程都**不看订单收没收钱**（那几把闸管的是会改应收的
+ * 动作，本操作一分钱不动），所以尾款未清的单照样能被释放回程 —— 它同样是一批已经放回库存、
+ * 等着票务重卖的座位。漏掉它，最该跟进的那类单（钱没收齐、人又没登机）反而扫不到。
  */
 const RETURN_RELEASED_STATUSES: OrderStatus[] = [
+  OrderStatus.PENDING_PAYMENT,
   OrderStatus.PAID,
   OrderStatus.PROCESSING,
   OrderStatus.TICKETED,

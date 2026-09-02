@@ -9,8 +9,10 @@ import {
   deriveLegStatus,
   formatLegStatus,
   formatOrderLegStatus,
+  hasNoShowMark,
   isReturnCurrentlyReleased,
   restoredOversoldSeats,
+  stripInternalLegPrefix,
 } from './orders.leg-status.js';
 
 const RELEASED_AT = '2026-09-02T03:15:23.000Z';
@@ -159,8 +161,38 @@ describe('deriveLegStatus / formatLegStatus — 四态', () => {
         }),
       ),
     ).toBe('回程已作废');
+    // 快照没记 leg（取消航段刚上线时的早期数据）→ 按回程处理，与那阵子只做回程的事实一致。
     expect(
       formatLegStatus(flight(null, { returnLegCancelled: { at: '2026-08-30T00:00:00.000Z' } })),
+    ).toBe('回程已作废');
+    expect(
+      formatLegStatus(
+        flight(null, { returnLegCancelled: { at: '2026-08-30T00:00:00.000Z', leg: 'RETURN' } }),
+      ),
+    ).toBe('回程已作废');
+  });
+
+  it('取消的是**去程** → 「去程已作废」（一律写成回程会把方向说反）', () => {
+    expect(
+      deriveLegStatus(
+        flight(null, { returnLegCancelled: { at: '2026-08-30T00:00:00.000Z', leg: 'OUTBOUND' } }),
+      ),
+    ).toBe('去程已作废');
+    expect(
+      formatLegStatus(
+        flight(null, { returnLegCancelled: { at: '2026-08-30T00:00:00.000Z', leg: 'OUTBOUND' } }),
+      ),
+    ).toBe('去程已作废');
+  });
+
+  it('起飞后作废（returnVoidedFinal）只发生在回程：即便同行还挂着去程取消快照也判回程作废', () => {
+    expect(
+      deriveLegStatus(
+        flight(null, {
+          returnVoidedFinal: { at: '2026-09-03T00:00:00.000Z' },
+          returnLegCancelled: { at: '2026-08-30T00:00:00.000Z', leg: 'OUTBOUND' },
+        }),
+      ),
     ).toBe('回程已作废');
   });
 
@@ -189,5 +221,34 @@ describe('formatOrderLegStatus — 整单合并成一格', () => {
       ]),
     ).toBe('去程未登机');
     expect(formatOrderLegStatus([flight('sch-1', null), flight('sch-2', null)])).toBe('');
+  });
+});
+
+describe('hasNoShowMark — 与飞行次数共用的「未登机」判据', () => {
+  it('metadata.noShow 存在即为真；脏 JSON 一律按未打标，绝不抛错', () => {
+    expect(hasNoShowMark({ noShow: { at: RELEASED_AT } })).toBe(true);
+    expect(hasNoShowMark({ noShow: {} })).toBe(true);
+    expect(hasNoShowMark({})).toBe(false);
+    expect(hasNoShowMark(null)).toBe(false);
+    expect(hasNoShowMark(undefined)).toBe(false);
+    expect(hasNoShowMark('not-an-object')).toBe(false);
+    expect(hasNoShowMark([{ noShow: { at: RELEASED_AT } }])).toBe(false);
+  });
+});
+
+describe('stripInternalLegPrefix — 对外一律剥净', () => {
+  it('六种前缀（含两种半角旧写法）逐一剥掉', () => {
+    expect(stripInternalLegPrefix('【去程未登机】CA123')).toBe('CA123');
+    expect(stripInternalLegPrefix('【回程座位已释放】CA124')).toBe('CA124');
+    expect(stripInternalLegPrefix('【已取消去程】CA125')).toBe('CA125');
+    expect(stripInternalLegPrefix('【已取消回程】CA126')).toBe('CA126');
+    expect(stripInternalLegPrefix('[去程 no-show] CA127')).toBe('CA127');
+    expect(stripInternalLegPrefix('[回程已释放] CA128')).toBe('CA128');
+  });
+
+  it('叠加多层（先释放后取消的脏数据）一路剥到干净；无前缀原样返回', () => {
+    expect(stripInternalLegPrefix('【已取消回程】【回程座位已释放】CA129')).toBe('CA129');
+    expect(stripInternalLegPrefix('CA130')).toBe('CA130');
+    expect(stripInternalLegPrefix('')).toBe('');
   });
 });

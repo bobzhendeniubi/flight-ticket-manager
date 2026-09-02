@@ -18,7 +18,10 @@
  */
 import { type FulfillmentStatus, type FulfillmentTask, type Order, type OrderItem, type Prisma } from '@prisma/client';
 import { prisma } from '../db/prisma.js';
-import { isReturnCurrentlyReleased } from '../modules/orders/orders.leg-status.js';
+import {
+  isReturnCurrentlyReleased,
+  stripInternalLegPrefix,
+} from '../modules/orders/orders.leg-status.js';
 
 export interface CancellationTier {
   hoursBeforeDeparture: number; // -1 = 已履约
@@ -337,6 +340,10 @@ export async function quoteCancellationForItem(
 }
 
 // ── 单个 item 的费率计算 ─────────────────────────────────────
+//
+// ⚠ 行 description 一律走 stripInternalLegPrefix：退款报价是**直接给代理/客户看的单据**
+//（前台退款页与订单详情的退款卡片都渲染它），内部岗位的操作留痕前缀（【去程未登机】/
+//【回程座位已释放】/【已取消去程】…）不该出现在上面 —— 口径同 serializeOrder 的对外脱敏分支。
 async function quoteItem(
   item: OrderItem & {
     flightSchedule: { departureTime: Date } | null;
@@ -348,27 +355,39 @@ async function quoteItem(
   const amount = Number(item.amount);
 
   // ── 已释放 / 已作废的航段行：一律 0 退款，**显式分支，绝不靠兜底** ────────────────
-  // 座位已经放回库存重新卖掉了（回程 no-show 释放）或整段已作废（取消航段，金额已归零），
-  // 这份收入不能再退给客户第二次。
+  // 座位已经放回库存重新卖掉了（回程 no-show 释放）或整段已作废（取消航段 / 起飞后作废，
+  // 金额已归零），这份收入不能再退给客户第二次。
   // 不能指望 hoursLeft === null 落进「无出发时间取最严档」的兜底：那条路取的是
   // policy.tiers 里 feePercent 最大的一档，默认 FLIGHT 政策把最严档配成 50% 时，
   // 一个座位已被重卖的航段会退掉一半钱。
-  if (item.kind === 'FLIGHT' && item.flightScheduleId === null) {
+  //
+  // ⚠ 判据必须是「有释放/作废留痕」，**不能只看 flightScheduleId 为空**：
+  // 天生就没绑班次的 FLIGHT 行（手工补录、地面段占位、导入的历史单）也满足 flightScheduleId===null，
+  // 把它们一并判成 0 退 = 客人交的钱一分不退，且报价上写着「已释放/已作废」这种查无实据的理由。
+  // 那类行维持本分支加进来之前的行为：往下走费率引擎，按「无出发时间取最严档」处理。
+  const legMeta =
+    item.metadata != null && typeof item.metadata === 'object' && !Array.isArray(item.metadata)
+      ? (item.metadata as Record<string, unknown>)
+      : {};
+  const legVoided = legMeta.returnLegCancelled != null || legMeta.returnVoidedFinal != null;
+  if (item.kind === 'FLIGHT' && item.flightScheduleId === null &&
+      (isReturnCurrentlyReleased(item) || legVoided)) {
     return {
       itemId: item.id,
       kind: item.kind,
-      description: item.description,
+      // 对外报价里不露内部留痕前缀（【回程座位已释放】/【已取消去程】…）——
+      // 退款报价是直接给代理/客户看的单据，内部岗位怎么标不该出现在上面。
+      description: stripInternalLegPrefix(item.description),
       amount,
       hoursLeft: null,
       policyId: null,
-      policyName: '（该航段已释放/已作废）',
+      policyName: '（该航段不在本单行程内）',
       matchedTier: null,
       feePercent: 100,
       feeAmount: round2(Math.max(0, amount)),
       refundAmount: 0,
-      reason: isReturnCurrentlyReleased(item)
-        ? '该航段座位已释放回库存重新销售，不参与退款'
-        : '该航段已释放/已作废（无有效班次），不参与退款',
+      // 对外中性文案：客户看到的是「这段已经不在你的行程里了」，不是我方内部怎么处置的座位。
+      reason: '该航段已不在本单行程内，不参与退款',
       fulfilled: item.fulfillmentTasks.some(
         (t) => t.status === ('CONFIRMED' as FulfillmentStatus),
       ),
@@ -382,7 +401,7 @@ async function quoteItem(
     return {
       itemId: item.id,
       kind: item.kind,
-      description: item.description,
+      description: stripInternalLegPrefix(item.description),
       amount,
       hoursLeft: null,
       policyId: null,
@@ -430,7 +449,7 @@ async function quoteItem(
     return {
       itemId: item.id,
       kind: item.kind,
-      description: item.description,
+      description: stripInternalLegPrefix(item.description),
       amount,
       hoursLeft,
       policyId: null,
@@ -476,7 +495,7 @@ async function quoteItem(
   return {
     itemId: item.id,
     kind: item.kind,
-    description: item.description,
+    description: stripInternalLegPrefix(item.description),
     amount,
     hoursLeft,
     policyId: policy.id,

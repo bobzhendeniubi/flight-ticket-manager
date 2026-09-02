@@ -44,7 +44,11 @@ import { markOverdueHolds } from '../modules/hold-orders/hold-overdue.js';
  * 抽成独立函数（而不是内联在 seatHoldWorker 的匿名回调里）供单测直接驱动——BullMQ 的
  * `new Worker(name, processor, opts)` 的 processor 是匿名回调，不好单独调用/断言。
  *
- * 与状态机释放分支（orders.service.ts `_updateStatusWithinTx` 的 releaseSeat）同一口径：
+ * 与状态机释放分支（orders.service.ts `_updateStatusWithinTx` 的 releaseSeat）共用**拆座**与
+ * **下限**两条口径（见下面两点），但**不含**它的「已起飞航段不放座」判定（isLegAlreadyFlown）——
+ * 本函数只处理 30 分钟未付款的占座单，且入参 items 压根没联查 flightSchedule.departureTime，
+ * 判不了起飞与否。日后若要对齐，得先把班次时间查进来再加判定。
+ * 两条共用的口径：
  *   - 按 item.metadata.businessUpgradeCount 拆分 BUSINESS/原舱位分别释放——旧版这里是扁平
  *     `sold - quantity` 只退原舱位，套餐升舱订单超时会漏退 BUSINESS、多退 ECONOMY（净释放量算
  *     对了但退错了舱，两边台账都不诚实）。

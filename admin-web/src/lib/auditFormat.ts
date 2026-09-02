@@ -4,6 +4,11 @@
  * 后端记录的是结构化数据（action 是 SCREAMING_SNAKE，before/after 是任意 JSON），
  * 前端这层负责翻译。新增 action 时只需在 ACTION_DICT 加一行；
  * 新增 payload 字段在 FIELD_DICT 加一行。
+ *
+ * FIELD_DICT 是**全局**字典：note / quantity / leg 这类通用键会命中所有 action，
+ * 所以它里面只放放之四海皆准的中性译名。某个 action 下要更精确的说法（如恢复回程的
+ * quantity 其实是「座数」）走 ACTION_FIELD_DICT 按 action 覆盖，别去改全局条目
+ * ——把全局 quantity 改成「座数」会误伤酒店间数、行项数量这些同名字段。
  */
 
 import type { IconName } from '../components/Icon';
@@ -141,7 +146,8 @@ const FIELD_DICT: Record<string, string> = {
   confirmedAmountCny: '确认金额',
   receivedAmount: '实收金额',
   // ── no-show / 航段取消 / 恢复回程 ──
-  leg: '航段方向',
+  // 通用键（leg / quantity / note / source）在这里只给中性译名，精确说法见 ACTION_FIELD_DICT。
+  leg: '航段',
   outboundItemId: '去程行 ID',
   returnItemId: '航段行 ID',
   releasedSeats: '释放座位',
@@ -157,6 +163,7 @@ const FIELD_DICT: Record<string, string> = {
   oversoldBy: '超售座位数',
   maxOversell: '超售上限',
   quantity: '数量',
+  source: '来源',
   acknowledgedWarnings: '已确认警告',
   feeMode: '手续费模式',
   policyName: '退订政策',
@@ -166,6 +173,49 @@ const FIELD_DICT: Record<string, string> = {
   totalCny: '订单总额',
   overpayAfterCny: '取消后多收额',
 };
+
+/**
+ * 按 action 覆盖的字段标签：只在这些 action 的 payload 里生效，命中不到就回落 FIELD_DICT。
+ * 存在的意义是让通用键（leg/quantity/note/source）在 no-show 与航段取消这条链路上说人话，
+ * 同时不污染其它 action 对同名键的语义。
+ */
+const ACTION_FIELD_DICT: Record<string, Record<string, string>> = {
+  MARK_NO_SHOW: {
+    leg: '航段方向',
+    quantity: '座数',
+    note: '处理备注',
+    source: '标记来源',
+  },
+  RESTORE_RETURN_LEG: {
+    leg: '航段方向',
+    quantity: '恢复座数',
+    note: '处理备注',
+  },
+  RESTORE_RETURN_LEG_OVERSOLD: {
+    leg: '航段方向',
+    quantity: '恢复座数',
+    note: '处理备注',
+  },
+  CANCEL_RETURN_LEG: {
+    leg: '航段方向',
+    quantity: '座数',
+    note: '处理备注',
+  },
+  CANCEL_OUTBOUND_LEG: {
+    leg: '航段方向',
+    quantity: '座数',
+    note: '处理备注',
+  },
+};
+
+/** 字段标签查找：action 覆盖 > 全局字典 > 原样键名。 */
+function fieldLabel(key: string, action?: string): string {
+  if (action) {
+    const scoped = ACTION_FIELD_DICT[action]?.[key];
+    if (scoped) return scoped;
+  }
+  return FIELD_DICT[key] ?? key;
+}
 
 /** OrderStatus / SettlementStatus / 其他后端枚举 → 中文 */
 const ENUM_DICT: Record<string, string> = {
@@ -217,6 +267,17 @@ const ENUM_DICT: Record<string, string> = {
   MANUAL: '手工覆盖',
 };
 
+/**
+ * 按**字段名**覆盖的枚举译名：同一个枚举值在不同字段下不是一个意思。
+ * 典型是 MANUAL——在 feeMode 上是「手工覆盖（政策价）」，在 no-show 的 source 上却是
+ * 「人工标记（相对航司名单自动导入）」，全局一份字典必然把其中一边翻错。
+ */
+const FIELD_ENUM_DICT: Record<string, Record<string, string>> = {
+  source: {
+    MANUAL: '人工标记',
+  },
+};
+
 export function formatAction(code: string): ActionEntry {
   const hit = ACTION_DICT[code];
   if (hit) return hit;
@@ -229,8 +290,8 @@ export function formatAction(code: string): ActionEntry {
 // 新代码的记账惯例），两种写法都按人民币格式化。
 const MONEY_KEY_RE = /(amount|total|payable|price|balance|offset|revenue|commission|fee|diff|due|discount)(cny)?$/i;
 
-/** 把任意标量值翻译成易读字符串 */
-function formatScalar(key: string, value: unknown): string {
+/** 把任意标量值翻译成易读字符串。action 只用于挑更精确的字段标签/枚举译名，可不传。 */
+function formatScalar(key: string, value: unknown, action?: string): string {
   if (value === null || value === undefined) return '—';
   if (typeof value === 'boolean') {
     if (key === 'force') return value ? '是（绕过状态机）' : '否';
@@ -246,8 +307,11 @@ function formatScalar(key: string, value: unknown): string {
     return value.toLocaleString('zh-CN');
   }
   if (typeof value === 'string') {
-    if (/^[A-Z][A-Z_]{1,30}$/.test(value) && ENUM_DICT[value]) {
-      return ENUM_DICT[value];
+    if (/^[A-Z][A-Z_]{1,30}$/.test(value)) {
+      // 字段级译名优先：MANUAL 在 feeMode 上是「手工覆盖」，在 source 上是「人工标记」。
+      const scoped = FIELD_ENUM_DICT[key]?.[value];
+      if (scoped) return scoped;
+      if (ENUM_DICT[value]) return ENUM_DICT[value];
     }
     if (/^-?\d+(\.\d+)?$/.test(value) && MONEY_KEY_RE.test(key)) {
       return `¥${Number(value).toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`;
@@ -272,7 +336,7 @@ function formatScalar(key: string, value: unknown): string {
       return `${value.length} 位`;
     }
     if (value.every((v) => v === null || typeof v !== 'object')) {
-      return value.map((v) => formatScalar(key, v)).join('、');
+      return value.map((v) => formatScalar(key, v, action)).join('、');
     }
     try {
       return JSON.stringify(value);
@@ -286,7 +350,7 @@ function formatScalar(key: string, value: unknown): string {
     const obj = value as Record<string, unknown>;
     const parts = Object.entries(obj)
       .filter(([, v]) => v !== null && v !== undefined && v !== '')
-      .map(([k, v]) => `${FIELD_DICT[k] ?? k}: ${formatScalar(k, v)}`);
+      .map(([k, v]) => `${fieldLabel(k, action)}: ${formatScalar(k, v, action)}`);
     if (parts.length > 0) return parts.join('，');
   }
   try {
@@ -314,7 +378,7 @@ function hasCompanionLabel(obj: Record<string, unknown> | undefined, key: string
 
 /** 把单边 payload（before 或 after）转成 ["原因: 客户超时未付", ...] 这样的行。
  * 非 Id 行在前；没有对应 name/label 的裸 Id 行保留但放到最后；有对应 name/label 的 Id 行整条跳过。 */
-function formatSide(payload: unknown): string[] {
+function formatSide(payload: unknown, action?: string): string[] {
   if (payload === null || payload === undefined) return [];
   if (typeof payload !== 'object') return [String(payload)];
   const obj = payload as Record<string, unknown>;
@@ -323,8 +387,8 @@ function formatSide(payload: unknown): string[] {
   for (const [k, v] of Object.entries(obj)) {
     if (v === null || v === undefined || v === '') continue;
     if (hasCompanionLabel(obj, k)) continue;
-    const label = FIELD_DICT[k] ?? k;
-    const line = `${label}: ${formatScalar(k, v)}`;
+    const label = fieldLabel(k, action);
+    const line = `${label}: ${formatScalar(k, v, action)}`;
     (isIdKey(k) ? idLines : otherLines).push(line);
   }
   return [...otherLines, ...idLines];
@@ -338,18 +402,18 @@ export interface DiffLine {
 }
 
 /**
- * 计算 before/after 的 diff，返回带前缀的行。
+ * 计算 before/after 的 diff，返回带前缀的行。传 action 时字段标签走该 action 的精确译名。
  * - 新建（before 为空）：列 after，前缀 '·'
  * - 删除（after 为空）：列 before，前缀 '−'
  * - 双值变化：合成 "字段: 旧 → 新"
  * - 仅一边出现：'+' 或 '−'
  */
-export function formatPayloadDiff(before: unknown, after: unknown): DiffLine[] {
+export function formatPayloadDiff(before: unknown, after: unknown, action?: string): DiffLine[] {
   if (before === null || before === undefined) {
-    return formatSide(after).map((text) => ({ prefix: '·', text }));
+    return formatSide(after, action).map((text) => ({ prefix: '·', text }));
   }
   if (after === null || after === undefined) {
-    return formatSide(before).map((text) => ({ prefix: '−', text, isRemoved: true }));
+    return formatSide(before, action).map((text) => ({ prefix: '−', text, isRemoved: true }));
   }
 
   if (typeof before === 'object' && typeof after === 'object') {
@@ -365,21 +429,21 @@ export function formatPayloadDiff(before: unknown, after: unknown): DiffLine[] {
       if (JSON.stringify(beforeVal) === JSON.stringify(afterVal)) continue;
       // 有对应 xxxName/xxxLabel 键（任一边）时，这条 Id 行是噪音，跳过——真正有用的名字自成一行。
       if (hasCompanionLabel(beforeObj, k) || hasCompanionLabel(afterObj, k)) continue;
-      const label = FIELD_DICT[k] ?? k;
+      const label = fieldLabel(k, action);
       const beforeFilled = beforeVal !== undefined && beforeVal !== null && beforeVal !== '';
       const afterFilled = afterVal !== undefined && afterVal !== null && afterVal !== '';
       const bucket = isIdKey(k) ? idLines : otherLines;
       if (beforeFilled && afterFilled) {
         bucket.push({
           prefix: '·',
-          text: `${label}: ${formatScalar(k, beforeVal)} → ${formatScalar(k, afterVal)}`,
+          text: `${label}: ${formatScalar(k, beforeVal, action)} → ${formatScalar(k, afterVal, action)}`,
         });
         continue;
       }
       if (afterFilled) {
-        bucket.push({ prefix: '+', text: `${label}: ${formatScalar(k, afterVal)}`, isAdded: true });
+        bucket.push({ prefix: '+', text: `${label}: ${formatScalar(k, afterVal, action)}`, isAdded: true });
       } else if (beforeFilled) {
-        bucket.push({ prefix: '−', text: `${label}: ${formatScalar(k, beforeVal)}`, isRemoved: true });
+        bucket.push({ prefix: '−', text: `${label}: ${formatScalar(k, beforeVal, action)}`, isRemoved: true });
       }
     }
     return [...otherLines, ...idLines];
@@ -392,8 +456,8 @@ export function formatPayloadDiff(before: unknown, after: unknown): DiffLine[] {
 }
 
 /** 一句话摘要（用于表格紧凑展示） */
-export function summarizePayload(_action: string, before: unknown, after: unknown): string {
-  const lines = formatPayloadDiff(before, after);
+export function summarizePayload(action: string, before: unknown, after: unknown): string {
+  const lines = formatPayloadDiff(before, after, action);
   if (lines.length === 0) return '—';
   const core = lines.find((l) => l.text.startsWith('目标状态:') || l.text.startsWith('状态:'));
   if (core) {

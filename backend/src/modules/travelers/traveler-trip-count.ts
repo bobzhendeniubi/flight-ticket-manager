@@ -23,6 +23,7 @@ import {
   type AggOrder,
   type TravelerAggregate,
 } from './traveler-profiles.aggregate.js';
+import { hasNoShowMark } from '../orders/orders.leg-status.js';
 
 /**
  * 有效订单口径：排除草稿/超时未付/已取消/失败/全退。
@@ -69,7 +70,8 @@ export const orderSelect = {
       flightCabin: true,
       hotelCheckIn: true,
       hotelCheckOut: true,
-      // 去程「未登机」标就住在这里（metadata.noShow）；飞行次数要认它，见 hasNoShowMark。
+      // 去程「未登机」标就住在这里（metadata.noShow）；飞行次数要认它，
+      // 判据走 orders.leg-status 的 hasNoShowMark（与航段状态派生/legFlag 同一份口径）。
       metadata: true,
       flightSchedule: {
         select: {
@@ -83,18 +85,6 @@ export const orderSelect = {
 } satisfies Prisma.OrderSelect;
 
 export type OrderRow = Prisma.OrderGetPayload<{ select: typeof orderSelect }>;
-
-/**
- * 该订单行是否被打了「未登机」标。
- *
- * 判据与航段状态派生（orders/orders.leg-status.ts）保持一致：metadata.noShow 存在即为真，
- * 形状不符（null / 非对象 / 数组）一律按未打标处理 —— 快照是历史数据，读侧不许因脏 JSON 抛错。
- * 打标不动 flightScheduleId（那趟航班真飞了），所以光看班次判断不出客人到底上没上飞机。
- */
-function hasNoShowMark(metadata: unknown): boolean {
-  if (metadata == null || typeof metadata !== 'object' || Array.isArray(metadata)) return false;
-  return (metadata as Record<string, unknown>).noShow != null;
-}
 
 export function toAggOrder(o: OrderRow): AggOrder {
   return {

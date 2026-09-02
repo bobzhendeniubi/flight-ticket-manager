@@ -88,7 +88,7 @@ function toView(l: AuditLog): AuditView {
     actionIcon: a.icon,
     targetType: l.targetType,
     targetLabel: l.targetLabel ?? l.targetId ?? '—',
-    diffLines: formatPayloadDiff(l.before, l.after),
+    diffLines: formatPayloadDiff(l.before, l.after, l.action),
     diffSummary: summarizePayload(l.action, l.before, l.after),
     severity: l.severity,
     before: l.before,

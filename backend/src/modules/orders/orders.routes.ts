@@ -2484,37 +2484,39 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
 
       // 幂等回放不落审计：首刷已记过一条，重试再记一条会让审计里出现两次「取消航段」，
       // 事后核对会以为放了两次座、收了两次手续费（口径同 no-show / 恢复回程两条路由）。
-      if (!audit.replayed) void writeAudit({
-        actor: actorFromRequest(req),
-        action: audit.leg === 'OUTBOUND' ? 'CANCEL_OUTBOUND_LEG' : 'CANCEL_RETURN_LEG',
-        targetType: 'ORDER',
-        targetId: id,
-        targetLabel: audit.orderNumber,
-        before: {
-          returnItemId: audit.returnItemId,
-          originalAmountCny: audit.originalAmountCny,
-          totalCny: audit.totalBefore,
-        },
-        after: {
-          leg: audit.leg,
-          feeCny: audit.feeCny,
-          feeMode: audit.feeMode,
-          policyName: audit.policyName,
-          // 手工覆盖取消政策是最需要事后复核的一步：原因原文进审计。
-          overrideReason: body.overrideReason ?? null,
-          note: body.note ?? null,
-          releasedSeats: audit.releasedSeats,
-          // 已出票的段被取消 → 同事务给票务派了撤名单/退票工单，id 进审计便于追踪跟进。
-          workOrderReminderId: audit.workOrderReminderId,
-          acknowledgedWarnings: body.acknowledgeWarnings === true,
-          netReductionCny: audit.netReductionCny,
-          totalCny: audit.totalAfter,
-          overpayAfterCny: audit.overpayAfterCny,
-          replayed: audit.replayed,
-        },
-        // 手工覆盖服务端政策报价 = 人为改动金额，按最高等级留痕；按政策走记 WARNING。
-        severity: audit.feeMode === 'MANUAL' ? 'CRITICAL' : 'WARNING',
-      });
+      if (!audit.replayed) {
+        void writeAudit({
+          actor: actorFromRequest(req),
+          action: audit.leg === 'OUTBOUND' ? 'CANCEL_OUTBOUND_LEG' : 'CANCEL_RETURN_LEG',
+          targetType: 'ORDER',
+          targetId: id,
+          targetLabel: audit.orderNumber,
+          before: {
+            returnItemId: audit.returnItemId,
+            originalAmountCny: audit.originalAmountCny,
+            totalCny: audit.totalBefore,
+          },
+          after: {
+            leg: audit.leg,
+            feeCny: audit.feeCny,
+            feeMode: audit.feeMode,
+            policyName: audit.policyName,
+            // 手工覆盖取消政策是最需要事后复核的一步：原因原文进审计。
+            overrideReason: body.overrideReason ?? null,
+            note: body.note ?? null,
+            releasedSeats: audit.releasedSeats,
+            // 已出票的段被取消 → 同事务给票务派了撤名单/退票工单，id 进审计便于追踪跟进。
+            workOrderReminderId: audit.workOrderReminderId,
+            acknowledgedWarnings: body.acknowledgeWarnings === true,
+            netReductionCny: audit.netReductionCny,
+            totalCny: audit.totalAfter,
+            overpayAfterCny: audit.overpayAfterCny,
+            replayed: audit.replayed,
+          },
+          // 手工覆盖服务端政策报价 = 人为改动金额，按最高等级留痕；按政策走记 WARNING。
+          severity: audit.feeMode === 'MANUAL' ? 'CRITICAL' : 'WARNING',
+        });
+      }
 
       return { order, audit };
     };
@@ -2557,29 +2559,31 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     // 幂等回放不再落审计：首刷已记过一条，重试再记一条会让审计里出现两次「释放回程」，
     // 事后核对会以为放了两次座。
     const seats = result.audit.releasedSeats.reduce((n, r) => n + r.quantity, 0);
-    if (!result.audit.replayed) void writeAudit({
-      actor: actorFromRequest(req),
-      action: 'MARK_NO_SHOW',
-      targetType: 'ORDER',
-      targetId: result.targetOrderId,
-      targetLabel:
-        `${result.audit.orderNumber} · 去程 no-show · ` +
-        `${result.audit.returnItemId ? `释放回程 ${seats} 座` : '未释放回程'}` +
-        `${result.audit.split ? `（自 ${result.audit.split.sourceOrderNumber} 拆出）` : ''}`,
-      before: { sourceOrderNumber: result.audit.split?.sourceOrderNumber ?? null },
-      after: {
-        outboundItemId: result.audit.outboundItemId,
-        returnItemId: result.audit.returnItemId,
-        releasedSeats: result.audit.releasedSeats,
-        releaseReturn: body.releaseReturn,
-        passengerIds: body.passengerIds ?? null,
-        workOrderReminderId: result.audit.workOrderReminderId,
-        split: result.audit.split,
-        note: body.note ?? null,
-        replayed: result.audit.replayed,
-      },
-      severity: 'WARNING',
-    });
+    if (!result.audit.replayed) {
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'MARK_NO_SHOW',
+        targetType: 'ORDER',
+        targetId: result.targetOrderId,
+        targetLabel:
+          `${result.audit.orderNumber} · 去程 no-show · ` +
+          `${result.audit.returnItemId ? `释放回程 ${seats} 座` : '未释放回程'}` +
+          `${result.audit.split ? `（自 ${result.audit.split.sourceOrderNumber} 拆出）` : ''}`,
+        before: { sourceOrderNumber: result.audit.split?.sourceOrderNumber ?? null },
+        after: {
+          outboundItemId: result.audit.outboundItemId,
+          returnItemId: result.audit.returnItemId,
+          releasedSeats: result.audit.releasedSeats,
+          releaseReturn: body.releaseReturn,
+          passengerIds: body.passengerIds ?? null,
+          workOrderReminderId: result.audit.workOrderReminderId,
+          split: result.audit.split,
+          note: body.note ?? null,
+          replayed: result.audit.replayed,
+        },
+        severity: 'WARNING',
+      });
+    }
 
     return { order: result.order, targetOrderId: result.targetOrderId, audit: result.audit };
   });
@@ -2616,29 +2620,31 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
 
     // ⚠ 超售放行的 CRITICAL 审计**已经在 service 的占座事务里写过了**（与占座同生共死）。
     // 这里再写一条只会让同一次放行在审计里出现两次，事后核对会以为放了两回；所以只记非超售那一档。
-    if (!audit.replayed && !audit.oversold) void writeAudit({
-      actor: actorFromRequest(req),
-      action: 'RESTORE_RETURN_LEG',
-      targetType: 'ORDER',
-      targetId: id,
-      targetLabel: `${audit.orderNumber} · 恢复回程（${audit.quantity} 座）`,
-      after: {
-        returnItemId: audit.returnItemId,
-        scheduleId: audit.scheduleId,
-        flightNumber: audit.flightNumber,
-        departDate: audit.departDate,
-        cabin: audit.cabin,
-        quantity: audit.quantity,
-        oversold: audit.oversold,
-        oversoldBy: audit.oversoldBy,
-        // 恢复之后这些舱的**累计**超售座数（0 = 没超）；风控看的是这个数，不是本次增量。
-        scheduleOversoldAfter: audit.scheduleOversoldAfter,
-        maxOversell: env.FLIGHT_NOSHOW_MAX_OVERSELL_SEATS,
-        note: body.note ?? null,
-        replayed: audit.replayed,
-      },
-      severity: 'WARNING',
-    });
+    if (!audit.replayed && !audit.oversold) {
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'RESTORE_RETURN_LEG',
+        targetType: 'ORDER',
+        targetId: id,
+        targetLabel: `${audit.orderNumber} · 恢复回程（${audit.quantity} 座）`,
+        after: {
+          returnItemId: audit.returnItemId,
+          scheduleId: audit.scheduleId,
+          flightNumber: audit.flightNumber,
+          departDate: audit.departDate,
+          cabin: audit.cabin,
+          quantity: audit.quantity,
+          oversold: audit.oversold,
+          oversoldBy: audit.oversoldBy,
+          // 恢复之后这些舱的**累计**超售座数（0 = 没超）；风控看的是这个数，不是本次增量。
+          scheduleOversoldAfter: audit.scheduleOversoldAfter,
+          maxOversell: env.FLIGHT_NOSHOW_MAX_OVERSELL_SEATS,
+          note: body.note ?? null,
+          replayed: audit.replayed,
+        },
+        severity: 'WARNING',
+      });
+    }
 
     return { order, audit };
   });

@@ -61,7 +61,17 @@ import {
   isVisaContradiction,
   VISA_CONTRADICTION_MESSAGE,
 } from './visa-need.js';
-import { deriveLegStatus, isReturnCurrentlyReleased } from './orders.leg-status.js';
+import {
+  deriveLegStatus,
+  isReturnCurrentlyReleased,
+  stripInternalLegPrefix,
+  LEG_CANCELLED_OUTBOUND_PREFIX,
+  LEG_CANCELLED_RETURN_PREFIX,
+  LEGACY_NO_SHOW_PREFIX,
+  LEGACY_RETURN_RELEASED_PREFIX,
+  NO_SHOW_PREFIX,
+  RETURN_RELEASED_PREFIX,
+} from './orders.leg-status.js';
 import { computePerPaxShares } from './per-pax-share.js';
 import {
   assertOrderAcceptsFunds,
@@ -1085,7 +1095,8 @@ export async function syncOrderHasReturnLeg(
  * 导出列却已经写着「回程已作废」，同一张单在筛选和导出里对不上）。
  *
  * 单行状态 → 物化列的映射（优先级同 deriveLegStatus：作废 > 已释放 > 已恢复 > 去程未登机）：
- *   回程已作废      → RETURN_VOIDED     终局（起飞后作废 returnVoidedFinal，或取消航段 returnLegCancelled）
+ *   去程已作废      → OUTBOUND_VOIDED   终局（取消航段取消的是去程）
+ *   回程已作废      → RETURN_VOIDED     终局（起飞后作废 returnVoidedFinal，或取消航段取消回程）
  *   回程座位已释放  → RETURN_RELEASED   可恢复（班次为空 + 释放晚于最近一次恢复）
  *   回程已恢复      → RETURN_RESTORED   释放过、已恢复回原班次
  *   去程未登机      → NO_SHOW           去程标过 no-show，但回程没被释放（单程单/未勾释放）
@@ -1106,7 +1117,10 @@ export async function syncOrderLegFlag(
   const statuses = new Set(items.map((it) => deriveLegStatus(it)).filter((v) => v != null));
 
   let legFlag: OrderLegFlag = OrderLegFlag.NONE;
-  if (statuses.has('回程已作废')) {
+  if (statuses.has('去程已作废')) {
+    // 去程作废优先于回程作废：两段都取消过的单，最要紧的事实是「去程没了」（整趟行程不成立）。
+    legFlag = OrderLegFlag.OUTBOUND_VOIDED;
+  } else if (statuses.has('回程已作废')) {
     legFlag = OrderLegFlag.RETURN_VOIDED;
   } else if (statuses.has('回程座位已释放')) {
     legFlag = OrderLegFlag.RETURN_RELEASED;
@@ -6382,8 +6396,8 @@ export class OrderService {
         // 把它们「还」回 FlightSeatClass.sold 等于让一个过去的班次凭空多出可卖余位 ——
         // 而且这条路径最常被走到的正是「客人 no-show 之后订单被取消/退款」，一放就错。
         // 未来的航段照常释放（订单确实不再持有它们）。
-        const departAt = item.flightSchedule?.departureTime ?? null;
-        if (departAt && departAt.getTime() <= releaseAt) continue;
+        // 判定走共享 helper isLegAlreadyFlown，与下面的重新占座分支同一口径（两处必须对称）。
+        if (isLegAlreadyFlown(item, releaseAt)) continue;
         // 套餐升舱拆座的镜像还原：经济舱行下单时拆了 businessUpgradeCount 个座到商务舱，
         // 退座时也要按同一拆分各退各舱（否则会少退商务舱、多退经济舱）。
         const meta = (item.metadata ?? {}) as { businessUpgradeCount?: unknown };
@@ -6458,8 +6472,15 @@ export class OrderService {
         }
       };
 
+      const retakeAt = Date.now();
       for (const item of order.items) {
         if (item.kind !== 'FLIGHT' || !item.flightScheduleId || !item.flightCabin) continue;
+        // ⚠ 与上面放座分支**严格对称**：已起飞的航段当初释放时就没放（座位早被飞机带走了），
+        // 这里也不能重新占回来 —— 一占就是给一个飞过去的班次凭空加一份 sold，
+        // 那份 sold 此后没有任何路径会释放（订单再落取消族时同样被这道闸跳过），永久卡账。
+        // 最常见的走法正是「客人去程 no-show → 单被取消 → 运营 force 拉回」这条。
+        // 判定走共享 helper isLegAlreadyFlown，与上面放座分支同一口径（两处必须对称）。
+        if (isLegAlreadyFlown(item, retakeAt)) continue;
         // 套餐升舱拆座：与下单/释放同一口径，按 businessUpgradeCount 分拆两舱各自占座
         // （否则会少占商务舱、多占经济舱，或漏占其中一段）。
         const meta = (item.metadata ?? {}) as { businessUpgradeCount?: unknown };
@@ -7808,6 +7829,30 @@ export class OrderService {
         // 改期的语义是「放旧座 + 拿新座」，这行现在一个座都没持有，放旧座会把 sold 打成负数。
         throw new BadRequestError(RELEASED_LEG_NO_SCHEDULE_HINT('改期'));
       }
+      // ── 已标 no-show 的段不许改期（与取消航段闸 11 对称）────────────────────────
+      // no-show 的口径是「客人没登机、钱与成本一分不动」。把这一段改期 = 把一次已经发生过的
+      // 未登机搬到未来的班次上：座位真的被搬走占住，no-show 快照却还挂在同一行上，
+      // 之后无论走恢复、取消还是退款都对不上账。要重新安排请另录一段航段。
+      if (readJsonObject(readJsonObject(item.metadata).noShow).at != null) {
+        throw new BadRequestError(
+          '该段已标 no-show（客人未登机），不能改期；如需重新安排行程请另录一段航段。',
+        );
+      }
+      // ── 已起飞的段不许改期（与取消航段闸 10 对称）──────────────────────────────
+      // 改期要「放旧座」，而飞过的座位早被真实消耗掉了（口径同 isLegAlreadyFlown）：
+      // 放回去等于让一个过去的班次凭空多出可卖余位，同时又在新班次占一份，两头都是错账。
+      if (isLegAlreadyFlown(item, Date.now())) {
+        const sched = item.flightSchedule;
+        const departAt = sched?.departureTime ?? null;
+        const localWhen =
+          departAt != null
+            ? `${localDateISO(departAt, sched?.departureTz)} ${localHHMM(departAt, sched?.departureTz)}`
+            : '时间未知';
+        throw new BadRequestError(
+          `该段已起飞（当地时间 ${localWhen} 出发），不能改期；` +
+            '客人没登机请走「标记 no-show」处理。',
+        );
+      }
 
       const oldScheduleId = item.flightScheduleId;
       const oldCabin = item.flightCabin;
@@ -8330,6 +8375,8 @@ export class OrderService {
           flightCabin: true,
           bundleId: true,
           metadata: true,
+          // 起飞判定要用（下面的「已起飞不许升舱」闸）；与改期端点的 itemSelect 同口径。
+          flightSchedule: { select: { departureTime: true, departureTz: true } },
         },
       });
       if (!item || item.orderId !== orderId) {
@@ -8342,6 +8389,28 @@ export class OrderService {
         // 机票行，但座位已经被放回库存（no-show 释放 / 取消航段）：升舱要「放经济舱座 + 拿商务舱座」，
         // 这行一个座都没持有，放旧座会把 sold 打成负数。
         throw new BadRequestError(RELEASED_LEG_NO_SCHEDULE_HINT('升舱'));
+      }
+      // ── 已标 no-show 的段不许升舱（与取消航段闸 11、改期同一道闸）──────────────
+      // no-show = 客人没登机、钱与成本一分不动。给这一段升舱会真的搬座位、真的抬 total，
+      // 而这段行程根本没有发生 —— 客人没上飞机却被收了升舱差价。
+      if (readJsonObject(readJsonObject(item.metadata).noShow).at != null) {
+        throw new BadRequestError(
+          '该段已标 no-show（客人未登机），不能升舱；如需重新安排行程请另录一段航段。',
+        );
+      }
+      // ── 已起飞的段不许升舱（与取消航段闸 10、改期同一道闸）──────────────────────
+      // 升舱要「放经济舱座 + 拿商务舱座」，飞过的座位早被真实消耗掉（口径同 isLegAlreadyFlown）：
+      // 放回去等于让过去的班次凭空多出可卖余位，还要对一段飞完的行程收升舱差价。
+      if (isLegAlreadyFlown(item, Date.now())) {
+        const sched = item.flightSchedule;
+        const departAt = sched?.departureTime ?? null;
+        const localWhen =
+          departAt != null
+            ? `${localDateISO(departAt, sched?.departureTz)} ${localHHMM(departAt, sched?.departureTz)}`
+            : '时间未知';
+        throw new BadRequestError(
+          `该段已起飞（当地时间 ${localWhen} 出发），不能升舱。`,
+        );
       }
       // 套餐机票腿：升舱份数/拆座由套餐加购模型管，售后升舱本次不覆盖。
       const meta = (item.metadata ?? {}) as Record<string, unknown> & { businessUpgradeCount?: unknown };
@@ -11905,6 +11974,20 @@ export class OrderService {
       blockers.push('订单含升舱商务的机票行，请先撤销升舱再拆单。');
     }
 
+    // ── 闸 11b：回程座位当前处于「已释放」态 ─────────────────────────────────────
+    // 释放快照（returnReleased.releasedSeats）记的是「这一行在**这张单上**放了几座」，
+    // 而它是不可继承的（见 NON_INHERITABLE_ITEM_METADATA_KEYS）：拆完之后
+    //   · 新单：回程行没有释放快照，「恢复回程」按钮无从下手，那几座回不来；
+    //   · 源单：快照还记着按拆前人数放掉的座数，恢复时会照旧数占回来 —— 人已经少了一批，
+    //     占回的座数却没变，座位账凭空多出一截。
+    // 两边人数与释放快照必然对不上，且没有任何路径会自己纠正。先恢复、或确认这段就此作废再拆。
+    if (order.items.some((it) => isReturnCurrentlyReleased(it))) {
+      blockers.push(
+        '本单回程座位当前处于「已释放」态，拆单会让释放快照与两侧人数对不上；' +
+          '请先「恢复回程」或确认作废后再拆。',
+      );
+    }
+
     // ── 闸 12（已放开）：已出票单同样可拆，票务状态随人搬家 ────────────────────
     // 旧口径拒拆已出票单、让运营「走改签流程」，可**已出票的多人单恰恰是最需要单独改期的**：
     // 三人一单已出票，只给一位客人改航班，除了拆单没有别的路（一单一行程是全站硬约束）。
@@ -14117,6 +14200,25 @@ export class OrderService {
       };
     }
 
+    // ── 1b. 拆单**之前**先过一遍订单级 no-show 闸（fail-closed）──────────────────
+    //
+    // ⚠ 拆单不可回滚（新单是一张合法订单，撤不掉）。所以凡是「跟选了谁无关、这单本来就不能标
+    // no-show」的原因 —— 回收站单 / 非占座状态 / 有进行中的退款 / 三段以上无法判方向 /
+    // 去程还没起飞 / 回程当前已处于已释放态 / 回程已起飞却勾了释放 —— 必须在拆单前就拦下，
+    // 否则运营会得到「单已经拆了，但标不了」这种收不回来的半成品：新单凭空多出来一张，
+    // 原单人数被拆走一批，而客人一个都没标上。
+    // 传 passengerIds=undefined 只跑订单级闸；与所选乘客相关的闸（不属于本单 / 拆单本身能不能拆）
+    // 仍留在拆后由 splitOrder 与 _executeNoShow 各自把关，不在这里重复。
+    const preSplitAssessed = await this._assessNoShow(
+      prisma,
+      orderId,
+      undefined,
+      input.releaseReturn,
+    );
+    if (preSplitAssessed.blockers.length > 0) {
+      throw new BadRequestError(preSplitAssessed.blockers.join('；'));
+    }
+
     // ── 2. 部分乘客：直接执行拆单（幂等，服务端权威算钱）────────────────────────
     //
     // 这里**不再先跑一遍 previewOrderSplit**：重试时这批人已经不在源单上了，预检的闸 14
@@ -14124,6 +14226,30 @@ export class OrderService {
     // 于是同一个 token 第二次调用直接 409 —— 明明第一次已经拆成并标好了。
     // 现在把判定权整个交给 splitOrder：能回放就回放，真被闸挡住它自己会抛，映射成同一个
     // 409 SPLIT_BLOCKED（前端一条路处理，无需区分「预检挡下」还是「执行挡下」）。
+    // ── 2a. 拆单回放的入参比对（与 _executeNoShow 的 releaseReturn 比对同一道理）────
+    // splitOrder 的幂等键是 (源单, requestToken)，命中就原样回放上一轮拆出的那张单。
+    // 若这次勾的是**另一批乘客**，回放会静默返回上一轮的新单、再去给那批人标 no-show ——
+    // 本次真正勾选的客人一个都没被处理，运营却看到成功。对不上就 409，让前端换新请求编号。
+    const priorSplit = await prisma.orderSplitRecord.findUnique({
+      where: { sourceOrderId_requestToken: { sourceOrderId: orderId, requestToken: input.requestToken } },
+      select: { snapshot: true },
+    });
+    if (priorSplit) {
+      const priorIdsRaw = readJsonObject(priorSplit.snapshot).movedPassengerIds;
+      const priorIds = Array.isArray(priorIdsRaw)
+        ? priorIdsRaw.filter((v): v is string => typeof v === 'string').sort()
+        : null;
+      const currentIds = [...picked!].sort();
+      // 老记录没留 movedPassengerIds → 无从比对，按老行为回放（fail-open）。
+      if (priorIds && priorIds.join(' ') !== currentIds.join(' ')) {
+        throw tokenPayloadMismatchError({
+          field: 'passengerIds',
+          priorCount: priorIds.length,
+          currentCount: currentIds.length,
+        });
+      }
+    }
+
     let split: SplitOrderResult;
     try {
       split = await this.splitOrder(
@@ -14210,6 +14336,17 @@ export class OrderService {
       // 只查当前快照上那一个 token 会漏掉「释放→恢复→再释放→再恢复」中间几轮被覆盖掉的 token，
       // 那几轮的延迟重试就会绕过回放二次放座。详见 collectLegActionTokens 的注释。
       if (hasSeenLegActionToken(flightRows, input.requestToken)) {
+        // ⚠ 回放前先比对关键入参：同一个 token 换一份请求体再发一次是可能的（弹窗里改了
+        //「同时释放回程」的勾选又点重试）。只按 token 命中就回成功，会让运营以为这次的勾选
+        // 生效了 —— 实际上座位早按上一次的勾选处置完了，两边认知从此分叉且审计里看不出来。
+        const priorReleased = resolveNoShowTokenReleaseFlag(flightRows, input.requestToken);
+        if (priorReleased !== null && priorReleased !== input.releaseReturn) {
+          throw tokenPayloadMismatchError({
+            field: 'releaseReturn',
+            prior: priorReleased,
+            current: input.releaseReturn,
+          });
+        }
         // 回放一律回**当前状态**（不是当初那一轮的快照）：调用方要的是「这单现在是什么样」，
         // 而中间几轮的快照早已不代表现状。单号同样读真值（整单回放时 split 为 null，
         // 原来的 `split?.targetOrderNumber ?? ''` 会让审计与响应里的单号变成空串）。
@@ -14342,6 +14479,10 @@ export class OrderService {
           originalCabin: returnItem.flightCabin,
           releasedSeats,
           ticketedAtRelease: returnTicketedCount,
+          // 释放当时回程是不是「已开票」态 —— 下面第 4 步会把它清成未开（钱不动，清的只是进度标记），
+          // 而恢复回程**不会自动翻回来**。记进快照，恢复预检才能如实提醒票务台重新标一次。
+          // 老快照没有这个键 → 恢复预检读到 undefined，按「不确定」不提示（fail-open）。
+          returnInvoicedAtRelease: order.returnInvoiced === true,
           workOrderReminderId,
           note,
           history: priorRelease.at != null ? [...priorHistory, priorWithoutHistory] : priorHistory,
@@ -14481,11 +14622,13 @@ export class OrderService {
     releasedItem: CancelLegItemSnapshot | null;
     snapshot: ReturnReleasedSnapshot | null;
     /** 逐舱位的恢复需求（照释放时的快照回填，不重新按 quantity 推算）。 */
-    seatNeeds: Array<{ cabin: CabinClass; quantity: number; available: number }>;
+    seatNeeds: RestoreSeatNeed[];
     blockers: string[];
     available: number;
-    /** 本次**新增**的超售座数（Σ increment）。 */
+    /** 本次**新增**的超售座数（Σ increment，纯 sold vs capacity 口径）。 */
     oversellBy: number;
+    /** 余位缺口（Σ max(0, 要占的座 − available)）——决定要不要运营二次确认，含锁位/占位口径。 */
+    seatShortfall: number;
     /** 恢复**之后**这些舱一共超出几座（Σ max(0, after)）——上限判定与风控看的是这个数。 */
     oversoldAfter: number;
     /** 逐舱三值（before/after/increment），供前端与审计逐舱对账。 */
@@ -14538,10 +14681,16 @@ export class OrderService {
       : [];
 
     let departed = false;
-    const seatNeeds: Array<{ cabin: CabinClass; quantity: number; available: number }> = [];
+    const seatNeeds: RestoreSeatNeed[] = [];
     if (releasedItem && snapshot && blockers.length === 0) {
       if (!scheduleId) {
         blockers.push('释放快照里没有原班次，无法自动恢复，请人工重录回程航段。');
+      } else if (releasedSeats.length === 0) {
+        // 「放几座就恢复几座」全靠这份逐舱明细。明细为空（老快照 / 释放时该行没有班次或舱位）
+        // 时继续往下走，会一座都不占地把行写回班次 —— 订单显示回程回来了，FlightSeatClass.sold
+        // 却没有对应扣减，成了幽灵持有：这几个人的座位在余位里被算成可卖，直接超卖。
+        // 与其静默占 0 座，不如在这里拒掉，让票务人工重录一段回程（金额不动，只补航段）。
+        blockers.push('释放快照里没有座位明细，无法自动恢复，请人工重录回程航段。');
       } else {
         const schedule = await db.flightSchedule.findUnique({
           where: { id: scheduleId },
@@ -14554,12 +14703,12 @@ export class OrderService {
           blockers.push('原班次已起飞，无法恢复。');
         } else {
           for (const need of releasedSeats) {
-            const availability = await cabinAvailabilityWithinTx(db, scheduleId, need.cabin);
-            if (availability == null) {
+            const seatState = await cabinSeatStateWithinTx(db, scheduleId, need.cabin);
+            if (seatState == null) {
               blockers.push(`原班次已没有 ${need.cabin} 舱位配置，无法恢复，请先在航班维护里补齐。`);
               continue;
             }
-            seatNeeds.push({ cabin: need.cabin, quantity: need.quantity, available: availability });
+            seatNeeds.push({ cabin: need.cabin, quantity: need.quantity, ...seatState });
           }
         }
       }
@@ -14569,6 +14718,13 @@ export class OrderService {
     //（前端只展示一个数）。上限判定用**累计**：班次已经被卖穿到上限之外时，再放行 1 座也是加码。
     const { detail: oversellDetail, oversellBy, oversoldAfter } = computeOversellDelta(seatNeeds);
     const available = seatNeeds.length > 0 ? Math.min(...seatNeeds.map((s) => s.available)) : 0;
+    // 「要不要运营二次确认」看的是**余位缺口**（available 口径，含他人锁位与占位单余座），
+    // 不是超售座数：一班还有物理空位、只是被别人锁位占满时，硬抢过来同样要有人拍板 ——
+    // 虽然 sold 没超 capacity（oversellBy=0，不触上限），但抢的确实是别人锁着的位子。
+    const seatShortfall = seatNeeds.reduce(
+      (n, s) => n + Math.max(0, s.quantity - s.available),
+      0,
+    );
     const maxOversell = env.FLIGHT_NOSHOW_MAX_OVERSELL_SEATS;
     if (oversoldAfter > maxOversell) {
       blockers.push(
@@ -14585,6 +14741,7 @@ export class OrderService {
       blockers,
       available,
       oversellBy,
+      seatShortfall,
       oversoldAfter,
       oversellDetail,
       departed,
@@ -14603,6 +14760,21 @@ export class OrderService {
     }
     const assessed = await this._assessRestoreReturnLeg(prisma, orderId);
     const item = assessed.releasedItem;
+    // ── 非阻断提示：恢复之后票务台还要动手做的事 ───────────────────────────────
+    // 这两件事系统都不会自己补回来，不提示的话就成了「恢复完了以为没事了」的静默缺口。
+    const warnings: string[] = [];
+    if (assessed.snapshot?.returnInvoicedAtRelease === true) {
+      warnings.push(
+        '释放时已把回程开票位清成未开（钱与发票不受影响，清的只是进度标记）。' +
+          '恢复并重新出票后请票务台重新标一次「已开票」。',
+      );
+    }
+    if (Number(assessed.snapshot?.ticketedAtRelease ?? 0) > 0) {
+      warnings.push(
+        '释放时该段已出票、给票务派过撤名单/退票工单：恢复后会再派一条「重新上名单」工单，' +
+          '请票务台核对该段名单与票的最新状态。',
+      );
+    }
     const schedule =
       assessed.scheduleId != null
         ? await prisma.flightSchedule.findUnique({
@@ -14617,6 +14789,7 @@ export class OrderService {
     return {
       eligible: assessed.blockers.length === 0,
       blockers: assessed.blockers,
+      warnings,
       original:
         item && assessed.scheduleId
           ? {
@@ -14634,7 +14807,10 @@ export class OrderService {
             }
           : null,
       available: assessed.available,
-      needsOversell: assessed.oversellBy > 0,
+      // 口径是**余位缺口**而不是超售座数：被别人锁位/占位单占满时 sold 没超 capacity
+      //（oversellBy=0、不触上限），但抢的是别人锁着的位子，同样要运营点头。
+      // 前端据此决定要不要带 allowOversell；「超售 N 座」的措辞另看 oversellBy。
+      needsOversell: assessed.seatShortfall > 0,
       oversellBy: assessed.oversellBy,
       oversoldAfter: assessed.oversoldAfter,
       oversellDetail: assessed.oversellDetail,
@@ -14674,6 +14850,10 @@ export class OrderService {
       // 只认当前快照会漏掉「释放→恢复→再释放→再恢复」中被顶掉的中间几轮 token，
       // 那几轮的延迟重试会绕过回放二次占座（returnRestored 是覆盖写，连 history 都没有）。
       if (hasSeenLegActionToken(flightRows, input.requestToken)) {
+        // ⚠ 本端点**不比对 allowOversell**（no-show 那边比对 releaseReturn，这里刻意不做）：
+        // allowOversell 只是「没座时要不要继续」的确认位，它不改变恢复的结果 —— 座位照释放
+        // 快照原样占回来，占几座只由快照决定。两次请求这个位不同，落库结果完全一致，
+        // 拦下来只会让运营看到一条莫名其妙的报错。恢复目标（班次/座数）本身也不由请求体决定。
         // 回放一律回**当前状态**：中间某一轮的快照早已不代表这单现在的样子。
         const restoredRow =
           flightRows.find((row) => readJsonObject(row.metadata).returnRestored != null) ?? null;
@@ -14706,10 +14886,11 @@ export class OrderService {
         throw new BadRequestError(assessed.blockers.join('；') || '本单没有可恢复的回程航段。');
       }
 
-      // ── 2. 没座必须先确认超售（稳定 code，前端据此弹二次确认，不靠中文文案匹配）──
-      if (assessed.oversellBy > 0 && input.allowOversell !== true) {
+      // ── 2. 没座必须先确认（稳定 code，前端据此弹二次确认，不靠中文文案匹配）──
+      // 判据是**余位缺口**（含他人锁位与占位单余座），不是超售座数：口径同预检 needsOversell。
+      if (assessed.seatShortfall > 0 && input.allowOversell !== true) {
         throw new AppError(
-          `原班次余位不足：还差 ${assessed.oversellBy} 座。确认超售后可继续恢复。`,
+          `原班次余位不足：还差 ${assessed.seatShortfall} 座。确认后可继续恢复。`,
           {
             statusCode: 409,
             code: 'OVERSELL_CONFIRMATION_REQUIRED',
@@ -14729,14 +14910,14 @@ export class OrderService {
       // 于是「上限 5 座」在并发下会被突破到任意深度 —— 上限形同虚设。
       // 这里先把本次要动的每个舱位行 FOR UPDATE 锁住（与 oversellSeatWithinTx 同一把锁），
       // 再重读 capacity/sold/locked/held 算真实缺口，超限就地 409 回滚。
-      const lockedNeeds: Array<{ cabin: CabinClass; quantity: number; available: number }> = [];
+      const lockedNeeds: RestoreSeatNeed[] = [];
       for (const need of assessed.seatNeeds) {
         await lockSeatClassWithinTx(tx, scheduleId, need.cabin);
-        const available = await cabinAvailabilityWithinTx(tx, scheduleId, need.cabin);
-        if (available == null) {
+        const seatState = await cabinSeatStateWithinTx(tx, scheduleId, need.cabin);
+        if (seatState == null) {
           throw new ConflictError(`原班次的 ${need.cabin} 舱位不存在，无法恢复回程座位。`);
         }
-        lockedNeeds.push({ cabin: need.cabin, quantity: need.quantity, available });
+        lockedNeeds.push({ cabin: need.cabin, quantity: need.quantity, ...seatState });
       }
       // 增量（本次多卖几座）与累计（恢复后一共超几座）分开算，口径见 computeOversellDelta。
       const {
@@ -14762,10 +14943,14 @@ export class OrderService {
           },
         );
       }
-      // 锁前有座、锁后变没座 → 同样要拿到运营的超售确认才继续（fail-closed，不静默超售）。
-      if (lockedOversellBy > 0 && input.allowOversell !== true) {
+      // 锁前有座、锁后变没座 → 同样要拿到运营确认才继续（fail-closed，不静默抢座）。
+      const lockedShortfall = lockedNeeds.reduce(
+        (n, need) => n + Math.max(0, need.quantity - need.available),
+        0,
+      );
+      if (lockedShortfall > 0 && input.allowOversell !== true) {
         throw new AppError(
-          `原班次余位不足：还差 ${lockedOversellBy} 座。确认超售后可继续恢复。`,
+          `原班次余位不足：还差 ${lockedShortfall} 座。确认后可继续恢复。`,
           {
             statusCode: 409,
             code: 'OVERSELL_CONFIRMATION_REQUIRED',
@@ -14976,10 +15161,13 @@ export class OrderService {
 /** 航段方向的中文名（闸文案/按钮/流水 label 共用一套，避免两处各写各的）。 */
 const LEG_ZH: Record<FlightLegSide, string> = { OUTBOUND: '去程', RETURN: '回程' };
 
-/** 被取消的航段行在描述前打的留痕前缀（幂等：已带前缀不再叠加）。 */
+/**
+ * 被取消的航段行在描述前打的留痕前缀（幂等：已带前缀不再叠加）。
+ * 字面量本体在 orders.leg-status.ts（对外脱敏要剥掉它们，两处各写一份必然漂移）。
+ */
 const LEG_CANCELLED_PREFIX: Record<FlightLegSide, string> = {
-  OUTBOUND: '【已取消去程】',
-  RETURN: '【已取消回程】',
+  OUTBOUND: LEG_CANCELLED_OUTBOUND_PREFIX,
+  RETURN: LEG_CANCELLED_RETURN_PREFIX,
 };
 
 /** 手续费调价行的 endpoint-only 原因码（去程/回程各一个，行 label 直接说清取消的是哪段）。 */
@@ -15110,49 +15298,14 @@ export interface CancelLegAudit {
 // ── 去程 no-show / 回程释放 · 恢复：常量 + 辅助 + 对外契约类型 ─────────────────
 
 /**
- * 被标记 no-show 的去程行、被释放的回程行在描述前打的留痕前缀（幂等：已带前缀不叠加）。
- * 用全角方括号，与 LEG_CANCELLED_PREFIX（【已取消去程】/【已取消回程】）同一套写法；
- * 半角旧写法只保留在 LEGACY_* 里，仅用于**剥前缀**（恢复回程、对外脱敏），让存量行也剥得干净。
+ * 内部留痕前缀（no-show / 释放 / 取消航段）与剥前缀函数**都住在 orders.leg-status.ts**：
+ * 退款报价引擎 lib/cancellation.ts 也要剥前缀，而 lib 层 import 本文件会形成反向依赖。
+ * 这里只做 re-export，让既有调用方（含单测）保持从本模块 import 不变。
+ * 写成 `export … from`（而不是转发本文件顶部那个 import 绑定）：后者在 vitest 的
+ * `vi.mock('./orders.service.js')` 局部 mock 下会变成一个指向未初始化局部绑定的 getter，
+ * 测试一 spread importOriginal() 就 ReferenceError。
  */
-const NO_SHOW_PREFIX = '【去程未登机】';
-const RETURN_RELEASED_PREFIX = '【回程座位已释放】';
-const LEGACY_NO_SHOW_PREFIX = '[去程 no-show] ';
-const LEGACY_RETURN_RELEASED_PREFIX = '[回程已释放] ';
-
-/**
- * 内部留痕前缀全集（no-show / 释放 / 取消航段，含半角旧写法）。
- * 这些前缀是**内部岗位的操作留痕**，代理与客户不该看到我们内部怎么标 ——
- * 对外序列化（serializeOrder 的脱敏分支、maskOrderForPublic）一律剥掉，见 stripInternalLegPrefix。
- */
-const INTERNAL_LEG_PREFIXES: readonly string[] = [
-  NO_SHOW_PREFIX,
-  RETURN_RELEASED_PREFIX,
-  LEG_CANCELLED_PREFIX.OUTBOUND,
-  LEG_CANCELLED_PREFIX.RETURN,
-  LEGACY_NO_SHOW_PREFIX,
-  LEGACY_RETURN_RELEASED_PREFIX,
-];
-
-/**
- * 剥掉行描述上的内部留痕前缀（可能叠加过多次，循环剥到干净）。
- * ADMIN/STAFF 视角保留前缀（内部要一眼看出这段的状态）；AGENT/CUSTOMER 视角一律剥。
- */
-export function stripInternalLegPrefix(description: string): string {
-  if (typeof description !== 'string' || description === '') return description;
-  let out = description;
-  let matched = true;
-  while (matched) {
-    matched = false;
-    for (const prefix of INTERNAL_LEG_PREFIXES) {
-      if (out.startsWith(prefix)) {
-        out = out.slice(prefix.length);
-        matched = true;
-        break;
-      }
-    }
-  }
-  return out;
-}
+export { stripInternalLegPrefix } from './orders.leg-status.js';
 
 /**
  * 跨单复制订单行 metadata 时必须**剔除**的「会话 / 座位账快照」键。
@@ -15161,6 +15314,10 @@ export function stripInternalLegPrefix(description: string): string {
  *   · requestToken 跨单重复 —— 新单再调 no-show / 取消航段，会命中回放分支，什么都不做却回成功；
  *   · releasedSeats 跟着走 —— 新单点「恢复回程」会照源单的放座明细再占一遍座（凭空多占）。
  * 拆出的新单从零开始：要标 no-show 就在新单上重新标一次。
+ *
+ * legActionLog 是幂等回放的**主**依据（append-only 的 token 流水，见 collectLegActionTokens）：
+ * 漏掉它就等于把源单见过的全部 token 一次性搬到新单，新单上任何一次 no-show / 恢复只要
+ * 复用了源单用过的 token 就会被判成重试直接回放 —— 座位一座没动却回成功，最难查。
  */
 const NON_INHERITABLE_ITEM_METADATA_KEYS: readonly string[] = [
   'noShow',
@@ -15168,6 +15325,7 @@ const NON_INHERITABLE_ITEM_METADATA_KEYS: readonly string[] = [
   'returnRestored',
   'returnVoidedFinal',
   'returnLegCancelled',
+  'legActionLog',
 ];
 
 /** 拆单复制行 metadata：显式剔除上面那批快照键，其余原样继承。 */
@@ -15277,6 +15435,8 @@ export interface ReturnReleasedSnapshot {
   originalCabin?: CabinClass | null;
   releasedSeats?: ReleasedSeatEntry[];
   ticketedAtRelease?: number;
+  /** 释放当时回程是否为「已开票」态（释放会把它清成未开，恢复不自动翻回；老快照缺省 undefined）。 */
+  returnInvoicedAtRelease?: boolean;
   workOrderReminderId?: string | null;
   note?: string | null;
 }
@@ -15356,6 +15516,63 @@ function appendLegActionLog(metadata: unknown, entry: LegActionLogEntry): LegAct
   return [...readLegActionLog(metadata), entry];
 }
 
+/**
+ * 这个 token 当初那一次 no-show **有没有释放回程**（幂等回放的入参比对依据）。
+ *
+ * 幂等回放的前提是「同 token = 同一个请求」。可 requestToken 由前端生成，同一个 token 换一份
+ * 请求体再发一次是完全可能的（弹窗里改了「同时释放回程」的勾选、又点了重试）。回放只按 token
+ * 命中就原样回成功，运营会以为「不释放回程」这次生效了 —— 实际上座位早在上一次被放掉了，
+ * 或者反过来以为释放成功了、座位其实还占着。这类分叉在事后审计里完全看不出来。
+ * 所以回放前先比对关键入参，对不上就 409 让前端换个新请求编号重来。
+ *
+ * 判定顺序按「哪份留痕最权威」：释放快照 > no-show 快照 > 再释放流水 > 动作流水。
+ * 返回 null = 老数据没留下足够线索（本次改动之前落库的行），此时不比对、按老行为回放（fail-open）。
+ */
+function resolveNoShowTokenReleaseFlag(
+  rows: ReadonlyArray<{ metadata: unknown }>,
+  requestToken: string,
+): boolean | null {
+  const tokenOf = (snapshot: unknown): string | null => {
+    const t = readJsonObject(snapshot).requestToken;
+    return typeof t === 'string' && t !== '' ? t : null;
+  };
+  // 1. 释放快照（含被顶掉压进 history 的历轮）命中 → 那一次确实释放了回程。
+  for (const row of rows) {
+    const released = readJsonObject(readJsonObject(row.metadata).returnReleased);
+    if (tokenOf(released) === requestToken) return true;
+    const history = Array.isArray(released.history) ? released.history : [];
+    if (history.some((h) => tokenOf(h) === requestToken)) return true;
+  }
+  // 2. 去程 no-show 快照命中 → 快照自己记着当初 releaseReturn 的结果。
+  //    快照没写这个键（更早的存量数据）→ 返回 null 不比对，绝不把「读不出来」当成「没释放」。
+  for (const row of rows) {
+    const noShow = readJsonObject(readJsonObject(row.metadata).noShow);
+    if (tokenOf(noShow) === requestToken) {
+      return typeof noShow.returnReleased === 'boolean' ? noShow.returnReleased : null;
+    }
+    const releaseHistory = Array.isArray(noShow.releaseHistory) ? noShow.releaseHistory : [];
+    // 「再释放一次回程」的流水：这条路径必然勾了释放（不勾会被闸挡在前面）。
+    if (releaseHistory.some((h) => tokenOf(h) === requestToken)) return true;
+  }
+  // 3. 动作流水兜底：RELEASE = 再释放一次回程，必然释放过。其余类型看不出入参，按未知处理。
+  for (const row of rows) {
+    for (const entry of readLegActionLog(row.metadata)) {
+      if (entry.requestToken !== requestToken) continue;
+      if (entry.type === 'RELEASE') return true;
+    }
+  }
+  return null;
+}
+
+/** 幂等回放时入参与首刷对不上 —— 稳定 code，前端据此提示换新请求编号重试。 */
+function tokenPayloadMismatchError(detail: Record<string, unknown>): AppError {
+  return new AppError('这个请求编号已用于另一次操作，请刷新后重试。', {
+    statusCode: 409,
+    code: 'TOKEN_PAYLOAD_MISMATCH',
+    details: detail,
+  });
+}
+
 /** 本次 no-show 的作用范围：整单 / 需要先按人拆单。 */
 export type NoShowScope = 'WHOLE' | 'SPLIT_REQUIRED';
 
@@ -15412,6 +15629,11 @@ export interface NoShowAudit {
 export interface RestoreReturnLegPreview {
   eligible: boolean;
   blockers: string[];
+  /**
+   * 非阻断提示：恢复之后**票务台还要动手做的事**（开票位重标、重新上名单工单），不影响 eligible。
+   * 系统不会自己补这两件事，不提示就成了静默缺口 —— 口径同 no-show 预检的 warnings。
+   */
+  warnings: string[];
   original: {
     orderItemId: string;
     flightNumber: string | null;
@@ -15422,6 +15644,11 @@ export interface RestoreReturnLegPreview {
   } | null;
   /** 原班次该舱当前余位（capacity − sold − 他人锁位 − 占位余座）。**可为负**（全站余位不夹 0）。 */
   available: number;
+  /**
+   * 余位不够、需要运营二次确认（提交时必须带 allowOversell）。
+   * 口径是**余位缺口**（含他人锁位与占位单余座），不是超售座数 —— 被锁位占满时这里为 true
+   * 而 oversellBy 可能是 0（sold 没超 capacity）。「超售 N 座」的措辞只看 oversellBy。
+   */
   needsOversell: boolean;
   /** 本次**新增**的超售座数（Σ 逐舱 increment）——「这一次会多卖几座」。 */
   oversellBy: number;
@@ -15446,7 +15673,7 @@ export interface RestoreReturnLegAudit {
   /** 本次超售的座数（增量）。 */
   oversoldBy: number;
   /**
-   * 恢复**之后**该班该舱的累计超售座数（sold + 锁位 + 占位余座 − capacity 的正数；0 = 未超）。
+   * 恢复**之后**该班该舱的累计超售座数（sold − capacity 的正数；0 = 未超。锁位/占位不算超售）。
    * 风控看的是这个数：第 3 次各超 1 座和第 1 次超 3 座，风险完全不同，只记增量看不出班次被卖到哪了。
    */
   scheduleOversoldAfter: number;
@@ -15457,6 +15684,19 @@ export interface RestoreReturnLegAudit {
 }
 
 /**
+ * 恢复回程时某一舱位的「要占几座 + 该舱现状」。
+ * capacity/sold 供超售口径（computeOversellDelta），available 供「走 CAS 占座还是超售直加」的分支 ——
+ * 两个口径分工见 cabinSeatStateWithinTx 的注释，绝不能互相替代。
+ */
+type RestoreSeatNeed = {
+  cabin: CabinClass;
+  quantity: number;
+  capacity: number;
+  sold: number;
+  available: number;
+};
+
+/**
  * 恢复回程时逐舱位的超售三值（快照 returnRestored.seatDetail[] 与审计 after 直接落这个形状）。
  * 写成 type 而非 interface：它要作为 metadata 快照的一部分赋给 Prisma.InputJsonValue，
  * 只有类型别名才拿得到隐式索引签名（口径同 ReleasedSeatEntry）。
@@ -15465,7 +15705,7 @@ export type OversellSeatDetail = {
   cabin: CabinClass;
   /** 本次要占回该舱几座。 */
   quantity: number;
-  /** 占座**前**该舱超售几座（= sold + 锁位 + 占位 − capacity，负数表示还有余位）。 */
+  /** 占座**前**该舱超售几座（= sold − capacity，负数表示还有物理空位；锁位/占位不算超售）。 */
   before: number;
   /** 占座**后**该舱超售几座。 */
   after: number;
@@ -15476,19 +15716,30 @@ export type OversellSeatDetail = {
 /**
  * 恢复回程的超售口径（预检与执行共用同一份算法，两边不再各算各的）。
  *
+ * ── 「超售」的唯一口径 = 纯 `sold vs capacity` ────────────────────────────────
+ *   before    = sold − capacity      占座**前**这一舱真的多卖了几座（负数 = 还有物理空位）
+ *   after     = before + quantity    占座**后**多卖几座
+ *   increment = max(0,after) − max(0,before)   本次**新增**几座超售，恒 ≥ 0
+ *
+ * ⚠ 这里**不减锁位、不减占位单余座**。那两样是「暂时不让别人卖」的软占用，不是已经卖出去的
+ * 座位：航司那边的实际卖出数只有 sold。旧写法用 available（= capacity − sold − 锁位 − 占位）
+ * 反推 before，于是一班明明还有 20 个物理空位、只是被锁位/占位单占满时，恢复 2 座会被报成
+ *「超售 2 座、班次累计超 2 座」，还可能直接顶到 FLIGHT_NOSHOW_MAX_OVERSELL_SEATS 上限被拒 ——
+ * 而这一班一座都没超卖。审计与房控看到的「超售座数」也跟着虚高，风控判断失真。
+ * 锁位/占位只参与另一件事：**这次是走 CAS 正常占座还是走超售直加**（那里仍用 available，
+ * 见 restoreReturnLeg 的占座循环）—— 别人锁着的位子确实不能当成有座直接抢。
+ *
  * ⚠ 增量与累计是两个数，混用过一次就再也看不出班次被卖到了什么程度：
  *   · `oversellBy`   = Σ increment —— **本次新增**几座超售，前端二次确认与「本次 +k」用它；
  *   · `oversoldAfter`= Σ max(0, after) —— 恢复**之后**该班这些舱一共超出几座，风控与上限判定用它。
- * 旧写法把 `max(0, quantity − available)` 当成本次增量：班次原本已超 1 座、本次恢复 2 座时，
- * 它算出 3（把别人早就卖穿的那 1 座也算到这次头上），真值是「本次新增 2、恢复后累计 3」。
  *
  * 多舱位（升舱拆座）一律**求和**而不是取最大值：经济舱超 2 + 商务舱超 1 就是这一班超了 3 座。
  */
 export function computeOversellDelta(
-  needs: ReadonlyArray<{ cabin: CabinClass; quantity: number; available: number }>,
+  needs: ReadonlyArray<{ cabin: CabinClass; quantity: number; capacity: number; sold: number }>,
 ): { detail: OversellSeatDetail[]; oversellBy: number; oversoldAfter: number } {
   const detail: OversellSeatDetail[] = needs.map((need) => {
-    const before = -need.available;
+    const before = need.sold - need.capacity;
     const after = before + need.quantity;
     return {
       cabin: need.cabin,
@@ -15506,15 +15757,20 @@ export function computeOversellDelta(
 }
 
 /**
- * 某班次某舱位的当前余位；该舱位没有配置时返回 null（调用方据此给 blocker）。
- * 口径与 takeSeatWithinTx 的 CAS 条件逐项对齐：capacity − sold − 他人 ACTIVE 锁位 − 占位余座。
- * **不夹 0** —— 已超售的班次要如实返回负数，否则前端会以为还有位。
+ * 某班次某舱位的座位现状；该舱位没有配置时返回 null（调用方据此给 blocker）。
+ *
+ * 三个数各有各的用处，**不能互相替代**：
+ *   · capacity / sold —— 「超售了几座」的唯一口径（见 computeOversellDelta）。锁位与占位单
+ *     是软占用，不是卖出去的座位，绝不参与超售计算。
+ *   · available —— 「现在还能不能直接卖一座」。口径与 takeSeatWithinTx 的 CAS 条件逐项对齐：
+ *     capacity − sold − 他人 ACTIVE 锁位 − 占位余座。**不夹 0**，已超售的班次如实返回负数，
+ *     否则前端会以为还有位。恢复回程据它决定走 CAS 占座还是走超售直加。
  */
-async function cabinAvailabilityWithinTx(
+async function cabinSeatStateWithinTx(
   db: Prisma.TransactionClient,
   scheduleId: string,
   cabin: CabinClass,
-): Promise<number | null> {
+): Promise<{ capacity: number; sold: number; available: number } | null> {
   const sc = await db.flightSeatClass.findFirst({
     where: { scheduleId, cabin },
     select: { capacity: true, sold: true },
@@ -15529,7 +15785,11 @@ async function cabinAvailabilityWithinTx(
     },
   });
   const held = await heldSeatsForCabin(db, scheduleId, cabin);
-  return sc.capacity - sc.sold - (lockedAgg._sum.qty ?? 0) - held;
+  return {
+    capacity: sc.capacity,
+    sold: sc.sold,
+    available: sc.capacity - sc.sold - (lockedAgg._sum.qty ?? 0) - held,
+  };
 }
 
 /**
@@ -17575,6 +17835,26 @@ export async function takeSeatWithinTx(
 }
 
 /**
+ * 该航段行「已经飞了」吗（座位账口径的唯一判定）。
+ *
+ * 状态机 `_updateStatusWithinTx` 的**放座分支与重新占座分支共用本函数**，两处必须严格对称：
+ *   · 放座侧：飞过的座位已被真实消耗，还回 sold 等于让过去的班次凭空多出可卖余位；
+ *   · 占座侧：既然当初没放，就绝不能再占回来 —— 占了就是给飞过去的班次凭空加一份 sold，
+ *     此后没有任何路径会释放它（再落取消族仍被这道闸跳过），永久卡账。
+ * 只有一边加判定 = 释放与占座不守恒，正是「no-show → 取消 → force 拉回」这条最常见路径。
+ *
+ * departureTime 存的是真 UTC 瞬间（departureTz 只用于展示折算），故直接与传入时刻比较。
+ * 没有班次时间（未联查 / 座位已释放的行）一律按「没飞」处理，交给各自分支的其它闸判断。
+ */
+function isLegAlreadyFlown(
+  item: { flightSchedule?: { departureTime: Date | null } | null },
+  atMs: number,
+): boolean {
+  const departAt = item.flightSchedule?.departureTime ?? null;
+  return departAt != null && departAt.getTime() <= atMs;
+}
+
+/**
  * 释放座位——下限钳制在 0（HIGH 修复第二层防线）。
  *
  * `sold = GREATEST(0, sold - qty)`（原子 SQL）取代普通 `decrement`：即便 businessUpgradeCount
@@ -18631,6 +18911,12 @@ export function serializeOrder<T extends OrderLike>(
     noteSpecial: redact ? undefined : order.noteSpecial,
     expectedAmountCny: redact ? undefined : order.expectedAmountCny,
     expectedAmountLocked: redact ? undefined : order.expectedAmountLocked,
+    // 航段留痕物化列：NO_SHOW / RETURN_RELEASED / RETURN_RESTORED / 去程或回程 VOIDED 说的都是
+    //「我方内部怎么处置的这段座位」，与行描述上的内部留痕前缀是同一类信息（那批前缀在下面的
+    // items 分支已经剥掉了）。只留 legFlag 不剥 = 前缀白剥了，代理照样能从这个枚举反推出来。
+    // 物化列本身只服务内部列表筛选与导出，对外角色（AGENT/CUSTOMER）一律不下发。
+    // hasReturnLeg 是客户自己也知道的行程事实（买没买回程），照常透出，两者不是一回事。
+    legFlag: redact ? undefined : (order as { legFlag?: unknown }).legFlag,
     settlementLocked: order.settlementLocked ?? false,
     // 锁定时间/操作人仅内部可见（对代理 redact），条件透传保持与 Prisma payload 类型兼容
     settlementLockedAt: redact ? undefined : (order.settlementLockedAt ?? null),

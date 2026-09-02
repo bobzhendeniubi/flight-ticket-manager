@@ -11,9 +11,13 @@ import { describe, it, expect, vi } from 'vitest';
 import { Prisma, UserRole } from '@prisma/client';
 
 // serializeOrder / orderSerializeRoleCtx 本身不查库，但导入 orders.service 会实例化 prisma 单例——mock 掉即可。
-vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
+// 公开脱敏视图（maskOrderForPublic）没有单独导出，只能经 lookupOrderPublic 走一趟，故留一个 findUnique。
+const { mockPrisma } = vi.hoisted(() => ({
+  mockPrisma: { order: { findUnique: vi.fn() } },
+}));
+vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
 
-import { serializeOrder, orderSerializeRoleCtx } from './orders.service.js';
+import { serializeOrder, orderSerializeRoleCtx, OrderService } from './orders.service.js';
 
 const dec = (n: number): Prisma.Decimal => new Prisma.Decimal(n);
 
@@ -523,5 +527,120 @@ describe('serializeOrder · 收款记录标注与脱敏', () => {
     const agentOut = serializeOrder(locked, orderSerializeRoleCtx(UserRole.AGENT)) as Record<string, any>;
     expect(agentOut.paymentsLocked).toBeUndefined();
     expect(agentOut.paymentsLockedBy).toBeUndefined();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 内部留痕前缀（no-show / 释放 / 取消航段）：内部保留，对外一律剥净
+// ══════════════════════════════════════════════════════════════════════════
+describe('serializeOrder · 行描述的内部留痕前缀', () => {
+  /** 六种前缀全集（四种全角新写法 + 两种半角旧写法）。存量行两种写法都有，得都剥得掉。 */
+  const PREFIXED_DESCRIPTIONS: Array<{ raw: string; clean: string }> = [
+    { raw: '【去程未登机】国航 CA123 经济舱', clean: '国航 CA123 经济舱' },
+    { raw: '【回程座位已释放】国航 CA124 经济舱', clean: '国航 CA124 经济舱' },
+    { raw: '【已取消去程】国航 CA125 经济舱', clean: '国航 CA125 经济舱' },
+    { raw: '【已取消回程】国航 CA126 经济舱', clean: '国航 CA126 经济舱' },
+    { raw: '[去程 no-show] 国航 CA127 经济舱', clean: '国航 CA127 经济舱' },
+    { raw: '[回程已释放] 国航 CA128 经济舱', clean: '国航 CA128 经济舱' },
+    // 叠加过多次的脏数据（先标 no-show、后取消航段）也要一路剥到干净。
+    { raw: '【已取消回程】【回程座位已释放】国航 CA129 经济舱', clean: '国航 CA129 经济舱' },
+  ];
+
+  function orderWithPrefixedItems() {
+    const base = buildOrder();
+    return {
+      ...base,
+      items: PREFIXED_DESCRIPTIONS.map((d, i) => ({
+        ...base.items[0],
+        id: `it_prefix_${i}`,
+        description: d.raw,
+      })),
+    };
+  }
+
+  it('ADMIN / STAFF 原样保留前缀（内部要一眼看出这段的状态）', () => {
+    for (const role of [UserRole.ADMIN, UserRole.STAFF]) {
+      const out = serializeOrder(orderWithPrefixedItems(), orderSerializeRoleCtx(role)) as Record<
+        string,
+        any
+      >;
+      PREFIXED_DESCRIPTIONS.forEach((d, i) => {
+        expect(out.items[i].description, `${role} 应保留前缀`).toBe(d.raw);
+      });
+    }
+  });
+
+  it('AGENT / CUSTOMER 六种前缀（含两种半角旧写法）与叠加写法一律剥净', () => {
+    for (const role of [UserRole.AGENT, UserRole.CUSTOMER]) {
+      const out = serializeOrder(orderWithPrefixedItems(), orderSerializeRoleCtx(role)) as Record<
+        string,
+        any
+      >;
+      PREFIXED_DESCRIPTIONS.forEach((d, i) => {
+        expect(out.items[i].description, `${role} 应剥净前缀`).toBe(d.clean);
+      });
+    }
+  });
+
+  it('公开查询视图（免登录）的 productName 同款剥净', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue({
+      orderNumber: 'CO-TEST-1',
+      status: 'PAID',
+      createdAt: new Date('2026-09-01T00:00:00Z'),
+      total: dec(1000),
+      guestPhone: '13800000000',
+      contactPhone: null,
+      guestEmail: null,
+      contactEmail: null,
+      user: null,
+      payments: [],
+      passengers: [{ fullName: '李四', firstName: null }],
+      items: PREFIXED_DESCRIPTIONS.map((d, i) => ({
+        id: `it_prefix_${i}`,
+        kind: 'FLIGHT',
+        description: d.raw,
+        quantity: 1,
+        amount: dec(1000),
+        hotelCheckIn: null,
+        metadata: null,
+        flightSchedule: null,
+      })),
+    });
+    const masked = await new OrderService().lookupOrderPublic({
+      orderNumber: 'CO-TEST-1',
+      phone: '13800000000',
+    } as Parameters<OrderService['lookupOrderPublic']>[0]);
+    expect(masked).not.toBeNull();
+    PREFIXED_DESCRIPTIONS.forEach((d, i) => {
+      expect(masked!.items[i].productName).toBe(d.clean);
+    });
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 航段留痕物化列 legFlag：内部筛选用，对外不下发
+// ══════════════════════════════════════════════════════════════════════════
+describe('serializeOrder · legFlag 物化列', () => {
+  const orderWithLegFlag = () => ({ ...buildOrder(), legFlag: 'RETURN_RELEASED', hasReturnLeg: true });
+
+  it('ADMIN / STAFF 看得到 legFlag', () => {
+    for (const role of [UserRole.ADMIN, UserRole.STAFF]) {
+      const out = serializeOrder(orderWithLegFlag(), orderSerializeRoleCtx(role)) as Record<
+        string,
+        any
+      >;
+      expect(out.legFlag, `${role} 应看得到 legFlag`).toBe('RETURN_RELEASED');
+    }
+  });
+
+  it('AGENT / CUSTOMER 拿不到 legFlag，但行程事实 hasReturnLeg 照常透出', () => {
+    for (const role of [UserRole.AGENT, UserRole.CUSTOMER]) {
+      const out = serializeOrder(orderWithLegFlag(), orderSerializeRoleCtx(role)) as Record<
+        string,
+        any
+      >;
+      expect(out.legFlag, `${role} 不该拿到 legFlag`).toBeUndefined();
+      expect(out.hasReturnLeg).toBe(true);
+    }
   });
 });
