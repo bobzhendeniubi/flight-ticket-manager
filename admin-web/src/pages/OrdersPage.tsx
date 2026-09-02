@@ -933,6 +933,8 @@ export function OrdersPage() {
   // 批量选酒店（随机池落位）：目标房型 + 逐单调用现有「换酒店」端点，仅作用于已选订单里
   // 「未落位随机池行」（kind=HOTEL 且 hotelRoomTypeId 为空且 randomStarTier 非空），其余单跳过。
   const [bulkHotels, setBulkHotels] = useState<Hotel[]>([]);
+  const [bulkHotelsLoaded, setBulkHotelsLoaded] = useState(false);
+  const [bulkHotelsLoading, setBulkHotelsLoading] = useState(false);
   const [bulkHotelRoomTypeId, setBulkHotelRoomTypeId] = useState('');
   const [bulkHotelSubmitting, setBulkHotelSubmitting] = useState(false);
   const [bulkHotelResult, setBulkHotelResult] = useState<{
@@ -1513,16 +1515,24 @@ export function OrdersPage() {
     ) return;
     void loadBulkAgents();
   }, [tokens?.accessToken, selectedIds.size, bulkAgentsLoaded, bulkAgentsLoading, bulkAgentsError, loadBulkAgents]);
-  // 批量选酒店用：在架酒店 + 房型列表，选中订单后按需拉一次（避免未用到该功能时空跑请求）。
+  // 批量选酒店用：拉全量酒店（含已下架）+ 房型列表，选中订单后按需拉一次。
+  // 占位酒店下架后，它名下已有订单行仍需按 randomTierPlaceholder 识别为未落位，不能只拉在架酒店。
   useEffect(() => {
-    if (!tokens?.accessToken || selectedIds.size === 0 || bulkHotels.length > 0) return;
+    if (!tokens?.accessToken || selectedIds.size === 0 || bulkHotelsLoaded || bulkHotelsLoading) return;
+    setBulkHotelsLoading(true);
     api
-      .listHotels(true, tokens.accessToken)
-      .then((r) => setBulkHotels(r.hotels))
+      .listHotels(false, tokens.accessToken)
+      .then((r) => {
+        setBulkHotels(r.hotels);
+        // 空数组也代表请求成功，不能再用 bulkHotels.length 判断是否加载过。
+        setBulkHotelsLoaded(true);
+        setBulkHotelsLoading(false);
+      })
       .catch(() => {
-        /* 加载失败不阻断其它批量操作；房型下拉留空，操作员可重新勾选触发重试 */
+        // 不置 loaded；下次重新选择订单时允许重试。
+        setBulkHotelsLoading(false);
       });
-  }, [tokens?.accessToken, selectedIds.size, bulkHotels.length]);
+  }, [tokens?.accessToken, selectedIds.size, bulkHotelsLoaded]);
   // 随机档「占位酒店」（Hotel.randomTierPlaceholder 非空）的全部房型 id。占位项不是真酒店：
   // 挂在它房型上的订单行业务上同样**还没落位**，所以既要能被批量落位选中，又不能当落位目标。
   // 判定一律看该字段，**不按酒店名字匹配**。
@@ -1558,7 +1568,7 @@ export function OrdersPage() {
     const opts: SearchSelectOption[] = [];
     for (const h of bulkHotels) {
       // 占位项不是真房源，不能作为落位目标（落过去等于原地没动）
-      if (h.randomTierPlaceholder != null) continue;
+      if (!h.isActive || h.randomTierPlaceholder != null) continue;
       for (const rt of h.roomTypes) {
         const price = Math.round(Number(rt.basePrice));
         opts.push({ id: rt.id, label: `${h.name} · ${rt.name}`, priceLabel: Number.isFinite(price) ? String(price) : rt.basePrice });
@@ -3258,8 +3268,14 @@ export function OrdersPage() {
               options={bulkHotelRoomTypeOptions}
               value={bulkHotelRoomTypeId || null}
               onChange={setBulkHotelRoomTypeId}
-              placeholder={bulkHotels.length ? '搜索目标酒店 / 房型…' : '加载中…'}
-              disabled={bulkHotelSubmitting || bulkHotels.length === 0}
+              placeholder={
+                bulkHotelsLoading
+                  ? '加载酒店中…'
+                  : bulkHotelRoomTypeOptions.length > 0
+                    ? '搜索目标酒店 / 房型…'
+                    : '暂无可落位的真酒店'
+              }
+              disabled={bulkHotelSubmitting || bulkHotelsLoading || bulkHotelRoomTypeOptions.length === 0}
               className="w-64"
             />
             <button
@@ -3276,7 +3292,7 @@ export function OrdersPage() {
             </button>
             <span className="text-xs text-ink-soft">
               仅对已选订单中「未落位占房行」生效（含仍挂在随机档占位项上的行；命中 {selectedPoolOrderCount}/
-              {selectedIds.size} 条），其余订单会被跳过。
+              {selectedIds.size} 条），其余订单会被跳过。已落到真酒店的订单不会被改动，要改请用单笔换酒店。
             </span>
           </div>
           {bulkHotelResult && (
