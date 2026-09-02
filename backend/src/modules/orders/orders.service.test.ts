@@ -24,6 +24,7 @@ const {
   mockResolveAgentSettlementDiscount,
   mockResolveRetailSettlementDiscount,
   mockGetSettlementRate,
+  mockAssertRandomTierFit,
 } = vi.hoisted(() => ({
   mockPrisma: {
     order: {
@@ -62,6 +63,9 @@ const {
     hotelRoomType: {
       findUnique: vi.fn(),
       // findMany：改期酒店日期同步的房量闸内部查房型→酒店归属（仅同步用例设置返回值）。
+      findMany: vi.fn(),
+    },
+    hotelBlockPeriod: {
       findMany: vi.fn(),
     },
     bundle: {
@@ -127,6 +131,7 @@ const {
   mockResolveAgentSettlementDiscount: vi.fn(),
   mockResolveRetailSettlementDiscount: vi.fn(),
   mockGetSettlementRate: vi.fn(),
+  mockAssertRandomTierFit: vi.fn(),
 }));
 
 // tx 对象与 mockPrisma 共享同一批 vi.fn()（swapPassenger 事务内 tx.order/tx.passenger/tx.fulfillmentTask
@@ -143,6 +148,7 @@ vi.mock('../../lib/cancellation.js', () => ({
 
 vi.mock('../hotel-control/hotel-control.service.js', () => ({
   getHotelNightlyRemaining: mockGetHotelNightlyRemaining,
+  assertRandomTierFit: mockAssertRandomTierFit,
   // 超售容忍上限：这些用例只关心立减/结算护栏，上限给 env 缺省同款常数即可
   getHotelOversellCapRooms: async () => 3,
 }));
@@ -180,6 +186,7 @@ import {
   passengerToData,
   createFulfillmentTasks,
   resolveOrderAgentId,
+  resolveHotelOversellCap,
   buildStayNightDates,
   summarizeBundleItems,
   deriveBundlePerAgeUnitPrices,
@@ -719,6 +726,115 @@ describe('OrderService 重复乘客校验', () => {
     expect(batchCreateOrdersBodySchema.safeParse({ ...base, settlementPriceCny: 1500 }).success).toBe(true);
     // 缺省（不传）仍合法 → 走旧动态定价路径
     expect(batchCreateOrdersBodySchema.safeParse(base).success).toBe(true);
+  });
+});
+
+describe('酒店超售 cap 统一身份口径', () => {
+  it('AGENT 与 ADMIN/STAFF 属于内部录单，CUSTOMER/游客不传 cap', async () => {
+    await expect(resolveHotelOversellCap({ role: 'AGENT' })).resolves.toBe(3);
+    await expect(resolveHotelOversellCap({ role: 'STAFF' })).resolves.toBe(3);
+    await expect(resolveHotelOversellCap({ role: 'ADMIN' })).resolves.toBe(3);
+    await expect(resolveHotelOversellCap({ role: 'CUSTOMER' })).resolves.toBeUndefined();
+    await expect(
+      resolveHotelOversellCap({ guest: { name: '游客', phone: '13800000000' } }),
+    ).resolves.toBeUndefined();
+  });
+
+  it('quoteOrder：AGENT 试算传入与 createOrder 同口径的内部 cap', async () => {
+    const service = new OrderService();
+    const serviceAny = service as unknown as Record<string, unknown>;
+    const priceSpy = vi
+      .spyOn(serviceAny as never, 'priceAndValidateItems' as never)
+      .mockResolvedValue([
+        { kind: 'HOTEL', description: '随机档', quantity: 1, unitPrice: 100, amount: 100 },
+      ] as never);
+    vi.spyOn(serviceAny as never, 'resolveBundleSettlementCalendarTotal' as never).mockResolvedValue(null as never);
+    vi.spyOn(serviceAny as never, 'resolveFlightSettlementCalendarTotal' as never).mockResolvedValue(null as never);
+
+    await service.quoteOrder(
+      {
+        items: [{ kind: 'HOTEL', description: '随机档', quantity: 1, unitPrice: 100, randomStarTier: 3 }],
+      } as never,
+      { role: 'AGENT' },
+    );
+
+    expect(priceSpy.mock.calls[0][5]).toBe(3);
+  });
+
+  it('OTA 手工结算价批量预定价：随机档行带上内部 cap 后放行预定价', async () => {
+    const service = new OrderService();
+    const serviceAny = service as unknown as Record<string, unknown>;
+    vi.spyOn(serviceAny as never, 'resolveBundleFlightLegs' as never).mockResolvedValue({
+      ok: true,
+      legs: [],
+      dates: { goDate: '2026-09-02' },
+      businessUpgradeCnyPerLeg: 0,
+    } as never);
+    mockPrisma.bundle.findUnique.mockResolvedValue({
+      name: '随机档套餐',
+      settlementTier: null,
+      items: [{ kind: 'HOTEL', qty: 1, unitPrice: 100 }],
+      groundDiscount: 0,
+      discountPct: 0,
+      isActive: true,
+      hotelRoomTypeId: null,
+      hotelNights: 1,
+      singleSupplementCnyPerNight: 0,
+      businessUpgradeCnyPerLeg: 0,
+      outboundFlight: null,
+      returnFlight: null,
+      childSeatDiscountCnyPerPerson: 0,
+      infantPriceCny: 0,
+      selfVisaDeductCny: 0,
+      operationFeeCny: 0,
+      legs: 1,
+      hotelRoomType: null,
+    });
+    mockPrisma.hotelRoomType.findUnique.mockResolvedValue({
+      id: 'random-placeholder-room',
+      hotelId: 'random-placeholder-hotel',
+      maxAdults: 2,
+      maxChildren: 1,
+      hotel: {
+        name: '随机档占位酒店',
+        isActive: true,
+        designationSurchargeCnyPerPerson: 0,
+        randomTierPlaceholder: 3,
+        starRating: 3,
+        intlFiveStar: false,
+      },
+    });
+    mockPrisma.hotelBlockPeriod.findMany.mockResolvedValue([]);
+    mockAssertRandomTierFit.mockResolvedValue([]);
+    vi.spyOn(service, 'createOrder').mockResolvedValue({ id: 'ord-1', orderNumber: 'ORD-1' } as never);
+
+    const result = await service.batchCreateOrders(
+      {
+        productType: 'BUNDLE',
+        bundleId: 'bundle-1',
+        bundleDepartDate: '2026-09-02',
+        description: '随机档套餐',
+        manualUnitPriceCny: 100,
+        passengers: [
+          {
+            fullName: '测试乘客',
+            documentNumber: 'E12345678',
+            dateOfBirth: '1990-01-01',
+            passportExpiry: '2031-01-01',
+            designatedHotelRoomTypeId: 'random-placeholder-room',
+          },
+        ],
+      },
+      { userId: 'staff-1', role: 'STAFF' },
+    );
+
+    expect(result.successCount).toBe(1);
+    expect(mockAssertRandomTierFit).toHaveBeenCalledWith(
+      3,
+      ['2026-09-02'],
+      0.5,
+      expect.objectContaining({ maxOversellRooms: Number.POSITIVE_INFINITY }),
+    );
   });
 });
 

@@ -1261,7 +1261,6 @@ export async function getRandomTierAggregate(
     select: { id: true },
   });
   const hotelIds = hotels.map((h) => h.id);
-  if (hotelIds.length === 0) return empty;
 
   const orderWhere = {
     deletedAt: null,
@@ -1298,13 +1297,13 @@ export async function getRandomTierAggregate(
       select: { hotelCheckIn: true, hotelCheckOut: true, roomsBilled: true, metadata: true },
     }),
   ]);
-  if (periods.length === 0) return empty;
-
-  const block = expandBlockByDate(periods, nightDates);
+  // 未纳入管控时仍保留真实占用，供每日加房清单识别「有需求但还没切房」；
+  // 下单闸继续由 hasBlock=false 短路放行，不把这里变成新的库存闸。
+  const block = periods.length > 0 ? expandBlockByDate(periods, nightDates) : nightDates.map(() => 0);
   const hotelUsed = expandUsedByDate(hotelItems, nightDates);
   const pendingUsed = expandUsedByDate(pendingItems, nightDates);
   const remaining = block.map((b, i) => round2(b - hotelUsed[i] - pendingUsed[i]));
-  return { hasBlock: true, block, hotelUsed, pendingUsed, remaining };
+  return { hasBlock: periods.length > 0, block, hotelUsed, pendingUsed, remaining };
 }
 
 /**
@@ -1337,21 +1336,26 @@ export async function assertRandomTierFit(
   client: HotelControlDbClient = defaultPrisma,
 ): Promise<RandomTierFitViolation[]> {
   const agg = await getRandomTierAggregate(tier, nightDates, opts, client);
-  if (!agg.hasBlock) return [];
+  const isInternalChannel = opts.maxOversellRooms != null;
+  // 对外渠道：整段未切房仍视为未纳入管控，不把内部库存信息返回给客人。
+  // 内部录单：随机档是需求池，即使整段/某晚 block 为 0，也要把缺口明细交给审计、清单和提醒。
+  if (!agg.hasBlock && !isInternalChannel) return [];
   const tolerated: RandomTierFitViolation[] = [];
   for (let i = 0; i < nightDates.length; i++) {
-    // block[i] === 0 = 该晚同星级酒店都没切房 → 未管控，不拦截
-    if (agg.block[i] <= 0) continue;
-    const after = round2(agg.remaining[i] - rooms);
+    // 对外渠道 block[i] === 0 = 该晚未纳入管控，不拦截；内部渠道按 block=0 计算缺口。
+    const block = agg.block[i] ?? 0;
+    if (block <= 0 && !isInternalChannel) continue;
+    const remaining = agg.remaining[i] ?? 0;
+    const after = round2(remaining - rooms);
     if (after < 0) {
       const shortfall = round2(-after);
       if (opts.maxOversellRooms != null && shortfall <= opts.maxOversellRooms) {
-        tolerated.push({ date: nightDates[i], remaining: agg.remaining[i], rooms, shortfall });
+        tolerated.push({ date: nightDates[i], remaining, rooms, shortfall });
         continue;
       }
       throw new BadRequestError(
         opts.buildMessage?.() ??
-          `${randomStarTierLabel(tier)}余量不足（${nightDates[i]} 同星级酒店合计余量 ${agg.remaining[i]} 间，本次需 ${rooms} 间）` +
+          `${randomStarTierLabel(tier)}余量不足（${nightDates[i]} 同星级酒店合计余量 ${remaining} 间，本次需 ${rooms} 间）` +
             (opts.maxOversellRooms != null
               ? `，缺口已超出超售容忍上限 ${opts.maxOversellRooms} 间`
               : ''),

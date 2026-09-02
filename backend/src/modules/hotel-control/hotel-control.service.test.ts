@@ -1958,12 +1958,74 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
     );
   });
 
+  it('内部需求池传 Infinity → 任意大缺口放行，并返回缺口明细；对外缺省仍拒', async () => {
+    const internal = aggClient({
+      hotelIds: ['h1'],
+      periods: [{ dateFrom: day(0), dateTo: day(1), rooms: 3 }],
+      pendingItems: [stay()],
+    });
+    await expect(
+      assertRandomTierFit(
+        3,
+        [dayStr(0)],
+        99,
+        { maxOversellRooms: Number.POSITIVE_INFINITY },
+        internal,
+      ),
+    ).resolves.toMatchObject([{ date: dayStr(0), shortfall: 97 }]);
+
+    const external = aggClient({
+      hotelIds: ['h1'],
+      periods: [{ dateFrom: day(0), dateTo: day(1), rooms: 3 }],
+      pendingItems: [stay()],
+    });
+    await expect(assertRandomTierFit(3, [dayStr(0)], 99, {}, external)).rejects.toThrow(
+      /三星随机余量不足/,
+    );
+  });
+
   it('该档次一家酒店都没切房 → 未管控，不拦截（未配包房 ≠ 售罄）', async () => {
     const noHotels = aggClient({ hotelIds: [], periods: [] });
     await expect(assertRandomTierFit(3, [dayStr(0)], 99, {}, noHotels)).resolves.toEqual([]);
 
     const noPeriods = aggClient({ hotelIds: ['h1'], periods: [] });
     await expect(assertRandomTierFit(3, [dayStr(0)], 99, {}, noPeriods)).resolves.toEqual([]);
+  });
+
+  it('内部需求池：整段未切房或单晚 block=0 也返回缺口；对外仍不拦截', async () => {
+    const noPeriods = aggClient({ hotelIds: ['h1'], periods: [] });
+    await expect(
+      assertRandomTierFit(
+        3,
+        [dayStr(0)],
+        99,
+        { maxOversellRooms: Number.POSITIVE_INFINITY },
+        noPeriods,
+      ),
+    ).resolves.toMatchObject([{ date: dayStr(0), remaining: 0, rooms: 99, shortfall: 99 }]);
+
+    const partialBlock = aggClient({
+      hotelIds: ['h1'],
+      periods: [{ dateFrom: day(1), dateTo: day(2), rooms: 3 }],
+    });
+    const partialViolations = await assertRandomTierFit(
+      3,
+      [dayStr(0), dayStr(1)],
+      4,
+      { maxOversellRooms: Number.POSITIVE_INFINITY },
+      partialBlock,
+    );
+    expect(partialViolations).toContainEqual(
+      expect.objectContaining({ date: dayStr(0), remaining: 0, rooms: 4, shortfall: 4 }),
+    );
+
+    const externalPartialBlock = aggClient({
+      hotelIds: ['h1'],
+      periods: [{ dateFrom: day(1), dateTo: day(2), rooms: 3 }],
+    });
+    await expect(
+      assertRandomTierFit(3, [dayStr(0), dayStr(1)], 4, {}, externalPartialBlock),
+    ).rejects.toThrow(/三星随机余量不足/);
   });
 
   it('拼房半间按床位口径吃 0.5：余 0.5 时还能再塞一位拼房客', async () => {
@@ -1973,6 +2035,21 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
       pendingItems: [stay({ roomsBilled: 1.5 })],
     });
     await expect(assertRandomTierFit(3, [dayStr(0)], 0.5, {}, client)).resolves.toEqual([]);
+  });
+
+  it('未切任何包房时仍保留随机需求占用，供清单显示未切房缺口', async () => {
+    const client = aggClient({
+      hotelIds: ['h1'],
+      periods: [],
+      pendingItems: [stay({ roomsBilled: 1.5 })],
+    });
+    await expect(getRandomTierAggregate(3, [dayStr(0)], {}, client)).resolves.toMatchObject({
+      hasBlock: false,
+      block: [0],
+      hotelUsed: [0],
+      pendingUsed: [1.5],
+      remaining: [-1.5],
+    });
   });
 
   // ── 限额内超售放行（内部录单口子，语义同 assertHotelPhysicalFit.maxOversellRooms）──
@@ -2069,6 +2146,24 @@ describe('assertRandomTierFitWithinTx（随机档事务内加锁版下单闸）'
       lockRandomTierBlockPeriodsWithinTx(tx as unknown as TxArg, 3, [dayStr(0)]),
     ).resolves.toBeUndefined();
     expect(tx.$queryRaw).not.toHaveBeenCalled();
+  });
+
+  it('事务内内部需求池：未切房也返回缺口明细；对外缺省仍返回空数组', async () => {
+    const internal = fakeTierTx({ hotelIds: ['h1'], periods: [] });
+    await expect(
+      assertRandomTierFitWithinTx(
+        internal.tx as unknown as TxArg,
+        3,
+        [dayStr(0)],
+        99,
+        { maxOversellRooms: Number.POSITIVE_INFINITY },
+      ),
+    ).resolves.toMatchObject([{ date: dayStr(0), shortfall: 99 }]);
+
+    const external = fakeTierTx({ hotelIds: ['h1'], periods: [] });
+    await expect(
+      assertRandomTierFitWithinTx(external.tx as unknown as TxArg, 3, [dayStr(0)], 99),
+    ).resolves.toEqual([]);
   });
 
   it('空 nightDates（无入住区间）→ 连酒店都不查，安静返回', async () => {
