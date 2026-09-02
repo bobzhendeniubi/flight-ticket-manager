@@ -404,7 +404,7 @@
 <h3>7.1 入口在哪</h3>
 <ul>
   <li>订单详情页里（运营工具附近）有个「no-show 处理」按钮——本单有去程航段、还没标过 no-show 才会出现。</li>
-  <li>标过 no-show、回程也恢复过之后，这颗按钮会变成「再次释放回程」（代理又不要回程了，再放一次）。</li>
+  <li>标过去程 no-show 之后，只要回程座位还在（没释放过，或者释放后又恢复回来），这个入口<strong>不会消失</strong>，只是换个文案继续留在原地：只标了 no-show、当时没勾「同时释放回程」的单，按钮变成「释放回程座位」，之后随时能从这个按钮把回程放出去；标过 no-show、回程释放过又恢复回来的单，按钮变成「再次释放回程」（代理又不要回程了，再放一次）。回程一旦被释放或作废（不可再恢复），入口才会收起。</li>
   <li>回程那一行旁边有「恢复回程」按钮——只有回程座位处于「已释放」状态时才会出现。</li>
 </ul>
 <!-- TODO 截图：订单详情「no-show 处理」按钮位置 -->
@@ -414,7 +414,7 @@
 <div class="steps">
   <div class="step">打开订单详情，点「no-show 处理」。</div>
   <div class="step">面板顶部勾选这次要标记的乘客，默认全选＝整单处理。只勾部分人：系统会先按你勾的人自动拆出一张新单（票随人走），再对新单标记——<strong>套餐单目前拆不了单，只能整单处理</strong>，勾部分人会被挡下来。</div>
-  <div class="step">勾选「同时释放回程座位」（默认勾选）。只想记一笔去程 no-show、暂时不放回程座位，就取消这个勾。</div>
+  <div class="step">勾选「同时释放回程座位」（默认勾选）。只想记一笔去程 no-show、暂时不放回程座位，就取消这个勾——不影响以后再放，回来时同一个入口会变成「释放回程座位」按钮，直接点它继续释放即可，不用重新勾人。</div>
   <div class="step">可以填一句备注（比如航司名单的日期、核对来源）。</div>
   <div class="step">点确认，再确认一次就生效。</div>
 </div>
@@ -446,7 +446,7 @@
 <div class="steps">
   <div class="step">回程行点「恢复回程」，面板先做预检：原班次现在还有几座余位。</div>
   <div class="step">有余位：直接占回原班次、原舱位（含当初升舱拆分的座位，也是原样占回），点确认即可。</div>
-  <div class="step">没余位：面板会提示还差几座，需要勾选「确认超售」才能继续——超售会把这个班次卖穿，系统按<strong>关键审计</strong>记这一笔，且有总量上限，超过上限会直接拒绝，不能无限超下去。</div>
+  <div class="step">没余位：不是勾选框，而是弹一个<strong>红色二次确认框</strong>，按钮文案会写清楚这次还要再超几座（比如「确认再超 2 座并恢复」）。面板会显示「该班已超售 A 座，本次再超 k 座，恢复后累计 N 座（上限 M 座）」——上限按这个<strong>班次累计</strong>算，不是单看这一次。点了按钮才真正超售，系统按<strong>关键审计</strong>记这一笔，超过上限会直接拒绝，不能无限超下去。</div>
 </div>
 <!-- TODO 截图：恢复回程面板（有余位 / 超售二次确认两种状态） -->
 
@@ -470,9 +470,9 @@
 <h2 id="s8">八、《票务专用》导出与 PNR 提交表</h2>
 <p>把乘客名单按航司要求的格式导成 Excel，拿去开票系统提交，共有两个入口：</p>
 
-<h3>7.1 入口一：单笔订单——详情里的「运营工具」</h3>
+<h3>8.1 入口一：单笔订单——详情里的「运营工具」</h3>
 <div class="figure">
-  <div class="cap">图 7-1 · 订单详情底部「运营工具」区</div>
+  <div class="cap">图 8-1 · 订单详情底部「运营工具」区</div>
   <div class="mock">
     <div class="mock-row" style="justify-content:space-between;">
       <strong style="color:var(--brand); font-size:13px;">运营工具</strong>
@@ -486,7 +486,7 @@
   <div class="point">▲ 「导出 PNR Excel」= 只导这一单的乘客，25 列航司格式，文件名如 <span class="mono">PNR_FTM20260721001.xlsx</span>。「打包护照图片」把本单乘客护照照片打成 zip，方便核对。</div>
 </div>
 
-<h3>7.2 入口二：批量——列表顶部的「模板导出」选《票务专用》</h3>
+<h3>8.2 入口二：批量——列表顶部的「模板导出」选《票务专用》</h3>
 <p>先按第四节的方法筛选（或直接勾选订单），再在列表上方的模板导出里选<strong>《票务专用》</strong>。规则：</p>
 <ul>
   <li><strong>勾选了订单 → 只导勾选的这些</strong>（忽略筛选条件）；没勾选 → 按当前筛选条件导出。</li>
@@ -495,7 +495,7 @@
   <li>文件名如 <span class="mono">订单导出_票务专用_2026-07-21.xlsx</span>。</li>
 </ul>
 
-<h3>7.3 表里的姓名为什么带 MR / MS / MSTR / MISS？</h3>
+<h3>8.3 表里的姓名为什么带 MR / MS / MSTR / MISS？</h3>
 <p>这是<strong>航司要求的称谓</strong>，系统按乘客<strong>在出发那天的实足年龄</strong>自动算出来，不用手填：</p>
 <table>
   <tr><th>出发日年龄</th><th>类型（PTC 列）</th><th>男</th><th>女</th></tr>
@@ -509,7 +509,7 @@
   <li>没录生日的乘客按成人处理——所以<strong>提交前请补齐生日</strong>，称谓和婴童类型才准。</li>
 </ul>
 <div class="figure">
-  <div class="cap">图 7-2 · 《票务专用》表头节选（前几列）与示例行</div>
+  <div class="cap">图 8-2 · 《票务专用》表头节选（前几列）与示例行</div>
   <div style="overflow-x:auto;">
     <table style="font-size:12px; white-space:nowrap;">
       <tr><th>代理</th><th>备注</th><th>Last Name</th><th>First Name and Middle Name</th><th>Title</th><th>PTC</th><th>Gender</th><th>Date of Birth</th><th>Passport Number</th><th>…</th></tr>
@@ -531,7 +531,7 @@
   <div class="step">出完票回来，把这批订单的对应航段开关翻成"已开"（可用第五节的批量开票）。明天再筛"未开"时它们就不会再出现。</div>
 </div>
 <div class="figure">
-  <div class="cap">图 8-1 · 票务开票导出面板</div>
+  <div class="cap">图 9-1 · 票务开票导出面板</div>
   <div class="mock" style="background:var(--sky-bg); border-color:var(--sky-line);">
     <div class="mock-row">
       <span><span class="lbl">出发日期（必填）</span><span class="inp hl">2026-07-25</span></span>
