@@ -13786,7 +13786,7 @@ function isUniqueViolation(err: unknown, fieldHint: string): boolean {
  * 两处各写一套，迟早出现「预检按 A 组字段放行、锁内按 B 组字段算钱」的漂移。
  * 覆盖四件事：挑套餐行、判已落位、算出发日、算旧档有效金额与占房。
  */
-const CHANGE_BUNDLE_ITEM_SELECT = {
+export const CHANGE_BUNDLE_ITEM_SELECT = {
   id: true,
   kind: true,
   quantity: true,
@@ -13819,7 +13819,7 @@ interface ChangeBundleCandidateRow {
  * 状态集合与换酒店 / 酒店改期同一份：改档会改应收（长出/减掉一笔差额），
  * 在已取消 / 已退款 / 超时 / 草稿单上做，等于给死单凭空改账、能被算出二次退款。
  */
-function assertOrderChangeBundleAllowed(order: {
+export function assertOrderChangeBundleAllowed(order: {
   status: OrderStatus;
   deletedAt: Date | null;
 }): void {
@@ -13844,7 +13844,7 @@ function assertOrderChangeBundleAllowed(order: {
  * 锁外预检与锁内权威判定共用本函数：并发可能在这两次之间把单改成任一种「不该改」，
  * 两处各写一套判定必然漂移。
  */
-function resolveChangeableBundleRow<T extends ChangeBundleCandidateRow>(
+export function resolveChangeableBundleRow<T extends ChangeBundleCandidateRow>(
   items: readonly T[],
   targetBundleId: string,
 ): { row: T; bundleId: string } {

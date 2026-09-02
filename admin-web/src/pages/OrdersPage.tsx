@@ -39,6 +39,9 @@ import {
   settlementRequestsApi,
   type SettlementRequest,
   type SettlementRequestStatus,
+  bundleChangeRequestsApi,
+  type BundleChangeRequest,
+  type BundleChangeRequestStatus,
 } from '../lib/api';
 import { countryIso3ToIso2 } from '../lib/passportOcr';
 import { runPassportOcr, ocrReviewHintText } from '../lib/passportOcrRunner';
@@ -968,6 +971,8 @@ export function OrdersPage() {
   // 或列表刷新时（同一 refreshNonce）重拉一次，避免徽标数长期滞后。
   const [showSettlementRequestQueue, setShowSettlementRequestQueue] = useState(false);
   const [settlementRequestPendingCount, setSettlementRequestPendingCount] = useState<number | null>(null);
+  const [showBundleChangeRequestQueue, setShowBundleChangeRequestQueue] = useState(false);
+  const [bundleChangeRequestPendingCount, setBundleChangeRequestPendingCount] = useState<number | null>(null);
 
   // 拉取订单 — 下单日期/出行日期/claimFilter/航班号/乘客姓名/开票状态 变化时重拉（后端过滤）
   useEffect(() => {
@@ -1001,6 +1006,19 @@ export function OrdersPage() {
       .listSettlementRequests(t, { status: 'PENDING', pageSize: 1 })
       .then((res) => { if (!cancelled) setSettlementRequestPendingCount(res.pagination.total); })
       .catch(() => { /* 徽标拉取失败静默：不影响主列表，按钮本身仍可点开队列核实 */ });
+    return () => { cancelled = true; };
+  }, [isOps, tokens?.accessToken, refreshNonce]);
+
+  // 套餐改档申请待处理数（仅 ADMIN/STAFF 拉；代理在订单详情里提交申请）。
+  useEffect(() => {
+    if (!isOps) return;
+    const t = tokens?.accessToken;
+    if (!t) return;
+    let cancelled = false;
+    bundleChangeRequestsApi
+      .listBundleChangeRequests(t, { status: 'PENDING', pageSize: 1 })
+      .then((res) => { if (!cancelled) setBundleChangeRequestPendingCount(res.pagination.total); })
+      .catch(() => { /* 徽标拉取失败静默，打开队列时仍会重新核实 */ });
     return () => { cancelled = true; };
   }, [isOps, tokens?.accessToken, refreshNonce]);
 
@@ -2211,6 +2229,20 @@ export function OrdersPage() {
               {!!settlementRequestPendingCount && (
                 <span className="ml-1.5 rounded-full bg-amber-500 px-1.5 py-0.5 text-[11px] font-semibold text-white">
                   {settlementRequestPendingCount}
+                </span>
+              )}
+            </button>
+          )}
+          {isOps && (
+            <button
+              className="btn-secondary relative text-sm"
+              onClick={() => setShowBundleChangeRequestQueue(true)}
+              title="代理提交的套餐改档申请，在这里集中确认/驳回"
+            >
+              改档申请
+              {!!bundleChangeRequestPendingCount && (
+                <span className="ml-1.5 rounded-full bg-amber-500 px-1.5 py-0.5 text-[11px] font-semibold text-white">
+                  {bundleChangeRequestPendingCount}
                 </span>
               )}
             </button>
@@ -4139,6 +4171,36 @@ export function OrdersPage() {
         />
       )}
 
+      {showBundleChangeRequestQueue && (
+        <BundleChangeRequestQueueModal
+          onClose={() => setShowBundleChangeRequestQueue(false)}
+          onDecided={(updated) => {
+            setRefreshNonce((n) => n + 1);
+            if (updated) {
+              setOrders((prev) => prev.map((o) => (o.id === updated.id ? updated : o)));
+              setSelected((prev) => (prev && prev.id === updated.id ? updated : prev));
+            }
+          }}
+          onOpenOrder={(orderId) => {
+            const local = orders.find((o) => o.id === orderId);
+            if (local) {
+              setSelected(local);
+              setShowBundleChangeRequestQueue(false);
+              return;
+            }
+            const t = tokens?.accessToken;
+            if (!t) return;
+            api
+              .getOrder(t, orderId)
+              .then((r) => {
+                setSelected(r.order);
+                setShowBundleChangeRequestQueue(false);
+              })
+              .catch(() => alert('打开订单详情失败，请到列表搜索该订单号'));
+          }}
+        />
+      )}
+
       {/* 回收站（仅 ADMIN）：已软删订单表 + 每行恢复 */}
       {showRecycleBin && (
         <div
@@ -4553,6 +4615,7 @@ function OrderDrawer({
   const needsRooming = orderNeedsRooming(o);
   const hasRooming = orderHasRooming(o);
   const [roomingOpen, setRoomingOpen] = useState(false);
+  const [bundleChangeOpen, setBundleChangeOpen] = useState(false);
   // 运营专属（ADMIN/STAFF）：更改归属代理 + 事后补收单房差。复用上面已解析的 role。
   const isOps = role === 'ADMIN' || role === 'STAFF';
   const [agentEditOpen, setAgentEditOpen] = useState(false);
@@ -4736,6 +4799,14 @@ function OrderDrawer({
               含补水态，补水完成后按权威 order 重新拉一次该单的申请列表。 */}
           <SettlementRequestSection
             key={`${o.id}:sr:${hydrated ? 'h' : 'l'}`}
+            order={o}
+            role={role}
+            onOrderUpdated={handleOrderUpdated}
+          />
+
+          <BundleChangeRequestSection
+            key={`bcr-${o.id}:${hydrated ? 'h' : 'l'}`}
+            id={`bcr-${o.id}`}
             order={o}
             role={role}
             onOrderUpdated={handleOrderUpdated}
@@ -5009,7 +5080,27 @@ function OrderDrawer({
 
           {/* 产品内容 */}
           <section>
-            <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">产品内容</h3>
+            <div className="flex items-center justify-between gap-2">
+              <h3 className="text-xs font-semibold uppercase tracking-wide text-ink-muted">产品内容</h3>
+              {isBundleOrder(o) && isOps && (
+                <button
+                  type="button"
+                  className="text-[11px] font-medium text-indigo-600 hover:text-indigo-800"
+                  onClick={() => setBundleChangeOpen(true)}
+                >
+                  套餐改档
+                </button>
+              )}
+              {isBundleOrder(o) && role === 'AGENT' && (
+                <button
+                  type="button"
+                  className="text-[11px] font-medium text-indigo-600 hover:text-indigo-800"
+                  onClick={() => document.getElementById(`bcr-${o.id}`)?.scrollIntoView({ behavior: 'smooth', block: 'start' })}
+                >
+                  申请改档
+                </button>
+              )}
+            </div>
             {isBundleOrder(o) ? (
               <>
                 <div className="mt-2">
@@ -5073,6 +5164,20 @@ function OrderDrawer({
               )}
             </p>
           </section>
+
+          {bundleChangeOpen && isOps && (() => {
+            const bundleLine = (o.items ?? []).find((it) => it.kind === 'BUNDLE');
+            if (!bundleLine) return null;
+            return (
+              <BundleChangeModal
+                orderId={o.id}
+                currentBundleId={bundleLine.bundleId ?? null}
+                currentLabel={bundleLine.description}
+                onClose={() => setBundleChangeOpen(false)}
+                onChanged={handleOrderUpdated}
+              />
+            );
+          })()}
 
           <PriceAdjustmentSection order={o} onOrderUpdated={handleOrderUpdated} />
 
@@ -7126,6 +7231,50 @@ function SplitRoomGroupModal({
 // 「档次」在数据模型上就是另一条套餐记录（结算档次 / 晚数是套餐自身的属性），所以改档 = 换套餐。
 // 定价与换酒店同一套：原行金额冻结，「新应收 − 原应收」落一条差额调价行；机票行/班次/座位一律不动。
 // 落位到真实酒店的单、已取消的单、选中同一套餐，后端会拒（400，文案原样展示给运营）。
+function useActiveBundleOptions(currentBundleId: string | null): {
+  options: SearchSelectOption[];
+  loading: boolean;
+  error: string | null;
+} {
+  const [bundles, setBundles] = useState<Bundle[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    setLoading(true);
+    setError(null);
+    api
+      .listBundles(true)
+      .then((r) => {
+        if (!cancelled) setBundles(r.bundles);
+      })
+      .catch(() => {
+        if (!cancelled) setError('套餐列表加载失败，请关闭重试');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const options = useMemo(
+    () =>
+      bundles
+        .filter((b) => b.id !== currentBundleId)
+        .map((b) => ({
+          id: b.id,
+          label: `${b.code ? `[${b.code}] ` : ''}${b.name}`,
+          priceLabel: String(Math.round((b.originalPerPaxCny ?? 0) * (1 - (b.discountPct ?? 0) / 100))),
+        })),
+    [bundles, currentBundleId],
+  );
+
+  return { options, loading, error };
+}
+
 function BundleChangeModal({
   orderId,
   currentBundleId,
@@ -7142,46 +7291,12 @@ function BundleChangeModal({
 }) {
   const token = useAuth((s) => s.tokens)?.accessToken ?? '';
   const dialogRef = useDialogA11y(onClose);
-  const [bundles, setBundles] = useState<Bundle[]>([]);
-  const [loading, setLoading] = useState(true);
+  const { options, loading, error: bundleLoadError } = useActiveBundleOptions(currentBundleId);
   const [targetId, setTargetId] = useState<string | null>(null);
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [done, setDone] = useState<{ diffCny: number; warnings: string[] } | null>(null);
-
-  // 只列在售套餐：改档是往「现在还能卖」的档次上换，停售档次不该出现在候选里。
-  useEffect(() => {
-    let cancelled = false;
-    api
-      .listBundles(true)
-      .then((r) => {
-        if (!cancelled) setBundles(r.bundles);
-      })
-      .catch(() => {
-        if (!cancelled) setErr('套餐列表加载失败，请关闭重试');
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  // 候选项与批量录单同一构造口径：`[编号] 名称`，priceLabel = 折后起价/人
-  //（originalPerPaxCny ×(1−discountPct/100)，与套餐卡「¥X 起/人」一致）。当前这档排除掉——换成自己后端也会拒。
-  const options: SearchSelectOption[] = useMemo(
-    () =>
-      bundles
-        .filter((b) => b.id !== currentBundleId)
-        .map((b) => ({
-          id: b.id,
-          label: `${b.code ? `[${b.code}] ` : ''}${b.name}`,
-          priceLabel: String(Math.round((b.originalPerPaxCny ?? 0) * (1 - (b.discountPct ?? 0) / 100))),
-        })),
-    [bundles, currentBundleId],
-  );
 
   async function submit(): Promise<void> {
     if (!token || !targetId || submitting) return;
@@ -7295,7 +7410,9 @@ function BundleChangeModal({
             指定酒店将被清除，需重新指定。机票行、班次与座位不受影响。
           </div>
 
-          {err && <div className="rounded bg-rose-50 px-2 py-1.5 text-xs text-rose-700">{err}</div>}
+          {(err ?? bundleLoadError) && (
+            <div className="rounded bg-rose-50 px-2 py-1.5 text-xs text-rose-700">{err ?? bundleLoadError}</div>
+          )}
         </div>
 
         <div className="mt-4 flex justify-end gap-2">
@@ -10297,6 +10414,459 @@ function SettlementRequestQueueModal({
                     </tr>
                   );
                 })}
+              </tbody>
+            </table>
+          </div>
+        )}
+      </div>
+    </Modal>
+  );
+}
+
+// ── 套餐改档申请：代理提申请、运营确认后才真正改档 ─────────────────────────────
+const BUNDLE_CHANGE_REQUEST_STATUS_LABEL: Record<BundleChangeRequestStatus, string> = {
+  PENDING: '待确认',
+  APPROVED: '已确认',
+  REJECTED: '已驳回',
+};
+
+function BundleChangeRequestStatusBadge({ status }: { status: BundleChangeRequestStatus }) {
+  const cls =
+    status === 'PENDING'
+      ? 'bg-amber-100 text-amber-700'
+      : status === 'APPROVED'
+        ? 'bg-emerald-100 text-emerald-700'
+        : 'bg-rose-100 text-rose-700';
+  return (
+    <span className={`rounded px-1.5 py-0.5 text-[11px] font-medium ${cls}`}>
+      {BUNDLE_CHANGE_REQUEST_STATUS_LABEL[status]}
+    </span>
+  );
+}
+
+function bundleDiffLabel(diffCny: number): string {
+  return `${diffCny >= 0 ? '+' : '−'}¥${Math.abs(diffCny).toLocaleString('zh-CN')}`;
+}
+
+function BundleChangeRequestForm({
+  orderId,
+  currentBundleId,
+  onCreated,
+}: {
+  orderId: string;
+  currentBundleId: string | null;
+  onCreated: (request: BundleChangeRequest) => void;
+}) {
+  const token = useAuth((s) => s.tokens)?.accessToken ?? '';
+  const { options, loading, error: optionsError } = useActiveBundleOptions(currentBundleId);
+  const [targetId, setTargetId] = useState<string | null>(null);
+  const [note, setNote] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async (): Promise<void> => {
+    if (!token || !targetId || submitting) return;
+    setSubmitting(true);
+    setError(null);
+    try {
+      const result = await bundleChangeRequestsApi.createBundleChangeRequest(token, orderId, {
+        bundleId: targetId,
+        note: note.trim() || undefined,
+      });
+      onCreated(result.request);
+      setTargetId(null);
+      setNote('');
+    } catch (e: unknown) {
+      setError(e instanceof ApiError ? e.message : '提交失败，请稍后重试');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3 text-sm">
+      <div className="text-xs text-slate-500">想换成别的档次？提交申请，运营确认后才会改档并重新计价。</div>
+      <label className="mt-2 block text-xs text-slate-500">
+        目标套餐
+        <SearchSelect
+          options={options}
+          value={targetId}
+          onChange={setTargetId}
+          placeholder={loading ? '加载套餐列表…' : options.length ? '搜索目标套餐…' : '暂无其它在售套餐'}
+          disabled={loading || submitting || options.length === 0}
+          className="mt-1"
+        />
+      </label>
+      <label className="mt-2 block text-xs text-slate-500">
+        备注（选填）
+        <input
+          className="input mt-1 w-full"
+          value={note}
+          maxLength={200}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder="如：客人想升到四星"
+          disabled={submitting}
+        />
+      </label>
+      {(error ?? optionsError) && <div className="mt-1 text-xs text-rose-600">{error ?? optionsError}</div>}
+      <button
+        type="button"
+        className="btn-primary mt-2 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+        disabled={submitting || !targetId}
+        onClick={() => void submit()}
+      >
+        {submitting ? '提交中…' : '提交改档申请'}
+      </button>
+    </div>
+  );
+}
+
+function BundleChangeRequestSection({
+  id,
+  order,
+  role,
+  onOrderUpdated,
+}: {
+  id: string;
+  order: OrderSummary;
+  role?: string;
+  onOrderUpdated?: (order: OrderSummary) => void;
+}) {
+  const token = useAuth((s) => s.tokens)?.accessToken ?? '';
+  const confirm = useConfirm();
+  const isAgentUser = role === 'AGENT';
+  const isOpsUser = role === 'ADMIN' || role === 'STAFF';
+  const isBundle = isBundleOrder(order);
+  const bundleLine = (order.items ?? []).find((it) => it.kind === 'BUNDLE');
+  const currentBundleId = bundleLine?.bundleId ?? null;
+  const currentLabel = bundleLine?.description ?? '当前套餐';
+  const orderAgentName = order.agent?.companyName?.trim() || order.agent?.contactName?.trim() || '—';
+
+  const [requests, setRequests] = useState<BundleChangeRequest[]>([]);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [decisionNoteById, setDecisionNoteById] = useState<Record<string, string>>({});
+  const [decidingId, setDecidingId] = useState<string | null>(null);
+  const [decisionResults, setDecisionResults] = useState<
+    Record<string, { diffCny: number; warnings: string[] }>
+  >({});
+
+  const load = useCallback(() => {
+    if (!token || !isBundle || (!isAgentUser && !isOpsUser)) return () => {};
+    let cancelled = false;
+    setLoading(true);
+    setLoadError(null);
+    bundleChangeRequestsApi
+      .listOrderBundleChangeRequests(token, order.id)
+      .then((result) => { if (!cancelled) setRequests(result.requests); })
+      .catch((e: unknown) => {
+        if (!cancelled) setLoadError(e instanceof ApiError ? e.message : '改档申请加载失败');
+      })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
+  }, [token, order.id, isBundle, isAgentUser, isOpsUser]);
+  useEffect(() => load(), [load]);
+
+  const decide = async (request: BundleChangeRequest, action: 'approve' | 'reject'): Promise<void> => {
+    if (!token || decidingId) return;
+    const note = (decisionNoteById[request.id] ?? '').trim();
+    const confirmed = await confirm({
+      title: action === 'approve' ? '确认改档申请？' : '驳回改档申请？',
+      body:
+        action === 'approve'
+          ? `确认后将按「${request.toBundleName}」重新计价，差额计入订单调价（可正可负），指定酒店会被清除。`
+          : '驳回后订单套餐、价格和住宿均不变，代理会看到驳回原因。',
+      tone: action === 'approve' ? 'default' : 'danger',
+      confirmText: action === 'approve' ? '确认改档' : '驳回',
+      cancelText: '取消',
+    });
+    if (!confirmed) return;
+    setDecidingId(request.id);
+    try {
+      if (action === 'approve') {
+        const result = await bundleChangeRequestsApi.approveBundleChangeRequest(token, request.id, note || undefined);
+        setRequests((prev) => prev.map((item) => (item.id === result.request.id ? result.request : item)));
+        setDecisionResults((prev) => ({
+          ...prev,
+          [request.id]: { diffCny: result.diffCny, warnings: result.warnings ?? [] },
+        }));
+        onOrderUpdated?.(result.order);
+      } else {
+        const result = await bundleChangeRequestsApi.rejectBundleChangeRequest(token, request.id, note || undefined);
+        setRequests((prev) => prev.map((item) => (item.id === result.request.id ? result.request : item)));
+      }
+    } catch (e: unknown) {
+      // 后端 400 中文文案（已落位需先换酒店等）原样透出，方便运营按提示处理。
+      alert(e instanceof ApiError ? e.message : '操作失败，请稍后重试');
+    } finally {
+      setDecidingId(null);
+    }
+  };
+
+  if (!isBundle || (!isAgentUser && !isOpsUser)) return null;
+
+  const sortedDesc = [...requests].sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  const pending = sortedDesc.filter((request) => request.status === 'PENDING');
+  const history = sortedDesc.filter((request) => request.status !== 'PENDING' && !decisionResults[request.id]);
+
+  return (
+    <section id={id} className="scroll-mt-4 space-y-2">
+      <div className="flex flex-wrap items-center gap-2 text-xs font-semibold uppercase tracking-wide text-ink-muted">
+        <span>改档申请</span>
+        <span className="font-normal normal-case text-slate-400" title={currentLabel}>当前：{currentLabel}</span>
+      </div>
+      {loading && requests.length === 0 && <div className="text-xs text-ink-muted">加载中…</div>}
+      {loadError && <div className="text-xs text-rose-600">{loadError}</div>}
+
+      {isAgentUser && sortedDesc.map((request) => (
+        <div key={`bcr-agent-${request.id}`} className="rounded-xl border border-slate-200 bg-white p-3 text-sm">
+          <div className="flex flex-wrap items-center gap-2">
+            <BundleChangeRequestStatusBadge status={request.status} />
+            <span className="font-medium text-slate-800">{request.fromBundleName} → {request.toBundleName}</span>
+            <span className="text-[11px] text-slate-400">{formatDateTimeSecCn(request.createdAt)}</span>
+          </div>
+          <div className="mt-1 text-xs text-slate-500">
+            原套餐 {request.fromNights == null ? '晚数未记录' : `${request.fromNights}晚`} · 目标套餐 {request.toNights == null ? '晚数未记录' : `${request.toNights}晚`}
+          </div>
+          {request.note && <div className="mt-1 text-xs text-slate-600">备注：{request.note}</div>}
+          {request.status === 'REJECTED' && request.decisionNote && (
+            <div className="mt-1 text-xs text-rose-600">驳回原因：{request.decisionNote}</div>
+          )}
+          {request.status === 'APPROVED' && request.decisionNote && (
+            <div className="mt-1 text-xs text-emerald-700">确认备注：{request.decisionNote}</div>
+          )}
+          {request.status === 'PENDING' && (
+            <div className="mt-1 text-[11px] text-amber-600">等待运营确认，确认前订单不变</div>
+          )}
+          {request.status === 'APPROVED' && request.appliedDiffCny !== null && (
+            <div className="mt-1 text-xs text-emerald-700">
+              已按新档重算，差额 {bundleDiffLabel(Number(request.appliedDiffCny))}
+            </div>
+          )}
+        </div>
+      ))}
+
+      {isAgentUser && pending.length === 0 && (
+        <BundleChangeRequestForm
+          orderId={order.id}
+          currentBundleId={currentBundleId}
+          onCreated={(request) => setRequests((prev) => [request, ...prev])}
+        />
+      )}
+
+      {isOpsUser && sortedDesc.map((request) => {
+        const result = decisionResults[request.id];
+        if (result) {
+          return (
+            <div key={`bcr-result-${request.id}`} className="rounded-xl border border-emerald-300 bg-emerald-50 p-3 text-sm text-emerald-900">
+              <div className="font-medium">套餐改档已完成：{request.fromBundleName} → {request.toBundleName}</div>
+              <div className="mt-1">
+              {result.diffCny === 0
+                  ? '按新档重新计价后应收未变，未产生差额。'
+                  : result.diffCny > 0
+                    ? `按新档重新计价，需向客户补收 ¥${result.diffCny.toLocaleString('zh-CN')}（已落一条差额调价行）。`
+                    : `按新档重新计价，应收减少 ¥${Math.abs(result.diffCny).toLocaleString('zh-CN')}（已落一条差额调价行）。`}
+              </div>
+              <div className="mt-1 text-xs text-emerald-700">已收款项未做任何变动，尾款/多付按新应收自然浮动。</div>
+              {result.warnings.length > 0 && (
+                <ul className="mt-2 space-y-1 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                  {result.warnings.map((warning, index) => <li key={`bcr-warning-${request.id}-${index}`}>· {warning}</li>)}
+                </ul>
+              )}
+            </div>
+          );
+        }
+        if (request.status !== 'PENDING') return null;
+        return (
+          <div key={`bcr-ops-${request.id}`} className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm">
+            <div className="font-medium text-amber-900">
+              代理改档申请：{request.fromBundleName} → {request.toBundleName}
+            </div>
+            <div className="mt-1 text-xs text-amber-700">
+              申请人：{orderAgentName} · {formatDateTimeSecCn(request.createdAt)}
+            </div>
+            {request.fromNights != null && request.toNights != null && request.fromNights !== request.toNights && (
+              <div className="mt-1 text-xs text-amber-800">晚数有变化，确认后回程航班需另行改期</div>
+            )}
+            {request.note && <div className="mt-1 text-xs text-amber-800">备注：{request.note}</div>}
+            <input
+              className="input mt-2 w-full text-xs"
+              placeholder="确认/驳回备注（选填）"
+              maxLength={200}
+              value={decisionNoteById[request.id] ?? ''}
+              onChange={(e) => setDecisionNoteById((prev) => ({ ...prev, [request.id]: e.target.value }))}
+              disabled={decidingId === request.id}
+            />
+            <div className="mt-2 flex gap-2">
+              <button
+                type="button"
+                className="btn-primary text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={decidingId === request.id}
+                onClick={() => void decide(request, 'approve')}
+              >
+                确认改档
+              </button>
+              <button
+                type="button"
+                className="btn-danger text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                disabled={decidingId === request.id}
+                onClick={() => void decide(request, 'reject')}
+              >
+                驳回
+              </button>
+            </div>
+          </div>
+        );
+      })}
+
+      {isOpsUser && history.length > 0 && (
+        <details className="text-xs text-slate-500">
+          <summary className="cursor-pointer select-none">历史申请（{history.length}）</summary>
+          <div className="mt-1.5 space-y-1.5">
+            {history.map((request) => (
+              <div key={`bcr-history-${request.id}`} className="rounded-lg border border-slate-200 bg-white p-2">
+                <div className="flex flex-wrap items-center gap-2">
+                  <BundleChangeRequestStatusBadge status={request.status} />
+                  <span className="font-medium text-slate-700">{request.fromBundleName} → {request.toBundleName}</span>
+                  <span className="text-slate-400">{formatDateTimeSecCn(request.createdAt)}</span>
+                </div>
+                <div className="mt-0.5 text-slate-500">申请人：{orderAgentName}</div>
+                {request.note && <div className="mt-0.5">申请备注：{request.note}</div>}
+                {request.decisionNote && <div className="mt-0.5 text-slate-600">{request.status === 'REJECTED' ? '驳回原因' : '确认备注'}：{request.decisionNote}</div>}
+              </div>
+            ))}
+          </div>
+        </details>
+      )}
+    </section>
+  );
+}
+
+function BundleChangeRequestQueueModal({
+  onClose,
+  onDecided,
+  onOpenOrder,
+}: {
+  onClose: () => void;
+  onDecided?: (order?: OrderSummary) => void;
+  onOpenOrder: (orderId: string) => void;
+}) {
+  const token = useAuth((s) => s.tokens)?.accessToken ?? '';
+  const confirm = useConfirm();
+  const [items, setItems] = useState<BundleChangeRequest[]>([]);
+  const [total, setTotal] = useState(0);
+  const [loading, setLoading] = useState(false);
+  const [loadError, setLoadError] = useState<string | null>(null);
+  const [decidingId, setDecidingId] = useState<string | null>(null);
+  const [decisionNoteById, setDecisionNoteById] = useState<Record<string, string>>({});
+
+  const load = useCallback(() => {
+    if (!token) return;
+    setLoading(true);
+    setLoadError(null);
+    bundleChangeRequestsApi
+      .listBundleChangeRequests(token, { status: 'PENDING', page: 1, pageSize: 50 })
+      .then((result) => {
+        setItems(result.requests);
+        setTotal(result.pagination.total);
+      })
+      .catch((e: unknown) => setLoadError(e instanceof ApiError ? e.message : '加载失败'))
+      .finally(() => setLoading(false));
+  }, [token]);
+  useEffect(() => { load(); }, [load]);
+
+  const decide = async (item: BundleChangeRequest, action: 'approve' | 'reject'): Promise<void> => {
+    if (!token || decidingId) return;
+    const note = (decisionNoteById[item.id] ?? '').trim();
+    const confirmed = await confirm({
+      title: action === 'approve' ? '确认改档申请？' : '驳回改档申请？',
+      body:
+        action === 'approve'
+          ? `订单 ${item.orderNumber ?? item.orderId}：确认后将按「${item.toBundleName}」重新计价，指定酒店会被清除。`
+          : `订单 ${item.orderNumber ?? item.orderId}：驳回后订单套餐和价格不变。`,
+      tone: action === 'approve' ? 'default' : 'danger',
+      confirmText: action === 'approve' ? '确认改档' : '驳回',
+      cancelText: '取消',
+    });
+    if (!confirmed) return;
+    setDecidingId(item.id);
+    try {
+      if (action === 'approve') {
+        const result = await bundleChangeRequestsApi.approveBundleChangeRequest(token, item.id, note || undefined);
+        if (result.warnings.length > 0) alert(result.warnings.join('\n'));
+        setItems((prev) => prev.filter((candidate) => candidate.id !== item.id));
+        setTotal((count) => Math.max(0, count - 1));
+        onDecided?.(result.order);
+      } else {
+        await bundleChangeRequestsApi.rejectBundleChangeRequest(token, item.id, note || undefined);
+        setItems((prev) => prev.filter((candidate) => candidate.id !== item.id));
+        setTotal((count) => Math.max(0, count - 1));
+        onDecided?.();
+      }
+    } catch (e: unknown) {
+      alert(e instanceof ApiError ? e.message : '操作失败，请稍后重试');
+    } finally {
+      setDecidingId(null);
+    }
+  };
+
+  return (
+    <Modal open onClose={onClose} title={`改档申请 · 待处理 ${total}`} size="xl">
+      <div className="max-h-[70vh] overflow-auto px-5 py-4">
+        {loading && items.length === 0 && <div className="text-sm text-ink-muted">加载中…</div>}
+        {loadError && <div className="text-sm text-rose-600">{loadError}</div>}
+        {!loading && !loadError && items.length === 0 && <div className="text-sm text-ink-muted">当前没有待处理的改档申请。</div>}
+        {items.length > 0 && (
+          <div className="overflow-x-auto">
+            <table className="w-full min-w-[800px] text-left text-sm">
+              <thead className="text-xs uppercase tracking-wide text-ink-muted">
+                <tr>
+                  <th className="pb-2 pr-3">订单号</th>
+                  <th className="pb-2 pr-3">代理</th>
+                  <th className="pb-2 pr-3">人数</th>
+                  <th className="pb-2 pr-3">当前套餐 → 目标套餐</th>
+                  <th className="pb-2 pr-3">申请时间</th>
+                  <th className="pb-2 pr-3">备注</th>
+                  <th className="pb-2 pr-3">操作</th>
+                </tr>
+              </thead>
+              <tbody>
+                {items.map((item) => (
+                  <tr key={`bcr-queue-${item.id}`} className="border-t border-slate-100 align-top">
+                    <td className="py-2 pr-3">
+                      <button type="button" className="font-mono text-xs font-medium text-brand hover:text-brand-dark" onClick={() => onOpenOrder(item.orderId)}>
+                        {item.orderNumber ?? item.orderId}
+                      </button>
+                    </td>
+                    <td className="py-2 pr-3 text-xs text-ink-soft">{item.agentName ?? '直客'}</td>
+                    <td className="py-2 pr-3 text-xs text-ink-soft">{item.passengerCount ?? '—'}</td>
+                    <td className="py-2 pr-3 text-xs text-ink-soft">
+                      <div>{item.fromBundleName} → {item.toBundleName}</div>
+                      <div className="mt-0.5 text-[11px] text-slate-400">
+                        {item.fromNights == null ? '—' : `${item.fromNights}晚`} → {item.toNights == null ? '—' : `${item.toNights}晚`}
+                        {item.nightsChanged && <span className="ml-1 rounded bg-amber-100 px-1 text-amber-700">晚数变</span>}
+                      </div>
+                    </td>
+                    <td className="py-2 pr-3 text-xs text-ink-soft">{formatDateTimeSecCn(item.createdAt)}</td>
+                    <td className="py-2 pr-3 text-xs text-ink-soft">
+                      <div className="max-w-[150px] truncate" title={item.note ?? undefined}>{item.note ?? '—'}</div>
+                      <input
+                        className="input mt-1 w-36 text-[11px]"
+                        placeholder="确认/驳回备注"
+                        maxLength={200}
+                        value={decisionNoteById[item.id] ?? ''}
+                        onChange={(e) => setDecisionNoteById((prev) => ({ ...prev, [item.id]: e.target.value }))}
+                        disabled={decidingId === item.id}
+                      />
+                    </td>
+                    <td className="py-2 pr-3">
+                      <div className="flex gap-1.5">
+                        <button type="button" className="btn-primary px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-50" disabled={decidingId === item.id} onClick={() => void decide(item, 'approve')}>确认改档</button>
+                        <button type="button" className="btn-danger px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-50" disabled={decidingId === item.id} onClick={() => void decide(item, 'reject')}>驳回</button>
+                      </div>
+                    </td>
+                  </tr>
+                ))}
               </tbody>
             </table>
           </div>

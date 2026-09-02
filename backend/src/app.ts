@@ -43,6 +43,10 @@ import {
   settlementRequestRoutes,
   orderSettlementRequestRoutes,
 } from './modules/settlement-requests/settlement-requests.routes.js';
+import {
+  bundleChangeRequestRoutes,
+  orderBundleChangeRequestRoutes,
+} from './modules/bundle-change-requests/bundle-change-requests.routes.js';
 import { marketingRoutes } from './modules/marketing/marketing.routes.js';
 import { ocrRoutes } from './modules/ocr/ocr.routes.js';
 import { settingsRoutes } from './modules/settings/settings.routes.js';
@@ -102,6 +106,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(orderRoutes, { prefix: '/orders' });
   await app.register(orderReviewRoutes, { prefix: '/orders' });
   await app.register(orderSettlementRequestRoutes, { prefix: '/orders' });
+  await app.register(orderBundleChangeRequestRoutes, { prefix: '/orders' });
   await app.register(orderCostItemRoutes, { prefix: '/orders' });
   await app.register(seatLockRoutes, { prefix: '/seat-locks' });
   await app.register(seatAllocationRoutes, { prefix: '/seat-allocations' });
@@ -112,6 +117,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(settlementRateRoutes, { prefix: '/settlement-rates' });
   await app.register(settlementDiscountRoutes, { prefix: '/settlement-discounts' });
   await app.register(settlementRequestRoutes, { prefix: '/settlement-requests' });
+  await app.register(bundleChangeRequestRoutes, { prefix: '/bundle-change-requests' });
   await app.register(flightSettlementRateRoutes, { prefix: '/flight-settlement-rates' });
   await app.register(productRoutes, { prefix: '/products' });
   await app.register(dashboardRoutes, { prefix: '/dashboard' });

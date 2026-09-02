@@ -336,6 +336,7 @@ model Agent {
   holdOrders             HoldOrder[]
   settlementDiscountRules SettlementDiscountRule[]
   settlementRequests      SettlementRequest[]
+  bundleChangeRequests    BundleChangeRequest[]
 
   @@index([isActive])
   @@index([parentAgentId])
@@ -895,6 +896,12 @@ enum SettlementRequestStatus {
   REJECTED
 }
 
+enum BundleChangeRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
 model SettlementRequest {
   id                      String                  @id @default(cuid())
   orderId                 String
@@ -919,6 +926,40 @@ model SettlementRequest {
   createdAt               DateTime                @default(now())
 
   order Order  @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  agent Agent? @relation(fields: [agentId], references: [id], onDelete: SetNull)
+
+  @@index([orderId])
+  @@index([status, createdAt])
+}
+
+model BundleChangeRequest {
+  id                String                    @id @default(cuid())
+  orderId           String
+  // 归属代理；直客单（运营代提）为空
+  agentId           String?
+  // 提交人 userId（代理账号本人，或代提的运营）
+  requestedById     String
+  // 提交时套餐行所绑套餐（快照：id + 名称 + 晚数），不建 FK（套餐可被删/改名，历史申请要保持可读）
+  fromBundleId      String
+  fromBundleName    String
+  fromNights        Int?
+  // 目标套餐（快照同上）
+  toBundleId        String
+  toBundleName      String
+  toNights          Int?
+  // 申请理由（代理填）
+  note              String?
+  status            BundleChangeRequestStatus @default(PENDING)
+  decidedById       String?
+  decidedAt         DateTime?
+  decisionNote      String?
+  // 确认执行成功后回填：执行时间 / 差额（新应收 − 原应收）/ 差额行 OrderItem id（差额为 0 时无行，留空）
+  appliedAt         DateTime?
+  appliedDiffCny    Decimal?                  @db.Decimal(12, 2)
+  appliedDiffItemId String?
+  createdAt         DateTime                  @default(now())
+
+  order Order @relation(fields: [orderId], references: [id], onDelete: Restrict)
   agent Agent? @relation(fields: [agentId], references: [id], onDelete: SetNull)
 
   @@index([orderId])
@@ -1583,6 +1624,7 @@ model Order {
   splitsOut         OrderSplitRecord[]     @relation("SplitSource")
   splitsIn          OrderSplitRecord[]     @relation("SplitTarget")
   settlementRequests SettlementRequest[]
+  bundleChangeRequests BundleChangeRequest[]
 
   @@index([userId, createdAt])
   @@index([agentId, createdAt])

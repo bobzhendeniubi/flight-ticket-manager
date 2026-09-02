@@ -6413,5 +6413,98 @@ export const settlementRequestsApi = {
       method: 'POST',
       token,
       body: note ? { note } : {},
+  }),
+};
+
+// ── 套餐改档申请（代理提申请 → 运营确认后执行既有「套餐改档」）── 独立命名空间，
+// 对应 backend/src/modules/bundle-change-requests/*。
+
+export type BundleChangeRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
+
+export interface BundleChangeRequest {
+  id: string;
+  orderId: string;
+  orderNumber: string | null;
+  agentId: string | null;
+  agentName: string | null;
+  passengerCount: number | null;
+  requestedById: string;
+  fromBundleId: string;
+  fromBundleName: string;
+  fromNights: number | null;
+  toBundleId: string;
+  toBundleName: string;
+  toNights: number | null;
+  nightsChanged: boolean;
+  note: string | null;
+  status: BundleChangeRequestStatus;
+  decidedById: string | null;
+  decidedAt: string | null;
+  decisionNote: string | null;
+  appliedAt: string | null;
+  appliedDiffCny: string | null;
+  appliedDiffItemId: string | null;
+  createdAt: string;
+}
+
+function bundleChangeRequestQuery(params?: {
+  status?: BundleChangeRequestStatus;
+  page?: number;
+  pageSize?: number;
+}): string {
+  const usp = new URLSearchParams();
+  if (params?.status) usp.set('status', params.status);
+  if (params?.page) usp.set('page', String(params.page));
+  if (params?.pageSize) usp.set('pageSize', String(params.pageSize));
+  const qs = usp.toString();
+  return qs ? `?${qs}` : '';
+}
+
+export const bundleChangeRequestsApi = {
+  /** 代理对自家套餐单提交改档申请；订单不会立即改变。 */
+  createBundleChangeRequest: (
+    token: string,
+    orderId: string,
+    body: { bundleId: string; note?: string },
+  ) =>
+    apiFetch<{ request: BundleChangeRequest }>(`/orders/${orderId}/bundle-change-requests`, {
+      method: 'POST',
+      token,
+      body,
+    }),
+
+  /** 该订单的全部改档申请。 */
+  listOrderBundleChangeRequests: (token: string, orderId: string) =>
+    apiFetch<{ requests: BundleChangeRequest[] }>(`/orders/${orderId}/bundle-change-requests`, { token }),
+
+  /** 运营待处理队列。 */
+  listBundleChangeRequests: (
+    token: string,
+    params?: { status?: BundleChangeRequestStatus; page?: number; pageSize?: number },
+  ) =>
+    apiFetch<{ requests: BundleChangeRequest[]; pagination: { page: number; pageSize: number; total: number } }>(
+      `/bundle-change-requests${bundleChangeRequestQuery(params)}`,
+      { token },
+    ),
+
+  /** 运营确认：服务端调用既有套餐改档并重新计价。 */
+  approveBundleChangeRequest: (token: string, id: string, note?: string) =>
+    apiFetch<{
+      request: BundleChangeRequest;
+      order: OrderSummary;
+      diffCny: number;
+      warnings: string[];
+    }>(`/bundle-change-requests/${id}/approve`, {
+      method: 'POST',
+      token,
+      body: note ? { note } : {},
+    }),
+
+  /** 运营驳回，不改订单。 */
+  rejectBundleChangeRequest: (token: string, id: string, note?: string) =>
+    apiFetch<{ request: BundleChangeRequest }>(`/bundle-change-requests/${id}/reject`, {
+      method: 'POST',
+      token,
+      body: note ? { note } : {},
     }),
 };
