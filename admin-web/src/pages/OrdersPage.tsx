@@ -5019,10 +5019,7 @@ function OrderDrawer({
                           canOperate={isOps}
                           settlementLocked={o.settlementLocked === true}
                           roomGroups={o.roomAssignment?.roomGroups}
-                          passengers={(o.passengers ?? []).map((p) => ({
-                            id: p.id,
-                            name: p.chineseName?.trim() || p.fullName,
-                          }))}
+                          passengers={reschedulePassengerOptions(o)}
                           outboundLegItemId={outboundFlightLegId(o)}
                           returnLegItemId={returnFlightLegId(o)}
                         />
@@ -5045,10 +5042,7 @@ function OrderDrawer({
                     canOperate={isOps}
                     settlementLocked={o.settlementLocked === true}
                     roomGroups={o.roomAssignment?.roomGroups}
-                    passengers={(o.passengers ?? []).map((p) => ({
-                      id: p.id,
-                      name: p.chineseName?.trim() || p.fullName,
-                    }))}
+                    passengers={reschedulePassengerOptions(o)}
                     outboundLegItemId={outboundFlightLegId(o)}
                     returnLegItemId={returnFlightLegId(o)}
                   />
@@ -6614,6 +6608,21 @@ function returnFlightLegId(o: OrderSummary): string | null {
   return legs.length >= 2 ? legs[1] : null;
 }
 
+/** 按人改期的原票作废提示（确认弹窗与勾选面板共用同一句，口径不分叉）。 */
+const TICKETED_RESCHEDULE_HINT = '已出票的乘客：拆出后改期会作废其原票，需票务台重开。';
+
+/** 改期乘客勾选列表用：本单出行人 + 每人是否已出票（按人改期的原票作废提示据此显示）。
+ *  判定两层：乘客自己的 PNR/票号，或订单级航段开票位已开（列表接口可能不回票号，
+ *  开票位是全岗都拿得到的兜底信号，此时按「全员已出票」提示，宁可多提示不可漏）。 */
+function reschedulePassengerOptions(o: OrderSummary): Array<{ id: string; name: string; ticketed: boolean }> {
+  const legInvoiced = o.outboundInvoiced === true || o.returnInvoiced === true;
+  return (o.passengers ?? []).map((p) => ({
+    id: p.id,
+    name: p.chineseName?.trim() || p.fullName,
+    ticketed: legInvoiced || Boolean(p.pnr?.trim() || p.eticketNumber?.trim()),
+  }));
+}
+
 /** 本行是否已被「取消航段」作废：后端在 metadata.returnLegCancelled 落一个快照对象
  *  （at/leg/feeCny/原班次…），对象存在即视为已取消；也兼容布尔 true。结构不符视为未取消。
  *  返回被取消的方向，供徽标写「去程已取消 / 回程已取消」；老数据无 leg 字段一律按回程读
@@ -6655,8 +6664,9 @@ function OrderItemRow({
   settlementLocked?: boolean;
   /** 本单分房表房组（「拆房组」入口用；未分房不传） */
   roomGroups?: RoomGroup[];
-  /** 本单出行人（拆房组弹窗展示组内乘客名用；改期乘客勾选列表复用同一份） */
-  passengers?: Array<{ id: string; name: string }>;
+  /** 本单出行人（拆房组弹窗展示组内乘客名用；改期乘客勾选列表复用同一份）。
+   *  ticketed = 该乘客已出票（有 PNR/票号，或本单航段开票位已开）——按人改期要提示原票会作废 */
+  passengers?: Array<{ id: string; name: string; ticketed?: boolean }>;
   /** 本单去程 FLIGHT 行的 orderItemId（outboundFlightLegId 派生）；本行匹配即渲染「取消去程」入口。
    *  单程单为 null——取消唯一一段等于取消整单，不给入口 */
   outboundLegItemId?: string | null;
@@ -7416,8 +7426,9 @@ function RescheduleForm({
 }: {
   orderId: string;
   item: OrderItem;
-  /** 本单出行人（勾选改期对象）；≥2 人才展示勾选列表，默认全选=整单改期（不拆） */
-  passengers: Array<{ id: string; name: string }>;
+  /** 本单出行人（勾选改期对象）；≥2 人才展示勾选列表，默认全选=整单改期（不拆）。
+   *  ticketed = 已出票（PNR/票号或开票位）：勾部分人时提示拆出后改期会作废原票 */
+  passengers: Array<{ id: string; name: string; ticketed?: boolean }>;
   /** 勾了部分人拆出新单后，用它让列表刷出新单那一行（源单本身走 onSaved/onRefreshOnly） */
   onChanged?: () => void;
   onCancel: () => void;
@@ -7450,6 +7461,9 @@ function RescheduleForm({
   const cabinOptions = selectedSchedule?.seatClasses ?? [];
   const showPassengerPicker = passengers.length >= 2;
   const isPartialSelection = showPassengerPicker && selectedIds.size < passengers.length;
+  // 已出票的单也能按人改期（后端拆单闸已放开，票随人走）：拆出去的人改期时原票必然作废，
+  // 票务台要给新单重开票，所以提示要在确认前就说清楚。
+  const hasTicketedPassenger = passengers.some((p) => p.ticketed);
 
   const togglePassenger = (id: string) => {
     setSelectedIds((prev) => {
@@ -7466,7 +7480,8 @@ function RescheduleForm({
     if (!newScheduleId) { setErr('请选择新班次'); return; }
     if (selectedIds.size === 0) { setErr('请至少勾选 1 位改期乘客'); return; }
     const confirmMsg = isPartialSelection
-      ? `将把勾选的 ${selectedIds.size} 位乘客拆成新订单并改期到 ${selectedSchedule ? scheduleLabel(selectedSchedule) : '新班次'}；原单其余乘客不变。`
+      ? `将把勾选的 ${selectedIds.size} 位乘客拆成新订单并改期到 ${selectedSchedule ? scheduleLabel(selectedSchedule) : '新班次'}；原单其余乘客不变。` +
+        (hasTicketedPassenger ? `\n${TICKETED_RESCHEDULE_HINT}` : '')
       : '确认改期？座位会移动到新班次（新班次售罄会被拒绝）；出发日期变动时本单酒店入住/离店日期会同步平移（新日期房量不足会整体拒绝），如填了改期差价将计入订单应收（可正可负）。';
     if (!confirm(confirmMsg)) return;
     setSubmitting(true);
@@ -7553,6 +7568,11 @@ function RescheduleForm({
               </li>
             ))}
           </ul>
+          {isPartialSelection && hasTicketedPassenger && (
+            <p className="mt-1 rounded bg-amber-50 px-2 py-1 text-[11px] leading-snug text-amber-800">
+              {TICKETED_RESCHEDULE_HINT}
+            </p>
+          )}
         </div>
       )}
 

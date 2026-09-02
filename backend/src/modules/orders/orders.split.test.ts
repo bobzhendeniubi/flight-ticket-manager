@@ -3,8 +3,9 @@
  *
  * 覆盖：
  *   1. 权限：非 ADMIN/STAFF 调 preview/execute → ForbiddenError（未触库）。
- *   2. 准入闸矩阵：回收站/状态/两把锁/开票/佣金/退款/售后费/套餐/升舱/已出票/
- *      人数选择/同房组 —— preview 逐条返回人话 blocker；已结清单（原闸 13）已放开，另有放行用例。
+ *   2. 准入闸矩阵：回收站/状态/两把锁/佣金/退款/售后费/套餐/升舱/
+ *      人数选择/同房组 —— preview 逐条返回人话 blocker；已结清单（原闸 13）、已开票（原闸 6）、
+ *      已出票（原闸 12）均已放开，另有放行 + 「票随人走」的专门用例。
  *   3. 纯机票 2 人拆 1 人：份额计算、行拆分（quantity/amount/成本比例）、乘客物理转移、
  *      两侧金额收口、承接 Payment 形状、拆单流水与审计。
  *   4. 按人调整行跟人走 / 整单调整行留守 + 两侧 SPLIT 平账行（±50 对称）。
@@ -33,7 +34,13 @@ const { mockPrisma } = vi.hoisted(() => ({
     payment: { findMany: vi.fn(), create: vi.fn() },
     refund: { count: vi.fn(), aggregate: vi.fn() },
     commissionRecord: { aggregate: vi.fn() },
-    fulfillmentTask: { count: vi.fn(), create: vi.fn(), updateMany: vi.fn() },
+    fulfillmentTask: {
+      count: vi.fn(),
+      create: vi.fn(),
+      update: vi.fn(),
+      updateMany: vi.fn(),
+      findMany: vi.fn(),
+    },
     orderCostItem: { create: vi.fn() },
     orderSplitRecord: { findUnique: vi.fn(), create: vi.fn() },
     auditLog: { create: vi.fn() },
@@ -200,10 +207,15 @@ describe('拆单 · 准入闸矩阵（preview 返回人话 blocker）', () => {
     expect(r.blockers.join()).toContain('收款已复核锁定');
   });
 
-  it('已开票（任一维度）', async () => {
-    const r = await previewWith({ returnInvoiced: true });
-    expect(r.blockers.join()).toContain('开票');
-  });
+  it.each(['outboundInvoiced', 'returnInvoiced', 'systemInvoiced'] as const)(
+    '已开票（%s）→ 闸 6 已放开：不拦，只给「票随人走」提示',
+    async (flag) => {
+      const r = await previewWith({ [flag]: true });
+      expect(r.eligible).toBe(true);
+      expect(r.blockers).toEqual([]);
+      expect(r.warnings.join()).toContain('票务状态');
+    },
+  );
 
   it('已计提佣金', async () => {
     armCleanGates();
@@ -240,17 +252,30 @@ describe('拆单 · 准入闸矩阵（preview 返回人话 blocker）', () => {
     expect(r.blockers.join()).toContain('升舱');
   });
 
-  it('乘客已有 PNR/票号', async () => {
-    const r = await previewWith({ passengers: [pax('p1', { pnr: 'ABC123' }), pax('p2')] });
-    expect(r.blockers.join()).toContain('已出票');
+  it('乘客已有 PNR/票号（闸 12 已放开）→ eligible，提示票随人走', async () => {
+    const r = await previewWith({
+      passengers: [pax('p1', { pnr: 'ABC123', eticketNumber: '999-1234567890' }), pax('p2')],
+    });
+    expect(r.eligible).toBe(true);
+    expect(r.blockers).toEqual([]);
+    expect(r.warnings.join()).toContain('已出票');
+    expect(r.warnings.join()).toContain('票务台重开');
   });
 
-  it('已确认出票任务', async () => {
+  it('已确认出票任务（闸 12 已放开）→ eligible，提示票随人走', async () => {
     armCleanGates();
     mockPrisma.fulfillmentTask.count.mockResolvedValue(1);
     mockPrisma.order.findUnique.mockResolvedValue(baseOrder());
     const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
-    expect(r.blockers.join()).toContain('已出票');
+    expect(r.eligible).toBe(true);
+    expect(r.blockers).toEqual([]);
+    expect(r.warnings.join()).toContain('已出票');
+  });
+
+  it('未出票的干净单：没有任何提示（warning 不是常驻文案）', async () => {
+    const r = await previewWith({});
+    expect(r.eligible).toBe(true);
+    expect(r.warnings).toEqual([]);
   });
 
   it('已结清单（闸 13 已放开）→ 不再拦，movedPaid 按份额全额随拆', async () => {
@@ -324,21 +349,43 @@ describe('拆单 · 准入闸矩阵（preview 返回人话 blocker）', () => {
 // ══════════════════════════════════════════════════════════════════════════
 // 执行链路的完整 mock 编排：$transaction 直接以 mockPrisma 为 tx。
 // ══════════════════════════════════════════════════════════════════════════
+/** 守恒断言读到的一侧终值：金额 + 三个开票位 + 乘客数（开票位随人搬家的守恒口径）。 */
+interface FinalOrderShape {
+  total: number;
+  paidAmount: number;
+  outboundInvoiced?: boolean;
+  returnInvoiced?: boolean;
+  systemInvoiced?: boolean;
+  passengerCount?: number;
+}
+
 interface ExecuteArmOptions {
   order: ReturnType<typeof baseOrder>;
   /** orderItem.aggregate 的返回（先查目标单再查源单，按 where.orderId 分派） */
   targetItemsSum: number;
   sourceItemsSum: number;
   /** 守恒断言读到的两侧终值 */
-  finalSource: { total: number; paidAmount: number };
-  finalTarget: { total: number; paidAmount: number };
+  finalSource: FinalOrderShape;
+  finalTarget: FinalOrderShape;
   conservationRows?: Array<{
     kind: string;
     flightScheduleId: string | null;
     flightCabin: string | null;
     quantity: number;
   }>;
+  /** 源单拆分行上已存在的出票任务（出票任务镜像用；缺省=源行没有出票任务） */
+  sourceTicketingTasks?: Array<Record<string, unknown>>;
 }
+
+/** 终值 → findUniqueOrThrow 的返回形状（补齐开票位与 _count.passengers 缺省值）。 */
+const finalOrderRow = (shape: FinalOrderShape) => ({
+  total: shape.total,
+  paidAmount: shape.paidAmount,
+  outboundInvoiced: shape.outboundInvoiced ?? false,
+  returnInvoiced: shape.returnInvoiced ?? false,
+  systemInvoiced: shape.systemInvoiced ?? false,
+  _count: { passengers: shape.passengerCount ?? 1 },
+});
 
 const armExecute = (opts: ExecuteArmOptions) => {
   armCleanGates();
@@ -416,10 +463,19 @@ const armExecute = (opts: ExecuteArmOptions) => {
   mockPrisma.payment.create.mockResolvedValue({ id: 'pay-split' });
   mockPrisma.fulfillmentTask.create.mockResolvedValue({ id: 'task-1' });
   mockPrisma.fulfillmentTask.updateMany.mockResolvedValue({ count: 1 });
+  mockPrisma.fulfillmentTask.update.mockResolvedValue({});
+  // 出票任务镜像：先查新单刚建的出票任务（按 id），再查源单对应行上的出票任务（按 orderItemId）
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any
+  mockPrisma.fulfillmentTask.findMany.mockImplementation(async (args: any) => {
+    const where = args?.where ?? {};
+    if (where.id?.in) return [{ id: 'task-1', orderItemId: 'new_i1' }];
+    if (where.orderItemId?.in) return opts.sourceTicketingTasks ?? [];
+    return [];
+  });
   mockPrisma.orderCostItem.create.mockResolvedValue({});
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   mockPrisma.order.findUniqueOrThrow.mockImplementation(async (args: any) =>
-    args?.where?.id === 'o2' ? opts.finalTarget : opts.finalSource,
+    args?.where?.id === 'o2' ? finalOrderRow(opts.finalTarget) : finalOrderRow(opts.finalSource),
   );
   mockPrisma.auditLog.create.mockResolvedValue({});
 };
@@ -763,6 +819,136 @@ describe('拆单 · 调整行归属与平账行', () => {
       shareCny: 1250,
       itemsSumCny: 1300,
     });
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 已出票单拆单（闸 6 / 闸 12 放开后）：票务状态随人搬家。
+// ══════════════════════════════════════════════════════════════════════════
+describe('拆单 · 已出票单：票务状态随人搬家', () => {
+  /** 已出票的 2 人单：去程与系统已开、乘客各有 PNR/票号、拆分行上有已确认出票任务。 */
+  const ticketedOrder = () =>
+    baseOrder({
+      status: 'TICKETED',
+      outboundInvoiced: true,
+      returnInvoiced: false,
+      systemInvoiced: true,
+      passengers: [
+        pax('p1', { pnr: 'ABC123', eticketNumber: '999-1234567890' }),
+        pax('p2', { pnr: 'ABC123', eticketNumber: '999-1234567891' }),
+      ],
+    });
+
+  const armTicketed = (over: Partial<ExecuteArmOptions> = {}) =>
+    armExecute({
+      order: ticketedOrder(),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: {
+        total: 1000,
+        paidAmount: 0,
+        outboundInvoiced: true,
+        systemInvoiced: true,
+        passengerCount: 1,
+      },
+      finalTarget: {
+        total: 1000,
+        paidAmount: 500,
+        outboundInvoiced: true,
+        systemInvoiced: true,
+        passengerCount: 1,
+      },
+      sourceTicketingTasks: [
+        {
+          orderItemId: 'i1',
+          status: 'CONFIRMED',
+          data: { pnr: 'ABC123' },
+          notes: '票务台已出票',
+          startedAt: new Date('2026-08-20T02:00:00.000Z'),
+          completedAt: new Date('2026-08-21T02:00:00.000Z'),
+        },
+      ],
+      ...over,
+    });
+
+  it('新单复制源单三个开票位，源单开票位一个不动', async () => {
+    armTicketed();
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    const created = mockPrisma.order.create.mock.calls[0][0].data;
+    expect(created).toMatchObject({
+      outboundInvoiced: true,
+      returnInvoiced: false,
+      systemInvoiced: true,
+    });
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const srcUpdate = mockPrisma.order.update.mock.calls
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      .map((c: any[]) => c[0])
+      .find((u) => u.where.id === 'o1');
+    expect(srcUpdate.data).not.toHaveProperty('outboundInvoiced');
+    expect(srcUpdate.data).not.toHaveProperty('returnInvoiced');
+    expect(srcUpdate.data).not.toHaveProperty('systemInvoiced');
+  });
+
+  it('乘客整行搬家：PNR/票号原样跟人走（拆单不清票）', async () => {
+    armTicketed();
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    expect(mockPrisma.passenger.updateMany).toHaveBeenCalledWith({
+      where: { id: { in: ['p1'] }, orderId: 'o1' },
+      data: { orderId: 'o2' },
+    });
+    // 拆单只改归属，绝不清票号（清票是改期 3b 的活，且只清新单那一侧）
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const clearedTickets = mockPrisma.passenger.updateMany.mock.calls.some(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0]?.data?.pnr === null || c[0]?.data?.eticketNumber === null,
+    );
+    expect(clearedTickets).toBe(false);
+  });
+
+  it('新单拆分行的出票任务镜像源单：CONFIRMED + 票务 data + 备注留拆单来源', async () => {
+    armTicketed();
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    expect(mockPrisma.fulfillmentTask.update).toHaveBeenCalledTimes(1);
+    const mirrored = mockPrisma.fulfillmentTask.update.mock.calls[0][0];
+    expect(mirrored.where).toEqual({ id: 'task-1' });
+    expect(mirrored.data).toMatchObject({
+      status: 'CONFIRMED',
+      data: { pnr: 'ABC123' },
+    });
+    expect(mirrored.data.notes).toBe('票务台已出票 · 由订单 FTM20260830-SRC 拆分创建');
+  });
+
+  it('源行没有活动出票任务 → 不镜像，新任务维持 PENDING', async () => {
+    armTicketed({ sourceTicketingTasks: [] });
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    expect(mockPrisma.fulfillmentTask.update).not.toHaveBeenCalled();
+  });
+
+  it('出票人数守恒断言：新单漏抄开票位 → 抛错回滚（拆单流水不落库）', async () => {
+    // 蓄意做坏：拆前去程已开（2 人占额），拆后只剩源单 1 人占额 → 额度凭空少一份。
+    armTicketed({
+      finalTarget: {
+        total: 1000,
+        paidAmount: 500,
+        outboundInvoiced: false,
+        systemInvoiced: true,
+        passengerCount: 1,
+      },
+    });
+
+    await expect(
+      service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin),
+    ).rejects.toThrow(/守恒断言失败：开票维度 outboundInvoiced/);
+    expect(mockPrisma.orderSplitRecord.create).not.toHaveBeenCalled();
   });
 });
 

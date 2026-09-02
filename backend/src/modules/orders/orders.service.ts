@@ -11550,7 +11550,7 @@ export class OrderService {
 
   /**
    * 拆单准入闸 + 每人份额评估（preview 与 execute 共用同一口径，避免预检放行、执行另算）。
-   * 只读不写；blockers 为空 = 可拆。
+   * 只读不写；blockers 为空 = 可拆。warnings 是**非阻断**提示，只给运营看，不影响可拆判定。
    */
   private async assessOrderSplit(
     db: Prisma.TransactionClient,
@@ -11558,6 +11558,7 @@ export class OrderService {
     passengerIds: string[],
   ): Promise<SplitAssessment> {
     const blockers: string[] = [];
+    const warnings: string[] = [];
 
     // ── 闸 1-3：存活 / 占座中 / 资金处置闸（前两条通过才跑处置闸，避免同因重复报）──
     if (order.deletedAt) {
@@ -11580,13 +11581,13 @@ export class OrderService {
       blockers.push('该订单收款已复核锁定，拆单会转移已收款。请先解锁收款再拆单。');
     }
 
-    // ── 闸 6：开票闸（与改结算价同因：发票金额与订单金额不能脱钩）──
-    if (order.outboundInvoiced || order.returnInvoiced || order.systemInvoiced) {
-      blockers.push(
-        '该订单已有开票记录（去程/回程/系统任一已开），拆单会使发票与订单金额不一致。' +
-          '请先在票务台把对应开票状态改回「未开」，拆单后再重新开票。',
-      );
-    }
+    // ── 闸 6（已放开）：开票位随人搬家，不再拦已开票的单 ──────────────────────
+    // 旧口径把三个开票位当成「发票金额与订单金额挂钩」而拒拆。但六态开票（去程/回程/系统）
+    // 是**给航司出票 / 系统出票的进度标记，不是发票**（口径见 ticketing-cap.ts 顶部注释与
+    // 财务岗操作手册的开票一节）：它记的是「这一段票开没开」，不承载金额。
+    // 现口径：拆单时把三个位原样复制给新单、源单保持不变 —— 拆出去的人本来就已出票，
+    // 新单当然也是已出票态。班次开票额度按「被标记订单的乘客数」算，拆前 n 人一份、
+    // 拆后 (n−k) + k 仍是 n 人，额度不增不减（执行段有守恒断言兜底，见步骤 11）。
 
     // ── 闸 7：已计提/已结算佣金（含结算申请中——佣金还挂在本单金额上，拆了两本账对不上）──
     const commissionAgg = await db.commissionRecord.aggregate({
@@ -11643,7 +11644,16 @@ export class OrderService {
       blockers.push('订单含升舱商务的机票行，请先撤销升舱再拆单。');
     }
 
-    // ── 闸 12：已出票（确认出票任务 / 任一乘客有 PNR 或票号）→ 走改签，不走拆单 ──
+    // ── 闸 12（已放开）：已出票单同样可拆，票务状态随人搬家 ────────────────────
+    // 旧口径拒拆已出票单、让运营「走改签流程」，可**已出票的多人单恰恰是最需要单独改期的**：
+    // 三人一单已出票，只给一位客人改航班，除了拆单没有别的路（一单一行程是全站硬约束）。
+    // 航司标准做法 Divide PNR 本来就是对已出票 PNR 做的：票跟着人走，拆完再对那个人改签重出票。
+    // 现口径同此 ——
+    //   · 乘客整行物理搬到新单，pnr / eticketNumber 原样跟着走（步骤 5 只改 orderId）；
+    //   · 开票位复制给新单（闸 6 注释）；FLIGHT_TICKETING 履约任务镜像源单状态（步骤 9）；
+    //   · 之后对新单改期会走 rescheduleOrderItem 的「换班次即作废原票」（清新单乘客票号 +
+    //     翻回新单被改航段的开票位），源单留守乘客的票与开票位一概不受影响。
+    // 只作为**非阻断提示**回给运营，让人知道拆完之后票务台要重开票。
     const confirmedTicketing = await db.fulfillmentTask.count({
       where: {
         orderItem: { orderId: order.id },
@@ -11654,8 +11664,17 @@ export class OrderService {
     const ticketedPax = order.passengers.some(
       (p) => (p.pnr && p.pnr.trim() !== '') || (p.eticketNumber && p.eticketNumber.trim() !== ''),
     );
-    if (confirmedTicketing > 0 || ticketedPax) {
-      blockers.push('订单已有确认出票记录（或乘客已有 PNR/票号）。已出票请走改签流程，不能拆单。');
+    if (
+      confirmedTicketing > 0 ||
+      ticketedPax ||
+      order.outboundInvoiced ||
+      order.returnInvoiced ||
+      order.systemInvoiced
+    ) {
+      warnings.push(
+        '本单已出票：拆出的乘客票务状态（PNR/票号、开票位、出票任务）随人转到新单；' +
+          '之后对新单改期会作废该乘客的票，需票务台重开。',
+      );
     }
 
     // ── 闸 13（已放开）：已结清单同样可拆 ────────────────────────────────────
@@ -11737,6 +11756,7 @@ export class OrderService {
 
     return {
       blockers,
+      warnings,
       shares: passengerIds
         .filter((pid) => allPaxIdSet.has(pid))
         .map((pid) => ({
@@ -11771,6 +11791,7 @@ export class OrderService {
   ): Promise<{
     eligible: boolean;
     blockers: string[];
+    warnings: string[];
     shares: Array<{ passengerId: string; fullName: string; shareCny: number }>;
     movedShareCny: number;
     movedPaidCny: number;
@@ -11785,6 +11806,7 @@ export class OrderService {
     return {
       eligible: assessment.blockers.length === 0,
       blockers: assessment.blockers,
+      warnings: assessment.warnings,
       shares: assessment.shares,
       movedShareCny: assessment.movedShareCny,
       movedPaidCny: assessment.movedPaidCny,
@@ -11797,8 +11819,10 @@ export class OrderService {
    *
    * 事务内流程：锁源单（FOR UPDATE）→ 幂等回放检查 → 重跑准入闸 → 建新单（不定价不扣座）
    * → 按行搬/拆（FLIGHT/VISA/TRANSFER 按人数、HOTEL 按显式 roomSplit、按人调整行跟人走）
-   * → 物理移乘客 → 两侧各一条 SPLIT 平账行 → 搬已收款（承接 Payment）→ 履约任务/回程列同步
-   * → 守恒断言（total / paidAmount / 逐班次舱位 Σquantity）→ OrderSplitRecord 落库。
+   * → 物理移乘客（PNR/票号随行）→ 两侧各一条 SPLIT 平账行 → 搬已收款（承接 Payment）
+   * → 履约任务/出票任务镜像/回程列同步
+   * → 守恒断言（total / paidAmount / 逐班次舱位 Σquantity / 各开票维度的乘客数）
+   * → OrderSplitRecord 落库。
    * 幂等：同 (sourceOrderId, requestToken) 重试只回放既有结果，绝不二次拆。
    */
   async splitOrder(
@@ -12016,6 +12040,11 @@ export class OrderService {
         contactName: order.contactName,
         contactPhone: order.contactPhone,
         contactEmail: order.contactEmail,
+        // 开票位随人搬家（闸 6 已放开）：拆出去的人与留守的人票态相同，新单复制源单三个位、
+        // 源单原样不动。班次开票额度按「被标记订单的乘客数」算，拆前后合计恒等（步骤 11 有断言）。
+        outboundInvoiced: order.outboundInvoiced,
+        returnInvoiced: order.returnInvoiced,
+        systemInvoiced: order.systemInvoiced,
         visaStatus: order.visaStatus,
         claimedById: order.claimedById,
         claimedAt: order.claimedAt,
@@ -12371,6 +12400,25 @@ export class OrderService {
         data: { notes: `由订单 ${order.orderNumber} 拆分创建` },
       });
     }
+    // 9b. 出票任务镜像（票务状态随人搬家，闸 12 已放开）：
+    //   整行搬走的行连着它的任务一起过户（任务只挂 orderItemId），本来就带着原状态；
+    //   被拆的行在新单上是**新建行**，createFulfillmentTasks 给它开的是 PENDING ——
+    //   源单那段明明已确认出票，新单却显示待出票，票务台会当成新活重出一次票。
+    //   故把 FLIGHT_TICKETING 任务的状态与票务字段从源行任务镜像过来（源单任务不动）。
+    //   其它类型（酒店/签证/接送）照旧建 PENDING：那些是按单办的活，拆出来的新单确实要重新办。
+    if (newTaskIds.length > 0 && splitItemIdMap.size > 0) {
+      await mirrorTicketingTasksForSplit(tx, {
+        newTaskIds,
+        // 新单拆分行 → 源单对应行（splitItemIdMap 的反向索引）
+        sourceItemIdByTargetItemId: new Map(
+          [...splitItemIdMap.entries()].map(([sourceItemId, targetItemId]) => [
+            targetItemId,
+            sourceItemId,
+          ]),
+        ),
+        splitNote: `由订单 ${order.orderNumber} 拆分创建`,
+      });
+    }
     await syncVisaTasksForOrder(tx, target.id, { userId: actor.userId, role: actor.role });
     await syncOrderHasReturnLeg(tx, orderId);
     await syncOrderHasReturnLeg(tx, target.id);
@@ -12386,15 +12434,17 @@ export class OrderService {
     });
 
     // ── 11. 守恒断言（不平整体回滚；宁可拆不成也不能拆出对不上的账）──
+    const conservationSelect = {
+      total: true,
+      paidAmount: true,
+      outboundInvoiced: true,
+      returnInvoiced: true,
+      systemInvoiced: true,
+      _count: { select: { passengers: true } },
+    } as const;
     const [sourceAfter, targetAfter] = await Promise.all([
-      tx.order.findUniqueOrThrow({
-        where: { id: orderId },
-        select: { total: true, paidAmount: true },
-      }),
-      tx.order.findUniqueOrThrow({
-        where: { id: target.id },
-        select: { total: true, paidAmount: true },
-      }),
+      tx.order.findUniqueOrThrow({ where: { id: orderId }, select: conservationSelect }),
+      tx.order.findUniqueOrThrow({ where: { id: target.id }, select: conservationSelect }),
     ]);
     const EPS = 0.005;
     const totalAfter = Number(sourceAfter.total) + Number(targetAfter.total);
@@ -12408,6 +12458,23 @@ export class OrderService {
       throw new Error(
         `拆单守恒断言失败：拆前 paidAmount ¥${prePaidCny}，拆后两单合计 ¥${round2(paidAfter)}（已回滚）`,
       );
+    }
+    // 出票人数守恒（开票位随人搬家的兜底，与座位守恒同哲学）：某个开票维度上
+    // 「被标记订单的乘客数」拆前后合计必须相等 —— 班次开票上限正是按这个数算的
+    //（ticketing-cap.ts 的 countIssuedPassengers = Σ 被标记订单的乘客数），
+    // 拆单一旦把它放大，就等于凭空多发一份开票额度、可能超发座位。
+    const INVOICE_FLAGS = ['outboundInvoiced', 'returnInvoiced', 'systemInvoiced'] as const;
+    const prePaxCount = order.passengers.length;
+    for (const flag of INVOICE_FLAGS) {
+      const before = order[flag] ? prePaxCount : 0;
+      const after =
+        (sourceAfter[flag] ? sourceAfter._count.passengers : 0) +
+        (targetAfter[flag] ? targetAfter._count.passengers : 0);
+      if (before !== after) {
+        throw new Error(
+          `拆单守恒断言失败：开票维度 ${flag} 拆前 ${before} 人、拆后两单合计 ${after} 人（已回滚）`,
+        );
+      }
     }
     const flightRowsAfter = await tx.orderItem.findMany({
       where: { orderId: { in: [orderId, target.id] }, kind: OrderItemKind.FLIGHT },
@@ -12857,7 +12924,10 @@ export class OrderService {
       );
     }
 
-    // ── 闸 8：本段已出票 → 走改签/退票，不走取消航段（与拆单闸 12 同口径）──
+    // ── 闸 8：本段已出票 → 走改签/退票，不走取消航段 ──────────────────────────
+    // ⚠ 与拆单**不再同口径**：拆单只是把人搬到另一张单、票跟着人走，没有作废任何票，
+    // 所以那边（原闸 12）已放开；取消航段是把这一段作废、座位放回库存重卖，已出票的段
+    // 必须先经退票拿回票款，否则票在航司那边还活着、钱也没退。此闸保持 fail-closed。
     const confirmedTicketing = targetRow
       ? await db.fulfillmentTask.count({
           where: {
@@ -13469,6 +13539,8 @@ export interface SplitOrderResult {
 /** assessOrderSplit 的评估结果（preview 直接透出其中展示字段）。 */
 interface SplitAssessment {
   blockers: string[];
+  /** 非阻断提示（如「本单已出票，票随人走」），只影响弹窗文案，不影响 eligible。 */
+  warnings: string[];
   shares: Array<{ passengerId: string; fullName: string; shareCny: number }>;
   allShareRows: Array<{ passengerId: string; netCny: number; shareCny: number }>;
   movedShareCny: number;
@@ -13543,6 +13615,67 @@ function sumFlightQuantities(
     map.set(key, (map.get(key) ?? 0) + it.quantity);
   }
   return map;
+}
+
+/**
+ * 拆单出票任务镜像：把新单拆分行的 FLIGHT_TICKETING 任务对齐到源单对应行的任务状态。
+ *
+ * 只对**被拆的行**做（整行搬走的行连任务一起过户，状态本来就没丢）；只镜像票务岗关心的字段
+ * （状态 / 票务 data / 备注 / 起止时间），不动源单任务，也不碰其它类型的任务。
+ * 源行若没有活动的出票任务（只有 CANCELLED 或压根没有）则不动新任务，让它维持 PENDING。
+ */
+async function mirrorTicketingTasksForSplit(
+  tx: Prisma.TransactionClient,
+  input: {
+    newTaskIds: string[];
+    /** 新单拆分行 id → 源单对应行 id */
+    sourceItemIdByTargetItemId: Map<string, string>;
+    /** 新任务备注里保留的拆单来源标注 */
+    splitNote: string;
+  },
+): Promise<void> {
+  const newTicketingTasks = await tx.fulfillmentTask.findMany({
+    where: { id: { in: input.newTaskIds }, type: FulfillmentType.FLIGHT_TICKETING },
+    select: { id: true, orderItemId: true },
+  });
+  const pairs = newTicketingTasks
+    .map((task) => ({
+      taskId: task.id,
+      sourceItemId: input.sourceItemIdByTargetItemId.get(task.orderItemId),
+    }))
+    .filter((p): p is { taskId: string; sourceItemId: string } => p.sourceItemId != null);
+  if (pairs.length === 0) return;
+
+  const sourceTasks = await tx.fulfillmentTask.findMany({
+    where: {
+      orderItemId: { in: [...new Set(pairs.map((p) => p.sourceItemId))] },
+      type: FulfillmentType.FLIGHT_TICKETING,
+      status: { not: FulfillmentStatus.CANCELLED },
+    },
+    select: {
+      orderItemId: true,
+      status: true,
+      data: true,
+      notes: true,
+      startedAt: true,
+      completedAt: true,
+    },
+  });
+  const sourceByItemId = new Map(sourceTasks.map((t) => [t.orderItemId, t]));
+  for (const pair of pairs) {
+    const source = sourceByItemId.get(pair.sourceItemId);
+    if (!source) continue;
+    await tx.fulfillmentTask.update({
+      where: { id: pair.taskId },
+      data: {
+        status: source.status,
+        data: source.data === null ? Prisma.DbNull : (source.data as Prisma.InputJsonValue),
+        notes: [source.notes?.trim() || null, input.splitNote].filter(Boolean).join(' · '),
+        startedAt: source.startedAt,
+        completedAt: source.completedAt,
+      },
+    });
+  }
 }
 
 /**

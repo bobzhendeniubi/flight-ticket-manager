@@ -10,6 +10,8 @@
  *   4. 部分乘客 → 先拆单、再对**新单**按航段改期，源单不被就地改期。
  *   5. 拆成了但改期失败 → 409 结构化错误、拆单不回滚、新单信息随错误返回。
  *   6. 同 requestToken 重试 → 拆单回放；新单已在目标班次则不再调改期（不重复收差价）。
+ *   7. 已出票单（拆单闸 6/12 放开后的主场景）：三人单勾一人 → 拆单 → 只对新单改期，
+ *      作废票的动作全部落在新单上，源单留守乘客的票与开票位不被触碰。
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { Prisma } from '@prisma/client';
@@ -289,6 +291,72 @@ describe('按人改期 · 部分乘客 = 先拆单再对新单改期', () => {
 
     await expect(service.reschedulePassengers('o1', body(), admin)).rejects.toThrow(/不能拆单/u);
     expect(reschedule).not.toHaveBeenCalled();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 已出票单（拆单闸 6/12 放开后的主场景）：三人单只给一位客人改期。
+// 两块拼图各自有专门覆盖 —— 拆单侧「票随人走」见 orders.split.test.ts，
+// 改期侧「换班次即作废原票（按 orderId 清票 + 翻回本单开票位）」见 orders.service.test.ts。
+// 这里验证的是**编排把这两块拼在哪张单上**：改期只打在新单，源单一次都没被改期。
+// 两个 spy 各按自己那块的既有契约做最小模拟，好让票的最终归属看得见。
+// ══════════════════════════════════════════════════════════════════════════
+describe('按人改期 · 已出票三人单勾一人', () => {
+  it('拆单成功 → 只对新单改期：作废票落在新单，源单两位乘客的票与开票位不动', async () => {
+    /** 两张单的票务快照（拆前只有源单）：每人一个票号 + 订单级去程开票位。 */
+    const ticketing: Record<string, { pax: Array<{ id: string; pnr: string | null }>; outboundInvoiced: boolean }> = {
+      o1: {
+        pax: [
+          { id: 'p1', pnr: 'ABC123' },
+          { id: 'p2', pnr: 'ABC123' },
+          { id: 'p3', pnr: 'ABC123' },
+        ],
+        outboundInvoiced: true,
+      },
+    };
+    mockPrisma.order.findUnique.mockResolvedValue(sourceSnapshot());
+
+    // 拆单：乘客整行搬到新单（票号随人走）+ 开票位复制给新单，源单其余人原样留守。
+    const split = vi.spyOn(service, 'splitOrder').mockImplementation(async () => {
+      const moved = ticketing.o1.pax.filter((p) => p.id === 'p1');
+      ticketing.o1 = {
+        pax: ticketing.o1.pax.filter((p) => p.id !== 'p1'),
+        outboundInvoiced: ticketing.o1.outboundInvoiced,
+      };
+      ticketing.o2 = { pax: moved, outboundInvoiced: true };
+      return splitOutcome();
+    });
+    // 改期：换班次即作废原票 —— 只清**被调用那张单**的票号并翻回它的开票位。
+    const reschedule = vi
+      .spyOn(service, 'rescheduleOrderItem')
+      .mockImplementation(async (targetOrderId: string) => {
+        const snapshot = ticketing[targetOrderId];
+        if (snapshot) {
+          snapshot.pax = snapshot.pax.map((p) => ({ ...p, pnr: null }));
+          snapshot.outboundInvoiced = false;
+        }
+        return rescheduleOutcome();
+      });
+
+    const result = await service.reschedulePassengers('o1', body(), admin);
+
+    // 已出票单不再被拆单闸挡回去：真的拆了，且只拆勾选的那一位
+    expect(split).toHaveBeenCalledTimes(1);
+    expect(split.mock.calls[0][1].passengerIds).toEqual(['p1']);
+    // 改期只打在新单上，源单一次都没被改期
+    expect(reschedule).toHaveBeenCalledTimes(1);
+    expect(reschedule.mock.calls[0][0]).toBe('o2');
+    // 新单：拆出去那位的票被作废、开票位翻回未开（票务台据此重开）
+    expect(ticketing.o2.pax).toEqual([{ id: 'p1', pnr: null }]);
+    expect(ticketing.o2.outboundInvoiced).toBe(false);
+    // 源单：留守两位的票号与开票位一概不动
+    expect(ticketing.o1.pax).toEqual([
+      { id: 'p2', pnr: 'ABC123' },
+      { id: 'p3', pnr: 'ABC123' },
+    ]);
+    expect(ticketing.o1.outboundInvoiced).toBe(true);
+    expect(result.splitPerformed).toBe(true);
+    expect(result.audit.newOrderNumber).toBe('FTM20260901-TGT');
   });
 });
 
