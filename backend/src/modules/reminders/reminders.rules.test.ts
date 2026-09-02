@@ -861,8 +861,12 @@ describe('NO_SHOW_RETURN_RELEASED 回程已释放提醒规则', () => {
 describe('generateRuleReminders — 规则 11 单独取数，不动其它规则的查询', () => {
   const NOW = new Date('2026-07-09T06:00:00Z');
 
-  function makePrisma() {
-    const store = new Set<string>();
+  /** 原回程班次的起飞时间（默认远在未来 → 走「待跟进」那一条）。 */
+  const FUTURE_RET_DEPART = new Date('2026-07-15T02:00:00Z');
+
+  function makePrisma(retDeparture: Date = FUTURE_RET_DEPART) {
+    /** ruleKey → 当前状态（模拟 OperationalReminder 的 ruleKey 唯一索引 + status 列）。 */
+    const store = new Map<string, string>();
     const orderItemFindMany = vi.fn(async (args: unknown) => {
       const where = (args as { where?: Record<string, unknown> }).where ?? {};
       if (where.flightScheduleId === null) {
@@ -893,11 +897,7 @@ describe('generateRuleReminders — 规则 11 单独取数，不动其它规则�
       orderItem: { findMany: orderItemFindMany },
       flightSchedule: {
         findMany: vi.fn(async () => [
-          {
-            id: 'sch_ret',
-            departureTime: new Date('2026-07-15T02:00:00Z'),
-            departureTz: 'Asia/Shanghai',
-          },
+          { id: 'sch_ret', departureTime: retDeparture, departureTz: 'Asia/Shanghai' },
         ]),
       },
       operationalReminder: {
@@ -908,15 +908,31 @@ describe('generateRuleReminders — 规则 11 单独取数，不动其它规则�
           let count = 0;
           for (const row of args.data) {
             if (!store.has(row.ruleKey)) {
-              store.add(row.ruleKey);
+              store.set(row.ruleKey, 'OPEN');
               count += 1;
             }
           }
           return { count };
         }),
+        updateMany: vi.fn(
+          async (args: {
+            where: { ruleKey: { in: string[] }; status: { in: string[] } };
+            data: { status: string };
+          }) => {
+            let count = 0;
+            for (const key of args.where.ruleKey.in) {
+              const current = store.get(key);
+              if (current != null && args.where.status.in.includes(current)) {
+                store.set(key, args.data.status);
+                count += 1;
+              }
+            }
+            return { count };
+          },
+        ),
       },
     };
-    return { mock: mock as unknown as PrismaClient, raw: mock };
+    return { mock: mock as unknown as PrismaClient, raw: mock, store };
   }
 
   it('扫到已释放回程行 → 生成 1 条，且订单查询的 items where 保持原样', async () => {
@@ -956,5 +972,50 @@ describe('generateRuleReminders — 规则 11 单独取数，不动其它规则�
     await generateRuleReminders(mock, 'user_sys', NOW);
     const second = await generateRuleReminders(mock, 'user_sys', NOW);
     expect(second).toMatchObject({ created: 0, skipped: 1 });
+  });
+
+  // ── 起飞后换条时的收口：两条不能并存 ─────────────────────────────────────────
+  // 起飞前那条写着「要保留就点『恢复回程』」，起飞后那条路已经走不通了。
+  // 两条同时挂在待办列表里，运营会照旧条去点恢复，白折腾一轮才发现班次早飞了。
+  it('先未起飞生成一条 → 推进时间再生成：旧条被置 SKIPPED，新的 :DEPARTED 条并存不了', async () => {
+    const RELEASED_KEY = 'NOSHOW_RELEASED:itm_ret:2026-07-09T05:00:00.000Z';
+    const DEPARTED_KEY = `${RELEASED_KEY}:DEPARTED`;
+
+    // ① 起飞前（班次 7-15 起飞，现在 7-9）→ 只生成「待跟进」那一条。
+    const before = makePrisma();
+    const first = await generateRuleReminders(before.mock, 'user_sys', NOW);
+    expect(first).toMatchObject({ created: 1 });
+    expect(before.store.get(RELEASED_KEY)).toBe('OPEN');
+    expect(before.store.has(DEPARTED_KEY)).toBe(false);
+    // 没有被顶替的条目 → 一次多余的 updateMany 都不发。
+    expect(before.raw.operationalReminder.updateMany).not.toHaveBeenCalled();
+
+    // ② 时间推到起飞之后：同一份存量（旧条还 OPEN）再跑一遍。
+    const after = makePrisma(new Date('2026-07-09T05:30:00Z'));
+    after.store.set(RELEASED_KEY, 'OPEN');
+    const second = await generateRuleReminders(after.mock, 'user_sys', NOW);
+
+    // 新条建出来了，旧条被收口成 SKIPPED（而不是留着两条并存）。
+    expect(second).toMatchObject({ created: 1, byRule: { NO_SHOW_RETURN_RELEASED: 1 } });
+    expect(after.store.get(DEPARTED_KEY)).toBe('OPEN');
+    expect(after.store.get(RELEASED_KEY)).toBe('SKIPPED');
+    const args = after.raw.operationalReminder.updateMany.mock.calls[0][0] as {
+      where: { ruleKey: { in: string[] }; status: { in: string[] } };
+      data: { status: string; resolvedNote: string };
+    };
+    expect(args.where.ruleKey.in).toEqual([RELEASED_KEY]);
+    // 运营已经手工处理过的（DONE / SKIPPED）不去覆盖他的结论。
+    expect(args.where.status.in).toEqual(['OPEN', 'IN_PROGRESS']);
+    expect(args.data.resolvedNote).toContain('已起飞');
+  });
+
+  it('重复跑第三遍：旧条已 SKIPPED 不再被动，新条也不重复建（幂等）', async () => {
+    const RELEASED_KEY = 'NOSHOW_RELEASED:itm_ret:2026-07-09T05:00:00.000Z';
+    const departed = makePrisma(new Date('2026-07-09T05:30:00Z'));
+    departed.store.set(RELEASED_KEY, 'OPEN');
+    await generateRuleReminders(departed.mock, 'user_sys', NOW);
+    const third = await generateRuleReminders(departed.mock, 'user_sys', NOW);
+    expect(third).toMatchObject({ created: 0, skipped: 1 });
+    expect(departed.store.get(RELEASED_KEY)).toBe('SKIPPED');
   });
 });

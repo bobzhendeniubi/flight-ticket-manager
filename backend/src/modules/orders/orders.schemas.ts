@@ -1483,7 +1483,9 @@ export type CancelReturnLegBody = Omit<CancelLegBody, 'leg'>;
 // releaseReturn 缺省 true：极少数只想打标不放座的情况可显式传 false。
 // requestToken 为幂等键：同 (订单, token) 重试只回放，座位绝不二次释放。
 export const noShowPreviewBodySchema = z.object({
-  passengerIds: z.array(z.string().min(1)).max(99).optional(),
+  // 缺省（不传）才是整单；`[]` 是**没勾任何人**，一律拒 —— 曾经空数组被当成整单，
+  // 前端一个交互 bug 就能把整单的人全标上，且请求体看上去完全正常。
+  passengerIds: z.array(z.string().min(1)).min(1, '至少选择 1 位乘客').max(99).optional(),
   // 「同时释放回程」勾选框的当前状态（缺省 true，与执行体同缺省）。
   // 预检要拿它才能如实回「回程已起飞 → 不能释放座位」这条闸；否则运营点了提交才被拒。
   releaseReturn: z.boolean().optional(),
@@ -1492,8 +1494,10 @@ export type NoShowPreviewBody = z.infer<typeof noShowPreviewBodySchema>;
 
 export const noShowBodySchema = z.object({
   requestToken: z.string().min(8).max(64).uuid(),
+  // 缺省（不传）才是整单；`[]` 是「没勾任何人」→ 直接拒（口径同预检，service 侧另有一道防御）。
   passengerIds: z
     .array(z.string().min(1))
+    .min(1, '至少选择 1 位乘客')
     .max(99)
     .optional()
     .refine((ids) => ids == null || new Set(ids).size === ids.length, {
@@ -1515,6 +1519,20 @@ export const restoreReturnLegBodySchema = z.object({
   note: z.string().max(200).optional(),
 });
 export type RestoreReturnLegBody = z.infer<typeof restoreReturnLegBodySchema>;
+
+// ── 回程起飞后作废（POST /orders/:id/void-return-leg；ADMIN/STAFF）────────────────
+// 「已释放」不是终态：no-show 把回程座位放回库存后，这一行会一直挂在单上等人处置。
+// 原班次一飞走，「恢复回程」就走不通了，而提醒还在一直催 —— 作废给这一行一个终态。
+//
+// ⚠ 只打终态标：**不动座位**（释放那一步早就还回库存了）、**不动一分钱**
+//（no-show 全程钱不动；要退钱走既有退款流程）、不动开票位。
+// 起飞前不许作废：那时候「恢复回程」还走得通，作废等于把客人的回程凭空抹掉。
+// requestToken 为幂等键：同 (订单, token) 重试只回放。
+export const voidReturnLegBodySchema = z.object({
+  requestToken: z.string().min(8).max(64).uuid(),
+  note: z.string().max(200).optional(),
+});
+export type VoidReturnLegBody = z.infer<typeof voidReturnLegBodySchema>;
 
 // ── 按人改期（POST /orders/:id/reschedule-passengers；ADMIN/STAFF）──────────────
 // 场景：三人一单，只给其中一位客人改航班。一单一行程是全站硬约束（去/回程各一条 FLIGHT 行），

@@ -41,7 +41,11 @@ const { mockPrisma } = vi.hoisted(() => ({
 vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
 
 import { OrderService, syncOrderLegFlag } from './orders.service.js';
-import { noShowBodySchema, restoreReturnLegBodySchema } from './orders.schemas.js';
+import {
+  noShowBodySchema,
+  restoreReturnLegBodySchema,
+  voidReturnLegBodySchema,
+} from './orders.schemas.js';
 import { AppError, BadRequestError, ConflictError, ForbiddenError } from '../../lib/errors.js';
 
 const service = new OrderService();
@@ -175,7 +179,7 @@ function mountTx(
      * 那一遍走裸 prisma；不传则与事务内同一份。只有「源单没问题、新单上出事」这类用例需要分开。
      */
     sourceSnapshot?: ReturnType<typeof orderSnapshot>;
-    flightMeta?: Array<{ id: string; metadata: unknown }>;
+    flightMeta?: Array<{ id: string; metadata: unknown } & Record<string, unknown>>;
     ticketedReturn?: number;
     /** 恢复用：原班次 + 该舱余位 */
     schedule?: { id: string; departureTime: Date } | null;
@@ -218,6 +222,8 @@ function mountTx(
     operationalReminder: {
       findUnique: vi.fn(async (): Promise<{ id: string } | null> => null),
       create: vi.fn(async () => ({ id: 'wo-1' })),
+      // 回程作废会把「回程已释放」的两条待办一并关掉（同事务）。
+      updateMany: vi.fn(async () => ({ count: 1 })),
     },
     flightSchedule: {
       findUnique: vi.fn(async () =>
@@ -248,10 +254,35 @@ function mountTx(
   return tx;
 }
 
+// ── legActionLog 流水的测试构造 ────────────────────────────────────────────────
+// 指纹字面量**写死**（不从 service import 那个函数）：它是落库的持久化契约，
+// 格式一改这里就该红。跟着实现走就永远测不出「指纹格式悄悄变了、存量 token 全部失配」。
+/** no-show / 再释放的入参指纹（键排序后 JSON）。 */
+const noShowFp = (releaseReturn = true, passengerIds: string[] = []): string =>
+  JSON.stringify({ passengerIds: [...passengerIds].sort(), releaseReturn });
+/** 恢复回程 / 起飞后作废的入参指纹：请求体里没有能改结果的字段，恒为空对象。 */
+const EMPTY_FP = '{}';
+
+/** 一条 legActionLog 流水（默认带上与 type 相称的指纹）。 */
+const legLog = (
+  type: 'NO_SHOW' | 'RELEASE' | 'RESTORE' | 'CANCEL_LEG' | 'VOID',
+  requestToken: string,
+  over: Record<string, unknown> = {},
+) => ({
+  type,
+  requestToken,
+  at: new Date().toISOString(),
+  byUserId: 'admin-1',
+  fingerprint: type === 'NO_SHOW' || type === 'RELEASE' ? noShowFp() : EMPTY_FP,
+  ...over,
+});
+
 const noShowBody = (over: Record<string, unknown> = {}) =>
   noShowBodySchema.parse({ requestToken: TOKEN, ...over });
 const restoreBody = (over: Record<string, unknown> = {}) =>
   restoreReturnLegBodySchema.parse({ requestToken: TOKEN, ...over });
+const voidBody = (over: Record<string, unknown> = {}) =>
+  voidReturnLegBodySchema.parse({ requestToken: TOKEN, ...over });
 
 /** 从一串 orderItem.update 调用里取某一行的 data。 */
 function updateDataFor(
@@ -850,6 +881,7 @@ describe('no-show · 幂等', () => {
               releasedSeats: [{ scheduleId: 'sch-ret', cabin: 'ECONOMY', quantity: 2 }],
               workOrderReminderId: 'wo-1',
             },
+            legActionLog: [legLog('NO_SHOW', TOKEN)],
           },
         },
         { id: 'leg-ret', metadata: null },
@@ -906,6 +938,7 @@ describe('no-show · 幂等', () => {
               releasedSeats: [{ scheduleId: 'sch-ret', cabin: 'ECONOMY', quantity: 2 }],
               workOrderReminderId: null,
             },
+            legActionLog: [legLog('RELEASE', TOKEN)],
           },
         },
       ],
@@ -924,7 +957,10 @@ describe('no-show · 幂等', () => {
       flightMeta: [
         {
           id: 'leg-out',
-          metadata: { noShow: { at: new Date().toISOString(), requestToken: TOKEN } },
+          metadata: {
+            noShow: { at: new Date().toISOString(), requestToken: TOKEN },
+            legActionLog: [legLog('NO_SHOW', TOKEN)],
+          },
         },
         { id: 'leg-ret', metadata: null },
       ],
@@ -1228,6 +1264,7 @@ describe('恢复回程 · 执行', () => {
               oversold: true,
               oversoldBy: 1,
             },
+            legActionLog: [legLog('RESTORE', TOKEN)],
           },
         },
       ],
@@ -2045,6 +2082,7 @@ describe('no-show · 回放入参比对', () => {
           id: 'leg-out',
           metadata: {
             noShow: { at: new Date().toISOString(), requestToken: TOKEN, returnReleased: true },
+            legActionLog: [legLog('NO_SHOW', TOKEN, { fingerprint: noShowFp(true) })],
           },
         },
         { id: 'leg-ret', metadata: null },
@@ -2056,7 +2094,7 @@ describe('no-show · 回放入参比对', () => {
     expect(err).toBeInstanceOf(AppError);
     expect((err as AppError).statusCode).toBe(409);
     expect((err as AppError).code).toBe('TOKEN_PAYLOAD_MISMATCH');
-    expect((err as AppError).details).toMatchObject({ field: 'releaseReturn', prior: true });
+    expect((err as AppError).details).toMatchObject({ reason: 'PAYLOAD', priorType: 'NO_SHOW' });
     expect(tx.orderItem.update).not.toHaveBeenCalled();
   });
 
@@ -2067,6 +2105,7 @@ describe('no-show · 回放入参比对', () => {
           id: 'leg-out',
           metadata: {
             noShow: { at: new Date().toISOString(), requestToken: TOKEN, returnReleased: true },
+            legActionLog: [legLog('NO_SHOW', TOKEN, { fingerprint: noShowFp(true) })],
           },
         },
         { id: 'leg-ret', metadata: null },
@@ -2074,6 +2113,135 @@ describe('no-show · 回放入参比对', () => {
     });
     const res = await service.markNoShow('ord-1', noShowBody({ releaseReturn: true }), ADMIN);
     expect(res.audit.replayed).toBe(true);
+  });
+
+  it('同 token 换了另一批乘客名单（整单 → 指定两人）→ 409，指纹认得出来', async () => {
+    const tx = mountTx({
+      flightMeta: [
+        {
+          id: 'leg-out',
+          metadata: {
+            noShow: { at: new Date().toISOString(), requestToken: TOKEN },
+            // 首刷是整单（passengerIds 为空）。
+            legActionLog: [legLog('NO_SHOW', TOKEN, { fingerprint: noShowFp(true, []) })],
+          },
+        },
+        { id: 'leg-ret', metadata: null },
+      ],
+    });
+    // 这次勾了全员两人 —— markNoShow 判成整单不走拆单，直接进 _executeNoShow 的回放守闸。
+    const err = await service
+      .markNoShow('ord-1', noShowBody({ passengerIds: ['pax-1', 'pax-2'] }), ADMIN)
+      .catch((e: unknown) => e);
+    expect((err as AppError).code).toBe('TOKEN_PAYLOAD_MISMATCH');
+    expect((err as AppError).details).toMatchObject({ reason: 'PAYLOAD' });
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+  });
+
+  it('同一批乘客顺序不同 → 指纹一致，照常回放（排序后比对）', async () => {
+    mountTx({
+      flightMeta: [
+        {
+          id: 'leg-out',
+          metadata: {
+            noShow: { at: new Date().toISOString(), requestToken: TOKEN },
+            legActionLog: [
+              legLog('NO_SHOW', TOKEN, { fingerprint: noShowFp(true, ['pax-1', 'pax-2']) }),
+            ],
+          },
+        },
+        { id: 'leg-ret', metadata: null },
+      ],
+    });
+    const res = await service.markNoShow(
+      'ord-1',
+      noShowBody({ passengerIds: ['pax-2', 'pax-1'] }),
+      ADMIN,
+    );
+    expect(res.audit.replayed).toBe(true);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 13b. 回放守闸：**动作类型**必须对得上 + 旧快照 fail-closed
+//
+// requestToken 由前端生成，同一个 token 拿去调另一个端点是完全可能的（页面里复用了同一个
+// 编号、或运营连点了两个按钮）。只按「见过这个 token」就回放，会让运营看到一条「成功」，
+// 而这次的动作压根没发生 —— 座位/钱早按上一次那个动作处置完了，审计里一个字都查不到。
+// 老数据（本次改动之前落库的行）没有指纹，一律拒：宁可让人换个新编号重新预检一遍。
+// ══════════════════════════════════════════════════════════════════════════
+describe('no-show / 恢复 · 回放守闸的动作类型与旧快照', () => {
+  it('token 是恢复回程用过的，拿来标 no-show → 409（类型不符）', async () => {
+    const tx = mountTx({
+      flightMeta: [
+        { id: 'leg-out', metadata: null },
+        { id: 'leg-ret', metadata: { legActionLog: [legLog('RESTORE', TOKEN)] } },
+      ],
+    });
+    const err = await service.markNoShow('ord-1', noShowBody(), ADMIN).catch((e: unknown) => e);
+    expect((err as AppError).statusCode).toBe(409);
+    expect((err as AppError).code).toBe('TOKEN_PAYLOAD_MISMATCH');
+    expect((err as AppError).details).toMatchObject({
+      reason: 'ACTION_TYPE',
+      priorType: 'RESTORE',
+    });
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+  });
+
+  it('token 是取消航段用过的，拿去恢复回程 → 409（类型不符），一座不动', async () => {
+    const tx = mountTx({
+      snapshot: releasedSnapshotOrder(),
+      seatClass: { capacity: 180, sold: 0 },
+      flightMeta: [
+        { id: 'leg-out', metadata: null },
+        { id: 'leg-ret', metadata: { legActionLog: [legLog('CANCEL_LEG', TOKEN)] } },
+      ],
+    });
+    const err = await service
+      .restoreReturnLeg('ord-1', restoreBody(), ADMIN)
+      .catch((e: unknown) => e);
+    expect((err as AppError).code).toBe('TOKEN_PAYLOAD_MISMATCH');
+    expect((err as AppError).details).toMatchObject({
+      reason: 'ACTION_TYPE',
+      priorType: 'CANCEL_LEG',
+    });
+    expect(tx.$executeRaw).not.toHaveBeenCalled();
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+  });
+
+  it('旧快照（只有 noShow.requestToken、没有流水指纹）→ 409 fail-closed，不再按老入参回成功', async () => {
+    const tx = mountTx({
+      flightMeta: [
+        {
+          id: 'leg-out',
+          metadata: { noShow: { at: new Date().toISOString(), requestToken: TOKEN } },
+        },
+        { id: 'leg-ret', metadata: null },
+      ],
+    });
+    const err = await service.markNoShow('ord-1', noShowBody(), ADMIN).catch((e: unknown) => e);
+    expect((err as AppError).statusCode).toBe(409);
+    expect((err as AppError).code).toBe('TOKEN_PAYLOAD_MISMATCH');
+    expect((err as AppError).details).toMatchObject({ reason: 'LEGACY_SNAPSHOT' });
+    expect(String((err as AppError).message)).toContain('重新预检');
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+  });
+
+  it('旧快照（只有 returnRestored.requestToken）拿去恢复回程 → 同样 409 fail-closed', async () => {
+    const tx = mountTx({
+      snapshot: releasedSnapshotOrder(),
+      seatClass: { capacity: 180, sold: 0 },
+      flightMeta: [
+        { id: 'leg-out', metadata: null },
+        { id: 'leg-ret', metadata: { returnRestored: { requestToken: TOKEN } } },
+      ],
+    });
+    const err = await service
+      .restoreReturnLeg('ord-1', restoreBody(), ADMIN)
+      .catch((e: unknown) => e);
+    expect((err as AppError).code).toBe('TOKEN_PAYLOAD_MISMATCH');
+    expect((err as AppError).details).toMatchObject({ reason: 'LEGACY_SNAPSHOT' });
+    expect(tx.$executeRaw).not.toHaveBeenCalled();
   });
 
   it('同 token 换了另一批乘客 → 409 TOKEN_PAYLOAD_MISMATCH，不拿上一轮的新单顶包', async () => {
@@ -2187,7 +2355,28 @@ describe('恢复回程 · 超售口径 = 纯 sold vs capacity', () => {
     expect(res.eligible).toBe(true);
   });
 
-  it('确认后走超售直加分支（余位不够就不能用 CAS 抢），审计不记超售', async () => {
+  it('预检回 reservedConflict：本次会挤掉几座他人锁位/占位', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(releasedSnapshotOrder());
+    mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sch-ret',
+      departureTime: RET_DEPART,
+      departureTz: 'Asia/Shanghai',
+      flight: { flightNumber: 'QH9588' },
+    });
+    // capacity 10 / sold 8 → 物理还剩 2 座，但这 2 座正被他人 ACTIVE 锁位占着 → available 0。
+    mockPrisma.flightSeatClass.findFirst.mockResolvedValue({ capacity: 10, sold: 8 });
+    mockPrisma.seatLock.aggregate.mockResolvedValue({ _sum: { qty: 2 } });
+
+    const res = await service.previewRestoreReturnLeg('ord-1', ADMIN);
+    expect(res.available).toBe(0);
+    expect(res.needsOversell).toBe(true);
+    // 一座都没超卖 —— 要抢的 2 座全部是别人的软预留。
+    expect(res.oversellBy).toBe(0);
+    expect(res.oversoldAfter).toBe(0);
+    expect(res.reservedConflict).toBe(2);
+  });
+
+  it('确认后走超售直加分支（余位不够就不能用 CAS 抢），账面不超卖但**必记** CRITICAL 挤占审计', async () => {
     const tx = mountTx({
       snapshot: releasedSnapshotOrder(),
       seatClass: { capacity: 180, sold: 100 },
@@ -2202,7 +2391,53 @@ describe('恢复回程 · 超售口径 = 纯 sold vs capacity', () => {
     expect(audit.oversold).toBe(false);
     expect(audit.oversoldBy).toBe(0);
     expect(audit.scheduleOversoldAfter).toBe(0);
-    expect(tx.auditLog.create).not.toHaveBeenCalled();
+    // 超售审计不该记（确实没超卖）；但抢的是别人锁着的位子 —— 这一条必须留痕，
+    // 否则对面那张锁位单下单失败时，审计里查不到是谁、什么时候、抢了几座。
+    expect(tx.auditLog.create).toHaveBeenCalledTimes(1);
+    const arg = (tx.auditLog.create.mock.calls[0] as unknown as [
+      { data: Record<string, unknown> },
+    ])[0];
+    expect(arg.data.action).toBe('RESTORE_RETURN_LEG_DISPLACED_RESERVATION');
+    expect(arg.data.severity).toBe('CRITICAL');
+    expect(arg.data.after).toMatchObject({
+      displacedReserved: 2,
+      oversold: false,
+      oversoldBy: 0,
+      displacedDetail: [
+        { cabin: 'ECONOMY', quantity: 2, displacedReserved: 2, physicalIncrement: 0 },
+      ],
+    });
+    // 恢复快照里也留一份，事后从订单行就能看出这次挤了谁。
+    const retData = updateDataFor(
+      tx.orderItem.update.mock.calls as unknown as Array<
+        [{ where: { id: string }; data: Record<string, unknown> }]
+      >,
+      'leg-ret',
+    )!;
+    expect((retData.metadata as { returnRestored: Record<string, unknown> }).returnRestored)
+      .toMatchObject({ displacedReserved: 2 });
+  });
+
+  it('真·物理超售时只记一条超售审计，after 里同时带上挤掉的软预留', async () => {
+    const tx = mountTx({
+      snapshot: releasedSnapshotOrder(),
+      // capacity 10 / sold 10 → 已卖满；再占 2 座就是真超卖 2 座。
+      seatClass: { capacity: 10, sold: 10 },
+    });
+    tx.seatLock.aggregate.mockResolvedValue({ _sum: { qty: 1 } });
+    const { audit } = await service.restoreReturnLeg(
+      'ord-1',
+      restoreBody({ allowOversell: true }),
+      ADMIN,
+    );
+    expect(audit.oversold).toBe(true);
+    expect(audit.oversoldBy).toBe(2);
+    expect(tx.auditLog.create).toHaveBeenCalledTimes(1);
+    const arg = (tx.auditLog.create.mock.calls[0] as unknown as [
+      { data: Record<string, unknown> },
+    ])[0];
+    expect(arg.data.action).toBe('RESTORE_RETURN_LEG_OVERSOLD');
+    expect(arg.data.after).toMatchObject({ oversoldBy: 2, displacedReserved: 1 });
   });
 });
 
@@ -2250,5 +2485,269 @@ describe('恢复回程 · 预检 warnings', () => {
     >;
     const meta = updateDataFor(calls, 'leg-ret')!.metadata as Record<string, unknown>;
     expect(meta.returnReleased).toMatchObject({ returnInvoicedAtRelease: true });
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════
+// 14. 「勾了人但一个都没勾」（passengerIds: []）
+//
+// 缺省（不传）才等于整单。传 `[]` 是前端把勾选框全部取消时的形状，把它当成整单
+// 就是给全单的人打 no-show 标、把全单的回程座位放回库存 —— 而请求体看上去毫无异常。
+// ══════════════════════════════════════════════════════════════════════════
+describe('no-show · 空乘客数组不等于整单', () => {
+  it('schema 直接拒（执行体与预检体同口径）', () => {
+    expect(() =>
+      noShowBodySchema.parse({ requestToken: TOKEN, passengerIds: [] }),
+    ).toThrow();
+  });
+
+  it('绕过 schema 的内部调用也被服务拒（防御式断言），一座不动', async () => {
+    const tx = mountTx();
+    const err = await service
+      .markNoShow(
+        'ord-1',
+        { requestToken: TOKEN, passengerIds: [], releaseReturn: true } as never,
+        ADMIN,
+      )
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(BadRequestError);
+    expect(String((err as Error).message)).toContain('至少选择 1 位乘客');
+    expect(tx.$executeRaw).not.toHaveBeenCalled();
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('预检同样拒', async () => {
+    await expect(
+      service.previewNoShow('ord-1', { passengerIds: [] }, ADMIN),
+    ).rejects.toBeInstanceOf(BadRequestError);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 15. 回程起飞后作废（终态收口）
+//
+// 「已释放」不是终态：原班次一飞走，恢复窗口就关了，而这一行还挂在单上、提醒一直在催。
+// 作废只打一个终态标：**座位不动、钱不动、开票位不动**。起飞前一律拒。
+// ══════════════════════════════════════════════════════════════════════════
+describe('回程作废 · 权限与预检', () => {
+  /** 已释放 + 原班次已起飞（3 天前）的单。 */
+  const departedReleasedOrder = () => releasedSnapshotOrder();
+  const armPreview = (departureTime: Date | null) => {
+    mockPrisma.order.findUnique.mockResolvedValue(departedReleasedOrder());
+    mockPrisma.flightSchedule.findUnique.mockResolvedValue(
+      departureTime
+        ? {
+            id: 'sch-ret',
+            departureTime,
+            departureTz: 'Asia/Shanghai',
+            flight: { flightNumber: 'QH9588' },
+          }
+        : null,
+    );
+  };
+
+  it('代理无权作废', async () => {
+    await expect(service.previewVoidReturnLeg('ord-1', AGENT)).rejects.toBeInstanceOf(
+      ForbiddenError,
+    );
+    await expect(service.voidReturnLeg('ord-1', voidBody(), AGENT)).rejects.toBeInstanceOf(
+      ForbiddenError,
+    );
+  });
+
+  it('原班次已起飞 → eligible，original 如实回哪一班', async () => {
+    armPreview(OUT_DEPART); // 3 天前
+    const res = await service.previewVoidReturnLeg('ord-1', STAFF);
+    expect(res.eligible).toBe(true);
+    expect(res.blockers).toEqual([]);
+    expect(res.departed).toBe(true);
+    expect(res.original).toMatchObject({
+      orderItemId: 'leg-ret',
+      scheduleId: 'sch-ret',
+      flightNumber: 'QH9588',
+      quantity: 2,
+    });
+  });
+
+  it('回程还没起飞 → 拒，并把下一步说清楚（去点恢复回程）', async () => {
+    armPreview(RET_DEPART); // 7 天后
+    const res = await service.previewVoidReturnLeg('ord-1', ADMIN);
+    expect(res.eligible).toBe(false);
+    expect(res.departed).toBe(false);
+    expect(res.blockers.join('')).toContain('回程未起飞，请用恢复回程或等待起飞后作废');
+  });
+
+  it('本单没有已释放的回程 → 拒（无事可做）', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(orderSnapshot());
+    const res = await service.previewVoidReturnLeg('ord-1', ADMIN);
+    expect(res.eligible).toBe(false);
+    expect(res.blockers.join('')).toContain('没有被 no-show 释放的回程航段');
+  });
+
+  it('已经作废过 → 拒（不重复操作）', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(
+      releasedSnapshotOrder({}, {}),
+    );
+    // 在回程行上补一个终态快照。
+    const snap = releasedSnapshotOrder();
+    const ret = snap.items.find((it) => it.id === 'leg-ret')!;
+    (ret as { metadata: Record<string, unknown> }).metadata = {
+      ...(ret.metadata as Record<string, unknown>),
+      returnVoidedFinal: { at: new Date().toISOString(), byUserId: 'SYSTEM' },
+    };
+    mockPrisma.order.findUnique.mockResolvedValue(snap);
+    const res = await service.previewVoidReturnLeg('ord-1', ADMIN);
+    expect(res.eligible).toBe(false);
+    expect(res.blockers.join('')).toContain('已作废');
+  });
+
+  it('原班次已被删除 → 放行（恢复回程那条路同样走不通，不放行就永远收不了口）', async () => {
+    armPreview(null);
+    const res = await service.previewVoidReturnLeg('ord-1', ADMIN);
+    expect(res.eligible).toBe(true);
+    // 判不出飞没飞，如实回 false，不假装。
+    expect(res.departed).toBe(false);
+  });
+});
+
+describe('回程作废 · 执行', () => {
+  const mountVoid = (over: Record<string, unknown> = {}) =>
+    mountTx({
+      snapshot: releasedSnapshotOrder(),
+      // 原班次 3 天前已起飞。
+      schedule: { id: 'sch-ret', departureTime: OUT_DEPART },
+      ...over,
+    });
+
+  it('落终态快照 + 同步物化列 + 关掉两条待办；座位与金额一个字都不写', async () => {
+    // flightMeta 是 syncOrderLegFlag 回读行状态的那一份（mock 不持久化写入）：
+    // 摆成「已作废」的样子，才验得到物化列真的落到 RETURN_VOIDED。
+    // 这里刻意不带 requestToken —— 带了就会命中回放分支，本用例要测的是首刷。
+    const tx = mountVoid({
+      flightMeta: [
+        { id: 'leg-out', metadata: null },
+        {
+          id: 'leg-ret',
+          kind: 'FLIGHT',
+          flightScheduleId: null,
+          metadata: { returnVoidedFinal: { at: new Date().toISOString() } },
+        },
+      ],
+    });
+    const { audit } = await service.voidReturnLeg('ord-1', voidBody({ note: '客人确认不飞' }), ADMIN);
+    expect(audit.replayed).toBe(false);
+    expect(audit.returnItemId).toBe('leg-ret');
+
+    const data = updateDataFor(
+      tx.orderItem.update.mock.calls as unknown as Array<
+        [{ where: { id: string }; data: Record<string, unknown> }]
+      >,
+      'leg-ret',
+    )!;
+    const meta = data.metadata as Record<string, unknown>;
+    expect(meta.returnVoidedFinal).toMatchObject({
+      byUserId: 'admin-1',
+      requestToken: TOKEN,
+      note: '客人确认不飞',
+    });
+    expect((meta.legActionLog as Array<Record<string, unknown>>)[0]).toMatchObject({
+      type: 'VOID',
+      requestToken: TOKEN,
+      fingerprint: EMPTY_FP,
+    });
+    // 释放快照保留（历史全留着才查得清）。
+    expect(meta.returnReleased).toBeTruthy();
+    // 钱与座位一个都不动。
+    for (const key of ['unitPrice', 'amount', 'unitCostCny', 'totalCostCny', 'flightScheduleId']) {
+      expect(data).not.toHaveProperty(key);
+    }
+    expect(tx.$executeRaw).not.toHaveBeenCalled();
+
+    // 两条「回程已释放」待办一起收口（原 key + :DEPARTED）。
+    expect(tx.operationalReminder.updateMany).toHaveBeenCalledTimes(1);
+    const remArgs = (tx.operationalReminder.updateMany.mock.calls[0] as unknown as [
+      { where: { ruleKey: { in: string[] } }; data: { status: string } },
+    ])[0];
+    expect(remArgs.where.ruleKey.in).toEqual([
+      `NOSHOW_RELEASED:leg-ret:${RELEASED_SNAPSHOT.at}`,
+      `NOSHOW_RELEASED:leg-ret:${RELEASED_SNAPSHOT.at}:DEPARTED`,
+    ]);
+    expect(remArgs.data.status).toBe('DONE');
+
+    // 订单上：物化列同步 + 0 元留痕，subtotal/total 不写。
+    const orderUpdates = tx.order.update.mock.calls.map(
+      (c: unknown[]) => (c[0] as { data: Record<string, unknown> }).data,
+    );
+    expect(orderUpdates.some((d) => d.legFlag === 'RETURN_VOIDED')).toBe(true);
+    for (const d of orderUpdates) {
+      expect(d).not.toHaveProperty('subtotal');
+      expect(d).not.toHaveProperty('total');
+    }
+    const adj = orderUpdates.find((d) => d.adjustments != null)!.adjustments as Array<
+      Record<string, unknown>
+    >;
+    expect(adj[adj.length - 1]).toMatchObject({ type: 'RETURN_LEG_VOIDED', amountCny: 0 });
+  });
+
+  it('回程还没起飞 → 400，一个字都不写', async () => {
+    const tx = mountVoid({ schedule: { id: 'sch-ret', departureTime: RET_DEPART } });
+    await expect(
+      service.voidReturnLeg('ord-1', voidBody(), ADMIN),
+    ).rejects.toBeInstanceOf(BadRequestError);
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+    expect(tx.order.update).not.toHaveBeenCalled();
+  });
+
+  it('同 token 重试 → 回放，不重复写快照、不重复关待办', async () => {
+    const tx = mountVoid({
+      flightMeta: [
+        { id: 'leg-out', metadata: null },
+        {
+          id: 'leg-ret',
+          metadata: {
+            returnVoidedFinal: { at: new Date().toISOString(), requestToken: TOKEN },
+            legActionLog: [legLog('VOID', TOKEN)],
+          },
+        },
+      ],
+    });
+    const { audit } = await service.voidReturnLeg('ord-1', voidBody(), ADMIN);
+    expect(audit.replayed).toBe(true);
+    expect(audit.returnItemId).toBe('leg-ret');
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+    expect(tx.operationalReminder.updateMany).not.toHaveBeenCalled();
+  });
+
+  it('token 是恢复回程用过的，拿来作废 → 409（类型不符）', async () => {
+    const tx = mountVoid({
+      flightMeta: [
+        { id: 'leg-out', metadata: null },
+        { id: 'leg-ret', metadata: { legActionLog: [legLog('RESTORE', TOKEN)] } },
+      ],
+    });
+    const err = await service.voidReturnLeg('ord-1', voidBody(), ADMIN).catch((e: unknown) => e);
+    expect((err as AppError).code).toBe('TOKEN_PAYLOAD_MISMATCH');
+    expect((err as AppError).details).toMatchObject({ reason: 'ACTION_TYPE' });
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+  });
+
+  it('作废之后恢复回程被拒（终态不可逆）', async () => {
+    const snap = releasedSnapshotOrder();
+    const ret = snap.items.find((it) => it.id === 'leg-ret')!;
+    (ret as { metadata: Record<string, unknown> }).metadata = {
+      ...(ret.metadata as Record<string, unknown>),
+      returnVoidedFinal: { at: new Date().toISOString(), byUserId: 'SYSTEM' },
+    };
+    mockPrisma.order.findUnique.mockResolvedValue(snap);
+    mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sch-ret',
+      departureTime: RET_DEPART,
+      departureTz: 'Asia/Shanghai',
+      flight: { flightNumber: 'QH9588' },
+    });
+    const res = await service.previewRestoreReturnLeg('ord-1', ADMIN);
+    expect(res.eligible).toBe(false);
+    expect(res.blockers.join('')).toContain('已过期作废');
   });
 });

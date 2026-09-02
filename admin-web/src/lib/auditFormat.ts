@@ -30,6 +30,8 @@ const ACTION_DICT: Record<string, ActionEntry> = {
   MARK_NO_SHOW: { label: '标记去程 no-show', icon: 'alert' },
   RESTORE_RETURN_LEG: { label: '恢复回程', icon: 'refresh' },
   RESTORE_RETURN_LEG_OVERSOLD: { label: '恢复回程（超售放行）', icon: 'alert' },
+  RESTORE_RETURN_LEG_DISPLACED_RESERVATION: { label: '恢复回程（挤占预留座）', icon: 'alert' },
+  VOID_RETURN_LEG: { label: '作废回程', icon: 'plane' },
   CANCEL_RETURN_LEG: { label: '取消回程', icon: 'plane' },
   CANCEL_OUTBOUND_LEG: { label: '取消去程', icon: 'plane' },
 
@@ -162,6 +164,9 @@ const FIELD_DICT: Record<string, string> = {
   oversold: '超售放行',
   oversoldBy: '超售座位数',
   maxOversell: '超售上限',
+  // 恢复回程占座的两个来源分开记：挤占的是别人预留的座（物理上有座），物理超售是真卖穿了。
+  displacedReserved: '挤占预留座数',
+  physicalIncrement: '物理超售座数',
   quantity: '数量',
   source: '来源',
   acknowledgedWarnings: '已确认警告',
@@ -194,6 +199,16 @@ const ACTION_FIELD_DICT: Record<string, Record<string, string>> = {
   RESTORE_RETURN_LEG_OVERSOLD: {
     leg: '航段方向',
     quantity: '恢复座数',
+    note: '处理备注',
+  },
+  RESTORE_RETURN_LEG_DISPLACED_RESERVATION: {
+    leg: '航段方向',
+    quantity: '恢复座数',
+    note: '处理备注',
+  },
+  VOID_RETURN_LEG: {
+    leg: '航段方向',
+    quantity: '座数',
     note: '处理备注',
   },
   CANCEL_RETURN_LEG: {

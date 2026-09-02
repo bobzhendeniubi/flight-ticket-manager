@@ -35,6 +35,7 @@ import {
   ReceiptSource,
   ReceiptStatus,
   ReminderPriority,
+  ReminderStatus,
   HoldOrderStatus,
   HoldInstallmentStatus,
   VisaSubmissionStatus,
@@ -228,6 +229,15 @@ export interface ReminderCandidate {
   priority: ReminderPriority;
   /** YYYY-MM-DD */
   dueAt: string;
+  /**
+   * 本条生效即让另一条提醒作废（落库时把它置 SKIPPED 并写明原因）。
+   *
+   * 只有一处在用：回程释放的提醒在原班次起飞后换成 `:DEPARTED` 的那一条 —— 两条讲的是
+   * 同一行的同一件事，键不同（ruleKey 唯一索引，不换键就发不出新的那条），不收口的话
+   * 待办列表里会同时挂着「请确认是否保留回程」和「回程已起飞，请确认作废」，
+   * 运营看到前者还会去点「恢复回程」，而那条路早已走不通。
+   */
+  supersedesRuleKey?: string;
 }
 
 export interface RuleOrder {
@@ -616,6 +626,16 @@ export interface RuleReleasedReturnLeg {
  * 直接静默停止，这单就永远没人管了。系统**没有**「起飞后自动作废」的定时任务，
  * 所以文案里一个字都不能承诺它，只能叫人来处置。
  */
+/**
+ * 「回程已释放」提醒的两个 ruleKey（原条 + 起飞后换的 `:DEPARTED` 条）。
+ *
+ * 键的构造收敛在这里：回程被作废（人工或起飞后 job）时要把这两条一起关掉，
+ * 那边照抄一遍字符串拼接，改键格式时必然漏一处、于是待办永远关不掉。
+ */
+export function noShowReleasedReminderRuleKeys(itemId: string, releasedAt: string): string[] {
+  return [`NOSHOW_RELEASED:${itemId}:${releasedAt}`, `NOSHOW_RELEASED:${itemId}:${releasedAt}:DEPARTED`];
+}
+
 export function buildNoShowReturnReleasedCandidates(
   leg: RuleReleasedReturnLeg,
   today: string,
@@ -642,12 +662,17 @@ export function buildNoShowReturnReleasedCandidates(
     `订单 ${leg.orderNumber} 去程 ${noShowDate} 未登机，回程（${returnDate ?? '日期未知'}）` +
     `${seats} 座已放回库存重新销售，钱款未动。`;
 
+  const [openKey, departedKey] = noShowReleasedReminderRuleKeys(leg.itemId, releasedAt);
+
   if (departed) {
     // 起飞后仍停在「已释放」态：恢复窗口已关，但这一段还挂在单上没有终态，必须有人来收口。
     return [
       {
         rule: 'NO_SHOW_RETURN_RELEASED',
-        ruleKey: `NOSHOW_RELEASED:${leg.itemId}:${releasedAt}:DEPARTED`,
+        ruleKey: departedKey,
+        // 起飞前那条「请与客人确认是否保留回程」已经失效（恢复回程点不动了），一并收口 ——
+        // 两条并存会让运营照旧条去点「恢复回程」，白折腾一轮才发现班次已经飞了。
+        supersedesRuleKey: openKey,
         orderId: leg.orderId,
         title: `【回程已起飞仍未恢复】${leg.orderNumber} ${seats} 座待收口`,
         body:
@@ -663,7 +688,7 @@ export function buildNoShowReturnReleasedCandidates(
   return [
     {
       rule: 'NO_SHOW_RETURN_RELEASED',
-      ruleKey: `NOSHOW_RELEASED:${leg.itemId}:${releasedAt}`,
+      ruleKey: openKey,
       orderId: leg.orderId,
       title: `【回程已释放待跟进】${leg.orderNumber} ${seats} 座已放回库存`,
       body:
@@ -1048,6 +1073,30 @@ export async function generateRuleReminders(
       skipDuplicates: true,
     });
     created = result.count;
+  }
+
+  // ── 被顶替的旧提醒收口（当前只有「回程已释放 → 起飞后请确认作废」这一对）────────────
+  //
+  // 放在 createMany **之后**：先确保新条目在库里，再关旧的，中途崩掉最多留下两条并存
+  //（下一轮扫描会补上），绝不会出现「旧的关了、新的没建」的空窗。
+  // 扫的是 unique 而不是 fresh：新条目在上一轮就建好了、这一轮不算 fresh，可旧条目未必
+  // 已经关掉（上一轮跑到一半崩了）—— 每轮都收一次才是真幂等。
+  // updateMany 只动仍活着的（OPEN / IN_PROGRESS）：运营已经手工处理过的不去覆盖他的结论。
+  const supersededKeys = [
+    ...new Set(unique.map((c) => c.supersedesRuleKey).filter((k): k is string => k != null)),
+  ];
+  if (supersededKeys.length > 0) {
+    await prisma.operationalReminder.updateMany({
+      where: {
+        ruleKey: { in: supersededKeys },
+        status: { in: [ReminderStatus.OPEN, ReminderStatus.IN_PROGRESS] },
+      },
+      data: {
+        status: ReminderStatus.SKIPPED,
+        resolvedAt: now,
+        resolvedNote: '回程原班次已起飞，本条已由「请确认作废」的新待办接手。',
+      },
+    });
   }
 
   return { created, skipped: unique.length - created, byRule };

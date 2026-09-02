@@ -20,9 +20,18 @@
  *   2. npx vitest run -c vitest.integration.config.ts src/modules/orders/orders.no-show.integration.test.ts
  */
 import { describe, it, expect } from 'vitest';
-import { AuditSeverity, CabinClass, OrderItemKind, Prisma, UserRole } from '@prisma/client';
+import {
+  AuditSeverity,
+  CabinClass,
+  OrderItemKind,
+  OrderLegFlag,
+  Prisma,
+  ReminderStatus,
+  UserRole,
+} from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { OrderService, type OrderRequester } from './orders.service.js';
+import { voidDepartedReleasedReturnLegs } from './no-show-void.js';
 import { ConflictError } from '../../lib/errors.js';
 
 const service = new OrderService();
@@ -375,6 +384,91 @@ describe('no-show · 超售放行（真 DB）', () => {
     ]);
   });
 
+  // ── 软预留被挤占：sold 没超 capacity，但抢的是别人锁着的位子 ──────────────────
+  // 这一档旧写法一条留痕都没有：超售审计不触发（确实没超卖），运营那边只看到一句
+  //「余位不足，确认后继续」。对面那张 ACTIVE 锁位的座位被悄悄拿走，等他们下单失败来问，
+  // 审计里查不到任何一条记录说明是谁、什么时候、抢了几座。
+  it('余位被他人 ACTIVE 锁位吃满 → 确认后占座成功、账面不超卖，但落一条 CRITICAL 挤占审计；锁位记录本身不动', async () => {
+    const actor = await adminActor();
+    const { orderId, ret } = await createRoundTripOrder();
+    const seatClass = await prisma.flightSeatClass.findFirstOrThrow({
+      where: { scheduleId: ret.id, cabin: CabinClass.ECONOMY },
+    });
+
+    await service.markNoShow(orderId, { requestToken: token('a1'), releaseReturn: true }, actor);
+    expect(await soldOf(ret.id, CabinClass.ECONOMY)).toBe(0);
+
+    // 别人把这一班的物理余位全锁光：capacity − sold(0) 全部被 ACTIVE 锁位占着 → available = 0，
+    // 但 sold 一座没动，恢复 2 座在**超售口径**上是 0（before −capacity → after −capacity+2 ≤ 0）。
+    const locker = await prisma.user.create({
+      data: { email: `${uniq('locker')}@test.com`, role: UserRole.STAFF },
+    });
+    const lock = await prisma.seatLock.create({
+      data: {
+        flightScheduleId: ret.id,
+        seatClassId: seatClass.id,
+        userId: locker.id,
+        qty: seatClass.capacity,
+        expiresAt: new Date(Date.now() + 3600_000),
+      },
+    });
+
+    // 预检：要确认，但一座都没超卖 —— 缺口全部来自他人软预留。
+    const preview = await service.previewRestoreReturnLeg(orderId, actor);
+    expect(preview.eligible).toBe(true);
+    expect(preview.needsOversell).toBe(true);
+    expect(preview.oversellBy).toBe(0);
+    expect(preview.oversoldAfter).toBe(0);
+    expect(preview.reservedConflict).toBe(2);
+
+    // 未确认 → 409（一座不动）。
+    await expect(
+      service.restoreReturnLeg(orderId, { requestToken: token('b2'), allowOversell: false }, actor),
+    ).rejects.toMatchObject({ code: 'OVERSELL_CONFIRMATION_REQUIRED' });
+    expect(await soldOf(ret.id, CabinClass.ECONOMY)).toBe(0);
+
+    const money0 = await moneySnapshot(orderId);
+    const { audit } = await service.restoreReturnLeg(
+      orderId,
+      { requestToken: token('b3'), allowOversell: true },
+      actor,
+    );
+
+    // 占座成功，账面一座没超卖。
+    expect(audit.oversold).toBe(false);
+    expect(audit.oversoldBy).toBe(0);
+    expect(audit.scheduleOversoldAfter).toBe(0);
+    expect(await soldOf(ret.id, CabinClass.ECONOMY)).toBe(2);
+
+    // 超售审计不该有（确实没超卖）；挤占审计必须有，且与占座同一事务落库。
+    expect(
+      await prisma.auditLog.count({
+        where: { action: 'RESTORE_RETURN_LEG_OVERSOLD', targetId: orderId },
+      }),
+    ).toBe(0);
+    const logs = await prisma.auditLog.findMany({
+      where: { action: 'RESTORE_RETURN_LEG_DISPLACED_RESERVATION', targetId: orderId },
+    });
+    expect(logs).toHaveLength(1);
+    expect(logs[0].severity).toBe(AuditSeverity.CRITICAL);
+    expect(logs[0].actorUserId).toBe(actor.userId);
+    const after = logs[0].after as Record<string, any>;
+    expect(after.displacedReserved).toBe(2);
+    expect(after.oversoldBy).toBe(0);
+    expect(after.displacedDetail).toEqual([
+      { cabin: 'ECONOMY', quantity: 2, displacedReserved: 2, physicalIncrement: 0 },
+    ]);
+
+    // 锁位记录本身**一个字都不动**：该怎么过期就怎么过期，本端点只如实记下占用了它预留的位子。
+    const lockAfter = await prisma.seatLock.findUniqueOrThrow({ where: { id: lock.id } });
+    expect(lockAfter.status).toBe(lock.status);
+    expect(lockAfter.qty).toBe(lock.qty);
+    expect(lockAfter.consumedOrderId).toBeNull();
+
+    // 钱一分没动。
+    expect(await moneySnapshot(orderId)).toEqual(money0);
+  });
+
   it('超售恢复后再释放：多出来的 2 座如实放回去，班次回到卖满而不是被打成负数', async () => {
     const actor = await adminActor();
     const { orderId, ret } = await createRoundTripOrder();
@@ -395,5 +489,127 @@ describe('no-show · 超售放行（真 DB）', () => {
 
     await service.markNoShow(orderId, { requestToken: token('c3'), releaseReturn: true }, actor);
     expect(await soldOf(ret.id, CabinClass.ECONOMY)).toBe(capacity);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 回程「起飞后自动作废」后台扫描（真 DB）
+//
+// 「已释放」不是终态：原班次一飞走，恢复窗口就关了，而这一行还挂在单上、提醒一直在催。
+// job 在起飞满 2 小时后把它推到终态 —— 只打标：座位不动、钱不动。
+// ══════════════════════════════════════════════════════════════════════════
+describe('回程起飞后自动作废 · 后台扫描（真 DB）', () => {
+  it('释放 → 原班次改到过去 → 跑 job：legFlag=RETURN_VOIDED、sold 不变，恢复端点被拒「已过期作废」', async () => {
+    const actor = await adminActor();
+    const { orderId, ret, retItem } = await createRoundTripOrder();
+
+    await service.markNoShow(orderId, { requestToken: token('a1'), releaseReturn: true }, actor);
+    const soldAfterRelease = await soldOf(ret.id, CabinClass.ECONOMY);
+    expect(soldAfterRelease).toBe(0);
+    const money0 = await moneySnapshot(orderId);
+    expect(
+      (await prisma.order.findUniqueOrThrow({ where: { id: orderId } })).legFlag,
+    ).toBe(OrderLegFlag.RETURN_RELEASED);
+
+    // ① 原班次还没飞 → job 一条都不动（恢复回程这时候仍然走得通）。
+    const noop = await voidDepartedReleasedReturnLegs(prisma, new Date());
+    expect(noop.voided).toBe(0);
+
+    // ② 把原回程班次改到 3 小时前（已过 2 小时缓冲）。
+    await prisma.flightSchedule.update({
+      where: { id: ret.id },
+      data: { departureTime: new Date(Date.now() - 3 * 3600_000) },
+    });
+
+    const result = await voidDepartedReleasedReturnLegs(prisma, new Date());
+    expect(result.voided).toBe(1);
+
+    // 终态快照 + 物化列；座位与钱一个字都没动。
+    const row = await prisma.orderItem.findUniqueOrThrow({ where: { id: retItem.id } });
+    const meta = row.metadata as Record<string, any>;
+    expect(meta.returnVoidedFinal).toMatchObject({ byUserId: 'SYSTEM', jobId: result.jobId });
+    expect(meta.returnReleased).toBeTruthy(); // 释放快照保留，历史全留着才查得清
+    const order = await prisma.order.findUniqueOrThrow({ where: { id: orderId } });
+    expect(order.legFlag).toBe(OrderLegFlag.RETURN_VOIDED);
+    expect(order.hasReturnLeg).toBe(false);
+    expect(await soldOf(ret.id, CabinClass.ECONOMY)).toBe(soldAfterRelease);
+    expect(await moneySnapshot(orderId)).toEqual(money0);
+
+    // 0 元留痕进了 adjustments。
+    const adjustments = order.adjustments as Array<Record<string, unknown>>;
+    expect(adjustments[adjustments.length - 1]).toMatchObject({
+      type: 'RETURN_LEG_VOIDED',
+      amountCny: 0,
+    });
+
+    // ③ 终态不可逆：恢复端点直接拒。
+    const preview = await service.previewRestoreReturnLeg(orderId, actor);
+    expect(preview.eligible).toBe(false);
+    expect(preview.blockers.join('')).toContain('已过期作废');
+    await expect(
+      service.restoreReturnLeg(orderId, { requestToken: token('b2'), allowOversell: true }, actor),
+    ).rejects.toThrow(/已过期作废/u);
+    expect(await soldOf(ret.id, CabinClass.ECONOMY)).toBe(soldAfterRelease);
+
+    // ④ 再跑一遍 job：已是终态，一条都不动（幂等）。
+    const again = await voidDepartedReleasedReturnLegs(prisma, new Date());
+    expect(again.voided).toBe(0);
+  });
+
+  it('人工作废：起飞前拒、起飞后放行，且把两条「回程已释放」待办一起关掉', async () => {
+    const actor = await adminActor();
+    const { orderId, ret, retItem } = await createRoundTripOrder();
+
+    await service.markNoShow(orderId, { requestToken: token('a1'), releaseReturn: true }, actor);
+    const released = await prisma.orderItem.findUniqueOrThrow({ where: { id: retItem.id } });
+    const releasedAt = (released.metadata as Record<string, any>).returnReleased.at as string;
+
+    // 起飞前：拒，并把下一步说清楚。
+    const early = await service.previewVoidReturnLeg(orderId, actor);
+    expect(early.eligible).toBe(false);
+    expect(early.blockers.join('')).toContain('回程未起飞');
+
+    // 造出这一行的两条自动提醒（起飞前那条 + 起飞后换的 :DEPARTED 条）。
+    for (const suffix of ['', ':DEPARTED']) {
+      await prisma.operationalReminder.create({
+        data: {
+          orderId,
+          createdById: actor.userId,
+          title: `回程已释放待跟进${suffix}`,
+          ruleKey: `NOSHOW_RELEASED:${retItem.id}:${releasedAt}${suffix}`,
+          status: ReminderStatus.OPEN,
+        },
+      });
+    }
+
+    await prisma.flightSchedule.update({
+      where: { id: ret.id },
+      data: { departureTime: new Date(Date.now() - 3 * 3600_000) },
+    });
+
+    const ok = await service.previewVoidReturnLeg(orderId, actor);
+    expect(ok.eligible).toBe(true);
+    expect(ok.departed).toBe(true);
+
+    const { audit } = await service.voidReturnLeg(
+      orderId,
+      { requestToken: token('c9'), note: '客人确认不飞' },
+      actor,
+    );
+    expect(audit.replayed).toBe(false);
+    expect(audit.returnItemId).toBe(retItem.id);
+
+    const reminders = await prisma.operationalReminder.findMany({
+      where: { orderId, ruleKey: { startsWith: `NOSHOW_RELEASED:${retItem.id}:` } },
+    });
+    expect(reminders).toHaveLength(2);
+    for (const r of reminders) {
+      expect(r.status).toBe(ReminderStatus.DONE);
+      expect(String(r.resolvedNote)).toContain('人工确认作废');
+    }
+
+    // 同 token 重试 → 回放（不重复写）。
+    const replay = await service.voidReturnLeg(orderId, { requestToken: token('c9') }, actor);
+    expect(replay.audit.replayed).toBe(true);
   });
 });

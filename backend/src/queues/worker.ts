@@ -29,6 +29,7 @@ import {
   type SeatHoldJobData,
   type SeatLockJobData,
   type HoldOverdueJobData,
+  type NoShowVoidJobData,
   type WaitlistCheckJobData,
 } from './queue.js';
 import { closeMailer } from '../lib/mailer.js';
@@ -37,6 +38,7 @@ import { computeBundleSeatSplit, releaseSeatFloored } from '../modules/orders/or
 import { REFUND_REQUESTED_FULFILLMENT_ERROR } from '../modules/fulfillment/fulfillment.service.js';
 import { heldSeatsForSeatClass } from '../modules/hold-orders/held-seats.js';
 import { markOverdueHolds } from '../modules/hold-orders/hold-overdue.js';
+import { voidDepartedReleasedReturnLegs } from '../modules/orders/no-show-void.js';
 
 /**
  * 超时释放某订单占用的座位——套餐升舱拆座感知 + 下限钳制在 0（MEDIUM 修复）。
@@ -434,6 +436,30 @@ void (async () => {
   }
 })();
 
+// no-show 回程「起飞后自动作废」扫描（每小时）：只打终态标，不动座位、不动钱。
+// 样板与 hold-overdue 完全一致：concurrency 1（全库扫描，没必要并发）+ 自注册 repeat。
+const noShowVoidWorker = new Worker<NoShowVoidJobData>(
+  'no-show-void',
+  async () => voidDepartedReleasedReturnLegs(prisma),
+  { connection: bullRedis, concurrency: 1 },
+);
+
+noShowVoidWorker.on('failed', (job, err) => {
+  // eslint-disable-next-line no-console
+  console.error(`[worker:no-show-void] ✗ job ${job?.id} failed:`, err.message);
+});
+
+void (async () => {
+  try {
+    const module = await import('./queue.js');
+    if (!Object.prototype.hasOwnProperty.call(module, 'scheduleNoShowVoidScan')) return;
+    await module.scheduleNoShowVoidScan();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[worker:no-show-void] failed to register repeatable scan:', err);
+  }
+})();
+
 seatLockWorker.on('failed', (job, err) => {
   // eslint-disable-next-line no-console
   console.error(`[worker:seat-lock] ✗ job ${job?.id} failed:`, err.message);
@@ -517,6 +543,7 @@ async function shutdown() {
     seatHoldWorker.close(),
     seatLockWorker.close(),
     holdOverdueWorker.close(),
+    noShowVoidWorker.close(),
     notificationWorker.close(),
   ]);
   await closeMailer();

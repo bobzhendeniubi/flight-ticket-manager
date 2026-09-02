@@ -39,6 +39,8 @@ const ORDER_ACTION_LABELS: Record<string, string> = {
   MARK_NO_SHOW: '标记去程 no-show',
   RESTORE_RETURN_LEG: '恢复回程',
   RESTORE_RETURN_LEG_OVERSOLD: '恢复回程（超售放行）',
+  RESTORE_RETURN_LEG_DISPLACED_RESERVATION: '恢复回程（挤占预留座）',
+  VOID_RETURN_LEG: '作废回程',
   CANCEL_RETURN_LEG: '取消回程',
   CANCEL_OUTBOUND_LEG: '取消去程',
   // ── 乘客 / 酒店 / 分房 ──

@@ -3749,6 +3749,14 @@ export interface RestoreReturnLegPreview {
   oversellDetail: OversellSeatDetail[];
   /** 系统允许的超售上限（超过它后端也会拒） */
   maxOversell: number;
+  /**
+   * 本次恢复会挤占**他人临时锁位 / 占位单余座**的座数（软预留冲突）。
+   * 与物理超售是两回事：物理上还有座、但那些座被别人预留着，所以会出现
+   * needsOversell=true、oversellBy=0、reservedConflict>0 的组合——确认后照样占，
+   * 后端记关键审计（RESTORE_RETURN_LEG_DISPLACED_RESERVATION）。
+   * 旧后端不下发时为 undefined，前端按 0 处理。
+   */
+  reservedConflict?: number;
   /** true = 原班次已起飞（不可恢复） */
   departed: boolean;
   /**
@@ -3767,6 +3775,35 @@ export interface RestoreReturnLegResult {
     quantity: number;
     oversold: boolean;
     oversoldBy: number;
+    replayed: boolean;
+  };
+}
+
+// ── 作废回程（ADMIN/STAFF）────────────────────────────────────────────────
+// 回程座位早已释放、原班次也已经起飞：这一段永远回不来了。作废把它钉成终态
+// （行 metadata 落 returnVoidedFinal、legFlag 变 RETURN_VOIDED，不再出现恢复入口），钱一分不动。
+
+export interface VoidReturnLegPreview {
+  eligible: boolean;
+  /** 不合格原因（逐条）；eligible=false 时非空 */
+  blockers: string[];
+  /** true = 原班次已起飞（作废的前提；false 时说明回程还能恢复，不该作废） */
+  departed: boolean;
+  /** 释放前的原班次快照（作废的就是这一段）；取不到为 null */
+  original: {
+    orderItemId: string;
+    flightNumber: string | null;
+    departDate: string | null;
+    cabin: CabinClass | null;
+    quantity: number;
+  } | null;
+}
+
+export interface VoidReturnLegResult {
+  order: OrderSummary;
+  audit: {
+    returnItemId: string;
+    /** true = 同 requestToken 幂等回放（本次没有新写入） */
     replayed: boolean;
   };
 }
@@ -4809,6 +4846,24 @@ export const api = {
     body: { requestToken: string; allowOversell?: boolean; note?: string },
   ) =>
     apiFetch<RestoreReturnLegResult>(`/orders/${orderId}/restore-return-leg`, {
+      method: 'POST',
+      token,
+      body,
+    }),
+  // 作废回程预检：只读。回程当前已释放、且原班次已起飞才 eligible，否则 blockers 说明原因。
+  previewVoidReturnLeg: (token: string, orderId: string) =>
+    apiFetch<VoidReturnLegPreview>(`/orders/${orderId}/void-return-leg/preview`, {
+      method: 'POST',
+      token,
+      body: {},
+    }),
+  // 作废回程提交：把「已释放 + 原班次已起飞」的回程钉成终态，作废后不可恢复；钱款不动。
+  voidReturnLeg: (
+    token: string,
+    orderId: string,
+    body: { requestToken: string; note?: string },
+  ) =>
+    apiFetch<VoidReturnLegResult>(`/orders/${orderId}/void-return-leg`, {
       method: 'POST',
       token,
       body,

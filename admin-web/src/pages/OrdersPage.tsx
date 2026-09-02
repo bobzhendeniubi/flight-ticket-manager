@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type OrderLegFlagFilter, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE, TOKEN_PAYLOAD_MISMATCH_CODE, TOKEN_PAYLOAD_MISMATCH_HINT } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type VoidReturnLegPreview, type OrderLegFlagFilter, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE, TOKEN_PAYLOAD_MISMATCH_CODE, TOKEN_PAYLOAD_MISMATCH_HINT } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -7019,13 +7019,56 @@ function readReturnRestoredMark(metadata: unknown): ReturnRestoredMark | null {
   };
 }
 
-/** 回程行的「最终作废」打标（metadata.returnVoidedFinal，由后台任务落）。 */
-function readReturnVoidedFinalAt(metadata: unknown): string | null | undefined {
-  if (!metadata || typeof metadata !== 'object') return undefined;
+/**
+ * 回程行的「最终作废」打标（metadata.returnVoidedFinal）。两条来路：
+ * 后台任务在原班次起飞后自动落（by='SYSTEM'），或运营在回程行手工点「确认作废回程」。
+ * 徽标要把这个区分说出来——「系统自动」和「有人拍过板」在事后对账时不是一回事。
+ */
+interface ReturnVoidedFinalMark {
+  at: string | null;
+  /** true = 后台任务起飞后自动作废；false = 人工确认作废 */
+  bySystem: boolean;
+}
+function readReturnVoidedFinal(metadata: unknown): ReturnVoidedFinalMark | null {
+  if (!metadata || typeof metadata !== 'object') return null;
   const v = (metadata as { returnVoidedFinal?: unknown }).returnVoidedFinal;
-  if (!v || typeof v !== 'object') return undefined;
-  const at = (v as { at?: unknown }).at;
-  return typeof at === 'string' ? at : null;
+  if (!v || typeof v !== 'object') return null;
+  const m = v as { at?: unknown; by?: unknown };
+  return {
+    at: typeof m.at === 'string' ? m.at : null,
+    bySystem: m.by === 'SYSTEM',
+  };
+}
+
+/**
+ * 已释放的回程行：**释放快照本身**能否证明原班次已经起飞（= 可以作废）。
+ * 现存释放快照只存了原班次 id / 舱位，没有出发时刻，所以这里多认几种可能的写法；
+ * 一个都取不到、或只有日期且就是今天 → 返回 false，调用方改打一次作废预检问后端 departed。
+ * 只做「确凿已起飞」的快速判定，绝不自己猜——猜错会凭空长出一个不可逆的作废入口。
+ */
+function readReleasedOriginalDeparted(metadata: unknown): boolean {
+  if (!metadata || typeof metadata !== 'object') return false;
+  const v = (metadata as { returnReleased?: unknown }).returnReleased;
+  if (!v || typeof v !== 'object') return false;
+  const m = v as {
+    originalDepartureTime?: unknown;
+    originalDeparture?: unknown;
+    originalDepartDate?: unknown;
+  };
+  const iso = [m.originalDepartureTime, m.originalDeparture].find(
+    (x): x is string => typeof x === 'string' && x.trim() !== '',
+  );
+  if (iso) {
+    const ms = Date.parse(iso);
+    if (Number.isFinite(ms)) return ms < Date.now();
+  }
+  const date = typeof m.originalDepartDate === 'string' ? m.originalDepartDate.slice(0, 10) : '';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
+  // 只有日期没有时刻：当天不敢判「已起飞」（可能还没飞），严格早于今天才算。
+  // 今天按业务时区取，别用浏览器本地日期（境外同事会差一天）。
+  const parts = businessTzParts(new Date());
+  if (!parts) return false;
+  return date < `${parts.year}-${parts.month}-${parts.day}`;
 }
 
 /**
@@ -7042,15 +7085,15 @@ function readReturnVoidedFinalAt(metadata: unknown): string | null | undefined {
  * 两边时间戳都缺（老数据）时以「班次为空」为准，不丢徽标。
  */
 type ReturnLegLifecycle =
-  | { kind: 'VOIDED'; at: string | null }
+  | { kind: 'VOIDED'; mark: ReturnVoidedFinalMark }
   | { kind: 'CANCELLED'; leg: FlightLegSide }
   | { kind: 'RELEASED'; mark: ReturnReleasedMark }
   | { kind: 'RESTORED'; mark: ReturnRestoredMark }
   | null;
 function readReturnLegLifecycle(item: OrderItem): ReturnLegLifecycle {
   if (item.kind !== 'FLIGHT') return null;
-  const voidedAt = readReturnVoidedFinalAt(item.metadata);
-  if (voidedAt !== undefined) return { kind: 'VOIDED', at: voidedAt };
+  const voided = readReturnVoidedFinal(item.metadata);
+  if (voided) return { kind: 'VOIDED', mark: voided };
   const cancelledLeg = readCancelledLeg(item.metadata);
   if (cancelledLeg) return { kind: 'CANCELLED', leg: cancelledLeg };
   const released = readReturnReleasedMark(item.metadata);
@@ -7138,6 +7181,14 @@ function OrderItemRow({
   const [cancelingLeg, setCancelingLeg] = useState<FlightLegSide | null>(null);
   /** 「恢复回程」面板是否展开。 */
   const [restoringReturn, setRestoringReturn] = useState(false);
+  /** 「作废回程」面板是否展开。 */
+  const [voidingReturn, setVoidingReturn] = useState(false);
+  /**
+   * 作废预检探到的「原班次是否已起飞」：null = 还没探到 / 探失败（此时不给作废入口，fail-closed）。
+   * 只在释放快照自己证明不了已起飞时才去探。
+   */
+  const [returnDepartedProbe, setReturnDepartedProbe] = useState<boolean | null>(null);
+  const rowToken = useAuth((st) => st.tokens)?.accessToken ?? '';
   const isFlight = item.kind === 'FLIGHT';
   // 取消航段：本行是去程/回程 FLIGHT 行、且尚未被取消过才给入口。两个入口都只在本单有
   // ≥2 条有效 FLIGHT 行时出现（单程单的 outboundLegItemId/returnLegItemId 都是 null）。
@@ -7162,6 +7213,27 @@ function OrderItemRow({
   const returnLife = isFlight ? readReturnLegLifecycle(item) : null;
   // 已释放的回程行班次是空的：对它改期/升舱/取消都是对着空班次操作，一律不给入口。
   const returnReleased = returnLife?.kind === 'RELEASED';
+  // 「作废回程」的前提：座位已释放 **且** 原班次已经起飞（没起飞就还能恢复，不该作废）。
+  // 释放快照能自己证明已起飞就地判；证明不了就打一次只读的作废预检问后端 departed。
+  const releasedDepartedLocal = returnReleased && readReleasedOriginalDeparted(item.metadata);
+  useEffect(() => {
+    if (!canOperate || !returnReleased || releasedDepartedLocal || !rowToken) return;
+    let cancelled = false;
+    api
+      .previewVoidReturnLeg(rowToken, orderId)
+      .then((res) => {
+        if (!cancelled) setReturnDepartedProbe(res.departed);
+      })
+      .catch(() => {
+        // 探测失败不弹错：入口不出现即可（宁可少给一个不可逆入口，也不能给错）。
+        if (!cancelled) setReturnDepartedProbe(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [canOperate, returnReleased, releasedDepartedLocal, rowToken, orderId]);
+  const canVoidReturn =
+    Boolean(canOperate) && returnReleased && (releasedDepartedLocal || returnDepartedProbe === true);
   // 套餐改档：换绑到另一张套餐（档次/晚数是 Bundle 自身的属性，改档=换 bundleId）。
   const isBundleRow = item.kind === 'BUNDLE' && Boolean(item.bundleId);
   // 升舱入口：只有**经济舱**机票行能一键升商务舱；套餐机票腿（带 bundleId）走套餐自身的升舱份数模型，后端也会拒。
@@ -7290,7 +7362,13 @@ function OrderItemRow({
           {returnLife?.kind === 'VOIDED' && (
             <span
               className="inline-flex items-center rounded border border-slate-300 bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-500"
-              title={returnLife.at ? `作废时间：${formatDateTimeSecCn(returnLife.at)}` : '回程已最终作废，不可恢复'}
+              title={[
+                returnLife.mark.at ? `作废时间：${formatDateTimeSecCn(returnLife.mark.at)}` : null,
+                returnLife.mark.bySystem ? '系统起飞后自动作废' : '人工确认作废',
+                '回程已最终作废，不可恢复；钱款不动',
+              ]
+                .filter(Boolean)
+                .join(' · ')}
             >
               回程已作废
             </span>
@@ -7325,13 +7403,23 @@ function OrderItemRow({
               {returnLife.mark.oversold && `（超售 ${returnLife.mark.oversoldBy} 座）`}
             </span>
           )}
-          {canOperate && returnReleased && !restoringReturn && (
+          {canOperate && returnReleased && !restoringReturn && !voidingReturn && (
             <button
               className="text-[11px] font-medium text-emerald-700 hover:text-emerald-900"
               onClick={() => setRestoringReturn(true)}
               title="把释放掉的回程座位重新占回原班次；原班次没余位会走超售确认"
             >
               恢复回程
+            </button>
+          )}
+          {/* 座位早已释放、原班次也已起飞：这一段回不来了，作废把它钉成终态（不可恢复，钱不动）。 */}
+          {canVoidReturn && !restoringReturn && !voidingReturn && (
+            <button
+              className="text-[11px] font-medium text-red-600 hover:text-red-800"
+              onClick={() => setVoidingReturn(true)}
+              title="回程座位早已释放、原班次已起飞；作废后这一段不可恢复，钱款不动"
+            >
+              确认作废回程
             </button>
           )}
           {canOperate &&
@@ -7447,6 +7535,16 @@ function OrderItemRow({
           onCancel={() => setRestoringReturn(false)}
           onSaved={(updated) => {
             setRestoringReturn(false);
+            onOrderUpdated?.(updated);
+          }}
+        />
+      )}
+      {returnReleased && voidingReturn && (
+        <VoidReturnLegForm
+          orderId={orderId}
+          onCancel={() => setVoidingReturn(false)}
+          onSaved={(updated) => {
+            setVoidingReturn(false);
             onOrderUpdated?.(updated);
           }}
         />
@@ -8640,12 +8738,19 @@ function RestoreReturnLegForm({
   // 不按订单行数量另算——部分人 no-show 拆过单时两者不是同一个数。
   const seats = original?.quantity ?? 0;
   const warnings = preview?.warnings ?? [];
+  // 软预留冲突：物理上有座，但这些座被别人的临时锁位 / 占位单占着。恢复照样占得下，
+  // 只是会把别人预留的座挤掉，后端记关键审计。与物理超售是两回事，文案必须分开说。
+  const reservedConflict = Math.max(0, preview?.reservedConflict ?? 0);
   // 本次恢复会「再超」的座数 = 后端预检的**新增**值；预检刚好没跟上（提交时才被占走）时
-  // 按需占座 − 余位兜底。
+  // 按需占座 − 余位兜底。注意：后端明说是软预留冲突（reservedConflict>0 且 oversellBy=0）时
+  // 不能走这条兜底——available 已经扣掉了别人的预留，反推出来的差额是「挤占座」不是「超售座」，
+  // 照着印会把「挤占预留」误报成「物理超售」。
   const oversellSeats = preview
     ? preview.oversellBy > 0
       ? preview.oversellBy
-      : Math.max(0, seats - preview.available)
+      : reservedConflict > 0
+        ? 0
+        : Math.max(0, seats - preview.available)
     : 0;
   // 恢复**前**该班已经超售的座数 = 后端的累计（oversoldAfter）− 本次新增（oversellBy）。
   // 不再用「余位取负」反推：多舱恢复时 available 只是其中一个舱的余位，反推出来的数是错的。
@@ -8663,6 +8768,9 @@ function RestoreReturnLegForm({
   // needsOversell 决定「要不要带 allowOversell」（被占走后强制置真，宁可多带也不能少带）；
   // 超售话术另按真实超售座数走，别在余位又放出来时印出「超售 0 座」。
   const showOversellWording = needsOversell && oversellSeats > 0;
+  // 三档口径：物理超售（卖穿）> 只挤占预留（有座、但是别人预留的）> 有座直接占。
+  const displacesReservedOnly = !showOversellWording && reservedConflict > 0;
+  const reservedConflictLine = `该班还有 ${reservedConflict} 座被他人临时锁位/占位单占着，恢复会占用这些座（记关键审计）。`;
 
   const submit = async () => {
     if (!token || submitting || !preview?.eligible || !original || limitBlocker) return;
@@ -8680,22 +8788,31 @@ function RestoreReturnLegForm({
           )
           .join('\n')}`
       : '';
-    const confirmed = await confirm(
-      showOversellWording
+    // 三档确认：物理超售（真卖穿）/ 只挤占预留（有座、但占的是别人预留的）/ 有座直接占。
+    const confirmOptions = showOversellWording
+      ? {
+          title: '恢复回程（超售）',
+          body:
+            `${legLabel}：${oversellLine}${detailLines}` +
+            `\n\n确认后恢复回程并记关键审计。钱款不动。${warningLines}`,
+          tone: 'danger' as const,
+          confirmText: `确认再超 ${oversellSeats} 座并恢复`,
+        }
+      : displacesReservedOnly
         ? {
-            title: '恢复回程（超售）',
+            title: '恢复回程（挤占预留座）',
             body:
-              `${legLabel}：${oversellLine}${detailLines}` +
-              `\n\n确认后恢复回程并记关键审计。钱款不动。${warningLines}`,
-            tone: 'danger',
-            confirmText: `确认再超 ${oversellSeats} 座并恢复`,
+              `${legLabel}：${reservedConflictLine}` +
+              `\n\n将把 ${seats} 座重新占回该班。确认后恢复回程并记关键审计。钱款不动。${warningLines}`,
+            tone: 'danger' as const,
+            confirmText: `确认挤占 ${reservedConflict} 座并恢复`,
           }
         : {
             title: '恢复回程',
             body: `将把 ${seats} 座重新占回 ${legLabel}（当前余位 ${preview.available} 座）。钱款不动。${warningLines}`,
             confirmText: '确认恢复回程',
-          },
-    );
+          };
+    const confirmed = await confirm(confirmOptions);
     if (!confirmed) return;
     setSubmitting(true);
     try {
@@ -8707,7 +8824,12 @@ function RestoreReturnLegForm({
       alert(
         `已恢复回程 ${res.audit.quantity} 座` +
           // oversoldBy = 本次新增超售座数（不是该班累计超售）。
-          (res.audit.oversold ? `（本次再超 ${res.audit.oversoldBy} 座，已记审计）` : ''),
+          // 没超售但挤了别人的预留座时，也得说一句——那边的锁位/占位余座少了。
+          (res.audit.oversold
+            ? `（本次再超 ${res.audit.oversoldBy} 座，已记审计）`
+            : displacesReservedOnly
+              ? `（占用了 ${reservedConflict} 座他人临时锁位/占位余座，已记审计）`
+              : ''),
       );
       onSaved(res.order);
     } catch (e) {
@@ -8800,6 +8922,13 @@ function RestoreReturnLegForm({
             </div>
           </div>
 
+          {/* 只挤占预留（物理有座）：与超售分开提示，别让运营以为把航班卖穿了。 */}
+          {displacesReservedOnly && (
+            <div className="space-y-1 rounded border border-amber-300 bg-amber-50 px-2 py-1.5 text-amber-800">
+              <div>{reservedConflictLine}</div>
+            </div>
+          )}
+
           {showOversellWording && (
             <div className="space-y-1 rounded border border-amber-300 bg-amber-50 px-2 py-1.5 text-amber-800">
               <div>{oversellLine}确认后会记关键审计。</div>
@@ -8840,7 +8969,178 @@ function RestoreReturnLegForm({
           onClick={submit}
           disabled={submitting || previewLoading || !preview?.eligible || limitBlocker != null}
         >
-          {submitting ? '提交中…' : showOversellWording ? '超售恢复回程' : '确认恢复回程'}
+          {submitting
+            ? '提交中…'
+            : showOversellWording
+              ? '超售恢复回程'
+              : displacesReservedOnly
+                ? '挤占预留并恢复'
+                : '确认恢复回程'}
+        </button>
+        <button
+          className="rounded bg-slate-100 px-3 py-1.5 text-slate-700 disabled:opacity-50"
+          onClick={onCancel}
+          disabled={submitting}
+        >
+          取消
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── 作废回程：座位早已释放、原班次也已经起飞，这一段永远回不来了。
+// 作废把它钉成终态（此后不再有「恢复回程」入口），钱一分不动。打开即 preview，
+// 不合格（比如班次还没飞）列 blockers，提交前走 danger 二次确认。
+function VoidReturnLegForm({
+  orderId,
+  onCancel,
+  onSaved,
+}: {
+  orderId: string;
+  onCancel: () => void;
+  onSaved: (order: OrderSummary) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const confirm = useConfirm();
+  // 幂等键：本面板打开期间只生成一次，提交失败重试复用同一个 token，避免重复写作废。
+  const requestTokenRef = useRef<string>(crypto.randomUUID());
+  const [previewLoading, setPreviewLoading] = useState(true);
+  const [previewErr, setPreviewErr] = useState<string | null>(null);
+  const [preview, setPreview] = useState<VoidReturnLegPreview | null>(null);
+  const [note, setNote] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  /** 提交失败后按最新状态重拉一次预检（比如这期间回程被别人恢复了）。 */
+  const refreshPreview = useCallback(async () => {
+    if (!token) return;
+    try {
+      const fresh = await api.previewVoidReturnLeg(token, orderId);
+      setPreview(fresh);
+    } catch (e) {
+      setPreviewErr(e instanceof ApiError ? e.message : '作废回程预检失败');
+    }
+  }, [token, orderId]);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    setPreviewLoading(true);
+    setPreviewErr(null);
+    api
+      .previewVoidReturnLeg(token, orderId)
+      .then((res) => {
+        if (!cancelled) setPreview(res);
+      })
+      .catch((e) => {
+        if (!cancelled) setPreviewErr(e instanceof ApiError ? e.message : '作废回程预检失败');
+      })
+      .finally(() => {
+        if (!cancelled) setPreviewLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [orderId, token]);
+
+  const original = preview?.original ?? null;
+  const legLabel = original
+    ? `${original.flightNumber ?? '原班次'}${original.departDate ? ` ${original.departDate}` : ''}`
+    : '本单回程';
+
+  const submit = async () => {
+    if (!token || submitting || !preview?.eligible) return;
+    setErr(null);
+    const confirmed = await confirm({
+      title: '作废回程',
+      body: `${legLabel}：回程座位早已释放、班次已起飞，作废后不可恢复，钱不动。`,
+      tone: 'danger',
+      confirmText: '确认作废回程',
+    });
+    if (!confirmed) return;
+    setSubmitting(true);
+    try {
+      const res = await api.voidReturnLeg(token, orderId, {
+        requestToken: requestTokenRef.current,
+        note: note.trim() || undefined,
+      });
+      alert('已作废回程，这一段不可恢复。钱款不动。');
+      onSaved(res.order);
+    } catch (e) {
+      const code = e instanceof ApiError ? e.code : null;
+      if (code === TOKEN_PAYLOAD_MISMATCH_CODE) {
+        // 同一个 requestToken 被另一次操作用过（含「同 token 换动作类型」）：幂等键与首次入参
+        // 绑定，回放旧结果会写错东西。换新 token + 重新预检后再提。
+        requestTokenRef.current = crypto.randomUUID();
+        setErr(TOKEN_PAYLOAD_MISMATCH_HINT);
+        await refreshPreview();
+      } else {
+        setErr(e instanceof ApiError ? e.message : '作废回程失败');
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="mt-3 space-y-2 rounded-md border border-red-300 bg-white p-3 text-xs">
+      <div className="font-medium text-red-700">作废回程</div>
+
+      {previewLoading && <div className="text-slate-500">正在核对原班次状态…</div>}
+      {previewErr && <div className="rounded bg-red-50 px-2 py-1 text-red-700">{previewErr}</div>}
+
+      {preview && !preview.eligible && (
+        <div className="space-y-1 rounded bg-red-50 px-2 py-1 text-red-700">
+          <div className="font-medium">当前不能作废回程：</div>
+          <ul className="list-disc space-y-0.5 pl-4">
+            {(preview.blockers.length > 0
+              ? preview.blockers
+              : [preview.departed ? '预检未通过' : '原班次尚未起飞，回程仍可恢复']
+            ).map((b) => (
+              <li key={b}>{b}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {preview && preview.eligible && (
+        <>
+          <div className="space-y-0.5 rounded border border-slate-200 bg-slate-50/60 p-2">
+            <div className="text-ink">
+              作废航段：{original?.flightNumber ?? '（班次号缺失）'}
+              {original?.departDate && <> · {original.departDate}</>}
+              {original?.cabin && <> · {CABIN_ZH[original.cabin] ?? original.cabin}</>}
+            </div>
+            <div className="text-slate-500">
+              {original?.quantity != null && <>原 {original.quantity} 座 · </>}
+              座位早已释放、班次已起飞 · 作废后不可恢复 · 钱款不动
+            </div>
+          </div>
+
+          <label className="block">
+            <span className="text-slate-500">备注（可选）</span>
+            <input
+              className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              disabled={submitting}
+              placeholder="如：已与代理确认不再保留回程"
+            />
+          </label>
+        </>
+      )}
+
+      {err && <div className="rounded bg-red-50 px-2 py-1 text-red-700">{err}</div>}
+
+      <div className="flex gap-2 pt-1">
+        <button
+          className="flex-1 rounded bg-red-600 px-2 py-1.5 font-medium text-white disabled:opacity-50"
+          onClick={submit}
+          disabled={submitting || previewLoading || !preview?.eligible}
+        >
+          {submitting ? '提交中…' : '确认作废回程'}
         </button>
         <button
           className="rounded bg-slate-100 px-3 py-1.5 text-slate-700 disabled:opacity-50"
@@ -9617,6 +9917,7 @@ const ZERO_AMOUNT_ADJUSTMENT_LABEL: Record<string, string> = {
   NO_SHOW_OUTBOUND: '去程 no-show',
   RETURN_LEG_RELEASED: '回程座位释放',
   RETURN_LEG_RESTORED: '回程恢复',
+  RETURN_LEG_VOIDED: '回程作废',
 };
 
 function AdjustmentsSection({ order }: { order: OrderSummary }) {

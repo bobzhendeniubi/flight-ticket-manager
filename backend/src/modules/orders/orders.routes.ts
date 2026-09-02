@@ -56,6 +56,7 @@ import {
   noShowBodySchema,
   noShowPreviewBodySchema,
   restoreReturnLegBodySchema,
+  voidReturnLegBodySchema,
   splitRoomGroupBodySchema,
   swapRefundBodySchema,
   updateSwapReplacementOrderBodySchema,
@@ -2484,7 +2485,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
 
       // 幂等回放不落审计：首刷已记过一条，重试再记一条会让审计里出现两次「取消航段」，
       // 事后核对会以为放了两次座、收了两次手续费（口径同 no-show / 恢复回程两条路由）。
-      if (!audit.replayed) {
+      //
+      // ⚠ 手工覆盖（feeMode=MANUAL）的 CRITICAL 审计**已经在 service 的改金额事务里写过了**
+      // （与改金额同生共死，见 cancelLeg 第 10 步）。这里再写一条只会让同一次覆盖在审计里
+      // 出现两次，事后核对会以为改了两回；所以路由层只记 POLICY 那一档的 WARNING。
+      if (!audit.replayed && audit.feeMode !== 'MANUAL') {
         void writeAudit({
           actor: actorFromRequest(req),
           action: audit.leg === 'OUTBOUND' ? 'CANCEL_OUTBOUND_LEG' : 'CANCEL_RETURN_LEG',
@@ -2513,8 +2518,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
             overpayAfterCny: audit.overpayAfterCny,
             replayed: audit.replayed,
           },
-          // 手工覆盖服务端政策报价 = 人为改动金额，按最高等级留痕；按政策走记 WARNING。
-          severity: audit.feeMode === 'MANUAL' ? 'CRITICAL' : 'WARNING',
+          severity: 'WARNING',
         });
       }
 
@@ -2640,6 +2644,56 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           scheduleOversoldAfter: audit.scheduleOversoldAfter,
           maxOversell: env.FLIGHT_NOSHOW_MAX_OVERSELL_SEATS,
           note: body.note ?? null,
+          replayed: audit.replayed,
+        },
+        severity: 'WARNING',
+      });
+    }
+
+    return { order, audit };
+  });
+
+  // ── 回程起飞后作废（ADMIN/STAFF）────────────────────────────────────────────
+  // 「已释放」不是终态：原班次一飞走，「恢复回程」就走不通了，而这一行还挂在单上、
+  // 提醒一直在催。作废给它一个终态 —— **不动座位、不动钱、不动开票位**，只打标。
+  // 起飞前一律拒（那时候恢复回程还走得通，作废等于把客人的回程凭空抹掉）。
+  // 起飞满 2 小时后还没人处置的，后台 job 会自动作废（见 orders/no-show-void.ts）。
+  //
+  // POST /orders/:id/void-return-leg/preview
+  app.post('/:id/void-return-leg/preview', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可作废回程' });
+    }
+    const { id } = req.params as { id: string };
+    return service.previewVoidReturnLeg(id, { userId: req.user.sub, role });
+  });
+
+  // POST /orders/:id/void-return-leg  body: { requestToken, note? }
+  app.post('/:id/void-return-leg', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可作废回程' });
+    }
+    const { id } = req.params as { id: string };
+    const body = voidReturnLegBodySchema.parse(req.body);
+    const { order, audit } = await service.voidReturnLeg(id, body, {
+      userId: req.user.sub,
+      role,
+    });
+
+    // 幂等回放不落审计（口径同 no-show / 恢复回程 / 取消航段三条路由）。
+    if (!audit.replayed) {
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'VOID_RETURN_LEG',
+        targetType: 'ORDER',
+        targetId: id,
+        targetLabel: `${audit.orderNumber} · 回程作废（原班次已起飞）`,
+        after: {
+          returnItemId: audit.returnItemId,
+          note: body.note ?? null,
+          auto: false,
           replayed: audit.replayed,
         },
         severity: 'WARNING',

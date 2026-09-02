@@ -121,6 +121,29 @@ export async function scheduleHoldOverdueScan(): Promise<void> {
   });
 }
 
+// no-show 回程「起飞后自动作废」扫描：每小时一次，样板同上面的占位单逾期扫描。
+// 判定（还是不是已释放态、原班次飞没飞满 2 小时）全在 worker 的逐条事务里做。
+export interface NoShowVoidJobData {
+  requestedAt?: string;
+}
+
+export const noShowVoidQueue = new Queue<NoShowVoidJobData>('no-show-void', {
+  connection: bullRedis,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 5000 },
+    removeOnComplete: { age: 7 * 24 * 3600 },
+    removeOnFail: { age: 30 * 24 * 3600 },
+  },
+});
+
+export async function scheduleNoShowVoidScan(): Promise<void> {
+  await noShowVoidQueue.add('scan-no-show-void', {}, {
+    jobId: 'no-show-void-hourly',
+    repeat: { every: 60 * 60 * 1000 },
+  });
+}
+
 /**
  * 创建锁位时排队：delay 毫秒后若锁仍 ACTIVE 则标 EXPIRED（座位自动回归可售）。
  * jobId 用 `seatlock-<lockId>`，方便下单消费 / 手动释放时 remove() 取消。
@@ -181,6 +204,7 @@ export async function closeQueues(): Promise<void> {
     seatHoldQueue.close(),
     seatLockQueue.close(),
     holdOverdueQueue.close(),
+    noShowVoidQueue.close(),
     fulfillmentQueueEvents.close(),
   ]);
   await bullRedis.quit();

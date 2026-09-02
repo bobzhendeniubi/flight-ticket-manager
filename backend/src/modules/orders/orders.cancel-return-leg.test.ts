@@ -41,13 +41,35 @@ import {
   cancelLegPreviewBodySchema,
   cancelReturnLegBodySchema,
 } from './orders.schemas.js';
-import { BadRequestError, ForbiddenError } from '../../lib/errors.js';
+import { AppError, BadRequestError, ForbiddenError } from '../../lib/errors.js';
 
 const service = new OrderService();
 const ADMIN = { userId: 'admin-1', role: UserRole.ADMIN } as const;
 const STAFF = { userId: 'staff-1', role: UserRole.STAFF } as const;
 const AGENT = { userId: 'agent-1', role: UserRole.AGENT } as const;
 const TOKEN = '00000000-0000-4000-8000-0000000cafe1';
+
+// 取消航段的入参指纹（键排序后 JSON）。**写死字面量**，不从 service import 那个函数：
+// 它是落库的持久化契约，格式一改这里就该红，跟着实现走就永远测不出静默漂移。
+const cancelLegFp = (
+  over: Partial<{ leg: string; feeMode: string; manualFeeCny: number | null; overrideReason: string | null }> = {},
+): string =>
+  JSON.stringify({
+    feeMode: 'POLICY',
+    leg: 'RETURN',
+    manualFeeCny: null,
+    overrideReason: null,
+    ...over,
+  });
+
+/** 一条 CANCEL_LEG 流水（回放守闸认的就是它的 type 与 fingerprint）。 */
+const cancelLegLog = (requestToken: string, fingerprint = cancelLegFp()) => ({
+  type: 'CANCEL_LEG' as const,
+  requestToken,
+  at: new Date().toISOString(),
+  byUserId: 'admin-1',
+  fingerprint,
+});
 
 // 现在起 10 天后出发 → 稳稳落在「>=72h」档（20% 手续费），不受跑测时刻影响。
 const OUT_DEPART = new Date(Date.now() + 10 * 24 * 3600_000);
@@ -217,6 +239,9 @@ function mountTx(
     fulfillmentTask: { count: vi.fn(async () => 0), updateMany: vi.fn(async () => ({ count: 1 })) },
     refund: { count: vi.fn(async () => 0) },
     cancellationPolicy: { findMany: vi.fn(async () => [FLIGHT_POLICY]) },
+    // 手工覆盖手续费的 CRITICAL 审计写在**同一事务**里（与改金额同生共死），
+    // 所以事务 mock 必须带 auditLog —— 路由层那条 fire-and-forget 的只记 POLICY 档。
+    auditLog: { create: vi.fn(async () => ({ id: 'audit-1' })) },
   };
   mockPrisma.$transaction.mockImplementation(async (fn: (t: unknown) => unknown) => fn(tx));
   mockPrisma.order.findUniqueOrThrow.mockResolvedValue(serializableOrder());
@@ -547,6 +572,123 @@ describe('取消回程 · MANUAL 手工覆盖', () => {
     // 政策报价照旧留档，供事后复核「手工覆盖了多少」
     expect(snapshot.policySnapshot).toMatchObject({ feePercent: 20, feeAmountCny: 600 });
   });
+
+  it('手工覆盖的 CRITICAL 审计与改金额**同一事务**（路由层那条 fire-and-forget 靠不住）', async () => {
+    const tx = mountTx();
+    await service.cancelReturnLeg(
+      'ord-1',
+      body({ feeMode: 'MANUAL', manualFeeCny: 100, overrideReason: '航司特批全免大部分退改费' }),
+      ADMIN,
+    );
+    expect(tx.auditLog.create).toHaveBeenCalledTimes(1);
+    const arg = tx.auditLog.create.mock.calls[0][0] as { data: Record<string, unknown> };
+    expect(arg.data.action).toBe('CANCEL_RETURN_LEG');
+    expect(arg.data.severity).toBe('CRITICAL');
+    expect(arg.data.after).toMatchObject({
+      feeMode: 'MANUAL',
+      manualFeeCny: 100,
+      overrideReason: '航司特批全免大部分退改费',
+      policyFeeCny: 600,
+      totalBefore: TOTAL_BEFORE,
+      totalAfter: TOTAL_BEFORE - RET_AMOUNT + 100,
+    });
+  });
+
+  it('按政策走（POLICY）不在事务内写审计 —— 那一档由路由层记 WARNING', async () => {
+    const tx = mountTx();
+    await service.cancelReturnLeg('ord-1', body(), ADMIN);
+    expect(tx.auditLog.create).not.toHaveBeenCalled();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 4b. 回放守闸：动作类型 / 入参指纹 / 旧快照
+// ══════════════════════════════════════════════════════════════════════════
+describe('取消回程 · 回放守闸', () => {
+  it('同 token 换了手续费口径（POLICY → MANUAL）→ 409，不按上一次的钱回成功', async () => {
+    const tx = mountTx({
+      flightMeta: [
+        { id: 'leg-out', metadata: null },
+        {
+          id: 'leg-ret',
+          metadata: {
+            returnLegCancelled: { requestToken: TOKEN, feeCny: 600, feeMode: 'POLICY' },
+            legActionLog: [cancelLegLog(TOKEN)],
+          },
+        },
+      ],
+    });
+    const err = await service
+      .cancelReturnLeg(
+        'ord-1',
+        body({ feeMode: 'MANUAL', manualFeeCny: 0, overrideReason: '航司特批' }),
+        ADMIN,
+      )
+      .catch((e: unknown) => e);
+    expect((err as AppError).statusCode).toBe(409);
+    expect((err as AppError).code).toBe('TOKEN_PAYLOAD_MISMATCH');
+    expect((err as AppError).details).toMatchObject({ reason: 'PAYLOAD' });
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+  });
+
+  it('token 是 no-show 用过的，拿来取消回程 → 409（类型不符），一座不动', async () => {
+    const tx = mountTx({
+      flightMeta: [
+        {
+          id: 'leg-out',
+          metadata: {
+            legActionLog: [
+              {
+                type: 'NO_SHOW',
+                requestToken: TOKEN,
+                at: new Date().toISOString(),
+                byUserId: 'admin-1',
+                fingerprint: '{"passengerIds":[],"releaseReturn":true}',
+              },
+            ],
+          },
+        },
+        { id: 'leg-ret', metadata: null },
+      ],
+    });
+    const err = await service.cancelReturnLeg('ord-1', body(), ADMIN).catch((e: unknown) => e);
+    expect((err as AppError).code).toBe('TOKEN_PAYLOAD_MISMATCH');
+    expect((err as AppError).details).toMatchObject({
+      reason: 'ACTION_TYPE',
+      priorType: 'NO_SHOW',
+    });
+    expect(tx.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('旧快照（只有 returnLegCancelled、没有流水指纹）→ 409 fail-closed', async () => {
+    const tx = mountTx({
+      flightMeta: [
+        { id: 'leg-out', metadata: null },
+        {
+          id: 'leg-ret',
+          metadata: { returnLegCancelled: { requestToken: TOKEN, feeCny: 600, feeMode: 'POLICY' } },
+        },
+      ],
+    });
+    const err = await service.cancelReturnLeg('ord-1', body(), ADMIN).catch((e: unknown) => e);
+    expect((err as AppError).code).toBe('TOKEN_PAYLOAD_MISMATCH');
+    expect((err as AppError).details).toMatchObject({ reason: 'LEGACY_SNAPSHOT' });
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+  });
+
+  it('作废快照里也追了一条 CANCEL_LEG 流水（带类型与指纹）', async () => {
+    const tx = mountTx();
+    await service.cancelReturnLeg('ord-1', body(), ADMIN);
+    const meta = tx.orderItem.update.mock.calls[0][0].data.metadata as {
+      legActionLog: Array<Record<string, unknown>>;
+    };
+    expect(meta.legActionLog).toHaveLength(1);
+    expect(meta.legActionLog[0]).toMatchObject({
+      type: 'CANCEL_LEG',
+      requestToken: TOKEN,
+      fingerprint: cancelLegFp(),
+    });
+  });
 });
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -633,6 +775,7 @@ describe('取消回程 · 幂等', () => {
               totalBeforeCny: TOTAL_BEFORE,
               releasedSeats: [{ scheduleId: 'sch-ret', cabin: 'ECONOMY', quantity: 2 }],
             },
+            legActionLog: [cancelLegLog(TOKEN)],
           },
         },
       ],

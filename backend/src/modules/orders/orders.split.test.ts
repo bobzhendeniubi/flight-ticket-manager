@@ -1109,6 +1109,87 @@ describe('拆单 · 不继承 no-show / 释放 / 取消航段快照', () => {
     }
   });
 
+  // 描述前缀与快照是一对：快照被剥掉、前缀跟着复制过去，新单上就会出现一行
+  // 「【回程座位已释放】…」而 metadata 里什么都没有 —— 派生状态判它无状态、legFlag 是 NONE、
+  // 「恢复回程」也点不动，运营只看得到那行字，以为这一段还释放着。
+  it('部分拆出的新行：剥了快照就一并剥掉描述上的内部留痕前缀', async () => {
+    armExecute({
+      order: baseOrder({
+        items: [
+          flightItem({
+            description: '【回程座位已释放】测试机票 回程',
+            metadata: snapshotMeta,
+          }),
+        ],
+      }),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 0 },
+      finalTarget: { total: 1000, paidAmount: 500 },
+    });
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    const splitCreate = mockPrisma.orderItem.create.mock.calls.find(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0].data.kind === 'FLIGHT',
+    );
+    expect(splitCreate?.[0].data.description).toBe('测试机票 回程');
+  });
+
+  it('没有快照可剥的普通行：描述原样保留，绝不误剥客户看得见的文案', async () => {
+    armExecute({
+      order: baseOrder({
+        items: [flightItem({ description: '【回程座位已释放】测试机票 回程', metadata: null })],
+      }),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 0 },
+      finalTarget: { total: 1000, paidAmount: 500 },
+    });
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    const splitCreate = mockPrisma.orderItem.create.mock.calls.find(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0].data.kind === 'FLIGHT',
+    );
+    // 这一行没有任何快照被剥掉 → 描述不动（前缀是不是「留痕」，只有快照说了算）。
+    expect(splitCreate?.[0].data.description).toBe('【回程座位已释放】测试机票 回程');
+  });
+
+  it('整行过户（人数 ≤ 拆走人数）同样剥描述前缀，与按比例拆行一个口径', async () => {
+    armExecute({
+      order: baseOrder({
+        items: [
+          flightItem({
+            quantity: 1,
+            description: '【去程未登机】测试机票 去程',
+            metadata: snapshotMeta,
+          }),
+        ],
+      }),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 0 },
+      finalTarget: { total: 1000, paidAmount: 500 },
+      // 整行过户：这一行 1 座整体搬到新单，两单合计仍是 1 座（守恒）。
+      conservationRows: [
+        { kind: 'FLIGHT', flightScheduleId: 'sch1', flightCabin: 'ECONOMY', quantity: 1 },
+      ],
+    });
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    const moved = mockPrisma.orderItem.update.mock.calls.find(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0].where?.id === 'i1' && c[0].data?.orderId != null,
+    );
+    expect(moved?.[0].data.description).toBe('测试机票 去程');
+    const meta = moved?.[0].data.metadata as Record<string, unknown>;
+    expect(meta).not.toHaveProperty('returnReleased');
+  });
+
   it('预检提示：源单去程已标 no-show，拆出的新单不会自动带标记', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(
       baseOrder({ items: [flightItem({ metadata: { noShow: { at: '2026-09-02T03:00:00.000Z' } } })] }),
