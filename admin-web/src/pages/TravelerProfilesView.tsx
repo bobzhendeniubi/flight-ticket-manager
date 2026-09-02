@@ -705,8 +705,12 @@ function ProfileDrawer({
                           {t.route && <span className="ml-2 font-mono text-brand">{t.route}</span>}
                           {t.returnAt && <span className="ml-1 text-slate-400">～{fmtDate(t.returnAt)}</span>}
                         </span>
-                        <span className={t.flown ? 'badge-neutral' : 'text-brand font-medium'}>
-                          {t.departAt ? (t.flown ? '已飞' : '待出行') : '—'}
+                        {/* no-show 的行程既不算已飞也不算待出行（飞行次数不计），单独标「未登机」 */}
+                        <span
+                          className={t.noShow ? 'badge-neutral text-amber-700' : t.flown ? 'badge-neutral' : 'text-brand font-medium'}
+                          title={t.noShow ? '去程 no-show：客人未登机，本次行程不计飞行次数' : undefined}
+                        >
+                          {t.departAt ? (t.noShow ? '未登机' : t.flown ? '已飞' : '待出行') : '—'}
                         </span>
                       </div>
                       <div className="mt-1 flex flex-wrap gap-x-3 gap-y-0.5 text-slate-500">

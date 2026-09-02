@@ -48,7 +48,10 @@ function order(over: Partial<AggOrder> & { id: string }): AggOrder {
   };
 }
 
-function flightItem(departISO: string, extra?: { cabin?: 'ECONOMY' | 'BUSINESS' }) {
+function flightItem(
+  departISO: string,
+  extra?: { cabin?: 'ECONOMY' | 'BUSINESS'; noShow?: boolean },
+) {
   return {
     kind: 'FLIGHT' as const,
     flightCabin: extra?.cabin ?? ('ECONOMY' as const),
@@ -60,6 +63,7 @@ function flightItem(departISO: string, extra?: { cabin?: 'ECONOMY' | 'BUSINESS' 
     roomTypeName: null,
     hotelCheckIn: null,
     hotelCheckOut: null,
+    noShow: extra?.noShow ?? false,
   };
 }
 
@@ -75,6 +79,7 @@ function hotelItem(name: string, checkInISO: string, checkOutISO: string, roomTy
     roomTypeName: roomType,
     hotelCheckIn: new Date(checkInISO),
     hotelCheckOut: new Date(checkOutISO),
+    noShow: false,
   };
 }
 
@@ -624,5 +629,103 @@ describe('待支付单：进飞行次数口径，不进已消费口径', () => {
     // 首末次出行都锁在已付款那张单上，不被待支付的 6 月那趟顶掉
     expect(agg.firstTripAt).toEqual(new Date('2026-02-01T02:00:00Z'));
     expect(agg.lastTripAt).toEqual(new Date('2026-02-01T02:00:00Z'));
+  });
+});
+
+// no-show 口径（2026-09-02 拍板）：去程打了未登机标的单，客人没上飞机 —— 飞行次数是权益核销的
+// 分母（可用次数 = 飞行次数 − 已核销），算进去等于没飞也拿一次额度。打标不动班次，所以只能
+// 靠订单行 metadata.noShow 认出来；departed（班次真飞了）仍为真，供老系统 ±1 天活体去重用。
+describe('no-show：去程未登机的单不算飞过一次', () => {
+  it('去程打了未登机标：tripCount 不 +1，也不退回在订未飞', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'no-show',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-03-01T02:00:00Z', { noShow: true })],
+      }),
+    ];
+    const agg = buildTravelerAggregates(orders, NOW).get(KEY)!;
+    expect(agg.tripCount).toBe(0);
+    expect(agg.pendingTripCount).toBe(0);
+    // 已消费口径不受影响：钱照收，首末次出行只认真飞过的行程
+    expect(agg.orderCount).toBe(1);
+    expect(agg.firstTripAt).toBeNull();
+    expect(agg.lastTripAt).toBeNull();
+  });
+
+  it('没打标的单照旧计一次（同一批数据只差 noShow 一个布尔）', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'flown',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-03-01T02:00:00Z')],
+      }),
+    ];
+    const agg = buildTravelerAggregates(orders, NOW).get(KEY)!;
+    expect(agg.tripCount).toBe(1);
+    expect(agg.firstTripAt).toEqual(new Date('2026-03-01T02:00:00Z'));
+  });
+
+  it('同一人一张 no-show 一张正常：只数正常那张', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'no-show',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-03-01T02:00:00Z', { noShow: true })],
+      }),
+      order({
+        id: 'flown',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-04-01T02:00:00Z')],
+      }),
+    ];
+    const agg = buildTravelerAggregates(orders, NOW).get(KEY)!;
+    expect(agg.tripCount).toBe(1);
+    expect(agg.lastTripAt).toEqual(new Date('2026-04-01T02:00:00Z'));
+  });
+
+  it('回程被恢复、客人真飞了回程：整单仍不计一次（一单最多换一次额度）', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'no-show-return-restored',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        // 去程打标（班次不动），回程恢复后仍带班次 → 两段都在 items 里
+        items: [
+          flightItem('2026-03-01T02:00:00Z', { noShow: true }),
+          flightItem('2026-03-05T10:00:00Z'),
+        ],
+      }),
+    ];
+    const agg = buildTravelerAggregates(orders, NOW).get(KEY)!;
+    expect(agg.tripCount).toBe(0);
+    expect(agg.pendingTripCount).toBe(0);
+  });
+
+  it('起飞前就先打了标：不进在订未飞（否则还在等一次永远不会发生的额度）', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'no-show-early',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-08-01T02:00:00Z', { noShow: true })],
+      }),
+    ];
+    const agg = buildTravelerAggregates(orders, NOW).get(KEY)!;
+    expect(agg.tripCount).toBe(0);
+    expect(agg.pendingTripCount).toBe(0);
+    expect(agg.nextTripAt).toBeNull();
+  });
+
+  it('trips 上 departed / noShow / flown 三个布尔各司其职（老系统去重要用 departed）', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'no-show',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-03-01T02:00:00Z', { noShow: true })],
+      }),
+    ];
+    const trip = buildTravelerAggregates(orders, NOW).get(KEY)!.trips[0];
+    expect(trip.departed).toBe(true); // 那趟航班真飞了
+    expect(trip.noShow).toBe(true); // 但客人没登机
+    expect(trip.flown).toBe(false); // 所以不算飞过
   });
 });

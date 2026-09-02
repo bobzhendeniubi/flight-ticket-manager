@@ -16,10 +16,15 @@ import { docKey } from './traveler-profiles.aggregate.js';
 
 const NOW = new Date('2026-07-14T00:00:00.000Z');
 
-/** orderSelect 形状的最小订单行：一位乘客 + 一条去程 */
-function orderRow(documentNumber: string, departISO: string, status = 'PAID') {
+/** orderSelect 形状的最小订单行：一位乘客 + 一条去程（opts.noShow 给去程行打未登机标） */
+function orderRow(
+  documentNumber: string,
+  departISO: string,
+  status = 'PAID',
+  opts?: { noShow?: boolean },
+) {
   return {
-    id: `o-${documentNumber}-${departISO}`,
+    id: `o-${documentNumber}-${departISO}${opts?.noShow ? '-noshow' : ''}`,
     orderNumber: `FTM-${documentNumber}`,
     status,
     createdAt: new Date('2026-01-01T00:00:00.000Z'),
@@ -46,6 +51,8 @@ function orderRow(documentNumber: string, departISO: string, status = 'PAID') {
         flightCabin: null,
         hotelCheckIn: null,
         hotelCheckOut: null,
+        // 打标不动 flightScheduleId（那趟航班真飞了），痕迹只在 metadata 上
+        metadata: opts?.noShow ? { noShow: { at: departISO, leg: 'OUTBOUND' } } : null,
         flightSchedule: {
           departureTime: new Date(departISO),
           flight: { flightNumber: 'QH9588', originCode: 'MFM', destinationCode: 'DAD' },
@@ -187,5 +194,82 @@ describe('computeCombinedTripCounts 批量与口径边界', () => {
     const { client, orderFindMany } = fakeClient([], []);
     expect((await computeCombinedTripCounts([], client, NOW)).size).toBe(0);
     expect(orderFindMany).not.toHaveBeenCalled();
+  });
+});
+
+// no-show 口径（2026-09-02 拍板）：去程打了未登机标 = 客人没上飞机，不算飞过一次。
+// 兜底路径最容易踩的坑在老系统那半边：把 no-show 那天从「已飞业务日」里一并删掉，
+// ±1 天活体去重就会失效，老系统的同日重录票冒出来，飞行次数不降反升。
+describe('computeCombinedTripCounts no-show 口径', () => {
+  it('去程打了未登机标：新系统那半边不 +1', async () => {
+    const { client } = fakeClient(
+      [orderRow('E12345678', '2026-03-01T02:00:00.000Z', 'PAID', { noShow: true })],
+      [],
+    );
+    const counts = await computeCombinedTripCounts([doc('E12345678')], client, NOW);
+    expect(counts.get(docKey('PASSPORT', 'E12345678'))).toEqual({
+      tripCount: 0,
+      pendingTripCount: 0,
+    });
+  });
+
+  it('no-show 那天的老系统同日票仍被 ±1 天去重吃掉，次数不因 no-show 反而变多', async () => {
+    const { client } = fakeClient(
+      [orderRow('E12345678', '2026-03-01T02:00:00.000Z', 'PAID', { noShow: true })],
+      [
+        legacyRow('E12345678', '2026-03-02T00:00:00.000Z'), // 同一趟行程的另一份记录 → 去重
+        legacyRow('E12345678', '2019-05-01T00:00:00.000Z'), // 真·历史行程 → 计入
+      ],
+    );
+    const counts = await computeCombinedTripCounts([doc('E12345678')], client, NOW);
+    // 新系统 0（没登机）+ 老系统 1（2019 那趟）；同日那张不能因为 no-show 就冒出来
+    expect(counts.get(docKey('PASSPORT', 'E12345678'))?.tripCount).toBe(1);
+  });
+
+  it('同一批数据不打标就照旧计一次（no-show 与正常单只差一个标）', async () => {
+    const { client } = fakeClient(
+      [orderRow('E12345678', '2026-03-01T02:00:00.000Z')],
+      [legacyRow('E12345678', '2026-03-02T00:00:00.000Z'), legacyRow('E12345678', '2019-05-01T00:00:00.000Z')],
+    );
+    const counts = await computeCombinedTripCounts([doc('E12345678')], client, NOW);
+    expect(counts.get(docKey('PASSPORT', 'E12345678'))?.tripCount).toBe(2); // 新 1 + 老 1
+  });
+
+  it('一张 no-show 一张正常：只数正常那张，各自的老系统同日票都照样去重', async () => {
+    const { client } = fakeClient(
+      [
+        orderRow('E12345678', '2026-03-01T02:00:00.000Z', 'PAID', { noShow: true }),
+        orderRow('E12345678', '2026-04-01T02:00:00.000Z'),
+      ],
+      [
+        legacyRow('E12345678', '2026-03-01T00:00:00.000Z'),
+        legacyRow('E12345678', '2026-04-01T00:00:00.000Z'),
+      ],
+    );
+    const counts = await computeCombinedTripCounts([doc('E12345678')], client, NOW);
+    expect(counts.get(docKey('PASSPORT', 'E12345678'))).toEqual({
+      tripCount: 1, // 新系统 1（4 月那张）+ 老系统 0（两张都被去重）
+      pendingTripCount: 0,
+    });
+  });
+
+  it('起飞前就打了标的单不进在订未飞', async () => {
+    const { client } = fakeClient(
+      [orderRow('E12345678', '2026-09-01T02:00:00.000Z', 'PAID', { noShow: true })],
+      [],
+    );
+    const counts = await computeCombinedTripCounts([doc('E12345678')], client, NOW);
+    expect(counts.get(docKey('PASSPORT', 'E12345678'))).toEqual({
+      tripCount: 0,
+      pendingTripCount: 0,
+    });
+  });
+
+  it('metadata 为脏数据（非对象 / 无 noShow 键）按未打标处理，不抛错', async () => {
+    const rows = [orderRow('E12345678', '2026-03-01T02:00:00.000Z')];
+    rows[0].items[0].metadata = 'not-an-object' as never;
+    const { client } = fakeClient(rows, []);
+    const counts = await computeCombinedTripCounts([doc('E12345678')], client, NOW);
+    expect(counts.get(docKey('PASSPORT', 'E12345678'))?.tripCount).toBe(1);
   });
 });

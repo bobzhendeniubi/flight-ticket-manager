@@ -69,6 +69,8 @@ export const orderSelect = {
       flightCabin: true,
       hotelCheckIn: true,
       hotelCheckOut: true,
+      // 去程「未登机」标就住在这里（metadata.noShow）；飞行次数要认它，见 hasNoShowMark。
+      metadata: true,
       flightSchedule: {
         select: {
           departureTime: true,
@@ -81,6 +83,18 @@ export const orderSelect = {
 } satisfies Prisma.OrderSelect;
 
 export type OrderRow = Prisma.OrderGetPayload<{ select: typeof orderSelect }>;
+
+/**
+ * 该订单行是否被打了「未登机」标。
+ *
+ * 判据与航段状态派生（orders/orders.leg-status.ts）保持一致：metadata.noShow 存在即为真，
+ * 形状不符（null / 非对象 / 数组）一律按未打标处理 —— 快照是历史数据，读侧不许因脏 JSON 抛错。
+ * 打标不动 flightScheduleId（那趟航班真飞了），所以光看班次判断不出客人到底上没上飞机。
+ */
+function hasNoShowMark(metadata: unknown): boolean {
+  if (metadata == null || typeof metadata !== 'object' || Array.isArray(metadata)) return false;
+  return (metadata as Record<string, unknown>).noShow != null;
+}
 
 export function toAggOrder(o: OrderRow): AggOrder {
   return {
@@ -101,15 +115,23 @@ export function toAggOrder(o: OrderRow): AggOrder {
       roomTypeName: i.hotelRoomType?.name ?? null,
       hotelCheckIn: i.hotelCheckIn,
       hotelCheckOut: i.hotelCheckOut,
+      noShow: hasNoShowMark(i.metadata),
     })),
   };
 }
 
-/** 该聚合里新系统已飞行程的去程业务日（UTC+8）——喂给老系统 ±1 天活体去重。 */
+/**
+ * 该聚合里**去程已起飞**行程的业务日（UTC+8）——喂给老系统 ±1 天活体去重。
+ *
+ * 这里用的是 departed 而不是 flown：no-show 单不算飞过一次（不进 tripCount），
+ * 但它那天的老系统同日票大概率是**同一次行程的另一份记录**，去重照样要生效。
+ * 若改用 flown，客人一 no-show 反而会让老系统那张重录票冒出来，飞行次数不降反升 ——
+ * 与「no-show 不给额度」的口径正好相反。
+ */
 export function aggregateFlownBusinessDates(aggregate: TravelerAggregate | undefined): string[] {
   if (!aggregate) return [];
   return aggregate.trips
-    .filter((trip) => trip.flown && trip.departAt !== null)
+    .filter((trip) => trip.departed && trip.departAt !== null)
     .map((trip) => businessDateISO(trip.departAt!));
 }
 

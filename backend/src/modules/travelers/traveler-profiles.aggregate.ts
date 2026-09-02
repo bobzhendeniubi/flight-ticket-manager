@@ -7,9 +7,11 @@
  *
  * 口径（proposal 拍板前的默认值，见 docs/常旅客计划-proposal.md 第七节）：
  *   - 行程（trip）按订单计：一张含机票的订单 = 1 次行程，取最早起飞的航段为「去程」；
- *     tripCount 只数新系统去程已起飞的行程（「飞过多少次」）；老系统历史次数由 service
- *     层按档案全部证件号批量查好后加到快照，不在本纯函数内访问数据库；
+ *     tripCount 只数新系统去程已起飞**且客人真登机**的行程（「飞过多少次」）；老系统历史
+ *     次数由 service 层按档案全部证件号批量查好后加到快照，不在本纯函数内访问数据库；
  *     pendingTripCount 只数去程未起飞的行程（「在订未飞多少次」）。
+ *   - no-show（去程被打了未登机标）的单既不算已飞、也不算在订未飞：飞行次数是权益核销的
+ *     分母（可用次数 = 飞行次数 − 已核销），客人没飞却拿到一次额度等于白送。
  *   - 待支付单也进本聚合（后台单/代理单永不自动退位，待支付是能挂很久的正常业务状态），
  *     但只进「人存不存在 + 飞行次数」口径；订单数 / 累计消费 / 首次·末次出行这些已消费
  *     语义的字段只认已付款单，见 countsTowardSpend。
@@ -47,6 +49,12 @@ export interface AggOrderItem {
   roomTypeName: string | null; // hotelRoomType.name
   hotelCheckIn: Date | null;
   hotelCheckOut: Date | null;
+  /**
+   * 该航段行是否被打了「未登机」标（订单行 metadata.noShow 存在即为真）。
+   * 打标只发生在去程行，班次本身不动（那趟航班真飞了，得留在航段统计里），
+   * 变的只是「这一单的客人没上飞机」——飞行次数口径必须认这个标。
+   */
+  noShow: boolean;
 }
 
 export interface AggOrder {
@@ -88,6 +96,14 @@ export interface TripSummary {
   hotels: HotelStay[];
   paxCount: number;
   spendShareCny: number;
+  /**
+   * 去程班次已起飞（不问客人有没有登机）。老系统 ±1 天活体去重要的是这个 ——
+   * 见 traveler-trip-count.ts 的 aggregateFlownBusinessDates。
+   */
+  departed: boolean;
+  /** 去程被打了未登机标（整单口径，见下方 summarizeOrder 注释）。 */
+  noShow: boolean;
+  /** 真飞过：去程已起飞 且 没被打未登机标。飞行次数只数这个。 */
   flown: boolean;
 }
 
@@ -100,9 +116,12 @@ export interface TravelerAggregate {
   dateOfBirth: Date | null;
   nationality: string | null;
   passportExpiry: Date | null;
-  /** 纯聚合结果中的新系统已飞次数；service 写快照时再加 legacyTripCount。 */
+  /** 纯聚合结果中的新系统已飞次数（不含 no-show 单）；service 写快照时再加 legacyTripCount。 */
   tripCount: number;
-  /** 在订未飞：有去程航班且去程尚未起飞的有效订单数（与新系统已飞互补；无航段单两边都不计） */
+  /**
+   * 在订未飞：有去程航班、去程尚未起飞、且没被打未登机标的有效订单数。
+   * 无航段单两边都不计；no-show 单同样两边都不计（既没飞成，也不再等一次未来的额度）。
+   */
   pendingTripCount: number;
   /** 订单数：只数已付款单（待支付单不进已消费口径） */
   orderCount: number;
@@ -183,7 +202,16 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
-/** 单张订单的行程摘要（对每位乘机人相同；spendShare 已是人均） */
+/**
+ * 单张订单的行程摘要（对每位乘机人相同；spendShare 已是人均）。
+ *
+ * no-show 是**整单口径**：去程行打了未登机标，这一单就不计一次飞行 ——
+ *   - 打标流程本身就是整单的（要只标其中几个人，得先拆单，标记落在拆出来的那张单上），
+ *     所以「一单里有人飞了有人没飞」不会以未拆单的形态存在；
+ *   - 回程若已释放，flightScheduleId 置空、departureTime 为 null，那一行自然不进 flightItems；
+ *   - 回程若被恢复、客人真飞了回程，仍按整单不计一次：飞行次数是权益核销的分母，
+ *     一张单最多换一次额度，去程没登机就不该拿到这次额度（业务已拍板）。
+ */
 function summarizeOrder(order: AggOrder, now: Date): TripSummary {
   const flightItems = order.items
     .filter((i): i is AggOrderItem & { departureTime: Date } => i.departureTime !== null)
@@ -200,6 +228,8 @@ function summarizeOrder(order: AggOrder, now: Date): TripSummary {
       orderNumber: order.orderNumber,
     }));
   const paxCount = Math.max(1, order.passengers.length);
+  const departed = depart !== null && depart.departureTime <= now;
+  const noShow = depart?.noShow ?? false;
   return {
     orderId: order.id,
     orderNumber: order.orderNumber,
@@ -215,7 +245,9 @@ function summarizeOrder(order: AggOrder, now: Date): TripSummary {
     hotels,
     paxCount,
     spendShareCny: round2(order.paidAmountCny / paxCount),
-    flown: depart !== null && depart.departureTime <= now,
+    departed,
+    noShow,
+    flown: departed && !noShow,
   };
 }
 
@@ -335,7 +367,9 @@ export function buildTravelerAggregates(
 
     // 飞行次数 / 在订未飞：含待支付单（在订就是在订，飞过就是飞过）
     const flown = trips.filter((t) => t.flown && t.departAt);
-    const upcoming = trips.filter((t) => !t.flown && t.departAt && t.departAt > now);
+    // no-show 单两边都不进：已经不算飞过，也不该退回「在订未飞」去等一次未来的额度
+    // （极端情况——起飞前就先打了标——否则会被 departAt > now 捞进在订未飞）。
+    const upcoming = trips.filter((t) => !t.flown && !t.noShow && t.departAt && t.departAt > now);
     // 已消费口径：订单数 / 累计消费 / 首末次出行只认已付款单
     const paidTrips = trips.filter((t) => countsTowardSpend(t.status));
     const paidFlown = paidTrips.filter((t) => t.flown && t.departAt);
