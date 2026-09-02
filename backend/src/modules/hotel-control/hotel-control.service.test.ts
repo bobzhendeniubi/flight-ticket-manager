@@ -74,7 +74,11 @@ const todayMs = new Date(`${todayStr}T00:00:00.000Z`).getTime();
 const day = (n: number): Date => new Date(todayMs + n * DAY_MS);
 const dayStr = (n: number): string => day(n).toISOString().slice(0, 10);
 
-function fakeClient(opts: { paxCounts: number[] }): PrismaClient {
+/**
+ * @param opts.restoredItems no-show 恢复超售的回程行（走 metadata path 过滤的那次查询）；
+ *   缺省空数组 = 没有任何恢复超售，行为与旧版逐位一致。
+ */
+function fakeClient(opts: { paxCounts: number[]; restoredItems?: unknown[] }): PrismaClient {
   return {
     // 包房：1 间，覆盖 today..today+13
     hotelBlockPeriod: {
@@ -90,8 +94,12 @@ function fakeClient(opts: { paxCounts: number[] }): PrismaClient {
       ]),
     },
     // 占房：今晚 2 行 → used(today)=2 > block=1 → 超卖
+    // 带 metadata 过滤的那次查询是「no-show 恢复超售」取数，走另一条返回。
     orderItem: {
-      findMany: vi.fn().mockResolvedValue([
+      findMany: vi.fn(async (args: unknown) => {
+        const where = (args as { where?: Record<string, unknown> }).where ?? {};
+        if (where.metadata) return opts.restoredItems ?? [];
+        return [
         {
           hotelCheckIn: day(0),
           hotelCheckOut: day(1),
@@ -102,7 +110,8 @@ function fakeClient(opts: { paxCounts: number[] }): PrismaClient {
           hotelCheckOut: day(1),
           hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } },
         },
-      ]),
+        ];
+      }),
     },
     flightSchedule: {
       findMany: vi.fn().mockResolvedValue([
@@ -162,7 +171,13 @@ describe('getAlerts', () => {
 
     // s1 乘客 195 > 191 → 报；s2 乘客 100 → 不报
     expect(alerts.overCapacitySchedules).toEqual([
-      { flightNumber: 'QH9589', departureDate: dayStr(1), paxCount: 195 },
+      {
+        flightNumber: 'QH9589',
+        departureDate: dayStr(1),
+        paxCount: 195,
+        noShowOversoldSeats: 0,
+        note: '',
+      },
     ]);
   });
 
@@ -170,6 +185,72 @@ describe('getAlerts', () => {
     const client = fakeClient({ paxCounts: [191, 191] });
     const alerts = await getAlerts(14, client);
     expect(alerts.overCapacitySchedules).toEqual([]);
+  });
+
+  // ── no-show 恢复超售：已人为确认 + 已落 CRITICAL 审计，不该当成异常刷屏 ──────
+  const restoredItem = (scheduleId: string, oversoldBy: number) => ({
+    flightScheduleId: scheduleId,
+    metadata: {
+      returnRestored: {
+        at: '2026-09-02T05:00:00.000Z',
+        oversold: oversoldBy > 0,
+        oversoldBy,
+      },
+    },
+  });
+
+  it('超员完全由 no-show 恢复超售解释（超出量 ≤ N）→ 不报', async () => {
+    const client = fakeClient({
+      paxCounts: [193, 100],
+      restoredItems: [restoredItem('s1', 1), restoredItem('s1', 1)],
+    });
+    const alerts = await getAlerts(14, client);
+    expect(alerts.overCapacitySchedules).toEqual([]);
+  });
+
+  it('超出量大于 no-show 恢复超售座数 → 照报，文案标注已放行的部分', async () => {
+    const client = fakeClient({
+      paxCounts: [195, 100],
+      restoredItems: [restoredItem('s1', 2)],
+    });
+    const alerts = await getAlerts(14, client);
+    expect(alerts.overCapacitySchedules).toEqual([
+      {
+        flightNumber: 'QH9589',
+        departureDate: dayStr(1),
+        paxCount: 195,
+        noShowOversoldSeats: 2,
+        note: '（其中 2 座为 no-show 恢复超售，已审计放行）',
+      },
+    ]);
+  });
+
+  it('恢复时没超售（oversold=false）不算数：超员照旧全额报警', async () => {
+    const client = fakeClient({
+      paxCounts: [193, 100],
+      restoredItems: [restoredItem('s1', 0)],
+    });
+    const alerts = await getAlerts(14, client);
+    expect(alerts.overCapacitySchedules).toEqual([
+      {
+        flightNumber: 'QH9589',
+        departureDate: dayStr(1),
+        paxCount: 193,
+        noShowOversoldSeats: 0,
+        note: '',
+      },
+    ]);
+  });
+
+  it('别的班次的恢复超售不串台', async () => {
+    const client = fakeClient({
+      paxCounts: [193, 100],
+      restoredItems: [restoredItem('s2', 5)],
+    });
+    const alerts = await getAlerts(14, client);
+    expect(alerts.overCapacitySchedules).toMatchObject([
+      { flightNumber: 'QH9589', paxCount: 193, noShowOversoldSeats: 0, note: '' },
+    ]);
   });
 });
 

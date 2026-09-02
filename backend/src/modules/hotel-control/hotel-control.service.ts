@@ -30,6 +30,7 @@ import type { AuditActor } from '../../lib/audit.js';
 import { writeAudit } from '../../lib/audit.js';
 import { businessDateISO, startOfBusinessDayUtc } from '../../lib/business-time.js';
 import { BadRequestError, NotFoundError } from '../../lib/errors.js';
+import { restoredOversoldSeats } from '../orders/orders.leg-status.js';
 import { fmtDepartureLocalDate } from '../orders/passport-zip.js';
 import type { CreateBlockPeriodBody, UpdateBlockPeriodBody } from './hotel-control.schemas.js';
 
@@ -1709,11 +1710,22 @@ export interface HotelControlAlerts {
   }>;
   /** 距今 3 天内仍有剩余包房（block > 0 且 remaining > 0）：提示该退房 */
   surplusSoon: Array<{ hotelName: string; date: string; surplus: number }>;
-  /** 出发在 30 天内、计入口径乘客数超过班次开票上限（默认 191）的班次 */
+  /**
+   * 出发在 30 天内、计入口径乘客数超过班次座位库存的班次。
+   *
+   * **超员完全由 no-show 恢复超售解释时不进本数组**（见 getAlerts）：那是票务点「恢复回程」
+   * 时人为确认、并已落 CRITICAL 审计的放行，不是需要房控/票务去查的异常。
+   * 本数组是纯告警列表（两个消费方——房控页告警卡与仪表盘 critical 计数——都把每一条
+   * 当成一次报警，结构里没有严重级通道），留在里面就等于持续误报。
+   */
   overCapacitySchedules: Array<{
     flightNumber: string;
     departureDate: string; // YYYY-MM-DD
     paxCount: number;
+    /** 该班次里由 no-show 恢复超售贡献的座数 = Σ returnRestored.oversoldBy（无则 0）。 */
+    noShowOversoldSeats: number;
+    /** 告警文案后缀（无 no-show 超售时为空串），供前端直接拼在句尾。 */
+    note: string;
   }>;
   /**
    * 入住临近（SHARED_ODD_NEAR_DAYS 天内）当晚有拼房客无法配对（落单数 > 0，异性不能拼、
@@ -1831,19 +1843,56 @@ export async function getAlerts(
       }),
     ),
   );
+  // no-show 恢复超售：票务点「恢复回程」时余位不足、经人为确认直加 sold 的座数
+  //（每一次都落了 CRITICAL 审计）。这部分超员是**已知且已批准**的，不该混在异常告警里，
+  // 但也不能一笔抹掉——超出量比它还大时说明另有真超售，要如实报并把已放行的部分标注出来。
+  const restoredRows =
+    schedules.length === 0
+      ? []
+      : await client.orderItem.findMany({
+          where: {
+            kind: OrderItemKind.FLIGHT,
+            flightScheduleId: { in: schedules.map((s) => s.id) },
+            metadata: { path: ['returnRestored'], not: Prisma.DbNull },
+            order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
+          },
+          select: { flightScheduleId: true, metadata: true },
+        });
+  const noShowOversoldBySchedule = new Map<string, number>();
+  for (const row of restoredRows) {
+    if (!row.flightScheduleId) continue;
+    const seats = restoredOversoldSeats({
+      kind: OrderItemKind.FLIGHT,
+      flightScheduleId: row.flightScheduleId,
+      metadata: row.metadata,
+    });
+    if (seats <= 0) continue;
+    noShowOversoldBySchedule.set(
+      row.flightScheduleId,
+      (noShowOversoldBySchedule.get(row.flightScheduleId) ?? 0) + seats,
+    );
+  }
+
   const overCapacitySchedules: HotelControlAlerts['overCapacitySchedules'] = [];
   schedules.forEach((s, i) => {
     // 一个舱位都没配的班次 → 无库存可比，跳过（与 getScheduleSeatCapacity 同口径：
     // 这种班次本来就卖不出座，把上限当 0 会把它全部报成超员）。
     if (s.seatClasses.length === 0) return;
     const seatCapacity = s.seatClasses.reduce((sum, sc) => sum + sc.capacity, 0);
-    if (paxCounts[i] > seatCapacity) {
-      overCapacitySchedules.push({
-        flightNumber: s.flight.flightNumber,
-        departureDate: fmtDateOnly(s.departureTime),
-        paxCount: paxCounts[i],
-      });
-    }
+    if (paxCounts[i] <= seatCapacity) return;
+    const noShowOversoldSeats = noShowOversoldBySchedule.get(s.id) ?? 0;
+    // 超出量完全落在已审计放行的范围内 → 不报（这条不是异常，是批准过的动作）。
+    if (paxCounts[i] - seatCapacity <= noShowOversoldSeats) return;
+    overCapacitySchedules.push({
+      flightNumber: s.flight.flightNumber,
+      departureDate: fmtDateOnly(s.departureTime),
+      paxCount: paxCounts[i],
+      noShowOversoldSeats,
+      note:
+        noShowOversoldSeats > 0
+          ? `（其中 ${noShowOversoldSeats} 座为 no-show 恢复超售，已审计放行）`
+          : '',
+    });
   });
 
   return { oversold, surplusSoon, overCapacitySchedules, sharedOddNear };

@@ -1371,6 +1371,7 @@ function AlertsBanner({ token }: { token: string }) {
                 >
                   <span className="inline-flex items-center gap-1 font-semibold"><Icon name="alert" /> 票务</span> {a.flightNumber}{' '}
                   {fmtMonthDay(a.departureDate)} 已收客 {a.paxCount} 人 · 超过开票上限
+                  {a.note ? <span className="ml-1 text-violet-500">{a.note}</span> : null}
                 </div>
               ))}
               {sharedOddNear.map((a, i) => (
