@@ -231,6 +231,8 @@ describe('按人改期 · 部分乘客 = 先拆单再对新单改期', () => {
         roomSplit: [{ itemId: 'hotel-1', roomsBilledToMove: 0.5 }],
         note: '客人单独改期',
         requestToken: TOKEN,
+        // 编排路径：混合房组自动劈半 + 未给的间数/升舱位按人头自动派生
+        autoSplitRoomGroups: true,
       },
       admin,
     );

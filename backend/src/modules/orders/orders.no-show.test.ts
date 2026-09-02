@@ -498,11 +498,11 @@ describe('no-show · 预检', () => {
     const spy = vi
       .spyOn(service as unknown as { assessOrderSplitForNoShow: () => Promise<string[]> },
         'assessOrderSplitForNoShow')
-      .mockResolvedValue(['套餐订单暂不支持拆单：请改用按人办签证 / 拆房组等既有售后操作。']);
+      .mockResolvedValue(['本单佣金已进结算流程，请财务先处理后再拆。']);
     const res = await service.previewNoShow('ord-1', { passengerIds: ['pax-1'] }, ADMIN);
     expect(res.scope).toBe('SPLIT_REQUIRED');
     expect(res.eligible).toBe(false);
-    expect(res.blockers.join('')).toContain('套餐订单暂不支持拆单');
+    expect(res.blockers.join('')).toContain('佣金已进结算流程');
     expect(res.warnings.join('')).toContain('1/2 位乘客');
     spy.mockRestore();
   });
@@ -680,9 +680,7 @@ describe('no-show · 部分乘客', () => {
     // 判定权整个交给 splitOrder（不再先跑一遍 previewOrderSplit，见 markNoShow 步骤 2 的注释）。
     const split = vi
       .spyOn(service, 'splitOrder')
-      .mockRejectedValue(
-        new BadRequestError('套餐订单暂不支持拆单：请改用按人办签证 / 拆房组等既有售后操作。'),
-      );
+      .mockRejectedValue(new BadRequestError('本单佣金已进结算流程，请财务先处理后再拆。'));
     const err = await service
       .markNoShow('ord-1', noShowBody({ passengerIds: ['pax-1'] }), ADMIN)
       .catch((e: unknown) => e);
@@ -690,7 +688,7 @@ describe('no-show · 部分乘客', () => {
     expect((err as AppError).statusCode).toBe(409);
     expect((err as AppError).code).toBe('SPLIT_BLOCKED');
     expect((err as AppError).details).toMatchObject({
-      blockers: [expect.stringContaining('套餐订单暂不支持拆单')],
+      blockers: [expect.stringContaining('佣金已进结算流程')],
     });
     expect(mockPrisma.$transaction).not.toHaveBeenCalled();
     split.mockRestore();

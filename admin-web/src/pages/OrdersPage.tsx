@@ -7243,13 +7243,14 @@ function OrderItemRow({
   // 单订酒店行（非套餐）：可改结算价（每间每晚价）与改期（挪住宿区间）。
   // 套餐的住宿日期跟着行程走，不从这里单独挪，故 BUNDLE 行不给这两个入口（后端也会拒）。
   const isPlainHotelRow = item.kind === 'HOTEL';
-  // 拆房组（按房组换酒店的前置步骤）：把一个房组从本 HOTEL 行拆成独立 0 元行。
-  // 仅 HOTEL 行（BUNDLE 行后端 400，不给入口）；须 ≥2 个有乘客的房组、且组间数 < 行计费房数
-  // （等于全额 = 无需拆，直接换酒店）。可拆的组 = 归属本行的 + 无归属的（归属别行的不动）。
+  // 拆房组（按房组换酒店的前置步骤）：把一个房组从本住宿行拆成独立 0 元行。
+  // 单订酒店行与盖了住宿的套餐行都给入口（后端两种都收）；须 ≥2 个有乘客的房组、
+  // 且组间数 < 行计费房数（等于全额 = 无需拆，直接换酒店）。
+  // 可拆的组 = 归属本行的 + 无归属的（归属别行的不动）。
   const roomsBilledNum = item.roomsBilled != null ? Number(item.roomsBilled) : null;
   const groupsWithPax = (roomGroups ?? []).filter((g) => (g.passengerIds?.length ?? 0) > 0);
   const splittableGroups =
-    isPlainHotelRow && roomsBilledNum != null && roomsBilledNum > 0 && groupsWithPax.length >= 2
+    isHotelRow && roomsBilledNum != null && roomsBilledNum > 0 && groupsWithPax.length >= 2
       ? groupsWithPax.filter(
           (g) =>
             (!g.orderItemId || g.orderItemId === item.id) &&
@@ -7636,7 +7637,7 @@ function OrderItemRow({
   );
 }
 
-// ── 拆房组：把分房表的一个房组从某条 HOTEL 行拆成独立 0 元行（ADMIN/STAFF）──────
+// ── 拆房组：把分房表的一个房组从某条住宿行（HOTEL 行或带住宿盖章的套餐行）拆成独立 0 元行（ADMIN/STAFF）──────
 // 「按房组换酒店」的前置步骤：钱不动（新行 0 元、源行金额冻结，总额恒等）、库存对称
 // （源行/新行 roomsBilled 此消彼长）。拆完对新行用行上现成的「换酒店」即可，只挪这一组人。
 function SplitRoomGroupModal({

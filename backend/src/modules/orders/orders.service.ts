@@ -14,6 +14,7 @@
 import {
   AuditSeverity,
   AuditTargetType,
+  BundleChangeRequestStatus,
   ReminderStatus,
   CabinClass,
   CommissionStatus,
@@ -74,6 +75,18 @@ import {
   RETURN_RELEASED_PREFIX,
 } from './orders.leg-status.js';
 import { computePerPaxShares } from './per-pax-share.js';
+import {
+  deriveRoomsToMove,
+  occupancyOfPassengers,
+  planItemMove,
+  readUpgradeCount,
+  resolveUpgradeToMove,
+  roundHalfGrid,
+  type SplitContext,
+  type SplitItemView,
+  type SplitOccupancy,
+  type SplitRowPatch,
+} from './split-move-strategies.js';
 import {
   assertOrderAcceptsFunds,
   assertOrderAllowsFundsDisposal,
@@ -10012,13 +10025,12 @@ export class OrderService {
       if (!item || item.orderId !== orderId) {
         throw new NotFoundError('订单项不存在或不属于该订单');
       }
-      if (item.kind === OrderItemKind.BUNDLE) {
-        throw new BadRequestError(
-          '套餐行不能直接拆分房组：请先经「补录房费」补一条独立酒店行，再对该行拆分/换酒店',
-        );
-      }
-      if (item.kind !== OrderItemKind.HOTEL) {
-        throw new BadRequestError('该行不是酒店行，无法拆分房组');
+      // 套餐行同样可拆房组（0902 放开）：套餐单没有独立 HOTEL 行，住宿盖章就在套餐行上，
+      // 「拆行不拆应收」的金额口径对它一字不差地成立 —— 新行 0 元、源行 amount 不动，
+      // 只把 roomsBilled 与成本按间数挪过去。新行落 kind=HOTEL（不是第二条 BUNDLE 行）：
+      // 多一条套餐行会让改档（resolveChangeableBundleRow）与拆单的套餐行数闸一起失灵。
+      if (item.kind !== OrderItemKind.HOTEL && item.kind !== OrderItemKind.BUNDLE) {
+        throw new BadRequestError('该行不是住宿行，无法拆分房组');
       }
 
       // ── 分房表 & 目标房组（防御式解析，形状不符按缺失处理）──
@@ -11891,9 +11903,11 @@ export class OrderService {
     db: Prisma.TransactionClient,
     order: SplitSourceOrder,
     passengerIds: string[],
+    options: { autoSplitRoomGroups?: boolean } = {},
   ): Promise<SplitAssessment> {
     const blockers: string[] = [];
     const warnings: string[] = [];
+    const autoSplitRoomGroups = options.autoSplitRoomGroups === true;
 
     // ── 闸 1-3：存活 / 占座中 / 资金处置闸（前两条通过才跑处置闸，避免同因重复报）──
     if (order.deletedAt) {
@@ -11908,12 +11922,17 @@ export class OrderService {
       }
     }
 
-    // ── 闸 4-5：结算价锁 / 收款复核锁 ──
-    if (order.settlementLocked) {
-      blockers.push('该订单结算价已锁定，拆单会改动两侧应收。请先解锁结算价再拆单。');
-    }
-    if (order.paymentsLocked) {
-      blockers.push('该订单收款已复核锁定，拆单会转移已收款。请先解锁收款再拆单。');
+    // ── 闸 4-5（已放开）：两把锁**跟随**到新单，不再拒拆 ────────────────────────
+    // 旧口径拒拆锁定单，于是「财务锁完价、客人 no-show」就彻底没路可走（no-show 按人拆单是
+    // 唯一通道）。锁本身是「别再动这单的钱」的意思，拆单不改单价、只按每人份额搬钱 ——
+    // 真正的风险不是拆，而是**拆完新单没锁**：新单 create 此前根本不写这两组字段，
+    // 等于静默解锁，谁都能去新单上改结算价/撤认款。现口径：新单继承两把锁与
+    // LockedAt/LockedBy（见执行段建新单），两侧同锁，谁也别想借拆单绕开复核。
+    if (order.settlementLocked || order.paymentsLocked) {
+      warnings.push(
+        '本单已锁定（结算价 / 收款复核）：拆出的新单会**继承同样的锁**，' +
+          '如需改动两侧金额请先各自解锁。',
+      );
     }
 
     // ── 闸 6（已放开）：开票位随人搬家，不再拦已开票的单 ──────────────────────
@@ -11924,8 +11943,14 @@ export class OrderService {
     // 新单当然也是已出票态。班次开票额度按「被标记订单的乘客数」算，拆前 n 人一份、
     // 拆后 (n−k) + k 仍是 n 人，额度不增不减（执行段有守恒断言兜底，见步骤 11）。
 
-    // ── 闸 7：已计提/已结算佣金（含结算申请中——佣金还挂在本单金额上，拆了两本账对不上）──
-    const commissionAgg = await db.commissionRecord.aggregate({
+    // ── 闸 7：佣金分档 ──────────────────────────────────────────────────────
+    // no-show / 按人改期发生时，佣金**必然还是 ACCRUED**（代理飞完 7 天后才申请结算），
+    // 一律拒拆等于把这两条售后路全堵死。故按状态分档：
+    //   · ACCRUED 且未挂结算单 → 随拆按份额劈成两条（rate / chainDepth 原样，Σ amount 恒等，
+    //     执行段落 CRITICAL 审计 SPLIT_ORDER_COMMISSION）；
+    //   · SETTLEMENT_REQUESTED / SETTLED（或已挂 settlementId）→ 钱已经进了结算单，
+    //     拆开两侧就与结算单对不上 —— 保留拒绝，请财务先处理。
+    const commissionRows = await db.commissionRecord.findMany({
       where: {
         orderId: order.id,
         status: {
@@ -11936,12 +11961,22 @@ export class OrderService {
           ],
         },
       },
-      _sum: { amount: true },
+      select: { id: true, amount: true, status: true, settlementId: true },
     });
-    const commissionCny = round2(Number(commissionAgg._sum.amount ?? 0));
-    if (commissionCny !== 0) {
-      blockers.push(
-        `该订单已计提佣金 ¥${commissionCny}，拆单会使佣金与订单金额脱钩。请先由财务冲销/处理佣金再拆单。`,
+    const commissionCny = round2(
+      commissionRows.reduce((sum, r) => sum + Number(r.amount), 0),
+    );
+    const commissionSettling = commissionRows.filter(
+      (r) => r.status !== CommissionStatus.ACCRUED || r.settlementId != null,
+    );
+    let commissionMode: 'NONE' | 'SPLIT' | 'BLOCKED' = 'NONE';
+    if (commissionSettling.length > 0) {
+      commissionMode = 'BLOCKED';
+      blockers.push('本单佣金已进结算流程，请财务先处理后再拆。');
+    } else if (commissionRows.length > 0) {
+      commissionMode = 'SPLIT';
+      warnings.push(
+        `本单已计提佣金 ¥${commissionCny}（尚未进结算）：拆单会把它按两侧份额劈成两条，合计不变。`,
       );
     }
 
@@ -11956,28 +11991,40 @@ export class OrderService {
       blockers.push('该订单有进行中的退款，请先完成或驳回退款流程再拆单。');
     }
 
-    // ── 闸 9：售后费用未结清（adjustmentCny 是整单口径，拆开就分不清谁欠的）──
+    // ── 闸 9（已放开）：售后费用按份额随拆分摊 ────────────────────────────────
+    // 旧口径拒拆带售后费的单（「整单口径，拆开就分不清谁欠的」）。可改期费/换人费本就是
+    // 按人产生的钱，均摊到每人份额里再随人搬走，比把整笔留在源单更诚实：
+    //   两侧 Σ adjustmentCny 恒等（执行段有断言），应收也恒等 —— 见执行段的份额收敛。
     if (order.adjustmentCny !== 0) {
-      blockers.push(
-        `该订单有售后费用 ¥${order.adjustmentCny}（改期费/换人费等），请先结清或冲销售后费用再拆单。`,
+      warnings.push(
+        `本单有售后费用 ¥${order.adjustmentCny}（改期费/换人费等）：拆单会按两侧份额分摊，合计不变。`,
       );
     }
 
-    // ── 闸 10：套餐单不支持 ──
-    if (order.items.some((it) => it.kind === OrderItemKind.BUNDLE)) {
-      blockers.push('套餐订单暂不支持拆单：请改用按人办签证 / 拆房组等既有售后操作。');
+    // ── 闸 10：套餐行数量 & 改档申请 ─────────────────────────────────────────
+    // 套餐单已支持拆单（见 split-move-strategies 的 moveBundle）。仍要拦两种情况：
+    //   · 多条套餐行 —— 「拆哪一张、人数快照按谁重建」无从判定（与 resolveChangeableBundleRow
+    //     的多套餐行口径一字不差，不猜）；
+    //   · 有待确认的改档申请 —— 申请里冻的是「拆之前这张单」的人数与档次，拆完再确认执行，
+    //     差额会按已经不存在的人数算。
+    const bundleRows = order.items.filter((it) => it.kind === OrderItemKind.BUNDLE);
+    if (bundleRows.length > 1) {
+      blockers.push('本单含多条套餐行，暂不支持拆单，请联系技术处理。');
+    }
+    if (bundleRows.length > 0) {
+      const pendingChange = await db.bundleChangeRequest.count({
+        where: { orderId: order.id, status: BundleChangeRequestStatus.PENDING },
+      });
+      if (pendingChange > 0) {
+        blockers.push('本单有待确认的套餐改档申请，请先确认或驳回该申请再拆单。');
+      }
     }
 
-    // ── 闸 11：升舱行（拆散升舱镜像会让退座还错舱位）──
-    const hasUpgrade = order.items.some((it) => {
-      if (it.kind !== OrderItemKind.FLIGHT) return false;
-      const md = readJsonObject(it.metadata);
-      const n = Number(md.businessUpgradeCount ?? 0);
-      return Number.isFinite(n) && n > 0;
-    });
-    if (hasUpgrade) {
-      blockers.push('订单含升舱商务的机票行，请先撤销升舱再拆单。');
-    }
+    // ── 闸 11（已放开）：升舱行随拆按人劈开 ──────────────────────────────────
+    // 旧口径拒拆含升舱的单。但升舱镜像账（metadata.businessUpgradeCount）本来就是逐行落库、
+    // 逐行对称释放的，拆的时候把它按人劈到两侧即可 —— 执行段有「逐班次 Σ min(升舱位, 座位数)
+    // 拆前后相等」的守恒断言兜底。未显式给 upgradeSplit 时按占座人头自动派生
+    //（升舱行清单在下面算完两侧人数后一并产出，供预检回显）。
 
     // ── 闸 11b：回程座位当前处于「已释放」态 ─────────────────────────────────────
     // 释放快照（returnReleased.releasedSeats）记的是「这一行在**这张单上**放了几座」，
@@ -12070,17 +12117,25 @@ export class OrderService {
       blockers.push('拆出乘客数需少于全员：至少留 1 位乘客在原订单（整单转移请走改归属/改备注）。');
     }
 
-    // ── 闸 15：同房组闸（一个房间不能一半在这单一半在那单）──
+    // ── 闸 15：同房组闸（一个房间不能一半在这单一半在那单）────────────────────
+    // 手工拆单**保留**这道闸：运营自己在分房里把人分开，比系统替他猜怎么劈更靠谱。
+    // no-show / 按人改期编排（autoSplitRoomGroups=true）则自动把混合房组按人劈成两个半组
+    //（同酒店同房型同日期，房控把两个半间配回一间，房量不变）—— 那两条路径上运营
+    // 根本没有「先去改分房」的机会，闸在那里只会变成死路。
     const roomGroups = readRoomGroups(order.roomAssignment);
+    let roomGroupConflict = false;
     for (const group of roomGroups) {
       const groupPax = group.passengerIds;
       if (groupPax.length === 0) continue;
       const movedInGroup = groupPax.filter((id) => movedIdSet.has(id));
       if (movedInGroup.length > 0 && movedInGroup.length < groupPax.length) {
-        const label = group.label ?? '未命名房组';
-        blockers.push(
-          `房组「${label}」同时包含拆出与留下的乘客，请先在分房里把他们分到不同房组再拆单。`,
-        );
+        roomGroupConflict = true;
+        if (!autoSplitRoomGroups) {
+          const label = group.label ?? '未命名房组';
+          blockers.push(
+            `房组「${label}」同时包含拆出与留下的乘客，请先在分房里把他们分到不同房组再拆单。`,
+          );
+        }
       }
     }
 
@@ -12119,6 +12174,45 @@ export class OrderService {
       Math.min(movedShareCny, round2(prePaidCny - completedRefundsCny)),
     );
 
+    // ── 两侧人数解析（套餐行人数快照重建 / 房数派生的唯一权威口径）──
+    const movedPassengers = order.passengers.filter((p) => movedIdSet.has(p.id));
+    const keptPassengers = order.passengers.filter((p) => !movedIdSet.has(p.id));
+    const movedOccupancy = occupancyOfPassengers(movedPassengers);
+    const keptOccupancy = occupancyOfPassengers(keptPassengers);
+    const occupancy = {
+      movedOccupancy,
+      keptOccupancy,
+      movedSingleCount: movedPassengers.filter((p) => p.singleRoom).length,
+      keptSingleCount: keptPassengers.filter((p) => p.singleRoom).length,
+      movedSelfVisaCount: movedPassengers.filter((p) => p.visaExempt).length,
+      keptSelfVisaCount: keptPassengers.filter((p) => p.visaExempt).length,
+    };
+
+    // ── 售后费按份额分摊 → 新单 total（应收 = total + adjustment，两者都不能重复计）──
+    const payableCny = shareResult.payableCny;
+    const shareRatio =
+      payableCny !== 0
+        ? movedShareCny / payableCny
+        : allPaxIds.length > 0
+          ? movedIdSet.size / allPaxIds.length
+          : 0;
+    // adjustmentCny 是**整数元**列（Order.adjustmentCny Int）：按份额取整分摊，
+    // 留守侧取「原值 − 拆出侧」，两侧仍是整数且 Σ 恒等。
+    const movedAdjustmentCny = Math.round(order.adjustmentCny * shareRatio);
+    const targetTotalCny = round2(movedShareCny - movedAdjustmentCny);
+
+    // ── 建议间数 / 建议升舱位（预检回显 + 编排路径的自动派生，同一套口径）──
+    const suggestCtx = buildSplitSuggestionContext({
+      movedIdSet,
+      totalPax: allPaxIds.length,
+      occupancy,
+    });
+    const stayRows = order.items.filter(
+      (it) =>
+        (it.kind === OrderItemKind.HOTEL || it.kind === OrderItemKind.BUNDLE) &&
+        (it.roomsBilled != null || it.hotelRoomTypeId != null),
+    );
+
     return {
       blockers,
       warnings,
@@ -12134,14 +12228,27 @@ export class OrderService {
       movedPaidCny,
       preTotalCny,
       prePaidCny,
-      hotelItems: order.items
-        .filter((it) => it.kind === OrderItemKind.HOTEL)
-        .map((it) => ({
+      payableCny,
+      movedAdjustmentCny,
+      targetTotalCny,
+      hotelItems: stayRows.map((it) => {
+        const rooms = it.roomsBilled != null ? Number(it.roomsBilled) : null;
+        const isBundleStay = it.kind === OrderItemKind.BUNDLE;
+        return {
           itemId: it.id,
-          description: it.description,
-          roomsBilled: it.roomsBilled != null ? Number(it.roomsBilled) : null,
-        })),
+          // 套餐单没有独立 HOTEL 行，住宿盖章就在套餐行上 —— 前缀点明，别让运营以为选错了行。
+          description: isBundleStay ? `套餐住宿 · ${it.description}` : it.description,
+          roomsBilled: rooms,
+          suggestedRoomsToMove:
+            rooms != null && rooms > 0 ? deriveRoomsToMove(rooms, suggestCtx) : null,
+          isBundleStay,
+        };
+      }),
+      upgradeItems: collectSplitUpgradeItems(order.items, suggestCtx),
+      commission: { mode: commissionMode, amountCny: commissionCny },
+      roomGroupConflict,
       movedIdSet,
+      occupancy,
     };
   }
 
@@ -12151,7 +12258,7 @@ export class OrderService {
    */
   async previewOrderSplit(
     orderId: string,
-    body: { passengerIds: string[] },
+    body: { passengerIds: string[]; autoSplitRoomGroups?: boolean },
     actor: { userId: string; role: UserRole },
   ): Promise<{
     eligible: boolean;
@@ -12160,14 +12267,20 @@ export class OrderService {
     shares: Array<{ passengerId: string; fullName: string; shareCny: number }>;
     movedShareCny: number;
     movedPaidCny: number;
-    hotelItems: Array<{ itemId: string; description: string; roomsBilled: number | null }>;
+    movedAdjustmentCny: number;
+    hotelItems: SplitHotelItemView[];
+    upgradeItems: SplitUpgradeItemView[];
+    commission: { mode: 'NONE' | 'SPLIT' | 'BLOCKED'; amountCny: number };
+    roomGroupConflict: boolean;
   }> {
     if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
       throw new ForbiddenError('仅运营/管理员可拆单');
     }
     const order = await loadOrderForSplit(prisma, orderId);
     if (!order) throw new NotFoundError('订单不存在');
-    const assessment = await this.assessOrderSplit(prisma, order, body.passengerIds);
+    const assessment = await this.assessOrderSplit(prisma, order, body.passengerIds, {
+      autoSplitRoomGroups: body.autoSplitRoomGroups,
+    });
     return {
       eligible: assessment.blockers.length === 0,
       blockers: assessment.blockers,
@@ -12175,7 +12288,11 @@ export class OrderService {
       shares: assessment.shares,
       movedShareCny: assessment.movedShareCny,
       movedPaidCny: assessment.movedPaidCny,
+      movedAdjustmentCny: assessment.movedAdjustmentCny,
       hotelItems: assessment.hotelItems,
+      upgradeItems: assessment.upgradeItems,
+      commission: assessment.commission,
+      roomGroupConflict: assessment.roomGroupConflict,
     };
   }
 
@@ -12192,12 +12309,7 @@ export class OrderService {
    */
   async splitOrder(
     orderId: string,
-    input: {
-      passengerIds: string[];
-      roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
-      note?: string;
-      requestToken: string;
-    },
+    input: SplitOrderInput,
     actor: { userId: string; role: UserRole },
   ): Promise<SplitOrderResult> {
     if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
@@ -12256,6 +12368,31 @@ export class OrderService {
           after: auditAfter,
           severity: AuditSeverity.CRITICAL,
         });
+        // 佣金被劈开过 → 单独一条 CRITICAL 审计：财务日后对账时，「这条佣金怎么变成两条的」
+        // 得有一处说得清（rate / chainDepth 未变、Σ amount 未变，只是分配到了两张单）。
+        if (outcome.commissionSplit.length > 0) {
+          await writeAudit({
+            actor: { userId: actor.userId, role: actor.role },
+            action: 'SPLIT_ORDER_COMMISSION',
+            targetType: AuditTargetType.ORDER,
+            targetId: outcome.result.sourceOrderId,
+            targetLabel: outcome.result.sourceOrderNumber,
+            before: {
+              records: outcome.commissionSplit.map((c) => ({
+                commissionId: c.commissionId,
+                agentId: c.agentId,
+                amountCny: c.beforeAmountCny,
+                rate: c.rate,
+                chainDepth: c.chainDepth,
+              })),
+            },
+            after: {
+              targetOrderNumber: outcome.result.targetOrderNumber,
+              records: outcome.commissionSplit,
+            },
+            severity: AuditSeverity.CRITICAL,
+          });
+        }
         return outcome.result;
       } catch (err) {
         if (isUniqueViolation(err, 'orderNumber')) {
@@ -12302,12 +12439,7 @@ export class OrderService {
   private async executeSplitWithinTx(
     tx: Prisma.TransactionClient,
     orderId: string,
-    input: {
-      passengerIds: string[];
-      roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
-      note?: string;
-      requestToken: string;
-    },
+    input: SplitOrderInput,
     actor: { userId: string; role: UserRole },
     targetOrderNumber: string,
   ): Promise<
@@ -12321,6 +12453,8 @@ export class OrderService {
         sourcePaidAfterCny: number;
         allShareRows: Array<{ passengerId: string; netCny: number; shareCny: number }>;
         passengerSummary: Array<{ id: string; name: string; moved: boolean }>;
+        /** 佣金劈分明细（非空 → 事务外补一条 CRITICAL 审计 SPLIT_ORDER_COMMISSION）。 */
+        commissionSplit: SplitCommissionAudit[];
       }
   > {
     // ── 0. 锁源单行（与改结算价/认款同一把锁），锁内幂等复查 ──
@@ -12355,37 +12489,130 @@ export class OrderService {
     // ── 1. 锁后读权威快照 + 重跑全部准入闸（fail-closed：预检放过的这里也要再拦一次）──
     const order = await loadOrderForSplit(tx, orderId);
     if (!order) throw new NotFoundError('订单不存在');
-    const assessment = await this.assessOrderSplit(tx, order, input.passengerIds);
+    const autoSplitRoomGroups = input.autoSplitRoomGroups === true;
+    const assessment = await this.assessOrderSplit(tx, order, input.passengerIds, {
+      autoSplitRoomGroups,
+    });
     if (assessment.blockers.length > 0) {
       throw new BadRequestError(`当前不能拆单：\n${assessment.blockers.join('\n')}`);
     }
     const movedIdSet = assessment.movedIdSet;
     const k = movedIdSet.size;
-    const { movedShareCny, movedPaidCny, preTotalCny, prePaidCny } = assessment;
+    const {
+      movedShareCny,
+      movedPaidCny,
+      preTotalCny,
+      prePaidCny,
+      movedAdjustmentCny,
+      targetTotalCny,
+    } = assessment;
 
-    // ── 2. roomSplit 显式校验（0.5 网格由 schema 保证；这里校验行归属与上限）──
+    // ── 2. 显式指令校验（0.5 网格 / 整数由 schema 保证；这里校验行归属与上限）──
+    // 2a. roomSplit：酒店行**与套餐住宿行**都收（套餐单没有独立 HOTEL 行，住宿盖章就在套餐行上）。
     const roomSplitByItem = new Map<string, number>();
     for (const entry of input.roomSplit ?? []) {
       if (roomSplitByItem.has(entry.itemId)) {
-        throw new BadRequestError('roomSplit 中同一酒店行出现多次，请合并为一条');
+        throw new BadRequestError('roomSplit 中同一住宿行出现多次，请合并为一条');
       }
       const item = order.items.find((it) => it.id === entry.itemId);
-      if (!item || item.kind !== OrderItemKind.HOTEL) {
-        throw new BadRequestError('roomSplit 指向的订单行不存在或不是酒店行，请刷新后重试');
+      if (!item || (item.kind !== OrderItemKind.HOTEL && item.kind !== OrderItemKind.BUNDLE)) {
+        throw new BadRequestError('roomSplit 指向的订单行不存在或不是住宿行，请刷新后重试');
       }
       const srcRooms = item.roomsBilled != null ? Number(item.roomsBilled) : null;
       if (srcRooms == null || srcRooms <= 0) {
         throw new BadRequestError(
-          `酒店行「${item.description}」未记录计费房数（roomsBilled），请先保存分房表再拆分`,
+          `住宿行「${item.description}」未记录计费房数（roomsBilled），请先保存分房表再拆分`,
         );
       }
       if (entry.roomsBilledToMove > srcRooms) {
         throw new BadRequestError(
-          `酒店行「${item.description}」随拆搬走的间数（${entry.roomsBilledToMove}）超过该行计费房数（${srcRooms}）`,
+          `住宿行「${item.description}」随拆搬走的间数（${entry.roomsBilledToMove}）超过该行计费房数（${srcRooms}）`,
         );
       }
-      roomSplitByItem.set(entry.itemId, entry.roomsBilledToMove);
+      roomSplitByItem.set(entry.itemId, roundHalfGrid(entry.roomsBilledToMove));
     }
+
+    // 2b. upgradeSplit：按航段给数，服务端按「第一条 FLIGHT 行=去程」归到具体行。
+    //     未给的行不是「不搬升舱」，而是「按占座人头自动派生」—— 编排路径（no-show / 按人改期）
+    //     根本不知道该填几个，硬要显式只会把它们逼进死路。
+    const upgradeSplitByItem = new Map<string, number>();
+    const flightRows = order.items.filter((it) => it.kind === OrderItemKind.FLIGHT);
+    for (const entry of input.upgradeSplit ?? []) {
+      if (upgradeSplitByItem.has(entry.itemId)) {
+        throw new BadRequestError('upgradeSplit 中同一机票行出现多次，请合并为一条');
+      }
+      const index = flightRows.findIndex((it) => it.id === entry.itemId);
+      if (index < 0) {
+        throw new BadRequestError('upgradeSplit 指向的订单行不存在或不是机票行，请刷新后重试');
+      }
+      const item = flightRows[index];
+      const view = toSplitItemView(item);
+      const count = readUpgradeCount(view.metadata);
+      const toMove = Math.trunc(
+        Number((index === 0 ? entry.outboundToMove : entry.returnToMove) ?? 0),
+      );
+      if (!Number.isFinite(toMove) || toMove < 0 || toMove > count) {
+        throw new BadRequestError(
+          `机票行「${item.description}」随拆搬走的升舱位（${toMove}）超出该行升舱人数（${count}）`,
+        );
+      }
+      const moveQty = Math.min(view.quantity, k);
+      const keepQty = view.quantity - moveQty;
+      if (toMove > moveQty || count - toMove > keepQty) {
+        throw new BadRequestError(
+          `机票行「${item.description}」的升舱位拆分与两侧座位数对不上：` +
+            `拆出 ${moveQty} 座最多带 ${moveQty} 个升舱位，留守 ${keepQty} 座最多留 ${keepQty} 个。`,
+        );
+      }
+      upgradeSplitByItem.set(entry.itemId, toMove);
+    }
+
+    // 2c. 升舱两侧分程汇总（套餐行 addOns 重建要用）：先按各机票行算出搬几个，再按航段归并。
+    const preUpgradeCtx = buildSplitContext({
+      movedIdSet,
+      totalPax: order.passengers.length,
+      occupancy: assessment.occupancy,
+      roomSplitByItem,
+      upgradeSplitByItem,
+      autoDeriveRooms: autoSplitRoomGroups,
+      movedUpgradeOutbound: 0,
+      movedUpgradeReturn: 0,
+      keptUpgradeOutbound: 0,
+      keptUpgradeReturn: 0,
+    });
+    let movedUpgradeOutbound = 0;
+    let movedUpgradeReturn = 0;
+    let keptUpgradeOutbound = 0;
+    let keptUpgradeReturn = 0;
+    flightRows.forEach((item, index) => {
+      const view = toSplitItemView(item);
+      const count = readUpgradeCount(view.metadata);
+      if (count <= 0) return;
+      const moveQty = Math.min(view.quantity, k);
+      const keepQty = view.quantity - moveQty;
+      const moved = moveQty >= view.quantity ? count : resolveUpgradeToMove(view, preUpgradeCtx, moveQty, keepQty);
+      if (index === 0) {
+        movedUpgradeOutbound += moved;
+        keptUpgradeOutbound += count - moved;
+      } else {
+        movedUpgradeReturn += moved;
+        keptUpgradeReturn += count - moved;
+      }
+    });
+    const splitCtx = buildSplitContext({
+      movedIdSet,
+      totalPax: order.passengers.length,
+      occupancy: assessment.occupancy,
+      roomSplitByItem,
+      upgradeSplitByItem,
+      // 编排路径（no-show / 按人改期）不传 roomSplit，房数一律按人头自动派生；
+      // 手工拆单不自动派生（酒店行没填间数就整块留源单，与 v1 行为一致）。
+      autoDeriveRooms: autoSplitRoomGroups,
+      movedUpgradeOutbound,
+      movedUpgradeReturn,
+      keptUpgradeOutbound,
+      keptUpgradeReturn,
+    });
 
     // ── 3. 建新单：抄转正建单的事务内建单法，但**不重新定价不扣座**（行是搬/拆来的）──
     const nowIso = new Date().toISOString();
@@ -12410,6 +12637,14 @@ export class OrderService {
         outboundInvoiced: order.outboundInvoiced,
         returnInvoiced: order.returnInvoiced,
         systemInvoiced: order.systemInvoiced,
+        // 两把锁跟随（闸 4-5 已放开）：源单锁着，新单也锁着。不写这两组字段 = 静默解锁，
+        // 谁都能借「先拆一刀」绕开财务的结算价锁与收款复核锁。
+        settlementLocked: order.settlementLocked,
+        settlementLockedAt: order.settlementLockedAt,
+        settlementLockedBy: order.settlementLockedBy,
+        paymentsLocked: order.paymentsLocked,
+        paymentsLockedAt: order.paymentsLockedAt,
+        paymentsLockedBy: order.paymentsLockedBy,
         visaStatus: order.visaStatus,
         claimedById: order.claimedById,
         claimedAt: order.claimedAt,
@@ -12434,8 +12669,8 @@ export class OrderService {
       select: { id: true, orderNumber: true },
     });
 
-    // ── 4. 按行搬/拆（unitPrice 全冻结）──
-    // 拆前逐班次舱位数量账（守恒断言基准）。
+    // ── 4. 按行搬/拆（unitPrice 全冻结；口径全在 split-move-strategies，内核只管落库）──
+    // 拆前逐班次舱位数量账 + 升舱位账 + 房数账 + 成本账（守恒断言基准）。
     const preFlightQty = sumFlightQuantities(
       order.items.map((it) => ({
         kind: it.kind,
@@ -12444,135 +12679,58 @@ export class OrderService {
         quantity: it.quantity,
       })),
     );
+    const preUpgradeQty = sumFlightUpgradeCounts(order.items);
+    const preRoomsHalf = sumRoomsBilledHalves(order.items);
+    const preCostCents = sumTotalCostCents(order.items);
     const fullyMovedItemIds = new Set<string>();
     const splitItemIdMap = new Map<string, string>(); // 源行 id → 新单对应行 id（拆分行）
     for (const item of order.items) {
-      const md = readJsonObject(item.metadata);
-      // 按人调整行跟人走；整单调整行（passengerId=null）全留源单。
-      if (md.priceAdjustment === true) {
-        if (item.passengerId && movedIdSet.has(item.passengerId)) {
-          await tx.orderItem.update({ where: { id: item.id }, data: { orderId: target.id } });
-          fullyMovedItemIds.add(item.id);
-        }
-        continue;
-      }
-      if (
-        item.kind === OrderItemKind.FLIGHT ||
-        item.kind === OrderItemKind.VISA ||
-        item.kind === OrderItemKind.TRANSFER
-      ) {
-        // quantity 是人数：拆出 min(quantity, k) 件。quantity ≤ k → 整行搬走。
-        const moveQty = Math.min(item.quantity, k);
-        if (moveQty <= 0) continue;
-        if (moveQty >= item.quantity) {
-          // 整行过户也要剥掉会话级快照（no-show / 释放 / 恢复 / 取消航段的 requestToken 与座位明细），
-          // 否则同一个幂等键会跟到新单、恢复时按源单的放座数占座——与下面按比例拆行的口径一致。
-          // 描述上的内部留痕前缀与快照成对，剥了快照就一并剥前缀（见 splitInheritedDescription）。
-          await tx.orderItem.update({
-            where: { id: item.id },
-            data: {
-              orderId: target.id,
-              description: splitInheritedDescription(item.description, md),
-              metadata: inheritableItemMetadata(md) as Prisma.InputJsonValue,
-            },
-          });
-          fullyMovedItemIds.add(item.id);
-          continue;
-        }
-        const keepQty = item.quantity - moveQty;
-        const unitPrice = Number(item.unitPrice);
-        const srcCost = item.totalCostCny != null ? Number(item.totalCostCny) : null;
-        const movedCost = srcCost == null ? null : round2((srcCost * moveQty) / item.quantity);
-        const keptCost = srcCost == null || movedCost == null ? null : round2(srcCost - movedCost);
+      const view = toSplitItemView(item);
+      const plan = planItemMove(view, splitCtx);
+      if (plan.mode === 'NONE') continue;
+      if (plan.mode === 'WHOLE') {
         await tx.orderItem.update({
           where: { id: item.id },
-          data: {
-            quantity: keepQty,
-            amount: new Prisma.Decimal(round2(unitPrice * keepQty)),
-            totalCostCny: keptCost == null ? null : new Prisma.Decimal(keptCost),
-          },
+          data: { orderId: target.id, ...splitPatchToPrisma(plan.update) },
         });
-        const createdRow = await tx.orderItem.create({
-          data: {
-            orderId: target.id,
-            kind: item.kind,
-            // 剥了快照就一并剥描述上的内部留痕前缀（见 splitInheritedDescription）。
-            description: splitInheritedDescription(item.description, md),
-            quantity: moveQty,
-            unitPrice: item.unitPrice,
-            amount: new Prisma.Decimal(round2(unitPrice * moveQty)),
-            unitCostCny: item.unitCostCny,
-            totalCostCny: movedCost == null ? null : new Prisma.Decimal(movedCost),
-            flightScheduleId: item.flightScheduleId,
-            flightCabin: item.flightCabin,
-            transferId: item.transferId,
-            visaId: item.visaId,
-            visaIntendedDate: item.visaIntendedDate,
-            // 剔除会话/座位账快照键再继承（见 NON_INHERITABLE_ITEM_METADATA_KEYS）。
-            metadata: {
-              ...inheritableItemMetadata(md),
-              splitFromItemId: item.id,
-            } as Prisma.InputJsonValue,
-            idempotencyKey: null,
-          },
-          select: { id: true },
-        });
-        splitItemIdMap.set(item.id, createdRow.id);
+        fullyMovedItemIds.add(item.id);
         continue;
       }
-      if (item.kind === OrderItemKind.HOTEL) {
-        // 只按显式 roomSplit 拆；无 roomSplit → 酒店行全留源单。
-        const moveRooms = roomSplitByItem.get(item.id);
-        if (moveRooms == null) continue;
-        const srcRooms = Number(item.roomsBilled); // 步骤 2 已保证非空 > 0
-        const srcHalf = Math.round(srcRooms * 2);
-        const moveHalf = Math.round(moveRooms * 2);
-        if (moveHalf >= srcHalf) {
-          await tx.orderItem.update({ where: { id: item.id }, data: { orderId: target.id } });
-          fullyMovedItemIds.add(item.id);
-          continue;
-        }
-        const srcAmount = Number(item.amount);
-        const movedAmount = round2((srcAmount * moveHalf) / srcHalf);
-        const srcCost = item.totalCostCny != null ? Number(item.totalCostCny) : null;
-        const movedCost = srcCost == null ? null : round2((srcCost * moveHalf) / srcHalf);
-        const keptCost = srcCost == null || movedCost == null ? null : round2(srcCost - movedCost);
-        await tx.orderItem.update({
-          where: { id: item.id },
-          data: {
-            roomsBilled: new Prisma.Decimal((srcHalf - moveHalf) / 2),
-            amount: new Prisma.Decimal(round2(srcAmount - movedAmount)),
-            totalCostCny: keptCost == null ? null : new Prisma.Decimal(keptCost),
-          },
-        });
-        const createdRow = await tx.orderItem.create({
-          data: {
-            orderId: target.id,
-            kind: OrderItemKind.HOTEL,
-            description: item.description,
-            quantity: item.quantity,
-            unitPrice: item.unitPrice,
-            amount: new Prisma.Decimal(movedAmount),
-            unitCostCny: item.unitCostCny,
-            totalCostCny: movedCost == null ? null : new Prisma.Decimal(movedCost),
-            hotelRoomTypeId: item.hotelRoomTypeId,
-            randomStarTier: item.randomStarTier,
-            hotelCheckIn: item.hotelCheckIn,
-            hotelCheckOut: item.hotelCheckOut,
-            roomsBilled: new Prisma.Decimal(moveHalf / 2),
-            // 剔除会话/座位账快照键再继承（见 NON_INHERITABLE_ITEM_METADATA_KEYS）。
-            metadata: {
-              ...inheritableItemMetadata(md),
-              splitFromItemId: item.id,
-            } as Prisma.InputJsonValue,
-            idempotencyKey: null,
-          },
-          select: { id: true },
-        });
-        splitItemIdMap.set(item.id, createdRow.id);
-        continue;
-      }
-      // 其余行（FEE/DISCOUNT 非调整行等）全留源单：份额差由 SPLIT 平账行收敛。
+      // SPLIT：源行就地改字段，新单建一条对应行（其余列原样复制，unitPrice 冻结）。
+      await tx.orderItem.update({
+        where: { id: item.id },
+        data: splitPatchToPrisma(plan.keep),
+      });
+      const createdRow = await tx.orderItem.create({
+        data: {
+          orderId: target.id,
+          kind: item.kind,
+          description: item.description,
+          quantity: item.quantity,
+          unitPrice: item.unitPrice,
+          amount: item.amount,
+          unitCostCny: item.unitCostCny,
+          totalCostCny: item.totalCostCny,
+          flightScheduleId: item.flightScheduleId,
+          flightCabin: item.flightCabin,
+          transferId: item.transferId,
+          visaId: item.visaId,
+          visaIntendedDate: item.visaIntendedDate,
+          // 套餐/酒店行的住宿盖章原样跟走：两张单同酒店同房型同日期，房控把两个半间配回一间。
+          hotelRoomTypeId: item.hotelRoomTypeId,
+          randomStarTier: item.randomStarTier,
+          hotelCheckIn: item.hotelCheckIn,
+          hotelCheckOut: item.hotelCheckOut,
+          roomsBilled: item.roomsBilled,
+          // 既有 bug 修复：新建行此前不复制 bundleId —— 拆出来的套餐/机票行与套餐产品脱钩，
+          // 新单改档（resolveChangeableBundleRow 要求 bundleId 非空）与套餐口径的佣金分类全失灵。
+          bundleId: item.bundleId,
+          idempotencyKey: null,
+          ...splitPatchToPrisma(plan.move),
+        },
+        select: { id: true },
+      });
+      splitItemIdMap.set(item.id, createdRow.id);
     }
 
     // ── 5. 物理移乘客（保 id，护照图/送签进度全跟走）──
@@ -12584,9 +12742,23 @@ export class OrderService {
       throw new Error(`拆单守恒断言失败：应移 ${k} 位乘客，实际移动 ${movedPax.count} 位（已回滚）`);
     }
 
-    // ── 6. 分房表：拆出乘客所在房组整组搬到新单（同房组闸已保证组内全员同侧）──
+    // ── 6. 分房表：拆出乘客所在房组整组搬到新单 ────────────────────────────────
+    // 混合房组（一半走一半留）：手工拆单已被闸 15 拒在门外；编排路径（autoSplitRoomGroups）
+    // 在这里按人劈成两个半组 —— 同酒店、同房型、同日期，两组 roomFraction 之和恒等于原组，
+    // 房控把两个半间配回一间，房量分毫不动。
     const rawRoomAssignment = order.roomAssignment;
-    const roomGroups = readRoomGroups(rawRoomAssignment);
+    const roomGroups = readRoomGroups(rawRoomAssignment).flatMap((group) => {
+      if (group.passengerIds.length === 0) return [group];
+      const movedInGroup = group.passengerIds.filter((id) => movedIdSet.has(id));
+      if (movedInGroup.length === 0 || movedInGroup.length === group.passengerIds.length) {
+        return [group];
+      }
+      const halves = splitMixedRoomGroup(group, movedIdSet);
+      return [
+        { ...group, raw: halves.kept, passengerIds: group.passengerIds.filter((id) => !movedIdSet.has(id)) },
+        { ...group, raw: halves.moved, passengerIds: movedInGroup },
+      ];
+    });
     let sourceRoomAssignmentUpdate: Prisma.InputJsonValue | undefined;
     let targetRoomAssignment: Prisma.InputJsonValue | undefined;
     if (roomGroups.length > 0) {
@@ -12623,7 +12795,10 @@ export class OrderService {
     }
 
     // ── 7. 平账行：两边各一条 SPLIT 差额行，把两侧 total 收敛到份额口径 ──
-    //   新单 total == movedShare；源单 total == 拆前 total − movedShare。
+    //   份额（movedShare）是**应收**口径 = total + adjustmentCny，故先把随拆分摊的售后费
+    //   （movedAdjustment）从份额里摘出来，剩下的才是新单的 total —— 否则售后费会被算两遍
+    //   （一遍在 total 里、一遍在 adjustmentCny 里），客人凭空多欠一笔。
+    //   新单 total == movedShare − movedAdjustment；源单 total == 拆前 total − 新单 total。
     //   正 → FEE、负 → DISCOUNT（与 buildSettlementTotalItem 同口径）；差额为 0 不生成行。
     const targetAgg = await tx.orderItem.aggregate({
       where: { orderId: target.id },
@@ -12632,13 +12807,14 @@ export class OrderService {
     const targetItemsSum = round2(Number(targetAgg._sum.amount ?? 0));
     await createSplitBalanceItem(tx, {
       orderId: target.id,
-      diffCny: round2(movedShareCny - targetItemsSum),
+      diffCny: round2(targetTotalCny - targetItemsSum),
       itemsSumCny: targetItemsSum,
-      shareCny: movedShareCny,
+      shareCny: targetTotalCny,
       splitFrom: order.orderNumber,
       splitTo: target.orderNumber,
     });
-    const sourceTotalAfterCny = round2(preTotalCny - movedShareCny);
+    const sourceTotalAfterCny = round2(preTotalCny - targetTotalCny);
+    const keptAdjustmentCny = order.adjustmentCny - movedAdjustmentCny;
     const sourceAgg = await tx.orderItem.aggregate({
       where: { orderId },
       _sum: { amount: true },
@@ -12671,6 +12847,8 @@ export class OrderService {
         subtotal: new Prisma.Decimal(sourceTotalAfterCny),
         total: new Prisma.Decimal(sourceTotalAfterCny),
         paidAmount: new Prisma.Decimal(sourcePaidAfterCny),
+        // 售后费按份额随拆分摊（闸 9 已放开）：两侧 Σ adjustmentCny 恒等，见步骤 11 断言。
+        adjustmentCny: keptAdjustmentCny,
         adjustments: sourceLog,
         ...(sourceRoomAssignmentUpdate !== undefined
           ? { roomAssignment: sourceRoomAssignmentUpdate }
@@ -12696,9 +12874,10 @@ export class OrderService {
     await tx.order.update({
       where: { id: target.id },
       data: {
-        subtotal: new Prisma.Decimal(movedShareCny),
-        total: new Prisma.Decimal(movedShareCny),
+        subtotal: new Prisma.Decimal(targetTotalCny),
+        total: new Prisma.Decimal(targetTotalCny),
         paidAmount: new Prisma.Decimal(movedPaidCny),
+        adjustmentCny: movedAdjustmentCny,
         adjustments: targetLog,
         ...(targetRoomAssignment !== undefined ? { roomAssignment: targetRoomAssignment } : {}),
       },
@@ -12819,10 +12998,76 @@ export class OrderService {
       },
     });
 
+    // ── 10b. 佣金劈分（闸 7 的 SPLIT 档：ACCRUED 且未挂结算单）─────────────────
+    // 按两侧应收份额劈成两条：rate / chainDepth / productKind 原样（费率是与代理谈定的，
+    // 不因拆单变），baseAmount 与 amount 同比例，留守侧取「原值 − 拆出侧」→ Σ 恒等。
+    // 事务外补一条 CRITICAL 审计（SPLIT_ORDER_COMMISSION）：谁在什么时候把哪条佣金劈成了几条。
+    const commissionSplit: SplitCommissionAudit[] = [];
+    if (assessment.commission.mode === 'SPLIT') {
+      const accrued = await tx.commissionRecord.findMany({
+        where: { orderId, status: CommissionStatus.ACCRUED, settlementId: null },
+        select: {
+          id: true,
+          agentId: true,
+          productKind: true,
+          baseAmount: true,
+          rate: true,
+          amount: true,
+          chainDepth: true,
+        },
+      });
+      const commissionRatio =
+        assessment.payableCny !== 0
+          ? movedShareCny / assessment.payableCny
+          : order.passengers.length > 0
+            ? k / order.passengers.length
+            : 0;
+      for (const rec of accrued) {
+        const beforeAmount = round2(Number(rec.amount));
+        const beforeBase = round2(Number(rec.baseAmount));
+        const movedAmount = round2(beforeAmount * commissionRatio);
+        const keptAmount = round2(beforeAmount - movedAmount);
+        const movedBase = round2(beforeBase * commissionRatio);
+        const keptBase = round2(beforeBase - movedBase);
+        if (movedAmount === 0 && movedBase === 0) continue; // 劈出来是 0 → 不建空记录
+        const created = await tx.commissionRecord.create({
+          data: {
+            agentId: rec.agentId,
+            orderId: target.id,
+            productKind: rec.productKind,
+            baseAmount: new Prisma.Decimal(movedBase),
+            rate: rec.rate,
+            amount: new Prisma.Decimal(movedAmount),
+            status: CommissionStatus.ACCRUED,
+            chainDepth: rec.chainDepth,
+          },
+          select: { id: true },
+        });
+        await tx.commissionRecord.update({
+          where: { id: rec.id },
+          data: {
+            baseAmount: new Prisma.Decimal(keptBase),
+            amount: new Prisma.Decimal(keptAmount),
+          },
+        });
+        commissionSplit.push({
+          commissionId: rec.id,
+          agentId: rec.agentId,
+          beforeAmountCny: beforeAmount,
+          keptAmountCny: keptAmount,
+          movedAmountCny: movedAmount,
+          movedCommissionId: created.id,
+          rate: Number(rec.rate),
+          chainDepth: rec.chainDepth,
+        });
+      }
+    }
+
     // ── 11. 守恒断言（不平整体回滚；宁可拆不成也不能拆出对不上的账）──
     const conservationSelect = {
       total: true,
       paidAmount: true,
+      adjustmentCny: true,
       outboundInvoiced: true,
       returnInvoiced: true,
       systemInvoiced: true,
@@ -12862,11 +13107,27 @@ export class OrderService {
         );
       }
     }
-    const flightRowsAfter = await tx.orderItem.findMany({
-      where: { orderId: { in: [orderId, target.id] }, kind: OrderItemKind.FLIGHT },
-      select: { kind: true, flightScheduleId: true, flightCabin: true, quantity: true },
+    // 售后费守恒（闸 9 放开后新增）：两侧 Σ adjustmentCny 必须等于拆前，
+    // 否则「应收 = total + adjustmentCny」在两张单上加起来就不是拆前那笔钱。
+    const adjustmentAfter = sourceAfter.adjustmentCny + targetAfter.adjustmentCny;
+    if (adjustmentAfter !== order.adjustmentCny) {
+      throw new Error(
+        `拆单守恒断言失败：拆前售后费 ¥${order.adjustmentCny}，拆后两单合计 ¥${adjustmentAfter}（已回滚）`,
+      );
+    }
+    const itemsAfter = await tx.orderItem.findMany({
+      where: { orderId: { in: [orderId, target.id] } },
+      select: {
+        kind: true,
+        flightScheduleId: true,
+        flightCabin: true,
+        quantity: true,
+        metadata: true,
+        roomsBilled: true,
+        totalCostCny: true,
+      },
     });
-    const postFlightQty = sumFlightQuantities(flightRowsAfter);
+    const postFlightQty = sumFlightQuantities(itemsAfter);
     for (const [key, preQty] of preFlightQty) {
       if ((postFlightQty.get(key) ?? 0) !== preQty) {
         throw new Error(
@@ -12877,6 +13138,55 @@ export class OrderService {
     for (const key of postFlightQty.keys()) {
       if (!preFlightQty.has(key)) {
         throw new Error(`拆单守恒断言失败：拆后凭空出现班次舱位 ${key}（已回滚）`);
+      }
+    }
+    // 升舱位守恒（套餐单拆分新增）：升舱位对应真实商务舱库存，逐班次舱位 Σ 拆前后必须相等。
+    const postUpgradeQty = sumFlightUpgradeCounts(itemsAfter);
+    for (const key of new Set([...preUpgradeQty.keys(), ...postUpgradeQty.keys()])) {
+      const before = preUpgradeQty.get(key) ?? 0;
+      const after = postUpgradeQty.get(key) ?? 0;
+      if (before !== after) {
+        throw new Error(
+          `拆单守恒断言失败：班次舱位 ${key} 升舱位拆前 ${before} 个、拆后 ${after} 个（已回滚）`,
+        );
+      }
+    }
+    // 房量守恒（套餐住宿行随拆按半间劈开后必查）：Σ roomsBilled 一分不能多、一分不能少，
+    // 否则房控板会凭空多出/少掉房间。以「半间」整数比，避开 0.5 的浮点尾数。
+    const postRoomsHalf = sumRoomsBilledHalves(itemsAfter);
+    if (postRoomsHalf !== preRoomsHalf) {
+      throw new Error(
+        `拆单守恒断言失败：Σ 计费房数拆前 ${preRoomsHalf / 2} 间、拆后 ${postRoomsHalf / 2} 间（已回滚）`,
+      );
+    }
+    // 成本守恒：拆单只搬成本不改成本，Σ totalCostCny 拆前后必须相等（毛利报表的底账）。
+    const postCostCents = sumTotalCostCents(itemsAfter);
+    if (postCostCents !== preCostCents) {
+      throw new Error(
+        `拆单守恒断言失败：Σ 成本拆前 ¥${preCostCents / 100}、拆后 ¥${postCostCents / 100}（已回滚）`,
+      );
+    }
+    // 佣金守恒：劈分只改分配不改金额，两单 Σ amount 必须等于拆前。
+    if (assessment.commission.mode === 'SPLIT') {
+      const postCommission = await tx.commissionRecord.aggregate({
+        where: {
+          orderId: { in: [orderId, target.id] },
+          status: {
+            in: [
+              CommissionStatus.ACCRUED,
+              CommissionStatus.SETTLEMENT_REQUESTED,
+              CommissionStatus.SETTLED,
+            ],
+          },
+        },
+        _sum: { amount: true },
+      });
+      const postCommissionCny = round2(Number(postCommission._sum.amount ?? 0));
+      if (Math.abs(postCommissionCny - assessment.commission.amountCny) > EPS) {
+        throw new Error(
+          `拆单守恒断言失败：拆前佣金 ¥${assessment.commission.amountCny}、` +
+            `拆后两单合计 ¥${postCommissionCny}（已回滚）`,
+        );
       }
     }
 
@@ -12933,6 +13243,7 @@ export class OrderService {
         name: p.chineseName?.trim() || p.fullName,
         moved: movedIdSet.has(p.id),
       })),
+      commissionSplit,
     };
   }
 
@@ -13064,9 +13375,12 @@ export class OrderService {
       orderId,
       {
         passengerIds: movedIds,
+        // roomSplit 可传可不传：不传时按人头自动派生（套餐单的住宿盖章就在套餐行上，
+        // 运营在改期弹窗里根本看不到「酒店行」可填）。
         roomSplit: input.roomSplit,
         note: input.note,
         requestToken: input.requestToken,
+        autoSplitRoomGroups: true,
       },
       actor,
     );
@@ -14150,7 +14464,11 @@ export class OrderService {
   ): Promise<string[]> {
     const source = await loadOrderForSplit(db, orderId);
     if (!source) return ['订单不存在，无法拆单。'];
-    const assessment = await this.assessOrderSplit(db, source, passengerIds);
+    // 编排路径会自动把混合房组按人劈成两个半组 —— 预检口径必须与执行一致，
+    // 否则运营会在弹窗里看到一条「请先去分房里把他们分开」的死路闸。
+    const assessment = await this.assessOrderSplit(db, source, passengerIds, {
+      autoSplitRoomGroups: true,
+    });
     return assessment.blockers;
   }
 
@@ -14328,7 +14646,14 @@ export class OrderService {
     try {
       split = await this.splitOrder(
         orderId,
-        { passengerIds: picked!, note: input.note, requestToken: input.requestToken },
+        {
+          passengerIds: picked!,
+          note: input.note,
+          requestToken: input.requestToken,
+          // 房数 / 升舱位不由本编排指定：no-show 只知道「谁没来」，间数与升舱位按人头
+          // 自动派生（同一份 deriveRoomsToMove / resolveUpgradeToMove，与预检回显同源）。
+          autoSplitRoomGroups: true,
+        },
         actor,
       );
     } catch (err) {
@@ -15637,55 +15962,6 @@ export interface CancelLegAudit {
 export { stripInternalLegPrefix } from './orders.leg-status.js';
 
 /**
- * 跨单复制订单行 metadata 时必须**剔除**的「会话 / 座位账快照」键。
- *
- * 这些快照记的是「这一行在**这张单上**发生过什么」，跟着行复制到新单会出两种事故：
- *   · requestToken 跨单重复 —— 新单再调 no-show / 取消航段，会命中回放分支，什么都不做却回成功；
- *   · releasedSeats 跟着走 —— 新单点「恢复回程」会照源单的放座明细再占一遍座（凭空多占）。
- * 拆出的新单从零开始：要标 no-show 就在新单上重新标一次。
- *
- * legActionLog 是幂等回放的**主**依据（append-only 的 token 流水，见 collectLegActionTokens）：
- * 漏掉它就等于把源单见过的全部 token 一次性搬到新单，新单上任何一次 no-show / 恢复只要
- * 复用了源单用过的 token 就会被判成重试直接回放 —— 座位一座没动却回成功，最难查。
- */
-const NON_INHERITABLE_ITEM_METADATA_KEYS: readonly string[] = [
-  'noShow',
-  'returnReleased',
-  'returnRestored',
-  'returnVoidedFinal',
-  'returnLegCancelled',
-  'legActionLog',
-];
-
-/** 拆单复制行 metadata：显式剔除上面那批快照键，其余原样继承。 */
-function inheritableItemMetadata(metadata: Record<string, unknown>): Record<string, unknown> {
-  const out: Record<string, unknown> = {};
-  for (const [key, value] of Object.entries(metadata)) {
-    if (NON_INHERITABLE_ITEM_METADATA_KEYS.includes(key)) continue;
-    out[key] = value;
-  }
-  return out;
-}
-
-/** 这一行的 metadata 上带着航段会话快照吗（= 继承时会被 inheritableItemMetadata 剥掉）。 */
-function hasStrippableLegSnapshot(metadata: Record<string, unknown>): boolean {
-  return NON_INHERITABLE_ITEM_METADATA_KEYS.some((key) => metadata[key] != null);
-}
-
-/**
- * 拆单时新行的描述：**剥掉了快照就一并剥掉描述上的内部留痕前缀**。
- *
- * 描述前缀（【去程未登机】/【回程座位已释放】/【已取消回程】…）和 metadata 快照是一对：
- * 快照说「这一行在这张单上发生过什么」，前缀是同一件事的人眼版本。继承时快照被剥掉、
- * 前缀却跟着复制，新单上就会出现一行「【回程座位已释放】…」但 metadata 里什么都没有 ——
- * deriveLegStatus 判它无状态、legFlag 是 NONE、恢复回程也点不动，运营只看得到那行字，
- * 以为这段还释放着。没有快照可剥的行（普通拆单）描述原样保留，绝不误剥客户看得见的文案。
- */
-function splitInheritedDescription(description: string, metadata: Record<string, unknown>): string {
-  return hasStrippableLegSnapshot(metadata) ? stripInternalLegPrefix(description) : description;
-}
-
-/**
  * 「这一段的座位已经放回库存了」的统一人话文案（改期 / 升舱共用）。
  * 之所以不复用「只能对机票行（FLIGHT）改期」那句：它会让运营以为自己点错了行，
  * 而真实原因是这行的 flightScheduleId 被 no-show 释放 / 取消航段置空了 —— 得给出下一步怎么做。
@@ -16538,6 +16814,22 @@ export interface ReschedulePassengersResult {
 
 // ── 拆单 v1 · 模块级辅助（类型 / 加载 / 纯函数）─────────────────────────────
 
+/** 拆单执行入参（路由 schema 与两条编排路径共用同一形状）。 */
+export interface SplitOrderInput {
+  passengerIds: string[];
+  /** 显式指定某条酒店 / 套餐住宿行随拆搬走几间（0.5 网格）。 */
+  roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
+  /** 显式指定某条机票行随拆搬走几个升舱位（按航段给数，服务端按行归属）。 */
+  upgradeSplit?: Array<{ itemId: string; outboundToMove?: number; returnToMove?: number }>;
+  /**
+   * 混合房组自动劈半（no-show / 按人改期编排传 true）。手工拆单默认 false：
+   * 同房组闸照旧拒拆，让运营自己先在分房里把人分开。
+   */
+  autoSplitRoomGroups?: boolean;
+  note?: string;
+  requestToken: string;
+}
+
 /** 拆单执行/回放的统一响应形状。 */
 export interface SplitOrderResult {
   sourceOrderId: string;
@@ -16562,8 +16854,47 @@ interface SplitAssessment {
   movedPaidCny: number;
   preTotalCny: number;
   prePaidCny: number;
-  hotelItems: Array<{ itemId: string; description: string; roomsBilled: number | null }>;
+  /** 应收总额 = total + adjustmentCny（份额的分母，Σ shares 恒等于它）。 */
+  payableCny: number;
+  /** 随拆转移的售后费用（改期费/换人费等按份额分摊的那一份）。 */
+  movedAdjustmentCny: number;
+  /** 新单 total = movedShare − movedAdjustment（售后费不重复计入应收）。 */
+  targetTotalCny: number;
+  hotelItems: SplitHotelItemView[];
+  upgradeItems: SplitUpgradeItemView[];
+  /** 佣金处置：NONE=无佣金；SPLIT=按份额劈两条；BLOCKED=已进结算流程，拒拆。 */
+  commission: { mode: 'NONE' | 'SPLIT' | 'BLOCKED'; amountCny: number };
+  /** 有房组同时含拆出与留下的乘客（手工拆单 = 闸 15 拒拆；编排路径 = 自动劈半组）。 */
+  roomGroupConflict: boolean;
   movedIdSet: Set<string>;
+  /** 两侧人数/单住/自备签/升舱的解析结果（执行段直接拿去建 SplitContext）。 */
+  occupancy: {
+    movedOccupancy: SplitOccupancy;
+    keptOccupancy: SplitOccupancy;
+    movedSingleCount: number;
+    keptSingleCount: number;
+    movedSelfVisaCount: number;
+    keptSelfVisaCount: number;
+  };
+}
+
+/** 预检回给前端的酒店/套餐住宿行（运营据此填 roomSplit）。 */
+export interface SplitHotelItemView {
+  itemId: string;
+  description: string;
+  roomsBilled: number | null;
+  /** 服务端按人头派生的建议间数（前端预填；不传 roomSplit 时编排路径也用这个数）。 */
+  suggestedRoomsToMove: number | null;
+  /** true = 这是套餐行自带的住宿盖章（套餐单没有独立 HOTEL 行）。 */
+  isBundleStay: boolean;
+}
+
+/** 预检回给前端的升舱行（运营据此填 upgradeSplit）。 */
+export interface SplitUpgradeItemView {
+  itemId: string;
+  leg: 'OUTBOUND' | 'RETURN';
+  businessUpgradeCount: number;
+  suggestedToMove: number;
 }
 
 /** 拆单要读的源单快照（预检与事务内共用同一份 loader，杜绝两处字段漂移）。 */
@@ -16581,6 +16912,13 @@ async function loadOrderForSplit(db: Prisma.TransactionClient, orderId: string) 
           chineseName: true,
           pnr: true,
           eticketNumber: true,
+          // 套餐单拆分要按乘客现势重建人数快照（addOns）：
+          //   passengerType → 成人/占座儿童/不占座婴儿；singleRoom → 单住间数；
+          //   visaExempt → 自备签减免人数；gender → 分房拆组时的同性同房判断。
+          passengerType: true,
+          visaExempt: true,
+          singleRoom: true,
+          gender: true,
         },
       },
     },
@@ -16630,6 +16968,229 @@ function sumFlightQuantities(
     map.set(key, (map.get(key) ?? 0) + it.quantity);
   }
   return map;
+}
+
+/** 订单行 → 策略层认得的最小形状（Decimal / JSON 都在这里归一化，策略层只见普通数字）。 */
+function toSplitItemView(item: SplitSourceOrder['items'][number]): SplitItemView {
+  return {
+    id: item.id,
+    kind: item.kind,
+    description: item.description,
+    quantity: item.quantity,
+    unitPrice: Number(item.unitPrice),
+    amount: Number(item.amount),
+    totalCostCny: item.totalCostCny != null ? Number(item.totalCostCny) : null,
+    roomsBilled: item.roomsBilled != null ? Number(item.roomsBilled) : null,
+    passengerId: item.passengerId,
+    metadata: readJsonObject(item.metadata),
+  };
+}
+
+/** 策略层补丁 → Prisma 落库形状（数字转 Decimal；只带真正要改的列）。 */
+interface SplitPatchData {
+  description?: string;
+  quantity?: number;
+  amount?: Prisma.Decimal;
+  totalCostCny?: Prisma.Decimal | null;
+  roomsBilled?: Prisma.Decimal | null;
+  metadata?: Prisma.InputJsonValue;
+}
+function splitPatchToPrisma(patch: SplitRowPatch): SplitPatchData {
+  const data: SplitPatchData = {};
+  if (patch.description !== undefined) data.description = patch.description;
+  if (patch.quantity !== undefined) data.quantity = patch.quantity;
+  if (patch.amount !== undefined) data.amount = new Prisma.Decimal(patch.amount);
+  if (patch.totalCostCny !== undefined) {
+    data.totalCostCny = patch.totalCostCny == null ? null : new Prisma.Decimal(patch.totalCostCny);
+  }
+  if (patch.roomsBilled !== undefined) {
+    data.roomsBilled = patch.roomsBilled == null ? null : new Prisma.Decimal(patch.roomsBilled);
+  }
+  if (patch.metadata !== undefined) data.metadata = patch.metadata as Prisma.InputJsonValue;
+  return data;
+}
+
+/** 守恒断言用的行形状（拆前读 loadOrderForSplit、拆后读两单 findMany，字段一致）。 */
+interface SplitConservationRow {
+  kind: OrderItemKind;
+  flightScheduleId?: string | null;
+  flightCabin?: import('@prisma/client').CabinClass | null;
+  quantity?: number;
+  metadata?: unknown;
+  roomsBilled?: Prisma.Decimal | number | null;
+  totalCostCny?: Prisma.Decimal | number | null;
+}
+
+/**
+ * 逐班次舱位的**升舱位**账：key = `${scheduleId}|${cabin}` → Σ min(升舱人数, 该行座位数)。
+ * 升舱位对应的是真实商务舱库存，拆单一旦把它放大就等于凭空占了商务舱座。
+ */
+function sumFlightUpgradeCounts(items: ReadonlyArray<SplitConservationRow>): Map<string, number> {
+  const map = new Map<string, number>();
+  for (const it of items) {
+    if (it.kind !== OrderItemKind.FLIGHT || !it.flightScheduleId) continue;
+    const count = readUpgradeCount(readJsonObject(it.metadata));
+    if (count <= 0) continue;
+    const key = `${it.flightScheduleId}|${it.flightCabin ?? 'NONE'}`;
+    map.set(key, (map.get(key) ?? 0) + Math.min(count, it.quantity ?? 0));
+  }
+  return map;
+}
+
+/** Σ roomsBilled（以「半间」为整数单位，避免 0.5 的浮点尾数）。 */
+function sumRoomsBilledHalves(items: ReadonlyArray<SplitConservationRow>): number {
+  return items.reduce(
+    (sum, it) => sum + (it.roomsBilled == null ? 0 : Math.round(Number(it.roomsBilled) * 2)),
+    0,
+  );
+}
+
+/** Σ totalCostCny（以「分」为整数单位）。 */
+function sumTotalCostCents(items: ReadonlyArray<SplitConservationRow>): number {
+  return items.reduce(
+    (sum, it) => sum + (it.totalCostCny == null ? 0 : Math.round(Number(it.totalCostCny) * 100)),
+    0,
+  );
+}
+
+/** 佣金劈分的审计明细（事务外写 CRITICAL 审计用）。 */
+export interface SplitCommissionAudit {
+  commissionId: string;
+  agentId: string;
+  beforeAmountCny: number;
+  keptAmountCny: number;
+  movedAmountCny: number;
+  movedCommissionId: string | null;
+  rate: number;
+  chainDepth: number;
+}
+
+/** 两侧人数解析结果（assessOrderSplit 产出，执行段与预检建议共用）。 */
+interface SplitOccupancyPair {
+  movedOccupancy: SplitOccupancy;
+  keptOccupancy: SplitOccupancy;
+  movedSingleCount: number;
+  keptSingleCount: number;
+  movedSelfVisaCount: number;
+  keptSelfVisaCount: number;
+}
+
+/**
+ * 「建议值」用的上下文：无任何显式指令、允许自动派生。预检回显的 suggestedRoomsToMove /
+ * suggestedToMove 与编排路径（不传 roomSplit/upgradeSplit）实际落库的数**同一函数算出来**，
+ * 不存在「预检显示 0.5、执行搬了 1」的漂移。
+ */
+function buildSplitSuggestionContext(input: {
+  movedIdSet: Set<string>;
+  totalPax: number;
+  occupancy: SplitOccupancyPair;
+}): SplitContext {
+  return buildSplitContext({
+    ...input,
+    roomSplitByItem: new Map(),
+    upgradeSplitByItem: new Map(),
+    autoDeriveRooms: true,
+    movedUpgradeOutbound: 0,
+    movedUpgradeReturn: 0,
+    keptUpgradeOutbound: 0,
+    keptUpgradeReturn: 0,
+  });
+}
+
+/** 拆单上下文装配（唯一入口，保证预检与执行看到同一套人数口径）。 */
+function buildSplitContext(input: {
+  movedIdSet: Set<string>;
+  totalPax: number;
+  occupancy: SplitOccupancyPair;
+  roomSplitByItem: Map<string, number>;
+  upgradeSplitByItem: Map<string, number>;
+  autoDeriveRooms: boolean;
+  movedUpgradeOutbound: number;
+  movedUpgradeReturn: number;
+  keptUpgradeOutbound: number;
+  keptUpgradeReturn: number;
+}): SplitContext {
+  const { occupancy } = input;
+  return {
+    movedIdSet: input.movedIdSet,
+    k: input.movedIdSet.size,
+    totalPax: input.totalPax,
+    movedSeatPax: occupancy.movedOccupancy.seatPax,
+    totalSeatPax: occupancy.movedOccupancy.seatPax + occupancy.keptOccupancy.seatPax,
+    movedOccupancy: occupancy.movedOccupancy,
+    keptOccupancy: occupancy.keptOccupancy,
+    movedSingleCount: occupancy.movedSingleCount,
+    keptSingleCount: occupancy.keptSingleCount,
+    movedSelfVisaCount: occupancy.movedSelfVisaCount,
+    keptSelfVisaCount: occupancy.keptSelfVisaCount,
+    roomSplitByItem: input.roomSplitByItem,
+    upgradeSplitByItem: input.upgradeSplitByItem,
+    movedUpgradeOutbound: input.movedUpgradeOutbound,
+    movedUpgradeReturn: input.movedUpgradeReturn,
+    keptUpgradeOutbound: input.keptUpgradeOutbound,
+    keptUpgradeReturn: input.keptUpgradeReturn,
+    autoDeriveRooms: input.autoDeriveRooms,
+  };
+}
+
+/**
+ * 带升舱位的机票行清单（预检回显 + 分程归属）。
+ *
+ * 航段归属按 **items 数组顺序**：第一条 FLIGHT 行 = 去程、其余 = 回程 —— 与套餐升舱占座
+ * 落库时的分配口径（「第一条经济舱航段 = 去程」）同源，单笔录单 / 前台商城 / 批量建单
+ * 三条派生路径都是去程行在前。这里不查班次表：拆单的 loader 不带 flightSchedule 关联，
+ * 而 no-show 释放过的行 flightScheduleId 已置空，按时刻反推反而会认错行。
+ */
+function collectSplitUpgradeItems(
+  items: SplitSourceOrder['items'],
+  ctx: SplitContext,
+): SplitUpgradeItemView[] {
+  const flightRows = items.filter((it) => it.kind === OrderItemKind.FLIGHT);
+  const out: SplitUpgradeItemView[] = [];
+  flightRows.forEach((item, index) => {
+    const view = toSplitItemView(item);
+    const count = readUpgradeCount(view.metadata);
+    if (count <= 0) return;
+    const moveQty = Math.min(view.quantity, ctx.k);
+    const keepQty = view.quantity - moveQty;
+    out.push({
+      itemId: view.id,
+      leg: index === 0 ? 'OUTBOUND' : 'RETURN',
+      businessUpgradeCount: count,
+      suggestedToMove: resolveUpgradeToMove(view, ctx, moveQty, keepQty),
+    });
+  });
+  return out;
+}
+
+/**
+ * 混合房组自动劈半（仅 no-show / 按人改期编排路径）：一个房组同时含拆出与留下的乘客时，
+ * 按人头把它劈成两个房组 —— 同酒店、同房型、同日期，各自 roomFraction 按 0.5 网格分，
+ * 两组之和恒等于原组（房控把两个半间配回一间，房量分毫不动）。
+ *
+ * 返回 { kept, moved }：留守组进源单分房表、拆出组进新单分房表。
+ */
+function splitMixedRoomGroup(
+  group: { raw: Record<string, unknown>; passengerIds: string[] },
+  movedIdSet: ReadonlySet<string>,
+): { kept: Record<string, unknown>; moved: Record<string, unknown> } {
+  const movedIds = group.passengerIds.filter((id) => movedIdSet.has(id));
+  const keptIds = group.passengerIds.filter((id) => !movedIdSet.has(id));
+  const rawFraction = group.raw.roomFraction == null ? 1 : Number(group.raw.roomFraction);
+  const srcHalf = Math.max(1, Math.round((Number.isFinite(rawFraction) ? rawFraction : 1) * 2));
+  let movedHalf = Math.round((srcHalf * movedIds.length) / group.passengerIds.length);
+  movedHalf = Math.min(Math.max(movedHalf, 1), Math.max(1, srcHalf - 1));
+  const keptHalf = srcHalf - movedHalf;
+  const baseId = typeof group.raw.id === 'string' && group.raw.id ? group.raw.id : 'group';
+  return {
+    kept: { ...group.raw, passengerIds: keptIds, roomFraction: keptHalf / 2 },
+    moved: {
+      ...group.raw,
+      id: `${baseId}-split`,
+      passengerIds: movedIds,
+      roomFraction: movedHalf / 2,
+    },
+  };
 }
 
 /**

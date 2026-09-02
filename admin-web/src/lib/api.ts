@@ -3523,8 +3523,38 @@ export interface SplitOrderPreviewResult {
   movedShareCny: number;
   /** 将转移到新单的已收（= min(movedShare, 已收 − 已完成退款)） */
   movedPaidCny: number;
-  /** 本单酒店行（供运营填「随拆搬走的间数」；可全 0 = 酒店全留原单） */
-  hotelItems: Array<{ itemId: string; description: string; roomsBilled: number | null }>;
+  /**
+   * 本单住宿行（供运营填「随拆搬走的间数」；可全 0 = 住宿全留原单）。
+   * 含单订酒店行（kind='HOTEL'）与盖了住宿的套餐行（kind='BUNDLE'，description 带「套餐住宿 · 」前缀）。
+   * suggestedRoomsToMove = 服务端按拆出人数算的建议间数（0.5 网格），运营可改。
+   * 两个字段都可选：老后端不返回时，UI 退回「无 kind 标、默认留空」的旧行为。
+   */
+  hotelItems: Array<{
+    itemId: string;
+    description: string;
+    roomsBilled: number | null;
+    kind?: 'HOTEL' | 'BUNDLE';
+    /** 服务端标记：true = 盖了住宿的套餐行（与 kind==='BUNDLE' 同义，两者认其一即可）。 */
+    isBundleStay?: boolean;
+    suggestedRoomsToMove?: number;
+  }>;
+  /**
+   * 本单商务舱升舱行（按航段一条）；非空时让运营填「随拆走的升舱人数」。
+   * suggestedToMove = 服务端建议份数，上限为该段升舱份数与拆出占座人数的较小值。
+   */
+  upgradeItems?: Array<{
+    itemId: string;
+    leg: FlightLegSide;
+    businessUpgradeCount: number;
+    suggestedToMove: number;
+  }>;
+  /**
+   * 本单佣金处置口径：NONE = 无佣金无需处理；SPLIT = 已计提未结算，按份额分到两张单；
+   * BLOCKED = 佣金状态不允许拆（blockers 里也会有对应人话）。
+   */
+  commission?: { mode: 'NONE' | 'SPLIT' | 'BLOCKED'; amountCny: number };
+  /** true = 拆出的人与留守的人同在一个房组，须先分房，或勾「自动劈房组」由服务端按人劈开 */
+  roomGroupConflict?: boolean;
 }
 
 export interface SplitOrderExecResult {
@@ -4981,7 +5011,11 @@ export const api = {
     }),
 
   // 拆单预检（ADMIN/STAFF；只读）：跑全部准入闸 + 每人份额计算。blockers 非空时禁提交。
-  splitOrderPreview: (token: string, orderId: string, body: { passengerIds: string[] }) =>
+  splitOrderPreview: (
+    token: string,
+    orderId: string,
+    body: { passengerIds: string[]; autoSplitRoomGroups?: boolean },
+  ) =>
     apiFetch<SplitOrderPreviewResult>(`/orders/${orderId}/split-preview`, {
       method: 'POST',
       token,
@@ -4997,16 +5031,22 @@ export const api = {
     orderId: string,
     body: {
       passengerIds: string[];
+      /** 随拆搬走的住宿间数（0.5 网格）；itemId 可以是单订酒店行，也可以是盖了住宿的套餐行 */
       roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
+      /** 随拆走的商务舱升舱份数（按航段分别给，整数） */
+      upgradeSplit?: Array<{ itemId: string; outboundToMove: number; returnToMove: number }>;
+      /** true = 同房组里既有拆出的人又有留守的人时，由服务端按人劈成两个半组 */
+      autoSplitRoomGroups?: boolean;
       note?: string;
       requestToken: string;
     },
   ) =>
     apiFetch<SplitOrderExecResult>(`/orders/${orderId}/split`, { method: 'POST', token, body }),
 
-  // 按房组拆分酒店行（ADMIN/STAFF）：把分房表里的一个房组从某条 HOTEL 行拆成独立 0 元行
+  // 按房组拆分住宿行（ADMIN/STAFF）：把分房表里的一个房组从某条住宿行拆成独立 0 元行
   // （「按房组换酒店」的前置步骤——拆完对新行走现成换酒店）。钱不动：新行 0 元、源行金额冻结，
-  // 订单总额恒等；库存对称：源行/新行 roomsBilled 此消彼长，Σ 恒等。BUNDLE 行后端会拒（400）。
+  // 订单总额恒等；库存对称：源行/新行 roomsBilled 此消彼长，Σ 恒等。
+  // 单订酒店行与盖了住宿的套餐行都可拆。
   splitRoomGroup: (
     token: string,
     orderId: string,

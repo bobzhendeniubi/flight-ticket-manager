@@ -33,7 +33,13 @@ const { mockPrisma } = vi.hoisted(() => ({
     passenger: { updateMany: vi.fn(), findMany: vi.fn() },
     payment: { findMany: vi.fn(), create: vi.fn() },
     refund: { count: vi.fn(), aggregate: vi.fn() },
-    commissionRecord: { aggregate: vi.fn() },
+    commissionRecord: {
+      aggregate: vi.fn(),
+      findMany: vi.fn(),
+      create: vi.fn(),
+      update: vi.fn(),
+    },
+    bundleChangeRequest: { count: vi.fn() },
     fulfillmentTask: {
       count: vi.fn(),
       create: vi.fn(),
@@ -137,6 +143,8 @@ const baseOrder = (over: Record<string, unknown> = {}) => ({
 /** 准入闸相关查询全部给「干净」返回（无佣金/无退款/无出票任务/无已完成退款）。 */
 const armCleanGates = () => {
   mockPrisma.commissionRecord.aggregate.mockResolvedValue({ _sum: { amount: null } });
+  mockPrisma.commissionRecord.findMany.mockResolvedValue([]);
+  mockPrisma.bundleChangeRequest.count.mockResolvedValue(0);
   mockPrisma.refund.count.mockResolvedValue(0);
   mockPrisma.fulfillmentTask.count.mockResolvedValue(0);
   mockPrisma.refund.aggregate.mockResolvedValue({ _sum: { amount: null } });
@@ -197,14 +205,18 @@ describe('拆单 · 准入闸矩阵（preview 返回人话 blocker）', () => {
     expect(r.blockers.join()).toContain('仅占座中的有效订单可拆');
   });
 
-  it('结算价锁', async () => {
+  it('结算价锁（闸 4 已放开）→ 不拦，提示锁跟随到新单', async () => {
     const r = await previewWith({ settlementLocked: true });
-    expect(r.blockers.join()).toContain('结算价已锁定');
+    expect(r.eligible).toBe(true);
+    expect(r.blockers).toEqual([]);
+    expect(r.warnings.join()).toContain('继承同样的锁');
   });
 
-  it('收款复核锁', async () => {
+  it('收款复核锁（闸 5 已放开）→ 不拦，提示锁跟随到新单', async () => {
     const r = await previewWith({ paymentsLocked: true });
-    expect(r.blockers.join()).toContain('收款已复核锁定');
+    expect(r.eligible).toBe(true);
+    expect(r.blockers).toEqual([]);
+    expect(r.warnings.join()).toContain('继承同样的锁');
   });
 
   it.each(['outboundInvoiced', 'returnInvoiced', 'systemInvoiced'] as const)(
@@ -217,12 +229,39 @@ describe('拆单 · 准入闸矩阵（preview 返回人话 blocker）', () => {
     },
   );
 
-  it('已计提佣金', async () => {
+  it('已计提佣金（ACCRUED 未进结算）→ 不拦，按份额劈两条', async () => {
     armCleanGates();
-    mockPrisma.commissionRecord.aggregate.mockResolvedValue({ _sum: { amount: 88 } });
+    mockPrisma.commissionRecord.findMany.mockResolvedValue([
+      { id: 'c1', amount: 88, status: 'ACCRUED', settlementId: null },
+    ]);
     mockPrisma.order.findUnique.mockResolvedValue(baseOrder());
     const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
-    expect(r.blockers.join()).toContain('佣金');
+    expect(r.eligible).toBe(true);
+    expect(r.commission).toEqual({ mode: 'SPLIT', amountCny: 88 });
+    expect(r.warnings.join()).toContain('劈成两条');
+  });
+
+  it('佣金已进结算流程（SETTLEMENT_REQUESTED）→ 拒拆', async () => {
+    armCleanGates();
+    mockPrisma.commissionRecord.findMany.mockResolvedValue([
+      { id: 'c1', amount: 88, status: 'SETTLEMENT_REQUESTED', settlementId: null },
+    ]);
+    mockPrisma.order.findUnique.mockResolvedValue(baseOrder());
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
+    expect(r.eligible).toBe(false);
+    expect(r.commission.mode).toBe('BLOCKED');
+    expect(r.blockers.join()).toContain('本单佣金已进结算流程，请财务先处理后再拆');
+  });
+
+  it('佣金 ACCRUED 但已挂结算单 id → 同样拒拆', async () => {
+    armCleanGates();
+    mockPrisma.commissionRecord.findMany.mockResolvedValue([
+      { id: 'c1', amount: 88, status: 'ACCRUED', settlementId: 'st-1' },
+    ]);
+    mockPrisma.order.findUnique.mockResolvedValue(baseOrder());
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
+    expect(r.eligible).toBe(false);
+    expect(r.commission.mode).toBe('BLOCKED');
   });
 
   it('进行中退款', async () => {
@@ -233,23 +272,76 @@ describe('拆单 · 准入闸矩阵（preview 返回人话 blocker）', () => {
     expect(r.blockers.join()).toContain('退款');
   });
 
-  it('售后费用未结清（adjustmentCny ≠ 0）', async () => {
+  it('售后费用（闸 9 已放开）→ 不拦，按份额分摊', async () => {
     const r = await previewWith({ adjustmentCny: 200 });
-    expect(r.blockers.join()).toContain('售后费用');
+    expect(r.eligible).toBe(true);
+    expect(r.warnings.join()).toContain('按两侧份额分摊');
+    // 应收 2000 + 200 = 2200，两人各 1100 → 拆出 1 人带走一半售后费。
+    expect(r.movedShareCny).toBe(1100);
+    expect(r.movedAdjustmentCny).toBe(100);
   });
 
-  it('套餐单', async () => {
+  it('套餐单（闸 10 已放开）→ 可拆，住宿盖章行带「套餐住宿 ·」前缀回显', async () => {
     const r = await previewWith({
-      items: [flightItem(), flightItem({ id: 'ib', kind: 'BUNDLE', flightScheduleId: null })],
+      items: [
+        flightItem(),
+        flightItem({
+          id: 'ib',
+          kind: 'BUNDLE',
+          description: '海岛 5 日套餐',
+          quantity: 1,
+          flightScheduleId: null,
+          flightCabin: null,
+          roomsBilled: 1,
+        }),
+      ],
     });
-    expect(r.blockers.join()).toContain('套餐订单暂不支持拆单');
+    expect(r.eligible).toBe(true);
+    expect(r.blockers).toEqual([]);
+    expect(r.hotelItems).toEqual([
+      {
+        itemId: 'ib',
+        description: '套餐住宿 · 海岛 5 日套餐',
+        roomsBilled: 1,
+        suggestedRoomsToMove: 0.5,
+        isBundleStay: true,
+      },
+    ]);
   });
 
-  it('升舱行', async () => {
+  it('多条套餐行 → 拒拆（拆哪一张无从判定，与改档同口径）', async () => {
+    const r = await previewWith({
+      items: [
+        flightItem({ id: 'ib1', kind: 'BUNDLE', flightScheduleId: null }),
+        flightItem({ id: 'ib2', kind: 'BUNDLE', flightScheduleId: null }),
+      ],
+    });
+    expect(r.eligible).toBe(false);
+    expect(r.blockers.join()).toContain('多条套餐行');
+  });
+
+  it('有待确认的套餐改档申请 → 拒拆', async () => {
+    armCleanGates();
+    mockPrisma.bundleChangeRequest.count.mockResolvedValue(1);
+    mockPrisma.order.findUnique.mockResolvedValue(
+      baseOrder({
+        items: [flightItem({ id: 'ib', kind: 'BUNDLE', flightScheduleId: null })],
+      }),
+    );
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
+    expect(r.eligible).toBe(false);
+    expect(r.blockers.join()).toContain('待确认的套餐改档申请');
+  });
+
+  it('升舱行（闸 11 已放开）→ 可拆，回显每程升舱位与建议搬走数', async () => {
     const r = await previewWith({
       items: [flightItem({ metadata: { businessUpgradeCount: 1 } })],
     });
-    expect(r.blockers.join()).toContain('升舱');
+    expect(r.eligible).toBe(true);
+    expect(r.blockers).toEqual([]);
+    expect(r.upgradeItems).toEqual([
+      { itemId: 'i1', leg: 'OUTBOUND', businessUpgradeCount: 1, suggestedToMove: 1 },
+    ]);
   });
 
   it('回程座位当前处于「已释放」态 → 拒拆（释放快照与两侧人数必然对不上）', async () => {
@@ -348,7 +440,7 @@ describe('拆单 · 准入闸矩阵（preview 返回人话 blocker）', () => {
     expect(r.blockers.join()).toContain('不属于本订单');
   });
 
-  it('同房组同时含拆出与留下 → 拒绝', async () => {
+  it('同房组同时含拆出与留下 → 手工拆单拒绝', async () => {
     const r = await previewWith({
       roomAssignment: {
         roomGroups: [
@@ -357,6 +449,28 @@ describe('拆单 · 准入闸矩阵（preview 返回人话 blocker）', () => {
       },
     });
     expect(r.blockers.join()).toContain('房组');
+    expect(r.roomGroupConflict).toBe(true);
+  });
+
+  it('同房组混合 + autoSplitRoomGroups → 不拦（编排路径自动劈半组）', async () => {
+    armCleanGates();
+    mockPrisma.order.findUnique.mockResolvedValue(
+      baseOrder({
+        roomAssignment: {
+          roomGroups: [
+            { id: 'g1', hotelName: '测试酒店', roomType: '双床', passengerIds: ['p1', 'p2'] },
+          ],
+        },
+      }),
+    );
+    const r = await service.previewOrderSplit(
+      'o1',
+      { passengerIds: ['p1'], autoSplitRoomGroups: true },
+      admin,
+    );
+    expect(r.eligible).toBe(true);
+    expect(r.blockers).toEqual([]);
+    expect(r.roomGroupConflict).toBe(true);
   });
 
   it('全闸通过：eligible + 份额/已收/酒店行', async () => {
@@ -386,7 +500,13 @@ describe('拆单 · 准入闸矩阵（preview 返回人话 blocker）', () => {
     expect(r.movedShareCny).toBe(1000);
     expect(r.movedPaidCny).toBe(500); // min(份额 1000, 已收 500)
     expect(r.hotelItems).toEqual([
-      { itemId: 'ih', description: '测试酒店 双床房', roomsBilled: 1 },
+      {
+        itemId: 'ih',
+        description: '测试酒店 双床房',
+        roomsBilled: 1,
+        suggestedRoomsToMove: 0.5,
+        isBundleStay: false,
+      },
     ]);
   });
 });
@@ -398,6 +518,7 @@ describe('拆单 · 准入闸矩阵（preview 返回人话 blocker）', () => {
 interface FinalOrderShape {
   total: number;
   paidAmount: number;
+  adjustmentCny?: number;
   outboundInvoiced?: boolean;
   returnInvoiced?: boolean;
   systemInvoiced?: boolean;
@@ -417,6 +538,9 @@ interface ExecuteArmOptions {
     flightScheduleId: string | null;
     flightCabin: string | null;
     quantity: number;
+    metadata?: unknown;
+    roomsBilled?: number | null;
+    totalCostCny?: number | null;
   }>;
   /** 源单拆分行上已存在的出票任务（出票任务镜像用；缺省=源行没有出票任务） */
   sourceTicketingTasks?: Array<Record<string, unknown>>;
@@ -426,6 +550,7 @@ interface ExecuteArmOptions {
 const finalOrderRow = (shape: FinalOrderShape) => ({
   total: shape.total,
   paidAmount: shape.paidAmount,
+  adjustmentCny: shape.adjustmentCny ?? 0,
   outboundInvoiced: shape.outboundInvoiced ?? false,
   returnInvoiced: shape.returnInvoiced ?? false,
   systemInvoiced: shape.systemInvoiced ?? false,
@@ -483,11 +608,27 @@ const armExecute = (opts: ExecuteArmOptions) => {
   mockPrisma.orderItem.findMany.mockImplementation(async (args: any) => {
     const where = args?.where ?? {};
     if (where.orderId?.in) {
-      // 守恒断言：两单的 FLIGHT 行
+      // 守恒断言：两单的全部订单行（座位 / 升舱位 / 房数 / 成本四维）
       return (
         opts.conservationRows ?? [
-          { kind: 'FLIGHT', flightScheduleId: 'sch1', flightCabin: 'ECONOMY', quantity: 1 },
-          { kind: 'FLIGHT', flightScheduleId: 'sch1', flightCabin: 'ECONOMY', quantity: 1 },
+          {
+            kind: 'FLIGHT',
+            flightScheduleId: 'sch1',
+            flightCabin: 'ECONOMY',
+            quantity: 1,
+            metadata: null,
+            roomsBilled: null,
+            totalCostCny: 600,
+          },
+          {
+            kind: 'FLIGHT',
+            flightScheduleId: 'sch1',
+            flightCabin: 'ECONOMY',
+            quantity: 1,
+            metadata: null,
+            roomsBilled: null,
+            totalCostCny: 600,
+          },
         ]
       );
     }
@@ -592,10 +733,10 @@ describe('拆单 · 执行（纯机票 2 人拆 1 人）', () => {
     expect(Number(srcUpdate.data.paidAmount)).toBe(0);
     expect(Number(tgtUpdate.data.total)).toBe(1000);
     expect(Number(tgtUpdate.data.paidAmount)).toBe(500);
-    // 源单留同状态自转事件；SPLIT_OUT/SPLIT_IN 流水仅记录（不写 adjustmentCny）
+    // 源单留同状态自转事件；本单无售后费 → 两侧 adjustmentCny 都收敛到 0（Σ 恒等）
     expect(srcUpdate.data.statusEvents.create.toStatus).toBe('PENDING_PAYMENT');
-    expect(srcUpdate.data.adjustmentCny).toBeUndefined();
-    expect(tgtUpdate.data.adjustmentCny).toBeUndefined();
+    expect(srcUpdate.data.adjustmentCny).toBe(0);
+    expect(tgtUpdate.data.adjustmentCny).toBe(0);
     expect(srcUpdate.data.adjustments[0]).toMatchObject({ type: 'SPLIT_OUT', amountCny: -1000 });
     expect(tgtUpdate.data.adjustments[0]).toMatchObject({ type: 'SPLIT_IN', amountCny: 1000 });
 
@@ -760,9 +901,9 @@ describe('拆单 · 执行（纯机票 2 人拆 1 人）', () => {
     expect(paymentsSum).toBeLessThanOrEqual(currentPaid);
   });
 
-  it('执行前重跑准入闸：锁内发现结算价已锁 → BadRequestError，不建新单', async () => {
+  it('执行前重跑准入闸：锁内发现单已进回收站 → BadRequestError，不建新单', async () => {
     armExecute({
-      order: baseOrder({ settlementLocked: true }),
+      order: baseOrder({ deletedAt: new Date() }),
       targetItemsSum: 0,
       sourceItemsSum: 0,
       finalSource: { total: 0, paidAmount: 0 },
@@ -1173,9 +1314,17 @@ describe('拆单 · 不继承 no-show / 释放 / 取消航段快照', () => {
       sourceItemsSum: 1000,
       finalSource: { total: 1000, paidAmount: 0 },
       finalTarget: { total: 1000, paidAmount: 500 },
-      // 整行过户：这一行 1 座整体搬到新单，两单合计仍是 1 座（守恒）。
+      // 整行过户：这一行 1 座整体搬到新单，两单合计仍是 1 座、成本仍是 ¥1200（守恒）。
       conservationRows: [
-        { kind: 'FLIGHT', flightScheduleId: 'sch1', flightCabin: 'ECONOMY', quantity: 1 },
+        {
+          kind: 'FLIGHT',
+          flightScheduleId: 'sch1',
+          flightCabin: 'ECONOMY',
+          quantity: 1,
+          metadata: null,
+          roomsBilled: null,
+          totalCostCny: 1200,
+        },
       ],
     });
 

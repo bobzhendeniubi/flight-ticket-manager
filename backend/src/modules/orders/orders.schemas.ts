@@ -1390,11 +1390,15 @@ export type AddGroundItemBody = z.infer<typeof addGroundItemBodySchema>;
 // roomSplit 只传间数（0.5 网格），金额由服务端按间数比例权威拆分 —— 前端不传任何金额。
 export const splitOrderPreviewBodySchema = z.object({
   passengerIds: z.array(z.string().min(1)).min(1, '至少选择 1 位乘客').max(99),
+  // 与执行体同名同义：勾上它预检就按「混合房组自动劈半」的口径评估（no-show / 按人改期弹窗用），
+  // 不勾则同房组闸照旧作为 blocker 回给运营。
+  autoSplitRoomGroups: z.boolean().optional(),
 });
 export type SplitOrderPreviewBody = z.infer<typeof splitOrderPreviewBodySchema>;
 
 export const splitOrderBodySchema = z.object({
   passengerIds: z.array(z.string().min(1)).min(1, '至少选择 1 位乘客').max(99),
+  // 酒店行**与套餐住宿行**都收（套餐单没有独立 HOTEL 行，住宿盖章就在套餐行上）。
   roomSplit: z
     .array(
       z.object({
@@ -1407,6 +1411,21 @@ export const splitOrderBodySchema = z.object({
     )
     .max(50)
     .optional(),
+  // 升舱位随拆搬走几个（按航段给数，服务端按「第一条机票行=去程」归到具体行）。
+  // 不传 = 按占座人头自动派生；两侧都不能记比自己座位还多的升舱位（服务端校验）。
+  upgradeSplit: z
+    .array(
+      z.object({
+        itemId: z.string().min(1, 'itemId 必填'),
+        outboundToMove: z.number().int().min(0).max(99).optional(),
+        returnToMove: z.number().int().min(0).max(99).optional(),
+      }),
+    )
+    .max(10)
+    .optional(),
+  // 混合房组（一半走一半留）自动劈成两个半组：no-show / 按人改期编排传 true。
+  // 手工拆单默认 false —— 同房组闸照旧拒拆，让运营自己先在分房里把人分开。
+  autoSplitRoomGroups: z.boolean().optional(),
   note: z.string().max(200).optional(),
   // 与占位单转正同款幂等键口径（uuid）：同 (源单, token) 重试只回放既有结果。
   requestToken: z.string().min(8).max(64).uuid(),

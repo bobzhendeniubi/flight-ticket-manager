@@ -2,7 +2,7 @@
  * 按房组拆分酒店行（split-room-group）· 服务级单测（vitest，mock Prisma，不依赖真 DB）
  *
  * 覆盖：
- *   1. 守卫矩阵：权限 / 死单 / 回收站 / BUNDLE 行拒拆（引导先补录酒店行）/ 非酒店行 /
+ *   1. 守卫矩阵：权限 / 死单 / 回收站 / 非住宿行（FLIGHT）/
  *      无分房表 / 房组不存在 / 已归属其它行 / 拆满-拆超-源行无房数 —— 全部拒绝且分毫不写。
  *   2. 成功路径：新行 0 元（拆行只拆库存归属不拆应收）、roomsBilled 与 totalCostCny
  *      按 0.5 网格/间数比例拆分且 Σ 守恒、metadata 打标、idempotencyKey 置空。
@@ -189,19 +189,21 @@ describe('splitHotelItemByRoomGroup · 守卫矩阵（全部拒绝且分毫不�
     expect(tx.orderItem.create).not.toHaveBeenCalled();
   });
 
-  it('BUNDLE 行 → 400，文案引导「先经补录房费加独立酒店行」', async () => {
-    const { tx } = mountSplit({ item: { kind: OrderItemKind.BUNDLE } });
-    await expect(
-      service.splitHotelItemByRoomGroup('ord-1', 'item-1', BODY, ADMIN),
-    ).rejects.toThrow(/补录房费/);
-    expect(tx.orderItem.create).not.toHaveBeenCalled();
+  it('BUNDLE 行（0902 放开）→ 照拆：新行落 kind=HOTEL、0 元、带走 0.5 间', async () => {
+    const { tx, state } = mountSplit({ item: { kind: OrderItemKind.BUNDLE } });
+    await service.splitHotelItemByRoomGroup('ord-1', 'item-1', BODY, ADMIN).catch(() => undefined);
+    expect(tx.orderItem.create).toHaveBeenCalledTimes(1);
+    // 新行不是第二条 BUNDLE 行（那会让改档与拆单的套餐行数闸一起失灵），而是一条住宿行。
+    expect(state.created?.kind).toBe(OrderItemKind.HOTEL);
+    expect(Number(state.created?.amount)).toBe(0);
+    expect(Number(state.created?.roomsBilled)).toBe(0.5);
   });
 
-  it('非酒店行（FLIGHT）→ 400', async () => {
+  it('非住宿行（FLIGHT）→ 400', async () => {
     const { tx } = mountSplit({ item: { kind: OrderItemKind.FLIGHT } });
     await expect(
       service.splitHotelItemByRoomGroup('ord-1', 'item-1', BODY, ADMIN),
-    ).rejects.toThrow(/不是酒店行/);
+    ).rejects.toThrow(/不是住宿行/);
     expect(tx.orderItem.create).not.toHaveBeenCalled();
   });
 
