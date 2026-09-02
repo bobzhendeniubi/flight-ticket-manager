@@ -8,6 +8,7 @@
  *   DELETE /hotel-control/block-periods/:id        删周期
  *   GET    /hotel-control/board?from&to            销控板（按酒店×日期：切/占/余）
  *   GET    /hotel-control/forward?from&to          远期视图（按日期跨酒店合计）
+ *   GET    /hotel-control/random-tier-shortfall?from&to  每日加房清单（随机档缺口）
  *   GET    /hotel-control/alerts?days=14           提醒线（超卖加房/富余退房/班次超员）
  *   GET    /hotel-control/recent-changes?days=7    近期用房变更（读审计流：调整分房/换酒店/补房差）
  *   GET    /hotel-control/occupants?hotelId|randomStarTier&date  占房下钻（某酒店/某星级随机池某晚，谁占的）
@@ -39,6 +40,7 @@ import {
   nightlyRemainingQuerySchema,
   occupantsQuerySchema,
   recentChangesQuerySchema,
+  randomTierShortfallQuerySchema,
   updateBlockPeriodBodySchema,
 } from './hotel-control.schemas.js';
 import {
@@ -58,6 +60,7 @@ import {
   HOTEL_OVERSELL_CAP_MAX,
   HOTEL_OVERSELL_CAP_SETTING_KEY,
 } from './hotel-control.service.js';
+import { getRandomTierShortfall } from './hotel-control.shortfall.js';
 import { z } from 'zod';
 import { prisma } from '../../db/prisma.js';
 import { AuditSeverity } from '@prisma/client';
@@ -135,6 +138,12 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
   app.get('/forward', requireStaff, async (req) => {
     const q = boardQuerySchema.parse(req.query);
     return getForward(q);
+  });
+
+  // ── 每日加房清单（随机档缺口；与销控矩阵共用 getRandomTierAggregate）──────
+  app.get('/random-tier-shortfall', requireStaff, async (req) => {
+    const q = randomTierShortfallQuerySchema.parse(req.query);
+    return getRandomTierShortfall(q.from, q.to);
   });
 
   // ── 提醒线（按需计算，无 cron）────────────────────────────────────────

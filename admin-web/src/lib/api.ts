@@ -2825,6 +2825,30 @@ export interface HotelControlForward {
   remaining: number[]; // held - occupied（余房）
 }
 
+/** GET /hotel-control/random-tier-shortfall — 每日加房清单（随机档缺口） */
+export interface RandomTierShortfallTier {
+  tier: RandomStarTier;
+  label: string;
+  hasBlock: boolean;
+  block: number;
+  hotelUsed: number;
+  pendingUsed: number;
+  remaining: number;
+  shortfall: number;
+  roomsToRequest: number;
+}
+
+export interface RandomTierShortfallDay {
+  date: string;
+  tiers: RandomTierShortfallTier[];
+}
+
+export interface RandomTierShortfall {
+  from: string;
+  to: string;
+  days: RandomTierShortfallDay[];
+}
+
 /** GET /hotel-control/alerts — 提醒线（超卖加房 / 富余退房 / 班次超开票上限） */
 export interface HotelControlAlerts {
   /** 余量 < 0：占房超过包房，提醒加房 */
@@ -5356,6 +5380,11 @@ export const api = {
     apiFetch<HotelControlForward>(
       `/hotel-control/forward?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
       { token },
+    ),
+  getRandomTierShortfall: (token: string, from: string, to: string, signal?: AbortSignal) =>
+    apiFetch<RandomTierShortfall>(
+      `/hotel-control/random-tier-shortfall?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+      { token, signal },
     ),
   // 提醒线（超卖加房 / 富余退房 / 班次超开票上限；按需计算，无 cron）
   getHotelAlerts: (token: string, days = 14) =>

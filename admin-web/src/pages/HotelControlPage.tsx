@@ -38,6 +38,7 @@ import { HotelSwapModal } from '../components/HotelSwapModal';
 import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
 import { useConfirm } from '../components/ConfirmDialog';
 import { useDialogA11y } from '../components/Modal';
+import { RandomTierShortfallPanel } from './hotel-control/RandomTierShortfallPanel';
 
 // ── helpers ────────────────────────────────────────────────────────────────
 function todayStr(): string {
@@ -237,6 +238,9 @@ export function HotelControlPage() {
 
       {/* ── 订单分房（按订单号查 → 拖拽分房）────────────────────── */}
       <RoomingSection token={token} board={board} />
+
+      {/* ── 随机档需求池：每日按缺口向地接加房 ─────────────────────── */}
+      <RandomTierShortfallPanel token={token} />
 
       {/* ── 销控矩阵（按酒店 × 日期）──────────────────────────────── */}
       <section className="card">
@@ -2050,7 +2054,7 @@ function OversellCapSetting({ token }: { token: string }) {
 
   return (
     <section className="flex flex-wrap items-center gap-2 rounded-lg border border-slate-200 bg-surface px-4 py-2.5 text-sm">
-      <span className="text-ink-soft">内部录单超售上限</span>
+      <span className="text-ink-soft">内部录单超售上限（仅具体酒店；随机档不闸单，缺口见每日加房清单）</span>
       {editing ? (
         <>
           <input
@@ -2090,7 +2094,7 @@ function OversellCapSetting({ token }: { token: string }) {
         </>
       )}
       <span className="ml-auto text-xs text-ink-muted">
-        销控售罄后录单最多允许打到负这么多间（0 = 没房就不能录）；改动会留审计。
+        仅影响具体酒店，随机档缺口按每日清单向地接加房；改动会留审计。
       </span>
     </section>
   );

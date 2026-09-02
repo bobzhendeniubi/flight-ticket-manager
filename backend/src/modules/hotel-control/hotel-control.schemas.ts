@@ -52,6 +52,50 @@ export const boardQuerySchema = z.object({
 });
 export type BoardQuery = z.infer<typeof boardQuerySchema>;
 
+// ── 每日加房清单（随机档缺口）──────────────────────────────────────────────
+const RANDOM_TIER_SHORTFALL_MAX_DAYS = 60;
+
+function isValidCalendarDate(value: string): boolean {
+  const parsed = new Date(`${value}T00:00:00.000Z`);
+  return !Number.isNaN(parsed.getTime()) && parsed.toISOString().slice(0, 10) === value;
+}
+
+const randomTierShortfallDate = dateStr.refine(isValidCalendarDate, '日期不是有效的日历日期');
+
+function addDaysToDateString(date: string, days: number): string {
+  const d = new Date(`${date}T00:00:00.000Z`);
+  d.setUTCDate(d.getUTCDate() + days);
+  return d.toISOString().slice(0, 10);
+}
+
+function dateSpanDays(from: string, to: string): number {
+  return Math.round(
+    (Date.parse(`${to}T00:00:00.000Z`) - Date.parse(`${from}T00:00:00.000Z`)) / 86_400_000,
+  ) + 1;
+}
+
+/** 随机档每日加房清单：缺省查 from 起 14 天，最多 60 个自然日。 */
+export const randomTierShortfallQuerySchema = z
+  .object({
+    from: randomTierShortfallDate,
+    to: randomTierShortfallDate.optional(),
+  })
+  .transform(({ from, to }) => ({ from, to: to ?? addDaysToDateString(from, 13) }))
+  .superRefine((q, ctx) => {
+    if (q.from > q.to) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['to'], message: '起始日不能晚于结束日' });
+      return;
+    }
+    if (dateSpanDays(q.from, q.to) > RANDOM_TIER_SHORTFALL_MAX_DAYS) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['to'],
+        message: `日期范围最多 ${RANDOM_TIER_SHORTFALL_MAX_DAYS} 天`,
+      });
+    }
+  });
+export type RandomTierShortfallQuery = z.infer<typeof randomTierShortfallQuerySchema>;
+
 // ── 按酒店导出护照 zip（选酒店 + 入住日期区间）────────────────────────────
 export const hotelPassportsQuerySchema = z
   .object({
