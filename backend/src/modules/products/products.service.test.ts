@@ -1629,3 +1629,141 @@ describe('签证加急分档 · parseVisaExpressTiers（DB Json → 类型化档
     ]);
   });
 });
+
+describe('ProductsService · 随机档占位酒店防呆', () => {
+  const ordinaryHotel = {
+    id: 'hotel-1',
+    name: '海景酒店',
+    starRating: 4,
+    intlFiveStar: false,
+    randomTierPlaceholder: null,
+  };
+  const placeholderHotel = {
+    id: 'hotel-placeholder',
+    name: '随机三星',
+    starRating: 3,
+    intlFiveStar: false,
+    randomTierPlaceholder: 3,
+  };
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPrisma.hotel.findUnique.mockReset();
+    mockPrisma.hotel.update.mockReset();
+    mockPrisma.hotel.findUniqueOrThrow.mockReset();
+    mockPrisma.hotelRoomType.findMany.mockReset();
+    mockPrisma.$transaction.mockReset();
+    mockPrisma.$transaction.mockImplementation(async (fn: (tx: typeof mockPrisma) => unknown) => fn(mockPrisma));
+  });
+
+  it('创建名字含「随机」的普通酒店 → 拒绝，且不写库', async () => {
+    const service = new ProductsService();
+
+    await expect(
+      service.createHotel({
+        name: '随机四星',
+        cityCode: 'DAD',
+        address: '测试地址',
+        starRating: 4,
+        isActive: true,
+        amenities: [],
+        photos: [],
+        roomTypes: [],
+      }),
+    ).rejects.toThrow('「随机档」不是酒店');
+    expect(mockPrisma.hotel.create).not.toHaveBeenCalled();
+  });
+
+  it('普通酒店改名为含「随机」的名字 → 拒绝，且不写库', async () => {
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(ordinaryHotel);
+    const service = new ProductsService();
+
+    await expect(service.updateHotel('hotel-1', { name: '随机五星' })).rejects.toThrow('「随机档」不是酒店');
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('已有占位标记的酒店改名仍放行', async () => {
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(placeholderHotel);
+    mockPrisma.hotel.update.mockResolvedValueOnce({});
+    mockPrisma.hotelRoomType.findMany.mockResolvedValueOnce([]);
+    mockPrisma.hotel.findUniqueOrThrow.mockResolvedValueOnce({
+      ...placeholderHotel,
+      name: '随机四星备用池',
+      roomTypes: [],
+    });
+    const service = new ProductsService();
+
+    await expect(service.updateHotel('hotel-placeholder', { name: '随机四星备用池' })).resolves.toMatchObject({
+      name: '随机四星备用池',
+    });
+    expect(mockPrisma.hotel.update).toHaveBeenCalled();
+  });
+
+  it('占位酒店传 isActive=false → 拒绝；普通酒店下架 → 放行', async () => {
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(placeholderHotel);
+    const service = new ProductsService();
+    await expect(service.updateHotel('hotel-placeholder', { isActive: false })).rejects.toThrow(
+      '随机档占位酒店不能下架',
+    );
+    expect(mockPrisma.hotel.update).not.toHaveBeenCalled();
+
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(ordinaryHotel);
+    mockPrisma.hotel.update.mockResolvedValueOnce({ id: 'hotel-1', isActive: false });
+    await expect(service.deleteHotel('hotel-1')).resolves.toEqual({ id: 'hotel-1', isActive: false });
+    expect(mockPrisma.hotel.update).toHaveBeenCalledWith({
+      where: { id: 'hotel-1' },
+      data: { isActive: false },
+    });
+  });
+
+  it('占位酒店 delete → 拒绝，且不写库', async () => {
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(placeholderHotel);
+    const service = new ProductsService();
+
+    await expect(service.deleteHotel('hotel-placeholder')).rejects.toThrow('随机档占位酒店不能下架');
+    expect(mockPrisma.hotel.update).not.toHaveBeenCalled();
+  });
+
+  it('占位酒店改星级且与随机档次不一致 → 拒绝', async () => {
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(placeholderHotel);
+    const service = new ProductsService();
+
+    await expect(service.updateHotel('hotel-placeholder', { starRating: 4 })).rejects.toThrow(
+      '占位酒店星级必须与随机档档次一致',
+    );
+    expect(mockPrisma.hotel.update).not.toHaveBeenCalled();
+  });
+
+  it('占位酒店传 intlFiveStar=true → 拒绝', async () => {
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(placeholderHotel);
+    const service = new ProductsService();
+
+    await expect(service.updateHotel('hotel-placeholder', { intlFiveStar: true })).rejects.toThrow(
+      '占位酒店不能标记为国际五星',
+    );
+    expect(mockPrisma.hotel.update).not.toHaveBeenCalled();
+  });
+
+  it('存量占位酒店星级已不一致时，修改其他字段仍拒绝；改回档次后放行', async () => {
+    const inconsistent = { ...placeholderHotel, starRating: 4 };
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(inconsistent);
+    const service = new ProductsService();
+    await expect(service.updateHotel('hotel-placeholder', { nameEn: '备用池' })).rejects.toThrow(
+      '占位酒店星级必须与随机档档次一致',
+    );
+    expect(mockPrisma.hotel.update).not.toHaveBeenCalled();
+
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(inconsistent);
+    mockPrisma.hotel.update.mockResolvedValueOnce({});
+    mockPrisma.hotelRoomType.findMany.mockResolvedValueOnce([]);
+    mockPrisma.hotel.findUniqueOrThrow.mockResolvedValueOnce({
+      ...inconsistent,
+      starRating: 3,
+      roomTypes: [],
+    });
+    await expect(service.updateHotel('hotel-placeholder', { starRating: 3 })).resolves.toMatchObject({
+      starRating: 3,
+    });
+    expect(mockPrisma.hotel.update).toHaveBeenCalled();
+  });
+});

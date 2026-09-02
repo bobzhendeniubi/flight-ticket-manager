@@ -1,6 +1,9 @@
 /**
  * 产品路由 — 公共 GET（客户浏览）+ 管理员写操作。
  *
+ * 产品 CRUD 必须留痕：本次运营事故中普通酒店与随机档占位酒店被误建同名、改绑套餐并下架占位项，
+ * 导致房控合计和录单受影响；如果新建、修改、下架没有 before/after 审计，就无法还原变更链路。
+ *
  * GET 列表/详情  → 无需登录（含 ?active=1 只看上架的），但走 optionalAuthenticate 做「可选」身份解析：
  *   不带 Authorization 头     → 游客 200，响应里完全不含 costPriceCny 这个 key；
  *   带有效 ADMIN/STAFF token → 序列化时下发 costPriceCny（内部结算成本）；
@@ -14,9 +17,17 @@
  */
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { UserRole } from '@prisma/client';
+import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { ProductsService } from './products.service.js';
 import { getHotelAvailability } from './hotel-availability.service.js';
 import { getBundleSellableDates } from './bundle-availability.service.js';
+import {
+  bundleAuditSnapshot,
+  hotelAuditSnapshot,
+  productAuditSeverity,
+  transferAuditSnapshot,
+  visaAuditSnapshot,
+} from './products.audit.js';
 import {
   bundleFlightRefQuerySchema,
   bundleSellableDatesQuerySchema,
@@ -71,18 +82,54 @@ export const productRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/hotels', adminPre, async (req, reply) => {
     const body = createHotelBodySchema.parse(req.body);
-    return reply.status(201).send({ hotel: await service.createHotel(body) });
+    const hotel = await service.createHotel(body);
+    const after = hotelAuditSnapshot(hotel);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'CREATE_HOTEL',
+      targetType: 'PRODUCT',
+      targetId: hotel.id,
+      targetLabel: String(after.name ?? hotel.id),
+      after,
+      severity: productAuditSeverity({ resource: 'HOTEL', operation: 'CREATE', after }),
+    });
+    return reply.status(201).send({ hotel });
   });
 
   app.patch('/hotels/:id', adminPre, async (req) => {
     const { id } = req.params as { id: string };
     const body = updateHotelBodySchema.parse(req.body);
-    return { hotel: await service.updateHotel(id, body) };
+    const before = hotelAuditSnapshot(await service.getHotel(id, true));
+    const hotel = await service.updateHotel(id, body);
+    const after = hotelAuditSnapshot(hotel);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'UPDATE_HOTEL',
+      targetType: 'PRODUCT',
+      targetId: hotel.id,
+      targetLabel: hotel.name,
+      before,
+      after,
+      severity: productAuditSeverity({ resource: 'HOTEL', operation: 'UPDATE', before, after }),
+    });
+    return { hotel };
   });
 
   app.delete('/hotels/:id', adminPre, async (req) => {
     const { id } = req.params as { id: string };
-    return { result: await service.deleteHotel(id) };
+    const before = hotelAuditSnapshot(await service.getHotel(id, true));
+    const result = await service.deleteHotel(id);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'DELETE_HOTEL',
+      targetType: 'PRODUCT',
+      targetId: result.id,
+      targetLabel: String(before.name ?? result.id),
+      before,
+      after: result,
+      severity: productAuditSeverity({ resource: 'HOTEL', operation: 'DELETE', before, after: result }),
+    });
+    return { result };
   });
 
   // ── Transfers ──────────────────────────────────────────────────
@@ -98,18 +145,54 @@ export const productRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/transfers', adminPre, async (req, reply) => {
     const body = createTransferBodySchema.parse(req.body);
-    return reply.status(201).send({ transfer: await service.createTransfer(body) });
+    const transfer = await service.createTransfer(body);
+    const after = transferAuditSnapshot(transfer);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'CREATE_TRANSFER',
+      targetType: 'PRODUCT',
+      targetId: transfer.id,
+      targetLabel: String(after.name ?? transfer.id),
+      after,
+      severity: productAuditSeverity({ resource: 'TRANSFER', operation: 'CREATE', after }),
+    });
+    return reply.status(201).send({ transfer });
   });
 
   app.patch('/transfers/:id', adminPre, async (req) => {
     const { id } = req.params as { id: string };
     const body = updateTransferBodySchema.parse(req.body);
-    return { transfer: await service.updateTransfer(id, body) };
+    const before = transferAuditSnapshot(await service.getTransfer(id, true));
+    const transfer = await service.updateTransfer(id, body);
+    const after = transferAuditSnapshot(transfer);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'UPDATE_TRANSFER',
+      targetType: 'PRODUCT',
+      targetId: transfer.id,
+      targetLabel: transfer.name,
+      before,
+      after,
+      severity: productAuditSeverity({ resource: 'TRANSFER', operation: 'UPDATE', before, after }),
+    });
+    return { transfer };
   });
 
   app.delete('/transfers/:id', adminPre, async (req) => {
     const { id } = req.params as { id: string };
-    return { result: await service.deleteTransfer(id) };
+    const before = transferAuditSnapshot(await service.getTransfer(id, true));
+    const result = await service.deleteTransfer(id);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'DELETE_TRANSFER',
+      targetType: 'PRODUCT',
+      targetId: result.id,
+      targetLabel: String(before.name ?? result.id),
+      before,
+      after: result,
+      severity: productAuditSeverity({ resource: 'TRANSFER', operation: 'DELETE', before, after: result }),
+    });
+    return { result };
   });
 
   // ── Visas ──────────────────────────────────────────────────────
@@ -125,18 +208,54 @@ export const productRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/visas', adminPre, async (req, reply) => {
     const body = createVisaBodySchema.parse(req.body);
-    return reply.status(201).send({ visa: await service.createVisa(body) });
+    const visa = await service.createVisa(body);
+    const after = visaAuditSnapshot(visa);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'CREATE_VISA',
+      targetType: 'PRODUCT',
+      targetId: visa.id,
+      targetLabel: String(after.name ?? visa.id),
+      after,
+      severity: productAuditSeverity({ resource: 'VISA', operation: 'CREATE', after }),
+    });
+    return reply.status(201).send({ visa });
   });
 
   app.patch('/visas/:id', adminPre, async (req) => {
     const { id } = req.params as { id: string };
     const body = updateVisaBodySchema.parse(req.body);
-    return { visa: await service.updateVisa(id, body) };
+    const before = visaAuditSnapshot(await service.getVisa(id, true));
+    const visa = await service.updateVisa(id, body);
+    const after = visaAuditSnapshot(visa);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'UPDATE_VISA',
+      targetType: 'PRODUCT',
+      targetId: visa.id,
+      targetLabel: String(after.name ?? visa.id),
+      before,
+      after,
+      severity: productAuditSeverity({ resource: 'VISA', operation: 'UPDATE', before, after }),
+    });
+    return { visa };
   });
 
   app.delete('/visas/:id', adminPre, async (req) => {
     const { id } = req.params as { id: string };
-    return { result: await service.deleteVisa(id) };
+    const before = visaAuditSnapshot(await service.getVisa(id, true));
+    const result = await service.deleteVisa(id);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'DELETE_VISA',
+      targetType: 'PRODUCT',
+      targetId: result.id,
+      targetLabel: String(before.name ?? result.id),
+      before,
+      after: result,
+      severity: productAuditSeverity({ resource: 'VISA', operation: 'DELETE', before, after: result }),
+    });
+    return { result };
   });
 
   // ── Bundles ────────────────────────────────────────────────────
@@ -160,17 +279,53 @@ export const productRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/bundles', adminPre, async (req, reply) => {
     const body = createBundleBodySchema.parse(req.body);
-    return reply.status(201).send({ bundle: await service.createBundle(body) });
+    const bundle = await service.createBundle(body);
+    const after = bundleAuditSnapshot(bundle);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'CREATE_BUNDLE',
+      targetType: 'PRODUCT',
+      targetId: bundle.id,
+      targetLabel: String(after.name ?? bundle.id),
+      after,
+      severity: productAuditSeverity({ resource: 'BUNDLE', operation: 'CREATE', after }),
+    });
+    return reply.status(201).send({ bundle });
   });
 
   app.patch('/bundles/:id', adminPre, async (req) => {
     const { id } = req.params as { id: string };
     const body = updateBundleBodySchema.parse(req.body);
-    return { bundle: await service.updateBundle(id, body) };
+    const before = bundleAuditSnapshot(await service.getBundle(id));
+    const bundle = await service.updateBundle(id, body);
+    const after = bundleAuditSnapshot(bundle);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'UPDATE_BUNDLE',
+      targetType: 'PRODUCT',
+      targetId: bundle.id,
+      targetLabel: bundle.name,
+      before,
+      after,
+      severity: productAuditSeverity({ resource: 'BUNDLE', operation: 'UPDATE', before, after }),
+    });
+    return { bundle };
   });
 
   app.delete('/bundles/:id', adminPre, async (req) => {
     const { id } = req.params as { id: string };
-    return { result: await service.deleteBundle(id) };
+    const before = bundleAuditSnapshot(await service.getBundle(id));
+    const result = await service.deleteBundle(id);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'DELETE_BUNDLE',
+      targetType: 'PRODUCT',
+      targetId: result.id,
+      targetLabel: String(before.name ?? result.id),
+      before,
+      after: result,
+      severity: productAuditSeverity({ resource: 'BUNDLE', operation: 'DELETE', before, after: result }),
+    });
+    return { result };
   });
 };

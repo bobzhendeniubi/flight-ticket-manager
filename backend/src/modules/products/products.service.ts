@@ -16,6 +16,11 @@ import {
   computeBundleOriginalPerPaxCny,
   type BundleFlightBinding,
 } from './bundle-pricing.js';
+import {
+  assertHotelDeleteAllowed,
+  assertHotelNameAllowed,
+  assertHotelUpdateAllowed,
+} from './products.placeholder-guard.js';
 import { parseVisaExpressTiers } from './products.schemas.js';
 import type {
   BundleItemInput,
@@ -251,6 +256,8 @@ export class ProductsService {
   }
 
   async createHotel(body: CreateHotelBody) {
+    // randomTierPlaceholder 不暴露给 API；因此新建酒店永远没有占位标记，名字命中「随机」必须拒绝。
+    assertHotelNameAllowed(body.name, null);
     const hotel = await createWithProductCode(
       'H',
       async () => {
@@ -303,6 +310,7 @@ export class ProductsService {
   async updateHotel(id: string, body: UpdateHotelBody) {
     const existing = await prisma.hotel.findUnique({ where: { id } });
     if (!existing) throw new NotFoundError('酒店不存在');
+    assertHotelUpdateAllowed(existing, body);
 
     const hotel = await prisma.$transaction(async (tx) => {
       const data: Prisma.HotelUpdateInput = {};
@@ -380,6 +388,9 @@ export class ProductsService {
   }
 
   async deleteHotel(id: string) {
+    const existing = await prisma.hotel.findUnique({ where: { id } });
+    if (!existing) throw new NotFoundError('酒店不存在');
+    assertHotelDeleteAllowed(existing);
     // 软删除：isActive=false（因为可能被订单引用）
     const hotel = await prisma.hotel.update({
       where: { id },
