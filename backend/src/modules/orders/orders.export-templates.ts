@@ -27,17 +27,8 @@ import {
   type PnrRow,
   PNR_COLUMNS,
 } from './pnr-export.js';
-import {
-  applyExportAgentScope,
-  buildOrderFilterWhere,
-  filterOrderIdsByLegFlightNumber,
-  GUEST_RECORDED_BY_LABEL,
-} from './orders.service.js';
-import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
-import {
-  excludeOnewayFromReturnLegExport,
-  filterExportOrdersByTripType,
-} from './orders.export-trip-filter.js';
+import { GUEST_RECORDED_BY_LABEL } from './orders.service.js';
+import { buildExportOrderWhere, filterExportOrders } from './orders.export-selection.js';
 import { determineFlightLegs } from './ticketing-cap.js';
 import {
   parseRoomGroups,
@@ -55,17 +46,6 @@ export const ORDER_TEMPLATE_LABEL: Record<OrderExportTemplate, string> = {
   ticketing: '票务专用',
   visa: '签证专用',
 };
-
-/** 运营导出有效订单：退款申请中的订单已释放库存，不计入。*/
-const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
 
 const PAYMENT_METHOD_LABEL: Record<string, string> = {
   WECHAT_PAY: '微信',
@@ -883,21 +863,19 @@ export async function buildOrderTemplateExportWorkbook(
   // query 是客户端可控的，走参数进来会被伪造成别家代理的集合。
   opts?: { agentScope?: string[] | null },
 ): Promise<Buffer> {
-  // 与列表完全一致的筛选 + 强制排除不计数状态（已取消/超时/失败等）。
-  // includeAnchorless：唯一与列表不同的一处——导出要把「一个日期锚点都没有的**签证单**」也取回
-  //（纯签证单不能因为没填预计出行日期就整批从岗位手上消失；空单/接送单/资料不全的机酒单
-  // 没有这个理由，不在豁免之列），取回后由下面的 filterExportOrdersByDepartDate 同口径兜底。
-  const where = buildOrderFilterWhere(query, { includeAnchorless: true });
-  const and = Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : [];
-  and.push({ status: { in: COUNTED_STATUSES } });
-  // 票务模板只导出含机票的订单
-  if (query.template === 'ticketing') {
-    and.push({ items: { some: { kind: OrderItemKind.FLIGHT } } });
-  }
-  where.AND = and;
+  // 与列表完全一致的筛选 + 有效状态 + 代理可见集合，全部走共享选单（orders.export-selection.ts，
+  // 与全岗总表同一份，含「无锚点签证单也取回」的导出专属口径）。
+  // 票务模板额外只导含机票的订单。
+  const where = buildExportOrderWhere(query, {
+    agentScope: opts?.agentScope,
+    extraAnd:
+      query.template === 'ticketing'
+        ? [{ items: { some: { kind: OrderItemKind.FLIGHT } } }]
+        : undefined,
+  });
 
   const fetched = (await client.order.findMany({
-    where: applyExportAgentScope(where, opts?.agentScope),
+    where,
     // 名单按录入倒序（最新录入在最上），对标旧系统
     orderBy: { createdAt: 'desc' },
     include: {
@@ -921,45 +899,10 @@ export async function buildOrderTemplateExportWorkbook(
     },
   })) as OrderForTemplateExport[];
 
-  // 出发日期精确细筛（0722 财务反馈）：取数 where 的 travelFrom/travelTo 故意宽召回
-  // （±1 天 + 命中任意航段/入住日），会把返程日或邻日落在窗口内、但整单出发日不在区间的往返单
-  // 也捞进来。这里按整单「出发日」（= 列表「出发日期」列同口径）二次过滤到 [travelFrom, travelTo]。
-  //   - scheduleId（整班·全岗精确导出）：取数已按班次精确圈定，出发日细筛不适用，原样放行；
-  //   - orderIds（勾选导出）：用户勾了哪些就导哪些，travelFrom/travelTo 已被忽略，不再二次筛。
-  const departFiltered =
-    query.scheduleId || (query.orderIds && query.orderIds.length > 0)
-      ? fetched
-      : filterExportOrdersByDepartDate(fetched, query.travelFrom, query.travelTo);
-
-  // 航班号 × 出行日期绑定（0831 票务反馈，与列表 listOrders 精筛同口径）：航班号与出行日期
-  // 同时给出时，航班号收口到**去程段**——「出行日期=8/31 + QH9588」只导 8/31 当天坐 QH9588
-  // 出发的单，而不是把 8/31 出发、回程才坐 QH9588 的往返单也带上。绑定不做会出现
-  // 「列表筛出 N 条、导出多于 N 条」的口径漂移。航班号单独给出时不绑定（任一段命中，维持现状）；
-  // scheduleId（整班导出）与 orderIds（勾选导出）沿用上面的短路原则，不二次过滤。
-  const legBound =
-    query.scheduleId ||
-    (query.orderIds && query.orderIds.length > 0) ||
-    !query.flightNumber?.trim() ||
-    !(query.travelFrom || query.travelTo)
-      ? departFiltered
-      : (() => {
-          const keep = new Set(
-            filterOrderIdsByLegFlightNumber(departFiltered, query.flightNumber, ['outbound']),
-          );
-          return departFiltered.filter((o) => keep.has(o.id));
-        })();
-
-  // 单程单排除 + 行程类型筛选（票务岗反馈）：查询层的航段守卫排不掉单程单（见
-  // orders.service.ts buildOrderFilterWhere 中该守卫的注释），只能在取回内存后按
-  // determineFlightLegs 二次收口。勾选导出（orderIds）不走这两个过滤——用户勾了哪些就导哪些，
-  // 与 filterExportOrdersByDepartDate 对 orderIds 的处理同一原则。
-  const orders =
-    query.orderIds && query.orderIds.length > 0
-      ? legBound
-      : filterExportOrdersByTripType(
-          excludeOnewayFromReturnLegExport(legBound, query.invoiceLeg),
-          query.tripType,
-        );
+  // 内存精筛（出行/返程/航班日期、航班号×日期绑定、单程/往返）—— 取数 where 的日期条件
+  // 故意宽召回（±1 天），加上「关联行 ≥ 2 条」Prisma 表达不了，都在这里按与列表 listOrders
+  // 相同的顺序与口径收口。orderIds（勾选导出）/ scheduleId（整班导出）的短路也在里面。
+  const orders = filterExportOrders(fetched, query);
 
   // 「飞行次数」列只在《全岗可用》有（票务/签证模板无此列），故只在 full 时才拉档案快照 ——
   // 一次性批量拉回本次导出全部乘客（无 N+1，见 orders.export-trip-stats.ts），与全岗总表/

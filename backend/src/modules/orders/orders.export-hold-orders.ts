@@ -86,7 +86,12 @@ export async function loadHoldExportRows(
   from: string | undefined,
   to: string | undefined,
   client: PrismaClient = defaultPrisma,
+  // 代理导出圈定（与订单主表 applyExportAgentScope 同一把闸）：AGENT 只能看到自己+下级的占位单。
+  // null/undefined = 内部岗位不圈。占位单带归属代理、团名、锁价、留座量，漏圈就是把同行的
+  // 留位台账整张交出去。
+  agentScope?: string[] | null,
 ): Promise<HoldExportRow[]> {
+  if (agentScope && agentScope.length === 0) return [];
   const fromParam = from ?? null;
   const toParam = to ?? null;
   const scheduleRows = await client.$queryRaw<Array<{ id: string }>>`
@@ -98,7 +103,11 @@ export async function loadHoldExportRows(
   if (scheduleIds.length === 0) return [];
 
   const holds = await client.holdOrder.findMany({
-    where: { flightScheduleId: { in: scheduleIds }, status: { in: EXPORTED_HOLD_STATUSES } },
+    where: {
+      flightScheduleId: { in: scheduleIds },
+      status: { in: EXPORTED_HOLD_STATUSES },
+      ...(agentScope ? { agentId: { in: agentScope } } : {}),
+    },
     include: {
       seatClass: { select: { cabin: true } },
       agent: { select: { companyName: true, contactName: true } },
@@ -147,7 +156,13 @@ export async function loadHoldExportRows(
 }
 
 /** 把占位单表挂进工作簿；没有数据也建表并写一行说明，避免读表的人误以为导出漏了。 */
-export function appendHoldOrderSheet(wb: ExcelJS.Workbook, rows: HoldExportRow[]): void {
+export function appendHoldOrderSheet(
+  wb: ExcelJS.Workbook,
+  rows: HoldExportRow[],
+  // 主表按下单时间/代理/渠道等筛选时，本表并不随之收窄（占位单只按班次出发日圈）——
+  // 表头首格把这句写给读表的人，别让人拿全量占位单去对一批筛过的订单。
+  opts?: { scopeNote?: string },
+): void {
   const ws = wb.addWorksheet('占位单');
   ws.columns = COLUMNS.map((c) => ({ header: c.header, key: c.key, width: c.width }));
   const headerRow = ws.getRow(1);
@@ -157,6 +172,11 @@ export function appendHoldOrderSheet(wb: ExcelJS.Workbook, rows: HoldExportRow[]
   COLUMNS.forEach((c, i) => {
     if (c.note) ws.getRow(1).getCell(i + 1).note = c.note;
   });
+  if (opts?.scopeNote) {
+    const existing = ws.getRow(1).getCell(1).note;
+    const existingText = typeof existing === 'string' ? existing : existing?.texts?.map((t) => t.text).join('') ?? '';
+    ws.getRow(1).getCell(1).note = existingText ? `${opts.scopeNote}\n${existingText}` : opts.scopeNote;
+  }
 
   if (rows.length === 0) {
     ws.addRow({ seq: '', departDate: '该区间没有仍占座的占位单' });

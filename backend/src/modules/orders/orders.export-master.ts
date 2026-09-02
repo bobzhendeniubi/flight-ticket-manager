@@ -6,8 +6,10 @@
  * 《全岗可用》模板相比，本表把系统里真实存有的字段全部填满（护照签发日、分房情况、
  * 订单成本、单房差、退款金额等），而不是留空占位。
  *
- * 筛选：按出发日期区间（from/to → travelFrom/travelTo 口径，复用 buildOrderFilterWhere），
- * 与整班/全岗导出选单方式一致；同时排除草稿/已取消/超时/失败/退款申请中/已退款。
+ * 筛选：与订单列表 listOrders **同名同义**的一整套筛选（下单时间/出行日期/返程日期/航班日期/
+ * 渠道/代理/状态/航班号/乘客姓名/录入人员/开票/签证/行程类型…），走共享选单
+ * orders.export-selection.ts —— 与三模板导出同一份，保证「导出 = 列表所见」；
+ * 同时排除草稿/已取消/超时/失败/退款申请中/已退款。
  *
  * 可选 role（all|ticketing|visa）：只隐藏与岗位无关的列，默认（不传）= 完整全岗表。
  * 无论 role 如何，都是同一份数据、同一个端点 —— role 仅做列可见性裁剪。
@@ -22,7 +24,7 @@ import ExcelJS from 'exceljs';
 import { localDateISO } from '../../lib/flight-time.js';
 import { businessDateTime } from '../../lib/business-time.js';
 import type { PrismaClient } from '@prisma/client';
-import { OrderStatus, Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import type { BundleItemJson } from '../../lib/json-types.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
@@ -36,13 +38,13 @@ import {
   passengerVisaStatusCell,
   pnrName,
 } from './orders.export-templates.js';
-import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
 import { appendHoldOrderSheet, loadHoldExportRows } from './orders.export-hold-orders.js';
+import { GUEST_RECORDED_BY_LABEL } from './orders.service.js';
 import {
-  applyExportAgentScope,
-  buildOrderFilterWhere,
-  GUEST_RECORDED_BY_LABEL,
-} from './orders.service.js';
+  buildExportOrderWhere,
+  filterExportOrders,
+  type ExportSelectionFilters,
+} from './orders.export-selection.js';
 import { determineFlightLegs } from './ticketing-cap.js';
 
 // ── 岗位视图 ──────────────────────────────────────────────────────────────
@@ -50,27 +52,18 @@ import { determineFlightLegs } from './ticketing-cap.js';
  * 强制，不接受 query 传入——代理改参数也拿不到 all 视图）。仅裁列，不改数据/取数。*/
 export type MasterExportRole = 'all' | 'ticketing' | 'visa' | 'agent';
 
-export interface MasterExportQuery {
-  /** 出发日期起（YYYY-MM-DD，含）*/
-  from?: string;
-  /** 出发日期止（YYYY-MM-DD，含）*/
-  to?: string;
-  /** 岗位视图，默认 all（完整全岗表）*/
+/**
+ * 全岗总表选单参数 = 列表 listOrders 的**整套**筛选（同名同义）+ 岗位视图。
+ *
+ * ⚠️ from/to 的语义是**下单时间**（与列表/三模板/进单统计一致），出行日期用 travelFrom/travelTo。
+ * 本端点历史上只有 from/to 且语义是出行日期，于是「在列表里按下单时间/代理/渠道筛好一批单，
+ * 再点全岗总表」导出的根本不是那一批。改为共用同一套参数后，「导出 = 列表所见」才成立。
+ * orderIds（勾选导出）语义不变：给了就只导这批订单，忽略其余筛选。
+ */
+export type MasterExportQuery = ExportSelectionFilters & {
+  /** 岗位视图，默认 all（完整全岗表）；路由按登录身份强制，不信 query。*/
   role?: MasterExportRole;
-  /** 勾选导出：给了就只导这批订单（以 id 集合为准，忽略 from/to）。 */
-  orderIds?: string[];
-}
-
-/** 运营口径：所有仍占座、应出行的订单；退款申请中的订单已释放库存。*/
-const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
+};
 
 // ── 中文标签表 ──────────────────────────────────────────────────────────────
 // 注：开票状态不再用这张表——旧字段 Order.invoiceStatus 是六态开票改造前的单一态字段，
@@ -632,38 +625,22 @@ export async function buildMasterExportWorkbook(
 ): Promise<Buffer> {
   const role: MasterExportRole = query.role ?? 'all';
 
-  // 按出发日期区间选单：复用 buildOrderFilterWhere 的 travelFrom/travelTo 口径，
-  // 再强制排除释放型状态。与整班/全岗导出选单方式一致。
-  // 勾选导出：orderIds 给了就以 id 集合为准（buildOrderFilterWhere 内部忽略 from/to）。
-  // includeAnchorless：导出口径要「无锚点的**签证单**也取回」（没有任何日期的纯签证单同样得
-  // 交到岗位手上；空单/接送单/资料不全的机酒单不在豁免之列），取回后由下面的
-  // filterExportOrdersByDepartDate 按同一收窄口径兜底保留。列表路径不传，维持排除。
-  const where = buildOrderFilterWhere(
-    {
-      travelFrom: query.from,
-      travelTo: query.to,
-      orderIds: query.orderIds,
-    } as Parameters<typeof buildOrderFilterWhere>[0],
-    { includeAnchorless: true },
-  );
-  const and = Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : [];
-  and.push({ status: { in: COUNTED_STATUSES } });
-  where.AND = and;
+  // 选单：与列表 listOrders 完全一致的筛选 + 有效状态 + 代理可见集合，
+  // 走共享选单（orders.export-selection.ts，与三模板同一份，含「无锚点签证单也取回」的
+  // 导出专属口径）。勾选导出（orderIds）在里面短路。
+  const where = buildExportOrderWhere(query, { agentScope: opts?.agentScope });
 
   const fetched = (await client.order.findMany({
-    where: applyExportAgentScope(where, opts?.agentScope),
+    where,
     orderBy: { createdAt: 'desc' },
     include: MASTER_EXPORT_INCLUDE,
   })) as OrderForMasterExport[];
 
-  // 出发日期精确细筛（0722 财务反馈）：取数 where 的 travelFrom/travelTo（=from/to）故意宽召回
-  // （±1 天 + 命中任意航段/入住日），会把返程日或邻日落在窗口内、但整单出发日不在区间的往返单
-  // 也捞进来。这里按整单「出发日」（= 列表「出发日期」列同口径）二次过滤到 [from, to]。
-  // 勾选导出（orderIds）：用户勾了哪些就导哪些，from/to 已被 buildOrderFilterWhere 忽略，不再二次筛。
-  const orders =
-    query.orderIds && query.orderIds.length > 0
-      ? fetched
-      : filterExportOrdersByDepartDate(fetched, query.from, query.to);
+  // 内存精筛（出行/返程/航班日期、航班号×日期绑定、单程/往返）—— 取数 where 的日期条件
+  // 故意宽召回（±1 天 + 命中任意航段/入住日），会把返程日或邻日落在窗口内、但整单出发日
+  // 不在区间的往返单也捞进来；「关联行 ≥ 2 条」Prisma 也表达不了。都在这里按与列表相同的
+  // 顺序与口径收口。
+  const orders = filterExportOrders(fetched, query);
 
   // 飞行次数/在订未飞/可用次数：一次性拉回本次导出所有乘客的常旅客档案（无 N+1；几百行
   // 也只有 2~3 条查询，含空表首建兜底，见 orders.export-trip-stats.ts 头部注释）。读到的是
@@ -715,17 +692,38 @@ export async function buildMasterExportWorkbook(
   // 「占位单」表：占位单不是订单（无名单、无订单号），任何按订单口径导出的表都看不见它，
   // 而收工时要逐条核对当天「留了哪几个团、几号的、多少座」恰恰只能看这张表。
   // 勾选导出（orderIds）是「导我勾的这几张订单」，不是按日期盘一天，故不附占位单表。
+  // 占位单按**班次出发日**圈定（loadHoldExportRows 的口径），所以给它的是出行日期区间
+  // travelFrom/travelTo，不是下单时间 from/to —— 别顺手把 from/to 传回来。
+  // 代理圈定（agentScope）必须一并传下去：主表圈了、占位单表不圈，代理导一次总表就拿到全公司留位台账。
   if (!query.orderIds || query.orderIds.length === 0) {
-    appendHoldOrderSheet(wb, await loadHoldExportRows(query.from, query.to, client));
+    const holdRows = await loadHoldExportRows(query.travelFrom, query.travelTo, client, opts?.agentScope);
+    const scopeNote =
+      query.travelFrom || query.travelTo
+        ? undefined
+        : '本表为全部在效占位单（按班次出发日圈定），不随上方下单时间/代理/渠道等筛选收窄；要看某段日期的占位单请填「出行日期」区间。';
+    appendHoldOrderSheet(wb, holdRows, { scopeNote });
   }
 
   const buf = await wb.xlsx.writeBuffer();
   return Buffer.from(buf);
 }
 
-/** 文件名：`全岗总表_{from}_{to}.xlsx`（缺省日期用「全部」）。*/
-export function masterExportFilename(from?: string, to?: string): string {
-  const a = from ?? '全部';
-  const b = to ?? from ?? '全部';
+/**
+ * 文件名：`全岗总表_{起}_{止}.xlsx`。
+ *
+ * 取哪个日期区间：出行日期（travelFrom/travelTo）优先 —— 这张表交到岗位手上是按「哪几天走的团」
+ * 用的，文件名写出行日期最好认；没筛出行日期就退回下单时间（from/to，可能带 T HH:mm，
+ * 只取日期段，冒号进不了文件名）；两个都没筛就是「全部」。
+ * 只填一端时另一端跟随同一天（与旧口径一致，`全岗总表_2026-07-10_2026-07-10.xlsx`）。
+ */
+export function masterExportFilename(
+  query: Pick<MasterExportQuery, 'travelFrom' | 'travelTo' | 'from' | 'to'> = {},
+): string {
+  const dateOnly = (v?: string): string | undefined => v?.slice(0, 10);
+  const [start, end] = query.travelFrom || query.travelTo
+    ? [query.travelFrom, query.travelTo]
+    : [dateOnly(query.from), dateOnly(query.to)];
+  const a = start ?? '全部';
+  const b = end ?? start ?? '全部';
   return `全岗总表_${a}_${b}.xlsx`;
 }

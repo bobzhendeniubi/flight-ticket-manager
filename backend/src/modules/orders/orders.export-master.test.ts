@@ -1069,10 +1069,29 @@ describe('bootstrapTripCountProfilesIfEmpty', () => {
 });
 
 describe('masterExportFilename', () => {
-  it('区间 / 单缺省两种文件名', () => {
-    expect(masterExportFilename('2026-07-01', '2026-07-31')).toBe('全岗总表_2026-07-01_2026-07-31.xlsx');
-    expect(masterExportFilename('2026-07-10')).toBe('全岗总表_2026-07-10_2026-07-10.xlsx');
+  it('出行日期区间 / 单缺省两种文件名', () => {
+    expect(masterExportFilename({ travelFrom: '2026-07-01', travelTo: '2026-07-31' })).toBe(
+      '全岗总表_2026-07-01_2026-07-31.xlsx',
+    );
+    expect(masterExportFilename({ travelFrom: '2026-07-10' })).toBe(
+      '全岗总表_2026-07-10_2026-07-10.xlsx',
+    );
     expect(masterExportFilename()).toBe('全岗总表_全部_全部.xlsx');
+  });
+
+  it('没筛出行日期时退回下单时间区间（带时分的输入只取日期段，冒号进不了文件名）', () => {
+    expect(masterExportFilename({ from: '2026-07-01', to: '2026-07-31' })).toBe(
+      '全岗总表_2026-07-01_2026-07-31.xlsx',
+    );
+    expect(masterExportFilename({ from: '2026-07-01T09:30', to: '2026-07-01T18:00' })).toBe(
+      '全岗总表_2026-07-01_2026-07-01.xlsx',
+    );
+  });
+
+  it('出行日期优先于下单时间 —— 这张表按「哪几天走的团」用，文件名写出行日期最好认', () => {
+    expect(
+      masterExportFilename({ travelFrom: '2026-08-01', from: '2026-07-01', to: '2026-07-31' }),
+    ).toBe('全岗总表_2026-08-01_2026-08-01.xlsx');
   });
 });
 

@@ -623,6 +623,11 @@ export type QuoteOrderBody = z.infer<typeof quoteOrderBodySchema>;
 export const listOrdersQuerySchema = z.object({
   status: z.nativeEnum(OrderStatus).optional(),
   agentId: z.string().optional(),
+  // 渠道筛选（直客 / 代理）—— 与 agentId 是同一维度的粗细两档：
+  //   direct = 直客/散客单（Order.agentId 为空）；agent = 代理单（Order.agentId 非空）。
+  // 与 agentId 同时给出时 agentId 优先（更细的那一档），channel 忽略 ——「某一家代理」本就是
+  // 「代理单」的子集，两者矛盾时按用户明确点名的那家算。
+  channel: z.enum(['direct', 'agent']).optional(),
   kind: z.nativeEnum(OrderItemKind).optional(),
   search: z.string().max(120).optional(), // 订单号/姓名/电话
   // 下单时间起/止 — 兼容两种口径（公测反馈：需精确到几点几分统计当日进单）：
@@ -717,12 +722,19 @@ export const exportTemplatesQuerySchema = listOrdersQuerySchema
   .pick({
     status: true,
     agentId: true,
+    // 渠道 / 返程日期 / 航班日期：列表有、导出此前没有的四组筛选。缺了它们，运营在列表里
+    // 按「代理单 + 9/3 回程」筛完再点导出，导出会按更宽的条件多带一批单出来（导出 ≠ 列表所见）。
+    channel: true,
     kind: true,
     search: true,
     from: true,
     to: true,
     travelFrom: true,
     travelTo: true,
+    returnFrom: true,
+    returnTo: true,
+    flightDateFrom: true,
+    flightDateTo: true,
     flightNumber: true,
     passengerName: true,
     recordedBy: true,
@@ -743,6 +755,46 @@ export const exportTemplatesQuerySchema = listOrdersQuerySchema
     orderIds: orderIdsQuerySchema,
   });
 export type ExportTemplatesQuery = z.infer<typeof exportTemplatesQuerySchema>;
+
+// ── 全岗总表导出 ─────────────────────────────────────────────────────────
+// 与三模板导出**同名同义**的一整套筛选（= 列表 listOrders 的筛选集），外加岗位视图 role
+// 与勾选导出 orderIds。此前本端点只认 from/to，且 from/to 的语义是**出行日期** —— 于是
+// 「按下单时间筛一批单再导全岗总表」根本导不出想要的那批，而列表上明明筛好了。
+//
+// ⚠️ from/to 的语义随本次改动统一为**下单时间**（与列表/三模板/进单统计一致），
+// 出行日期改用 travelFrom/travelTo。唯一调用方是运营后台，与本批同版本发布。
+export const exportMasterQuerySchema = listOrdersQuerySchema
+  .pick({
+    status: true,
+    agentId: true,
+    channel: true,
+    kind: true,
+    search: true,
+    from: true,
+    to: true,
+    travelFrom: true,
+    travelTo: true,
+    returnFrom: true,
+    returnTo: true,
+    flightDateFrom: true,
+    flightDateTo: true,
+    flightNumber: true,
+    passengerName: true,
+    recordedBy: true,
+    invoiceStatus: true,
+    invoiceLeg: true,
+    invoiced: true,
+    visaFulfillmentStatus: true,
+    visaRequirement: true,
+    tripType: true,
+  })
+  .extend({
+    // 岗位视图：仅裁列，不改取数。路由按登录身份强制覆盖（专岗账号改参数无效）。
+    role: z.enum(['all', 'ticketing', 'visa']).optional(),
+    // 勾选导出：给了就以这批 id 为准（忽略上述筛选，见 buildOrderFilterWhere）。
+    orderIds: orderIdsQuerySchema,
+  });
+export type ExportMasterQuery = z.infer<typeof exportMasterQuerySchema>;
 
 // ── 分房表导出（成都格式：按入住日期分 sheet）────────────────────────────
 export const exportRoomAllocationQuerySchema = z.object({

@@ -34,6 +34,7 @@ import {
   orderPriceAdjustmentBodySchema,
   PRICE_ADJUSTMENT_REASON_LABEL,
   roomSupplementBodySchema,
+  exportMasterQuerySchema,
   exportRoomAllocationQuerySchema,
   exportTemplatesQuerySchema,
   listOrdersQuerySchema,
@@ -95,6 +96,10 @@ import {
   buildMasterExportWorkbook,
   masterExportFilename,
 } from './orders.export-master.js';
+import {
+  describeOrderFilters,
+  serializableOrderFilters,
+} from './orders.export-selection.js';
 import {
   buildIntakeExportWorkbook,
   intakeExportFilename,
@@ -414,6 +419,23 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       const query = listOrdersQuerySchema.parse(req.query);
       const requester = await buildRequester(req.user.sub, req.user.role);
       return service.listOrders(query, requester);
+    },
+  );
+
+  // ── 代理分销统计（列表卡片）──────────────────────────────────────
+  // GET /orders/agent-stats + listOrders 同款筛选（page/pageSize 忽略）
+  //   → { direct: {orders, revenueCny}, agents: [{agentId, agentName, orders, revenueCny}] }
+  // 卡片此前在前端按「已加载的那一页」现算：列表一次只拉最新 200 单，于是排行榜其实只是
+  // 最近 200 单里的排名，稍早成交的代理直接消失。真分页后改由后端在**全量**上聚合。
+  // 权限与列表同（authenticate + 同一 requester 构建），AGENT 只看得到自己 + 下级的聚合。
+  // 静态路由，Fastify 优先于 /:id 匹配，不会被参数路由吞掉。
+  app.get(
+    '/agent-stats',
+    { preHandler: [app.authenticate] },
+    async (req) => {
+      const query = listOrdersQuerySchema.parse(req.query);
+      const requester = await buildRequester(req.user.sub, req.user.role);
+      return service.getAgentStats(query, requester);
     },
   );
 
@@ -818,8 +840,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   );
 
   // ── 全岗总表导出（PRIMARY 综合导出：一行/乘客，字段全）──
-  // GET /orders/export/master?from=YYYY-MM-DD&to=YYYY-MM-DD&role=all|ticketing|visa
-  // 按出发日期区间选单（同整班/全岗口径）；role 缺省=完整全岗表，仅裁与岗位无关的列。
+  // GET /orders/export/master + listOrders 同款筛选（与三模板导出同名同义）&role=all|ticketing|visa
+  // ⚠️ from/to 的语义是**下单时间**（与列表/三模板一致），出行日期用 travelFrom/travelTo。
+  //   此前本端点只认 from/to 且语义是出行日期，运营在列表里按下单时间/代理/渠道筛好一批单
+  //   再点导出，导出的根本不是那一批。选单走共享 helper（orders.export-selection.ts）。
+  // role 缺省=完整全岗表，仅裁与岗位无关的列。
   // ADMIN/STAFF + AGENT（0831 代理反馈：导出与列表同权；客户不放行）。
   // A20 岗位细分（2026-07-20 拍板「全改」）：role 不再单信 query 参数——专岗账号
   //（User.staffRole）被强制裁到本岗模板，改参数也拿不到订单成本/结算价等全岗列：
@@ -836,15 +861,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       ],
     },
     async (req, reply) => {
-      const query = z
-        .object({
-          from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD').optional(),
-          to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD').optional(),
-          role: z.enum(['all', 'ticketing', 'visa']).optional(),
-          // 勾选导出：给了就只导这批订单（以 id 集合为准，忽略 from/to）。
-          orderIds: orderIdsQuerySchema,
-        })
-        .parse(req.query);
+      const query = exportMasterQuerySchema.parse(req.query);
       if (req.user.role === UserRole.STAFF) {
         const me = await prisma.user.findUnique({
           where: { id: req.user.sub },
@@ -874,10 +891,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         targetId: 'master',
         targetLabel: query.orderIds
           ? `全岗总表 · 勾选 ${query.orderIds.length} 条`
-          : `全岗总表 ${query.from ?? '全部'} ~ ${query.to ?? query.from ?? '全部'}`,
+          : `全岗总表 · ${describeOrderFilters(query)}`,
+        // 全部筛选照实留痕：只记 from/to 的话，「这份表到底是按什么条件导的」事后查不出来
+        //（尤其 from/to 语义已改为下单时间，出行日期另有 travelFrom/travelTo）。
         after: {
-          from: query.from ?? null,
-          to: query.to ?? null,
+          ...serializableOrderFilters(query),
           role: effectiveRole ?? 'all',
           selectedCount: query.orderIds?.length ?? null,
         },
@@ -890,7 +908,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         )
         .header(
           'Content-Disposition',
-          `attachment; filename="${encodeURIComponent(masterExportFilename(query.from, query.to))}"`,
+          `attachment; filename="${encodeURIComponent(masterExportFilename(query))}"`,
         )
         .send(buf);
     },

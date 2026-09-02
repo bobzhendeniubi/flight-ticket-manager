@@ -13,7 +13,8 @@ import { NumberInput } from '../components/NumberInput';
 import { Icon, type IconName } from '../components/Icon';
 import { parseOtaRoster } from '../lib/parseOtaRoster';
 import { computePerPaxSettlement } from '../lib/perPaxSettlement';
-import type { AgentListItem, OrderImportParseResult } from '../lib/api';
+import { toOrdersExportFilter } from '../lib/api';
+import type { AgentListItem, OrderAgentStats, OrderImportParseResult } from '../lib/api';
 import { OrderFinanceSection } from '../components/OrderFinanceSection';
 import { RefundSplitCard } from '../components/RefundSplitCard';
 import {
@@ -263,17 +264,31 @@ function KindBadge({ kind }: { kind: OrderItemKindLabel }) {
 // 前端按产品类型拍一个固定费率算出来的数与结算完全无关，运营照着它跟代理对账必然对不上。
 // 需要佣金口径请到结算/报表页看后端算好的数。
 
-// 客户端分页每页条数（票务反馈）：默认 50 —— 开票一次最多 50 张的口径，一页正好一批。
-// 上限 200 = 单次拉取上限（ORDERS_FETCH_LIMIT），选 200 即一页看全本次拉到的所有单。
+// 每页条数（票务反馈）：默认 50 —— 开票一次最多 50 张的口径，一页正好一批。
+// 上限 200 = 后端 listOrdersQuerySchema.pageSize 的硬上限。
+// 主列表是**真分页**：page/pageSize 都发后端，一页就是后端返回的那一页，没有「只加载前 200 条」的窗口。
 const PAGE_SIZE_OPTIONS = [20, 30, 40, 50, 100, 200] as const;
 const DEFAULT_PAGE_SIZE = 50;
 
-// 主列表单次拉取上限 —— 后端 listOrdersQuerySchema.pageSize 的硬上限就是 200，本页不翻页。
-// 命中数超过它时列表只是「前 200 条」的窗口，界面必须把这件事说出来（见 ordersTotal）。
-const ORDERS_FETCH_LIMIT = 200;
+// 回收站单次拉取上限（回收站弹窗不翻页，命中超出时界面明说，见弹窗内的提示）。
+const RECYCLE_FETCH_LIMIT = 200;
 // 批量端点单次条数上限 —— 对齐后端 batchUpdateStatusBodySchema / batchSetInvoiceFlagsBodySchema
 // 的 .max(100)。超限时 Zod 整体校验失败返回 400，150 单一条都不会被处理；前置拦下并提示分批。
 const BULK_ORDER_LIMIT = 100;
+// 勾选导出单次上限 —— 与后端 MAX_EXPORT_ORDER_IDS 对齐。真分页后勾选可以跨页累加，
+// 翻三页各全选一次就能勾出 600 条，不在前端先拦，点导出才被服务端整体 400 打回。
+const EXPORT_SELECTION_LIMIT = 500;
+// 导出只收「仍占座」的状态（与后端 EXPORT_COUNTED_STATUSES 同一份清单）：运营把状态筛成
+// 已取消/已退款/超时再点导出，服务端会给一张空表——按钮上直接说清，别让人导完才发现。
+const EXPORTABLE_STATUSES: ReadonlySet<OrderStatus> = new Set<OrderStatus>([
+  'PENDING_PAYMENT',
+  'PAID',
+  'PROCESSING',
+  'TICKETED',
+  'COMPLETED',
+  'CHANGE_REQUESTED',
+  'CHANGED',
+]);
 const BATCH_RESCHEDULE_ORDER_LIMIT = 500;
 
 // 列表「签证」列主显（签证岗反馈）：录单时的签证要求 order.visaStatus，而非履约任务进度。
@@ -699,10 +714,11 @@ export function OrdersPage() {
   // 深链承接：从签证台等页面带 ?q=订单号 跳入时用于填充搜索框并自动开详情抽屉
   const [searchParams] = useSearchParams();
   const legacyOrderId = searchParams.get('legacyOrderId')?.trim();
+  // 当前页订单（真分页：page/pageSize 都发后端，这里装的就是后端返回的那一页）。
   const [orders, setOrders] = useState<OrderSummary[]>([]);
-  // 后端命中总数（res.pagination.total）。列表一次只拉 ORDERS_FETCH_LIMIT 条且不翻页，
-  // 命中数超过窗口时必须显式告知——否则「共 N 条 / 命中 N 单」是谎报，而且状态/渠道/
-  // 代理/搜索这些客户端二次筛选只在窗口内跑，运营据此报人数会出错。
+  // 筛选命中的**全量**条数（res.pagination.total）——分页导航、「共 N 条」、导出按钮上的
+  // 「筛选命中 N 条」都用它。此前列表一次只拉前 200 条不翻页，9/1 进单 273 条时运营
+  // 「每页 200 → 全选 → 导出」只导到 200 条，最早的 73 条被静默丢掉。
   const [ordersTotal, setOrdersTotal] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -723,8 +739,8 @@ export function OrdersPage() {
   const [search, setSearch] = useState('');
   // 公测反馈：中文名/拼音名搜不到 —— 搜索改接后端（防抖后透传 search，匹配订单号/联系人/乘客中英文名）。
   const [debouncedSearch, setDebouncedSearch] = useState('');
-  // 客户端分页（票务反馈）：数据仍一次拉 200（后端 search/筛选生效），渲染按页切片。
-  // 默认每页 50 = 开票一次最多 50 张的口径；筛选/搜索变化时回到第 1 页（见下方 effect）。
+  // 服务端分页：page/pageSize 都发后端，翻页 / 改每页条数都重新拉一次。
+  // 默认每页 50 = 开票一次最多 50 张的口径；筛选/搜索变化时回到第 1 页（见下方 queryKey 复位）。
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
   const [page, setPage] = useState(1);
   // 列显示配置（本机偏好，默认全显）+ 「列设置」弹层开关。
@@ -781,10 +797,8 @@ export function OrdersPage() {
   const [visaFilterCode, setVisaFilterCode] = useState<
     '' | 'req:NEEDED' | 'req:E_VISA' | 'req:HAS_VISA' | 'req:NOT_NEEDED' | 'ful:signed' | 'ful:unsigned'
   >('');
-  // 兼容既有办理进度字段：从编码状态提取 ful:*；录单要求另由 visaRequirement 透传。
-  const visaFilter: '' | 'signed' | 'unsigned' = visaFilterCode.startsWith('ful:')
-    ? (visaFilterCode.slice(4) as 'signed' | 'unsigned')
-    : '';
+  // 办理进度（ful:*）与录单要求（req:*）在 filterQuery 里就地拆成 visaFulfillmentStatus /
+  // visaRequirement 两个参数，列表与导出共用同一份，不再各拆一次。
   // 列表行程类型筛选：后端按物化列 hasReturnLeg 收口；票务快捷导出面板另有自己的 tkTripType，不共用。
   const [tripTypeFilter, setTripTypeFilter] = useState<'' | 'oneway' | 'roundtrip'>('');
   // 文本筛选防抖：停止输入 400ms 后才请求后端，避免每个键击打一次接口
@@ -811,12 +825,20 @@ export function OrdersPage() {
   // 下单时间起/止：日期 + 可选时间（HH:mm）→ datetime-local 口径 YYYY-MM-DDTHH:mm；无时间＝纯日期（整天）。
   const createdFromParam = createdFrom ? (createdFromTime ? `${createdFrom}T${createdFromTime}` : createdFrom) : '';
   const createdToParam = createdTo ? (createdToTime ? `${createdTo}T${createdToTime}` : createdTo) : '';
-  // 列表/导出共用的后端筛选（不含仅前端的 status/channel/agent，与三模板/全岗导出口径一致）。
+  // 列表/导出/统计共用的后端筛选。**不含 status**：名单/整班导出要覆盖全部「占座」订单
+  // （后端已限定 COUNTED_STATUSES），再按状态切一刀会漏单（4 人分 2 单、只翻了 3 人单为已支付时
+  // 漏掉 1 人单）。列表请求另外把 status 拼上去（见 listQuery）。
+  // 渠道/代理已改为后端筛选：此前它们只在「最新 200 单」窗口里前端过滤，最近一单较早的代理
+  // （如只在月初出过单的那几家）被挤出窗口就整个搜不到。
   const filterQuery = useMemo<ListOrdersParams>(() => {
     const q: ListOrdersParams = {};
     // 产品类型接后端（items.some(kind)）——此前只在已加载的 200 条窗口里前端过滤，
     // 而「筛选后导出」早就带 kind 走后端，于是同一个「酒店」筛选，列表和导出出来的不是同一批单。
     if (kindFilter) q.kind = kindFilter;
+    // 渠道与代理：具体某一家（agentId）比整个渠道更具体，两者同给时后端以 agentId 为准；
+    // 界面上选其中一个也会清掉另一个，这里只做透传。
+    if (agentFilter) q.agentId = agentFilter;
+    else if (channelFilter) q.channel = channelFilter;
     if (createdFromParam) q.from = createdFromParam;
     if (createdToParam) q.to = createdToParam;
     const resolvedTravel = travelDateRange(travelFrom, travelTo);
@@ -845,7 +867,7 @@ export function OrdersPage() {
     if (tripTypeFilter) q.tripType = tripTypeFilter;
     if (debouncedSearch.trim()) q.search = debouncedSearch.trim();
     return q;
-  }, [kindFilter, createdFromParam, createdToParam, travelFrom, travelTo, returnFrom, returnTo, flightDateFrom, flightDateTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, debouncedRecordedBy, invoiceLegFilter, visaFilterCode, tripTypeFilter, debouncedSearch]);
+  }, [kindFilter, agentFilter, channelFilter, createdFromParam, createdToParam, travelFrom, travelTo, returnFrom, returnTo, flightDateFrom, flightDateTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, debouncedRecordedBy, invoiceLegFilter, visaFilterCode, tripTypeFilter, debouncedSearch]);
   // 三模板筛选导出（全岗可用/票务专用/签证专用）
   const [exportTemplate, setExportTemplate] = useState<OrderExportTemplate>('full');
   const [exporting, setExporting] = useState(false);
@@ -974,27 +996,84 @@ export function OrdersPage() {
   const [showBundleChangeRequestQueue, setShowBundleChangeRequestQueue] = useState(false);
   const [bundleChangeRequestPendingCount, setBundleChangeRequestPendingCount] = useState<number | null>(null);
 
-  // 拉取订单 — 下单日期/出行日期/claimFilter/航班号/乘客姓名/开票状态 变化时重拉（后端过滤）
-  useEffect(() => {
-    if (!tokens?.accessToken) return;
-    let cancelled = false;
+  // 三模板导出 / 全岗总表导出共用的筛选 —— 与列表同一份 filterQuery + 状态（去掉分页与
+  // 接单筛选，导出端点不收）。两个导出走**同一套字段**，才不会出现「照着列表筛完点导出、
+  // 拿回来的是另一批单」：此前全岗总表只带出行日期，下单时间/航班号/开票/签证/渠道/代理全被丢掉；
+  // 状态此前也不透传（历史口径：整班名单要连未支付那单一起导）——现在状态筛选**默认为空**，
+  // 不筛就还是导全部占座单；运营明确选了某个状态，导出就按那个状态出，按钮上的条数才是真数。
+  // 已取消/已退款/支付超时这类释放型状态服务端一律不进导出（EXPORT_COUNTED_STATUSES）。
+  const exportFilter = useMemo(
+    () => toOrdersExportFilter({ ...filterQuery, ...(statusFilter ? { status: statusFilter } : {}) }),
+    [filterQuery, statusFilter],
+  );
+
+  // 导出按钮上的条数口径：无勾选时 = 后端命中总数（列表与导出现在是同一套筛选，含状态）。
+  // 两个例外必须在按钮上说出来，否则数字就是假的：
+  //   · 状态筛成释放型（已取消/已退款/超时…）→ 导出为空表，按钮禁用并直说；
+  //   · 接单状态筛选（只看未接单）导出端点不收 → 不报条数，只说「按筛选（不含接单状态）」。
+  const exportStatusBlocked = Boolean(statusFilter) && !EXPORTABLE_STATUSES.has(statusFilter as OrderStatus);
+  const exportIgnoresClaim = claimFilter !== '';
+  const exportScopeLabel = exportStatusBlocked
+    ? '该状态不进导出'
+    : exportIgnoresClaim
+      ? '按筛选，不含接单状态'
+      : `筛选命中 ${ordersTotal ?? 0} 条`;
+  const exportScopeTitle = exportStatusBlocked
+    ? '已取消/已退款/支付超时等已释放座位的订单不进任何导出；请把「状态」改回全部或占座中的状态再导。'
+    : exportIgnoresClaim
+      ? '导出端点不认「接单状态」筛选，会按其余筛选导出全部命中订单（含已接单的）。'
+      : `按上方筛选导出命中的全部 ${ordersTotal ?? 0} 条（不只是当前页）；未筛状态时已取消/已退款/超时的单不进导出，实际行数可能略少`;
+
+  // 列表请求参数 = 共用筛选 + 状态 + 当前页。
+  const listQuery = useMemo<ListOrdersParams>(
+    () => ({
+      ...filterQuery,
+      ...(statusFilter ? { status: statusFilter } : {}),
+      page,
+      pageSize,
+    }),
+    [filterQuery, statusFilter, page, pageSize],
+  );
+
+  // 筛选/每页条数一变就回第 1 页。这里在**渲染期**复位（而不是 useEffect），
+  // 否则同一次提交里拉取 effect 会先按旧 page 打一枪、复位后再打一枪，白跑一次请求。
+  const listQueryKey = JSON.stringify({ ...filterQuery, status: statusFilter, pageSize });
+  const [prevListQueryKey, setPrevListQueryKey] = useState(listQueryKey);
+  if (listQueryKey !== prevListQueryKey) {
+    setPrevListQueryKey(listQueryKey);
+    if (page !== 1) setPage(1);
+  }
+
+  // 拉取当前页 —— 列表的唯一入口。筛选变化、翻页、改每页条数、批量操作后刷新都走它，
+  // 保证刷新出来的永远是「当前筛选 + 当前页」，不会被换成全库最新的一页。
+  const ordersReqRef = useRef(0);
+  const refetchCurrentPage = useCallback(async () => {
+    const token = tokens?.accessToken;
+    if (!token) return;
+    // 请求序号：晚到的旧响应不能覆盖新结果（翻页连点 / 批量操作与筛选变化撞在一起）。
+    const reqId = ++ordersReqRef.current;
     setLoading(true);
     setError(null);
-    api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: ORDERS_FETCH_LIMIT })
-      .then((res) => {
-        if (cancelled) return;
-        setOrders(res.orders);
-        setOrdersTotal(res.pagination.total);
-      })
-      .catch((err: unknown) => {
-        if (cancelled) return;
-        setError(err instanceof ApiError ? err.message : '加载订单失败');
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
-    return () => { cancelled = true; };
-  }, [tokens?.accessToken, filterQuery, refreshNonce]);
+    try {
+      const res = await api.listOrders(token, listQuery);
+      if (reqId !== ordersReqRef.current) return;
+      setOrders(res.orders);
+      setOrdersTotal(res.pagination.total);
+      // 删单/筛选收窄后总页数可能变少：当前页越界就钳到最后一页并自动重拉，
+      // 否则停在一张永远空的页上，看着像「订单没了」。
+      const maxPage = Math.max(1, Math.ceil(res.pagination.total / pageSize));
+      if (page > maxPage) setPage(maxPage);
+    } catch (err: unknown) {
+      if (reqId !== ordersReqRef.current) return;
+      setError(err instanceof ApiError ? err.message : '加载订单失败');
+    } finally {
+      if (reqId === ordersReqRef.current) setLoading(false);
+    }
+  }, [tokens?.accessToken, listQuery, page, pageSize]);
+
+  useEffect(() => {
+    void refetchCurrentPage();
+  }, [refetchCurrentPage, refreshNonce]);
 
   // 议价申请待处理数（仅 ADMIN/STAFF 拉；代理看不到这个入口）。
   useEffect(() => {
@@ -1093,76 +1172,48 @@ export function OrdersPage() {
     [orders],
   );
 
-  // 所有代理名（去重）
-  const agentNames = useMemo(() => {
-    const set = new Set<string>();
-    ordersView.forEach(({ view }) => { if (view.agentName) set.add(view.agentName); });
-    return Array.from(set).sort();
-  }, [ordersView]);
-
-  const filtered = useMemo(() => {
-    return ordersView.filter(({ order, view }) => {
-      if (statusFilter && order.status !== statusFilter) return false;
-      // 产品类型已由后端 items.some(kind) 筛过；这里的本地判定必须用同一口径（全部行的 kind），
-      // 否则「机票+酒店」混合单会被后端召回、又被前端按首行 kind 误藏，窗口内外两套结果。
-      if (kindFilter && !view.itemKinds.includes(kindFilter)) return false;
-      if (channelFilter === 'direct' && view.agentName) return false;
-      if (channelFilter === 'agent' && !view.agentName) return false;
-      if (agentFilter && view.agentName !== agentFilter) return false;
-      if (search.trim()) {
-        // 与后端 search 口径对齐的超集（订单号/客户/联系人/电话/代理/乘客中英文名+证件号/六段备注），
-        // 保证后端召回的单不会被前端二次过滤误藏；并为已加载页补上即时匹配。
-        // 分词口径与后端一致：空格/逗号/中文逗号/顿号切词，词间 AND（每个词命中任一字段即可）。
-        const terms = splitSearchTerms(search);
-        const hay = [
-          order.orderNumber,
-          view.customerName,
-          order.contactName,
-          order.contactPhone,
-          view.agentName ?? '',
-          order.notes ?? '',
-          order.internalNotes ?? '',
-          order.noteHotel ?? '',
-          order.noteVisa ?? '',
-          order.notePayment ?? '',
-          order.noteSpecial ?? '',
-          ...order.passengers.flatMap((p) => [p.fullName, p.chineseName ?? '', p.documentNumber ?? '']),
-        ].map((s) => s.toLowerCase());
-        // 列表接口目前不回传乘客证件号（窄 select）：按护照号搜索时后端能召回、前端 hay 却看不见。
-        // 该情况下对「后端已核验过的词」（已进防抖 debouncedSearch 的词）放行，宁可短暂多显示，
-        // 绝不把后端召回的单误藏。待列表接口补回 documentNumber 后此回退自然失效（docsKnown=true）。
-        const docsUnknown =
-          order.passengers.length > 0 && order.passengers.every((p) => p.documentNumber === undefined);
-        const backendVetted = docsUnknown ? splitSearchTerms(debouncedSearch) : [];
-        if (
-          !terms.every(
-            (t) => hay.some((s) => s.includes(t)) || (docsUnknown && backendVetted.includes(t)),
-          )
-        ) {
-          return false;
-        }
-      }
-      return true;
-    });
-  }, [ordersView, statusFilter, kindFilter, channelFilter, agentFilter, search, debouncedSearch]);
-
-  // 筛选/搜索一变就回第 1 页（含后端筛选 filterQuery：出行日期/航班号/开票状态等）。
+  // 代理下拉候选 —— 拉全量代理（value=代理 id），不再从「已加载订单」里凑：
+  // 那种凑法只列得出当前这一页里出现过的代理，最近一单较早的代理整个搜不到。
+  // 已停用的代理保留（加后缀标注）：它们的历史订单还要能筛出来。页面首次用到时懒加载一次。
+  const [filterAgents, setFilterAgents] = useState<AgentListItem[]>([]);
+  const [filterAgentsLoaded, setFilterAgentsLoaded] = useState(false);
   useEffect(() => {
-    setPage(1);
-  }, [statusFilter, kindFilter, channelFilter, agentFilter, search, filterQuery, pageSize]);
+    const token = tokens?.accessToken;
+    if (!token || filterAgentsLoaded) return;
+    let cancelled = false;
+    api
+      .listAgents(token)
+      .then((res) => {
+        if (cancelled) return;
+        setFilterAgents(res.agents);
+        setFilterAgentsLoaded(true);
+      })
+      .catch(() => {
+        // 静默降级：代理下拉暂时只剩「全部代理」，主列表与其余筛选不受影响；下次进页面再试。
+      });
+    return () => { cancelled = true; };
+  }, [tokens?.accessToken, filterAgentsLoaded]);
+  const agentFilterOptions = useMemo(
+    () =>
+      filterAgents
+        .map((a) => ({
+          id: a.id,
+          label: `${a.companyName?.trim() || a.contactName}${a.isActive ? '' : '（已停用）'}`,
+        }))
+        .sort((x, y) => x.label.localeCompare(y.label, 'zh-Hans-CN')),
+    [filterAgents],
+  );
 
-  // 客户端分页切片：page 越界时（筛选后条数变少）钳到最后一页，保证永远有内容可看。
-  // 列表被截断（后端命中数 > 本次拉回的条数）——此时页面上的一切计数都只是「窗口内」的数：
-  // filtered.length 不是全量命中数，状态/渠道/代理这些客户端二次筛选也只在窗口内跑（产品类型/关键词已接后端整体筛选）。
-  // 界面必须把这句话说出来，运营才知道要用上方筛选缩小范围，而不是照着数字报人数/订位。
-  const ordersTruncated = ordersTotal !== null && ordersTotal > orders.length;
-  const totalPages = Math.max(1, Math.ceil(filtered.length / pageSize));
+  // 状态/渠道/代理/产品类型/关键词都已是后端筛选，前端**不再二次过滤**——真分页下二次过滤会把
+  // 后端召回的单从当前页里悄悄抹掉（页面显示 47 条、后端说 50 条，谁也说不清少的是哪几条），
+  // 「第 x-y 条」「本页 N 条」这些计数也会跟着失真。一页所见 = 后端返回的那一页。
+  const filtered = ordersView;
+
+  // 真分页：一页就是后端返回的那一页，前端不再切片。总页数按后端命中总数算。
+  const totalPages = Math.max(1, Math.ceil((ordersTotal ?? 0) / pageSize));
   const currentPage = Math.min(page, totalPages);
   const pageStart = (currentPage - 1) * pageSize;
-  const paged = useMemo(
-    () => filtered.slice(pageStart, pageStart + pageSize),
-    [filtered, pageStart, pageSize],
-  );
+  const paged = filtered;
 
   // ── 深链承接（?q=订单号）─────────────────────────────────────
   // 从签证台订单号点入时：先把订单号填进搜索框（前端过滤已支持订单号），
@@ -1224,28 +1275,31 @@ export function OrdersPage() {
     // filtered.length > 1 且无精确命中：保留搜索结果，不自动开抽屉（用户手动挑）
   }, [searchParams, search, loading, filtered, tokens?.accessToken]);
 
-  // 代理维度统计
-  const agentStats = useMemo(() => {
-    const map = new Map<string, { orders: number; revenue: number }>();
-    const directStats = { orders: 0, revenue: 0 };
-    filtered.forEach(({ order, view }) => {
-      const paid = order.status === 'PAID' || order.status === 'TICKETED' || order.status === 'COMPLETED';
-      if (!paid) return;
-      if (view.agentName) {
-        const cur = map.get(view.agentName) ?? { orders: 0, revenue: 0 };
-        cur.orders++;
-        cur.revenue += view.totalNum;
-        map.set(view.agentName, cur);
-      } else {
-        directStats.orders++;
-        directStats.revenue += view.totalNum;
-      }
-    });
-    // 卡片位只有 2 个 → 按成交额从高到低取前两家。按 Map 插入序取「前两个」拿到的是
-    // 「列表里最先出现的两家」，不是最大的两家，看着像排行榜其实不是。
-    const ranked = Array.from(map.entries()).sort((a, b) => b[1].revenue - a[1].revenue);
-    return { byAgent: map, ranked, direct: directStats };
-  }, [filtered]);
+  // 代理维度统计 —— 后端按当前筛选**全量**聚合（GET /orders/agent-stats），不是在当前页里现算：
+  // 真分页后当前页只有几十单，照着页面现算出来的「成交额前 2 家」根本不是排行榜。
+  // 口径与后端一致：只计已付款族（已支付/已出票/已完成）订单的成交额。
+  const [agentStats, setAgentStats] = useState<OrderAgentStats | null>(null);
+  const [agentStatsError, setAgentStatsError] = useState(false);
+  useEffect(() => {
+    const token = tokens?.accessToken;
+    if (!token) return;
+    let cancelled = false;
+    api
+      // 带上状态筛选：运营筛「待支付」时统计卡要诚实变空（后端把已付款族叠进 AND），不能纹丝不动。
+      .getOrderAgentStats(token, { ...filterQuery, ...(statusFilter ? { status: statusFilter } : {}) })
+      .then((res) => {
+        if (cancelled) return;
+        setAgentStats(res);
+        setAgentStatsError(false);
+      })
+      .catch(() => {
+        if (cancelled) return;
+        // 统计卡失败不影响主列表；卡片上明说读不到，别让人对着上一次筛选的旧数字看。
+        setAgentStats(null);
+        setAgentStatsError(true);
+      });
+    return () => { cancelled = true; };
+  }, [tokens?.accessToken, filterQuery, statusFilter, refreshNonce]);
 
   /**
    * 批准退款前的防重复打款闸（不可逆操作的最后一道防线）。
@@ -1373,7 +1427,7 @@ export function OrdersPage() {
     setRecycleError(null);
     try {
       const res = await api.listDeletedOrders(tokens.accessToken, {
-        pageSize: ORDERS_FETCH_LIMIT,
+        pageSize: RECYCLE_FETCH_LIMIT,
         search: search.trim() || undefined,
       });
       if (reqId !== recycleReqRef.current) return;
@@ -1459,11 +1513,37 @@ export function OrdersPage() {
     setBulkHotelResult(null);
   };
 
-  // 当前选中的订单对象（批量到账弹窗用）
-  const selectedOrders = useMemo(
-    () => orders.filter((o) => selectedIds.has(o.id)),
-    [orders, selectedIds],
+  // 已勾选订单的**对象**缓存（id → 订单）。真分页后不能再从 orders 里捞：其它页勾的单
+  // 不在当前页数据里，那样捞会漏——人数提示、批量目标状态、可到账清单、批量落位候选
+  // 全都会少算，运营翻着页勾了 80 单、工具条却只按当前页那 20 单干活。
+  // 维护规则：① 当前页重拉 → 用新数据覆盖同 id 的旧对象；② 勾选 → 从当前页补进来；
+  // ③ 取消勾选/清空 → 跟着 selectedIds 一起丢掉，缓存不会无限长。
+  const [selectedOrdersById, setSelectedOrdersById] = useState<Map<string, OrderSummary>>(
+    () => new Map(),
   );
+  useEffect(() => {
+    setSelectedOrdersById((prev) => {
+      const onPage = new Map(orders.map((o) => [o.id, o]));
+      const next = new Map<string, OrderSummary>();
+      for (const id of selectedIds) {
+        const fresh = onPage.get(id) ?? prev.get(id);
+        if (fresh) next.set(id, fresh);
+      }
+      // 内容没变就返回原引用，否则这个 effect 会自己把自己再触发一遍。
+      if (next.size === prev.size && Array.from(next).every(([id, o]) => prev.get(id) === o)) {
+        return prev;
+      }
+      return next;
+    });
+  }, [selectedIds, orders]);
+  const selectedOrders = useMemo(() => Array.from(selectedOrdersById.values()), [selectedOrdersById]);
+  // 批量结果面板按 id 反查订单号用：当前页 + 已勾选（可能来自别的页）两边都要能查到，
+  // 否则跨页批量出的失败行只显示一截 id，运营对不上是哪一单。
+  const bulkResultOrders = useMemo(() => {
+    const map = new Map(orders.map((o) => [o.id, o]));
+    for (const o of selectedOrders) if (!map.has(o.id)) map.set(o.id, o);
+    return Array.from(map.values());
+  }, [orders, selectedOrders]);
   const selectedReturnLegOrderCount = useMemo(
     () => selectedOrders.filter((o) => flightLegCount(o) >= 2).length,
     [selectedOrders],
@@ -1655,11 +1735,8 @@ export function OrdersPage() {
         bulkReason,
         effectiveForceMode,
       );
-      // 刷新必须带上当前后端筛选条件——不带的话列表会被换成「全库最新 200 单」，
-      // 而筛选框还显示着条件、徽标还写「已筛选」，随后「导出 CSV」就按这份被污染的列表出。
-      const updated = await api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: ORDERS_FETCH_LIMIT });
-      setOrders(updated.orders);
-      setOrdersTotal(updated.pagination.total);
+      // 刷新走统一入口：带当前筛选 + 当前页，不会把列表换成「全库最新的一页」。
+      await refetchCurrentPage();
       setBulkResult({
         successCount: res.successCount,
         failureCount: res.failureCount,
@@ -1706,11 +1783,8 @@ export function OrdersPage() {
     try {
       const ids = Array.from(selectedIds);
       const res = await api.batchInvoiceFlags(tokens.accessToken, ids, opt.flags);
-      // 刷新必须带上当前后端筛选条件——不带的话列表会被换成「全库最新 200 单」，
-      // 而筛选框还显示着条件、徽标还写「已筛选」，随后「导出 CSV」就按这份被污染的列表出。
-      const updated = await api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: ORDERS_FETCH_LIMIT });
-      setOrders(updated.orders);
-      setOrdersTotal(updated.pagination.total);
+      // 刷新走统一入口：带当前筛选 + 当前页，不会把列表换成「全库最新的一页」。
+      await refetchCurrentPage();
       setBulkInvoiceResult({
         succeeded: res.succeeded,
         failed: res.failed,
@@ -1770,11 +1844,8 @@ export function OrdersPage() {
           failures.push({ id, error: e instanceof ApiError ? e.message : '改签证状态失败' });
         }
       }
-      // 刷新必须带上当前后端筛选条件——不带的话列表会被换成「全库最新 200 单」，
-      // 而筛选框还显示着条件、徽标还写「已筛选」，随后「导出 CSV」就按这份被污染的列表出。
-      const updated = await api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: ORDERS_FETCH_LIMIT });
-      setOrders(updated.orders);
-      setOrdersTotal(updated.pagination.total);
+      // 刷新走统一入口：带当前筛选 + 当前页，不会把列表换成「全库最新的一页」。
+      await refetchCurrentPage();
       setBulkVisaResult({ succeeded, failed: failures.length, failures });
       if (failures.length === 0) {
         setSelectedIds(new Set());
@@ -1813,13 +1884,9 @@ export function OrdersPage() {
         setSelectedIds(new Set());
         setBulkNotes('');
       }
-      try {
-        const updated = await api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: ORDERS_FETCH_LIMIT });
-        setOrders(updated.orders);
-        setOrdersTotal(updated.pagination.total);
-      } catch (err) {
-        alert(err instanceof ApiError ? `批量改备注已完成，但刷新订单列表失败：${err.message}` : '批量改备注已完成，但刷新订单列表失败');
-      }
+      // 刷新走统一入口：带当前筛选 + 当前页，不会把列表换成「全库最新的一页」。
+      // 刷新本身失败只会点亮列表上方的错误条，不影响上面已经落库的批量结果。
+      await refetchCurrentPage();
     } finally {
       setBulkNotesSubmitting(false);
     }
@@ -1859,13 +1926,9 @@ export function OrdersPage() {
       } else {
         setSelectedIds(new Set(failures.map((f) => f.id)));
       }
-      try {
-        const updated = await api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: ORDERS_FETCH_LIMIT });
-        setOrders(updated.orders);
-        setOrdersTotal(updated.pagination.total);
-      } catch (err) {
-        alert(err instanceof ApiError ? `批量改代理已完成，但刷新订单列表失败：${err.message}` : '批量改代理已完成，但刷新订单列表失败');
-      }
+      // 刷新走统一入口：带当前筛选 + 当前页，不会把列表换成「全库最新的一页」。
+      // 刷新本身失败只会点亮列表上方的错误条，不影响上面已经落库的批量结果。
+      await refetchCurrentPage();
     } finally {
       setBulkAgentSubmitting(false);
     }
@@ -1912,13 +1975,9 @@ export function OrdersPage() {
       } else {
         setSelectedIds(new Set(res.results.filter((r) => !r.ok).map((r) => r.id)));
       }
-      try {
-        const updated = await api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: ORDERS_FETCH_LIMIT });
-        setOrders(updated.orders);
-        setOrdersTotal(updated.pagination.total);
-      } catch (err) {
-        alert(err instanceof ApiError ? `批量改航班已完成，但刷新订单列表失败：${err.message}` : '批量改航班已完成，但刷新订单列表失败');
-      }
+      // 刷新走统一入口：带当前筛选 + 当前页，不会把列表换成「全库最新的一页」。
+      // 刷新本身失败只会点亮列表上方的错误条，不影响上面已经落库的批量结果。
+      await refetchCurrentPage();
     } finally {
       setBulkRescheduleSubmitting(false);
     }
@@ -1995,11 +2054,8 @@ export function OrdersPage() {
           failures.push({ id: orderId, error: e instanceof ApiError ? e.message : '换酒店失败' });
         }
       }
-      // 刷新必须带上当前后端筛选条件——不带的话列表会被换成「全库最新 200 单」，
-      // 而筛选框还显示着条件、徽标还写「已筛选」，随后「导出 CSV」就按这份被污染的列表出。
-      const updated = await api.listOrders(tokens.accessToken, { ...filterQuery, pageSize: ORDERS_FETCH_LIMIT });
-      setOrders(updated.orders);
-      setOrdersTotal(updated.pagination.total);
+      // 刷新走统一入口：带当前筛选 + 当前页，不会把列表换成「全库最新的一页」。
+      await refetchCurrentPage();
       setBulkHotelResult({ succeeded, failed: failures.length, skipped, failures });
       if (failures.length === 0) {
         setBulkHotelRoomTypeId('');
@@ -2012,35 +2068,23 @@ export function OrdersPage() {
   // 三模板筛选导出 — 用当前筛选条件调后端 xlsx，复用 createObjectURL 下载流
   const handleTemplateExport = async () => {
     if (!tokens?.accessToken) return;
+    if (selectedIds.size > EXPORT_SELECTION_LIMIT) {
+      alert(`单次最多导出 ${EXPORT_SELECTION_LIMIT} 条勾选订单（当前已勾选 ${selectedIds.size} 条）。请分批勾选，或清空勾选后按筛选导出全部。`);
+      return;
+    }
     setExporting(true);
     try {
       // 有勾选就只导勾选的这批（后端以 id 集合为准，忽略下面的筛选条件）。
       const selected = Array.from(selectedIds);
       // 出行日期：与主列表同一条口径（travelDateRange），保证「导出＝列表所见」。
       const resolvedTravel = travelDateRange(travelFrom, travelTo);
+      // 整套筛选与列表同源（exportFilter）：下单时间/出行/返程/航班日期/航班号/乘客/录入人员/
+      // 开票/签证/行程/渠道/代理/关键词全带上，保证「导出＝列表所见」。
+      // 唯独**不带状态**：整班/名单导出要覆盖全部「占座」订单（含未支付那单），否则会漏单
+      //（如 4 人分 2 单、只翻了 3 人单为已支付时漏掉 1 人单）。后端已限定在 COUNTED_STATUSES 内。
       const blob = await api.downloadOrdersTemplateExport(tokens.accessToken, {
+        ...exportFilter,
         template: exportTemplate,
-        // 不透传列表的"状态"筛选：整班/名单导出要覆盖全部「占座」订单（含未支付那单），
-        // 否则会漏单（如 4 人分 2 单、只翻了 3 人单为已支付时漏掉 1 人单）。
-        // 后端已限定在 COUNTED_STATUSES（占座状态）范围内。
-        kind: kindFilter || undefined,
-        search: search.trim() || undefined,
-        from: createdFromParam || undefined, // 下单时间起（createdAt，可带时间到分）— "当天进单多少"导出
-        to: createdToParam || undefined, // 下单时间止（createdAt，可带时间到分）
-        travelFrom: resolvedTravel.travelFrom,
-        travelTo: resolvedTravel.travelTo,
-        flightNumber: flightNumberFilter.trim() || undefined,
-        passengerName: passengerNameFilter.trim() || undefined,
-        recordedBy: recordedByFilter.trim() || undefined,
-        // 六态开票筛选（与列表同源）——票务岗「7/10 去程未开 → 导出」就走这条。
-        invoiceLeg: parseInvoiceLegFilter(invoiceLegFilter)?.invoiceLeg,
-        invoiced: parseInvoiceLegFilter(invoiceLegFilter)?.invoiced,
-        // 签证办理状态（与列表「签证」筛选同源）——保持「导出=列表所见」一致。
-        visaFulfillmentStatus: visaFilter || undefined,
-        visaRequirement: visaFilterCode.startsWith('req:')
-          ? (visaFilterCode.slice(4) as 'NEEDED' | 'E_VISA' | 'HAS_VISA' | 'NOT_NEEDED')
-          : undefined,
-        tripType: tripTypeFilter || undefined,
         orderIds: selected.length > 0 ? selected : undefined,
       });
       const url = URL.createObjectURL(blob);
@@ -2105,26 +2149,34 @@ export function OrdersPage() {
   // 全岗总表导出 — 一行/乘客·字段全（PRIMARY 综合台账）。按上方「出行日期」区间选单；无日期=全部。
   const handleMasterExport = async () => {
     if (!tokens?.accessToken) return;
+    if (selectedIds.size > EXPORT_SELECTION_LIMIT) {
+      alert(`单次最多导出 ${EXPORT_SELECTION_LIMIT} 条勾选订单（当前已勾选 ${selectedIds.size} 条）。请分批勾选，或清空勾选后按筛选导出全部。`);
+      return;
+    }
     setExportingMaster(true);
     try {
-      // 有勾选就只导勾选的这批（后端以 id 集合为准，忽略 from/to）。
+      // 有勾选就只导勾选的这批（后端以 id 集合为准，忽略筛选）。
       const selected = Array.from(selectedIds);
-      // 出行日期：与主列表/三模板导出同一条口径（travelDateRange）。
+      // 出行日期：与主列表/三模板导出同一条口径（travelDateRange）；这里只用于文件名。
       const resolvedTravel = travelDateRange(travelFrom, travelTo);
+      // 与三模板导出同一套筛选（含状态，口径见 exportFilter）——此前这里只传出行日期，
+      // 运营在列表上按「下单时间 9/1」筛完点导出，拿回来的是全量单，对不上列表。
       const blob = await api.exportMaster(tokens.accessToken, {
-        from: resolvedTravel.travelFrom,
-        to: resolvedTravel.travelTo,
+        ...exportFilter,
         role: 'all',
         orderIds: selected.length > 0 ? selected : undefined,
       });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
+      // 文件名区间标签：优先出行日期，没填就用下单时间，都没填写「全部」。
       const rangeLabel = selected.length > 0
         ? `勾选${selected.length}条`
         : resolvedTravel.travelFrom || resolvedTravel.travelTo
           ? `${resolvedTravel.travelFrom || '全部'}_${resolvedTravel.travelTo || '全部'}`
-          : '全部_全部';
+          : createdFromParam || createdToParam
+            ? `${(createdFromParam || '全部').replace(/:/g, '-')}_${(createdToParam || '全部').replace(/:/g, '-')}`
+            : '全部_全部';
       a.download = `全岗总表_${rangeLabel}.xlsx`;
       document.body.appendChild(a);
       a.click();
@@ -2173,36 +2225,24 @@ export function OrdersPage() {
         </div>
         <div className="flex flex-wrap items-center justify-end gap-2">
           {(() => {
-            // 筛选是否生效的徽标（票务反馈 T1）：此前只看前端二次过滤（状态/产品/渠道/代理/搜索），
-            // 而出行日期/开票/签证/航班号/乘客名等大多在后端过滤——只用这些字段时 filtered.length
-            // 始终等于 orders.length，徽标误报「未筛选」，让人以为筛选没生效。这里把后端筛选参数
-            // 也纳入判定，只要任一条件生效就高亮显示「已筛选」。
-            const hasBackendFilter = Boolean(
+            // 筛选是否生效的徽标（票务反馈 T1）：所有筛选都在后端跑，条数一律取后端命中总数
+            //（ordersTotal），不再是「当前页有几条」。此前只看前端二次过滤，只用出行日期/开票/
+            // 签证这类后端字段时徽标误报「未筛选」，让人以为筛选没生效。
+            const isFiltered = Boolean(
+              statusFilter || channelFilter || agentFilter || debouncedSearch.trim() ||
               kindFilter || createdFrom || createdTo || travelFrom || travelTo || returnFrom || returnTo ||
+              flightDateFrom || flightDateTo ||
               flightNumberFilter.trim() || passengerNameFilter.trim() || recordedByFilter.trim() ||
               invoiceLegFilter || visaFilterCode || tripTypeFilter || claimFilter,
             );
-            const hasFrontendFilter = filtered.length !== orders.length;
-            const isFiltered = hasBackendFilter || hasFrontendFilter;
             return (
-              <>
-                <span className={isFiltered ? 'badge-info' : 'badge-neutral'}>
-                  {loading
-                    ? '加载中…'
-                    : isFiltered
-                      ? `已筛选 · ${filtered.length} 条`
-                      : `共 ${ordersTotal ?? orders.length} 条`}
-                </span>
-                {/* 截断提示：命中数超出单次拉取窗口时，上面的条数只是窗口内的数，必须说清楚。 */}
-                {!loading && ordersTruncated && (
-                  <span
-                    className="badge-warning"
-                    title={`后端命中 ${ordersTotal} 条，本页单次只加载前 ${orders.length} 条；状态/渠道/代理筛选只在这 ${orders.length} 条内生效（产品类型已改为后端整体筛选）。请用上方「出行日期 / 下单时间 / 产品类型 / 航班号 / 乘客姓名」等后端筛选缩小范围后再统计或导出。`}
-                  >
-                    仅显示前 {orders.length} 条 / 共 {ordersTotal} 条，请用筛选缩小范围
-                  </span>
-                )}
-              </>
+              <span className={isFiltered ? 'badge-info' : 'badge-neutral'}>
+                {loading
+                  ? '加载中…'
+                  : isFiltered
+                    ? `已筛选 · ${ordersTotal ?? 0} 条`
+                    : `共 ${ordersTotal ?? 0} 条`}
+              </span>
             );
           })()}
           <button
@@ -2247,9 +2287,12 @@ export function OrdersPage() {
               )}
             </button>
           )}
+          {/* 快速 CSV = **当前页**的表格快照（浏览器本地生成，不走后端）。真分页后它只覆盖这一页，
+              按钮上直说条数，别让人当成全量台账——要全量请用右边的《导出》/《全岗总表》。 */}
           <button
             className="btn-secondary text-sm"
             disabled={loading}
+            title="把当前这一页的表格另存为 CSV（本地生成）。要按筛选导出命中的全部订单，请用右边的《导出》或《全岗总表》。"
             onClick={() =>
               exportToCSV(
                 '订单列表',
@@ -2296,7 +2339,7 @@ export function OrdersPage() {
               )
             }
           >
-            <Icon name="download" /> 导出 CSV
+            <Icon name="download" /> 导出 CSV（本页 {filtered.length} 条）
           </button>
           {/* 录入周期快捷预设：一键设上方「下单时间」起止，导出按此周期（佣金/提成/客户统计） */}
           {([
@@ -2331,35 +2374,35 @@ export function OrdersPage() {
           </select>
           <button
             className="btn-secondary text-sm"
-            disabled={loading || exporting}
+            disabled={loading || exporting || (selectedIds.size === 0 && exportStatusBlocked)}
             onClick={() => void handleTemplateExport()}
             title={
               selectedIds.size > 0
-                ? `只导出已勾选的 ${selectedIds.size} 条订单`
-                : '导出按上方「下单时间」周期（录入日期），用于佣金/提成/客户统计'
+                ? `只导出已勾选的 ${selectedIds.size} 条订单（忽略上方筛选）`
+                : `${exportScopeTitle}；「下单时间」周期用于佣金/提成/客户统计`
             }
           >
             {exporting
               ? '导出中…'
               : selectedIds.size > 0
-                ? <><Icon name="upload" /> 导出（已选 {selectedIds.size} 条）</>
-                : <><Icon name="upload" /> 导出</>}
+                ? <><Icon name="upload" /> 导出（已勾选 {selectedIds.size} 条）</>
+                : <><Icon name="upload" /> 导出（{exportScopeLabel}）</>}
           </button>
           <button
             className="btn-primary text-sm"
-            disabled={loading || exportingMaster}
+            disabled={loading || exportingMaster || (selectedIds.size === 0 && exportStatusBlocked)}
             onClick={() => void handleMasterExport()}
             title={
               selectedIds.size > 0
-                ? `只导出已勾选的 ${selectedIds.size} 条订单（全岗综合台账）`
-                : '全岗综合台账：一行一位乘客，涵盖机票/酒店/签证/付款全字段。按上方「出行日期」区间选单，不填=全部。'
+                ? `只导出已勾选的 ${selectedIds.size} 条订单（全岗综合台账，忽略上方筛选）`
+                : `全岗综合台账：一行一位乘客，涵盖机票/酒店/签证/付款全字段。${exportScopeTitle}；不筛=全部。`
             }
           >
             {exportingMaster
               ? '导出中…'
               : selectedIds.size > 0
-                ? <><Icon name="list" /> 导出全岗总表（已选 {selectedIds.size} 条）</>
-                : <><Icon name="list" /> 导出全岗总表</>}
+                ? <><Icon name="list" /> 导出全岗总表（已勾选 {selectedIds.size} 条）</>
+                : <><Icon name="list" /> 导出全岗总表（{exportScopeLabel}）</>}
           </button>
           <button
             className="btn-secondary text-sm"
@@ -2390,8 +2433,8 @@ export function OrdersPage() {
           )}
           <p className="w-full text-right text-xs text-ink-muted">
             {selectedIds.size > 0
-              ? `已勾选 ${selectedIds.size} 条：三个导出都只导勾选的这些订单（忽略上方筛选）；取消勾选恢复按筛选导出`
-              : '《导出》按上方「下单时间」周期（佣金/提成/客户统计）；《全岗总表》按「出行日期」区间（综合台账，不填=全部）；《票务开票导出》按出发日/航段/开票状态'}
+              ? `已勾选 ${selectedIds.size} 条：三个导出都只导勾选的这些订单（忽略上方筛选）；要导出筛选命中的全部 ${ordersTotal ?? 0} 条，清空勾选后直接点导出即可`
+              : '《导出》《全岗总表》都按上方筛选导出「命中的全部订单」（不只是当前页）；《票务开票导出》按出发日/航段/开票状态'}
           </p>
           {/* 票务开票快捷入口：某日某航段需开票订单一键导《票务专用》（航司 PNR） */}
           {showTicketingQuick && (
@@ -2524,39 +2567,42 @@ export function OrdersPage() {
         </div>
       )}
 
-      {/* 代理维度统计 */}
+      {/* 代理维度统计 —— 后端按当前筛选全量聚合，不是当前页现算 */}
       <section className="card">
         <div className="flex items-center justify-between mb-3">
           <h2 className="text-sm font-semibold text-ink">代理分销统计（仅含已付款订单）</h2>
           <span className="text-xs text-ink-muted">
-            点击代理名称可过滤订单
-            {agentStats.ranked.length > 2 && `　·　共 ${agentStats.ranked.length} 家代理，此处仅显示成交额前 2 家`}
-            {ordersTruncated && '　·　仅统计已加载的订单，非全量'}
+            点击卡片按该代理/渠道筛选订单
+            {agentStats && agentStats.agents.length > 2 &&
+              `　·　共 ${agentStats.agents.length} 家代理，此处仅显示成交额前 2 家`}
+            {agentStatsError && '　·　统计读取失败，稍后重试'}
           </span>
         </div>
         <div className="grid gap-2 md:grid-cols-3">
           <button
             className={`rounded-lg border p-3 text-left transition ${channelFilter === 'direct' && !agentFilter ? 'border-brand bg-brand-50 ring-1 ring-brand/20' : 'border-slate-200 hover:border-slate-300 hover:bg-slate-50/60'}`}
-            onClick={() => { setChannelFilter('direct'); setAgentFilter(''); }}
+            onClick={() => { setChannelFilter(channelFilter === 'direct' ? '' : 'direct'); setAgentFilter(''); }}
           >
             <div className="flex items-center justify-between">
               <span className="inline-flex items-center gap-1 text-sm font-medium text-ink-soft"><Icon name="building" /> 直销（散客/自营）</span>
-              <span className="text-xs text-ink-muted">{agentStats.direct.orders} 单</span>
+              <span className="text-xs text-ink-muted">{agentStats?.direct.orders ?? 0} 单</span>
             </div>
-            <div className="nums mt-1 text-lg font-semibold text-ink">¥{agentStats.direct.revenue.toLocaleString()}</div>
+            <div className="nums mt-1 text-lg font-semibold text-ink">
+              ¥{(agentStats?.direct.revenueCny ?? 0).toLocaleString()}
+            </div>
             <div className="text-xs text-ink-muted">直客成交额</div>
           </button>
-          {agentStats.ranked.slice(0, 2).map(([name, s]) => (
+          {(agentStats?.agents ?? []).slice(0, 2).map((a) => (
             <button
-              key={name}
-              className={`rounded-lg border p-3 text-left transition ${agentFilter === name ? 'border-brand bg-brand-50 ring-1 ring-brand/20' : 'border-slate-200 hover:border-slate-300 hover:bg-slate-50/60'}`}
-              onClick={() => { setAgentFilter(agentFilter === name ? '' : name); setChannelFilter(''); }}
+              key={a.agentId}
+              className={`rounded-lg border p-3 text-left transition ${agentFilter === a.agentId ? 'border-brand bg-brand-50 ring-1 ring-brand/20' : 'border-slate-200 hover:border-slate-300 hover:bg-slate-50/60'}`}
+              onClick={() => { setAgentFilter(agentFilter === a.agentId ? '' : a.agentId); setChannelFilter(''); }}
             >
               <div className="flex items-center justify-between">
-                <span className="inline-flex items-center gap-1 truncate text-sm font-medium text-ink-soft"><Icon name="handshake" /> {name}</span>
-                <span className="text-xs text-ink-muted">{s.orders} 单</span>
+                <span className="inline-flex items-center gap-1 truncate text-sm font-medium text-ink-soft"><Icon name="handshake" /> {a.agentName}</span>
+                <span className="text-xs text-ink-muted">{a.orders} 单</span>
               </div>
-              <div className="nums mt-1 text-lg font-semibold text-ink">¥{s.revenue.toLocaleString()}</div>
+              <div className="nums mt-1 text-lg font-semibold text-ink">¥{a.revenueCny.toLocaleString()}</div>
               <div className="text-xs text-ink-muted">成交额（佣金以结算页为准）</div>
             </button>
           ))}
@@ -2844,11 +2890,17 @@ export function OrdersPage() {
               className="input"
               value={agentFilter}
               onChange={(e) => { setAgentFilter(e.target.value); if (e.target.value) setChannelFilter(''); }}
+              title="列出全部代理（含已停用的——它们的历史订单还要能筛出来），不是只列当前页出现过的那几家"
             >
               <option value="">全部代理</option>
-              {agentNames.map((n) => (
-                <option key={n} value={n}>{n}</option>
+              {agentFilterOptions.map((o) => (
+                <option key={o.id} value={o.id}>{o.label}</option>
               ))}
+              {/* 代理列表还没拉到、但已经按 id 筛着了（如从统计卡点进来）：先占一个选项，
+                  否则 select 会因为找不到 value 而回落到「全部代理」，看着像筛选被清空了。 */}
+              {agentFilter && !agentFilterOptions.some((o) => o.id === agentFilter) && (
+                <option value={agentFilter}>已选代理</option>
+              )}
             </select>
           </div>
           <div>
@@ -2930,12 +2982,7 @@ export function OrdersPage() {
             {/* 日期筛选回显 — 两个框各自独立生效，只填一个就是开区间；把当前生效的条件和命中单数
                 摊开写清楚，填了「从」却看到更晚的订单时一眼就知道为什么，不用猜。 */}
             <span className="flex flex-wrap items-center gap-x-2 gap-y-1">
-              <span>显示 {filtered.length} 条订单</span>
-              {ordersTruncated && (
-                <span className="rounded bg-amber-100 px-1.5 py-0.5 font-medium text-amber-700">
-                  <Icon name="alert" size={14} /> 后端命中 {ordersTotal} 条，只加载了前 {orders.length} 条；这里的条数不是全量，请缩小筛选范围
-                </span>
-              )}
+              <span>命中 {ordersTotal ?? 0} 条订单</span>
               {(() => {
                 const travelEcho = describeDateRange(travelFrom, travelTo);
                 const returnEcho = describeDateRange(returnFrom, returnTo);
@@ -2945,8 +2992,7 @@ export function OrdersPage() {
                   <>
                     {travelEcho && (
                       <span className="rounded bg-brand-50 px-1.5 py-0.5 font-medium text-brand">
-                        出行日期：{travelEcho} · 命中 {filtered.length}
-                        {ordersTruncated ? '+' : ''} 单
+                        出行日期：{travelEcho} · 命中 {ordersTotal ?? 0} 单
                       </span>
                     )}
                     {returnEcho && (
@@ -3127,7 +3173,7 @@ export function OrdersPage() {
               succeeded={bulkVisaResult.succeeded}
               failed={bulkVisaResult.failed}
               failures={bulkVisaResult.failures}
-              orders={orders}
+              orders={bulkResultOrders}
             />
           )}
 
@@ -3335,7 +3381,7 @@ export function OrdersPage() {
               skipped={bulkHotelResult.skipped}
               failNote="失败常见原因：目标房型星级低于池档次，或目标酒店当晚余量不足。"
               failures={bulkHotelResult.failures}
-              orders={orders}
+              orders={bulkResultOrders}
             />
           )}
             </>
@@ -3363,7 +3409,7 @@ export function OrdersPage() {
                 failed={bulkDeleteResult.failed}
                 failNote="失败常见原因：仍占座需先取消订单释放座位，或净收款＞0 不允许删除。"
                 failures={bulkDeleteResult.failures}
-                orders={orders}
+                orders={bulkResultOrders}
               />
               {bulkDeleteResult.failures.some((f) => f.error?.includes('未退')) && (
                 <p className="mt-2 text-xs text-rose-700">
@@ -3399,7 +3445,7 @@ export function OrdersPage() {
               {bulkInvoiceResult.failures.length > 0 && (
                 <ul className="mt-2 max-h-40 overflow-auto rounded border border-rose-200 bg-white px-2 py-1.5 text-red-600">
                   {bulkInvoiceResult.failures.map((f) => {
-                    const orderNo = orders.find((o) => o.id === f.id)?.orderNumber ?? `${f.id.slice(0, 8)}…`;
+                    const orderNo = bulkResultOrders.find((o) => o.id === f.id)?.orderNumber ?? `${f.id.slice(0, 8)}…`;
                     return (
                       <li key={f.id} className="py-0.5 text-[11px]">
                         · <span className="font-mono">{orderNo}</span>：{f.error ?? '未知原因'}
@@ -3436,7 +3482,7 @@ export function OrdersPage() {
               {bulkResult.failures.length > 0 && (
                 <ul className="mt-2 max-h-40 overflow-auto rounded border border-rose-200 bg-white px-2 py-1.5 text-red-600">
                   {bulkResult.failures.map((f) => {
-                    const orderNo = orders.find((o) => o.id === f.id)?.orderNumber ?? `${f.id.slice(0, 8)}…`;
+                    const orderNo = bulkResultOrders.find((o) => o.id === f.id)?.orderNumber ?? `${f.id.slice(0, 8)}…`;
                     return (
                       <li key={f.id} className="py-0.5 text-[11px]">
                         · <span className="font-mono">{orderNo}</span>：{f.error ?? '未知原因'}
@@ -3452,7 +3498,7 @@ export function OrdersPage() {
                   </div>
                   <ul className="mt-1 max-h-40 overflow-auto text-[11px]">
                     {bulkResult.warnings.map((w) => {
-                      const orderNo = w.orderNumber ?? orders.find((o) => o.id === w.id)?.orderNumber ?? `${w.id.slice(0, 8)}…`;
+                      const orderNo = w.orderNumber ?? bulkResultOrders.find((o) => o.id === w.id)?.orderNumber ?? `${w.id.slice(0, 8)}…`;
                       return (
                         <li key={w.id} className="py-0.5">
                           · <span className="font-mono">{orderNo}</span>：{w.messages.join('；')}
@@ -3472,7 +3518,7 @@ export function OrdersPage() {
           succeeded={bulkNotesResult.succeeded}
           failed={bulkNotesResult.failed}
           failures={bulkNotesResult.failures}
-          orders={orders}
+          orders={bulkResultOrders}
         />
       )}
       {bulkAgentResult && (
@@ -3480,7 +3526,7 @@ export function OrdersPage() {
           succeeded={bulkAgentResult.succeeded}
           failed={bulkAgentResult.failed}
           failures={bulkAgentResult.failures}
-          orders={orders}
+          orders={bulkResultOrders}
         />
       )}
       {bulkRescheduleResult && (
@@ -3489,13 +3535,14 @@ export function OrdersPage() {
           failed={bulkRescheduleResult.failed}
           failures={bulkRescheduleResult.failures}
           notices={bulkRescheduleResult.notices}
-          orders={orders}
+          orders={bulkResultOrders}
         />
       )}
 
       <section className="card p-0 overflow-hidden">
-        {/* 分页工具条（票务反馈）：每页 20/30/40/50/100/200（默认 50 = 一次开票上限口径）+ 上一页/下一页
-            + 「第 x-y 条 / 共 N 条」。数据仍一次拉全（≤200），只是渲染分页。 */}
+        {/* 分页工具条：每页 20/30/40/50/100/200（默认 50 = 一次开票上限口径）+ 上一页/下一页
+            + 「第 x-y 条 / 共 N 条」。**真分页**：翻页 / 改每页条数都重新问后端要那一页，
+            「共 N 条」是筛选命中的全量数，不再是「本次拉回来多少条」。 */}
         <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 px-4 py-2 text-sm text-ink-soft">
           <div className="flex items-center gap-2">
             <span>每页</span>
@@ -3568,15 +3615,19 @@ export function OrdersPage() {
               )}
             </div>
             <span className="text-xs text-ink-muted">表头「全选」只选当前页，翻页后可继续勾选累加</span>
+            {/* 勾选 ≠ 筛选：勾了本页几十条就点导出，只会导这几十条。命中数比本页多的时候
+                把这句摆在分页条上——9/1 那次「每页 200 + 全选 + 导出」漏掉 73 条就是这么来的。 */}
+            {allVisibleSelected && (ordersTotal ?? 0) > filtered.length && (
+              <span className="rounded bg-amber-100 px-1.5 py-0.5 text-xs font-medium text-amber-700">
+                <Icon name="alert" size={14} /> 已勾选本页 {filtered.length} 条；要导出筛选命中的全部 {ordersTotal} 条，清空勾选后直接点导出即可
+              </span>
+            )}
           </div>
           <div className="flex items-center gap-2">
             <span className="nums text-xs text-ink-muted">
-              {filtered.length === 0
-                ? '共 0 条'
-                : `第 ${pageStart + 1}-${Math.min(pageStart + pageSize, filtered.length)} 条 / 共 ${filtered.length} 条`}
-              {ordersTruncated && (
-                <span className="ml-1 text-amber-700">（已加载 {orders.length} / 命中 {ordersTotal}）</span>
-              )}
+              {(ordersTotal ?? 0) === 0 || filtered.length === 0
+                ? `共 ${ordersTotal ?? 0} 条`
+                : `第 ${pageStart + 1}-${pageStart + filtered.length} 条 / 共 ${ordersTotal} 条`}
             </span>
             <button
               type="button"
@@ -4250,7 +4301,7 @@ export function OrdersPage() {
                 </p>
               ) : (
                 <>
-                {/* 回收站同样单次只拉 ORDERS_FETCH_LIMIT 条且不翻页——超出就明说，别让人以为这是全部。 */}
+                {/* 回收站单次只拉 RECYCLE_FETCH_LIMIT 条且不翻页——超出就明说，别让人以为这是全部。 */}
                 {deletedTotal !== null && deletedTotal > deletedOrders.length && (
                   <p className="mb-2 rounded bg-amber-50 px-2 py-1 text-xs text-amber-700">
                     共 {deletedTotal} 条已删除订单，仅显示前 {deletedOrders.length} 条，请用上方搜索缩小范围。

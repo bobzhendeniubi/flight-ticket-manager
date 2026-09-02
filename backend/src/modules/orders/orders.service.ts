@@ -1120,6 +1120,29 @@ function rescheduleCommittedContext(err: unknown): RescheduleCommittedContext | 
   return rescheduleCommittedContexts.get(err) ?? null;
 }
 
+// ── 代理分销统计（GET /orders/agent-stats）────────────────────────────────
+/**
+ * 统计口径的「已付款」= 钱已经进来、单子还算数的三个状态。
+ * 与列表卡片标题「仅含已付款订单」同义，也与卡片此前的前端算法逐字一致 ——
+ * 待支付单不算成交额，取消/退款族不再是成交。
+ */
+const AGENT_STATS_PAID_STATUSES: OrderStatus[] = [
+  OrderStatus.PAID,
+  OrderStatus.TICKETED,
+  OrderStatus.COMPLETED,
+];
+
+/** 代理行查不到（已删/脏数据）时的兜底名，与前台列表同一标签，不静默丢掉这笔成交额。*/
+const AGENT_STATS_UNKNOWN_AGENT_LABEL = '未知代理';
+
+/** GET /orders/agent-stats 响应体。金额单位元（CNY），两位小数。*/
+export interface AgentStatsResult {
+  /** 直客/散客（Order.agentId 为空）汇总。*/
+  direct: { orders: number; revenueCny: number };
+  /** 各代理汇总，按成交额从高到低。*/
+  agents: Array<{ agentId: string; agentName: string; orders: number; revenueCny: number }>;
+}
+
 export class OrderService {
   private readonly pricing = new PricingService();
 
@@ -3674,7 +3697,20 @@ export class OrderService {
   // ════════════════════════════════════════════════════════════════════
   // 列表
   // ════════════════════════════════════════════════════════════════════
-  async listOrders(query: ListOrdersQuery, requester: OrderRequester) {
+  /**
+   * 列表取数的最终 where —— 「筛选 + RBAC + 接单 + 出行/返程/航班日期精筛」一次算完。
+   *
+   * 抽出来是因为「代理分销统计」必须与列表**同一口径**：统计卡片曾在前端按已加载的那一页
+   * 现算，真分页之后只能由后端聚合；聚合若自己再拼一份 where，两处必然漂移（差一个 RBAC
+   * 分支就是越权，差一个精筛就是「卡片数字和列表条数对不上」）。listOrders 与
+   * getAgentStats 共用本方法，保证两者永远看同一批订单。
+   *
+   * 不含分页与排序（由调用方各自决定）。
+   */
+  private async resolveListOrdersWhere(
+    query: ListOrdersQuery,
+    requester: OrderRequester,
+  ): Promise<Prisma.OrderWhereInput> {
     const where = buildOrderFilterWhere(query);
 
     // RBAC 过滤 — 先建基准可见集合，再按 query 过滤（但 query.agentId 不能覆盖可见集合）
@@ -3775,6 +3811,12 @@ export class OrderService {
       where.id = { in: preciseIds };
     }
 
+    return where;
+  }
+
+  async listOrders(query: ListOrdersQuery, requester: OrderRequester) {
+    const where = await this.resolveListOrdersWhere(query, requester);
+
     const [rows, total] = await prisma.$transaction([
       prisma.order.findMany({
         where,
@@ -3845,6 +3887,73 @@ export class OrderService {
       // bundle.items，没有 visaStayDaysById 可传，这里只传 order + 角色脱敏口径，用默认空表。
       orders: rows.map((order) => serializeOrder(order, serializeCtx)),
       pagination: { page: query.page, pageSize: query.pageSize, total },
+    };
+  }
+
+  /**
+   * 代理分销统计（仅含已付款订单）—— 按当前筛选条件在**全量**订单上聚合。
+   *
+   * 此前这张卡片在前端按「已加载的那一批订单」现算：列表一次只拉最新 200 单，于是
+   * 「共 N 家代理 / 成交额前 2 家」算的其实是最近 200 单里的排名，最近一单稍早的代理直接
+   * 从卡片和下拉里消失。真分页之后前端手上更没有全量数据，只能由后端聚合。
+   *
+   * 口径与卡片旧算法逐条对齐，不新开第三口径：
+   *   · 只计已付款族 status ∈ {PAID, TICKETED, COMPLETED}（与列表卡片标题「仅含已付款订单」同义）；
+   *   · 成交额 = Σ Order.total（订单总额，非人均、非结算价），保留两位小数；
+   *   · 代理名 = 公司名优先、否则联系人名（与列表「代理机构」列同源）；
+   *   · 直客 = Order.agentId 为空的单，单独一格。
+   * 筛选 / RBAC / 精筛全部走 resolveListOrdersWhere —— 与列表同一批订单，卡片和列表不会打架。
+   * 聚合走 groupBy + 一次代理名查询，不把订单全拉进内存。
+   */
+  async getAgentStats(query: ListOrdersQuery, requester: OrderRequester): Promise<AgentStatsResult> {
+    const where = await this.resolveListOrdersWhere(query, requester);
+    // 已付款族叠进 AND 而不是覆盖 where.status：用户同时筛了「待支付」时诚实返回空集，
+    // 而不是让某一边静默失效。
+    const and = Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : [];
+    const paidWhere: Prisma.OrderWhereInput = {
+      ...where,
+      AND: [...and, { status: { in: AGENT_STATS_PAID_STATUSES } }],
+    };
+
+    const grouped = await prisma.order.groupBy({
+      by: ['agentId'],
+      where: paidWhere,
+      _count: { _all: true },
+      _sum: { total: true },
+    });
+
+    const agentIds = grouped
+      .map((g) => g.agentId)
+      .filter((id): id is string => typeof id === 'string' && id.length > 0);
+    const agentRows = agentIds.length
+      ? await prisma.agent.findMany({
+          where: { id: { in: agentIds } },
+          select: { id: true, companyName: true, contactName: true },
+        })
+      : [];
+    const nameById = new Map(
+      agentRows.map((a) => [
+        a.id,
+        a.companyName?.trim() || a.contactName?.trim() || AGENT_STATS_UNKNOWN_AGENT_LABEL,
+      ]),
+    );
+
+    const directRow = grouped.find((g) => g.agentId === null);
+    return {
+      direct: {
+        orders: directRow?._count._all ?? 0,
+        revenueCny: round2(Number(directRow?._sum.total ?? 0)),
+      },
+      agents: grouped
+        .filter((g): g is typeof g & { agentId: string } => typeof g.agentId === 'string')
+        .map((g) => ({
+          agentId: g.agentId,
+          // 代理行被删/查不到时不静默丢掉这笔成交额（金额对不上比名字缺失更糟）。
+          agentName: nameById.get(g.agentId) ?? AGENT_STATS_UNKNOWN_AGENT_LABEL,
+          orders: g._count._all,
+          revenueCny: round2(Number(g._sum.total ?? 0)),
+        }))
+        .sort((a, b) => b.revenueCny - a.revenueCny),
     };
   }
 
@@ -14045,6 +14154,7 @@ export type OrderListFilters = Pick<
   ListOrdersQuery,
   | 'status'
   | 'agentId'
+  | 'channel'
   | 'kind'
   | 'search'
   | 'from'
@@ -14206,7 +14316,20 @@ export function buildOrderFilterWhere(
   const andClauses: Prisma.OrderWhereInput[] = [];
 
   if (query.status) where.status = query.status;
-  if (query.agentId) where.agentId = query.agentId;
+  // 归属代理 / 渠道 —— 同一维度的粗细两档，同时给出时 agentId 优先（更细的那一档；
+  //「某一家代理」本就是「代理单」的子集），故写成 if/else if 而不是两条独立的 if。
+  //
+  // ⚠️ channel 必须走 andClauses，不能直接赋值 where.agentId：listOrders 对 AGENT 角色会把
+  // where.agentId 覆盖成 { in: 可见代理集合 }（RBAC 基准），若 channel 也写 where.agentId，
+  // 两者互相覆盖 —— 代理请求 channel=direct 就会把 RBAC 那层打穿、看到全站直客单。
+  // 放进 AND 后两个条件同时成立：代理 + 直客 = 空集（诚实地什么都没有），而不是越权。
+  if (query.agentId) {
+    where.agentId = query.agentId;
+  } else if (query.channel === 'direct') {
+    andClauses.push({ agentId: null });
+  } else if (query.channel === 'agent') {
+    andClauses.push({ agentId: { not: null } });
+  }
   if (query.kind) andClauses.push({ items: { some: { kind: query.kind } } });
   if (query.from || query.to) {
     where.createdAt = {

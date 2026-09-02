@@ -1853,6 +1853,11 @@ export interface RefundQuote {
 export interface ListOrdersParams {
   status?: OrderStatus;
   agentId?: string;
+  /**
+   * 销售渠道：direct=直客单（无归属代理），agent=代理单（有归属代理）。
+   * 与 agentId 同时给出时以 agentId 为准（具体某一家 > 整个渠道）。
+   */
+  channel?: 'direct' | 'agent';
   kind?: OrderItemKind;
   search?: string;
   from?: string; // 下单日期起 YYYY-MM-DD
@@ -1905,26 +1910,55 @@ export interface ListOrdersParams {
    * 后端走物化列 Order.hasReturnLeg 判定，与三模板导出的 tripType 同口径。
    */
   tripType?: 'oneway' | 'roundtrip';
+  /** 第几页（1 起）。主列表是**真分页**：page/pageSize 都发后端，返回的 orders 就是当前页。 */
   page?: number;
+  /** 每页条数；后端 listOrdersQuerySchema 的硬上限是 200。 */
   pageSize?: number;
+}
+
+/** 代理分销统计（GET /orders/agent-stats）：与 listOrders 同一套筛选，口径=只计已付款族订单的成交额。 */
+export interface OrderAgentStatsRow {
+  agentId: string;
+  agentName: string;
+  orders: number;
+  revenueCny: number;
+}
+export interface OrderAgentStats {
+  direct: { orders: number; revenueCny: number };
+  /** 按成交额从高到低排序（后端已排），前端直接取前 N 家即为排行榜。 */
+  agents: OrderAgentStatsRow[];
 }
 
 // ── 三模板筛选导出（全岗可用 / 票务专用 / 签证专用）──────────────────────
 export type OrderExportTemplate = 'full' | 'ticketing' | 'visa';
 
-/** GET /orders/export-templates 查询参数 = listOrders 同款筛选 + template */
-export interface OrdersTemplateExportParams {
-  template: OrderExportTemplate;
+/**
+ * 订单导出共用筛选 —— 三模板导出（/orders/export-templates）与全岗总表导出
+ * （/orders/export/master）收的是**同名同义的同一套字段**，与 listOrders 的筛选口径逐字段对齐，
+ * 保证「导出＝列表所见」。此前全岗总表只收 from/to/role，列表上筛的下单时间/航班号/开票/签证
+ * 等条件一律被丢掉，运营筛完再导出拿到的是另一批单。
+ *
+ * ⚠ from/to = **下单时间**（createdAt，可带 `T HH:mm`）；出行日期是 travelFrom/travelTo。
+ */
+export interface OrdersExportFilterParams {
   status?: OrderStatus;
   agentId?: string;
+  /** 销售渠道：direct=直客单 / agent=代理单；与 agentId 同给时 agentId 优先。 */
+  channel?: 'direct' | 'agent';
   kind?: OrderItemKind;
   search?: string;
+  /** 下单时间起（createdAt，可带 T HH:mm）。 */
   from?: string;
+  /** 下单时间止（createdAt，可带 T HH:mm）。 */
   to?: string;
   travelFrom?: string;
   travelTo?: string;
-  /** 精确按班次导出（整班·全岗用）；比 travelFrom/travelTo 精确，只导该班次订单。 */
-  scheduleId?: string;
+  /** 返程日期（整单回程航段）；与出行日期是两个独立维度。 */
+  returnFrom?: string;
+  returnTo?: string;
+  /** 航班日期（航段级：任一航段当天起飞即命中）。 */
+  flightDateFrom?: string;
+  flightDateTo?: string;
   /** 行程类型（选填：单程/往返，票务岗反馈）；导出内存侧按 determineFlightLegs 判定。 */
   tripType?: 'oneway' | 'roundtrip';
   flightNumber?: string;
@@ -1939,8 +1973,52 @@ export interface OrdersTemplateExportParams {
   visaFulfillmentStatus?: 'signed' | 'unsigned';
   /** 订单录单签证要求（NEEDED/E_VISA/HAS_VISA/NOT_NEEDED）；与 listOrders 同款。 */
   visaRequirement?: 'NEEDED' | 'E_VISA' | 'HAS_VISA' | 'NOT_NEEDED';
-  /** 勾选导出：给了就只导这批订单（后端以 id 集合为准，忽略其余筛选）。 */
+  /** 勾选导出：给了就只导这批订单（后端以 id 集合为准，忽略其余筛选）。上限 500 条。 */
   orderIds?: string[];
+}
+
+/** GET /orders/export-templates 查询参数 = 导出共用筛选 + template（+ 可选班次） */
+export interface OrdersTemplateExportParams extends OrdersExportFilterParams {
+  template: OrderExportTemplate;
+  /** 精确按班次导出（整班·全岗用）；比 travelFrom/travelTo 精确，只导该班次订单。 */
+  scheduleId?: string;
+}
+
+/** GET /orders/export/master 查询参数 = 导出共用筛选 + role（岗位视图裁列） */
+export interface OrdersMasterExportParams extends OrdersExportFilterParams {
+  role?: 'all' | 'ticketing' | 'visa';
+}
+
+/**
+ * 从 listOrders 的筛选里挑出**导出端点认识的**字段。
+ * 分页（page/pageSize）与接单筛选（unclaimedOnly/claimedById）导出端点不收，这里直接丢掉——
+ * 直接 spread 整个 listOrders 查询过去会带上导出端点看不懂的参数。
+ */
+export function toOrdersExportFilter(query: ListOrdersParams): OrdersExportFilterParams {
+  return {
+    status: query.status,
+    agentId: query.agentId,
+    channel: query.channel,
+    kind: query.kind,
+    search: query.search,
+    from: query.from,
+    to: query.to,
+    travelFrom: query.travelFrom,
+    travelTo: query.travelTo,
+    returnFrom: query.returnFrom,
+    returnTo: query.returnTo,
+    flightDateFrom: query.flightDateFrom,
+    flightDateTo: query.flightDateTo,
+    tripType: query.tripType,
+    flightNumber: query.flightNumber,
+    passengerName: query.passengerName,
+    recordedBy: query.recordedBy,
+    invoiceStatus: query.invoiceStatus,
+    invoiceLeg: query.invoiceLeg,
+    invoiced: query.invoiced,
+    visaFulfillmentStatus: query.visaFulfillmentStatus,
+    visaRequirement: query.visaRequirement,
+  };
 }
 
 export interface OrderPayment {
@@ -3868,6 +3946,21 @@ export const api = {
   },
   getOrder: (token: string, id: string) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${id}`, { token }),
+  /**
+   * 代理分销统计（GET /orders/agent-stats）：与 listOrders 同一套筛选，后端全量聚合。
+   * 分页参数在这里没有意义（统计的是筛选命中的**全部**订单，不是某一页），调用前会剔掉。
+   */
+  getOrderAgentStats: (token: string, query?: ListOrdersParams) => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(query ?? {})) {
+      if (k === 'page' || k === 'pageSize') continue;
+      if (v !== undefined && v !== '') qs.set(k, String(v));
+    }
+    return apiFetch<OrderAgentStats>(
+      `/orders/agent-stats${qs.toString() ? '?' + qs.toString() : ''}`,
+      { token },
+    );
+  },
 
   // Legacy archive (read-only)
   listLegacyTickets: (token: string, query?: ListLegacyTicketsParams) => {
@@ -4255,17 +4348,19 @@ export const api = {
     return res.blob();
   },
   // 全岗总表导出（PRIMARY 综合导出：一行/乘客，字段全）；ADMIN/STAFF only。
-  // GET /orders/export/master?from&to&role — 按出发日期区间选单；缺省 = 全部。返回 Blob 直接下载。
-  exportMaster: async (
-    token: string,
-    params?: { from?: string; to?: string; role?: 'all' | 'ticketing' | 'visa'; orderIds?: string[] },
-  ): Promise<Blob> => {
+  // GET /orders/export/master + 与三模板导出**同名同义**的整套筛选（见 OrdersExportFilterParams）
+  // + role（岗位视图裁列）。⚠ from/to = 下单时间，出行日期走 travelFrom/travelTo。返回 Blob 直接下载。
+  exportMaster: async (token: string, params?: OrdersMasterExportParams): Promise<Blob> => {
     const qs = new URLSearchParams();
-    if (params?.from) qs.set('from', params.from);
-    if (params?.to) qs.set('to', params.to);
-    if (params?.role) qs.set('role', params.role);
-    // 勾选导出：给了就只导这批订单（逗号分隔透传，后端以 id 集合为准）。
-    if (params?.orderIds && params.orderIds.length > 0) qs.set('orderIds', params.orderIds.join(','));
+    for (const [k, v] of Object.entries(params ?? {})) {
+      if (v === undefined || v === '') continue;
+      // 勾选导出：orderIds 以逗号分隔透传（后端以 id 集合为准）；其余标量直接 set。
+      if (k === 'orderIds' && Array.isArray(v)) {
+        if (v.length > 0) qs.set('orderIds', v.join(','));
+        continue;
+      }
+      qs.set(k, String(v));
+    }
     const suffix = qs.toString() ? `?${qs.toString()}` : '';
     const res = await fetch(`${API_BASE}/orders/export/master${suffix}`, {
       headers: { Authorization: `Bearer ${token}` },

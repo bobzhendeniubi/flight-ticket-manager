@@ -111,4 +111,26 @@ describe('loadHoldExportRows', () => {
     const rows = await loadHoldExportRows(undefined, undefined, client as never);
     expect(rows[0]).toMatchObject({ owner: '自组团', ownerType: '直客' });
   });
+
+  it('代理导出圈定：agentScope 非空时占位单只取自己+下级代理的（与订单主表同一把闸）', async () => {
+    const { client, findMany } = clientWith(['schedule_1'], [holdRow()]);
+    await loadHoldExportRows(undefined, undefined, client as never, ['agent_a', 'agent_b']);
+    expect(findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ agentId: { in: ['agent_a', 'agent_b'] } }),
+      }),
+    );
+  });
+
+  it('代理导出圈定：可见集合为空时不查库直接空表；内部岗位（null）不圈', async () => {
+    const empty = clientWith(['schedule_1'], [holdRow()]);
+    expect(await loadHoldExportRows(undefined, undefined, empty.client as never, [])).toEqual([]);
+    expect(empty.findMany).not.toHaveBeenCalled();
+
+    const internal = clientWith(['schedule_1'], [holdRow()]);
+    await loadHoldExportRows(undefined, undefined, internal.client as never, null);
+    const where = (internal.findMany.mock.calls[0]?.[0] as { where: Record<string, unknown> } | undefined)?.where;
+    expect(where).toBeDefined();
+    expect(where).not.toHaveProperty('agentId');
+  });
 });
