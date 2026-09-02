@@ -224,6 +224,23 @@ describe('listFulfillmentQuerySchema — 客人搜索 / 签证口径', () => {
   });
 });
 
+describe('listFulfillmentQuerySchema — pageSize 上限', () => {
+  it('默认 50；1-500 区间内接受', () => {
+    expect(listFulfillmentQuerySchema.parse({}).pageSize).toBe(50);
+    expect(listFulfillmentQuerySchema.parse({ pageSize: 1 }).pageSize).toBe(1);
+    expect(listFulfillmentQuerySchema.parse({ pageSize: 500 }).pageSize).toBe(500);
+  });
+
+  it('超过 500 拒绝（签证台自定义每页条数上限与此对齐）', () => {
+    expect(listFulfillmentQuerySchema.safeParse({ pageSize: 501 }).success).toBe(false);
+  });
+
+  it('0 或负数拒绝', () => {
+    expect(listFulfillmentQuerySchema.safeParse({ pageSize: 0 }).success).toBe(false);
+    expect(listFulfillmentQuerySchema.safeParse({ pageSize: -1 }).success).toBe(false);
+  });
+});
+
 describe('listFulfillmentQuerySchema — 签证口径「未标注」档', () => {
   it("接受 'UNSET'（未标注 = 订单级签证状态为空）", () => {
     expect(listFulfillmentQuerySchema.parse({ visaRequirement: 'UNSET' }).visaRequirement).toBe(

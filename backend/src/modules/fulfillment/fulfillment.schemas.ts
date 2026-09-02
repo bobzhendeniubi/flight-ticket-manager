@@ -88,7 +88,9 @@ export const listFulfillmentQuerySchema = z.object({
     .regex(/^\d{4}-\d{2}-\d{2}$/, '出发日期需为 YYYY-MM-DD')
     .optional(),
   page: z.coerce.number().int().min(1).default(1),
-  pageSize: z.coerce.number().int().min(1).max(200).default(50),
+  // 上限与前端签证台单次拉取上限（PAGE_SIZE）一致：签证岗自定义每页条数最多 500，
+  // 一次向后端拉的量跟着抬到 500，否则任务数超过旧上限（200）时前端会截断（只显示前 N 条）。
+  pageSize: z.coerce.number().int().min(1).max(500).default(50),
 });
 export type ListFulfillmentQuery = z.infer<typeof listFulfillmentQuerySchema>;
 

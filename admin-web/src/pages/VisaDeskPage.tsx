@@ -86,10 +86,30 @@ interface BatchActionOutcome extends BatchFulfillmentStatusResult {
   /** 整项请求失败（没拿到逐条结果）时的原因 */
   error: string | null;
 }
-// 列表单页拉取上限（与后端一致）
-const PAGE_SIZE = 200;
-const PAGE_SIZE_OPTIONS = [20, 30, 40, 50] as const;
+// 列表单页拉取上限（与后端 listFulfillmentQuerySchema.pageSize 一致）
+const PAGE_SIZE = 500;
+const PAGE_SIZE_OPTIONS = [20, 30, 40, 50, 100, 200] as const;
 const DEFAULT_PAGE_SIZE = 50;
+// 自定义每页条数的合法区间（1 = 至少显示一条；上限与 PAGE_SIZE 对齐，超过它也拉不到更多）
+const CUSTOM_PAGE_SIZE_MIN = 1;
+const CUSTOM_PAGE_SIZE_MAX = PAGE_SIZE;
+// 每页条数记在 localStorage：签证岗自己惯用的条数不必每次重选（隐私模式下存取会抛错，降级为不记忆）
+const PAGE_SIZE_STORAGE_KEY = 'ftm.visaDesk.pageSize';
+
+/** 读本机记忆的每页条数；缺失/解析失败/超出合法区间都回退默认值（永远给一个能用的数）。 */
+function loadStoredPageSize(): number {
+  try {
+    const raw = window.localStorage.getItem(PAGE_SIZE_STORAGE_KEY);
+    if (!raw) return DEFAULT_PAGE_SIZE;
+    const n = Number(raw);
+    if (!Number.isInteger(n) || n < CUSTOM_PAGE_SIZE_MIN || n > CUSTOM_PAGE_SIZE_MAX) {
+      return DEFAULT_PAGE_SIZE;
+    }
+    return n;
+  } catch {
+    return DEFAULT_PAGE_SIZE;
+  }
+}
 // 护照有效期临期阈值：距今 < 6 个月标黄
 const EXPIRY_SOON_MONTHS = 6;
 
@@ -1203,8 +1223,27 @@ export function VisaDeskPage() {
   // 代理搜索（走后端 agentQuery：代理公司名 / 联系人名）；防抖与另两个搜索框一致
   const [agentQueryInput, setAgentQueryInput] = useState('');
   const [debouncedAgentQuery, setDebouncedAgentQuery] = useState('');
-  const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
+  const [pageSize, setPageSize] = useState<number>(() => loadStoredPageSize());
+  // 每页条数下拉是否停在「自定义」档——独立于 pageSize 本身（哪怕自定义值凑巧等于某个预设档，
+  // 用户仍在编辑自定义输入框，不该被判定成选中了预设选项）。
+  const [customPageSizeMode, setCustomPageSizeMode] = useState<boolean>(() => {
+    const stored = loadStoredPageSize();
+    return !(PAGE_SIZE_OPTIONS as readonly number[]).includes(stored);
+  });
+  // 自定义输入框草稿（字符串，允许中途非法态）；仅在自定义档显示
+  const [customPageSizeDraft, setCustomPageSizeDraft] = useState<string>(() => {
+    const stored = loadStoredPageSize();
+    return (PAGE_SIZE_OPTIONS as readonly number[]).includes(stored) ? '' : String(stored);
+  });
   const [currentPage, setCurrentPage] = useState(1);
+  // 每页条数变化即记忆（含自定义值）；隐私模式下存不进去只影响下次记忆，不影响本次使用
+  useEffect(() => {
+    try {
+      window.localStorage.setItem(PAGE_SIZE_STORAGE_KEY, String(pageSize));
+    } catch {
+      // 存不进去就只影响记忆
+    }
+  }, [pageSize]);
   useEffect(() => {
     const t = setTimeout(() => setDebouncedNotesQuery(notesQueryInput.trim()), 400);
     return () => clearTimeout(t);
@@ -1341,8 +1380,8 @@ export function VisaDeskPage() {
   const effectiveCurrentPage = Math.min(currentPage, totalPages);
   const pageStart = (effectiveCurrentPage - 1) * pageSize;
   // 当前页 ids 仍按 pageStart/pageSize 计算。tbody 保留全量 OrderGroup 挂载，仅隐藏非当前页行：
-  // 今天本来就是平铺渲染全部任务（≤200 条），隐藏式分页不增加 DOM 成本；显式保存口径下，
-  // 选择保留草稿不丢优先于虚拟化。
+  // 今天本来就是平铺渲染全部任务（≤PAGE_SIZE=500 条），隐藏式分页不增加太多 DOM 成本；显式保存
+  // 口径下，选择保留草稿不丢优先于虚拟化。
   const currentPageTasks = useMemo(
     () => tasks.slice(pageStart, pageStart + pageSize),
     [tasks, pageStart, pageSize],
@@ -1389,6 +1428,29 @@ export function VisaDeskPage() {
       else visiblePassengerIds.forEach((id) => next.add(id));
       return next;
     });
+  };
+
+  // 每页条数下拉：选预设档直接生效并退出自定义态；选「自定义」进入自定义态，
+  // 输入框先带出当前 pageSize（不立即改变生效值，等用户填完确认）。
+  const handlePageSizeSelectChange = (value: string) => {
+    if (value === 'custom') {
+      setCustomPageSizeDraft(String(pageSize));
+      setCustomPageSizeMode(true);
+      return;
+    }
+    setCustomPageSizeMode(false);
+    setPageSize(Number(value));
+  };
+  // 自定义输入框失焦/回车才生效：1-500 内的整数才接受，非法值静默回退到上一次有效值
+  // （不弹错误提示——回退本身就是最直观的反馈）。
+  const commitCustomPageSize = () => {
+    const n = Math.trunc(Number(customPageSizeDraft));
+    if (Number.isFinite(n) && n >= CUSTOM_PAGE_SIZE_MIN && n <= CUSTOM_PAGE_SIZE_MAX) {
+      setPageSize(n);
+      setCustomPageSizeDraft(String(n));
+    } else {
+      setCustomPageSizeDraft(String(pageSize));
+    }
   };
   const clearSelection = useCallback(() => {
     setSelectedPassengerIds(new Set());
@@ -2145,7 +2207,9 @@ export function VisaDeskPage() {
             </span>
           )}
           {totalCount > tasks.length && (
-            <span className="badge-warning">仅显示前 {tasks.length} 条，请用筛选缩小范围</span>
+            <span className="badge-warning">
+              后端命中 {totalCount} 条，本页一次最多加载 {PAGE_SIZE} 条，请缩小出发日期区间
+            </span>
           )}
         </div>
       )}
@@ -2157,14 +2221,35 @@ export function VisaDeskPage() {
             <span>每页</span>
             <select
               className="rounded-md border border-slate-200 bg-white px-2 py-1 text-sm"
-              value={pageSize}
-              onChange={(e) => setPageSize(Number(e.target.value))}
+              value={customPageSizeMode ? 'custom' : String(pageSize)}
+              onChange={(e) => handlePageSizeSelectChange(e.target.value)}
               aria-label="每页条数"
             >
               {PAGE_SIZE_OPTIONS.map((n) => (
                 <option key={n} value={n}>{n} 条</option>
               ))}
+              <option value="custom">自定义</option>
             </select>
+            {customPageSizeMode && (
+              <input
+                type="number"
+                min={CUSTOM_PAGE_SIZE_MIN}
+                max={CUSTOM_PAGE_SIZE_MAX}
+                step={1}
+                className="input w-20 py-1 text-sm"
+                value={customPageSizeDraft}
+                onChange={(e) => setCustomPageSizeDraft(e.target.value)}
+                onBlur={commitCustomPageSize}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    e.preventDefault();
+                    commitCustomPageSize();
+                  }
+                }}
+                aria-label={`自定义每页条数（${CUSTOM_PAGE_SIZE_MIN}-${CUSTOM_PAGE_SIZE_MAX}）`}
+                title={`输入 ${CUSTOM_PAGE_SIZE_MIN}-${CUSTOM_PAGE_SIZE_MAX} 之间的整数，失焦或回车生效`}
+              />
+            )}
             <span className="text-xs text-ink-muted">表头「全选」只选当前页，翻页后可继续勾选累加</span>
           </div>
           <div className="flex items-center gap-2">
