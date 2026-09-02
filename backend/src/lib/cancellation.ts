@@ -18,6 +18,7 @@
  */
 import { type FulfillmentStatus, type FulfillmentTask, type Order, type OrderItem, type Prisma } from '@prisma/client';
 import { prisma } from '../db/prisma.js';
+import { isReturnCurrentlyReleased } from '../modules/orders/orders.leg-status.js';
 
 export interface CancellationTier {
   hoursBeforeDeparture: number; // -1 = 已履约
@@ -345,6 +346,34 @@ async function quoteItem(
   cancelAt: Date,
 ): Promise<GrossItemQuote> {
   const amount = Number(item.amount);
+
+  // ── 已释放 / 已作废的航段行：一律 0 退款，**显式分支，绝不靠兜底** ────────────────
+  // 座位已经放回库存重新卖掉了（回程 no-show 释放）或整段已作废（取消航段，金额已归零），
+  // 这份收入不能再退给客户第二次。
+  // 不能指望 hoursLeft === null 落进「无出发时间取最严档」的兜底：那条路取的是
+  // policy.tiers 里 feePercent 最大的一档，默认 FLIGHT 政策把最严档配成 50% 时，
+  // 一个座位已被重卖的航段会退掉一半钱。
+  if (item.kind === 'FLIGHT' && item.flightScheduleId === null) {
+    return {
+      itemId: item.id,
+      kind: item.kind,
+      description: item.description,
+      amount,
+      hoursLeft: null,
+      policyId: null,
+      policyName: '（该航段已释放/已作废）',
+      matchedTier: null,
+      feePercent: 100,
+      feeAmount: round2(Math.max(0, amount)),
+      refundAmount: 0,
+      reason: isReturnCurrentlyReleased(item)
+        ? '该航段座位已释放回库存重新销售，不参与退款'
+        : '该航段已释放/已作废（无有效班次），不参与退款',
+      fulfilled: item.fulfillmentTasks.some(
+        (t) => t.status === ('CONFIRMED' as FulfillmentStatus),
+      ),
+    };
+  }
 
   // 非正金额行（优惠/减免 DISCOUNT 等）：不进费率引擎。
   // 否则"保守按 100% 收费"会算出负手续费，抵减总手续费、把应退顶高（甚至超过实收）。

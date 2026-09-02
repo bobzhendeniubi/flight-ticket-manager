@@ -11,7 +11,9 @@ import {
   CANCELLABLE_STATUSES,
   computeRefundBreakdown,
   splitRefundBetweenCashAndBalance,
+  quoteCancellationForItem,
   validateTiers,
+  type CancellationQuoteItem,
   type CancellationTier,
   type GrossItemQuote,
 } from './cancellation.js';
@@ -558,5 +560,117 @@ describe('computeRefundBreakdown · offsetGrossCny 只改拆分、不改可退�
     expect(withOffset.refundToCashCny).toBe(6_000);
     expect(withOffset.refundToBalanceCny).toBe(1_000);
     expect(withoutOffset.refundToBalanceCny).toBe(0);
+  });
+});
+
+// ── 已释放 / 已作废航段行的退款报价（no-show 回程释放）────────────────────────────
+describe('quoteCancellationForItem — 已释放航段不参与退款', () => {
+  /** 默认机票取消政策：最严档 50%（故意配松，用来证明不是靠兜底拿到 0 退款）。 */
+  const LOOSE_FLIGHT_POLICY = {
+    id: 'pol-flight-default',
+    productKind: 'FLIGHT',
+    scope: null,
+    name: '机票默认政策',
+    isDefault: true,
+    tiers: [
+      { hoursBeforeDeparture: 72, feePercent: 10 },
+      { hoursBeforeDeparture: 0, feePercent: 50 },
+    ],
+  };
+
+  /** 只查 cancellationPolicy 的假 db（quoteCancellationForItem 的第三个参数）。 */
+  function fakeDb(policies: unknown[]) {
+    return {
+      cancellationPolicy: { findMany: async () => policies },
+    } as unknown as Parameters<typeof quoteCancellationForItem>[2];
+  }
+
+  /** 造一条机票明细行；scheduleId=null 表示座位已经不认这一行了。 */
+  function flightItem(overrides: {
+    scheduleId: string | null;
+    metadata?: unknown;
+    amount?: number;
+  }): CancellationQuoteItem {
+    return {
+      id: 'itm-1',
+      kind: 'FLIGHT',
+      description: '[回程已释放] HKG → PVG',
+      amount: overrides.amount ?? 5_000,
+      flightScheduleId: overrides.scheduleId,
+      hotelRoomTypeId: null,
+      bundleId: null,
+      visaId: null,
+      transferId: null,
+      hotelCheckIn: null,
+      metadata: overrides.metadata ?? null,
+      flightSchedule: null,
+      fulfillmentTasks: [],
+    } as unknown as CancellationQuoteItem;
+  }
+
+  const RELEASED_META = {
+    returnReleased: { at: '2026-09-02T03:15:23.000Z', releasedSeats: [] },
+  };
+
+  it('回程座位已释放的行：手续费 100%、应退 0', async () => {
+    const q = await quoteCancellationForItem(
+      flightItem({ scheduleId: null, metadata: RELEASED_META }),
+      new Date('2026-09-02T04:00:00.000Z'),
+      fakeDb([LOOSE_FLIGHT_POLICY]),
+    );
+    expect(q.feePercent).toBe(100);
+    expect(q.refundAmount).toBe(0);
+    expect(q.feeAmount).toBe(5_000);
+    expect(q.policyName).toBe('（该航段已释放/已作废）');
+    expect(q.reason).toBe('该航段座位已释放回库存重新销售，不参与退款');
+    expect(q.policyId).toBeNull();
+  });
+
+  it('默认机票政策最严档配成 50% 时，已释放行仍然一分不退（不走"无出发时间取最严档"兜底）', async () => {
+    const q = await quoteCancellationForItem(
+      flightItem({ scheduleId: null, metadata: RELEASED_META, amount: 8_000 }),
+      new Date('2026-09-02T04:00:00.000Z'),
+      fakeDb([LOOSE_FLIGHT_POLICY]),
+    );
+    // 兜底口径会给 50% → 应退 4000；显式分支必须压到 0。
+    expect(q.refundAmount).toBe(0);
+    expect(q.feePercent).toBe(100);
+    expect(q.matchedTier).toBeNull();
+  });
+
+  it('已作废航段（金额归零 + returnLegCancelled 快照）：文案区分于"已释放"', async () => {
+    const q = await quoteCancellationForItem(
+      flightItem({
+        scheduleId: null,
+        amount: 0,
+        metadata: { returnLegCancelled: { at: '2026-08-30T00:00:00.000Z' } },
+      }),
+      new Date('2026-09-02T04:00:00.000Z'),
+      fakeDb([LOOSE_FLIGHT_POLICY]),
+    );
+    expect(q.refundAmount).toBe(0);
+    expect(q.feeAmount).toBe(0);
+    expect(q.reason).toBe('该航段已释放/已作废（无有效班次），不参与退款');
+  });
+
+  it('已恢复回程（班次写回）不受影响：照常走时间档', async () => {
+    const item = {
+      ...flightItem({
+        scheduleId: 'sch-1',
+        metadata: {
+          returnReleased: { at: '2026-09-02T03:00:00.000Z' },
+          returnRestored: { at: '2026-09-02T05:00:00.000Z' },
+        },
+      }),
+      flightSchedule: { departureTime: new Date('2026-09-12T00:00:00.000Z') },
+    } as CancellationQuoteItem;
+    const q = await quoteCancellationForItem(
+      item,
+      new Date('2026-09-02T04:00:00.000Z'),
+      fakeDb([LOOSE_FLIGHT_POLICY]),
+    );
+    expect(q.feePercent).toBe(10);
+    expect(q.refundAmount).toBe(4_500);
+    expect(q.policyName).toBe('机票默认政策');
   });
 });
