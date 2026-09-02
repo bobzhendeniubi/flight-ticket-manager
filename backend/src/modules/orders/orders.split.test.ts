@@ -1014,3 +1014,62 @@ describe('拆单 · 幂等与守恒兜底', () => {
     expect(mockPrisma.orderSplitRecord.create).not.toHaveBeenCalled();
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════════
+// A5：会话/座位账快照不跨单继承
+// ══════════════════════════════════════════════════════════════════════════
+describe('拆单 · 不继承 no-show / 释放 / 取消航段快照', () => {
+  const snapshotMeta = {
+    // 业务键：该继承的照常继承。
+    businessUpgradeCount: 0,
+    goDate: '2026-09-10',
+    // 会话/座位账快照：一律剔除（requestToken 跨单重复会命中别单的幂等回放；
+    // releasedSeats 跟着走会让新单「恢复回程」凭空多占座）。
+    noShow: { at: '2026-09-02T03:00:00.000Z', requestToken: TOKEN },
+    returnReleased: {
+      at: '2026-09-02T03:00:00.000Z',
+      requestToken: TOKEN,
+      releasedSeats: [{ scheduleId: 'sch1', cabin: 'ECONOMY', quantity: 2 }],
+    },
+    returnRestored: { at: '2026-09-02T04:00:00.000Z', requestToken: TOKEN },
+    returnVoidedFinal: { at: '2026-09-02T05:00:00.000Z' },
+    returnLegCancelled: { at: '2026-09-02T06:00:00.000Z', originalAmountCny: 3000 },
+  };
+
+  it('拆出的新行只带业务键，五个快照键一个都不复制', async () => {
+    armExecute({
+      order: baseOrder({ items: [flightItem({ metadata: snapshotMeta })] }),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 0 },
+      finalTarget: { total: 1000, paidAmount: 500 },
+    });
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    const splitCreate = mockPrisma.orderItem.create.mock.calls.find(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0].data.kind === 'FLIGHT',
+    );
+    const meta = splitCreate?.[0].data.metadata as Record<string, unknown>;
+    expect(meta).toMatchObject({ goDate: '2026-09-10', splitFromItemId: 'i1' });
+    for (const key of [
+      'noShow',
+      'returnReleased',
+      'returnRestored',
+      'returnVoidedFinal',
+      'returnLegCancelled',
+    ]) {
+      expect(meta).not.toHaveProperty(key);
+    }
+  });
+
+  it('预检提示：源单去程已标 no-show，拆出的新单不会自动带标记', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(
+      baseOrder({ items: [flightItem({ metadata: { noShow: { at: '2026-09-02T03:00:00.000Z' } } })] }),
+    );
+    armCleanGates();
+    const preview = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
+    expect(preview.warnings.join('')).toContain('拆出的新单不会自动带标记');
+  });
+});

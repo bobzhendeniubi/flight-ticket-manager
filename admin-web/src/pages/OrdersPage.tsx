@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, splitBlockedReasons, splitDoneNoShowFailedOrderId } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type OrderLegFlagFilter, splitBlockedReasons, splitDoneNoShowFailedOrderId } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -824,6 +824,9 @@ export function OrdersPage() {
   // visaRequirement 两个参数，列表与导出共用同一份，不再各拆一次。
   // 列表行程类型筛选：后端按物化列 hasReturnLeg 收口；票务快捷导出面板另有自己的 tkTripType，不共用。
   const [tripTypeFilter, setTripTypeFilter] = useState<'' | 'oneway' | 'roundtrip'>('');
+  // 航段状态筛选（去程未登机 / 回程已释放·已恢复·已作废）：后端按订单级派生标记筛选，
+  // 与列表「内容」列的航段状态短标同源；''=全部。
+  const [legFlagFilter, setLegFlagFilter] = useState<'' | OrderLegFlagFilter>('');
   // 文本筛选防抖：停止输入 400ms 后才请求后端，避免每个键击打一次接口
   const [debouncedFlightNumber, setDebouncedFlightNumber] = useState('');
   const [debouncedPassengerName, setDebouncedPassengerName] = useState('');
@@ -888,9 +891,11 @@ export function OrdersPage() {
       q.visaFulfillmentStatus = visaFilterCode.slice(4) as NonNullable<ListOrdersParams['visaFulfillmentStatus']>;
     }
     if (tripTypeFilter) q.tripType = tripTypeFilter;
+    // 航段状态：后端按订单级派生标记筛选，导出侧同名同义（见 toOrdersExportFilter）。
+    if (legFlagFilter) q.legFlag = legFlagFilter;
     if (debouncedSearch.trim()) q.search = debouncedSearch.trim();
     return q;
-  }, [kindFilter, agentFilter, channelFilter, createdFromParam, createdToParam, travelFrom, travelTo, returnFrom, returnTo, flightDateFrom, flightDateTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, debouncedRecordedBy, invoiceLegFilter, visaFilterCode, tripTypeFilter, debouncedSearch]);
+  }, [kindFilter, agentFilter, channelFilter, createdFromParam, createdToParam, travelFrom, travelTo, returnFrom, returnTo, flightDateFrom, flightDateTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, debouncedRecordedBy, invoiceLegFilter, visaFilterCode, tripTypeFilter, legFlagFilter, debouncedSearch]);
   // 三模板筛选导出（全岗可用/票务专用/签证专用）
   const [exportTemplate, setExportTemplate] = useState<OrderExportTemplate>('full');
   const [exporting, setExporting] = useState(false);
@@ -2256,7 +2261,7 @@ export function OrdersPage() {
               kindFilter || createdFrom || createdTo || travelFrom || travelTo || returnFrom || returnTo ||
               flightDateFrom || flightDateTo ||
               flightNumberFilter.trim() || passengerNameFilter.trim() || recordedByFilter.trim() ||
-              invoiceLegFilter || visaFilterCode || tripTypeFilter || claimFilter,
+              invoiceLegFilter || visaFilterCode || tripTypeFilter || legFlagFilter || claimFilter,
             );
             return (
               <span className={isFiltered ? 'badge-info' : 'badge-neutral'}>
@@ -2836,6 +2841,21 @@ export function OrdersPage() {
             </select>
           </div>
           <div>
+            <label className="label">航段状态</label>
+            <select
+              className="input"
+              value={legFlagFilter}
+              onChange={(e) => setLegFlagFilter(e.target.value as '' | OrderLegFlagFilter)}
+              title="按 no-show / 回程释放的处理痕迹筛选：去程未登机、回程座位已放回库存、回程已恢复占位、回程已最终作废。与列表「内容」列的航段状态短标同一口径。"
+            >
+              <option value="">全部</option>
+              <option value="NO_SHOW">去程未登机</option>
+              <option value="RETURN_RELEASED">回程已释放</option>
+              <option value="RETURN_RESTORED">回程已恢复</option>
+              <option value="RETURN_VOIDED">回程已作废</option>
+            </select>
+          </div>
+          <div>
             <label className="label">开票筛选</label>
             <select
               className="input"
@@ -3000,7 +3020,7 @@ export function OrdersPage() {
           </div>
           </div>
         </div>
-        {(statusFilter || kindFilter || tripTypeFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || recordedByFilter || invoiceLegFilter || visaFilterCode || createdFrom || createdTo || travelFrom || travelTo || returnFrom || returnTo || flightDateFrom || flightDateTo) && (
+        {(statusFilter || kindFilter || tripTypeFilter || legFlagFilter || channelFilter || agentFilter || search || flightNumberFilter || passengerNameFilter || recordedByFilter || invoiceLegFilter || visaFilterCode || createdFrom || createdTo || travelFrom || travelTo || returnFrom || returnTo || flightDateFrom || flightDateTo) && (
           <div className="mt-3 flex items-center justify-between text-xs text-slate-500">
             {/* 日期筛选回显 — 两个框各自独立生效，只填一个就是开区间；把当前生效的条件和命中单数
                 摊开写清楚，填了「从」却看到更晚的订单时一眼就知道为什么，不用猜。 */}
@@ -3042,7 +3062,7 @@ export function OrdersPage() {
               className="text-brand hover:text-brand-dark"
               onClick={() => {
                 setStatusFilter(''); setKindFilter(''); setChannelFilter(''); setAgentFilter(''); setSearch('');
-                setFlightNumberFilter(''); setPassengerNameFilter(''); setRecordedByFilter(''); setInvoiceLegFilter(''); setVisaFilterCode(''); setTripTypeFilter('');
+                setFlightNumberFilter(''); setPassengerNameFilter(''); setRecordedByFilter(''); setInvoiceLegFilter(''); setVisaFilterCode(''); setTripTypeFilter(''); setLegFlagFilter('');
                 setCreatedFrom(''); setCreatedTo(''); setCreatedFromTime(''); setCreatedToTime(''); setTravelFrom(''); setTravelTo(''); setReturnFrom(''); setReturnTo(''); setFlightDateFrom(''); setFlightDateTo('');
               }}
             >
@@ -5272,20 +5292,34 @@ function OrderDrawer({
           />
 
           {/* no-show 处理：航司 no-show 名单来了之后，票务在这里标去程 no-show + 释放回程座位。
-              已标过就不再给入口（回程要恢复走产品内容里回程行的「恢复回程」）。 */}
-          {isOps &&
-            !noShowOpen &&
-            (o.items ?? []).some((it) => it.kind === 'FLIGHT' && it.flightScheduleId) &&
-            !orderHasNoShow(o) && (
+              标过之后入口收起（回程要恢复走产品内容里回程行的「恢复回程」）；但回程恢复之后
+              代理又不要了是常态，此时入口以「再次释放回程」的名义重新出现——否则运营只能干看着
+              一张已恢复的回程单没有任何出口。 */}
+          {(() => {
+            if (!isOps || noShowOpen) return null;
+            const hasLiveFlight = (o.items ?? []).some((it) => it.kind === 'FLIGHT' && it.flightScheduleId);
+            if (!hasLiveFlight) return null;
+            const noShowDone = orderHasNoShow(o);
+            const returnRestored = (o.items ?? []).some(
+              (it) => readReturnLegLifecycle(it)?.kind === 'RESTORED',
+            );
+            const releaseAgain = noShowDone && returnRestored;
+            if (noShowDone && !releaseAgain) return null;
+            return (
               <button
                 type="button"
                 className="text-[11px] font-medium text-slate-600 hover:text-ink"
                 onClick={() => setNoShowOpen(true)}
-                title="客人没登机：去程标 no-show（钱不动），回程座位放回库存重新可卖"
+                title={
+                  releaseAgain
+                    ? '去程已标 no-show、回程已恢复：代理又不要回程时，把座位再放回库存重新可卖（钱不动）'
+                    : '客人没登机：去程标 no-show（钱不动），回程座位放回库存重新可卖'
+                }
               >
-                no-show 处理
+                {releaseAgain ? '再次释放回程' : 'no-show 处理'}
               </button>
-            )}
+            );
+          })()}
           {isOps && noShowOpen && (
             <NoShowPanel
               order={o}
@@ -6947,13 +6981,19 @@ function readReturnVoidedFinalAt(metadata: unknown): string | null | undefined {
 }
 
 /**
- * 回程行当前处于哪一态。判定口径（与后端约定）：
- *   returnVoidedFinal 存在              → 已作废（终态，最高优先级）
- *   班次为空 + 有 returnReleased        → 已释放（可恢复）
- *   班次非空 + 有 returnRestored        → 已恢复（returnReleased 仍留着当历史，不能据它判当前态）
+ * 回程行当前处于哪一态。判定口径（与后端约定，按优先级从高到低）：
+ *   returnVoidedFinal 存在              → 已作废（终态）
+ *   returnLegCancelled 存在             → 已取消（走的是「取消航段」售后，与 no-show 释放不是一条链路；
+ *                                         取消也会把班次置空，若不先拦一道，历史释放快照会把已取消的行
+ *                                         误判成「已释放（可恢复）」，凭空长出一个恢复入口）
+ *   班次为空 + 释放打标晚于恢复打标      → 已释放（可恢复）
+ *   班次非空 + 有 returnRestored        → 已恢复
+ * 释放与恢复的打标会同时留存（恢复后再次释放是正常流程），所以当前态只能按时间戳定，
+ * 不能只看快照存不存在。两边时间戳都缺（老数据）时以「班次为空」为准，不丢徽标。
  */
 type ReturnLegLifecycle =
   | { kind: 'VOIDED'; at: string | null }
+  | { kind: 'CANCELLED'; leg: FlightLegSide }
   | { kind: 'RELEASED'; mark: ReturnReleasedMark }
   | { kind: 'RESTORED'; mark: ReturnRestoredMark }
   | null;
@@ -6961,9 +7001,13 @@ function readReturnLegLifecycle(item: OrderItem): ReturnLegLifecycle {
   if (item.kind !== 'FLIGHT') return null;
   const voidedAt = readReturnVoidedFinalAt(item.metadata);
   if (voidedAt !== undefined) return { kind: 'VOIDED', at: voidedAt };
+  const cancelledLeg = readCancelledLeg(item.metadata);
+  if (cancelledLeg) return { kind: 'CANCELLED', leg: cancelledLeg };
   const released = readReturnReleasedMark(item.metadata);
-  if (!item.flightScheduleId && released) return { kind: 'RELEASED', mark: released };
   const restored = readReturnRestoredMark(item.metadata);
+  if (!item.flightScheduleId && released && (released.at ?? '') >= (restored?.at ?? '')) {
+    return { kind: 'RELEASED', mark: released };
+  }
   if (item.flightScheduleId && restored) return { kind: 'RESTORED', mark: restored };
   return null;
 }
@@ -7242,7 +7286,8 @@ function OrderItemRow({
               升舱
             </button>
           )}
-          {canEditPrice && !legCancelled && !rescheduling && !editingPrice && (
+          {/* 已释放的回程行班次是空的、座位已回库存：改结算价与改期/升舱/取消同理，一律不给入口。 */}
+          {canEditPrice && !legCancelled && !returnReleased && !rescheduling && !editingPrice && (
             <>
               <button
                 className="text-[11px] font-medium text-amber-600 hover:text-amber-800 disabled:cursor-not-allowed disabled:text-slate-400"
@@ -8450,23 +8495,28 @@ function RestoreReturnLegForm({
 
   const original = preview?.original ?? null;
   const needsOversell = preview?.needsOversell === true;
+  // 要占回去的座位数以预检的原班次快照为准（后端口径 = 释放时实际放回库存的 Σ releasedSeats），
+  // 不按订单行数量另算——部分人 no-show 拆过单时两者不是同一个数。
   const seats = original?.quantity ?? 0;
+  const warnings = preview?.warnings ?? [];
 
   const submit = async () => {
     if (!token || submitting || !preview?.eligible || !original) return;
     setErr(null);
     const legLabel = `${original.flightNumber ?? '原班次'}${original.departDate ? ` ${original.departDate}` : ''}`;
+    // 后端提示（如开票位已清）跟着确认框一起走，避免只在面板里一闪而过没人看见。
+    const warningLines = warnings.length > 0 ? `\n\n${warnings.map((w) => `· ${w}`).join('\n')}` : '';
     const confirmed = await confirm(
       needsOversell
         ? {
             title: '恢复回程（超售）',
-            body: `${legLabel} 已满，当前余位 ${preview.available} 座。\n\n确认超售 ${preview.oversellBy} 座并恢复回程，将记关键审计。钱款不动。`,
+            body: `${legLabel} 已满，当前余位 ${preview.available} 座。\n\n确认超售 ${preview.oversellBy} 座并恢复回程，将记关键审计。钱款不动。${warningLines}`,
             tone: 'danger',
             confirmText: `确认超售 ${preview.oversellBy} 座并恢复`,
           }
         : {
             title: '恢复回程',
-            body: `将把 ${seats} 座重新占回 ${legLabel}（当前余位 ${preview.available} 座）。钱款不动。`,
+            body: `将把 ${seats} 座重新占回 ${legLabel}（当前余位 ${preview.available} 座）。钱款不动。${warningLines}`,
             confirmText: '确认恢复回程',
           },
     );
@@ -8506,6 +8556,17 @@ function RestoreReturnLegForm({
               : [preview.departed ? '原班次已起飞' : '预检未通过']
             ).map((b) => (
               <li key={b}>{b}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {warnings.length > 0 && (
+        <div className="space-y-1 rounded border border-amber-300 bg-amber-50 px-2 py-1.5 text-amber-800">
+          <div className="font-medium">请先确认：</div>
+          <ul className="list-disc space-y-0.5 pl-4">
+            {warnings.map((w) => (
+              <li key={w}>{w}</li>
             ))}
           </ul>
         </div>
@@ -8595,38 +8656,106 @@ function NoShowPanel({
   const [err, setErr] = useState<string | null>(null);
   /** 后端拒绝拆单（如套餐单）时原样列出的逐条原因 */
   const [splitBlockers, setSplitBlockers] = useState<string[]>([]);
+  /** 勾选变化触发的重新预检是否在途（首次加载走 previewLoading，两者分开显示）。 */
+  const [repreviewing, setRepreviewing] = useState(false);
+  /** 请求序号：勾选连点会并发多次预检，只认最后一次的响应，防旧响应盖新结果。 */
+  const previewSeqRef = useRef(0);
+  /** 首次预检是否已回来（回来前不触发勾选联动预检，否则会跟首次请求打架）。 */
+  const initializedRef = useRef(false);
+  /** 最近一次已经预检过的勾选组合，用来跳过「默认全选」这类没变化的重复请求。 */
+  const previewedKeyRef = useRef<string | null>(null);
+
+  // 「再次释放回程」：去程早已标过 no-show、回程恢复后代理又不要了。此时不再选人、不再动去程，
+  // 面板收敛成「只释放回程」；后端 alreadyNoShow 仍为 true，blockers 为空即可提交。
+  const orderNoShowMark =
+    (order.items ?? [])
+      .map((it) => (it.kind === 'FLIGHT' ? readNoShowMark(it.metadata) : null))
+      .find((m): m is NonNullable<typeof m> => m != null) ?? null;
+  const releaseAgain = orderNoShowMark != null;
+
+  /** 把预检结果落到面板：回程已起飞时强制取消「同时释放回程」（勾了也会被后端拒）。 */
+  const applyPreview = useCallback((res: NoShowPreview) => {
+    setPreview(res);
+    if (res.returnDeparted) setReleaseReturn(false);
+  }, []);
 
   useEffect(() => {
     if (!token) return;
     let cancelled = false;
+    const seq = ++previewSeqRef.current;
     setPreviewLoading(true);
     setPreviewErr(null);
     api
       .previewNoShow(token, order.id)
       .then((res) => {
-        if (cancelled) return;
-        setPreview(res);
+        if (cancelled || seq !== previewSeqRef.current) return;
+        applyPreview(res);
         // 默认全选＝整单处理（勾掉部分人才走拆单）。
-        setSelectedIds(new Set((res.passengers ?? []).map((p) => p.id)));
+        const allIds = (res.passengers ?? []).map((p) => p.id);
+        setSelectedIds(new Set(allIds));
+        // 首次预检就是「整单」口径，记下它，勾选联动不必再原样请求一遍。
+        previewedKeyRef.current = [...allIds].sort().join(',');
+        initializedRef.current = true;
       })
       .catch((e) => {
-        if (!cancelled) setPreviewErr(e instanceof ApiError ? e.message : 'no-show 预检失败');
+        if (!cancelled && seq === previewSeqRef.current) {
+          setPreviewErr(e instanceof ApiError ? e.message : 'no-show 预检失败');
+        }
       })
       .finally(() => {
-        if (!cancelled) setPreviewLoading(false);
+        if (!cancelled && seq === previewSeqRef.current) setPreviewLoading(false);
       });
     return () => {
       cancelled = true;
     };
-  }, [order.id, token]);
+  }, [order.id, token, applyPreview]);
 
   const passengers = preview?.passengers ?? [];
-  const showPicker = passengers.length >= 2;
+  // 再次释放回程时不选人（去程已定案），选人框只在首次 no-show 且多人单时出现。
+  const showPicker = !releaseAgain && passengers.length >= 2;
   const isPartial = showPicker && selectedIds.size > 0 && selectedIds.size < passengers.length;
   const outboundItem = preview?.outboundItem ?? null;
   const returnItem = preview?.returnItem ?? null;
   const warnings = preview?.warnings ?? [];
+  const returnDeparted = preview?.returnDeparted === true;
   const releasingSeats = returnItem?.quantity ?? 0;
+  // 勾选人变化后必须重新预检：拆单口径（scope）与 blockers 都是按所选乘客算的，
+  // 拿首次整单的预检结果去提交，等于用一份过期的判断结果做资金/库存动作。
+  const selectedKey = [...selectedIds].sort().join(',');
+  useEffect(() => {
+    if (!token || !initializedRef.current || releaseAgain) return;
+    // 一个都没勾时不发请求（提交侧已拦「请至少勾选 1 位」），避免把空选当整单预检误导操作人。
+    if (selectedIds.size === 0) return;
+    if (previewedKeyRef.current === selectedKey) return;
+    const ids = isPartial ? [...selectedIds] : undefined;
+    const timer = setTimeout(() => {
+      const seq = ++previewSeqRef.current;
+      setRepreviewing(true);
+      api
+        .previewNoShow(token, order.id, ids)
+        .then((res) => {
+          if (seq !== previewSeqRef.current) return;
+          applyPreview(res);
+          previewedKeyRef.current = selectedKey;
+          setPreviewErr(null);
+        })
+        .catch((e) => {
+          if (seq !== previewSeqRef.current) return;
+          setPreviewErr(e instanceof ApiError ? e.message : 'no-show 预检失败');
+        })
+        .finally(() => {
+          if (seq === previewSeqRef.current) setRepreviewing(false);
+        });
+    }, 300);
+    return () => clearTimeout(timer);
+    // selectedKey 是 selectedIds 的稳定字符串投影（Set 每次都是新引用，不能直接进依赖）。
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [selectedKey, isPartial, order.id, token, releaseAgain, applyPreview]);
+
+  // 再次释放回程：后端仍会回 alreadyNoShow=true（去程确实标过），此时 eligible 未必为真，
+  // 但只要没有 blockers 就等价于一次「只释放回程」，可以提交。
+  const canProceed =
+    preview != null && (preview.eligible || (releaseAgain && preview.blockers.length === 0));
 
   const togglePassenger = (id: string) => {
     setSelectedIds((prev) => {
@@ -8638,24 +8767,27 @@ function NoShowPanel({
   };
 
   const submit = async () => {
-    if (!token || submitting || !preview?.eligible || !outboundItem) return;
+    if (!token || submitting || !canProceed || !outboundItem) return;
     setErr(null);
     setSplitBlockers([]);
     if (showPicker && selectedIds.size === 0) {
       setErr('请至少勾选 1 位 no-show 乘客');
       return;
     }
-    const releaseLine =
-      returnItem && releaseReturn
-        ? `回程 ${releasingSeats} 座放回库存可卖，之后代理来要可恢复。`
+    // 回程已起飞时永远不释放：勾选框是禁用态，也不把残留的 true 发出去。
+    const doRelease = Boolean(returnItem) && releaseReturn && !returnDeparted;
+    const releaseLine = doRelease
+      ? `回程 ${releasingSeats} 座放回库存可卖，之后代理来要可恢复。`
+      : returnDeparted
+        ? '回程已起飞，本次只记录 no-show，不释放座位。'
         : '本次不释放回程座位。';
     const confirmed = await confirm({
-      title: 'no-show 处理',
+      title: releaseAgain ? '再次释放回程' : 'no-show 处理',
       body:
-        `去程标 no-show，钱一分不退不动。\n${releaseLine}` +
+        (releaseAgain ? `去程已标 no-show，本次只处理回程。\n${releaseLine}` : `去程标 no-show，钱一分不退不动。\n${releaseLine}`) +
         (isPartial ? `\n\n只勾了 ${selectedIds.size} 位：系统会先拆单，再对拆出的新单处理。` : '') +
-        (returnItem?.ticketed && releaseReturn ? '\n\n回程已出票，释放后会给票务派撤名单工单。' : ''),
-      confirmText: '确认处理',
+        (returnItem?.ticketed && doRelease ? '\n\n回程已出票，释放后会给票务派撤名单工单。' : ''),
+      confirmText: releaseAgain ? '确认释放回程' : '确认处理',
     });
     if (!confirmed) return;
     setSubmitting(true);
@@ -8663,8 +8795,8 @@ function NoShowPanel({
       const res = await api.markNoShow(token, order.id, {
         requestToken: requestTokenRef.current,
         passengerIds: isPartial ? [...selectedIds] : undefined,
-        // 没有回程航段时恒 false：勾选框此时是禁用态，别把默认的 true 发出去。
-        releaseReturn: returnItem ? releaseReturn : false,
+        // 没有回程航段/回程已起飞时恒 false：勾选框此时是禁用态，别把默认的 true 发出去。
+        releaseReturn: doRelease,
         note: note.trim() || undefined,
       });
       const seats = res.audit.releasedSeats.reduce((sum, r) => sum + r.quantity, 0);
@@ -8682,7 +8814,11 @@ function NoShowPanel({
         }
         return;
       }
-      alert(`已标记去程 no-show${seats > 0 ? `，回程 ${seats} 座已放回库存可卖` : ''}${workOrderLine}`);
+      alert(
+        releaseAgain
+          ? `已再次释放回程${seats > 0 ? ` ${seats} 座，已放回库存可卖` : ''}${workOrderLine}`
+          : `已标记去程 no-show${seats > 0 ? `，回程 ${seats} 座已放回库存可卖` : ''}${workOrderLine}`,
+      );
       onSaved(res.order);
     } catch (e) {
       const blockers = splitBlockedReasons(e);
@@ -8703,26 +8839,57 @@ function NoShowPanel({
 
   return (
     <div className="space-y-2 rounded-md border border-slate-300 bg-white p-3 text-xs">
-      <div className="font-medium text-ink">no-show 处理</div>
+      <div className="font-medium text-ink">{releaseAgain ? '再次释放回程' : 'no-show 处理'}</div>
       <p className="leading-snug text-slate-500">
-        按航司 no-show 名单：客人没登机 → 去程标 no-show（钱不动），回程座位放回库存重新可卖（钱同样不动）。
+        {releaseAgain
+          ? '去程已标 no-show。回程恢复后代理又不要了，可以把回程座位再放回库存重新可卖（钱同样不动）。'
+          : '按航司 no-show 名单：客人没登机 → 去程标 no-show（钱不动），回程座位放回库存重新可卖（钱同样不动）。'}
       </p>
 
       {previewLoading && <div className="text-slate-500">正在核对本单是否可处理…</div>}
+      {!previewLoading && repreviewing && (
+        <div className="text-slate-500">正在按所选乘客重新核对…</div>
+      )}
       {previewErr && <div className="rounded bg-red-50 px-2 py-1 text-red-700">{previewErr}</div>}
 
-      {preview?.alreadyNoShow && (
-        <div className="rounded bg-slate-100 px-2 py-1 text-slate-600">本单去程已经标过 no-show。</div>
+      {/* 去程已标 no-show：首次处理时是「不要重复处理」的提示，再次释放回程时是只读事实交代。 */}
+      {(releaseAgain || preview?.alreadyNoShow) && (
+        <div className="rounded bg-slate-100 px-2 py-1 text-slate-600">
+          {releaseAgain && orderNoShowMark?.at
+            ? `去程已标 no-show（${formatDateTimeSecCn(orderNoShowMark.at)}），本次不再改动去程。`
+            : releaseAgain
+              ? '去程已标 no-show，本次不再改动去程。'
+              : '本单去程已经标过 no-show。'}
+        </div>
       )}
 
-      {preview && !preview.eligible && (
+      {preview && !canProceed && (
         <div className="space-y-1 rounded bg-red-50 px-2 py-1 text-red-700">
-          <div className="font-medium">当前不能做 no-show 处理：</div>
+          <div className="font-medium">
+            {releaseAgain ? '当前不能再次释放回程：' : '当前不能做 no-show 处理：'}
+          </div>
           <ul className="list-disc space-y-0.5 pl-4">
             {(preview.blockers.length > 0 ? preview.blockers : ['预检未通过']).map((b) => (
               <li key={b}>{b}</li>
             ))}
           </ul>
+        </div>
+      )}
+
+      {/* 拆单口径由后端预检给（scope），不靠前端按勾选数自己猜：只勾部分人时后端会先拆单、
+          再对拆出的新单处理，这一步必须让操作人在提交前就看见。 */}
+      {preview?.scope === 'SPLIT_REQUIRED' && (
+        <div className="space-y-1 rounded border border-amber-300 bg-amber-50 px-2 py-1.5 text-amber-800">
+          <div className="font-medium">
+            将先拆单，再对拆出的新单处理（本次涉及 {selectedIds.size} 位）。
+          </div>
+          {preview.blockers.length > 0 && (
+            <ul className="list-disc space-y-0.5 pl-4">
+              {preview.blockers.map((b) => (
+                <li key={b}>{b}</li>
+              ))}
+            </ul>
+          )}
         </div>
       )}
 
@@ -8737,29 +8904,31 @@ function NoShowPanel({
         </div>
       )}
 
-      {preview && preview.eligible && (
-        <>
-          <div className="space-y-0.5 rounded border border-slate-200 bg-slate-50/60 p-2">
-            <div className="text-ink">
-              去程：{outboundItem ? outboundItem.description : '（未找到去程航段）'}
-            </div>
-            {outboundItem && (
-              <div className="text-slate-500">
-                {outboundItem.flightNumber && <>{outboundItem.flightNumber} · </>}
-                {outboundItem.departDate && <>{outboundItem.departDate} · </>}
-                {outboundItem.cabin && <>{CABIN_ZH[outboundItem.cabin] ?? outboundItem.cabin} · </>}
-                {outboundItem.quantity} 座
-              </div>
-            )}
-            {returnItem && (
-              <div className="mt-1 text-slate-500">
-                回程：{returnItem.flightNumber ?? '（班次号缺失）'}
-                {returnItem.departDate && <> · {returnItem.departDate}</>} · {returnItem.quantity} 座
-              </div>
-            )}
+      {preview && (
+        <div className="space-y-0.5 rounded border border-slate-200 bg-slate-50/60 p-2">
+          <div className="text-ink">
+            去程：{outboundItem ? outboundItem.description : '（未找到去程航段）'}
           </div>
+          {outboundItem && (
+            <div className="text-slate-500">
+              {outboundItem.flightNumber && <>{outboundItem.flightNumber} · </>}
+              {outboundItem.departDate && <>{outboundItem.departDate} · </>}
+              {outboundItem.cabin && <>{CABIN_ZH[outboundItem.cabin] ?? outboundItem.cabin} · </>}
+              {outboundItem.quantity} 座
+            </div>
+          )}
+          {returnItem && (
+            <div className="mt-1 text-slate-500">
+              回程：{returnItem.flightNumber ?? '（班次号缺失）'}
+              {returnItem.departDate && <> · {returnItem.departDate}</>} · {returnItem.quantity} 座
+              {returnDeparted && <span className="ml-1 text-amber-700">（已起飞）</span>}
+            </div>
+          )}
+        </div>
+      )}
 
-          {showPicker && (
+      {/* 选人框不跟着 eligible 走：部分人预检不通过时若把它一起藏掉，操作人连改回全选的入口都没有。 */}
+      {showPicker && (
             <div className="rounded border border-slate-200 bg-slate-50/60 p-2">
               <div className="mb-1 flex items-center justify-between">
                 <span className="text-slate-500">no-show 乘客（默认全选＝整单处理）</span>
@@ -8797,26 +8966,32 @@ function NoShowPanel({
                   </li>
                 ))}
               </ul>
-              {isPartial && (
+              {/* 服务端 scope 还没跟上（防抖窗口内）时的即时回声，scope 回来后由上面的横幅接管。 */}
+              {isPartial && preview?.scope !== 'SPLIT_REQUIRED' && (
                 <p className="mt-1 rounded bg-amber-50 px-2 py-1 text-[11px] leading-snug text-amber-800">
                   将先拆单，再对拆出的新单处理。
                 </p>
               )}
-            </div>
-          )}
+        </div>
+      )}
 
+      {preview && canProceed && (
+        <>
           <label className="flex items-start gap-1.5">
             <input
               type="checkbox"
               className="mt-0.5"
               checked={releaseReturn}
               onChange={(e) => setReleaseReturn(e.target.checked)}
-              disabled={submitting || !returnItem}
+              disabled={submitting || !returnItem || returnDeparted}
             />
             <span>
-              同时释放回程座位（可卖，钱不动）
+              {releaseAgain ? '释放回程座位（可卖，钱不动）' : '同时释放回程座位（可卖，钱不动）'}
               {!returnItem && <span className="text-slate-500">（本单没有回程航段）</span>}
-              {returnItem?.ticketed && (
+              {returnDeparted && (
+                <span className="ml-1 text-amber-700">回程已起飞，只能记录 no-show。</span>
+              )}
+              {returnItem?.ticketed && !returnDeparted && (
                 <span className="ml-1 text-amber-700">回程已出票，释放后会给票务派撤名单工单。</span>
               )}
             </span>
@@ -8852,9 +9027,9 @@ function NoShowPanel({
         <button
           className="flex-1 rounded bg-slate-800 px-2 py-1.5 font-medium text-white disabled:opacity-50"
           onClick={submit}
-          disabled={submitting || previewLoading || !preview?.eligible}
+          disabled={submitting || previewLoading || repreviewing || !canProceed}
         >
-          {submitting ? '提交中…' : '确认 no-show 处理'}
+          {submitting ? '提交中…' : releaseAgain ? '确认释放回程' : '确认 no-show 处理'}
         </button>
         <button
           className="rounded bg-slate-100 px-3 py-1.5 text-slate-700 disabled:opacity-50"

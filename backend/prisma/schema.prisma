@@ -1522,6 +1522,20 @@ enum InvoiceStatus {
   ISSUED // 已开具
 }
 
+/// 订单航段留痕四态（列表筛选/导出用的物化列；真源仍是 FLIGHT 行 metadata 快照）。
+///   NONE             无任何 no-show / 释放留痕（绝大多数单）
+///   NO_SHOW          去程已标 no-show，但回程没被释放（单程单，或勾了不释放）
+///   RETURN_RELEASED  回程座位当前处于「已释放」态 —— 可恢复
+///   RETURN_RESTORED  释放过、已恢复回原班次
+///   RETURN_VOIDED    释放后原班次已飞完、终局作废，不可再恢复
+enum OrderLegFlag {
+  NONE
+  NO_SHOW
+  RETURN_RELEASED
+  RETURN_RESTORED
+  RETURN_VOIDED
+}
+
 model Order {
   id                   String           @id @default(cuid())
   orderNumber          String           @unique // human-friendly, e.g., "FTM2026041400001"
@@ -1549,6 +1563,11 @@ model Order {
   // 由 syncOrderHasReturnLeg 在所有增删 FLIGHT 行 / 改 flightScheduleId 的事务内同步维护。
   // 与软删无关：已删订单同样维护本列（列语义是结构，不是可见性）。
   hasReturnLeg         Boolean          @default(false)
+  // 航段留痕物化列 —— 「去程 no-show / 回程已释放 / 已恢复 / 已作废」这四态是从 FLIGHT 行的
+  // metadata 快照派生的，Prisma where 表达不了「关联行的 JSON 字段里某个键存在且比另一个键新」，
+  // 于是列表筛选与导出根本筛不出「今天释放了哪些回程」。派生规则见 syncOrderLegFlag，
+  // 由它在所有落 no-show / 释放 / 恢复 / 拆单 / 改期的事务内与 hasReturnLeg 成对维护。
+  legFlag              OrderLegFlag     @default(NONE)
   currency             String           @default("CNY")
   subtotal             Decimal          @db.Decimal(12, 2)
   taxesAndFees         Decimal          @default(0) @db.Decimal(12, 2)
@@ -1633,6 +1652,7 @@ model Order {
   @@index([createdAt])
   @@index([claimedById])
   @@index([deletedAt])
+  @@index([legFlag])
 }
 
 model OrderItem {

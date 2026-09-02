@@ -1573,6 +1573,11 @@ export interface OrderSummary {
   updatedAt: string;
   // 出发日期（YYYY-MM-DD）：FLIGHT 最早班次当地出发日 → 回退最早酒店入住日 → null（列表列用）
   departDate?: string | null;
+  /**
+   * 航段状态标记（后端派生）：NONE / 去程未登机 / 回程已释放·已恢复·已作废，与 legFlag 筛选同源。
+   * 旧后端/窄接口未下发时为 undefined —— 列表短标仍按订单行 metadata 自行派生，不依赖本字段。
+   */
+  legFlag?: OrderLegFlag;
   items: OrderItem[];
   passengers: OrderPassenger[];
   agent: {
@@ -1849,6 +1854,14 @@ export interface RefundQuote {
   cancellableReason?: string;
 }
 
+/**
+ * 航段状态筛选值（no-show / 回程释放·恢复·作废）。与订单行 metadata 上的打标同源，
+ * 后端派生成订单级标记后收口筛选，前端不再在窗口内二次过滤。
+ */
+export type OrderLegFlagFilter = 'NO_SHOW' | 'RETURN_RELEASED' | 'RETURN_RESTORED' | 'RETURN_VOIDED';
+/** 订单级航段状态标记：NONE = 本单没有任何 no-show/回程释放打标。 */
+export type OrderLegFlag = 'NONE' | OrderLegFlagFilter;
+
 /** listOrders 查询参数（与 backend listOrdersQuerySchema 对齐） */
 export interface ListOrdersParams {
   status?: OrderStatus;
@@ -1910,6 +1923,11 @@ export interface ListOrdersParams {
    * 后端走物化列 Order.hasReturnLeg 判定，与三模板导出的 tripType 同口径。
    */
   tripType?: 'oneway' | 'roundtrip';
+  /**
+   * 航段状态 — 去程未登机（NO_SHOW）/ 回程已释放 / 已恢复 / 已作废。后端按订单级派生标记筛选，
+   * 与列表「内容」列的航段状态短标同源。
+   */
+  legFlag?: OrderLegFlagFilter;
   /** 第几页（1 起）。主列表是**真分页**：page/pageSize 都发后端，返回的 orders 就是当前页。 */
   page?: number;
   /** 每页条数；后端 listOrdersQuerySchema 的硬上限是 200。 */
@@ -1973,6 +1991,8 @@ export interface OrdersExportFilterParams {
   visaFulfillmentStatus?: 'signed' | 'unsigned';
   /** 订单录单签证要求（NEEDED/E_VISA/HAS_VISA/NOT_NEEDED）；与 listOrders 同款。 */
   visaRequirement?: 'NEEDED' | 'E_VISA' | 'HAS_VISA' | 'NOT_NEEDED';
+  /** 航段状态（no-show / 回程释放·恢复·作废）；与 listOrders 同款，用于「筛选后导出」。 */
+  legFlag?: OrderLegFlagFilter;
   /** 勾选导出：给了就只导这批订单（后端以 id 集合为准，忽略其余筛选）。上限 500 条。 */
   orderIds?: string[];
 }
@@ -2018,6 +2038,7 @@ export function toOrdersExportFilter(query: ListOrdersParams): OrdersExportFilte
     invoiced: query.invoiced,
     visaFulfillmentStatus: query.visaFulfillmentStatus,
     visaRequirement: query.visaRequirement,
+    legFlag: query.legFlag,
   };
 }
 
@@ -2174,7 +2195,12 @@ export interface TravelerProfileTrip {
   hotels: TravelerProfileHotelStay[];
   paxCount: number;
   spendShareCny: number;
+  /** 已飞 = 去程班次已起飞且客人登了机；去程 no-show 的行程不算已飞（也不计飞行次数）。 */
   flown: boolean;
+  /** 去程班次已起飞（不问登没登机）；后端新字段，老快照可能缺省。 */
+  departed?: boolean;
+  /** 去程 no-show（未登机）；后端新字段，老快照可能缺省。 */
+  noShow?: boolean;
 }
 
 export interface ListTravelerProfilesResult {
@@ -2945,6 +2971,10 @@ export interface HotelControlAlerts {
     flightNumber: string;
     departureDate: string; // YYYY-MM-DD
     paxCount: number;
+    /** 其中由 no-show 恢复回程走超售放行占掉的座数（0 = 无）；超出量 ≤ 该数时后端不报警。 */
+    noShowOversoldSeats?: number;
+    /** 后端拼好的补充说明（如「（其中 N 座为 no-show 恢复超售，已审计放行）」），无则空串。 */
+    note?: string;
   }>;
 }
 
@@ -3612,8 +3642,14 @@ export interface NoShowPreview {
   outboundItem: NoShowLegItem | null;
   returnItem: NoShowReturnItem | null;
   passengers: Array<{ id: string; fullName: string; chineseName: string | null }>;
-  /** true = 本单去程已经标过 no-show（不再重复处理） */
+  /** true = 本单去程已经标过 no-show。二次进入（回程恢复后要再释放）时它仍为 true，
+   *  此时只要 blockers 为空即可提交，等价于一次「只释放回程」。 */
   alreadyNoShow: boolean;
+  /**
+   * true = 回程航班已经起飞：座位不可能再放回库存重新卖，勾「同时释放回程」会被 blocker 拒。
+   * 此时只能单纯记录去程 no-show（取消勾选后即可提交）。
+   */
+  returnDeparted: boolean;
 }
 
 export interface NoShowResult {
@@ -3666,6 +3702,7 @@ export interface RestoreReturnLegPreview {
     flightNumber: string | null;
     departDate: string | null;
     cabin: CabinClass | null;
+    /** 要占回去的座位数 = 释放时实际放回库存的座位数（Σ releasedSeats），不是订单行数量。 */
     quantity: number;
     scheduleId: string;
   } | null;
@@ -3679,6 +3716,11 @@ export interface RestoreReturnLegPreview {
   maxOversell: number;
   /** true = 原班次已起飞（不可恢复） */
   departed: boolean;
+  /**
+   * 可以继续、但操作人必须先看到的提示（如「回程开票位已清，出票后请票务重标」）。
+   * 旧后端不下发时为 undefined，按空数组处理。
+   */
+  warnings?: string[];
 }
 
 export interface RestoreReturnLegResult {

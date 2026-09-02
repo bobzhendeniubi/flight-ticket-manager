@@ -304,7 +304,7 @@ describe('取消回程 · 准入闸', () => {
 
   // 闸 8 修复：整单级的「乘客有 PNR/票号」不再参与判定 —— 那是订单维度的，
   // 去程出了票会把回程一并判成已出票，回程明明一张票都没开也被挡住。
-  it('乘客有票号但回程没有确认出票记录 → 不再挡取消回程', async () => {
+  it('乘客有票号但回程没有确认出票记录 → 不挡取消回程，只留一条不需回执的提示', async () => {
     mountPreview(
       orderSnapshot({
         passengers: [
@@ -315,8 +315,66 @@ describe('取消回程 · 准入闸', () => {
     );
     const preview = await service.previewCancelReturnLeg('ord-1', ADMIN);
     expect(preview.eligible).toBe(true);
-    expect(preview.warnings).toEqual([]);
+    // 判定仍只信航段级出票任务（订单级会把去程的票算到回程头上），但「这单出过票」是客观事实，
+    // 至少提醒一句；它不进 requiresAcknowledgement，不逼运营勾回执。
+    expect(preview.warnings.join('')).toContain('本单乘客已有 PNR/票号');
     expect(preview.requiresAcknowledgement).toBe(false);
+  });
+
+  it('只有订单级票号的提示不逼回执：不带 acknowledgeWarnings 也能直接执行', async () => {
+    const snapshot = orderSnapshot({
+      passengers: [
+        { pnr: 'ABC123', eticketNumber: '880-1234567890' },
+        { pnr: null, eticketNumber: null },
+      ],
+    });
+    const tx = mountTx({ snapshot });
+    await expect(
+      service.cancelReturnLeg('ord-1', body(), ADMIN),
+    ).resolves.toBeTruthy();
+    expect(tx.orderItem.update).toHaveBeenCalled();
+  });
+
+  // ── H4：no-show 与取消航段的边界（钱不动 vs 按政策退钱，绝不能互相串门）──
+  it('该段已起飞 → 拒绝取消航段，指路 no-show', async () => {
+    const flownOut = new Date(Date.now() - 20 * 24 * 3600_000);
+    const flownRet = new Date(Date.now() - 5 * 24 * 3600_000);
+    const snapshot = orderSnapshot();
+    snapshot.items = snapshot.items.map((it) =>
+      it.id === 'leg-out'
+        ? { ...it, flightSchedule: { ...it.flightSchedule!, departureTime: flownOut } }
+        : it.id === 'leg-ret'
+          ? { ...it, flightSchedule: { ...it.flightSchedule!, departureTime: flownRet } }
+          : it,
+    ) as typeof snapshot.items;
+    mountPreview(snapshot);
+    const preview = await service.previewCancelReturnLeg('ord-1', ADMIN);
+    expect(preview.eligible).toBe(false);
+    expect(preview.blockers.join('')).toContain('回程已起飞');
+    expect(preview.blockers.join('')).toContain('no-show');
+  });
+
+  it('该段已标 no-show → 拒绝取消航段（钱已明确不退，不能再从取消通道退一次）', async () => {
+    const snapshot = orderSnapshot();
+    snapshot.items = snapshot.items.map((it) =>
+      it.id === 'leg-ret' ? { ...it, metadata: { noShow: { at: new Date().toISOString() } } } : it,
+    ) as typeof snapshot.items;
+    mountPreview(snapshot);
+    const preview = await service.previewCancelReturnLeg('ord-1', ADMIN);
+    expect(preview.eligible).toBe(false);
+    expect(preview.blockers.join('')).toContain('已标记 no-show');
+  });
+
+  it('执行段同样挡住已标 no-show 的段（预检放行到执行之间世界变了也拦得住）', async () => {
+    const snapshot = orderSnapshot();
+    snapshot.items = snapshot.items.map((it) =>
+      it.id === 'leg-ret' ? { ...it, metadata: { noShow: { at: new Date().toISOString() } } } : it,
+    ) as typeof snapshot.items;
+    const tx = mountTx({ snapshot });
+    await expect(service.cancelReturnLeg('ord-1', body(), ADMIN)).rejects.toBeInstanceOf(
+      BadRequestError,
+    );
+    expect(tx.$executeRaw).not.toHaveBeenCalled();
   });
 
   it('回程有确认出票任务 → 不再拒绝，改为 warning + 需二次确认', async () => {
@@ -682,7 +740,8 @@ describe('取消去程 · 准入闸', () => {
     );
     const preview = await service.previewCancelLeg('ord-1', 'OUTBOUND', ADMIN);
     expect(preview.eligible).toBe(true);
-    expect(preview.warnings).toEqual([]);
+    expect(preview.warnings.join('')).toContain('本单乘客已有 PNR/票号');
+    expect(preview.requiresAcknowledgement).toBe(false);
   });
 
   it('单程单取消去程 → 拒绝：取消唯一一段等于取消整单', async () => {

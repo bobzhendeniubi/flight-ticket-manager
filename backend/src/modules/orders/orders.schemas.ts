@@ -691,6 +691,15 @@ export const listOrdersQuerySchema = z.object({
   // 行程类型筛选：oneway=只有去程（且必须有航段，酒店单/签证单不算单程单）；roundtrip=有回程。
   // 查询层走物化列 Order.hasReturnLeg（Prisma where 表达不了「关联行 ≥ 2 条」）。
   tripType: z.enum(['oneway', 'roundtrip']).optional(),
+  // 航段留痕四态筛选（物化列 Order.legFlag，派生规则见 orders.service 的 syncOrderLegFlag）：
+  //   NO_SHOW         去程标了 no-show，但回程没释放（单程单，或勾了不释放）
+  //   RETURN_RELEASED 回程座位当前处于「已释放」态 —— 票务要盯的就是这一批（可恢复、可重卖）
+  //   RETURN_RESTORED 释放过、已恢复回原班次
+  //   RETURN_VOIDED   释放后原班次已飞完、终局作废
+  //   NONE            没有任何此类留痕（绝大多数单）
+  legFlag: z
+    .enum(['NONE', 'NO_SHOW', 'RETURN_RELEASED', 'RETURN_RESTORED', 'RETURN_VOIDED'])
+    .optional(),
   page: z.coerce.number().int().min(1).default(1),
   pageSize: z.coerce.number().int().min(1).max(200).default(50),
 });
@@ -743,6 +752,7 @@ export const exportTemplatesQuerySchema = listOrdersQuerySchema
     invoiced: true,
     visaFulfillmentStatus: true,
     visaRequirement: true,
+    legFlag: true,
   })
   .extend({
     template: z.enum(['full', 'ticketing', 'visa']),
@@ -787,6 +797,7 @@ export const exportMasterQuerySchema = listOrdersQuerySchema
     visaFulfillmentStatus: true,
     visaRequirement: true,
     tripType: true,
+    legFlag: true,
   })
   .extend({
     // 岗位视图：仅裁列，不改取数。路由按登录身份强制覆盖（专岗账号改参数无效）。
@@ -1465,6 +1476,9 @@ export type CancelReturnLegBody = Omit<CancelLegBody, 'leg'>;
 // requestToken 为幂等键：同 (订单, token) 重试只回放，座位绝不二次释放。
 export const noShowPreviewBodySchema = z.object({
   passengerIds: z.array(z.string().min(1)).max(99).optional(),
+  // 「同时释放回程」勾选框的当前状态（缺省 true，与执行体同缺省）。
+  // 预检要拿它才能如实回「回程已起飞 → 不能释放座位」这条闸；否则运营点了提交才被拒。
+  releaseReturn: z.boolean().optional(),
 });
 export type NoShowPreviewBody = z.infer<typeof noShowPreviewBodySchema>;
 
