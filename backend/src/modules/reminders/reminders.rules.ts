@@ -1,12 +1,13 @@
 /**
  * 规则化自动生成提醒 — 扫描订单/乘客/签证任务，按规则生成操作部待办。
  *
- * 五条规则（详见各 build 函数）：
+ * 规则（详见各 build 函数）：
  *   1. BALANCE_DUE      催尾款：临近出发仍有尾款未收
  *   2. DEPARTURE_SOON   出行提醒：3 天内出发的已付订单
  *   3. PASSPORT_EXPIRY  护照有效期：距出发不足 6 个月
  *   4. VISA_MISSING     签证缺件：在办签证任务下有乘客缺护照照片（排除自备签乘客，见下）
  *   5. HOLD_INSTALLMENT_DUE 占位单收款期：截止前三天提醒，逾期标红
+ *   10. RANDOM_TIER_SHORTFALL 随机档缺口：未来 7 天需向地接加房
  *
  * 各规则与「自备签证」（Passenger.visaExempt=true：客人自行办妥签证，无需送签）的口径：
  *   - 规则 4 签证缺件：按签证台同口径排除自备签乘客（visaExempt=true）——客人自备签证
@@ -40,6 +41,10 @@ import {
 } from '@prisma/client';
 import { businessDateISO } from '../../lib/business-time.js';
 import { localDateISO } from '../../lib/flight-time.js';
+import {
+  getRandomTierShortfall,
+  type RandomTierShortfallReport,
+} from '../hotel-control/hotel-control.shortfall.js';
 
 // ── 状态集合 ────────────────────────────────────────────────────────────────
 /** 催尾款：待付 + 已付未完结（这些状态还会收钱） */
@@ -190,7 +195,8 @@ export type RuleName =
   | 'TICKET_MISSING'
   | 'VISA_NOT_SUBMITTED'
   | 'ROOM_UNASSIGNED'
-  | 'RECEIPT_UNVERIFIED';
+  | 'RECEIPT_UNVERIFIED'
+  | 'RANDOM_TIER_SHORTFALL';
 
 export interface ReminderCandidate {
   rule: RuleName;
@@ -479,6 +485,60 @@ export function buildReceiptVerifyCandidates(
   ];
 }
 
+function formatShortfallDate(date: string): string {
+  const [, month, day] = date.split('-');
+  return `${Number(month)}/${Number(day)}`;
+}
+
+function formatShortfallNumber(value: number): string {
+  if (Object.is(value, -0) || Number.isInteger(value)) return String(Math.round(value));
+  return value.toFixed(2).replace(/0+$/u, '').replace(/\.$/u, '');
+}
+
+/**
+ * 规则 10：未来 7 天内随机档有缺口就提醒房控向地接加房。
+ * 每个「档次 × 日期」一条候选，但正文复述该档次 7 天内全部缺口，方便一次处理。
+ */
+export function buildRandomTierShortfallCandidates(
+  report: RandomTierShortfallReport,
+  today: string,
+): ReminderCandidate[] {
+  const end = addDaysUtc(today, 6);
+  const days = report.days.filter((day) => day.date >= today && day.date <= end);
+  const gapDatesByTier = new Map<number, Array<{ date: string; shortfall: number; roomsToRequest: number }>>();
+  for (const day of days) {
+    for (const tier of day.tiers) {
+      if (tier.shortfall <= 0) continue;
+      const entries = gapDatesByTier.get(tier.tier) ?? [];
+      entries.push({ date: day.date, shortfall: tier.shortfall, roomsToRequest: tier.roomsToRequest });
+      gapDatesByTier.set(tier.tier, entries);
+    }
+  }
+
+  const candidates: ReminderCandidate[] = [];
+  for (const day of days) {
+    for (const tier of day.tiers) {
+      if (tier.shortfall <= 0) continue;
+      const details = (gapDatesByTier.get(tier.tier) ?? [])
+        .map(
+          (entry) =>
+            `${formatShortfallDate(entry.date)} 缺 ${formatShortfallNumber(entry.shortfall)} 间（需加 ${entry.roomsToRequest} 间）`,
+        )
+        .join('；');
+      candidates.push({
+        rule: 'RANDOM_TIER_SHORTFALL',
+        ruleKey: `RANDOMSHORTFALL:${tier.tier}:${day.date}`,
+        orderId: null,
+        title: `${tier.label} ${formatShortfallDate(day.date)} 缺 ${formatShortfallNumber(tier.shortfall)} 间，需向地接加房`,
+        body: `未来7天${tier.label}缺口：${details}。请打开房控页「每日加房清单（随机档缺口）」向地接加房；地接确认后到「包房周期」给真酒店切房。`,
+        priority: ReminderPriority.HIGH,
+        dueAt: today,
+      });
+    }
+  }
+  return candidates;
+}
+
 /** 规则 5：占位单收款期截止提醒；日期口径与 dueDate（建单时已按起飞地折算）一致。 */
 export function buildHoldInstallmentCandidates(hold: RuleHoldOrder, today: string): ReminderCandidate[] {
   const activeStatuses: HoldOrderStatus[] = [HoldOrderStatus.PENDING, HoldOrderStatus.HOLDING, HoldOrderStatus.OVERDUE];
@@ -631,6 +691,22 @@ export async function generateRuleReminders(
   for (const hold of holdOrders) {
     const holdToday = dateInTz(now, hold.flightSchedule?.departureTz);
     candidates.push(...buildHoldInstallmentCandidates(hold, holdToday));
+  }
+
+  // ── 规则 10：随机档缺口（未来 7 天；与房控每日加房清单复用同一计算）────
+  // 旧测试 mock 可能没有酒店相关 delegate；缺少这些 delegate 时跳过，不影响其它提醒规则。
+  const hotelControl = prisma as unknown as {
+    hotel?: { findMany?: unknown };
+    hotelBlockPeriod?: { findMany?: unknown };
+    orderItem?: { findMany?: unknown };
+  };
+  if (
+    typeof hotelControl.hotel?.findMany === 'function' &&
+    typeof hotelControl.hotelBlockPeriod?.findMany === 'function' &&
+    typeof hotelControl.orderItem?.findMany === 'function'
+  ) {
+    const shortfall = await getRandomTierShortfall(today, addDaysUtc(today, 6), prisma);
+    candidates.push(...buildRandomTierShortfallCandidates(shortfall, today));
   }
 
   // ── 规则 7：临近出发未送签（订单级；范围 = 有在办签证任务的订单）─────────────

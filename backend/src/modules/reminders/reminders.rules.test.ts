@@ -14,6 +14,7 @@ import {
   addMonthsUtc,
   buildOrderCandidates,
   buildHoldInstallmentCandidates,
+  buildRandomTierShortfallCandidates,
   buildReceiptVerifyCandidates,
   buildVisaCandidates,
   buildVisaSubmissionCandidates,
@@ -26,6 +27,7 @@ import {
   utcDateStr,
   type RuleOrder,
 } from './reminders.rules.js';
+import type { RandomTierShortfallReport } from '../hotel-control/hotel-control.shortfall.js';
 import { HoldInstallmentStatus, HoldOrderStatus } from '@prisma/client';
 import { businessDateISO } from '../../lib/business-time.js';
 
@@ -290,6 +292,53 @@ describe('VISA_MISSING', () => {
   });
 });
 
+describe('RANDOM_TIER_SHORTFALL 随机档缺口提醒规则', () => {
+  const tierRow = (overrides: Partial<RandomTierShortfallReport['days'][number]['tiers'][number]> = {}) => ({
+    tier: 3 as const,
+    label: '三星随机',
+    hasBlock: true,
+    block: 2,
+    hotelUsed: 2,
+    pendingUsed: 0,
+    remaining: 0,
+    shortfall: 0,
+    roomsToRequest: 0,
+    ...overrides,
+  });
+
+  it('shortfall > 0 按档次×日期生成，正文列出该档未来 7 天全部缺口；shortfall = 0 不生成', () => {
+    const report: RandomTierShortfallReport = {
+      from: TODAY,
+      to: addDaysUtc(TODAY, 6),
+      days: [
+        { date: TODAY, tiers: [tierRow({ shortfall: 1, roomsToRequest: 1 })] },
+        {
+          date: addDaysUtc(TODAY, 1),
+          tiers: [tierRow({ shortfall: 0.5, roomsToRequest: 1 })],
+        },
+      ],
+    };
+
+    const candidates = buildRandomTierShortfallCandidates(report, TODAY);
+
+    expect(candidates).toHaveLength(2);
+    expect(candidates[0]).toMatchObject({
+      rule: 'RANDOM_TIER_SHORTFALL',
+      ruleKey: `RANDOMSHORTFALL:3:${TODAY}`,
+      title: '三星随机 7/9 缺 1 间，需向地接加房',
+      priority: ReminderPriority.HIGH,
+    });
+    expect(candidates[0].body).toContain('7/9 缺 1 间（需加 1 间）');
+    expect(candidates[0].body).toContain('7/10 缺 0.5 间（需加 1 间）');
+    expect(
+      buildRandomTierShortfallCandidates(
+        { ...report, days: report.days.map((day) => ({ ...day, tiers: [tierRow()] })) },
+        TODAY,
+      ),
+    ).toEqual([]);
+  });
+});
+
 // ── generateRuleReminders：幂等（跑两遍第二遍 created = 0）──────────────────
 describe('generateRuleReminders 幂等', () => {
   /** 带内存态的 mock prisma：createMany 落进 store，findMany 按 ruleKey 查重 */
@@ -317,6 +366,38 @@ describe('generateRuleReminders 幂等', () => {
     };
     return { mock: mock as unknown as PrismaClient, raw: mock, store };
   }
+
+  it('接入每日加房清单：未来 7 天有随机档缺口时生成随机档提醒', async () => {
+    const { mock, raw } = makeMockPrisma([], []);
+    const randomRaw = raw as typeof raw & {
+      hotel: { findMany: ReturnType<typeof vi.fn> };
+      hotelBlockPeriod: { findMany: ReturnType<typeof vi.fn> };
+      orderItem: { findMany: ReturnType<typeof vi.fn> };
+    };
+    randomRaw.hotel = { findMany: vi.fn(async () => [{ id: 'hotel-3' }]) };
+    randomRaw.hotelBlockPeriod = {
+      findMany: vi.fn(async () => [{ dateFrom: new Date('2026-07-09T00:00:00Z'), dateTo: new Date('2026-07-15T00:00:00Z'), rooms: 1 }]),
+    };
+    randomRaw.orderItem = {
+      findMany: vi.fn(async (args: unknown) => {
+        const where = (args as { where?: { OR?: unknown } }).where;
+        return where?.OR
+          ? [{ hotelCheckIn: new Date('2026-07-09T00:00:00Z'), hotelCheckOut: new Date('2026-07-10T00:00:00Z'), roomsBilled: new Prisma.Decimal(2), metadata: null }]
+          : [];
+      }),
+    };
+
+    const result = await generateRuleReminders(
+      mock,
+      'user_sys',
+      new Date('2026-07-09T06:00:00Z'),
+    );
+
+    expect(result).toMatchObject({
+      created: 3,
+      byRule: { RANDOM_TIER_SHORTFALL: 3 },
+    });
+  });
 
   // 相对今天构造，规则窗口不随真实日期漂移。必须与引擎同口径（北京业务日），
   // 否则 UTC 16:00 之后跑测试，用例算的「今天」会比引擎早一天。
