@@ -437,8 +437,9 @@ function deriveHotelLine(o: OrderSummary): string | null {
   for (const it of o.items ?? []) {
     if (it.kind !== 'HOTEL' && it.kind !== 'BUNDLE') continue;
     let label: string | null = null;
-    if (it.randomStarTier != null) {
-      // 随机档行：后端把档次名（「四星随机」）落在 hotelName 上，落位后该列被清空。
+    if (it.randomStarTier != null || it.hotelPendingTier != null) {
+      // 随机档行（含房型仍挂在占位酒店上的伪落位行）：后端把档次名（「四星随机」）落在
+      // hotelName 上；落位到真酒店后两者都清空，自然回到真实酒店名。
       label = `${it.hotelName ?? '随机酒店'}（待落位）`;
     } else if (it.hotelName) {
       label = it.roomTypeName ? `${it.hotelName} · ${it.roomTypeName}` : it.hotelName;

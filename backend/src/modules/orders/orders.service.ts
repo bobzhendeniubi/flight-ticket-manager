@@ -3757,6 +3757,13 @@ export class OrderService {
           items: {
             include: {
               fulfillmentTasks: { select: { type: true, status: true } },
+              // 联查盖章酒店：列表「内容」列的住宿标签要显示**当前**酒店。此前列表不联查，
+              // 序列化里 hotelName 恒为 null，前端只能退回到套餐行 metadata 里录单时的「指定酒店」
+              // 留痕——换酒店之后标签永远不跟着走。randomTierPlaceholder 用于把占位酒店显示成
+              // 「X星随机（待落位）」而不是当成一家真酒店。
+              hotelRoomType: {
+                select: { name: true, hotel: { select: { name: true, randomTierPlaceholder: true } } },
+              },
               // 联查航班号（flight.flightNumber）——列表「出发日期」列旁的往返航班号展示要用它；
               // 此前只 select 了 departureTime/departureTz，序列化里的 flightNumber 恒为 null，
               // 前端 deriveFlightLegs 只能退化用正则从 description 里捞第一个航班号，往返单两条腿
@@ -3833,7 +3840,9 @@ export class OrderService {
         //     不会因为关联行的其它字段值而不联查；isActive 只在下单校验时拦截新购，不影响历史订单读取）。
         items: {
           include: {
-            hotelRoomType: { select: { name: true, hotel: { select: { name: true } } } },
+            hotelRoomType: {
+              select: { name: true, hotel: { select: { name: true, randomTierPlaceholder: true } } },
+            },
             flightSchedule: {
               select: {
                 departureTime: true,
@@ -9520,7 +9529,9 @@ export class OrderService {
       include: {
         items: {
           include: {
-            hotelRoomType: { select: { name: true, hotel: { select: { name: true } } } },
+            hotelRoomType: {
+              select: { name: true, hotel: { select: { name: true, randomTierPlaceholder: true } } },
+            },
             flightSchedule: {
               select: {
                 departureTime: true,
@@ -16464,13 +16475,26 @@ export function serializeOrder<T extends OrderLike>(
       // 这里用可选链读取，未联查时安全落 null，不强行断言非空。
       // 订单行自身未盖章 hotelRoomTypeId 时（老订单常见，见 CLAUDE 里记录的"套餐没盖房型"数据问题），
       // 回落到套餐定义自己关联的房型，而不是整段留空。
+      const ownHotel = (
+        i as {
+          hotelRoomType?: {
+            name?: string | null;
+            hotel?: { name?: string | null; randomTierPlaceholder?: number | null } | null;
+          } | null;
+        }
+      ).hotelRoomType;
+      // 房型挂在随机档占位酒店上 = 伪落位，业务上还没落到任何一家真酒店：
+      // 酒店名显示成档次名（「四星随机」），房型留空，并单独暴露 hotelPendingTier 让前端标「待落位」。
+      // 联查没带 randomTierPlaceholder（老调用方）时安全落 null，按真酒店显示，不误判。
+      const hotelPendingTier = ownHotel?.hotel?.randomTierPlaceholder ?? null;
       const ownHotelName =
-        (i as { hotelRoomType?: { hotel?: { name?: string | null } | null } | null }).hotelRoomType
-          ?.hotel?.name ?? null;
-      const ownRoomTypeName =
-        (i as { hotelRoomType?: { name?: string | null } | null }).hotelRoomType?.name ?? null;
+        hotelPendingTier != null
+          ? randomStarTierLabel(hotelPendingTier)
+          : (ownHotel?.hotel?.name ?? null);
+      const ownRoomTypeName = hotelPendingTier != null ? null : (ownHotel?.name ?? null);
       return {
         ...i,
+        hotelPendingTier,
         // 对外脱敏：逐项拆价（单价/小计）是我方内部口径，AGENT/CUSTOMER 只看订单总价，不下发行级金额。
         //   保留 kind / description / quantity / 行程信息（航班号、出发日期等）等非价格字段。
         unitPrice: redact ? undefined : i.unitPrice.toString(),

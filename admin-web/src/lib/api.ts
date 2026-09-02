@@ -1301,8 +1301,10 @@ export interface OrderItem {
   cabin?: CabinClass | null;
   /** HOTEL 行 / BUNDLE 行盖章酒店：房型名（区别于 hotelName 酒店名） */
   roomTypeName?: string | null;
-  /** HOTEL 行 / BUNDLE 行盖章酒店：酒店中文名 */
+  /** HOTEL 行 / BUNDLE 行盖章酒店：酒店中文名（房型挂在随机档占位酒店上时为档次名，如「四星随机」） */
   hotelName?: string | null;
+  /** 非空 = 房型挂在随机档占位酒店上（伪落位，业务上仍未落到真酒店）；hotelName 此时为档次名 */
+  hotelPendingTier?: number | null;
   /** VISA 行（独立提交时）：签证名称 */
   visaName?: string | null;
   /** VISA 行：签证目的国 */
