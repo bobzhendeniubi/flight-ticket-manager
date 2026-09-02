@@ -21,6 +21,8 @@ import {
   orderToTicketingRows,
   orderToVisaRows,
   buildOrderContext,
+  VISA_COLUMNS,
+  TICKETING_COLUMNS,
   buildOrderTemplateExportWorkbook,
   pnrName,
   nameWithTitle,
@@ -35,14 +37,15 @@ import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 const D = (s: string): Date => new Date(s.length <= 10 ? `${s}T00:00:00.000Z` : `${s}Z`);
 
 /**
- * 《全岗可用》模版 56 列表头（叶子列；末尾三列并入「订单成本」分组）。
+ * 《全岗可用》模版 57 列表头（叶子列；末尾三列并入「订单成本」分组）。
  * 定金组四列已移除：系统无定金模型，四列恒空，且现行模版本身已删除该组。
  * 「纯拼音名」为旧模版之外新增：无 MR/MS 称谓的 LAST/FIRST，财务对数/名单匹配用。
  * 「订单状态」为新增：中文标签，数据岗筛选用，紧邻开票/签证状态列。
+ * 「航段状态」为新增：no-show / 回程释放·恢复·作废，紧跟「订单类型」（同属行程口径列）。
  */
 const FULL_HEADERS = [
   '序号', '是否是原订单', '代理机构', '备注', '酒店类型', '中文名称', '乘客姓名',
-  '纯拼音名', '飞行次数', '出发(往返)日期', '航班号', '订单类型',
+  '纯拼音名', '飞行次数', '出发(往返)日期', '航班号', '订单类型', '航段状态',
   '结算价格', '结算价到账金额', '结算价到账时间',
   '结算价到账渠道', '尾款金额', '单房差', '单房差到账金额', '签证金额', '签证到账金额',
   '抵扣金额', '抵扣到账金额', '抵扣人员', '抵扣订单', '是否清账', '退款金额', '退款时间',
@@ -225,8 +228,8 @@ function fixtureRoundTrip(): OrderForTemplateExport {
   } as unknown as OrderForTemplateExport;
 }
 
-describe('《全岗可用》full 模版 — 列定义对齐 56 列', () => {
-  it('FULL_COLUMNS 列名列序与模版 56 列完全一致', () => {
+describe('《全岗可用》full 模版 — 列定义对齐 57 列', () => {
+  it('FULL_COLUMNS 列名列序与模版 57 列完全一致', () => {
     expect(FULL_COLUMNS.map((c) => c.header)).toEqual(FULL_HEADERS);
   });
 
@@ -1201,5 +1204,66 @@ describe('《全岗可用》full 模版 — 签证状态按乘客取值', () => 
     const order = fixtureMixedVisa();
     const rows = orderToVisaRows(order, buildOrderContext(order));
     expect(rows.map((r) => r.chineseName)).toEqual(['李四', '王五']);
+  });
+});
+
+// ── 航段状态列（no-show / 回程释放·恢复·作废）────────────────────────────────
+describe('航段状态列 — 《全岗可用》与《签证专用》', () => {
+  const RELEASED_AT = '2026-09-02T03:15:23.000Z';
+
+  /** 把往返单的去程标 no-show、回程置成已释放态。 */
+  function fixtureNoShowReleased(): OrderForTemplateExport {
+    const order = fixtureRoundTrip();
+    const items = order.items as unknown as Array<Record<string, unknown>>;
+    items[0].metadata = { noShow: { at: RELEASED_AT, leg: 'OUTBOUND' } };
+    items[1].metadata = { returnReleased: { at: RELEASED_AT, originalScheduleId: 'sch-ret' } };
+    items[1].flightScheduleId = null;
+    items[1].flightSchedule = null;
+    return order;
+  }
+
+  it('列位置紧跟「订单类型」（同属行程口径列）', () => {
+    const headers = FULL_COLUMNS.map((c) => c.header);
+    expect(headers[headers.indexOf('订单类型') + 1]).toBe('航段状态');
+  });
+
+  it('正常单留空', () => {
+    const order = fixtureRoundTrip();
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    expect(rows.map((r) => r.legStatus)).toEqual(['', '']);
+  });
+
+  it('去程 no-show + 回程已释放 → 两个状态合成一格，每行乘客都带', () => {
+    const order = fixtureNoShowReleased();
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    expect(rows.map((r) => r.legStatus)).toEqual([
+      '去程未登机 / 回程座位已释放',
+      '去程未登机 / 回程座位已释放',
+    ]);
+  });
+
+  it('回程已恢复且超售 → 带上超售座数', () => {
+    const order = fixtureRoundTrip();
+    const items = order.items as unknown as Array<Record<string, unknown>>;
+    items[1].metadata = {
+      returnReleased: { at: RELEASED_AT },
+      returnRestored: { at: '2026-09-02T05:00:00.000Z', oversold: true, oversoldBy: 2 },
+    };
+    const [row] = orderToFullRows(order, buildOrderContext(order));
+    expect(row.legStatus).toBe('回程已恢复（超售 2 座）');
+  });
+
+  it('《签证专用》同一口径，列在「出发日期」之后', () => {
+    const visaHeaders = VISA_COLUMNS.map((c) => c.header);
+    expect(visaHeaders[visaHeaders.indexOf('出发日期') + 1]).toBe('航段状态');
+
+    const order = fixtureNoShowReleased();
+    const rows = orderToVisaRows(order, buildOrderContext(order));
+    expect(rows.every((r) => r.legStatus === '去程未登机 / 回程座位已释放')).toBe(true);
+  });
+
+  it('《票务专用》27 列航司格式一格不动：不加航段状态列', () => {
+    expect(TICKETING_COLUMNS).toHaveLength(27);
+    expect(TICKETING_COLUMNS.map((c) => c.header)).not.toContain('航段状态');
   });
 });

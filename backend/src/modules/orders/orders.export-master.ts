@@ -46,6 +46,7 @@ import {
   type ExportSelectionFilters,
 } from './orders.export-selection.js';
 import { determineFlightLegs } from './ticketing-cap.js';
+import { formatOrderLegStatus } from './orders.leg-status.js';
 
 // ── 岗位视图 ──────────────────────────────────────────────────────────────
 /** 岗位视图：all=完整全岗（默认）；ticketing=票务；visa=签证；agent=代理（路由按登录身份
@@ -160,6 +161,9 @@ export interface MasterRow {
   travelDates: string; // 出发(往返)日期
   flightNumbers: string; // 航班号（去⇌回）
   orderType: string; // 往返票/单程票/品类
+  // 航段状态：去程未登机 / 回程座位已释放 / 回程已恢复（超售 N 座）/ 回程已作废；正常单留空。
+  // 从各 FLIGHT 行 metadata 派生，口径与三模板导出/整班导出同一入口（orders.leg-status.ts）。
+  legStatus: string;
   cabin: string; // 舱位等级
   settlePrice: number; // 结算价格（人均）
   settlementDiscountAmount: number; // 立减金额（人均，订单立减快照行金额绝对值合计）
@@ -246,6 +250,7 @@ const MASTER_COLUMNS: MasterColumn[] = [
   { header: '出发(往返)日期', key: 'travelDates', width: 24 },
   { header: '航班号', key: 'flightNumbers', width: 18, roles: ['all', 'ticketing'] },
   { header: '订单类型', key: 'orderType', width: 10 },
+  { header: '航段状态', key: 'legStatus', width: 20 },
   { header: '舱位等级', key: 'cabin', width: 10, roles: ['all', 'ticketing'] },
   { header: '结算价格', key: 'settlePrice', width: 10, roles: ['all'] },
   {
@@ -373,6 +378,9 @@ export function orderToMasterRows(
   const cabinLabels = Array.from(
     new Set(legs.filter((l) => l.cabin).map((l) => CABIN_LABEL[l.cabin!] ?? l.cabin!)),
   ).join(' / ');
+
+  // 航段状态（no-show / 回程释放·恢复·作废）：整单合并成一格，正常单留空。
+  const legStatus = formatOrderLegStatus(order.items);
 
   // ── 订单类型：两段及以上=往返票 / 一段=单程票 / 无机票按品类 ──
   let orderType: string;
@@ -576,6 +584,7 @@ export function orderToMasterRows(
       travelDates,
       flightNumbers,
       orderType,
+      legStatus,
       cabin: cabinLabels,
       settlePrice: settlePerPax,
       settlementDiscountAmount: settlementDiscountPerPax,

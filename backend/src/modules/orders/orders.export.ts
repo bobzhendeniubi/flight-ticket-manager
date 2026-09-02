@@ -24,6 +24,7 @@ import {
   type RoomNumberEntry,
 } from './orders.export-room-allocation.js';
 import { nameWithTitle } from './orders.export-templates.js';
+import { formatOrderLegStatus, isReturnCurrentlyReleased } from './orders.leg-status.js';
 
 /**
  * 整班运营导出口径（SEAT_HOLDING）：所有「占座中」订单。
@@ -73,7 +74,10 @@ interface OrderRow {
   // 航班
   flightNumbers: string;
   departDate: string;
+  /** 回程日期；回程座位已释放时写「已释放」（留空会被当成单程单，看不出座位已放回库存）。 */
   returnDate: string;
+  /** 航段状态：去程未登机 / 回程座位已释放 / 回程已恢复（超售 N 座）/ 回程已作废；正常单留空。 */
+  legStatus: string;
   route: string;
   // 产品
   bundleName: string;
@@ -116,6 +120,7 @@ const COLUMNS: Array<{ header: string; key: keyof OrderRow; width: number }> = [
   { header: '航班号', key: 'flightNumbers', width: 12 },
   { header: '去程日期', key: 'departDate', width: 12 },
   { header: '回程日期', key: 'returnDate', width: 12 },
+  { header: '航段状态', key: 'legStatus', width: 20 },
   { header: '路线', key: 'route', width: 14 },
   { header: '套餐', key: 'bundleName', width: 18 },
   { header: '酒店名称', key: 'hotelName', width: 20 },
@@ -364,10 +369,16 @@ function orderToRows(
   const routeStr = Array.from(new Set(legs.map((l) => l.route))).join(' / ');
   // 去程 = 最早航段；回程 = 最末航段（单程留空；两段以上取最末段）
   const departStr = fmtDepartDate(legs[0]?.departureTime, legs[0]?.departureTz);
-  const returnStr =
-    legs.length >= 2
+  // 回程座位已释放的行没有班次，进不了 legs —— 只按 legs 算会让这类往返单显示成单程（回程列空白）。
+  // 写「已释放」而不是留空：整班表是票务点人头的表，「这单本来有回程、现在座位放回库存了」
+  // 必须一眼看得见。
+  const returnReleased = order.items.some((it) => isReturnCurrentlyReleased(it));
+  const returnStr = returnReleased
+    ? '已释放'
+    : legs.length >= 2
       ? fmtDepartDate(legs[legs.length - 1]?.departureTime, legs[legs.length - 1]?.departureTz)
       : '';
+  const legStatus = formatOrderLegStatus(order.items);
   // 客单金额(人均) = 订单总额 ÷ 乘客数（每行写人均，避免按总额误读为每人都付了全款）
   const orderTotal = dec(order.total) / Math.max(1, order.passengers.length);
   // 录入时间是「动作发生时刻」，按北京时间输出（容器 TZ 是 UTC，直接取 UTC 分量会少 8 小时）
@@ -419,6 +430,7 @@ function orderToRows(
       flightNumbers: flightStr,
       departDate: departStr,
       returnDate: returnStr,
+      legStatus,
       route: routeStr,
       bundleName: bundleParts.join(' + '),
       hotelName: hotelNames,

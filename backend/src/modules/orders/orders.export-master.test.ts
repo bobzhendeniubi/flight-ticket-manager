@@ -1251,3 +1251,43 @@ describe('全岗总表 — 签证状态按乘客取值', () => {
     expect(orderToMasterRows(order).map((r) => r.visaStatus)).toEqual(['电子签', '电子签']);
   });
 });
+
+// ── 航段状态列（no-show / 回程释放·恢复·作废）────────────────────────────────
+describe('全岗总表 · 航段状态列', () => {
+  const RELEASED_AT = '2026-09-02T03:15:23.000Z';
+
+  it('列位置紧跟「订单类型」，各岗位视图都可见', () => {
+    const headers = visibleColumns('all').map((c) => c.header);
+    expect(headers[headers.indexOf('订单类型') + 1]).toBe('航段状态');
+    for (const role of ['ticketing', 'visa', 'agent'] as const) {
+      expect(visibleColumns(role).map((c) => c.header)).toContain('航段状态');
+    }
+  });
+
+  it('正常单留空', () => {
+    const rows = orderToMasterRows(fixtureRoundTripBundle());
+    expect(rows.every((r) => r.legStatus === '')).toBe(true);
+  });
+
+  it('去程 no-show + 回程已释放 → 一格里两个状态', () => {
+    const order = fixtureRoundTripBundle();
+    const items = order.items as unknown as Array<Record<string, unknown>>;
+    items[0].metadata = { noShow: { at: RELEASED_AT, leg: 'OUTBOUND' } };
+    items[1].metadata = { returnReleased: { at: RELEASED_AT } };
+    items[1].flightScheduleId = null;
+    items[1].flightSchedule = null;
+    const [row] = orderToMasterRows(order);
+    expect(row.legStatus).toBe('去程未登机 / 回程座位已释放');
+  });
+
+  it('回程已恢复且超售 → 带超售座数', () => {
+    const order = fixtureRoundTripBundle();
+    const items = order.items as unknown as Array<Record<string, unknown>>;
+    items[1].metadata = {
+      returnReleased: { at: RELEASED_AT },
+      returnRestored: { at: '2026-09-02T05:00:00.000Z', oversold: true, oversoldBy: 1 },
+    };
+    const [row] = orderToMasterRows(order);
+    expect(row.legStatus).toBe('回程已恢复（超售 1 座）');
+  });
+});

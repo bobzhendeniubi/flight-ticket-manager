@@ -225,6 +225,60 @@ describe('buildOrdersBySchedule · 航段排序与去/回程日期', () => {
     expect(cell(header, row, '回程日期')).toBe('2026-06-15');
   });
 
+  it('回程座位已释放：回程日期写「已释放」，航段状态列出两态', async () => {
+    // Arrange：去程正常 + 已标 no-show；回程行班次已置空（座位放回库存）
+    const released = {
+      ...flightItem({
+        flightNumber: 'ZJ8889',
+        originCode: 'DPS',
+        destinationCode: 'PVG',
+        departureTime: D('2026-06-15'),
+      }),
+      flightSchedule: null,
+      flightScheduleId: null,
+      metadata: {
+        returnReleased: { at: '2026-06-11T02:00:00.000Z', originalScheduleId: 'sch-ret' },
+      },
+    };
+    const outbound = {
+      ...flightItem({
+        flightNumber: 'ZJ8888',
+        originCode: 'PVG',
+        destinationCode: 'DPS',
+        departureTime: D('2026-06-10'),
+      }),
+      flightScheduleId: 'sch-out',
+      metadata: { noShow: { at: '2026-06-11T02:00:00.000Z', leg: 'OUTBOUND' } },
+    };
+    const client = fakeClient([order('ORD-NS-001', [outbound, released])]);
+
+    // Act
+    const buf = await buildOrdersBySchedule('sched-1', client);
+    const { header, dataRows } = await parseSheet(buf);
+
+    // Assert：留空会被当成单程单，必须写「已释放」
+    const row = dataRows[0];
+    expect(cell(header, row, '去程日期')).toBe('2026-06-10');
+    expect(cell(header, row, '回程日期')).toBe('已释放');
+    expect(cell(header, row, '航段状态')).toBe('去程未登机 / 回程座位已释放');
+  });
+
+  it('航段状态列紧跟「回程日期」，正常单留空', async () => {
+    const client = fakeClient([
+      order('ORD-RT-002', [
+        flightItem({
+          flightNumber: 'ZJ8888',
+          originCode: 'PVG',
+          destinationCode: 'DPS',
+          departureTime: D('2026-06-10'),
+        }),
+      ]),
+    ]);
+    const { header, dataRows } = await parseSheet(await buildOrdersBySchedule('sched-1', client));
+    expect(header[header.indexOf('回程日期') + 1]).toBe('航段状态');
+    expect(cell(header, dataRows[0], '航段状态')).toBe('');
+  });
+
   it('单程单只有去程日期，回程日期留空', async () => {
     // Arrange
     const client = fakeClient([

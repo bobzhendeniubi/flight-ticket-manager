@@ -29,6 +29,7 @@ import {
 } from './pnr-export.js';
 import { GUEST_RECORDED_BY_LABEL } from './orders.service.js';
 import { buildExportOrderWhere, filterExportOrders } from './orders.export-selection.js';
+import { formatOrderLegStatus } from './orders.leg-status.js';
 import { determineFlightLegs } from './ticketing-cap.js';
 import {
   parseRoomGroups,
@@ -307,6 +308,12 @@ interface OrderContext {
   flightLegCount: number;
   cabinLabels: string;
   orderType: string;
+  /**
+   * 航段状态：去程未登机 / 回程座位已释放 / 回程已恢复（超售 N 座）/ 回程已作废；无则空串。
+   * 从各 FLIGHT 行 metadata 派生（唯一口径在 orders.leg-status.ts，全岗总表与整班导出共用）。
+   * 一单同时有去程未登机与回程已释放两行时两个状态都出，' / ' 连接。
+   */
+  legStatus: string;
   settlePerPax: number; // 结算价格 = total ÷ pax
   paidPerPax: number; // 到账金额 = paidAmount ÷ pax
   // 尾款 = max(0, total + adjustmentCny − paidAmount − prepaymentOffset) ÷ pax。含售后费（改期费/
@@ -393,6 +400,7 @@ export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
     flightLegCount: legs.length,
     cabinLabels,
     orderType,
+    legStatus: formatOrderLegStatus(order.items),
     settlePerPax: round2(total / paxCount),
     paidPerPax: round2(paid / paxCount),
     balancePerPax: round2(Math.max(0, total + adjustment - paid - prepaymentOffset) / paxCount),
@@ -421,6 +429,7 @@ interface FullRow {
   travelDates: string; // 出发(往返)日期
   flightNumbers: string; // 航班号
   orderType: string; // 订单类型
+  legStatus: string; // 航段状态（no-show / 回程释放·恢复·作废）；正常单留空
   settlePrice: number; // 结算价格（人均）
   settleReceived: number; // 结算价到账金额（人均）
   settleReceivedAt: string; // 结算价到账时间
@@ -494,6 +503,7 @@ export const FULL_COLUMNS: Array<{
   { header: '出发(往返)日期', key: 'travelDates', width: 24 },
   { header: '航班号', key: 'flightNumbers', width: 18 },
   { header: '订单类型', key: 'orderType', width: 10 },
+  { header: '航段状态', key: 'legStatus', width: 20 },
   { header: '结算价格', key: 'settlePrice', width: 10 },
   { header: '结算价到账金额', key: 'settleReceived', width: 14 },
   { header: '结算价到账时间', key: 'settleReceivedAt', width: 18 },
@@ -644,6 +654,7 @@ export function orderToFullRows(
     travelDates: ctx.travelDates,
     flightNumbers: ctx.flightNumbers,
     orderType: ctx.orderType,
+    legStatus: ctx.legStatus,
     settlePrice: ctx.settlePerPax,
     settleReceived: ctx.paidPerPax,
     settleReceivedAt: lastPayment ? businessDateTimeSec(lastPayment.paidAt) : '',
@@ -771,6 +782,7 @@ export interface VisaRow {
   issueDate: string; // Passenger.passportIssueDate（dd-mm-yyyy），缺失留空
   expiryDate: string;
   departDate: string;
+  legStatus: string; // 航段状态（no-show / 回程释放·恢复·作废）；正常单留空
 }
 
 export const VISA_COLUMNS: Array<{ header: string; key: keyof VisaRow; width: number }> = [
@@ -796,6 +808,7 @@ export const VISA_COLUMNS: Array<{ header: string; key: keyof VisaRow; width: nu
   { header: '签发日期', key: 'issueDate', width: 12 },
   { header: '有效日期', key: 'expiryDate', width: 12 },
   { header: '出发日期', key: 'departDate', width: 24 },
+  { header: '航段状态', key: 'legStatus', width: 20 },
 ];
 
 // 签证公司（财务反馈：需清晰核对某笔签证金额属于哪家供应商）：取订单 VISA 行关联产品的 supplier，
@@ -851,6 +864,7 @@ export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext
     issueDate: fmtDateDMYDash(p.passportIssueDate),
     expiryDate: fmtDateDMYDash(p.passportExpiry),
     departDate: ctx.travelDates,
+    legStatus: ctx.legStatus,
     };
   });
 }
