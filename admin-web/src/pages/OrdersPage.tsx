@@ -10973,10 +10973,10 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
 
   useEffect(() => { loadFlights(); }, [token]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // 加载套餐列表
+  // 加载套餐列表：只拉在架套餐（下架套餐服务端会以「套餐已下架」拒单，列出来只会误选）
   useEffect(() => {
     if (!token || productType !== 'BUNDLE') return;
-    api.listBundles(false).then((r) => setBundles(r.bundles)).catch(() => {/* 忽略，套餐下拉空白时用户可重选 */});
+    api.listBundles(true).then((r) => setBundles(r.bundles)).catch(() => {/* 忽略，套餐下拉空白时用户可重选 */});
   }, [token, productType]);
 
   // 代理列表（仅 ADMIN/STAFF 需要；用于归属选择。无代理不致命）

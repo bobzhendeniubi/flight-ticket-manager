@@ -561,10 +561,11 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     api.listVisas(false).then((r) => setVisas(r.visas)).catch(() => setErr('签证列表加载失败'));
   }, [needsVisaCatalog, visas.length]);
 
-  // 套餐列表
+  // 套餐列表：只拉在架套餐。下架套餐服务端会拒单（「套餐已下架」），列进下拉只会让录单员
+  // 选中后才发现不能用；已下架的酒店专属套餐（如某酒店 2天1晚）应改选同档次随机套餐 + 指定酒店。
   useEffect(() => {
     if (!isBundleOrder || bundles.length > 0) return;
-    api.listBundles(false).then((r) => setBundles(r.bundles)).catch(() => setErr('套餐列表加载失败'));
+    api.listBundles(true).then((r) => setBundles(r.bundles)).catch(() => setErr('套餐列表加载失败'));
   }, [isBundleOrder, bundles.length]);
 
   // 接送列表
