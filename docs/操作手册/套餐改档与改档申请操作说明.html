@@ -1,0 +1,215 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>套餐改档与代理改档申请 操作说明 — 世途旅行·运营控制台</title>
+<style>
+  :root{
+    --indigo:#4F46E5; --indigo-dark:#4338CA; --indigo-50:#EEF2FF;
+    --ink:#0F172A; --ink-soft:#334155; --muted:#64748B;
+    --bg:#F1F5F9; --card:#FFFFFF; --line:#E2E8F0;
+    --amber-bg:#FFFBEB; --amber-line:#FDE68A;
+    --green:#059669; --green-bg:#ECFDF5;
+    --red-bg:#FEF2F2;
+    --blue-bg:#EFF6FF;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Inter','PingFang SC','Hiragino Sans GB','Microsoft YaHei',system-ui,-apple-system,sans-serif;color:var(--ink-soft);background:var(--bg);line-height:1.85;font-size:15px}
+  .page{max-width:900px;margin:0 auto;background:var(--card);padding:40px 44px 72px;box-shadow:0 0 24px rgba(15,23,42,.06)}
+  h1,h2,h3{color:var(--ink);line-height:1.35}
+  h1{font-size:26px;margin:0 0 6px}
+  h2{font-size:20px;margin:40px 0 12px;padding:10px 14px;background:var(--indigo-50);border-left:5px solid var(--indigo);border-radius:0 8px 8px 0}
+  h3{font-size:16.5px;margin:24px 0 8px;color:var(--indigo-dark)}
+  p{margin:10px 0}
+  .sub{color:var(--muted);font-size:13.5px;margin:0 0 4px}
+  .cover{border-bottom:3px solid var(--indigo);padding-bottom:18px;margin-bottom:22px}
+  .cover .brand{display:inline-block;background:var(--indigo);color:#fff;font-weight:700;font-size:13px;padding:3px 12px;border-radius:999px;letter-spacing:.5px;margin-bottom:10px}
+  .lead{background:var(--indigo-50);border-radius:10px;padding:14px 18px;margin:16px 0 8px;color:var(--ink);font-size:15.5px}
+  .shot{margin:14px 0 4px;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
+  .shot img{display:block;width:100%;height:auto}
+  .shot.narrow{max-width:560px}
+  .cap{color:var(--muted);font-size:13px;margin:4px 0 16px;text-align:center}
+  .tip,.info,.warn,.danger{border-radius:10px;padding:12px 16px;margin:14px 0}
+  .tip{background:var(--green-bg);border:1px solid #A7F3D0}
+  .info{background:var(--blue-bg);border:1px solid #BFDBFE}
+  .warn{background:var(--amber-bg);border:1px solid var(--amber-line)}
+  .danger{background:var(--red-bg);border:1px solid #FECACA}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14.5px}
+  table.doc th,table.doc td{border:1px solid var(--line);padding:8px 12px;text-align:left;vertical-align:top}
+  table.doc th{background:#F8FAFC;color:var(--ink)}
+  table.money td{border-bottom:1px solid var(--line);padding:8px 12px}
+  table.money td:first-child{color:var(--muted);width:220px}
+  ol.steps{padding-left:22px}
+  ol.steps li{margin:6px 0}
+  .toc{background:#F8FAFC;border:1px solid var(--line);border-radius:10px;padding:12px 18px 12px 34px;margin:14px 0 6px}
+  .toc li{margin:3px 0}
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="cover">
+  <span class="brand">运营控制台</span>
+  <h1>套餐改档与代理改档申请 操作说明</h1>
+  <p class="sub">已录入的套餐单怎么换档次 · 运营直接改 · 代理提申请运营确认　·　2026-09-02</p>
+</div>
+
+<div class="lead">
+客人录单之后想换档次（三星改四星、2晚改3晚），不用删单重录。运营在订单详情里直接「套餐改档」；代理没有直接改的权限，改成在订单上提「改档申请」，运营点确认才生效。
+</div>
+
+<ol class="toc">
+  <li><a href="#s1">谁能做什么</a></li>
+  <li><a href="#s2">运营：直接给订单改档</a></li>
+  <li><a href="#s3">代理：提改档申请</a></li>
+  <li><a href="#s4">运营：处理代理的改档申请</a></li>
+  <li><a href="#s5">2晚改3晚这种晚数有变化的</a></li>
+  <li><a href="#s6">改完之后钱和房怎么算</a></li>
+  <li><a href="#s7">点不了的几种情况</a></li>
+</ol>
+
+<h2 id="s1">一、谁能做什么</h2>
+
+<table class="doc">
+  <tr><th style="width:160px">账号</th><th>能做什么</th></tr>
+  <tr><td>运营 / 管理员</td><td>在订单详情里直接改档，当场生效；处理代理提的改档申请（确认或驳回）</td></tr>
+  <tr><td>代理</td><td>只能对自己名下的订单提「改档申请」，提了不生效，等运营确认</td></tr>
+</table>
+
+<div class="warn">
+改档会动两样东西：钱（按新档重算，差额记成一条调价）和房（换到另一个档次的房池）。所以代理提的申请，运营确认之前订单一分钱一间房都不会变。
+</div>
+
+<h2 id="s2">二、运营：直接给订单改档</h2>
+
+<p><strong>解决了什么：</strong>以前「套餐改档」按钮藏在「金额明细（点开）」里面，不好找。现在订单详情「产品内容」标题右边就有。</p>
+
+<h3>怎么操作</h3>
+
+<ol class="steps">
+  <li>打开订单详情，「产品内容」标题右边点「套餐改档」。</li>
+  <li>弹窗里选要改到哪一档（只列在售的套餐，当前这档不会出现）。</li>
+  <li>原因选填，会进审计和差额行。</li>
+  <li>点「确认改档」。</li>
+</ol>
+
+<div class="shot"><img src="shots-2026-09-02-改档申请/01-运营-入口.png"></div>
+<p class="cap">产品内容标题右边的「套餐改档」按钮</p>
+
+<div class="shot narrow"><img src="shots-2026-09-02-改档申请/02-运营-改档弹窗.png"></div>
+<p class="cap">选目标套餐，填原因</p>
+
+<div class="shot narrow"><img src="shots-2026-09-02-改档申请/03-运营-改档结果.png"></div>
+<p class="cap">改完会告诉你差额是多少、有没有要人工跟进的</p>
+
+<div class="info">
+「金额明细」里套餐那一行的「套餐改档」按钮还在，两个入口是同一个功能。
+</div>
+
+<h2 id="s3">三、代理：提改档申请</h2>
+
+<p><strong>解决了什么：</strong>代理以前没有任何入口，只能微信找运营。现在代理在订单详情里自己提，运营在系统里看到就能处理。</p>
+
+<h3>怎么操作（代理账号）</h3>
+
+<ol class="steps">
+  <li>打开自己的订单，「产品内容」标题右边点「申请改档」，页面会跳到下面的「改档申请」区块。</li>
+  <li>选想换成哪一档，备注写清楚原因（比如「客人想升到四星」）。</li>
+  <li>点「提交改档申请」。</li>
+</ol>
+
+<div class="shot"><img src="shots-2026-09-02-改档申请/04-代理-入口.png"></div>
+<p class="cap">代理账号看到的是「申请改档」，点了跳到下面的区块</p>
+
+<div class="shot"><img src="shots-2026-09-02-改档申请/04-代理-申请表单.png"></div>
+<p class="cap">代理端的改档申请区块：选目标套餐，写备注，提交</p>
+
+<div class="shot"><img src="shots-2026-09-02-改档申请/05-代理-待确认.png"></div>
+<p class="cap">提交后显示「待确认」，运营处理后这里会变成已确认或已驳回，驳回原因也在这</p>
+
+<div class="info">
+一张单同时只能有一条待确认的申请，运营处理完才能再提。提交之后订单本身不会有任何变化。
+</div>
+
+<h2 id="s4">四、运营：处理代理的改档申请</h2>
+
+<p>两个地方都能处理，跟议价申请一样。</p>
+
+<h3>订单列表上方的「改档申请」队列</h3>
+
+<p>按钮上的橙色数字是待处理条数。点开是队列，每行写着哪张单、哪个代理、从哪档改到哪档，能直接确认或驳回。</p>
+
+<div class="shot"><img src="shots-2026-09-02-改档申请/06-运营-列表入口.png"></div>
+<p class="cap">列表上方的入口，带待处理数</p>
+
+<div class="shot"><img src="shots-2026-09-02-改档申请/07-运营-队列.png"></div>
+<p class="cap">待处理队列</p>
+
+<h3>订单详情里的「改档申请」卡片</h3>
+
+<div class="shot"><img src="shots-2026-09-02-改档申请/08-运营-详情卡片.png"></div>
+<p class="cap">黄色卡片就是待处理的，下面可以写备注再确认或驳回</p>
+
+<div class="shot narrow"><img src="shots-2026-09-02-改档申请/09-运营-确认结果.png"></div>
+<p class="cap">确认后当场执行改档，差额和提醒都显示出来</p>
+
+<table class="doc">
+  <tr><th style="width:120px">点什么</th><th>发生什么</th></tr>
+  <tr><td>确认改档</td><td>系统立刻按目标套餐重新计价并换档，差额记成一条调价行，代理那边看到「已确认」</td></tr>
+  <tr><td>驳回</td><td>订单不变，申请标为已驳回，写的原因代理能看到</td></tr>
+</table>
+
+<div class="info">
+确认那一刻才算钱，用的是当时的应收和当天的结算价，不是代理提申请时的。中间加过的改期费、房差不会被抹掉。
+</div>
+
+<h2 id="s5">五、2晚改3晚这种晚数有变化的</h2>
+
+<p>改档能处理晚数变化：选「三星 4天3晚」这种目标套餐，酒店离店日会按新晚数自动往后推。但<strong>回程航班不会自动改</strong>。</p>
+
+<ol class="steps">
+  <li>先改档（或先确认代理的改档申请）。</li>
+  <li>再到「金额明细」里回程航班那一行点「改期」，把回程挪到新的日期。</li>
+</ol>
+
+<div class="shot"><img src="shots-2026-09-02-改档申请/10-晚数变化提醒.png"></div>
+<p class="cap">晚数有变化时，确认结果里会提醒回程要另行改期</p>
+
+<div class="warn">
+顺序是先改档再改回程。只改回程不会再动酒店日期，不会重复平移。
+</div>
+
+<h2 id="s6">六、改完之后钱和房怎么算</h2>
+
+<table class="money">
+  <tr><td>订单应收</td><td>按新档重算，「新应收 − 原应收」记成一条调价行，正数补收、负数减少</td></tr>
+  <tr><td>已收的钱</td><td>不动。尾款或多付按新应收自然浮动，多付的到付款情况里处理</td></tr>
+  <tr><td>代理单结算价</td><td>按目标档次和出发日在结算价日历里重新取价，立减规则照常生效</td></tr>
+  <tr><td>酒店</td><td>换到目标档次的随机池，离店日按新晚数重算；原来指定的酒店会被清除，需要的话重新指定</td></tr>
+  <tr><td>机票、签证、接送</td><td>全部不动</td></tr>
+  <tr><td>审计</td><td>谁提的申请、谁确认的、改前改后是哪档、差额多少，全部有记录</td></tr>
+</table>
+
+<h2 id="s7">七、点不了的几种情况</h2>
+
+<table class="doc">
+  <tr><th style="width:260px">情况</th><th>怎么办</th></tr>
+  <tr><td>酒店已经落位到具体酒店（不是「X星随机」）</td><td>先用「换酒店」把住宿处理掉，再改档</td></tr>
+  <tr><td>订单已取消 / 已退款 / 超时</td><td>不能改档</td></tr>
+  <tr><td>目标套餐已下架</td><td>换一个在售的档次</td></tr>
+  <tr><td>一张单里有多条套餐行</td><td>联系技术处理</td></tr>
+  <tr><td>已经有一条待确认的申请</td><td>先处理掉那条</td></tr>
+</table>
+
+<div class="warn">
+代理单改档之后应收变了，<strong>佣金不会自动重算</strong>，需要财务手工处理，和改期、取消航段是一样的口径。
+</div>
+
+<p style="margin-top:44px;color:#94A3B8;font-size:12.5px;border-top:1px solid #E2E8F0;padding-top:12px">
+世途旅行 · 运营控制台　|　套餐改档与代理改档申请操作说明　|　2026-09-02　|　文中金额与单号为演示数据
+</p>
+
+</div>
+</body>
+</html>
