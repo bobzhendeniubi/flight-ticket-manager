@@ -435,6 +435,81 @@ describe('serializeOrder · 收款记录标注与脱敏', () => {
     expect(p.externalTxnId).toBeNull();
   });
 
+  // ── 售后会话 / 座位账 / 取消手续费的内部快照键（黑名单必须逐个盖到）──────────────
+  // 这些键随 `...i` 展开就会整段下发：内部操作人 id、逐舱放座明细、超售座数、
+  // 取消手续费的口径（按政策还是手工核定）——代理凭此能反推我方库存与议价空间。
+  const AFTERSALE_META_KEYS = [
+    'noShow',
+    'returnReleased',
+    'returnRestored',
+    'returnVoidedFinal',
+    'returnLegCancelled',
+    'legActionLog',
+    'returnLegCancelFee',
+    'cancelledLeg',
+    'returnItemId',
+    'feeMode',
+  ] as const;
+
+  /** 一条把全部售后内部键都塞满的订单行（同时带两个必须**保留**的业务键）。 */
+  function orderWithAftersaleMeta() {
+    const base = buildOrder();
+    return {
+      ...base,
+      items: [
+        {
+          ...base.items[0],
+          metadata: {
+            goDate: '2026-08-01',
+            businessUpgradeCount: 1,
+            noShow: { at: '2026-09-01T00:00:00Z', byUserId: 'u_ops', passengerIds: ['p1'] },
+            returnReleased: {
+              at: '2026-09-01T00:00:00Z',
+              byUserId: 'u_ops',
+              originalScheduleId: 'sch_ret',
+              releasedSeats: [{ scheduleId: 'sch_ret', cabin: 'ECONOMY', quantity: 2 }],
+            },
+            returnRestored: { at: '2026-09-02T00:00:00Z', oversoldBy: 2, scheduleOversoldAfter: 3 },
+            returnVoidedFinal: { at: '2026-09-10T00:00:00Z' },
+            returnLegCancelled: { originalAmountCny: 3000, policySnapshot: { feePercent: 20 } },
+            legActionLog: [
+              { type: 'NO_SHOW', requestToken: 'tok-1', at: '2026-09-01T00:00:00Z', byUserId: 'u_ops' },
+            ],
+            returnLegCancelFee: true,
+            cancelledLeg: 'RETURN',
+            returnItemId: 'it_ret',
+            feeMode: 'MANUAL',
+          },
+        },
+      ],
+    };
+  }
+
+  it('售后 / 座位账 / 取消手续费的内部快照键：ADMIN 全量可见', () => {
+    const out = serializeOrder(
+      orderWithAftersaleMeta(),
+      orderSerializeRoleCtx(UserRole.ADMIN),
+    ) as Record<string, any>;
+    for (const key of AFTERSALE_META_KEYS) {
+      expect(out.items[0].metadata[key]).toBeDefined();
+    }
+  });
+
+  it('售后 / 座位账 / 取消手续费的内部快照键：AGENT 与 CUSTOMER 一个都拿不到，业务键照留', () => {
+    for (const role of [UserRole.AGENT, UserRole.CUSTOMER]) {
+      const out = serializeOrder(
+        orderWithAftersaleMeta(),
+        orderSerializeRoleCtx(role),
+      ) as Record<string, any>;
+      for (const key of AFTERSALE_META_KEYS) {
+        expect(out.items[0].metadata[key], `${role} 不该看到 ${key}`).toBeUndefined();
+      }
+      // 黑名单只剥计价 / 内部键，非价格业务键必须原样保留（代理要凭此替客人办事）。
+      expect(out.items[0].metadata.goDate).toBe('2026-08-01');
+      expect(out.items[0].metadata.businessUpgradeCount).toBe(1);
+    }
+  });
+
   it('收款复核锁字段：ADMIN 可见 paymentsLocked，AGENT 脱敏不下发', () => {
     const locked = {
       ...buildOrder(),

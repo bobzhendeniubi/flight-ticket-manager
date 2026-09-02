@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type OrderLegFlagFilter, splitBlockedReasons, splitDoneNoShowFailedOrderId } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type OrderLegFlagFilter, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -417,11 +417,25 @@ function deriveView(o: OrderSummary) {
 }
 
 /**
+ * 订单级航段状态标记 → 列表短标文案。
+ * RETURN_VOIDED 在后端口径里同时覆盖「最终作废」与「按取消政策取消的回程」两种，
+ * 所以文案写成两者兼容的说法，不替后端认定是哪一种。
+ */
+const ORDER_LEG_FLAG_NOTICE: Record<OrderLegFlagFilter, string> = {
+  NO_SHOW: '去程no-show',
+  RETURN_RELEASED: '回程已释放',
+  RETURN_RESTORED: '回程已恢复',
+  RETURN_VOIDED: '回程已作废/已取消',
+};
+
+/**
  * 列表「内容」列的航段状态短标：去程 no-show / 回程已释放（可恢复）/ 回程已恢复 / 回程已作废。
- * 只读行 metadata 的打标，判定口径与详情抽屉共用同一组函数（不另起一份，避免漂移）；
- * 无打标返回 null。
+ * 后端下发订单级 legFlag 时**直接消费它**——它与航段状态筛选同源，自己按 metadata 再派生
+ * 一份就会出现「筛出来的单不带这个标」的漂移。老后端/窄接口不下发时才回退到行 metadata，
+ * 判定口径与详情抽屉共用同一组函数。无打标返回 null。
  */
 function deriveLegNotice(o: OrderSummary): string | null {
+  if (o.legFlag) return o.legFlag === 'NONE' ? null : ORDER_LEG_FLAG_NOTICE[o.legFlag];
   const tags: string[] = [];
   const push = (t: string) => {
     if (!tags.includes(t)) tags.push(t);
@@ -5299,10 +5313,15 @@ function OrderDrawer({
             if (!isOps || noShowOpen) return null;
             const hasLiveFlight = (o.items ?? []).some((it) => it.kind === 'FLIGHT' && it.flightScheduleId);
             if (!hasLiveFlight) return null;
-            const noShowDone = orderHasNoShow(o);
-            const returnRestored = (o.items ?? []).some(
-              (it) => readReturnLegLifecycle(it)?.kind === 'RESTORED',
-            );
+            // 后端下发 legFlag 时按它判（与航段状态筛选同源）：
+            //   NONE → 没处理过；NO_SHOW / RETURN_RELEASED → 已处理且回程不在原班次上；
+            //   RETURN_RESTORED → 回程已恢复（代理又不要时可再次释放）；
+            //   RETURN_VOIDED → 回程已作废/已取消，没有再处理的余地。
+            // 不下发时回退到行 metadata 派生。
+            const noShowDone = o.legFlag ? o.legFlag !== 'NONE' : orderHasNoShow(o);
+            const returnRestored = o.legFlag
+              ? o.legFlag === 'RETURN_RESTORED'
+              : (o.items ?? []).some((it) => readReturnLegLifecycle(it)?.kind === 'RESTORED');
             const releaseAgain = noShowDone && returnRestored;
             if (noShowDone && !releaseAgain) return null;
             return (
@@ -6901,6 +6920,23 @@ function readCancelledLeg(metadata: unknown): FlightLegSide | null {
 // ── no-show / 回程释放·恢复 的行级打标读取（后端落在 item.metadata，与 returnLegCancelled 平级）
 // 一律「结构不符即视为没打标」：宁可少显示一个徽标，也不能把脏数据渲染成 undefined。
 
+/**
+ * 打标里的「是/否」位：后端这类字段有过 boolean 与数字（张数/座数）两种口径，
+ * 统一按 Number(value) > 0 判真，别让 `=== true` 把数字 1 读成 false。
+ */
+function isPositiveFlag(v: unknown): boolean {
+  if (typeof v === 'boolean') return v;
+  const n = Number(v);
+  return Number.isFinite(n) && n > 0;
+}
+
+/** 打标时间戳 → 毫秒数；缺失/不可解析为 null（不参与比较，而不是当成 0）。 */
+function markTimeMs(at: string | null | undefined): number | null {
+  if (typeof at !== 'string' || !at.trim()) return null;
+  const ms = Date.parse(at);
+  return Number.isFinite(ms) ? ms : null;
+}
+
 /** 去程行的 no-show 打标（metadata.noShow）。 */
 interface NoShowMark {
   at: string | null;
@@ -6946,7 +6982,7 @@ function readReturnReleasedMark(metadata: unknown): ReturnReleasedMark | null {
   return {
     at: typeof m.at === 'string' ? m.at : null,
     releasedSeats: seats,
-    ticketedAtRelease: m.ticketedAtRelease === true,
+    ticketedAtRelease: isPositiveFlag(m.ticketedAtRelease),
     note: typeof m.note === 'string' && m.note.trim() ? m.note.trim() : null,
   };
 }
@@ -6965,7 +7001,7 @@ function readReturnRestoredMark(metadata: unknown): ReturnRestoredMark | null {
   const m = v as { at?: unknown; oversold?: unknown; oversoldBy?: unknown; note?: unknown };
   return {
     at: typeof m.at === 'string' ? m.at : null,
-    oversold: m.oversold === true,
+    oversold: isPositiveFlag(m.oversold),
     oversoldBy: typeof m.oversoldBy === 'number' && Number.isFinite(m.oversoldBy) ? m.oversoldBy : 0,
     note: typeof m.note === 'string' && m.note.trim() ? m.note.trim() : null,
   };
@@ -6989,7 +7025,9 @@ function readReturnVoidedFinalAt(metadata: unknown): string | null | undefined {
  *   班次为空 + 释放打标晚于恢复打标      → 已释放（可恢复）
  *   班次非空 + 有 returnRestored        → 已恢复
  * 释放与恢复的打标会同时留存（恢复后再次释放是正常流程），所以当前态只能按时间戳定，
- * 不能只看快照存不存在。两边时间戳都缺（老数据）时以「班次为空」为准，不丢徽标。
+ * 不能只看快照存不存在。时间戳一律 Date.parse 成毫秒后按数值严格 `>` 比（与后端拿 Date
+ * 比同一口径）——字符串比大小会在时区写法不一致的两条打标上判反。
+ * 两边时间戳都缺（老数据）时以「班次为空」为准，不丢徽标。
  */
 type ReturnLegLifecycle =
   | { kind: 'VOIDED'; at: string | null }
@@ -7005,11 +7043,24 @@ function readReturnLegLifecycle(item: OrderItem): ReturnLegLifecycle {
   if (cancelledLeg) return { kind: 'CANCELLED', leg: cancelledLeg };
   const released = readReturnReleasedMark(item.metadata);
   const restored = readReturnRestoredMark(item.metadata);
-  if (!item.flightScheduleId && released && (released.at ?? '') >= (restored?.at ?? '')) {
+  if (!item.flightScheduleId && released && isReleaseCurrent(released, restored)) {
     return { kind: 'RELEASED', mark: released };
   }
   if (item.flightScheduleId && restored) return { kind: 'RESTORED', mark: restored };
   return null;
+}
+
+/** 释放打标是否比恢复打标新（= 当前处于「已释放」）。两边都没时间戳时退回「班次为空」即算释放。 */
+function isReleaseCurrent(
+  released: ReturnReleasedMark,
+  restored: ReturnRestoredMark | null,
+): boolean {
+  const releasedMs = markTimeMs(released.at);
+  const restoredMs = markTimeMs(restored?.at);
+  if (releasedMs == null && restoredMs == null) return true;
+  if (releasedMs == null) return false;
+  if (restoredMs == null) return true;
+  return releasedMs > restoredMs;
 }
 
 /** 本单是否已经标过去程 no-show（订单级入口据此隐藏「no-show 处理」按钮）。 */
@@ -8192,8 +8243,13 @@ function CancelLegForm({
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  /** 有 warnings 时必须先勾「已知悉」才能提交（后端同样会拦，前端只是把风险摆到眼前）。 */
+  /** 已勾「已知悉」。是否**必须**勾由 preview.requiresAcknowledgement 决定，不是「有 warnings 就要勾」。 */
   const [acknowledged, setAcknowledged] = useState(false);
+  /**
+   * 提交时后端回 ACKNOWLEDGEMENT_REQUIRED（预检之后航段才变成已出票这类）后置真：
+   * 强制补一次回执，勾完用同一个 requestToken 重提。
+   */
+  const [ackRequiredByServer, setAckRequiredByServer] = useState(false);
 
   useEffect(() => {
     if (!token) return;
@@ -8201,6 +8257,7 @@ function CancelLegForm({
     setPreviewLoading(true);
     setPreviewErr(null);
     setAcknowledged(false);
+    setAckRequiredByServer(false);
     api
       .previewCancelLeg(token, orderId, leg)
       .then((res) => {
@@ -8223,9 +8280,16 @@ function CancelLegForm({
 
   // 后端字段名沿用 returnItem（去程/回程共用），装的是本次要取消的那一段。
   const legItem = preview?.returnItem ?? null;
-  // 风险提示（如「已出票」）：不阻断，但要运营勾选确认后才放行提交。
+  // 风险提示（如「已出票」）：**只展示，不阻断**。是否必须回执只认 requiresAcknowledgement，
+  // 「有 warnings 就当强制确认」会把一堆纯提示单变成必须多点一下才能提交。
   const warnings = preview?.warnings ?? [];
-  const needsAck = Boolean(preview?.requiresAcknowledgement) || warnings.length > 0;
+  // 需要回执的那一档：后端下发 ackWarnings 就用它生成勾选文案；不下发时回退到 warnings 全量。
+  const ackWarnings = preview?.ackWarnings ?? null;
+  const ackLines = ackWarnings && ackWarnings.length > 0 ? ackWarnings : warnings;
+  // 剩下的纯提示（后端分档时不与勾选文案重复展示一遍）。
+  const infoWarnings =
+    ackWarnings && ackWarnings.length > 0 ? warnings.filter((w) => !ackWarnings.includes(w)) : warnings;
+  const needsAck = Boolean(preview?.requiresAcknowledgement) || ackRequiredByServer;
   const policyFee = preview?.policyFee ?? null;
   const hasPolicyFee = policyFee != null;
   // 本地估算展示用（权威数字来自提交后返回的 audit）：按当前选中的手续费口径重算降额/多付。
@@ -8281,7 +8345,23 @@ function CancelLegForm({
       );
       onSaved(res.order);
     } catch (e) {
-      setErr(e instanceof ApiError ? e.message : `取消${legZh}失败`);
+      // 预检之后航段才变成「已出票」这类：后端回 ACKNOWLEDGEMENT_REQUIRED。
+      // 不能只把报错抛给操作人——重新预检拿到最新提示，勾完「已知悉」用同一个
+      // requestToken 再提一次即可（幂等键不换，不会重复取消）。
+      if (e instanceof ApiError && e.code === ACKNOWLEDGEMENT_REQUIRED_CODE) {
+        setAckRequiredByServer(true);
+        setAcknowledged(false);
+        setErr('航段状态刚发生变化，请看清下面的提示、勾选「已知悉」后再提交一次。');
+        try {
+          const fresh = await api.previewCancelLeg(token, orderId, leg);
+          setPreview(fresh);
+          if (!fresh.policyFee) setFeeMode('MANUAL');
+        } catch (pe) {
+          setPreviewErr(pe instanceof ApiError ? pe.message : `取消${legZh}预检失败`);
+        }
+      } else {
+        setErr(e instanceof ApiError ? e.message : `取消${legZh}失败`);
+      }
     } finally {
       setSubmitting(false);
     }
@@ -8307,11 +8387,12 @@ function CancelLegForm({
         </div>
       )}
 
-      {warnings.length > 0 && (
+      {/* 纯提示：摆出来让运营看见即可，不挡提交。要不要回执由下面的勾选框单独决定。 */}
+      {infoWarnings.length > 0 && (
         <div className="space-y-1 rounded border border-amber-300 bg-amber-50 px-2 py-1.5 text-amber-800">
-          <div className="font-medium">请先确认：</div>
+          <div className="font-medium">请注意：</div>
           <ul className="list-disc space-y-0.5 pl-4">
-            {warnings.map((w) => (
+            {infoWarnings.map((w) => (
               <li key={w}>{w}</li>
             ))}
           </ul>
@@ -8327,7 +8408,11 @@ function CancelLegForm({
             onChange={(e) => setAcknowledged(e.target.checked)}
             disabled={submitting}
           />
-          <span>已知悉：取消后将给票务派撤名单/退票工单。</span>
+          <span>
+            {ackLines.length > 0
+              ? `已知悉：${ackLines.join('；')}`
+              : '已知悉：取消后将给票务派撤名单/退票工单。'}
+          </span>
         </label>
       )}
 
@@ -8471,6 +8556,24 @@ function RestoreReturnLegForm({
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  /**
+   * 提交时后端回 OVERSELL_CONFIRMATION_REQUIRED（预检时还有座、提交前被别人占走）后置真：
+   * 面板切到超售确认态，运营再确认一次即用同一个 requestToken 带 allowOversell 重提。
+   */
+  const [oversellConfirmRequired, setOversellConfirmRequired] = useState(false);
+  /** 后端回 OVERSELL_LIMIT_EXCEEDED：超售会超系统上限，二次确认也过不了，按硬阻断展示。 */
+  const [limitBlocker, setLimitBlocker] = useState<string | null>(null);
+
+  /** 提交失败后按最新库存重拉一次预检（余位/超售座数都要跟着变）。 */
+  const refreshPreview = useCallback(async () => {
+    if (!token) return;
+    try {
+      const fresh = await api.previewRestoreReturnLeg(token, orderId);
+      setPreview(fresh);
+    } catch (e) {
+      setPreviewErr(e instanceof ApiError ? e.message : '恢复回程预检失败');
+    }
+  }, [token, orderId]);
 
   useEffect(() => {
     if (!token) return;
@@ -8494,25 +8597,41 @@ function RestoreReturnLegForm({
   }, [orderId, token]);
 
   const original = preview?.original ?? null;
-  const needsOversell = preview?.needsOversell === true;
+  const needsOversell = preview?.needsOversell === true || oversellConfirmRequired;
   // 要占回去的座位数以预检的原班次快照为准（后端口径 = 释放时实际放回库存的 Σ releasedSeats），
   // 不按订单行数量另算——部分人 no-show 拆过单时两者不是同一个数。
   const seats = original?.quantity ?? 0;
   const warnings = preview?.warnings ?? [];
+  // 该班次「当前已经超售」的座数：余位为负即是超售深度（后端口径下 available 会走到负数）。
+  const alreadyOversold = preview ? Math.max(0, -preview.available) : 0;
+  // 本次恢复会「再超」的座数 = 预检值；预检刚好没跟上（提交时才被占走）时按需占座 − 余位兜底。
+  const oversellSeats = preview
+    ? preview.oversellBy > 0
+      ? preview.oversellBy
+      : Math.max(0, seats - preview.available)
+    : 0;
+  /** 超售确认文案：该班已超售 N 座 → 本次再超 k 座（上限 M）。N=0 时说「已满」。 */
+  const oversellLine =
+    alreadyOversold > 0
+      ? `该班已超售 ${alreadyOversold} 座，本次再超 ${oversellSeats} 座（上限 ${preview?.maxOversell ?? 0} 座）。`
+      : `该班已满，本次超售 ${oversellSeats} 座（上限 ${preview?.maxOversell ?? 0} 座）。`;
+  // needsOversell 决定「要不要带 allowOversell」（被占走后强制置真，宁可多带也不能少带）；
+  // 超售话术另按真实超售座数走，别在余位又放出来时印出「超售 0 座」。
+  const showOversellWording = needsOversell && oversellSeats > 0;
 
   const submit = async () => {
-    if (!token || submitting || !preview?.eligible || !original) return;
+    if (!token || submitting || !preview?.eligible || !original || limitBlocker) return;
     setErr(null);
     const legLabel = `${original.flightNumber ?? '原班次'}${original.departDate ? ` ${original.departDate}` : ''}`;
     // 后端提示（如开票位已清）跟着确认框一起走，避免只在面板里一闪而过没人看见。
     const warningLines = warnings.length > 0 ? `\n\n${warnings.map((w) => `· ${w}`).join('\n')}` : '';
     const confirmed = await confirm(
-      needsOversell
+      showOversellWording
         ? {
             title: '恢复回程（超售）',
-            body: `${legLabel} 已满，当前余位 ${preview.available} 座。\n\n确认超售 ${preview.oversellBy} 座并恢复回程，将记关键审计。钱款不动。${warningLines}`,
+            body: `${legLabel}：${oversellLine}\n\n确认后恢复回程并记关键审计。钱款不动。${warningLines}`,
             tone: 'danger',
-            confirmText: `确认超售 ${preview.oversellBy} 座并恢复`,
+            confirmText: `确认再超 ${oversellSeats} 座并恢复`,
           }
         : {
             title: '恢复回程',
@@ -8530,11 +8649,29 @@ function RestoreReturnLegForm({
       });
       alert(
         `已恢复回程 ${res.audit.quantity} 座` +
-          (res.audit.oversold ? `（超售 ${res.audit.oversoldBy} 座，已记审计）` : ''),
+          // oversoldBy = 本次新增超售座数（不是该班累计超售）。
+          (res.audit.oversold ? `（本次再超 ${res.audit.oversoldBy} 座，已记审计）` : ''),
       );
       onSaved(res.order);
     } catch (e) {
-      setErr(e instanceof ApiError ? e.message : '恢复回程失败');
+      const code = e instanceof ApiError ? e.code : null;
+      if (code === OVERSELL_CONFIRMATION_REQUIRED_CODE) {
+        // 预检时还有座、提交前被别人占走：不是死路，切到超售确认态让运营再拍一次板，
+        // 重提沿用同一个 requestToken（幂等键不换，不会重复占座）。
+        setOversellConfirmRequired(true);
+        setErr('原班次余位刚被占走，恢复要走超售。请确认后再提交一次。');
+        await refreshPreview();
+      } else if (code === OVERSELL_LIMIT_EXCEEDED_CODE) {
+        // 超上限：二次确认也过不了，按阻断展示，别让运营反复点。
+        setLimitBlocker(
+          e instanceof ApiError && e.message
+            ? e.message
+            : '恢复会让该班超售超过系统上限，暂时不能恢复回程。',
+        );
+        setErr(null);
+      } else {
+        setErr(e instanceof ApiError ? e.message : '恢复回程失败');
+      }
     } finally {
       setSubmitting(false);
     }
@@ -8561,6 +8698,16 @@ function RestoreReturnLegForm({
         </div>
       )}
 
+      {/* 超售超上限：与预检 blockers 同样按阻断展示（提交按钮同步禁用）。 */}
+      {limitBlocker && (
+        <div className="space-y-1 rounded bg-red-50 px-2 py-1 text-red-700">
+          <div className="font-medium">当前不能恢复回程：</div>
+          <ul className="list-disc space-y-0.5 pl-4">
+            <li>{limitBlocker}</li>
+          </ul>
+        </div>
+      )}
+
       {warnings.length > 0 && (
         <div className="space-y-1 rounded border border-amber-300 bg-amber-50 px-2 py-1.5 text-amber-800">
           <div className="font-medium">请先确认：</div>
@@ -8581,13 +8728,18 @@ function RestoreReturnLegForm({
               {original.cabin && <> · {CABIN_ZH[original.cabin] ?? original.cabin}</>}
             </div>
             <div className="text-slate-500">
-              需占 {original.quantity} 座 · 当前余位 {preview.available} 座 · 钱款不动
+              需占 {original.quantity} 座 ·{' '}
+              {/* 余位可能为负（该班已超售）：负数直接印出来看不懂，按「已超售 N 座」说人话。 */}
+              {alreadyOversold > 0
+                ? `该班已超售 ${alreadyOversold} 座`
+                : `当前余位 ${preview.available} 座`}{' '}
+              · 钱款不动
             </div>
           </div>
 
-          {needsOversell && (
+          {showOversellWording && (
             <div className="rounded border border-amber-300 bg-amber-50 px-2 py-1.5 text-amber-800">
-              该班已满，恢复将超售 {preview.oversellBy} 座（上限 {preview.maxOversell} 座）。确认后会记关键审计。
+              {oversellLine}确认后会记关键审计。
             </div>
           )}
 
@@ -8610,9 +8762,9 @@ function RestoreReturnLegForm({
         <button
           className="flex-1 rounded bg-emerald-600 px-2 py-1.5 font-medium text-white disabled:opacity-50"
           onClick={submit}
-          disabled={submitting || previewLoading || !preview?.eligible}
+          disabled={submitting || previewLoading || !preview?.eligible || limitBlocker != null}
         >
-          {submitting ? '提交中…' : needsOversell ? '超售恢复回程' : '确认恢复回程'}
+          {submitting ? '提交中…' : showOversellWording ? '超售恢复回程' : '确认恢复回程'}
         </button>
         <button
           className="rounded bg-slate-100 px-3 py-1.5 text-slate-700 disabled:opacity-50"
@@ -8662,7 +8814,11 @@ function NoShowPanel({
   const previewSeqRef = useRef(0);
   /** 首次预检是否已回来（回来前不触发勾选联动预检，否则会跟首次请求打架）。 */
   const initializedRef = useRef(false);
-  /** 最近一次已经预检过的勾选组合，用来跳过「默认全选」这类没变化的重复请求。 */
+  /**
+   * 最近一次已经预检过的请求组合 `${勾选乘客}|${是否释放回程}`，用来跳过没变化的重复请求。
+   * 释放与否必须进这个 key：blockers 是按它算的，只按勾选人做 key 会把「改了释放开关」
+   * 当成没变化，拿一份过期判定去提交。
+   */
   const previewedKeyRef = useRef<string | null>(null);
 
   // 「再次释放回程」：去程早已标过 no-show、回程恢复后代理又不要了。此时不再选人、不再动去程，
@@ -8673,10 +8829,15 @@ function NoShowPanel({
       .find((m): m is NonNullable<typeof m> => m != null) ?? null;
   const releaseAgain = orderNoShowMark != null;
 
-  /** 把预检结果落到面板：回程已起飞时强制取消「同时释放回程」（勾了也会被后端拒）。 */
+  /**
+   * 把预检结果落到面板：回程已起飞、或本单压根没有回程航段时，强制取消「同时释放回程」
+   * （这两种情况勾了也会被后端拒，勾选框本身也是禁用态）。
+   * 取消勾选会让下面的联动 effect 立刻以 releaseReturn:false 再预检一次——只有那一次的
+   * blockers 才是「只标 no-show、不释放回程」这一档的判定，不重拉就永远提交不了。
+   */
   const applyPreview = useCallback((res: NoShowPreview) => {
     setPreview(res);
-    if (res.returnDeparted) setReleaseReturn(false);
+    if (res.returnDeparted || !res.returnItem) setReleaseReturn(false);
   }, []);
 
   useEffect(() => {
@@ -8686,15 +8847,16 @@ function NoShowPanel({
     setPreviewLoading(true);
     setPreviewErr(null);
     api
-      .previewNoShow(token, order.id)
+      // 首次预检按面板初始态来：整单 + 勾着「释放回程」。
+      .previewNoShow(token, order.id, { releaseReturn: true })
       .then((res) => {
         if (cancelled || seq !== previewSeqRef.current) return;
         applyPreview(res);
         // 默认全选＝整单处理（勾掉部分人才走拆单）。
         const allIds = (res.passengers ?? []).map((p) => p.id);
         setSelectedIds(new Set(allIds));
-        // 首次预检就是「整单」口径，记下它，勾选联动不必再原样请求一遍。
-        previewedKeyRef.current = [...allIds].sort().join(',');
+        // 首次预检就是「整单 + 释放回程」口径，记下它，联动不必再原样请求一遍。
+        previewedKeyRef.current = `${releaseAgain ? '' : [...allIds].sort().join(',')}|1`;
         initializedRef.current = true;
       })
       .catch((e) => {
@@ -8708,7 +8870,7 @@ function NoShowPanel({
     return () => {
       cancelled = true;
     };
-  }, [order.id, token, applyPreview]);
+  }, [order.id, token, applyPreview, releaseAgain]);
 
   const passengers = preview?.passengers ?? [];
   // 再次释放回程时不选人（去程已定案），选人框只在首次 no-show 且多人单时出现。
@@ -8719,24 +8881,30 @@ function NoShowPanel({
   const warnings = preview?.warnings ?? [];
   const returnDeparted = preview?.returnDeparted === true;
   const releasingSeats = returnItem?.quantity ?? 0;
-  // 勾选人变化后必须重新预检：拆单口径（scope）与 blockers 都是按所选乘客算的，
-  // 拿首次整单的预检结果去提交，等于用一份过期的判断结果做资金/库存动作。
+  // 勾选人 / 是否释放回程 变化后都必须重新预检：拆单口径（scope）与 blockers 都是按
+  // 「哪些人 + 这次释不释放回程」算的，拿一份过期判定去提交等于凭旧结论做资金/库存动作。
   const selectedKey = [...selectedIds].sort().join(',');
+  // 再次释放回程时不选人（去程已定案），选人部分从 key 里摘掉。
+  const selectionKey = releaseAgain ? '' : selectedKey;
+  const previewKey = `${selectionKey}|${releaseReturn ? '1' : '0'}`;
   useEffect(() => {
-    if (!token || !initializedRef.current || releaseAgain) return;
+    if (!token || !initializedRef.current) return;
     // 一个都没勾时不发请求（提交侧已拦「请至少勾选 1 位」），避免把空选当整单预检误导操作人。
-    if (selectedIds.size === 0) return;
-    if (previewedKeyRef.current === selectedKey) return;
-    const ids = isPartial ? [...selectedIds] : undefined;
+    if (!releaseAgain && selectedIds.size === 0) return;
+    if (previewedKeyRef.current === previewKey) return;
+    const ids = !releaseAgain && isPartial ? [...selectedIds] : undefined;
+    // 只是切了「释放回程」开关（选人没动）时不防抖：回程已起飞会当场取消勾选，
+    // 这一次重拉决定了「只标 no-show」能不能提交，不该让操作人干等。
+    const delay = previewedKeyRef.current?.split('|')[0] === selectionKey ? 0 : 300;
     const timer = setTimeout(() => {
       const seq = ++previewSeqRef.current;
       setRepreviewing(true);
       api
-        .previewNoShow(token, order.id, ids)
+        .previewNoShow(token, order.id, { passengerIds: ids, releaseReturn })
         .then((res) => {
           if (seq !== previewSeqRef.current) return;
           applyPreview(res);
-          previewedKeyRef.current = selectedKey;
+          previewedKeyRef.current = previewKey;
           setPreviewErr(null);
         })
         .catch((e) => {
@@ -8746,11 +8914,12 @@ function NoShowPanel({
         .finally(() => {
           if (seq === previewSeqRef.current) setRepreviewing(false);
         });
-    }, 300);
+    }, delay);
     return () => clearTimeout(timer);
-    // selectedKey 是 selectedIds 的稳定字符串投影（Set 每次都是新引用，不能直接进依赖）。
+    // previewKey 是 selectedIds + releaseReturn 的稳定字符串投影（Set 每次都是新引用，
+    // 不能直接进依赖）；selectionKey/selectedIds 只在 effect 体内读当次值。
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [selectedKey, isPartial, order.id, token, releaseAgain, applyPreview]);
+  }, [previewKey, isPartial, order.id, token, releaseAgain, releaseReturn, applyPreview]);
 
   // 再次释放回程：后端仍会回 alreadyNoShow=true（去程确实标过），此时 eligible 未必为真，
   // 但只要没有 blockers 就等价于一次「只释放回程」，可以提交。

@@ -1722,7 +1722,11 @@ export interface HotelControlAlerts {
     flightNumber: string;
     departureDate: string; // YYYY-MM-DD
     paxCount: number;
-    /** 该班次里由 no-show 恢复超售贡献的座数 = Σ returnRestored.oversoldBy（无则 0）。 */
+    /**
+     * 该班次里由 no-show 恢复超售贡献的座数 = Σ 各单 returnRestored.oversoldBy（无则 0）。
+     * oversoldBy 是**本次新增**的超售座数（increment），所以逐单求和正好就是「已审计放行的那部分」；
+     * 若用累计口径（scheduleOversoldAfter）求和，同一班上有两单时会把同一批座算两遍。
+     */
     noShowOversoldSeats: number;
     /** 告警文案后缀（无 no-show 超售时为空串），供前端直接拼在句尾。 */
     note: string;

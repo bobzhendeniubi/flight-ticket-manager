@@ -3562,8 +3562,14 @@ export interface CancelLegPreview {
   blockers: string[];
   /** 可以继续、但必须让运营先看见的风险提示（如「已出票，取消后需撤名单/退票」）。 */
   warnings: string[];
-  /** true = 有 warnings，提交必须带 acknowledgeWarnings（否则后端 400 ACKNOWLEDGEMENT_REQUIRED）。 */
+  /** true = 提交必须带 acknowledgeWarnings（否则后端 400 ACKNOWLEDGEMENT_REQUIRED）。
+   *  注意：不是「有 warnings 就要回执」——只有 requiresAcknowledgement 才是强制项。 */
   requiresAcknowledgement: boolean;
+  /**
+   * warnings 里真正需要运营勾「已知悉」的那一档（前端据此生成勾选文案）。
+   * 旧后端不下发时为 undefined：回退到 requiresAcknowledgement + warnings 的老口径。
+   */
+  ackWarnings?: string[];
   /** 待取消的那一段航段行；字段名沿用 returnItem（去程/回程共用），方向看 leg。无该段时为 null */
   returnItem: {
     orderItemId: string;
@@ -3598,7 +3604,8 @@ export interface CancelLegResult {
     totalBefore: number;
     totalAfter: number;
     overpayAfterCny: number;
-    releasedSeats: number;
+    /** 放回库存的座位，逐班次逐舱一行（与后端审计同结构）；总座数自行 Σ quantity。 */
+    releasedSeats: Array<{ scheduleId: string; cabin: string; quantity: number }>;
     /** 已出票航段被取消时后端派给票务的撤名单/退票工单 id；无需派单为 null。 */
     workOrderReminderId: string | null;
   };
@@ -3738,6 +3745,12 @@ export interface RestoreReturnLegResult {
 
 /** 恢复回程需要超售、但没带 allowOversell 时后端拒绝的稳定 code（details: {available, oversellBy}）。 */
 export const OVERSELL_CONFIRMATION_REQUIRED_CODE = 'OVERSELL_CONFIRMATION_REQUIRED';
+
+/**
+ * 带了 allowOversell 但超售量会超过系统上限时后端拒绝的稳定 code。
+ * 与 OVERSELL_CONFIRMATION_REQUIRED 不同：这条不是二次确认能过的，属于硬阻断。
+ */
+export const OVERSELL_LIMIT_EXCEEDED_CODE = 'OVERSELL_LIMIT_EXCEEDED';
 
 export const api = {
   login: (email: string, password: string) =>
@@ -4707,11 +4720,22 @@ export const api = {
     }),
   // no-show 预检：只读。不传 passengerIds = 整单；传部分人 = scope 回 SPLIT_REQUIRED
   // （提交时后端先拆单、再对拆出的新单处理）。
-  previewNoShow: (token: string, orderId: string, passengerIds?: string[]) =>
+  // releaseReturn 必须跟着面板上的勾选一起传：blockers 是按「本次要不要释放回程」算的，
+  // 回程已起飞时只有传 false 才能拿到「只标 no-show」这一档的合格判定。
+  previewNoShow: (
+    token: string,
+    orderId: string,
+    opts?: { passengerIds?: string[]; releaseReturn?: boolean },
+  ) =>
     apiFetch<NoShowPreview>(`/orders/${orderId}/no-show/preview`, {
       method: 'POST',
       token,
-      body: passengerIds && passengerIds.length > 0 ? { passengerIds } : {},
+      body: {
+        ...(opts?.passengerIds && opts.passengerIds.length > 0
+          ? { passengerIds: opts.passengerIds }
+          : {}),
+        ...(opts?.releaseReturn === undefined ? {} : { releaseReturn: opts.releaseReturn }),
+      },
     }),
   // no-show 提交：去程标 no-show（钱不动），releaseReturn（默认 true）时回程座位放回库存
   // 重新可卖（钱同样不动）。requestToken 幂等键（同一次表单提交内复用）。

@@ -38,9 +38,9 @@ const { mockPrisma } = vi.hoisted(() => ({
 
 vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
 
-import { OrderService } from './orders.service.js';
+import { OrderService, syncOrderLegFlag } from './orders.service.js';
 import { noShowBodySchema, restoreReturnLegBodySchema } from './orders.schemas.js';
-import { AppError, BadRequestError, ForbiddenError } from '../../lib/errors.js';
+import { AppError, BadRequestError, ConflictError, ForbiddenError } from '../../lib/errors.js';
 
 const service = new OrderService();
 const ADMIN = { userId: 'admin-1', role: UserRole.ADMIN } as const;
@@ -226,6 +226,8 @@ function mountTx(
     },
     seatLock: { aggregate: vi.fn(async () => ({ _sum: { qty: 0 } })) },
     refund: { count: vi.fn(async () => 0) },
+    // 超售放行的 CRITICAL 审计与占座同一事务写（writeAuditWithinTx），故 tx 上必须有这张表。
+    auditLog: { create: vi.fn(async () => ({ id: 'audit-1' })) },
   };
   mockPrisma.$transaction.mockImplementation(async (fn: (t: unknown) => unknown) => fn(tx));
   mockPrisma.order.findUniqueOrThrow.mockResolvedValue(serializableOrder());
@@ -999,7 +1001,13 @@ describe('恢复回程 · 预检', () => {
     const res = await service.previewRestoreReturnLeg('ord-1', ADMIN);
     expect(res.available).toBe(-1);
     expect(res.needsOversell).toBe(true);
-    expect(res.oversellBy).toBe(3);
+    // 班次本来就已超 1 座（sold 181 / capacity 180），本次占回 2 座 →
+    // **本次新增** 2 座超售、恢复后累计超出 3 座。旧口径把别人早就卖穿的那 1 座也算进本次，报 3。
+    expect(res.oversellBy).toBe(2);
+    expect(res.oversoldAfter).toBe(3);
+    expect(res.oversellDetail).toEqual([
+      { cabin: 'ECONOMY', quantity: 2, before: 1, after: 3, increment: 2 },
+    ]);
     expect(res.maxOversell).toBe(5);
     expect(res.eligible).toBe(true);
   });
@@ -1017,8 +1025,12 @@ describe('恢复回程 · 预检', () => {
 
     const res = await service.previewRestoreReturnLeg('ord-1', ADMIN);
     expect(res.eligible).toBe(false);
-    expect(res.oversellBy).toBe(12);
+    // 上限比的是**累计**（恢复后一共超 12 座），不是本次新增的 2 座 ——
+    // 班次早被卖穿到上限之外时，再放行 1 座也是继续加码。
+    expect(res.oversellBy).toBe(2);
+    expect(res.oversoldAfter).toBe(12);
     expect(res.blockers.join('')).toContain('超售将超过上限 5 座');
+    expect(res.blockers.join('')).toContain('累计超出 12 座');
   });
 
   it('原班次已起飞 → blocker + departed=true', async () => {
@@ -1101,7 +1113,11 @@ describe('恢复回程 · 执行', () => {
     expect(err).toBeInstanceOf(AppError);
     expect((err as AppError).statusCode).toBe(409);
     expect((err as AppError).code).toBe('OVERSELL_CONFIRMATION_REQUIRED');
-    expect((err as AppError).details).toEqual({ available: -1, oversellBy: 3 });
+    expect((err as AppError).details).toEqual({
+      available: -1,
+      oversellBy: 2,
+      oversoldAfter: 3,
+    });
     expect(tx.$executeRaw).not.toHaveBeenCalled();
     expect(tx.orderItem.update).not.toHaveBeenCalled();
   });
@@ -1117,13 +1133,35 @@ describe('恢复回程 · 执行', () => {
       ADMIN,
     );
     expect(audit.oversold).toBe(true);
-    expect(audit.oversoldBy).toBe(3);
+    // 本次新增 2 座（班次原本已超 1 座）；恢复后该舱累计超出 3 座。
+    expect(audit.oversoldBy).toBe(2);
+    expect(audit.scheduleOversoldAfter).toBe(3);
     expect(tx.$executeRaw).toHaveBeenCalledTimes(1);
     const calls = tx.orderItem.update.mock.calls as unknown as Array<
       [{ where: { id: string }; data: Record<string, unknown> }]
     >;
     const meta = updateDataFor(calls, 'leg-ret')!.metadata as Record<string, unknown>;
-    expect(meta.returnRestored).toMatchObject({ oversold: true, oversoldBy: 3 });
+    expect(meta.returnRestored).toMatchObject({
+      oversold: true,
+      oversoldBy: 2,
+      scheduleOversoldAfter: 3,
+      seatDetail: [{ cabin: 'ECONOMY', quantity: 2, before: 1, after: 3, increment: 2 }],
+    });
+
+    // 超售放行的 CRITICAL 审计与占座同一事务（不再由路由异步补记，避免占座成了、审计没成）。
+    expect(tx.auditLog.create).toHaveBeenCalledTimes(1);
+    const auditArg = (tx.auditLog.create.mock.calls[0] as unknown as [
+      { data: Record<string, unknown> },
+    ])[0];
+    expect(auditArg.data.action).toBe('RESTORE_RETURN_LEG_OVERSOLD');
+    expect(auditArg.data.severity).toBe('CRITICAL');
+    expect(auditArg.data.targetType).toBe('ORDER');
+    expect(String(auditArg.data.targetLabel)).toContain('超出 3 座（本次 +2，上限 5）');
+    expect(auditArg.data.after).toMatchObject({
+      oversoldBy: 2,
+      scheduleOversoldAfter: 3,
+      seatDetail: [{ cabin: 'ECONOMY', before: 1, after: 3, increment: 2 }],
+    });
   });
 
   it('缺口超上限 → 即便确认也被拒，且一座不动', async () => {
@@ -1600,5 +1638,288 @@ describe('_updateStatusWithinTx · 已起飞航段不放座', () => {
       [],
     );
     expect(tx.$executeRaw).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 9. 多轮释放/恢复后，**旧 token** 仍然幂等（legActionLog）
+//
+// 释放 → 恢复 → 再释放 → 再恢复，returnReleased / returnRestored 每轮都会被新快照顶掉，
+// 中间几轮的 requestToken 因此从「当前快照」上消失。旧写法只查当前快照的 token，
+// 那几轮的延迟重试（网络抖动/运营连点/前端自动重试）会被当成新请求重跑一遍：
+// 二次放座 / 二次占座，座位账凭空多算或少算一批，事后极难查。
+// 现在每轮都往行上的 legActionLog 追加一条（append-only），回放只认「见没见过这个 token」。
+// ══════════════════════════════════════════════════════════════════════════
+const TOKEN_A = '00000000-0000-4000-8000-00000000aaa1';
+const TOKEN_B = '00000000-0000-4000-8000-00000000bbb2';
+const TOKEN_C = '00000000-0000-4000-8000-00000000ccc3';
+const TOKEN_D = '00000000-0000-4000-8000-00000000ddd4';
+const TOKEN_E = '00000000-0000-4000-8000-00000000eee5';
+
+describe('no-show · 多轮释放/恢复后旧 token 的延迟重试', () => {
+  it('释放 A → 恢复 B → 再释放 C → 再恢复 D → 再释放 E 之后，B 与 C 的重试都不动库存', async () => {
+    type UpdateCalls = Array<[{ where: { id: string }; data: Record<string, unknown> }]>;
+    let outMeta: unknown = null;
+    let retMeta: unknown = null;
+
+    // 只假造 Date：四轮动作在真实时钟下可能落在同一毫秒，
+    // 「释放晚于最近一次恢复」就判不出来了（那是时间戳精度问题，不是本用例要测的东西）。
+    vi.useFakeTimers({ toFake: ['Date'] });
+    const tick = (): void => {
+      vi.setSystemTime(new Date(Date.now() + 60_000));
+    };
+
+    /** 把上一轮写下的 metadata 接到下一轮的快照上（mock 不持久化，得手工串起来）。 */
+    const mountRound = (returnOnSchedule: boolean, seatClass?: { capacity: number; sold: number }) =>
+      mountTx({
+        snapshot: orderSnapshot({
+          items: [
+            outboundRow({
+              description: '【去程未登机】机票 QH9589 经济舱 × 2',
+              metadata: outMeta,
+            }),
+            returnRow(
+              returnOnSchedule
+                ? { metadata: retMeta }
+                : {
+                    description: '【回程座位已释放】机票 QH9588 经济舱 × 2',
+                    flightScheduleId: null,
+                    flightSchedule: null,
+                    metadata: retMeta,
+                  },
+            ),
+            hotelRow,
+          ],
+        }),
+        flightMeta: [
+          { id: 'leg-out', metadata: outMeta },
+          { id: 'leg-ret', metadata: retMeta },
+        ],
+        seatClass,
+      });
+
+    // ① 释放 A（干净单）
+    let tx = mountTx();
+    await service.markNoShow('ord-1', noShowBody({ requestToken: TOKEN_A }), ADMIN);
+    outMeta = updateDataFor(tx.orderItem.update.mock.calls as unknown as UpdateCalls, 'leg-out')!
+      .metadata;
+    retMeta = updateDataFor(tx.orderItem.update.mock.calls as unknown as UpdateCalls, 'leg-ret')!
+      .metadata;
+
+    // ② 恢复 B
+    tick();
+    vi.clearAllMocks();
+    tx = mountRound(false, { capacity: 180, sold: 100 });
+    await service.restoreReturnLeg('ord-1', restoreBody({ requestToken: TOKEN_B }), ADMIN);
+    retMeta = updateDataFor(tx.orderItem.update.mock.calls as unknown as UpdateCalls, 'leg-ret')!
+      .metadata;
+
+    // ③ 再释放 C
+    tick();
+    vi.clearAllMocks();
+    tx = mountRound(true);
+    await service.markNoShow('ord-1', noShowBody({ requestToken: TOKEN_C }), ADMIN);
+    outMeta = updateDataFor(tx.orderItem.update.mock.calls as unknown as UpdateCalls, 'leg-out')!
+      .metadata;
+    retMeta = updateDataFor(tx.orderItem.update.mock.calls as unknown as UpdateCalls, 'leg-ret')!
+      .metadata;
+
+    // ④ 再恢复 D
+    tick();
+    vi.clearAllMocks();
+    tx = mountRound(false, { capacity: 180, sold: 100 });
+    await service.restoreReturnLeg('ord-1', restoreBody({ requestToken: TOKEN_D }), ADMIN);
+    retMeta = updateDataFor(tx.orderItem.update.mock.calls as unknown as UpdateCalls, 'leg-ret')!
+      .metadata;
+
+    // ⑤ 再释放 E（多走这一轮，C 才会被 E 挤出 returnReleased —— 否则 C 还挂在当前快照上，
+    //    旧写法也能扫到，这条用例就白测了）
+    tick();
+    vi.clearAllMocks();
+    tx = mountRound(true);
+    await service.markNoShow('ord-1', noShowBody({ requestToken: TOKEN_E }), ADMIN);
+    outMeta = updateDataFor(tx.orderItem.update.mock.calls as unknown as UpdateCalls, 'leg-out')!
+      .metadata;
+    retMeta = updateDataFor(tx.orderItem.update.mock.calls as unknown as UpdateCalls, 'leg-ret')!
+      .metadata;
+
+    // 五轮动作都进了 legActionLog（append-only，一条不丢）。
+    const log = (retMeta as { legActionLog: Array<Record<string, unknown>> }).legActionLog;
+    expect(log.map((e) => [e.type, e.requestToken])).toEqual([
+      ['NO_SHOW', TOKEN_A],
+      ['RESTORE', TOKEN_B],
+      ['RELEASE', TOKEN_C],
+      ['RESTORE', TOKEN_D],
+      ['RELEASE', TOKEN_E],
+    ]);
+    // 当前快照上只剩最后两轮：returnReleased=E、returnRestored=D。
+    // C 被挤进了 returnReleased.history，B 则**连 history 都没有**（returnRestored 是纯覆盖写）——
+    // 只查当前快照 requestToken 的旧写法，这两个 token 到这里就彻底扫不到了。
+    expect((retMeta as { returnReleased: { requestToken: string } }).returnReleased.requestToken)
+      .toBe(TOKEN_E);
+    expect((retMeta as { returnRestored: { requestToken: string } }).returnRestored.requestToken)
+      .toBe(TOKEN_D);
+
+    // ⑥ C（第二次释放）的延迟重试 → 回放，一座不动
+    vi.clearAllMocks();
+    const txC = mountRound(false); // E 之后回程又处于已释放态
+    const replayC = await service.markNoShow(
+      'ord-1',
+      noShowBody({ requestToken: TOKEN_C }),
+      ADMIN,
+    );
+    expect(replayC.audit.replayed).toBe(true);
+    expect(txC.$executeRaw).not.toHaveBeenCalled();
+    expect(txC.orderItem.update).not.toHaveBeenCalled();
+
+    // ⑦ B（第一次恢复）的延迟重试 → 回放，一座不动
+    vi.clearAllMocks();
+    const txB = mountRound(false, { capacity: 180, sold: 100 });
+    const replayB = await service.restoreReturnLeg(
+      'ord-1',
+      restoreBody({ requestToken: TOKEN_B }),
+      ADMIN,
+    );
+    expect(replayB.audit.replayed).toBe(true);
+    // 回放回的是**当前状态**（最后那次恢复的结果），不是 B 那一轮的旧快照。
+    expect(replayB.audit.returnItemId).toBe('leg-ret');
+    expect(txB.$executeRaw).not.toHaveBeenCalled();
+    expect(txB.orderItem.update).not.toHaveBeenCalled();
+
+    vi.useRealTimers();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 10. 释放量必须与快照恒等（releaseSeatStrictWithinTx）
+// ══════════════════════════════════════════════════════════════════════════
+describe('no-show · 释放量与快照恒等', () => {
+  it('该舱 sold 不足以释放 → 整单回滚，metadata 一个字都不写', async () => {
+    const tx = mountTx();
+    // sold >= qty 的条件没命中 → affected 0（floored 版会静默少放，快照却照记 2 座）。
+    tx.$executeRaw.mockResolvedValue(0);
+
+    await expect(service.markNoShow('ord-1', noShowBody(), ADMIN)).rejects.toBeInstanceOf(
+      ConflictError,
+    );
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+    expect(tx.order.update).not.toHaveBeenCalled();
+    expect(tx.operationalReminder.create).not.toHaveBeenCalled();
+  });
+
+  it('错误文案写清楚「已回滚、一座未放」，运营知道下一步是核库存', async () => {
+    const tx = mountTx();
+    tx.$executeRaw.mockResolvedValue(0);
+    const err = await service.markNoShow('ord-1', noShowBody(), ADMIN).catch((e: unknown) => e);
+    expect(String((err as Error).message)).toContain('库存账对不上');
+    expect(String((err as Error).message)).toContain('已回滚');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 11. legFlag 物化列 —— 与导出「航段状态」同一口径（含取消航段的作废态）
+// ══════════════════════════════════════════════════════════════════════════
+describe('syncOrderLegFlag · 与 deriveLegStatus 同口径', () => {
+  /** 只给 syncOrderLegFlag 用的最小 tx：一批 FLIGHT 行 + 记录写下的 legFlag。 */
+  function legFlagTx(items: Array<Record<string, unknown>>) {
+    return {
+      orderItem: { findMany: vi.fn(async () => items) },
+      order: { update: vi.fn(async () => ({})) },
+    } as unknown as Parameters<typeof syncOrderLegFlag>[0];
+  }
+
+  const AT1 = '2026-09-01T00:00:00.000Z';
+  const AT2 = '2026-09-02T00:00:00.000Z';
+  const AT3 = '2026-09-03T00:00:00.000Z';
+
+  it('释放 → RETURN_RELEASED', async () => {
+    const flag = await syncOrderLegFlag(
+      legFlagTx([
+        { kind: 'FLIGHT', flightScheduleId: 'sch-out', metadata: { noShow: { at: AT1 } } },
+        { kind: 'FLIGHT', flightScheduleId: null, metadata: { returnReleased: { at: AT1 } } },
+      ]),
+      'ord-1',
+    );
+    expect(flag).toBe('RETURN_RELEASED');
+  });
+
+  it('释放 → 恢复 → RETURN_RESTORED', async () => {
+    const flag = await syncOrderLegFlag(
+      legFlagTx([
+        { kind: 'FLIGHT', flightScheduleId: 'sch-out', metadata: { noShow: { at: AT1 } } },
+        {
+          kind: 'FLIGHT',
+          flightScheduleId: 'sch-ret',
+          metadata: { returnReleased: { at: AT1 }, returnRestored: { at: AT2 } },
+        },
+      ]),
+      'ord-1',
+    );
+    expect(flag).toBe('RETURN_RESTORED');
+  });
+
+  it('释放 → 恢复 → 取消航段 → RETURN_VOIDED（此前停在 RETURN_RESTORED，与导出列自相矛盾）', async () => {
+    const flag = await syncOrderLegFlag(
+      legFlagTx([
+        { kind: 'FLIGHT', flightScheduleId: 'sch-out', metadata: { noShow: { at: AT1 } } },
+        {
+          kind: 'FLIGHT',
+          flightScheduleId: null,
+          metadata: {
+            returnReleased: { at: AT1 },
+            returnRestored: { at: AT2 },
+            returnLegCancelled: { at: AT3 },
+          },
+        },
+      ]),
+      'ord-1',
+    );
+    expect(flag).toBe('RETURN_VOIDED');
+  });
+
+  it('没标过 no-show、直接取消回程 → 同样是 RETURN_VOIDED', async () => {
+    const flag = await syncOrderLegFlag(
+      legFlagTx([
+        { kind: 'FLIGHT', flightScheduleId: 'sch-out', metadata: null },
+        {
+          kind: 'FLIGHT',
+          flightScheduleId: null,
+          metadata: { returnLegCancelled: { at: AT1, originalAmountCny: 3000 } },
+        },
+      ]),
+      'ord-1',
+    );
+    expect(flag).toBe('RETURN_VOIDED');
+  });
+
+  it('起飞后作废（returnVoidedFinal）→ RETURN_VOIDED；单标去程 → NO_SHOW；干净单 → NONE', async () => {
+    expect(
+      await syncOrderLegFlag(
+        legFlagTx([
+          {
+            kind: 'FLIGHT',
+            flightScheduleId: null,
+            metadata: { returnReleased: { at: AT1 }, returnVoidedFinal: { at: AT3 } },
+          },
+        ]),
+        'ord-1',
+      ),
+    ).toBe('RETURN_VOIDED');
+
+    expect(
+      await syncOrderLegFlag(
+        legFlagTx([
+          { kind: 'FLIGHT', flightScheduleId: 'sch-out', metadata: { noShow: { at: AT1 } } },
+        ]),
+        'ord-1',
+      ),
+    ).toBe('NO_SHOW');
+
+    expect(
+      await syncOrderLegFlag(
+        legFlagTx([{ kind: 'FLIGHT', flightScheduleId: 'sch-out', metadata: null }]),
+        'ord-1',
+      ),
+    ).toBe('NONE');
   });
 });

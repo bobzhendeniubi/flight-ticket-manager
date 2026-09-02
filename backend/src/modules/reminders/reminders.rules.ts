@@ -606,7 +606,10 @@ export interface RuleReleasedReturnLeg {
  * ruleKey 带上 returnReleased.at：释放→恢复→再释放是允许反复发生的，
  * 只用行 id 做键会让第二次释放被第一次的提醒永久吃掉（ruleKey 唯一索引）。
  *
- * 原回程班次已起飞 → 不提醒：座位早卖出去了，这时候再叫人「恢复回程」是无效待办。
+ * 原回程班次已起飞 → **照样提醒，但换一条**（ruleKey 加 `:DEPARTED` 后缀、文案改「请确认作废或人工处置」）：
+ * 座位早卖出去了，「恢复回程」确实已经无效，但这一行仍卡在「已释放」态没人收口 ——
+ * 直接静默停止，这单就永远没人管了。系统**没有**「起飞后自动作废」的定时任务，
+ * 所以文案里一个字都不能承诺它，只能叫人来处置。
  */
 export function buildNoShowReturnReleasedCandidates(
   leg: RuleReleasedReturnLeg,
@@ -617,10 +620,9 @@ export function buildNoShowReturnReleasedCandidates(
   const snapshot = readMetaObject(readMetaObject(leg.metadata).returnReleased);
   const releasedAt = typeof snapshot.at === 'string' ? snapshot.at : null;
   if (!releasedAt) return [];
-  // 原班次已起飞（含正点起飞那一刻）→ 恢复窗口已关，不再生成待办。
-  if (leg.originalSchedule && leg.originalSchedule.departureTime.getTime() <= now.getTime()) {
-    return [];
-  }
+  // 原班次已起飞（含正点起飞那一刻）→ 恢复窗口已关，换成「请确认作废」的待办（见下方分支）。
+  const departed =
+    leg.originalSchedule != null && leg.originalSchedule.departureTime.getTime() <= now.getTime();
 
   const seats = sumReleasedSeats(snapshot.releasedSeats);
   const returnDate = leg.originalSchedule
@@ -631,6 +633,27 @@ export function buildNoShowReturnReleasedCandidates(
     typeof noShowSnapshot.listDate === 'string' && noShowSnapshot.listDate
       ? noShowSnapshot.listDate
       : releasedAt.slice(0, 10);
+  const head =
+    `订单 ${leg.orderNumber} 去程 ${noShowDate} 未登机，回程（${returnDate ?? '日期未知'}）` +
+    `${seats} 座已放回库存重新销售，钱款未动。`;
+
+  if (departed) {
+    // 起飞后仍停在「已释放」态：恢复窗口已关，但这一段还挂在单上没有终态，必须有人来收口。
+    return [
+      {
+        rule: 'NO_SHOW_RETURN_RELEASED',
+        ruleKey: `NOSHOW_RELEASED:${leg.itemId}:${releasedAt}:DEPARTED`,
+        orderId: leg.orderId,
+        title: `【回程已起飞仍未恢复】${leg.orderNumber} ${seats} 座待收口`,
+        body:
+          head +
+          '该回程班次已起飞，座位无法再恢复，但这一段仍停在「已释放」状态。' +
+          '请确认作废或人工处置（系统不会自动作废）。',
+        priority: ReminderPriority.HIGH,
+        dueAt: today,
+      },
+    ];
+  }
 
   return [
     {
@@ -639,10 +662,9 @@ export function buildNoShowReturnReleasedCandidates(
       orderId: leg.orderId,
       title: `【回程已释放待跟进】${leg.orderNumber} ${seats} 座已放回库存`,
       body:
-        `订单 ${leg.orderNumber} 去程 ${noShowDate} 未登机，回程（${returnDate ?? '日期未知'}）` +
-        `${seats} 座已放回库存重新销售，钱款未动。` +
+        head +
         '请与客人确认是否保留回程：要保留就到订单详情点「恢复回程」（余位不足可超售）；' +
-        '确认不飞则无需处理，回程起飞后系统自动作废。',
+        '确认不飞则无需处理，本条会保留到回程起飞，届时转为「请确认作废」的待办。',
       priority: ReminderPriority.HIGH,
       dueAt: today,
     },

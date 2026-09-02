@@ -788,7 +788,7 @@ describe('NO_SHOW_RETURN_RELEASED 回程已释放提醒规则', () => {
     expect(second[0].ruleKey).not.toBe(first[0].ruleKey);
   });
 
-  it('已恢复 / 已作废 / 回程已起飞 → 一条都不生成', () => {
+  it('已恢复 / 已作废 → 一条都不生成', () => {
     // 已恢复：班次写回 + returnRestored 晚于 returnReleased
     expect(
       buildNoShowReturnReleasedCandidates(
@@ -818,19 +818,32 @@ describe('NO_SHOW_RETURN_RELEASED 回程已释放提醒规则', () => {
       ),
     ).toEqual([]);
 
-    // 原回程班次已起飞 → 恢复窗口已关
-    expect(
-      buildNoShowReturnReleasedCandidates(
-        releasedLeg({
-          originalSchedule: {
-            departureTime: new Date('2026-07-09T05:30:00Z'),
-            departureTz: 'Asia/Shanghai',
-          },
-        }),
-        TODAY,
-        NOW,
-      ),
-    ).toEqual([]);
+  });
+
+  it('回程已起飞仍停在已释放态 → 换成「请确认作废」待办（ruleKey 带 :DEPARTED，不承诺自动作废）', () => {
+    // 系统里并没有「起飞后自动作废」的定时任务，所以起飞后既不能静默停止提醒
+    //（这一段就永远没人收口了），也不能在文案里承诺一个不存在的机制。
+    const out = buildNoShowReturnReleasedCandidates(
+      releasedLeg({
+        originalSchedule: {
+          departureTime: new Date('2026-07-09T05:30:00Z'),
+          departureTz: 'Asia/Shanghai',
+        },
+      }),
+      TODAY,
+      NOW,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0].ruleKey).toBe(`NOSHOW_RELEASED:itm_ret:${RELEASED_AT}:DEPARTED`);
+    expect(out[0].title).toBe('【回程已起飞仍未恢复】FTM2026070900001 2 座待收口');
+    expect(out[0].body).toContain('请确认作废或人工处置');
+    expect(out[0].body).toContain('系统不会自动作废');
+    expect(out[0].priority).toBe(ReminderPriority.HIGH);
+  });
+
+  it('未起飞的常规待办不承诺「系统自动作废」', () => {
+    const out = buildNoShowReturnReleasedCandidates(releasedLeg(), TODAY, NOW);
+    expect(out[0].body).not.toContain('自动作废');
   });
 
   it('班次查不到 / 去程快照缺失时照样提醒，日期分别回落「日期未知」与释放当日', () => {

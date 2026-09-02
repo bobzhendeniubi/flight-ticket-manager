@@ -2614,18 +2614,14 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       role,
     });
 
-    if (!audit.replayed) void writeAudit({
+    // ⚠ 超售放行的 CRITICAL 审计**已经在 service 的占座事务里写过了**（与占座同生共死）。
+    // 这里再写一条只会让同一次放行在审计里出现两次，事后核对会以为放了两回；所以只记非超售那一档。
+    if (!audit.replayed && !audit.oversold) void writeAudit({
       actor: actorFromRequest(req),
-      action: audit.oversold ? 'RESTORE_RETURN_LEG_OVERSOLD' : 'RESTORE_RETURN_LEG',
+      action: 'RESTORE_RETURN_LEG',
       targetType: 'ORDER',
       targetId: id,
-      // 超售留痕要一眼看出「是哪一班、这班一共被卖穿了多少座」——
-      // 只写 scheduleId 与本次增量，事后复核还得再去查班次、再去算累计，最该看见的数反而看不见。
-      targetLabel: audit.oversold
-        ? `${audit.orderNumber} · 超售放行（${audit.flightNumber ?? '航班未知'} ` +
-          `${audit.departDate ?? '日期未知'} ${audit.cabin ?? '未知舱'} ` +
-          `超出 ${audit.scheduleOversoldAfter} 座（本次 +${audit.oversoldBy}，上限 ${env.FLIGHT_NOSHOW_MAX_OVERSELL_SEATS}））`
-        : `${audit.orderNumber} · 恢复回程（${audit.quantity} 座）`,
+      targetLabel: `${audit.orderNumber} · 恢复回程（${audit.quantity} 座）`,
       after: {
         returnItemId: audit.returnItemId,
         scheduleId: audit.scheduleId,
@@ -2635,14 +2631,13 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         quantity: audit.quantity,
         oversold: audit.oversold,
         oversoldBy: audit.oversoldBy,
-        // 恢复之后该班该舱的**累计**超售座数（0 = 没超）；风控看的是这个数，不是本次增量。
+        // 恢复之后这些舱的**累计**超售座数（0 = 没超）；风控看的是这个数，不是本次增量。
         scheduleOversoldAfter: audit.scheduleOversoldAfter,
         maxOversell: env.FLIGHT_NOSHOW_MAX_OVERSELL_SEATS,
         note: body.note ?? null,
         replayed: audit.replayed,
       },
-      // 超售 = 把班次卖到负余位，最需要事后复核 → CRITICAL；有座恢复记 WARNING。
-      severity: audit.oversold ? 'CRITICAL' : 'WARNING',
+      severity: 'WARNING',
     });
 
     return { order, audit };

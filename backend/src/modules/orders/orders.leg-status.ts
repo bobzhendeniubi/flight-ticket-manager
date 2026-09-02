@@ -60,7 +60,11 @@ export function isReturnCurrentlyReleased(item: LegStatusItemLike): boolean {
   return releasedAt > restoredAt;
 }
 
-/** 最近一次恢复超售了几座（无超售 / 恢复后又被释放 → 0）。 */
+/**
+ * 最近一次恢复**新增**了几座超售（无超售 / 恢复后又被释放 → 0）。
+ * 取的是快照里的 oversoldBy（increment），不是 scheduleOversoldAfter（该班累计）——
+ * 房控按订单逐条累加时，只有增量口径加起来才等于「这一班被放行了多少超售」。
+ */
 export function restoredOversoldSeats(item: LegStatusItemLike): number {
   if (item.kind !== 'FLIGHT') return 0;
   const meta = readObject(item.metadata);
