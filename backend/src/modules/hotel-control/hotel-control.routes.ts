@@ -45,6 +45,7 @@ import {
   createBlockPeriod,
   deleteBlockPeriod,
   getAlerts,
+  getBlockPeriod,
   getBoard,
   getForward,
   getHotelOversellCapRooms,
@@ -108,14 +109,19 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
 
   app.delete('/block-periods/:id', requireStaff, async (req) => {
     const { id } = req.params as { id: string };
+    // 删除前先取快照：审计 before 必须能回答「删的是哪家酒店、哪段、几间」，
+    // 否则事后只剩一个 id，无从追责。找不到就交给 deleteBlockPeriod 抛 404。
+    const before = await getBlockPeriod(id);
     const result = await deleteBlockPeriod(id);
     void writeAudit({
       actor: actorFromRequest(req),
       action: 'DELETE_HOTEL_BLOCK_PERIOD',
       targetType: 'PRODUCT',
-      targetId: id,
-      targetLabel: 'block-period',
+      targetId: before?.hotelId ?? id,
+      targetLabel: before ? `${before.hotelName} ${before.dateFrom}→${before.dateTo}` : 'block-period',
+      before,
       after: null,
+      severity: AuditSeverity.WARNING,
     });
     return result;
   });

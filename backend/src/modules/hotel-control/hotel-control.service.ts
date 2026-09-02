@@ -485,6 +485,22 @@ export async function updateBlockPeriod(
   return toDto(row);
 }
 
+/**
+ * 单条包房周期（DTO）；不存在 → null。
+ * 供删除路由在真正删除前取一份快照写进审计 `before` —— 此前删除审计只记一个 id、
+ * 内容为空，事后想知道「删掉的是哪家酒店哪段几间」完全查不到。
+ */
+export async function getBlockPeriod(
+  id: string,
+  client: PrismaClient = defaultPrisma,
+): Promise<HotelBlockPeriodDto | null> {
+  const row = await client.hotelBlockPeriod.findUnique({
+    where: { id },
+    include: { hotel: { select: { name: true, randomTierPlaceholder: true } } },
+  });
+  return row ? toDto(row) : null;
+}
+
 export async function deleteBlockPeriod(
   id: string,
   client: PrismaClient = defaultPrisma,
