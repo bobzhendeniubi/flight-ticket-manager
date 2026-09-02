@@ -39,8 +39,12 @@ type HotelControlDbClient = PrismaClient | Prisma.TransactionClient;
 // ── 超售容忍上限（运营可调）──────────────────────────────────────────────────
 /** SystemSetting 键：酒店超售容忍上限（间）。房控页可改；无记录回落 env 缺省。*/
 export const HOTEL_OVERSELL_CAP_SETTING_KEY = 'hotelMaxOversellRooms';
-/** 上限的上限：防止把口子改成事实上不设防（要放更大得改 env 或来找开发）。*/
-export const HOTEL_OVERSELL_CAP_MAX = 20;
+/**
+ * 上限的上限。曾为 20：随机档真超卖（同星级真酒店切房不够、订单已卖出去）时，
+ * 每一单内部录单都被闸死，运营只能停单等开发。现在放到 999 —— 房控页填 999 即
+ * 事实上「不设上限」，由运营自己决定口子开多大；每次改动仍写 WARNING 审计可追溯。
+ */
+export const HOTEL_OVERSELL_CAP_MAX = 999;
 
 /**
  * 当前生效的超售容忍上限：DB 配置（房控页可改）优先，无记录/非法值回落
