@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, splitBlockedReasons, splitDoneNoShowFailedOrderId } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -406,12 +406,35 @@ function deriveView(o: OrderSummary) {
     it.quantity > 1 ? `${it.description} × ${it.quantity}` : it.description,
   );
   const itemSummary = summaryParts.join(' + ');
+  // 航段状态短标（去程no-show / 回程已释放…）：跟在内容摘要后面单独一段，不参与摘要拼接。
+  const legNotice = deriveLegNotice(o);
   const customerName = o.user?.displayName ?? o.contactName;
   // 公司名可能是空串（历史空名代理）：`??` 只认 null 不认 ''，空串会吞掉联系人名兜底，
   // 把明明有归属的单显示成「直客」——必须 trim + `||` 双兜底。
   const agentName = (o.agent?.companyName?.trim() || o.agent?.contactName?.trim()) ?? null;
   const totalNum = Number(o.total);
-  return { itemKind, itemKinds, itemSummary, customerName, agentName, totalNum };
+  return { itemKind, itemKinds, itemSummary, legNotice, customerName, agentName, totalNum };
+}
+
+/**
+ * 列表「内容」列的航段状态短标：去程 no-show / 回程已释放（可恢复）/ 回程已恢复 / 回程已作废。
+ * 只读行 metadata 的打标，判定口径与详情抽屉共用同一组函数（不另起一份，避免漂移）；
+ * 无打标返回 null。
+ */
+function deriveLegNotice(o: OrderSummary): string | null {
+  const tags: string[] = [];
+  const push = (t: string) => {
+    if (!tags.includes(t)) tags.push(t);
+  };
+  for (const it of o.items ?? []) {
+    if (it.kind !== 'FLIGHT') continue;
+    if (readNoShowMark(it.metadata)) push('去程no-show');
+    const life = readReturnLegLifecycle(it);
+    if (life?.kind === 'RELEASED') push('回程已释放');
+    else if (life?.kind === 'RESTORED') push('回程已恢复');
+    else if (life?.kind === 'VOIDED') push('回程已作废');
+  }
+  return tags.length > 0 ? tags.join(' · ') : null;
 }
 
 // ── 列表内容列 / 出发日期列的派生（全部只吃列表已有字段，不新增后端往返）────────────
@@ -3796,8 +3819,12 @@ export function OrdersPage() {
                         </div>
                       );
                     })()}
-                    <div className="mt-0.5 max-w-xs truncate text-ink" title={view.itemSummary}>
+                    <div
+                      className="mt-0.5 max-w-xs truncate text-ink"
+                      title={view.legNotice ? `${view.itemSummary} · ${view.legNotice}` : view.itemSummary}
+                    >
                       {view.itemSummary}
+                      {view.legNotice && <span className="text-ink-muted"> · {view.legNotice}</span>}
                     </div>
                     <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-xs text-ink-muted">
                       {/* 一单多产品（机票+酒店混挂）时全部标出来，不再只显示首行的那一个 */}
@@ -4672,6 +4699,8 @@ function OrderDrawer({
   const [agentEditOpen, setAgentEditOpen] = useState(false);
   // 拆单（split PNR 售后逃生门）：仅 ADMIN/STAFF 且乘客 ≥ 2 时 OpsToolbar 才给入口。
   const [splitOpen, setSplitOpen] = useState(false);
+  // no-show 处理面板（仅 ADMIN/STAFF；本单有去程航段且没标过 no-show 才给入口）。
+  const [noShowOpen, setNoShowOpen] = useState(false);
   const [roomSupplementOpen, setRoomSupplementOpen] = useState(false);
   const [groundItemKind, setGroundItemKind] = useState<'VISA' | 'HOTEL' | null>(null);
   const roomingDialogRef = useDialogA11y(() => setRoomingOpen(false), roomingOpen);
@@ -5241,6 +5270,33 @@ function OrderDrawer({
               isOps && (o.passengers?.length ?? 0) >= 2 ? () => setSplitOpen(true) : undefined
             }
           />
+
+          {/* no-show 处理：航司 no-show 名单来了之后，票务在这里标去程 no-show + 释放回程座位。
+              已标过就不再给入口（回程要恢复走产品内容里回程行的「恢复回程」）。 */}
+          {isOps &&
+            !noShowOpen &&
+            (o.items ?? []).some((it) => it.kind === 'FLIGHT' && it.flightScheduleId) &&
+            !orderHasNoShow(o) && (
+              <button
+                type="button"
+                className="text-[11px] font-medium text-slate-600 hover:text-ink"
+                onClick={() => setNoShowOpen(true)}
+                title="客人没登机：去程标 no-show（钱不动），回程座位放回库存重新可卖"
+              >
+                no-show 处理
+              </button>
+            )}
+          {isOps && noShowOpen && (
+            <NoShowPanel
+              order={o}
+              onCancel={() => setNoShowOpen(false)}
+              onChanged={onChanged}
+              onSaved={(updated) => {
+                setNoShowOpen(false);
+                handleOrderUpdated(updated);
+              }}
+            />
+          )}
 
           {/* 拆单弹窗：预检/份额/roomSplit/确认全在组件内；成功后就地刷新抽屉 + 冒泡刷新列表 */}
           {splitOpen && (
@@ -6808,6 +6864,115 @@ function readCancelledLeg(metadata: unknown): FlightLegSide | null {
   return (v as { leg?: unknown }).leg === 'OUTBOUND' ? 'OUTBOUND' : 'RETURN';
 }
 
+// ── no-show / 回程释放·恢复 的行级打标读取（后端落在 item.metadata，与 returnLegCancelled 平级）
+// 一律「结构不符即视为没打标」：宁可少显示一个徽标，也不能把脏数据渲染成 undefined。
+
+/** 去程行的 no-show 打标（metadata.noShow）。 */
+interface NoShowMark {
+  at: string | null;
+  note: string | null;
+  /** 本次标记的乘客数（passengerIds 长度）；缺失为 null */
+  passengerCount: number | null;
+}
+function readNoShowMark(metadata: unknown): NoShowMark | null {
+  if (!metadata || typeof metadata !== 'object') return null;
+  const v = (metadata as { noShow?: unknown }).noShow;
+  if (!v || typeof v !== 'object') return null;
+  const m = v as { at?: unknown; note?: unknown; passengerIds?: unknown };
+  return {
+    at: typeof m.at === 'string' ? m.at : null,
+    note: typeof m.note === 'string' && m.note.trim() ? m.note.trim() : null,
+    passengerCount: Array.isArray(m.passengerIds) ? m.passengerIds.length : null,
+  };
+}
+
+/** 回程行的「座位已释放」打标（metadata.returnReleased）。恢复后这条仍保留作历史。 */
+interface ReturnReleasedMark {
+  at: string | null;
+  /** 放回库存的座位数；后端可能给数字或逐班次数组，两种都归一成总数，取不到为 null */
+  releasedSeats: number | null;
+  /** 释放当时该航段是否已出票（已出票 = 已给票务派撤名单工单） */
+  ticketedAtRelease: boolean;
+  note: string | null;
+}
+function readReturnReleasedMark(metadata: unknown): ReturnReleasedMark | null {
+  if (!metadata || typeof metadata !== 'object') return null;
+  const v = (metadata as { returnReleased?: unknown }).returnReleased;
+  if (!v || typeof v !== 'object') return null;
+  const m = v as { at?: unknown; releasedSeats?: unknown; ticketedAtRelease?: unknown; note?: unknown };
+  let seats: number | null = null;
+  if (typeof m.releasedSeats === 'number' && Number.isFinite(m.releasedSeats)) {
+    seats = m.releasedSeats;
+  } else if (Array.isArray(m.releasedSeats)) {
+    seats = m.releasedSeats.reduce<number>((sum, row) => {
+      const q = (row as { quantity?: unknown })?.quantity;
+      return sum + (typeof q === 'number' && Number.isFinite(q) ? q : 0);
+    }, 0);
+  }
+  return {
+    at: typeof m.at === 'string' ? m.at : null,
+    releasedSeats: seats,
+    ticketedAtRelease: m.ticketedAtRelease === true,
+    note: typeof m.note === 'string' && m.note.trim() ? m.note.trim() : null,
+  };
+}
+
+/** 回程行的「已恢复」打标（metadata.returnRestored）。 */
+interface ReturnRestoredMark {
+  at: string | null;
+  oversold: boolean;
+  oversoldBy: number;
+  note: string | null;
+}
+function readReturnRestoredMark(metadata: unknown): ReturnRestoredMark | null {
+  if (!metadata || typeof metadata !== 'object') return null;
+  const v = (metadata as { returnRestored?: unknown }).returnRestored;
+  if (!v || typeof v !== 'object') return null;
+  const m = v as { at?: unknown; oversold?: unknown; oversoldBy?: unknown; note?: unknown };
+  return {
+    at: typeof m.at === 'string' ? m.at : null,
+    oversold: m.oversold === true,
+    oversoldBy: typeof m.oversoldBy === 'number' && Number.isFinite(m.oversoldBy) ? m.oversoldBy : 0,
+    note: typeof m.note === 'string' && m.note.trim() ? m.note.trim() : null,
+  };
+}
+
+/** 回程行的「最终作废」打标（metadata.returnVoidedFinal，由后台任务落）。 */
+function readReturnVoidedFinalAt(metadata: unknown): string | null | undefined {
+  if (!metadata || typeof metadata !== 'object') return undefined;
+  const v = (metadata as { returnVoidedFinal?: unknown }).returnVoidedFinal;
+  if (!v || typeof v !== 'object') return undefined;
+  const at = (v as { at?: unknown }).at;
+  return typeof at === 'string' ? at : null;
+}
+
+/**
+ * 回程行当前处于哪一态。判定口径（与后端约定）：
+ *   returnVoidedFinal 存在              → 已作废（终态，最高优先级）
+ *   班次为空 + 有 returnReleased        → 已释放（可恢复）
+ *   班次非空 + 有 returnRestored        → 已恢复（returnReleased 仍留着当历史，不能据它判当前态）
+ */
+type ReturnLegLifecycle =
+  | { kind: 'VOIDED'; at: string | null }
+  | { kind: 'RELEASED'; mark: ReturnReleasedMark }
+  | { kind: 'RESTORED'; mark: ReturnRestoredMark }
+  | null;
+function readReturnLegLifecycle(item: OrderItem): ReturnLegLifecycle {
+  if (item.kind !== 'FLIGHT') return null;
+  const voidedAt = readReturnVoidedFinalAt(item.metadata);
+  if (voidedAt !== undefined) return { kind: 'VOIDED', at: voidedAt };
+  const released = readReturnReleasedMark(item.metadata);
+  if (!item.flightScheduleId && released) return { kind: 'RELEASED', mark: released };
+  const restored = readReturnRestoredMark(item.metadata);
+  if (item.flightScheduleId && restored) return { kind: 'RESTORED', mark: restored };
+  return null;
+}
+
+/** 本单是否已经标过去程 no-show（订单级入口据此隐藏「no-show 处理」按钮）。 */
+function orderHasNoShow(o: OrderSummary): boolean {
+  return (o.items ?? []).some((it) => it.kind === 'FLIGHT' && readNoShowMark(it.metadata) != null);
+}
+
 // ── 产品内容行：FLIGHT 项可「改期」（换班次/日期 + 改舱位 + 改期费）──────
 function OrderItemRow({
   orderId,
@@ -6855,6 +7020,8 @@ function OrderItemRow({
   const [splittingGroup, setSplittingGroup] = useState(false);
   /** 正在取消的航段方向（null = 面板未展开）。 */
   const [cancelingLeg, setCancelingLeg] = useState<FlightLegSide | null>(null);
+  /** 「恢复回程」面板是否展开。 */
+  const [restoringReturn, setRestoringReturn] = useState(false);
   const isFlight = item.kind === 'FLIGHT';
   // 取消航段：本行是去程/回程 FLIGHT 行、且尚未被取消过才给入口。两个入口都只在本单有
   // ≥2 条有效 FLIGHT 行时出现（单程单的 outboundLegItemId/returnLegItemId 都是 null）。
@@ -6869,6 +7036,12 @@ function OrderItemRow({
         : null;
   const cancelledLeg = isFlight ? readCancelledLeg(item.metadata) : null;
   const legCancelled = cancelledLeg != null;
+  // no-show：去程行被标过 no-show（钱不动，只留痕）；标过之后不再给「取消去程」入口。
+  const noShowMark = isFlight ? readNoShowMark(item.metadata) : null;
+  // 回程行当前态：已释放（座位放回库存，可恢复）/ 已恢复 / 已作废。
+  const returnLife = isFlight ? readReturnLegLifecycle(item) : null;
+  // 已释放的回程行班次是空的：对它改期/升舱/取消都是对着空班次操作，一律不给入口。
+  const returnReleased = returnLife?.kind === 'RELEASED';
   // 套餐改档：换绑到另一张套餐（档次/晚数是 Bundle 自身的属性，改档=换 bundleId）。
   const isBundleRow = item.kind === 'BUNDLE' && Boolean(item.bundleId);
   // 升舱入口：只有**经济舱**机票行能一键升商务舱；套餐机票腿（带 bundleId）走套餐自身的升舱份数模型，后端也会拒。
@@ -6961,7 +7134,7 @@ function OrderItemRow({
           {item.amount != null && (
             <div className="nums text-sm font-medium text-ink">¥{Number(item.amount).toLocaleString()}</div>
           )}
-          {canOperate && isFlight && !legCancelled && !rescheduling && !editingPrice && !upgradingCabin && (
+          {canOperate && isFlight && !legCancelled && !returnReleased && !rescheduling && !editingPrice && !upgradingCabin && (
             <button
               className="text-[11px] font-medium text-brand hover:text-brand-dark"
               onClick={() => setRescheduling(true)}
@@ -6979,7 +7152,77 @@ function OrderItemRow({
               {FLIGHT_LEG_ZH[cancelledLeg]}已取消
             </span>
           )}
-          {canOperate && legEntry && !legCancelled && !rescheduling && !editingPrice && !upgradingCabin && !cancelingLeg && (
+          {noShowMark && (
+            <span
+              className="inline-flex items-center rounded border border-slate-300 bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-500"
+              title={[
+                noShowMark.at ? `标记时间：${formatDateTimeSecCn(noShowMark.at)}` : null,
+                noShowMark.passengerCount != null ? `涉及 ${noShowMark.passengerCount} 人` : null,
+                noShowMark.note ? `备注：${noShowMark.note}` : null,
+                '客人未登机，钱款不动',
+              ]
+                .filter(Boolean)
+                .join(' · ')}
+            >
+              去程 no-show
+            </span>
+          )}
+          {returnLife?.kind === 'VOIDED' && (
+            <span
+              className="inline-flex items-center rounded border border-slate-300 bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-500"
+              title={returnLife.at ? `作废时间：${formatDateTimeSecCn(returnLife.at)}` : '回程已最终作废，不可恢复'}
+            >
+              回程已作废
+            </span>
+          )}
+          {returnLife?.kind === 'RELEASED' && (
+            <span
+              className="inline-flex items-center rounded border border-amber-300 bg-amber-50 px-1.5 py-0.5 text-[11px] font-medium text-amber-700"
+              title={[
+                returnLife.mark.at ? `释放时间：${formatDateTimeSecCn(returnLife.mark.at)}` : null,
+                returnLife.mark.releasedSeats != null ? `放回 ${returnLife.mark.releasedSeats} 座` : null,
+                returnLife.mark.ticketedAtRelease ? '释放时已出票（已派票务工单）' : null,
+                returnLife.mark.note ? `备注：${returnLife.mark.note}` : null,
+                '座位已放回库存可卖，钱款不动；代理来要可恢复',
+              ]
+                .filter(Boolean)
+                .join(' · ')}
+            >
+              回程已释放（可恢复）
+            </span>
+          )}
+          {returnLife?.kind === 'RESTORED' && (
+            <span
+              className="inline-flex items-center rounded border border-emerald-300 bg-emerald-50 px-1.5 py-0.5 text-[11px] font-medium text-emerald-700"
+              title={[
+                returnLife.mark.at ? `恢复时间：${formatDateTimeSecCn(returnLife.mark.at)}` : null,
+                returnLife.mark.note ? `备注：${returnLife.mark.note}` : null,
+              ]
+                .filter(Boolean)
+                .join(' · ')}
+            >
+              回程已恢复
+              {returnLife.mark.oversold && `（超售 ${returnLife.mark.oversoldBy} 座）`}
+            </span>
+          )}
+          {canOperate && returnReleased && !restoringReturn && (
+            <button
+              className="text-[11px] font-medium text-emerald-700 hover:text-emerald-900"
+              onClick={() => setRestoringReturn(true)}
+              title="把释放掉的回程座位重新占回原班次；原班次没余位会走超售确认"
+            >
+              恢复回程
+            </button>
+          )}
+          {canOperate &&
+            legEntry &&
+            !legCancelled &&
+            !returnReleased &&
+            !(legEntry === 'OUTBOUND' && noShowMark) &&
+            !rescheduling &&
+            !editingPrice &&
+            !upgradingCabin &&
+            !cancelingLeg && (
             <button
               className="text-[11px] font-medium text-red-600 hover:text-red-800"
               onClick={() => setCancelingLeg(legEntry)}
@@ -6990,7 +7233,7 @@ function OrderItemRow({
               取消{FLIGHT_LEG_ZH[legEntry]}（改单{legEntry === 'OUTBOUND' ? '回程' : '去程'}）
             </button>
           )}
-          {canOperate && canUpgradeCabin && !legCancelled && !rescheduling && !editingPrice && !upgradingCabin && (
+          {canOperate && canUpgradeCabin && !legCancelled && !returnReleased && !rescheduling && !editingPrice && !upgradingCabin && (
             <button
               className="text-[11px] font-medium text-indigo-600 hover:text-indigo-800"
               onClick={() => setUpgradingCabin(true)}
@@ -7072,6 +7315,16 @@ function OrderItemRow({
           onCancel={() => setCancelingLeg(null)}
           onSaved={(updated) => {
             setCancelingLeg(null);
+            onOrderUpdated?.(updated);
+          }}
+        />
+      )}
+      {returnReleased && restoringReturn && (
+        <RestoreReturnLegForm
+          orderId={orderId}
+          onCancel={() => setRestoringReturn(false)}
+          onSaved={(updated) => {
+            setRestoringReturn(false);
             onOrderUpdated?.(updated);
           }}
         />
@@ -7894,12 +8147,15 @@ function CancelLegForm({
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  /** 有 warnings 时必须先勾「已知悉」才能提交（后端同样会拦，前端只是把风险摆到眼前）。 */
+  const [acknowledged, setAcknowledged] = useState(false);
 
   useEffect(() => {
     if (!token) return;
     let cancelled = false;
     setPreviewLoading(true);
     setPreviewErr(null);
+    setAcknowledged(false);
     api
       .previewCancelLeg(token, orderId, leg)
       .then((res) => {
@@ -7922,6 +8178,9 @@ function CancelLegForm({
 
   // 后端字段名沿用 returnItem（去程/回程共用），装的是本次要取消的那一段。
   const legItem = preview?.returnItem ?? null;
+  // 风险提示（如「已出票」）：不阻断，但要运营勾选确认后才放行提交。
+  const warnings = preview?.warnings ?? [];
+  const needsAck = Boolean(preview?.requiresAcknowledgement) || warnings.length > 0;
   const policyFee = preview?.policyFee ?? null;
   const hasPolicyFee = policyFee != null;
   // 本地估算展示用（权威数字来自提交后返回的 audit）：按当前选中的手续费口径重算降额/多付。
@@ -7945,6 +8204,10 @@ function CancelLegForm({
       setErr(`请填写有效的手续费（整数、不超过${legZh}行金额）与覆盖原因`);
       return;
     }
+    if (needsAck && !acknowledged) {
+      setErr('请先勾选「已知悉」再提交');
+      return;
+    }
     const confirmed = await confirm({
       title: `取消${legZh}（改单${survivorZh}）`,
       body: `${legZh}座位将立即放回库存重新销售，本单变为单${survivorZh}，不可撤销。\n\n手续费 ¥${effectiveFeeCny.toLocaleString()}，本单应收将从 ¥${preview.currentTotalCny.toLocaleString()} 降到 ¥${projectedTotal.toLocaleString()}。${
@@ -7965,9 +8228,11 @@ function CancelLegForm({
         manualFeeCny: feeMode === 'MANUAL' ? manualFeeCny ?? undefined : undefined,
         overrideReason: feeMode === 'MANUAL' ? overrideReason.trim() : undefined,
         note: note.trim() || undefined,
+        acknowledgeWarnings: needsAck ? true : undefined,
       });
       alert(
-        `已取消${legZh}，应收 ¥${res.audit.totalBefore.toLocaleString()} → ¥${res.audit.totalAfter.toLocaleString()}，手续费 ¥${res.audit.feeCny.toLocaleString()}`,
+        `已取消${legZh}，应收 ¥${res.audit.totalBefore.toLocaleString()} → ¥${res.audit.totalAfter.toLocaleString()}，手续费 ¥${res.audit.feeCny.toLocaleString()}` +
+          (res.audit.workOrderReminderId ? '\n已给票务派工单（撤名单/退票）。' : ''),
       );
       onSaved(res.order);
     } catch (e) {
@@ -7995,6 +8260,30 @@ function CancelLegForm({
             ))}
           </ul>
         </div>
+      )}
+
+      {warnings.length > 0 && (
+        <div className="space-y-1 rounded border border-amber-300 bg-amber-50 px-2 py-1.5 text-amber-800">
+          <div className="font-medium">请先确认：</div>
+          <ul className="list-disc space-y-0.5 pl-4">
+            {warnings.map((w) => (
+              <li key={w}>{w}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {preview?.eligible && needsAck && (
+        <label className="flex items-start gap-1.5 rounded border border-amber-300 bg-amber-50/60 px-2 py-1.5 text-amber-800">
+          <input
+            type="checkbox"
+            className="mt-0.5"
+            checked={acknowledged}
+            onChange={(e) => setAcknowledged(e.target.checked)}
+            disabled={submitting}
+          />
+          <span>已知悉：取消后将给票务派撤名单/退票工单。</span>
+        </label>
       )}
 
       {preview && preview.eligible && legItem && (
@@ -8097,9 +8386,475 @@ function CancelLegForm({
         <button
           className="flex-1 rounded bg-red-600 px-2 py-1.5 font-medium text-white disabled:opacity-50"
           onClick={submit}
-          disabled={submitting || previewLoading || !preview?.eligible || manualFeeInvalid}
+          disabled={
+            submitting || previewLoading || !preview?.eligible || manualFeeInvalid || (needsAck && !acknowledged)
+          }
         >
           {submitting ? '提交中…' : `确认取消${legZh}`}
+        </button>
+        <button
+          className="rounded bg-slate-100 px-3 py-1.5 text-slate-700 disabled:opacity-50"
+          onClick={onCancel}
+          disabled={submitting}
+        >
+          取消
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── 恢复回程：把「已释放」的回程座位重新占回原班次（钱不动）。代理来说要保留时用。
+// 打开即 preview：不合格列 blockers；有余位普通确认，没余位走超售二次确认（记关键审计）。
+function RestoreReturnLegForm({
+  orderId,
+  onCancel,
+  onSaved,
+}: {
+  orderId: string;
+  onCancel: () => void;
+  onSaved: (order: OrderSummary) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const confirm = useConfirm();
+  // 幂等键：本面板打开期间只生成一次，提交失败重试复用同一个 token，避免重复占座。
+  const requestTokenRef = useRef<string>(crypto.randomUUID());
+  const [previewLoading, setPreviewLoading] = useState(true);
+  const [previewErr, setPreviewErr] = useState<string | null>(null);
+  const [preview, setPreview] = useState<RestoreReturnLegPreview | null>(null);
+  const [note, setNote] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    setPreviewLoading(true);
+    setPreviewErr(null);
+    api
+      .previewRestoreReturnLeg(token, orderId)
+      .then((res) => {
+        if (!cancelled) setPreview(res);
+      })
+      .catch((e) => {
+        if (!cancelled) setPreviewErr(e instanceof ApiError ? e.message : '恢复回程预检失败');
+      })
+      .finally(() => {
+        if (!cancelled) setPreviewLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [orderId, token]);
+
+  const original = preview?.original ?? null;
+  const needsOversell = preview?.needsOversell === true;
+  const seats = original?.quantity ?? 0;
+
+  const submit = async () => {
+    if (!token || submitting || !preview?.eligible || !original) return;
+    setErr(null);
+    const legLabel = `${original.flightNumber ?? '原班次'}${original.departDate ? ` ${original.departDate}` : ''}`;
+    const confirmed = await confirm(
+      needsOversell
+        ? {
+            title: '恢复回程（超售）',
+            body: `${legLabel} 已满，当前余位 ${preview.available} 座。\n\n确认超售 ${preview.oversellBy} 座并恢复回程，将记关键审计。钱款不动。`,
+            tone: 'danger',
+            confirmText: `确认超售 ${preview.oversellBy} 座并恢复`,
+          }
+        : {
+            title: '恢复回程',
+            body: `将把 ${seats} 座重新占回 ${legLabel}（当前余位 ${preview.available} 座）。钱款不动。`,
+            confirmText: '确认恢复回程',
+          },
+    );
+    if (!confirmed) return;
+    setSubmitting(true);
+    try {
+      const res = await api.restoreReturnLeg(token, orderId, {
+        requestToken: requestTokenRef.current,
+        allowOversell: needsOversell ? true : undefined,
+        note: note.trim() || undefined,
+      });
+      alert(
+        `已恢复回程 ${res.audit.quantity} 座` +
+          (res.audit.oversold ? `（超售 ${res.audit.oversoldBy} 座，已记审计）` : ''),
+      );
+      onSaved(res.order);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '恢复回程失败');
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="mt-3 space-y-2 rounded-md border border-emerald-300 bg-white p-3 text-xs">
+      <div className="font-medium text-emerald-700">恢复回程</div>
+
+      {previewLoading && <div className="text-slate-500">正在核对原班次余位…</div>}
+      {previewErr && <div className="rounded bg-red-50 px-2 py-1 text-red-700">{previewErr}</div>}
+
+      {preview && !preview.eligible && (
+        <div className="space-y-1 rounded bg-red-50 px-2 py-1 text-red-700">
+          <div className="font-medium">当前不能恢复回程：</div>
+          <ul className="list-disc space-y-0.5 pl-4">
+            {(preview.blockers.length > 0
+              ? preview.blockers
+              : [preview.departed ? '原班次已起飞' : '预检未通过']
+            ).map((b) => (
+              <li key={b}>{b}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {preview && preview.eligible && original && (
+        <>
+          <div className="space-y-0.5 rounded border border-slate-200 bg-slate-50/60 p-2">
+            <div className="text-ink">
+              恢复到原班次：{original.flightNumber ?? '（班次号缺失）'}
+              {original.departDate && <> · {original.departDate}</>}
+              {original.cabin && <> · {CABIN_ZH[original.cabin] ?? original.cabin}</>}
+            </div>
+            <div className="text-slate-500">
+              需占 {original.quantity} 座 · 当前余位 {preview.available} 座 · 钱款不动
+            </div>
+          </div>
+
+          {needsOversell && (
+            <div className="rounded border border-amber-300 bg-amber-50 px-2 py-1.5 text-amber-800">
+              该班已满，恢复将超售 {preview.oversellBy} 座（上限 {preview.maxOversell} 座）。确认后会记关键审计。
+            </div>
+          )}
+
+          <label className="block">
+            <span className="text-slate-500">备注（可选）</span>
+            <input
+              className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              disabled={submitting}
+              placeholder="如：代理来电要求保留回程"
+            />
+          </label>
+        </>
+      )}
+
+      {err && <div className="rounded bg-red-50 px-2 py-1 text-red-700">{err}</div>}
+
+      <div className="flex gap-2 pt-1">
+        <button
+          className="flex-1 rounded bg-emerald-600 px-2 py-1.5 font-medium text-white disabled:opacity-50"
+          onClick={submit}
+          disabled={submitting || previewLoading || !preview?.eligible}
+        >
+          {submitting ? '提交中…' : needsOversell ? '超售恢复回程' : '确认恢复回程'}
+        </button>
+        <button
+          className="rounded bg-slate-100 px-3 py-1.5 text-slate-700 disabled:opacity-50"
+          onClick={onCancel}
+          disabled={submitting}
+        >
+          取消
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── no-show 处理（订单级）：航司每天发 no-show 名单，票务把没来的客人去程标 no-show
+// （钱一分不动），回程座位释放回库存重新可卖（钱同样不动）。之后代理来说要保留，
+// 在回程行点「恢复回程」即可。只勾部分人时后端先拆单、再对拆出的新单处理。
+function NoShowPanel({
+  order,
+  onCancel,
+  onSaved,
+  onChanged,
+}: {
+  order: OrderSummary;
+  onCancel: () => void;
+  onSaved: (updated: OrderSummary) => void;
+  /** 后端拆出新单时用来让列表刷出新单那一行 */
+  onChanged?: () => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const confirm = useConfirm();
+  // 幂等键：本面板打开期间只生成一次，提交失败重试复用同一个 token，避免重复拆单/重复释放。
+  const requestTokenRef = useRef<string>(crypto.randomUUID());
+  const [previewLoading, setPreviewLoading] = useState(true);
+  const [previewErr, setPreviewErr] = useState<string | null>(null);
+  const [preview, setPreview] = useState<NoShowPreview | null>(null);
+  const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
+  const [releaseReturn, setReleaseReturn] = useState(true);
+  const [note, setNote] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  /** 后端拒绝拆单（如套餐单）时原样列出的逐条原因 */
+  const [splitBlockers, setSplitBlockers] = useState<string[]>([]);
+
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    setPreviewLoading(true);
+    setPreviewErr(null);
+    api
+      .previewNoShow(token, order.id)
+      .then((res) => {
+        if (cancelled) return;
+        setPreview(res);
+        // 默认全选＝整单处理（勾掉部分人才走拆单）。
+        setSelectedIds(new Set((res.passengers ?? []).map((p) => p.id)));
+      })
+      .catch((e) => {
+        if (!cancelled) setPreviewErr(e instanceof ApiError ? e.message : 'no-show 预检失败');
+      })
+      .finally(() => {
+        if (!cancelled) setPreviewLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [order.id, token]);
+
+  const passengers = preview?.passengers ?? [];
+  const showPicker = passengers.length >= 2;
+  const isPartial = showPicker && selectedIds.size > 0 && selectedIds.size < passengers.length;
+  const outboundItem = preview?.outboundItem ?? null;
+  const returnItem = preview?.returnItem ?? null;
+  const warnings = preview?.warnings ?? [];
+  const releasingSeats = returnItem?.quantity ?? 0;
+
+  const togglePassenger = (id: string) => {
+    setSelectedIds((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  };
+
+  const submit = async () => {
+    if (!token || submitting || !preview?.eligible || !outboundItem) return;
+    setErr(null);
+    setSplitBlockers([]);
+    if (showPicker && selectedIds.size === 0) {
+      setErr('请至少勾选 1 位 no-show 乘客');
+      return;
+    }
+    const releaseLine =
+      returnItem && releaseReturn
+        ? `回程 ${releasingSeats} 座放回库存可卖，之后代理来要可恢复。`
+        : '本次不释放回程座位。';
+    const confirmed = await confirm({
+      title: 'no-show 处理',
+      body:
+        `去程标 no-show，钱一分不退不动。\n${releaseLine}` +
+        (isPartial ? `\n\n只勾了 ${selectedIds.size} 位：系统会先拆单，再对拆出的新单处理。` : '') +
+        (returnItem?.ticketed && releaseReturn ? '\n\n回程已出票，释放后会给票务派撤名单工单。' : ''),
+      confirmText: '确认处理',
+    });
+    if (!confirmed) return;
+    setSubmitting(true);
+    try {
+      const res = await api.markNoShow(token, order.id, {
+        requestToken: requestTokenRef.current,
+        passengerIds: isPartial ? [...selectedIds] : undefined,
+        // 没有回程航段时恒 false：勾选框此时是禁用态，别把默认的 true 发出去。
+        releaseReturn: returnItem ? releaseReturn : false,
+        note: note.trim() || undefined,
+      });
+      const seats = res.audit.releasedSeats.reduce((sum, r) => sum + r.quantity, 0);
+      const workOrderLine = res.audit.workOrderReminderId ? '\n已给票务派工单（撤名单/退票）。' : '';
+      if (res.targetOrderId !== order.id) {
+        const newNumber = res.audit.split?.targetOrderNumber ?? res.order.orderNumber;
+        alert(`已拆出新单 ${newNumber} 并处理 no-show${seats > 0 ? `，回程 ${seats} 座已放回库存` : ''}${workOrderLine}`);
+        onChanged?.();
+        // 抽屉留在源单上：源单被拆走了乘客，重新拉一遍最新数据。
+        try {
+          const fresh = await api.getOrder(token, order.id);
+          onSaved(fresh.order);
+        } catch {
+          onSaved(res.order);
+        }
+        return;
+      }
+      alert(`已标记去程 no-show${seats > 0 ? `，回程 ${seats} 座已放回库存可卖` : ''}${workOrderLine}`);
+      onSaved(res.order);
+    } catch (e) {
+      const blockers = splitBlockedReasons(e);
+      if (blockers.length > 0) {
+        setSplitBlockers(blockers);
+        setErr('这一单暂时不能按人拆分处理');
+      } else if (splitDoneNoShowFailedOrderId(e)) {
+        // 新单已经拆出来了，处理这一步失败：不能当普通失败静默丢弃，列表要刷出新单。
+        setErr(e instanceof ApiError ? e.message : '已拆出新单，但 no-show 处理未成功，请到新单上重试');
+        onChanged?.();
+      } else {
+        setErr(e instanceof ApiError ? e.message : 'no-show 处理失败');
+      }
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <div className="space-y-2 rounded-md border border-slate-300 bg-white p-3 text-xs">
+      <div className="font-medium text-ink">no-show 处理</div>
+      <p className="leading-snug text-slate-500">
+        按航司 no-show 名单：客人没登机 → 去程标 no-show（钱不动），回程座位放回库存重新可卖（钱同样不动）。
+      </p>
+
+      {previewLoading && <div className="text-slate-500">正在核对本单是否可处理…</div>}
+      {previewErr && <div className="rounded bg-red-50 px-2 py-1 text-red-700">{previewErr}</div>}
+
+      {preview?.alreadyNoShow && (
+        <div className="rounded bg-slate-100 px-2 py-1 text-slate-600">本单去程已经标过 no-show。</div>
+      )}
+
+      {preview && !preview.eligible && (
+        <div className="space-y-1 rounded bg-red-50 px-2 py-1 text-red-700">
+          <div className="font-medium">当前不能做 no-show 处理：</div>
+          <ul className="list-disc space-y-0.5 pl-4">
+            {(preview.blockers.length > 0 ? preview.blockers : ['预检未通过']).map((b) => (
+              <li key={b}>{b}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {warnings.length > 0 && (
+        <div className="space-y-1 rounded border border-amber-300 bg-amber-50 px-2 py-1.5 text-amber-800">
+          <div className="font-medium">请先确认：</div>
+          <ul className="list-disc space-y-0.5 pl-4">
+            {warnings.map((w) => (
+              <li key={w}>{w}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {preview && preview.eligible && (
+        <>
+          <div className="space-y-0.5 rounded border border-slate-200 bg-slate-50/60 p-2">
+            <div className="text-ink">
+              去程：{outboundItem ? outboundItem.description : '（未找到去程航段）'}
+            </div>
+            {outboundItem && (
+              <div className="text-slate-500">
+                {outboundItem.flightNumber && <>{outboundItem.flightNumber} · </>}
+                {outboundItem.departDate && <>{outboundItem.departDate} · </>}
+                {outboundItem.cabin && <>{CABIN_ZH[outboundItem.cabin] ?? outboundItem.cabin} · </>}
+                {outboundItem.quantity} 座
+              </div>
+            )}
+            {returnItem && (
+              <div className="mt-1 text-slate-500">
+                回程：{returnItem.flightNumber ?? '（班次号缺失）'}
+                {returnItem.departDate && <> · {returnItem.departDate}</>} · {returnItem.quantity} 座
+              </div>
+            )}
+          </div>
+
+          {showPicker && (
+            <div className="rounded border border-slate-200 bg-slate-50/60 p-2">
+              <div className="mb-1 flex items-center justify-between">
+                <span className="text-slate-500">no-show 乘客（默认全选＝整单处理）</span>
+                <span className="flex shrink-0 gap-2">
+                  <button
+                    type="button"
+                    className="text-[11px] font-medium text-brand hover:text-brand-dark"
+                    onClick={() => setSelectedIds(new Set(passengers.map((p) => p.id)))}
+                    disabled={submitting}
+                  >
+                    全选
+                  </button>
+                  <button
+                    type="button"
+                    className="text-[11px] font-medium text-slate-500 hover:text-slate-700"
+                    onClick={() => setSelectedIds(new Set())}
+                    disabled={submitting}
+                  >
+                    清空
+                  </button>
+                </span>
+              </div>
+              <ul className="max-h-32 space-y-0.5 overflow-y-auto">
+                {passengers.map((p) => (
+                  <li key={p.id}>
+                    <label className="flex cursor-pointer items-center gap-2 rounded px-1 py-0.5 hover:bg-white">
+                      <input
+                        type="checkbox"
+                        checked={selectedIds.has(p.id)}
+                        onChange={() => togglePassenger(p.id)}
+                        disabled={submitting}
+                      />
+                      <span>{p.chineseName?.trim() || p.fullName}</span>
+                    </label>
+                  </li>
+                ))}
+              </ul>
+              {isPartial && (
+                <p className="mt-1 rounded bg-amber-50 px-2 py-1 text-[11px] leading-snug text-amber-800">
+                  将先拆单，再对拆出的新单处理。
+                </p>
+              )}
+            </div>
+          )}
+
+          <label className="flex items-start gap-1.5">
+            <input
+              type="checkbox"
+              className="mt-0.5"
+              checked={releaseReturn}
+              onChange={(e) => setReleaseReturn(e.target.checked)}
+              disabled={submitting || !returnItem}
+            />
+            <span>
+              同时释放回程座位（可卖，钱不动）
+              {!returnItem && <span className="text-slate-500">（本单没有回程航段）</span>}
+              {returnItem?.ticketed && (
+                <span className="ml-1 text-amber-700">回程已出票，释放后会给票务派撤名单工单。</span>
+              )}
+            </span>
+          </label>
+
+          <label className="block">
+            <span className="text-slate-500">备注（可选）</span>
+            <input
+              className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+              value={note}
+              onChange={(e) => setNote(e.target.value)}
+              disabled={submitting}
+              placeholder="如：航司 no-show 名单日期"
+            />
+          </label>
+        </>
+      )}
+
+      {splitBlockers.length > 0 && (
+        <div className="space-y-1 rounded bg-red-50 px-2 py-1 text-red-700">
+          <div className="font-medium">不能拆单的原因：</div>
+          <ul className="list-disc space-y-0.5 pl-4">
+            {splitBlockers.map((b) => (
+              <li key={b}>{b}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {err && <div className="rounded bg-red-50 px-2 py-1 text-red-700">{err}</div>}
+
+      <div className="flex gap-2 pt-1">
+        <button
+          className="flex-1 rounded bg-slate-800 px-2 py-1.5 font-medium text-white disabled:opacity-50"
+          onClick={submit}
+          disabled={submitting || previewLoading || !preview?.eligible}
+        >
+          {submitting ? '提交中…' : '确认 no-show 处理'}
         </button>
         <button
           className="rounded bg-slate-100 px-3 py-1.5 text-slate-700 disabled:opacity-50"
@@ -8374,6 +9129,16 @@ function countNightsBetween(checkIn: string, checkOut: string): number | null {
 // ── 售后费用（改期费 / 换人费 / 换酒店差价）明细展示 ───────────────────────────────
 // 运行时结构见 lib/api.ts 的 OrderAdjustment（= 后端 OrderAdjustmentEntry）：
 // { type, label, amountCny(number), at(ISO), by, note? }，无 id / createdAt。
+/**
+ * 留痕型调价条目（no-show 那一组）：金额恒 0（钱一分不动），只记事件。
+ * label 在这里统一成中文口径，金额位显示「不涉及金额」而不是「金额见价格调整」。
+ */
+const ZERO_AMOUNT_ADJUSTMENT_LABEL: Record<string, string> = {
+  NO_SHOW_OUTBOUND: '去程 no-show',
+  RETURN_LEG_RELEASED: '回程座位释放',
+  RETURN_LEG_RESTORED: '回程恢复',
+};
+
 function AdjustmentsSection({ order }: { order: OrderSummary }) {
   const adjustments = order.adjustments ?? [];
   if (adjustments.length === 0) return null;
@@ -8384,19 +9149,22 @@ function AdjustmentsSection({ order }: { order: OrderSummary }) {
         {adjustments.map((a, i) => {
           const amountCny = Number(a.amountCny);
           const sign = amountCny < 0 ? '-' : '+';
+          const moneylessLabel = ZERO_AMOUNT_ADJUSTMENT_LABEL[a.type];
           return (
             <li
               key={`${a.at}-${a.type}-${i}`}
               className="flex items-start justify-between gap-2 rounded-md border border-amber-200 bg-amber-50/60 p-2.5"
             >
               <div className="flex-1">
-                <div className="text-ink">{a.label}</div>
+                <div className="text-ink">{moneylessLabel ?? a.label}</div>
                 {a.note && <div className="mt-0.5 text-xs text-ink-muted">{a.note}</div>}
                 <div className="mt-0.5 text-[11px] text-ink-muted">{formatDateTimeSecCn(a.at)}</div>
               </div>
               {amountCny === 0 ? (
                 // 留痕型条目（如取消回程：手续费已作为独立调价行计入应收，这里只记事件），不显示 +¥0 误导
-                <div className="text-[11px] text-ink-muted">金额见价格调整</div>
+                <div className="text-[11px] text-ink-muted">
+                  {moneylessLabel ? '不涉及金额' : '金额见价格调整'}
+                </div>
               ) : (
                 <div className="nums text-sm font-medium text-amber-700">
                   {sign}¥{Math.abs(amountCny).toLocaleString()}

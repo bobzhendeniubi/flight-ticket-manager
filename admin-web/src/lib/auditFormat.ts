@@ -22,6 +22,11 @@ const ACTION_DICT: Record<string, ActionEntry> = {
   BATCH_FORCE_ORDER_STATUS: { label: '批量强制改状态', icon: 'alert' },
   REQUEST_CANCELLATION: { label: '申请取消订单', icon: 'alert' },
   RESEND_ITINERARY: { label: '重发行程单', icon: 'mail' },
+  MARK_NO_SHOW: { label: '标记去程 no-show', icon: 'alert' },
+  RESTORE_RETURN_LEG: { label: '恢复回程', icon: 'refresh' },
+  RESTORE_RETURN_LEG_OVERSOLD: { label: '恢复回程（超售放行）', icon: 'alert' },
+  CANCEL_RETURN_LEG: { label: '取消回程', icon: 'plane' },
+  CANCEL_OUTBOUND_LEG: { label: '取消去程', icon: 'plane' },
 
   // ── 支付 ──
   CREATE_PAYMENT: { label: '创建支付', icon: 'wallet' },
@@ -135,6 +140,31 @@ const FIELD_DICT: Record<string, string> = {
   expectedAmountCny: '预期到账金额',
   confirmedAmountCny: '确认金额',
   receivedAmount: '实收金额',
+  // ── no-show / 航段取消 / 恢复回程 ──
+  leg: '航段方向',
+  outboundItemId: '去程行 ID',
+  returnItemId: '航段行 ID',
+  releasedSeats: '释放座位',
+  releaseReturn: '释放回程',
+  passengerIds: '涉及乘客',
+  workOrderReminderId: '关联工单',
+  split: '拆单',
+  sourceOrderNumber: '源单号',
+  targetOrderNumber: '新单号',
+  note: '备注',
+  replayed: '幂等回放',
+  oversold: '超售放行',
+  oversoldBy: '超售座位数',
+  maxOversell: '超售上限',
+  quantity: '数量',
+  acknowledgedWarnings: '已确认警告',
+  feeMode: '手续费模式',
+  policyName: '退订政策',
+  overrideReason: '手工覆盖原因',
+  originalAmountCny: '原航段金额',
+  netReductionCny: '应收降低额',
+  totalCny: '订单总额',
+  overpayAfterCny: '取消后多收额',
 };
 
 /** OrderStatus / SettlementStatus / 其他后端枚举 → 中文 */
@@ -179,6 +209,12 @@ const ENUM_DICT: Record<string, string> = {
   B: 'B 高峰日',
   C: 'C 平峰日',
   D: 'D 优惠日',
+  // FlightLegSide（取消 / 恢复航段方向）
+  OUTBOUND: '去程',
+  RETURN: '回程',
+  // 取消航段手续费模式
+  POLICY: '按政策',
+  MANUAL: '手工覆盖',
 };
 
 export function formatAction(code: string): ActionEntry {
@@ -217,6 +253,41 @@ function formatScalar(key: string, value: unknown): string {
       return `¥${Number(value).toLocaleString('zh-CN', { maximumFractionDigits: 2 })}`;
     }
     return value;
+  }
+  if (Array.isArray(value)) {
+    if (value.length === 0) return '—';
+    // releasedSeats 这类对象数组（{scheduleId, cabin, quantity}）：渲染成
+    // 「经济舱 2 座 / 商务舱 1 座」这类人话，别整段 dump JSON。
+    if (key === 'releasedSeats') {
+      return value
+        .map((seat) => {
+          const s = seat as { cabin?: string; quantity?: number };
+          const cabinLabel = (s.cabin && ENUM_DICT[s.cabin]) ?? s.cabin ?? '未知舱位';
+          return `${cabinLabel} ${s.quantity ?? 0} 座`;
+        })
+        .join(' / ');
+    }
+    // 纯 id 数组（如 passengerIds）：裸 id 列表没意义，只报数量。
+    if (/Ids$/.test(key) && value.every((v) => typeof v === 'string')) {
+      return `${value.length} 位`;
+    }
+    if (value.every((v) => v === null || typeof v !== 'object')) {
+      return value.map((v) => formatScalar(key, v)).join('、');
+    }
+    try {
+      return JSON.stringify(value);
+    } catch {
+      return String(value);
+    }
+  }
+  if (typeof value === 'object') {
+    // 普通嵌套对象（如 split{sourceOrderNumber,targetOrderNumber}）：逐字段拼成一行，
+    // 复用同一份 FIELD_DICT/formatScalar，别为嵌套对象另起一套格式化逻辑。
+    const obj = value as Record<string, unknown>;
+    const parts = Object.entries(obj)
+      .filter(([, v]) => v !== null && v !== undefined && v !== '')
+      .map(([k, v]) => `${FIELD_DICT[k] ?? k}: ${formatScalar(k, v)}`);
+    if (parts.length > 0) return parts.join('，');
   }
   try {
     return JSON.stringify(value);

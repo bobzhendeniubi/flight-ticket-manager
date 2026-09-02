@@ -1430,6 +1430,10 @@ export const cancelLegBodySchema = z
       .optional(),
     overrideReason: z.string().max(200).optional(),
     note: z.string().max(200).optional(),
+    // 非阻断提示的「我已知悉」回执：预检 requiresAcknowledgement=true 时前端弹二次确认，
+    // 确认后带 true 再提交。缺省 false —— 有 warnings 而未确认，服务端回 400
+    // ACKNOWLEDGEMENT_REQUIRED，绝不静默放行（已出票的段被取消是需要票务善后的动作）。
+    acknowledgeWarnings: z.boolean().optional(),
   })
   .refine((v) => v.feeMode !== 'MANUAL' || v.manualFeeCny != null, {
     message: '手工指定手续费时必须填写金额（整数 CNY，可为 0）',
@@ -1445,6 +1449,50 @@ export type CancelLegBody = z.infer<typeof cancelLegBodySchema>;
 // 保留别名让既有调用方与用例不必改动。
 export const cancelReturnLegBodySchema = cancelLegBodySchema;
 export type CancelReturnLegBody = Omit<CancelLegBody, 'leg'>;
+
+// ── 去程 no-show / 回程释放（POST /orders/:id/no-show；ADMIN/STAFF）────────────────
+// 场景：航司每天发 no-show 名单。客人没登机 —— 去程钱不动不退、成本不动，只打一个
+// no-show 标；回程座位释放回库存可以继续卖（钱同样不动）。
+//
+// ⚠ 与「取消航段」是两件事，别混：
+//   取消回程 = 客人主动退这一段，按取消政策收手续费、应收下降（钱要动）；
+//   no-show 释放 = 客人没来、公司把空出来的回程座位收回重卖，**一分钱不动**
+//                （不改 unitPrice/amount/成本/subtotal/total，不改开票状态）。
+//
+// passengerIds 缺省 = 全员 no-show；只勾部分人 → 服务端先按所选乘客拆单（票随人走）、
+// 再对拆出的新单标记，与「按人改期」同一条 Split PNR 编排。
+// releaseReturn 缺省 true：极少数只想打标不放座的情况可显式传 false。
+// requestToken 为幂等键：同 (订单, token) 重试只回放，座位绝不二次释放。
+export const noShowPreviewBodySchema = z.object({
+  passengerIds: z.array(z.string().min(1)).max(99).optional(),
+});
+export type NoShowPreviewBody = z.infer<typeof noShowPreviewBodySchema>;
+
+export const noShowBodySchema = z.object({
+  requestToken: z.string().min(8).max(64).uuid(),
+  passengerIds: z
+    .array(z.string().min(1))
+    .max(99)
+    .optional()
+    .refine((ids) => ids == null || new Set(ids).size === ids.length, {
+      message: '所选乘客不得重复',
+    }),
+  releaseReturn: z.boolean().default(true),
+  note: z.string().max(200).optional(),
+});
+export type NoShowBody = z.infer<typeof noShowBodySchema>;
+
+// ── 恢复回程（POST /orders/:id/restore-return-leg；ADMIN/STAFF）─────────────────
+// 代理来说「这位客人还要回程」→ 票务把之前释放掉的回程恢复回**原班次**。
+// 有座直接占；没座允许超售（前端二次确认 → allowOversell=true），后端记 CRITICAL 审计。
+// 系统不设通知时限或门槛，能不能恢复只看余位与班次是否已起飞。
+export const restoreReturnLegBodySchema = z.object({
+  requestToken: z.string().min(8).max(64).uuid(),
+  // 余位不足时的「确认超售」回执；缺省 false → 服务端回 409 OVERSELL_CONFIRMATION_REQUIRED。
+  allowOversell: z.boolean().default(false),
+  note: z.string().max(200).optional(),
+});
+export type RestoreReturnLegBody = z.infer<typeof restoreReturnLegBodySchema>;
 
 // ── 按人改期（POST /orders/:id/reschedule-passengers；ADMIN/STAFF）──────────────
 // 场景：三人一单，只给其中一位客人改航班。一单一行程是全站硬约束（去/回程各一条 FLIGHT 行），

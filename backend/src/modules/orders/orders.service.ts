@@ -27,6 +27,7 @@ import {
   ProductKind,
   ReceiptSource,
   RefundStatus,
+  ReminderPriority,
   SeatLockStatus,
   type SettlementTier,
   UserRole,
@@ -51,7 +52,7 @@ import {
   splitPassengerFullName,
 } from '../../lib/passenger-name.js';
 import { localHHMM, localDateISO, localToUtc } from '../../lib/flight-time.js';
-import { BUSINESS_TZ, businessDateTime } from '../../lib/business-time.js';
+import { BUSINESS_TZ, businessDateISO, businessDateTime } from '../../lib/business-time.js';
 import { CANCELLABLE_STATUSES } from '../../lib/cancellation.js';
 import {
   orderNeedsVisaTask,
@@ -128,6 +129,8 @@ import type {
   CancelLegBody,
   CancelReturnLegBody,
   FlightLegSide,
+  NoShowBody,
+  RestoreReturnLegBody,
   PublicOrderLookupQuery,
   QuoteOrderBody,
   SettlementPreview,
@@ -13019,12 +13022,17 @@ export class OrderService {
     order: CancelLegOrderSnapshot;
     legItem: CancelLegItemSnapshot | null;
     blockers: string[];
+    /** 非阻断提示（需运营勾「我已知悉」才放行执行），见闸 8。 */
+    warnings: string[];
+    /** 本段确认出票的记录数（>0 → 执行时给票务派撤名单/退票工单）。 */
+    ticketedCount: number;
   }> {
     const order = await loadOrderForLegCancel(db, orderId);
     if (!order) throw new NotFoundError('订单不存在');
 
     const legZh = LEG_ZH[leg];
     const blockers: string[] = [];
+    const warnings: string[] = [];
 
     // ── 闸 1-3：存活 / 占座中 / 资金处置闸 ──────────────────────────────────
     // 前两条通过才跑处置闸（同因不重复报）。取消航段会改 total（应收下降），语义上属于
@@ -13088,10 +13096,17 @@ export class OrderService {
       );
     }
 
-    // ── 闸 8：本段已出票 → 走改签/退票，不走取消航段 ──────────────────────────
-    // ⚠ 与拆单**不再同口径**：拆单只是把人搬到另一张单、票跟着人走，没有作废任何票，
-    // 所以那边（原闸 12）已放开；取消航段是把这一段作废、座位放回库存重卖，已出票的段
-    // 必须先经退票拿回票款，否则票在航司那边还活着、钱也没退。此闸保持 fail-closed。
+    // ── 闸 8（已从硬闸改为「提示 + 二次确认」）：本段已出票 ──────────────────────
+    // 旧口径 fail-closed 拒绝已出票的段、让运营「走改签/退票流程」。但真实业务里
+    // 「客人不飞了、这一段作废、座位放回去重卖」本来就要发生，硬拦只会逼运营去别处
+    // 手改状态绕过，账反而更乱。现口径：照做，但
+    //   · 预检把它列进 warnings（requiresAcknowledgement=true），前端弹二次确认；
+    //   · 未带 acknowledgeWarnings 提交 → 400 ACKNOWLEDGEMENT_REQUIRED；
+    //   · 执行时在同一事务里给票务派一条「撤名单/退票」工单，善后由票务台按工单跟进。
+    //
+    // ⚠ 判定只认**航段级**的确认出票记录（FulfillmentTask.orderItemId = 被取消的这一行）。
+    // 旧实现还 or 了一条整单级的 `order.passengers.some(pnr || eticket)` —— 那是订单维度的，
+    // 去程出了票就会把回程一并判成「已出票」，回程明明一张票都没开也被挡住。已删除。
     const confirmedTicketing = targetRow
       ? await db.fulfillmentTask.count({
           where: {
@@ -13101,13 +13116,10 @@ export class OrderService {
           },
         })
       : 0;
-    const ticketedPax = order.passengers.some(
-      (p) => (p.pnr && p.pnr.trim() !== '') || (p.eticketNumber && p.eticketNumber.trim() !== ''),
-    );
-    if (confirmedTicketing > 0 || ticketedPax) {
-      blockers.push(
-        `${legZh}已出票（有确认出票记录，或乘客已有 PNR/票号）。已出票请走改签/退票流程，` +
-          '不能直接取消航段。',
+    if (confirmedTicketing > 0) {
+      warnings.push(
+        `${legZh}已出票（${confirmedTicketing} 人有确认出票记录）。` +
+          `取消后系统会给票务派一条撤名单/退票工单，请确认已知悉。`,
       );
     }
 
@@ -13122,7 +13134,13 @@ export class OrderService {
       blockers.push(`该订单有进行中的退款，请先完成或驳回退款流程再取消${legZh}。`);
     }
 
-    return { order, legItem: targetRow ?? null, blockers };
+    return {
+      order,
+      legItem: targetRow ?? null,
+      blockers,
+      warnings,
+      ticketedCount: confirmedTicketing,
+    };
   }
 
   /**
@@ -13191,7 +13209,7 @@ export class OrderService {
     if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
       throw new ForbiddenError(`仅运营/管理员可取消${LEG_ZH[leg]}`);
     }
-    const { order, legItem, blockers } = await this._assessCancelLeg(prisma, orderId, leg);
+    const { order, legItem, blockers, warnings } = await this._assessCancelLeg(prisma, orderId, leg);
 
     const currentTotalCny = round2(Number(order.total));
     const paidAmountCny = round2(Number(order.paidAmount));
@@ -13209,6 +13227,9 @@ export class OrderService {
       leg,
       eligible: blockers.length === 0,
       blockers,
+      warnings,
+      // 有非阻断提示 → 前端必须弹二次确认，确认后带 acknowledgeWarnings=true 才允许提交。
+      requiresAcknowledgement: warnings.length > 0,
       returnItem: legItem ? this._describeLeg(legItem) : null,
       policyFee,
       netReductionCny,
@@ -13284,6 +13305,8 @@ export class OrderService {
           leg: (snap.leg === 'OUTBOUND' ? 'OUTBOUND' : 'RETURN') as FlightLegSide,
           returnItemId: replayRow.id,
           feeItemId: null,
+          workOrderReminderId:
+            typeof snap.workOrderReminderId === 'string' ? snap.workOrderReminderId : null,
           releasedSeats: Array.isArray(snap.releasedSeats)
             ? (snap.releasedSeats as CancelLegAudit['releasedSeats'])
             : [],
@@ -13300,9 +13323,24 @@ export class OrderService {
       }
 
       // ── 1. 重跑准入闸（预检放行到执行之间世界可能已经变了）──
-      const { order, legItem, blockers } = await this._assessCancelLeg(tx, orderId, leg);
+      const { order, legItem, blockers, warnings, ticketedCount } = await this._assessCancelLeg(
+        tx,
+        orderId,
+        leg,
+      );
       if (blockers.length > 0 || !legItem) {
         throw new BadRequestError(blockers.join('；') || `本单没有可取消的${legZh}航段。`);
+      }
+
+      // ── 1b. 非阻断提示必须带「我已知悉」回执 ──────────────────────────────
+      // 稳定 code 给前端判：收到就弹二次确认（把 details.warnings 原文列出来），
+      // 确认后带 acknowledgeWarnings=true 重提。不靠中文文案匹配。
+      if (warnings.length > 0 && input.acknowledgeWarnings !== true) {
+        throw new AppError(warnings.join('；'), {
+          statusCode: 400,
+          code: 'ACKNOWLEDGEMENT_REQUIRED',
+          details: { warnings },
+        });
       }
 
       const legAmountCny = round2(Number(legItem.amount));
@@ -13356,6 +13394,25 @@ export class OrderService {
         }
       }
 
+      // ── 3b. 本段已出票 → 同一事务给票务派「撤名单/退票」工单 ────────────────
+      // 与作废动作同事务：不可能出现「段作废了、工单没派出去」。
+      // 工单 id 进下面的作废快照，幂等回放时原样读回（不会重复派单）。
+      let workOrderReminderId: string | null = null;
+      if (ticketedCount > 0) {
+        workOrderReminderId = await createTicketWorkOrder(tx, {
+          orderId,
+          createdById: actor.userId,
+          ruleKey: `LEG_CANCEL_WITHDRAW:${legItem.id}:${input.requestToken}`,
+          title: buildTicketWorkOrderTitle('撤名单/退票', order.orderNumber, legZh, legItem),
+          body:
+            `订单 ${order.orderNumber} 的${legZh}已取消，该段座位已放回库存。` +
+            `该段有 ${ticketedCount} 条确认出票记录，请到航司/出票渠道撤名单或办理退票，` +
+            `完成后把本条标记为已处理。` +
+            (input.note?.trim() ? `\n操作备注：${input.note.trim()}` : ''),
+          at: now,
+        });
+      }
+
       // ── 4. 该航段行「作废保留」：金额/成本归零 + 班次置空 + 快照落 metadata ──────
       // 不物理删行：已取消航段要留痕（原班次、原金额、谁在什么时候按什么政策取消的）。
       // flightScheduleId 置空 = 全站「有效航段」判定的统一口径，置空即退出座位/开票/回程列统计。
@@ -13379,6 +13436,8 @@ export class OrderService {
         policyName: policyFee?.policyName ?? null,
         policySnapshot: policyFee,
         releasedSeats,
+        ticketedAtCancel: ticketedCount,
+        workOrderReminderId,
         totalBeforeCny,
         totalAfterCny: round2(totalBeforeCny - netReductionCny),
       };
@@ -13401,6 +13460,8 @@ export class OrderService {
       });
 
       // ── 5. 该段履约任务终态化（口径同订单落取消族：只动仍活着的任务，幂等）──
+      // 已 CONFIRMED 的出票任务**不动**：票在航司那边是真实存在的，把记录改掉等于抹掉
+      // 「这段出过票」的事实。撤名单/退票由下面派出去的工单驱动票务台处理。
       await tx.fulfillmentTask.updateMany({
         where: {
           orderItemId: legItem.id,
@@ -13408,6 +13469,7 @@ export class OrderService {
         },
         data: { status: FulfillmentStatus.CANCELLED, completedAt: now },
       });
+
 
       // ── 6. 物化列 hasReturnLeg 同步（此刻只剩一段有效航段 → 必然回落 false）──
       await syncOrderHasReturnLeg(tx, orderId);
@@ -13488,6 +13550,7 @@ export class OrderService {
         leg,
         returnItemId: legItem.id,
         feeItemId,
+        workOrderReminderId,
         releasedSeats,
         originalAmountCny: legAmountCny,
         feeCny,
@@ -13518,6 +13581,880 @@ export class OrderService {
     actor: { userId: string; role: UserRole },
   ): Promise<{ order: ReturnType<typeof serializeOrder>; audit: CancelLegAudit }> {
     return this.cancelLeg(orderId, { ...input, leg: 'RETURN' }, actor);
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 去程 no-show + 回程释放 / 恢复
+  //
+  // 业务原样（航司每天发 no-show 名单，票务照单处理）：
+  //   · 客人没登机 → 去程标 no-show：**钱不动**（不退款、不改应收）、**成本不动**
+  //     （座位已经飞掉了，采购成本照付）。只在订单行上打一个可查的标。
+  //   · 回程座位释放回库存，可以继续卖 —— 同样**钱不动**：这是公司把空出来的座位收回，
+  //     不是客人退票。收了多少还是多少，退不退由既有多收/退款流程另行决定。
+  //   · 之后代理来说「这位客人还要回程」→ 票务恢复回原班次：有座直接占，没座允许超售
+  //     （包机位本来就按 no-show 率放量），前端二次确认、后端 CRITICAL 审计。
+  //     系统不设任何通知时限或门槛，能不能恢复只看余位与班次是否已起飞。
+  //
+  // ⚠ 与「取消航段」的界线（两个端点，别混）：
+  //   取消回程 = 客人主动退这一段 → 按取消政策收手续费、应收下降、多收走退款流程（钱要动）；
+  //   no-show 释放 = 客人没来、公司放座重卖 → **一个金额字段都不写**
+  //     （unitPrice / amount / unitCostCny / totalCostCny / subtotal / total 全不动），
+  //     开票位也不动（钱没变，发票就不该变）。
+  //
+  // 座位账对称：释放时把逐舱位的张数快照进 metadata.returnReleased.releasedSeats，
+  // 恢复时**照快照回填**，不重新按 quantity 推算 —— 放几座就恢复几座，升舱拆座镜像原样还原。
+  //
+  // 一单只有部分人 no-show：先按所选乘客拆单（票随人走）、再对拆出的新单标记，
+  // 与「按人改期」同一条 Split PNR 编排。套餐单目前被拆单闸 10 挡住 → 返回结构化 409。
+  // ════════════════════════════════════════════════════════════════════
+
+  /** no-show 的准入评估（preview 与 execute 共用同一口径，杜绝预检放行、执行另算）。 */
+  private async _assessNoShow(
+    db: Prisma.TransactionClient,
+    orderId: string,
+    passengerIds: string[] | undefined,
+  ): Promise<{
+    order: CancelLegOrderSnapshot;
+    outboundItem: CancelLegItemSnapshot | null;
+    returnItem: CancelLegItemSnapshot | null;
+    returnTicketedCount: number;
+    blockers: string[];
+    warnings: string[];
+    scope: NoShowScope;
+    alreadyNoShow: boolean;
+  }> {
+    const order = await loadOrderForLegCancel(db, orderId);
+    if (!order) throw new NotFoundError('订单不存在');
+
+    const blockers: string[] = [];
+    const warnings: string[] = [];
+
+    // ── 闸 1-2：存活 / 占座中 ────────────────────────────────────────────────
+    // **不跑资金处置闸、不看结算价锁/收款复核锁/开票位**：本操作一分钱不动，
+    // 那几把闸管的都是「会改应收」的动作，套在这里只会白挡运营。
+    if (order.deletedAt) {
+      blockers.push('订单在回收站（已软删），不能标记 no-show；如需操作请先恢复订单。');
+    } else if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
+      blockers.push(
+        `订单当前状态（${zhStatus(order.status)}）不能标记 no-show：` +
+          '仅占座中的有效订单可操作（已取消/已退款/支付超时的单不再持有座位）。',
+      );
+    }
+
+    // ── 闸 3：必须有去程航段（有效航段 = flightScheduleId 非空，与全站同口径）──
+    const legRows = order.items.filter(
+      (it) =>
+        it.kind === OrderItemKind.FLIGHT &&
+        it.flightScheduleId != null &&
+        it.flightSchedule?.departureTime != null,
+    );
+    const legs = determineFlightLegItems(legRows);
+    const outboundItem = legs.outbound ?? null;
+    const returnItem = legs.return ?? null;
+    if (!outboundItem) {
+      blockers.push('本单没有可标记的去程航段（航段未录入班次，或已被取消/释放）。');
+    }
+    if (legRows.length > 2) {
+      // 与取消航段同因：三段以上单的去程/回程没有权威口径，猜错会放错座。
+      blockers.push(
+        `本单有 ${legRows.length} 段航段（超过去程+回程两段），系统无法自动判定航段方向，` +
+          '请人工逐段处理或先拆单。',
+      );
+    }
+
+    // ── 闸 4：去程必须**已经起飞**（没飞怎么算没来）────────────────────────────
+    // departureTime 存的是真 UTC 瞬间（departureTz 只用于展示折算），所以直接与当前时刻比。
+    const departAt = outboundItem?.flightSchedule?.departureTime ?? null;
+    if (outboundItem && departAt && departAt.getTime() > Date.now()) {
+      const sched = outboundItem.flightSchedule;
+      const localWhen = `${localDateISO(departAt, sched?.departureTz)} ${localHHMM(departAt, sched?.departureTz)}`;
+      blockers.push(
+        `去程航班尚未起飞（当地时间 ${localWhen} 出发），未起飞不能标记 no-show。` +
+          '客人临时不飞请走取消航段/取消订单流程。',
+      );
+    }
+
+    // ── 闸 5：去程未标记过 no-show（幂等回放在执行段先行拦截，走不到这里）──
+    const alreadyNoShow =
+      outboundItem != null && readJsonObject(readJsonObject(outboundItem.metadata).noShow).at != null;
+    if (alreadyNoShow) {
+      const at = readJsonObject(readJsonObject(outboundItem!.metadata).noShow).at;
+      blockers.push(
+        `本单去程已标记 no-show（${typeof at === 'string' ? businessDateTime(new Date(at)) : '时间未知'}），无需重复标记。`,
+      );
+    }
+
+    // ── 闸 6：勾选范围 —— 部分乘客须先拆单（票随人走）────────────────────────
+    const allPaxIds = new Set(order.passengers.map((p) => p.id));
+    const picked = passengerIds ? [...new Set(passengerIds)] : null;
+    let scope: NoShowScope = 'WHOLE';
+    if (picked && picked.length > 0) {
+      const unknown = picked.filter((id) => !allPaxIds.has(id));
+      if (unknown.length > 0) {
+        blockers.push('所选乘客不属于本订单（可能已被换人/拆走），请刷新后重试。');
+      } else if (picked.length < allPaxIds.size) {
+        scope = 'SPLIT_REQUIRED';
+        warnings.push(
+          `本次只标记 ${picked.length}/${allPaxIds.size} 位乘客：系统会先按所选乘客拆出新单` +
+            '（票随人走），再对新单标记 no-show / 释放回程。',
+        );
+        // 拆单的闸并到同一份 blockers 里，让运营在一个弹窗看完所有待清障项。
+        const splitAssessment = await this.assessOrderSplitForNoShow(db, orderId, picked);
+        blockers.push(...splitAssessment);
+      }
+    }
+
+    // ── 回程状态：出票 / 开票位（都只是提示，不阻断）────────────────────────────
+    const returnTicketedCount = returnItem
+      ? await db.fulfillmentTask.count({
+          where: {
+            orderItemId: returnItem.id,
+            type: FulfillmentType.FLIGHT_TICKETING,
+            status: FulfillmentStatus.CONFIRMED,
+          },
+        })
+      : 0;
+    if (returnItem && returnTicketedCount > 0) {
+      warnings.push(
+        `回程已出票（${returnTicketedCount} 人有确认出票记录）。释放座位后系统会给票务派一条` +
+          '撤名单/退票工单，请确认已知悉。',
+      );
+    }
+    if (returnItem && order.returnInvoiced) {
+      warnings.push('回程已标记开票：本操作不动钱也不动开票状态，如需调整请到票务台单独处理。');
+    }
+    if (!returnItem) {
+      warnings.push('本单没有回程航段（单程单），本次只给去程打 no-show 标，没有座位可释放。');
+    }
+
+    return {
+      order,
+      outboundItem,
+      returnItem,
+      returnTicketedCount,
+      blockers,
+      warnings,
+      scope,
+      alreadyNoShow,
+    };
+  }
+
+  /**
+   * 借拆单预检拿到「这单能不能按人拆」的人话闸（只取 blockers，不重复算份额展示）。
+   * 单独包一层是为了让 _assessNoShow 不必知道拆单的 loader 与快照形状。
+   */
+  private async assessOrderSplitForNoShow(
+    db: Prisma.TransactionClient,
+    orderId: string,
+    passengerIds: string[],
+  ): Promise<string[]> {
+    const source = await loadOrderForSplit(db, orderId);
+    if (!source) return ['订单不存在，无法拆单。'];
+    const assessment = await this.assessOrderSplit(db, source, passengerIds);
+    return assessment.blockers;
+  }
+
+  /** 航段行 → no-show 预检用的可读快照（不含金额：本操作与钱无关）。 */
+  private _describeNoShowLeg(item: CancelLegItemSnapshot): NoShowLegView {
+    const sched = item.flightSchedule;
+    return {
+      orderItemId: item.id,
+      description: item.description,
+      flightNumber: sched?.flight?.flightNumber ?? null,
+      departDate: sched?.departureTime ? localDateISO(sched.departureTime, sched.departureTz) : null,
+      cabin: item.flightCabin,
+      quantity: item.quantity,
+    };
+  }
+
+  /**
+   * no-show · 预检（只读）：POST /orders/:id/no-show/preview。
+   * 一次性返回全部不满足的闸（blockers）+ 全部提示（warnings），供运营在一个弹窗看完。
+   */
+  async previewNoShow(
+    orderId: string,
+    body: { passengerIds?: string[] },
+    actor: { userId: string; role: UserRole },
+  ): Promise<NoShowPreview> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可标记 no-show');
+    }
+    const assessed = await this._assessNoShow(prisma, orderId, body.passengerIds);
+    return {
+      eligible: assessed.blockers.length === 0,
+      blockers: assessed.blockers,
+      warnings: assessed.warnings,
+      scope: assessed.scope,
+      outboundItem: assessed.outboundItem
+        ? this._describeNoShowLeg(assessed.outboundItem)
+        : null,
+      returnItem: assessed.returnItem
+        ? {
+            ...this._describeNoShowLeg(assessed.returnItem),
+            ticketed: assessed.returnTicketedCount > 0,
+          }
+        : null,
+      passengers: assessed.order.passengers.map((p) => ({
+        id: p.id,
+        fullName: p.fullName,
+        chineseName: p.chineseName,
+      })),
+      alreadyNoShow: assessed.alreadyNoShow,
+    };
+  }
+
+  /**
+   * no-show · 执行：POST /orders/:id/no-show。
+   *
+   * 部分乘客 → 照「按人改期」的编排：先 splitOrder 拆出新单，再对新单执行标记
+   * （两步不套一个事务，理由同 reschedulePassengers：两套行锁硬嵌会绞死）。
+   * 拆成了但标记失败 → 不回滚拆单（新单本身是合法订单），回 409 让运营到新单重试。
+   */
+  async markNoShow(
+    orderId: string,
+    input: NoShowBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    targetOrderId: string;
+    audit: NoShowAudit;
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可标记 no-show');
+    }
+
+    // ── 1. 判定是否需要先拆单 ───────────────────────────────────────────────
+    const head = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: { id: true, orderNumber: true, passengers: { select: { id: true } } },
+    });
+    if (!head) throw new NotFoundError('订单不存在');
+    const picked = input.passengerIds ? [...new Set(input.passengerIds)] : null;
+    const needsSplit = picked != null && picked.length > 0 && picked.length < head.passengers.length;
+
+    if (!needsSplit) {
+      const audit = await this._executeNoShow(orderId, input, actor, null);
+      const finalOrder = await prisma.order.findUniqueOrThrow({
+        where: { id: orderId },
+        include: ORDER_FULL_INCLUDE,
+      });
+      return {
+        order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
+        targetOrderId: orderId,
+        audit,
+      };
+    }
+
+    // ── 2. 部分乘客：先跑拆单预检拿结构化 blockers，再执行拆单 ────────────────
+    const splitPreview = await this.previewOrderSplit(orderId, { passengerIds: picked! }, actor);
+    if (!splitPreview.eligible) {
+      throw new AppError(
+        `本单无法按人拆分，因此不能只给部分乘客标记 no-show：${splitPreview.blockers.join('；')}`,
+        { statusCode: 409, code: 'SPLIT_BLOCKED', details: { blockers: splitPreview.blockers } },
+      );
+    }
+
+    let split: SplitOrderResult;
+    try {
+      split = await this.splitOrder(
+        orderId,
+        { passengerIds: picked!, note: input.note, requestToken: input.requestToken },
+        actor,
+      );
+    } catch (err) {
+      // 预检到执行之间世界变了（并发改单/并发拆单）→ 同样回 SPLIT_BLOCKED，前端一条路处理。
+      const reason = err instanceof Error ? err.message : '未知错误';
+      throw new AppError(`拆单未成功，无法只给部分乘客标记 no-show：${reason}`, {
+        statusCode: 409,
+        code: 'SPLIT_BLOCKED',
+        details: { blockers: [reason] },
+      });
+    }
+
+    // ── 3. 对新单执行标记 ───────────────────────────────────────────────────
+    let audit: NoShowAudit;
+    try {
+      audit = await this._executeNoShow(
+        split.targetOrderId,
+        input,
+        actor,
+        { sourceOrderNumber: split.sourceOrderNumber, targetOrderNumber: split.targetOrderNumber },
+      );
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : '未知错误';
+      throw new AppError(
+        `已拆出新订单 ${split.targetOrderNumber}（${split.passengerCount} 人），` +
+          `但对新单标记 no-show 未成功：${reason}。拆单不会回滚，请到该单上重试。`,
+        {
+          statusCode: 409,
+          code: 'SPLIT_DONE_NOSHOW_FAILED',
+          details: {
+            newOrderId: split.targetOrderId,
+            newOrderNumber: split.targetOrderNumber,
+            passengerCount: split.passengerCount,
+            reason,
+          },
+        },
+      );
+    }
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: split.targetOrderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+    return {
+      order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
+      targetOrderId: split.targetOrderId,
+      audit,
+    };
+  }
+
+  /**
+   * 单事务执行标记：锁订单行 → 幂等回放 → 重跑闸 → 去程打标 → 回程放座+置空 →
+   * 任务处理 / 工单 → hasReturnLeg 同步 → adjustments 留痕。
+   *
+   * ⚠ 金额四字段（unitPrice / amount / unitCostCny / totalCostCny）与 subtotal / total
+   * 在本方法内**一个都不写**。改这里前先读上面「与取消航段的界线」。
+   */
+  private async _executeNoShow(
+    targetOrderId: string,
+    input: NoShowBody,
+    actor: { userId: string; role: UserRole },
+    split: { sourceOrderNumber: string; targetOrderNumber: string } | null,
+  ): Promise<NoShowAudit> {
+    return prisma.$transaction(async (tx) => {
+      // 与改期 / 取消航段 / 超时 worker 同一把行锁 → 座位账严格串行。
+      const lockRows = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "Order" WHERE id = ${targetOrderId} FOR UPDATE
+      `;
+      if (lockRows.length === 0) throw new NotFoundError('订单不存在');
+
+      // ── 0. 幂等回放：同 token 已标记过 → 原样回放，绝不二次放座、二次派工单 ──
+      const flightRows = await tx.orderItem.findMany({
+        where: { orderId: targetOrderId, kind: OrderItemKind.FLIGHT },
+        select: { id: true, metadata: true },
+      });
+      const replayRow = flightRows.find(
+        (row) => readJsonObject(readJsonObject(row.metadata).noShow).requestToken === input.requestToken,
+      );
+      if (replayRow) {
+        const snap = readJsonObject(readJsonObject(replayRow.metadata).noShow);
+        return {
+          orderNumber: split?.targetOrderNumber ?? '',
+          outboundItemId: replayRow.id,
+          returnItemId: typeof snap.returnItemId === 'string' ? snap.returnItemId : null,
+          releasedSeats: Array.isArray(snap.releasedSeats)
+            ? (snap.releasedSeats as NoShowAudit['releasedSeats'])
+            : [],
+          workOrderReminderId:
+            typeof snap.workOrderReminderId === 'string' ? snap.workOrderReminderId : null,
+          split,
+          replayed: true,
+        } satisfies NoShowAudit;
+      }
+
+      // ── 1. 重跑准入闸（此刻订单里就是该被标记的那批人 → 不再传 passengerIds）──
+      const { order, outboundItem, returnItem, returnTicketedCount, blockers } =
+        await this._assessNoShow(tx, targetOrderId, undefined);
+      if (blockers.length > 0 || !outboundItem) {
+        throw new BadRequestError(blockers.join('；') || '本单没有可标记 no-show 的去程航段。');
+      }
+
+      const now = new Date();
+      const note = input.note?.trim() || null;
+      const passengerIdList = order.passengers.map((p) => p.id);
+
+      // ── 2. 回程处置（先做：工单 id / 放座明细要写进去程的 no-show 快照供回放）──
+      const releasedSeats: NoShowAudit['releasedSeats'] = [];
+      let workOrderReminderId: string | null = null;
+      const willRelease = input.releaseReturn && returnItem != null;
+
+      if (willRelease && returnItem) {
+        // 2a. 放座：按下单时的升舱拆座镜像各退各舱（与取消航段第 3 步同一 helper）。
+        const retScheduleId = returnItem.flightScheduleId;
+        const retCabin = returnItem.flightCabin;
+        if (retScheduleId && retCabin) {
+          const meta = readJsonObject(returnItem.metadata);
+          const rawUpgrade =
+            typeof meta.businessUpgradeCount === 'number' ? meta.businessUpgradeCount : 0;
+          const seatSplit = computeBundleSeatSplit(retCabin, returnItem.quantity, rawUpgrade);
+          await releaseSeatFloored(tx, retScheduleId, 'BUSINESS', seatSplit.business);
+          await releaseSeatFloored(tx, retScheduleId, retCabin, seatSplit.sameCabin);
+          if (seatSplit.business > 0) {
+            releasedSeats.push({
+              scheduleId: retScheduleId,
+              cabin: 'BUSINESS',
+              quantity: seatSplit.business,
+            });
+          }
+          if (seatSplit.sameCabin > 0) {
+            releasedSeats.push({
+              scheduleId: retScheduleId,
+              cabin: retCabin,
+              quantity: seatSplit.sameCabin,
+            });
+          }
+        }
+
+        // 2b. 出票任务：未出票的关掉；已出票的**不动**，另派撤名单/退票工单。
+        //     已 CONFIRMED 的记录是「票在航司那边真实存在」的事实，抹掉它等于丢账。
+        if (returnTicketedCount > 0) {
+          workOrderReminderId = await createTicketWorkOrder(tx, {
+            orderId: targetOrderId,
+            createdById: actor.userId,
+            ruleKey: `NOSHOW_WITHDRAW:${returnItem.id}:${input.requestToken}`,
+            title: buildTicketWorkOrderTitle('撤名单/退票', order.orderNumber, '回程', returnItem),
+            body:
+              `订单 ${order.orderNumber} 的客人去程 no-show，回程座位已释放回库存可继续销售。` +
+              `该段有 ${returnTicketedCount} 条确认出票记录，请到航司/出票渠道撤名单或办理退票，` +
+              '完成后把本条标记为已处理。（本操作不涉及退款，钱款处置另循财务流程。）' +
+              (note ? `\n操作备注：${note}` : ''),
+            at: now,
+          });
+        } else {
+          await tx.fulfillmentTask.updateMany({
+            where: {
+              orderItemId: returnItem.id,
+              type: FulfillmentType.FLIGHT_TICKETING,
+              status: { in: [FulfillmentStatus.PENDING, FulfillmentStatus.IN_PROGRESS] },
+            },
+            data: { status: FulfillmentStatus.CANCELLED, completedAt: now },
+          });
+        }
+
+        // 2c. 回程行「释放留痕」：班次置空（= 退出全站有效航段判定）+ 描述前缀 + 快照。
+        //     金额与成本一律不动 —— 钱不动是本操作的第一口径。
+        //     voidedAt 预留给「回程起飞后自动作废」的后续 job：它只需给这个快照补
+        //     returnVoidedFinal，恢复端点见到即拒绝，不必再动表结构。
+        const retMeta = readJsonObject(returnItem.metadata);
+        const releaseSnapshot = {
+          at: now.toISOString(),
+          byUserId: actor.userId,
+          requestToken: input.requestToken,
+          reason: 'NO_SHOW_OUTBOUND',
+          originalDescription: returnItem.description,
+          originalScheduleId: returnItem.flightScheduleId,
+          originalCabin: returnItem.flightCabin,
+          releasedSeats,
+          ticketedAtRelease: returnTicketedCount,
+          workOrderReminderId,
+          note,
+        };
+        await tx.orderItem.update({
+          where: { id: returnItem.id },
+          data: {
+            description: returnItem.description.startsWith(RETURN_RELEASED_PREFIX)
+              ? returnItem.description
+              : `${RETURN_RELEASED_PREFIX}${returnItem.description}`,
+            flightScheduleId: null,
+            metadata: {
+              ...retMeta,
+              returnReleased: releaseSnapshot,
+            } as Prisma.InputJsonValue,
+          },
+        });
+      }
+
+      // ── 3. 去程打 no-show 标（班次**不置空**：这段是真飞了的，得留在航段统计里）──
+      const outMeta = readJsonObject(outboundItem.metadata);
+      const noShowSnapshot = {
+        at: now.toISOString(),
+        byUserId: actor.userId,
+        requestToken: input.requestToken,
+        leg: 'OUTBOUND',
+        source: 'MANUAL',
+        // 航司 no-show 名单的日期锚点：按去程出发地当地日折算（同全站出发日口径）。
+        listDate: outboundItem.flightSchedule?.departureTime
+          ? localDateISO(
+              outboundItem.flightSchedule.departureTime,
+              outboundItem.flightSchedule.departureTz,
+            )
+          : null,
+        passengerIds: passengerIdList,
+        note,
+        // 回放要用的下游结果（放在去程快照里，回放只读一行）。
+        returnItemId: willRelease && returnItem ? returnItem.id : null,
+        returnReleased: willRelease,
+        releasedSeats,
+        workOrderReminderId,
+      };
+      await tx.orderItem.update({
+        where: { id: outboundItem.id },
+        data: {
+          description: outboundItem.description.startsWith(NO_SHOW_PREFIX)
+            ? outboundItem.description
+            : `${NO_SHOW_PREFIX}${outboundItem.description}`,
+          metadata: { ...outMeta, noShow: noShowSnapshot } as Prisma.InputJsonValue,
+        },
+      });
+
+      // ── 4. 物化列同步 + 留痕流水（金额恒 0：本操作不动钱，只留「谁在什么时候做了什么」）──
+      await syncOrderHasReturnLeg(tx, targetOrderId);
+
+      let log = appendAdjustment(order.adjustments, {
+        type: 'NO_SHOW_OUTBOUND',
+        label: '去程 no-show（钱款不动）',
+        amountCny: 0,
+        at: now.toISOString(),
+        by: actor.userId,
+        note: note ?? undefined,
+      });
+      if (willRelease) {
+        log = appendAdjustment(log as Prisma.JsonValue, {
+          type: 'RETURN_LEG_RELEASED',
+          label: `回程座位释放回库存（${releasedSeats.reduce((n, r) => n + r.quantity, 0)} 座，钱款不动）`,
+          amountCny: 0,
+          at: now.toISOString(),
+          by: actor.userId,
+          note: note ?? undefined,
+        });
+      }
+      await tx.order.update({ where: { id: targetOrderId }, data: { adjustments: log } });
+
+      return {
+        orderNumber: order.orderNumber,
+        outboundItemId: outboundItem.id,
+        returnItemId: willRelease && returnItem ? returnItem.id : null,
+        releasedSeats,
+        workOrderReminderId,
+        split,
+        replayed: false,
+      } satisfies NoShowAudit;
+    });
+  }
+
+  /** 恢复回程的准入评估（preview 与 execute 共用）。 */
+  private async _assessRestoreReturnLeg(
+    db: Prisma.TransactionClient,
+    orderId: string,
+  ): Promise<{
+    order: CancelLegOrderSnapshot;
+    releasedItem: CancelLegItemSnapshot | null;
+    snapshot: ReturnReleasedSnapshot | null;
+    /** 逐舱位的恢复需求（照释放时的快照回填，不重新按 quantity 推算）。 */
+    seatNeeds: Array<{ cabin: CabinClass; quantity: number; available: number }>;
+    blockers: string[];
+    available: number;
+    oversellBy: number;
+    departed: boolean;
+    scheduleId: string | null;
+  }> {
+    const order = await loadOrderForLegCancel(db, orderId);
+    if (!order) throw new NotFoundError('订单不存在');
+
+    const blockers: string[] = [];
+    if (order.deletedAt) {
+      blockers.push('订单在回收站（已软删），不能恢复回程；如需操作请先恢复订单。');
+    } else if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
+      blockers.push(
+        `订单当前状态（${zhStatus(order.status)}）不能恢复回程：仅占座中的有效订单可操作。`,
+      );
+    }
+
+    // 被 no-show 释放过的那一行：有 returnReleased 快照、且未被「起飞后自动作废」终结。
+    const releasedItem =
+      order.items.find(
+        (it) =>
+          it.kind === OrderItemKind.FLIGHT &&
+          readJsonObject(readJsonObject(it.metadata).returnReleased).at != null,
+      ) ?? null;
+    const snapshot = releasedItem
+      ? (readJsonObject(readJsonObject(releasedItem.metadata).returnReleased) as ReturnReleasedSnapshot)
+      : null;
+
+    if (!releasedItem || !snapshot) {
+      blockers.push('本单没有被 no-show 释放的回程航段，无需恢复。');
+    } else if (readJsonObject(releasedItem.metadata).returnVoidedFinal != null) {
+      blockers.push('该回程已过期作废（原班次已飞完），无法恢复。');
+    } else if (releasedItem.flightScheduleId != null) {
+      blockers.push('该回程当前已占着班次，无需恢复。');
+    }
+
+    const scheduleId = typeof snapshot?.originalScheduleId === 'string' ? snapshot.originalScheduleId : null;
+    const releasedSeats = Array.isArray(snapshot?.releasedSeats)
+      ? (snapshot!.releasedSeats as Array<{ cabin: CabinClass; quantity: number }>)
+      : [];
+
+    let departed = false;
+    const seatNeeds: Array<{ cabin: CabinClass; quantity: number; available: number }> = [];
+    if (releasedItem && snapshot && blockers.length === 0) {
+      if (!scheduleId) {
+        blockers.push('释放快照里没有原班次，无法自动恢复，请人工重录回程航段。');
+      } else {
+        const schedule = await db.flightSchedule.findUnique({
+          where: { id: scheduleId },
+          select: { id: true, departureTime: true },
+        });
+        if (!schedule) {
+          blockers.push('原班次已不存在（可能已被删除），无法恢复，请人工重录回程航段。');
+        } else if (schedule.departureTime.getTime() <= Date.now()) {
+          departed = true;
+          blockers.push('原班次已起飞，无法恢复。');
+        } else {
+          for (const need of releasedSeats) {
+            const availability = await cabinAvailabilityWithinTx(db, scheduleId, need.cabin);
+            if (availability == null) {
+              blockers.push(`原班次已没有 ${need.cabin} 舱位配置，无法恢复，请先在航班维护里补齐。`);
+              continue;
+            }
+            seatNeeds.push({ cabin: need.cabin, quantity: need.quantity, available: availability });
+          }
+        }
+      }
+    }
+
+    // 逐舱位缺口合计 = 本次要超售的座数；available 取各舱位余位的最小值（前端只展示一个数）。
+    const oversellBy = seatNeeds.reduce((n, s) => n + Math.max(0, s.quantity - s.available), 0);
+    const available = seatNeeds.length > 0 ? Math.min(...seatNeeds.map((s) => s.available)) : 0;
+    const maxOversell = env.FLIGHT_NOSHOW_MAX_OVERSELL_SEATS;
+    if (oversellBy > maxOversell) {
+      blockers.push(
+        `超售将超过上限 ${maxOversell} 座（本次需超售 ${oversellBy} 座）。` +
+          '请先向航司加位、或联系管理员调整上限后再恢复。',
+      );
+    }
+
+    return {
+      order,
+      releasedItem,
+      snapshot,
+      seatNeeds,
+      blockers,
+      available,
+      oversellBy,
+      departed,
+      scheduleId,
+    };
+  }
+
+  /** 恢复回程 · 预检（只读）：POST /orders/:id/restore-return-leg/preview。 */
+  async previewRestoreReturnLeg(
+    orderId: string,
+    actor: { userId: string; role: UserRole },
+  ): Promise<RestoreReturnLegPreview> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可恢复回程');
+    }
+    const assessed = await this._assessRestoreReturnLeg(prisma, orderId);
+    const item = assessed.releasedItem;
+    const schedule =
+      assessed.scheduleId != null
+        ? await prisma.flightSchedule.findUnique({
+            where: { id: assessed.scheduleId },
+            select: {
+              departureTime: true,
+              departureTz: true,
+              flight: { select: { flightNumber: true } },
+            },
+          })
+        : null;
+    return {
+      eligible: assessed.blockers.length === 0,
+      blockers: assessed.blockers,
+      original:
+        item && assessed.scheduleId
+          ? {
+              orderItemId: item.id,
+              flightNumber: schedule?.flight?.flightNumber ?? null,
+              departDate: schedule?.departureTime
+                ? localDateISO(schedule.departureTime, schedule.departureTz)
+                : null,
+              cabin: item.flightCabin,
+              quantity: item.quantity,
+              scheduleId: assessed.scheduleId,
+            }
+          : null,
+      available: assessed.available,
+      needsOversell: assessed.oversellBy > 0,
+      oversellBy: assessed.oversellBy,
+      maxOversell: env.FLIGHT_NOSHOW_MAX_OVERSELL_SEATS,
+      departed: assessed.departed,
+    };
+  }
+
+  /**
+   * 恢复回程 · 执行：POST /orders/:id/restore-return-leg。
+   *
+   * 有座 → takeSeatWithinTx（CAS 防超售）；没座且 allowOversell → FOR UPDATE 后直加 sold
+   * （余位变负 = 超售，全站余位本来就不夹 0）；没座且未确认 → 409 让前端弹二次确认。
+   * 座位数照释放快照回填，放几座恢复几座。
+   */
+  async restoreReturnLeg(
+    orderId: string,
+    input: RestoreReturnLegBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{ order: ReturnType<typeof serializeOrder>; audit: RestoreReturnLegAudit }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可恢复回程');
+    }
+
+    const audit = await prisma.$transaction(async (tx) => {
+      const lockRows = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE
+      `;
+      if (lockRows.length === 0) throw new NotFoundError('订单不存在');
+
+      // ── 0. 幂等回放：同 token 已恢复过 → 原样回放，绝不二次占座 ──
+      const flightRows = await tx.orderItem.findMany({
+        where: { orderId, kind: OrderItemKind.FLIGHT },
+        select: { id: true, metadata: true },
+      });
+      const replayRow = flightRows.find(
+        (row) =>
+          readJsonObject(readJsonObject(row.metadata).returnRestored).requestToken ===
+          input.requestToken,
+      );
+      if (replayRow) {
+        const snap = readJsonObject(readJsonObject(replayRow.metadata).returnRestored);
+        const current = await tx.order.findUniqueOrThrow({
+          where: { id: orderId },
+          select: { orderNumber: true },
+        });
+        return {
+          orderNumber: current.orderNumber,
+          returnItemId: replayRow.id,
+          scheduleId: typeof snap.toScheduleId === 'string' ? snap.toScheduleId : '',
+          cabin: (typeof snap.cabin === 'string' ? snap.cabin : null) as CabinClass | null,
+          quantity: typeof snap.seats === 'number' ? snap.seats : 0,
+          oversold: snap.oversold === true,
+          oversoldBy: typeof snap.oversoldBy === 'number' ? snap.oversoldBy : 0,
+          replayed: true,
+        } satisfies RestoreReturnLegAudit;
+      }
+
+      // ── 1. 重跑准入闸 ──
+      const assessed = await this._assessRestoreReturnLeg(tx, orderId);
+      const item = assessed.releasedItem;
+      const scheduleId = assessed.scheduleId;
+      if (assessed.blockers.length > 0 || !item || !scheduleId) {
+        throw new BadRequestError(assessed.blockers.join('；') || '本单没有可恢复的回程航段。');
+      }
+
+      // ── 2. 没座必须先确认超售（稳定 code，前端据此弹二次确认，不靠中文文案匹配）──
+      if (assessed.oversellBy > 0 && input.allowOversell !== true) {
+        throw new AppError(
+          `原班次余位不足：还差 ${assessed.oversellBy} 座。确认超售后可继续恢复。`,
+          {
+            statusCode: 409,
+            code: 'OVERSELL_CONFIRMATION_REQUIRED',
+            details: { available: assessed.available, oversellBy: assessed.oversellBy },
+          },
+        );
+      }
+
+      // ── 3. 占座：够就走 CAS，短的那一舱直加（已确认超售）──
+      for (const need of assessed.seatNeeds) {
+        if (need.available >= need.quantity) {
+          await takeSeatWithinTx(tx, scheduleId, need.cabin, need.quantity, null);
+        } else {
+          await oversellSeatWithinTx(tx, scheduleId, need.cabin, need.quantity);
+        }
+      }
+      const totalSeats = assessed.seatNeeds.reduce((n, s) => n + s.quantity, 0);
+
+      const now = new Date();
+      const note = input.note?.trim() || null;
+
+      // ── 4. 回程行写回班次 + 去掉释放前缀 + 落 returnRestored 快照 ────────────
+      // returnReleased **保留不删**：释放→恢复可以反复发生，历史全留着才查得清。
+      const meta = readJsonObject(item.metadata);
+      const restoredSnapshot = {
+        at: now.toISOString(),
+        byUserId: actor.userId,
+        requestToken: input.requestToken,
+        toScheduleId: scheduleId,
+        cabin: item.flightCabin,
+        seats: totalSeats,
+        seatDetail: assessed.seatNeeds.map((s) => ({ cabin: s.cabin, quantity: s.quantity })),
+        oversold: assessed.oversellBy > 0,
+        oversoldBy: assessed.oversellBy,
+        note,
+      };
+      await tx.orderItem.update({
+        where: { id: item.id },
+        data: {
+          description: item.description.startsWith(RETURN_RELEASED_PREFIX)
+            ? item.description.slice(RETURN_RELEASED_PREFIX.length)
+            : item.description,
+          flightScheduleId: scheduleId,
+          metadata: { ...meta, returnRestored: restoredSnapshot } as Prisma.InputJsonValue,
+        },
+      });
+
+      // ── 5. 出票任务复活：之前被关掉的重开为 PENDING；一条都没有才新建 ──────────
+      // createTasksForOrder 见「已有任何任务就跳过」，CANCELLED 也算已有 → 不能靠它复活。
+      const reopened = await tx.fulfillmentTask.updateMany({
+        where: {
+          orderItemId: item.id,
+          type: FulfillmentType.FLIGHT_TICKETING,
+          status: FulfillmentStatus.CANCELLED,
+        },
+        data: { status: FulfillmentStatus.PENDING, completedAt: null },
+      });
+      if (reopened.count === 0) {
+        const existing = await tx.fulfillmentTask.count({
+          where: { orderItemId: item.id, type: FulfillmentType.FLIGHT_TICKETING },
+        });
+        if (existing === 0) {
+          await tx.fulfillmentTask.create({
+            data: {
+              orderItemId: item.id,
+              type: FulfillmentType.FLIGHT_TICKETING,
+              status: FulfillmentStatus.PENDING,
+            },
+          });
+        }
+      }
+
+      // ── 6. 释放时已出票（派过撤名单工单）→ 再派一条「重新上名单」工单 ──────────
+      const ticketedAtRelease = Number(assessed.snapshot?.ticketedAtRelease ?? 0);
+      if (ticketedAtRelease > 0) {
+        await createTicketWorkOrder(tx, {
+          orderId,
+          createdById: actor.userId,
+          ruleKey: `NOSHOW_RELIST:${item.id}:${input.requestToken}`,
+          title: buildTicketWorkOrderTitle('重新上名单', assessed.order.orderNumber, '回程', item),
+          body:
+            `订单 ${assessed.order.orderNumber} 的回程已恢复到原班次` +
+            `（${totalSeats} 座${assessed.oversellBy > 0 ? `，其中 ${assessed.oversellBy} 座为超售` : ''}）。` +
+            '此前因 no-show 释放时曾派过撤名单/退票工单，请核对该段名单与票的最新状态，' +
+            '需要重新上名单/重新出票的请一并处理。' +
+            (note ? `\n操作备注：${note}` : ''),
+          at: now,
+        });
+      }
+
+      // ── 7. 物化列同步 + 留痕流水（金额恒 0）──
+      await syncOrderHasReturnLeg(tx, orderId);
+      const log = appendAdjustment(assessed.order.adjustments, {
+        type: 'RETURN_LEG_RESTORED',
+        label:
+          `回程恢复到原班次（${totalSeats} 座` +
+          `${assessed.oversellBy > 0 ? `，超售 ${assessed.oversellBy} 座` : ''}，钱款不动）`,
+        amountCny: 0,
+        at: now.toISOString(),
+        by: actor.userId,
+        note: note ?? undefined,
+      });
+      await tx.order.update({ where: { id: orderId }, data: { adjustments: log } });
+
+      return {
+        orderNumber: assessed.order.orderNumber,
+        returnItemId: item.id,
+        scheduleId,
+        cabin: item.flightCabin,
+        quantity: totalSeats,
+        oversold: assessed.oversellBy > 0,
+        oversoldBy: assessed.oversellBy,
+        replayed: false,
+      } satisfies RestoreReturnLegAudit;
+    });
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+    return { order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)), audit };
   }
 }
 
@@ -13576,7 +14513,10 @@ async function loadOrderForLegCancel(db: Prisma.TransactionClient, orderId: stri
           },
         },
       },
-      passengers: { select: { pnr: true, eticketNumber: true } },
+      // id/姓名供 no-show 预检回乘客名单；pnr/票号留给其它读者（取消航段闸 8 已不再用整单级票号）。
+      passengers: {
+        select: { id: true, fullName: true, chineseName: true, pnr: true, eticketNumber: true },
+      },
     },
   });
 }
@@ -13612,6 +14552,13 @@ export interface CancelLegPreview {
   eligible: boolean;
   /** 全部不满足的闸（人话逐条），空数组 = 可取消。 */
   blockers: string[];
+  /**
+   * 非阻断提示（不影响 eligible）。目前只有一条：本段已出票 —— 取消照做，
+   * 但系统会给票务派撤名单/退票工单，需运营先确认已知悉。
+   */
+  warnings: string[];
+  /** = warnings.length > 0：前端据此弹二次确认，确认后提交带 acknowledgeWarnings=true。 */
+  requiresAcknowledgement: boolean;
   /** 待取消的那一段航段行（字段名沿用 returnItem，去程/回程共用；方向看上面的 leg）。 */
   returnItem: CancelLegItemView | null;
   policyFee: LegCancelPolicyFee | null;
@@ -13632,6 +14579,8 @@ export interface CancelLegAudit {
   returnItemId: string;
   /** 生成的手续费调价行 id；手续费为 0 或幂等回放时为 null。 */
   feeItemId: string | null;
+  /** 本段已出票时给票务派的「撤名单/退票」工单 id；未出票为 null。 */
+  workOrderReminderId: string | null;
   releasedSeats: Array<{ scheduleId: string; cabin: CabinClass; quantity: number }>;
   originalAmountCny: number;
   feeCny: number;
@@ -13643,6 +14592,234 @@ export interface CancelLegAudit {
   overpayAfterCny: number;
   /** true = 同 requestToken 重试，本次没有任何写入（座位不会被二次释放）。 */
   replayed: boolean;
+}
+
+// ── 去程 no-show / 回程释放 · 恢复：常量 + 辅助 + 对外契约类型 ─────────────────
+
+/** 被标记 no-show 的去程行、被释放的回程行在描述前打的留痕前缀（幂等：已带前缀不叠加）。 */
+const NO_SHOW_PREFIX = '[去程 no-show] ';
+const RETURN_RELEASED_PREFIX = '[回程已释放] ';
+
+/**
+ * 释放/恢复的座位明细（放几座恢复几座的唯一依据）。
+ * 写成 type 而非 interface：它要作为 metadata 快照的一部分赋给 Prisma.InputJsonValue，
+ * 只有类型别名才拿得到隐式索引签名（interface 拿不到，会编译不过）。
+ */
+export type ReleasedSeatEntry = {
+  scheduleId: string;
+  cabin: CabinClass;
+  quantity: number;
+};
+
+/**
+ * 回程行 metadata.returnReleased 的快照形状（防御式读，字段都可能缺）。
+ * `returnVoidedFinal` 由「回程起飞后自动作废」的后续 job 补写在**同级 metadata** 上，
+ * 恢复端点见到即拒绝 —— 本版不实现那个 job，但结构位置先钉死，届时零迁移接入。
+ */
+export interface ReturnReleasedSnapshot {
+  at?: string;
+  byUserId?: string;
+  requestToken?: string;
+  reason?: string;
+  originalDescription?: string;
+  originalScheduleId?: string | null;
+  originalCabin?: CabinClass | null;
+  releasedSeats?: ReleasedSeatEntry[];
+  ticketedAtRelease?: number;
+  workOrderReminderId?: string | null;
+  note?: string | null;
+}
+
+/** 本次 no-show 的作用范围：整单 / 需要先按人拆单。 */
+export type NoShowScope = 'WHOLE' | 'SPLIT_REQUIRED';
+
+/** 航段行 → no-show 预检用的可读快照（**不含金额**：本操作与钱无关）。 */
+export interface NoShowLegView {
+  orderItemId: string;
+  description: string;
+  flightNumber: string | null;
+  /** 出发地当地日 YYYY-MM-DD（按班次 departureTz 折算）。 */
+  departDate: string | null;
+  cabin: CabinClass | null;
+  quantity: number;
+}
+
+/** POST /orders/:id/no-show/preview 的响应契约。 */
+export interface NoShowPreview {
+  eligible: boolean;
+  /** 全部不满足的闸（人话逐条），空数组 = 可标记。 */
+  blockers: string[];
+  /** 非阻断提示（已出票 / 已开票 / 需拆单 / 单程单等），不影响 eligible。 */
+  warnings: string[];
+  scope: NoShowScope;
+  outboundItem: NoShowLegView | null;
+  /** 单程单为 null；ticketed=true 表示该段有确认出票记录，释放后会派撤名单/退票工单。 */
+  returnItem: (NoShowLegView & { ticketed: boolean }) | null;
+  passengers: Array<{ id: string; fullName: string; chineseName: string | null }>;
+  alreadyNoShow: boolean;
+}
+
+/** POST /orders/:id/no-show 的审计明细（路由据此记 MARK_NO_SHOW）。 */
+export interface NoShowAudit {
+  /** 实际被操作的那张单的单号（拆过则是新单号）。 */
+  orderNumber: string;
+  outboundItemId: string;
+  /** 释放掉的回程行 id；未释放 / 单程单为 null。 */
+  returnItemId: string | null;
+  releasedSeats: ReleasedSeatEntry[];
+  /** 回程已出票时给票务派的「撤名单/退票」工单 id。 */
+  workOrderReminderId: string | null;
+  /** 走了拆单时的两侧单号；整单标记为 null。 */
+  split: { sourceOrderNumber: string; targetOrderNumber: string } | null;
+  /** true = 同 requestToken 重试，本次没有任何写入（座位不会被二次释放）。 */
+  replayed: boolean;
+}
+
+/** POST /orders/:id/restore-return-leg/preview 的响应契约。 */
+export interface RestoreReturnLegPreview {
+  eligible: boolean;
+  blockers: string[];
+  original: {
+    orderItemId: string;
+    flightNumber: string | null;
+    departDate: string | null;
+    cabin: CabinClass | null;
+    quantity: number;
+    scheduleId: string;
+  } | null;
+  /** 原班次该舱当前余位（capacity − sold − 他人锁位 − 占位余座）。**可为负**（全站余位不夹 0）。 */
+  available: number;
+  needsOversell: boolean;
+  /** 逐舱位缺口合计 = 本次要超售的座数。 */
+  oversellBy: number;
+  maxOversell: number;
+  /** 原班次已起飞（同时会有一条 blocker）。 */
+  departed: boolean;
+}
+
+/** POST /orders/:id/restore-return-leg 的审计明细。 */
+export interface RestoreReturnLegAudit {
+  orderNumber: string;
+  returnItemId: string;
+  scheduleId: string;
+  cabin: CabinClass | null;
+  /** 本次恢复的总座数（升舱拆座时是各舱之和；逐舱明细在 metadata.returnRestored.seatDetail）。 */
+  quantity: number;
+  oversold: boolean;
+  oversoldBy: number;
+  replayed: boolean;
+}
+
+/**
+ * 某班次某舱位的当前余位；该舱位没有配置时返回 null（调用方据此给 blocker）。
+ * 口径与 takeSeatWithinTx 的 CAS 条件逐项对齐：capacity − sold − 他人 ACTIVE 锁位 − 占位余座。
+ * **不夹 0** —— 已超售的班次要如实返回负数，否则前端会以为还有位。
+ */
+async function cabinAvailabilityWithinTx(
+  db: Prisma.TransactionClient,
+  scheduleId: string,
+  cabin: CabinClass,
+): Promise<number | null> {
+  const sc = await db.flightSeatClass.findFirst({
+    where: { scheduleId, cabin },
+    select: { capacity: true, sold: true },
+  });
+  if (!sc) return null;
+  const lockedAgg = await db.seatLock.aggregate({
+    _sum: { qty: true },
+    where: {
+      seatClass: { scheduleId, cabin },
+      status: SeatLockStatus.ACTIVE,
+      expiresAt: { gt: new Date() },
+    },
+  });
+  const held = await heldSeatsForCabin(db, scheduleId, cabin);
+  return sc.capacity - sc.sold - (lockedAgg._sum.qty ?? 0) - held;
+}
+
+/**
+ * 超售式占座：先 FOR UPDATE 拿行锁，再无条件 `sold += qty`（**不带余位条件**）。
+ *
+ * 只在「no-show 释放过的回程要恢复、原班次已卖光、运营显式确认超售」这一条路径上使用。
+ * 与 takeSeatWithinTx 的区别就是没有 CAS 条件 —— 所以调用方必须已经：
+ *   1) 校验过缺口 ≤ FLIGHT_NOSHOW_MAX_OVERSELL_SEATS；
+ *   2) 拿到运营的 allowOversell 确认；
+ *   3) 准备好记 CRITICAL 审计。
+ * 三条缺一不可，别把它当成普通占座入口复用。
+ */
+async function oversellSeatWithinTx(
+  tx: Prisma.TransactionClient,
+  scheduleId: string,
+  cabin: CabinClass,
+  qty: number,
+): Promise<void> {
+  if (qty <= 0) return;
+  if (typeof tx.$queryRaw === 'function') {
+    await tx.$queryRaw`
+      SELECT id FROM "FlightSeatClass"
+      WHERE "scheduleId" = ${scheduleId} AND cabin = ${cabin}::"CabinClass"
+      FOR UPDATE
+    `;
+  }
+  const affected = await tx.$executeRaw`
+    UPDATE "FlightSeatClass"
+    SET sold = sold + ${qty}, "updatedAt" = NOW()
+    WHERE "scheduleId" = ${scheduleId} AND cabin = ${cabin}::"CabinClass"
+  `;
+  if (affected !== 1) {
+    throw new ConflictError(`原班次的 ${cabin} 舱位不存在，无法恢复回程座位。`);
+  }
+}
+
+/** 工单标题：「撤名单/退票：单号 · 回程 QH9588 2026-09-10 · 2 人」。 */
+function buildTicketWorkOrderTitle(
+  action: string,
+  orderNumber: string,
+  legZh: string,
+  item: CancelLegItemSnapshot,
+): string {
+  const sched = item.flightSchedule;
+  const flightNo = sched?.flight?.flightNumber ?? '航班未知';
+  const day = sched?.departureTime ? localDateISO(sched.departureTime, sched.departureTz) : '日期未知';
+  return `${action}：${orderNumber} · ${legZh} ${flightNo} ${day} · ${item.quantity} 人`;
+}
+
+/**
+ * 在**当前事务内**给票务派一条待办工单（复用既有 OperationalReminder 表，零迁移）。
+ *
+ * 幂等靠 ruleKey 唯一索引：先查后建（订单行已被 FOR UPDATE 锁住，同单不会并发到这里）。
+ * 不用 create+catch(P2002)：Postgres 里语句失败会废掉整个事务，业务写入会被一并回滚。
+ */
+async function createTicketWorkOrder(
+  tx: Prisma.TransactionClient,
+  input: {
+    orderId: string;
+    createdById: string;
+    ruleKey: string;
+    title: string;
+    body: string;
+    at: Date;
+  },
+): Promise<string | null> {
+  const existing = await tx.operationalReminder.findUnique({
+    where: { ruleKey: input.ruleKey },
+    select: { id: true },
+  });
+  if (existing) return existing.id;
+  // dueAt 是 @db.Date：按业务日（上海）取当天零点 UTC，与提醒引擎落库口径一致。
+  const created = await tx.operationalReminder.create({
+    data: {
+      orderId: input.orderId,
+      createdById: input.createdById,
+      title: input.title,
+      body: input.body,
+      dueAt: new Date(`${businessDateISO(input.at)}T00:00:00Z`),
+      priority: ReminderPriority.HIGH,
+      ruleKey: input.ruleKey,
+    },
+    select: { id: true },
+  });
+  return created.id;
 }
 
 /** 老名字的兼容别名（老路径 /cancel-return-leg 的调用方仍按这些名字引用）。 */

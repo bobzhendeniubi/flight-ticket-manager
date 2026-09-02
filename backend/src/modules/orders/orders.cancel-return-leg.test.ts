@@ -302,7 +302,9 @@ describe('取消回程 · 准入闸', () => {
     expect(preview.blockers.join('')).toContain('票务台');
   });
 
-  it('乘客已有票号 → 拒绝，指向改签/退票流程', async () => {
+  // 闸 8 修复：整单级的「乘客有 PNR/票号」不再参与判定 —— 那是订单维度的，
+  // 去程出了票会把回程一并判成已出票，回程明明一张票都没开也被挡住。
+  it('乘客有票号但回程没有确认出票记录 → 不再挡取消回程', async () => {
     mountPreview(
       orderSnapshot({
         passengers: [
@@ -312,16 +314,20 @@ describe('取消回程 · 准入闸', () => {
       }),
     );
     const preview = await service.previewCancelReturnLeg('ord-1', ADMIN);
-    expect(preview.eligible).toBe(false);
-    expect(preview.blockers.join('')).toContain('已出票');
+    expect(preview.eligible).toBe(true);
+    expect(preview.warnings).toEqual([]);
+    expect(preview.requiresAcknowledgement).toBe(false);
   });
 
-  it('回程有确认出票任务 → 拒绝（即便乘客还没回填票号）', async () => {
+  it('回程有确认出票任务 → 不再拒绝，改为 warning + 需二次确认', async () => {
     mountPreview();
-    mockPrisma.fulfillmentTask.count.mockResolvedValue(1);
+    mockPrisma.fulfillmentTask.count.mockResolvedValue(2);
     const preview = await service.previewCancelReturnLeg('ord-1', ADMIN);
-    expect(preview.eligible).toBe(false);
-    expect(preview.blockers.join('')).toContain('已出票');
+    expect(preview.eligible).toBe(true);
+    expect(preview.blockers).toEqual([]);
+    expect(preview.requiresAcknowledgement).toBe(true);
+    expect(preview.warnings.join('')).toContain('回程已出票（2 人有确认出票记录）');
+    expect(preview.warnings.join('')).toContain('撤名单/退票工单');
   });
 
   it('结算价锁 / 收款复核锁 → 两条闸各自成条列出（不是命中一条就停）', async () => {
@@ -655,15 +661,16 @@ describe('取消去程 · 准入闸', () => {
     expect(preview.eligible).toBe(true);
   });
 
-  it('去程有确认出票任务 → 拒绝，指向改签/退票流程', async () => {
+  it('去程有确认出票任务 → 不再拒绝，改为 warning + 需二次确认', async () => {
     mountPreview(orderSnapshot(), 'leg-out');
     mockPrisma.fulfillmentTask.count.mockResolvedValue(1);
     const preview = await service.previewCancelLeg('ord-1', 'OUTBOUND', ADMIN);
-    expect(preview.eligible).toBe(false);
-    expect(preview.blockers.join('')).toContain('去程已出票');
+    expect(preview.eligible).toBe(true);
+    expect(preview.requiresAcknowledgement).toBe(true);
+    expect(preview.warnings.join('')).toContain('去程已出票（1 人有确认出票记录）');
   });
 
-  it('乘客已有票号 → 拒绝', async () => {
+  it('乘客有票号但本段没有确认出票记录 → 不产生任何闸或提示', async () => {
     mountPreview(
       orderSnapshot({
         passengers: [
@@ -674,7 +681,8 @@ describe('取消去程 · 准入闸', () => {
       'leg-out',
     );
     const preview = await service.previewCancelLeg('ord-1', 'OUTBOUND', ADMIN);
-    expect(preview.blockers.join('')).toContain('去程已出票');
+    expect(preview.eligible).toBe(true);
+    expect(preview.warnings).toEqual([]);
   });
 
   it('单程单取消去程 → 拒绝：取消唯一一段等于取消整单', async () => {

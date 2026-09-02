@@ -36,6 +36,11 @@ const ORDER_ACTION_LABELS: Record<string, string> = {
   REQUEST_CANCELLATION: '申请取消订单',
   REQUEST_CHANGE: '申请改签',
   RESCHEDULE_ORDER_ITEM: '改期航班',
+  MARK_NO_SHOW: '标记去程 no-show',
+  RESTORE_RETURN_LEG: '恢复回程',
+  RESTORE_RETURN_LEG_OVERSOLD: '恢复回程（超售放行）',
+  CANCEL_RETURN_LEG: '取消回程',
+  CANCEL_OUTBOUND_LEG: '取消去程',
   // ── 乘客 / 酒店 / 分房 ──
   SWAP_ORDER_PASSENGER: '换人',
   SWAP_ORDER_ITEM_HOTEL: '更换酒店',

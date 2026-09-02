@@ -8,6 +8,7 @@
  */
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { localDateISO } from '../../lib/flight-time.js';
+import { env } from '../../config/env.js';
 import { z } from 'zod';
 import { OrderItemKind, Prisma, UserRole, type Passenger } from '@prisma/client';
 import {
@@ -52,6 +53,9 @@ import {
   splitOrderPreviewBodySchema,
   cancelLegBodySchema,
   cancelLegPreviewBodySchema,
+  noShowBodySchema,
+  noShowPreviewBodySchema,
+  restoreReturnLegBodySchema,
   splitRoomGroupBodySchema,
   swapRefundBodySchema,
   updateSwapReplacementOrderBodySchema,
@@ -2498,6 +2502,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           overrideReason: body.overrideReason ?? null,
           note: body.note ?? null,
           releasedSeats: audit.releasedSeats,
+          // 已出票的段被取消 → 同事务给票务派了撤名单/退票工单，id 进审计便于追踪跟进。
+          workOrderReminderId: audit.workOrderReminderId,
+          acknowledgedWarnings: body.acknowledgeWarnings === true,
           netReductionCny: audit.netReductionCny,
           totalCny: audit.totalAfter,
           overpayAfterCny: audit.overpayAfterCny,
@@ -2512,6 +2519,125 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
 
   app.post('/:id/cancel-leg', { preHandler: [app.authenticate] }, cancelLegHandler());
   app.post('/:id/cancel-return-leg', { preHandler: [app.authenticate] }, cancelLegHandler('RETURN'));
+
+  // ── 去程 no-show + 回程释放 / 恢复（ADMIN/STAFF）────────────────────────────
+  // 航司每天发 no-show 名单：客人没登机 → 去程标 no-show（钱不动不退、成本不动）、
+  // 回程座位释放回库存继续卖（钱同样不动）。之后代理来说要保留 → 恢复回程到原班次，
+  // 有座直接占、没座允许超售（前端二次确认 + CRITICAL 审计）。
+  //
+  // ⚠ 与「取消航段」是两件事：取消回程 = 客人主动退、按政策退钱；
+  //    no-show 释放 = 公司放座重卖、一分钱不动。前端两个入口别合并。
+  //
+  // POST /orders/:id/no-show/preview  body: { passengerIds? }
+  app.post('/:id/no-show/preview', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可标记 no-show' });
+    }
+    const { id } = req.params as { id: string };
+    const body = noShowPreviewBodySchema.parse(req.body ?? {});
+    return service.previewNoShow(id, body, { userId: req.user.sub, role });
+  });
+
+  // POST /orders/:id/no-show  body: { requestToken, passengerIds?, releaseReturn?, note? }
+  //   幂等：同 (订单, token) 重试只回放，座位绝不二次释放。
+  //   部分乘客 → 服务端先拆单再对新单标记；拆单被闸挡回 409 SPLIT_BLOCKED，
+  //   拆成了但标记失败回 409 SPLIT_DONE_NOSHOW_FAILED（details.newOrderId）。
+  app.post('/:id/no-show', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可标记 no-show' });
+    }
+    const { id } = req.params as { id: string };
+    const body = noShowBodySchema.parse(req.body);
+    const result = await service.markNoShow(id, body, { userId: req.user.sub, role });
+
+    // 幂等回放不再落审计：首刷已记过一条，重试再记一条会让审计里出现两次「释放回程」，
+    // 事后核对会以为放了两次座。
+    const seats = result.audit.releasedSeats.reduce((n, r) => n + r.quantity, 0);
+    if (!result.audit.replayed) void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'MARK_NO_SHOW',
+      targetType: 'ORDER',
+      targetId: result.targetOrderId,
+      targetLabel:
+        `${result.audit.orderNumber} · 去程 no-show · ` +
+        `${result.audit.returnItemId ? `释放回程 ${seats} 座` : '未释放回程'}` +
+        `${result.audit.split ? `（自 ${result.audit.split.sourceOrderNumber} 拆出）` : ''}`,
+      before: { sourceOrderNumber: result.audit.split?.sourceOrderNumber ?? null },
+      after: {
+        outboundItemId: result.audit.outboundItemId,
+        returnItemId: result.audit.returnItemId,
+        releasedSeats: result.audit.releasedSeats,
+        releaseReturn: body.releaseReturn,
+        passengerIds: body.passengerIds ?? null,
+        workOrderReminderId: result.audit.workOrderReminderId,
+        split: result.audit.split,
+        note: body.note ?? null,
+        replayed: result.audit.replayed,
+      },
+      severity: 'WARNING',
+    });
+
+    return { order: result.order, targetOrderId: result.targetOrderId, audit: result.audit };
+  });
+
+  // POST /orders/:id/restore-return-leg/preview
+  //   只读预检：能不能恢复、原班次还剩几座、要不要超售、超售上限多少。
+  app.post(
+    '/:id/restore-return-leg/preview',
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      const role = req.user.role;
+      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+        return reply.status(403).send({ error: '仅运营/管理员可恢复回程' });
+      }
+      const { id } = req.params as { id: string };
+      return service.previewRestoreReturnLeg(id, { userId: req.user.sub, role });
+    },
+  );
+
+  // POST /orders/:id/restore-return-leg  body: { requestToken, allowOversell?, note? }
+  //   余位不足且未确认 → 409 OVERSELL_CONFIRMATION_REQUIRED（details 带 available/oversellBy），
+  //   前端弹二次确认后带 allowOversell=true 重提。超售放行按最高等级留痕。
+  app.post('/:id/restore-return-leg', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可恢复回程' });
+    }
+    const { id } = req.params as { id: string };
+    const body = restoreReturnLegBodySchema.parse(req.body);
+    const { order, audit } = await service.restoreReturnLeg(id, body, {
+      userId: req.user.sub,
+      role,
+    });
+
+    if (!audit.replayed) void writeAudit({
+      actor: actorFromRequest(req),
+      action: audit.oversold ? 'RESTORE_RETURN_LEG_OVERSOLD' : 'RESTORE_RETURN_LEG',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: audit.oversold
+        ? `${audit.orderNumber} · 超售放行（班次 ${audit.scheduleId} 舱位 ${audit.cabin ?? '未知'} ` +
+          `超出 ${audit.oversoldBy} 座，上限 ${env.FLIGHT_NOSHOW_MAX_OVERSELL_SEATS}）`
+        : `${audit.orderNumber} · 恢复回程（${audit.quantity} 座）`,
+      after: {
+        returnItemId: audit.returnItemId,
+        scheduleId: audit.scheduleId,
+        cabin: audit.cabin,
+        quantity: audit.quantity,
+        oversold: audit.oversold,
+        oversoldBy: audit.oversoldBy,
+        maxOversell: env.FLIGHT_NOSHOW_MAX_OVERSELL_SEATS,
+        note: body.note ?? null,
+        replayed: audit.replayed,
+      },
+      // 超售 = 把班次卖到负余位，最需要事后复核 → CRITICAL；有座恢复记 WARNING。
+      severity: audit.oversold ? 'CRITICAL' : 'WARNING',
+    });
+
+    return { order, audit };
+  });
 
   // ── 按人改期（ADMIN/STAFF）────────────────────────────────────────────────
   // POST /orders/:id/reschedule-passengers

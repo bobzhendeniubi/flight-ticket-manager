@@ -3528,8 +3528,12 @@ export interface CancelLegPreview {
   /** 本次预检的航段方向 */
   leg: FlightLegSide;
   eligible: boolean;
-  /** 不合格原因（逐条），如「已出票」「已过起飞时间」等；eligible=false 时非空 */
+  /** 不合格原因（逐条），如「已过起飞时间」等；eligible=false 时非空 */
   blockers: string[];
+  /** 可以继续、但必须让运营先看见的风险提示（如「已出票，取消后需撤名单/退票」）。 */
+  warnings: string[];
+  /** true = 有 warnings，提交必须带 acknowledgeWarnings（否则后端 400 ACKNOWLEDGEMENT_REQUIRED）。 */
+  requiresAcknowledgement: boolean;
   /** 待取消的那一段航段行；字段名沿用 returnItem（去程/回程共用），方向看 leg。无该段时为 null */
   returnItem: {
     orderItemId: string;
@@ -3565,12 +3569,133 @@ export interface CancelLegResult {
     totalAfter: number;
     overpayAfterCny: number;
     releasedSeats: number;
+    /** 已出票航段被取消时后端派给票务的撤名单/退票工单 id；无需派单为 null。 */
+    workOrderReminderId: string | null;
   };
 }
 
 /** 老名字的兼容别名（取消回程是 leg='RETURN' 的特例）。 */
 export type CancelReturnLegPreview = CancelLegPreview;
 export type CancelReturnLegResult = CancelLegResult;
+
+/** 取消航段有 warnings 却没勾「已知悉」时后端拒绝的稳定 code（前端按 code 判，不匹配中文）。 */
+export const ACKNOWLEDGEMENT_REQUIRED_CODE = 'ACKNOWLEDGEMENT_REQUIRED';
+
+// ── no-show 处理 / 回程释放与恢复（ADMIN/STAFF）─────────────────────────────
+// 航司每天发 no-show 名单：没登机的客人，去程标 no-show（钱一分不动），回程座位
+// 释放回库存重新可卖（钱同样不动）。之后代理来说要保留，票务再把回程恢复到原班次，
+// 没余位时二次确认走超售。一单只有部分人 no-show 时后端会先拆单、再对拆出的新单处理。
+
+/** no-show 预检里的航段行（去程/回程共用的最小展示字段）。 */
+export interface NoShowLegItem {
+  orderItemId: string;
+  description: string;
+  flightNumber: string | null;
+  departDate: string | null;
+  cabin: CabinClass | null;
+  quantity: number;
+}
+
+/** 回程行比去程多一个「是否已出票」（已出票释放要给票务派撤名单工单）。 */
+export interface NoShowReturnItem extends NoShowLegItem {
+  ticketed: boolean;
+}
+
+export interface NoShowPreview {
+  eligible: boolean;
+  /** 不合格原因（逐条）；eligible=false 时非空 */
+  blockers: string[];
+  /** 可以继续但要先看见的提示（如回程已出票） */
+  warnings: string[];
+  /** WHOLE = 整单处理；SPLIT_REQUIRED = 只勾了部分人，后端会先拆单再对新单处理 */
+  scope: 'WHOLE' | 'SPLIT_REQUIRED';
+  outboundItem: NoShowLegItem | null;
+  returnItem: NoShowReturnItem | null;
+  passengers: Array<{ id: string; fullName: string; chineseName: string | null }>;
+  /** true = 本单去程已经标过 no-show（不再重复处理） */
+  alreadyNoShow: boolean;
+}
+
+export interface NoShowResult {
+  order: OrderSummary;
+  /** 实际被处理的订单 id：整单处理=本单；部分人处理=后端拆出的新单 */
+  targetOrderId: string;
+  audit: {
+    outboundItemId: string;
+    returnItemId: string | null;
+    releasedSeats: Array<{ scheduleId: string; cabin: string; quantity: number }>;
+    /** 回程已出票时派给票务的撤名单工单 id；未派单为 null */
+    workOrderReminderId: string | null;
+    split: { sourceOrderNumber: string; targetOrderNumber: string } | null;
+    /** true = 同 requestToken 幂等回放（本次没有新写入） */
+    replayed: boolean;
+  };
+}
+
+/** no-show 需要拆单、但本单拆不了（如套餐单）时后端拒绝的稳定 code，details.blockers 是逐条原因。 */
+export const SPLIT_BLOCKED_CODE = 'SPLIT_BLOCKED';
+
+/** 从 SPLIT_BLOCKED 错误里取逐条阻断原因；非该错误 / 结构异常 → []。 */
+export function splitBlockedReasons(err: unknown): string[] {
+  if (!(err instanceof ApiError) || err.code !== SPLIT_BLOCKED_CODE) return [];
+  const d = err.details;
+  if (!d || typeof d !== 'object') return [];
+  const blockers = (d as { blockers?: unknown }).blockers;
+  if (!Array.isArray(blockers)) return [];
+  return blockers.filter((b): b is string => typeof b === 'string');
+}
+
+/** 「已拆单但 no-show 处理未成功」的稳定 code：新单已经拆出来了，去新单上重试。 */
+export const SPLIT_DONE_NOSHOW_FAILED_CODE = 'SPLIT_DONE_NOSHOW_FAILED';
+
+/** 从 SPLIT_DONE_NOSHOW_FAILED 错误里取已拆出的新单 id；非该情形 → null。 */
+export function splitDoneNoShowFailedOrderId(err: unknown): string | null {
+  if (!(err instanceof ApiError) || err.code !== SPLIT_DONE_NOSHOW_FAILED_CODE) return null;
+  const d = err.details;
+  if (!d || typeof d !== 'object') return null;
+  const id = (d as { newOrderId?: unknown }).newOrderId;
+  return typeof id === 'string' ? id : null;
+}
+
+export interface RestoreReturnLegPreview {
+  eligible: boolean;
+  blockers: string[];
+  /** 释放前的原班次快照（恢复就是恢复到这一班）；取不到为 null */
+  original: {
+    orderItemId: string;
+    flightNumber: string | null;
+    departDate: string | null;
+    cabin: CabinClass | null;
+    quantity: number;
+    scheduleId: string;
+  } | null;
+  /** 原班次该舱位当前余位 */
+  available: number;
+  /** true = 余位不够，恢复要走超售确认 */
+  needsOversell: boolean;
+  /** 需要超售的座位数（needsOversell=false 时为 0） */
+  oversellBy: number;
+  /** 系统允许的超售上限（超过它后端也会拒） */
+  maxOversell: number;
+  /** true = 原班次已起飞（不可恢复） */
+  departed: boolean;
+}
+
+export interface RestoreReturnLegResult {
+  order: OrderSummary;
+  audit: {
+    returnItemId: string;
+    scheduleId: string;
+    cabin: string;
+    quantity: number;
+    oversold: boolean;
+    oversoldBy: number;
+    replayed: boolean;
+  };
+}
+
+/** 恢复回程需要超售、但没带 allowOversell 时后端拒绝的稳定 code（details: {available, oversellBy}）。 */
+export const OVERSELL_CONFIRMATION_REQUIRED_CODE = 'OVERSELL_CONFIRMATION_REQUIRED';
 
 export const api = {
   login: (email: string, password: string) =>
@@ -4529,9 +4654,57 @@ export const api = {
       manualFeeCny?: number;
       overrideReason?: string;
       note?: string;
+      /** 预检有 warnings 时必填 true（运营已勾「已知悉」），否则后端 400 ACKNOWLEDGEMENT_REQUIRED */
+      acknowledgeWarnings?: boolean;
     },
   ) =>
     apiFetch<CancelLegResult>(`/orders/${orderId}/cancel-leg`, {
+      method: 'POST',
+      token,
+      body,
+    }),
+  // no-show 预检：只读。不传 passengerIds = 整单；传部分人 = scope 回 SPLIT_REQUIRED
+  // （提交时后端先拆单、再对拆出的新单处理）。
+  previewNoShow: (token: string, orderId: string, passengerIds?: string[]) =>
+    apiFetch<NoShowPreview>(`/orders/${orderId}/no-show/preview`, {
+      method: 'POST',
+      token,
+      body: passengerIds && passengerIds.length > 0 ? { passengerIds } : {},
+    }),
+  // no-show 提交：去程标 no-show（钱不动），releaseReturn（默认 true）时回程座位放回库存
+  // 重新可卖（钱同样不动）。requestToken 幂等键（同一次表单提交内复用）。
+  // 失败可能是 409 SPLIT_BLOCKED（本单拆不了，details.blockers）或
+  // 409 SPLIT_DONE_NOSHOW_FAILED（已拆出新单但处理未成功，details.newOrderId）。
+  markNoShow: (
+    token: string,
+    orderId: string,
+    body: {
+      requestToken: string;
+      passengerIds?: string[];
+      releaseReturn?: boolean;
+      note?: string;
+    },
+  ) =>
+    apiFetch<NoShowResult>(`/orders/${orderId}/no-show`, {
+      method: 'POST',
+      token,
+      body,
+    }),
+  // 恢复回程预检：只读。给出释放前的原班次 + 当前余位；余位不够时 needsOversell=true。
+  previewRestoreReturnLeg: (token: string, orderId: string) =>
+    apiFetch<RestoreReturnLegPreview>(`/orders/${orderId}/restore-return-leg/preview`, {
+      method: 'POST',
+      token,
+      body: {},
+    }),
+  // 恢复回程提交：把释放掉的回程座位重新占回原班次。余位不足时须带 allowOversell:true
+  // （否则后端 409 OVERSELL_CONFIRMATION_REQUIRED），超售会记关键审计。
+  restoreReturnLeg: (
+    token: string,
+    orderId: string,
+    body: { requestToken: string; allowOversell?: boolean; note?: string },
+  ) =>
+    apiFetch<RestoreReturnLegResult>(`/orders/${orderId}/restore-return-leg`, {
       method: 'POST',
       token,
       body,
