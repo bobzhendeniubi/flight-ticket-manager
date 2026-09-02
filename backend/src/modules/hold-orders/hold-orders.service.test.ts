@@ -60,8 +60,8 @@ function hold(overrides: Record<string, unknown> = {}) {
     createdAt: new Date(),
     updatedAt: new Date(),
     installments: [
-      { id: 'i1', seq: 1, label: '定金', amountRule: HoldAmountRule.PER_PERSON_FIXED, perPersonCny: 300, amountCny: 6000, seatsBasis: 20, status: HoldInstallmentStatus.PENDING, paidAt: null, dueDate: new Date('2026-09-01T00:00:00Z'), allocations: [] },
-      { id: 'i2', seq: 2, label: '尾款', amountRule: HoldAmountRule.REMAINDER, perPersonCny: null, amountCny: 18000, seatsBasis: 20, status: HoldInstallmentStatus.PENDING, paidAt: null, dueDate: new Date('2026-09-10T00:00:00Z'), allocations: [] },
+      { id: 'i1', seq: 1, label: '定金', amountRule: HoldAmountRule.PER_PERSON_FIXED, perPersonCny: 300, amountCny: 6000, seatsBasis: 20, status: HoldInstallmentStatus.PENDING, paidAt: null, dueDate: new Date('2027-09-01T00:00:00Z'), allocations: [] },
+      { id: 'i2', seq: 2, label: '尾款', amountRule: HoldAmountRule.REMAINDER, perPersonCny: null, amountCny: 18000, seatsBasis: 20, status: HoldInstallmentStatus.PENDING, paidAt: null, dueDate: new Date('2027-09-10T00:00:00Z'), allocations: [] },
     ],
     reductions: [],
     flightSchedule: { id: 'schedule_1', departureTime: new Date('2026-09-20T00:00:00Z'), departureTz: 'UTC', flight: { flightNumber: 'CA1' } },
@@ -199,12 +199,12 @@ describe('HoldOrderService actions', () => {
           {
             id: 'i1', seq: 1, label: '定金', amountRule: HoldAmountRule.PER_PERSON_FIXED, perPersonCny: 300,
             amountCny: 6000, seatsBasis: 20, status: HoldInstallmentStatus.PAID, paidAt: new Date(),
-            dueDate: new Date('2026-09-01T00:00:00Z'), allocations: [{ amountCny: 6000, reversedAt: null }],
+            dueDate: new Date('2027-09-01T00:00:00Z'), allocations: [{ amountCny: 6000, reversedAt: null }],
           },
           {
             id: 'i2', seq: 2, label: '尾款', amountRule: HoldAmountRule.REMAINDER, perPersonCny: null,
             amountCny: 18000, seatsBasis: 20, status: HoldInstallmentStatus.PENDING, paidAt: null,
-            dueDate: new Date('2026-09-10T00:00:00Z'), allocations: [],
+            dueDate: new Date('2027-09-10T00:00:00Z'), allocations: [],
           },
         ],
       }),
@@ -222,7 +222,7 @@ describe('HoldOrderService actions', () => {
           {
             id: 'i1', seq: 1, label: '定金', amountRule: HoldAmountRule.PER_PERSON_FIXED, perPersonCny: 300,
             amountCny: 6000, seatsBasis: 20, status: HoldInstallmentStatus.PAID, paidAt: new Date(),
-            dueDate: new Date('2026-09-01T00:00:00Z'), allocations: [{ amountCny: 6000, reversedAt: null }],
+            dueDate: new Date('2027-09-01T00:00:00Z'), allocations: [{ amountCny: 6000, reversedAt: null }],
           },
         ],
       }),
