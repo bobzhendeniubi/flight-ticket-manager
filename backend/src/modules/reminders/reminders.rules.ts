@@ -8,6 +8,7 @@
  *   4. VISA_MISSING     签证缺件：在办签证任务下有乘客缺护照照片（排除自备签乘客，见下）
  *   5. HOLD_INSTALLMENT_DUE 占位单收款期：截止前三天提醒，逾期标红
  *   10. RANDOM_TIER_SHORTFALL 随机档缺口：未来 7 天需向地接加房
+ *   11. NO_SHOW_RETURN_RELEASED 回程已释放待跟进：去程 no-show 后回程座位已放回库存，待确认是否恢复
  *
  * 各规则与「自备签证」（Passenger.visaExempt=true：客人自行办妥签证，无需送签）的口径：
  *   - 规则 4 签证缺件：按签证台同口径排除自备签乘客（visaExempt=true）——客人自备签证
@@ -45,6 +46,7 @@ import {
   getRandomTierShortfall,
   type RandomTierShortfallReport,
 } from '../hotel-control/hotel-control.shortfall.js';
+import { isReturnCurrentlyReleased } from '../orders/orders.leg-status.js';
 
 // ── 状态集合 ────────────────────────────────────────────────────────────────
 /** 催尾款：待付 + 已付未完结（这些状态还会收钱） */
@@ -67,6 +69,19 @@ const PASSPORT_ACTIVE_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
   ...DEPARTURE_SOON_STATUSES,
 ];
+/**
+ * 规则 11 回程已释放：去程飞过之后订单常常已经 COMPLETED，不能沿用 SCAN_STATUSES
+ *（那套排除 COMPLETED），否则最该跟进的单反而扫不到。只排掉取消/退款/失败族。
+ */
+const RETURN_RELEASED_STATUSES: OrderStatus[] = [
+  OrderStatus.PAID,
+  OrderStatus.PROCESSING,
+  OrderStatus.TICKETED,
+  OrderStatus.CHANGE_REQUESTED,
+  OrderStatus.CHANGED,
+  OrderStatus.COMPLETED,
+];
+
 /** 规则 1–3 一次查询覆盖的状态并集 */
 const SCAN_STATUSES: OrderStatus[] = [
   ...new Set([...BALANCE_DUE_STATUSES, ...PASSPORT_ACTIVE_STATUSES]),
@@ -196,7 +211,8 @@ export type RuleName =
   | 'VISA_NOT_SUBMITTED'
   | 'ROOM_UNASSIGNED'
   | 'RECEIPT_UNVERIFIED'
-  | 'RANDOM_TIER_SHORTFALL';
+  | 'RANDOM_TIER_SHORTFALL'
+  | 'NO_SHOW_RETURN_RELEASED';
 
 export interface ReminderCandidate {
   rule: RuleName;
@@ -539,6 +555,100 @@ export function buildRandomTierShortfallCandidates(
   return candidates;
 }
 
+/** 防御式读 JSON 对象（形状不符按空对象处理）。 */
+function readMetaObject(raw: unknown): Record<string, unknown> {
+  return raw != null && typeof raw === 'object' && !Array.isArray(raw)
+    ? (raw as Record<string, unknown>)
+    : {};
+}
+
+/** releasedSeats 快照的座数合计（形状不符按 0）。 */
+function sumReleasedSeats(raw: unknown): number {
+  if (!Array.isArray(raw)) return 0;
+  return raw.reduce((n: number, entry) => {
+    const q = Number(readMetaObject(entry).quantity);
+    return Number.isFinite(q) && q > 0 ? n + q : n;
+  }, 0);
+}
+
+/** 规则 11 的取数行形状（orderItem.findMany 的 select 与它同源）。 */
+interface RawReleasedReturnRow {
+  id: string;
+  orderId: string;
+  metadata: unknown;
+  order?: { orderNumber: string } | null;
+}
+
+/** 规则 11 的输入：一条**已释放的回程明细行** + 它原班次与同单去程行的快照。 */
+export interface RuleReleasedReturnLeg {
+  /** 回程明细行 id（ruleKey 的一半）。 */
+  itemId: string;
+  orderId: string;
+  orderNumber: string;
+  /** 恒为 'FLIGHT'；带上是为了直接复用 orders.leg-status 的释放态判定。 */
+  kind: string;
+  /** 已释放的行这里必然是 null；非 null 说明已恢复，规则不触发。 */
+  flightScheduleId: string | null;
+  /** 回程行 metadata 原文（returnReleased / returnRestored / returnVoidedFinal 都在里面）。 */
+  metadata: unknown;
+  /** 同单去程行的 metadata（取 noShow.listDate 当「去程未登机日期」）；无则不传。 */
+  outboundMetadata?: unknown;
+  /** 释放前的原回程班次；班次被删或快照缺 id 时为 null（照样提醒，这种行更需要人看）。 */
+  originalSchedule: { departureTime: Date; departureTz: string | null } | null;
+}
+
+/**
+ * 规则 11：去程 no-show 之后回程座位已放回库存，提醒运营确认客人是否要保留回程。
+ *
+ * 只对**当前处于已释放态**的行触发（判定见 orders.leg-status：班次为空 + 释放晚于最近一次恢复
+ * + 未被起飞后自动作废终结）。已恢复的行、已作废的行都不再提醒。
+ *
+ * ruleKey 带上 returnReleased.at：释放→恢复→再释放是允许反复发生的，
+ * 只用行 id 做键会让第二次释放被第一次的提醒永久吃掉（ruleKey 唯一索引）。
+ *
+ * 原回程班次已起飞 → 不提醒：座位早卖出去了，这时候再叫人「恢复回程」是无效待办。
+ */
+export function buildNoShowReturnReleasedCandidates(
+  leg: RuleReleasedReturnLeg,
+  today: string,
+  now: Date,
+): ReminderCandidate[] {
+  if (!isReturnCurrentlyReleased(leg)) return [];
+  const snapshot = readMetaObject(readMetaObject(leg.metadata).returnReleased);
+  const releasedAt = typeof snapshot.at === 'string' ? snapshot.at : null;
+  if (!releasedAt) return [];
+  // 原班次已起飞（含正点起飞那一刻）→ 恢复窗口已关，不再生成待办。
+  if (leg.originalSchedule && leg.originalSchedule.departureTime.getTime() <= now.getTime()) {
+    return [];
+  }
+
+  const seats = sumReleasedSeats(snapshot.releasedSeats);
+  const returnDate = leg.originalSchedule
+    ? dateInTz(leg.originalSchedule.departureTime, leg.originalSchedule.departureTz)
+    : null;
+  const noShowSnapshot = readMetaObject(readMetaObject(leg.outboundMetadata).noShow);
+  const noShowDate =
+    typeof noShowSnapshot.listDate === 'string' && noShowSnapshot.listDate
+      ? noShowSnapshot.listDate
+      : releasedAt.slice(0, 10);
+
+  return [
+    {
+      rule: 'NO_SHOW_RETURN_RELEASED',
+      ruleKey: `NOSHOW_RELEASED:${leg.itemId}:${releasedAt}`,
+      orderId: leg.orderId,
+      title: `【回程已释放待跟进】${leg.orderNumber} ${seats} 座已放回库存`,
+      body:
+        `订单 ${leg.orderNumber} 去程 ${noShowDate} 未登机，回程（${returnDate ?? '日期未知'}）` +
+        `${seats} 座已放回库存重新销售，钱款未动。` +
+        '请与客人确认是否保留回程：要保留就到订单详情点「恢复回程」（余位不足可超售）；' +
+        '确认不飞则无需处理，回程起飞后系统自动作废。',
+      priority: ReminderPriority.HIGH,
+      dueAt: today,
+    },
+  ];
+}
+
 /** 规则 5：占位单收款期截止提醒；日期口径与 dueDate（建单时已按起飞地折算）一致。 */
 export function buildHoldInstallmentCandidates(hold: RuleHoldOrder, today: string): ReminderCandidate[] {
   const activeStatuses: HoldOrderStatus[] = [HoldOrderStatus.PENDING, HoldOrderStatus.HOLDING, HoldOrderStatus.OVERDUE];
@@ -707,6 +817,107 @@ export async function generateRuleReminders(
   ) {
     const shortfall = await getRandomTierShortfall(today, addDaysUtc(today, 6), prisma);
     candidates.push(...buildRandomTierShortfallCandidates(shortfall, today));
+  }
+
+  // ── 规则 11：回程已释放待跟进（no-show 之后座位放回库存，等运营确认要不要恢复）──
+  // **单独查一次**，不放宽上面订单查询的 items where：那条 where 是
+  // `flightScheduleId not null OR hotelCheckIn not null`，放宽它会让每一张扫描到的订单
+  // 都多拉一批无班次行，且要在 select 里加 metadata（每行一坨 JSON，订单量千级）——
+  // 为一条规则把其它九条的取数成本一起抬上去不划算，也容易碰坏既有口径。
+  // 这里按 metadata path 过滤，命中面只有真正被释放过的那几行。
+  // delegate 防御与 holdOrder 同哲学：旧测试 mock 没有 orderItem/flightSchedule 时整条规则跳过。
+  const orderItemDelegate = (
+    prisma as unknown as {
+      orderItem?: { findMany?: (args: unknown) => Promise<RawReleasedReturnRow[]> };
+    }
+  ).orderItem;
+  const scheduleDelegate = (
+    prisma as unknown as {
+      flightSchedule?: {
+        findMany?: (args: unknown) => Promise<
+          Array<{ id: string; departureTime: Date; departureTz: string | null }>
+        >;
+      };
+    }
+  ).flightSchedule;
+  if (
+    typeof orderItemDelegate?.findMany === 'function' &&
+    typeof scheduleDelegate?.findMany === 'function'
+  ) {
+    const releasedRows = await orderItemDelegate.findMany({
+      where: {
+        kind: 'FLIGHT',
+        flightScheduleId: null,
+        metadata: { path: ['returnReleased'], not: Prisma.DbNull },
+        order: { deletedAt: null, status: { in: RETURN_RELEASED_STATUSES } },
+      },
+      select: {
+        id: true,
+        orderId: true,
+        metadata: true,
+        order: { select: { orderNumber: true } },
+      },
+    });
+    // path 过滤在不同 Prisma/PG 版本下对「键不存在」的处理不完全一致，
+    // 统一再用同一套释放态判定兜一层（也顺手挡掉已恢复/已作废的行）。
+    const live = releasedRows.filter((row) =>
+      isReturnCurrentlyReleased({ kind: 'FLIGHT', flightScheduleId: null, metadata: row.metadata }),
+    );
+    if (live.length > 0) {
+      const scheduleIds = [
+        ...new Set(
+          live
+            .map((row) => {
+              const snap = readMetaObject(readMetaObject(row.metadata).returnReleased);
+              return typeof snap.originalScheduleId === 'string' ? snap.originalScheduleId : null;
+            })
+            .filter((id): id is string => id !== null),
+        ),
+      ];
+      const schedules =
+        scheduleIds.length === 0
+          ? []
+          : await scheduleDelegate.findMany({
+              where: { id: { in: scheduleIds } },
+              select: { id: true, departureTime: true, departureTz: true },
+            });
+      const scheduleById = new Map(schedules.map((sc) => [sc.id, sc]));
+
+      // 去程行的 noShow 快照（body 里的「去程未登机日期」）：同一批订单一次查回。
+      const outboundRows = await orderItemDelegate.findMany({
+        where: {
+          orderId: { in: [...new Set(live.map((row) => row.orderId))] },
+          kind: 'FLIGHT',
+          metadata: { path: ['noShow'], not: Prisma.DbNull },
+        },
+        select: { orderId: true, metadata: true },
+      });
+      const outboundByOrder = new Map(
+        outboundRows.map((row) => [row.orderId, row.metadata as unknown]),
+      );
+
+      for (const row of live) {
+        const snap = readMetaObject(readMetaObject(row.metadata).returnReleased);
+        const scheduleId =
+          typeof snap.originalScheduleId === 'string' ? snap.originalScheduleId : null;
+        candidates.push(
+          ...buildNoShowReturnReleasedCandidates(
+            {
+              itemId: row.id,
+              orderId: row.orderId,
+              orderNumber: row.order?.orderNumber ?? '',
+              kind: 'FLIGHT',
+              flightScheduleId: null,
+              metadata: row.metadata,
+              outboundMetadata: outboundByOrder.get(row.orderId) ?? null,
+              originalSchedule: scheduleId ? (scheduleById.get(scheduleId) ?? null) : null,
+            },
+            today,
+            now,
+          ),
+        );
+      }
+    }
   }
 
   // ── 规则 7：临近出发未送签（订单级；范围 = 有在办签证任务的订单）─────────────

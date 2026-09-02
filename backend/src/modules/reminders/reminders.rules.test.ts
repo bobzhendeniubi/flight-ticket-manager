@@ -12,6 +12,7 @@ import { OrderStatus, Prisma, ReminderPriority, type PrismaClient } from '@prism
 import {
   addDaysUtc,
   addMonthsUtc,
+  buildNoShowReturnReleasedCandidates,
   buildOrderCandidates,
   buildHoldInstallmentCandidates,
   buildRandomTierShortfallCandidates,
@@ -26,6 +27,7 @@ import {
   hasRoomAssignment,
   utcDateStr,
   type RuleOrder,
+  type RuleReleasedReturnLeg,
 } from './reminders.rules.js';
 import type { RandomTierShortfallReport } from '../hotel-control/hotel-control.shortfall.js';
 import { HoldInstallmentStatus, HoldOrderStatus } from '@prisma/client';
@@ -717,5 +719,212 @@ describe('RECEIPT_UNVERIFIED 到账核实提醒规则', () => {
 
   it('挂账不足 2 天 → 不触发（给财务留正常处理时间）', () => {
     expect(buildReceiptVerifyCandidates(receipt('2026-07-08T04:00:00Z'), TODAY)).toEqual([]);
+  });
+});
+
+// ── 规则 11：去程 no-show 后回程座位已释放，待跟进是否恢复 ─────────────────────
+describe('NO_SHOW_RETURN_RELEASED 回程已释放提醒规则', () => {
+  const NOW = new Date('2026-07-09T06:00:00Z');
+  const RELEASED_AT = '2026-07-09T05:00:00.000Z';
+
+  function releasedLeg(overrides: Partial<RuleReleasedReturnLeg> = {}): RuleReleasedReturnLeg {
+    return {
+      itemId: 'itm_ret',
+      orderId: 'ord_1',
+      orderNumber: 'FTM2026070900001',
+      kind: 'FLIGHT',
+      flightScheduleId: null,
+      metadata: {
+        returnReleased: {
+          at: RELEASED_AT,
+          originalScheduleId: 'sch_ret',
+          releasedSeats: [{ scheduleId: 'sch_ret', cabin: 'ECONOMY', quantity: 2 }],
+        },
+      },
+      outboundMetadata: { noShow: { at: RELEASED_AT, listDate: '2026-07-08' } },
+      originalSchedule: { departureTime: new Date('2026-07-15T02:00:00Z'), departureTz: 'Asia/Shanghai' },
+      ...overrides,
+    };
+  }
+
+  it('已释放且回程未起飞 → HIGH 待办，标题带单号与座数，正文写去程日期/回程日期/恢复入口', () => {
+    const out = buildNoShowReturnReleasedCandidates(releasedLeg(), TODAY, NOW);
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({
+      rule: 'NO_SHOW_RETURN_RELEASED',
+      orderId: 'ord_1',
+      priority: ReminderPriority.HIGH,
+      dueAt: TODAY,
+    });
+    expect(out[0].title).toBe('【回程已释放待跟进】FTM2026070900001 2 座已放回库存');
+    expect(out[0].body).toContain('2026-07-08');
+    expect(out[0].body).toContain('2026-07-15');
+    expect(out[0].body).toContain('恢复回程');
+    expect(out[0].body).toContain('余位不足可超售');
+  });
+
+  it('ruleKey 带 returnReleased.at：释放→恢复→再释放能再次生成', () => {
+    const first = buildNoShowReturnReleasedCandidates(releasedLeg(), TODAY, NOW);
+    expect(first[0].ruleKey).toBe(`NOSHOW_RELEASED:itm_ret:${RELEASED_AT}`);
+
+    // 第二次释放：at 更晚，且晚于中间那次恢复 → 新键，不会被上一条的唯一索引吃掉
+    const secondAt = '2026-07-09T09:00:00.000Z';
+    const second = buildNoShowReturnReleasedCandidates(
+      releasedLeg({
+        metadata: {
+          returnReleased: {
+            at: secondAt,
+            originalScheduleId: 'sch_ret',
+            releasedSeats: [{ scheduleId: 'sch_ret', cabin: 'ECONOMY', quantity: 2 }],
+          },
+          returnRestored: { at: '2026-07-09T07:00:00.000Z', oversold: false, oversoldBy: 0 },
+        },
+      }),
+      TODAY,
+      NOW,
+    );
+    expect(second).toHaveLength(1);
+    expect(second[0].ruleKey).toBe(`NOSHOW_RELEASED:itm_ret:${secondAt}`);
+    expect(second[0].ruleKey).not.toBe(first[0].ruleKey);
+  });
+
+  it('已恢复 / 已作废 / 回程已起飞 → 一条都不生成', () => {
+    // 已恢复：班次写回 + returnRestored 晚于 returnReleased
+    expect(
+      buildNoShowReturnReleasedCandidates(
+        releasedLeg({
+          flightScheduleId: 'sch_ret',
+          metadata: {
+            returnReleased: { at: RELEASED_AT, originalScheduleId: 'sch_ret', releasedSeats: [] },
+            returnRestored: { at: '2026-07-09T08:00:00.000Z' },
+          },
+        }),
+        TODAY,
+        NOW,
+      ),
+    ).toEqual([]);
+
+    // 已作废（起飞后自动作废终结）
+    expect(
+      buildNoShowReturnReleasedCandidates(
+        releasedLeg({
+          metadata: {
+            returnReleased: { at: RELEASED_AT, originalScheduleId: 'sch_ret', releasedSeats: [] },
+            returnVoidedFinal: { at: '2026-07-16T00:00:00.000Z' },
+          },
+        }),
+        TODAY,
+        NOW,
+      ),
+    ).toEqual([]);
+
+    // 原回程班次已起飞 → 恢复窗口已关
+    expect(
+      buildNoShowReturnReleasedCandidates(
+        releasedLeg({
+          originalSchedule: {
+            departureTime: new Date('2026-07-09T05:30:00Z'),
+            departureTz: 'Asia/Shanghai',
+          },
+        }),
+        TODAY,
+        NOW,
+      ),
+    ).toEqual([]);
+  });
+
+  it('班次查不到 / 去程快照缺失时照样提醒，日期分别回落「日期未知」与释放当日', () => {
+    const out = buildNoShowReturnReleasedCandidates(
+      releasedLeg({ originalSchedule: null, outboundMetadata: null }),
+      TODAY,
+      NOW,
+    );
+    expect(out).toHaveLength(1);
+    expect(out[0].body).toContain('日期未知');
+    expect(out[0].body).toContain('2026-07-09');
+  });
+});
+
+describe('generateRuleReminders — 规则 11 单独取数，不动其它规则的查询', () => {
+  const NOW = new Date('2026-07-09T06:00:00Z');
+
+  function makePrisma() {
+    const store = new Set<string>();
+    const orderItemFindMany = vi.fn(async (args: unknown) => {
+      const where = (args as { where?: Record<string, unknown> }).where ?? {};
+      if (where.flightScheduleId === null) {
+        return [
+          {
+            id: 'itm_ret',
+            orderId: 'ord_1',
+            order: { orderNumber: 'FTM2026070900001' },
+            metadata: {
+              returnReleased: {
+                at: '2026-07-09T05:00:00.000Z',
+                originalScheduleId: 'sch_ret',
+                releasedSeats: [{ scheduleId: 'sch_ret', cabin: 'ECONOMY', quantity: 3 }],
+              },
+            },
+          },
+        ];
+      }
+      if (where.orderId) {
+        return [{ orderId: 'ord_1', metadata: { noShow: { listDate: '2026-07-08' } } }];
+      }
+      return [];
+    });
+    const mock = {
+      order: { findMany: vi.fn(async () => []) },
+      fulfillmentTask: { findMany: vi.fn(async () => []) },
+      holdOrder: { findMany: vi.fn(async () => []) },
+      orderItem: { findMany: orderItemFindMany },
+      flightSchedule: {
+        findMany: vi.fn(async () => [
+          {
+            id: 'sch_ret',
+            departureTime: new Date('2026-07-15T02:00:00Z'),
+            departureTz: 'Asia/Shanghai',
+          },
+        ]),
+      },
+      operationalReminder: {
+        findMany: vi.fn(async (args: { where: { ruleKey: { in: string[] } } }) =>
+          args.where.ruleKey.in.filter((k) => store.has(k)).map((ruleKey) => ({ ruleKey })),
+        ),
+        createMany: vi.fn(async (args: { data: Array<{ ruleKey: string }> }) => {
+          let count = 0;
+          for (const row of args.data) {
+            if (!store.has(row.ruleKey)) {
+              store.add(row.ruleKey);
+              count += 1;
+            }
+          }
+          return { count };
+        }),
+      },
+    };
+    return { mock: mock as unknown as PrismaClient, raw: mock };
+  }
+
+  it('扫到已释放回程行 → 生成 1 条，且订单查询的 items where 保持原样', async () => {
+    const { mock, raw } = makePrisma();
+    const result = await generateRuleReminders(mock, 'user_sys', NOW);
+    expect(result).toMatchObject({ created: 1, byRule: { NO_SHOW_RETURN_RELEASED: 1 } });
+
+    // 其它规则的取数没被放宽：订单 items 仍只取「有班次或有入住日」的行，且不拉 metadata
+    const orderArgs = raw.order.findMany.mock.calls[0][0] as {
+      select: { items: { where: unknown; select: Record<string, unknown> } };
+    };
+    expect(orderArgs.select.items.where).toEqual({
+      OR: [{ flightScheduleId: { not: null } }, { hotelCheckIn: { not: null } }],
+    });
+    expect(orderArgs.select.items.select).not.toHaveProperty('metadata');
+  });
+
+  it('第二遍全部 skipped（ruleKey 幂等）', async () => {
+    const { mock } = makePrisma();
+    await generateRuleReminders(mock, 'user_sys', NOW);
+    const second = await generateRuleReminders(mock, 'user_sys', NOW);
+    expect(second).toMatchObject({ created: 0, skipped: 1 });
   });
 });
