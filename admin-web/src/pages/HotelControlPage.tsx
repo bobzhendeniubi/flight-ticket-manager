@@ -2008,7 +2008,7 @@ function BlockPeriodRow({
  */
 function OversellCapSetting({ token }: { token: string }) {
   const [cap, setCap] = useState<number | null>(null);
-  const [max, setMax] = useState(999);
+  const [max, setMax] = useState(20);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
   const [saving, setSaving] = useState(false);
@@ -2090,7 +2090,7 @@ function OversellCapSetting({ token }: { token: string }) {
         </>
       )}
       <span className="ml-auto text-xs text-ink-muted">
-        销控售罄后录单最多允许打到负这么多间（0 = 没房就不能录；填 {max} = 不设上限，随机档真超卖时先保录单）；改动会留审计。
+        销控售罄后录单最多允许打到负这么多间（0 = 没房就不能录）；改动会留审计。
       </span>
     </section>
   );
