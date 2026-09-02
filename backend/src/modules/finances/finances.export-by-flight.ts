@@ -114,9 +114,17 @@ function fmtDepartDate(d: Date, tz: string | null | undefined): string {
 /**
  * 一张订单可有多条 FLIGHT 腿（去程+回程）。按腿数把订单级商品成本/收入平摊到每条腿，
  * 避免在该腿对应班次的合计里重复计入同一份酒店/签证/车费/杂项。
+ *
+ * **只数还挂在班次上的腿**（flightScheduleId 非空）。回程 no-show 释放 / 航段作废之后，
+ * 那条腿的 flightScheduleId 已置空，本表任何一个班次都不会认领它 —— 把它算进分母，
+ * 它那一份收入与成本就再也没有班次去承接，凭空蒸发（往返单直接少算一半）。
+ * 分母降到 1 后，整单收入成本全部落到还在飞的那条腿的班次上，与「钱一分没动」的口径一致。
  */
-function countFlightLegs(items: Array<{ kind: string }>): number {
-  return Math.max(1, items.filter((it) => it.kind === 'FLIGHT').length);
+function countFlightLegs(items: Array<{ kind: string; flightScheduleId?: string | null }>): number {
+  return Math.max(
+    1,
+    items.filter((it) => it.kind === 'FLIGHT' && it.flightScheduleId != null).length,
+  );
 }
 
 export async function buildFinanceExportByFlightWorkbook(
