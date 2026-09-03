@@ -60,11 +60,84 @@ import type {
   PreviewConvertHoldOrderBody,
 } from './hold-orders.schemas.js';
 import { convertHoldOrderBodySchema } from './hold-orders.schemas.js';
+import type { BatchPassengerInput } from '../orders/orders.schemas.js';
 import { deriveHoldStatus, HOLD_STATUS_LABEL } from './hold-status.js';
 
 const HOLD_NO_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789';
 
 type Tx = Prisma.TransactionClient;
+
+// ── 证件待补转正（先占名字、护照后到）─────────────────────────────────────────
+// Passenger.documentNumber 是非空列，而「只填姓名」的转正名单本来就没有证件号；建单又必须走
+// createHoldConversionOrderWithinTx 的重复乘客校验（名单内重号 + 同班次占座重号），那套校验
+// 完全以证件号为键。做法：给待补行发一个**本次请求内唯一**的临时键走完校验，建单成功后在同一
+// 事务里清成「证件号为空 + 出生日期为空」—— 落库不留假证件号、假生日；空证件号本就被常旅客
+// 画像当作占位行排除（见 travelers/traveler-profiles.aggregate.ts 的 isPlaceholderTraveler）。
+const PENDING_DOCUMENT_PREFIX = 'PENDING-DOC-';
+// 出生日期同为待补时的哨兵：passengerToData 恒把 dateOfBirth 转成 Date，先给一个可解析值让
+// 建单通过，随后按证件键精确回写成 null（Passenger.dateOfBirth 本就可空）。
+const PENDING_BIRTH_DATE = '1900-01-01';
+
+type PendingDocumentFlags = { clearDocument: boolean; clearBirthDate: boolean };
+
+/**
+ * 转正名单 → 建单入参：给证件/生日待补的行补上临时键，并记下建单后要清空哪些字段。
+ * 临时证件键在本次请求内唯一，既不会触发「名单内证件号重复」，也不可能命中真实存量订单。
+ */
+function prepareConversionPassengers(
+  passengers: ConvertHoldOrderBody['passengers'],
+  requestToken: string,
+): { passengers: BatchPassengerInput[]; pendingByDocument: Map<string, PendingDocumentFlags> } {
+  const pendingByDocument = new Map<string, PendingDocumentFlags>();
+  const prepared = passengers.map((passenger, index) => {
+    const clearDocument = passenger.documentNumber == null;
+    const clearBirthDate = passenger.dateOfBirth == null;
+    const documentNumber =
+      passenger.documentNumber ?? `${PENDING_DOCUMENT_PREFIX}${requestToken.slice(0, 8)}-${index + 1}`;
+    if (clearDocument || clearBirthDate) {
+      pendingByDocument.set(documentNumber, { clearDocument, clearBirthDate });
+    }
+    // 类型上仍复用 BatchPassengerInput —— 转正是它唯一放宽的调用点：passportExpiry 运行时可为
+    // undefined，passengerToData 已按 `? new Date() : null` 处理，落库即 null。
+    return {
+      ...passenger,
+      documentNumber,
+      dateOfBirth: passenger.dateOfBirth ?? PENDING_BIRTH_DATE,
+    } as BatchPassengerInput;
+  });
+  return { passengers: prepared, pendingByDocument };
+}
+
+/**
+ * 建单后清掉临时键：证件待补行落 documentNumber=''、生日待补行落 dateOfBirth=null。
+ * 返回本单「证件资料待补」的人数（0 表示名单是全的）。
+ */
+async function clearPendingPassengerDocuments(
+  tx: Tx,
+  orderId: string,
+  pendingByDocument: Map<string, PendingDocumentFlags>,
+): Promise<number> {
+  if (pendingByDocument.size === 0) return 0;
+  const rows = await tx.passenger.findMany({
+    where: { orderId, documentNumber: { in: [...pendingByDocument.keys()] } },
+    select: { id: true, documentNumber: true },
+  });
+  const clearDocumentIds: string[] = [];
+  const clearBirthDateIds: string[] = [];
+  for (const row of rows) {
+    const flags = pendingByDocument.get(row.documentNumber);
+    if (!flags) continue;
+    if (flags.clearDocument) clearDocumentIds.push(row.id);
+    if (flags.clearBirthDate) clearBirthDateIds.push(row.id);
+  }
+  if (clearDocumentIds.length > 0) {
+    await tx.passenger.updateMany({ where: { id: { in: clearDocumentIds } }, data: { documentNumber: '' } });
+  }
+  if (clearBirthDateIds.length > 0) {
+    await tx.passenger.updateMany({ where: { id: { in: clearBirthDateIds } }, data: { dateOfBirth: null } });
+  }
+  return rows.length;
+}
 
 function generateHoldNo(now = new Date()): string {
   const date = `${now.getUTCFullYear()}${String(now.getUTCMonth() + 1).padStart(2, '0')}${String(now.getUTCDate()).padStart(2, '0')}`;
@@ -633,10 +706,17 @@ export class HoldOrderService {
   }
 
   async convert(id: string, body: ConvertHoldOrderBody, actor?: AuditActor) {
-    // 路由层已 parse；服务层再守一道边界，保证任何直接调用也在事务开始前完成
-    // 与批量创单完全相同的姓名/证件/出生日期/护照有效期校验，失败不会先消费占位余座。
+    // 路由层已 parse；服务层再守一道边界，保证任何直接调用也在事务开始前完成姓名与各证件
+    // 字段的格式校验，失败不会先消费占位余座。转正口径只强制姓名必填（护照可后补，见
+    // holdConversionPassengerInputSchema）；填了的字段仍按批量创单同款规则校验格式。
     const validatedBody = convertHoldOrderBodySchema.parse(body);
+    const { passengers: conversionPassengers, pendingByDocument } = prepareConversionPassengers(
+      validatedBody.passengers,
+      validatedBody.requestToken,
+    );
     const pendingFulfillmentTaskIds: string[] = [];
+    // 本次转正里「证件资料待补」的人数，事务内回填、事务后写进审计（幂等回放不重算）。
+    let pendingDocumentCount = 0;
     const actorUserId = actor?.userId ?? null;
     const actorRole = actor?.role === 'STAFF' ? UserRole.STAFF : UserRole.ADMIN;
     const result = await prisma.$transaction(async (tx) => {
@@ -708,13 +788,21 @@ export class HoldOrderService {
         cabin: existing.seatClass.cabin as CabinClass,
         quantity: seatsToConvert,
         unitPriceCny: existing.perSeatPriceCny,
-        passengers: validatedBody.passengers,
+        passengers: conversionPassengers,
         contactName: validatedBody.contactName,
         contactPhone: validatedBody.contactPhone,
         agentId: existing.agentId,
         actorUserId,
         allowDuplicatePassengers: validatedBody.allowDuplicatePassengers === true && (actorRole === UserRole.ADMIN || actorRole === UserRole.STAFF),
       });
+
+      // 证件待补行收口：清掉临时证件键与哨兵生日，并在订单备注上留「证件待补 N 人」，
+      // 让运营在订单列表就看得出这单还缺护照（补录走订单详情的出行人证件资料入口）。
+      pendingDocumentCount = await clearPendingPassengerDocuments(tx, created.order.id, pendingByDocument);
+      if (pendingDocumentCount > 0) {
+        const notes = [created.order.notes, `证件待补 ${pendingDocumentCount} 人`].filter(Boolean).join(' · ');
+        await tx.order.update({ where: { id: created.order.id }, data: { notes } });
+      }
 
       let paymentId: string | null = null;
       if (carryCny > 0) {
@@ -833,6 +921,7 @@ export class HoldOrderService {
         carryCny: result.carryCny,
         remainingSeats: result.remainingSeats,
         status: result.holdStatus,
+        ...(pendingDocumentCount > 0 ? { pendingDocumentCount } : {}),
       },
     });
     return result;

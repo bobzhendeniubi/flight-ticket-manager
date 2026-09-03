@@ -8,7 +8,9 @@ const { prismaMock, orderCreateMock, paymentMock, advancePaidMock, auditMock } =
     holdConversionRecord: { create: vi.fn(), findUnique: vi.fn() },
     // 结转款核实状态继承：convert 会数一遍未核实的 OPS_CLAIM 认款（默认 0 = 全部已核实）
     holdReceiptAllocation: { count: vi.fn() },
-    order: { findUnique: vi.fn() },
+    // 证件待补转正：建单后清临时证件键 / 哨兵生日，并在订单备注贴「证件待补 N 人」
+    passenger: { findMany: vi.fn(), updateMany: vi.fn() },
+    order: { findUnique: vi.fn(), update: vi.fn() },
     $queryRaw: vi.fn(),
     $transaction: vi.fn(),
   },
@@ -94,7 +96,10 @@ beforeEach(() => {
   prismaMock.holdConversionRecord.create.mockResolvedValue({ id: 'conversion_1' });
   prismaMock.holdConversionRecord.findUnique.mockResolvedValue(undefined);
   prismaMock.order.findUnique.mockResolvedValue({ id: 'order_1', orderNumber: 'FTM2026082400001', total: 2000, paidAmount: 600, status: 'PENDING_PAYMENT' });
-  orderCreateMock.mockResolvedValue({ order: { id: 'order_1', orderNumber: 'FTM2026082400001' }, duplicateConflicts: [] });
+  prismaMock.order.update.mockResolvedValue({});
+  prismaMock.passenger.findMany.mockResolvedValue([]);
+  prismaMock.passenger.updateMany.mockResolvedValue({ count: 0 });
+  orderCreateMock.mockResolvedValue({ order: { id: 'order_1', orderNumber: 'FTM2026082400001', notes: '占位单 H20260824AB12 转正' }, duplicateConflicts: [] });
   paymentMock.mockResolvedValue({ paymentId: 'payment_1', paidAmount: 600, total: 2000, fullyPaid: false, orderNumber: 'FTM2026082400001', status: 'PENDING_PAYMENT' });
   advancePaidMock.mockResolvedValue({ fullyPaid: false, status: HoldOrderStatus.PENDING });
 });
@@ -162,9 +167,97 @@ describe('HoldOrderService.convert', () => {
 
   it('乘客校验失败发生在事务前，不消费占位余座', async () => {
     const service = new HoldOrderService();
-    await expect(service.convert('hold_1', conversionBody([{ ...passenger('P1', 'P1001'), passportExpiry: '' }]))).rejects.toThrow();
+    // 姓名是转正唯一的必填项；格式不对的护照有效期同样在事务前就被拦下。
+    await expect(service.convert('hold_1', conversionBody([{ ...passenger('P1', 'P1001'), fullName: '' }]))).rejects.toThrow();
+    await expect(service.convert('hold_1', conversionBody([{ ...passenger('P1', 'P1001'), passportExpiry: '2030/01/01' }]))).rejects.toThrow();
     expect(prismaMock.$transaction).not.toHaveBeenCalled();
     expect(prismaMock.holdOrder.update).not.toHaveBeenCalled();
+  });
+
+  // ── 证件待补：先占名字、护照后到 ───────────────────────────────────────────
+  describe('证件待补转正（只填姓名）', () => {
+    it('只有姓名也能转正：证件号/出生日期/护照有效期留空不再报错', async () => {
+      const service = new HoldOrderService();
+      const result = await service.convert('hold_1', conversionBody([
+        { fullName: '张三', documentType: DocumentType.PASSPORT, passengerType: PassengerType.ADULT },
+        { fullName: '李四', documentType: DocumentType.PASSPORT, passengerType: PassengerType.ADULT },
+      ] as unknown as ReturnType<typeof passenger>[], '00000000-0000-4000-8000-000000000011'));
+
+      expect(result).toMatchObject({ seats: 2 });
+      const created = orderCreateMock.mock.calls[0][1] as { passengers: Array<{ documentNumber: string; dateOfBirth: string; passportExpiry?: string }> };
+      // 建单入参补了本次请求内唯一的临时证件键 + 可解析的哨兵生日，重复乘客校验才有键可用。
+      expect(created.passengers.map((p) => p.documentNumber)).toEqual([
+        'PENDING-DOC-00000000-1',
+        'PENDING-DOC-00000000-2',
+      ]);
+      expect(new Set(created.passengers.map((p) => p.documentNumber)).size).toBe(2);
+      expect(created.passengers.every((p) => p.passportExpiry === undefined)).toBe(true);
+    });
+
+    it('建单后把临时证件键清成空、哨兵生日清成 null，并在订单备注贴「证件待补」', async () => {
+      const service = new HoldOrderService();
+      prismaMock.passenger.findMany.mockResolvedValueOnce([
+        { id: 'pax_1', documentNumber: 'PENDING-DOC-00000000-1' },
+        { id: 'pax_2', documentNumber: 'PENDING-DOC-00000000-2' },
+      ]);
+
+      await service.convert('hold_1', conversionBody([
+        { fullName: '张三', documentType: DocumentType.PASSPORT, passengerType: PassengerType.ADULT },
+        { fullName: '李四', documentType: DocumentType.PASSPORT, passengerType: PassengerType.ADULT },
+      ] as unknown as ReturnType<typeof passenger>[], '00000000-0000-4000-8000-000000000012'));
+
+      expect(prismaMock.passenger.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['pax_1', 'pax_2'] } },
+        data: { documentNumber: '' },
+      });
+      expect(prismaMock.passenger.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['pax_1', 'pax_2'] } },
+        data: { dateOfBirth: null },
+      });
+      expect(prismaMock.order.update).toHaveBeenCalledWith({
+        where: { id: 'order_1' },
+        data: { notes: '占位单 H20260824AB12 转正 · 证件待补 2 人' },
+      });
+    });
+
+    it('名单是全的时候完全不碰乘客表，也不改订单备注', async () => {
+      const service = new HoldOrderService();
+      await service.convert('hold_1', conversionBody([passenger('P1', 'P1001')], '00000000-0000-4000-8000-000000000013'));
+
+      expect(prismaMock.passenger.findMany).not.toHaveBeenCalled();
+      expect(prismaMock.passenger.updateMany).not.toHaveBeenCalled();
+      expect(prismaMock.order.update).not.toHaveBeenCalled();
+    });
+
+    it('只补了护照号、生日仍待补：证件号原样保留，只清生日', async () => {
+      const service = new HoldOrderService();
+      prismaMock.passenger.findMany.mockResolvedValueOnce([{ id: 'pax_1', documentNumber: 'E12345678' }]);
+
+      await service.convert('hold_1', conversionBody([
+        { fullName: '张三', documentType: DocumentType.PASSPORT, passengerType: PassengerType.ADULT, documentNumber: 'E12345678' },
+      ] as unknown as ReturnType<typeof passenger>[], '00000000-0000-4000-8000-000000000014'));
+
+      const created = orderCreateMock.mock.calls[0][1] as { passengers: Array<{ documentNumber: string }> };
+      expect(created.passengers[0]!.documentNumber).toBe('E12345678');
+      expect(prismaMock.passenger.updateMany).toHaveBeenCalledTimes(1);
+      expect(prismaMock.passenger.updateMany).toHaveBeenCalledWith({
+        where: { id: { in: ['pax_1'] } },
+        data: { dateOfBirth: null },
+      });
+    });
+
+    it('空串等同于留空：前端表格没填的列不会被当成非法值打回', async () => {
+      const service = new HoldOrderService();
+      const result = await service.convert('hold_1', conversionBody([
+        { fullName: '张三', documentType: DocumentType.PASSPORT, passengerType: PassengerType.ADULT, documentNumber: '', dateOfBirth: '', passportExpiry: '', nationality: '' },
+      ] as unknown as ReturnType<typeof passenger>[], '00000000-0000-4000-8000-000000000015'));
+
+      expect(result).toMatchObject({ seats: 1 });
+      const created = orderCreateMock.mock.calls[0][1] as { passengers: Array<{ nationality: string; documentNumber: string }> };
+      // 国籍留空回落 CN（与基座 schema 默认值一致）
+      expect(created.passengers[0]!.nationality).toBe('CN');
+      expect(created.passengers[0]!.documentNumber).toBe('PENDING-DOC-00000000-1');
+    });
   });
 
   it('重复 requestToken 只回放既有订单，不再次消费余座或生成收款', async () => {

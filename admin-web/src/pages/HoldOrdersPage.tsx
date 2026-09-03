@@ -483,10 +483,13 @@ export function HoldOrdersPage() {
           order={convertOrder}
           token={tokens.accessToken}
           onCancel={() => setConvertOrder(null)}
-          onDone={async (result) => {
+          onDone={async (result, pendingDocumentCount) => {
             setConvertOrder(null);
             await Promise.all([reload(), reloadSchedules()]);
-            notify(`已转正 ${result.seats} 座，结转 ¥${result.carryCny.toLocaleString()}，订单 ${result.orderNumber}`);
+            const base = `已转正 ${result.seats} 座，结转 ¥${result.carryCny.toLocaleString()}，订单 ${result.orderNumber}`;
+            notify(pendingDocumentCount > 0
+              ? `${base}；其中 ${pendingDocumentCount} 人证件待补，护照到了到订单详情的出行人卡片补录`
+              : base);
           }}
         />
       )}
@@ -924,6 +927,10 @@ type ConversionResult = {
   carryCny: number;
 };
 
+/** 转正名单里的日期列：留空 = 待补，填了就必须是 YYYY-MM-DD。 */
+const isBlankOrYmd = (value: string | undefined): boolean =>
+  !value?.trim() || /^\d{4}-\d{2}-\d{2}$/.test(value.trim());
+
 function ConvertModal({
   order,
   token,
@@ -933,7 +940,7 @@ function ConvertModal({
   order: HoldOrderListItem;
   token: string;
   onCancel: () => void;
-  onDone: (result: ConversionResult) => Promise<void>;
+  onDone: (result: ConversionResult, pendingDocumentCount: number) => Promise<void>;
 }) {
   const dialogRef = useDialogA11y(onCancel);
   const remaining = order.seats - order.seatsConverted - order.seatsCancelled;
@@ -965,6 +972,9 @@ function ConvertModal({
   const unverifiedClaimCny = (order.installments ?? []).reduce((sum, installment) =>
     sum + installment.allocations.filter((a) => !a.reversedAt && a.receipt?.source === 'OPS_CLAIM' && !a.receipt?.verifiedAt).reduce((s, a) => s + Number(a.amountCny), 0), 0);
 
+  // 「证件资料待补」= 这行只有名字、还没有证件号。转正照常建单占位，护照到了再去订单详情补录。
+  const pendingDocumentCount = rows.filter((row) => !row.documentNumber.trim()).length;
+
   const setRow = (index: number, patch: Partial<BatchOrderPassenger>) => setRows((old) => old.map((row, i) => i === index ? { ...row, ...patch } : row));
   const addRow = () => { if (rows.length < remaining) setRows((old) => [...old, { fullName: '', documentNumber: '', dateOfBirth: '', passportExpiry: '', nationality: 'CN' }]); };
   const removeRow = (index: number) => setRows((old) => old.length <= 1 ? old : old.filter((_, i) => i !== index));
@@ -980,8 +990,12 @@ function ConvertModal({
 
   const submit = async () => {
     if (rows.length < 1 || rows.length > remaining) { setError(`本次人数必须在 1 至 ${remaining} 人之间`); return; }
-    const invalid = rows.findIndex((row) => !row.fullName.trim() || !row.documentNumber.trim() || !/^\d{4}-\d{2}-\d{2}$/.test(row.dateOfBirth) || !/^\d{4}-\d{2}-\d{2}$/.test(row.passportExpiry ?? ''));
-    if (invalid >= 0) { setError(`第 ${invalid + 1} 位请填写姓名、证件号、出生日期和护照有效期（YYYY-MM-DD）`); return; }
+    // 转正只强制姓名：护照可以等名单先占座、证件后到再补（后端 holdConversionPassengerInputSchema
+    // 同款口径）。填了的日期仍要求 YYYY-MM-DD，避免半截日期被静默丢掉。
+    const missingName = rows.findIndex((row) => !row.fullName.trim());
+    if (missingName >= 0) { setError(`第 ${missingName + 1} 位请填写姓名`); return; }
+    const badDate = rows.findIndex((row) => !isBlankOrYmd(row.dateOfBirth) || !isBlankOrYmd(row.passportExpiry));
+    if (badDate >= 0) { setError(`第 ${badDate + 1} 位的出生日期 / 护照有效期格式应为 YYYY-MM-DD（不填请留空）`); return; }
     setBusy(true); setError(null);
     try {
       const result = await api.convertHoldOrder(token, order.id, {
@@ -991,7 +1005,7 @@ function ConvertModal({
         ...(contactPhone.trim() ? { contactPhone: contactPhone.trim() } : {}),
         ...(allowDuplicate ? { allowDuplicatePassengers: true } : {}),
       });
-      await onDone(result.result);
+      await onDone(result.result, pendingDocumentCount);
     } catch (err) {
       setError(err instanceof Error ? err.message : '转正失败');
     } finally { setBusy(false); }
@@ -1003,9 +1017,11 @@ function ConvertModal({
       <div className="space-y-4 px-5 py-4">
         <div className="grid gap-3 rounded-lg bg-slate-50 p-3 text-sm sm:grid-cols-3"><div>本次转正 <b>{rows.length}</b> 座</div><div>结转 <b className="text-emerald-700">{previewBusy ? '试算中…' : `¥${carry.toLocaleString()}`}</b></div><div>订单待收 <b className="text-amber-700">{previewBusy ? '试算中…' : `¥${orderDue.toLocaleString()}`}</b></div></div>
         {unverifiedClaimCny > 0 && <p className="rounded bg-amber-50 px-3 py-2 text-sm font-medium text-amber-800">⚠ 本占位单已收里有 ¥{unverifiedClaimCny.toLocaleString()} 手工到账<b>未经财务核实</b>。转正后这笔钱会结转进订单并保留「待核实」标记——出票前请确认财务已对到流水，或自行评估风险再继续。</p>}
+        <p className="rounded bg-sky-50 px-3 py-2 text-xs text-sky-800">只有<b>姓名必填</b>：护照还没到就先填名字把座位定下来，证件号 / 出生日期 / 护照有效期留空即可。转正后这几位会标成「证件待补」，护照到了到订单详情的出行人卡片补录。出票前请补齐。</p>
+        {pendingDocumentCount > 0 && <p className="rounded bg-amber-50 px-3 py-2 text-xs font-medium text-amber-800">本次有 <b>{pendingDocumentCount}</b> 人只填了姓名，转正后按「证件待补」入单（订单备注会带这个标记）。</p>}
         <div className="flex flex-wrap gap-3"><input className="input max-w-xs" placeholder="联系人（选填）" value={contactName} onChange={(e) => setContactName(e.target.value)} /><input className="input max-w-xs" placeholder="联系电话（选填）" value={contactPhone} onChange={(e) => setContactPhone(e.target.value)} /><label className="flex items-center gap-2 text-sm text-ink-soft"><input type="checkbox" checked={allowDuplicate} onChange={(e) => setAllowDuplicate(e.target.checked)} />确认允许重复乘客</label></div>
-        <div className="overflow-x-auto rounded border border-slate-200"><table className="min-w-[850px] w-full text-xs"><thead className="bg-slate-50 text-ink-muted"><tr><th className="px-2 py-2 text-left">姓名</th><th className="px-2 py-2 text-left">证件号</th><th className="px-2 py-2 text-left">出生日期</th><th className="px-2 py-2 text-left">护照有效期 *</th><th className="px-2 py-2 text-left">国籍</th><th></th></tr></thead><tbody>{rows.map((row, index) => <tr key={index} className="border-t border-slate-100"><td className="px-2 py-1"><input className="input h-8" value={row.fullName} onChange={(e) => setRow(index, { fullName: e.target.value })} /></td><td className="px-2 py-1"><input className="input h-8" value={row.documentNumber} onChange={(e) => setRow(index, { documentNumber: e.target.value })} /></td><td className="px-2 py-1"><input className="input h-8" type="date" value={row.dateOfBirth} onChange={(e) => setRow(index, { dateOfBirth: e.target.value })} /></td><td className="px-2 py-1"><input className="input h-8" type="date" value={row.passportExpiry ?? ''} onChange={(e) => setRow(index, { passportExpiry: e.target.value })} /></td><td className="px-2 py-1"><input className="input h-8 w-20" value={row.nationality ?? 'CN'} onChange={(e) => setRow(index, { nationality: e.target.value.toUpperCase() })} /></td><td className="px-2 py-1"><button className="btn-ghost-danger text-xs" onClick={() => removeRow(index)}>删除</button></td></tr>)}</tbody></table></div>
-        <div className="flex flex-wrap items-center gap-3"><button className="btn-secondary text-sm" disabled={rows.length >= remaining} onClick={addRow}>＋ 加一行</button><button className="btn-secondary text-sm" disabled={!pasteText.trim()} onClick={parsePaste}>解析粘贴名单</button><span className="text-xs text-ink-muted">快速粘贴格式：姓名,证件号,出生日期,护照有效期</span></div>
+        <div className="overflow-x-auto rounded border border-slate-200"><table className="min-w-[850px] w-full text-xs"><thead className="bg-slate-50 text-ink-muted"><tr><th className="px-2 py-2 text-left">姓名 *</th><th className="px-2 py-2 text-left">证件号<span className="ml-1 font-normal text-ink-muted">选填</span></th><th className="px-2 py-2 text-left">出生日期<span className="ml-1 font-normal text-ink-muted">选填</span></th><th className="px-2 py-2 text-left">护照有效期<span className="ml-1 font-normal text-ink-muted">选填</span></th><th className="px-2 py-2 text-left">国籍</th><th></th></tr></thead><tbody>{rows.map((row, index) => <tr key={index} className={`border-t border-slate-100 ${row.documentNumber.trim() ? '' : 'bg-amber-50/60'}`}><td className="px-2 py-1"><input className="input h-8" value={row.fullName} onChange={(e) => setRow(index, { fullName: e.target.value })} /></td><td className="px-2 py-1"><input className="input h-8" placeholder="待补" value={row.documentNumber} onChange={(e) => setRow(index, { documentNumber: e.target.value })} /></td><td className="px-2 py-1"><input className="input h-8" type="date" value={row.dateOfBirth} onChange={(e) => setRow(index, { dateOfBirth: e.target.value })} /></td><td className="px-2 py-1"><input className="input h-8" type="date" value={row.passportExpiry ?? ''} onChange={(e) => setRow(index, { passportExpiry: e.target.value })} /></td><td className="px-2 py-1"><input className="input h-8 w-20" value={row.nationality ?? 'CN'} onChange={(e) => setRow(index, { nationality: e.target.value.toUpperCase() })} /></td><td className="px-2 py-1"><button className="btn-ghost-danger text-xs" onClick={() => removeRow(index)}>删除</button></td></tr>)}</tbody></table></div>
+        <div className="flex flex-wrap items-center gap-3"><button className="btn-secondary text-sm" disabled={rows.length >= remaining} onClick={addRow}>＋ 加一行</button><button className="btn-secondary text-sm" disabled={!pasteText.trim()} onClick={parsePaste}>解析粘贴名单</button><span className="text-xs text-ink-muted">快速粘贴格式：姓名,证件号,出生日期,护照有效期（只有姓名一列也能粘）</span></div>
         <textarea className="input min-h-20 font-mono text-xs" value={pasteText} onChange={(e) => setPasteText(e.target.value)} placeholder="张三,E12345678,1990-01-01,2030-01-01" />
         {error && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}
         <div className="flex justify-end gap-3"><button className="btn-secondary" onClick={onCancel}>取消</button><button className="btn-primary" disabled={busy || rows.length < 1 || rows.length > remaining} onClick={() => void submit()}>{busy ? '转正中…' : '确认导入转正'}</button></div>

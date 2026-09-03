@@ -132,9 +132,33 @@ export const listHoldOrdersQuerySchema = z.object({
 });
 export type ListHoldOrdersQuery = z.infer<typeof listHoldOrdersQuerySchema>;
 
+const blankToUndefined = (value: unknown) => (typeof value === 'string' && value.trim() === '' ? undefined : value);
+
+/**
+ * 占位单转正专用的乘客输入：**只强制姓名**，护照相关字段（证件号 / 出生日期 / 护照有效期 /
+ * 签发日 / 国籍…）全部可留空。
+ *
+ * 占位单本身就是「先按座位数占座、名单后到」的产品（建单不要姓名）。业务反馈的常见节奏是
+ * 先发一串名字把座位定死、护照过几天才凑齐，所以转正这一步不能逼着一次交全套证件。
+ *
+ * **刻意不改 batchPassengerInputSchema**：那份 schema 同时供批量创单 / OTA 名单入口使用，
+ * 「新建订单必须带护照有效期」是全渠道口径（见 orders.schemas 的
+ * passengerInputWithRequiredExpirySchema 注释），放松它会把口径漏到别的下单路径上。
+ * 这里只在转正这一条通道上放宽；护照到了之后走订单详情既有的「补录证件资料」入口
+ * （PATCH /orders/:id/passengers/:passengerId）补全。
+ */
+export const holdConversionPassengerInputSchema = batchPassengerInputSchema.extend({
+  documentNumber: z.preprocess(blankToUndefined, batchPassengerInputSchema.shape.documentNumber.optional()),
+  dateOfBirth: z.preprocess(blankToUndefined, batchPassengerInputSchema.shape.dateOfBirth.optional()),
+  passportExpiry: z.preprocess(blankToUndefined, batchPassengerInputSchema.shape.passportExpiry.optional()),
+  // 国籍留空回落 CN（与基座 schema 的默认值一致），不要求经办人手填。
+  nationality: z.preprocess(blankToUndefined, batchPassengerInputSchema.shape.nationality),
+});
+export type HoldConversionPassengerInput = z.infer<typeof holdConversionPassengerInputSchema>;
+
 export const convertHoldOrderBodySchema = z.object({
   requestToken: z.string().min(8).max(64).uuid(),
-  passengers: z.array(batchPassengerInputSchema).min(1).max(100),
+  passengers: z.array(holdConversionPassengerInputSchema).min(1).max(100),
   contactName: z.preprocess((v) => (v === '' ? undefined : v), z.string().trim().min(1).max(120).optional()),
   contactPhone: z.preprocess((v) => (v === '' ? undefined : v), z.string().trim().min(5).max(40).optional()),
   allowDuplicatePassengers: z.boolean().optional(),
