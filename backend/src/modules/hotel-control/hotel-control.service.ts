@@ -731,7 +731,18 @@ function groupRoomFraction(g: Record<string, unknown>): number {
 function groupBucketKey(g: Record<string, unknown>): string {
   const pair = g.splitPairKey;
   if (typeof pair === 'string' && pair.length > 0) return `pair:${pair}`;
-  return `rt:${typeof g.roomType === 'string' ? g.roomType : ''}`;
+  // ⚠ 无配对键时**每个盒子自成一桶**，绝不按房型合桶。
+  // 房控只把「明确配过对」的两个半组算成一间。分房接口允许运营手工填 0.5（真拼房：
+  // 两张不相干的单各出一位客人合住），按房型合桶会把这两张单各自的 0.5 加成 1.0 → 只占 1 间，
+  // 而地接那边实际要给两张单各留一间 —— 房量凭空少算一间，等于超卖。
+  // 各占一间是最保守口径，也与「数盒子」的历史行为一致（ceil(0.5) = 1）。
+  const id = typeof g.id === 'string' && g.id.length > 0 ? g.id : null;
+  if (id) return `box:${id}`;
+  // 缺 id 的老数据用乘客名单派生：同一盒子每次算出来都一样，不同盒子必然不同。
+  const ids = Array.isArray(g.passengerIds)
+    ? g.passengerIds.filter((v): v is string => typeof v === 'string')
+    : [];
+  return `box:pax:${[...ids].sort().join('|')}`;
 }
 
 /** 0.5 网格对齐后向上取整（消除浮点尾数，避免 1.0000001 被算成 2 间）。*/
@@ -1990,6 +2001,9 @@ export async function getAlerts(
             kind: OrderItemKind.FLIGHT,
             flightScheduleId: { in: schedules.map((s) => s.id) },
             metadata: { path: ['returnRestored'], not: Prisma.DbNull },
+            // 这里**不需要**再排 returnVoidedFinal：作废/再释放过的行 flightScheduleId 已置空，
+            // 上面的 `flightScheduleId in 本批班次` 天然把它们挡在外面。本口径要的正是
+            // 「此刻真的占在这一班上的超售座」，而不是历史上恢复过几座。
             order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
           },
           select: { flightScheduleId: true, metadata: true },

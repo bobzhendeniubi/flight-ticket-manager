@@ -839,6 +839,59 @@ describe('expandAssignedPhysicalByDate · roomFraction 求和再取整（拆单�
     expect(res.assignedPhysical).toEqual([1, 0]);
   });
 
+  // 真拼房：两张不相干的单各出一位客人合住（分房接口允许运营手填 0.5），**没有**配对键。
+  // 按房型合桶会把两个 0.5 加成 1.0 → 只占 1 间，可地接那边要给两张单各留一间 —— 少算一间。
+  it('两张单各一个无配对键的 0.5 半组（同房型）→ 各占 1 间，共 2 间', () => {
+    const res = expandAssignedPhysicalByDate(
+      [
+        {
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 0.5,
+          order: {
+            id: 'o1',
+            roomAssignment: fractionAssignment([{ id: 'g1', fraction: 0.5, roomType: '标间' }]),
+            passengers: [],
+          },
+        },
+        {
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 0.5,
+          order: {
+            id: 'o2',
+            roomAssignment: fractionAssignment([{ id: 'g2', fraction: 0.5, roomType: '标间' }]),
+            passengers: [],
+          },
+        },
+      ],
+      dates,
+    );
+    expect(res.assignedPhysical).toEqual([2, 0]);
+  });
+
+  it('同一张单里两个无配对键的 0.5 半组（同房型）→ 同样各占 1 间', () => {
+    const res = expandAssignedPhysicalByDate(
+      [
+        {
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 1,
+          order: {
+            id: 'o1',
+            roomAssignment: fractionAssignment([
+              { id: 'g1', fraction: 0.5, roomType: '标间' },
+              { id: 'g2', fraction: 0.5, roomType: '标间' },
+            ]),
+            passengers: [],
+          },
+        },
+      ],
+      dates,
+    );
+    expect(res.assignedPhysical).toEqual([2, 0]);
+  });
+
   it('落单的半间组（配不上对）→ 仍向上取整成 1 间，绝不少算', () => {
     const res = expandAssignedPhysicalByDate(
       [
