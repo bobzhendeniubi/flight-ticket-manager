@@ -2,7 +2,13 @@
  * 批量 no-show 的纯计算/文案（无 React，便于页面与表格组件共用）。
  * 合格性判定全部来自服务端 preview —— 这里只做展示口径与勾选汇总，不自己判能不能标。
  */
-import type { NoShowBatchEntry, NoShowBatchMatch, NoShowMatchedBy } from '../../lib/api';
+import type {
+  NoShowAmbiguousCandidate,
+  NoShowAmbiguousLine,
+  NoShowBatchEntry,
+  NoShowBatchMatch,
+  NoShowMatchedBy,
+} from '../../lib/api';
 
 /** 勾选键：同一乘客在同一单里唯一 */
 export function matchKey(m: Pick<NoShowBatchMatch, 'orderId' | 'passengerId'>): string {
@@ -15,9 +21,186 @@ export const MATCHED_BY_LABEL: Record<NoShowMatchedBy, string> = {
   CHINESE_NAME: '中文名',
 };
 
-/** 默认勾选：服务端判定合格、且这次还没标过的人 */
+/**
+ * 多人同名候选选定后，就地拼一条 matched 行 —— 不用再让运营把名单文字换成候选姓名、
+ * 手工点一次「匹配」等服务端重新判一遍。
+ *
+ * eligible/blockers/scope/回程信息先尽量借同一张单里服务端已经判过的另一行（同单同口径）；
+ * 这张单在名单里没有别的乘客、借不到口径时，就放行勾选但打上警示。
+ *
+ * 无论借没借到，这些行都带 pinned 标记：页面随后会对这张单再补一次逐单预检
+ * （applyOrderAssessment），拿回真实的 eligible/blockers/scope —— 补上了警示才消。
+ */
+function pinnedCandidateToMatch(
+  line: string,
+  candidate: NoShowAmbiguousCandidate,
+  matched: NoShowBatchMatch[],
+): NoShowBatchMatch {
+  const sibling = matched.find((m) => m.orderId === candidate.orderId);
+  const base = {
+    line,
+    lines: [line],
+    // 借来的口径终究不是这一行自己的判定：标记 pinned，页面会对这张单再补一次逐单预检。
+    pinned: true,
+    orderId: candidate.orderId,
+    orderNumber: candidate.orderNumber,
+    passengerId: candidate.passengerId,
+    fullName: candidate.fullName,
+    chineseName: candidate.chineseName,
+    // 候选目前不带护照尾号；万一后端以后补上，这里顺手接住，没有就显示 —（由表格兜底）
+    documentTail: candidate.documentTail ?? null,
+    matchedBy: 'NAME' as NoShowMatchedBy,
+  };
+  if (sibling) {
+    return {
+      ...base,
+      alreadyNoShow: sibling.alreadyNoShow,
+      eligible: sibling.eligible,
+      blockers: sibling.blockers,
+      scope: sibling.scope,
+      hasReturn: sibling.hasReturn,
+      returnTicketed: sibling.returnTicketed,
+      returnDeparted: sibling.returnDeparted,
+    };
+  }
+  return {
+    ...base,
+    alreadyNoShow: false,
+    eligible: true,
+    blockers: [],
+    scope: 'WHOLE',
+    hasReturn: false,
+    returnTicketed: false,
+    returnDeparted: false,
+    warning: '该单未预检，提交前请确认',
+  };
+}
+
+export interface ResolvedPreviewMatches {
+  matched: NoShowBatchMatch[];
+  ambiguous: NoShowAmbiguousLine[];
+}
+
+/**
+ * 用「运营已经钉住的候选」把预检结果里仍然多人同名的行解出来，合并进 matched。
+ * pinnedPassengerIds 以「当前名单里这一行的文本」为键（选定候选后名单文字已经换成了
+ * 候选的证件姓名——所以键是新文本，不是原始行）。不在 pins 里、或钉住的 passengerId
+ * 在这次候选里已经找不到（服务端候选变了）的行，原样留在 ambiguous 里等运营重新选。
+ */
+export function resolvePinnedAmbiguous(
+  matched: NoShowBatchMatch[],
+  ambiguous: NoShowAmbiguousLine[],
+  pinnedPassengerIds: Record<string, string>,
+): ResolvedPreviewMatches {
+  const stillAmbiguous: NoShowAmbiguousLine[] = [];
+  const resolved: NoShowBatchMatch[] = [];
+  for (const amb of ambiguous) {
+    const pinnedId = pinnedPassengerIds[amb.line];
+    const candidate = pinnedId ? amb.candidates.find((c) => c.passengerId === pinnedId) : undefined;
+    if (!candidate) {
+      stillAmbiguous.push(amb);
+      continue;
+    }
+    resolved.push(pinnedCandidateToMatch(amb.line, candidate, matched));
+  }
+  return { matched: [...matched, ...resolved], ambiguous: stillAmbiguous };
+}
+
+/**
+ * 默认勾选：服务端判定合格、这次还没标过、**且不需要拆单**的人。
+ *
+ * 需拆单的行默认不勾：拆单会真的拆出一张新单，拆完不可回滚（钱与座位都搬到新单上）。
+ * 「全选」按下去就把整批人一起拆了，谁也没来得及看一眼是哪几张单 —— 这一档必须由
+ * 运营逐行明确勾上，提交前的确认弹窗还会把会被拆的单号逐条列出来。
+ */
 export function defaultSelectedKeys(matched: NoShowBatchMatch[]): Set<string> {
-  return new Set(matched.filter((m) => m.eligible && !m.alreadyNoShow).map(matchKey));
+  return new Set(
+    matched
+      .filter((m) => m.eligible && !m.alreadyNoShow && m.scope !== 'SPLIT_REQUIRED')
+      .map(matchKey),
+  );
+}
+
+/** 勾选里会触发自动拆单的订单号（去重、按单号排序），给确认弹窗逐条列出来。 */
+export function splitOrderNumbers(selected: NoShowBatchMatch[]): string[] {
+  const byOrder = new Map<string, string>();
+  for (const m of selected) {
+    if (m.scope === 'SPLIT_REQUIRED') byOrder.set(m.orderId, m.orderNumber);
+  }
+  return [...byOrder.values()].sort((a, b) => a.localeCompare(b));
+}
+
+/**
+ * 「本来整单、被取消勾选后变成只标部分人」的订单 id。
+ *
+ * 服务端的 scope 是按**贴进来的名单**算的：整单的人都在名单里 → WHOLE。运营在表格里
+ * 取消勾了同单的某个人之后，实际提交的就只是这张单的一部分 —— 服务端到执行时会自动拆单，
+ * 而表格上那一行还写着「整单」。这里把这种单挑出来，行上给一条琥珀提示。
+ */
+export function downgradedToSplitOrderIds(
+  matched: NoShowBatchMatch[],
+  selectedKeys: Set<string>,
+): Set<string> {
+  const stat = new Map<string, { picked: number; total: number }>();
+  for (const m of matched) {
+    if (m.scope !== 'WHOLE') continue;
+    const hit = stat.get(m.orderId) ?? { picked: 0, total: 0 };
+    hit.total += 1;
+    if (selectedKeys.has(matchKey(m))) hit.picked += 1;
+    stat.set(m.orderId, hit);
+  }
+  const out = new Set<string>();
+  for (const [orderId, { picked, total }] of stat) {
+    if (picked > 0 && picked < total) out.add(orderId);
+  }
+  return out;
+}
+
+/** 带 pinned 标记（多人同名点选并入）的行所在的订单 id —— 这些单要补一次逐单预检。 */
+export function pinnedOrderIds(matched: NoShowBatchMatch[]): string[] {
+  return [...new Set(matched.filter((m) => m.pinned).map((m) => m.orderId))];
+}
+
+/** 一张单补预检回来的真实口径（字段与服务端 previewNoShow 同源）。 */
+export interface OrderAssessmentPatch {
+  eligible: boolean;
+  blockers: string[];
+  scope: NoShowBatchMatch['scope'];
+  alreadyNoShow: boolean;
+  hasReturn: boolean;
+  returnTicketed: boolean;
+  returnDeparted: boolean;
+}
+
+/**
+ * 把补回来的逐单口径盖到这张单的所有行上，并抹掉「未预检」警示。
+ * 补不回来（接口失败）时页面不调本函数，警示原样留着。
+ */
+export function applyOrderAssessment(
+  matched: NoShowBatchMatch[],
+  orderId: string,
+  patch: OrderAssessmentPatch,
+): NoShowBatchMatch[] {
+  return matched.map((m) =>
+    m.orderId === orderId ? { ...m, ...patch, pinned: m.pinned, warning: undefined } : m,
+  );
+}
+
+/**
+ * 单次提交的分片大小 —— 与服务端 noShowBatchBodySchema 的 entries 上限一致。
+ * 批量是串行执行的（每单一个事务，要拆单的还要再走一整套拆单），一片太大就会把
+ * 一个 HTTP 请求拖到网关超时。超过一片时前端按片顺序连发，单片失败不影响后续片。
+ */
+export const NO_SHOW_BATCH_CHUNK_SIZE = 50;
+
+/** 按 size 把提交载荷切片（保序）。 */
+export function chunkEntries(
+  entries: NoShowBatchEntry[],
+  size: number = NO_SHOW_BATCH_CHUNK_SIZE,
+): NoShowBatchEntry[][] {
+  const out: NoShowBatchEntry[][] = [];
+  for (let i = 0; i < entries.length; i += size) out.push(entries.slice(i, i + size));
+  return out;
 }
 
 /** 勾选 → 提交载荷（同一单的多个乘客合成一条 entry） */

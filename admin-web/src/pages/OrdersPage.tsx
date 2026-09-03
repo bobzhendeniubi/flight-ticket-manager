@@ -8493,6 +8493,14 @@ function CancelLegForm({
   const projectedTotal = preview ? preview.currentTotalCny - effectiveNetReduction : null;
   const projectedOverpay =
     preview && projectedTotal != null ? Math.max(0, preview.paidAmountCny - projectedTotal) : 0;
+  // 应收变化那句话（确认弹窗与面板同一份文案）。
+  // 手续费恰好等于航段金额时降额为 0 ——「从 ¥X 降到 ¥X」读起来像出了 bug，直接说不变。
+  const totalChangeSentence =
+    preview == null
+      ? ''
+      : projectedTotal == null || projectedTotal === preview.currentTotalCny
+        ? `本单应收不变（航段金额与手续费相抵，仍为 ¥${preview.currentTotalCny.toLocaleString()}）`
+        : `本单应收将从 ¥${preview.currentTotalCny.toLocaleString()} 降到 ¥${projectedTotal.toLocaleString()}`;
   const manualFeeInvalid =
     feeMode === 'MANUAL' &&
     (manualFeeCny == null ||
@@ -8514,7 +8522,7 @@ function CancelLegForm({
     }
     const confirmed = await confirm({
       title: `取消${legZh}（改单${survivorZh}）`,
-      body: `${legZh}座位将立即放回库存重新销售，本单变为单${survivorZh}，不可撤销。\n\n手续费 ¥${effectiveFeeCny.toLocaleString()}，本单应收将从 ¥${preview.currentTotalCny.toLocaleString()} 降到 ¥${projectedTotal.toLocaleString()}。${
+      body: `${legZh}座位将立即放回库存重新销售，本单变为单${survivorZh}，不可撤销。\n\n手续费 ¥${effectiveFeeCny.toLocaleString()}，${totalChangeSentence}。${
         projectedOverpay > 0
           ? `\n\n客户已多付 ¥${projectedOverpay.toLocaleString()}，确认后请到付款情况处理多收（转预存款/退款）。`
           : ''
@@ -8705,9 +8713,7 @@ function CancelLegForm({
           </label>
 
           <div className="rounded bg-slate-50 px-2 py-1.5 text-slate-700">
-            本单应收将从 ¥{preview.currentTotalCny.toLocaleString()} 降到 ¥
-            {(projectedTotal ?? preview.currentTotalCny).toLocaleString()}（手续费 ¥
-            {effectiveFeeCny.toLocaleString()}）
+            {totalChangeSentence}（手续费 ¥{effectiveFeeCny.toLocaleString()}）
             {projectedOverpay > 0 && (
               <div className="mt-1 text-amber-700">
                 客户已多付 ¥{projectedOverpay.toLocaleString()}，确认后请到付款情况处理多收（转预存款/退款）。

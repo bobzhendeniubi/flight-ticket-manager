@@ -1910,8 +1910,14 @@ export interface NoShowBatchSchedule {
 }
 
 export interface NoShowBatchMatch {
-  /** 名单里的原始行文本（用于回指是哪一行） */
+  /** 名单里的原始行文本（用于回指是哪一行）；同一人被多行命中时是第一条 */
   line: string;
+  /**
+   * 命中这位乘客的**全部**原文行（含 line 自己）。
+   * 名单里「张三」与「ZHANG/SAN E12345678」指同一人时服务端会合成一条，这里两行都留着，
+   * 界面按原文核对时看得到到底是哪几行点到了他。
+   */
+  lines: string[];
   orderId: string;
   orderNumber: string;
   passengerId: string;
@@ -1928,13 +1934,29 @@ export interface NoShowBatchMatch {
   hasReturn: boolean;
   returnTicketed: boolean;
   returnDeparted: boolean;
+  /**
+   * 前端专用、服务端不下发：多人同名弹窗里选定候选后就地并入 matched 列表时，
+   * 若同单没有别的已预检行可借口径（见 noShowMatch.resolvePinnedAmbiguous），
+   * 就用这条提示代替真实的 eligible/blockers —— 该行没有真正过一遍服务端合格性判定，
+   * 允许勾选但提交前请运营自己确认。
+   */
+  warning?: string;
+  /**
+   * 前端专用、服务端不下发：这一行是多人同名点选后就地并入的。
+   * 页面据此对这些行所在的**整张单**再补一次逐单预检（api.previewNoShow），
+   * 拿回真实的 eligible/blockers/scope —— 补上了就把 warning 抹掉。
+   */
+  pinned?: boolean;
 }
 
 export interface NoShowAmbiguousCandidate {
+  orderId: string;
   orderNumber: string;
   passengerId: string;
   fullName: string;
   chineseName: string | null;
+  /** 护照尾号：服务端目前不下发，前端按「候选若有否则显示 —」兼容处理 */
+  documentTail?: string | null;
 }
 
 export interface NoShowAmbiguousLine {
@@ -1947,6 +1969,12 @@ export interface NoShowBatchPreview {
   matched: NoShowBatchMatch[];
   unmatched: string[];
   ambiguous: NoShowAmbiguousLine[];
+  /** 贴进来的名单去重后共多少行（**不受单次上限影响**） */
+  totalLines: number;
+  /** 本次实际参与匹配的行数（truncated 时 < totalLines） */
+  processedLines: number;
+  /** 行数超过服务端单次上限 → 这次只看了前 processedLines 行，其余要再贴一次 */
+  truncated: boolean;
 }
 
 /** 一张单里要标的乘客（同一单多人合成一条） */
@@ -2007,8 +2035,9 @@ export interface WorkOrderSummaryItem {
   ruleKey: string;
   kind: WorkOrderKind;
   title: string;
-  orderId: string;
-  orderNumber: string;
+  /** 关联订单；独立待办（不挂任何订单）时为 null —— 界面不能拿它去拼订单深链 */
+  orderId: string | null;
+  orderNumber: string | null;
   priority: ReminderPriority;
   status: ReminderStatus;
   createdAt: string;
@@ -5420,8 +5449,15 @@ export const api = {
   // ── 批量 no-show ──────────────────────────────────────────────────────
   // 合格性、拆单与否、能释放几座，全部由服务端判定；前端只负责勾选与展示。
   noShow: {
-    /** 干跑：贴名单 → 逐行匹配结果（不落任何库存/资金变化） */
-    batchPreview: (token: string, body: { scheduleId: string; names: string[] }) =>
+    /**
+     * 干跑：贴名单 → 逐行匹配结果（不落任何库存/资金变化）。
+     * releaseReturn 必须跟着面板上的勾选一起传：「回程已起飞不能释放」这类闸是按
+     * 「本次要不要释放回程」算的，不传就会出现贴名单时一片绿、点了执行才逐单蹦红。
+     */
+    batchPreview: (
+      token: string,
+      body: { scheduleId: string; names: string; releaseReturn?: boolean },
+    ) =>
       apiFetch<NoShowBatchPreview>('/orders/no-show/batch-preview', {
         method: 'POST',
         token,

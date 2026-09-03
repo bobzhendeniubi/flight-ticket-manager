@@ -18,8 +18,10 @@
  *   5. 同入住区间（checkIn / checkOut 逐日相等）；
  *   6. 两侧都**还没有** splitPairKey（已经有的一律不碰，避免覆盖真实拆单写下的键）。
  *
- * 房组侧同理：两张单各自的分房表里，符合「半间 + 无配对键 + 归属这一行」的房组
+ * 房组侧同理：两张单各自的分房表里，符合「半间 + 无配对键 + **显式归属这一行**」的房组
  * **各恰好一个**时才配对 —— 有两个以上就无从判断谁配谁，一律跳过交人工。
+ * 没写 orderItemId 的老房组一个都不碰（原因 ROOM_GROUP_UNOWNED_REASON）：一张单有两行住宿时，
+ * 「按本单兜底」会把另一行的半房组配过来，两间真房并成一间，房量凭空多一间 = 超卖。
  */
 
 import { OrderItemKind } from '@prisma/client';
@@ -156,17 +158,57 @@ export function decideItemPair(
 
 // ── 房组配对判定 ────────────────────────────────────────────────────────────
 
-/** 该房组是不是「有出行人的、无配对键的、归属这一行的半个房组」。 */
-function isPairableGroup(group: BackfillRoomGroupView, itemId: string): boolean {
+/** 半房组的粗筛：有出行人、没配对键、占半间。归属另算（见 classifyGroup）。 */
+function isHalfCandidateGroup(group: BackfillRoomGroupView): boolean {
   const ids = group.passengerIds;
   if (!Array.isArray(ids) || ids.length === 0) return false;
   if (hasPairKey(group)) return false;
   const fraction = group.roomFraction == null ? 1 : Number(group.roomFraction);
-  if (!isHalfRoom(fraction)) return false;
-  // 归属：显式写了 orderItemId 的必须对上；没写的（老分房表）按「属于本单那一行」放行。
+  return isHalfRoom(fraction);
+}
+
+/**
+ * 该半房组与这一行的关系。
+ *
+ * `OWNED` 才参与回填 —— **只认显式写了 orderItemId 的房组**。
+ * 老分房表（没写归属）曾经按「属于本单那一行」放行：一张单有两行住宿（比如前后两段酒店）
+ * 时，这个「兜底」会把另一行的半房组当成这一行的，两侧各挑一个一拍即合，
+ * 把两间真房并成一间 —— 房控看到的可用房量凭空多一间，直接超卖。
+ * 宁可少配、留给人工，也不能错配。
+ */
+type GroupOwnership = 'OWNED' | 'UNOWNED' | 'FOREIGN';
+
+function classifyGroup(group: BackfillRoomGroupView, itemId: string): GroupOwnership {
   const owner = group.orderItemId;
-  if (typeof owner === 'string' && owner !== '') return owner === itemId;
-  return true;
+  if (typeof owner !== 'string' || owner === '') return 'UNOWNED';
+  return owner === itemId ? 'OWNED' : 'FOREIGN';
+}
+
+/** 房组上可能带的入住区间（老/新分房表字段名都试一遍；没有就当没写）。 */
+function groupStayRange(group: BackfillRoomGroupView): { checkIn: string | null; checkOut: string | null } {
+  const raw = group as Record<string, unknown>;
+  const pick = (...keys: string[]): string | null => {
+    for (const key of keys) {
+      const value = raw[key];
+      if (value instanceof Date || typeof value === 'string') {
+        const iso = dateOnly(value);
+        if (iso != null) return iso;
+      }
+    }
+    return null;
+  };
+  return {
+    checkIn: pick('checkIn', 'hotelCheckIn', 'checkInDate'),
+    checkOut: pick('checkOut', 'hotelCheckOut', 'checkOutDate'),
+  };
+}
+
+/** 两个房组都写了日期时必须一致（只有一侧写了 → 不拿它否决，交给订单行那一层的区间判据）。 */
+function stayRangeConflicts(a: BackfillRoomGroupView, b: BackfillRoomGroupView): boolean {
+  const ra = groupStayRange(a);
+  const rb = groupStayRange(b);
+  if (ra.checkIn != null && rb.checkIn != null && ra.checkIn !== rb.checkIn) return true;
+  return ra.checkOut != null && rb.checkOut != null && ra.checkOut !== rb.checkOut;
 }
 
 function groupLabel(group: BackfillRoomGroupView): string {
@@ -179,11 +221,34 @@ export type RoomGroupPairDecision =
   | { ok: true; sourceIndex: number; splitIndex: number }
   | { ok: false; reason: string };
 
+/** 房组无行归属时的跳过原因（脚本按这句归并计数，改动请连脚本一起改）。 */
+export const ROOM_GROUP_UNOWNED_REASON = '房组无行归属，交人工';
+
+/** 一侧分房表的扫描结果：归属本行的下标 + 没写归属的半房组个数。 */
+function scanGroups(
+  groups: readonly BackfillRoomGroupView[],
+  itemId: string,
+): { owned: number[]; unowned: number } {
+  const owned: number[] = [];
+  let unowned = 0;
+  groups.forEach((g, i) => {
+    if (!isHalfCandidateGroup(g)) return;
+    const ownership = classifyGroup(g, itemId);
+    if (ownership === 'OWNED') owned.push(i);
+    else if (ownership === 'UNOWNED') unowned += 1;
+  });
+  return { owned, unowned };
+}
+
 /**
  * 两张单的分房表里各挑出**恰好一个**可配对的半房组 → 它们就是同一间房的两半。
  *
- * 「各恰一个」是硬条件：一侧有两个以上时无从判断谁配谁，错配会把两间房并成一间。
- * 酒店名 + 房型也必须对得上（日期由订单行那一层已经比过了）。
+ * 三条硬条件：
+ *   · 只认**显式写了 orderItemId** 的房组：老房组（没写归属）一律跳过交人工 ——
+ *     一单两行住宿时，「按本单兜底」会把另一行的半房组配过来，两间真房并成一间 = 超卖；
+ *   · 「各恰一个」：一侧有两个以上时无从判断谁配谁；
+ *   · 酒店名 + 房型对得上；房组自己带了入住区间的话，区间也要对得上
+ *     （订单行那一层已经比过一次区间，这里是房组自带日期时的加保）。
  */
 export function decideRoomGroupPair(
   sourceGroups: readonly BackfillRoomGroupView[],
@@ -191,26 +256,28 @@ export function decideRoomGroupPair(
   sourceItemId: string,
   splitItemId: string,
 ): RoomGroupPairDecision {
-  const srcIdx = sourceGroups
-    .map((g, i) => (isPairableGroup(g, sourceItemId) ? i : -1))
-    .filter((i) => i >= 0);
-  const dstIdx = splitGroups
-    .map((g, i) => (isPairableGroup(g, splitItemId) ? i : -1))
-    .filter((i) => i >= 0);
+  const src = scanGroups(sourceGroups, sourceItemId);
+  const dst = scanGroups(splitGroups, splitItemId);
 
-  if (srcIdx.length === 0 || dstIdx.length === 0) {
-    return { ok: false, reason: '一侧没有可配对的半房组' };
+  if (src.owned.length === 0 || dst.owned.length === 0) {
+    const unowned = src.unowned + dst.unowned;
+    return { ok: false, reason: unowned > 0 ? ROOM_GROUP_UNOWNED_REASON : '一侧没有可配对的半房组' };
   }
-  if (srcIdx.length > 1 || dstIdx.length > 1) {
+  if (src.owned.length > 1 || dst.owned.length > 1) {
     return {
       ok: false,
-      reason: `可配对的半房组不唯一（源单 ${srcIdx.length} 个 / 新单 ${dstIdx.length} 个），交人工核对`,
+      reason: `可配对的半房组不唯一（源单 ${src.owned.length} 个 / 新单 ${dst.owned.length} 个），交人工核对`,
     };
   }
-  if (groupLabel(sourceGroups[srcIdx[0]]) !== groupLabel(splitGroups[dstIdx[0]])) {
+  const sourceGroup = sourceGroups[src.owned[0]];
+  const splitGroup = splitGroups[dst.owned[0]];
+  if (groupLabel(sourceGroup) !== groupLabel(splitGroup)) {
     return { ok: false, reason: '两个半房组的酒店 / 房型对不上' };
   }
-  return { ok: true, sourceIndex: srcIdx[0], splitIndex: dstIdx[0] };
+  if (stayRangeConflicts(sourceGroup, splitGroup)) {
+    return { ok: false, reason: '两个半房组的入住区间对不上' };
+  }
+  return { ok: true, sourceIndex: src.owned[0], splitIndex: dst.owned[0] };
 }
 
 /** 防御式读分房表里的 roomGroups 数组（形状不符按无分房处理）。 */

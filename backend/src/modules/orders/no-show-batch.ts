@@ -49,10 +49,16 @@ export interface NoShowBatchScheduleView {
   seatsSold: number;
 }
 
-/** 一行名单 → 一位乘客的匹配结果 + 该单的 no-show 准入结论。 */
+/** 一位被名单点到的乘客 + 该单的 no-show 准入结论（同一人被多行命中时合并成一条）。 */
 export interface NoShowBatchMatchedRow {
-  /** 名单原文那一行（票务要按原文核对，不能只回我们解析后的名字）。 */
+  /** 名单原文那一行（票务要按原文核对，不能只回我们解析后的名字）；多行命中同一人时是第一条。 */
   line: string;
+  /**
+   * 命中这位乘客的**全部**原文行（含 line 自己）。
+   * 名单里「张三」与「ZHANG/SAN E12345678」指的是同一个人时，这里会有两条 ——
+   * 合成一行返回，勾选列表就不会出现两条同人记录、执行时也不会为同一人排两次。
+   */
+  lines: string[];
   orderId: string;
   orderNumber: string;
   passengerId: string;
@@ -92,6 +98,12 @@ export interface NoShowBatchPreview {
   unmatched: string[];
   /** 匹配到多位乘客的原文行 —— 系统**不猜**，交人工点选。 */
   ambiguous: NoShowBatchAmbiguousRow[];
+  /** 贴进来的名单去重后共多少行（**不受单次上限影响**）。 */
+  totalLines: number;
+  /** 行数超过单次上限 → 本次只处理了前 NO_SHOW_ROSTER_MAX_LINES 行，其余需再贴一次。 */
+  truncated: boolean;
+  /** 本次实际参与匹配的行数（truncated 时 < totalLines）。 */
+  processedLines: number;
 }
 
 export interface NoShowBatchEntryResult {
@@ -119,6 +131,12 @@ export interface NoShowBatchPreviewInput {
   scheduleId: string;
   /** 整块贴进来的名单文本（按行切）。 */
   names: string;
+  /**
+   * 「同时释放回程」勾选框的当前状态（缺省 true，与执行体同缺省）。
+   * 必须原样带进逐单预检：「回程已起飞不能释放」「这是再次释放」这两条闸只有拿到它才算得准，
+   * 否则贴名单时一片绿、点了执行才逐单蹦红。
+   */
+  releaseReturn?: boolean;
 }
 
 export interface NoShowBatchInput {
@@ -235,6 +253,9 @@ async function loadScheduleCandidates(
  *
  * eligible/blockers 逐**单**算一次（不是逐行）：同一张单被名单点到 2 个人时，
  * 这 2 行的准入结论必然一样 —— 一单一次 previewNoShow，结果分发给它的每一行。
+ *
+ * 名单超过单次上限（NO_SHOW_ROSTER_MAX_LINES）时仍处理前若干行，但响应里的
+ * totalLines / processedLines / truncated 会把「贴了多少、这次看了多少」明说出来。
  */
 export async function previewNoShowBatch(
   deps: NoShowBatchDeps,
@@ -265,24 +286,41 @@ export async function previewNoShowBatch(
     seatsSold: schedule.seatClasses.reduce((n, sc) => n + sc.sold, 0),
   };
 
-  const lines = parseRosterLines(input.names);
+  const { lines, totalLines, truncated } = parseRosterLines(input.names);
   const candidates = await loadScheduleCandidates(client, input.scheduleId);
   const { matched, unmatched, ambiguous } = matchRosterLines(lines, candidates);
 
-  // 一单一次预检：先把本次名单点到的乘客按单归拢。
-  const pickedByOrder = new Map<string, string[]>();
+  // 同一位乘客被多行命中（「张三」+「ZHANG/SAN E12345678」）→ 合并成一条，原文行都留着。
+  // 不合并的话勾选列表会出现两条同人记录，票务勾两次、执行时这一单也会被排两遍。
+  const mergedByPassenger = new Map<string, { first: (typeof matched)[number]; lines: string[] }>();
   for (const m of matched) {
-    const list = pickedByOrder.get(m.candidate.orderId) ?? [];
-    if (!list.includes(m.candidate.passengerId)) list.push(m.candidate.passengerId);
-    pickedByOrder.set(m.candidate.orderId, list);
+    const key = `${m.candidate.orderId}:${m.candidate.passengerId}`;
+    const hit = mergedByPassenger.get(key);
+    if (hit) {
+      if (!hit.lines.includes(m.line)) hit.lines.push(m.line);
+      continue;
+    }
+    mergedByPassenger.set(key, { first: m, lines: [m.line] });
   }
 
+  // 一单一次预检：先把本次名单点到的乘客按单归拢。
+  const pickedByOrder = new Map<string, string[]>();
+  for (const { first } of mergedByPassenger.values()) {
+    const list = pickedByOrder.get(first.candidate.orderId) ?? [];
+    if (!list.includes(first.candidate.passengerId)) list.push(first.candidate.passengerId);
+    pickedByOrder.set(first.candidate.orderId, list);
+  }
+
+  // 与执行体同缺省：不传 = true。带进逐单预检，「回程已起飞不能释放」「这是再次释放」
+  // 这类闸才会在贴名单这一步就如实亮出来，而不是点了执行才逐单蹦红。
+  const releaseReturn = input.releaseReturn ?? true;
   const assessments = new Map<string, NoShowPreview | { failure: string }>();
   for (const [orderId, passengerIds] of pickedByOrder) {
     try {
-      // releaseReturn 不传 → 走 previewNoShow 的缺省 true，与批量执行体的缺省一致：
-      //「回程已起飞不能释放」这类闸要在贴名单这一步就看得到，而不是点了执行才蹦出来。
-      assessments.set(orderId, await deps.service.previewNoShow(orderId, { passengerIds }, actor));
+      assessments.set(
+        orderId,
+        await deps.service.previewNoShow(orderId, { passengerIds, releaseReturn }, actor),
+      );
     } catch (err) {
       // 单张单预检抛错（订单被并发删掉 / 勾选的人已被拆走…）只影响这一张单，
       // 整批不能因此 500 —— 如实把原因落到这张单的 blockers 上。
@@ -292,13 +330,15 @@ export async function previewNoShowBatch(
     }
   }
 
-  const matchedRows: NoShowBatchMatchedRow[] = matched.map((m) => {
+  const matchedRows: NoShowBatchMatchedRow[] = [...mergedByPassenger.values()].map((entry) => {
+    const m = entry.first;
     const c = m.candidate;
     const assessed = assessments.get(c.orderId);
     const failure = assessed != null && 'failure' in assessed ? assessed.failure : null;
     const preview = assessed != null && !('failure' in assessed) ? assessed : null;
     return {
       line: m.line,
+      lines: entry.lines,
       orderId: c.orderId,
       orderNumber: c.orderNumber,
       passengerId: c.passengerId,
@@ -319,6 +359,9 @@ export async function previewNoShowBatch(
   return {
     schedule: scheduleView,
     matched: matchedRows,
+    totalLines,
+    truncated,
+    processedLines: lines.length,
     unmatched,
     ambiguous: ambiguous.map((a) => ({
       line: a.line,

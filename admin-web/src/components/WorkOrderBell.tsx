@@ -12,6 +12,11 @@
  *     下拉里给一颗按钮，运营想要才点（权限请求必须由点击触发，否则浏览器直接拒）。
  *   - 「看过了」的判定 = 打开过下拉：此时把 latestAt 记进 localStorage，标题前缀消失。
  *
+ * 两个 localStorage 键都**按用户分**（同一台机器换人登录不该继承上一位的已读进度）：
+ *   - lastSeenAt：看过了没（管标题前缀与角标颜色）
+ *   - notifiedAt：桌面通知弹过了没。它必须落盘 —— 只记在内存里的话，整页刷新（F5、切路由
+ *     重挂载）就会把同一批工单再弹一遍，而「已读」判定又不能借用：运营还没看过。
+ *
  * 工单的处理仍在提醒中心 / 订单详情里做，这里只负责「别漏看」。
  */
 import { useCallback, useEffect, useRef, useState } from 'react';
@@ -24,7 +29,9 @@ import { Icon } from './Icon';
 const POLL_INTERVAL_MS = 60_000;
 /** 下拉里「最近」的窗口：只是列表范围，未结数量由服务端的 open 给 */
 const RECENT_WINDOW_DAYS = 7;
-const LAST_SEEN_KEY = 'ftm.workOrders.lastSeenAt';
+/** 键按用户分：`<前缀>.<userId>`，没拿到 userId 时退回 `anon`（登录前不会渲染本组件，兜底而已） */
+const LAST_SEEN_KEY_PREFIX = 'ftm.workOrders.lastSeenAt';
+const NOTIFIED_KEY_PREFIX = 'ftm.workOrders.notifiedAt';
 /** index.html 里的站点标题，加前缀时拿它做基底 */
 const BASE_TITLE = '世途旅行 · 运营后台';
 
@@ -41,20 +48,24 @@ const STATUS_LABEL: Record<string, string> = {
   SKIPPED: '已跳过',
 };
 
-function readLastSeen(): string | null {
+function storageKey(prefix: string, userId: string | null | undefined): string {
+  return `${prefix}.${userId || 'anon'}`;
+}
+
+function readStamp(key: string): string | null {
   try {
-    return localStorage.getItem(LAST_SEEN_KEY);
+    return localStorage.getItem(key);
   } catch {
     // 隐私模式下读不到就当作没看过：顶多多提醒一次，不会漏
     return null;
   }
 }
 
-function writeLastSeen(value: string): void {
+function writeStamp(key: string, value: string): void {
   try {
-    localStorage.setItem(LAST_SEEN_KEY, value);
+    localStorage.setItem(key, value);
   } catch {
-    // 存不进去只影响「记住看过了」，不影响本次展示
+    // 存不进去只影响「记住看过了 / 弹过了」，不影响本次展示
   }
 }
 
@@ -65,11 +76,15 @@ function notificationsSupported(): boolean {
 
 export function WorkOrderBell() {
   const token = useAuth((s) => s.tokens?.accessToken) ?? '';
+  const userId = useAuth((s) => s.user?.id) ?? null;
   const navigate = useNavigate();
+
+  const lastSeenKey = storageKey(LAST_SEEN_KEY_PREFIX, userId);
+  const notifiedKey = storageKey(NOTIFIED_KEY_PREFIX, userId);
 
   const [summary, setSummary] = useState<WorkOrderSummary | null>(null);
   const [open, setOpen] = useState(false);
-  const [lastSeenAt, setLastSeenAt] = useState<string | null>(() => readLastSeen());
+  const [lastSeenAt, setLastSeenAt] = useState<string | null>(() => readStamp(lastSeenKey));
   const [permission, setPermission] = useState<NotificationPermission | 'unsupported'>(() =>
     notificationsSupported() ? Notification.permission : 'unsupported',
   );
@@ -78,9 +93,15 @@ export function WorkOrderBell() {
   const sinceRef = useRef<string>(
     new Date(Date.now() - RECENT_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString(),
   );
-  // 上一轮已经弹过通知的 latestAt —— 同一批工单只弹一次
-  const notifiedAtRef = useRef<string | null>(null);
+  // 已经弹过桌面通知的 latestAt —— 同一批工单只弹一次；落盘，刷新页面也不重弹
+  const notifiedAtRef = useRef<string | null>(readStamp(notifiedKey));
   const panelRef = useRef<HTMLDivElement | null>(null);
+
+  // 登录信息是异步水合的：userId 一到位，键就变了，两个进度都按新键重读一遍
+  useEffect(() => {
+    setLastSeenAt(readStamp(lastSeenKey));
+    notifiedAtRef.current = readStamp(notifiedKey);
+  }, [lastSeenKey, notifiedKey]);
 
   const load = useCallback(async () => {
     if (!token) return;
@@ -108,7 +129,10 @@ export function WorkOrderBell() {
     if (!hasNew || !latestAt) return;
     if (notifiedAtRef.current === latestAt) return;
     if (!notificationsSupported() || Notification.permission !== 'granted') return;
+    // 先落盘再弹：整页刷新后重挂载会从 localStorage 读回这个戳，同一批工单不再弹第二次。
+    // 注意**不能**借用 lastSeenAt 来去重 —— 那代表「运营看过了」，弹过通知不等于看过。
     notifiedAtRef.current = latestAt;
+    writeStamp(notifiedKey, latestAt);
     const newest = summary?.items?.[0];
     const orderPart = newest?.orderNumber ? `单号 ${newest.orderNumber}` : '详见工单列表';
     try {
@@ -116,7 +140,7 @@ export function WorkOrderBell() {
     } catch {
       // 某些环境构造 Notification 会抛（要求走 ServiceWorker）：静默降级为角标提示
     }
-  }, [hasNew, latestAt, summary]);
+  }, [hasNew, latestAt, summary, notifiedKey]);
 
   // 页面标题前缀：有新工单时挂 `(N) `，看过 / 清零后还原
   useEffect(() => {
@@ -149,7 +173,7 @@ export function WorkOrderBell() {
       // 打开即视为「看过了」：标题前缀落下，下次再有更新的才会重新提示
       if (next && latestAt) {
         setLastSeenAt(latestAt);
-        writeLastSeen(latestAt);
+        writeStamp(lastSeenKey, latestAt);
       }
       return next;
     });
@@ -203,17 +227,27 @@ export function WorkOrderBell() {
                     <button
                       type="button"
                       className="w-full px-3 py-2 text-left transition hover:bg-slate-50"
+                      title={it.title}
                       onClick={() => {
                         setOpen(false);
-                        navigate(`/orders?q=${encodeURIComponent(it.orderNumber)}`);
+                        // 工单可以不挂订单（独立待办）：没有单号就别拼 ?q=null 那种搜不出东西的深链
+                        navigate(
+                          it.orderNumber ? `/orders?q=${encodeURIComponent(it.orderNumber)}` : '/orders',
+                        );
                       }}
                     >
-                      <div className="flex items-center gap-1.5">
-                        <span className="badge-neutral">{KIND_LABEL[it.kind] ?? it.kind}</span>
-                        <span className="truncate text-sm font-medium text-ink">{it.title}</span>
+                      {/* 标题里「去程/回程」常常就在末尾，截断等于看不出这条要处理哪一段 ——
+                          徽标固定宽度在前，标题最多两行完整展示，实在超长再靠 title 兜底 */}
+                      <div className="flex items-start gap-1.5">
+                        <span className="badge-neutral shrink-0 whitespace-nowrap">
+                          {KIND_LABEL[it.kind] ?? it.kind}
+                        </span>
+                        <span className="line-clamp-2 break-words text-sm font-medium leading-5 text-ink">
+                          {it.title}
+                        </span>
                       </div>
                       <div className="mt-0.5 flex flex-wrap items-center gap-x-2 text-xs text-ink-muted">
-                        <span className="nums">{it.orderNumber}</span>
+                        <span className="nums">{it.orderNumber ?? '无关联订单'}</span>
                         <span className="nums">{formatDateTimeCn(it.createdAt)}</span>
                         <span>{STATUS_LABEL[it.status] ?? it.status}</span>
                       </div>

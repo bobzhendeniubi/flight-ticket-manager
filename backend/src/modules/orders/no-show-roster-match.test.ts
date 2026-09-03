@@ -30,17 +30,35 @@ function pax(over: Partial<RosterCandidate> & { passengerId: string }): RosterCa
 
 describe('parseRosterLines · 整块名单按行切', () => {
   it('去空行、trim、按原文去重，保序', () => {
-    expect(parseRosterLines('  A \n\n B\r\nA\n  \n')).toEqual(['A', 'B']);
+    expect(parseRosterLines('  A \n\n B\r\nA\n  \n')).toEqual({
+      lines: ['A', 'B'],
+      totalLines: 2,
+      truncated: false,
+    });
   });
 
-  it('截断到上限', () => {
+  // 超上限**不静默丢**：总行数与截断标记都要如实回，否则票务以为整班都处理完了，
+  // 上限之外的人无声无息地漏在那儿。
+  it('截断到上限，但总行数与截断标记如实回', () => {
     const text = Array.from({ length: 10 }, (_, i) => `L${i}`).join('\n');
-    expect(parseRosterLines(text, 3)).toEqual(['L0', 'L1', 'L2']);
+    expect(parseRosterLines(text, 3)).toEqual({
+      lines: ['L0', 'L1', 'L2'],
+      totalLines: 10,
+      truncated: true,
+    });
   });
 
-  it('空输入 → 空数组（不抛错）', () => {
-    expect(parseRosterLines('')).toEqual([]);
-    expect(parseRosterLines('   \n  ')).toEqual([]);
+  it('总行数按去重后算（重复行不撑大计数）', () => {
+    expect(parseRosterLines('A\nA\nB', 2)).toEqual({
+      lines: ['A', 'B'],
+      totalLines: 2,
+      truncated: false,
+    });
+  });
+
+  it('空输入 → 空结果（不抛错）', () => {
+    expect(parseRosterLines('')).toEqual({ lines: [], totalLines: 0, truncated: false });
+    expect(parseRosterLines('   \n  ')).toEqual({ lines: [], totalLines: 0, truncated: false });
   });
 });
 
@@ -111,6 +129,35 @@ describe('matchRosterLines · 逐行匹配', () => {
 
   it('「姓名 护照号」同行时护照号优先（名字对不上也按证件号认人）', () => {
     const r = matchRosterLines(['SOMEONE ELSE E10000001'], pool);
+    expect(r.matched[0].candidate.passengerId).toBe('p-chen');
+    expect(r.matched[0].matchedBy).toBe('DOCUMENT');
+  });
+
+  // 整行去分隔符后的「回落成证件号」这一路必须含数字：不含数字的整行就是纯姓名
+  // （「ZHANG SAN」拼起来是 ZHANGSAN），拿它去撞证件号索引，一旦某张单的证件号录成
+  // 纯字母，就会以「护照号精确」的最高置信度认错人 —— 而这条路是不再看名字直接定人的。
+  it('不含数字的整行不当证件号用（纯字母证件号不会被姓名误撞）', () => {
+    const letterDoc = pax({
+      passengerId: 'p-doc',
+      fullName: 'HUANG/QI',
+      chineseName: null,
+      documentNumber: 'ZHANGSAN',
+    });
+    const target = pax({
+      passengerId: 'p-zs',
+      fullName: 'ZHANG/SAN',
+      chineseName: null,
+      documentNumber: 'E90000009',
+    });
+    const r = matchRosterLines(['ZHANG SAN'], [letterDoc, target]);
+    expect(r.matched).toHaveLength(1);
+    expect(r.matched[0].candidate.passengerId).toBe('p-zs');
+    expect(r.matched[0].matchedBy).toBe('NAME');
+  });
+
+  it('被空格劈开的证件号仍按整行回落命中（含数字才走这条路）', () => {
+    const r = matchRosterLines(['E1000 0001'], pool);
+    expect(r.matched).toHaveLength(1);
     expect(r.matched[0].candidate.passengerId).toBe('p-chen');
     expect(r.matched[0].matchedBy).toBe('DOCUMENT');
   });

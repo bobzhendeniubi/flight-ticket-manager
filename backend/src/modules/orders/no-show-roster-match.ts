@@ -38,25 +38,39 @@ const NON_CJK_GLOBAL = /[^㐀-䶿一-鿿豈-﫿]/gu;
 /** 单次最多解析多少行（防误传整本表格把接口拖死）。 */
 export const NO_SHOW_ROSTER_MAX_LINES = 500;
 
+/** 名单切行的结果：真正参与匹配的行 + 去重后的总行数 + 是否被上限截断。 */
+export interface RosterParseResult {
+  /** 参与匹配的行（最多 limit 条）。 */
+  lines: string[];
+  /** 去重后的总行数（**不受上限影响**，用来告诉票务「贴进来多少条」）。 */
+  totalLines: number;
+  /** 总行数超过上限 → 只处理了前 limit 条，剩下的这一次没看。 */
+  truncated: boolean;
+}
+
 /**
  * 整块名单文本 → 逐行（trim、去空行、按原文去重、截断到上限）。
  * 去重按 trim 后的原文：航司名单里同一个人贴两遍很常见，重复行会让勾选列表出现两条一模一样的记录。
+ *
+ * 超上限时**不静默丢**：照样把总行数与截断标记回给调用方，界面必须明说「贴了 700 条、
+ * 这次只处理前 500 条」—— 否则票务以为整班都处理完了，剩下的两百人无声无息地漏在那儿。
  */
 export function parseRosterLines(
   names: string,
   limit: number = NO_SHOW_ROSTER_MAX_LINES,
-): string[] {
+): RosterParseResult {
   const seen = new Set<string>();
-  const out: string[] = [];
+  const lines: string[] = [];
+  let totalLines = 0;
   for (const raw of String(names ?? '').split(LINE_SEPARATORS)) {
     const line = raw.trim();
     if (line === '') continue;
     if (seen.has(line)) continue;
     seen.add(line);
-    out.push(line);
-    if (out.length >= limit) break;
+    totalLines += 1;
+    if (lines.length < limit) lines.push(line);
   }
-  return out;
+  return { lines, totalLines, truncated: totalLines > lines.length };
 }
 
 /** 一行拆成词（大写、去空词）：汉字与其它非 ASCII 一律当分隔符，只留拉丁字母与数字。 */
@@ -239,11 +253,15 @@ function resolveLine(
 ): { matchedBy: RosterMatchedBy; candidates: RosterCandidate[] } | null {
   // ① 护照号：行内每个「含数字的词」都试一遍，另外整行去分隔符也试一次
   //    （名单里偶见「E1234 5678」这种被空格劈开的证件号）。
+  //    整行回落**必须含数字**：不含数字的整行是纯姓名（「ZHANG SAN」拼起来就是 ZHANGSAN），
+  //    拿它去撞证件号索引，一旦哪张单的证件号录成了纯字母，就会以「护照号精确」的最高
+  //    置信度认错人 —— 而这一条恰恰是不再看名字、直接定人的那条路。
   const docCandidates: RosterCandidate[] = [];
   const tried = new Set<string>();
+  const wholeLine = normalizeDocumentNumber(line);
   const docTokens = [
     ...latinTokens(line).filter((t) => /\d/.test(t)),
-    normalizeDocumentNumber(line),
+    ...(/\d/.test(wholeLine) ? [wholeLine] : []),
   ];
   for (const token of docTokens) {
     const norm = normalizeDocumentNumber(token);

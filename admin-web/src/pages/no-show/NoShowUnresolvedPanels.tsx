@@ -1,22 +1,22 @@
 /**
  * 批量 no-show · 两个「没收干净」的提示块：
  *   1. 未匹配 —— 名单里查无此人（错字 / 不是本班次 / 单已取消）
- *   2. 多人同名 —— 一行命中多位乘客，必须人工挑一个再重新匹配
+ *   2. 多人同名 —— 一行命中多位乘客，选一个就地并入下方「匹配结果」表
  *
- * 同名候选只带订单号与姓名（服务端口径），没有可提交的订单内部 id，所以这里**不直接提交**：
- * 运营选定后把该行换成更精确的写法（选定者的证件姓名）重新匹配。宁可多跑一趟，
- * 也不能猜错人去标 no-show。
+ * 同名候选现在带订单内部 id（orderId），选定后不用运营再把名单文字换掉、手工点一次
+ * 「匹配」——直接并入 matched 列表；页面会在背后自动拿新文本重新预检一遍核对口径。
  */
-import type { NoShowAmbiguousLine } from '../../lib/api';
+import type { NoShowAmbiguousCandidate, NoShowAmbiguousLine } from '../../lib/api';
 
 interface Props {
   unmatched: string[];
   ambiguous: NoShowAmbiguousLine[];
-  /** line → 选中的 passengerId */
+  /** line → 选中的 passengerId（仅用于本轮渲染态；重新预检后这一行多半会从 ambiguous 里消失） */
   choices: Record<string, string>;
-  onChoose: (line: string, passengerId: string) => void;
-  /** 把该行替换成选定乘客的证件姓名（回到名单框，等运营再点一次「匹配」） */
-  onApplyChoice: (line: string, replacement: string) => void;
+  /** 选中某个候选：由父组件负责替换名单文字、钉住选择并触发重新预检 */
+  onChoose: (line: string, candidate: NoShowAmbiguousCandidate) => void;
+  /** 页面正在重新预检时，禁用选择避免重复触发 */
+  disabled?: boolean;
 }
 
 export function NoShowUnresolvedPanels({
@@ -24,7 +24,7 @@ export function NoShowUnresolvedPanels({
   ambiguous,
   choices,
   onChoose,
-  onApplyChoice,
+  disabled,
 }: Props) {
   if (unmatched.length === 0 && ambiguous.length === 0) return null;
 
@@ -51,13 +51,12 @@ export function NoShowUnresolvedPanels({
         <section className="card border-rose-200 bg-rose-50/60">
           <h2 className="text-sm font-semibold text-rose-800">多人同名 · {ambiguous.length} 行</h2>
           <p className="mt-0.5 text-xs text-rose-700">
-            一行命中了多位乘客，系统不替你挑人。选定后点「替换该行」，名单里会换成该乘客的证件姓名，
-            再点一次「匹配」即可；仍然分不开时改用护照号。
+            一行命中了多位乘客，系统不替你挑人。点选其中一位，会直接并入下方「匹配结果」表
+            （背后会自动核对一遍口径）；仍然分不开时改用护照号。
           </p>
           <ul className="mt-2 space-y-2">
             {ambiguous.map((amb) => {
               const chosenId = choices[amb.line];
-              const chosen = amb.candidates.find((c) => c.passengerId === chosenId) ?? null;
               return (
                 <li key={amb.line} className="rounded-lg bg-white/80 p-2">
                   <div className="font-mono text-xs text-ink-muted">{amb.line}</div>
@@ -71,7 +70,8 @@ export function NoShowUnresolvedPanels({
                           type="radio"
                           name={`ambiguous-${amb.line}`}
                           checked={chosenId === c.passengerId}
-                          onChange={() => onChoose(amb.line, c.passengerId)}
+                          disabled={disabled}
+                          onChange={() => onChoose(amb.line, c)}
                         />
                         <span className="font-medium text-ink">{c.fullName}</span>
                         {c.chineseName?.trim() && (
@@ -81,14 +81,6 @@ export function NoShowUnresolvedPanels({
                       </label>
                     ))}
                   </div>
-                  <button
-                    type="button"
-                    className="btn-secondary mt-1.5 py-1 text-xs"
-                    disabled={!chosen}
-                    onClick={() => chosen && onApplyChoice(amb.line, chosen.fullName)}
-                  >
-                    替换该行
-                  </button>
                 </li>
               );
             })}

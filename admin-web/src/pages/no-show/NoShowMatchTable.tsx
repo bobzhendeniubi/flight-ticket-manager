@@ -2,6 +2,12 @@
  * 批量 no-show · 匹配结果表。
  * 合格性（eligible / blockers）与「整单还是要拆单」（scope）都由服务端给，本组件只渲染与勾选。
  * 护照一律只显示服务端下发的尾号，不拼全号。
+ *
+ * 两条只在这张表上成立的口径：
+ *   - 「名单原文」列显示命中这位乘客的**全部**原文行（服务端已按人合并）——票务核对的是自己
+ *     贴进去的那几个字，不是我们解析出来的名字。
+ *   - 服务端说「整单」的单，被取消勾了同单的某个人之后其实只标部分人（执行时会自动拆单），
+ *     这一行给琥珀提示，不让它继续写着「整单」蒙人。
  */
 import type { NoShowBatchMatch } from '../../lib/api';
 import { MATCHED_BY_LABEL, matchKey } from './noShowMatch';
@@ -9,11 +15,19 @@ import { MATCHED_BY_LABEL, matchKey } from './noShowMatch';
 interface Props {
   matched: NoShowBatchMatch[];
   selectedKeys: Set<string>;
+  /** 本来整单、因取消勾选而变成需拆单的订单 id（见 noShowMatch.downgradedToSplitOrderIds） */
+  downgradedOrderIds: Set<string>;
   onToggle: (key: string, checked: boolean) => void;
   onToggleAll: (checked: boolean) => void;
 }
 
-export function NoShowMatchTable({ matched, selectedKeys, onToggle, onToggleAll }: Props) {
+export function NoShowMatchTable({
+  matched,
+  selectedKeys,
+  downgradedOrderIds,
+  onToggle,
+  onToggleAll,
+}: Props) {
   // 可勾的行 = 服务端判定合格的行（已标过的仍可再勾，只是默认不勾）
   const selectableKeys = matched.filter((m) => m.eligible).map(matchKey);
   const allSelected = selectableKeys.length > 0 && selectableKeys.every((k) => selectedKeys.has(k));
@@ -40,26 +54,39 @@ export function NoShowMatchTable({ matched, selectedKeys, onToggle, onToggleAll 
                 onChange={(e) => onToggleAll(e.target.checked)}
               />
             </th>
-            <th className="text-left">姓名</th>
-            <th className="text-left">中文名</th>
-            <th className="text-left" title="服务端下发的护照尾号；看全号请进订单详情">
+            <th className="whitespace-nowrap text-left">姓名</th>
+            <th className="whitespace-nowrap text-left">中文名</th>
+            <th
+              className="whitespace-nowrap text-left"
+              title="服务端下发的护照尾号；看全号请进订单详情"
+            >
               护照尾号
             </th>
-            <th className="text-left">订单号</th>
-            <th className="text-left">匹配方式</th>
             <th
-              className="text-left"
+              className="whitespace-nowrap text-left"
+              title="名单里命中这位乘客的原文行（同一人被多行点到时都列出来）"
+            >
+              名单原文
+            </th>
+            <th className="whitespace-nowrap text-left">订单号</th>
+            <th className="whitespace-nowrap text-left">匹配方式</th>
+            <th
+              className="whitespace-nowrap text-left"
               title="整单 = 本单乘客都在名单里；需拆单 = 只标其中部分人，提交时服务端会先自动拆单"
             >
               范围
             </th>
-            <th className="text-left">回程</th>
-            <th className="text-left">状态 / 不可标原因</th>
+            <th className="whitespace-nowrap text-left">回程</th>
+            <th className="whitespace-nowrap text-left">状态 / 不可标原因</th>
           </tr>
         </thead>
         <tbody>
           {matched.map((m) => {
             const key = matchKey(m);
+            // 服务端没下发 lines 的旧响应：回落到单行 line，别让这一列空着
+            const rosterLines = m.lines && m.lines.length > 0 ? m.lines : [m.line];
+            const rosterText = rosterLines.join(' / ');
+            const downgraded = downgradedOrderIds.has(m.orderId) && selectedKeys.has(key);
             return (
               <tr key={key} className={m.eligible ? undefined : 'bg-slate-50 text-ink-muted'}>
                 <td>
@@ -71,11 +98,23 @@ export function NoShowMatchTable({ matched, selectedKeys, onToggle, onToggleAll 
                     onChange={(e) => onToggle(key, e.target.checked)}
                   />
                 </td>
-                <td className={m.eligible ? 'font-medium text-ink' : 'font-medium'}>{m.fullName}</td>
-                <td>{m.chineseName?.trim() || '—'}</td>
-                <td className="nums">{m.documentTail?.trim() || '—'}</td>
-                <td className="nums">{m.orderNumber}</td>
+                <td
+                  className={`whitespace-nowrap ${m.eligible ? 'font-medium text-ink' : 'font-medium'}`}
+                >
+                  {m.fullName}
+                </td>
+                <td className="whitespace-nowrap">{m.chineseName?.trim() || '—'}</td>
+                <td className="nums whitespace-nowrap">{m.documentTail?.trim() || '—'}</td>
                 <td>
+                  <span
+                    className="block max-w-[14rem] truncate font-mono text-xs text-ink-soft"
+                    title={rosterText}
+                  >
+                    {rosterText}
+                  </span>
+                </td>
+                <td className="nums whitespace-nowrap">{m.orderNumber}</td>
+                <td className="whitespace-nowrap">
                   {/* 后端加了新匹配方式而前端还没发版时，原样显示比空着强 */}
                   <span className="badge-neutral">
                     {MATCHED_BY_LABEL[m.matchedBy] ?? m.matchedBy}
@@ -90,7 +129,7 @@ export function NoShowMatchTable({ matched, selectedKeys, onToggle, onToggleAll 
                     </span>
                   )}
                 </td>
-                <td>
+                <td className="whitespace-nowrap">
                   {m.scope === 'SPLIT_REQUIRED' ? (
                     <span
                       className="badge-warning"
@@ -101,8 +140,16 @@ export function NoShowMatchTable({ matched, selectedKeys, onToggle, onToggleAll 
                   ) : (
                     <span className="badge-neutral">整单</span>
                   )}
+                  {downgraded && (
+                    <span
+                      className="mt-1 block whitespace-normal text-[11px] leading-4 text-amber-700"
+                      title="服务端按整份名单判的是「整单」；取消勾选同单其他人后实际只标部分人，执行时会自动拆单"
+                    >
+                      取消勾选后该单将变为需拆单，建议重新匹配
+                    </span>
+                  )}
                 </td>
-                <td>
+                <td className="whitespace-nowrap">
                   {!m.hasReturn ? (
                     <span className="text-ink-muted">单程</span>
                   ) : m.returnDeparted ? (
@@ -120,7 +167,7 @@ export function NoShowMatchTable({ matched, selectedKeys, onToggle, onToggleAll 
                 <td>
                   <div className="flex flex-wrap items-center gap-1">
                     {m.alreadyNoShow && (
-                      <span className="badge-neutral" title="此前已标过 no-show">
+                      <span className="badge-neutral whitespace-nowrap" title="此前已标过 no-show">
                         已标记
                       </span>
                     )}
@@ -129,7 +176,15 @@ export function NoShowMatchTable({ matched, selectedKeys, onToggle, onToggleAll 
                         {b}
                       </span>
                     ))}
-                    {!m.alreadyNoShow && m.blockers.length === 0 && (
+                    {m.warning && (
+                      <span
+                        className="badge-warning"
+                        title="多人同名候选就地并入，补预检也没拿到这张单的口径，没有真正过一遍服务端合格性判定"
+                      >
+                        {m.warning}
+                      </span>
+                    )}
+                    {!m.alreadyNoShow && m.blockers.length === 0 && !m.warning && (
                       <span className="text-ink-muted">—</span>
                     )}
                   </div>

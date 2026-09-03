@@ -13,6 +13,7 @@ import {
 } from '@prisma/client';
 import { normalizePassengerFullName } from '../../lib/passenger-name.js';
 import { COUNTRY_ALPHA3_TO_ALPHA2 } from '../../lib/country-codes.js';
+import { businessDateISO } from '../../lib/business-time.js';
 
 // 团队议价结算价上限（CNY/人）。防误输天价；正常机票远低于此。
 export const SETTLEMENT_PRICE_CAP_CNY = 100_000;
@@ -1542,8 +1543,17 @@ export type NoShowBody = z.infer<typeof noShowBodySchema>;
 // 所以后端按「护照号精确 → 英文名归一化 → 中文名精确」逐行试，命中多人一律交人工点选。
 export const noShowBatchPreviewBodySchema = z.object({
   scheduleId: z.string().min(1, '请先选择航班班次'),
+  // names 两种形状都收：整块粘贴的**字符串**，以及前端已经切好的**字符串数组**（拼回带换行的
+  // 整块文本再走同一套解析）。只收其中一种就会出现「界面上贴了名单、后端一条 400」这种
+  // 前后端各说各话的故障，而这条路径每天都在用。
   // 上限 20000 字符 ≈ 500 行名单，与 NO_SHOW_ROSTER_MAX_LINES 同量级（防误传整本表格）。
-  names: z.string().min(1, '请粘贴 no-show 名单').max(20000, '名单过长，请分批处理'),
+  names: z
+    .union([z.string(), z.array(z.string()).max(600, '名单过长，请分批处理')])
+    .transform((v) => (Array.isArray(v) ? v.join('\n') : v))
+    .pipe(z.string().min(1, '请粘贴 no-show 名单').max(20000, '名单过长，请分批处理')),
+  // 「同时释放回程」勾选框的当前状态（缺省 true，与执行体同缺省）：带上它，逐单预检里
+  // 「回程已起飞不能释放」这类闸才与执行口径一致。
+  releaseReturn: z.boolean().optional(),
 });
 export type NoShowBatchPreviewBody = z.infer<typeof noShowBatchPreviewBodySchema>;
 
@@ -1561,7 +1571,9 @@ export const noShowBatchBodySchema = z.object({
       }),
     )
     .min(1, '请至少勾选一条')
-    .max(200, '单次最多处理 200 张单，请分批执行')
+    // 单次 50 张：批量是**串行**跑的，每单一个事务（拆单的单还要再走一整套 Split PNR），
+    // 200 张一批足以把一个 HTTP 请求拖到网关超时 —— 前端会自动分片连发。
+    .max(50, '单次最多处理 50 张单，请分批执行')
     .refine((list) => new Set(list.map((e) => e.orderId)).size === list.length, {
       message: '同一张订单只能出现一次，请把该单的乘客合并到一条里',
     }),
@@ -1572,12 +1584,40 @@ export type NoShowBatchBody = z.infer<typeof noShowBatchBodySchema>;
 
 // ── no-show 报表（GET /orders/no-show/report[/export]；ADMIN/STAFF）──────────────
 // 区间按**去程航班的起飞地当地日**取（与全站「出发日期」同口径），不是 no-show 的操作日期。
+
+/** 单次最长查询跨度（天，含首尾）。再长就把整库的班次都捞进内存了。 */
+export const NO_SHOW_REPORT_MAX_SPAN_DAYS = 92;
+/** 不传区间时的缺省跨度（天，含首尾）：近 30 天。 */
+export const NO_SHOW_REPORT_DEFAULT_SPAN_DAYS = 30;
+
+/** 业务日（上海）往前/往后 n 天的 YYYY-MM-DD。 */
+function businessDayShiftISO(days: number): string {
+  return businessDateISO(new Date(Date.now() + days * 86_400_000));
+}
+
+/** 两个 YYYY-MM-DD 之间的天数差（to - from）；不可解析回 NaN。 */
+function isoDayDiff(from: string, to: string): number {
+  return (Date.parse(`${to}T00:00:00Z`) - Date.parse(`${from}T00:00:00Z`)) / 86_400_000;
+}
+
 export const noShowReportQuerySchema = z
   .object({
-    from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD'),
-    to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD'),
+    // 前端把区间当可选参数发（不选就是「看看最近的情况」），所以这里**可不传**：
+    // 缺省 = 近 30 天。后端拿到的永远是一对具体日期，装载层不必再处理 undefined。
+    from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD').optional(),
+    to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD').optional(),
   })
-  .refine((q) => q.from <= q.to, { message: '开始日期不能晚于结束日期' });
+  .transform((q) => ({
+    from: q.from ?? businessDayShiftISO(-(NO_SHOW_REPORT_DEFAULT_SPAN_DAYS - 1)),
+    to: q.to ?? businessDayShiftISO(0),
+  }))
+  .refine((q) => Number.isFinite(isoDayDiff(q.from, q.to)), { message: '日期不是合法日期' })
+  .refine((q) => q.from <= q.to, { message: '开始日期不能晚于结束日期' })
+  // 跨度闸：这张表要先把区间内**所有**班次捞出来再按班次捞单，跨度越大越接近全表扫描。
+  // 92 天 ≈ 一个季度，覆盖了实际会查的所有口径；再长的请分段导出。
+  .refine((q) => isoDayDiff(q.from, q.to) + 1 <= NO_SHOW_REPORT_MAX_SPAN_DAYS, {
+    message: `单次最多查 ${NO_SHOW_REPORT_MAX_SPAN_DAYS} 天，请分段查询或导出`,
+  });
 export type NoShowReportQuery = z.infer<typeof noShowReportQuerySchema>;
 
 // ── 恢复回程（POST /orders/:id/restore-return-leg；ADMIN/STAFF）─────────────────

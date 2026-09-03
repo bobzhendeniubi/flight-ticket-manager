@@ -489,7 +489,7 @@ describe('no-show · 预检', () => {
     const res = await service.previewNoShow('ord-1', {}, ADMIN);
     expect(res.eligible).toBe(true);
     expect(res.returnItem?.ticketed).toBe(true);
-    expect(res.warnings.join('')).toContain('回程已出票（2 人有确认出票记录）');
+    expect(res.warnings.join('')).toContain('回程已出票（该段有 2 条确认出票记录）');
     expect(res.warnings.join('')).toContain('清成未开');
   });
 
@@ -1365,7 +1365,7 @@ describe('取消航段 · 已出票的段', () => {
     expect((err as AppError).statusCode).toBe(400);
     expect((err as AppError).code).toBe('ACKNOWLEDGEMENT_REQUIRED');
     expect((err as AppError).details).toMatchObject({
-      warnings: [expect.stringContaining('回程已出票（2 人有确认出票记录）')],
+      warnings: [expect.stringContaining('回程已出票（该段有 2 条确认出票记录）')],
     });
     expect(tx.$executeRaw).not.toHaveBeenCalled();
     expect(tx.orderItem.update).not.toHaveBeenCalled();

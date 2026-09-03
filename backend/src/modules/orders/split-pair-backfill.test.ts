@@ -13,6 +13,7 @@ import {
   decideRoomGroupPair,
   isHalfRoom,
   readBackfillRoomGroups,
+  ROOM_GROUP_UNOWNED_REASON,
   splitFromItemIdOf,
   withGroupPairKey,
   type BackfillItemView,
@@ -191,14 +192,74 @@ describe('decideRoomGroupPair · 分房表两个半房组', () => {
     expect(d).toEqual({ ok: true, sourceIndex: 0, splitIndex: 0 });
   });
 
-  it('没写 orderItemId 的老分房表也认', () => {
+  // 老分房表（没写 orderItemId）一律不配：一张单有两行住宿时，「按本单兜底」会把另一行的
+  // 半房组配过来，两间真房并成一间 —— 房控看到的可用房量凭空多一间，直接超卖。
+  it('没写 orderItemId 的老分房表一律跳过交人工（宁可不配）', () => {
     const d = decideRoomGroupPair(
       [group({ orderItemId: undefined })],
       [group({ id: 'g2', orderItemId: undefined })],
       'itm_src1',
       'itm_new1',
     );
-    expect(d.ok).toBe(true);
+    expect(d.ok).toBe(false);
+    if (!d.ok) expect(d.reason).toBe(ROOM_GROUP_UNOWNED_REASON);
+  });
+
+  it('一侧写了归属、另一侧没写 → 照样不配（半边兜底也不行）', () => {
+    const d = decideRoomGroupPair(
+      [group()],
+      [group({ id: 'g2', orderItemId: undefined })],
+      'itm_src1',
+      'itm_new1',
+    );
+    expect(d.ok).toBe(false);
+    if (!d.ok) expect(d.reason).toBe(ROOM_GROUP_UNOWNED_REASON);
+  });
+
+  it('归属指向别的行 → 不算候选（不会被误当成这一行的半间）', () => {
+    const d = decideRoomGroupPair(
+      [group({ orderItemId: 'itm_other_hotel_row' })],
+      [group({ id: 'g2', orderItemId: 'itm_new1' })],
+      'itm_src1',
+      'itm_new1',
+    );
+    expect(d.ok).toBe(false);
+    if (!d.ok) expect(d.reason).toMatch(/没有可配对的半房组/);
+  });
+
+  it('房组自带入住区间且对不上 → 不配（订单行区间之外的加保）', () => {
+    const d = decideRoomGroupPair(
+      [group({ checkIn: '2026-09-02', checkOut: '2026-09-05' } as BackfillRoomGroupView)],
+      [
+        group({
+          id: 'g2',
+          orderItemId: 'itm_new1',
+          checkIn: '2026-09-03',
+          checkOut: '2026-09-05',
+        } as BackfillRoomGroupView),
+      ],
+      'itm_src1',
+      'itm_new1',
+    );
+    expect(d.ok).toBe(false);
+    if (!d.ok) expect(d.reason).toMatch(/入住区间对不上/);
+  });
+
+  it('房组自带入住区间且一致 → 照常配对', () => {
+    const d = decideRoomGroupPair(
+      [group({ checkIn: '2026-09-02', checkOut: '2026-09-05' } as BackfillRoomGroupView)],
+      [
+        group({
+          id: 'g2',
+          orderItemId: 'itm_new1',
+          checkIn: '2026-09-02',
+          checkOut: '2026-09-05',
+        } as BackfillRoomGroupView),
+      ],
+      'itm_src1',
+      'itm_new1',
+    );
+    expect(d).toEqual({ ok: true, sourceIndex: 0, splitIndex: 0 });
   });
 
   it('一侧有两个候选 → 不猜，跳过交人工', () => {

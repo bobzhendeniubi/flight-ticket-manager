@@ -18,8 +18,14 @@
  *   · 两侧都还没有 splitPairKey（已有的一律不碰）。
  * 键值：`源行id:backfill-<该次拆单记录的 requestToken；取不到则回落到新行 id>`。
  *
- * 分房表同步：两张单的 roomAssignment 里，各自「半间 + 无配对键 + 归属这一行」的房组
- * **各恰好一个**时写同一把键；有两个以上就跳过交人工（无从判断谁配谁）。
+ * 分房表同步：两张单的 roomAssignment 里，各自「半间 + 无配对键 + **显式写了 orderItemId
+ * 且指向这一行**」的房组**各恰好一个**时写同一把键；有两个以上就跳过交人工（无从判断谁配谁）。
+ * 没写 orderItemId 的老房组一律跳过（原因「房组无行归属，交人工」）—— 一张单有两行住宿时
+ * 按单兜底会把另一行的半房组配过来，两间真房并成一间 = 超卖。
+ *
+ * 回收站单（order.deletedAt 非空）两侧都不回填。
+ * --apply 会额外落一条 CRITICAL 审计 `BACKFILL_SPLIT_PAIR_KEY`（after 带本次全量配对清单），
+ * 事后可据此逐条回溯或回滚。
  *
  * ⚠ 一个字都不动钱与房量：unitPrice / amount / unitCostCny / totalCostCny / roomsBilled /
  *   roomFraction 全部原样，只往 metadata 与房组上加一个 `splitPairKey` 字段。
@@ -50,6 +56,7 @@
  */
 import { OrderItemKind, Prisma } from '@prisma/client';
 import { prisma } from '../src/db/prisma.js';
+import { writeAudit } from '../src/lib/audit.js';
 import {
   decideItemPair,
   decideRoomGroupPair,
@@ -129,6 +136,9 @@ async function main(): Promise<void> {
     where: {
       kind: { in: [OrderItemKind.HOTEL, OrderItemKind.BUNDLE] },
       roomsBilled: new Prisma.Decimal(0.5),
+      // 回收站单不回填（口径同全站导出）：那些行早就不占房，给它们配上键只会
+      // 让房控把两个已删除的半间当成一间真房。
+      order: { deletedAt: null },
     },
     select: ITEM_SELECT,
     orderBy: { createdAt: 'asc' },
@@ -142,6 +152,15 @@ async function main(): Promise<void> {
 
   let paired = 0;
   let pairedGroups = 0;
+  /** 本次真正写下去的配对清单（--apply 时整份进审计的 after，事后可逐条回溯/回滚）。 */
+  const pairedLog: Array<{
+    sourceOrderNumber: string;
+    sourceItemId: string;
+    splitOrderNumber: string;
+    splitItemId: string;
+    splitPairKey: string;
+    roomGroupPaired: boolean;
+  }> = [];
   const skipReasons = new Map<string, number>();
   const skip = (itemId: string, reason: string): void => {
     skipReasons.set(reason, (skipReasons.get(reason) ?? 0) + 1);
@@ -180,13 +199,18 @@ async function main(): Promise<void> {
     const [sourceOrder, splitOrder] = await Promise.all([
       prisma.order.findUnique({
         where: { id: sourceView.orderId },
-        select: { id: true, orderNumber: true, roomAssignment: true },
+        select: { id: true, orderNumber: true, roomAssignment: true, deletedAt: true },
       }),
       prisma.order.findUnique({
         where: { id: splitView.orderId },
-        select: { id: true, orderNumber: true, roomAssignment: true },
+        select: { id: true, orderNumber: true, roomAssignment: true, deletedAt: true },
       }),
     ]);
+    // 源行那张单在回收站 → 整对不回填（候选侧已按 order.deletedAt 筛过，这里补上另一侧）。
+    if (sourceOrder?.deletedAt != null || splitOrder?.deletedAt != null) {
+      skip(row.id, '配对的另一张单在回收站');
+      continue;
+    }
     const groupDecision = decideRoomGroupPair(
       readBackfillRoomGroups(sourceOrder?.roomAssignment),
       readBackfillRoomGroups(splitOrder?.roomAssignment),
@@ -250,6 +274,39 @@ async function main(): Promise<void> {
       },
       { timeout: TX_TIMEOUT_MS, maxWait: TX_MAX_WAIT_MS },
     );
+
+    // 写成了才记进清单：事务抛错时这一对没落库，审计里不该出现它。
+    pairedLog.push({
+      sourceOrderNumber: sourceOrder?.orderNumber ?? '',
+      sourceItemId: sourceView.id,
+      splitOrderNumber: splitOrder?.orderNumber ?? '',
+      splitItemId: splitView.id,
+      splitPairKey: key,
+      roomGroupPaired: groupDecision.ok,
+    });
+  }
+
+  // --apply 必留一条 CRITICAL 审计：这把键决定房控把两个半间算成一间还是两间，
+  // 写错就是超卖。事后要能回答「谁、什么时候、给哪些行补了哪把键」，
+  // 光靠脚本的 stdout 是留不住的。
+  if (apply) {
+    await writeAudit({
+      actor: { label: 'backfill-split-pair-key', role: 'SYSTEM' },
+      action: 'BACKFILL_SPLIT_PAIR_KEY',
+      targetType: 'ORDER',
+      targetLabel: `拆单配对键回填 · 写入 ${pairedLog.length} 对（其中分房表 ${pairedGroups} 对）`,
+      after: {
+        scanned: scanned.length,
+        paired: pairedLog.length,
+        pairedRoomGroups: pairedGroups,
+        skipped: scanned.length - paired,
+        limit: limit ?? null,
+        skipReasons: Object.fromEntries(skipReasons),
+        // 全量清单进 after：回滚时逐条按 splitPairKey 找回这两行。
+        pairs: pairedLog,
+      },
+      severity: 'CRITICAL',
+    });
   }
 
   console.log(

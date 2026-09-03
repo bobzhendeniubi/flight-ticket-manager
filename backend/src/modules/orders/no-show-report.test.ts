@@ -9,11 +9,13 @@
  *   · 起飞后作废的座落 voided，不再算进 stillReleased；
  *   · workOrdersOpen 只数 NOSHOW_* 且 OPEN/IN_PROGRESS 的工单。
  */
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import ExcelJS from 'exceljs';
 import { OrderItemKind, ReminderStatus } from '@prisma/client';
+import type { PrismaClient } from '@prisma/client';
 import {
   aggregateNoShowReport,
+  loadNoShowReport,
   noShowReportFilename,
   renderNoShowReportWorkbook,
   type NoShowReportOrderView,
@@ -267,6 +269,36 @@ describe('明细行', () => {
     expect(r.details[0].passengers).toBe('林晓梅');
     expect(r.details[0].agent).toBe('直客');
     expect(r.details[0].noShowAt).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
+  });
+});
+
+// ── 装载层（假 client：只钉查询口径，不碰真库）────────────────────────────
+describe('loadNoShowReport · 装载口径', () => {
+  function fakeClient(scheduleIds: string[]) {
+    const findMany = vi.fn().mockResolvedValue([]);
+    const client = {
+      $queryRaw: vi.fn().mockResolvedValue(scheduleIds.map((id) => ({ id }))),
+      order: { findMany },
+    } as unknown as PrismaClient;
+    return { client, findMany };
+  }
+
+  // 没动过航段的单 legFlag 恒为 NONE，一个 no-show 快照都不会有。不粗筛的话，
+  // 一班几百张正常单要连行带 metadata 全捞进内存再逐单丢掉。
+  it('按 legFlag 粗筛（有索引），回收站单不进表', async () => {
+    const { client, findMany } = fakeClient(['sch-a']);
+    await loadNoShowReport('2026-09-01', '2026-09-03', client);
+    const where = findMany.mock.calls[0][0].where;
+    expect(where.legFlag).toEqual({ not: 'NONE' });
+    expect(where.deletedAt).toBeNull();
+    expect(where.items.some).toMatchObject({ flightScheduleId: { in: ['sch-a'] } });
+  });
+
+  it('区间内一个班次都没有 → 直接回空表，不去捞订单', async () => {
+    const { client, findMany } = fakeClient([]);
+    const r = await loadNoShowReport('2026-09-01', '2026-09-03', client);
+    expect(r).toEqual({ rows: [], totals: expect.any(Object), details: [] });
+    expect(findMany).not.toHaveBeenCalled();
   });
 });
 

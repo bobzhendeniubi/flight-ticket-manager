@@ -2609,8 +2609,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // ⚠ 路由顺序无所谓：Fastify 的 radix 路由静态段优先，`/orders/no-show/...` 不会被
   //    `/orders/:id/no-show` 抢走（反之亦然）。
   //
-  // POST /orders/no-show/batch-preview  body: { scheduleId, names }
-  //   只读：一个字段都不写库。matched 里的 blockers/eligible 与单单端点同源（_assessNoShow）。
+  // POST /orders/no-show/batch-preview  body: { scheduleId, names, releaseReturn? }
+  //   只读：一个字段都不写库。matched 里的 blockers/eligible 与单单端点同源（_assessNoShow），
+  //   releaseReturn 原样带进逐单预检，预检与执行两处的闸永远同一套口径。
+  //   names 收整块文本或字符串数组（数组会拼回换行文本）；超过单次上限时响应带
+  //   totalLines / processedLines / truncated，界面必须明说这次只看了前多少行。
   app.post('/no-show/batch-preview', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
     if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
@@ -2636,7 +2639,10 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     void writeAudit({
       actor: actorFromRequest(req),
       action: 'MARK_NO_SHOW_BATCH',
-      targetType: 'ORDER',
+      // 整批的对象是**一个班次**，不是某一张单。schema.AuditTargetType 没有 FLIGHT_SCHEDULE，
+      // 用 FLIGHT + scheduleId（口径同 EXPORT_ORDERS_BY_SCHEDULE）——
+      // 挂 ORDER 会让「按订单 id 查审计」的索引查询把班次 id 当订单 id，永远查不到这条。
+      targetType: 'FLIGHT',
       targetId: body.scheduleId,
       targetLabel:
         `按航班批量 no-show · ${body.entries.length} 张单 · ` +
@@ -2713,8 +2719,10 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       void writeAudit({
         actor: actorFromRequest(req),
         action: 'EXPORT_NO_SHOW_REPORT',
-        targetType: 'ORDER',
-        targetId: 'no-show-report',
+        // 这张表跨的是一段时间里的**若干班次**，没有单一对象：targetType 用 FLIGHT、
+        // targetId 留空，区间进 after。挂 ORDER + 'no-show-report' 会在按订单查审计时
+        // 混进一条对不上任何订单的记录。
+        targetType: 'FLIGHT',
         targetLabel: `no-show 报表 ${from} ~ ${to}`,
         after: { from, to },
       });

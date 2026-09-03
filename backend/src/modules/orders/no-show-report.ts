@@ -25,7 +25,7 @@
  */
 
 import ExcelJS from 'exceljs';
-import { OrderItemKind, ReminderStatus, type PrismaClient } from '@prisma/client';
+import { OrderItemKind, OrderLegFlag, ReminderStatus, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { businessDateTime } from '../../lib/business-time.js';
@@ -366,6 +366,11 @@ export async function loadNoShowReport(
   const orders = await client.order.findMany({
     where: {
       deletedAt: null,
+      // legFlag 粗筛（有索引）：没动过航段的单恒为 NONE，一个 no-show 快照都不会有 ——
+      // 不筛的话一班几百张正常单全都要连行带 metadata 捞进内存再逐单丢掉。
+      // 粗筛只保证「不漏」：取消航段的单 legFlag 也非 NONE，但它没有 noShow 快照，
+      // 会被 aggregateNoShowReport 里的「去程行必须带 noShow 快照」那一关精筛掉。
+      legFlag: { not: OrderLegFlag.NONE },
       items: { some: { kind: OrderItemKind.FLIGHT, flightScheduleId: { in: scheduleIds } } },
     },
     select: {

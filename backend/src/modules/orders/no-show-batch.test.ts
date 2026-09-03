@@ -5,6 +5,8 @@
  *   1. 权限：仅 ADMIN/STAFF；
  *   2. 候选池口径：只收「该班次是这单**去程**」的占座单 —— 同一班次是别单回程时绝不能进池；
  *   3. 同一张单被名单点到多人时只跑一次预检，结论分发给这单的每一行；
+ *      同一位乘客被多行命中时合并成一条（原文行都留在 lines 里）；
+ *   3b. releaseReturn 原样带进逐单预检；名单超上限时 totalLines / truncated 如实回；
  *   4. 对外只出证件号后 4 位；
  *   5. 执行逐单独立：一单失败不影响其它单，失败带稳定 code；
  *   6. 逐单 token 由「整批 token + 订单 id」稳定派生（整批重试才会命中逐单回放）。
@@ -26,7 +28,10 @@ import {
   previewNoShowBatch,
   type NoShowBatchService,
 } from './no-show-batch.js';
-import { deriveBatchOrderToken } from './no-show-roster-match.js';
+import {
+  deriveBatchOrderToken,
+  NO_SHOW_ROSTER_MAX_LINES,
+} from './no-show-roster-match.js';
 import { ForbiddenError, NotFoundError, AppError } from '../../lib/errors.js';
 import type { NoShowPreview } from './orders.service.js';
 
@@ -210,9 +215,77 @@ describe('批量 no-show · 预检', () => {
     expect(service.previewNoShow).toHaveBeenCalledTimes(1);
     expect(service.previewNoShow).toHaveBeenCalledWith(
       'ord-1',
-      { passengerIds: ['p-1', 'p-2'] },
+      { passengerIds: ['p-1', 'p-2'], releaseReturn: true },
       ADMIN,
     );
+  });
+
+  // 预检口径必须与执行口径同参：不带 releaseReturn 进去，「回程已起飞不能释放」这条闸
+  // 在贴名单时是绿的、点了执行才逐单蹦红。
+  it('releaseReturn 原样带进逐单预检（缺省 true）', async () => {
+    const service = fakeService();
+    await previewNoShowBatch(
+      { service },
+      { scheduleId: 'sch-out', names: '陈志远', releaseReturn: false },
+      ADMIN,
+    );
+    expect(service.previewNoShow).toHaveBeenCalledWith(
+      'ord-1',
+      { passengerIds: ['p-1'], releaseReturn: false },
+      ADMIN,
+    );
+
+    const withDefault = fakeService();
+    await previewNoShowBatch(
+      { service: withDefault },
+      { scheduleId: 'sch-out', names: '陈志远' },
+      ADMIN,
+    );
+    expect(withDefault.previewNoShow).toHaveBeenCalledWith(
+      'ord-1',
+      { passengerIds: ['p-1'], releaseReturn: true },
+      ADMIN,
+    );
+  });
+
+  // 同一个人被名单点到两次（中文名一行、拼音 + 护照号又一行）→ 勾选列表只该出现一条，
+  // 否则票务勾两次、执行时这一单会被排两遍。
+  it('同一位乘客被多行命中 → 合并成一条，原文行都留在 lines 里', async () => {
+    const r = await previewNoShowBatch(
+      { service: fakeService() },
+      { scheduleId: 'sch-out', names: '陈志远\nCHEN/ZHIYUAN E10000001' },
+      ADMIN,
+    );
+    expect(r.matched).toHaveLength(1);
+    expect(r.matched[0].passengerId).toBe('p-1');
+    // line 保留第一条（老前端只读这个字段）；lines 是全部命中的原文行。
+    expect(r.matched[0].line).toBe('陈志远');
+    expect(r.matched[0].lines).toEqual(['陈志远', 'CHEN/ZHIYUAN E10000001']);
+  });
+
+  it('名单超上限 → 仍处理前若干行，但 totalLines / truncated 明说', async () => {
+    const names = Array.from({ length: NO_SHOW_ROSTER_MAX_LINES + 8 }, (_, i) => `路人${i}`).join(
+      '\n',
+    );
+    const r = await previewNoShowBatch(
+      { service: fakeService() },
+      { scheduleId: 'sch-out', names },
+      ADMIN,
+    );
+    expect(r.totalLines).toBe(NO_SHOW_ROSTER_MAX_LINES + 8);
+    expect(r.processedLines).toBe(NO_SHOW_ROSTER_MAX_LINES);
+    expect(r.truncated).toBe(true);
+  });
+
+  it('名单没超上限 → truncated=false，两个计数一致', async () => {
+    const r = await previewNoShowBatch(
+      { service: fakeService() },
+      { scheduleId: 'sch-out', names: '陈志远\n林晓梅' },
+      ADMIN,
+    );
+    expect(r.totalLines).toBe(2);
+    expect(r.processedLines).toBe(2);
+    expect(r.truncated).toBe(false);
   });
 
   it('只勾一部分 → 预检回 SPLIT_REQUIRED，前端据此提示会先自动拆单', async () => {

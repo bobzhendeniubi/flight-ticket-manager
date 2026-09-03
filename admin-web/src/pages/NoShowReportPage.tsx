@@ -114,9 +114,15 @@ export function NoShowReportPage() {
     }
   }, [token, from, to]);
 
+  /**
+   * 跳订单列表：只带航班号 + 出发日，**不带** legFlag=NO_SHOW。
+   *
+   * legFlag 是单值物化列，优先级里 NO_SHOW 排最后（作废 > 已释放 > 已恢复 > 去程未登机）：
+   * 标了 no-show 又释放了回程的单，legFlag 已经是 RETURN_RELEASED —— 按 NO_SHOW 筛几乎必空，
+   * 而这恰恰是报表里数量最多的那一档。宁可列表宽一点（该班次该日的单都在），也别给一张空表。
+   */
   const openOrders = (row: NoShowReportRow) => {
     const qs = new URLSearchParams({
-      legFlag: 'NO_SHOW',
       flightNumber: row.flightNumber,
       flightDateFrom: row.departDate,
       flightDateTo: row.departDate,
@@ -135,7 +141,8 @@ export function NoShowReportPage() {
         <h1 className="page-title">no-show 报表</h1>
         <p className="page-sub">
           按班次看 no-show 的后续影响：释放了多少座、又恢复回去多少、有没有卖穿导致别人被顶，
-          以及现在还有多少座停在「已释放」没有着落。点某一行可以直接跳到对应的订单列表。
+          以及现在还有多少座停在「已释放」没有着落。点某一行可以直接跳到该航班当日的订单列表
+          （到了列表再按「航段状态」细筛）。
         </p>
       </section>
 
@@ -191,7 +198,12 @@ export function NoShowReportPage() {
             </button>
           </div>
         </div>
-        <p className="mt-2 text-sm text-slate-500">显示 {rows.length} 个班次</p>
+        <p className="mt-2 text-sm text-slate-500">
+          显示 {rows.length} 个班次
+          <span className="ml-2 text-xs text-ink-muted">
+            日期两端都可留空（不填按近 30 天算）；单次最多查 92 天，超了服务端会让你分段。
+          </span>
+        </p>
       </section>
 
       {error && <div className="card border-rose-200 bg-rose-50 text-rose-700">{error}</div>}
@@ -230,7 +242,7 @@ export function NoShowReportPage() {
                   <tr
                     key={row.scheduleId}
                     className="cursor-pointer"
-                    title="查看该班次的 no-show 订单"
+                    title="按该航班 + 该出发日查订单列表（含未处理的单，可在列表里按航段状态再筛）"
                     onClick={() => openOrders(row)}
                   >
                     <td className="nums">{row.departDate}</td>

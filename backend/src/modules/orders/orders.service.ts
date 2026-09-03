@@ -13865,7 +13865,7 @@ export class OrderService {
       : 0;
     if (confirmedTicketing > 0) {
       const ticketedWarning =
-        `${legZh}已出票（${confirmedTicketing} 人有确认出票记录）。` +
+        `${legZh}已出票（该段有 ${confirmedTicketing} 条确认出票记录）。` +
         `取消后系统会给票务派一条撤名单/退票工单，请确认已知悉。`;
       warnings.push(ticketedWarning);
       ackWarnings.push(ticketedWarning);
@@ -14630,7 +14630,7 @@ export class OrderService {
       : 0;
     if (returnItem && returnTicketedCount > 0) {
       warnings.push(
-        `回程已出票（${returnTicketedCount} 人有确认出票记录）。释放座位后系统会给票务派一条` +
+        `回程已出票（该段有 ${returnTicketedCount} 条确认出票记录）。释放座位后系统会给票务派一条` +
           '撤名单/退票工单，请确认已知悉。',
       );
     }

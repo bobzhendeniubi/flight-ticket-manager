@@ -409,7 +409,7 @@ describe('取消回程 · 准入闸', () => {
     expect(preview.eligible).toBe(true);
     expect(preview.blockers).toEqual([]);
     expect(preview.requiresAcknowledgement).toBe(true);
-    expect(preview.warnings.join('')).toContain('回程已出票（2 人有确认出票记录）');
+    expect(preview.warnings.join('')).toContain('回程已出票（该段有 2 条确认出票记录）');
     expect(preview.warnings.join('')).toContain('撤名单/退票工单');
   });
 
@@ -868,7 +868,7 @@ describe('取消去程 · 准入闸', () => {
     const preview = await service.previewCancelLeg('ord-1', 'OUTBOUND', ADMIN);
     expect(preview.eligible).toBe(true);
     expect(preview.requiresAcknowledgement).toBe(true);
-    expect(preview.warnings.join('')).toContain('去程已出票（1 人有确认出票记录）');
+    expect(preview.warnings.join('')).toContain('去程已出票（该段有 1 条确认出票记录）');
   });
 
   it('乘客有票号但本段没有确认出票记录 → 不产生任何闸或提示', async () => {
