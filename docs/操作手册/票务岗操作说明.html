@@ -37,6 +37,11 @@
   /* 界面示意图（纯 CSS 模拟） */
   .figure{ border:1px solid var(--line); border-radius:12px; background:var(--bg); padding:14px; margin:14px 0; font-size:13px; }
   .figure .cap{ font-size:12px; color:var(--ink-muted); margin-bottom:10px; }
+  /* 真实截图 */
+  figure.shot{ border:1px solid var(--line); border-radius:12px; background:var(--bg); padding:10px; margin:14px 0; }
+  figure.shot img{ display:block; width:100%; height:auto; border-radius:8px; border:1px solid var(--line); background:#fff; }
+  figure.shot figcaption{ font-size:12px; color:var(--ink-muted); margin-top:8px; line-height:1.6; }
+  figure.shot.narrow{ max-width:620px; }
   .mock{ background:#fff; border:1px solid var(--line); border-radius:10px; padding:12px; }
   .mock-row{ display:flex; flex-wrap:wrap; gap:8px; align-items:center; margin:6px 0; }
   .btn-p{ display:inline-block; background:var(--brand); color:#fff; border-radius:8px; padding:5px 12px; font-size:12.5px; font-weight:600; }
@@ -82,7 +87,7 @@
     body{ background:#fff; font-size:12.5px; }
     .page{ max-width:100%; padding:0; }
     h2{ page-break-after:avoid; margin-top:28px; }
-    .figure,.step,.faq,table{ page-break-inside:avoid; }
+    .figure,figure.shot,.step,.faq,table{ page-break-inside:avoid; }
     a{ color:inherit; text-decoration:none; }
   }
 </style>
@@ -407,8 +412,8 @@
   <li>标过去程 no-show 之后，只要回程座位还在（没释放过，或者释放后又恢复回来），这个入口<strong>不会消失</strong>，只是换个文案继续留在原地：只标了 no-show、当时没勾「同时释放回程」的单，按钮变成「释放回程座位」，之后随时能从这个按钮把回程放出去；标过 no-show、回程释放过又恢复回来的单，按钮变成「再次释放回程」（代理又不要回程了，再放一次）。回程一旦被释放或作废（不可再恢复），入口才会收起。</li>
   <li>回程那一行旁边有「恢复回程」按钮——只有回程座位处于「已释放」状态时才会出现。</li>
 </ul>
-<!-- TODO 截图：订单详情「no-show 处理」按钮位置 -->
-<!-- TODO 截图：回程行「恢复回程」按钮位置 -->
+<figure class="shot"><img src="shots-2026-09-03-noshow/01-入口-noshow处理按钮.png"><figcaption>图 7-1 · 订单详情底部「运营工具」下面就是「no-show 处理」入口（本单已标过、回程还在，这里会变成「释放回程座位」或「再次释放回程」）</figcaption></figure>
+<figure class="shot"><img src="shots-2026-09-03-noshow/04-徽标-去程noshow与回程已释放.png"><figcaption>图 7-2 · 处理完的样子：回程行挂琥珀色「回程已释放（可恢复）」并多出「恢复回程」按钮，去程行挂灰色「去程 no-show」</figcaption></figure>
 
 <h3>7.2 标记 no-show + 释放回程：怎么操作</h3>
 <div class="steps">
@@ -418,7 +423,8 @@
   <div class="step">可以填一句备注（比如航司名单的日期、核对来源）。</div>
   <div class="step">点确认，再确认一次就生效。</div>
 </div>
-<!-- TODO 截图：no-show 处理面板（勾人 / 同时释放回程 / 备注 / 确认） -->
+<figure class="shot"><img src="shots-2026-09-03-noshow/02-面板-勾人与释放回程.png"><figcaption>图 7-3 · no-show 处理面板：上半截是去程 / 回程摘要，中间勾人（默认全选＝整单），下面是「同时释放回程座位」与备注</figcaption></figure>
+<figure class="shot"><img src="shots-2026-09-03-noshow/03-面板-只勾部分人自动拆单.png"><figcaption>图 7-4 · 只勾了 2 位里的 1 位：面板顶部会先说明「将先拆单，再对拆出的新单处理」，琥珀框里写清这一单会怎么拆</figcaption></figure>
 
 <h3>7.3 面板打不开 / 点了没反应？预检拦截的几种情况</h3>
 <p>点开面板会先自动预检，不满足的条件会逐条列在面板上，人话版对照：</p>
@@ -457,10 +463,15 @@
   <div class="step">有余位：直接占回原班次、原舱位（含当初升舱拆分的座位，也是原样占回），点确认即可。</div>
   <div class="step">没余位：不是勾选框，而是弹一个<strong>红色二次确认框</strong>，按钮文案会写清楚这次还要再超几座（比如「确认再超 2 座并恢复」）。面板会显示「该班已超售 A 座，本次再超 k 座，恢复后累计 N 座（上限 M 座）」——上限按这个<strong>班次累计</strong>算，不是单看这一次。点了按钮才真正超售，系统按<strong>关键审计</strong>记这一笔，超过上限会直接拒绝，不能无限超下去。</div>
 </div>
-<!-- TODO 截图：恢复回程面板（有余位 / 超售二次确认两种状态） -->
+<figure class="shot"><img src="shots-2026-09-03-noshow/05-恢复回程-有余位.png"><figcaption>图 7-5 · 有余位：面板写明「恢复到原班次 … 需占 N 座 · 当前余位 M 座 · 钱款不动」，按钮是绿色「确认恢复回程」</figcaption></figure>
+<figure class="shot"><img src="shots-2026-09-03-noshow/06-恢复回程-无余位需超售确认.png"><figcaption>图 7-6 · 没余位：多出一条琥珀提示「该班已满，本次超售 N 座（上限 M 座）。确认后会记关键审计」，按钮文案变成「超售恢复回程」，点下去还要再确认一次</figcaption></figure>
 
-<h3>7.6 再次释放</h3>
+<h3>7.6 再次释放 / 回程起飞后作废</h3>
 <p>回程恢复回去之后，代理又说不要了——这种情况很常见。此时订单详情的入口按钮会自动变成「再次释放回程」，不用重新勾人，直接对回程再放一次座位。去程最初标记 no-show 的时间和操作人不会被覆盖，系统只会在历史记录里追加这一次释放的记录，方便事后核对总共释放过几次。</p>
+<figure class="shot"><img src="shots-2026-09-03-noshow/07-徽标-回程已恢复.png"><figcaption>图 7-7 · 恢复成功后回程行换成绿色「回程已恢复」（超售恢复的还会带「（超售 N 座）」），去程行的「去程 no-show」保持不变</figcaption></figure>
+<figure class="shot"><img src="shots-2026-09-03-noshow/08-入口-再次释放回程.png"><figcaption>图 7-8 · 恢复过一次之后，原来的入口按钮自动变成「再次释放回程」，点它就能再放一次，不用重新勾人</figcaption></figure>
+<p><strong>回程一直没人来要、班次也飞完了，怎么收尾？</strong>座位早就放回库存卖掉了，这一段留在「已释放」状态没有意义。原班次起飞之后，回程行会多出一个红色的「确认作废回程」；点开面板核对一遍航段和座位数，确认即可。<strong>作废之后不可恢复，钱同样一分不动。</strong>没人手工点的，系统会在原班次起飞 2 小时后自动作废，效果一样。</p>
+<figure class="shot"><img src="shots-2026-09-03-noshow/09-作废回程-面板.png"><figcaption>图 7-9 · 作废回程面板：写明「原 N 座 · 座位早已释放、班次已起飞 · 作废后不可恢复 · 钱款不动」</figcaption></figure>
 
 <h3>7.7 客人要换到别的日期飞，怎么办</h3>
 <p>no-show 处理和恢复回程都不涉及换班次。客人如果不是不来了，而是要<strong>换到别的日期</strong>，按第六节的「改期」流程走，改期费按政策收取，跟本节无关。</p>
@@ -474,6 +485,28 @@
   <tr><td>算不算飞行次数</td><td>该段本就取消了，不涉及</td><td>去程不计入飞行次数（客人没坐这趟）</td></tr>
   <tr><td>已出票怎么办</td><td>可以取消，勾「已知悉」后系统自动派撤名单/退票工单给票务</td><td>回程释放时若已出票，同样自动派撤名单/退票工单；去程本身不涉及退票</td></tr>
 </table>
+
+<figure class="shot"><img src="shots-2026-09-03-noshow/10-取消回程-已出票提示与已知悉.png"><figcaption>图 7-10 · 走「取消航段」时，如果那一段已经出过票，面板会先弹琥珀提示，还要勾一次「已知悉」才能提交——提交后系统自动派撤名单 / 退票工单给票务</figcaption></figure>
+<h3>7.9 按航班批量处理（一次贴一整份 no-show 名单）</h3>
+<p>航司发来的是一整份名单，一单一单点太慢。左侧导航<strong>运营 → 「no-show 处理」</strong>页可以按班次一次处理完。</p>
+<div class="steps">
+  <div class="step">第 1 步选班次：先填<strong>出发日期</strong>，再选航班号、选具体班次。选中后上方会显示这个班次已售多少座、是不是「已起飞」——<strong>没起飞的班次不能提交</strong>。</div>
+  <div class="step">第 2 步贴名单：一行一个，<strong>证件姓名 / 中文名 / 护照号都认，护照号最准</strong>（姓名容易撞同名）。空行和重复行系统自动忽略。贴完点「匹配」。</div>
+  <div class="step">第 3 步看匹配结果：能标的行默认打勾；不能标的行会灰掉，最后一列写清原因。表下面还会单列「未匹配」（这个班次里没找到这个人）和「多人同名」（一个名字撞了好几位，点选其中一位并进上面的表；实在分不开就改用护照号）。</div>
+  <div class="step">第 4 步提交：勾不勾「同时释放回程座位」和单单处理是一个意思。点「标记 no-show」，下面会出结果表：每张单成功还是失败、释放了几座、有没有开撤名单工单、失败的原因是什么。失败的可以点「重试失败项」再来一遍。</div>
+</div>
+<figure class="shot"><img src="shots-2026-09-03-noshow/11-批量-选班次与贴名单.png"><figcaption>图 7-11 · 第 1、2 步：选日期 → 航班号 → 班次（选中后能看到「已售 N 座 / 已起飞」），再把名单整块贴进去</figcaption></figure>
+<figure class="shot"><img src="shots-2026-09-03-noshow/12-批量-匹配结果.png"><figcaption>图 7-12 · 第 3 步匹配结果：能标的打勾，不能标的灰掉并写清原因；下面分别是「未匹配」和「多人同名」两个待处理区</figcaption></figure>
+<figure class="shot"><img src="shots-2026-09-03-noshow/13-批量-提交结果.png"><figcaption>图 7-13 · 第 4 步提交结果：一行一张单，写明结果、释放座位数、工单与失败原因</figcaption></figure>
+<div class="warn">同名撞车时，系统<strong>不替你挑人</strong>。请按护照号核对清楚再选，选错了就等于给没事的客人标了 no-show、还把他回程座位放出去卖了。</div>
+<h3>7.10 no-show 报表与撤名单工单提醒</h3>
+<p><strong>报表</strong>在左侧导航<strong>财务 → 「no-show 报表」</strong>（也可以从 no-show 处理页顶部的「报表」页签切过去）。按<strong>出发日期区间</strong>筛，一行一个班次，看得到这个班次 no-show 了多少人、放出去多少座、又恢复回来多少、有没有超售或把别人顶掉、还有多少座停在「已释放」没着落、以及未结的工单数。点某一行会直接跳到对应的订单列表；右上角「导出 xlsx」按当前区间导出，口径和页面上完全一样。</p>
+<figure class="shot"><img src="shots-2026-09-03-noshow/14-报表-班次汇总与导出.png"><figcaption>图 7-14 · no-show 报表：按出发日期区间筛，一行一个班次；右上角「导出 xlsx」与页面同口径</figcaption></figure>
+<p><strong>工单提醒</strong>在顶栏右侧的三角铃铛。释放（或取消）了已出票的回程，系统会自动开一条「撤名单 / 退票」工单，铃铛上的数字就是未结条数。点开能看到工单标题（带订单号和航段方向）和当前状态，点「去提醒中心处理」进提醒中心；<strong>去航司渠道办完撤名单或退票后，回来把工单标记成已处理</strong>，铃铛才会减下去。</p>
+<figure class="shot narrow"><img src="shots-2026-09-03-noshow/15-工单铃铛-撤名单下拉.png"><figcaption>图 7-15 · 顶栏铃铛：数字＝未结的撤名单 / 退票工单条数，点开能直接跳去提醒中心处理</figcaption></figure>
+<h3>7.11 代理那边看到什么</h3>
+<p>代理和客户看到的是<strong>中性文案</strong>，不会出现我们内部的「no-show」「已释放」这类说法：去程行显示<strong>「去程未登机」</strong>，回程行显示<strong>「回程座位已释放，如需保留请联系运营恢复」</strong>（订单列表和小程序里简写成「回程待重新安排」）。所以代理看到这条提示来找你，就是要恢复回程——按 7.5 走一遍即可。</p>
+<figure class="shot"><img src="shots-2026-09-03-noshow/18-代理视角-回程待重新安排.png"><figcaption>图 7-16 · 代理登录后看到的同一张单：航段行只有中性状态，没有内部口径和操作按钮</figcaption></figure>
 
 <!-- ─────────────── 8 ─────────────── -->
 <h2 id="s8">八、《票务专用》导出与 PNR 提交表</h2>
