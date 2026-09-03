@@ -44,7 +44,6 @@ import {
   PRICE_ADJUSTMENT_REASON_LABEL,
   PRICE_ADJUSTMENT_REASON_OPTIONS,
   VISA_STATUS_LABEL,
-  settlementRequestsApi,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from './NumberInput';
@@ -377,7 +376,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [adjustAmount, setAdjustAmount] = useState<number | null>(null);
   const [adjustReason, setAdjustReason] = useState<PriceAdjustmentReason>('DISCOUNT');
   const [adjustText, setAdjustText] = useState('');
-  // 本单结算总价（仅 ADMIN/STAFF 可见；提交为 settlementTotalCny）：代理单一口价，系统照此收钱。
+  // 本单结算总价（运营与代理都可填；提交为 settlementTotalCny）：一口价，系统照此收钱。
   // 服务端按「结算价 − 权威合计」自动生成一条「代理结算价」（SETTLEMENT）差额行——不改任何
   // 明细行价格，原价/差额留痕可审计。与下方手工「调整金额」互斥（服务端 400，前端也阻断提交）。
   const [settlementPrice, setSettlementPrice] = useState<number | null>(null);
@@ -385,19 +384,6 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 提交为 perPassengerSettlementCny（与 settlementTotalCny 互斥；开启时清空整单结算价）。
   // 服务端仍走差额模型落库（min 基准 + 按乘客 SETTLEMENT 差额行），不是手填行价的口子。
   const [perPaxSettlementOn, setPerPaxSettlementOn] = useState(false);
-
-  // ── 议价申请（仅 AGENT；不开手填结算价口子）──────────────────────────────
-  // 代理不能直接改结算价，只能对「本单」提交一个「想按这个价结算」的申请，运营确认后才生效；
-  // 不影响本次下单价格/流程——下单仍按系统结算价（或既有结算价日历）走，申请是下单成功后
-  // 额外挂一条 PENDING 记录。折叠默认收起，避免多数不议价的单也要看这一坨。
-  const [bargainRequestOpen, setBargainRequestOpen] = useState(false);
-  const [bargainRequestAmount, setBargainRequestAmount] = useState<number | null>(null);
-  const [bargainRequestNote, setBargainRequestNote] = useState('');
-  const [bargainRequestSubmitting, setBargainRequestSubmitting] = useState(false);
-  // 下单成功后议价申请的提交结果（订单已经建成，这里只是告知申请有没有递上去）。
-  const [bargainRequestResult, setBargainRequestResult] = useState<
-    { ok: true } | { ok: false; message: string } | null
-  >(null);
 
   // ── 产品目录（各区块共用一份，按本单用到的类型按需加载）──
   // hotels 里的星级随机池是哨兵项（见 poolOptionValue）——客人买「N 星随机」，
@@ -872,19 +858,14 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const hasValidAdjustment = adjustIsInteger && !adjustNeedsText;
   const adjustError = adjustIsInteger && adjustNeedsText ? '选择「其它」时请填写调整原因说明' : null;
 
-  // ── 本单结算总价（仅 ADMIN/STAFF）──
+  // ── 本单结算总价 ──
   const isStaffUser = user?.role === 'ADMIN' || user?.role === 'STAFF';
-  // 代理录单：只看结算价（业务拍板）。系统价/调价/手工结算总价是运营概念，对代理隐藏；
+  // 代理录单：只看结算价（业务拍板）。系统价/调价是运营概念，对代理隐藏；
   // quote 接口对 AGENT 已在服务端强制归属自家，结算价预览无需先选归属代理。
+  // 结算价锁定前代理可以自己填 / 自己改，不经运营审批（锁定后才走议价申请，见订单详情）。
   const isAgentUser = user?.role === 'AGENT';
-  // 代理头部金额：结算价日历命中 → 日历合计；日历缺价 → 不给数（下方黄条提示）；
-  // 无日历接管（纯酒店/签证/未配日历）→ 权威价即应付结算额。
-  const agentHeaderTotal =
-    settlementPreview?.ok === true
-      ? settlementPreview.totalCny
-      : settlementPreview?.ok === false
-        ? null
-        : quoteTotal;
+  // 手填结算价开放给运营与代理；「调整金额 / 机票结算价」等运营通道仍只对运营开放。
+  const canFillSettlement = isStaffUser || isAgentUser;
   // 差额上限（镜像后端 PRICE_ADJUSTMENT_CAP_CNY）：超出直接前端阻断，省一次必败的提交。
   const SETTLEMENT_DIFF_CAP_CNY = 100_000;
   // 差额 = 结算价 − 系统价（表单当前试算值；对齐到分，避免浮点尾差）。系统价不可用时为 null。
@@ -912,7 +893,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const validPassengerEntries = passengers
     .map((p, idx) => ({ p, idx }))
     .filter(({ p }) => p.fullName.trim() && p.documentNumber.trim() && parseDob(p.dateOfBirth));
-  const perPaxEligible = isStaffUser && validPassengerEntries.length >= 2;
+  const perPaxEligible = canFillSettlement && validPassengerEntries.length >= 2;
   const perPaxActive = perPaxSettlementOn && perPaxEligible;
   const perPaxPrices = validPassengerEntries.map(({ p }) => p.settlementCny ?? null);
   const perPaxAllFilled = perPaxPrices.every((v) => v !== null && v >= 0);
@@ -943,19 +924,19 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       ? '「按人填结算价」与「调整金额」不能同时填写（两者互斥）；请清空其中一个'
       : null;
 
-  // ── 议价申请派生（仅 AGENT）── 对照的「系统结算价」与页面头部金额同一口径（agentHeaderTotal）。
-  const bargainRequestDiff =
-    bargainRequestAmount !== null && agentHeaderTotal !== null
-      ? Math.round((bargainRequestAmount - agentHeaderTotal) * 100) / 100
-      : null;
-  const bargainRequestError =
-    bargainRequestAmount === null
-      ? null
-      : Number(bargainRequestAmount.toFixed(2)) !== bargainRequestAmount
-        ? '申请结算总价最多两位小数'
-        : bargainRequestAmount <= 0
-          ? '申请结算总价需大于 0'
-          : null;
+  // 代理头部金额：自己填了结算价 → 以填的为准（整单价 / 按人填合计）；
+  // 没填则结算价日历命中 → 日历合计；日历缺价 → 不给数（下方黄条提示）；
+  // 无日历接管（纯酒店/签证/未配日历）→ 权威价即应付结算额。
+  const agentHeaderTotal =
+    settlementPrice !== null
+      ? settlementPrice
+      : perPaxActive && perPaxSumCny !== null
+        ? perPaxSumCny
+        : settlementPreview?.ok === true
+          ? settlementPreview.totalCny
+          : settlementPreview?.ok === false
+            ? null
+            : quoteTotal;
 
   function setPassenger(i: number, patch: Partial<PassengerRow>): void {
     setPassengers((prev) => {
@@ -1484,12 +1465,6 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       return;
     }
 
-    // 议价申请：格式错误也阻断提交（订单还没建，让代理先把申请价填对，避免建单后申请再报错）。
-    if (bargainRequestError) {
-      setErr(bargainRequestError);
-      return;
-    }
-
     // 指定酒店星级 ≠ 套餐档次星级：block-with-override（此前只是琥珀色提醒，照样能提交，
     // 于是「四星档的单指到五星店」不声不响地过去，成本对不上账才被发现）。
     //   · 代理：一律拦下（服务端对 AGENT 直接 400，前端先把话说清楚，省一次必败提交）；
@@ -1588,13 +1563,13 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
             },
           }
         : {}),
-      // 结算价通道（仅 ADMIN/STAFF；与 priceAdjustment 互斥，上方已阻断同时填写）二选一：
+      // 结算价通道（运营与代理都可填；与 priceAdjustment 互斥，上方已阻断同时填写）二选一：
       //   · 按人填结算价：与 passengerPayload（=validPassengers）同序等长的逐人价数组，
       //     服务端按差额模型落库（min 基准 + 按乘客 SETTLEMENT 差额行挂 passengerId）。
       //   · 本单结算总价：服务端按「结算价 − 权威合计」自动生成「代理结算价」差额行，系统照此收钱。
       ...(perPaxActive && perPaxSumCny !== null
         ? { perPassengerSettlementCny: perPaxPrices as number[] }
-        : isStaffUser && settlementPrice !== null
+        : canFillSettlement && settlementPrice !== null
           ? { settlementTotalCny: settlementPrice }
           : {}),
     };
@@ -1627,32 +1602,6 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       setShowRooming(false);
       setIdemKey(makeIdemKey());
       onCreated();
-
-      // 议价申请：订单已经建成，这一步失败绝不能倒回去污染「录单成功」——单独 try/catch，
-      // 只落一个提交结果供成功页展示，不进外层 catch（那会误报「录单失败」）。
-      // 只在真填了申请价、且与系统结算价不同（对齐到分）时才提交；相等 = 后端也会 400，白提交一次。
-      if (isAgentUser && bargainRequestAmount !== null && !bargainRequestError) {
-        const sameAsSystem =
-          agentHeaderTotal !== null &&
-          Math.round((bargainRequestAmount - agentHeaderTotal) * 100) === 0;
-        if (!sameAsSystem) {
-          setBargainRequestSubmitting(true);
-          try {
-            await settlementRequestsApi.createSettlementRequest(token, res.order.id, {
-              requestedTotalCny: bargainRequestAmount,
-              note: bargainRequestNote.trim() || undefined,
-            });
-            setBargainRequestResult({ ok: true });
-          } catch (e: unknown) {
-            setBargainRequestResult({
-              ok: false,
-              message: e instanceof ApiError ? e.message : '提交失败，请稍后重试',
-            });
-          } finally {
-            setBargainRequestSubmitting(false);
-          }
-        }
-      }
     } catch (e: unknown) {
       setErr(e instanceof ApiError ? e.message : '录单失败');
     } finally {
@@ -1788,11 +1737,6 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     // 每人结算价数值随 setPassengers([emptyPassenger()]) 清空，这里只复位模式开关。
     setSettlementPrice(null);
     setPerPaxSettlementOn(false);
-    // 议价申请同款复位：金额/备注/折叠态/上一单的提交结果都不该带到下一单。
-    setBargainRequestOpen(false);
-    setBargainRequestAmount(null);
-    setBargainRequestNote('');
-    setBargainRequestResult(null);
   }
 
   const inputCls = 'mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm';
@@ -1815,21 +1759,6 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               <Icon name="check" size={14} /> 录单成功 · 订单号 <b className="font-mono">{okOrderNumber}</b>
               {roomingSaved && <span className="ml-2 text-emerald-700">· 分房已保存</span>}
             </div>
-
-            {/* 议价申请提交结果：订单已经建成，这里只是告知申请有没有递上去，不影响上面的成功状态。 */}
-            {bargainRequestSubmitting && (
-              <div className="rounded-md bg-slate-50 px-4 py-2 text-xs text-slate-500">议价申请提交中…</div>
-            )}
-            {bargainRequestResult?.ok === true && (
-              <div className="rounded-md bg-brand-50 px-4 py-2 text-xs text-brand-800">
-                <Icon name="check" size={12} /> 议价申请已提交，运营确认后结算价才会更新，可到订单详情查看进度。
-              </div>
-            )}
-            {bargainRequestResult?.ok === false && (
-              <div className="rounded-md bg-rose-50 px-4 py-2 text-xs text-rose-700">
-                订单已建立，议价申请提交失败：{bargainRequestResult.message}，可到订单详情里再提。
-              </div>
-            )}
 
             {/* 录单后分房：进入分房编辑器 */}
             {showRooming && roomingPassengers.length > 0 ? (
@@ -2772,10 +2701,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               )}
               {(agentId || isAgentUser) && settlementPrice === null && settlementPreview?.ok === false && (
                 <p className="mt-2 rounded-md border border-amber-200 bg-amber-50 px-3 py-2 text-[11px] text-amber-800">
-                  {settlementPreview.reason}——提交将被拒，{isAgentUser ? '请联系运营维护结算价' : '请先维护结算价日历'}
+                  {settlementPreview.reason}——{isAgentUser ? '请在下方自行填写本单结算价，否则提交将被拒' : '提交将被拒，请先维护结算价日历'}
                 </p>
               )}
-              {agentId && settlementPrice !== null && (
+              {(agentId || isAgentUser) && settlementPrice !== null && (
                 <p className="mt-2 rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-600">
                   已填手工结算价，结算价日历不生效
                 </p>
@@ -2786,16 +2715,25 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 </p>
               )}
 
-              {isStaffUser && <div className="mt-3 border-t border-slate-100 pt-3">
-                <div className="mb-1.5 text-xs font-medium text-slate-600">
-                  价格调整（选填）— 优惠 / 补收杂费 / 变更改期费
-                </div>
-                <p className="mb-1.5 text-[11px] text-slate-400">
-                  升舱/单人入住请用套餐加购选项（占真实库存）；换酒店走订单详情「换酒店」；签证改多签请更换签证产品——这些操作不要走调价，否则相关岗位看不到。
-                </p>
-                {isStaffUser && (
+              {canFillSettlement && <div className="mt-3 border-t border-slate-100 pt-3">
+                {isStaffUser ? (
                   <>
-                    {perPaxEligible && (
+                    <div className="mb-1.5 text-xs font-medium text-slate-600">
+                      价格调整（选填）— 优惠 / 补收杂费 / 变更改期费
+                    </div>
+                    <p className="mb-1.5 text-[11px] text-slate-400">
+                      升舱/单人入住请用套餐加购选项（占真实库存）；换酒店走订单详情「换酒店」；签证改多签请更换签证产品——这些操作不要走调价，否则相关岗位看不到。
+                    </p>
+                  </>
+                ) : (
+                  <>
+                    <div className="mb-1.5 text-xs font-medium text-slate-600">结算价（可自填）</div>
+                    <p className="mb-1.5 text-[11px] text-slate-400">
+                      不填按协议价自动计算；填了以你填的为准，锁价前可在订单详情再改。
+                    </p>
+                  </>
+                )}
+                {perPaxEligible && (
                       <label className="mb-2 flex items-center gap-1.5 text-xs text-slate-600">
                         <input
                           type="checkbox"
@@ -2806,7 +2744,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                             if (e.target.checked) setSettlementPrice(null);
                           }}
                         />
-                        按人填结算价（同单多人结算价不同时逐人填，系统自动按差额留痕落账）
+                        {isStaffUser
+                          ? '按人填结算价（同单多人结算价不同时逐人填，系统自动按差额留痕落账）'
+                          : '按人填结算价（同单每个人价格不一样时逐人填）'}
                       </label>
                     )}
                     {perPaxActive ? (
@@ -2829,7 +2769,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                             <span className="text-xs text-slate-500">合计（提交后订单总额按此收敛）</span>
                             <span className="text-xs font-medium text-slate-700">
                               ¥{perPaxSumCny.toLocaleString('zh-CN')}
-                              {perPaxDiff !== null && quoteTotal !== null
+                              {isStaffUser && perPaxDiff !== null && quoteTotal !== null
                                 ? `（系统价 ¥${quoteTotal.toLocaleString('zh-CN')} · 差额 ${perPaxDiff >= 0 ? '+' : '−'}¥${Math.abs(perPaxDiff).toLocaleString('zh-CN')}）`
                                 : ''}
                             </span>
@@ -2837,14 +2777,18 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                         )}
                         {perPaxError && <p className="text-[11px] text-rose-500">{perPaxError}</p>}
                         {perPaxConflict && <p className="text-[11px] text-rose-500">{perPaxConflict}</p>}
-                        <p className="text-[11px] text-slate-400">
-                          逐人价落库仍走差额留痕：整单按最低每人价收敛，价高的乘客各挂一条「代理结算价」差额行；订单详情「每人结算价」表即为此处所填逐人价。与下方「调整金额」互斥。
-                        </p>
+                        {isStaffUser && (
+                          <p className="text-[11px] text-slate-400">
+                            逐人价落库仍走差额留痕：整单按最低每人价收敛，价高的乘客各挂一条「代理结算价」差额行；订单详情「每人结算价」表即为此处所填逐人价。与下方「调整金额」互斥。
+                          </p>
+                        )}
                       </div>
                     ) : (
                       <>
                         <label className="mb-2 block text-xs text-slate-500">
-                          本单结算总价（¥，选填：与代理谈定的一口价，系统照此收钱）
+                          {isStaffUser
+                            ? '本单结算总价（¥，选填：与代理谈定的一口价，系统照此收钱）'
+                            : '本单结算总价（¥，选填：填了就按这个价结算）'}
                           <NumberInput
                             className={inputCls}
                             value={settlementPrice}
@@ -2856,21 +2800,25 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                           <div className="mb-1.5 flex items-center justify-between rounded-md bg-slate-50 px-2.5 py-1.5">
                             <span className="text-xs text-slate-500">结算价预览</span>
                             <span className="text-xs font-medium text-slate-700">
-                              {settlementDiff !== null && quoteTotal !== null
-                                ? `系统价 ¥${quoteTotal.toLocaleString('zh-CN')} · 结算价 ¥${settlementPrice.toLocaleString('zh-CN')} · 差额 ${settlementDiff >= 0 ? '+' : '−'}¥${Math.abs(settlementDiff).toLocaleString('zh-CN')}`
-                                : `结算价 ¥${settlementPrice.toLocaleString('zh-CN')}（系统价试算中/不可用，差额以提交后服务端权威价为准）`}
+                              {!isStaffUser
+                                ? `本单按 ¥${settlementPrice.toLocaleString('zh-CN')} 结算`
+                                : settlementDiff !== null && quoteTotal !== null
+                                  ? `系统价 ¥${quoteTotal.toLocaleString('zh-CN')} · 结算价 ¥${settlementPrice.toLocaleString('zh-CN')} · 差额 ${settlementDiff >= 0 ? '+' : '−'}¥${Math.abs(settlementDiff).toLocaleString('zh-CN')}`
+                                  : `结算价 ¥${settlementPrice.toLocaleString('zh-CN')}（系统价试算中/不可用，差额以提交后服务端权威价为准）`}
                             </span>
                           </div>
                         )}
                         {settlementError && <p className="mb-1.5 text-[11px] text-rose-500">{settlementError}</p>}
                         {settlementConflict && <p className="mb-1.5 text-[11px] text-rose-500">{settlementConflict}</p>}
-                        <p className="mb-1.5 text-[11px] text-slate-400">
-                          填写后系统按「结算价 − 系统价」自动生成一条「代理结算价」调价行（不改明细行价格，留痕可审计）；与下方「调整金额」互斥，二选一。
-                        </p>
+                        {isStaffUser && (
+                          <p className="mb-1.5 text-[11px] text-slate-400">
+                            填写后系统按「结算价 − 系统价」自动生成一条「代理结算价」调价行（不改明细行价格，留痕可审计）；与下方「调整金额」互斥，二选一。
+                          </p>
+                        )}
                       </>
                     )}
-                  </>
-                )}
+                {isStaffUser && (
+                <>
                 <div className="grid gap-2 md:grid-cols-3">
                   <label className="text-xs text-slate-500">
                     调整金额（¥，可负=优惠）
@@ -2921,73 +2869,15 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 <p className="mt-1.5 text-[11px] text-slate-400">
                   调价只在系统权威价上加减一笔并留审计记录；不会改动机票/酒店等基础项的权威价。
                 </p>
+                </>
+                )}
               </div>}
             </div>
-
-            {/* 议价申请（仅 AGENT）：代理不能手填结算价，只能对本单提交「想按这个价结算」的申请，
-                运营确认后才生效；不影响本次下单——提交/不提交都不改变上面的结算价与下单流程。 */}
-            {isAgentUser && (
-              <div className="rounded-lg border border-slate-200 p-3">
-                <button
-                  type="button"
-                  className="flex w-full items-center justify-between text-left"
-                  onClick={() => setBargainRequestOpen((v) => !v)}
-                >
-                  <span className="text-sm font-medium text-slate-700">
-                    本单想按别的价结算？提交议价申请
-                  </span>
-                  <span className="text-xs text-slate-400">{bargainRequestOpen ? '收起 ▲' : '展开 ▼'}</span>
-                </button>
-                {bargainRequestOpen && (
-                  <div className="mt-2 space-y-2">
-                    <p className="text-[11px] text-slate-400">
-                      提交后不会改变本次下单的价格与流程，仍按上方结算价下单；运营确认这条申请后，订单结算价才会改成申请价。
-                    </p>
-                    <div className="flex items-center justify-between rounded-md bg-slate-50 px-2.5 py-1.5 text-xs text-slate-500">
-                      <span>当前结算价</span>
-                      <span className="font-medium text-slate-700">
-                        {agentHeaderTotal !== null ? `¥${agentHeaderTotal.toLocaleString('zh-CN')}` : '—'}
-                      </span>
-                    </div>
-                    <label className="block text-xs text-slate-500">
-                      申请结算总价（¥）
-                      <NumberInput
-                        className={inputCls}
-                        value={bargainRequestAmount}
-                        onChange={setBargainRequestAmount}
-                        placeholder={agentHeaderTotal !== null ? `如 ${Math.round(agentHeaderTotal)}` : '如 1500'}
-                      />
-                    </label>
-                    <label className="block text-xs text-slate-500">
-                      备注（选填）
-                      <input
-                        className={inputCls}
-                        value={bargainRequestNote}
-                        maxLength={200}
-                        onChange={(e) => setBargainRequestNote(e.target.value)}
-                        placeholder="如：客人同业价 ¥1500，麻烦按此价结算"
-                      />
-                    </label>
-                    {bargainRequestAmount !== null && !bargainRequestError && (
-                      <div className="flex items-center justify-between rounded-md bg-slate-50 px-2.5 py-1.5">
-                        <span className="text-xs text-slate-500">差额</span>
-                        <span className="text-xs font-medium text-slate-700">
-                          {bargainRequestDiff !== null
-                            ? `${bargainRequestDiff >= 0 ? '+' : '−'}¥${Math.abs(bargainRequestDiff).toLocaleString('zh-CN')}`
-                            : '结算价试算中/不可用，提交后由运营核实'}
-                        </span>
-                      </div>
-                    )}
-                    {bargainRequestError && <p className="text-[11px] text-rose-500">{bargainRequestError}</p>}
-                  </div>
-                )}
-              </div>
-            )}
 
             <div className="flex items-center justify-between border-t border-slate-200 pt-3">
               <span className="text-xs text-slate-500">
                 {isAgentUser
-                  ? '结算价由系统按协议价自动计算；价格有疑问请联系运营。'
+                  ? null
                   : '价格由系统按所选产品权威计算；如有优惠/加项请用上方「价格调整」。'}
               </span>
               <div className="flex gap-2">

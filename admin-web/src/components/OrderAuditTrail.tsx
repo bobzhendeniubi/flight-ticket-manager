@@ -60,6 +60,7 @@ const ORDER_ACTION_LABELS: Record<string, string> = {
   UPDATE_ITEM_SETTLEMENT_PRICE: '修改结算价',
   UPDATE_ORDER_COST_ITEM: '更新订单成本项',
   APPLY_SETTLEMENT_TOTAL: '应用结算总额',
+  AGENT_SELF_SETTLEMENT: '代理自助改结算价',
   // ── 收款 / 支付 / 财务 ──
   CREATE_PAYMENT: '创建支付',
   CONFIRM_MANUAL_PAYMENT: '确认收款',

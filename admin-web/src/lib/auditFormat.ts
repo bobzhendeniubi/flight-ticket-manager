@@ -50,6 +50,7 @@ const ACTION_DICT: Record<string, ActionEntry> = {
 
   // ── 结算 ──
   ADVANCE_SETTLEMENT_STATUS: { label: '推进结算单状态', icon: 'wallet' },
+  AGENT_SELF_SETTLEMENT: { label: '代理自助改结算价', icon: 'wallet' },
 
   // ── 代理 ──
   CREATE_AGENT: { label: '创建代理', icon: 'handshake' },

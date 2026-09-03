@@ -4981,8 +4981,8 @@ function OrderDrawer({
             onDirtyChange={setNotesDirty}
           />
 
-          {/* 议价申请：代理不能手填结算价，只能对本单提申请、运营确认后才生效 —— key 同 NotesSection
-              含补水态，补水完成后按权威 order 重新拉一次该单的申请列表。 */}
+          {/* 结算价：代理在锁价前可自己改（立即生效），锁定后走议价申请由运营确认 —— key 同
+              NotesSection 含补水态，补水完成后按权威 order 重新拉一次该单的申请列表。 */}
           <SettlementRequestSection
             key={`${o.id}:sr:${hydrated ? 'h' : 'l'}`}
             order={o}
@@ -11689,9 +11689,12 @@ function SettlementRequestStatusBadge({ status }: { status: SettlementRequestSta
 }
 
 /**
- * 订单详情里的议价申请区块。代理：看自己对本单提过的申请（全部状态）+ 没有待处理申请时给
- * 提交表单。运营（ADMIN/STAFF）：待处理申请高亮卡片带确认/驳回，历史申请折叠。
- * 其它角色（含未登录/CUSTOMER）不渲染——议价是代理与运营之间的口径，不对客户露出。
+ * 订单详情里的结算价 / 议价申请区块。
+ *   · 代理 + 本单结算价**未锁定**：自己填、自己改，保存即生效（服务端直接落 APPROVED，
+ *     响应带 selfApplied=true），不用等运营确认；
+ *   · 代理 + 本单结算价**已锁定**（已进结算单/已开票等）：照旧提交议价申请，等运营确认；
+ *   · 运营（ADMIN/STAFF）：待处理申请高亮卡片带确认/驳回，历史申请折叠。
+ * 其它角色（含未登录/CUSTOMER）不渲染——结算价是代理与运营之间的口径，不对客户露出。
  */
 function SettlementRequestSection({
   order,
@@ -11708,6 +11711,8 @@ function SettlementRequestSection({
   const confirm = useConfirm();
   const isAgentUser = role === 'AGENT';
   const isOpsUser = role === 'ADMIN' || role === 'STAFF';
+  // 锁价前代理自助改价（服务端同口径判定）；锁定后回落议价申请。
+  const canSelfApply = isAgentUser && order.settlementLocked !== true;
 
   const [requests, setRequests] = useState<SettlementRequest[]>([]);
   const [loading, setLoading] = useState(false);
@@ -11742,10 +11747,12 @@ function SettlementRequestSection({
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
+  const [selfAppliedHint, setSelfAppliedHint] = useState<string | null>(null);
   const submitRequest = async () => {
     if (!token || submitting || amount === null) return;
     setSubmitting(true);
     setSubmitError(null);
+    setSelfAppliedHint(null);
     try {
       const r = await settlementRequestsApi.createSettlementRequest(token, order.id, {
         requestedTotalCny: amount,
@@ -11754,6 +11761,17 @@ function SettlementRequestSection({
       setRequests((prev) => [r.request, ...prev]);
       setAmount(null);
       setNote('');
+      // 自助改价：服务端已直接生效，把订单重新拉一份刷新抽屉与列表金额（拉失败不算改价失败，
+      // 价已经改成了，只是这一屏还是旧数字——提示照给，重开抽屉即可看到新值）。
+      if (r.request.selfApplied) {
+        setSelfAppliedHint('结算价已更新');
+        try {
+          const fresh = await api.getOrder(token, order.id);
+          onOrderUpdated?.(fresh.order);
+        } catch {
+          /* 刷新失败不回滚提示：改价本身已经成功 */
+        }
+      }
     } catch (e: unknown) {
       setSubmitError(e instanceof ApiError ? e.message : '提交失败，请稍后重试');
     } finally {
@@ -11812,7 +11830,9 @@ function SettlementRequestSection({
 
   return (
     <section className="space-y-2">
-      <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">议价申请</div>
+      <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">
+        {canSelfApply ? '结算价' : '议价申请'}
+      </div>
       {loading && requests.length === 0 && <div className="text-xs text-ink-muted">加载中…</div>}
       {loadError && <div className="text-xs text-rose-600">{loadError}</div>}
 
@@ -11883,9 +11903,14 @@ function SettlementRequestSection({
 
       {isAgentUser && pending.length === 0 && (
         <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3 text-sm">
-          <div className="text-xs text-slate-500">本单想按别的价结算？提交申请，运营确认后才生效。</div>
+          <div className="text-sm font-medium text-slate-700">{canSelfApply ? '改结算价' : '提交议价申请'}</div>
+          <div className="mt-0.5 text-xs text-slate-500">
+            {canSelfApply
+              ? '本单结算价还没锁定，改完立即生效，不用等运营确认。'
+              : '本单结算价已锁定，改价需运营确认。'}
+          </div>
           <label className="mt-2 block text-xs text-slate-500">
-            申请结算总价（¥）
+            {canSelfApply ? '本单结算总价（¥）' : '申请结算总价（¥）'}
             <NumberInput
               className="input mt-1 w-full"
               value={amount}
@@ -11900,17 +11925,18 @@ function SettlementRequestSection({
               value={note}
               maxLength={200}
               onChange={(e) => setNote(e.target.value)}
-              placeholder="如：客人同业价 ¥1500，麻烦按此价结算"
+              placeholder={canSelfApply ? '如：客人同业价 ¥1500，按此价结算' : '如：客人同业价 ¥1500，麻烦按此价结算'}
             />
           </label>
           {submitError && <div className="mt-1 text-xs text-rose-600">{submitError}</div>}
+          {selfAppliedHint && <div className="mt-1 text-xs text-emerald-700">{selfAppliedHint}</div>}
           <button
             type="button"
             className="btn-primary mt-2 text-xs disabled:cursor-not-allowed disabled:opacity-50"
             disabled={submitting || amount === null}
             onClick={() => void submitRequest()}
           >
-            {submitting ? '提交中…' : '提交议价申请'}
+            {submitting ? (canSelfApply ? '保存中…' : '提交中…') : canSelfApply ? '立即生效' : '提交议价申请'}
           </button>
         </div>
       )}

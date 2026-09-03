@@ -876,14 +876,15 @@ export interface CreateOrderInput extends OrderStructuredNotes {
   /** 录单调价/加项（ADMIN/STAFF 录单专用；服务端按认证身份判权限） */
   priceAdjustment?: PriceAdjustmentInput;
   /**
-   * 本单结算总价（CNY，≥0，最多两位小数；ADMIN/STAFF 录单专用，服务端按认证身份判权限）。
-   * 代理单一口价场景：系统照此收钱——服务端按「结算价 − 权威合计」自动生成一条
+   * 本单结算总价（CNY，≥0，最多两位小数）。ADMIN/STAFF 与 AGENT 均可传（代理只能对自家单填，
+   * 服务端按认证身份判权限；代理不可传 priceAdjustment / flightSettlementPriceCny）。
+   * 一口价场景：系统照此收钱——服务端按「结算价 − 权威合计」自动生成一条
    * reasonCode=SETTLEMENT 的差额调价行（不改任何明细行价格，原价/差额留痕可审计）。
    * 与 priceAdjustment 互斥（同时传服务端 400）。
    */
   settlementTotalCny?: number;
   /**
-   * 每人结算价（CNY，≥0，最多两位小数；ADMIN/STAFF 录单专用，与 passengers 同序等长）。
+   * 每人结算价（CNY，≥0，最多两位小数；ADMIN/STAFF 与 AGENT 均可传，与 passengers 同序等长）。
    * 同单多人结算价不同场景：逐人填价，服务端按差额模型落库——取 min 为基准生成整单
    * SETTLEMENT 差额行 + 逐人「该人价 − min」的按乘客 SETTLEMENT 差额行（挂 passengerId），
    * 订单详情「每人结算价」表按既有派生口径还原逐人价。
@@ -4671,7 +4672,7 @@ export const api = {
   createOrder: (token: string, body: CreateOrderInput) =>
     apiFetch<{ order: OrderSummary }>('/orders/', { method: 'POST', token, body }),
 
-  // 录单前试算「系统价」（只算不落库；ADMIN/STAFF）。items 与 createOrder 同结构。
+  // 录单前试算「系统价」（只算不落库；ADMIN/STAFF 与 AGENT）。items 与 createOrder 同结构。
   // passengers（可选）：套餐乘客级住宿/签证选项，让系统价随每人选择实时变化（缺省回落 item 级旧口径）。
   quoteOrder: (
     token: string,
@@ -4684,6 +4685,8 @@ export const api = {
        * 手工价通道字段（形状同 createOrder，已随后端 quoteOrderBodySchema 暴露）：录单页已填
        * 手工结算价/优惠时随试算一起发送，服务端据此与 createOrder 同口径判定是否存在手工价
        * 通道，抑制一笔真下单时并不会生效的自动立减（同业/代理）。
+       * settlementTotalCny 代理也可传（自己填的一口价）；priceAdjustment /
+       * flightSettlementPriceCny 是运营通道，代理传会被服务端拒。
        */
       priceAdjustment?: PriceAdjustmentInput;
       settlementTotalCny?: number;
@@ -7052,7 +7055,7 @@ export const hotelControlOpsApi = {
     ),
 };
 
-// ── 议价申请（代理不能手填结算价；改走「提交议价申请 → 运营确认后生效」）── 独立命名空间，
+// ── 结算价 / 议价申请（代理对自家单：锁价前自己改立即生效，锁价后走「提交申请 → 运营确认」）── 独立命名空间，
 // 不改动上方既有 `api` 对象字面量（并发改动风险，同 hotelControlOpsApi 一带的写法）。
 // 对应 backend/src/modules/settlement-requests/*（已核对实际服务端代码，口径以此为准，
 // 与本模块最初约定的契约有几处出入，均在下面各字段/方法注释里点明）：
@@ -7101,6 +7104,12 @@ export interface SettlementRequest {
   decisionNote: string | null;
   /** 确认后落的差额行 OrderItem id；差额为 0（应收已被别的操作调到申请价）不生成行，留空 */
   appliedAdjustmentItemId: string | null;
+  /**
+   * 代理对自家**未锁价**单自助改价：服务端不走审批、直接生效，回 status='APPROVED' + 本位为
+   * true（审计动作 AGENT_SELF_SETTLEMENT）。锁价单照旧落 PENDING 等运营确认，本位为 false。
+   * 老响应可能不带这个字段，判定一律用 `=== true` / truthy，不要用 `!== false`。
+   */
+  selfApplied?: boolean;
   createdAt: string;
 }
 
@@ -7118,7 +7127,12 @@ function settlementRequestQuery(params?: {
 }
 
 export const settlementRequestsApi = {
-  /** 代理对自家单提交议价申请（服务端校验归属自家；已有待处理申请 409；与当前应收相等 400）。 */
+  /**
+   * 代理对自家单提交结算价（服务端校验归属自家；已有待处理申请 409；与当前应收相等 400）。
+   *   · 未锁价单：服务端**直接生效**，回 status='APPROVED' + selfApplied=true；
+   *   · 已锁价单：照旧落 PENDING（selfApplied=false），等运营确认。
+   * 已进结算单 / 已开票 / 改后金额低于已收款等情形服务端 400，文案直接透传给用户。
+   */
   createSettlementRequest: (
     token: string,
     orderId: string,
