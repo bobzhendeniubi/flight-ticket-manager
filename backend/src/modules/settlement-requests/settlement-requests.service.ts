@@ -16,6 +16,15 @@
  * 服务端权威定价的底线仍在：代理传的是「目标应收」，不是可自由写入的明细行价格；金额由服务端
  * 按「申请价 − 此刻应收」算差额，并同样受单笔调价上限约束。
  *
+ * 作用范围两种（0903 运营反馈「代理只能改总价，需要能分别调整」）：
+ *   · 整单（passengerId 空）：代理填「这一单想收多少」，差额 = 申请价 − 此刻应收（老行为不变）；
+ *   · 指定乘客（passengerId 非空）：代理填「只给这个人加/减多少」的**调整净额**，与事后调价
+ *     addPriceAdjustment 的 amountCny 同口径。之所以不是「这个人的新结算价」——每人结算价是
+ *     「应收均摊 + 该乘客调整净额」派生出来的展示值、本就不可手填，收新总价得倒推均摊，两处口径
+ *     必然漂移。这笔净额是**固定的**：确认时不按当下应收反推，否则会把期间别人头上的改期费/
+ *     补房差一并抹到这一位乘客身上。
+ * 「一单同一时刻只能挂一条 PENDING」的口径两种范围共用（不按乘客放宽），免得运营审批时对不上账。
+ *
  * 差额行的 reasonCode 选型见 approve() 注释。
  */
 import { OrderStatus, Prisma, SettlementRequestStatus, UserRole } from '@prisma/client';
@@ -86,6 +95,11 @@ type SettlementRequestRow = {
   requestedById: string;
   requestedTotalCny: Prisma.Decimal;
   systemTotalCny: Prisma.Decimal;
+  /** 非空 = 只调这一位乘客的份额；空 = 整单（老行为） */
+  passengerId: string | null;
+  passengerName: string | null;
+  /** 指定乘客时申请的调整净额（正=补收 / 负=优惠）；整单申请为空 */
+  requestedAdjustmentCny: Prisma.Decimal | null;
   note: string | null;
   status: SettlementRequestStatus;
   decidedById: string | null;
@@ -108,6 +122,17 @@ function serializeSettlementRequest(r: SettlementRequestRow) {
   // 队列要的是「现在还差多少」：带上订单时用**当前**应收重算，不吃 systemTotalCny 那份旧快照
   // （申请挂着的这段时间里改期费/补房差都可能已经动过应收）。
   const currentTotalCny = r.order ? receivableCny(r.order) : null;
+  // 指定乘客的申请：申请的是一笔**固定的调整净额**，差额就是它本身，不随期间别的调价重算
+  // （重算等于把别人头上的调价抹到这个人身上）。整单申请照旧「申请价 − 当前应收」。
+  const requestedAdjustmentCny =
+    r.requestedAdjustmentCny === null || r.requestedAdjustmentCny === undefined
+      ? null
+      : round2(Number(r.requestedAdjustmentCny.toString()));
+  const diffCny = r.passengerId
+    ? requestedAdjustmentCny
+    : currentTotalCny === null
+      ? null
+      : round2(requested - currentTotalCny);
   return {
     id: r.id,
     orderId: r.orderId,
@@ -119,7 +144,11 @@ function serializeSettlementRequest(r: SettlementRequestRow) {
     requestedTotalCny: r.requestedTotalCny.toString(),
     systemTotalCny: r.systemTotalCny.toString(),
     currentTotalCny: currentTotalCny === null ? null : currentTotalCny.toFixed(2),
-    diffCny: currentTotalCny === null ? null : round2(requested - currentTotalCny).toFixed(2),
+    diffCny: diffCny === null ? null : diffCny.toFixed(2),
+    // 作用范围：非空 = 只调这一位乘客；空 = 整单。姓名是提交时的快照（乘客可能已被换人/拆单挪走）。
+    passengerId: r.passengerId ?? null,
+    passengerName: r.passengerName ?? null,
+    requestedAdjustmentCny: requestedAdjustmentCny === null ? null : requestedAdjustmentCny.toFixed(2),
     note: r.note,
     status: r.status,
     decidedById: r.decidedById,
@@ -202,7 +231,12 @@ export class SettlementRequestsService {
       throw new ForbiddenError('无权限提交议价申请');
     }
 
-    let claim: { requestId: string; selfApplied: boolean; diffCny: number };
+    let claim: {
+      requestId: string;
+      selfApplied: boolean;
+      diffCny: number;
+      passengerId: string | null;
+    };
     try {
       claim = await prisma.$transaction(async (tx) => {
         // 订单行锁：与调价/补房差/批量锁价同一把锁，串行化「查重 → 判锁 → 插入」。
@@ -236,8 +270,31 @@ export class SettlementRequestsService {
           );
         }
 
+        // 作用范围 = 指定乘客时，先确认这位乘客真属于本单（口径与 addPriceAdjustment 的
+        // passengerId 归属校验一字一致：不接受跨单/不存在的乘客）。姓名当场存一份快照。
+        let passengerName: string | null = null;
+        if (body.passengerId) {
+          const pax = await tx.passenger.findUnique({
+            where: { id: body.passengerId },
+            select: { id: true, orderId: true, fullName: true, chineseName: true },
+          });
+          if (!pax || pax.orderId !== orderId) {
+            throw new BadRequestError('指定的乘客不存在或不属于本订单');
+          }
+          passengerName = pax.chineseName?.trim() || pax.fullName;
+        }
+
         const systemTotalCny = receivableCny(order);
-        const diffCny = round2(body.requestedTotalCny - systemTotalCny);
+        // 两种口径分流：
+        //   · 指定乘客 → 申请的就是一笔调整净额（与 addPriceAdjustment 的 amountCny 同口径，
+        //     schema 已保证整数非 0）；整单应收顺带派生一份留痕，只作展示。
+        //   · 整单 → 照旧「申请价 − 此刻应收」反推差额。
+        const diffCny = body.passengerId
+          ? body.adjustmentCny!
+          : round2(body.requestedTotalCny! - systemTotalCny);
+        const requestedTotalCny = body.passengerId
+          ? round2(systemTotalCny + diffCny)
+          : body.requestedTotalCny!;
         if (diffCny === 0) {
           throw new BadRequestError('与当前应收一致，无需申请');
         }
@@ -255,7 +312,9 @@ export class SettlementRequestsService {
         // ── 自助直通判定：代理本人 + 未锁价。锁着 → 落 PENDING 交运营（不是错误）。 ──
         const selfApplied = ownAgentId !== null && !order.settlementLocked;
         if (selfApplied) {
-          await this.assertSelfServiceAllowed(tx, order, body.requestedTotalCny);
+          // 「改后应收低于已收款」那道闸看的是改完之后的整单应收 —— 指定乘客的申请同样会抬/降
+          // 整单 total，所以喂进去的是上面派生的 requestedTotalCny，两种口径同一把尺子。
+          await this.assertSelfServiceAllowed(tx, order, requestedTotalCny);
         }
 
         const created = await tx.settlementRequest.create({
@@ -263,8 +322,11 @@ export class SettlementRequestsService {
             orderId,
             agentId: order.agentId,
             requestedById: actor.userId,
-            requestedTotalCny: new Prisma.Decimal(body.requestedTotalCny),
+            requestedTotalCny: new Prisma.Decimal(requestedTotalCny),
             systemTotalCny: new Prisma.Decimal(systemTotalCny),
+            passengerId: body.passengerId ?? null,
+            passengerName,
+            requestedAdjustmentCny: body.passengerId ? new Prisma.Decimal(diffCny) : null,
             note: selfApplied
               ? [AGENT_SELF_SETTLEMENT_NOTE_PREFIX, body.note?.trim()].filter(Boolean).join('：')
               : body.note?.trim() || null,
@@ -278,7 +340,7 @@ export class SettlementRequestsService {
           select: { id: true },
         });
 
-        return { requestId: created.id, selfApplied, diffCny };
+        return { requestId: created.id, selfApplied, diffCny, passengerId: body.passengerId ?? null };
       });
     } catch (err) {
       // 部分唯一索引兜底命中（并发穿过应用层查重）→ 回同一句 409，别把裸约束名抛给前端。
@@ -296,6 +358,8 @@ export class SettlementRequestsService {
             amountCny: claim.diffCny,
             reasonCode: claim.diffCny > 0 ? 'MISC_FEE' : 'DISCOUNT',
             reasonText: AGENT_SELF_SETTLEMENT_REASON_TEXT,
+            // 作用范围原样透传：非空 → 差额行挂在这位乘客名下（订单详情按人分组看得到）。
+            ...(claim.passengerId ? { passengerId: claim.passengerId } : {}),
           },
           { userId: actor.userId, role: actor.role },
           // 公开的 POST /orders/:id/price-adjustment 对 AGENT 照旧 403；只有这条内部路径放行。
@@ -463,6 +527,8 @@ export class SettlementRequestsService {
       diffCny: number;
       itemId: string | null;
       requestedById: string;
+      /** 作用范围：非空 = 只调了这一位乘客的份额；空 = 整单 */
+      passengerId: string | null;
     };
   }> {
     if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
@@ -477,8 +543,10 @@ export class SettlementRequestsService {
           requestedTotalCny: Prisma.Decimal;
           status: SettlementRequestStatus;
           requestedById: string;
+          passengerId: string | null;
+          requestedAdjustmentCny: Prisma.Decimal | null;
         }>
-      >`SELECT id, "orderId", "requestedTotalCny", status, "requestedById" FROM "SettlementRequest" WHERE id = ${id} FOR UPDATE`;
+      >`SELECT id, "orderId", "requestedTotalCny", status, "requestedById", "passengerId", "requestedAdjustmentCny" FROM "SettlementRequest" WHERE id = ${id} FOR UPDATE`;
       const row = rows[0];
       if (!row) throw new NotFoundError('议价申请不存在');
       if (row.status !== SettlementRequestStatus.PENDING) {
@@ -501,7 +569,15 @@ export class SettlementRequestsService {
 
       const requestedTotalCny = Number(row.requestedTotalCny.toString());
       const currentTotalCny = receivableCny(order);
-      const diffCny = round2(requestedTotalCny - currentTotalCny);
+      // 指定乘客的申请：确认的是那笔**固定的调整净额**，不按当下应收反推 ——
+      // 反推会把申请挂着这段时间里别人头上的改期费/补房差一并抹到这一位乘客身上。
+      // 整单申请照旧按「确认那一刻」重读的应收算差额。
+      if (row.passengerId && row.requestedAdjustmentCny === null) {
+        throw new ConflictError('该申请缺少调整净额，请让代理重新提交');
+      }
+      const diffCny = row.passengerId
+        ? round2(Number(row.requestedAdjustmentCny!.toString()))
+        : round2(requestedTotalCny - currentTotalCny);
       this.assertDiffWithinCap(diffCny);
 
       await tx.settlementRequest.update({
@@ -521,6 +597,7 @@ export class SettlementRequestsService {
         requestedTotalCny,
         currentTotalCny,
         diffCny,
+        passengerId: row.passengerId,
       };
     });
 
@@ -534,6 +611,8 @@ export class SettlementRequestsService {
             amountCny: claim.diffCny,
             reasonCode: claim.diffCny > 0 ? 'MISC_FEE' : 'DISCOUNT',
             reasonText: SETTLEMENT_REQUEST_REASON_TEXT,
+            // 作用范围原样透传：非空 → 差额行挂在这位乘客名下（订单详情按人分组看得到）。
+            ...(claim.passengerId ? { passengerId: claim.passengerId } : {}),
           },
           { userId: actor.userId, role: actor.role },
         );
@@ -574,6 +653,7 @@ export class SettlementRequestsService {
         diffCny: claim.diffCny,
         itemId,
         requestedById: claim.requestedById,
+        passengerId: claim.passengerId,
       },
     };
   }

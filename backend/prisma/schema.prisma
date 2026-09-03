@@ -909,8 +909,19 @@ model SettlementRequest {
   agentId                 String?
   // 提交人 userId（代理账号本人，或代提的运营）
   requestedById           String
-  // 代理申请的整单价（申请人希望这一单收多少）
+  // 代理申请的整单价（申请人希望这一单收多少）。
+  // 指定乘客的申请（passengerId 非空）里这一列是**派生留痕**：提交那一刻的应收 + 调整净额，
+  // 只作展示；真正落地的金额一律读 requestedAdjustmentCny。
   requestedTotalCny       Decimal                 @db.Decimal(12, 2)
+  // 作用范围 · 指定乘客：非空 = 只调这一位乘客的应收份额（与事后调价 addPriceAdjustment 的
+  // passengerId 同口径）；空 = 整单申请，老行为一字不变。
+  // 不建 FK：乘客可能被换人/拆单挪走，历史申请仍要读得出当时改的是谁 → 另存一份姓名快照。
+  passengerId             String?
+  passengerName           String?
+  // 指定乘客时申请的调整净额（正=补收 / 负=优惠），与 addPriceAdjustment 的 amountCny 同口径。
+  // 每人结算价是「应收均摊 + 该乘客调整净额」派生出来的、不可手填，按人改价只能填净额。
+  // 整单申请为空。
+  requestedAdjustmentCny  Decimal?                @db.Decimal(12, 2)
   // 提交当时的应收快照（= Order.total + Order.adjustmentCny，与订单详情「应收」/尾款同口径）。
   // 只作留痕：确认时一律按**确认那一刻**重读的应收重算差额，不吃这份可能已过期的快照。
   systemTotalCny          Decimal                 @db.Decimal(12, 2)

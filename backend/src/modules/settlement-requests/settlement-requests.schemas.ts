@@ -6,6 +6,7 @@
  */
 import { z } from 'zod';
 import { SettlementRequestStatus } from '@prisma/client';
+import { PRICE_ADJUSTMENT_CAP_CNY } from '../orders/orders.schemas.js';
 
 /**
  * 申请价的绝对上限：Order.total 落 Decimal(12, 2)，越界会在写库时炸成 500。
@@ -25,10 +26,67 @@ const requestedTotalSchema = z
     message: '申请价最多两位小数',
   });
 
-export const createSettlementRequestBodySchema = z.object({
-  requestedTotalCny: requestedTotalSchema,
-  note: z.string().max(200, '申请说明最多 200 字').optional(),
-});
+/**
+ * 指定乘客时填的「调整净额」（正=补收 / 负=优惠）。
+ *
+ * 口径与事后调价 addPriceAdjustment 的 amountCny 一字一致（整数 CNY、非 0、不超单笔上限）——
+ * 按人改价只能填净额、不能填「这个人的新结算价」：每人结算价是「应收均摊 + 该乘客调整净额」
+ * 派生出来的展示值，本来就不接受手填，收一个新总价反而要倒推均摊、两处口径必然漂移。
+ */
+const adjustmentCnySchema = z
+  .number()
+  .int('调整金额必须为整数（CNY）')
+  .refine((v) => v !== 0, { message: '调整金额不能为 0（不调整请勿提交）' })
+  .refine((v) => Math.abs(v) <= PRICE_ADJUSTMENT_CAP_CNY, {
+    message: `调整金额超出上限（±${PRICE_ADJUSTMENT_CAP_CNY}）`,
+  });
+
+/**
+ * 提交申请的两种口径，二选一（互斥，服务端按 passengerId 是否为空分流）：
+ *   · 整单：只传 requestedTotalCny =「这一单我想收多少」（老客户端原样可用，行为不变）；
+ *   · 指定乘客：传 passengerId + adjustmentCny =「只给这个人加/减多少」。
+ * 两组字段都在同一个对象上（不用 discriminatedUnion）是为了让老请求体一字不改仍然合法。
+ */
+export const createSettlementRequestBodySchema = z
+  .object({
+    requestedTotalCny: requestedTotalSchema.optional(),
+    passengerId: z.string().min(1).max(64).optional(),
+    adjustmentCny: adjustmentCnySchema.optional(),
+    note: z.string().max(200, '申请说明最多 200 字').optional(),
+  })
+  .superRefine((v, ctx) => {
+    if (v.passengerId) {
+      if (v.adjustmentCny === undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['adjustmentCny'],
+          message: '指定乘客时请填写调整净额（正=补收 / 负=优惠）',
+        });
+      }
+      if (v.requestedTotalCny !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          path: ['requestedTotalCny'],
+          message: '指定乘客时按调整净额提交，不接受整单结算总价',
+        });
+      }
+      return;
+    }
+    if (v.requestedTotalCny === undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['requestedTotalCny'],
+        message: '请填写本单结算总价',
+      });
+    }
+    if (v.adjustmentCny !== undefined) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        path: ['adjustmentCny'],
+        message: '整单申请按结算总价提交；调整净额只用于指定乘客',
+      });
+    }
+  });
 export type CreateSettlementRequestBody = z.infer<typeof createSettlementRequestBodySchema>;
 
 /** 确认 / 驳回共用：决定备注可空（驳回时建议填，但不强制，避免卡住急件）。 */

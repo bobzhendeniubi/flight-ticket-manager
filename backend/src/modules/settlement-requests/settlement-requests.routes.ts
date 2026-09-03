@@ -3,6 +3,8 @@
  *
  * 挂在 /orders 前缀（在 app.ts 用 prefix:'/orders' 注册 orderSettlementRequestRoutes）：
  *   POST /orders/:id/settlement-requests   代理（限本单归属代理）或运营提交申请
+ *     两种作用范围二选一：整单传 requestedTotalCny（想收多少），
+ *     指定乘客传 passengerId + adjustmentCny（只给这个人加/减多少的调整净额）。
  *   GET  /orders/:id/settlement-requests   本单全部申请
  *
  * 提交的返回体带 selfApplied：true = 代理在未锁价的自家单上自助改价、已当场生效（审计
@@ -60,6 +62,10 @@ export const orderSettlementRequestRoutes: FastifyPluginAsync = async (app) => {
           appliedAdjustmentItemId: request.appliedAdjustmentItemId,
           requestedById: request.requestedById,
           selfApplied: request.selfApplied,
+          // 作用范围：非空 = 只调了这一位乘客的份额（财务复核要分得清改的是整单还是某个人）。
+          passengerId: request.passengerId,
+          passengerName: request.passengerName,
+          requestedAdjustmentCny: request.requestedAdjustmentCny,
           note: request.note,
         },
         ...(request.selfApplied ? { severity: 'WARNING' as const } : {}),
@@ -116,6 +122,9 @@ export const settlementRequestRoutes: FastifyPluginAsync = async (app) => {
         decidedById: request.decidedById,
         decisionNote: request.decisionNote,
         itemId: audit.itemId,
+        // 作用范围：非空 = 差额行只挂在这一位乘客名下。
+        passengerId: audit.passengerId,
+        passengerName: request.passengerName,
       },
       severity: 'WARNING',
     });

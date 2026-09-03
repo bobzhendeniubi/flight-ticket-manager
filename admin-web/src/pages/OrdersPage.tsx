@@ -11742,22 +11742,37 @@ function SettlementRequestSection({
   // 归属代理本人提交，直接用订单自己的 agent 名代表申请人（与订单列表导出同一取名口径）。
   const orderAgentName = order.agent?.companyName?.trim() || order.agent?.contactName?.trim() || '—';
 
-  // 代理提交表单
+  // 代理提交表单。scope = 'WHOLE'（整单，填想收的总价）或 passengerId（指定乘客，填调整净额）。
+  // 按人填的是**净额**不是新总价：每人结算价是「应收均摊 + 该乘客调整净额」派生出来的展示值，
+  // 本来就不可手填，与运营侧「价格调整（按乘客 / 整单）」同一口径。
+  const [scope, setScope] = useState<string>('WHOLE');
   const [amount, setAmount] = useState<number | null>(null);
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [submitError, setSubmitError] = useState<string | null>(null);
   const [selfAppliedHint, setSelfAppliedHint] = useState<string | null>(null);
+  // 一人单没有「分别调整」可言（按人 = 整单），只有多人单才给作用范围选择。
+  const canPickPassenger = order.passengers.length > 1;
+  const isPassengerScope = canPickPassenger && scope !== 'WHOLE';
+  const passengerLabel = (p: { chineseName?: string | null; fullName: string }): string =>
+    p.chineseName?.trim() || p.fullName;
   const submitRequest = async () => {
     if (!token || submitting || amount === null) return;
+    if (isPassengerScope && (!Number.isInteger(amount) || amount === 0)) {
+      setSubmitError('请输入非 0 的整数金额（正=补收 / 负=优惠）');
+      return;
+    }
     setSubmitting(true);
     setSubmitError(null);
     setSelfAppliedHint(null);
     try {
-      const r = await settlementRequestsApi.createSettlementRequest(token, order.id, {
-        requestedTotalCny: amount,
-        note: note.trim() || undefined,
-      });
+      const r = await settlementRequestsApi.createSettlementRequest(
+        token,
+        order.id,
+        isPassengerScope
+          ? { passengerId: scope, adjustmentCny: amount, note: note.trim() || undefined }
+          : { requestedTotalCny: amount, note: note.trim() || undefined },
+      );
       setRequests((prev) => [r.request, ...prev]);
       setAmount(null);
       setNote('');
@@ -11790,15 +11805,21 @@ function SettlementRequestSection({
     const requestedCny = Number(req.requestedTotalCny);
     const currentCny = req.currentTotalCny !== null ? Number(req.currentTotalCny) : null;
     const diffCny = req.diffCny !== null ? Number(req.diffCny) : null;
+    // 指定乘客的申请：确认的是一笔挂在这位乘客名下的固定调整净额，不是把整单收敛到某个总价。
+    const scopedName = req.passengerId ? req.passengerName?.trim() || '该乘客' : null;
+    const approveBody = scopedName
+      ? `确认后将给「${scopedName}」记一笔 ${diffCny !== null && diffCny >= 0 ? '+' : '−'}¥${Math.abs(diffCny ?? 0).toLocaleString('zh-CN')} 的价格调整` +
+        (currentCny !== null
+          ? `（当前整单应收 ¥${currentCny.toLocaleString('zh-CN')}，确认后随之变动）。`
+          : '。')
+      : `确认后订单结算总价将改为 ¥${requestedCny.toLocaleString('zh-CN')}` +
+        (currentCny !== null && diffCny !== null
+          ? `（当前应收 ¥${currentCny.toLocaleString('zh-CN')}，差额 ${diffCny >= 0 ? '+' : '−'}¥${Math.abs(diffCny).toLocaleString('zh-CN')}）。`
+          : '。');
     const confirmed = await confirm({
       title: action === 'approve' ? '确认这条议价申请？' : '驳回这条议价申请？',
       body:
-        action === 'approve'
-          ? `确认后订单结算总价将改为 ¥${requestedCny.toLocaleString('zh-CN')}` +
-            (currentCny !== null && diffCny !== null
-              ? `（当前应收 ¥${currentCny.toLocaleString('zh-CN')}，差额 ${diffCny >= 0 ? '+' : '−'}¥${Math.abs(diffCny).toLocaleString('zh-CN')}）。`
-              : '。')
-          : '驳回后订单价格不变，代理会看到驳回状态与备注。',
+        action === 'approve' ? approveBody : '驳回后订单价格不变，代理会看到驳回状态与备注。',
       tone: action === 'approve' ? 'default' : 'danger',
       confirmText: action === 'approve' ? '确认' : '驳回',
       cancelText: '取消',
@@ -11841,12 +11862,26 @@ function SettlementRequestSection({
         const requestedCny = Number(req.requestedTotalCny);
         const currentCny = req.currentTotalCny !== null ? Number(req.currentTotalCny) : null;
         const diffCny = req.diffCny !== null ? Number(req.diffCny) : null;
+        // 指定乘客的申请：主角是「给谁调多少」，整单目标价没有意义（差额挂在这一个人头上）。
+        const scopedName = req.passengerId ? req.passengerName?.trim() || '该乘客' : null;
         return (
           <div key={req.id} className="rounded-xl border border-amber-300 bg-amber-50 p-3 text-sm">
             <div className="font-medium text-amber-900">
-              代理议价申请：申请 ¥{requestedCny.toLocaleString('zh-CN')}
-              {currentCny !== null && ` · 当前应收 ¥${currentCny.toLocaleString('zh-CN')}`}
-              {diffCny !== null && ` · 差额 ${diffCny >= 0 ? '+' : '−'}¥${Math.abs(diffCny).toLocaleString('zh-CN')}`}
+              {scopedName ? (
+                <>
+                  代理议价申请 · 指定乘客：{scopedName}
+                  {diffCny !== null &&
+                    ` · 调整 ${diffCny >= 0 ? '+' : '−'}¥${Math.abs(diffCny).toLocaleString('zh-CN')}`}
+                  {currentCny !== null && ` · 当前整单应收 ¥${currentCny.toLocaleString('zh-CN')}`}
+                </>
+              ) : (
+                <>
+                  代理议价申请：申请 ¥{requestedCny.toLocaleString('zh-CN')}
+                  {currentCny !== null && ` · 当前应收 ¥${currentCny.toLocaleString('zh-CN')}`}
+                  {diffCny !== null &&
+                    ` · 差额 ${diffCny >= 0 ? '+' : '−'}¥${Math.abs(diffCny).toLocaleString('zh-CN')}`}
+                </>
+              )}
             </div>
             <div className="mt-1 text-xs text-amber-700">
               申请人：{orderAgentName} · {formatDateTimeSecCn(req.createdAt)}
@@ -11883,9 +11918,21 @@ function SettlementRequestSection({
 
       {isAgentUser && sortedDesc.map((req) => (
         <div key={req.id} className="rounded-xl border border-slate-200 bg-white p-3 text-sm">
-          <div className="flex items-center gap-2">
+          <div className="flex flex-wrap items-center gap-2">
             <SettlementRequestStatusBadge status={req.status} />
-            <span className="font-medium text-slate-800">¥{Number(req.requestedTotalCny).toLocaleString('zh-CN')}</span>
+            {req.passengerId ? (
+              <>
+                <span className="rounded bg-slate-100 px-1.5 py-0.5 text-[11px] text-slate-600">
+                  {req.passengerName?.trim() || '指定乘客'}
+                </span>
+                <span className="font-medium text-slate-800">
+                  {Number(req.diffCny ?? req.requestedAdjustmentCny ?? 0) >= 0 ? '+' : '−'}¥
+                  {Math.abs(Number(req.diffCny ?? req.requestedAdjustmentCny ?? 0)).toLocaleString('zh-CN')}
+                </span>
+              </>
+            ) : (
+              <span className="font-medium text-slate-800">¥{Number(req.requestedTotalCny).toLocaleString('zh-CN')}</span>
+            )}
             <span className="text-[11px] text-slate-400">{formatDateTimeSecCn(req.createdAt)}</span>
           </div>
           {req.note && <div className="mt-1 text-xs text-slate-600">备注：{req.note}</div>}
@@ -11909,15 +11956,53 @@ function SettlementRequestSection({
               ? '本单结算价还没锁定，改完立即生效，不用等运营确认。'
               : '本单结算价已锁定，改价需运营确认。'}
           </div>
-          <label className="mt-2 block text-xs text-slate-500">
-            {canSelfApply ? '本单结算总价（¥）' : '申请结算总价（¥）'}
-            <NumberInput
-              className="input mt-1 w-full"
-              value={amount}
-              onChange={setAmount}
-              placeholder={`如 ${Math.round(currentPayable)}`}
-            />
-          </label>
+          {canPickPassenger && (
+            <label className="mt-2 block text-xs text-slate-500">
+              作用范围
+              <select
+                className="input mt-1 w-full"
+                value={scope}
+                onChange={(e) => {
+                  setScope(e.target.value);
+                  // 两种范围的金额口径不同（总价 ↔ 净额），换范围后旧数字没有意义，清掉重填。
+                  setAmount(null);
+                  setSubmitError(null);
+                }}
+                disabled={submitting}
+              >
+                <option value="WHOLE">整单（所有乘客共担）</option>
+                {order.passengers.map((p) => (
+                  <option key={p.id} value={p.id}>
+                    指定乘客：{passengerLabel(p)}
+                  </option>
+                ))}
+              </select>
+            </label>
+          )}
+          {isPassengerScope ? (
+            <label className="mt-2 block text-xs text-slate-500">
+              该乘客调整净额（¥，正=补收 / 负=优惠）
+              <NumberInput
+                className="input mt-1 w-full"
+                value={amount}
+                onChange={setAmount}
+                placeholder="如 -500"
+              />
+              <span className="mt-1 block text-[11px] text-slate-400">
+                每人结算价 = 应收均摊 + 该乘客调整净额（系统派生，不可手填），所以按人改价填的是加/减多少。
+              </span>
+            </label>
+          ) : (
+            <label className="mt-2 block text-xs text-slate-500">
+              {canSelfApply ? '本单结算总价（¥）' : '申请结算总价（¥）'}
+              <NumberInput
+                className="input mt-1 w-full"
+                value={amount}
+                onChange={setAmount}
+                placeholder={`如 ${Math.round(currentPayable)}`}
+              />
+            </label>
+          )}
           <label className="mt-2 block text-xs text-slate-500">
             备注（选填）
             <input

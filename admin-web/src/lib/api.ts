@@ -291,6 +291,11 @@ export interface AdminSchedule {
   arrivalTime: string;
   departureTz: string;
   arrivalTz: string;
+  /**
+   * 关柜提前分钟数（起飞前多少分钟关闭值机柜台）；null / 缺失 = 走系统默认 45。
+   * 只影响 no-show 从哪一刻起可标，不动价也不动座。
+   */
+  checkinCloseMinutes?: number | null;
   isActive: boolean;
   seatClasses: AdminScheduleSeat[];
 }
@@ -1905,7 +1910,11 @@ export interface NoShowBatchSchedule {
   departDate: string;
   /** 出发时刻 HH:mm（班次当地时） */
   departTimeLocal: string;
-  /** 是否已起飞（服务端权威判定，前端本地时间只作提示，不作闸） */
+  /**
+   * 是否**已关柜**（= 起飞时刻 − 该班次关柜提前分钟数，默认提前 45 分钟）。
+   * 服务端权威判定，前端本地时间只作提示、不作闸；字段名沿用 departed 未改。
+   * 口径与逐单预检同源：关柜之后就能标 no-show，不必等到起飞那一刻。
+   */
   departed: boolean;
   seatsSold: number;
 }
@@ -1921,6 +1930,12 @@ export interface NoShowBatchMatch {
   lines: string[];
   orderId: string;
   orderNumber: string;
+  /**
+   * 订单备注原文（Order.notes），跟在订单号下面当可读识别标。
+   * 这张表针对单一班次，所有行出发日相同、没有「团期」可分，运营习惯把团组/客人信息
+   * 写在备注里，就拿它辅助识别。旧后端不下发时为 undefined，界面留空即可。
+   */
+  notes?: string | null;
   passengerId: string;
   fullName: string;
   chineseName: string | null;
@@ -4188,6 +4203,8 @@ export const api = {
       arrivalTime?: string;
       /** A11：已售班次改时刻的二次确认标志——首次调用被 400 拦下后，确认再带 true 重试。 */
       confirmSoldTimeChange?: boolean;
+      /** 关柜提前分钟数：数字=设定；null=清空回落系统默认（45）；不传=不改这一项。 */
+      checkinCloseMinutes?: number | null;
       // fareBuckets：数组=设阶梯；null 或 [] = 清除阶梯（恢复自动定价）；
       // 单独传 fareBuckets 即为有效修改（无需同时传 basePrice/capacity）。
       seatClasses?: Array<{
@@ -7090,13 +7107,29 @@ export interface SettlementRequest {
    * （议价申请事实上只由订单归属代理本人提交，agentName 已经代表「谁」）。
    */
   requestedById: string;
+  /**
+   * 申请后的整单应收。指定乘客的申请（passengerId 非空）里这一列是**派生留痕**：
+   * 提交那一刻的应收 + 调整净额，只作展示；真正落地的金额读 requestedAdjustmentCny。
+   */
   requestedTotalCny: string;
   /** 提交时的应收快照（留痕；确认时后端按当下应收重算，不吃这份可能已过期的值） */
   systemTotalCny: string;
   /** 当前应收（后端用**当下**订单重算，可能已被别的调价动作改变；订单查不到时为 null） */
   currentTotalCny: string | null;
-  /** = requestedTotalCny − currentTotalCny（订单查不到时为 null） */
+  /**
+   * 会落地的差额：整单申请 = requestedTotalCny − currentTotalCny（订单查不到时为 null）；
+   * 指定乘客的申请 = requestedAdjustmentCny 本身（那是一笔固定净额，不随别的调价重算）。
+   */
   diffCny: string | null;
+  /**
+   * 作用范围：非空 = 只调这一位乘客的应收份额（与事后调价的 passengerId 同口径）；
+   * 空 = 整单申请（老行为）。老响应不带这三个字段，判定一律用 truthy。
+   */
+  passengerId?: string | null;
+  /** 提交时的乘客姓名快照（乘客可能已被换人/拆单挪走，历史申请仍读得出改的是谁） */
+  passengerName?: string | null;
+  /** 指定乘客时申请的调整净额（正=补收 / 负=优惠）；整单申请为 null */
+  requestedAdjustmentCny?: string | null;
   note: string | null;
   status: SettlementRequestStatus;
   decidedById: string | null;
@@ -7132,11 +7165,19 @@ export const settlementRequestsApi = {
    *   · 未锁价单：服务端**直接生效**，回 status='APPROVED' + selfApplied=true；
    *   · 已锁价单：照旧落 PENDING（selfApplied=false），等运营确认。
    * 已进结算单 / 已开票 / 改后金额低于已收款等情形服务端 400，文案直接透传给用户。
+   *
+   * 作用范围两种，二选一（同时传两组字段服务端 400）：
+   *   · 整单：`{ requestedTotalCny }` =「这一单想收多少」；
+   *   · 指定乘客：`{ passengerId, adjustmentCny }` =「只给这个人加/减多少」的**调整净额**
+   *     （正=补收 / 负=优惠，整数 CNY）。按人填的是净额不是新总价——每人结算价本来就是
+   *     「应收均摊 + 该乘客调整净额」派生出来的展示值，不接受手填。
    */
   createSettlementRequest: (
     token: string,
     orderId: string,
-    body: { requestedTotalCny: number; note?: string },
+    body:
+      | { requestedTotalCny: number; note?: string }
+      | { passengerId: string; adjustmentCny: number; note?: string },
   ) =>
     apiFetch<{ request: SettlementRequest }>(`/orders/${orderId}/settlement-requests`, {
       method: 'POST',
