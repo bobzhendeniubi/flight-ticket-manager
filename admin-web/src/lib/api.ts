@@ -5150,6 +5150,10 @@ export const api = {
       dateOfBirth?: string;
       gender?: 'M' | 'F' | 'X';
       nationality?: string;
+      /** 新出行人护照有效期（YYYY-MM-DD）。换人=录入新人的护照：证件号变化且本单含机票/套餐/签证行时后端必填。 */
+      passportExpiry?: string;
+      /** 新出行人护照签发日（YYYY-MM-DD，选填；OCR 识别到才带）。 */
+      passportIssueDate?: string;
       resetInvoice?: boolean;
       resetVisa?: boolean;
       feeCny?: number;

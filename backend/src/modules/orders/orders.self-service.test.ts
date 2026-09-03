@@ -182,6 +182,24 @@ describe('resolvePassengerPatchChannel', () => {
     ).toBe('SWAP');
   });
 
+  // 护照有效期/签发日两个 schema 都有 → 绝不能进「换人独有键」集合，否则只补护照资料的请求
+  // 会被误分流到换人通道。换人表单带着它们提交时靠 fullName 等换人语义字段判定，
+  // 且换人 schema 必须接得住这两个键（不然分流对了却 400）。
+  it('只带护照有效期/签发日 → 补录；与换人语义字段同行 → 换人且换人 schema 接得住', () => {
+    for (const role of [UserRole.ADMIN, UserRole.STAFF]) {
+      expect(resolvePassengerPatchChannel(role, { passportExpiry: '2035-06-30' })).toBe('SELF_UPDATE');
+      expect(resolvePassengerPatchChannel(role, { passportIssueDate: '2025-06-30' })).toBe('SELF_UPDATE');
+    }
+    const swapBody = {
+      fullName: 'NEW PERSON',
+      documentNumber: 'E12345678',
+      passportExpiry: '2035-06-30',
+      passportIssueDate: '2025-06-30',
+    };
+    expect(resolvePassengerPatchChannel(UserRole.ADMIN, swapBody)).toBe('SWAP');
+    expect(swapPassengerBodySchema.safeParse(swapBody).success).toBe(true);
+  });
+
   // 换人 schema 独有、补录 schema 没有的新出行人属性 —— 漏进分流集合就会被判成补录，
   // 而补录 schema 是 .strict() 的 → 400；换人通道后面挂着的自备签→签证任务同步也整条跑不到。
   it.each([

@@ -145,7 +145,11 @@ import {
   determineFlightLegItems,
 } from './ticketing-cap.js';
 import type { FlightLegItem } from './ticketing-cap.js';
-import { PRICE_ADJUSTMENT_CAP_CNY, PRICE_ADJUSTMENT_REASON_LABEL } from './orders.schemas.js';
+import {
+  PER_PERSON_TRAVEL_KINDS,
+  PRICE_ADJUSTMENT_CAP_CNY,
+  PRICE_ADJUSTMENT_REASON_LABEL,
+} from './orders.schemas.js';
 import { heldSeatsForCabin } from '../hold-orders/held-seats.js';
 // 「回程已释放」提醒的 ruleKey 构造收敛在提醒规则那边：作废时要把这两条待办一起关掉，
 // 在这里照抄一遍拼接格式，改键时必然漏一处、待办就永远关不掉。
@@ -8657,6 +8661,10 @@ export class OrderService {
       dateOfBirth?: string;
       gender?: import('@prisma/client').Gender;
       nationality?: string;
+      // 新出行人的护照有效期 / 签发日（YYYY-MM-DD）：换人 = 录入一个新人的护照。
+      // 证件号变化时旧人的这两项会被清空，本请求带的值即新人的值（缺有效期且本单按人出行 → 400）。
+      passportExpiry?: string;
+      passportIssueDate?: string;
       // title/passengerType/visaExempt/singleRoom 已由 swapPassengerBodySchema 暴露透传；
       // 真换人时用它们作为「显式新值」覆盖默认清洗值（前向兼容：不传则保持既有清洗行为）。
       title?: string;
@@ -8763,6 +8771,12 @@ export class OrderService {
       if (input.dateOfBirth !== undefined) data.dateOfBirth = new Date(input.dateOfBirth);
       if (input.gender !== undefined) data.gender = input.gender;
       if (input.nationality !== undefined) data.nationality = input.nationality;
+      // 护照有效期 / 签发日：带了就写（真换人＝新人的护照；证件号没变则等价于一次补录，
+      // 与 selfUpdatePassenger 同款「undefined 即不动」口径，绝不在这里清空）。
+      if (input.passportExpiry !== undefined) data.passportExpiry = new Date(input.passportExpiry);
+      if (input.passportIssueDate !== undefined) {
+        data.passportIssueDate = new Date(input.passportIssueDate);
+      }
       if (input.title !== undefined) data.title = input.title;
       if (input.passengerType !== undefined) data.passengerType = input.passengerType;
       if (input.visaExempt !== undefined) data.visaExempt = input.visaExempt;
@@ -8776,6 +8790,25 @@ export class OrderService {
       const newDocument = input.documentNumber?.trim();
       const documentChanged =
         newDocument !== undefined && newDocument !== '' && newDocument !== passenger.documentNumber;
+
+      // ── 1b·闸0. 换人 = 录入一个新人的护照 → 按人出行的单必须带新出行人的护照有效期 ────────
+      // 口径与建单一致（PER_PERSON_TRAVEL_KINDS / refineRequiredPassportExpiry，同一常量复用）：
+      // 含机票 / 套餐 / 签证行的订单，每位出行人都要有护照有效期。下方 1b 会把旧人的
+      // passportExpiry 清成 null（数据上正确——旧人的有效期绝不能套到新人头上），若这里不强制，
+      // 换人后新人的有效期就永远是空的，出票 / 送签 / 开票全程无人察觉（已发生过的线上事故）。
+      // 纯酒店 / 接送单不在此列：那类单的出行人可能只是联系人占位，没有护照资料，强制会打死正常操作。
+      if (documentChanged && !input.passportExpiry) {
+        const perPersonKinds = Object.values(OrderItemKind).filter((k) =>
+          PER_PERSON_TRAVEL_KINDS.has(k),
+        );
+        const perPersonItemCount = await tx.orderItem.count({
+          where: { orderId, kind: { in: perPersonKinds } },
+        });
+        if (perPersonItemCount > 0) {
+          throw new BadRequestError('换人须填写新出行人护照有效期（YYYY-MM-DD）');
+        }
+      }
+
       if (documentChanged) {
         // 表单可编辑但本次没填 → 显式置空（不残留前一个人的值）
         if (data.chineseName === undefined) data.chineseName = null;
@@ -8784,12 +8817,12 @@ export class OrderService {
         // （migration 20260708140000_passenger_dob_nullable），彻底解决换人残留旧生日。
         if (data.dateOfBirth === undefined) data.dateOfBirth = null;
         data.placeOfBirth = null;
-        // 护照证件信息随人走
+        // 护照证件信息随人走：本次带了新值的（有效期 / 签发日，上面已赋）保留新值，其余置空。
         data.passportPhotoUrl = null;
-        data.passportIssueDate = null;
+        if (data.passportIssueDate === undefined) data.passportIssueDate = null;
         data.passportIssueCountry = null;
         data.passportIssuePlace = null;
-        data.passportExpiry = null;
+        if (data.passportExpiry === undefined) data.passportExpiry = null;
         // 已签发签证信息随人走
         data.visaNumber = null;
         data.visaType = null;

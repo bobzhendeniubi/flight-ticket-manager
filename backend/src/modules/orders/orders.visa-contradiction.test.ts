@@ -18,6 +18,9 @@ const { mockPrisma } = vi.hoisted(() => ({
     $queryRaw: vi.fn(),
     order: { findUnique: vi.fn(), findUniqueOrThrow: vi.fn() },
     passenger: { findUnique: vi.fn(), findMany: vi.fn(), update: vi.fn() },
+    // 换人护照有效期必填闸数「按人出行」行（FLIGHT/BUNDLE/VISA）。这些用例只关心签证矛盾闸，
+    // 固定 0 = 纯酒店/接送单 → 有效期不必填，该闸不参与本文件的判定。
+    orderItem: { count: vi.fn(async () => 0), findMany: vi.fn(async () => []) },
     user: { findUnique: vi.fn() },
   },
 }));

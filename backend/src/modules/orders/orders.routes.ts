@@ -2107,9 +2107,12 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   visaExempt/singleRoom/resetInvoice/resetVisa/feeCny/feeLabel/note 任一「换人语义字段」
   //   即判为换人，见 resolvePassengerPatchChannel）：
   //   body: { lastName?, firstName?, fullName?, documentNumber?, dateOfBirth?, gender?,
-  //           nationality?, title?, passengerType?, visaExempt?, singleRoom?,
-  //           resetInvoice?, resetVisa?, feeCny?, feeLabel?, note? }
+  //           nationality?, passportExpiry?, passportIssueDate?, title?, passengerType?,
+  //           visaExempt?, singleRoom?, resetInvoice?, resetVisa?, feeCny?, feeLabel?, note? }
   //   就地把出行人换成新人；resetInvoice→开票 NONE、resetVisa→签证任务 PENDING；可选加换人费。
+  //   passportExpiry/passportIssueDate 两个 schema 都有 → 不是分流依据（未列入换人独有键）：
+  //   只带护照资料 = 补录；带了换人语义字段才走换人，此时护照有效期由换人 schema 一并接住
+  //   （证件号变化 + 本单按人出行 + 未带有效期 → service 抛 400）。
   app.patch('/:id/passengers/:passengerId', { preHandler: [app.authenticate] }, async (req) => {
     const role = req.user.role;
     const { id, passengerId } = req.params as { id: string; passengerId: string };

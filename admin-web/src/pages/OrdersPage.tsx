@@ -10695,6 +10695,10 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                 <PassengerEditForm
                   orderId={order.id}
                   passenger={p}
+                  // 「按人出行」的单（含机票/套餐/签证行）换人时护照有效期必填，与建单同口径。
+                  requiresPassportExpiry={order.items.some(
+                    (it) => it.kind === 'FLIGHT' || it.kind === 'BUNDLE' || it.kind === 'VISA',
+                  )}
                   onCancel={() => setEditingId(null)}
                   onSaved={(updated) => {
                     setEditingId(null);
@@ -11038,11 +11042,14 @@ function PassengerVisaDatesInline({
 function PassengerEditForm({
   orderId,
   passenger,
+  requiresPassportExpiry,
   onCancel,
   onSaved,
 }: {
   orderId: string;
   passenger: OrderSummary['passengers'][number];
+  /** 本单是否「按人出行」（含机票/套餐/签证行）：为真时真换人必须填新出行人护照有效期。 */
+  requiresPassportExpiry: boolean;
   onCancel: () => void;
   onSaved: (order: OrderSummary) => void;
 }) {
@@ -11065,7 +11072,8 @@ function PassengerEditForm({
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // 护照有效期（可见字段；换人后经补录通道随新人写回）+ OCR 识别到的其余护照资料（隐藏携带）。
+  // 护照有效期 / 签发日（随换人请求本身提交——换人 = 录入新人的护照）+ OCR 识别到的其余护照资料
+  // （护照图/签发地/签发国仍走补录通道）。
   const [passportExpiry, setPassportExpiry] = useState(passenger.passportExpiry?.slice(0, 10) ?? '');
   const [passportPhotoUrl, setPassportPhotoUrl] = useState<string | null>(passenger.passportPhotoUrl ?? null);
   const [passportIssueDate, setPassportIssueDate] = useState<string | null>(null);
@@ -11185,6 +11193,19 @@ function PassengerEditForm({
     // 证件号变化 = 真换人：后端会清除旧出行人残留的护照/签证信息，需显式二次确认防误清。
     const newDoc = documentNumber.trim();
     const isRealSwap = newDoc !== '' && newDoc !== (passenger.documentNumber ?? '');
+    // 护照有效期先于二次确认校验（别让用户确认完才被打回）：
+    //   · 填了就要合法（YYYY-MM-DD）；
+    //   · 真换人 + 本单按人出行 → 必填。换人会清掉旧人的有效期，不填新的就等于把这一栏留空出行。
+    //     文案与后端 400 保持一致。
+    const expiryValue = passportExpiry.trim();
+    if (expiryValue && !/^\d{4}-\d{2}-\d{2}$/.test(expiryValue)) {
+      setErr('护照有效期格式不正确（示例：2030-01-01）');
+      return;
+    }
+    if (isRealSwap && requiresPassportExpiry && !expiryValue) {
+      setErr('换人须填写新出行人护照有效期（YYYY-MM-DD）');
+      return;
+    }
     highRiskConfirmRef.current = true;
     if (isRealSwap) {
       if (!(await confirm({
@@ -11205,13 +11226,6 @@ function PassengerEditForm({
         return;
       }
     }
-    // 护照有效期填了就要合法（YYYY-MM-DD）
-    const expiryValue = passportExpiry.trim();
-    if (expiryValue && !/^\d{4}-\d{2}-\d{2}$/.test(expiryValue)) {
-      setErr('护照有效期格式不正确（示例：2030-01-01）');
-      highRiskConfirmRef.current = false;
-      return;
-    }
     setSubmitting(true);
     try {
       const res = await api.updateOrderPassenger(token, orderId, passenger.id, {
@@ -11223,6 +11237,10 @@ function PassengerEditForm({
         dateOfBirth: dobValue,
         gender: gender || undefined,
         nationality: nationality.trim() || undefined,
+        // 护照有效期/签发日随换人请求一起提交：换人 = 录入新人的护照。放在这里而不是事后补录，
+        // 是因为服务端清空旧人有效期与写入新人有效期必须在同一次事务里定下来（缺则 400）。
+        passportExpiry: expiryValue || undefined,
+        passportIssueDate: passportIssueDate ?? undefined,
         resetInvoice: resetInvoice || undefined,
         resetVisa: resetVisa || undefined,
         feeCny: feeCny != null && feeCny > 0 ? feeCny : undefined,
@@ -11230,23 +11248,19 @@ function PassengerEditForm({
         note: note.trim() || undefined,
       });
 
-      // 换人本身会清空旧人护照资料；这里把 OCR 识别到的新人护照资料（护照图/有效期/签发日/签发地/签发国）
+      // 换人本身会清空旧人护照资料；这里把换人请求装不下的其余 OCR 结果（护照图/签发地/签发国）
       // 经「补录」通道写回，不削弱换人的清除语义。只在确有新护照资料时才发第二次请求。
+      // 有效期/签发日已随上面的换人请求提交，不再重复发一遍（同一字段发两遍 = 后一遍覆盖前一遍，
+      // 且「与旧值相同就不发」的老逻辑正是有效期被换人清空后再也补不回来的原因）。
       // 与旧值一致的字段不重复提交（passportPhotoUrl 是 data-URL，与旧照相同则跳过）。
       const supplement: {
         passportPhotoUrl?: string;
-        passportExpiry?: string;
-        passportIssueDate?: string;
         passportIssuePlace?: string;
         passportIssueCountry?: string;
       } = {};
       if (passportPhotoUrl && passportPhotoUrl !== (passenger.passportPhotoUrl ?? null)) {
         supplement.passportPhotoUrl = passportPhotoUrl;
       }
-      if (expiryValue && expiryValue !== (passenger.passportExpiry?.slice(0, 10) ?? '')) {
-        supplement.passportExpiry = expiryValue;
-      }
-      if (passportIssueDate) supplement.passportIssueDate = passportIssueDate;
       if (passportIssuePlace) supplement.passportIssuePlace = passportIssuePlace;
       if (passportIssueCountry) supplement.passportIssueCountry = passportIssueCountry;
 
@@ -11273,6 +11287,12 @@ function PassengerEditForm({
   };
 
   const inputCls = 'mt-0.5 w-full rounded border border-slate-300 px-2 py-1 text-xs';
+  // 护照有效期是否此刻必填：证件号已改成新的（真换人）+ 本单按人出行。随输入实时变化，
+  // 让运营在改证件号的当下就看见必填标记，而不是提交时才被打回。
+  const expiryRequired =
+    requiresPassportExpiry &&
+    documentNumber.trim() !== '' &&
+    documentNumber.trim() !== (passenger.documentNumber ?? '');
   const ocring = ocrPct !== null && ocrPct < 100;
   const ocrEngineLabel =
     ocrEngine === 'ai' ? 'AI 识别' : ocrEngine === 'local' ? '本地识别' : ocrEngine === 'ai-fallback' ? 'AI 失败·本地兜底' : '';
@@ -11368,8 +11388,21 @@ function PassengerEditForm({
           <input className={inputCls} value={nationality} onChange={(e) => setNationality(e.target.value)} placeholder="CN" />
         </label>
         <label className="block">
-          <span className="text-slate-500">护照有效期</span>
-          <input className={`${inputCls} font-mono`} value={passportExpiry} onChange={(e) => setPassportExpiry(e.target.value)} placeholder="2030-01-01" />
+          <span className="text-slate-500">
+            护照有效期
+            {expiryRequired && <span className="ml-0.5 text-rose-600">*</span>}
+          </span>
+          <input
+            className={`${inputCls} font-mono ${expiryRequired && !passportExpiry.trim() ? 'border-rose-400' : ''}`}
+            value={passportExpiry}
+            onChange={(e) => setPassportExpiry(e.target.value)}
+            placeholder="2030-01-01"
+          />
+          {expiryRequired && (
+            <span className="mt-0.5 block text-[10px] text-rose-600">
+              换人须填新出行人的护照有效期（原出行人的有效期会被清除）
+            </span>
+          )}
         </label>
       </div>
 

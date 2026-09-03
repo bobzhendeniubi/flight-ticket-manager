@@ -559,6 +559,8 @@ describe('OrderService.swapPassenger · 真 DB E2E', () => {
         fullName: 'LI MING',
         documentNumber: 'E99999999',
         nationality: 'CHN',
+        // 真换人 = 录入新人的护照：按人出行的单（本例纯机票）必须带新出行人的护照有效期。
+        passportExpiry: '2035-01-01',
         // P1-8：这些字段此前 swapPassengerBodySchema 未暴露（前端传不进来）；补齐后应透传落库。
         visaExempt: true,
         singleRoom: true,
@@ -579,6 +581,8 @@ describe('OrderService.swapPassenger · 真 DB E2E', () => {
     // P1-8：换人可显式带的乘客级属性（自备签 / 单住）落库
     expect(px.visaExempt).toBe(true);
     expect(px.singleRoom).toBe(true);
+    // 新出行人的护照有效期随换人一并落库（换人清洗只清旧人的，本次带了新值就用新值）
+    expect(px.passportExpiry?.toISOString().slice(0, 10)).toBe('2035-01-01');
 
     // resetInvoice → NONE
     const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
@@ -605,6 +609,36 @@ describe('OrderService.swapPassenger · 真 DB E2E', () => {
     expect(result.audit.after.fullName).toBe('LI MING');
     expect(result.audit.visaTasksReset).toBe(1);
     expect(result.order.balanceDue).toBe('200'); // 1000+200−1000
+  });
+
+  // 换人 = 录入一个新人的护照：证件号变化会清掉旧人的有效期，不同时给新人的就等于把这一栏
+  // 留空出行（线上曾出现「没填有效期就录进系统还开了票」）。按人出行的单（含机票/套餐/签证行）硬拦。
+  it('换人未带护照有效期 + 本单含机票行 → 400，且身份不落库', async () => {
+    const actor = await adminActor();
+    const from = await createScheduleWithSeats({ sold: 1 });
+    const order = await createPaidFlightOrder({
+      scheduleId: from.schedule.id,
+      cabin: CabinClass.ECONOMY,
+    });
+    const before = await prisma.passenger.findUniqueOrThrow({
+      where: { id: order.passengers[0].id },
+    });
+
+    await expect(
+      service.swapPassenger(
+        order.id,
+        order.passengers[0].id,
+        { fullName: 'LI MING', documentNumber: 'E90000001', nationality: 'CHN' },
+        actor,
+      ),
+    ).rejects.toThrow(/护照有效期/);
+
+    // 事务整体回滚：姓名/证件号都没动
+    const after = await prisma.passenger.findUniqueOrThrow({
+      where: { id: order.passengers[0].id },
+    });
+    expect(after.fullName).toBe(before.fullName);
+    expect(after.documentNumber).toBe(before.documentNumber);
   });
 
   it('换人无 resetInvoice/resetVisa → 开票/签证状态不变', async () => {
@@ -653,7 +687,7 @@ describe('OrderService.swapPassenger · 真 DB E2E', () => {
     const result = await service.swapPassenger(
       order.id,
       order.passengers[0].id,
-      { fullName: 'LI MING', documentNumber: 'E77777777', nationality: 'CHN' },
+      { fullName: 'LI MING', documentNumber: 'E77777777', nationality: 'CHN', passportExpiry: '2035-01-01' },
       actor,
     );
 
@@ -679,7 +713,14 @@ describe('OrderService.swapPassenger · 真 DB E2E', () => {
     await service.swapPassenger(
       order.id,
       order.passengers[0].id,
-      { fullName: 'LI MING', documentNumber: 'E88888888', nationality: 'CHN', feeCny: 200, feeLabel: '换人费' },
+      {
+        fullName: 'LI MING',
+        documentNumber: 'E88888888',
+        nationality: 'CHN',
+        passportExpiry: '2035-01-01',
+        feeCny: 200,
+        feeLabel: '换人费',
+      },
       actor,
     );
 
@@ -710,7 +751,7 @@ describe('OrderService.swapPassenger · 真 DB E2E', () => {
     await service.swapPassenger(
       order.id,
       order.passengers[0].id,
-      { fullName: 'LI MING', documentNumber: 'E99990000', nationality: 'CHN' },
+      { fullName: 'LI MING', documentNumber: 'E99990000', nationality: 'CHN', passportExpiry: '2035-01-01' },
       actor,
     );
 
@@ -745,7 +786,13 @@ describe('OrderService.swapPassenger · 真 DB E2E', () => {
     const result = await service.swapPassenger(
       order.id,
       order.passengers[0].id,
-      { fullName: 'LI MING', documentNumber: 'E12312312', nationality: 'CHN', resetVisa: true },
+      {
+        fullName: 'LI MING',
+        documentNumber: 'E12312312',
+        nationality: 'CHN',
+        passportExpiry: '2035-01-01',
+        resetVisa: true,
+      },
       actor,
     );
 
@@ -768,7 +815,7 @@ describe('OrderService.swapPassenger · 真 DB E2E', () => {
     await service.swapPassenger(
       order.id,
       passengerId,
-      { fullName: 'LI MING', documentNumber: 'E55550001', nationality: 'CHN' },
+      { fullName: 'LI MING', documentNumber: 'E55550001', nationality: 'CHN', passportExpiry: '2035-01-01' },
       actor,
     );
     let reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
@@ -781,7 +828,7 @@ describe('OrderService.swapPassenger · 真 DB E2E', () => {
     await service.swapPassenger(
       order.id,
       passengerId,
-      { fullName: 'ZHAO LEI', documentNumber: 'E55550002', nationality: 'CHN' },
+      { fullName: 'ZHAO LEI', documentNumber: 'E55550002', nationality: 'CHN', passportExpiry: '2035-01-01' },
       actor,
     );
     reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });

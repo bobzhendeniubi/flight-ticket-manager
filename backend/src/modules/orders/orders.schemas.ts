@@ -281,7 +281,9 @@ export const passengerInputWithRequiredExpirySchema = passengerInputSchema.exten
 // 「按人出行」的产品行：含这些行的订单，每位出行人都必须有护照有效期。
 // 纯酒店/接送单不在此列 —— 那类单的出行人可能只是联系人占位（documentNumber='N/A'），
 // 没有护照资料，强制有效期会把正常录单打死。
-const PER_PERSON_TRAVEL_KINDS = new Set(['FLIGHT', 'BUNDLE', 'VISA']);
+// 导出：换人通道（service.swapPassenger）复用同一口径判断「本单是否按人出行」，
+// 避免两处各写一份 kind 名单而漂移。
+export const PER_PERSON_TRAVEL_KINDS = new Set(['FLIGHT', 'BUNDLE', 'VISA']);
 
 /**
  * 公开下单端点（POST /orders）的护照有效期必填校验：**不分渠道**（后台单录、前台散客/
@@ -1121,6 +1123,11 @@ export type UpgradeItemCabinBody = z.infer<typeof upgradeItemCabinBodySchema>;
 
 // ── 售后改单：换人（passenger swap）─────────────────────────────────────────
 // PATCH /orders/:id/passengers/:passengerId（ADMIN/STAFF）：就地改出行人身份 + 可选重置开票/签证 + 换人费。
+//
+// 护照口径：**换人 = 录入一个新人的护照**，与建单同一要求。证件号变化（真换人）会把旧人的
+// passportExpiry / passportIssueDate 清空（不能把旧人的有效期套到新人头上），所以新人的
+// 护照有效期必须随本请求一起给——含机票/套餐/签证行的「按人出行」订单由 service.swapPassenger
+// 硬性要求（缺失 400），纯酒店/接送单不强制（出行人可能只是联系人占位）。
 export const swapPassengerBodySchema = z
   .object({
     // lastName/firstName 各自单段规范化（不做斜线拼接）：与录单入口同款，单段里不允许出现 '/'
@@ -1141,6 +1148,13 @@ export const swapPassengerBodySchema = z
     //   注：Zod superRefine 只能硬性 400，而「建议必填」是软约束（不改现有不传国籍即换人的行为、不误伤既有
     //   调用/测试），故此处不做条件强制；由前端在证件号变化时提示补录国籍（真正的硬校验留待后续按业务定夺）。
     nationality: z.string().max(60).optional(),
+    // 新出行人的护照有效期 / 签发日（YYYY-MM-DD，正则与建单 passengerInputSchema 同款）。
+    //   证件号变化时 service 会清空旧人的这两项，本请求带的值即新人的值；未带有效期且本单
+    //   「按人出行」→ service 400（见 swapPassengerBodySchema 上方口径说明）。
+    //   注意：这两个键补录 schema（selfUpdatePassengerBodySchema）里也有 → **不可**加进
+    //   SWAP_PASSENGER_SEMANTIC_FIELDS，否则只补护照资料的请求会被误分流到换人通道。
+    passportExpiry: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    passportIssueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     // 换人可显式带的新出行人属性（service.swapPassenger 早已按可选接收，此前 schema 未暴露 → 前端传不进来）：
     //   title（称谓）/ passengerType（成人·儿童·婴儿）/ visaExempt（自备签）/ singleRoom（单住）。
     title: z.enum(['MR', 'MRS', 'MS', 'MSTR', 'MISS', 'DR']).optional(),
@@ -1164,6 +1178,8 @@ export const swapPassengerBodySchema = z
       b.dateOfBirth !== undefined ||
       b.gender !== undefined ||
       b.nationality !== undefined ||
+      b.passportExpiry !== undefined ||
+      b.passportIssueDate !== undefined ||
       b.title !== undefined ||
       b.passengerType !== undefined ||
       b.visaExempt !== undefined ||

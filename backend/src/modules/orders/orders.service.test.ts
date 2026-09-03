@@ -48,10 +48,13 @@ const {
       updateMany: vi.fn(),
     },
     // swapPassenger 换人重复证件号校验：查本订单 FLIGHT 行的 flightScheduleId（P1-8）。
+    // count：换人护照有效期必填闸数「按人出行」行（FLIGHT/BUNDLE/VISA）。默认 0 =「纯酒店/接送单」，
+    // 既有换人用例（不带护照有效期）因此不受必填闸影响；专测必填闸的用例显式改返回值。
     orderItem: {
       findMany: vi.fn(),
       findUnique: vi.fn(),
       update: vi.fn(),
+      count: vi.fn(async () => 0),
     },
     refund: { create: vi.fn() },
     user: {
@@ -3467,6 +3470,165 @@ describe('swapPassenger · 证件号变化触发旧护照/签证清洗', () => {
     ).rejects.toMatchObject({ code: 'DUPLICATE_PASSENGER' });
     // 冲突时在 update 之前中止 → 绝不落库
     expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+});
+
+// ── swapPassenger · 新出行人护照有效期必填 / 写入 ────────────────────────────
+// 口径：换人 = 录入一个新人的护照。证件号变化会清掉旧人的护照有效期（旧人的有效期绝不能套到
+// 新人头上），若不同时要新人的有效期，换人后这一栏就永远是空的（线上曾出现「没填有效期就录进
+// 系统还开了票」）。含机票/套餐/签证行的「按人出行」订单硬性要求；纯酒店/接送单不强制
+// （出行人可能只是联系人占位，没有护照资料）。
+describe('swapPassenger · 新出行人护照有效期', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  /** @param perPersonItems 本单「按人出行」行数（>0 = 含机票/套餐/签证行 → 有效期必填）。 */
+  function armSwapMocks(existingDoc: string, perPersonItems: number) {
+    mockPrisma.order.findUnique.mockResolvedValueOnce({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
+    mockPrisma.passenger.findUnique.mockResolvedValueOnce({
+      id: 'px1',
+      orderId: 'ord1',
+      fullName: 'OLD, PERSON',
+      documentNumber: existingDoc,
+    });
+    mockPrisma.orderItem.count.mockResolvedValue(perPersonItems);
+    // 重复证件号校验：无 FLIGHT 行 → 无班次 → 短路，不触达 passenger.findFirst。
+    mockPrisma.orderItem.findMany.mockResolvedValue([]);
+    mockPrisma.passenger.update.mockResolvedValue({});
+    mockPrisma.passenger.findUniqueOrThrow.mockResolvedValue({
+      fullName: 'NEW, PERSON',
+      documentNumber: 'NEW999',
+    });
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValue(fakeFullOrder({ id: 'ord1' }));
+  }
+
+  it('证件号变化 + 未填有效期 + 本单含按人出行行 → 400，且不落库', async () => {
+    const service = new OrderService();
+    armSwapMocks('OLD111', 1);
+
+    await expect(
+      service.swapPassenger(
+        'ord1',
+        'px1',
+        { fullName: 'NEW PERSON', documentNumber: 'NEW999' },
+        { userId: 'admin1', role: 'ADMIN' },
+      ),
+    ).rejects.toThrow('换人须填写新出行人护照有效期（YYYY-MM-DD）');
+    expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+
+  it('证件号变化 + 带有效期 → 写入新人的有效期（不被换人清洗置空）', async () => {
+    const service = new OrderService();
+    armSwapMocks('OLD111', 1);
+
+    await service.swapPassenger(
+      'ord1',
+      'px1',
+      { fullName: 'NEW PERSON', documentNumber: 'NEW999', passportExpiry: '2035-06-30' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data.passportExpiry).toEqual(new Date('2035-06-30'));
+    // 本次未带签发日 → 仍随人清空（不残留前一位）
+    expect(data.passportIssueDate).toBeNull();
+    // 带了签发日也一并写入的分支见下一条用例
+  });
+
+  it('证件号变化 + 带有效期与签发日 → 两项都写入新值', async () => {
+    const service = new OrderService();
+    armSwapMocks('OLD111', 1);
+
+    await service.swapPassenger(
+      'ord1',
+      'px1',
+      {
+        fullName: 'NEW PERSON',
+        documentNumber: 'NEW999',
+        passportExpiry: '2035-06-30',
+        passportIssueDate: '2025-06-30',
+      },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data.passportExpiry).toEqual(new Date('2035-06-30'));
+    expect(data.passportIssueDate).toEqual(new Date('2025-06-30'));
+  });
+
+  it('证件号变化 + 未填有效期 + 纯酒店/接送单 → 放行，有效期置空（沿用换人清洗）', async () => {
+    const service = new OrderService();
+    armSwapMocks('OLD111', 0);
+
+    await service.swapPassenger(
+      'ord1',
+      'px1',
+      { fullName: 'NEW PERSON', documentNumber: 'NEW999' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data.passportExpiry).toBeNull();
+    expect(data.passportIssueDate).toBeNull();
+  });
+
+  it('证件号不变 + 未填有效期 → 原有效期保持不变（不再被清空）', async () => {
+    const service = new OrderService();
+    armSwapMocks('SAME123', 1);
+
+    await service.swapPassenger(
+      'ord1',
+      'px1',
+      { fullName: 'FIXED SPELLING', documentNumber: 'SAME123' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data).not.toHaveProperty('passportExpiry');
+    expect(data).not.toHaveProperty('passportIssueDate');
+    // 证件号没变 → 必填闸整段不跑（连查询都不发）
+    expect(mockPrisma.orderItem.count).not.toHaveBeenCalled();
+  });
+
+  it('证件号不变 + 带有效期 → 等价于一次补录，更新有效期', async () => {
+    const service = new OrderService();
+    armSwapMocks('SAME123', 1);
+
+    await service.swapPassenger(
+      'ord1',
+      'px1',
+      { fullName: 'FIXED SPELLING', documentNumber: 'SAME123', passportExpiry: '2031-12-31' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data.passportExpiry).toEqual(new Date('2031-12-31'));
+  });
+});
+
+// ── swapPassengerBodySchema · 护照有效期 / 签发日字段 ────────────────────────
+describe('swapPassengerBodySchema · passportExpiry / passportIssueDate', () => {
+  it('接受 YYYY-MM-DD', () => {
+    const parsed = swapPassengerBodySchema.parse({
+      documentNumber: 'E12345678',
+      passportExpiry: '2035-06-30',
+      passportIssueDate: '2025-06-30',
+    });
+    expect(parsed.passportExpiry).toBe('2035-06-30');
+    expect(parsed.passportIssueDate).toBe('2025-06-30');
+  });
+
+  it('拒绝带时区的完整 ISO 串与斜杠日期（与建单同款正则）', () => {
+    expect(() =>
+      swapPassengerBodySchema.parse({ passportExpiry: '2035-06-30T00:00:00+08:00' }),
+    ).toThrow();
+    expect(() => swapPassengerBodySchema.parse({ passportExpiry: '2035/06/30' })).toThrow();
+  });
+
+  it('只带护照有效期也能通过「至少改一项」的 refine（换人通道接得住补录字段）', () => {
+    expect(swapPassengerBodySchema.safeParse({ passportExpiry: '2035-06-30' }).success).toBe(true);
+    expect(swapPassengerBodySchema.safeParse({ passportIssueDate: '2025-06-30' }).success).toBe(true);
   });
 });
 
