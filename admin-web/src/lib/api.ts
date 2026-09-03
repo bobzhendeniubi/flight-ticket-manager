@@ -1327,7 +1327,27 @@ export interface OrderItem {
   bundleTransfers?: Array<{ name: string; qty: number }> | null;
   /** BUNDLE 行：套餐定义里的签证组件（第一条）；stayDays 由服务端按 visaId 查好；无签证组件为 null */
   bundleVisa?: { name: string; visaId: string; stayDays: number | null } | null;
+
+  /**
+   * 对外（代理/客户）视角的航段中性状态。**只对 AGENT 角色下发**，ADMIN/STAFF 拿不到这个字段
+   * ——内部视角看的是 legFlag / 行 metadata 那套完整口径，两边不混用。
+   * 缺省 = 该航段没有需要对外说明的状态，什么都不显示（不臆造「正常」这类标）。
+   */
+  publicLegStatus?: PublicLegStatus;
 }
+
+/**
+ * 对外航段状态（代理/客户口吻）：
+ * · RETURN_PENDING_REARRANGE —— 回程座位已释放，还能联系运营恢复
+ * · RETURN_CANCELLED / OUTBOUND_CANCELLED —— 对应方向已取消
+ * · OUTBOUND_NOT_BOARDED —— 去程未登机
+ * 内部的 no-show / 释放 / 作废口径不对外露出，一律翻译成上面这四种中性说法。
+ */
+export type PublicLegStatus =
+  | 'RETURN_PENDING_REARRANGE'
+  | 'RETURN_CANCELLED'
+  | 'OUTBOUND_CANCELLED'
+  | 'OUTBOUND_NOT_BOARDED';
 
 export interface OrderPassenger {
   id: string;
@@ -1867,6 +1887,142 @@ export type OrderLegFlagFilter =
   | 'OUTBOUND_VOIDED';
 /** 订单级航段状态标记：NONE = 本单没有任何 no-show/回程释放打标。 */
 export type OrderLegFlag = 'NONE' | OrderLegFlagFilter;
+
+// ── 批量 no-show（贴航司名单 → 逐人标记 / 释放回程）────────────────────────────
+// 名单一行一个标识：护照号 / 证件姓名 / 中文名，服务端负责匹配与合格性判定。
+// 前端**不自己判合格**——eligible / blockers / scope 全部以服务端 preview 为准。
+
+/** 名单行是靠什么匹配上的（护照号最强，姓名类可能同名） */
+export type NoShowMatchedBy = 'DOCUMENT' | 'NAME' | 'CHINESE_NAME';
+/** WHOLE = 整单就是这些人；SPLIT_REQUIRED = 只标其中部分人，服务端会先自动拆单 */
+export type NoShowMatchScope = 'WHOLE' | 'SPLIT_REQUIRED';
+
+export interface NoShowBatchSchedule {
+  id: string;
+  flightNumber: string;
+  /** 出发日 YYYY-MM-DD（班次当地日） */
+  departDate: string;
+  /** 出发时刻 HH:mm（班次当地时） */
+  departTimeLocal: string;
+  /** 是否已起飞（服务端权威判定，前端本地时间只作提示，不作闸） */
+  departed: boolean;
+  seatsSold: number;
+}
+
+export interface NoShowBatchMatch {
+  /** 名单里的原始行文本（用于回指是哪一行） */
+  line: string;
+  orderId: string;
+  orderNumber: string;
+  passengerId: string;
+  fullName: string;
+  chineseName: string | null;
+  /** 护照尾号（服务端已脱敏；前端不拼全号） */
+  documentTail: string | null;
+  matchedBy: NoShowMatchedBy;
+  alreadyNoShow: boolean;
+  eligible: boolean;
+  /** 不合格原因（服务端文案，前端原样展示） */
+  blockers: string[];
+  scope: NoShowMatchScope;
+  hasReturn: boolean;
+  returnTicketed: boolean;
+  returnDeparted: boolean;
+}
+
+export interface NoShowAmbiguousCandidate {
+  orderNumber: string;
+  passengerId: string;
+  fullName: string;
+  chineseName: string | null;
+}
+
+export interface NoShowAmbiguousLine {
+  line: string;
+  candidates: NoShowAmbiguousCandidate[];
+}
+
+export interface NoShowBatchPreview {
+  schedule: NoShowBatchSchedule;
+  matched: NoShowBatchMatch[];
+  unmatched: string[];
+  ambiguous: NoShowAmbiguousLine[];
+}
+
+/** 一张单里要标的乘客（同一单多人合成一条） */
+export interface NoShowBatchEntry {
+  orderId: string;
+  passengerIds: string[];
+}
+
+export interface NoShowBatchResult {
+  orderId: string;
+  orderNumber: string;
+  ok: boolean;
+  /** 触发自动拆单时的新单号（钱与座位都在新单上） */
+  targetOrderNumber?: string;
+  releasedSeats?: number;
+  /** 服务端顺带开出的撤名单/退票工单 id */
+  workOrderReminderId?: string;
+  error?: string;
+  code?: string;
+}
+
+export interface NoShowBatchResponse {
+  results: NoShowBatchResult[];
+  summary: { ok: number; failed: number; releasedSeats: number };
+}
+
+/** no-show 报表行（按班次聚合） */
+export interface NoShowReportRow {
+  scheduleId: string;
+  flightNumber: string;
+  departDate: string;
+  orders: number;
+  noShowPax: number;
+  releasedSeats: number;
+  restoredSeats: number;
+  oversoldSeats: number;
+  displacedSeats: number;
+  voidedSeats: number;
+  stillReleasedSeats: number;
+  workOrdersOpen: number;
+}
+
+/** 合计行：与行同名的数值字段；旧后端可能不下发某一项，渲染处一律 `?? 0`。 */
+export type NoShowReportTotals = Partial<
+  Omit<NoShowReportRow, 'scheduleId' | 'flightNumber' | 'departDate'>
+>;
+
+export interface NoShowReportResponse {
+  rows: NoShowReportRow[];
+  totals: NoShowReportTotals;
+}
+
+// ── 撤名单 / 退票工单角标（提醒中心的子集，顶栏轮询用）──────────────────────
+export type WorkOrderKind = 'WITHDRAW' | 'RELIST' | 'LEG_CANCEL_WITHDRAW';
+
+export interface WorkOrderSummaryItem {
+  id: string;
+  ruleKey: string;
+  kind: WorkOrderKind;
+  title: string;
+  orderId: string;
+  orderNumber: string;
+  priority: ReminderPriority;
+  status: ReminderStatus;
+  createdAt: string;
+  dueAt: string | null;
+  assigneeUserId: string | null;
+}
+
+export interface WorkOrderSummary {
+  open: number;
+  inProgress: number;
+  /** 最新一条工单的时间（ISO）；无工单为 null。角标靠它判断「有没有新的」 */
+  latestAt: string | null;
+  items: WorkOrderSummaryItem[];
+}
 
 /** listOrders 查询参数（与 backend listOrdersQuerySchema 对齐） */
 export interface ListOrdersParams {
@@ -5253,6 +5409,62 @@ export const api = {
       '/reminders/generate',
       { method: 'POST', token, body: {} },
     ),
+
+  // 撤名单 / 退票工单角标（顶栏轮询）：since 之后的工单 + 未结数量。
+  // 只是提醒中心的一个视图，行操作（认领/完成）仍走 /reminders/*。
+  listWorkOrderSummary: (token: string, since?: string) => {
+    const qs = since ? `?since=${encodeURIComponent(since)}` : '';
+    return apiFetch<WorkOrderSummary>(`/reminders/work-orders/summary${qs}`, { token });
+  },
+
+  // ── 批量 no-show ──────────────────────────────────────────────────────
+  // 合格性、拆单与否、能释放几座，全部由服务端判定；前端只负责勾选与展示。
+  noShow: {
+    /** 干跑：贴名单 → 逐行匹配结果（不落任何库存/资金变化） */
+    batchPreview: (token: string, body: { scheduleId: string; names: string[] }) =>
+      apiFetch<NoShowBatchPreview>('/orders/no-show/batch-preview', {
+        method: 'POST',
+        token,
+        body,
+      }),
+    /**
+     * 落库执行。requestToken 是幂等键：同一批载荷重试必须复用同一个 token，
+     * 否则已成功的那几单会被再执行一遍。
+     */
+    batch: (
+      token: string,
+      body: {
+        requestToken: string;
+        scheduleId: string;
+        entries: NoShowBatchEntry[];
+        releaseReturn: boolean;
+        note?: string;
+      },
+    ) =>
+      apiFetch<NoShowBatchResponse>('/orders/no-show/batch', { method: 'POST', token, body }),
+    /** 按班次聚合的 no-show 报表（释放/恢复/超售/被顶/作废/仍释放 + 未结工单） */
+    report: (token: string, range?: { from?: string; to?: string }) => {
+      const qs = new URLSearchParams();
+      if (range?.from) qs.set('from', range.from);
+      if (range?.to) qs.set('to', range.to);
+      const suffix = qs.toString() ? `?${qs.toString()}` : '';
+      return apiFetch<NoShowReportResponse>(`/orders/no-show/report${suffix}`, { token });
+    },
+    /** 同口径 xlsx 导出（Blob 直接下载） */
+    exportReport: async (token: string, range?: { from?: string; to?: string }): Promise<Blob> => {
+      const qs = new URLSearchParams();
+      if (range?.from) qs.set('from', range.from);
+      if (range?.to) qs.set('to', range.to);
+      const suffix = qs.toString() ? `?${qs.toString()}` : '';
+      const res = await fetch(`${API_BASE}/orders/no-show/report/export${suffix}`, {
+        headers: { Authorization: `Bearer ${token}` },
+      });
+      if (!res.ok) {
+        throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
+      }
+      return res.blob();
+    },
+  },
 
   // Settlements
   listSettlements: (token: string, query?: { period?: string; agentId?: string; status?: SettlementStatus; page?: number; pageSize?: number }) => {

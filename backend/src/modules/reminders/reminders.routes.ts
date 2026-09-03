@@ -20,9 +20,12 @@ import { prisma } from '../../db/prisma.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import {
   createReminderSchema,
+  deriveWorkOrderKind,
   listRemindersQuerySchema,
   resolveReminderSchema,
   updateReminderSchema,
+  WORK_ORDER_RULE_KINDS,
+  workOrderSummaryQuerySchema,
 } from './reminders.schemas.js';
 import { generateRuleReminders } from './reminders.rules.js';
 
@@ -63,6 +66,61 @@ export const reminderRoutes: FastifyPluginAsync = async (app) => {
     ]);
 
     return { reminders: rows, pagination: { page: q.page, pageSize: q.pageSize, total } };
+  });
+
+  // 出票工单角标（顶栏轮询）——no-show 释放回程「撤名单」/回程恢复「重新上名单」/航段作废
+  // 「撤名单」三类工单（ruleKey 前缀见 WORK_ORDER_RULE_KINDS）。票务只有去待办中心才看得到，
+  // 这里给顶栏一个轻量端点：open/inProgress 是全量计数（角标数字），items 是最近 30 条明细，
+  // 可选 since 只把 items 收窄到新增的（弹桌面通知用），计数不受 since 影响。
+  app.get('/work-orders/summary', requireOps, async (req) => {
+    const q = workOrderSummaryQuerySchema.parse(req.query);
+    const ruleKeyFilter: Prisma.OperationalReminderWhereInput = {
+      OR: Object.keys(WORK_ORDER_RULE_KINDS).map((prefix) => ({
+        ruleKey: { startsWith: `${prefix}:` },
+      })),
+    };
+
+    const [open, inProgress, recent] = await prisma.$transaction([
+      prisma.operationalReminder.count({
+        where: { ...ruleKeyFilter, status: ReminderStatus.OPEN },
+      }),
+      prisma.operationalReminder.count({
+        where: { ...ruleKeyFilter, status: ReminderStatus.IN_PROGRESS },
+      }),
+      prisma.operationalReminder.findMany({
+        where: {
+          ...ruleKeyFilter,
+          status: { in: [ReminderStatus.OPEN, ReminderStatus.IN_PROGRESS] },
+        },
+        orderBy: { createdAt: 'desc' },
+        take: 30,
+        include: { order: { select: { orderNumber: true } } },
+      }),
+    ]);
+
+    // latestAt 永远来自全量（不受 since 影响）最近一条，前端拿它做下一轮轮询的 since 锚点。
+    const latestAt = recent[0]?.createdAt.toISOString() ?? null;
+    const sinceMs = q.since ? new Date(q.since).getTime() : null;
+    const filtered = sinceMs === null ? recent : recent.filter((r) => r.createdAt.getTime() > sinceMs);
+
+    return {
+      open,
+      inProgress,
+      latestAt,
+      items: filtered.map((r) => ({
+        id: r.id,
+        ruleKey: r.ruleKey,
+        kind: deriveWorkOrderKind(r.ruleKey),
+        title: r.title,
+        orderId: r.orderId,
+        orderNumber: r.order?.orderNumber ?? null,
+        priority: r.priority,
+        status: r.status,
+        createdAt: r.createdAt.toISOString(),
+        dueAt: r.dueAt ? r.dueAt.toISOString() : null,
+        assigneeUserId: r.claimedById,
+      })),
+    };
   });
 
   app.post('/', requireOps, async (req) => {

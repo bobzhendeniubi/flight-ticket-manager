@@ -1532,6 +1532,54 @@ export const noShowBodySchema = z.object({
 });
 export type NoShowBody = z.infer<typeof noShowBodySchema>;
 
+// ── 按航班批量 no-show（POST /orders/no-show/batch-preview | /batch；ADMIN/STAFF）──
+//
+// 票务每天收到航司发来的整班 no-show 名单。单单点一张一张处理下来半小时起、还容易漏，
+// 所以给一条正路：贴名单 → 系统匹配到本班次去程占座单的乘客并逐单预检 → 勾选后一键执行。
+//
+// names 是**整块粘贴的原文**（按行切，一行一人）。一行长什么样完全不受我们控制 ——
+// 可能是中文名、拼音名（姓/名 或 名 姓）、姓名 + 护照号，分隔符空格/逗号/顿号/斜杠/制表混着来，
+// 所以后端按「护照号精确 → 英文名归一化 → 中文名精确」逐行试，命中多人一律交人工点选。
+export const noShowBatchPreviewBodySchema = z.object({
+  scheduleId: z.string().min(1, '请先选择航班班次'),
+  // 上限 20000 字符 ≈ 500 行名单，与 NO_SHOW_ROSTER_MAX_LINES 同量级（防误传整本表格）。
+  names: z.string().min(1, '请粘贴 no-show 名单').max(20000, '名单过长，请分批处理'),
+});
+export type NoShowBatchPreviewBody = z.infer<typeof noShowBatchPreviewBodySchema>;
+
+export const noShowBatchBodySchema = z.object({
+  // 整批一个 requestToken；逐单的幂等键由服务端按 `${requestToken}:${orderId}` 做 uuid v5 派生。
+  // 前端整批重试请**沿用同一个** token —— 换新 token 会让已标过的单被当成新请求再跑一遍。
+  requestToken: z.string().min(8).max(64).uuid(),
+  scheduleId: z.string().min(1),
+  entries: z
+    .array(
+      z.object({
+        orderId: z.string().min(1),
+        // 逐单勾选的乘客（勾满即整单，服务端自行判定；勾一部分会先自动拆单再标）。
+        passengerIds: z.array(z.string().min(1)).min(1, '每张单至少勾选 1 位乘客').max(99),
+      }),
+    )
+    .min(1, '请至少勾选一条')
+    .max(200, '单次最多处理 200 张单，请分批执行')
+    .refine((list) => new Set(list.map((e) => e.orderId)).size === list.length, {
+      message: '同一张订单只能出现一次，请把该单的乘客合并到一条里',
+    }),
+  releaseReturn: z.boolean().default(true),
+  note: z.string().max(200).optional(),
+});
+export type NoShowBatchBody = z.infer<typeof noShowBatchBodySchema>;
+
+// ── no-show 报表（GET /orders/no-show/report[/export]；ADMIN/STAFF）──────────────
+// 区间按**去程航班的起飞地当地日**取（与全站「出发日期」同口径），不是 no-show 的操作日期。
+export const noShowReportQuerySchema = z
+  .object({
+    from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD'),
+    to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD'),
+  })
+  .refine((q) => q.from <= q.to, { message: '开始日期不能晚于结束日期' });
+export type NoShowReportQuery = z.infer<typeof noShowReportQuerySchema>;
+
 // ── 恢复回程（POST /orders/:id/restore-return-leg；ADMIN/STAFF）─────────────────
 // 代理来说「这位客人还要回程」→ 票务把之前释放掉的回程恢复回**原班次**。
 // 有座直接占；没座允许超售（前端二次确认 → allowOversell=true），后端记 CRITICAL 审计。

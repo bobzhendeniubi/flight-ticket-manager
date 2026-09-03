@@ -54,7 +54,10 @@ import {
   cancelLegBodySchema,
   cancelLegPreviewBodySchema,
   noShowBodySchema,
+  noShowBatchBodySchema,
+  noShowBatchPreviewBodySchema,
   noShowPreviewBodySchema,
+  noShowReportQuerySchema,
   restoreReturnLegBodySchema,
   voidReturnLegBodySchema,
   splitRoomGroupBodySchema,
@@ -120,6 +123,12 @@ import {
   parseOrderImportXlsx,
   resolveOrderImport,
 } from './orders.import.js';
+import { executeNoShowBatch, previewNoShowBatch } from './no-show-batch.js';
+import {
+  buildNoShowReportWorkbook,
+  loadNoShowReport,
+  noShowReportFilename,
+} from './no-show-report.js';
 
 // ── 出纳「预期到账金额」上限（CNY，整单总额）──────────────────────────────
 // 取 40_000_000 的依据（非拍脑袋）：
@@ -2591,6 +2600,137 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
 
     return { order: result.order, targetOrderId: result.targetOrderId, audit: result.audit };
   });
+
+  // ── 按航班批量 no-show（ADMIN/STAFF）──────────────────────────────────────
+  //
+  // 票务每天照航司名单处理：整块贴名单 → 系统匹配到本班次**去程**占座单的乘客并逐单预检 →
+  // 勾选后一键执行。执行逐单调既有 markNoShow（一单一事务），一单失败不影响其它单。
+  //
+  // ⚠ 路由顺序无所谓：Fastify 的 radix 路由静态段优先，`/orders/no-show/...` 不会被
+  //    `/orders/:id/no-show` 抢走（反之亦然）。
+  //
+  // POST /orders/no-show/batch-preview  body: { scheduleId, names }
+  //   只读：一个字段都不写库。matched 里的 blockers/eligible 与单单端点同源（_assessNoShow）。
+  app.post('/no-show/batch-preview', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可标记 no-show' });
+    }
+    const body = noShowBatchPreviewBodySchema.parse(req.body);
+    return previewNoShowBatch({ service }, body, { userId: req.user.sub, role });
+  });
+
+  // POST /orders/no-show/batch  body: { requestToken, scheduleId, entries, releaseReturn?, note? }
+  //   幂等：整批一个 requestToken，逐单 token 由服务端按 `${requestToken}:${orderId}` 做
+  //   uuid v5 派生 —— 整批重试会命中逐单的既有回放，座位绝不二次释放。
+  app.post('/no-show/batch', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可标记 no-show' });
+    }
+    const body = noShowBatchBodySchema.parse(req.body);
+    const result = await executeNoShowBatch({ service }, body, { userId: req.user.sub, role });
+
+    // 整批一条 WARNING 审计：事后要能一眼看出「哪一班、贴了多少条、成了几条、放了多少座」。
+    // 逐单的 MARK_NO_SHOW 由下面那段单独写（与单单端点同一个 action，审计口径不分叉）。
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'MARK_NO_SHOW_BATCH',
+      targetType: 'ORDER',
+      targetId: body.scheduleId,
+      targetLabel:
+        `按航班批量 no-show · ${body.entries.length} 张单 · ` +
+        `成功 ${result.summary.ok} / 失败 ${result.summary.failed} · ` +
+        `释放 ${result.summary.releasedSeats} 座`,
+      after: {
+        scheduleId: body.scheduleId,
+        entryCount: body.entries.length,
+        ok: result.summary.ok,
+        failed: result.summary.failed,
+        releasedSeats: result.summary.releasedSeats,
+        releaseReturn: body.releaseReturn,
+        note: body.note ?? null,
+        // 失败明细进审计：事后追「那天为什么这几张没标上」不必再去翻日志。
+        failures: result.results
+          .filter((r) => !r.ok)
+          .map((r) => ({ orderNumber: r.orderNumber, code: r.code ?? null, error: r.error })),
+      },
+      severity: 'WARNING',
+    });
+
+    // 逐单审计：与单单端点 POST /orders/:id/no-show 落同一个 action，
+    // 订单维度的审计流水不因为「是批量点的」而缺一段。
+    for (const r of result.results) {
+      if (!r.ok) continue;
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'MARK_NO_SHOW',
+        targetType: 'ORDER',
+        targetId: r.orderId,
+        targetLabel:
+          `${r.orderNumber} · 去程 no-show（批量） · ` +
+          `${r.releasedSeats ? `释放回程 ${r.releasedSeats} 座` : '未释放回程'}` +
+          `${r.targetOrderNumber && r.targetOrderNumber !== r.orderNumber ? `（拆出 ${r.targetOrderNumber}）` : ''}`,
+        after: {
+          batch: true,
+          scheduleId: body.scheduleId,
+          targetOrderNumber: r.targetOrderNumber ?? null,
+          releasedSeats: r.releasedSeats ?? 0,
+          workOrderReminderId: r.workOrderReminderId ?? null,
+          releaseReturn: body.releaseReturn,
+          note: body.note ?? null,
+        },
+        severity: 'WARNING',
+      });
+    }
+
+    return result;
+  });
+
+  // ── no-show 报表（ADMIN/STAFF；AGENT 不放行）────────────────────────────────
+  // 区间按**去程航班的起飞地当地日**取。代理不放行：这张表是整班的库存/超售台账，
+  // 跨代理汇总，放开等于把同行的 no-show 情况交出去。
+  //
+  // GET /orders/no-show/report?from&to
+  app.get(
+    '/no-show/report',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req) => {
+      const { from, to } = noShowReportQuerySchema.parse(req.query);
+      const { rows, totals } = await loadNoShowReport(from, to);
+      return { rows, totals };
+    },
+  );
+
+  // GET /orders/no-show/report/export?from&to → xlsx（汇总 + 逐单明细两个 sheet）
+  app.get(
+    '/no-show/report/export',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req, reply) => {
+      const { from, to } = noShowReportQuerySchema.parse(req.query);
+      const buf = await buildNoShowReportWorkbook(from, to);
+
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'EXPORT_NO_SHOW_REPORT',
+        targetType: 'ORDER',
+        targetId: 'no-show-report',
+        targetLabel: `no-show 报表 ${from} ~ ${to}`,
+        after: { from, to },
+      });
+
+      return reply
+        .header(
+          'Content-Type',
+          'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet',
+        )
+        .header(
+          'Content-Disposition',
+          `attachment; filename="${encodeURIComponent(noShowReportFilename(from, to))}"`,
+        )
+        .send(buf);
+    },
+  );
 
   // POST /orders/:id/restore-return-leg/preview
   //   只读预检：能不能恢复、原班次还剩几座、要不要超售、超售上限多少。

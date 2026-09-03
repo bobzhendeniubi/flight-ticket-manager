@@ -1,6 +1,6 @@
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type VoidReturnLegPreview, type OrderLegFlagFilter, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE, TOKEN_PAYLOAD_MISMATCH_CODE, TOKEN_PAYLOAD_MISMATCH_HINT } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type VoidReturnLegPreview, type OrderLegFlagFilter, type PublicLegStatus, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE, TOKEN_PAYLOAD_MISMATCH_CODE, TOKEN_PAYLOAD_MISMATCH_HINT } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -430,6 +430,38 @@ const ORDER_LEG_FLAG_NOTICE: Record<OrderLegFlagFilter, string> = {
 };
 
 /**
+ * 对外（代理/客户）航段状态的说法与配色。
+ * 后端只对 AGENT 下发 item.publicLegStatus，ADMIN/STAFF 拿不到这个字段，所以这套文案
+ * 天然只出现在代理视角 —— 内部还是看 legFlag 那套（no-show / 释放 / 作废）。
+ * 文案是站在代理这边说话：不说「no-show」「作废」这类内部处置词，只说事实与下一步。
+ */
+const PUBLIC_LEG_STATUS: Record<
+  PublicLegStatus,
+  { short: string; full: string; className: string }
+> = {
+  RETURN_PENDING_REARRANGE: {
+    short: '回程待重新安排',
+    full: '回程座位已释放，如需保留请联系运营恢复',
+    className: 'badge-warning',
+  },
+  RETURN_CANCELLED: { short: '回程已取消', full: '回程已取消', className: 'badge-neutral' },
+  OUTBOUND_CANCELLED: { short: '去程已取消', full: '去程已取消', className: 'badge-neutral' },
+  OUTBOUND_NOT_BOARDED: { short: '去程未登机', full: '去程未登机', className: 'badge-neutral' },
+};
+
+/** 航段行上的对外状态徽标；没有 publicLegStatus（即内部视角）时什么都不渲染。 */
+function PublicLegBadge({ status }: { status?: PublicLegStatus }) {
+  if (!status) return null;
+  const s = PUBLIC_LEG_STATUS[status];
+  if (!s) return null;
+  return (
+    <span className={s.className} title={s.full}>
+      {s.full}
+    </span>
+  );
+}
+
+/**
  * 列表「内容」列的航段状态短标：去程 no-show / 回程已释放（可恢复）/ 回程已恢复 / 回程已作废。
  * 后端下发订单级 legFlag 时**直接消费它**——它与航段状态筛选同源，自己按 metadata 再派生
  * 一份就会出现「筛出来的单不带这个标」的漂移。老后端/窄接口不下发时才回退到行 metadata，
@@ -437,6 +469,16 @@ const ORDER_LEG_FLAG_NOTICE: Record<OrderLegFlagFilter, string> = {
  */
 function deriveLegNotice(o: OrderSummary): string | null {
   if (o.legFlag) return o.legFlag === 'NONE' ? null : ORDER_LEG_FLAG_NOTICE[o.legFlag];
+  // 代理视角：后端不下发 legFlag（那是内部口径），只在航段行上给 publicLegStatus。
+  // 有它就直接用对外说法，别退回下面按行 metadata 派生的内部措辞。
+  const publicNotices: string[] = [];
+  for (const it of o.items ?? []) {
+    // 后端加了新状态而前端还没发版时，这里查得到 undefined —— 必须先兜住再取字段，
+    // 否则整份列表的 deriveView 一起炸（memo 里 map 全量算，一单坏掉就整页白屏）。
+    const s = it.publicLegStatus ? PUBLIC_LEG_STATUS[it.publicLegStatus] : undefined;
+    if (s && !publicNotices.includes(s.short)) publicNotices.push(s.short);
+  }
+  if (publicNotices.length > 0) return publicNotices.join(' · ');
   const tags: string[] = [];
   const push = (t: string) => {
     if (!tags.includes(t)) tags.push(t);
@@ -1288,6 +1330,25 @@ export function OrdersPage() {
     if (!q || deepLinkSearchRef.current) return;
     deepLinkSearchRef.current = true;
     setSearch(q);
+  }, [searchParams]);
+
+  // 深链承接（?legFlag=&flightNumber=&flightDateFrom=&flightDateTo=）：
+  // no-show 报表点某一行跳过来时，把筛选条件填进对应的筛选器，落地就是筛好的列表。
+  // 只在首次挂载填一次（ref 守卫），之后用户怎么改筛选都不再被 URL 覆盖。
+  const deepLinkFiltersRef = useRef(false);
+  useEffect(() => {
+    if (deepLinkFiltersRef.current) return;
+    const leg = searchParams.get('legFlag')?.trim();
+    const fn = searchParams.get('flightNumber')?.trim();
+    const dFrom = searchParams.get('flightDateFrom')?.trim();
+    const dTo = searchParams.get('flightDateTo')?.trim();
+    if (!leg && !fn && !dFrom && !dTo) return;
+    deepLinkFiltersRef.current = true;
+    // legFlag 只认筛选器认识的那几个值，别把 URL 里的脏字符串塞进查询参数
+    if (leg && leg in ORDER_LEG_FLAG_NOTICE) setLegFlagFilter(leg as OrderLegFlagFilter);
+    if (fn) setFlightNumberFilter(fn);
+    if (dFrom) setFlightDateFrom(dFrom);
+    if (dTo) setFlightDateTo(dTo);
   }, [searchParams]);
   useEffect(() => {
     const q = searchParams.get('q')?.trim();
@@ -6658,11 +6719,17 @@ function BundleItineraryCard({ items, order }: { items: OrderItem[]; order: Orde
             <dt className="font-medium text-ink-muted">航班信息</dt>
             <dd className="mt-0.5 space-y-0.5">
               {flightLegs.map((leg) => (
-                <div key={leg.id}>
-                  {leg.departureDate && `${formatMonthDayZh(leg.departureDate)} `}
-                  {leg.route && routeCityLabel(leg.route)}
-                  {leg.flightNumber && ` ${leg.flightNumber}`}
-                  {leg.departureTime && leg.arrivalTime && ` ${leg.departureTime}-${leg.arrivalTime}`}
+                <div key={leg.id} className="flex flex-wrap items-center gap-1.5">
+                  <span>
+                    {leg.departureDate && `${formatMonthDayZh(leg.departureDate)} `}
+                    {leg.route && routeCityLabel(leg.route)}
+                    {leg.flightNumber && ` ${leg.flightNumber}`}
+                    {leg.departureTime &&
+                      leg.arrivalTime &&
+                      ` ${leg.departureTime}-${leg.arrivalTime}`}
+                  </span>
+                  {/* 套餐单的代理视角只看得到这张产品内容卡，航段状态也要在这里出 */}
+                  <PublicLegBadge status={leg.publicLegStatus} />
                 </div>
               ))}
             </dd>
@@ -7294,6 +7361,8 @@ function OrderItemRow({
                 <Icon name="plane" /> 航变
               </span>
             )}
+            {/* 对外航段状态：只有代理视角能拿到 publicLegStatus，内部视角这里不渲染 */}
+            <PublicLegBadge status={item.publicLegStatus} />
           </div>
           <div className="mt-0.5 text-xs text-ink-muted">
             {KIND_LABEL[item.kind]} · 数量 {item.quantity}

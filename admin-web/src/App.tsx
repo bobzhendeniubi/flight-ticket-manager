@@ -26,6 +26,8 @@ import { HotelControlPage } from './pages/HotelControlPage';
 import { VisaDeskPage } from './pages/VisaDeskPage';
 import { AiOcrSettingsPage } from './pages/AiOcrSettingsPage';
 import { RemindersPage } from './pages/RemindersPage';
+import { NoShowBatchPage } from './pages/NoShowBatchPage';
+import { NoShowReportPage } from './pages/NoShowReportPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { FulfillmentBoardPage } from './pages/FulfillmentBoardPage';
 import { MarketingPage } from './pages/MarketingPage';
@@ -307,6 +309,23 @@ export function App() {
           element={
             <Protected adminOnly>
               <RemindersPage />
+            </Protected>
+          }
+        />
+        {/* no-show 两页：处理名单（导航挂运营组）+ 报表（挂报表附近），都是 ADMIN/STAFF 专属 */}
+        <Route
+          path="/no-show/report"
+          element={
+            <Protected adminOnly>
+              <NoShowReportPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/no-show"
+          element={
+            <Protected adminOnly>
+              <NoShowBatchPage />
             </Protected>
           }
         />

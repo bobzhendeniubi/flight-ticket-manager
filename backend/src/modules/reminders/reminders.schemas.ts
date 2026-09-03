@@ -38,3 +38,29 @@ export type CreateReminderInput = z.infer<typeof createReminderSchema>;
 export type UpdateReminderInput = z.infer<typeof updateReminderSchema>;
 export type ResolveReminderInput = z.infer<typeof resolveReminderSchema>;
 export type ListRemindersQuery = z.infer<typeof listRemindersQuerySchema>;
+
+// ── 出票工单角标（顶栏轮询）──────────────────────────────────────────────
+// no-show 释放回程 / 恢复回程 / 航段作废三类动作会在同一事务里派 OperationalReminder
+// 工单（复用本表，零迁移），ruleKey 固定前缀 + ":" + 行 id + ":" + 幂等 token。
+// 票务只有去待办中心才看得到；这里给顶栏一个轻量端点做角标轮询，不建新表。
+export const WORK_ORDER_RULE_KINDS = {
+  NOSHOW_WITHDRAW: 'WITHDRAW',
+  NOSHOW_RELIST: 'RELIST',
+  LEG_CANCEL_WITHDRAW: 'LEG_CANCEL_WITHDRAW',
+} as const;
+
+export type WorkOrderKind = (typeof WORK_ORDER_RULE_KINDS)[keyof typeof WORK_ORDER_RULE_KINDS];
+
+/** ruleKey → 工单类型；前缀不在上表内返回 null（查询已按前缀过滤，正常不会发生）。 */
+export function deriveWorkOrderKind(ruleKey: string | null): WorkOrderKind | null {
+  if (!ruleKey) return null;
+  const prefix = ruleKey.split(':')[0];
+  return (WORK_ORDER_RULE_KINDS as Record<string, WorkOrderKind | undefined>)[prefix] ?? null;
+}
+
+export const workOrderSummaryQuerySchema = z.object({
+  // 只影响 items（返回 createdAt > since 的新增行）；open/inProgress 计数不受影响。
+  since: z.string().datetime().optional(),
+});
+
+export type WorkOrderSummaryQuery = z.infer<typeof workOrderSummaryQuerySchema>;

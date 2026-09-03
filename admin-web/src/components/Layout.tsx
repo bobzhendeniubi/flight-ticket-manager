@@ -5,6 +5,7 @@ import { api, ApiError, AUTH_REFRESH_UNAVAILABLE_CODE } from '../lib/api';
 import { ErrorBoundary } from './ErrorBoundary';
 import { Icon } from './Icon';
 import { useDialogA11y } from './Modal';
+import { WorkOrderBell } from './WorkOrderBell';
 
 const ROLE_LABEL: Record<string, string> = {
   STAFF: '运营',
@@ -30,6 +31,7 @@ const NAV: Array<{
   { to: '/hold-orders',     label: '占位单',       roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/hotel-control',   label: '房控',        roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/visa-desk',       label: '签证台',      roles: ['ADMIN', 'STAFF'],          section: '运营' },
+  { to: '/no-show',         label: 'no-show 处理', roles: ['ADMIN', 'STAFF'],         section: '运营' },
   { to: '/reminders',       label: '提醒中心',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/fulfillment-board', label: '工单看板',  roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/marketing',       label: '营销中心',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
@@ -44,6 +46,8 @@ const NAV: Array<{
   { to: '/agent-balance',   label: '余额与认款',  roles: ['ADMIN', 'STAFF', 'AGENT'], section: '财务' },
   { to: '/reconciliation',  label: '收款对账台',  roles: ['ADMIN', 'STAFF'],          section: '财务' },
   { to: '/finances',        label: '财务',        roles: ['ADMIN'],                   section: '财务', financeRole: true },
+  // no-show 报表不走 financeRole：出座位/工单口径，运营与票务都要看
+  { to: '/no-show/report',  label: 'no-show 报表', roles: ['ADMIN', 'STAFF'],         section: '财务' },
   { to: '/reports',         label: '经营报表',    roles: ['ADMIN'],                   section: '财务', financeRole: true },
   { to: '/legacy-archive',  label: '历史档案',    roles: ['ADMIN', 'STAFF'],          section: '系统' },
   { to: '/audit-logs',      label: '审计日志',    roles: ['ADMIN', 'STAFF'],          section: '系统' },
@@ -164,8 +168,15 @@ export function Layout() {
       )
     : [];
 
-  // 当前页标题（用于内容区顶栏的上下文）
-  const currentLabel = visibleNav.find((n) => location.pathname.startsWith(n.to))?.label ?? '';
+  // 当前页标题（用于内容区顶栏的上下文）。
+  // 两点讲究：
+  //   1. 按路径分段命中，不是裸 startsWith —— 否则 /no-show 会把将来的 /no-show-xxx 也认作自己；
+  //   2. 取前缀最长的那一项，不是数组里第一个命中的 —— /no-show 与 /no-show/report 这种父子路径
+  //      同时命中时，取首个会把子页标成父页的名字。
+  const currentLabel =
+    visibleNav
+      .filter((n) => location.pathname === n.to || location.pathname.startsWith(`${n.to}/`))
+      .sort((a, b) => b.to.length - a.to.length)[0]?.label ?? '';
 
   const homeTo = user?.role === 'AGENT' ? '/orders' : '/dashboard';
 
@@ -350,6 +361,8 @@ export function Layout() {
           <div className="flex items-center gap-3 text-sm">
             {user ? (
               <>
+                {/* 撤名单 / 退票工单角标：只有内部岗位盯这类时效工单，代理不显示 */}
+                {(user.role === 'ADMIN' || user.role === 'STAFF') && <WorkOrderBell />}
                 <span className="hidden items-center gap-2 sm:flex">
                   <span className="font-medium text-ink-soft">{user.displayName ?? user.email}</span>
                   <span className="badge-neutral">{ROLE_LABEL[user.role] ?? user.role}</span>
