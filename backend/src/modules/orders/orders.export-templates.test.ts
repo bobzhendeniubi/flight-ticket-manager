@@ -1180,18 +1180,18 @@ describe('《全岗可用》full 模版 — 签证状态按乘客取值', () => 
     expect(rows[2].visaStatus).toBe('材料准备');
   });
 
-  it('订单级「不需要签证」→ 全员「不需要」，乘客级标记不盖过订单结论', () => {
+  it('订单级「不需要签证」不再一票否决：有个人信息的按人显示，其余才回落订单级', () => {
     const order = fixtureMixedVisa();
     (order as unknown as { visaStatus: string }).visaStatus = 'NOT_NEEDED';
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows.map((r) => r.visaStatus)).toEqual(['不需要', '不需要', '不需要']);
+    expect(rows.map((r) => r.visaStatus)).toEqual(['自备签', '已送签', '不需要']);
   });
 
-  it('订单级「已签证」同样一票否决 → 全员「已签证」', () => {
+  it('订单级「已签证」同理：自备签/已送签逐人显示，无个人信息的才写「已签证」', () => {
     const order = fixtureMixedVisa();
     (order as unknown as { visaStatus: string }).visaStatus = 'HAS_VISA';
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows.map((r) => r.visaStatus)).toEqual(['已签证', '已签证', '已签证']);
+    expect(rows.map((r) => r.visaStatus)).toEqual(['自备签', '已送签', '已签证']);
   });
 
   it('老数据（乘客无送签字段）→ 整列沿用订单级/履约任务文案，与改动前一致', () => {
@@ -1204,6 +1204,77 @@ describe('《全岗可用》full 模版 — 签证状态按乘客取值', () => 
     const order = fixtureMixedVisa();
     const rows = orderToVisaRows(order, buildOrderContext(order));
     expect(rows.map((r) => r.chineseName)).toEqual(['李四', '王五']);
+  });
+});
+
+// ── 结算价格按乘客（运营反馈）──────────────────────────────────────────────────
+// 反馈：同单多人结算价各不相同，导出来却是订单总价平分。
+// 口径：每人结算价 = 应收均摊 + 该乘客调价净额（权威算法 per-pax-share.ts，
+// 与订单详情页「每人结算价」表、全岗总表同一份）。
+describe('结算价格按乘客 — 《全岗可用》与《签证专用》', () => {
+  /** 两位乘客各挂一条按乘客调价行（p1 −360、p2 −120）。*/
+  function fixtureWithPerPaxAdjustments(): OrderForTemplateExport {
+    const order = fixtureRoundTrip();
+    const o = order as unknown as { total: number; items: Array<Record<string, unknown>> };
+    o.total = 3792;
+    o.items = [
+      ...o.items,
+      {
+        id: 'adj1',
+        kind: 'DISCOUNT',
+        flightCabin: null,
+        amount: -360,
+        description: '价格调整：自备签',
+        passengerId: 'p1',
+        metadata: { priceAdjustment: true, reasonCode: 'MISC_FEE' },
+        hotelRoomTypeId: null,
+        flightSchedule: null,
+        hotelRoomType: null,
+        visa: null,
+        transfer: null,
+        bundle: null,
+        fulfillmentTasks: [],
+      },
+      {
+        id: 'adj2',
+        kind: 'DISCOUNT',
+        flightCabin: null,
+        amount: -120,
+        description: '价格调整：补收杂费',
+        passengerId: 'p2',
+        metadata: { priceAdjustment: true, reasonCode: 'MISC_FEE' },
+        hotelRoomTypeId: null,
+        flightSchedule: null,
+        hotelRoomType: null,
+        visa: null,
+        transfer: null,
+        bundle: null,
+        fulfillmentTasks: [],
+      },
+    ];
+    return order;
+  }
+
+  it('《全岗可用》：两人各自调价 → 结算价格逐人不同，合计恒等于应收总额', () => {
+    const order = fixtureWithPerPaxAdjustments();
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    // 基准每人 = (3792 + 480) / 2 = 2136；p1 = 2136 − 360 = 1776；p2 = 2136 − 120 = 2016
+    expect(rows.map((r) => r.settlePrice)).toEqual([1776, 2016]);
+    expect(rows.reduce((s, r) => s + r.settlePrice, 0)).toBe(3792);
+  });
+
+  it('《签证专用》与《全岗可用》同一个数：同一位乘客在两张表里不会打架', () => {
+    const order = fixtureWithPerPaxAdjustments();
+    const ctx = buildOrderContext(order);
+    const full = orderToFullRows(order, ctx);
+    const visa = orderToVisaRows(order, ctx);
+    expect(visa.map((r) => r.settlePrice)).toEqual(full.map((r) => r.settlePrice));
+  });
+
+  it('无按乘客调价的单：与「总额÷人数」完全一致（不改现有数字）', () => {
+    const order = fixtureRoundTrip();
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    expect(rows.map((r) => r.settlePrice)).toEqual([1268, 1268]); // 2536 / 2
   });
 });
 

@@ -17,7 +17,9 @@
  * 诚实口径：
  *   - 飞行次数 / 在订未飞 / 可用次数：飞行次数含老系统历史飞行（已去重、退票不计），口径与取数见 orders.export-trip-stats.ts（分房表、
  *     《全岗可用》模板共用同一份，同一位乘客在三张表里的数字必然相同）。
- *   - 金额列（结算价/到账/尾款/单房差/签证/退款/订单成本）均为「每位出行人」均摊，
+ *   - 结算价格是**按乘客**的真实结算价（应收均摊 + 该乘客调价净额），与订单详情页
+ *     「每人结算价」表同一份算法（per-pax-share.ts）；同单不同价的单逐人可解释。
+ *   - 其余金额列（到账/尾款/立减/单房差/签证/退款/订单成本）为「每位出行人」均摊，
  *     与《全岗可用》模板同口径，避免按订单总额被误读为每人都付了全款。
  */
 import ExcelJS from 'exceljs';
@@ -36,6 +38,7 @@ import {
   nameWithTitle,
   orderVisaStatusLabel,
   passengerVisaStatusCell,
+  perPaxSettlementByPassenger,
   pnrName,
 } from './orders.export-templates.js';
 import { appendHoldOrderSheet, loadHoldExportRows } from './orders.export-hold-orders.js';
@@ -296,14 +299,53 @@ const MASTER_COLUMNS: MasterColumn[] = [
   { header: '录入人员', key: 'recordedBy', width: 14 },
 ];
 
+/**
+ * 代理视图**不给**的列。三类，缺一都会把不该出岛的东西交到同行手上：
+ *
+ *   1. 我方内部账与风控：
+ *      · orderCost  真实进价（OrderCostItem），与详情页逐项拆价同一条脱敏红线；
+ *      · legStatus  带超售座数（这一班被卖穿几座是我方与航司之间的口径，见该列定义处注释）。
+ *   2. 护照/身份 PII：生日、乘客类型、性别、国籍、证件类型/编号、签发日、有效期、护照签发地、
+ *      出生地。代理要核对的是自己的账目与行程，出行人的证件明细他们下单时本来就有，
+ *      导出表没有再回吐一份完整证件档案的理由；这张表一旦转手就是一份成建制的身份信息名单。
+ *   3. 纯内部运营信息：飞行次数 / 在订未飞 / 可用次数（我方常旅客权益台账，跨代理跨订单聚合，
+ *      会把这位客人在别家下过多少单暴露出来）、分房情况（房控排房结果）、录入时间 /
+ *      **录入人员**（录入人员写的是我方下单账号的姓名或邮箱 —— 内部同事的名字不进外发文件）。
+ *
+ * 列是整列裁掉而不是留表头置空：代理导出没有"列序对外承诺"的历史包袱（本表只有全岗序一套），
+ * 留空列反而会让代理以为系统没数据而来问。
+ */
+const AGENT_HIDDEN_COLUMN_KEYS: ReadonlySet<keyof MasterRow> = new Set([
+  // 1. 内部账与风控
+  'orderCost',
+  'legStatus',
+  // 2. 护照/身份 PII
+  'dateOfBirth',
+  'passengerType',
+  'gender',
+  'nationality',
+  'documentType',
+  'documentNumber',
+  'issueDate',
+  'expiryDate',
+  'passportIssuePlace',
+  'placeOfBirth',
+  // 3. 纯内部运营信息
+  'flightCount',
+  'pendingTripCount',
+  'availableTrips',
+  'distribution',
+  'recordedAt',
+  'recordedBy',
+]);
+
 /** 按岗位视图筛出可见列（role=all/缺省 → 全部；否则保留 roles 命中或未限定 role 的列）。*/
 export function visibleColumns(role: MasterExportRole): MasterColumn[] {
   if (role === 'all') return MASTER_COLUMNS;
-  // 代理视角：结构同全岗，仅裁「订单成本」——那是我方真实进价（OrderCostItem），
-  // 与详情页逐项拆价同一条脱敏红线；结算价/立减/到账是代理自己的应付账目，保留。
-  // 「航段状态」一并裁掉：它带超售座数（我方与航司之间的风控口径），见该列定义处的注释。
+  // 代理视角：结构同全岗，按 AGENT_HIDDEN_COLUMN_KEYS 裁。保留的是代理自己的账目与业务信息
+  //（代理机构/备注/酒店/姓名/行程/航班/结算价/立减/尾款/到账/单房差/签证四列/开票/清账/退款/订单编号）。
   if (role === 'agent') {
-    return MASTER_COLUMNS.filter((c) => c.key !== 'orderCost' && c.key !== 'legStatus');
+    return MASTER_COLUMNS.filter((c) => !AGENT_HIDDEN_COLUMN_KEYS.has(c.key));
   }
   return MASTER_COLUMNS.filter((c) => !c.roles || c.roles.includes(role));
 }
@@ -412,9 +454,12 @@ export function orderToMasterRows(
     ),
   ).join(' / ');
 
-  // ── 金额口径（均摊到人）──
-  // per-pax 采用「订单总额÷乘客数」均摊，与详情页按年龄段反推的另一套口径不同（P2-15c，
-  // 待产品统一口径，此处不擅自改成年龄段——会改变现有导出数字）。
+  // ── 金额口径 ──
+  // 结算价格 = **按乘客**真实结算价（含该乘客调价净额），走权威口径 perPaxSettlementByPassenger
+  //（= per-pax-share.ts 的 computePerPaxShares + 按乘客调价分组），与订单详情页「每人结算价」
+  // 表、《全岗可用》/《签证专用》模板、拆单搬钱同一份算法。
+  // 其余金额列（到账/尾款/立减/单房差/签证/退款/订单成本）仍是整单 ÷ 乘客数：这些钱按整单发生，
+  // 没有逐人归属，不臆造。
   const total = dec(order.total);
   const paid = dec(order.paidAmount);
   // 售后费（改期费/换人费等）走 adjustmentCny，不在 total 里；代理预付款抵扣走 prepaymentOffset。
@@ -423,7 +468,9 @@ export function orderToMasterRows(
   // reports.service.ts balanceOf 对齐：应付 = total + adjustmentCny − prepaymentOffset。
   const adjustment = order.adjustmentCny ?? 0;
   const prepaymentOffset = dec(order.prepaymentOffset);
-  const settlePerPax = round2(total / paxCount);
+  const settleByPassenger = perPaxSettlementByPassenger(order);
+  /** 结算价格的均摊兜底 = 应收（total + adjustmentCny）÷ pax；只在乘客不在上表里时用到。*/
+  const settlePerPax = round2((total + adjustment) / paxCount);
   const settlementDiscountTotal = order.items.reduce((sum, item) => {
     const metadata = item.metadata;
     if (
@@ -592,18 +639,15 @@ export function orderToMasterRows(
       orderType,
       legStatus,
       cabin: cabinLabels,
-      settlePrice: settlePerPax,
+      // 结算价格按人（含该乘客调价净额），不再整单均摊 —— 见 perPaxSettlementByPassenger。
+      settlePrice: settleByPassenger.get(p.id) ?? settlePerPax,
       settlementDiscountAmount: settlementDiscountPerPax,
       balanceDue: balancePerPax,
       settleReceived: paidPerPax,
       singleRoomDiff: round2(singleRoomDiffOrder / paxCount),
       visaAmount: round2(visaAmountOrder / paxCount),
       visaSupplier,
-      visaStatus: passengerVisaStatusCell({
-        orderVisaStatus: order.visaStatus,
-        orderVisaLabel,
-        passenger: p,
-      }),
+      visaStatus: passengerVisaStatusCell({ orderVisaLabel, passenger: p }),
       visaNote,
       invoiceStatus,
       settled,

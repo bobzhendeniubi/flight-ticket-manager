@@ -15,9 +15,9 @@ import { localDateISO } from '../../lib/flight-time.js';
 import { businessDateISO, businessDateTimeSec } from '../../lib/business-time.js';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderItemKind, OrderStatus } from '@prisma/client';
-import type { VisaRequirement } from '@prisma/client';
-import { orderVisaStatusExplicitlyNotNeeded } from './visa-need.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+// 「结算价格」按人取值的权威口径：每人份额端口（详见 perPaxSettlementByPassenger）。
+import { computePerPaxShares } from './per-pax-share.js';
 import type { BundleItemJson } from '../../lib/json-types.js';
 import { toAlpha3 } from './nationality.js';
 import {
@@ -27,7 +27,8 @@ import {
   type PnrRow,
   PNR_COLUMNS,
 } from './pnr-export.js';
-import { GUEST_RECORDED_BY_LABEL } from './orders.service.js';
+// groupPassengerAdjustments：按乘客调价分组的唯一口径（与订单详情页金额明细同源）。
+import { GUEST_RECORDED_BY_LABEL, groupPassengerAdjustments } from './orders.service.js';
 import { buildExportOrderWhere, filterExportOrders } from './orders.export-selection.js';
 import { formatOrderLegStatus } from './orders.leg-status.js';
 import { determineFlightLegs } from './ticketing-cap.js';
@@ -106,37 +107,82 @@ export function orderVisaStatusLabel(
 /**
  * 「签证状态」列的**按乘客**取值 —— 全岗总表与《全岗可用》共用的唯一口径。
  *
- * 为什么不能整单一个值（运营反馈）：一张需要签证的单里，自备签的客人导出来也写「需要」、
- * 只要有一位已送签就整单都写成已送签，复查的同事没法从表上分辨谁办到哪一步。
+ * 为什么不能整单一个值（运营反馈）：一张单里，自备签的客人导出来跟着整单走、
+ * 订单头一表态就全员一个词，复查的同事没法从表上分辨谁办到哪一步。
  *
- * 判定顺序（先否决、再按人）：
- *   1. 订单级明确「不需要办」（不需要签证 / 已签证）→ 全员沿用订单级文案。
- *      这两档是录单人给出的结论，签证岗完全无事可做（口径同 orderVisaStatusExplicitlyNotNeeded），
- *      此时乘客级的自备签标记与残留的送签进度都是噪音，不该盖过订单结论。
- *   2. 该乘客 visaExempt=true → 「自备签」（不进送签名单，与签证台过滤同口径）。
- *   3. 该乘客送签进度已推进（材料准备 / 已送签）→ 用签证台同一份文案。
- *   4. 其余（待处理 / 老数据无该字段）→ 沿用订单级文案，与改动前完全一致。
+ * 判定顺序（**先按人、订单级只做兜底**）：
+ *   1. 该乘客 visaExempt=true → 「自备签」（不进送签名单，与签证台过滤同口径）。
+ *   2. 该乘客送签进度已推进（材料准备 / 已送签）→ 用签证台同一份文案。
+ *   3. 其余（待处理 / 老数据无该字段）→ 才回落订单级文案。
+ *
+ * 订单级「不需要签证 / 已签证」为什么不再一票否决（运营反馈的四人单）：订单头是「已签证」、
+ * 其中两人 visaExempt=true（录单时按自备签逐人减了钱）、另两人由我方送签且已送签 ——
+ * 一票否决把这四个人全写成「已签证」，那两位自备签的钱怎么减的、另两位办到哪一步，表上全看不见。
+ * 自备签与送签进度都是**逐人落库的事实**（自备签同时是定价输入，送签进度由签证台逐人推进），
+ * 比订单头这个整单结论更精确；订单头只在这位乘客没有任何个人信息时才代表他。
+ *
+ * 副作用（需知会运营）：订单头选了「不需要签证 / 已签证」、个别乘客却留有送签进度的单，
+ * 这些人现在按各自的进度显示，不再被整单结论盖住 —— 这正是要暴露的矛盾，不是回归。
  */
 export function passengerVisaStatusCell(input: {
-  /** 订单级 visaStatus 原值（判断是否一票否决用）。*/
-  orderVisaStatus: string | null | undefined;
-  /** 订单级文案（由 orderVisaStatusLabel 在行循环外算好传入）。*/
+  /** 订单级文案（由 orderVisaStatusLabel 在行循环外算好传入）—— 乘客无个人信息时的兜底。*/
   orderVisaLabel: string;
   passenger: { visaExempt?: boolean | null; visaSubmissionStatus?: string | null };
 }): string {
-  if (
-    orderVisaStatusExplicitlyNotNeeded(
-      (input.orderVisaStatus ?? null) as VisaRequirement | null,
-    )
-  ) {
-    return input.orderVisaLabel;
-  }
   if (input.passenger.visaExempt === true) return VISA_EXEMPT_LABEL;
   const submission = input.passenger.visaSubmissionStatus;
   if (submission && submission !== 'PENDING') {
     return VISA_SUBMISSION_LABEL[submission] ?? input.orderVisaLabel;
   }
   return input.orderVisaLabel;
+}
+
+/**
+ * 「结算价格」列的**按乘客**取值 —— 全岗总表与《全岗可用》《签证专用》共用的唯一口径。
+ *
+ * 改前：整单 total ÷ 人数，四个人一律同一个数。同单不同价的单（某人补签证多收 800、
+ * 某人自备签少收 360）导出来看不出差别，与订单详情页「每人结算价」表也对不上。
+ *
+ * 改后：直接复用权威口径 —— `computePerPaxShares`（backend/src/modules/orders/per-pax-share.ts，
+ * 与前端 admin-web/src/lib/perPaxSettlement.ts 逐分对拍、拆单搬钱也走它）：
+ *   应收总额 = total + adjustmentCny；基准每人 = (应收 − Σ按乘客调价净额) ÷ 人数；
+ *   每人结算价 = 基准每人 + 该乘客调价净额。全员合计恒等于应收总额。
+ * 按乘客调价净额取自 `groupPassengerAdjustments`（只认 metadata.priceAdjustment=true 且挂了
+ * passengerId 的行；整单调价行留在基准里，不重复计）。
+ *
+ * 口径变化（需知会运营）：应收含 adjustmentCny（改期费/换人费等售后费，原先不在本列里），
+ * 与详情页每人结算价、尾款列（本就含 adjustmentCny）从此同源。
+ */
+export function perPaxSettlementByPassenger(order: {
+  total: Prisma.Decimal | number | null;
+  adjustmentCny?: number | null;
+  passengers: ReadonlyArray<{ id: string }>;
+  items: ReadonlyArray<{
+    id: string;
+    amount: Prisma.Decimal | number | null;
+    description: string;
+    passengerId?: string | null;
+    metadata?: unknown;
+  }>;
+}): Map<string, number> {
+  const { byPassenger } = groupPassengerAdjustments(
+    order.items.map((it) => ({
+      id: it.id,
+      amount: dec(it.amount),
+      description: it.description,
+      passengerId: it.passengerId ?? null,
+      metadata: it.metadata,
+    })),
+  );
+  const { rows } = computePerPaxShares({
+    totalCny: dec(order.total),
+    adjustmentCny: order.adjustmentCny ?? 0,
+    passengerIds: order.passengers.map((p) => p.id),
+    netByPassenger: new Map(
+      Object.entries(byPassenger).map(([pid, bucket]) => [pid, bucket.netCny]),
+    ),
+  });
+  return new Map(rows.map((r) => [r.passengerId, r.shareCny]));
 }
 
 // 注：《全岗可用》模版对齐旧系统口径 —— 乘客类型/性别/证件类型均按旧模版原样
@@ -314,7 +360,13 @@ interface OrderContext {
    * 一单同时有去程未登机与回程已释放两行时两个状态都出，' / ' 连接。
    */
   legStatus: string;
-  settlePerPax: number; // 结算价格 = total ÷ pax
+  /**
+   * 结算价格（**按乘客**）：passengerId → 该乘客的每人结算价（权威口径，见
+   * perPaxSettlementByPassenger）。行渲染一律 `settleByPassenger.get(p.id) ?? settlePerPax`。
+   */
+  settleByPassenger: ReadonlyMap<string, number>;
+  /** 结算价格的均摊兜底 = 应收（total + adjustmentCny）÷ pax；只在乘客不在上表里时用到。*/
+  settlePerPax: number;
   paidPerPax: number; // 到账金额 = paidAmount ÷ pax
   // 尾款 = max(0, total + adjustmentCny − paidAmount − prepaymentOffset) ÷ pax。含售后费（改期费/
   // 换人费等走 adjustmentCny，不在 total 里）与代理预付款抵扣（prepaymentOffset）——漏掉任一项都会让
@@ -388,8 +440,10 @@ export function buildOrderContext(
   }
   const hotelNames = Array.from(hotelNameSet).join(' / ');
 
-  // per-pax 均摊口径（结算/到账/尾款）：订单总额 ÷ 乘客数，与订单详情页按年龄段反推价格的
-  // 另一套口径不同（P2-15c，待产品统一），此处不擅自改成年龄段口径——会改变现有导出数字。
+  // per-pax 口径：
+  //   · 结算价格 = **按乘客**真实结算价（权威口径 perPaxSettlementByPassenger），同单不同价
+  //     的单（某人补签证多收、某人自备签少收）逐人可解释，与订单详情页「每人结算价」同源；
+  //   · 到账/尾款仍是整单 ÷ 人数（收款按整单发生，没有逐人归属，不臆造）。
   // 尾款口径与财务/提醒/报表对齐：应付 = total + adjustmentCny − prepaymentOffset（代理预付款抵扣）。
   const total = dec(order.total);
   const paid = dec(order.paidAmount);
@@ -410,7 +464,8 @@ export function buildOrderContext(
     cabinLabels,
     orderType,
     legStatus: opts?.redactLegStatus === true ? '' : formatOrderLegStatus(order.items),
-    settlePerPax: round2(total / paxCount),
+    settleByPassenger: perPaxSettlementByPassenger(order),
+    settlePerPax: round2((total + adjustment) / paxCount),
     paidPerPax: round2(paid / paxCount),
     balancePerPax: round2(Math.max(0, total + adjustment - paid - prepaymentOffset) / paxCount),
   };
@@ -664,7 +719,8 @@ export function orderToFullRows(
     flightNumbers: ctx.flightNumbers,
     orderType: ctx.orderType,
     legStatus: ctx.legStatus,
-    settlePrice: ctx.settlePerPax,
+    // 结算价格按人（含该乘客调价净额），不再整单均摊 —— 见 perPaxSettlementByPassenger。
+    settlePrice: ctx.settleByPassenger.get(p.id) ?? ctx.settlePerPax,
     settleReceived: ctx.paidPerPax,
     settleReceivedAt: lastPayment ? businessDateTimeSec(lastPayment.paidAt) : '',
     settleChannel: lastPayment ? PAYMENT_METHOD_LABEL[lastPayment.method] ?? lastPayment.method : '',
@@ -684,11 +740,7 @@ export function orderToFullRows(
     orderStatus: ORDER_STATUS_LABEL[order.status] ?? order.status,
     invoiceStatusSys,
     invoiceStatusManual,
-    visaStatus: passengerVisaStatusCell({
-      orderVisaStatus: order.visaStatus,
-      orderVisaLabel,
-      passenger: p,
-    }),
+    visaStatus: passengerVisaStatusCell({ orderVisaLabel, passenger: p }),
     visaOption,
     visaSupplier: visaSupplierOf(order),
     visaNote: order.noteVisa ?? '',
@@ -854,7 +906,8 @@ export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext
     // （现状值），绝不留空。
     hotelInfo: resolveExportHotelName(group, ctx.hotelInfo),
     visaNote: '',
-    settlePrice: ctx.settlePerPax,
+    // 结算价格按人（与《全岗可用》/全岗总表同一口径）：同一位乘客在三张表里的数字必然相同。
+    settlePrice: ctx.settleByPassenger.get(p.id) ?? ctx.settlePerPax,
     paidAmount: ctx.paidPerPax,
     balanceDue: ctx.balancePerPax,
     visaSupplier,
