@@ -351,6 +351,9 @@ export function NoShowBatchPage() {
     let ok = 0;
     let failed = 0;
     let releasedSeats = 0;
+    // 幂等回放的单数：这些单在上一次提交里就已经处理过，本次没有再执行一遍
+    // （服务端的 releasedSeats 也不把它们算进去，否则「重试失败项」会把座位数越加越多）。
+    let replayedCount = 0;
     const chunkErrors: string[] = [];
 
     for (const [index, chunk] of chunks.entries()) {
@@ -372,6 +375,9 @@ export function NoShowBatchPage() {
         ok += res.summary.ok;
         failed += res.summary.failed;
         releasedSeats += res.summary.releasedSeats;
+        // 旧后端不下发 replayedCount 时按逐单标记兜一次
+        replayedCount +=
+          res.summary.replayedCount ?? res.results.filter((r) => r.replayed).length;
       } catch (e) {
         const message = e instanceof ApiError ? e.message : '提交失败，请稍后重试';
         chunkErrors.push(`第 ${index + 1}/${chunks.length} 批（${chunk.length} 张单）：${message}`);
@@ -380,13 +386,14 @@ export function NoShowBatchPage() {
             orderId: entry.orderId,
             orderNumber: orderNumberById.get(entry.orderId) ?? entry.orderId,
             ok: false,
+            replayed: false,
             error: message,
           });
         }
         failed += chunk.length;
       }
       // 每片一落：批次多的时候运营能看着结果一片片长出来，不用干等
-      setResult({ results: [...merged], summary: { ok, failed, releasedSeats } });
+      setResult({ results: [...merged], summary: { ok, failed, releasedSeats, replayedCount } });
       setSubmitProgress({ done: index + 1, total: chunks.length });
     }
 
@@ -433,6 +440,14 @@ export function NoShowBatchPage() {
   };
 
   const failedResults = result?.results.filter((r) => !r.ok) ?? [];
+  // 服务端按订单张数截断时用来说清「只预检了前几单」：优先用服务端下发的 processedOrders，
+  // 旧后端没有这一项时回落成命中的去重单数。
+  const matchedOrderCount = useMemo(
+    () => new Set((preview?.matched ?? []).map((m) => m.orderId)).size,
+    [preview],
+  );
+  const previewedOrderCount = preview?.processedOrders ?? matchedOrderCount;
+  const totalOrderCount = preview?.totalOrders ?? matchedOrderCount;
 
   return (
     <div className="space-y-5">
@@ -603,6 +618,21 @@ export function NoShowBatchPage() {
             </section>
           )}
 
+          {/* 按订单张数截断（与按行截断是两把不同的刀）：名单行都看了，但命中的单太多，
+              服务端只预检了前面这些单 —— 同样必须明说，否则以为整班都处理完了。 */}
+          {preview.truncatedOrders && (
+            <section className="card border-rose-300 bg-rose-50/70">
+              <p className="text-sm font-semibold text-rose-700">
+                本次名单涉及 <span className="nums">{totalOrderCount}</span> 张单，超过单次上限，只预检了前{' '}
+                <span className="nums">{previewedOrderCount}</span> 单，请分批。
+              </p>
+              <p className="mt-1 text-xs text-rose-700">
+                没进这批的单在下方会带「这一单没有预检」的拦截原因，勾不了也不会被标记。先把这一批处理完，
+                再把剩下的名单贴进来匹配一次。
+              </p>
+            </section>
+          )}
+
           <section className="card p-0">
             <div className="flex flex-wrap items-center justify-between gap-2 border-b border-slate-200 px-4 py-3">
               <h2 className="section-title">
@@ -729,6 +759,14 @@ export function NoShowBatchPage() {
             <h2 className="section-title">
               提交结果 · 成功 {result.summary.ok} 张 / 失败 {result.summary.failed} 张 · 实际释放{' '}
               {result.summary.releasedSeats} 座
+              {(result.summary.replayedCount ?? 0) > 0 && (
+                <span
+                  className="ml-2 text-xs font-normal text-ink-muted"
+                  title="这些单在上一次提交里就已经处理过，本次幂等回放、没有再执行一遍；释放座位数也不重复计入"
+                >
+                  （其中 {result.summary.replayedCount ?? 0} 张为已处理过的回放）
+                </span>
+              )}
             </h2>
             {failedResults.length > 0 && (
               <button
@@ -764,10 +802,19 @@ export function NoShowBatchPage() {
                   <tr key={`${r.orderId}-${r.orderNumber}`}>
                     <td className="nums">{r.orderNumber}</td>
                     <td>
-                      {r.ok ? (
-                        <span className="badge-success">已标记</span>
-                      ) : (
+                      {!r.ok ? (
                         <span className="badge-danger">失败</span>
+                      ) : r.replayed ? (
+                        // 回放行：这一单上次就处理完了，本次什么都没做 —— 说成「本次释放 N 座」
+                        // 会让人以为又放了一批座位出去。
+                        <span
+                          className="badge-info"
+                          title="上一次提交里已经处理过，本次幂等回放，没有再执行一遍"
+                        >
+                          已处理过（回放）
+                        </span>
+                      ) : (
+                        <span className="badge-success">已标记</span>
                       )}
                     </td>
                     {/* 服务端整单处理时 targetOrderNumber 就是原单号 —— 那不是「拆出的新单」，
@@ -777,7 +824,15 @@ export function NoShowBatchPage() {
                         ? r.targetOrderNumber
                         : '—'}
                     </td>
-                    <td className="nums text-right">{r.releasedSeats ?? 0}</td>
+                    <td className="nums text-right">
+                      {r.replayed ? (
+                        <span className="text-ink-muted" title="回放行不重复计释放座位">
+                          —
+                        </span>
+                      ) : (
+                        (r.releasedSeats ?? 0)
+                      )}
+                    </td>
                     <td>
                       {r.workOrderReminderId ? (
                         <span className="badge-info" title="已开出撤名单 / 退票工单，见顶栏工单角标">

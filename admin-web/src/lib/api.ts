@@ -1975,6 +1975,15 @@ export interface NoShowBatchPreview {
   processedLines: number;
   /** 行数超过服务端单次上限 → 这次只看了前 processedLines 行，其余要再贴一次 */
   truncated: boolean;
+  /**
+   * 名单命中的**订单张数**超过服务端单次预检上限 → 这次只预检了前 N 张单。
+   * 与 truncated（按名单行截断）是两把不同的刀，可能只中其中一把。
+   * 旧后端不下发这一项，缺失按 false 处理。
+   */
+  truncatedOrders?: boolean;
+  /** 名单命中的去重订单张数 / 本次真正做了预检的张数（旧后端不下发）。 */
+  totalOrders?: number;
+  processedOrders?: number;
 }
 
 /** 一张单里要标的乘客（同一单多人合成一条） */
@@ -1987,9 +1996,16 @@ export interface NoShowBatchResult {
   orderId: string;
   orderNumber: string;
   ok: boolean;
+  /** 落地单 id：拆过单就是拆出的新单，整单处理时等于 orderId */
+  targetOrderId?: string;
   /** 触发自动拆单时的新单号（钱与座位都在新单上） */
   targetOrderNumber?: string;
   releasedSeats?: number;
+  /**
+   * 幂等回放：这一单在同一幂等键的上一次提交里就已经处理过，本次没有再执行一遍。
+   * releasedSeats 之类的数字对回放行不作数（服务端只在非回放行上计释放座位）。
+   */
+  replayed?: boolean;
   /** 服务端顺带开出的撤名单/退票工单 id */
   workOrderReminderId?: string;
   error?: string;
@@ -1998,7 +2014,8 @@ export interface NoShowBatchResult {
 
 export interface NoShowBatchResponse {
   results: NoShowBatchResult[];
-  summary: { ok: number; failed: number; releasedSeats: number };
+  /** releasedSeats 只统计**非回放**的单；replayedCount = 本次被幂等回放的单数 */
+  summary: { ok: number; failed: number; releasedSeats: number; replayedCount?: number };
 }
 
 /** no-show 报表行（按班次聚合） */

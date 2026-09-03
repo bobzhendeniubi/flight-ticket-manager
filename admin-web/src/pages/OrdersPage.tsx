@@ -487,7 +487,8 @@ function deriveLegNotice(o: OrderSummary): string | null {
     if (it.kind !== 'FLIGHT') continue;
     if (readNoShowMark(it.metadata)) push('去程no-show');
     const life = readReturnLegLifecycle(it);
-    if (life?.kind === 'RELEASED') push('回程已释放');
+    // 老快照判不出释放/恢复谁更新（unverified）：不敢说「已释放」，只提示这一行状态待核。
+    if (life?.kind === 'RELEASED') push(life.unverified ? '回程状态待核' : '回程已释放');
     else if (life?.kind === 'RESTORED') push('回程已恢复');
     else if (life?.kind === 'VOIDED') push('回程已作废');
     // 按取消政策取消的航段与后端 OUTBOUND_VOIDED / RETURN_VOIDED 同源，回退口径也要出标，
@@ -952,10 +953,11 @@ export function OrdersPage() {
     }
     if (tripTypeFilter) q.tripType = tripTypeFilter;
     // 航段状态：后端按订单级派生标记筛选，导出侧同名同义（见 toOrdersExportFilter）。
-    if (legFlagFilter) q.legFlag = legFlagFilter;
+    // 这是内部口径（no-show / 释放 / 作废），代理视角既不给筛选器也不带这个参数。
+    if (isOps && legFlagFilter) q.legFlag = legFlagFilter;
     if (debouncedSearch.trim()) q.search = debouncedSearch.trim();
     return q;
-  }, [kindFilter, agentFilter, channelFilter, createdFromParam, createdToParam, travelFrom, travelTo, returnFrom, returnTo, flightDateFrom, flightDateTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, debouncedRecordedBy, invoiceLegFilter, visaFilterCode, tripTypeFilter, legFlagFilter, debouncedSearch]);
+  }, [kindFilter, agentFilter, channelFilter, createdFromParam, createdToParam, travelFrom, travelTo, returnFrom, returnTo, flightDateFrom, flightDateTo, claimFilter, debouncedFlightNumber, debouncedPassengerName, debouncedRecordedBy, invoiceLegFilter, visaFilterCode, tripTypeFilter, legFlagFilter, isOps, debouncedSearch]);
   // 三模板筛选导出（全岗可用/票务专用/签证专用）
   const [exportTemplate, setExportTemplate] = useState<OrderExportTemplate>('full');
   const [exporting, setExporting] = useState(false);
@@ -1344,12 +1346,13 @@ export function OrdersPage() {
     const dTo = searchParams.get('flightDateTo')?.trim();
     if (!leg && !fn && !dFrom && !dTo) return;
     deepLinkFiltersRef.current = true;
-    // legFlag 只认筛选器认识的那几个值，别把 URL 里的脏字符串塞进查询参数
-    if (leg && leg in ORDER_LEG_FLAG_NOTICE) setLegFlagFilter(leg as OrderLegFlagFilter);
+    // legFlag 只认筛选器认识的那几个值，别把 URL 里的脏字符串塞进查询参数；
+    // 代理视角没有这个筛选器，深链也不给它填（填了就是个看不见却在生效的筛选）。
+    if (isOps && leg && leg in ORDER_LEG_FLAG_NOTICE) setLegFlagFilter(leg as OrderLegFlagFilter);
     if (fn) setFlightNumberFilter(fn);
     if (dFrom) setFlightDateFrom(dFrom);
     if (dTo) setFlightDateTo(dTo);
-  }, [searchParams]);
+  }, [searchParams, isOps]);
   useEffect(() => {
     const q = searchParams.get('q')?.trim();
     if (!q || deepLinkOpenRef.current || loading) return;
@@ -2919,22 +2922,25 @@ export function OrdersPage() {
               <option value="roundtrip">往返</option>
             </select>
           </div>
-          <div>
-            <label className="label">航段状态</label>
-            <select
-              className="input"
-              value={legFlagFilter}
-              onChange={(e) => setLegFlagFilter(e.target.value as '' | OrderLegFlagFilter)}
-              title="按 no-show / 回程释放的处理痕迹筛选：去程未登机、回程座位已放回库存、回程已恢复占位、回程已最终作废。与列表「内容」列的航段状态短标同一口径。"
-            >
-              <option value="">全部</option>
-              <option value="NO_SHOW">去程未登机</option>
-              <option value="RETURN_RELEASED">回程已释放</option>
-              <option value="RETURN_RESTORED">回程已恢复</option>
-              <option value="RETURN_VOIDED">回程已作废</option>
-              <option value="OUTBOUND_VOIDED">去程已作废</option>
-            </select>
-          </div>
+          {/* 航段状态是内部口径（no-show / 释放 / 作废），代理视角不给这个筛选器 */}
+          {isOps && (
+            <div>
+              <label className="label">航段状态</label>
+              <select
+                className="input"
+                value={legFlagFilter}
+                onChange={(e) => setLegFlagFilter(e.target.value as '' | OrderLegFlagFilter)}
+                title="按 no-show / 回程释放的处理痕迹筛选：去程未登机、回程座位已放回库存、回程已恢复占位、回程已最终作废。与列表「内容」列的航段状态短标同一口径。"
+              >
+                <option value="">全部</option>
+                <option value="NO_SHOW">去程未登机</option>
+                <option value="RETURN_RELEASED">回程已释放</option>
+                <option value="RETURN_RESTORED">回程已恢复</option>
+                <option value="RETURN_VOIDED">回程已作废</option>
+                <option value="OUTBOUND_VOIDED">去程已作废</option>
+              </select>
+            </div>
+          )}
           <div>
             <label className="label">开票筛选</label>
             <select
@@ -7100,42 +7106,14 @@ function readReturnVoidedFinal(metadata: unknown): ReturnVoidedFinalMark | null 
   if (!metadata || typeof metadata !== 'object') return null;
   const v = (metadata as { returnVoidedFinal?: unknown }).returnVoidedFinal;
   if (!v || typeof v !== 'object') return null;
-  const m = v as { at?: unknown; by?: unknown };
+  // 后端作废快照写的键是 byUserId（起飞后自动作废的后台任务传 'SYSTEM'）；
+  // 老快照里可能是 by，两个都认，否则「系统自动」这一句永远显示不出来。
+  const m = v as { at?: unknown; by?: unknown; byUserId?: unknown };
+  const by = m.byUserId ?? m.by;
   return {
     at: typeof m.at === 'string' ? m.at : null,
-    bySystem: m.by === 'SYSTEM',
+    bySystem: by === 'SYSTEM',
   };
-}
-
-/**
- * 已释放的回程行：**释放快照本身**能否证明原班次已经起飞（= 可以作废）。
- * 现存释放快照只存了原班次 id / 舱位，没有出发时刻，所以这里多认几种可能的写法；
- * 一个都取不到、或只有日期且就是今天 → 返回 false，调用方改打一次作废预检问后端 departed。
- * 只做「确凿已起飞」的快速判定，绝不自己猜——猜错会凭空长出一个不可逆的作废入口。
- */
-function readReleasedOriginalDeparted(metadata: unknown): boolean {
-  if (!metadata || typeof metadata !== 'object') return false;
-  const v = (metadata as { returnReleased?: unknown }).returnReleased;
-  if (!v || typeof v !== 'object') return false;
-  const m = v as {
-    originalDepartureTime?: unknown;
-    originalDeparture?: unknown;
-    originalDepartDate?: unknown;
-  };
-  const iso = [m.originalDepartureTime, m.originalDeparture].find(
-    (x): x is string => typeof x === 'string' && x.trim() !== '',
-  );
-  if (iso) {
-    const ms = Date.parse(iso);
-    if (Number.isFinite(ms)) return ms < Date.now();
-  }
-  const date = typeof m.originalDepartDate === 'string' ? m.originalDepartDate.slice(0, 10) : '';
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(date)) return false;
-  // 只有日期没有时刻：当天不敢判「已起飞」（可能还没飞），严格早于今天才算。
-  // 今天按业务时区取，别用浏览器本地日期（境外同事会差一天）。
-  const parts = businessTzParts(new Date());
-  if (!parts) return false;
-  return date < `${parts.year}-${parts.month}-${parts.day}`;
 }
 
 /**
@@ -7149,12 +7127,14 @@ function readReleasedOriginalDeparted(metadata: unknown): boolean {
  * 释放与恢复的打标会同时留存（恢复后再次释放是正常流程），所以当前态只能按时间戳定，
  * 不能只看快照存不存在。时间戳一律 Date.parse 成毫秒后按数值严格 `>` 比（与后端拿 Date
  * 比同一口径）——字符串比大小会在时区写法不一致的两条打标上判反。
- * 两边时间戳都缺（老数据）时以「班次为空」为准，不丢徽标。
+ * 两边时间戳都缺（老快照）时**判不出来**：后端此时算「未释放」，前端若一口咬定「已释放
+ * 可恢复」，运营点恢复必然被后端拒。这种行落 unverified=true：徽标改成灰色「状态待核」，
+ * 恢复 / 作废两个入口都不给（fail-closed，宁可少一个入口也不给一个必然失败的按钮）。
  */
 type ReturnLegLifecycle =
   | { kind: 'VOIDED'; mark: ReturnVoidedFinalMark }
   | { kind: 'CANCELLED'; leg: FlightLegSide }
-  | { kind: 'RELEASED'; mark: ReturnReleasedMark }
+  | { kind: 'RELEASED'; mark: ReturnReleasedMark; unverified: boolean }
   | { kind: 'RESTORED'; mark: ReturnRestoredMark }
   | null;
 function readReturnLegLifecycle(item: OrderItem): ReturnLegLifecycle {
@@ -7165,24 +7145,33 @@ function readReturnLegLifecycle(item: OrderItem): ReturnLegLifecycle {
   if (cancelledLeg) return { kind: 'CANCELLED', leg: cancelledLeg };
   const released = readReturnReleasedMark(item.metadata);
   const restored = readReturnRestoredMark(item.metadata);
-  if (!item.flightScheduleId && released && isReleaseCurrent(released, restored)) {
-    return { kind: 'RELEASED', mark: released };
+  if (!item.flightScheduleId && released) {
+    const state = releaseState(released, restored);
+    if (state !== 'STALE') {
+      return { kind: 'RELEASED', mark: released, unverified: state === 'UNKNOWN' };
+    }
   }
   if (item.flightScheduleId && restored) return { kind: 'RESTORED', mark: restored };
   return null;
 }
 
-/** 释放打标是否比恢复打标新（= 当前处于「已释放」）。两边都没时间戳时退回「班次为空」即算释放。 */
-function isReleaseCurrent(
+/**
+ * 释放打标与恢复打标谁更新：
+ *   CURRENT = 释放更新（当前处于「已释放」，可恢复）
+ *   STALE   = 恢复更新（释放是历史痕迹）
+ *   UNKNOWN = 两边都没时间戳的老快照，判不出来 —— 与后端口径不一致，一律 fail-closed
+ */
+type ReleaseState = 'CURRENT' | 'STALE' | 'UNKNOWN';
+function releaseState(
   released: ReturnReleasedMark,
   restored: ReturnRestoredMark | null,
-): boolean {
+): ReleaseState {
   const releasedMs = markTimeMs(released.at);
   const restoredMs = markTimeMs(restored?.at);
-  if (releasedMs == null && restoredMs == null) return true;
-  if (releasedMs == null) return false;
-  if (restoredMs == null) return true;
-  return releasedMs > restoredMs;
+  if (releasedMs == null && restoredMs == null) return 'UNKNOWN';
+  if (releasedMs == null) return 'STALE';
+  if (restoredMs == null) return 'CURRENT';
+  return releasedMs > restoredMs ? 'CURRENT' : 'STALE';
 }
 
 /** 本单是否已经标过去程 no-show（订单级入口据此隐藏「no-show 处理」按钮）。 */
@@ -7280,11 +7269,17 @@ function OrderItemRow({
   const returnLife = isFlight ? readReturnLegLifecycle(item) : null;
   // 已释放的回程行班次是空的：对它改期/升舱/取消都是对着空班次操作，一律不给入口。
   const returnReleased = returnLife?.kind === 'RELEASED';
+  // 老快照判不出释放/恢复谁更新：前端与后端口径不一致，只给灰标「状态待核」，两个入口都不给。
+  const returnReleaseUnverified = returnLife?.kind === 'RELEASED' && returnLife.unverified;
   // 「作废回程」的前提：座位已释放 **且** 原班次已经起飞（没起飞就还能恢复，不该作废）。
-  // 释放快照能自己证明已起飞就地判；证明不了就打一次只读的作废预检问后端 departed。
-  const releasedDepartedLocal = returnReleased && readReleasedOriginalDeparted(item.metadata);
+  // 释放快照里没有出发时刻，只能打一次只读的作废预检问后端 departed —— 同一行同一次打开
+  // 只探一次（ref 记住已探过的行，父组件重渲不再重发）。
+  const probedRowRef = useRef<string | null>(null);
   useEffect(() => {
-    if (!canOperate || !returnReleased || releasedDepartedLocal || !rowToken) return;
+    if (!canOperate || !returnReleased || returnReleaseUnverified || !rowToken) return;
+    const probeKey = `${orderId}:${item.id}`;
+    if (probedRowRef.current === probeKey) return;
+    probedRowRef.current = probeKey;
     let cancelled = false;
     api
       .previewVoidReturnLeg(rowToken, orderId)
@@ -7298,9 +7293,13 @@ function OrderItemRow({
     return () => {
       cancelled = true;
     };
-  }, [canOperate, returnReleased, releasedDepartedLocal, rowToken, orderId]);
+  }, [canOperate, returnReleased, returnReleaseUnverified, rowToken, orderId, item.id]);
+  // 原班次已起飞 = 这一段回不来了：只留「确认作废回程」，「恢复回程」收起来（点了必被后端拒）。
+  const returnOriginalDeparted = returnDepartedProbe === true;
   const canVoidReturn =
-    Boolean(canOperate) && returnReleased && (releasedDepartedLocal || returnDepartedProbe === true);
+    Boolean(canOperate) && returnReleased && !returnReleaseUnverified && returnOriginalDeparted;
+  const canRestoreReturn =
+    Boolean(canOperate) && returnReleased && !returnReleaseUnverified && !returnOriginalDeparted;
   // 套餐改档：换绑到另一张套餐（档次/晚数是 Bundle 自身的属性，改档=换 bundleId）。
   const isBundleRow = item.kind === 'BUNDLE' && Boolean(item.bundleId);
   // 升舱入口：只有**经济舱**机票行能一键升商务舱；套餐机票腿（带 bundleId）走套餐自身的升舱份数模型，后端也会拒。
@@ -7443,7 +7442,7 @@ function OrderItemRow({
               回程已作废
             </span>
           )}
-          {returnLife?.kind === 'RELEASED' && (
+          {returnLife?.kind === 'RELEASED' && !returnLife.unverified && (
             <span
               className="inline-flex items-center rounded border border-amber-300 bg-amber-50 px-1.5 py-0.5 text-[11px] font-medium text-amber-700"
               title={[
@@ -7457,6 +7456,22 @@ function OrderItemRow({
                 .join(' · ')}
             >
               回程已释放（可恢复）
+            </span>
+          )}
+          {/* 老快照没留时间戳：说不清这一行现在到底是释放还是恢复，不给恢复/作废入口，
+              只把「要人工核一下」摆出来（乱给入口 → 点了必被后端拒，或者把状态改错）。 */}
+          {returnLife?.kind === 'RELEASED' && returnLife.unverified && (
+            <span
+              className="inline-flex items-center rounded border border-slate-300 bg-slate-100 px-1.5 py-0.5 text-[11px] font-medium text-slate-500"
+              title={[
+                returnLife.mark.releasedSeats != null ? `放回 ${returnLife.mark.releasedSeats} 座` : null,
+                returnLife.mark.note ? `备注：${returnLife.mark.note}` : null,
+                '这一行的释放/恢复记录缺时间戳，系统判不出当前状态，请人工核对后再处理',
+              ]
+                .filter(Boolean)
+                .join(' · ')}
+            >
+              回程状态待核
             </span>
           )}
           {returnLife?.kind === 'RESTORED' && (
@@ -7473,7 +7488,8 @@ function OrderItemRow({
               {returnLife.mark.oversold && `（超售 ${returnLife.mark.oversoldBy} 座）`}
             </span>
           )}
-          {canOperate && returnReleased && !restoringReturn && !voidingReturn && (
+          {/* 原班次已起飞时收起：那时候只剩「确认作废回程」一条路。 */}
+          {canRestoreReturn && !restoringReturn && !voidingReturn && (
             <button
               className="text-[11px] font-medium text-emerald-700 hover:text-emerald-900"
               onClick={() => setRestoringReturn(true)}

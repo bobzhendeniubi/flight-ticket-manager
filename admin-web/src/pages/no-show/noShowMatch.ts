@@ -284,11 +284,22 @@ export function parseNameLines(text: string): string[] {
   return out;
 }
 
-/** 浏览器不支持 crypto.randomUUID 时的退路（幂等键只要够唯一即可） */
+/**
+ * 幂等键。服务端按 **uuid v4 格式**校验，格式不对直接 400 —— 所以退路也必须产出合法 v4，
+ * 不能随手拼时间戳加随机数（randomUUID 只在安全上下文里有，内网 http 打开后台就会走到退路）。
+ */
 export function newRequestToken(): string {
   const c = globalThis.crypto;
   if (c && typeof c.randomUUID === 'function') return c.randomUUID();
-  return `${Date.now().toString(16)}-${Math.random().toString(16).slice(2)}-${Math.random()
-    .toString(16)
-    .slice(2)}`;
+  const bytes = new Uint8Array(16);
+  if (c && typeof c.getRandomValues === 'function') {
+    c.getRandomValues(bytes);
+  } else {
+    for (let i = 0; i < bytes.length; i += 1) bytes[i] = Math.floor(Math.random() * 256);
+  }
+  // v4 版本位与 variant 位（第 6/8 字节）：不盖上去就不是合法 v4
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = Array.from(bytes, (b) => b.toString(16).padStart(2, '0')).join('');
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
 }
