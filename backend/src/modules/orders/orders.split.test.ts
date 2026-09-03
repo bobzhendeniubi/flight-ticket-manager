@@ -40,6 +40,7 @@ const { mockPrisma } = vi.hoisted(() => ({
       update: vi.fn(),
     },
     bundleChangeRequest: { count: vi.fn() },
+    settlementRequest: { count: vi.fn() },
     fulfillmentTask: {
       count: vi.fn(),
       create: vi.fn(),
@@ -145,6 +146,7 @@ const armCleanGates = () => {
   mockPrisma.commissionRecord.aggregate.mockResolvedValue({ _sum: { amount: null } });
   mockPrisma.commissionRecord.findMany.mockResolvedValue([]);
   mockPrisma.bundleChangeRequest.count.mockResolvedValue(0);
+  mockPrisma.settlementRequest.count.mockResolvedValue(0);
   mockPrisma.refund.count.mockResolvedValue(0);
   mockPrisma.fulfillmentTask.count.mockResolvedValue(0);
   mockPrisma.refund.aggregate.mockResolvedValue({ _sum: { amount: null } });
@@ -231,14 +233,35 @@ describe('拆单 · 准入闸矩阵（preview 返回人话 blocker）', () => {
 
   it('已计提佣金（ACCRUED 未进结算）→ 不拦，按份额劈两条', async () => {
     armCleanGates();
-    mockPrisma.commissionRecord.findMany.mockResolvedValue([
-      { id: 'c1', amount: 88, status: 'ACCRUED', settlementId: null },
-    ]);
+    // 计提查询与「负数冲销」查询共用同一个 findMany：按 where.status 分流，别让一份数据被算两遍
+    mockPrisma.commissionRecord.findMany.mockImplementation((args: { where?: { status?: unknown } }) =>
+      Promise.resolve(
+        args?.where?.status === 'REVERSED'
+          ? []
+          : [{ id: 'c1', amount: 88, status: 'ACCRUED', settlementId: null }],
+      ),
+    );
     mockPrisma.order.findUnique.mockResolvedValue(baseOrder());
     const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
     expect(r.eligible).toBe(true);
-    expect(r.commission).toEqual({ mode: 'SPLIT', amountCny: 88 });
+    expect(r.commission).toEqual({ mode: 'SPLIT', amountCny: 88, reversalCny: 0 });
     expect(r.warnings.join()).toContain('劈成两条');
+  });
+
+  it('待追回的负数佣金冲销（REVERSED 未进结算）→ 不拦，按份额劈两条', async () => {
+    armCleanGates();
+    mockPrisma.commissionRecord.findMany.mockImplementation((args: { where?: { status?: unknown } }) =>
+      Promise.resolve(
+        args?.where?.status === 'REVERSED'
+          ? [{ id: 'r1', amount: -40, status: 'REVERSED', settlementId: null }]
+          : [],
+      ),
+    );
+    mockPrisma.order.findUnique.mockResolvedValue(baseOrder());
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
+    expect(r.eligible).toBe(true);
+    expect(r.commission).toEqual({ mode: 'SPLIT', amountCny: 0, reversalCny: -40 });
+    expect(r.warnings.join()).toContain('待追回的佣金冲销');
   });
 
   it('佣金已进结算流程（SETTLEMENT_REQUESTED）→ 拒拆', async () => {
@@ -340,7 +363,14 @@ describe('拆单 · 准入闸矩阵（preview 返回人话 blocker）', () => {
     expect(r.eligible).toBe(true);
     expect(r.blockers).toEqual([]);
     expect(r.upgradeItems).toEqual([
-      { itemId: 'i1', leg: 'OUTBOUND', businessUpgradeCount: 1, suggestedToMove: 1 },
+      {
+        itemId: 'i1',
+        leg: 'OUTBOUND',
+        businessUpgradeCount: 1,
+        suggestedToMove: 1,
+        movedSeatPax: 1,
+        keptSeatPax: 1,
+      },
     ]);
   });
 
@@ -519,6 +549,7 @@ interface FinalOrderShape {
   total: number;
   paidAmount: number;
   adjustmentCny?: number;
+  prepaymentOffset?: number;
   outboundInvoiced?: boolean;
   returnInvoiced?: boolean;
   systemInvoiced?: boolean;
@@ -551,6 +582,7 @@ const finalOrderRow = (shape: FinalOrderShape) => ({
   total: shape.total,
   paidAmount: shape.paidAmount,
   adjustmentCny: shape.adjustmentCny ?? 0,
+  prepaymentOffset: shape.prepaymentOffset ?? 0,
   outboundInvoiced: shape.outboundInvoiced ?? false,
   returnInvoiced: shape.returnInvoiced ?? false,
   systemInvoiced: shape.systemInvoiced ?? false,
@@ -654,7 +686,7 @@ const armExecute = (opts: ExecuteArmOptions) => {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   mockPrisma.fulfillmentTask.findMany.mockImplementation(async (args: any) => {
     const where = args?.where ?? {};
-    if (where.id?.in) return [{ id: 'task-1', orderItemId: 'new_i1' }];
+    if (where.id?.in) return [{ id: 'task-1', orderItemId: 'new_i1', type: 'FLIGHT_TICKETING' }];
     if (where.orderItemId?.in) return opts.sourceTicketingTasks ?? [];
     return [];
   });
@@ -1047,6 +1079,7 @@ describe('拆单 · 已出票单：票务状态随人搬家', () => {
       sourceTicketingTasks: [
         {
           orderItemId: 'i1',
+          type: 'FLIGHT_TICKETING',
           status: 'CONFIRMED',
           data: { pnr: 'ABC123' },
           notes: '票务台已出票',
@@ -1346,5 +1379,424 @@ describe('拆单 · 不继承 no-show / 释放 / 取消航段快照', () => {
     armCleanGates();
     const preview = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
     expect(preview.warnings.join('')).toContain('拆出的新单不会自动带标记');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('拆单 · 议价申请闸（H3）', () => {
+  it('本单有待处理的议价申请 → 拒拆（申请里冻的是拆之前的应收）', async () => {
+    armCleanGates();
+    mockPrisma.settlementRequest.count.mockResolvedValue(1);
+    mockPrisma.order.findUnique.mockResolvedValue(baseOrder());
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
+    expect(r.eligible).toBe(false);
+    expect(r.blockers.join()).toContain('待处理的议价申请');
+  });
+
+  it('改档申请闸对非套餐单同样生效（申请挂在订单上，不看有没有套餐行）', async () => {
+    armCleanGates();
+    mockPrisma.bundleChangeRequest.count.mockResolvedValue(1);
+    mockPrisma.order.findUnique.mockResolvedValue(baseOrder()); // items 里只有机票行
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
+    expect(r.eligible).toBe(false);
+    expect(r.blockers.join()).toContain('待确认的套餐改档申请');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('拆单 · 升舱位航段归属按班次时刻判定（H1）', () => {
+  /** 去程行排在数组第二位（被 UPDATE 过的行会跑到结果集末尾）。*/
+  const swappedOrder = () =>
+    baseOrder({
+      items: [
+        flightItem({
+          id: 'i-ret',
+          description: '测试机票 回程',
+          flightScheduleId: 'sch2',
+          flightSchedule: { departureTime: new Date('2026-09-10T02:00:00.000Z'), departureTz: 'Asia/Shanghai' },
+          metadata: { businessUpgradeCount: 2 },
+        }),
+        flightItem({
+          id: 'i-out',
+          description: '测试机票 去程',
+          flightScheduleId: 'sch1',
+          flightSchedule: { departureTime: new Date('2026-09-01T02:00:00.000Z'), departureTz: 'Asia/Shanghai' },
+          metadata: { businessUpgradeCount: 1 },
+        }),
+      ],
+    });
+
+  it('数组第一条是回程行时，仍按出发时刻把去程认成 OUTBOUND', async () => {
+    armCleanGates();
+    mockPrisma.order.findUnique.mockResolvedValue(swappedOrder());
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
+    const byId = new Map(r.upgradeItems.map((u) => [u.itemId, u]));
+    expect(byId.get('i-out')?.leg).toBe('OUTBOUND');
+    expect(byId.get('i-ret')?.leg).toBe('RETURN');
+    // 两侧座位数一并回显（前端据此夹输入框）
+    expect(byId.get('i-out')).toMatchObject({ movedSeatPax: 1, keptSeatPax: 1 });
+  });
+
+  it('无班次的行（no-show 释放后 scheduleId 置空）不参与判腿，按去程处理', async () => {
+    armCleanGates();
+    mockPrisma.order.findUnique.mockResolvedValue(
+      baseOrder({
+        items: [
+          flightItem({
+            id: 'i-orphan',
+            flightScheduleId: null,
+            flightSchedule: null,
+            metadata: { businessUpgradeCount: 1 },
+          }),
+        ],
+      }),
+    );
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
+    expect(r.upgradeItems[0]).toMatchObject({ itemId: 'i-orphan', leg: 'OUTBOUND' });
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('拆单 · 显式 roomSplit 上限（B-H2）', () => {
+  const bundleStayOrder = () =>
+    baseOrder({
+      items: [
+        flightItem({
+          id: 'ib',
+          kind: 'BUNDLE',
+          description: '海岛五日套餐',
+          flightScheduleId: null,
+          flightCabin: null,
+          quantity: 1,
+          unitPrice: 9000,
+          amount: 9000,
+          totalCostCny: 6000,
+          roomsBilled: 2,
+          metadata: { roomsNeeded: 2 },
+        }),
+      ],
+    });
+
+  it('套餐住宿行搬走全部间数 → 400（两侧都有人，最多搬 roomsBilled − 0.5）', async () => {
+    armExecute({
+      order: bundleStayOrder(),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 0 },
+      finalTarget: { total: 1000, paidAmount: 500 },
+    });
+    await expect(
+      service.splitOrder(
+        'o1',
+        {
+          passengerIds: ['p1'],
+          roomSplit: [{ itemId: 'ib', roomsBilledToMove: 2 }],
+          requestToken: TOKEN,
+        },
+        admin,
+      ),
+    ).rejects.toThrow(/最多搬走 1.5 间/);
+  });
+
+  it('显式 0 合法（该行整块留原单），不再被 min(0.5) 拦在 schema 外', async () => {
+    armExecute({
+      order: bundleStayOrder(),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 0 },
+      finalTarget: { total: 1000, paidAmount: 500 },
+      conservationRows: [
+        { kind: 'BUNDLE', flightScheduleId: null, flightCabin: null, quantity: 1, metadata: null, roomsBilled: 2, totalCostCny: 4000 },
+        { kind: 'BUNDLE', flightScheduleId: null, flightCabin: null, quantity: 1, metadata: null, roomsBilled: 0, totalCostCny: 2000 },
+      ],
+    });
+    await service.splitOrder(
+      'o1',
+      {
+        passengerIds: ['p1'],
+        roomSplit: [{ itemId: 'ib', roomsBilledToMove: 0 }],
+        requestToken: TOKEN,
+      },
+      admin,
+    );
+    const bundleCreate = mockPrisma.orderItem.create.mock.calls.find(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0].data.kind === 'BUNDLE',
+    );
+    expect(Number(bundleCreate?.[0].data.roomsBilled)).toBe(0);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('拆单 · 佣金劈分保留计提时刻与负数冲销（M1 / M2）', () => {
+  const armCommission = (rows: Array<Record<string, unknown>>) => {
+    armExecute({
+      order: baseOrder({ agentId: 'a1' }),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 0 },
+      finalTarget: { total: 1000, paidAmount: 500 },
+    });
+    // 闸查询（按 status 分流）与执行段查询（settlementId + OR）共用同一个 findMany
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mockPrisma.commissionRecord.findMany.mockImplementation(async (args: any) => {
+      const where = args?.where ?? {};
+      if (where.OR) return rows;
+      if (where.status === 'REVERSED') return rows.filter((r) => r.status === 'REVERSED');
+      if (where.status?.in) return rows.filter((r) => r.status !== 'REVERSED');
+      return [];
+    });
+    mockPrisma.commissionRecord.create.mockResolvedValue({ id: 'c-new' });
+    mockPrisma.commissionRecord.update.mockResolvedValue({});
+  };
+
+  it('劈出的记录显式继承源记录 createdAt（否则跳到当月结算单）', async () => {
+    const accruedAt = new Date('2026-08-03T10:00:00.000Z');
+    armCommission([
+      {
+        id: 'c1',
+        agentId: 'a1',
+        productKind: 'BUNDLE',
+        baseAmount: 2000,
+        rate: 0.05,
+        amount: 100,
+        chainDepth: 0,
+        status: 'ACCRUED',
+        settlementId: null,
+        createdAt: accruedAt,
+      },
+    ]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mockPrisma.commissionRecord.aggregate.mockImplementation(async (args: any) =>
+      args?.where?.status === 'REVERSED' || args?.where?.amount
+        ? { _sum: { amount: 0 } }
+        : { _sum: { amount: 100 } },
+    );
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    const created = mockPrisma.commissionRecord.create.mock.calls[0][0].data;
+    expect(created.createdAt).toBe(accruedAt);
+    expect(created.status).toBe('ACCRUED');
+    expect(Number(created.amount)).toBe(50);
+  });
+
+  it('负数 REVERSED 补偿行也按同比例劈，状态原样保留', async () => {
+    armCommission([
+      {
+        id: 'r1',
+        agentId: 'a1',
+        productKind: 'BUNDLE',
+        baseAmount: -800,
+        rate: 0.05,
+        amount: -40,
+        chainDepth: 0,
+        status: 'REVERSED',
+        settlementId: null,
+        createdAt: new Date('2026-08-05T10:00:00.000Z'),
+      },
+    ]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mockPrisma.commissionRecord.aggregate.mockImplementation(async (args: any) =>
+      args?.where?.status === 'REVERSED' ? { _sum: { amount: -40 } } : { _sum: { amount: 0 } },
+    );
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    const created = mockPrisma.commissionRecord.create.mock.calls[0][0].data;
+    expect(created.status).toBe('REVERSED');
+    expect(Number(created.amount)).toBe(-20);
+    const kept = mockPrisma.commissionRecord.update.mock.calls[0][0];
+    expect(Number(kept.data.amount)).toBe(-20);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('拆单 · 预存抵扣随拆按份额搬（H4）', () => {
+  it('历史遗留的非零 prepaymentOffset 按份额劈到两侧，并落一条 CRITICAL 审计', async () => {
+    armExecute({
+      order: baseOrder({ prepaymentOffset: 400 }),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 0, prepaymentOffset: 200 },
+      finalTarget: { total: 1000, paidAmount: 500, prepaymentOffset: 200 },
+    });
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const orderUpdates = mockPrisma.order.update.mock.calls.map((c: any[]) => c[0]);
+    expect(Number(orderUpdates.find((u) => u.where.id === 'o1').data.prepaymentOffset)).toBe(200);
+    expect(Number(orderUpdates.find((u) => u.where.id === 'o2').data.prepaymentOffset)).toBe(200);
+    // 审计留痕（预存流水仍按单挂在源单，财务据此对账）
+    const actions = mockPrisma.auditLog.create.mock.calls.map(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0].data.action,
+    );
+    expect(actions).toContain('SPLIT_ORDER_PREPAYMENT_OFFSET');
+  });
+
+  it('两侧 Σ prepaymentOffset 对不上 → 守恒断言抛错回滚', async () => {
+    armExecute({
+      order: baseOrder({ prepaymentOffset: 400 }),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 0, prepaymentOffset: 400 },
+      finalTarget: { total: 1000, paidAmount: 500, prepaymentOffset: 200 },
+    });
+    await expect(
+      service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin),
+    ).rejects.toThrow(/守恒断言失败：拆前预存抵扣/);
+  });
+
+  it('抵扣为 0 的常规单：两侧 update 都不写这一列（不给现行系统加无谓写入）', async () => {
+    armExecute({
+      order: baseOrder(),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 0 },
+      finalTarget: { total: 1000, paidAmount: 500 },
+    });
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const orderUpdates = mockPrisma.order.update.mock.calls.map((c: any[]) => c[0]);
+    expect(orderUpdates.find((u) => u.where.id === 'o1').data).not.toHaveProperty(
+      'prepaymentOffset',
+    );
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('拆单 · 履约任务镜像扩到签证/酒店/接送（M3）', () => {
+  it('签证任务镜像源行状态，不给已办结的人再开一堆待办', async () => {
+    armExecute({
+      order: baseOrder({
+        items: [
+          flightItem({
+            id: 'i1',
+            kind: 'VISA',
+            description: '越南签证',
+            flightScheduleId: null,
+            flightCabin: null,
+          }),
+        ],
+      }),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 0 },
+      finalTarget: { total: 1000, paidAmount: 500 },
+      conservationRows: [
+        { kind: 'VISA', flightScheduleId: null, flightCabin: null, quantity: 1, metadata: null, roomsBilled: null, totalCostCny: 600 },
+        { kind: 'VISA', flightScheduleId: null, flightCabin: null, quantity: 1, metadata: null, roomsBilled: null, totalCostCny: 600 },
+      ],
+      sourceTicketingTasks: [
+        {
+          orderItemId: 'i1',
+          type: 'VISA_APPLICATION',
+          status: 'CONFIRMED',
+          data: { applicationNo: 'V-9' },
+          notes: '签证岗已办结',
+          startedAt: null,
+          completedAt: new Date('2026-08-21T02:00:00.000Z'),
+        },
+      ],
+    });
+    // 新单上刚建的任务是签证任务
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mockPrisma.fulfillmentTask.findMany.mockImplementation(async (args: any) => {
+      const where = args?.where ?? {};
+      if (where.id?.in) {
+        return [{ id: 'task-1', orderItemId: 'new_i1', type: 'VISA_APPLICATION' }];
+      }
+      if (where.orderItemId?.in) {
+        return [
+          {
+            orderItemId: 'i1',
+            type: 'VISA_APPLICATION',
+            status: 'CONFIRMED',
+            data: { applicationNo: 'V-9' },
+            notes: '签证岗已办结',
+            startedAt: null,
+            completedAt: new Date('2026-08-21T02:00:00.000Z'),
+          },
+        ];
+      }
+      return [];
+    });
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    const mirrored = mockPrisma.fulfillmentTask.update.mock.calls.find(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0].where?.id === 'task-1',
+    );
+    expect(mirrored?.[0].data).toMatchObject({ status: 'CONFIRMED', data: { applicationNo: 'V-9' } });
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('拆单 · 分房/房数脏数据闸（L2 / L4）', () => {
+  it('0.5 间的房组里住着 2 位客人 + 自动劈半 → 人话 blocker（劈开必有一侧 0 间却住着人）', async () => {
+    armCleanGates();
+    mockPrisma.order.findUnique.mockResolvedValue(
+      baseOrder({
+        roomAssignment: {
+          roomGroups: [
+            {
+              id: 'g1',
+              hotelName: '测试酒店',
+              roomType: '双床',
+              roomFraction: 0.5,
+              passengerIds: ['p1', 'p2'],
+            },
+          ],
+        },
+      }),
+    );
+    const r = await service.previewOrderSplit(
+      'o1',
+      { passengerIds: ['p1'], autoSplitRoomGroups: true },
+      admin,
+    );
+    expect(r.eligible).toBe(false);
+    expect(r.blockers.join()).toContain('分房表数据有误');
+    expect(r.blockers.join()).toContain('0 间房');
+  });
+
+  it('计费房数不是 0.5 的整数倍（历史脏数据）→ 人话 blocker', async () => {
+    armCleanGates();
+    mockPrisma.order.findUnique.mockResolvedValue(
+      baseOrder({
+        items: [
+          flightItem({
+            id: 'ih',
+            kind: 'HOTEL',
+            description: '测试酒店 双床房',
+            flightScheduleId: null,
+            flightCabin: null,
+            quantity: 1,
+            roomsBilled: 1.3,
+          }),
+        ],
+      }),
+    );
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
+    expect(r.eligible).toBe(false);
+    expect(r.blockers.join()).toContain('不是 0.5 的整数倍');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('拆单 · 只拆婴儿/儿童的提示（M7）', () => {
+  it('拆出的人里没有成人 → 非阻断 warning，提醒复核金额口径', async () => {
+    armCleanGates();
+    mockPrisma.order.findUnique.mockResolvedValue(
+      baseOrder({
+        passengers: [pax('p1', { passengerType: 'INFANT' }), pax('p2'), pax('p3')],
+      }),
+    );
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
+    expect(r.eligible).toBe(true);
+    expect(r.warnings.join()).toContain('只拆出婴儿');
   });
 });

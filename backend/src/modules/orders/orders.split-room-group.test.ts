@@ -197,6 +197,18 @@ describe('splitHotelItemByRoomGroup · 守卫矩阵（全部拒绝且分毫不�
     expect(state.created?.kind).toBe(OrderItemKind.HOTEL);
     expect(Number(state.created?.amount)).toBe(0);
     expect(Number(state.created?.roomsBilled)).toBe(0.5);
+    // 单价与金额配套归 0：照抄套餐整包一口价会得到「单价 ¥X / 金额 ¥0」的自相矛盾行，
+    // 任何按 unitPrice × quantity 复算金额的地方都会把它算成一笔没入账的钱。
+    expect(Number(state.created?.unitPrice)).toBe(0);
+    // 描述点明来历（新行 kind=HOTEL，不加后缀会被当成另买的酒店）
+    expect(String(state.created?.description)).toContain('（拆出住宿）');
+  });
+
+  it('独立 HOTEL 行拆出的新行保留源行单价与描述（只有套餐行才归 0 / 加后缀）', async () => {
+    const { state } = mountSplit({ item: { kind: OrderItemKind.HOTEL } });
+    await service.splitHotelItemByRoomGroup('ord-1', 'item-1', BODY, ADMIN).catch(() => undefined);
+    expect(Number(state.created?.unitPrice)).not.toBe(0);
+    expect(String(state.created?.description)).not.toContain('（拆出住宿）');
   });
 
   it('非住宿行（FLIGHT）→ 400', async () => {

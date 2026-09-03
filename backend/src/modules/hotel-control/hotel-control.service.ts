@@ -715,13 +715,57 @@ function groupOrderItemId(g: Record<string, unknown>): string | null {
   return typeof v === 'string' && v.length > 0 ? v : null;
 }
 
+/** 房组的计费间数（roomFraction；缺省 / 形状不符按整间 1）。*/
+function groupRoomFraction(g: Record<string, unknown>): number {
+  if (g.roomFraction == null) return 1;
+  const n = Number(g.roomFraction);
+  return Number.isFinite(n) && n > 0 ? n : 1;
+}
+
 /**
- * 权威分房表的物理间数：Order.roomAssignment.roomGroups（orders 模块分房保存的 JSON）中
- * 「至少 1 名出行人」的房间盒子数量。返回 null = 无有效分房表（未分房 / 形状不符 /
- * 全部盒子无人）→ 调用方走拼房性别推算 fallback。防御式解析，形状不符不抛错。
+ * 物理间数聚合的**桶键**：同一个桶里的 roomFraction 求和后才向上取整成整间。
+ *   · 拆单配对键（splitPairKey）优先 —— 一间房被拆单劈成两张单的两个半组时两侧写同一个 key，
+ *     据此配回一间（不看性别、不看房型：夫妻拼房被拆开正是「一男一女各半间」）；
+ *   · 其余按房型 —— 同酒店同房型同日期的半间两两成一间。
+ */
+function groupBucketKey(g: Record<string, unknown>): string {
+  const pair = g.splitPairKey;
+  if (typeof pair === 'string' && pair.length > 0) return `pair:${pair}`;
+  return `rt:${typeof g.roomType === 'string' ? g.roomType : ''}`;
+}
+
+/** 0.5 网格对齐后向上取整（消除浮点尾数，避免 1.0000001 被算成 2 间）。*/
+function ceilHalfGrid(fraction: number): number {
+  return Math.ceil(Math.round(fraction * 2) / 2);
+}
+
+/**
+ * 一批房组 → 物理间数（整单 / 单行口径）：按桶求和 roomFraction 再各自向上取整。
+ * 只数有出行人的盒子；空盒子不占房。
+ */
+function physicalRoomsOfGroups(groups: ReadonlyArray<Record<string, unknown>>): number {
+  const byBucket = new Map<string, number>();
+  for (const g of groups) {
+    if (!groupHasPassengers(g)) continue;
+    const key = groupBucketKey(g);
+    byBucket.set(key, (byBucket.get(key) ?? 0) + groupRoomFraction(g));
+  }
+  let rooms = 0;
+  for (const frac of byBucket.values()) rooms += ceilHalfGrid(frac);
+  return rooms;
+}
+
+/**
+ * 权威分房表的物理间数：Order.roomAssignment.roomGroups（orders 模块分房保存的 JSON）里
+ * 有出行人的房组，按桶（拆单配对键 / 房型）求和 roomFraction 再各自向上取整。
+ * 返回 null = 无有效分房表（未分房 / 形状不符 / 全部盒子无人）→ 调用方走拼房性别推算 fallback。
+ * 防御式解析，形状不符不抛错。
  *
  * 背景：分房保存把 Σ roomFraction 塌缩写进首个酒店行的 roomsBilled（床位/计费口径），
  * "男+女各半间分 2 房"会塌缩成 1.0——物理间数必须回读分房表，不能只看 roomsBilled。
+ *
+ * ⚠ 口径是**求和再取整**而不是「数盒子」：拆单会把一间房劈成两个 0.5 的半组，
+ * 数盒子会把它算成两间（凭空多占一间房）。两个 0.5 求和 = 1.0 → 1 间，房量分毫不动。
  *
  * ⚠ 这是**整单**口径（不看房组住哪家店）。逐酒店统计请走 expandAssignedPhysicalByDate ——
  * 它对带 orderItemId 归属的房组按归属过滤，一单房组分住两家店不会两边各记整单数。
@@ -729,8 +773,8 @@ function groupOrderItemId(g: Record<string, unknown>): string | null {
 export function assignedPhysicalRooms(roomAssignment: unknown): number | null {
   const groups = parseRoomGroups(roomAssignment);
   if (!groups) return null;
-  const withPassengers = groups.filter(groupHasPassengers).length;
-  return withPassengers > 0 ? withPassengers : null;
+  const rooms = physicalRoomsOfGroups(groups);
+  return rooms > 0 ? rooms : null;
 }
 
 /**
@@ -749,14 +793,15 @@ export function assignedRoomsForItem(
   const groups = parseRoomGroups(roomAssignment);
   if (!groups) return null;
   if (!groups.some((g) => groupOrderItemId(g) != null)) return null;
-  const own = groups.filter((g) => groupHasPassengers(g) && groupOrderItemId(g) === itemId).length;
-  const byName =
-    hotelName == null
-      ? 0
-      : groups.filter(
-          (g) => groupHasPassengers(g) && groupOrderItemId(g) == null && g.hotelName === hotelName,
-        ).length;
-  return own + byName;
+  // 间数口径与 assignedPhysicalRooms / expandAssignedPhysicalByDate 同一把尺：
+  // 按桶求和 roomFraction 再取整（拆单劈出的两个半组不会被数成两间）。
+  return physicalRoomsOfGroups(
+    groups.filter(
+      (g) =>
+        groupOrderItemId(g) === itemId ||
+        (groupOrderItemId(g) == null && hotelName != null && g.hotelName === hotelName),
+    ),
+  );
 }
 
 /** 占房行（物理口径拆分用）：订单级分房表 + 拼房性别 fallback 所需字段。*/
@@ -797,22 +842,58 @@ export function expandAssignedPhysicalByDate<T extends PhysicalOccupancyItem>(
   items: ReadonlyArray<T>,
   dates: readonly string[],
 ): { assignedPhysical: number[]; fallbackItems: T[] } {
-  const assignedPhysical = new Array<number>(dates.length).fill(0);
   const fallbackItems: T[] = [];
+  // 逐桶逐日累计 roomFraction，**最后**才向上取整成整间 —— 取整必须发生在跨单汇总之后，
+  // 否则拆单劈出的两个 0.5（分在两张单上）会各自 ceil 成 1 间，凭空多占一间房。
+  const fracByBucket = new Map<string, number[]>();
+  const addFrac = (bucket: string, index: number, fraction: number): void => {
+    let arr = fracByBucket.get(bucket);
+    if (!arr) {
+      arr = new Array<number>(dates.length).fill(0);
+      fracByBucket.set(bucket, arr);
+    }
+    arr[index] += fraction;
+  };
   // 本批行 id 集合：调用方（销控板/余量/前瞻闸）传进来的 items 已按「一家酒店」分好组，
   // 这就是归属过滤的坐标系；一个 id 都没有 = 调用方未升级，整单口径兜底。
   const batchItemIds = new Set<string>();
   for (const it of items) {
     if (typeof it.id === 'string' && it.id.length > 0) batchItemIds.add(it.id);
   }
-  // 整单口径的订单级去重（旧数据 / 未升级调用方 / 无归属的按名匹配组）
-  const legacyByOrder = new Map<string, { rooms: number; covered: boolean[] }>();
-  const namedByOrder = new Map<string, { rooms: number; covered: boolean[] }>();
+  // 整单口径的订单级去重（旧数据 / 未升级调用方 / 无归属的按名匹配组）：
+  // key = `${订单}|${桶}`，间数（fraction）只按第一条行记一次，区间取并集。
+  const legacyByOrder = new Map<string, { bucket: string; fraction: number; covered: boolean[] }>();
+  const namedByOrder = new Map<string, { bucket: string; fraction: number; covered: boolean[] }>();
   const cover = (covered: boolean[], checkInD: Date, checkOutD: Date): void => {
     const checkIn = fmtDateOnly(checkInD);
     const checkOut = fmtDateOnly(checkOutD);
     for (let i = 0; i < dates.length; i++) {
       if (checkIn <= dates[i] && dates[i] < checkOut) covered[i] = true;
+    }
+  };
+  /** 房组按桶汇总 roomFraction（只数有出行人的盒子）。*/
+  const fractionByBucket = (groups: ReadonlyArray<Record<string, unknown>>): Map<string, number> => {
+    const out = new Map<string, number>();
+    for (const g of groups) {
+      if (!groupHasPassengers(g)) continue;
+      const key = groupBucketKey(g);
+      out.set(key, (out.get(key) ?? 0) + groupRoomFraction(g));
+    }
+    return out;
+  };
+  const dedupe = (
+    store: Map<string, { bucket: string; fraction: number; covered: boolean[] }>,
+    orderKey: string,
+    buckets: Map<string, number>,
+    checkIn: Date,
+    checkOut: Date,
+  ): void => {
+    for (const [bucket, fraction] of buckets) {
+      const key = `${orderKey}|${bucket}`;
+      const entry =
+        store.get(key) ?? { bucket, fraction, covered: new Array<boolean>(dates.length).fill(false) };
+      if (!store.has(key)) store.set(key, entry);
+      cover(entry.covered, checkIn, checkOut);
     }
   };
 
@@ -827,53 +908,97 @@ export function expandAssignedPhysicalByDate<T extends PhysicalOccupancyItem>(
     const hasAttribution = groups.some((g) => groupOrderItemId(g) != null);
 
     if (!hasAttribution || batchItemIds.size === 0) {
-      // 整单口径（现行为）：有乘客的盒子数 × 区间并集；全盒子无人 → 性别推算 fallback。
-      const rooms = groups.filter(groupHasPassengers).length;
-      if (rooms === 0) {
+      // 整单口径（现行为）：整单房组按桶求和 × 区间并集；全盒子无人 → 性别推算 fallback。
+      const buckets = fractionByBucket(groups);
+      if (buckets.size === 0) {
         fallbackItems.push(it);
         return;
       }
-      const entry =
-        legacyByOrder.get(key) ?? { rooms, covered: new Array<boolean>(dates.length).fill(false) };
-      if (!legacyByOrder.has(key)) legacyByOrder.set(key, entry);
-      cover(entry.covered, it.hotelCheckIn, it.hotelCheckOut);
+      dedupe(legacyByOrder, key, buckets, it.hotelCheckIn, it.hotelCheckOut);
       return;
     }
 
     // 归属口径：orderItemId == 本行的组按本行区间逐晚直计
-    const own = groups.filter((g) => groupHasPassengers(g) && groupOrderItemId(g) === it.id).length;
-    if (own > 0) {
+    const own = fractionByBucket(groups.filter((g) => groupOrderItemId(g) === it.id));
+    if (own.size > 0) {
       const checkIn = fmtDateOnly(it.hotelCheckIn);
       const checkOut = fmtDateOnly(it.hotelCheckOut);
       for (let i = 0; i < dates.length; i++) {
-        if (checkIn <= dates[i] && dates[i] < checkOut) assignedPhysical[i] += own;
+        if (checkIn <= dates[i] && dates[i] < checkOut) {
+          for (const [bucket, fraction] of own) addFrac(bucket, i, fraction);
+        }
       }
     }
     // 无 orderItemId 的组按 hotelName 匹配到本行所在酒店（整单去重 + 区间并集，防多行重复计）
     const hotelName = it.hotelRoomType?.hotel?.name ?? null;
     const unattributed =
       hotelName == null
-        ? 0
-        : groups.filter(
-            (g) => groupHasPassengers(g) && groupOrderItemId(g) == null && g.hotelName === hotelName,
-          ).length;
-    if (unattributed > 0) {
-      const entry =
-        namedByOrder.get(key) ??
-        { rooms: unattributed, covered: new Array<boolean>(dates.length).fill(false) };
-      if (!namedByOrder.has(key)) namedByOrder.set(key, entry);
-      cover(entry.covered, it.hotelCheckIn, it.hotelCheckOut);
+        ? new Map<string, number>()
+        : fractionByBucket(
+            groups.filter((g) => groupOrderItemId(g) == null && g.hotelName === hotelName),
+          );
+    if (unattributed.size > 0) {
+      dedupe(namedByOrder, key, unattributed, it.hotelCheckIn, it.hotelCheckOut);
     }
     // 有权威分房表的行一律不进 fallback：即便本行在本酒店归属 0 组（组都归属在别的行 /
     // 别的酒店），也绝不能按性别推算把它计回来 —— 那正是本口径要修的双算。
   });
 
-  for (const { rooms, covered } of [...legacyByOrder.values(), ...namedByOrder.values()]) {
+  for (const { bucket, fraction, covered } of [
+    ...legacyByOrder.values(),
+    ...namedByOrder.values(),
+  ]) {
     for (let i = 0; i < dates.length; i++) {
-      if (covered[i]) assignedPhysical[i] += rooms;
+      if (covered[i]) addFrac(bucket, i, fraction);
     }
   }
+
+  const assignedPhysical = new Array<number>(dates.length).fill(0);
+  for (const arr of fracByBucket.values()) {
+    for (let i = 0; i < dates.length; i++) assignedPhysical[i] += ceilHalfGrid(arr[i]);
+  }
   return { assignedPhysical, fallbackItems };
+}
+
+/**
+ * 拆单配对的半间行（无分房表的 fallback 侧）：订单行 metadata 上带 `splitPairKey` 的行，
+ * 按 key 逐日汇总计费房数再向上取整 —— 一间房被拆单劈成两张单的两个 0.5 行时配回一间。
+ *
+ * 为什么不能交给性别配对：拆开的可能是夫妻拼房（一男一女各半间），性别口径「异性不能拼」
+ * 会把它算成两间 —— 可它们本来就是同一间房，拆单一张床都没多占。
+ *
+ * 返回 { pairedPhysical, remainingItems }：带 key 的行的物理占用 + 其余行（照旧走性别推算）。
+ */
+export function expandSplitPairedByDate<T extends PhysicalOccupancyItem>(
+  items: ReadonlyArray<T>,
+  dates: readonly string[],
+): { pairedPhysical: number[]; remainingItems: T[] } {
+  const remainingItems: T[] = [];
+  const fracByKey = new Map<string, number[]>();
+  for (const it of items) {
+    const meta = it.metadata != null && typeof it.metadata === 'object' ? (it.metadata as Record<string, unknown>) : null;
+    const pairKey = meta != null && typeof meta.splitPairKey === 'string' ? meta.splitPairKey : '';
+    if (!pairKey || !it.hotelCheckIn || !it.hotelCheckOut) {
+      remainingItems.push(it);
+      continue;
+    }
+    let arr = fracByKey.get(pairKey);
+    if (!arr) {
+      arr = new Array<number>(dates.length).fill(0);
+      fracByKey.set(pairKey, arr);
+    }
+    const rooms = itemRoomCount(it);
+    const checkIn = fmtDateOnly(it.hotelCheckIn);
+    const checkOut = fmtDateOnly(it.hotelCheckOut);
+    for (let i = 0; i < dates.length; i++) {
+      if (checkIn <= dates[i] && dates[i] < checkOut) arr[i] += rooms;
+    }
+  }
+  const pairedPhysical = new Array<number>(dates.length).fill(0);
+  for (const arr of fracByKey.values()) {
+    for (let i = 0; i < dates.length; i++) pairedPhysical[i] += ceilHalfGrid(arr[i]);
+  }
+  return { pairedPhysical, remainingItems };
 }
 
 /**
@@ -991,8 +1116,11 @@ function computePhysicalUsedForItems<T extends PhysicalOccupancyItem>(
   prospective: ProspectiveOccupancy | null,
 ): number[] {
   const { assignedPhysical, fallbackItems } = expandAssignedPhysicalByDate(items, dates);
-  const baseBuckets = expandSharedHalfByDate(fallbackItems, dates);
-  const baseUsed = expandUsedByDate(fallbackItems, dates);
+  // 拆单劈出的半间行（无分房表侧）先按配对键配回整间，不进性别推算 ——
+  // 夫妻拼房被拆开后是「一男一女各半间」，按性别口径会被算成两间。
+  const { pairedPhysical, remainingItems } = expandSplitPairedByDate(fallbackItems, dates);
+  const baseBuckets = expandSharedHalfByDate(remainingItems, dates);
+  const baseUsed = expandUsedByDate(remainingItems, dates);
 
   const solos = prospective?.solos ?? [];
   // 防御：整间数按非负整数取，避免调用方误传 0.5（0.5 间的语义是「拼房客」，应走 solos）。
@@ -1008,7 +1136,7 @@ function computePhysicalUsedForItems<T extends PhysicalOccupancyItem>(
   const used = baseUsed.map((v) => round2(v + solos.length * 0.5 + extraWhole));
 
   const fallbackPhysical = computePhysicalUsed(used, buckets);
-  return fallbackPhysical.map((v, i) => round2(v + assignedPhysical[i]));
+  return fallbackPhysical.map((v, i) => round2(v + assignedPhysical[i] + pairedPhysical[i]));
 }
 
 /**
@@ -1592,16 +1720,20 @@ export async function getBoard(
     const used = expandUsedByDate(groupItems, dates);
     // 权威分房表订单直计物理间数并退出拼房口径；其余行（fallback）按性别推算
     const { assignedPhysical, fallbackItems } = expandAssignedPhysicalByDate(groupItems, dates);
+    // 拆单劈出的半间行按配对键先配回整间（不看性别），剩下的才进拼房性别推算
+    const { pairedPhysical, remainingItems } = expandSplitPairedByDate(fallbackItems, dates);
     // 拼房客（0.5 半间）逐日按性别分桶（仅 fallback 订单；异性不能拼一间；
-    // 已有分房表的订单不进拼房桶、不标「拼」落单）
-    const buckets = expandSharedHalfByDate(fallbackItems, dates);
+    // 已有分房表 / 已按拆单配对键配回整间的订单不进拼房桶、不标「拼」落单）
+    const buckets = expandSharedHalfByDate(remainingItems, dates);
     const sharedHalfCount = buckets.m.map((mv, i) => mv + buckets.f[i] + buckets.u[i]);
     // 落单数 = 同性两两配对后的余数 + 未知性别（全算落单）
     const sharedUnpaired = buckets.m.map((mv, i) => (mv % 2) + (buckets.f[i] % 2) + buckets.u[i]);
     const sharedOdd = sharedUnpaired.map((n) => n > 0);
-    // 物理房间口径（内存推导，无额外查库）：分房表直计 + fallback 性别推算
-    const fallbackPhysical = computePhysicalUsed(expandUsedByDate(fallbackItems, dates), buckets);
-    const physicalUsed = fallbackPhysical.map((v, i) => round2(v + assignedPhysical[i]));
+    // 物理房间口径（内存推导，无额外查库）：分房表直计 + 拆单配对 + fallback 性别推算
+    const fallbackPhysical = computePhysicalUsed(expandUsedByDate(remainingItems, dates), buckets);
+    const physicalUsed = fallbackPhysical.map((v, i) =>
+      round2(v + assignedPhysical[i] + pairedPhysical[i]),
+    );
     return {
       block,
       used,

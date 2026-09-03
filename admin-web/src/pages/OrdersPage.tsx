@@ -8140,6 +8140,7 @@ function RescheduleForm({
     if (selectedIds.size === 0) { setErr('请至少勾选 1 位改期乘客'); return; }
     const confirmMsg = isPartialSelection
       ? `将把勾选的 ${selectedIds.size} 位乘客拆成新订单并改期到 ${selectedSchedule ? scheduleLabel(selectedSchedule) : '新班次'}；原单其余乘客不变。` +
+        '\n套餐单也能这么拆：金额按占座比例劈，住宿按人头搬，同房组会自动劈成两个半组（房控后续配回一间）。' +
         (hasTicketedPassenger ? `\n${TICKETED_RESCHEDULE_HINT}` : '')
       : '确认改期？座位会移动到新班次（新班次售罄会被拒绝）；出发日期变动时本单酒店入住/离店日期会同步平移（新日期房量不足会整体拒绝），如填了改期差价将计入订单应收（可正可负）。';
     if (!confirm(confirmMsg)) return;
@@ -9183,7 +9184,7 @@ function NoShowPanel({
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
-  /** 后端拒绝拆单（如套餐单）时原样列出的逐条原因 */
+  /** 后端拒绝拆单时原样列出的逐条原因 */
   const [splitBlockers, setSplitBlockers] = useState<string[]>([]);
   /** 勾选变化触发的重新预检是否在途（首次加载走 previewLoading，两者分开显示）。 */
   const [repreviewing, setRepreviewing] = useState(false);

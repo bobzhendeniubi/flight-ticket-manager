@@ -1403,20 +1403,25 @@ export const splitOrderBodySchema = z.object({
     .array(
       z.object({
         itemId: z.string().min(1, 'itemId 必填'),
+        // 显式 0 = 「这一行整块留在源单」（套餐住宿行也一样）；只有**缺省**（不给这一行）
+        // 才走自动派生。两者语义不同，故下限是 0 而不是 0.5。
         roomsBilledToMove: z
           .number()
           .multipleOf(0.5, '随拆搬走的间数必须是 0.5 的整数倍')
-          .min(0.5, '随拆搬走的间数至少 0.5'),
+          .min(0, '随拆搬走的间数不能为负'),
       }),
     )
     .max(50)
     .optional(),
-  // 升舱位随拆搬走几个（按航段给数，服务端按「第一条机票行=去程」归到具体行）。
+  // 升舱位随拆搬走几个：一行一腿，toMove 直接给这一行搬几个。
   // 不传 = 按占座人头自动派生；两侧都不能记比自己座位还多的升舱位（服务端校验）。
+  // outboundToMove / returnToMove 是旧形状（一条 entry 同时带两腿的数），继续兼容：
+  // 服务端按该行实际归属的航段取对应字段。新前端只发 toMove。
   upgradeSplit: z
     .array(
       z.object({
         itemId: z.string().min(1, 'itemId 必填'),
+        toMove: z.number().int().min(0).max(99).optional(),
         outboundToMove: z.number().int().min(0).max(99).optional(),
         returnToMove: z.number().int().min(0).max(99).optional(),
       }),

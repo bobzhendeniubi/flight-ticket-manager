@@ -402,7 +402,7 @@ describe('套餐单拆单 · 七条守恒（真 DB）', () => {
     expect(preview.eligible).toBe(true);
     expect(preview.blockers).toEqual([]);
     expect(preview.roomGroupConflict).toBe(true);
-    expect(preview.commission).toEqual({ mode: 'SPLIT', amountCny: 1485 });
+    expect(preview.commission).toEqual({ mode: 'SPLIT', amountCny: 1485, reversalCny: 0 });
     const stay = preview.hotelItems.find((h) => h.isBundleStay)!;
     expect(stay.description.startsWith('套餐住宿 · ')).toBe(true);
     expect(stay.suggestedRoomsToMove).toBe(0.5);

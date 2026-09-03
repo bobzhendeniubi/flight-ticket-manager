@@ -645,6 +645,50 @@ describe('changeOrderBundle · 套餐改档', () => {
     expect(orderUpdate.data).not.toHaveProperty('paidAmount');
   });
 
+  /**
+   * 取改档响应里的 warnings。终态 serializeOrder 需要一份完整订单快照，本批只关心提示文案，
+   * 故给 findUniqueOrThrow 喂一份最小可序列化订单。
+   */
+  const warningsOf = async (roomsBilled: number): Promise<string> => {
+    mountOrder({ items: [bundleItem({ roomsBilled: new Prisma.Decimal(roomsBilled) })] });
+    mountNewBundle();
+    mountTx(5000);
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValue({
+      id: 'ord-1',
+      orderNumber: 'FTM-0001',
+      status: 'PAID',
+      currency: 'CNY',
+      total: new Prisma.Decimal(5000),
+      subtotal: new Prisma.Decimal(5000),
+      taxesAndFees: new Prisma.Decimal(0),
+      discountTotal: new Prisma.Decimal(0),
+      paidAmount: new Prisma.Decimal(0),
+      prepaymentOffset: new Prisma.Decimal(0),
+      adjustmentCny: 0,
+      adjustments: [],
+      items: [],
+      passengers: [],
+      payments: [],
+      refunds: [],
+      statusEvents: [],
+      createdAt: new Date('2026-08-01T00:00:00.000Z'),
+      updatedAt: new Date('2026-08-01T00:00:00.000Z'),
+    });
+    const res = await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF);
+    return res.audit.warnings.join();
+  };
+
+  it('改档抹平了拆单留下的半间 → 响应 warnings 提示房控核对房量（M5）', async () => {
+    // 拆单后套餐行占 0.5 间；改档按新档容量重算成整间（2 人 → 1 间），房控板上的占用会跳。
+    const warnings = await warningsOf(0.5);
+    expect(warnings).toContain('套餐行占房由 0.5 间改为 1 间');
+    expect(warnings).toContain('房控');
+  });
+
+  it('房量没变（原本就是整间）→ 不冒这条提示（warning 不是常驻文案）', async () => {
+    expect(await warningsOf(1)).not.toContain('套餐行占房由');
+  });
+
   it('降档（新档更便宜）→ 差额行为负、落 DISCOUNT 行', async () => {
     mountOrder();
     mountNewBundle({ items: [{ kind: 'HOTEL', qty: 2, unitPrice: 1500 }] });

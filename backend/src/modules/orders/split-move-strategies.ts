@@ -158,6 +158,21 @@ export interface SplitContext {
    * 手工拆单默认 false —— 酒店行不动，运营自己在弹窗里填间数）。
    */
   autoDeriveRooms: boolean;
+  /**
+   * 本次拆单的配对令牌（= requestToken）。住宿行被劈成两个半间时，两侧写同一个
+   * `splitPairKey`（源行 id + 本令牌），房控据此把跨单的两个半间**配回一间** ——
+   * 否则「一间房拆成两张单的两个半间」会被物理口径数成两间，凭空多占房。
+   * 建议值上下文（预检回显）传空串 = 不写配对键（预检不落库）。
+   */
+  splitPairToken: string;
+}
+
+/**
+ * 住宿行随拆劈半时两侧共用的配对键：`源行 id:拆单令牌`。
+ * 令牌为空（预检建议上下文）→ 返回 null，调用方不写这个键。
+ */
+export function splitPairKeyOf(itemId: string, ctx: SplitContext): string | null {
+  return ctx.splitPairToken ? `${itemId}:${ctx.splitPairToken}` : null;
 }
 
 /** 策略要读的订单行最小形状（真实入参是 loadOrderForSplit 读出来的行）。 */
@@ -296,18 +311,25 @@ export function moveHotel(item: SplitItemView, ctx: SplitContext): SplitMove {
   const srcCost = item.totalCostCny;
   const movedCost = srcCost == null ? null : round2((srcCost * moveHalf) / srcHalf);
   const keptCost = srcCost == null || movedCost == null ? null : round2(srcCost - movedCost);
+  // 配对键：两侧写同一个 key，房控把跨单的两个半间配回一间（不看性别）。
+  const pairKey = splitPairKeyOf(item.id, ctx);
   return {
     mode: 'SPLIT',
     keep: {
       roomsBilled: (srcHalf - moveHalf) / 2,
       amount: round2(srcAmount - movedAmount),
       totalCostCny: keptCost,
+      ...(pairKey ? { metadata: { ...item.metadata, splitPairKey: pairKey } } : {}),
     },
     move: {
       roomsBilled: moveHalf / 2,
       amount: movedAmount,
       totalCostCny: movedCost,
-      metadata: { ...inheritableItemMetadata(item.metadata), splitFromItemId: item.id },
+      metadata: {
+        ...inheritableItemMetadata(item.metadata),
+        splitFromItemId: item.id,
+        ...(pairKey ? { splitPairKey: pairKey } : {}),
+      },
     },
   };
 }
@@ -364,29 +386,42 @@ export function moveBundle(item: SplitItemView, ctx: SplitContext): SplitMove {
   const totalSeat = ctx.totalSeatPax > 0 ? ctx.totalSeatPax : ctx.totalPax;
   const movedSeat = ctx.totalSeatPax > 0 ? ctx.movedSeatPax : ctx.k;
   const r = totalSeat > 0 ? movedSeat / totalSeat : 0;
+  // 成本份额：只拆婴儿时占座比 r === 0，成本会整块留在源单 —— 婴儿也吃地接成本，
+  // 按人头比例（k / 全员）劈才对得上毛利底账。占座比非 0 时两者同源，不改现有口径。
+  const costRatio = movedSeat > 0 ? r : ctx.totalPax > 0 ? ctx.k / ctx.totalPax : 0;
 
   const movedAmount = round2(item.amount * r);
   const keptAmount = round2(item.amount - movedAmount);
   const srcCost = item.totalCostCny;
-  const movedCost = srcCost == null ? null : round2(srcCost * r);
+  const movedCost = srcCost == null ? null : round2(srcCost * costRatio);
   const keptCost = srcCost == null || movedCost == null ? null : round2(srcCost - movedCost);
+
+  // 单住 / 自备签计数：乘客表与套餐快照对不上（商城整单口径）时回落到按占座份额劈原快照，
+  // 房数下限（单住整间）也吃这个回落值 —— 否则会按「两侧都 0 位单住」派生房数。
+  const effCtx = withBundleSideCounts(item, ctx);
 
   let movedRooms: number | null = null;
   let keptRooms: number | null = null;
   if (item.roomsBilled != null && item.roomsBilled > 0) {
     // 套餐单的住宿盖章就在这条行上：未显式给 roomSplit 也要派生，否则房量会整块留在源单。
     const resolved =
-      resolveRoomsToMove(item, ctx, item.roomsBilled) ?? deriveRoomsToMove(item.roomsBilled, ctx);
+      resolveRoomsToMove(item, effCtx, item.roomsBilled) ??
+      deriveRoomsToMove(item.roomsBilled, effCtx);
     const srcHalf = Math.round(item.roomsBilled * 2);
     const moveHalf = clamp(Math.round(resolved * 2), 0, srcHalf);
     movedRooms = moveHalf / 2;
     keptRooms = (srcHalf - moveHalf) / 2;
   }
 
-  const { keep: keepMeta, move: moveMeta } = rebuildBundleMetadataPair(item, ctx, r, {
+  const { keep: keepMeta, move: moveMeta } = rebuildBundleMetadataPair(item, effCtx, r, {
     movedRooms,
     keptRooms,
   });
+  // 住宿盖章两侧都留了半间 → 写配对键，房控把两个半间配回一间（口径同 moveHotel）。
+  const pairKey =
+    movedRooms != null && keptRooms != null && movedRooms > 0 && keptRooms > 0
+      ? splitPairKeyOf(item.id, ctx)
+      : null;
 
   return {
     mode: 'SPLIT',
@@ -394,7 +429,7 @@ export function moveBundle(item: SplitItemView, ctx: SplitContext): SplitMove {
       amount: keptAmount,
       totalCostCny: keptCost,
       ...(keptRooms != null ? { roomsBilled: keptRooms } : {}),
-      metadata: keepMeta,
+      metadata: pairKey ? { ...keepMeta, splitPairKey: pairKey } : keepMeta,
     },
     move: {
       description: item.description,
@@ -402,9 +437,68 @@ export function moveBundle(item: SplitItemView, ctx: SplitContext): SplitMove {
       amount: movedAmount,
       totalCostCny: movedCost,
       ...(movedRooms != null ? { roomsBilled: movedRooms } : {}),
-      metadata: { ...moveMeta, splitFromItemId: item.id },
+      metadata: {
+        ...moveMeta,
+        splitFromItemId: item.id,
+        ...(pairKey ? { splitPairKey: pairKey } : {}),
+      },
     },
   };
+}
+
+/**
+ * 套餐行两侧的单住 / 自备签人数：乘客表标记优先，与套餐快照对不上时按占座份额劈快照。
+ *
+ * 为什么要回落：前台商城单是**整单口径**下的单（addOns.singleCount / selfProvidedVisaCount
+ * 记在套餐行上），乘客表里一个 singleRoom / visaExempt 标记都没有。照乘客表重建，两侧
+ * singleCount 都会变成 0 —— 单房差凭空蒸发，房数派生也失去「单住整间」的下限。
+ * 回落口径：moved = round(原快照 × 拆出占座 / 全员占座)（夹进两侧座位数），kept = 原 − moved，
+ * 两侧 Σ 恒等于原快照。
+ */
+export function withBundleSideCounts(item: SplitItemView, ctx: SplitContext): SplitContext {
+  const addOns = readJsonRecord(item.metadata.addOns);
+  const totalSeat = ctx.totalSeatPax > 0 ? ctx.totalSeatPax : ctx.totalPax;
+  const movedSeat = ctx.totalSeatPax > 0 ? ctx.movedSeatPax : ctx.k;
+  const share = (orig: number, movedCap: number, keptCap: number): [number, number] => {
+    const derived = totalSeat > 0 ? Math.round((orig * movedSeat) / totalSeat) : 0;
+    const moved = clamp(derived, Math.max(0, orig - keptCap), Math.min(orig, movedCap));
+    return [moved, orig - moved];
+  };
+
+  let movedSingleCount = ctx.movedSingleCount;
+  let keptSingleCount = ctx.keptSingleCount;
+  const origSingle = Math.max(0, toInt(addOns.singleCount, 0));
+  if (addOns.singleCount != null && movedSingleCount + keptSingleCount !== origSingle) {
+    [movedSingleCount, keptSingleCount] = share(
+      origSingle,
+      ctx.movedOccupancy.seatPax,
+      ctx.keptOccupancy.seatPax,
+    );
+  }
+
+  let movedSelfVisaCount = ctx.movedSelfVisaCount;
+  let keptSelfVisaCount = ctx.keptSelfVisaCount;
+  const origSelfVisa = Math.max(0, toInt(addOns.selfProvidedVisaCount, 0));
+  if (
+    addOns.selfProvidedVisaCount != null &&
+    movedSelfVisaCount + keptSelfVisaCount !== origSelfVisa
+  ) {
+    [movedSelfVisaCount, keptSelfVisaCount] = share(
+      origSelfVisa,
+      ctx.movedOccupancy.headCount,
+      ctx.keptOccupancy.headCount,
+    );
+  }
+
+  if (
+    movedSingleCount === ctx.movedSingleCount &&
+    keptSingleCount === ctx.keptSingleCount &&
+    movedSelfVisaCount === ctx.movedSelfVisaCount &&
+    keptSelfVisaCount === ctx.keptSelfVisaCount
+  ) {
+    return ctx;
+  }
+  return { ...ctx, movedSingleCount, keptSingleCount, movedSelfVisaCount, keptSelfVisaCount };
 }
 
 /**
@@ -434,6 +528,7 @@ export function rebuildBundleMetadataPair(
       selfVisaCount: ctx.movedSelfVisaCount,
       upgradeOutbound: ctx.movedUpgradeOutbound,
       upgradeReturn: ctx.movedUpgradeReturn,
+      rooms: rooms.movedRooms,
     });
     keep.addOns = rebuildAddOns(orig, {
       occupancy: ctx.keptOccupancy,
@@ -441,6 +536,7 @@ export function rebuildBundleMetadataPair(
       selfVisaCount: ctx.keptSelfVisaCount,
       upgradeOutbound: ctx.keptUpgradeOutbound,
       upgradeReturn: ctx.keptUpgradeReturn,
+      rooms: rooms.keptRooms,
     });
   }
   // 顶层三计数（无 addOns 的老单靠它回落）
@@ -497,7 +593,11 @@ export function rebuildBundleMetadataPair(
   return { keep, move };
 }
 
-/** addOns 明细按一侧的乘客现势重算（费率 / nights / legs 原样，小计 = 新计数 × 原费率）。 */
+/**
+ * addOns 明细按一侧的乘客现势重算（费率 / nights / legs 原样，小计 = 新计数 × 原费率）。
+ * `side.rooms` 给这一侧实际盖章的计费房数（roomsBilled）：addOns.rooms 必须跟着它走
+ * （= ceil(roomsBilled)），否则「按人头猜的间数」与订单行的房量两本账会分叉。
+ */
 export function rebuildAddOns(
   orig: Record<string, unknown>,
   side: {
@@ -506,6 +606,7 @@ export function rebuildAddOns(
     selfVisaCount: number;
     upgradeOutbound: number;
     upgradeReturn: number;
+    rooms?: number | null;
   },
 ): Record<string, unknown> {
   const occ = side.occupancy;
@@ -540,7 +641,10 @@ export function rebuildAddOns(
     infantCount: occ.infantCount,
     seatPax: occ.seatPax,
     headCount: occ.headCount,
-    rooms: Math.ceil(occ.seatPax / 2),
+    rooms:
+      side.rooms != null && side.rooms > 0
+        ? Math.ceil(side.rooms)
+        : Math.ceil(occ.seatPax / 2),
     nights,
     legs,
     singleSupplementCnyPerNight: singleRate,
@@ -598,14 +702,16 @@ export function movePriceAdjustment(item: SplitItemView, ctx: SplitContext): Spl
 }
 
 /**
- * 同业立减行（metadata.settlementDiscount === true）：按 **人数** 拆成两行
- *（立减本就是「每人 ¥X × N 人」，人走了那份让利也跟着走），描述随之更新。
+ * 同业立减行（metadata.settlementDiscount === true）：按 **占座人数** 拆成两行
+ *（立减规则本就按占座人头计，婴儿不占座也不吃立减），描述随之更新。
  */
 export function moveDiscount(item: SplitItemView, ctx: SplitContext): SplitMove {
   const perPerson = toNum(item.metadata.discountPerPersonCny, 0);
   const origPax = Math.max(0, toInt(item.metadata.pax, 0));
   if (perPerson <= 0 || origPax <= 0 || ctx.totalPax <= 0) return { mode: 'NONE' };
-  const movedPax = clamp(Math.round((origPax * ctx.k) / ctx.totalPax), 0, origPax);
+  const totalSeat = ctx.totalSeatPax > 0 ? ctx.totalSeatPax : ctx.totalPax;
+  const movedSeat = ctx.totalSeatPax > 0 ? ctx.movedSeatPax : ctx.k;
+  const movedPax = clamp(Math.round((origPax * movedSeat) / totalSeat), 0, origPax);
   if (movedPax <= 0) return { mode: 'NONE' };
   const keptPax = origPax - movedPax;
   const label = (pax: number): string => `同业立减 ¥${perPerson}/人 × ${pax}人`;
@@ -640,6 +746,19 @@ export function planItemMove(item: SplitItemView, ctx: SplitContext): SplitMove 
     return item.metadata.settlementDiscount === true
       ? moveDiscount(item, ctx)
       : movePriceAdjustment(item, ctx);
+  }
+  // 按人落的签证行（passengerId 非空 = 「这一条是给这位客人办的签」）跟人走：
+  // 按 quantity 劈会把「张三那条签证」的钱留在源单、把一条无主的空壳搬到新单。
+  if (item.kind === OrderItemKind.VISA && item.passengerId) {
+    return ctx.movedIdSet.has(item.passengerId)
+      ? {
+          mode: 'WHOLE',
+          update: {
+            description: splitInheritedDescription(item.description, item.metadata),
+            metadata: inheritableItemMetadata(item.metadata),
+          },
+        }
+      : { mode: 'NONE' };
   }
   if (
     item.kind === OrderItemKind.FLIGHT ||

@@ -54,6 +54,7 @@ function ctx(over: Partial<SplitContext> = {}): SplitContext {
     keptUpgradeOutbound: 0,
     keptUpgradeReturn: 0,
     autoDeriveRooms: true,
+    splitPairToken: '',
     ...over,
   };
 }
@@ -478,5 +479,217 @@ describe('planItemMove · 派单', () => {
       expect(plan.move.quantity).toBe(1);
       expect(plan.keep.quantity).toBe(2);
     }
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('住宿行劈半 · 配对键（房控据此把跨单的两个半间配回一间）', () => {
+  it('酒店行劈成两个半间 → 两侧写同一个 splitPairKey', () => {
+    const row = item({
+      id: 'ih',
+      kind: OrderItemKind.HOTEL,
+      quantity: 1,
+      unitPrice: 0,
+      amount: 2000,
+      totalCostCny: 1200,
+      roomsBilled: 1,
+    });
+    const plan = moveHotel(row, ctx({ movedOccupancy: occ(1), keptOccupancy: occ(1), splitPairToken: 'tok-1' }));
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    const keepKey = (plan.keep.metadata as Record<string, unknown>).splitPairKey;
+    const moveKey = (plan.move.metadata as Record<string, unknown>).splitPairKey;
+    expect(keepKey).toBe('ih:tok-1');
+    expect(moveKey).toBe('ih:tok-1');
+    expect(plan.keep.roomsBilled! + plan.move.roomsBilled!).toBe(1);
+  });
+
+  it('无令牌（预检建议上下文）→ 不写配对键', () => {
+    const row = item({ kind: OrderItemKind.HOTEL, quantity: 1, amount: 2000, roomsBilled: 1 });
+    const plan = moveHotel(row, ctx({ movedOccupancy: occ(1), keptOccupancy: occ(1) }));
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    expect(plan.keep.metadata).toBeUndefined();
+    expect((plan.move.metadata as Record<string, unknown>).splitPairKey).toBeUndefined();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('roomSplit 显式 0 = 该行整块留原单（与「缺省 → 自动派生」语义不同）', () => {
+  it('酒店行显式 0 → 不搬（NONE）', () => {
+    const row = item({ id: 'ih', kind: OrderItemKind.HOTEL, quantity: 1, amount: 2000, roomsBilled: 1 });
+    const plan = moveHotel(row, ctx({ roomSplitByItem: new Map([['ih', 0]]) }));
+    expect(plan.mode).toBe('NONE');
+  });
+
+  it('套餐住宿行显式 0 → 房数整块留守（钱仍按占座份额劈）', () => {
+    const row = item({
+      id: 'ib',
+      kind: OrderItemKind.BUNDLE,
+      quantity: 1,
+      unitPrice: 9000,
+      amount: 9000,
+      totalCostCny: 6000,
+      roomsBilled: 2,
+      metadata: { addOns: addOnsSnapshot(), roomsNeeded: 2 },
+    });
+    const plan = moveBundle(row, ctx({ roomSplitByItem: new Map([['ib', 0]]) }));
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    expect(plan.move.roomsBilled).toBe(0);
+    expect(plan.keep.roomsBilled).toBe(2);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('套餐快照与乘客表对不上（商城整单口径）→ 按占座份额劈原快照', () => {
+  const mallBundle = () =>
+    item({
+      id: 'ib',
+      kind: OrderItemKind.BUNDLE,
+      quantity: 1,
+      unitPrice: 9000,
+      amount: 9000,
+      totalCostCny: 6000,
+      roomsBilled: 2,
+      metadata: {
+        addOns: {
+          ...addOnsSnapshot(),
+          adultCount: 3,
+          childCount: 0,
+          seatPax: 3,
+          headCount: 3,
+          selfProvidedVisaCount: 0,
+          selfProvidedVisa: false,
+          selfVisaDeductTotal: 0,
+        },
+        roomsNeeded: 2,
+      },
+    });
+
+  it('3 人 1 单住、乘客表零标记，拆 1 人 → 两侧 singleCount Σ 仍为 1、单房差 Σ 守恒', () => {
+    const plan = moveBundle(
+      mallBundle(),
+      ctx({ movedOccupancy: occ(1), keptOccupancy: occ(2), movedSingleCount: 0, keptSingleCount: 0 }),
+    );
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    const moveAdd = (plan.move.metadata as Record<string, unknown>).addOns as Record<string, number>;
+    const keepAdd = (plan.keep.metadata as Record<string, unknown>).addOns as Record<string, number>;
+    expect(moveAdd.singleCount + keepAdd.singleCount).toBe(1);
+    expect(moveAdd.singleSupplementTotal + keepAdd.singleSupplementTotal).toBe(
+      1 * 300 * 4, // 原快照：1 人 × ¥300/晚 × 4 晚
+    );
+  });
+
+  it('乘客表标记与快照对得上时不回落（照乘客现势重建）', () => {
+    const row = mallBundle();
+    const plan = moveBundle(
+      row,
+      ctx({ movedOccupancy: occ(1), keptOccupancy: occ(2), movedSingleCount: 1, keptSingleCount: 0 }),
+    );
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    const moveAdd = (plan.move.metadata as Record<string, unknown>).addOns as Record<string, number>;
+    expect(moveAdd.singleCount).toBe(1);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('addOns.rooms 跟随本侧 roomsBilled（不再按人头猜）', () => {
+  it('rooms = ceil(本侧 roomsBilled)', () => {
+    const plan = moveBundle(
+      item({
+        id: 'ib',
+        kind: OrderItemKind.BUNDLE,
+        quantity: 1,
+        unitPrice: 9000,
+        amount: 9000,
+        totalCostCny: 6000,
+        roomsBilled: 1,
+        metadata: { addOns: addOnsSnapshot(), roomsNeeded: 1 },
+      }),
+      ctx({ movedOccupancy: occ(1), keptOccupancy: occ(1) }),
+    );
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    const moveAdd = (plan.move.metadata as Record<string, unknown>).addOns as Record<string, number>;
+    const keepAdd = (plan.keep.metadata as Record<string, unknown>).addOns as Record<string, number>;
+    // 两侧各 0.5 间 → 各 ceil(0.5) = 1（房控按配对键把它们配回一间）
+    expect(plan.move.roomsBilled).toBe(0.5);
+    expect(moveAdd.rooms).toBe(1);
+    expect(keepAdd.rooms).toBe(1);
+  });
+
+  it('rebuildAddOns 不给 rooms 时退回按人头（老调用不受影响）', () => {
+    const built = rebuildAddOns(addOnsSnapshot(), {
+      occupancy: occ(3),
+      singleCount: 0,
+      selfVisaCount: 0,
+      upgradeOutbound: 0,
+      upgradeReturn: 0,
+    });
+    expect(built.rooms).toBe(2);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('只拆婴儿 · 成本按人头比例劈（占座比为 0 时钱不动、成本照走）', () => {
+  it('3 人 1 婴儿，只拆婴儿 → 金额 0，成本按 1/3 随拆', () => {
+    const plan = moveBundle(
+      item({
+        id: 'ib',
+        kind: OrderItemKind.BUNDLE,
+        quantity: 1,
+        unitPrice: 9000,
+        amount: 9000,
+        totalCostCny: 6000,
+        roomsBilled: null,
+        metadata: {},
+      }),
+      ctx({
+        movedOccupancy: occ(0, 0, 1),
+        keptOccupancy: occ(2),
+        movedIdSet: new Set(['p3']),
+      }),
+    );
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    expect(plan.move.amount).toBe(0);
+    expect(plan.move.totalCostCny).toBe(2000);
+    expect(plan.keep.totalCostCny).toBe(4000);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('按人落的签证行跟人走', () => {
+  it('passengerId 在拆出侧 → 整行搬走', () => {
+    const row = item({ kind: OrderItemKind.VISA, quantity: 1, passengerId: 'p1' });
+    expect(planItemMove(row, ctx()).mode).toBe('WHOLE');
+  });
+
+  it('passengerId 在留守侧 → 全留源单（不按 quantity 劈出无主空壳）', () => {
+    const row = item({ kind: OrderItemKind.VISA, quantity: 3, passengerId: 'p9' });
+    expect(planItemMove(row, ctx()).mode).toBe('NONE');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('同业立减按占座人数劈（婴儿不吃立减）', () => {
+  it('2 成人 + 1 婴儿的单拆走 1 成人 → 立减按 1/2 劈，不按 1/3', () => {
+    const row = item({
+      kind: OrderItemKind.DISCOUNT,
+      quantity: 1,
+      unitPrice: -200,
+      amount: -200,
+      totalCostCny: 0,
+      metadata: {
+        priceAdjustment: true,
+        settlementDiscount: true,
+        discountPerPersonCny: 100,
+        pax: 2,
+      },
+    });
+    const plan = moveDiscount(
+      row,
+      ctx({ movedOccupancy: occ(1), keptOccupancy: occ(1, 0, 1) }),
+    );
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    expect(plan.move.amount).toBe(-100);
+    expect(plan.keep.amount).toBe(-100);
   });
 });

@@ -3517,36 +3517,50 @@ export interface SplitOrderPreviewResult {
   eligible: boolean;
   /** 不满足的准入闸（人话，每条一个）——非空时禁提交 */
   blockers: string[];
+  /**
+   * 不阻断但必须让运营看见的口径提示（人话，每条一个）：
+   * 已出票的票随人走、两把锁一并继承到新单、售后费按份额分摊、源单 no-show 标记不跟随……
+   * 与 blockers 的区别是「知悉即可，不拦提交」——UI 用琥珀色列出，确认页再复述一遍。
+   */
+  warnings: string[];
   /** 拆出乘客的每人份额（与详情页「每人结算价」同一权威口径） */
   shares: Array<{ passengerId: string; fullName: string; shareCny: number }>;
   /** 将转移到新单的应收合计（= Σ shares.shareCny） */
   movedShareCny: number;
   /** 将转移到新单的已收（= min(movedShare, 已收 − 已完成退款)） */
   movedPaidCny: number;
+  /** 随拆按份额分摊到新单的售后费（改期费/换人费等调整项，整数元，可正可负） */
+  movedAdjustmentCny: number;
   /**
-   * 本单住宿行（供运营填「随拆搬走的间数」；可全 0 = 住宿全留原单）。
-   * 含单订酒店行（kind='HOTEL'）与盖了住宿的套餐行（kind='BUNDLE'，description 带「套餐住宿 · 」前缀）。
-   * suggestedRoomsToMove = 服务端按拆出人数算的建议间数（0.5 网格），运营可改。
-   * 两个字段都可选：老后端不返回时，UI 退回「无 kind 标、默认留空」的旧行为。
+   * 本单住宿行（供运营填「随拆搬走的间数」）。
+   * 含单订酒店行与盖了住宿的套餐行（isBundleStay=true，description 带「套餐住宿 · 」前缀）。
+   * suggestedRoomsToMove = 服务端按拆出人数算的建议间数（0.5 网格），运营可改；
+   * null = 该行没有可搬的计费房数。
+   * 提交口径：不传该行 = 由服务端按人头自动派生；显式传 0 = 该行全留原单。
    */
   hotelItems: Array<{
     itemId: string;
     description: string;
     roomsBilled: number | null;
-    kind?: 'HOTEL' | 'BUNDLE';
-    /** 服务端标记：true = 盖了住宿的套餐行（与 kind==='BUNDLE' 同义，两者认其一即可）。 */
-    isBundleStay?: boolean;
-    suggestedRoomsToMove?: number;
+    /** true = 盖了住宿的套餐行（套餐单没有独立住宿行，住宿盖在套餐行上）。 */
+    isBundleStay: boolean;
+    suggestedRoomsToMove: number | null;
   }>;
   /**
-   * 本单商务舱升舱行（按航段一条）；非空时让运营填「随拆走的升舱人数」。
-   * suggestedToMove = 服务端建议份数，上限为该段升舱份数与拆出占座人数的较小值。
+   * 本单商务舱升舱行（一条机票行一条，leg 只是给运营看的航段名）；
+   * 非空时让运营填「随拆走的升舱人数」。
+   * suggestedToMove = 服务端建议份数，上限为该行升舱份数与拆出占座人数的较小值。
+   * movedSeatPax / keptSeatPax = 该行两侧的占座人数：拆出侧最多带走 movedSeatPax 份，
+   * 留守侧至少要留够 businessUpgradeCount − keptSeatPax 份。
+   * 这两个字段可选：老后端不返回时前端退回「只按份数与拆出人数收上限」的旧口径。
    */
   upgradeItems?: Array<{
     itemId: string;
     leg: FlightLegSide;
     businessUpgradeCount: number;
     suggestedToMove: number;
+    movedSeatPax?: number;
+    keptSeatPax?: number;
   }>;
   /**
    * 本单佣金处置口径：NONE = 无佣金无需处理；SPLIT = 已计提未结算，按份额分到两张单；
@@ -5031,10 +5045,16 @@ export const api = {
     orderId: string,
     body: {
       passengerIds: string[];
-      /** 随拆搬走的住宿间数（0.5 网格）；itemId 可以是单订酒店行，也可以是盖了住宿的套餐行 */
+      /**
+       * 随拆搬走的住宿间数（0.5 网格，允许 0）；itemId 可以是单订酒店行，也可以是盖了住宿的套餐行。
+       * 不传某一行 = 由服务端按人头自动派生；显式传 0 = 该行全留原单。
+       */
       roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
-      /** 随拆走的商务舱升舱份数（按航段分别给，整数） */
-      upgradeSplit?: Array<{ itemId: string; outboundToMove: number; returnToMove: number }>;
+      /**
+       * 随拆走的商务舱升舱份数（按机票行给，整数，允许 0）。
+       * 不传某一行 = 由服务端按人头自动派生；显式传 0 = 该行升舱全留原单。
+       */
+      upgradeSplit?: Array<{ itemId: string; toMove: number }>;
       /** true = 同房组里既有拆出的人又有留守的人时，由服务端按人劈成两个半组 */
       autoSplitRoomGroups?: boolean;
       note?: string;

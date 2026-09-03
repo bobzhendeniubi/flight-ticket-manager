@@ -40,6 +40,7 @@ import {
   computePhysicalUsed,
   assignedPhysicalRooms,
   expandAssignedPhysicalByDate,
+  expandSplitPairedByDate,
   checkHotelPhysicalFit,
   assertHotelPhysicalFit,
   assertHotelPhysicalFitWithinTx,
@@ -741,6 +742,177 @@ describe('expandAssignedPhysicalByDate 房组归属过滤（一单两酒店不�
   });
 });
 
+describe('expandAssignedPhysicalByDate · roomFraction 求和再取整（拆单劈半不双算）', () => {
+  const dates = [dayStr(0), dayStr(1)];
+  /** 带 roomFraction / splitPairKey 的分房表。*/
+  const fractionAssignment = (
+    groups: Array<{ id: string; fraction?: number; splitPairKey?: string; roomType?: string }>,
+  ) => ({
+    roomGroups: groups.map((g) => ({
+      id: g.id,
+      hotelName: '美溪海滩酒店',
+      roomType: g.roomType ?? '标间',
+      passengerIds: [`${g.id}-p1`],
+      ...(g.fraction != null ? { roomFraction: g.fraction } : {}),
+      ...(g.splitPairKey ? { splitPairKey: g.splitPairKey } : {}),
+    })),
+  });
+
+  it('拆单劈半：一间房变成两张单的两个 0.5 组 → 该日物理占用仍是 1 间（拆前拆后不变）', () => {
+    const before = expandAssignedPhysicalByDate(
+      [
+        {
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 1,
+          order: { id: 'o1', roomAssignment: fractionAssignment([{ id: 'g1' }]), passengers: [] },
+        },
+      ],
+      dates,
+    );
+    expect(before.assignedPhysical).toEqual([1, 0]);
+
+    // 拆单后：源单留半间、新单半间，两侧写同一个 splitPairKey
+    const after = expandAssignedPhysicalByDate(
+      [
+        {
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 0.5,
+          order: {
+            id: 'o1',
+            roomAssignment: fractionAssignment([
+              { id: 'g1', fraction: 0.5, splitPairKey: 'g1:tok' },
+            ]),
+            passengers: [],
+          },
+        },
+        {
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 0.5,
+          order: {
+            id: 'o2',
+            roomAssignment: fractionAssignment([
+              { id: 'g1-split', fraction: 0.5, splitPairKey: 'g1:tok' },
+            ]),
+            passengers: [],
+          },
+        },
+      ],
+      dates,
+    );
+    expect(after.assignedPhysical).toEqual([1, 0]);
+  });
+
+  it('夫妻拼房被拆开（一男一女各半间，同 splitPairKey）→ 仍是 1 间（配对键不看性别）', () => {
+    const res = expandAssignedPhysicalByDate(
+      [
+        {
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 0.5,
+          order: {
+            id: 'o1',
+            roomAssignment: fractionAssignment([
+              { id: 'g1', fraction: 0.5, splitPairKey: 'g1:tok', roomType: '大床' },
+            ]),
+            passengers: [{ gender: 'M' as Gender }],
+          },
+        },
+        {
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 0.5,
+          order: {
+            id: 'o2',
+            roomAssignment: fractionAssignment([
+              // 拆出侧房型字段被改过也无所谓：配对键优先于房型桶
+              { id: 'g1-split', fraction: 0.5, splitPairKey: 'g1:tok', roomType: '标间' },
+            ]),
+            passengers: [{ gender: 'F' as Gender }],
+          },
+        },
+      ],
+      dates,
+    );
+    expect(res.assignedPhysical).toEqual([1, 0]);
+  });
+
+  it('落单的半间组（配不上对）→ 仍向上取整成 1 间，绝不少算', () => {
+    const res = expandAssignedPhysicalByDate(
+      [
+        {
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 0.5,
+          order: {
+            id: 'o1',
+            roomAssignment: fractionAssignment([{ id: 'g1', fraction: 0.5 }]),
+            passengers: [],
+          },
+        },
+      ],
+      dates,
+    );
+    expect(res.assignedPhysical).toEqual([1, 0]);
+  });
+
+  it('整间组仍按整间计（缺省 roomFraction = 1，老数据行为不变）', () => {
+    const res = expandAssignedPhysicalByDate(
+      [
+        {
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 2,
+          order: { id: 'o1', roomAssignment: roomAssignmentOf([2, 2]), passengers: [] },
+        },
+      ],
+      dates,
+    );
+    expect(res.assignedPhysical).toEqual([2, 0]);
+  });
+});
+
+describe('expandSplitPairedByDate · 无分房表侧按配对键配回整间', () => {
+  const dates = [dayStr(0), dayStr(1)];
+
+  it('两张单各半间、同 splitPairKey → 1 间；且不再进性别推算', () => {
+    const rows = [
+      {
+        hotelCheckIn: day(0),
+        hotelCheckOut: day(1),
+        roomsBilled: 0.5,
+        metadata: { splitPairKey: 'ih:tok' },
+        order: { id: 'o1', roomAssignment: null, passengers: [{ gender: 'M' as Gender }] },
+      },
+      {
+        hotelCheckIn: day(0),
+        hotelCheckOut: day(1),
+        roomsBilled: 0.5,
+        metadata: { splitPairKey: 'ih:tok' },
+        order: { id: 'o2', roomAssignment: null, passengers: [{ gender: 'F' as Gender }] },
+      },
+    ];
+    const res = expandSplitPairedByDate(rows, dates);
+    expect(res.pairedPhysical).toEqual([1, 0]);
+    expect(res.remainingItems).toEqual([]);
+  });
+
+  it('没有配对键的行原样留给性别推算', () => {
+    const row = {
+      hotelCheckIn: day(0),
+      hotelCheckOut: day(1),
+      roomsBilled: 0.5,
+      metadata: null,
+      order: { id: 'o1', roomAssignment: null, passengers: [{ gender: 'M' as Gender }] },
+    };
+    const res = expandSplitPairedByDate([row], dates);
+    expect(res.pairedPhysical).toEqual([0, 0]);
+    expect(res.remainingItems).toEqual([row]);
+  });
+});
+
 describe('getBoard 权威分房表优先（物理口径）', () => {
   const rt = { hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } } };
 
@@ -791,7 +963,7 @@ describe('getBoard 权威分房表优先（物理口径）', () => {
 
   it('分房表半间单不再按性别落单；无分房表 fallback 单维持原推算', async () => {
     const client = boardClient([
-      // 有分房表的半间单：物理 1 间、不落单
+      // 有分房表的单：物理间数 = Σ roomFraction 向上取整（此处 1 组缺省 1 间）→ 1 间、不落单
       {
         hotelCheckIn: day(0),
         hotelCheckOut: day(1),
@@ -874,6 +1046,45 @@ describe('getHotelNightlyRemaining 权威分房表优先（物理口径）', () 
     expect(res.remaining).toEqual([9]);
     // 物理口径按分房表直计 2 间 → 10 - 2 = 8
     expect(res.physicalRemaining).toEqual([8]);
+  });
+
+  it('拆单劈半后两张单各半间（同 splitPairKey）→ 物理仍占 1 间，余量与拆前一致', async () => {
+    const half = (orderId: string, groupId: string) => ({
+      hotelCheckIn: day(0),
+      hotelCheckOut: day(1),
+      roomsBilled: 0.5,
+      metadata: { splitPairKey: 'ih:tok' },
+      order: {
+        id: orderId,
+        roomAssignment: {
+          roomGroups: [
+            {
+              id: groupId,
+              hotelName: '美溪海滩酒店',
+              roomType: '标间',
+              passengerIds: [`${orderId}-p1`],
+              roomFraction: 0.5,
+              splitPairKey: 'g1:tok',
+            },
+          ],
+        },
+        passengers: [{ gender: orderId === 'o1' ? 'M' : 'F' }],
+      },
+    });
+    const client = {
+      hotelBlockPeriod: {
+        findMany: vi
+          .fn()
+          .mockResolvedValue([{ hotelId: 'h1', dateFrom: day(0), dateTo: day(2), rooms: 10 }]),
+      },
+      orderItem: {
+        findMany: vi.fn().mockResolvedValue([half('o1', 'g1'), half('o2', 'g1-split')]),
+      },
+    } as unknown as PrismaClient;
+    const res = await getHotelNightlyRemaining('h1', [dayStr(0)], client);
+    // 床位口径 0.5 + 0.5 = 1.0；物理口径两个半间配回一间 → 10 - 1 = 9（拆前也是 9）
+    expect(res.remaining).toEqual([9]);
+    expect(res.physicalRemaining).toEqual([9]);
   });
 });
 
@@ -1171,6 +1382,50 @@ describe('checkHotelPhysicalFit（物理房间口径前瞻闸）', () => {
     // 20 男 → 10；20 女 → 10 → 共 20 间 == 包房 20 间 → 装得下
     expect(female.physicalUsedAfter).toEqual([20]);
     expect(female.violations).toEqual([]);
+  });
+
+  it('拆单劈半的两个半间不再各占一间 → 前瞻闸不再误拒新单（C1 回归锚）', async () => {
+    // 场景：包房 1 间，已有一张 2 人单占满这 1 间；该单被拆单劈成两张单的两个半间。
+    // 旧口径把两个半间数成 2 间 → 该晚「已占 2 间 > 包房 1 间」，随便来一笔操作都被判超卖。
+    const half = (orderId: string, groupId: string) => ({
+      id: `item-${orderId}`,
+      hotelCheckIn: day(0),
+      hotelCheckOut: day(1),
+      roomsBilled: 0.5,
+      metadata: { splitPairKey: 'ih:tok' },
+      hotelRoomType: { hotel: { name: '美溪海滩酒店' } },
+      order: {
+        id: orderId,
+        roomAssignment: {
+          roomGroups: [
+            {
+              id: groupId,
+              hotelName: '美溪海滩酒店',
+              roomType: '标间',
+              passengerIds: [`${orderId}-p1`],
+              roomFraction: 0.5,
+              splitPairKey: 'g1:tok',
+              orderItemId: `item-${orderId}`,
+            },
+          ],
+        },
+        passengers: [{ gender: orderId === 'o1' ? 'M' : 'F' }],
+      },
+    });
+    const client = fitClient([half('o1', 'g1'), half('o2', 'g1-split')], 1);
+    const res = await checkHotelPhysicalFit('h1', [dayStr(0)], { wholeRooms: 0, solos: [] }, {}, client);
+    expect(res.physicalUsedBefore).toEqual([1]);
+    expect(res.violations).toEqual([]);
+    // 再来 1 间整间 → 2 间 > 包房 1 间 → 照常拒（闸没被放松，只是不再重复计）
+    const oneMore = await checkHotelPhysicalFit(
+      'h1',
+      [dayStr(0)],
+      { wholeRooms: 1, solos: [] },
+      {},
+      client,
+    );
+    expect(oneMore.physicalUsedAfter).toEqual([2]);
+    expect(oneMore.violations).toHaveLength(1);
   });
 
   it('配对语义：physicalRemaining=0 但当晚有同性落单 → 同性拼房客增量 0 → 放行；异性 / 性别未知 → 增量 1 → 拒', async () => {
