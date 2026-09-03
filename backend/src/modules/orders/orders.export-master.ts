@@ -40,6 +40,7 @@ import {
   passengerVisaStatusCell,
   perPaxSettlementByPassenger,
   pnrName,
+  withoutAgentHiddenColumns,
 } from './orders.export-templates.js';
 import { appendHoldOrderSheet, loadHoldExportRows } from './orders.export-hold-orders.js';
 import { GUEST_RECORDED_BY_LABEL } from './orders.service.js';
@@ -299,53 +300,18 @@ const MASTER_COLUMNS: MasterColumn[] = [
   { header: '录入人员', key: 'recordedBy', width: 14 },
 ];
 
-/**
- * 代理视图**不给**的列。三类，缺一都会把不该出岛的东西交到同行手上：
- *
- *   1. 我方内部账与风控：
- *      · orderCost  真实进价（OrderCostItem），与详情页逐项拆价同一条脱敏红线；
- *      · legStatus  带超售座数（这一班被卖穿几座是我方与航司之间的口径，见该列定义处注释）。
- *   2. 护照/身份 PII：生日、乘客类型、性别、国籍、证件类型/编号、签发日、有效期、护照签发地、
- *      出生地。代理要核对的是自己的账目与行程，出行人的证件明细他们下单时本来就有，
- *      导出表没有再回吐一份完整证件档案的理由；这张表一旦转手就是一份成建制的身份信息名单。
- *   3. 纯内部运营信息：飞行次数 / 在订未飞 / 可用次数（我方常旅客权益台账，跨代理跨订单聚合，
- *      会把这位客人在别家下过多少单暴露出来）、分房情况（房控排房结果）、录入时间 /
- *      **录入人员**（录入人员写的是我方下单账号的姓名或邮箱 —— 内部同事的名字不进外发文件）。
- *
- * 列是整列裁掉而不是留表头置空：代理导出没有"列序对外承诺"的历史包袱（本表只有全岗序一套），
- * 留空列反而会让代理以为系统没数据而来问。
- */
-const AGENT_HIDDEN_COLUMN_KEYS: ReadonlySet<keyof MasterRow> = new Set([
-  // 1. 内部账与风控
-  'orderCost',
-  'legStatus',
-  // 2. 护照/身份 PII
-  'dateOfBirth',
-  'passengerType',
-  'gender',
-  'nationality',
-  'documentType',
-  'documentNumber',
-  'issueDate',
-  'expiryDate',
-  'passportIssuePlace',
-  'placeOfBirth',
-  // 3. 纯内部运营信息
-  'flightCount',
-  'pendingTripCount',
-  'availableTrips',
-  'distribution',
-  'recordedAt',
-  'recordedBy',
-]);
-
 /** 按岗位视图筛出可见列（role=all/缺省 → 全部；否则保留 roles 命中或未限定 role 的列）。*/
 export function visibleColumns(role: MasterExportRole): MasterColumn[] {
   if (role === 'all') return MASTER_COLUMNS;
-  // 代理视角：结构同全岗，按 AGENT_HIDDEN_COLUMN_KEYS 裁。保留的是代理自己的账目与业务信息
-  //（代理机构/备注/酒店/姓名/行程/航班/结算价/立减/尾款/到账/单房差/签证四列/开票/清账/退款/订单编号）。
+  // 代理视角：结构同全岗，按**共享**脱敏政策裁 —— 唯一一份口径与理由在
+  // orders.export-templates.ts 的 AGENT_HIDDEN_EXPORT_KEYS（本表与三模板筛选导出共用，
+  // 避免两处各维护一份、这边关了门隔壁还开着）。本表命中其中 20 个 key：
+  // 订单成本 / 航段状态 / 签证公司 / 签证备注（我方供应商与进价）+ 护照身份 10 列
+  // + 飞行次数 / 在订未飞 / 可用次数 / 分房情况 / 录入时间 / 录入人员。
+  // 保留的是代理自己的账目与业务信息（代理机构/备注/酒店/姓名/行程/航班/结算价/立减/
+  // 尾款/到账/单房差/签证金额/签证状态/开票/清账/退款/订单编号）。
   if (role === 'agent') {
-    return MASTER_COLUMNS.filter((c) => !AGENT_HIDDEN_COLUMN_KEYS.has(c.key));
+    return withoutAgentHiddenColumns(MASTER_COLUMNS);
   }
   return MASTER_COLUMNS.filter((c) => !c.roles || c.roles.includes(role));
 }
@@ -647,7 +613,13 @@ export function orderToMasterRows(
       singleRoomDiff: round2(singleRoomDiffOrder / paxCount),
       visaAmount: round2(visaAmountOrder / paxCount),
       visaSupplier,
-      visaStatus: passengerVisaStatusCell({ orderVisaLabel, passenger: p }),
+      // 订单级原值一并传入：「不需要 / 已签证」两档要压过录单联动批量置上的 visaExempt，
+      // 详见 passengerVisaStatusCell 的判定顺序说明。
+      visaStatus: passengerVisaStatusCell({
+        orderVisaLabel,
+        orderVisaStatus: order.visaStatus,
+        passenger: p,
+      }),
       visaNote,
       invoiceStatus,
       settled,

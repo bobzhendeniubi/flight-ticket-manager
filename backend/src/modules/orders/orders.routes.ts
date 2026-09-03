@@ -816,7 +816,10 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // GET /orders/export-templates?template=full|ticketing|visa + listOrders 同款筛选
   // ADMIN/STAFF + AGENT（0831 代理反馈：导出与列表同权）。AGENT 由服务端强制圈到
   // 自己+下级代理的订单（与 listOrders RBAC 同源），勾选导出同受此闸；客户不放行。
-  // 列内容对代理无泄漏：三模板不含订单成本（《全岗可用》成本三列是留空占位）、不含 internalNotes。
+  // 代理导出的列按共享脱敏政策裁（AGENT_HIDDEN_EXPORT_KEYS，与全岗总表 role='agent' 同一份）：
+  // 三模板一律不给护照/身份 PII、我方内部人员（录入人员/录入时间）、我方供应商与成本
+  //（订单成本三列、签证公司、签证备注）、内部运营指标（飞行次数、分房、带超售座数的航段状态）。
+  // ADMIN/STAFF 导出一列不少。模板对代理仍开放，只是列变少（导出与列表同权，不改成 403）。
   app.get(
     '/export-templates',
     {

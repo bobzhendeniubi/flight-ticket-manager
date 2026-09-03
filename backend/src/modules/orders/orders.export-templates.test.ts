@@ -21,11 +21,11 @@ import {
   orderToTicketingRows,
   orderToVisaRows,
   buildOrderContext,
-  VISA_COLUMNS,
-  TICKETING_COLUMNS,
   buildOrderTemplateExportWorkbook,
   pnrName,
   nameWithTitle,
+  AGENT_HIDDEN_EXPORT_KEYS,
+  perPaxSettlementByPassenger,
   FULL_COLUMNS,
   TICKETING_COLUMNS,
   VISA_COLUMNS,
@@ -343,7 +343,8 @@ describe('《全岗可用》full 模版 — 逐列取值/格式', () => {
       expect(r.refundChannel).toBe('');
       expect(r.invoiceStatusManual).toBe('');
       expect(r.visaNote).toBe(''); // 本 fixture noteVisa=null → 留空（有值时填真值，见下）
-      expect(r.distribution).toBe('');
+      // 分销状态（key 叫 distributionStatus，避免与全岗总表的「分房情况」key 撞名）
+      expect(r.distributionStatus).toBe('');
       expect(r.infantWith).toBe('');
       expect(r.temp).toBe('');
       expect(r.costType).toBe('');
@@ -1180,18 +1181,85 @@ describe('《全岗可用》full 模版 — 签证状态按乘客取值', () => 
     expect(rows[2].visaStatus).toBe('材料准备');
   });
 
-  it('订单级「不需要签证」不再一票否决：有个人信息的按人显示，其余才回落订单级', () => {
+  // 订单级「不需要 / 已签证」压过 visaExempt（录单弹窗选这两档时会把全员批量置自备签，
+  // 那个"自动置上"的标记不落库）；只有逐人推进的送签进度才压得过订单头。
+  it('订单级「不需要签证」：exempt 的人跟订单头写「不需要」，有送签进度的仍按进度', () => {
     const order = fixtureMixedVisa();
     (order as unknown as { visaStatus: string }).visaStatus = 'NOT_NEEDED';
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows.map((r) => r.visaStatus)).toEqual(['自备签', '已送签', '不需要']);
+    expect(rows.map((r) => r.visaStatus)).toEqual(['不需要', '已送签', '不需要']);
   });
 
-  it('订单级「已签证」同理：自备签/已送签逐人显示，无个人信息的才写「已签证」', () => {
+  it('订单级「已签证」同理：exempt 的人写「已签证」，已送签的仍写「已送签」', () => {
     const order = fixtureMixedVisa();
     (order as unknown as { visaStatus: string }).visaStatus = 'HAS_VISA';
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows.map((r) => r.visaStatus)).toEqual(['自备签', '已送签', '已签证']);
+    expect(rows.map((r) => r.visaStatus)).toEqual(['已签证', '已送签', '已签证']);
+  });
+
+  // ── 录单联动把全员置 exempt 之后，「不需要」这个结论不能被吃掉 ────────────────
+  it('「不需要签证」+ 全员联动置 exempt 且无送签进度 → 全员「不需要」，不是全员「自备签」', () => {
+    const order = fixtureMixedVisa();
+    const o = order as unknown as {
+      visaStatus: string;
+      passengers: Array<Record<string, unknown>>;
+    };
+    o.visaStatus = 'NOT_NEEDED';
+    o.passengers = o.passengers.map((p) => ({
+      ...p,
+      visaExempt: true,
+      visaSubmissionStatus: 'PENDING',
+    }));
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    expect(rows.map((r) => r.visaStatus)).toEqual(['不需要', '不需要', '不需要']);
+  });
+
+  it('「不需要签证」+ 某人已送签 → 该人「已送签」（逐人事实压过订单头）', () => {
+    const order = fixtureMixedVisa();
+    const o = order as unknown as {
+      visaStatus: string;
+      passengers: Array<Record<string, unknown>>;
+    };
+    o.visaStatus = 'NOT_NEEDED';
+    o.passengers = o.passengers.map((p) => ({ ...p, visaExempt: true, visaSubmissionStatus: 'PENDING' }));
+    o.passengers[1] = { ...o.passengers[1], visaSubmissionStatus: 'CONFIRMED' };
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    expect(rows.map((r) => r.visaStatus)).toEqual(['不需要', '已送签', '不需要']);
+  });
+
+  it('「已签证」四人单（两人 exempt 无进度 + 两人已送签）→ 已签证/已签证/已送签/已送签', () => {
+    const order = fixtureMixedVisa();
+    const o = order as unknown as {
+      visaStatus: string;
+      passengers: Array<Record<string, unknown>>;
+    };
+    o.visaStatus = 'HAS_VISA';
+    const [base] = o.passengers;
+    o.passengers = [
+      { ...base, id: 'q1', visaExempt: true, visaSubmissionStatus: 'PENDING' },
+      { ...base, id: 'q2', visaExempt: true, visaSubmissionStatus: 'PENDING' },
+      { ...base, id: 'q3', visaExempt: false, visaSubmissionStatus: 'CONFIRMED' },
+      { ...base, id: 'q4', visaExempt: false, visaSubmissionStatus: 'CONFIRMED' },
+    ];
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    expect(rows.map((r) => r.visaStatus)).toEqual(['已签证', '已签证', '已送签', '已送签']);
+  });
+
+  it('「需要签证」+ 某人 exempt → 该人「自备签」，其余「需要」（逐人手勾的自备签照旧）', () => {
+    const order = fixtureMixedVisa();
+    const o = order as unknown as {
+      visaStatus: string;
+      passengers: Array<Record<string, unknown>>;
+    };
+    o.visaStatus = 'NEEDED';
+    o.passengers = o.passengers.map((p) => ({
+      ...p,
+      visaExempt: false,
+      visaSubmissionStatus: 'PENDING',
+    }));
+    o.passengers[1] = { ...o.passengers[1], visaExempt: true };
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    expect(rows.map((r) => r.visaStatus)).toEqual(['需要', '自备签', '需要']);
   });
 
   it('老数据（乘客无送签字段）→ 整列沿用订单级/履约任务文案，与改动前一致', () => {
@@ -1275,6 +1343,32 @@ describe('结算价格按乘客 — 《全岗可用》与《签证专用》', ()
     const order = fixtureRoundTrip();
     const rows = orderToFullRows(order, buildOrderContext(order));
     expect(rows.map((r) => r.settlePrice)).toEqual([1268, 1268]); // 2536 / 2
+  });
+
+  // 尾差归属确定化：权威算法把分级余数（那一分钱）兜给数组**最后一位**，而 passengers
+  // 的查询没有 orderBy —— 行序会随任何一次 UPDATE 漂移。不排序的话同一张单两次导出，
+  // 那一分钱可能换到别人头上，财务对数时看着像有人偷偷改过价。
+  it('乘客乱序传入 → 每人份额完全相同（那一分钱尾差不换人）', () => {
+    const build = (ids: string[]): Parameters<typeof perPaxSettlementByPassenger>[0] => ({
+      total: 1000, // 3 人除不尽：100000 分 ÷ 3 → 余 1 分
+      adjustmentCny: 0,
+      passengers: ids.map((id) => ({ id })),
+      items: [],
+    });
+    const ordered = perPaxSettlementByPassenger(build(['p1', 'p2', 'p3']));
+    for (const ids of [
+      ['p3', 'p1', 'p2'],
+      ['p2', 'p3', 'p1'],
+      ['p3', 'p2', 'p1'],
+    ]) {
+      const shuffled = perPaxSettlementByPassenger(build(ids));
+      for (const id of ids) expect(shuffled.get(id)).toBe(ordered.get(id));
+    }
+    // 尾差恒定落在 id 最大的那位；合计仍守恒
+    expect(ordered.get('p1')).toBe(333.33);
+    expect(ordered.get('p2')).toBe(333.33);
+    expect(ordered.get('p3')).toBe(333.34);
+    expect([...ordered.values()].reduce((s, v) => s + v, 0)).toBeCloseTo(1000, 2);
   });
 });
 
@@ -1360,5 +1454,266 @@ describe('航段状态列 — 《全岗可用》与《签证专用》', () => {
     };
     const [row] = orderToFullRows(order, buildOrderContext(order, { redactLegStatus: true }));
     expect(row.legStatus).toBe('');
+  });
+});
+
+// ── 代理导出脱敏：三模板按共享政策裁列 ──────────────────────────────────────
+// 全岗总表（orders.export-master.ts）早先已经把护照 PII / 内部人员 / 成本 / 内部指标
+// 从代理视角裁掉了，隔壁这三张表却照旧发全量 —— 同一批筛选、同一个代理身份能调，
+// 等于刚关上的门旁边还开着。现在两处共用 AGENT_HIDDEN_EXPORT_KEYS 一份政策。
+// 内部导出（agentScope=null，ADMIN/STAFF）**一列都不能少**，每条用例都反向锁住。
+describe('代理导出（agentScope 非空）— 三模板按共享脱敏政策裁列', () => {
+  /**
+   * 假 client。order.findMany 按 where 形态分流（与「飞行次数取数」那组同款）：
+   * 带 passengers 条件的是快照未命中时的现算兜底 → 给空。
+   */
+  function fakeClient(orders: OrderForTemplateExport[]): PrismaClient {
+    return {
+      order: {
+        findMany: vi.fn(async (args?: { where?: Record<string, unknown> }) =>
+          args?.where?.passengers ? [] : orders,
+        ),
+      },
+      legacyTicket: { findMany: vi.fn().mockResolvedValue([]) },
+      travelerProfile: {
+        count: vi.fn().mockResolvedValue(42),
+        aggregate: vi.fn().mockResolvedValue({ _max: { refreshedAt: new Date() } }),
+        findMany: vi.fn().mockResolvedValue([]),
+      },
+      travelerBenefitRedemption: { groupBy: vi.fn().mockResolvedValue([]) },
+    } as unknown as PrismaClient;
+  }
+
+  const SHEET_NAME = { full: '全岗可用', ticketing: '票务专用', visa: '签证专用' } as const;
+
+  async function loadSheet(
+    template: keyof typeof SHEET_NAME,
+    agentScope: string[] | null,
+  ): Promise<ExcelJS.Worksheet> {
+    const buf = await buildOrderTemplateExportWorkbook(
+      { template } as Parameters<typeof buildOrderTemplateExportWorkbook>[0],
+      fakeClient([fixtureRoundTrip()]),
+      { agentScope },
+    );
+    const wb = new ExcelJS.Workbook();
+    await wb.xlsx.load(buf as unknown as Parameters<typeof wb.xlsx.load>[0]);
+    const ws = wb.getWorksheet(SHEET_NAME[template]);
+    if (!ws) throw new Error(`${SHEET_NAME[template]} sheet 不存在`);
+    return ws;
+  }
+
+  /** 读第 n 行的表头/单元格文本（合并单元格读回的是主格文本）。*/
+  function rowText(ws: ExcelJS.Worksheet, row = 1): string[] {
+    const cells: string[] = [];
+    ws.getRow(row).eachCell((cell, col) => (cells[col - 1] = String(cell.value ?? '')));
+    return cells;
+  }
+
+  /** 越文表头带换行（"Số hộ chiếu (*)\n护照号"），按片段匹配。*/
+  function hasHeaderFragment(headers: string[], fragment: string): boolean {
+    return headers.some((h) => h.includes(fragment));
+  }
+
+  // 《全岗可用》两行表头：非分组列纵向合并；末尾三列本来并入「订单成本」分组。
+  // 代理视角成本三列整组消失 —— 分组标题也不能留在首行，且列不能错位。
+  describe('《全岗可用》full', () => {
+    it('代理视角：护照 PII / 内部人员 / 供应商与成本 / 内部指标列全部不在表头里', async () => {
+      const headers = rowText(await loadSheet('full', ['agent-1']));
+      for (const h of [
+        // 护照/身份 PII
+        '乘客生日',
+        '乘客类型',
+        '性别',
+        '国籍',
+        '证件类型',
+        '证件编号',
+        '签发日期',
+        '有效日期',
+        '护照签发地',
+        '出生地',
+        // 我方内部人员与时间戳
+        '录入时间',
+        '录入人员',
+        // 我方供应商与成本（成本三列 + 分组标题）
+        '签证公司',
+        '签证备注',
+        '成本类型',
+        '子类型',
+        '金额',
+        '订单成本',
+        // 内部运营指标与风控
+        '飞行次数',
+        '航段状态',
+      ]) {
+        expect(headers).not.toContain(h);
+      }
+    });
+
+    it('代理视角：自己的账目与业务信息照旧保留（不是把表裁空）', async () => {
+      const headers = rowText(await loadSheet('full', ['agent-1']));
+      for (const h of [
+        '序号',
+        '代理机构',
+        '备注',
+        '酒店类型',
+        '中文名称',
+        '乘客姓名',
+        '纯拼音名',
+        '出发(往返)日期',
+        '航班号',
+        '结算价格',
+        '尾款金额',
+        '订单状态',
+        '签证状态',
+        '订单编号',
+      ]) {
+        expect(headers).toContain(h);
+      }
+      // 57 列裁掉 19 列（PII 10 + 内部人员 2 + 供应商/成本 5 + 内部指标 2）
+      expect(headers).toHaveLength(FULL_COLUMNS.length - 19);
+    });
+
+    it('代理视角：两行表头仍成立，列不错位（末列是「临时」、数据从第 3 行起且逐列对得上）', async () => {
+      const ws = await loadSheet('full', ['agent-1']);
+      const headers = rowText(ws, 1);
+      // 成本三列没了 → 首行末尾不再是分组标题，而是最后一个叶子列
+      expect(headers[headers.length - 1]).toBe('临时');
+      // 纵向合并后第 2 行读回与第 1 行同文本（合并主格），数据行从第 3 行开始
+      expect(rowText(ws, 2)[0]).toBe('序号');
+      const first = rowText(ws, 3);
+      expect(first[0]).toBe('1');
+      expect(first[headers.indexOf('代理机构')]).toBe('世途3');
+      expect(first[headers.indexOf('乘客姓名')]).toBe('WANG/LIANBO MR');
+      expect(first[headers.indexOf('结算价格')]).toBe('1268');
+      // 末列「临时」恒空 —— 若列裁剪把行数据写错位，这里会串进别的值
+      expect(first[headers.length - 1] ?? '').toBe('');
+    });
+
+    it('内部导出（agentScope=null）一列不少：57 列俱在，「订单成本」分组表头照旧', async () => {
+      const ws = await loadSheet('full', null);
+      const row1 = rowText(ws, 1);
+      const row2 = rowText(ws, 2);
+      // 叶子表头 = 首行前 54 列 + 第二行末尾三列
+      expect([...row1.slice(0, FULL_COLUMNS.length - 3), ...row2.slice(-3)]).toEqual(FULL_HEADERS);
+      expect(row1[FULL_COLUMNS.length - 3]).toBe('订单成本');
+      for (const h of ['证件编号', '录入人员', '签证公司', '签证备注', '飞行次数', '航段状态']) {
+        expect(row1).toContain(h);
+      }
+    });
+  });
+
+  describe('《票务专用》ticketing', () => {
+    it('代理视角：证件/签证/住址/性别/PTC/出生日期等身份列全裁，只留姓名与代理备注', async () => {
+      const headers = rowText(await loadSheet('ticketing', ['agent-1']));
+      for (const h of [
+        'PTC',
+        'Gender',
+        'Date of Birth',
+        'Passport Number',
+        'Passport Nationality',
+        'Passport Issue Country',
+        'Passport Expiry Date',
+        'Place of Birth',
+        'Visa Number',
+        'Visa Type',
+        'Visa Issue Date',
+        'Visa Place of Issue',
+        'Visa Country of Application',
+        'Visa Expiry Date',
+        'Address Type',
+        'Address Country',
+        'Address Details',
+        'Address City',
+        'Address State',
+        'Address Zip Code',
+      ]) {
+        expect(headers).not.toContain(h);
+      }
+      expect(headers).toEqual([
+        '代理',
+        '备注',
+        'Last Name',
+        'First Name and Middle Name',
+        'Title',
+        'Passport Last Name',
+        'Passport First Name',
+      ]);
+    });
+
+    it('代理视角：数据行跟着裁，护照号不会串到别的列里', async () => {
+      const ws = await loadSheet('ticketing', ['agent-1']);
+      const headers = rowText(ws, 1);
+      const first = rowText(ws, 2);
+      expect(first[headers.indexOf('Last Name')]).toBe('WANG');
+      // fixture 的护照号（EN7208993）在整行里根本不出现
+      expect(first.join('|')).not.toContain('EN7208993');
+    });
+
+    it('内部导出（agentScope=null）一列不少：27 列航司格式原样', async () => {
+      const headers = rowText(await loadSheet('ticketing', null));
+      expect(headers).toEqual(OLD_TICKETING_HEADERS);
+    });
+  });
+
+  describe('《签证专用》visa', () => {
+    it('代理视角：护照号/性别/出生日期/国籍/职业/工作地址/签发有效期/签证公司备注/航段状态全裁', async () => {
+      const headers = rowText(await loadSheet('visa', ['agent-1']));
+      for (const fragment of [
+        'Số hộ chiếu',
+        'Giới tính',
+        'Ngày, tháng, năm sinh',
+        'Quốc tịch hiện nay',
+        'Quốc tịch gốc',
+        'Nghề nghiệp',
+        'Nơi làm việc',
+      ]) {
+        expect(hasHeaderFragment(headers, fragment)).toBe(false);
+      }
+      for (const h of ['签发日期', '有效日期', '签证公司', '签证备注', '航段状态']) {
+        expect(headers).not.toContain(h);
+      }
+      // 代理仍拿得到自己的名单与账目（10 列）
+      expect(headers).toEqual([
+        'STT',
+        '代理机构',
+        '备注信息',
+        '酒店类型',
+        '结算价格',
+        '到账金额',
+        '尾款金额',
+        '中文姓名',
+        'Họ và tên (*)\n姓名',
+        '出发日期',
+      ]);
+    });
+
+    it('代理视角：数据行跟着裁，护照号不会串到别的列里', async () => {
+      const ws = await loadSheet('visa', ['agent-1']);
+      const headers = rowText(ws, 1);
+      const first = rowText(ws, 2);
+      expect(first[0]).toBe('1');
+      expect(first[headers.indexOf('中文姓名')]).toBe('王连波');
+      expect(first.join('|')).not.toContain('EN7208993');
+    });
+
+    it('内部导出（agentScope=null）一列不少：22 列俱在，含越文身份列', async () => {
+      const headers = rowText(await loadSheet('visa', null));
+      expect(headers).toEqual(VISA_COLUMNS.map((c) => c.header));
+      expect(hasHeaderFragment(headers, 'Số hộ chiếu')).toBe(true);
+      for (const h of ['签发日期', '有效日期', '签证公司', '航段状态']) {
+        expect(headers).toContain(h);
+      }
+    });
+  });
+
+  it('共享政策集合覆盖三模板的同性质列（key 命名不一致也按语义收齐）', () => {
+    // 各模板里"同一件事"的不同 key 都在集合里 —— 少一个就等于那张表漏一列出去。
+    for (const key of ['documentNumber', 'passportNumber', 'dob', 'dateOfBirth', 'recordedBy']) {
+      expect(AGENT_HIDDEN_EXPORT_KEYS.has(key)).toBe(true);
+    }
+    // 代理自己的账目不在裁列名单里（别把表裁成空壳）
+    for (const key of ['settlePrice', 'balanceDue', 'orderNumber', 'agency', 'visaStatus']) {
+      expect(AGENT_HIDDEN_EXPORT_KEYS.has(key)).toBe(false);
+    }
   });
 });

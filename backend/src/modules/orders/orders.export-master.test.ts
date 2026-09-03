@@ -707,8 +707,11 @@ describe('visibleColumns（role 裁列）', () => {
 
   it('agent（代理）裁掉内部账/风控 + 护照 PII + 纯内部运营列；代理自己的账目与业务信息保留', () => {
     const headers = visibleColumns('agent').map((c) => c.header);
-    // 1. 内部账与风控
+    // 1. 内部账与成本
     expect(headers).not.toContain('订单成本');
+    // 签证公司 = 我方签证供应商；签证备注实际写的是供应商 + 进价 —— 与订单成本同性质。
+    expect(headers).not.toContain('签证公司');
+    expect(headers).not.toContain('签证备注');
     // 航段状态会写成「回程已恢复（超售 2 座）」—— 超售是我方与航司之间的内部风控口径。
     expect(headers).not.toContain('航段状态');
     // 2. 护照/身份 PII（成建制的身份信息名单不随导出出岛）
@@ -738,8 +741,8 @@ describe('visibleColumns（role 裁列）', () => {
     expect(headers).toContain('签证状态');
     expect(headers).toContain('乘客中文名');
     expect(headers).toContain('订单编号');
-    // 共裁 18 列：agent 列数 = all 列数 - 18
-    expect(visibleColumns('agent')).toHaveLength(visibleColumns('all').length - 18);
+    // 共裁 20 列：agent 列数 = all 列数 - 20（原 18 列 + 签证公司/签证备注两列供应商与进价）
+    expect(visibleColumns('agent')).toHaveLength(visibleColumns('all').length - 20);
   });
 
   it('所有视图都保留通用列（序号/代理机构/乘客中文名/订单编号）', () => {
@@ -1252,29 +1255,51 @@ describe('全岗总表 — 签证状态按乘客取值', () => {
     expect(orderToMasterRows(order)[2].visaStatus).toBe('材料准备');
   });
 
-  it('订单级「不需要签证」不再一票否决：有个人信息的按人显示，其余才回落订单级', () => {
+  // 订单级「不需要 / 已签证」压过 visaExempt：录单弹窗选这两档时会把该单全员批量置
+  // visaExempt=true（"自动置上"的标记不落库），先看 visaExempt 会把每一张「不需要签证」
+  // 的单整单导成「自备签」—— 业务结论被换成了另一件事。只有逐人推进的送签进度压得过订单头。
+  it('订单级「不需要签证」：exempt 的人跟订单头写「不需要」，有送签进度的仍按进度', () => {
     const order = fixtureMixedVisa();
     (order as unknown as { visaStatus: string }).visaStatus = 'NOT_NEEDED';
     expect(orderToMasterRows(order).map((r) => r.visaStatus)).toEqual([
-      '自备签',
+      '不需要',
       '已送签',
       '不需要',
     ]);
   });
 
-  it('订单级「已签证」同理：自备签/已送签逐人显示，无个人信息的才写「已签证」', () => {
+  it('订单级「已签证」同理：exempt 的人写「已签证」，已送签的仍写「已送签」', () => {
     const order = fixtureMixedVisa();
     (order as unknown as { visaStatus: string }).visaStatus = 'HAS_VISA';
     expect(orderToMasterRows(order).map((r) => r.visaStatus)).toEqual([
-      '自备签',
+      '已签证',
       '已送签',
       '已签证',
     ]);
   });
 
-  // 运营反馈的四人单：订单头「已签证」，两人录单时标了自备签（逐人减了钱）、两人由我方送签
-  // 且已送签。改前一票否决把四行全写成「已签证」，谁自备签、谁办到哪一步在表上全看不见。
-  it('订单头「已签证」的四人单：两人自备签 + 两人已送签，四行不再是同一个词', () => {
+  it('「不需要签证」+ 全员联动置 exempt 且无送签进度 → 全员「不需要」，不是全员「自备签」', () => {
+    const order = fixtureMixedVisa();
+    const o = order as unknown as {
+      visaStatus: string;
+      passengers: Array<Record<string, unknown>>;
+    };
+    o.visaStatus = 'NOT_NEEDED';
+    o.passengers = o.passengers.map((p) => ({
+      ...p,
+      visaExempt: true,
+      visaSubmissionStatus: 'PENDING',
+    }));
+    expect(orderToMasterRows(order).map((r) => r.visaStatus)).toEqual([
+      '不需要',
+      '不需要',
+      '不需要',
+    ]);
+  });
+
+  // 运营反馈的四人单：订单头「已签证」，两人 exempt 且无送签进度、两人由我方送签且已送签。
+  // 要的是两组分得开：前两人跟订单头写「已签证」，后两人按各自进度写「已送签」。
+  it('订单头「已签证」的四人单：两人已签证 + 两人已送签，两组仍分得开', () => {
     const order = fixtureMixedVisa();
     const o = order as unknown as {
       visaStatus: string;
@@ -1289,8 +1314,8 @@ describe('全岗总表 — 签证状态按乘客取值', () => {
       { ...submitted, id: 'p4', documentNumber: 'E33334444' },
     ];
     expect(orderToMasterRows(order).map((r) => r.visaStatus)).toEqual([
-      '自备签',
-      '自备签',
+      '已签证',
+      '已签证',
       '已送签',
       '已送签',
     ]);
@@ -1429,7 +1454,9 @@ describe('全岗总表 — 结算价格按乘客取值', () => {
     // 基准每人 = (3792 + 960) / 4 = 1188 → 自备签两人 828、送签两人 1068，合计 3792
     expect(rows.map((r) => r.settlePrice)).toEqual([828, 828, 1068, 1068]);
     expect(rows.reduce((s, r) => s + r.settlePrice, 0)).toBe(3792);
-    expect(rows.map((r) => r.visaStatus)).toEqual(['自备签', '自备签', '已送签', '已送签']);
+    // 订单头是「已签证」→ 前两人（exempt 且无送签进度）跟订单头写「已签证」，
+    // 后两人按各自送签进度写「已送签」；金额仍逐人可解释（自备签那两位少收 360）。
+    expect(rows.map((r) => r.visaStatus)).toEqual(['已签证', '已签证', '已送签', '已送签']);
   });
 
   it('售后费（adjustmentCny）计入应收：与详情页每人结算价、尾款列同源', () => {

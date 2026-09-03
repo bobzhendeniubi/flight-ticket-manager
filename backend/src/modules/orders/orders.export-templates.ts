@@ -13,8 +13,10 @@
 import ExcelJS from 'exceljs';
 import { localDateISO } from '../../lib/flight-time.js';
 import { businessDateISO, businessDateTimeSec } from '../../lib/business-time.js';
-import type { Prisma, PrismaClient } from '@prisma/client';
+import type { Prisma, PrismaClient, VisaRequirement } from '@prisma/client';
 import { OrderItemKind, OrderStatus } from '@prisma/client';
+// 订单级「明确不需要我方代办（NOT_NEEDED / HAS_VISA）」的唯一判定口径，与建签证任务共用。
+import { orderVisaStatusExplicitlyNotNeeded } from './visa-need.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 // 「结算价格」按人取值的权威口径：每人份额端口（详见 perPaxSettlementByPassenger）。
 import { computePerPaxShares } from './per-pax-share.js';
@@ -48,6 +50,94 @@ export const ORDER_TEMPLATE_LABEL: Record<OrderExportTemplate, string> = {
   ticketing: '票务专用',
   visa: '签证专用',
 };
+
+/**
+ * ── 代理导出脱敏政策（**全站唯一一份**）────────────────────────────────────
+ *
+ * 口径：**代理导出的任何多单表格，一律不带**护照/身份 PII、我方内部人员、
+ * 我方供应商与成本、内部运营指标。适用面：本文件三模板（全岗可用/票务专用/签证专用）
+ * 与全岗总表（orders.export-master.ts 的 `visibleColumns('agent')`）—— 两处引用同一个
+ * 集合，避免"这边关了门、隔壁还开着"（全岗总表先关、三模板漏关，正是本次补的洞）。
+ *
+ * 四类，缺一都会把不该出岛的东西交到同行手上：
+ *
+ *   1. 我方内部账与成本：订单成本（真实进价）、《全岗可用》末尾成本三列（现为留空占位，
+ *      但语义是成本，不给代理留这个位）、签证公司（我方签证供应商）、签证备注
+ *      （实际数据里写的是供应商 + 进价这类内容）。
+ *   2. 内部风控：航段状态会写成「回程已恢复（超售 N 座）」—— 这一班被卖穿几座是我方
+ *      与航司之间的口径，交到代理手上等于把班次卖到什么程度告诉同行。
+ *   3. 护照/身份 PII：生日、乘客类型/PTC、性别、国籍、证件类型/编号、签发日/地、有效期、
+ *      出生地、职业/工作地址、签证证件明细、住址。代理要核对的是自己的账目与行程，
+ *      出行人的证件明细他们下单时本来就有，导出表没有再回吐一份完整证件档案的理由；
+ *      这张表一旦转手就是一份成建制的身份信息名单。
+ *   4. 纯内部运营信息：飞行次数 / 在订未飞 / 可用次数（我方常旅客权益台账，跨代理跨订单
+ *      聚合，会把这位客人在别家下过多少单暴露出来）、分房情况（房控排房结果）、
+ *      录入时间 / **录入人员**（录入人员写的是我方下单账号的姓名或邮箱 —— 内部同事的
+ *      名字不进外发文件）。
+ *
+ * 集合装的是**语义 key 的并集**：各表同一含义的列命名不一致（护照号在《签证专用》/
+ * 《票务专用》叫 passportNumber、在《全岗可用》叫 documentNumber），全部塞进来按 key
+ * 精确匹配裁；某张表没有这个 key 就自然跳过。
+ *
+ * 列是整列裁掉而不是留表头置空：留空列会让代理以为系统没数据而来问。
+ * 代理仍可用这三个模板（导出与列表同权，不改成 403），只是列变少。
+ */
+export const AGENT_HIDDEN_EXPORT_KEYS: ReadonlySet<string> = new Set([
+  // 1. 内部账与成本
+  'orderCost', // 全岗总表·订单成本
+  'costType', // 《全岗可用》订单成本·成本类型
+  'costSubType', // 《全岗可用》订单成本·子类型
+  'costAmount', // 《全岗可用》订单成本·金额
+  'visaSupplier', // 签证公司 = 我方签证供应商
+  'visaNote', // 签证备注（实际内容含供应商与进价）
+  // 2. 内部风控
+  'legStatus', // 航段状态（带超售座数）
+  // 3. 护照/身份 PII
+  'dateOfBirth',
+  'dob', // 《票务专用》Date of Birth
+  'passengerType',
+  'ptc', // 《票务专用》PTC（乘客类型的航司写法）
+  'gender',
+  'nationality',
+  'nationalityNow', // 《签证专用》现国籍
+  'nationalityOrigin', // 《签证专用》原国籍
+  'passportNationality', // 《票务专用》Passport Nationality
+  'documentType',
+  'documentNumber',
+  'passportNumber', // 《签证专用》/《票务专用》护照号
+  'issueDate',
+  'passportIssuePlace',
+  'passportIssueCountry', // 《票务专用》此列填的是签发地文本
+  'expiryDate',
+  'passportExpiry', // 《票务专用》Passport Expiry Date
+  'placeOfBirth',
+  'occupation', // 《签证专用》职业
+  'workplace', // 《签证专用》工作地址
+  'visaNumber', // 以下为《票务专用》签证证件明细
+  'visaType',
+  'visaIssueDate',
+  'visaPlaceOfIssue',
+  'visaCountryOfApplication',
+  'visaExpiry',
+  'addressType', // 以下为《票务专用》住址明细
+  'addressCountry',
+  'addressDetails',
+  'addressCity',
+  'addressState',
+  'addressZip',
+  // 4. 纯内部运营信息
+  'flightCount',
+  'pendingTripCount',
+  'availableTrips',
+  'distribution', // 全岗总表·分房情况（房控排房结果）
+  'recordedAt',
+  'recordedBy',
+]);
+
+/** 按上面的政策裁列（列序不变，只少列）。三模板与全岗总表共用。*/
+export function withoutAgentHiddenColumns<T extends { key: string }>(columns: readonly T[]): T[] {
+  return columns.filter((c) => !AGENT_HIDDEN_EXPORT_KEYS.has(c.key));
+}
 
 const PAYMENT_METHOD_LABEL: Record<string, string> = {
   WECHAT_PAY: '微信',
@@ -110,30 +200,47 @@ export function orderVisaStatusLabel(
  * 为什么不能整单一个值（运营反馈）：一张单里，自备签的客人导出来跟着整单走、
  * 订单头一表态就全员一个词，复查的同事没法从表上分辨谁办到哪一步。
  *
- * 判定顺序（**先按人、订单级只做兜底**）：
- *   1. 该乘客 visaExempt=true → 「自备签」（不进送签名单，与签证台过滤同口径）。
- *   2. 该乘客送签进度已推进（材料准备 / 已送签）→ 用签证台同一份文案。
- *   3. 其余（待处理 / 老数据无该字段）→ 才回落订单级文案。
+ * 判定顺序（三档，谁更能代表这位乘客谁在前）：
+ *   1. 该乘客送签进度已推进（IN_PROGRESS 材料准备 / CONFIRMED 已送签）→ 用签证台同一份文案。
+ *      这是签证岗逐人推着走出来的事实，最精确，压过任何整单结论。
+ *   2. 订单级明确「不需要(NOT_NEEDED) / 已签证(HAS_VISA)」→ 按订单头文案（不需要 / 已签证）。
+ *   3. 其余（订单级 NEEDED/E_VISA/未表态）：visaExempt=true → 「自备签」；否则回落订单级文案。
  *
- * 订单级「不需要签证 / 已签证」为什么不再一票否决（运营反馈的四人单）：订单头是「已签证」、
- * 其中两人 visaExempt=true（录单时按自备签逐人减了钱）、另两人由我方送签且已送签 ——
- * 一票否决把这四个人全写成「已签证」，那两位自备签的钱怎么减的、另两位办到哪一步，表上全看不见。
- * 自备签与送签进度都是**逐人落库的事实**（自备签同时是定价输入，送签进度由签证台逐人推进），
- * 比订单头这个整单结论更精确；订单头只在这位乘客没有任何个人信息时才代表他。
+ * 第 2 档为什么必须排在「自备签」前面（否则整个「不需要」结论会被吃掉）：
+ * 录单弹窗在订单级选「不需要签证 / 已签证」时，会把该单**所有**出行人批量置 visaExempt=true
+ *（前端那个"自动置上"的标记不落库，导出侧分不出是联动置的还是逐人手勾的）。若先看 visaExempt，
+ * 每一张「不需要签证」的单都会全员导成「自备签」—— 把「本来就免签/不涉签」这个业务结论
+ * 整个换成了另一件事（客人自己办了签证）。这两档订单头既然已明说签证岗无事可做
+ *（与建任务口径同源：visa-need.ts 的 orderVisaStatusExplicitlyNotNeeded），
+ * 单内那批 visaExempt 与订单头同义，直接用订单头文案更准。
  *
- * 副作用（需知会运营）：订单头选了「不需要签证 / 已签证」、个别乘客却留有送签进度的单，
- * 这些人现在按各自的进度显示，不再被整单结论盖住 —— 这正是要暴露的矛盾，不是回归。
+ * 反馈里那张四人单（订单头 HAS_VISA；两人 exempt 且无进度、另两人 CONFIRMED）
+ * 仍按 已签证 / 已签证 / 已送签 / 已送签 导出 —— 两组照旧分得开，正是运营要的。
+ *
+ * 需知会运营的口径点：订单头选了「不需要 / 已签证」、个别乘客却留有送签进度的单，
+ * 这些人按各自进度显示（第 1 档），不被整单结论盖住 —— 这正是要暴露的矛盾，不是回归。
  */
 export function passengerVisaStatusCell(input: {
   /** 订单级文案（由 orderVisaStatusLabel 在行循环外算好传入）—— 乘客无个人信息时的兜底。*/
   orderVisaLabel: string;
+  /**
+   * 订单级 `Order.visaStatus` **原值**（不是文案）。必须传原值：靠中文文案反推档位
+   * 一改文案就散架，且 orderVisaLabel 在 visaStatus 为空时装的是履约任务文案。
+   */
+  orderVisaStatus?: VisaRequirement | null;
   passenger: { visaExempt?: boolean | null; visaSubmissionStatus?: string | null };
 }): string {
-  if (input.passenger.visaExempt === true) return VISA_EXEMPT_LABEL;
+  // 1. 签证台逐人推进的进度（PENDING 不算推进）
   const submission = input.passenger.visaSubmissionStatus;
   if (submission && submission !== 'PENDING') {
     return VISA_SUBMISSION_LABEL[submission] ?? input.orderVisaLabel;
   }
+  // 2. 订单头明确「不需要 / 已签证」—— 与签证任务判定同一个口径函数
+  if (orderVisaStatusExplicitlyNotNeeded(input.orderVisaStatus)) {
+    return input.orderVisaLabel;
+  }
+  // 3. 逐人手勾的自备签（此时订单头是 NEEDED/E_VISA/未表态，不存在联动批量置的情况）
+  if (input.passenger.visaExempt === true) return VISA_EXEMPT_LABEL;
   return input.orderVisaLabel;
 }
 
@@ -177,7 +284,12 @@ export function perPaxSettlementByPassenger(order: {
   const { rows } = computePerPaxShares({
     totalCny: dec(order.total),
     adjustmentCny: order.adjustmentCny ?? 0,
-    passengerIds: order.passengers.map((p) => p.id),
+    // 按 id 升序传入：computePerPaxShares 把分级余数（那一分钱）兜给**数组最后一位**，
+    // 而 order.passengers 的查询没有 orderBy —— 行序会随任何一次 UPDATE 漂移，
+    // 同一张单两次导出那一分钱可能换人头，财务对数时看着像有人改过价。
+    // 只排序、不动算法（口径仍在 per-pax-share.ts，与前端逐分对拍）；
+    // 返回的是 Map，输出顺序与本处排序无关。
+    passengerIds: [...order.passengers.map((p) => p.id)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
     netByPassenger: new Map(
       Object.entries(byPassenger).map(([pid, bucket]) => [pid, bucket.netCny]),
     ),
@@ -381,7 +493,9 @@ export function buildOrderContext(
    * 脱敏开关。`redactLegStatus` = 这是一次**代理导出**（路由解析出 agentScope 时为真）：
    * 「航段状态」会写成「回程已恢复（超售 2 座）」—— 超售是我方与航司之间的内部风控口径，
    * 交到代理手里等于把这一班被卖穿到什么程度告诉同行。
-   * 置空而不是删列：三个模板的列序是对外承诺过的（运营拿它对旧表），少一列会让下游全部错位。
+   * 代理导出这一列现在在工作簿层面整列裁掉（见 AGENT_HIDDEN_EXPORT_KEYS），本开关是第二道闸：
+   * 行数据本身也不带这段文案，任何绕过列裁剪的取数路径都拿不到超售座数。
+   * 内部导出（ADMIN/STAFF）不受影响，列与内容照旧。
    */
   opts?: { redactLegStatus?: boolean },
 ): OrderContext {
@@ -524,7 +638,10 @@ interface FullRow {
   cabin: string; // 舱位等级
   dateOfBirth: string; // 乘客生日 DD-MM-YYYY
   passengerType: string; // 乘客类型（旧模版原样枚举 ADULT/CHILD/INFANT）
-  distribution: string; // 分销状态 — 暂无数据，留空
+  // 分销状态 — 暂无数据，留空。key 特意**不叫** distribution：全岗总表那边
+  // distribution 是「分房情况」（房控排房结果、代理不可见），共用一份脱敏 key 集合时
+  // 同名会把这一列一起误裁。
+  distributionStatus: string;
   gender: string; // 性别（旧模版原样 M/F）
   nationality: string; // 国籍 ISO alpha-3
   documentType: string; // 证件类型（P=护照）
@@ -598,7 +715,7 @@ export const FULL_COLUMNS: Array<{
   { header: '舱位等级', key: 'cabin', width: 10 },
   { header: '乘客生日', key: 'dateOfBirth', width: 12 },
   { header: '乘客类型', key: 'passengerType', width: 8 },
-  { header: '分销状态', key: 'distribution', width: 8 },
+  { header: '分销状态', key: 'distributionStatus', width: 8 },
   { header: '性别', key: 'gender', width: 6 },
   { header: '国籍', key: 'nationality', width: 8 },
   { header: '证件类型', key: 'documentType', width: 8 },
@@ -615,9 +732,9 @@ export const FULL_COLUMNS: Array<{
   { header: '金额', key: 'costAmount', width: 10 },
 ];
 
-/** 末尾「订单成本」分组表头及其覆盖的子列数（成本类型/子类型/金额）。*/
+/** 末尾「订单成本」分组表头及其覆盖的子列（成本类型/子类型/金额）。*/
 const FULL_COST_GROUP_HEADER = '订单成本';
-const FULL_COST_GROUP_SPAN = 3;
+const FULL_COST_GROUP_KEYS: ReadonlySet<string> = new Set(['costType', 'costSubType', 'costAmount']);
 
 /**
  * @param tripStats 「飞行次数」列的档案快照（由 loadExportTripStats 批量拉好后传入——本函数是
@@ -740,7 +857,11 @@ export function orderToFullRows(
     orderStatus: ORDER_STATUS_LABEL[order.status] ?? order.status,
     invoiceStatusSys,
     invoiceStatusManual,
-    visaStatus: passengerVisaStatusCell({ orderVisaLabel, passenger: p }),
+    visaStatus: passengerVisaStatusCell({
+      orderVisaLabel,
+      orderVisaStatus: order.visaStatus,
+      passenger: p,
+    }),
     visaOption,
     visaSupplier: visaSupplierOf(order),
     visaNote: order.noteVisa ?? '',
@@ -752,7 +873,7 @@ export function orderToFullRows(
     dateOfBirth: fmtDateDMYDash(p.dateOfBirth),
     // 旧模版原样枚举（ADULT/CHILD/INFANT），不译中文。
     passengerType: p.passengerType,
-    distribution: '',
+    distributionStatus: '',
     // 旧模版原样代码（M/F），不译中文。
     gender: p.gender ?? '',
     nationality: toAlpha3(p.nationality),
@@ -772,28 +893,42 @@ export function orderToFullRows(
   });
 }
 
-/** 《全岗可用》两行表头：0..N-4 单列纵向合并两行；末尾 3 列并入「订单成本」分组（首行横向合并）。*/
-function applyFullHeader(ws: ExcelJS.Worksheet, oldestRefreshedAt: Date | null = null): void {
-  const leafBeforeGroup = FULL_COLUMNS.length - FULL_COST_GROUP_SPAN;
+/**
+ * 《全岗可用》两行表头：非分组列纵向合并两行；末尾「订单成本」三子列并入分组（首行横向合并）。
+ *
+ * @param columns 实际写进工作簿的列（代理导出已按 AGENT_HIDDEN_EXPORT_KEYS 裁过）——
+ *   必须传**同一份**列表，用全量 FULL_COLUMNS 算索引会让代理视角的合并区与列错位。
+ *   成本三列在代理视角整组消失：分组标题随之不写，两行表头照旧（数据仍从第 3 行起）。
+ */
+function applyFullHeader(
+  ws: ExcelJS.Worksheet,
+  columns: typeof FULL_COLUMNS,
+  oldestRefreshedAt: Date | null = null,
+): void {
+  // 成本子列一律在末尾（filter 保序），故存活几列就从末尾数几列。
+  const groupSpan = columns.filter((c) => FULL_COST_GROUP_KEYS.has(c.key)).length;
+  const leafBeforeGroup = columns.length - groupSpan;
   const row1 = ws.getRow(1);
   const row2 = ws.getRow(2);
-  FULL_COLUMNS.forEach((c, i) => {
+  columns.forEach((c, i) => {
     const col = i + 1;
     // 非分组列：表头文字放首行（随后与第二行纵向合并）；分组子列：叶子表头放第二行。
     if (i < leafBeforeGroup) row1.getCell(col).value = c.header;
     else row2.getCell(col).value = c.header;
   });
-  // 「订单成本」分组标题落在首行、覆盖三子列。
-  row1.getCell(leafBeforeGroup + 1).value = FULL_COST_GROUP_HEADER;
+  if (groupSpan > 0) {
+    // 「订单成本」分组标题落在首行、覆盖存活的子列。
+    row1.getCell(leafBeforeGroup + 1).value = FULL_COST_GROUP_HEADER;
+    ws.mergeCells(1, leafBeforeGroup + 1, 1, columns.length);
+  }
   for (let col = 1; col <= leafBeforeGroup; col += 1) ws.mergeCells(1, col, 2, col);
-  ws.mergeCells(1, leafBeforeGroup + 1, 1, FULL_COLUMNS.length);
   for (const r of [row1, row2]) {
     r.font = { bold: true };
     r.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
     r.alignment = { vertical: 'middle', horizontal: 'center', wrapText: true };
   }
-  const flightCountColumn = FULL_COLUMNS.findIndex((c) => c.key === 'flightCount');
-  const flightCountNote = FULL_COLUMNS[flightCountColumn]?.note;
+  const flightCountColumn = columns.findIndex((c) => c.key === 'flightCount');
+  const flightCountNote = columns[flightCountColumn]?.note;
   if (flightCountColumn >= 0 && flightCountNote) {
     row1.getCell(flightCountColumn + 1).note = oldestRefreshedAt
       ? `${flightCountNote}\n档案快照时间：${businessDateTimeSec(oldestRefreshedAt)}（北京时间）`
@@ -980,11 +1115,16 @@ export async function buildOrderTemplateExportWorkbook(
   // 相同的顺序与口径收口。orderIds（勾选导出）/ scheduleId（整班导出）的短路也在里面。
   const orders = filterExportOrders(fetched, query);
 
+  // 代理导出（agentScope 非空）：按共享脱敏政策整列裁掉护照 PII / 我方内部人员 /
+  // 供应商与成本 / 内部运营指标（见 AGENT_HIDDEN_EXPORT_KEYS）。ADMIN/STAFF 一列不少。
+  const isAgentExport = opts?.agentScope != null;
+
   // 「飞行次数」列只在《全岗可用》有（票务/签证模板无此列），故只在 full 时才拉档案快照 ——
   // 一次性批量拉回本次导出全部乘客（无 N+1，见 orders.export-trip-stats.ts），与全岗总表/
   // 分房表同一入口 → 同一位乘客在三张表里的数字必然相同。
+  // 代理视角这一列本身就被裁掉（常旅客台账是内部运营信息），连拉都不用拉。
   const tripStatsLookup =
-    query.template === 'full'
+    query.template === 'full' && !isAgentExport
       ? await loadExportTripStats(orders.flatMap((o) => o.passengers), client)
       : { tripStats: new Map() as TripStatsMap, oldestRefreshedAt: null };
   const { tripStats, oldestRefreshedAt } = tripStatsLookup;
@@ -995,17 +1135,22 @@ export async function buildOrderTemplateExportWorkbook(
   const ws = wb.addWorksheet(ORDER_TEMPLATE_LABEL[query.template]);
 
   // full 用两行表头（末列「订单成本」分组）；ticketing/visa 单行表头。
+  // 三处的列表都先过一遍脱敏（代理视角才会真的少列），行数据不用改 ——
+  // exceljs 按 key 写单元格，没有列定义的 key 直接被忽略。
   if (query.template === 'full') {
-    // 只设列 key/宽度，表头由 applyFullHeader 手工写两行（含合并）。
-    ws.columns = FULL_COLUMNS.map((c) => ({ key: c.key, width: c.width }));
-    applyFullHeader(ws, oldestRefreshedAt);
+    const columns = isAgentExport ? withoutAgentHiddenColumns(FULL_COLUMNS) : FULL_COLUMNS;
+    // 只设列 key/宽度，表头由 applyFullHeader 手工写两行（含合并）——必须传同一份列表。
+    ws.columns = columns.map((c) => ({ key: c.key, width: c.width }));
+    applyFullHeader(ws, columns, oldestRefreshedAt);
   } else if (query.template === 'ticketing') {
     // 《票务专用》对齐航司 PNR 原版样例的朴素样式（票务反馈「改成原版，表格看起来简洁一些」）：
     // 列名/列序/日期格式（DDMonYY）本就与样例一致，此处只去掉加粗/底色/居中换行等装饰 ——
     // 样例表头为默认字体、无填充、无居中换行，故这里不给表头设任何样式。
-    ws.columns = TICKETING_COLUMNS.map((c) => ({ header: c.header, key: c.key, width: c.width }));
+    const columns = isAgentExport ? withoutAgentHiddenColumns(TICKETING_COLUMNS) : TICKETING_COLUMNS;
+    ws.columns = columns.map((c) => ({ header: c.header, key: c.key, width: c.width }));
   } else {
-    ws.columns = VISA_COLUMNS.map((c) => ({ header: c.header, key: c.key, width: c.width }));
+    const columns = isAgentExport ? withoutAgentHiddenColumns(VISA_COLUMNS) : VISA_COLUMNS;
+    ws.columns = columns.map((c) => ({ header: c.header, key: c.key, width: c.width }));
     const headerRow = ws.getRow(1);
     headerRow.font = { bold: true };
     headerRow.fill = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFEFEFEF' } };
