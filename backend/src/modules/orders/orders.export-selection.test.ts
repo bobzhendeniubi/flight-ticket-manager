@@ -168,6 +168,23 @@ describe('buildExportOrderWhere · 取数 where', () => {
     expect(and(where).some((c) => 'agentId' in c)).toBe(false);
   });
 
+  // legFlag 是内部航段口径的枚举（no-show / 已释放 / 已恢复 / 已作废）。序列化时对代理已经
+  // 脱敏掉了，可它还是个能筛的参数 —— 挨个枚举值筛一遍就能反推出每张单的内部状态。
+  it('代理导出忽略 legFlag 筛选（能筛就能反推，脱敏白做）', () => {
+    const where = buildExportOrderWhere(f({ legFlag: 'RETURN_RELEASED' }), {
+      agentScope: ['agt-self'],
+    }) as Where;
+    expect(and(where).some((c) => 'legFlag' in c)).toBe(false);
+    expect(where.legFlag).toBeUndefined();
+  });
+
+  it('内部岗位（agentScope=null）照常按 legFlag 筛', () => {
+    const where = buildExportOrderWhere(f({ legFlag: 'RETURN_RELEASED' }), {
+      agentScope: null,
+    }) as Where;
+    expect(and(where)).toContainEqual({ legFlag: 'RETURN_RELEASED' });
+  });
+
   it('extraAnd：票务模板「只导含机票的订单」这类附加条件能叠上', () => {
     const where = buildExportOrderWhere(f({}), {
       extraAnd: [{ items: { some: { kind: 'FLIGHT' } } }],

@@ -705,15 +705,17 @@ describe('visibleColumns（role 裁列）', () => {
     expect(headers).not.toContain('可用次数');
   });
 
-  it('agent（代理）= 全岗结构仅裁「订单成本」（真实进价）；结算价/立减/到账是代理自己的账，保留', () => {
+  it('agent（代理）裁掉「订单成本」与「航段状态」；结算价/立减/到账是代理自己的账，保留', () => {
     const headers = visibleColumns('agent').map((c) => c.header);
     expect(headers).not.toContain('订单成本');
+    // 航段状态会写成「回程已恢复（超售 2 座）」—— 超售是我方与航司之间的内部风控口径。
+    expect(headers).not.toContain('航段状态');
     expect(headers).toContain('结算价格');
     expect(headers).toContain('立减金额');
     expect(headers).toContain('已到账金额');
     expect(headers).toContain('分房情况');
-    // 唯一差异就是订单成本一列：agent 列数 = all 列数 - 1
-    expect(visibleColumns('agent')).toHaveLength(visibleColumns('all').length - 1);
+    // 差异就这两列：agent 列数 = all 列数 - 2
+    expect(visibleColumns('agent')).toHaveLength(visibleColumns('all').length - 2);
   });
 
   it('所有视图都保留通用列（序号/代理机构/乘客中文名/订单编号）', () => {
@@ -1256,12 +1258,14 @@ describe('全岗总表 — 签证状态按乘客取值', () => {
 describe('全岗总表 · 航段状态列', () => {
   const RELEASED_AT = '2026-09-02T03:15:23.000Z';
 
-  it('列位置紧跟「订单类型」，各岗位视图都可见', () => {
+  it('列位置紧跟「订单类型」，内部岗位可见、代理视角不给', () => {
     const headers = visibleColumns('all').map((c) => c.header);
     expect(headers[headers.indexOf('订单类型') + 1]).toBe('航段状态');
-    for (const role of ['ticketing', 'visa', 'agent'] as const) {
+    for (const role of ['ticketing', 'visa'] as const) {
       expect(visibleColumns(role).map((c) => c.header)).toContain('航段状态');
     }
+    // 代理不给：这一列带超售座数（我方与航司之间的风控口径），交出去等于告诉同行这一班卖穿了多少。
+    expect(visibleColumns('agent').map((c) => c.header)).not.toContain('航段状态');
   });
 
   it('正常单留空', () => {

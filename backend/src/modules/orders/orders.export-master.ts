@@ -250,7 +250,10 @@ const MASTER_COLUMNS: MasterColumn[] = [
   { header: '出发(往返)日期', key: 'travelDates', width: 24 },
   { header: '航班号', key: 'flightNumbers', width: 18, roles: ['all', 'ticketing'] },
   { header: '订单类型', key: 'orderType', width: 10 },
-  { header: '航段状态', key: 'legStatus', width: 20 },
+  // 代理视角**不给**这一列：它会写成「回程已恢复（超售 2 座）」—— 超售是我方与航司之间的
+  // 内部风控口径（谁批的、这一班被卖穿几座），交到代理手上等于把班次卖到什么程度告诉同行。
+  // 代理该知道的「这一段还飞不飞」由前台的中性航段状态（publicLegStatus）负责。
+  { header: '航段状态', key: 'legStatus', width: 20, roles: ['all', 'ticketing', 'visa'] },
   { header: '舱位等级', key: 'cabin', width: 10, roles: ['all', 'ticketing'] },
   { header: '结算价格', key: 'settlePrice', width: 10, roles: ['all'] },
   {
@@ -298,7 +301,10 @@ export function visibleColumns(role: MasterExportRole): MasterColumn[] {
   if (role === 'all') return MASTER_COLUMNS;
   // 代理视角：结构同全岗，仅裁「订单成本」——那是我方真实进价（OrderCostItem），
   // 与详情页逐项拆价同一条脱敏红线；结算价/立减/到账是代理自己的应付账目，保留。
-  if (role === 'agent') return MASTER_COLUMNS.filter((c) => c.key !== 'orderCost');
+  // 「航段状态」一并裁掉：它带超售座数（我方与航司之间的风控口径），见该列定义处的注释。
+  if (role === 'agent') {
+    return MASTER_COLUMNS.filter((c) => c.key !== 'orderCost' && c.key !== 'legStatus');
+  }
   return MASTER_COLUMNS.filter((c) => !c.roles || c.roles.includes(role));
 }
 

@@ -323,7 +323,16 @@ interface OrderContext {
   balancePerPax: number;
 }
 
-export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
+export function buildOrderContext(
+  order: OrderForTemplateExport,
+  /**
+   * 脱敏开关。`redactLegStatus` = 这是一次**代理导出**（路由解析出 agentScope 时为真）：
+   * 「航段状态」会写成「回程已恢复（超售 2 座）」—— 超售是我方与航司之间的内部风控口径，
+   * 交到代理手里等于把这一班被卖穿到什么程度告诉同行。
+   * 置空而不是删列：三个模板的列序是对外承诺过的（运营拿它对旧表），少一列会让下游全部错位。
+   */
+  opts?: { redactLegStatus?: boolean },
+): OrderContext {
   const paxCount = Math.max(1, order.passengers.length);
 
   // 航班段（按出发时间排序）
@@ -400,7 +409,7 @@ export function buildOrderContext(order: OrderForTemplateExport): OrderContext {
     flightLegCount: legs.length,
     cabinLabels,
     orderType,
-    legStatus: formatOrderLegStatus(order.items),
+    legStatus: opts?.redactLegStatus === true ? '' : formatOrderLegStatus(order.items),
     settlePerPax: round2(total / paxCount),
     paidPerPax: round2(paid / paxCount),
     balancePerPax: round2(Math.max(0, total + adjustment - paid - prepaymentOffset) / paxCount),
@@ -953,7 +962,8 @@ export async function buildOrderTemplateExportWorkbook(
   let seq = 0;
   for (const order of orders) {
     if (order.passengers.length === 0) continue;
-    const ctx = buildOrderContext(order);
+    // agentScope 非空 = 代理在导自己的单 → 「航段状态」置空（超售口径不外流，见 buildOrderContext）。
+    const ctx = buildOrderContext(order, { redactLegStatus: opts?.agentScope != null });
     if (query.template === 'full') {
       for (const row of orderToFullRows(order, ctx, tripStats)) {
         seq += 1;

@@ -836,8 +836,11 @@ describe('NO_SHOW_RETURN_RELEASED 回程已释放提醒规则', () => {
     expect(out).toHaveLength(1);
     expect(out[0].ruleKey).toBe(`NOSHOW_RELEASED:itm_ret:${RELEASED_AT}:DEPARTED`);
     expect(out[0].title).toBe('【回程已起飞仍未恢复】FTM2026070900001 2 座待收口');
-    expect(out[0].body).toContain('请确认作废或人工处置');
-    expect(out[0].body).toContain('系统不会自动作废');
+    // 文案口径：自动作废 job 上线后，这条待办要如实说「系统会自动收口」，
+    // 并给出「想提前收口就手工作废」的出路 —— 旧文案的「系统不会自动作废」已是错话。
+    expect(out[0].body).toContain('起飞满 2 小时系统会自动作废收口');
+    expect(out[0].body).toContain('手工作废');
+    expect(out[0].body).not.toContain('系统不会自动作废');
     expect(out[0].priority).toBe(ReminderPriority.HIGH);
   });
 

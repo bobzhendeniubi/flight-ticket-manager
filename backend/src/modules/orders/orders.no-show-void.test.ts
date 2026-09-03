@@ -28,6 +28,7 @@ vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
 import {
   voidDepartedReleasedReturnLegs,
   RETURN_VOID_DEPARTED_GRACE_MS,
+  VOID_SCAN_PAGE_SIZE,
 } from './no-show-void.js';
 
 const NOW = new Date('2026-09-10T12:00:00Z');
@@ -195,5 +196,99 @@ describe('回程起飞后自动作废 · 扫描', () => {
     const res = await voidDepartedReleasedReturnLegs(mockPrisma as never, NOW);
     expect(res).toMatchObject({ scanned: 1, voided: 0 });
     expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  // ── 候选集粗筛：能让数据库筛的一律别捞回内存 ────────────────────────────────
+  it('粗筛 where 排除「已作废」与「回收站单」，并带游标分页', async () => {
+    arm();
+    await voidDepartedReleasedReturnLegs(mockPrisma as never, NOW);
+
+    const args = mockPrisma.orderItem.findMany.mock.calls[0][0] as {
+      where: Record<string, unknown>;
+      take: number;
+      orderBy: Record<string, string>;
+    };
+    expect(args.where).toMatchObject({
+      kind: 'FLIGHT',
+      flightScheduleId: null,
+      order: { deletedAt: null },
+    });
+    const and = args.where.AND as Array<{ metadata: { path: string[]; equals?: unknown; not?: unknown } }>;
+    expect(and.map((c) => c.metadata.path[0])).toEqual(['returnReleased', 'returnVoidedFinal']);
+    // 已作废的那一条走 equals DbNull（= 这一行还没有终态标）。
+    expect(and[1].metadata).toHaveProperty('equals');
+    expect(args.take).toBe(VOID_SCAN_PAGE_SIZE);
+    expect(args.orderBy).toEqual({ id: 'asc' });
+  });
+
+  it('满页 → 按 id 游标继续翻下一页，直到不满一页为止', async () => {
+    arm();
+    const fullPage = Array.from({ length: VOID_SCAN_PAGE_SIZE }, (_, i) => ({
+      id: `leg-${i}`,
+      orderId: 'ord-1',
+      // 没有原班次 id → 逐条跳过（本例只验翻页，不验作废动作）。
+      metadata: { returnReleased: { at: RELEASED_AT } },
+    }));
+    let call = 0;
+    mockPrisma.orderItem.findMany.mockImplementation(
+      async (args: { where?: { orderId?: unknown } }) => {
+        if (args?.where?.orderId != null) return [];
+        call += 1;
+        return call === 1 ? fullPage : [];
+      },
+    );
+
+    const res = await voidDepartedReleasedReturnLegs(mockPrisma as never, NOW);
+    expect(res.scanned).toBe(VOID_SCAN_PAGE_SIZE);
+    expect(call).toBe(2);
+    const second = mockPrisma.orderItem.findMany.mock.calls[1][0] as {
+      cursor?: { id: string };
+      skip?: number;
+    };
+    expect(second.cursor).toEqual({ id: `leg-${VOID_SCAN_PAGE_SIZE - 1}` });
+    expect(second.skip).toBe(1);
+  });
+
+  // ── 逐条容错：一条炸了不能把整轮打断（本 job 每小时才跑一次）────────────────
+  it('一条处理失败 → 计进 failed 并继续跑完整轮，其余单照常作废', async () => {
+    arm({
+      candidates: [
+        { id: 'leg-bad', orderId: 'ord-bad', metadata: releasedMeta() },
+        { id: 'leg-ret', orderId: 'ord-1', metadata: releasedMeta() },
+      ],
+    });
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+    // 第一条的行锁查询抛错，第二条正常。
+    let first = true;
+    mockPrisma.$queryRaw.mockImplementation(async () => {
+      if (first) {
+        first = false;
+        throw new Error('deadlock detected');
+      }
+      return [{ id: 'ord-1' }];
+    });
+
+    const res = await voidDepartedReleasedReturnLegs(mockPrisma as never, NOW);
+    expect(res).toMatchObject({ scanned: 2, voided: 1, failed: 1 });
+    // 日志里必须能看出是哪一单（否则线上只剩一句无主的堆栈）。
+    expect(consoleError).toHaveBeenCalledWith(
+      expect.stringContaining('ord-bad'),
+      expect.any(Error),
+    );
+    consoleError.mockRestore();
+  });
+
+  it('审计与作废同一事务写（重试时补不回来的东西不能 fire-and-forget）', async () => {
+    arm();
+    await voidDepartedReleasedReturnLegs(mockPrisma as never, NOW);
+    expect(mockPrisma.auditLog.create).toHaveBeenCalledTimes(1);
+    const entry = mockPrisma.auditLog.create.mock.calls[0][0] as {
+      data: { action: string; targetId: string; severity: string };
+    };
+    expect(entry.data).toMatchObject({
+      action: 'VOID_RETURN_LEG',
+      targetId: 'ord-1',
+      severity: 'WARNING',
+    });
   });
 });

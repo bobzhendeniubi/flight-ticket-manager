@@ -1713,6 +1713,10 @@ model OrderItem {
 
   @@index([orderId])
   @@index([passengerId])
+  // 「某班次上的机票行」与「无班次的机票行」两类查询的支撑索引：
+  // no-show 名单匹配、no-show 报表、回程起飞后自动作废扫描、房控超售告警、提醒规则 11
+  // 全部按 (kind, flightScheduleId) 起手。没有它这几条路径一律全表扫 OrderItem。
+  @@index([kind, flightScheduleId])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -18,15 +18,23 @@
  *   1. **按去程航班的当地日期**分组（与全站「出发日期」同口径），不是按 no-show 的操作日期。
  *   2. releasedSeats / restoredSeats 是**累计事件量**（释放→恢复→再释放会各记各的），
  *      stillReleasedSeats 才是「此刻还躺在库存里可卖的座」。两个数不该相等，也不该互相校验。
- *   3. oversoldSeats / displacedSeats 取**最近一次恢复**的快照值（恢复不留 history 快照）。
- *      多次超售恢复同一段极罕见；要逐次复盘请查审计里的 RESTORE_RETURN_LEG_OVERSOLD。
+ *   3. oversoldSeats / displacedSeats 同样是**累计事件量**，按 legActionLog 的 RESTORE 流水
+ *      逐次累加（老数据流水里没有这两个数时回落到 returnRestored 快照 = 最近一次恢复口径）。
+ *      要逐次复盘细到舱位请查审计里的 RESTORE_RETURN_LEG_OVERSOLD。
  *
  * 回收站单（deletedAt 非空）不进表：与全站其它导出同口径。
  */
 
 import ExcelJS from 'exceljs';
-import { OrderItemKind, OrderLegFlag, ReminderStatus, type PrismaClient } from '@prisma/client';
+import {
+  OrderItemKind,
+  OrderLegFlag,
+  ReminderStatus,
+  UserRole,
+  type PrismaClient,
+} from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import { ForbiddenError } from '../../lib/errors.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { businessDateTime } from '../../lib/business-time.js';
 import { determineFlightLegItems } from './ticketing-cap.js';
@@ -89,6 +97,25 @@ export interface NoShowReport {
   rows: NoShowReportRow[];
   totals: NoShowReportTotals;
   details: NoShowReportDetailRow[];
+}
+
+/** 调用方身份（本表跨代理汇总，只对内部岗位开放）。 */
+export interface NoShowReportActor {
+  userId?: string;
+  role: UserRole;
+}
+
+/**
+ * 岗位闸（与本模块其它入口同一句口径）。
+ *
+ * 路由上已经挂了 requireRole，这里再断一次是**纵深防御**：这两个函数是导出的，
+ * 脚本、任务、将来新加的路由都可能直接调它们 —— 闸只写在路由上，绕过路由就等于没有闸。
+ * 这张表是整班的库存/超售台账，跨代理汇总，代理看到就等于看到了同行的底牌。
+ */
+function assertInternalRole(actor: NoShowReportActor): void {
+  if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    throw new ForbiddenError('仅运营/管理员可查看 no-show 报表');
+  }
 }
 
 // ── 聚合内核的入参形状（纯数据，便于单测直接喂） ──────────────────────────────
@@ -178,6 +205,31 @@ function seatEventsOfItem(metadata: unknown): { released: number; restored: numb
   return { released: fallbackReleased, restored: fallbackRestored };
 }
 
+/**
+ * 一行上的超售事件量（恢复时放行的超售座数 + 挤掉的他人软预留座数）。
+ *
+ * 主源同样是 legActionLog：returnRestored 是**覆盖写**的快照，一行反复
+ * 释放→恢复→再释放→再恢复几轮之后只剩最后一轮，照快照统计会把中间几轮的超售全漏掉。
+ * 老数据（流水里的 RESTORE 条目还没带这两个数）回落到快照，与改动前的口径一字不差。
+ */
+function oversellEventsOfItem(metadata: unknown): { oversold: number; displaced: number } {
+  const entries = readArray(readObject(metadata).legActionLog)
+    .map((e) => readObject(e))
+    .filter((e) => e.type === 'RESTORE' && (e.oversoldBy != null || e.displacedReserved != null));
+  if (entries.length > 0) {
+    return {
+      oversold: entries.reduce((n, e) => n + toInt(e.oversoldBy), 0),
+      displaced: entries.reduce((n, e) => n + toInt(e.displacedReserved), 0),
+    };
+  }
+  const restoredSnap = readObject(readObject(metadata).returnRestored);
+  if (restoredSnap.at == null) return { oversold: 0, displaced: 0 };
+  return {
+    oversold: restoredSnap.oversold === true ? toInt(restoredSnap.oversoldBy) : 0,
+    displaced: toInt(restoredSnap.displacedReserved),
+  };
+}
+
 /** 仍未收口的工单状态。 */
 const OPEN_REMINDER_STATUSES: ReminderStatus[] = [ReminderStatus.OPEN, ReminderStatus.IN_PROGRESS];
 
@@ -242,10 +294,12 @@ export function aggregateNoShowReport(orders: readonly NoShowReportOrderView[]):
       released += events.released;
       restored += events.restored;
 
+      const oversellEvents = oversellEventsOfItem(row.metadata);
+      oversold += oversellEvents.oversold;
+      displaced += oversellEvents.displaced;
+
       const restoredSnap = readObject(meta.returnRestored);
       if (restoredSnap.at != null) {
-        if (restoredSnap.oversold === true) oversold += toInt(restoredSnap.oversoldBy);
-        displaced += toInt(restoredSnap.displacedReserved);
         const at = snapshotDate(restoredSnap);
         if (at && (restoredAt == null || at > restoredAt)) restoredAt = at;
       }
@@ -351,8 +405,10 @@ export function aggregateNoShowReport(orders: readonly NoShowReportOrderView[]):
 export async function loadNoShowReport(
   from: string,
   to: string,
+  actor: NoShowReportActor,
   client: PrismaClient = defaultPrisma,
 ): Promise<NoShowReport> {
+  assertInternalRole(actor);
   const scheduleRows = await client.$queryRaw<Array<{ id: string }>>`
     SELECT s.id FROM "FlightSchedule" s
     WHERE (s."departureTime" AT TIME ZONE 'UTC' AT TIME ZONE s."departureTz")::date >= ${from}::date
@@ -460,9 +516,11 @@ export function noShowReportFilename(from: string, to: string): string {
 export async function buildNoShowReportWorkbook(
   from: string,
   to: string,
+  actor: NoShowReportActor,
   client: PrismaClient = defaultPrisma,
 ): Promise<Buffer> {
-  const report = await loadNoShowReport(from, to, client);
+  assertInternalRole(actor);
+  const report = await loadNoShowReport(from, to, actor, client);
   return renderNoShowReportWorkbook(report, from, to);
 }
 

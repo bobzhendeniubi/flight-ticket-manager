@@ -81,6 +81,14 @@ export function hasStrippableLegSnapshot(metadata: Record<string, unknown>): boo
 }
 
 /**
+ * 这一段航班是否已经走到**终态**：回程过期作废（returnVoidedFinal）或取消航段（returnLegCancelled）。
+ * 两者的共同点是「班次已置空、钱已按取消政策结清、座位早已还回库存」，这一行只剩一具留痕残骸。
+ */
+export function isTerminalLegItem(metadata: Record<string, unknown>): boolean {
+  return metadata.returnVoidedFinal != null || metadata.returnLegCancelled != null;
+}
+
+/**
  * 拆单时新行的描述：**剥掉了快照就一并剥掉描述上的内部留痕前缀**。
  *
  * 描述前缀（【去程未登机】/【回程座位已释放】…）和 metadata 快照是一对。继承时快照被剥掉、
@@ -212,12 +220,30 @@ export function readUpgradeCount(metadata: Record<string, unknown>): number {
 
 // ── 策略 1：按人数行（FLIGHT / VISA / TRANSFER）──────────────────────────────
 /**
- * quantity 就是人数：拆出 min(quantity, k) 件；quantity ≤ k → 整行搬走。
+ * 这一行随拆搬走几件 —— **按各自 quantity 的语义取分母**，不能一律用「拆出人头数」。
+ *
+ *   · FLIGHT：quantity 是**占座数**（婴儿不占座，压根不出现在这一行的 quantity 里）
+ *     → 用拆出侧占座人数 `movedSeatPax`；
+ *   · VISA / TRANSFER：按人头计费（婴儿一样要办签、一样要坐车，quantity 含婴儿）
+ *     → 仍用拆出人头数 `k`。
+ *
+ * 混用过一次就是事故：2 大 1 婴的单（机票行 quantity = 2），拆「大人 A + 婴儿」时
+ * k = 2 ≥ quantity = 2 会被判成「整行搬走」—— 留守那位大人的机票行连座位一起被搬到新单，
+ * 源单剩着一位客人却一条航段行都没有。
+ */
+export function movedUnitsFor(item: SplitItemView, ctx: SplitContext): number {
+  const demand = item.kind === OrderItemKind.FLIGHT ? ctx.movedSeatPax : ctx.k;
+  return Math.min(item.quantity, Math.max(0, demand));
+}
+
+/**
+ * quantity 就是人数：拆出 min(quantity, 本行的拆出需求) 件；需求 ≥ quantity → 整行搬走。
+ * 「拆出需求」按该行 quantity 的语义取（见 movedUnitsFor：机票看占座数、签证/接送看人头）。
  * 升舱人数（metadata.businessUpgradeCount）随之按显式指令或人头比例拆开 ——
  * 它是**真实商务舱座位**的镜像账，拆散了退座会还错舱位，故必须两侧各记各的。
  */
 export function moveFlightLike(item: SplitItemView, ctx: SplitContext): SplitMove {
-  const moveQty = Math.min(item.quantity, ctx.k);
+  const moveQty = movedUnitsFor(item, ctx);
   if (moveQty <= 0) return { mode: 'NONE' };
   const md = item.metadata;
   if (moveQty >= item.quantity) {
@@ -759,6 +785,17 @@ export function planItemMove(item: SplitItemView, ctx: SplitContext): SplitMove 
           },
         }
       : { mode: 'NONE' };
+  }
+  // 已走到终态的航段行（回程过期作废 / 取消航段）**整块留在源单**，不随拆。
+  //
+  // 为什么不做成拆单闸（blocker）：终态是既成事实、也是常态 —— 一张单里回程被作废掉之后，
+  // 剩下的人照样可能要按人改期、按人拆单。拿它拦住拆单等于把这批单永久锁死。
+  // 为什么也不能跟着搬：这一行的钱已经按取消政策结清、座位早已还回库存，快照
+  //（returnVoidedFinal / returnLegCancelled）又是不可继承的（见 NON_INHERITABLE_ITEM_METADATA_KEYS）。
+  // 劈一半过去，新单上会出现一条「没有班次、没有快照、还占着 quantity」的空壳行 ——
+  // 运营看不懂、导出对不上、后续任何航段动作都无从下手。留痕留在它发生的那张单上最干净。
+  if (item.kind === OrderItemKind.FLIGHT && isTerminalLegItem(item.metadata)) {
+    return { mode: 'NONE' };
   }
   if (
     item.kind === OrderItemKind.FLIGHT ||

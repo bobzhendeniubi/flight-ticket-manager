@@ -32,6 +32,7 @@ import {
   filterOrderIdsByFlightDate,
   filterOrderIdsByLegFlightNumber,
   filterOrderIdsByReturnDate,
+  withoutAgentHiddenFilters,
   type OrderListFilters,
 } from './orders.service.js';
 import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
@@ -70,7 +71,11 @@ export function buildExportOrderWhere(
   query: ExportSelectionFilters,
   opts?: { agentScope?: string[] | null; extraAnd?: Prisma.OrderWhereInput[] },
 ): Prisma.OrderWhereInput {
-  const where = buildOrderFilterWhere(query, { includeAnchorless: true });
+  // agentScope 非空 = 代理在导自己的单 → 剥掉 legFlag 筛选：那是内部航段口径的枚举，
+  // 能筛就能从「哪些单出现在结果里」反推出每张单的内部状态（详见 withoutAgentHiddenFilters）。
+  // 与列表 resolveListOrdersWhere 同一句口径，两边不分叉。
+  const effectiveQuery = opts?.agentScope != null ? withoutAgentHiddenFilters(query) : query;
+  const where = buildOrderFilterWhere(effectiveQuery, { includeAnchorless: true });
   const and = Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : [];
   and.push({ status: { in: EXPORT_COUNTED_STATUSES } });
   if (opts?.extraAnd?.length) and.push(...opts.extraAnd);

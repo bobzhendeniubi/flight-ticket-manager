@@ -1541,8 +1541,19 @@ export type NoShowBody = z.infer<typeof noShowBodySchema>;
 // names 是**整块粘贴的原文**（按行切，一行一人）。一行长什么样完全不受我们控制 ——
 // 可能是中文名、拼音名（姓/名 或 名 姓）、姓名 + 护照号，分隔符空格/逗号/顿号/斜杠/制表混着来，
 // 所以后端按「护照号精确 → 英文名归一化 → 中文名精确」逐行试，命中多人一律交人工点选。
+/**
+ * 数据库主键（Prisma cuid）的形状闸。
+ *
+ * 用 `.regex` 而不是 zod 的 `.cuid()`：库里同时躺着 cuid 与 cuid2 两代 id（迁移期留下的），
+ * `.cuid()` 只认第一代的 `c` 前缀 + 定长 25，会把 cuid2 的行直接判成 400。
+ * 这一层拦的是「拿一串任意文本当 id 发过来」——真实性仍由后面的 findMany/findUnique 说了算。
+ */
+const dbIdSchema = z
+  .string()
+  .regex(/^[a-z0-9]{20,32}$/, '标识格式不正确，请刷新页面后重试');
+
 export const noShowBatchPreviewBodySchema = z.object({
-  scheduleId: z.string().min(1, '请先选择航班班次'),
+  scheduleId: dbIdSchema,
   // names 两种形状都收：整块粘贴的**字符串**，以及前端已经切好的**字符串数组**（拼回带换行的
   // 整块文本再走同一套解析）。只收其中一种就会出现「界面上贴了名单、后端一条 400」这种
   // 前后端各说各话的故障，而这条路径每天都在用。
@@ -1561,13 +1572,13 @@ export const noShowBatchBodySchema = z.object({
   // 整批一个 requestToken；逐单的幂等键由服务端按 `${requestToken}:${orderId}` 做 uuid v5 派生。
   // 前端整批重试请**沿用同一个** token —— 换新 token 会让已标过的单被当成新请求再跑一遍。
   requestToken: z.string().min(8).max(64).uuid(),
-  scheduleId: z.string().min(1),
+  scheduleId: dbIdSchema,
   entries: z
     .array(
       z.object({
-        orderId: z.string().min(1),
+        orderId: dbIdSchema,
         // 逐单勾选的乘客（勾满即整单，服务端自行判定；勾一部分会先自动拆单再标）。
-        passengerIds: z.array(z.string().min(1)).min(1, '每张单至少勾选 1 位乘客').max(99),
+        passengerIds: z.array(dbIdSchema).min(1, '每张单至少勾选 1 位乘客').max(99),
       }),
     )
     .min(1, '请至少勾选一条')

@@ -41,6 +41,7 @@ const { mockPrisma } = vi.hoisted(() => ({
     },
     bundleChangeRequest: { count: vi.fn() },
     settlementRequest: { count: vi.fn() },
+    prepaymentTransaction: { findFirst: vi.fn() },
     fulfillmentTask: {
       count: vi.fn(),
       create: vi.fn(),
@@ -147,6 +148,8 @@ const armCleanGates = () => {
   mockPrisma.commissionRecord.findMany.mockResolvedValue([]);
   mockPrisma.bundleChangeRequest.count.mockResolvedValue(0);
   mockPrisma.settlementRequest.count.mockResolvedValue(0);
+  // 无预存余额抵扣流水（闸 10c 干净）
+  mockPrisma.prepaymentTransaction.findFirst.mockResolvedValue(null);
   mockPrisma.refund.count.mockResolvedValue(0);
   mockPrisma.fulfillmentTask.count.mockResolvedValue(0);
   mockPrisma.refund.aggregate.mockResolvedValue({ _sum: { amount: null } });
@@ -1251,11 +1254,17 @@ describe('拆单 · 不继承 no-show / 释放 / 取消航段快照', () => {
       releasedSeats: [{ scheduleId: 'sch1', cabin: 'ECONOMY', quantity: 2 }],
     },
     returnRestored: { at: '2026-09-02T04:00:00.000Z', requestToken: TOKEN },
+  };
+  /**
+   * 终态快照（回程过期作废 / 取消航段）。带上它的航段行**整块留在源单**、根本不参与搬移
+   *（planItemMove 判 NONE），故这里单列出来给终态用例用，不混进上面那份「活航段」快照。
+   */
+  const terminalMeta = {
     returnVoidedFinal: { at: '2026-09-02T05:00:00.000Z' },
     returnLegCancelled: { at: '2026-09-02T06:00:00.000Z', originalAmountCny: 3000 },
   };
 
-  it('拆出的新行只带业务键，五个快照键一个都不复制', async () => {
+  it('拆出的新行只带业务键，五类快照键一个都不复制', async () => {
     armExecute({
       order: baseOrder({ items: [flightItem({ metadata: snapshotMeta })] }),
       targetItemsSum: 1000,
@@ -1372,6 +1381,66 @@ describe('拆单 · 不继承 no-show / 释放 / 取消航段快照', () => {
     expect(meta).not.toHaveProperty('returnReleased');
   });
 
+  // 终态残骸行（回程过期作废 / 取消航段）：整块留在源单，一格都不搬。
+  // 劈一半过去，新单上会多出一条「没有班次、没有快照、还占着 quantity」的空壳回程行 ——
+  // 对客可见、导出对不上、后续任何航段动作都无从下手。
+  it('回程已过期作废的残骸行不随拆：新单不建这条行', async () => {
+    armExecute({
+      order: baseOrder({
+        items: [
+          flightItem({
+            description: '【回程座位已释放】测试机票 回程',
+            metadata: { ...terminalMeta, returnVoidedFinal: terminalMeta.returnVoidedFinal },
+          }),
+        ],
+      }),
+      targetItemsSum: 0,
+      sourceItemsSum: 2000,
+      finalSource: { total: 1000, paidAmount: 0 },
+      finalTarget: { total: 1000, paidAmount: 500 },
+    });
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const flightCreate = mockPrisma.orderItem.create.mock.calls.find(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0].data.kind === 'FLIGHT',
+    );
+    expect(flightCreate).toBeUndefined();
+  });
+
+  it('取消航段留下的残骸行同样不随拆（returnLegCancelled）', async () => {
+    armExecute({
+      order: baseOrder({
+        items: [
+          flightItem({
+            description: '【回程已取消】测试机票 回程',
+            metadata: { returnLegCancelled: terminalMeta.returnLegCancelled },
+          }),
+        ],
+      }),
+      targetItemsSum: 0,
+      sourceItemsSum: 2000,
+      finalSource: { total: 1000, paidAmount: 0 },
+      finalTarget: { total: 1000, paidAmount: 500 },
+    });
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    const flightCreate = mockPrisma.orderItem.create.mock.calls.find(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0].data.kind === 'FLIGHT',
+    );
+    expect(flightCreate).toBeUndefined();
+    // 源行也不该被改（它整块留在源单）。
+    const sourceUpdate = mockPrisma.orderItem.update.mock.calls.find(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0].where?.id === 'i1',
+    );
+    expect(sourceUpdate).toBeUndefined();
+  });
+
   it('预检提示：源单去程已标 no-show，拆出的新单不会自动带标记', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(
       baseOrder({ items: [flightItem({ metadata: { noShow: { at: '2026-09-02T03:00:00.000Z' } } })] }),
@@ -1400,6 +1469,27 @@ describe('拆单 · 议价申请闸（H3）', () => {
     const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
     expect(r.eligible).toBe(false);
     expect(r.blockers.join()).toContain('待确认的套餐改档申请');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 预存余额抵扣闸：抵扣的真源是 PrepaymentTransaction(OFFSET) 流水，它按 orderId 挂在源单上，
+// 拆单一条都搬不走 —— 新单退款时查不到 OFFSET，会把「从余额里扣的钱」当现金全额退出去。
+describe('拆单 · 预存余额抵扣闸（C-H1）', () => {
+  it('本单有预存余额抵扣流水 → 拒拆，让财务先结清或冲回', async () => {
+    armCleanGates();
+    mockPrisma.prepaymentTransaction.findFirst.mockResolvedValue({ id: 'ptx-1' });
+    mockPrisma.order.findUnique.mockResolvedValue(baseOrder());
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
+    expect(r.eligible).toBe(false);
+    expect(r.blockers.join()).toContain('预存余额抵扣');
+  });
+
+  it('没有抵扣流水的常规单照常放行', async () => {
+    armCleanGates();
+    mockPrisma.order.findUnique.mockResolvedValue(baseOrder());
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
+    expect(r.blockers.join()).not.toContain('预存余额抵扣');
   });
 });
 

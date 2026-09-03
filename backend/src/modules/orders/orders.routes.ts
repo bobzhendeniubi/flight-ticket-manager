@@ -2654,6 +2654,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         ok: result.summary.ok,
         failed: result.summary.failed,
         releasedSeats: result.summary.releasedSeats,
+        /** 同 token 重试时库里没动过的单数（releasedSeats 已把它们排除在外）。 */
+        replayedCount: result.summary.replayedCount,
         releaseReturn: body.releaseReturn,
         note: body.note ?? null,
         // 失败明细进审计：事后追「那天为什么这几张没标上」不必再去翻日志。
@@ -2668,11 +2670,16 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     // 订单维度的审计流水不因为「是批量点的」而缺一段。
     for (const r of result.results) {
       if (!r.ok) continue;
+      // 回放的单**不落审计**：这一次库里一个字段都没动，写一条 MARK_NO_SHOW 只会让
+      // 订单的审计流水上凭空多出几条「又标了一次 no-show」，事后复盘时把重试看成真操作。
+      if (r.replayed === true) continue;
       void writeAudit({
         actor: actorFromRequest(req),
         action: 'MARK_NO_SHOW',
         targetType: 'ORDER',
-        targetId: r.orderId,
+        // 部分乘客的单会先拆单，**真正被标的是拆出来的新单** —— 审计挂在源单 id 上，
+        // 按订单 id 查新单的流水时会一条都查不到。有新单 id 就挂新单。
+        targetId: r.targetOrderId ?? r.orderId,
         targetLabel:
           `${r.orderNumber} · 去程 no-show（批量） · ` +
           `${r.releasedSeats ? `释放回程 ${r.releasedSeats} 座` : '未释放回程'}` +
@@ -2680,7 +2687,10 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         after: {
           batch: true,
           scheduleId: body.scheduleId,
+          /** 源单 id：targetId 挂的是被标的那张单，这里留一条回溯源单的线。 */
+          sourceOrderId: r.orderId,
           targetOrderNumber: r.targetOrderNumber ?? null,
+          targetOrderId: r.targetOrderId ?? null,
           releasedSeats: r.releasedSeats ?? 0,
           workOrderReminderId: r.workOrderReminderId ?? null,
           releaseReturn: body.releaseReturn,
@@ -2703,7 +2713,23 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
     async (req) => {
       const { from, to } = noShowReportQuerySchema.parse(req.query);
-      const { rows, totals } = await loadNoShowReport(from, to);
+      const { rows, totals } = await loadNoShowReport(from, to, {
+        userId: req.user.sub,
+        role: req.user.role,
+      });
+
+      // 看表也留痕（INFO）：这张表是跨代理的整班库存/超售台账，「谁在什么时候查了哪一段」
+      // 和「谁导出了它」同等重要 —— 只审导出，等于把在线翻表这条路留成盲区。
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'VIEW_NO_SHOW_REPORT',
+        // 与导出那条同口径：跨若干班次、没有单一对象 → FLIGHT + targetId 留空，区间进 after。
+        targetType: 'FLIGHT',
+        targetLabel: `no-show 报表 ${from} ~ ${to}`,
+        after: { from, to, rowCount: rows.length },
+        severity: 'INFO',
+      });
+
       return { rows, totals };
     },
   );
@@ -2714,7 +2740,10 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
     async (req, reply) => {
       const { from, to } = noShowReportQuerySchema.parse(req.query);
-      const buf = await buildNoShowReportWorkbook(from, to);
+      const buf = await buildNoShowReportWorkbook(from, to, {
+        userId: req.user.sub,
+        role: req.user.role,
+      });
 
       void writeAudit({
         actor: actorFromRequest(req),

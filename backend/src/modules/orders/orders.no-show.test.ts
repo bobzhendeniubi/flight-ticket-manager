@@ -1000,6 +1000,31 @@ function releasedSnapshotOrder(over: Record<string, unknown> = {}, snapOver: Rec
   });
 }
 
+// 放座是按舱位做的：舱位为空时旧写法静默跳过放座，却照常置空班次、落 returnReleased 快照 ——
+// 座位一个没放回库存，系统却认为释放过了（这一班从此少卖 N 座）。
+describe('no-show · 回程行缺舱位信息（C-L4）', () => {
+  it('勾了「同时释放回程」但回程行没有舱位 → blocker，不做半拉子释放', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(
+      orderSnapshot({
+        items: [outboundRow(), returnRow({ flightCabin: null }), hotelRow],
+      }),
+    );
+    const res = await service.previewNoShow('ord-1', { releaseReturn: true }, ADMIN);
+    expect(res.eligible).toBe(false);
+    expect(res.blockers.join('')).toContain('缺舱位信息');
+  });
+
+  it('不勾释放回程 → 照常放行（只记 no-show，不动座位）', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(
+      orderSnapshot({
+        items: [outboundRow(), returnRow({ flightCabin: null }), hotelRow],
+      }),
+    );
+    const res = await service.previewNoShow('ord-1', { releaseReturn: false }, ADMIN);
+    expect(res.blockers.join('')).not.toContain('缺舱位信息');
+  });
+});
+
 describe('恢复回程 · 预检', () => {
   it('有座：needsOversell=false，余位与原班次如实回', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(releasedSnapshotOrder());
@@ -1106,6 +1131,82 @@ describe('恢复回程 · 预检', () => {
 });
 
 describe('恢复回程 · 执行', () => {
+  // ── 待办收口：不关的话运营手上那条「回程已释放待跟进」会一直催，还会照旧条去点「恢复回程」──
+  it('把这一行的两条「回程已释放」提醒置 DONE，写明是本次恢复收的口', async () => {
+    const tx = mountTx({
+      snapshot: releasedSnapshotOrder(),
+      flightMeta: [
+        { id: 'leg-out', metadata: null },
+        { id: 'leg-ret', metadata: null },
+      ],
+      seatClass: { capacity: 180, sold: 100 },
+    });
+    await service.restoreReturnLeg('ord-1', restoreBody(), ADMIN);
+
+    const calls = tx.operationalReminder.updateMany.mock.calls as unknown as Array<
+      [{ where: Record<string, unknown>; data: Record<string, unknown> }]
+    >;
+    const released = calls.find((c) => Array.isArray((c[0].where.ruleKey as { in?: string[] })?.in));
+    expect(released).toBeDefined();
+    expect((released![0].where.ruleKey as { in: string[] }).in).toEqual([
+      `NOSHOW_RELEASED:leg-ret:${RELEASED_SNAPSHOT.at}`,
+      `NOSHOW_RELEASED:leg-ret:${RELEASED_SNAPSHOT.at}:DEPARTED`,
+    ]);
+    expect(released![0].data.status).toBe('DONE');
+    expect(released![0].data.resolvedNote).toContain('回程已恢复到原班次');
+  });
+
+  // 释放时派的「撤名单/退票」工单：这一刀作废了（名单不用撤了），要办的是新派的「重新上名单」。
+  // 置 SKIPPED 而不是 DONE —— 这活并没有做完，报表上不该记成一条已完成的工单。
+  it('把该行仍未处理的「撤名单/退票」工单置 SKIPPED，注明改派重新上名单', async () => {
+    const tx = mountTx({
+      snapshot: releasedSnapshotOrder(),
+      flightMeta: [
+        { id: 'leg-out', metadata: null },
+        { id: 'leg-ret', metadata: null },
+      ],
+      seatClass: { capacity: 180, sold: 100 },
+    });
+    await service.restoreReturnLeg('ord-1', restoreBody(), ADMIN);
+
+    const calls = tx.operationalReminder.updateMany.mock.calls as unknown as Array<
+      [{ where: Record<string, unknown>; data: Record<string, unknown> }]
+    >;
+    const withdraw = calls.find(
+      (c) => (c[0].where.ruleKey as { startsWith?: string })?.startsWith != null,
+    );
+    expect(withdraw).toBeDefined();
+    expect((withdraw![0].where.ruleKey as { startsWith: string }).startsWith).toBe(
+      'NOSHOW_WITHDRAW:leg-ret:',
+    );
+    expect(withdraw![0].data.status).toBe('SKIPPED');
+    expect(withdraw![0].data.resolvedNote).toContain('改派重新上名单');
+  });
+
+  // legActionLog 是多轮释放/恢复的**唯一**全量来源：returnRestored 快照是覆盖写，
+  // 只记布尔的 oversold 事后连「这一班到底为恢复多卖了几座」都答不上来。
+  it('legActionLog 的 RESTORE 条目带 oversoldBy / displacedReserved 数值', async () => {
+    const tx = mountTx({
+      snapshot: releasedSnapshotOrder(),
+      flightMeta: [
+        { id: 'leg-out', metadata: null },
+        { id: 'leg-ret', metadata: null },
+      ],
+      // 余位不够 → 走超售直加（本次新增 2 座超售）。
+      seatClass: { capacity: 100, sold: 100 },
+    });
+    await service.restoreReturnLeg('ord-1', restoreBody({ allowOversell: true }), ADMIN);
+
+    const calls = tx.orderItem.update.mock.calls as unknown as Array<
+      [{ where: { id: string }; data: Record<string, unknown> }]
+    >;
+    const meta = updateDataFor(calls, 'leg-ret')!.metadata as Record<string, unknown>;
+    const log = meta.legActionLog as Array<Record<string, unknown>>;
+    const restore = log.find((e) => e.type === 'RESTORE')!;
+    expect(restore.oversoldBy).toBe(2);
+    expect(restore.displacedReserved).toBe(0);
+  });
+
   it('有座：CAS 占座、班次写回、释放前缀去掉、returnReleased 历史保留', async () => {
     const tx = mountTx({
       snapshot: releasedSnapshotOrder(),

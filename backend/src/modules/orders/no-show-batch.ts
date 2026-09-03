@@ -104,6 +104,16 @@ export interface NoShowBatchPreview {
   truncated: boolean;
   /** 本次实际参与匹配的行数（truncated 时 < totalLines）。 */
   processedLines: number;
+  /**
+   * 名单点到的订单数超过单次预检上限 → 本次只逐单预检了前 NO_SHOW_PREVIEW_MAX_ORDERS 张单，
+   * 其余单的 eligible/blockers **没有算过**（如实回一条「本次未预检」的 blocker，不装绿）。
+   * 前端见到 true 要提示票务分批贴名单。
+   */
+  truncatedOrders: boolean;
+  /** 名单点到的订单总数（**不受上限影响**）。 */
+  totalOrders: number;
+  /** 本次实际逐单预检的订单数（truncatedOrders 时 < totalOrders）。 */
+  processedOrders: number;
 }
 
 export interface NoShowBatchEntryResult {
@@ -112,7 +122,15 @@ export interface NoShowBatchEntryResult {
   ok: boolean;
   /** 实际被标记的那张单的单号（部分乘客时是拆出来的新单）。 */
   targetOrderNumber?: string;
-  /** 本单释放回库存的回程座数。 */
+  /** 实际被标记的那张单的 id（部分乘客时是拆出来的新单 id）；供审计与前端跳转用。 */
+  targetOrderId?: string;
+  /**
+   * true = 这一单是**同 token 重试的回放**：库里一个字段都没动，座位没有二次释放。
+   * 整批重试时前几单必然是回放 —— 不把它标出来，前端会把「一座没放」的单显示成
+   * 「本次释放了 N 座」，票务照着这个数去跟航司对座位就会对不上。
+   */
+  replayed?: boolean;
+  /** 本单释放回库存的回程座数（回放的单这里是上一次的数，不计进 summary）。 */
   releasedSeats?: number;
   /** 回程已出票时派给票务的「撤名单/退票」工单 id。 */
   workOrderReminderId?: string | null;
@@ -122,7 +140,14 @@ export interface NoShowBatchEntryResult {
 
 export interface NoShowBatchResult {
   results: NoShowBatchEntryResult[];
-  summary: { ok: number; failed: number; releasedSeats: number };
+  summary: {
+    ok: number;
+    failed: number;
+    /** **本次真正放回库存**的座数：回放的单不计（它们上一次就已经放过了）。 */
+    releasedSeats: number;
+    /** 本批里属于「同 token 回放、库里没动」的单数。 */
+    replayedCount: number;
+  };
 }
 
 // ── 入参 ────────────────────────────────────────────────────────────────────
@@ -179,6 +204,18 @@ function assertInternalRole(actor: NoShowBatchActor): void {
     throw new ForbiddenError('仅运营/管理员可标记 no-show');
   }
 }
+
+/**
+ * 单次预检最多逐单跑几张单。
+ *
+ * 比执行体的 50 张宽（预检是**只读**的，没有事务、不拆单），但仍必须有上限：
+ * 500 行名单可能点到几百张单，每张单一次 previewNoShow 都要连行带乘客读一遍，
+ * 不设限就是一个请求打穿网关超时。超出的单如实回 truncatedOrders，不装绿。
+ */
+export const NO_SHOW_PREVIEW_MAX_ORDERS = 200;
+
+/** 逐单预检的并发分片大小：同一批里 10 张单一组并发跑，组间串行（连接池不会被打满）。 */
+const PREVIEW_CONCURRENCY = 10;
 
 // ── 候选人装载 ──────────────────────────────────────────────────────────────
 
@@ -315,26 +352,50 @@ export async function previewNoShowBatch(
   // 这类闸才会在贴名单这一步就如实亮出来，而不是点了执行才逐单蹦红。
   const releaseReturn = input.releaseReturn ?? true;
   const assessments = new Map<string, NoShowPreview | { failure: string }>();
-  for (const [orderId, passengerIds] of pickedByOrder) {
-    try {
-      assessments.set(
-        orderId,
-        await deps.service.previewNoShow(orderId, { passengerIds, releaseReturn }, actor),
-      );
-    } catch (err) {
-      // 单张单预检抛错（订单被并发删掉 / 勾选的人已被拆走…）只影响这一张单，
-      // 整批不能因此 500 —— 如实把原因落到这张单的 blockers 上。
-      assessments.set(orderId, {
-        failure: err instanceof Error ? err.message : '预检失败（原因未知）',
-      });
-    }
+  // 订单数上限：超出的单本次不预检，如实回 truncatedOrders（下面给它们一条明说的 blocker）。
+  const allOrderEntries = [...pickedByOrder.entries()];
+  const totalOrders = allOrderEntries.length;
+  const orderEntries = allOrderEntries.slice(0, NO_SHOW_PREVIEW_MAX_ORDERS);
+  const truncatedOrders = totalOrders > orderEntries.length;
+  // 分片并发：一张单的预检是几次只读查询，串行跑几百张会把响应时间线性堆起来。
+  // 10 张一组、组间串行 —— 既压掉大部分等待，又不会把连接池打满拖垮别的请求。
+  for (let i = 0; i < orderEntries.length; i += PREVIEW_CONCURRENCY) {
+    const chunk = orderEntries.slice(i, i + PREVIEW_CONCURRENCY);
+    const settled = await Promise.all(
+      chunk.map(async ([orderId, passengerIds]) => {
+        try {
+          return {
+            orderId,
+            value: await deps.service.previewNoShow(
+              orderId,
+              { passengerIds, releaseReturn },
+              actor,
+            ),
+          };
+        } catch (err) {
+          // 单张单预检抛错（订单被并发删掉 / 勾选的人已被拆走…）只影响这一张单，
+          // 整批不能因此 500 —— 如实把原因落到这张单的 blockers 上。
+          return {
+            orderId,
+            value: { failure: err instanceof Error ? err.message : '预检失败（原因未知）' },
+          };
+        }
+      }),
+    );
+    for (const { orderId, value } of settled) assessments.set(orderId, value);
   }
 
   const matchedRows: NoShowBatchMatchedRow[] = [...mergedByPassenger.values()].map((entry) => {
     const m = entry.first;
     const c = m.candidate;
     const assessed = assessments.get(c.orderId);
-    const failure = assessed != null && 'failure' in assessed ? assessed.failure : null;
+    // 超出单次预检上限、本次根本没跑过的单：明说「未预检」，绝不按 eligible=true 放绿。
+    const failure =
+      assessed == null
+        ? '本次名单点到的订单数超过单次预检上限，这一单没有预检；请分批贴名单。'
+        : 'failure' in assessed
+          ? assessed.failure
+          : null;
     const preview = assessed != null && !('failure' in assessed) ? assessed : null;
     return {
       line: m.line,
@@ -362,6 +423,9 @@ export async function previewNoShowBatch(
     totalLines,
     truncated,
     processedLines: lines.length,
+    truncatedOrders,
+    totalOrders,
+    processedOrders: orderEntries.length,
     unmatched,
     ambiguous: ambiguous.map((a) => ({
       line: a.line,
@@ -448,7 +512,7 @@ export async function executeNoShowBatch(
     }
 
     try {
-      const { audit } = await deps.service.markNoShow(
+      const { audit, targetOrderId } = await deps.service.markNoShow(
         entry.orderId,
         {
           requestToken: deriveBatchOrderToken(input.requestToken, entry.orderId),
@@ -463,6 +527,8 @@ export async function executeNoShowBatch(
         orderNumber: head.orderNumber,
         ok: true,
         targetOrderNumber: audit.split?.targetOrderNumber ?? audit.orderNumber,
+        targetOrderId,
+        replayed: audit.replayed,
         releasedSeats: audit.releasedSeats.reduce((n, r) => n + r.quantity, 0),
         workOrderReminderId: audit.workOrderReminderId,
       });
@@ -483,7 +549,13 @@ export async function executeNoShowBatch(
     summary: {
       ok,
       failed: results.length - ok,
-      releasedSeats: results.reduce((n, r) => n + (r.releasedSeats ?? 0), 0),
+      // 回放的单**不计**释放座数：那几座上一次就已经放回库存了，这一次库里一个字段都没动。
+      // 累加进去会让整批重试的汇总数随重试次数翻倍，票务拿着这个数跟航司对座位必然对不上。
+      releasedSeats: results.reduce(
+        (n, r) => n + (r.replayed === true ? 0 : (r.releasedSeats ?? 0)),
+        0,
+      ),
+      replayedCount: results.filter((r) => r.replayed === true).length,
     },
   };
 }

@@ -177,6 +177,65 @@ describe('moveFlightLike · 按人数行', () => {
     const view = item({ quantity: 3, metadata: { businessUpgradeCount: 3 } });
     expect(resolveUpgradeToMove(view, ctx(), 1, 2)).toBe(1);
   });
+
+  // ── 婴儿不占座：机票行 quantity 是占座数，不能拿人头数去比 ────────────────────
+  // 2 大 1 婴（机票行 2 座）拆「大人 A + 婴儿」：人头数 = 2 ≥ quantity = 2，
+  // 按人头判会得出「整行搬走」—— 留守那位大人的座位被一起搬到新单，源单一条航段行都不剩。
+  it('2 大 1 婴拆「大人 A + 婴儿」：机票行劈成 1/1，不是整行搬走', () => {
+    const c = ctx({
+      movedIdSet: new Set(['p1', 'p3']),
+      movedOccupancy: occ(1, 0, 1), // 1 成人 + 1 婴儿：占座 1、人头 2
+      keptOccupancy: occ(1), // 留守 1 成人
+    });
+    const plan = moveFlightLike(item({ quantity: 2, amount: 2000, totalCostCny: 1200 }), c);
+    expect(plan.mode).toBe('SPLIT');
+    if (plan.mode !== 'SPLIT') throw new Error('unreachable');
+    expect(plan.keep).toMatchObject({ quantity: 1, amount: 1000, totalCostCny: 600 });
+    expect(plan.move).toMatchObject({ quantity: 1, amount: 1000, totalCostCny: 600 });
+  });
+
+  it('只拆婴儿：机票行一座不搬（占座人数 0 → moveQty 0）', () => {
+    const c = ctx({
+      movedIdSet: new Set(['p3']),
+      movedOccupancy: occ(0, 0, 1), // 只有 1 位婴儿：占座 0
+      keptOccupancy: occ(2),
+    });
+    expect(moveFlightLike(item({ quantity: 2 }), c).mode).toBe('NONE');
+  });
+
+  it('签证行按**人头**算（婴儿也要办签）：只拆婴儿照样搬走 1 件', () => {
+    const c = ctx({
+      movedIdSet: new Set(['p3']),
+      movedOccupancy: occ(0, 0, 1),
+      keptOccupancy: occ(2),
+    });
+    const plan = moveFlightLike(
+      item({ kind: OrderItemKind.VISA, quantity: 3, unitPrice: 500, amount: 1500 }),
+      c,
+    );
+    expect(plan.mode).toBe('SPLIT');
+    if (plan.mode !== 'SPLIT') throw new Error('unreachable');
+    expect(plan.move).toMatchObject({ quantity: 1, amount: 500 });
+    expect(plan.keep).toMatchObject({ quantity: 2, amount: 1000 });
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('planItemMove · 终态航段行不随拆', () => {
+  it('回程已过期作废（returnVoidedFinal）→ NONE，整块留源单', () => {
+    const view = item({ quantity: 3, metadata: { returnVoidedFinal: { at: '2026-09-02T00:00:00.000Z' } } });
+    expect(planItemMove(view, ctx()).mode).toBe('NONE');
+  });
+
+  it('取消航段留下的残骸（returnLegCancelled）→ NONE', () => {
+    const view = item({ quantity: 3, metadata: { returnLegCancelled: { at: '2026-09-02T00:00:00.000Z' } } });
+    expect(planItemMove(view, ctx()).mode).toBe('NONE');
+  });
+
+  it('只有 no-show / 已释放快照的活航段行照常拆', () => {
+    const view = item({ quantity: 3, metadata: { returnReleased: { at: '2026-09-02T00:00:00.000Z' } } });
+    expect(planItemMove(view, ctx()).mode).toBe('SPLIT');
+  });
 });
 
 // ══════════════════════════════════════════════════════════════════════════

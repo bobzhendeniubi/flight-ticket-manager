@@ -80,6 +80,8 @@ import type { LegStatusItemLike, PublicLegStatus } from './orders.leg-status.js'
 import { computePerPaxShares } from './per-pax-share.js';
 import {
   deriveRoomsToMove,
+  isTerminalLegItem,
+  movedUnitsFor,
   occupancyOfPassengers,
   planItemMove,
   readUpgradeCount,
@@ -87,6 +89,7 @@ import {
   roundHalfGrid,
   type SplitContext,
   type SplitItemView,
+  type SplitMove,
   type SplitOccupancy,
   type SplitRowPatch,
 } from './split-move-strategies.js';
@@ -3800,7 +3803,10 @@ export class OrderService {
     query: ListOrdersQuery,
     requester: OrderRequester,
   ): Promise<Prisma.OrderWhereInput> {
-    const where = buildOrderFilterWhere(query);
+    // 代理不能按 legFlag 筛：那是内部航段口径，能筛就能反推（见 withoutAgentHiddenFilters）。
+    const where = buildOrderFilterWhere(
+      requester.role === 'AGENT' ? withoutAgentHiddenFilters(query) : query,
+    );
 
     // RBAC 过滤 — 先建基准可见集合，再按 query 过滤（但 query.agentId 不能覆盖可见集合）
     if (requester.role === 'CUSTOMER') {
@@ -12068,6 +12074,22 @@ export class OrderService {
       blockers.push('本单有待处理的议价申请，请先处理后再拆。');
     }
 
+    // ── 闸 10c：用过代理预存余额抵扣的单不许拆（口径同改归属的资金纠缠阻断）───────
+    // 预存抵扣的真源是 PrepaymentTransaction(OFFSET) 流水，它**按 orderId 挂在源单上**
+    //（Order.prepaymentOffset 那一列没有任何生产代码写入，恒为 0，指望不上）。
+    // 拆单只搬 paidAmount，流水一条都搬不走 —— 新单退款时按 orderId 查不到任何 OFFSET，
+    // 会把「本来是从余额里扣的钱」当成真现金全额退出去，等于凭空多退一笔。
+    // 最小安全动作：先由财务把这笔抵扣结清/冲回，再拆。
+    const splitBalanceOffset = await db.prepaymentTransaction.findFirst({
+      where: { orderId: order.id, type: PrepaymentTxType.OFFSET },
+      select: { id: true },
+    });
+    if (splitBalanceOffset != null) {
+      blockers.push(
+        '该单有预存余额抵扣记录，拆分后新单退款会按现金全额退出，请先由财务结清或冲回后再拆。',
+      );
+    }
+
     // ── 闸 11（已放开）：升舱行随拆按人劈开 ──────────────────────────────────
     // 旧口径拒拆含升舱的单。但升舱镜像账（metadata.businessUpgradeCount）本来就是逐行落库、
     // 逐行对称释放的，拆的时候把它按人劈到两侧即可 —— 执行段有「逐班次 Σ min(升舱位, 座位数)
@@ -12335,6 +12357,8 @@ export class OrderService {
       targetTotalCny,
       prePrepaymentOffsetCny,
       movedPrepaymentOffsetCny,
+      /** 本单挂着预存余额抵扣流水吗（闸 10c 已据此拒拆；执行段留作防御性审计条件）。 */
+      hasPrepaymentOffsetTxn: splitBalanceOffset != null,
       hotelItems: stayRows.map((it) => {
         const rooms = it.roomsBilled != null ? Number(it.roomsBilled) : null;
         const isBundleStay = it.kind === OrderItemKind.BUNDLE;
@@ -12685,6 +12709,21 @@ export class OrderService {
     //     根本不知道该填几个，硬要显式只会把它们逼进死路。
     const upgradeSplitByItem = new Map<string, number>();
     const { flightRows, returnItemId } = resolveSplitFlightLegs(order.items);
+    // 升舱校验与升舱汇总共用同一份上下文：两个 Map 是**引用**传进去的，
+    // 下面循环里往 upgradeSplitByItem 塞的值，2c 汇总时照样读得到。
+    const preUpgradeCtx = buildSplitContext({
+      movedIdSet,
+      totalPax: order.passengers.length,
+      occupancy: assessment.occupancy,
+      roomSplitByItem,
+      upgradeSplitByItem,
+      autoDeriveRooms: autoSplitRoomGroups,
+      movedUpgradeOutbound: 0,
+      movedUpgradeReturn: 0,
+      keptUpgradeOutbound: 0,
+      keptUpgradeReturn: 0,
+      splitPairToken: input.requestToken,
+    });
     for (const entry of input.upgradeSplit ?? []) {
       if (upgradeSplitByItem.has(entry.itemId)) {
         throw new BadRequestError('upgradeSplit 中同一机票行出现多次，请合并为一条');
@@ -12702,7 +12741,9 @@ export class OrderService {
           `机票行「${item.description}」随拆搬走的升舱位（${toMove}）超出该行升舱人数（${count}）`,
         );
       }
-      const moveQty = Math.min(view.quantity, k);
+      // 机票行的 quantity 是**占座数**（婴儿不占座），故两侧座位数按占座人头算 ——
+      // 与 moveFlightLike 落库时用的是同一个 movedUnitsFor，校验与落库不会各算各的。
+      const moveQty = movedUnitsFor(view, preUpgradeCtx);
       const keepQty = view.quantity - moveQty;
       if (toMove > moveQty || count - toMove > keepQty) {
         throw new BadRequestError(
@@ -12714,19 +12755,6 @@ export class OrderService {
     }
 
     // 2c. 升舱两侧分程汇总（套餐行 addOns 重建要用）：先按各机票行算出搬几个，再按航段归并。
-    const preUpgradeCtx = buildSplitContext({
-      movedIdSet,
-      totalPax: order.passengers.length,
-      occupancy: assessment.occupancy,
-      roomSplitByItem,
-      upgradeSplitByItem,
-      autoDeriveRooms: autoSplitRoomGroups,
-      movedUpgradeOutbound: 0,
-      movedUpgradeReturn: 0,
-      keptUpgradeOutbound: 0,
-      keptUpgradeReturn: 0,
-      splitPairToken: input.requestToken,
-    });
     let movedUpgradeOutbound = 0;
     let movedUpgradeReturn = 0;
     let keptUpgradeOutbound = 0;
@@ -12735,7 +12763,14 @@ export class OrderService {
       const view = toSplitItemView(item);
       const count = readUpgradeCount(view.metadata);
       if (count <= 0) return;
-      const moveQty = Math.min(view.quantity, k);
+      // 终态残骸行（回程过期作废 / 取消航段）整块留源单（planItemMove 判 NONE），
+      // 升舱位自然一个不搬 —— 这里必须与落库口径一致，否则汇总会算出源单不存在的账。
+      if (isTerminalLegItem(view.metadata)) {
+        keptUpgradeOutbound += item.id === returnItemId ? 0 : count;
+        keptUpgradeReturn += item.id === returnItemId ? count : 0;
+        return;
+      }
+      const moveQty = movedUnitsFor(view, preUpgradeCtx);
       const keepQty = view.quantity - moveQty;
       const moved = moveQty >= view.quantity ? count : resolveUpgradeToMove(view, preUpgradeCtx, moveQty, keepQty);
       // 无班次的行（no-show 释放后 flightScheduleId 置空）归去程：它本就是去程行的残骸。
@@ -12834,9 +12869,12 @@ export class OrderService {
     const preCostCents = sumTotalCostCents(order.items);
     const fullyMovedItemIds = new Set<string>();
     const splitItemIdMap = new Map<string, string>(); // 源行 id → 新单对应行 id（拆分行）
+    // 逐行的搬移决策留档：步骤 11 的「有占座人就必须有航段行」断言直接读它，不再回查数据库。
+    const movePlans: Array<{ item: SplitItemView; plan: SplitMove }> = [];
     for (const item of order.items) {
       const view = toSplitItemView(item);
       const plan = planItemMove(view, splitCtx);
+      movePlans.push({ item: view, plan });
       if (plan.mode === 'NONE') continue;
       if (plan.mode === 'WHOLE') {
         await tx.orderItem.update({
@@ -13309,6 +13347,52 @@ export class OrderService {
         totalCostCny: true,
       },
     });
+    // ── 「有占座人就必须有航段行」（fail-closed）─────────────────────────────────
+    //
+    // 座位守恒只保证两侧 Σ 相等，它拦不住「整行搬到一侧、另一侧一座不剩」：
+    // 2 大 1 婴的单拆「一位大人 + 婴儿」时，旧口径拿人头数 2 与机票行 quantity 2（占座数）比，
+    // 判成整行搬走 —— 源单剩着一位客人却连一条航段行都没有，Σ 照样相等，账却已经错了。
+    //
+    // 两个刻意的豁免：
+    //   · 终态残骸行（作废 / 取消航段）不计入 —— 它本来就整块留源单（planItemMove 判 NONE）；
+    //   · **拆前就不齐**的单不管（活航段座位数 < 全员占座人数）：那是历史脏数据，
+    //     拆单既不是成因也修不了它，拿这条断言拦住只会把这批单永久锁死。
+    const liveFlightSeats = (items: ReadonlyArray<SplitConservationRow>): number =>
+      items.reduce(
+        (sum, it) =>
+          it.kind === OrderItemKind.FLIGHT && !isTerminalLegItem(readJsonObject(it.metadata))
+            ? sum + (it.quantity ?? 0)
+            : sum,
+        0,
+      );
+    const preLiveFlightSeats = liveFlightSeats(order.items);
+    if (preLiveFlightSeats >= splitCtx.totalSeatPax && splitCtx.totalSeatPax > 0) {
+      // 两侧各自的活航段座位数直接由**本次的搬移决策**推出（movePlans 在步骤 4 逐行记下），
+      // 不再回查数据库：决策就是落库依据，二者必然一致，多一次往返反而多一个漂移点。
+      let keptSeats = 0;
+      let movedSeats = 0;
+      for (const { item, plan } of movePlans) {
+        if (item.kind !== OrderItemKind.FLIGHT || isTerminalLegItem(item.metadata)) continue;
+        if (plan.mode === 'NONE') keptSeats += item.quantity;
+        else if (plan.mode === 'WHOLE') movedSeats += item.quantity;
+        else {
+          keptSeats += plan.keep.quantity ?? item.quantity;
+          movedSeats += plan.move.quantity ?? 0;
+        }
+      }
+      const sides = [
+        { label: '留守', seatPax: splitCtx.keptOccupancy.seatPax, seats: keptSeats },
+        { label: '拆出', seatPax: splitCtx.movedOccupancy.seatPax, seats: movedSeats },
+      ];
+      for (const side of sides) {
+        if (side.seatPax > 0 && side.seats <= 0) {
+          throw new Error(
+            `拆单守恒断言失败：${side.label}侧还有 ${side.seatPax} 位占座客人，` +
+              '却一条有效航段行都没有（已回滚）',
+          );
+        }
+      }
+    }
     const postFlightQty = sumFlightQuantities(itemsAfter);
     for (const [key, preQty] of preFlightQty) {
       if ((postFlightQty.get(key) ?? 0) !== preQty) {
@@ -13443,8 +13527,12 @@ export class OrderService {
         moved: movedIdSet.has(p.id),
       })),
       commissionSplit,
+      // 审计条件看的是**预存流水**（PrepaymentTransaction(OFFSET)）而不是 Order.prepaymentOffset
+      // 那一列 —— 那一列没有任何生产代码写入、恒为 0，照它判等于这条审计永远不会触发。
+      // 闸 10c 已在准入段把有流水的单拒在门外，这里留作最后一道防御：万一有路径绕过闸，
+      // 至少财务能从审计里看到「这单的预存抵扣被拆过」。
       prepaymentOffsetSplit:
-        prePrepaymentOffsetCny !== 0
+        prePrepaymentOffsetCny !== 0 || assessment.hasPrepaymentOffsetTxn
           ? {
               beforeCny: prePrepaymentOffsetCny,
               keptCny: keptPrepaymentOffsetCny,
@@ -14585,6 +14673,18 @@ export class OrderService {
       );
     }
 
+    // ── 闸 5b2：回程行缺舱位信息 —— 放不了座就一步都别走 ────────────────────────
+    // 放座是按舱位做的（releaseSeatStrictWithinTx 要 scheduleId + cabin）。舱位为空时旧写法
+    // 静默跳过放座那一段，却照常把这一行的班次置空、落 returnReleased 快照 ——
+    // 结果是「座位一个没放回库存，系统却认为已经释放了」：这一班从此少卖 N 座，
+    // 而后来点「恢复回程」还会照空快照占回来。fail-closed：拦在门口，让运营先把舱位补上。
+    if (releaseReturn && returnItem?.flightScheduleId && !returnItem.flightCabin) {
+      blockers.push(
+        '回程航段缺舱位信息，无法释放座位；请先在订单里补全该航段的舱位等级后重试，' +
+          '或取消勾选「同时释放回程」只记录 no-show。',
+      );
+    }
+
     // ── 闸 5c：进行中的退款（与取消航段闸 9 同款）──────────────────────────────
     // 本操作虽不动钱，却会把回程座位放掉、把出票任务终态化 —— 退款报价快照是按
     //「申请那一刻这单还有哪些航段」算的，边审批边抽掉一段，批下来的金额就对不上了。
@@ -15015,6 +15115,14 @@ export class OrderService {
         // 2a. 放座：按下单时的升舱拆座镜像各退各舱（与取消航段第 3 步同一 helper）。
         const retScheduleId = returnItem.flightScheduleId;
         const retCabin = returnItem.flightCabin;
+        // fail-closed：有班次却没舱位 = 放不了座。旧写法在这里静默跳过放座、却照常置空班次
+        // 并落释放快照 —— 座位一个没回库存，系统却认为释放过了（闸 5b2 已在准入段拦过一次，
+        // 这里是并发改行的兜底：宁可整单回滚，也不留一条对不上账的「假释放」）。
+        if (retScheduleId && !retCabin) {
+          throw new BadRequestError(
+            '回程航段缺舱位信息，无法释放座位；请先补全该航段的舱位等级后重试。',
+          );
+        }
         if (retScheduleId && retCabin) {
           const meta = readJsonObject(returnItem.metadata);
           const rawUpgrade =
@@ -15668,6 +15776,10 @@ export class OrderService {
               byUserId: actor.userId,
               seats: totalSeats,
               oversold: oversellBy > 0,
+              // 超售座数与挤掉的软预留**逐轮**记在流水里：returnRestored 快照是覆盖写，
+              // 一行反复释放→恢复几轮之后只剩最后一轮，报表照快照统计会把中间几轮全漏掉。
+              oversoldBy: oversellBy,
+              displacedReserved: displacedReservedTotal,
               // 恢复的结果只由释放快照决定，请求体里没有能改结果的字段 → 恒定空指纹。
               fingerprint: EMPTY_LEG_ACTION_FINGERPRINT,
             }),
@@ -15802,6 +15914,39 @@ export class OrderService {
           at: now,
         });
       }
+
+      // ── 6b. 待办收口：这一行的「回程已释放」提醒 + 未处理的撤名单工单 ──────────────
+      //
+      // 不收口的后果与作废那条一模一样：待办永远催下去，运营还会照旧条去点「恢复回程」，
+      // 而这一段已经恢复完了。写法照 voidReleasedReturnLegWithinTx，只是结论换成「已恢复」。
+      const releasedAtIso = readJsonObject(meta.returnReleased).at;
+      if (typeof releasedAtIso === 'string' && releasedAtIso !== '') {
+        await tx.operationalReminder.updateMany({
+          where: {
+            ruleKey: { in: noShowReleasedReminderRuleKeys(item.id, releasedAtIso) },
+            status: { in: [ReminderStatus.OPEN, ReminderStatus.IN_PROGRESS] },
+          },
+          data: {
+            status: ReminderStatus.DONE,
+            resolvedAt: now,
+            resolvedNote: '回程已恢复到原班次，本条收口。',
+          },
+        });
+      }
+      // 释放时派的「撤名单/退票」工单若还没人处理，这一刀已经作废了 —— 名单不用撤了，
+      // 要办的是上面步骤 6 新派的「重新上名单」。置 SKIPPED 而不是 DONE：这活并没有做完，
+      // 只是被本次恢复接手了，报表上不该记成一条已完成的工单。
+      await tx.operationalReminder.updateMany({
+        where: {
+          ruleKey: { startsWith: `NOSHOW_WITHDRAW:${item.id}:` },
+          status: { in: [ReminderStatus.OPEN, ReminderStatus.IN_PROGRESS] },
+        },
+        data: {
+          status: ReminderStatus.SKIPPED,
+          resolvedAt: now,
+          resolvedNote: '已由本次恢复接手，改派重新上名单。',
+        },
+      });
 
       // ── 7. 物化列同步 + 留痕流水（金额恒 0）──
       await syncOrderHasReturnLeg(tx, orderId);
@@ -16291,6 +16436,14 @@ export type LegActionLogEntry = {
   seats?: number;
   /** 本次恢复是否超售（RESTORE 才有）。 */
   oversold?: boolean;
+  /**
+   * 本次**新增**的超售座数（RESTORE 才有）。
+   * 只记布尔的 oversold 说不出量：同一行释放→恢复→再释放→再恢复反复几轮，
+   * 快照 returnRestored 是覆盖写，只留得下最后一轮 —— 报表按快照统计会漏掉中间几轮的超售。
+   */
+  oversoldBy?: number;
+  /** 本次挤掉了几座他人软预留（他人 ACTIVE 锁位 + 占位单余座；RESTORE 才有）。 */
+  displacedReserved?: number;
   /**
    * 本次动作的关键入参指纹（见 legActionFingerprint）。
    * 回放时逐字比对：同一个 token 换一份请求体再发一次，指纹对不上就拒，绝不静默按上一次的入参回成功。
@@ -17079,6 +17232,11 @@ interface SplitAssessment {
   prePrepaymentOffsetCny: number;
   /** 随拆搬到新单的预存抵扣（按份额比；留守 = 拆前 − 本值）。 */
   movedPrepaymentOffsetCny: number;
+  /**
+   * 本单挂着预存余额抵扣流水（PrepaymentTransaction(OFFSET)）吗。
+   * 闸 10c 据此拒拆；执行段拿它当审计触发条件（那时已被闸拦下，纯属防御）。
+   */
+  hasPrepaymentOffsetTxn: boolean;
   hotelItems: SplitHotelItemView[];
   upgradeItems: SplitUpgradeItemView[];
   /**
@@ -17398,7 +17556,10 @@ function collectSplitUpgradeItems(
     const view = toSplitItemView(item);
     const count = readUpgradeCount(view.metadata);
     if (count <= 0) return;
-    const moveQty = Math.min(view.quantity, ctx.k);
+    // 终态残骸行不随拆（planItemMove 判 NONE），预检也不该把它列进「可拆升舱位」。
+    if (isTerminalLegItem(view.metadata)) return;
+    // 机票行两侧座位数按**占座人头**算（婴儿不占座），与落库同一个 movedUnitsFor。
+    const moveQty = movedUnitsFor(view, ctx);
     const keepQty = view.quantity - moveQty;
     out.push({
       itemId: view.id,
@@ -17431,7 +17592,14 @@ function splitMixedRoomGroup(
   let movedHalf = Math.round((srcHalf * movedIds.length) / group.passengerIds.length);
   movedHalf = Math.min(Math.max(movedHalf, 1), Math.max(1, srcHalf - 1));
   const keptHalf = srcHalf - movedHalf;
-  const baseId = typeof group.raw.id === 'string' && group.raw.id ? group.raw.id : 'group';
+  // 房组 id 缺省时**不能**回落成固定字符串：一张单里两个无 id 的房组同时被劈开，
+  // 两对半组会共用同一个 `group:<token>` 配对键，房控按 key 归并时会把四个半组
+  // 错配成两间（甚至把 A 组的半间与 B 组的半间配成一间）。改用房组内乘客 id 排序后拼成的
+  // 稳定派生值：同一房组每次算出来都一样，不同房组必然不同。
+  const baseId =
+    typeof group.raw.id === 'string' && group.raw.id
+      ? group.raw.id
+      : `pax:${[...group.passengerIds].sort().join('|')}`;
   // 配对键：两个半组写同一个 key，房控按 key 把它们配回一间（不看性别 —— 夫妻拼房
   // 被拆开后正是「一男一女各半间」，按性别配对会算成两间）。
   const splitPairKey = `${baseId}:${pairToken}`;
@@ -17980,6 +18148,24 @@ export function applyExportAgentScope(
  *   **的签证单**」也召回（详见下方 travelFrom/travelTo 分支；空单/接送单/资料不全的机酒单
  *   不在豁免之列）。列表路径保持默认 false。
  */
+/**
+ * 代理视角的筛选净化：剥掉 `legFlag`（航段留痕四态）。
+ *
+ * legFlag 是**内部口径**的枚举（NO_SHOW / RETURN_RELEASED / RETURN_RESTORED / RETURN_VOIDED）。
+ * serializeOrder 对代理已经把它连同行描述前缀一起脱敏掉了（见 orders.service 的 redact 分支），
+ * 可它仍然是个**可筛的查询参数** —— 代理挨个枚举值筛一遍，就能从「哪些单出现在结果里」
+ * 反推出每张单的内部航段状态，脱敏白做。
+ *
+ * 处置是**忽略这个键**（当成没传），不是报错：代理侧界面本来就不该出现这个筛选器，
+ * 报 400 只会把「有人在探测」变成一条噪音告警，静默忽略等价于「这个维度对你不存在」。
+ */
+export function withoutAgentHiddenFilters<T extends OrderListFilters>(query: T): T {
+  if (query.legFlag == null) return query;
+  const next = { ...query };
+  delete next.legFlag;
+  return next;
+}
+
 export function buildOrderFilterWhere(
   query: OrderListFilters,
   options?: { includeAnchorless?: boolean },
@@ -20154,6 +20340,9 @@ const REDACTED_ITEM_METADATA_KEYS: readonly string[] = [
   'cancelledLeg', // 被取消的是去程还是回程（内部航段方向判定）
   'returnItemId', // 指向被作废的那条航段行 id（内部关联）
   'feeMode', // 手续费口径：按政策 / 手工核定 —— 让代理看见等于把议价空间摊开
+  // ── 拆单留痕（都指向**另一张单**上的行，对外一律不认）────────────────────────
+  'splitPairKey', // 住宿行劈半的配对键 = `<源行 id>:<拆单令牌>`：泄露源行 id 与内部拆单令牌
+  'splitFromItemId', // 这条行是从哪条源行拆出来的（源行可能在代理看不见的另一张单上）
 ];
 // ⚠ 新增「会话 / 座位账快照」类 metadata 键（售后动作往行上落的留痕对象）必须来这里登记：
 //    它们普遍带原价、成本、政策报价、班次 id 与内部操作人，随 `...i` 展开就会整段下发给代理。

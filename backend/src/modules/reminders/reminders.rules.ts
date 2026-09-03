@@ -623,8 +623,12 @@ export interface RuleReleasedReturnLeg {
  *
  * 原回程班次已起飞 → **照样提醒，但换一条**（ruleKey 加 `:DEPARTED` 后缀、文案改「请确认作废或人工处置」）：
  * 座位早卖出去了，「恢复回程」确实已经无效，但这一行仍卡在「已释放」态没人收口 ——
- * 直接静默停止，这单就永远没人管了。系统**没有**「起飞后自动作废」的定时任务，
- * 所以文案里一个字都不能承诺它，只能叫人来处置。
+ * 直接静默停止，这单就永远没人管了。
+ *
+ * ⚠ 文案口径：系统**有**「起飞满 2 小时自动作废」的定时任务（orders/no-show-void.ts，
+ * 每小时扫一次，只打终态标：不动座位、不动钱、不动开票位）。所以这条待办不能再说
+ * 「系统不会自动作废」—— 那是自动作废上线前的旧话，照旧文案运营会以为不点就永远挂着。
+ * 现文案如实说：系统会自动收口，想提前收口就手工作废。
  */
 /**
  * 「回程已释放」提醒的两个 ruleKey（原条 + 起飞后换的 `:DEPARTED` 条）。
@@ -678,7 +682,7 @@ export function buildNoShowReturnReleasedCandidates(
         body:
           head +
           '该回程班次已起飞，座位无法再恢复，但这一段仍停在「已释放」状态。' +
-          '请确认作废或人工处置（系统不会自动作废）。',
+          '起飞满 2 小时系统会自动作废收口；需要提前收口可到订单详情手工作废。',
         priority: ReminderPriority.HIGH,
         dueAt: today,
       },
@@ -900,7 +904,13 @@ export async function generateRuleReminders(
       where: {
         kind: 'FLIGHT',
         flightScheduleId: null,
-        metadata: { path: ['returnReleased'], not: Prisma.DbNull },
+        // 已作废（起飞后 job 或人工打了 returnVoidedFinal 终态标）的行让**数据库**筛掉：
+        // 下面的 isReturnCurrentlyReleased 本来也会把它们过滤成 live=false，
+        // 但那是把整坨 metadata 捞回内存之后才判的 —— 存量作废行只增不减，白捞一年比一年多。
+        AND: [
+          { metadata: { path: ['returnReleased'], not: Prisma.DbNull } },
+          { metadata: { path: ['returnVoidedFinal'], equals: Prisma.DbNull } },
+        ],
         order: { deletedAt: null, status: { in: RETURN_RELEASED_STATUSES } },
       },
       select: {

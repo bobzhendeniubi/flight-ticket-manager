@@ -1266,4 +1266,28 @@ describe('航段状态列 — 《全岗可用》与《签证专用》', () => {
     expect(TICKETING_COLUMNS).toHaveLength(27);
     expect(TICKETING_COLUMNS.map((c) => c.header)).not.toContain('航段状态');
   });
+
+  // 代理导出（路由解析出 agentScope 时）这一格必须是空的：状态文案会带超售座数，
+  // 那是我方与航司之间的内部风控口径，交给代理等于把这一班卖穿了多少告诉同行。
+  // 置空而不是删列 —— 列序是对外承诺过的，少一列会让下游全部错位。
+  it('代理导出：《全岗可用》与《签证专用》该格置空，列本身仍在', () => {
+    const order = fixtureNoShowReleased();
+    const agentCtx = buildOrderContext(order, { redactLegStatus: true });
+    expect(orderToFullRows(order, agentCtx).every((r) => r.legStatus === '')).toBe(true);
+    expect(orderToVisaRows(order, agentCtx).every((r) => r.legStatus === '')).toBe(true);
+    // 列定义不动（只置空格子）。
+    expect(FULL_COLUMNS.map((c) => c.header)).toContain('航段状态');
+    expect(VISA_COLUMNS.map((c) => c.header)).toContain('航段状态');
+  });
+
+  it('代理导出连超售座数一起藏掉（不给「回程已恢复（超售 2 座）」这种文案）', () => {
+    const order = fixtureRoundTrip();
+    const items = order.items as unknown as Array<Record<string, unknown>>;
+    items[1].metadata = {
+      returnReleased: { at: RELEASED_AT },
+      returnRestored: { at: '2026-09-02T05:00:00.000Z', oversold: true, oversoldBy: 2 },
+    };
+    const [row] = orderToFullRows(order, buildOrderContext(order, { redactLegStatus: true }));
+    expect(row.legStatus).toBe('');
+  });
 });

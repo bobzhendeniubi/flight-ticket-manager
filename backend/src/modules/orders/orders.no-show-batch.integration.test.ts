@@ -239,7 +239,7 @@ describe('按航班批量 no-show（真 DB）', () => {
       actor,
     );
 
-    expect(result.summary).toEqual({ ok: 2, failed: 0, releasedSeats: 3 });
+    expect(result.summary).toEqual({ ok: 2, failed: 0, releasedSeats: 3, replayedCount: 0 });
     const resA = result.results.find((r) => r.orderId === orderA.id)!;
     const resB = result.results.find((r) => r.orderId === orderB.id)!;
     expect(resA).toMatchObject({ ok: true, releasedSeats: 2 });

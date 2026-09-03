@@ -11,7 +11,7 @@
  */
 import { describe, expect, it, vi } from 'vitest';
 import ExcelJS from 'exceljs';
-import { OrderItemKind, ReminderStatus } from '@prisma/client';
+import { OrderItemKind, ReminderStatus, UserRole } from '@prisma/client';
 import type { PrismaClient } from '@prisma/client';
 import {
   aggregateNoShowReport,
@@ -20,6 +20,9 @@ import {
   renderNoShowReportWorkbook,
   type NoShowReportOrderView,
 } from './no-show-report.js';
+
+/** 报表只对内部岗位开放（模块内部再断一次，纵深防御）——单测统一用运营身份调。 */
+const STAFF_ACTOR = { userId: 'u-staff', role: UserRole.STAFF };
 
 const OUT_DEPART = new Date('2026-09-02T01:40:00.000Z'); // 北京 09:40
 const RET_DEPART = new Date('2026-09-09T05:00:00.000Z');
@@ -188,6 +191,73 @@ describe('aggregateNoShowReport · 座位口径', () => {
     expect(r.details[0].restoredAt).toMatch(/^\d{4}-\d{2}-\d{2} \d{2}:\d{2}$/);
   });
 
+  // 多轮释放→恢复：returnRestored 是覆盖写，只留得下最后一轮。超售必须按 legActionLog
+  // 的 RESTORE 流水逐次累加，否则中间几轮的超售在报表上凭空消失。
+  it('两轮恢复各超售 1 座 → 合计 2 座（按流水累加，不看覆盖写的快照）', () => {
+    const retMeta = {
+      returnReleased: {
+        at: '2026-09-03T02:00:00.000Z',
+        releasedSeats: [{ cabin: 'ECONOMY', quantity: 2 }],
+      },
+      // 快照只剩最后一轮：oversoldBy = 1。
+      returnRestored: {
+        at: '2026-09-03T08:00:00.000Z',
+        seats: 2,
+        oversold: true,
+        oversoldBy: 1,
+        displacedReserved: 0,
+      },
+      legActionLog: [
+        { type: 'NO_SHOW', requestToken: 't1', at: '2026-09-02T02:00:00.000Z', seats: 2 },
+        {
+          type: 'RESTORE',
+          requestToken: 't2',
+          at: '2026-09-02T08:00:00.000Z',
+          seats: 2,
+          oversoldBy: 1,
+          displacedReserved: 2,
+        },
+        { type: 'RELEASE', requestToken: 't3', at: '2026-09-03T02:00:00.000Z', seats: 2 },
+        {
+          type: 'RESTORE',
+          requestToken: 't4',
+          at: '2026-09-03T08:00:00.000Z',
+          seats: 2,
+          oversoldBy: 1,
+          displacedReserved: 0,
+        },
+      ],
+    };
+    const r = aggregateNoShowReport([
+      order({ items: [outboundRow(noShowMeta()), restoredReturnRow(retMeta)] }),
+    ]);
+    expect(r.rows[0]).toMatchObject({ oversoldSeats: 2, displacedSeats: 2 });
+  });
+
+  it('老数据（流水里没有这两个数）回落到快照口径，与改动前一字不差', () => {
+    const retMeta = {
+      returnReleased: {
+        at: '2026-09-02T02:00:00.000Z',
+        releasedSeats: [{ cabin: 'ECONOMY', quantity: 2 }],
+      },
+      returnRestored: {
+        at: '2026-09-02T08:00:00.000Z',
+        seats: 2,
+        oversold: true,
+        oversoldBy: 3,
+        displacedReserved: 1,
+      },
+      // 老流水条目只有 seats，没有 oversoldBy / displacedReserved。
+      legActionLog: [
+        { type: 'RESTORE', requestToken: 't2', at: '2026-09-02T08:00:00.000Z', seats: 2 },
+      ],
+    };
+    const r = aggregateNoShowReport([
+      order({ items: [outboundRow(noShowMeta()), restoredReturnRow(retMeta)] }),
+    ]);
+    expect(r.rows[0]).toMatchObject({ oversoldSeats: 3, displacedSeats: 1 });
+  });
+
   it('起飞后作废：座落 voided，不再算进当前可卖', () => {
     const retMeta = {
       returnReleased: {
@@ -287,7 +357,7 @@ describe('loadNoShowReport · 装载口径', () => {
   // 一班几百张正常单要连行带 metadata 全捞进内存再逐单丢掉。
   it('按 legFlag 粗筛（有索引），回收站单不进表', async () => {
     const { client, findMany } = fakeClient(['sch-a']);
-    await loadNoShowReport('2026-09-01', '2026-09-03', client);
+    await loadNoShowReport('2026-09-01', '2026-09-03', STAFF_ACTOR, client);
     const where = findMany.mock.calls[0][0].where;
     expect(where.legFlag).toEqual({ not: 'NONE' });
     expect(where.deletedAt).toBeNull();
@@ -296,7 +366,7 @@ describe('loadNoShowReport · 装载口径', () => {
 
   it('区间内一个班次都没有 → 直接回空表，不去捞订单', async () => {
     const { client, findMany } = fakeClient([]);
-    const r = await loadNoShowReport('2026-09-01', '2026-09-03', client);
+    const r = await loadNoShowReport('2026-09-01', '2026-09-03', STAFF_ACTOR, client);
     expect(r).toEqual({ rows: [], totals: expect.any(Object), details: [] });
     expect(findMany).not.toHaveBeenCalled();
   });

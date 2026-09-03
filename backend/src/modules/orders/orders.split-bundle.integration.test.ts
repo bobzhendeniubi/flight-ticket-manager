@@ -619,6 +619,132 @@ describe('套餐单拆单 · 七条守恒（真 DB）', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
+// 婴儿不占座：机票行的 quantity 是**占座数**（2 大 1 婴 → 2 座），拿人头数（3）去比会把
+// 「拆 1 大 + 1 婴」判成整行搬走 —— 留守那位大人的座位跟着被搬到新单，源单一条航段行都不剩。
+describe('含婴儿的单拆单 · 机票行按占座数劈（真 DB）', () => {
+  /** 2 成人 + 1 婴儿：机票行 2 座，套餐行 headCount 3 / seatPax 2。 */
+  async function createInfantOrder() {
+    const outbound = await createSchedule({ hoursFromNow: 48, economySold: 2 });
+    const ret = await createSchedule({ hoursFromNow: 24 * 10, economySold: 2 });
+    const order = await prisma.order.create({
+      data: {
+        orderNumber: uniq('TEST-SPLITI'),
+        status: OrderStatus.PAID,
+        subtotal: new Prisma.Decimal(20000),
+        total: new Prisma.Decimal(20000),
+        paidAmount: new Prisma.Decimal(20000),
+        contactName: 'INFANT SPLIT E2E',
+        contactPhone: '13800138000',
+        items: {
+          create: [
+            {
+              kind: OrderItemKind.FLIGHT,
+              description: '去程（经济舱）',
+              quantity: 2,
+              unitPrice: new Prisma.Decimal(5000),
+              amount: new Prisma.Decimal(10000),
+              totalCostCny: new Prisma.Decimal(1200),
+              flightScheduleId: outbound.id,
+              flightCabin: CabinClass.ECONOMY,
+            },
+            {
+              kind: OrderItemKind.FLIGHT,
+              description: '回程（经济舱）',
+              quantity: 2,
+              unitPrice: new Prisma.Decimal(5000),
+              amount: new Prisma.Decimal(10000),
+              totalCostCny: new Prisma.Decimal(1200),
+              flightScheduleId: ret.id,
+              flightCabin: CabinClass.ECONOMY,
+            },
+          ],
+        },
+        passengers: {
+          create: [
+            passengerData(1),
+            passengerData(2),
+            passengerData(3, {
+              passengerType: PassengerType.INFANT,
+              dateOfBirth: new Date('2026-01-01'),
+            }),
+          ],
+        },
+      },
+      include: { items: true, passengers: true },
+    });
+    const [p1, p2, infant] = order.passengers;
+    return { order, outbound, ret, p1, p2, infant };
+  }
+
+  it('拆「大人 A + 婴儿」：两侧各留 1 座，绝不整行搬走', async () => {
+    const actor = await adminActor();
+    const { order, p1, infant } = await createInfantOrder();
+    const before = await ledgerOf([order.id]);
+
+    const res = await service.splitOrder(
+      order.id,
+      { passengerIds: [p1.id, infant.id], requestToken: token('e1') },
+      actor,
+    );
+
+    const src = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+      include: { items: true, passengers: true },
+    });
+    const tgt = await prisma.order.findUniqueOrThrow({
+      where: { id: res.targetOrderId },
+      include: { items: true, passengers: true },
+    });
+
+    const seatsOf = (items: Array<{ kind: OrderItemKind; quantity: number }>) =>
+      items.filter((it) => it.kind === OrderItemKind.FLIGHT).reduce((n, it) => n + it.quantity, 0);
+    // 去程 + 回程各劈成 1/1：两侧各 2 座（一去一回），合计仍是 4。
+    expect(seatsOf(src.items)).toBe(2);
+    expect(seatsOf(tgt.items)).toBe(2);
+    // 婴儿跟着走，人头 2 / 1。
+    expect(tgt.passengers).toHaveLength(2);
+    expect(src.passengers).toHaveLength(1);
+
+    // 座位与钱守恒。
+    const after = await ledgerOf([order.id, res.targetOrderId]);
+    expect(after.seats).toBe(before.seats);
+    expect(after.total).toBe(before.total);
+    expect(after.paid).toBe(before.paid);
+    expect(after.costCents).toBe(before.costCents);
+  });
+
+  it('只拆婴儿：机票行一座不搬，源单座位分毫不动', async () => {
+    const actor = await adminActor();
+    const { order, infant } = await createInfantOrder();
+    const before = await ledgerOf([order.id]);
+
+    const res = await service.splitOrder(
+      order.id,
+      { passengerIds: [infant.id], requestToken: token('e2') },
+      actor,
+    );
+
+    const src = await prisma.order.findUniqueOrThrow({
+      where: { id: order.id },
+      include: { items: true },
+    });
+    const tgt = await prisma.order.findUniqueOrThrow({
+      where: { id: res.targetOrderId },
+      include: { items: true, passengers: true },
+    });
+    const seatsOf = (items: Array<{ kind: OrderItemKind; quantity: number }>) =>
+      items.filter((it) => it.kind === OrderItemKind.FLIGHT).reduce((n, it) => n + it.quantity, 0);
+    expect(seatsOf(src.items)).toBe(4); // 去 2 + 回 2，一座没动
+    expect(seatsOf(tgt.items)).toBe(0); // 婴儿不占座 → 新单没有航段行
+    expect(tgt.passengers).toHaveLength(1);
+
+    const after = await ledgerOf([order.id, res.targetOrderId]);
+    expect(after.seats).toBe(before.seats);
+    expect(after.total).toBe(before.total);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
 describe('套餐单拆完之后改档 · 两侧各按各自人数算', () => {
   it('源单（2 人）与新单（1 人）都能改档，且新档金额随各自人数不同', async () => {
     const actor = await adminActor();
