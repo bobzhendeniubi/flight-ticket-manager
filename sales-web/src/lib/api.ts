@@ -328,6 +328,17 @@ export type DocumentType = 'PASSPORT' | 'ID_CARD' | 'OTHER';
 export type PassengerType = 'ADULT' | 'CHILD' | 'INFANT';
 export type PaymentMethod = 'WECHAT_PAY' | 'ALIPAY' | 'BANK_CARD' | 'AGENT_PREPAYMENT';
 
+/**
+ * 对外中性航段状态（镜像后端 orders.leg-status.ts 的 PublicLegStatus）。
+ * 去程/回程被改动后（未登机、取消航段、回程暂无班次）后端只给这个中性枚举，
+ * 不下发任何内部动作口径；买家口吻的文案统一放在 lib/legStatus.ts。
+ */
+export type PublicLegStatus =
+  | 'RETURN_PENDING_REARRANGE'
+  | 'RETURN_CANCELLED'
+  | 'OUTBOUND_CANCELLED'
+  | 'OUTBOUND_NOT_BOARDED';
+
 export interface OrderItem {
   id: string;
   kind: OrderItemKind;
@@ -353,6 +364,11 @@ export interface OrderItem {
   departureDate?: string | null;
   /** FLIGHT 行：出发时间（HH:MM） */
   departureTime?: string | null;
+  /**
+   * 对外中性航段状态；仅 AGENT/CUSTOMER 视角下发，无状态时不带该键。
+   * 前端据此在航段行上补一句说明（见 lib/legStatus.ts），避免无班次的行显示成光杆。
+   */
+  publicLegStatus?: PublicLegStatus;
 }
 
 export interface OrderPassenger {
@@ -942,6 +958,8 @@ export interface MaskedOrderItem {
   travelDate: string | null;
   /** 该航段是否发生过航变改班（前台标红提示「留意新起飞时间」）；后端脱敏后仅暴露此布尔 */
   flightChanged?: boolean;
+  /** 对外中性航段状态（无状态时不带该键），文案见 lib/legStatus.ts */
+  publicLegStatus?: PublicLegStatus;
 }
 
 /** GET /orders/lookup 返回的脱敏订单（无需登录，订单号 + 手机号或邮箱即可查） */

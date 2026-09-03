@@ -73,7 +73,9 @@ import {
   LEGACY_RETURN_RELEASED_PREFIX,
   NO_SHOW_PREFIX,
   RETURN_RELEASED_PREFIX,
+  derivePublicLegStatus,
 } from './orders.leg-status.js';
+import type { LegStatusItemLike, PublicLegStatus } from './orders.leg-status.js';
 import { computePerPaxShares } from './per-pax-share.js';
 import {
   deriveRoomsToMove,
@@ -20187,6 +20189,17 @@ export function serializeOrder<T extends OrderLike>(
               ),
             }
           : {}),
+        // 对外中性航段状态：前缀剥掉、快照黑名单掉之后，被释放的回程行在前台只剩一个光杆名字
+        //   （无班次 → 无日期无航班号），客人会以为系统坏了。这里补一个**枚举**让前端能落一句
+        //   买家口吻的说明，不含任何内部动作/操作人/库存口径。
+        //   内部角色不下发：他们有 legFlag 与行描述前缀，够用且更细。
+        //   注意必须从原始行 i 派生 —— 上面的 metadata 脱敏已经把 noShow/returnReleased 等快照抹掉了。
+        ...(redact
+          ? (() => {
+              const publicLegStatus = derivePublicLegStatus(i as unknown as LegStatusItemLike);
+              return publicLegStatus ? { publicLegStatus } : {};
+            })()
+          : {}),
         // 未落位随机单还没落到具体酒店 → 用档次名（「四星随机」）当酒店名，让各处「住哪」
         // 一栏如实显示"买的是随机、待落位"，而不是空白（落位后本列被清空，自然回到真实酒店名）。
         hotelName:
@@ -20236,6 +20249,8 @@ export interface MaskedOrderView {
     amount: string;
     travelDate: string | null; // 出行/入住日期（仅日期，无时间）
     flightChanged: boolean; // 该航段是否发生过航变改班（前台标红提示「留意新起飞时间」）
+    /** 对外中性航段状态（无状态时不带该键）；前端据此落一句买家口吻的说明。 */
+    publicLegStatus?: PublicLegStatus;
   }>;
   passengers: Array<{ name: string }>; // 仅名（given name），姓氏脱敏
 }
@@ -20286,16 +20301,21 @@ function maskOrderForPublic(order: OrderForMasking): MaskedOrderView {
     paymentStatus,
     createdAt: order.createdAt,
     total: order.total.toString(),
-    items: order.items.map((it) => ({
-      kind: it.kind,
-      // 公开脱敏视图同样不露内部留痕前缀（口径与 serializeOrder 的对外分支一致）。
-      productName: stripInternalLegPrefix(it.description),
-      quantity: it.quantity,
-      amount: it.amount.toString(),
-      travelDate: maskedItemTravelDate(it),
-      // 仅暴露「是否航变」这个客户可见事实布尔，不带任何内部班次 id/明细（脱敏口径）。
-      flightChanged: hasFlightChanged((it as { metadata?: unknown }).metadata),
-    })),
+    items: order.items.map((it) => {
+      // 中性航段状态（口径与 serializeOrder 的对外分支一致）：无班次的航段行不至于变光杆。
+      const publicLegStatus = derivePublicLegStatus(it as unknown as LegStatusItemLike);
+      return {
+        kind: it.kind,
+        // 公开脱敏视图同样不露内部留痕前缀（口径与 serializeOrder 的对外分支一致）。
+        productName: stripInternalLegPrefix(it.description),
+        quantity: it.quantity,
+        amount: it.amount.toString(),
+        travelDate: maskedItemTravelDate(it),
+        // 仅暴露「是否航变」这个客户可见事实布尔，不带任何内部班次 id/明细（脱敏口径）。
+        flightChanged: hasFlightChanged((it as { metadata?: unknown }).metadata),
+        ...(publicLegStatus ? { publicLegStatus } : {}),
+      };
+    }),
     passengers: order.passengers.map((p) => ({ name: maskFamilyName(p.fullName) })),
   };
 }

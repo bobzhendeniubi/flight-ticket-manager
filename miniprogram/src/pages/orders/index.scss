@@ -27,6 +27,16 @@
       border-bottom: 2rpx solid #f1f5f9;
       .order-item-line { display: block; color: #334155; font-size: 26rpx; padding: 4rpx 0; }
       .more { color: #94a3b8; font-size: 22rpx; }
+      /* 航段说明（回程待重新安排 / 已取消…）：琥珀提示，不是错误 */
+      .order-item-note {
+        display: inline-block;
+        margin: 2rpx 0 4rpx 16rpx;
+        padding: 2rpx 12rpx;
+        border-radius: 999rpx;
+        background: #fef3c7;
+        color: #92400e;
+        font-size: 22rpx;
+      }
     }
     .order-footer {
       display: flex;

@@ -7,6 +7,7 @@ import { View, Text, ScrollView } from '@tarojs/components';
 import { api, ApiError } from '../../lib/api';
 import type { OrderSummary, OrderStatus } from '../../lib/types';
 import { formatDateCn } from '../../lib/datetime';
+import { legStatusNote } from '../../lib/legStatus';
 import { useAuth } from '../../stores/auth';
 import './index.scss';
 
@@ -103,11 +104,16 @@ export default function OrdersPage() {
               <Text className='status' style={{ color: st.color }}>{st.label}</Text>
             </View>
             <View className='order-items'>
-              {o.items.slice(0, 2).map((it) => (
-                <Text key={it.id} className='order-item-line'>
-                  · {it.description}
-                </Text>
-              ))}
+              {o.items.slice(0, 2).map((it) => {
+                // 航段行的说明（回程待重新安排 / 已取消…）—— 未登机不再多说一句（见 lib/legStatus）。
+                const legNote = legStatusNote(it.publicLegStatus);
+                return (
+                  <View key={it.id}>
+                    <Text className='order-item-line'>· {it.description}</Text>
+                    {legNote && <Text className='order-item-note'>{legNote}</Text>}
+                  </View>
+                );
+              })}
               {o.items.length > 2 && <Text className='more'>+{o.items.length - 2} 项</Text>}
             </View>
             <View className='order-footer'>

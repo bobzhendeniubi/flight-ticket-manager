@@ -192,3 +192,36 @@ export function formatOrderLegStatus(items: LegStatusItemLike[]): string {
   }
   return parts.join(' / ');
 }
+
+// ── 对外（代理 / 客户）视角的中性航段状态 ────────────────────────────────────
+//
+// 内部五态（LegStatus）连同行描述前缀一起对外剥离后，回程那一行在前台/小程序上只剩一个
+// 光杆名字：没班次、没日期、没说明，客人会以为系统坏了。这里给对外视角一个**中性枚举**，
+// 让前端能落一句买家口吻的说明，同时不暴露「座位放回库存 / 被转卖」这类我方内部动作。
+// 只下发枚举值，文案由各前端自己写（后端不落中文，避免同一句话在四端各存一份）。
+
+/** 对外可见的航段状态（没有可说的 → null，前端保持原样）。 */
+export type PublicLegStatus =
+  | 'RETURN_PENDING_REARRANGE' // 回程当前无班次，待重新安排
+  | 'RETURN_CANCELLED' // 回程已取消（作废 / 取消航段）
+  | 'OUTBOUND_CANCELLED' // 去程已取消
+  | 'OUTBOUND_NOT_BOARDED'; // 去程未登机（客人自己知道，前端不必额外解释）
+
+/**
+ * 内部五态 → 对外中性状态。
+ * 「回程已恢复」= 已经重新安排妥当，对外没有额外要说的 → null（回到普通航段行的展示）。
+ */
+export function derivePublicLegStatus(item: LegStatusItemLike): PublicLegStatus | null {
+  switch (deriveLegStatus(item)) {
+    case '回程座位已释放':
+      return 'RETURN_PENDING_REARRANGE';
+    case '回程已作废':
+      return 'RETURN_CANCELLED';
+    case '去程已作废':
+      return 'OUTBOUND_CANCELLED';
+    case '去程未登机':
+      return 'OUTBOUND_NOT_BOARDED';
+    default:
+      return null;
+  }
+}

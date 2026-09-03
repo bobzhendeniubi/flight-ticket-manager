@@ -644,3 +644,176 @@ describe('serializeOrder · legFlag 物化列', () => {
     }
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════════
+// 对外中性航段状态 publicLegStatus：
+//   前缀剥掉 + 快照黑名单之后，被释放的回程行在前台只剩光杆名字（无班次→无日期无航班号），
+//   客人会以为系统坏了。对外视角补一个中性枚举让前端能落一句买家口吻的说明；
+//   内部角色不下发（他们有 legFlag 与行描述前缀）。枚举本身不含任何内部动作/操作人/库存口径。
+// ══════════════════════════════════════════════════════════════════════════
+describe('serializeOrder · 对外中性航段状态 publicLegStatus', () => {
+  /** 各种航段留痕 → 对外应得到的中性状态（undefined = 不下发该键）。 */
+  const LEG_CASES: Array<{
+    name: string;
+    item: Record<string, unknown>;
+    expected: string | undefined;
+  }> = [
+    {
+      name: '回程当前已释放（无班次）→ 待重新安排',
+      item: {
+        flightScheduleId: null,
+        metadata: { returnReleased: { at: '2026-09-01T10:00:00Z' } },
+      },
+      expected: 'RETURN_PENDING_REARRANGE',
+    },
+    {
+      name: '回程起飞后自动作废 → 回程已取消',
+      item: {
+        flightScheduleId: null,
+        metadata: { returnVoidedFinal: { at: '2026-09-02T10:00:00Z' } },
+      },
+      expected: 'RETURN_CANCELLED',
+    },
+    {
+      name: '取消回程航段 → 回程已取消',
+      item: {
+        flightScheduleId: null,
+        metadata: { returnLegCancelled: { leg: 'RETURN', at: '2026-09-02T10:00:00Z' } },
+      },
+      expected: 'RETURN_CANCELLED',
+    },
+    {
+      name: '取消去程航段 → 去程已取消',
+      item: {
+        flightScheduleId: null,
+        metadata: { returnLegCancelled: { leg: 'OUTBOUND', at: '2026-09-02T10:00:00Z' } },
+      },
+      expected: 'OUTBOUND_CANCELLED',
+    },
+    {
+      name: '去程未登机（班次照旧）→ 去程未登机',
+      item: {
+        flightScheduleId: 'fs_1',
+        metadata: { noShow: { at: '2026-09-01T10:00:00Z' } },
+      },
+      expected: 'OUTBOUND_NOT_BOARDED',
+    },
+    {
+      name: '释放后又恢复 → 已安排妥当，不下发',
+      item: {
+        flightScheduleId: 'fs_1',
+        metadata: {
+          returnReleased: { at: '2026-09-01T10:00:00Z' },
+          returnRestored: { at: '2026-09-01T12:00:00Z' },
+        },
+      },
+      expected: undefined,
+    },
+    {
+      name: '普通航段行 → 不下发',
+      item: { flightScheduleId: 'fs_1', metadata: null },
+      expected: undefined,
+    },
+    {
+      name: '非航段行（套餐）即便带脏快照也不下发',
+      item: {
+        kind: 'BUNDLE',
+        flightScheduleId: null,
+        metadata: { returnReleased: { at: '2026-09-01T10:00:00Z' } },
+      },
+      expected: undefined,
+    },
+  ];
+
+  function orderWithLegCases() {
+    const base = buildOrder();
+    return {
+      ...base,
+      items: LEG_CASES.map((c, i) => ({
+        ...base.items[0],
+        id: `it_leg_${i}`,
+        kind: 'FLIGHT',
+        ...c.item,
+      })),
+    };
+  }
+
+  it('AGENT / CUSTOMER 拿到中性枚举（回程待重新安排 / 已取消 / 去程已取消 / 去程未登机）', () => {
+    for (const role of [UserRole.AGENT, UserRole.CUSTOMER]) {
+      const out = serializeOrder(orderWithLegCases(), orderSerializeRoleCtx(role)) as Record<
+        string,
+        any
+      >;
+      LEG_CASES.forEach((c, i) => {
+        expect(out.items[i].publicLegStatus, `${role} · ${c.name}`).toBe(c.expected);
+      });
+    }
+  });
+
+  it('AGENT / CUSTOMER 的中性枚举不夹带任何内部快照键', () => {
+    const out = serializeOrder(
+      orderWithLegCases(),
+      orderSerializeRoleCtx(UserRole.AGENT),
+    ) as Record<string, any>;
+    for (const item of out.items) {
+      const meta = (item.metadata ?? {}) as Record<string, unknown>;
+      for (const key of [
+        'noShow',
+        'returnReleased',
+        'returnRestored',
+        'returnVoidedFinal',
+        'returnLegCancelled',
+        'legActionLog',
+      ]) {
+        expect(meta[key], `对外 metadata 不该带 ${key}`).toBeUndefined();
+      }
+      expect(item.legFlag).toBeUndefined();
+    }
+  });
+
+  it('ADMIN / STAFF 不下发 publicLegStatus（内部看行描述前缀与 legFlag）', () => {
+    for (const role of [UserRole.ADMIN, UserRole.STAFF]) {
+      const out = serializeOrder(orderWithLegCases(), orderSerializeRoleCtx(role)) as Record<
+        string,
+        any
+      >;
+      LEG_CASES.forEach((_c, i) => {
+        expect(out.items[i].publicLegStatus, `${role} 不该拿到 publicLegStatus`).toBeUndefined();
+      });
+    }
+  });
+
+  it('公开查询视图（免登录）同款下发中性枚举', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue({
+      orderNumber: 'CO-TEST-1',
+      status: 'PAID',
+      createdAt: new Date('2026-09-01T00:00:00Z'),
+      total: dec(1000),
+      guestPhone: '13800000000',
+      contactPhone: null,
+      guestEmail: null,
+      contactEmail: null,
+      user: null,
+      payments: [],
+      passengers: [{ fullName: '李四', firstName: null }],
+      items: LEG_CASES.map((c, i) => ({
+        id: `it_leg_${i}`,
+        kind: 'FLIGHT',
+        description: '国航 CA124 经济舱',
+        quantity: 1,
+        amount: dec(1000),
+        hotelCheckIn: null,
+        flightSchedule: null,
+        ...c.item,
+      })),
+    });
+    const masked = await new OrderService().lookupOrderPublic({
+      orderNumber: 'CO-TEST-1',
+      phone: '13800000000',
+    } as Parameters<OrderService['lookupOrderPublic']>[0]);
+    expect(masked).not.toBeNull();
+    LEG_CASES.forEach((c, i) => {
+      expect(masked!.items[i].publicLegStatus, `公开视图 · ${c.name}`).toBe(c.expected);
+    });
+  });
+});

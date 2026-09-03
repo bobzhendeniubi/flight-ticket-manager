@@ -39,6 +39,27 @@
     }
   }
 
+  /* 产品明细的一行（名称 + 金额，下面可能挂航段信息与说明） */
+  .item {
+    padding: 4rpx 0;
+    .item-meta {
+      display: block;
+      font-size: 22rpx;
+      color: #94a3b8;
+      margin-top: 2rpx;
+    }
+    /* 航段说明（回程待重新安排 / 已取消…）：琥珀提示，不是错误 */
+    .item-note {
+      display: inline-block;
+      margin-top: 6rpx;
+      padding: 4rpx 12rpx;
+      border-radius: 999rpx;
+      background: #fef3c7;
+      color: #92400e;
+      font-size: 22rpx;
+    }
+  }
+
   .passenger {
     padding: 12rpx 0;
     border-bottom: 2rpx solid #f1f5f9;

@@ -30,6 +30,7 @@ import {
 } from '../lib/api';
 import { CABIN_LABEL, formatLocalDate, formatLocalTime } from '../lib/airports';
 import { formatDateTimeCn } from '../lib/datetime';
+import { legStatusNote } from '../lib/legStatus';
 import { useAuth } from '../stores/auth';
 import { Icon, type IconName } from '../components/Icon';
 import { Modal } from '../components/Modal';
@@ -574,7 +575,7 @@ export function MyOrdersPage() {
                 <div>
                   <div className="mb-1.5 text-xs font-bold uppercase tracking-wide text-ink-muted">项目明细</div>
                   <ul className="space-y-1.5">
-                    {o.items.map((it) => {
+                    {detail.items.map((it) => {
                       const changed = readFlightChanged(it.metadata);
                       const oldDepart = changed
                         ? formatDepart(changed.fromDeparture, changed.fromDepartureTz)
@@ -583,6 +584,8 @@ export function MyOrdersPage() {
                         it.departureDate && it.departureTime
                           ? `${it.departureDate} ${it.departureTime}`
                           : it.departureDate ?? null;
+                      // 航段行的说明（回程待重新安排 / 已取消…）—— 未登机不再多说一句（见 lib/legStatus）。
+                      const legNote = legStatusNote(it.publicLegStatus);
                       return (
                         <li key={it.id} className="rounded-xl border border-slate-100 bg-surface px-3 py-2.5">
                           <div className="flex items-center justify-between">
@@ -597,6 +600,25 @@ export function MyOrdersPage() {
                               )}
                             </div>
                           </div>
+                          {/* 航班号 / 出发日期：暂无班次时留「—」，不让这一行变成光杆名字 */}
+                          {it.kind === 'FLIGHT' && (
+                            <div className="mt-1 flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-ink-muted">
+                              <span className="inline-flex items-center gap-1">
+                                <Icon name="plane" className="h-3.5 w-3.5" />
+                                {it.flightNumber || '—'}
+                              </span>
+                              <span className="inline-flex items-center gap-1">
+                                <Icon name="calendar" className="h-3.5 w-3.5" />
+                                {newDepart || '—'}
+                              </span>
+                            </div>
+                          )}
+                          {legNote && (
+                            <div className="mt-1.5 inline-flex items-center gap-1 rounded-full bg-sun-light px-2.5 py-1 text-xs font-medium text-amber-800">
+                              <Icon name="info" className="h-3.5 w-3.5 shrink-0" />
+                              {legNote}
+                            </div>
+                          )}
                           {changed && (
                             <div className="mt-1.5 rounded-lg bg-rose-50 px-2.5 py-1.5 text-xs leading-relaxed text-rose-700">
                               航班有调整，请留意新的起飞时间

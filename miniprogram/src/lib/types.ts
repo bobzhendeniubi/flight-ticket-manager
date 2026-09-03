@@ -82,6 +82,17 @@ export interface FlightSearchResult {
 }
 
 // ── 订单 ───────────────────────────────────────────────────
+/**
+ * 对外中性航段状态（镜像后端 orders.leg-status.ts 的 PublicLegStatus）。
+ * 去程/回程被改动后（未登机、取消航段、回程暂无班次）后端只给这个中性枚举，
+ * 不下发任何内部动作口径；买家口吻的文案统一放在 lib/legStatus.ts。
+ */
+export type PublicLegStatus =
+  | 'RETURN_PENDING_REARRANGE'
+  | 'RETURN_CANCELLED'
+  | 'OUTBOUND_CANCELLED'
+  | 'OUTBOUND_NOT_BOARDED';
+
 export interface OrderItem {
   id: string;
   kind: string;
@@ -89,6 +100,12 @@ export interface OrderItem {
   quantity: number;
   unitPrice: string;
   amount: string;
+  /** FLIGHT 行：航班号（详情接口联查后才有；暂无班次时为 null） */
+  flightNumber?: string | null;
+  /** FLIGHT 行：出发日期 YYYY-MM-DD（同上） */
+  departureDate?: string | null;
+  /** 对外中性航段状态；无状态时不带该键，文案见 lib/legStatus.ts */
+  publicLegStatus?: PublicLegStatus;
 }
 
 export interface OrderPassenger {

@@ -16,6 +16,7 @@ import { View, Text, ScrollView } from '@tarojs/components';
 import { api, ApiError } from '../../lib/api';
 import type { OrderSummary, OrderStatus } from '../../lib/types';
 import { formatDateTimeCn } from '../../lib/datetime';
+import { legStatusNote } from '../../lib/legStatus';
 import { useAuth } from '../../stores/auth';
 import './index.scss';
 
@@ -152,12 +153,25 @@ export default function OrderDetailPage() {
 
       <View className='card'>
         <Text className='section-title'>产品明细</Text>
-        {order.items.map((it) => (
-          <View key={it.id} className='line'>
-            <Text className='k flex'>{it.description}</Text>
-            <Text className='v'>¥{Number(it.amount).toLocaleString()}</Text>
-          </View>
-        ))}
+        {order.items.map((it) => {
+          // 航段行的说明（回程待重新安排 / 已取消…）—— 未登机不再多说一句（见 lib/legStatus）。
+          const legNote = legStatusNote(it.publicLegStatus);
+          return (
+            <View key={it.id} className='item'>
+              <View className='line'>
+                <Text className='k flex'>{it.description}</Text>
+                <Text className='v'>¥{Number(it.amount).toLocaleString()}</Text>
+              </View>
+              {/* 航班号 / 出发日期：暂无班次时留「—」，不让这一行变成光杆名字 */}
+              {it.kind === 'FLIGHT' && (
+                <Text className='item-meta'>
+                  {it.flightNumber || '—'} · {it.departureDate || '—'}
+                </Text>
+              )}
+              {legNote && <Text className='item-note'>{legNote}</Text>}
+            </View>
+          );
+        })}
         <View className='line total'>
           <Text className='k'>合计</Text>
           <Text className='text-price big'>¥{Number(order.total).toLocaleString()}</Text>

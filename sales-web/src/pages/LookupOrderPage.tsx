@@ -13,6 +13,7 @@ import { Breadcrumb } from '../components/Breadcrumb';
 import { PaymentPanel } from '../components/PaymentPanel';
 import { Icon, type IconName } from '../components/Icon';
 import { formatDateCn, formatPlainDate } from '../lib/datetime';
+import { legStatusNote } from '../lib/legStatus';
 
 // 订单状态中文标签（与 MyOrdersPage 保持一致）
 const STATUS_LABEL: Record<OrderStatus, string> = {
@@ -259,7 +260,10 @@ function MaskedOrderCard({ order }: { order: MaskedOrder }) {
       <div>
         <div className="mb-1.5 text-xs font-bold uppercase tracking-wide text-ink-muted">项目明细</div>
         <ul className="space-y-1.5">
-          {order.items.map((it, idx) => (
+          {order.items.map((it, idx) => {
+            // 航段行的说明（回程待重新安排 / 已取消…）—— 未登机不再多说一句（见 lib/legStatus）。
+            const legNote = legStatusNote(it.publicLegStatus);
+            return (
             <li
               key={`${it.productName}-${idx}`}
               className="rounded-xl border border-slate-100 bg-surface px-3 py-2.5"
@@ -276,9 +280,11 @@ function MaskedOrderCard({ order }: { order: MaskedOrder }) {
                   )}
                 </div>
                 <div className="flex items-center gap-3">
-                  {it.travelDate && (
+                  {/* 出行日期：航段行暂无班次时留「—」，不让这一行变成光杆名字 */}
+                  {(it.travelDate || it.kind === 'FLIGHT') && (
                     <span className="inline-flex items-center gap-1 text-xs text-ink-soft">
-                      <Icon name="calendar" className="h-3.5 w-3.5" /> {fmtTravelDate(it.travelDate)}
+                      <Icon name="calendar" className="h-3.5 w-3.5" />{' '}
+                      {it.travelDate ? fmtTravelDate(it.travelDate) : '—'}
                     </span>
                   )}
                   <span className="font-semibold text-ink nums">¥{fmt(it.amount)}</span>
@@ -290,8 +296,15 @@ function MaskedOrderCard({ order }: { order: MaskedOrder }) {
                   {it.travelDate && <>：<span className="font-semibold">{fmtTravelDate(it.travelDate)}</span></>}
                 </div>
               )}
+              {legNote && (
+                <div className="mt-1.5 inline-flex items-center gap-1 rounded-full bg-sun-light px-2.5 py-1 text-xs font-medium text-amber-800">
+                  <Icon name="info" className="h-3.5 w-3.5 shrink-0" />
+                  {legNote}
+                </div>
+              )}
             </li>
-          ))}
+            );
+          })}
         </ul>
       </div>
 
