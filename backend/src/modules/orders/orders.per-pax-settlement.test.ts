@@ -10,7 +10,8 @@
  * 覆盖：
  *   1. buildPerPassengerSettlementItem：FEE 行、描述可读、metadata 打标（perPassenger/快照/序号）。
  *   2. schema：负元素 / 三位小数 / 空数组拒绝；合法数组通过。
- *   3. 权限：游客 / CUSTOMER / AGENT 携带 → 无权调整订单价格（400），不触库。
+ *   3. 权限：游客 / CUSTOMER 携带 → 无权调整订单价格（400），不触库；AGENT 自家单放行（自助结算价），
+ *      但叠加 priceAdjustment / flightSettlementPriceCny 仍拦。
  *   4. 互斥/等长：与 settlementTotalCny、priceAdjustment 同时传 → 400；与 passengers 数不一致 → 400。
  *   5. 全链路（mock Prisma）：差额分解正确（逐人行 + 整单收敛行 + 总额 = Σ每人价）、
  *      passengerId 事务内回填到正确乘客、全员同价不生成逐人行、逐人差额超 cap 拒绝。
@@ -219,10 +220,23 @@ describe('createOrder · perPassengerSettlementCny 权限与互斥/等长（服�
     ).rejects.toThrow('无权调整订单价格');
   });
 
-  it('AGENT 携带 → 无权调整订单价格（代理不能自定逐人价）', async () => {
+  // 代理自助结算价（业务拍板）：代理对自己名下的单可以录单当场自填逐人结算价，不必先下单再申请。
+  // 归属由服务端强制收敛到本人代理，改的只可能是自家这一单的应收。
+  it('AGENT 携带 → 放行（自家单可自填逐人结算价）', async () => {
     await expect(
       service.createOrder(bodyWithPerPax, { userId: 'u-agent', role: 'AGENT', agentId: 'a1' }),
+    ).resolves.toMatchObject({ id: 'order-1' });
+  });
+
+  it('AGENT 同时携带 priceAdjustment → 仍 400（手工调价通道不对代理开放）', async () => {
+    const withManual = {
+      ...(bodyWithPerPax as unknown as Record<string, unknown>),
+      priceAdjustment: { amountCny: -100, reasonCode: 'DISCOUNT' },
+    } as unknown as CreateOrderBody;
+    await expect(
+      service.createOrder(withManual, { userId: 'u-agent', role: 'AGENT', agentId: 'a1' }),
     ).rejects.toThrow('无权调整订单价格');
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
   });
 
   it('与 settlementTotalCny 同时传 → 400（互斥）', async () => {

@@ -1,12 +1,20 @@
 /**
- * 结算价议价申请服务 —— 代理提申请、运营确认后才由既有调价通道生效。
+ * 结算价议价申请服务 —— 代理改自家单的结算价：锁价前自助直通、锁价后走运营确认。
  *
- * 为什么不给代理开手填结算价的口子：代理能自己改低应付价 = 自己给自己打折。
- * 所以这条通道只搬运「意向价」，不碰钱：
- *   代理提交 → 落一条 PENDING（订单金额一分不动）
- *   运营确认 → 服务端按**确认那一刻**重读的应收算差额，调既有 addPriceAdjustment 生成差额行
- *   运营驳回 → 只改申请状态
- * 服务端权威定价这条底线因此不破：申请本身永远改不动订单金额。
+ * 两条分支（业务拍板：代理对自己名下的订单，结算价锁定前可以自己填、自己改，不经运营审批）：
+ *   · 未锁价 → **自助直通**：当场落一条 APPROVED（决定人=代理本人）并立即调既有 addPriceAdjustment
+ *     生成差额行。钱动了，但只可能动自家这一单，且仍旧只走那一条服务端权威调价通道。
+ *   · 已锁价 → 照旧只落一条 PENDING（订单金额一分不动），运营确认时才按**确认那一刻**重读的应收
+ *     算差额、调同一条通道生成差额行；运营驳回只改申请状态。
+ *
+ * 自助直通的四道闸（只管自助这一支，运营提交/确认不受影响）—— 挡的是「改了会对不上账」的单：
+ *   1. 已进结算单（本单佣金行已被某期结算单收走）：账单已出，改应收会与已出账目脱钩；
+ *   2. 已开票（去程/回程/系统任一）：发票是已交付下游的凭证，改价必须先冲开票状态；
+ *   3. 已收款且改后应收低于已收：凭空造出一笔应退款，退款口径必须有人经手；
+ *   4. 结算价已锁定：财务已按这个应收对过账 → 落回 PENDING 交运营。
+ *
+ * 服务端权威定价的底线仍在：代理传的是「目标应收」，不是可自由写入的明细行价格；金额由服务端
+ * 按「申请价 − 此刻应收」算差额，并同样受单笔调价上限约束。
  *
  * 差额行的 reasonCode 选型见 approve() 注释。
  */
@@ -33,6 +41,15 @@ function round2(n: number): number {
  */
 export const SETTLEMENT_REQUEST_REASON_TEXT = '代理议价申请（运营确认）';
 
+/**
+ * 自助直通生成的差额行说明文本。与上面那条固定文案分开，是为了在订单详情/导出里一眼分得清
+ * 「运营确认过的议价」和「代理自己改的价」——两者钱一样动，追责路径不一样。
+ */
+export const AGENT_SELF_SETTLEMENT_REASON_TEXT = '代理自助改结算价';
+
+/** 自助直通落库时给申请说明加的前缀（队列里一眼看出这条不是等运营处理的）。 */
+const AGENT_SELF_SETTLEMENT_NOTE_PREFIX = '代理自助';
+
 /** 应收口径：total + adjustmentCny（与订单详情「应收」/尾款 balanceDue 一字一致）。 */
 export function receivableCny(order: { total: Prisma.Decimal; adjustmentCny: number }): number {
   return round2(Number(order.total.toString()) + order.adjustmentCny);
@@ -51,6 +68,15 @@ type OrderPricingSnapshot = {
   deletedAt: Date | null;
   total: Prisma.Decimal;
   adjustmentCny: number;
+};
+
+/** 提交申请时多读的几列：只有自助直通那一支要看它们（锁价/开票/已收款）。 */
+type OrderSelfServiceSnapshot = OrderPricingSnapshot & {
+  settlementLocked: boolean;
+  paidAmount: Prisma.Decimal;
+  outboundInvoiced: boolean;
+  returnInvoiced: boolean;
+  systemInvoiced: boolean;
 };
 
 type SettlementRequestRow = {
@@ -147,20 +173,28 @@ export class SettlementRequestsService {
   }
 
   // ══════════════════════════════════════════════════════════════════
-  // 提交申请
+  // 提交申请（未锁价的自家单 = 自助直通；其余 = 落 PENDING 等运营）
   // ══════════════════════════════════════════════════════════════════
   /**
-   * 代理（限本单归属代理）或运营提交议价申请。**不改订单一分钱**，只落一条 PENDING。
+   * 代理（限本单归属代理）或运营提交结算价申请。
+   *
+   * 代理 + 自家单 + 未锁价 + 四道闸全过 → 自助直通：落 APPROVED 并立即生效（selfApplied=true）。
+   * 其余情况（运营提交、已锁价）→ 只落一条 PENDING，**不改订单一分钱**（selfApplied=false）。
    *
    * 并发：先锁订单行再查重 —— 「同一订单只能有一条 PENDING」的判断要靠这把锁才成立，
    * 否则两个并发请求各自读到「没有 PENDING」、各插一条。迁移里的部分唯一索引是第二道兜底
    * （任何绕过本方法的路径也插不进第二条），P2002 在这里被翻译成同一句 409。
+   * 同一把锁也串行化了「读 settlementLocked → 决定走哪一支」与批量锁价
+   * （batchSetSettlementLock 同样 FOR UPDATE 后再改），不会出现「读到未锁 → 期间被锁 → 照样改价」。
+   *
+   * 差额行的落地放在事务外（addPriceAdjustment 自己要拿同一把行锁，嵌在本事务里必然自锁），
+   * 取舍与 approve() 同款：先占位、后执行，失败则把刚落的那条 APPROVED 撤掉再原样抛错。
    */
   async create(
     actor: SettlementRequestActor,
     orderId: string,
     body: CreateSettlementRequestBody,
-  ): Promise<SerializedSettlementRequest> {
+  ): Promise<SerializedSettlementRequest & { selfApplied: boolean; appliedDiffCny: string | null }> {
     let ownAgentId: string | null = null;
     if (actor.role === UserRole.AGENT) {
       ownAgentId = await this.resolveOwnAgentId(actor.userId);
@@ -168,9 +202,10 @@ export class SettlementRequestsService {
       throw new ForbiddenError('无权限提交议价申请');
     }
 
+    let claim: { requestId: string; selfApplied: boolean; diffCny: number };
     try {
-      const created = await prisma.$transaction(async (tx) => {
-        // 订单行锁：与调价/补房差同一把锁，串行化「查重 → 插入」。
+      claim = await prisma.$transaction(async (tx) => {
+        // 订单行锁：与调价/补房差/批量锁价同一把锁，串行化「查重 → 判锁 → 插入」。
         await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
         const order = (await tx.order.findUnique({
           where: { id: orderId },
@@ -182,8 +217,14 @@ export class SettlementRequestsService {
             deletedAt: true,
             total: true,
             adjustmentCny: true,
+            // 自助直通那一支要看的四列（运营提交时读到也不用）。
+            settlementLocked: true,
+            paidAmount: true,
+            outboundInvoiced: true,
+            returnInvoiced: true,
+            systemInvoiced: true,
           },
-        })) as OrderPricingSnapshot | null;
+        })) as OrderSelfServiceSnapshot | null;
         if (!order || order.deletedAt) throw new NotFoundError('订单不存在');
 
         if (ownAgentId && order.agentId !== ownAgentId) {
@@ -202,6 +243,7 @@ export class SettlementRequestsService {
         }
         this.assertDiffWithinCap(diffCny);
 
+        // 一单一议照旧：已有待确认申请时两条支路都拒，免得自助改完还挂着一条没人处理的 PENDING。
         const pending = await tx.settlementRequest.findFirst({
           where: { orderId, status: SettlementRequestStatus.PENDING },
           select: { id: true },
@@ -210,26 +252,115 @@ export class SettlementRequestsService {
           throw new ConflictError('该订单已有一条待确认的议价申请，请等运营处理后再提交');
         }
 
-        return tx.settlementRequest.create({
+        // ── 自助直通判定：代理本人 + 未锁价。锁着 → 落 PENDING 交运营（不是错误）。 ──
+        const selfApplied = ownAgentId !== null && !order.settlementLocked;
+        if (selfApplied) {
+          await this.assertSelfServiceAllowed(tx, order, body.requestedTotalCny);
+        }
+
+        const created = await tx.settlementRequest.create({
           data: {
             orderId,
             agentId: order.agentId,
             requestedById: actor.userId,
             requestedTotalCny: new Prisma.Decimal(body.requestedTotalCny),
             systemTotalCny: new Prisma.Decimal(systemTotalCny),
-            note: body.note?.trim() || null,
-            status: SettlementRequestStatus.PENDING,
+            note: selfApplied
+              ? [AGENT_SELF_SETTLEMENT_NOTE_PREFIX, body.note?.trim()].filter(Boolean).join('：')
+              : body.note?.trim() || null,
+            status: selfApplied
+              ? SettlementRequestStatus.APPROVED
+              : SettlementRequestStatus.PENDING,
+            // 自助直通没有第二个人经手：决定人就是提交人本人，留痕如实写。
+            decidedById: selfApplied ? actor.userId : null,
+            decidedAt: selfApplied ? new Date() : null,
           },
-          include: REQUEST_INCLUDE,
+          select: { id: true },
         });
+
+        return { requestId: created.id, selfApplied, diffCny };
       });
-      return serializeSettlementRequest(created);
     } catch (err) {
       // 部分唯一索引兜底命中（并发穿过应用层查重）→ 回同一句 409，别把裸约束名抛给前端。
       if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
         throw new ConflictError('该订单已有一条待确认的议价申请，请等运营处理后再提交');
       }
       throw err;
+    }
+
+    if (claim.selfApplied) {
+      try {
+        const applied = await this.orders.addPriceAdjustment(
+          orderId,
+          {
+            amountCny: claim.diffCny,
+            reasonCode: claim.diffCny > 0 ? 'MISC_FEE' : 'DISCOUNT',
+            reasonText: AGENT_SELF_SETTLEMENT_REASON_TEXT,
+          },
+          { userId: actor.userId, role: actor.role },
+          // 公开的 POST /orders/:id/price-adjustment 对 AGENT 照旧 403；只有这条内部路径放行。
+          { viaAgentSelfSettlement: true },
+        );
+        await prisma.settlementRequest.update({
+          where: { id: claim.requestId },
+          data: { appliedAdjustmentItemId: applied.audit.itemId },
+        });
+      } catch (err) {
+        // 差额行没落地 → 刚占位的那条 APPROVED 必须消失，否则它显示「已生效」而钱没动。
+        // 这里删而不是回落 PENDING：代理拿到的是真实错误、可以改完再提；留一条 PENDING 反而会让
+        // 他下一次提交撞上「已有待确认申请」的 409，而运营队列里那条也没人知道是怎么来的。
+        // 条件删除（只删仍是自己刚落的那条、且没回写差额行 id 的）避免误删并发写入。
+        await prisma.settlementRequest.deleteMany({
+          where: {
+            id: claim.requestId,
+            status: SettlementRequestStatus.APPROVED,
+            appliedAdjustmentItemId: null,
+          },
+        });
+        throw err;
+      }
+    }
+
+    // 统一回读：自助直通后应收已变，序列化里的 currentTotalCny/diffCny 要按改完之后的数说话。
+    const finalRow = await prisma.settlementRequest.findUniqueOrThrow({
+      where: { id: claim.requestId },
+      include: REQUEST_INCLUDE,
+    });
+    return {
+      ...serializeSettlementRequest(finalRow),
+      selfApplied: claim.selfApplied,
+      // 自助直通实际落地的差额（正=补收/负=优惠）；落 PENDING 时没有差额行 → null。
+      appliedDiffCny: claim.selfApplied ? claim.diffCny.toFixed(2) : null,
+    };
+  }
+
+  /**
+   * 自助直通的三道「对不上账」闸（锁价那一道在调用处判：锁着就落 PENDING，不是错误）。
+   * 全部只在代理自助支路生效——运营提交/确认照旧不受这三条约束。
+   */
+  private async assertSelfServiceAllowed(
+    tx: Prisma.TransactionClient,
+    order: OrderSelfServiceSnapshot,
+    requestedTotalCny: number,
+  ): Promise<void> {
+    // 1. 已进结算单：本单的佣金行已被某期结算单收走（CommissionRecord.settlementId 非空 —— 订单
+    //    与结算单的连接就在这张表上，OrderItem 侧没有结算标记）。账单已出，再改应收会让那期结算单的
+    //    营收/佣金与订单对不上，只能由运营连着结算单一起处理。
+    const settledCommission = await tx.commissionRecord.findFirst({
+      where: { orderId: order.id, settlementId: { not: null } },
+      select: { id: true },
+    });
+    if (settledCommission) {
+      throw new ConflictError('该订单已进入结算单，改价请联系运营处理');
+    }
+    // 2. 已开票：发票是已交付下游的凭证，改价必须先冲开票状态（与改结算价/改自备签同口径）。
+    if (order.outboundInvoiced || order.returnInvoiced || order.systemInvoiced) {
+      throw new ConflictError('已开票的订单请联系运营改价');
+    }
+    // 3. 改后应收低于已收款：等于凭空造出一笔应退款，退款口径必须有人经手。
+    const paidAmount = Number(order.paidAmount.toString());
+    if (paidAmount > 0 && requestedTotalCny < paidAmount) {
+      throw new ConflictError('订单已收款，改后金额低于已收款，请联系运营处理');
     }
   }
 

@@ -5,12 +5,16 @@
  *   POST /orders/:id/settlement-requests   代理（限本单归属代理）或运营提交申请
  *   GET  /orders/:id/settlement-requests   本单全部申请
  *
+ * 提交的返回体带 selfApplied：true = 代理在未锁价的自家单上自助改价、已当场生效（审计
+ * AGENT_SELF_SETTLEMENT）；false = 只落了一条待运营确认的申请，订单金额未动。
+ *
  * 挂在 /settlement-requests 前缀：
  *   GET  /settlement-requests              待办队列（AGENT 调用只返回自家 + 下级）
  *   POST /settlement-requests/:id/approve  确认（ADMIN/STAFF）→ 走既有调价通道生成差额行
  *   POST /settlement-requests/:id/reject   驳回（ADMIN/STAFF）
  *
- * 提交申请**永远改不动订单金额**；钱只在运营确认那一步、由服务端按既有调价通道动。
+ * 钱只有两种动法，都由服务端按既有调价通道生成差额行：代理在未锁价的自家单上自助改价（提交
+ * 当场生效），或运营确认一条待确认申请。其余任何提交都改不动订单金额。
  */
 import type { FastifyPluginAsync } from 'fastify';
 import { UserRole } from '@prisma/client';
@@ -38,7 +42,9 @@ export const orderSettlementRequestRoutes: FastifyPluginAsync = async (app) => {
       const request = await service.create({ userId: req.user.sub, role: req.user.role }, id, body);
       void writeAudit({
         actor: actorFromRequest(req),
-        action: 'SETTLEMENT_REQUEST_CREATED',
+        // 自助直通改的是真金白银的应收，且没有第二个人经手 → 独立 action + WARNING 级，
+        // 财务复核能把它与「等运营确认」的申请分开筛。落 PENDING 的照旧是创建流水（INFO）。
+        action: request.selfApplied ? 'AGENT_SELF_SETTLEMENT' : 'SETTLEMENT_REQUEST_CREATED',
         targetType: 'ORDER',
         targetId: id,
         targetLabel: request.orderNumber ?? undefined,
@@ -47,10 +53,16 @@ export const orderSettlementRequestRoutes: FastifyPluginAsync = async (app) => {
           agentId: request.agentId,
           requestedTotalCny: request.requestedTotalCny,
           systemTotalCny: request.systemTotalCny,
-          diffCny: request.diffCny,
+          // 自助直通：实际落地的差额（申请价 − 提交那一刻的应收）；
+          // 落 PENDING 时是「现在还差多少」（申请价 − 当前应收），口径与队列一致。
+          diffCny: request.selfApplied ? request.appliedDiffCny : request.diffCny,
+          // 自助直通生成的差额行 id（落 PENDING 时为 null，钱还没动）。
+          appliedAdjustmentItemId: request.appliedAdjustmentItemId,
           requestedById: request.requestedById,
+          selfApplied: request.selfApplied,
           note: request.note,
         },
+        ...(request.selfApplied ? { severity: 'WARNING' as const } : {}),
       });
       return reply.status(201).send({ request });
     },

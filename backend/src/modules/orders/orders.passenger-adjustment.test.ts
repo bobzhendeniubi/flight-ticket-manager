@@ -4,8 +4,10 @@
  * 覆盖：
  *   1. groupPassengerAdjustments 纯函数：按乘客分桶 + 净额、整单调价归 wholeOrder、忽略非调价商品行。
  *   2. orderPriceAdjustmentBodySchema：金额/原因/passengerId 边界；「其它」须补说明。
- *   3. addPriceAdjustment 权限：非 ADMIN/STAFF（CUSTOMER/AGENT）→ ForbiddenError（未触库）。
+ *   3. addPriceAdjustment 权限：CUSTOMER / 未带内部标的 AGENT → ForbiddenError（未触库）；
+ *      带 viaAgentSelfSettlement 内部标的 AGENT（代理自助改结算价通道）→ 放行。
  *   4. addPriceAdjustment passengerId 归属校验：乘客不属于本单 → BadRequestError（事务内早拦）。
+ *   5. addPriceAdjustment 结算价锁闸：锁定的单 → ConflictError（所有调用方共用这道闸）。
  *
  * 「计入 total / 审计流水追加 / 整单调价回归」需真 DB 全链路 —— 见
  * orders.passenger-adjustment.integration.test.ts。
@@ -25,7 +27,7 @@ const { mockPrisma } = vi.hoisted(() => ({
 vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
 
 import { OrderService, groupPassengerAdjustments } from './orders.service.js';
-import { BadRequestError, ForbiddenError } from '../../lib/errors.js';
+import { BadRequestError, ConflictError, ForbiddenError } from '../../lib/errors.js';
 import { orderPriceAdjustmentBodySchema } from './orders.schemas.js';
 
 const service = new OrderService();
@@ -101,6 +103,30 @@ describe('orderPriceAdjustmentBodySchema', () => {
   });
 });
 
+/** addPriceAdjustment 事务内用的 tx mock：一张 5000 元、未锁价的在售单。 */
+function makeTx(orderOverrides: Record<string, unknown> = {}) {
+  return {
+    $queryRaw: vi.fn().mockResolvedValue([{ id: 'order-1' }]),
+    order: {
+      findUnique: vi.fn().mockResolvedValue({
+        id: 'order-1',
+        orderNumber: 'FT-1',
+        status: 'PENDING_PAYMENT',
+        deletedAt: null,
+        subtotal: new Prisma.Decimal(5000),
+        total: new Prisma.Decimal(5000),
+        adjustments: [],
+        settlementLocked: false,
+        items: [{ id: 'i0', amount: new Prisma.Decimal(5000) }],
+        ...orderOverrides,
+      }),
+      update: vi.fn(),
+    },
+    orderItem: { create: vi.fn().mockResolvedValue({ id: 'i-new' }) },
+    passenger: { findUnique: vi.fn() },
+  };
+}
+
 describe('addPriceAdjustment · 权限与归属', () => {
   it('CUSTOMER → ForbiddenError（权限在事务外最先断言，绝不触库）', async () => {
     await expect(
@@ -110,6 +136,60 @@ describe('addPriceAdjustment · 权限与归属', () => {
       }),
     ).rejects.toBeInstanceOf(ForbiddenError);
     expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('AGENT 未带内部标 → ForbiddenError（公开的 POST /orders/:id/price-adjustment 照旧拒代理）', async () => {
+    await expect(
+      service.addPriceAdjustment('order-1', { amountCny: -200, reasonCode: 'DISCOUNT' }, {
+        userId: 'u-agent',
+        role: 'AGENT' as never,
+      }),
+    ).rejects.toBeInstanceOf(ForbiddenError);
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('AGENT + viaAgentSelfSettlement → 放行（代理自助改结算价的内部通道）', async () => {
+    const tx = makeTx();
+    mockPrisma.$transaction.mockImplementation(async (cb: (t: typeof tx) => unknown) => cb(tx));
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValue({
+      id: 'order-1',
+      orderNumber: 'FT-1',
+      total: new Prisma.Decimal(4300),
+      subtotal: new Prisma.Decimal(4300),
+      taxesAndFees: new Prisma.Decimal(0),
+      discountTotal: new Prisma.Decimal(0),
+      paidAmount: new Prisma.Decimal(0),
+      prepaymentOffset: new Prisma.Decimal(0),
+      adjustmentCny: 0,
+      items: [],
+      passengers: [],
+    });
+
+    const result = await service.addPriceAdjustment(
+      'order-1',
+      { amountCny: -700, reasonCode: 'DISCOUNT', reasonText: '代理自助改结算价' },
+      { userId: 'u-agent', role: 'AGENT' as never },
+      { viaAgentSelfSettlement: true },
+    );
+
+    expect(tx.orderItem.create).toHaveBeenCalledTimes(1);
+    expect(result.audit.amountCny).toBe(-700);
+    // 差额行进 total：5000 − 700 = 4300
+    expect(result.audit.after.total).toBe('4300');
+  });
+
+  it('结算价已锁定 → ConflictError，绝不落调整行（运营事后调价/议价确认/代理自助共用这道闸）', async () => {
+    const tx = makeTx({ settlementLocked: true });
+    mockPrisma.$transaction.mockImplementation(async (cb: (t: typeof tx) => unknown) => cb(tx));
+
+    await expect(
+      service.addPriceAdjustment('order-1', { amountCny: -200, reasonCode: 'DISCOUNT' }, {
+        userId: 'u-staff',
+        role: 'STAFF' as never,
+      }),
+    ).rejects.toBeInstanceOf(ConflictError);
+    expect(tx.orderItem.create).not.toHaveBeenCalled();
+    expect(tx.order.update).not.toHaveBeenCalled();
   });
 
   it('passengerId 不属于本单 → BadRequestError（事务内早拦，绝不落调整行）', async () => {

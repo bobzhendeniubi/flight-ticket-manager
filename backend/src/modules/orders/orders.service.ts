@@ -1409,10 +1409,17 @@ export class OrderService {
     const ownerUserId: string | null = isGuest ? null : requester.userId;
     const guest = isGuest ? requester.guest : null;
 
-    // 录单调价/加项 + 本单结算总价 + 机票团队议价结算价：仅 ADMIN/STAFF 录单可用。服务端按认证身份
-    // 判权限（不信前端）——公开散客/客户/代理携带这些字段直接 400，杜绝对外接口被绕过手工改价。
+    // 录单调价/加项 + 本单结算总价 + 机票团队议价结算价：默认仅 ADMIN/STAFF 录单可用。服务端按认证
+    // 身份判权限（不信前端）——公开散客/客户携带这些字段直接 400，杜绝对外接口被绕过手工改价。
     // flightSettlementPriceCny 会短路机票动态定价（priceAndValidateItems），公开下单口必须与 /orders/batch
     // 一样收口，否则匿名游客可传 0 以零元买机票并真实扣座。
+    //
+    // 代理自助结算价（业务拍板）：代理对**自己名下**的单可以录单当场自填结算价，不必先下单再走议价申请。
+    // 敢放开的前提是归属被服务端强制收敛：AGENT 的 agentId 由 resolveOrderAgentId 无视 body.agentId
+    // 取本人，改的只可能是自家这一单的应收。只放开「结算总价 / 每人结算价」两个通道：
+    //   · priceAdjustment 是运营的手工调价/加项通道（原因码语义、可与日历价叠加），仍仅 ADMIN/STAFF；
+    //   · flightSettlementPriceCny 直接覆盖机票行单价、短路动态定价，代理可传 0 零元买票并真实扣座，
+    //     绝不放开（与 /orders/batch 的 settlementPriceCny 同口径，那条批量通道也照旧只给运营）。
     if (
       body.priceAdjustment ||
       body.settlementTotalCny !== undefined ||
@@ -1420,7 +1427,13 @@ export class OrderService {
       body.flightSettlementPriceCny !== undefined
     ) {
       const role = isGuest ? undefined : requester.role;
-      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      const isOps = role === UserRole.ADMIN || role === UserRole.STAFF;
+      const isAgentSelfSettlement =
+        role === UserRole.AGENT &&
+        !body.priceAdjustment &&
+        body.flightSettlementPriceCny === undefined &&
+        (body.settlementTotalCny !== undefined || body.perPassengerSettlementCny !== undefined);
+      if (!isOps && !isAgentSelfSettlement) {
         throw new BadRequestError('无权调整订单价格');
       }
       // 两个改价通道互斥：结算总价本身就是「把总额收敛到一个数」，再叠加手工调价会双重砸价。
@@ -2086,6 +2099,9 @@ export class OrderService {
           reasonLabel: PRICE_ADJUSTMENT_REASON_LABEL.SETTLEMENT,
           // 每人结算价通道留痕（与 passengers 同序的逐人价）；整单结算总价/日历取价时为 null。
           perPassengerSettlementCny: body.perPassengerSettlementCny ?? null,
+          // 代理自助改价留痕：这一笔结算价是代理本人在自家单上填的（不经运营审批），
+          // 财务复核时要能一眼把它与运营录入的结算价分开。运营录入不带此键。
+          ...(requester.role === UserRole.AGENT ? { selfService: true } : {}),
           // 结算价日历自动取价来源留痕（档次/晚数/出发日期/每人价/人数）；手工结算价时为 null。
           settlementCalendar: settlementCalendarAudit,
         },
@@ -5985,6 +6001,11 @@ export class OrderService {
   /**
    * 批量锁定/解锁订单结算价。不存在或已软删订单不更新并计入 skipped；
    * 每个有效订单独立更新，便于路由层按成功订单逐条写审计。
+   *
+   * 并发：整批在一个事务里、逐单先 `SELECT ... FOR UPDATE` 再改。与改应收的通道
+   * （addPriceAdjustment / 代理自助改结算价）用的是同一把订单行锁，两边互斥：
+   * 要么「先上锁 → 后面的改价被锁挡住」，要么「先改完价 → 再上锁」，
+   * 不会出现「读到未锁 → 上锁落库 → 那笔改价随后覆盖应收」的中间态。
    */
   async batchSetSettlementLock(
     ids: string[],
@@ -6000,37 +6021,49 @@ export class OrderService {
       settlementLockedAt: Date | null;
     }>;
   }> {
-    const activeOrders = await prisma.order.findMany({
-      where: { id: { in: ids }, deletedAt: null },
-      select: { id: true, orderNumber: true, settlementLocked: true },
-    });
-    const activeById = new Map(activeOrders.map((order) => [order.id, order]));
-    const results: Array<{
-      id: string;
-      orderNumber: string;
-      beforeLocked: boolean;
-      settlementLockedAt: Date | null;
-    }> = [];
-
-    for (const id of ids) {
-      const order = activeById.get(id);
-      if (!order) continue;
-      const settlementLockedAt = lock ? new Date() : null;
-      await prisma.order.update({
-        where: { id },
-        data: {
-          settlementLocked: lock,
-          settlementLockedAt,
-          settlementLockedBy: lock ? userId : null,
-        },
-      });
-      results.push({
-        id,
-        orderNumber: order.orderNumber,
-        beforeLocked: order.settlementLocked,
-        settlementLockedAt,
-      });
-    }
+    const results = await prisma.$transaction(
+      async (tx) => {
+        const applied: Array<{
+          id: string;
+          orderNumber: string;
+          beforeLocked: boolean;
+          settlementLockedAt: Date | null;
+        }> = [];
+        // 按 id 排序后再逐单加锁：两个并发批次若按各自的传入顺序抢锁，交叉的两单会互等成死锁。
+        // 固定顺序后并发批次只会排队，不会互锁。（顺序只影响加锁次序，审计逐单写、与顺序无关。）
+        for (const id of [...ids].sort()) {
+          const rows = await tx.$queryRaw<
+            Array<{
+              id: string;
+              orderNumber: string;
+              settlementLocked: boolean;
+              deletedAt: Date | null;
+            }>
+          >`SELECT id, "orderNumber", "settlementLocked", "deletedAt" FROM "Order" WHERE id = ${id} FOR UPDATE`;
+          const order = rows[0];
+          // 不存在 / 已软删 → 跳过（计入 skipped，口径不变）。
+          if (!order || order.deletedAt) continue;
+          const settlementLockedAt = lock ? new Date() : null;
+          await tx.order.update({
+            where: { id },
+            data: {
+              settlementLocked: lock,
+              settlementLockedAt,
+              settlementLockedBy: lock ? userId : null,
+            },
+          });
+          applied.push({
+            id,
+            orderNumber: order.orderNumber,
+            beforeLocked: order.settlementLocked,
+            settlementLockedAt,
+          });
+        }
+        return applied;
+      },
+      // 批量上限 500 单（schema），逐单两次往返；默认 5s 超时对大批量不够用。
+      { timeout: 120_000, maxWait: 15_000 },
+    );
 
     return { updated: results.length, skipped: ids.length - results.length, results };
   }
@@ -11320,6 +11353,13 @@ export class OrderService {
     orderId: string,
     input: OrderPriceAdjustmentBody,
     actor: { userId: string; role: UserRole },
+    /**
+     * 内部调用选项。viaAgentSelfSettlement = 代理自助改结算价通道（settlement-requests.create
+     * 里那条「未锁价 → 直接生效」的分支）调进来的，放行 AGENT 身份。
+     * **只给服务端内部路径用**：公开的 POST /orders/:id/price-adjustment 不接这个参数，
+     * 代理直接打那个端点照旧 403。
+     */
+    options?: { viaAgentSelfSettlement?: boolean },
   ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
@@ -11333,7 +11373,10 @@ export class OrderService {
       after: { subtotal: string; total: string };
     };
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    const isOps = actor.role === UserRole.ADMIN || actor.role === UserRole.STAFF;
+    const isAgentSelfSettlement =
+      actor.role === UserRole.AGENT && options?.viaAgentSelfSettlement === true;
+    if (!isOps && !isAgentSelfSettlement) {
       throw new ForbiddenError('仅运营/管理员可调整订单价格');
     }
     const { amountCny, reasonCode, reasonText } = input;
@@ -11354,10 +11397,18 @@ export class OrderService {
           subtotal: true,
           total: true,
           adjustments: true,
+          settlementLocked: true,
           items: { select: { id: true, amount: true } },
         },
       });
       if (!order) throw new NotFoundError('订单不存在');
+      // 结算价锁闸：锁定 = 财务已按这个应收对过账，之后任何改应收的动作都要先解锁（与改结算价 /
+      // 改自备签 / 取消单腿同一句口径）。此前这条通道是唯一绕过锁的改价路径——运营的事后调价、
+      // 议价申请确认都能在锁着的单上直接改 total，锁形同虚设。放在资金闸之前：
+      // 「已锁定」比「死单」更早能给出可操作的下一步（先解锁）。
+      if (order.settlementLocked) {
+        throw new ConflictError('结算价已锁定，请先解锁再修改');
+      }
       // 资金闸：调价新增/降低差额行会改 order.total —— total 是应退额与取消手续费的计算基数。
       // 死单（已取消/已退款/支付超时/草稿）若还能调价，等于凭空改动死单应收，可被算出二次退款。
       assertOrderAcceptsFunds(order);

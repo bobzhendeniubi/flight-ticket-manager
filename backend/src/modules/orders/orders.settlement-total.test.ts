@@ -8,7 +8,8 @@
  * 覆盖：
  *   1. buildSettlementTotalItem：负差额=DISCOUNT / 正差额=FEE，描述可读，metadata 打标。
  *   2. schema：settlementTotalCny 负数/三位小数拒绝；人工调价下拉不得出现 SETTLEMENT。
- *   3. 权限：游客 / CUSTOMER / AGENT 携带 settlementTotalCny 一律 BadRequestError（400）。
+ *   3. 权限：游客 / CUSTOMER 携带 settlementTotalCny 一律 BadRequestError（400）；
+ *      AGENT 自家单放行（自助结算价），但叠加 priceAdjustment / flightSettlementPriceCny 仍拦。
  *   4. 互斥：settlementTotalCny 与 priceAdjustment 同时传 → BadRequestError（400）。
  *   5. 全链路（mock Prisma）：负/正差额生成对应行且总额=结算价；diff=0 不生成行；超 cap 拒绝。
  */
@@ -226,10 +227,49 @@ describe('createOrder · settlementTotalCny 权限与互斥（服务端按认证
     ).rejects.toBeInstanceOf(BadRequestError);
   });
 
-  it('AGENT 携带 settlementTotalCny → BadRequestError', async () => {
+  // 代理自助结算价（业务拍板）：代理对自己名下的单可以录单当场自填结算总价，不必先下单再走议价申请。
+  // 归属由 resolveOrderAgentId 强制收敛到本人代理，改的只可能是自家这一单的应收。
+  it('AGENT 携带 settlementTotalCny → 放行（自家单可自填结算价）', async () => {
     await expect(
       service.createOrder(bodyWithSettlement, { userId: 'u-agent', role: 'AGENT', agentId: 'a1' }),
-    ).rejects.toBeInstanceOf(BadRequestError);
+    ).resolves.toMatchObject({ id: 'order-1' });
+  });
+
+  it('AGENT 自助填结算价 → 审计 after 带 selfService=true（与运营录入分得开）', async () => {
+    const service = makeService(7402);
+    await service.createOrder(bodyWithSettlement, {
+      userId: 'u-agent',
+      role: 'AGENT',
+      agentId: 'a1',
+    } as never);
+
+    const settlementAudit = mockPrisma.auditLog.create.mock.calls
+      .map((c) => (c[0] as { data: { action: string; after: Record<string, unknown> } }).data)
+      .find((d) => d.action === 'APPLY_SETTLEMENT_TOTAL');
+    expect(settlementAudit?.after.selfService).toBe(true);
+    expect(settlementAudit?.after.settlementTotalCny).toBe(1718);
+  });
+
+  it('运营录入结算价 → 审计不带 selfService 键', async () => {
+    const service = makeService(7402);
+    await service.createOrder(bodyWithSettlement, ADMIN);
+
+    const settlementAudit = mockPrisma.auditLog.create.mock.calls
+      .map((c) => (c[0] as { data: { action: string; after: Record<string, unknown> } }).data)
+      .find((d) => d.action === 'APPLY_SETTLEMENT_TOTAL');
+    expect(settlementAudit).toBeDefined();
+    expect(settlementAudit!.after).not.toHaveProperty('selfService');
+  });
+
+  it('AGENT 同时携带 priceAdjustment → 仍 BadRequestError（手工调价通道不对代理开放）', async () => {
+    const withManual = {
+      ...(bodyWithSettlement as unknown as Record<string, unknown>),
+      priceAdjustment: { amountCny: -100, reasonCode: 'DISCOUNT' },
+    } as unknown as CreateOrderBody;
+    await expect(
+      service.createOrder(withManual, { userId: 'u-agent', role: 'AGENT', agentId: 'a1' }),
+    ).rejects.toThrow('无权调整订单价格');
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
   });
 
   it('与 priceAdjustment 同时传 → BadRequestError（互斥，避免双重调价）', async () => {
