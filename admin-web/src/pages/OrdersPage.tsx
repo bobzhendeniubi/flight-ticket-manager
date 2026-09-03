@@ -9409,7 +9409,7 @@ function NoShowPanel({
    * 等于拿过期判定去做库存动作。key 对不上就一律禁用。
    */
   const previewStale = previewedKeyRef.current !== previewKey;
-  // 只释放回程这一档：没有可释放的回程（没航段/已起飞）就没有任何可做的事，别让人点空。
+  // 只释放回程这一档：没有可释放的回程（没航段/已关柜）就没有任何可做的事，别让人点空。
   const canReleaseReturn = Boolean(returnItem) && !returnDeparted;
 
   const togglePassenger = (id: string) => {
@@ -9439,7 +9439,7 @@ function NoShowPanel({
     const releaseLine = doRelease
       ? `回程 ${releasingSeats} 座放回库存可卖，之后代理来要可恢复。`
       : returnDeparted
-        ? '回程已起飞，本次只记录 no-show，不释放座位。'
+        ? '回程已关柜，本次只记录 no-show，不释放座位。'
         : '本次不释放回程座位。';
     const confirmed = await confirm({
       title: releaseAgain ? releaseAgainLabel : 'no-show 处理',
@@ -9605,7 +9605,7 @@ function NoShowPanel({
             <div className="mt-1 text-slate-500">
               回程：{returnItem.flightNumber ?? '（班次号缺失）'}
               {returnItem.departDate && <> · {returnItem.departDate}</>} · {returnItem.quantity} 座
-              {returnDeparted && <span className="ml-1 text-amber-700">（已起飞）</span>}
+              {returnDeparted && <span className="ml-1 text-amber-700">（已关柜）</span>}
             </div>
           )}
         </div>
@@ -9679,7 +9679,7 @@ function NoShowPanel({
               {releaseAgain ? '释放回程座位（可卖，钱不动）' : '同时释放回程座位（可卖，钱不动）'}
               {!returnItem && <span className="text-slate-500">（本单没有回程航段）</span>}
               {returnDeparted && (
-                <span className="ml-1 text-amber-700">回程已起飞，只能记录 no-show。</span>
+                <span className="ml-1 text-amber-700">回程已关柜，只能记录 no-show。</span>
               )}
               {returnItem?.ticketed && !returnDeparted && (
                 <span className="ml-1 text-amber-700">回程已出票，释放后会给票务派撤名单工单。</span>

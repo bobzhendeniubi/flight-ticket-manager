@@ -160,6 +160,16 @@ describe('回程起飞后自动作废 · 扫描', () => {
     expect(mockPrisma.orderItem.update).not.toHaveBeenCalled();
   });
 
+  // 关柜到起飞之间那 45 分钟：no-show / 释放 / 恢复三把闸都已按关柜口径动了，
+  // 唯独作废仍按**起飞**——飞机还没走，延误 / 换班次都可能让它最终没走成，
+  // 此刻打终态就把话说早了。本 job 一根手指也不能动这一行。
+  it('已关柜但还没起飞 → 一律不动（作废的锚点是起飞，不是关柜）', async () => {
+    arm({ departureTime: new Date(NOW.getTime() + 20 * 60_000) }); // 20 分钟后起飞 = 早已关柜
+    const res = await voidDepartedReleasedReturnLegs(mockPrisma as never, NOW);
+    expect(res).toMatchObject({ scanned: 1, voided: 0 });
+    expect(mockPrisma.orderItem.update).not.toHaveBeenCalled();
+  });
+
   it('已经作废过 → 粗筛就跳过（幂等，不重复写）', async () => {
     arm({
       candidates: [candidate(releasedMeta({ returnVoidedFinal: { at: RELEASED_AT } }))],

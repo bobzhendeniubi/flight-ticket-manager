@@ -868,7 +868,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   ADMIN / 通用 STAFF（staffRole=null）→ 尊重 query（现状，可信运营）
   //   VISA_DESK → 强制 'visa'；TICKETING → 强制 'ticketing'
   //   ROOM_CONTROL → 强制 'visa'（总表内金额暴露面最小的模板；房控本职导出在房控模块）
-  //   AGENT → 强制 'agent'（全岗列裁掉「订单成本」真实进价）+ 服务端圈到自己+下级代理的订单
+  //   AGENT → 强制 'agent' + 服务端圈到自己+下级代理的订单。'agent' 视图按**共享**脱敏政策
+  //     （AGENT_HIDDEN_EXPORT_KEYS，与三模板筛选导出同一份）裁掉本表命中的 20 列：
+  //     我方供应商与成本（订单成本 / 签证公司 / 签证备注）、内部风控（带超售座数的航段状态）、
+  //     护照身份 PII 10 列、内部运营指标（飞行次数 / 在订未飞 / 可用次数 / 分房情况）、
+  //     我方内部人员（录入时间 / 录入人员）。代理自己的账目与行程信息一列不少。
   app.get(
     '/export/master',
     {

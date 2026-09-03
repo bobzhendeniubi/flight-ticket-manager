@@ -19,8 +19,12 @@ const { mockPrisma } = vi.hoisted(() => ({
     },
     passenger: {
       findUnique: vi.fn(),
+      // findMany：补录反向查重（证件从空补成真值时查同班次是否已有人用这本护照）。
+      findMany: vi.fn(),
       update: vi.fn(),
     },
+    // 反向查重要先知道本单占着哪几个班次。
+    orderItem: { findMany: vi.fn() },
     $transaction: vi.fn(),
   },
 }));
@@ -54,7 +58,9 @@ const dec = (s: string) => ({
 beforeEach(() => {
   mockPrisma.order.findUnique.mockReset();
   mockPrisma.passenger.findUnique.mockReset();
+  mockPrisma.passenger.findMany.mockReset();
   mockPrisma.passenger.update.mockReset();
+  mockPrisma.orderItem.findMany.mockReset();
   mockPrisma.$transaction.mockReset();
 });
 
@@ -146,6 +152,123 @@ describe('selfUpdatePassenger', () => {
     const updateArg = mockPrisma.passenger.update.mock.calls[0][0];
     expect(Object.keys(updateArg.data).sort()).toEqual(['passportExpiry', 'passportIssueDate']);
     expect(result.changedFields.sort()).toEqual(['passportExpiry', 'passportIssueDate']);
+  });
+});
+
+// ── 1a. selfUpdatePassenger · 补录护照的反向同班次查重 ────────────────────────────
+//
+// 建单查重只在**建单那一刻**量得到。占位单转正的乘客当时只填姓名、证件号落库是空串，
+// 那一刻量不出任何东西；若同期还有人在同一班次用这本真护照建过单，这份重复要等到
+// 护照补录落库那一刻才浮出水面 —— 补完之后，同一个人在同一班次上实打实占着两份座。
+// 所以补录路径要回头再查一次。这条路**没有强录口子**：两张单总有一张要收口，
+// 先处理掉那一张再来补录。
+describe('selfUpdatePassenger · 补录护照的反向同班次查重', () => {
+  const NEW_DOCUMENT = 'E12345678';
+  const OPS = { userId: 'staff1', role: UserRole.STAFF };
+
+  /** 摆好一次补录：本单一段去程班次 sch-out，乘客证件号现状由 currentDocument 给定。 */
+  function arm(
+    opts: {
+      currentDocument?: string | null;
+      legScheduleIds?: Array<string | null>;
+      conflictOrderNumbers?: string[];
+    } = {},
+  ): void {
+    mockPrisma.order.findUnique.mockResolvedValue({
+      id: 'o1',
+      status: 'PAID',
+      userId: 'u1',
+      agentId: null,
+      orderNumber: 'FTM20260709001',
+    });
+    mockPrisma.passenger.findUnique.mockResolvedValue({
+      id: 'p1',
+      orderId: 'o1',
+      documentNumber: opts.currentDocument ?? '',
+    });
+    mockPrisma.orderItem.findMany.mockResolvedValue(
+      (opts.legScheduleIds ?? ['sch-out']).map((flightScheduleId) => ({ flightScheduleId })),
+    );
+    mockPrisma.passenger.findMany.mockResolvedValue(
+      (opts.conflictOrderNumbers ?? []).map((orderNumber) => ({ order: { orderNumber } })),
+    );
+    mockPrisma.passenger.update.mockResolvedValue({
+      id: 'p1',
+      fullName: 'ZHANG SAN',
+      documentNumber: NEW_DOCUMENT,
+    });
+  }
+
+  it('证件从「待补」补成真值、同班次已有人用同一本护照 → 拦（带冲突订单号），且不落库', async () => {
+    arm({ currentDocument: '', conflictOrderNumbers: ['FTM-DUP-001'] });
+
+    const err = await service
+      .selfUpdatePassenger('o1', 'p1', { documentNumber: NEW_DOCUMENT }, OPS)
+      .then(() => null, (e: unknown) => e as AppError);
+
+    expect(err).toBeInstanceOf(AppError);
+    expect((err as AppError).code).toBe('DUPLICATE_PASSENGER');
+    expect((err as AppError).message).toContain('FTM-DUP-001');
+    // 补录一旦落库两份座就都算数了 —— 必须拦在 update 之前。
+    expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+
+  it('查重范围与建单闸同源：本单各航段班次上的占座中订单，且排除本单自己', async () => {
+    arm({ currentDocument: '', conflictOrderNumbers: ['FTM-DUP-001'] });
+
+    await service
+      .selfUpdatePassenger('o1', 'p1', { documentNumber: NEW_DOCUMENT }, OPS)
+      .catch(() => undefined);
+
+    const where = mockPrisma.passenger.findMany.mock.calls[0][0].where;
+    expect(where.documentNumber).toBe(NEW_DOCUMENT);
+    expect(where.orderId).toEqual({ not: 'o1' });
+    expect(where.order.items.some.flightScheduleId).toEqual({ in: ['sch-out'] });
+    expect(where.order.status.in).toContain('PAID');
+    // 已取消的单不占座，不该拦住补录。
+    expect(where.order.status.in).not.toContain('CANCELLED');
+  });
+
+  it('同班次没人用这本护照 → 照常补录落库', async () => {
+    arm({ currentDocument: '', conflictOrderNumbers: [] });
+
+    const res = await service.selfUpdatePassenger(
+      'o1',
+      'p1',
+      { documentNumber: NEW_DOCUMENT },
+      OPS,
+    );
+
+    expect(res.changedFields).toContain('documentNumber');
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('本来就有证件号（是改证件不是补录）→ 不走这道闸，一次查重都不打', async () => {
+    arm({ currentDocument: 'E00000001', conflictOrderNumbers: ['FTM-DUP-001'] });
+
+    await service.selfUpdatePassenger('o1', 'p1', { documentNumber: NEW_DOCUMENT }, OPS);
+
+    expect(mockPrisma.passenger.findMany).not.toHaveBeenCalled();
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('本次没改证件号（只补有效期）→ 不走这道闸', async () => {
+    arm({ currentDocument: '', conflictOrderNumbers: ['FTM-DUP-001'] });
+
+    await service.selfUpdatePassenger('o1', 'p1', { passportExpiry: '2035-06-30' }, OPS);
+
+    expect(mockPrisma.passenger.findMany).not.toHaveBeenCalled();
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
+  });
+
+  // 纯酒店 / 接送单没有航段，就没有「同班次」这个概念，无从比对 —— 不能因此把补录锁死。
+  it('本单没有有效航段 → 无从比对，放行', async () => {
+    arm({ currentDocument: '', legScheduleIds: [], conflictOrderNumbers: ['FTM-DUP-001'] });
+
+    await service.selfUpdatePassenger('o1', 'p1', { documentNumber: NEW_DOCUMENT }, OPS);
+
+    expect(mockPrisma.passenger.findMany).not.toHaveBeenCalled();
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
   });
 });
 

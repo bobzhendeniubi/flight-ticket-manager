@@ -250,3 +250,138 @@ describe('createOrder 重复乘客强录 · allowDuplicatePassengers', () => {
     expect(mockPrisma.order.create).not.toHaveBeenCalled();
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════════
+// 证件待补的同名乘客（占位单转正只填了姓名 → documentNumber 落库为空串）
+//
+// 只按证件号查重的旧口径量不到这种人：空串对不上任何真护照号。于是「占位单转正只填姓名 →
+// 三天后护照到了、经办人没走补录而是在同一班次重新建了一张带真护照号的新单」这条路上，
+// 闸静默放行 —— 同 3 个人占了 6 个座。第二把尺子（同班次 + 证件待补 + 同名）就是补这个洞。
+// ══════════════════════════════════════════════════════════════════════════
+describe('createOrder 重复乘客 · 同班次「证件待补」同名乘客', () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPrisma.$transaction.mockImplementation(
+      async (fn: (tx: unknown) => Promise<unknown>) => fn(mockTx),
+    );
+  });
+
+  /** 库里已有的一位「证件待补」乘客（占位单转正留下的），挂在同班次的另一张单上。 */
+  function stagePendingDocumentConflict(over: Record<string, unknown> = {}): void {
+    mockPrisma.passenger.findMany.mockResolvedValue([
+      {
+        documentNumber: '',
+        lastName: null,
+        firstName: null,
+        fullName: '张三',
+        chineseName: '张三',
+        order: { orderNumber: 'FTM-HOLD-007' },
+        ...over,
+      },
+    ]);
+  }
+
+  it('① 同班次已有空证件同名乘客 + 新单带真护照 → 拦，错误信息含旧单号并指路去补录', async () => {
+    stagePendingDocumentConflict();
+    const service = makeService();
+    const requester: OrderRequester = { userId: 'staff1', role: 'STAFF' };
+
+    const err = await catchErr(service.createOrder(makeBody(), requester));
+
+    expect(err.code).toBe('DUPLICATE_PASSENGER');
+    expect(err.message).toContain('FTM-HOLD-007');
+    expect(err.message).toContain('张三');
+    // 「去哪张单、做什么」必须写在错误里，否则经办人只会换个证件号再试一次。
+    expect(err.message).toContain('请到该订单补录护照而不是重新建单');
+    expect(err.details).toEqual({
+      conflicts: [{ documentNumber: '', passengerName: '张三', orderNumbers: ['FTM-HOLD-007'] }],
+    });
+    expect(mockPrisma.order.create).not.toHaveBeenCalled();
+    expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it('② STAFF 带 allowDuplicatePassengers → 放行建单 + 备注留痕 + FORCE 审计（与证件号命中同权）', async () => {
+    stagePendingDocumentConflict();
+    stageHappyPath();
+    const service = makeService();
+    const requester: OrderRequester = { userId: 'staff1', role: 'STAFF' };
+
+    const order = await service.createOrder(makeBody(true), requester);
+
+    expect(order).toMatchObject({ id: 'ord1' });
+    const notes = notesPassedToCreate();
+    expect(notes).toContain('重复乘客强录');
+    expect(notes).toContain('FTM-HOLD-007');
+    // 备注要说清是哪一类命中：「对方证件待补」要采取的动作与「同证件号」完全不同。
+    expect(notes).toContain('同班次同名（对方证件待补）');
+
+    const auditData = mockPrisma.auditLog.create.mock.calls[0][0] as {
+      data: { action: string; severity: string; after: unknown };
+    };
+    expect(auditData.data.action).toBe('FORCE_DUPLICATE_PASSENGERS');
+    expect(auditData.data.severity).toBe('WARNING');
+    expect(auditData.data.after).toEqual({
+      conflicts: [{ documentNumber: '', passengerName: '张三', orderNumbers: ['FTM-HOLD-007'] }],
+    });
+  });
+
+  // 查重的 where 本来就把候选圈在「本单各航段班次上的占座中订单」里；不同班次的同名乘客
+  // 根本进不了候选集（查不出行）——重名在中文名里太常见，跨班次拦人只会天天误伤。
+  it('③ 同名但不在同班次 → 不拦（候选集里根本没有这一行）', async () => {
+    mockPrisma.passenger.findMany.mockResolvedValue([]);
+    stageHappyPath();
+    const service = makeService();
+    const requester: OrderRequester = { userId: 'staff1', role: 'STAFF' };
+
+    await service.createOrder(makeBody(), requester);
+
+    expect(mockPrisma.order.create).toHaveBeenCalledTimes(1);
+    expect(notesPassedToCreate() ?? '').not.toContain('重复乘客强录');
+    expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it('④ 同班次有空证件乘客但姓名对不上 → 不拦（证件待补不等于谁都算重复）', async () => {
+    stagePendingDocumentConflict({ fullName: '李四', chineseName: '李四' });
+    stageHappyPath();
+    const service = makeService();
+    const requester: OrderRequester = { userId: 'staff1', role: 'STAFF' };
+
+    await service.createOrder(makeBody(), requester);
+
+    expect(mockPrisma.order.create).toHaveBeenCalledTimes(1);
+    expect(notesPassedToCreate() ?? '').not.toContain('重复乘客强录');
+    expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  // 姓名比对键先拆再拼：录单两种写法（空格 / 斜线）都会出现，按原样比对会漏掉一半。
+  it('拉丁姓名 `ZHANG SAN` 与库里的 `ZHANG/SAN` 算同一个人 → 拦', async () => {
+    stagePendingDocumentConflict({ fullName: 'ZHANG/SAN', chineseName: null });
+    const service = makeService();
+    const requester: OrderRequester = { userId: 'staff1', role: 'STAFF' };
+    const body = makeBody();
+    (body as unknown as { passengers: Array<Record<string, unknown>> }).passengers = [
+      { ...passenger, fullName: 'ZHANG SAN' },
+    ];
+
+    const err = await catchErr(service.createOrder(body, requester));
+
+    expect(err.code).toBe('DUPLICATE_PASSENGER');
+    expect(err.message).toContain('FTM-HOLD-007');
+  });
+
+  // 姓/名两栏优先于 fullName：航司标准写法录入的新单，同样要量得到库里只填了 fullName 的那位。
+  it('新单填的是姓/名两栏（ZHANG + SAN）→ 与库里 fullName=`ZHANG/SAN` 命中', async () => {
+    stagePendingDocumentConflict({ fullName: 'ZHANG/SAN', chineseName: null });
+    const service = makeService();
+    const requester: OrderRequester = { userId: 'staff1', role: 'STAFF' };
+    const body = makeBody();
+    (body as unknown as { passengers: Array<Record<string, unknown>> }).passengers = [
+      { ...passenger, fullName: 'SOMEONE ELSE', lastName: 'ZHANG', firstName: 'SAN' },
+    ];
+
+    const err = await catchErr(service.createOrder(body, requester));
+
+    expect(err.code).toBe('DUPLICATE_PASSENGER');
+    expect(err.message).toContain('FTM-HOLD-007');
+  });
+});

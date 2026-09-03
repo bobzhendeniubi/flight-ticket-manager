@@ -207,6 +207,32 @@ describe('批量 no-show · 预检', () => {
     expect(r.schedule.departed).toBe(true);
   });
 
+  // 关柜到起飞之间那 45 分钟里，去程照样能标（抬头绿、逐行也绿），但回程座位放不了 ——
+  // 逐行的 returnDeparted 就是单单预检闸 5b 的结论（现按关柜算），批量原样透出来给票务看。
+  it('关柜后未起飞窗口内：去程逐行仍 eligible，回程按关柜口径回 returnDeparted=true', async () => {
+    mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sch-out',
+      departureTime: new Date(Date.now() + 20 * 60_000),
+      departureTz: 'Asia/Shanghai',
+      checkinCloseMinutes: null,
+      flight: { flightNumber: 'QH9589' },
+      seatClasses: [{ sold: 1 }],
+    });
+    const service = fakeService({
+      // 单单预检在这个窗口给出的结论：可标 no-show，但回程已关柜 → 座位不释放。
+      previewNoShow: vi.fn(async () => previewResult({ returnDeparted: true })),
+    });
+    const r = await previewNoShowBatch(
+      { service },
+      { scheduleId: 'sch-out', names: '陈志远' },
+      ADMIN,
+    );
+    expect(r.schedule.departed).toBe(true);
+    expect(r.matched[0].eligible).toBe(true);
+    expect(r.matched[0].hasReturn).toBe(true);
+    expect(r.matched[0].returnDeparted).toBe(true);
+  });
+
   it('起飞前 2 小时（还没到关柜点）→ 抬头判未关柜', async () => {
     mockPrisma.flightSchedule.findUnique.mockResolvedValue({
       id: 'sch-out',

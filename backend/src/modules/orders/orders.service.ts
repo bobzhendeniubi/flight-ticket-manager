@@ -56,7 +56,7 @@ import {
   splitPassengerFullName,
 } from '../../lib/passenger-name.js';
 import { localHHMM, localDateISO, localToUtc } from '../../lib/flight-time.js';
-import { checkinCloseAt } from '../../lib/checkin-close.js';
+import { checkinCloseAt, isCheckinClosed } from '../../lib/checkin-close.js';
 import { BUSINESS_TZ, businessDateISO, businessDateTime } from '../../lib/business-time.js';
 import { CANCELLABLE_STATUSES } from '../../lib/cancellation.js';
 import {
@@ -1239,6 +1239,57 @@ export interface AgentStatsResult {
   agents: Array<{ agentId: string; agentName: string; orders: number; revenueCny: number }>;
 }
 
+// ── 重复乘客校验：入参 / 出参形状 + 姓名比对键 ────────────────────────────────
+
+/** 参与同班次重复校验的一位乘客（建单入参与库里既有行共用这一份形状）。 */
+export interface DuplicateCheckPassenger {
+  documentNumber?: string | null;
+  lastName?: string | null;
+  firstName?: string | null;
+  fullName?: string | null;
+  chineseName?: string | null;
+}
+
+/** 一条重复命中。documentNumber 为空串 = 对方证件待补、按姓名命中（passengerName 才是那个键）。 */
+export interface DuplicatePassengerConflict {
+  documentNumber: string;
+  orderNumbers: string[];
+  /** 仅「证件待补 + 同名」命中时有值：命中的那位乘客姓名（展示/审计用）。 */
+  passengerName?: string;
+}
+
+/**
+ * 拉丁姓名比对键：一律收敛成规范化后的 `LAST/FIRST`。
+ *
+ * 姓/名两栏优先（航司标准写法），没有才回落 fullName。两边都先拆再拼，
+ * 所以 `ZHANG SAN`（空格）与 `ZHANG/SAN`（斜线）算同一个人 —— 录单时这两种写法都会出现，
+ * 按原样比对必然漏掉一半。拆不出名的单名（`MADONNA`）保持原样，不编造分隔。
+ * 中文写在姓名栏里（如 fullName='张三'）同样能得到键，不额外特判。
+ */
+function latinPassengerNameKey(p: DuplicateCheckPassenger): string | null {
+  const composed = composePassengerFullName(p.lastName, p.firstName);
+  const base = composed ?? (p.fullName ? normalizePassengerFullName(p.fullName) : '');
+  if (!base) return null;
+  const { lastName, firstName } = splitPassengerFullName(base);
+  return composePassengerFullName(lastName, firstName);
+}
+
+/** 中文姓名比对键：去掉全部空白后比较（「张 三」与「张三」是同一个人）。空 → null（不参与比对）。 */
+function chinesePassengerNameKey(value?: string | null): string | null {
+  const s = (value ?? '').replace(/\s+/g, '');
+  return s || null;
+}
+
+/** 强录留痕的一行订单备注（无冲突 → null，调用方据此决定加不加这一行）。 */
+function duplicateForceNoteFor(
+  conflicts: DuplicatePassengerConflict[],
+  reason: string,
+): string | null {
+  if (conflicts.length === 0) return null;
+  const orderNumbers = [...new Set(conflicts.flatMap((c) => c.orderNumbers))];
+  return `重复乘客强录：与订单 ${orderNumbers.join('、')} ${reason}`;
+}
+
 export class OrderService {
   private readonly pricing = new PricingService();
 
@@ -1546,7 +1597,8 @@ export class OrderService {
       }
     }
 
-    // 重复乘客校验：同班次「占座中」订单里已有同证件号乘客 → 拒绝，防同人同航班重复占座
+    // 重复乘客校验：同班次「占座中」订单里已有同证件号乘客（或证件待补的同名乘客）→ 拒绝，
+    // 防同人同航班重复占座
     const flightScheduleIds = [
       ...new Set(
         body.items
@@ -1560,18 +1612,25 @@ export class OrderService {
     const duplicateConflicts =
       (await this.assertNoDuplicatePassengersOnFlights(
         flightScheduleIds,
-        body.passengers.map((px) => px.documentNumber),
+        body.passengers,
         allowDuplicatePassengers,
       )) ?? [];
 
     // 重复乘客强录留痕：附加一行「重复乘客强录：与订单 XXX 同班次同证件号」到订单备注（可追溯）。
+    // 两类命中分开写清楚 —— 财务/票务复核时「同证件号」与「对方证件待补、只是同名」
+    // 要采取的动作完全不同（后者要去那张单补护照）。
     // 仅 allowDuplicatePassengers 放行且确有冲突时非空（其余情况 conflicts 恒为 []）。
-    const duplicateForceNote =
-      duplicateConflicts.length > 0
-        ? `重复乘客强录：与订单 ${[
-            ...new Set(duplicateConflicts.flatMap((c) => c.orderNumbers)),
-          ].join('、')} 同班次同证件号`
-        : null;
+    const duplicateNoteParts = [
+      duplicateForceNoteFor(
+        duplicateConflicts.filter((c) => c.documentNumber !== ''),
+        '同班次同证件号',
+      ),
+      duplicateForceNoteFor(
+        duplicateConflicts.filter((c) => c.documentNumber === ''),
+        '同班次同名（对方证件待补）',
+      ),
+    ].filter((v): v is string => v !== null);
+    const duplicateForceNote = duplicateNoteParts.length > 0 ? duplicateNoteParts.join(' · ') : null;
     const finalNotes = duplicateForceNote
       ? [body.notes, duplicateForceNote].filter(Boolean).join(' · ')
       : body.notes;
@@ -2915,25 +2974,43 @@ export class OrderService {
 
   /**
    * 重复乘客校验：同一航班班次的「占座中」订单（SEAT_HOLDING_STATUSES）里，
-   * 同证件号乘客不允许再次下单 —— 已取消/已退款/超时的订单不算占座，可重订。
+   * 同一个人不允许再次下单 —— 已取消/已退款/超时的订单不算占座，可重订。
+   *
+   * 「同一个人」有两把尺子，命中任一即算重复：
+   *   ① 证件号相同（主口径，最可靠）。
+   *   ② 对方是**证件待补**（documentNumber = ''，占位单只填姓名转正来的）且**姓名相同**。
+   *      为什么必须有第二把：占位单转正只填了姓名，证件号落库是空串；护照到手后如果经办人
+   *      没走补录、而是在同一班次重新建了一张带真护照号的新单，第一把尺子永远量不到
+   *      （空串对不上任何真护照号），闸静默放行 —— 3 个人就占了 6 个座。
    *
    *   - allowDuplicate=false（默认；前台散客 / 未授权）：命中即抛 DuplicatePassengerError
-   *     （code=DUPLICATE_PASSENGER，details.conflicts 带证件号 + 冲突订单号），拒绝下单。
+   *     （code=DUPLICATE_PASSENGER，details.conflicts 带证件号/姓名 + 冲突订单号），拒绝下单。
    *   - allowDuplicate=true（仅 ADMIN/STAFF 后台录入，权限已在 createOrder 入口按身份收口）：
    *     命中不拦，返回冲突明细，由调用方写审计 + 订单备注留痕（客人重复订票且已付款场景）。
+   *     两把尺子同权：证件待补的同名命中一样可强录、一样留痕。
    *
    * 无冲突恒返回 []（含无 FLIGHT 班次 / 无乘客的快速返回）。
    */
   private async assertNoDuplicatePassengersOnFlights(
     flightScheduleIds: string[],
-    documentNumbers: string[],
+    passengers: ReadonlyArray<DuplicateCheckPassenger>,
     allowDuplicate = false,
-  ): Promise<Array<{ documentNumber: string; orderNumbers: string[] }>> {
-    if (flightScheduleIds.length === 0 || documentNumbers.length === 0) return [];
+  ): Promise<DuplicatePassengerConflict[]> {
+    if (flightScheduleIds.length === 0 || passengers.length === 0) return [];
 
-    const conflicts = await prisma.passenger.findMany({
+    const documentNumbers = [
+      ...new Set(passengers.map((p) => p.documentNumber?.trim()).filter((d): d is string => !!d)),
+    ];
+
+    // 一次查询取两类候选行：本次要下单的证件号 + 同班次所有「证件待补」乘客。
+    // 拆成两次查会多打一次库，且两次之间的窗口里对方可能刚补完证件，反而更容易漏。
+    const rows = await prisma.passenger.findMany({
       where: {
-        documentNumber: { in: [...new Set(documentNumbers)] },
+        OR: [
+          ...(documentNumbers.length > 0 ? [{ documentNumber: { in: documentNumbers } }] : []),
+          // 空串 = 占位单转正时只填了姓名、证件待补（见 createHoldConversionOrderWithinTx）。
+          { documentNumber: '' },
+        ],
         order: {
           status: { in: SEAT_HOLDING_STATUSES },
           items: { some: { flightScheduleId: { in: flightScheduleIds } } },
@@ -2941,32 +3018,80 @@ export class OrderService {
       },
       select: {
         documentNumber: true,
+        lastName: true,
+        firstName: true,
+        fullName: true,
+        chineseName: true,
         order: { select: { orderNumber: true } },
       },
     });
-    if (conflicts.length === 0) return [];
+    if (rows.length === 0) return [];
 
+    // ── ① 证件号命中 ────────────────────────────────────────────────────────
+    const requestedDocuments = new Set(documentNumbers);
     const orderNumbersByDoc = new Map<string, Set<string>>();
-    for (const c of conflicts) {
-      const orderNumbers = orderNumbersByDoc.get(c.documentNumber) ?? new Set<string>();
-      orderNumbers.add(c.order.orderNumber);
-      orderNumbersByDoc.set(c.documentNumber, orderNumbers);
+    for (const r of rows) {
+      if (!r.documentNumber || !requestedDocuments.has(r.documentNumber)) continue;
+      const orderNumbers = orderNumbersByDoc.get(r.documentNumber) ?? new Set<string>();
+      orderNumbers.add(r.order.orderNumber);
+      orderNumbersByDoc.set(r.documentNumber, orderNumbers);
     }
-    const conflictList = [...orderNumbersByDoc.entries()].map(([documentNumber, orderNumbers]) => ({
-      documentNumber,
-      orderNumbers: [...orderNumbers],
-    }));
+    const docConflicts: DuplicatePassengerConflict[] = [...orderNumbersByDoc.entries()].map(
+      ([documentNumber, orderNumbers]) => ({ documentNumber, orderNumbers: [...orderNumbers] }),
+    );
+
+    // ── ② 证件待补 + 同名命中 ───────────────────────────────────────────────
+    const pendingRows = rows.filter((r) => !r.documentNumber);
+    const orderNumbersByName = new Map<string, Set<string>>();
+    for (const px of passengers) {
+      const latin = latinPassengerNameKey(px);
+      const chinese = chinesePassengerNameKey(px.chineseName);
+      if (!latin && !chinese) continue;
+      for (const row of pendingRows) {
+        const rowLatin = latinPassengerNameKey(row);
+        const rowChinese = chinesePassengerNameKey(row.chineseName);
+        const hit =
+          (latin != null && rowLatin != null && latin === rowLatin) ||
+          (chinese != null && rowChinese != null && chinese === rowChinese);
+        if (!hit) continue;
+        const label = px.chineseName?.trim() || latin || chinese!;
+        const orderNumbers = orderNumbersByName.get(label) ?? new Set<string>();
+        orderNumbers.add(row.order.orderNumber);
+        orderNumbersByName.set(label, orderNumbers);
+      }
+    }
+    const nameConflicts: DuplicatePassengerConflict[] = [...orderNumbersByName.entries()].map(
+      ([passengerName, orderNumbers]) => ({
+        // 对方证件本来就是空的，如实回空串（前端/审计据此与证件号命中区分开）。
+        documentNumber: '',
+        passengerName,
+        orderNumbers: [...orderNumbers],
+      }),
+    );
+
+    const conflictList = [...docConflicts, ...nameConflicts];
+    if (conflictList.length === 0) return [];
 
     // 授权强录 → 不拦，把明细交回调用方做审计 + 备注。
     if (allowDuplicate) return conflictList;
 
-    const detail = conflictList
-      .map(({ documentNumber, orderNumbers }) => `${documentNumber}（订单 ${orderNumbers.join('、')}）`)
-      .join('；');
-    throw new DuplicatePassengerError(
-      `以下乘客证件号已在同航班的有效订单中，不能重复下单：${detail}`,
-      { conflicts: conflictList },
-    );
+    const messages: string[] = [];
+    if (docConflicts.length > 0) {
+      const detail = docConflicts
+        .map(({ documentNumber, orderNumbers }) => `${documentNumber}（订单 ${orderNumbers.join('、')}）`)
+        .join('；');
+      messages.push(`以下乘客证件号已在同航班的有效订单中，不能重复下单：${detail}`);
+    }
+    if (nameConflicts.length > 0) {
+      const detail = nameConflicts
+        .map(({ passengerName, orderNumbers }) => `${passengerName}（订单 ${orderNumbers.join('、')}）`)
+        .join('；');
+      messages.push(
+        `以下乘客与同航班有效订单里的同名乘客重合：${detail}；` +
+          '该订单存在证件待补的同名乘客，请到该订单补录护照而不是重新建单',
+      );
+    }
+    throw new DuplicatePassengerError(messages.join('。'), { conflicts: conflictList });
   }
 
   /**
@@ -5103,7 +5228,7 @@ export class OrderService {
       (requester.role === UserRole.ADMIN || requester.role === UserRole.STAFF);
     await this.assertNoDuplicatePassengersOnFlights(
       dedupScheduleIds,
-      body.passengers.map((px) => px.documentNumber),
+      body.passengers,
       allowDuplicatePassengers,
     );
 
@@ -7049,10 +7174,21 @@ export class OrderService {
 
     const passenger = await prisma.passenger.findUnique({
       where: { id: passengerId },
-      select: { id: true, orderId: true },
+      select: { id: true, orderId: true, documentNumber: true },
     });
     if (!passenger || passenger.orderId !== orderId) {
       throw new NotFoundError('出行人不存在或不属于该订单');
+    }
+
+    // ── 补录反向闸：证件号从「待补」补成真值时，回头查一次同班次同证件号 ─────────────
+    // 建单闸只在**建单那一刻**量得到，占位单转正的乘客当时证件是空的（量不到）。
+    // 若同期还有人在同班次用这本真护照建过单，那份重复到今天才浮出水面：补录一落库，
+    // 同一个人在同一班次上就实打实占着两份座。此路没有强录口子 —— 两张单总有一张要收口，
+    // 与其让两份座位一直挂着，不如在这里拦住，让经办人先处理掉那一张。
+    const nextDocumentNumber = input.documentNumber?.trim();
+    const hadDocumentNumber = (passenger.documentNumber ?? '').trim() !== '';
+    if (nextDocumentNumber && !hadDocumentNumber) {
+      await this.assertBackfilledDocumentNotDuplicated(orderId, nextDocumentNumber);
     }
 
     // 仅映射传入字段（与 swapPassenger 同款「undefined 即不动」口径）；日期字符串 → Date。
@@ -7075,6 +7211,49 @@ export class OrderService {
       changedFields,
       orderNumber: order.orderNumber,
     };
+  }
+
+  /**
+   * 补录护照后的同班次查重（证件号从空补成真值时调用）。
+   *
+   * 与建单闸同口径：只看本单各航段班次上「占座中」的订单，且排除本单自己。
+   * 命中即抛 DuplicatePassengerError（同一个错误类型，前端已有的 DUPLICATE_PASSENGER
+   * 处理逻辑照旧接得住）。本单没有任何有效航段（纯酒店/接送）→ 无从比对，直接放行。
+   */
+  private async assertBackfilledDocumentNotDuplicated(
+    orderId: string,
+    documentNumber: string,
+  ): Promise<void> {
+    const legs = await prisma.orderItem.findMany({
+      where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+      select: { flightScheduleId: true },
+    });
+    const scheduleIds = [
+      ...new Set(legs.map((l) => l.flightScheduleId).filter((v): v is string => v != null)),
+    ];
+    if (scheduleIds.length === 0) return;
+
+    const conflicts = await prisma.passenger.findMany({
+      where: {
+        documentNumber,
+        orderId: { not: orderId },
+        order: {
+          status: { in: SEAT_HOLDING_STATUSES },
+          items: { some: { flightScheduleId: { in: scheduleIds } } },
+        },
+      },
+      select: { order: { select: { orderNumber: true } } },
+    });
+    if (conflicts.length === 0) return;
+
+    const orderNumbers = [...new Set(conflicts.map((c) => c.order.orderNumber))];
+    throw new DuplicatePassengerError(
+      `该证件号已在同航班的有效订单中：${orderNumbers.join('、')}。` +
+        '同一个人在同一班次占了两份座，请先处理掉其中一张单再补录护照。',
+      {
+        conflicts: [{ documentNumber, orderNumbers }] satisfies DuplicatePassengerConflict[],
+      },
+    );
   }
 
   /**
@@ -14664,7 +14843,10 @@ export class OrderService {
     warnings: string[];
     scope: NoShowScope;
     alreadyNoShow: boolean;
-    /** 回程班次已起飞（releaseReturn=true 时同时会有一条 blocker）。 */
+    /**
+     * 回程班次**已关柜**（releaseReturn=true 时同时会有一条 blocker）。
+     * 字段名是历史契约（前端在用），口径已随闸 5b 改成关柜时刻，含「已起飞」这一段。
+     */
     returnDeparted: boolean;
     /** true = 去程早标过 no-show、回程已恢复回来，本次只是「再释放一次回程」。 */
     isRerelease: boolean;
@@ -14762,18 +14944,25 @@ export class OrderService {
       );
     }
 
-    // ── 闸 5b：回程班次已起飞 —— 起飞后的座位放回库存是凭空多卖 ──────────────────
+    // ── 闸 5b：回程班次已关柜 —— 关柜后的座位放回库存是凭空多卖 ────────────────────
+    // 锚点与闸 4 同源，都是关柜时刻（见 lib/checkin-close.ts）：柜台一关，这个座位就再没人
+    // 值得了机 —— 放回库存等于把一个卖不出去的座位当可卖余位再卖一次。
     // 只在勾了「同时释放回程」时阻断；只想留个 no-show 记录（releaseReturn=false）照常放行。
     const returnDepartAt = returnItem?.flightSchedule?.departureTime ?? null;
-    const returnDeparted = returnDepartAt != null && returnDepartAt.getTime() <= Date.now();
+    const returnCloseAt = returnDepartAt
+      ? checkinCloseAt(returnDepartAt, returnItem?.flightSchedule?.checkinCloseMinutes)
+      : null;
+    // 字段名沿用 returnDeparted（前端契约未改），语义已是「已关柜」（含已起飞）。
+    const returnDeparted = returnCloseAt != null && returnCloseAt.getTime() <= Date.now();
     if (returnDeparted && releaseReturn && returnItem) {
       const sched = returnItem.flightSchedule;
       const localWhen =
-        returnDepartAt != null
-          ? `${localDateISO(returnDepartAt, sched?.departureTz)} ${localHHMM(returnDepartAt, sched?.departureTz)}`
+        returnCloseAt != null
+          ? `${localDateISO(returnCloseAt, sched?.departureTz)} ${localHHMM(returnCloseAt, sched?.departureTz)}`
           : '时间未知';
       blockers.push(
-        `回程航班已起飞（当地时间 ${localWhen} 出发），无法释放座位；` +
+        `回程航班已关柜（当地时间 ${localWhen} 关柜），座位不再释放 ——` +
+          '关柜后放回库存的座位没人能值机，等于凭空多卖；' +
           '如只需记录 no-show 请取消勾选「同时释放回程」。',
       );
     }
@@ -15455,6 +15644,7 @@ export class OrderService {
     oversoldAfter: number;
     /** 逐舱三值（before/after/increment），供前端与审计逐舱对账。 */
     oversellDetail: OversellSeatDetail[];
+    /** 原班次**已关柜**（字段名是历史契约，口径含「已起飞」这一段）。 */
     departed: boolean;
     scheduleId: string | null;
     /** 释放快照里逐舱张数之和 = 本次要恢复的总座数（预检展示口径，与实际占回数一致）。 */
@@ -15516,13 +15706,16 @@ export class OrderService {
       } else {
         const schedule = await db.flightSchedule.findUnique({
           where: { id: scheduleId },
-          select: { id: true, departureTime: true },
+          // checkinCloseMinutes：恢复的时间锚点同样是关柜时刻（见 lib/checkin-close.ts）。
+          select: { id: true, departureTime: true, checkinCloseMinutes: true },
         });
         if (!schedule) {
           blockers.push('原班次已不存在（可能已被删除），无法恢复，请人工重录回程航段。');
-        } else if (schedule.departureTime.getTime() <= Date.now()) {
+        } else if (isCheckinClosed(schedule.departureTime, schedule.checkinCloseMinutes)) {
+          // 恢复 = 把座位重新占回原班次。柜台已关，占回来的人也上不去这班飞机 ——
+          // 占的是一个交付不了的座位，还把这一舱的余位平白吃掉一份。
           departed = true;
-          blockers.push('原班次已起飞，无法恢复。');
+          blockers.push('原班次已关柜，无法恢复；关柜后占回的座位没人能值机。');
         } else {
           for (const need of releasedSeats) {
             const seatState = await cabinSeatStateWithinTx(db, scheduleId, need.cabin);
@@ -16230,14 +16423,25 @@ export class OrderService {
             select: {
               departureTime: true,
               departureTz: true,
+              // 只用于文案分支（关柜后 / 关柜前给的下一步不一样）；作废判定本身仍按起飞时刻。
+              checkinCloseMinutes: true,
               flight: { select: { flightNumber: true } },
             },
           })
         : null;
       if (schedule && scheduleId) {
+        // 作废的锚点仍是**起飞时刻**，不是关柜：作废是「飞机走了、这段确实消耗掉了」的事实动作，
+        // 而关柜到起飞之间飞机还没走（延误/换班次都可能让它最终没走成），此时打终态就把话说早了。
+        // 关柜与起飞之间那段窗口：恢复回程（闸按关柜）已经关了、释放座位（闸 5b 按关柜）也关了，
+        // 这一段只能原地等到起飞——文案要把这个状态讲清楚，不能让运营以为还有别的路可走。
         departed = schedule.departureTime.getTime() <= Date.now();
         if (!departed) {
-          blockers.push('回程未起飞，请用恢复回程或等待起飞后作废。');
+          blockers.push(
+            isCheckinClosed(schedule.departureTime, schedule.checkinCloseMinutes)
+              ? '回程已关柜但尚未起飞：此时既不能恢复回程、也不能再释放座位，请等起飞后再作废' +
+                '（起飞满 2 小时系统会自动作废）。'
+              : '回程未起飞，请用恢复回程或等待起飞后作废。',
+          );
         }
         original = {
           orderItemId: item.id,
@@ -16852,7 +17056,7 @@ export interface RestoreReturnLegPreview {
   /** 逐舱三值（before/after/increment），前端要逐舱展示时用。 */
   oversellDetail: OversellSeatDetail[];
   maxOversell: number;
-  /** 原班次已起飞（同时会有一条 blocker）。 */
+  /** 原班次**已关柜**（同时会有一条 blocker）。字段名是历史契约，口径含「已起飞」这一段。 */
   departed: boolean;
 }
 

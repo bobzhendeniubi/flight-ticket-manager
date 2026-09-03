@@ -1,7 +1,7 @@
 /**
  * no-show 处理（批量）· ADMIN/STAFF
  *
- * 场景：航班起飞后航司给来一份未登机名单，票务贴进来一次性标完，顺带把回程座位放回库存。
+ * 场景：班次关柜后航司给来一份未登机名单，票务贴进来一次性标完，顺带把回程座位放回库存。
  *
  * 口径与边界（都由服务端把关，本页只做勾选与展示）：
  *   - 能不能标（eligible / blockers）、要不要先拆单（scope）、能释放几座，全部以 preview 为准；
@@ -458,7 +458,7 @@ export function NoShowBatchPage() {
       <section>
         <h1 className="page-title">no-show 处理</h1>
         <p className="page-sub">
-          航班起飞后，把航司给的未登机名单贴进来一次性标记：去程标 no-show（<strong>钱不动</strong>），
+          班次关柜后，把航司给的未登机名单贴进来一次性标记：去程标 no-show（<strong>钱不动</strong>），
           回程座位可同时放回库存重新可卖。能不能标、要不要先拆单、能释放几座，全部以系统匹配结果为准。
         </p>
       </section>

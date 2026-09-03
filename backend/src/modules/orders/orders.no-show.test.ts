@@ -490,7 +490,7 @@ describe('no-show · 预检', () => {
     expect(res.warnings.join('')).toContain('只会再释放一次回程座位');
   });
 
-  it('回程班次已起飞 + 勾了释放 → 拒绝；不勾释放则放行', async () => {
+  it('回程班次已关柜（已起飞）+ 勾了释放 → 拒绝；不勾释放则放行', async () => {
     const departed = new Date(Date.now() - 2 * 24 * 3600_000);
     const snapshot = orderSnapshot({
       items: [
@@ -499,6 +499,7 @@ describe('no-show · 预检', () => {
           flightSchedule: {
             departureTime: departed,
             departureTz: 'Asia/Shanghai',
+            checkinCloseMinutes: null,
             flight: { flightNumber: 'QH9588' },
           },
         }),
@@ -509,12 +510,65 @@ describe('no-show · 预检', () => {
     const blocked = await service.previewNoShow('ord-1', {}, ADMIN);
     expect(blocked.eligible).toBe(false);
     expect(blocked.returnDeparted).toBe(true);
-    expect(blocked.blockers.join('')).toContain('回程航班已起飞');
+    expect(blocked.blockers.join('')).toContain('回程航班已关柜');
 
     mountPreview(snapshot);
     const allowed = await service.previewNoShow('ord-1', { releaseReturn: false }, ADMIN);
     expect(allowed.eligible).toBe(true);
     expect(allowed.returnDeparted).toBe(true);
+  });
+
+  // 关柜到起飞之间那 45 分钟：柜台已关、飞机还没走。座位这时候放回库存，
+  // 买到它的人根本值不了机 —— 与起飞后放回去一样是凭空多卖，所以闸 5b 提前到关柜。
+  it('回程已关柜但未起飞（起飞前 20 分钟）+ 勾了释放 → 拒绝释放；不勾释放仍放行', async () => {
+    const soon = new Date(Date.now() + 20 * 60_000);
+    const snapshot = orderSnapshot({
+      items: [
+        outboundRow(),
+        returnRow({
+          flightSchedule: {
+            departureTime: soon,
+            departureTz: 'Asia/Shanghai',
+            checkinCloseMinutes: null, // 未配置 → 系统默认提前 45 分钟 → 25 分钟前已关柜
+            flight: { flightNumber: 'QH9588' },
+          },
+        }),
+        hotelRow,
+      ],
+    });
+    mountPreview(snapshot);
+    const blocked = await service.previewNoShow('ord-1', {}, ADMIN);
+    expect(blocked.eligible).toBe(false);
+    expect(blocked.returnDeparted).toBe(true);
+    expect(blocked.blockers.join('')).toContain('回程航班已关柜');
+
+    mountPreview(snapshot);
+    const allowed = await service.previewNoShow('ord-1', { releaseReturn: false }, ADMIN);
+    expect(allowed.eligible).toBe(true);
+  });
+
+  // 同一时刻的反面：还没到关柜点就照常能释放（别把闸提前成「起飞前一整段」都不让放）。
+  it('回程尚未关柜（起飞前 2 小时）+ 勾了释放 → 放行', async () => {
+    const later = new Date(Date.now() + 2 * 3600_000);
+    mountPreview(
+      orderSnapshot({
+        items: [
+          outboundRow(),
+          returnRow({
+            flightSchedule: {
+              departureTime: later,
+              departureTz: 'Asia/Shanghai',
+              checkinCloseMinutes: null,
+              flight: { flightNumber: 'QH9588' },
+            },
+          }),
+          hotelRow,
+        ],
+      }),
+    );
+    const res = await service.previewNoShow('ord-1', {}, ADMIN);
+    expect(res.returnDeparted).toBe(false);
+    expect(res.blockers.join('')).not.toContain('关柜');
   });
 
   it('有进行中的退款 → 拒绝标记 no-show', async () => {
@@ -1146,17 +1200,69 @@ describe('恢复回程 · 预检', () => {
     expect(res.blockers.join('')).toContain('累计超出 12 座');
   });
 
-  it('原班次已起飞 → blocker + departed=true', async () => {
+  it('原班次已关柜（已起飞）→ blocker + departed=true', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(releasedSnapshotOrder());
     mockPrisma.flightSchedule.findUnique.mockResolvedValue({
       id: 'sch-ret',
       departureTime: new Date(Date.now() - 3600_000),
       departureTz: 'Asia/Shanghai',
+      checkinCloseMinutes: null,
       flight: { flightNumber: 'QH9588' },
     });
     const res = await service.previewRestoreReturnLeg('ord-1', ADMIN);
     expect(res.departed).toBe(true);
-    expect(res.blockers.join('')).toContain('原班次已起飞');
+    expect(res.blockers.join('')).toContain('原班次已关柜');
+  });
+
+  // 关柜到起飞之间那 45 分钟：恢复 = 重新占座，柜台已关，占回来的人也登不上这班机 ——
+  // 占的是一个交付不了的座位，还白吃掉这一舱一份余位，所以恢复闸同样提前到关柜。
+  it('原班次已关柜但未起飞（起飞前 20 分钟）→ 拒绝恢复，且不查余位', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(releasedSnapshotOrder());
+    mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sch-ret',
+      departureTime: new Date(Date.now() + 20 * 60_000),
+      departureTz: 'Asia/Shanghai',
+      checkinCloseMinutes: null, // 未配置 → 默认提前 45 分钟 → 25 分钟前已关柜
+      flight: { flightNumber: 'QH9588' },
+    });
+    const res = await service.previewRestoreReturnLeg('ord-1', ADMIN);
+    expect(res.eligible).toBe(false);
+    expect(res.departed).toBe(true);
+    expect(res.blockers.join('')).toContain('原班次已关柜');
+    expect(mockPrisma.flightSeatClass.findFirst).not.toHaveBeenCalled();
+  });
+
+  // 班次自配的关柜提前分钟数压过系统默认（与闸 4 同源）。
+  it('原班次自配关柜提前 90 分钟 → 起飞前 60 分钟已关柜，拒绝恢复', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(releasedSnapshotOrder());
+    mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sch-ret',
+      departureTime: new Date(Date.now() + 60 * 60_000),
+      departureTz: 'Asia/Shanghai',
+      checkinCloseMinutes: 90,
+      flight: { flightNumber: 'QH9588' },
+    });
+    const res = await service.previewRestoreReturnLeg('ord-1', ADMIN);
+    expect(res.departed).toBe(true);
+    expect(res.blockers.join('')).toContain('原班次已关柜');
+  });
+
+  // 反面：还没到关柜点照常能恢复（别把恢复闸提前成「起飞前一整段」都不让恢复）。
+  it('原班次尚未关柜（起飞前 2 小时）→ 照常可恢复', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(releasedSnapshotOrder());
+    mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sch-ret',
+      departureTime: new Date(Date.now() + 2 * 3600_000),
+      departureTz: 'Asia/Shanghai',
+      checkinCloseMinutes: null,
+      flight: { flightNumber: 'QH9588' },
+    });
+    mockPrisma.flightSeatClass.findFirst.mockResolvedValue({ capacity: 180, sold: 100 });
+    mockPrisma.seatLock.aggregate.mockResolvedValue({ _sum: { qty: 0 } });
+
+    const res = await service.previewRestoreReturnLeg('ord-1', ADMIN);
+    expect(res.eligible).toBe(true);
+    expect(res.departed).toBe(false);
   });
 
   it('没有被释放过的回程 → blocker', async () => {
@@ -2681,7 +2787,7 @@ describe('no-show · 空乘客数组不等于整单', () => {
 describe('回程作废 · 权限与预检', () => {
   /** 已释放 + 原班次已起飞（3 天前）的单。 */
   const departedReleasedOrder = () => releasedSnapshotOrder();
-  const armPreview = (departureTime: Date | null) => {
+  const armPreview = (departureTime: Date | null, checkinCloseMinutes: number | null = null) => {
     mockPrisma.order.findUnique.mockResolvedValue(departedReleasedOrder());
     mockPrisma.flightSchedule.findUnique.mockResolvedValue(
       departureTime
@@ -2689,6 +2795,7 @@ describe('回程作废 · 权限与预检', () => {
             id: 'sch-ret',
             departureTime,
             departureTz: 'Asia/Shanghai',
+            checkinCloseMinutes,
             flight: { flightNumber: 'QH9588' },
           }
         : null,
@@ -2724,6 +2831,20 @@ describe('回程作废 · 权限与预检', () => {
     expect(res.eligible).toBe(false);
     expect(res.departed).toBe(false);
     expect(res.blockers.join('')).toContain('回程未起飞，请用恢复回程或等待起飞后作废');
+  });
+
+  // 关柜到起飞之间那 45 分钟：作废的锚点仍是**起飞**（飞机还没走，此时打终态就把话说早了），
+  // 所以这一刻照旧拒。但文案不能再指路「去点恢复回程」—— 恢复闸此刻已经按关柜关上了，
+  // 照原文案走过去只会撞另一堵墙。这一段唯一能做的就是等起飞（起飞满 2 小时 job 自动收口）。
+  it('回程已关柜但未起飞 → 仍拒作废，且文案不再指路恢复回程', async () => {
+    armPreview(new Date(Date.now() + 20 * 60_000)); // 默认提前 45 分钟 → 25 分钟前已关柜
+    const res = await service.previewVoidReturnLeg('ord-1', ADMIN);
+    expect(res.eligible).toBe(false);
+    expect(res.departed).toBe(false);
+    const blockers = res.blockers.join('');
+    expect(blockers).toContain('已关柜但尚未起飞');
+    expect(blockers).toContain('请等起飞后再作废');
+    expect(blockers).not.toContain('请用恢复回程');
   });
 
   it('本单没有已释放的回程 → 拒（无事可做）', async () => {

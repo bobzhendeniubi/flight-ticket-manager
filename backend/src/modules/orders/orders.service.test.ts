@@ -489,11 +489,13 @@ describe('OrderService 重复乘客校验', () => {
     expect(thrown!.message).toContain('FTM-TEST-001');
     expect(thrown!.message).toContain('FTM-TEST-002');
 
-    // 查重条件：同班次 + 占座状态 + 证件号 in
+    // 查重条件：同班次 + 占座状态 + 两类候选（本次的证件号 in ∪ 证件待补的空串）。
+    // 空串那一支是给「占位单转正只填姓名」的乘客留的：不把它一起捞出来，
+    // 同名重复就永远量不到（空串对不上任何真护照号）。
     expect(mockPrisma.passenger.findMany).toHaveBeenCalledWith(
       expect.objectContaining({
         where: expect.objectContaining({
-          documentNumber: { in: ['E12345678'] },
+          OR: [{ documentNumber: { in: ['E12345678'] } }, { documentNumber: '' }],
           order: expect.objectContaining({
             items: { some: { flightScheduleId: { in: ['sched-1'] } } },
           }),
@@ -509,10 +511,13 @@ describe('OrderService 重复乘客校验', () => {
       (service as unknown as {
         assertNoDuplicatePassengersOnFlights(
           s: string[],
-          d: string[],
+          p: Array<Record<string, unknown>>,
           allow?: boolean,
         ): Promise<unknown[]>;
-      }).assertNoDuplicatePassengersOnFlights(['sched-1'], ['E12345678']),
+      }).assertNoDuplicatePassengersOnFlights(
+        ['sched-1'],
+        [{ documentNumber: 'E12345678', fullName: 'ZHANG/SAN' }],
+      ),
     ).resolves.toEqual([]);
   });
 
@@ -520,10 +525,10 @@ describe('OrderService 重复乘客校验', () => {
     await (service as unknown as {
       assertNoDuplicatePassengersOnFlights(
         s: string[],
-        d: string[],
+        p: Array<Record<string, unknown>>,
         allow?: boolean,
       ): Promise<unknown[]>;
-    }).assertNoDuplicatePassengersOnFlights([], ['E12345678']);
+    }).assertNoDuplicatePassengersOnFlights([], [{ documentNumber: 'E12345678' }]);
     expect(mockPrisma.passenger.findMany).not.toHaveBeenCalled();
   });
 
