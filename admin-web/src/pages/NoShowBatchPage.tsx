@@ -6,8 +6,9 @@
  * 口径与边界（都由服务端把关，本页只做勾选与展示）：
  *   - 能不能标（eligible / blockers）、要不要先拆单（scope）、能释放几座，全部以 preview 为准；
  *     前端不自己判，判出来的第二套口径必然漂移。
- *   - 未起飞的班次不给提交：起飞前谁也说不准客人到底登不登机。起飞与否以 preview 的
- *     schedule.departed 为准，本机时间只在选班次时给个提示。
+ *   - 未关柜的班次不给提交：柜台还开着，谁也说不准客人到底登不登机。关柜与否以 preview 的
+ *     schedule.departed 为准（该字段算的是**关柜时刻** = 起飞时刻 − 关柜提前分钟数，
+ *     默认提前 45 分钟；字段名沿用未改），本机时间只在选班次时给个提示。
  *   - 提交按 50 张单一片**顺序**连发（服务端 entries 上限就是 50，批量还是串行执行的）。
  *     每片一个 requestToken，按该片载荷指纹记忆化：「重试失败项」原样重发同一批载荷，
  *     已成功的片会被幂等回放、不会再执行一遍；改了勾选 / 释放开关 / 备注才换新键。
@@ -110,9 +111,12 @@ export function NoShowBatchPage() {
   }, [candidateSchedules]);
 
   const selectedSchedule = candidateSchedules.find((s) => s.id === scheduleId) ?? null;
-  // 本机时间只作提示；真正的闸走 preview.schedule.departed。
+  // 本机时间只作提示；真正的闸走 preview.schedule.departed（服务端按该班次自己的关柜分钟数算）。
+  // 这里按系统默认 45 分钟粗估一下关柜时刻，让预检之前的角标不至于与预检后反着来。
+  const DEFAULT_CHECKIN_CLOSE_MINUTES = 45;
   const looksDeparted = selectedSchedule
-    ? new Date(selectedSchedule.departureTime).getTime() < Date.now()
+    ? new Date(selectedSchedule.departureTime).getTime() - DEFAULT_CHECKIN_CLOSE_MINUTES * 60_000 <
+      Date.now()
     : false;
 
   // ── 名单与匹配 ────────────────────────────────────────────────────────
@@ -546,15 +550,19 @@ export function NoShowBatchPage() {
                 座
               </span>
               {departed ? (
-                <span className="badge-neutral">已起飞</span>
+                <span className="badge-neutral" title="值机柜台已关闭（起飞前 45 分钟关柜，个别班次可单独配置）">
+                  已关柜
+                </span>
               ) : (
-                <span className="badge-warning">未起飞</span>
+                <span className="badge-warning" title="值机柜台还开着，客人仍可能赶上">
+                  未关柜
+                </span>
               )}
             </div>
             {!departed && (
               <p className="mt-1.5 text-xs text-amber-700">
-                <Icon name="alert" /> 本班次还没起飞，不能标 no-show —— 起飞前谁也说不准客人到底登不登机。
-                可以先贴名单做匹配核对，起飞后再回来提交。
+                <Icon name="alert" /> 本班次还没关柜，不能标 no-show —— 柜台还开着，谁也说不准客人到底登不登机。
+                可以先贴名单做匹配核对，关柜后再回来提交。
               </p>
             )}
           </div>
@@ -738,7 +746,7 @@ export function NoShowBatchPage() {
                     : '提交中…'
                   : '标记 no-show'}
               </button>
-              {!departed && <span className="text-xs text-amber-700">班次未起飞，暂不能提交</span>}
+              {!departed && <span className="text-xs text-amber-700">班次未关柜，暂不能提交</span>}
               {departed && truncationBlocked && (
                 <span className="text-xs text-rose-700">
                   名单被截断，请先确认上方「知道要分批」再提交

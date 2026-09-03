@@ -594,6 +594,9 @@ model FlightSchedule {
   costLockedBy       String?
   // 开票上限不再是本表上的独立字段：上限 = 该班次座位库存 = Σ FlightSeatClass.capacity
   //（多少商务舱 + 多少经济舱）。卖票与开票共用同一本账，见 ticketing-cap.ts。
+  // 关柜提前分钟数：值机柜台在起飞前多少分钟关闭。null = 用系统默认（见 lib/checkin-close.ts）。
+  // no-show 判定的时间锚点就是它算出来的关柜时刻——柜台一关人就来不了了，不必等到起飞那一刻。
+  checkinCloseMinutes Int?
   isActive           Boolean  @default(true)
   createdAt          DateTime @default(now())
   updatedAt          DateTime @updatedAt

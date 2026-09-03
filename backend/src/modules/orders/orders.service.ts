@@ -56,6 +56,7 @@ import {
   splitPassengerFullName,
 } from '../../lib/passenger-name.js';
 import { localHHMM, localDateISO, localToUtc } from '../../lib/flight-time.js';
+import { checkinCloseAt } from '../../lib/checkin-close.js';
 import { BUSINESS_TZ, businessDateISO, businessDateTime } from '../../lib/business-time.js';
 import { CANCELLABLE_STATUSES } from '../../lib/cancellation.js';
 import {
@@ -137,6 +138,7 @@ import { syncOrderVisaCompletion } from '../fulfillment/visa-completion.js';
 import { resolveSelfVisaDeductCny } from '../products/self-visa-deduct.js';
 import {
   assertOrderAllowsInvoicing,
+  assertPassportExpiryForInvoicing,
   assertTicketingCap,
   countsTowardTicketingCap,
   determineFlightLegs,
@@ -5686,12 +5688,16 @@ export class OrderService {
   /**
    * 设置六态开票的三个布尔位（路由层限 ADMIN/STAFF）：去程 / 回程 / 系统 各自独立。
    *
-   * 两道闸，都只在「从未开翻成已开」（false → true）时生效（翻回未开 / 无变化一律放行——
+   * 三道闸，都只在「从未开翻成已开」（false → true）时生效（翻回未开 / 无变化一律放行——
    * 死单纠错撤销错标记应当允许）：
    *   1. 订单状态闸（assertOrderAllowsInvoicing）：取消族（DRAFT/CANCELLED/PAYMENT_TIMEOUT/
    *      REFUNDED/FAILED）与软删单不许标开票 → 400。口径「能标开票」⟺「占额度」，
    *      与算额度复用同一份 COUNTED_STATUSES，两处不可能分叉。三个位都过这道闸。
-   *   2. 班次开票上限（assertTicketingCap）：只校验正在翻开的那个航段对应的班次 → 超限 422。
+   *   2. 护照有效期闸（assertPassportExpiryForInvoicing）：本航段涉及的乘客必须都有护照有效期
+   *      → 缺 400，报文点名是谁缺。护照有效期「必填」只在建单路径生效，编辑/补录路径为了
+   *      让存量空值旧单可编辑而放行空值 —— 这道闸是开票这一步的兜底，不改录入端。
+   *      systemInvoiced 不对应航段、不校验。
+   *   3. 班次开票上限（assertTicketingCap）：只校验正在翻开的那个航段对应的班次 → 超限 422。
    *      systemInvoiced 不占班次额度、不校验（但仍过状态闸）。
    *
    * 去程/回程班次由订单 FLIGHT 行按 departureTime 升序判定（determineFlightLegs）。
@@ -5717,7 +5723,15 @@ export class OrderService {
           outboundInvoiced: true,
           returnInvoiced: true,
           systemInvoiced: true,
-          passengers: { select: { passengerType: true } },
+          // passengerType 供座位口径（婴儿不占座）；姓名 + 护照有效期供开票护照闸报错文案。
+          passengers: {
+            select: {
+              passengerType: true,
+              fullName: true,
+              chineseName: true,
+              passportExpiry: true,
+            },
+          },
           items: {
             where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
             select: {
@@ -5747,12 +5761,14 @@ export class OrderService {
 
       const { outboundScheduleId, returnScheduleId } = determineFlightLegs(order.items);
 
-      // 去程：从 false → true 且有去程班次时校验该班次上限
+      // 去程：从 false → true 且有去程班次时校验护照有效期 + 该班次上限
       if (flags.outboundInvoiced === true && !order.outboundInvoiced && outboundScheduleId) {
+        assertPassportExpiryForInvoicing(order.orderNumber, '去程', order.passengers);
         await assertTicketingCap(tx, [outboundScheduleId], seatPassengerCount);
       }
-      // 回程：从 false → true 且有回程班次时校验该班次上限
+      // 回程：从 false → true 且有回程班次时校验护照有效期 + 该班次上限
       if (flags.returnInvoiced === true && !order.returnInvoiced && returnScheduleId) {
+        assertPassportExpiryForInvoicing(order.orderNumber, '回程', order.passengers);
         await assertTicketingCap(tx, [returnScheduleId], seatPassengerCount);
       }
 
@@ -14659,14 +14675,19 @@ export class OrderService {
       );
     }
 
-    // ── 闸 4：去程必须**已经起飞**（没飞怎么算没来）────────────────────────────
-    // departureTime 存的是真 UTC 瞬间（departureTz 只用于展示折算），所以直接与当前时刻比。
+    // ── 闸 4：去程必须**已经关柜**（柜台一关，人就上不去了）──────────────────────
+    // 锚点是关柜时刻，不是起飞时刻：航司名单按关柜出，票务不必再干等那 45 分钟
+    //（关柜提前分钟数按班次取，没配走系统默认，见 lib/checkin-close.ts）。
+    // departureTime / 关柜时刻都是真 UTC 瞬间（departureTz 只用于展示折算），直接与当前时刻比。
     const departAt = outboundItem?.flightSchedule?.departureTime ?? null;
-    if (outboundItem && departAt && departAt.getTime() > Date.now()) {
+    const outboundCloseAt = departAt
+      ? checkinCloseAt(departAt, outboundItem?.flightSchedule?.checkinCloseMinutes)
+      : null;
+    if (outboundItem && outboundCloseAt && outboundCloseAt.getTime() > Date.now()) {
       const sched = outboundItem.flightSchedule;
-      const localWhen = `${localDateISO(departAt, sched?.departureTz)} ${localHHMM(departAt, sched?.departureTz)}`;
+      const localWhen = `${localDateISO(outboundCloseAt, sched?.departureTz)} ${localHHMM(outboundCloseAt, sched?.departureTz)}`;
       blockers.push(
-        `去程航班尚未起飞（当地时间 ${localWhen} 出发），未起飞不能标记 no-show。` +
+        `去程航班尚未关柜（当地时间 ${localWhen} 关柜），未关柜不能标记 no-show。` +
           '客人临时不飞请走取消航段/取消订单流程。',
       );
     }
@@ -16266,6 +16287,8 @@ async function loadOrderForLegCancel(db: Prisma.TransactionClient, orderId: stri
             select: {
               departureTime: true,
               departureTz: true,
+              // 关柜提前分钟数（null = 走系统默认）：no-show 判定的时间锚点，见 lib/checkin-close.ts。
+              checkinCloseMinutes: true,
               flight: { select: { flightNumber: true } },
             },
           },

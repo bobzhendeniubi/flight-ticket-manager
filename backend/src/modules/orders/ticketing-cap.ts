@@ -115,6 +115,54 @@ export function assertOrderAllowsInvoicing(order: InvoicingGuardOrder): void {
   }
 }
 
+/** assertPassportExpiryForInvoicing 入参：本航段涉及的乘客（姓名用于报错文案）。 */
+export interface InvoicingPassportGuardPassenger {
+  fullName: string;
+  chineseName?: string | null;
+  passportExpiry: Date | null;
+}
+
+/** 报错文案里的乘客称呼：优先中文名（票务核名单用的就是它），没有就用拼音/英文名。 */
+function passengerLabel(p: InvoicingPassportGuardPassenger): string {
+  const zh = (p.chineseName ?? '').trim();
+  if (zh !== '') return zh;
+  return p.fullName.trim() === '' ? '（未填姓名）' : p.fullName.trim();
+}
+
+/**
+ * 开票护照有效期闸：某个航段翻成「已开票」前，该航段涉及的乘客必须都有护照有效期。
+ *
+ * 背景（真实事故）：护照有效期「必填」只在**新建订单**路径生效（见 orders.schemas 的
+ * passengerInputWithRequiredExpirySchema / refineRequiredPassportExpiry）；编辑、补录、换人
+ * 这些更新路径为了让存量空值旧单还能继续编辑，一律放行空值 —— 于是「录单填了、后来被清空」
+ * 与「开票」之间没有任何联动校验，没有护照有效期的单照样能标已开票。
+ * 出票要向航司报证件资料，缺有效期的名单出到一半被打回，返工全落在票务身上。
+ *
+ * 口径：
+ *   - 只在「翻成已开」（false → true）且**该方向确有航段**时校验（与 assertTicketingCap 同条件）——
+ *     纯酒店/接送单的出行人可能只是联系人占位（documentNumber='N/A'），本来就没有护照资料，
+ *     不该被这道闸打死；建单必填口径同样只覆盖「按人出行」的产品行。
+ *   - systemInvoiced 不对应任何航段，不校验（与它不占班次开票额度同理）。
+ *   - **婴儿一视同仁**：出境同样要护照，建单必填口径也没给婴儿开口子
+ *     （婴儿被排除的是「占座」——见 countIssuedPassengers，与证件要求是两回事）。
+ *   - 翻回「未开」不挡：纠错撤销错标记应当允许（与状态闸、资金闸「只挡进不挡退」同构）。
+ *
+ * 这是**开票这一步的兜底**，不动录入端：补录/编辑仍可留空，只是留空就开不了票。
+ */
+export function assertPassportExpiryForInvoicing(
+  orderNumber: string,
+  legLabel: '去程' | '回程',
+  passengers: ReadonlyArray<InvoicingPassportGuardPassenger>,
+): void {
+  const missing = passengers.filter((p) => p.passportExpiry == null);
+  if (missing.length === 0) return;
+  throw new BadRequestError(
+    `订单 ${orderNumber} 有 ${missing.length} 位出行人没有护照有效期，不能标记${legLabel}已开票：` +
+      `${missing.map(passengerLabel).join('、')}。` +
+      '出票要向航司报证件资料，缺有效期的名单会被打回。请先在订单里补全护照有效期再标开票。',
+  );
+}
+
 /** determineFlightLegs 入参：只需班次 id 与出发时刻。 */
 export interface FlightLegItem {
   id?: string;

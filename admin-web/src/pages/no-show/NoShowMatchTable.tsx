@@ -8,6 +8,10 @@
  *     贴进去的那几个字，不是我们解析出来的名字。
  *   - 服务端说「整单」的单，被取消勾了同单的某个人之后其实只标部分人（执行时会自动拆单），
  *     这一行给琥珀提示，不让它继续写着「整单」蒙人。
+ *   - 订单号下面带一行订单备注：本表只针对一个班次，所有行的出发日期天然相同，没有可区分的
+ *     「团期」；运营录单时把团组/客人识别信息写在备注里，拿它当可读标识是现成的。
+ *   - 回程一列写「票务已确认 / 票务未确认」而不是「已出票 / 未出票」：这里读的是出票任务的
+ *     确认状态，与财务的「开票」（订单上的三个开票位）是完全独立的两件事，字面太像会看串。
  */
 import type { NoShowBatchMatch } from '../../lib/api';
 import { MATCHED_BY_LABEL, matchKey } from './noShowMatch';
@@ -68,7 +72,12 @@ export function NoShowMatchTable({
             >
               名单原文
             </th>
-            <th className="whitespace-nowrap text-left">订单号</th>
+            <th
+              className="whitespace-nowrap text-left"
+              title="订单号下面是该单的备注原文，用来认人认团。本表只针对一个班次，所有行出发日期天然相同，没有可区分的「团期」"
+            >
+              订单号 / 备注
+            </th>
             <th className="whitespace-nowrap text-left">匹配方式</th>
             <th
               className="whitespace-nowrap text-left"
@@ -113,7 +122,20 @@ export function NoShowMatchTable({
                     {rosterText}
                   </span>
                 </td>
-                <td className="nums whitespace-nowrap">{m.orderNumber}</td>
+                <td className="align-top">
+                  <span className="nums block whitespace-nowrap">{m.orderNumber}</span>
+                  {/* 备注是运营自己写的识别信息（团组/客人/房型），过长时截断，鼠标悬停看全文 */}
+                  {m.notes?.trim() ? (
+                    <span
+                      className="mt-0.5 block max-w-[12rem] truncate text-[11px] text-ink-soft"
+                      title={m.notes}
+                    >
+                      {m.notes}
+                    </span>
+                  ) : (
+                    <span className="mt-0.5 block text-[11px] text-ink-muted">无备注</span>
+                  )}
+                </td>
                 <td className="whitespace-nowrap">
                   {/* 后端加了新匹配方式而前端还没发版时，原样显示比空着强 */}
                   <span className="badge-neutral">
@@ -157,11 +179,21 @@ export function NoShowMatchTable({
                       已起飞
                     </span>
                   ) : m.returnTicketed ? (
-                    <span className="badge-info" title="回程已出票：释放座位后需要走撤名单 / 退票工单">
-                      已出票
+                    // 「票务已确认」= 该航段的出票任务已确认，与财务的「开票」无关 ——
+                    // 单写「已出票」跟「已开票」只差一个字，运营真的看串过。
+                    <span
+                      className="badge-info"
+                      title="回程出票任务已确认（票务口径，与财务「开票」无关）：释放座位后需要走撤名单 / 退票工单"
+                    >
+                      票务已确认
                     </span>
                   ) : (
-                    <span className="badge-neutral">未出票</span>
+                    <span
+                      className="badge-neutral"
+                      title="回程出票任务尚未确认（票务口径，与财务「开票」无关）"
+                    >
+                      票务未确认
+                    </span>
                   )}
                 </td>
                 <td>

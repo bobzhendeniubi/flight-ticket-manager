@@ -838,6 +838,11 @@ export class FlightService {
       if (body.isActive !== undefined) scheduleData.isActive = body.isActive;
       if (newDep) scheduleData.departureTime = newDep;
       if (newArr) scheduleData.arrivalTime = newArr;
+      // 关柜提前分钟数：给了数就写，给 null 是「清空、回落系统默认」（见 lib/checkin-close.ts）；
+      // 不传则整项不动。不设二次确认闸 —— 它只影响 no-show 从哪一刻起可标，不动钱也不动座。
+      if (body.checkinCloseMinutes !== undefined) {
+        scheduleData.checkinCloseMinutes = body.checkinCloseMinutes;
+      }
       if (Object.keys(scheduleData).length > 0) {
         await tx.flightSchedule.update({ where: { id: scheduleId }, data: scheduleData });
       }

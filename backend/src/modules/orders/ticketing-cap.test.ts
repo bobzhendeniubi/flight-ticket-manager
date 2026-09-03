@@ -48,7 +48,15 @@ interface FakePax {
   id: string;
   documentNumber: string | null;
   passengerType: PassengerType;
+  // 开票护照闸要读的三项。默认给一个有效期 —— 绝大多数用例聚焦的是上限 / 状态闸，
+  // 不该被护照闸顺手拦下；护照闸自己的用例显式把 passportExpiry 置 null。
+  fullName: string;
+  chineseName: string | null;
+  passportExpiry: Date | null;
 }
+
+/** 默认护照有效期（远期日子，用例只关心「有没有」，不关心具体是哪天）。 */
+const VALID_EXPIRY = new Date('2031-05-20T00:00:00Z');
 interface FakeOrder {
   status: OrderStatus;
   outboundInvoiced: boolean;
@@ -67,13 +75,28 @@ function adults(n: number): FakePax[] {
       id: `p${paxSeq}`,
       documentNumber: `DOC${paxSeq}`,
       passengerType: PassengerType.ADULT,
+      fullName: `PAX ${paxSeq}`,
+      chineseName: null,
+      passportExpiry: VALID_EXPIRY,
     };
   });
 }
 /** 指定证件号/类型的乘客（去重与婴儿口径用例用）。 */
-function pax(documentNumber: string | null, passengerType = PassengerType.ADULT): FakePax {
+function pax(
+  documentNumber: string | null,
+  passengerType = PassengerType.ADULT,
+  over: Partial<Pick<FakePax, 'fullName' | 'chineseName' | 'passportExpiry'>> = {},
+): FakePax {
   paxSeq += 1;
-  return { id: `p${paxSeq}`, documentNumber, passengerType };
+  return {
+    id: `p${paxSeq}`,
+    documentNumber,
+    passengerType,
+    fullName: `PAX ${paxSeq}`,
+    chineseName: null,
+    passportExpiry: VALID_EXPIRY,
+    ...over,
+  };
 }
 
 /** 第 1 参：数字 = n 位互不相同的成人；数组 = 精确指定的乘客名单。 */
@@ -735,6 +758,113 @@ describe('OrderService.setInvoiceFlags', () => {
 
     it('有效状态（处理中）标开票 → 放行', async () => {
       stubOrder({ status: OrderStatus.PROCESSING });
+      await service.setInvoiceFlags('ord1', { outboundInvoiced: true });
+      expect(txMock.order.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { outboundInvoiced: true } }),
+      );
+    });
+  });
+
+  // ── 护照有效期闸：缺有效期的单不许标航段已开票 ─────────────────────────────
+  // 建单路径必填、编辑/补录路径放行空值，两者之间没有联动 —— 真实事故是有单没有护照有效期
+  // 却被标成了已开票。这道闸是开票这一步的兜底。
+  describe('护照有效期闸：本航段乘客缺护照有效期不许标已开票', () => {
+    it('有人缺护照有效期 → 标去程已开被拒，报文点名是谁，且不写库、不查班次额度', async () => {
+      stubOrder({
+        passengers: [
+          pax('A1', PassengerType.ADULT, { chineseName: '张三' }),
+          pax('A2', PassengerType.ADULT, { chineseName: '李四', passportExpiry: null }),
+        ],
+      });
+      await expect(service.setInvoiceFlags('ord1', { outboundInvoiced: true })).rejects.toThrow(
+        /有 1 位出行人没有护照有效期，不能标记去程已开票：李四/,
+      );
+      expect(txMock.order.update).not.toHaveBeenCalled();
+      // 护照闸先于班次上限：缺资料直接拒，不必再去查额度
+      expect(txMock.flightSeatClass.findMany).not.toHaveBeenCalled();
+    });
+
+    it('回程同样拦（报文写「回程」）', async () => {
+      stubOrder({ passengers: [pax('A1', PassengerType.ADULT, { passportExpiry: null })] });
+      await expect(service.setInvoiceFlags('ord1', { returnInvoiced: true })).rejects.toThrow(
+        /不能标记回程已开票/,
+      );
+      expect(txMock.order.update).not.toHaveBeenCalled();
+    });
+
+    it('多人都缺 → 一次列全，不用运营补一个试一次', async () => {
+      stubOrder({
+        passengers: [
+          pax('A1', PassengerType.ADULT, { chineseName: '张三', passportExpiry: null }),
+          pax('A2', PassengerType.ADULT, { chineseName: '李四', passportExpiry: null }),
+        ],
+      });
+      await expect(service.setInvoiceFlags('ord1', { outboundInvoiced: true })).rejects.toThrow(
+        /有 2 位出行人没有护照有效期.*张三、李四/,
+      );
+    });
+
+    it('没有中文名 → 报文回落拼音/英文名', async () => {
+      stubOrder({
+        passengers: [
+          pax('A1', PassengerType.ADULT, {
+            fullName: 'ZHANG/SAN',
+            chineseName: null,
+            passportExpiry: null,
+          }),
+        ],
+      });
+      await expect(service.setInvoiceFlags('ord1', { outboundInvoiced: true })).rejects.toThrow(
+        /ZHANG\/SAN/,
+      );
+    });
+
+    // 婴儿出境同样要护照：建单必填口径没给婴儿开口子，这里也不能开
+    //（婴儿被豁免的是「占座」，与证件要求是两回事）
+    it('婴儿缺护照有效期 → 照样拦（婴儿不占座 ≠ 不要证件）', async () => {
+      stubOrder({
+        passengers: [
+          pax('A1'),
+          pax('B1', PassengerType.INFANT, { chineseName: '小宝', passportExpiry: null }),
+        ],
+      });
+      await expect(service.setInvoiceFlags('ord1', { outboundInvoiced: true })).rejects.toThrow(
+        /有 1 位出行人没有护照有效期.*小宝/,
+      );
+    });
+
+    it('系统开票位不看护照（不对应任何航段）→ 放行', async () => {
+      stubOrder({ passengers: [pax('A1', PassengerType.ADULT, { passportExpiry: null })] });
+      await service.setInvoiceFlags('ord1', { systemInvoiced: true });
+      expect(txMock.order.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { systemInvoiced: true } }),
+      );
+    });
+
+    it('翻回未开（true→false）→ 不看护照（纠错撤销错标记必须放行）', async () => {
+      stubOrder({
+        outboundInvoiced: true,
+        passengers: [pax('A1', PassengerType.ADULT, { passportExpiry: null })],
+      });
+      await service.setInvoiceFlags('ord1', { outboundInvoiced: false });
+      expect(txMock.order.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { outboundInvoiced: false } }),
+      );
+    });
+
+    it('该方向没有航段（纯酒店/接送单）→ 不看护照，占位联系人不被打死', async () => {
+      stubOrder({
+        items: [],
+        passengers: [pax(null, PassengerType.ADULT, { passportExpiry: null })],
+      });
+      await service.setInvoiceFlags('ord1', { outboundInvoiced: true });
+      expect(txMock.order.update).toHaveBeenCalledWith(
+        expect.objectContaining({ data: { outboundInvoiced: true } }),
+      );
+    });
+
+    it('全员都有护照有效期 → 照常放行', async () => {
+      stubOrder();
       await service.setInvoiceFlags('ord1', { outboundInvoiced: true });
       expect(txMock.order.update).toHaveBeenCalledWith(
         expect.objectContaining({ data: { outboundInvoiced: true } }),

@@ -20,6 +20,7 @@
 import { UserRole, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { localDateISO, localHHMM } from '../../lib/flight-time.js';
+import { isCheckinClosed } from '../../lib/checkin-close.js';
 import { AppError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import { determineFlightLegItems } from './ticketing-cap.js';
 import { SEAT_HOLDING_STATUSES } from './orders.service.js';
@@ -43,7 +44,14 @@ export interface NoShowBatchScheduleView {
   departDate: string;
   /** 出发地当地时刻 HH:mm。 */
   departTimeLocal: string;
-  /** 已起飞（no-show 的前提；没飞的班次匹配得出来但一条都标不了）。 */
+  /**
+   * 已关柜（no-show 的前提；没关柜的班次匹配得出来但一条都标不了）。
+   *
+   * 锚点是**关柜时刻**（起飞时刻 − 该班次的关柜提前分钟数，没配走系统默认，见 lib/checkin-close.ts），
+   * 与单单口径 `_assessNoShow` 闸 4 同源 —— 两处若一个看起飞、一个看关柜，就会出现
+   * 「整批抬头说不能提交、逐行却全绿」的对不上。字段名沿用 departed 不改（前端只拿它当
+   * 「现在能不能提交」的开关），语义以本注释为准。
+   */
   departed: boolean;
   /** 该班次逐舱 sold 之和（对名单规模用）。 */
   seatsSold: number;
@@ -61,6 +69,14 @@ export interface NoShowBatchMatchedRow {
   lines: string[];
   orderId: string;
   orderNumber: string;
+  /**
+   * 订单备注原文（`Order.notes`），给票务在单号旁边多一个可读的识别标。
+   *
+   * 为什么不是「团期」：这张表本来就是针对**单一已选定班次**的，所有行的出发日期天然相同，
+   * 再造一个团期字段既无区分度也无真源。运营录单时习惯往备注里写团组/客人识别信息
+   *（「两位成人（双床）三星」这类），拿它当标识是现成的、不必新增字段。
+   */
+  notes: string | null;
   passengerId: string;
   fullName: string;
   chineseName: string | null;
@@ -232,7 +248,7 @@ const PREVIEW_CONCURRENCY = 10;
 async function loadScheduleCandidates(
   client: PrismaClient,
   scheduleId: string,
-): Promise<RosterCandidate[]> {
+): Promise<{ candidates: RosterCandidate[]; notesByOrderId: Map<string, string | null> }> {
   const orders = await client.order.findMany({
     where: {
       deletedAt: null,
@@ -242,6 +258,9 @@ async function loadScheduleCandidates(
     select: {
       id: true,
       orderNumber: true,
+      // 备注：匹配用不到，只是随行下发给前端当可读识别标（见 NoShowBatchMatchedRow.notes）。
+      // 因此不塞进 RosterCandidate —— 那是纯匹配用的形状，别让展示字段渗进去。
+      notes: true,
       passengers: {
         select: {
           id: true,
@@ -264,9 +283,11 @@ async function loadScheduleCandidates(
   });
 
   const out: RosterCandidate[] = [];
+  const notesByOrderId = new Map<string, string | null>();
   for (const order of orders) {
     const { outbound } = determineFlightLegItems(order.items);
     if (outbound?.flightScheduleId !== scheduleId) continue;
+    notesByOrderId.set(order.id, order.notes);
     for (const p of order.passengers) {
       out.push({
         orderId: order.id,
@@ -280,7 +301,7 @@ async function loadScheduleCandidates(
       });
     }
   }
-  return out;
+  return { candidates: out, notesByOrderId };
 }
 
 // ── 预检 ────────────────────────────────────────────────────────────────────
@@ -308,6 +329,8 @@ export async function previewNoShowBatch(
       id: true,
       departureTime: true,
       departureTz: true,
+      // 关柜提前分钟数（null = 系统默认）：抬头的「能不能提交」按关柜算，与单单闸 4 同源。
+      checkinCloseMinutes: true,
       flight: { select: { flightNumber: true } },
       seatClasses: { select: { sold: true } },
     },
@@ -319,12 +342,12 @@ export async function previewNoShowBatch(
     flightNumber: schedule.flight?.flightNumber ?? '',
     departDate: localDateISO(schedule.departureTime, schedule.departureTz),
     departTimeLocal: localHHMM(schedule.departureTime, schedule.departureTz),
-    departed: schedule.departureTime.getTime() <= Date.now(),
+    departed: isCheckinClosed(schedule.departureTime, schedule.checkinCloseMinutes),
     seatsSold: schedule.seatClasses.reduce((n, sc) => n + sc.sold, 0),
   };
 
   const { lines, totalLines, truncated } = parseRosterLines(input.names);
-  const candidates = await loadScheduleCandidates(client, input.scheduleId);
+  const { candidates, notesByOrderId } = await loadScheduleCandidates(client, input.scheduleId);
   const { matched, unmatched, ambiguous } = matchRosterLines(lines, candidates);
 
   // 同一位乘客被多行命中（「张三」+「ZHANG/SAN E12345678」）→ 合并成一条，原文行都留着。
@@ -402,6 +425,7 @@ export async function previewNoShowBatch(
       lines: entry.lines,
       orderId: c.orderId,
       orderNumber: c.orderNumber,
+      notes: notesByOrderId.get(c.orderId) ?? null,
       passengerId: c.passengerId,
       fullName: c.fullName,
       chineseName: c.chineseName,

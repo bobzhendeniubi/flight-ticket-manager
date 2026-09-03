@@ -260,7 +260,15 @@ describe('setInvoiceFlags · 航段标记翻齐后自动推进「出票完成」
           outboundInvoiced: false,
           returnInvoiced: false,
           systemInvoiced: false,
-          passengers: [{ passengerType: 'ADULT' }],
+          // 护照有效期非空 —— 开票护照闸要读它（本组用例聚焦的是自动推进，不该被那道闸拦下）
+          passengers: [
+            {
+              passengerType: 'ADULT',
+              fullName: 'PAX ONE',
+              chineseName: null,
+              passportExpiry: new Date('2031-05-20T00:00:00.000Z'),
+            },
+          ],
           items: [
             {
               flightScheduleId: 'sch-1',

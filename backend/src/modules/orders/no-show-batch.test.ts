@@ -48,6 +48,8 @@ function orderRow(over: Record<string, unknown> = {}) {
   return {
     id: 'ord-1',
     orderNumber: 'FTM20260902-001',
+    // 备注随行下发，给票务在单号旁边多一个可读识别标（本表所有行同一班次，没有团期可分）
+    notes: '两位成人（双床）三星',
     passengers: [
       {
         id: 'p-1',
@@ -130,6 +132,7 @@ beforeEach(() => {
     id: 'sch-out',
     departureTime: OUT_DEPART,
     departureTz: 'Asia/Shanghai',
+    checkinCloseMinutes: null, // 未配置 → 系统默认提前 45 分钟关柜
     flight: { flightNumber: 'QH9589' },
     seatClasses: [{ sold: 12 }, { sold: 3 }],
   });
@@ -172,7 +175,7 @@ describe('批量 no-show · 预检', () => {
     ).rejects.toBeInstanceOf(NotFoundError);
   });
 
-  it('抬头带航班号 / 当地日期时刻 / 已起飞 / 已售座数', async () => {
+  it('抬头带航班号 / 当地日期时刻 / 已关柜 / 已售座数', async () => {
     const r = await previewNoShowBatch(
       { service: fakeService() },
       { scheduleId: 'sch-out', names: '陈志远' },
@@ -183,6 +186,59 @@ describe('批量 no-show · 预检', () => {
     expect(r.schedule.departTimeLocal).toMatch(/^\d{2}:\d{2}$/);
     expect(r.schedule.departed).toBe(true);
     expect(r.schedule.seatsSold).toBe(15);
+  });
+
+  // 抬头的「能不能提交」按关柜算，与单单闸 4 同源 —— 两处若一个看起飞、一个看关柜，
+  // 就会出现「抬头说不能提交、逐行却全绿」的对不上。
+  it('起飞前 20 分钟（已过默认关柜点）→ 抬头判已关柜', async () => {
+    mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sch-out',
+      departureTime: new Date(Date.now() + 20 * 60_000),
+      departureTz: 'Asia/Shanghai',
+      checkinCloseMinutes: null,
+      flight: { flightNumber: 'QH9589' },
+      seatClasses: [{ sold: 1 }],
+    });
+    const r = await previewNoShowBatch(
+      { service: fakeService() },
+      { scheduleId: 'sch-out', names: '陈志远' },
+      ADMIN,
+    );
+    expect(r.schedule.departed).toBe(true);
+  });
+
+  it('起飞前 2 小时（还没到关柜点）→ 抬头判未关柜', async () => {
+    mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sch-out',
+      departureTime: new Date(Date.now() + 2 * 3600_000),
+      departureTz: 'Asia/Shanghai',
+      checkinCloseMinutes: null,
+      flight: { flightNumber: 'QH9589' },
+      seatClasses: [{ sold: 1 }],
+    });
+    const r = await previewNoShowBatch(
+      { service: fakeService() },
+      { scheduleId: 'sch-out', names: '陈志远' },
+      ADMIN,
+    );
+    expect(r.schedule.departed).toBe(false);
+  });
+
+  it('匹配行带订单备注（认人认团用；没备注则为 null）', async () => {
+    const r = await previewNoShowBatch(
+      { service: fakeService() },
+      { scheduleId: 'sch-out', names: '陈志远' },
+      ADMIN,
+    );
+    expect(r.matched[0].notes).toBe('两位成人（双床）三星');
+
+    mockPrisma.order.findMany.mockResolvedValue([orderRow({ notes: null })]);
+    const r2 = await previewNoShowBatch(
+      { service: fakeService() },
+      { scheduleId: 'sch-out', names: '陈志远' },
+      ADMIN,
+    );
+    expect(r2.matched[0].notes).toBeNull();
   });
 
   it('匹配上的行带准入结论；证件号只给后 4 位', async () => {

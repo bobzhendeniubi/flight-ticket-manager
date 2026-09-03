@@ -344,7 +344,7 @@ describe('no-show · 预检', () => {
     expect(res.alreadyNoShow).toBe(false);
   });
 
-  it('去程还没起飞 → 拒绝（没飞怎么算没来）', async () => {
+  it('去程还没关柜 → 拒绝（柜台还开着，说不准客人到底登不登机）', async () => {
     const future = new Date(Date.now() + 2 * 24 * 3600_000);
     mountPreview(
       orderSnapshot({
@@ -353,6 +353,7 @@ describe('no-show · 预检', () => {
             flightSchedule: {
               departureTime: future,
               departureTz: 'Asia/Shanghai',
+              checkinCloseMinutes: null,
               flight: { flightNumber: 'QH9589' },
             },
           }),
@@ -363,7 +364,55 @@ describe('no-show · 预检', () => {
     );
     const res = await service.previewNoShow('ord-1', {}, ADMIN);
     expect(res.eligible).toBe(false);
-    expect(res.blockers.join('')).toContain('尚未起飞');
+    expect(res.blockers.join('')).toContain('尚未关柜');
+  });
+
+  // 关柜口径的核心收益：起飞前 45 分钟一到就能标，不必再干等那一段。
+  it('起飞前 20 分钟（已过默认关柜点）→ 闸 4 放行', async () => {
+    const soon = new Date(Date.now() + 20 * 60_000);
+    mountPreview(
+      orderSnapshot({
+        items: [
+          outboundRow({
+            flightSchedule: {
+              departureTime: soon,
+              departureTz: 'Asia/Shanghai',
+              checkinCloseMinutes: null, // 未配置 → 系统默认提前 45 分钟
+              flight: { flightNumber: 'QH9589' },
+            },
+          }),
+          returnRow(),
+          hotelRow,
+        ],
+      }),
+    );
+    const res = await service.previewNoShow('ord-1', {}, ADMIN);
+    expect(res.blockers.join('')).not.toContain('关柜');
+  });
+
+  // 班次自配的值压过系统默认：起飞前 120 分钟这一刻，默认 45 分钟早该放行了，
+  // 但这一班配的是提前 90 分钟关柜（还有 30 分钟才关），必须仍然拒。
+  it('班次自配关柜提前 90 分钟 → 起飞前 120 分钟仍未关柜，拒绝', async () => {
+    const soon = new Date(Date.now() + 120 * 60_000);
+    mountPreview(
+      orderSnapshot({
+        items: [
+          outboundRow({
+            flightSchedule: {
+              departureTime: soon,
+              departureTz: 'Asia/Shanghai',
+              checkinCloseMinutes: 90,
+              flight: { flightNumber: 'QH9589' },
+            },
+          }),
+          returnRow(),
+          hotelRow,
+        ],
+      }),
+    );
+    const res = await service.previewNoShow('ord-1', {}, ADMIN);
+    expect(res.eligible).toBe(false);
+    expect(res.blockers.join('')).toContain('尚未关柜');
   });
 
   it('回收站单 → 拒绝', async () => {
@@ -2118,7 +2167,7 @@ describe('syncOrderLegFlag · 与 deriveLegStatus 同口径', () => {
 // 12. 拆单**之前**先过订单级 no-show 闸（拆单不可回滚）
 // ══════════════════════════════════════════════════════════════════════════
 describe('no-show · 部分乘客 · 拆单前的订单级闸', () => {
-  it('去程还没起飞 + 只勾部分乘客 → 400，splitOrder 一次都没被调用', async () => {
+  it('去程还没关柜 + 只勾部分乘客 → 400，splitOrder 一次都没被调用', async () => {
     mountTx({
       snapshot: orderSnapshot({
         items: [
@@ -2139,7 +2188,7 @@ describe('no-show · 部分乘客 · 拆单前的订单级闸', () => {
       .markNoShow('ord-1', noShowBody({ passengerIds: ['pax-1'] }), ADMIN)
       .catch((e: unknown) => e);
     expect(err).toBeInstanceOf(BadRequestError);
-    expect(String((err as Error).message)).toContain('尚未起飞');
+    expect(String((err as Error).message)).toContain('尚未关柜');
     // 拆单不可回滚：这类「跟选了谁无关」的原因必须在拆之前拦住，不能拆完再说标不了。
     expect(split).not.toHaveBeenCalled();
     expect(mockPrisma.$transaction).not.toHaveBeenCalled();

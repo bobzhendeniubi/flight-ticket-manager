@@ -27,6 +27,8 @@ interface AdminSchedule {
   arrivalTime: string;
   departureTz: string;
   arrivalTz: string;
+  /** 关柜提前分钟数（起飞前多少分钟关闭值机柜台）；null / 缺失 = 走系统默认 45 分钟。 */
+  checkinCloseMinutes?: number | null;
   isActive: boolean;
   seatClasses: ScheduleSeat[];
 }
@@ -1284,6 +1286,8 @@ function DaySchedule({
   const [showTimeEdit, setShowTimeEdit] = useState(false);
   const [timeDep, setTimeDep] = useState('');
   const [timeArr, setTimeArr] = useState('');
+  // 关柜提前分钟数（选填）：空串 = 不设，跟随系统默认 DEFAULT_CHECKIN_CLOSE_MINUTES。
+  const [timeCheckinClose, setTimeCheckinClose] = useState('');
   const [timeSaving, setTimeSaving] = useState(false);
   const [timeErr, setTimeErr] = useState<string | null>(null);
   const [timeMsg, setTimeMsg] = useState<string | null>(null);
@@ -1478,6 +1482,10 @@ function DaySchedule({
   const openTimeEdit = () => {
     setTimeDep(isoToLocal(schedule.departureTime, schedule.departureTz));
     setTimeArr(isoToLocal(schedule.arrivalTime, schedule.arrivalTz));
+    // 没设过就留空——留空即「跟随系统默认」，不要预填 45 假装这班次配过。
+    setTimeCheckinClose(
+      typeof schedule.checkinCloseMinutes === 'number' ? String(schedule.checkinCloseMinutes) : '',
+    );
     setTimeErr(null);
     setTimeMsg(null);
     setShowTimeEdit(true);
@@ -1489,6 +1497,17 @@ function DaySchedule({
     if (!timeDep || !timeArr) {
       setTimeErr('请填写出发和到达时刻');
       return;
+    }
+    // 关柜提前分钟数：留空 = 清空（回落系统默认）；填了就必须是 0–1440 的整数。
+    const closeRaw = timeCheckinClose.trim();
+    let checkinCloseMinutes: number | null = null;
+    if (closeRaw !== '') {
+      const parsed = Number(closeRaw);
+      if (!Number.isInteger(parsed) || parsed < 0 || parsed > 1440) {
+        setTimeErr('关柜提前分钟数请填 0–1440 的整数（留空 = 用系统默认 45 分钟）');
+        return;
+      }
+      checkinCloseMinutes = parsed;
     }
     setTimeSaving(true);
     setTimeErr(null);
@@ -1503,6 +1522,7 @@ function DaySchedule({
       const body = {
         departureTime: toIso(timeDep, schedule.departureTz),
         arrivalTime: toIso(timeArr, schedule.arrivalTz),
+        checkinCloseMinutes,
       };
       try {
         await api.updateSchedule(tokens.accessToken, schedule.id, body);
@@ -1889,6 +1909,23 @@ function DaySchedule({
                   value={timeArr}
                   onChange={(e) => setTimeArr(e.target.value)}
                 />
+              </div>
+              <div>
+                <label className="label">关柜提前分钟数（选填）</label>
+                <input
+                  type="number"
+                  min={0}
+                  max={1440}
+                  step={5}
+                  className="input w-full"
+                  placeholder="留空 = 用系统默认 45 分钟"
+                  value={timeCheckinClose}
+                  onChange={(e) => setTimeCheckinClose(e.target.value)}
+                />
+                <p className="mt-1 text-[11px] leading-4 text-ink-muted">
+                  值机柜台在起飞前多少分钟关闭。这是 no-show 的判定时点——关柜之后票务就能照航司名单标记，
+                  不必等到起飞那一刻。这班次没有特殊规则就留空。
+                </p>
               </div>
             </div>
             {timeErr && (

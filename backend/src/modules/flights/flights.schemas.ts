@@ -154,6 +154,10 @@ export const updateScheduleBodySchema = z
     // A11 二次确认：已售班次改时刻影响存量订单（客人通知/签证/酒店/已导名单），
     // 必须显式带上此标志才放行；缺省 false → 已售班次改点被 400 拦下并回报影响面。
     confirmSoldTimeChange: z.boolean().optional(),
+    // 关柜提前分钟数（选填）：起飞前多少分钟关闭值机柜台，是 no-show 判定的时间锚点。
+    // null = 清空 = 回落系统默认（见 lib/checkin-close.ts）；不传 = 不改这一项。
+    // 上限 24 小时：再大就不是关柜而是填错了（比如把秒当成分钟填进来）。
+    checkinCloseMinutes: z.number().int().min(0).max(1440).nullable().optional(),
     seatClasses: z
       .array(
         z.object({
@@ -190,8 +194,18 @@ export const updateScheduleBodySchema = z
   .superRefine((body, ctx) => {
     const hasSeatChanges = body.seatClasses !== undefined && body.seatClasses.length > 0;
     const hasTimeChange = body.departureTime !== undefined || body.arrivalTime !== undefined;
-    if (body.isActive === undefined && !hasSeatChanges && !hasTimeChange) {
-      ctx.addIssue({ code: z.ZodIssueCode.custom, message: '至少要改一项（停用启用 / 价格 / 容量 / 时刻）' });
+    // 关柜分钟数单独改也算一项变更（null 是「清空回默认」，同样是有效变更）
+    const hasCheckinCloseChange = body.checkinCloseMinutes !== undefined;
+    if (
+      body.isActive === undefined &&
+      !hasSeatChanges &&
+      !hasTimeChange &&
+      !hasCheckinCloseChange
+    ) {
+      ctx.addIssue({
+        code: z.ZodIssueCode.custom,
+        message: '至少要改一项（停用启用 / 价格 / 容量 / 时刻 / 关柜提前分钟数）',
+      });
     }
   });
 export type UpdateScheduleBody = z.infer<typeof updateScheduleBodySchema>;
