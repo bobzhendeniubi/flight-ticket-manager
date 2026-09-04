@@ -435,34 +435,46 @@ export class FulfillmentService {
   }
 
   /**
-   * 「出发日期」筛选下沉到查询层，口径与列表回传的 departureTime 逐字一致：
-   * **每订单最早一段 FLIGHT** 的 departureTime，按该班次 departureTz 折算成出发地本地日。
+   * 「出发日期」筛选下沉到查询层，口径与列表回传的出发日逐字一致：
+   * **每订单最早一段 FLIGHT** 的 departureTime，按该班次 departureTz 折算成出发地本地日；
+   * 无航班的单回退**最早 VISA 行的预计出行日期 visaIntendedDate**（纯签证单的业务日期锚点，
+   * 与订单列表/导出的整单出发日派生同源：最早航班 → 签证预计出行日期）。
    *
-   * 两个必须守住的点：
-   * 1. 纯签证单/纯酒店单**无航班 → 保留可见**（不被日期筛选误隐藏）——与护照按姓名导出同口径
-   *    （见 hotel-control.passports.ts collectPassportGroupsByNames），别让两边分叉。
-   * 2. 取**最早**一段而非任意一段：否则回程恰好落在该日的订单会被误命中。
-   *    「最早一段」是聚合语义，关系过滤表达不了，故先用一条原生 SQL 算出命中的 orderId 集合，
+   * 三个必须守住的点：
+   * 1. 有锚点就按锚点筛。纯签证单填了预计出行日期，就该只出现在那一天的区间里——
+   *    否则它会出现在**每一个**日期区间里，签证岗按日筛选批量送签时会把别的日子的单一起扫进去
+   *    （公测反馈：9/4 的纯签证单混进 9/5 的筛选结果，被一并标成已送签）。
+   * 2. 既无航班也无预计出行日期的单（行程未定的纯签证单 / 纯酒店单）→ **保留可见**
+   *    （不被日期筛选误隐藏）——与护照导出对无锚点签证单的保护同口径
+   *    （见 orders.export-depart-filter.ts），别让两边分叉。
+   * 3. 取**最早**一段/最早一行而非任意一行：否则回程恰好落在该日的订单会被误命中。
+   *    「最早」是聚合语义，关系过滤表达不了，故先用一条原生 SQL 算出命中的 orderId 集合，
    *    再并回关系过滤 —— 这样 findMany 与 count 仍共用同一个 where。
    *
    * 时区换算方向：departureTime 是 TIMESTAMP(3) **without time zone** 且存的是 UTC，
    * 所以必须先 `AT TIME ZONE 'UTC'` 还原成 timestamptz，再 `AT TIME ZONE departureTz`
    * 落到出发地本地时刻。少了第一跳会把 UTC 时刻当成本地时刻，日期整体错位。
+   * visaIntendedDate 是 @db.Date（无时刻、无时区），直接 to_char 比对即可，不折时区。
    */
   private async departureDateWhere(
     from: string | undefined,
     to: string | undefined,
   ): Promise<Prisma.OrderItemWhereInput> {
-    // 最早一段机票出发地本地日，供区间上下界比对（'YYYY-MM-DD' 串按字典序比较即日期序）
-    const localDay = Prisma.sql`to_char(
+    // 区间边界：from/to 各自可缺省（开区间）；至少有一侧（调用方已保证）。
+    // 'YYYY-MM-DD' 串按字典序比较即日期序。
+    const dayBounds = (localDay: Prisma.Sql): Prisma.Sql => {
+      const bounds: Prisma.Sql[] = [];
+      if (from) bounds.push(Prisma.sql`${localDay} >= ${from}`);
+      if (to) bounds.push(Prisma.sql`${localDay} <= ${to}`);
+      return Prisma.join(bounds, ' AND ');
+    };
+    // 最早一段机票出发地本地日
+    const flightLocalDay = Prisma.sql`to_char(
       fs."departureTime" AT TIME ZONE 'UTC' AT TIME ZONE fs."departureTz",
       'YYYY-MM-DD'
     )`;
-    // 区间边界：from/to 各自可缺省（开区间）；至少有一侧（调用方已保证）
-    const bounds: Prisma.Sql[] = [];
-    if (from) bounds.push(Prisma.sql`${localDay} >= ${from}`);
-    if (to) bounds.push(Prisma.sql`${localDay} <= ${to}`);
-    const boundsSql = Prisma.join(bounds, ' AND ');
+    // 最早 VISA 行的预计出行日期（@db.Date，不折时区）
+    const visaAnchorDay = Prisma.sql`to_char(v."visaIntendedDate", 'YYYY-MM-DD')`;
 
     const rows = await prisma.$queryRaw<Array<{ orderId: string }>>(Prisma.sql`
       SELECT DISTINCT oi."orderId" AS "orderId"
@@ -475,17 +487,38 @@ export class FulfillmentService {
           JOIN "FlightSchedule" fs2 ON fs2."id" = oi2."flightScheduleId"
           WHERE oi2."orderId" = oi."orderId" AND oi2."kind"::text = 'FLIGHT'
         )
-        AND ${boundsSql}
+        AND ${dayBounds(flightLocalDay)}
+      UNION
+      SELECT DISTINCT v."orderId" AS "orderId"
+      FROM "OrderItem" v
+      WHERE v."kind"::text = 'VISA'
+        AND v."visaIntendedDate" IS NOT NULL
+        AND v."visaIntendedDate" = (
+          SELECT MIN(v2."visaIntendedDate")
+          FROM "OrderItem" v2
+          WHERE v2."orderId" = v."orderId" AND v2."kind"::text = 'VISA'
+        )
+        AND NOT EXISTS (
+          SELECT 1 FROM "OrderItem" f
+          WHERE f."orderId" = v."orderId"
+            AND f."kind"::text = 'FLIGHT' AND f."flightScheduleId" IS NOT NULL
+        )
+        AND ${dayBounds(visaAnchorDay)}
     `);
-    const orderIds = rows.map((r) => r.orderId);
+    const orderIds = [...new Set(rows.map((r) => r.orderId))];
 
     return {
       order: {
         OR: [
-          // 最早一段机票的出发地本地日落在所选区间内
+          // 最早一段机票的出发地本地日 / 无航班时最早签证预计出行日期 落在所选区间内
           { id: { in: orderIds } },
-          // 无航班订单（纯签证单等）→ 保留可见
-          { items: { none: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } } } },
+          // 既无航班也无签证预计出行日期（行程未定的纯签证单 / 纯酒店单）→ 保留可见
+          {
+            AND: [
+              { items: { none: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } } } },
+              { items: { none: { kind: OrderItemKind.VISA, visaIntendedDate: { not: null } } } },
+            ],
+          },
         ],
       },
     };
@@ -596,7 +629,8 @@ export class FulfillmentService {
       orderId: string;
       flightSchedule: { departureTime: Date; departureTz: string } | null;
     };
-    const [passengerRows, flightLegRows] = await Promise.all([
+    type VisaAnchorRow = { orderId: string; visaIntendedDate: Date | null };
+    const [passengerRows, flightLegRows, visaAnchorRows] = await Promise.all([
       // 性能关键：护照图以 base64 data URL 落库（单人可达数 MB），列表页 200 行会放大成
       // 数百 MB 的响应体（读库 + 序列化 + 传输都被拖垮，签证台加载卡到分钟级）。
       // 这里改用原生 SQL 只在库内算出 hasPhoto（布尔），不把大字段拉到应用层；
@@ -628,6 +662,19 @@ export class FulfillmentService {
             orderBy: { flightSchedule: { departureTime: 'asc' } },
           })
         : Promise.resolve([] as FlightLegRow[]),
+      // 纯签证单的出发日锚点：最早 VISA 行的预计出行日期（无航班时签证台「出发」列的回退来源，
+      // 与 departureDateWhere 的筛选口径同源——筛得到的日子就是行上显示的日子）
+      orderIds.length
+        ? prisma.orderItem.findMany({
+            where: {
+              orderId: { in: orderIds },
+              kind: OrderItemKind.VISA,
+              visaIntendedDate: { not: null },
+            },
+            select: { orderId: true, visaIntendedDate: true },
+            orderBy: { visaIntendedDate: 'asc' },
+          })
+        : Promise.resolve([] as VisaAnchorRow[]),
     ]);
 
     // orderId → 乘客列表
@@ -646,6 +693,14 @@ export class FulfillmentService {
           departureTime: sched.departureTime,
           departureTz: sched.departureTz,
         });
+      }
+    }
+
+    // orderId → 最早签证预计出行日期（YYYY-MM-DD；@db.Date 直接截 ISO 前 10 位，不折时区）
+    const visaAnchorByOrder = new Map<string, string>();
+    for (const row of visaAnchorRows) {
+      if (row.visaIntendedDate && !visaAnchorByOrder.has(row.orderId)) {
+        visaAnchorByOrder.set(row.orderId, row.visaIntendedDate.toISOString().slice(0, 10));
       }
     }
 
@@ -707,6 +762,9 @@ export class FulfillmentService {
             // #6：出发日期 + 时区（ISO 字符串 / null）
             departureTime: firstLeg ? firstLeg.departureTime.toISOString() : null,
             departureTz: firstLeg?.departureTz ?? null,
+            // 纯签证单的出发日锚点（YYYY-MM-DD / null）：无航班时签证台「出发」列由它回退显示，
+            // 与出发日期区间筛选同一口径
+            visaIntendedDate: visaAnchorByOrder.get(order.id) ?? null,
           },
           // 签证任务附带乘客明细（轻量）：名称/姓名拆分/性别/证件号/hasPhoto，不含护照大图。
           // 缺照标红只依赖 hasPhoto（库内算出，准确）；护照真图展开某单时按需拉取。

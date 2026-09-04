@@ -2595,6 +2595,11 @@ export interface FulfillmentTask {
     departureTime?: string | null;
     /** 出发机场时区（IANA）；用于本地化出发日期 */
     departureTz?: string | null;
+    /**
+     * 签证预计出行日期（YYYY-MM-DD）；纯签证单的出发日锚点。无航班时「出发」列由它回退显示，
+     * 与出发日期区间筛选同一口径。无签证行或未填 → null。
+     */
+    visaIntendedDate?: string | null;
   };
   /** 签证产品名（含"…单次"/"…多次"）；非签证任务或缺失 → null */
   visaName?: string | null;

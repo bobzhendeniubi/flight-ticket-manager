@@ -1004,10 +1004,50 @@ describe('FulfillmentService.list — 出发日期筛选（纯签证单无航班
     const dateBranch = where.orderItem.AND[0].order.OR;
     // 命中日期的订单
     expect(dateBranch[0]).toEqual({ id: { in: ['ord-a', 'ord-b'] } });
-    // 纯签证单/纯酒店单（无任何带班次的机票行）→ 保留可见，与护照导出同口径
+    // 既无航班也无签证预计出行日期（行程未定的纯签证单 / 纯酒店单）→ 保留可见，与护照导出同口径；
+    // 填了预计出行日期的纯签证单**不**走这支——它有锚点，按锚点筛
     expect(dateBranch[1]).toEqual({
-      items: { none: { kind: 'FLIGHT', flightScheduleId: { not: null } } },
+      AND: [
+        { items: { none: { kind: 'FLIGHT', flightScheduleId: { not: null } } } },
+        { items: { none: { kind: 'VISA', visaIntendedDate: { not: null } } } },
+      ],
     });
+  });
+
+  it('纯签证单按最早 VISA 行的预计出行日期筛（UNION 第二支），且只对无航班单生效', async () => {
+    mockPagedDataset([]);
+    const p = prisma as unknown as { $queryRaw: ReturnType<typeof vi.fn> };
+    const queryRaw = vi.fn().mockResolvedValue([]);
+    p.$queryRaw = queryRaw;
+
+    await new FulfillmentService().list({ departureDate: '2026-09-05', page: 1, pageSize: 50 });
+
+    const sql = queryRaw.mock.calls[0][0] as { strings: string[]; values: unknown[] };
+    const text = sql.strings.join('?');
+    expect(text).toContain('UNION');
+    // 锚点 = 最早 VISA 行的 visaIntendedDate（@db.Date，直接 to_char，不折时区）
+    expect(text).toContain(`to_char(v."visaIntendedDate", 'YYYY-MM-DD')`);
+    expect(text).toContain('MIN(v2."visaIntendedDate")');
+    // 只对无航班的单生效：有航班的单以航班为准，不让签证日期再插一脚
+    expect(text).toContain('NOT EXISTS');
+    expect(text).toContain(`f."kind"::text = 'FLIGHT' AND f."flightScheduleId" IS NOT NULL`);
+    // 两支各带同一组边界参数（from=to=该日 → 每支 2 个 → 共 4 个）
+    expect(sql.values.filter((v) => v === '2026-09-05')).toHaveLength(4);
+  });
+
+  it('两支命中的 orderId 去重后并回关系过滤', async () => {
+    const { findMany } = mockPagedDataset([]);
+    const p = prisma as unknown as { $queryRaw: ReturnType<typeof vi.fn> };
+    p.$queryRaw = vi
+      .fn()
+      .mockResolvedValue([{ orderId: 'ord-a' }, { orderId: 'ord-a' }, { orderId: 'ord-visa' }]);
+
+    await new FulfillmentService().list({ departureDate: '2026-09-05', page: 1, pageSize: 50 });
+
+    const { where } = findMany.mock.calls[0][0] as {
+      where: { orderItem: { AND: Array<{ order: { OR: unknown[] } }> } };
+    };
+    expect(where.orderItem.AND[0].order.OR[0]).toEqual({ id: { in: ['ord-a', 'ord-visa'] } });
   });
 
   it('时区换算方向正确：先 AT TIME ZONE UTC 再折算出发地时区，且取最早一段（MIN）', async () => {
@@ -1093,8 +1133,8 @@ describe('FulfillmentService.list — 出发日期区间（from/to，兼容旧�
     const text = sql.strings.join('?');
     expect(text).toContain('>=');
     expect(text).toContain('<=');
-    // from=to=该日 → 两个边界参数都是同一天
-    expect(sql.values.filter((v) => v === '2026-07-20')).toHaveLength(2);
+    // from=to=该日 → 两个边界参数都是同一天；航班支 + 签证锚点支各一组 → 共 4 个
+    expect(sql.values.filter((v) => v === '2026-07-20')).toHaveLength(4);
   });
 });
 

@@ -870,11 +870,12 @@ function OrderGroup({
     if (next && !visaDatesLoadedRef.current) loadVisaDates();
   };
 
-  // 出发日期（本地化）：纯签证单无航班 → null
+  // 出发日期（本地化）：最早航段出发地本地日；纯签证单无航班 → 回退签证预计出行日期
+  // （与后端出发日期区间筛选同一口径：筛得到的日子就是这里显示的日子）；两者都没有 → null
   const departureYmd =
     task.order?.departureTime && task.order?.departureTz
       ? localYmd(task.order.departureTime, task.order.departureTz)
-      : null;
+      : (task.order?.visaIntendedDate ?? null);
 
   // 类型徽章（签发方式 / 入境次数，带证据出处）
   const visaName = task.visaName ?? '';
@@ -929,7 +930,7 @@ function OrderGroup({
       colorClass: 'badge-warning',
     });
   }
-  // 「纯签证单」特殊情况徽标：无航班（出发日期为空）的单办签证单，送签排期没有机票锚点。
+  // 「纯签证单」特殊情况徽标：无航班的单办签证单，送签排期没有机票锚点（出发列显示的是签证预计出行日期）。
   if (!task.order?.departureTime) {
     typeBadges.push({ key: 'visa-only', text: '纯签证单', evidence: 'PRODUCT', colorClass: 'badge-teal' });
   }
