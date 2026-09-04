@@ -5193,6 +5193,12 @@ export const api = {
     orderId: string,
     passengerId: string,
     body: {
+      /**
+       * CORRECTION=改信息（纠错，不清护照/签证；只发变化字段）；
+       * SWAP=换人（既有语义，证件号变化会清旧人护照/签证）。
+       * 缺省时后端按既有 SWAP 语义处理（向后兼容旧调用点）。
+       */
+      mode?: 'CORRECTION' | 'SWAP';
       lastName?: string;
       firstName?: string;
       fullName?: string;

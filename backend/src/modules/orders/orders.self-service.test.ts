@@ -39,6 +39,7 @@ vi.mock('../../lib/audit.js', () => ({
 
 import { OrderService } from './orders.service.js';
 import {
+  correctPassengerBodySchema,
   resolvePassengerPatchChannel,
   selfUpdatePassengerBodySchema,
   swapPassengerBodySchema,
@@ -349,6 +350,113 @@ describe('resolvePassengerPatchChannel', () => {
     for (const role of [UserRole.CUSTOMER, UserRole.AGENT]) {
       expect(resolvePassengerPatchChannel(role, { visaExempt: true })).toBe('SELF_UPDATE');
     }
+  });
+
+  // ── 显式 mode：订正 / 换人两条通道的唯一分流依据 ─────────────────────────
+  // 订正与换人的请求体长得一模一样（都是「姓名/证件号变了」），靠字段猜必然猜错 ——
+  // 护照图被误清的根因就在这里，所以调用方必须显式说自己在做哪件事。
+  it('运营带 mode:CORRECTION → 订正通道', () => {
+    for (const role of [UserRole.ADMIN, UserRole.STAFF]) {
+      expect(
+        resolvePassengerPatchChannel(role, { mode: 'CORRECTION', documentNumber: 'E12345078' }),
+      ).toBe('CORRECTION');
+    }
+  });
+
+  it('代理带 mode:CORRECTION / mode:SWAP → 各走订正 / 换人（2026-09 对代理开放）', () => {
+    expect(
+      resolvePassengerPatchChannel(UserRole.AGENT, { mode: 'CORRECTION', documentNumber: 'E1' }),
+    ).toBe('CORRECTION');
+    expect(
+      resolvePassengerPatchChannel(UserRole.AGENT, { mode: 'SWAP', fullName: 'NEW PERSON' }),
+    ).toBe('SWAP');
+  });
+
+  it('代理不带 mode → 仍走补录（老行为一字不变）', () => {
+    expect(resolvePassengerPatchChannel(UserRole.AGENT, { passportExpiry: '2035-06-30' })).toBe(
+      'SELF_UPDATE',
+    );
+    expect(resolvePassengerPatchChannel(UserRole.AGENT, { fullName: 'NEW PERSON' })).toBe(
+      'SELF_UPDATE',
+    );
+  });
+
+  it('客户带 mode 也没用 → 永远补录（改身份只能联系客服）', () => {
+    for (const mode of ['CORRECTION', 'SWAP']) {
+      expect(
+        resolvePassengerPatchChannel(UserRole.CUSTOMER, { mode, documentNumber: 'E12345078' }),
+      ).toBe('SELF_UPDATE');
+    }
+  });
+
+  it('运营带 mode:SWAP 但没有任何换人语义字段 → 仍走换人（显式优先于字段猜测）', () => {
+    expect(
+      resolvePassengerPatchChannel(UserRole.ADMIN, { mode: 'SWAP', documentNumber: 'E9' }),
+    ).toBe('SWAP');
+    expect(swapPassengerBodySchema.safeParse({ mode: 'SWAP', documentNumber: 'E9' }).success).toBe(
+      true,
+    );
+  });
+});
+
+// ── 1c. correctPassengerBodySchema（订正通道的请求体）──────────────────────────
+describe('correctPassengerBodySchema', () => {
+  it('接受身份/护照字段，姓名按 PNR 口径规范化', () => {
+    const parsed = correctPassengerBodySchema.parse({
+      mode: 'CORRECTION',
+      fullName: ' zhang/san ',
+      documentNumber: 'E12345078',
+      dateOfBirth: '1990-01-01',
+      passportExpiry: '2035-06-30',
+    });
+    expect(parsed.fullName).toBe('ZHANG/SAN');
+    expect(parsed.documentNumber).toBe('E12345078');
+  });
+
+  it('只给 mode、没给任何要改的字段 → 拒（防空 PATCH）', () => {
+    const r = correctPassengerBodySchema.safeParse({ mode: 'CORRECTION' });
+    expect(r.success).toBe(false);
+  });
+
+  it('缺 mode 或 mode 写错 → 拒（订正必须显式声明）', () => {
+    expect(correctPassengerBodySchema.safeParse({ documentNumber: 'E1234567' }).success).toBe(false);
+    expect(
+      correctPassengerBodySchema.safeParse({ mode: 'SWAP', documentNumber: 'E1234567' }).success,
+    ).toBe(false);
+  });
+
+  // 订正 = 只改身份，绝不重置状态、绝不收钱 —— 这些键在订正 schema 里必须一律被拒（.strict()）。
+  it.each([
+    ['resetInvoice', { resetInvoice: true }],
+    ['resetVisa', { resetVisa: true }],
+    ['feeCny', { feeCny: 100 }],
+    ['feeLabel', { feeLabel: '换人费' }],
+    ['visaExempt', { visaExempt: true }],
+    ['singleRoom', { singleRoom: true }],
+    ['passengerType', { passengerType: 'CHILD' }],
+    ['passportPhotoUrl', { passportPhotoUrl: 'https://example.com/p.png' }],
+  ])('订正通道拒收 %s（那是换人/补录的语义）', (_label, extra) => {
+    const r = correctPassengerBodySchema.safeParse({
+      mode: 'CORRECTION',
+      documentNumber: 'E12345078',
+      ...extra,
+    });
+    expect(r.success).toBe(false);
+  });
+
+  it('日期必须是 YYYY-MM-DD（带时区的完整 ISO 串会被折错一天，直接拒）', () => {
+    expect(
+      correctPassengerBodySchema.safeParse({
+        mode: 'CORRECTION',
+        dateOfBirth: '1990-01-01T00:00:00+08:00',
+      }).success,
+    ).toBe(false);
+  });
+
+  it('姓/名单段里不允许出现斜线（与录单/换人同款）', () => {
+    expect(
+      correctPassengerBodySchema.safeParse({ mode: 'CORRECTION', lastName: 'ZHANG/SAN' }).success,
+    ).toBe(false);
   });
 });
 

@@ -48,6 +48,7 @@ const ORDER_ACTION_LABELS: Record<string, string> = {
   CANCEL_OUTBOUND_LEG: '取消去程',
   // ── 乘客 / 酒店 / 分房 ──
   SWAP_ORDER_PASSENGER: '换人',
+  CORRECT_ORDER_PASSENGER: '改出行人信息',
   SWAP_ORDER_ITEM_HOTEL: '更换酒店',
   RESCHEDULE_ORDER_ITEM_HOTEL: '酒店改期',
   UPDATE_ROOM_ASSIGNMENT: '调整分房',

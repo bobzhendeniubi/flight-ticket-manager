@@ -50,6 +50,7 @@ import {
   upgradeItemCabinBodySchema,
   resolvePassengerPatchChannel,
   selfUpdatePassengerBodySchema,
+  correctPassengerBodySchema,
   rescheduleItemHotelBodySchema,
   splitOrderBodySchema,
   splitOrderPreviewBodySchema,
@@ -2220,10 +2221,45 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   passportExpiry/passportIssueDate 两个 schema 都有 → 不是分流依据（未列入换人独有键）：
   //   只带护照资料 = 补录；带了换人语义字段才走换人，此时护照有效期由换人 schema 一并接住
   //   （证件号变化 + 本单按人出行 + 未带有效期 → service 抛 400）。
+  //   换人自 2026-09 起对代理开放（限自家 + 下级单，须显式带 mode:'SWAP'）：代理换人一律
+  //   feeCny=0、resetVisa=true、忽略 resetInvoice；已开票的单代理不许换人（service 400）。
+  //
+  // ③ 售后改单：订正证件资料（body 带 mode:'CORRECTION'；ADMIN/STAFF + 代理自家单）：
+  //   body: { mode:'CORRECTION', lastName?, firstName?, fullName?, chineseName?, documentNumber?,
+  //           dateOfBirth?, gender?, nationality?, passportExpiry?, passportIssueDate? }（至少一项）
+  //   同一个人录错了字 → 只改传进来的字段，**不清空任何资料**（护照图/签发地/签证号/票号全保留）。
+  //   证件号改动 > 2 个字符、或已开票的单改姓名/证件号 → 400 指路换人通道。
+  //   与②的区别只能由调用方显式声明：两者的请求体长得一模一样，靠字段猜必然猜错
+  //   （护照图被误清的根因就在这里）。
   app.patch('/:id/passengers/:passengerId', { preHandler: [app.authenticate] }, async (req) => {
     const role = req.user.role;
     const { id, passengerId } = req.params as { id: string; passengerId: string };
-    if (resolvePassengerPatchChannel(role, req.body) === 'SELF_UPDATE') {
+    const channel = resolvePassengerPatchChannel(role, req.body);
+    if (channel === 'CORRECTION') {
+      // ③ 订正通道：归属校验（代理限自家 + 下级）在 service 内，越权 403 由错误处理器统一格式化。
+      const correction = correctPassengerBodySchema.parse(req.body);
+      const requester = await buildRequester(req.user.sub, role);
+      const { order, audit } = await service.correctPassenger(
+        id,
+        passengerId,
+        correction,
+        requester,
+      );
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'CORRECT_ORDER_PASSENGER',
+        targetType: 'ORDER',
+        targetId: id,
+        targetLabel: audit.orderNumber,
+        // PII 口径与换人审计一致（换人本就落姓名 + 证件号）；只记真的变了的字段。
+        before: { passengerId: audit.passengerId, ...audit.before },
+        after: { ...audit.after, changedFields: audit.changedFields },
+        // INFO 而非 WARNING：订正是「把录错的字改对」，不动钱、不动状态、不清任何资料。
+        severity: 'INFO',
+      });
+      return { order };
+    }
+    if (channel === 'SELF_UPDATE') {
       // ① 补录护照/证件资料通道（CUSTOMER/AGENT 全部走此路；ADMIN/STAFF 无换人语义字段时也走此路）。
       //   归属/状态校验在 service 内；越权 403、锁定 409 由错误处理器统一格式化。
       const selfBody = selfUpdatePassengerBodySchema.parse(req.body);
@@ -2240,11 +2276,14 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       });
       return { passenger: result.passenger };
     }
-    // ② 换人通道（仅 ADMIN/STAFF——resolvePassengerPatchChannel 已保证前台角色永不到此）。
+    // ② 换人通道（ADMIN/STAFF；代理显式带 mode:'SWAP' 时也走此路，归属与降权口径在 service 内）。
     const body = swapPassengerBodySchema.parse(req.body);
+    // 代理需要 agentId 才能判「是不是自家（含下级）的单」；ADMIN/STAFF 不查库直接返回。
+    const swapRequester = await buildRequester(req.user.sub, role);
     const { order, audit } = await service.swapPassenger(id, passengerId, body, {
       userId: req.user.sub,
       role,
+      agentId: swapRequester.agentId,
     });
     void writeAudit({
       actor: actorFromRequest(req),

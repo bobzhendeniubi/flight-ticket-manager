@@ -10419,8 +10419,22 @@ function genderLabel(gender?: 'M' | 'F' | 'X' | null): string {
   return '—';
 }
 
-// 换人历史一条记录的形状（从 SWAP_ORDER_PASSENGER 审计的 before/after 读；旧记录字段可能缺）
-type SwapHistoryEntry = {
+// 乘客卡下方历史一条记录的形状（从 SWAP_ORDER_PASSENGER / CORRECT_ORDER_PASSENGER 审计的
+// before/after 读；旧记录字段可能缺）。SWAP 额外带 before.snapshot（换人前完整信息快照）+
+// after.feeCny（换人费）；CORRECTION 没有这两项，只做「改信息」轻量行展示。
+type SwapBeforeSnapshot = {
+  chineseName?: string | null;
+  dateOfBirth?: string | null;
+  passportExpiry?: string | null;
+  hotels?: string[];
+  visaStatus?: string | null;
+  visaExempt?: boolean | null;
+  visaTaskStatus?: string | null;
+  settlementCny?: number | null;
+};
+
+type PassengerHistoryEntry = {
+  kind: 'SWAP' | 'CORRECTION';
   id: string;
   at: string; // ISO 时间
   actor: string | null; // 经手（actorLabel）
@@ -10429,6 +10443,10 @@ type SwapHistoryEntry = {
   beforeDoc?: string;
   afterName?: string;
   afterDoc?: string;
+  /** 仅 SWAP：换人前完整信息快照（旧记录可能没有） */
+  snapshot?: SwapBeforeSnapshot;
+  /** 仅 SWAP：换人费（旧记录/未收费为 null） */
+  feeCny?: number | null;
 };
 
 // 从审计 payload 安全取字段（旧记录可能缺 fullName/documentNumber，缺了就不显示，不造数据）
@@ -10442,56 +10460,140 @@ function readSwapSide(payload: unknown): { name?: string; doc?: string; passenge
   };
 }
 
-function auditToSwapHistory(logs: AuditLog[]): SwapHistoryEntry[] {
+/** 换人前信息快照的安全读取（旧 SWAP 记录没有 snapshot，缺了就不展示，不造数据）。 */
+function readSwapSnapshot(payload: unknown): SwapBeforeSnapshot | undefined {
+  if (!payload || typeof payload !== 'object') return undefined;
+  const snap = (payload as Record<string, unknown>).snapshot;
+  if (!snap || typeof snap !== 'object') return undefined;
+  const s = snap as Record<string, unknown>;
+  return {
+    chineseName: typeof s.chineseName === 'string' ? s.chineseName : null,
+    dateOfBirth: typeof s.dateOfBirth === 'string' ? s.dateOfBirth : null,
+    passportExpiry: typeof s.passportExpiry === 'string' ? s.passportExpiry : null,
+    hotels: Array.isArray(s.hotels) ? s.hotels.filter((h): h is string => typeof h === 'string') : undefined,
+    visaStatus: typeof s.visaStatus === 'string' ? s.visaStatus : null,
+    visaExempt: typeof s.visaExempt === 'boolean' ? s.visaExempt : null,
+    visaTaskStatus: typeof s.visaTaskStatus === 'string' ? s.visaTaskStatus : null,
+    settlementCny: typeof s.settlementCny === 'number' ? s.settlementCny : null,
+  };
+}
+
+function readFeeCny(payload: unknown): number | null {
+  if (!payload || typeof payload !== 'object') return null;
+  const v = (payload as Record<string, unknown>).feeCny;
+  return typeof v === 'number' ? v : null;
+}
+
+/** 换人 / 改信息审计 → 乘客卡历史行；两种 action 混排，按时间倒序（最新在上）。 */
+function auditToPassengerHistory(logs: AuditLog[]): PassengerHistoryEntry[] {
   return logs
-    .filter((l) => l.action === 'SWAP_ORDER_PASSENGER')
+    .filter((l) => l.action === 'SWAP_ORDER_PASSENGER' || l.action === 'CORRECT_ORDER_PASSENGER')
     .map((l) => {
       const before = readSwapSide(l.before);
       const after = readSwapSide(l.after);
+      const isSwap = l.action === 'SWAP_ORDER_PASSENGER';
       return {
+        kind: (isSwap ? 'SWAP' : 'CORRECTION') as 'SWAP' | 'CORRECTION',
         id: l.id,
         at: l.createdAt,
         actor: l.actorLabel,
-        passengerId: before.passengerId,
+        passengerId: before.passengerId ?? after.passengerId,
         beforeName: before.name,
         beforeDoc: before.doc,
         afterName: after.name,
         afterDoc: after.doc,
+        snapshot: isSwap ? readSwapSnapshot(l.before) : undefined,
+        feeCny: isSwap ? readFeeCny(l.after) : undefined,
       };
-    });
+    })
+    .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
 }
 
-/** 换人时刻，固定北京时间（原先用 getHours 等取浏览器时区，境外看会跟导出对不上）。 */
+/** 换人/改信息时刻，固定北京时间（原先用 getHours 等取浏览器时区，境外看会跟导出对不上）。 */
 function fmtSwapTime(iso: string): string {
   const parts = businessTzParts(iso);
   if (!parts) return iso;
   return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}`;
 }
 
-// 单个乘客卡下方的换人历史（时间 · 旧人姓名/证件号 → 新人 · 经手；含多次换人，最新在上）
-function PassengerSwapHistory({ entries }: { entries: SwapHistoryEntry[] }) {
+/** 签证状态口径（与订单详情/签证台一致的中文短标） */
+const HISTORY_VISA_STATUS_LABEL: Record<string, string> = {
+  NEEDED: '需要',
+  E_VISA: '电子签',
+  NOT_NEEDED: '不需要',
+  HAS_VISA: '已签证',
+};
+
+// 「换人前信息 ▸」折叠子行：中文名/出生日期/护照有效期/酒店/签证状态/结算价/换人费。
+function SwapBeforeSnapshotDetails({ snapshot, feeCny }: { snapshot: SwapBeforeSnapshot; feeCny: number | null }) {
+  const visaLabel = snapshot.visaStatus
+    ? HISTORY_VISA_STATUS_LABEL[snapshot.visaStatus] ?? snapshot.visaStatus
+    : '—';
+  return (
+    <details className="mt-1 rounded bg-white/70 px-1.5 py-1">
+      <summary className="cursor-pointer select-none text-[10px] text-slate-400 hover:text-slate-600">
+        换人前信息 ▸
+      </summary>
+      <dl className="mt-1 grid grid-cols-2 gap-x-2 gap-y-0.5 text-[10px] text-slate-600">
+        <dt className="text-slate-400">中文名</dt>
+        <dd>{snapshot.chineseName || '—'}</dd>
+        <dt className="text-slate-400">出生日期</dt>
+        <dd className="font-mono">{snapshot.dateOfBirth?.slice(0, 10) || '—'}</dd>
+        <dt className="text-slate-400">护照有效期</dt>
+        <dd className="font-mono">{snapshot.passportExpiry?.slice(0, 10) || '—'}</dd>
+        <dt className="text-slate-400">酒店</dt>
+        <dd>{snapshot.hotels && snapshot.hotels.length > 0 ? snapshot.hotels.join(' · ') : '—'}</dd>
+        <dt className="text-slate-400">签证状态</dt>
+        <dd>
+          {visaLabel}
+          {snapshot.visaExempt && <span className="ml-1 text-sky-600">· 自备签</span>}
+          {snapshot.visaTaskStatus && <span className="ml-1 text-slate-400">（{snapshot.visaTaskStatus}）</span>}
+        </dd>
+        <dt className="text-slate-400">结算价</dt>
+        <dd>{snapshot.settlementCny != null ? `¥${snapshot.settlementCny.toLocaleString()}` : '—'}</dd>
+        <dt className="text-slate-400">换人费</dt>
+        <dd>{feeCny != null && feeCny > 0 ? `¥${feeCny.toLocaleString()}` : '—'}</dd>
+      </dl>
+    </details>
+  );
+}
+
+// 单个乘客卡下方的换人/改信息历史（时间 · 内容 · 经手；两种记录混排，最新在上）
+function PassengerSwapHistory({ entries }: { entries: PassengerHistoryEntry[] }) {
   if (entries.length === 0) return null;
   return (
     <details className="mt-2 rounded border border-slate-200 bg-slate-50/70 px-2 py-1 text-[11px]">
       <summary className="cursor-pointer select-none text-slate-500 hover:text-slate-700">
-        换人历史（{entries.length} 次）
+        换人 / 改信息记录（{entries.length} 次）
       </summary>
       <ul className="mt-1 space-y-1.5">
-        {entries.map((e) => (
-          <li key={e.id} className="border-l-2 border-amber-300 pl-2">
-            <div className="text-slate-400">{fmtSwapTime(e.at)}{e.actor ? ` · 经手 ${e.actor}` : ''}</div>
-            <div className="text-slate-700">
-              <span className="text-slate-500">换前：</span>
-              <span className="font-medium">{e.beforeName ?? '—'}</span>
-              {e.beforeDoc && <span className="ml-1 font-mono text-slate-500">{e.beforeDoc}</span>}
-            </div>
-            <div className="text-slate-700">
-              <span className="text-slate-500">换后：</span>
-              <span className="font-medium">{e.afterName ?? '—'}</span>
-              {e.afterDoc && <span className="ml-1 font-mono text-slate-500">{e.afterDoc}</span>}
-            </div>
-          </li>
-        ))}
+        {entries.map((e) =>
+          e.kind === 'CORRECTION' ? (
+            <li key={e.id} className="border-l-2 border-slate-300 pl-2 text-slate-500">
+              <div className="text-slate-400">{fmtSwapTime(e.at)}{e.actor ? ` · 经手 ${e.actor}` : ''}</div>
+              <div>
+                改信息：<span className="font-medium text-slate-600">{e.beforeName ?? e.beforeDoc ?? '—'}</span>
+                <span className="mx-1">→</span>
+                <span className="font-medium text-slate-600">{e.afterName ?? e.afterDoc ?? '—'}</span>
+              </div>
+            </li>
+          ) : (
+            <li key={e.id} className="border-l-2 border-amber-300 pl-2">
+              <div className="text-slate-400">{fmtSwapTime(e.at)}{e.actor ? ` · 经手 ${e.actor}` : ''}</div>
+              <div className="text-slate-700">
+                <span className="text-slate-500">换前：</span>
+                <span className="font-medium">{e.beforeName ?? '—'}</span>
+                {e.beforeDoc && <span className="ml-1 font-mono text-slate-500">{e.beforeDoc}</span>}
+              </div>
+              <div className="text-slate-700">
+                <span className="text-slate-500">换后：</span>
+                <span className="font-medium">{e.afterName ?? '—'}</span>
+                {e.afterDoc && <span className="ml-1 font-mono text-slate-500">{e.afterDoc}</span>}
+              </div>
+              {e.snapshot && <SwapBeforeSnapshotDetails snapshot={e.snapshot} feeCny={e.feeCny ?? null} />}
+            </li>
+          ),
+        )}
       </ul>
     </details>
   );
@@ -10629,6 +10731,8 @@ function useLegacyHistoryByDoc(
 function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onOrderUpdated?: (order: OrderSummary) => void }) {
   const navigate = useNavigate();
   const [editingId, setEditingId] = useState<string | null>(null);
+  // 改信息（CORRECTION，纠错不清资料）/ 换人（SWAP，既有清资料语义）——同一张表单两种模式。
+  const [editingMode, setEditingMode] = useState<'CORRECTION' | 'SWAP'>('SWAP');
   const [lightbox, setLightbox] = useState<{ photoUrl: string; title: string } | null>(null);
   // B1：签证日期内联编辑（订单侧入口——HAS_VISA/全员自备签的单进不了签证台，这里是它们唯一可达的录入口）
   const [visaEditId, setVisaEditId] = useState<string | null>(null);
@@ -10703,23 +10807,32 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
     }
   };
 
-  // 换人历史：读订单维度的 SWAP_ORDER_PASSENGER 审计（before/after 已含旧/新姓名+证件号、经手、时间）。
+  // 换人 / 改信息历史：读订单维度的 SWAP_ORDER_PASSENGER + CORRECT_ORDER_PASSENGER 审计
+  // （before/after 已含旧/新姓名+证件号、经手、时间；SWAP 还带换人前快照/换人费）。
   // 复用已有 audit 数据源，无需后端改动；按 before.passengerId 归到各乘客卡下方。
+  // listAuditLogs 的 action 过滤一次只认一个值，两种动作分两次拉，前端合并按时间倒序。
   const token = useAuth((s) => s.tokens)?.accessToken ?? '';
-  const [swapHistory, setSwapHistory] = useState<SwapHistoryEntry[]>([]);
+  const [swapHistory, setSwapHistory] = useState<PassengerHistoryEntry[]>([]);
   const [historyReloadKey, setHistoryReloadKey] = useState(0);
   useEffect(() => {
     if (!token) return;
     let cancelled = false;
-    api
-      .listAuditLogs(token, {
+    Promise.all([
+      api.listAuditLogs(token, {
         targetType: 'ORDER',
         targetId: order.id,
         action: 'SWAP_ORDER_PASSENGER',
         pageSize: 100,
-      })
-      .then((r) => {
-        if (!cancelled) setSwapHistory(auditToSwapHistory(r.logs));
+      }),
+      api.listAuditLogs(token, {
+        targetType: 'ORDER',
+        targetId: order.id,
+        action: 'CORRECT_ORDER_PASSENGER',
+        pageSize: 100,
+      }),
+    ])
+      .then(([swapRes, correctionRes]) => {
+        if (!cancelled) setSwapHistory(auditToPassengerHistory([...swapRes.logs, ...correctionRes.logs]));
       })
       .catch(() => {
         /* 历史读取失败不阻断详情展示 */
@@ -10780,6 +10893,7 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                 <PassengerEditForm
                   orderId={order.id}
                   passenger={p}
+                  mode={editingMode}
                   // 「按人出行」的单（含机票/套餐/签证行）换人时护照有效期必填，与建单同口径。
                   requiresPassportExpiry={order.items.some(
                     (it) => it.kind === 'FLIGHT' || it.kind === 'BUNDLE' || it.kind === 'VISA',
@@ -10788,7 +10902,7 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                   onSaved={(updated) => {
                     setEditingId(null);
                     onOrderUpdated?.(updated);
-                    setHistoryReloadKey((k) => k + 1); // 换人后重拉换人历史
+                    setHistoryReloadKey((k) => k + 1); // 改信息/换人后重拉历史
                   }}
                 />
               </li>
@@ -10836,9 +10950,23 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                     )}
                     <button
                       className="ml-2 text-[11px] font-normal text-brand hover:text-brand-dark"
-                      onClick={() => setEditingId(p.id)}
+                      onClick={() => {
+                        setEditingMode('CORRECTION');
+                        setEditingId(p.id);
+                      }}
+                      title="纠正拼写/证件号错字，不清护照照片和签证信息"
                     >
-                      换人/编辑
+                      改信息
+                    </button>
+                    <button
+                      className="ml-2 text-[11px] font-normal text-brand hover:text-brand-dark"
+                      onClick={() => {
+                        setEditingMode('SWAP');
+                        setEditingId(p.id);
+                      }}
+                      title="换成另一个人：清空旧人护照/签证信息，可记换人费"
+                    >
+                      换人
                     </button>
                     <button
                       className="ml-2 text-[11px] font-normal text-sky-700 hover:text-sky-900"
@@ -11123,11 +11251,35 @@ function PassengerVisaDatesInline({
   );
 }
 
-// ── 换人/编辑出行人（改身份 + 可选重置开票/签证 + 换人费）─────────────
+/**
+ * 编辑距离（Levenshtein）：用于「改信息」证件号纠错幅度校验——与后端口径一致，
+ * 改动超过 CORRECTION_DOC_DIFF_LIMIT 个字符视为「换人」而非「纠错」，前端提前拦，
+ * 不必等提交才被 400 打回。
+ */
+function levenshteinDistance(a: string, b: string): number {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+  let prev = Array.from({ length: n + 1 }, (_, j) => j);
+  for (let i = 1; i <= m; i++) {
+    const curr = [i];
+    for (let j = 1; j <= n; j++) {
+      const cost = a[i - 1] === b[j - 1] ? 0 : 1;
+      curr[j] = Math.min(curr[j - 1] + 1, prev[j] + 1, prev[j - 1] + cost);
+    }
+    prev = curr;
+  }
+  return prev[n];
+}
+const CORRECTION_DOC_DIFF_LIMIT = 2;
+
+// ── 改信息（CORRECTION，纠错不清资料）/ 换人（SWAP，改身份 + 可选重置开票/签证 + 换人费）─────
 function PassengerEditForm({
   orderId,
   passenger,
   requiresPassportExpiry,
+  mode,
   onCancel,
   onSaved,
 }: {
@@ -11135,10 +11287,14 @@ function PassengerEditForm({
   passenger: OrderSummary['passengers'][number];
   /** 本单是否「按人出行」（含机票/套餐/签证行）：为真时真换人必须填新出行人护照有效期。 */
   requiresPassportExpiry: boolean;
+  /** CORRECTION=改信息（纠错，不清护照/签证，只发变化字段）；SWAP=换人（既有语义，可清资料/收换人费）。 */
+  mode: 'CORRECTION' | 'SWAP';
   onCancel: () => void;
   onSaved: (order: OrderSummary) => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
+  const role = useAuth((s) => s.user?.role);
+  const isAgentUser = role === 'AGENT';
   const confirm = useConfirm();
   const highRiskConfirmRef = useRef(false);
   const token = tokens?.accessToken ?? '';
@@ -11265,6 +11421,41 @@ function PassengerEditForm({
     }
   };
 
+  // 提交成功后：若 OCR 识别到主请求装不下的护照资料（护照图/签发地/签发国），经「补录」通道
+  // 写回；有效期/签发日已随主请求一起提交，不重复发（同一字段发两遍 = 后一遍覆盖前一遍）。
+  // 与旧值一致的字段不重复提交（passportPhotoUrl 是 data-URL，与旧照相同则跳过）。
+  const applySupplementAndFinish = async (res: { order: OrderSummary }) => {
+    const supplement: {
+      passportPhotoUrl?: string;
+      passportIssuePlace?: string;
+      passportIssueCountry?: string;
+    } = {};
+    if (passportPhotoUrl && passportPhotoUrl !== (passenger.passportPhotoUrl ?? null)) {
+      supplement.passportPhotoUrl = passportPhotoUrl;
+    }
+    if (passportIssuePlace) supplement.passportIssuePlace = passportIssuePlace;
+    if (passportIssueCountry) supplement.passportIssueCountry = passportIssueCountry;
+
+    if (Object.keys(supplement).length > 0) {
+      try {
+        await api.supplementOrderPassengerPassport(token, orderId, passenger.id, supplement);
+        const refreshed = await api.getOrder(token, orderId);
+        onSaved(refreshed.order);
+        return;
+      } catch {
+        // 主请求已成功，仅护照资料补录失败：不回滚，提示可稍后在「补录护照」重试。
+        setErr(
+          mode === 'CORRECTION'
+            ? '信息已保存，但护照资料补录失败，请稍后重新上传护照。'
+            : '换人已保存，但护照资料补录失败，请稍后重新上传护照。',
+        );
+        onSaved(res.order);
+        return;
+      }
+    }
+    onSaved(res.order);
+  };
+
   const submit = async () => {
     if (!token || submitting || highRiskConfirmRef.current) return;
     setErr(null);
@@ -11275,18 +11466,74 @@ function PassengerEditForm({
       if (!parsed) { setErr('出生日期格式不正确（示例：1990-01-01）'); return; }
       dobValue = parsed;
     }
-    // 证件号变化 = 真换人：后端会清除旧出行人残留的护照/签证信息，需显式二次确认防误清。
-    const newDoc = documentNumber.trim();
-    const isRealSwap = newDoc !== '' && newDoc !== (passenger.documentNumber ?? '');
-    // 护照有效期先于二次确认校验（别让用户确认完才被打回）：
-    //   · 填了就要合法（YYYY-MM-DD）；
-    //   · 真换人 + 本单按人出行 → 必填。换人会清掉旧人的有效期，不填新的就等于把这一栏留空出行。
-    //     文案与后端 400 保持一致。
     const expiryValue = passportExpiry.trim();
     if (expiryValue && !/^\d{4}-\d{2}-\d{2}$/.test(expiryValue)) {
       setErr('护照有效期格式不正确（示例：2030-01-01）');
       return;
     }
+
+    if (mode === 'CORRECTION') {
+      // 改信息 = 纠错：证件号改动超过阈值就不算「纠错」，前端提前拦，文案与后端 400 一致。
+      const newDoc = documentNumber.trim();
+      const oldDoc = (passenger.documentNumber ?? '').trim();
+      if (newDoc && oldDoc && levenshteinDistance(newDoc, oldDoc) > CORRECTION_DOC_DIFF_LIMIT) {
+        setErr('证件号改动超过 2 个字符，请使用「换人」');
+        return;
+      }
+      highRiskConfirmRef.current = true;
+      if (!(await confirm({
+        title: '确认保存出行人信息修正？',
+        body: '不会清除护照照片和签证信息。',
+      }))) {
+        highRiskConfirmRef.current = false;
+        return;
+      }
+      // 只发生变化的字段（对照当前乘客原值 diff），服务端也不会清空任何未提交的字段。
+      const oldDobFmt = passenger.dateOfBirth?.slice(0, 10) ?? '';
+      const oldExpiryFmt = passenger.passportExpiry?.slice(0, 10) ?? '';
+      const body: {
+        mode: 'CORRECTION';
+        lastName?: string;
+        firstName?: string;
+        fullName?: string;
+        chineseName?: string;
+        documentNumber?: string;
+        dateOfBirth?: string;
+        gender?: 'M' | 'F' | 'X';
+        nationality?: string;
+        passportExpiry?: string;
+        passportIssueDate?: string;
+      } = { mode: 'CORRECTION' };
+      if (lastName.trim() !== (passenger.lastName ?? '').trim()) body.lastName = lastName.trim();
+      if (firstName.trim() !== (passenger.firstName ?? '').trim()) body.firstName = firstName.trim();
+      if (fullName.trim() !== (passenger.fullName ?? '').trim()) body.fullName = fullName.trim();
+      if (chineseName.trim() !== (passenger.chineseName ?? '').trim()) body.chineseName = chineseName.trim();
+      if (newDoc !== oldDoc) body.documentNumber = newDoc;
+      if ((dobValue ?? '') !== oldDobFmt) body.dateOfBirth = dobValue;
+      if (gender !== (passenger.gender ?? '')) body.gender = gender || undefined;
+      if (nationality.trim() !== (passenger.nationality ?? '').trim()) body.nationality = nationality.trim();
+      if (expiryValue !== oldExpiryFmt) body.passportExpiry = expiryValue || undefined;
+      if (passportIssueDate) body.passportIssueDate = passportIssueDate;
+
+      setSubmitting(true);
+      try {
+        const res = await api.updateOrderPassenger(token, orderId, passenger.id, body);
+        await applySupplementAndFinish(res);
+      } catch (e) {
+        setErr(e instanceof ApiError ? e.message : '保存失败');
+      } finally {
+        setSubmitting(false);
+        highRiskConfirmRef.current = false;
+      }
+      return;
+    }
+
+    // ── SWAP：既有换人语义。证件号变化 = 真换人：后端会清除旧出行人残留的护照/签证信息，
+    // 需显式二次确认防误清。护照有效期先于二次确认校验（别让用户确认完才被打回）：
+    //   · 填了就要合法（YYYY-MM-DD）；
+    //   · 真换人 + 本单按人出行 → 必填。换人会清掉旧人的有效期，不填新的就等于把这一栏留空出行。
+    const newDoc = documentNumber.trim();
+    const isRealSwap = newDoc !== '' && newDoc !== (passenger.documentNumber ?? '');
     if (isRealSwap && requiresPassportExpiry && !expiryValue) {
       setErr('换人须填写新出行人护照有效期（YYYY-MM-DD）');
       return;
@@ -11295,7 +11542,9 @@ function PassengerEditForm({
     if (isRealSwap) {
       if (!(await confirm({
         title: '确认换人？',
-        body: '证件号已变更，原出行人的护照/签证信息（护照照片、签发地、有效期、签证号等）将被清除，仅保留本次填写的新值。此操作会记入审计。',
+        body: isAgentUser
+          ? '证件号已变更，原出行人的护照/签证信息（护照照片、签发地、有效期、签证号等）将被清除，仅保留本次填写的新值。系统将自动重置签证进度，不收换人费。此操作会记入审计。'
+          : '证件号已变更，原出行人的护照/签证信息（护照照片、签发地、有效期、签证号等）将被清除，仅保留本次填写的新值。此操作会记入审计。',
         tone: 'danger',
       }))) {
         highRiskConfirmRef.current = false;
@@ -11304,7 +11553,9 @@ function PassengerEditForm({
     } else {
       if (!(await confirm({
         title: '确认保存出行人改动？',
-        body: '如勾选了重置开票/签证将清除对应状态，填了换人费将计入订单尾款。',
+        body: isAgentUser
+          ? '此操作会记入审计。'
+          : '如勾选了重置开票/签证将清除对应状态，填了换人费将计入订单尾款。',
         tone: 'danger',
       }))) {
         highRiskConfirmRef.current = false;
@@ -11314,6 +11565,7 @@ function PassengerEditForm({
     setSubmitting(true);
     try {
       const res = await api.updateOrderPassenger(token, orderId, passenger.id, {
+        mode: 'SWAP',
         lastName: lastName.trim() || undefined,
         firstName: firstName.trim() || undefined,
         fullName: fullName.trim() || undefined,
@@ -11332,37 +11584,7 @@ function PassengerEditForm({
         feeLabel: feeCny != null && feeCny > 0 ? '换人费' : undefined,
         note: note.trim() || undefined,
       });
-
-      // 换人本身会清空旧人护照资料；这里把换人请求装不下的其余 OCR 结果（护照图/签发地/签发国）
-      // 经「补录」通道写回，不削弱换人的清除语义。只在确有新护照资料时才发第二次请求。
-      // 有效期/签发日已随上面的换人请求提交，不再重复发一遍（同一字段发两遍 = 后一遍覆盖前一遍，
-      // 且「与旧值相同就不发」的老逻辑正是有效期被换人清空后再也补不回来的原因）。
-      // 与旧值一致的字段不重复提交（passportPhotoUrl 是 data-URL，与旧照相同则跳过）。
-      const supplement: {
-        passportPhotoUrl?: string;
-        passportIssuePlace?: string;
-        passportIssueCountry?: string;
-      } = {};
-      if (passportPhotoUrl && passportPhotoUrl !== (passenger.passportPhotoUrl ?? null)) {
-        supplement.passportPhotoUrl = passportPhotoUrl;
-      }
-      if (passportIssuePlace) supplement.passportIssuePlace = passportIssuePlace;
-      if (passportIssueCountry) supplement.passportIssueCountry = passportIssueCountry;
-
-      if (Object.keys(supplement).length > 0) {
-        try {
-          await api.supplementOrderPassengerPassport(token, orderId, passenger.id, supplement);
-          const refreshed = await api.getOrder(token, orderId);
-          onSaved(refreshed.order);
-          return;
-        } catch {
-          // 换人已成功，仅护照资料补录失败：不回滚，提示可稍后在「补录护照」重试。
-          setErr('换人已保存，但护照资料补录失败，请稍后重新上传护照。');
-          onSaved(res.order);
-          return;
-        }
-      }
-      onSaved(res.order);
+      await applySupplementAndFinish(res);
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : '保存失败');
     } finally {
@@ -11372,19 +11594,26 @@ function PassengerEditForm({
   };
 
   const inputCls = 'mt-0.5 w-full rounded border border-slate-300 px-2 py-1 text-xs';
-  // 护照有效期是否此刻必填：证件号已改成新的（真换人）+ 本单按人出行。随输入实时变化，
-  // 让运营在改证件号的当下就看见必填标记，而不是提交时才被打回。
+  // 护照有效期是否此刻必填：仅换人模式下、证件号已改成新的（真换人）+ 本单按人出行。
+  // 随输入实时变化，让运营在改证件号的当下就看见必填标记，而不是提交时才被打回。
   const expiryRequired =
+    mode === 'SWAP' &&
     requiresPassportExpiry &&
     documentNumber.trim() !== '' &&
     documentNumber.trim() !== (passenger.documentNumber ?? '');
+  // 改信息模式：证件号改动幅度实时提示（与提交时的校验同口径），超限则禁用保存。
+  const correctionDocOverLimit =
+    mode === 'CORRECTION' &&
+    documentNumber.trim() !== '' &&
+    (passenger.documentNumber ?? '').trim() !== '' &&
+    levenshteinDistance(documentNumber.trim(), (passenger.documentNumber ?? '').trim()) > CORRECTION_DOC_DIFF_LIMIT;
   const ocring = ocrPct !== null && ocrPct < 100;
   const ocrEngineLabel =
     ocrEngine === 'ai' ? 'AI 识别' : ocrEngine === 'local' ? '本地识别' : ocrEngine === 'ai-fallback' ? 'AI 失败·本地兜底' : '';
 
   return (
     <div className="space-y-2 text-xs">
-      <div className="font-medium text-brand">换人/编辑 · {passenger.fullName}</div>
+      <div className="font-medium text-brand">{mode === 'CORRECTION' ? '改信息' : '换人'} · {passenger.fullName}</div>
 
       {/* 护照 OCR：上传照片自动识别并预填下方字段（与录单同款，AI 优先、本地兜底）。用户可改后提交。 */}
       <div className="flex items-center gap-2 rounded border border-dashed border-brand/40 bg-brand/5 px-2 py-1.5">
@@ -11448,7 +11677,16 @@ function PassengerEditForm({
 
       <label className="block">
         <span className="text-slate-500">护照号</span>
-        <input className={`${inputCls} font-mono`} value={documentNumber} onChange={(e) => setDocumentNumber(e.target.value)} />
+        <input
+          className={`${inputCls} font-mono ${correctionDocOverLimit ? 'border-rose-400' : ''}`}
+          value={documentNumber}
+          onChange={(e) => setDocumentNumber(e.target.value)}
+        />
+        {correctionDocOverLimit && (
+          <span className="mt-0.5 block text-[10px] text-rose-600">
+            改动超过 2 个字符，请改用「换人」
+          </span>
+        )}
       </label>
 
       <div className="grid grid-cols-2 gap-2">
@@ -11491,32 +11729,38 @@ function PassengerEditForm({
         </label>
       </div>
 
-      <div className="space-y-1 rounded border border-slate-200 bg-white p-2">
-        <label className="flex items-center gap-2">
-          <input type="checkbox" checked={resetInvoice} onChange={(e) => setResetInvoice(e.target.checked)} />
-          <span>重置开票状态（开票 → 未开）</span>
-        </label>
-        <label className="flex items-center gap-2">
-          <input type="checkbox" checked={resetVisa} onChange={(e) => setResetVisa(e.target.checked)} />
-          <span>重置签证状态（签证任务 → 待处理）</span>
-        </label>
-      </div>
+      {mode === 'SWAP' && !isAgentUser && (
+        <div className="space-y-1 rounded border border-slate-200 bg-white p-2">
+          <label className="flex items-center gap-2">
+            <input type="checkbox" checked={resetInvoice} onChange={(e) => setResetInvoice(e.target.checked)} />
+            <span>重置开票状态（开票 → 未开）</span>
+          </label>
+          <label className="flex items-center gap-2">
+            <input type="checkbox" checked={resetVisa} onChange={(e) => setResetVisa(e.target.checked)} />
+            <span>重置签证状态（签证任务 → 待处理）</span>
+          </label>
+        </div>
+      )}
 
-      <label className="block">
-        <span className="text-slate-500">换人费（¥，可选）</span>
-        <NumberInput
-          value={feeCny}
-          onChange={setFeeCny}
-          integerOnly
-          placeholder="不收换人费则留空"
-          className={inputCls}
-        />
-      </label>
+      {mode === 'SWAP' && !isAgentUser && (
+        <label className="block">
+          <span className="text-slate-500">换人费（¥，可选）</span>
+          <NumberInput
+            value={feeCny}
+            onChange={setFeeCny}
+            integerOnly
+            placeholder="不收换人费则留空"
+            className={inputCls}
+          />
+        </label>
+      )}
 
-      <label className="block">
-        <span className="text-slate-500">备注（可选）</span>
-        <input className={inputCls} value={note} onChange={(e) => setNote(e.target.value)} placeholder="如：客户更换出行人" />
-      </label>
+      {mode === 'SWAP' && (
+        <label className="block">
+          <span className="text-slate-500">备注（可选）</span>
+          <input className={inputCls} value={note} onChange={(e) => setNote(e.target.value)} placeholder="如：客户更换出行人" />
+        </label>
+      )}
 
       {err && <div className="rounded bg-red-50 px-2 py-1 text-red-700">{err}</div>}
 
@@ -11524,7 +11768,7 @@ function PassengerEditForm({
         <button
           className="flex-1 rounded bg-brand px-2 py-1.5 font-medium text-white disabled:opacity-50"
           onClick={submit}
-          disabled={submitting}
+          disabled={submitting || correctionDocOverLimit}
         >
           {submitting ? '保存中…' : '保存'}
         </button>

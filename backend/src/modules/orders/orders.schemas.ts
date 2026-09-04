@@ -1166,6 +1166,10 @@ export type UpgradeItemCabinBody = z.infer<typeof upgradeItemCabinBodySchema>;
 // 硬性要求（缺失 400），纯酒店/接送单不强制（出行人可能只是联系人占位）。
 export const swapPassengerBodySchema = z
   .object({
+    // 显式通道标记（与 mode:'CORRECTION' 的订正通道成对）：带 'SWAP' 即明说「这是换人」，
+    // 不再靠「请求体里有没有换人语义字段」猜。缺省保持老行为（见 resolvePassengerPatchChannel），
+    // 代理换人则**必须**显式带 'SWAP'（前台角色不参与字段猜测分流）。
+    mode: z.literal('SWAP').optional(),
     // lastName/firstName 各自单段规范化（不做斜线拼接）：与录单入口同款，单段里不允许出现 '/'
     // ——换人同样会把姓名写进库、同样喂给导出层拼 `LAST/FIRST`，正门堵了这扇窗也不能留。
     // fullName 是整名，斜线在这里是合法分隔符，故仍走不带斜线校验的 optionalNormalizedName。
@@ -1227,6 +1231,51 @@ export const swapPassengerBodySchema = z
   );
 export type SwapPassengerBody = z.infer<typeof swapPassengerBodySchema>;
 
+// ── 售后改单：订正出行人证件资料（passenger correction）─────────────────────
+// PATCH /orders/:id/passengers/:passengerId，body 带 mode:'CORRECTION'（ADMIN/STAFF/代理自家单）。
+//
+// 为什么要跟换人分家：护照 OCR 把 Q 读成 0/5 是常态，运营改的是**同一个人**录错的一个字。
+// 走换人通道会按「另一个人上飞机」清洗数据 —— 护照图、签发地、签证号、票号全被抹掉，
+// 实测里九月上旬的「换人」记录绝大多数其实是这种同名单字订正，护照图无一幸免。
+// 订正通道的口径与换人正相反：
+//   · **只写传进来的字段，一个字段都不清空** —— 没传的（护照图/签发地/签证号/出生地/有效期）
+//     原样保留，因为人没变，那些资料本来就是他的。
+//   · 证件号改动 ≤ 2 个字符才算「录错字」（levenshteinDistance，见 lib/edit-distance.ts）；
+//     超过就是换了个人，服务端拒并指路换人通道。
+//   · 已开票的单改姓名/证件号 → 拒（票面身份已发出，必须走换人并显式重置开票位）。
+// 刻意不含 resetInvoice / resetVisa / feeCny —— 订正不重置任何状态、不收钱。
+export const correctPassengerBodySchema = z
+  .object({
+    mode: z.literal('CORRECTION'),
+    // 姓名三件套与换人/录单同款规范化（单段不允许出现 '/'，fullName 允许斜线分隔）
+    lastName: optionalPnrSegmentName(120),
+    firstName: optionalPnrSegmentName(120),
+    fullName: optionalNormalizedName(120),
+    chineseName: z.string().max(120).optional(),
+    documentNumber: z.string().min(3).max(60).optional(),
+    dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    gender: z.nativeEnum(Gender).optional(),
+    nationality: z.string().max(60).optional(),
+    passportExpiry: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    passportIssueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  })
+  .strict()
+  .refine(
+    (b) =>
+      b.lastName !== undefined ||
+      b.firstName !== undefined ||
+      b.fullName !== undefined ||
+      b.chineseName !== undefined ||
+      b.documentNumber !== undefined ||
+      b.dateOfBirth !== undefined ||
+      b.gender !== undefined ||
+      b.nationality !== undefined ||
+      b.passportExpiry !== undefined ||
+      b.passportIssueDate !== undefined,
+    { message: '请至少提供一个需要订正的字段' },
+  );
+export type CorrectPassengerBody = z.infer<typeof correctPassengerBodySchema>;
+
 /**
  * PATCH /orders/:id/passengers/:passengerId/visa-exempt —— 建单后按人改自备签（专用端点）。
  *
@@ -1276,21 +1325,33 @@ export const SWAP_PASSENGER_SEMANTIC_FIELDS: readonly string[] = [
 ];
 
 /**
- * 同一路径双通道判定（纯函数，供路由与单测复用）：返回 'SWAP' 走换人分支，'SELF_UPDATE' 走补录分支。
+ * 同一路径三通道判定（纯函数，供路由与单测复用）：'SWAP' 走换人、'CORRECTION' 走订正、
+ * 'SELF_UPDATE' 走补录。
  *
- * 判定规则：
- *   - CUSTOMER / AGENT（前台）：一律 'SELF_UPDATE'（自助补录护照/证件资料；换人只能联系客服）。
- *   - ADMIN / STAFF（运营）：请求体带任一「换人语义字段」→ 'SWAP'（换人）；否则 → 'SELF_UPDATE'
+ * 判定规则（显式 mode 优先于字段猜测）：
+ *   - 请求体显式带 mode='CORRECTION' / 'SWAP'，且角色是运营（ADMIN/STAFF）或代理（AGENT）
+ *     → 直接走对应通道。归属校验（代理只能动自家单）在 service 里做，这里只做分流。
+ *   - CUSTOMER：一律 'SELF_UPDATE'（自助补录护照/证件资料；改身份只能联系客服），mode 不生效。
+ *   - AGENT 不带 mode：'SELF_UPDATE'（老行为一字不变——代理自助补护照资料的口子照旧）。
+ *   - ADMIN / STAFF 不带 mode：请求体带任一「换人语义字段」→ 'SWAP'；否则 → 'SELF_UPDATE'
  *     （运营只想补 passportIssueDate/passportExpiry/护照图 等证件资料时，走补录同款更新路径，
  *      不该被换人 schema 400——换人 schema 无护照字段）。
+ *
+ * 为什么必须有 mode：订正与换人在请求体上长得一模一样（都是「姓名/证件号变了」），
+ * 靠字段猜永远猜不出「这是同一个人录错了字」还是「换了个人」——那正是护照图被误清的根因。
  */
 export function resolvePassengerPatchChannel(
   role: UserRole,
   body: unknown,
-): 'SWAP' | 'SELF_UPDATE' {
+): 'SWAP' | 'SELF_UPDATE' | 'CORRECTION' {
   const isInternal = role === UserRole.ADMIN || role === UserRole.STAFF;
-  if (!isInternal) return 'SELF_UPDATE';
   const raw = (body ?? {}) as Record<string, unknown>;
+  // 代理（AGENT）2026-09 起获得自家单的换人/订正权（运营事后复核）；客户永远只能补录。
+  if (isInternal || role === UserRole.AGENT) {
+    if (raw.mode === 'CORRECTION') return 'CORRECTION';
+    if (raw.mode === 'SWAP') return 'SWAP';
+  }
+  if (!isInternal) return 'SELF_UPDATE';
   const hasSwapSemantics = SWAP_PASSENGER_SEMANTIC_FIELDS.some((key) => raw[key] !== undefined);
   return hasSwapSemantics ? 'SWAP' : 'SELF_UPDATE';
 }
