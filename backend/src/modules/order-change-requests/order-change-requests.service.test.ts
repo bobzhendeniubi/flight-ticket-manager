@@ -17,6 +17,7 @@ const { mockPrisma, mockGetDescendantAgentIds } = vi.hoisted(() => ({
   mockPrisma: {
     agent: { findUnique: vi.fn() },
     order: { findUnique: vi.fn() },
+    orderItem: { findUnique: vi.fn() },
     flightSchedule: { findUnique: vi.fn() },
     hotelRoomType: { findUnique: vi.fn() },
     user: { findMany: vi.fn() },
@@ -56,11 +57,15 @@ function orderFixture(overrides: Record<string, unknown> = {}) {
     orderNumber: 'FTM2026090400001',
     agentId: 'agent-1',
     deletedAt: null,
+    status: 'PENDING_PAYMENT',
     visaStatus: VisaRequirement.NEEDED,
     items: [
       {
         id: 'item-out',
         kind: 'FLIGHT',
+        quantity: 2,
+        roomsBilled: null,
+        totalCostCny: null,
         flightScheduleId: 'sched-out',
         flightCabin: 'ECONOMY',
         hotelRoomTypeId: null,
@@ -68,13 +73,17 @@ function orderFixture(overrides: Record<string, unknown> = {}) {
           id: 'sched-out',
           departureTime: new Date('2026-09-12T02:00:00.000Z'),
           departureTz: 'Asia/Shanghai',
-          flight: { flightNumber: 'QH0001' },
+          // 2 人 × ¥2400/程 = ¥4800 补差
+          flight: { flightNumber: 'QH0001', businessUpgradeCnyPerLeg: 2400 },
         },
         hotelRoomType: null,
       },
       {
         id: 'item-ret',
         kind: 'FLIGHT',
+        quantity: 2,
+        roomsBilled: null,
+        totalCostCny: null,
         flightScheduleId: 'sched-ret',
         flightCabin: 'ECONOMY',
         hotelRoomTypeId: null,
@@ -82,13 +91,17 @@ function orderFixture(overrides: Record<string, unknown> = {}) {
           id: 'sched-ret',
           departureTime: new Date('2026-09-15T02:00:00.000Z'),
           departureTz: 'Asia/Shanghai',
-          flight: { flightNumber: 'QH0002' },
+          flight: { flightNumber: 'QH0002', businessUpgradeCnyPerLeg: 2400 },
         },
         hotelRoomType: null,
       },
       {
         id: 'item-hotel',
         kind: 'HOTEL',
+        // 3 晚 × 1 间，原成本 ¥900
+        quantity: 3,
+        roomsBilled: 1,
+        totalCostCny: 900,
         flightScheduleId: null,
         flightCabin: null,
         hotelRoomTypeId: 'room-old',
@@ -129,6 +142,8 @@ let ordersStub: {
   setOrderVisaStatus: ReturnType<typeof vi.fn>;
   swapItemHotel: ReturnType<typeof vi.fn>;
   upgradeOrderItemCabin: ReturnType<typeof vi.fn>;
+  /** 幂等分支（不执行、只补状态）要回一份当前订单。 */
+  getOrder: ReturnType<typeof vi.fn>;
 };
 let service: OrderChangeRequestsService;
 
@@ -155,6 +170,7 @@ beforeEach(() => {
     setOrderVisaStatus: vi.fn(),
     swapItemHotel: vi.fn(),
     upgradeOrderItemCabin: vi.fn(),
+    getOrder: vi.fn().mockResolvedValue({ id: 'order-1' }),
   };
   service = new OrderChangeRequestsService(ordersStub as never);
 });
@@ -217,14 +233,15 @@ describe('create() · 提交只落申请', () => {
     expect(data.summary).toBe('去程 2026-09-12 QH0001 → 2026-09-13 QH0001');
   });
 
-  it('换酒店申请 → 快照新旧「酒店 · 房型」', async () => {
+  it('换酒店申请 → 快照新旧「酒店 · 房型」+ 前后成本，摘要里不带成本', async () => {
     mockPrisma.hotelRoomType.findUnique.mockResolvedValue({
       id: 'room-new',
       name: '豪华套房',
+      costPriceCny: 400, // 400 × 3 晚 × 1 间 = 1200
       hotel: { name: '示例山景酒店', isActive: true },
     });
 
-    await service.create(ADMIN, 'order-1', {
+    const request = await service.create(ADMIN, 'order-1', {
       kind: OrderChangeKind.HOTEL,
       payload: { itemId: 'item-hotel', toHotelRoomTypeId: 'room-new' },
     });
@@ -235,19 +252,95 @@ describe('create() · 提交只落申请', () => {
       toHotelRoomTypeId: 'room-new',
       toHotelName: '示例山景酒店 · 豪华套房',
       fromHotelName: '示例海景酒店 · 高级大床',
+      costBeforeCny: 900,
+      costAfterCny: 1200,
     });
     expect(data.summary).toBe('酒店 示例海景酒店 · 高级大床 → 示例山景酒店 · 豪华套房');
+    // 运营看得到成本变动
+    expect(request.costDeltaCny).toBe(300);
   });
 
-  it('升舱申请 → 目标舱位恒商务舱，快照原舱位', async () => {
-    await service.create(ADMIN, 'order-1', {
+  it('换酒店申请 · 代理侧 → 成本快照与 costDeltaCny 一个字都不给', async () => {
+    mockPrisma.hotelRoomType.findUnique.mockResolvedValue({
+      id: 'room-new',
+      name: '豪华套房',
+      costPriceCny: 400,
+      hotel: { name: '示例山景酒店', isActive: true },
+    });
+
+    const request = await service.create(AGENT, 'order-1', {
+      kind: OrderChangeKind.HOTEL,
+      payload: { itemId: 'item-hotel', toHotelRoomTypeId: 'room-new' },
+    });
+
+    expect(request.costDeltaCny).toBeNull();
+    expect(request.payload).not.toHaveProperty('costBeforeCny');
+    expect(request.payload).not.toHaveProperty('costAfterCny');
+    // 落库的那份仍然带着成本（运营侧要看）
+    expect(mockPrisma.orderChangeRequest.create.mock.calls[0][0].data.payload).toMatchObject({
+      costBeforeCny: 900,
+      costAfterCny: 1200,
+    });
+  });
+
+  it('升舱申请 → 目标舱位恒商务舱，快照原舱位与补差，摘要写明金额', async () => {
+    const request = await service.create(ADMIN, 'order-1', {
       kind: OrderChangeKind.CABIN,
       payload: { itemId: 'item-out' },
     });
 
     const data = mockPrisma.orderChangeRequest.create.mock.calls[0][0].data;
-    expect(data.payload).toEqual({ itemId: 'item-out', toCabin: 'BUSINESS', fromCabin: 'ECONOMY' });
-    expect(data.summary).toBe('经济舱 → 商务舱');
+    expect(data.payload).toEqual({
+      itemId: 'item-out',
+      toCabin: 'BUSINESS',
+      fromCabin: 'ECONOMY',
+      diffCny: 4800,
+    });
+    expect(data.summary).toBe('经济舱 → 商务舱（补差 ¥4,800）');
+    // 补差所有角色都看得见（这笔钱最终由代理的客人出）
+    expect(request.amountCny).toBe(4800);
+  });
+
+  it('升舱申请 · 代理侧同样看得到补差金额', async () => {
+    const request = await service.create(AGENT, 'order-1', {
+      kind: OrderChangeKind.CABIN,
+      payload: { itemId: 'item-out' },
+    });
+    expect(request.amountCny).toBe(4800);
+  });
+
+  it('升舱申请 · 航班没配商务舱差价 → 400，不攒执行不了的申请', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(
+      orderFixture({
+        items: [
+          {
+            ...orderFixture().items[0],
+            flightSchedule: {
+              ...orderFixture().items[0].flightSchedule,
+              flight: { flightNumber: 'QH0001', businessUpgradeCnyPerLeg: 0 },
+            },
+          },
+        ],
+      }),
+    );
+    await expect(
+      service.create(ADMIN, 'order-1', {
+        kind: OrderChangeKind.CABIN,
+        payload: { itemId: 'item-out' },
+      }),
+    ).rejects.toThrow('该航班未配置商务舱差价，请先在航班管理维护');
+    expect(mockPrisma.orderChangeRequest.create).not.toHaveBeenCalled();
+  });
+
+  it('订单不在占座态 → 400 带状态中文名，不写库', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(orderFixture({ status: 'CANCELLED' }));
+    await expect(
+      service.create(AGENT, 'order-1', {
+        kind: OrderChangeKind.VISA,
+        payload: { toVisaStatus: VisaRequirement.NOT_NEEDED },
+      }),
+    ).rejects.toThrow('订单当前状态（已取消）不可提交改单申请');
+    expect(mockPrisma.orderChangeRequest.create).not.toHaveBeenCalled();
   });
 
   it('代理对别家单提申请 → 403，不写库', async () => {
@@ -336,6 +429,31 @@ describe('createBatch() · 一批单同一类改动', () => {
     expect(res.results[1]).toMatchObject({ orderId: 'order-2', ok: true });
   });
 
+  it('按航段批量 · 本单有已释放的机票行 → 拒，绝不落到另一段上', async () => {
+    // 去程座位被 no-show 释放（flightScheduleId 置空）：旧口径下回程会顶上来当「去程」。
+    const released = orderFixture();
+    released.items[0].flightScheduleId = null;
+    released.items[0].flightSchedule = null;
+    mockPrisma.order.findUnique.mockResolvedValue(released);
+    mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sched-new',
+      departureTime: new Date('2026-09-13T02:00:00.000Z'),
+      departureTz: 'Asia/Shanghai',
+      isActive: true,
+      flight: { flightNumber: 'QH0001' },
+    });
+
+    const res = await service.createBatch(ADMIN, {
+      orderIds: ['order-1'],
+      kind: OrderChangeKind.FLIGHT,
+      payload: { leg: 'OUTBOUND', newScheduleId: 'sched-new' },
+    });
+
+    expect(res.created).toBe(0);
+    expect(res.results[0].reason).toBe('该航段座位已释放，无法按航段申请');
+    expect(mockPrisma.orderChangeRequest.create).not.toHaveBeenCalled();
+  });
+
   it('换酒店 / 升舱不支持批量 → 400', async () => {
     for (const kind of [OrderChangeKind.HOTEL, OrderChangeKind.CABIN]) {
       await expect(
@@ -370,7 +488,14 @@ function primeApprove(kind: OrderChangeKind, payload: Record<string, unknown>) {
     orderNumber: 'FTM2026090400001',
     deletedAt: null,
   });
+  // 目标班次默认可用（在售 + 未起飞）：改班次执行前会复检一次现状。
+  mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+    id: 'sched-new',
+    isActive: true,
+    departureTime: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+  });
   mockPrisma.orderChangeRequest.update.mockResolvedValue(requestFixture());
+  mockPrisma.orderChangeRequest.updateMany.mockResolvedValue({ count: 1 });
   mockPrisma.orderChangeRequest.findUniqueOrThrow.mockResolvedValue(
     requestFixture({
       kind,
@@ -398,14 +523,184 @@ describe('approve() · 运营一键执行', () => {
     );
     expect(res.request.status).toBe(OrderChangeRequestStatus.APPROVED);
     expect(res.order).toEqual({ id: 'order-1' });
-    expect(mockPrisma.orderChangeRequest.update).toHaveBeenLastCalledWith(
+    // 收尾回写是条件更新（status 仍是 PENDING 才写），不是无条件 update
+    expect(mockPrisma.orderChangeRequest.updateMany).toHaveBeenLastCalledWith(
       expect.objectContaining({
+        where: { id: 'req-1', status: OrderChangeRequestStatus.PENDING },
         data: expect.objectContaining({
           status: OrderChangeRequestStatus.APPROVED,
           applyError: null,
         }),
       }),
     );
+  });
+
+  it('目标班次已停售 → 400 指路重提，申请留 PENDING', async () => {
+    primeApprove(OrderChangeKind.FLIGHT, { itemId: 'item-out', newScheduleId: 'sched-new' });
+    mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sched-new',
+      isActive: false,
+      departureTime: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+    });
+
+    await expect(service.approve(ADMIN, 'req-1', {})).rejects.toThrow(
+      '目标班次已停售或已起飞，请驳回后重新申请',
+    );
+    expect(ordersStub.correctFlightSchedule).not.toHaveBeenCalled();
+  });
+
+  it('目标班次已起飞 → 400 指路重提', async () => {
+    primeApprove(OrderChangeKind.FLIGHT, { itemId: 'item-out', newScheduleId: 'sched-new' });
+    mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sched-new',
+      isActive: true,
+      departureTime: new Date(Date.now() - 60 * 60 * 1000),
+    });
+
+    await expect(service.approve(ADMIN, 'req-1', {})).rejects.toThrow(
+      '目标班次已停售或已起飞，请驳回后重新申请',
+    );
+    expect(ordersStub.correctFlightSchedule).not.toHaveBeenCalled();
+  });
+
+  it('升舱补差变了 → 400 带新旧金额，不按新价扣钱', async () => {
+    primeApprove(OrderChangeKind.CABIN, {
+      itemId: 'item-out',
+      toCabin: 'BUSINESS',
+      diffCny: 4800,
+    });
+    // 现状：航班差价涨到 3000/程，2 人 → ¥6000
+    mockPrisma.orderItem.findUnique.mockResolvedValue({
+      orderId: 'order-1',
+      flightScheduleId: 'sched-out',
+      hotelRoomTypeId: null,
+      flightCabin: 'ECONOMY',
+      quantity: 2,
+      flightSchedule: { flight: { businessUpgradeCnyPerLeg: 3000 } },
+    });
+
+    await expect(service.approve(ADMIN, 'req-1', {})).rejects.toThrow(
+      '升舱差价已变（申请时 ¥4,800，现 ¥6,000），请驳回后让代理重新提交',
+    );
+    expect(ordersStub.upgradeOrderItemCabin).not.toHaveBeenCalled();
+  });
+
+  it('升舱补差没变 → 照常执行', async () => {
+    primeApprove(OrderChangeKind.CABIN, {
+      itemId: 'item-out',
+      toCabin: 'BUSINESS',
+      diffCny: 4800,
+    });
+    mockPrisma.orderItem.findUnique.mockResolvedValue({
+      orderId: 'order-1',
+      flightScheduleId: 'sched-out',
+      hotelRoomTypeId: null,
+      flightCabin: 'ECONOMY',
+      quantity: 2,
+      flightSchedule: { flight: { businessUpgradeCnyPerLeg: 2400 } },
+    });
+    ordersStub.upgradeOrderItemCabin.mockResolvedValue({ order: { id: 'order-1' }, audit: {} });
+
+    await service.approve(ADMIN, 'req-1', {});
+    expect(ordersStub.upgradeOrderItemCabin).toHaveBeenCalled();
+  });
+
+  it('换酒店 · 带星级放行原因 → 原样透给换酒店通道', async () => {
+    primeApprove(OrderChangeKind.HOTEL, { itemId: 'item-hotel', toHotelRoomTypeId: 'room-new' });
+    ordersStub.swapItemHotel.mockResolvedValue({ order: { id: 'order-1' }, audit: {} });
+
+    await service.approve(ADMIN, 'req-1', {
+      designatedHotelStarMismatchReason: '客人自愿降档，差额已线下退回',
+    });
+
+    expect(ordersStub.swapItemHotel).toHaveBeenCalledWith(
+      'order-1',
+      'item-hotel',
+      expect.objectContaining({
+        designatedHotelStarMismatchReason: '客人自愿降档，差额已线下退回',
+      }),
+      expect.anything(),
+    );
+  });
+
+  it('订单早已是目标状态（上次执行成功但状态没回写）→ 不再执行一遍，备注写明', async () => {
+    primeApprove(OrderChangeKind.VISA, { toVisaStatus: VisaRequirement.NOT_NEEDED });
+    // 幂等判定读到的现状：签证状态已经是目标值
+    mockPrisma.order.findUnique
+      .mockResolvedValueOnce({ id: 'order-1', orderNumber: 'FTM2026090400001', deletedAt: null })
+      .mockResolvedValueOnce({ visaStatus: VisaRequirement.NOT_NEEDED });
+
+    await service.approve(ADMIN, 'req-1', {});
+
+    expect(ordersStub.setOrderVisaStatus).not.toHaveBeenCalled();
+    expect(mockPrisma.orderChangeRequest.updateMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        where: { id: 'req-1', status: OrderChangeRequestStatus.PENDING },
+        data: expect.objectContaining({
+          status: OrderChangeRequestStatus.APPROVED,
+          decisionNote: '已按申请内容生效（重试时发现已执行）',
+        }),
+      }),
+    );
+  });
+
+  it('执行中的占位未过期 → 409，不重复执行', async () => {
+    primeApprove(OrderChangeKind.VISA, { toVisaStatus: VisaRequirement.NOT_NEEDED });
+    mockPrisma.$queryRaw.mockResolvedValue([
+      {
+        id: 'req-1',
+        orderId: 'order-1',
+        kind: OrderChangeKind.VISA,
+        payload: {},
+        summary: '摘要',
+        status: OrderChangeRequestStatus.PENDING,
+        requestedById: 'agent-user-1',
+        decidedAt: new Date(Date.now() - 60 * 1000), // 1 分钟前占位，TTL 5 分钟内
+      },
+    ]);
+
+    await expect(service.approve(ADMIN, 'req-1', {})).rejects.toThrow('该申请正在处理中');
+    expect(ordersStub.setOrderVisaStatus).not.toHaveBeenCalled();
+  });
+
+  it('占位超过 5 分钟 TTL → 允许重试执行', async () => {
+    primeApprove(OrderChangeKind.VISA, { toVisaStatus: VisaRequirement.NOT_NEEDED });
+    mockPrisma.$queryRaw.mockResolvedValue([
+      {
+        id: 'req-1',
+        orderId: 'order-1',
+        kind: OrderChangeKind.VISA,
+        payload: { toVisaStatus: VisaRequirement.NOT_NEEDED },
+        summary: '摘要',
+        status: OrderChangeRequestStatus.PENDING,
+        requestedById: 'agent-user-1',
+        decidedAt: new Date(Date.now() - 6 * 60 * 1000),
+      },
+    ]);
+    ordersStub.setOrderVisaStatus.mockResolvedValue({ order: { id: 'order-1' } });
+
+    await service.approve(ADMIN, 'req-1', {});
+    expect(ordersStub.setOrderVisaStatus).toHaveBeenCalled();
+  });
+
+  it('收尾回写没命中 PENDING（并发驳回）→ 409 留声', async () => {
+    primeApprove(OrderChangeKind.VISA, { toVisaStatus: VisaRequirement.NOT_NEEDED });
+    ordersStub.setOrderVisaStatus.mockResolvedValue({ order: { id: 'order-1' } });
+    mockPrisma.orderChangeRequest.updateMany.mockResolvedValue({ count: 0 });
+
+    await expect(service.approve(ADMIN, 'req-1', {})).rejects.toThrow('申请状态已被其他操作改变');
+  });
+
+  it('收尾回写瞬时失败 → 重试后成功（订单已改完，不留脏队列）', async () => {
+    primeApprove(OrderChangeKind.VISA, { toVisaStatus: VisaRequirement.NOT_NEEDED });
+    ordersStub.setOrderVisaStatus.mockResolvedValue({ order: { id: 'order-1' } });
+    mockPrisma.orderChangeRequest.updateMany
+      .mockRejectedValueOnce(new Error('connection reset'))
+      .mockResolvedValueOnce({ count: 1 });
+
+    const res = await service.approve(ADMIN, 'req-1', {});
+    expect(res.request.status).toBe(OrderChangeRequestStatus.APPROVED);
+    expect(mockPrisma.orderChangeRequest.updateMany).toHaveBeenCalledTimes(2);
   });
 
   it('签证 → 调写签证状态通道', async () => {
@@ -527,6 +822,35 @@ describe('reject()', () => {
     expect(ordersStub.setOrderVisaStatus).not.toHaveBeenCalled();
   });
 
+  it('有人正在执行这条申请 → 驳回被拒 409（否则队列显示已驳回、订单却真改了）', async () => {
+    mockPrisma.$queryRaw.mockResolvedValue([
+      {
+        id: 'req-1',
+        status: OrderChangeRequestStatus.PENDING,
+        decidedAt: new Date(Date.now() - 30 * 1000),
+      },
+    ]);
+
+    await expect(service.reject(ADMIN, 'req-1', {})).rejects.toThrow('该申请正在执行中，请稍后刷新');
+    expect(mockPrisma.orderChangeRequest.update).not.toHaveBeenCalled();
+  });
+
+  it('占位已过 TTL（上次执行挂了）→ 允许驳回', async () => {
+    mockPrisma.$queryRaw.mockResolvedValue([
+      {
+        id: 'req-1',
+        status: OrderChangeRequestStatus.PENDING,
+        decidedAt: new Date(Date.now() - 6 * 60 * 1000),
+      },
+    ]);
+    mockPrisma.orderChangeRequest.update.mockResolvedValue(
+      requestFixture({ status: OrderChangeRequestStatus.REJECTED }),
+    );
+
+    const { request } = await service.reject(ADMIN, 'req-1', {});
+    expect(request.status).toBe(OrderChangeRequestStatus.REJECTED);
+  });
+
   it('代理点驳回 → 403', async () => {
     await expect(service.reject(AGENT, 'req-1', {})).rejects.toThrow('仅运营/管理员可驳回改单申请');
   });
@@ -595,6 +919,53 @@ describe('list() · 可见范围', () => {
     );
     expect(res.requests).toHaveLength(1);
     expect(res.nextCursor).toBe('req-a');
+  });
+
+  it('代理可查已处理的申请 + since 只要这个时间之后的，决定备注照常回', async () => {
+    const since = new Date('2026-09-01T00:00:00.000Z');
+    mockPrisma.orderChangeRequest.findMany.mockResolvedValue([
+      requestFixture({
+        status: OrderChangeRequestStatus.REJECTED,
+        decisionNote: '客人已确认不改',
+      }),
+    ]);
+
+    const res = await service.list(AGENT, {
+      status: OrderChangeRequestStatus.REJECTED,
+      since,
+      limit: 50,
+    });
+
+    expect(mockPrisma.orderChangeRequest.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          status: OrderChangeRequestStatus.REJECTED,
+          createdAt: { gte: since },
+        }),
+      }),
+    );
+    expect(res.requests[0].decisionNote).toBe('客人已确认不改');
+  });
+
+  it('代理侧列表：换酒店的成本一律不给（costDeltaCny=null，payload 里也没有）', async () => {
+    mockPrisma.orderChangeRequest.findMany.mockResolvedValue([
+      requestFixture({
+        kind: OrderChangeKind.HOTEL,
+        payload: {
+          itemId: 'item-hotel',
+          toHotelRoomTypeId: 'room-new',
+          costBeforeCny: 900,
+          costAfterCny: 1200,
+        },
+      }),
+    ]);
+
+    const agentView = await service.list(AGENT, { limit: 50 });
+    expect(agentView.requests[0].costDeltaCny).toBeNull();
+    expect(agentView.requests[0].payload).not.toHaveProperty('costBeforeCny');
+
+    const opsView = await service.list(ADMIN, { limit: 50 });
+    expect(opsView.requests[0].costDeltaCny).toBe(300);
   });
 });
 

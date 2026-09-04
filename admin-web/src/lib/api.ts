@@ -7425,6 +7425,10 @@ export interface OrderChangeRequest {
   status: OrderChangeRequestStatus;
   decidedAt: string | null;
   decisionNote: string | null;
+  /** CABIN 升舱差价（人民币元），所有角色可见——运营执行前用于告知代理将加收多少；非 CABIN 恒为 null。 */
+  amountCny: number | null;
+  /** HOTEL 换酒店导致的成本变化（人民币元，正负号即涨跌），仅运营可见——代理不该看到内部成本；非 HOTEL 或 AGENT 视角恒为 null。 */
+  costDeltaCny: number | null;
   appliedAt: string | null;
   /** 非空 = 上一次确认执行失败的原因；申请仍留在 PENDING，运营可改完再重试 */
   applyError: string | null;
@@ -7446,6 +7450,8 @@ function orderChangeRequestQuery(params?: {
   orderId?: string;
   limit?: number;
   cursor?: string;
+  /** 仅在拉 APPROVED/REJECTED 时有意义：只回最近这个时间点之后才 decided 的，配合「最近处理」小面板用。 */
+  since?: string;
 }): string {
   const usp = new URLSearchParams();
   if (params?.status) usp.set('status', params.status);
@@ -7453,6 +7459,7 @@ function orderChangeRequestQuery(params?: {
   if (params?.orderId) usp.set('orderId', params.orderId);
   if (params?.limit) usp.set('limit', String(params.limit));
   if (params?.cursor) usp.set('cursor', params.cursor);
+  if (params?.since) usp.set('since', params.since);
   const qs = usp.toString();
   return qs ? `?${qs}` : '';
 }
@@ -7498,6 +7505,7 @@ export const orderChangeRequestsApi = {
       orderId?: string;
       limit?: number;
       cursor?: string;
+      since?: string;
     },
   ) =>
     apiFetch<{ requests: OrderChangeRequest[]; nextCursor: string | null }>(
@@ -7510,11 +7518,16 @@ export const orderChangeRequestsApi = {
     apiFetch<{ count: number }>('/order-change-requests/pending-count', { token }),
 
   /** 运营确认执行：服务端调用既有纠错改航班/签证状态/换酒店/升舱端点并重新计价（如涉及）。
-   *  失败为 400（申请仍留在 PENDING，applyError 会被服务端记下，message 原样展示即可）。 */
-  approveOrderChangeRequest: (token: string, id: string) =>
+   *  失败为 400（申请仍留在 PENDING，applyError 会被服务端记下，message 原样展示即可）；
+   *  其中「放行原因」类 400（指定酒店星级与套餐档次不符）可带 designatedHotelStarMismatchReason 重试。 */
+  approveOrderChangeRequest: (
+    token: string,
+    id: string,
+    body?: { decisionNote?: string; designatedHotelStarMismatchReason?: string },
+  ) =>
     apiFetch<{ request: OrderChangeRequest; order: OrderSummary }>(
       `/order-change-requests/${id}/approve`,
-      { method: 'POST', token },
+      { method: 'POST', token, body: body ?? {} },
     ),
 
   /** 运营驳回，不改订单。 */

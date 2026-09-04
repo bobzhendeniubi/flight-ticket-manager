@@ -10,7 +10,12 @@ import { useAuth } from '../stores/auth';
 import { useConfirm } from './ConfirmDialog';
 import { Modal } from './Modal';
 import { formatDateTimeSecCn } from '../lib/datetime';
-import { ORDER_CHANGE_REQUEST_KIND_LABEL } from './orderChangeRequestShared';
+import {
+  formatSignedCny,
+  isStarMismatchApproveError,
+  ORDER_CHANGE_REQUEST_KIND_LABEL,
+  STAR_MISMATCH_REASON_MAX,
+} from './orderChangeRequestShared';
 
 const STATUS_TABS: Array<{ value: OrderChangeRequestStatus; label: string }> = [
   { value: 'PENDING', label: '待处理' },
@@ -41,8 +46,10 @@ export function OrderChangeRequestQueueModal({ onClose, onDecided, onOpenOrder }
   const [decidingId, setDecidingId] = useState<string | null>(null);
   const [decisionNoteById, setDecisionNoteById] = useState<Record<string, string>>({});
   const [rowErrorById, setRowErrorById] = useState<Record<string, string>>({});
+  const [rowRejectErrorById, setRowRejectErrorById] = useState<Record<string, string>>({});
   const [batchSubmitting, setBatchSubmitting] = useState(false);
   const [batchResult, setBatchResult] = useState<{ approved: number; failed: number } | null>(null);
+  const [batchError, setBatchError] = useState<string | null>(null);
 
   const load = useCallback(() => {
     if (!token) return;
@@ -50,6 +57,7 @@ export function OrderChangeRequestQueueModal({ onClose, onDecided, onOpenOrder }
     setLoadError(null);
     setSelectedIds(new Set());
     setBatchResult(null);
+    setBatchError(null);
     orderChangeRequestsApi
       .listOrderChangeRequests(token, { status: statusTab, limit: PAGE_LIMIT })
       .then((result) => {
@@ -88,14 +96,42 @@ export function OrderChangeRequestQueueModal({ onClose, onDecided, onOpenOrder }
     });
   };
 
+  /** 确认执行，途中若命中「放行原因」类 400（指定酒店星级与套餐档次不符），弹窗补填理由后原样重试一次。 */
+  const approveWithStarMismatchRetry = async (item: OrderChangeRequest, decisionNote: string) => {
+    try {
+      return await orderChangeRequestsApi.approveOrderChangeRequest(token, item.id, {
+        decisionNote: decisionNote || undefined,
+      });
+    } catch (e: unknown) {
+      if (!(e instanceof ApiError) || !isStarMismatchApproveError(e.message)) throw e;
+      const reason = window.prompt(
+        `${e.message}\n请填写「套餐档次与酒店星级不符 · 放行原因」（必填，${STAR_MISMATCH_REASON_MAX} 字以内，随订单留档备查）：`,
+        '',
+      );
+      if (reason === null) throw e; // 取消 = 维持原错误，不重试
+      const reasonText = reason.trim();
+      if (!reasonText || reasonText.length > STAR_MISMATCH_REASON_MAX) throw e;
+      return await orderChangeRequestsApi.approveOrderChangeRequest(token, item.id, {
+        decisionNote: decisionNote || undefined,
+        designatedHotelStarMismatchReason: reasonText,
+      });
+    }
+  };
+
   const decide = async (item: OrderChangeRequest, action: 'approve' | 'reject'): Promise<void> => {
     if (!token || decidingId) return;
     const note = (decisionNoteById[item.id] ?? '').trim();
+    const moneyLine =
+      action === 'approve' && item.kind === 'CABIN' && item.amountCny != null
+        ? `\n确认执行后将向本单加收 ¥${item.amountCny.toLocaleString()} 升舱差价（计入应收）。`
+        : action === 'approve' && item.kind === 'HOTEL' && item.costDeltaCny != null
+          ? `\n本单成本变化 ${formatSignedCny(item.costDeltaCny)}。`
+          : '';
     const confirmed = await confirm({
       title: action === 'approve' ? '确认执行改单申请？' : '驳回改单申请？',
       body:
         action === 'approve'
-          ? `订单 ${item.orderNumber ?? item.orderId}：确认后将按「${item.summary ?? ORDER_CHANGE_REQUEST_KIND_LABEL[item.kind]}」直接执行。`
+          ? `订单 ${item.orderNumber ?? item.orderId}：确认后将按「${item.summary ?? ORDER_CHANGE_REQUEST_KIND_LABEL[item.kind]}」直接执行。${moneyLine}`
           : `订单 ${item.orderNumber ?? item.orderId}：驳回后订单不变，代理会看到驳回原因。`,
       tone: action === 'approve' ? 'default' : 'danger',
       confirmText: action === 'approve' ? '确认执行' : '驳回',
@@ -105,7 +141,7 @@ export function OrderChangeRequestQueueModal({ onClose, onDecided, onOpenOrder }
     setDecidingId(item.id);
     try {
       if (action === 'approve') {
-        const result = await orderChangeRequestsApi.approveOrderChangeRequest(token, item.id);
+        const result = await approveWithStarMismatchRetry(item, note);
         setItems((prev) => prev.filter((candidate) => candidate.id !== item.id));
         setRowErrorById((prev) => {
           if (!(item.id in prev)) return prev;
@@ -117,6 +153,12 @@ export function OrderChangeRequestQueueModal({ onClose, onDecided, onOpenOrder }
       } else {
         await orderChangeRequestsApi.rejectOrderChangeRequest(token, item.id, note || undefined);
         setItems((prev) => prev.filter((candidate) => candidate.id !== item.id));
+        setRowRejectErrorById((prev) => {
+          if (!(item.id in prev)) return prev;
+          const next = { ...prev };
+          delete next[item.id];
+          return next;
+        });
         onDecided?.();
       }
     } catch (e: unknown) {
@@ -125,7 +167,7 @@ export function OrderChangeRequestQueueModal({ onClose, onDecided, onOpenOrder }
       if (action === 'approve') {
         setRowErrorById((prev) => ({ ...prev, [item.id]: message }));
       } else {
-        alert(message);
+        setRowRejectErrorById((prev) => ({ ...prev, [item.id]: message }));
       }
     } finally {
       setDecidingId(null);
@@ -143,6 +185,7 @@ export function OrderChangeRequestQueueModal({ onClose, onDecided, onOpenOrder }
     });
     if (!confirmed) return;
     setBatchSubmitting(true);
+    setBatchError(null);
     try {
       const res = await orderChangeRequestsApi.batchApproveOrderChangeRequests(token, ids);
       setBatchResult({ approved: res.approved, failed: res.failed });
@@ -154,12 +197,15 @@ export function OrderChangeRequestQueueModal({ onClose, onDecided, onOpenOrder }
           if (row.error) nextRowErrors[row.id] = row.error;
         }
       }
-      setItems((prev) => prev.filter((item) => failedIds.has(item.id)));
+      // 只摘掉「本次选中且成功」的行——未选中的行、以及选中但失败的行都要留在列表里，
+      // 之前 filter(failedIds.has(...)) 把没选的行也一并冲掉了（H3）。
+      const selectedIdSet = new Set(ids);
+      setItems((prev) => prev.filter((item) => !selectedIdSet.has(item.id) || failedIds.has(item.id)));
       setRowErrorById((prev) => ({ ...prev, ...nextRowErrors }));
       setSelectedIds(new Set());
       onDecided?.();
     } catch (e: unknown) {
-      alert(e instanceof ApiError ? e.message : '批量确认执行失败，请稍后重试');
+      setBatchError(e instanceof ApiError ? e.message : '批量确认执行失败，请稍后重试');
     } finally {
       setBatchSubmitting(false);
     }
@@ -198,6 +244,11 @@ export function OrderChangeRequestQueueModal({ onClose, onDecided, onOpenOrder }
         {batchResult && (
           <div className="mb-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-xs text-emerald-800">
             批量确认执行完成：成功 {batchResult.approved} 条，失败 {batchResult.failed} 条（失败原因见对应行）。
+          </div>
+        )}
+        {batchError && (
+          <div className="mb-3 rounded-lg border border-rose-200 bg-rose-50 px-3 py-2 text-xs text-rose-700">
+            {batchError}
           </div>
         )}
 
@@ -248,6 +299,16 @@ export function OrderChangeRequestQueueModal({ onClose, onDecided, onOpenOrder }
                     <td className="py-2 pr-3 text-xs text-ink-soft">{ORDER_CHANGE_REQUEST_KIND_LABEL[item.kind]}</td>
                     <td className="py-2 pr-3 text-xs text-ink-soft">
                       <div className="max-w-[220px]" title={item.summary ?? undefined}>{item.summary ?? '—'}</div>
+                      {item.kind === 'CABIN' && item.amountCny != null && (
+                        <div className="mt-1 text-[11px] font-medium text-indigo-700">
+                          补差 ¥{item.amountCny.toLocaleString()}（计入应收）
+                        </div>
+                      )}
+                      {item.kind === 'HOTEL' && item.costDeltaCny != null && (
+                        <div className="mt-1 text-[11px] font-medium text-amber-700">
+                          成本 {formatSignedCny(item.costDeltaCny)}
+                        </div>
+                      )}
                       {rowErrorById[item.id] && (
                         <div className="mt-1 rounded bg-rose-50 px-1.5 py-1 text-[11px] text-rose-700">
                           上次执行失败：{rowErrorById[item.id]}
@@ -256,6 +317,11 @@ export function OrderChangeRequestQueueModal({ onClose, onDecided, onOpenOrder }
                       {!rowErrorById[item.id] && item.applyError && (
                         <div className="mt-1 rounded bg-rose-50 px-1.5 py-1 text-[11px] text-rose-700">
                           上次执行失败：{item.applyError}
+                        </div>
+                      )}
+                      {rowRejectErrorById[item.id] && (
+                        <div className="mt-1 rounded bg-rose-50 px-1.5 py-1 text-[11px] text-rose-700">
+                          上次驳回失败：{rowRejectErrorById[item.id]}
                         </div>
                       )}
                       {!isPendingTab && item.decisionNote && (

@@ -41,6 +41,7 @@ const { mockPrisma } = vi.hoisted(() => ({
     },
     bundleChangeRequest: { count: vi.fn() },
     settlementRequest: { count: vi.fn() },
+    orderChangeRequest: { count: vi.fn() },
     prepaymentTransaction: { findFirst: vi.fn() },
     fulfillmentTask: {
       count: vi.fn(),
@@ -151,6 +152,7 @@ const armCleanGates = () => {
   mockPrisma.commissionRecord.findMany.mockResolvedValue([]);
   mockPrisma.bundleChangeRequest.count.mockResolvedValue(0);
   mockPrisma.settlementRequest.count.mockResolvedValue(0);
+  mockPrisma.orderChangeRequest.count.mockResolvedValue(0);
   // 无预存余额抵扣流水（闸 10c 干净）
   mockPrisma.prepaymentTransaction.findFirst.mockResolvedValue(null);
   mockPrisma.refund.count.mockResolvedValue(0);
@@ -360,6 +362,15 @@ describe('拆单 · 准入闸矩阵（preview 返回人话 blocker）', () => {
     const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
     expect(r.eligible).toBe(false);
     expect(r.blockers.join()).toContain('待确认的套餐改档申请');
+  });
+
+  it('有待处理的改单申请 → 拒拆（申请里冻的是拆之前那一行）', async () => {
+    armCleanGates();
+    mockPrisma.orderChangeRequest.count.mockResolvedValue(1);
+    mockPrisma.order.findUnique.mockResolvedValue(baseOrder());
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
+    expect(r.eligible).toBe(false);
+    expect(r.blockers.join()).toContain('待处理的改单申请');
   });
 
   it('升舱行（闸 11 已放开）→ 可拆，回显每程升舱位与建议搬走数', async () => {

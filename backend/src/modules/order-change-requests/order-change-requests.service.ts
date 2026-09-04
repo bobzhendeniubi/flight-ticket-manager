@@ -24,7 +24,13 @@ import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '.
 import { getDescendantAgentIds } from '../../lib/agent-tree.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { determineFlightLegItems } from '../orders/ticketing-cap.js';
-import { OrderService } from '../orders/orders.service.js';
+import {
+  computeCabinUpgradeDiffCny,
+  computeSwapHotelCostSnapshot,
+  ORDER_STATUS_LABEL_ZH,
+  OrderService,
+  SEAT_HOLDING_STATUSES,
+} from '../orders/orders.service.js';
 import {
   cabinChangeSubmitSchema,
   flightChangeSubmitSchema,
@@ -43,8 +49,29 @@ export const ORDER_CHANGE_VISA_HAS_VISA_MESSAGE = '「已签证」由签证岗�
 export const ORDER_CHANGE_BATCH_UNSUPPORTED_KIND_MESSAGE =
   '换酒店 / 升舱要按行选，只能单张单提交，不支持批量';
 export const ORDER_CHANGE_REQUEST_REASON_TEXT = '改单申请（运营确认）';
-/** 确认执行的处理中占位有效期：超过视为上次执行中途挂掉，允许再次确认。 */
-export const APPROVE_CLAIM_TTL_MS = 2 * 60 * 1000;
+/**
+ * 确认执行的处理中占位有效期：超过视为上次执行中途挂掉，允许再次确认。
+ *
+ * 定 5 分钟而不是 2 分钟：真正执行的那几条通道（换酒店要逐晚校验房量、改班次要搬座位并
+ * 重算立减、升舱要放旧座拿新座）在大单上跑满一两分钟是正常的。占位过早失效，第二个运营
+ * 点下去就会与仍在执行的那次撞车 —— 同一条申请被执行两遍。宁可让「真挂掉」的那条多等
+ * 三分钟，也不能让并发执行溜进来。
+ */
+export const APPROVE_CLAIM_TTL_MS = 5 * 60 * 1000;
+/** 按航段（去程/回程）定位时撞上已释放座位的航段：绝不退而求其次落到另一段上。 */
+export const ORDER_CHANGE_RELEASED_LEG_MESSAGE = '该航段座位已释放，无法按航段申请';
+/** 确认时目标班次已停售 / 已起飞（提交到确认之间班次变了）。 */
+export const ORDER_CHANGE_STALE_SCHEDULE_MESSAGE = '目标班次已停售或已起飞，请驳回后重新申请';
+/** 确认时发现订单早已是申请里的目标状态（上次执行成功但回写状态没落地）。 */
+export const ORDER_CHANGE_ALREADY_APPLIED_NOTE = '已按申请内容生效（重试时发现已执行）';
+/** 有人正在执行这条申请时点驳回。 */
+export const ORDER_CHANGE_REJECT_IN_FLIGHT_MESSAGE = '该申请正在执行中，请稍后刷新';
+/** 收尾回写状态时发现申请已被别的操作改掉（驳回/另一次确认）。 */
+export const ORDER_CHANGE_STATUS_RACED_MESSAGE = '申请状态已被其他操作改变';
+/** 收尾回写状态的重试次数：连接抖动/瞬时超时不该让「订单已改完」的单卡在 PENDING。 */
+const FINAL_STATUS_WRITE_MAX_ATTEMPTS = 3;
+/** 成本字段只给运营看：代理拿到的 payload 里这几个键一律抹掉。 */
+const OPS_ONLY_PAYLOAD_KEYS = ['costBeforeCny', 'costAfterCny'] as const;
 
 const VISA_LABEL: Record<VisaRequirement, string> = {
   [VisaRequirement.NOT_NEEDED]: '不需要',
@@ -72,11 +99,17 @@ const SUBMIT_ORDER_SELECT = {
   orderNumber: true,
   agentId: true,
   deletedAt: true,
+  // 占座态闸要用（非占座态的单提了也执行不了，见 insertRequest）。
+  status: true,
   visaStatus: true,
   items: {
     select: {
       id: true,
       kind: true,
+      // 升舱差价 = 每人每航段 × 该行人数；换酒店成本 = 每间每晚 × 晚数(quantity) × 房数。
+      quantity: true,
+      roomsBilled: true,
+      totalCostCny: true,
       flightScheduleId: true,
       flightCabin: true,
       hotelRoomTypeId: true,
@@ -85,7 +118,7 @@ const SUBMIT_ORDER_SELECT = {
           id: true,
           departureTime: true,
           departureTz: true,
-          flight: { select: { flightNumber: true } },
+          flight: { select: { flightNumber: true, businessUpgradeCnyPerLeg: true } },
         },
       },
       hotelRoomType: {
@@ -130,10 +163,40 @@ interface DecisionAudit {
   summary: string;
 }
 
+/** payload 里读一个数字字段；缺失 / 不是有限数一律 null（老申请没有这些快照键）。 */
+function readPayloadNumber(payload: Prisma.JsonValue, key: string): number | null {
+  if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) return null;
+  const value = (payload as Record<string, unknown>)[key];
+  return typeof value === 'number' && Number.isFinite(value) ? value : null;
+}
+
+/** 代理侧的 payload：抹掉成本快照键（我方进价，对外身份一个字都不给）。 */
+function stripOpsOnlyPayload(payload: Prisma.JsonValue): Prisma.JsonValue {
+  if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) return payload;
+  const rest = { ...(payload as Record<string, unknown>) };
+  for (const key of OPS_ONLY_PAYLOAD_KEYS) delete rest[key];
+  return rest as Prisma.JsonValue;
+}
+
+/**
+ * 序列化一条申请。
+ *
+ * 两个派生金额字段：
+ *   · amountCny —— 升舱补差（CABIN），**所有角色都看得到**：这笔钱最终由代理的客人出，
+ *     提交时就该白纸黑字写清楚，不能等运营点完确认才冒出来。
+ *   · costDeltaCny —— 换酒店的成本变动（HOTEL），**只给运营**：那是我方进价，
+ *     代理侧连 payload 里的成本快照键都一并抹掉（见 stripOpsOnlyPayload）。
+ */
 function serializeOrderChangeRequest(
   r: OrderChangeRequestRow,
-  requestedByLabel: string | null = null,
+  opts: { requestedByLabel?: string | null; canSeeCost: boolean },
 ) {
+  const costBefore = readPayloadNumber(r.payload, 'costBeforeCny');
+  const costAfter = readPayloadNumber(r.payload, 'costAfterCny');
+  const costDeltaCny =
+    opts.canSeeCost && r.kind === OrderChangeKind.HOTEL && costBefore != null && costAfter != null
+      ? costAfter - costBefore
+      : null;
   return {
     id: r.id,
     orderId: r.orderId,
@@ -141,10 +204,10 @@ function serializeOrderChangeRequest(
     agentId: r.agentId,
     agentName: r.agent ? r.agent.companyName || r.agent.contactName : null,
     requestedById: r.requestedById,
-    requestedByLabel,
+    requestedByLabel: opts.requestedByLabel ?? null,
     batchId: r.batchId,
     kind: r.kind,
-    payload: r.payload,
+    payload: opts.canSeeCost ? r.payload : stripOpsOnlyPayload(r.payload),
     summary: r.summary,
     note: r.note,
     status: r.status,
@@ -154,7 +217,26 @@ function serializeOrderChangeRequest(
     appliedAt: r.appliedAt?.toISOString() ?? null,
     applyError: r.applyError,
     createdAt: r.createdAt.toISOString(),
+    amountCny: r.kind === OrderChangeKind.CABIN ? readPayloadNumber(r.payload, 'diffCny') : null,
+    costDeltaCny,
   };
+}
+
+/** 运营（含管理员）才看得到成本。 */
+function canSeeCost(actor: OrderChangeRequestActor): boolean {
+  return actor.role === UserRole.ADMIN || actor.role === UserRole.STAFF;
+}
+
+/** 金额千分位（¥4,800）：摘要是给人看的，别把裸数字甩上去。 */
+function formatCny(amount: number): string {
+  return amount.toLocaleString('en-US');
+}
+
+/** Prisma Decimal / number / null → number | null（两种形态都可能，统一走 toString）。 */
+function toNumberOrNull(value: unknown): number | null {
+  if (value == null) return null;
+  const n = Number(String(value));
+  return Number.isFinite(n) ? n : null;
 }
 export type SerializedOrderChangeRequest = ReturnType<typeof serializeOrderChangeRequest>;
 
@@ -210,7 +292,7 @@ export class OrderChangeRequestsService {
       note: body.note,
       batchId: null,
     });
-    return serializeOrderChangeRequest(created);
+    return serializeOrderChangeRequest(created, { canSeeCost: canSeeCost(actor) });
   }
 
   /**
@@ -310,6 +392,14 @@ export class OrderChangeRequestsService {
         if (ownAgentId && order.agentId !== ownAgentId) {
           throw new ForbiddenError('只能对自己名下的订单提交改单申请');
         }
+        // 占座态闸：改班次/换酒店/升舱在执行侧都要求订单当前真的持有座位与履约（各通道自带同一道闸）。
+        // 非占座态（已取消/已退款/超时/草稿…）的单提上来，运营点确认时必然被底层拒掉 ——
+        // 与其攒一队执行不了的申请，不如提交这一刻就说清楚。
+        if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
+          throw new BadRequestError(
+            `订单当前状态（${ORDER_STATUS_LABEL_ZH[order.status] ?? order.status}）不可提交改单申请`,
+          );
+        }
 
         const resolved = await this.resolveChange(tx, order, kind, rawPayload);
 
@@ -375,6 +465,15 @@ export class OrderChangeRequestsService {
     );
     const legs = determineFlightLegItems(flightItems);
     if (input.leg) {
+      // ── 已释放航段：绝不退而求其次落到另一段上 ────────────────────────────────
+      // determineFlightLegItems 是「按出发时刻排序取前两条**有班次**的行」：no-show 释放 /
+      // 取消航段会把那一行的 flightScheduleId 置空（座位已放回库存），该行随即退出判定 ——
+      // 于是回程行会顶上来变成 legs.outbound。批量按航段提交时，这等于把「改去程」
+      // 静默改到了回程头上。本单只要还有一条座位已释放的机票行，就一律拒，不猜。
+      const hasReleasedLeg = order.items.some(
+        (i) => i.kind === OrderItemKind.FLIGHT && i.flightScheduleId === null,
+      );
+      if (hasReleasedLeg) throw new BadRequestError(ORDER_CHANGE_RELEASED_LEG_MESSAGE);
       const picked = input.leg === 'OUTBOUND' ? legs.outbound : legs.return;
       if (!picked) {
         throw new BadRequestError(
@@ -474,7 +573,12 @@ export class OrderChangeRequestsService {
 
     const target = await tx.hotelRoomType.findUnique({
       where: { id: input.toHotelRoomTypeId },
-      select: { id: true, name: true, hotel: { select: { name: true, isActive: true } } },
+      select: {
+        id: true,
+        name: true,
+        costPriceCny: true,
+        hotel: { select: { name: true, isActive: true } },
+      },
     });
     if (!target) throw new NotFoundError('目标酒店房型不存在');
     if (!target.hotel.isActive) throw new BadRequestError('目标酒店已下架');
@@ -482,13 +586,30 @@ export class OrderChangeRequestsService {
     const fromHotelName = hotelLabel(item.hotelRoomType?.hotel.name, item.hotelRoomType?.name);
     const toHotelName = hotelLabel(target.hotel.name, target.name) ?? target.name;
 
+    // ── 成本快照（只给运营看）：换酒店「差价恒 0」说的是**卖价**，我方进价该换是要换的。
+    // 口径与 swapItemHotel 的重打快照一字不差：HOTEL 行 = 新房型成本价 × 晚数(quantity) × 房数；
+    // BUNDLE 行建单时没快照过酒店成本（totalCostCny 覆盖整包），换酒店也不重算 → 前后一致。
+    const roomsBilled = toNumberOrNull(item.roomsBilled) ?? 1;
+    const costBeforeCny = toNumberOrNull(item.totalCostCny);
+    const costAfterCny =
+      item.kind === OrderItemKind.HOTEL
+        ? computeSwapHotelCostSnapshot({
+            newCostPriceCny: toNumberOrNull(target.costPriceCny),
+            nights: item.quantity,
+            rooms: roomsBilled,
+          }).totalCostCny
+        : costBeforeCny;
+
     return {
       payload: {
         itemId: item.id,
         toHotelRoomTypeId: target.id,
         toHotelName,
         fromHotelName,
+        costBeforeCny,
+        costAfterCny,
       },
+      // 摘要不带成本 —— 它是所有角色共用的一句话，成本走 costDeltaCny（运营专属）。
       summary: `酒店 ${fromHotelName ?? '待落位'} → ${toHotelName}`,
     };
   }
@@ -501,12 +622,28 @@ export class OrderChangeRequestsService {
     const item = order.items.find((i) => i.id === input.itemId);
     if (!item) throw new BadRequestError('所选订单行不属于本订单');
     if (item.kind !== OrderItemKind.FLIGHT) throw new BadRequestError('只有机票行可以升舱');
+    if (!item.flightScheduleId) throw new BadRequestError(ORDER_CHANGE_RELEASED_LEG_MESSAGE);
     const fromCabin = item.flightCabin ?? CabinClass.ECONOMY;
     if (fromCabin === CabinClass.BUSINESS) throw new BadRequestError('该航段已经是商务舱');
 
+    // ── 补差要在提交这一刻算清楚并写进摘要 ──────────────────────────────────────
+    // 升舱是这四类改单里**唯一动钱**的一类：执行时 upgradeOrderItemCabin 会按
+    // 「每人每航段差价 × 该行人数」抬 total，这笔钱最终由代理的客人出。
+    // 不在申请上写明金额，等于让人闭眼签字。取价口径与执行侧同一个纯函数。
+    const diffCny = computeCabinUpgradeDiffCny(
+      item.flightSchedule?.flight.businessUpgradeCnyPerLeg ?? 0,
+      item.quantity,
+    );
+    if (diffCny <= 0) {
+      // 与升舱通道同一句话：没配差价就没法报价，先去航班管理补，别攒一条执行不了的申请。
+      throw new BadRequestError('该航班未配置商务舱差价，请先在航班管理维护');
+    }
+
     return {
-      payload: { itemId: item.id, toCabin: CabinClass.BUSINESS, fromCabin },
-      summary: `${CABIN_LABEL[fromCabin]} → ${CABIN_LABEL[CabinClass.BUSINESS]}`,
+      payload: { itemId: item.id, toCabin: CabinClass.BUSINESS, fromCabin, diffCny },
+      summary:
+        `${CABIN_LABEL[fromCabin]} → ${CABIN_LABEL[CabinClass.BUSINESS]}` +
+        `（补差 ¥${formatCny(diffCny)}）`,
     };
   }
 
@@ -517,9 +654,13 @@ export class OrderChangeRequestsService {
     query: ListOrderChangeRequestsQuery,
   ): Promise<{ requests: SerializedOrderChangeRequest[]; nextCursor: string | null }> {
     const where: Prisma.OrderChangeRequestWhereInput = {};
+    // status 不按角色分档：代理提完申请要能回来看「运营到底确认了还是驳回了、备注写了什么」，
+    // 只筛得到 PENDING 等于把处理结果藏起来。可见范围仍由下面的 agentId 收口。
     if (query.status) where.status = query.status;
     if (query.kind) where.kind = query.kind;
     if (query.orderId) where.orderId = query.orderId;
+    // since：只要这个时间点之后新建的申请（代理侧轮询「我这批单有没有新结果」用）。
+    if (query.since) where.createdAt = { gte: query.since };
 
     if (actor.role === UserRole.AGENT) {
       // 代理只看自己（含下级）的申请；显式传 agentId 时与可见集合取交集，越权筛不出别人的单。
@@ -544,9 +685,13 @@ export class OrderChangeRequestsService {
     const page = hasMore ? rows.slice(0, query.limit) : rows;
     const labels = await this.requestedByLabels(page.map((r) => r.requestedById));
 
+    const cost = canSeeCost(actor);
     return {
       requests: page.map((row) =>
-        serializeOrderChangeRequest(row, labels.get(row.requestedById) ?? null),
+        serializeOrderChangeRequest(row, {
+          requestedByLabel: labels.get(row.requestedById) ?? null,
+          canSeeCost: cost,
+        }),
       ),
       nextCursor: hasMore ? (page[page.length - 1]?.id ?? null) : null,
     };
@@ -638,27 +783,37 @@ export class OrderChangeRequestsService {
       };
     });
 
+    const opsActor = { userId: actor.userId, role: actor.role, agentId: actor.agentId };
+
+    // ── 幂等：订单早已是申请里的目标状态 → 不再执行第二遍 ──────────────────────
+    // 成因是「执行成功了，但收尾回写状态那一步没落地」（进程被杀、连接断在中间）：
+    // 申请还挂在 PENDING，运营看队列里还有一条就会再点一次。真的再执行一遍就是
+    // 第二次搬座位 / 第二次抬 total。先对一遍现状，对上了就只补状态。
+    const alreadyApplied = await this.detectAlreadyApplied(claim.orderId, claim.kind, claim.payload);
+
     let order: unknown;
-    try {
-      order = await this.execute(claim.orderId, claim.kind, claim.payload, actor);
-    } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      // 没执行成 → 撤掉处理中标记、把原因记下来，申请原样留在队列里（状态一直是 PENDING）。
-      await prisma.orderChangeRequest.updateMany({
-        where: { id, status: OrderChangeRequestStatus.PENDING, appliedAt: null },
-        data: { decidedById: null, decidedAt: null, decisionNote: null, applyError: message },
-      });
-      throw new BadRequestError(message);
+    if (alreadyApplied) {
+      order = await this.orders.getOrder(claim.orderId, opsActor);
+    } else {
+      try {
+        order = await this.execute(claim.orderId, claim.kind, claim.payload, actor, body);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        // 没执行成 → 撤掉处理中标记、把原因记下来，申请原样留在队列里（状态一直是 PENDING）。
+        await prisma.orderChangeRequest.updateMany({
+          where: { id, status: OrderChangeRequestStatus.PENDING, appliedAt: null },
+          data: { decidedById: null, decidedAt: null, decisionNote: null, applyError: message },
+        });
+        throw new BadRequestError(message);
+      }
     }
 
-    await prisma.orderChangeRequest.update({
-      where: { id },
-      data: {
-        status: OrderChangeRequestStatus.APPROVED,
-        appliedAt: new Date(),
-        applyError: null,
-      },
-    });
+    // 幂等分支要把「这次没真执行」写进备注（运营在队列里一眼看得出）；
+    // 正常分支的备注在占位那一步已经写过，这里不重复覆盖。
+    const decisionNoteOverride = alreadyApplied
+      ? [ORDER_CHANGE_ALREADY_APPLIED_NOTE, body.decisionNote?.trim()].filter(Boolean).join('；')
+      : undefined;
+    await this.finalizeApproved(id, decisionNoteOverride);
 
     const finalRow = (await prisma.orderChangeRequest.findUniqueOrThrow({
       where: { id },
@@ -666,7 +821,7 @@ export class OrderChangeRequestsService {
     })) as OrderChangeRequestRow;
 
     return {
-      request: serializeOrderChangeRequest(finalRow),
+      request: serializeOrderChangeRequest(finalRow, { canSeeCost: canSeeCost(actor) }),
       order,
       audit: {
         orderId: claim.orderId,
@@ -679,6 +834,126 @@ export class OrderChangeRequestsService {
   }
 
   /**
+   * 收尾回写状态：条件更新（status 仍是 PENDING 才写），并对瞬时失败重试。
+   *
+   * 用 updateMany 而不是 update：到这一步订单已经真的改完了，如果此刻申请行被并发的
+   * 驳回 / 另一次确认翻走，无条件 update 会把别人的决定悄悄盖掉。条件不命中 → 409 留声，
+   * 让运营回队列核对这张单（订单侧的改动是已生效的事实，不会因为这条 409 回滚）。
+   */
+  private async finalizeApproved(id: string, decisionNoteOverride?: string | null): Promise<void> {
+    const data = {
+      status: OrderChangeRequestStatus.APPROVED,
+      appliedAt: new Date(),
+      applyError: null,
+      ...(decisionNoteOverride !== undefined ? { decisionNote: decisionNoteOverride } : {}),
+    };
+    let lastError: unknown = null;
+    for (let attempt = 1; attempt <= FINAL_STATUS_WRITE_MAX_ATTEMPTS; attempt += 1) {
+      try {
+        const { count } = await prisma.orderChangeRequest.updateMany({
+          where: { id, status: OrderChangeRequestStatus.PENDING },
+          data,
+        });
+        if (count === 0) {
+          console.error('[order-change-requests] 收尾回写状态未命中 PENDING（并发驳回/重复确认）', {
+            requestId: id,
+          });
+          throw new ConflictError(ORDER_CHANGE_STATUS_RACED_MESSAGE);
+        }
+        return;
+      } catch (err) {
+        if (err instanceof ConflictError) throw err;
+        // 瞬时错误（连接抖动 / 超时）：订单侧的改动**已经落库**，这一步放弃就会留下
+        // 「订单改了、申请还在 PENDING」的脏队列 —— 多试两次比留脏账划算。
+        lastError = err;
+        console.error('[order-change-requests] 收尾回写状态失败，第', attempt, '次', err);
+      }
+    }
+    throw lastError;
+  }
+
+  /**
+   * 订单当前是不是**已经**是申请里的目标状态（幂等重试判定）。
+   * 只对最终态取值，不看过程：目标班次/目标房型/目标签证状态/已是商务舱。
+   */
+  private async detectAlreadyApplied(
+    orderId: string,
+    kind: OrderChangeKind,
+    payload: Record<string, unknown>,
+  ): Promise<boolean> {
+    if (kind === OrderChangeKind.VISA) {
+      const order = await prisma.order.findUnique({
+        where: { id: orderId },
+        select: { visaStatus: true },
+      });
+      return order?.visaStatus != null && order.visaStatus === payload.toVisaStatus;
+    }
+    const itemId = typeof payload.itemId === 'string' ? payload.itemId : null;
+    if (!itemId) return false;
+    const item = await prisma.orderItem.findUnique({
+      where: { id: itemId },
+      select: { orderId: true, flightScheduleId: true, hotelRoomTypeId: true, flightCabin: true },
+    });
+    // 行已经不在这张单上（被拆走/删了）→ 不算「已生效」，交给通道自己报错。
+    if (!item || item.orderId !== orderId) return false;
+    switch (kind) {
+      case OrderChangeKind.FLIGHT:
+        return item.flightScheduleId != null && item.flightScheduleId === payload.newScheduleId;
+      case OrderChangeKind.HOTEL:
+        return item.hotelRoomTypeId != null && item.hotelRoomTypeId === payload.toHotelRoomTypeId;
+      case OrderChangeKind.CABIN:
+        return item.flightCabin === CabinClass.BUSINESS;
+      default:
+        return false;
+    }
+  }
+
+  /**
+   * 改班次执行前复检目标班次：提交到确认之间隔着几小时甚至几天，班次可能已经停售或已起飞。
+   * 提交时那一刻的快照不作数，执行前一律重读现状（与 payload 只作展示留痕的口径一致）。
+   */
+  private async assertTargetScheduleStillUsable(scheduleId: string): Promise<void> {
+    const target = await prisma.flightSchedule.findUnique({
+      where: { id: scheduleId },
+      select: { id: true, isActive: true, departureTime: true },
+    });
+    if (!target || !target.isActive || target.departureTime.getTime() <= Date.now()) {
+      throw new BadRequestError(ORDER_CHANGE_STALE_SCHEDULE_MESSAGE);
+    }
+  }
+
+  /**
+   * 升舱执行前复检补差：申请上写的金额是代理（和他的客人）看过并认下的那个数。
+   * 航班改了 businessUpgradeCnyPerLeg、或这行人数变了，执行下去就是按新价扣钱 ——
+   * 拒掉，让运营驳回后重新走一遍「代理看得见金额」的流程。
+   * 老申请（payload 里没有 diffCny 快照）不判，没有可比对的基准。
+   */
+  private async assertCabinDiffUnchanged(payload: Record<string, unknown>): Promise<void> {
+    const snapshot = readPayloadNumber(payload as Prisma.JsonValue, 'diffCny');
+    if (snapshot == null) return;
+    const itemId = typeof payload.itemId === 'string' ? payload.itemId : null;
+    if (!itemId) return;
+    const item = await prisma.orderItem.findUnique({
+      where: { id: itemId },
+      select: {
+        quantity: true,
+        flightSchedule: { select: { flight: { select: { businessUpgradeCnyPerLeg: true } } } },
+      },
+    });
+    if (!item) return; // 行不在了：交给升舱通道自己报「订单项不存在」
+    const current = computeCabinUpgradeDiffCny(
+      item.flightSchedule?.flight.businessUpgradeCnyPerLeg ?? 0,
+      item.quantity,
+    );
+    if (current !== snapshot) {
+      throw new BadRequestError(
+        `升舱差价已变（申请时 ¥${formatCny(snapshot)}，现 ¥${formatCny(current)}），` +
+          '请驳回后让代理重新提交',
+      );
+    }
+  }
+
+  /**
    * 真正改订单的一步：一律回调运营侧既有通道，actor = 点确认的那个运营
    * （所以自助窗口闸、自助差价归零那套代理规则统统不适用，走的就是运营路径）。
    */
@@ -687,10 +962,12 @@ export class OrderChangeRequestsService {
     kind: OrderChangeKind,
     payload: Record<string, unknown>,
     actor: OrderChangeRequestActor,
+    body: DecideOrderChangeRequestBody,
   ): Promise<unknown> {
     const opsActor = { userId: actor.userId, role: actor.role, agentId: actor.agentId };
     switch (kind) {
       case OrderChangeKind.FLIGHT: {
+        await this.assertTargetScheduleStillUsable(String(payload.newScheduleId));
         const { order } = await this.orders.correctFlightSchedule(
           orderId,
           String(payload.itemId),
@@ -716,12 +993,18 @@ export class OrderChangeRequestsService {
             // 改单申请永远不动钱：换酒店差价恒 0。
             feeCny: 0,
             note: ORDER_CHANGE_REQUEST_REASON_TEXT,
+            // 套餐档次与酒店星级不符时，换酒店通道要求运营写明放行原因才过。
+            // 这是**运营在确认这一刻**做的定价决定（代理侧那条路是硬拒的），所以取自确认请求体。
+            ...(body.designatedHotelStarMismatchReason
+              ? { designatedHotelStarMismatchReason: body.designatedHotelStarMismatchReason }
+              : {}),
           },
           opsActor,
         );
         return order;
       }
       case OrderChangeKind.CABIN: {
+        await this.assertCabinDiffUnchanged(payload);
         const { order } = await this.orders.upgradeOrderItemCabin(
           orderId,
           String(payload.itemId),
@@ -777,12 +1060,19 @@ export class OrderChangeRequestsService {
 
     const updated = (await prisma.$transaction(async (tx) => {
       const rows = await tx.$queryRaw<
-        Array<{ id: string; status: OrderChangeRequestStatus }>
-      >`SELECT id, status FROM "OrderChangeRequest" WHERE id = ${id} FOR UPDATE`;
+        Array<{ id: string; status: OrderChangeRequestStatus; decidedAt: Date | null }>
+      >`SELECT id, status, "decidedAt" FROM "OrderChangeRequest" WHERE id = ${id} FOR UPDATE`;
       const row = rows[0];
       if (!row) throw new NotFoundError('改单申请不存在');
       if (row.status !== OrderChangeRequestStatus.PENDING) {
         throw new ConflictError(`该申请当前状态为 ${row.status}，不可重复处理`);
+      }
+      // ── 执行中不许驳回 ────────────────────────────────────────────────────
+      // 确认执行期间申请一直是 PENDING（只有 decidedAt 占位），此刻驳回会翻成 REJECTED，
+      // 而那边的订单正被真的改着：改完收尾时状态已经不是 PENDING —— 队列显示「已驳回」，
+      // 订单却实实在在改了。占位有效期内一律拒，让运营刷新看执行结果。
+      if (row.decidedAt && Date.now() - row.decidedAt.getTime() < APPROVE_CLAIM_TTL_MS) {
+        throw new ConflictError(ORDER_CHANGE_REJECT_IN_FLIGHT_MESSAGE);
       }
       return tx.orderChangeRequest.update({
         where: { id },
@@ -797,7 +1087,7 @@ export class OrderChangeRequestsService {
     })) as OrderChangeRequestRow;
 
     return {
-      request: serializeOrderChangeRequest(updated),
+      request: serializeOrderChangeRequest(updated, { canSeeCost: canSeeCost(actor) }),
       audit: {
         orderId: updated.orderId,
         orderNumber: updated.order?.orderNumber ?? null,

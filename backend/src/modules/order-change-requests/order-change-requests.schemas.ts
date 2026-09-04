@@ -66,6 +66,14 @@ export type BatchOrderChangeRequestBody = z.infer<typeof batchOrderChangeRequest
 
 export const decideOrderChangeRequestBodySchema = z.object({
   decisionNote: z.string().max(200, '备注最多 200 字').optional(),
+  // 换酒店确认专用：套餐档次与换入酒店星级不符时，换酒店通道要求写明放行原因才过
+  //（字段名与录单/换酒店端点一致，前端一套表单复用）。其余 kind 传了也不起作用。
+  designatedHotelStarMismatchReason: z
+    .string()
+    .trim()
+    .min(1)
+    .max(200, '放行原因最多 200 字')
+    .optional(),
 });
 export type DecideOrderChangeRequestBody = z.infer<typeof decideOrderChangeRequestBodySchema>;
 
@@ -81,6 +89,8 @@ export const listOrderChangeRequestsQuerySchema = z.object({
   kind: z.nativeEnum(OrderChangeKind).optional(),
   agentId: z.string().min(1).optional(),
   orderId: z.string().min(1).optional(),
+  // 只看这个时刻之后新建的申请（ISO 时间串）：代理侧「我这批单有没有新结果」轮询用。
+  since: z.coerce.date().optional(),
   limit: z.coerce.number().int().min(1).max(200).default(50),
   cursor: z.string().min(1).optional(),
 });

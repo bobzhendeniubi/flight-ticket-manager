@@ -72,6 +72,9 @@ const REQUEST_FIXTURE = {
   appliedAt: null,
   applyError: null,
   createdAt: '2026-09-04T00:00:00.000Z',
+  // 前端契约：升舱补差（所有角色）/ 换酒店成本变动（仅运营）
+  amountCny: null,
+  costDeltaCny: null,
 };
 
 describe('改单申请路由', () => {
@@ -247,6 +250,29 @@ describe('改单申请路由', () => {
       );
     });
 
+    it('代理查已处理的申请 + since → 透传给服务层', async () => {
+      serviceMocks.list.mockResolvedValue({ requests: [], nextCursor: null });
+      const res = await call(
+        'GET',
+        '/order-change-requests?status=APPROVED&since=2026-09-01T00:00:00.000Z',
+        UserRole.AGENT,
+      );
+      expect(res.statusCode).toBe(200);
+      expect(serviceMocks.list).toHaveBeenCalledWith(
+        { userId: 'u-AGENT', role: UserRole.AGENT },
+        expect.objectContaining({
+          status: OrderChangeRequestStatus.APPROVED,
+          since: new Date('2026-09-01T00:00:00.000Z'),
+        }),
+      );
+    });
+
+    it('since 不是合法时间 → 400（zod）', async () => {
+      const res = await call('GET', '/order-change-requests?since=昨天', UserRole.AGENT);
+      expect(res.statusCode).toBe(400);
+      expect(serviceMocks.list).not.toHaveBeenCalled();
+    });
+
     it('角标只给运营 → 代理 403', async () => {
       serviceMocks.pendingCount.mockResolvedValue({ count: 3 });
       const ok = await call('GET', '/order-change-requests/pending-count', UserRole.STAFF);
@@ -301,6 +327,29 @@ describe('改单申请路由', () => {
       );
     });
 
+    it('带星级放行原因确认 → 原样透传给服务层', async () => {
+      serviceMocks.approve.mockResolvedValue(approved);
+      const res = await call('POST', '/order-change-requests/req-1/approve', UserRole.ADMIN, {
+        decisionNote: '已与客人确认',
+        designatedHotelStarMismatchReason: '客人自愿降档，差额已线下退回',
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(serviceMocks.approve).toHaveBeenCalledWith({ userId: 'u-ADMIN', role: UserRole.ADMIN }, 'req-1', {
+        decisionNote: '已与客人确认',
+        designatedHotelStarMismatchReason: '客人自愿降档，差额已线下退回',
+      });
+    });
+
+    it('放行原因超 200 字 → 400（zod），不触服务', async () => {
+      const res = await call('POST', '/order-change-requests/req-1/approve', UserRole.ADMIN, {
+        designatedHotelStarMismatchReason: '很'.repeat(201),
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error.message).toContain('放行原因最多 200 字');
+      expect(serviceMocks.approve).not.toHaveBeenCalled();
+    });
+
     it('执行失败 → 400 把原因回给运营，不写确认审计', async () => {
       serviceMocks.approve.mockRejectedValue(
         new BadRequestError('本单含套餐立减，改班次要重算补差'),
@@ -338,6 +387,14 @@ describe('改单申请路由', () => {
       expect(writeAudit).toHaveBeenCalledWith(
         expect.objectContaining({ action: 'ORDER_CHANGE_REQUEST_REJECTED', severity: 'WARNING' }),
       );
+    });
+
+    it('申请正在执行中 → 服务层 409 原样透出', async () => {
+      serviceMocks.reject.mockRejectedValue(new ConflictError('该申请正在执行中，请稍后刷新'));
+      const res = await call('POST', '/order-change-requests/req-1/reject', UserRole.ADMIN, {});
+      expect(res.statusCode).toBe(409);
+      expect(res.json().error.message).toBe('该申请正在执行中，请稍后刷新');
+      expect(writeAudit).not.toHaveBeenCalled();
     });
 
     it('代理打不开 → 403', async () => {

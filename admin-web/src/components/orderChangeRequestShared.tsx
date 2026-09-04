@@ -15,6 +15,20 @@ export const ORDER_CHANGE_REQUEST_KIND_LABEL: Record<OrderChangeRequestKind, str
   CABIN: '升舱',
 };
 
+/** 「套餐档次与酒店星级不符」放行原因的字数上限，与 SingleOrderModal 纠错换酒店同一档口径。 */
+export const STAR_MISMATCH_REASON_MAX = 200;
+
+/** 400 报错文案里带「放行原因」= 指定酒店星级与套餐档次不符，需要运营补填理由才能放行执行。 */
+export function isStarMismatchApproveError(message: string): boolean {
+  return message.includes('放行原因');
+}
+
+/** 金额带正负号展示（成本变化用）：正数 +¥X，负数 −¥X（全角负号，跟订单财务模块同一套写法）。 */
+export function formatSignedCny(amountCny: number): string {
+  const sign = amountCny < 0 ? '−' : '+';
+  return `${sign}¥${Math.abs(amountCny).toLocaleString()}`;
+}
+
 /** 改单申请里签证目标状态的三个选项（比录单口径少「已签证」——那是完成态，不是申请目标）。 */
 export const CHANGE_REQUEST_VISA_STATUS_OPTIONS: Array<{ value: ChangeRequestVisaStatus; label: string }> = [
   { value: 'NEEDED', label: '需要' },

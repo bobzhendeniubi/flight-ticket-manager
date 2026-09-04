@@ -19,6 +19,7 @@ import {
   CabinClass,
   CommissionStatus,
   InvoiceStatus,
+  OrderChangeRequestStatus,
   OrderItemKind,
   OrderLegFlag,
   OrderStatus,
@@ -13607,6 +13608,15 @@ export class OrderService {
     });
     if (pendingSettlementRequest > 0) {
       blockers.push('本单有待处理的议价申请，请先处理后再拆。');
+    }
+    // 改单申请（OrderChangeRequest）同理：申请里冻的是「拆之前这张单」的那一行
+    //（itemId / 航段 / 房型 / 升舱补差按当时人数算），拆完那一行可能已经搬到新单上、
+    // 或者人数已经变了，再确认执行就是按已经不存在的行改单 —— 先处理完再拆。
+    const pendingOrderChangeRequest = await db.orderChangeRequest.count({
+      where: { orderId: order.id, status: OrderChangeRequestStatus.PENDING },
+    });
+    if (pendingOrderChangeRequest > 0) {
+      blockers.push('本单有待处理的改单申请，请先确认执行或驳回后再拆单。');
     }
 
     // ── 闸 10c：用过代理预存余额抵扣的单不许拆（口径同改归属的资金纠缠阻断）───────
