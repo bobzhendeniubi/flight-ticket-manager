@@ -3878,14 +3878,26 @@ export function OrdersPage() {
                       // 自然不标，不占位）。字母紧贴姓名会糊成一团（"张三M"），用独立小号淡色 span 隔开。
                       const names = order.passengers.map((p) => p.chineseName?.trim() || p.fullName);
                       const genders = order.passengers.map((p) => genderMark(p.gender));
+                      // 拼音（反馈：中文名后加拼音方便核对）：有中文名时才需要额外标注，
+                      // 拼音就是证件姓名（fullName，护照格式如 MA/GUANBEI）；本来就只显示
+                      // fullName 的乘客不重复标注。
+                      const pinyins = order.passengers.map((p) => (p.chineseName?.trim() ? p.fullName : null));
                       const titleText = names
-                        .map((n, i) => (genders[i] ? `${n}（${genders[i]}）` : n))
+                        .map((n, i) => {
+                          const base = pinyins[i] ? `${n} ${pinyins[i]}` : n;
+                          return genders[i] ? `${base}（${genders[i]}）` : base;
+                        })
                         .join('、');
-                      const nameNode = (idx: number, emphasized: boolean) => (
+                      // 逐人都标拼音（运营要核对每个人，不只是第一个）：单行放不下三对
+                      // "中文 拼音" 时改让这格换行，而不是藏起拼音——见下方 whitespace-normal。
+                      const nameNode = (idx: number, emphasized: boolean, showPinyin: boolean) => (
                         <span key={idx} className={emphasized ? 'font-semibold text-brand' : 'font-semibold text-ink'}>
                           {names[idx]}
                           {genders[idx] ? (
                             <span className="ml-0.5 text-[10px] font-normal text-ink-soft">{genders[idx]}</span>
+                          ) : null}
+                          {showPinyin && pinyins[idx] ? (
+                            <span className="ml-1 text-[10px] font-normal text-ink-soft">{pinyins[idx]}</span>
                           ) : null}
                         </span>
                       );
@@ -3906,7 +3918,7 @@ export function OrdersPage() {
                         const companions = names.length - 1;
                         return (
                           <div className="max-w-xs truncate text-sm" title={titleText}>
-                            {nameNode(hitIdx, true)}
+                            {nameNode(hitIdx, true, true)}
                             {companions > 0 ? <span className="text-ink-muted"> +{companions} 同行</span> : null}
                           </div>
                         );
@@ -3914,11 +3926,11 @@ export function OrdersPage() {
                       const shownCount = Math.min(names.length, 3);
                       const hasMore = names.length > shownCount;
                       return (
-                        <div className="max-w-xs truncate text-sm" title={titleText}>
+                        <div className="max-w-xs whitespace-normal break-words text-sm" title={titleText}>
                           {Array.from({ length: shownCount }, (_, i) => (
                             <span key={i}>
                               {i > 0 ? <span className="text-ink-muted">、</span> : null}
-                              {nameNode(i, false)}
+                              {nameNode(i, false, true)}
                             </span>
                           ))}
                           {hasMore ? <span className="text-ink-muted"> 等{names.length}人</span> : null}
