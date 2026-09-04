@@ -449,6 +449,33 @@ describe('按人改期 · 部分乘客的同 token 重试（A2）', () => {
     expect(err.code).toBe('TOKEN_PAYLOAD_MISMATCH');
   });
 
+  it('留档的编排入参键序被数据库打乱 → 仍判一致，照常回放', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(afterFirstSplit());
+    mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(
+      priorRecord({
+        snapshot: {
+          movedPassengerIds: ['p1'],
+          // JSONB 读回来的键序不保证与写入时一致，这里模拟被打乱后的形状。
+          orchestration: {
+            feeCny: 300,
+            newCabin: null,
+            newScheduleId: 'sch-new',
+            orderItemId: 'leg-out',
+          },
+        },
+      }),
+    );
+    mockPrisma.orderItem.findMany.mockResolvedValue([
+      { id: 'leg-out-moved', flightScheduleId: 'sch-new' },
+      { id: 'leg-ret-moved', flightScheduleId: 'sch-ret' },
+    ]);
+    const split = vi.spyOn(service, 'splitOrder');
+
+    const result = await service.reschedulePassengers('o1', body(), admin);
+    expect(split).not.toHaveBeenCalled();
+    expect(result.audit.splitReplayed).toBe(true);
+  });
+
   it('老记录没留编排入参 → 只按乘客集合一致回放（fail-open 只对老数据）', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(afterFirstSplit());
     mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(

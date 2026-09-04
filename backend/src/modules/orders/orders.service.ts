@@ -59,6 +59,7 @@ import { localHHMM, localDateISO, localToUtc } from '../../lib/flight-time.js';
 import { checkinCloseAt, isCheckinClosed } from '../../lib/checkin-close.js';
 import { BUSINESS_TZ, businessDateISO, businessDateTime } from '../../lib/business-time.js';
 import { CANCELLABLE_STATUSES } from '../../lib/cancellation.js';
+import { canonicalJson } from '../../lib/canonical-json.js';
 import {
   orderNeedsVisaTask,
   orderVisaStatusRequiresVisa,
@@ -13990,7 +13991,9 @@ export class OrderService {
       if (priorOrchestrationRaw != null && typeof priorOrchestrationRaw === 'object') {
         const priorOrchestration = readJsonObject(priorOrchestrationRaw);
         const current = reschedulePassengersOrchestration(input);
-        if (JSON.stringify(priorOrchestration) !== JSON.stringify(current)) {
+        // 键序无关地比：留档那份是从 JSONB 读回来的，键序未必还是当初写进去的样子，
+        // 直接 JSON.stringify 两边比会把「原样重试」误判成「换了一份入参」。
+        if (canonicalJson(priorOrchestration) !== canonicalJson(current)) {
           throw tokenPayloadMismatchError(
             { reason: 'PAYLOAD', prior: priorOrchestration, current },
             '这个请求编号已经用于另一班次/另一份改期差价，请刷新后用新的请求编号重试。',
