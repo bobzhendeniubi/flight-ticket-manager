@@ -45,7 +45,8 @@ export function fmtDepartureLocalDate(departure: Date | null, tz: string | null)
 
 /**
  * 订单级送签补充信息（全订单乘客共用一份）：
- *   departureLocalDate — 最早一段机票的本地出发日（按出发地时区）；纯签证单无航班 → ''
+ *   departureLocalDate — 最早一段机票的本地出发日（按出发地时区）；纯签证单无航班 → 回退最早
+ *                        VISA 行的签证预计出行日期（与订单列表/签证台出发日同口径）；两者皆无 → ''
  *   remark             — 备注：优先签证任务备注，回落订单签证备注/客户备注
  */
 async function loadVisaSheetContext(
@@ -53,7 +54,7 @@ async function loadVisaSheetContext(
 ): Promise<{ departureLocalDate: string; remark: string }> {
   if (!orderId) return { departureLocalDate: '', remark: '' };
 
-  const [earliestFlight, order, visaTask] = await Promise.all([
+  const [earliestFlight, order, visaTask, earliestVisaAnchor] = await Promise.all([
     // 最早一段机票 → 客人出发日期
     prisma.orderItem.findFirst({
       where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
@@ -71,13 +72,21 @@ async function loadVisaSheetContext(
       select: { notes: true },
       orderBy: { createdAt: 'asc' },
     }),
+    // 纯签证单无航班时的出发日锚点：最早 VISA 行的签证预计出行日期（@db.Date，不折时区）
+    prisma.orderItem.findFirst({
+      where: { orderId, kind: OrderItemKind.VISA, visaIntendedDate: { not: null } },
+      select: { visaIntendedDate: true },
+      orderBy: { visaIntendedDate: 'asc' },
+    }),
   ]);
 
   const sched = earliestFlight?.flightSchedule ?? null;
-  const departureLocalDate = fmtDepartureLocalDate(
-    sched?.departureTime ?? null,
-    sched?.departureTz ?? null,
-  );
+  const visaAnchor = earliestVisaAnchor?.visaIntendedDate ?? null;
+  const departureLocalDate = sched
+    ? fmtDepartureLocalDate(sched.departureTime, sched.departureTz ?? null)
+    : visaAnchor
+      ? visaAnchor.toISOString().slice(0, 10)
+      : '';
   const remark = visaTask?.notes?.trim() || order?.noteVisa?.trim() || order?.notes?.trim() || '';
 
   return { departureLocalDate, remark };

@@ -107,6 +107,23 @@ describe('deriveDepartureDate', () => {
     expect(deriveDepartureDate([])).toBeNull();
   });
 
+  it('无机票无酒店回落最早签证预计出行日期（纯签证单锚点）；有机票/酒店时它不插手', () => {
+    const visaItem = (d: string) => ({
+      hotelCheckIn: null,
+      flightSchedule: null,
+      visaIntendedDate: new Date(`${d}T00:00:00Z`),
+    });
+    expect(deriveDepartureDate([visaItem('2026-09-06'), visaItem('2026-09-04')])).toBe('2026-09-04');
+    expect(deriveDepartureDate([hotelItem('2026-07-16'), visaItem('2026-07-01')])).toBe('2026-07-16');
+    expect(deriveDepartureDate([visaItem('2026-07-01'), flightItem('2026-07-15T02:00:00Z')])).toBe(
+      '2026-07-15',
+    );
+    // 未填（null / 缺省）不算锚点
+    expect(
+      deriveDepartureDate([{ hotelCheckIn: null, flightSchedule: null, visaIntendedDate: null }]),
+    ).toBeNull();
+  });
+
   it('有机票时机票优先（即使酒店入住更早）', () => {
     const date = deriveDepartureDate([hotelItem('2026-07-10'), flightItem('2026-07-15T02:00:00Z')]);
     expect(date).toBe('2026-07-15');
@@ -947,8 +964,13 @@ describe('generateRuleReminders — 规则 11 单独取数，不动其它规则�
     const orderArgs = raw.order.findMany.mock.calls[0][0] as {
       select: { items: { where: unknown; select: Record<string, unknown> } };
     };
+    // 出发日锚点三级：机票班次 / 酒店入住 / 签证预计出行日期（纯签证单）；规则 11 不往这里塞 metadata
     expect(orderArgs.select.items.where).toEqual({
-      OR: [{ flightScheduleId: { not: null } }, { hotelCheckIn: { not: null } }],
+      OR: [
+        { flightScheduleId: { not: null } },
+        { hotelCheckIn: { not: null } },
+        { visaIntendedDate: { not: null } },
+      ],
     });
     expect(orderArgs.select.items.select).not.toHaveProperty('metadata');
   });

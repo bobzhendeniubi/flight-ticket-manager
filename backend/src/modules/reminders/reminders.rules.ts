@@ -182,16 +182,22 @@ export function computeBalance(order: {
 export interface DepartureSourceItem {
   hotelCheckIn: Date | null;
   flightSchedule: { departureTime: Date; departureTz: string | null } | null;
+  /** 签证预计出行日期（VISA 行专用，@db.Date）：纯签证单的出发日锚点；缺省/null = 未填 */
+  visaIntendedDate?: Date | null;
 }
 
 /**
  * 订单出发日（YYYY-MM-DD）：最早一段机票起飞时间（按班次时区）；
- * 无机票行则用最早酒店入住日（@db.Date → UTC 日期）。两者皆无 → null。
+ * 无机票行则用最早酒店入住日（@db.Date → UTC 日期）；两者皆无则用最早签证预计出行日期
+ * （纯签证单的业务日期锚点，@db.Date → UTC 日期）。三者皆无 → null。
+ * 三级回退与订单列表 deriveOrderDepartDate / 签证台日期筛选同源：纯签证单填了预计出行日期，
+ * 「临近出发未送签」「催尾款」「护照临期」这些按出发日触发的提醒才会覆盖到它。
  * 口径提炼自 fulfillment.service.ts 的 earliestLegByOrder（不 import 私有实现避免耦合）。
  */
 export function deriveDepartureDate(items: DepartureSourceItem[]): string | null {
   let earliestFlight: { departureTime: Date; departureTz: string | null } | null = null;
   let earliestCheckIn: Date | null = null;
+  let earliestVisaDate: Date | null = null;
   for (const item of items) {
     const sched = item.flightSchedule;
     if (sched && (!earliestFlight || sched.departureTime < earliestFlight.departureTime)) {
@@ -200,9 +206,14 @@ export function deriveDepartureDate(items: DepartureSourceItem[]): string | null
     if (item.hotelCheckIn && (!earliestCheckIn || item.hotelCheckIn < earliestCheckIn)) {
       earliestCheckIn = item.hotelCheckIn;
     }
+    const visaDate = item.visaIntendedDate ?? null;
+    if (visaDate && (!earliestVisaDate || visaDate < earliestVisaDate)) {
+      earliestVisaDate = visaDate;
+    }
   }
   if (earliestFlight) return dateInTz(earliestFlight.departureTime, earliestFlight.departureTz);
   if (earliestCheckIn) return utcDateStr(earliestCheckIn);
+  if (earliestVisaDate) return utcDateStr(earliestVisaDate);
   return null;
 }
 
@@ -768,9 +779,16 @@ export async function generateRuleReminders(
         roomAssignment: true,
         // 只取推导出发时间需要的行（有机票班次或酒店入住日的）
         items: {
-          where: { OR: [{ flightScheduleId: { not: null } }, { hotelCheckIn: { not: null } }] },
+          where: {
+            OR: [
+              { flightScheduleId: { not: null } },
+              { hotelCheckIn: { not: null } },
+              { visaIntendedDate: { not: null } },
+            ],
+          },
           select: {
             hotelCheckIn: true,
+            visaIntendedDate: true,
             flightSchedule: { select: { departureTime: true, departureTz: true } },
           },
         },
@@ -797,10 +815,15 @@ export async function generateRuleReminders(
                 deletedAt: true,
                 items: {
                   where: {
-                    OR: [{ flightScheduleId: { not: null } }, { hotelCheckIn: { not: null } }],
+                    OR: [
+                      { flightScheduleId: { not: null } },
+                      { hotelCheckIn: { not: null } },
+                      { visaIntendedDate: { not: null } },
+                    ],
                   },
                   select: {
                     hotelCheckIn: true,
+                    visaIntendedDate: true,
                     flightSchedule: { select: { departureTime: true, departureTz: true } },
                   },
                 },

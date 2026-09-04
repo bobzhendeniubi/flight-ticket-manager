@@ -76,6 +76,36 @@ export interface HotelPassportsByNamesSelection {
   excludedByDateNames: string[];
 }
 
+/**
+ * 订单出发日锚点（YYYY-MM-DD；取不到 ''）：最早一段带班次机票的出发地本地日；无航班时回退
+ * 最早 VISA 行的签证预计出行日期（@db.Date，UTC 日期直出，不折时区）。
+ * 与订单列表 deriveOrderDepartDate / 签证台日期筛选 / 送签表 departureLocalDate 同口径。
+ */
+export function departureLocalDateOfItems(
+  items: ReadonlyArray<{
+    visaIntendedDate?: Date | null;
+    flightSchedule: { departureTime: Date; departureTz: string | null } | null;
+  }>,
+): string {
+  let earliestFlight: { departureTime: Date; departureTz: string | null } | null = null;
+  let earliestVisaDate: Date | null = null;
+  for (const item of items) {
+    const sched = item.flightSchedule;
+    if (sched && (!earliestFlight || sched.departureTime < earliestFlight.departureTime)) {
+      earliestFlight = sched;
+    }
+    const visaDate = item.visaIntendedDate ?? null;
+    if (visaDate && (!earliestVisaDate || visaDate < earliestVisaDate)) {
+      earliestVisaDate = visaDate;
+    }
+  }
+  if (earliestFlight) {
+    return fmtDepartureLocalDate(earliestFlight.departureTime, earliestFlight.departureTz);
+  }
+  if (earliestVisaDate) return earliestVisaDate.toISOString().slice(0, 10);
+  return '';
+}
+
 function toDateOnly(s: string): Date {
   // 'YYYY-MM-DD' → UTC midnight，与 Prisma @db.Date 存取口径一致
   return new Date(`${s}T00:00:00.000Z`);
@@ -222,12 +252,20 @@ export async function collectPassportGroupsByNames(
         select: {
           id: true,
           orderNumber: true,
-          // 最早一段机票 → 出发日（与送签表 departureLocalDate 同口径）
+          // 出发日锚点行（与送签表 departureLocalDate / 签证台日期筛选同口径）：
+          // 带班次的机票行（取最早一段）；无航班时回退带预计出行日期的 VISA 行（纯签证单）。
+          // 两类行一起取回、在内存里按优先级挑，同一关系一个 select 不能带两套 where/orderBy。
           items: {
-            where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
-            orderBy: { flightSchedule: { departureTime: 'asc' } },
-            take: 1,
-            select: { flightSchedule: { select: { departureTime: true, departureTz: true } } },
+            where: {
+              OR: [
+                { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+                { kind: OrderItemKind.VISA, visaIntendedDate: { not: null } },
+              ],
+            },
+            select: {
+              visaIntendedDate: true,
+              flightSchedule: { select: { departureTime: true, departureTz: true } },
+            },
           },
         },
       },
@@ -240,11 +278,7 @@ export async function collectPassportGroupsByNames(
   /** 这个人真的被打进了 zip —— 定 excludedByDateNames 用。*/
   const includedNames = new Set<string>();
   for (const p of passengers) {
-    const fs = p.order.items[0]?.flightSchedule ?? null;
-    const departureLocalDate = fmtDepartureLocalDate(
-      fs?.departureTime ?? null,
-      fs?.departureTz ?? null,
-    );
+    const departureLocalDate = departureLocalDateOfItems(p.order.items);
 
     // 姓名匹配必须先于日期过滤：被日期排除的人也算「找到了」，否则会假冒「查无此人」
     const fullNameLower = (p.fullName ?? '').trim().toLowerCase();
@@ -255,8 +289,8 @@ export async function collectPassportGroupsByNames(
     for (const name of hitNames) matchedNames.add(name);
 
     // 出发地本地日字符串比较（YYYY-MM-DD 字典序 = 日期序）。
-    // 无出发日（纯签证单/纯酒店单）→ 不被日期区间筛掉，归入「无出发日期」文件夹。
-    // 与签证台 departureDate 过滤同口径（纯签证单无航班 → 保留可见）。
+    // 无出发日（既无航班也无签证预计出行日期：行程未定的纯签证单 / 纯酒店单）→ 不被日期区间筛掉，
+    // 归入「无出发日期」文件夹。与签证台出发日期筛选同口径（有锚点按锚点筛，无锚点保留可见）。
     if (departureLocalDate) {
       if (args.from && departureLocalDate < args.from) continue;
       if (args.to && departureLocalDate > args.to) continue;

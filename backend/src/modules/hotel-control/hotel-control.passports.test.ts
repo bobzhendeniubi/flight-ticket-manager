@@ -247,7 +247,12 @@ function makePassenger(opts: {
   documentNumber: string;
   passportPhotoUrl?: string | null;
   departure?: { time: string; tz: string };
+  /** 纯签证单：VISA 行的签证预计出行日期（YYYY-MM-DD）；与 departure 互斥使用 */
+  visaIntendedDate?: string;
 }) {
+  const visaItems = opts.visaIntendedDate
+    ? [{ visaIntendedDate: new Date(`${opts.visaIntendedDate}T00:00:00.000Z`), flightSchedule: null }]
+    : [];
   return {
     id: opts.id,
     fullName: opts.fullName ?? 'ZHANG SAN',
@@ -267,8 +272,9 @@ function makePassenger(opts: {
                 departureTz: opts.departure.tz,
               },
             },
+            ...visaItems,
           ]
-        : [],
+        : visaItems,
     },
   };
 }
@@ -290,11 +296,14 @@ describe('collectPassportGroupsByNames — 取数过滤', () => {
       { chineseName: 'ZHANG SAN' },
     ]);
 
-    // 出发日口径取数：每订单最早一段 FLIGHT 的 departureTime/departureTz
+    // 出发日锚点取数：带班次的 FLIGHT 行 + 带预计出行日期的 VISA 行（纯签证单回退），内存里按优先级挑
     const itemsSelect = arg.select.order.select.items;
-    expect(itemsSelect.where.kind).toBe('FLIGHT');
-    expect(itemsSelect.orderBy).toEqual({ flightSchedule: { departureTime: 'asc' } });
-    expect(itemsSelect.take).toBe(1);
+    expect(itemsSelect.where.OR).toEqual([
+      { kind: 'FLIGHT', flightScheduleId: { not: null } },
+      { kind: 'VISA', visaIntendedDate: { not: null } },
+    ]);
+    expect(itemsSelect.select.visaIntendedDate).toBe(true);
+    expect(itemsSelect.select.flightSchedule.select).toEqual({ departureTime: true, departureTz: true });
   });
 
   it('姓名去重去空白：重复/纯空白项只查一次', async () => {
@@ -442,6 +451,51 @@ describe('collectPassportGroupsByNames — 出发日期过滤（出发地本地�
     expect(selRanged.groups[0].departureLocalDate).toBe('');
     expect(selRanged.notFoundNames).toEqual([]);
     expect(selRanged.excludedByDateNames).toEqual([]);
+  });
+
+  it('纯签证单填了预计出行日期：按它归文件夹、按它筛区间（与签证台同口径，不再绕过日期）', async () => {
+    const visaOnly = makePassenger({
+      id: 'p1',
+      orderId: 'o1',
+      orderNumber: 'FTM2026090300001',
+      fullName: 'ZHANG SAN',
+      documentNumber: 'E1',
+      visaIntendedDate: '2026-09-04',
+    });
+    // 不传区间：出发日 = 预计出行日期（@db.Date 直出，不折时区）
+    const selAll = await collectPassportGroupsByNames({ names: ['ZHANG SAN'] }, fakePassengerClient([visaOnly]));
+    expect(selAll.groups[0].departureLocalDate).toBe('2026-09-04');
+
+    // 区间覆盖 9/4 → 保留
+    const selHit = await collectPassportGroupsByNames(
+      { names: ['ZHANG SAN'], from: '2026-09-04', to: '2026-09-04' },
+      fakePassengerClient([visaOnly]),
+    );
+    expect(selHit.groups).toHaveLength(1);
+    expect(selHit.excludedByDateNames).toEqual([]);
+
+    // 区间是 9/5 → 被日期排除（进 excludedByDateNames，不是查无此人）
+    const selMiss = await collectPassportGroupsByNames(
+      { names: ['ZHANG SAN'], from: '2026-09-05', to: '2026-09-05' },
+      fakePassengerClient([visaOnly]),
+    );
+    expect(selMiss.groups).toHaveLength(0);
+    expect(selMiss.notFoundNames).toEqual([]);
+    expect(selMiss.excludedByDateNames).toEqual(['ZHANG SAN']);
+  });
+
+  it('有航班时航班优先，签证预计出行日期不插手', async () => {
+    const both = makePassenger({
+      id: 'p1',
+      orderId: 'o1',
+      orderNumber: 'FTM2026090300002',
+      fullName: 'ZHANG SAN',
+      documentNumber: 'E1',
+      departure: { time: '2026-09-10T02:00:00Z', tz: 'Asia/Shanghai' },
+      visaIntendedDate: '2026-09-04',
+    });
+    const sel = await collectPassportGroupsByNames({ names: ['ZHANG SAN'] }, fakePassengerClient([both]));
+    expect(sel.groups[0].departureLocalDate).toBe('2026-09-10');
   });
 
   it('只传单端：from 之前的排除（计入 excludedByDateNames）、之后的保留', async () => {

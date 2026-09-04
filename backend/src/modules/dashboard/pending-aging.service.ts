@@ -113,12 +113,15 @@ type ItemLike = {
   kind: string;
   hotelCheckIn: Date | null;
   flightSchedule: { departureTime: Date } | null;
+  /** 签证预计出行日期（VISA 行专用，@db.Date）：纯签证单的出发日锚点；缺省/null = 未填 */
+  visaIntendedDate?: Date | null;
 };
 
 /**
  * 订单行 → 最早出发日（YYYY-MM-DD, UTC）。
- * 机票行取 departureTime，没有机票行则退到酒店入住日；都没有 → null。
- * 与订单列表的出行日期口径同源（FLIGHT: departureTime；HOTEL: hotelCheckIn）。
+ * 机票行取 departureTime，没有机票行则退到酒店入住日，再没有则退到签证预计出行日期
+ * （纯签证单的业务日期锚点）；都没有 → null。
+ * 与订单列表的出行日期口径同源（FLIGHT: departureTime；HOTEL: hotelCheckIn；VISA: visaIntendedDate）。
  */
 export function departureDateOf(items: ItemLike[]): string | null {
   const times: number[] = [];
@@ -128,6 +131,11 @@ export function departureDateOf(items: ItemLike[]): string | null {
   if (times.length === 0) {
     for (const it of items) {
       if (it.hotelCheckIn) times.push(it.hotelCheckIn.getTime());
+    }
+  }
+  if (times.length === 0) {
+    for (const it of items) {
+      if (it.visaIntendedDate) times.push(it.visaIntendedDate.getTime());
     }
   }
   if (times.length === 0) return null;
@@ -205,6 +213,7 @@ export class PendingAgingService {
             select: {
               kind: true,
               hotelCheckIn: true,
+              visaIntendedDate: true,
               flightSchedule: { select: { departureTime: true } },
             },
           },

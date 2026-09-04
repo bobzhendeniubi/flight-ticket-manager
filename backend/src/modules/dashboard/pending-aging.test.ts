@@ -159,6 +159,22 @@ describe('departureDateOf — 最早出发日', () => {
     expect(departureDateOf([{ kind: 'VISA', hotelCheckIn: null, flightSchedule: null }])).toBeNull();
   });
 
+  it('纯签证单填了预计出行日期 → 以它为出发日（第三级回退）；有机票/酒店时不插手', () => {
+    const visa = (d: string) => ({
+      kind: 'VISA',
+      hotelCheckIn: null,
+      flightSchedule: null,
+      visaIntendedDate: new Date(`${d}T00:00:00Z`),
+    });
+    expect(departureDateOf([visa('2026-09-06'), visa('2026-09-04')])).toBe('2026-09-04');
+    expect(
+      departureDateOf([
+        visa('2026-07-01'),
+        { kind: 'HOTEL', hotelCheckIn: new Date('2026-08-01T00:00:00Z'), flightSchedule: null },
+      ]),
+    ).toBe('2026-08-01');
+  });
+
   it('空行 → null', () => {
     expect(departureDateOf([])).toBeNull();
   });
