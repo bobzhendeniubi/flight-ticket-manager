@@ -556,7 +556,15 @@ export function expandBlockByDate(
 
 /**
  * 单行真实占房间数：roomsBilled（新列，支持 0.5 半间）→ metadata.roomsNeeded（套餐已写）
- * → metadata.rooms（酒店行写）→ 1（兜底）。任意值非有限正数都回落到下一优先级。
+ * → metadata.rooms（酒店行写）→ 1（兜底）。
+ *
+ * 取值的判据是**这一级有没有显式提供**，不是「值大不大于 0」——**0 是真值**。
+ * 拆单会稳定产出 `roomsBilled = 0` 且 `roomsNeeded = 0` 的 BUNDLE / HOTEL 行（典型：
+ * 只拆不占座、也不占房的婴儿）。把这种「明说了不占房」的行当成「没填」兜底成 1 间，
+ * 就是凭空多出的幽灵房：该口径被销控板已用房量、占房下钻、以及「装不下」超售硬拦截共用，
+ * 会误判满房、误拒新单。只有三级**全都缺**（历史行 roomsBilled 为 null、metadata 里没有
+ * 这两个键）才回落 1 间 —— 那才是真的「不知道占几间」。
+ * 非有限值与负数不算显式提供，继续回落下一优先级。
  * export：占房下钻（getOccupyingOrders）复用同一口径，避免与销控板 used 计算漂移。
  */
 export function itemRoomCount(it: {
@@ -564,13 +572,17 @@ export function itemRoomCount(it: {
   metadata?: unknown;
 }): number {
   const billed = dec(it.roomsBilled ?? null);
-  if (billed != null && Number.isFinite(billed) && billed > 0) return billed;
+  if (billed != null && Number.isFinite(billed) && billed >= 0) return billed;
   if (it.metadata != null && typeof it.metadata === 'object') {
     const meta = it.metadata as { roomsNeeded?: unknown; rooms?: unknown };
-    const needed = Number(meta.roomsNeeded);
-    if (Number.isFinite(needed) && needed > 0) return needed;
-    const rooms = Number(meta.rooms);
-    if (Number.isFinite(rooms) && rooms > 0) return rooms;
+    if (meta.roomsNeeded != null) {
+      const needed = Number(meta.roomsNeeded);
+      if (Number.isFinite(needed) && needed >= 0) return needed;
+    }
+    if (meta.rooms != null) {
+      const rooms = Number(meta.rooms);
+      if (Number.isFinite(rooms) && rooms >= 0) return rooms;
+    }
   }
   return 1;
 }

@@ -665,8 +665,11 @@ export function rebuildAddOns(
     infantCount: occ.infantCount,
     seatPax: occ.seatPax,
     headCount: occ.headCount,
+    // 显式给了 rooms 就照用 —— **0 是真值**（本侧明说了不占房，典型是只拆不占座的婴儿），
+    // 当成「没填」按人头猜会在套餐快照里留下一间幽灵房，和订单行的 roomsBilled 两本账分叉。
+    // 只有压根没传（null/undefined）或值非法才回落按人头。
     rooms:
-      side.rooms != null && side.rooms > 0
+      side.rooms != null && Number.isFinite(side.rooms) && side.rooms >= 0
         ? Math.ceil(side.rooms)
         : Math.ceil(occ.seatPax / 2),
     nights,

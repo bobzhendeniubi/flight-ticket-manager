@@ -687,6 +687,30 @@ describe('addOns.rooms 跟随本侧 roomsBilled（不再按人头猜）', () => 
     });
     expect(built.rooms).toBe(2);
   });
+
+  it('显式给 rooms = 0（本侧不占房）→ addOns.rooms 就是 0，不按人头猜出幽灵房', () => {
+    const built = rebuildAddOns(addOnsSnapshot(), {
+      occupancy: occ(2),
+      singleCount: 0,
+      selfVisaCount: 0,
+      upgradeOutbound: 0,
+      upgradeReturn: 0,
+      rooms: 0,
+    });
+    expect(built.rooms).toBe(0);
+  });
+
+  it('rooms 显式给 null（没这个概念的调用）→ 仍按人头回落', () => {
+    const built = rebuildAddOns(addOnsSnapshot(), {
+      occupancy: occ(2),
+      singleCount: 0,
+      selfVisaCount: 0,
+      upgradeOutbound: 0,
+      upgradeReturn: 0,
+      rooms: null,
+    });
+    expect(built.rooms).toBe(1);
+  });
 });
 
 // ══════════════════════════════════════════════════════════════════════════

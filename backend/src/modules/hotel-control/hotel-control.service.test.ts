@@ -55,6 +55,7 @@ import {
   deleteBlockPeriod,
   listBlockPeriods,
   getRecentRoomChanges,
+  itemRoomCount,
 } from './hotel-control.service.js';
 
 /** 权威分房表 fixture：groupSizes[i] = 第 i 个房间盒子的乘客数（形状同 orders 模块分房保存）。*/
@@ -2849,5 +2850,36 @@ describe('getHotelOversellCapRooms', () => {
     await expect(
       getHotelOversellCapRooms({} as unknown as PrismaClient),
     ).resolves.toBe(3);
+  });
+});
+
+describe('itemRoomCount · 显式 0 间房是真值，不是「没填」', () => {
+  it('roomsBilled = 0（拆单产生的不占房行）→ 0 间，不兜底成 1', () => {
+    expect(itemRoomCount({ roomsBilled: 0, metadata: { roomsNeeded: 0 } })).toBe(0);
+  });
+
+  it('roomsBilled 为空、metadata.roomsNeeded = 0 → 0 间', () => {
+    expect(itemRoomCount({ roomsBilled: null, metadata: { roomsNeeded: 0 } })).toBe(0);
+  });
+
+  it('roomsBilled 与 roomsNeeded 都为空、metadata.rooms = 0 → 0 间', () => {
+    expect(itemRoomCount({ roomsBilled: null, metadata: { rooms: 0 } })).toBe(0);
+  });
+
+  it('三处都没提供（历史行）→ 仍兜底 1 间，行为不变', () => {
+    expect(itemRoomCount({ roomsBilled: null, metadata: {} })).toBe(1);
+    expect(itemRoomCount({})).toBe(1);
+  });
+
+  it('正常值与半间照旧按优先级取值', () => {
+    expect(itemRoomCount({ roomsBilled: 2, metadata: { roomsNeeded: 9 } })).toBe(2);
+    expect(itemRoomCount({ roomsBilled: 0.5, metadata: {} })).toBe(0.5);
+    expect(itemRoomCount({ roomsBilled: null, metadata: { roomsNeeded: 3, rooms: 9 } })).toBe(3);
+    expect(itemRoomCount({ roomsBilled: null, metadata: { rooms: 2 } })).toBe(2);
+  });
+
+  it('非有限值 / 负数不算「显式提供」，继续回落下一优先级', () => {
+    expect(itemRoomCount({ roomsBilled: null, metadata: { roomsNeeded: 'abc', rooms: 2 } })).toBe(2);
+    expect(itemRoomCount({ roomsBilled: null, metadata: { roomsNeeded: -1 } })).toBe(1);
   });
 });
