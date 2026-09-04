@@ -24,6 +24,7 @@ import {
   type TripStatsMap,
 } from './orders.export-master.js';
 import { flightCountCell } from './orders.export-trip-stats.js';
+import { AGENT_HIDDEN_EXPORT_KEYS } from './orders.export-templates.js';
 import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 import { SNAPSHOT_STALE_MS } from '../travelers/traveler-profiles.service.js';
@@ -705,17 +706,34 @@ describe('visibleColumns（role 裁列）', () => {
     expect(headers).not.toContain('可用次数');
   });
 
-  it('agent（代理）裁掉内部账/风控 + 护照 PII + 纯内部运营列；代理自己的账目与业务信息保留', () => {
+  it('agent（代理）= 运营拍板的 13 列白名单，且顺序与全岗序一致（0903 运营反馈模版）', () => {
     const headers = visibleColumns('agent').map((c) => c.header);
-    // 1. 内部账与成本
-    expect(headers).not.toContain('订单成本');
-    // 签证公司 = 我方签证供应商；签证备注实际写的是供应商 + 进价 —— 与订单成本同性质。
-    expect(headers).not.toContain('签证公司');
-    expect(headers).not.toContain('签证备注');
-    // 航段状态会写成「回程已恢复（超售 2 座）」—— 超售是我方与航司之间的内部风控口径。
-    expect(headers).not.toContain('航段状态');
-    // 2. 护照/身份 PII（成建制的身份信息名单不随导出出岛）
+    expect(headers).toEqual([
+      '序号',
+      '代理机构',
+      '备注',
+      '酒店中文名称',
+      '乘客中文名',
+      '乘客拼音名',
+      '纯拼音名',
+      '出发(往返)日期',
+      '航班号',
+      '订单类型',
+      '舱位等级',
+      '结算价格',
+      '签证状态',
+    ]);
+  });
+
+  it('agent（代理）白名单之外一律不给：护照 PII / 内部人员 / 供应商成本 / 内部指标 / 代理账目列', () => {
+    const headers = visibleColumns('agent').map((c) => c.header);
     for (const h of [
+      // 内部账与成本 / 风控
+      '订单成本',
+      '签证公司',
+      '签证备注',
+      '航段状态',
+      // 护照/身份 PII
       '乘客生日',
       '乘客类型',
       '性别',
@@ -726,33 +744,42 @@ describe('visibleColumns（role 裁列）', () => {
       '证件有效期',
       '护照签发地',
       '出生地',
+      // 纯内部运营信息
+      '飞行次数',
+      '在订未飞',
+      '可用次数',
+      '分房情况',
+      '录入时间',
+      '录入人员',
+      // 运营拍板不给代理的账目列（0903）
+      '立减金额',
+      '尾款金额',
+      '已到账金额',
+      '单房差',
+      '签证金额',
+      '开票状态',
+      '是否清账',
+      '退款金额',
+      '订单编号',
     ]) {
       expect(headers).not.toContain(h);
     }
-    // 3. 纯内部运营信息（常旅客权益台账 / 房控排房 / 内部时间戳与录单账号姓名）
-    for (const h of ['飞行次数', '在订未飞', '可用次数', '分房情况', '录入时间', '录入人员']) {
-      expect(headers).not.toContain(h);
-    }
-    // 保留：代理自己的账目与业务信息
-    expect(headers).toContain('结算价格');
-    expect(headers).toContain('立减金额');
-    expect(headers).toContain('已到账金额');
-    expect(headers).toContain('尾款金额');
-    expect(headers).toContain('签证状态');
-    expect(headers).toContain('乘客中文名');
-    expect(headers).toContain('订单编号');
-    // 共裁 20 列：agent 列数 = all 列数 - 20（原 18 列 + 签证公司/签证备注两列供应商与进价）
-    expect(visibleColumns('agent')).toHaveLength(visibleColumns('all').length - 20);
+    // 白名单是共享黑名单的子集之外再收窄：任何黑名单 key 都不可能出现在 agent 视图
+    const agentKeys = new Set(visibleColumns('agent').map((c) => c.key as string));
+    for (const k of AGENT_HIDDEN_EXPORT_KEYS) expect(agentKeys.has(k)).toBe(false);
   });
 
-  it('所有视图都保留通用列（序号/代理机构/乘客中文名/订单编号）', () => {
+  it('所有视图都保留通用列（序号/代理机构/乘客中文名）；订单编号内部视图都有、代理白名单不含', () => {
     for (const role of ['all', 'ticketing', 'visa', 'agent'] as const) {
       const headers = visibleColumns(role).map((c) => c.header);
       expect(headers).toContain('序号');
       expect(headers).toContain('代理机构');
       expect(headers).toContain('乘客中文名');
-      expect(headers).toContain('订单编号');
     }
+    for (const role of ['all', 'ticketing', 'visa'] as const) {
+      expect(visibleColumns(role).map((c) => c.header)).toContain('订单编号');
+    }
+    expect(visibleColumns('agent').map((c) => c.header)).not.toContain('订单编号');
   });
 });
 

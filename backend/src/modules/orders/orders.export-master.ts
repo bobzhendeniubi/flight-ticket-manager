@@ -300,18 +300,39 @@ const MASTER_COLUMNS: MasterColumn[] = [
   { header: '录入人员', key: 'recordedBy', width: 14 },
 ];
 
-/** 按岗位视图筛出可见列（role=all/缺省 → 全部；否则保留 roles 命中或未限定 role 的列）。*/
+/**
+ * 代理视角的**白名单**（运营反馈 0903：代理导出的全岗总表只保留这 13 列，其余一律不给）。
+ *
+ * 为什么是白名单不是黑名单：护照 PII / 内部人员 / 供应商成本 / 内部运营指标用共享黑名单
+ * AGENT_HIDDEN_EXPORT_KEYS 已经裁掉了，但运营要的比这更少——代理自己的账目列（立减 / 尾款 /
+ * 已到账 / 单房差 / 签证金额 / 开票 / 清账 / 退款 / 订单编号）也不要。列表以后再加新列，
+ * 白名单默认不给代理，不会再出现"这边加了一列、隔壁代理就多看一列"。
+ * 顺序沿用 MASTER_COLUMNS（与运营发来的模版列序一致）。
+ */
+export const AGENT_MASTER_ALLOWED_KEYS: ReadonlySet<keyof MasterRow> = new Set<keyof MasterRow>([
+  'seq',
+  'agency',
+  'notes',
+  'hotelName',
+  'chineseName',
+  'passengerName',
+  'cleanName',
+  'travelDates',
+  'flightNumbers',
+  'orderType',
+  'cabin',
+  'settlePrice',
+  'visaStatus',
+]);
+
+/** 按岗位视图筛出可见列（role=all/缺省 → 全部；agent → 白名单；否则保留 roles 命中或未限定 role 的列）。*/
 export function visibleColumns(role: MasterExportRole): MasterColumn[] {
   if (role === 'all') return MASTER_COLUMNS;
-  // 代理视角：结构同全岗，按**共享**脱敏政策裁 —— 唯一一份口径与理由在
-  // orders.export-templates.ts 的 AGENT_HIDDEN_EXPORT_KEYS（本表与三模板筛选导出共用，
-  // 避免两处各维护一份、这边关了门隔壁还开着）。本表命中其中 20 个 key：
-  // 订单成本 / 航段状态 / 签证公司 / 签证备注（我方供应商与进价）+ 护照身份 10 列
-  // + 飞行次数 / 在订未飞 / 可用次数 / 分房情况 / 录入时间 / 录入人员。
-  // 保留的是代理自己的账目与业务信息（代理机构/备注/酒店/姓名/行程/航班/结算价/立减/
-  // 尾款/到账/单房差/签证金额/签证状态/开票/清账/退款/订单编号）。
+  // 代理视角：先过共享脱敏黑名单（与三模板同一份口径，护照 PII / 内部人员 / 供应商成本 / 内部指标），
+  // 再过本表专属白名单（运营拍板的 13 列）。两道都过才给——黑名单保证"敏感的一定没有"，
+  // 白名单保证"没点名的一定没有"。
   if (role === 'agent') {
-    return withoutAgentHiddenColumns(MASTER_COLUMNS);
+    return withoutAgentHiddenColumns(MASTER_COLUMNS).filter((c) => AGENT_MASTER_ALLOWED_KEYS.has(c.key));
   }
   return MASTER_COLUMNS.filter((c) => !c.roles || c.roles.includes(role));
 }
