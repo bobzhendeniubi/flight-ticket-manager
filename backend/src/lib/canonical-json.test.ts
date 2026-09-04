@@ -37,8 +37,12 @@ describe('canonicalJson', () => {
     expect(canonicalJson(false)).toBe('false');
   });
 
-  it('undefined 与 JSON.stringify 同口径：顶层 undefined、对象里的 undefined 键都被丢掉', () => {
-    expect(canonicalJson(undefined)).toBe(JSON.stringify(undefined));
+  it('对象里的 undefined 键被丢掉（与 JSON.stringify 同口径）', () => {
     expect(canonicalJson({ a: 1, b: undefined })).toBe(canonicalJson({ a: 1 }));
+  });
+
+  it('顶层 undefined 已经不是合法入参：能返回 undefined 的指纹，比对起来永远判不相等', () => {
+    // @ts-expect-error 入参收窄到「JSON.stringify 一定给得出字符串」的那些值（排除顶层 undefined）
+    expect(canonicalJson(undefined)).toBeUndefined();
   });
 });

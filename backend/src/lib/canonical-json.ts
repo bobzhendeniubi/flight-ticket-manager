@@ -8,11 +8,22 @@
  *
  * 口径：对象递归按键名升序后再 stringify；数组**保序**（顺序本身是语义的一部分，
  * 比如按人改期的 roomSplit 已经按 itemId 排过了，这里再排一次只会掩盖真实差异）。
- * 其余与 `JSON.stringify` 一致 —— undefined 该丢就丢。
+ * 其余与 `JSON.stringify` 一致 —— 对象里值为 undefined 的键该丢就丢。
  */
-export function canonicalJson(value: unknown): string {
+export function canonicalJson(value: CanonicalJsonInput): string {
   return JSON.stringify(sortDeep(value));
 }
+
+/**
+ * 可参与指纹比对的值：**除顶层 `undefined` 之外的一切**（null、数字、字符串、布尔、对象、数组）。
+ *
+ * 为什么要把顶层 undefined 挡在门外：`JSON.stringify(undefined)` 返回的是 `undefined` 而不是
+ * 字符串，指纹一旦可能是 undefined，`a !== b` 的比对就再也说明不了问题 —— 两份都读不出来的
+ * 入参会被判成「一致」，读得出的那份又永远判成「不一致」。收窄入参比把返回类型放宽成
+ * `string | undefined` 更好：调用方不必为一个根本不该出现的分支写兜底。
+ * 对象/数组**内部**的 undefined 不受影响，照 JSON.stringify 的老规矩处理。
+ */
+export type CanonicalJsonInput = NonNullable<unknown> | null;
 
 /** 递归重建：对象换成按键名升序的新对象，数组逐个处理但不重排，其余原样返回。 */
 function sortDeep(value: unknown): unknown {
