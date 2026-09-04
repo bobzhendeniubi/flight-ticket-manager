@@ -222,7 +222,8 @@ describe('selfUpdatePassenger · 补录护照的反向同班次查重', () => {
       .catch(() => undefined);
 
     const where = mockPrisma.passenger.findMany.mock.calls[0][0].where;
-    expect(where.documentNumber).toBe(NEW_DOCUMENT);
+    // 证件号比对大小写不敏感（M3）：库里躺着大小写混杂的存量值，按字面比会漏判。
+    expect(where.documentNumber).toEqual({ equals: NEW_DOCUMENT, mode: 'insensitive' });
     expect(where.orderId).toEqual({ not: 'o1' });
     expect(where.order.items.some.flightScheduleId).toEqual({ in: ['sch-out'] });
     expect(where.order.status.in).toContain('PAID');

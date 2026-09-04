@@ -111,11 +111,14 @@ describe('代理自助改单路由', () => {
       const res = await call('POST', '/orders/o1/correct-flight', UserRole.AGENT, body);
       expect(res.statusCode).toBe(200);
       expect(res.json()).toEqual({ order: { id: 'o1' } });
-      expect(serviceMocks.correctFlightSchedule).toHaveBeenCalledWith('o1', 'i1', 's2', {
-        userId: 'u-AGENT',
-        role: UserRole.AGENT,
-        agentId: 'ag-1',
-      });
+      expect(serviceMocks.correctFlightSchedule).toHaveBeenCalledWith(
+        'o1',
+        'i1',
+        's2',
+        { userId: 'u-AGENT', role: UserRole.AGENT, agentId: 'ag-1' },
+        // allowTicketed 未传 → schema 缺省 false（服务端还会按角色再判一次，代理传了也不认）。
+        { allowTicketed: false },
+      );
       expect(writeAudit).toHaveBeenCalledWith(
         expect.objectContaining({
           action: 'CORRECT_ORDER_FLIGHT',
@@ -206,11 +209,13 @@ describe('代理自助改单路由', () => {
           role: UserRole.AGENT,
           agentId: 'ag-1',
         });
-        expect(serviceMocks.setOrderVisaStatus).toHaveBeenCalledWith('o1', visaStatus, {
-          userId: 'u-AGENT',
-          role: UserRole.AGENT,
-          agentId: 'ag-1',
-        });
+        expect(serviceMocks.setOrderVisaStatus).toHaveBeenCalledWith(
+          'o1',
+          visaStatus,
+          { userId: 'u-AGENT', role: UserRole.AGENT, agentId: 'ag-1' },
+          // 本端点只回 { ok: true } → 不必回读整单；本次没带备注 → 只写签证状态。
+          { withOrder: false },
+        );
       },
     );
 
@@ -247,7 +252,9 @@ describe('代理自助改单路由', () => {
       });
     });
 
-    it('运营改签证状态 → 不走窗口闸，写入口径不变', async () => {
+    // M2：签证状态与备注四栏是一次提交 → 必须一起进 setOrderVisaStatus 的那一个事务，
+    // 不能再分成「service 写签证状态 + 路由另写一条 update」两笔（中间失败会写半拉）。
+    it('运营同时改签证状态与备注 → 备注随签证状态进同一个事务，路由不再单独写库', async () => {
       const res = await call('PATCH', '/orders/o1/notes', UserRole.STAFF, {
         visaStatus: VisaRequirement.NEEDED,
         internalNotes: '运营口径',
@@ -255,10 +262,13 @@ describe('代理自助改单路由', () => {
       expect(res.statusCode).toBe(200);
       expect(serviceMocks.assertAgentSelfEditAllowed).not.toHaveBeenCalled();
       expect(serviceMocks.setOrderVisaStatus).toHaveBeenCalledTimes(1);
-      expect(prismaMock.order.update).toHaveBeenCalledWith({
-        where: { id: 'o1' },
-        data: { internalNotes: '运营口径' },
-      });
+      expect(serviceMocks.setOrderVisaStatus).toHaveBeenCalledWith(
+        'o1',
+        VisaRequirement.NEEDED,
+        { userId: 'u-STAFF', role: UserRole.STAFF, agentId: undefined },
+        { withOrder: false, noteData: { internalNotes: '运营口径' } },
+      );
+      expect(prismaMock.order.update).not.toHaveBeenCalled();
     });
 
     it('客户改签证状态 → 403（口径未变）', async () => {

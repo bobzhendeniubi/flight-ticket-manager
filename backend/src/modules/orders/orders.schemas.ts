@@ -1153,9 +1153,12 @@ export type RescheduleOrderBody = z.infer<typeof rescheduleOrderBodySchema>;
 // 把某条 FLIGHT 行改到**本来就该录的**班次。与售后改期的区别只有一句话：纠错不动钱 ——
 // 所以请求体里**没有任何金额字段**（差价恒 0 由服务端写死），也没有 newCabin
 //（改舱要重算差价，那是升舱通道的事）。多一个字段就多一条代理能动钱的路。
+// allowTicketed：已出票/已完成的单也纠错（票要重开，运营心里有数才勾）。**只对 ADMIN/STAFF 生效** ——
+// 代理带上它一样被「已出票」那道闸拦住（服务端按角色判，不看请求体），与批量纠错同名同义。
 export const correctFlightBodySchema = z.object({
   itemId: z.string().min(1, 'itemId 必填'),
   newScheduleId: z.string().min(1, 'newScheduleId 必填'),
+  allowTicketed: z.boolean().optional().default(false),
 });
 export type CorrectFlightBody = z.infer<typeof correctFlightBodySchema>;
 

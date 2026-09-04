@@ -557,6 +557,18 @@ const CORRECTABLE_IDENTITY_FIELDS = [
 ] as const;
 
 /**
+ * 「票面身份里的姓名」三件套：订正通道判「这次动没动名字」「历史上动没动名字」都只认这三个。
+ * chineseName 不在内（护照扩展字段，不上票面、不进航司系统）。
+ */
+const CORRECTION_NAME_FIELDS = ['fullName', 'lastName', 'firstName'] as const;
+
+/**
+ * 只改姓名（证件号不动）时允许的最大编辑距离。比证件号那道闸（TYPO_MAX_EDIT_DISTANCE=2）松一格：
+ * 姓名订正常见的漏音节 / 姓名颠倒一个字就能差到 3，而真换人差得远不止 3。
+ */
+const CORRECTION_NAME_MAX_EDIT_DISTANCE = 3;
+
+/**
  * 证件号规范化（订正通道口径）：trim + 大写。
  *
  * 护照号本来就是大写字母 + 数字，「e12345678」和「E12345678」是同一本护照。不规范化的话，
@@ -7664,8 +7676,10 @@ export class OrderService {
    * 命中即抛 DuplicatePassengerError（同一个错误类型，前端已有的 DUPLICATE_PASSENGER
    * 处理逻辑照旧接得住）。本单没有任何有效航段（纯酒店/接送）→ 无从比对，直接放行。
    *
-   * client：调用方在事务里时把 tx 传进来 —— 订正通道整段读-判-写都在同一把 Order 行锁下，
-   * 查重要是走全局 prisma 就跑到事务外面去了，锁白加（并发两单能同时判过）。
+   * client：调用方在事务里时把 tx 传进来 —— 查重与随后的写入至少落在同一个事务里，
+   * 中途不会读到别人尚未提交的中间态。**但这把锁只锁住本订单那一行**：与本单并发的
+   * 「另一张单也在补录同一本护照」照样能同时判过（各锁各的订单行，谁都看不见对方），
+   * 跨单的 TOCTOU 仍然存在，真正兜底的是事后对账与这条报错的指路。
    * 缺省全局单例，补录通道（不在事务里）行为一字未变。
    */
   private async assertBackfilledDocumentNotDuplicated(
@@ -7684,7 +7698,8 @@ export class OrderService {
 
     const conflicts = await client.passenger.findMany({
       where: {
-        documentNumber,
+        // 大小写不敏感：库里既有大写也有小写的存量证件号，按字面比对会把同一本护照放过去。
+        documentNumber: { equals: documentNumber, mode: 'insensitive' },
         orderId: { not: orderId },
         order: {
           status: { in: SEAT_HOLDING_STATUSES },
@@ -8491,9 +8506,48 @@ export class OrderService {
 
       const order = await tx.order.findUnique({
         where: { id: orderId },
-        select: { id: true, status: true, deletedAt: true, adjustmentCny: true, adjustments: true },
+        select: {
+          id: true,
+          status: true,
+          deletedAt: true,
+          adjustmentCny: true,
+          adjustments: true,
+          // 自助纠错的窗口复查要用（锁内的权威现势，见下方）。
+          createdAt: true,
+          outboundInvoiced: true,
+          returnInvoiced: true,
+          systemInvoiced: true,
+          settlementLocked: true,
+        },
       });
       if (!order) throw new NotFoundError('订单不存在');
+
+      // ── 自助纠错：锁内复查窗口 + 票务现势（L3 / C2）──────────────────────────
+      // 入口那道 assertAgentSelfEditAllowed 是**锁外**读的一次快照：从判完到这里之间，订单可能
+      // 已被出票、开票、锁结算价，或者跨过了北京业务日的 24:00。拿刚 FOR UPDATE 锁住的这一行
+      // 重跑同一份纯函数，口径与入口逐字一致（报错文案也是同一句）。
+      // 「真·自助」= 带自助旗子**且**操作人是代理。运营走同一条纠错通道也带这面旗子（它只是用来
+      // 绕开「仅运营/管理员可改期」那句闸），下面这批收紧一条都不该落到运营头上。
+      const isAgentSelfService =
+        input.selfServiceCorrection === true && actor.role === UserRole.AGENT;
+      if (isAgentSelfService) {
+        const window = computeAgentSelfEditWindow(order);
+        if (!window.open) {
+          throw new ForbiddenError(window.reason ?? AGENT_SELF_EDIT_REASON.NEXT_DAY);
+        }
+        // 换班次会把全单乘客的 PNR / 票号清空、并翻回被改航段的开票标记 —— 那是运营的售后动作。
+        // 只要这单已经有人订上座或出了票，自助通道一律不碰，走改单申请由运营核对航司那边再改。
+        const ticketedRows = await tx.passenger.findMany({
+          where: { orderId },
+          select: { pnr: true, eticketNumber: true },
+        });
+        const anyTicketed = ticketedRows.some(
+          (p) => (p.pnr ?? '').trim() !== '' || (p.eticketNumber ?? '').trim() !== '',
+        );
+        if (anyTicketed) {
+          throw new BadRequestError('已订座/已出票，请提交改单申请由运营处理');
+        }
+      }
 
       // ── 幂等键的守闸：**必须在订单行锁内再查一次**（并发安全）────────────────────
       // 编排层（按人改期的全员快路径）在事务外先查一遍 token 拦不住并发：同 token 的两次
@@ -8871,9 +8925,15 @@ export class OrderService {
                 orderPassengers.map((p) => ({ gender: p.gender ?? undefined })),
                 { excludeOrderId: orderId },
               );
+              // 随机档超售上限（H3）：运营改期/纠错沿用内部录单的「需求池不闸单」口径；
+              // 代理自助纠错必须吃与其它录单同一份上限（默认 3 间，可后台配）——
+              // 自助只是把「录错的班次改对」，不该顺手把随机档的超售闸整个卸掉：
+              // 平移日期挤爆某一天的随机档房量，最后是房控半夜加房。
               await assertRandomTierStaysFitWithinTx(tx, prospectiveStays, {
                 excludeOrderId: orderId,
-                maxOversellRooms: RANDOM_TIER_INTERNAL_NO_CAP,
+                maxOversellRooms: isAgentSelfService
+                  ? await getHotelOversellCapRooms(tx)
+                  : RANDOM_TIER_INTERNAL_NO_CAP,
               });
             } catch (err) {
               if (err instanceof BadRequestError) {
@@ -9141,9 +9201,25 @@ export class OrderService {
           subtotal: true,
           total: true,
           items: { select: { amount: true } },
+          // 自助窗口的锁内复查要用（口径同入口 assertAgentSelfEditAllowed）。
+          createdAt: true,
+          outboundInvoiced: true,
+          returnInvoiced: true,
+          systemInvoiced: true,
+          settlementLocked: true,
         },
       });
       if (!order) throw new NotFoundError('订单不存在');
+
+      // ── 自助窗口锁内复查（L3）───────────────────────────────────────────────
+      // 入口那次判定是锁外快照：从判完到拿锁之间订单可能已出票/已开票/已锁结算价，或者
+      // 跨过了北京业务日 24:00。拿刚锁住的这一行重跑同一份纯函数，报错文案也是同一句。
+      if (actor.role === UserRole.AGENT) {
+        const window = computeAgentSelfEditWindow(order);
+        if (!window.open) {
+          throw new ForbiddenError(window.reason ?? AGENT_SELF_EDIT_REASON.NEXT_DAY);
+        }
+      }
 
       // 资金闸：升舱会抬 total，与补录地面项/调价同源守卫——回收站单、已取消/已退款/超时/草稿单一律拒绝。
       assertOrderAcceptsFunds(order);
@@ -10098,8 +10174,16 @@ export class OrderService {
     itemId: string,
     newScheduleId: string,
     actor: { userId: string; role: UserRole; agentId?: string },
+    options: { allowTicketed?: boolean } = {},
   ): ReturnType<OrderService['rescheduleOrderItem']> {
     await this.assertAgentSelfEditAllowed(orderId, actor);
+    const isOpsActor = actor.role === UserRole.ADMIN || actor.role === UserRole.STAFF;
+    // 自助通道（代理）：同航班 + 同价才算「纠错」，否则是一次改价改产品的售后动作 → 走改单申请。
+    if (!isOpsActor) {
+      await this.assertSelfServiceCorrectionIsFreeOfCharge(itemId, newScheduleId);
+    }
+    // 已出票单放行开关只认运营（L1）：代理带 allowTicketed 一律不认，仍旧被 forbidTicketed 拦住。
+    const allowTicketed = isOpsActor && options.allowTicketed === true;
     return this.rescheduleOrderItem(
       orderId,
       {
@@ -10107,11 +10191,86 @@ export class OrderService {
         newScheduleId,
         // 纠错永远不动钱：差价恒 0（请求体里根本没有金额字段，这里也不给任何注入口）。
         feeCny: 0,
-        guard: { correction: true, forbidTicketed: true },
+        guard: { correction: true, forbidTicketed: !allowTicketed },
         selfServiceCorrection: true,
       },
       actor,
     );
+  }
+
+  /**
+   * 纠错比价（只读，不写任何库）：本行现在的成交单价 vs 改到目标班次后**按建单口径**重算的单价。
+   *
+   * 用途有二：
+   *   ① 自助纠错的同价闸（见 assertSelfServiceCorrectionIsFreeOfCharge）；
+   *   ② 改单申请模块日后可以直接拿这个差额展示给运营（「代理想改到这一班，差 ¥X」），
+   *      两处口径必须是同一份计算，不能各算各的。
+   *
+   * toPrice 走的就是建单给 FLIGHT 行定价的那条路（PricingService.calculatePrice 的
+   * averageUnitPrice，按本行人数取平均），因此仓位阶梯 / 商务舱联动一并吃到。
+   * 目标班次余位不够本行人数时 calculatePrice 会抛「余票仅 N 张」——那本来就是这次纠错做不成的
+   * 真实原因（座位搬不过去），照原样抛给调用方，不在这里吞成一个假的价格。
+   */
+  async quoteFlightCorrectionDelta(
+    itemId: string,
+    newScheduleId: string,
+  ): Promise<{ fromPrice: number; toPrice: number; deltaCny: number; sameFlight: boolean }> {
+    const item = await prisma.orderItem.findUnique({
+      where: { id: itemId },
+      select: {
+        id: true,
+        kind: true,
+        quantity: true,
+        unitPrice: true,
+        flightScheduleId: true,
+        flightCabin: true,
+        flightSchedule: { select: { flightId: true } },
+      },
+    });
+    if (!item) throw new NotFoundError('订单项不存在');
+    if (item.kind !== OrderItemKind.FLIGHT || !item.flightScheduleId || !item.flightCabin) {
+      throw new BadRequestError('该行不是持有座位的机票行，无法比价');
+    }
+    const target = await prisma.flightSchedule.findUnique({
+      where: { id: newScheduleId },
+      select: { id: true, flightId: true },
+    });
+    if (!target) throw new NotFoundError('目标班次不存在');
+
+    const fromPrice = Number(item.unitPrice.toString());
+    const pricing = await this.pricing.calculatePrice(newScheduleId, item.flightCabin, item.quantity);
+    const toPrice = pricing.averageUnitPrice;
+    return {
+      fromPrice,
+      toPrice,
+      deltaCny: round2(toPrice - fromPrice),
+      sameFlight: item.flightSchedule?.flightId === target.flightId,
+    };
+  }
+
+  /**
+   * 自助纠错的「同航班 + 同价」硬闸（CRITICAL 修复）。
+   *
+   * 没有这道闸时，自助通道等于一个免费改产品的口子：纠错不重算金额（amount/quantity 明写不变），
+   * 代理只要在窗口内把班次换成任意一趟更贵的航班，座位真的搬过去、一分差价都不收。
+   * 纠错的定义是「本来就该录这一班」——所以只允许：
+   *   · 同一 flightId 的别的日期/别的班次（录错出行日是最常见的录单错误）；
+   *   · 且该班次同舱位按建单口径重算出来的单价与本行成交单价**完全相等**（差一分都不放）。
+   * 任何一条不满足都不是纠错，是要动钱的售后改单 → 400 指路改单申请，由运营核价后执行。
+   */
+  private async assertSelfServiceCorrectionIsFreeOfCharge(
+    itemId: string,
+    newScheduleId: string,
+  ): Promise<void> {
+    const quote = await this.quoteFlightCorrectionDelta(itemId, newScheduleId);
+    if (!quote.sameFlight) {
+      throw new BadRequestError('只能改到同一航班的其他日期，请提交改单申请由运营处理');
+    }
+    if (quote.deltaCny !== 0) {
+      throw new BadRequestError(
+        `目标班次价格与原班次不同（¥${quote.fromPrice} → ¥${quote.toPrice}），当日自助只能改同价班次，请提交改单申请由运营处理`,
+      );
+    }
   }
 
   /**
@@ -10125,6 +10284,13 @@ export class OrderService {
    *      裸用全局 prisma 时两个并发请求会各建一条任务。
    *   ③ 审计仍由调用方（路由）写，before/after 由本方法返回，口径不分叉。
    *
+   * options：
+   *   · noteData —— 与签证状态**同一条 UPDATE、同一个事务**落库的备注列（notes 路由传）。
+   *     抽出本方法时曾变成「先写签证状态，再由路由写备注」两次写：中间失败就留下
+   *     「签证状态改了、备注没改」的半拉现场，而这两栏在界面上是同一次提交。收回一处写。
+   *   · withOrder —— 是否回读并序列化整单（默认 true）。notes 路由只回 `{ ok: true }`，
+   *     为它拼一次 ORDER_FULL_INCLUDE 的富联查纯属白花钱，传 false 直接省掉。
+   *
    * 权限**不在这里判**：调用方按自己的通道判（运营走 notes 路由的 opsOnly 闸；代理走
    * assertAgentSelfEditAllowed + HAS_VISA 硬拦）。本方法只保证「写进去的状态是自洽的」。
    */
@@ -10132,8 +10298,9 @@ export class OrderService {
     orderId: string,
     visaStatus: VisaRequirement,
     actor: { userId: string; role: UserRole; agentId?: string },
+    options: { withOrder?: boolean; noteData?: Prisma.OrderUpdateInput } = {},
   ): Promise<{
-    order: ReturnType<typeof serializeOrder>;
+    order: ReturnType<typeof serializeOrder> | null;
     changed: boolean;
     before: VisaRequirement | null;
     after: VisaRequirement;
@@ -10155,14 +10322,21 @@ export class OrderService {
       throw new BadRequestError(VISA_CONTRADICTION_MESSAGE);
     }
 
-    await prisma.order.update({ where: { id: orderId }, data: { visaStatus } });
     const changed = current.visaStatus !== visaStatus;
-    if (changed) {
-      await prisma.$transaction((tx) =>
-        syncVisaTasksForOrder(tx, orderId, { userId: actor.userId, role: actor.role }),
-      );
-    }
+    // 签证状态 + 备注四栏 + 签证任务同步，一个事务落地：要么都生效，要么一个字都不落。
+    await prisma.$transaction(async (tx) => {
+      await tx.order.update({
+        where: { id: orderId },
+        data: { ...(options.noteData ?? {}), visaStatus },
+      });
+      if (changed) {
+        await syncVisaTasksForOrder(tx, orderId, { userId: actor.userId, role: actor.role });
+      }
+    });
 
+    if (options.withOrder === false) {
+      return { order: null, changed, before: current.visaStatus, after: visaStatus };
+    }
     const finalOrder = await prisma.order.findUniqueOrThrow({
       where: { id: orderId },
       include: ORDER_FULL_INCLUDE,
@@ -10350,6 +10524,57 @@ export class OrderService {
         (input.lastName !== undefined && input.lastName !== (passenger.lastName ?? undefined)) ||
         (input.firstName !== undefined && input.firstName !== (passenger.firstName ?? undefined));
 
+      // ── 闸④b：只改姓名也有幅度上限（非内部角色）───────────────────────────
+      // 闸④只在「证件号也变了」时才量姓名，于是「证件号一个字不动、姓名整个换掉」是条敞开的路：
+      // 同一本护照挂上另一个人的名字照样是换人，出票与值机对的是姓名 + 证件号那一对。
+      // 阈值放宽到 3（比证件号的 2 松）：中英文姓名的正常订正（漏一个音节、姓名颠倒一个字）
+      // 常常差三个字符，真正的换人差的远不止 3。运营/管理员不受此限（他们本就在核对现场）。
+      if (
+        !isInternalActor &&
+        !documentChanging &&
+        nextName !== null &&
+        nextName !== oldName &&
+        levenshteinDistance(oldName, nextName, CORRECTION_NAME_MAX_EDIT_DISTANCE) >
+          CORRECTION_NAME_MAX_EDIT_DISTANCE
+      ) {
+        throw new BadRequestError('姓名改动较大，请使用「换人」');
+      }
+
+      // ── 闸④c：分两步的伪装换人（非内部角色）───────────────────────────────
+      // 闸④只看**单次**请求：先提一次「只改姓名」（过闸④b 的小步），再提一次「只改证件号」
+      // （过闸③的小步），两次合起来就是一个全新的人，而每一次单看都像正常订正。
+      // 所以要看这位出行人的订正历史：此前订正过姓名、这次动证件号（或者反过来）→ 一律指路换人。
+      // 历史取自审计（CORRECT_ORDER_PASSENGER 的 before.passengerId 就是这一位），
+      // 与界面上「订正历史」读的是同一份流水，运营复核时看到的和闸判的是同一件事。
+      if (!isInternalActor && (nameChanging || documentChanging)) {
+        const priorCorrections = await tx.auditLog.findMany({
+          where: {
+            action: 'CORRECT_ORDER_PASSENGER',
+            before: { path: ['passengerId'], equals: passengerId },
+          },
+          select: { before: true, after: true },
+        });
+        const priorFields = new Set<string>();
+        for (const row of priorCorrections) {
+          // 优先读 after.changedFields（路由写审计时就落了这一份）；老记录回退到 before 的键。
+          const changedFields = readJsonObject(row.after).changedFields;
+          const fields = Array.isArray(changedFields)
+            ? changedFields
+            : Object.keys(readJsonObject(row.before)).filter((k) => k !== 'passengerId');
+          for (const field of fields) {
+            if (typeof field === 'string') priorFields.add(field);
+          }
+        }
+        const priorNameCorrected = CORRECTION_NAME_FIELDS.some((f) => priorFields.has(f));
+        const priorDocumentCorrected = priorFields.has('documentNumber');
+        if (
+          (priorNameCorrected && documentChanging) ||
+          (priorDocumentCorrected && nameChanging)
+        ) {
+          throw new BadRequestError('该出行人此前已订正过姓名/证件号，再次改动请使用「换人」');
+        }
+      }
+
       // ── 闸⑤：代理不许改已订座/已出票的人的票面身份 ─────────────────────────
       // 与换人通道同一口径：开票位是财务口径（发票开没开），票务口径要另看 —— 订单状态已出票/
       // 已完成，或这一位身上已经有 PNR / 电子票号。改了票面身份，航司那边对不上，值机卡死。
@@ -10379,8 +10604,14 @@ export class OrderService {
       if (documentChanging) {
         // 同一订单内查重：反向查重只看**别的订单**，同单里两位出行人被订正成同一本护照
         // （典型是同行家属的资料串行录错）它一句话都不说，出票时才炸。
+        // 大小写不敏感：证件号在订正通道统一大写后落库，但存量/建单入口没做这层规范化，
+        // 库里躺着 `e12345678` 这种小写值 —— 按字面比对会漏判，同单里就真出现两位同一本护照。
         const sameOrderDup = await tx.passenger.findFirst({
-          where: { orderId, id: { not: passengerId }, documentNumber: nextDocument },
+          where: {
+            orderId,
+            id: { not: passengerId },
+            documentNumber: { equals: nextDocument, mode: 'insensitive' },
+          },
           select: { id: true },
         });
         if (sameOrderDup) {
@@ -11017,7 +11248,8 @@ export class OrderService {
               hotelId: true,
               // randomTierPlaceholder：原房型可能挂在随机档「占位酒店」上（伪落位行）——
               //   这种行业务上等同未落位随机单，落位时同样要吃「不许降级交付」的星级约束。
-              hotel: { select: { name: true, randomTierPlaceholder: true } },
+              // starRating：自助换酒店的同星级闸要拿它跟目标酒店比（见下方）。
+              hotel: { select: { name: true, starRating: true, randomTierPlaceholder: true } },
             },
           })
         : Promise.resolve(null),
@@ -11061,6 +11293,21 @@ export class OrderService {
       throw new BadRequestError(
         `${randomStarTierLabel(pendingTier)}只能落到 ${pendingTier} 星及以上的酒店（所选酒店为 ${newRoomType.hotel.starRating} 星）`,
       );
+    }
+
+    // ── 自助换酒店只许「同星级」（HIGH 修复）──────────────────────────────────
+    // 差价被强制归 0 的前提是「换的是同一档住宿」。不比星级的话，自助通道就是一条免费升星的路：
+    // 三星换五星，房量真的占过去、成本真的抬上去，我方一分钱收不到；反过来降星则是悄悄降级
+    // 交付，客人买的档次没兑现，事后只能靠客诉才发现。
+    // 现势星级来源：具体酒店行看当前酒店（含挂在占位酒店上的伪落位行）；未落位随机行看它买的档次。
+    // 取不到现势星级（数据异常）一律按不符处理 —— 自助口子上宁可少放行。
+    if (isSelfService) {
+      const currentStar = isRandomPoolRow
+        ? item.randomStarTier
+        : (oldRoomType?.hotel.starRating ?? null);
+      if (currentStar == null || newRoomType.hotel.starRating !== currentStar) {
+        throw new BadRequestError('当日自助只能换同星级酒店，升降星请提交改单申请');
+      }
     }
 
     // ── 套餐行的星级不匹配闸（口径与录单指定酒店同一份映射，见 SETTLEMENT_TIER_STAR_RATING）──
@@ -11174,9 +11421,25 @@ export class OrderService {
           adjustments: true,
           roomAssignment: true,
           total: true,
+          // 自助窗口的锁内复查要用（口径同入口 assertAgentSelfEditAllowed）。
+          createdAt: true,
+          outboundInvoiced: true,
+          returnInvoiced: true,
+          systemInvoiced: true,
+          settlementLocked: true,
         },
       });
       if (!order) throw new NotFoundError('订单不存在');
+
+      // ── 自助窗口锁内复查（L3）───────────────────────────────────────────────
+      // 入口那次判定是锁外快照：从判完到拿锁之间订单可能已出票/已开票/已锁结算价，或者
+      // 跨过了北京业务日 24:00。拿刚锁住的这一行重跑同一份纯函数，报错文案也是同一句。
+      if (actor.role === UserRole.AGENT) {
+        const window = computeAgentSelfEditWindow(order);
+        if (!window.open) {
+          throw new ForbiddenError(window.reason ?? AGENT_SELF_EDIT_REASON.NEXT_DAY);
+        }
+      }
 
       // ── 有效订单守卫（HIGH 修复）：与改期 / 升舱同款双闸 ────────────────────
       // 换酒店会往目标酒店新增占房、并通过 feeCny 改 adjustmentCny（客户应付）。在已取消 /
@@ -22578,6 +22841,11 @@ export function serializeOrder<T extends OrderLike>(
      * 代理预存余额、以及逐项拆价（item.unitPrice / item.amount）。缺省 false（ADMIN/STAFF 看全量，兼容既有调用方）。
      */
     redactForExternal?: boolean;
+    /**
+     * 请求者角色（由 orderSerializeRoleCtx 带上）。只用于「这个字段该给谁看」这类判断，
+     * 目前仅代理自助改单窗口（agentSelfEdit）用它把客户视角整个略掉。缺省不传 = 照旧全给。
+     */
+    role?: UserRole;
   } = {},
 ) {
   const visaStayDaysById = ctx.visaStayDaysById ?? new Map<string, number | null>();
@@ -22634,15 +22902,20 @@ export function serializeOrder<T extends OrderLike>(
     //    「这单代理现在还能不能自己改」，否则运营接到电话得自己心算下单日期。
     //    createdAt 缺失（窄 select 的调用方）时 fail-closed：按 1970 年的单算 → 窗口关闭，
     //    宁可少给一个自助入口，也不能凭一次漏 select 就把闸放开。
-    agentSelfEdit: computeAgentSelfEditWindow({
-      createdAt: order.createdAt ?? new Date(0),
-      status: order.status,
-      deletedAt: order.deletedAt ?? null,
-      outboundInvoiced: order.outboundInvoiced ?? false,
-      returnInvoiced: order.returnInvoiced ?? false,
-      systemInvoiced: order.systemInvoiced ?? false,
-      settlementLocked: order.settlementLocked ?? false,
-    }),
+    //    **客户视角整个不下发**（键都不出现）：自助改单是代理与我方之间的业务口径，
+    //    客户既没有这条通道，也不该从响应里读出「这单还能不能被改」这类我方内部时限。
+    agentSelfEdit:
+      ctx.role === UserRole.CUSTOMER
+        ? undefined
+        : computeAgentSelfEditWindow({
+            createdAt: order.createdAt ?? new Date(0),
+            status: order.status,
+            deletedAt: order.deletedAt ?? null,
+            outboundInvoiced: order.outboundInvoiced ?? false,
+            returnInvoiced: order.returnInvoiced ?? false,
+            systemInvoiced: order.systemInvoiced ?? false,
+            settlementLocked: order.settlementLocked ?? false,
+          }),
     // 出行人数（按 Passenger.passengerType 统计；套餐行程单「人数：成人 X · 儿童 X · 婴儿 X」用）
     adultCount,
     childCount,
@@ -22814,9 +23087,11 @@ export function serializeOrder<T extends OrderLike>(
 export function orderSerializeRoleCtx(role: UserRole): {
   includePassportPhotos: boolean;
   redactForExternal: boolean;
+  role: UserRole;
 } {
   const isInternal = role === UserRole.ADMIN || role === UserRole.STAFF;
-  return { includePassportPhotos: isInternal, redactForExternal: !isInternal };
+  // role 原样带上：个别字段（如代理自助改单窗口）是「给谁看」的问题，不是「脱不脱敏」能表达的。
+  return { includePassportPhotos: isInternal, redactForExternal: !isInternal, role };
 }
 
 // ── 公开订单脱敏视图（A4）────────────────────────────────────────────

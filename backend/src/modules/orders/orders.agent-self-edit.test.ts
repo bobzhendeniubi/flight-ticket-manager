@@ -31,6 +31,11 @@ const { mockPrisma } = vi.hoisted(() => ({
     bundle: { findUnique: vi.fn() },
     passenger: { findMany: vi.fn() },
     visa: { findMany: vi.fn() },
+    // 自助纠错的「同航班 + 同价」闸：读目标班次的 flightId，再按建单口径（真实
+    // PricingService，非 stub）重算目标班次同舱位的单价 —— 后两个是它要查的表。
+    flightSchedule: { findUnique: vi.fn() },
+    flightSeatClass: { findFirst: vi.fn() },
+    dateRanking: { findUnique: vi.fn() },
   },
 }));
 vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
@@ -218,8 +223,45 @@ describe('correctFlightSchedule', () => {
       .mockResolvedValue({ order: { id: 'o1' }, audit: {} } as never);
   }
 
-  it('代理当天自家单 → 走 correction 通道，差价恒 0、不允许已出票', async () => {
+  /**
+   * 自助「同航班 + 同价」闸的现场：本行成交单价 fromUnitPrice，目标班次同舱位按建单口径
+   * （PricingService 的固定底价模式 → round(basePrice)）重算出 toBasePrice。
+   * sameFlight=false 时目标班次挂到另一趟航班上。
+   */
+  function armCorrectionQuote(
+    opts: { fromUnitPrice?: number; toBasePrice?: number; sameFlight?: boolean } = {},
+  ) {
+    mockPrisma.orderItem.findUnique.mockResolvedValue({
+      id: 'item-1',
+      kind: 'FLIGHT',
+      quantity: 2,
+      unitPrice: dec(opts.fromUnitPrice ?? 1200),
+      flightScheduleId: 'sched-old',
+      flightCabin: 'ECONOMY',
+      flightSchedule: { flightId: 'fl-1' },
+    });
+    mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sched-new',
+      flightId: opts.sameFlight === false ? 'fl-2' : 'fl-1',
+    });
+    mockPrisma.flightSeatClass.findFirst.mockResolvedValue({
+      id: 'sc-new',
+      capacity: 100,
+      sold: 0,
+      basePrice: dec(opts.toBasePrice ?? 1200),
+      fareBuckets: null,
+      schedule: {
+        departureTz: 'Asia/Shanghai',
+        departureTime: new Date('2026-10-01T02:00:00.000Z'),
+        flight: { businessPriceLinked: false, businessUpgradeCnyPerLeg: 700 },
+      },
+    });
+    mockPrisma.dateRanking.findUnique.mockResolvedValue(null);
+  }
+
+  it('代理当天自家单、同航班同价 → 走 correction 通道，差价恒 0、不允许已出票', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(openOrderRow());
+    armCorrectionQuote();
     const spy = stubReschedule();
     await service.correctFlightSchedule('o1', 'item-1', 'sched-new', AGENT);
     expect(spy).toHaveBeenCalledWith(
@@ -234,6 +276,72 @@ describe('correctFlightSchedule', () => {
       AGENT,
     );
     spy.mockRestore();
+  });
+
+  // ── C1：自助纠错只允许「同一航班 + 同价」──────────────────────────────────
+  // 纠错不重算金额（座位真的搬走、amount 一个字不动），不设这道闸就等于一条免费改产品的路。
+  it('代理改到别的航班 → 400 指路改单申请，一次都不进改期', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(openOrderRow());
+    armCorrectionQuote({ sameFlight: false });
+    const spy = stubReschedule();
+    await expect(
+      service.correctFlightSchedule('o1', 'item-1', 'sched-new', AGENT),
+    ).rejects.toThrow('只能改到同一航班的其他日期，请提交改单申请由运营处理');
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it('代理改到同航班但更贵的班次 → 400 带新旧价，一次都不进改期', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(openOrderRow());
+    armCorrectionQuote({ fromUnitPrice: 1200, toBasePrice: 1900 });
+    const spy = stubReschedule();
+    const err = await service
+      .correctFlightSchedule('o1', 'item-1', 'sched-new', AGENT)
+      .catch((e: Error) => e);
+    expect(err).toBeInstanceOf(BadRequestError);
+    expect((err as Error).message).toBe(
+      '目标班次价格与原班次不同（¥1200 → ¥1900），当日自助只能改同价班次，请提交改单申请由运营处理',
+    );
+    expect(spy).not.toHaveBeenCalled();
+    spy.mockRestore();
+  });
+
+  it('运营改到别的航班/别的价 → 不吃同价闸（核过价的人是他自己）', async () => {
+    armCorrectionQuote({ sameFlight: false, toBasePrice: 1900 });
+    const spy = stubReschedule();
+    await service.correctFlightSchedule('o1', 'item-1', 'sched-new', STAFF);
+    expect(spy).toHaveBeenCalledTimes(1);
+    spy.mockRestore();
+  });
+
+  // ── L1：已出票放行开关只认运营 ──────────────────────────────────────────
+  it('运营带 allowTicketed → forbidTicketed 翻假；代理带同一个开关一律不认', async () => {
+    armCorrectionQuote();
+    const spy = stubReschedule();
+    await service.correctFlightSchedule('o1', 'item-1', 'sched-new', STAFF, {
+      allowTicketed: true,
+    });
+    expect(spy.mock.calls[0][1]).toMatchObject({ guard: { correction: true, forbidTicketed: false } });
+
+    mockPrisma.order.findUnique.mockResolvedValue(openOrderRow());
+    await service.correctFlightSchedule('o1', 'item-1', 'sched-new', AGENT, {
+      allowTicketed: true,
+    });
+    expect(spy.mock.calls[1][1]).toMatchObject({ guard: { correction: true, forbidTicketed: true } });
+    spy.mockRestore();
+  });
+
+  // ── quoteFlightCorrectionDelta：只读比价（改单申请模块日后展示差额用同一份）──
+  it('quoteFlightCorrectionDelta 只读比价：给出新旧价、差额与是否同航班', async () => {
+    armCorrectionQuote({ fromUnitPrice: 1200, toBasePrice: 1500, sameFlight: false });
+    await expect(service.quoteFlightCorrectionDelta('item-1', 'sched-new')).resolves.toEqual({
+      fromPrice: 1200,
+      toPrice: 1500,
+      deltaCny: 300,
+      sameFlight: false,
+    });
+    expect(mockPrisma.orderItem.update).not.toHaveBeenCalled();
+    expect(mockPrisma.order.update).not.toHaveBeenCalled();
   });
 
   it('代理次日改 → 403，一次都不进改期', async () => {
@@ -312,7 +420,8 @@ describe('swapItemHotel · 自助差价', () => {
               id: 'rt-old',
               name: '大床房',
               hotelId: 'h1',
-              hotel: { name: '椰岛酒店', randomTierPlaceholder: null },
+              // starRating：自助换酒店的同星级闸拿它和目标酒店比（这里同店换房型，自然同星）。
+              hotel: { name: '椰岛酒店', starRating: 4, randomTierPlaceholder: null },
             }
           : {
               id: 'rt-new',
@@ -390,7 +499,7 @@ describe('swapItemHotel · 自助差价', () => {
   // ── 套餐档次 ↔ 酒店星级不匹配：代理硬拒，运营写原因才放行（W3）────────────────
   // 放行是「明知档次不符仍按此成交」的定价决定。代理自己填一行原因就能把四星档的单落到
   // 三星店，等于把定价权从我方手里拿走 —— 自助通道没有这个口子，一律找运营。
-  function mountBundleSwapToLowStar() {
+  function mountBundleSwapToLowStar(oldStar = 4) {
     const tx = mountSwap();
     mockPrisma.orderItem.findUnique.mockResolvedValue({
       id: 'i1',
@@ -415,7 +524,7 @@ describe('swapItemHotel · 自助差价', () => {
               id: 'rt-old',
               name: '大床房',
               hotelId: 'h1',
-              hotel: { name: '椰岛酒店', randomTierPlaceholder: null },
+              hotel: { name: '椰岛酒店', starRating: oldStar, randomTierPlaceholder: null },
             }
           : {
               id: 'rt-new',
@@ -439,9 +548,10 @@ describe('swapItemHotel · 自助差价', () => {
     return tx;
   }
 
-  it('代理自助换到低星酒店 → 硬拒，写了放行原因也不认', async () => {
+  it('代理自助换到与套餐档次不符的酒店 → 硬拒，写了放行原因也不认', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(openOrderRow());
-    const tx = mountBundleSwapToLowStar();
+    // 现酒店本来就是三星（存量落位，本闸不追溯）→ 同星级闸放行，拦住它的是套餐档次那道闸。
+    const tx = mountBundleSwapToLowStar(3);
 
     await expect(
       service.swapItemHotel(
@@ -474,6 +584,73 @@ describe('swapItemHotel · 自助差价', () => {
       hotelStarRating: 3,
       reason: '同城升级补位',
     });
+  });
+
+  // ── H1：自助换酒店只许同星级 ────────────────────────────────────────────
+  // 差价被强制归 0 的前提是「换的是同一档住宿」：不比星级 = 一条免费升星的路（三星换五星，
+  // 房量真占过去、成本真抬上去，我方一分收不到），反过来则是悄悄降级交付。
+  it.each([
+    ['升星（四星 → 五星）', 5],
+    ['降星（四星 → 三星）', 3],
+  ])('代理自助%s → 400，一个字都不落库', async (_label, newStar) => {
+    mockPrisma.order.findUnique.mockResolvedValue(openOrderRow());
+    const tx = mountSwap();
+    mockPrisma.hotelRoomType.findUnique.mockImplementation(
+      async ({ where }: { where: { id: string } }) =>
+        where.id === 'rt-old'
+          ? {
+              id: 'rt-old',
+              name: '大床房',
+              hotelId: 'h1',
+              hotel: { name: '椰岛酒店', starRating: 4, randomTierPlaceholder: null },
+            }
+          : {
+              id: 'rt-new',
+              name: '海景房',
+              hotelId: 'h1',
+              costPriceCny: null,
+              hotel: {
+                name: '另一家店',
+                isActive: true,
+                starRating: newStar,
+                intlFiveStar: false,
+                randomTierPlaceholder: null,
+              },
+            },
+    );
+    await expect(
+      service.swapItemHotel('o1', 'i1', { newHotelRoomTypeId: 'rt-new' }, AGENT),
+    ).rejects.toThrow('当日自助只能换同星级酒店，升降星请提交改单申请');
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+  });
+
+  it('运营升降星照旧放行（同星级闸只针对自助通道）', async () => {
+    const tx = mountSwap();
+    mockPrisma.hotelRoomType.findUnique.mockImplementation(
+      async ({ where }: { where: { id: string } }) =>
+        where.id === 'rt-old'
+          ? {
+              id: 'rt-old',
+              name: '大床房',
+              hotelId: 'h1',
+              hotel: { name: '椰岛酒店', starRating: 4, randomTierPlaceholder: null },
+            }
+          : {
+              id: 'rt-new',
+              name: '海景房',
+              hotelId: 'h1',
+              costPriceCny: null,
+              hotel: {
+                name: '五星店',
+                isActive: true,
+                starRating: 5,
+                intlFiveStar: false,
+                randomTierPlaceholder: null,
+              },
+            },
+    );
+    await service.swapItemHotel('o1', 'i1', { newHotelRoomTypeId: 'rt-new' }, STAFF);
+    expect(tx.orderItem.update).toHaveBeenCalledTimes(1);
   });
 
   it('代理次日换酒店 → 403，一行订单项都不读', async () => {
@@ -557,29 +734,79 @@ describe('setOrderVisaStatus', () => {
     expect(mockPrisma.order.update).not.toHaveBeenCalled();
   });
 
-  it('状态真变了 → 写库 + 事务内同步签证任务', async () => {
+  /** 事务壳：把回调跑起来，返回里面用到的 tx 桩（order.update / 签证任务同步的首查）。 */
+  function mountTx() {
+    const tx = {
+      order: { update: vi.fn().mockResolvedValue({}), findUnique: vi.fn().mockResolvedValue(null) },
+    };
+    mockPrisma.$transaction.mockImplementation(async (fn: (t: unknown) => unknown) => fn(tx));
+    return tx;
+  }
+
+  it('状态真变了 → 同一个事务里写库 + 同步签证任务', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(visaOrderRow());
-    mockPrisma.$transaction.mockResolvedValue(undefined);
+    const tx = mountTx();
     mountFinalRead();
     const res = await service.setOrderVisaStatus('o1', VisaRequirement.NEEDED, STAFF);
     expect(res.changed).toBe(true);
     expect(res.before).toBe(VisaRequirement.NOT_NEEDED);
     expect(res.after).toBe(VisaRequirement.NEEDED);
-    expect(mockPrisma.order.update).toHaveBeenCalledWith({
+    expect(tx.order.update).toHaveBeenCalledWith({
       where: { id: 'o1' },
       data: { visaStatus: VisaRequirement.NEEDED },
     });
+    // 只开一个事务：签证状态、备注、任务同步全在里头（M2 原子性）。
     expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
+    // 任务同步真的在事务里跑了（它的第一步就是用同一个 tx 读订单现状）。
+    expect(tx.order.findUnique).toHaveBeenCalled();
   });
 
   it('状态没变 → 不跑签证任务同步（纯改备注的请求不平白多几次查询）', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(
       visaOrderRow({ visaStatus: VisaRequirement.NEEDED }),
     );
+    const tx = mountTx();
     mountFinalRead();
     const res = await service.setOrderVisaStatus('o1', VisaRequirement.NEEDED, STAFF);
     expect(res.changed).toBe(false);
+    expect(tx.order.update).toHaveBeenCalledTimes(1);
+    expect(tx.order.findUnique).not.toHaveBeenCalled();
+  });
+
+  // ── M2：签证状态与备注四栏必须同一条 UPDATE 落库 ─────────────────────────
+  // 界面上是一次提交；分两条写时中间失败会留下「签证状态改了、备注没改」的半拉现场。
+  it('带备注一起改 → 一个事务、一条 UPDATE 同时写签证状态与备注', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(visaOrderRow());
+    const tx = mountTx();
+    const res = await service.setOrderVisaStatus(
+      'o1',
+      VisaRequirement.NEEDED,
+      STAFF,
+      { withOrder: false, noteData: { noteVisa: '客人自己办签' } },
+    );
+    expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
+    expect(tx.order.update).toHaveBeenCalledTimes(1);
+    expect(tx.order.update).toHaveBeenCalledWith({
+      where: { id: 'o1' },
+      data: { noteVisa: '客人自己办签', visaStatus: VisaRequirement.NEEDED },
+    });
+    // M5：withOrder:false 时不回读整单（notes 端点只回 { ok: true }，不必白拼一次富联查）。
+    expect(res.order).toBeNull();
+    expect(mockPrisma.order.findUniqueOrThrow).not.toHaveBeenCalled();
+  });
+
+  it('矛盾组合被拒时 → 事务一次都不开，备注也一个字不落库', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(
+      visaOrderRow({ passengers: [{ visaExempt: true }] }),
+    );
+    const tx = mountTx();
+    await expect(
+      service.setOrderVisaStatus('o1', VisaRequirement.NEEDED, STAFF, {
+        noteData: { noteVisa: '这句也不该落库' },
+      }),
+    ).rejects.toBeInstanceOf(BadRequestError);
     expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+    expect(tx.order.update).not.toHaveBeenCalled();
   });
 
   it('回收站 / 取消族单不受矛盾闸约束（不参与履约，允许状态收尾）', async () => {

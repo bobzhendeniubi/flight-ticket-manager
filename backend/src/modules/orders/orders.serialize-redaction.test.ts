@@ -120,6 +120,7 @@ describe('orderSerializeRoleCtx', () => {
       expect(orderSerializeRoleCtx(role)).toEqual({
         includePassportPhotos: true,
         redactForExternal: false,
+        role,
       });
     }
   });
@@ -129,8 +130,29 @@ describe('orderSerializeRoleCtx', () => {
       expect(orderSerializeRoleCtx(role)).toEqual({
         includePassportPhotos: false,
         redactForExternal: true,
+        role,
       });
     }
+  });
+});
+
+// ── 代理自助改单窗口（agentSelfEdit）：客户视角整个不下发（L2）────────────────────
+// 这是代理与我方之间的业务口径（「这单今天还能不能自己改」），客户既没有这条通道，
+// 也不该从响应里读出我方的内部时限。代理/运营照常下发（代理端要据此显示入口与倒计时）。
+describe('serializeOrder · agentSelfEdit 的角色可见性', () => {
+  it('客户视角：响应体里连键都不出现', () => {
+    const serialized = serializeOrder(
+      buildOrder() as never,
+      orderSerializeRoleCtx(UserRole.CUSTOMER),
+    );
+    expect('agentSelfEdit' in JSON.parse(JSON.stringify(serialized))).toBe(false);
+  });
+
+  it.each([UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT])('%s 视角：照常下发窗口', (role) => {
+    const serialized = serializeOrder(buildOrder() as never, orderSerializeRoleCtx(role)) as {
+      agentSelfEdit?: { open: boolean };
+    };
+    expect(serialized.agentSelfEdit).toMatchObject({ open: expect.any(Boolean) });
   });
 });
 

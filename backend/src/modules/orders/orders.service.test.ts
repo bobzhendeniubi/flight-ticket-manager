@@ -105,7 +105,8 @@ const {
       updateMany: vi.fn(),
     },
     orderCostItem: { create: vi.fn() },
-    auditLog: { create: vi.fn() },
+    // findMany：订正通道的「历史订正」闸要回查这位出行人此前的 CORRECT_ORDER_PASSENGER 审计。
+    auditLog: { create: vi.fn(), findMany: vi.fn(async () => []) },
     seatLock: {
       aggregate: vi.fn(),
       findMany: vi.fn(),
@@ -3701,6 +3702,9 @@ describe('correctPassenger · 订正证件资料', () => {
 
   beforeEach(() => {
     vi.clearAllMocks();
+    // 「历史订正」闸的审计回查：默认无历史。逐条重置（clearAllMocks 只清调用记录，
+    // 不清 mockResolvedValueOnce 的队列 —— 未被消费的 once 值会串到下一条用例）。
+    mockPrisma.auditLog.findMany.mockReset().mockResolvedValue([]);
   });
 
   it('订正一个字符的证件号 → 只写证件号，护照图/签发地/签证号/票号一个都不清空', async () => {
@@ -3832,6 +3836,95 @@ describe('correctPassenger · 订正证件资料', () => {
     );
 
     expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
+  });
+
+  // ══════════════════════════════════════════════════════════════════════
+  // 分两步的伪装换人：单看每一次都像正常订正，合起来是另一个人上飞机
+  // ══════════════════════════════════════════════════════════════════════
+  const MINE = { userId: 'u-agent', role: 'AGENT' as const, agentId: 'agent-mine' };
+
+  it('只改姓名、证件号不动：小改（错字）放行，大改 → 400 指路换人', async () => {
+    const service = new OrderService();
+
+    // ZHANG/SAN → ZHANG/SAM：一个字符，典型 OCR 错字 → 放行
+    armCorrectMocks({ agentId: 'agent-mine' });
+    await service.correctPassenger('ord1', 'px1', { fullName: 'ZHANG/SAM' }, MINE);
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
+
+    // ZHANG/SAN → LI/SI：整个换了个名字（证件号一个字没动，闸④根本量不到）
+    armCorrectMocks({ agentId: 'agent-mine' });
+    mockPrisma.passenger.update.mockClear();
+    await expect(
+      service.correctPassenger('ord1', 'px1', { fullName: 'LI/SI' }, MINE),
+    ).rejects.toThrow('姓名改动较大，请使用「换人」');
+    expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+
+  it('运营改名字不吃幅度闸（核对现场的人是他自己）', async () => {
+    const service = new OrderService();
+    armCorrectMocks();
+
+    await service.correctPassenger('ord1', 'px1', { fullName: 'LI/SI' }, OPS);
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
+  });
+
+  it.each([
+    ['此前改过姓名、这次改证件号', ['fullName'], { documentNumber: 'E12345078' }],
+    ['此前改过证件号、这次改姓名', ['documentNumber'], { fullName: 'ZHANG/SAM' }],
+  ])('%s → 400 指路换人（分两步的换人也是换人）', async (_label, priorFields, patch) => {
+    const service = new OrderService();
+    armCorrectMocks({ agentId: 'agent-mine' });
+    mockPrisma.auditLog.findMany.mockResolvedValueOnce([
+      { before: { passengerId: 'px1' }, after: { changedFields: priorFields } },
+    ]);
+
+    await expect(service.correctPassenger('ord1', 'px1', patch, MINE)).rejects.toThrow(
+      '该出行人此前已订正过姓名/证件号，再次改动请使用「换人」',
+    );
+    // 历史闸只认这一位出行人的订正流水
+    expect(mockPrisma.auditLog.findMany.mock.calls[0][0].where).toEqual({
+      action: 'CORRECT_ORDER_PASSENGER',
+      before: { path: ['passengerId'], equals: 'px1' },
+    });
+    expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+
+  it('此前只改过生日/性别 → 这次改姓名照旧放行（历史闸只认姓名与证件号）', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ agentId: 'agent-mine' });
+    mockPrisma.auditLog.findMany.mockResolvedValueOnce([
+      { before: { passengerId: 'px1' }, after: { changedFields: ['dateOfBirth', 'gender'] } },
+    ]);
+
+    await service.correctPassenger('ord1', 'px1', { fullName: 'ZHANG/SAM' }, MINE);
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('运营不吃历史闸，也不为此白查一次审计', async () => {
+    const service = new OrderService();
+    armCorrectMocks();
+    mockPrisma.auditLog.findMany.mockResolvedValueOnce([
+      { before: { passengerId: 'px1' }, after: { changedFields: ['fullName'] } },
+    ]);
+
+    await service.correctPassenger('ord1', 'px1', { documentNumber: 'E12345078' }, OPS);
+    expect(mockPrisma.auditLog.findMany).not.toHaveBeenCalled();
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('同单证件号查重大小写不敏感（M3：存量里大小写混杂）', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ sameOrderDup: { id: 'px2' } });
+
+    await expect(
+      service.correctPassenger('ord1', 'px1', { documentNumber: 'e12345078' }, OPS),
+    ).rejects.toThrow('同一订单内已有相同证件号的出行人');
+    expect(mockPrisma.passenger.findFirst.mock.calls[0][0].where).toEqual({
+      orderId: 'ord1',
+      id: { not: 'px1' },
+      // 订正通道统一大写后再比，且比对本身大小写不敏感
+      documentNumber: { equals: 'E12345078', mode: 'insensitive' },
+    });
   });
 
   it('改生日 → 按出发日权威重派生出行人类型（与换人 1b2 同口径）', async () => {

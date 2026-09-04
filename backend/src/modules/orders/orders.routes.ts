@@ -1540,17 +1540,6 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     });
     if (!before) return reply.status(404).send({ error: '订单不存在' });
 
-    // ── 签证状态：写入 + 矛盾组合硬闸 + 任务同步，统一收在 service.setOrderVisaStatus ──
-    // 先跑它再写备注四栏：矛盾组合在写库之前就抛 400（口径同抽出前——拒掉的请求一个字都不落库）。
-    // 「改成需签 / 电子签但全员自备签」这种组合不会生成签证任务，签证台看不见这单，到期漏送签。
-    if (body.visaStatus !== undefined) {
-      await service.setOrderVisaStatus(id, body.visaStatus, {
-        userId: req.user.sub,
-        role,
-        agentId: requester.agentId,
-      });
-    }
-
     const plainNoteData = {
       ...(body.notes !== undefined && { notes: body.notes }),
       ...(body.internalNotes !== undefined && { internalNotes: body.internalNotes }),
@@ -1559,7 +1548,23 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       ...(body.notePayment !== undefined && { notePayment: body.notePayment }),
       ...(body.noteSpecial !== undefined && { noteSpecial: body.noteSpecial }),
     };
-    if (Object.keys(plainNoteData).length > 0) {
+
+    // ── 签证状态 + 备注四栏：同一条 UPDATE、同一个事务（矛盾闸与签证任务同步都在里头）──
+    // 界面上这是一次提交，落库也必须是一次：分两条写时中间失败就留下「签证状态改了、备注没改」
+    // 的半拉现场，而运营看到的是一个失败的请求，根本不会想到去补那一半。
+    // 矛盾组合（改成需签 / 电子签但全员自备签）仍在写库之前抛 400，拒掉的请求一个字都不落库。
+    // withOrder:false —— 本端点只回 { ok: true }，不必为它拼一次整单富联查。
+    if (body.visaStatus !== undefined) {
+      await service.setOrderVisaStatus(
+        id,
+        body.visaStatus,
+        { userId: req.user.sub, role, agentId: requester.agentId },
+        {
+          withOrder: false,
+          ...(Object.keys(plainNoteData).length > 0 ? { noteData: plainNoteData } : {}),
+        },
+      );
+    } else if (Object.keys(plainNoteData).length > 0) {
       await prisma.order.update({ where: { id }, data: plainNoteData });
     }
     void writeAudit({
@@ -2156,6 +2161,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       body.itemId,
       body.newScheduleId,
       { userId: req.user.sub, role, agentId: requester.agentId },
+      // 已出票单放行只对运营生效（service 内按角色再判一次，代理传了也不认）。
+      { allowTicketed: body.allowTicketed },
     );
     void writeAudit({
       actor: actorFromRequest(req),
