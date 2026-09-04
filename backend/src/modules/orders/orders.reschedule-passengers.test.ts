@@ -701,39 +701,58 @@ describe('按人改期 · 部分乘客的同 token 重试（A2）', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-// 全员勾选（快路径）的幂等：首次已提交、客户端超时原样重试。
-// 该行已经落在目标班次+目标舱位上 → 视为回放：不再调改期（否则改期差价会被再记一条、
-// adjustmentCny 再加一次，客人被重复收差价），也不重复写汇总审计。
+// 全员勾选（快路径）的幂等：靠 token 绑定，不靠「该行是否已在目标班次」。
+//
+// 「已在目标班次即回放」认不出 token：换一个新请求编号、换一份差价重发，只要班次
+// 恰好已经对上就照样回一个成功，本次真正要收的差价一分没收，运营看到的是 200。
+// 现在改用航段行 metadata 上的 legActionLog（append-only 的 token 流水，与
+// no-show / 取消航段 / 恢复回程同一套）：同 token 且指纹一致才回放，指纹对不上 409。
 // ══════════════════════════════════════════════════════════════════════════
 describe('按人改期 · 全员勾选的同 token 重试（A1）', () => {
-  /** 第二次调用时的源单快照：去程行已经在目标班次 sch-new 上。 */
-  const alreadyOnTarget = () =>
+  const ALL_PAX = ['p1', 'p2', 'p3'];
+
+  /** 首刷已在去程行上留下本 token 的 RESCHEDULE_ALL 流水。 */
+  const withLegActionLog = (fingerprintPayload: Record<string, unknown>) =>
     sourceSnapshot({
       items: [
         {
           id: 'leg-out',
           flightScheduleId: 'sch-new',
-          flightCabin: 'ECONOMY',
           flightSchedule: { departureTime: OUT_DEPART, departureTz: 'Asia/Shanghai' },
+          metadata: {
+            legActionLog: [
+              {
+                type: 'RESCHEDULE_ALL',
+                requestToken: TOKEN,
+                at: '2026-09-04T00:00:00.000Z',
+                byUserId: 'admin-1',
+                fingerprint: JSON.stringify(fingerprintPayload),
+              },
+            ],
+          },
         },
         {
           id: 'leg-ret',
           flightScheduleId: 'sch-ret',
-          flightCabin: 'ECONOMY',
           flightSchedule: { departureTime: RET_DEPART, departureTz: 'Asia/Shanghai' },
+          metadata: {},
         },
       ],
     });
 
-  it('该行已在目标班次 → 不再调改期、不重复写审计、rescheduleSkipped=true', async () => {
-    mockPrisma.order.findUnique.mockResolvedValue(alreadyOnTarget());
+  /** 首刷那次的入参指纹（键按字母序，与 legActionFingerprint 同口径）。 */
+  const FIRST_RUN_FINGERPRINT = {
+    feeCny: 300,
+    newCabin: null,
+    newScheduleId: 'sch-new',
+    orderItemId: 'leg-out',
+  };
+
+  it('同 token 原样重试 → 回放：不再调改期、不重复写审计、rescheduleSkipped=true', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(withLegActionLog(FIRST_RUN_FINGERPRINT));
     const reschedule = vi.spyOn(service, 'rescheduleOrderItem');
 
-    const result = await service.reschedulePassengers(
-      'o1',
-      body({ passengerIds: ['p1', 'p2', 'p3'] }),
-      admin,
-    );
+    const result = await service.reschedulePassengers('o1', body({ passengerIds: ALL_PAX }), admin);
 
     expect(reschedule).not.toHaveBeenCalled();
     expect(result.splitPerformed).toBe(false);
@@ -742,18 +761,85 @@ describe('按人改期 · 全员勾选的同 token 重试（A1）', () => {
     expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
   });
 
-  it('目标舱位与当前不同 → 不算回放，照常改期', async () => {
-    mockPrisma.order.findUnique.mockResolvedValue(alreadyOnTarget());
+  it('同 token 换一份差价重发 → 409，不静默按上一次的入参回成功', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(withLegActionLog(FIRST_RUN_FINGERPRINT));
+    const reschedule = vi.spyOn(service, 'rescheduleOrderItem');
+
+    const err = await service
+      .reschedulePassengers('o1', body({ passengerIds: ALL_PAX, feeCny: 900 }), admin)
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(AppError);
+    expect(err.statusCode).toBe(409);
+    expect(err.code).toBe('TOKEN_PAYLOAD_MISMATCH');
+    expect(reschedule).not.toHaveBeenCalled();
+  });
+
+  it('同 token 换一个目标班次重发 → 409', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(withLegActionLog(FIRST_RUN_FINGERPRINT));
+
+    const err = await service
+      .reschedulePassengers('o1', body({ passengerIds: ALL_PAX, newScheduleId: 'sch-other' }), admin)
+      .catch((e) => e);
+
+    expect(err.statusCode).toBe(409);
+    expect(err.code).toBe('TOKEN_PAYLOAD_MISMATCH');
+  });
+
+  it('这个 token 是别的航段动作用过的 → 409（动作类型不符）', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(
+      sourceSnapshot({
+        items: [
+          {
+            id: 'leg-out',
+            flightScheduleId: 'sch-new',
+            flightSchedule: { departureTime: OUT_DEPART, departureTz: 'Asia/Shanghai' },
+            metadata: {
+              legActionLog: [
+                { type: 'NO_SHOW', requestToken: TOKEN, fingerprint: '{}' },
+              ],
+            },
+          },
+        ],
+      }),
+    );
+
+    const err = await service
+      .reschedulePassengers('o1', body({ passengerIds: ALL_PAX }), admin)
+      .catch((e) => e);
+
+    expect(err.statusCode).toBe(409);
+    expect(err.details).toMatchObject({ reason: 'ACTION_TYPE' });
+  });
+
+  it('换一个新 token：班次恰好已经对上也照样真改期（不再拿「已在目标班次」当回放）', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(withLegActionLog(FIRST_RUN_FINGERPRINT));
     const reschedule = vi
       .spyOn(service, 'rescheduleOrderItem')
       .mockResolvedValue(rescheduleOutcome('FTM20260901-SRC'));
 
     await service.reschedulePassengers(
       'o1',
-      body({ passengerIds: ['p1', 'p2', 'p3'], newCabin: 'BUSINESS' }),
+      body({ passengerIds: ALL_PAX, requestToken: '00000000-0000-4000-8000-0000000ffff1' }),
       admin,
     );
+
     expect(reschedule).toHaveBeenCalledTimes(1);
+  });
+
+  it('首刷把 requestToken 传进改期，供下次回放绑定', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(sourceSnapshot());
+    const reschedule = vi
+      .spyOn(service, 'rescheduleOrderItem')
+      .mockResolvedValue(rescheduleOutcome('FTM20260901-SRC'));
+
+    await service.reschedulePassengers('o1', body({ passengerIds: ALL_PAX }), admin);
+
+    expect(reschedule).toHaveBeenCalledWith(
+      'o1',
+      expect.objectContaining({ orderItemId: 'leg-out', requestToken: TOKEN }),
+      admin,
+    );
   });
 });
 

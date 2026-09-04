@@ -7970,6 +7970,16 @@ export class OrderService {
       note?: string;
       /** 仅批量入口使用；省略时保持单条改期路由原有行为。 */
       guard?: { forbidTicketed?: boolean; correction?: boolean };
+      /**
+       * 幂等键（按人改期的全员快路径传）：成功后在同一事务里往该航段行的 legActionLog
+       * 追加一条 RESCHEDULE_ALL 流水，编排层下次拿同一个 token 重试时据此回放。
+       *
+       * 为什么 append 放在这里、而不是等它返回后另起一个事务补写：本方法整个是一个
+       * `prisma.$transaction`，返回时座位与金额都已提交。事务外补写一旦失败（进程被杀、
+       * 连接断开），就留下「钱已收、流水没留」的状态，下次重试认不出回放会再收一次差价。
+       * 而且这一行的 metadata 正是本方法在改（flightChanged 标记），两处分开写必然互相覆盖。
+       */
+      requestToken?: string;
     },
     actor: { userId: string; role: UserRole },
   ): Promise<{
@@ -8131,6 +8141,17 @@ export class OrderService {
       // 无变化（同班次同舱位）→ 不做座位搬移，避免无意义的放/拿
       const sameSeat = oldScheduleId === newScheduleId && oldCabin === newCabin;
 
+      // ── 同班次同舱位还带着差价 = 自相矛盾的请求，直接拒 ──────────────────────
+      // 不能改成「静默不收」：本方法返回的 audit 里带的是请求里的 feeCny，路由照它写审计
+      // 「已收 ¥X」。悄悄清零就成了「审计说收了、账上没这笔钱」，事后对账对不上，而运营
+      // 当场看到的还是一次成功。拒掉，审计里记的就永远是真实生效的金额。
+      // 差价为 0 照旧放行（没搬座、也没钱可谈）；纠错通道（correction）本来就不动钱，不受约束。
+      if (sameSeat && feeCny !== 0 && !input.guard?.correction) {
+        throw new BadRequestError(
+          '班次与舱位都没变，不能只收/退改期差价；要单独调整金额请走按乘客调价。',
+        );
+      }
+
       if (input.guard?.correction && !sameSeat && item.bundleId) {
         const discountRows = await tx.orderItem.findMany({
           where: { orderId, kind: OrderItemKind.DISCOUNT },
@@ -8205,15 +8226,33 @@ export class OrderService {
       }
 
       // ── 3. 更新订单行的班次/舱位（amount/quantity 不变：机票基础价不重算）──
+      // metadata 一次写完：「航变标记」与「幂等流水」都挂在这一行上，分两次写必然互相覆盖。
+      const nextMeta: Record<string, unknown> | null =
+        flightChangedMeta || input.requestToken
+          ? {
+              ...meta,
+              // 换班次 → 落「航变」标记（保留该行原有 metadata，如套餐升舱拆座计数）
+              ...(flightChangedMeta ? { flightChanged: flightChangedMeta } : {}),
+              // 幂等流水：与座位、金额同一个事务提交，绝不会出现「钱已收、流水没留」。
+              ...(input.requestToken
+                ? {
+                    legActionLog: appendLegActionLog(meta, {
+                      type: 'RESCHEDULE_ALL',
+                      requestToken: input.requestToken,
+                      at: new Date().toISOString(),
+                      byUserId: actor.userId,
+                      fingerprint: rescheduleAllFingerprint(input),
+                    }),
+                  }
+                : {}),
+            }
+          : null;
       await tx.orderItem.update({
         where: { id: item.id },
         data: {
           flightScheduleId: newScheduleId,
           flightCabin: newCabin,
-          // 换班次 → 落「航变」标记（保留该行原有 metadata，如套餐升舱拆座计数）
-          ...(flightChangedMeta
-            ? { metadata: { ...meta, flightChanged: flightChangedMeta } as Prisma.InputJsonValue }
-            : {}),
+          ...(nextMeta ? { metadata: nextMeta as Prisma.InputJsonValue } : {}),
         },
       });
 
@@ -8390,12 +8429,9 @@ export class OrderService {
       // ── 4. 改期立减取消补差 + 手填改期费（两笔分别留流水）──
       // 改期后原立减不随新日期重新命中：只撤销订单上尚未撤销的快照行，
       // 并把等额补差记入 adjustmentCny。行级 revoked 标记保证同单二次改期幂等。
-      // sameSeat（同班次同舱位）不收改期差价：座位本来就不搬，「改期到原地」本身没有业务意义，
-      // 首次成功后客户端超时重试会带着同一份 feeCny 再打一次 —— 旧口径会再记一条 RESCHEDULE_FEE、
-      // adjustmentCny 再加一次，客人被重复收差价。纯纠错请走 correction 通道。
-      // ⚠ PATCH /orders/:id/reschedule 也走这条路径：「班次不变只手填一笔差价」从此不再入账，
-      // 要单独收/退钱请走按乘客调价或对应的售后费入口。
-      let adjustmentDelta = input.guard?.correction || sameSeat ? 0 : feeCny;
+      // 走到这里 sameSeat 必然带着 feeCny === 0（有金额的已在上面被拒），无须再夹一层：
+      // 审计记的 feeCny 与这里实际入账的金额永远是同一个数。
+      let adjustmentDelta = input.guard?.correction ? 0 : feeCny;
       let adjustmentLog = order.adjustments;
       if (!sameSeat && !input.guard?.correction) {
         // 立减只挂在套餐地面价上：纯机票行改期与立减无关。
@@ -8446,7 +8482,7 @@ export class OrderService {
       }
       // feeCny 可正可负（改到贵班次补差 / 改到便宜班次退差），故判 !== 0 而不是 > 0。
       // 默认名从「改期费」改为「改期差价」——它现在两个方向都用。
-      if (feeCny !== 0 && !input.guard?.correction && !sameSeat) {
+      if (feeCny !== 0 && !input.guard?.correction) {
         adjustmentLog = appendAdjustment(adjustmentLog, {
           type: 'RESCHEDULE_FEE',
           label: input.feeLabel || '改期差价',
@@ -13934,8 +13970,8 @@ export class OrderService {
           select: {
             id: true,
             flightScheduleId: true,
-            // flightCabin 供全员分支的「是否已落在目标班次+目标舱位」回放判定。
-            flightCabin: true,
+            // metadata 供全员分支按 legActionLog 做 token 绑定的幂等回放判定。
+            metadata: true,
             // departureTz 只为「已起飞」闸的人话文案（当地起飞时刻），与改期端点同一份折算。
             flightSchedule: { select: { departureTime: true, departureTz: true } },
           },
@@ -14061,18 +14097,17 @@ export class OrderService {
     // 回放命中的请求一律走部分乘客那条路：首次已把人拆走，源单剩下的人可能比本次勾的还少，
     // 拿「勾的人数 ≥ 源单人数」去判会把一次重试误判成整单改期，对源单再改一次期。
     if (!replaySplit && movedIds.length >= allPaxIds.size) {
-      // 3a. 幂等回放：首次已提交、客户端超时原样重试时，这一行已经落在目标班次+目标舱位上。
-      // 快路径不带 requestToken 进 rescheduleOrderItem（那边没有幂等键），再调一次只会被
-      // sameSeat 跳过座位搬移 —— 改期差价却会被再记一条 RESCHEDULE_FEE、adjustmentCny 再加
-      // 一次，客人被重复收差价。判定口径与部分乘客分支的 alreadyRescheduled 一致：
-      // 「该行现在就在目标班次上（指定了舱位则舱位也一致）」。
-      // 视为回放 → 返回当前订单，rescheduleSkipped=true，汇总审计不重复写。
-      const selectedItem = order.items.find((it) => it.id === input.orderItemId);
-      const alreadyOnTarget =
-        selectedItem != null &&
-        selectedItem.flightScheduleId === input.newScheduleId &&
-        (input.newCabin === undefined || selectedItem.flightCabin === input.newCabin);
-      if (alreadyOnTarget) {
+      // 3a. 幂等回放：**按 token 绑定**，不按「该行是否已经落在目标班次上」。
+      //
+      // 后者认不出请求编号：换一个新 token、换一份差价重发，只要班次恰好已经对上就照样
+      // 回一个成功，本次真正要收的差价一分没收，运营看到的却是 200。
+      // 现在与 no-show / 取消航段 / 恢复回程同一套机制：认这张单任一航段行 legActionLog 上
+      // 见过的 token，动作类型必须是 RESCHEDULE_ALL、入参指纹必须一致，否则 409；
+      // 老数据没有指纹一律 fail-closed（assertLegActionTokenReplay 内）。
+      // 命中回放 → 返回当前订单，rescheduleSkipped=true，汇总审计不重复写。
+      const tokenLookup = hasSeenLegActionToken(order.items, input.requestToken);
+      if (tokenLookup.seen) {
+        assertLegActionTokenReplay(tokenLookup, ['RESCHEDULE_ALL'], rescheduleAllFingerprint(input));
         const current = await prisma.order.findUniqueOrThrow({
           where: { id: orderId },
           include: ORDER_FULL_INCLUDE,
@@ -14106,6 +14141,8 @@ export class OrderService {
           feeCny: input.feeCny,
           feeLabel: input.feeLabel,
           note: input.note,
+          // 幂等键：改期与流水同一事务提交，下次同 token 重试据此回放（上面 3a）。
+          requestToken: input.requestToken,
         },
         actor,
       );
@@ -16932,9 +16969,16 @@ export interface ReturnReleasedSnapshot {
 /**
  * 航段动作类型（legActionLog 条目的 type）。
  * 每个端点只接受属于自己的那几种：no-show 端点接 NO_SHOW/RELEASE，恢复只接 RESTORE，
- * 取消航段只接 CANCEL_LEG，起飞后作废只接 VOID —— 跨动作复用同一个 token 一律拒。
+ * 取消航段只接 CANCEL_LEG，起飞后作废只接 VOID，按人改期的全员快路径只接
+ * RESCHEDULE_ALL —— 跨动作复用同一个 token 一律拒。
  */
-export type LegActionType = 'NO_SHOW' | 'RELEASE' | 'RESTORE' | 'CANCEL_LEG' | 'VOID';
+export type LegActionType =
+  | 'NO_SHOW'
+  | 'RELEASE'
+  | 'RESTORE'
+  | 'CANCEL_LEG'
+  | 'VOID'
+  | 'RESCHEDULE_ALL';
 
 /**
  * 一条航段动作流水（no-show / 再释放 / 恢复 / 取消航段 / 作废各一条）。
@@ -17004,6 +17048,27 @@ function cancelLegFingerprint(input: CancelLegBody): string {
     feeMode: input.feeMode,
     manualFeeCny: input.feeMode === 'MANUAL' ? Math.trunc(input.manualFeeCny ?? 0) : null,
     overrideReason: input.overrideReason?.trim() || null,
+  });
+}
+
+/**
+ * 按人改期「全员快路径」的入参指纹（决定改哪一行、改到哪、收多少差价）。
+ *
+ * 这条路径不拆单，直接落到整单改期上 —— 座位真搬、差价真记，重复执行就是重复计费，
+ * 所以幂等只能靠 token 绑定：同一个 requestToken 命中且指纹一致才回放，对不上一律 409。
+ * feeLabel / note 不入指纹（只影响留痕文案，改个备注重试不该被拦成 409）。
+ */
+function rescheduleAllFingerprint(input: {
+  orderItemId?: string;
+  newScheduleId: string;
+  newCabin?: CabinClass;
+  feeCny?: number;
+}): string {
+  return legActionFingerprint({
+    orderItemId: input.orderItemId ?? null,
+    newScheduleId: input.newScheduleId,
+    newCabin: input.newCabin ?? null,
+    feeCny: Math.trunc(input.feeCny ?? 0),
   });
 }
 

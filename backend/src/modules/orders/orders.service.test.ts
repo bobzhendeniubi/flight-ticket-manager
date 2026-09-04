@@ -207,7 +207,7 @@ import {
   computeGroundItemAmounts,
   resolveGroundItemUnitPrice,
 } from './orders.service.js';
-import { PriceChangedError } from '../../lib/errors.js';
+import { BadRequestError, PriceChangedError } from '../../lib/errors.js';
 import type { OrderItemInput } from './orders.schemas.js';
 import {
   batchCreateOrdersBodySchema,
@@ -4123,7 +4123,7 @@ describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
     }));
   });
 
-  it('同班次同舱位 → 不撤销立减，也不记改期差价（改期到原地没有业务意义）', async () => {
+  it('同班次同舱位还带差价 → 直接拒绝，一分钱一条流水都不落', async () => {
     const service = new OrderService();
     mockPrisma.order.findUnique.mockReset().mockResolvedValue({
       id: 'ord1',
@@ -4152,21 +4152,20 @@ describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
     mockPrisma.order.update.mockReset().mockResolvedValue({});
     mockPrisma.order.findUniqueOrThrow.mockReset().mockResolvedValue(fakeFullOrder({ adjustmentCny: 80 }));
 
-    await service.rescheduleOrderItem(
-      'ord1',
-      { orderItemId: 'it1', newScheduleId: 'sched1', newCabin: 'ECONOMY', feeCny: 80 },
-      { userId: 'admin1', role: 'ADMIN' },
-    );
+    await expect(
+      service.rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'it1', newScheduleId: 'sched1', newCabin: 'ECONOMY', feeCny: 80 },
+        { userId: 'admin1', role: 'ADMIN' },
+      ),
+    ).rejects.toThrow(/班次与舱位都没变/u);
 
+    // 立减一分没撤，改期差价一分没记，订单行也没被动过 —— 拒得干干净净，
+    // 审计里不会留下一笔「已收 ¥80」而账上其实没这笔钱。
     expect(mockPrisma.orderItem.findMany).not.toHaveBeenCalledWith(
       expect.objectContaining({ where: { orderId: 'ord1', kind: 'DISCOUNT' } }),
     );
-    expect(mockPrisma.orderItem.update).toHaveBeenCalledTimes(1);
-    expect(mockPrisma.orderItem.update).toHaveBeenCalledWith(expect.objectContaining({
-      where: { id: 'it1' },
-    }));
-    // 立减一分没撤（280 那条口径本来就不该出现），改期差价也一分没记：
-    // 座位没搬、行程没变，重试时再打一次同样不会重复计费。
+    expect(mockPrisma.orderItem.update).not.toHaveBeenCalled();
     expect(mockPrisma.order.update).not.toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ adjustmentCny: 80 }),
     }));
@@ -4263,11 +4262,13 @@ describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
-// 同班次同舱位（sameSeat）：座位本来就不搬，改期差价也不该收。
-// 首次改期成功后客户端超时重试会带着同一份 feeCny 再打一次，旧口径会再记一条
-// RESCHEDULE_FEE、adjustmentCny 再加一次 —— 客人被重复收差价。
+// 同班次同舱位（sameSeat）还带着改期差价 —— 这是一次自相矛盾的请求，直接拒。
+//
+// 为什么不能「静默不收」：这个方法返回的 audit 里带的是请求里的 feeCny，路由照它
+// 写审计「已收 ¥X」。悄悄清零就成了「审计说收了、账上没这笔钱」，事后对账对不上，
+// 而运营当场看到的是一次成功。要单独收/退一笔钱请走按乘客调价。
 // ══════════════════════════════════════════════════════════════════════════
-describe('OrderService.rescheduleOrderItem · 同班次同舱位不收改期差价', () => {
+describe('OrderService.rescheduleOrderItem · 同班次同舱位带差价一律拒绝', () => {
   const armSameSeat = () => {
     mockPrisma.order.findUnique.mockReset().mockResolvedValue({
       id: 'ord1',
@@ -4299,13 +4300,47 @@ describe('OrderService.rescheduleOrderItem · 同班次同舱位不收改期差�
     mockPrisma.order.findUniqueOrThrow.mockReset().mockResolvedValue(fakeFullOrder());
   };
 
-  it('改到同班次同舱位且带 feeCny → 不追加改期差价流水、不动 adjustmentCny', async () => {
+  it('改到同班次同舱位且带 feeCny → 400，引导走按乘客调价', async () => {
+    const service = new OrderService();
+    armSameSeat();
+
+    const err = await service
+      .rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'it1', newScheduleId: 'sched1', feeCny: 300 },
+        { userId: 'admin1', role: 'ADMIN' },
+      )
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(BadRequestError);
+    expect(err.message).toContain('按乘客调价');
+    const adjustmentWrites = mockPrisma.order.update.mock.calls.filter(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0]?.data?.adjustmentCny !== undefined,
+    );
+    expect(adjustmentWrites).toHaveLength(0);
+  });
+
+  it('负差价（退钱）同样拒绝：判的是「有没有金额」不是「正不正」', async () => {
+    const service = new OrderService();
+    armSameSeat();
+
+    await expect(
+      service.rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'it1', newScheduleId: 'sched1', feeCny: -300 },
+        { userId: 'admin1', role: 'ADMIN' },
+      ),
+    ).rejects.toBeInstanceOf(BadRequestError);
+  });
+
+  it('同班次同舱位但差价为 0 → 照旧放行（无座位搬移、无差价）', async () => {
     const service = new OrderService();
     armSameSeat();
 
     await service.rescheduleOrderItem(
       'ord1',
-      { orderItemId: 'it1', newScheduleId: 'sched1', feeCny: 300 },
+      { orderItemId: 'it1', newScheduleId: 'sched1', feeCny: 0 },
       { userId: 'admin1', role: 'ADMIN' },
     );
 
@@ -4316,17 +4351,15 @@ describe('OrderService.rescheduleOrderItem · 同班次同舱位不收改期差�
     expect(adjustmentWrites).toHaveLength(0);
   });
 
-  it('同 feeCny 连打两次 → 仍然一分不收（幂等）', async () => {
+  it('纠错通道（correction）不受这道闸约束', async () => {
     const service = new OrderService();
     armSameSeat();
 
-    for (let i = 0; i < 2; i++) {
-      await service.rescheduleOrderItem(
-        'ord1',
-        { orderItemId: 'it1', newScheduleId: 'sched1', feeCny: 300 },
-        { userId: 'admin1', role: 'ADMIN' },
-      );
-    }
+    await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'it1', newScheduleId: 'sched1', feeCny: 300, guard: { correction: true } },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
 
     const adjustmentWrites = mockPrisma.order.update.mock.calls.filter(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -4465,13 +4498,13 @@ describe('OrderService.rescheduleOrderItem · 换班次即作废原票', () => {
     });
   });
 
-  it('同班次（只收差价、不换航段）→ 票号与开票位一律不动', async () => {
+  it('同班次不换航段（差价 0）→ 票号与开票位一律不动', async () => {
     const service = new OrderService();
     mountRoundTrip('outbound-item');
 
     await service.rescheduleOrderItem(
       'ord1',
-      { orderItemId: 'outbound-item', newScheduleId: 'schedOut', feeCny: 100 },
+      { orderItemId: 'outbound-item', newScheduleId: 'schedOut', feeCny: 0 },
       { userId: 'admin1', role: 'ADMIN' },
     );
 
@@ -4479,6 +4512,20 @@ describe('OrderService.rescheduleOrderItem · 换班次即作废原票', () => {
     expect(mockPrisma.order.update).not.toHaveBeenCalledWith(
       expect.objectContaining({ data: { outboundInvoiced: false } }),
     );
+  });
+
+  it('同班次还想顺手收一笔差价 → 拒（票务字段更不该被这种请求碰到）', async () => {
+    const service = new OrderService();
+    mountRoundTrip('outbound-item');
+
+    await expect(
+      service.rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'outbound-item', newScheduleId: 'schedOut', feeCny: 100 },
+        { userId: 'admin1', role: 'ADMIN' },
+      ),
+    ).rejects.toBeInstanceOf(BadRequestError);
+    expect(mockPrisma.passenger.updateMany).not.toHaveBeenCalled();
   });
 
   it('负差价（改到便宜班次要退差）→ adjustmentCny 下调并留一条「改期差价」流水', async () => {
@@ -4502,7 +4549,7 @@ describe('OrderService.rescheduleOrderItem · 换班次即作废原票', () => {
     );
   });
 
-  it('CHANGE_REQUESTED 下只收差价不换班次 → 不推 CHANGED（没航变就不是已改期），也不报错', async () => {
+  it('CHANGE_REQUESTED 下改到同班次 → 不推 CHANGED（没航变就不是已改期），也不报错', async () => {
     // 回归：CHANGED 派生闸要求本单有 flightChanged 标记，而同班次调用根本不落标记。
     // 若这里仍去推状态，就会撞上自家的闸把整笔改期回滚 —— 运营看到的是自相矛盾的报错。
     const service = new OrderService();
@@ -4518,7 +4565,7 @@ describe('OrderService.rescheduleOrderItem · 换班次即作废原票', () => {
 
     const result = await service.rescheduleOrderItem(
       'ord1',
-      { orderItemId: 'outbound-item', newScheduleId: 'schedOut', feeCny: 200 },
+      { orderItemId: 'outbound-item', newScheduleId: 'schedOut', feeCny: 0 },
       { userId: 'admin1', role: 'ADMIN' },
     );
 
