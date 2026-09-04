@@ -103,9 +103,12 @@ const pax = (id: string, over: Record<string, unknown> = {}) => ({
   ...over,
 });
 
+const SOURCE_CREATED_AT = new Date('2026-08-15T02:00:00.000Z');
+
 const baseOrder = (over: Record<string, unknown> = {}) => ({
   id: 'o1',
   orderNumber: 'FTM20260830-SRC',
+  createdAt: SOURCE_CREATED_AT,
   userId: null,
   agentId: null,
   guestName: null,
@@ -2009,6 +2012,24 @@ describe('拆单 · 分房/房数脏数据闸（L2 / L4）', () => {
     const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
     expect(r.eligible).toBe(false);
     expect(r.blockers.join()).toContain('不是 0.5 的整数倍');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('拆单 · 新单继承源单下单时刻（跨月拆单的财务分期）', () => {
+  it('新单 createdAt = 源单 createdAt，不落建单当刻', async () => {
+    armExecute({
+      order: baseOrder(),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 0 },
+      finalTarget: { total: 1000, paidAmount: 500 },
+    });
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    const created = mockPrisma.order.create.mock.calls[0][0].data;
+    expect(created.createdAt).toEqual(SOURCE_CREATED_AT);
   });
 });
 

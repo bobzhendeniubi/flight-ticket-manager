@@ -13091,6 +13091,10 @@ export class OrderService {
     const target = await tx.order.create({
       data: {
         orderNumber: targetOrderNumber,
+        // 下单时刻原样继承源单（与下面佣金记录同口径）：财务/毛利报表按 order.createdAt 圈期，
+        // 用默认的「now」会把一张 8 月的单拆出一张 9 月的新单 —— 8 月少算一半、9 月凭空多一半。
+        // 拆单是同一笔业务的一分为二，不是新成交。updatedAt 照旧落当刻。
+        createdAt: order.createdAt,
         userId: order.userId,
         agentId: order.agentId,
         guestName: order.guestName,
