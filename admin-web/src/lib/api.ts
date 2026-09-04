@@ -4762,6 +4762,51 @@ export const api = {
       body: { orderIds, lock },
     }),
 
+  // 批量锁定/解锁收款（ADMIN/STAFF）：语义同单笔「锁定收款」——只挡手工录收款，
+  // 对账台认款与线上到账不受影响。不存在/已软删/权限不符的单计入 skipped，原因逐条见 results。
+  batchPaymentsLock: (token: string, orderIds: string[], locked: boolean) =>
+    apiFetch<{
+      updated: number;
+      skipped: number;
+      results: Array<{ orderId: string; orderNumber?: string | null; ok: boolean; reason?: string }>;
+    }>('/orders/batch/payments-lock', {
+      method: 'POST',
+      token,
+      body: { orderIds, locked },
+    }),
+
+  // 批量调价（ADMIN/STAFF）：给所选订单统一挂一笔差额（正=补收/负=优惠）+ 原因，与事后调价
+  // （addOrderPriceAdjustment）同语义——追加价格调整行，计入订单应收/尾款，全程审计留痕。
+  // mode=PER_ORDER 按单固定金额；PER_PAX 按每人金额 × 占座人数摊（婴儿不计入人数）。
+  // 已锁结算价 / 已取消的单会被跳过，不会被绕过，原因逐条见 results。
+  batchPriceAdjustment: (
+    token: string,
+    body: {
+      orderIds: string[];
+      mode: 'PER_ORDER' | 'PER_PAX';
+      /** 整数 CNY，可正（补收）可负（优惠），非 0；|金额| ≤ 100000。 */
+      amountCny: number;
+      reasonCode: PriceAdjustmentReason;
+      /** 「其它」原因必填说明。 */
+      reasonText?: string;
+    },
+  ) =>
+    apiFetch<{
+      updated: number;
+      skipped: number;
+      results: Array<{
+        orderId: string;
+        orderNumber?: string | null;
+        ok: boolean;
+        appliedAmountCny?: number | null;
+        reason?: string;
+      }>;
+    }>('/orders/batch/price-adjustment', {
+      method: 'POST',
+      token,
+      body,
+    }),
+
   // 人工确认收款（线下收款 → 标记已付 + 上传截图）ADMIN/STAFF
   // 现已允许多付：amount 可超过尾款（paidAmount 可大于 total）。
   // 超收不再报错：应收部分照常核销进本单，超出部分自动拆进挂账池（见 OverpaySplitDetail）。

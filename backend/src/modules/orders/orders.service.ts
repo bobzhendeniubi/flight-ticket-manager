@@ -161,6 +161,7 @@ import { heldSeatsForCabin } from '../hold-orders/held-seats.js';
 import { noShowReleasedReminderRuleKeys } from '../reminders/reminders.rules.js';
 import type {
   BatchCreateOrdersBody,
+  BatchPriceAdjustmentBody,
   BatchRescheduleBody,
   AddGroundItemBody,
   BatchPassengerInput,
@@ -6219,6 +6220,245 @@ export class OrderService {
   }
 
   /**
+   * 批量锁定/解锁收款复核。口径与单单 POST /orders/:id/payments-lock 完全一致：
+   * 锁的只是「人工录收款」这道口子（人工确认 / 批量确认在 paymentsLocked 时 409），
+   * 网关到账 / 对账认款是真钱已落库，照旧不受影响 —— 批量不另立口径。
+   *
+   * 跳过而不整批失败：一次勾几十上百单，里面混着已经锁好的、已删的、点错的很正常。
+   * 为一单不合条件就把整批回滚，运营只能靠肉眼挑出那一单再来一遍，实际更容易出错；
+   * 逐单给出跳过原因、其余照做，才是可收敛的做法。（真锁不上的库级异常仍然整批抛。）
+   *
+   * 并发：整批一个事务，按 id 排序后逐单 `SELECT ... FOR UPDATE` —— 与 batchSetSettlementLock
+   * 同一套加锁纪律（固定顺序 = 并发批次排队而不是交叉互等成死锁）。
+   */
+  async batchSetPaymentsLock(
+    orderIds: string[],
+    locked: boolean,
+    userId: string,
+  ): Promise<{
+    updated: number;
+    skipped: number;
+    results: Array<{
+      orderId: string;
+      orderNumber: string | null;
+      ok: boolean;
+      reason?: string;
+      beforeLocked?: boolean;
+      paymentsLockedAt?: Date | null;
+    }>;
+  }> {
+    const results = await prisma.$transaction(
+      async (tx) => {
+        const acc: Array<{
+          orderId: string;
+          orderNumber: string | null;
+          ok: boolean;
+          reason?: string;
+          beforeLocked?: boolean;
+          paymentsLockedAt?: Date | null;
+        }> = [];
+        for (const orderId of [...orderIds].sort()) {
+          const rows = await tx.$queryRaw<
+            Array<{
+              id: string;
+              orderNumber: string;
+              paymentsLocked: boolean;
+              deletedAt: Date | null;
+            }>
+          >`SELECT id, "orderNumber", "paymentsLocked", "deletedAt" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+          const order = rows[0];
+          if (!order) {
+            acc.push({ orderId, orderNumber: null, ok: false, reason: '订单不存在' });
+            continue;
+          }
+          if (order.deletedAt) {
+            acc.push({
+              orderId,
+              orderNumber: order.orderNumber,
+              ok: false,
+              reason: '订单在回收站，请先恢复',
+            });
+            continue;
+          }
+          // 已经是目标状态 → 跳过而不是重复写：重复写会凭空多一条审计，看上去像「又锁了一次」，
+          // 对账时分不清哪次才是财务真正复核的那一刻。
+          if (order.paymentsLocked === locked) {
+            acc.push({
+              orderId,
+              orderNumber: order.orderNumber,
+              ok: false,
+              reason: locked ? '收款已是锁定状态' : '收款已是解锁状态',
+            });
+            continue;
+          }
+          const paymentsLockedAt = locked ? new Date() : null;
+          await tx.order.update({
+            where: { id: orderId },
+            data: {
+              paymentsLocked: locked,
+              paymentsLockedAt,
+              paymentsLockedBy: locked ? userId : null,
+            },
+          });
+          acc.push({
+            orderId,
+            orderNumber: order.orderNumber,
+            ok: true,
+            beforeLocked: order.paymentsLocked,
+            paymentsLockedAt,
+          });
+        }
+        return acc;
+      },
+      // 批量上限 500 单（schema），逐单两次往返；默认 5s 超时对大批量不够用。
+      { timeout: 120_000, maxWait: 15_000 },
+    );
+
+    const updated = results.filter((r) => r.ok).length;
+    return { updated, skipped: results.length - updated, results };
+  }
+
+  /**
+   * 批量事后调价（ADMIN/STAFF）。主用场景：一批单选了指定酒店却漏收「指定酒店加价（每人 ¥X）」，
+   * 事后按人补上；也可用于整单口径的统一补收/优惠。
+   *
+   * 两种口径：
+   *   PER_ORDER —— 每单挂一笔 amountCny（与单单事后调价完全一致）。
+   *   PER_PAX   —— amountCny 是每人的钱，落库金额 = amountCny × 占座人数。
+   *
+   * 占座人数口径直接复用 occupancyOfPassengers（= 成人 + 占座儿童，婴儿不计）：与「指定酒店加价
+   * × occupancy.seatPax」「每人操作费 × seatPax」同一个数。婴儿不占座也不占床，指定酒店那笔加价
+   * 本来就没收他的钱，补收当然也不该按他收 —— 用出行总人数会当场多收一个婴儿的钱。
+   *
+   * 跳过而不整批失败（同 batchSetPaymentsLock）：锁价单、死单、回收站单、点错的 id 逐单跳过并
+   * 带回原因，其余照做。闸门判断不在这里重写一遍，一律由 _addPriceAdjustmentWithinTx 抛出后接住，
+   * 口径只有一份。只接住这三类业务异常，库级异常照旧整批抛（事务已脏，不能继续做后面的单）。
+   */
+  async batchAddPriceAdjustment(
+    orderIds: string[],
+    input: Omit<BatchPriceAdjustmentBody, 'orderIds'>,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    updated: number;
+    skipped: number;
+    results: Array<{
+      orderId: string;
+      orderNumber: string | null;
+      ok: boolean;
+      reason?: string;
+      appliedAmountCny: number | null;
+      itemId?: string;
+      before?: { subtotal: string; total: string };
+      after?: { subtotal: string; total: string };
+    }>;
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可调整订单价格');
+    }
+    const { mode, amountCny, reasonCode, reasonText } = input;
+
+    const results = await prisma.$transaction(
+      async (tx) => {
+        const acc: Array<{
+          orderId: string;
+          orderNumber: string | null;
+          ok: boolean;
+          reason?: string;
+          appliedAmountCny: number | null;
+          itemId?: string;
+          before?: { subtotal: string; total: string };
+          after?: { subtotal: string; total: string };
+        }> = [];
+        // 与 batchSetSettlementLock 同一套加锁纪律：固定 id 顺序，并发批次排队而不是交叉死锁。
+        for (const orderId of [...orderIds].sort()) {
+          const rows = await tx.$queryRaw<
+            Array<{ id: string; orderNumber: string }>
+          >`SELECT id, "orderNumber" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+          const found = rows[0];
+          if (!found) {
+            acc.push({ orderId, orderNumber: null, ok: false, reason: '订单不存在', appliedAmountCny: null });
+            continue;
+          }
+          const orderNumber = found.orderNumber;
+
+          let applied = amountCny;
+          if (mode === 'PER_PAX') {
+            const passengers = await tx.passenger.findMany({
+              where: { orderId },
+              select: { passengerType: true },
+            });
+            const { seatPax } = occupancyOfPassengers(passengers);
+            if (seatPax === 0) {
+              acc.push({
+                orderId,
+                orderNumber,
+                ok: false,
+                reason: '本单没有占座客人（婴儿不占座），按人调价无从计算',
+                appliedAmountCny: null,
+              });
+              continue;
+            }
+            applied = amountCny * seatPax;
+            // 乘出来的钱可能顶破单笔调整上限 —— 那是单单入口会当场拒绝的金额，批量也不该悄悄写进去。
+            if (Math.abs(applied) > PRICE_ADJUSTMENT_CAP_CNY) {
+              acc.push({
+                orderId,
+                orderNumber,
+                ok: false,
+                reason: `按 ${seatPax} 人合计 ¥${applied}，超出单笔调整上限（±${PRICE_ADJUSTMENT_CAP_CNY}）`,
+                appliedAmountCny: null,
+              });
+              continue;
+            }
+          }
+
+          try {
+            const scratch = await this._addPriceAdjustmentWithinTx(
+              tx,
+              orderId,
+              { amountCny: applied, reasonCode, reasonText },
+              actor,
+            );
+            acc.push({
+              orderId,
+              orderNumber: scratch.orderNumber,
+              ok: true,
+              appliedAmountCny: applied,
+              itemId: scratch.itemId,
+              before: { subtotal: scratch.beforeSubtotal, total: scratch.beforeTotal },
+              after: { subtotal: scratch.afterSubtotal, total: scratch.afterTotal },
+            });
+          } catch (err) {
+            // 只接住业务闸门抛的三类（锁价 / 死单·回收站 / 找不到单）——它们都在任何写库之前抛出，
+            // 事务是干净的，可以继续做后面的单。其余（库级错误）事务已脏，必须整批抛。
+            if (
+              err instanceof ConflictError ||
+              err instanceof BadRequestError ||
+              err instanceof NotFoundError
+            ) {
+              acc.push({
+                orderId,
+                orderNumber,
+                ok: false,
+                reason: err.message,
+                appliedAmountCny: null,
+              });
+              continue;
+            }
+            throw err;
+          }
+        }
+        return acc;
+      },
+      // 批量上限 500 单（schema），逐单多次往返 + 重算 total；默认 5s 超时远远不够。
+      { timeout: 120_000, maxWait: 15_000 },
+    );
+
+    const updated = results.filter((r) => r.ok).length;
+    return { updated, skipped: results.length - updated, results };
+  }
+
+  /**
    * 事务内执行状态流转 —— 供 payments.handleCallback 等外部事务复用。
    * 调用方负责包 $transaction 且提交后 enqueue newTaskIdsOut 里的任务。
    */
@@ -11673,106 +11913,13 @@ export class OrderService {
     if (!isOps && !isAgentSelfSettlement) {
       throw new ForbiddenError('仅运营/管理员可调整订单价格');
     }
-    const { amountCny, reasonCode, reasonText } = input;
-    const row = buildPriceAdjustmentItem({ amountCny, reasonCode, reasonText });
+    const { amountCny, reasonCode } = input;
 
-    const scratch = await prisma.$transaction(async (tx) => {
-      // 行锁：先锁订单行串行化并发调价，避免两个并发请求各读旧 items、各加一条差额行、
-      // 各按「旧合计 + 一次差额」写 total → 丢失更新（两条行，total 只含一条）。
-      await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
-
-      const order = await tx.order.findUnique({
-        where: { id: orderId },
-        select: {
-          id: true,
-          orderNumber: true,
-          status: true,
-          deletedAt: true,
-          subtotal: true,
-          total: true,
-          adjustments: true,
-          settlementLocked: true,
-          items: { select: { id: true, amount: true } },
-        },
-      });
-      if (!order) throw new NotFoundError('订单不存在');
-      // 结算价锁闸：锁定 = 财务已按这个应收对过账，之后任何改应收的动作都要先解锁（与改结算价 /
-      // 改自备签 / 取消单腿同一句口径）。此前这条通道是唯一绕过锁的改价路径——运营的事后调价、
-      // 议价申请确认都能在锁着的单上直接改 total，锁形同虚设。放在资金闸之前：
-      // 「已锁定」比「死单」更早能给出可操作的下一步（先解锁）。
-      if (order.settlementLocked) {
-        throw new ConflictError('结算价已锁定，请先解锁再修改');
-      }
-      // 资金闸：调价新增/降低差额行会改 order.total —— total 是应退额与取消手续费的计算基数。
-      // 死单（已取消/已退款/支付超时/草稿）若还能调价，等于凭空改动死单应收，可被算出二次退款。
-      assertOrderAcceptsFunds(order);
-
-      // passengerId 归属校验：非空必须属于本单，否则 400（不接受跨单/不存在的乘客）。
-      let passengerName: string | null = null;
-      if (input.passengerId) {
-        const pax = await tx.passenger.findUnique({
-          where: { id: input.passengerId },
-          select: { id: true, orderId: true, fullName: true },
-        });
-        if (!pax || pax.orderId !== orderId) {
-          throw new BadRequestError('指定的乘客不存在或不属于本订单');
-        }
-        passengerName = pax.fullName;
-      }
-
-      // ── 1. 追加一条 priceAdjustment 差额行（passengerId 非空 = 该乘客名下；空 = 整单）──
-      // 纯价格调整行（优惠/补收/调价）无采购成本 → totalCostCny 显式落 0（row 已带 0），不留 NULL。
-      const created = await tx.orderItem.create({
-        data: {
-          orderId,
-          kind: row.kind,
-          description: row.description,
-          quantity: 1,
-          unitPrice: new Prisma.Decimal(row.unitPrice),
-          amount: new Prisma.Decimal(row.amount),
-          totalCostCny: new Prisma.Decimal(row.totalCostCny),
-          metadata: row.metadata as Prisma.InputJsonValue,
-          passengerId: input.passengerId ?? null,
-        },
-      });
-
-      // ── 2. 用所有既有行 + 新行重算 subtotal/total（当前无 taxes/discount，total = subtotal）──
-      const newSubtotal = round2(
-        order.items.reduce((sum, it) => sum + Number(it.amount.toString()), 0) + amountCny,
-      );
-      const newTotal = newSubtotal;
-
-      // ── 3. 审计流水（appendAdjustment；仅记录用，钱走上面的 total，不进 adjustmentCny）──
-      const log = appendAdjustment(order.adjustments, {
-        type: 'PRICE_ADJUSTMENT',
-        label: row.description,
-        amountCny,
-        at: new Date().toISOString(),
-        by: actor.userId,
-        reasonCode,
-        note: reasonText?.trim() || undefined,
-        ...(input.passengerId ? { passengerId: input.passengerId } : {}),
-      });
-
-      await tx.order.update({
-        where: { id: orderId },
-        data: {
-          subtotal: new Prisma.Decimal(newSubtotal),
-          total: new Prisma.Decimal(newTotal),
-          adjustments: log,
-        },
-      });
-
-      return {
-        orderNumber: order.orderNumber,
-        itemId: created.id,
-        passengerName,
-        beforeSubtotal: order.subtotal.toString(),
-        beforeTotal: order.total.toString(),
-        afterSubtotal: newSubtotal.toString(),
-        afterTotal: newTotal.toString(),
-      };
-    });
+    // 事务内核抽到 _addPriceAdjustmentWithinTx：批量调价要在同一个事务里逐单复用同一套闸门与
+    // 算账口径（锁价闸 / 资金闸 / 差额行 / 重算 total），口径只留一份，单单入口行为一字未改。
+    const scratch = await prisma.$transaction((tx) =>
+      this._addPriceAdjustmentWithinTx(tx, orderId, input, actor),
+    );
 
     const finalOrder = await prisma.order.findUniqueOrThrow({
       where: { id: orderId },
@@ -11791,6 +11938,118 @@ export class OrderService {
         before: { subtotal: scratch.beforeSubtotal, total: scratch.beforeTotal },
         after: { subtotal: scratch.afterSubtotal, total: scratch.afterTotal },
       },
+    };
+  }
+
+  /**
+   * 事务内执行一笔事后调价 —— 单单事后调价（addPriceAdjustment）与批量调价
+   * （batchAddPriceAdjustment）共用的内核。调用方负责包 $transaction 与鉴权。
+   *
+   * 闸门口径全部留在这里（结算价锁 → 资金闸 → 乘客归属），批量入口逐单捕获这些异常改成
+   * 「跳过 + 原因」，绝不另写一套判断，避免两条入口的口径漂移。
+   */
+  async _addPriceAdjustmentWithinTx(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    input: OrderPriceAdjustmentBody,
+    actor: { userId: string; role: UserRole },
+  ) {
+    const { amountCny, reasonCode, reasonText } = input;
+    const row = buildPriceAdjustmentItem({ amountCny, reasonCode, reasonText });
+    // 行锁：先锁订单行串行化并发调价，避免两个并发请求各读旧 items、各加一条差额行、
+    // 各按「旧合计 + 一次差额」写 total → 丢失更新（两条行，total 只含一条）。
+    await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+
+    const order = await tx.order.findUnique({
+      where: { id: orderId },
+      select: {
+        id: true,
+        orderNumber: true,
+        status: true,
+        deletedAt: true,
+        subtotal: true,
+        total: true,
+        adjustments: true,
+        settlementLocked: true,
+        items: { select: { id: true, amount: true } },
+      },
+    });
+    if (!order) throw new NotFoundError('订单不存在');
+    // 结算价锁闸：锁定 = 财务已按这个应收对过账，之后任何改应收的动作都要先解锁（与改结算价 /
+    // 改自备签 / 取消单腿同一句口径）。此前这条通道是唯一绕过锁的改价路径——运营的事后调价、
+    // 议价申请确认都能在锁着的单上直接改 total，锁形同虚设。放在资金闸之前：
+    // 「已锁定」比「死单」更早能给出可操作的下一步（先解锁）。
+    if (order.settlementLocked) {
+      throw new ConflictError('结算价已锁定，请先解锁再修改');
+    }
+    // 资金闸：调价新增/降低差额行会改 order.total —— total 是应退额与取消手续费的计算基数。
+    // 死单（已取消/已退款/支付超时/草稿）若还能调价，等于凭空改动死单应收，可被算出二次退款。
+    assertOrderAcceptsFunds(order);
+
+    // passengerId 归属校验：非空必须属于本单，否则 400（不接受跨单/不存在的乘客）。
+    let passengerName: string | null = null;
+    if (input.passengerId) {
+      const pax = await tx.passenger.findUnique({
+        where: { id: input.passengerId },
+        select: { id: true, orderId: true, fullName: true },
+      });
+      if (!pax || pax.orderId !== orderId) {
+        throw new BadRequestError('指定的乘客不存在或不属于本订单');
+      }
+      passengerName = pax.fullName;
+    }
+
+    // ── 1. 追加一条 priceAdjustment 差额行（passengerId 非空 = 该乘客名下；空 = 整单）──
+    // 纯价格调整行（优惠/补收/调价）无采购成本 → totalCostCny 显式落 0（row 已带 0），不留 NULL。
+    const created = await tx.orderItem.create({
+      data: {
+        orderId,
+        kind: row.kind,
+        description: row.description,
+        quantity: 1,
+        unitPrice: new Prisma.Decimal(row.unitPrice),
+        amount: new Prisma.Decimal(row.amount),
+        totalCostCny: new Prisma.Decimal(row.totalCostCny),
+        metadata: row.metadata as Prisma.InputJsonValue,
+        passengerId: input.passengerId ?? null,
+      },
+    });
+
+    // ── 2. 用所有既有行 + 新行重算 subtotal/total（当前无 taxes/discount，total = subtotal）──
+    const newSubtotal = round2(
+      order.items.reduce((sum, it) => sum + Number(it.amount.toString()), 0) + amountCny,
+    );
+    const newTotal = newSubtotal;
+
+    // ── 3. 审计流水（appendAdjustment；仅记录用，钱走上面的 total，不进 adjustmentCny）──
+    const log = appendAdjustment(order.adjustments, {
+      type: 'PRICE_ADJUSTMENT',
+      label: row.description,
+      amountCny,
+      at: new Date().toISOString(),
+      by: actor.userId,
+      reasonCode,
+      note: reasonText?.trim() || undefined,
+      ...(input.passengerId ? { passengerId: input.passengerId } : {}),
+    });
+
+    await tx.order.update({
+      where: { id: orderId },
+      data: {
+        subtotal: new Prisma.Decimal(newSubtotal),
+        total: new Prisma.Decimal(newTotal),
+        adjustments: log,
+      },
+    });
+
+    return {
+      orderNumber: order.orderNumber,
+      itemId: created.id,
+      passengerName,
+      beforeSubtotal: order.subtotal.toString(),
+      beforeTotal: order.total.toString(),
+      afterSubtotal: newSubtotal.toString(),
+      afterTotal: newTotal.toString(),
     };
   }
 

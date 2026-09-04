@@ -986,6 +986,9 @@ export function OrdersPage() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [bulkStatus, setBulkStatus] = useState<OrderStatus | ''>('');
   const [bulkSubmitting, setBulkSubmitting] = useState(false);
+  // 批量锁定/解锁收款：只挡手工录收款，语义同单笔「锁定收款」；批量调价走单独弹窗（见 showBulkPriceAdjust）。
+  const [bulkPaymentsLockSubmitting, setBulkPaymentsLockSubmitting] = useState(false);
+  const [showBulkPriceAdjust, setShowBulkPriceAdjust] = useState(false);
   const [bulkResult, setBulkResult] = useState<{
     successCount: number;
     failureCount: number;
@@ -1932,6 +1935,34 @@ export function OrdersPage() {
       alert(err instanceof ApiError ? `批量${lock ? '锁定' : '解锁'}失败：${err.message}` : `批量${lock ? '锁定' : '解锁'}失败`);
     } finally {
       setBulkSubmitting(false);
+    }
+  };
+
+  // 批量锁定/解锁收款：语义同单笔「锁定收款」——只挡手工录收款，对账台认款与线上到账不受影响；
+  // 与上面 applyBulkSettlementLock 同款式，多带一份跳过原因（结算价/收款有专属闸，服务端逐单判定）。
+  const applyBulkPaymentsLock = async (locked: boolean) => {
+    if (!tokens?.accessToken || selectedIds.size === 0) return;
+    const confirmMessage = locked
+      ? '锁定收款后这些单不能再手工录收款（对账台认款与线上到账不受影响），确定？'
+      : '解锁后可继续手工录收款，操作会留审计，确定？';
+    if (!window.confirm(confirmMessage)) return;
+    setBulkPaymentsLockSubmitting(true);
+    try {
+      const res = await api.batchPaymentsLock(tokens.accessToken, Array.from(selectedIds), locked);
+      setRefreshNonce((n) => n + 1);
+      setSelectedIds(new Set());
+      if (res.skipped > 0) {
+        const reasonLines = res.results
+          .filter((r) => !r.ok)
+          .slice(0, 20)
+          .map((r) => `· ${r.orderNumber ?? `${r.orderId.slice(0, 8)}…`}：${r.reason ?? '未知原因'}`)
+          .join('\n');
+        window.alert(`已${locked ? '锁定' : '解锁'}收款 ${res.updated} 单，跳过 ${res.skipped} 单。\n${reasonLines}`);
+      }
+    } catch (err) {
+      alert(err instanceof ApiError ? `批量${locked ? '锁定' : '解锁'}收款失败：${err.message}` : `批量${locked ? '锁定' : '解锁'}收款失败`);
+    } finally {
+      setBulkPaymentsLockSubmitting(false);
     }
   };
 
@@ -3237,6 +3268,29 @@ export function OrdersPage() {
             >
               解锁结算价
             </button>
+            <span className="text-slate-300">|</span>
+            <button
+              className="btn-secondary text-sm py-1.5 disabled:opacity-50"
+              onClick={() => void applyBulkPaymentsLock(true)}
+              disabled={bulkPaymentsLockSubmitting}
+              title="只挡手工录收款，对账台认款与线上到账不受影响"
+            >
+              <Icon name="lock" /> 锁定收款
+            </button>
+            <button
+              className="btn-secondary text-sm py-1.5 disabled:opacity-50"
+              onClick={() => void applyBulkPaymentsLock(false)}
+              disabled={bulkPaymentsLockSubmitting}
+            >
+              解锁收款
+            </button>
+            <button
+              className="btn-secondary text-sm py-1.5 disabled:opacity-50"
+              onClick={() => setShowBulkPriceAdjust(true)}
+              title="给所选订单统一挂一笔差额（每单固定金额，或按占座人数摊）"
+            >
+              批量调价
+            </button>
               </>
             )}
             <button
@@ -4060,6 +4114,12 @@ export function OrdersPage() {
                           换人
                         </span>
                       )}
+                      {/* 收款已锁：只挡手工录收款，对账台认款/线上到账不受影响；仅运营可见（后端对代理脱敏该字段）。 */}
+                      {isOps && order.paymentsLocked && (
+                        <span className="badge-warning text-[10px]" title="收款已锁定，暂不能手工录收款">
+                          <Icon name="lock" size={10} /> 收款已锁
+                        </span>
+                      )}
                     </div>
                   </td>
                   )}
@@ -4320,6 +4380,14 @@ export function OrdersPage() {
               });
             }
           }}
+        />
+      )}
+
+      {showBulkPriceAdjust && (
+        <BulkPriceAdjustModal
+          orderIds={Array.from(selectedIds)}
+          onClose={() => setShowBulkPriceAdjust(false)}
+          onDone={() => setRefreshNonce((n) => n + 1)}
         />
       )}
 
@@ -16668,5 +16736,191 @@ function BatchPayModal({
         </div>
       </div>
     </div>
+  );
+}
+
+// 批量调价（0904 反馈：如「选了指定酒店但没收指定费」这类批量补漏场景）——ADMIN/STAFF。
+// 与事后调价（PriceAdjustmentSection）同语义：追加一笔差额行，计入订单应收/尾款，全程审计留痕；
+// 这里多了 PER_PAX 批量模式（按占座人数摊，婴儿不计），一次性给一批订单挂同样的调价理由。
+// 已锁结算价 / 已取消的单由服务端逐单判定跳过，不绕过闸门——结果面板列出跳过原因。
+function BulkPriceAdjustModal({
+  orderIds,
+  onClose,
+  onDone,
+}: {
+  orderIds: string[];
+  onClose: () => void;
+  onDone: () => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+
+  const [mode, setMode] = useState<'PER_ORDER' | 'PER_PAX'>('PER_ORDER');
+  const [amount, setAmount] = useState<number | null>(null);
+  const [reasonCode, setReasonCode] = useState<PriceAdjustmentReason>('MISC_FEE');
+  const [reasonText, setReasonText] = useState('');
+  const [submitting, setSubmitting] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+  const [result, setResult] = useState<{
+    updated: number;
+    skipped: number;
+    results: Array<{ orderId: string; orderNumber?: string | null; ok: boolean; reason?: string }>;
+  } | null>(null);
+
+  async function submit(): Promise<void> {
+    if (!token || submitting) return;
+    setErr(null);
+    if (amount === null || !Number.isInteger(amount) || amount === 0) {
+      setErr('请输入非 0 的整数金额（正=补收 / 负=优惠）');
+      return;
+    }
+    if (reasonCode === 'OTHER' && !reasonText.trim()) {
+      setErr('选择「其它」时必须填写调整原因说明');
+      return;
+    }
+    const modeLabel = mode === 'PER_ORDER' ? '每单固定金额' : '按人计（每人 × 占座人数，婴儿不计）';
+    if (!window.confirm(
+      `确认给所选 ${orderIds.length} 条订单按「${modeLabel}」${signedCny(amount)}（${PRICE_ADJUSTMENT_REASON_LABEL[reasonCode]}）？\n` +
+      `将追加一条价格调整行，计入订单应收/尾款，全程审计留痕；已锁结算价或已取消的单会跳过。`,
+    )) return;
+    setSubmitting(true);
+    try {
+      const res = await api.batchPriceAdjustment(token, {
+        orderIds,
+        mode,
+        amountCny: amount,
+        reasonCode,
+        reasonText: reasonText.trim() || undefined,
+      });
+      setResult(res);
+      if (res.updated > 0) onDone();
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? `批量调价失败：${e.message}` : '批量调价失败');
+    } finally {
+      setSubmitting(false);
+    }
+  }
+
+  const skippedResults = result ? result.results.filter((r) => !r.ok) : [];
+
+  return (
+    <Modal
+      open
+      onClose={onClose}
+      title={`批量调价（${orderIds.length} 条订单）`}
+      size="md"
+      footer={(
+        <div className="flex justify-end gap-2">
+          {result === null ? (
+            <>
+              <button className="btn-secondary text-sm" onClick={onClose} disabled={submitting}>取消</button>
+              <button
+                className="btn-primary text-sm disabled:opacity-50"
+                onClick={() => void submit()}
+                disabled={submitting || amount === null}
+              >
+                {submitting ? '处理中…' : `应用到 ${orderIds.length} 条`}
+              </button>
+            </>
+          ) : (
+            <button className="btn-primary text-sm" onClick={onClose}>完成</button>
+          )}
+        </div>
+      )}
+    >
+      <div className="space-y-4 px-5 py-4">
+        {err && <div className="rounded-md bg-rose-50 px-3 py-2 text-sm text-rose-700">{err}</div>}
+
+        {result === null ? (
+          <>
+            <div>
+              <span className="text-[11px] font-medium text-ink-muted">方式</span>
+              <div className="mt-1 space-y-1.5">
+                <label className="flex items-center gap-1.5 text-sm text-ink">
+                  <input
+                    type="radio"
+                    name="bulk-price-adjust-mode"
+                    checked={mode === 'PER_ORDER'}
+                    onChange={() => setMode('PER_ORDER')}
+                    disabled={submitting}
+                  />
+                  每单固定金额
+                </label>
+                <label className="flex items-center gap-1.5 text-sm text-ink">
+                  <input
+                    type="radio"
+                    name="bulk-price-adjust-mode"
+                    checked={mode === 'PER_PAX'}
+                    onChange={() => setMode('PER_PAX')}
+                    disabled={submitting}
+                  />
+                  按人计 · 每人 X 元 × 占座人数（婴儿不计）
+                </label>
+              </div>
+            </div>
+            <label className="block">
+              <span className="text-[11px] font-medium text-ink-muted">金额（CNY，正数补收，负数优惠）</span>
+              <NumberInput
+                value={amount}
+                onChange={setAmount}
+                integerOnly
+                allowNegative
+                placeholder="如 200 或 -80"
+                className="input mt-0.5 w-full"
+                disabled={submitting}
+              />
+            </label>
+            <label className="block">
+              <span className="text-[11px] font-medium text-ink-muted">原因</span>
+              <select
+                className="input mt-0.5 w-full"
+                value={reasonCode}
+                onChange={(e) => setReasonCode(e.target.value as PriceAdjustmentReason)}
+                disabled={submitting}
+              >
+                {PRICE_ADJUSTMENT_REASON_OPTIONS.map((rc) => (
+                  <option key={rc} value={rc}>{PRICE_ADJUSTMENT_REASON_LABEL[rc]}</option>
+                ))}
+              </select>
+            </label>
+            {reasonCode === 'OTHER' && (
+              <label className="block">
+                <span className="text-[11px] font-medium text-ink-muted">原因说明（必填）</span>
+                <input
+                  className="input mt-0.5 w-full"
+                  value={reasonText}
+                  onChange={(e) => setReasonText(e.target.value)}
+                  maxLength={500}
+                  disabled={submitting}
+                  placeholder="选择「其它」时必填"
+                />
+              </label>
+            )}
+            <p className="text-xs text-ink-soft">例：选了指定酒店但没收指定费的单，按人计 +40。</p>
+            <p className="text-xs text-ink-soft">已锁结算价或已取消的单会跳过并列出。</p>
+          </>
+        ) : (
+          <div
+            className={`rounded-lg border-2 px-4 py-3 text-sm ${
+              result.skipped > 0 ? 'border-rose-300 bg-rose-50' : 'border-emerald-200 bg-emerald-50'
+            }`}
+          >
+            <div className={`font-semibold ${result.skipped > 0 ? 'text-rose-700' : 'text-emerald-700'}`}>
+              <Icon name="check" size={14} /> 已调价 {result.updated} 条
+              {result.skipped > 0 && <span className="ml-3"><Icon name="close" size={14} /> 跳过 {result.skipped} 条</span>}
+            </div>
+            {skippedResults.length > 0 && (
+              <ul className="mt-2 max-h-40 overflow-auto rounded border border-rose-200 bg-white px-2 py-1.5 text-red-600">
+                {skippedResults.map((r) => (
+                  <li key={r.orderId} className="py-0.5 text-[11px]">
+                    · <span className="font-mono">{r.orderNumber ?? `${r.orderId.slice(0, 8)}…`}</span>：{r.reason ?? '未知原因'}
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+      </div>
+    </Modal>
   );
 }

@@ -24,6 +24,8 @@ import { assertHotelPhysicalFitWithinTx } from '../hotel-control/hotel-control.s
 import {
   batchCreateOrdersBodySchema,
   batchRescheduleBodySchema,
+  batchPaymentsLockBodySchema,
+  batchPriceAdjustmentBodySchema,
   batchSettlementLockBodySchema,
   batchSetInvoiceFlagsBodySchema,
   batchUpdateStatusBodySchema,
@@ -1763,6 +1765,107 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         });
       }
       return { updated: result.updated, skipped: result.skipped };
+    },
+  );
+
+  // ── 批量锁定/解锁收款复核（ADMIN/STAFF）──────────────────────────────────
+  // POST /orders/batch/payments-lock  body: { orderIds: string[], locked: boolean }
+  // 口径与单单 POST /orders/:id/payments-lock 一致：只挡人工录收款，网关到账 / 对账认款不受影响。
+  // 不存在 / 回收站 / 已是目标状态的单逐单跳过并带回原因；每个真正改动的订单各写一条审计。
+  app.post(
+    '/batch/payments-lock',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req) => {
+      const body = batchPaymentsLockBodySchema.parse(req.body);
+      const result = await service.batchSetPaymentsLock(body.orderIds, body.locked, req.user.sub);
+      for (const r of result.results) {
+        if (!r.ok) continue;
+        void writeAudit({
+          actor: actorFromRequest(req),
+          action: body.locked ? 'LOCK_PAYMENTS' : 'UNLOCK_PAYMENTS',
+          targetType: 'ORDER',
+          targetId: r.orderId,
+          targetLabel: r.orderNumber ?? r.orderId,
+          before: { paymentsLocked: r.beforeLocked },
+          after: {
+            paymentsLocked: body.locked,
+            paymentsLockedAt: r.paymentsLockedAt?.toISOString() ?? null,
+            paymentsLockedBy: body.locked ? req.user.sub : null,
+            // 批量留痕：单单入口与批量入口共用同一个 action，靠这面旗子区分是谁点的哪条路。
+            batch: true,
+          },
+          severity: 'WARNING',
+        });
+      }
+      return {
+        updated: result.updated,
+        skipped: result.skipped,
+        results: result.results.map((r) => ({
+          orderId: r.orderId,
+          orderNumber: r.orderNumber,
+          ok: r.ok,
+          ...(r.reason ? { reason: r.reason } : {}),
+        })),
+      };
+    },
+  );
+
+  // ── 批量事后调价（ADMIN/STAFF）────────────────────────────────────────────
+  // POST /orders/batch/price-adjustment
+  //   body: { orderIds: string[], mode: 'PER_ORDER'|'PER_PAX', amountCny: int≠0,
+  //           reasonCode: DISCOUNT|MISC_FEE|CHANGE|OTHER, reasonText? }
+  // PER_PAX 的 amountCny 是每人的钱，落库 = 每人金额 × 占座人数（婴儿不占座不计）。
+  // 锁价单 / 死单 / 回收站单 / 找不到的 id 逐单跳过并带回原因；每笔真调价各写一条审计。
+  app.post(
+    '/batch/price-adjustment',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req) => {
+      const body = batchPriceAdjustmentBodySchema.parse(req.body);
+      const { orderIds, ...input } = body;
+      const result = await service.batchAddPriceAdjustment(orderIds, input, {
+        userId: req.user.sub,
+        role: req.user.role,
+      });
+      for (const r of result.results) {
+        if (!r.ok) continue;
+        void writeAudit({
+          actor: actorFromRequest(req),
+          action: 'ADD_ORDER_PRICE_ADJUSTMENT',
+          targetType: 'ORDER',
+          targetId: r.orderId,
+          targetLabel: r.orderNumber ?? r.orderId,
+          before: { subtotal: r.before?.subtotal, total: r.before?.total },
+          after: {
+            subtotal: r.after?.subtotal,
+            total: r.after?.total,
+            amountCny: r.appliedAmountCny,
+            reasonCode: body.reasonCode,
+            reasonLabel:
+              PRICE_ADJUSTMENT_REASON_LABEL[
+                body.reasonCode as keyof typeof PRICE_ADJUSTMENT_REASON_LABEL
+              ],
+            reasonText: body.reasonText?.trim() || null,
+            // 批量调价一律整单口径（不挂乘客）：按人补收是把每人金额乘进总额，不是逐人挂行。
+            passengerId: null,
+            passengerName: null,
+            itemId: r.itemId,
+            mode: body.mode,
+            batch: true,
+          },
+          severity: 'WARNING',
+        });
+      }
+      return {
+        updated: result.updated,
+        skipped: result.skipped,
+        results: result.results.map((r) => ({
+          orderId: r.orderId,
+          orderNumber: r.orderNumber,
+          ok: r.ok,
+          appliedAmountCny: r.appliedAmountCny,
+          ...(r.reason ? { reason: r.reason } : {}),
+        })),
+      };
     },
   );
 

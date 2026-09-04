@@ -904,6 +904,42 @@ export const batchSettlementLockBodySchema = z.object({
 });
 export type BatchSettlementLockBody = z.infer<typeof batchSettlementLockBodySchema>;
 
+// ── 批量锁定/解锁收款复核（ADMIN/STAFF）──────────────────────────────────────
+// 口径与单单 POST /orders/:id/payments-lock 完全一致：锁的是「人工录收款」这道口子，
+// 网关到账 / 对账认款是真钱已落库，照旧不受此锁影响（不能因为批量就换一套口径）。
+// orderIds 去重：勾选列表里同一单被重复带上来是常态，重复 id 会让同一单写两条审计，
+// 这里直接收敛成集合（不像批量改航班那样报错——锁定是幂等动作，重复不是错误）。
+export const batchPaymentsLockBodySchema = z.object({
+  orderIds: z
+    .array(z.string().min(1))
+    .min(1)
+    .max(500)
+    .transform((ids) => [...new Set(ids)]),
+  locked: z.boolean(),
+});
+export type BatchPaymentsLockBody = z.infer<typeof batchPaymentsLockBodySchema>;
+
+// ── 批量事后调价（ADMIN/STAFF）─────────────────────────────────────────────
+// 主用场景：一批单选了指定酒店却漏收「指定酒店加价（每人 ¥X）」，事后按人补收。
+//   mode=PER_ORDER —— amountCny 就是每单挂一笔的金额（与单单调价同口径）。
+//   mode=PER_PAX   —— amountCny 是「每人」的金额，落库金额 = amountCny × 该单占座人数。
+// 金额/原因口径与单单事后调价共用同一套校验（priceAdjustmentAmountSchema + 「其它必填说明」），
+// 避免批量入口出现一套宽松口径。
+export const batchPriceAdjustmentBodySchema = z
+  .object({
+    orderIds: z
+      .array(z.string().min(1))
+      .min(1)
+      .max(500)
+      .transform((ids) => [...new Set(ids)]),
+    mode: z.enum(['PER_ORDER', 'PER_PAX']),
+    amountCny: priceAdjustmentAmountSchema,
+    reasonCode: z.enum(PRICE_ADJUSTMENT_REASON),
+    reasonText: z.string().max(200).optional(),
+  })
+  .refine(requireReasonTextForOther, REASON_TEXT_REQUIRED_MSG);
+export type BatchPriceAdjustmentBody = z.infer<typeof batchPriceAdjustmentBodySchema>;
+
 // ── 批量散客建单（后台）─────────────────────────────────────────────────────
 // 选一个航班班次 + 舱位 + 共享联系人 → 名单里每位乘客各成一单（FLIGHT × 1）
 // ── 公开订单查询（免登录，A4）──────────────────────────────────────────────
