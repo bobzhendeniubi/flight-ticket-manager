@@ -5396,6 +5396,7 @@ function OrderDrawer({
                           passengers={reschedulePassengerOptions(o)}
                           outboundLegItemId={outboundFlightLegId(o)}
                           returnLegItemId={returnFlightLegId(o)}
+                          agentSelfEditOpen={o.agentSelfEdit?.open === true}
                         />
                       ))}
                     </ul>
@@ -5419,6 +5420,7 @@ function OrderDrawer({
                     passengers={reschedulePassengerOptions(o)}
                     outboundLegItemId={outboundFlightLegId(o)}
                     returnLegItemId={returnFlightLegId(o)}
+                    agentSelfEditOpen={o.agentSelfEdit?.open === true}
                   />
                 ))}
               </ul>
@@ -7282,6 +7284,7 @@ function OrderItemRow({
   passengers,
   outboundLegItemId,
   returnLegItemId,
+  agentSelfEditOpen,
 }: {
   orderId: string;
   item: OrderItem;
@@ -7305,8 +7308,15 @@ function OrderItemRow({
   outboundLegItemId?: string | null;
   /** 本单回程 FLIGHT 行的 orderItemId（returnFlightLegId 派生）；本行匹配即渲染「取消回程」入口 */
   returnLegItemId?: string | null;
+  /** 代理自助修改窗口（order.agentSelfEdit.open）：本单下单当天为 true，只对 role===AGENT 生效 */
+  agentSelfEditOpen?: boolean;
 }) {
-  const [rescheduling, setRescheduling] = useState(false);
+  const role = useAuth((st) => st.user?.role);
+  // 代理自助纠错：仅本单下单当天窗口内（后端 agentSelfEdit.open）——改航班/换酒店/升舱三个入口，
+  // 与 ADMIN/STAFF 的 canOperate 是两条并行的开门条件，互不覆盖。
+  const canAgentSelfEdit = role === 'AGENT' && Boolean(agentSelfEditOpen);
+  const [rescheduleMode, setRescheduleMode] = useState<'NONE' | 'RESCHEDULE' | 'CORRECTION'>('NONE');
+  const rescheduling = rescheduleMode !== 'NONE';
   const [editingPrice, setEditingPrice] = useState(false);
   const [swappingHotel, setSwappingHotel] = useState(false);
   const [reschedulingHotel, setReschedulingHotel] = useState(false);
@@ -7478,9 +7488,28 @@ function OrderItemRow({
           {canOperate && isFlight && !legCancelled && !returnReleased && !noShowLocked && !rescheduling && !editingPrice && !upgradingCabin && (
             <button
               className="text-[11px] font-medium text-brand hover:text-brand-dark"
-              onClick={() => setRescheduling(true)}
+              onClick={() => setRescheduleMode('RESCHEDULE')}
             >
               改期
+            </button>
+          )}
+          {/* 纠错改航班（ADMIN/STAFF）：录错班次专用，不动钱不改状态；与售后「改期」是两条并行入口。 */}
+          {canOperate && isFlight && !legCancelled && !returnReleased && !noShowLocked && !rescheduling && !editingPrice && !upgradingCabin && (
+            <button
+              className="text-[11px] font-medium text-slate-500 hover:text-slate-700"
+              onClick={() => setRescheduleMode('CORRECTION')}
+              title="录错班次用这个：不动钱不改状态；真正的售后改期请用「改期」"
+            >
+              纠错改航班
+            </button>
+          )}
+          {/* 代理自助纠错：仅本单下单当天窗口内（agentSelfEdit.open）。同一纠错口径，AGENT 侧无需二次确认文案外的额外说明。 */}
+          {canAgentSelfEdit && isFlight && !legCancelled && !returnReleased && !noShowLocked && !rescheduling && !editingPrice && !upgradingCabin && (
+            <button
+              className="text-[11px] font-medium text-brand hover:text-brand-dark"
+              onClick={() => setRescheduleMode('CORRECTION')}
+            >
+              改航班
             </button>
           )}
           {cancelledLeg && (
@@ -7607,7 +7636,7 @@ function OrderItemRow({
               取消{FLIGHT_LEG_ZH[legEntry]}（改单{legEntry === 'OUTBOUND' ? '回程' : '去程'}）
             </button>
           )}
-          {canOperate && canUpgradeCabin && !legCancelled && !returnReleased && !noShowLocked && !rescheduling && !editingPrice && !upgradingCabin && (
+          {(canOperate || canAgentSelfEdit) && canUpgradeCabin && !legCancelled && !returnReleased && !noShowLocked && !rescheduling && !editingPrice && !upgradingCabin && (
             <button
               className="text-[11px] font-medium text-indigo-600 hover:text-indigo-800"
               onClick={() => setUpgradingCabin(true)}
@@ -7631,7 +7660,7 @@ function OrderItemRow({
               {settlementLocked && <span className="text-[11px] text-slate-500">已锁定</span>}
             </>
           )}
-          {canOperate && isHotelRow && (
+          {(canOperate || canAgentSelfEdit) && isHotelRow && (
             <button
               className="text-[11px] font-medium text-brand hover:text-brand-dark"
               onClick={() => setSwappingHotel(true)}
@@ -7673,10 +7702,11 @@ function OrderItemRow({
           orderId={orderId}
           item={item}
           passengers={passengers ?? []}
+          isCorrection={rescheduleMode === 'CORRECTION'}
           onChanged={onChanged}
-          onCancel={() => setRescheduling(false)}
+          onCancel={() => setRescheduleMode('NONE')}
           onSaved={(updated) => {
-            setRescheduling(false);
+            setRescheduleMode('NONE');
             onOrderUpdated?.(updated);
           }}
           onRefreshOnly={(updated) => {
@@ -7777,6 +7807,7 @@ function OrderItemRow({
             hotelName: item.hotelName,
             roomTypeName: item.roomTypeName,
           }}
+          hideFee={role === 'AGENT'}
           onClose={() => setSwappingHotel(false)}
           onSwapped={(updated) => {
             setSwappingHotel(false);
@@ -8243,6 +8274,7 @@ function RescheduleForm({
   orderId,
   item,
   passengers,
+  isCorrection,
   onChanged,
   onCancel,
   onSaved,
@@ -8253,6 +8285,12 @@ function RescheduleForm({
   /** 本单出行人（勾选改期对象）；≥2 人才展示勾选列表，默认全选=整单改期（不拆）。
    *  ticketed = 已出票（PNR/票号或开票位）：勾部分人时提示拆出后改期会作废原票 */
   passengers: Array<{ id: string; name: string; ticketed?: boolean }>;
+  /**
+   * true = 纠错口径（POST /orders/:id/correct-flight）：不收改期费、价格不动、不支持按人拆单，
+   * 表单只留「选航班/选新班次」两个字段。false/缺省 = 售后改期（PATCH reschedule-passengers），
+   * 与原有行为一致。ADMIN/STAFF 走「纠错改航班」按钮、AGENT 走自助窗口内的「改航班」按钮都传 true。
+   */
+  isCorrection?: boolean;
   /** 勾了部分人拆出新单后，用它让列表刷出新单那一行（源单本身走 onSaved/onRefreshOnly） */
   onChanged?: () => void;
   onCancel: () => void;
@@ -8283,7 +8321,9 @@ function RescheduleForm({
 
   const selectedSchedule = schedules.find((s) => s.id === newScheduleId);
   const cabinOptions = selectedSchedule?.seatClasses ?? [];
-  const showPassengerPicker = passengers.length >= 2;
+  // 纠错口径不支持按人拆单（POST /orders/:id/correct-flight 只收 itemId + newScheduleId）：
+  // 不展示乘客勾选，整单一起纠错。
+  const showPassengerPicker = passengers.length >= 2 && !isCorrection;
   const isPartialSelection = showPassengerPicker && selectedIds.size < passengers.length;
   // 已出票的单也能按人改期（后端拆单闸已放开，票随人走）：拆出去的人改期时原票必然作废，
   // 票务台要给新单重开票，所以提示要在确认前就说清楚。
@@ -8302,6 +8342,27 @@ function RescheduleForm({
     if (!token || submitting || splitFailure) return;
     setErr(null);
     if (!newScheduleId) { setErr('请选择新班次'); return; }
+    // 纠错口径：单独一条提交路径，走 correct-flight，不经过下面按人拆单改期的逻辑。
+    if (isCorrection) {
+      if (
+        !confirm(
+          '按纠错口径改航班：不收改期费、价格不变，座位按新班次余座检查；套餐单酒店日期随之平移。确定？',
+        )
+      ) {
+        return;
+      }
+      setSubmitting(true);
+      try {
+        const res = await api.correctFlightSchedule(token, orderId, item.id, newScheduleId);
+        onSaved(res.order);
+      } catch (e) {
+        // 后端 400（如「本单含套餐立减…」）原样展示。
+        setErr(e instanceof ApiError ? e.message : '改航班失败');
+      } finally {
+        setSubmitting(false);
+      }
+      return;
+    }
     if (selectedIds.size === 0) { setErr('请至少勾选 1 位改期乘客'); return; }
     const confirmMsg = isPartialSelection
       ? `将把勾选的 ${selectedIds.size} 位乘客拆成新订单并改期到 ${selectedSchedule ? scheduleLabel(selectedSchedule) : '新班次'}；原单其余乘客不变。` +
@@ -8358,7 +8419,15 @@ function RescheduleForm({
 
   return (
     <div className="mt-3 space-y-2 rounded-md border border-brand/40 bg-white p-3 text-xs">
-      <div className="font-medium text-brand">改期 · 当前：{item.description}{item.flightCabin && ` · ${CABIN_ZH[item.flightCabin] ?? item.flightCabin}`}</div>
+      <div className="font-medium text-brand">
+        {isCorrection ? '纠错改航班' : '改期'} · 当前：{item.description}
+        {item.flightCabin && ` · ${CABIN_ZH[item.flightCabin] ?? item.flightCabin}`}
+      </div>
+      {isCorrection && (
+        <p className="rounded bg-slate-50 px-2 py-1 leading-snug text-slate-500">
+          纠错口径：不收改期费、价格不变，只搬座位；套餐单酒店日期会随之平移。
+        </p>
+      )}
 
       {showPassengerPicker && (
         <div className="rounded border border-slate-200 bg-slate-50/60 p-2">
@@ -8440,45 +8509,51 @@ function RescheduleForm({
         </select>
       </label>
 
-      <label className="block">
-        <span className="text-slate-500">新舱位（可选）</span>
-        <select
-          className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1 disabled:bg-slate-100"
-          value={newCabin}
-          onChange={(e) => setNewCabin(e.target.value as CabinClass | '')}
-          disabled={!selectedSchedule}
-        >
-          <option value="">沿用原舱位</option>
-          {cabinOptions.map((c) => (
-            <option key={c.id} value={c.cabin}>{CABIN_ZH[c.cabin] ?? c.cabin}</option>
-          ))}
-        </select>
-        <span className="mt-0.5 block text-[11px] leading-snug text-slate-500">
-          仅升舱请用「升舱」按钮（自动按差价源计费）；这里的舱位用于航变换班次时同步调整舱位。
-        </span>
-      </label>
+      {!isCorrection && (
+        <label className="block">
+          <span className="text-slate-500">新舱位（可选）</span>
+          <select
+            className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1 disabled:bg-slate-100"
+            value={newCabin}
+            onChange={(e) => setNewCabin(e.target.value as CabinClass | '')}
+            disabled={!selectedSchedule}
+          >
+            <option value="">沿用原舱位</option>
+            {cabinOptions.map((c) => (
+              <option key={c.id} value={c.cabin}>{CABIN_ZH[c.cabin] ?? c.cabin}</option>
+            ))}
+          </select>
+          <span className="mt-0.5 block text-[11px] leading-snug text-slate-500">
+            仅升舱请用「升舱」按钮（自动按差价源计费）；这里的舱位用于航变换班次时同步调整舱位。
+          </span>
+        </label>
+      )}
 
-      <label className="block">
-        <span className="text-slate-500">改期差价（可负，¥）</span>
-        <NumberInput
-          value={feeCny}
-          onChange={setFeeCny}
-          integerOnly
-          allowNegative
-          placeholder="不调整价格则留空；新班次更便宜可填负数退差价"
-          className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
-        />
-      </label>
+      {!isCorrection && (
+        <label className="block">
+          <span className="text-slate-500">改期差价（可负，¥）</span>
+          <NumberInput
+            value={feeCny}
+            onChange={setFeeCny}
+            integerOnly
+            allowNegative
+            placeholder="不调整价格则留空；新班次更便宜可填负数退差价"
+            className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+          />
+        </label>
+      )}
 
-      <label className="block">
-        <span className="text-slate-500">备注（可选）</span>
-        <input
-          className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
-          value={note}
-          onChange={(e) => setNote(e.target.value)}
-          placeholder="如：客户主动改期 / 航变"
-        />
-      </label>
+      {!isCorrection && (
+        <label className="block">
+          <span className="text-slate-500">备注（可选）</span>
+          <input
+            className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
+            value={note}
+            onChange={(e) => setNote(e.target.value)}
+            placeholder="如：客户主动改期 / 航变"
+          />
+        </label>
+      )}
 
       {err && <div className="rounded bg-red-50 px-2 py-1 text-red-700">{err}</div>}
       {/* 拆单不回滚：message 已是后端给的完整文案（含新单号 + 失败原因 + 去哪重试），原样展示。 */}
@@ -8490,9 +8565,14 @@ function RescheduleForm({
         <button
           className="flex-1 rounded bg-brand px-2 py-1.5 font-medium text-white disabled:opacity-50"
           onClick={submit}
-          disabled={submitting || !newScheduleId || selectedIds.size === 0 || Boolean(splitFailure)}
+          disabled={
+            submitting ||
+            !newScheduleId ||
+            (!isCorrection && selectedIds.size === 0) ||
+            Boolean(splitFailure)
+          }
         >
-          {submitting ? '改期中…' : '确认改期'}
+          {submitting ? (isCorrection ? '改航班中…' : '改期中…') : isCorrection ? '确认改航班' : '确认改期'}
         </button>
         <button
           className="rounded bg-slate-100 px-3 py-1.5 text-slate-700 disabled:opacity-50"
@@ -11925,6 +12005,10 @@ const VISA_STATUS_BADGE: Record<VisaStatusInput, string> = {
   HAS_VISA: 'bg-emerald-100 text-emerald-700',
 };
 
+// 代理自助修改窗口内可选的订单级签证状态（业务拍板：只开放三档，「已签证」不给代理改，
+// 后端 PATCH /orders/:id/notes 对 AGENT 提交 HAS_VISA 一律 403）。
+const AGENT_EDITABLE_VISA_STATUSES: VisaStatusInput[] = ['NEEDED', 'E_VISA', 'NOT_NEEDED'];
+
 // 结构化备注录入口径展示顺序：酒店 → 签证 → 付款 → 特殊
 const STRUCTURED_NOTE_FIELDS = [
   { key: 'noteHotel', label: '酒店情况', placeholder: '房型/入住时间/特殊安排' },
@@ -13071,6 +13155,10 @@ function NotesSection({
   // 内部口径（签证状态 + 内部备注 + 结构化四栏）只对运营开放；代理只写客户备注那一栏。
   // 后端 PATCH /orders/:id/notes 也是这个口径：notes 对 AGENT 放行，internalNotes/visaStatus/note* 仅 ops。
   const canEditInternal = role === 'ADMIN' || role === 'STAFF';
+  const isAgent = role === 'AGENT';
+  // 代理自助修改窗口（下单当天，北京时间）：窗口内代理也能改订单级签证状态（三档，见下方选项）；
+  // 窗口外只读展示，改动须走改单申请（后续波次）。
+  const agentSelfEditOpen = isAgent && order.agentSelfEdit?.open === true;
 
   const dirty =
     customerNotes !== (order.notes ?? '') ||
@@ -13080,7 +13168,8 @@ function NotesSection({
         structured.noteHotel !== (order.noteHotel ?? '') ||
         structured.noteVisa !== (order.noteVisa ?? '') ||
         structured.notePayment !== (order.notePayment ?? '') ||
-        structured.noteSpecial !== (order.noteSpecial ?? '')));
+        structured.noteSpecial !== (order.noteSpecial ?? ''))) ||
+    (agentSelfEditOpen && visaStatus !== (order.visaStatus ?? 'NOT_NEEDED'));
 
   // 上报给抽屉壳，供关闭前的未保存改动拦截使用；卸载时归零，避免残留 true 挡住下次打开的关闭。
   useEffect(() => {
@@ -13105,6 +13194,10 @@ function NotesSection({
       if (structured.noteVisa !== (order.noteVisa ?? '')) body.noteVisa = structured.noteVisa;
       if (structured.notePayment !== (order.notePayment ?? '')) body.notePayment = structured.notePayment;
       if (structured.noteSpecial !== (order.noteSpecial ?? '')) body.noteSpecial = structured.noteSpecial;
+    } else if (agentSelfEditOpen && visaStatus !== (order.visaStatus ?? 'NOT_NEEDED')) {
+      // 代理自助窗口内只发 visaStatus 这一个字段：后端对 AGENT 只放行三档
+      // （NEEDED/E_VISA/NOT_NEEDED），选项本身已不出现「已签证」，不会送出后端会 403 的值。
+      body.visaStatus = visaStatus;
     }
     if (Object.keys(body).length === 0) return; // 无改动，不发空 PATCH
     setSaving(true);
@@ -13134,15 +13227,15 @@ function NotesSection({
     }
   };
 
-  // 代理（AGENT）能改客户备注——后端 notes 本就对其放行；只是内部口径（签证状态 / 内部备注 /
-  // 结构化四栏）不渲染，那些字段后端也不对代理下发、更不许改。CUSTOMER 整块不渲染。
+  // 代理（AGENT）能改客户备注——后端 notes 本就对其放行；只是内部口径（内部备注 / 结构化四栏）
+  // 不渲染，那些字段后端也不对代理下发、更不许改。订单级签证状态窗口内代理也能改（见下方）。CUSTOMER 整块不渲染。
   if (!canEditInternal && role !== 'AGENT') return null;
 
   return (
     <section>
       <div className="flex items-center gap-2">
-        <h3 className="text-sm font-medium text-slate-700">{canEditInternal ? '签证状态 / 备注' : '备注'}</h3>
-        {canEditInternal && (
+        <h3 className="text-sm font-medium text-slate-700">{canEditInternal || isAgent ? '签证状态 / 备注' : '备注'}</h3>
+        {(canEditInternal || isAgent) && (
           <span className={`rounded px-2 py-0.5 text-[11px] font-medium ${VISA_STATUS_BADGE[visaStatus]}`}>
             {VISA_STATUS_LABEL[visaStatus]}
           </span>
@@ -13161,6 +13254,31 @@ function NotesSection({
                 <option key={v} value={v}>{VISA_STATUS_LABEL[v]}</option>
               ))}
             </select>
+          </div>
+        )}
+        {isAgent && (
+          <div>
+            <label className="text-xs text-slate-500">签证状态</label>
+            {agentSelfEditOpen ? (
+              <select
+                className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-xs"
+                value={visaStatus}
+                onChange={(e) => setVisaStatus(e.target.value as VisaStatusInput)}
+              >
+                {/* 已签证不在代理可选范围内（后端 403）；当前若已是「已签证」，加一个禁用项让选框
+                    如实显示当前值，不能被代理选回去。 */}
+                {order.visaStatus === 'HAS_VISA' && (
+                  <option value="HAS_VISA" disabled>{VISA_STATUS_LABEL.HAS_VISA}（当前，代理不可改）</option>
+                )}
+                {AGENT_EDITABLE_VISA_STATUSES.map((v) => (
+                  <option key={v} value={v}>{VISA_STATUS_LABEL[v]}</option>
+                ))}
+              </select>
+            ) : (
+              <div className="mt-1 rounded-md border border-slate-200 bg-slate-50 px-2 py-1.5 text-xs text-ink-muted">
+                {VISA_STATUS_LABEL[visaStatus]}
+              </div>
+            )}
           </div>
         )}
         {canEditInternal &&

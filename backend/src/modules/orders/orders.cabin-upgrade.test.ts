@@ -9,7 +9,8 @@
  *   1. computeCabinUpgradeDiffCny：差价 = 每人每航段 × 人数（含 0/负数兜底）。
  *   2. buildUpgradedCabinDescription：描述快照刷新（替换/追加/幂等/超级经济舱写法）。
  *   3. upgradeItemCabinBodySchema：请求体只收备注，任何金额字段都进不来。
- *   4. 权限：非 ADMIN/STAFF → ForbiddenError（未触库）。
+ *   4. 权限：客户 → ForbiddenError（未触库）；代理走「下单当天自助改单」窗口闸
+ *      —— 过了当天同样 ForbiddenError，且都不开事务。
  *   5. 成功路径：座位对称搬移（放 ECONOMY → 拿 BUSINESS）+ 行改舱 + UPGRADE_CHANGE 行 + 总额抬升 + 状态不动。
  *   6. 商务舱余位不足 → ConflictError，且不落任何金额写入（真回滚由事务保证）。
  *   7. 非经济舱行 / 套餐机票腿 / 差价源未配置 / 收款已锁定 → 拒绝，且不搬座位。
@@ -21,6 +22,8 @@ const { mockPrisma } = vi.hoisted(() => ({
   mockPrisma: {
     order: { findUnique: vi.fn(), findUniqueOrThrow: vi.fn(), update: vi.fn() },
     orderItem: { findUnique: vi.fn(), create: vi.fn(), update: vi.fn() },
+    // 代理自助窗口闸要走归属判定（getDescendantAgentIds 的递归 CTE）。
+    $queryRaw: vi.fn(),
     $transaction: vi.fn(),
   },
 }));
@@ -200,9 +203,34 @@ describe('upgradeItemCabinBodySchema · 请求体不接受任何金额', () => {
 });
 
 describe('OrderService.upgradeOrderItemCabin · 权限', () => {
-  it.each(['CUSTOMER', 'AGENT'] as const)('%s 调用 → ForbiddenError，且未开事务', async (role) => {
+  it('CUSTOMER 调用 → ForbiddenError，且未开事务（自助通道不对客户开）', async () => {
     await expect(
-      service.upgradeOrderItemCabin('o1', 'it-1', {}, { userId: 'u1', role }),
+      service.upgradeOrderItemCabin('o1', 'it-1', {}, { userId: 'u1', role: 'CUSTOMER' }),
+    ).rejects.toBeInstanceOf(ForbiddenError);
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  // 代理自 0904 起有「下单当天自助升舱」的口子（差价仍由服务端按航班差价源 × 人数算，
+  // 请求体连金额字段都没有）；过了当天照旧拒。窗口口径见 orders.agent-self-edit.test.ts。
+  it('AGENT 过了下单当天 → ForbiddenError，且未开事务', async () => {
+    mockPrisma.$queryRaw.mockResolvedValue([{ id: 'ag-1' }]);
+    mockPrisma.order.findUnique.mockResolvedValue({
+      userId: null,
+      agentId: 'ag-1',
+      createdAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000),
+      status: 'PAID',
+      deletedAt: null,
+      outboundInvoiced: false,
+      returnInvoiced: false,
+      systemInvoiced: false,
+      settlementLocked: false,
+    });
+    await expect(
+      service.upgradeOrderItemCabin('o1', 'it-1', {}, {
+        userId: 'u1',
+        role: 'AGENT',
+        agentId: 'ag-1',
+      }),
     ).rejects.toBeInstanceOf(ForbiddenError);
     expect(mockPrisma.$transaction).not.toHaveBeenCalled();
   });

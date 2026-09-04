@@ -1148,6 +1148,17 @@ export const rescheduleOrderBodySchema = z.object({
 });
 export type RescheduleOrderBody = z.infer<typeof rescheduleOrderBodySchema>;
 
+// ── 航班纠错（correction）────────────────────────────────────────────────
+// POST /orders/:id/correct-flight（ADMIN/STAFF 任意时候；AGENT 限「下单当天 + 自家单」）：
+// 把某条 FLIGHT 行改到**本来就该录的**班次。与售后改期的区别只有一句话：纠错不动钱 ——
+// 所以请求体里**没有任何金额字段**（差价恒 0 由服务端写死），也没有 newCabin
+//（改舱要重算差价，那是升舱通道的事）。多一个字段就多一条代理能动钱的路。
+export const correctFlightBodySchema = z.object({
+  itemId: z.string().min(1, 'itemId 必填'),
+  newScheduleId: z.string().min(1, 'newScheduleId 必填'),
+});
+export type CorrectFlightBody = z.infer<typeof correctFlightBodySchema>;
+
 // ── 售后改单：升舱（经济舱 → 商务舱）───────────────────────────────────────
 // POST /orders/:id/items/:itemId/upgrade-cabin（ADMIN/STAFF）：把某条经济舱 FLIGHT 行升到商务舱。
 // 目标舱固定商务舱、差价由服务端按航班的升舱差价源 × 人数权威计算——**请求体里不接受任何金额**，

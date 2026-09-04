@@ -1638,6 +1638,13 @@ export interface OrderSummary {
   claimedBy?: { id: string; displayName: string | null; email: string | null } | null;
   roomAssignment?: RoomAssignment | null;
   reminders?: OperationalReminder[];
+  /**
+   * 代理自助修改窗口（下单当天，北京时间）：open=当前是否在窗口内；until=窗口关闭时刻
+   * （ISO，权威值来自服务端）；reason=窗口关闭时展示给代理的提示文案。全角色下发。
+   * 窗口内 AGENT 可自助纠错航班/改签证状态（订单级三档）/换酒店/升舱；窗口外只读，
+   * 改动须走改单申请（后续波次）。ADMIN/STAFF 不受此窗口约束。
+   */
+  agentSelfEdit?: { open: boolean; until: string | null; reason: string | null };
   // 订单详情(getOrder)带出的收款记录（列表不含，避免 proof 数据膨胀）
   payments?: OrderPayment[];
   // 未经财务核实的已收金额（详情联查 payments 时后端派生；出票前提示用，仅内部角色下发）
@@ -5059,6 +5066,15 @@ export const api = {
       method: 'POST',
       token,
       body,
+    }),
+  // 纠错改航班（录错班次专用，单单版）：不收改期费、价格不动，座位按新班次余座检查；
+  // 套餐单酒店日期随之平移。ADMIN/STAFF 任何时候可用；AGENT 仅本单 agentSelfEdit.open
+  // 窗口内（下单当天）可用——窗口关闭服务端 403，message 为窗口关闭提示，原样展示。
+  correctFlightSchedule: (token: string, orderId: string, itemId: string, newScheduleId: string) =>
+    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/correct-flight`, {
+      method: 'POST',
+      token,
+      body: { itemId, newScheduleId },
     }),
   // 批量改航班（录入纠错）：服务端按订单既有航段解析并逐单搬座位，不收改期费。
   batchRescheduleOrders: (

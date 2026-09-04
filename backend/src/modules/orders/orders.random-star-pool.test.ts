@@ -15,6 +15,9 @@ import { OrderItemKind, UserRole } from '@prisma/client';
 const { mockPrisma } = vi.hoisted(() => ({
   mockPrisma: {
     orderItem: { findUnique: vi.fn() },
+    // 代理自助换酒店的窗口闸：读订单归属 + 下单时间，再走归属判定的递归 CTE。
+    order: { findUnique: vi.fn() },
+    $queryRaw: vi.fn().mockResolvedValue([{ id: 'ag-1' }]),
     hotelRoomType: { findUnique: vi.fn() },
     passenger: { findMany: vi.fn().mockResolvedValue([]) },
     hotelBlockPeriod: { findMany: vi.fn().mockResolvedValue([]) },
@@ -203,14 +206,40 @@ describe('星级随机档落位：具体酒店行行为不变（回归）', () =
     );
   });
 
-  it('非 ADMIN/STAFF 调用 → 仍拒（池行不放宽鉴权）', async () => {
+  it('客户调用 → 仍拒（池行不放宽鉴权）', async () => {
     mockPrisma.orderItem.findUnique.mockResolvedValue(poolItem(4));
+
+    await expect(
+      service.swapItemHotel('order-1', 'item-1', swapBody, {
+        userId: 'cust-1',
+        role: UserRole.CUSTOMER,
+      }),
+    ).rejects.toThrow('仅运营 / 代理可自助改单');
+  });
+
+  // 代理自 0904 起有「下单当天自助换酒店」的口子（差价强制归 0）；过了当天照旧拒，
+  // 池行不因为是随机档就放宽窗口。窗口口径见 orders.agent-self-edit.test.ts。
+  it('代理过了下单当天 → 仍拒，且一行订单项都不读', async () => {
+    mockPrisma.orderItem.findUnique.mockResolvedValue(poolItem(4));
+    mockPrisma.order.findUnique.mockResolvedValue({
+      userId: null,
+      agentId: 'ag-1',
+      createdAt: new Date(Date.now() - 3 * 24 * 60 * 60 * 1000),
+      status: 'PAID',
+      deletedAt: null,
+      outboundInvoiced: false,
+      returnInvoiced: false,
+      systemInvoiced: false,
+      settlementLocked: false,
+    });
 
     await expect(
       service.swapItemHotel('order-1', 'item-1', swapBody, {
         userId: 'agent-1',
         role: UserRole.AGENT,
+        agentId: 'ag-1',
       }),
-    ).rejects.toThrow('仅运营/管理员可换酒店');
+    ).rejects.toThrow('下单当天可自助修改，次日起请提交改单申请');
+    expect(mockPrisma.orderItem.findUnique).not.toHaveBeenCalled();
   });
 });

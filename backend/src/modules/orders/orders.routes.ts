@@ -10,16 +10,13 @@ import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
 import { localDateISO } from '../../lib/flight-time.js';
 import { env } from '../../config/env.js';
 import { z } from 'zod';
-import { OrderItemKind, Prisma, UserRole, type Passenger } from '@prisma/client';
+import { OrderItemKind, Prisma, UserRole, VisaRequirement, type Passenger } from '@prisma/client';
 import {
   buildStayNightDates,
-  FULFILLMENT_TERMINATING_STATUSES,
   OrderService,
   resolveOrderAgentId,
-  syncVisaTasksForOrder,
   type OrderRequester,
 } from './orders.service.js';
-import { isVisaContradiction, VISA_CONTRADICTION_MESSAGE } from './visa-need.js';
 import { assertHotelPhysicalFitWithinTx } from '../hotel-control/hotel-control.service.js';
 import {
   batchCreateOrdersBodySchema,
@@ -47,6 +44,7 @@ import {
   quoteOrderBodySchema,
   rescheduleOrderBodySchema,
   reschedulePassengersBodySchema,
+  correctFlightBodySchema,
   upgradeItemCabinBodySchema,
   resolvePassengerPatchChannel,
   selfUpdatePassengerBodySchema,
@@ -1502,7 +1500,29 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       body.noteVisa !== undefined ||
       body.notePayment !== undefined ||
       body.noteSpecial !== undefined;
-    if (opsOnlyTouched && !isOps) {
+    // ── 代理自助改签证状态（下单当天、自家单）──────────────────────────────
+    // 代理动的 ops-only 字段**只能**是 visaStatus 这一个，且只能落在
+    // 「需要签证 / 电子签 / 不需要签证」三档里；带上任何别的内部字段仍旧 403（口径不变）。
+    // 为什么 HAS_VISA（已签证）不给代理：那是签证岗见到签证页之后才盖的章 ——
+    // 代理自己标「已签证」，这单会直接从签证台的待送签队列里消失，然后漏送签。
+    const agentVisaOnly =
+      role === UserRole.AGENT &&
+      body.visaStatus !== undefined &&
+      body.internalNotes === undefined &&
+      body.noteHotel === undefined &&
+      body.noteVisa === undefined &&
+      body.notePayment === undefined &&
+      body.noteSpecial === undefined;
+    if (agentVisaOnly && body.visaStatus === VisaRequirement.HAS_VISA) {
+      return reply.status(403).send({ error: '已签证状态由签证岗确认，代理不可自行设置' });
+    }
+    if (agentVisaOnly) {
+      await service.assertAgentSelfEditAllowed(id, {
+        userId: req.user.sub,
+        role,
+        agentId: requester.agentId,
+      });
+    } else if (opsOnlyTouched && !isOps) {
       return reply.status(403).send({ error: '仅运营/管理员可修改内部备注 / 签证状态 / 结构化备注' });
     }
     const before = await prisma.order.findUnique({
@@ -1516,41 +1536,32 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         noteVisa: true,
         notePayment: true,
         noteSpecial: true,
-        // 签证矛盾硬闸要读：订单是否还参与履约 + 本单出行人的自备签现势
-        status: true,
-        deletedAt: true,
-        passengers: { select: { visaExempt: true } },
       },
     });
     if (!before) return reply.status(404).send({ error: '订单不存在' });
 
-    // ── 签证矛盾组合硬闸：改成「需要签证 / 电子签」但本单出行人全是自备签 → 拒绝 ──
-    // 这种组合不会生成签证任务（判定见 visa-need.ts 的 orderNeedsVisaTask），签证台看不见
-    // 这单，到期漏送签。只拒绝、不替客人翻 visaExempt（它同时是定价输入，改它 = 静默改价）。
-    // 豁免：未录乘客（先建单后补人是正常流程）、部分自备签、取消族终态 / 回收站单
-    //   —— 后者不参与履约，对它们做状态收尾不该被这条闸挡住（口径同 evaluateOrderVisaTaskState）。
-    const orderInactive =
-      Boolean(before.deletedAt) || FULFILLMENT_TERMINATING_STATUSES.includes(before.status);
-    if (
-      body.visaStatus !== undefined &&
-      !orderInactive &&
-      isVisaContradiction({ visaStatus: body.visaStatus, passengers: before.passengers })
-    ) {
-      return reply.status(400).send({ error: VISA_CONTRADICTION_MESSAGE });
+    // ── 签证状态：写入 + 矛盾组合硬闸 + 任务同步，统一收在 service.setOrderVisaStatus ──
+    // 先跑它再写备注四栏：矛盾组合在写库之前就抛 400（口径同抽出前——拒掉的请求一个字都不落库）。
+    // 「改成需签 / 电子签但全员自备签」这种组合不会生成签证任务，签证台看不见这单，到期漏送签。
+    if (body.visaStatus !== undefined) {
+      await service.setOrderVisaStatus(id, body.visaStatus, {
+        userId: req.user.sub,
+        role,
+        agentId: requester.agentId,
+      });
     }
 
-    await prisma.order.update({
-      where: { id },
-      data: {
-        ...(body.notes !== undefined && { notes: body.notes }),
-        ...(body.internalNotes !== undefined && { internalNotes: body.internalNotes }),
-        ...(body.visaStatus !== undefined && { visaStatus: body.visaStatus }),
-        ...(body.noteHotel !== undefined && { noteHotel: body.noteHotel }),
-        ...(body.noteVisa !== undefined && { noteVisa: body.noteVisa }),
-        ...(body.notePayment !== undefined && { notePayment: body.notePayment }),
-        ...(body.noteSpecial !== undefined && { noteSpecial: body.noteSpecial }),
-      },
-    });
+    const plainNoteData = {
+      ...(body.notes !== undefined && { notes: body.notes }),
+      ...(body.internalNotes !== undefined && { internalNotes: body.internalNotes }),
+      ...(body.noteHotel !== undefined && { noteHotel: body.noteHotel }),
+      ...(body.noteVisa !== undefined && { noteVisa: body.noteVisa }),
+      ...(body.notePayment !== undefined && { notePayment: body.notePayment }),
+      ...(body.noteSpecial !== undefined && { noteSpecial: body.noteSpecial }),
+    };
+    if (Object.keys(plainNoteData).length > 0) {
+      await prisma.order.update({ where: { id }, data: plainNoteData });
+    }
     void writeAudit({
       actor: actorFromRequest(req),
       action: 'UPDATE_ORDER_NOTES',
@@ -1568,18 +1579,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       },
       after: body,
     });
-    // 订单级签证状态变更 → 签证任务事件驱动同步（条10）。
-    // 改成「不需要签证 / 客人已有签证」之后，早先建的那条 PENDING 签证任务不会自己消失，
-    // 签证台上会永远挂着一条办不掉的「待处理」；改回需签则要把任务补回来。
-    // 只在 visaStatus 真的变了时才跑（幂等，且不给纯改备注的请求平白加几次查询）；
-    // 批量改备注走的是同一个端点逐单调用，因此一并受益。
-    // 放进事务：同步内部是「读现状 → 撤/建」，裸用全局 prisma 时两个并发请求会各建一条任务。
-    // 事务 + 建任务前的同事务 re-check（见 syncVisaTasksForOrder）把并发窗口收到最小。
-    if (body.visaStatus !== undefined && body.visaStatus !== before.visaStatus) {
-      await prisma.$transaction((tx) =>
-        syncVisaTasksForOrder(tx, id, { userId: req.user.sub, role }),
-      );
-    }
+    // 签证任务同步（改成「不需要签证」后那条 PENDING 任务不会自己消失，改回需签又要补回来）
+    // 已随 setOrderVisaStatus 在同一条事务里跑掉，这里不再重复。
     return { ok: true };
   });
 
@@ -2129,6 +2130,51 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     return { order };
   });
 
+  // ── 航班纠错（ADMIN/STAFF 任意时候；AGENT 限下单当天自家单）──
+  // POST /orders/:id/correct-flight  body: { itemId, newScheduleId }
+  // 「录错班次了」而不是「行程变了」：走改期的 correction 通道 —— 差价恒 0、不撤立减、
+  // 不推状态、不动任何金额，只把座位从错班次原子搬到对班次（搬不动整事务回滚）。
+  // 运营此前只有批量纠错入口，单张单要纠错只能借售后改期表单填 0 元；这里补齐单单入口。
+  app.post('/:id/correct-flight', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    // 客户没有这条通道（代理的自助窗口闸在 service 里判，报错文案与详情页提示同一句）。
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF && role !== UserRole.AGENT) {
+      return reply.status(403).send({ error: '仅运营 / 代理可纠正航班' });
+    }
+    const { id } = req.params as { id: string };
+    const body = correctFlightBodySchema.parse(req.body);
+    const requester = await buildRequester(req.user.sub, role);
+    const { order, audit } = await service.correctFlightSchedule(
+      id,
+      body.itemId,
+      body.newScheduleId,
+      { userId: req.user.sub, role, agentId: requester.agentId },
+    );
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'CORRECT_ORDER_FLIGHT',
+      targetType: 'ORDER',
+      targetId: id,
+      targetLabel: audit.orderNumber,
+      before: {
+        orderItemId: audit.orderItemId,
+        scheduleId: audit.fromScheduleId,
+        departureDate: audit.fromDepartureLocal,
+      },
+      after: {
+        scheduleId: audit.toScheduleId,
+        departureDate: audit.toDepartureLocal,
+        // 纠错口径留痕：这条不是售后改期，没有任何金额/状态变动。
+        correction: true,
+        feeCny: 0,
+        selfService: role === UserRole.AGENT,
+        hotelDateSync: audit.hotelDateSync,
+      },
+      severity: 'WARNING',
+    });
+    return { order };
+  });
+
   // ── 售后改单：升舱（ADMIN/STAFF）──
   // POST /orders/:id/items/:itemId/upgrade-cabin  body: { note? }
   // 把某条**经济舱**机票行就地升到商务舱：座位先放经济舱再原子拿商务舱（余位不足回滚），
@@ -2136,14 +2182,17 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // UPGRADE_CHANGE 收入行并抬订单总额；**订单状态不动**（升舱不是改签）。
   app.post('/:id/items/:itemId/upgrade-cabin', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    // 代理放行到 service：那里按「下单当天 + 自家单」判自助窗口（差价始终服务端算，代理动不了钱）。
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF && role !== UserRole.AGENT) {
       return reply.status(403).send({ error: '仅运营/管理员可升舱' });
     }
     const { id, itemId } = req.params as { id: string; itemId: string };
     const body = upgradeItemCabinBodySchema.parse(req.body ?? {});
+    const cabinRequester = await buildRequester(req.user.sub, role);
     const { order, audit } = await service.upgradeOrderItemCabin(id, itemId, body, {
       userId: req.user.sub,
       role,
+      agentId: cabinRequester.agentId,
     });
     void writeAudit({
       actor: actorFromRequest(req),
@@ -2165,6 +2214,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         upgradeItemId: audit.upgradeItemId,
         subtotalCny: audit.subtotalAfter,
         note: body.note,
+        // 代理下单当天自助升舱（非运营代操作）——审计一眼分得清是谁按的。
+        selfService: role === UserRole.AGENT,
       },
       severity: 'WARNING',
     });
@@ -2396,14 +2447,17 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 价格默认冻结（绝不按新房型 basePrice 重算 unitPrice/amount）；只换住哪，可选加/减差价。
   app.patch('/:id/items/:itemId/hotel', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    // 代理放行到 service：那里按「下单当天 + 自家单」判自助窗口，并把差价强制归 0。
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF && role !== UserRole.AGENT) {
       return reply.status(403).send({ error: '仅运营/管理员可换酒店' });
     }
     const { id, itemId } = req.params as { id: string; itemId: string };
     const body = swapItemHotelBodySchema.parse(req.body);
+    const hotelRequester = await buildRequester(req.user.sub, role);
     const { order, audit } = await service.swapItemHotel(id, itemId, body, {
       userId: req.user.sub,
       role,
+      agentId: hotelRequester.agentId,
     });
     void writeAudit({
       actor: actorFromRequest(req),
@@ -2414,9 +2468,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       before: { orderItemId: audit.orderItemId, ...audit.before },
       after: {
         ...audit.after,
+        // audit.feeCny 是服务端真正生效的差价：代理自助通道恒 0（请求里填了也不认）。
         feeCny: audit.feeCny,
         untrackedNights: audit.untrackedNights,
         note: body.note,
+        selfService: role === UserRole.AGENT,
       },
       severity: 'WARNING',
     });

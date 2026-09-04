@@ -57,7 +57,12 @@ import {
 } from '../../lib/passenger-name.js';
 import { localHHMM, localDateISO, localToUtc } from '../../lib/flight-time.js';
 import { checkinCloseAt, isCheckinClosed } from '../../lib/checkin-close.js';
-import { BUSINESS_TZ, businessDateISO, businessDateTime } from '../../lib/business-time.js';
+import {
+  BUSINESS_TZ,
+  businessDateISO,
+  businessDateTime,
+  startOfBusinessDayUtc,
+} from '../../lib/business-time.js';
 import { CANCELLABLE_STATUSES } from '../../lib/cancellation.js';
 import { canonicalJson } from '../../lib/canonical-json.js';
 import { levenshteinDistance, TYPO_MAX_EDIT_DISTANCE } from '../../lib/edit-distance.js';
@@ -361,6 +366,88 @@ export const FULFILLMENT_TERMINATING_STATUSES: OrderStatus[] = [
   'PAYMENT_TIMEOUT',
   'FAILED',
 ];
+
+// ── 代理自助改单窗口（下单当天）─────────────────────────────────────────
+// 口径（运营负责人 + 老板 2026-09-04 拍板）：
+//   代理录单出错的比例高、改起来又急，而运营本来就会拿群里的信息把每张代理单核对 2–3 遍，
+//   所以**下单当天**（北京时间同一业务日）让代理自己改自家的单；**次日起**一律走改单申请审批。
+//   自助口子只开给「不动钱」的四件事：航班班次纠错、订单级签证状态、换酒店、升舱。
+// 为什么按业务日而不是「下单后 24 小时」：运营对单是按天做的（当天的单当天核），
+//   跨天的单已经进了昨天那一轮核对与报表，再让代理静默改就对不上账了。
+// 为什么改期走「纠错」语义（correction）而不是售后改期：纠错是「本来就该录成这样」，
+//   不产生改期费、不撤立减、不推状态、不动任何金额 —— 代理自助永远不能动钱。
+// 为什么「已签证」(HAS_VISA) 不在自助范围：那是签证岗见到签证页之后才敢盖的章，
+//   代理自己说「已签证」会让这单从签证台的待送签队列里消失，直接漏送签。
+const AGENT_SELF_EDIT_STATUSES: OrderStatus[] = SEAT_HOLDING_STATUSES.filter(
+  // 已出票 / 已完成：票面已经发出去了，改班次要动真票，必须走审批。
+  (s) => s !== OrderStatus.TICKETED && s !== OrderStatus.COMPLETED,
+);
+
+/** 窗口关闭原因（面向界面的中文；前端直接展示，别在别处另写一套措辞）。 */
+export const AGENT_SELF_EDIT_REASON = {
+  NEXT_DAY: '下单当天可自助修改，次日起请提交改单申请',
+  TICKETED: '已出票，请提交改单申请',
+  INVOICED: '已开票，请提交改单申请',
+  SETTLEMENT_LOCKED: '结算价已锁定',
+  DELETED: '订单已在回收站，请联系运营',
+} as const;
+
+/** 代理自助改单窗口。until = 该业务日结束时刻（ISO），仅当订单是「今天下的」才有值。 */
+export interface AgentSelfEditWindow {
+  open: boolean;
+  until: string | null;
+  reason: string | null;
+}
+
+/** 一个业务日的长度：Asia/Shanghai 自 1991 年起无夏令时，+24h 就是当天结束，不必再走 Intl。 */
+const BUSINESS_DAY_MS = 24 * 60 * 60 * 1000;
+
+/**
+ * 纯函数：算某张单此刻还在不在「代理自助改单」窗口里。
+ *
+ * open = 下单业务日 == 今天（北京） 且 状态 ∈ 占座态 −{已出票, 已完成}
+ *        且 三个开票位全未开 且 结算价未锁 且 不在回收站。
+ * until = 下单当天时给出「今天 24:00（北京）」的 ISO，供界面倒计时；隔天的单为 null。
+ *         注意 until 只表达「窗口本来到几点」，不代表 open —— 已出票/已锁价的当天单
+ *         同样给 until，但 open=false，界面据 reason 说明为什么改不了。
+ * reason = 关闭原因（open 时为 null）。硬性障碍（回收站/状态/开票/锁价）优先于「过了当天」，
+ *         因为它们即使今天也改不了，先告诉代理真正的拦路石，别让他以为是时间问题。
+ */
+export function computeAgentSelfEditWindow(
+  order: {
+    createdAt: Date;
+    status: OrderStatus;
+    deletedAt?: Date | null;
+    outboundInvoiced?: boolean | null;
+    returnInvoiced?: boolean | null;
+    systemInvoiced?: boolean | null;
+    settlementLocked?: boolean | null;
+  },
+  now: Date = new Date(),
+): AgentSelfEditWindow {
+  const createdDay = businessDateISO(order.createdAt);
+  const isSameBusinessDay = createdDay === businessDateISO(now);
+  const until = isSameBusinessDay
+    ? new Date(startOfBusinessDayUtc(order.createdAt).getTime() + BUSINESS_DAY_MS).toISOString()
+    : null;
+
+  const closed = (reason: string): AgentSelfEditWindow => ({ open: false, until, reason });
+
+  if (order.deletedAt) return closed(AGENT_SELF_EDIT_REASON.DELETED);
+  if (!AGENT_SELF_EDIT_STATUSES.includes(order.status)) {
+    if (order.status === OrderStatus.TICKETED || order.status === OrderStatus.COMPLETED) {
+      return closed(AGENT_SELF_EDIT_REASON.TICKETED);
+    }
+    return closed(`订单「${zhStatus(order.status)}」不可自助修改`);
+  }
+  if (order.outboundInvoiced || order.returnInvoiced || order.systemInvoiced) {
+    return closed(AGENT_SELF_EDIT_REASON.INVOICED);
+  }
+  if (order.settlementLocked) return closed(AGENT_SELF_EDIT_REASON.SETTLEMENT_LOCKED);
+  if (!isSameBusinessDay) return closed(AGENT_SELF_EDIT_REASON.NEXT_DAY);
+
+  return { open: true, until, reason: null };
+}
 
 // ── 前台自助端点的状态闸 ────────────────────────────────────────────────
 // 出行人护照资料自助补录：出票流程启动前（含处理中）可改；出票后锁定走客服。
@@ -8255,6 +8342,15 @@ export class OrderService {
       /** 仅批量入口使用；省略时保持单条改期路由原有行为。 */
       guard?: { forbidTicketed?: boolean; correction?: boolean };
       /**
+       * 内部专用旗子：**只**由 correctFlightSchedule 在过完「代理自助改单窗口」闸之后设置，
+       * 用来绕过下面那句「仅运营/管理员可改期」。
+       *
+       * 为什么不是把那句闸整体放开：售后改期会收改期费、撤立减、推状态 —— 那是动钱的操作，
+       * 代理永远碰不得。放开的只有纠错通道（correction=true，差价恒 0）这一条。
+       * 请求体进不来这个字段：两条改期路由的 zod schema（z.object 默认剥未知键）都不含它。
+       */
+      selfServiceCorrection?: boolean;
+      /**
        * 幂等键（按人改期的全员快路径传）：成功后在同一事务里往该航段行的 legActionLog
        * 追加一条 RESCHEDULE_ALL 流水，编排层下次拿同一个 token 重试时据此回放。
        *
@@ -8277,6 +8373,12 @@ export class OrderService {
       toScheduleId: string;
       toCabin: import('@prisma/client').CabinClass;
       toDeparture: Date | null;
+      /**
+       * 原/新班次的**当地**出发日（YYYY-MM-DD，按各自 departureTz 折算；查不到班次为 null）。
+       * 审计里光有 UTC 瞬间读不出「改到哪一天」——班次时刻存 UTC，港澳台/东南亚航线折下来常差一天。
+       */
+      fromDepartureLocal: string | null;
+      toDepartureLocal: string | null;
       feeCny: number;
       statusChanged: boolean;
       /** 随出发日平移自动同步的酒店行（未平移/无酒店行 = 空数组），日期为 YYYY-MM-DD。 */
@@ -8289,7 +8391,13 @@ export class OrderService {
       }>;
     };
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    // 代理自助纠错（correctFlightSchedule）已在上游过完归属 + 下单当天窗口闸，从此处放行；
+    // 其余一切改期入口维持原样只认运营/管理员（自助旗子请求体注入不进来）。
+    if (
+      actor.role !== UserRole.ADMIN &&
+      actor.role !== UserRole.STAFF &&
+      !input.selfServiceCorrection
+    ) {
       throw new ForbiddenError('仅运营/管理员可改期');
     }
     // 改期差价可正可负（与换酒店差价 / 酒店改期差价同一 adjustmentCny 机制）：改到更便宜的班次
@@ -8855,11 +8963,11 @@ export class OrderService {
       const [fromSched, toSched, finalOrder] = await Promise.all([
         prisma.flightSchedule.findUnique({
           where: { id: scratch.oldScheduleId },
-          select: { departureTime: true },
+          select: { departureTime: true, departureTz: true },
         }),
         prisma.flightSchedule.findUnique({
           where: { id: scratch.newScheduleId },
-          select: { departureTime: true },
+          select: { departureTime: true, departureTz: true },
         }),
         prisma.order.findUniqueOrThrow({ where: { id: orderId }, include: ORDER_FULL_INCLUDE }),
       ]);
@@ -8876,6 +8984,13 @@ export class OrderService {
           toScheduleId: scratch.newScheduleId,
           toCabin: scratch.newCabin,
           toDeparture: toSched?.departureTime ?? null,
+          // 当地出发日：按各班次自己的 departureTz 折（口径同 lib/flight-time 唯一入口）。
+          fromDepartureLocal: fromSched
+            ? localDateISO(fromSched.departureTime, fromSched.departureTz)
+            : null,
+          toDepartureLocal: toSched
+            ? localDateISO(toSched.departureTime, toSched.departureTz)
+            : null,
           feeCny,
           statusChanged: scratch.statusChanged,
           hotelDateSync: scratch.hotelDateSync,
@@ -8912,7 +9027,7 @@ export class OrderService {
     orderId: string,
     orderItemId: string,
     input: { note?: string },
-    actor: { userId: string; role: UserRole },
+    actor: { userId: string; role: UserRole; agentId?: string },
   ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
@@ -8929,8 +9044,10 @@ export class OrderService {
       subtotalAfter: number;
     };
   }> {
+    // 代理自助升舱（下单当天、自家单）：过窗口闸后放行。差价本就由服务端按
+    // 「航班升舱差价源 × 人数」权威计算、请求体连金额字段都没有，代理动不了钱。
     if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
-      throw new ForbiddenError('仅运营/管理员可升舱');
+      await this.assertAgentSelfEditAllowed(orderId, actor);
     }
 
     const scratch = await prisma.$transaction(async (tx) => {
@@ -9820,6 +9937,149 @@ export class OrderService {
   }
 
   /**
+   * 代理自助改单闸（航班纠错 / 订单级签证状态 / 换酒店 / 升舱 四条通道共用）。
+   *
+   *   · ADMIN/STAFF：直接放行 —— 运营本来就随时能改，这道闸只是给代理开的口子。
+   *   · CUSTOMER：403。自助改单是代理与我方之间的业务口径，客户侧没有这条通道。
+   *   · AGENT：先过归属（assertCanView：只能碰自己 + 下级代理的单），再过下单当天窗口
+   *     （computeAgentSelfEditWindow），关闭则把窗口自己的 reason 原样抛给界面 ——
+   *     报错文案和详情页上那行提示是同一句，代理不会看到两种说法。
+   *
+   * 刻意只读一次、放在事务外：这是权限判定，不参与后续读-改-写的并发串行；
+   * 真正的资金/座位安全由各通道自己的 Order 行锁负责。窗口边界（23:59:59 提交、
+   * 00:00:01 才落库）不做额外收紧 —— 差一秒的单本来就该让代理改完，运营次日照样复核。
+   */
+  async assertAgentSelfEditAllowed(
+    orderId: string,
+    actor: { userId: string; role: UserRole; agentId?: string },
+  ): Promise<void> {
+    if (actor.role === UserRole.ADMIN || actor.role === UserRole.STAFF) return;
+    if (actor.role !== UserRole.AGENT) {
+      throw new ForbiddenError('仅运营 / 代理可自助改单');
+    }
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: {
+        userId: true,
+        agentId: true,
+        createdAt: true,
+        status: true,
+        deletedAt: true,
+        outboundInvoiced: true,
+        returnInvoiced: true,
+        systemInvoiced: true,
+        settlementLocked: true,
+      },
+    });
+    if (!order) throw new NotFoundError('订单不存在');
+    await this.assertCanView(order, {
+      userId: actor.userId,
+      role: actor.role,
+      agentId: actor.agentId,
+    });
+    const window = computeAgentSelfEditWindow(order);
+    if (!window.open) {
+      throw new ForbiddenError(window.reason ?? AGENT_SELF_EDIT_REASON.NEXT_DAY);
+    }
+  }
+
+  /**
+   * 航班纠错（代理下单当天自助 / 运营任意时候）：把某条 FLIGHT 行改到正确的班次。
+   *
+   * 与「售后改期」的分工：改期是**行程真的变了**（航变/客人要改），要收改期费、撤立减、推状态；
+   * 纠错是**录单当时就录错了**，本来就该是这个班次 —— 所以走 rescheduleOrderItem 的
+   * correction 通道：差价恒 0、不撤立减、不推状态、不产生任何资金流水，只把座位从错的班次
+   * 原子搬到对的班次（搬不动就整事务回滚，不泄漏、不超售）。
+   *
+   * 运营此前只有「批量纠错」一个入口（POST /orders/batch-reschedule），单张单要纠错只能借
+   * 售后改期表单填 0 元 —— 本方法把单单纠错补齐，运营与代理共用同一条口径。
+   *
+   * 含套餐立减的单改班次仍旧拒绝（rescheduleOrderItem 内的既有闸，报「本单含套餐立减…」）：
+   * 立减是按班次+晚数匹配出来的，换班次要重算补差 = 动钱，代理自助不能碰，得找运营。
+   */
+  async correctFlightSchedule(
+    orderId: string,
+    itemId: string,
+    newScheduleId: string,
+    actor: { userId: string; role: UserRole; agentId?: string },
+  ): ReturnType<OrderService['rescheduleOrderItem']> {
+    await this.assertAgentSelfEditAllowed(orderId, actor);
+    return this.rescheduleOrderItem(
+      orderId,
+      {
+        orderItemId: itemId,
+        newScheduleId,
+        // 纠错永远不动钱：差价恒 0（请求体里根本没有金额字段，这里也不给任何注入口）。
+        feeCny: 0,
+        guard: { correction: true, forbidTicketed: true },
+        selfServiceCorrection: true,
+      },
+      actor,
+    );
+  }
+
+  /**
+   * 写订单级签证状态（原先内联在 PATCH /orders/:id/notes 里，抽出来给自助 / 改单申请共用）。
+   *
+   * 三件事一个都没变，运营侧行为与抽出前逐字一致：
+   *   ① 矛盾组合硬闸：改成「需要签证 / 电子签」但已录出行人全是自备签 → 400。这种组合
+   *      不会生成签证任务（orderNeedsVisaTask 一票否决），签证台看不见这单 → 漏送签。
+   *      豁免未录出行人（先建单后补人是正常流程）与取消族 / 回收站单（不参与履约）。
+   *   ② 状态真变了才跑签证任务同步，且放在事务里 —— 同步内部是「读现状 → 撤 / 建」，
+   *      裸用全局 prisma 时两个并发请求会各建一条任务。
+   *   ③ 审计仍由调用方（路由）写，before/after 由本方法返回，口径不分叉。
+   *
+   * 权限**不在这里判**：调用方按自己的通道判（运营走 notes 路由的 opsOnly 闸；代理走
+   * assertAgentSelfEditAllowed + HAS_VISA 硬拦）。本方法只保证「写进去的状态是自洽的」。
+   */
+  async setOrderVisaStatus(
+    orderId: string,
+    visaStatus: VisaRequirement,
+    actor: { userId: string; role: UserRole; agentId?: string },
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    changed: boolean;
+    before: VisaRequirement | null;
+    after: VisaRequirement;
+  }> {
+    const current = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: {
+        visaStatus: true,
+        status: true,
+        deletedAt: true,
+        passengers: { select: { visaExempt: true } },
+      },
+    });
+    if (!current) throw new NotFoundError('订单不存在');
+
+    const orderInactive =
+      Boolean(current.deletedAt) || FULFILLMENT_TERMINATING_STATUSES.includes(current.status);
+    if (!orderInactive && isVisaContradiction({ visaStatus, passengers: current.passengers })) {
+      throw new BadRequestError(VISA_CONTRADICTION_MESSAGE);
+    }
+
+    await prisma.order.update({ where: { id: orderId }, data: { visaStatus } });
+    const changed = current.visaStatus !== visaStatus;
+    if (changed) {
+      await prisma.$transaction((tx) =>
+        syncVisaTasksForOrder(tx, orderId, { userId: actor.userId, role: actor.role }),
+      );
+    }
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+    return {
+      order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
+      changed,
+      before: current.visaStatus,
+      after: visaStatus,
+    };
+  }
+
+  /**
    * 订正出行人证件资料（同一个人录错了字，不是换人）。
    *
    * 与 swapPassenger 的根本区别 —— **只写传进来的字段，一个字段都不清空**：
@@ -10485,7 +10745,7 @@ export class OrderService {
     orderId: string,
     itemId: string,
     input: SwapItemHotelBody,
-    actor: { userId: string; role: UserRole },
+    actor: { userId: string; role: UserRole; agentId?: string },
   ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
@@ -10511,10 +10771,13 @@ export class OrderService {
       starMismatchOverride: DesignatedHotelStarMismatchOverride | null;
     };
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
-      throw new ForbiddenError('仅运营/管理员可换酒店');
+    // 代理自助换酒店（下单当天、自家单）：过窗口闸后放行；客户与过期窗口一律 403。
+    const isSelfService = actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF;
+    if (isSelfService) {
+      await this.assertAgentSelfEditAllowed(orderId, actor);
     }
-    const feeCny = Math.trunc(input.feeCny ?? 0);
+    // 自助通道差价恒 0（请求里填了也不认）：代理自助只改「住哪」，动钱一律走运营。
+    const feeCny = isSelfService ? 0 : Math.trunc(input.feeCny ?? 0);
 
     const item = await prisma.orderItem.findUnique({
       where: { id: itemId },
@@ -10610,8 +10873,11 @@ export class OrderService {
 
     // ── 套餐行的星级不匹配闸（口径与录单指定酒店同一份映射，见 SETTLEMENT_TIER_STAR_RATING）──
     // 套餐行的钱是按 Bundle.settlementTier 收的；售后把住宿换到别的档次而系统不知情，
-    // 就等于「四星档的钱住三星店」从售后口子溜进来。本端点只有 ADMIN/STAFF 可达，
-    // 故没有硬拒分支 —— 一律「必须写明原因才放行」，放行写 WARNING 审计。
+    // 就等于「四星档的钱住三星店」从售后口子溜进来。两档口径，与录单指定酒店那道闸完全一致：
+    //   · 运营（ADMIN/STAFF）→ 必须写明放行原因才过，放行写 WARNING 审计（谁放的、为什么放）；
+    //   · 代理自助 → **硬拒**，没有放行原因这个口子。放行是「明知档次不符仍按此成交」的定价决定，
+    //     代理自己填一行原因就能把四星档的单落到三星店，等于把定价权从我方手里拿走；
+    //     真有这种需求走运营。请求体里带了 designatedHotelStarMismatchReason 也一律不认。
     // 已落位低星的存量单不追溯：本闸只在**本次换入**的酒店上判定。
     let starMismatchOverride: DesignatedHotelStarMismatchOverride | null = null;
     if (item.kind === OrderItemKind.BUNDLE && item.bundleId && newRoomType.hotel.randomTierPlaceholder == null) {
@@ -10623,6 +10889,13 @@ export class OrderService {
         swapBundle?.settlementTier != null &&
         isSettlementTierStarMismatch(swapBundle.settlementTier, newRoomType.hotel)
       ) {
+        // 代理自助：硬拒，放行原因一概不认（越权定价的口子对外身份一律不开）。
+        if (isSelfService) {
+          throw new BadRequestError(
+            `${buildStarMismatchMessage(swapBundle.settlementTier, newRoomType.hotel)}。` +
+              '套餐档次与酒店星级不符，请联系运营处理。',
+          );
+        }
         const reason = input.designatedHotelStarMismatchReason?.trim();
         if (!reason) {
           throw new BadRequestError(
@@ -21404,6 +21677,13 @@ interface OrderLike {
   noteSpecial?: string | null;
   expectedAmountCny?: Prisma.Decimal | null;
   expectedAmountLocked?: boolean;
+  // 代理自助改单窗口（agentSelfEdit）的判定位。列表与详情都是 include 全量标量，必然带上；
+  // 声明为可选是为了兼容窄 select 的调用方（缺失时窗口 fail-closed，见 serializeOrder）。
+  createdAt?: Date;
+  deletedAt?: Date | null;
+  outboundInvoiced?: boolean;
+  returnInvoiced?: boolean;
+  systemInvoiced?: boolean;
   settlementLocked?: boolean;
   settlementLockedAt?: Date | null;
   settlementLockedBy?: string | null;
@@ -22138,6 +22418,20 @@ export function serializeOrder<T extends OrderLike>(
     //    污染成 FORCE_ORDER_STATUS + WARNING 审计记录，真正该警觉的强制被淹没。
     //    逐单下发（而非单独的 meta 接口）：天然跟随本单 status，不存在「元数据与单状态不同步」的窗口。
     allowedTransitions: ALLOWED_TRANSITIONS[order.status] ?? [],
+    // ── 代理自助改单窗口（下单当天可自助改班次/签证状态/酒店/升舱，次日起走改单申请）──
+    //    **所有角色都下发**：代理端据此显示/隐藏自助入口与倒计时，运营端也要一眼看出
+    //    「这单代理现在还能不能自己改」，否则运营接到电话得自己心算下单日期。
+    //    createdAt 缺失（窄 select 的调用方）时 fail-closed：按 1970 年的单算 → 窗口关闭，
+    //    宁可少给一个自助入口，也不能凭一次漏 select 就把闸放开。
+    agentSelfEdit: computeAgentSelfEditWindow({
+      createdAt: order.createdAt ?? new Date(0),
+      status: order.status,
+      deletedAt: order.deletedAt ?? null,
+      outboundInvoiced: order.outboundInvoiced ?? false,
+      returnInvoiced: order.returnInvoiced ?? false,
+      systemInvoiced: order.systemInvoiced ?? false,
+      settlementLocked: order.settlementLocked ?? false,
+    }),
     // 出行人数（按 Passenger.passengerType 统计；套餐行程单「人数：成人 X · 儿童 X · 婴儿 X」用）
     adultCount,
     childCount,

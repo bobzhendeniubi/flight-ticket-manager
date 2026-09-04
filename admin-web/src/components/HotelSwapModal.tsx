@@ -57,6 +57,11 @@ export interface HotelSwapModalProps {
    * randomStarTier 非空 = 池下钻（此时 hotelId 是后端合成键，定位只看池档次+日期）。
    */
   locateHint?: { hotelId: string; checkIn: string; checkOut: string; randomStarTier?: RandomStarTier | null };
+  /**
+   * 代理自助纠错入口传 true：隐藏「加/减价」选填区——服务端对 AGENT 自助换酒店本就忽略
+   * fee（0/omit），界面不给这个口子，避免代理以为填了差价会生效。
+   */
+  hideFee?: boolean;
   onClose: () => void;
   /** 换酒店成功后回传更新后的整单；关闭 + 刷新由调用方决定。 */
   onSwapped: (order: OrderSummary) => void;
@@ -80,7 +85,7 @@ function nightlyPriceLabel(basePrice: string): string {
   return Number.isFinite(n) ? String(n) : basePrice;
 }
 
-export function HotelSwapModal({ orderId, item, locateHint, onClose, onSwapped }: HotelSwapModalProps) {
+export function HotelSwapModal({ orderId, item, locateHint, hideFee, onClose, onSwapped }: HotelSwapModalProps) {
   const dialogRef = useDialogA11y(onClose);
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
@@ -360,33 +365,35 @@ export function HotelSwapModal({ orderId, item, locateHint, onClose, onSwapped }
                 </div>
               )}
 
-              <details className="rounded-lg border border-slate-200">
-                <summary className="cursor-pointer select-none px-3 py-2 text-xs font-medium text-ink-muted hover:text-ink">
-                  加/减价（选填）
-                </summary>
-                <div className="space-y-2 border-t border-slate-100 p-3">
-                  <label className="block">
-                    <span className="label">金额（¥，可负数=减价；留空=不调整）</span>
-                    <NumberInput
-                      value={feeCny}
-                      onChange={setFeeCny}
-                      integerOnly
-                      allowNegative
-                      placeholder="如 200，减价填 -200"
-                      className="input mt-1"
-                    />
-                  </label>
-                  <label className="block">
-                    <span className="label">备注（选填）</span>
-                    <input
-                      className="input mt-1"
-                      value={feeNote}
-                      onChange={(e) => setFeeNote(e.target.value)}
-                      placeholder="如：升级至海景房"
-                    />
-                  </label>
-                </div>
-              </details>
+              {!hideFee && (
+                <details className="rounded-lg border border-slate-200">
+                  <summary className="cursor-pointer select-none px-3 py-2 text-xs font-medium text-ink-muted hover:text-ink">
+                    加/减价（选填）
+                  </summary>
+                  <div className="space-y-2 border-t border-slate-100 p-3">
+                    <label className="block">
+                      <span className="label">金额（¥，可负数=减价；留空=不调整）</span>
+                      <NumberInput
+                        value={feeCny}
+                        onChange={setFeeCny}
+                        integerOnly
+                        allowNegative
+                        placeholder="如 200，减价填 -200"
+                        className="input mt-1"
+                      />
+                    </label>
+                    <label className="block">
+                      <span className="label">备注（选填）</span>
+                      <input
+                        className="input mt-1"
+                        value={feeNote}
+                        onChange={(e) => setFeeNote(e.target.value)}
+                        placeholder="如：升级至海景房"
+                      />
+                    </label>
+                  </div>
+                </details>
+              )}
             </>
           )}
 
