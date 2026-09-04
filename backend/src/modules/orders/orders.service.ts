@@ -8389,7 +8389,12 @@ export class OrderService {
       // ── 4. 改期立减取消补差 + 手填改期费（两笔分别留流水）──
       // 改期后原立减不随新日期重新命中：只撤销订单上尚未撤销的快照行，
       // 并把等额补差记入 adjustmentCny。行级 revoked 标记保证同单二次改期幂等。
-      let adjustmentDelta = input.guard?.correction ? 0 : feeCny;
+      // sameSeat（同班次同舱位）不收改期差价：座位本来就不搬，「改期到原地」本身没有业务意义，
+      // 首次成功后客户端超时重试会带着同一份 feeCny 再打一次 —— 旧口径会再记一条 RESCHEDULE_FEE、
+      // adjustmentCny 再加一次，客人被重复收差价。纯纠错请走 correction 通道。
+      // ⚠ PATCH /orders/:id/reschedule 也走这条路径：「班次不变只手填一笔差价」从此不再入账，
+      // 要单独收/退钱请走按乘客调价或对应的售后费入口。
+      let adjustmentDelta = input.guard?.correction || sameSeat ? 0 : feeCny;
       let adjustmentLog = order.adjustments;
       if (!sameSeat && !input.guard?.correction) {
         // 立减只挂在套餐地面价上：纯机票行改期与立减无关。
@@ -8440,7 +8445,7 @@ export class OrderService {
       }
       // feeCny 可正可负（改到贵班次补差 / 改到便宜班次退差），故判 !== 0 而不是 > 0。
       // 默认名从「改期费」改为「改期差价」——它现在两个方向都用。
-      if (feeCny !== 0 && !input.guard?.correction) {
+      if (feeCny !== 0 && !input.guard?.correction && !sameSeat) {
         adjustmentLog = appendAdjustment(adjustmentLog, {
           type: 'RESCHEDULE_FEE',
           label: input.feeLabel || '改期差价',
@@ -13926,6 +13931,8 @@ export class OrderService {
           select: {
             id: true,
             flightScheduleId: true,
+            // flightCabin 供全员分支的「是否已落在目标班次+目标舱位」回放判定。
+            flightCabin: true,
             // departureTz 只为「已起飞」闸的人话文案（当地起飞时刻），与改期端点同一份折算。
             flightSchedule: { select: { departureTime: true, departureTz: true } },
           },
@@ -13962,6 +13969,42 @@ export class OrderService {
 
     // ── 3. 全员勾选 → 没什么好拆的，直接走整单改期（与 PATCH /orders/:id/reschedule 同一条路径）──
     if (movedIds.length >= allPaxIds.size) {
+      // 3a. 幂等回放：首次已提交、客户端超时原样重试时，这一行已经落在目标班次+目标舱位上。
+      // 快路径不带 requestToken 进 rescheduleOrderItem（那边没有幂等键），再调一次只会被
+      // sameSeat 跳过座位搬移 —— 改期差价却会被再记一条 RESCHEDULE_FEE、adjustmentCny 再加
+      // 一次，客人被重复收差价。判定口径与部分乘客分支的 alreadyRescheduled 一致：
+      // 「该行现在就在目标班次上（指定了舱位则舱位也一致）」。
+      // 视为回放 → 返回当前订单，rescheduleSkipped=true，汇总审计不重复写。
+      const selectedItem = order.items.find((it) => it.id === input.orderItemId);
+      const alreadyOnTarget =
+        selectedItem != null &&
+        selectedItem.flightScheduleId === input.newScheduleId &&
+        (input.newCabin === undefined || selectedItem.flightCabin === input.newCabin);
+      if (alreadyOnTarget) {
+        const current = await prisma.order.findUniqueOrThrow({
+          where: { id: orderId },
+          include: ORDER_FULL_INCLUDE,
+        });
+        return {
+          order: serializeOrder(current, orderSerializeRoleCtx(actor.role)),
+          newOrder: null,
+          splitPerformed: false,
+          audit: {
+            orderNumber: order.orderNumber,
+            newOrderId: null,
+            newOrderNumber: null,
+            passengerCount: movedIds.length,
+            leg,
+            orderItemId: input.orderItemId,
+            toScheduleId: input.newScheduleId,
+            feeCny: Math.trunc(input.feeCny ?? 0),
+            splitReplayed: false,
+            rescheduleSkipped: true,
+            reschedule: null,
+            split: null,
+          },
+        };
+      }
       const { order: serialized, audit } = await this.rescheduleOrderItem(
         orderId,
         {

@@ -4123,7 +4123,7 @@ describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
     }));
   });
 
-  it('同班次同舱位仅记改期费 → 不撤销立减，adjustmentCny 只增加 feeCny', async () => {
+  it('同班次同舱位 → 不撤销立减，也不记改期差价（改期到原地没有业务意义）', async () => {
     const service = new OrderService();
     mockPrisma.order.findUnique.mockReset().mockResolvedValue({
       id: 'ord1',
@@ -4165,7 +4165,9 @@ describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
     expect(mockPrisma.orderItem.update).toHaveBeenCalledWith(expect.objectContaining({
       where: { id: 'it1' },
     }));
-    expect(mockPrisma.order.update).toHaveBeenCalledWith(expect.objectContaining({
+    // 立减一分没撤（280 那条口径本来就不该出现），改期差价也一分没记：
+    // 座位没搬、行程没变，重试时再打一次同样不会重复计费。
+    expect(mockPrisma.order.update).not.toHaveBeenCalledWith(expect.objectContaining({
       data: expect.objectContaining({ adjustmentCny: 80 }),
     }));
     expect(mockPrisma.order.update).not.toHaveBeenCalledWith(expect.objectContaining({
@@ -4257,6 +4259,98 @@ describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
     );
     expect(orderState.adjustmentCny).toBe(100);
     expect(orderState.adjustments.filter((entry) => entry.type === 'RESCHEDULE_DISCOUNT_REVOKE')).toHaveLength(1);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 同班次同舱位（sameSeat）：座位本来就不搬，改期差价也不该收。
+// 首次改期成功后客户端超时重试会带着同一份 feeCny 再打一次，旧口径会再记一条
+// RESCHEDULE_FEE、adjustmentCny 再加一次 —— 客人被重复收差价。
+// ══════════════════════════════════════════════════════════════════════════
+describe('OrderService.rescheduleOrderItem · 同班次同舱位不收改期差价', () => {
+  const armSameSeat = () => {
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue({
+      id: 'ord1',
+      status: 'PAID',
+      deletedAt: null,
+      adjustmentCny: 0,
+      adjustments: [],
+    });
+    mockPrisma.orderItem.findUnique.mockReset().mockResolvedValue({
+      id: 'it1',
+      orderId: 'ord1',
+      kind: 'FLIGHT',
+      quantity: 1,
+      bundleId: null,
+      flightScheduleId: 'sched1',
+      flightCabin: 'ECONOMY',
+      metadata: {},
+    });
+    mockPrisma.orderItem.findMany.mockReset().mockResolvedValue([]);
+    mockPrisma.flightSeatClass.findFirst.mockReset().mockResolvedValue({ id: 'seat1' });
+    mockPrisma.seatLock.aggregate.mockReset().mockResolvedValue({ _sum: { qty: 0 } });
+    mockPrisma.$queryRaw.mockReset().mockResolvedValue([{ id: 'ord1' }]);
+    mockPrisma.$executeRaw.mockReset().mockResolvedValue(1);
+    mockPrisma.orderItem.update.mockReset().mockResolvedValue({});
+    mockPrisma.order.update.mockReset().mockResolvedValue({});
+    mockPrisma.flightSchedule.findUnique
+      .mockReset()
+      .mockResolvedValue({ departureTime: new Date(Date.now() + 30 * 24 * 3600_000) });
+    mockPrisma.order.findUniqueOrThrow.mockReset().mockResolvedValue(fakeFullOrder());
+  };
+
+  it('改到同班次同舱位且带 feeCny → 不追加改期差价流水、不动 adjustmentCny', async () => {
+    const service = new OrderService();
+    armSameSeat();
+
+    await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'it1', newScheduleId: 'sched1', feeCny: 300 },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const adjustmentWrites = mockPrisma.order.update.mock.calls.filter(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0]?.data?.adjustmentCny !== undefined,
+    );
+    expect(adjustmentWrites).toHaveLength(0);
+  });
+
+  it('同 feeCny 连打两次 → 仍然一分不收（幂等）', async () => {
+    const service = new OrderService();
+    armSameSeat();
+
+    for (let i = 0; i < 2; i++) {
+      await service.rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'it1', newScheduleId: 'sched1', feeCny: 300 },
+        { userId: 'admin1', role: 'ADMIN' },
+      );
+    }
+
+    const adjustmentWrites = mockPrisma.order.update.mock.calls.filter(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0]?.data?.adjustmentCny !== undefined,
+    );
+    expect(adjustmentWrites).toHaveLength(0);
+  });
+
+  it('真换班次仍照常收差价（不误伤正常改期）', async () => {
+    const service = new OrderService();
+    armSameSeat();
+
+    await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'it1', newScheduleId: 'sched2', feeCny: 300 },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const adjustmentWrites = mockPrisma.order.update.mock.calls.filter(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0]?.data?.adjustmentCny !== undefined,
+    );
+    expect(adjustmentWrites).toHaveLength(1);
+    expect(adjustmentWrites[0][0].data.adjustmentCny).toBe(300);
   });
 });
 

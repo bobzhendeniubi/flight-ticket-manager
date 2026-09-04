@@ -365,6 +365,63 @@ describe('按人改期 · 已出票三人单勾一人', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
+// 全员勾选（快路径）的幂等：首次已提交、客户端超时原样重试。
+// 该行已经落在目标班次+目标舱位上 → 视为回放：不再调改期（否则改期差价会被再记一条、
+// adjustmentCny 再加一次，客人被重复收差价），也不重复写汇总审计。
+// ══════════════════════════════════════════════════════════════════════════
+describe('按人改期 · 全员勾选的同 token 重试（A1）', () => {
+  /** 第二次调用时的源单快照：去程行已经在目标班次 sch-new 上。 */
+  const alreadyOnTarget = () =>
+    sourceSnapshot({
+      items: [
+        {
+          id: 'leg-out',
+          flightScheduleId: 'sch-new',
+          flightCabin: 'ECONOMY',
+          flightSchedule: { departureTime: OUT_DEPART, departureTz: 'Asia/Shanghai' },
+        },
+        {
+          id: 'leg-ret',
+          flightScheduleId: 'sch-ret',
+          flightCabin: 'ECONOMY',
+          flightSchedule: { departureTime: RET_DEPART, departureTz: 'Asia/Shanghai' },
+        },
+      ],
+    });
+
+  it('该行已在目标班次 → 不再调改期、不重复写审计、rescheduleSkipped=true', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(alreadyOnTarget());
+    const reschedule = vi.spyOn(service, 'rescheduleOrderItem');
+
+    const result = await service.reschedulePassengers(
+      'o1',
+      body({ passengerIds: ['p1', 'p2', 'p3'] }),
+      admin,
+    );
+
+    expect(reschedule).not.toHaveBeenCalled();
+    expect(result.splitPerformed).toBe(false);
+    expect(result.audit.rescheduleSkipped).toBe(true);
+    expect(result.audit.reschedule).toBeNull();
+    expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it('目标舱位与当前不同 → 不算回放，照常改期', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(alreadyOnTarget());
+    const reschedule = vi
+      .spyOn(service, 'rescheduleOrderItem')
+      .mockResolvedValue(rescheduleOutcome('FTM20260901-SRC'));
+
+    await service.reschedulePassengers(
+      'o1',
+      body({ passengerIds: ['p1', 'p2', 'p3'], newCabin: 'BUSINESS' }),
+      admin,
+    );
+    expect(reschedule).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
 // 已起飞的航段：前置闸必须在拆单**之前**拦下。
 // 否则先拆一张新单（真搬人搬钱写审计），再由 rescheduleOrderItem 拒绝 ——
 // 留下一张多余的新单，而且新单同一航段照样已起飞，「到新单重试」永远走不通。
