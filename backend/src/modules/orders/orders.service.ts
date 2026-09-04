@@ -11506,6 +11506,10 @@ export class OrderService {
           amount: new Prisma.Decimal(row.amount),
           totalCostCny: new Prisma.Decimal(feeTotalCostCny),
           metadata: { ...row.metadata, costSource: feeCostSource } as Prisma.InputJsonValue,
+          // 挂到转单住的那位乘客：这行带 priceAdjustment=true，不挂人会被每人结算价
+          //（groupPassengerAdjustments）当整单调价摊给全员；导出「单房差」列也按它归属到人。
+          // 未指定乘客（老入口/整单补收）→ null，仍走整单口径。
+          passengerId: input.passengerId ?? null,
           idempotencyKey: input.idempotencyKey ?? null,
         },
       });

@@ -61,6 +61,34 @@ async function createOrderWith(
 }
 
 describe('OrderService.addRoomSupplement · 真 DB E2E', () => {
+  it('指定乘客补收：FEE 行挂上 passengerId（每人结算价 / 导出单房差按它归属到人），乘客标单住', async () => {
+    const actor = await adminActor();
+    const order = await createOrderWith(OrderItemKind.HOTEL, { total: 1000, paidAmount: 1000 });
+    const pax = await prisma.passenger.create({
+      data: {
+        orderId: order.id,
+        fullName: 'ZHANG/SAN',
+        documentType: 'PASSPORT',
+        documentNumber: uniq('E'),
+        nationality: 'CN',
+      },
+    });
+
+    await service.addRoomSupplement(
+      order.id,
+      { perNightCny: 200, nights: 2, passengerId: pax.id },
+      actor,
+    );
+
+    const fee = await prisma.orderItem.findFirstOrThrow({
+      where: { orderId: order.id, kind: OrderItemKind.FEE },
+    });
+    expect(fee.passengerId).toBe(pax.id);
+    expect(Number(fee.amount)).toBe(400);
+    const reloadedPax = await prisma.passenger.findUniqueOrThrow({ where: { id: pax.id } });
+    expect(reloadedPax.singleRoom).toBe(true);
+  });
+
   it('正常：新增 FEE 行 + total 增加 + 审计流水追加 + metadata 打标', async () => {
     const actor = await adminActor();
     const order = await createOrderWith(OrderItemKind.HOTEL, { total: 1000, paidAmount: 1000 });
