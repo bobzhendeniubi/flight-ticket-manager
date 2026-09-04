@@ -2882,4 +2882,25 @@ describe('itemRoomCount · 显式 0 间房是真值，不是「没填」', () =>
     expect(itemRoomCount({ roomsBilled: null, metadata: { roomsNeeded: 'abc', rooms: 2 } })).toBe(2);
     expect(itemRoomCount({ roomsBilled: null, metadata: { roomsNeeded: -1 } })).toBe(1);
   });
+
+  // Number('') === 0、Number(false) === 0、Number([]) === 0 —— 历史脏元数据会被
+  // 一路当成「明确 0 间」，那一行就从房量里凭空消失，销控板少算、超售闸放行。
+  it('脏元数据（空串 / 布尔 / 空数组）不是 0 间，回落下一优先级', () => {
+    expect(itemRoomCount({ roomsBilled: null, metadata: { roomsNeeded: '', rooms: 2 } })).toBe(2);
+    expect(itemRoomCount({ roomsBilled: null, metadata: { roomsNeeded: false, rooms: 2 } })).toBe(2);
+    expect(itemRoomCount({ roomsBilled: null, metadata: { roomsNeeded: [], rooms: 2 } })).toBe(2);
+    expect(itemRoomCount({ roomsBilled: null, metadata: { rooms: '' } })).toBe(1);
+    expect(itemRoomCount({ roomsBilled: null, metadata: { rooms: false } })).toBe(1);
+    expect(itemRoomCount({ roomsBilled: null, metadata: { rooms: [] } })).toBe(1);
+  });
+
+  it('rooms 一级同样挡住 abc 与负数', () => {
+    expect(itemRoomCount({ roomsBilled: null, metadata: { rooms: 'abc' } })).toBe(1);
+    expect(itemRoomCount({ roomsBilled: null, metadata: { rooms: -1 } })).toBe(1);
+  });
+
+  it('纯数字字符串仍按数字读（老行里存过 "0" / "2"）', () => {
+    expect(itemRoomCount({ roomsBilled: null, metadata: { roomsNeeded: '0' } })).toBe(0);
+    expect(itemRoomCount({ roomsBilled: null, metadata: { rooms: '2' } })).toBe(2);
+  });
 });

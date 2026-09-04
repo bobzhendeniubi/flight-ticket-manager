@@ -30,6 +30,7 @@ import type { AuditActor } from '../../lib/audit.js';
 import { writeAudit } from '../../lib/audit.js';
 import { businessDateISO, startOfBusinessDayUtc } from '../../lib/business-time.js';
 import { BadRequestError, NotFoundError } from '../../lib/errors.js';
+import { readExplicitRoomCount } from '../../lib/room-count.js';
 import { restoredOversoldSeats } from '../orders/orders.leg-status.js';
 import { fmtDepartureLocalDate } from '../orders/passport-zip.js';
 import type { CreateBlockPeriodBody, UpdateBlockPeriodBody } from './hotel-control.schemas.js';
@@ -564,7 +565,10 @@ export function expandBlockByDate(
  * 就是凭空多出的幽灵房：该口径被销控板已用房量、占房下钻、以及「装不下」超售硬拦截共用，
  * 会误判满房、误拒新单。只有三级**全都缺**（历史行 roomsBilled 为 null、metadata 里没有
  * 这两个键）才回落 1 间 —— 那才是真的「不知道占几间」。
- * 非有限值与负数不算显式提供，继续回落下一优先级。
+ *
+ * 两个 metadata 级走 readExplicitRoomCount：`Number('')`、`Number(false)`、`Number([])`
+ * 全等于 0，历史脏元数据一撞上就被读成「明确 0 间」，那一行从房量里凭空消失（销控板少算、
+ * 超售硬拦截放行）。非数字、负数一律不算显式提供，继续回落下一优先级。
  * export：占房下钻（getOccupyingOrders）复用同一口径，避免与销控板 used 计算漂移。
  */
 export function itemRoomCount(it: {
@@ -575,14 +579,10 @@ export function itemRoomCount(it: {
   if (billed != null && Number.isFinite(billed) && billed >= 0) return billed;
   if (it.metadata != null && typeof it.metadata === 'object') {
     const meta = it.metadata as { roomsNeeded?: unknown; rooms?: unknown };
-    if (meta.roomsNeeded != null) {
-      const needed = Number(meta.roomsNeeded);
-      if (Number.isFinite(needed) && needed >= 0) return needed;
-    }
-    if (meta.rooms != null) {
-      const rooms = Number(meta.rooms);
-      if (Number.isFinite(rooms) && rooms >= 0) return rooms;
-    }
+    const needed = readExplicitRoomCount(meta.roomsNeeded);
+    if (needed != null) return needed;
+    const rooms = readExplicitRoomCount(meta.rooms);
+    if (rooms != null) return rooms;
   }
   return 1;
 }

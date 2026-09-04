@@ -711,6 +711,27 @@ describe('addOns.rooms 跟随本侧 roomsBilled（不再按人头猜）', () => 
     });
     expect(built.rooms).toBe(1);
   });
+
+  // Number('') / Number(false) / Number([]) 全等于 0：脏值一路当成「本侧不占房」，
+  // 套餐快照就少一间房，和订单行的 roomsBilled 两本账分叉。
+  it.each([
+    ['空字符串', ''],
+    ['布尔 false', false],
+    ['布尔 true', true],
+    ['空数组', []],
+    ['非数字串', 'abc'],
+    ['负数', -1],
+  ])('rooms 是脏值（%s）→ 不当 0 间，按人头回落', (_label, dirty) => {
+    const built = rebuildAddOns(addOnsSnapshot(), {
+      occupancy: occ(2),
+      singleCount: 0,
+      selfVisaCount: 0,
+      upgradeOutbound: 0,
+      upgradeReturn: 0,
+      rooms: dirty as unknown as number,
+    });
+    expect(built.rooms).toBe(1);
+  });
 });
 
 // ══════════════════════════════════════════════════════════════════════════
