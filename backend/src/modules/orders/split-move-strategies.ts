@@ -728,8 +728,16 @@ export function movePriceAdjustment(item: SplitItemView, ctx: SplitContext): Spl
 /**
  * 同业立减行（metadata.settlementDiscount === true）：按 **占座人数** 拆成两行
  *（立减规则本就按占座人头计，婴儿不占座也不吃立减），描述随之更新。
+ *
+ * **已撤销的立减行整块不动**（`settlementDiscountRevoked === true`）：改归属 / 改期撤立减是
+ * 「金额归零 + 打撤销标记 + 描述加（已撤销）前缀，**但不删行**」——留痕行 amount 已经是 0，
+ * `discountPerPersonCny / pax` 只是历史快照。这里若照旧按 每人金额 × 人头 重算，会把一条
+ * 早已归零的行复活成「源单 +N、新单 −N」的一正一负：两侧 Σ 仍是 0 看着守恒，可源单凭空多出
+ * 一笔正数「立减」、新单多出一笔从没发生过的负数立减，描述上的（已撤销）前缀也丢了；
+ * 佣金计提对 DISCOUNT 行求和时还会把它算进折扣基数。留痕留在它发生的那张单上，原样不动。
  */
 export function moveDiscount(item: SplitItemView, ctx: SplitContext): SplitMove {
+  if (item.metadata.settlementDiscountRevoked === true) return { mode: 'NONE' };
   const perPerson = toNum(item.metadata.discountPerPersonCny, 0);
   const origPax = Math.max(0, toInt(item.metadata.pax, 0));
   if (perPerson <= 0 || origPax <= 0 || ctx.totalPax <= 0) return { mode: 'NONE' };

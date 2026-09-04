@@ -754,3 +754,59 @@ describe('同业立减按占座人数劈（婴儿不吃立减）', () => {
     expect(plan.keep.amount).toBe(-100);
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('已撤销的同业立减行不随拆（金额已归零，重算会凭空复活一正一负）', () => {
+  const revokedRow = (): SplitItemView =>
+    item({
+      kind: OrderItemKind.DISCOUNT,
+      description: '（已撤销）同业立减 ¥100/人 × 4人',
+      quantity: 1,
+      unitPrice: 0,
+      amount: 0,
+      totalCostCny: 0,
+      metadata: {
+        priceAdjustment: true,
+        settlementDiscount: true,
+        settlementDiscountRevoked: true,
+        revokedReason: 'AGENT_CHANGED',
+        discountPerPersonCny: 100,
+        pax: 4,
+      },
+    });
+
+  it('已撤销行拆 2/4 人 → 整行留源单，新单不复制', () => {
+    const plan = moveDiscount(revokedRow(), ctx({ movedOccupancy: occ(2), keptOccupancy: occ(2) }));
+    expect(plan.mode).toBe('NONE');
+  });
+
+  it('派单入口同样不动已撤销行（源单金额、描述、撤销标记原样保留）', () => {
+    const row = revokedRow();
+    const plan = planItemMove(row, ctx({ movedOccupancy: occ(2), keptOccupancy: occ(2) }));
+    expect(plan.mode).toBe('NONE');
+    expect(row.amount).toBe(0);
+    expect(row.description).toBe('（已撤销）同业立减 ¥100/人 × 4人');
+    expect(row.metadata.settlementDiscountRevoked).toBe(true);
+  });
+
+  it('未撤销的立减行照旧按占座人数劈两行', () => {
+    const live = item({
+      kind: OrderItemKind.DISCOUNT,
+      description: '同业立减 ¥100/人 × 4人',
+      quantity: 1,
+      unitPrice: -400,
+      amount: -400,
+      totalCostCny: 0,
+      metadata: {
+        priceAdjustment: true,
+        settlementDiscount: true,
+        discountPerPersonCny: 100,
+        pax: 4,
+      },
+    });
+    const plan = moveDiscount(live, ctx({ movedOccupancy: occ(2), keptOccupancy: occ(2) }));
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    expect(plan.move.amount).toBe(-200);
+    expect(plan.keep.amount).toBe(-200);
+  });
+});
