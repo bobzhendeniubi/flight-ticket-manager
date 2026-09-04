@@ -1295,12 +1295,33 @@ describe('全岗总表 — 签证状态按乘客取值', () => {
     ]);
   });
 
-  it('订单级「已签证」同理：exempt 的人写「已签证」，已送签的仍写「已送签」', () => {
+  // 「已签证」与「不需要」不同：混合单（有人 exempt、有人不是）里的 exempt 只能是逐人手勾的
+  //（联动是全员一起置），照实写「自备签」；没进度的非 exempt 乘客才跟订单头写「已签证」。
+  it('订单级「已签证」的混合单：exempt 的人写「自备签」，已送签的写「已送签」，其余「已签证」', () => {
     const order = fixtureMixedVisa();
     (order as unknown as { visaStatus: string }).visaStatus = 'HAS_VISA';
     expect(orderToMasterRows(order).map((r) => r.visaStatus)).toEqual([
-      '已签证',
+      '自备签',
       '已送签',
+      '已签证',
+    ]);
+  });
+
+  it('「已签证」+ 全员联动置 exempt 且无送签进度 → 全员「已签证」，不是全员「自备签」', () => {
+    const order = fixtureMixedVisa();
+    const o = order as unknown as {
+      visaStatus: string;
+      passengers: Array<Record<string, unknown>>;
+    };
+    o.visaStatus = 'HAS_VISA';
+    o.passengers = o.passengers.map((p) => ({
+      ...p,
+      visaExempt: true,
+      visaSubmissionStatus: 'PENDING',
+    }));
+    expect(orderToMasterRows(order).map((r) => r.visaStatus)).toEqual([
+      '已签证',
+      '已签证',
       '已签证',
     ]);
   });
@@ -1324,9 +1345,10 @@ describe('全岗总表 — 签证状态按乘客取值', () => {
     ]);
   });
 
-  // 运营反馈的四人单：订单头「已签证」，两人 exempt 且无送签进度、两人由我方送签且已送签。
-  // 要的是两组分得开：前两人跟订单头写「已签证」，后两人按各自进度写「已送签」。
-  it('订单头「已签证」的四人单：两人已签证 + 两人已送签，两组仍分得开', () => {
+  // 运营反馈的四人单：两人自备签、两人由我方送签且已送签 → 非自备签全员已送签，系统自动把
+  // 订单头办结成「已签证」（visa-completion.ts）。改前自备签的两人跟订单头也写「已签证」，
+  // 看不出谁自己办、谁我们办；现在照实写「自备签」，与订单列表子行的徽章一致。
+  it('订单头「已签证」的四人单：两人自备签 + 两人已送签，两组分得开', () => {
     const order = fixtureMixedVisa();
     const o = order as unknown as {
       visaStatus: string;
@@ -1341,11 +1363,66 @@ describe('全岗总表 — 签证状态按乘客取值', () => {
       { ...submitted, id: 'p4', documentNumber: 'E33334444' },
     ];
     expect(orderToMasterRows(order).map((r) => r.visaStatus)).toEqual([
-      '已签证',
-      '已签证',
+      '自备签',
+      '自备签',
       '已送签',
       '已送签',
     ]);
+  });
+
+  // ── 签证金额 / 签证公司 / 签证备注 也按乘客（同一批反馈）──────────────────────
+  // 改前四列整单 ÷ 人数、整单同值：自备签的客人也分到一份签证金额、也挂我方签证公司与
+  // 签证台的代办备注。自备签的人没走我方签证：金额 0、公司留空、备注只留订单「签证情况」。
+  it('独立 VISA 行 500 元、三人单一人自备签 → 金额 0 / 250 / 250，公司与任务备注只给非自备签', () => {
+    const order = fixtureMixedVisa();
+    const o = order as unknown as {
+      noteVisa: string | null;
+      items: Array<{ kind: string; fulfillmentTasks: Array<Record<string, unknown>> }>;
+    };
+    o.noteVisa = '客人材料齐';
+    const visaItem = o.items.find((it) => it.kind === 'VISA')!;
+    visaItem.fulfillmentTasks = [{ type: 'VISA_APPLICATION', status: 'IN_PROGRESS', notes: '代办渠道 65 美金' }];
+    const rows = orderToMasterRows(order);
+    expect(rows.map((r) => r.visaAmount)).toEqual([0, 250, 250]);
+    expect(rows.map((r) => r.visaSupplier)).toEqual(['', '越南A签证公司', '越南A签证公司']);
+    expect(rows.map((r) => r.visaNote)).toEqual([
+      '客人材料齐',
+      '代办渠道 65 美金 / 客人材料齐',
+      '代办渠道 65 美金 / 客人材料齐',
+    ]);
+  });
+
+  // 套餐签证挂牌价（快照 / 套餐定义 qty×unitPrice）是**每人**口径：改前当成整单合计再 ÷ 人数，
+  // 四人单 240/人 导成 60/人（运营反馈的那张单）。
+  it('套餐单四人两人自备签：挂牌价 220/人（无快照，回退套餐定义）→ 0 / 0 / 220 / 220', () => {
+    const order = fixtureBundleHotelStampedOnBundleItem();
+    const o = order as unknown as { passengers: Array<Record<string, unknown>> };
+    const [base] = o.passengers;
+    o.passengers = [
+      { ...base, id: 'q1', visaExempt: true },
+      { ...base, id: 'q2', visaExempt: true },
+      { ...base, id: 'q3', visaExempt: false },
+      { ...base, id: 'q4', visaExempt: false },
+    ];
+    expect(orderToMasterRows(order).map((r) => r.visaAmount)).toEqual([0, 0, 220, 220]);
+  });
+
+  it('套餐单带下单快照 visaListSnapshotCny=240 → 非自备签各 240，不再 ÷ 人数', () => {
+    const order = fixtureBundleHotelStampedOnBundleItem();
+    const o = order as unknown as {
+      passengers: Array<Record<string, unknown>>;
+      items: Array<{ kind: string; metadata: unknown }>;
+    };
+    const [base] = o.passengers;
+    o.passengers = [
+      { ...base, id: 'q1', visaExempt: true },
+      { ...base, id: 'q2', visaExempt: true },
+      { ...base, id: 'q3', visaExempt: false },
+      { ...base, id: 'q4', visaExempt: false },
+    ];
+    const bundleItem = o.items.find((it) => it.kind === 'BUNDLE')!;
+    bundleItem.metadata = { ...(bundleItem.metadata as object | null), visaListSnapshotCny: 240 };
+    expect(orderToMasterRows(order).map((r) => r.visaAmount)).toEqual([0, 0, 240, 240]);
   });
 
   it('老数据（乘客无送签字段）→ 整列沿用订单级文案，与改动前一致', () => {
@@ -1481,9 +1558,9 @@ describe('全岗总表 — 结算价格按乘客取值', () => {
     // 基准每人 = (3792 + 960) / 4 = 1188 → 自备签两人 828、送签两人 1068，合计 3792
     expect(rows.map((r) => r.settlePrice)).toEqual([828, 828, 1068, 1068]);
     expect(rows.reduce((s, r) => s + r.settlePrice, 0)).toBe(3792);
-    // 订单头是「已签证」→ 前两人（exempt 且无送签进度）跟订单头写「已签证」，
+    // 订单头是「已签证」（非自备签全员已送签后系统自动办结）→ 混合单：前两人照实写「自备签」，
     // 后两人按各自送签进度写「已送签」；金额仍逐人可解释（自备签那两位少收 360）。
-    expect(rows.map((r) => r.visaStatus)).toEqual(['已签证', '已签证', '已送签', '已送签']);
+    expect(rows.map((r) => r.visaStatus)).toEqual(['自备签', '自备签', '已送签', '已送签']);
   });
 
   it('售后费（adjustmentCny）计入应收：与详情页每人结算价、尾款列同源', () => {

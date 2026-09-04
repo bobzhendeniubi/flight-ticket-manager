@@ -200,22 +200,30 @@ export function orderVisaStatusLabel(
  * 为什么不能整单一个值（运营反馈）：一张单里，自备签的客人导出来跟着整单走、
  * 订单头一表态就全员一个词，复查的同事没法从表上分辨谁办到哪一步。
  *
- * 判定顺序（三档，谁更能代表这位乘客谁在前）：
+ * 判定顺序（谁更能代表这位乘客谁在前）：
  *   1. 该乘客送签进度已推进（IN_PROGRESS 材料准备 / CONFIRMED 已送签）→ 用签证台同一份文案。
  *      这是签证岗逐人推着走出来的事实，最精确，压过任何整单结论。
- *   2. 订单级明确「不需要(NOT_NEEDED) / 已签证(HAS_VISA)」→ 按订单头文案（不需要 / 已签证）。
- *   3. 其余（订单级 NEEDED/E_VISA/未表态）：visaExempt=true → 「自备签」；否则回落订单级文案。
+ *   2. 订单级明确「不需要(NOT_NEEDED)」→ 全员按订单头文案「不需要」。
+ *   3. 订单级「已签证(HAS_VISA)」：
+ *      · 单内**全员** visaExempt → 按订单头文案「已签证」（录单联动批量置的，见下）；
+ *      · 混合单（有人自备签、有人由我方送签）→ 自备签的人写「自备签」，其余写「已签证」。
+ *   4. 其余（订单级 NEEDED/E_VISA/未表态）：visaExempt=true → 「自备签」；否则回落订单级文案。
  *
- * 第 2 档为什么必须排在「自备签」前面（否则整个「不需要」结论会被吃掉）：
+ * 第 2/3 档为什么不能一律先看 visaExempt（否则整个「不需要」结论会被吃掉）：
  * 录单弹窗在订单级选「不需要签证 / 已签证」时，会把该单**所有**出行人批量置 visaExempt=true
  *（前端那个"自动置上"的标记不落库，导出侧分不出是联动置的还是逐人手勾的）。若先看 visaExempt，
  * 每一张「不需要签证」的单都会全员导成「自备签」—— 把「本来就免签/不涉签」这个业务结论
  * 整个换成了另一件事（客人自己办了签证）。这两档订单头既然已明说签证岗无事可做
  *（与建任务口径同源：visa-need.ts 的 orderVisaStatusExplicitlyNotNeeded），
- * 单内那批 visaExempt 与订单头同义，直接用订单头文案更准。
+ * 全员置上的那批 visaExempt 与订单头同义，直接用订单头文案更准。
  *
- * 反馈里那张四人单（订单头 HAS_VISA；两人 exempt 且无进度、另两人 CONFIRMED）
- * 仍按 已签证 / 已签证 / 已送签 / 已送签 导出 —— 两组照旧分得开，正是运营要的。
+ * 第 3 档为什么要区分「全员 exempt」与「混合单」：订单头的 HAS_VISA 不只来自录单手选——
+ * 非自备签乘客全部推到「已送签」时，系统会自动把订单头办结成 HAS_VISA
+ *（fulfillment/visa-completion.ts）。这种单天然是混合的：两人自备签、两人我方送签。
+ * 混合单里的 visaExempt 不可能是联动批量置的（联动是全员一起置），只能是逐人手勾的自备签，
+ * 此时再让他们跟订单头写「已签证」，就把「谁自己办、谁我们办」抹平了（运营反馈那张四人单：
+ * 自备签的两人导出来也是「已签证」，与订单列表子行的「自备签」徽章对不上）。
+ * 「全员 exempt」在订单级算一次（allPassengersVisaExempt）传入，行循环里不重复扫名单。
  *
  * 需知会运营的口径点：订单头选了「不需要 / 已签证」、个别乘客却留有送签进度的单，
  * 这些人按各自进度显示（第 1 档），不被整单结论盖住 —— 这正是要暴露的矛盾，不是回归。
@@ -229,19 +237,44 @@ export function passengerVisaStatusCell(input: {
    */
   orderVisaStatus?: VisaRequirement | null;
   passenger: { visaExempt?: boolean | null; visaSubmissionStatus?: string | null };
+  /**
+   * 单内是否**全员** visaExempt（订单级算一次传入，见 allPassengersVisaExempt）。
+   * 只影响订单头 HAS_VISA 的单：false = 混合单，自备签的人照实写「自备签」；
+   * 缺省/true = 视作录单联动全员置上，跟订单头写「已签证」。
+   */
+  allPassengersExempt?: boolean;
 }): string {
   // 1. 签证台逐人推进的进度（PENDING 不算推进）
   const submission = input.passenger.visaSubmissionStatus;
   if (submission && submission !== 'PENDING') {
     return VISA_SUBMISSION_LABEL[submission] ?? input.orderVisaLabel;
   }
-  // 2. 订单头明确「不需要 / 已签证」—— 与签证任务判定同一个口径函数
+  // 2/3. 订单头明确「不需要 / 已签证」—— 与签证任务判定同一个口径函数
   if (orderVisaStatusExplicitlyNotNeeded(input.orderVisaStatus)) {
+    // 3. 已签证 + 混合单：这批 visaExempt 是逐人手勾的，不是联动置的，照实写「自备签」
+    if (
+      input.orderVisaStatus === 'HAS_VISA' &&
+      input.passenger.visaExempt === true &&
+      input.allPassengersExempt === false
+    ) {
+      return VISA_EXEMPT_LABEL;
+    }
     return input.orderVisaLabel;
   }
-  // 3. 逐人手勾的自备签（此时订单头是 NEEDED/E_VISA/未表态，不存在联动批量置的情况）
+  // 4. 逐人手勾的自备签（此时订单头是 NEEDED/E_VISA/未表态，不存在联动批量置的情况）
   if (input.passenger.visaExempt === true) return VISA_EXEMPT_LABEL;
   return input.orderVisaLabel;
+}
+
+/**
+ * 单内是否**全员**自备签（空名单 → false）—— passengerVisaStatusCell 第 3 档的订单级输入，
+ * 全岗总表与《全岗可用》各在行循环外算一次。老数据（乘客无 visaExempt 字段）→ false，
+ * 此时乘客的 visaExempt 也不为 true，第 3 档不会触发，行为与改动前一致。
+ */
+export function allPassengersVisaExempt(
+  passengers: ReadonlyArray<{ visaExempt?: boolean | null }>,
+): boolean {
+  return passengers.length > 0 && passengers.every((p) => p.visaExempt === true);
 }
 
 /**
@@ -295,6 +328,68 @@ export function perPaxSettlementByPassenger(order: {
     ),
   });
   return new Map(rows.map((r) => [r.passengerId, r.shareCny]));
+}
+
+/**
+ * 「签证金额」列的**按乘客**取值 —— 全岗总表与《全岗可用》共用的唯一口径。
+ *
+ * 改前：整单合计 ÷ 人数，四个人一律同一个数。两处失真（运营反馈那张四人单：两人自备签、
+ * 套餐签证挂牌价 240/人，导出来四人各 60）：
+ *   · 自备签（visaExempt）的客人没走我方签证，套餐价里也按 selfVisaDeductCny 给他减掉了，
+ *     这列却照样分到一份；
+ *   · 套餐签证挂牌价快照 metadata.visaListSnapshotCny 是**每人**口径（套餐定义 items 的
+ *     qty×unitPrice，与 products/bundle-pricing.ts 的 visaPerPax 同源），改前当成整单合计
+ *     再 ÷ 人数，多人单被压低 N 倍（单人单恰好看不出来）。
+ *
+ * 改后：
+ *   · 独立 VISA 行的实收金额是整单口径（qty = 买签证的人数）→ 在**非自备签**乘客间均摊；
+ *     全员 exempt 却仍有 VISA 行（矛盾数据）时在全员间均摊，钱不凭空消失。
+ *   · 套餐签证挂牌价（快照优先；老单无快照回退现行定义 qty×unitPrice，与旧版一致）是每人
+ *     口径 → 非自备签乘客各记一份，自备签乘客记 0。
+ *   · 自备签乘客 = 0 + 0 = 0。
+ * 本列仍是「挂牌价 / 实收」的核对口径：客人付的是折后套餐总价，这里不是实收拆分额。
+ */
+export function perPaxVisaAmountByPassenger(order: {
+  passengers: ReadonlyArray<{ id: string; visaExempt?: boolean | null }>;
+  items: ReadonlyArray<{
+    kind: string;
+    amount: Prisma.Decimal | number | null;
+    metadata?: unknown;
+    bundle?: { items: unknown } | null;
+  }>;
+}): Map<string, number> {
+  const standaloneTotal = order.items
+    .filter((it) => it.kind === 'VISA')
+    .reduce((s, it) => s + dec(it.amount), 0);
+  const bundleListPerPax = order.items.reduce((s, it) => {
+    if (it.kind !== 'BUNDLE') return s;
+    // B14 快照优先（2026-07-20）：下单时把签证挂牌价快照进 metadata.visaListSnapshotCny
+    //（含 0 = 当时不含签证组件），历史导出钉死在下单时点，不再随套餐改价漂移。
+    const meta = (it.metadata ?? null) as { visaListSnapshotCny?: unknown } | null;
+    if (meta && typeof meta.visaListSnapshotCny === 'number') {
+      return s + meta.visaListSnapshotCny;
+    }
+    const components = Array.isArray(it.bundle?.items)
+      ? (it.bundle!.items as unknown as BundleItemJson[])
+      : [];
+    return (
+      s +
+      components
+        .filter((c) => c && c.kind === 'VISA')
+        .reduce((acc, c) => acc + (Number(c.qty) || 0) * (Number(c.unitPrice) || 0), 0)
+    );
+  }, 0);
+  const payers = order.passengers.filter((p) => p.visaExempt !== true);
+  const sharers = payers.length > 0 ? payers : order.passengers;
+  const standalonePerPax = sharers.length > 0 ? standaloneTotal / sharers.length : 0;
+  const sharerIds = new Set(sharers.map((p) => p.id));
+  return new Map(
+    order.passengers.map((p) => {
+      const standalone = sharerIds.has(p.id) ? standalonePerPax : 0;
+      const bundle = p.visaExempt === true ? 0 : bundleListPerPax;
+      return [p.id, round2(standalone + bundle)];
+    }),
+  );
 }
 
 // 注：《全岗可用》模版对齐旧系统口径 —— 乘客类型/性别/证件类型均按旧模版原样
@@ -479,6 +574,13 @@ interface OrderContext {
   settleByPassenger: ReadonlyMap<string, number>;
   /** 结算价格的均摊兜底 = 应收（total + adjustmentCny）÷ pax；只在乘客不在上表里时用到。*/
   settlePerPax: number;
+  /**
+   * 签证金额（**按乘客**）：passengerId → 该乘客的签证金额（自备签 = 0；套餐签证挂牌价是
+   * 每人口径不再 ÷ 人数），见 perPaxVisaAmountByPassenger。
+   */
+  visaAmountByPassenger: ReadonlyMap<string, number>;
+  /** 单内是否全员自备签 —— passengerVisaStatusCell 第 3 档的订单级输入（算一次，行内复用）。*/
+  allPassengersExempt: boolean;
   paidPerPax: number; // 到账金额 = paidAmount ÷ pax
   // 尾款 = max(0, total + adjustmentCny − paidAmount − prepaymentOffset) ÷ pax。含售后费（改期费/
   // 换人费等走 adjustmentCny，不在 total 里）与代理预付款抵扣（prepaymentOffset）——漏掉任一项都会让
@@ -580,6 +682,8 @@ export function buildOrderContext(
     legStatus: opts?.redactLegStatus === true ? '' : formatOrderLegStatus(order.items),
     settleByPassenger: perPaxSettlementByPassenger(order),
     settlePerPax: round2((total + adjustment) / paxCount),
+    visaAmountByPassenger: perPaxVisaAmountByPassenger(order),
+    allPassengersExempt: allPassengersVisaExempt(order.passengers),
     paidPerPax: round2(paid / paxCount),
     balancePerPax: round2(Math.max(0, total + adjustment - paid - prepaymentOffset) / paxCount),
   };
@@ -769,8 +873,9 @@ export function orderToFullRows(
   // 状态是**按乘客**的（0901 运营反馈：整单一个值时自备签的客人也写「需要」、
   // 一位已送签就整单写已送签）—— 订单级文案在循环外算好，逐行走 passengerVisaStatusCell，
   // 与全岗总表（orders.export-master.ts）共用同一个函数。
+  // 金额也是**按乘客**的（ctx.visaAmountByPassenger：自备签 = 0，套餐签证挂牌价按每人口径），
+  // 与全岗总表共用 perPaxVisaAmountByPassenger。
   const visaItems = order.items.filter((it) => it.kind === 'VISA');
-  const visaAmountOrder = visaItems.reduce((s, it) => s + dec(it.amount), 0);
   const bundleVisaNames = order.items.flatMap((it) => {
     if (it.kind !== 'BUNDLE' || !it.bundle) return [];
     const components = Array.isArray(it.bundle.items)
@@ -844,7 +949,7 @@ export function orderToFullRows(
     balanceDue: ctx.balancePerPax,
     singleRoomDiff: '',
     singleRoomDiffReceived: '',
-    visaAmount: round2(visaAmountOrder / ctx.paxCount),
+    visaAmount: ctx.visaAmountByPassenger.get(p.id) ?? 0,
     visaReceived: '',
     offsetAmount: round2(dec(order.prepaymentOffset) / ctx.paxCount),
     offsetReceived: '',
@@ -861,9 +966,11 @@ export function orderToFullRows(
       orderVisaLabel,
       orderVisaStatus: order.visaStatus,
       passenger: p,
+      allPassengersExempt: ctx.allPassengersExempt,
     }),
     visaOption,
-    visaSupplier: visaSupplierOf(order),
+    // 自备签乘客没走我方送签：签证公司（我方供应商）不属于他们，留空。
+    visaSupplier: p.visaExempt === true ? '' : visaSupplierOf(order),
     visaNote: order.noteVisa ?? '',
     passportIssuePlace: p.passportIssuePlace ?? p.passportIssueCountry ?? '',
     placeOfBirth: p.placeOfBirth ?? '',

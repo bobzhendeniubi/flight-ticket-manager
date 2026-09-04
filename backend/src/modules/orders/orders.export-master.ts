@@ -28,7 +28,6 @@ import { businessDateTime } from '../../lib/business-time.js';
 import type { PrismaClient } from '@prisma/client';
 import { Prisma } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
-import type { BundleItemJson } from '../../lib/json-types.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats.js';
 import type { TripStatsMap } from './orders.export-trip-stats.js';
@@ -39,6 +38,8 @@ import {
   orderVisaStatusLabel,
   passengerVisaStatusCell,
   perPaxSettlementByPassenger,
+  perPaxVisaAmountByPassenger,
+  allPassengersVisaExempt,
   pnrName,
   withoutAgentHiddenColumns,
 } from './orders.export-templates.js';
@@ -477,32 +478,13 @@ export function orderToMasterRows(
   const settled = paid + prepaymentOffset >= total + adjustment ? '是' : '否';
 
   // ── 签证：金额 + 状态 ──
-  // 独立 VISA 行的实收金额（客人单买签证时的口径）。
-  const visaItems = order.items.filter((it) => it.kind === 'VISA');
-  const visaAmountStandalone = visaItems.reduce((s, it) => s + dec(it.amount), 0);
-  // 套餐(BUNDLE)行：签证费并入折后套餐价、订单行不单列，但套餐定义 items JSON 里仍有
-  // 签证组件的挂牌价。此处取套餐定义中 VISA 组件的挂牌价（qty×unitPrice）补上，
-  // 让套餐单的签证金额不再显示 0。口径说明：客人付的是折后套餐总价，本列反映的是
-  // 套餐里签证部分的「挂牌价」（list price），仅供运营核对签证分摊，非实收拆分额。
-  const visaAmountBundle = order.items.reduce((s, it) => {
-    if (it.kind !== 'BUNDLE') return s;
-    // B14 快照优先（2026-07-20）：新单下单时把签证挂牌价快照进行 metadata.visaListSnapshotCny
-    //（含 0 = 当时不含签证组件），历史导出钉死在下单时点，不再随套餐改价漂移。
-    // 老单（无快照字段）回退现行定义反推——行为与旧版一致，仅供核对，非实收拆分。
-    const meta = (it.metadata ?? null) as { visaListSnapshotCny?: unknown } | null;
-    if (meta && typeof meta.visaListSnapshotCny === 'number') {
-      return s + meta.visaListSnapshotCny;
-    }
-    if (!it.bundle) return s;
-    const components = Array.isArray(it.bundle.items)
-      ? (it.bundle.items as unknown as BundleItemJson[])
-      : [];
-    const bundleVisa = components
-      .filter((c) => c && c.kind === 'VISA')
-      .reduce((acc, c) => acc + (Number(c.qty) || 0) * (Number(c.unitPrice) || 0), 0);
-    return s + bundleVisa;
-  }, 0);
-  const visaAmountOrder = visaAmountStandalone + visaAmountBundle;
+  // 签证金额**按乘客**（自备签 = 0；独立 VISA 行实收在非自备签乘客间均摊；套餐签证挂牌价
+  // 快照是每人口径，不再 ÷ 人数）—— 唯一口径在 perPaxVisaAmountByPassenger，与《全岗可用》共用。
+  // 本列仍是「挂牌价 / 实收」的核对口径，非实收拆分额。
+  const visaAmountByPassenger = perPaxVisaAmountByPassenger(order);
+  // 「全员自备签」在订单级算一次，供 passengerVisaStatusCell 区分「录单联动全员置上」与
+  // 「混合单里逐人手勾」（后者订单头 HAS_VISA 时自备签的人要照实写「自备签」）。
+  const allPassengersExempt = allPassengersVisaExempt(order.passengers);
   // 状态：订单级文案（visaStatus 优先，缺省回落任意订单行的签证履约任务）在循环外算一次，
   // 每行再按本乘客取值（自备签 / 送签进度）—— 见 passengerVisaStatusCell。
   // 不限 kind —— 套餐(BUNDLE)含签证时 VISA_APPLICATION 任务挂在 BUNDLE 行上（无独立 VISA 行），
@@ -521,6 +503,9 @@ export function orderToMasterRows(
         .filter(Boolean),
     ),
   ).join(' / ');
+  // 自备签乘客没走我方送签：签证任务备注（签证台记的代办渠道/进价，如「XX 65 美金」）
+  // 不属于他们，只保留订单「签证情况」备注；「签证公司」同理留空（见行内）。
+  const visaNoteExempt = typeof order.noteVisa === 'string' ? order.noteVisa.trim() : '';
   // 签证公司（财务反馈：需清晰核对某笔签证金额属于哪家供应商）：取独立 VISA 行关联产品的 supplier，
   // 多签证产品去重后逗号拼接；无 supplier 留空。套餐内签证组件无独立供应商字段，故只认 VISA 行。
   const visaSupplier = Array.from(
@@ -632,16 +617,18 @@ export function orderToMasterRows(
       balanceDue: balancePerPax,
       settleReceived: paidPerPax,
       singleRoomDiff: round2(singleRoomDiffOrder / paxCount),
-      visaAmount: round2(visaAmountOrder / paxCount),
-      visaSupplier,
-      // 订单级原值一并传入：「不需要 / 已签证」两档要压过录单联动批量置上的 visaExempt，
-      // 详见 passengerVisaStatusCell 的判定顺序说明。
+      // 签证金额按人（自备签 = 0）—— 见 perPaxVisaAmountByPassenger。
+      visaAmount: visaAmountByPassenger.get(p.id) ?? 0,
+      visaSupplier: p.visaExempt === true ? '' : visaSupplier,
+      // 订单级原值一并传入：「不需要 / 已签证」两档要压过录单联动批量置上的 visaExempt；
+      // 全员 exempt 与否也一并传入，混合单里的自备签照实写 —— 详见 passengerVisaStatusCell。
       visaStatus: passengerVisaStatusCell({
         orderVisaLabel,
         orderVisaStatus: order.visaStatus,
         passenger: p,
+        allPassengersExempt,
       }),
-      visaNote,
+      visaNote: p.visaExempt === true ? visaNoteExempt : visaNote,
       invoiceStatus,
       settled,
       refundAmount: round2(refundTotal / paxCount),

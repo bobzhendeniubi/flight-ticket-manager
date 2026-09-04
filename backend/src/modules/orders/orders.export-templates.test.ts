@@ -26,6 +26,7 @@ import {
   nameWithTitle,
   AGENT_HIDDEN_EXPORT_KEYS,
   perPaxSettlementByPassenger,
+  perPaxVisaAmountByPassenger,
   FULL_COLUMNS,
   TICKETING_COLUMNS,
   VISA_COLUMNS,
@@ -1190,11 +1191,25 @@ describe('《全岗可用》full 模版 — 签证状态按乘客取值', () => 
     expect(rows.map((r) => r.visaStatus)).toEqual(['不需要', '已送签', '不需要']);
   });
 
-  it('订单级「已签证」同理：exempt 的人写「已签证」，已送签的仍写「已送签」', () => {
+  // 「已签证」与「不需要」不同：混合单里的 exempt 只能是逐人手勾的（联动是全员一起置），
+  // 照实写「自备签」；没进度的非 exempt 乘客才跟订单头写「已签证」。
+  it('订单级「已签证」的混合单：exempt 的人写「自备签」，已送签的写「已送签」，其余「已签证」', () => {
     const order = fixtureMixedVisa();
     (order as unknown as { visaStatus: string }).visaStatus = 'HAS_VISA';
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows.map((r) => r.visaStatus)).toEqual(['已签证', '已送签', '已签证']);
+    expect(rows.map((r) => r.visaStatus)).toEqual(['自备签', '已送签', '已签证']);
+  });
+
+  it('「已签证」+ 全员联动置 exempt 且无送签进度 → 全员「已签证」，不是全员「自备签」', () => {
+    const order = fixtureMixedVisa();
+    const o = order as unknown as {
+      visaStatus: string;
+      passengers: Array<Record<string, unknown>>;
+    };
+    o.visaStatus = 'HAS_VISA';
+    o.passengers = o.passengers.map((p) => ({ ...p, visaExempt: true, visaSubmissionStatus: 'PENDING' }));
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    expect(rows.map((r) => r.visaStatus)).toEqual(['已签证', '已签证', '已签证']);
   });
 
   // ── 录单联动把全员置 exempt 之后，「不需要」这个结论不能被吃掉 ────────────────
@@ -1227,7 +1242,9 @@ describe('《全岗可用》full 模版 — 签证状态按乘客取值', () => 
     expect(rows.map((r) => r.visaStatus)).toEqual(['不需要', '已送签', '不需要']);
   });
 
-  it('「已签证」四人单（两人 exempt 无进度 + 两人已送签）→ 已签证/已签证/已送签/已送签', () => {
+  // 运营反馈的四人单：两人自备签、两人我方送签且已送签 → 系统自动办结订单头为「已签证」。
+  // 自备签的两人照实写「自备签」（改前跟订单头写「已签证」，与订单列表子行徽章对不上）。
+  it('「已签证」四人单（两人 exempt 无进度 + 两人已送签）→ 自备签/自备签/已送签/已送签', () => {
     const order = fixtureMixedVisa();
     const o = order as unknown as {
       visaStatus: string;
@@ -1242,7 +1259,15 @@ describe('《全岗可用》full 模版 — 签证状态按乘客取值', () => 
       { ...base, id: 'q4', visaExempt: false, visaSubmissionStatus: 'CONFIRMED' },
     ];
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows.map((r) => r.visaStatus)).toEqual(['已签证', '已签证', '已送签', '已送签']);
+    expect(rows.map((r) => r.visaStatus)).toEqual(['自备签', '自备签', '已送签', '已送签']);
+  });
+
+  // ── 签证金额 / 签证公司 也按乘客（同一批反馈）────────────────────────────────
+  it('独立 VISA 行 500 元、三人单一人自备签 → 签证金额 0 / 250 / 250，签证公司只给非自备签', () => {
+    const order = fixtureMixedVisa();
+    const rows = orderToFullRows(order, buildOrderContext(order));
+    expect(rows.map((r) => r.visaAmount)).toEqual([0, 250, 250]);
+    expect(rows.map((r) => r.visaSupplier)).toEqual(['', '越南领区签证代办', '越南领区签证代办']);
   });
 
   it('「需要签证」+ 某人 exempt → 该人「自备签」，其余「需要」（逐人手勾的自备签照旧）', () => {
@@ -1715,5 +1740,59 @@ describe('代理导出（agentScope 非空）— 三模板按共享脱敏政策�
     for (const key of ['settlePrice', 'balanceDue', 'orderNumber', 'agency', 'visaStatus']) {
       expect(AGENT_HIDDEN_EXPORT_KEYS.has(key)).toBe(false);
     }
+  });
+});
+
+// ── 签证金额按乘客（纯函数，全岗总表与《全岗可用》共用）──────────────────────────
+// 反馈：四人套餐单、两人自备签、签证挂牌价 240/人，导出来四人各 60 —— 自备签的人也分到一份，
+// 且每人口径的快照被当成整单合计再 ÷ 人数。
+describe('perPaxVisaAmountByPassenger', () => {
+  const pax = (id: string, visaExempt: boolean) => ({ id, visaExempt });
+
+  it('套餐快照 240/人 + 两人自备签 → 0 / 0 / 240 / 240（不再 ÷ 人数）', () => {
+    const m = perPaxVisaAmountByPassenger({
+      passengers: [pax('a', true), pax('b', true), pax('c', false), pax('d', false)],
+      items: [{ kind: 'BUNDLE', amount: 700, metadata: { visaListSnapshotCny: 240 }, bundle: { items: [] } }],
+    });
+    expect(['a', 'b', 'c', 'd'].map((id) => m.get(id))).toEqual([0, 0, 240, 240]);
+  });
+
+  it('老单无快照 → 回退套餐定义 qty×unitPrice（每人口径）', () => {
+    const m = perPaxVisaAmountByPassenger({
+      passengers: [pax('a', false), pax('b', true)],
+      items: [
+        {
+          kind: 'BUNDLE',
+          amount: 1000,
+          metadata: null,
+          bundle: { items: [{ kind: 'VISA', qty: 1, unitPrice: 220 }, { kind: 'HOTEL', qty: 1, unitPrice: 300 }] },
+        },
+      ],
+    });
+    expect([m.get('a'), m.get('b')]).toEqual([220, 0]);
+  });
+
+  it('独立 VISA 行是整单实收 → 只在非自备签乘客间均摊', () => {
+    const m = perPaxVisaAmountByPassenger({
+      passengers: [pax('a', true), pax('b', false), pax('c', false)],
+      items: [{ kind: 'VISA', amount: 500, metadata: null }],
+    });
+    expect([m.get('a'), m.get('b'), m.get('c')]).toEqual([0, 250, 250]);
+  });
+
+  it('全员自备签却仍有 VISA 行（矛盾数据）→ 全员均摊，钱不凭空消失', () => {
+    const m = perPaxVisaAmountByPassenger({
+      passengers: [pax('a', true), pax('b', true)],
+      items: [{ kind: 'VISA', amount: 300, metadata: null }],
+    });
+    expect([m.get('a'), m.get('b')]).toEqual([150, 150]);
+  });
+
+  it('无签证行也无快照 → 全员 0', () => {
+    const m = perPaxVisaAmountByPassenger({
+      passengers: [pax('a', false)],
+      items: [{ kind: 'FLIGHT', amount: 800, metadata: null }],
+    });
+    expect(m.get('a')).toBe(0);
   });
 });
