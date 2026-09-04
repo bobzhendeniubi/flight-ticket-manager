@@ -35,6 +35,8 @@ const TOKEN = '00000000-0000-4000-8000-00000000abcd';
 
 const OUT_DEPART = new Date('2026-09-10T02:00:00.000Z');
 const RET_DEPART = new Date('2026-09-15T02:00:00.000Z');
+/** 已经飞走的去程（用于「已起飞不许改期」的前置闸用例）。 */
+const FLOWN_DEPART = new Date('2020-01-01T02:00:00.000Z');
 
 /** prisma.order.findUnique 的源单快照（乘客名册 + 带班次的机票行）。 */
 const sourceSnapshot = (over: Record<string, unknown> = {}) => ({
@@ -45,12 +47,12 @@ const sourceSnapshot = (over: Record<string, unknown> = {}) => ({
     {
       id: 'leg-out',
       flightScheduleId: 'sch-out',
-      flightSchedule: { departureTime: OUT_DEPART },
+      flightSchedule: { departureTime: OUT_DEPART, departureTz: 'Asia/Shanghai' },
     },
     {
       id: 'leg-ret',
       flightScheduleId: 'sch-ret',
-      flightSchedule: { departureTime: RET_DEPART },
+      flightSchedule: { departureTime: RET_DEPART, departureTz: 'Asia/Shanghai' },
     },
   ],
   ...over,
@@ -359,6 +361,63 @@ describe('按人改期 · 已出票三人单勾一人', () => {
     expect(ticketing.o1.outboundInvoiced).toBe(true);
     expect(result.splitPerformed).toBe(true);
     expect(result.audit.newOrderNumber).toBe('FTM20260901-TGT');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 已起飞的航段：前置闸必须在拆单**之前**拦下。
+// 否则先拆一张新单（真搬人搬钱写审计），再由 rescheduleOrderItem 拒绝 ——
+// 留下一张多余的新单，而且新单同一航段照样已起飞，「到新单重试」永远走不通。
+// ══════════════════════════════════════════════════════════════════════════
+describe('按人改期 · 已起飞航段的前置闸', () => {
+  const flownSnapshot = () =>
+    sourceSnapshot({
+      items: [
+        {
+          id: 'leg-out',
+          flightScheduleId: 'sch-out',
+          flightSchedule: { departureTime: FLOWN_DEPART, departureTz: 'Asia/Shanghai' },
+        },
+        {
+          id: 'leg-ret',
+          flightScheduleId: 'sch-ret',
+          flightSchedule: { departureTime: RET_DEPART, departureTz: 'Asia/Shanghai' },
+        },
+      ],
+    });
+
+  it('部分乘客改已起飞的去程 → 直接抛错，拆单一次都没被调用', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(flownSnapshot());
+    const split = vi.spyOn(service, 'splitOrder');
+    const reschedule = vi.spyOn(service, 'rescheduleOrderItem');
+
+    await expect(service.reschedulePassengers('o1', body(), admin)).rejects.toThrow(/已起飞/u);
+    expect(split).not.toHaveBeenCalled();
+    expect(reschedule).not.toHaveBeenCalled();
+  });
+
+  it('错误文案与改期端点同一份（带当地起飞时刻 + 引导走 no-show）', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(flownSnapshot());
+    vi.spyOn(service, 'splitOrder');
+
+    const err = await service.reschedulePassengers('o1', body(), admin).catch((e) => e);
+    expect(err).toBeInstanceOf(BadRequestError);
+    expect(err.message).toContain('2020-01-01 10:00');
+    expect(err.message).toContain('标记 no-show');
+  });
+
+  it('未起飞的回程不受影响：照常拆单再改期', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(flownSnapshot());
+    const split = vi.spyOn(service, 'splitOrder').mockResolvedValue(splitOutcome());
+    vi.spyOn(service, 'rescheduleOrderItem').mockResolvedValue(rescheduleOutcome());
+
+    const result = await service.reschedulePassengers(
+      'o1',
+      body({ orderItemId: 'leg-ret' }),
+      admin,
+    );
+    expect(split).toHaveBeenCalledTimes(1);
+    expect(result.audit.leg).toBe('RETURN');
   });
 });
 

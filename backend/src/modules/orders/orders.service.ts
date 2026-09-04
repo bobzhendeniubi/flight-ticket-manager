@@ -8104,18 +8104,9 @@ export class OrderService {
       // ── 已起飞的段不许改期（与取消航段闸 10 对称）──────────────────────────────
       // 改期要「放旧座」，而飞过的座位早被真实消耗掉了（口径同 isLegAlreadyFlown）：
       // 放回去等于让一个过去的班次凭空多出可卖余位，同时又在新班次占一份，两头都是错账。
-      if (isLegAlreadyFlown(item, Date.now())) {
-        const sched = item.flightSchedule;
-        const departAt = sched?.departureTime ?? null;
-        const localWhen =
-          departAt != null
-            ? `${localDateISO(departAt, sched?.departureTz)} ${localHHMM(departAt, sched?.departureTz)}`
-            : '时间未知';
-        throw new BadRequestError(
-          `该段已起飞（当地时间 ${localWhen} 出发），不能改期；` +
-            '客人没登机请走「标记 no-show」处理。',
-        );
-      }
+      // 判定与文案抽到 assertLegNotFlownForReschedule：按人改期在拆单**之前**要跑同一份闸
+      //（见 reschedulePassengers 步骤 3b），两处必须是同一份时刻口径、同一句人话。
+      assertLegNotFlownForReschedule(item);
 
       const oldScheduleId = item.flightScheduleId;
       const oldCabin = item.flightCabin;
@@ -13935,7 +13926,8 @@ export class OrderService {
           select: {
             id: true,
             flightScheduleId: true,
-            flightSchedule: { select: { departureTime: true } },
+            // departureTz 只为「已起飞」闸的人话文案（当地起飞时刻），与改期端点同一份折算。
+            flightSchedule: { select: { departureTime: true, departureTz: true } },
           },
         },
       },
@@ -14004,6 +13996,14 @@ export class OrderService {
       await this._auditReschedulePassengers(result, actor, movedIds);
       return result;
     }
+
+    // ── 3b. 已起飞的段：拆单**之前**就拦下（fail-closed）────────────────────────
+    // 拆单不可回滚（新单是一张合法订单，撤不掉）。这道闸只跟「这一段飞没飞」有关、
+    // 与勾了谁无关，晚到 rescheduleOrderItem 里才判就会留下一张多余的新单，
+    // 而且新单同一航段照样已起飞，前端提示的「到新单上重试改期」永远走不通。
+    // 判定与文案跟改期端点共用 assertLegNotFlownForReschedule（同一份时区折算）。
+    const selectedLeg = leg === 'OUTBOUND' ? sourceLegs.outbound : sourceLegs.return;
+    if (selectedLeg) assertLegNotFlownForReschedule(selectedLeg);
 
     // ── 4. 部分乘客：先拆单（幂等，服务端权威算钱），失败则整体失败、什么都没发生 ──
     const split = await this.splitOrder(
@@ -19986,6 +19986,34 @@ function isLegAlreadyFlown(
 ): boolean {
   const departAt = item.flightSchedule?.departureTime ?? null;
   return departAt != null && departAt.getTime() <= atMs;
+}
+
+/**
+ * 「该段已起飞 → 不能改期」的统一判定与文案。
+ *
+ * 改期要「放旧座」，飞过的座位早被真实消耗掉：放回去等于让过去的班次凭空多出可卖余位，
+ * 同时又在新班次占一份，两头都是错账。判定口径走共享 helper isLegAlreadyFlown，
+ * 时区折算走 lib/flight-time.ts（与全站展示同一口径）。
+ *
+ * 两处调用必须是同一份闸：
+ *   · rescheduleOrderItem（PATCH /orders/:id/reschedule 与航段入口的执行段）；
+ *   · reschedulePassengers 拆单前的前置闸 —— 拆单不可回滚，晚一步就会留下一张多余新单，
+ *     而且新单同一航段照样已起飞，「到新单重试」永远走不通。
+ */
+function assertLegNotFlownForReschedule(item: {
+  flightSchedule?: { departureTime: Date | null; departureTz?: string | null } | null;
+}): void {
+  if (!isLegAlreadyFlown(item, Date.now())) return;
+  const sched = item.flightSchedule;
+  const departAt = sched?.departureTime ?? null;
+  const localWhen =
+    departAt != null
+      ? `${localDateISO(departAt, sched?.departureTz)} ${localHHMM(departAt, sched?.departureTz)}`
+      : '时间未知';
+  throw new BadRequestError(
+    `该段已起飞（当地时间 ${localWhen} 出发），不能改期；` +
+      '客人没登机请走「标记 no-show」处理。',
+  );
 }
 
 /**
