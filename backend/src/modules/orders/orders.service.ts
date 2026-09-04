@@ -13973,6 +13973,7 @@ export class OrderService {
       },
     });
     let replaySplit: SplitOrderResult | null = null;
+    let replayLeg: 'OUTBOUND' | 'RETURN' | null = null;
     if (priorSplit) {
       const snapshot = readJsonObject(priorSplit.snapshot);
       const priorIdsRaw = snapshot.movedPassengerIds;
@@ -14000,15 +14001,19 @@ export class OrderService {
         );
       }
       const priorOrchestration = readJsonObject(priorOrchestrationRaw);
-      const current = reschedulePassengersOrchestration(input);
+      const current = reschedulePassengersOrchestration(input, null);
       // 键序无关地比：留档那份是从 JSONB 读回来的，键序未必还是当初写进去的样子，
       // 直接 JSON.stringify 两边比会把「原样重试」误判成「换了一份入参」。
-      if (canonicalJson(priorOrchestration) !== canonicalJson(current)) {
+      // 派生记录（leg）不参与比对 —— 它不是请求入参，正是这里还推不出来的那个值。
+      if (orchestrationFingerprint(priorOrchestration) !== orchestrationFingerprint(current)) {
         throw tokenPayloadMismatchError(
           { reason: 'PAYLOAD', prior: priorOrchestration, current },
           '这个请求编号已经用于另一班次/另一份改期差价，请刷新后用新的请求编号重试。',
         );
       }
+      // 首刷时派生出的航段：源单可能已经没有这一行了（整条机票行被搬走），
+      // 回放要用它，不能再从当前源单推。
+      replayLeg = readOrchestrationLeg(priorOrchestration.leg);
       replaySplit = {
         sourceOrderId: orderId,
         sourceOrderNumber: order.orderNumber,
@@ -14034,13 +14039,18 @@ export class OrderService {
     // 新单上不一定存在。所以这里在源单上一次性把「哪一段」定下来，改期时对新单按航段定位
     // （rescheduleOrderItem 的 leg 入口，与批量改航班同一条路径）。
     // 三段及以上的罕见单只认前两段（与开票六态、导出、hasReturnLeg 全站同口径）。
+    //
+    // 回放（1b 命中）时优先用快照里首刷派生出的那一段：首刷若把机票行**整条**搬去了新单
+    // （比如成人全拆、源单只剩不占座的婴儿），源单已经没有这一行，按 orderItemId 推只能推空
+    // —— 原样重试会在真正回放之前就吃 400，永远走不通。
     const sourceLegs = determineFlightLegItems(order.items);
-    const leg: 'OUTBOUND' | 'RETURN' | null =
+    const derivedLeg: 'OUTBOUND' | 'RETURN' | null =
       sourceLegs.outbound?.id === input.orderItemId
         ? 'OUTBOUND'
         : sourceLegs.return?.id === input.orderItemId
           ? 'RETURN'
           : null;
+    const leg = derivedLeg ?? replayLeg;
     if (!leg) {
       throw new BadRequestError(
         '所选航段不是本订单的去程/回程机票行，无法按人改期，请刷新订单后重试',
@@ -14144,8 +14154,9 @@ export class OrderService {
           note: input.note,
           requestToken: input.requestToken,
           autoSplitRoomGroups: true,
-          // 编排入参留档：下次同 token 重试时 1b 据此比对（换班次/换费用 → 409）。
-          orchestration: reschedulePassengersOrchestration(input),
+          // 编排入参留档：下次同 token 重试时 1b 据此比对（换班次/换费用/换房数 → 409），
+          // 并把这次派生出的航段一起留着，供源单已无该行时的回放使用。
+          orchestration: reschedulePassengersOrchestration(input, leg),
         },
         actor,
       ));
@@ -17142,6 +17153,24 @@ export type SplitOrchestrationSnapshot = Record<
 >;
 
 /**
+ * orchestration 里**不参与指纹比对**的键：不是请求入参，是首刷时算出来留给回放用的派生值。
+ * 拿它们比对等于要求「回放前先把这个值算出来」—— 而回放要解决的恰恰是算不出来。
+ */
+const ORCHESTRATION_DERIVED_KEYS: readonly string[] = ['leg'];
+
+/** 编排入参指纹：剔掉派生记录后按键序无关序列化。 */
+function orchestrationFingerprint(snapshot: Record<string, unknown>): string {
+  const inputsOnly: Record<string, unknown> = { ...snapshot };
+  for (const key of ORCHESTRATION_DERIVED_KEYS) delete inputsOnly[key];
+  return canonicalJson(inputsOnly);
+}
+
+/** 从留档的 orchestration 里读回首刷派生的航段（读不出合法值就当没留）。 */
+function readOrchestrationLeg(value: unknown): 'OUTBOUND' | 'RETURN' | null {
+  return value === 'OUTBOUND' || value === 'RETURN' ? value : null;
+}
+
+/**
  * 按人改期的编排入参指纹（拆单流水 snapshot.orchestration 的唯一构造口径）。
  *
  * 落库与比对必须走同一个函数、同一个键序 —— 两处各写一份对象字面量，
@@ -17156,19 +17185,26 @@ export type SplitOrchestrationSnapshot = Record<
  *
  * **不进指纹的**：feeLabel / note —— 只影响留痕文案，不改变座位、金额、房控任何结果。
  * 把它们纳进来只会让运营改个备注重试就吃 409。
+ *
+ * `leg` 是**派生记录**而不是入参：它由 orderItemId 在源单上推出来，留档只为了回放时
+ * 源单已无该行还能定位航段（见 ORCHESTRATION_DERIVED_KEYS），因此不参与指纹比对。
  */
-function reschedulePassengersOrchestration(input: {
-  orderItemId: string;
-  newScheduleId: string;
-  newCabin?: CabinClass;
-  feeCny?: number;
-  roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
-}): SplitOrchestrationSnapshot {
+function reschedulePassengersOrchestration(
+  input: {
+    orderItemId: string;
+    newScheduleId: string;
+    newCabin?: CabinClass;
+    feeCny?: number;
+    roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
+  },
+  leg: 'OUTBOUND' | 'RETURN' | null,
+): SplitOrchestrationSnapshot {
   return {
     orderItemId: input.orderItemId,
     newScheduleId: input.newScheduleId,
     newCabin: input.newCabin ?? null,
     feeCny: Math.trunc(input.feeCny ?? 0),
+    leg,
     roomSplit:
       input.roomSplit == null
         ? null

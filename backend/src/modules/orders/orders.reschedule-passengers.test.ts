@@ -245,6 +245,7 @@ describe('按人改期 · 部分乘客 = 先拆单再对新单改期', () => {
           newCabin: null,
           feeCny: 300,
           roomSplit: [{ itemId: 'hotel-1', roomsBilledToMove: 0.5 }],
+          leg: 'OUTBOUND',
         },
       },
       admin,
@@ -399,6 +400,8 @@ describe('按人改期 · 部分乘客的同 token 重试（A2）', () => {
         newCabin: null,
         feeCny: 300,
         roomSplit: null,
+        // 首刷时派生出的航段，回放直接用它，不再要求源单还留着那一行
+        leg: 'OUTBOUND',
       },
     },
     ...over,
@@ -591,6 +594,54 @@ describe('按人改期 · 部分乘客的同 token 重试（A2）', () => {
     expect(result.audit.splitReplayed).toBe(true);
   });
 
+  it('整条机票行已被首刷搬走（源单只剩不占座婴儿）→ 用快照里的航段回放，不再 400', async () => {
+    // 首次拆单把去程行整条搬去了新单，源单已经没有这一行了。
+    // 旧口径在真正回放之前就要从源单按 orderItemId 推航段 → 推不出来 → 400，
+    // 原样重试永远走不通。
+    mockPrisma.order.findUnique.mockResolvedValue(
+      sourceSnapshot({ passengers: [{ id: 'p9' }], items: [] }),
+    );
+    mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(priorRecord());
+    mockPrisma.orderItem.findMany.mockResolvedValue([
+      { id: 'leg-out-moved', flightScheduleId: 'sch-new' },
+      { id: 'leg-ret-moved', flightScheduleId: 'sch-ret' },
+    ]);
+    const split = vi.spyOn(service, 'splitOrder');
+    const reschedule = vi.spyOn(service, 'rescheduleOrderItem');
+
+    const result = await service.reschedulePassengers('o1', body(), admin);
+
+    expect(split).not.toHaveBeenCalled();
+    expect(reschedule).not.toHaveBeenCalled();
+    expect(result.audit.splitReplayed).toBe(true);
+    expect(result.audit.rescheduleSkipped).toBe(true);
+    expect(result.audit.leg).toBe('OUTBOUND');
+  });
+
+  it('源单没这一行、快照也没留航段 → 照旧 400（不猜）', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(
+      sourceSnapshot({ passengers: [{ id: 'p9' }], items: [] }),
+    );
+    mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(
+      priorRecord({
+        snapshot: {
+          movedPassengerIds: ['p1'],
+          orchestration: {
+            orderItemId: 'leg-out',
+            newScheduleId: 'sch-new',
+            newCabin: null,
+            feeCny: 300,
+            roomSplit: null,
+          },
+        },
+      }),
+    );
+
+    await expect(service.reschedulePassengers('o1', body(), admin)).rejects.toBeInstanceOf(
+      BadRequestError,
+    );
+  });
+
   it('未命中 → 走原有流程（正常拆单 + 改期）', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(sourceSnapshot());
     mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(null);
@@ -631,6 +682,8 @@ describe('按人改期 · 部分乘客的同 token 重试（A2）', () => {
           { itemId: 'hotel-a', roomsBilledToMove: 1 },
           { itemId: 'hotel-b', roomsBilledToMove: 2 },
         ],
+        // 派生记录：回放时源单可能已经没有这一行了，只能靠快照里的航段
+        leg: 'OUTBOUND',
       },
     });
   });
