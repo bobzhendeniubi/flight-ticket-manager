@@ -14130,7 +14130,10 @@ export class OrderService {
         : sourceLegs.return?.id === input.orderItemId
           ? 'RETURN'
           : null;
-    const leg = derivedLeg ?? replayLeg;
+    // 快照优先、现势兜底：回放要复现的是**首刷那一次**改的哪一段。源单在两次请求之间
+    // 还可能被改过期（改晚了会让两条航段按出发时刻对调），这时按 orderItemId 现推出来的
+    // 是另一段 —— 信现势就会拿错的那一段去改新单。快照没留（老记录）才回落到现势。
+    const leg = replayLeg ?? derivedLeg;
     if (!leg) {
       throw new BadRequestError(
         '所选航段不是本订单的去程/回程机票行，无法按人改期，请刷新订单后重试',

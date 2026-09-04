@@ -618,6 +618,50 @@ describe('按人改期 · 部分乘客的同 token 重试（A2）', () => {
     expect(result.audit.leg).toBe('OUTBOUND');
   });
 
+  it('快照留的航段与现势推出来的不一致 → 认快照那个，不会改错腿', async () => {
+    // 首刷拆单成了、新单改期失败；之后源单又对原机票行改了一次期，两条航段按出发时刻
+    // 重新排了序 —— 同一行现在被推成回程。原 token 重试若信现势，就会拿「回程」去改
+    // 新单，而首刷要改的是去程。回放必须认快照里留的那一段。
+    mockPrisma.order.findUnique.mockResolvedValue(
+      sourceSnapshot({
+        passengers: [{ id: 'p2' }, { id: 'p3' }],
+        items: [
+          {
+            id: 'leg-other',
+            flightScheduleId: 'sch-ret',
+            flightSchedule: { departureTime: OUT_DEPART, departureTz: 'Asia/Shanghai' },
+            metadata: {},
+          },
+          {
+            // 改期改晚了，这一行现在排在第 2 段 → 按现势推出来是 RETURN
+            id: 'leg-out',
+            flightScheduleId: 'sch-out',
+            flightSchedule: { departureTime: RET_DEPART, departureTz: 'Asia/Shanghai' },
+            metadata: {},
+          },
+        ],
+      }),
+    );
+    mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(priorRecord());
+    // 新单还没改到目标班次上（上一轮改期失败了）→ 这次要真的调改期
+    mockPrisma.orderItem.findMany.mockResolvedValue([
+      { id: 'leg-out-moved', flightScheduleId: 'sch-out' },
+      { id: 'leg-ret-moved', flightScheduleId: 'sch-ret' },
+    ]);
+    const reschedule = vi
+      .spyOn(service, 'rescheduleOrderItem')
+      .mockResolvedValue(rescheduleOutcome());
+
+    const result = await service.reschedulePassengers('o1', body(), admin);
+
+    expect(reschedule).toHaveBeenCalledWith(
+      'o2',
+      expect.objectContaining({ leg: 'OUTBOUND' }),
+      admin,
+    );
+    expect(result.audit.leg).toBe('OUTBOUND');
+  });
+
   it('源单没这一行、快照也没留航段 → 照旧 400（不猜）', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(
       sourceSnapshot({ passengers: [{ id: 'p9' }], items: [] }),
