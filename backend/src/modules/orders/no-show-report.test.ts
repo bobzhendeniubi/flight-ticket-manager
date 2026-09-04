@@ -115,6 +115,20 @@ describe('aggregateNoShowReport · 选单口径', () => {
     expect(r.rows[0].noShowPax).toBe(2);
   });
 
+  it('快照里有已不在本单的人（拆走 / 换人的历史脏数据）→ 只数还在单上的', () => {
+    const r = aggregateNoShowReport([
+      order({ items: [outboundRow(noShowMeta(['p-1', 'p-2', 'p-9']))] }),
+    ]);
+    expect(r.rows[0].noShowPax).toBe(2);
+    expect(r.details[0].passengers).toBe('陈志远、林晓梅');
+  });
+
+  it('名单被拆空（空数组 = 标记还在但人都拆走了）→ 人次 0，不回落成整单人数', () => {
+    const r = aggregateNoShowReport([order({ items: [outboundRow(noShowMeta([]))] })]);
+    expect(r.rows[0].noShowPax).toBe(0);
+    expect(r.details[0].passengers).toBe('');
+  });
+
   it('同一班多张单合并成一行；不同班分行并按日期 + 航班号排序', () => {
     const later = outboundRow(noShowMeta(), 'sch-z', 'QH9600');
     const r = aggregateNoShowReport([

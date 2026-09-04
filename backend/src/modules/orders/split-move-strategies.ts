@@ -218,6 +218,26 @@ export function readUpgradeCount(metadata: Record<string, unknown>): number {
   return Math.max(0, toInt(metadata.businessUpgradeCount, 0));
 }
 
+/**
+ * 源单留守侧的 no-show 名单裁剪：把本次拆走的乘客从 `noShow.passengerIds` 里剔掉。
+ *
+ * 返回 null = 不用改（这一行没有 noShow 快照，或快照里压根没有 passengerIds 数组的老数据）——
+ * 调用方据此决定要不要往 keep 补丁里塞 metadata（内核的 splitPatchToPrisma 对补丁里
+ * 没出现的字段不写回，塞了才会落库）。
+ * 名单被裁空时返回的仍是带空数组的对象：no-show 标记本身不因拆单撤销，只是这张单上
+ * 没人还挂在名单里了。
+ */
+export function trimNoShowRoster(
+  rawNoShow: unknown,
+  movedIdSet: ReadonlySet<string>,
+): Record<string, unknown> | null {
+  if (rawNoShow == null || typeof rawNoShow !== 'object' || Array.isArray(rawNoShow)) return null;
+  const snapshot = rawNoShow as Record<string, unknown>;
+  const ids = snapshot.passengerIds;
+  if (!Array.isArray(ids)) return null;
+  return { ...snapshot, passengerIds: ids.filter((id) => !movedIdSet.has(id as string)) };
+}
+
 // ── 策略 1：按人数行（FLIGHT / VISA / TRANSFER）──────────────────────────────
 /**
  * 这一行随拆搬走几件 —— **按各自 quantity 的语义取分母**，不能一律用「拆出人头数」。
@@ -274,6 +294,14 @@ export function moveFlightLike(item: SplitItemView, ctx: SplitContext): SplitMov
     keepMeta.businessUpgradeCount = keptUpgrade;
     moveMeta.businessUpgradeCount = movedUpgrade;
   }
+  // no-show 名单要跟着人走：拆走的人不能还挂在源单的未登机名单上。
+  // 新单侧的 noShow 快照由 inheritableItemMetadata 整块剥掉（既定设计，要标就在新单重标）；
+  // 源单侧过去是 `{ ...md }` 原样保留，被拆走的人仍留在 passengerIds 里 ——
+  // no-show 报表按 passengerIds.length 计人次，源单人次会虚高，反复拆几次越虚越多。
+  // 裁剪后为空数组也保留 noShow 对象：标记本身没被撤销，只是名单空了。
+  const trimmedNoShow = trimNoShowRoster(md.noShow, ctx.movedIdSet);
+  if (trimmedNoShow != null) keepMeta.noShow = trimmedNoShow;
+  const keepMetaChanged = md.businessUpgradeCount != null || trimmedNoShow != null;
 
   return {
     mode: 'SPLIT',
@@ -281,7 +309,7 @@ export function moveFlightLike(item: SplitItemView, ctx: SplitContext): SplitMov
       quantity: keepQty,
       amount: round2(item.unitPrice * keepQty),
       totalCostCny: keptCost,
-      ...(md.businessUpgradeCount != null ? { metadata: keepMeta } : {}),
+      ...(keepMetaChanged ? { metadata: keepMeta } : {}),
     },
     move: {
       description: splitInheritedDescription(item.description, md),

@@ -834,3 +834,99 @@ describe('已撤销的同业立减行不随拆（金额已归零，重算会凭�
     expect(plan.keep.amount).toBe(-200);
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('部分拆分时源单 no-show 名单要裁掉被拆走的人（否则报表人次虚高）', () => {
+  const noShowRow = () =>
+    item({
+      kind: OrderItemKind.FLIGHT,
+      quantity: 3,
+      metadata: {
+        noShow: { at: '2026-09-02T02:00:00.000Z', passengerIds: ['p1', 'p2', 'p3'] },
+      },
+    });
+
+  const splitOffP3 = () =>
+    ctx({
+      movedIdSet: new Set(['p3']),
+      movedOccupancy: occ(1),
+      keptOccupancy: occ(2),
+    });
+
+  it('3 人已标 no-show 的单拆走 p3 → 源单名单只剩 p1/p2，新单不带 no-show 快照', () => {
+    const plan = moveFlightLike(noShowRow(), splitOffP3());
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    const keepMeta = plan.keep.metadata as Record<string, unknown>;
+    expect(keepMeta).toBeDefined();
+    const keptNoShow = keepMeta.noShow as { at: string; passengerIds: string[] };
+    expect(keptNoShow.passengerIds).toEqual(['p1', 'p2']);
+    // 标记本身不动（撤销 no-show 是另一个动作），只是名单短了。
+    expect(keptNoShow.at).toBe('2026-09-02T02:00:00.000Z');
+    expect((plan.move.metadata as Record<string, unknown>).noShow).toBeUndefined();
+  });
+
+  it('把名单上的人全拆走 → 源单留空数组（标记还在，人没了）', () => {
+    const plan = moveFlightLike(
+      noShowRow(),
+      ctx({
+        movedIdSet: new Set(['p1', 'p2', 'p3']),
+        movedOccupancy: occ(2),
+        keptOccupancy: occ(1),
+      }),
+    );
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    const keptNoShow = (plan.keep.metadata as Record<string, unknown>).noShow as {
+      passengerIds: string[];
+    };
+    expect(keptNoShow.passengerIds).toEqual([]);
+  });
+
+  it('拆走的人不在名单上 → 名单原样（不误删）', () => {
+    const plan = moveFlightLike(
+      noShowRow(),
+      ctx({ movedIdSet: new Set(['p9']), movedOccupancy: occ(1), keptOccupancy: occ(2) }),
+    );
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    const keptNoShow = (plan.keep.metadata as Record<string, unknown>).noShow as {
+      passengerIds: string[];
+    };
+    expect(keptNoShow.passengerIds).toEqual(['p1', 'p2', 'p3']);
+  });
+
+  it('快照没有 passengerIds（老数据）→ 不动它，也不给 keep 补丁塞 metadata', () => {
+    const plan = moveFlightLike(
+      item({
+        kind: OrderItemKind.FLIGHT,
+        quantity: 3,
+        metadata: { noShow: { at: '2026-09-02T02:00:00.000Z' } },
+      }),
+      splitOffP3(),
+    );
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    expect(plan.keep.metadata).toBeUndefined();
+  });
+
+  it('没有 no-show 快照的普通航段行照旧不带 keep.metadata', () => {
+    const plan = moveFlightLike(item({ kind: OrderItemKind.FLIGHT, quantity: 3 }), splitOffP3());
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    expect(plan.keep.metadata).toBeUndefined();
+  });
+
+  it('升舱人数与 no-show 名单同时存在时两者都写进 keep 补丁', () => {
+    const plan = moveFlightLike(
+      item({
+        kind: OrderItemKind.FLIGHT,
+        quantity: 3,
+        metadata: {
+          businessUpgradeCount: 3,
+          noShow: { at: '2026-09-02T02:00:00.000Z', passengerIds: ['p1', 'p2', 'p3'] },
+        },
+      }),
+      splitOffP3(),
+    );
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    const keepMeta = plan.keep.metadata as Record<string, unknown>;
+    expect(keepMeta.businessUpgradeCount).toBe(2);
+    expect((keepMeta.noShow as { passengerIds: string[] }).passengerIds).toEqual(['p1', 'p2']);
+  });
+});

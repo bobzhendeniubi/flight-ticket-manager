@@ -320,10 +320,17 @@ export function aggregateNoShowReport(orders: readonly NoShowReportOrderView[]):
       }
     }
 
+    // 名单与本单当前乘客取交集再计数：快照是「标 no-show 那一刻」的留痕，之后这张单还会
+    // 被拆单 / 换人动过，名单上可能留着已经不在本单的人。直接数 passengerIds.length 会让
+    // 源单人次虚高（拆单侧已在源头裁剪名单，这里是覆盖历史脏数据的第二道）。
+    // `passengerIds` 整个键都没有 = 老数据没留名单，才回落整单人数；显式空数组是真值
+    //（标记还在、人都被拆走了），人次就是 0，不能回落成整单人数。
+    const hasMarkedRoster = Array.isArray(noShowSnap.passengerIds);
+    const passengerIdSet = new Set(order.passengers.map((p) => p.id));
     const markedIds = readArray(noShowSnap.passengerIds).filter(
-      (v): v is string => typeof v === 'string',
+      (v): v is string => typeof v === 'string' && passengerIdSet.has(v),
     );
-    const noShowPax = markedIds.length > 0 ? markedIds.length : order.passengers.length;
+    const noShowPax = hasMarkedRoster ? markedIds.length : order.passengers.length;
     const workOrdersOpen = order.reminders.filter(
       (r) => isNoShowReminder(r.ruleKey) && OPEN_REMINDER_STATUSES.includes(r.status),
     ).length;
@@ -345,10 +352,12 @@ export function aggregateNoShowReport(orders: readonly NoShowReportOrderView[]):
     row.workOrdersOpen += workOrdersOpen;
     byScheduleId.set(scheduleId, row);
 
+    // 明细里的乘客列与人次口径同源：留了名单就只列名单上还在本单的人（名单空 = 一个都不列），
+    // 老数据没留名单才列全单人。
     const markedSet = new Set(markedIds);
-    const shownPassengers = order.passengers.filter(
-      (p) => markedSet.size === 0 || markedSet.has(p.id),
-    );
+    const shownPassengers = hasMarkedRoster
+      ? order.passengers.filter((p) => markedSet.has(p.id))
+      : order.passengers;
     const hasNoShowReminder = order.reminders.some((r) => isNoShowReminder(r.ruleKey));
     details.push({
       orderNumber: order.orderNumber,
