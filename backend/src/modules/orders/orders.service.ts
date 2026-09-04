@@ -134,7 +134,11 @@ import { derivePtcByAge, earliestFlightDeparture } from './pnr-export.js';
 // 按人送签的任务级状态派生（纯函数）：与签证台同一口径。依赖方向安全——
 // fulfillment.service 只 import prisma/errors/自身 schemas，不回头 import orders 模块，无环。
 import { deriveVisaTaskStatus } from '../fulfillment/fulfillment.service.js';
-import { syncOrderVisaCompletion } from '../fulfillment/visa-completion.js';
+import {
+  syncOrderVisaCompletion,
+  VISA_AUTO_COMPLETE_ACTION,
+  VISA_AUTO_COMPLETE_REVERT_ACTION,
+} from '../fulfillment/visa-completion.js';
 import { resolveSelfVisaDeductCny } from '../products/self-visa-deduct.js';
 import {
   assertOrderAllowsInvoicing,
@@ -13456,6 +13460,18 @@ export class OrderService {
       });
     }
     await syncVisaTasksForOrder(tx, target.id, { userId: actor.userId, role: actor.role });
+    // 9c. 签证任务承接：源单已办结（订单级已签证 + 乘客已送签）时新单复制的是「已签证」，
+    //   建任务口径把它当客人自带签证而不建任务，9b 也就没得镜像 —— 拆出去的人从签证台消失。
+    //   这里按「源单有活的签证任务 + 新单有非自备签乘客 + 新单还没有」补一条镜像任务。
+    await carryVisaTaskForSplit(tx, {
+      sourceOrderId: orderId,
+      targetOrderId: target.id,
+      targetOrderNumber: target.orderNumber,
+      sourceOrderNumber: order.orderNumber,
+      splitItemIdMap,
+      splitNote: `由订单 ${order.orderNumber} 拆分创建`,
+      actor: { userId: actor.userId, role: actor.role },
+    });
     await syncOrderHasReturnLeg(tx, orderId);
     await syncOrderLegFlag(tx, orderId);
     await syncOrderHasReturnLeg(tx, target.id);
@@ -18005,6 +18021,145 @@ async function mirrorTicketingTasksForSplit(
 }
 
 /**
+ * 拆单 · 签证任务承接（9c）。
+ *
+ * 源单的签证任务不是「被拆的行」上的普通任务：订单级需签时它按锚点规则挂在**首个订单项**
+ * （见 resolveVisaTaskAnchor），拆出去的人的送签进度（Passenger.visaSubmissionStatus）随人搬家，
+ * 订单级「已签证」也被原样复制到新单。可新单 visaStatus=HAS_VISA 在建任务口径里等于
+ * 「客人自带签证」（orderNeedsVisaTask 一票否决）→ createFulfillmentTasks / syncVisaTasksForOrder
+ * 都不给新单建签证任务，9b 的镜像也就无从下手。结果：拆出的人在订单列表挂着「已签证」、
+ * 乘客也「已送签」，签证台却搜不到这个人（签证台读的是 VISA_APPLICATION 任务；公测反馈）。
+ *
+ * 口径：源单有活的（非 CANCELLED）签证任务 + 新单有非自备签乘客 + 新单还没有活的签证任务
+ * → 在新单补一条**镜像源任务**的签证任务（状态 / 材料 data / 备注 / 起止时间 / 签证成本三字段 /
+ * 签证公司），锚点优先取源任务所在行对应的新行（splitItemIdMap），其次按建单同一套锚点规则，
+ * 最后兜底新单首行。源单任务不动（留守的人继续挂在源单）。
+ *
+ * 办结审计对称：源单的「已签证」若是自动办结写的（最近一条 AUTO_COMPLETE_VISA），新单同样记一条
+ * AUTO_COMPLETE_VISA（before 沿用源单的办结前原档）——这样在新单上把乘客退回待送时，
+ * visa-completion 的对称回退才认得这是派生值、会自动撤销办结；否则新单的 HAS_VISA 会被当成
+ * 录单手选的「客人自带签证」永远退不回去。审计 fire-and-forget、不进事务（与全文件同款）。
+ *
+ * 幂等：新单已有活的签证任务（无论谁建的）就不动；重复调用零写入。
+ */
+async function carryVisaTaskForSplit(
+  tx: Prisma.TransactionClient,
+  input: {
+    sourceOrderId: string;
+    targetOrderId: string;
+    sourceOrderNumber: string;
+    targetOrderNumber: string;
+    /** 源行 id → 新单对应行 id（拆分行） */
+    splitItemIdMap: Map<string, string>;
+    splitNote: string;
+    actor: { userId: string; role: UserRole };
+  },
+): Promise<{ taskId: string } | null> {
+  const visaTaskSelect = {
+    orderItemId: true,
+    status: true,
+    data: true,
+    notes: true,
+    startedAt: true,
+    completedAt: true,
+    visaUnitCostUsd: true,
+    visaFxRate: true,
+    visaUnitCostCny: true,
+    visaSupplier: true,
+  } as const;
+  const sourceTasks = await tx.fulfillmentTask.findMany({
+    where: {
+      orderItem: { orderId: input.sourceOrderId },
+      type: FulfillmentType.VISA_APPLICATION,
+      status: { not: FulfillmentStatus.CANCELLED },
+    },
+    select: visaTaskSelect,
+    orderBy: { createdAt: 'asc' },
+  });
+  const source = sourceTasks[0];
+  if (!source) return null;
+
+  const targetTasks = await tx.fulfillmentTask.findMany({
+    where: {
+      orderItem: { orderId: input.targetOrderId },
+      type: FulfillmentType.VISA_APPLICATION,
+      status: { not: FulfillmentStatus.CANCELLED },
+    },
+    select: { id: true },
+  });
+  if (targetTasks.length > 0) return null;
+
+  // 拆出去的人里得有要我方代办的：全员自备签的一拨人过去，签证台本就无事可做
+  const targetPax = await tx.passenger.findMany({
+    where: { orderId: input.targetOrderId, visaExempt: false },
+    select: { id: true },
+  });
+  if (targetPax.length === 0) return null;
+
+  const targetItems = await tx.orderItem.findMany({
+    where: { orderId: input.targetOrderId },
+    select: { id: true, kind: true, bundleId: true },
+    orderBy: { createdAt: 'asc' },
+  });
+  if (targetItems.length === 0) return null;
+  const targetOrder = await tx.order.findUnique({
+    where: { id: input.targetOrderId },
+    select: { visaStatus: true },
+  });
+  const mappedAnchor = input.splitItemIdMap.get(source.orderItemId);
+  const anchorItemId =
+    (mappedAnchor && targetItems.some((item) => item.id === mappedAnchor) ? mappedAnchor : null) ??
+    (await resolveVisaTaskAnchor(tx, targetItems, targetOrder?.visaStatus)).anchorItemId ??
+    targetItems[0].id;
+
+  const task = await tx.fulfillmentTask.create({
+    data: {
+      orderItemId: anchorItemId,
+      type: FulfillmentType.VISA_APPLICATION,
+      status: source.status,
+      data: source.data === null ? Prisma.DbNull : (source.data as Prisma.InputJsonValue),
+      notes: [source.notes?.trim() || null, input.splitNote].filter(Boolean).join(' · '),
+      startedAt: source.startedAt,
+      completedAt: source.completedAt,
+      visaUnitCostUsd: source.visaUnitCostUsd,
+      visaFxRate: source.visaFxRate,
+      visaUnitCostCny: source.visaUnitCostCny,
+      visaSupplier: source.visaSupplier,
+    },
+    select: { id: true },
+  });
+
+  // 办结审计对称（见函数头）：源单最近一条办结审计是 AUTO_COMPLETE_VISA 且新单复制到了 HAS_VISA
+  if (targetOrder?.visaStatus === VisaRequirement.HAS_VISA) {
+    const lastAuto = await tx.auditLog.findFirst({
+      where: {
+        targetType: AuditTargetType.ORDER,
+        targetId: input.sourceOrderId,
+        action: { in: [VISA_AUTO_COMPLETE_ACTION, VISA_AUTO_COMPLETE_REVERT_ACTION] },
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { action: true, before: true },
+    });
+    if (lastAuto?.action === VISA_AUTO_COMPLETE_ACTION) {
+      void writeAudit({
+        actor: input.actor,
+        action: VISA_AUTO_COMPLETE_ACTION,
+        targetType: AuditTargetType.ORDER,
+        targetId: input.targetOrderId,
+        targetLabel: input.targetOrderNumber,
+        before: (lastAuto.before ?? { visaStatus: VisaRequirement.NEEDED }) as Prisma.InputJsonValue,
+        after: {
+          visaStatus: VisaRequirement.HAS_VISA,
+          reason: `随拆单承接源单 ${input.sourceOrderNumber} 的自动办结`,
+          carriedTaskId: task.id,
+        },
+      });
+    }
+  }
+  return { taskId: task.id };
+}
+
+/**
  * 拆单平账行：使该侧 total 收敛到份额口径（正 → FEE、负 → DISCOUNT，
  * 与 buildSettlementTotalItem 同一正负口径）；差额为 0 不生成行。
  */
@@ -21113,7 +21268,7 @@ function maskedItemTravelDate(it: {
 void PaymentMethod;
 
 // ── Fulfillment 任务生成（PAID 时触发） ─────────────────────────
-import { FulfillmentStatus, FulfillmentType, VisaSubmissionStatus, type VisaRequirement } from '@prisma/client';
+import { FulfillmentStatus, FulfillmentType, VisaRequirement, VisaSubmissionStatus } from '@prisma/client';
 
 // 非套餐订单项：一行 → 一个对应岗任务。
 const KIND_TO_FULFILLMENT_TYPE: Partial<Record<OrderItemKind, FulfillmentType>> = {

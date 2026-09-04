@@ -51,7 +51,7 @@ const { mockPrisma } = vi.hoisted(() => ({
     },
     orderCostItem: { create: vi.fn() },
     orderSplitRecord: { findUnique: vi.fn(), create: vi.fn() },
-    auditLog: { create: vi.fn() },
+    auditLog: { create: vi.fn(), findFirst: vi.fn() },
     $transaction: vi.fn(),
     $queryRaw: vi.fn(),
   },
@@ -1821,6 +1821,142 @@ describe('拆单 · 履约任务镜像扩到签证/酒店/接送（M3）', () =>
       (c: any[]) => c[0].where?.id === 'task-1',
     );
     expect(mirrored?.[0].data).toMatchObject({ status: 'CONFIRMED', data: { applicationNo: 'V-9' } });
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('拆单 · 签证任务承接（源单已自动办结，新单复制到已签证却建不出任务）', () => {
+  /**
+   * 场景（公测反馈）：纯机票单录单标「需要签证」，签证任务按锚点挂在首个机票行；签证岗把两人都
+   * 标已送签 → 订单自动办结为已签证。随后 no-show 拆出一人：新单复制 visaStatus=HAS_VISA，
+   * 建任务口径把它当客人自带签证，不建签证任务 → 拆出的人在签证台搜不到。
+   */
+  const armCarryScenario = () => {
+    armExecute({
+      order: baseOrder({ visaStatus: 'HAS_VISA' }),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 0 },
+      finalTarget: { total: 1000, paidAmount: 500 },
+    });
+    // 新单 visaStatus 复制自源单（HAS_VISA）→ createFulfillmentTasks / syncVisaTasksForOrder 都不建签证任务
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mockPrisma.order.findUnique.mockImplementation(async (args: any) => {
+      if (args?.include) return baseOrder({ visaStatus: 'HAS_VISA' });
+      const sel = args?.select ?? {};
+      if (sel.prepaymentOffset) {
+        return { status: 'PAID', total: 1000, adjustmentCny: 0, paidAmount: 500, prepaymentOffset: 0 };
+      }
+      if (sel.orderNumber && sel.visaStatus) {
+        return { visaStatus: 'HAS_VISA', orderNumber: 'FTM-TGT', status: 'PAID', deletedAt: null };
+      }
+      if (sel.visaStatus) return { visaStatus: 'HAS_VISA' };
+      return null;
+    });
+    // 新单订单行（承接锚点用）：拆过来的机票行
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mockPrisma.orderItem.findMany.mockImplementation(async (args: any) => {
+      const where = args?.where ?? {};
+      const sel = args?.select ?? {};
+      if (where.orderId?.in) {
+        return [
+          { kind: 'FLIGHT', flightScheduleId: 'sch1', flightCabin: 'ECONOMY', quantity: 1, metadata: null, roomsBilled: null, totalCostCny: 600 },
+          { kind: 'FLIGHT', flightScheduleId: 'sch1', flightCabin: 'ECONOMY', quantity: 1, metadata: null, roomsBilled: null, totalCostCny: 600 },
+        ];
+      }
+      if (sel.flightSchedule) return [];
+      if (sel.fulfillmentTasks) return [{ id: 'new_i1', kind: 'FLIGHT', bundleId: null, fulfillmentTasks: [] }];
+      if (where.orderId === 'o2' && sel.bundleId) return [{ id: 'new_i1', kind: 'FLIGHT', bundleId: null }];
+      return [];
+    });
+    // 源单挂在首个机票行 i1 上的签证任务（已办结）；新单一条都没有
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mockPrisma.fulfillmentTask.findMany.mockImplementation(async (args: any) => {
+      const where = args?.where ?? {};
+      if (where.id?.in) return [{ id: 'task-1', orderItemId: 'new_i1', type: 'FLIGHT_TICKETING' }];
+      if (where.orderItemId?.in) return [];
+      if (where.orderItem?.orderId === 'o1' && where.type === 'VISA_APPLICATION') {
+        return [
+          {
+            orderItemId: 'i1',
+            status: 'CONFIRMED',
+            data: null,
+            notes: '签证公司A 15美金',
+            startedAt: null,
+            completedAt: new Date('2026-09-02T14:29:24.000Z'),
+            visaUnitCostUsd: 15,
+            visaFxRate: null,
+            visaUnitCostCny: null,
+            visaSupplier: '签证公司A',
+          },
+        ];
+      }
+      return [];
+    });
+    mockPrisma.fulfillmentTask.create.mockResolvedValue({ id: 'task-carried' });
+    // 源单的已签证是自动办结写的
+    mockPrisma.auditLog.findFirst.mockResolvedValue({
+      action: 'AUTO_COMPLETE_VISA',
+      before: { visaStatus: 'NEEDED' },
+    });
+  };
+
+  it('源单有已办结签证任务、新单没有 → 在新单拆分行补一条镜像任务（状态/备注/成本/签证公司）', async () => {
+    armCarryScenario();
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    const created = mockPrisma.fulfillmentTask.create.mock.calls.find(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0].data?.type === 'VISA_APPLICATION',
+    );
+    expect(created).toBeTruthy();
+    expect(created?.[0].data).toMatchObject({
+      // 锚点 = 源任务所在行 i1 对应的新单拆分行
+      orderItemId: 'new_i1',
+      status: 'CONFIRMED',
+      visaUnitCostUsd: 15,
+      visaSupplier: '签证公司A',
+      completedAt: new Date('2026-09-02T14:29:24.000Z'),
+    });
+    expect(created?.[0].data.notes).toBe('签证公司A 15美金 · 由订单 FTM20260830-SRC 拆分创建');
+  });
+
+  it('源单是自动办结 → 新单同样记一条 AUTO_COMPLETE_VISA 审计（before 沿用源单原档），回退对称', async () => {
+    armCarryScenario();
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+    // writeAudit 是 fire-and-forget，让微任务排空
+    await new Promise((r) => setImmediate(r));
+
+    const carried = mockPrisma.auditLog.create.mock.calls.find(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0].data?.action === 'AUTO_COMPLETE_VISA',
+    );
+    expect(carried).toBeTruthy();
+    expect(carried?.[0].data).toMatchObject({
+      targetId: 'o2',
+      before: { visaStatus: 'NEEDED' },
+      after: expect.objectContaining({ visaStatus: 'HAS_VISA', carriedTaskId: 'task-carried' }),
+    });
+  });
+
+  it('源单没有活的签证任务 → 不承接（不多建任务）', async () => {
+    armCarryScenario();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    mockPrisma.fulfillmentTask.findMany.mockImplementation(async (args: any) => {
+      const where = args?.where ?? {};
+      if (where.id?.in) return [{ id: 'task-1', orderItemId: 'new_i1', type: 'FLIGHT_TICKETING' }];
+      return [];
+    });
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    const created = mockPrisma.fulfillmentTask.create.mock.calls.find(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0].data?.type === 'VISA_APPLICATION',
+    );
+    expect(created).toBeUndefined();
   });
 });
 
