@@ -337,6 +337,7 @@ model Agent {
   settlementDiscountRules SettlementDiscountRule[]
   settlementRequests      SettlementRequest[]
   bundleChangeRequests    BundleChangeRequest[]
+  orderChangeRequests     OrderChangeRequest[]
 
   @@index([isActive])
   @@index([parentAgentId])
@@ -978,6 +979,64 @@ model BundleChangeRequest {
 
   @@index([orderId])
   @@index([status, createdAt])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 改单申请 —— 代理下单当天可自助改单；过了当天一律走「提申请 → 运营一键执行」。
+//
+// 与套餐改档申请（BundleChangeRequest）是同一套形状，只是这边一张表承载四类改动
+// （kind 区分），且支持一次给多张单批量提交（batchId 串起同一批）。
+// 真正会动订单的动作只发生在确认（approve）那一刻，调用的是运营侧既有通道，
+// 申请表本身只存「谁在什么时候想把什么改成什么」。
+// ─────────────────────────────────────────────────────────────────────────────
+enum OrderChangeKind {
+  FLIGHT // 改班次（纠错口径：不动钱）
+  VISA   // 订单级签证状态（只允许 需要 / 电子签 / 不需要）
+  HOTEL  // 换酒店房型（差价恒 0）
+  CABIN  // 升商务舱（差价服务端算）
+}
+
+enum OrderChangeRequestStatus {
+  PENDING
+  APPROVED
+  REJECTED
+}
+
+model OrderChangeRequest {
+  id            String                   @id @default(cuid())
+  orderId       String
+  // 归属代理；直客单（运营代提）为空
+  agentId       String?
+  // 提交人 userId（代理账号本人，或代提的运营）
+  requestedById String
+  // 同一次批量提交共用的一个 cuid；单张提交为空。运营可据此把一批申请聚在一起看/一起确认。
+  batchId       String?
+  kind          OrderChangeKind
+  // 各 kind 的入参 + 提交那一刻的「原值」快照（快照只作展示留痕，执行时一律重读现状）
+  payload       Json
+  // 服务端拼好的人话摘要（如「去程 2026-09-12 QH9588 → 2026-09-13 QH9588」），
+  // 列表/队列直接展示，不让前端各拼一套。
+  summary       String
+  // 申请说明（提交人填）
+  note          String?
+  status        OrderChangeRequestStatus @default(PENDING)
+  decidedById   String?
+  decidedAt     DateTime?
+  decisionNote  String?
+  // 确认执行成功后回填
+  appliedAt     DateTime?
+  // 确认时执行失败留下的错误原文：申请**不翻状态**（仍是 PENDING 留在队列里），
+  // 运营看得到这次为什么没执行成（立减拒绝 / 座位抢没了 / 星级不匹配…）。
+  applyError    String?
+  createdAt     DateTime                 @default(now())
+  updatedAt     DateTime                 @updatedAt
+
+  order Order  @relation(fields: [orderId], references: [id], onDelete: Restrict)
+  agent Agent? @relation(fields: [agentId], references: [id], onDelete: SetNull)
+
+  @@index([orderId, status])
+  @@index([status, createdAt])
+  @@index([agentId, status])
 }
 
 model HoldOrderConfig {
@@ -1660,6 +1719,7 @@ model Order {
   splitsIn          OrderSplitRecord[]     @relation("SplitTarget")
   settlementRequests SettlementRequest[]
   bundleChangeRequests BundleChangeRequest[]
+  orderChangeRequests  OrderChangeRequest[]
 
   @@index([userId, createdAt])
   @@index([agentId, createdAt])

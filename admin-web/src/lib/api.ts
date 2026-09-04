@@ -7393,3 +7393,143 @@ export const bundleChangeRequestsApi = {
       body: note ? { note } : {},
     }),
 };
+
+// ── 订单改单申请（下单当天以外，代理提申请 → 运营一键执行）── 独立命名空间，
+// 对应 backend/src/modules/order-change-requests/*。与「套餐改档申请」并行：改的是
+// 套餐之外的航班/签证状态/酒店/舱位四类字段，运营确认后由服务端直接调用既有的纠错改航班/
+// 签证状态/换酒店/升舱端点，前端不需要重新实现这些动作本身。
+export type OrderChangeRequestKind = 'FLIGHT' | 'VISA' | 'HOTEL' | 'CABIN';
+export type OrderChangeRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
+/** 改单申请里的签证目标状态：比录单/签证台的 VisaStatusInput 少一档（不收 HAS_VISA——那不是「要改成」的目标，是已完成态）。 */
+export type ChangeRequestVisaStatus = 'NEEDED' | 'E_VISA' | 'NOT_NEEDED';
+
+export type OrderChangeRequestPayload =
+  | { itemId: string; newScheduleId: string }
+  | { toVisaStatus: ChangeRequestVisaStatus }
+  | { itemId: string; toHotelRoomTypeId: string }
+  | { itemId: string; toCabin: 'BUSINESS' };
+
+export interface OrderChangeRequest {
+  id: string;
+  orderId: string;
+  orderNumber: string | null;
+  agentId: string | null;
+  agentName: string | null;
+  /** 提交人展示名（代理联系人/机构名或内部用户名，服务端拼好） */
+  requestedByLabel: string | null;
+  kind: OrderChangeRequestKind;
+  payload: OrderChangeRequestPayload;
+  /** 服务端拼好的人类可读摘要（如「去程改签 CZ3401 09-20 08:30 场次」），列表/队列直接展示，不用前端自己拼 */
+  summary: string | null;
+  note: string | null;
+  status: OrderChangeRequestStatus;
+  decidedAt: string | null;
+  decisionNote: string | null;
+  appliedAt: string | null;
+  /** 非空 = 上一次确认执行失败的原因；申请仍留在 PENDING，运营可改完再重试 */
+  applyError: string | null;
+  createdAt: string;
+}
+
+export interface OrderChangeRequestBatchResultItem {
+  orderId: string;
+  orderNumber: string | null;
+  ok: boolean;
+  requestId?: string;
+  /** ok=false 时的失败原因（如「该订单已有待处理的同类改单申请」） */
+  reason?: string;
+}
+
+function orderChangeRequestQuery(params?: {
+  status?: OrderChangeRequestStatus;
+  kind?: OrderChangeRequestKind;
+  orderId?: string;
+  limit?: number;
+  cursor?: string;
+}): string {
+  const usp = new URLSearchParams();
+  if (params?.status) usp.set('status', params.status);
+  if (params?.kind) usp.set('kind', params.kind);
+  if (params?.orderId) usp.set('orderId', params.orderId);
+  if (params?.limit) usp.set('limit', String(params.limit));
+  if (params?.cursor) usp.set('cursor', params.cursor);
+  const qs = usp.toString();
+  return qs ? `?${qs}` : '';
+}
+
+export const orderChangeRequestsApi = {
+  /** 代理对自家一笔订单提交改单申请（FLIGHT/VISA/HOTEL/CABIN 之一）；订单本身不会立即改变。 */
+  createOrderChangeRequest: (
+    token: string,
+    orderId: string,
+    body: { kind: OrderChangeRequestKind; payload: OrderChangeRequestPayload; note?: string },
+  ) =>
+    apiFetch<{ request: OrderChangeRequest }>(`/orders/${orderId}/change-requests`, {
+      method: 'POST',
+      token,
+      body,
+    }),
+
+  /** 代理批量申请（多单同一种改动）：仅支持 VISA（三档）与 FLIGHT（去/回程 + 新班次）。 */
+  batchCreateOrderChangeRequests: (
+    token: string,
+    body: {
+      orderIds: string[];
+      kind: 'VISA' | 'FLIGHT';
+      payload:
+        | { toVisaStatus: ChangeRequestVisaStatus }
+        | { leg: 'OUTBOUND' | 'RETURN'; newScheduleId: string };
+      note?: string;
+    },
+  ) =>
+    apiFetch<{
+      batchId: string;
+      created: number;
+      skipped: number;
+      results: OrderChangeRequestBatchResultItem[];
+    }>('/order-change-requests/batch', { method: 'POST', token, body }),
+
+  /** 查询改单申请列表（AGENT 服务端自动收窄到自家范围）。 */
+  listOrderChangeRequests: (
+    token: string,
+    params?: {
+      status?: OrderChangeRequestStatus;
+      kind?: OrderChangeRequestKind;
+      orderId?: string;
+      limit?: number;
+      cursor?: string;
+    },
+  ) =>
+    apiFetch<{ requests: OrderChangeRequest[]; nextCursor: string | null }>(
+      `/order-change-requests${orderChangeRequestQuery(params)}`,
+      { token },
+    ),
+
+  /** 运营待处理数徽标（仅 ADMIN/STAFF）。 */
+  getOrderChangeRequestPendingCount: (token: string) =>
+    apiFetch<{ count: number }>('/order-change-requests/pending-count', { token }),
+
+  /** 运营确认执行：服务端调用既有纠错改航班/签证状态/换酒店/升舱端点并重新计价（如涉及）。
+   *  失败为 400（申请仍留在 PENDING，applyError 会被服务端记下，message 原样展示即可）。 */
+  approveOrderChangeRequest: (token: string, id: string) =>
+    apiFetch<{ request: OrderChangeRequest; order: OrderSummary }>(
+      `/order-change-requests/${id}/approve`,
+      { method: 'POST', token },
+    ),
+
+  /** 运营驳回，不改订单。 */
+  rejectOrderChangeRequest: (token: string, id: string, decisionNote?: string) =>
+    apiFetch<{ request: OrderChangeRequest }>(`/order-change-requests/${id}/reject`, {
+      method: 'POST',
+      token,
+      body: decisionNote ? { decisionNote } : {},
+    }),
+
+  /** 批量确认执行：逐条独立成败，单条失败不影响其余。 */
+  batchApproveOrderChangeRequests: (token: string, ids: string[]) =>
+    apiFetch<{
+      approved: number;
+      failed: number;
+      results: Array<{ id: string; ok: boolean; error?: string }>;
+    }>('/order-change-requests/batch-approve', { method: 'POST', token, body: { ids } }),
+};

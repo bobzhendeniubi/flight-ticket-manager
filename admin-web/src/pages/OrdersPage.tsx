@@ -43,6 +43,7 @@ import {
   bundleChangeRequestsApi,
   type BundleChangeRequest,
   type BundleChangeRequestStatus,
+  orderChangeRequestsApi,
 } from '../lib/api';
 import { countryIso3ToIso2 } from '../lib/passportOcr';
 import { runPassportOcr, ocrReviewHintText } from '../lib/passportOcrRunner';
@@ -51,6 +52,10 @@ import { SUBMISSION_BADGE, SUBMISSION_LABEL } from '../lib/visaSubmission';
 import { useConfirm } from '../components/ConfirmDialog';
 import { Modal, useDialogA11y } from '../components/Modal';
 import { groupHotelsByBundleTier } from '../lib/settlement-tier';
+import { ChangeRequestModal } from '../components/ChangeRequestModal';
+import { OrderChangeRequestsPanel } from '../components/OrderChangeRequestsPanel';
+import { BatchOrderChangeRequestModal } from '../components/BatchOrderChangeRequestModal';
+import { OrderChangeRequestQueueModal } from '../components/OrderChangeRequestQueueModal';
 
 // 批量开票下拉的六个选项（票务岗 0715 反馈）：按航段/系统三个布尔位各自「标已开/标未开」，
 // 对应逐单调用 setInvoiceFlags 时传的 flags 字段。
@@ -1091,6 +1096,11 @@ export function OrdersPage() {
   const [settlementRequestPendingCount, setSettlementRequestPendingCount] = useState<number | null>(null);
   const [showBundleChangeRequestQueue, setShowBundleChangeRequestQueue] = useState(false);
   const [bundleChangeRequestPendingCount, setBundleChangeRequestPendingCount] = useState<number | null>(null);
+  // 改单申请（次日起代理提申请：改航班/签证状态/换酒店/升舱，运营一键执行）——队列弹窗 + 待处理数徽标，
+  // 与套餐改档申请并行但走独立的 orderChangeRequestsApi。批量申请弹窗（代理专属）也在这里管状态。
+  const [showOrderChangeRequestQueue, setShowOrderChangeRequestQueue] = useState(false);
+  const [orderChangeRequestPendingCount, setOrderChangeRequestPendingCount] = useState<number | null>(null);
+  const [showBatchOrderChangeRequest, setShowBatchOrderChangeRequest] = useState(false);
 
   // 三模板导出 / 全岗总表导出共用的筛选 —— 与列表同一份 filterQuery + 状态（去掉分页与
   // 接单筛选，导出端点不收）。两个导出走**同一套字段**，才不会出现「照着列表筛完点导出、
@@ -1193,6 +1203,19 @@ export function OrdersPage() {
     bundleChangeRequestsApi
       .listBundleChangeRequests(t, { status: 'PENDING', pageSize: 1 })
       .then((res) => { if (!cancelled) setBundleChangeRequestPendingCount(res.pagination.total); })
+      .catch(() => { /* 徽标拉取失败静默，打开队列时仍会重新核实 */ });
+    return () => { cancelled = true; };
+  }, [isOps, tokens?.accessToken, refreshNonce]);
+
+  // 改单申请待处理数（仅 ADMIN/STAFF 拉；代理在订单详情/批量工具条里提交申请）。
+  useEffect(() => {
+    if (!isOps) return;
+    const t = tokens?.accessToken;
+    if (!t) return;
+    let cancelled = false;
+    orderChangeRequestsApi
+      .getOrderChangeRequestPendingCount(t)
+      .then((res) => { if (!cancelled) setOrderChangeRequestPendingCount(res.count); })
       .catch(() => { /* 徽标拉取失败静默，打开队列时仍会重新核实 */ });
     return () => { cancelled = true; };
   }, [isOps, tokens?.accessToken, refreshNonce]);
@@ -2435,6 +2458,20 @@ export function OrdersPage() {
               )}
             </button>
           )}
+          {isOps && (
+            <button
+              className="btn-secondary relative text-sm"
+              onClick={() => setShowOrderChangeRequestQueue(true)}
+              title="代理提交的改单申请（改航班/签证状态/换酒店/升舱），在这里集中确认执行/驳回"
+            >
+              改单申请
+              {!!orderChangeRequestPendingCount && (
+                <span className="ml-1.5 rounded-full bg-amber-500 px-1.5 py-0.5 text-[11px] font-semibold text-white">
+                  {orderChangeRequestPendingCount}
+                </span>
+              )}
+            </button>
+          )}
           {/* 快速 CSV = **当前页**的表格快照（浏览器本地生成，不走后端）。真分页后它只覆盖这一页，
               按钮上直说条数，别让人当成全量台账——要全量请用右边的《导出》/《全岗总表》。 */}
           <button
@@ -3577,6 +3614,24 @@ export function OrdersPage() {
             </>
           )}
 
+          {/* 批量申请改单（代理专属）：多单同种改动一次提交，运营在「改单申请」队列里一键执行；
+              订单不会立即改变。与运营专属的「批量改航班/批量改签证状态」是两条并行通道——那两个
+              直接改订单（仅 ADMIN/STAFF），这个只落申请（仅 AGENT）。 */}
+          {user?.role === 'AGENT' && (
+            <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-brand/15 pt-3">
+              <button
+                className="btn-secondary text-sm py-1.5"
+                onClick={() => setShowBatchOrderChangeRequest(true)}
+                disabled={selectedIds.size === 0}
+              >
+                批量申请改单
+              </button>
+              <span className="text-xs text-ink-soft">
+                对已选 {selectedIds.size} 条订单一次提交改签证状态或改航班的申请，运营确认执行后才会真正改动。
+              </span>
+            </div>
+          )}
+
           {/* 批量删除（ADMIN + STAFF）：软删除可在回收站恢复；逐单调用现有端点，服务端占座/净收款守卫逐单生效。 */}
           {canManageDeleted && (
             <div className="mt-3 flex flex-wrap items-center gap-3 border-t border-rose-200 pt-3">
@@ -4472,6 +4527,46 @@ export function OrdersPage() {
         />
       )}
 
+      {showOrderChangeRequestQueue && (
+        <OrderChangeRequestQueueModal
+          onClose={() => setShowOrderChangeRequestQueue(false)}
+          onDecided={(updated) => {
+            setRefreshNonce((n) => n + 1);
+            if (updated) {
+              setOrders((prev) => prev.map((o) => (o.id === updated.id ? updated : o)));
+              setSelected((prev) => (prev && prev.id === updated.id ? updated : prev));
+            }
+          }}
+          onOpenOrder={(orderId) => {
+            const local = orders.find((o) => o.id === orderId);
+            if (local) {
+              setSelected(local);
+              setShowOrderChangeRequestQueue(false);
+              return;
+            }
+            const t = tokens?.accessToken;
+            if (!t) return;
+            api
+              .getOrder(t, orderId)
+              .then((r) => {
+                setSelected(r.order);
+                setShowOrderChangeRequestQueue(false);
+              })
+              .catch(() => alert('打开订单详情失败，请到列表搜索该订单号'));
+          }}
+        />
+      )}
+
+      {showBatchOrderChangeRequest && (
+        <BatchOrderChangeRequestModal
+          orderIds={[...selectedIds]}
+          onClose={() => setShowBatchOrderChangeRequest(false)}
+          onDone={() => {
+            setRefreshNonce((n) => n + 1);
+          }}
+        />
+      )}
+
       {/* 回收站（仅 ADMIN）：已软删订单表 + 每行恢复 */}
       {showRecycleBin && (
         <div
@@ -4720,6 +4815,10 @@ function OrderDrawer({
   const canSeeInternal = role === 'ADMIN' || role === 'STAFF';
   // 删单同为内部员工权限；与 isAdmin（强制改状态）分开判断。
   const canManageDeleted = role === 'ADMIN' || role === 'STAFF';
+  // 改单申请（代理自助窗口关闭后的入口）：提交弹窗开关 + 一个刷新计数器，
+  // 提交成功后 bump 它让下方「改单申请 · 待处理」小面板重新拉一次，不用整抽屉重挂载。
+  const [showChangeRequestModal, setShowChangeRequestModal] = useState(false);
+  const [changeRequestRefreshNonce, setChangeRequestRefreshNonce] = useState(0);
   // #8 修复：列表行的 passengers 只有 {id, fullName}（后端 listOrders select 精简），护照号/生日/国籍/类型
   // 恒显示「—」。抽屉打开时用 getOrder 拉全量详情，之后所有子区块都读 hydrated（拿不到时兜底列表行）。
   const [hydrated, setHydrated] = useState<OrderSummary | null>(null);
@@ -4978,6 +5077,44 @@ function OrderDrawer({
         </div>
 
         <div className="flex-1 space-y-5 overflow-auto px-6 py-5">
+          {/* 代理自助修改窗口提示：仅下单当天（北京时间）可自助纠错，次日起收窄为改单申请（后续波次）。
+              ADMIN/STAFF 不受此窗口约束，不渲染。 */}
+          {role === 'AGENT' && (
+            <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-slate-300 bg-slate-50 px-3 py-2 text-xs text-slate-600">
+              <span>
+                {o.agentSelfEdit?.open ? (
+                  <>
+                    今天内可自助修改航班/签证状态/酒店/舱位（至 北京时间{' '}
+                    {o.agentSelfEdit.until ? formatInBusinessTz(o.agentSelfEdit.until, { hour: '2-digit', minute: '2-digit', hour12: false }) : '—'}
+                    ）
+                  </>
+                ) : (
+                  <>自助修改已关闭：{o.agentSelfEdit?.reason || '下单当天可自助修改，次日起请提交改单申请'}</>
+                )}
+              </span>
+              {o.agentSelfEdit?.open === false && (
+                <button
+                  type="button"
+                  className="btn-secondary shrink-0 px-2 py-1 text-xs"
+                  onClick={() => setShowChangeRequestModal(true)}
+                >
+                  提交改单申请
+                </button>
+              )}
+            </div>
+          )}
+
+          {role === 'AGENT' && showChangeRequestModal && (
+            <ChangeRequestModal
+              orderId={o.id}
+              order={o}
+              onClose={() => setShowChangeRequestModal(false)}
+              onCreated={() => {
+                setChangeRequestRefreshNonce((n) => n + 1);
+              }}
+            />
+          )}
+
           {/* 补水失败提示：明确告知展示的是列表快照（可能陈旧），提供重试，避免用户对着旧数据编辑 */}
           {hydrateFailed && (
             <div className="flex items-center justify-between gap-2 rounded-lg border border-amber-300 bg-amber-50 px-3 py-2 text-xs text-amber-800">
@@ -5083,6 +5220,15 @@ function OrderDrawer({
             order={o}
             role={role}
             onOrderUpdated={handleOrderUpdated}
+          />
+
+          <OrderChangeRequestsPanel
+            key={`ocr-${o.id}:${hydrated ? 'h' : 'l'}`}
+            id={`ocr-${o.id}`}
+            orderId={o.id}
+            role={role}
+            onOrderUpdated={handleOrderUpdated}
+            refreshNonce={changeRequestRefreshNonce}
           />
 
           {/* ── 付款：付款情况卡 + 收款操作（相邻摆放，运营排序需求）── */}
