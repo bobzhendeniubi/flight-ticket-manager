@@ -13985,20 +13985,29 @@ export class OrderService {
           '这个请求编号已经用于另一批乘客，请刷新后用新的请求编号重试。',
         );
       }
-      // 编排入参（目标航段行/班次/舱位/差价）比对。老记录没留这一段 → 无从比对，
-      // 按「乘客集合一致即回放」处理（fail-open 只对老数据）。
+      // 编排入参（目标航段行/班次/舱位/差价）比对。
+      //
+      // 老记录（本次改动之前落库的拆单流水）没留这一段 —— 一律 **fail-closed**，
+      // 与本文件其它按 token 回放的动作（assertLegActionTokenReplay 的 LEGACY_SNAPSHOT
+      // 分支）同一个口径。凭「乘客集合一致」就回放是不安全的：同一个 token 换个班次、
+      // 换份差价重发，会照样回放上一轮那张新单、再对它改一次期，本次真正要改的没改，
+      // 接口却返回 200。宁可让运营换个新请求编号重提一遍。
       const priorOrchestrationRaw = snapshot.orchestration;
-      if (priorOrchestrationRaw != null && typeof priorOrchestrationRaw === 'object') {
-        const priorOrchestration = readJsonObject(priorOrchestrationRaw);
-        const current = reschedulePassengersOrchestration(input);
-        // 键序无关地比：留档那份是从 JSONB 读回来的，键序未必还是当初写进去的样子，
-        // 直接 JSON.stringify 两边比会把「原样重试」误判成「换了一份入参」。
-        if (canonicalJson(priorOrchestration) !== canonicalJson(current)) {
-          throw tokenPayloadMismatchError(
-            { reason: 'PAYLOAD', prior: priorOrchestration, current },
-            '这个请求编号已经用于另一班次/另一份改期差价，请刷新后用新的请求编号重试。',
-          );
-        }
+      if (priorOrchestrationRaw == null || typeof priorOrchestrationRaw !== 'object') {
+        throw tokenPayloadMismatchError(
+          { reason: 'LEGACY_NO_FINGERPRINT' },
+          '这条拆单记录没有留改期入参，无法确认是同一个请求，请用新的请求编号重试。',
+        );
+      }
+      const priorOrchestration = readJsonObject(priorOrchestrationRaw);
+      const current = reschedulePassengersOrchestration(input);
+      // 键序无关地比：留档那份是从 JSONB 读回来的，键序未必还是当初写进去的样子，
+      // 直接 JSON.stringify 两边比会把「原样重试」误判成「换了一份入参」。
+      if (canonicalJson(priorOrchestration) !== canonicalJson(current)) {
+        throw tokenPayloadMismatchError(
+          { reason: 'PAYLOAD', prior: priorOrchestration, current },
+          '这个请求编号已经用于另一班次/另一份改期差价，请刷新后用新的请求编号重试。',
+        );
       }
       replaySplit = {
         sourceOrderId: orderId,

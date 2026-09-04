@@ -476,7 +476,7 @@ describe('按人改期 · 部分乘客的同 token 重试（A2）', () => {
     expect(result.audit.splitReplayed).toBe(true);
   });
 
-  it('老记录没留编排入参 → 只按乘客集合一致回放（fail-open 只对老数据）', async () => {
+  it('老记录没留编排入参 → 409 fail-closed，不拿乘客集合一致就回放', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(afterFirstSplit());
     mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(
       priorRecord({ snapshot: { movedPassengerIds: ['p1'] } }),
@@ -486,10 +486,31 @@ describe('按人改期 · 部分乘客的同 token 重试（A2）', () => {
       { id: 'leg-ret-moved', flightScheduleId: 'sch-ret' },
     ]);
     const split = vi.spyOn(service, 'splitOrder');
+    const reschedule = vi.spyOn(service, 'rescheduleOrderItem');
 
-    const result = await service.reschedulePassengers('o1', body(), admin);
+    const err = await service.reschedulePassengers('o1', body(), admin).catch((e) => e);
+
+    expect(err).toBeInstanceOf(AppError);
+    expect(err.statusCode).toBe(409);
+    expect(err.code).toBe('TOKEN_PAYLOAD_MISMATCH');
+    expect(err.details).toMatchObject({ reason: 'LEGACY_NO_FINGERPRINT' });
+    expect(err.message).toContain('没有留改期入参');
     expect(split).not.toHaveBeenCalled();
-    expect(result.audit.splitReplayed).toBe(true);
+    expect(reschedule).not.toHaveBeenCalled();
+  });
+
+  it('留档的编排入参不是对象（脏值）→ 同样 409 fail-closed', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(afterFirstSplit());
+    mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(
+      priorRecord({ snapshot: { movedPassengerIds: ['p1'], orchestration: 'legacy' } }),
+    );
+    const split = vi.spyOn(service, 'splitOrder');
+
+    const err = await service.reschedulePassengers('o1', body(), admin).catch((e) => e);
+
+    expect(err.statusCode).toBe(409);
+    expect(err.details).toMatchObject({ reason: 'LEGACY_NO_FINGERPRINT' });
+    expect(split).not.toHaveBeenCalled();
   });
 
   it('未命中 → 走原有流程（正常拆单 + 改期）', async () => {
