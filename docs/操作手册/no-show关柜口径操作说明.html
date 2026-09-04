@@ -1,0 +1,170 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>no-show 按关柜时间判定 操作说明 — 世途旅行·运营控制台</title>
+<style>
+  :root{
+    --indigo:#4F46E5; --indigo-dark:#4338CA; --indigo-50:#EEF2FF;
+    --ink:#0F172A; --ink-soft:#334155; --muted:#64748B;
+    --bg:#F1F5F9; --card:#FFFFFF; --line:#E2E8F0;
+    --amber-bg:#FFFBEB; --amber-line:#FDE68A;
+    --green:#059669; --green-bg:#ECFDF5;
+    --red-bg:#FEF2F2;
+    --blue-bg:#EFF6FF;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Inter','PingFang SC','Hiragino Sans GB','Microsoft YaHei',system-ui,-apple-system,sans-serif;color:var(--ink-soft);background:var(--bg);line-height:1.85;font-size:15px}
+  .page{max-width:900px;margin:0 auto;background:var(--card);padding:40px 44px 72px;box-shadow:0 0 24px rgba(15,23,42,.06)}
+  h1,h2,h3{color:var(--ink);line-height:1.35}
+  h1{font-size:26px;margin:0 0 6px}
+  h2{font-size:20px;margin:40px 0 12px;padding:10px 14px;background:var(--indigo-50);border-left:5px solid var(--indigo);border-radius:0 8px 8px 0}
+  h3{font-size:16.5px;margin:24px 0 8px;color:var(--indigo-dark)}
+  p{margin:10px 0}
+  .sub{color:var(--muted);font-size:13.5px;margin:0 0 4px}
+  .cover{border-bottom:3px solid var(--indigo);padding-bottom:18px;margin-bottom:22px}
+  .cover .brand{display:inline-block;background:var(--indigo);color:#fff;font-weight:700;font-size:13px;padding:3px 12px;border-radius:999px;letter-spacing:.5px;margin-bottom:10px}
+  .lead{background:var(--indigo-50);border-radius:10px;padding:14px 18px;margin:16px 0 8px;color:var(--ink);font-size:15.5px}
+  .shot{margin:14px 0 4px;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
+  .shot img{display:block;width:100%;height:auto}
+  .shot.narrow{max-width:620px}
+  .cap{color:var(--muted);font-size:13px;margin:4px 0 16px;text-align:center}
+  .tip,.info,.warn,.danger{border-radius:10px;padding:12px 16px;margin:14px 0}
+  .tip{background:var(--green-bg);border:1px solid #A7F3D0}
+  .info{background:var(--blue-bg);border:1px solid #BFDBFE}
+  .warn{background:var(--amber-bg);border:1px solid var(--amber-line)}
+  .danger{background:var(--red-bg);border:1px solid #FECACA}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14.5px}
+  table.doc th,table.doc td{border:1px solid var(--line);padding:8px 12px;text-align:left;vertical-align:top}
+  table.doc th{background:#F8FAFC;color:var(--ink)}
+  ol.steps{padding-left:22px}
+  ol.steps li{margin:6px 0}
+  .toc{background:#F8FAFC;border:1px solid var(--line);border-radius:10px;padding:12px 18px 12px 34px;margin:14px 0 6px}
+  .toc li{margin:3px 0}
+  .timeline{display:flex;gap:0;margin:16px 0;border:1px solid var(--line);border-radius:10px;overflow:hidden;font-size:13.5px}
+  .timeline div{flex:1;padding:10px 12px;border-right:1px solid var(--line)}
+  .timeline div:last-child{border-right:0}
+  .timeline b{display:block;color:var(--ink);margin-bottom:4px}
+  .t-open{background:#F8FAFC}
+  .t-closed{background:var(--amber-bg)}
+  .t-gone{background:#F1F5F9}
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="cover">
+  <span class="brand">运营控制台</span>
+  <h1>no-show 按「关柜时间」判定 操作说明</h1>
+  <p class="sub">关柜提前分钟数怎么配 · 关柜后能做什么不能做什么 · 批量页与匹配表的变化　·　2026-09-04</p>
+</div>
+
+<div class="lead">
+以前要等航班<strong>起飞</strong>才能标 no-show，赶上最后一刻处理不完。现在改成<strong>值机柜台一关就能标</strong>：关柜时间 = 起飞时间往前推一个分钟数，系统默认 45 分钟，哪一班不一样可以单独填。
+</div>
+
+<ol class="toc">
+  <li><a href="#s1">关柜时间是怎么算的</a></li>
+  <li><a href="#s2">给某一班单独设关柜提前分钟数</a></li>
+  <li><a href="#s3">订单详情里标 no-show：关柜前 / 关柜后</a></li>
+  <li><a href="#s4">关柜之后到起飞之前，哪些事不能做</a></li>
+  <li><a href="#s5">no-show 批量处理页的变化</a></li>
+  <li><a href="#s6">一句话对照表</a></li>
+</ol>
+
+<h2 id="s1">一、关柜时间是怎么算的</h2>
+
+<p><strong>关柜时间 = 该班次起飞时间 − 关柜提前分钟数。</strong>提前分钟数没填就按系统默认 <strong>45 分钟</strong>。举例：15:45 起飞、没单独设置 → 15:00 关柜；到了 15:00 就可以标 no-show，不用等到 15:45。</p>
+
+<div class="timeline">
+  <div class="t-open"><b>关柜前</b>不能标 no-show。客人临时不飞，走「取消航段 / 取消订单」。</div>
+  <div class="t-closed"><b>关柜后 → 起飞前</b>可以标 no-show。回程座位<strong>不能</strong>再释放、也不能恢复。</div>
+  <div class="t-gone"><b>起飞后</b>照旧：系统起飞满 2 小时自动作废回程；手工作废也在这时才放行。</div>
+</div>
+
+<div class="info">
+「能不能登机看柜台关没关，不是飞机推没推出去」——这是整套判定的原则。去程标 no-show、回程放座、恢复回程三处都按这个原则走；只有「作废」仍然按真起飞时刻，因为作废是座位确实消耗掉之后才做的事。
+</div>
+
+<h2 id="s2">二、给某一班单独设关柜提前分钟数</h2>
+
+<p><strong>什么时候要设：</strong>某个航司 / 某一班关柜不是提前 45 分钟（比如提前 60 分钟）。其余班次不用管，默认就是 45。</p>
+
+<ol class="steps">
+  <li>左侧菜单「航班管理」，展开对应航班，在月历里点那一天的班次格子打开班次详情，面板底部点<strong>「改时刻」</strong>。</li>
+  <li>弹窗里除了出发 / 到达时间，多了一项<strong>「关柜提前分钟数」</strong>。填整数（0–1440），比如 60。</li>
+  <li><strong>留空 = 用系统默认 45 分钟。</strong>想改回默认，把数字删掉保存即可。</li>
+  <li>保存后立即生效：这一班的 no-show 判定、批量页的「已关柜 / 未关柜」都按新值算。</li>
+</ol>
+
+<div class="shot"><img src="shots-2026-09-04-关柜/01-班次-改时刻入口.png"></div>
+<p class="cap">航班管理 → 展开航班 → 点班次格子 → 班次详情面板底部的「改时刻」</p>
+
+<div class="shot narrow"><img src="shots-2026-09-04-关柜/02-改时刻弹窗-关柜分钟数.png"></div>
+<p class="cap">改时刻弹窗：「关柜提前分钟数」选填，留空即默认 45</p>
+
+<div class="warn">
+这个数只影响<strong>本班次</strong>。同一航班号的不同日期各是各的班次，要每一班都改的话，批量操作里目前不带这一项——通常也不需要，航司规则一般是固定提前量，默认值已经覆盖了大多数情况。
+</div>
+
+<h2 id="s3">三、订单详情里标 no-show：关柜前 / 关柜后</h2>
+
+<p>入口没变：订单详情 → 「no-show 处理」。变的是能不能标的时间点，以及提示文案。</p>
+
+<h3>关柜前点进去</h3>
+<p>面板会直接告诉你还没关柜、什么时候关柜，此时不能标。客人临时不飞请走「取消航段 / 取消订单」。</p>
+
+<div class="shot"><img src="shots-2026-09-04-关柜/03-订单详情-未关柜拦截.png"></div>
+<p class="cap">未关柜：红字写明当地时间几点关柜，「确认」按钮不可用</p>
+
+<h3>关柜后点进去</h3>
+<p>能标了。去程打 no-show 标（钱不动）；有回程的单可以勾「同时释放回程座位」——但要看回程这一班关没关柜，见下一节。</p>
+
+<div class="shot"><img src="shots-2026-09-04-关柜/04-订单详情-已关柜可标.png"></div>
+<p class="cap">已关柜：可以确认标记；单程单会提示没有回程座位可释放</p>
+
+<h2 id="s4">四、关柜之后到起飞之前，哪些事不能做</h2>
+
+<p>这段一般就是 45 分钟。柜台关了，座位就算放回库存也没人能值机——所以：</p>
+
+<table class="doc">
+  <tr><th style="width:220px">动作</th><th>回程那一班关柜后</th><th>为什么</th></tr>
+  <tr><td>标去程 no-show</td><td>可以</td><td>看的是去程那一班关没关柜</td></tr>
+  <tr><td>同时释放回程座位</td><td><strong>不行</strong>，勾选会被拦，只能记录 no-show</td><td>关柜后放回库存的座位没人能值机，等于凭空多卖</td></tr>
+  <tr><td>恢复回程（代理来要座位）</td><td><strong>不行</strong></td><td>占回去也上不了飞机</td></tr>
+  <tr><td>作废回程</td><td>要等起飞后（系统起飞满 2 小时自动作废）</td><td>作废是座位确实消耗掉之后的动作</td></tr>
+</table>
+
+<div class="tip">
+正常流程不会卡在这里：去程当天关柜后标 no-show，回程通常是隔天甚至更晚，那时回程还没关柜，座位照样能释放、能恢复。只有回程那一班本身已经关柜了，才会碰到上面这几条。
+</div>
+
+<h2 id="s5">五、no-show 批量处理页的变化</h2>
+
+<ol class="steps">
+  <li>左侧菜单「no-show 处理」，选班次。班次角标现在显示<strong>「已关柜 / 未关柜」</strong>而不是已起飞 / 未起飞；未关柜的班次不给提交。</li>
+  <li>贴航司名单，点「匹配」。匹配表的<strong>订单号下面多了一行订单备注</strong>，方便认人；鼠标放上去看全文。</li>
+  <li>回程那一列原来写「已出票 / 未出票」，现在写<strong>「票务已确认 / 票务未确认」</strong>——这是票务任务的状态，跟财务的「开票」不是一回事。</li>
+</ol>
+
+<div class="shot"><img src="shots-2026-09-04-关柜/05-批量页-班次已关柜角标.png"></div>
+<p class="cap">批量页：抬头与班次角标改为关柜口径</p>
+
+<div class="shot"><img src="shots-2026-09-04-关柜/06-批量页-匹配表备注与票务列.png"></div>
+<p class="cap">匹配表：订单号下带备注；回程列写「票务已确认 / 未确认」</p>
+
+<h2 id="s6">六、一句话对照表</h2>
+
+<table class="doc">
+  <tr><th style="width:260px">以前</th><th>现在</th></tr>
+  <tr><td>起飞后才能标 no-show</td><td>关柜后就能标（默认起飞前 45 分钟）</td></tr>
+  <tr><td>关柜时间系统里没有</td><td>班次「改时刻」里可填「关柜提前分钟数」，留空用默认</td></tr>
+  <tr><td>回程起飞前都能释放 / 恢复座位</td><td>回程关柜后就不能释放、不能恢复，等起飞后作废</td></tr>
+  <tr><td>批量页角标「已起飞 / 未起飞」</td><td>「已关柜 / 未关柜」</td></tr>
+  <tr><td>匹配表回程列「已出票 / 未出票」</td><td>「票务已确认 / 票务未确认」，并在订单号下显示备注</td></tr>
+</table>
+
+</div>
+</body>
+</html>
