@@ -59,7 +59,7 @@ const { mockPrisma } = vi.hoisted(() => ({
 
 vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
 
-import { OrderService } from './orders.service.js';
+import { OrderService, splitNoneUpdateToPrisma } from './orders.service.js';
 import { BadRequestError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 
 const service = new OrderService();
@@ -2211,7 +2211,37 @@ describe('拆单 · 只拆婴儿/儿童的提示（M7）', () => {
     expect(rosterWrite!.data.quantity).toBeUndefined();
     expect(rosterWrite!.data.amount).toBeUndefined();
     expect(rosterWrite!.data.totalCostCny).toBeUndefined();
+    expect(rosterWrite!.data.roomsBilled).toBeUndefined();
     // 行也没有被过户到新单
     expect(rosterWrite!.data.orderId).toBeUndefined();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 「不动」决策（SplitMove.NONE）的落库形状：内核自己兜住「只许改 metadata」。
+//
+// 类型上 NONE.update 已经收成 Pick<SplitRowPatch, 'metadata'>，但 TypeScript 的结构类型
+// 挡不住一个多带了字段的变量被赋进来；而通用的 splitPatchToPrisma 能写数量/金额/成本/房数。
+// 「不动的行不许动财务字段」是守恒断言成立的前提，前提得由内核保证，不能只靠生产者自觉。
+// ══════════════════════════════════════════════════════════════════════════
+describe('拆单内核 · 「不动」决策的落库白名单', () => {
+  it('补丁里混进数量/金额/成本/房数 → 一律丢掉，只落 metadata', () => {
+    const data = splitNoneUpdateToPrisma({
+      metadata: { noShow: { passengerIds: ['p2'] } },
+      // 生产者不会这么发，但类型系统拦不住；内核必须自己拦。
+      quantity: 9,
+      amount: 12345,
+      totalCostCny: 6789,
+      roomsBilled: 3,
+      description: '被改掉的描述',
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    } as any);
+
+    expect(Object.keys(data ?? {})).toEqual(['metadata']);
+    expect(data!.metadata).toEqual({ noShow: { passengerIds: ['p2'] } });
+  });
+
+  it('补丁里没有 metadata → 返回 null，这一行一个字都不用改', () => {
+    expect(splitNoneUpdateToPrisma({})).toBeNull();
   });
 });

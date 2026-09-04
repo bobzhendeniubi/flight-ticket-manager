@@ -13267,13 +13267,12 @@ export class OrderService {
       movePlans.push({ item: view, plan });
       if (plan.mode === 'NONE') {
         // 「不动」也可能带一个就地补丁（目前只有：源单 no-show 名单裁掉被拆走的人）。
-        // 类型上只允许改 metadata —— 一条「不动」的决策改不了数量/金额/房数，守恒断言的
-        // 前提不受影响。
-        if (plan.update) {
-          await tx.orderItem.update({
-            where: { id: item.id },
-            data: splitPatchToPrisma(plan.update),
-          });
+        // 走**只出 metadata 的硬白名单**，不走通用的 splitPatchToPrisma —— 后者能写数量/
+        // 金额/成本/房数，而「不动的行不许动财务字段」正是守恒断言成立的前提，
+        // 这个前提得由内核自己保证，不能只靠生产者自觉（类型上的 Pick 拦不住多带字段的变量）。
+        const noneData = plan.update ? splitNoneUpdateToPrisma(plan.update) : null;
+        if (noneData) {
+          await tx.orderItem.update({ where: { id: item.id }, data: noneData });
         }
         continue;
       }
@@ -18104,6 +18103,23 @@ interface SplitPatchData {
   roomsBilled?: Prisma.Decimal | null;
   metadata?: Prisma.InputJsonValue;
 }
+/**
+ * 「不动」决策（SplitMove.NONE）的落库形状 —— **硬白名单，只出 metadata**。
+ *
+ * 类型上 NONE 的 update 已经收成 `Pick<SplitRowPatch, 'metadata'>`，但 TypeScript 的结构类型
+ * 挡不住一个多带了字段的变量被赋进来；而通用的 splitPatchToPrisma 能写数量/金额/成本/房数。
+ * 「不动的行不许动财务字段」是拆单守恒断言成立的前提，这个前提必须由内核自己兜住，
+ * 不能只靠生产者（split-move-strategies 里的各条策略）自觉。
+ *
+ * 返回 null = 补丁里没有 metadata，这一行一个字都不用改（连一次空写都省掉）。
+ */
+export function splitNoneUpdateToPrisma(
+  update: Pick<SplitRowPatch, 'metadata'>,
+): { metadata: Prisma.InputJsonValue } | null {
+  if (update.metadata === undefined) return null;
+  return { metadata: update.metadata as Prisma.InputJsonValue };
+}
+
 function splitPatchToPrisma(patch: SplitRowPatch): SplitPatchData {
   const data: SplitPatchData = {};
   if (patch.description !== undefined) data.description = patch.description;
