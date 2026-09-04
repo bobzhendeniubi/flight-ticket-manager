@@ -207,7 +207,7 @@ import {
   computeGroundItemAmounts,
   resolveGroundItemUnitPrice,
 } from './orders.service.js';
-import { BadRequestError, PriceChangedError } from '../../lib/errors.js';
+import { AppError, BadRequestError, PriceChangedError } from '../../lib/errors.js';
 import type { OrderItemInput } from './orders.schemas.js';
 import {
   batchCreateOrdersBodySchema,
@@ -4384,6 +4384,157 @@ describe('OrderService.rescheduleOrderItem · 同班次同舱位带差价一律�
     );
     expect(adjustmentWrites).toHaveLength(1);
     expect(adjustmentWrites[0][0].data.adjustmentCny).toBe(300);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 幂等键（requestToken）的守闸必须在**订单行锁内**复查。
+//
+// 编排层（按人改期的全员快路径）在事务外先查一遍 token 拦不住并发：同 token 的两次提交
+// 会双双读到「没见过」，随后被订单行锁串行执行两次 —— 座位搬两回、差价记两笔。
+// 查的范围也必须是本单**全部** FLIGHT 行：no-show 释放 / 取消航段会把 flightScheduleId
+// 置空，只查「有班次的行」会漏掉那些行上留过的 token，同一个编号又能拿去改另一条活着的航段。
+// ══════════════════════════════════════════════════════════════════════════
+describe('OrderService.rescheduleOrderItem · 锁内复查幂等键', () => {
+  const TOKEN = '00000000-0000-4000-8000-0000000000ab';
+
+  /** 与服务端 rescheduleAllFingerprint 同口径：键名升序后 JSON.stringify。 */
+  const fingerprintOf = (
+    over: {
+      orderItemId?: string | null;
+      newScheduleId?: string;
+      newCabin?: string | null;
+      feeCny?: number;
+    } = {},
+  ) =>
+    JSON.stringify({
+      feeCny: over.feeCny ?? 300,
+      newCabin: over.newCabin ?? null,
+      newScheduleId: over.newScheduleId ?? 'sched2',
+      orderItemId: over.orderItemId ?? 'it1',
+    });
+
+  const logEntry = (fingerprint: string) => ({
+    type: 'RESCHEDULE_ALL',
+    requestToken: TOKEN,
+    at: '2026-09-04T00:00:00.000Z',
+    byUserId: 'admin1',
+    fingerprint,
+  });
+
+  /** flightRows = 锁内那次「本单全部 FLIGHT 行」查询要返回的行。 */
+  const arm = (flightRows: Array<Record<string, unknown>>) => {
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue({
+      id: 'ord1',
+      status: 'PAID',
+      deletedAt: null,
+      adjustmentCny: 0,
+      adjustments: [],
+    });
+    mockPrisma.orderItem.findUnique.mockReset().mockResolvedValue({
+      id: 'it1',
+      orderId: 'ord1',
+      kind: 'FLIGHT',
+      quantity: 1,
+      bundleId: null,
+      flightScheduleId: 'sched1',
+      flightCabin: 'ECONOMY',
+      metadata: {},
+      flightSchedule: { departureTime: new Date(Date.now() + 30 * 24 * 3600_000) },
+    });
+    mockPrisma.orderItem.findMany.mockReset().mockResolvedValue(flightRows);
+    mockPrisma.flightSeatClass.findFirst.mockReset().mockResolvedValue({ id: 'seat1' });
+    mockPrisma.seatLock.aggregate.mockReset().mockResolvedValue({ _sum: { qty: 0 } });
+    mockPrisma.$queryRaw.mockReset().mockResolvedValue([{ id: 'ord1' }]);
+    mockPrisma.$executeRaw.mockReset().mockResolvedValue(1);
+    mockPrisma.orderItem.update.mockReset().mockResolvedValue({});
+    mockPrisma.order.update.mockReset().mockResolvedValue({});
+    mockPrisma.passenger.updateMany.mockReset().mockResolvedValue({ count: 0 });
+    mockPrisma.flightSchedule.findUnique
+      .mockReset()
+      .mockResolvedValue({ departureTime: new Date(Date.now() + 30 * 24 * 3600_000) });
+    mockPrisma.order.findUniqueOrThrow.mockReset().mockResolvedValue(fakeFullOrder());
+  };
+
+  const call = (over: Record<string, unknown> = {}) =>
+    new OrderService().rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'it1', newScheduleId: 'sched2', feeCny: 300, requestToken: TOKEN, ...over },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+  it('同 token 已经落过流水 → 锁内 409，座位与金额一个字都不写', async () => {
+    arm([
+      {
+        id: 'it1',
+        flightScheduleId: 'sched2',
+        flightCabin: 'ECONOMY',
+        metadata: { legActionLog: [logEntry(fingerprintOf())] },
+      },
+    ]);
+
+    const err = await call().catch((e) => e);
+
+    expect(err).toBeInstanceOf(AppError);
+    expect(err.statusCode).toBe(409);
+    expect(mockPrisma.orderItem.update).not.toHaveBeenCalled();
+    expect(mockPrisma.order.update).not.toHaveBeenCalled();
+  });
+
+  it('token 留在已被释放（无班次）的航段行上 → 照样拦下，不能拿去改另一条活着的航段', async () => {
+    arm([
+      {
+        id: 'leg-released',
+        flightScheduleId: null,
+        flightCabin: null,
+        metadata: { legActionLog: [logEntry(fingerprintOf())] },
+      },
+      { id: 'it1', flightScheduleId: 'sched1', flightCabin: 'ECONOMY', metadata: {} },
+    ]);
+
+    const err = await call().catch((e) => e);
+
+    expect(err).toBeInstanceOf(AppError);
+    expect(err.statusCode).toBe(409);
+    expect(mockPrisma.orderItem.update).not.toHaveBeenCalled();
+  });
+
+  it('同 token 换了一份入参 → 409 TOKEN_PAYLOAD_MISMATCH', async () => {
+    arm([
+      {
+        id: 'it1',
+        flightScheduleId: 'sched2',
+        flightCabin: 'ECONOMY',
+        metadata: { legActionLog: [logEntry(fingerprintOf({ feeCny: 900 }))] },
+      },
+    ]);
+
+    const err = await call().catch((e) => e);
+
+    expect(err).toBeInstanceOf(AppError);
+    expect(err.statusCode).toBe(409);
+    expect(err.code).toBe('TOKEN_PAYLOAD_MISMATCH');
+    expect(mockPrisma.orderItem.update).not.toHaveBeenCalled();
+  });
+
+  it('token 没见过 → 照常改期，并在同一事务里落一条 RESCHEDULE_ALL 流水', async () => {
+    arm([{ id: 'it1', flightScheduleId: 'sched1', flightCabin: 'ECONOMY', metadata: {} }]);
+
+    await call();
+
+    const legWrite = mockPrisma.orderItem.update.mock.calls.find(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0]?.where?.id === 'it1' && c[0]?.data?.flightScheduleId === 'sched2',
+    );
+    expect(legWrite).toBeDefined();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    expect((legWrite as any)[0].data.metadata.legActionLog).toEqual([
+      expect.objectContaining({
+        type: 'RESCHEDULE_ALL',
+        requestToken: TOKEN,
+        fingerprint: fingerprintOf(),
+      }),
+    ]);
   });
 });
 

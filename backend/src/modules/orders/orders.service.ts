@@ -8030,6 +8030,31 @@ export class OrderService {
       });
       if (!order) throw new NotFoundError('订单不存在');
 
+      // ── 幂等键的守闸：**必须在订单行锁内再查一次**（并发安全）────────────────────
+      // 编排层（按人改期的全员快路径）在事务外先查一遍 token 拦不住并发：同 token 的两次
+      // 提交会双双读到「没见过」，随后被上面这把行锁串行执行两次 —— 座位搬两回、差价记两笔。
+      // 所以说了算的这一次查放在拿到锁之后、任何座位/金额写入之前。
+      //
+      // 查的范围是本单**全部** FLIGHT 行，含 flightScheduleId 已被置空的行：no-show 释放 /
+      // 取消航段会把班次清掉，只捞「有班次的行」就会漏掉那些行上留过的 token，
+      // 同一个编号又能拿去改另一条活着的航段。
+      //
+      // 命中后一律 409、不在锁内回放：能走到这里说明编排层刚刚才判过「没见过」，
+      // 也就是撞上了一次并发的同 token 提交 —— 这是真正的冲突，不是一次可以静默复用的重试。
+      // 客户端刷新后原样重发即可：那时首刷已提交，编排层的回放分支会正常返回 200。
+      if (input.requestToken) {
+        const tokenRows = await tx.orderItem.findMany({
+          where: { orderId, kind: OrderItemKind.FLIGHT },
+          select: { id: true, metadata: true },
+        });
+        const lookup = hasSeenLegActionToken(tokenRows, input.requestToken);
+        if (lookup.seen) {
+          // 动作类型 / 入参指纹对不上 → 更精确的 TOKEN_PAYLOAD_MISMATCH。
+          assertLegActionTokenReplay(lookup, ['RESCHEDULE_ALL'], rescheduleAllFingerprint(input));
+          throw rescheduleTokenInFlightError(input.requestToken);
+        }
+      }
+
       // 占座状态守卫（HIGH）：改期要"放旧座 + 拿新座"，只有当订单当前**真的持有座位**时才成立。
       // 旧代码读了 order.status 却从不校验：对 CANCELLED/REFUNDED/软删单改期会——
       //   · 二次释放旧座（旧座早已释放，再放会把 sold 打成负数并永久卡账）；
@@ -13982,7 +14007,11 @@ export class OrderService {
         orderNumber: true,
         passengers: { select: { id: true } },
         items: {
-          where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+          // 不夹 flightScheduleId：全员分支要按 legActionLog 查这个 token 见过没有，
+          // 而 no-show 释放 / 取消航段会把该行的班次置空 —— 只捞「有班次的行」就会漏掉
+          // 那些行上留过的 token，同一个编号又能拿去改另一条活着的航段。
+          // 判去程/回程的 determineFlightLegItems 自己就会滤掉无班次的行，不受影响。
+          where: { kind: OrderItemKind.FLIGHT },
           select: {
             id: true,
             flightScheduleId: true,
@@ -17307,6 +17336,21 @@ function tokenPayloadMismatchError(
     statusCode: 409,
     code: 'TOKEN_PAYLOAD_MISMATCH',
     details: detail,
+  });
+}
+
+/**
+ * 改期的幂等键在**订单行锁内**被判定为「已经用过」时的 409。
+ *
+ * 与 TOKEN_PAYLOAD_MISMATCH 分开是因为成因不同：那个是「同编号换了一份入参」（请求本身有问题），
+ * 这个是「同编号的另一次提交正好在并发执行、并且先一步提交了」（请求没问题，只是撞车了）。
+ * 客户端刷新后原样重发即可 —— 那时首刷已提交，编排层的回放分支会正常返回成功。
+ */
+function rescheduleTokenInFlightError(requestToken: string): AppError {
+  return new AppError('这个请求编号刚刚已经被另一次提交用掉了，请刷新订单确认改期结果后再操作。', {
+    statusCode: 409,
+    code: 'RESCHEDULE_TOKEN_IN_FLIGHT',
+    details: { requestToken },
   });
 }
 

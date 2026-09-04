@@ -761,6 +761,48 @@ describe('按人改期 · 全员勾选的同 token 重试（A1）', () => {
     expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
   });
 
+  it('token 留在已被释放（无班次）的航段行上 → 一样查得到，不会被当成没见过', async () => {
+    // no-show 释放 / 取消航段会把该行 flightScheduleId 置空。查重若只捞「有班次的行」，
+    // 那些行上留过的 token 就成了漏网之鱼，同一个编号又能拿去改另一条活着的航段。
+    mockPrisma.order.findUnique.mockResolvedValue(
+      sourceSnapshot({
+        items: [
+          {
+            id: 'leg-out',
+            flightScheduleId: 'sch-new',
+            flightSchedule: { departureTime: OUT_DEPART, departureTz: 'Asia/Shanghai' },
+            metadata: {},
+          },
+          {
+            id: 'leg-released',
+            flightScheduleId: null,
+            flightSchedule: null,
+            metadata: {
+              legActionLog: [
+                {
+                  type: 'RESCHEDULE_ALL',
+                  requestToken: TOKEN,
+                  at: '2026-09-04T00:00:00.000Z',
+                  byUserId: 'admin-1',
+                  fingerprint: JSON.stringify(FIRST_RUN_FINGERPRINT),
+                },
+              ],
+            },
+          },
+        ],
+      }),
+    );
+    const reschedule = vi.spyOn(service, 'rescheduleOrderItem');
+
+    const result = await service.reschedulePassengers('o1', body({ passengerIds: ALL_PAX }), admin);
+
+    expect(reschedule).not.toHaveBeenCalled();
+    expect(result.audit.rescheduleSkipped).toBe(true);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const itemsSelect = (mockPrisma.order.findUnique.mock.calls[0][0] as any).select.items;
+    expect(itemsSelect.where).not.toHaveProperty('flightScheduleId');
+  });
+
   it('同 token 换一份差价重发 → 409，不静默按上一次的入参回成功', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(withLegActionLog(FIRST_RUN_FINGERPRINT));
     const reschedule = vi.spyOn(service, 'rescheduleOrderItem');
