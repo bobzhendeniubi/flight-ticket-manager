@@ -8263,6 +8263,11 @@ function RescheduleForm({
         } catch {
           // 源单补刷失败不影响已展示的错误提示；运营关闭抽屉重开即可看到最新状态。
         }
+      } else if (e instanceof ApiError && e.code === TOKEN_PAYLOAD_MISMATCH_CODE) {
+        // 同一个请求编号此前已用于另一批乘客/另一班次，服务端拒绝回放：换新编号，
+        // 让运营按当前勾选再提一次（与拆单弹窗同一处理）。不换编号会一直撞同一个 409。
+        requestTokenRef.current = crypto.randomUUID();
+        setErr(TOKEN_PAYLOAD_MISMATCH_HINT);
       } else {
         setErr(e instanceof ApiError ? e.message : '改期失败');
       }
