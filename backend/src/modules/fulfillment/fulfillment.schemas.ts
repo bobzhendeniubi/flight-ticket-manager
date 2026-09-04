@@ -69,8 +69,9 @@ export const listFulfillmentQuerySchema = z.object({
    */
   issuanceMethod: z.union([z.nativeEnum(VisaIssuanceMethod), z.literal('NONE')]).optional(),
   /**
-   * 出发日期筛选（单日 YYYY-MM-DD，按订单最早一段机票的**出发地本地日**比对）。
-   * 纯签证单无航班 → 保留可见（与护照导出同口径，不被日期筛选误隐藏）。
+   * 出发日期筛选（单日 YYYY-MM-DD，按订单最早一段机票的**出发地本地日**比对；
+   * 无航班的单按最早 VISA 行的预计出行日期）。
+   * 既无航班也无预计出行日期的单 → 保留可见（与护照导出同口径，不被日期筛选误隐藏）。
    * 向后兼容参数：新前端改用区间 departureDateFrom/To；旧单日仍等价于 from=to=该日。
    */
   departureDate: z
