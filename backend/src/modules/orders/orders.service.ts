@@ -13824,6 +13824,8 @@ export class OrderService {
           movedShareCny,
           movedPaidCny,
           roomSplit: input.roomSplit ?? null,
+          // 编排入参留档（只增字段）：按人改期的同 token 回放据此比对，见 reschedulePassengers。
+          orchestration: input.orchestration ?? null,
         } as Prisma.InputJsonValue,
         requestToken: input.requestToken,
         createdById: actor.userId,
@@ -13944,9 +13946,75 @@ export class OrderService {
     const allPaxIds = new Set(order.passengers.map((p) => p.id));
     const movedIds = [...new Set(input.passengerIds)];
     if (movedIds.length === 0) throw new BadRequestError('请至少选择 1 位乘客');
-    const unknownIds = movedIds.filter((id) => !allPaxIds.has(id));
-    if (unknownIds.length > 0) {
-      throw new BadRequestError('所选乘客不属于本订单（可能已被换人/拆走），请刷新后重试');
+
+    // ── 1b. 同 token 回放的入参比对，**排在乘客归属校验之前** ────────────────────
+    //
+    // 首次成功后被拆走的人已经不在源单上了：归属校验会抢先把「原样重试」判成
+    // 400「所选乘客不属于本订单」，永远走不到拆单的幂等回放 —— 明明第一次已经拆成并改好了。
+    // 反过来，换一批人（换成仍在源单的人）或换一个目标班次还沿用同一个 token，
+    // splitOrder 按 (源单, token) 命中就静默回放上一轮那张新单，随后再对它改一次期：
+    // 本次真正要动的人一个都没动，接口却返回 200，还可能重复计费。
+    // 所以这里先按 (orderId, requestToken) 查拆单流水：
+    //   · 命中且乘客集合与编排入参都一致 → 回放（跳过归属校验，走既有的新单改期判定）；
+    //   · 命中但对不上 → 409，让前端换新请求编号重提；
+    //   · 未命中 → 原有流程。
+    const priorSplit = await prisma.orderSplitRecord.findUnique({
+      where: {
+        sourceOrderId_requestToken: { sourceOrderId: orderId, requestToken: input.requestToken },
+      },
+      select: {
+        targetOrderId: true,
+        targetOrder: { select: { orderNumber: true } },
+        movedShareCny: true,
+        movedPaidCny: true,
+        passengerCount: true,
+        snapshot: true,
+      },
+    });
+    let replaySplit: SplitOrderResult | null = null;
+    if (priorSplit) {
+      const snapshot = readJsonObject(priorSplit.snapshot);
+      const priorIdsRaw = snapshot.movedPassengerIds;
+      const priorIds = Array.isArray(priorIdsRaw)
+        ? priorIdsRaw.filter((v): v is string => typeof v === 'string').sort()
+        : null;
+      if (priorIds && JSON.stringify(priorIds) !== JSON.stringify([...movedIds].sort())) {
+        throw tokenPayloadMismatchError(
+          { reason: 'PASSENGERS', priorCount: priorIds.length, currentCount: movedIds.length },
+          '这个请求编号已经用于另一批乘客，请刷新后用新的请求编号重试。',
+        );
+      }
+      // 编排入参（目标航段行/班次/舱位/差价）比对。老记录没留这一段 → 无从比对，
+      // 按「乘客集合一致即回放」处理（fail-open 只对老数据）。
+      const priorOrchestrationRaw = snapshot.orchestration;
+      if (priorOrchestrationRaw != null && typeof priorOrchestrationRaw === 'object') {
+        const priorOrchestration = readJsonObject(priorOrchestrationRaw);
+        const current = reschedulePassengersOrchestration(input);
+        if (JSON.stringify(priorOrchestration) !== JSON.stringify(current)) {
+          throw tokenPayloadMismatchError(
+            { reason: 'PAYLOAD', prior: priorOrchestration, current },
+            '这个请求编号已经用于另一班次/另一份改期差价，请刷新后用新的请求编号重试。',
+          );
+        }
+      }
+      replaySplit = {
+        sourceOrderId: orderId,
+        sourceOrderNumber: order.orderNumber,
+        targetOrderId: priorSplit.targetOrderId,
+        targetOrderNumber: priorSplit.targetOrder.orderNumber,
+        movedShareCny: round2(Number(priorSplit.movedShareCny)),
+        movedPaidCny: round2(Number(priorSplit.movedPaidCny)),
+        passengerCount: priorSplit.passengerCount,
+        replayed: true,
+      };
+    }
+
+    // 回放命中时这批人已经不在源单上了，归属校验只会误伤；未命中才校验。
+    if (!replaySplit) {
+      const unknownIds = movedIds.filter((id) => !allPaxIds.has(id));
+      if (unknownIds.length > 0) {
+        throw new BadRequestError('所选乘客不属于本订单（可能已被换人/拆走），请刷新后重试');
+      }
     }
 
     // ── 2. 把 orderItemId 解成航段（OUTBOUND / RETURN）──
@@ -13968,7 +14036,9 @@ export class OrderService {
     }
 
     // ── 3. 全员勾选 → 没什么好拆的，直接走整单改期（与 PATCH /orders/:id/reschedule 同一条路径）──
-    if (movedIds.length >= allPaxIds.size) {
+    // 回放命中的请求一律走部分乘客那条路：首次已把人拆走，源单剩下的人可能比本次勾的还少，
+    // 拿「勾的人数 ≥ 源单人数」去判会把一次重试误判成整单改期，对源单再改一次期。
+    if (!replaySplit && movedIds.length >= allPaxIds.size) {
       // 3a. 幂等回放：首次已提交、客户端超时原样重试时，这一行已经落在目标班次+目标舱位上。
       // 快路径不带 requestToken 进 rescheduleOrderItem（那边没有幂等键），再调一次只会被
       // sameSeat 跳过座位搬移 —— 改期差价却会被再记一条 RESCHEDULE_FEE、adjustmentCny 再加
@@ -14046,22 +14116,27 @@ export class OrderService {
     // 而且新单同一航段照样已起飞，前端提示的「到新单上重试改期」永远走不通。
     // 判定与文案跟改期端点共用 assertLegNotFlownForReschedule（同一份时区折算）。
     const selectedLeg = leg === 'OUTBOUND' ? sourceLegs.outbound : sourceLegs.return;
-    if (selectedLeg) assertLegNotFlownForReschedule(selectedLeg);
+    if (!replaySplit && selectedLeg) assertLegNotFlownForReschedule(selectedLeg);
 
     // ── 4. 部分乘客：先拆单（幂等，服务端权威算钱），失败则整体失败、什么都没发生 ──
-    const split = await this.splitOrder(
-      orderId,
-      {
-        passengerIds: movedIds,
-        // roomSplit 可传可不传：不传时按人头自动派生（套餐单的住宿盖章就在套餐行上，
-        // 运营在改期弹窗里根本看不到「酒店行」可填）。
-        roomSplit: input.roomSplit,
-        note: input.note,
-        requestToken: input.requestToken,
-        autoSplitRoomGroups: true,
-      },
-      actor,
-    );
+    // 1b 已经命中并比对过入参时直接用那份回放结果，不必再进 splitOrder 兜一圈。
+    const split =
+      replaySplit ??
+      (await this.splitOrder(
+        orderId,
+        {
+          passengerIds: movedIds,
+          // roomSplit 可传可不传：不传时按人头自动派生（套餐单的住宿盖章就在套餐行上，
+          // 运营在改期弹窗里根本看不到「酒店行」可填）。
+          roomSplit: input.roomSplit,
+          note: input.note,
+          requestToken: input.requestToken,
+          autoSplitRoomGroups: true,
+          // 编排入参留档：下次同 token 重试时 1b 据此比对（换班次/换费用 → 409）。
+          orchestration: reschedulePassengersOrchestration(input),
+        },
+        actor,
+      ));
 
     // ── 5. 对新单改期 ──
     // 幂等回放（同 token 重试）时先看新单是否已经落在目标班次上：已落 = 上一轮已改成，
@@ -17045,6 +17120,26 @@ function appendLegActionLog(metadata: unknown, entry: LegActionLogEntry): LegAct
   return [...readLegActionLog(metadata), entry];
 }
 
+/**
+ * 按人改期的编排入参指纹（拆单流水 snapshot.orchestration 的唯一构造口径）。
+ *
+ * 落库与比对必须走同一个函数、同一个键序 —— 两处各写一份对象字面量，
+ * 早晚会因为键序或缺省值不同而把「同一个请求」判成不一致，运营侧表现为莫名其妙的 409。
+ */
+function reschedulePassengersOrchestration(input: {
+  orderItemId: string;
+  newScheduleId: string;
+  newCabin?: CabinClass;
+  feeCny?: number;
+}): Record<string, string | number | null> {
+  return {
+    orderItemId: input.orderItemId,
+    newScheduleId: input.newScheduleId,
+    newCabin: input.newCabin ?? null,
+    feeCny: Math.trunc(input.feeCny ?? 0),
+  };
+}
+
 /** 幂等回放时入参与首刷对不上 —— 稳定 code，前端据此提示换新请求编号重试。 */
 function tokenPayloadMismatchError(
   detail: Record<string, unknown>,
@@ -17610,6 +17705,13 @@ export interface SplitOrderInput {
    */
   autoSplitRoomGroups?: boolean;
   note?: string;
+  /**
+   * 编排上下文留档（按人改期传：目标航段行 / 目标班次 / 目标舱位 / 改期差价）。
+   * 拆单本身不读它，只原样写进 OrderSplitRecord.snapshot.orchestration ——
+   * 编排层拿同一个 requestToken 回放时据此比对入参：换了班次或换了费用还沿用同一个 token，
+   * 必须判 409，而不是静默回放上一轮拆出的那张单。
+   */
+  orchestration?: Record<string, string | number | null>;
   requestToken: string;
 }
 

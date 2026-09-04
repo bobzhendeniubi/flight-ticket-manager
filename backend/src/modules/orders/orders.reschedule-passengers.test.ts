@@ -20,6 +20,7 @@ const { mockPrisma } = vi.hoisted(() => ({
   mockPrisma: {
     order: { findUnique: vi.fn(), findUniqueOrThrow: vi.fn() },
     orderItem: { findMany: vi.fn() },
+    orderSplitRecord: { findUnique: vi.fn() },
     auditLog: { create: vi.fn() },
   },
 }));
@@ -119,6 +120,8 @@ beforeEach(() => {
   vi.restoreAllMocks();
   vi.clearAllMocks();
   mockPrisma.auditLog.create.mockResolvedValue({});
+  // 缺省：这个 requestToken 还没拆过单（未命中回放）
+  mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(null);
   mockPrisma.order.findUniqueOrThrow.mockResolvedValue(serializableOrder());
   mockPrisma.orderItem.findMany.mockResolvedValue([
     { id: 'leg-out-moved', flightScheduleId: 'sch-out' },
@@ -235,6 +238,13 @@ describe('按人改期 · 部分乘客 = 先拆单再对新单改期', () => {
         requestToken: TOKEN,
         // 编排路径：混合房组自动劈半 + 未给的间数/升舱位按人头自动派生
         autoSplitRoomGroups: true,
+        // 编排入参留档：同 token 重试时据此比对（换班次/换费用 → 409）
+        orchestration: {
+          orderItemId: 'leg-out',
+          newScheduleId: 'sch-new',
+          newCabin: null,
+          feeCny: 300,
+        },
       },
       admin,
     );
@@ -361,6 +371,128 @@ describe('按人改期 · 已出票三人单勾一人', () => {
     expect(ticketing.o1.outboundInvoiced).toBe(true);
     expect(result.splitPerformed).toBe(true);
     expect(result.audit.newOrderNumber).toBe('FTM20260901-TGT');
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 部分乘客的同 token 重试：首次成功后被拆走的人已经不在源单上了。
+// 旧口径的乘客归属校验会抢先把请求判死（400「所选乘客不属于本订单」），永远走不到
+// 拆单的幂等回放；而换一批人/换一个班次沿用同一个 token 又会静默回放上一轮的新单，
+// 本次真正要动的人一个没动，接口还返回 200。
+// ══════════════════════════════════════════════════════════════════════════
+describe('按人改期 · 部分乘客的同 token 重试（A2）', () => {
+  /** 首次已拆走 p1：源单只剩 p2/p3。 */
+  const afterFirstSplit = () => sourceSnapshot({ passengers: [{ id: 'p2' }, { id: 'p3' }] });
+
+  const priorRecord = (over: Record<string, unknown> = {}) => ({
+    targetOrderId: 'o2',
+    targetOrder: { orderNumber: 'FTM20260901-TGT' },
+    movedShareCny: 2000,
+    movedPaidCny: 2000,
+    passengerCount: 1,
+    snapshot: {
+      movedPassengerIds: ['p1'],
+      orchestration: {
+        orderItemId: 'leg-out',
+        newScheduleId: 'sch-new',
+        newCabin: null,
+        feeCny: 300,
+      },
+    },
+    ...over,
+  });
+
+  it('原样重试 → 走拆单回放，不再拆单、不重复计费', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(afterFirstSplit());
+    mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(priorRecord());
+    // 新单已经改到目标班次上（上一轮改期已成）
+    mockPrisma.orderItem.findMany.mockResolvedValue([
+      { id: 'leg-out-moved', flightScheduleId: 'sch-new' },
+      { id: 'leg-ret-moved', flightScheduleId: 'sch-ret' },
+    ]);
+    const split = vi.spyOn(service, 'splitOrder');
+    const reschedule = vi.spyOn(service, 'rescheduleOrderItem');
+
+    const result = await service.reschedulePassengers('o1', body(), admin);
+
+    expect(split).not.toHaveBeenCalled();
+    expect(reschedule).not.toHaveBeenCalled();
+    expect(result.audit.splitReplayed).toBe(true);
+    expect(result.audit.rescheduleSkipped).toBe(true);
+    expect(result.audit.newOrderNumber).toBe('FTM20260901-TGT');
+  });
+
+  it('换一批乘客沿用同一个 token → 409 TOKEN_PAYLOAD_MISMATCH', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(afterFirstSplit());
+    mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(priorRecord());
+    const split = vi.spyOn(service, 'splitOrder');
+
+    const err = await service
+      .reschedulePassengers('o1', body({ passengerIds: ['p2'] }), admin)
+      .catch((e) => e);
+
+    expect(err).toBeInstanceOf(AppError);
+    expect(err.statusCode).toBe(409);
+    expect(err.code).toBe('TOKEN_PAYLOAD_MISMATCH');
+    expect(split).not.toHaveBeenCalled();
+  });
+
+  it('换一个目标班次沿用同一个 token → 409', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(afterFirstSplit());
+    mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(priorRecord());
+
+    const err = await service
+      .reschedulePassengers('o1', body({ newScheduleId: 'sch-other' }), admin)
+      .catch((e) => e);
+
+    expect(err.statusCode).toBe(409);
+    expect(err.code).toBe('TOKEN_PAYLOAD_MISMATCH');
+  });
+
+  it('老记录没留编排入参 → 只按乘客集合一致回放（fail-open 只对老数据）', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(afterFirstSplit());
+    mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(
+      priorRecord({ snapshot: { movedPassengerIds: ['p1'] } }),
+    );
+    mockPrisma.orderItem.findMany.mockResolvedValue([
+      { id: 'leg-out-moved', flightScheduleId: 'sch-new' },
+      { id: 'leg-ret-moved', flightScheduleId: 'sch-ret' },
+    ]);
+    const split = vi.spyOn(service, 'splitOrder');
+
+    const result = await service.reschedulePassengers('o1', body(), admin);
+    expect(split).not.toHaveBeenCalled();
+    expect(result.audit.splitReplayed).toBe(true);
+  });
+
+  it('未命中 → 走原有流程（正常拆单 + 改期）', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(sourceSnapshot());
+    mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(null);
+    const split = vi.spyOn(service, 'splitOrder').mockResolvedValue(splitOutcome());
+    const reschedule = vi
+      .spyOn(service, 'rescheduleOrderItem')
+      .mockResolvedValue(rescheduleOutcome());
+
+    const result = await service.reschedulePassengers('o1', body(), admin);
+    expect(split).toHaveBeenCalledTimes(1);
+    expect(reschedule).toHaveBeenCalledTimes(1);
+    expect(result.audit.splitReplayed).toBe(false);
+  });
+
+  it('拆单入参里带上编排上下文，供下次回放比对', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(sourceSnapshot());
+    const split = vi.spyOn(service, 'splitOrder').mockResolvedValue(splitOutcome());
+    vi.spyOn(service, 'rescheduleOrderItem').mockResolvedValue(rescheduleOutcome());
+
+    await service.reschedulePassengers('o1', body(), admin);
+    expect(split.mock.calls[0][1]).toMatchObject({
+      orchestration: {
+        orderItemId: 'leg-out',
+        newScheduleId: 'sch-new',
+        newCabin: null,
+        feeCny: 300,
+      },
+    });
   });
 });
 
