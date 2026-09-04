@@ -480,7 +480,7 @@ describe('套餐单拆单 · 七条守恒（真 DB）', () => {
       singleSupplementTotal: 1200,
       businessUpgradeTotal: 800,
     });
-    // 操作费 / 签证挂牌价快照按份额缩放，Σ 恒等
+    // 操作费按份额缩放 Σ 恒等；签证挂牌价快照是每人口径，两侧原样继承（不切半）
     const tgtMeta = tgtBundle.metadata as {
       operationFee: { totalCny: number };
       visaListSnapshotCny: number;
@@ -490,7 +490,8 @@ describe('套餐单拆单 · 七条守恒（真 DB）', () => {
       visaListSnapshotCny: number;
     };
     expect(tgtMeta.operationFee.totalCny + srcMeta.operationFee.totalCny).toBe(60);
-    expect(tgtMeta.visaListSnapshotCny + srcMeta.visaListSnapshotCny).toBe(900);
+    expect(tgtMeta.visaListSnapshotCny).toBe(900);
+    expect(srcMeta.visaListSnapshotCny).toBe(900);
 
     // 立减行按人数拆两行
     const isDiscountRow = (it: { kind: OrderItemKind; metadata: unknown }) =>

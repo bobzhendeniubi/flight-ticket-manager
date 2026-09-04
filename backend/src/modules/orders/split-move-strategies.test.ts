@@ -407,7 +407,7 @@ describe('moveBundle · 套餐行', () => {
     expect((plan.keep.metadata as Record<string, unknown>).roomsNeeded).toBe(1.5);
   });
 
-  it('指定酒店 / 操作费 / 签证挂牌价快照按份额缩放，Σ 恒等', () => {
+  it('指定酒店 / 操作费按份额缩放 Σ 恒等；签证挂牌价快照是每人口径，两侧原样继承', () => {
     const plan = moveBundle(bundleRow(), bundleCtx());
     if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
     const moved = plan.move.metadata as Record<string, Record<string, number> & number>;
@@ -416,7 +416,9 @@ describe('moveBundle · 套餐行', () => {
     expect(moved.designatedHotel.pax).toBe(1);
     expect(kept.designatedHotel.pax).toBe(2);
     expect(moved.operationFee.totalCny + kept.operationFee.totalCny).toBe(60);
-    expect(Number(moved.visaListSnapshotCny) + Number(kept.visaListSnapshotCny)).toBe(900);
+    // 每人口径：拆前 900/人，拆后两边仍各 900/人（按份额切半会让导出签证金额偏低）
+    expect(Number(moved.visaListSnapshotCny)).toBe(900);
+    expect(Number(kept.visaListSnapshotCny)).toBe(900);
   });
 
   it('老单（无 addOns、只有顶层三计数）→ 顶层计数同步刷新', () => {

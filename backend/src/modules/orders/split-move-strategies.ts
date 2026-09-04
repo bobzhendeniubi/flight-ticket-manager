@@ -531,7 +531,8 @@ export function withBundleSideCounts(item: SplitItemView, ctx: SplitContext): Sp
  * 套餐行 metadata 两侧重建。
  *   · addOns：按各侧乘客现势重算（计数按人算、费率与 nights/legs 原样、小计 = 新计数 × 原费率）；
  *   · roomsNeeded：跟随各侧 roomsBilled；
- *   · designatedHotel / operationFee / visaListSnapshotCny：按份额缩放，Σ 恒等（kept = 原 − moved）；
+ *   · designatedHotel / operationFee：整行合计按份额缩放，Σ 恒等（kept = 原 − moved）；
+ *   · visaListSnapshotCny：每人口径，两侧原样继承，不缩放；
  *   · 顶层 adultCount/childCount/infantCount/pax（老单无 addOns 时的回落口径）同步刷新。
  */
 export function rebuildBundleMetadataPair(
@@ -610,12 +611,9 @@ export function rebuildBundleMetadataPair(
       totalCny: round2(origTotal - movedTotal),
     };
   }
-  if (base.visaListSnapshotCny != null) {
-    const origVisa = toNum(base.visaListSnapshotCny, 0);
-    const movedVisa = round2(origVisa * r);
-    move.visaListSnapshotCny = movedVisa;
-    keep.visaListSnapshotCny = round2(origVisa - movedVisa);
-  }
+  // visaListSnapshotCny 是**每人**口径（下单时套餐定义 VISA 组件 qty×unitPrice，与
+  // bundle-pricing 的 visaPerPax 同源；导出侧 perPaxVisaAmountByPassenger 也按每人读），
+  // 不是整行合计 —— 两侧原样继承（base 已带），不按份额缩放；缩放会让拆后两边的签证金额都偏低。
   return { keep, move };
 }
 
