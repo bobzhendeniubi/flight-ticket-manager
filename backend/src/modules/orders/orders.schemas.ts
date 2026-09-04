@@ -1263,10 +1263,16 @@ export const correctPassengerBodySchema = z
     firstName: optionalPnrSegmentName(120),
     fullName: optionalNormalizedName(120),
     chineseName: z.string().max(120).optional(),
-    documentNumber: z.string().min(3).max(60).optional(),
+    // 证件号长度口径**必须**与建单 / 补录同款（min 3、max 40）：订正写的是同一个
+    // Passenger.documentNumber 列，这里放宽到 60 就等于开了一扇「正门录不进、订正能录进」的窗，
+    // 40~60 位的脏证件号只会从这条通道进库。换人 schema 的 60 是历史遗留，不作为参照。
+    documentNumber: z.string().min(3).max(40).optional(),
     dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     gender: z.nativeEnum(Gender).optional(),
-    nationality: z.string().max(60).optional(),
+    // 国籍：ISO-2 两位码（口径同 selfUpdatePassengerBodySchema）。此前的 max(60) 能把
+    // 「中国」「CHN」这类值原样写进只认两位码的列，导出/送签层再按 ISO-2 查表就查不到。
+    // 大小写统一收在边界：cn → CN，免得同一个国籍在库里存成两种写法。
+    nationality: z.string().length(2).transform((v) => v.toUpperCase()).optional(),
     passportExpiry: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     passportIssueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   })

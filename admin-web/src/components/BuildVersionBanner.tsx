@@ -29,6 +29,15 @@ export function BuildVersionBanner() {
     setDismissedUntil(readDismissedUntil());
   }, [hasNewVersion]);
 
+  // 「稍后」snooze 期间没有任何东西会触发重渲染——不到期不会自动回来。
+  // 用定时器在 dismissedUntil 那一刻把状态清零，逼一次重渲染，横幅到点自动重新出现。
+  useEffect(() => {
+    if (dismissedUntil <= Date.now()) return;
+    const delay = dismissedUntil - Date.now();
+    const timer = window.setTimeout(() => setDismissedUntil(0), delay);
+    return () => window.clearTimeout(timer);
+  }, [dismissedUntil]);
+
   if (!hasNewVersion || dismissedUntil > Date.now()) return null;
 
   const dismiss = () => {

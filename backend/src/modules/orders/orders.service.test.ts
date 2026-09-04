@@ -3634,22 +3634,31 @@ function armQueryRaw(opts: { lockedOrderRow?: Record<string, unknown>; agentIds?
 describe('correctPassenger · 订正证件资料', () => {
   const OPS = { userId: 'staff1', role: 'STAFF' as const };
 
-  /** 订正通道现场：默认一张无航段（纯酒店）单、未开票、直客归属。 */
+  /** 订正通道现场：默认一张无航段（纯酒店）单、占座态、未开票、直客归属。 */
   function armCorrectMocks(
     opts: {
       documentNumber?: string;
+      fullName?: string;
+      lastName?: string | null;
+      firstName?: string | null;
+      pnr?: string | null;
+      eticketNumber?: string | null;
+      status?: string;
       invoiced?: boolean;
       agentId?: string | null;
+      agentIds?: string[];
       deletedAt?: Date | null;
       conflicts?: Array<{ order: { orderNumber: string } }>;
+      /** 同一订单内已有相同证件号的另一位出行人（passenger.findFirst 的返回）。 */
+      sameOrderDup?: { id: string } | null;
     } = {},
   ) {
     const passengerRow = {
       id: 'px1',
       orderId: 'ord1',
-      fullName: 'ZHANG/SAN',
-      lastName: 'ZHANG',
-      firstName: 'SAN',
+      fullName: opts.fullName ?? 'ZHANG/SAN',
+      lastName: opts.lastName === undefined ? 'ZHANG' : opts.lastName,
+      firstName: opts.firstName === undefined ? 'SAN' : opts.firstName,
       chineseName: '张三',
       documentNumber: opts.documentNumber ?? 'E12345Q78',
       dateOfBirth: new Date('1990-01-01'),
@@ -3658,18 +3667,26 @@ describe('correctPassenger · 订正证件资料', () => {
       passengerType: 'ADULT',
       passportExpiry: new Date('2035-06-30'),
       passportIssueDate: new Date('2025-06-30'),
+      pnr: opts.pnr ?? null,
+      eticketNumber: opts.eticketNumber ?? null,
     };
-    mockPrisma.order.findUnique.mockResolvedValue({
-      id: 'ord1',
-      orderNumber: 'FTM-CORRECT-1',
-      userId: 'u1',
-      agentId: opts.agentId ?? null,
-      deletedAt: opts.deletedAt ?? null,
-      outboundInvoiced: opts.invoiced === true,
-      returnInvoiced: false,
-      systemInvoiced: false,
+    // 订正整段包在事务里，订单行走 FOR UPDATE 裸 SQL（不再是 order.findUnique）。
+    armQueryRaw({
+      agentIds: opts.agentIds ?? ['agent-mine'],
+      lockedOrderRow: {
+        id: 'ord1',
+        orderNumber: 'FTM-CORRECT-1',
+        userId: 'u1',
+        agentId: opts.agentId ?? null,
+        status: opts.status ?? 'PAID',
+        deletedAt: opts.deletedAt ?? null,
+        outboundInvoiced: opts.invoiced === true,
+        returnInvoiced: false,
+        systemInvoiced: false,
+      },
     });
     mockPrisma.passenger.findUnique.mockResolvedValue(passengerRow);
+    mockPrisma.passenger.findFirst.mockResolvedValue(opts.sameOrderDup ?? null);
     // 无航段 → 同班次反向查重短路，出行人类型也不重派生（专测那两条的用例各自覆盖）
     mockPrisma.orderItem.findMany.mockResolvedValue([]);
     mockPrisma.passenger.findMany.mockResolvedValue(opts.conflicts ?? []);
@@ -3789,9 +3806,8 @@ describe('correctPassenger · 订正证件资料', () => {
 
   it('代理订正别人家的单 → 403（归属闸与 getOrder 同口径）', async () => {
     const service = new OrderService();
-    armCorrectMocks({ agentId: 'agent-other' });
-    // 代理树只含自己
-    armQueryRaw({ agentIds: ['agent-mine'] });
+    // 代理树只含自己，单子挂在别家代理名下
+    armCorrectMocks({ agentId: 'agent-other', agentIds: ['agent-mine'] });
 
     await expect(
       service.correctPassenger(
@@ -3807,7 +3823,6 @@ describe('correctPassenger · 订正证件资料', () => {
   it('代理订正自家单 → 放行', async () => {
     const service = new OrderService();
     armCorrectMocks({ agentId: 'agent-mine' });
-    armQueryRaw({ agentIds: ['agent-mine'] });
 
     await service.correctPassenger(
       'ord1',
@@ -3862,6 +3877,216 @@ describe('correctPassenger · 订正证件资料', () => {
     expect(audit.after).toEqual({ documentNumber: 'E12345078' });
     expect(audit.orderNumber).toBe('FTM-CORRECT-1');
   });
+
+  // ── 闸②：订单状态（H1）──────────────────────────────────────────────────
+  // 此前这条通道一道状态闸都没有：死单/已取消单上照样能改身份，而补录与换人两条兄弟通道
+  // 都拦着。代理按补录口径（出票流程启动前），运营按换人口径（占座态）。
+  it.each(['CANCELLED', 'REFUNDED', 'PAYMENT_TIMEOUT'])(
+    '运营在 %s 的死单上订正 → 400（死单上改身份没有正当场景）',
+    async (status) => {
+      const service = new OrderService();
+      armCorrectMocks({ status });
+
+      await expect(
+        service.correctPassenger('ord1', 'px1', { chineseName: '张叁' }, OPS),
+      ).rejects.toThrow('不可订正出行人资料');
+      expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it('运营在已出票（占座态）的单上订正 → 放行（运营口径 = 换人那道占座闸）', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ status: 'TICKETED' });
+
+    await service.correctPassenger('ord1', 'px1', { chineseName: '张叁' }, OPS);
+
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('代理在已出票的单上订正 → 409 ORDER_LOCKED（与补录同一句话、同一个码）', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ status: 'TICKETED', agentId: 'agent-mine' });
+
+    await expect(
+      service.correctPassenger(
+        'ord1',
+        'px1',
+        { chineseName: '张叁' },
+        { userId: 'u-agent', role: 'AGENT', agentId: 'agent-mine' },
+      ),
+    ).rejects.toMatchObject({ statusCode: 409, code: 'ORDER_LOCKED' });
+    expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+
+  it('代理在处理中的单上订正 → 放行（补录口径的三个状态）', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ status: 'PROCESSING', agentId: 'agent-mine' });
+
+    await service.correctPassenger(
+      'ord1',
+      'px1',
+      { chineseName: '张叁' },
+      { userId: 'u-agent', role: 'AGENT', agentId: 'agent-mine' },
+    );
+
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
+  });
+
+  // ── 闸④：证件号 + 姓名同时改动（H2）──────────────────────────────────────
+  // 连号护照 + 一个全新的名字能整条溜过证件号那道闸（距离 1），但这是另一个人上飞机：
+  // 护照图/签证号/票号原样留着挂到新名字下面，签证台与值机全被误导。
+  it('连号护照 + 全新姓名 → 400 指路换人（换人伪装成订正）', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ documentNumber: 'E1234567' });
+
+    await expect(
+      service.correctPassenger(
+        'ord1',
+        'px1',
+        { documentNumber: 'E1234568', fullName: 'LI/SI' },
+        OPS,
+      ),
+    ).rejects.toThrow('证件号与姓名同时改动，请使用「换人」');
+    expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+
+  it('只改姓名不动证件号 → 放行（同一本护照就是同一个人，OCR 认错名是常事）', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ documentNumber: 'E1234567' });
+
+    await service.correctPassenger('ord1', 'px1', { fullName: 'WANG/XIAOMING' }, OPS);
+
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('证件号错一字 + 姓名错一字 → 放行（一次录单两处笔误是常态）', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ documentNumber: 'E1234567' });
+
+    await service.correctPassenger(
+      'ord1',
+      'px1',
+      { documentNumber: 'E1234568', fullName: 'ZHANG/SAM' },
+      OPS,
+    );
+
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('只给姓（不给 fullName）时按 姓/名 拼起来比：改姓改到面目全非同样拦', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ documentNumber: 'E1234567' });
+
+    await expect(
+      service.correctPassenger(
+        'ord1',
+        'px1',
+        { documentNumber: 'E1234568', lastName: 'OUYANG' },
+        OPS,
+      ),
+    ).rejects.toThrow('证件号与姓名同时改动，请使用「换人」');
+  });
+
+  // ── 闸⑤：代理不许改已订座/已出票的人的票面身份（H3）─────────────────────
+  // 开票位是财务口径（发票开没开），票务口径要另看：订单状态已出票，或这一位身上已有
+  // PNR / 电子票号。改了票面身份，航司那边对不上，值机当场卡死。
+  it.each([
+    ['PNR', { pnr: 'ABC123' }],
+    ['电子票号', { eticketNumber: '999-1234567890' }],
+  ])('代理改已有 %s 的出行人的证件号 → 400 指路运营', async (_label, ticketFields) => {
+    const service = new OrderService();
+    armCorrectMocks({ agentId: 'agent-mine', documentNumber: 'E12345Q78', ...ticketFields });
+
+    await expect(
+      service.correctPassenger(
+        'ord1',
+        'px1',
+        { documentNumber: 'E12345078' },
+        { userId: 'u-agent', role: 'AGENT', agentId: 'agent-mine' },
+      ),
+    ).rejects.toThrow('已订座/已出票，改姓名/证件号请联系运营');
+    expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+
+  it('代理改已订座出行人的中文姓名 → 放行（中文名不上票面）', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ agentId: 'agent-mine', pnr: 'ABC123' });
+
+    await service.correctPassenger(
+      'ord1',
+      'px1',
+      { chineseName: '张叁' },
+      { userId: 'u-agent', role: 'AGENT', agentId: 'agent-mine' },
+    );
+
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('运营改已订座出行人的证件号 → 放行（票务口径的处置权在运营手里）', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ pnr: 'ABC123', documentNumber: 'E12345Q78' });
+
+    await service.correctPassenger('ord1', 'px1', { documentNumber: 'E12345078' }, OPS);
+
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
+  });
+
+  // ── 查重 + 事务（M1）────────────────────────────────────────────────────
+  it('同一订单内已有相同证件号的出行人 → 400（反向查重只看别的单，同单里两个人撞号它不吭声）', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ documentNumber: 'E12345Q78', sameOrderDup: { id: 'px2' } });
+
+    await expect(
+      service.correctPassenger('ord1', 'px1', { documentNumber: 'E12345078' }, OPS),
+    ).rejects.toThrow('同一订单内已有相同证件号的出行人');
+    expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+    // 同单查重要排除自己，否则每次订正都会撞上自己
+    expect(mockPrisma.passenger.findFirst).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({ orderId: 'ord1', id: { not: 'px1' } }),
+      }),
+    );
+  });
+
+  it('整段读-判-写在同一个事务里，且订单行 FOR UPDATE 锁住', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ documentNumber: 'E12345Q78' });
+
+    await service.correctPassenger('ord1', 'px1', { documentNumber: 'E12345078' }, OPS);
+
+    expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
+    // $queryRaw 的 mock 签名是无参的，call 元组取不到下标 → 先摊平成 unknown[][] 再读模板串
+    const rawCalls = mockPrisma.$queryRaw.mock.calls as unknown as unknown[][];
+    const lockSql = rawCalls
+      .map((c) => (Array.isArray(c[0]) ? c[0].join(' ') : String(c[0])))
+      .find((sql) => sql.includes('"Order"'));
+    expect(lockSql).toContain('FOR UPDATE');
+  });
+
+  // ── 证件号规范化（L1）────────────────────────────────────────────────────
+  it('只改大小写 → 证件号完全不落库（同一本护照，不该白写一次库、也不该进审计）', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ documentNumber: 'e12345678' });
+
+    const { audit } = await service.correctPassenger(
+      'ord1',
+      'px1',
+      { documentNumber: 'E12345678' },
+      OPS,
+    );
+
+    expect(mockPrisma.passenger.update.mock.calls[0][0].data).not.toHaveProperty('documentNumber');
+    expect(audit.changedFields).toEqual([]);
+  });
+
+  it('证件号带前后空格 + 小写 → 规范化后写入（trim + 大写）', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ documentNumber: 'E12345Q78' });
+
+    await service.correctPassenger('ord1', 'px1', { documentNumber: '  e12345078 ' }, OPS);
+
+    expect(mockPrisma.passenger.update.mock.calls[0][0].data.documentNumber).toBe('E12345078');
+  });
 });
 
 // ── swapPassenger · 代理换人（2026-09 起对代理开放，运营事后复核）──────────────
@@ -3884,7 +4109,10 @@ describe('swapPassenger · 代理换人降权口径', () => {
         systemInvoiced: false,
       },
     });
-    // 归属闸（事务外，走 prisma.order.findUnique）
+    // 归属闸（事务外，走 prisma.order.findUnique）。
+    // 先 mockReset：vi.clearAllMocks 只清调用记录，**不清 mockResolvedValueOnce 的排队值** ——
+    // 上游 describe 里排了没被消费掉的一次性返回值会漏到这里，把归属闸喂成「无 agentId 的单」。
+    mockPrisma.order.findUnique.mockReset();
     mockPrisma.order.findUnique.mockResolvedValue({
       id: 'ord1',
       userId: 'u1',
@@ -3961,6 +4189,112 @@ describe('swapPassenger · 代理换人降权口径', () => {
       ),
     ).rejects.toThrow('票已出，换人请联系运营');
     expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+
+  // ── 代理换人闸②：票务现势（H3）──────────────────────────────────────────
+  // 三个开票位是财务口径（发票开没开）。内部录单的单常年一张发票都没开，却早就在航司系统里
+  // 订好座、出好票了 —— 只看开票位，代理能在已出票的单上把名字换掉，值机当场卡死。
+  it.each(['TICKETED', 'COMPLETED'])(
+    '代理在 %s 的单上换人 → 400 指路运营（开票位全空也拦）',
+    async (status) => {
+      const service = new OrderService();
+      armAgentSwap();
+      armQueryRaw({
+        agentIds: ['agent-mine'],
+        lockedOrderRow: {
+          id: 'ord1',
+          adjustmentCny: 0,
+          adjustments: null,
+          status,
+          deletedAt: null,
+          visaStatus: null,
+          outboundInvoiced: false,
+          returnInvoiced: false,
+          systemInvoiced: false,
+        },
+      });
+
+      await expect(
+        service.swapPassenger(
+          'ord1',
+          'px1',
+          { fullName: 'NEW PERSON', documentNumber: 'NEW999' },
+          { userId: 'u-agent', role: 'AGENT', agentId: 'agent-mine' },
+        ),
+      ).rejects.toThrow('已订座/已出票，换人请联系运营');
+      expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+    },
+  );
+
+  it.each([
+    ['PNR', { pnr: 'ABC123', eticketNumber: null }],
+    ['电子票号', { pnr: null, eticketNumber: '999-1234567890' }],
+  ])('代理换一位已有 %s 的出行人 → 400（订单状态还在占座态也拦）', async (_label, ticketFields) => {
+    const service = new OrderService();
+    armAgentSwap();
+    mockPrisma.passenger.findUnique.mockResolvedValue({
+      id: 'px1',
+      orderId: 'ord1',
+      fullName: 'OLD/PERSON',
+      documentNumber: 'OLD111',
+      visaExempt: false,
+      passengerType: 'ADULT',
+      chineseName: null,
+      dateOfBirth: null,
+      passportExpiry: null,
+      ...ticketFields,
+    });
+
+    await expect(
+      service.swapPassenger(
+        'ord1',
+        'px1',
+        { fullName: 'NEW PERSON', documentNumber: 'NEW999' },
+        { userId: 'u-agent', role: 'AGENT', agentId: 'agent-mine' },
+      ),
+    ).rejects.toThrow('已订座/已出票，换人请联系运营');
+    expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  });
+
+  it('运营在已出票的单上换人 → 照旧放行（票务处置权在运营手里）', async () => {
+    const service = new OrderService();
+    armAgentSwap();
+    armQueryRaw({
+      agentIds: ['agent-mine'],
+      lockedOrderRow: {
+        id: 'ord1',
+        adjustmentCny: 0,
+        adjustments: null,
+        status: 'TICKETED',
+        deletedAt: null,
+        visaStatus: null,
+        outboundInvoiced: false,
+        returnInvoiced: false,
+        systemInvoiced: false,
+      },
+    });
+    mockPrisma.passenger.findUnique.mockResolvedValue({
+      id: 'px1',
+      orderId: 'ord1',
+      fullName: 'OLD/PERSON',
+      documentNumber: 'OLD111',
+      visaExempt: false,
+      passengerType: 'ADULT',
+      chineseName: null,
+      dateOfBirth: null,
+      passportExpiry: null,
+      pnr: 'ABC123',
+      eticketNumber: '999-1234567890',
+    });
+
+    await service.swapPassenger(
+      'ord1',
+      'px1',
+      { fullName: 'NEW PERSON', documentNumber: 'NEW999' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
   });
 
   it('代理换别人家的单 → 403（连事务都不进）', async () => {

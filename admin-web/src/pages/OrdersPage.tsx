@@ -290,6 +290,9 @@ const EXPORTABLE_STATUSES: ReadonlySet<OrderStatus> = new Set<OrderStatus>([
   'CHANGED',
 ]);
 const BATCH_RESCHEDULE_ORDER_LIMIT = 500;
+// 批量锁收款 / 批量调价没有各自的后端条数上限（不像上面几个批量端点有 Zod .max()），
+// 但单次请求带太多单仍会拖垮接口——前端统一按 500 条硬拦，超了提示缩小选择。
+const BULK_SELECTION_HARD_CAP = 500;
 
 // 列表「签证」列主显（签证岗反馈）：录单时的签证要求 order.visaStatus，而非履约任务进度。
 // NOT_NEEDED → 空白（不需要签证的单不占视觉）；其余映射为短徽标。履约进度改为次要小字附注。
@@ -1942,6 +1945,10 @@ export function OrdersPage() {
   // 与上面 applyBulkSettlementLock 同款式，多带一份跳过原因（结算价/收款有专属闸，服务端逐单判定）。
   const applyBulkPaymentsLock = async (locked: boolean) => {
     if (!tokens?.accessToken || selectedIds.size === 0) return;
+    if (selectedIds.size > BULK_SELECTION_HARD_CAP) {
+      window.alert(`一次最多处理 ${BULK_SELECTION_HARD_CAP} 单，请缩小选择`);
+      return;
+    }
     const confirmMessage = locked
       ? '锁定收款后这些单不能再手工录收款（对账台认款与线上到账不受影响），确定？'
       : '解锁后可继续手工录收款，操作会留审计，确定？';
@@ -10527,6 +10534,23 @@ type PassengerHistoryEntry = {
   snapshot?: SwapBeforeSnapshot;
   /** 仅 SWAP：换人费（旧记录/未收费为 null） */
   feeCny?: number | null;
+  /** 仅 CORRECTION：本次实际改动的字段名（后端 CORRECTABLE_IDENTITY_FIELDS 子集） */
+  changedFields?: string[];
+};
+
+/** CORRECTION 改动字段名 → 中文标签（与后端 CORRECTABLE_IDENTITY_FIELDS 一一对应） */
+const CORRECTION_FIELD_LABEL: Record<string, string> = {
+  fullName: '姓名',
+  lastName: '姓',
+  firstName: '名',
+  chineseName: '中文名',
+  documentNumber: '证件号',
+  dateOfBirth: '出生日期',
+  gender: '性别',
+  nationality: '国籍',
+  passportExpiry: '护照有效期',
+  passportIssueDate: '护照签发日',
+  passengerType: '出行人类型',
 };
 
 // 从审计 payload 安全取字段（旧记录可能缺 fullName/documentNumber，缺了就不显示，不造数据）
@@ -10564,6 +10588,13 @@ function readFeeCny(payload: unknown): number | null {
   return typeof v === 'number' ? v : null;
 }
 
+/** CORRECTION 审计 after.changedFields 的安全读取（旧记录可能没有，缺了就给空数组，不造数据） */
+function readChangedFields(payload: unknown): string[] {
+  if (!payload || typeof payload !== 'object') return [];
+  const v = (payload as Record<string, unknown>).changedFields;
+  return Array.isArray(v) ? v.filter((f): f is string => typeof f === 'string') : [];
+}
+
 /** 换人 / 改信息审计 → 乘客卡历史行；两种 action 混排，按时间倒序（最新在上）。 */
 function auditToPassengerHistory(logs: AuditLog[]): PassengerHistoryEntry[] {
   return logs
@@ -10584,6 +10615,7 @@ function auditToPassengerHistory(logs: AuditLog[]): PassengerHistoryEntry[] {
         afterDoc: after.doc,
         snapshot: isSwap ? readSwapSnapshot(l.before) : undefined,
         feeCny: isSwap ? readFeeCny(l.after) : undefined,
+        changedFields: isSwap ? undefined : readChangedFields(l.after),
       };
     })
     .sort((a, b) => (a.at < b.at ? 1 : a.at > b.at ? -1 : 0));
@@ -10639,8 +10671,20 @@ function SwapBeforeSnapshotDetails({ snapshot, feeCny }: { snapshot: SwapBeforeS
 }
 
 // 单个乘客卡下方的换人/改信息历史（时间 · 内容 · 经手；两种记录混排，最新在上）
-function PassengerSwapHistory({ entries }: { entries: PassengerHistoryEntry[] }) {
-  if (entries.length === 0) return null;
+function PassengerSwapHistory({
+  entries,
+  forbidden,
+}: {
+  entries: PassengerHistoryEntry[];
+  /** 换人/改信息两个审计接口都 403（AGENT 角色，审计接口仅内部岗可读）——提示原因，别留空面板 */
+  forbidden?: boolean;
+}) {
+  if (entries.length === 0) {
+    if (forbidden) {
+      return <p className="mt-2 text-[11px] text-slate-400">换人/改信息记录仅内部岗可见</p>;
+    }
+    return null;
+  }
   return (
     <details className="mt-2 rounded border border-slate-200 bg-slate-50/70 px-2 py-1 text-[11px]">
       <summary className="cursor-pointer select-none text-slate-500 hover:text-slate-700">
@@ -10652,9 +10696,24 @@ function PassengerSwapHistory({ entries }: { entries: PassengerHistoryEntry[] })
             <li key={e.id} className="border-l-2 border-slate-300 pl-2 text-slate-500">
               <div className="text-slate-400">{fmtSwapTime(e.at)}{e.actor ? ` · 经手 ${e.actor}` : ''}</div>
               <div>
-                改信息：<span className="font-medium text-slate-600">{e.beforeName ?? e.beforeDoc ?? '—'}</span>
-                <span className="mx-1">→</span>
-                <span className="font-medium text-slate-600">{e.afterName ?? e.afterDoc ?? '—'}</span>
+                {/* 姓名/证件号变了才有 X → Y 好看；只改了出生日期/性别这类字段时姓名证件号两侧都是 undefined，
+                    改用 changedFields 列出实际改了哪几项，别硬凑出「— → —」。 */}
+                {e.beforeName != null || e.afterName != null || e.beforeDoc != null || e.afterDoc != null ? (
+                  <>
+                    改信息：<span className="font-medium text-slate-600">{e.beforeName ?? e.beforeDoc ?? '—'}</span>
+                    <span className="mx-1">→</span>
+                    <span className="font-medium text-slate-600">{e.afterName ?? e.afterDoc ?? '—'}</span>
+                  </>
+                ) : (
+                  <>
+                    改信息：
+                    <span className="font-medium text-slate-600">
+                      {e.changedFields && e.changedFields.length > 0
+                        ? e.changedFields.map((f) => CORRECTION_FIELD_LABEL[f] ?? f).join('、')
+                        : '—'}
+                    </span>
+                  </>
+                )}
               </div>
             </li>
           ) : (
@@ -10893,11 +10952,22 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
   // listAuditLogs 的 action 过滤一次只认一个值，两种动作分两次拉，前端合并按时间倒序。
   const token = useAuth((s) => s.tokens)?.accessToken ?? '';
   const [swapHistory, setSwapHistory] = useState<PassengerHistoryEntry[]>([]);
+  // 两个 action 的审计查询都 403（AGENT 角色——审计接口仅内部岗可读）时置 true，面板换成提示文案。
+  const [swapHistoryForbidden, setSwapHistoryForbidden] = useState(false);
   const [historyReloadKey, setHistoryReloadKey] = useState(0);
+  // 改信息/改人保存后的审计写入是 fire-and-forget，可能比这次 onSaved 触发的刷新慢；
+  // 用一次延迟兜底重拉，避免刚保存完历史面板还是旧的。卸载时清掉，防止内存泄漏/setState 报警。
+  const historyReloadTimerRef = useRef<number | null>(null);
+  useEffect(() => {
+    return () => {
+      if (historyReloadTimerRef.current !== null) window.clearTimeout(historyReloadTimerRef.current);
+    };
+  }, []);
   useEffect(() => {
     if (!token) return;
     let cancelled = false;
-    Promise.all([
+    // 两个 action 分开查，各自成败独立：一个 403/失败不该拖累另一个已经查到的数据。
+    Promise.allSettled([
       api.listAuditLogs(token, {
         targetType: 'ORDER',
         targetId: order.id,
@@ -10910,13 +10980,21 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
         action: 'CORRECT_ORDER_PASSENGER',
         pageSize: 100,
       }),
-    ])
-      .then(([swapRes, correctionRes]) => {
-        if (!cancelled) setSwapHistory(auditToPassengerHistory([...swapRes.logs, ...correctionRes.logs]));
-      })
-      .catch(() => {
-        /* 历史读取失败不阻断详情展示 */
-      });
+    ]).then(([swapRes, correctionRes]) => {
+      if (cancelled) return;
+      const logs = [
+        ...(swapRes.status === 'fulfilled' ? swapRes.value.logs : []),
+        ...(correctionRes.status === 'fulfilled' ? correctionRes.value.logs : []),
+      ];
+      setSwapHistory(auditToPassengerHistory(logs));
+      const isForbidden =
+        swapRes.status === 'rejected' &&
+        correctionRes.status === 'rejected' &&
+        [swapRes, correctionRes].some(
+          (r) => r.status === 'rejected' && r.reason instanceof ApiError && r.reason.status === 403,
+        );
+      setSwapHistoryForbidden(isForbidden);
+    });
     return () => {
       cancelled = true;
     };
@@ -10982,7 +11060,12 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                   onSaved={(updated) => {
                     setEditingId(null);
                     onOrderUpdated?.(updated);
-                    setHistoryReloadKey((k) => k + 1); // 改信息/换人后重拉历史
+                    setHistoryReloadKey((k) => k + 1); // 改信息/换人后立即重拉一次历史
+                    if (historyReloadTimerRef.current !== null) window.clearTimeout(historyReloadTimerRef.current);
+                    historyReloadTimerRef.current = window.setTimeout(() => {
+                      historyReloadTimerRef.current = null;
+                      setHistoryReloadKey((k) => k + 1); // 审计写入是异步的，1.5s 后兜底再拉一次
+                    }, 1500);
                   }}
                 />
               </li>
@@ -11121,7 +11204,10 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                   </button>
                 )}
               </div>
-              <PassengerSwapHistory entries={swapHistory.filter((h) => h.passengerId === p.id)} />
+              <PassengerSwapHistory
+                entries={swapHistory.filter((h) => h.passengerId === p.id)}
+                forbidden={swapHistoryForbidden}
+              />
             </li>
           );
         })}
@@ -11554,23 +11640,21 @@ function PassengerEditForm({
 
     if (mode === 'CORRECTION') {
       // 改信息 = 纠错：证件号改动超过阈值就不算「纠错」，前端提前拦，文案与后端 400 一致。
+      // 大小写不敏感比较，与后端编辑距离口径一致（如 "e12345" 改成 "E12345" 不该算 5 个字符的改动）。
       const newDoc = documentNumber.trim();
       const oldDoc = (passenger.documentNumber ?? '').trim();
-      if (newDoc && oldDoc && levenshteinDistance(newDoc, oldDoc) > CORRECTION_DOC_DIFF_LIMIT) {
+      if (newDoc && oldDoc && levenshteinDistance(newDoc.toUpperCase(), oldDoc.toUpperCase()) > CORRECTION_DOC_DIFF_LIMIT) {
         setErr('证件号改动超过 2 个字符，请使用「换人」');
         return;
       }
-      highRiskConfirmRef.current = true;
-      if (!(await confirm({
-        title: '确认保存出行人信息修正？',
-        body: '不会清除护照照片和签证信息。',
-      }))) {
-        highRiskConfirmRef.current = false;
-        return;
-      }
-      // 只发生变化的字段（对照当前乘客原值 diff），服务端也不会清空任何未提交的字段。
+
+      // 逐字段 diff：改信息通道服务端把 undefined 当「不改」处理，清空字段没有对应语义——
+      // 「原来有值、这次填空」一律拦下改用「换人」，而不是把空字符串当作变化悄悄发过去。
+      // 比较口径统一：字符串 trim 后比，日期切片到 YYYY-MM-DD 后比，'' 与 null/undefined 视为相等。
       const oldDobFmt = passenger.dateOfBirth?.slice(0, 10) ?? '';
       const oldExpiryFmt = passenger.passportExpiry?.slice(0, 10) ?? '';
+      const dobTrim = dob.trim();
+      let hasCleared = false;
       const body: {
         mode: 'CORRECTION';
         lastName?: string;
@@ -11584,16 +11668,56 @@ function PassengerEditForm({
         passportExpiry?: string;
         passportIssueDate?: string;
       } = { mode: 'CORRECTION' };
-      if (lastName.trim() !== (passenger.lastName ?? '').trim()) body.lastName = lastName.trim();
-      if (firstName.trim() !== (passenger.firstName ?? '').trim()) body.firstName = firstName.trim();
-      if (fullName.trim() !== (passenger.fullName ?? '').trim()) body.fullName = fullName.trim();
-      if (chineseName.trim() !== (passenger.chineseName ?? '').trim()) body.chineseName = chineseName.trim();
-      if (newDoc !== oldDoc) body.documentNumber = newDoc;
-      if ((dobValue ?? '') !== oldDobFmt) body.dateOfBirth = dobValue;
-      if (gender !== (passenger.gender ?? '')) body.gender = gender || undefined;
-      if (nationality.trim() !== (passenger.nationality ?? '').trim()) body.nationality = nationality.trim();
-      if (expiryValue !== oldExpiryFmt) body.passportExpiry = expiryValue || undefined;
+
+      const diffText = (oldRaw: string | null | undefined, newRaw: string, apply: (v: string) => void) => {
+        const oldValue = (oldRaw ?? '').trim();
+        const newValue = newRaw.trim();
+        if (oldValue === newValue) return;
+        if (oldValue !== '' && newValue === '') { hasCleared = true; return; }
+        apply(newValue);
+      };
+      diffText(passenger.lastName, lastName, (v) => { body.lastName = v; });
+      diffText(passenger.firstName, firstName, (v) => { body.firstName = v; });
+      diffText(passenger.fullName, fullName, (v) => { body.fullName = v; });
+      diffText(passenger.chineseName, chineseName, (v) => { body.chineseName = v; });
+      diffText(passenger.documentNumber, documentNumber, (v) => { body.documentNumber = v; });
+      diffText(passenger.nationality, nationality, (v) => { body.nationality = v; });
+
+      const oldGender = passenger.gender ?? '';
+      if (oldGender !== gender) {
+        if (oldGender !== '' && gender === '') hasCleared = true;
+        else body.gender = gender || undefined;
+      }
+
+      if (oldDobFmt !== dobTrim) {
+        if (oldDobFmt !== '' && dobTrim === '') hasCleared = true;
+        else body.dateOfBirth = dobValue;
+      }
+
+      if (oldExpiryFmt !== expiryValue) {
+        if (oldExpiryFmt !== '' && expiryValue === '') hasCleared = true;
+        else body.passportExpiry = expiryValue || undefined;
+      }
+
       if (passportIssueDate) body.passportIssueDate = passportIssueDate;
+
+      if (hasCleared) {
+        setErr('改信息不支持清空字段，留空表示不改；要清除请用「换人」');
+        return;
+      }
+      if (!Object.keys(body).some((k) => k !== 'mode')) {
+        setErr('没有改动');
+        return;
+      }
+
+      highRiskConfirmRef.current = true;
+      if (!(await confirm({
+        title: '确认保存出行人信息修正？',
+        body: '不会清除护照照片和签证信息。',
+      }))) {
+        highRiskConfirmRef.current = false;
+        return;
+      }
 
       setSubmitting(true);
       try {
@@ -11681,12 +11805,13 @@ function PassengerEditForm({
     requiresPassportExpiry &&
     documentNumber.trim() !== '' &&
     documentNumber.trim() !== (passenger.documentNumber ?? '');
-  // 改信息模式：证件号改动幅度实时提示（与提交时的校验同口径），超限则禁用保存。
+  // 改信息模式：证件号改动幅度实时提示（与提交时的校验同口径，大小写不敏感），超限则禁用保存。
   const correctionDocOverLimit =
     mode === 'CORRECTION' &&
     documentNumber.trim() !== '' &&
     (passenger.documentNumber ?? '').trim() !== '' &&
-    levenshteinDistance(documentNumber.trim(), (passenger.documentNumber ?? '').trim()) > CORRECTION_DOC_DIFF_LIMIT;
+    levenshteinDistance(documentNumber.trim().toUpperCase(), (passenger.documentNumber ?? '').trim().toUpperCase()) >
+      CORRECTION_DOC_DIFF_LIMIT;
   const ocring = ocrPct !== null && ocrPct < 100;
   const ocrEngineLabel =
     ocrEngine === 'ai' ? 'AI 识别' : ocrEngine === 'local' ? '本地识别' : ocrEngine === 'ai-fallback' ? 'AI 失败·本地兜底' : '';
@@ -17105,6 +17230,11 @@ function BatchPayModal({
 // 与事后调价（PriceAdjustmentSection）同语义：追加一笔差额行，计入订单应收/尾款，全程审计留痕；
 // 这里多了 PER_PAX 批量模式（按占座人数摊，婴儿不计），一次性给一批订单挂同样的调价理由。
 // 已锁结算价 / 已取消的单由服务端逐单判定跳过，不绕过闸门——结果面板列出跳过原因。
+// 与后端 priceAdjustmentAmountSchema / batchPriceAdjustmentBodySchema 同一份口径
+// （PRICE_ADJUSTMENT_CAP_CNY=100000、reasonText.max(200)）——前端先拦，别等 400 才发现。
+const PRICE_ADJUSTMENT_AMOUNT_LIMIT = 100_000;
+const PRICE_ADJUSTMENT_REASON_TEXT_MAX_LEN = 200;
+
 function BulkPriceAdjustModal({
   orderIds,
   onClose,
@@ -17132,8 +17262,20 @@ function BulkPriceAdjustModal({
   async function submit(): Promise<void> {
     if (!token || submitting) return;
     setErr(null);
+    if (orderIds.length > BULK_SELECTION_HARD_CAP) {
+      setErr(`一次最多处理 ${BULK_SELECTION_HARD_CAP} 单，请缩小选择`);
+      return;
+    }
     if (amount === null || !Number.isInteger(amount) || amount === 0) {
       setErr('请输入非 0 的整数金额（正=补收 / 负=优惠）');
+      return;
+    }
+    if (Math.abs(amount) > PRICE_ADJUSTMENT_AMOUNT_LIMIT) {
+      setErr(`单次调整金额不能超过 ¥${PRICE_ADJUSTMENT_AMOUNT_LIMIT.toLocaleString()}`);
+      return;
+    }
+    if (reasonText.length > PRICE_ADJUSTMENT_REASON_TEXT_MAX_LEN) {
+      setErr(`调整原因说明不能超过 ${PRICE_ADJUSTMENT_REASON_TEXT_MAX_LEN} 字`);
       return;
     }
     if (reasonCode === 'OTHER' && !reasonText.trim()) {
@@ -17252,10 +17394,13 @@ function BulkPriceAdjustModal({
                   className="input mt-0.5 w-full"
                   value={reasonText}
                   onChange={(e) => setReasonText(e.target.value)}
-                  maxLength={500}
+                  maxLength={PRICE_ADJUSTMENT_REASON_TEXT_MAX_LEN}
                   disabled={submitting}
                   placeholder="选择「其它」时必填"
                 />
+                <span className="mt-0.5 block text-right text-[10px] text-ink-soft">
+                  {reasonText.length}/{PRICE_ADJUSTMENT_REASON_TEXT_MAX_LEN}
+                </span>
               </label>
             )}
             <p className="text-xs text-ink-soft">例：选了指定酒店但没收指定费的单，按人计 +40。</p>

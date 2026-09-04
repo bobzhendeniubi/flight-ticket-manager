@@ -322,6 +322,79 @@ describe('OrderService.batchAddPriceAdjustment', () => {
     expect(mockPrisma.orderItem.create).not.toHaveBeenCalled();
   });
 
+  // ── 按人口径的单价还原位（M4）────────────────────────────────────────────
+  // 落库的是乘出来的合计。事后只看「+¥80」，财务与客服都答不上「每人多少 × 几个人」——
+  // 单价必须同时写进调整行描述（客人在详情页看得到）与批量回执（路由据此写审计）。
+  it('PER_PAX：调整行描述带「每人 ¥X × N 人」，回执带 unitAmountCny / seatPax', async () => {
+    const tx = txFor({
+      o1: {
+        orderNumber: 'ORD-001',
+        passengers: [PassengerType.ADULT, PassengerType.CHILD, PassengerType.INFANT],
+      },
+    });
+    runInTx(tx);
+
+    const res = await service.batchAddPriceAdjustment(['o1'], feeInput, OPS);
+
+    expect(mockPrisma.orderItem.create.mock.calls[0][0].data.description).toBe(
+      '价格调整：补收杂费（+¥80）（每人 ¥40 × 2 人）',
+    );
+    expect(res.results[0]).toMatchObject({ unitAmountCny: 40, seatPax: 2 });
+  });
+
+  it('PER_PAX 负数（按人优惠）：描述里的单价取绝对值，方向由合计的减号表达', async () => {
+    const tx = txFor({
+      o1: { orderNumber: 'ORD-001', passengers: [PassengerType.ADULT, PassengerType.ADULT] },
+    });
+    runInTx(tx);
+
+    await service.batchAddPriceAdjustment(
+      ['o1'],
+      { mode: 'PER_PAX', amountCny: -200, reasonCode: 'DISCOUNT', reasonText: '老客回馈' },
+      OPS,
+    );
+
+    expect(mockPrisma.orderItem.create.mock.calls[0][0].data.description).toBe(
+      '价格调整：优惠（−¥400）（每人 ¥200 × 2 人）：老客回馈',
+    );
+  });
+
+  it('PER_ORDER：描述一字不变（整单口径本来就没有「每人」），回执两位还原位为 null', async () => {
+    const tx = txFor({
+      o1: { orderNumber: 'ORD-001', passengers: [PassengerType.ADULT, PassengerType.ADULT] },
+    });
+    runInTx(tx);
+
+    const res = await service.batchAddPriceAdjustment(
+      ['o1'],
+      { ...feeInput, mode: 'PER_ORDER' },
+      OPS,
+    );
+
+    expect(mockPrisma.orderItem.create.mock.calls[0][0].data.description).toBe(
+      '价格调整：补收杂费（+¥40）',
+    );
+    expect(res.results[0]).toMatchObject({ unitAmountCny: null, seatPax: null });
+  });
+
+  it('跳过的单也带回单价还原位：顶破上限时能看出「每人多少 × 几个人」才顶破的', async () => {
+    const tx = txFor({
+      o1: {
+        orderNumber: 'ORD-001',
+        passengers: Array.from({ length: 4 }, () => PassengerType.ADULT),
+      },
+    });
+    runInTx(tx);
+
+    const res = await service.batchAddPriceAdjustment(
+      ['o1'],
+      { ...feeInput, amountCny: 30_000 },
+      OPS,
+    );
+
+    expect(res.results[0]).toMatchObject({ ok: false, unitAmountCny: 30_000, seatPax: 4 });
+  });
+
   it.each([UserRole.AGENT, UserRole.CUSTOMER])('role=%s 直接拒绝，且不开事务', async (role) => {
     await expect(
       service.batchAddPriceAdjustment(['o1'], feeInput, { userId: 'u1', role }),

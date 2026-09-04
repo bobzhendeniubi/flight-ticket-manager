@@ -1852,6 +1852,10 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
             passengerName: null,
             itemId: r.itemId,
             mode: body.mode,
+            // 按人口径的还原位：每人多少 × 几个人（整单口径为 null）。审计里只留合计金额的话，
+            // 事后没人能回答「这 ¥1400 是每人 700 两个人，还是每人 350 四个人」。
+            unitAmountCny: r.unitAmountCny,
+            seatPax: r.seatPax,
             batch: true,
           },
           severity: 'WARNING',
@@ -1865,6 +1869,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           orderNumber: r.orderNumber,
           ok: r.ok,
           appliedAmountCny: r.appliedAmountCny,
+          // 按人口径的两个还原位一并回给前端（整单口径为 null，回执照旧只显示合计）。
+          unitAmountCny: r.unitAmountCny,
+          seatPax: r.seatPax,
           ...(r.reason ? { reason: r.reason } : {}),
         })),
       };
@@ -2279,7 +2286,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   body: { mode:'CORRECTION', lastName?, firstName?, fullName?, chineseName?, documentNumber?,
   //           dateOfBirth?, gender?, nationality?, passportExpiry?, passportIssueDate? }（至少一项）
   //   同一个人录错了字 → 只改传进来的字段，**不清空任何资料**（护照图/签发地/签证号/票号全保留）。
-  //   证件号改动 > 2 个字符、或已开票的单改姓名/证件号 → 400 指路换人通道。
+  //   闸（service 内，全部在同一个事务 + 订单行锁下）：订单状态（代理按补录口径 409、运营按占座
+  //   口径 400）→ 证件号改动 > 2 个字符 → 证件号与姓名同时大改（换人伪装成订正）→ 代理改
+  //   已订座/已出票者的姓名或证件号 → 已开票的单改姓名/证件号 → 同单/同班次证件号查重。
   //   与②的区别只能由调用方显式声明：两者的请求体长得一模一样，靠字段猜必然猜错
   //   （护照图被误清的根因就在这里）。
   app.patch('/:id/passengers/:passengerId', { preHandler: [app.authenticate] }, async (req) => {

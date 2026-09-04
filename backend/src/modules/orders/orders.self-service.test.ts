@@ -458,6 +458,42 @@ describe('correctPassengerBodySchema', () => {
       correctPassengerBodySchema.safeParse({ mode: 'CORRECTION', lastName: 'ZHANG/SAN' }).success,
     ).toBe(false);
   });
+
+  // ── 字段约束必须与建单 / 补录同款（M5）────────────────────────────────────
+  // 订正写的是同一个 Passenger 列。约束比正门松，就等于开了一扇「正门录不进、订正能录进」
+  // 的窗：脏数据只会从这条通道进库。
+  it('证件号上限 40（与建单 / 补录同款），41 位拒收', () => {
+    const ok = correctPassengerBodySchema.safeParse({
+      mode: 'CORRECTION',
+      documentNumber: 'E'.repeat(40),
+    });
+    expect(ok.success).toBe(true);
+    expect(
+      correctPassengerBodySchema.safeParse({
+        mode: 'CORRECTION',
+        documentNumber: 'E'.repeat(41),
+      }).success,
+    ).toBe(false);
+  });
+
+  it('证件号下限 3（与建单 / 补录同款）', () => {
+    expect(
+      correctPassengerBodySchema.safeParse({ mode: 'CORRECTION', documentNumber: 'E1' }).success,
+    ).toBe(false);
+  });
+
+  it('国籍只认两位 ISO 码，且统一收成大写', () => {
+    const parsed = correctPassengerBodySchema.parse({ mode: 'CORRECTION', nationality: 'cn' });
+    expect(parsed.nationality).toBe('CN');
+    // 三位码 / 单字符都拒 —— 这一列只存两位码，写进去导出与送签层都查不到。
+    // （「中国」这类两字中文在 JS 里长度也是 2，length(2) 拦不住 —— 与补录 schema 同一个
+    //   历史口径，两条通道要放严得一起放严，这里不单独收紧免得两处漂移。）
+    for (const bad of ['CHN', 'C']) {
+      expect(
+        correctPassengerBodySchema.safeParse({ mode: 'CORRECTION', nationality: bad }).success,
+      ).toBe(false);
+    }
+  });
 });
 
 // ── 2. requestChange ───────────────────────────────────────────────────

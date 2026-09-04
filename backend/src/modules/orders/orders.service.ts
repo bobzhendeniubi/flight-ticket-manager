@@ -555,6 +555,34 @@ const CORRECTABLE_IDENTITY_FIELDS = [
   'passengerType',
 ] as const;
 
+/**
+ * 证件号规范化（订正通道口径）：trim + 大写。
+ *
+ * 护照号本来就是大写字母 + 数字，「e12345678」和「E12345678」是同一本护照。不规范化的话，
+ * 一次纯大小写的「订正」会白写一次库、在审计里留一条根本没发生的变更，还会让同单/同班次
+ * 查重按字面比对而漏判。建单入口不做这一层（历史存量口径），故只在订正写入前收口。
+ * 导出供单测复用。
+ */
+export function normalizeDocumentNumber(value: string | null | undefined): string {
+  return (value ?? '').trim().toUpperCase();
+}
+
+/**
+ * 姓名规范化（订正通道「证件号 + 姓名同改」闸的比对口径）：
+ * 有 fullName 用 fullName，没有就用 `姓/名` 拼，统一 trim + 大写 + 折叠空白。
+ * 两侧必须用同一种拼法，否则 `ZHANG/SAN` 与 `ZHANG SAN` 会被当成两个人。
+ * 导出供单测复用。
+ */
+export function normalizeCorrectionName(
+  fullName: string | null | undefined,
+  lastName: string | null | undefined,
+  firstName: string | null | undefined,
+): string {
+  const full = (fullName ?? '').trim();
+  const composed = full !== '' ? full : `${(lastName ?? '').trim()}/${(firstName ?? '').trim()}`;
+  return composed.replace(/\s+/g, ' ').trim().toUpperCase();
+}
+
 export interface OrderRequester {
   userId: string;
   role: UserRole;
@@ -844,6 +872,12 @@ export function buildPriceAdjustmentItem(adj: {
    */
   reasonCode: PriceAdjustmentReasonDisplay;
   reasonText?: string;
+  /**
+   * 单价口径注记（批量按人调价专用，如「每人 ¥700 × 2 人」）。
+   * 落库金额是乘出来的合计，光看「+¥1400」事后没人还原得出「每人多少 × 几个人」——
+   * 财务对账、客人问「这笔怎么来的」都要靠这一句。单单调价不传 → 描述一字不变。
+   */
+  unitNote?: string;
 }): {
   kind: OrderItemKind;
   description: string;
@@ -857,9 +891,11 @@ export function buildPriceAdjustmentItem(adj: {
   const reasonText = adj.reasonText?.trim() || undefined;
   const signed = `${adj.amountCny > 0 ? '+' : '−'}¥${Math.abs(adj.amountCny)}`;
   const suffix = reasonText ? `：${reasonText}` : '';
+  // 单价注记紧跟合计金额，说明这笔钱是怎么乘出来的；不传即整单口径，描述与此前逐字一致。
+  const unitNote = adj.unitNote?.trim() ? `（${adj.unitNote.trim()}）` : '';
   return {
     kind: adj.amountCny > 0 ? OrderItemKind.FEE : OrderItemKind.DISCOUNT,
-    description: `价格调整：${label}（${signed}）${suffix}`,
+    description: `价格调整：${label}（${signed}）${unitNote}${suffix}`,
     quantity: 1,
     unitPrice: adj.amountCny,
     amount: adj.amountCny,
@@ -6478,6 +6514,10 @@ export class OrderService {
       ok: boolean;
       reason?: string;
       appliedAmountCny: number | null;
+      /** PER_PAX 时的每人金额（PER_ORDER 为 null）——审计与回执要能还原「怎么乘出来的」。 */
+      unitAmountCny: number | null;
+      /** PER_PAX 时的占座人数（PER_ORDER 为 null）。 */
+      seatPax: number | null;
       itemId?: string;
       before?: { subtotal: string; total: string };
       after?: { subtotal: string; total: string };
@@ -6496,6 +6536,8 @@ export class OrderService {
           ok: boolean;
           reason?: string;
           appliedAmountCny: number | null;
+          unitAmountCny: number | null;
+          seatPax: number | null;
           itemId?: string;
           before?: { subtotal: string; total: string };
           after?: { subtotal: string; total: string };
@@ -6507,12 +6549,23 @@ export class OrderService {
           >`SELECT id, "orderNumber" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
           const found = rows[0];
           if (!found) {
-            acc.push({ orderId, orderNumber: null, ok: false, reason: '订单不存在', appliedAmountCny: null });
+            acc.push({
+              orderId,
+              orderNumber: null,
+              ok: false,
+              reason: '订单不存在',
+              appliedAmountCny: null,
+              unitAmountCny: null,
+              seatPax: null,
+            });
             continue;
           }
           const orderNumber = found.orderNumber;
 
           let applied = amountCny;
+          // 按人口径的两个还原位：每人多少 × 几个人。整单口径恒 null（这笔本来就没有「每人」）。
+          let unitAmountCny: number | null = null;
+          let paxCount: number | null = null;
           if (mode === 'PER_PAX') {
             const passengers = await tx.passenger.findMany({
               where: { orderId },
@@ -6526,10 +6579,14 @@ export class OrderService {
                 ok: false,
                 reason: '本单没有占座客人（婴儿不占座），按人调价无从计算',
                 appliedAmountCny: null,
+                unitAmountCny: amountCny,
+                seatPax: 0,
               });
               continue;
             }
             applied = amountCny * seatPax;
+            unitAmountCny = amountCny;
+            paxCount = seatPax;
             // 乘出来的钱可能顶破单笔调整上限 —— 那是单单入口会当场拒绝的金额，批量也不该悄悄写进去。
             if (Math.abs(applied) > PRICE_ADJUSTMENT_CAP_CNY) {
               acc.push({
@@ -6538,6 +6595,8 @@ export class OrderService {
                 ok: false,
                 reason: `按 ${seatPax} 人合计 ¥${applied}，超出单笔调整上限（±${PRICE_ADJUSTMENT_CAP_CNY}）`,
                 appliedAmountCny: null,
+                unitAmountCny: amountCny,
+                seatPax,
               });
               continue;
             }
@@ -6549,12 +6608,18 @@ export class OrderService {
               orderId,
               { amountCny: applied, reasonCode, reasonText },
               actor,
+              // 按人口径把单价写进行描述：落库的是合计，事后光看「+¥1400」还原不出每人多少。
+              paxCount != null && unitAmountCny != null
+                ? { unitNote: `每人 ¥${Math.abs(unitAmountCny)} × ${paxCount} 人` }
+                : undefined,
             );
             acc.push({
               orderId,
               orderNumber: scratch.orderNumber,
               ok: true,
               appliedAmountCny: applied,
+              unitAmountCny,
+              seatPax: paxCount,
               itemId: scratch.itemId,
               before: { subtotal: scratch.beforeSubtotal, total: scratch.beforeTotal },
               after: { subtotal: scratch.afterSubtotal, total: scratch.afterTotal },
@@ -6573,6 +6638,8 @@ export class OrderService {
                 ok: false,
                 reason: err.message,
                 appliedAmountCny: null,
+                unitAmountCny,
+                seatPax: paxCount,
               });
               continue;
             }
@@ -7595,12 +7662,17 @@ export class OrderService {
    * 与建单闸同口径：只看本单各航段班次上「占座中」的订单，且排除本单自己。
    * 命中即抛 DuplicatePassengerError（同一个错误类型，前端已有的 DUPLICATE_PASSENGER
    * 处理逻辑照旧接得住）。本单没有任何有效航段（纯酒店/接送）→ 无从比对，直接放行。
+   *
+   * client：调用方在事务里时把 tx 传进来 —— 订正通道整段读-判-写都在同一把 Order 行锁下，
+   * 查重要是走全局 prisma 就跑到事务外面去了，锁白加（并发两单能同时判过）。
+   * 缺省全局单例，补录通道（不在事务里）行为一字未变。
    */
   private async assertBackfilledDocumentNotDuplicated(
     orderId: string,
     documentNumber: string,
+    client: Prisma.TransactionClient = prisma,
   ): Promise<void> {
-    const legs = await prisma.orderItem.findMany({
+    const legs = await client.orderItem.findMany({
       where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
       select: { flightScheduleId: true },
     });
@@ -7609,7 +7681,7 @@ export class OrderService {
     ];
     if (scheduleIds.length === 0) return;
 
-    const conflicts = await prisma.passenger.findMany({
+    const conflicts = await client.passenger.findMany({
       where: {
         documentNumber,
         orderId: { not: orderId },
@@ -9394,6 +9466,19 @@ export class OrderService {
         throw new BadRequestError('票已出，换人请联系运营');
       }
 
+      // ── 代理换人闸②：已订座 / 已出票的单不给代理换 ─────────────────────────
+      // 三个开票位是**财务**口径（发票开没开），跟票务口径（座位订没订、票号出没出）是两码事：
+      // 内部录单的单常年一张发票都没开，却早就在航司系统里订好座、出好票了 —— 只看开票位的话，
+      // 代理能在已出票的单上直接把名字换掉，航司那边的票面身份对不上，值机当场卡死。
+      // 所以再看两处票务现势：订单状态已出票/已完成，或该乘客身上已经有 PNR / 电子票号。
+      // 运营不受此闸（走换人并勾选「重置开票」照旧可做，退改签由票务另行处理）。
+      if (
+        !isInternalActor &&
+        (order.status === OrderStatus.TICKETED || order.status === OrderStatus.COMPLETED)
+      ) {
+        throw new BadRequestError('已订座/已出票，换人请联系运营');
+      }
+
       // ── 有效订单守卫（HIGH 修复）：与改期 / 升舱同款双闸 ────────────────────
       // 换人不只是改个名字：它会通过 feeCny 往 adjustmentCny 里加收换人费，还会重置开票位与签证任务。
       // 在已取消 / 已退款 / 超时 / 回收站单上换人 → 这些死单会凭空长出一笔「欠款」并重新进应收报表，
@@ -9420,6 +9505,9 @@ export class OrderService {
           documentNumber: true,
           visaExempt: true,
           passengerType: true,
+          // pnr / eticketNumber：代理换人闸②要读（票务现势，见上方开票位那段口径说明）。
+          pnr: true,
+          eticketNumber: true,
           // 以下三项只服务「换人前现场快照」（审计 before.snapshot），不参与任何业务判定。
           chineseName: true,
           dateOfBirth: true,
@@ -9428,6 +9516,13 @@ export class OrderService {
       });
       if (!passenger || passenger.orderId !== orderId) {
         throw new NotFoundError('出行人不存在或不属于该订单');
+      }
+      // 乘客级票务现势：这一位已经订上座 / 出了票 → 代理换不了（口径同上方状态闸）。
+      if (
+        !isInternalActor &&
+        ((passenger.pnr ?? '').trim() !== '' || (passenger.eticketNumber ?? '').trim() !== '')
+      ) {
+        throw new BadRequestError('已订座/已出票，换人请联系运营');
       }
       const beforeIdentity = {
         fullName: passenger.fullName,
@@ -10088,13 +10183,20 @@ export class OrderService {
    * 实测里九月上旬十几条「换人」记录，绝大多数其实是护照 OCR 把一个字符读错后的订正
    * （Q 被读成 0 / 5），走换人通道把护照图全清了 —— 本方法就是为堵这个洞而设。
    *
-   * 三道闸（依序）：
+   * 六道闸（依序，全部在同一个事务 + Order 行锁 FOR UPDATE 之下）：
    *   ① 归属：ADMIN/STAFF 全量；代理只能订正自家（含下级）单 → 否则 403。
-   *   ② 证件号改动幅度：与原值的编辑距离 > 2 就不是「录错字」而是换了个人 → 400 指路换人。
-   *      原值为空（占位单还没录证件）时不比距离 —— 那是补录，走的是「从空补成真值」的口径，
-   *      与补录通道同样只跑一次同班次反向查重。
-   *   ③ 已开票的单改姓名/证件号 → 400：票面身份已经发出去了，必须走换人并显式重置开票位。
-   *      中文姓名不在此列（护照扩展字段，不上票面）。
+   *   ② 订单状态：代理按补录口径（PENDING_PAYMENT/PAID/PROCESSING，否则 409 ORDER_LOCKED）、
+   *      运营按换人口径（占座态，否则 400）。死单/回收站单上改身份没有任何正当场景。
+   *   ③ 证件号改动幅度：与原值（trim + 大写后）的编辑距离 > 2 就不是「录错字」而是换了个人
+   *      → 400 指路换人。原值为空（占位单还没录证件）时不比距离 —— 那是补录，走的是
+   *      「从空补成真值」的口径，与补录通道同样只跑一次同班次反向查重。
+   *   ④ 证件号与姓名同时改动（姓名编辑距离 > 2）→ 400：连号护照 + 全新姓名是换人伪装成订正。
+   *      只改姓名不动证件号照旧放行（同一本护照就是同一个人）。
+   *   ⑤ 代理改已订座/已出票的人的姓名/证件号 → 400：票面身份已进航司系统，值机会对不上。
+   *   ⑥ 已开票的单改姓名/证件号 → 400：票面身份已经发出去了，必须走换人并显式重置开票位。
+   *      中文姓名不在⑤⑥之列（护照扩展字段，不上票面）。
+   * 查重两道：同一订单内不许出现两位相同证件号的出行人；订正后的护照也不许在同班次的
+   * 其他有效订单里已经占着座（与补录通道同一道反向查重，同事务内跑）。
    * 生日改动仍按建单同款权威口径重派生 passengerType（与换人 1b2 同一段逻辑），
    * 否则把生日从 2019 改成 2009 之后，乘客还挂着「婴儿」类型进出票与分房。
    */
@@ -10124,149 +10226,238 @@ export class OrderService {
       changedFields: string[];
     };
   }> {
-    const order = await prisma.order.findUnique({
-      where: { id: orderId },
-      select: {
-        id: true,
-        orderNumber: true,
-        userId: true,
-        agentId: true,
-        deletedAt: true,
-        outboundInvoiced: true,
-        returnInvoiced: true,
-        systemInvoiced: true,
-      },
-    });
-    if (!order) throw new NotFoundError('订单不存在');
-    // 闸①：归属（ADMIN/STAFF 直接放行；代理限自己 + 下级；客户到不了这条路径）
-    await this.assertCanView(order, requester);
-    if (order.deletedAt) {
-      throw new BadRequestError('订单在回收站（已软删），不可订正出行人资料；如需操作请先恢复');
-    }
-
-    const passenger = await prisma.passenger.findUnique({
-      where: { id: passengerId },
-      select: {
-        id: true,
-        orderId: true,
-        fullName: true,
-        lastName: true,
-        firstName: true,
-        chineseName: true,
-        documentNumber: true,
-        dateOfBirth: true,
-        gender: true,
-        nationality: true,
-        passengerType: true,
-        passportExpiry: true,
-        passportIssueDate: true,
-      },
-    });
-    if (!passenger || passenger.orderId !== orderId) {
-      throw new NotFoundError('出行人不存在或不属于该订单');
-    }
-
-    // ── 闸②：证件号改动幅度 ────────────────────────────────────────────────
-    const oldDocument = (passenger.documentNumber ?? '').trim();
-    const nextDocument = input.documentNumber?.trim();
-    const documentChanging =
-      nextDocument !== undefined && nextDocument !== '' && nextDocument !== oldDocument;
-    // 原值为空（占位单还没录证件）不比距离 —— 那是「从空补成真值」的补录，不是订正，
-    // 比距离必然超阈值，会给出「请使用换人」这种误导性指路。
-    if (documentChanging && oldDocument !== '') {
-      // 大小写不敏感（同一本护照，录成小写不算改动）；只关心是否超阈值，故给早停上限。
-      const distance = levenshteinDistance(
-        oldDocument.toUpperCase(),
-        nextDocument.toUpperCase(),
-        TYPO_MAX_EDIT_DISTANCE,
-      );
-      if (distance > TYPO_MAX_EDIT_DISTANCE) {
-        throw new BadRequestError(`证件号改动超过 ${TYPO_MAX_EDIT_DISTANCE} 个字符，请使用「换人」`);
+    // 整段读-判-写包在一个事务里，开头对 Order 行 FOR UPDATE（与换人 / 改自备签同一把锁）：
+    // 订正要按「订单状态 + 开票位 + 同单/同班次证件号」判完再写，裸读会与并发出票流转、
+    // 并发换人/订正 TOCTOU —— 两个请求各自读到「没人用这本护照」，然后各写各的。
+    const scratch = await prisma.$transaction(async (tx) => {
+      const orderRows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          orderNumber: string;
+          userId: string | null;
+          agentId: string | null;
+          status: OrderStatus;
+          deletedAt: Date | null;
+          outboundInvoiced: boolean | null;
+          returnInvoiced: boolean | null;
+          systemInvoiced: boolean | null;
+        }>
+      >`SELECT id, "orderNumber", "userId", "agentId", status, "deletedAt", "outboundInvoiced", "returnInvoiced", "systemInvoiced" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      const order = orderRows[0];
+      if (!order) throw new NotFoundError('订单不存在');
+      // 闸①：归属（ADMIN/STAFF 直接放行；代理限自己 + 下级；客户到不了这条路径）
+      await this.assertCanView(order, requester);
+      if (order.deletedAt) {
+        throw new BadRequestError('订单在回收站（已软删），不可订正出行人资料；如需操作请先恢复');
       }
-    }
 
-    // ── 闸③：已开票的单不许改票面身份 ──────────────────────────────────────
-    // 排在查重之前：这是纯内存判定，不该为一个注定要拒的请求先去数据库跑一趟同班次查重。
-    const nameChanging =
-      (input.fullName !== undefined && input.fullName !== passenger.fullName) ||
-      (input.lastName !== undefined && input.lastName !== (passenger.lastName ?? undefined)) ||
-      (input.firstName !== undefined && input.firstName !== (passenger.firstName ?? undefined));
-    const invoiced =
-      order.outboundInvoiced === true ||
-      order.returnInvoiced === true ||
-      order.systemInvoiced === true;
-    if (invoiced && (nameChanging || documentChanging)) {
-      throw new BadRequestError('已出票，改姓名/证件号请走「换人」并勾选重置开票');
-    }
-
-    // 与补录通道同一道反向查重：订正后的这本护照若已在同班次的有效订单里占着座，
-    // 同一个人就在同一班次上占了两份 —— 必须先处理掉其中一张单。
-    if (documentChanging) {
-      await this.assertBackfilledDocumentNotDuplicated(orderId, nextDocument);
-    }
-
-    // ── 写入：只映射传进来的字段（与补录同款「undefined 即不动」；这里绝不出现任何置 null）──
-    const data: Prisma.PassengerUpdateInput = {};
-    if (input.fullName !== undefined) {
-      data.fullName = input.fullName;
-      // 客户端没显式给 lastName/firstName 时按下单口径自动拆（与换人/建单同一函数）
-      if (input.lastName === undefined || input.firstName === undefined) {
-        const { lastName: autoLast, firstName: autoFirst } = splitPassengerFullName(input.fullName);
-        if (input.lastName === undefined && autoLast) data.lastName = autoLast;
-        if (input.firstName === undefined && autoFirst) data.firstName = autoFirst;
-      }
-    }
-    if (input.lastName !== undefined) data.lastName = input.lastName;
-    if (input.firstName !== undefined) data.firstName = input.firstName;
-    if (input.chineseName !== undefined) data.chineseName = input.chineseName;
-    if (input.documentNumber !== undefined) data.documentNumber = input.documentNumber;
-    if (input.dateOfBirth !== undefined) data.dateOfBirth = new Date(input.dateOfBirth);
-    if (input.gender !== undefined) data.gender = input.gender;
-    if (input.nationality !== undefined) data.nationality = input.nationality;
-    if (input.passportExpiry !== undefined) data.passportExpiry = new Date(input.passportExpiry);
-    if (input.passportIssueDate !== undefined) {
-      data.passportIssueDate = new Date(input.passportIssueDate);
-    }
-
-    // 出行人类型服务端权威重派生 —— 与换人 1b2 同一口径（建单 passengerToData 也走它）。
-    // 回退口径：已有的旧类型 > 兜底成人（同一人只是订正生日，不该把儿童/婴儿丢回成人）。
-    if (data.dateOfBirth instanceof Date) {
-      const flightItems = await prisma.orderItem.findMany({
-        where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
-        select: { flightSchedule: { select: { departureTime: true } } },
-      });
-      const departureDate = earliestFlightDeparture(
-        flightItems.map((it) => ({ kind: 'FLIGHT', flightSchedule: it.flightSchedule })),
-      );
-      if (departureDate) {
-        data.passengerType = ptcToPassengerType(
-          derivePtcByAge(
-            data.dateOfBirth,
-            departureDate,
-            passenger.passengerType ?? PassengerType.ADULT,
-          ),
+      // ── 闸②：订单状态 ──────────────────────────────────────────────────
+      // 此前这条通道**一道状态闸都没有**：已取消 / 已退款 / 支付超时的死单上照样能改身份，
+      // 而补录（selfUpdatePassenger）与换人（swapPassenger）两条兄弟通道都拦着。
+      //   · 代理：按补录同一口径（出票流程启动前可改），出票后一律 409 走客服；
+      //   · 运营：按换人同一口径（占座态才算有效订单），死单/回收站单不许再改身份。
+      const isInternalActor =
+        requester.role === UserRole.ADMIN || requester.role === UserRole.STAFF;
+      if (!isInternalActor) {
+        if (!SELF_EDITABLE_PASSENGER_STATUSES.includes(order.status)) {
+          throw new AppError('当前订单状态不可修改出行人资料，请联系客服', {
+            statusCode: 409,
+            code: 'ORDER_LOCKED',
+          });
+        }
+      } else if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
+        throw new BadRequestError(
+          `订单当前状态（${zhStatus(order.status)}）不可订正出行人资料：仅占座中的有效订单可订正（已取消/已退款/超时订单请勿订正）`,
         );
       }
-    }
 
-    const updated = await prisma.passenger.update({ where: { id: passengerId }, data });
+      const passenger = await tx.passenger.findUnique({
+        where: { id: passengerId },
+        select: {
+          id: true,
+          orderId: true,
+          fullName: true,
+          lastName: true,
+          firstName: true,
+          chineseName: true,
+          documentNumber: true,
+          dateOfBirth: true,
+          gender: true,
+          nationality: true,
+          passengerType: true,
+          passportExpiry: true,
+          passportIssueDate: true,
+          // 票务现势：代理订正闸要读（已订座/已出票的人不给代理改票面身份）。
+          pnr: true,
+          eticketNumber: true,
+        },
+      });
+      if (!passenger || passenger.orderId !== orderId) {
+        throw new NotFoundError('出行人不存在或不属于该订单');
+      }
 
-    // 审计 before/after：只记**真的变了**的身份字段（PII 口径与换人审计一致——
-    // 换人审计本就落姓名与证件号，订正不比它更敏感）。
-    const before: Record<string, string | null> = {};
-    const after: Record<string, string | null> = {};
-    const changedFields: string[] = [];
-    // 日期按 UTC 切片（同 buildSwapBeforeSnapshot 口径）：这些是「日期本身」，折时区会推后一天。
-    const asText = (v: unknown): string | null =>
-      v == null ? null : v instanceof Date ? v.toISOString().slice(0, 10) : String(v);
-    for (const field of CORRECTABLE_IDENTITY_FIELDS) {
-      const oldValue = asText((passenger as Record<string, unknown>)[field]);
-      const newValue = asText((updated as unknown as Record<string, unknown>)[field]);
-      if (oldValue === newValue) continue;
-      before[field] = oldValue;
-      after[field] = newValue;
-      changedFields.push(field);
-    }
+      // ── 闸③：证件号改动幅度 ──────────────────────────────────────────────
+      // 证件号统一按「trim + 大写」规范化后再比、再写：同一本护照录成小写不算改动，
+      // 也就不该白写一次库、更不该在审计里留一条「变了」。
+      // （建单入口不做这层规范化，是历史存量口径；这里只规范本次订正写进去的值。）
+      const oldDocument = normalizeDocumentNumber(passenger.documentNumber);
+      const nextDocument =
+        input.documentNumber !== undefined
+          ? normalizeDocumentNumber(input.documentNumber)
+          : undefined;
+      const documentChanging =
+        nextDocument !== undefined && nextDocument !== '' && nextDocument !== oldDocument;
+      // 原值为空（占位单还没录证件）不比距离 —— 那是「从空补成真值」的补录，不是订正，
+      // 比距离必然超阈值，会给出「请使用换人」这种误导性指路。
+      if (documentChanging && oldDocument !== '') {
+        // 只关心是否超阈值，故给早停上限（两侧都已大写，距离本身与大小写无关）。
+        const distance = levenshteinDistance(oldDocument, nextDocument, TYPO_MAX_EDIT_DISTANCE);
+        if (distance > TYPO_MAX_EDIT_DISTANCE) {
+          throw new BadRequestError(
+            `证件号改动超过 ${TYPO_MAX_EDIT_DISTANCE} 个字符，请使用「换人」`,
+          );
+        }
+      }
+
+      // ── 闸④：证件号与姓名同时改动 = 换人伪装成订正 ─────────────────────────
+      // 单看证件号那道闸只量「差几个字符」，于是「连号护照 + 一个全新的名字」能整条溜过去：
+      // E1234567 → E1234568 距离 1，姓名 ZHANG/SAN → LI/SI 一起改掉 —— 这是另一个人上飞机，
+      // 却按订正走：护照图/签证号/票号全部原样留着挂到新名字下面，签证台与值机全被误导。
+      // 判定：证件号真的变了 **且** 规范化后的姓名编辑距离 > 2 才拦。
+      //   · 只改名字不动证件号 → 放行：同一本护照就是同一个人，OCR 把 SAN 读成 SAM 是常事。
+      //   · 名字只差一两个字符（错字）+ 证件号错字 → 放行：一次录单两处笔误是常态。
+      const oldName = normalizeCorrectionName(passenger.fullName, passenger.lastName, passenger.firstName);
+      const nextName =
+        input.fullName !== undefined
+          ? normalizeCorrectionName(input.fullName, null, null)
+          : input.lastName !== undefined || input.firstName !== undefined
+            ? normalizeCorrectionName(
+                null,
+                input.lastName ?? passenger.lastName,
+                input.firstName ?? passenger.firstName,
+              )
+            : null;
+      if (documentChanging && nextName !== null && nextName !== oldName) {
+        const nameDistance = levenshteinDistance(oldName, nextName, TYPO_MAX_EDIT_DISTANCE);
+        if (nameDistance > TYPO_MAX_EDIT_DISTANCE) {
+          throw new BadRequestError('证件号与姓名同时改动，请使用「换人」');
+        }
+      }
+
+      const nameChanging =
+        (input.fullName !== undefined && input.fullName !== passenger.fullName) ||
+        (input.lastName !== undefined && input.lastName !== (passenger.lastName ?? undefined)) ||
+        (input.firstName !== undefined && input.firstName !== (passenger.firstName ?? undefined));
+
+      // ── 闸⑤：代理不许改已订座/已出票的人的票面身份 ─────────────────────────
+      // 与换人通道同一口径：开票位是财务口径（发票开没开），票务口径要另看 —— 订单状态已出票/
+      // 已完成，或这一位身上已经有 PNR / 电子票号。改了票面身份，航司那边对不上，值机卡死。
+      // （状态那半其实已被闸②的代理分支挡住，这里显式再写一次：两道闸各自成立，日后谁放宽
+      //   闸②也不会连带把这条口子一起放开。）中文姓名不在此列（护照扩展字段，不上票面）。
+      if (!isInternalActor && (nameChanging || documentChanging)) {
+        const ticketed =
+          order.status === OrderStatus.TICKETED ||
+          order.status === OrderStatus.COMPLETED ||
+          (passenger.pnr ?? '').trim() !== '' ||
+          (passenger.eticketNumber ?? '').trim() !== '';
+        if (ticketed) {
+          throw new BadRequestError('已订座/已出票，改姓名/证件号请联系运营');
+        }
+      }
+
+      // ── 闸⑥：已开票的单不许改票面身份 ────────────────────────────────────
+      // 排在查重之前：这是纯内存判定，不该为一个注定要拒的请求先去数据库跑一趟同班次查重。
+      const invoiced =
+        order.outboundInvoiced === true ||
+        order.returnInvoiced === true ||
+        order.systemInvoiced === true;
+      if (invoiced && (nameChanging || documentChanging)) {
+        throw new BadRequestError('已出票，改姓名/证件号请走「换人」并勾选重置开票');
+      }
+
+      if (documentChanging) {
+        // 同一订单内查重：反向查重只看**别的订单**，同单里两位出行人被订正成同一本护照
+        // （典型是同行家属的资料串行录错）它一句话都不说，出票时才炸。
+        const sameOrderDup = await tx.passenger.findFirst({
+          where: { orderId, id: { not: passengerId }, documentNumber: nextDocument },
+          select: { id: true },
+        });
+        if (sameOrderDup) {
+          throw new BadRequestError('同一订单内已有相同证件号的出行人');
+        }
+        // 与补录通道同一道反向查重：订正后的这本护照若已在同班次的有效订单里占着座，
+        // 同一个人就在同一班次上占了两份 —— 必须先处理掉其中一张单。
+        await this.assertBackfilledDocumentNotDuplicated(orderId, nextDocument, tx);
+      }
+
+      // ── 写入：只映射传进来的字段（与补录同款「undefined 即不动」；这里绝不出现任何置 null）──
+      const data: Prisma.PassengerUpdateInput = {};
+      if (input.fullName !== undefined) {
+        data.fullName = input.fullName;
+        // 客户端没显式给 lastName/firstName 时按下单口径自动拆（与换人/建单同一函数）
+        if (input.lastName === undefined || input.firstName === undefined) {
+          const { lastName: autoLast, firstName: autoFirst } = splitPassengerFullName(
+            input.fullName,
+          );
+          if (input.lastName === undefined && autoLast) data.lastName = autoLast;
+          if (input.firstName === undefined && autoFirst) data.firstName = autoFirst;
+        }
+      }
+      if (input.lastName !== undefined) data.lastName = input.lastName;
+      if (input.firstName !== undefined) data.firstName = input.firstName;
+      if (input.chineseName !== undefined) data.chineseName = input.chineseName;
+      // 只在规范化后真的变了时才写：纯大小写差异 = 同一本护照，不落库也不进审计。
+      if (documentChanging) data.documentNumber = nextDocument;
+      if (input.dateOfBirth !== undefined) data.dateOfBirth = new Date(input.dateOfBirth);
+      if (input.gender !== undefined) data.gender = input.gender;
+      if (input.nationality !== undefined) data.nationality = input.nationality;
+      if (input.passportExpiry !== undefined) data.passportExpiry = new Date(input.passportExpiry);
+      if (input.passportIssueDate !== undefined) {
+        data.passportIssueDate = new Date(input.passportIssueDate);
+      }
+
+      // 出行人类型服务端权威重派生 —— 与换人 1b2 同一口径（建单 passengerToData 也走它）。
+      // 回退口径：已有的旧类型 > 兜底成人（同一人只是订正生日，不该把儿童/婴儿丢回成人）。
+      if (data.dateOfBirth instanceof Date) {
+        const flightItems = await tx.orderItem.findMany({
+          where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+          select: { flightSchedule: { select: { departureTime: true } } },
+        });
+        const departureDate = earliestFlightDeparture(
+          flightItems.map((it) => ({ kind: 'FLIGHT', flightSchedule: it.flightSchedule })),
+        );
+        if (departureDate) {
+          data.passengerType = ptcToPassengerType(
+            derivePtcByAge(
+              data.dateOfBirth,
+              departureDate,
+              passenger.passengerType ?? PassengerType.ADULT,
+            ),
+          );
+        }
+      }
+
+      const updated = await tx.passenger.update({ where: { id: passengerId }, data });
+
+      // 审计 before/after：只记**真的变了**的身份字段（PII 口径与换人审计一致——
+      // 换人审计本就落姓名与证件号，订正不比它更敏感）。
+      const before: Record<string, string | null> = {};
+      const after: Record<string, string | null> = {};
+      const changedFields: string[] = [];
+      // 日期按 UTC 切片（同 buildSwapBeforeSnapshot 口径）：这些是「日期本身」，折时区会推后一天。
+      const asText = (v: unknown): string | null =>
+        v == null ? null : v instanceof Date ? v.toISOString().slice(0, 10) : String(v);
+      for (const field of CORRECTABLE_IDENTITY_FIELDS) {
+        const oldValue = asText((passenger as Record<string, unknown>)[field]);
+        const newValue = asText((updated as unknown as Record<string, unknown>)[field]);
+        if (oldValue === newValue) continue;
+        before[field] = oldValue;
+        after[field] = newValue;
+        changedFields.push(field);
+      }
+      return { before, after, changedFields };
+    });
+    const { before, after, changedFields } = scratch;
 
     const finalOrder = await prisma.order.findUniqueOrThrow({
       where: { id: orderId },
@@ -12683,9 +12874,19 @@ export class OrderService {
     orderId: string,
     input: OrderPriceAdjustmentBody,
     actor: { userId: string; role: UserRole },
+    /**
+     * 批量按人调价（PER_PAX）传进来的单价注记，会原样进调整行描述（「每人 ¥700 × 2 人」）。
+     * 单单入口不传 → 行描述与此前逐字一致，不影响任何既有单据。
+     */
+    options?: { unitNote?: string },
   ) {
     const { amountCny, reasonCode, reasonText } = input;
-    const row = buildPriceAdjustmentItem({ amountCny, reasonCode, reasonText });
+    const row = buildPriceAdjustmentItem({
+      amountCny,
+      reasonCode,
+      reasonText,
+      unitNote: options?.unitNote,
+    });
     // 行锁：先锁订单行串行化并发调价，避免两个并发请求各读旧 items、各加一条差额行、
     // 各按「旧合计 + 一次差额」写 total → 丢失更新（两条行，total 只含一条）。
     await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE`;

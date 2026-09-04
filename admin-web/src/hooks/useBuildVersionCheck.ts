@@ -2,6 +2,9 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 
 // 5 分钟轮询一次——够快能在合理时间内探测到发版，又不至于给 nginx 添无谓负载。
 const POLL_INTERVAL_MS = 5 * 60 * 1000;
+// focus / visibilitychange 触发的检查之间至少间隔这么久：用户来回切标签页/切窗口可能几秒内
+// 连续触发好几次，别把每次都打到 /version.json。定时轮询本身按 POLL_INTERVAL_MS 走，不受此限。
+const MIN_CHECK_INTERVAL_MS = 30 * 1000;
 
 interface VersionPayload {
   buildId?: unknown;
@@ -28,10 +31,13 @@ export function useBuildVersionCheck(): UseBuildVersionCheckResult {
   // 防止同一时刻轮询 / visibilitychange / focus 三个触发源重叠发请求
   const inFlightRef = useRef(false);
   const mountedRef = useRef(true);
+  // 上一次真正发出检查请求的时间戳，用于 focus/visibilitychange 的最小间隔节流
+  const lastCheckedAtRef = useRef(0);
 
   const checkVersion = useCallback(async () => {
     if (inFlightRef.current) return;
     inFlightRef.current = true;
+    lastCheckedAtRef.current = Date.now();
     try {
       const res = await fetch(`/version.json?t=${Date.now()}`, { cache: 'no-store' });
       if (!res.ok) return;
@@ -54,10 +60,15 @@ export function useBuildVersionCheck(): UseBuildVersionCheckResult {
     void checkVersion();
 
     const timer = window.setInterval(() => void checkVersion(), POLL_INTERVAL_MS);
+    // focus/visibilitychange 距上次检查不足 30s 就跳过——定时轮询不受影响，仍按 POLL_INTERVAL_MS 走。
     const handleVisibility = () => {
-      if (document.visibilityState === 'visible') void checkVersion();
+      if (document.visibilityState === 'visible' && Date.now() - lastCheckedAtRef.current >= MIN_CHECK_INTERVAL_MS) {
+        void checkVersion();
+      }
     };
-    const handleFocus = () => void checkVersion();
+    const handleFocus = () => {
+      if (Date.now() - lastCheckedAtRef.current >= MIN_CHECK_INTERVAL_MS) void checkVersion();
+    };
 
     document.addEventListener('visibilitychange', handleVisibility);
     window.addEventListener('focus', handleFocus);
