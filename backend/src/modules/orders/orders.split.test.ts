@@ -2016,6 +2016,72 @@ describe('拆单 · 分房/房数脏数据闸（L2 / L4）', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
+describe('拆单 · 按人调价把份额算成负数/超出整单应收（A4）', () => {
+  // 2 人单 total 1000，p1 名下挂 −1500 的按乘客调价：
+  // 应收 1000、Σ 净额 −1500 → 基准 (1000+1500)/2 = 1250
+  // → p1 份额 −250、p2 份额 1250。拆出 p2 就会拆出「新单 1250、源单 −250」。
+  const skewedOrder = () =>
+    baseOrder({
+      total: 1000,
+      subtotal: 1000,
+      items: [
+        flightItem(),
+        flightItem({
+          id: 'i_adj_p1',
+          kind: 'DISCOUNT',
+          description: '价格调整：优惠',
+          quantity: 1,
+          unitPrice: -1500,
+          amount: -1500,
+          totalCostCny: null,
+          unitCostCny: null,
+          flightScheduleId: null,
+          flightCabin: null,
+          passengerId: 'p1',
+          metadata: { priceAdjustment: true, reasonCode: 'DISCOUNT' },
+        }),
+      ],
+    });
+
+  it('preview：有人的份额为负 → 人话 blocker，列出姓名与份额', async () => {
+    armCleanGates();
+    mockPrisma.order.findUnique.mockResolvedValue(skewedOrder());
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p2'] }, admin);
+    expect(r.eligible).toBe(false);
+    expect(r.blockers.join()).toContain('份额为负');
+    expect(r.blockers.join()).toContain('PAX p1');
+  });
+
+  it('preview：拆出份额超过整单应收（留守侧会变负）→ 人话 blocker', async () => {
+    armCleanGates();
+    mockPrisma.order.findUnique.mockResolvedValue(skewedOrder());
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p2'] }, admin);
+    expect(r.blockers.join()).toContain('超出整单应收');
+  });
+
+  it('execute：同一份闸在执行段拦下，绝不建新单', async () => {
+    armExecute({
+      order: skewedOrder(),
+      targetItemsSum: 1250,
+      sourceItemsSum: -250,
+      finalSource: { total: -250, paidAmount: 0 },
+      finalTarget: { total: 1250, paidAmount: 500 },
+    });
+    await expect(
+      service.splitOrder('o1', { passengerIds: ['p2'], requestToken: TOKEN }, admin),
+    ).rejects.toBeInstanceOf(BadRequestError);
+    expect(mockPrisma.order.create).not.toHaveBeenCalled();
+  });
+
+  it('正常单（无极端调价）不受影响：preview 仍可拆', async () => {
+    armCleanGates();
+    mockPrisma.order.findUnique.mockResolvedValue(baseOrder());
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p1'] }, admin);
+    expect(r.eligible).toBe(true);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
 describe('拆单 · SPLIT_ORDER 审计的 targetTotal 口径（有售后费的单）', () => {
   it('审计 targetTotal = 新单落库 total（份额 − 分摊的售后费），另留 movedShareCny 记份额', async () => {
     // 应收 2000 + 售后费 200 = 2200，两人各 1100；拆出 1 人带走一半售后费 100

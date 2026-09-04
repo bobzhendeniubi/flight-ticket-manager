@@ -12600,6 +12600,35 @@ export class OrderService {
     const movedAdjustmentCny = Math.round(order.adjustmentCny * shareRatio);
     const targetTotalCny = round2(movedShareCny - movedAdjustmentCny);
 
+    // ── 闸 17：按人调价把份额算成负数 / 超出整单应收 → 拒拆 ─────────────────────
+    // computePerPaxShares 只保证 Σ 份额 == 应收，单个人的份额是运营手填的调价净额直接
+    // 加出来的，可以为负、也可以大过整单应收。拿这种份额去搬钱，拆出来就是
+    //「新单 1250、源单 −250」这种账 —— 守恒断言只看两侧之和，一分不差地放行。
+    // 这里不静默夹逼：夹了 Σ 就不守恒，等于系统背着运营改了钱。宁可拒拆，
+    // 让运营先把那一行调价改对。预检与执行段跑的是同一份闸（fail-closed）。
+    const SHARE_EPS = 0.005;
+    const negativeShareLabels = order.passengers
+      .filter((p) => (shareByPax.get(p.id) ?? 0) < -SHARE_EPS)
+      .map((p) => `${paxNameById.get(p.id) ?? p.id} ¥${round2(shareByPax.get(p.id) ?? 0)}`);
+    if (negativeShareLabels.length > 0) {
+      blockers.push(
+        `按乘客调价后有人的份额为负（${negativeShareLabels.join('、')}）：` +
+          '拆单只搬钱不改钱，负份额会把一侧订单金额拆成负数。请先调整该乘客的调价行再拆单。',
+      );
+    }
+    const keptShareCny = round2(payableCny - movedShareCny);
+    if (
+      movedShareCny > payableCny + SHARE_EPS ||
+      keptShareCny < -SHARE_EPS ||
+      targetTotalCny < -SHARE_EPS
+    ) {
+      blockers.push(
+        `按乘客调价后拆出的份额超出整单应收（拆出 ¥${movedShareCny}、整单应收 ¥${payableCny}、` +
+          `留守侧 ¥${keptShareCny}、新单应收 ¥${targetTotalCny}）：` +
+          '拆完会有一侧金额为负。请先调整相关乘客的调价行再拆单。',
+      );
+    }
+
     // ── 预存抵扣（Order.prepaymentOffset）随拆按份额搬 ────────────────────────
     // 这一列进「清账/尾款/已收净额」的每一条公式（应付 = total + adjustmentCny − paidAmount
     // − prepaymentOffset）。整块留在源单：源单 total 变小、抵扣没变 → 看起来多付；
