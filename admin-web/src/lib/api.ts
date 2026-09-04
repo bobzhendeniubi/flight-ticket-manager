@@ -324,6 +324,8 @@ export interface RangeSchedule {
   /** ISO datetime 字符串 */
   departureTime: string;
   departureTz: string;
+  /** 关柜提前分钟数；null / 缺失 = 系统默认 45。no-show 批量页预检前的角标粗估用。 */
+  checkinCloseMinutes?: number | null;
   seatClasses: RangeScheduleSeat[];
 }
 

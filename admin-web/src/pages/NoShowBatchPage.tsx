@@ -13,7 +13,7 @@
  *     每片一个 requestToken，按该片载荷指纹记忆化：「重试失败项」原样重发同一批载荷，
  *     已成功的片会被幂等回放、不会再执行一遍；改了勾选 / 释放开关 / 备注才换新键。
  *     单片失败不拦后面的片 —— 票务今天处理到哪就是哪，剩下的重试即可。
- *   - 「同时释放回程」是预检口径的一部分（回程已起飞能不能标要看它），开关一变就按新口径
+ *   - 「同时释放回程」是预检口径的一部分（回程已关柜能不能标要看它），开关一变就按新口径
  *     重新匹配一遍；提交前再兜一次底，开关与上次预检不一致时先重跑再让运营核对。
  *   - 护照只显示服务端下发的尾号。
  */
@@ -112,11 +112,14 @@ export function NoShowBatchPage() {
 
   const selectedSchedule = candidateSchedules.find((s) => s.id === scheduleId) ?? null;
   // 本机时间只作提示；真正的闸走 preview.schedule.departed（服务端按该班次自己的关柜分钟数算）。
-  // 这里按系统默认 45 分钟粗估一下关柜时刻，让预检之前的角标不至于与预检后反着来。
+  // 这里按该班次自己的关柜分钟数（没配就用系统默认 45）粗估一下关柜时刻，让预检之前的角标不至于与预检后反着来。
   const DEFAULT_CHECKIN_CLOSE_MINUTES = 45;
+  const closeMinutes =
+    selectedSchedule?.checkinCloseMinutes != null && selectedSchedule.checkinCloseMinutes >= 0
+      ? selectedSchedule.checkinCloseMinutes
+      : DEFAULT_CHECKIN_CLOSE_MINUTES;
   const looksDeparted = selectedSchedule
-    ? new Date(selectedSchedule.departureTime).getTime() - DEFAULT_CHECKIN_CLOSE_MINUTES * 60_000 <
-      Date.now()
+    ? new Date(selectedSchedule.departureTime).getTime() - closeMinutes * 60_000 < Date.now()
     : false;
 
   // ── 名单与匹配 ────────────────────────────────────────────────────────
@@ -172,7 +175,7 @@ export function NoShowBatchPage() {
    * 拿一份名单去服务端预检，再用当前钉住的候选把「仍然多人同名」的行就地解出来并入 matched。
    * 「匹配」按钮、多人同名面板选定候选、以及改「同时释放回程」开关，都走这一个函数。
    *
-   * release 必须显式传：它是预检口径的一部分（回程已起飞时能不能标要看它），
+   * release 必须显式传：它是预检口径的一部分（回程已关柜时能不能标要看它），
    * 从 state 里读会拿到 setState 之前的旧值，预检与界面就对不上了。
    *
    * 钉住并入的行（pinned）没有真正过一遍服务端逐单判定，所以预检回来后再对**这些行所在的
@@ -259,7 +262,7 @@ export function NoShowBatchPage() {
   };
 
   /**
-   * 改「同时释放回程」= 换了一套预检口径（回程已起飞的单在两档下结论不同），
+   * 改「同时释放回程」= 换了一套预检口径（回程已关柜的单在两档下结论不同），
    * 已经匹配过就立刻按新口径重跑一遍。重跑会把勾选恢复成默认值 —— 界面上明说了这一点。
    */
   const handleReleaseReturnChange = (checked: boolean) => {
@@ -684,7 +687,7 @@ export function NoShowBatchPage() {
                     代理事后来要，运营仍可逐单恢复。
                   </span>
                   <span className="mt-0.5 block text-xs text-amber-700">
-                    改这个开关会按新口径重新匹配一遍（回程已起飞的单在两档下结论不同），勾选会恢复默认。
+                    改这个开关会按新口径重新匹配一遍（回程已关柜的单在两档下结论不同），勾选会恢复默认。
                   </span>
                 </span>
               </label>

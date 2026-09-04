@@ -175,8 +175,8 @@ export function NoShowMatchTable({
                   {!m.hasReturn ? (
                     <span className="text-ink-muted">单程</span>
                   ) : m.returnDeparted ? (
-                    <span className="text-ink-muted" title="回程已起飞，没有可释放的座位">
-                      已起飞
+                    <span className="text-ink-muted" title="回程已关柜，没有可释放的座位">
+                      已关柜
                     </span>
                   ) : m.returnTicketed ? (
                     // 「票务已确认」= 该航段的出票任务已确认，与财务的「开票」无关 ——

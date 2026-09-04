@@ -620,6 +620,9 @@ export class FlightService {
       destinationCode: s.flight.destinationCode,
       departureTime: s.departureTime.toISOString(),
       departureTz: s.departureTz,
+      // 关柜提前分钟数：no-show 批量页选完班次、还没预检之前，角标要按这一班自己的值粗估，
+      // 否则班次自配了分钟数的会先显示「未关柜」、预检后又翻成「已关柜」。null = 系统默认。
+      checkinCloseMinutes: s.checkinCloseMinutes,
       seatClasses: s.seatClasses.map((c) => {
         const locked = lockedMap.get(c.id) ?? 0;
         const held = heldMap.get(c.id) ?? 0;
