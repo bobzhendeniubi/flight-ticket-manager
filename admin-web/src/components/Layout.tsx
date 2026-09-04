@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from 'react';
 import { Link, Navigate, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../stores/auth';
 import { api, ApiError, AUTH_REFRESH_UNAVAILABLE_CODE } from '../lib/api';
+import { BuildVersionBanner } from './BuildVersionBanner';
 import { ErrorBoundary } from './ErrorBoundary';
 import { Icon } from './Icon';
 import { useDialogA11y } from './Modal';
@@ -386,6 +387,10 @@ export function Layout() {
             )}
           </div>
         </header>
+
+        {/* 新版本可用提示条：置于内容区顶部、header 之下，不随 header 一起 sticky，
+            不遮挡登出/导航；见 BuildVersionBanner + useBuildVersionCheck */}
+        <BuildVersionBanner />
 
         <main className="flex-1">
           <div className="mx-auto w-full max-w-[1400px] px-4 py-6 md:px-6 lg:px-8">
