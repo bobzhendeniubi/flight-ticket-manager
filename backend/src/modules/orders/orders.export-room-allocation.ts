@@ -27,7 +27,7 @@ import { OrderStatus, OrderItemKind } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { BadRequestError } from '../../lib/errors.js';
 import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
-import { fmtDateDMYDash, pnrName } from './orders.export-templates.js';
+import { fmtDateDMYDash, pnrName, perPaxSettlementByPassenger } from './orders.export-templates.js';
 import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats.js';
 import type { TripStatsMap } from './orders.export-trip-stats.js';
 import { earliestFlightDepartureLocalDate } from './pnr-export.js';
@@ -66,7 +66,7 @@ export interface RoomAllocationRow {
    */
   flightCount: string;
   travelDates: string; // 'YYYY-MM-DD / YYYY-MM-DD'
-  settlePrice: number; // 结算价格（人均）：round2(order.total / 乘客数)
+  settlePrice: number; // 结算价格（按乘客，与全岗总表同口径：perPaxSettlementByPassenger）
   dateOfBirth: string; // dd-mm-yyyy
   gender: string; // M / F
   documentNumber: string;
@@ -286,7 +286,12 @@ export type RoomItemForExport = Prisma.OrderItemGetPayload<{
         passengers: true;
         items: {
           select: {
+            id: true;
             kind: true;
+            amount: true;
+            description: true;
+            passengerId: true;
+            metadata: true;
             flightSchedule: { select: { departureTime: true, departureTz: true } };
           };
         };
@@ -458,10 +463,13 @@ export function buildRoomAllocationSheets(
     // 公司名可能是空串（历史空名代理）：trim + `||` 兜底到联系人名，双空才算直客。
     const agency = order.agent?.companyName?.trim() || order.agent?.contactName?.trim() || '直客';
 
-    // 结算价格（人均）：订单总价 / 乘客数，与 orders.export-master.ts 的 settlePerPax 同口径；
-    // 除零保护 —— 乘客数至少按 1 算，避免空乘客订单除以 0。
+    // 结算价格**按乘客**：与全岗总表 /《全岗可用》同一个权威口径（perPaxSettlementByPassenger，
+    // 含该乘客调价净额与售后费 adjustmentCny）——同一位乘客在三张表里必须是同一个数。
+    // 改前这里自己算「订单总价 ÷ 乘客数」，同单不同价的单导出来全员一个数，且漏了改期费/换人费。
+    // 均摊兜底只在乘客不在上表里时用到；除零保护 —— 乘客数至少按 1 算。
     const paxCount = Math.max(1, order.passengers.length);
-    const settlePrice = round2(dec(order.total) / paxCount);
+    const settleByPassenger = perPaxSettlementByPassenger(order);
+    const settleFallback = round2((dec(order.total) + (order.adjustmentCny ?? 0)) / paxCount);
     // 录入时间是「动作发生时刻」，按北京时间输出（容器 TZ 是 UTC，直接取 UTC 分量会少 8 小时）
     const enteredAt = businessDateTimeSec(order.createdAt);
 
@@ -525,7 +533,7 @@ export function buildRoomAllocationSheets(
         pnrName: pnrName(p),
         flightCount: flightCountCell(p, tripStats),
         travelDates,
-        settlePrice,
+        settlePrice: settleByPassenger.get(p.id) ?? settleFallback,
         dateOfBirth: fmtDateDMYDash(p.dateOfBirth),
         gender: p.gender ? GENDER_MF[p.gender] ?? '' : '',
         documentNumber: p.documentNumber,
@@ -723,7 +731,13 @@ const ROOM_ITEM_INCLUDE = {
       passengers: true,
       items: {
         select: {
+          // id/amount/description/passengerId/metadata：结算价格按人（perPaxSettlementByPassenger）取数用
+          id: true,
           kind: true,
+          amount: true,
+          description: true,
+          passengerId: true,
+          metadata: true,
           flightSchedule: { select: { departureTime: true, departureTz: true } },
         },
       },

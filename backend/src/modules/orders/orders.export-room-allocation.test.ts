@@ -1115,3 +1115,50 @@ describe('filterRoomItemsByDepartDate（出发日精确细筛）', () => {
     expect(filterRoomItemsByDepartDate([redEye('red-eye')], '2026-07-21')).toEqual([]);
   });
 });
+
+// ── 结算价格按乘客（与全岗总表 /《全岗可用》同一口径）──────────────────────────────
+// 改前分房表自己算「订单总价 ÷ 乘客数」：同单不同价的单全员一个数，且漏了改期费/换人费，
+// 同一位乘客在分房表与全岗总表上是两个数。
+describe('分房表结算价格按乘客', () => {
+  it('按乘客调价 −360 / −120 → 828 / 1068，合计仍等于应收；无调价的单与均摊一致', () => {
+    const items = fixtureItems().map((it) =>
+      it.orderId === 'o1'
+        ? ({
+            ...it,
+            order: {
+              ...it.order,
+              total: 1896,
+              adjustmentCny: 0,
+              items: [
+                ...it.order.items,
+                {
+                  id: 'adj-p1', kind: 'DISCOUNT', amount: -360, description: '价格调整：自备签',
+                  passengerId: 'p1', metadata: { priceAdjustment: true, reasonCode: 'MISC_FEE' }, flightSchedule: null,
+                },
+                {
+                  id: 'adj-p2', kind: 'DISCOUNT', amount: -120, description: '价格调整：补收杂费',
+                  passengerId: 'p2', metadata: { priceAdjustment: true, reasonCode: 'MISC_FEE' }, flightSchedule: null,
+                },
+              ],
+            },
+          } as typeof it)
+        : it,
+    );
+    const sheets = buildRoomAllocationSheets(items);
+    const [r1, r2] = sheets[0].rows;
+    // 基准每人 = (1896 + 480) / 2 = 1188 → p1 828、p2 1068
+    expect(r1.settlePrice).toBe(828);
+    expect(r2.settlePrice).toBe(1068);
+    expect(r1.settlePrice + r2.settlePrice).toBe(1896);
+  });
+
+  it('售后费 adjustmentCny 计入应收（与全岗总表尾款/结算价同口径）', () => {
+    const items = fixtureItems().map((it) =>
+      it.orderId === 'o1' ? ({ ...it, order: { ...it.order, adjustmentCny: 200 } } as typeof it) : it,
+    );
+    const [r1, r2] = buildRoomAllocationSheets(items)[0].rows;
+    // (4800 + 200) / 2 = 2500
+    expect(r1.settlePrice).toBe(2500);
+    expect(r2.settlePrice).toBe(2500);
+  });
+});
