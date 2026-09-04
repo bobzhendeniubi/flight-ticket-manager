@@ -17132,23 +17132,52 @@ function appendLegActionLog(metadata: unknown, entry: LegActionLogEntry): LegAct
   return [...readLegActionLog(metadata), entry];
 }
 
+/** 按人改期编排入参指纹里归一化后的 roomSplit 行。 */
+type OrchestrationRoomSplitRow = { itemId: string; roomsBilledToMove: number };
+
+/** 拆单流水 snapshot.orchestration 的形状（落库与回放比对共用同一个类型）。 */
+export type SplitOrchestrationSnapshot = Record<
+  string,
+  string | number | null | OrchestrationRoomSplitRow[]
+>;
+
 /**
  * 按人改期的编排入参指纹（拆单流水 snapshot.orchestration 的唯一构造口径）。
  *
  * 落库与比对必须走同一个函数、同一个键序 —— 两处各写一份对象字面量，
  * 早晚会因为键序或缺省值不同而把「同一个请求」判成不一致，运营侧表现为莫名其妙的 409。
+ *
+ * **进指纹的是「会改变结果的入参」**：
+ *   · orderItemId / newScheduleId / newCabin / feeCny —— 改哪一段、改到哪、收多少差价。
+ *   · roomSplit —— 每张酒店行搬几间房，直接决定两侧订单的金额与房控占用；同 token 换一份
+ *     房数重发，若不比对就会静默回放上一轮的拆法，运营以为新的房数生效了。
+ *     行序不是语义（前端按弹窗行序发），这里统一按 itemId 升序、房数转 number 后再落；
+ *     不传 = null，与「传了空数组」区分开。
+ *
+ * **不进指纹的**：feeLabel / note —— 只影响留痕文案，不改变座位、金额、房控任何结果。
+ * 把它们纳进来只会让运营改个备注重试就吃 409。
  */
 function reschedulePassengersOrchestration(input: {
   orderItemId: string;
   newScheduleId: string;
   newCabin?: CabinClass;
   feeCny?: number;
-}): Record<string, string | number | null> {
+  roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
+}): SplitOrchestrationSnapshot {
   return {
     orderItemId: input.orderItemId,
     newScheduleId: input.newScheduleId,
     newCabin: input.newCabin ?? null,
     feeCny: Math.trunc(input.feeCny ?? 0),
+    roomSplit:
+      input.roomSplit == null
+        ? null
+        : [...input.roomSplit]
+            .map((row) => ({
+              itemId: row.itemId,
+              roomsBilledToMove: Number(row.roomsBilledToMove),
+            }))
+            .sort((a, b) => (a.itemId < b.itemId ? -1 : a.itemId > b.itemId ? 1 : 0)),
   };
 }
 
@@ -17718,12 +17747,12 @@ export interface SplitOrderInput {
   autoSplitRoomGroups?: boolean;
   note?: string;
   /**
-   * 编排上下文留档（按人改期传：目标航段行 / 目标班次 / 目标舱位 / 改期差价）。
+   * 编排上下文留档（按人改期传：目标航段行 / 目标班次 / 目标舱位 / 改期差价 / 每行搬几间房）。
    * 拆单本身不读它，只原样写进 OrderSplitRecord.snapshot.orchestration ——
-   * 编排层拿同一个 requestToken 回放时据此比对入参：换了班次或换了费用还沿用同一个 token，
-   * 必须判 409，而不是静默回放上一轮拆出的那张单。
+   * 编排层拿同一个 requestToken 回放时据此比对入参：换了班次、换了费用或换了房数还沿用
+   * 同一个 token，必须判 409，而不是静默回放上一轮拆出的那张单。
    */
-  orchestration?: Record<string, string | number | null>;
+  orchestration?: SplitOrchestrationSnapshot;
   requestToken: string;
 }
 

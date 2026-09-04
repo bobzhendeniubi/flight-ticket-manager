@@ -238,12 +238,13 @@ describe('按人改期 · 部分乘客 = 先拆单再对新单改期', () => {
         requestToken: TOKEN,
         // 编排路径：混合房组自动劈半 + 未给的间数/升舱位按人头自动派生
         autoSplitRoomGroups: true,
-        // 编排入参留档：同 token 重试时据此比对（换班次/换费用 → 409）
+        // 编排入参留档：同 token 重试时据此比对（换班次/换费用/换房数 → 409）
         orchestration: {
           orderItemId: 'leg-out',
           newScheduleId: 'sch-new',
           newCabin: null,
           feeCny: 300,
+          roomSplit: [{ itemId: 'hotel-1', roomsBilledToMove: 0.5 }],
         },
       },
       admin,
@@ -397,6 +398,7 @@ describe('按人改期 · 部分乘客的同 token 重试（A2）', () => {
         newScheduleId: 'sch-new',
         newCabin: null,
         feeCny: 300,
+        roomSplit: null,
       },
     },
     ...over,
@@ -457,6 +459,7 @@ describe('按人改期 · 部分乘客的同 token 重试（A2）', () => {
           movedPassengerIds: ['p1'],
           // JSONB 读回来的键序不保证与写入时一致，这里模拟被打乱后的形状。
           orchestration: {
+            roomSplit: null,
             feeCny: 300,
             newCabin: null,
             newScheduleId: 'sch-new',
@@ -513,6 +516,81 @@ describe('按人改期 · 部分乘客的同 token 重试（A2）', () => {
     expect(split).not.toHaveBeenCalled();
   });
 
+  it('换一份 roomSplit 沿用同一个 token → 409（房数直接决定两侧钱与房控占用）', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(afterFirstSplit());
+    mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(priorRecord());
+    const split = vi.spyOn(service, 'splitOrder');
+
+    const err = await service
+      .reschedulePassengers(
+        'o1',
+        body({ roomSplit: [{ itemId: 'hotel-1', roomsBilledToMove: 1 }] }),
+        admin,
+      )
+      .catch((e) => e);
+
+    expect(err.statusCode).toBe(409);
+    expect(err.code).toBe('TOKEN_PAYLOAD_MISMATCH');
+    expect(split).not.toHaveBeenCalled();
+  });
+
+  it('roomSplit 只是行序不同 → 仍判一致，照常回放', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(afterFirstSplit());
+    mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(
+      priorRecord({
+        snapshot: {
+          movedPassengerIds: ['p1'],
+          orchestration: {
+            orderItemId: 'leg-out',
+            newScheduleId: 'sch-new',
+            newCabin: null,
+            feeCny: 300,
+            roomSplit: [
+              { itemId: 'hotel-a', roomsBilledToMove: 1 },
+              { itemId: 'hotel-b', roomsBilledToMove: 2 },
+            ],
+          },
+        },
+      }),
+    );
+    mockPrisma.orderItem.findMany.mockResolvedValue([
+      { id: 'leg-out-moved', flightScheduleId: 'sch-new' },
+      { id: 'leg-ret-moved', flightScheduleId: 'sch-ret' },
+    ]);
+    const split = vi.spyOn(service, 'splitOrder');
+
+    const result = await service.reschedulePassengers(
+      'o1',
+      body({
+        roomSplit: [
+          { itemId: 'hotel-b', roomsBilledToMove: 2 },
+          { itemId: 'hotel-a', roomsBilledToMove: 1 },
+        ],
+      }),
+      admin,
+    );
+    expect(split).not.toHaveBeenCalled();
+    expect(result.audit.splitReplayed).toBe(true);
+  });
+
+  it('只换留痕文案（feeLabel / note）→ 不进指纹，照常回放', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(afterFirstSplit());
+    mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(priorRecord());
+    mockPrisma.orderItem.findMany.mockResolvedValue([
+      { id: 'leg-out-moved', flightScheduleId: 'sch-new' },
+      { id: 'leg-ret-moved', flightScheduleId: 'sch-ret' },
+    ]);
+    const split = vi.spyOn(service, 'splitOrder');
+
+    const result = await service.reschedulePassengers(
+      'o1',
+      body({ feeLabel: '改期费（重发）', note: '客人电话补充' }),
+      admin,
+    );
+    expect(split).not.toHaveBeenCalled();
+    expect(result.audit.splitReplayed).toBe(true);
+  });
+
   it('未命中 → 走原有流程（正常拆单 + 改期）', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(sourceSnapshot());
     mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(null);
@@ -532,15 +610,40 @@ describe('按人改期 · 部分乘客的同 token 重试（A2）', () => {
     const split = vi.spyOn(service, 'splitOrder').mockResolvedValue(splitOutcome());
     vi.spyOn(service, 'rescheduleOrderItem').mockResolvedValue(rescheduleOutcome());
 
-    await service.reschedulePassengers('o1', body(), admin);
+    await service.reschedulePassengers(
+      'o1',
+      body({
+        roomSplit: [
+          { itemId: 'hotel-b', roomsBilledToMove: 2 },
+          { itemId: 'hotel-a', roomsBilledToMove: 1 },
+        ],
+      }),
+      admin,
+    );
     expect(split.mock.calls[0][1]).toMatchObject({
       orchestration: {
         orderItemId: 'leg-out',
         newScheduleId: 'sch-new',
         newCabin: null,
         feeCny: 300,
+        // 按 itemId 升序归一化后再落库，行序不同不该判成两份入参
+        roomSplit: [
+          { itemId: 'hotel-a', roomsBilledToMove: 1 },
+          { itemId: 'hotel-b', roomsBilledToMove: 2 },
+        ],
       },
     });
+  });
+
+  it('不传 roomSplit 时指纹里记 null（与「传了空数组」区分开）', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(sourceSnapshot());
+    const split = vi.spyOn(service, 'splitOrder').mockResolvedValue(splitOutcome());
+    vi.spyOn(service, 'rescheduleOrderItem').mockResolvedValue(rescheduleOutcome());
+
+    await service.reschedulePassengers('o1', body(), admin);
+    expect(
+      (split.mock.calls[0][1] as { orchestration: { roomSplit: unknown } }).orchestration.roomSplit,
+    ).toBeNull();
   });
 });
 
