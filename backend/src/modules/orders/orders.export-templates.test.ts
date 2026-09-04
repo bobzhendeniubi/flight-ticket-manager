@@ -338,7 +338,10 @@ describe('《全岗可用》full 模版 — 逐列取值/格式', () => {
   it('系统暂无数据的列一律留空（绝不编造）', () => {
     for (const r of rows) {
       expect(r.isOriginalOrder).toBe('');
-      expect(r.singleRoomDiff).toBe('');
+      // 单房差已有真实来源（单住乘客 / 补收单房差行，见 perPaxSingleRoomDiffByPassenger）：
+      // 本 fixture 无单住乘客 → 0，不再留空
+      expect(r.singleRoomDiff).toBe(0);
+      expect(r.singleRoomDiffReceived).toBe('');
       expect(r.offsetPerson).toBe('');
       expect(r.offsetOrder).toBe('');
       expect(r.refundChannel).toBe('');

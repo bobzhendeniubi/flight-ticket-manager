@@ -392,6 +392,65 @@ export function perPaxVisaAmountByPassenger(order: {
   );
 }
 
+/**
+ * 「单房差」列的**按乘客**取值 —— 全岗总表与《全岗可用》共用的唯一口径。
+ *
+ * 改前（全岗总表）读的是订单行 metadata.singleRoomDiff —— 系统从没写过这个字段，整列恒 0；
+ *《全岗可用》则干脆留空。单房差的真实来源有两处：
+ *   · 下单时的单住：套餐行 metadata.addOns.singleSupplementTotal（= singleCount × 每晚差 × 晚数）；
+ *   · 事后补收：kind=FEE、metadata.reasonCode='ROOM_DIFF' 的补收单房差行（addRoomSupplement），
+ *     新行带 passengerId 指向转单住的那位乘客；老行没挂人。
+ * 这两笔钱都只属于「单住」的乘客（Passenger.singleRoom=true），不该摊给拼房的人。
+ *
+ * 取值：挂了人的补收行直接记到该乘客；其余（套餐单住小计 + 未挂人的补收行）在**还没有专属补收行的
+ * 单住乘客**间均摊。没有任何单住乘客却有钱（脏数据）→ 全员均摊，钱不凭空消失。
+ */
+export function perPaxSingleRoomDiffByPassenger(order: {
+  passengers: ReadonlyArray<{ id: string; singleRoom?: boolean | null }>;
+  items: ReadonlyArray<{
+    kind: string;
+    amount: Prisma.Decimal | number | null;
+    passengerId?: string | null;
+    metadata?: unknown;
+  }>;
+}): Map<string, number> {
+  const linked = new Map<string, number>();
+  let pool = 0;
+  for (const it of order.items) {
+    const meta = (it.metadata ?? null) as
+      | { reasonCode?: unknown; addOns?: { singleSupplementTotal?: unknown } | null }
+      | null;
+    if (it.kind === 'FEE' && meta?.reasonCode === 'ROOM_DIFF') {
+      if (it.passengerId) {
+        linked.set(it.passengerId, round2((linked.get(it.passengerId) ?? 0) + dec(it.amount)));
+      } else {
+        pool += dec(it.amount);
+      }
+    } else if (it.kind === 'BUNDLE') {
+      const v = meta?.addOns?.singleSupplementTotal;
+      if (typeof v === 'number') pool += v;
+    }
+  }
+  const singles = order.passengers.filter((p) => p.singleRoom === true);
+  const unlinkedSingles = singles.filter((p) => !linked.has(p.id));
+  const sharers =
+    pool === 0
+      ? []
+      : unlinkedSingles.length > 0
+        ? unlinkedSingles
+        : singles.length > 0
+          ? singles
+          : order.passengers;
+  const sharerIds = new Set(sharers.map((p) => p.id));
+  const share = sharers.length > 0 ? pool / sharers.length : 0;
+  return new Map(
+    order.passengers.map((p) => [
+      p.id,
+      round2((linked.get(p.id) ?? 0) + (sharerIds.has(p.id) ? share : 0)),
+    ]),
+  );
+}
+
 // 注：《全岗可用》模版对齐旧系统口径 —— 乘客类型/性别/证件类型均按旧模版原样
 // 输出枚举/代码（ADULT、M、P），不译中文。
 
@@ -581,6 +640,8 @@ interface OrderContext {
   visaAmountByPassenger: ReadonlyMap<string, number>;
   /** 单内是否全员自备签 —— passengerVisaStatusCell 第 3 档的订单级输入（算一次，行内复用）。*/
   allPassengersExempt: boolean;
+  /** 单房差（**按乘客**）：只记到单住的乘客，见 perPaxSingleRoomDiffByPassenger。*/
+  singleRoomDiffByPassenger: ReadonlyMap<string, number>;
   paidPerPax: number; // 到账金额 = paidAmount ÷ pax
   // 尾款 = max(0, total + adjustmentCny − paidAmount − prepaymentOffset) ÷ pax。含售后费（改期费/
   // 换人费等走 adjustmentCny，不在 total 里）与代理预付款抵扣（prepaymentOffset）——漏掉任一项都会让
@@ -684,6 +745,7 @@ export function buildOrderContext(
     settlePerPax: round2((total + adjustment) / paxCount),
     visaAmountByPassenger: perPaxVisaAmountByPassenger(order),
     allPassengersExempt: allPassengersVisaExempt(order.passengers),
+    singleRoomDiffByPassenger: perPaxSingleRoomDiffByPassenger(order),
     paidPerPax: round2(paid / paxCount),
     balancePerPax: round2(Math.max(0, total + adjustment - paid - prepaymentOffset) / paxCount),
   };
@@ -717,8 +779,8 @@ interface FullRow {
   settleReceivedAt: string; // 结算价到账时间
   settleChannel: string; // 结算价到账渠道
   balanceDue: number; // 尾款金额（人均）
-  singleRoomDiff: string; // 单房差 — 暂无数据，留空
-  singleRoomDiffReceived: string; // 单房差到账金额 — 留空
+  singleRoomDiff: number; // 单房差（按乘客：只记到单住的人，见 perPaxSingleRoomDiffByPassenger）
+  singleRoomDiffReceived: string; // 单房差到账金额 — 收款不分项，留空
   visaAmount: number; // 签证金额（人均）
   visaReceived: string; // 签证到账金额 — 留空
   offsetAmount: number; // 抵扣金额（人均）
@@ -947,7 +1009,7 @@ export function orderToFullRows(
     settleReceivedAt: lastPayment ? businessDateTimeSec(lastPayment.paidAt) : '',
     settleChannel: lastPayment ? PAYMENT_METHOD_LABEL[lastPayment.method] ?? lastPayment.method : '',
     balanceDue: ctx.balancePerPax,
-    singleRoomDiff: '',
+    singleRoomDiff: ctx.singleRoomDiffByPassenger.get(p.id) ?? 0,
     singleRoomDiffReceived: '',
     visaAmount: ctx.visaAmountByPassenger.get(p.id) ?? 0,
     visaReceived: '',

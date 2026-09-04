@@ -39,6 +39,7 @@ import {
   passengerVisaStatusCell,
   perPaxSettlementByPassenger,
   perPaxVisaAmountByPassenger,
+  perPaxSingleRoomDiffByPassenger,
   allPassengersVisaExempt,
   pnrName,
   withoutAgentHiddenColumns,
@@ -174,7 +175,7 @@ export interface MasterRow {
   settlementDiscountAmount: number; // 立减金额（人均，订单立减快照行金额绝对值合计）
   balanceDue: number; // 尾款金额（人均）= max(0, total + adjustmentCny − paid − prepaymentOffset) / 人数，含售后调整与预付款抵扣
   settleReceived: number; // 已到账金额（人均）
-  singleRoomDiff: number; // 单房差（人均）
+  singleRoomDiff: number; // 单房差（按乘客：只记到单住的人）
   visaAmount: number; // 签证金额（人均）
   visaSupplier: string; // 签证公司（供应商/代办渠道，多签证去重逗号拼接）— 财务对账用，缺失留空
   visaStatus: string; // 签证状态（按乘客：自备签 / 送签进度，回落订单级 + 履约任务）
@@ -516,12 +517,9 @@ export function orderToMasterRows(
     ),
   ).join(', ');
 
-  // ── 单房差：从酒店/套餐行 metadata.singleRoomDiff 汇总（系统若无该字段 → 0）──
-  const singleRoomDiffOrder = order.items.reduce((s, it) => {
-    const meta = (it.metadata ?? null) as { singleRoomDiff?: unknown } | null;
-    const v = meta && typeof meta.singleRoomDiff === 'number' ? meta.singleRoomDiff : 0;
-    return s + v;
-  }, 0);
+  // ── 单房差：按乘客（只记到单住的人）。改前读的 metadata.singleRoomDiff 系统从没写过，整列恒 0；
+  // 真实来源是套餐行 addOns.singleSupplementTotal 与补收单房差 FEE 行 —— 见 perPaxSingleRoomDiffByPassenger。
+  const singleRoomDiffByPassenger = perPaxSingleRoomDiffByPassenger(order);
 
   // ── 退款：已完成退款金额合计 ──
   const refundTotal = order.refunds
@@ -616,7 +614,7 @@ export function orderToMasterRows(
       settlementDiscountAmount: settlementDiscountPerPax,
       balanceDue: balancePerPax,
       settleReceived: paidPerPax,
-      singleRoomDiff: round2(singleRoomDiffOrder / paxCount),
+      singleRoomDiff: singleRoomDiffByPassenger.get(p.id) ?? 0,
       // 签证金额按人（自备签 = 0）—— 见 perPaxVisaAmountByPassenger。
       visaAmount: visaAmountByPassenger.get(p.id) ?? 0,
       visaSupplier: p.visaExempt === true ? '' : visaSupplier,

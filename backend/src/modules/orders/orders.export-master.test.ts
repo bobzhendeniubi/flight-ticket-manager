@@ -144,7 +144,7 @@ function fixtureRoundTripBundle(): OrderForMasterExport {
         flightCabin: null,
         hotelRoomTypeId: 'hrt1',
         amount: 0,
-        metadata: { singleRoomDiff: 800 },
+        metadata: null,
         flightSchedule: null,
         hotelRoomType: { name: '标准双床', hotel: { name: '明月酒店' } },
         visa: null,
@@ -221,7 +221,7 @@ function fixtureBundleHotelStampedOnBundleItem(): OrderForMasterExport {
         flightCabin: null,
         hotelRoomTypeId: 'hrt_dn4s',
         amount: 8000,
-        metadata: { singleRoomDiff: 0 },
+        metadata: null,
         flightSchedule: null,
         hotelRoomType: { name: '海景房', hotel: { name: '岘港四季度假村' } },
         visa: null,
@@ -280,8 +280,9 @@ describe('orderToMasterRows', () => {
     // 订单成本（OrderCostItem）
     expect(r1.orderCost).toBe('操作费 20');
 
-    // 单房差 metadata 汇总 800 / 2 人 = 400；签证金额 500/2 = 250
-    expect(r1.singleRoomDiff).toBe(400);
+    // 单房差：本单无单住乘客、无套餐单住小计、无补收单房差行 → 0（按乘客取值见下方 describe）；
+    // 签证金额 500/2 = 250
+    expect(r1.singleRoomDiff).toBe(0);
     expect(r1.visaAmount).toBe(250);
 
     // 签证状态：订单级 E_VISA 优先 → 电子签
@@ -1405,6 +1406,50 @@ describe('全岗总表 — 签证状态按乘客取值', () => {
       { ...base, id: 'q4', visaExempt: false },
     ];
     expect(orderToMasterRows(order).map((r) => r.visaAmount)).toEqual([0, 0, 220, 220]);
+  });
+
+  // ── 单房差按乘客：改前读 metadata.singleRoomDiff（系统从没写过）→ 整列恒 0 ─────────────
+  it('补收单房差 FEE 行挂了乘客 → 只记到该乘客，其余 0', () => {
+    const order = fixtureRoundTripBundle();
+    const o = order as unknown as { items: unknown[]; passengers: Array<Record<string, unknown>> };
+    o.passengers[0] = { ...o.passengers[0], singleRoom: true };
+    o.items.push({
+      id: 'fee1', kind: 'FEE', flightCabin: null, hotelRoomTypeId: null, amount: 800,
+      description: '补收单房差 ¥400/晚 × 2晚', passengerId: 'p1',
+      metadata: { priceAdjustment: true, reasonCode: 'ROOM_DIFF', perNightCny: 400, nights: 2 },
+      flightSchedule: null, hotelRoomType: null, visa: null, fulfillmentTasks: [],
+    });
+    expect(orderToMasterRows(order).map((r) => r.singleRoomDiff)).toEqual([800, 0]);
+  });
+
+  it('老的补收单房差行没挂乘客 → 归到单住的那位，不摊给拼房的人', () => {
+    const order = fixtureRoundTripBundle();
+    const o = order as unknown as { items: unknown[]; passengers: Array<Record<string, unknown>> };
+    o.passengers[1] = { ...o.passengers[1], singleRoom: true };
+    o.items.push({
+      id: 'fee1', kind: 'FEE', flightCabin: null, hotelRoomTypeId: null, amount: 600,
+      description: '补收单房差 ¥300/晚 × 2晚', passengerId: null,
+      metadata: { priceAdjustment: true, reasonCode: 'ROOM_DIFF', perNightCny: 300, nights: 2 },
+      flightSchedule: null, hotelRoomType: null, visa: null, fulfillmentTasks: [],
+    });
+    expect(orderToMasterRows(order).map((r) => r.singleRoomDiff)).toEqual([0, 600]);
+  });
+
+  it('套餐单下单时的单住小计 addOns.singleSupplementTotal → 记到单住乘客', () => {
+    const order = fixtureBundleHotelStampedOnBundleItem();
+    const o = order as unknown as {
+      passengers: Array<Record<string, unknown>>;
+      items: Array<{ kind: string; metadata: unknown }>;
+    };
+    const [base] = o.passengers;
+    o.passengers = [
+      { ...base, id: 'q1', singleRoom: true },
+      { ...base, id: 'q2', singleRoom: false },
+      { ...base, id: 'q3', singleRoom: false },
+    ];
+    const bundleItem = o.items.find((it) => it.kind === 'BUNDLE')!;
+    bundleItem.metadata = { addOns: { singleCount: 1, singleSupplementCnyPerNight: 100, nights: 4, singleSupplementTotal: 400 } };
+    expect(orderToMasterRows(order).map((r) => r.singleRoomDiff)).toEqual([400, 0, 0]);
   });
 
   it('套餐单带下单快照 visaListSnapshotCny=240 → 非自备签各 240，不再 ÷ 人数', () => {
