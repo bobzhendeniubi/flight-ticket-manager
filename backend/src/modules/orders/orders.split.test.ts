@@ -2016,6 +2016,29 @@ describe('拆单 · 分房/房数脏数据闸（L2 / L4）', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
+describe('拆单 · SPLIT_ORDER 审计的 targetTotal 口径（有售后费的单）', () => {
+  it('审计 targetTotal = 新单落库 total（份额 − 分摊的售后费），另留 movedShareCny 记份额', async () => {
+    // 应收 2000 + 售后费 200 = 2200，两人各 1100；拆出 1 人带走一半售后费 100
+    // → 新单落库 total = 1100 − 100 = 1000，源单 total = 1000。
+    armExecute({
+      order: baseOrder({ adjustmentCny: 200 }),
+      targetItemsSum: 1000,
+      sourceItemsSum: 1000,
+      finalSource: { total: 1000, paidAmount: 0, adjustmentCny: 100 },
+      finalTarget: { total: 1000, paidAmount: 500, adjustmentCny: 100 },
+    });
+
+    await service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin);
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const after = mockPrisma.auditLog.create.mock.calls[0][0].data.after as any;
+    expect(after.sourceTotal).toBe(1000);
+    expect(after.targetTotal).toBe(1000);
+    expect(after.movedShareCny).toBe(1100);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
 describe('拆单 · 新单继承源单下单时刻（跨月拆单的财务分期）', () => {
   it('新单 createdAt = 源单 createdAt，不落建单当刻', async () => {
     armExecute({

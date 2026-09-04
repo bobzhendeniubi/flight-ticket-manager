@@ -12761,7 +12761,12 @@ export class OrderService {
           sourceOrderNumber: outcome.result.sourceOrderNumber,
           targetOrderNumber: outcome.result.targetOrderNumber,
           sourceTotal: outcome.sourceTotalAfterCny,
-          targetTotal: outcome.result.movedShareCny,
+          // 新单**落库的 total**（= 份额 − 随拆分摊的售后费），与 sourceTotal 同口径。
+          // 从前这里写的是份额 movedShareCny：有售后费的单两者不等，
+          // 一条审计里两侧却按两种口径记，财务照着对账永远差一个售后费。
+          targetTotal: outcome.targetTotalCny,
+          // 份额单独留一个字段（只增不删，读审计的前端 auditFormat 不受影响）。
+          movedShareCny: outcome.result.movedShareCny,
           sourcePaid: outcome.sourcePaidAfterCny,
           targetPaid: outcome.result.movedPaidCny,
           movedPassengerIds: input.passengerIds,
@@ -12888,6 +12893,8 @@ export class OrderService {
         preTotalCny: number;
         prePaidCny: number;
         sourceTotalAfterCny: number;
+        /** 新单落库 total（份额 − 随拆分摊的售后费）——审计的 targetTotal 就取它。 */
+        targetTotalCny: number;
         sourcePaidAfterCny: number;
         allShareRows: Array<{ passengerId: string; netCny: number; shareCny: number }>;
         passengerSummary: Array<{ id: string; name: string; moved: boolean }>;
@@ -13822,6 +13829,7 @@ export class OrderService {
       preTotalCny,
       prePaidCny,
       sourceTotalAfterCny,
+      targetTotalCny,
       sourcePaidAfterCny,
       allShareRows: assessment.allShareRows,
       passengerSummary: order.passengers.map((p) => ({
