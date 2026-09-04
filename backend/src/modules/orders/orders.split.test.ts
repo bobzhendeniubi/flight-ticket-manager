@@ -2052,11 +2052,37 @@ describe('拆单 · 按人调价把份额算成负数/超出整单应收（A4）
     expect(r.blockers.join()).toContain('PAX p1');
   });
 
-  it('preview：拆出份额超过整单应收（留守侧会变负）→ 人话 blocker', async () => {
+  it('preview：拆出份额超过整单应收 → 单独一句，只讲「拆出多少 vs 整单应收多少」', async () => {
     armCleanGates();
     mockPrisma.order.findUnique.mockResolvedValue(skewedOrder());
     const r = await service.previewOrderSplit('o1', { passengerIds: ['p2'] }, admin);
-    expect(r.blockers.join()).toContain('超出整单应收');
+    const overPayable = r.blockers.find((b) => b.includes('超出整单应收'));
+    expect(overPayable).toBeDefined();
+    expect(overPayable).toContain('拆出 ¥1250');
+    expect(overPayable).toContain('整单应收 ¥1000');
+    // 这一句只说「超出」这件事，不把「一侧为负」的数字也塞进来
+    expect(overPayable).not.toContain('留守');
+    expect(overPayable).not.toContain('新单');
+  });
+
+  it('preview：拆完一侧为负 → 另起一句，新单那个数叫「基础总额」不叫「应收」', async () => {
+    armCleanGates();
+    mockPrisma.order.findUnique.mockResolvedValue(skewedOrder());
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p2'] }, admin);
+    const negativeSide = r.blockers.find((b) => b.includes('一侧基础金额为负'));
+    expect(negativeSide).toBeDefined();
+    expect(negativeSide).toContain('新单基础总额 ¥1250');
+    expect(negativeSide).toContain('留守 ¥-250');
+    // targetTotalCny 是「份额 − 分摊的售后费」，不是应收，别再叫「新单应收」
+    expect(r.blockers.join()).not.toContain('新单应收');
+  });
+
+  it('preview：两种触发原因各占一句，不再糊成一条', async () => {
+    armCleanGates();
+    mockPrisma.order.findUnique.mockResolvedValue(skewedOrder());
+    const r = await service.previewOrderSplit('o1', { passengerIds: ['p2'] }, admin);
+    expect(r.blockers.filter((b) => b.includes('超出整单应收'))).toHaveLength(1);
+    expect(r.blockers.filter((b) => b.includes('一侧基础金额为负'))).toHaveLength(1);
   });
 
   it('execute：同一份闸在执行段拦下，绝不建新单', async () => {

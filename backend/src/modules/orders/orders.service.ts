@@ -12649,16 +12649,21 @@ export class OrderService {
           '拆单只搬钱不改钱，负份额会把一侧订单金额拆成负数。请先调整该乘客的调价行再拆单。',
       );
     }
+    // 两种触发原因分两句：运营看到的第一件事应该是「哪儿不对」，而不是一串数字里自己找。
+    // ① 拆出份额本身就超过整单应收；② 拆完两侧里有一侧算出来是负数。
     const keptShareCny = round2(payableCny - movedShareCny);
-    if (
-      movedShareCny > payableCny + SHARE_EPS ||
-      keptShareCny < -SHARE_EPS ||
-      targetTotalCny < -SHARE_EPS
-    ) {
+    if (movedShareCny > payableCny + SHARE_EPS) {
       blockers.push(
-        `按乘客调价后拆出的份额超出整单应收（拆出 ¥${movedShareCny}、整单应收 ¥${payableCny}、` +
-          `留守侧 ¥${keptShareCny}、新单应收 ¥${targetTotalCny}）：` +
-          '拆完会有一侧金额为负。请先调整相关乘客的调价行再拆单。',
+        `按乘客调价后拆出份额超出整单应收（拆出 ¥${movedShareCny}，整单应收 ¥${payableCny}）：` +
+          '拆单只搬钱不改钱，搬不出比整单还多的钱。请先调整相关乘客的调价行再拆单。',
+      );
+    }
+    // targetTotalCny = 份额 − 分摊的售后费，是新单**基础总额**，不是应收（应收还要再加回
+    // 新单自己的 adjustmentCny）。叫错名字会让运营拿它去对尾款，怎么对都对不上。
+    if (keptShareCny < -SHARE_EPS || targetTotalCny < -SHARE_EPS) {
+      blockers.push(
+        `按乘客调价后拆完有一侧基础金额为负（新单基础总额 ¥${targetTotalCny} / 留守 ¥${keptShareCny}）：` +
+          '负金额订单没有业务含义。请先调整相关乘客的调价行再拆单。',
       );
     }
 
