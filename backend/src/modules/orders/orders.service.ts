@@ -13240,7 +13240,18 @@ export class OrderService {
       const view = toSplitItemView(item);
       const plan = planItemMove(view, splitCtx);
       movePlans.push({ item: view, plan });
-      if (plan.mode === 'NONE') continue;
+      if (plan.mode === 'NONE') {
+        // 「不动」也可能带一个就地补丁（目前只有：源单 no-show 名单裁掉被拆走的人）。
+        // 类型上只允许改 metadata —— 一条「不动」的决策改不了数量/金额/房数，守恒断言的
+        // 前提不受影响。
+        if (plan.update) {
+          await tx.orderItem.update({
+            where: { id: item.id },
+            data: splitPatchToPrisma(plan.update),
+          });
+        }
+        continue;
+      }
       if (plan.mode === 'WHOLE') {
         await tx.orderItem.update({
           where: { id: item.id },

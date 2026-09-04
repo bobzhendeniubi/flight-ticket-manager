@@ -933,6 +933,64 @@ describe('部分拆分时源单 no-show 名单要裁掉被拆走的人（否则�
     expect(plan.keep.metadata).toBeUndefined();
   });
 
+  // 只拆不占座的婴儿：机票行的 quantity 是占座数，movedSeatPax = 0 → 这一行搬 0 件，
+  // 决策是 NONE。名单裁剪写在早退之后，于是婴儿一直挂在源单的未登机名单上，
+  // 报表按 passengerIds.length 计人次，越拆越虚。
+  it('只拆婴儿（本行搬 0 件）→ 仍裁掉源单名单里的婴儿，行其它字段一个不动', () => {
+    const plan = moveFlightLike(
+      item({
+        kind: OrderItemKind.FLIGHT,
+        quantity: 2,
+        metadata: {
+          noShow: { at: '2026-09-02T02:00:00.000Z', passengerIds: ['p1', 'p2', 'baby'] },
+        },
+      }),
+      ctx({
+        movedIdSet: new Set(['baby']),
+        movedOccupancy: occ(0, 0, 1),
+        keptOccupancy: occ(2),
+      }),
+    );
+    if (plan.mode !== 'NONE') throw new Error('expected NONE');
+    const keepMeta = plan.update?.metadata as Record<string, unknown> | undefined;
+    expect(keepMeta).toBeDefined();
+    const keptNoShow = keepMeta!.noShow as { at: string; passengerIds: string[] };
+    expect(keptNoShow.passengerIds).toEqual(['p1', 'p2']);
+    expect(keptNoShow.at).toBe('2026-09-02T02:00:00.000Z');
+    // 补丁里只有 metadata：座位、金额、成本一律不动（这一行根本没被拆）
+    expect(Object.keys(plan.update!)).toEqual(['metadata']);
+  });
+
+  it('只拆婴儿但这一行没有 no-show 名单 → NONE 不带补丁，一个字段都不写回', () => {
+    const plan = moveFlightLike(
+      item({ kind: OrderItemKind.FLIGHT, quantity: 2 }),
+      ctx({
+        movedIdSet: new Set(['baby']),
+        movedOccupancy: occ(0, 0, 1),
+        keptOccupancy: occ(2),
+      }),
+    );
+    if (plan.mode !== 'NONE') throw new Error('expected NONE');
+    expect(plan.update).toBeUndefined();
+  });
+
+  it('只拆婴儿、名单是老数据（没有 passengerIds）→ 同样不带补丁', () => {
+    const plan = moveFlightLike(
+      item({
+        kind: OrderItemKind.FLIGHT,
+        quantity: 2,
+        metadata: { noShow: { at: '2026-09-02T02:00:00.000Z' } },
+      }),
+      ctx({
+        movedIdSet: new Set(['baby']),
+        movedOccupancy: occ(0, 0, 1),
+        keptOccupancy: occ(2),
+      }),
+    );
+    if (plan.mode !== 'NONE') throw new Error('expected NONE');
+    expect(plan.update).toBeUndefined();
+  });
+
   it('升舱人数与 no-show 名单同时存在时两者都写进 keep 补丁', () => {
     const plan = moveFlightLike(
       item({

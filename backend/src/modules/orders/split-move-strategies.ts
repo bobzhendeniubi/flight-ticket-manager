@@ -208,9 +208,16 @@ export interface SplitRowPatch {
   metadata?: Record<string, unknown>;
 }
 
-/** 搬移决策：不动 / 整行搬走 / 拆成两行。 */
+/**
+ * 搬移决策：不动 / 整行搬走 / 拆成两行。
+ *
+ * NONE 的 `update` 是「这一行不随拆搬走，但源行上有东西要就地改一下」——
+ * 目前只有一种：源单 no-show 名单要裁掉被拆走的人。**只允许改 metadata**
+ * （故意收成 Pick 而不是整个 SplitRowPatch）：一条「不动」的决策若能改数量、金额、
+ * 房数，守恒断言就再也拦不住它了。
+ */
 export type SplitMove =
-  | { mode: 'NONE' }
+  | { mode: 'NONE'; update?: Pick<SplitRowPatch, 'metadata'> }
   | { mode: 'WHOLE'; update: SplitRowPatch }
   | { mode: 'SPLIT'; keep: SplitRowPatch; move: SplitRowPatch };
 
@@ -265,8 +272,17 @@ export function movedUnitsFor(item: SplitItemView, ctx: SplitContext): number {
  */
 export function moveFlightLike(item: SplitItemView, ctx: SplitContext): SplitMove {
   const moveQty = movedUnitsFor(item, ctx);
-  if (moveQty <= 0) return { mode: 'NONE' };
   const md = item.metadata;
+  if (moveQty <= 0) {
+    // 这一行一件都不搬（典型：只拆不占座的婴儿，机票行 quantity 是占座数 → 需求为 0），
+    // 但源单的 no-show 名单照样要把被拆走的人裁掉 —— 名单裁剪原本写在这个早退之后，
+    // 于是那个人一直挂在源单的未登机名单上，报表按 passengerIds.length 计人次越拆越虚。
+    // 只回一个 metadata 补丁：数量、金额、成本、房数一个都不动，这一行确实没被拆。
+    const trimmed = trimNoShowRoster(md.noShow, ctx.movedIdSet);
+    return trimmed == null
+      ? { mode: 'NONE' }
+      : { mode: 'NONE', update: { metadata: { ...md, noShow: trimmed } } };
+  }
   if (moveQty >= item.quantity) {
     // 整行过户也要剥掉会话级快照（幂等 token 与放座明细），描述前缀与快照成对剥。
     return {

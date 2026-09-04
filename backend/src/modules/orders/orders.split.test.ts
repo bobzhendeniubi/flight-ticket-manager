@@ -2161,4 +2161,57 @@ describe('拆单 · 只拆婴儿/儿童的提示（M7）', () => {
     expect(r.eligible).toBe(true);
     expect(r.warnings.join()).toContain('只拆出婴儿');
   });
+
+  // 机票行的 quantity 是**占座数**，只拆不占座的婴儿时这一行一件都不搬（决策 NONE）。
+  // 名单裁剪原本写在 NONE 早退之后，于是婴儿一直挂在源单的未登机名单上 ——
+  // no-show 报表按 passengerIds.length 计人次，越拆越虚。
+  it('只拆婴儿 → 源单航段行不搬，但 no-show 名单里的婴儿被就地裁掉', async () => {
+    const infantOrder = baseOrder({
+      passengers: [pax('baby', { passengerType: 'INFANT' }), pax('p2'), pax('p3')],
+      items: [
+        flightItem({
+          metadata: {
+            noShow: { at: '2026-09-02T02:00:00.000Z', passengerIds: ['baby', 'p2', 'p3'] },
+          },
+        }),
+      ],
+    });
+    armExecute({
+      order: infantOrder,
+      targetItemsSum: 0,
+      sourceItemsSum: 2000,
+      finalSource: { total: 1333.33, paidAmount: 0, passengerCount: 2 },
+      finalTarget: { total: 666.67, paidAmount: 500 },
+      conservationRows: [
+        {
+          kind: 'FLIGHT',
+          flightScheduleId: 'sch1',
+          flightCabin: 'ECONOMY',
+          quantity: 2,
+          metadata: null,
+          roomsBilled: null,
+          totalCostCny: 1200,
+        },
+      ],
+    });
+
+    await service.splitOrder('o1', { passengerIds: ['baby'], requestToken: TOKEN }, admin);
+
+    const rosterWrite = mockPrisma.orderItem.update.mock.calls
+      .map((call) => call[0] as { where: { id: string }; data: Record<string, unknown> })
+      .find((arg) => arg.where.id === 'i1' && arg.data.metadata !== undefined);
+    expect(rosterWrite).toBeDefined();
+    const noShow = (rosterWrite!.data.metadata as Record<string, unknown>).noShow as {
+      at: string;
+      passengerIds: string[];
+    };
+    expect(noShow.passengerIds).toEqual(['p2', 'p3']);
+    expect(noShow.at).toBe('2026-09-02T02:00:00.000Z');
+    // 这一行确实没被拆：座位、金额、成本一个都没写
+    expect(rosterWrite!.data.quantity).toBeUndefined();
+    expect(rosterWrite!.data.amount).toBeUndefined();
+    expect(rosterWrite!.data.totalCostCny).toBeUndefined();
+    // 行也没有被过户到新单
+    expect(rosterWrite!.data.orderId).toBeUndefined();
+  });
 });
