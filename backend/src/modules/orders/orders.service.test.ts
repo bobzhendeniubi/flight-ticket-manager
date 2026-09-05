@@ -5734,11 +5734,11 @@ describe('OrderService.rescheduleOrderItem · 换班次即作废原票', () => {
 describe('OrderService.rescheduleOrderItem · 酒店入住日期随出发日平移', () => {
   const HOTEL_ROW = () => ({
     id: 'hot1',
-    description: '海边酒店 · 标准房 · 2026-09-05~2026-09-06 · 1晚 × 1间',
+    description: '海边酒店 · 标准房 · 2027-09-05~2027-09-06 · 1晚 × 1间',
     hotelRoomTypeId: 'rt1',
     randomStarTier: null,
-    hotelCheckIn: new Date('2026-09-05T00:00:00.000Z'),
-    hotelCheckOut: new Date('2026-09-06T00:00:00.000Z'),
+    hotelCheckIn: new Date('2027-09-05T00:00:00.000Z'),
+    hotelCheckOut: new Date('2027-09-06T00:00:00.000Z'),
     roomsBilled: { toString: () => '1' },
   });
 
@@ -5760,7 +5760,7 @@ describe('OrderService.rescheduleOrderItem · 酒店入住日期随出发日平�
       flightScheduleId: 'sched-old',
       flightCabin: 'ECONOMY',
       metadata: {},
-      flightSchedule: { departureTime: new Date('2026-09-05T02:00:00.000Z'), departureTz: null },
+      flightSchedule: { departureTime: new Date('2027-09-05T02:00:00.000Z'), departureTz: null },
     });
     // findMany 三路分发：改期后重查航段（kind=FLIGHT，被改行已是新班次）/ 占房行 / 立减行
     mockPrisma.orderItem.findMany.mockReset().mockImplementation(
@@ -5788,7 +5788,7 @@ describe('OrderService.rescheduleOrderItem · 酒店入住日期随出发日平�
     mockPrisma.orderItem.update.mockReset().mockResolvedValue({});
     mockPrisma.order.update.mockReset().mockResolvedValue({});
     mockPrisma.flightSchedule.findUnique.mockReset().mockResolvedValue({
-      departureTime: new Date('2026-09-05T02:00:00.000Z'),
+      departureTime: new Date('2027-09-05T02:00:00.000Z'),
       departureTz: null,
       flight: { flightNumber: 'XX101' },
     });
@@ -5798,7 +5798,7 @@ describe('OrderService.rescheduleOrderItem · 酒店入住日期随出发日平�
   it('出发日 9/5 → 9/1（−4 天）：酒店行入住/离店同步平移，description 日期段改写，审计留痕', async () => {
     const service = new OrderService();
     vi.spyOn(service, '_updateStatusWithinTx').mockResolvedValue(undefined as never);
-    mountFlightWithHotel({ newDepartIso: '2026-09-01T02:00:00.000Z' });
+    mountFlightWithHotel({ newDepartIso: '2027-09-01T02:00:00.000Z' });
 
     const result = await service.rescheduleOrderItem(
       'ord1',
@@ -5809,16 +5809,16 @@ describe('OrderService.rescheduleOrderItem · 酒店入住日期随出发日平�
     const hotelWrite = mockPrisma.orderItem.update.mock.calls
       .map((call) => call[0] as { where: { id: string }; data: Record<string, unknown> })
       .find((arg) => arg.where.id === 'hot1');
-    expect(hotelWrite?.data.hotelCheckIn).toEqual(new Date('2026-09-01T00:00:00.000Z'));
-    expect(hotelWrite?.data.hotelCheckOut).toEqual(new Date('2026-09-02T00:00:00.000Z'));
-    expect(hotelWrite?.data.description).toBe('海边酒店 · 标准房 · 2026-09-01~2026-09-02 · 1晚 × 1间');
+    expect(hotelWrite?.data.hotelCheckIn).toEqual(new Date('2027-09-01T00:00:00.000Z'));
+    expect(hotelWrite?.data.hotelCheckOut).toEqual(new Date('2027-09-02T00:00:00.000Z'));
+    expect(hotelWrite?.data.description).toBe('海边酒店 · 标准房 · 2027-09-01~2027-09-02 · 1晚 × 1间');
     expect(result.audit.hotelDateSync).toEqual([
       {
         orderItemId: 'hot1',
-        fromCheckIn: '2026-09-05',
-        toCheckIn: '2026-09-01',
-        fromCheckOut: '2026-09-06',
-        toCheckOut: '2026-09-02',
+        fromCheckIn: '2027-09-05',
+        toCheckIn: '2027-09-01',
+        fromCheckOut: '2027-09-06',
+        toCheckOut: '2027-09-02',
       },
     ]);
   });
@@ -5827,7 +5827,7 @@ describe('OrderService.rescheduleOrderItem · 酒店入住日期随出发日平�
     const service = new OrderService();
     vi.spyOn(service, '_updateStatusWithinTx').mockResolvedValue(undefined as never);
     // 新班次同为 9/5（仅时刻不同）→ 最早出发日没动 → 不平移
-    mountFlightWithHotel({ newDepartIso: '2026-09-05T10:00:00.000Z' });
+    mountFlightWithHotel({ newDepartIso: '2027-09-05T10:00:00.000Z' });
 
     const result = await service.rescheduleOrderItem(
       'ord1',
