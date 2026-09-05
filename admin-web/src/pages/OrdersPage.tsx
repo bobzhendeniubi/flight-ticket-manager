@@ -790,6 +790,106 @@ function BulkResultPanel({
   );
 }
 
+/**
+ * 换人费标准（预填选项，如 [450, 550]）：运营/管理员自己在这里改，不用找开发——换人表单
+ * （PassengerEditForm SWAP 模式）据此渲染快捷选项 + 默认预填第一项。ADMIN only（与
+ * hotel-control 的 OversellCapSetting 同款展示，逗号分隔的整数列表）。
+ */
+function SwapFeeOptionsSetting({ token }: { token: string }) {
+  const [options, setOptions] = useState<number[] | null>(null);
+  const [editing, setEditing] = useState(false);
+  const [draft, setDraft] = useState('');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getSwapFeeOptions(token)
+      .then((r) => {
+        if (!cancelled) setOptions(r.options ?? []);
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
+  if (options == null) return null;
+
+  const startEdit = () => {
+    setDraft(options.join(', '));
+    setError(null);
+    setEditing(true);
+  };
+
+  const save = async () => {
+    const parsed = draft
+      .split(',')
+      .map((s) => s.trim())
+      .filter((s) => s !== '')
+      .map(Number);
+    if (parsed.length === 0 || parsed.some((n) => !Number.isInteger(n) || n < 0)) {
+      setError('请填逗号分隔的非负整数，如 450, 550');
+      return;
+    }
+    setSaving(true);
+    setError(null);
+    try {
+      const r = await api.setSwapFeeOptions(token, parsed);
+      setOptions(r.options);
+      setEditing(false);
+    } catch (e) {
+      setError(e instanceof ApiError ? e.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  return (
+    <div className="w-full rounded-lg border border-slate-200 bg-slate-50/60 px-3 py-2.5 text-sm">
+      <span className="text-ink-soft">换人费标准（预填选项）</span>
+      {editing ? (
+        <div className="mt-1.5 flex flex-wrap items-center gap-2">
+          <input
+            type="text"
+            className="input w-48 py-1 text-sm"
+            value={draft}
+            onChange={(e) => setDraft(e.target.value)}
+            placeholder="如 450, 550"
+            autoFocus
+          />
+          <button type="button" className="btn-primary px-3 py-1 text-xs" onClick={() => void save()} disabled={saving}>
+            {saving ? '保存中…' : '保存'}
+          </button>
+          <button
+            type="button"
+            className="btn-ghost px-2 py-1 text-xs"
+            onClick={() => {
+              setEditing(false);
+              setError(null);
+            }}
+            disabled={saving}
+          >
+            取消
+          </button>
+          {error && <span className="text-xs text-rose-600">{error}</span>}
+        </div>
+      ) : (
+        <div className="mt-1.5 flex flex-wrap items-center gap-2">
+          <span className="nums font-semibold text-ink">
+            {options.length > 0 ? options.map((o) => `¥${o}`).join(' / ') : '未配置'}
+          </span>
+          <button type="button" className="btn-ghost px-2 py-1 text-xs" onClick={startEdit}>
+            修改
+          </button>
+        </div>
+      )}
+      <p className="mt-1 text-xs text-ink-muted">换人表单里换人费的快捷选项，第一项作为默认预填值。</p>
+    </div>
+  );
+}
+
 export function OrdersPage() {
   const confirm = useConfirm();
   const highRiskConfirmRef = useRef(false);
@@ -975,6 +1075,8 @@ export function OrdersPage() {
   const [exportingIntake, setExportingIntake] = useState(false);
   // 票务开票快捷导出 — 某日某航段需开票订单（《票务专用》= 航司 PNR 模板）
   const [showTicketingQuick, setShowTicketingQuick] = useState(false);
+  // 换人费标准（预填选项，如 [450, 550]）设置面板 — 仅 ADMIN 可见/可改
+  const [showSwapFeeSettings, setShowSwapFeeSettings] = useState(false);
   const [tkDate, setTkDate] = useState(''); // 出发日期（必填）
   const [tkLeg, setTkLeg] = useState<InvoiceLeg>('outbound'); // 航段，默认去程
   const [tkInvoiced, setTkInvoiced] = useState(false); // 开票状态，默认「未开」
@@ -2616,6 +2718,17 @@ export function OrdersPage() {
               <Icon name="trash" /> 回收站
             </button>
           )}
+          {isAdmin && (
+            <button
+              type="button"
+              className={showSwapFeeSettings ? 'btn-primary text-sm' : 'btn-ghost text-sm'}
+              aria-expanded={showSwapFeeSettings}
+              onClick={() => setShowSwapFeeSettings((v) => !v)}
+              title="配置换人表单里换人费的预填快捷选项（如 450 / 550）"
+            >
+              <Icon name="settings" size={14} /> 换人费标准
+            </button>
+          )}
           <p className="w-full text-right text-xs text-ink-muted">
             {selectedIds.size > 0
               ? `已勾选 ${selectedIds.size} 条：三个导出都只导勾选的这些订单（忽略上方筛选）；要导出筛选命中的全部 ${ordersTotal ?? 0} 条，清空勾选后直接点导出即可`
@@ -2742,6 +2855,10 @@ export function OrdersPage() {
                 )}
               </p>
             </div>
+          )}
+          {/* 换人费标准（预填选项）：运营/管理员自己改，不用找开发；换人表单据此渲染快捷选项 + 默认预填。 */}
+          {isAdmin && showSwapFeeSettings && tokens?.accessToken && (
+            <SwapFeeOptionsSetting token={tokens.accessToken} />
           )}
         </div>
       </section>
@@ -10348,7 +10465,14 @@ function AdjustmentsSection({ order }: { order: OrderSummary }) {
               className="flex items-start justify-between gap-2 rounded-md border border-amber-200 bg-amber-50/60 p-2.5"
             >
               <div className="flex-1">
-                <div className="text-ink">{moneylessLabel ?? a.label}</div>
+                <div className="text-ink">
+                  {moneylessLabel ?? a.label}
+                  {/* 换人差价/换人费等挂给被换人的条目：该乘客可能已因换人离开 order.passengers，
+                      靠 passengerName 快照标出「这笔算谁的」，不摊入同行人已在上方每人结算价脚注说明。 */}
+                  {a.passengerName && (
+                    <span className="ml-1.5 text-xs font-normal text-ink-muted">· {a.passengerName}</span>
+                  )}
+                </div>
                 {a.note && <div className="mt-0.5 text-xs text-ink-muted">{a.note}</div>}
                 <div className="mt-0.5 text-[11px] text-ink-muted">{formatDateTimeSecCn(a.at)}</div>
               </div>
@@ -10402,8 +10526,10 @@ function PriceAdjustmentSection({
   const hasAnyAdjustment = grouped.wholeOrder.lines.length > 0 || grouped.byPassenger.size > 0;
 
   // 每人结算价（D2 派生展示，票务需求：多人同单要看到每人结算价，如某人补签证只多收她 800）。
-  // 纯展示派生：应收总额 = total + adjustmentCny；基准每人 = (应收总额 − Σ按乘客调价净额) / 人数；
+  // 纯展示派生：应收总额 = total + 可摊调整额；基准每人 = (应收总额 − Σ按乘客调价净额) / 人数；
   // 每人结算价 = 基准每人 + 该乘客净额。不接受任何独立输入，不是「手填每人价格」的口子。
+  // order.adjustments 里 excludeFromPerPax===true 的条目（换人差价/换人费挂给已离开订单的
+  // 被换人）从摊入基数里剔除，见 perPaxSettlement.ts 的 spreadableAdjustmentCny。
   const perPax = useMemo(() => {
     if (order.passengers.length < 2) return null;
     const netByPassenger = new Map<string, number>(
@@ -10412,10 +10538,11 @@ function PriceAdjustmentSection({
     return computePerPaxSettlement({
       totalCny: Number(order.total),
       adjustmentCny: order.adjustmentCny,
+      adjustments: order.adjustments ?? [],
       passengerIds: order.passengers.map((p) => p.id),
       netByPassenger,
     });
-  }, [order.passengers, order.total, order.adjustmentCny, grouped.byPassenger]);
+  }, [order.passengers, order.total, order.adjustmentCny, order.adjustments, grouped.byPassenger]);
 
   // 内部角色才可见（对外脱敏时后端也不下发逐项金额；这里再做一道前端权限门）。
   if (!isOps) return null;
@@ -10541,6 +10668,13 @@ function PriceAdjustmentSection({
               </tr>
             </tfoot>
           </table>
+          {/* 换人差价/换人费挂给已离开订单的被换人（excludeFromPerPax），不摊给同行人，
+              合计因此比 order.total+adjustmentCny 少这一截，这里说明差额去向。 */}
+          {perPax.excludedCny > 0 && (
+            <p className="mt-1 text-[11px] text-ink-muted">
+              含被换人承担的换人费/差价 ¥{perPax.excludedCny.toLocaleString()}（不摊入同行人）
+            </p>
+          )}
         </div>
       )}
 
@@ -10680,9 +10814,56 @@ type PassengerHistoryEntry = {
   snapshot?: SwapBeforeSnapshot;
   /** 仅 SWAP：换人费（旧记录/未收费为 null） */
   feeCny?: number | null;
+  /** 仅 SWAP：按今日结算价日历重算的结果（换人差价批次新增；旧记录没有） */
+  reprice?: SwapReprice;
   /** 仅 CORRECTION：本次实际改动的字段名（后端 CORRECTABLE_IDENTITY_FIELDS 子集） */
   changedFields?: string[];
 };
+
+/** 换人时按今日结算价日历重算的结果（后端审计 after.reprice，见 GET .../swap-preview 同款字段）。 */
+type SwapReprice = {
+  /** 原人结算价（建单日历口径） */
+  basisCny: number;
+  newSettlementCny: number | null;
+  diffCny: number;
+  feeCny: number | null;
+  /**
+   * 未按日历重算的原因码（非 null = 未重算，下面几项数值不采信）：
+   * SETTLEMENT_LOCKED=结算价已锁定 / NO_CALENDAR=日历无该日期价格 /
+   * NOT_CALENDAR_PRICED=本单结算价非日历定价 / DIFF_OVER_CAP=差价超过单次调价上限。
+   */
+  repriceSkipped: string | null;
+  calendarSource?: string | null;
+};
+
+/** repriceSkipped 原因码 → 中文说明（换人历史 SwapRepriceNote 与换人前预览共用同一份文案）。 */
+const REPRICE_SKIPPED_LABEL: Record<string, string> = {
+  SETTLEMENT_LOCKED: '结算价已锁定，未按日历重算',
+  NO_CALENDAR: '结算价日历无该日期价格，未重算',
+  NOT_CALENDAR_PRICED: '本单结算价非日历定价，未重算（如需调整请手工调价）',
+  DIFF_OVER_CAP: '差价超过单次调价上限，未重算',
+  // 建单后改过档或改过期：基准价的定价键（档次/晚数/出发日）已变，改档差价或改期价差
+  // 已在各自流程里收过，换人不再按日历重算，避免二次收取。
+  PRICING_KEY_CHANGED: '本单改档/改期后定价键已变，不按日历重算',
+};
+
+/**
+ * 换人差价三态文案（新人结算价 vs 原人建单日历结算价），换人前预览/换人确认弹窗/换人历史三处共用。
+ * diffCny 是后端夹在 ≥0 的口径（涨价夹成 0），判断涨跌必须看 delta = newSettlementCny − basisCny，
+ * 不能看 diffCny 的符号——否则「新人结算价更高」这一支永远进不去（M3）。
+ * basisCny/newSettlementCny 任一缺失（未重算/请求中）时返回 null，调用方按“不显示”处理，不硬凑数字。
+ */
+function swapRepriceDeltaText(
+  basisCny: number | null,
+  newSettlementCny: number | null,
+  diffCny: number,
+): string | null {
+  if (basisCny == null || newSettlementCny == null) return null;
+  const delta = newSettlementCny - basisCny;
+  if (delta > 0) return `新人结算价较建单日历高 ¥${delta.toLocaleString()}，本单应收相应增加`;
+  if (delta < 0) return `差价 ¥${Math.abs(diffCny).toLocaleString()} 挂被换人`;
+  return '结算价与建单日历一致，无差价';
+}
 
 /** CORRECTION 改动字段名 → 中文标签（与后端 CORRECTABLE_IDENTITY_FIELDS 一一对应） */
 const CORRECTION_FIELD_LABEL: Record<string, string> = {
@@ -10734,6 +10915,24 @@ function readFeeCny(payload: unknown): number | null {
   return typeof v === 'number' ? v : null;
 }
 
+/** 换人差价重算结果的安全读取（after.reprice；换人差价批次新增，旧记录没有 → undefined，不造数据）。 */
+function readSwapReprice(payload: unknown): SwapReprice | undefined {
+  if (!payload || typeof payload !== 'object') return undefined;
+  const r = (payload as Record<string, unknown>).reprice;
+  if (!r || typeof r !== 'object') return undefined;
+  const o = r as Record<string, unknown>;
+  return {
+    basisCny: typeof o.basisCny === 'number' ? o.basisCny : 0,
+    newSettlementCny: typeof o.newSettlementCny === 'number' ? o.newSettlementCny : null,
+    diffCny: typeof o.diffCny === 'number' ? o.diffCny : 0,
+    feeCny: typeof o.feeCny === 'number' ? o.feeCny : null,
+    // repriceSkipped 是原因码字符串（非布尔）：SETTLEMENT_LOCKED / NO_CALENDAR /
+    // NOT_CALENDAR_PRICED / DIFF_OVER_CAP；未跳过或旧记录都读作 null。
+    repriceSkipped: typeof o.repriceSkipped === 'string' ? o.repriceSkipped : null,
+    calendarSource: typeof o.calendarSource === 'string' ? o.calendarSource : null,
+  };
+}
+
 /** CORRECTION 审计 after.changedFields 的安全读取（旧记录可能没有，缺了就给空数组，不造数据） */
 function readChangedFields(payload: unknown): string[] {
   if (!payload || typeof payload !== 'object') return [];
@@ -10761,6 +10960,7 @@ function auditToPassengerHistory(logs: AuditLog[]): PassengerHistoryEntry[] {
         afterDoc: after.doc,
         snapshot: isSwap ? readSwapSnapshot(l.before) : undefined,
         feeCny: isSwap ? readFeeCny(l.after) : undefined,
+        reprice: isSwap ? readSwapReprice(l.after) : undefined,
         changedFields: isSwap ? undefined : readChangedFields(l.after),
       };
     })
@@ -10876,11 +11076,36 @@ function PassengerSwapHistory({
                 {e.afterDoc && <span className="ml-1 font-mono text-slate-500">{e.afterDoc}</span>}
               </div>
               {e.snapshot && <SwapBeforeSnapshotDetails snapshot={e.snapshot} feeCny={e.feeCny ?? null} />}
+              {e.reprice && <SwapRepriceNote reprice={e.reprice} />}
             </li>
           ),
         )}
       </ul>
     </details>
+  );
+}
+
+// 换人差价重算结果（after.reprice）：换人费 / 差价 / 新人结算价 / 原人结算价一行说清，
+// 未按日历重算（结算价已锁定 / 日历查不到当天价格）时只显示灰字说明，不硬凑数字。
+function SwapRepriceNote({ reprice }: { reprice: SwapReprice }) {
+  // 未按日历重算：只显示原因说明 + 换人费，不摆新人/原人结算价数字（M6：那两项此时不采信）。
+  if (reprice.repriceSkipped) {
+    const label = REPRICE_SKIPPED_LABEL[reprice.repriceSkipped] ?? '未按今日结算价日历重算';
+    return (
+      <p className="mt-1 text-[10px] text-slate-400">
+        {label}
+        {reprice.feeCny != null && reprice.feeCny > 0 && <>{' · '}换人费 ¥{reprice.feeCny.toLocaleString()}</>}
+      </p>
+    );
+  }
+  const deltaText = swapRepriceDeltaText(reprice.basisCny, reprice.newSettlementCny, reprice.diffCny);
+  return (
+    <p className="mt-1 text-[10px] text-slate-500">
+      新人结算价 {reprice.newSettlementCny != null ? `¥${reprice.newSettlementCny.toLocaleString()}` : '—'}
+      {' · '}原人结算价 ¥{reprice.basisCny.toLocaleString()}
+      {deltaText && <>{' · '}{deltaText}</>}
+      {reprice.feeCny != null && reprice.feeCny > 0 && <>{' · '}换人费 ¥{reprice.feeCny.toLocaleString()}</>}
+    </p>
   );
 }
 
@@ -11625,6 +11850,78 @@ function PassengerEditForm({
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  // 换人费标准（预填选项，如 [450, 550]）：ADMIN 在「换人费标准」里配，这里只读取。
+  // 加载完成前用固定默认兜底，避免请求慢时快捷选项一闪而空。
+  const [feeOptions, setFeeOptions] = useState<number[]>([450, 550]);
+  useEffect(() => {
+    if (mode !== 'SWAP' || !token) return;
+    let cancelled = false;
+    api
+      .getSwapFeeOptions(token)
+      .then((r) => {
+        if (!cancelled && Array.isArray(r.options) && r.options.length > 0) setFeeOptions(r.options);
+      })
+      .catch(() => {
+        // 取不到就用上面的默认值兜底，不阻塞换人操作本身。
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [mode, token]);
+  // 换人费不自动预填（H4/M5）：字段默认留空，只由下方快捷选项点击才写入，避免运营/代理
+  // 没注意就把默认档位的换人费收给了「改信息」这类非真换人操作。
+
+  // 换人前预览（真换人才重算）：证件号改动防抖后拉 swap-preview，显示新人按今日结算价日历
+  // 重算的价格 vs 原人份额的差价。「不重算」两种情形（结算价已锁定 / 日历查不到当天价格）
+  // 由后端显式打标，不在前端猜。
+  const [debouncedDocumentNumber, setDebouncedDocumentNumber] = useState(documentNumber);
+  useEffect(() => {
+    const t = setTimeout(() => setDebouncedDocumentNumber(documentNumber), 400);
+    return () => clearTimeout(t);
+  }, [documentNumber]);
+  const isRealSwapLive =
+    mode === 'SWAP' &&
+    debouncedDocumentNumber.trim() !== '' &&
+    debouncedDocumentNumber.trim() !== (passenger.documentNumber ?? '');
+  const [swapPreview, setSwapPreview] = useState<{
+    oldShareCny: number;
+    basisCny: number | null;
+    newSettlementCny: number | null;
+    diffCny: number;
+    calendarSource: string | null;
+    settlementLocked: boolean;
+    repriceSkipped?: string | null;
+  } | null>(null);
+  const [swapPreviewLoading, setSwapPreviewLoading] = useState(false);
+  const [swapPreviewErr, setSwapPreviewErr] = useState<string | null>(null);
+  useEffect(() => {
+    if (!isRealSwapLive || !token) {
+      setSwapPreview(null);
+      setSwapPreviewErr(null);
+      return;
+    }
+    let cancelled = false;
+    setSwapPreviewLoading(true);
+    setSwapPreviewErr(null);
+    api
+      .getSwapPreview(token, orderId, passenger.id)
+      .then((r) => {
+        if (cancelled) return;
+        setSwapPreview(r);
+        if (Array.isArray(r.feeOptions) && r.feeOptions.length > 0) setFeeOptions(r.feeOptions);
+      })
+      .catch((e) => {
+        if (!cancelled) setSwapPreviewErr(e instanceof ApiError ? e.message : '结算价预览失败');
+      })
+      .finally(() => {
+        if (!cancelled) setSwapPreviewLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isRealSwapLive, token, orderId, passenger.id]);
+
   // 护照有效期 / 签发日（随换人请求本身提交——换人 = 录入新人的护照）+ OCR 识别到的其余护照资料
   // （护照图/签发地/签发国仍走补录通道）。
   const [passportExpiry, setPassportExpiry] = useState(passenger.passportExpiry?.slice(0, 10) ?? '');
@@ -11890,11 +12187,19 @@ function PassengerEditForm({
     }
     highRiskConfirmRef.current = true;
     if (isRealSwap) {
+      // 确认弹窗把换人费 + 结算价重算的差价都摆出来，谁来点确认都看得到这次换人要收多少钱、
+      // 差价挂给谁——不再是「不收换人费」的固定文案（代理现在也能自己填换人费）。
+      const feeText = feeCny != null && feeCny > 0 ? `换人费 ¥${feeCny.toLocaleString()}` : '不收换人费';
+      const swapDeltaText =
+        swapPreview && !swapPreview.repriceSkipped
+          ? swapRepriceDeltaText(swapPreview.basisCny ?? swapPreview.oldShareCny, swapPreview.newSettlementCny, swapPreview.diffCny)
+          : null;
+      const diffText = swapDeltaText ? `，${swapDeltaText}` : '';
       if (!(await confirm({
         title: '确认换人？',
         body: isAgentUser
-          ? '证件号已变更，原出行人的护照/签证信息（护照照片、签发地、有效期、签证号等）将被清除，仅保留本次填写的新值。系统将自动重置签证进度，不收换人费。此操作会记入审计。'
-          : '证件号已变更，原出行人的护照/签证信息（护照照片、签发地、有效期、签证号等）将被清除，仅保留本次填写的新值。此操作会记入审计。',
+          ? `证件号已变更，原出行人的护照/签证信息（护照照片、签发地、有效期、签证号等）将被清除，仅保留本次填写的新值。系统将自动重置签证进度，${feeText}${diffText}。此操作会记入审计。`
+          : `证件号已变更，原出行人的护照/签证信息（护照照片、签发地、有效期、签证号等）将被清除，仅保留本次填写的新值。${feeText}${diffText}。此操作会记入审计。`,
         tone: 'danger',
       }))) {
         highRiskConfirmRef.current = false;
@@ -11905,7 +12210,7 @@ function PassengerEditForm({
         title: '确认保存出行人改动？',
         body: isAgentUser
           ? '此操作会记入审计。'
-          : '如勾选了重置开票/签证将清除对应状态，填了换人费将计入订单尾款。',
+          : '如勾选了重置开票/签证将清除对应状态。',
         tone: 'danger',
       }))) {
         highRiskConfirmRef.current = false;
@@ -11944,13 +12249,21 @@ function PassengerEditForm({
   };
 
   const inputCls = 'mt-0.5 w-full rounded border border-slate-300 px-2 py-1 text-xs';
-  // 护照有效期是否此刻必填：仅换人模式下、证件号已改成新的（真换人）+ 本单按人出行。
-  // 随输入实时变化，让运营在改证件号的当下就看见必填标记，而不是提交时才被打回。
-  const expiryRequired =
+  // 是否真换人（证件号已改成新的）：不等 400ms 防抖，随输入实时变化，用来决定换人费输入框/
+  // 快捷选项是否露出——只有真换人才收换人费，改信息一律不显示、不提交这个字段（H4/M5）。
+  const isRealSwapNow =
     mode === 'SWAP' &&
-    requiresPassportExpiry &&
     documentNumber.trim() !== '' &&
     documentNumber.trim() !== (passenger.documentNumber ?? '');
+  // 一旦不再是真换人（证件号改回原值/清空），已填的换人费清空，避免残留数值被当作
+  // 「改信息」的一部分提交（后端本就会拒绝，这里提前把输入框也归位）。
+  useEffect(() => {
+    if (!isRealSwapNow && feeCny !== null) setFeeCny(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [isRealSwapNow]);
+  // 护照有效期是否此刻必填：仅换人模式下、证件号已改成新的（真换人）+ 本单按人出行。
+  // 随输入实时变化，让运营在改证件号的当下就看见必填标记，而不是提交时才被打回。
+  const expiryRequired = isRealSwapNow && requiresPassportExpiry;
   // 改信息模式：证件号改动幅度实时提示（与提交时的校验同口径，大小写不敏感），超限则禁用保存。
   const correctionDocOverLimit =
     mode === 'CORRECTION' &&
@@ -11961,6 +12274,9 @@ function PassengerEditForm({
   const ocring = ocrPct !== null && ocrPct < 100;
   const ocrEngineLabel =
     ocrEngine === 'ai' ? 'AI 识别' : ocrEngine === 'local' ? '本地识别' : ocrEngine === 'ai-fallback' ? 'AI 失败·本地兜底' : '';
+  const swapPreviewDeltaText = swapPreview
+    ? swapRepriceDeltaText(swapPreview.basisCny ?? swapPreview.oldShareCny, swapPreview.newSettlementCny, swapPreview.diffCny)
+    : null;
 
   return (
     <div className="space-y-2 text-xs">
@@ -12093,7 +12409,11 @@ function PassengerEditForm({
         </div>
       )}
 
-      {mode === 'SWAP' && !isAgentUser && (
+      {/* 换人费：仅真换人（证件号已改成新的）才露出，代理也能自己填（原先只对内部岗开放，
+          见 90be1a3）——代理自助换人时同样要能定这次收多少手续费，不用等运营录。字段默认
+          留空，不自动预填（H4/M5）；快捷选项来自「换人费标准」（ADMIN 配置），点击才写入。
+          改信息/证件号改回原值时这一栏直接隐藏，避免被误当成能收换人费的操作。 */}
+      {isRealSwapNow && (
         <label className="block">
           <span className="text-slate-500">换人费（¥，可选）</span>
           <NumberInput
@@ -12103,7 +12423,47 @@ function PassengerEditForm({
             placeholder="不收换人费则留空"
             className={inputCls}
           />
+          <div className="mt-1 flex flex-wrap gap-1">
+            {feeOptions.map((opt) => (
+              <button
+                key={opt}
+                type="button"
+                className={`rounded-full border px-2 py-0.5 text-[11px] ${
+                  feeCny === opt
+                    ? 'border-brand bg-brand/10 font-medium text-brand'
+                    : 'border-slate-300 text-slate-500 hover:border-brand/50'
+                }`}
+                onClick={() => setFeeCny(opt)}
+              >
+                ¥{opt}
+              </button>
+            ))}
+          </div>
         </label>
+      )}
+
+      {/* 换人前预览（真换人才出现）：新人按今日结算价日历（同出行日期）重算的结算价，
+          与原人建单日历口径的结算价对比。是否重算由后端 repriceSkipped 原因码显式打标
+          （M9：与换人历史 SwapRepriceNote 共用同一份文案），这里如实转述，不拿 null 硬凑数字。
+          文案不提「成本」，只说结算价。 */}
+      {isRealSwapLive && (
+        <div className="rounded border border-sky-200 bg-sky-50/60 px-2 py-1.5 text-[11px] text-ink-soft">
+          {swapPreviewLoading ? (
+            '结算价重算中…'
+          ) : swapPreviewErr ? (
+            <span className="text-rose-600">{swapPreviewErr}</span>
+          ) : swapPreview ? (
+            swapPreview.repriceSkipped ? (
+              <span>{REPRICE_SKIPPED_LABEL[swapPreview.repriceSkipped] ?? '未按今日结算价日历重算'}</span>
+            ) : (
+              <span>
+                原人结算价（建单日历）¥{(swapPreview.basisCny ?? swapPreview.oldShareCny).toLocaleString()} ·
+                新人结算价（今日日历）¥{swapPreview.newSettlementCny?.toLocaleString() ?? '—'}
+                {swapPreviewDeltaText && <>{' · '}{swapPreviewDeltaText}</>}
+              </span>
+            )
+          ) : null}
+        </div>
       )}
 
       {mode === 'SWAP' && (

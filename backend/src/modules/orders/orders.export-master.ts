@@ -51,6 +51,7 @@ import {
   filterExportOrders,
   type ExportSelectionFilters,
 } from './orders.export-selection.js';
+import { spreadableAdjustmentCny } from './per-pax-share.js';
 import { determineFlightLegs } from './ticketing-cap.js';
 import { formatOrderLegStatus } from './orders.leg-status.js';
 
@@ -458,8 +459,13 @@ export function orderToMasterRows(
   const adjustment = order.adjustmentCny ?? 0;
   const prepaymentOffset = dec(order.prepaymentOffset);
   const settleByPassenger = perPaxSettlementByPassenger(order);
-  /** 结算价格的均摊兜底 = 应收（total + adjustmentCny）÷ pax；只在乘客不在上表里时用到。*/
-  const settlePerPax = round2((total + adjustment) / paxCount);
+  /**
+   * 结算价格的均摊兜底 = 可摊应收 ÷ pax；只在乘客不在上表里时用到。
+   * 分子用 spreadableAdjustmentCny 而不是裸 adjustmentCny：换人费/换人差价挂在**已经不在这张单上**
+   * 的被换人头上（excludeFromPerPax），上面那张按人表已经把它们剔除了；兜底若还按裸值算，
+   * 同一张导出里「表里的人」和「兜底的人」用的是两套分母，同行人凭空多背一笔换人的钱。
+   */
+  const settlePerPax = round2((total + spreadableAdjustmentCny(order)) / paxCount);
   const settlementDiscountTotal = order.items.reduce((sum, item) => {
     const metadata = item.metadata;
     if (

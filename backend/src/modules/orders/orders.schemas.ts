@@ -62,6 +62,10 @@ export const PRICE_ADJUSTMENT_REASON_ENDPOINT_ONLY = [
   // **只能系统生成**，不进人工调价下拉。
   'RETURN_LEG_CANCEL_FEE',
   'OUTBOUND_LEG_CANCEL_FEE',
+  // 换人重算结算价：真换人（证件号变化）时由换人通道按**换人当天**的结算价日历重取新出行人
+  // 的每人价，与他接手的那份旧份额之间的差额落成这一行（挂在该乘客名下，可正可负）。
+  // **只能系统生成**，不进人工调价下拉。
+  'SWAP_REPRICE',
 ] as const;
 
 export type PriceAdjustmentReasonDisplay =
@@ -81,6 +85,7 @@ export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReasonDisplay,
   SETTLEMENT: '代理结算价',
   RETURN_LEG_CANCEL_FEE: '取消回程手续费',
   OUTBOUND_LEG_CANCEL_FEE: '取消去程手续费',
+  SWAP_REPRICE: '换人重算结算价',
 };
 
 // 调价金额校验（录单调价与「按乘客/整单事后调价」共用同一口径，避免两处漂移）：
@@ -1244,6 +1249,28 @@ export const swapPassengerBodySchema = z
     { message: '换人请求需至少包含一项身份变更 / 重置 / 费用' },
   );
 export type SwapPassengerBody = z.infer<typeof swapPassengerBodySchema>;
+
+// ── 换人费标准档（运营可配）───────────────────────────────────────────────────
+// 换人费是业务常数（当前在用的两档），但「按什么规则取哪一档」还没有成文口径 ——
+// 系统不替人猜：只维护一份可选清单，换人时由经办人自己选/填，运营复核时三次核对。
+// 清单存在 SystemSetting（键 orders.swapFeeOptionsCny，逗号分隔整数），改动走 PUT 端点 + 审计。
+export const SWAP_FEE_OPTIONS_MAX = 5; // 清单最多 5 档（再多就不是「标准档」了）
+// 单档上限 = 售后费上限（POST_SALE_FEE_CAP_CNY）：换人费本身就是走 postSaleFeeSchema 收的钱，
+// 档位清单是它的预填建议，两处必须同一个常量 —— 各写各的数就会出现「PUT 存得进去、
+// getSwapFeeOptions 读回来被滤掉」的静默不一致（改档位后界面上那一档凭空消失）。
+export const swapFeeOptionsBodySchema = z.object({
+  options: z
+    .array(
+      z
+        .number()
+        .int('换人费必须为整数（CNY）')
+        .min(0, '换人费不能为负')
+        .max(POST_SALE_FEE_CAP_CNY, `换人费超出上限（${POST_SALE_FEE_CAP_CNY}）`),
+    )
+    .min(1, '至少保留 1 档换人费')
+    .max(SWAP_FEE_OPTIONS_MAX, `最多 ${SWAP_FEE_OPTIONS_MAX} 档换人费`),
+});
+export type SwapFeeOptionsBody = z.infer<typeof swapFeeOptionsBodySchema>;
 
 // ── 售后改单：订正出行人证件资料（passenger correction）─────────────────────
 // PATCH /orders/:id/passengers/:passengerId，body 带 mode:'CORRECTION'（ADMIN/STAFF/代理自家单）。

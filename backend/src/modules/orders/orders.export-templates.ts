@@ -19,7 +19,7 @@ import { OrderItemKind, OrderStatus } from '@prisma/client';
 import { orderVisaStatusExplicitlyNotNeeded } from './visa-need.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 // 「结算价格」按人取值的权威口径：每人份额端口（详见 perPaxSettlementByPassenger）。
-import { computePerPaxShares } from './per-pax-share.js';
+import { computePerPaxShares, spreadableAdjustmentCny } from './per-pax-share.js';
 import type { BundleItemJson } from '../../lib/json-types.js';
 import { toAlpha3 } from './nationality.js';
 import {
@@ -296,6 +296,8 @@ export function allPassengersVisaExempt(
 export function perPaxSettlementByPassenger(order: {
   total: Prisma.Decimal | number | null;
   adjustmentCny?: number | null;
+  /** 售后费流水（换人费/换人差价带 excludeFromPerPax，不参与均摊，见 spreadableAdjustmentCny）。 */
+  adjustments?: unknown;
   passengers: ReadonlyArray<{ id: string }>;
   items: ReadonlyArray<{
     id: string;
@@ -316,7 +318,8 @@ export function perPaxSettlementByPassenger(order: {
   );
   const { rows } = computePerPaxShares({
     totalCny: dec(order.total),
-    adjustmentCny: order.adjustmentCny ?? 0,
+    // 可摊售后费：换人费/换人差价（excludeFromPerPax）记在被换下去的人头上，不摊给同行人与新客。
+    adjustmentCny: spreadableAdjustmentCny(order),
     // 按 id 升序传入：computePerPaxShares 把分级余数（那一分钱）兜给**数组最后一位**，
     // 而 order.passengers 的查询没有 orderBy —— 行序会随任何一次 UPDATE 漂移，
     // 同一张单两次导出那一分钱可能换人头，财务对数时看着像有人改过价。
@@ -631,7 +634,10 @@ interface OrderContext {
    * perPaxSettlementByPassenger）。行渲染一律 `settleByPassenger.get(p.id) ?? settlePerPax`。
    */
   settleByPassenger: ReadonlyMap<string, number>;
-  /** 结算价格的均摊兜底 = 应收（total + adjustmentCny）÷ pax；只在乘客不在上表里时用到。*/
+  /**
+   * 结算价格的均摊兜底 = 可摊应收 ÷ pax；只在乘客不在上表里时用到。
+   * 「可摊」= total + spreadableAdjustmentCny（换人费/换人差价不进分子，见该函数口径）。
+   */
   settlePerPax: number;
   /**
    * 签证金额（**按乘客**）：passengerId → 该乘客的签证金额（自备签 = 0；套餐签证挂牌价是
@@ -742,7 +748,11 @@ export function buildOrderContext(
     orderType,
     legStatus: opts?.redactLegStatus === true ? '' : formatOrderLegStatus(order.items),
     settleByPassenger: perPaxSettlementByPassenger(order),
-    settlePerPax: round2((total + adjustment) / paxCount),
+    // 分子用 spreadableAdjustmentCny 而不是裸 adjustment（复审 M1，与《全岗总表》
+    // orders.export-master.ts 的 settlePerPax 同一处修正）：换人费/换人差价挂在**已经不在这张单上**
+    // 的被换人头上（excludeFromPerPax），上面那张按人表已经把它们剔除了；兜底若还按裸值算，
+    // 同一张导出里「表里的人」和「兜底的人」用的是两套分母，同行人凭空多背一笔换人的钱。
+    settlePerPax: round2((total + spreadableAdjustmentCny(order)) / paxCount),
     visaAmountByPassenger: perPaxVisaAmountByPassenger(order),
     allPassengersExempt: allPassengersVisaExempt(order.passengers),
     singleRoomDiffByPassenger: perPaxSingleRoomDiffByPassenger(order),

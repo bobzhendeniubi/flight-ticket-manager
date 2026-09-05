@@ -48,6 +48,55 @@ function toCents(cny: number): number {
   return Math.round(cny * 100);
 }
 
+/** Order.adjustments 里一条流水的最小形状（本模块只关心金额与「摊不摊」这一位）。 */
+export interface SpreadableAdjustmentEntryLike {
+  amountCny?: unknown;
+  /** true = 这笔钱挂在某个**已经不在这单上**的人头上，不参与每人均摊（见下方口径）。 */
+  excludeFromPerPax?: unknown;
+}
+
+/**
+ * 可摊售后费（喂给 computePerPaxShares 的 adjustmentCny）。
+ *
+ * 口径（换人重算结算价，2026-09 拍板）：**被换人的钱不是同行人的钱**。
+ * 换人时收的换人费（SWAP_FEE）与旧客留下的差价（SWAP_PRICE_DIFF），账记在**被换下去
+ * 的那个人**头上——他已经不在这张单的乘客名单里了。若照旧把它们并进 adjustmentCny 一起
+ * 均摊，这笔钱会摊到留下来的同行人和换进来的新客身上：新客的每人结算价凭空高出一截，
+ * 同行人什么都没做也要多付，导出与详情页的「每人结算价」从此对不上谈定的价。
+ * 所以这类流水写入时打 `excludeFromPerPax: true`，均摊基数把它们扣掉；
+ * 钱本身仍留在 order.adjustmentCny 里（应收/尾款一分不少），只是不参与「每人多少」的分配。
+ *
+ * 为什么**不夹逼**：这是一道减法，不是估算。拆单侧已经改成「排除条目整条留在源单、
+ * 只按可摊基数劈」（见 orders.service.ts 拆单段的 movedAdjustmentCny），流水与 adjustmentCny
+ * 天然对得齐；再夹一次只会在真出现脏数据时把差额静默吞掉，让两侧份额之和不再等于应收。
+ * 结果为负是合法的（改到便宜班次退差等场景本来就有负的售后费），照实返回。
+ * 与前端 admin-web/src/lib/perPaxSettlement.ts 的同名口径逐行等价 —— 两边都不夹。
+ *
+ * **切换生效日口径（2026-09 拍板，复审 M5）：只往前看，不回填历史。**
+ * `excludeFromPerPax` 这一位是本批才开始写的。上线之前产生的 SWAP_FEE 流水没有这一位，
+ * 因此照旧参与均摊（老单的每人份额维持它一直以来的样子）。**刻意不做数据回填**：
+ *   · 回填会让已经导出过、已经跟代理对过账的老单每人份额当场变一个数，对账口径凭空断层；
+ *   · 换人本身是低频动作，上线前的存量样本极少，人工核对比批量改库安全得多。
+ * 所以看到「老单摊了换人费、新单没摊」不是 bug，是这条切换线两侧的正常差异。
+ */
+export function spreadableAdjustmentCny(order: {
+  adjustmentCny?: number | null;
+  adjustments?: unknown;
+}): number {
+  const adjustmentCny = order.adjustmentCny ?? 0;
+  const entries = Array.isArray(order.adjustments)
+    ? (order.adjustments as SpreadableAdjustmentEntryLike[])
+    : [];
+  let excludedCents = 0;
+  for (const e of entries) {
+    if (!e || typeof e !== 'object' || e.excludeFromPerPax !== true) continue;
+    const amt = typeof e.amountCny === 'number' && Number.isFinite(e.amountCny) ? e.amountCny : 0;
+    excludedCents += toCents(amt);
+  }
+  if (excludedCents === 0) return adjustmentCny;
+  return (toCents(adjustmentCny) - excludedCents) / 100;
+}
+
 /**
  * 计算每人份额。乘客数为 0 时返回空行。
  * 与前端 computePerPaxSettlement 逐行等价（字段名 settlementCny → shareCny）。

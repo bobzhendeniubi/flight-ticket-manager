@@ -28,6 +28,7 @@ import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { BadRequestError } from '../../lib/errors.js';
 import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
 import { fmtDateDMYDash, pnrName, perPaxSettlementByPassenger } from './orders.export-templates.js';
+import { spreadableAdjustmentCny } from './per-pax-share.js';
 import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats.js';
 import type { TripStatsMap } from './orders.export-trip-stats.js';
 import { earliestFlightDepartureLocalDate } from './pnr-export.js';
@@ -469,7 +470,11 @@ export function buildRoomAllocationSheets(
     // 均摊兜底只在乘客不在上表里时用到；除零保护 —— 乘客数至少按 1 算。
     const paxCount = Math.max(1, order.passengers.length);
     const settleByPassenger = perPaxSettlementByPassenger(order);
-    const settleFallback = round2((dec(order.total) + (order.adjustmentCny ?? 0)) / paxCount);
+    // 分子用 spreadableAdjustmentCny 而不是裸 adjustmentCny（复审 M1，与《全岗总表》
+    // orders.export-master.ts 同一处修正）：换人费/换人差价挂在**已经不在这张单上**的被换人头上
+    //（excludeFromPerPax），上面那张按人表已经把它们剔掉了；兜底若还按裸值算，同一张分房表里
+    //「表里的人」和「兜底的人」用的是两套分母，留守同行人凭空多背一笔换人的钱。
+    const settleFallback = round2((dec(order.total) + spreadableAdjustmentCny(order)) / paxCount);
     // 录入时间是「动作发生时刻」，按北京时间输出（容器 TZ 是 UTC，直接取 UTC 分量会少 8 小时）
     const enteredAt = businessDateTimeSec(order.createdAt);
 

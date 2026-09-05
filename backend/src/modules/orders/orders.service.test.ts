@@ -4183,8 +4183,9 @@ describe('correctPassenger · 订正证件资料', () => {
 });
 
 // ── swapPassenger · 代理换人（2026-09 起对代理开放，运营事后复核）──────────────
-// 代理拿到的是「换人」本身，不是定价权与状态重置权：换人费强制 0（运营复核时再补）、
-// 签证强制回队（新人要重新送签）、开票位不许动；已开票的单代理干脆换不了。
+// 代理拿到的是「换人」本身，不是状态重置权：签证强制回队（新人要重新送签）、开票位不许动；
+// 已开票的单代理干脆换不了。换人费**由经办人自己填**（代理也一样，档位见 getSwapFeeOptions），
+// 运营复核时三次核对 —— 此前强制 0 等于把「代理换人不收费」写死，事后要另开调价才补得回来。
 describe('swapPassenger · 代理换人降权口径', () => {
   function armAgentSwap(opts: { agentId?: string; invoiced?: boolean } = {}) {
     // 事务内 FOR UPDATE 行（带三维开票位，代理闸要读）+ 代理树递归，按 SQL 分流
@@ -4237,7 +4238,7 @@ describe('swapPassenger · 代理换人降权口径', () => {
     vi.clearAllMocks();
   });
 
-  it('代理带换人费 → 强制 0，不写任何调整流水（定价权在运营）', async () => {
+  it('代理带换人费 → 照收；费用名一律「换人费」，档位外的金额审计打标', async () => {
     const service = new OrderService();
     armAgentSwap();
 
@@ -4245,6 +4246,65 @@ describe('swapPassenger · 代理换人降权口径', () => {
       'ord1',
       'px1',
       { fullName: 'NEW PERSON', documentNumber: 'NEW999', feeCny: 500, feeLabel: '代理自定义' },
+      { userId: 'u-agent', role: 'AGENT', agentId: 'agent-mine' },
+    );
+
+    expect(audit.feeCny).toBe(500);
+    // 换人费进 adjustmentCny + 一条 SWAP_FEE 流水，且记的是**被换下去的人**、不参与均摊。
+    const updateArgs = mockPrisma.order.update.mock.calls.at(-1)?.[0] as {
+      data: { adjustmentCny: number; adjustments: unknown[] };
+    };
+    expect(updateArgs.data.adjustmentCny).toBe(500);
+    const feeEntry = updateArgs.data.adjustments.at(-1) as Record<string, unknown>;
+    expect(feeEntry.type).toBe('SWAP_FEE');
+    expect(feeEntry.amountCny).toBe(500);
+    // 代理自定义的费用名被忽略：这笔钱进我方财务台账，名字由代理起会让同一笔钱有 N 种叫法。
+    expect(feeEntry.label).toBe('换人费');
+    expect(feeEntry.passengerName).toBe('OLD/PERSON');
+    expect(feeEntry.passengerDocument).toBe('OLD111');
+    expect(feeEntry.excludeFromPerPax).toBe(true);
+    // 500 不在缺省档位（450/550）里 → 审计打标，运营复核时一眼挑得出来（不拦）。
+    expect(audit.after.feeOffList).toBe(true);
+  });
+
+  it('代理填的换人费正好是档位内的金额 → 审计不打标', async () => {
+    const service = new OrderService();
+    armAgentSwap();
+
+    const { audit } = await service.swapPassenger(
+      'ord1',
+      'px1',
+      { fullName: 'NEW PERSON', documentNumber: 'NEW999', feeCny: 450 },
+      { userId: 'u-agent', role: 'AGENT', agentId: 'agent-mine' },
+    );
+
+    expect(audit.feeCny).toBe(450);
+    expect(audit.after.feeOffList).toBeUndefined();
+  });
+
+  it('代理只改名字却带换人费 → 400，一分钱不动', async () => {
+    const service = new OrderService();
+    armAgentSwap();
+
+    await expect(
+      service.swapPassenger(
+        'ord1',
+        'px1',
+        { fullName: 'TYPO FIXED', feeCny: 450 },
+        { userId: 'u-agent', role: 'AGENT', agentId: 'agent-mine' },
+      ),
+    ).rejects.toThrow('未换人不能收取换人费');
+    expect(mockPrisma.order.update).not.toHaveBeenCalled();
+  });
+
+  it('代理不填换人费（缺省 0）→ 不写任何调整流水', async () => {
+    const service = new OrderService();
+    armAgentSwap();
+
+    const { audit } = await service.swapPassenger(
+      'ord1',
+      'px1',
+      { fullName: 'NEW PERSON', documentNumber: 'NEW999' },
       { userId: 'u-agent', role: 'AGENT', agentId: 'agent-mine' },
     );
 

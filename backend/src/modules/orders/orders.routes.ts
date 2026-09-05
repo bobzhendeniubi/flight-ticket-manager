@@ -13,8 +13,10 @@ import { z } from 'zod';
 import { OrderItemKind, Prisma, UserRole, VisaRequirement, type Passenger } from '@prisma/client';
 import {
   buildStayNightDates,
+  getSwapFeeOptions,
   OrderService,
   resolveOrderAgentId,
+  SWAP_FEE_OPTIONS_SETTING_KEY,
   type OrderRequester,
 } from './orders.service.js';
 import { assertHotelPhysicalFitWithinTx } from '../hotel-control/hotel-control.service.js';
@@ -64,6 +66,7 @@ import {
   splitRoomGroupBodySchema,
   swapRefundBodySchema,
   updateSwapReplacementOrderBodySchema,
+  swapFeeOptionsBodySchema,
   swapItemHotelBodySchema,
   swapPassengerBodySchema,
   setPassengerVisaExemptBodySchema,
@@ -2375,6 +2378,63 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       severity: 'WARNING',
     });
     return { order };
+  });
+
+  // ── 换人预览（GET /orders/:id/passengers/:passengerId/swap-preview）─────────
+  // 换人弹窗打开时先算一遍：这个人现在算多少钱、按**今天**的结算价日历重取是多少、
+  // 旧客要补多少差价、换人费有哪几档。只读，与真换人跑同一份取价内核（预览所见 = 换人所得）。
+  // ADMIN/STAFF 全量；代理限自家（含下级）单 —— 归属闸在 service 内，403 由错误处理器格式化。
+  app.get(
+    '/:id/passengers/:passengerId/swap-preview',
+    { preHandler: [app.authenticate] },
+    async (req) => {
+      const role = req.user.role;
+      const { id, passengerId } = req.params as { id: string; passengerId: string };
+      const requester = await buildRequester(req.user.sub, role);
+      return service.swapPreview(id, passengerId, {
+        userId: req.user.sub,
+        role,
+        agentId: requester.agentId,
+      });
+    },
+  );
+
+  // ── 换人费标准档（GET 运营/管理员/代理 / PUT 仅 ADMIN）──────────────────────
+  // 「按什么规则收哪一档」还没有成文口径 —— 系统只维护可选清单，金额由经办人自己填，
+  // 运营复核时三次核对。GET 对代理开放：代理换人同样要填这笔钱，界面得能预填档位。
+  // 客户看不到：换人费档位是我方与代理之间的收费口径（跟换人预览同一条线，见 swapPreview），
+  // 客户拿到它只会照着问「为什么收我这个数」，而客户侧根本没有换人这条通道（复审 L3）。
+  app.get('/swap-fee-options', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF && role !== UserRole.AGENT) {
+      return reply.status(403).send({ error: '仅运营/代理可查看换人费档位' });
+    }
+    return { options: await getSwapFeeOptions(prisma) };
+  });
+
+  app.put('/swap-fee-options', { preHandler: [app.authenticate] }, async (req, reply) => {
+    if (req.user.role !== UserRole.ADMIN) {
+      return reply.status(403).send({ error: '仅管理员可修改换人费档位' });
+    }
+    const body = swapFeeOptionsBodySchema.parse(req.body);
+    const before = await getSwapFeeOptions(prisma);
+    const value = body.options.join(',');
+    await prisma.systemSetting.upsert({
+      where: { key: SWAP_FEE_OPTIONS_SETTING_KEY },
+      create: { key: SWAP_FEE_OPTIONS_SETTING_KEY, value, updatedById: req.user.sub },
+      update: { value, updatedById: req.user.sub },
+    });
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'UPDATE_SWAP_FEE_OPTIONS',
+      targetType: 'PRODUCT',
+      targetId: SWAP_FEE_OPTIONS_SETTING_KEY,
+      targetLabel: `换人费档位 ${before.join('/')} → ${body.options.join('/')}`,
+      before: { options: before },
+      after: { options: body.options },
+      severity: 'WARNING',
+    });
+    return { options: body.options };
   });
 
   // ── 签证台：出签后补录 出签日/生效日/有效期（ADMIN/STAFF）──

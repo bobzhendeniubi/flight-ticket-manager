@@ -8,7 +8,7 @@
  */
 import { describe, it, expect } from 'vitest';
 
-import { computePerPaxShares } from './per-pax-share.js';
+import { computePerPaxShares, spreadableAdjustmentCny } from './per-pax-share.js';
 
 const nets = (obj: Record<string, number>) => new Map(Object.entries(obj));
 
@@ -100,5 +100,79 @@ describe('computePerPaxShares · 与前端 computePerPaxSettlement 对拍（硬�
       const sumCents = r.rows.reduce((acc, row) => acc + Math.round(row.shareCny * 100), 0);
       expect(sumCents).toBe(Math.round(r.payableCny * 100));
     }
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 可摊售后费：被换人的钱不摊给同行人（换人费 / 换人差价 excludeFromPerPax）
+describe('spreadableAdjustmentCny · 换人的钱不进均摊基数', () => {
+  const swapFee = (amountCny: number) => ({
+    type: 'SWAP_FEE',
+    label: '换人费',
+    amountCny,
+    at: '2026-09-05T02:00:00.000Z',
+    by: 'usr_x',
+    passengerName: 'OLD/PERSON',
+    passengerDocument: 'E1234xxxx',
+    excludeFromPerPax: true,
+  });
+
+  it('无流水 / 非数组 → 原样返回 adjustmentCny', () => {
+    expect(spreadableAdjustmentCny({ adjustmentCny: 300 })).toBe(300);
+    expect(spreadableAdjustmentCny({ adjustmentCny: 300, adjustments: null })).toBe(300);
+    expect(spreadableAdjustmentCny({ adjustmentCny: 300, adjustments: { not: 'an array' } })).toBe(300);
+    expect(spreadableAdjustmentCny({})).toBe(0);
+  });
+
+  it('普通售后费（改期费，无 excludeFromPerPax）→ 照旧全额参与均摊', () => {
+    const adjustments = [
+      { type: 'RESCHEDULE_FEE', label: '改期费', amountCny: 300, at: '2026-09-05T02:00:00.000Z', by: null },
+    ];
+    expect(spreadableAdjustmentCny({ adjustmentCny: 300, adjustments })).toBe(300);
+  });
+
+  it('换人费 + 换人差价 → 均摊基数扣掉这两笔（钱仍在 adjustmentCny 里）', () => {
+    const adjustments = [
+      { type: 'RESCHEDULE_FEE', label: '改期费', amountCny: 300, at: '2026-09-05T02:00:00.000Z', by: null },
+      swapFee(450),
+      {
+        type: 'SWAP_PRICE_DIFF',
+        label: '换人差价',
+        amountCny: 200,
+        at: '2026-09-05T02:00:00.000Z',
+        by: 'usr_x',
+        passengerName: 'OLD/PERSON',
+        excludeFromPerPax: true,
+      },
+    ];
+    expect(spreadableAdjustmentCny({ adjustmentCny: 950, adjustments })).toBe(300);
+  });
+
+  it('脏数据：金额非数字 → 当 0 处理，不把基数算飞', () => {
+    const adjustments = [{ type: 'SWAP_FEE', label: '换人费', amountCny: 'x', excludeFromPerPax: true }];
+    expect(spreadableAdjustmentCny({ adjustmentCny: 450, adjustments })).toBe(450);
+  });
+
+  it('是一道精确减法，不夹逼（与前端 perPaxSettlement.ts 逐行等价）', () => {
+    // 拆单侧已改成「排除条目整条留源单」，正常情况下扣不出负数；真出现脏数据时也照实返回，
+    // 不静默吞掉差额（吞掉会让两侧份额之和不再等于应收）。
+    expect(spreadableAdjustmentCny({ adjustmentCny: 200, adjustments: [swapFee(450)] })).toBe(-250);
+    // 负的 adjustmentCny（改到便宜班次退差）继续按减法走。
+    expect(spreadableAdjustmentCny({ adjustmentCny: -100, adjustments: [swapFee(450)] })).toBe(-550);
+  });
+
+  it('喂给 computePerPaxShares：换人费不进任何在册乘客的每人份额', () => {
+    const order = { adjustmentCny: 650, adjustments: [swapFee(450), {
+      type: 'SWAP_PRICE_DIFF', label: '换人差价', amountCny: 200, excludeFromPerPax: true,
+    }] };
+    const r = computePerPaxShares({
+      totalCny: 2400,
+      adjustmentCny: spreadableAdjustmentCny(order),
+      passengerIds: ['p1', 'p2', 'p3'],
+      netByPassenger: nets({}),
+    });
+    // 应收仍是 2400 + 650 = 3050（尾款照收），但每人份额只按 2400 分。
+    expect(r.payableCny).toBe(2400);
+    expect(r.rows.map((x) => x.shareCny)).toEqual([800, 800, 800]);
   });
 });

@@ -28,6 +28,7 @@ import {
   PaymentStatus,
   PrepaymentTxType,
   Prisma,
+  type PrismaClient,
   ProductKind,
   ReceiptSource,
   RefundStatus,
@@ -86,7 +87,7 @@ import {
   derivePublicLegStatus,
 } from './orders.leg-status.js';
 import type { LegStatusItemLike, PublicLegStatus } from './orders.leg-status.js';
-import { computePerPaxShares } from './per-pax-share.js';
+import { computePerPaxShares, spreadableAdjustmentCny } from './per-pax-share.js';
 import {
   deriveRoomsToMove,
   isTerminalLegItem,
@@ -159,6 +160,7 @@ import {
 import type { FlightLegItem } from './ticketing-cap.js';
 import {
   PER_PERSON_TRAVEL_KINDS,
+  POST_SALE_FEE_CAP_CNY,
   PRICE_ADJUSTMENT_CAP_CNY,
   PRICE_ADJUSTMENT_REASON_LABEL,
 } from './orders.schemas.js';
@@ -536,6 +538,132 @@ export interface SwapBeforeSnapshot {
   visaTaskStatus: FulfillmentStatus | null;
   /** 该乘客的结算价（与《全岗总表》「结算价格」列同一权威口径）；算不出为 null。 */
   settlementCny: number | null;
+}
+
+/**
+ * 换人重算结算价被跳过的原因（口径逐条见 resolveSwapRepriceQuote 的方法头）。
+ * 跳过 = 只收换人费、不动结算价，界面据此告诉经办人「这一单要不要人工调价」。
+ */
+export type SwapRepriceSkipReason =
+  | 'SETTLEMENT_LOCKED'
+  | 'NO_CALENDAR'
+  | 'NOT_CALENDAR_PRICED'
+  | 'PRICING_KEY_CHANGED'
+  | 'DIFF_OVER_CAP';
+
+/**
+ * 「这张单是按日历上的哪一格成交的」= 定价键。
+ *
+ * 换人重算是「日历比日历」：只有**同一格**的今昔两个价相减，量出来的才是「日历动了多少」。
+ * 而这张单在成交之后可能被改过档（套餐改档换了 bundleId → 档次/晚数变了）或改过期
+ *（改期把出发日挪走了，行价按设计冻结、差额另有调价行收），此时「今天的这一格」已经不是
+ * 「成交那一格」—— 再相减等于把改档/改期的价差当成日历浮动，对着已经收过一次的差额再收一次。
+ * 因此基准戳里连定价键一起盖章，换人当天先比键：键变了就不重算（PRICING_KEY_CHANGED）。
+ */
+export type SwapCalendarKey =
+  | {
+      source: 'BUNDLE_SETTLEMENT_CALENDAR';
+      /** 套餐日历的三维键：档次 × 晚数 × 去程出发本地日。 */
+      tier: string;
+      nights: number;
+      departDate: string;
+    }
+  | {
+      source: 'FLIGHT_SETTLEMENT_CALENDAR';
+      /** 机票日历逐航段的键：航班号 × 该段出发地本地日（往返各一条）。 */
+      legs: Array<{ flightNumber: string; departDate: string }>;
+    };
+
+/**
+ * 定价键 → 可直接比较的指纹字符串；null → null（判不出键，调用方一律 fail-closed）。
+ * 机票多航段按「航班号@出发日」排序后拼，行顺序变化不当作键变（同一组航段就是同一格）。
+ */
+export function calendarKeyFingerprint(key: SwapCalendarKey | null | undefined): string | null {
+  if (!key) return null;
+  if (key.source === 'BUNDLE_SETTLEMENT_CALENDAR') {
+    return `BUNDLE|${key.tier}|${key.nights}|${key.departDate}`;
+  }
+  const legs = key.legs
+    .map((leg) => `${leg.flightNumber}@${leg.departDate}`)
+    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
+  return `FLIGHT|${legs.join(',')}`;
+}
+
+/**
+ * 落库的 JSON（基准戳 metadata.calendarKey / 上一次换人行的 calendarDetail.calendarKey）→ 定价键。
+ * 形状不完整一律 null（缺一维就比不出键有没有变，宁可不重算）。
+ */
+export function readCalendarKey(raw: unknown): SwapCalendarKey | null {
+  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const obj = raw as Record<string, unknown>;
+  const str = (v: unknown): string | null =>
+    typeof v === 'string' && v.trim() !== '' ? v : null;
+  if (obj.source === 'BUNDLE_SETTLEMENT_CALENDAR') {
+    const tier = str(obj.tier);
+    const departDate = str(obj.departDate);
+    const nights = typeof obj.nights === 'number' && Number.isFinite(obj.nights) ? obj.nights : null;
+    if (tier == null || departDate == null || nights == null) return null;
+    return { source: 'BUNDLE_SETTLEMENT_CALENDAR', tier, nights, departDate };
+  }
+  if (obj.source === 'FLIGHT_SETTLEMENT_CALENDAR') {
+    if (!Array.isArray(obj.legs) || obj.legs.length === 0) return null;
+    const legs: Array<{ flightNumber: string; departDate: string }> = [];
+    for (const item of obj.legs) {
+      if (item == null || typeof item !== 'object') return null;
+      const leg = item as Record<string, unknown>;
+      const flightNumber = str(leg.flightNumber);
+      const departDate = str(leg.departDate);
+      if (flightNumber == null || departDate == null) return null;
+      legs.push({ flightNumber, departDate });
+    }
+    return { source: 'FLIGHT_SETTLEMENT_CALENDAR', legs };
+  }
+  return null;
+}
+
+/**
+ * 基准那一格 vs 换人当天这一格：一样 → null（可以继续按日历重算）；
+ * 不一样（含基准没记键）→ 一份带两把键的明细，调用方据此落 PRICING_KEY_CHANGED 并留痕。
+ */
+function keyChangedDetail(
+  basisKey: SwapCalendarKey | null,
+  todayKey: SwapCalendarKey,
+): Record<string, unknown> | null {
+  const basisFp = calendarKeyFingerprint(basisKey);
+  const todayFp = calendarKeyFingerprint(todayKey);
+  if (basisFp != null && basisFp === todayFp) return null;
+  return {
+    note: '本单成交后改过档 / 改过期，定价键已变，不按日历重算',
+    basisKey,
+    todayKey,
+  };
+}
+
+/** 换人重算结算价的取价结果（换人事务与换人预览端点共用）。 */
+export interface SwapRepriceQuote {
+  /**
+   * 差价基准 = **这张单成交时用的那一天的日历每人价**（日历价 − 当时的代理立减）。
+   *
+   * 为什么是它、而不是这位乘客今天的每人份额（oldShareCny）：差价这件事之所以存在，
+   * 唯一的原因是「结算价日历在下单之后动了」。日历比日历，才量得出日历动了多少。
+   * 每人份额里还揉着单房差、杂费、按人调价、整单议价与售后费均摊 —— 拿它跟今天的
+   * **裸日历价**比，等于把「我们跟这个代理谈定的价」和「手工调过的价」一并当成日历差额
+   * 「纠正」回日历：手工价单会被多收，被换人还要替同行人的售后费买单。
+   * 取不到（非日历成交 / 存量单无从判定）为 null，此时 repriceSkipped 必有值。
+   */
+  basisCny: number | null;
+  /** 被换下去的那位在换人前的每人份额（与换人前快照 settlementCny 同源；只给界面看，不参与差价计算）。 */
+  oldShareCny: number;
+  /** 按换人当天日历重取的新出行人每人价；取不到为 null（此时 repriceSkipped 必有值）。 */
+  newSettlementCny: number | null;
+  /** 旧客要补的差价 = max(0, 基准 − 新价)；价没跌就是 0。 */
+  diffCny: number;
+  /** 取价来源：BUNDLE_SETTLEMENT_CALENDAR / FLIGHT_SETTLEMENT_CALENDAR；未取价为 null。 */
+  calendarSource: string | null;
+  settlementLocked: boolean;
+  repriceSkipped?: SwapRepriceSkipReason;
+  /** 取价明细（进调价行 metadata 与审计，供事后解释这个价怎么来的）。 */
+  detail?: Record<string, unknown>;
 }
 
 /**
@@ -975,6 +1103,37 @@ export function buildSettlementTotalItem(input: {
   diffCny: number;
   authoritativeTotalCny: number;
   settlementTotalCny: number;
+  /**
+   * 建单当天的**日历每人价**（未减代理立减）与**每人立减**。
+   * 只有「结算价日历自动取价」这条路会带；手工结算总价 / 每人结算价一律不带。
+   *
+   * 为什么要单独落这两个数（换人重算结算价 2026-09 拍板）：日历取价此前只把整单总价写进
+   * settlementTotalCny，事后没人还原得出「当时每人是按哪个日历价成交的」——
+   * 加项、单房差、婴儿同价都揉在总价里，÷ 人数只是估算。换人时要拿它跟**换人当天**的日历价
+   * 比差额（日历比日历，见 resolveSwapRepriceQuote），估算不够用。纯加字段、不改任何金额，
+   * 存量单读不到就退回保守分支（NOT_CALENDAR_PRICED，只收换人费不动结算价）。
+   */
+  calendarPerPaxCny?: number | null;
+  calendarDiscountPerPaxCny?: number | null;
+  /**
+   * 建单**当时是否真的减了代理立减**（复审 H3）。
+   *
+   * 建单侧只有在「没有任何手工价通道」时才自动命中立减（见 createOrder 的
+   * hasManualSettlementChannel）；换人侧却无条件再算一次今天的立减 —— 两边不对称，
+   * 手工价单会被平白多减一次立减，或者反过来把立减当成日历涨价再收一遍。
+   * 因此把「建单到底减没减」这一位随基准戳一起盖章：换人时按这一位决定要不要减今天的立减，
+   * 保证减法两边同口径（基准减了 → 今天也减；基准没减 → 今天也不减）。
+   */
+  calendarDiscountApplied?: boolean;
+  /**
+   * 建单那次取价用的**日历定价键**（档次×晚数×出发日 / 逐航段航班号×出发日，见 SwapCalendarKey）。
+   *
+   * 光有每人价还不够：这张单成交之后可能被改档（换 bundleId → 档次晚数变了）或改期（出发日挪了），
+   * 那时「今天的日历价」查的已经是另一格 —— 拿它跟成交那格的价相减，就把改档/改期的价差
+   * 当成日历浮动又收了一遍（改档/改期本身早就各自落过差额行）。把键一起盖章，换人当天先比键。
+   * 与 calendarPerPaxCny 同生共死：取价口径明确（能算出每人价）才有键，缺一不给。
+   */
+  calendarKey?: SwapCalendarKey | null;
 }): {
   kind: OrderItemKind;
   description: string;
@@ -999,8 +1158,98 @@ export function buildSettlementTotalItem(input: {
       settlementPrice: true,
       authoritativeTotalCny: input.authoritativeTotalCny,
       settlementTotalCny: input.settlementTotalCny,
+      // 日历成交的每人基准（见入参注释）；手工结算价不带这几个键。
+      ...(input.calendarPerPaxCny != null
+        ? {
+            calendarPerPaxCny: input.calendarPerPaxCny,
+            calendarDiscountPerPaxCny: input.calendarDiscountPerPaxCny ?? 0,
+            calendarDiscountApplied: input.calendarDiscountApplied === true,
+            // 定价键（改档/改期后换人据此 fail-closed，见入参注释）。
+            ...(input.calendarKey ? { calendarKey: input.calendarKey } : {}),
+          }
+        : {}),
     },
   };
+}
+
+/**
+ * 结算价日历取价审计 → 建单当天的「每人日历基准」（换人重算结算价的差价基准）。
+ *
+ * 只认口径明确的两种形状，其余一律返回 null（宁可不落基准，也不落一个估算出来的数）：
+ *   · 套餐日历（source=SETTLEMENT_CALENDAR）：**恰好一条** lines 时取该行 pricePerPersonCny；
+ *     多条行分不清换下去的这个人算哪一条（换人重算本身也在这一步跳过，见 resolveSwapRepriceQuote）。
+ *   · 机票日历（source=FLIGHT_SETTLEMENT_CALENDAR）：Σ 各航段 pricePerPersonCny（往返各查各的价）。
+ * 每人立减取自动立减命中的 perPersonCny（恰好一条命中时才认，同理由）。
+ *
+ * 返回的是**未减立减的裸日历价 + 每人立减**两个数，与 resolveSwapRepriceQuote 换人当天的取法
+ * 逐项对齐：基准 = perPaxCny − discountPerPaxCny。
+ * 第三个数 discountApplied =「这一单当时到底减没减立减」（复审 H3）：建单侧只在没有任何手工价
+ * 通道时才自动命中立减，换人侧必须照着这一位决定今天减不减，否则同一笔立减会被多减/多收一次。
+ * 第四项 key =「这次取的是日历上的哪一格」（档次×晚数×出发日 / 逐航段航班号×出发日）：
+ * 改档 / 改期之后那一格已经换人了，换人当天先比键，键变了就不重算（PRICING_KEY_CHANGED）。
+ * 键这一维读不出来 → 整份基准返回 null（只有价没有键的基准戳，换人时照样用不了）。
+ *
+ * 两处调用共用这一份口径：① 建单当场（autoDiscount = 本次命中的立减）；
+ * ② 存量单换人时从建单审计里回读（autoDiscount = 审计 blob 里的 autoDiscount 快照，
+ *    建单只在真减了立减时才写这个键，见 createOrder 的 settlementCalendarAudit 组装）。
+ */
+export function resolveCalendarPerPaxBasis(
+  calendarAudit: Record<string, unknown> | null,
+  autoDiscount: AutoDiscountSummary | null,
+): {
+  perPaxCny: number;
+  discountPerPaxCny: number;
+  discountApplied: boolean;
+  /** 这次取价用的是日历上的哪一格（换人当天先比这个键，见 SwapCalendarKey）。 */
+  key: SwapCalendarKey;
+} | null {
+  if (!calendarAudit) return null;
+  const lines = Array.isArray(calendarAudit.lines)
+    ? (calendarAudit.lines as Array<Record<string, unknown>>)
+    : [];
+  if (lines.length === 0) return null;
+  const perPax = (line: Record<string, unknown>): number | null => {
+    const v = line.pricePerPersonCny;
+    return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null;
+  };
+  const str = (v: unknown): string | null => (typeof v === 'string' && v.trim() !== '' ? v : null);
+  let perPaxCny: number | null = null;
+  // 定价键与每人价同生共死：键这一维缺了就整份基准不给 —— 只有价没有键，换人当天照样
+  // fail-closed，落一个用不上的基准戳反而让人以为「这单能重算」。
+  let key: SwapCalendarKey | null = null;
+  if (calendarAudit.source === 'SETTLEMENT_CALENDAR') {
+    if (lines.length !== 1) return null;
+    perPaxCny = perPax(lines[0]);
+    const tier = str(lines[0].tier);
+    const departDate = str(lines[0].departDate) ?? str(calendarAudit.departDate);
+    const nights =
+      typeof lines[0].nights === 'number' && Number.isFinite(lines[0].nights)
+        ? (lines[0].nights as number)
+        : null;
+    if (tier != null && nights != null && departDate != null) {
+      key = { source: 'BUNDLE_SETTLEMENT_CALENDAR', tier, nights, departDate };
+    }
+  } else if (calendarAudit.source === 'FLIGHT_SETTLEMENT_CALENDAR') {
+    let sum = 0;
+    const legs: Array<{ flightNumber: string; departDate: string }> = [];
+    for (const line of lines) {
+      const v = perPax(line);
+      if (v == null) return null;
+      sum = round2(sum + v);
+      const flightNumber = str(line.flightNumber);
+      const departDate = str(line.departDate);
+      if (flightNumber == null || departDate == null) return null;
+      legs.push({ flightNumber, departDate });
+    }
+    perPaxCny = sum;
+    key = { source: 'FLIGHT_SETTLEMENT_CALENDAR', legs };
+  }
+  if (perPaxCny == null || !(perPaxCny > 0) || key == null) return null;
+  const hits = autoDiscount?.hits ?? [];
+  // 立减命中多条 = 多条套餐行，上面已经拦掉；这里只可能是 0 或 1 条。
+  const discountPerPaxCny = hits.length === 1 ? round2(hits[0].perPersonCny) : 0;
+  // 「减没减」看的是有没有命中行，不是金额是否为正：¥0 的立减规则也算减过（今天照样要减）。
+  return { perPaxCny, discountPerPaxCny, discountApplied: hits.length > 0, key };
 }
 
 /**
@@ -1474,6 +1723,133 @@ function duplicateForceNoteFor(
   if (conflicts.length === 0) return null;
   const orderNumbers = [...new Set(conflicts.flatMap((c) => c.orderNumbers))];
   return `重复乘客强录：与订单 ${orderNumbers.join('、')} ${reason}`;
+}
+
+// ── 换人费标准档（运营可配）───────────────────────────────────────────────────
+/** SystemSetting 键：换人费可选档位（逗号分隔的整数 CNY）。无记录 → 回落下面的缺省两档。*/
+export const SWAP_FEE_OPTIONS_SETTING_KEY = 'orders.swapFeeOptionsCny';
+/** 缺省档位：当前业务在用的两档。「按什么规则取哪一档」尚无成文口径，系统不猜，由经办人自己选。*/
+export const DEFAULT_SWAP_FEE_OPTIONS_CNY: readonly number[] = [450, 550];
+
+/**
+ * 当前生效的换人费档位清单（换人弹窗预填 + 换人预览端点共用）。
+ *
+ * 读得到它的只有 ADMIN / STAFF / AGENT 三种身份（GET /orders/swap-fee-options 与换人预览各自
+ * 在路由/服务里断言）：档位是我方与代理之间的收费口径，客户侧既没有换人这条通道，
+ * 也不该看见「换人费有哪几档」。PUT 改档位仍限 ADMIN。
+ *
+ * 与房控超售上限（getHotelOversellCapRooms）同款读法：DB 配置优先，缺记录 / 脏值 / 测试里
+ * 没铺 systemSetting delegate 时一律回落缺省 —— 档位只是**预填建议**，不是放行条件，
+ * 配置读挂了也绝不能让换人跟着炸（金额最终以经办人提交的 feeCny 为准）。
+ */
+export async function getSwapFeeOptions(
+  client: typeof prisma | Prisma.TransactionClient = prisma,
+): Promise<number[]> {
+  const delegate = (
+    client as unknown as {
+      systemSetting?: {
+        findUnique: (args: { where: { key: string } }) => Promise<{ value: string } | null>;
+      };
+    }
+  ).systemSetting;
+  if (!delegate) return [...DEFAULT_SWAP_FEE_OPTIONS_CNY];
+  const row = await delegate
+    .findUnique({ where: { key: SWAP_FEE_OPTIONS_SETTING_KEY } })
+    .catch(() => null);
+  const parsed = (row?.value ?? '')
+    .split(',')
+    .map((s) => s.trim())
+    // 先滤掉空片段再转数字：Number('') === 0，不滤会让「空配置」变成一档 ¥0。
+    .filter((s) => s !== '')
+    .map((s) => Number(s))
+    // 上限与 PUT 校验同一个常量（POST_SALE_FEE_CAP_CNY，换人费本身也归它管）——
+    // 两处各写各的数就会出现「存得进去、读回来被滤掉」的静默不一致。
+    .filter((n) => Number.isInteger(n) && n >= 0 && n <= POST_SALE_FEE_CAP_CNY);
+  return parsed.length > 0 ? parsed : [...DEFAULT_SWAP_FEE_OPTIONS_CNY];
+}
+
+/**
+ * 这张**存量**订单建单时那次「结算价日历自动取价」的审计快照（换人重算差价基准的最后一条来源）。
+ *
+ * 2026-09 之前建的单，SETTLEMENT 行上只有整单结算总价，没有基准戳，光看这一行分不出
+ *「日历自动取的价」和「运营手填的结算总价 / 团队议价」—— 后者不是日历成交，日历动没动
+ * 跟它一分钱关系都没有，拿日历去「纠正」它就是无中生有地多收/少收。
+ * 唯一留在库里的判据是建单时那条 APPLY_SETTLEMENT_TOTAL 审计的 after.settlementCalendar
+ *（日历取价时非空、手工价时为 null，见 createOrder 的结算价审计段），它里面存的是
+ * `{ source, departDate, lines:[{ pricePerPersonCny, pax, … }], autoDiscount? }` ——
+ * **每人价原样躺在 lines 上**，不需要拿总价去除人数。
+ *
+ * 复审 H1/H2 之后本函数从「返回 true/false」改成「把这个 blob 原样交出来」：
+ * 旧口径用它当一道闸、再拿 settlementTotalCny ÷ 占座人数派生基准，而那个总价里揉着
+ * 单房差 / 升舱 / 婴儿价 / 儿童折扣 / 指定酒店加价 / 自备签减免，除出来的根本不是日历每人价。
+ * 现在直接跑 resolveCalendarPerPaxBasis 读 lines，与建单当场盖章走的是同一份口径。
+ *
+ * 读不到（审计表没铺 / 查询失败 / 没有这条记录）一律返回 null —— 判不出就不重算，
+ * 只收换人费。宁可少做一次自动重算，也不能按猜出来的基准改钱。
+ */
+/**
+ * 本单**已计提**（含已结算）的佣金合计（CNY）；一条都没有 → null。
+ *
+ * 佣金在订单转 PAID 时按当时的价格基数一次性计提，之后任何改价都不重算 —— 所以每一条会动
+ * total 的路（改结算价 / 改归属 / 换人重算）都得先问一句「这单计提过没有」，有就留一条
+ * SETTLEMENT_PRICE_CHANGED_AFTER_COMMISSION 的 WARNING，让财务自己决定要不要人工调整。
+ * 三处共用这一份读法，免得各写各的口径（状态集合漏一个就少留一条审计）。
+ *
+ * 单测常只 mock 用得到的 delegate：**delegate 压根不在**（没铺 commissionRecord）或一条记录都没有
+ * → null（当「没计提」）。但**查询本身失败不吞**：往上抛。
+ * 这条路上的三个调用方（改结算价 / 改归属 / 换人重算）都在事务里，且都要靠这个数决定留不留
+ * 「佣金基数已漂移」的 WARNING —— 把查询异常吞成 null，等于在真出错时静默宣布「本单没计提过佣金」，
+ * 该留的审计不留，财务事后对不上账也翻不出是哪一步动的。原本的改结算价路径就是直接查、
+ * 出错整事务回滚（响亮失败），抽成公共函数不能顺手把这份响亮改没了。
+ */
+async function sumAccruedCommissionCny(
+  client: Prisma.TransactionClient | typeof prisma,
+  orderId: string,
+): Promise<number | null> {
+  const delegate = (
+    client as unknown as {
+      commissionRecord?: {
+        findMany?: (args: unknown) => Promise<Array<{ amount: unknown }>>;
+      };
+    }
+  ).commissionRecord;
+  if (!delegate || typeof delegate.findMany !== 'function') return null;
+  // 查询异常不吞（见方法头）：抛出去让调用方的事务整体回滚，别把「读失败」说成「没计提」。
+  const rows = await delegate.findMany({
+    where: { orderId, status: { in: [CommissionStatus.ACCRUED, CommissionStatus.SETTLED] } },
+    select: { amount: true },
+  });
+  if (!Array.isArray(rows) || rows.length === 0) return null;
+  return round2(rows.reduce((sum, c) => sum + Number(String(c.amount ?? 0)), 0));
+}
+
+async function readOrderSettlementCalendarAudit(
+  client: Prisma.TransactionClient | typeof prisma,
+  orderId: string,
+): Promise<Record<string, unknown> | null> {
+  const delegate = (
+    client as unknown as {
+      auditLog?: {
+        findFirst: (args: unknown) => Promise<{ after: Prisma.JsonValue | null } | null>;
+      };
+    }
+  ).auditLog;
+  if (!delegate) return null;
+  const row = await delegate
+    .findFirst({
+      where: {
+        action: 'APPLY_SETTLEMENT_TOTAL',
+        targetType: AuditTargetType.ORDER,
+        targetId: orderId,
+      },
+      orderBy: { createdAt: 'desc' },
+      select: { after: true },
+    })
+    .catch(() => null);
+  if (!row) return null;
+  const calendar = readJsonObject(row.after).settlementCalendar;
+  if (calendar == null || typeof calendar !== 'object' || Array.isArray(calendar)) return null;
+  return calendar as Record<string, unknown>;
 }
 
 export class OrderService {
@@ -1973,6 +2349,13 @@ export class OrderService {
       }
     }
 
+    // ── 日历成交的「每人基准」（换人重算结算价用）─────────────────────────────
+    // 从刚才那次取价的 audit.lines 里直接读，不再事后 ÷ 人数：加项 / 婴儿同价 / 单房差都揉在
+    // 总价里，除法只是估算，而换人差价要拿它跟换人当天的日历价逐分相减（日历比日历）。
+    // 只在「口径明确」时给值：套餐单必须恰好一条已配日历行（多行分不清这个人算哪一条），
+    // 机票单取各航段每人价之和。取不到 → 不落这两个键，换人时退回保守分支。
+    const calendarBasis = resolveCalendarPerPaxBasis(settlementCalendarAudit, agentAutoDiscount);
+
     const calendarDiscountCny = stackableCalendarAdjustment
       ? Math.max(0, -(body.priceAdjustment?.amountCny ?? 0))
       : 0;
@@ -2009,6 +2392,13 @@ export class OrderService {
             diffCny,
             authoritativeTotalCny,
             settlementTotalCny: effectiveSettlementTotalCny,
+            calendarPerPaxCny: calendarBasis?.perPaxCny ?? null,
+            calendarDiscountPerPaxCny: calendarBasis?.discountPerPaxCny ?? 0,
+            // 建单到底减没减代理立减（手工价通道在场时一律没减，见上方 hasManualSettlementChannel）。
+            // 换人重算按这一位决定今天减不减，两边同口径（复审 H3）。
+            calendarDiscountApplied: calendarBasis?.discountApplied === true,
+            // 这次取价用的是日历上的哪一格：改档 / 改期后换人据此不重算（PRICING_KEY_CHANGED）。
+            calendarKey: calendarBasis?.key ?? null,
           }),
         );
       }
@@ -5892,18 +6282,10 @@ export class OrderService {
       // 且计提幂等键按（订单, productKind）不区分状态 —— 补提也会被判成"已提过"而永久锁死。
       // 本次只做可见性：把「已计提多少」明明白白摆到操作者面前 + 留一条 WARNING 审计，
       // 让财务自己决定要不要人工调整。真正的重算/幂等键收口是独立议题，不在此处顺手改。
-      const accruedCommissions = await tx.commissionRecord.findMany({
-        where: {
-          orderId,
-          status: { in: [CommissionStatus.ACCRUED, CommissionStatus.SETTLED] },
-        },
-        select: { amount: true },
-      });
-      const accruedCommissionCny = round2(
-        accruedCommissions.reduce((s, c) => s + Number(c.amount.toString()), 0),
-      );
+      // 口径与换人重算 / 改归属共用（sumAccruedCommissionCny）：一条都没有 → null。
+      const accruedCommissionCny = await sumAccruedCommissionCny(tx, orderId);
       const commissionWarning =
-        accruedCommissions.length > 0
+        accruedCommissionCny !== null
           ? `本单已计提佣金 ¥${accruedCommissionCny}，价格基数已变更，请财务确认是否调整。`
           : null;
 
@@ -5937,7 +6319,7 @@ export class OrderService {
         afterSubtotal: updated.subtotal.toString(),
         afterTotal: updated.total.toString(),
         warning,
-        accruedCommissionCny: accruedCommissions.length > 0 ? accruedCommissionCny : null,
+        accruedCommissionCny,
       };
     });
 
@@ -9436,7 +9818,11 @@ export class OrderService {
    *   1. 更新该乘客的身份字段（仅传入的字段；fullName/姓名拆分与下单口径一致）。
    *   2. resetInvoice → order.invoiceStatus = NONE（新出行人需重新开票）。
    *   3. resetVisa → 该订单所有 VISA 履约任务回到 PENDING（新出行人需重新送签）。
-   *   4. feeCny>0 → order.adjustmentCny += feeCny + adjustments 流水（SWAP_FEE）。
+   *   4. 真换人（证件号变化）且结算价未锁 → 按**换人当天**的结算价日历重取新出行人每人价，
+   *      与旧份额的差额落一条挂在该乘客名下的 SWAP_REPRICE 调价行（口径见 resolveSwapRepriceQuote）。
+   *   5. feeCny>0 → order.adjustmentCny += feeCny + adjustments 流水（SWAP_FEE）；
+   *      旧份额高于新价时再加一条 SWAP_PRICE_DIFF（换人差价）。两条都记在**被换下去的人**头上、
+   *      不参与每人均摊（excludeFromPerPax）。
    *
    * 返回更新后的订单（serializeOrder）+ 审计用的原/新身份。
    */
@@ -9480,7 +9866,25 @@ export class OrderService {
         /** 换人前的整单现场快照（供订单页「换人历史」还原换人那一刻的样子）。 */
         snapshot: SwapBeforeSnapshot;
       };
-      after: { fullName: string; documentNumber: string };
+      after: {
+        fullName: string;
+        documentNumber: string;
+        /** 换人重算结算价的结果（未跑重算 = null；跳过时 repriceSkipped 说明为什么）。 */
+        reprice: {
+          /** 差价基准 = 成交那天的日历每人价（换人费也一并回给审计，见 L10）。 */
+          basisCny: number | null;
+          oldShareCny: number;
+          newSettlementCny: number | null;
+          diffCny: number;
+          feeCny: number;
+          calendarSource: string | null;
+          repriceSkipped: SwapRepriceSkipReason | null;
+          itemId: string | null;
+          itemAmountCny: number;
+        } | null;
+        /** 代理填的换人费不在配置档位里（运营复核时重点看这一笔）；运营/管理员不判。 */
+        feeOffList?: boolean;
+      };
       resetInvoice: boolean;
       resetVisa: boolean;
       visaTasksReset: number;
@@ -9492,11 +9896,19 @@ export class OrderService {
     // ── 换人权限口径（2026-09 拍板）────────────────────────────────────────
     // 运营/管理员：照旧全量。
     // 代理：可以换自家（含下级）单里的人，运营事后复核 —— 客人临时换人时不必再等运营上班。
-    //   但代理拿不到「定价权」与「状态重置权」：
-    //     · feeCny 强制 0、feeLabel 忽略 —— 换人费该收多少是我方口径，代理不能给自己定价，
-    //       运营复核时再补一笔（走既有加收费用通道）。
+    //   但代理拿不到「状态重置权」：
     //     · resetVisa 强制 true —— 换的是另一个人，旧签证进度对新人无效，必须回队重新送签。
     //     · resetInvoice 忽略 —— 开票位属于财务口径，代理不该动；已开票的单代理干脆不许换人（见事务内闸）。
+    //
+    // 换人费口径（2026-09 拍板，改）：**换人费由经办人自己填**，代理也不例外 ——
+    // 换人费是业务常数（清单见 getSwapFeeOptions，界面按清单预填），谁换人谁填这一笔，
+    // 运营复核时三次核对。此前代理侧强制 feeCny=0，等于把「代理换的人不收费」写死进系统，
+    // 运营事后要另开一笔调价才补得回来，账上看不出这笔钱是哪次换人产生的。
+    // 金额边界仍由 schema 的 postSaleFeeSchema 兜（整数、≥0、≤ 上限），此处只做同款取整兜底。
+    //   · **费用名（feeLabel）只有运营/管理员能改**：代理写什么都按「换人费」入账 —— 这一笔
+    //     进的是我方财务台账，名字由代理自定义，对账时同一笔钱会有 N 种叫法，分类当场作废。
+    //   · 代理填的金额不在配置档位里 → 不拦（档位只是建议，特殊情况本来就要按实际收），
+    //     但在审计里打 feeOffList，运营复核时一眼能挑出来。
     const isInternalActor = actor.role === UserRole.ADMIN || actor.role === UserRole.STAFF;
     if (!isInternalActor) {
       if (actor.role !== UserRole.AGENT) {
@@ -9504,7 +9916,7 @@ export class OrderService {
       }
       await this.assertPassengerEditScope(orderId, actor);
     }
-    const feeCny = isInternalActor ? Math.max(0, Math.trunc(input.feeCny ?? 0)) : 0;
+    const feeCny = Math.max(0, Math.trunc(input.feeCny ?? 0));
     const feeLabel = isInternalActor ? input.feeLabel : undefined;
     const resetInvoice = isInternalActor ? Boolean(input.resetInvoice) : false;
     const resetVisa = isInternalActor ? Boolean(input.resetVisa) : true;
@@ -9525,8 +9937,10 @@ export class OrderService {
           outboundInvoiced: boolean | null;
           returnInvoiced: boolean | null;
           systemInvoiced: boolean | null;
+          // 结算价锁：锁着的单不重算结算价（财务已按这个应收对过账），见下方「1f」。
+          settlementLocked: boolean | null;
         }>
-      >`SELECT id, "adjustmentCny", adjustments, status, "deletedAt", "visaStatus", "outboundInvoiced", "returnInvoiced", "systemInvoiced" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      >`SELECT id, "adjustmentCny", adjustments, status, "deletedAt", "visaStatus", "outboundInvoiced", "returnInvoiced", "systemInvoiced", "settlementLocked" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
       const order = orderRows[0];
       if (!order) throw new NotFoundError('订单不存在');
 
@@ -9645,6 +10059,15 @@ export class OrderService {
       const newDocument = input.documentNumber?.trim();
       const documentChanged =
         newDocument !== undefined && newDocument !== '' && newDocument !== passenger.documentNumber;
+
+      // ── 1b·闸. 换人费只在**真换人**时能收 ──────────────────────────────────────
+      // 这个端点同时承担「改错别字 / 补生日 / 改自备签」这些非换人的小修（证件号没变），
+      // 它们跟换人服务费没有半点关系。此前不判，界面上换人费输入框留着上一次的值、
+      // 或者经办人顺手填了一笔，就会在一次改错别字里凭空多收客人几百块，而且流水上写着
+      //「换人费」、乘客名单里根本找不到被换的人 —— 账面上无从解释。宁可拒绝，让人看清自己在做什么。
+      if (!documentChanged && feeCny > 0) {
+        throw new BadRequestError('未换人不能收取换人费');
+      }
 
       // ── 1b·闸0. 换人 = 录入一个新人的护照 → 按人出行的单必须带新出行人的护照有效期 ────────
       // 口径与建单一致（PER_PERSON_TRAVEL_KINDS / refineRequiredPassportExpiry，同一常量复用）：
@@ -9836,6 +10259,77 @@ export class OrderService {
         }
       }
 
+      // ── 1f. 换人重算结算价（只在真换人时跑：证件号变了才是「另一个人上飞机」）────────
+      // 口径（2026-09 拍板）：新出行人的结算价按**换人当天**的结算价日历、同一出行日期重取；
+      // 旧客那份份额若更高，差额（旧 − 新，只取正）连同换人费一起挂在**被换下去的那个人**头上，
+      // 绝不摊给留下来的同行人与新客（不摊的机制见 per-pax-share.ts 的 spreadableAdjustmentCny）。
+      // 价格没变（最常见）→ 差额 0、不落任何行。取不到价 / 结算价已锁 → 跳过重算，只收换人费。
+      //
+      // 落账方式与「取消航段手续费」同款：直接建一条 endpoint-only 原因码的调价行 + 重算 total，
+      // 不走 _addPriceAdjustmentWithinTx —— 那个内核会自己再锁一次行、再写一次 adjustments 与 total，
+      // 与本事务末尾那一次合并写（步骤 4）互相覆盖，且它的 reasonCode 只收人工四类。
+      let repriceQuote: SwapRepriceQuote | null = null;
+      let repriceItemId: string | null = null;
+      let repriceDeltaCny = 0;
+      let repriceRowDescription: string | null = null;
+      let repricedSubtotalCny: number | null = null;
+      /** 本单已计提佣金（>0 才留佣金基数漂移审计，见下方 M2 段）；null = 没计提过 / 没重算。 */
+      let repriceCommissionCny: number | null = null;
+      if (documentChanged) {
+        repriceQuote = await this.resolveSwapRepriceQuote(tx, orderId, passengerId);
+        const { basisCny, newSettlementCny } = repriceQuote;
+        if (basisCny != null && newSettlementCny != null && !repriceQuote.repriceSkipped) {
+          // 日历比日历：delta = 换人当天的日历价 − 成交那天的日历价。
+          // 两端在取价内核里已取整（复审 H1），这里再取一次只是把「整数」这件事写死在落库口径上。
+          const deltaCny = Math.round(newSettlementCny - basisCny);
+          // 差额为 0（日历没动，最常见）→ 不落空行；可正可负（涨价 → 新客补，降价 → 新客少付）。
+          if (Math.abs(deltaCny) >= 0.005) {
+            const row = buildPriceAdjustmentItem({
+              amountCny: deltaCny,
+              reasonCode: 'SWAP_REPRICE',
+            });
+            const createdReprice = await tx.orderItem.create({
+              data: {
+                orderId,
+                kind: row.kind,
+                description: row.description,
+                quantity: 1,
+                unitPrice: new Prisma.Decimal(row.unitPrice),
+                amount: new Prisma.Decimal(row.amount),
+                totalCostCny: new Prisma.Decimal(row.totalCostCny),
+                metadata: {
+                  ...row.metadata,
+                  swapReprice: true,
+                  // basisCny 是这次减法的左边（成交那天的日历价）；oldShareCny 只做展示留痕。
+                  basisCny,
+                  oldShareCny: repriceQuote.oldShareCny,
+                  newSettlementCny,
+                  calendarSource: repriceQuote.calendarSource,
+                  ...(repriceQuote.detail ? { calendarDetail: repriceQuote.detail } : {}),
+                } as Prisma.InputJsonValue,
+                // 挂在这一位乘客名下：新出行人的每人结算价 = 均摊 + 本行净额 = 重取的日历价。
+                passengerId,
+              },
+            });
+            repriceItemId = createdReprice.id;
+            repriceDeltaCny = deltaCny;
+            repriceRowDescription = row.description;
+            // 重算 subtotal/total（口径同事后调价：Σ 全部行金额，当前 total = subtotal）。
+            const agg = await tx.orderItem.aggregate({
+              where: { orderId },
+              _sum: { amount: true },
+            });
+            repricedSubtotalCny = round2(Number(agg._sum.amount ?? 0));
+            // ── 佣金基数漂移留痕（复审 M2）───────────────────────────────────
+            // 佣金在订单转 PAID 时按当时的价格基数一次性计提，之后任何改价都**不重算佣金**。
+            // 改结算价 / 改归属两条路早就为此各留一条 WARNING 审计，换人重算却把 total 悄悄改了
+            // 却什么也不留 —— 财务对账时看到佣金与应收对不上，翻不出是哪一步动的。
+            // 这里与改结算价那条路同一个 action、同一批字段，方便财务用一个筛选条件全捞出来。
+            repriceCommissionCny = await sumAccruedCommissionCny(tx, orderId);
+          }
+        }
+      }
+
       // ── 2. resetInvoice → 开票状态回 NONE + 三维开票位（去/回/系统）一并清零（新出行人重开票）──
       if (resetInvoice) {
         await tx.order.update({
@@ -9905,20 +10399,81 @@ export class OrderService {
           at: new Date().toISOString(),
           by: actor.userId,
           note: input.note,
+          // 换人费是**被换下去的那个人**的账：留他的姓名/证件号（他已不在乘客名单里，
+          // 只有这条流水还记得这笔钱是谁产生的），并且不参与每人均摊。
+          passengerName: beforeIdentity.fullName,
+          passengerDocument: beforeIdentity.documentNumber,
+          excludeFromPerPax: true,
         });
       }
-      if (swapAdjustments.length > 0) {
+      // 换人差价（成交那天的日历价 − 换人当天的日历价，只取正）：挂在被换下去的人头上、不摊。
+      // 取整：这笔钱进 Order.adjustmentCny（Int 列），一分钱的小数就能把整个换人事务打回 500。
+      const swapPriceDiffCny = repriceQuote?.repriceSkipped
+        ? 0
+        : Math.round(repriceQuote?.diffCny ?? 0);
+      if (swapPriceDiffCny > 0) {
+        swapAdjustments.push({
+          type: 'SWAP_PRICE_DIFF',
+          label: '换人差价',
+          amountCny: swapPriceDiffCny,
+          at: new Date().toISOString(),
+          by: actor.userId,
+          note: input.note,
+          passengerName: beforeIdentity.fullName,
+          passengerDocument: beforeIdentity.documentNumber,
+          excludeFromPerPax: true,
+        });
+      }
+      // ── 4b. 重算调价行的台账留痕（PRICE_ADJUSTMENT 流水）───────────────────────
+      // 与补房差 / 事后调价同一条既有约定：**PRICE_ADJUSTMENT 型流水只记账、不进 adjustmentCny**
+      //（钱已经随调价行进了 total，见 addPriceAdjustment / addRoomSupplement 的「仅记录用」注释）。
+      // 因此这条不带 excludeFromPerPax —— 它压根不在均摊基数里，spreadableAdjustmentCny 也就
+      // 不需要（更不能）把它扣一次；带上反而会把 total 里的钱从每人份额里再减一遍，双重扣减。
+      // 决策记在这里：沿用既有约定，不引入 ledgerOnly 这种只此一处的新标记。
+      const ledgerEntries: OrderAdjustmentEntry[] = [];
+      if (repriceItemId && Math.abs(repriceDeltaCny) >= 0.005) {
+        ledgerEntries.push({
+          type: 'PRICE_ADJUSTMENT',
+          label: repriceRowDescription ?? PRICE_ADJUSTMENT_REASON_LABEL.SWAP_REPRICE,
+          amountCny: repriceDeltaCny,
+          at: new Date().toISOString(),
+          by: actor.userId,
+          reasonCode: 'SWAP_REPRICE',
+          note: input.note,
+          passengerId,
+        });
+      }
+
+      // 售后费流水（换人费 / 换人差价 / 自备签减免回滚）+ 重算台账流水 + 重算后的 subtotal/total
+      // 合并写一次 —— 分两次写会彼此覆盖 adjustments 数组（同一事务内后写的读的是事务开始时的快照）。
+      if (swapAdjustments.length > 0 || ledgerEntries.length > 0 || repricedSubtotalCny != null) {
         const existingArr = Array.isArray(order.adjustments)
           ? (order.adjustments as Prisma.JsonArray)
           : [];
         const log = [
           ...existingArr,
-          ...(swapAdjustments as unknown as Prisma.JsonArray),
+          ...([...swapAdjustments, ...ledgerEntries] as unknown as Prisma.JsonArray),
         ] as Prisma.InputJsonValue;
-        const delta = swapAdjustments.reduce((s, e) => s + e.amountCny, 0);
+        // 只有售后费流水进 adjustmentCny；台账流水（PRICE_ADJUSTMENT）的钱已经在 total 里。
+        // Math.round 是最后一道兜底：adjustmentCny 是 Int 列，三笔来源（换人费 / 自备签减免回滚 /
+        // 换人差价）各自已经取整，这里只保证任何将来新增的流水也不会带小数进来（复审 H1）。
+        const delta = Math.round(swapAdjustments.reduce((s, e) => s + e.amountCny, 0));
         await tx.order.update({
           where: { id: orderId },
-          data: { adjustmentCny: order.adjustmentCny + delta, adjustments: log },
+          data: {
+            ...(swapAdjustments.length > 0
+              ? { adjustmentCny: order.adjustmentCny + delta }
+              : {}),
+            ...(swapAdjustments.length > 0 || ledgerEntries.length > 0
+              ? { adjustments: log }
+              : {}),
+            ...(repricedSubtotalCny != null
+              ? {
+                  subtotal: new Prisma.Decimal(repricedSubtotalCny),
+                  total: new Prisma.Decimal(repricedSubtotalCny),
+                }
+              : {}),
+          },
         });
       }
 
@@ -9933,6 +10488,23 @@ export class OrderService {
         afterIdentity: afterPassenger,
         visaTasksReset,
         clearedProfile: documentChanged,
+        // 佣金基数漂移（M2）：换人重算真的改了 total 且本单已计提佣金 → 事务外补一条 WARNING 审计。
+        repriceCommissionCny: repricedSubtotalCny != null ? repriceCommissionCny : null,
+        repricedTotalCny: repricedSubtotalCny,
+        repriceItemId,
+        // 重算留痕：审计要能解释「新客这个价是怎么来的、旧客为什么补这笔差价」。
+        reprice: repriceQuote
+          ? {
+              basisCny: repriceQuote.basisCny,
+              oldShareCny: repriceQuote.oldShareCny,
+              newSettlementCny: repriceQuote.newSettlementCny,
+              diffCny: swapPriceDiffCny,
+              calendarSource: repriceQuote.calendarSource,
+              repriceSkipped: repriceQuote.repriceSkipped ?? null,
+              itemId: repriceItemId,
+              itemAmountCny: repriceDeltaCny,
+            }
+          : null,
       };
     });
 
@@ -9940,6 +10512,39 @@ export class OrderService {
       where: { id: orderId },
       include: ORDER_FULL_INCLUDE,
     });
+
+    // ── 换人重算撞上已计提佣金 → 单独留一条 WARNING 审计（复审 M2）────────────────
+    // 与「改结算价」「改归属」两条路同一个 action、同一批字段：佣金按计提当时的价格基数一次算死，
+    // 换人重算改了 total 却不重算佣金，财务要能一眼捞出所有「基数已变、佣金没动」的单。
+    // await 而非 fire-and-forget：与那两条路同口径，落审计后再返回。
+    if (result.repriceCommissionCny !== null) {
+      await writeAudit({
+        actor: { userId: actor.userId, role: actor.role },
+        action: 'SETTLEMENT_PRICE_CHANGED_AFTER_COMMISSION',
+        targetType: 'ORDER',
+        targetId: orderId,
+        targetLabel: finalOrder.orderNumber,
+        before: { accruedCommissionCny: result.repriceCommissionCny },
+        after: {
+          total: result.repricedTotalCny?.toString() ?? null,
+          orderItemId: result.repriceItemId,
+          // 佣金不随换人重算，这条审计就是「基数已变、佣金没动」的留痕。
+          commissionRecalculated: false,
+          reason: '换人重算结算价',
+          passengerId,
+        },
+        severity: AuditSeverity.WARNING,
+      });
+    }
+
+    // 代理填的换人费不在配置档位里 → 审计打标（不拦，见上方口径）。档位读挂了一律不打标：
+    // 档位只是建议，读不到就没有「off list」这回事，不能凭读失败给人扣个异常帽子。
+    const feeOffList =
+      actor.role === UserRole.AGENT && feeCny > 0
+        ? await getSwapFeeOptions(prisma)
+            .then((options) => !options.includes(feeCny))
+            .catch(() => false)
+        : false;
 
     return {
       // 对外脱敏：换人的返回按操作者角色脱敏（ADMIN/STAFF 全量，其余剥离内部字段 + 逐项拆价）。
@@ -9951,8 +10556,10 @@ export class OrderService {
         after: {
           fullName: result.afterIdentity.fullName,
           documentNumber: result.afterIdentity.documentNumber,
+          reprice: result.reprice ? { ...result.reprice, feeCny } : null,
+          ...(feeOffList ? { feeOffList: true } : {}),
         },
-        // 记的是**实际生效**的口径（代理换人被强制成 feeCny=0 / resetVisa=true），
+        // 记的是**实际生效**的口径（代理换人被强制成 resetVisa=true、费用名固定「换人费」），
         // 不是请求里写了什么 —— 审计要能解释账面为什么这样变。
         resetInvoice,
         resetVisa,
@@ -10014,6 +10621,8 @@ export class OrderService {
       select: {
         total: true,
         adjustmentCny: true,
+        // 售后费流水：可摊基数要扣掉换人费/换人差价（excludeFromPerPax），见 spreadableAdjustmentCny。
+        adjustments: true,
         passengers: { select: { id: true } },
         items: {
           select: {
@@ -10074,7 +10683,8 @@ export class OrderService {
       );
       const { rows } = computePerPaxShares({
         totalCny: Number(snapOrder.total?.toString() ?? 0),
-        adjustmentCny: snapOrder.adjustmentCny ?? 0,
+        // 可摊售后费：换人费/换人差价挂在被换下去的人头上，不摊给同行人（spreadableAdjustmentCny）。
+        adjustmentCny: spreadableAdjustmentCny(snapOrder),
         passengerIds: [...roster.map((p) => p.id)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
         netByPassenger: new Map(
           Object.entries(byPassenger).map(([pid, bucket]) => [pid, bucket.netCny]),
@@ -10084,6 +10694,566 @@ export class OrderService {
     }
 
     return snapshot;
+  }
+
+  /**
+   * 换人重算结算价：取价内核（换人事务与换人预览端点共用的**唯一**口径）。
+   *
+   * 业务口径（2026-09 拍板，经复审修正）：**差价只因为结算价日历动了才存在**，
+   * 所以要拿日历比日历 —— 基准是「这张单成交那天的日历每人价」（basisCny），
+   * 对手方是「换人当天的日历每人价」（newSettlementCny）：
+   *   · delta = 新 − 基准 → 挂在该乘客名下的一条 SWAP_REPRICE 调价行（可正可负，进 total）；
+   *   · diff  = max(0, 基准 − 新) → 旧客留下的差价，与换人费一起记在**被换下去的那个人**头上
+   *     （不摊给同行人与新客，机制见 per-pax-share.ts 的 spreadableAdjustmentCny）。
+   * 这单上的其它任何一笔钱都不许动。常见情形是日历没动 → delta 与 diff 都是 0、不落任何行。
+   *
+   * 为什么**不能**拿这位乘客今天的每人份额（oldShareCny）当基准（复审 BLOCK 的那条）：
+   * 每人份额 = 均摊（含单房差/杂费/整单议价/售后费）+ 这个人身上的按人调价净额。
+   * 拿它去跟今天的**裸日历价**相减，等于把「手工谈定的价」「售后补收的钱」一并当成日历差额
+   * 「纠正」回日历 —— 手工价单会被系统按日历多收，被换下去的人还要替同行人的售后费买单。
+   * oldShareCny 保留下来只做展示（界面上告诉经办人这个人原来算多少钱），不进任何算式。
+   *
+   * 基准（basisCny）从哪来，按下面的顺序，取不到就 NOT_CALENDAR_PRICED（只收换人费、不动结算价）：
+   *   1. 这位乘客名下已经有 SWAP_REPRICE 行（这单换过人了）→ 取最近那一行的 newSettlementCny。
+   *      连续换人时基准要跟着走，否则第二次换人会拿第一次换之前的价再算一遍（重复计差）。
+   *   2. 整单 SETTLEMENT 行带 calendarPerPaxCny（2026-09 起建单落的日历基准戳，见
+   *      buildSettlementTotalItem）→ 基准 = calendarPerPaxCny − calendarDiscountPerPaxCny。
+   *   3. 存量单（没有基准戳）：回建单那条 APPLY_SETTLEMENT_TOTAL 审计，把
+   *      after.settlementCalendar 的 lines[].pricePerPersonCny 当每人价（LEGACY_AUDIT）。
+   *      blob 缺失 / 口径不明 / 本单拆过 / 有按人 SETTLEMENT 覆盖行 → NOT_CALENDAR_PRICED。
+   *      **绝不再拿 settlementTotalCny ÷ 人数派生**：那个总价含加项，除出来不是日历价（复审 H1/H2）。
+   *
+   * 换人当天取价口径（对齐录单：resolveBundleSettlementCalendarTotal / resolveFlightSettlementCalendarTotal）：
+   *   · 只对**代理单**取价 —— 结算价日历本来就是同业价表，散客单的价不出自这张表（散客走套餐
+   *     percent-off + 散客立减），拿同业价去重算散客单等于按代理价卖给客人。
+   *   · 套餐单：本单唯一一条「配了日历键（档次+晚数）」的 BUNDLE 行 → 日历每人价 − 每人立减
+   *     （resolveAgentSettlementDiscount，与录单把立减写成独立 DISCOUNT 行同一净效果）。
+   *     **立减减不减看基准那一位**（basis.discountApplied，复审 H3）：建单侧只在没有任何手工价
+   *     通道时才自动命中立减，换人侧若无条件再减一次，手工价单的基准没减、今天减了，
+   *     差额里就凭空多出一整笔立减 —— 减法两边必须同口径。
+   *     加项（升舱/单住/婴儿价/指定酒店加价…）不再需要单独设闸：它们从来不在基准里，
+   *     日历比日历这道减法碰不到它们（原 ADDON_NOT_ATTRIBUTABLE 因此撤掉）。
+   *   · 纯机票单：逐条经济舱 FLIGHT 行按「航班号 × 该段出发地本地日」取每人价后求和（往返各查各的）。
+   *   · 其余一律不取价（repriceSkipped）—— **宁可不重算，也不算错**：
+   *       - NO_CALENDAR：非代理单 / 无日历键 / 多条套餐行分不清这人算哪一条 / 当日无价 /
+   *         含非经济舱航段（日历不分舱位）/ 取到的价 ≤ 0；
+   *       - NOT_CALENDAR_PRICED：这张单不是按日历成交的（手工价 / 议价 / 每人价），或存量单
+   *         判不出当时的日历基准 —— 没有基准就没有「日历动了多少」这回事；
+   *       - PRICING_KEY_CHANGED：这张单成交之后改过档（换 bundleId → 档次/晚数变了）或改过期
+   *         （出发日挪了，行价按设计冻结、差额另有调价行收），今天查的已经是日历上的**另一格**。
+   *         同一格的今昔两价相减才是「日历动了多少」；跨格相减量到的是改档/改期的价差，
+   *         那笔钱在各自的通道里早已收过一次，再收一次就是重复收费。故基准戳连**定价键**
+   *         一起盖章（档次×晚数×出发日 / 逐航段航班号×出发日），换人当天先比键、再比价；
+   *       - DIFF_OVER_CAP：差额超出调价上限 —— 多半是数据不对，不静默落一笔巨额调价；
+   *       - SETTLEMENT_LOCKED：结算价已锁（财务已按这个应收对过账），只收换人费、不动结算价。
+   *
+   * 只读，不写任何一行；换人事务与 GET 预览端点跑的是同一份代码（预览所见 = 换人所得）。
+   */
+  private async resolveSwapRepriceQuote(
+    db: Prisma.TransactionClient | typeof prisma,
+    orderId: string,
+    passengerId: string,
+  ): Promise<SwapRepriceQuote> {
+    // 结算价日历是整数每人价（SettlementRate.pricePerPersonCny 是 Int）。基准 / 新价 / 差额 /
+    // 差价全线取整：diff 会直接写进 Order.adjustmentCny（**Int 列**），带小数会整事务 500 回滚；
+    // 调价行金额也跟着整数，免得订单上冒出「−¥199.67」这种没人解释得清的行（复审 H1）。
+    const toInt = (n: number): number => Math.round(n);
+    // 日历表 / 立减规则都在换人这同一个事务里读：换人事务已经把 Order 行 FOR UPDATE 锁住了，
+    // 走事务外的 default client 等于在锁外另开一条连接读价 —— 与事务快照不是同一时刻（复审 L2）。
+    const txClient = db as unknown as PrismaClient;
+    const skip = (
+      reason: SwapRepriceSkipReason,
+      oldShareCny: number,
+      settlementLocked: boolean,
+      detail?: Record<string, unknown>,
+      basisCny: number | null = null,
+    ): SwapRepriceQuote => ({
+      basisCny,
+      oldShareCny,
+      newSettlementCny: null,
+      diffCny: 0,
+      calendarSource: null,
+      settlementLocked,
+      repriceSkipped: reason,
+      ...(detail ? { detail } : {}),
+    });
+
+    const order = await db.order.findUnique({
+      where: { id: orderId },
+      select: {
+        agentId: true,
+        total: true,
+        adjustmentCny: true,
+        adjustments: true,
+        settlementLocked: true,
+        // 只要 id：每人份额按乘客 id 升序均摊（分级余数兜给最后一位）。
+        // 基准早已改成「日历每人价」，不再拿总价 ÷ 占座人数派生，所以婴儿占不占座与这里无关。
+        passengers: { select: { id: true } },
+        // 拆过的单不认基准：拆单改的是人数与产品构成，成交那一刻的日历快照没跟着改。
+        _count: { select: { splitsIn: true, splitsOut: true } },
+        items: {
+          select: {
+            id: true,
+            kind: true,
+            amount: true,
+            description: true,
+            passengerId: true,
+            metadata: true,
+            quantity: true,
+            // 连续换人时取**最近**那条 SWAP_REPRICE 行的价当下一次的基准。
+            createdAt: true,
+            flightCabin: true,
+            flightScheduleId: true,
+            hotelCheckIn: true,
+            visaIntendedDate: true,
+            bundle: { select: { settlementTier: true, settlementNights: true } },
+            flightSchedule: {
+              select: {
+                departureTime: true,
+                departureTz: true,
+                flight: { select: { flightNumber: true } },
+              },
+            },
+          },
+        },
+      },
+    });
+    if (!order || !Array.isArray(order.items) || !Array.isArray(order.passengers)) {
+      return skip('NO_CALENDAR', 0, false, { note: '订单数据不完整，跳过重算' });
+    }
+    const settlementLocked = order.settlementLocked === true;
+
+    // ── 旧份额：与换人前快照 settlementCny 逐分同源（computePerPaxShares + 按乘客调价净额）──
+    const { byPassenger } = groupPassengerAdjustments(
+      order.items.map((it) => ({
+        id: it.id,
+        amount: Number(it.amount?.toString() ?? 0),
+        description: it.description,
+        passengerId: it.passengerId ?? null,
+        metadata: it.metadata,
+      })),
+    );
+    const { rows } = computePerPaxShares({
+      totalCny: Number(order.total?.toString() ?? 0),
+      adjustmentCny: spreadableAdjustmentCny(order),
+      // 乘客 id 升序：分级余数那一分钱兜给最后一位，不排序会随任何一次 UPDATE 漂移。
+      passengerIds: [...order.passengers.map((p) => p.id)].sort((a, b) =>
+        a < b ? -1 : a > b ? 1 : 0,
+      ),
+      netByPassenger: new Map(
+        Object.entries(byPassenger).map(([pid, bucket]) => [pid, bucket.netCny]),
+      ),
+    });
+    const oldShareCny = round2(rows.find((r) => r.passengerId === passengerId)?.shareCny ?? 0);
+
+    if (settlementLocked) return skip('SETTLEMENT_LOCKED', oldShareCny, true);
+    if (!order.agentId) {
+      return skip('NO_CALENDAR', oldShareCny, false, { note: '非代理单，不走结算价日历' });
+    }
+
+    // ── 差价基准：这张单成交那天的日历每人价（口径与取法见方法头）───────────────
+    const basis = await this.resolveSwapRepriceBasis(db, orderId, order, passengerId);
+    if (basis.basisCny == null) {
+      return skip('NOT_CALENDAR_PRICED', oldShareCny, false, { note: basis.note });
+    }
+    const basisCny = basis.basisCny;
+
+    const departYmd = deriveOrderDepartDate(
+      order.items as unknown as Array<Record<string, unknown>>,
+    );
+    const bundleItems = order.items.filter((it) => it.kind === OrderItemKind.BUNDLE);
+    let newSettlementCny: number | null = null;
+    let calendarSource: string | null = null;
+    let detail: Record<string, unknown> = {};
+
+    if (bundleItems.length > 0) {
+      const configured = bundleItems.filter(
+        (it) => it.bundle?.settlementTier != null && it.bundle?.settlementNights != null,
+      );
+      if (configured.length !== 1) {
+        return skip(
+          'NO_CALENDAR',
+          oldShareCny,
+          false,
+          {
+            note:
+              configured.length === 0 ? '套餐未配结算价日历' : '本单多条日历套餐行，无法确定取价行',
+          },
+          basisCny,
+        );
+      }
+      if (!departYmd) {
+        return skip('NO_CALENDAR', oldShareCny, false, { note: '本单无法确定出发日期' }, basisCny);
+      }
+      const row = configured[0];
+      // 加项（升舱/单住/婴儿价/儿童折扣/自备签减免/指定酒店加价）不设闸：它们从来不在基准里，
+      // 「今天的日历价 − 成交那天的日历价」这道减法碰不到它们，重算不会把谁身上的加项抹掉。
+      const tier = row.bundle!.settlementTier as SettlementTier;
+      const nights = row.bundle!.settlementNights as number;
+      // 定价键先比（在查价之前）：改档换了 bundleId → 档次/晚数变了，改期挪了出发日 ——
+      // 两者都把这张单挪到了日历的另一格，今昔两个价不是同一格的价，相减出来的不是日历浮动。
+      const todayKey: SwapCalendarKey = {
+        source: 'BUNDLE_SETTLEMENT_CALENDAR',
+        tier,
+        nights,
+        departDate: departYmd,
+      };
+      const keyMismatch = keyChangedDetail(basis.key, todayKey);
+      if (keyMismatch) {
+        return skip('PRICING_KEY_CHANGED', oldShareCny, false, keyMismatch, basisCny);
+      }
+      const rate = await getSettlementRate(tier, nights, departYmd, txClient);
+      if (!rate) {
+        return skip(
+          'NO_CALENDAR',
+          oldShareCny,
+          false,
+          { note: '该出发日期的结算价未维护', tier, nights, departDate: departYmd },
+          basisCny,
+        );
+      }
+      // 立减只在「基准也减过」时才减（复审 H3）：基准没减 → 今天也不减，减法两边同口径。
+      const hit = basis.discountApplied
+        ? await resolveAgentSettlementDiscount(order.agentId, tier, nights, departYmd, txClient)
+        : null;
+      const perPersonCny = toInt(rate.pricePerPersonCny - (hit?.discountPerPersonCny ?? 0));
+      calendarSource = 'BUNDLE_SETTLEMENT_CALENDAR';
+      detail = {
+        tier,
+        nights,
+        departDate: departYmd,
+        pricePerPersonCny: rate.pricePerPersonCny,
+        discountPerPersonCny: hit?.discountPerPersonCny ?? 0,
+        // 连续换人要接力这一位：下一次换人拿这条 SWAP_REPRICE 行当基准时照它决定减不减立减。
+        discountApplied: basis.discountApplied,
+        // 定价键同样接力：下一次换人拿这条行当基准时，要能比出「这之后又改没改档/改期」。
+        calendarKey: todayKey,
+      };
+      newSettlementCny = perPersonCny;
+    } else {
+      const flightRows = order.items.filter(
+        (it) => it.kind === OrderItemKind.FLIGHT && it.flightScheduleId != null,
+      );
+      if (flightRows.length === 0) {
+        return skip('NO_CALENDAR', oldShareCny, false, { note: '本单无可取价的产品行' }, basisCny);
+      }
+      // 机票结算价日历的键是「航班号 × 出发日」，没有舱位这一维：非经济舱按它取价 = 按经济舱价重算。
+      if (
+        flightRows.some((it) => it.flightCabin != null && it.flightCabin !== CabinClass.ECONOMY)
+      ) {
+        return skip('NO_CALENDAR', oldShareCny, false, { note: '本单含非经济舱航段，日历不分舱位' }, basisCny);
+      }
+      // 先把这张单今天落在日历上的哪几格（航班号 × 该段出发地本地日）列全，比完键再查价：
+      // 改期把航段挪到了别的日期 → 已经不是成交那几格，今昔相减量到的不是日历浮动。
+      const legs: Array<{ flightNumber: string; departDate: string }> = [];
+      for (const it of flightRows) {
+        const sched = it.flightSchedule;
+        if (!sched?.departureTime || !sched.flight?.flightNumber) {
+          return skip('NO_CALENDAR', oldShareCny, false, { note: '航段班次信息缺失' }, basisCny);
+        }
+        legs.push({
+          flightNumber: sched.flight.flightNumber,
+          departDate: localDate(sched.departureTime, sched.departureTz),
+        });
+      }
+      const todayKey: SwapCalendarKey = { source: 'FLIGHT_SETTLEMENT_CALENDAR', legs };
+      const keyMismatch = keyChangedDetail(basis.key, todayKey);
+      if (keyMismatch) {
+        return skip('PRICING_KEY_CHANGED', oldShareCny, false, keyMismatch, basisCny);
+      }
+      const lines: Array<Record<string, unknown>> = [];
+      let sum = 0;
+      for (const leg of legs) {
+        const rate = await getFlightSettlementRate(leg.flightNumber, leg.departDate, txClient);
+        // 任一段无价 → 整单放弃（与录单同款：绝不做半单收敛）。
+        if (!rate) {
+          return skip(
+            'NO_CALENDAR',
+            oldShareCny,
+            false,
+            {
+              note: '该航班当日结算价未维护',
+              flightNumber: leg.flightNumber,
+              departDate: leg.departDate,
+            },
+            basisCny,
+          );
+        }
+        sum = round2(sum + rate.pricePerPersonCny);
+        lines.push({
+          flightNumber: leg.flightNumber,
+          departDate: leg.departDate,
+          pricePerPersonCny: rate.pricePerPersonCny,
+        });
+      }
+      calendarSource = 'FLIGHT_SETTLEMENT_CALENDAR';
+      // 机票日历没有立减这一维（立减规则的键是档次×晚数），这里原样接力基准那一位，
+      // 只为让连续换人读到的 calendarDetail.discountApplied 恒有值、不至于第二次换人 fail-closed。
+      // calendarKey 同样接力：下一次换人要能比出这之后有没有再改期。
+      detail = { lines, discountApplied: basis.discountApplied, calendarKey: todayKey };
+      newSettlementCny = toInt(sum);
+    }
+
+    if (newSettlementCny == null || !(newSettlementCny > 0)) {
+      return skip('NO_CALENDAR', oldShareCny, false, { ...detail, note: '取价结果异常（≤0）' }, basisCny);
+    }
+    // 日历比日历：涨了多少 / 跌了多少，只跟基准比，不跟这个人的每人份额比。
+    // 两端都已取整（basisCny 来自 resolveSwapRepriceBasis、newSettlementCny 见上方各分支），
+    // 所以 delta / diff 天然是整数 —— diff 进 Order.adjustmentCny 这个 Int 列。
+    const deltaCny = toInt(newSettlementCny - basisCny);
+    if (Math.abs(deltaCny) > PRICE_ADJUSTMENT_CAP_CNY) {
+      return skip('DIFF_OVER_CAP', oldShareCny, false, { ...detail, deltaCny }, basisCny);
+    }
+    return {
+      basisCny,
+      oldShareCny,
+      newSettlementCny,
+      diffCny: Math.max(0, toInt(basisCny - newSettlementCny)),
+      calendarSource,
+      settlementLocked: false,
+      detail: { ...detail, basisCny, basisSource: basis.source },
+    };
+  }
+
+  /**
+   * 换人重算的**差价基准**：这张单成交那天的日历每人价（CNY，整数）。取不到 → basisCny=null + 原因。
+   *
+   * 取法三级（口径与「为什么是日历基准而不是每人份额」见 resolveSwapRepriceQuote 方法头）：
+   *   0. 拆单拆出来的新单（splitsIn > 0）一律不认基准 —— 三级来源全部拦在最前面（M4 不变式：
+   *      拆出来的新单不重算）。此前这道闸只挡在第 3 级门口，于是「换过人之后再被拆出去」的乘客
+   *      带着他名下那条 SWAP_REPRICE 行进了新单，第 1 级照样接力、照样重算，把不变式绕了过去。
+   *   1. PRIOR_SWAP —— 这位乘客名下已有 SWAP_REPRICE 行：取**最近**那一行的 newSettlementCny。
+   *      连续换人必须接力，否则第二次换人会拿第一次换之前的价再减一遍，同一段日历差被收两次。
+   *   2. CALENDAR_STAMP —— 整单 SETTLEMENT 行带 calendarPerPaxCny（2026-09 起建单落的基准戳）：
+   *      基准 = calendarPerPaxCny − calendarDiscountPerPaxCny，逐分精确。
+   *   3. LEGACY_AUDIT —— 存量单（无基准戳）：回建单那条 APPLY_SETTLEMENT_TOTAL 审计，
+   *      把 after.settlementCalendar 这个 blob 原样喂给 resolveCalendarPerPaxBasis ——
+   *      **每人价就写在 lines[].pricePerPersonCny 上**，与建单当场盖章同一份口径。
+   *      blob 缺失 / 口径不明（多条套餐行分不清这人算哪一条、没有行、价 ≤0）→ NOT_CALENDAR_PRICED。
+   *
+   * 为什么**撤掉了**旧的 DERIVED_FROM_TOTAL（结算总价 ÷ 占座人数，复审 H1/H2 BLOCK）：
+   * settlementTotalCny 是**含加项**的整单成交价 —— 单房差 / 升舱 / 婴儿价 / 儿童折扣 /
+   * 指定酒店加价 / 自备签减免全在里面，除以人数得到的既不是日历价、还常常带小数：
+   *   · 基准偏高 → 换人时被当成「日历跌价」，旧客白补一笔换人差价；
+   *   · 自备签减免被摊进基准后，换人通道的 SWAP_VISA_DEDUCT_REVERSAL 会把同一笔减免再撤一次（双收）；
+   *   · 带小数的 diff 直接写进 Order.adjustmentCny（Int 列）会让整个换人事务 500 回滚。
+   * 审计 blob 里的每人价没有这些毛病，也不需要人数这个变量，所以婴儿那道闸一并撤掉。
+   *
+   * 三级都返回 discountApplied：「基准是不是已经减过代理立减」。换人当天要不要再减今天的立减，
+   * 只看这一位（复审 H3）；判不出来就不重算，绝不猜。
+   * 三级也都返回 key：「基准是日历上的哪一格」（档次×晚数×出发日 / 逐航段航班号×出发日）。
+   * 改档 / 改期把这张单挪到了另一格之后，今昔两个价压根不是同一格的价，相减出来的不是
+   * 「日历动了多少」而是改档 / 改期的价差（那笔钱各自的通道早就收过一次）。键读不出来 → 不重算。
+   */
+  private async resolveSwapRepriceBasis(
+    db: Prisma.TransactionClient | typeof prisma,
+    orderId: string,
+    order: {
+      passengers: ReadonlyArray<{ id: string }>;
+      items: ReadonlyArray<{
+        passengerId: string | null;
+        metadata: Prisma.JsonValue | null;
+        createdAt?: Date | null;
+      }>;
+      _count?: { splitsIn?: number; splitsOut?: number } | null;
+    },
+    passengerId: string,
+  ): Promise<{
+    basisCny: number | null;
+    source: string | null;
+    /** 基准里已经减过代理立减 → 换人当天也要减；false → 两边都不减（复审 H3）。 */
+    discountApplied: boolean;
+    /** 基准取自日历上的哪一格；换人当天先比这个键（见方法头）。取不到基准时为 null。 */
+    key: SwapCalendarKey | null;
+    note?: string;
+  }> {
+    const num = (v: unknown): number | null =>
+      typeof v === 'number' && Number.isFinite(v) ? v : null;
+    // 结算价日历本来就是整数每人价（SettlementRate.pricePerPersonCny 是 Int），
+    // 这里再取一次整只为兜住脏数据：基准/新价/差额/差价全线整数，Order.adjustmentCny 是 Int 列。
+    const toInt = (n: number): number => Math.round(n);
+    const skip = (note: string) => ({
+      basisCny: null,
+      source: null,
+      discountApplied: false,
+      key: null,
+      note,
+    });
+
+    // ── 0. 拆单拆出来的新单：三级来源一律不认（M4 不变式，闸必须在最前面）──────────
+    // 结算价收敛行整条留在源单，所以子单通常本来就取不到基准；但**按人挂的调价行会随人搬家**，
+    // 「换过人之后又被拆出去」的乘客带着他名下那条 SWAP_REPRICE 行进新单，第 1 级就会接力重算。
+    // 闸摆在第 3 级门口挡不住这条路，所以提到最前面。
+    if ((order._count?.splitsIn ?? 0) > 0) {
+      return skip('本单是拆单拆出来的新单，拆前的日历基准与这张单对不上');
+    }
+
+    // ── 1. 上一次换人留下的基准（连续换人接力）───────────────────────────────
+    const priorRows = order.items
+      .filter(
+        (it) =>
+          it.passengerId === passengerId &&
+          readJsonObject(it.metadata).reasonCode === 'SWAP_REPRICE',
+      )
+      .sort((a, b) => (a.createdAt?.getTime() ?? 0) - (b.createdAt?.getTime() ?? 0));
+    const priorMeta = readJsonObject(priorRows.at(-1)?.metadata ?? null);
+    const priorBasis = num(priorMeta.newSettlementCny);
+    if (priorBasis != null && priorBasis > 0) {
+      // 上一次换人减没减立减，随那一行的 calendarDetail 一起留了痕；读不到就不接力
+      //（fail-closed：这一位判错的后果是同一笔立减被多减或多收一次）。
+      const priorDetail = readJsonObject(
+        (priorMeta.calendarDetail ?? null) as Prisma.JsonValue | null,
+      );
+      const priorApplied = priorDetail.discountApplied;
+      if (typeof priorApplied !== 'boolean') {
+        return skip('上一次换人的重算行未记录立减口径，判不出基准是否已减立减');
+      }
+      // 上一次换人取的是日历上的哪一格，同样随那一行留了痕；读不到就不接力
+      //（fail-closed：判不出键，就分不清今天的价是「日历动了」还是「这单改过档/改过期」）。
+      const priorKey = readCalendarKey(priorDetail.calendarKey);
+      if (!priorKey) {
+        return skip('上一次换人的重算行未记录定价键，判不出这单之后有没有改档/改期');
+      }
+      return {
+        basisCny: toInt(priorBasis),
+        source: 'PRIOR_SWAP',
+        discountApplied: priorApplied,
+        key: priorKey,
+      };
+    }
+
+    // ── 2/3. SETTLEMENT 行：先找基准戳，没有再回建单审计 ───────────────────────
+    const settlementRows = order.items.filter(
+      (it) => readJsonObject(it.metadata).settlementPrice === true,
+    );
+    // 按人 SETTLEMENT 覆盖行在场 = 这单是逐人填的价，整单基准不代表这个人 → 不猜。
+    if (settlementRows.some((it) => readJsonObject(it.metadata).perPassenger === true)) {
+      return skip('本单按每人结算价成交，无整单日历基准');
+    }
+    const orderRow = settlementRows.find(
+      (it) => readJsonObject(it.metadata).perPassenger !== true,
+    );
+    // 没有结算价收敛行 = 日历差额恰为 0（没落行）或压根不是结算价成交，也包括拆出来的新单
+    //（SETTLEMENT 行整条留在源单，见 split-move-strategies 的 movePriceAdjustment）→ 一律不重算。
+    if (!orderRow) {
+      return skip('本单没有结算价收敛行，判不出日历基准');
+    }
+    const meta = readJsonObject(orderRow.metadata);
+    const stamped = num(meta.calendarPerPaxCny);
+    if (stamped != null && stamped > 0) {
+      const discountPerPax = num(meta.calendarDiscountPerPaxCny) ?? 0;
+      const basisCny = toInt(stamped - discountPerPax);
+      if (!(basisCny > 0)) return skip('基准戳异常（≤0）');
+      // 定价键与基准戳同批盖章（buildSettlementTotalItem）。没有键 = 判不出这单成交之后
+      // 有没有改档 / 改期 —— 那就没法保证今昔两个价是同一格的价，一律不重算（fail-closed）。
+      const stampedKey = readCalendarKey(meta.calendarKey);
+      if (!stampedKey) {
+        return skip('基准戳未记录定价键（档次/晚数/出发日），判不出这单之后有没有改档/改期');
+      }
+      // calendarDiscountApplied 是与基准戳同批盖的章；万一只有老版本的两个键（本批之前的
+      // 灰度行），退回「减过的金额 > 0 就算减过」这个可判的近似，仍不猜「减了 ¥0」这种情形。
+      const appliedFlag = meta.calendarDiscountApplied;
+      return {
+        basisCny,
+        source: 'CALENDAR_STAMP',
+        discountApplied: typeof appliedFlag === 'boolean' ? appliedFlag : discountPerPax > 0,
+        key: stampedKey,
+      };
+    }
+
+    // ── 3. 存量单：回建单审计里的日历 blob 取每人价（不再 ÷ 人数，见方法头）──────
+    // 拆出去过的源单（splitsOut > 0）也不认这份 blob：它记的是拆之前那张单的产品构成，
+    // 与现在这张单未必还对得上。（拆出来的新单 splitsIn > 0 已在本方法最前面全线拦掉。）
+    if ((order._count?.splitsOut ?? 0) > 0) {
+      return skip('本单拆过单，建单日历快照与当前订单构成已对不上');
+    }
+    const calendarAudit = await readOrderSettlementCalendarAudit(db, orderId);
+    if (!calendarAudit) {
+      return skip('本单不是结算价日历成交（手工价/议价）');
+    }
+    // 建单只在**真减了立减**时才把 autoDiscount 写进这个 blob（见 createOrder 的组装段），
+    // 因此这个键在不在，就等于「当时减没减」——手工价通道压根不会命中立减，也就不会有这个键。
+    const auditDiscount = (calendarAudit.autoDiscount ?? null) as AutoDiscountSummary | null;
+    const derived = resolveCalendarPerPaxBasis(calendarAudit, auditDiscount);
+    if (!derived) {
+      return skip('建单日历快照口径不明（多条套餐行 / 无每人价），判不出日历基准');
+    }
+    const basisCny = toInt(derived.perPaxCny - derived.discountPerPaxCny);
+    if (!(basisCny > 0)) return skip('建单日历快照的每人价异常（≤0）');
+    return {
+      basisCny,
+      source: 'LEGACY_AUDIT',
+      discountApplied: derived.discountApplied,
+      // 定价键直接来自建单审计的 lines（档次/晚数/出发日 或 逐航段航班号/出发日）。
+      key: derived.key,
+    };
+  }
+
+  /**
+   * 换人预览（GET /orders/:id/passengers/:passengerId/swap-preview · ADMIN/STAFF + 代理自家单）。
+   *
+   * 只读：换人弹窗打开时先告诉经办人「这个人现在算多少钱、按今天的日历重算是多少、旧客要补多少差价、
+   * 换人费有哪几档」。与真换人跑同一份取价内核（resolveSwapRepriceQuote），预览所见 = 换人所得。
+   */
+  async swapPreview(
+    orderId: string,
+    passengerId: string,
+    actor: { userId: string; role: UserRole; agentId?: string },
+  ): Promise<{
+    /** 差价基准 = 成交那天的日历每人价；null = 判不出（此时 repriceSkipped 必有值）。 */
+    basisCny: number | null;
+    oldShareCny: number;
+    newSettlementCny: number | null;
+    diffCny: number;
+    calendarSource: string | null;
+    settlementLocked: boolean;
+    repriceSkipped?: SwapRepriceSkipReason;
+    feeOptions: number[];
+  }> {
+    const isInternalActor = actor.role === UserRole.ADMIN || actor.role === UserRole.STAFF;
+    if (!isInternalActor) {
+      if (actor.role !== UserRole.AGENT) {
+        throw new ForbiddenError('仅运营/代理可查看换人预览');
+      }
+      // 归属闸与换人同一口径（代理只能看自己 + 下级代理的单）。
+      await this.assertPassengerEditScope(orderId, actor);
+    }
+    // ── 有效订单守卫：与真换人同一对闸、同一句话（复审 L5）────────────────────
+    // 预览是换人弹窗打开时跑的第一步。若这里不判，回收站单 / 已取消 / 已退款单照样能弹出
+    //「新价 800，旧客补 200」这样一份报价，经办人照着填完点确认才被写入口拒掉 ——
+    // 白填一遍不说，更糟的是他会以为「这单本来就该这么算」。让预览当场说同一句话。
+    const orderGuard = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: { status: true, deletedAt: true },
+    });
+    if (!orderGuard) throw new NotFoundError('订单不存在');
+    if (orderGuard.deletedAt) {
+      throw new BadRequestError('订单在回收站（已软删），不可换人；如需操作请先恢复');
+    }
+    if (!SEAT_HOLDING_STATUSES.includes(orderGuard.status)) {
+      throw new BadRequestError(
+        `订单当前状态（${zhStatus(orderGuard.status)}）不可换人：仅占座中的有效订单可换人（已取消/已退款/超时订单请勿换人）`,
+      );
+    }
+    const passenger = await prisma.passenger.findUnique({
+      where: { id: passengerId },
+      select: { id: true, orderId: true },
+    });
+    if (!passenger || passenger.orderId !== orderId) {
+      throw new NotFoundError('出行人不存在或不属于该订单');
+    }
+    const quote = await this.resolveSwapRepriceQuote(prisma, orderId, passengerId);
+    const feeOptions = await getSwapFeeOptions(prisma);
+    return {
+      basisCny: quote.basisCny,
+      oldShareCny: quote.oldShareCny,
+      newSettlementCny: quote.newSettlementCny,
+      diffCny: quote.diffCny,
+      calendarSource: quote.calendarSource,
+      settlementLocked: quote.settlementLocked,
+      ...(quote.repriceSkipped ? { repriceSkipped: quote.repriceSkipped } : {}),
+      feeOptions,
+    };
   }
 
   /**
@@ -13835,13 +15005,23 @@ export class OrderService {
       blockers.push('该订单有进行中的退款，请先完成或驳回退款流程再拆单。');
     }
 
+    // 可摊售后费（= adjustmentCny − 换人费/换人差价等 excludeFromPerPax 条目）：
+    // 闸 9 的提示语与下方的份额/分摊计算共用这一个数，两处分别算会漂。
+    const spreadableAdjCny = spreadableAdjustmentCny(order);
+
     // ── 闸 9（已放开）：售后费用按份额随拆分摊 ────────────────────────────────
-    // 旧口径拒拆带售后费的单（「整单口径，拆开就分不清谁欠的」）。可改期费/换人费本就是
-    // 按人产生的钱，均摊到每人份额里再随人搬走，比把整笔留在源单更诚实：
+    // 旧口径拒拆带售后费的单（「整单口径，拆开就分不清谁欠的」）。改期费本就是按人产生的钱，
+    // 均摊到每人份额里再随人搬走，比把整笔留在源单更诚实：
     //   两侧 Σ adjustmentCny 恒等（执行段有断言），应收也恒等 —— 见执行段的份额收敛。
+    // 例外：换人费 / 换人差价（excludeFromPerPax）挂在**已经不在这张单上**的被换人头上，
+    // 不进任何在册乘客的份额，也就不随拆 —— 整条留在源单（换人是在源单上发生的）。
     if (order.adjustmentCny !== 0) {
+      const excludedCny = round2(order.adjustmentCny - spreadableAdjCny);
       warnings.push(
-        `本单有售后费用 ¥${order.adjustmentCny}（改期费/换人费等）：拆单会按两侧份额分摊，合计不变。`,
+        excludedCny !== 0
+          ? `本单有售后费用 ¥${order.adjustmentCny}，其中 ¥${excludedCny} 是换人费/换人差价` +
+              `（记在被换下去的人头上）不随拆、整条留在本单；其余 ¥${spreadableAdjCny} 按两侧份额分摊，合计不变。`
+          : `本单有售后费用 ¥${order.adjustmentCny}（改期费等）：拆单会按两侧份额分摊，合计不变。`,
       );
     }
 
@@ -14057,7 +15237,10 @@ export class OrderService {
     );
     const shareResult = computePerPaxShares({
       totalCny: preTotalCny,
-      adjustmentCny: order.adjustmentCny,
+      // 可摊售后费：换人费/换人差价（excludeFromPerPax）记在被换下去的人头上，不进任何在册乘客
+      // 的份额 —— 拆单是「按每人份额搬钱」，把不属于任何人的钱摊进去会让两侧都拿到不该拿的数。
+      // 这类钱整条留在源单（换人是在源单上发生的），见下方 movedAdjustmentCny。
+      adjustmentCny: spreadableAdjCny,
       passengerIds: allPaxIds,
       netByPassenger,
     });
@@ -14118,7 +15301,13 @@ export class OrderService {
     );
     // adjustmentCny 是**整数元**列（Order.adjustmentCny Int）：按份额取整分摊，
     // 留守侧取「原值 − 拆出侧」，两侧仍是整数且 Σ 恒等。
-    const movedAdjustmentCny = Math.round(order.adjustmentCny * shareRatio);
+    //
+    // 只摊**可摊**的那部分（spreadableAdjustmentCny）：换人费与换人差价挂在一个已经不在这张单上
+    // 的人头上，excludeFromPerPax 已经把它们踢出了每人份额；分摊时若还按整数 adjustmentCny 劈，
+    // 就会把这笔「谁都不属于」的钱按份额比塞进新单，新单凭空多一笔应收、源单少一笔 ——
+    // 而被换下去的那个人是在**源单**上被换的，这笔钱本来就该整条留在源单。
+    // 留守侧仍取「原值 − 拆出侧」，两侧 Σ adjustmentCny 恒等（执行段有断言）不受影响。
+    const movedAdjustmentCny = Math.round(spreadableAdjCny * shareRatio);
     const targetTotalCny = round2(movedShareCny - movedAdjustmentCny);
 
     // ── 闸 17：按人调价把份额算成负数 / 超出整单应收 → 拒拆 ─────────────────────
@@ -21911,7 +23100,13 @@ export async function releaseSeatStrictWithinTx(
 
 /** 一条售后费用流水（写入 Order.adjustments）。 */
 export interface OrderAdjustmentEntry {
-  type: 'RESCHEDULE_FEE' | 'SWAP_FEE' | 'SWAP_VISA_DEDUCT_REVERSAL' | 'PRICE_ADJUSTMENT' | string;
+  type:
+    | 'RESCHEDULE_FEE'
+    | 'SWAP_FEE'
+    | 'SWAP_PRICE_DIFF'
+    | 'SWAP_VISA_DEDUCT_REVERSAL'
+    | 'PRICE_ADJUSTMENT'
+    | string;
   label: string;
   amountCny: number;
   at: string; // ISO 时间
@@ -21919,6 +23114,19 @@ export interface OrderAdjustmentEntry {
   note?: string;
   /** 关联出行人（SWAP_VISA_DEDUCT_REVERSAL 幂等去重、PRICE_ADJUSTMENT 按乘客调价用；整单调价为空）。 */
   passengerId?: string;
+  /**
+   * 被换下去的那位出行人姓名 / 证件号（SWAP_FEE / SWAP_PRICE_DIFF 专用）。
+   * 这个人换完就不在乘客名单里了，passengerId 指向的那条记录已经是**新客**——
+   * 只有这两项还能回答「这笔钱是谁产生的」。
+   */
+  passengerName?: string;
+  passengerDocument?: string;
+  /**
+   * true = 这笔钱不参与每人均摊（换人费 / 换人差价：记在被换下去的人头上）。
+   * 口径与实现见 per-pax-share.ts 的 spreadableAdjustmentCny —— 钱仍在 adjustmentCny 里
+   * （应收/尾款一分不少），只是不摊到留守同行人与新客的每人结算价上。
+   */
+  excludeFromPerPax?: boolean;
   /** 调价原因码（仅 PRICE_ADJUSTMENT 流水带；财务四类 DISCOUNT/MISC_FEE/CHANGE/OTHER）。 */
   reasonCode?: string;
 }
@@ -22718,7 +23926,25 @@ const REDACTED_ITEM_METADATA_KEYS: readonly string[] = [
   // ── 拆单留痕（都指向**另一张单**上的行，对外一律不认）────────────────────────
   'splitPairKey', // 住宿行劈半的配对键 = `<源行 id>:<拆单令牌>`：泄露源行 id 与内部拆单令牌
   'splitFromItemId', // 这条行是从哪条源行拆出来的（源行可能在代理看不见的另一张单上）
+  // ── 换人重算结算价（SWAP_REPRICE 行）：整段是我方同业价口径 ──────────────────
+  // 基准价 / 重取价 / 日历档次晚数与每人立减 —— 代理凭这几个数能把我方结算价日历反推出来。
+  // 行金额本身对外仍可见（这笔钱确实调了他的应收），只是「这个价怎么来的」不外露。
+  'basisCny', // 成交那天的日历每人价（差价基准）
+  'oldShareCny', // 被换人换人前的每人份额
+  'newSettlementCny', // 换人当天重取的日历每人价
+  'calendarDetail', // 取价明细（档次/晚数/出发日/日历价/每人立减 或 逐航段每人价）
+  'calendarSource', // 取自哪张日历表
+  // 建单落在 SETTLEMENT 行上的日历基准戳：calendarPerPaxCny 是**未减立减**的同业挂牌价，
+  // 露出去等于把我方 rate card 与这家代理的折扣幅度一并交出去（代理该看到的是自己的结算价，
+  // 不是折前价）。settlementTotalCny 等既有键不在此列，维持现状。
+  'calendarPerPaxCny',
+  'calendarDiscountPerPaxCny',
+  'calendarKey', // 成交那格的定价键（档次/晚数/出发日 或 逐航段航班号/出发日）
 ];
+// ⚠ 这份名单只管**订单行 metadata**。换人预览（swapPreview）是另一回事，刻意不脱敏：
+//    它回给代理的 basisCny / newSettlementCny / calendarSource 是**减完这家代理自己的立减之后**
+//    的价，也就是这单他自己要付的结算价 —— 本来就该让他在换人前看见、据此决定换不换。
+//    折前挂牌价（calendarPerPaxCny）与我方 rate card 仍只活在订单行 metadata 里，按上表剥掉。
 // ⚠ 新增「会话 / 座位账快照」类 metadata 键（售后动作往行上落的留痕对象）必须来这里登记：
 //    它们普遍带原价、成本、政策报价、班次 id 与内部操作人，随 `...i` 展开就会整段下发给代理。
 

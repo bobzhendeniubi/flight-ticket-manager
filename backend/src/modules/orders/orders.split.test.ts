@@ -61,6 +61,7 @@ const { mockPrisma } = vi.hoisted(() => ({
 vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
 
 import { OrderService, splitNoneUpdateToPrisma } from './orders.service.js';
+import { computePerPaxShares, spreadableAdjustmentCny } from './per-pax-share.js';
 import { BadRequestError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 
 const service = new OrderService();
@@ -310,6 +311,41 @@ describe('拆单 · 准入闸矩阵（preview 返回人话 blocker）', () => {
     // 应收 2000 + 200 = 2200，两人各 1100 → 拆出 1 人带走一半售后费。
     expect(r.movedShareCny).toBe(1100);
     expect(r.movedAdjustmentCny).toBe(100);
+  });
+
+  // ── 换人之后再拆单：被换人的钱整条留源单 ─────────────────────────────────────
+  // 换人费 / 换人差价挂在一个**已经不在这张单上**的人头上（excludeFromPerPax），
+  // 每人份额里根本没有它；分摊时若还按裸 adjustmentCny 劈，新单会凭空多背一笔换人的钱。
+  it('换人费/换人差价（excludeFromPerPax）→ 不随拆，整条留在源单', async () => {
+    const swapEntries = [
+      { type: 'SWAP_FEE', label: '换人费', amountCny: 450, excludeFromPerPax: true },
+      { type: 'SWAP_PRICE_DIFF', label: '换人差价', amountCny: 200, excludeFromPerPax: true },
+    ];
+    const r = await previewWith({ adjustmentCny: 650, adjustments: swapEntries });
+    expect(r.eligible).toBe(true);
+    // 提示语要照实说清哪一部分不随拆，别让运营以为 650 会被劈成两半。
+    expect(r.warnings.join()).toContain('¥650，其中 ¥650 是换人费/换人差价');
+    expect(r.warnings.join()).toContain('不随拆、整条留在本单');
+    // 可摊基数 = 650 − 650 = 0 → 每人份额只按 total 2000 分（两人各 1000），
+    // 拆出 1 人带走 1000、售后费一分不带；源单留 1000 + 650 全额。
+    expect(r.movedShareCny).toBe(1000);
+    expect(r.movedAdjustmentCny).toBe(0);
+  });
+
+  it('混合流水：改期费随拆分摊，换人费整条留源单', async () => {
+    const r = await previewWith({
+      adjustmentCny: 650,
+      adjustments: [
+        { type: 'RESCHEDULE_FEE', label: '改期费', amountCny: 200 },
+        { type: 'SWAP_FEE', label: '换人费', amountCny: 450, excludeFromPerPax: true },
+      ],
+    });
+    // 可摊基数 = 650 − 450 = 200 → 应收（份额口径）2200/2 人 = 1100；
+    // 拆出侧只带走可摊的那 200 的一半 = 100，450 的换人费整条留源单。
+    expect(r.movedShareCny).toBe(1100);
+    expect(r.movedAdjustmentCny).toBe(100);
+    expect(r.warnings.join()).toContain('其中 ¥450 是换人费/换人差价');
+    expect(r.warnings.join()).toContain('其余 ¥200 按两侧份额分摊');
   });
 
   it('套餐单（闸 10 已放开）→ 可拆，住宿盖章行带「套餐住宿 ·」前缀回显', async () => {
@@ -2254,5 +2290,193 @@ describe('拆单内核 · 「不动」决策的落库白名单', () => {
 
   it('补丁里没有 metadata → 返回 null，这一行一个字都不用改', () => {
     expect(splitNoneUpdateToPrisma({})).toBeNull();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 换人之后再拆单 · 走**真的** executeSplit 全链路（复审 T4/T5）
+//
+// 此前只有 preview 层与手算对拍两种覆盖，执行段这条真路径没人走过 —— 而「排除条目整条留源单」
+// 恰恰是在执行段落库的（movedAdjustmentCny 只摊 spreadableAdjustmentCny）。这里把它跑通并断言：
+//   T4：源单留守同行人的每人份额 = 1000（一分钱不替被换人背）、新单份额 = 换人后重取的 800；
+//       两侧 Σ adjustmentCny 恒等于拆前（守恒断言本身也在事务里跑，不平会整体回滚）。
+//   T5：挂在乘客名下的 SWAP_REPRICE 调价行**跟着这个人搬家**
+//       （split-move-strategies 的 movePriceAdjustment 对 passengerId 非空的行按人判去留）。
+// ══════════════════════════════════════════════════════════════════════════
+describe('拆单 · 换人之后（排除条目 + 按人重算行）', () => {
+  /** 换人后的 3 人单：套餐/机票 3000 + 挂在 p1 名下的 −200 重算行；售后费 650 全是排除条目。 */
+  const swappedOrder = () =>
+    baseOrder({
+      subtotal: 2800,
+      total: 2800,
+      adjustmentCny: 650,
+      adjustments: [
+        { type: 'SWAP_FEE', label: '换人费', amountCny: 450, excludeFromPerPax: true },
+        { type: 'SWAP_PRICE_DIFF', label: '换人差价', amountCny: 200, excludeFromPerPax: true },
+      ],
+      passengers: [pax('p1'), pax('p2'), pax('p3')],
+      items: [
+        flightItem({ quantity: 3, unitPrice: 1000, amount: 3000, totalCostCny: 1800 }),
+        flightItem({
+          id: 'i_swap_reprice',
+          kind: 'DISCOUNT',
+          description: '价格调整：换人重算结算价（−¥200）',
+          quantity: 1,
+          unitPrice: -200,
+          amount: -200,
+          totalCostCny: null,
+          unitCostCny: null,
+          flightScheduleId: null,
+          flightCabin: null,
+          passengerId: 'p1',
+          metadata: { priceAdjustment: true, reasonCode: 'SWAP_REPRICE', swapReprice: true },
+        }),
+      ],
+    });
+
+  it('拆出换进来的那一位：重算行随人走、换人费整条留源单，两侧份额各自成立', async () => {
+    // 可摊售后费 = 650 − 650 = 0 → 每人份额只按 total 2800 分：
+    //   基准每人 = (2800 − (−200)) / 3 = 1000；p1 = 1000 − 200 = 800，p2/p3 = 1000。
+    // 拆出 p1：新单 total = 800（拆来的机票 1000 + 重算行 −200，正好等于份额 → 无平账行）；
+    //          源单 total = 2000，售后费 650 一分不带走。
+    armExecute({
+      order: swappedOrder(),
+      targetItemsSum: 800,
+      sourceItemsSum: 2000,
+      finalSource: { total: 2000, paidAmount: 0, adjustmentCny: 650, passengerCount: 2 },
+      finalTarget: { total: 800, paidAmount: 500, adjustmentCny: 0, passengerCount: 1 },
+      conservationRows: [
+        {
+          kind: 'FLIGHT',
+          flightScheduleId: 'sch1',
+          flightCabin: 'ECONOMY',
+          quantity: 2,
+          metadata: null,
+          roomsBilled: null,
+          totalCostCny: 1200,
+        },
+        {
+          kind: 'FLIGHT',
+          flightScheduleId: 'sch1',
+          flightCabin: 'ECONOMY',
+          quantity: 1,
+          metadata: null,
+          roomsBilled: null,
+          totalCostCny: 600,
+        },
+        {
+          kind: 'DISCOUNT',
+          flightScheduleId: null,
+          flightCabin: null,
+          quantity: 1,
+          metadata: { priceAdjustment: true, reasonCode: 'SWAP_REPRICE' },
+          roomsBilled: null,
+          totalCostCny: null,
+        },
+      ],
+    });
+
+    const result = await service.splitOrder(
+      'o1',
+      { passengerIds: ['p1'], requestToken: TOKEN },
+      admin,
+    );
+
+    // ① 份额：拆走的是换进来那一位重取后的 800，不是「2800÷3」也不是「(2800+650)÷3」。
+    expect(result.movedShareCny).toBe(800);
+
+    // ② SWAP_REPRICE 行跟着 p1 搬到新单：整行 UPDATE orderId，金额一分不改。
+    expect(mockPrisma.orderItem.update).toHaveBeenCalledWith({
+      where: { id: 'i_swap_reprice' },
+      data: { orderId: 'o2' },
+    });
+
+    // ③ 两侧落库金额：源单 total 2000 + 售后费 650 全额留下；新单 total 800、售后费 0
+    //    —— 换人费/换人差价一分不随拆（可摊基数是 0）。
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const updates = mockPrisma.order.update.mock.calls.map((c: any[]) => c[0]);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const sourceMoney = updates.find((u: any) => u.where.id === 'o1' && u.data.total != null);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const targetMoney = updates.find((u: any) => u.where.id === 'o2' && u.data.total != null);
+    expect(Number(sourceMoney.data.total)).toBe(2000);
+    expect(sourceMoney.data.adjustmentCny).toBe(650);
+    expect(Number(targetMoney.data.total)).toBe(800);
+    expect(targetMoney.data.adjustmentCny).toBe(0);
+
+    // ④ 两侧份额各自成立：源单留守 2 人各 1000（可摊售后费仍是 0），新单 1 人 800。
+    const keptShares = computePerPaxShares({
+      totalCny: 2000,
+      adjustmentCny: spreadableAdjustmentCny({
+        adjustmentCny: 650,
+        adjustments: swappedOrder().adjustments,
+      }),
+      passengerIds: ['p2', 'p3'],
+      netByPassenger: new Map(),
+    });
+    expect(keptShares.rows.map((r) => r.shareCny)).toEqual([1000, 1000]);
+    const movedShares = computePerPaxShares({
+      totalCny: 800,
+      adjustmentCny: 0,
+      passengerIds: ['p1'],
+      // 重算行跟着人搬过去了，在新单上仍是这一位的按人调价净额；
+      // 新单 total 800 已经含这条行，净额与均摊在新单内部自洽（单人单 → 直接 800）。
+      netByPassenger: new Map(),
+    });
+    expect(movedShares.rows[0].shareCny).toBe(800);
+  });
+
+  it('拆出留守的两位：重算行留在源单（跟着它的人走，不跟着钱走）', async () => {
+    armExecute({
+      order: swappedOrder(),
+      // 拆走 p2+p3：份额 2×1000 = 2000；新单只有拆来的机票 2000 → 无平账行。
+      targetItemsSum: 2000,
+      sourceItemsSum: 800,
+      finalSource: { total: 800, paidAmount: 0, adjustmentCny: 650, passengerCount: 1 },
+      finalTarget: { total: 2000, paidAmount: 500, adjustmentCny: 0, passengerCount: 2 },
+      conservationRows: [
+        {
+          kind: 'FLIGHT',
+          flightScheduleId: 'sch1',
+          flightCabin: 'ECONOMY',
+          quantity: 1,
+          metadata: null,
+          roomsBilled: null,
+          totalCostCny: 600,
+        },
+        {
+          kind: 'FLIGHT',
+          flightScheduleId: 'sch1',
+          flightCabin: 'ECONOMY',
+          quantity: 2,
+          metadata: null,
+          roomsBilled: null,
+          totalCostCny: 1200,
+        },
+        {
+          kind: 'DISCOUNT',
+          flightScheduleId: null,
+          flightCabin: null,
+          quantity: 1,
+          metadata: { priceAdjustment: true, reasonCode: 'SWAP_REPRICE' },
+          roomsBilled: null,
+          totalCostCny: null,
+        },
+      ],
+    });
+
+    const result = await service.splitOrder(
+      'o1',
+      { passengerIds: ['p2', 'p3'], requestToken: TOKEN },
+      admin,
+    );
+
+    expect(result.movedShareCny).toBe(2000);
+    // 重算行属于留在源单的 p1 → 一个字都不动。
+    const movedReprice = mockPrisma.orderItem.update.mock.calls.some(
+      // eslint-disable-next-line @typescript-eslint/no-explicit-any
+      (c: any[]) => c[0].where.id === 'i_swap_reprice' && c[0].data?.orderId === 'o2',
+    );
+    expect(movedReprice).toBe(false);
   });
 });

@@ -4,11 +4,17 @@
  * groupOrderAdjustments byPassenger）重新摊到每个乘客身上，给票务一眼看出「补办签证只多收她 800」。
  *
  * 公式（与调用方约定一致，禁止在别处重算）：
- *   应收总额 payableCny = totalCny + (adjustmentCny ?? 0)
+ *   可摊调整额 spreadableAdjCny = (adjustmentCny ?? 0) − Σ adjustments 中 excludeFromPerPax===true 的条目
+ *   应收总额 payableCny = totalCny + spreadableAdjCny
  *   基准每人 baseCny    = (payableCny − Σ 全部乘客调整净额) / 乘客数
  *   每人结算价           = 基准每人 + 该乘客调整净额
  * 全员合计恒等于 payableCny（用「分」做整数运算，余数兜给最后一位乘客，避免浮点/四舍五入导致
  * 合计对不上）。
+ *
+ * excludeFromPerPax（换人差价/换人费批次新增）：这类条目挂在已离开订单的被换人身上
+ * （Order.adjustments 里带 passengerName/passengerDocument 快照，passengerId 已不在
+ * order.passengers 里），不该摊给还在同行的乘客——从摊入基数里剔除，payableCny 相应减少，
+ * 调用方用 excludedCny 渲染一行「含被换人承担的换人费/差价 ¥X（不摊入同行人）」脚注。
  *
  * 绝不是「手填每人价格」的新口子——每人结算价完全由 total/adjustmentCny/调价净额派生，
  * 换算过程不接受任何独立输入。
@@ -25,8 +31,17 @@ export interface PerPaxSettlementRow {
 export interface PerPaxSettlementResult {
   /** 与入参 passengerIds 同序 */
   rows: PerPaxSettlementRow[];
-  /** 应收总额 = totalCny + adjustmentCny，等于 Σ rows[].settlementCny */
+  /** 应收总额 = totalCny + spreadableAdjustmentCny(adjustmentCny, adjustments)，等于 Σ rows[].settlementCny */
   payableCny: number;
+  /** Σ adjustments 中 excludeFromPerPax===true 条目的金额（CNY）；0 = 无排除项，调用方据此决定是否展示脚注 */
+  excludedCny: number;
+}
+
+/** Order.adjustments 条目的最小结构（结构兼容 lib/api.ts 的 OrderAdjustment，可直接传入）。 */
+export interface SpreadableAdjustmentEntry {
+  amountCny: number;
+  /** true = 挂给已离开订单的被换人（换人差价/换人费等），不摊入还在同行的乘客 */
+  excludeFromPerPax?: boolean;
 }
 
 export interface PerPaxSettlementInput {
@@ -34,6 +49,8 @@ export interface PerPaxSettlementInput {
   totalCny: number;
   /** 售后费用合计（改期费/换人费等，CNY），未启用时按 0 处理 */
   adjustmentCny?: number | null;
+  /** order.adjustments 原始条目（用于剔除 excludeFromPerPax===true 的部分）；缺省视为空 */
+  adjustments?: readonly SpreadableAdjustmentEntry[];
   /** 乘客 ID 列表，决定输出顺序（通常传 order.passengers 顺序） */
   passengerIds: readonly string[];
   /** 乘客 → 「按乘客调价」净额（CNY）；不在此 Map 中的乘客视为净额 0 */
@@ -46,16 +63,54 @@ function toCents(cny: number): number {
 }
 
 /**
+ * 运行时校验单条 adjustment 是否可安全计入「排除摊入」——与后端同名口径镜像的防呆
+ * （typeof e === 'object' && e !== null && typeof e.amountCny === 'number' &&
+ * Number.isFinite(e.amountCny) && e.excludeFromPerPax === true）。TS 类型标注不保证运行时
+ * 数据真的长这样（脏数据、null 条目都可能混进 order.adjustments），漏了这层防呆会把
+ * amountCny 非数字的条目算进 toCents() 产出 NaN，进而污染 payableCny/每人结算价全表。
+ */
+function isExcludableAdjustment(a: unknown): a is SpreadableAdjustmentEntry & { amountCny: number } {
+  return (
+    typeof a === 'object' &&
+    a !== null &&
+    typeof (a as { amountCny?: unknown }).amountCny === 'number' &&
+    Number.isFinite((a as { amountCny: number }).amountCny) &&
+    (a as { excludeFromPerPax?: unknown }).excludeFromPerPax === true
+  );
+}
+
+/** Σ adjustments 中 excludeFromPerPax===true 条目的金额（分）。 */
+function excludedAdjustmentCents(adjustments: readonly SpreadableAdjustmentEntry[]): number {
+  return adjustments
+    .filter(isExcludableAdjustment)
+    .reduce((sum, a) => sum + toCents(a.amountCny), 0);
+}
+
+/**
+ * 可摊入同行乘客的调整额（CNY）= adjustmentCny − Σ excludeFromPerPax===true 条目金额。
+ * 与后端同名口径镜像：那部分钱已经挂给被换人本人，不进「基准每人」的分母池。
+ */
+export function spreadableAdjustmentCny(
+  adjustmentCny: number | null | undefined,
+  adjustments: readonly SpreadableAdjustmentEntry[],
+): number {
+  const cents = toCents(adjustmentCny ?? 0) - excludedAdjustmentCents(adjustments);
+  return cents / 100;
+}
+
+/**
  * 计算每人结算价。乘客数为 0 时返回空行（调用方应只在乘客数 ≥ 2 时展示这张表）。
  */
 export function computePerPaxSettlement(input: PerPaxSettlementInput): PerPaxSettlementResult {
-  const { totalCny, adjustmentCny, passengerIds, netByPassenger } = input;
-  const payableCents = toCents(totalCny) + toCents(adjustmentCny ?? 0);
+  const { totalCny, adjustmentCny, adjustments, passengerIds, netByPassenger } = input;
+  const excludedCents = excludedAdjustmentCents(adjustments ?? []);
+  const payableCents = toCents(totalCny) + toCents(adjustmentCny ?? 0) - excludedCents;
   const payableCny = payableCents / 100;
+  const excludedCny = excludedCents / 100;
 
   const n = passengerIds.length;
   if (n === 0) {
-    return { rows: [], payableCny };
+    return { rows: [], payableCny, excludedCny };
   }
 
   const netCentsById = new Map<string, number>(
@@ -79,5 +134,5 @@ export function computePerPaxSettlement(input: PerPaxSettlementInput): PerPaxSet
     };
   });
 
-  return { rows, payableCny };
+  return { rows, payableCny, excludedCny };
 }

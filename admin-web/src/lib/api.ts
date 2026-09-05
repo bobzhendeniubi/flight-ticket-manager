@@ -1526,18 +1526,27 @@ export type InvoiceStatus = 'NONE' | 'REQUESTED' | 'ISSUED';
 export type InvoiceLeg = 'outbound' | 'return' | 'system';
 
 /**
- * 售后费用流水（改期费 / 换人费 / 换酒店差价）。
+ * 售后费用流水（改期费 / 换人费 / 换酒店差价 / 换人差价）。
  * 对应后端 orders.service.ts 的 OrderAdjustmentEntry（Order.adjustments JSON 列，
  * serializeOrder 原样透传，不做 Decimal 字符串化）：amountCny 是原始 number，
  * 日期字段是 at（ISO），没有 id / createdAt。
  */
 export interface OrderAdjustment {
-  type: 'RESCHEDULE_FEE' | 'SWAP_FEE' | string;
+  type: 'RESCHEDULE_FEE' | 'SWAP_FEE' | 'SWAP_PRICE_DIFF' | string;
   label: string;
   amountCny: number;
   at: string; // ISO 时间
   by: string | null; // 操作人 userId
   note?: string;
+  /**
+   * true = 这笔钱挂在已离开订单的被换人身上（换人差价/换人费改由被换人承担，
+   * 不摊给还在同行的乘客）。每人结算价（lib/perPaxSettlement.ts）据此从摊入基数里剔除。
+   */
+  excludeFromPerPax?: boolean;
+  /** 该条目归属乘客的姓名快照（该乘客换人后可能已不在 order.passengers 里，需要独立快照展示） */
+  passengerName?: string;
+  /** 该条目归属乘客的证件号快照 */
+  passengerDocument?: string;
 }
 
 /** 回收站行（GET /orders/deleted）：只带回收站表所需的最小字段。 */
@@ -5240,6 +5249,44 @@ export const api = {
       token,
       body,
     }),
+
+  // 换人费标准（预填选项，如 [450, 550]）：换人表单据此渲染快捷选项 + 默认预填第一项。
+  // ADMIN/STAFF/AGENT 可读（顾客角色 403）；改动仅 ADMIN。
+  getSwapFeeOptions: (token: string) =>
+    apiFetch<{ options: number[] }>('/orders/swap-fee-options', { token }),
+  setSwapFeeOptions: (token: string, options: number[]) =>
+    apiFetch<{ options: number[] }>('/orders/swap-fee-options', {
+      method: 'PUT',
+      token,
+      body: { options },
+    }),
+
+  // 换人前预览：新人按今日结算价日历（同出行日期）重算的结算价 vs 原人原份额的差价。
+  // 证件号改动（真换人）时前端防抖调用；结算价已锁定或日历查不到当天价格时后端会显式打标，
+  // 前端据此显示「不重算」而不是拿 null 硬凑一个数字。
+  getSwapPreview: (token: string, orderId: string, passengerId: string) =>
+    apiFetch<{
+      /** 原人结算价（建单日历口径），M9：与 basisCny 语义一致，新旧字段并存 */
+      oldShareCny: number;
+      /** 原人结算价（建单日历口径）；展示用这个字段名，与换人历史 after.reprice.basisCny 对齐 */
+      basisCny: number | null;
+      newSettlementCny: number | null;
+      diffCny: number;
+      calendarSource: string | null;
+      settlementLocked: boolean;
+      feeOptions: number[];
+      /**
+       * 未按日历重算的原因码：SETTLEMENT_LOCKED / NO_CALENDAR / NOT_CALENDAR_PRICED /
+       * DIFF_OVER_CAP；未跳过时不下发或为 null。
+       */
+      repriceSkipped?:
+        | 'SETTLEMENT_LOCKED'
+        | 'NO_CALENDAR'
+        | 'NOT_CALENDAR_PRICED'
+        | 'DIFF_OVER_CAP'
+        | 'PRICING_KEY_CHANGED'
+        | null;
+    }>(`/orders/${orderId}/passengers/${passengerId}/swap-preview`, { token }),
 
   // 换人后为新出行人补录护照资料（护照图/有效期/签发日/签发地/签发国）。
   // 走同一 PATCH /orders/:id/passengers/:passengerId 端点的「补录」通道（不含换人语义字段 →
