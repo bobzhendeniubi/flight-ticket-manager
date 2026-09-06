@@ -724,6 +724,8 @@ export async function swapPassenger(
     actor,
     action: 'SWAP_PASSENGER',
     conserve: { unchanged: ['paid', 'seats', 'rooms', 'cost'], label: '换人' },
+    // 换人改应收 / 售后费（换人费不摊、差价重算）→ 份额随人（同一乘客 id）重算落库（R1）。
+    persistShares: true,
   }, async (ctx) => {
     const tx = ctx.tx;
     // Order 行锁（与改期 rescheduleOrderItem / worker 超时释放 / 到账入账同一把 FOR UPDATE 行锁）：

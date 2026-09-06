@@ -721,6 +721,8 @@ export async function splitOrder(
           action: 'SPLIT_ORDER',
           requestToken: input.requestToken,
           idempotency: { find: (db) => findSplitReplayIn(db, orderId, input.requestToken) },
+          // 按人份额落库（R1）：搬人搬钱之后两侧各落一遍——源单清掉被拆走乘客的旧行、新单补建。
+          persistShares: true,
         },
         async (ctx) => {
           const outcome = await svc.executeSplitWithinTx(
@@ -730,6 +732,8 @@ export async function splitOrder(
             actor,
             targetOrderNumber,
           );
+          // 新单是 body 里才有 id 的，点名进内核的份额落库名单。
+          ctx.track(outcome.result.targetOrderId);
 
           // 审计**进事务**（原先事务外 fire-and-forget）：拆单是资金 / 库存动作，
           // 「谁把哪些人、多少钱拆到了哪张单」必须与拆单本身同生共死。两条 SPLIT_ORDER，各挂一侧订单。

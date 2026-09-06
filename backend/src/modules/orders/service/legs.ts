@@ -628,6 +628,8 @@ export async function cancelLeg(
     idempotency: { fastPath: false, find: (db) => findCancelLegReplay(db, orderId, input) },
     // 取消航段动应收（退款）与座位（该段放回库存）；已收一分不动、房量不动。
     conserve: { unchanged: ['paid', 'rooms'], label: `取消${legZh}` },
+    // 应收变了 → 每人份额跟着重算落库（R1）。
+    persistShares: true,
   }, async (ctx) => {
     const tx = ctx.tx;
     // ── 1. 重跑准入闸（预检放行到执行之间世界可能已经变了）──
@@ -1506,6 +1508,8 @@ export async function _executeNoShow(
     requestToken: input.requestToken,
     idempotency: { fastPath: false, find: (db) => findNoShowReplay(db, targetOrderId, input, split) },
     conserve: { unchanged: ['receivable', 'paid', 'rooms', 'cost'], label: 'no-show' },
+    // 钱不动，但部分人 no-show 走的是拆单后的新单：这里再落一遍份额，让新单一定有完整的一套（R1）。
+    persistShares: true,
   }, async (ctx) => {
     const tx = ctx.tx;
     // ── 1. 重跑准入闸（此刻订单里就是该被标记的那批人 → 不再传 passengerIds）──
@@ -1997,6 +2001,7 @@ export async function restoreReturnLeg(
     requestToken: input.requestToken,
     idempotency: { fastPath: false, find: (db) => findRestoreReturnLegReplay(db, orderId, input) },
     conserve: { unchanged: ['receivable', 'paid', 'rooms', 'cost'], label: '恢复回程' },
+    persistShares: true,
   }, async (ctx) => {
     const tx = ctx.tx;
     // ── 1. 重跑准入闸 ──
@@ -2431,6 +2436,7 @@ export async function voidReturnLeg(
     requestToken: input.requestToken,
     idempotency: { fastPath: false, find: (db) => findVoidReturnLegReplay(db, orderId, input) },
     conserve: { unchanged: ['receivable', 'paid', 'seats', 'rooms', 'cost'], label: '作废回程' },
+    persistShares: true,
   }, async (ctx) => {
     const tx = ctx.tx;
     // ── 1. 重跑准入闸 ──
