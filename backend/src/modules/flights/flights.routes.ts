@@ -1,6 +1,6 @@
-import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
+import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { StaffRole, UserRole } from '@prisma/client';
+import { UserRole } from '@prisma/client';
 import {
   FlightService,
   serializeScheduleForAgent,
@@ -13,7 +13,6 @@ import {
   scheduleToSeatStatsRow,
   seatStatsExportFilename,
 } from './flights.export-seat-stats.js';
-import { ForbiddenError, UnauthorizedError } from '../../lib/errors.js';
 import { priceQuerySchema } from '../pricing/pricing.schemas.js';
 import {
   batchDeleteSchedulesBodySchema,
@@ -27,21 +26,8 @@ import {
   upsertBaggagePoliciesBodySchema,
 } from './flights.schemas.js';
 
-/**
- * 航班维护岗 = ADMIN，或 STAFF 里的「运营（未设岗）」与「票务岗」。
- * 建航班 / 加班次 / 改班次（价、容量、时刻、上下架）是运营与票务的日常活，不该每次都找管理员代劳；
- * 签证岗 / 房控 / 财务不碰航班库存，因此不在此列（他们仍可只读班次）。
- * 岗位逐请求从 User 表取回（authenticate 写进 req.staffRole），改岗后下一个请求即生效，不依赖 token 内容。
- * 判岗口径与 plugins/auth.ts 的 requireFinanceAccess 一致，只是放行的岗位不同。
- */
-async function requireFlightMaintenance(req: FastifyRequest, _reply: FastifyReply): Promise<void> {
-  if (!req.user) throw new UnauthorizedError();
-  const allowed =
-    req.user.role === UserRole.ADMIN ||
-    (req.user.role === UserRole.STAFF &&
-      (req.staffRole == null || req.staffRole === StaffRole.TICKETING));
-  if (!allowed) throw new ForbiddenError('需要运营或票务岗权限');
-}
+// 航班维护岗（ADMIN / 运营 / 票务岗）的判定已收敛进能力表（见 lib/capabilities.ts 的
+// flights.maintain，FLIGHT_MAINTENANCE 受众），不再在本文件手写角色判断。
 
 export const flightRoutes: FastifyPluginAsync = async (app) => {
   const service = new FlightService();
@@ -69,7 +55,7 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   // 列表：ADMIN/STAFF/AGENT 都可读（代理批量创单要选航班；AdminFlight 不含成本字段，安全）
   app.get(
     '/',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)] },
+    { preHandler: [app.authenticate, app.requireCapability('flights.read')] },
     async () => {
       const flights = await service.listFlights();
       return { flights };
@@ -79,7 +65,7 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   // 新建航班：航班维护岗（ADMIN / 运营 / 票务岗）都可建线。
   app.post(
     '/',
-    { preHandler: [app.authenticate, requireFlightMaintenance] },
+    { preHandler: [app.authenticate, app.requireCapability('flights.maintain')] },
     async (req, reply) => {
       const body = createFlightBodySchema.parse(req.body);
       const flight = await service.createFlight(body);
@@ -90,7 +76,7 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   // 整线停售 / 恢复：一次影响该航线全部班次，前台立刻不可售 —— 仅 ADMIN。
   app.post(
     '/:flightId/toggle',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    { preHandler: [app.authenticate, app.requireCapability('flights.dangerous')] },
     async (req) => {
       const { flightId } = req.params as { flightId: string };
       const flight = await service.deactivateFlight(flightId);
@@ -102,7 +88,7 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   // 定价敏感（一改影响整条航线所有班次的商务舱成交价），不随航班维护岗放开 —— 仅 ADMIN。
   app.patch(
     '/:flightId',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    { preHandler: [app.authenticate, app.requireCapability('flights.dangerous')] },
     async (req) => {
       const { flightId } = req.params as { flightId: string };
       const body = updateFlightBodySchema.parse(req.body);
@@ -113,7 +99,7 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
 
   app.get(
     '/:flightId/schedules',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)] },
+    { preHandler: [app.authenticate, app.requireCapability('flights.read')] },
     async (req) => {
       const { flightId } = req.params as { flightId: string };
       const schedules = await service.listSchedules(flightId);
@@ -129,7 +115,7 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   // ── 座位统计：按出发日区间列出所有航班的班次（含 available/locked，一次取数，免 N+1）──
   app.get(
     '/schedules',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('flights.seat_stats.view')] },
     async (req) => {
       const q = z
         .object({
@@ -148,7 +134,7 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   // flightNumber 选填 = 页面上的航班筛选。权限与座位统计页一致：ADMIN/STAFF。
   app.get(
     '/schedules/export-seat-stats',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('flights.seat_stats.view')] },
     async (req, reply) => {
       const q = z
         .object({
@@ -190,7 +176,7 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   // ── 行李规则（航班 × 舱等；ADMIN/STAFF 维护）──
   app.get(
     '/:flightId/baggage-policies',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('flights.baggage.manage')] },
     async (req) => {
       const { flightId } = req.params as { flightId: string };
       const policies = await service.listBaggagePolicies(flightId);
@@ -201,7 +187,7 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   // PUT 整体替换：body 是 [{cabin, checkedKg, checkedPieces, carryOnKg, note}]；未出现的舱等删除
   app.put(
     '/:flightId/baggage-policies',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('flights.baggage.manage')] },
     async (req) => {
       const { flightId } = req.params as { flightId: string };
       const items = upsertBaggagePoliciesBodySchema.parse(req.body);
@@ -214,7 +200,7 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   // 航班维护岗（ADMIN / 运营 / 票务岗）都可加班次。
   app.post(
     '/schedules',
-    { preHandler: [app.authenticate, requireFlightMaintenance] },
+    { preHandler: [app.authenticate, app.requireCapability('flights.maintain')] },
     async (req, reply) => {
       const body = createScheduleBodySchema.parse(req.body);
       const schedule = await service.createSchedule(body);
@@ -229,7 +215,7 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   // 航班维护岗（ADMIN / 运营 / 票务岗）可改；签证岗 / 房控 / 财务只读，不再能改班次。
   app.patch(
     '/schedules/:scheduleId',
-    { preHandler: [app.authenticate, requireFlightMaintenance] },
+    { preHandler: [app.authenticate, app.requireCapability('flights.maintain')] },
     async (req) => {
       const { scheduleId } = req.params as { scheduleId: string };
       const body = updateScheduleBodySchema.parse(req.body);
@@ -244,7 +230,7 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   // 返回 { deleted, skipped: [{ scheduleId, reason }] }，已售/有订单的班次不会被删。
   app.post(
     '/schedules/batch-delete',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    { preHandler: [app.authenticate, app.requireCapability('flights.dangerous')] },
     async (req) => {
       const body = batchDeleteSchedulesBodySchema.parse(req.body);
       const result = await service.batchDeleteSchedules(body, actorFromRequest(req));
@@ -260,7 +246,7 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   // 返回 { applied, skipped: [{ scheduleId, reason }], oversold: [{ scheduleId, cabin, sold, capacity, oversoldBy }] }。
   app.post(
     '/schedules/batch-update-capacity',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    { preHandler: [app.authenticate, app.requireCapability('flights.dangerous')] },
     async (req) => {
       const body = batchUpdateCapacityBodySchema.parse(req.body);
       const result = await service.batchUpdateCapacity(body, actorFromRequest(req));
@@ -276,7 +262,7 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   // 返回 { applied, skipped: [{ scheduleId, reason }], soldSchedules, soldSeats }。
   app.post(
     '/schedules/batch-update-times',
-    { preHandler: [app.authenticate, requireFlightMaintenance] },
+    { preHandler: [app.authenticate, app.requireCapability('flights.maintain')] },
     async (req) => {
       const body = batchUpdateScheduleTimesBodySchema.parse(req.body);
       const result = await service.batchUpdateScheduleTimes(body, actorFromRequest(req));
@@ -287,7 +273,7 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
   // 单班次删除：不可恢复，与批量删除同权限口径 —— 仅 ADMIN。
   app.delete(
     '/schedules/:scheduleId',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    { preHandler: [app.authenticate, app.requireCapability('flights.dangerous')] },
     async (req) => {
       const { scheduleId } = req.params as { scheduleId: string };
       const result = await service.deleteSchedule(scheduleId);

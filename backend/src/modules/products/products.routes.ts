@@ -16,8 +16,8 @@
  * 4 个子资源：/hotels, /transfers, /visas, /bundles
  */
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
-import { UserRole } from '@prisma/client';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
+import { hasCapability } from '../../lib/capabilities.js';
 import { ProductsService } from './products.service.js';
 import { getHotelAvailability } from './hotel-availability.service.js';
 import { getBundleSellableDates } from './bundle-availability.service.js';
@@ -45,13 +45,13 @@ import {
 /** req.user 由 optionalAuthenticate 在带有效 token 时设置；不带 token（游客）时为 undefined。
  *  带了但无效/过期的 token 走不到这里 —— optionalAuthenticate 已经抛 401。 */
 function isCostVisible(req: FastifyRequest): boolean {
-  const role = req.user?.role;
-  return role === UserRole.ADMIN || role === UserRole.STAFF;
+  if (!req.user) return false; // 游客：与能力表判定一致，恒不可见
+  return hasCapability({ role: req.user.role, staffRole: req.staffRole }, 'products.cost.view');
 }
 
 export const productRoutes: FastifyPluginAsync = async (app) => {
   const service = new ProductsService();
-  const adminPre = { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] };
+  const adminPre = { preHandler: [app.authenticate, app.requireCapability('products.write')] };
   // 公开 GET 但仍尝试解析身份（不 401）——只用来决定要不要下发 costPriceCny。
   const optionalAuthPre = { preHandler: [app.optionalAuthenticate] };
 

@@ -6,7 +6,6 @@
  * POST /seat-allocations/:id/reclaim  回收切位（ACTIVE → RECLAIMED，座位回散客池）
  */
 import type { FastifyPluginAsync } from 'fastify';
-import { UserRole } from '@prisma/client';
 import { SeatAllocationService } from './seat-allocation.service.js';
 import {
   createSeatAllocationBodySchema,
@@ -25,7 +24,7 @@ export const seatAllocationRoutes: FastifyPluginAsync = async (app) => {
   //   列表 / 回收保持开放，供清理存量切位。
   app.post(
     '/',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('seat_allocation.manage')] },
     async (req, reply) => {
       createSeatAllocationBodySchema.parse(req.body); // 仍校验请求形状，但下方一律拒绝
       return reply.status(409).send({
@@ -38,7 +37,7 @@ export const seatAllocationRoutes: FastifyPluginAsync = async (app) => {
   // ── 列表 ────────────────────────────────────────────────────────
   app.get(
     '/',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('seat_allocation.manage')] },
     async (req) => {
       const query = listSeatAllocationsQuerySchema.parse(req.query);
       const allocations = await service.listAllocations(query);
@@ -49,7 +48,7 @@ export const seatAllocationRoutes: FastifyPluginAsync = async (app) => {
   // ── 回收切位 ────────────────────────────────────────────────────
   app.post(
     '/:id/reclaim',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('seat_allocation.manage')] },
     async (req) => {
       const { id } = req.params as { id: string };
       const result = await service.reclaimAllocation(id, actorFromRequest(req));

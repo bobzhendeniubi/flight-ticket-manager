@@ -3,7 +3,6 @@
  * 建单与订单、锁位共享：capacity − sold − 未过期 ACTIVE 锁位 − 占位余座；收款与清算在本模块闭环。
  */
 import type { FastifyPluginAsync } from 'fastify';
-import { UserRole } from '@prisma/client';
 import { actorFromRequest } from '../../lib/audit.js';
 import { HoldOrderService } from './hold-orders.service.js';
 import {
@@ -26,8 +25,8 @@ import {
 
 export const holdOrderRoutes: FastifyPluginAsync = async (app) => {
   const service = new HoldOrderService();
-  const pre = { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] };
-  const adminOnly = { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] };
+  const pre = { preHandler: [app.authenticate, app.requireCapability('hold_orders.manage')] };
+  const adminOnly = { preHandler: [app.authenticate, app.requireCapability('hold_orders.config.write')] };
 
   app.post('/', pre, async (req, reply) => {
     const body = createHoldOrderBodySchema.parse(req.body);
