@@ -47,6 +47,7 @@ import {
   tokenPayloadMismatchError,
 } from './leg-action-log.js';
 import { orderSerializeRoleCtx, serializeOrder } from './read.js';
+import { resolveOneFlightCostSnapshot } from './item-cost-snapshot.js';
 import {
   assertLegNotFlownForReschedule,
   computeBundleSeatSplit,
@@ -614,11 +615,30 @@ export async function rescheduleOrderItem(
               : {}),
           }
         : null;
+    // 换了班次 → 成本快照按新班次重打（口径不变，仍走 resolveFlightItemCost）：
+    // 快照记的是「这条航段花了我们多少钱」，人改到别的班次上，成本自然是新班次那一份。
+    // 新班次算不出成本（override 与周期都没填）→ 转 NULL：留着原班次的数字让报表继续算毛利
+    // 比如实报「未知」坏得多。同班次仅改舱位不重打（包机分摊按座不按舱，成本本就不变）。
+    const rescheduledCost = scheduleChanged
+      ? await resolveOneFlightCostSnapshot(newScheduleId, item.quantity, tx)
+      : null;
     await tx.orderItem.update({
       where: { id: item.id },
       data: {
         flightScheduleId: newScheduleId,
         flightCabin: newCabin,
+        ...(rescheduledCost
+          ? {
+              unitCostCny:
+                rescheduledCost.unitCostCny != null
+                  ? new Prisma.Decimal(rescheduledCost.unitCostCny)
+                  : null,
+              totalCostCny:
+                rescheduledCost.totalCostCny != null
+                  ? new Prisma.Decimal(rescheduledCost.totalCostCny)
+                  : null,
+            }
+          : {}),
         ...(nextMeta ? { metadata: nextMeta as Prisma.InputJsonValue } : {}),
       },
     });
