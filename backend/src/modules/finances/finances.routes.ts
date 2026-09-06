@@ -44,6 +44,7 @@ import {
   buildFinanceExportByOrderWorkbook,
   financeExportByOrderFilename,
 } from './finances.export-orders.js';
+import { listPendingRefundPayouts } from './finances.refund-payout.js';
 
 const dateStr = z
   .string()
@@ -142,6 +143,15 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     const detail = await getOrderPnlDetail(id);
     if (!detail) return reply.status(404).send({ error: '订单不存在或已删除' });
     return detail;
+  });
+
+  // ── 待打款队列 ────────────────────────────────────────────────────────────
+  // 已核准（Refund=COMPLETED）但还没登记打款（paidAt 为空）的退款。
+  // 核准只是「账上认了这笔退款」，钱是财务在银行/微信里手工打的——这条队列就是那一步的待办。
+  // 登记入口在订单侧（POST /orders/:id/refunds/:refundId/mark-paid），两处同一份财务岗闸。
+  app.get('/refunds/pending-payout', requireFinance, async (req) => {
+    logView(req, { route: 'refunds-pending-payout' });
+    return listPendingRefundPayouts();
   });
 
   app.get('/monthly', requireFinance, async (req) => {

@@ -6336,6 +6336,24 @@ export const api = {
     return res.blob();
   },
 
+  // ── 退款待打款队列 + 实付登记 ────────────────────────────────────────────
+  // 「已核准」不等于「钱打出去了」：核准只是账上认了这笔退款，真金白银是财务手工打的。
+  // 队列 = 已核准但还没登记打款的退款；登记只写打款痕迹，不改退款状态、不动订单金额。
+  listPendingRefundPayouts: (token: string) =>
+    apiFetch<PendingRefundPayoutResult>('/finances/refunds/pending-payout', { token }),
+
+  /** 登记某笔退款已实际打款；重复登记后端直接 409（真打两笔和点两次必须分得清）。 */
+  markRefundPaid: (
+    token: string,
+    orderId: string,
+    refundId: string,
+    body: MarkRefundPaidInput,
+  ) =>
+    apiFetch<{ refund: MarkRefundPaidResult }>(
+      `/orders/${orderId}/refunds/${refundId}/mark-paid`,
+      { method: 'POST', token, body },
+    ),
+
   // 财务对账 xlsx 按订单维度导出（一行一订单，订单毛利）
   downloadFinanceExportByOrder: async (
     token: string,
@@ -6744,6 +6762,58 @@ export interface CostBreakdown {
   other: number;
   total: number;
 }
+// ── 退款待打款队列 ────────────────────────────────────────────────────────────
+/** 打款渠道（与后端 REFUND_PAY_METHODS 同一份白名单）。 */
+export type RefundPayMethod = 'BANK' | 'WECHAT' | 'ALIPAY' | 'CASH' | 'OTHER';
+export const REFUND_PAY_METHOD_LABEL: Record<RefundPayMethod, string> = {
+  BANK: '银行转账',
+  WECHAT: '微信',
+  ALIPAY: '支付宝',
+  CASH: '现金',
+  OTHER: '其他',
+};
+
+export interface PendingRefundPayoutRow {
+  refundId: string;
+  orderId: string;
+  orderNumber: string;
+  contactName: string;
+  agencyLabel: string | null;
+  amountCny: number;
+  reason: string | null;
+  /** 申请日（ISO） */
+  requestedAt: string;
+  /** 核准日（ISO）；老数据可能为空 */
+  approvedAt: string | null;
+  ageDays: number;
+  isSwapRefund: boolean;
+}
+
+export interface PendingRefundPayoutResult {
+  rows: PendingRefundPayoutRow[];
+  totalAmountCny: number;
+  /** 账龄 ≥7 天的笔数 */
+  overdueCount: number;
+}
+
+export interface MarkRefundPaidInput {
+  /** ISO 时间串；省略 = 此刻。允许回溯补录，未来时刻后端拒。 */
+  paidAt?: string;
+  paidMethod: RefundPayMethod;
+  paidTxnRef?: string;
+  paidNote?: string;
+}
+
+export interface MarkRefundPaidResult {
+  refundId: string;
+  orderNumber: string;
+  amountCny: number;
+  paidAt: string;
+  paidMethod: RefundPayMethod;
+  paidTxnRef: string | null;
+  paidNote: string | null;
+}
+
 export interface FinanceSummary {
   range: { from: string; to: string };
   revenueCny: number;

@@ -863,6 +863,18 @@ export const updateSwapReplacementOrderBodySchema = z.object({
 });
 export type UpdateSwapReplacementOrderBody = z.infer<typeof updateSwapReplacementOrderBodySchema>;
 
+// ── 退款实付登记（财务岗）────────────────────────────────────────────────────
+// 只描述「钱怎么打出去的」，不含金额：退多少由 Refund.amount 定死，允许在这里改金额
+// 就等于开了一条绕过退款核准的付款口子。
+// paidAt 可空 = 此刻；允许回溯补录（打完钱隔天才登记是常态），未来时刻由服务层拒。
+export const markRefundPaidBodySchema = z.object({
+  paidAt: z.string().datetime({ offset: true }).optional(),
+  paidMethod: z.enum(['BANK', 'WECHAT', 'ALIPAY', 'CASH', 'OTHER']),
+  paidTxnRef: z.string().trim().max(128).optional(),
+  paidNote: z.string().trim().max(500).optional(),
+});
+export type MarkRefundPaidBody = z.infer<typeof markRefundPaidBodySchema>;
+
 // ── 批量状态流转（ADMIN/STAFF）──────────────────────────────────────────
 export const batchUpdateStatusBodySchema = z.object({
   ids: z.array(z.string().min(1)).min(1).max(100),

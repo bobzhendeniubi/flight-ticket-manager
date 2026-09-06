@@ -15,6 +15,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatLocalTime } from '../lib/airports';
 import { formatDateTimeSecCn, formatInBusinessTz } from '../lib/datetime';
 import { Icon } from '../components/Icon';
+import { RefundPayoutQueue } from '../components/RefundPayoutQueue';
 import {
   api,
   ApiError,
@@ -37,7 +38,7 @@ import { UsdRateInput } from '../components/UsdRateInput';
 import { useConfirm } from '../components/ConfirmDialog';
 import { useDialogA11y } from '../components/Modal';
 
-type Tab = 'summary' | 'flights' | 'orders' | 'monthly' | 'costs';
+type Tab = 'summary' | 'flights' | 'orders' | 'monthly' | 'costs' | 'payouts';
 
 const KIND_LABEL: Record<string, string> = {
   FLIGHT: '机票',
@@ -367,6 +368,9 @@ export function FinancesPage() {
         <TabBtn active={tab === 'costs'} onClick={() => setTab('costs')}>
           成本维护
         </TabBtn>
+        <TabBtn active={tab === 'payouts'} onClick={() => setTab('payouts')}>
+          待打款
+        </TabBtn>
       </nav>
 
       {tab === 'summary' && <SummaryTab token={token} range={range} />}
@@ -374,6 +378,9 @@ export function FinancesPage() {
       {tab === 'orders' && <OrdersTab token={token} range={range} />}
       {tab === 'monthly' && <MonthlyTab token={token} />}
       {tab === 'costs' && <CostsTab token={token} />}
+      {/* 待打款：已核准但钱还没打出去的退款。不吃上面的日期区间——队列是「还没做完的事」，
+          按时间段筛会把更早的漏账藏起来，正是本页要暴露的东西。 */}
+      {tab === 'payouts' && <RefundPayoutQueue />}
     </div>
   );
 }

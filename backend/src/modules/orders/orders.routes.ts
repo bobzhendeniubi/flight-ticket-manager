@@ -64,6 +64,7 @@ import {
   restoreReturnLegBodySchema,
   voidReturnLegBodySchema,
   splitRoomGroupBodySchema,
+  markRefundPaidBodySchema,
   swapRefundBodySchema,
   updateSwapReplacementOrderBodySchema,
   swapFeeOptionsBodySchema,
@@ -108,6 +109,7 @@ import {
   buildMasterExportWorkbook,
   masterExportFilename,
 } from './orders.export-master.js';
+import { markRefundPaid } from '../finances/finances.refund-payout.js';
 import {
   describeOrderFilters,
   serializableOrderFilters,
@@ -599,6 +601,51 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       });
 
       return result;
+    },
+  );
+
+  /**
+   * POST /orders/:id/refunds/:refundId/mark-paid
+   * 登记「这笔退款的钱确实打出去了」。ADMIN 或财务岗（requireFinanceAccess，与财务页同一道闸）。
+   *
+   * 与退款状态机无关：Refund.status 一个字不改，订单的已收/尾款一分不动 —— 这里只是给
+   * 「核准之后、真金白银离开公司账户」这一步留一条可查的痕迹（谁打的、几时、走哪条渠道、流水号）。
+   * 重复标记直接 409（见 markRefundPaid 的幂等口径注释）：真打了两笔和点了两次必须能分清。
+   */
+  app.post(
+    '/:id/refunds/:refundId/mark-paid',
+    { preHandler: [app.authenticate, app.requireFinanceAccess] },
+    async (req) => {
+      const { id, refundId } = req.params as { id: string; refundId: string };
+      const body = markRefundPaidBodySchema.parse(req.body ?? {});
+      const result = await markRefundPaid({
+        orderId: id,
+        refundId,
+        paidAt: body.paidAt ? new Date(body.paidAt) : undefined,
+        paidMethod: body.paidMethod,
+        paidTxnRef: body.paidTxnRef ?? null,
+        paidNote: body.paidNote ?? null,
+        paidByUserId: req.user.sub,
+      });
+
+      // 资金离场，留痕等级同收款纠错：谁在什么时候登记了多少钱出去，必须查得到。
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'MARK_REFUND_PAID',
+        targetType: 'ORDER',
+        targetId: id,
+        targetLabel: result.orderNumber,
+        after: {
+          refundId: result.refundId,
+          amountCny: result.amountCny,
+          paidAt: result.paidAt,
+          paidMethod: result.paidMethod,
+          paidTxnRef: result.paidTxnRef,
+        },
+        severity: 'WARNING',
+      });
+
+      return { refund: result };
     },
   );
 
