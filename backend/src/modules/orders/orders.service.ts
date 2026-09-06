@@ -169,6 +169,8 @@ import { heldSeatsForCabin } from '../hold-orders/held-seats.js';
 // 「回程已释放」提醒的 ruleKey 构造收敛在提醒规则那边：作废时要把这两条待办一起关掉，
 // 在这里照抄一遍拼接格式，改键时必然漏一处、待办就永远关不掉。
 import { noShowReleasedReminderRuleKeys } from '../reminders/reminders.rules.js';
+import { isFeatureEnabled } from '../../lib/feature-flags.js';
+import { pushWecomMarkdown } from '../../lib/wecom-webhook.js';
 import type {
   BatchCreateOrdersBody,
   BatchPriceAdjustmentBody,
@@ -17420,6 +17422,7 @@ export class OrderService {
           feeItemId: null,
           workOrderReminderId:
             typeof snap.workOrderReminderId === 'string' ? snap.workOrderReminderId : null,
+          workOrderTitle: typeof snap.workOrderTitle === 'string' ? snap.workOrderTitle : null,
           releasedSeats: Array.isArray(snap.releasedSeats)
             ? (snap.releasedSeats as CancelLegAudit['releasedSeats'])
             : [],
@@ -17527,12 +17530,14 @@ export class OrderService {
       // 与作废动作同事务：不可能出现「段作废了、工单没派出去」。
       // 工单 id 进下面的作废快照，幂等回放时原样读回（不会重复派单）。
       let workOrderReminderId: string | null = null;
+      let workOrderTitle: string | null = null;
       if (ticketedCount > 0) {
+        workOrderTitle = buildTicketWorkOrderTitle('撤名单/退票', order.orderNumber, legZh, legItem);
         workOrderReminderId = await createTicketWorkOrder(tx, {
           orderId,
           createdById: actor.userId,
           ruleKey: `LEG_CANCEL_WITHDRAW:${legItem.id}:${input.requestToken}`,
-          title: buildTicketWorkOrderTitle('撤名单/退票', order.orderNumber, legZh, legItem),
+          title: workOrderTitle,
           body:
             `订单 ${order.orderNumber} 的${legZh}已取消，该段座位已放回库存。` +
             `该段有 ${ticketedCount} 条确认出票记录，请到航司/出票渠道撤名单或办理退票，` +
@@ -17570,6 +17575,7 @@ export class OrderService {
         releasedSeats,
         ticketedAtCancel: ticketedCount,
         workOrderReminderId,
+        workOrderTitle,
         totalBeforeCny,
         totalAfterCny: round2(totalBeforeCny - netReductionCny),
       };
@@ -17735,6 +17741,7 @@ export class OrderService {
         returnItemId: legItem.id,
         feeItemId,
         workOrderReminderId,
+        workOrderTitle,
         releasedSeats,
         originalAmountCny: legAmountCny,
         feeCny,
@@ -17747,6 +17754,12 @@ export class OrderService {
         replayed: false,
       };
     });
+
+    // 事务已提交：这里才 fire-and-forget 推企业微信，绝不在事务内发 HTTP。
+    // replayed=true（幂等回放）不重复推——工单在上一次真实执行时已经推过了。
+    if (!audit.replayed && audit.workOrderReminderId) {
+      void notifyWorkOrderCreatedToWecom(audit.orderNumber, audit.workOrderTitle);
+    }
 
     const finalOrder = await prisma.order.findUniqueOrThrow({
       where: { id: orderId },
@@ -18145,6 +18158,10 @@ export class OrderService {
 
     if (!needsSplit) {
       const audit = await this._executeNoShow(orderId, input, actor, null);
+      // _executeNoShow 内部的事务已提交，这里才 fire-and-forget 推企业微信。
+      if (!audit.replayed && audit.workOrderReminderId) {
+        void notifyWorkOrderCreatedToWecom(audit.orderNumber, audit.workOrderTitle);
+      }
       const finalOrder = await prisma.order.findUniqueOrThrow({
         where: { id: orderId },
         include: ORDER_FULL_INCLUDE,
@@ -18261,6 +18278,11 @@ export class OrderService {
       );
     }
 
+    // _executeNoShow 内部的事务已提交，这里才 fire-and-forget 推企业微信。
+    if (!audit.replayed && audit.workOrderReminderId) {
+      void notifyWorkOrderCreatedToWecom(audit.orderNumber, audit.workOrderTitle);
+    }
+
     const finalOrder = await prisma.order.findUniqueOrThrow({
       where: { id: split.targetOrderId },
       include: ORDER_FULL_INCLUDE,
@@ -18338,6 +18360,7 @@ export class OrderService {
             : [],
           workOrderReminderId:
             typeof snap.workOrderReminderId === 'string' ? snap.workOrderReminderId : null,
+          workOrderTitle: typeof snap.workOrderTitle === 'string' ? snap.workOrderTitle : null,
           split,
           replayed: true,
         } satisfies NoShowAudit;
@@ -18357,6 +18380,7 @@ export class OrderService {
       // ── 2. 回程处置（先做：工单 id / 放座明细要写进去程的 no-show 快照供回放）──
       const releasedSeats: NoShowAudit['releasedSeats'] = [];
       let workOrderReminderId: string | null = null;
+      let workOrderTitle: string | null = null;
       const willRelease = input.releaseReturn && returnItem != null;
       // 本次动作的 legActionLog 条目：只落一条，落在**这次真正被改写的那一行**上
       //（释放 → 回程行；不释放/单程单 → 去程行）。回放扫的是全部航段行，落哪一行都找得到。
@@ -18410,11 +18434,12 @@ export class OrderService {
         // 2b. 出票任务：未出票的关掉；已出票的**不动**，另派撤名单/退票工单。
         //     已 CONFIRMED 的记录是「票在航司那边真实存在」的事实，抹掉它等于丢账。
         if (returnTicketedCount > 0) {
+          workOrderTitle = buildTicketWorkOrderTitle('撤名单/退票', order.orderNumber, '回程', returnItem);
           workOrderReminderId = await createTicketWorkOrder(tx, {
             orderId: targetOrderId,
             createdById: actor.userId,
             ruleKey: `NOSHOW_WITHDRAW:${returnItem.id}:${input.requestToken}`,
-            title: buildTicketWorkOrderTitle('撤名单/退票', order.orderNumber, '回程', returnItem),
+            title: workOrderTitle,
             body:
               `订单 ${order.orderNumber} 的客人去程 no-show，回程座位已释放回库存可继续销售。` +
               `该段有 ${returnTicketedCount} 条确认出票记录，请到航司/出票渠道撤名单或办理退票，` +
@@ -18458,6 +18483,7 @@ export class OrderService {
           // 老快照没有这个键 → 恢复预检读到 undefined，按「不确定」不提示（fail-open）。
           returnInvoicedAtRelease: order.returnInvoiced === true,
           workOrderReminderId,
+          workOrderTitle,
           note,
           history: priorRelease.at != null ? [...priorHistory, priorWithoutHistory] : priorHistory,
         };
@@ -18497,6 +18523,7 @@ export class OrderService {
         returnReleased: willRelease,
         releasedSeats,
         workOrderReminderId,
+        workOrderTitle,
       };
       // 「再释放一次回程」不重写 noShow 快照：首次 no-show 的时间/操作人是事实，覆盖掉就查不回来了。
       // 只往 releaseHistory 追加一条本次释放的记录（快照形状与首刷同构，供事后逐次对账）。
@@ -18516,6 +18543,7 @@ export class OrderService {
                 returnItemId: willRelease && returnItem ? returnItem.id : null,
                 releasedSeats,
                 workOrderReminderId,
+                workOrderTitle,
                 note,
               },
             ],
@@ -18581,6 +18609,7 @@ export class OrderService {
         returnItemId: willRelease && returnItem ? returnItem.id : null,
         releasedSeats,
         workOrderReminderId,
+        workOrderTitle,
         split,
         replayed: false,
       } satisfies NoShowAudit;
@@ -18864,6 +18893,11 @@ export class OrderService {
             typeof snap.scheduleOversoldAfter === 'number' ? snap.scheduleOversoldAfter : 0,
           flightNumber: typeof snap.flightNumber === 'string' ? snap.flightNumber : null,
           departDate: typeof snap.departDate === 'string' ? snap.departDate : null,
+          // 重放不重新派工单（createTicketWorkOrder 按 ruleKey 幂等，重放这条分支根本不会
+          // 跑到第 6 步），这两个字段在重放场景没有对应历史值可读，且下面调用方只在
+          // !replayed 时才用它们决定推不推企业微信——重放恒为 null 不影响任何判断。
+          workOrderReminderId: null,
+          workOrderTitle: null,
           replayed: true,
         } satisfies RestoreReturnLegAudit;
       }
@@ -19162,12 +19196,15 @@ export class OrderService {
 
       // ── 6. 释放时已出票（派过撤名单工单）→ 再派一条「重新上名单」工单 ──────────
       const ticketedAtRelease = Number(assessed.snapshot?.ticketedAtRelease ?? 0);
+      let relistWorkOrderReminderId: string | null = null;
+      let relistWorkOrderTitle: string | null = null;
       if (ticketedAtRelease > 0) {
-        await createTicketWorkOrder(tx, {
+        relistWorkOrderTitle = buildTicketWorkOrderTitle('重新上名单', assessed.order.orderNumber, '回程', item);
+        relistWorkOrderReminderId = await createTicketWorkOrder(tx, {
           orderId,
           createdById: actor.userId,
           ruleKey: `NOSHOW_RELIST:${item.id}:${input.requestToken}`,
-          title: buildTicketWorkOrderTitle('重新上名单', assessed.order.orderNumber, '回程', item),
+          title: relistWorkOrderTitle,
           body:
             `订单 ${assessed.order.orderNumber} 的回程已恢复到原班次` +
             `（${totalSeats} 座${oversellBy > 0 ? `，其中 ${oversellBy} 座为超售` : ''}）。` +
@@ -19237,9 +19274,16 @@ export class OrderService {
         scheduleOversoldAfter,
         flightNumber: restoredFlightNumber,
         departDate: restoredDepartDate,
+        workOrderReminderId: relistWorkOrderReminderId,
+        workOrderTitle: relistWorkOrderTitle,
         replayed: false,
       } satisfies RestoreReturnLegAudit;
     });
+
+    // 事务已提交：这里才 fire-and-forget 推企业微信，绝不在事务内发 HTTP。
+    if (!audit.replayed && audit.workOrderReminderId) {
+      void notifyWorkOrderCreatedToWecom(audit.orderNumber, audit.workOrderTitle);
+    }
 
     const finalOrder = await prisma.order.findUniqueOrThrow({
       where: { id: orderId },
@@ -19569,6 +19613,8 @@ export interface CancelLegAudit {
   feeItemId: string | null;
   /** 本段已出票时给票务派的「撤名单/退票」工单 id；未出票为 null。 */
   workOrderReminderId: string | null;
+  /** 上面那条工单的标题（企业微信即时推送用，跟 workOrderReminderId 同步为 null）。 */
+  workOrderTitle: string | null;
   releasedSeats: Array<{ scheduleId: string; cabin: CabinClass; quantity: number }>;
   originalAmountCny: number;
   feeCny: number;
@@ -20110,6 +20156,8 @@ export interface NoShowAudit {
   releasedSeats: ReleasedSeatEntry[];
   /** 回程已出票时给票务派的「撤名单/退票」工单 id。 */
   workOrderReminderId: string | null;
+  /** 上面那条工单的标题（企业微信即时推送用，跟 workOrderReminderId 同步为 null）。 */
+  workOrderTitle: string | null;
   /** 走了拆单时的两侧单号；整单标记为 null。 */
   split: { sourceOrderNumber: string; targetOrderNumber: string } | null;
   /** true = 同 requestToken 重试，本次没有任何写入（座位不会被二次释放）。 */
@@ -20294,6 +20342,10 @@ export interface RestoreReturnLegAudit {
   /** 原班次航班号 / 出发地当地出发日（审计 targetLabel 直接说清是哪一班，不必再去翻 scheduleId）。 */
   flightNumber: string | null;
   departDate: string | null;
+  /** 释放时已出票 → 本次恢复顺带派的「重新上名单」工单 id；未派为 null。 */
+  workOrderReminderId: string | null;
+  /** 上面那条工单的标题（企业微信即时推送用，跟 workOrderReminderId 同步为 null）。 */
+  workOrderTitle: string | null;
   replayed: boolean;
 }
 
@@ -20539,6 +20591,19 @@ async function createTicketWorkOrder(
     select: { id: true },
   });
   return created.id;
+}
+
+/**
+ * 撤名单/退票、重新上名单三类工单创建后即时推一条企业微信通知——受 REMINDER_WEBHOOK_PUSH
+ * feature flag 控制（关或未配置 WECOM_WEBHOOK_URL 都是 no-op），且必须由调用方在
+ * **事务提交之后**以 `void notifyWorkOrderCreatedToWecom(...)` 的方式 fire-and-forget 调用：
+ * 本函数自己不开事务、不参与调用方的事务，pushWecomMarkdown 内部的 HTTP 请求绝不会发生在
+ * 一个尚未提交的数据库事务里。title 为 null（未真正派出工单）时直接跳过。
+ */
+async function notifyWorkOrderCreatedToWecom(orderNumber: string, title: string | null): Promise<void> {
+  if (!title) return;
+  if (!(await isFeatureEnabled(prisma, 'REMINDER_WEBHOOK_PUSH'))) return;
+  await pushWecomMarkdown(`### 新工单\n订单 ${orderNumber}\n${title}`, 'work-order-created');
 }
 
 /** 老名字的兼容别名（老路径 /cancel-return-leg 的调用方仍按这些名字引用）。 */
