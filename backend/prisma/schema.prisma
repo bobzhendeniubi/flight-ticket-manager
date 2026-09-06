@@ -62,6 +62,10 @@ enum StaffRole {
   TICKETING // 票务岗
   ROOM_CONTROL // 房控岗
   FINANCE // 财务岗（财务页 + 经营报表；导出不裁剪，等同通用）
+  // 运营岗 = 通用岗，与 staffRole 留空完全等价（判定见 lib/capabilities.ts 的 isGeneralOps）。
+  // 2026-09-06 才补的显式选项：此前只能靠留空表达「运营」，界面上看着像忘了设岗。
+  // 存量 null 不回填，两种写法长期并存。
+  OPERATIONS
 }
 
 model User {

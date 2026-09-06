@@ -1,0 +1,11 @@
+-- StaffRole 新增显式的「运营岗」枚举值。
+--
+-- 背景：2026-08-25 起「staffRole 为空 = 运营/通用岗」一直只是写在注释里的隐含约定，
+-- 开账号时没法在界面上明确选「运营」，只能靠留空表达，新人容易误读成「忘了设岗」。
+--
+-- **只加枚举值，不回填**：存量 staffRole=null 的账号继续留空，两者在权限判定里等价
+-- （见 lib/capabilities.ts 的 isGeneralOps）。回填会把「没设过岗」和「明确是运营岗」
+-- 这两件本来就不同的事混成一件，而且对权限没有任何影响——这里纯粹是给账号页多一个可选项。
+--
+-- IF NOT EXISTS：与 20260824130000_add_finance_staff_role 同样的幂等写法，迁移必须可重跑。
+ALTER TYPE "StaffRole" ADD VALUE IF NOT EXISTS 'OPERATIONS';
