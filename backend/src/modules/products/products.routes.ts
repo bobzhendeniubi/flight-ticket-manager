@@ -75,6 +75,11 @@ export const productRoutes: FastifyPluginAsync = async (app) => {
     return { hotels: await service.listHotels(active === '1' || active === 'true', isCostVisible(req)) };
   });
 
+  // 酒店城市清单（distinct cityCode）：产品页城市下拉候选；注册在 /hotels/:id 之前，静态段优先
+  app.get('/hotels/cities', adminPre, async () => {
+    return { cities: await service.listHotelCities() };
+  });
+
   app.get('/hotels/:id', optionalAuthPre, async (req) => {
     const { id } = req.params as { id: string };
     return { hotel: await service.getHotel(id, isCostVisible(req)) };

@@ -5868,6 +5868,9 @@ export const api = {
   // 匿名/不传 token 时响应里完全不含这个 key（0702 反馈 6·成本泄漏修复，见 backend products.routes.ts isCostVisible）。
   listHotels: (activeOnly = false, token?: string | null) =>
     apiFetch<{ hotels: Hotel[] }>(`/products/hotels${activeOnly ? '?active=1' : ''}`, { token }),
+  /** 酒店城市清单（distinct cityCode + 家数；主营地排最前）：产品页城市下拉候选，允许新输入。ADMIN/STAFF。 */
+  listHotelCities: (token: string) =>
+    apiFetch<{ cities: Array<HotelCity & { hotelCount: number }> }>('/products/hotels/cities', { token }),
   createHotel: (token: string, body: Record<string, unknown>) =>
     apiFetch<{ hotel: Hotel }>('/products/hotels', { method: 'POST', token, body }),
   updateHotel: (token: string, id: string, body: Record<string, unknown>) =>

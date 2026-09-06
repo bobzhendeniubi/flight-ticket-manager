@@ -17,7 +17,7 @@ import {
   type BundleFlightBinding,
 } from './bundle-pricing.js';
 import { bundleRouteKey, resolveBundleRoute } from './bundle-route.js';
-import { normalizeCityCode } from '../hotel-control/hotel-city.js';
+import { cityLabel, compareCityCodes, normalizeCityCode } from '../hotel-control/hotel-city.js';
 import {
   assertHotelDeleteAllowed,
   assertHotelNameAllowed,
@@ -227,6 +227,25 @@ export class ProductsService {
     if (!hotel) throw new NotFoundError('酒店不存在');
     const ratings = await this.hotelRatings([hotel]);
     return serializeHotel(hotel, ratings.get(hotel.id) ?? ZERO_RATING, includeCost);
+  }
+
+  /**
+   * 酒店城市清单（distinct cityCode + 家数）：产品页「城市代码」下拉的候选来源，
+   * 允许运营新输入不在清单里的码（新城市开站不需要改代码）。主营地排最前。
+   */
+  async listHotelCities(): Promise<Array<{ cityCode: string; cityLabel: string; hotelCount: number }>> {
+    const rows = await prisma.hotel.groupBy({
+      by: ['cityCode'],
+      _count: { _all: true },
+    });
+    const countByCity = new Map<string, number>();
+    for (const row of rows) {
+      const code = normalizeCityCode(row.cityCode);
+      countByCity.set(code, (countByCity.get(code) ?? 0) + row._count._all);
+    }
+    return [...countByCity.entries()]
+      .sort(([a], [b]) => compareCityCodes(a, b))
+      .map(([cityCode, hotelCount]) => ({ cityCode, cityLabel: cityLabel(cityCode), hotelCount }));
   }
 
   /**
