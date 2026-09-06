@@ -186,8 +186,29 @@ export function WorkOrderBell() {
 
   const items = summary?.items ?? [];
 
+  // 铃铛全覆盖（REMINDER_BELL_ALL 开时后端才会带 reminders 字段）：除三类工单外的
+  // 紧急/高优先级规则提醒总数。flag 关时 summary.reminders 是 undefined，这一段整个不渲染，
+  // 界面与开关之前完全一样。
+  const reminderCounts = summary?.reminders;
+  const reminderTotal = reminderCounts ? reminderCounts.critical + reminderCounts.high : 0;
+  const goToReminders = () => {
+    // 单选筛选器优先带更急的一档：有紧急就筛紧急，否则筛高优先级。
+    const priority = (reminderCounts?.critical ?? 0) > 0 ? 'CRITICAL' : 'HIGH';
+    navigate(`/reminders?priority=${priority}`);
+  };
+
   return (
-    <div className="relative" ref={panelRef}>
+    <div className="relative flex items-center gap-2" ref={panelRef}>
+      {reminderCounts && (
+        <button
+          type="button"
+          className="hidden items-center gap-1 whitespace-nowrap rounded-full border border-amber-200 bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-700 transition hover:bg-amber-100 sm:inline-flex"
+          title="点击查看规则自动生成的紧急/高优先级提醒"
+          onClick={goToReminders}
+        >
+          工单 {openCount} · 提醒 {reminderTotal}
+        </button>
+      )}
       <button
         type="button"
         className="relative flex h-9 w-9 items-center justify-center rounded-lg border border-slate-200 text-ink-soft transition hover:bg-slate-50 hover:text-ink"

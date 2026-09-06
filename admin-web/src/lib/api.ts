@@ -2108,6 +2108,9 @@ export interface WorkOrderSummary {
   /** 最新一条工单的时间（ISO）；无工单为 null。角标靠它判断「有没有新的」 */
   latestAt: string | null;
   items: WorkOrderSummaryItem[];
+  /** 铃铛全覆盖（REMINDER_BELL_ALL 开时才有）：除上面三类工单外，其它规则提醒里
+   * OPEN/IN_PROGRESS 且 priority 为 CRITICAL/HIGH 的计数。flag 关时该字段不存在。 */
+  reminders?: { critical: number; high: number };
 }
 
 /** listOrders 查询参数（与 backend listOrdersQuerySchema 对齐） */

@@ -15,9 +15,10 @@
  * POST   /reminders/:id/resolve   完成 / 跳过
  */
 import type { FastifyPluginAsync } from 'fastify';
-import { Prisma, ReminderStatus, UserRole } from '@prisma/client';
+import { Prisma, ReminderPriority, ReminderStatus, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
+import { isFeatureEnabled } from '../../lib/feature-flags.js';
 import {
   createReminderSchema,
   deriveWorkOrderKind,
@@ -104,6 +105,27 @@ export const reminderRoutes: FastifyPluginAsync = async (app) => {
     const sinceMs = q.since ? new Date(q.since).getTime() : null;
     const filtered = sinceMs === null ? recent : recent.filter((r) => r.createdAt.getTime() > sinceMs);
 
+    // 铃铛全覆盖（REMINDER_BELL_ALL）：除上面三类工单外，再数一遍所有 OPEN/IN_PROGRESS 且
+    // priority ∈ {CRITICAL, HIGH} 的规则提醒（ruleKey 非空 = 规则自动生成，手工创建的不算）。
+    // flag 关时完全不查、response 里也不带这个字段——与开关之前的行为逐字节一致。
+    let reminders: { critical: number; high: number } | undefined;
+    if (await isFeatureEnabled(prisma, 'REMINDER_BELL_ALL')) {
+      const otherRuleWhere: Prisma.OperationalReminderWhereInput = {
+        ruleKey: { not: null },
+        NOT: ruleKeyFilter,
+        status: { in: [ReminderStatus.OPEN, ReminderStatus.IN_PROGRESS] },
+      };
+      const [criticalCount, highCount] = await prisma.$transaction([
+        prisma.operationalReminder.count({
+          where: { ...otherRuleWhere, priority: ReminderPriority.CRITICAL },
+        }),
+        prisma.operationalReminder.count({
+          where: { ...otherRuleWhere, priority: ReminderPriority.HIGH },
+        }),
+      ]);
+      reminders = { critical: criticalCount, high: highCount };
+    }
+
     return {
       open,
       inProgress,
@@ -121,6 +143,7 @@ export const reminderRoutes: FastifyPluginAsync = async (app) => {
         dueAt: r.dueAt ? r.dueAt.toISOString() : null,
         assigneeUserId: r.claimedById,
       })),
+      ...(reminders ? { reminders } : {}),
     };
   });
 
