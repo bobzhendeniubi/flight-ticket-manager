@@ -161,3 +161,27 @@ export interface OrderSummary {
   items: OrderItem[];
   passengers: OrderPassenger[];
 }
+
+// ── 航线 / 机场 / 酒店城市（公开，动态派生，不再由前端写死目的地）──────────────
+/** GET /public/airports、/public/routes 里机场展示信息（中文名 / 城市 / 国家 / IANA 时区）。 */
+export interface PublicAirport {
+  code: string;
+  name: string;
+  city: string;
+  country: string;
+  tz: string;
+}
+
+/** GET /public/routes 返回的一条活跃航线（起降机场对 + 两端展示信息）。 */
+export interface PublicRoute {
+  originCode: string;
+  destinationCode: string;
+  origin: PublicAirport;
+  destination: PublicAirport;
+}
+
+/** GET /public/hotel-cities 返回的一个在架酒店城市（含非机场码，如会安）。 */
+export interface PublicHotelCity {
+  code: string;
+  name: string;
+}

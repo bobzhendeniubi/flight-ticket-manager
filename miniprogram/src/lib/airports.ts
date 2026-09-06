@@ -13,6 +13,11 @@
  */
 import { parseIsoUtcMs } from './datetime';
 
+/**
+ * 机场中文名兜底表：只保留少量静态兜底（首屏渲染早于任何网络请求返回，不能空白）。
+ * 运行时用 `applyPublicAirports()` 合并后端 `GET /public/airports` 的结果——
+ * 公司马上开第二条直飞航线（目的地未定），小程序不能只认写死的这几个机场。
+ */
 const AIRPORTS: Record<string, string> = {
   MFM: '澳门',
   DAD: '岘港',
@@ -29,6 +34,15 @@ export function airportLabel(code: string): string {
 }
 
 /**
+ * 用后端 `GET /public/airports` 的结果合并进机场中文名表。传入空数组按
+ * "拉取失败/暂无数据" 处理，直接跳过，保留调用前的状态（不清空兜底）。
+ */
+export function applyPublicAirports(list: Array<{ code: string; name: string }>): void {
+  if (!list || list.length === 0) return;
+  for (const a of list) AIRPORTS[a.code] = a.name;
+}
+
+/**
  * IANA 时区 → 相对 UTC 的固定偏移（分钟）。
  *
  * 覆盖全库实际出现过的 tz 值域：Asia/Macau 与 Asia/Ho_Chi_Minh（主力航线
@@ -36,9 +50,12 @@ export function airportLabel(code: string): string {
  * Asia/Hong_Kong 与 Asia/Bangkok（机场表里的扩展目的地）。
  * Asia/Singapore 一并列上，对应上面机场表里的 SIN。
  *
- * 这几个时区都**没有夏令时**（Asia/Shanghai 自 1991 年起、其余长期无 DST），
- * 所以按固定偏移平移不会算错。将来若接入有 DST 的时区，这张表就不够用了，
- * 得改成按日期查偏移。
+ * 下半张（Tokyo/Seoul/Manila/Kuala_Lumpur/Kuching/Makassar）是为「第二条航线
+ * 目的地未定」预先补的常见候选点——和 backend/src/lib/airports.ts 收录的机场
+ * 一一对应，真落地某个新时区就不必再靠 FALLBACK_OFFSET_MINUTES 回退猜。
+ *
+ * 这几个时区都**没有夏令时**，所以按固定偏移平移不会算错。将来若接入有 DST
+ * 的时区，这张表就不够用了，得改成按日期查偏移。
  */
 const TZ_OFFSET_MINUTES: Record<string, number> = {
   'Asia/Shanghai': 8 * 60,
@@ -47,6 +64,12 @@ const TZ_OFFSET_MINUTES: Record<string, number> = {
   'Asia/Singapore': 8 * 60,
   'Asia/Ho_Chi_Minh': 7 * 60,
   'Asia/Bangkok': 7 * 60,
+  'Asia/Tokyo': 9 * 60,
+  'Asia/Seoul': 9 * 60,
+  'Asia/Manila': 8 * 60,
+  'Asia/Kuala_Lumpur': 8 * 60,
+  'Asia/Kuching': 8 * 60,
+  'Asia/Makassar': 8 * 60,
 };
 
 /**

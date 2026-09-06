@@ -1,7 +1,9 @@
 /**
  * 首页 — 航班搜索 + 结果列表。
  *
- * Demo 默认：MFM → DAD，不限日期，1 人。
+ * 静态兜底：澳门 MFM → 岘港 DAD，不限日期，1 人。挂载后拉 `/public/routes`
+ * 用真实航线覆盖默认出发/到达 + 出发/到达选择器 + 标题栏（公司马上开第二条
+ * 直飞航线，目的地未定）；拉取失败/暂无数据时保留这份兜底，表现与改造前一致。
  * 用户可改出发地/目的地/日期/人数，显示动态价 + 限时优惠徽章（dynamicPrice<basePrice×0.95 时）。
  * 注意：dateRank A/B/C/D 是公司内部日期等级，绝不暴露给客户。
  */
@@ -11,11 +13,13 @@ import { View, Text, ScrollView, Picker, Input } from '@tarojs/components';
 import { api, ApiError } from '../../lib/api';
 import type { FlightSearchResult } from '../../lib/types';
 import { airportLabel, formatLocalDate, formatLocalTime, CABIN_LABEL } from '../../lib/airports';
+import { loadPublicRoutes, routeSummaryText } from '../../lib/routes';
 import { useAuth } from '../../stores/auth';
 import { useCart } from '../../stores/cart';
 import './index.scss';
 
-const AIRPORT_OPTIONS = [
+/** 出发/到达选择器的静态兜底；拉到 `/public/routes` 后整体替换为真实机场清单。 */
+const DEFAULT_AIRPORT_OPTIONS = [
   { code: 'MFM', label: '澳门' },
   { code: 'DAD', label: '岘港' },
   { code: 'HKG', label: '香港' },
@@ -26,6 +30,7 @@ export default function Index() {
   const hydrateAuth = useAuth((s) => s.hydrate);
   const hydrateCart = useCart((s) => s.hydrate);
 
+  const [airportOptions, setAirportOptions] = useState(DEFAULT_AIRPORT_OPTIONS);
   const [origin, setOrigin] = useState('MFM');
   const [destination, setDestination] = useState('DAD');
   const [date, setDate] = useState('');
@@ -38,6 +43,30 @@ export default function Index() {
     hydrateAuth();
     hydrateCart();
   }, [hydrateAuth, hydrateCart]);
+
+  // 拉活跃航线，覆盖默认出发/到达 + 选择器清单 + 标题栏；失败/为空保留上面的静态兜底。
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      const routes = await loadPublicRoutes();
+      if (cancelled) return;
+      Taro.setNavigationBarTitle({ title: routeSummaryText(routes) }).catch(() => {
+        // 忽略：部分基础库版本对该 API 支持不完整，标题栏留在 index.config.ts 的静态兜底即可
+      });
+      if (routes.length === 0) return;
+      const codeToLabel = new Map<string, string>();
+      for (const r of routes) {
+        codeToLabel.set(r.originCode, r.origin.name);
+        codeToLabel.set(r.destinationCode, r.destination.name);
+      }
+      setAirportOptions(Array.from(codeToLabel, ([code, label]) => ({ code, label })));
+      setOrigin(routes[0].originCode);
+      setDestination(routes[0].destinationCode);
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const load = useCallback(async () => {
     setLoading(true);
@@ -67,9 +96,9 @@ export default function Index() {
             <Text className='label'>出发地</Text>
             <Picker
               mode='selector'
-              range={AIRPORT_OPTIONS.map((a) => a.label)}
-              value={AIRPORT_OPTIONS.findIndex((a) => a.code === origin)}
-              onChange={(e) => setOrigin(AIRPORT_OPTIONS[Number(e.detail.value)].code)}
+              range={airportOptions.map((a) => a.label)}
+              value={airportOptions.findIndex((a) => a.code === origin)}
+              onChange={(e) => setOrigin(airportOptions[Number(e.detail.value)].code)}
             >
               <View className='input'>{airportLabel(origin)}</View>
             </Picker>
@@ -78,9 +107,9 @@ export default function Index() {
             <Text className='label'>目的地</Text>
             <Picker
               mode='selector'
-              range={AIRPORT_OPTIONS.map((a) => a.label)}
-              value={AIRPORT_OPTIONS.findIndex((a) => a.code === destination)}
-              onChange={(e) => setDestination(AIRPORT_OPTIONS[Number(e.detail.value)].code)}
+              range={airportOptions.map((a) => a.label)}
+              value={airportOptions.findIndex((a) => a.code === destination)}
+              onChange={(e) => setDestination(airportOptions[Number(e.detail.value)].code)}
             >
               <View className='input'>{airportLabel(destination)}</View>
             </Picker>
