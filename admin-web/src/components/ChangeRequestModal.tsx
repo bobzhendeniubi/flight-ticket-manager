@@ -5,7 +5,12 @@
  *   · VISA：三档单选（与 OrderDrawer 订单级签证状态口径一致，少「已签证」这一已完成态）
  *   · HOTEL：选目标住宿行 + 选换到的酒店/房型（与 HotelSwapModal 同一套酒店房型 SearchSelect）
  *   · CABIN：选目标经济舱机票行即可，无需其它字段（升舱目标恒为商务舱）
- * 提交后不会立即改动订单——运营在「改单申请」队列里确认执行，本组件只落一条 PENDING 申请。
+ * 扩展三类（SPLIT/CANCEL_LEG/VISA_EXEMPT）挂在后端 flag AGENT_CHANGE_REQUEST_EXTRA_KINDS
+ * 后面：能不能提以 GET /order-change-requests/kinds 的返回为准，前端不猜、也不拿
+ * /settings/feature-flags 当判据（那条路只对运营开放，代理读不到）。它们的表单在
+ * ChangeRequestExtraFields 里，提交前会先跑一次只读预检把不满足的条件摆出来。
+ *
+ * 提交后不会立即改动订单——我们在「改单申请」队列里确认执行，本组件只落一条 PENDING 申请。
  */
 import { useEffect, useMemo, useState } from 'react';
 import {
@@ -17,6 +22,7 @@ import {
   type OrderChangeRequest,
   type OrderChangeRequestKind,
   type OrderChangeRequestPayload,
+  type OrderChangeRequestPreview,
   type OrderItem,
   type OrderSummary,
 } from '../lib/api';
@@ -26,9 +32,20 @@ import { SearchSelect, type SearchSelectOption } from './SearchSelect';
 import {
   CHANGE_REQUEST_VISA_STATUS_OPTIONS,
   ORDER_CHANGE_REQUEST_KIND_LABEL,
+  isExtraOrderChangeKind,
   scheduleLabel,
   useChangeRequestFlightSchedules,
 } from './orderChangeRequestShared';
+import {
+  bookedFlightItems,
+  CancelLegPicker,
+  ChangeRequestPreviewCard,
+  SplitPassengerPicker,
+  VisaExemptPicker,
+} from './ChangeRequestExtraFields';
+
+/** flag 关着（或 /kinds 请求失败）时的兜底：只放基础四类，绝不猜着放行扩展项。 */
+const BASE_KINDS: OrderChangeRequestKind[] = ['FLIGHT', 'VISA', 'HOTEL', 'CABIN'];
 
 function isHotelItem(item: OrderItem): boolean {
   return item.kind === 'HOTEL' || (item.kind === 'BUNDLE' && Boolean(item.hotelRoomTypeId));
@@ -66,14 +83,42 @@ export function ChangeRequestModal({ orderId, order, onClose, onCreated }: Chang
   const hotelItems = useMemo(() => (order.items ?? []).filter(isHotelItem), [order.items]);
   const cabinItems = useMemo(() => (order.items ?? []).filter(isEconomyFlightItem), [order.items]);
 
+  const passengers = useMemo(() => order.passengers ?? [], [order.passengers]);
+  const legItems = useMemo(() => bookedFlightItems(order), [order]);
+
+  // 服务端说了算：flag 关着时这里回的就是基础四类，扩展项连出现的机会都没有。
+  const [serverKinds, setServerKinds] = useState<OrderChangeRequestKind[]>(BASE_KINDS);
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    orderChangeRequestsApi
+      .getOrderChangeRequestKinds(token)
+      .then((r) => { if (!cancelled) setServerKinds(r.kinds); })
+      // 拿不到就按「没开」处理（fail-closed）：宁可少一个入口，也别摆一个点了就 403 的按钮。
+      .catch(() => { if (!cancelled) setServerKinds(BASE_KINDS); });
+    return () => { cancelled = true; };
+  }, [token]);
+
   const availableKinds = useMemo(() => {
+    const allowed = new Set(serverKinds);
     const kinds: OrderChangeRequestKind[] = [];
     if (flightItems.length > 0) kinds.push('FLIGHT');
     kinds.push('VISA'); // 签证状态是订单级字段，恒可申请
     if (hotelItems.length > 0) kinds.push('HOTEL');
     if (cabinItems.length > 0) kinds.push('CABIN');
+    // 扩展三类：服务端放行 + 本单形状撑得住这个动作，两个条件都满足才出现。
+    if (allowed.has('SPLIT') && passengers.length > 1) kinds.push('SPLIT');
+    if (allowed.has('CANCEL_LEG') && legItems.length > 1) kinds.push('CANCEL_LEG');
+    if (allowed.has('VISA_EXEMPT') && passengers.length > 0) kinds.push('VISA_EXEMPT');
     return kinds;
-  }, [flightItems.length, hotelItems.length, cabinItems.length]);
+  }, [
+    serverKinds,
+    flightItems.length,
+    hotelItems.length,
+    cabinItems.length,
+    passengers.length,
+    legItems.length,
+  ]);
 
   const [kind, setKind] = useState<OrderChangeRequestKind>(availableKinds[0] ?? 'VISA');
 
@@ -119,6 +164,12 @@ export function ChangeRequestModal({ orderId, order, onClose, onCreated }: Chang
   // CABIN：目标行（多为 1 条，>1 条时才展示选择）
   const [cabinTargetItemId, setCabinTargetItemId] = useState(cabinItems[0]?.id ?? '');
 
+  // 扩展三类的表单状态
+  const [splitPassengerIds, setSplitPassengerIds] = useState<string[]>([]);
+  const [cancelLegSide, setCancelLegSide] = useState<'OUTBOUND' | 'RETURN'>('RETURN');
+  const [visaExemptPassengerId, setVisaExemptPassengerId] = useState(passengers[0]?.id ?? '');
+  const [visaExemptTarget, setVisaExemptTarget] = useState(true);
+
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
@@ -134,9 +185,69 @@ export function ChangeRequestModal({ orderId, order, onClose, onCreated }: Chang
     if (kind === 'HOTEL') {
       return hotelTargetItemId && toHotelRoomTypeId ? { itemId: hotelTargetItemId, toHotelRoomTypeId } : null;
     }
+    if (kind === 'SPLIT') {
+      return splitPassengerIds.length > 0 ? { passengerIds: splitPassengerIds } : null;
+    }
+    if (kind === 'CANCEL_LEG') {
+      return { leg: cancelLegSide };
+    }
+    if (kind === 'VISA_EXEMPT') {
+      return visaExemptPassengerId
+        ? { passengerId: visaExemptPassengerId, visaExempt: visaExemptTarget }
+        : null;
+    }
     // CABIN
     return cabinTargetItemId ? { itemId: cabinTargetItemId, toCabin: 'BUSINESS' } : null;
-  }, [kind, flightTargetItemId, newScheduleId, toVisaStatus, hotelTargetItemId, toHotelRoomTypeId, cabinTargetItemId]);
+  }, [
+    kind,
+    flightTargetItemId,
+    newScheduleId,
+    toVisaStatus,
+    hotelTargetItemId,
+    toHotelRoomTypeId,
+    cabinTargetItemId,
+    splitPassengerIds,
+    cancelLegSide,
+    visaExemptPassengerId,
+    visaExemptTarget,
+  ]);
+
+  // ── 扩展三类的只读预检：选什么就核对什么，不满足的条件当场摆出来 ────────────────
+  const [preview, setPreview] = useState<OrderChangeRequestPreview | null>(null);
+  const [previewLoading, setPreviewLoading] = useState(false);
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  // payload 每次渲染都是新对象，直接进依赖会死循环；按内容做键。
+  const previewKey =
+    isExtraOrderChangeKind(kind) && payload ? JSON.stringify({ kind, payload }) : '';
+  useEffect(() => {
+    if (!token || !previewKey) {
+      setPreview(null);
+      setPreviewError(null);
+      setPreviewLoading(false);
+      return;
+    }
+    const { kind: k, payload: pl } = JSON.parse(previewKey) as {
+      kind: OrderChangeRequestKind;
+      payload: OrderChangeRequestPayload;
+    };
+    let cancelled = false;
+    setPreviewLoading(true);
+    setPreviewError(null);
+    orderChangeRequestsApi
+      .previewOrderChangeRequest(token, orderId, { kind: k, payload: pl })
+      .then((r) => { if (!cancelled) setPreview(r); })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setPreview(null);
+        setPreviewError(e instanceof ApiError ? e.message : '核对失败');
+      })
+      .finally(() => { if (!cancelled) setPreviewLoading(false); });
+    return () => { cancelled = true; };
+  }, [token, orderId, previewKey]);
+
+  // 预检明确说不行 → 不让提交。预检**没跑成**（网络错）不拦：服务端提交时还会再判一次，
+  // 拦在这里只会让人对着一个点不动的按钮干瞪眼。
+  const blockedByPreview = isExtraOrderChangeKind(kind) && preview != null && !preview.eligible;
 
   const submit = async (): Promise<void> => {
     if (!token || !payload || submitting) return;
@@ -174,7 +285,7 @@ export function ChangeRequestModal({ orderId, order, onClose, onCreated }: Chang
             <button
               type="button"
               className="btn-primary disabled:cursor-not-allowed disabled:opacity-50"
-              disabled={submitting || !payload}
+              disabled={submitting || !payload || previewLoading || blockedByPreview}
               onClick={() => void submit()}
             >
               {submitting ? '提交中…' : '提交申请'}
@@ -344,6 +455,47 @@ export function ChangeRequestModal({ orderId, order, onClose, onCreated }: Chang
                   </>
                 )}
               </>
+            )}
+
+            {kind === 'SPLIT' && (
+              <SplitPassengerPicker
+                passengers={passengers}
+                selectedIds={splitPassengerIds}
+                onToggle={(id) =>
+                  setSplitPassengerIds((prev) =>
+                    prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id],
+                  )
+                }
+                preview={preview}
+                disabled={submitting}
+              />
+            )}
+
+            {kind === 'CANCEL_LEG' && (
+              <CancelLegPicker
+                value={cancelLegSide}
+                onChange={setCancelLegSide}
+                disabled={submitting}
+              />
+            )}
+
+            {kind === 'VISA_EXEMPT' && (
+              <VisaExemptPicker
+                passengers={passengers}
+                passengerId={visaExemptPassengerId}
+                onPassengerChange={setVisaExemptPassengerId}
+                visaExempt={visaExemptTarget}
+                onVisaExemptChange={setVisaExemptTarget}
+                disabled={submitting}
+              />
+            )}
+
+            {isExtraOrderChangeKind(kind) && (
+              <ChangeRequestPreviewCard
+                loading={previewLoading}
+                preview={preview}
+                error={previewError}
+              />
             )}
 
             <label className="block">

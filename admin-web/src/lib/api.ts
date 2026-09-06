@@ -7921,7 +7921,17 @@ export const bundleChangeRequestsApi = {
 // 对应 backend/src/modules/order-change-requests/*。与「套餐改档申请」并行：改的是
 // 套餐之外的航班/签证状态/酒店/舱位四类字段，运营确认后由服务端直接调用既有的纠错改航班/
 // 签证状态/换酒店/升舱端点，前端不需要重新实现这些动作本身。
-export type OrderChangeRequestKind = 'FLIGHT' | 'VISA' | 'HOTEL' | 'CABIN';
+// SPLIT / CANCEL_LEG / VISA_EXEMPT 三类挂在后端 feature flag AGENT_CHANGE_REQUEST_EXTRA_KINDS
+// 后面（默认关）。前台不猜开没开，一律以 GET /order-change-requests/kinds 的返回为准
+// （/settings/feature-flags 只对运营开放，代理读不到，不能拿那条路当判据）。
+export type OrderChangeRequestKind =
+  | 'FLIGHT'
+  | 'VISA'
+  | 'HOTEL'
+  | 'CABIN'
+  | 'SPLIT'
+  | 'CANCEL_LEG'
+  | 'VISA_EXEMPT';
 export type OrderChangeRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
 /** 改单申请里的签证目标状态：比录单/签证台的 VisaStatusInput 少一档（不收 HAS_VISA——那不是「要改成」的目标，是已完成态）。 */
 export type ChangeRequestVisaStatus = 'NEEDED' | 'E_VISA' | 'NOT_NEEDED';
@@ -7930,7 +7940,40 @@ export type OrderChangeRequestPayload =
   | { itemId: string; newScheduleId: string }
   | { toVisaStatus: ChangeRequestVisaStatus }
   | { itemId: string; toHotelRoomTypeId: string }
-  | { itemId: string; toCabin: 'BUSINESS' };
+  | { itemId: string; toCabin: 'BUSINESS' }
+  // 扩展三类。都不带金额字段：拆单按每人份额、取消单程按取消政策、改自备签按建单快照费率，
+  // 三笔钱全由服务端权威算，提交侧填不进去也不该填。
+  | { passengerIds: string[]; note?: string }
+  | { leg: 'OUTBOUND' | 'RETURN'; note?: string }
+  | { passengerId: string; visaExempt: boolean; note?: string };
+
+/**
+ * 三类扩展提交前的只读预检（POST /orders/:id/change-requests/preview）。
+ * eligible=false 时 blockers 是人话逐条，直接摆给提交方看，别自己拼文案。
+ */
+export interface OrderChangeRequestPreview {
+  kind: OrderChangeRequestKind;
+  eligible: boolean;
+  blockers: string[];
+  warnings: string[];
+  /** 取消单程：按当下取消政策算出的预估退款。是**预估不是承诺**——确认那一刻会重算。 */
+  cancelLeg: {
+    leg: 'OUTBOUND' | 'RETURN';
+    legLabel: string;
+    flightNumber: string | null;
+    /** 出发当地日 YYYY-MM-DD（按出发地时区折算，不是 UTC）。 */
+    departDate: string | null;
+    refundCny: number;
+    policyName: string | null;
+    /** true = 有需回执的提示（多为该段已出票），运营确认时要勾「我已知悉」。 */
+    requiresAcknowledgement: boolean;
+  } | null;
+  /** 拆单：随拆搬走的应收份额与每人份额明细。 */
+  split: {
+    movedShareCny: number;
+    shares: Array<{ passengerId: string; fullName: string; shareCny: number }>;
+  } | null;
+}
 
 export interface OrderChangeRequest {
   id: string;
@@ -8019,6 +8062,25 @@ export const orderChangeRequestsApi = {
       results: OrderChangeRequestBatchResultItem[];
     }>('/order-change-requests/batch', { method: 'POST', token, body }),
 
+  /**
+   * 当前身份能提哪几类申请。基础四类恒有；扩展三类只在后端 flag 开着时才回。
+   * 前台据此决定申请类型下拉里出不出「拆单 / 取消单程 / 改自备签」。
+   */
+  getOrderChangeRequestKinds: (token: string) =>
+    apiFetch<{ kinds: OrderChangeRequestKind[] }>('/order-change-requests/kinds', { token }),
+
+  /** 三类扩展提交前的只读预检：blockers + 预估退款 / 拆出份额。不落任何东西。 */
+  previewOrderChangeRequest: (
+    token: string,
+    orderId: string,
+    body: { kind: OrderChangeRequestKind; payload: OrderChangeRequestPayload },
+  ) =>
+    apiFetch<OrderChangeRequestPreview>(`/orders/${orderId}/change-requests/preview`, {
+      method: 'POST',
+      token,
+      body,
+    }),
+
   /** 查询改单申请列表（AGENT 服务端自动收窄到自家范围）。 */
   listOrderChangeRequests: (
     token: string,
@@ -8046,7 +8108,12 @@ export const orderChangeRequestsApi = {
   approveOrderChangeRequest: (
     token: string,
     id: string,
-    body?: { decisionNote?: string; designatedHotelStarMismatchReason?: string },
+    body?: {
+      decisionNote?: string;
+      designatedHotelStarMismatchReason?: string;
+      /** 取消单程专用：该段已出票等「需回执」提示的我已知悉。不勾则后端 400，绝不静默放行。 */
+      acknowledgeWarnings?: boolean;
+    },
   ) =>
     apiFetch<{ request: OrderChangeRequest; order: OrderSummary }>(
       `/order-change-requests/${id}/approve`,

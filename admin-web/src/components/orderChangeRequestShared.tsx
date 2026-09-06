@@ -13,7 +13,16 @@ export const ORDER_CHANGE_REQUEST_KIND_LABEL: Record<OrderChangeRequestKind, str
   VISA: '签证状态',
   HOTEL: '换酒店',
   CABIN: '升舱',
+  // 扩展三类：后端 flag 关着时这三个 kind 根本回不来，但 Record 是穷举的，标签仍要给全。
+  SPLIT: '拆单',
+  CANCEL_LEG: '取消单程',
+  VISA_EXEMPT: '改自备签',
 };
+
+/** 三类扩展在队列/面板里要单独提示「这一类动订单结构或动钱」，用它判。 */
+export function isExtraOrderChangeKind(kind: OrderChangeRequestKind): boolean {
+  return kind === 'SPLIT' || kind === 'CANCEL_LEG' || kind === 'VISA_EXEMPT';
+}
 
 /** 「套餐档次与酒店星级不符」放行原因的字数上限，与 SingleOrderModal 纠错换酒店同一档口径。 */
 export const STAR_MISMATCH_REASON_MAX = 200;
