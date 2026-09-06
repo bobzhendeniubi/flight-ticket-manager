@@ -19,6 +19,7 @@ import {
   CabinClass,
   CommissionStatus,
   InvoiceStatus,
+  OrderChangeKind,
   OrderChangeRequestStatus,
   OrderItemKind,
   OrderLegFlag,
@@ -15287,8 +15288,20 @@ export class OrderService {
     // 改单申请（OrderChangeRequest）同理：申请里冻的是「拆之前这张单」的那一行
     //（itemId / 航段 / 房型 / 升舱补差按当时人数算），拆完那一行可能已经搬到新单上、
     // 或者人数已经变了，再确认执行就是按已经不存在的行改单 —— 先处理完再拆。
+    //
+    // ⚠ kind=SPLIT 的申请**排除在外**，两个理由：
+    //   1. 这条闸拦的是「冻了某一行」的申请，而拆单申请冻的是乘客名单，没有 itemId；
+    //      名单还成不成立由拆单自己判（「所选乘客不属于本订单，请刷新后重试」），
+    //      不需要这条闸代劳。
+    //   2. 更要紧的是：运营从队列里确认一条拆单申请时，那条申请自己还挂在 PENDING ——
+    //      不排除就等于「拆单申请永远拆不动」，它每次都把自己算成阻拦自己的那一条。
+    //      一单一类只能有一条待处理（部分唯一索引兜底），所以这里最多只漏掉自己这一条。
     const pendingOrderChangeRequest = await db.orderChangeRequest.count({
-      where: { orderId: order.id, status: OrderChangeRequestStatus.PENDING },
+      where: {
+        orderId: order.id,
+        status: OrderChangeRequestStatus.PENDING,
+        kind: { not: OrderChangeKind.SPLIT },
+      },
     });
     if (pendingOrderChangeRequest > 0) {
       blockers.push('本单有待处理的改单申请，请先确认执行或驳回后再拆单。');
