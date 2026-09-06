@@ -1,51 +1,10 @@
-import { z } from 'zod';
-import { SettlementTier } from '@prisma/client';
-
-// 出发日期（date-only，YYYY-MM-DD）
-const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD');
-
-// 航线键：去程方向「起飞-到达」机场码（如 MFM-DAD），与 modules/products/bundle-route.ts 的派生格式一致。
-// 读写都**必填**：老客户端不传一律 400，绝不默认某条航线（第二条线一开，默认就是按错线的价）。
-export const routeKeySchema = z
-  .string()
-  .regex(/^[A-Z0-9]{3}-[A-Z0-9]{3}$/u, '航线格式应为「起飞-到达」机场码，如 MFM-DAD');
-
-// 酒店档次（对齐 Prisma SettlementTier；中文标签放前端映射，后端只认枚举值）
-const tierSchema = z.nativeEnum(SettlementTier);
-
-// 住宿晚数（1–5）——同业结算表当前只维护 1..5 晚
-const nightsSchema = z.number().int().min(1).max(5);
-
-// ── 网格查询：按航线 + 出发日期区间 + 可选晚数/档次筛选 ─────────────────
-export const listRatesQuerySchema = z.object({
-  routeKey: routeKeySchema,
-  from: dateStr,
-  to: dateStr,
-  // 查询串是字符串，coerce 成数字；缺省 = 返回区间内全部晚数
-  nights: z.coerce.number().int().min(1).max(5).optional(),
-  tier: tierSchema.optional(),
-});
-export type ListRatesQuery = z.infer<typeof listRatesQuerySchema>;
-
-// ── 批量 upsert：一次提交多格（网格整批保存 / Excel 粘贴块）────────────────
-const rateEntrySchema = z.object({
-  routeKey: routeKeySchema,
-  tier: tierSchema,
-  nights: nightsSchema,
-  departDate: dateStr,
-  // 每人结算价（CNY，整数，≥0）
-  pricePerPersonCny: z.number().int().min(0).max(10_000_000),
-  note: z.string().max(200).nullable().optional(),
-});
-export type RateEntry = z.infer<typeof rateEntrySchema>;
-
-export const upsertRatesBodySchema = z.object({
-  // 一次最多 2000 格（约 1 档 × 1 晚 × 数年，足够整月整批保存）
-  rates: z.array(rateEntrySchema).min(1).max(2000),
-});
-export type UpsertRatesBody = z.infer<typeof upsertRatesBodySchema>;
-
-export const deleteRateParamsSchema = z.object({
-  id: z.string().min(1),
-});
-export type DeleteRateParams = z.infer<typeof deleteRateParamsSchema>;
+/**
+ * 地面结算价日历（按航线 / 档次 / 晚数）的请求体与查询参数 —— 定义已搬进 @ftm/contracts（packages/contracts/src/settlement-rates.ts）。
+ *
+ * 校验规则一字未改：只把 z.nativeEnum(PrismaEnum) 换成契约包镜像的同值 schema
+ *（枚举漂移测试守着两边一致），helper 的 import 改指契约包里的同一份实现。
+ *
+ * 这里留 re-export 壳子，既有 import 路径全部继续可用；前端从 @ftm/contracts
+ * 取同一份类型，不再手抄。
+ */
+export * from '@ftm/contracts/settlement-rates';
