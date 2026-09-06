@@ -31,7 +31,8 @@ import {
 } from '../../lib/payablesView';
 import { Icon } from '../../components/Icon';
 import { SupplierDirectory } from './SupplierDirectory';
-import { SupplierInvoiceCreateModal, SupplierInvoiceDetailModal } from './SupplierInvoiceModals';
+import { SupplierInvoiceCreateModal } from './SupplierInvoiceCreateModal';
+import { SupplierInvoiceDetailModal } from './SupplierInvoiceDetailModal';
 import { SupplierReconcileDrawer } from './SupplierReconcileDrawer';
 
 const STATUS_OPTIONS: SupplierInvoiceStatus[] = [
