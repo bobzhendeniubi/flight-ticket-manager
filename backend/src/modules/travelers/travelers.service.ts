@@ -67,7 +67,14 @@ export class TravelersService {
     };
   }
 
-  async getById(id: string) {
+  /**
+   * agentTreeIds 传入 → AGENT 视角：历史行程只圈自己代理树里的订单。
+   *
+   * 匹配键是「姓名 + 生日」，同名同生日在护照口径下并不唯一（档案合并功能本身就是为这个存在），
+   * 不圈定就会把别家代理下同一个真人的订单号 / 状态 / 总价 / PNR / 票号整段吐给代理。
+   * tripCount / lastTripAt 一并按圈定后的结果算，避免「列表一个数、详情另一个数」自相矛盾。
+   */
+  async getById(id: string, agentTreeIds?: string[]) {
     const r = await prisma.savedPassenger.findUnique({
       where: { id },
       include: { user: { select: { id: true, displayName: true, email: true, phone: true } } },
@@ -76,7 +83,11 @@ export class TravelersService {
 
     // 匹配 Passenger 表找历史订单
     const passengers = await prisma.passenger.findMany({
-      where: { fullName: r.fullName, dateOfBirth: r.dateOfBirth },
+      where: {
+        fullName: r.fullName,
+        dateOfBirth: r.dateOfBirth,
+        ...(agentTreeIds ? { order: { agentId: { in: agentTreeIds } } } : {}),
+      },
       include: { order: { select: { id: true, orderNumber: true, status: true, total: true, createdAt: true } } },
       orderBy: { createdAt: 'desc' },
     });

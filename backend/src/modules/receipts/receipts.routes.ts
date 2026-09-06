@@ -79,7 +79,8 @@ export const receiptRoutes: FastifyPluginAsync = async (app) => {
   // ── 撤销认款（认领的逆操作，原子对称）───────────────
   app.post(
     '/:id/allocations/:allocationId/reverse',
-    { preHandler: [app.authenticate, requireAdminOrStaff] },
+    // 口径：撤销已入账的认款限财务岗。
+    { preHandler: [app.authenticate, app.requireFinanceAccess] },
     async (req) => {
       const { id, allocationId } = req.params as { id: string; allocationId: string };
       return service.reverseAllocation(id, allocationId, {
@@ -101,7 +102,8 @@ export const receiptRoutes: FastifyPluginAsync = async (app) => {
     return { items: await service.listUnverifiedClaims() };
   });
 
-  app.post('/:id/verify-claim', { preHandler: [app.authenticate, requireAdminOrStaff] }, async (req) => {
+  // 口径：核实（把钱定性为「已核实」）限财务岗；运营认款（allocate）保留 STAFF。
+  app.post('/:id/verify-claim', { preHandler: [app.authenticate, app.requireFinanceAccess] }, async (req) => {
     const { id } = req.params as { id: string };
     const body = verifyClaimReceiptSchema.parse(req.body ?? {});
     return service.verifyClaimReceipt(id, { externalTxnId: body.externalTxnId ?? null }, { userId: req.user.sub, role: req.user.role });
@@ -134,7 +136,7 @@ export const receiptRoutes: FastifyPluginAsync = async (app) => {
   // ── 二维码流水入池（externalTxnId 唯一索引兜底去重）───
   app.post(
     '/statement/import',
-    { preHandler: [app.authenticate, requireAdminOrStaff] },
+    { preHandler: [app.authenticate, app.requireFinanceAccess] /* 口径：流水导入限财务岗 */ },
     async (req, reply) => {
       const body = importStatementSchema.parse(req.body);
       const result = await service.importStatement(body, {

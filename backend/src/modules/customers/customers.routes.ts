@@ -50,9 +50,16 @@ export const customerRoutes: FastifyPluginAsync = async (app) => {
     return { customer };
   });
 
-  app.patch('/:id', pre, async (req) => {
+  app.patch('/:id', pre, async (req, reply) => {
     const { id } = req.params as { id: string };
     const body = updateCustomerBodySchema.parse(req.body);
+
+    // 归属代理只归运营改：代理自己改 primaryAgentId 等于能把下级代理的客源收归自己名下、
+    // 挂到无关第三方，或传 null 把客户脱钩成直客（后续佣金流向随之改变）。
+    // 口径同 PATCH /orders/:id/agent —— 改归属一律 403，不看目标 id 在不在自己树里。
+    if (req.user.role === UserRole.AGENT && body.primaryAgentId !== undefined) {
+      return reply.status(403).send({ error: '仅运营/管理员可更改客户归属代理' });
+    }
 
     // AGENT 只能改自己树里的客户
     const agentTreeIds = await resolveAgentScope(req);

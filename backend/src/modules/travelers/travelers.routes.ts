@@ -215,7 +215,8 @@ export const travelerRoutes: FastifyPluginAsync = async (app) => {
     const { id } = req.params as { id: string };
     const agentTreeIds = await resolveAgentScope(req);
     await assertTravelerInScope(id, agentTreeIds);
-    const traveler = await service.getById(id);
+    // 圈定同样往下传：档案本身在自己树里，不代表它的历史行程都是自己树里的单（同名同生日会撞出别家的单）
+    const traveler = await service.getById(id, agentTreeIds);
     return { traveler };
   });
 

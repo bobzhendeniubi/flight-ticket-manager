@@ -24,6 +24,21 @@ import {
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { appPublicUrl } from '../../config/env.js';
 
+// ── 集中读取本文件用到的 process.env（C-28 汇报）─────────────────────────
+// PAYMENT_MODE / SANDBOX_WEBHOOK_SECRET 尚未纳入 config/env.ts 的 EnvSchema（原因与建议见
+// payment-adapters.ts 顶部同名注释：env.ts 的 `env` 单例是进程启动时算好、不再变的，
+// 而这条 sandbox 专用调试口需要按请求时机动态读取，才能被测试/运维按需切换，故仍按调用时
+// 读取 process.env，只是把散落在函数体里的几处读取收拢到此处）。
+function getNodeEnv(): string | undefined {
+  return process.env.NODE_ENV;
+}
+function getPaymentModeEnv(): string {
+  return process.env.PAYMENT_MODE ?? 'sandbox';
+}
+function getSandboxWebhookSecret(): string | undefined {
+  return process.env.SANDBOX_WEBHOOK_SECRET;
+}
+
 const PROVIDER_TO_METHOD: Record<string, PaymentMethod> = {
   wechat: PaymentMethod.WECHAT_PAY,
   alipay: PaymentMethod.ALIPAY,
@@ -117,7 +132,8 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
   const reverseManualPaymentSchema = z.object({
     reason: z.string().trim().min(4).max(200),
   });
-  app.post('/:paymentId/reverse', { preHandler: [app.authenticate] }, async (req, reply) => {
+  // 口径：撤销认款限财务岗（认款 manual-confirm / batch-confirm 保留运营）。
+  app.post('/:paymentId/reverse', { preHandler: [app.authenticate, app.requireFinanceAccess] }, async (req, reply) => {
     if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
       return reply.status(403).send({ error: '仅运营/管理员可撤销收款' });
     }
@@ -132,7 +148,8 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
 
   // ── 已成功收款转移到另一订单 ADMIN/STAFF ──
   // POST /payments/:paymentId/transfer
-  app.post('/:paymentId/transfer', { preHandler: [app.authenticate] }, async (req, reply) => {
+  // 口径：跨单转移限财务岗（认款 manual-confirm / batch-confirm 保留运营）。
+  app.post('/:paymentId/transfer', { preHandler: [app.authenticate, app.requireFinanceAccess] }, async (req, reply) => {
     if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
       return reply.status(403).send({ error: '仅运营/管理员可转移收款' });
     }
@@ -147,7 +164,8 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
 
   // ── 财务核实一笔人工录入的收款（到账双状态第二段）ADMIN/STAFF ──
   // POST /payments/:paymentId/verify
-  app.post('/:paymentId/verify', { preHandler: [app.authenticate] }, async (req, reply) => {
+  // 口径：核实限财务岗（认款 manual-confirm / batch-confirm 保留运营）。
+  app.post('/:paymentId/verify', { preHandler: [app.authenticate, app.requireFinanceAccess] }, async (req, reply) => {
     if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
       return reply.status(403).send({ error: '仅财务/运营/管理员可核实到账' });
     }
@@ -330,10 +348,10 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
     async (req, reply) => {
       // 生产环境（NODE_ENV=production）一律 404 — 防止部署时 PAYMENT_MODE 忘改
-      if (process.env.NODE_ENV === 'production') {
+      if (getNodeEnv() === 'production') {
         throw new NotFoundError();
       }
-      if ((process.env.PAYMENT_MODE ?? 'sandbox') === 'live') {
+      if (getPaymentModeEnv() === 'live') {
         throw new NotFoundError();
       }
       const body = sandboxConfirmBodySchema.parse(req.body);
@@ -346,7 +364,9 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
         return reply.send({ ok: false, message: 'marked FAILED' });
       }
 
-      const fakeHeaders = { 'x-sandbox-secret': process.env.SANDBOX_WEBHOOK_SECRET ?? 'sandbox-test-secret' };
+      // C-28：不再兜底硬编码 'sandbox-test-secret'——沙箱调试口也必须配置密钥才能用，
+      // 未配置时让下面 verifyCallback 按 fail-closed 抛错，而不是悄悄用一个公开字符串通过。
+      const fakeHeaders = { 'x-sandbox-secret': getSandboxWebhookSecret() };
       const p = await prisma.payment.findUnique({ where: { id: body.paymentId } });
       if (!p) throw new NotFoundError('支付不存在');
 
