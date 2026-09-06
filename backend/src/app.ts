@@ -12,6 +12,7 @@ import { authRoutes } from './modules/auth/auth.routes.js';
 import { userRoutes } from './modules/users/users.routes.js';
 import { flightRoutes } from './modules/flights/flights.routes.js';
 import { agentRoutes } from './modules/agents/agents.routes.js';
+import { agentStatementRoutes } from './modules/agent-statements/agent-statements.routes.js';
 import { orderRoutes } from './modules/orders/orders.routes.js';
 import { orderCostItemRoutes } from './modules/orders/order-cost-items.routes.js';
 import { seatLockRoutes } from './modules/seat-locks/seat-locks.routes.js';
@@ -107,6 +108,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(userRoutes, { prefix: '/users' });
   await app.register(flightRoutes, { prefix: '/flights' });
   await app.register(agentRoutes, { prefix: '/agents' });
+  await app.register(agentStatementRoutes, { prefix: '/agents' });
   await app.register(orderRoutes, { prefix: '/orders' });
   await app.register(orderReviewRoutes, { prefix: '/orders' });
   await app.register(orderSettlementRequestRoutes, { prefix: '/orders' });
