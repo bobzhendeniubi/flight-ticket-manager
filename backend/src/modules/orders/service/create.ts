@@ -132,6 +132,7 @@ import {
   syncOrderHasReturnLeg,
   syncOrderLegFlag,
 } from './shared.js';
+import { persistPassengerShares } from './passenger-shares.js';
 import { createVisaTaskAtCreation } from './visa-sync.js';
 import type { OrderService } from '../orders.service.js';
 
@@ -494,6 +495,8 @@ export async function createHoldConversionOrderWithinTx(
   // 普通创单在事务内的签证任务内核：转正订单也必须从创建时进入签证台，不能等到
   // 事务提交后补写，避免订单已可见但履约台漏任务。
   await createVisaTaskAtCreation(tx, order.id);
+  // 按人份额落库（R1）：转正单一建好就有完整的一套份额，不等读侧回填。
+  await persistPassengerShares(tx, order.id);
   return { order, duplicateConflicts: conflictList };
 }
 
@@ -1127,6 +1130,9 @@ export async function createOrder(svc: OrderService, body: CreateOrderBody, requ
         it.passengerId = pid; // 同步内存副本，创建响应即带归属，无需重查
       }
     }
+
+    // 按人份额落库（R1）：建单事务末尾落一遍，订单一出生就带完整的每人份额（每人结算价差额行已回填归属）。
+    await persistPassengerShares(tx, created.id);
 
     // 座位已在订单 create 之前原子扣减；此处无需再动库存
     return created;

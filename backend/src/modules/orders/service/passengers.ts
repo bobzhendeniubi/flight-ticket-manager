@@ -105,6 +105,7 @@ import {
 import { syncVisaTasksForOrder } from './visa-sync.js';
 import type { OrderService } from '../orders.service.js';
 import { runOrderMutation } from './order-mutation.js';
+import { persistPassengerShares } from './passenger-shares.js';
 
 // ── 类型 ────────────────────────────────────────────────────────────────
 
@@ -2989,6 +2990,8 @@ export async function setPassengerVisaExempt(
       }
     }
 
+    // 按人份额落库（R1）：本事务改了应收 / 行金额，提交前把每人份额重算落库（写点见 service/passenger-shares.ts）。
+    await persistPassengerShares(tx, orderId);
     return {
       noop: false as const,
       orderNumber: order.orderNumber,

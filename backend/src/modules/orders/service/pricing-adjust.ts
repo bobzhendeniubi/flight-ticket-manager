@@ -33,6 +33,7 @@ import {
   sumAccruedCommissionCny,
   zhStatus,
 } from './shared.js';
+import { persistPassengerShares } from './passenger-shares.js';
 import type { OrderService } from '../orders.service.js';
 
 /**
@@ -200,6 +201,8 @@ export async function updateItemSettlementPrice(
     // 佣金提示与资金提示并列返回：两件事互不覆盖（可能同时成立）。
     warning = [warning, commissionWarning].filter(Boolean).join(' ') || null;
 
+    // 按人份额落库（R1）：本事务改了应收 / 行金额，提交前把每人份额重算落库（写点见 service/passenger-shares.ts）。
+    await persistPassengerShares(tx, orderId);
     return {
       orderNumber: order.orderNumber,
       beforeUnitPrice,
@@ -613,6 +616,9 @@ export async function _addPriceAdjustmentWithinTx(
       adjustments: log,
     },
   });
+
+  // 按人份额落库（R1）：调价行进了 total（可能挂人），每人份额随之重算落库。批量调价逐单复用本内核 → 逐单落。
+  await persistPassengerShares(tx, orderId);
 
   return {
     orderNumber: order.orderNumber,

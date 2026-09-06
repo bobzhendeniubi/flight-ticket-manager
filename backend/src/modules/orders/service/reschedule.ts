@@ -76,6 +76,7 @@ import {
 import type { SplitOrderResult } from './split.js';
 import type { OrderService } from '../orders.service.js';
 import { runOrderOrchestration, type OrderOrchestrationCtx } from './order-mutation.js';
+import { persistPassengerShares } from './passenger-shares.js';
 
 export type RescheduleCommittedContext = {
   orderItemId: string;
@@ -921,6 +922,9 @@ export async function rescheduleOrderItem(
       statusChanged = true;
     }
 
+    // 按人份额落库（R1）：改期差价进了 adjustmentCny，提交前把每人份额重算落库（写点见 service/passenger-shares.ts）。
+    await persistPassengerShares(tx, orderId);
+
     // 把审计需要的「原/新」明细返回到 tx 外（出发时间另查）。
     // 直接 return 而非写模块级单例，避免并发改期互相覆盖。
     return {
@@ -1245,6 +1249,8 @@ export async function upgradeOrderItemCabin(
     });
 
     // 订单状态刻意不动：升舱不是改签，推 CHANGED 会污染改签流程与状态统计。
+    // 按人份额落库（R1）：本事务改了应收 / 行金额，提交前把每人份额重算落库（写点见 service/passenger-shares.ts）。
+    await persistPassengerShares(tx, orderId);
     return {
       orderNumber: order.orderNumber,
       orderItemId: item.id,

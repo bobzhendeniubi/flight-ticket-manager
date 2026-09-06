@@ -98,6 +98,7 @@ import {
   bundleHotelNightsOf,
   computeSwapBundleCostSnapshot,
 } from './item-cost-snapshot.js';
+import { persistPassengerShares } from './passenger-shares.js';
 import { createFulfillmentTasks, syncVisaTasksForOrder } from './visa-sync.js';
 import type { OrderService } from '../orders.service.js';
 
@@ -621,6 +622,8 @@ export async function swapItemHotel(
       }
     }
 
+    // 按人份额落库（R1）：换酒店差价进了 adjustmentCny，每人份额随之重算。
+    await persistPassengerShares(tx, orderId);
     return { orderNumber: order.orderNumber, untrackedNights };
   });
 
@@ -1232,6 +1235,8 @@ export async function rescheduleItemHotel(
       });
     }
 
+    // 按人份额落库（R1）：酒店改期差价进了 adjustmentCny，每人份额随之重算。
+    await persistPassengerShares(tx, orderId);
     return { orderNumber: order.orderNumber, untrackedNights };
   });
 
@@ -1467,6 +1472,8 @@ export async function changeOrderAgent(
       accruedCommissions.reduce((s, c) => s + Number(c.amount.toString()), 0),
     );
 
+    // 按人份额落库（R1）：本事务改了应收 / 行金额，提交前把每人份额重算落库（写点见 service/passenger-shares.ts）。
+    await persistPassengerShares(tx, orderId);
     return {
       revoked,
       revokedTotalCny: round2(revoked.reduce((s, r) => s + r.amountCny, 0)),
@@ -1803,6 +1810,8 @@ export async function addGroundItem(
       },
     });
 
+    // 按人份额落库（R1）：本事务改了应收 / 行金额，提交前把每人份额重算落库（写点见 service/passenger-shares.ts）。
+    await persistPassengerShares(tx, orderId);
     return {
       orderNumber: order.orderNumber,
       itemId: created.id,
@@ -2055,6 +2064,8 @@ export async function addRoomSupplement(
       },
     });
 
+    // 按人份额落库（R1）：本事务改了应收 / 行金额，提交前把每人份额重算落库（写点见 service/passenger-shares.ts）。
+    await persistPassengerShares(tx, orderId);
     return {
       orderNumber: order.orderNumber,
       itemId: created.id,
@@ -2518,6 +2529,8 @@ export async function changeOrderBundle(
       warnings.push('新档次含签证，已自动补建一条「待处理」签证任务');
     }
 
+    // 按人份额落库（R1）：本事务改了应收 / 行金额，提交前把每人份额重算落库（写点见 service/passenger-shares.ts）。
+    await persistPassengerShares(tx, orderId);
     return {
       orderNumber: locked.orderNumber,
       beforeTotal: locked.total.toString(),
