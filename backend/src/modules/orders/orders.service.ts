@@ -12225,21 +12225,34 @@ export class OrderService {
         const projected = roster.map((p) =>
           p.id === passengerId ? { visaExempt: true } : { visaExempt: p.visaExempt },
         );
-        if (isVisaContradiction({ visaStatus: order.visaStatus, passengers: projected })) {
-          throw new BadRequestError(VISA_CONTRADICTION_MESSAGE);
-        }
+        assertNoVisaContradiction({ visaStatus: order.visaStatus, passengers: projected });
       }
 
-      // ── 3. false→true 门槛：送签已在办理（材料准备/已送签）→ 人为确认（签证岗 0830 口径）──
+      // ── 3. 乘客级转移走状态机：DECLARE_SELF_ARRANGED / REVOKE_SELF_ARRANGED ──────────
+      // false→true 门槛：送签已在办理（材料准备/已送签）→ 人为确认（签证岗 0830 口径）。
       // 不硬拦也不自动退：批文成本已发生，退不退/退多少由操作人当场定（默认 0）。缺确认参数时
-      // 抛带 [NEED_CONFIRM_SUBMITTED] 标记的冲突错，前端据此弹退费确认框后重试。
+      // 转移表拒绝（NEED_CONFIRM_SUBMITTED），抛带 [NEED_CONFIRM_SUBMITTED] 标记的冲突错，
+      // 前端据此弹退费确认框后重试。文案只在状态机里定义一份。
       const submittedInProcess =
         input.visaExempt && passenger.visaSubmissionStatus !== VisaSubmissionStatus.PENDING;
-      if (submittedInProcess && !input.submittedOverride) {
-        throw new ConflictError(
-          '[NEED_CONFIRM_SUBMITTED] 该乘客送签已在办理（材料准备/已送签），批文成本已发生。' +
-            '请确认退费金额（0 = 不退）与原因后重试。',
-        );
+      const transition = transitionPassengerVisa(
+        {
+          orderVisaStatus: order.visaStatus,
+          visaExempt: passenger.visaExempt,
+          visaSubmissionStatus: passenger.visaSubmissionStatus,
+          allPassengersExempt: false,
+        },
+        input.visaExempt
+          ? { type: 'DECLARE_SELF_ARRANGED', submittedConfirmed: Boolean(input.submittedOverride) }
+          : { type: 'REVOKE_SELF_ARRANGED' },
+      );
+      if (!transition.ok) {
+        throw new ConflictError(transition.reason);
+      }
+      // 幂等短路已在上方判过（现值 ≠ 目标值才走到这里），转移表必然给出两列写入。
+      const passengerWrite = transition.write.passenger;
+      if (!passengerWrite || passengerWrite.visaExempt === undefined) {
+        throw new Error('签证状态机未给出自备签写入（不该发生）');
       }
 
       // ── 4. 历史冲突闸（fail-closed）：换人通道时代已给该乘客补过自备签减免的钱 ──
@@ -12306,15 +12319,12 @@ export class OrderService {
         );
       }
 
-      // ── 6. 写乘客标记；两个方向都把送签进度置回待处理 ─────────────────────
+      // ── 6. 写乘客标记（唯一写点）；转移表两个方向都把送签进度置回待处理 ─────────
       // true→false：防旧 CONFIRMED 复活污染任务派生（人已换办签方式，进度从头来）；
       // false→true：门槛已保证本就是 PENDING，写入幂等。
-      await tx.passenger.update({
-        where: { id: passengerId },
-        data: {
-          visaExempt: input.visaExempt,
-          visaSubmissionStatus: VisaSubmissionStatus.PENDING,
-        },
+      await writePassengerVisaExempt(tx, passengerId, {
+        visaExempt: passengerWrite.visaExempt,
+        visaSubmissionStatus: passengerWrite.visaSubmissionStatus,
       });
 
       // ── 5b. 行重算（唯一钱行）：以翻转后的乘客现势重算自备签人数，其余维度沿用原快照 ──
@@ -12449,19 +12459,11 @@ export class OrderService {
       });
       let warning: string | null = null;
       if (nonExempt.length > 0) {
-        // 重派生范围：仅 PENDING/IN_PROGRESS（CONFIRMED/FAILED/CANCELLED 不动——已出结果
-        // 或已终态的任务不被系统悄悄改写）。
-        const derived = deriveVisaTaskStatus(nonExempt.map((p) => p.visaSubmissionStatus));
-        await tx.fulfillmentTask.updateMany({
-          where: {
-            orderItem: { orderId },
-            type: FulfillmentType.VISA_APPLICATION,
-            status: { in: [FulfillmentStatus.PENDING, FulfillmentStatus.IN_PROGRESS] },
-          },
-          data: {
-            status: derived,
-            completedAt: derived === FulfillmentStatus.CONFIRMED ? new Date() : null,
-          },
+        // 任务级状态唯一重派生点。重派生范围：仅 PENDING/IN_PROGRESS（CONFIRMED/FAILED/CANCELLED
+        // 不动——已出结果或已终态的任务不被系统悄悄改写）。
+        await rederiveVisaTaskStatus(tx, orderId, {
+          touch: [FulfillmentStatus.PENDING, FulfillmentStatus.IN_PROGRESS],
+          statuses: nonExempt.map((p) => p.visaSubmissionStatus),
         });
       } else {
         // ── 8. 全员自备签但仍有非 PENDING 的签证任务（sync 按设计只撤 PENDING）→ 警示 ──
