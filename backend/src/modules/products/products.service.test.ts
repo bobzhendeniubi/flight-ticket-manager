@@ -1638,6 +1638,7 @@ describe('ProductsService · 随机档占位酒店防呆', () => {
   const ordinaryHotel = {
     id: 'hotel-1',
     name: '海景酒店',
+    cityCode: 'DAD',
     starRating: 4,
     intlFiveStar: false,
     randomTierPlaceholder: null,
@@ -1645,6 +1646,7 @@ describe('ProductsService · 随机档占位酒店防呆', () => {
   const placeholderHotel = {
     id: 'hotel-placeholder',
     name: '随机三星',
+    cityCode: 'DAD',
     starRating: 3,
     intlFiveStar: false,
     randomTierPlaceholder: 3,
@@ -1701,6 +1703,55 @@ describe('ProductsService · 随机档占位酒店防呆', () => {
       name: '随机四星备用池',
     });
     expect(mockPrisma.hotel.update).toHaveBeenCalled();
+  });
+
+  // ── 随机档按城市圈定：占位酒店的城市 = 它承载的套餐的城市，必填 ─────────────
+  it('占位酒店把 cityCode 改成空白 → 拒绝，且不写库', async () => {
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(placeholderHotel);
+    const service = new ProductsService();
+
+    await expect(
+      service.updateHotel('hotel-placeholder', { cityCode: '   ' } as never),
+    ).rejects.toThrow('随机档占位酒店必须填写城市代码');
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('存量占位酒店城市为空时，改其它字段也先拦下（逼着补城市）；补上城市后放行并归一写库', async () => {
+    const legacyBlank = { ...placeholderHotel, cityCode: '' };
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(legacyBlank);
+    const service = new ProductsService();
+    await expect(service.updateHotel('hotel-placeholder', { name: '随机三星（岘港）' })).rejects.toThrow(
+      '随机档占位酒店必须填写城市代码',
+    );
+
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(legacyBlank);
+    mockPrisma.hotel.update.mockResolvedValueOnce({});
+    mockPrisma.hotelRoomType.findMany.mockResolvedValueOnce([]);
+    mockPrisma.hotel.findUniqueOrThrow.mockResolvedValueOnce({
+      ...placeholderHotel,
+      cityCode: 'HOA',
+      roomTypes: [],
+    });
+    await expect(
+      service.updateHotel('hotel-placeholder', { name: '随机三星（会安）', cityCode: 'hoa' }),
+    ).resolves.toMatchObject({ cityCode: 'HOA' });
+    // 归一后落库：'hoa' → 'HOA'（聚合按等值匹配，大小写不同不能算两个城市）
+    expect(mockPrisma.hotel.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ cityCode: 'HOA' }) }),
+    );
+  });
+
+  it('普通酒店 cityCode 归一后落库（去空白 + 大写）', async () => {
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(ordinaryHotel);
+    mockPrisma.hotel.update.mockResolvedValueOnce({});
+    mockPrisma.hotelRoomType.findMany.mockResolvedValueOnce([]);
+    mockPrisma.hotel.findUniqueOrThrow.mockResolvedValueOnce({ ...ordinaryHotel, cityCode: 'BAN', roomTypes: [] });
+    const service = new ProductsService();
+
+    await service.updateHotel('hotel-1', { cityCode: ' ban ' });
+    expect(mockPrisma.hotel.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ cityCode: 'BAN' }) }),
+    );
   });
 
   it('占位酒店传 isActive=false → 拒绝；普通酒店下架 → 放行', async () => {

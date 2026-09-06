@@ -50,6 +50,7 @@ import {
   assertRandomTierFit,
   assertRandomTierFitWithinTx,
   lockRandomTierBlockPeriodsWithinTx,
+  listRandomTierCities,
   createBlockPeriod,
   updateBlockPeriod,
   deleteBlockPeriod,
@@ -57,6 +58,11 @@ import {
   getRecentRoomChanges,
   itemRoomCount,
 } from './hotel-control.service.js';
+
+/** 随机档作用域 = 城市 × 档次；存量默认城市 DAD 的三星 / 四星。*/
+const DAD3 = { tier: 3, cityCode: 'DAD' } as const;
+const DAD4 = { tier: 4, cityCode: 'DAD' } as const;
+const HOA3 = { tier: 3, cityCode: 'HOA' } as const;
 
 /** 权威分房表 fixture：groupSizes[i] = 第 i 个房间盒子的乘客数（形状同 orders 模块分房保存）。*/
 const roomAssignmentOf = (groupSizes: number[]) => ({
@@ -2019,9 +2025,17 @@ describe('星级随机档：销控板聚合组', () => {
     );
     const board = await getBoard({ from: dayStr(0), to: dayStr(1) }, client);
     const tier = board.hotels.find((h) => h.randomStarTier === 3)!;
-    expect(tier).toMatchObject({ hotelId: 'random-star-3', hotelName: '三星随机', unitPrice: null });
+    // fixture 没给 cityCode → 归存量默认城市 DAD：分组键带城市，名字带城市
+    expect(tier).toMatchObject({
+      hotelId: 'random-star-3-DAD',
+      hotelName: '岘港三星随机',
+      cityCode: 'DAD',
+      cityLabel: '岘港',
+      unitPrice: null,
+    });
+    expect(board.cities).toEqual([{ cityCode: 'DAD', cityLabel: '岘港' }]);
     // 聚合组排在最前，房控一眼先看「随机还剩多少」
-    expect(board.hotels[0].hotelId).toBe('random-star-3');
+    expect(board.hotels[0].hotelId).toBe('random-star-3-DAD');
     expect(tier.rows.block).toEqual([9, 9]);
     expect(tier.rows.used).toEqual([2, 0]);
     expect(tier.rows.remaining).toEqual([7, 9]);
@@ -2120,10 +2134,10 @@ describe('星级随机档：销控板聚合组', () => {
       passenger: { count: vi.fn() },
     } as unknown as PrismaClient;
     const alerts = await getAlerts(2, client);
-    const tierOversold = alerts.oversold.find((o) => o.hotelName === '三星随机')!;
+    const tierOversold = alerts.oversold.find((o) => o.hotelName === '岘港三星随机')!;
     expect(tierOversold).toMatchObject({ date: dayStr(0), block: 1, used: 2, deficit: 1 });
-    // 次日：明月还剩 1 间富余 → 只报明月，不报「三星随机」
-    expect(alerts.surplusSoon.some((s) => s.hotelName === '三星随机')).toBe(false);
+    // 次日：明月还剩 1 间富余 → 只报明月，不报「岘港三星随机」
+    expect(alerts.surplusSoon.some((s) => s.hotelName === '岘港三星随机')).toBe(false);
     expect(alerts.surplusSoon.some((s) => s.hotelName === '明月酒店')).toBe(true);
   });
 
@@ -2222,7 +2236,7 @@ describe('星级随机档：销控板聚合组', () => {
     );
     const board = await getBoard({ from: dayStr(0), to: dayStr(0) }, client);
     const tier5 = board.hotels.find((h) => h.randomStarTier === 5)!;
-    expect(tier5.hotelName).toBe('五星随机');
+    expect(tier5.hotelName).toBe('岘港五星随机');
     expect(tier5.rows.block).toEqual([7]); // 只有棕榈的 7 间：国际五星与占位项都不算
     expect(tier5.rows.used).toEqual([1]);
     expect(tier5.rows.remaining).toEqual([6]);
@@ -2265,14 +2279,30 @@ describe('星级随机档：未落位随机单的占房下钻', () => {
         ]),
       },
     } as unknown as PrismaClient;
-    const occupants = await getOccupyingOrders({ randomStarTier: 4 }, dayStr(0), client);
+    const occupants = await getOccupyingOrders(
+      { randomStarTier: 4, cityCode: 'DAD' },
+      dayStr(0),
+      client,
+    );
     expect(occupants).toHaveLength(1);
     expect(occupants[0].orderNumber).toBe('CT250001');
     const where = (client.orderItem.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
-    // 两类未落位行都要下钻得到：正规随机单（无房型 + 档次命中）＋ 挂在占位酒店房型上的伪落位行
+    // 存量默认城市：两类未落位行都要下钻得到 —— 正规随机单（无房型 + 档次命中）
+    // ＋ 挂在该城市占位酒店房型上的伪落位行
     expect(where.OR).toEqual([
       { hotelRoomTypeId: null, randomStarTier: 4 },
-      { hotelRoomType: { hotel: { randomTierPlaceholder: 4 } } },
+      { hotelRoomType: { hotel: { randomTierPlaceholder: 4, cityCode: 'DAD' } } },
+    ]);
+  });
+
+  it('非存量默认城市的随机池下钻只认该城市占位酒店上的伪落位行（单独随机行没有城市，不归它）', async () => {
+    const client = {
+      orderItem: { findMany: vi.fn().mockResolvedValue([]) },
+    } as unknown as PrismaClient;
+    await getOccupyingOrders({ randomStarTier: 3, cityCode: 'hoa' }, dayStr(0), client);
+    const where = (client.orderItem.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
+    expect(where.OR).toEqual([
+      { hotelRoomType: { hotel: { randomTierPlaceholder: 3, cityCode: 'HOA' } } },
     ]);
   });
 });
@@ -2311,23 +2341,78 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
       hotelItems: [stay(), stay()],
       pendingItems: [stay()],
     });
-    const agg = await getRandomTierAggregate(3, [dayStr(0)], {}, client);
-    expect(agg).toMatchObject({ hasBlock: true, block: [7], hotelUsed: [2], pendingUsed: [1] });
+    const agg = await getRandomTierAggregate(DAD3, [dayStr(0)], {}, client);
+    expect(agg).toMatchObject({
+      hasBlock: true,
+      hotelCount: 2,
+      block: [7],
+      hotelUsed: [2],
+      pendingUsed: [1],
+    });
     expect(agg.remaining).toEqual([4]);
-    // 档次筛选口径：starRating 命中，且排除国际五星与占位酒店（两者都不是该档的真房源）
+    // 档次筛选口径：城市命中、starRating 命中，且排除国际五星与占位酒店（两者都不是该档的真房源）
     const hotelWhere = (client.hotel.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
     expect(hotelWhere).toMatchObject({
       starRating: 3,
       intlFiveStar: false,
       randomTierPlaceholder: null,
+      cityCode: 'DAD',
     });
-    // 未落位占用同吃两类行：正规随机单 ＋ 挂在该档占位酒店房型上的伪落位行
+    // 存量默认城市的未落位占用同吃两类行：正规随机单 ＋ 挂在该城市该档占位酒店房型上的伪落位行
     const pendingWhere = (client.orderItem.findMany as ReturnType<typeof vi.fn>).mock.calls[1][0]
       .where;
     expect(pendingWhere.OR).toEqual([
       { hotelRoomTypeId: null, randomStarTier: 3 },
-      { hotelRoomType: { hotel: { randomTierPlaceholder: 3 } } },
+      { hotelRoomType: { hotel: { randomTierPlaceholder: 3, cityCode: 'DAD' } } },
     ]);
+  });
+
+  it('两城同星级互不串：会安三星只看会安的真酒店与会安占位酒店上的占用，不吃岘港的房、也不算单独随机行', async () => {
+    const client = aggClient({
+      hotelIds: ['hoa1'],
+      periods: [{ dateFrom: day(0), dateTo: day(1), rooms: 2 }],
+      pendingItems: [stay()],
+    });
+    const agg = await getRandomTierAggregate({ tier: 3, cityCode: ' hoa ' }, [dayStr(0)], {}, client);
+    expect(agg).toMatchObject({ hotelCount: 1, block: [2], pendingUsed: [1], remaining: [1] });
+    // 城市码归一后进 where：'  hoa ' → 'HOA'
+    const hotelWhere = (client.hotel.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0].where;
+    expect(hotelWhere).toMatchObject({ starRating: 3, cityCode: 'HOA' });
+    // 非存量默认城市：单独随机行（无房型 + randomStarTier）不进这个池子，只认会安占位酒店上的伪落位行
+    const pendingWhere = (client.orderItem.findMany as ReturnType<typeof vi.fn>).mock.calls[1][0]
+      .where;
+    expect(pendingWhere.OR).toEqual([
+      { hotelRoomType: { hotel: { randomTierPlaceholder: 3, cityCode: 'HOA' } } },
+    ]);
+  });
+
+  it('A 城缺口不吃 B 城库存：岘港三星售罄时会安三星照样放行，岘港照样拒', async () => {
+    // 同一份 fake 库：hotel.findMany 按 where.cityCode 回不同酒店；周期只挂在会安酒店名下
+    const hotelFindMany = vi.fn(async (args: { where: { cityCode: string } }) =>
+      args.where.cityCode === 'HOA' ? [{ id: 'hoa1' }] : [{ id: 'dad1' }],
+    );
+    const periodFindMany = vi.fn(async (args: { where: { hotelId: { in: string[] } } }) =>
+      args.where.hotelId.in.includes('hoa1')
+        ? [{ dateFrom: day(0), dateTo: day(1), rooms: 5 }]
+        : [{ dateFrom: day(0), dateTo: day(1), rooms: 1 }],
+    );
+    // 岘港已有 1 间未落位占用（存量默认城市才吃单独随机行），会安没有占用
+    const itemFindMany = vi.fn(async (args: { where: { OR?: unknown[] } }) => {
+      if (!args.where.OR) return [];
+      return args.where.OR.length === 2 ? [stay()] : [];
+    });
+    const client = {
+      hotel: { findMany: hotelFindMany },
+      hotelBlockPeriod: { findMany: periodFindMany },
+      orderItem: { findMany: itemFindMany },
+    } as unknown as PrismaClient;
+
+    // 岘港三星：包房 1、已占 1 → 余 0，再来 1 间 → 拒
+    await expect(assertRandomTierFit(DAD3, [dayStr(0)], 1, {}, client)).rejects.toThrow(
+      /岘港三星随机余量不足/,
+    );
+    // 会安三星：包房 5、无占用 → 同一晚放行，岘港的缺口没有吃掉会安的房
+    await expect(assertRandomTierFit(HOA3, [dayStr(0)], 1, {}, client)).resolves.toEqual([]);
   });
 
   it('余量够 → 放行；不够 → 拦下并点名档次与该晚余量', async () => {
@@ -2336,14 +2421,14 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
       periods: [{ dateFrom: day(0), dateTo: day(1), rooms: 3 }],
       pendingItems: [stay()],
     });
-    await expect(assertRandomTierFit(4, [dayStr(0)], 2, {}, ok)).resolves.toEqual([]);
+    await expect(assertRandomTierFit(DAD4, [dayStr(0)], 2, {}, ok)).resolves.toEqual([]);
 
     const tight = aggClient({
       hotelIds: ['h1'],
       periods: [{ dateFrom: day(0), dateTo: day(1), rooms: 3 }],
       pendingItems: [stay()],
     });
-    await expect(assertRandomTierFit(4, [dayStr(0)], 3, {}, tight)).rejects.toThrow(
+    await expect(assertRandomTierFit(DAD4, [dayStr(0)], 3, {}, tight)).rejects.toThrow(
       /四星随机余量不足.*余量 2 间.*本次需 3 间/,
     );
   });
@@ -2356,7 +2441,7 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
     });
     await expect(
       assertRandomTierFit(
-        3,
+        DAD3,
         [dayStr(0)],
         99,
         { maxOversellRooms: Number.POSITIVE_INFINITY },
@@ -2369,24 +2454,24 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
       periods: [{ dateFrom: day(0), dateTo: day(1), rooms: 3 }],
       pendingItems: [stay()],
     });
-    await expect(assertRandomTierFit(3, [dayStr(0)], 99, {}, external)).rejects.toThrow(
+    await expect(assertRandomTierFit(DAD3, [dayStr(0)], 99, {}, external)).rejects.toThrow(
       /三星随机余量不足/,
     );
   });
 
   it('该档次一家酒店都没切房 → 未管控，不拦截（未配包房 ≠ 售罄）', async () => {
     const noHotels = aggClient({ hotelIds: [], periods: [] });
-    await expect(assertRandomTierFit(3, [dayStr(0)], 99, {}, noHotels)).resolves.toEqual([]);
+    await expect(assertRandomTierFit(DAD3, [dayStr(0)], 99, {}, noHotels)).resolves.toEqual([]);
 
     const noPeriods = aggClient({ hotelIds: ['h1'], periods: [] });
-    await expect(assertRandomTierFit(3, [dayStr(0)], 99, {}, noPeriods)).resolves.toEqual([]);
+    await expect(assertRandomTierFit(DAD3, [dayStr(0)], 99, {}, noPeriods)).resolves.toEqual([]);
   });
 
   it('内部需求池：整段未切房或单晚 block=0 也返回缺口；对外仍不拦截', async () => {
     const noPeriods = aggClient({ hotelIds: ['h1'], periods: [] });
     await expect(
       assertRandomTierFit(
-        3,
+        DAD3,
         [dayStr(0)],
         99,
         { maxOversellRooms: Number.POSITIVE_INFINITY },
@@ -2399,7 +2484,7 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
       periods: [{ dateFrom: day(1), dateTo: day(2), rooms: 3 }],
     });
     const partialViolations = await assertRandomTierFit(
-      3,
+      DAD3,
       [dayStr(0), dayStr(1)],
       4,
       { maxOversellRooms: Number.POSITIVE_INFINITY },
@@ -2414,7 +2499,7 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
       periods: [{ dateFrom: day(1), dateTo: day(2), rooms: 3 }],
     });
     await expect(
-      assertRandomTierFit(3, [dayStr(0), dayStr(1)], 4, {}, externalPartialBlock),
+      assertRandomTierFit(DAD3, [dayStr(0), dayStr(1)], 4, {}, externalPartialBlock),
     ).rejects.toThrow(/三星随机余量不足/);
   });
 
@@ -2424,7 +2509,7 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
       periods: [{ dateFrom: day(0), dateTo: day(1), rooms: 2 }],
       pendingItems: [stay({ roomsBilled: 1.5 })],
     });
-    await expect(assertRandomTierFit(3, [dayStr(0)], 0.5, {}, client)).resolves.toEqual([]);
+    await expect(assertRandomTierFit(DAD3, [dayStr(0)], 0.5, {}, client)).resolves.toEqual([]);
   });
 
   it('未切任何包房时仍保留随机需求占用，供清单显示未切房缺口', async () => {
@@ -2433,7 +2518,7 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
       periods: [],
       pendingItems: [stay({ roomsBilled: 1.5 })],
     });
-    await expect(getRandomTierAggregate(3, [dayStr(0)], {}, client)).resolves.toMatchObject({
+    await expect(getRandomTierAggregate(DAD3, [dayStr(0)], {}, client)).resolves.toMatchObject({
       hasBlock: false,
       block: [0],
       hotelUsed: [0],
@@ -2450,7 +2535,7 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
       periods: [{ dateFrom: day(0), dateTo: day(1), rooms: 3 }],
       pendingItems: [stay()],
     });
-    const tolerated = await assertRandomTierFit(4, [dayStr(0)], 4, { maxOversellRooms: 3 }, within);
+    const tolerated = await assertRandomTierFit(DAD4, [dayStr(0)], 4, { maxOversellRooms: 3 }, within);
     expect(tolerated).toHaveLength(1);
     expect(tolerated[0]).toMatchObject({ date: dayStr(0), remaining: 2, rooms: 4, shortfall: 2 });
 
@@ -2461,7 +2546,7 @@ describe('星级随机档：下单闸 assertRandomTierFit / getRandomTierAggrega
       pendingItems: [stay()],
     });
     await expect(
-      assertRandomTierFit(4, [dayStr(0)], 6, { maxOversellRooms: 3 }, beyond),
+      assertRandomTierFit(DAD4, [dayStr(0)], 6, { maxOversellRooms: 3 }, beyond),
     ).rejects.toThrow(/超售容忍上限 3 间/);
   });
 });
@@ -2496,7 +2581,7 @@ describe('assertRandomTierFitWithinTx（随机档事务内加锁版下单闸）'
       hotelIds: ['h1', 'h2'],
       periods: [{ dateFrom: day(0), dateTo: day(1), rooms: 5 }],
     });
-    await assertRandomTierFitWithinTx(tx as unknown as TxArg, 3, [dayStr(0)], 1);
+    await assertRandomTierFitWithinTx(tx as unknown as TxArg, DAD3, [dayStr(0)], 1);
 
     expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
     const sql = calls[0].sql.replace(/\s+/g, ' ');
@@ -2504,12 +2589,13 @@ describe('assertRandomTierFitWithinTx（随机档事务内加锁版下单闸）'
     expect(sql).toContain('FOR UPDATE');
     // 按 id 排序加锁：两个事务锁同一批行的顺序一致，不会互相死锁
     expect(sql).toContain('ORDER BY id');
-    // 锁的是「该档次全部真酒店」的周期行，不是单一酒店——先查了这批酒店 id
+    // 锁的是「该城市该档次全部真酒店」的周期行，不是单一酒店——先按城市 × 档次查了这批酒店 id
     expect(tx.hotel.findMany).toHaveBeenCalled();
     expect(tx.hotel.findMany.mock.calls[0][0].where).toMatchObject({
       starRating: 3,
       intlFiveStar: false,
       randomTierPlaceholder: null,
+      cityCode: 'DAD',
     });
     // 锁必须发生在读占房之前 —— 先读后锁等于没锁
     const lockOrder = tx.$queryRaw.mock.invocationCallOrder[0];
@@ -2524,7 +2610,7 @@ describe('assertRandomTierFitWithinTx（随机档事务内加锁版下单闸）'
       pendingItems: [{ hotelCheckIn: day(0), hotelCheckOut: day(1) }],
     });
     await expect(
-      assertRandomTierFitWithinTx(tx as unknown as TxArg, 4, [dayStr(0)], 3),
+      assertRandomTierFitWithinTx(tx as unknown as TxArg, DAD4, [dayStr(0)], 3),
     ).rejects.toThrow(/四星随机余量不足/);
     // 拒绝路径上锁一样要加过（否则并发下「都装得下」的判定仍是脏读）
     expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
@@ -2533,7 +2619,7 @@ describe('assertRandomTierFitWithinTx（随机档事务内加锁版下单闸）'
   it('该档次一家真酒店都没有 → 无行可锁，安静返回（未纳入管控）', async () => {
     const { tx } = fakeTierTx({ hotelIds: [], periods: [] });
     await expect(
-      lockRandomTierBlockPeriodsWithinTx(tx as unknown as TxArg, 3, [dayStr(0)]),
+      lockRandomTierBlockPeriodsWithinTx(tx as unknown as TxArg, DAD3, [dayStr(0)]),
     ).resolves.toBeUndefined();
     expect(tx.$queryRaw).not.toHaveBeenCalled();
   });
@@ -2543,7 +2629,7 @@ describe('assertRandomTierFitWithinTx（随机档事务内加锁版下单闸）'
     await expect(
       assertRandomTierFitWithinTx(
         internal.tx as unknown as TxArg,
-        3,
+        DAD3,
         [dayStr(0)],
         99,
         { maxOversellRooms: Number.POSITIVE_INFINITY },
@@ -2552,13 +2638,13 @@ describe('assertRandomTierFitWithinTx（随机档事务内加锁版下单闸）'
 
     const external = fakeTierTx({ hotelIds: ['h1'], periods: [] });
     await expect(
-      assertRandomTierFitWithinTx(external.tx as unknown as TxArg, 3, [dayStr(0)], 99),
+      assertRandomTierFitWithinTx(external.tx as unknown as TxArg, DAD3, [dayStr(0)], 99),
     ).resolves.toEqual([]);
   });
 
   it('空 nightDates（无入住区间）→ 连酒店都不查，安静返回', async () => {
     const { tx } = fakeTierTx({ hotelIds: ['h1'], periods: [] });
-    await expect(lockRandomTierBlockPeriodsWithinTx(tx as unknown as TxArg, 3, [])).resolves.toBeUndefined();
+    await expect(lockRandomTierBlockPeriodsWithinTx(tx as unknown as TxArg, DAD3, [])).resolves.toBeUndefined();
     expect(tx.hotel.findMany).not.toHaveBeenCalled();
     expect(tx.$queryRaw).not.toHaveBeenCalled();
   });
@@ -2902,5 +2988,103 @@ describe('itemRoomCount · 显式 0 间房是真值，不是「没填」', () =>
   it('纯数字字符串仍按数字读（老行里存过 "0" / "2"）', () => {
     expect(itemRoomCount({ roomsBilled: null, metadata: { roomsNeeded: '0' } })).toBe(0);
     expect(itemRoomCount({ roomsBilled: null, metadata: { rooms: '2' } })).toBe(2);
+  });
+});
+
+// ── 随机档按城市圈定：销控板分城市成组、城市清单 ─────────────────────────────
+describe('星级随机档：城市维度（销控板 / 城市清单）', () => {
+  function cityBoardClient(periods: unknown[], items: unknown[]): PrismaClient {
+    return {
+      hotelBlockPeriod: { findMany: vi.fn().mockResolvedValue(periods) },
+      orderItem: { findMany: vi.fn().mockResolvedValue(items) },
+    } as unknown as PrismaClient;
+  }
+  const period = (hotelId: string, name: string, cityCode: string, rooms: number) => ({
+    hotelId,
+    randomStarTier: null,
+    dateFrom: day(0),
+    dateTo: day(1),
+    rooms,
+    unitPrice: null,
+    hotel: { name, starRating: 3, intlFiveStar: false, randomTierPlaceholder: null, cityCode },
+  });
+  /** 挂在某城市三星占位酒店房型上的伪落位行。*/
+  const placeholderItem = (cityCode: string) => ({
+    hotelCheckIn: day(0),
+    hotelCheckOut: day(1),
+    randomStarTier: null,
+    hotelRoomType: {
+      hotelId: `ph3-${cityCode}`,
+      hotel: { name: '随机三星', starRating: 3, intlFiveStar: false, randomTierPlaceholder: 3, cityCode },
+    },
+  });
+  /** 单独随机行（无房型）：没有城市，归存量默认城市。*/
+  const legacyPending = () => ({
+    hotelCheckIn: day(0),
+    hotelCheckOut: day(1),
+    hotelRoomType: null,
+    randomStarTier: 3,
+  });
+
+  it('两城同星级各成一个聚合组：包房只算本城市酒店，未落位只算本城市占位酒店上的行；单独随机行归存量默认城市', async () => {
+    const client = cityBoardClient(
+      [period('dad1', '明月酒店', 'DAD', 5), period('hoa1', '古城酒店', 'hoa', 2)],
+      [placeholderItem('HOA'), legacyPending()],
+    );
+    const board = await getBoard({ from: dayStr(0), to: dayStr(0) }, client);
+
+    // 主营地 DAD 排最前；城市内聚合组先于酒店；城市码已归一（'hoa' → 'HOA'）
+    expect(board.cities).toEqual([
+      { cityCode: 'DAD', cityLabel: '岘港' },
+      { cityCode: 'HOA', cityLabel: '会安' },
+    ]);
+    expect(board.hotels.map((h) => h.hotelId)).toEqual([
+      'random-star-3-DAD',
+      'dad1',
+      'random-star-3-HOA',
+      'hoa1',
+    ]);
+    const dad = board.hotels.find((h) => h.hotelId === 'random-star-3-DAD')!;
+    const hoa = board.hotels.find((h) => h.hotelId === 'random-star-3-HOA')!;
+    expect(dad).toMatchObject({ hotelName: '岘港三星随机', cityCode: 'DAD', cityLabel: '岘港' });
+    expect(hoa).toMatchObject({ hotelName: '会安三星随机', cityCode: 'HOA', cityLabel: '会安' });
+    // 岘港：包房 5，未落位 = 单独随机行 1 → 余 4；会安：包房 2，未落位 = 会安占位行 1 → 余 1
+    expect(dad.rows.block).toEqual([5]);
+    expect(dad.rows.used).toEqual([1]);
+    expect(dad.rows.remaining).toEqual([4]);
+    expect(hoa.rows.block).toEqual([2]);
+    expect(hoa.rows.used).toEqual([1]);
+    expect(hoa.rows.remaining).toEqual([1]);
+  });
+
+  it('cityCode 筛选：只出该城市的酒店组与聚合组，别的城市一行都不留', async () => {
+    const client = cityBoardClient(
+      [period('dad1', '明月酒店', 'DAD', 5), period('hoa1', '古城酒店', 'HOA', 2)],
+      [placeholderItem('HOA'), legacyPending()],
+    );
+    const board = await getBoard({ from: dayStr(0), to: dayStr(0), cityCode: 'hoa' }, client);
+    expect(board.cities).toEqual([{ cityCode: 'HOA', cityLabel: '会安' }]);
+    expect(board.hotels.map((h) => h.hotelId)).toEqual(['random-star-3-HOA', 'hoa1']);
+    // 岘港的单独随机行不会被算进会安
+    expect(board.hotels[0].rows.used).toEqual([1]);
+  });
+
+  it('未知城市码原样展示（不抛错、不吞成 undefined）', async () => {
+    const client = cityBoardClient([period('x1', '新城酒店', 'xyz', 1)], []);
+    const board = await getBoard({ from: dayStr(0), to: dayStr(0) }, client);
+    expect(board.cities).toEqual([{ cityCode: 'XYZ', cityLabel: 'XYZ' }]);
+    expect(board.hotels[0]).toMatchObject({ hotelName: 'XYZ三星随机', cityCode: 'XYZ' });
+  });
+
+  it('listRandomTierCities：酒店 distinct 城市（归一）∪ 存量默认城市，主营地排最前', async () => {
+    const client = {
+      hotel: {
+        findMany: vi.fn().mockResolvedValue([{ cityCode: 'hoa ' }, { cityCode: 'BAN' }, { cityCode: '' }]),
+      },
+    } as unknown as PrismaClient;
+    await expect(listRandomTierCities(client)).resolves.toEqual(['DAD', 'BAN', 'HOA']);
+    expect((client.hotel.findMany as ReturnType<typeof vi.fn>).mock.calls[0][0]).toMatchObject({
+      distinct: ['cityCode'],
+    });
   });
 });

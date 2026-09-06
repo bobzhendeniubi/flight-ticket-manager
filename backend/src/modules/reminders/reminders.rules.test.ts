@@ -313,6 +313,8 @@ describe('VISA_MISSING', () => {
 
 describe('RANDOM_TIER_SHORTFALL 随机档缺口提醒规则', () => {
   const tierRow = (overrides: Partial<RandomTierShortfallReport['days'][number]['tiers'][number]> = {}) => ({
+    cityCode: 'DAD',
+    cityLabel: '岘港',
     tier: 3 as const,
     label: '三星随机',
     hasBlock: true,
@@ -324,11 +326,13 @@ describe('RANDOM_TIER_SHORTFALL 随机档缺口提醒规则', () => {
     roomsToRequest: 0,
     ...overrides,
   });
+  const cities = [{ cityCode: 'DAD', cityLabel: '岘港' }];
 
   it('shortfall > 0 按档次×日期生成，正文列出该档未来 7 天全部缺口；shortfall = 0 不生成', () => {
     const report: RandomTierShortfallReport = {
       from: TODAY,
       to: addDaysUtc(TODAY, 6),
+      cities,
       days: [
         { date: TODAY, tiers: [tierRow({ shortfall: 1, roomsToRequest: 1 })] },
         {
@@ -341,12 +345,14 @@ describe('RANDOM_TIER_SHORTFALL 随机档缺口提醒规则', () => {
     const candidates = buildRandomTierShortfallCandidates(report, TODAY);
 
     expect(candidates).toHaveLength(2);
+    // 存量默认城市沿用老的幂等键格式（上线那天不会把已有岘港提醒再生成一遍）；标题带城市
     expect(candidates[0]).toMatchObject({
       rule: 'RANDOM_TIER_SHORTFALL',
       ruleKey: `RANDOMSHORTFALL:3:${TODAY}`,
-      title: '三星随机 7/9 缺 1 间，需向地接加房',
+      title: '岘港三星随机 7/9 缺 1 间，需向地接加房',
       priority: ReminderPriority.HIGH,
     });
+    expect(candidates[0].body).toContain('未来7天岘港三星随机缺口');
     expect(candidates[0].body).toContain('7/9 缺 1 间（需加 1 间）');
     expect(candidates[0].body).toContain('7/10 缺 0.5 间（需加 1 间）');
     expect(
@@ -355,6 +361,44 @@ describe('RANDOM_TIER_SHORTFALL 随机档缺口提醒规则', () => {
         TODAY,
       ),
     ).toEqual([]);
+  });
+
+  it('按城市分条：两城同档同日各一条，键与正文互不串；非存量默认城市的键带城市后缀', () => {
+    const report: RandomTierShortfallReport = {
+      from: TODAY,
+      to: addDaysUtc(TODAY, 6),
+      cities: [...cities, { cityCode: 'HOA', cityLabel: '会安' }],
+      days: [
+        {
+          date: TODAY,
+          tiers: [
+            tierRow({ shortfall: 1, roomsToRequest: 1 }),
+            tierRow({ cityCode: 'HOA', cityLabel: '会安', shortfall: 2, roomsToRequest: 2 }),
+          ],
+        },
+        {
+          // 次日只有会安还缺：岘港的正文不该把它列进去
+          date: addDaysUtc(TODAY, 1),
+          tiers: [tierRow({ cityCode: 'HOA', cityLabel: '会安', shortfall: 0.5, roomsToRequest: 1 })],
+        },
+      ],
+    };
+
+    const candidates = buildRandomTierShortfallCandidates(report, TODAY);
+
+    expect(candidates.map((c) => c.ruleKey)).toEqual([
+      `RANDOMSHORTFALL:3:${TODAY}`,
+      `RANDOMSHORTFALL:3:${TODAY}:HOA`,
+      `RANDOMSHORTFALL:3:${addDaysUtc(TODAY, 1)}:HOA`,
+    ]);
+    const dad = candidates[0];
+    const hoa = candidates[1];
+    expect(dad.title).toBe('岘港三星随机 7/9 缺 1 间，需向地接加房');
+    expect(hoa.title).toBe('会安三星随机 7/9 缺 2 间，需向地接加房');
+    // 岘港正文只有岘港自己的缺口；会安正文列出会安 7 天内的两天
+    expect(dad.body).toContain('未来7天岘港三星随机缺口：7/9 缺 1 间（需加 1 间）。');
+    expect(dad.body).not.toContain('7/10');
+    expect(hoa.body).toContain('7/9 缺 2 间（需加 2 间）；7/10 缺 0.5 间（需加 1 间）');
   });
 });
 

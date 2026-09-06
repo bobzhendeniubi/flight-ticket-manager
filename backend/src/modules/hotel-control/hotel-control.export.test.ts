@@ -5,6 +5,9 @@
  * 表头/冻结视图/矩阵形状，重点覆盖「未配包房」（block=0 且 used>0）渲染为文本标记而非裸负数、
  * 真超卖（block>0 且 remaining<0）仍是数字这两种口径。getBoard 本身的口径已在
  * hotel-control.service.test.ts 覆盖，这里只测导出层的映射/样式。
+ *
+ * 行序：第 1 行表头；矩阵按城市分块，每块前一行城市标题（存量默认城市 DAD → 「岘港（DAD）」），
+ * 所以单城市场景下酒店 4 行从第 3 行起（fixture 没给 cityCode → 归存量默认城市）。
  */
 import { describe, it, expect, vi } from 'vitest';
 
@@ -34,7 +37,7 @@ async function loadWorkbook(buf: Buffer): Promise<ExcelJS.Workbook> {
 }
 
 describe('buildHotelControlBoardWorkbook', () => {
-  it('矩阵形状：每家酒店 4 行（包房/用房/物理房间/余量）× 日期列；表头 + 冻结视图', async () => {
+  it('矩阵形状：城市标题行 + 每家酒店 4 行（包房/用房/物理房间/余量）× 日期列；表头 + 冻结视图', async () => {
     const rt = { hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } } };
     const client = boardClient(
       [
@@ -64,15 +67,20 @@ describe('buildHotelControlBoardWorkbook', () => {
     // 冻结表头行 + 前 3 列（镜像页面 sticky 列）—— 读回后 ExcelJS 会补上其余默认视图属性，只断言关心的三项
     expect(ws!.views?.[0]).toMatchObject({ state: 'frozen', xSplit: 3, ySplit: 1 });
 
-    // 4 行：包房/用房/物理房间/余量（数据行从第 2 行起）
-    expect(ws!.getRow(2).getCell(3).value).toBe('包房');
-    expect(ws!.getRow(3).getCell(3).value).toBe('用房(床位)');
-    expect(ws!.getRow(4).getCell(3).value).toBe('物理房间');
-    expect(ws!.getRow(5).getCell(3).value).toBe('余量');
+    // 第 2 行 = 城市标题（fixture 没给 cityCode → 存量默认城市 DAD），跨全部列合并、带底色
+    expect(ws!.getCell(2, 1).value).toBe('岘港（DAD）');
+    expect(ws!.getRow(2).font).toMatchObject({ bold: true });
+    expect(ws!.getCell(2, 1).fill).toMatchObject({ fgColor: { argb: 'FFC7D2FE' } });
+
+    // 4 行：包房/用房/物理房间/余量（数据行从第 3 行起）
+    expect(ws!.getRow(3).getCell(3).value).toBe('包房');
+    expect(ws!.getRow(4).getCell(3).value).toBe('用房(床位)');
+    expect(ws!.getRow(5).getCell(3).value).toBe('物理房间');
+    expect(ws!.getRow(6).getCell(3).value).toBe('余量');
 
     // 酒店名 / 单价列跨 4 行合并
-    expect(ws!.getCell(2, 1).value).toBe('美溪海滩酒店');
-    expect(ws!.getCell(2, 2).value).toBe(150);
+    expect(ws!.getCell(3, 1).value).toBe('美溪海滩酒店');
+    expect(ws!.getCell(3, 2).value).toBe(150);
   });
 
   it('「未配包房」渲染文本标记（非裸负数）；真超卖仍是数字并高亮', async () => {
@@ -91,8 +99,8 @@ describe('buildHotelControlBoardWorkbook', () => {
     const wb = await loadWorkbook(buf);
     const ws = wb.getWorksheet('销控矩阵')!;
 
-    // 余量行 = 第 5 行；日期列从第 4 列起（D0=col4, D1=col5, D2=col6）
-    const remainingRow = ws.getRow(5);
+    // 余量行 = 第 6 行（城市标题占了第 2 行）；日期列从第 4 列起（D0=col4, D1=col5, D2=col6）
+    const remainingRow = ws.getRow(6);
     expect(remainingRow.getCell(4).value).toBe('未配包房'); // D0: block=0, used=1
     expect(remainingRow.getCell(4).fill).toMatchObject({ fgColor: { argb: 'FFFDE68A' } });
 
@@ -146,42 +154,44 @@ describe('buildHotelControlBoardWorkbook', () => {
     const wb = await loadWorkbook(buf);
     const ws = wb.getWorksheet('销控矩阵')!;
 
-    // 海景酒店（第一家，索引0）：4 行在 2-5，无 banding（默认留白）
-    expect(ws.getRow(2).getCell(3).value).toBe('包房');
-    expect(ws.getRow(2).getCell(4).fill).toBeUndefined();
-    expect(ws.getCell(2, 1).value).toBe('海景酒店');
+    // 第 2 行城市标题；海景酒店（第一家，索引0）：4 行在 3-6，无 banding（默认留白）
+    expect(ws.getCell(2, 1).value).toBe('岘港（DAD）');
+    expect(ws.getRow(3).getCell(3).value).toBe('包房');
+    expect(ws.getRow(3).getCell(4).fill).toBeUndefined();
+    expect(ws.getCell(3, 1).value).toBe('海景酒店');
 
-    // 山景酒店（第二家，索引1）：4 行在 6-9，非高亮单元格带浅灰 banding
-    expect(ws.getRow(6).getCell(3).value).toBe('包房');
-    expect(ws.getRow(6).getCell(4).fill).toMatchObject({ fgColor: { argb: 'FFF3F4F6' } });
-    // 酒店名合并单元格（列1，行6=startRow）同样带 banding
-    expect(ws.getCell(6, 1).fill).toMatchObject({ fgColor: { argb: 'FFF3F4F6' } });
-    // 山景酒店余量行（第 9 行）：未配包房高亮覆盖在 banding 之上
-    expect(ws.getRow(9).getCell(4).value).toBe('未配包房');
-    expect(ws.getRow(9).getCell(4).fill).toMatchObject({ fgColor: { argb: 'FFFDE68A' } });
+    // 山景酒店（第二家，索引1）：4 行在 7-10，非高亮单元格带浅灰 banding
+    expect(ws.getRow(7).getCell(3).value).toBe('包房');
+    expect(ws.getRow(7).getCell(4).fill).toMatchObject({ fgColor: { argb: 'FFF3F4F6' } });
+    // 酒店名合并单元格（列1，行7=startRow）同样带 banding
+    expect(ws.getCell(7, 1).fill).toMatchObject({ fgColor: { argb: 'FFF3F4F6' } });
+    // 山景酒店余量行（第 10 行）：未配包房高亮覆盖在 banding 之上
+    expect(ws.getRow(10).getCell(4).value).toBe('未配包房');
+    expect(ws.getRow(10).getCell(4).fill).toMatchObject({ fgColor: { argb: 'FFFDE68A' } });
 
-    // 3 行跨酒店汇总紧跟在最后一家酒店之后（第 10-12 行）
-    expect(ws.getRow(10).getCell(3).value).toBe('当日包房累计');
-    expect(ws.getRow(10).getCell(4).value).toBe(3); // 海景 block=3 + 山景 block=0
-    expect(ws.getRow(10).font).toMatchObject({ bold: true });
+    // 3 行跨酒店汇总紧跟在最后一家酒店之后（第 11-13 行）
+    expect(ws.getRow(11).getCell(3).value).toBe('当日包房累计');
+    expect(ws.getRow(11).getCell(4).value).toBe(3); // 海景 block=3 + 山景 block=0
+    expect(ws.getRow(11).font).toMatchObject({ bold: true });
 
-    expect(ws.getRow(11).getCell(3).value).toBe('当日用房累计');
+    expect(ws.getRow(12).getCell(3).value).toBe('当日用房累计');
     // 人工核对：海景 used=1 + 山景 used=2 = 3（与两家酒店「用房(床位)」行手工相加一致）
-    expect(ws.getRow(11).getCell(4).value).toBe(3);
+    expect(ws.getRow(12).getCell(4).value).toBe(3);
 
-    expect(ws.getRow(12).getCell(3).value).toBe('当日余房累计');
+    expect(ws.getRow(13).getCell(3).value).toBe('当日余房累计');
     // 海景 remaining=2（正常）+ 山景「未配包房」按 0 计入（不计其误导性 -2）= 2
-    expect(ws.getRow(12).getCell(4).value).toBe(2);
+    expect(ws.getRow(13).getCell(4).value).toBe(2);
 
-    // 图例：标题 + 未配包房说明 + 超卖说明 + 三条口径说明（床位口径 / 随机档合计 / 余房累计）
-    expect(ws.getRow(14).getCell(1).value).toBe('图例');
-    expect(String(ws.getRow(15).getCell(2).value)).toContain('未配包房 = 该晚有客占房');
-    expect(ws.getRow(15).getCell(1).fill).toMatchObject({ fgColor: { argb: 'FFFDE68A' } });
-    expect(String(ws.getRow(16).getCell(2).value)).toContain('超卖 = 该晚包房周期已设置');
-    expect(String(ws.getRow(17).getCell(2).value)).toContain('「余量」为床位口径');
-    expect(String(ws.getRow(18).getCell(2).value)).toContain('同星级酒店的合计');
-    expect(String(ws.getRow(19).getCell(2).value)).toContain('当日余房累计');
-    expect(String(ws.getRow(19).getCell(2).value)).toContain('按 0 计入');
+    // 图例：标题 + 未配包房说明 + 超卖说明 + 四条口径说明（城市分块 / 床位口径 / 随机档合计 / 余房累计）
+    expect(ws.getRow(15).getCell(1).value).toBe('图例');
+    expect(String(ws.getRow(16).getCell(2).value)).toContain('未配包房 = 该晚有客占房');
+    expect(ws.getRow(16).getCell(1).fill).toMatchObject({ fgColor: { argb: 'FFFDE68A' } });
+    expect(String(ws.getRow(17).getCell(2).value)).toContain('超卖 = 该晚包房周期已设置');
+    expect(String(ws.getRow(18).getCell(2).value)).toContain('矩阵按城市分块');
+    expect(String(ws.getRow(19).getCell(2).value)).toContain('「余量」为床位口径');
+    expect(String(ws.getRow(20).getCell(2).value)).toContain('同星级酒店的合计');
+    expect(String(ws.getRow(21).getCell(2).value)).toContain('当日余房累计');
+    expect(String(ws.getRow(21).getCell(2).value)).toContain('按 0 计入');
   });
 
   it('余量行按床位口径（异性拼房：床位余 9，物理房间行仍如实报 2 间）', async () => {
@@ -201,15 +211,15 @@ describe('buildHotelControlBoardWorkbook', () => {
     const wb = await loadWorkbook(buf);
     const ws = wb.getWorksheet('销控矩阵')!;
 
-    // 行序：包房(2)/用房床位(3)/物理房间(4)/余量(5)；日期列 col4=D0
-    expect(ws.getRow(3).getCell(4).value).toBe(1); // 用房(床位) = 1.0
-    expect(ws.getRow(4).getCell(4).value).toBe(2); // 物理房间 = 2
+    // 行序：城市标题(2)/包房(3)/用房床位(4)/物理房间(5)/余量(6)；日期列 col4=D0
+    expect(ws.getRow(4).getCell(4).value).toBe(1); // 用房(床位) = 1.0
+    expect(ws.getRow(5).getCell(4).value).toBe(2); // 物理房间 = 2
     // 余量 = 床位余量 10 − 1 = 9（物理房间行照旧报 2，只作展示不参与余量），正常余量无高亮
-    expect(ws.getRow(5).getCell(4).value).toBe(9);
-    expect(ws.getRow(5).getCell(4).fill).toBeUndefined();
-    // 当日余房累计（汇总，第 8 行）同样按床位口径 = 9
-    expect(ws.getRow(8).getCell(3).value).toBe('当日余房累计');
-    expect(ws.getRow(8).getCell(4).value).toBe(9);
+    expect(ws.getRow(6).getCell(4).value).toBe(9);
+    expect(ws.getRow(6).getCell(4).fill).toBeUndefined();
+    // 当日余房累计（汇总，第 9 行）同样按床位口径 = 9
+    expect(ws.getRow(9).getCell(3).value).toBe('当日余房累计');
+    expect(ws.getRow(9).getCell(4).value).toBe(9);
   });
 });
 
@@ -251,32 +261,87 @@ describe('buildHotelControlBoardWorkbook · 随机档聚合行', () => {
     const wb = await loadWorkbook(buf);
     const ws = wb.getWorksheet('销控矩阵')!;
 
-    // 聚合行排在最前（行 2-5）：包房 = 同星级合计 5；用房 = 未落位 1；余量 = (5−1) − 1 = 3
-    expect(ws.getCell(2, 1).value).toBe('三星随机');
-    expect(ws.getRow(2).getCell(4).value).toBe(5);
-    expect(ws.getRow(3).getCell(4).value).toBe(1);
-    expect(ws.getRow(5).getCell(3).value).toBe('余量');
-    expect(ws.getRow(5).getCell(4).value).toBe(3);
-    // 明月自己（行 6-9）：余量 5 − 1 = 4
-    expect(ws.getCell(6, 1).value).toBe('明月酒店');
-    expect(ws.getRow(9).getCell(4).value).toBe(4);
+    // 第 2 行城市标题；聚合行排在城市块最前（行 3-6）：包房 = 同城同星级合计 5；用房 = 未落位 1；余量 = (5−1) − 1 = 3
+    expect(ws.getCell(2, 1).value).toBe('岘港（DAD）');
+    expect(ws.getCell(3, 1).value).toBe('岘港三星随机');
+    expect(ws.getRow(3).getCell(4).value).toBe(5);
+    expect(ws.getRow(4).getCell(4).value).toBe(1);
+    expect(ws.getRow(6).getCell(3).value).toBe('余量');
+    expect(ws.getRow(6).getCell(4).value).toBe(3);
+    // 明月自己（行 7-10）：余量 5 − 1 = 4
+    expect(ws.getCell(7, 1).value).toBe('明月酒店');
+    expect(ws.getRow(10).getCell(4).value).toBe(4);
 
-    // 汇总（行 10-12）：包房只数明月的 5（聚合行的 5 是派生值，不重复计）
-    expect(ws.getRow(10).getCell(3).value).toBe('当日包房累计');
-    expect(ws.getRow(10).getCell(4).value).toBe(5);
+    // 汇总（行 11-13）：包房只数明月的 5（聚合行的 5 是派生值，不重复计）
+    expect(ws.getRow(11).getCell(3).value).toBe('当日包房累计');
+    expect(ws.getRow(11).getCell(4).value).toBe(5);
     // 用房 = 明月 1 + 未落位随机单 1
-    expect(ws.getRow(11).getCell(4).value).toBe(2);
+    expect(ws.getRow(12).getCell(4).value).toBe(2);
     // 余房 = 明月余量 4 − 未落位随机单 1 = 3
-    expect(ws.getRow(12).getCell(3).value).toBe('当日余房累计');
-    expect(ws.getRow(12).getCell(4).value).toBe(3);
+    expect(ws.getRow(13).getCell(3).value).toBe('当日余房累计');
+    expect(ws.getRow(13).getCell(4).value).toBe(3);
+  });
+
+  it('两个城市：各成一块、各带城市标题，聚合行只算本城市的酒店；cityCode 筛选只导一块', async () => {
+    const periods = [
+      {
+        hotelId: 'dad1',
+        randomStarTier: null,
+        dateFrom: day(0),
+        dateTo: day(0),
+        rooms: 5,
+        unitPrice: null,
+        hotel: { name: '明月酒店', starRating: 3, intlFiveStar: false, cityCode: 'DAD' },
+      },
+      {
+        hotelId: 'hoa1',
+        randomStarTier: null,
+        dateFrom: day(0),
+        dateTo: day(0),
+        rooms: 2,
+        unitPrice: null,
+        hotel: { name: '古城酒店', starRating: 3, intlFiveStar: false, cityCode: 'HOA' },
+      },
+    ];
+    const client = boardClient([], periods);
+
+    const buf = await buildHotelControlBoardWorkbook({ from: dayStr(0), to: dayStr(0) }, client);
+    const ws = (await loadWorkbook(buf)).getWorksheet('销控矩阵')!;
+    // 岘港块：标题(2) / 岘港三星随机(3-6) / 明月(7-10)；会安块：标题(11) / 会安三星随机(12-15) / 古城(16-19)
+    expect(ws.getCell(2, 1).value).toBe('岘港（DAD）');
+    expect(ws.getCell(3, 1).value).toBe('岘港三星随机');
+    expect(ws.getRow(3).getCell(4).value).toBe(5); // 只有明月的 5，古城的 2 不进岘港
+    expect(ws.getCell(7, 1).value).toBe('明月酒店');
+    expect(ws.getCell(11, 1).value).toBe('会安（HOA）');
+    expect(ws.getCell(12, 1).value).toBe('会安三星随机');
+    expect(ws.getRow(12).getCell(4).value).toBe(2);
+    expect(ws.getCell(16, 1).value).toBe('古城酒店');
+
+    // 只导会安：一块，标题在第 2 行
+    const hoaBuf = await buildHotelControlBoardWorkbook(
+      { from: dayStr(0), to: dayStr(0), cityCode: 'hoa' },
+      boardClient([], periods),
+    );
+    const hoaWs = (await loadWorkbook(hoaBuf)).getWorksheet('销控矩阵')!;
+    expect(hoaWs.getCell(2, 1).value).toBe('会安（HOA）');
+    expect(hoaWs.getCell(3, 1).value).toBe('会安三星随机');
+    expect(hoaWs.getCell(7, 1).value).toBe('古城酒店');
+    // 岘港一行都不该出现
+    const names: unknown[] = [];
+    hoaWs.eachRow((row) => names.push(row.getCell(1).value));
+    expect(names).not.toContain('岘港（DAD）');
+    expect(names).not.toContain('明月酒店');
   });
 });
 
 describe('hotelControlExportFilename', () => {
-  it('单日 / 区间两种文件名', () => {
+  it('单日 / 区间两种文件名；带城市筛选追加城市码', () => {
     expect(hotelControlExportFilename('2026-07-10', '2026-07-10')).toBe('房控导出_2026-07-10.xlsx');
     expect(hotelControlExportFilename('2026-07-10', '2026-07-12')).toBe(
       '房控导出_2026-07-10_2026-07-12.xlsx',
+    );
+    expect(hotelControlExportFilename('2026-07-10', '2026-07-12', 'hoa')).toBe(
+      '房控导出_2026-07-10_2026-07-12_HOA.xlsx',
     );
   });
 });

@@ -838,8 +838,9 @@ describe('酒店超售 cap 统一身份口径', () => {
     );
 
     expect(result.successCount).toBe(1);
+    // 随机档按城市圈定：占位酒店的城市（mock 没给 cityCode → 归存量默认城市 DAD）随档次一起传给聚合闸
     expect(mockAssertRandomTierFit).toHaveBeenCalledWith(
-      3,
+      { tier: 3, cityCode: 'DAD' },
       ['2026-09-02'],
       0.5,
       expect.objectContaining({ maxOversellRooms: Number.POSITIVE_INFINITY }),
