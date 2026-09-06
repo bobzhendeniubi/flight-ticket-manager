@@ -99,17 +99,56 @@ export const CAPABILITIES = {
   // ── 订单 ────────────────────────────────────────────────────────────────
   'orders.read': { audience: 'OPS_AND_AGENT', 说明: '查看订单列表与详情（代理只看自己树内）' },
   'orders.create': { audience: 'OPS_AND_AGENT', 说明: '录单（含批量录单解析、报价试算）' },
-  'orders.write': { audience: 'OPS', 说明: '改订单信息：备注、开票标记、航班纠错、状态推进' },
+  'orders.write': { audience: 'OPS', 说明: '改订单信息：备注、开票标记、状态推进' },
+  'orders.force_status': {
+    audience: 'ADMIN_ONLY',
+    说明: '强制改状态：绕过状态机（内部员工传 force 也不算数，只有管理员生效）',
+  },
+  'orders.roster.manage': {
+    // 与 orders.create 分开：名单模版下载与名单解析是运营侧的批量录单工具，代理够不到。
+    audience: 'OPS',
+    说明: '团队名单模版下载与名单解析（运营侧批量录单）',
+  },
+  'orders.correct_flight': {
+    // 从 orders.write 里拆出来：纠错这条通道对代理开放（下单当天、自家单），
+    // 窗口闸在 service 的 assertAgentSelfEditAllowed 里，能力只管「有没有这条通道」。
+    audience: 'OPS_AND_AGENT',
+    说明: '航班纠错（代理限下单当天自家单）',
+  },
   'orders.split': { audience: 'OPS', 说明: '拆单（含拆单预览）' },
   'orders.cancel': { audience: 'OPS', 说明: '取消整单' },
   'orders.cancel_leg': { audience: 'OPS', 说明: '取消去程/回程航段、作废与恢复回程' },
   'orders.no_show': { audience: 'OPS', 说明: 'no-show 处理（单单与批量）' },
   'orders.reschedule': { audience: 'OPS', 说明: '改期（单单、批量、按人改期）' },
   'orders.price_adjust': { audience: 'OPS', 说明: '调价、应收金额调整与锁定' },
-  'orders.passengers.write': { audience: 'OPS', 说明: '改乘客信息、换人、票号、签证日期与自备签' },
-  'orders.hotel.write': { audience: 'OPS', 说明: '改订单住宿：换酒店、酒店改期、分房、补房差' },
+  'orders.passengers.write': { audience: 'OPS', 说明: '改乘客票号、签证日期与自备签' },
+  'orders.passengers.swap': {
+    // 换人与换人预览走「仅运营/代理」，与其余乘客改动（纯运营）不是一道闸。
+    audience: 'OPS_AND_AGENT',
+    说明: '换人与换人预览（代理只能动自己+下级的单）',
+  },
+  'orders.hotel.write': { audience: 'OPS', 说明: '改订单住宿：酒店改期、分房、拆房组、补房差' },
+  'orders.hotel.swap': {
+    audience: 'OPS_AND_AGENT',
+    说明: '换酒店（代理限下单当天自家单，且差价恒 0）',
+  },
   'orders.settlement_price.write': { audience: 'OPS', 说明: '改行级结算价' },
-  'orders.upgrade_cabin': { audience: 'OPS', 说明: '升舱与加地面项' },
+  'orders.upgrade_cabin': {
+    // 受众照端点写：POST /orders/:id/items/:itemId/upgrade-cabin 本来就放行代理，
+    // 代理那条再由 service 的自助窗口闸收窄（差价始终服务端算，请求体里没有金额字段）。
+    audience: 'OPS_AND_AGENT',
+    说明: '升舱（代理限下单当天自家单）',
+  },
+  'orders.add_ground_item': { audience: 'OPS', 说明: '补录地面项（接送 / 签证 / 加项）' },
+  'orders.expected_amount.override_lock': {
+    audience: 'ADMIN_ONLY',
+    说明: '改已锁定的预期到账金额',
+  },
+  'orders.swap_fee_options.read': {
+    audience: 'OPS_AND_AGENT',
+    说明: '查看换人费档位（代理换人也要填这笔钱，界面得能预填）',
+  },
+  'orders.swap_fee_options.write': { audience: 'ADMIN_ONLY', 说明: '改换人费档位' },
   'orders.change_bundle': { audience: 'OPS', 说明: '套餐改档' },
   'orders.delete': { audience: 'OPS', 说明: '删单与回收站恢复（2026-08-24 放开给内部员工）' },
   'orders.read_deleted': { audience: 'OPS', 说明: '查看回收站' },

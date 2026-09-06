@@ -233,6 +233,140 @@ const INLINE_GATES: InlineGate[] = [
     cap: 'products.cost.view',
     legacy: isOps,
   },
+
+  // ── 订单：内联 403 的大头，一个能力登记一行（同判断式的多个端点合并在 来源 里）──
+  // orders.routes.ts / orders.service.ts 里绝大多数是同一个模板：
+  //   `role !== ADMIN && role !== STAFF → ForbiddenError('仅运营/管理员可…')`
+  {
+    来源: 'orders 批量建单里的定价三闸（议价结算价 / 手动结算单价 / 优惠，仅运营）',
+    cap: 'orders.price_adjust',
+    legacy: isOps,
+  },
+  {
+    来源: 'orders.routes.ts POST /orders/batch（客户不可批量建单，其余登录身份都放行）',
+    cap: 'orders.create',
+    legacy: isOpsOrAgent,
+  },
+  {
+    来源: 'orders.routes.ts POST /:id/claim（仅运营/管理员可认领订单）',
+    cap: 'orders.claim',
+    legacy: isOps,
+  },
+  {
+    来源: 'orders.routes.ts PATCH /:id/notes 的 isOps（内部备注四栏与签证状态仅运营可改）',
+    cap: 'orders.write',
+    legacy: isOps,
+  },
+  {
+    来源: 'orders.routes.ts PATCH /:id/expected-amount 的锁后旁路（已锁定，请联系管理员）',
+    cap: 'orders.expected_amount.override_lock',
+    legacy: isAdmin,
+  },
+  {
+    来源: 'orders.service.ts _updateStatusWithinTx 的 isAdminForce（强制流转只认管理员）',
+    cap: 'orders.force_status',
+    legacy: isAdmin,
+  },
+  {
+    来源: 'orders.routes.ts POST /:id/correct-flight（仅运营 / 代理可纠正航班）',
+    cap: 'orders.correct_flight',
+    legacy: isOpsOrAgent,
+  },
+  {
+    来源: 'orders.service.ts swapPassenger / swapPreview（仅运营/代理可换人、看换人预览）',
+    cap: 'orders.passengers.swap',
+    legacy: isOpsOrAgent,
+  },
+  {
+    来源: 'orders.routes.ts GET /swap-fee-options（仅运营/代理可查看换人费档位）',
+    cap: 'orders.swap_fee_options.read',
+    legacy: isOpsOrAgent,
+  },
+  {
+    来源: 'orders.routes.ts PUT /swap-fee-options（仅管理员可修改换人费档位）',
+    cap: 'orders.swap_fee_options.write',
+    legacy: isAdmin,
+  },
+  {
+    来源: 'orders.routes.ts POST /:id/items/:itemId/upgrade-cabin（运营 + 代理当日自助）',
+    cap: 'orders.upgrade_cabin',
+    legacy: isOpsOrAgent,
+  },
+  {
+    来源: 'orders.routes.ts PATCH /:id/items/:itemId/hotel（运营 + 代理当日自助换酒店）',
+    cap: 'orders.hotel.swap',
+    legacy: isOpsOrAgent,
+  },
+  {
+    来源: 'orders.service.ts rescheduleItemHotel / splitHotelItemByRoomGroup / addRoomSupplement 与 PUT /:id/room-assignment',
+    cap: 'orders.hotel.write',
+    legacy: isOps,
+  },
+  {
+    来源: 'orders.service.ts addGroundItem（仅运营/管理员可补录地面项）',
+    cap: 'orders.add_ground_item',
+    legacy: isOps,
+  },
+  {
+    来源: 'orders.service.ts softDeleteOrder / listDeletedOrders / restoreOrder（仅内部员工可删除订单）',
+    cap: 'orders.delete',
+    legacy: isOps,
+  },
+  {
+    来源: 'orders.service.ts creditOverpayToAgent / applyAgentBalanceToOrder / overpayToPool',
+    cap: 'payments.overpay.handle',
+    legacy: isOps,
+  },
+  {
+    来源: 'orders.service.ts updateItemSettlementPrice（仅运营/管理员可改结算价）',
+    cap: 'orders.settlement_price.write',
+    legacy: isOps,
+  },
+  {
+    来源: 'orders.service.ts updatePassengerVisaDates / updatePassengerTicket / setPassengerVisaExempt',
+    cap: 'orders.passengers.write',
+    legacy: isOps,
+  },
+  {
+    来源: 'orders.service.ts rescheduleOrderItem / reschedulePassengers 与批量改期',
+    cap: 'orders.reschedule',
+    legacy: isOps,
+  },
+  {
+    来源: 'orders.service.ts previewOrderSplit / splitOrder（仅运营/管理员可拆单）',
+    cap: 'orders.split',
+    legacy: isOps,
+  },
+  {
+    来源: 'orders.service.ts previewCancelLeg / cancelLeg / restoreReturnLeg / voidReturnLeg',
+    cap: 'orders.cancel_leg',
+    legacy: isOps,
+  },
+  {
+    来源: 'orders.service.ts previewNoShow / markNoShow 与批量 no-show',
+    cap: 'orders.no_show',
+    legacy: isOps,
+  },
+  {
+    来源: 'orders.service.ts changeOrderAgent（仅运营/管理员可改归属代理）',
+    cap: 'orders.agent.write',
+    legacy: isOps,
+  },
+  {
+    来源: 'orders.service.ts changeOrderBundle（仅运营/管理员可套餐改档）',
+    cap: 'orders.change_bundle',
+    legacy: isOps,
+  },
+  {
+    来源: 'orders.service.ts batchAddPriceAdjustment / addPriceAdjustment 的 isOps',
+    cap: 'orders.price_adjust',
+    legacy: isOps,
+  },
+  {
+    来源: 'orders.routes.ts POST /tickets/batch 与 /tickets/batch-preview（票号批量回填）',
+    cap: 'orders.passengers.write',
+    legacy: isOps,
+  },
 ];
 
 describe('能力表：与替换前的内联角色判断逐格等价', () => {
