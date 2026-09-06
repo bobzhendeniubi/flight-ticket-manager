@@ -4447,6 +4447,21 @@ export const api = {
       body: { isActive },
     }),
 
+  /**
+   * 代理月度对账单 xlsx（Blob 直接下载）。运营/财务替代理下；代理自己在前台也能下同一张表。
+   * 按**出发日**归月（与结算单按下单日归期的口径不同，表格抬头印着这句说明）。
+   */
+  downloadAgentStatement: async (token: string, agentId: string, month: string): Promise<Blob> => {
+    const res = await fetch(
+      `${API_BASE}/agents/${encodeURIComponent(agentId)}/statement?month=${encodeURIComponent(month)}&format=xlsx`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) {
+      throw new ApiError(res.status, { code: 'STATEMENT_FAILED', message: await res.text() });
+    }
+    return res.blob();
+  },
+
   // 切位（包位）——从散客池划座给代理专卖，到期未售回散客池（ADMIN/STAFF）
   createSeatAllocation: (token: string, body: CreateSeatAllocationInput) =>
     apiFetch<{ allocation: SeatAllocationRecord }>('/seat-allocations/', {

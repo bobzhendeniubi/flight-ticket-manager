@@ -754,6 +754,7 @@ function InfoTab({
   return (
     <div className="space-y-4">
       <SettlementModeCard agent={agent} isAdmin={isAdmin} onChanged={onChanged} />
+      <AgentStatementCard agent={agent} />
       {isAdmin && <AgentExclusiveDiscounts agent={agent} />}
 
       {canEdit && !editing && (
@@ -849,6 +850,90 @@ function InfoTab({
       )}
     </div>
   );
+}
+
+/**
+ * 对账单下载卡片 —— 运营/财务替代理下同一张表（代理自己在前台也能下）。
+ *
+ * 与「结算单」是两件事，卡片上要写清楚，不然两个数对不上就会有人来问：
+ *   · 结算单（财务 → 结算单）= 佣金的账，按下单时间归期，一个代理一月一张；
+ *   · 对账单 = 订单的账（应收/已收/余额/每人结算价/立减/佣金），按**出发日**归月，
+ *     含本代理与全部下级；表格抬头也印着同一句口径说明。
+ * 内容与代理自助下载的完全一致：没有成本、没有证件，随手转给代理也不会漏内部信息。
+ */
+function AgentStatementCard({ agent }: { agent: AgentListItem }) {
+  const tokens = useAuth((s) => s.tokens);
+  const [month, setMonth] = useState<string>(() => statementMonthOptions(1)[0]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const onDownload = async (): Promise<void> => {
+    if (!tokens || busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const blob = await api.downloadAgentStatement(tokens.accessToken, agent.id, month);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `对账单_${agent.companyName || agent.contactName}_${month}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '下载失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="rounded-md border border-slate-200 p-3">
+      <div className="flex items-center justify-between gap-2">
+        <div>
+          <h3 className="text-sm font-semibold text-slate-900">月度对账单</h3>
+          <p className="mt-0.5 text-xs text-slate-500">
+            按出发日归月，含本代理与下级的订单明细、合计与预存款；不含成本与证件信息，可直接转给代理。
+          </p>
+        </div>
+      </div>
+      <div className="mt-2 flex items-end gap-2">
+        <div>
+          <label className="label text-xs" htmlFor={`statement-month-${agent.id}`}>
+            月份
+          </label>
+          <select
+            id={`statement-month-${agent.id}`}
+            className="input py-1.5"
+            value={month}
+            onChange={(e) => setMonth(e.target.value)}
+          >
+            {statementMonthOptions(12).map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        </div>
+        <button type="button" className="btn-secondary text-xs px-3 py-2" disabled={busy} onClick={onDownload}>
+          {busy ? '生成中…' : '⬇ 下载对账单'}
+        </button>
+      </div>
+      {err && <div className="mt-2 rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>}
+    </section>
+  );
+}
+
+/** 最近 n 个自然月的 'YYYY-MM'（倒序，本月在前）。 */
+function statementMonthOptions(months: number): string[] {
+  const now = new Date();
+  const out: string[] = [];
+  for (let i = 0; i < months; i++) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
+  }
+  return out;
 }
 
 // 结算方式卡片：展示 逐单到账 / 月结；ADMIN 可切换（调 setAgentSettlementMode）。

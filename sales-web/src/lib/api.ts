@@ -908,6 +908,14 @@ export interface SettlementDetail extends SettlementSummary {
   commissions: SettlementCommissionRecord[];
 }
 
+/** GET /agents/me —— 当前登录代理自己的档案（对账单要用它的 id） */
+export interface MyAgentProfile {
+  id: string;
+  companyName: string | null;
+  contactName: string;
+  tier: number;
+}
+
 // ── 评价 / 评论 ─────────────────────────────────────────────────────────────
 export type ReviewProductType = 'BUNDLE' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'FLIGHT';
 
@@ -1352,6 +1360,25 @@ export const api = {
   },
   getSettlement: (token: string, id: string) =>
     apiFetch<{ settlement: SettlementDetail }>(`/settlements/${id}`, { token }),
+
+  /** 当前登录代理自己的档案（下载对账单要先拿到自己的 agentId） */
+  getMyAgent: (token: string) =>
+    apiFetch<{ agent: MyAgentProfile | null }>('/agents/me', { token }),
+
+  /**
+   * 下载自己（或下级）的月度对账单 xlsx。
+   * 后端按出发日归月，含订单明细 + 合计 + 预存款段；权限与结算单同一棵代理树。
+   */
+  downloadAgentStatement: async (token: string, agentId: string, month: string): Promise<Blob> => {
+    const res = await fetch(
+      `${API_BASE}/agents/${encodeURIComponent(agentId)}/statement?month=${encodeURIComponent(month)}&format=xlsx`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) {
+      throw new ApiError(res.status, { code: 'STATEMENT_FAILED', message: await res.text() });
+    }
+    return res.blob();
+  },
 
   // 评价（公开读；写需订单关联）
   /** GET /reviews — 某产品的评价列表 + 评分聚合（分页） */
