@@ -4649,8 +4649,11 @@ export const api = {
       pagination: { page: number; pageSize: number; total: number };
     }>(`/orders/${qs.toString() ? '?' + qs.toString() : ''}`, { token });
   },
+  // autoFulfillmentSandbox = 后端的沙箱自动出票开关（env ENABLE_AUTO_FULFILLMENT）现在开着。
+  // 乘客卡上「演示自动出票」提示只在它为 true 时挂 —— 以前写死，接了真航司/关了开关之后
+  // 界面还会一直管真票号叫演示号。可选字段：拿不到就按 false 处理（不挂提示）。
   getOrder: (token: string, id: string) =>
-    apiFetch<{ order: OrderSummary }>(`/orders/${id}`, { token }),
+    apiFetch<{ order: OrderSummary; autoFulfillmentSandbox?: boolean }>(`/orders/${id}`, { token }),
   /**
    * 代理分销统计（GET /orders/agent-stats）：与 listOrders 同一套筛选，后端全量聚合。
    * 分页参数在这里没有意义（统计的是筛选命中的**全部**订单，不是某一页），调用前会剔掉。
@@ -5514,6 +5517,32 @@ export const api = {
       `/orders/${orderId}/passengers/${passengerId}/visa-dates`,
       { method: 'PATCH', token, body },
     ),
+
+  // 票务台：回填真实 PNR / 电子票号（仅 ADMIN/STAFF）。
+  // 出票走沙箱自动生成号，真实航司出票之后本来没有任何人工录入口 —— 这就是那个入口。
+  //   · 给字符串 = 写入（PNR 5–8 位字母数字；票号 10–17 位数字，票面的 784-… 连字符可省可留）
+  //   · 给 null   = 只清这一个字段；clear:true = 两个一起清（与给值互斥，同时给会 400）
+  // 只动这两列：不碰订单状态、履约任务、开票状态，**也不会自动发行程单邮件**
+  //（要发走履约区既有的「重发行程单邮件」）。changedFields 为空 = 库里本来就是这个号。
+  updatePassengerTicket: (
+    token: string,
+    orderId: string,
+    passengerId: string,
+    body: {
+      pnr?: string | null;
+      eticketNumber?: string | null;
+      clear?: true;
+      note?: string;
+    },
+  ) =>
+    apiFetch<{
+      passenger: { id: string };
+      changedFields: Array<'pnr' | 'eticketNumber'>;
+    }>(`/orders/${orderId}/passengers/${passengerId}/ticket`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
 
   // 换酒店：把某条 HOTEL 行（或已盖章酒店的 BUNDLE 行）换到另一个房型/酒店。
   // 价格默认冻结（绝不按新房型 basePrice 重算 unitPrice/amount）；可选加/减「换酒店差价」

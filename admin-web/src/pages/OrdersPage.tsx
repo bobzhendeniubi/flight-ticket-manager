@@ -4970,6 +4970,9 @@ function OrderDrawer({
   // 恒显示「—」。抽屉打开时用 getOrder 拉全量详情，之后所有子区块都读 hydrated（拿不到时兜底列表行）。
   const [hydrated, setHydrated] = useState<OrderSummary | null>(null);
   const [hydrating, setHydrating] = useState(false);
+  // 后端的沙箱自动出票开关现状（详情接口随行下发）。乘客卡的「演示自动出票」提示只认它，
+  // 不再写死 —— 接了真航司/把开关关掉之后，界面不该继续管真票号叫演示号。
+  const [autoFulfillmentSandbox, setAutoFulfillmentSandbox] = useState(false);
   // 补水失败不能静默吞掉——否则用户对着列表快照（护照/备注等字段陈旧）编辑还以为是最新。
   // 记一个失败标记，在抽屉里给出轻量提示 + 重试；重试复用同一 loader。
   const [hydrateFailed, setHydrateFailed] = useState(false);
@@ -4979,7 +4982,14 @@ function OrderDrawer({
     setHydrating(true);
     setHydrateFailed(false);
     api.getOrder(token, order.id)
-      .then((r) => { if (!cancelled) setHydrated(r.order); })
+      .then((r) => {
+        if (cancelled) return;
+        setHydrated(r.order);
+        // 沙箱自动出票开着吗（后端读 env ENABLE_AUTO_FULFILLMENT 如实下发）。
+        // 乘客卡的「演示自动出票」提示据此挂 —— 拿不到就按 false：宁可不提示，
+        // 也不要在一个真票号旁边挂「这是演示号」的错标。
+        setAutoFulfillmentSandbox(r.autoFulfillmentSandbox === true);
+      })
       .catch(() => { if (!cancelled) setHydrateFailed(true); })
       .finally(() => { if (!cancelled) setHydrating(false); });
     return () => { cancelled = true; };
@@ -5307,7 +5317,11 @@ function OrderDrawer({
           )}
 
           {/* 乘客（读 hydrated → 护照号/生日/国籍/类型 真实显示）*/}
-          <PassengersSection order={o} onOrderUpdated={handleOrderUpdated} />
+          <PassengersSection
+            order={o}
+            onOrderUpdated={handleOrderUpdated}
+            autoFulfillmentSandbox={autoFulfillmentSandbox}
+          />
 
           {/* 开票（六态：去程 / 回程 / 系统 三个独立开关）*/}
           <InvoiceFlagsSection order={o} onOrderUpdated={handleOrderUpdated} />
@@ -6671,7 +6685,16 @@ const FF_TYPE_LABEL: Record<FulfillmentTask['type'], { icon: IconName; label: st
 };
 
 // 履约进度已按运营要求移出订单详情抽屉；组件保留（导出以备后续页面复用，也避免未引用告警）。
-export function FulfillmentSection({ orderId }: { orderId: string }) {
+// autoFulfillmentSandbox 由挂载方从订单详情接口取（后端读 env ENABLE_AUTO_FULFILLMENT）：
+// 「演示自动出票」标以前写死在这里，接了真航司/关掉开关之后会一直管真票号叫演示号。
+// 缺省 false —— 拿不到开关状态时宁可不挂标，也不要在真票号旁边挂个错的。
+export function FulfillmentSection({
+  orderId,
+  autoFulfillmentSandbox = false,
+}: {
+  orderId: string;
+  autoFulfillmentSandbox?: boolean;
+}) {
   const confirm = useConfirm();
   const highRiskConfirmRef = useRef(false);
   const tokens = useAuth((s) => s.tokens);
@@ -6771,10 +6794,10 @@ export function FulfillmentSection({ orderId }: { orderId: string }) {
                     value={
                       <span className="inline-flex items-center gap-1.5">
                         <span className="font-mono">{data.pnr ?? '（未生成）'}</span>
-                        {data.pnr && (
+                        {data.pnr && autoFulfillmentSandbox && (
                           <span
                             className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700"
-                            title="此 PNR/电子票号为系统演示自动出票生成，非真实航司 PNR；正式对接航司后以真实出票为准。"
+                            title="后台的沙箱自动出票开关目前开着：这组 PNR/票号可能是系统演示自动出票生成的，非真实航司号。拿到航司真号后请在乘客卡上回填覆盖。"
                           >
                             演示自动出票
                           </span>
@@ -11307,7 +11330,20 @@ function useLegacyHistoryByDoc(
   return rows;
 }
 
-function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onOrderUpdated?: (order: OrderSummary) => void }) {
+function PassengersSection({
+  order,
+  onOrderUpdated,
+  autoFulfillmentSandbox = false,
+}: {
+  order: OrderSummary;
+  onOrderUpdated?: (order: OrderSummary) => void;
+  /**
+   * 后端沙箱自动出票开关现在是开着的（详情接口下发）。
+   * 只有它为 true 时，票号旁边才挂「演示自动出票」提示 —— 关了开关或接了真航司之后，
+   * 这个标必须自己消失，不能靠改代码。
+   */
+  autoFulfillmentSandbox?: boolean;
+}) {
   const navigate = useNavigate();
   const [editingId, setEditingId] = useState<string | null>(null);
   // 改信息（CORRECTION，纠错不清资料）/ 换人（SWAP，既有清资料语义）——同一张表单两种模式。
@@ -11315,6 +11351,8 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
   const [lightbox, setLightbox] = useState<{ photoUrl: string; title: string } | null>(null);
   // B1：签证日期内联编辑（订单侧入口——HAS_VISA/全员自备签的单进不了签证台，这里是它们唯一可达的录入口）
   const [visaEditId, setVisaEditId] = useState<string | null>(null);
+  // 票号内联编辑（票务岗回填真实 PNR / 电子票号）——单人一改；整班请走「票号批量回填」页。
+  const [ticketEditId, setTicketEditId] = useState<string | null>(null);
 
   // 建单后按人改自备签（专用端点，非换人通道）：仅内部可编辑角色可见（AGENT 不给）。
   const role = useAuth((s) => s.user?.role);
@@ -11485,6 +11523,21 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
               </li>
             );
           }
+          if (ticketEditId === p.id) {
+            return (
+              <li key={p.id} className="rounded-md border border-emerald-300 bg-emerald-50/50 p-3">
+                <PassengerTicketInline
+                  orderId={order.id}
+                  passenger={p}
+                  onCancel={() => setTicketEditId(null)}
+                  onSaved={(updated) => {
+                    setTicketEditId(null);
+                    onOrderUpdated?.(updated);
+                  }}
+                />
+              </li>
+            );
+          }
           if (editingId === p.id) {
             return (
               <li key={p.id} className="rounded-md border border-brand/40 bg-brand/5 p-3">
@@ -11580,6 +11633,15 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                     </button>
                     {canToggleVisaExempt && (
                       <button
+                        className="ml-2 text-[11px] font-normal text-emerald-700 hover:text-emerald-900"
+                        onClick={() => setTicketEditId(p.id)}
+                        title="回填航司出票后的真实 PNR / 电子票号（整班一次灌请走「票号批量回填」页）"
+                      >
+                        票号
+                      </button>
+                    )}
+                    {canToggleVisaExempt && (
+                      <button
                         className="ml-2 text-[11px] font-normal text-amber-700 hover:text-amber-900 disabled:opacity-50"
                         disabled={visaExemptBusyId !== null}
                         onClick={() => void toggleVisaExempt(p)}
@@ -11626,6 +11688,23 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                         <dt>签证有效期</dt><dd className="font-mono">{p.visaExpiry.slice(0, 10)}</dd>
                       </>
                     )}
+                    {/* PNR / 电子票号：一直显示（没有就是「—」）—— 票务岗要一眼看出这个人到底
+                        有没有票号，「字段不存在」和「还没出票」在界面上必须是同一件事的两种写法，
+                        不能靠「有值才出现」让人猜。沙箱开着时才在旁边挂「演示自动出票」。 */}
+                    <dt>PNR</dt>
+                    <dd className="font-mono">
+                      {p.pnr ?? '—'}
+                      {p.pnr && autoFulfillmentSandbox && (
+                        <span
+                          className="ml-1.5 rounded bg-amber-100 px-1 py-0.5 text-[10px] font-medium text-amber-700"
+                          title="后台的沙箱自动出票开关目前开着：订单转已支付后系统会自动生成一组演示用的 PNR/票号。拿到航司真号后请点上方「票号」回填覆盖。"
+                        >
+                          演示自动出票
+                        </span>
+                      )}
+                    </dd>
+                    <dt>电子票号</dt>
+                    <dd className="font-mono">{p.eticketNumber ?? '—'}</dd>
                   </dl>
                 </div>
                 {p.passportPhotoUrl && (
@@ -11850,6 +11929,139 @@ function PassengerVisaDatesInline({
       <div className="flex justify-end gap-2">
         <button type="button" className="btn-ghost text-xs" onClick={onCancel} disabled={saving}>取消</button>
         <button type="button" className="btn-primary text-xs disabled:opacity-50" onClick={save} disabled={saving}>
+          {saving ? '保存中…' : '保存'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── 票号内联编辑（票务岗回填真实 PNR / 电子票号）─────────────────────────────
+// 出票走沙箱自动生成号，真实航司出票之后系统里本来没有任何人工录入口。这是单人那个口；
+// 整班一次灌走「票号批量回填」页（导航 · 运营组）。
+//
+// 三条要在界面上说清楚的事（都写在表单里，不指望人记得）：
+//   1. 留空 = 不动这一列；要清掉请点「清空票号」（与「什么都没填就保存」区分开）。
+//   2. 保存**不会**发行程单邮件 —— 边录边发，客人会收到一串行程单。要发走履约区的「重发行程单邮件」。
+//   3. 库里已经就是这个号时，后端回 changedFields: []，这里如实说「没有变化」，不谎报「已保存」。
+function PassengerTicketInline({
+  orderId,
+  passenger,
+  onCancel,
+  onSaved,
+}: {
+  orderId: string;
+  passenger: { id: string; fullName: string; pnr?: string | null; eticketNumber?: string | null };
+  onCancel: () => void;
+  onSaved: (updated: OrderSummary) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const confirm = useConfirm();
+  const [pnr, setPnr] = useState(passenger.pnr ?? '');
+  const [eticketNumber, setEticketNumber] = useState(passenger.eticketNumber ?? '');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const save = async () => {
+    if (!token || saving) return;
+    const nextPnr = pnr.trim();
+    const nextTicket = eticketNumber.trim();
+    // 两格都空 = 这次调用没有意义（要清空请走下面那个按钮，语义不同，别让人误清）。
+    if (nextPnr === '' && nextTicket === '') {
+      setErr('请填写 PNR 或电子票号；要清空已有票号请点「清空票号」。');
+      return;
+    }
+    setSaving(true);
+    setErr(null);
+    try {
+      const res = await api.updatePassengerTicket(token, orderId, passenger.id, {
+        // 留空 = 不动这一列（不传该字段），不是「清空」。
+        ...(nextPnr === '' ? {} : { pnr: nextPnr }),
+        ...(nextTicket === '' ? {} : { eticketNumber: nextTicket }),
+      });
+      if (res.changedFields.length === 0) window.alert('填的号与系统里现有的完全一致，没有改动。');
+      const r = await api.getOrder(token, orderId); // 重拉整单让抽屉/列表同步
+      onSaved(r.order);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const clearAll = async () => {
+    if (!token || saving) return;
+    const ok = await confirm({
+      title: `确认清空 ${passenger.fullName} 的票号？`,
+      body: 'PNR 与电子票号会一起清空。票号一没，这个人的退票/对账就断了线索，请确认是录错了要撤掉。',
+      tone: 'danger',
+      confirmText: '清空',
+    });
+    if (!ok) return;
+    setSaving(true);
+    setErr(null);
+    try {
+      await api.updatePassengerTicket(token, orderId, passenger.id, { clear: true });
+      const r = await api.getOrder(token, orderId);
+      onSaved(r.order);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '清空失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const hasExisting = Boolean(passenger.pnr || passenger.eticketNumber);
+  const inputCls = 'mt-0.5 w-full rounded-md border border-slate-300 px-2 py-1 font-mono text-xs';
+  return (
+    <div className="space-y-2 text-xs">
+      <div className="font-medium text-slate-900">票号 · {passenger.fullName}</div>
+      <div className="grid grid-cols-2 gap-2">
+        <label className="block text-[11px] text-slate-500">
+          PNR（订座编码）
+          <input
+            className={inputCls}
+            value={pnr}
+            placeholder="5–8 位字母数字"
+            onChange={(e) => setPnr(e.target.value)}
+          />
+        </label>
+        <label className="block text-[11px] text-slate-500">
+          电子票号
+          <input
+            className={inputCls}
+            value={eticketNumber}
+            placeholder="10–17 位数字，784-… 的横杠可省可留"
+            onChange={(e) => setEticketNumber(e.target.value)}
+          />
+        </label>
+      </div>
+      <p className="text-[11px] text-slate-400">
+        留空 = 不动这一列（不是清空）。保存<span className="font-medium text-slate-500">不会</span>
+        自动给客人发行程单，需要时请用履约区的「重发行程单邮件」。
+      </p>
+      {err && <div className="text-[11px] text-rose-600">{err}</div>}
+      <div className="flex items-center justify-end gap-2">
+        {hasExisting && (
+          <button
+            type="button"
+            className="mr-auto text-[11px] text-rose-600 hover:text-rose-800 disabled:opacity-50"
+            onClick={() => void clearAll()}
+            disabled={saving}
+          >
+            清空票号
+          </button>
+        )}
+        <button type="button" className="btn-ghost text-xs" onClick={onCancel} disabled={saving}>
+          取消
+        </button>
+        <button
+          type="button"
+          className="btn-primary text-xs disabled:opacity-50"
+          onClick={() => void save()}
+          disabled={saving}
+        >
           {saving ? '保存中…' : '保存'}
         </button>
       </div>

@@ -492,7 +492,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       const { id } = req.params as { id: string };
       const requester = await buildRequester(req.user.sub, req.user.role);
       const order = await service.getOrder(id, requester);
-      return { order };
+      // 沙箱自动出票开着吗（env ENABLE_AUTO_FULFILLMENT）。
+      // 订单详情的乘客卡上，PNR/票号旁边那个「演示自动出票」提示以前是**写死**的 ——
+      // 一旦真接了航司、或者把开关关掉改人工回填，界面还会一直管真票号叫演示号。
+      // 这里如实下发一个布尔，前端据此决定要不要挂那个提示（本任务不动开关默认值）。
+      return { order, autoFulfillmentSandbox: process.env.ENABLE_AUTO_FULFILLMENT === 'true' };
     },
   );
 
