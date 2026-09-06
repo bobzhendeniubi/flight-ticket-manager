@@ -5,6 +5,7 @@
  */
 import { BundleChangeRequestStatus, OrderStatus, Prisma, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
+import { hasCapability } from '../../lib/capabilities.js';
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import { getDescendantAgentIds } from '../../lib/agent-tree.js';
 import {
@@ -280,7 +281,7 @@ export class BundleChangeRequestsService {
     };
     audit: { orderId: string; orderNumber: string; requestedById: string };
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!hasCapability({ role: actor.role }, 'bundle_change_requests.decide')) {
       throw new ForbiddenError('仅运营/管理员可确认改档申请');
     }
 
@@ -393,7 +394,7 @@ export class BundleChangeRequestsService {
     request: SerializedBundleChangeRequest;
     audit: { orderId: string; orderNumber: string | null; requestedById: string };
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!hasCapability({ role: actor.role }, 'bundle_change_requests.decide')) {
       throw new ForbiddenError('仅运营/管理员可驳回改档申请');
     }
 

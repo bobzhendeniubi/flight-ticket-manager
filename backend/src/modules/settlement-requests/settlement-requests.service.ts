@@ -29,6 +29,7 @@
  */
 import { OrderStatus, Prisma, SettlementRequestStatus, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
+import { hasCapability } from '../../lib/capabilities.js';
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import { getDescendantAgentIds } from '../../lib/agent-tree.js';
 import { OrderService, SEAT_HOLDING_STATUSES } from '../orders/orders.service.js';
@@ -531,7 +532,7 @@ export class SettlementRequestsService {
       passengerId: string | null;
     };
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!hasCapability({ role: actor.role }, 'settlement_requests.decide')) {
       throw new ForbiddenError('仅运营/管理员可确认议价申请');
     }
 
@@ -667,7 +668,7 @@ export class SettlementRequestsService {
     request: SerializedSettlementRequest;
     audit: { orderId: string; requestedById: string };
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!hasCapability({ role: actor.role }, 'settlement_requests.decide')) {
       throw new ForbiddenError('仅运营/管理员可驳回议价申请');
     }
 

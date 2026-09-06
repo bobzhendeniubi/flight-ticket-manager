@@ -9,6 +9,7 @@
  */
 import { AgentRechargeStatus, Prisma, PrepaymentTxType, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
+import { hasCapability } from '../../lib/capabilities.js';
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import { getDescendantAgentIds } from '../../lib/agent-tree.js';
 import type {
@@ -162,7 +163,7 @@ export class AgentRechargesService {
    * prepaymentTxId @unique 是 DB 层兜底：即使并发穿过应用层校验，二次写入也会因唯一约束回滚。
    */
   async confirm(actor: RechargeActor, id: string, body: ConfirmRechargeRequestInput) {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!hasCapability({ role: actor.role }, 'agent_recharges.decide')) {
       throw new ForbiddenError('仅运营/管理员可确认认款');
     }
 
@@ -235,7 +236,7 @@ export class AgentRechargesService {
 
   /** 驳回（ADMIN/STAFF）。PENDING → REJECTED，不动余额；非 PENDING → 409。 */
   async reject(actor: RechargeActor, id: string, body: RejectRechargeRequestInput) {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!hasCapability({ role: actor.role }, 'agent_recharges.decide')) {
       throw new ForbiddenError('仅运营/管理员可驳回认款');
     }
 
@@ -270,7 +271,7 @@ export class AgentRechargesService {
    * 不会把「其他代理」的专属码泄露出去。
    */
   async myChannels(actor: RechargeActor) {
-    if (actor.role !== UserRole.AGENT) {
+    if (!hasCapability({ role: actor.role }, 'agent_recharges.my_channels')) {
       throw new ForbiddenError('仅代理可查询专属收款渠道');
     }
     const agentId = await this.resolveOwnAgentId(actor.userId);
@@ -296,7 +297,7 @@ export class AgentRechargesService {
    * 复用与 confirm() 完全相同的行锁 + 校验模式，保证「不许赊账」这条线在这个入口也成立。
    */
   async manualAdjust(actor: RechargeActor, body: ManualBalanceAdjustmentInput) {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!hasCapability({ role: actor.role }, 'agent_recharges.decide')) {
       throw new ForbiddenError('仅运营/管理员可手动调整代理余额');
     }
     const delta = round2(body.amount);
