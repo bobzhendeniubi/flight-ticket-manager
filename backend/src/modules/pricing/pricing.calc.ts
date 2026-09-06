@@ -103,11 +103,11 @@ export function computePerSeatBreakdown(input: BreakdownInput): BreakdownResult 
 // 与旧版区别：没有日期倍率、没有自动余位倍率 —— 仓位价就是最终成交价。
 // ════════════════════════════════════════════════════════════════════════════
 
-/** 单个仓位档位：quota=本档多少张，price=本档单座成交价 */
-export interface FareBucket {
-  quota: number;
-  price: number;
-}
+// 档位形状是契约的一部分（前端阶梯价表格按同一形状渲染），定义已搬进 @ftm/contracts；
+// 这里 re-export，本文件既有的 import 方照旧从这里取。
+import type { FareBucket } from '@ftm/contracts/pricing';
+
+export type { FareBucket };
 
 export interface LadderBreakdownInput {
   /** 有序档位，index 0 最先卖（最便宜） */
