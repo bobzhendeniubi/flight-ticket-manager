@@ -6,6 +6,7 @@
 #   /opt/ftm-staging/infra/deploy.sh staging [服务...]   测试环境（随便折腾）
 #
 # 不传服务名 = 重建 backend worker admin-web sales-web（不动 postgres/redis，数据不受影响）。
+# 加 --no-auto-rollback 关掉「冒烟失败自动回滚」（仍会跑冒烟、仍会记历史，只是不自己动手回滚）。
 #
 #   /opt/ftm/infra/deploy.sh rollback <prod|staging> [tag] [--force]
 #
@@ -129,7 +130,16 @@ prune_images() {
 cmd_deploy() {
   ENVIRONMENT="${1:-}"
   shift || true
-  local -a services=("$@")
+
+  local -a services=()
+  local no_auto_rollback=0
+  local a
+  for a in "$@"; do
+    case "$a" in
+      --no-auto-rollback) no_auto_rollback=1 ;;
+      *) services+=("$a") ;;
+    esac
+  done
   if [ ${#services[@]} -eq 0 ]; then
     services=("${APP_SERVICES[@]}")
   fi
@@ -146,7 +156,7 @@ cmd_deploy() {
       ENV_FILE=.env.staging
       ;;
     *)
-      echo "用法: $0 <prod|staging> [服务...]" >&2
+      echo "用法: $0 <prod|staging> [服务...] [--no-auto-rollback]" >&2
       echo "  或: $0 rollback <prod|staging> [tag] [--force]" >&2
       exit 2
       ;;
@@ -171,6 +181,13 @@ cmd_deploy() {
   if [ "$ENVIRONMENT" = "prod" ] && [ -t 0 ] && [ "$DRY_RUN" != "1" ]; then
     read -r -p "这是同事正在用的实测环境，确认部署？[y/N] " ans
     case "$ans" in y | Y) ;; *) echo "已取消"; exit 1 ;; esac
+  fi
+
+  # 部署前记一下「当下已经在跑的版本」——冒烟失败要自动回滚时就是回到这里，
+  # 而不是回滚脚本自己再去猜「上一条」（这个新部署此刻还没写进历史，猜会猜错一格）。
+  local prev_good_tag=""
+  if [ -f "$DIR/.deploy-history" ]; then
+    prev_good_tag=$(awk -F'\t' '$7=="success"{t=$4} END{print t}' "$DIR/.deploy-history")
   fi
 
   local t0=$SECONDS
@@ -199,13 +216,52 @@ cmd_deploy() {
   wait_healthy
 
   local duration=$((SECONDS - t0))
-  append_history deploy "$IMAGE_TAG" "$commit_sha" "$duration" success
+
+  echo "▶ 冒烟…"
+  local smoke_result=success
+  if [ "$DRY_RUN" = "1" ]; then
+    echo "[DRY_RUN] 将执行 $DIR/infra/smoke.sh $ENVIRONMENT"
+  elif ! bash "$DIR/infra/smoke.sh" "$ENVIRONMENT"; then
+    smoke_result=smoke_failed
+    if [ "$no_auto_rollback" = "1" ]; then
+      echo "✗ 冒烟失败，--no-auto-rollback 已生效，不自动回滚（当前仍是新版本 $IMAGE_TAG，请人工核实）" >&2
+    elif [ -z "$prev_good_tag" ]; then
+      smoke_result=smoke_failed_no_rollback_target
+      echo "✗ 冒烟失败，但历史里没有更早的成功记录，无法自动回滚，需要人工介入！" >&2
+    else
+      echo "✗ 冒烟失败，自动回滚到上一个成功版本 $prev_good_tag…" >&2
+      if run_rollback_for_auto_deploy "$prev_good_tag"; then
+        smoke_result=smoke_failed_rolled_back
+      else
+        smoke_result=smoke_failed_rollback_failed
+        echo "✗✗ 自动回滚也失败了，需要人工立即介入！" >&2
+      fi
+    fi
+  fi
+
+  append_history deploy "$IMAGE_TAG" "$commit_sha" "$duration" "$smoke_result"
 
   prune_images
 
   df -h / | awk 'NR==2 {print "  磁盘 "$3" 已用 / "$4" 可用 ("$5")"}'
 
-  echo "✓ 完成"
+  case "$smoke_result" in
+    success)
+      echo "✓ 完成"
+      ;;
+    *)
+      echo "✗ 部署完成但冒烟未通过（$smoke_result），见上方日志" >&2
+      exit 1
+      ;;
+  esac
+}
+
+# deploy 失败自动回滚时用：直接给定目标 tag，绕开 cmd_rollback「不传 tag 用上一条」
+# 的默认猜测逻辑——此刻这次失败的部署还没写进历史，猜出来的会是上上一条，差一格。
+run_rollback_for_auto_deploy() {
+  local tag="$1"
+  FORCE=0
+  cmd_rollback "$ENVIRONMENT" "$tag"
 }
 
 # ── 回滚 ──────────────────────────────────────────────────────────────────
