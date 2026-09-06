@@ -11,6 +11,7 @@
  *    - CUSTOMER：仅本人订单；仅允许取消 PENDING_PAYMENT
  * 4. 幂等：idempotencyKey 存在则直接返回已有订单（保护客户端重试）
  */
+
 import {
   AuditSeverity,
   AuditTargetType,
@@ -39,7 +40,7 @@ import {
   type SettlementTier,
   UserRole,
 } from '@prisma/client';
-import { randomInt, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { prisma } from '../../db/prisma.js';
 import {
   AppError,
@@ -48,11 +49,9 @@ import {
   DuplicatePassengerError,
   ForbiddenError,
   NotFoundError,
-  PriceChangedError,
   UnprocessableEntityError,
 } from '../../lib/errors.js';
 import type { ItineraryData } from '../../lib/itinerary-pdf.js';
-import { hasCapability, type Capability } from '../../lib/capabilities.js';
 import { writeAudit, writeAuditWithinTx } from '../../lib/audit.js';
 import {
   composePassengerFullName,
@@ -61,18 +60,11 @@ import {
 } from '../../lib/passenger-name.js';
 import { localHHMM, localDateISO, localToUtc } from '../../lib/flight-time.js';
 import { checkinCloseAt, isCheckinClosed } from '../../lib/checkin-close.js';
-import {
-  BUSINESS_TZ,
-  businessDateISO,
-  businessDateTime,
-  startOfBusinessDayUtc,
-} from '../../lib/business-time.js';
+import { BUSINESS_TZ, businessDateISO, businessDateTime } from '../../lib/business-time.js';
 import { CANCELLABLE_STATUSES } from '../../lib/cancellation.js';
-import { canonicalJson } from '../../lib/canonical-json.js';
 import { levenshteinDistance, TYPO_MAX_EDIT_DISTANCE } from '../../lib/edit-distance.js';
 import { orderNeedsVisaTask, orderVisaStatusRequiresVisa } from './visa-need.js';
 import {
-  deriveLegStatus,
   isReturnCurrentlyReleased,
   stripInternalLegPrefix,
   LEG_CANCELLED_OUTBOUND_PREFIX,
@@ -86,18 +78,8 @@ import {
 import type { LegStatusItemLike, PublicLegStatus } from './orders.leg-status.js';
 import { computePerPaxShares, spreadableAdjustmentCny } from './per-pax-share.js';
 import { groupPassengerAdjustments } from './order-adjustment-lines.js';
-// 订单金额单一口径（审查根因 R2）：DTO 的应收 / 尾款从这里取；本文件写路径里的内联清账公式本批不动。
 import { balanceDueCny, payableCny } from '../../lib/order-money.js';
-// 订单状态集合全站唯一一份：占座 / 释放 / 取消族终态在下方原名再导出；代理成交额只认已付款三态。
-// 三个占座/释放/取消族集合起 _LIB 别名再用 `export const` 落成本模块自己的绑定：单测里
-// `vi.mock('./orders.service.js', importOriginal)` 会展开模块命名空间，直接 `export { 导入绑定 }`
-// 在 vite 的 SSR 变换下会生成引用未定义标识符的 getter（ReferenceError），本地 const 则没有这个坑。
-import {
-  AGENT_STATS_PAID_STATUSES,
-  FULFILLMENT_TERMINATING_STATUSES as FULFILLMENT_TERMINATING_STATUSES_LIB,
-  SEAT_HOLDING_STATUSES as SEAT_HOLDING_STATUSES_LIB,
-  SEAT_RELEASING_STATUSES as SEAT_RELEASING_STATUSES_LIB,
-} from '../../lib/order-status-sets.js';
+import { AGENT_STATS_PAID_STATUSES } from '../../lib/order-status-sets.js';
 import {
   deriveRoomsToMove,
   isTerminalLegItem,
@@ -124,21 +106,14 @@ import { resolveBundleNights } from '../products/bundle-nights.js';
 import { parseVisaExpressTiers, type VisaExpressTier } from '../products/products.schemas.js';
 import { localDate } from '../finances/finances.cost.service.js';
 import { getSettlementRate } from '../settlement-rates/settlement-rates.service.js';
-// 套餐航线派生唯一入口：结算价日历 / 立减规则按航线取键；派生不到 = 没有航线 = 不取价（不兜底）。
-import {
-  BUNDLE_ROUTE_SELECT,
-  LEGACY_ROUTE_KEY,
-  bundleRouteKey,
-} from '../products/bundle-route.js';
+import { BUNDLE_ROUTE_SELECT, bundleRouteKey } from '../products/bundle-route.js';
 import { getFlightSettlementRate } from '../settlement-rates/flight-settlement-rates.service.js';
 import {
   resolveAgentSettlementDiscount,
   resolveRetailSettlementDiscount,
-  type SettlementDiscountHit,
 } from '../settlement-discounts/settlement-discounts.service.js';
 import {
   assertHotelPhysicalFit,
-  assertHotelPhysicalFitWithinTx,
   assertRandomTierFit,
   assertRandomTierFitWithinTx,
   checkHotelPhysicalFit,
@@ -147,12 +122,7 @@ import {
   getRandomTierAggregate,
   lockHotelBlockPeriodsWithinTx,
   randomStarTierLabel,
-  type PhysicalFitViolation,
-  type ProspectiveOccupancy,
-  type RandomTierFitViolation,
 } from '../hotel-control/hotel-control.service.js';
-// 城市维度的纯函数直接从 hotel-city 取（不经 hotel-control.service 再导出）：
-// 单测整模块 mock hotel-control.service 时，这几个纯函数不需要跟着 mock。
 import {
   cityLabel,
   normalizeCityCode,
@@ -162,10 +132,7 @@ import { env } from '../../config/env.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
 import { OPERATION_FEE_CNY_PER_ORDER } from './order-cost-items.service.js';
-import { bundleItemMetadataSchema } from './orders.schemas.js';
 import { derivePtcByAge, earliestFlightDeparture } from './pnr-export.js';
-// 乘客级签证状态机（fulfillment/visa-state）：三列的唯一写点 + 带守卫的转移表。依赖方向安全——
-// visa-state 只 import prisma 枚举 / errors / orders/visa-need（纯判定），不回头 import orders 模块，无环。
 import {
   assertNoVisaContradiction,
   DERIVABLE_TASK_STATUSES,
@@ -199,8 +166,6 @@ import {
   PRICE_ADJUSTMENT_REASON_LABEL,
 } from './orders.schemas.js';
 import { heldSeatsForCabin } from '../hold-orders/held-seats.js';
-// 「回程已释放」提醒的 ruleKey 构造收敛在提醒规则那边：作废时要把这两条待办一起关掉，
-// 在这里照抄一遍拼接格式，改键时必然漏一处、待办就永远关不掉。
 import { noShowReleasedReminderRuleKeys } from '../reminders/reminders.rules.js';
 import { isFeatureEnabled } from '../../lib/feature-flags.js';
 import { pushWecomMarkdown } from '../../lib/wecom-webhook.js';
@@ -235,268 +200,243 @@ import type {
   UpdatePassengerTicketBody,
   UpdatePassengerVisaDatesBody,
 } from './orders.schemas.js';
+import {
+  FulfillmentStatus,
+  FulfillmentType,
+  VisaRequirement,
+  VisaSubmissionStatus,
+} from '@prisma/client';
+import {
+  assertHotelStaysFitWithinTx,
+  assertRandomTierStaysFitWithinTx,
+  buildStayNightDates,
+  type BundleAddOnBreakdown,
+  type BundleBusinessUpgradeSplit,
+  type BundleOccupancy,
+  computeBundleAddOn,
+  computeBundleGroundTotal,
+  computeBundleOperationFeeTotal,
+  computeBundleRoomsCharged,
+  computeRequiredPassengerCount,
+  derivePerPaxBundleOptions,
+  HOTEL_SOLD_OUT_MESSAGE,
+  type HotelStayOversellRecord,
+  MAX_STAY_NIGHTS,
+  type ProspectiveHotelStay,
+  type RandomTierOversellRecord,
+  resolveBundleBusinessUpgradeInput,
+  resolveBundleBusinessUpgradeRate,
+  resolveBundleHotelStamp,
+  resolveBundleOccupancy,
+  resolveRandomTierNightlyCost,
+  rewriteHotelStayDescription,
+  splitSettlementPriceAcrossLegs,
+  toProspectiveOccupancy,
+} from './service/bundle-pricing.js';
+import {
+  appendLegActionLog,
+  assertLegActionTokenReplay,
+  assertNonEmptyPassengerSelection,
+  cancelLegFingerprint,
+  EMPTY_LEG_ACTION_FINGERPRINT,
+  hasSeenLegActionToken,
+  type LegActionLogEntry,
+  noShowFingerprint,
+  orchestrationFingerprint,
+  readJsonObject,
+  readOrchestrationLeg,
+  type ReleasedSeatEntry,
+  rescheduleAllFingerprint,
+  reschedulePassengersOrchestration,
+  rescheduleTokenInFlightError,
+  type ReturnReleasedSnapshot,
+  type SplitOrchestrationSnapshot,
+  tokenPayloadMismatchError,
+} from './service/leg-action-log.js';
+import {
+  assertLegNotFlownForReschedule,
+  cabinSeatStateWithinTx,
+  computeBundleSeatSplit,
+  computeDisplacedReserved,
+  computeOversellDelta,
+  type DisplacedReservationDetail,
+  isLegAlreadyFlown,
+  lockSeatClassWithinTx,
+  type OversellSeatDetail,
+  oversellSeatWithinTx,
+  releaseSeatFloored,
+  releaseSeatStrictWithinTx,
+  takeSeatWithinTx,
+} from './service/seat-inventory.js';
+import {
+  actorCan,
+  addDaysToYmd,
+  AGENT_SELF_EDIT_REASON,
+  ALLOWED_TRANSITIONS,
+  appendAdjustment,
+  assertDisplayedTotalMatches,
+  type AutoDiscountSummary,
+  buildPerPassengerSettlementItem,
+  buildPriceAdjustmentItem,
+  buildRoomSupplementItem,
+  buildSettlementDiscountItem,
+  buildSettlementTotalItem,
+  buildStarMismatchMessage,
+  buildUpgradedCabinDescription,
+  CABIN_ZH_LABEL,
+  CHANGE_REQUESTABLE_STATUSES,
+  computeAgentSelfEditWindow,
+  computeCabinUpgradeDiffCny,
+  computeGroundItemAmounts,
+  computeSwapHotelCostSnapshot,
+  DAY_MS,
+  type DesignatedHotelStarGate,
+  type DesignatedHotelStarMismatchOverride,
+  type DuplicateCheckPassenger,
+  type DuplicatePassengerConflict,
+  formatDateOnly,
+  formatHHMM,
+  formatMonthDay,
+  formatSlashMonthDay,
+  FULFILLMENT_TERMINATING_STATUSES,
+  generateOrderNumber,
+  type GuestRequester,
+  isGuestRequester,
+  isSettlementTierStarMismatch,
+  isStaffEnteredOrder,
+  ITINERARY_READY_STATUSES,
+  keyChangedDetail,
+  NEAR_EXPIRY_SURCHARGE_CNY,
+  ORDER_FULL_INCLUDE,
+  type OrderAdjustmentEntry,
+  type OrderRequester,
+  passengerToData,
+  PASSPORT_EXPIRY_SURCHARGE_DAYS,
+  PRICE_TOLERANCE_CNY,
+  type PricedOrderItem,
+  ptcToPassengerType,
+  RANDOM_TIER_INTERNAL_NO_CAP,
+  readCalendarKey,
+  resolveCalendarPerPaxBasis,
+  resolveGroundItemUnitPrice,
+  resolveHotelOversellCap,
+  resolveOrderAgentId,
+  resolveRoomSupplementCost,
+  RETAIL_PAYMENT_TIMEOUT_MS,
+  type RoomCostSource,
+  round2,
+  round2Decimal,
+  SEAT_HOLDING_STATUSES,
+  SEAT_RELEASING_STATUSES,
+  SELF_EDITABLE_PASSENGER_STATUSES,
+  SETTLEMENT_TIER_STAR_RATING,
+  shouldApplyRetailSettlementDiscount,
+  sumAccruedCommissionCny,
+  type SwapCalendarKey,
+  syncOrderHasReturnLeg,
+  syncOrderLegFlag,
+  zhStatus,
+} from './service/shared.js';
 
-// ── 状态机：允许的转移 ──────────────────────────────────────────────────
-// 本表是状态机的**唯一真源**：前端不再手抄一份，而是消费 serializeOrder 逐单下发的
-// allowedTransitions（见本文件末 serializeOrder）。改这里 = 前后台同时生效，抄不错、漂移不了。
-
-// 状态中文名（与 admin-web 列表叫法一致）：面向用户的报错一律用中文，不透出枚举名。
-export const ORDER_STATUS_LABEL_ZH: Record<OrderStatus, string> = {
-  DRAFT: '草稿',
-  PENDING_PAYMENT: '待支付',
-  PAID: '已支付',
-  PROCESSING: '处理中',
-  TICKETED: '出票完成',
-  COMPLETED: '已完成',
-  PAYMENT_TIMEOUT: '支付超时',
-  CANCELLED: '已取消',
-  REFUND_REQUESTED: '退款申请中',
-  REFUNDED: '已退款',
-  CHANGE_REQUESTED: '改期申请中',
-  CHANGED: '已改期',
-  FAILED: '出票失败',
-};
-const zhStatus = (s: OrderStatus): string => ORDER_STATUS_LABEL_ZH[s] ?? s;
-
-export const ALLOWED_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
-  DRAFT: ['PENDING_PAYMENT', 'CANCELLED'],
-  PENDING_PAYMENT: ['PAID', 'PAYMENT_TIMEOUT', 'CANCELLED'],
-  // CHANGE_REQUESTED：前台改签申请可在出票前（PAID/PROCESSING）就发起 —— 与 TICKETED 一致进入白名单
-  PAID: ['PROCESSING', 'TICKETED', 'REFUND_REQUESTED', 'CHANGE_REQUESTED'],
-  PROCESSING: ['TICKETED', 'FAILED', 'REFUND_REQUESTED', 'CHANGE_REQUESTED'],
-  TICKETED: ['COMPLETED', 'CHANGE_REQUESTED', 'REFUND_REQUESTED'],
-  COMPLETED: [], // 终态
-  PAYMENT_TIMEOUT: ['PENDING_PAYMENT', 'CANCELLED'],
-  CANCELLED: [], // 终态
-  REFUND_REQUESTED: ['REFUNDED', 'PROCESSING'], // 被拒回退到 PROCESSING
-  REFUNDED: [], // 终态
-  // 改签申请可从 PAID/PROCESSING（出票前）发起，故驳回要能退回出票前流程，
-  // 批准（CHANGED）后也要能继续走出票——否则未出票单被迫落"已出票"，或改签后卡死只能 force。
-  CHANGE_REQUESTED: ['CHANGED', 'PAID', 'PROCESSING', 'TICKETED'], // 驳回→PAID/PROCESSING，批准→CHANGED，已出票改签→TICKETED
-  CHANGED: ['PROCESSING', 'TICKETED', 'COMPLETED', 'REFUND_REQUESTED'], // 改签后继续出票流程或直接完结/退款
-  FAILED: ['PROCESSING', 'REFUND_REQUESTED', 'CANCELLED'],
-};
-
-// ════════════════════════════════════════════════════════════════════════════
-// 结算档次 ↔ 酒店星级：唯一权威映射
-//
-// 数据模型上这两件事分别记在两处，谁都不是对方的派生字段：
-//   · 套餐档次 = Bundle.settlementTier（SettlementTier 枚举，结算价日历的取价键之一）；
-//   · 酒店星级 = Hotel.starRating（纯 1..5 整数）+ Hotel.intlFiveStar（国际五星标记，
-//     与 starRating=5 共用整数星级，另行报价 —— 口径见 schema.prisma 与 hotel-control.service.ts）。
-// 「四星档的钱住三星店」这类交付降级此前系统完全不知情（只校验房型存在 + 在架），
-// 故在此把两套口径钉成一份映射，录单指定酒店与售后换酒店共用，绝不各推各的。
-// ════════════════════════════════════════════════════════════════════════════
-export const SETTLEMENT_TIER_STAR_RATING: Record<SettlementTier, number> = {
-  CITY_3STAR: 3,
-  CITY_4STAR: 4,
-  CITY_5STAR: 5,
-  INTL_5STAR: 5,
-};
-export const SETTLEMENT_TIER_LABEL: Record<SettlementTier, string> = {
-  CITY_3STAR: '市区三星',
-  CITY_4STAR: '市区四星',
-  CITY_5STAR: '市区五星',
-  INTL_5STAR: '国际五星',
-};
-
-/** 酒店档案 → 结算档次；1/2 星等档次表里没有的星级返回 null（即「对不上任何档」）。 */
-export function resolveHotelSettlementTier(hotel: {
-  starRating?: number | null;
-  intlFiveStar?: boolean | null;
-}): SettlementTier | null {
-  if (hotel.starRating == null) return null;
-  if (hotel.intlFiveStar === true) return hotel.starRating === 5 ? 'INTL_5STAR' : null;
-  if (hotel.starRating === 3) return 'CITY_3STAR';
-  if (hotel.starRating === 4) return 'CITY_4STAR';
-  if (hotel.starRating === 5) return 'CITY_5STAR';
-  return null;
-}
-
-/**
- * 指定/换入酒店的星级是否与套餐档次不匹配。
- *
- * 保守口径（宁可多问一句，也不放行一次沉默的降级交付）：
- *   · 星级缺失（starRating 为空）→ 视为不匹配；
- *   · 1/2 星等映射不到任何档次的酒店 → 视为不匹配；
- *   · 国际五星与市区五星互为不同档（另行报价）→ 视为不匹配。
- * 「升级」（如三星档住五星店）同样算不匹配 —— 钱与货对不上就该有人签字，方向不改变这一点。
- */
-export function isSettlementTierStarMismatch(
-  tier: SettlementTier,
-  hotel: { starRating?: number | null; intlFiveStar?: boolean | null },
-): boolean {
-  return resolveHotelSettlementTier(hotel) !== tier;
-}
-
-/** 星级不匹配放行（override）的留痕明细 —— 调用方据此写审计。 */
-export interface DesignatedHotelStarMismatchOverride {
-  bundleId: string;
-  bundleName: string | null;
-  /** 套餐档次（SettlementTier 枚举值）与其对应星级。 */
-  bundleTier: SettlementTier;
-  bundleTierStar: number;
-  hotelRoomTypeId: string;
-  hotelId: string;
-  hotelName: string;
-  hotelStarRating: number | null;
-  hotelIntlFiveStar: boolean;
-  reason: string;
-}
-
-/** 星级闸的调用上下文：role=null 视为对外身份（游客/客户），一律拒单。 */
-export interface DesignatedHotelStarGate {
-  role: UserRole | null;
-  overrides: DesignatedHotelStarMismatchOverride[];
-}
-
-/** 星级不匹配的人眼文案（录单与换酒店共用一句，运营看到的提示不分叉）。 */
-export function buildStarMismatchMessage(
-  tier: SettlementTier,
-  hotel: { starRating?: number | null },
-): string {
-  const hotelStar = hotel.starRating != null ? `${hotel.starRating}星` : '星级未标注';
-  return (
-    `该套餐为${SETTLEMENT_TIER_STAR_RATING[tier]}星档（${SETTLEMENT_TIER_LABEL[tier]}），` +
-    `指定酒店为${hotelStar}；请改选对应档次套餐或联系运营`
-  );
-}
-
-// 哪些状态视为"占用座位"（需要扣库存）/ 释放型 / 取消族终态：集合本体在 lib/order-status-sets.ts
-// （全站唯一一份，审查根因 R2；对称性由 order-status-sets.test.ts 断言）。这里原名再导出，
-// no-show-batch / ticket-batch / settlement-requests 等既有 import 路径不变；下面的口径注释保留原文。
-export const SEAT_HOLDING_STATUSES: OrderStatus[] = SEAT_HOLDING_STATUSES_LIB;
-export const SEAT_RELEASING_STATUSES: OrderStatus[] = SEAT_RELEASING_STATUSES_LIB;
-export const FULFILLMENT_TERMINATING_STATUSES: OrderStatus[] = FULFILLMENT_TERMINATING_STATUSES_LIB;
-
-// DRAFT 归类为"释放型"而非"既不占座也不释放"的中间地带（CRITICAL 修复）：
-//   createOrder 唯一的建单路径（~389）永远显式写 status: PENDING_PAYMENT（扣座与建单同一事务原子发生），
-//   从未有代码路径以 DRAFT 建单后才占座 —— 所以 DRAFT 状态本身从未持有真实库存。
-//   若把 DRAFT 排除在 SEAT_HOLDING/SEAT_RELEASING 之外（旧版行为），admin force 可以拿它当"座位账
-//   死区"套利：force H→DRAFT（宣称释放）不触发释放分支（因为 DRAFT 不在 RELEASING 集合，wasHolding
-//   && isReleasing 为 false）→ sold 原地不动；再 force DRAFT→PAID 时 isNewHolding 为真、wasHolding 假
-//   → 触发"非占座→占座"分支重新占座一次 → sold 又 +qty。反复横跳 H→DRAFT→PAID 每次 +qty，sold 无界
-//   增长，单订单就能把某舱位账面"卖爆"（实际库存没变化，纯粹是账被做出来的）。
-//   把 DRAFT 并入 SEAT_RELEASING（而不是单独拒绝 force 到 DRAFT）是安全的且对称：
-//     H→DRAFT：wasHolding=true, isReleasing=true → 正常释放（座位真还给库存，账目诚实）
-//     DRAFT→H：wasHolding=false, isNewHolding=true → 走"重新占座"分支，原子 CAS + 余位校验（与从
-//              CANCELLED/PAYMENT_TIMEOUT 拉回占座完全同一套保护，不会超卖）
-//     DRAFT→R（如 CANCELLED）：wasHolding=false → 释放→释放，短路不触碰库存（幂等，不会二次释放）
-//（SEAT_RELEASING_STATUSES 本体见 lib/order-status-sets.ts，与上方一并再导出。）
-
-// 订单落「取消族」终态 → 履约任务应被终态化（CANCELLED），而非仅靠列表查询过滤隐藏。
-// 隐藏式过滤的问题：任务仍是 PENDING/IN_PROGRESS，force 把订单拉回占座态即"复活"，且统计口径数不到。
-// 注意与 DRAFT 区分：DRAFT 虽在 SEAT_RELEASING_STATUSES 里（座位账口径），但不是取消族终态，
-// 不应把履约任务一并终态化（force H→DRAFT→PAID 的座位来回搬移不涉及"订单被取消"语义）。
-// 导出：路由层的签证矛盾硬闸要用同一份「不参与履约」口径判豁免，不另立一套。
-//（FULFILLMENT_TERMINATING_STATUSES 本体见 lib/order-status-sets.ts = 释放型 − {DRAFT, REFUND_REQUESTED}，上方已再导出。）
-
-// ── 代理自助改单窗口（下单当天）─────────────────────────────────────────
-// 口径（运营负责人 + 老板 2026-09-04 拍板）：
-//   代理录单出错的比例高、改起来又急，而运营本来就会拿群里的信息把每张代理单核对 2–3 遍，
-//   所以**下单当天**（北京时间同一业务日）让代理自己改自家的单；**次日起**一律走改单申请审批。
-//   自助口子只开给「不动钱」的四件事：航班班次纠错、订单级签证状态、换酒店、升舱。
-// 为什么按业务日而不是「下单后 24 小时」：运营对单是按天做的（当天的单当天核），
-//   跨天的单已经进了昨天那一轮核对与报表，再让代理静默改就对不上账了。
-// 为什么改期走「纠错」语义（correction）而不是售后改期：纠错是「本来就该录成这样」，
-//   不产生改期费、不撤立减、不推状态、不动任何金额 —— 代理自助永远不能动钱。
-// 为什么「已签证」(HAS_VISA) 不在自助范围：那是签证岗见到签证页之后才敢盖的章，
-//   代理自己说「已签证」会让这单从签证台的待送签队列里消失，直接漏送签。
-const AGENT_SELF_EDIT_STATUSES: OrderStatus[] = SEAT_HOLDING_STATUSES.filter(
-  // 已出票 / 已完成：票面已经发出去了，改班次要动真票，必须走审批。
-  (s) => s !== OrderStatus.TICKETED && s !== OrderStatus.COMPLETED,
-);
-
-/** 窗口关闭原因（面向界面的中文；前端直接展示，别在别处另写一套措辞）。 */
-export const AGENT_SELF_EDIT_REASON = {
-  NEXT_DAY: '下单当天可自助修改，次日起请提交改单申请',
-  TICKETED: '已出票，请提交改单申请',
-  INVOICED: '已开票，请提交改单申请',
-  SETTLEMENT_LOCKED: '结算价已锁定',
-  DELETED: '订单已在回收站，请联系运营',
-} as const;
-
-/** 代理自助改单窗口。until = 该业务日结束时刻（ISO），仅当订单是「今天下的」才有值。 */
-export interface AgentSelfEditWindow {
-  open: boolean;
-  until: string | null;
-  reason: string | null;
-}
-
-/** 一个业务日的长度：Asia/Shanghai 自 1991 年起无夏令时，+24h 就是当天结束，不必再走 Intl。 */
-const BUSINESS_DAY_MS = 24 * 60 * 60 * 1000;
-
-/**
- * 纯函数：算某张单此刻还在不在「代理自助改单」窗口里。
- *
- * open = 下单业务日 == 今天（北京） 且 状态 ∈ 占座态 −{已出票, 已完成}
- *        且 三个开票位全未开 且 结算价未锁 且 不在回收站。
- * until = 下单当天时给出「今天 24:00（北京）」的 ISO，供界面倒计时；隔天的单为 null。
- *         注意 until 只表达「窗口本来到几点」，不代表 open —— 已出票/已锁价的当天单
- *         同样给 until，但 open=false，界面据 reason 说明为什么改不了。
- * reason = 关闭原因（open 时为 null）。硬性障碍（回收站/状态/开票/锁价）优先于「过了当天」，
- *         因为它们即使今天也改不了，先告诉代理真正的拦路石，别让他以为是时间问题。
- */
-export function computeAgentSelfEditWindow(
-  order: {
-    createdAt: Date;
-    status: OrderStatus;
-    deletedAt?: Date | null;
-    outboundInvoiced?: boolean | null;
-    returnInvoiced?: boolean | null;
-    systemInvoiced?: boolean | null;
-    settlementLocked?: boolean | null;
-  },
-  now: Date = new Date(),
-): AgentSelfEditWindow {
-  const createdDay = businessDateISO(order.createdAt);
-  const isSameBusinessDay = createdDay === businessDateISO(now);
-  const until = isSameBusinessDay
-    ? new Date(startOfBusinessDayUtc(order.createdAt).getTime() + BUSINESS_DAY_MS).toISOString()
-    : null;
-
-  const closed = (reason: string): AgentSelfEditWindow => ({ open: false, until, reason });
-
-  if (order.deletedAt) return closed(AGENT_SELF_EDIT_REASON.DELETED);
-  if (!AGENT_SELF_EDIT_STATUSES.includes(order.status)) {
-    if (order.status === OrderStatus.TICKETED || order.status === OrderStatus.COMPLETED) {
-      return closed(AGENT_SELF_EDIT_REASON.TICKETED);
-    }
-    return closed(`订单「${zhStatus(order.status)}」不可自助修改`);
-  }
-  if (order.outboundInvoiced || order.returnInvoiced || order.systemInvoiced) {
-    return closed(AGENT_SELF_EDIT_REASON.INVOICED);
-  }
-  if (order.settlementLocked) return closed(AGENT_SELF_EDIT_REASON.SETTLEMENT_LOCKED);
-  if (!isSameBusinessDay) return closed(AGENT_SELF_EDIT_REASON.NEXT_DAY);
-
-  return { open: true, until, reason: null };
-}
-
-// ── 前台自助端点的状态闸 ────────────────────────────────────────────────
-// 出行人护照资料自助补录：出票流程启动前（含处理中）可改；出票后锁定走客服。
-const SELF_EDITABLE_PASSENGER_STATUSES: OrderStatus[] = ['PENDING_PAYMENT', 'PAID', 'PROCESSING'];
-// 改签申请：已付款到已出票之间可申请。
-const CHANGE_REQUESTABLE_STATUSES: OrderStatus[] = ['PAID', 'PROCESSING', 'TICKETED'];
-// 电子行程单下载：订单确认（付款）后即可（含改签中/已改签——旅客仍需凭行程单出行）。
-const ITINERARY_READY_STATUSES: OrderStatus[] = [
-  'PAID',
-  'PROCESSING',
-  'TICKETED',
-  'COMPLETED',
-  'CHANGE_REQUESTED',
-  'CHANGED',
-];
-
-// 服务端价格校验容差（CNY）：客户端提交金额与服务端权威重算金额相差超过此值则拒单（A3）
-const PRICE_TOLERANCE_CNY = 1.0;
-
-// 护照有效期规则（相对出发日）— 反馈：签证岗
-const PASSPORT_EXPIRY_SURCHARGE_DAYS = 180; // 不足 6 个月加收附加费
-const NEAR_EXPIRY_SURCHARGE_CNY = 200; // 每位临期乘客附加费
-// 升舱差价兜底（¥/程/座）：套餐 businessUpgradeCnyPerLeg=null（跟随航班）但两趟都没绑到航班时使用，
-// 与 Flight.businessUpgradeCnyPerLeg 的 schema 默认值一致，绝不让升舱派生出 0/裸价。
-const DEFAULT_BUSINESS_UPGRADE_CNY_PER_LEG = 700;
+// ── 原样再导出：拆分前本文件导出的名字一个不少，调用方 import 路径不变 ──
+export {
+  ORDER_STATUS_LABEL_ZH,
+  ALLOWED_TRANSITIONS,
+  SETTLEMENT_TIER_STAR_RATING,
+  SETTLEMENT_TIER_LABEL,
+  resolveHotelSettlementTier,
+  isSettlementTierStarMismatch,
+  buildStarMismatchMessage,
+  SEAT_HOLDING_STATUSES,
+  SEAT_RELEASING_STATUSES,
+  FULFILLMENT_TERMINATING_STATUSES,
+  AGENT_SELF_EDIT_REASON,
+  computeAgentSelfEditWindow,
+  calendarKeyFingerprint,
+  readCalendarKey,
+  RANDOM_TIER_INTERNAL_NO_CAP,
+  resolveHotelOversellCap,
+  resolveOrderAgentId,
+  addDaysToYmd,
+  buildPriceAdjustmentItem,
+  buildSettlementDiscountItem,
+  buildSettlementTotalItem,
+  resolveCalendarPerPaxBasis,
+  buildPerPassengerSettlementItem,
+  assertDisplayedTotalMatches,
+  shouldApplyRetailSettlementDiscount,
+  buildRoomSupplementItem,
+  computeCabinUpgradeDiffCny,
+  buildUpgradedCabinDescription,
+  resolveRoomSupplementCost,
+  computeSwapHotelCostSnapshot,
+  computeGroundItemAmounts,
+  resolveGroundItemUnitPrice,
+  resolveHasReturnLeg,
+  syncOrderHasReturnLeg,
+  syncOrderLegFlag,
+  passengerToData,
+} from './service/shared.js';
+export type {
+  DesignatedHotelStarMismatchOverride,
+  DesignatedHotelStarGate,
+  AgentSelfEditWindow,
+  SwapCalendarKey,
+  OrderRequester,
+  GuestRequester,
+  RoomCostSource,
+  DuplicateCheckPassenger,
+  DuplicatePassengerConflict,
+  OrderAdjustmentEntry,
+} from './service/shared.js';
+export {
+  computeOversellDelta,
+  computeDisplacedReserved,
+  takeSeatWithinTx,
+  releaseSeatFloored,
+  releaseSeatStrictWithinTx,
+  computeBundleSeatSplit,
+} from './service/seat-inventory.js';
+export type { OversellSeatDetail, DisplacedReservationDetail } from './service/seat-inventory.js';
+export {
+  buildStayNightDates,
+  rewriteHotelStayDescription,
+  HOTEL_SOLD_OUT_MESSAGE,
+  assertRandomTierStaysFitWithinTx,
+  assertHotelStaysFitWithinTx,
+  splitSettlementPriceAcrossLegs,
+  computeBundleGroundTotal,
+  resolveBundleHotelStamp,
+  resolveBundleOccupancy,
+  DEFAULT_ROOM_MAX_ADULTS,
+  DEFAULT_ROOM_MAX_CHILDREN,
+  computeRoomsNeeded,
+  toProspectiveOccupancy,
+  computeBundleRoomsCharged,
+  computeBundleOperationFeeTotal,
+  derivePerPaxBundleOptions,
+  resolveBundleBusinessUpgradeRate,
+  resolveBundleBusinessUpgradeInput,
+  computeBundleAddOn,
+  computeRequiredPassengerCount,
+} from './service/bundle-pricing.js';
+export type {
+  ProspectiveHotelStay,
+  RandomTierOversellRecord,
+  HotelStayOversellRecord,
+  BundleAddOnBreakdown,
+  BundleOccupancyInput,
+  BundleOccupancy,
+  BundleBusinessUpgradeSplit,
+} from './service/bundle-pricing.js';
+export type {
+  ReleasedSeatEntry,
+  ReturnReleasedSnapshot,
+  LegActionType,
+  LegActionLogEntry,
+  LegActionTokenLookup,
+  SplitOrchestrationSnapshot,
+} from './service/leg-action-log.js';
 
 /**
  * 剥离 FLIGHT 行 metadata 里客户端可能伪造的 businessUpgradeCount（HIGH 修复）。
@@ -571,103 +511,6 @@ export type SwapRepriceSkipReason =
   | 'NOT_CALENDAR_PRICED'
   | 'PRICING_KEY_CHANGED'
   | 'DIFF_OVER_CAP';
-
-/**
- * 「这张单是按日历上的哪一格成交的」= 定价键。
- *
- * 换人重算是「日历比日历」：只有**同一格**的今昔两个价相减，量出来的才是「日历动了多少」。
- * 而这张单在成交之后可能被改过档（套餐改档换了 bundleId → 档次/晚数变了）或改过期
- *（改期把出发日挪走了，行价按设计冻结、差额另有调价行收），此时「今天的这一格」已经不是
- * 「成交那一格」—— 再相减等于把改档/改期的价差当成日历浮动，对着已经收过一次的差额再收一次。
- * 因此基准戳里连定价键一起盖章，换人当天先比键：键变了就不重算（PRICING_KEY_CHANGED）。
- */
-export type SwapCalendarKey =
-  | {
-      source: 'BUNDLE_SETTLEMENT_CALENDAR';
-      /**
-       * 套餐日历的四维键：航线 × 档次 × 晚数 × 去程出发本地日。
-       * 航线加进键里，套餐换绑到别的航线（改档到另一条线的套餐）同样算「换了一格」，不按日历重算。
-       */
-      routeKey: string;
-      tier: string;
-      nights: number;
-      departDate: string;
-    }
-  | {
-      source: 'FLIGHT_SETTLEMENT_CALENDAR';
-      /** 机票日历逐航段的键：航班号 × 该段出发地本地日（往返各一条）。 */
-      legs: Array<{ flightNumber: string; departDate: string }>;
-    };
-
-/**
- * 定价键 → 可直接比较的指纹字符串；null → null（判不出键，调用方一律 fail-closed）。
- * 机票多航段按「航班号@出发日」排序后拼，行顺序变化不当作键变（同一组航段就是同一格）。
- */
-export function calendarKeyFingerprint(key: SwapCalendarKey | null | undefined): string | null {
-  if (!key) return null;
-  if (key.source === 'BUNDLE_SETTLEMENT_CALENDAR') {
-    return `BUNDLE|${key.routeKey}|${key.tier}|${key.nights}|${key.departDate}`;
-  }
-  const legs = key.legs
-    .map((leg) => `${leg.flightNumber}@${leg.departDate}`)
-    .sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
-  return `FLIGHT|${legs.join(',')}`;
-}
-
-/**
- * 落库的 JSON（基准戳 metadata.calendarKey / 上一次换人行的 calendarDetail.calendarKey）→ 定价键。
- * 形状不完整一律 null（缺一维就比不出键有没有变，宁可不重算）。
- */
-export function readCalendarKey(raw: unknown): SwapCalendarKey | null {
-  if (raw == null || typeof raw !== 'object' || Array.isArray(raw)) return null;
-  const obj = raw as Record<string, unknown>;
-  const str = (v: unknown): string | null =>
-    typeof v === 'string' && v.trim() !== '' ? v : null;
-  if (obj.source === 'BUNDLE_SETTLEMENT_CALENDAR') {
-    const tier = str(obj.tier);
-    const departDate = str(obj.departDate);
-    const nights = typeof obj.nights === 'number' && Number.isFinite(obj.nights) ? obj.nights : null;
-    if (tier == null || departDate == null || nights == null) return null;
-    // 航线这一维是本批（结算价日历加航线）才盖进键里的。更早落库的键没有它——那时系统只有
-    // 澳门-岘港一条线，迁移也把日历存量行统一回填成 MFM-DAD；这里对存量键做同一个回填读法，
-    // 才不会让所有老单在换人当天一律撞 PRICING_KEY_CHANGED。⚠ 仅限回读**已落库**的键，
-    // 取价侧派生不到航线绝不用它兜底。
-    const routeKey = str(obj.routeKey) ?? LEGACY_ROUTE_KEY;
-    return { source: 'BUNDLE_SETTLEMENT_CALENDAR', routeKey, tier, nights, departDate };
-  }
-  if (obj.source === 'FLIGHT_SETTLEMENT_CALENDAR') {
-    if (!Array.isArray(obj.legs) || obj.legs.length === 0) return null;
-    const legs: Array<{ flightNumber: string; departDate: string }> = [];
-    for (const item of obj.legs) {
-      if (item == null || typeof item !== 'object') return null;
-      const leg = item as Record<string, unknown>;
-      const flightNumber = str(leg.flightNumber);
-      const departDate = str(leg.departDate);
-      if (flightNumber == null || departDate == null) return null;
-      legs.push({ flightNumber, departDate });
-    }
-    return { source: 'FLIGHT_SETTLEMENT_CALENDAR', legs };
-  }
-  return null;
-}
-
-/**
- * 基准那一格 vs 换人当天这一格：一样 → null（可以继续按日历重算）；
- * 不一样（含基准没记键）→ 一份带两把键的明细，调用方据此落 PRICING_KEY_CHANGED 并留痕。
- */
-function keyChangedDetail(
-  basisKey: SwapCalendarKey | null,
-  todayKey: SwapCalendarKey,
-): Record<string, unknown> | null {
-  const basisFp = calendarKeyFingerprint(basisKey);
-  const todayFp = calendarKeyFingerprint(todayKey);
-  if (basisFp != null && basisFp === todayFp) return null;
-  return {
-    note: '本单成交后改过档 / 改过期，定价键已变，不按日历重算',
-    basisKey,
-    todayKey,
-  };
-}
 
 /** 换人重算结算价的取价结果（换人事务与换人预览端点共用）。 */
 export interface SwapRepriceQuote {
@@ -752,116 +595,6 @@ export function normalizeCorrectionName(
   const full = (fullName ?? '').trim();
   const composed = full !== '' ? full : `${(lastName ?? '').trim()}/${(firstName ?? '').trim()}`;
   return composed.replace(/\s+/g, ' ').trim().toUpperCase();
-}
-
-export interface OrderRequester {
-  userId: string;
-  role: UserRole;
-  /** 当前登录代理的 agentId（如果是 AGENT） */
-  agentId?: string;
-  /** 显式区分系统操作（支付回调 / cron）与真实用户，而非靠 userId 字符串前缀 */
-  actorType?: 'USER' | 'SYSTEM';
-}
-
-/**
- * 游客下单上下文（免登录，A1）。createOrder 收到 guest 时：
- * userId=null、agentId=null、无佣金/结算（等同直客无代理单）。
- */
-export interface GuestRequester {
-  guest: { name: string; phone: string; email?: string };
-}
-
-type CapRequester = { role: UserRole | null } | GuestRequester;
-
-function isGuestRequester(r: CapRequester): r is GuestRequester {
-  return 'guest' in r;
-}
-
-/** 前台散客单的支付超时（未支付即自动释放机位的时长）。 */
-const RETAIL_PAYMENT_TIMEOUT_MS = 30 * 60 * 1000;
-
-/** 后台/代理录入身份：这些认证角色录的单默认「肯定要飞」，不设支付超时。 */
-const STAFF_ENTRY_ROLES: readonly UserRole[] = [UserRole.AGENT, UserRole.STAFF, UserRole.ADMIN];
-
-/**
- * 内部录单的随机档口径：随机档是需求池，不用具体酒店的超售上限闸单；
- * 缺口由房控审计、每日加房清单和提醒引擎接手。具体酒店仍使用原 cap。
- */
-export const RANDOM_TIER_INTERNAL_NO_CAP = Number.POSITIVE_INFINITY;
-
-/**
- * 支付超时口径（0708 业务定）：机位是否会因未支付被自动退回，只看**服务端认证身份**。
- *   - 后台/代理录入（AGENT / STAFF / ADMIN，含批量建单）→ true：不设支付超时（paymentExpiresAt=null），
- *     机位永不自动释放。这类订单默认「肯定要飞」、多为 T+1 线下结算；要退机位必须由运营手动取消/改状态。
- *   - 前台散客（匿名游客 / 登录 CUSTOMER）→ false：保留 30 分钟未支付自动释放，防匿名占坑锁库存。
- * 用角色允许名单（而非「非 CUSTOMER」）判定：未知/新增角色默认按散客处理（保留超时），是更安全的兜底。
- * 绝不信任 body 里的字段——POST /orders 是 optionalAuthenticate 公开可达，身份必须来自 JWT / 游客上下文。
- */
-function isStaffEnteredOrder(requester: CapRequester): boolean {
-  if (isGuestRequester(requester)) return false;
-  return requester.role != null && STAFF_ENTRY_ROLES.includes(requester.role);
-}
-
-/**
- * 统一解析内部录单的酒店超售 cap。
- * AGENT、STAFF、ADMIN 都属于内部录单；游客/CUSTOMER/未登录不传 cap，保持对外硬闸。
- * quote、createOrder 和批量手工价预定价必须共用这一处身份口径。
- */
-export async function resolveHotelOversellCap(
-  requester?: CapRequester,
-): Promise<number | undefined> {
-  if (!requester || !isStaffEnteredOrder(requester)) return undefined;
-  return getHotelOversellCapRooms();
-}
-
-/**
- * 解析订单的代理归属（登录用户）。佣金链路在订单转 PAID 时按 order.agentId 计算，
- * 因此 ADMIN/STAFF 代下单显式归属的代理，会与该代理本人下单产生完全相同的佣金链。
- *
- *   - AGENT：只能归属自己（忽略 body.agentId，代理不能替他人记单）。
- *   - ADMIN / STAFF：可显式传 body.agentId 归属某代理；先校验存在且 isActive，
- *     否则 404（不存在）/ 400（已停用）。不传则记为直客（null）。
- *   - 其他角色（如 CUSTOMER 自助下单）：无代理归属 → null。
- *
- * 导出供单测复用。
- */
-export async function resolveOrderAgentId(
-  requester: OrderRequester,
-  bodyAgentId: string | undefined,
-): Promise<string | null> {
-  if (requester.role === 'AGENT') {
-    return requester.agentId ?? null;
-  }
-
-  if (requester.role === 'ADMIN' || requester.role === 'STAFF') {
-    if (!bodyAgentId) return null;
-    const agent = await prisma.agent.findUnique({
-      where: { id: bodyAgentId },
-      select: { id: true, isActive: true },
-    });
-    if (!agent) {
-      throw new NotFoundError(`指定的代理不存在：${bodyAgentId}`);
-    }
-    if (!agent.isActive) {
-      throw new BadRequestError('指定的代理已停用，无法归属订单');
-    }
-    return agent.id;
-  }
-
-  return null;
-}
-
-/**
- * YYYY-MM-DD + 天数 → YYYY-MM-DD（纯函数，UTC 历法推算，避免时区跨日错位）。
- * 用于套餐回程/退房日期 = 出发日期 + 住宿晚数。非法输入原样返回（调用方另有兜底）。
- */
-export function addDaysToYmd(ymd: string, days: number): string {
-  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(ymd);
-  if (!m) return ymd;
-  const dt = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
-  if (Number.isNaN(dt.getTime())) return ymd;
-  dt.setUTCDate(dt.getUTCDate() + Math.trunc(days));
-  return dt.toISOString().slice(0, 10);
 }
 
 /**
@@ -1024,650 +757,6 @@ export function buildBatchItems(
   ];
 }
 
-/**
- * 录单调价/加项 → 一条独立 OrderItem 定价行（计入 subtotal/total）。
- *   - 金额可正可负（整数 CNY）：正=加钱（补收杂费/变更改期费…），负=减价（优惠/让利）。
- *   - kind 复用现有枚举：正 → FEE、负 → DISCOUNT，让财务分类诚实（不新增枚举/迁移）。
- *   - 描述可读（详情页自然显示），如「价格调整：补收杂费（+¥700）」/「价格调整：优惠（−¥200）」。
- *   - metadata 打标 priceAdjustment=true + reasonCode/reasonText，供审计与后续识别。
- *   - adj.reasonCode 类型收窄为纯财务四类（DISCOUNT/MISC_FEE/CHANGE/OTHER）；label 查表用
- *     PRICE_ADJUSTMENT_REASON_LABEL（覆盖历史三个已下线原因值，避免旧订单行 label 缺失）。
- * 导出供单测复用。
- */
-export function buildPriceAdjustmentItem(adj: {
-  amountCny: number;
-  /**
-   * 人工可录入的四类 + 专用端点自己产生的 endpoint-only 原因码（ROOM_DIFF / SETTLEMENT /
-   * RETURN_LEG_CANCEL_FEE …）。收窄仍然发生在**入口**：面向 HTTP 的 priceAdjustmentSchema /
-   * orderPriceAdjustmentBodySchema 只认四类，运营下拉里永远看不到 endpoint-only 的码。
-   */
-  reasonCode: PriceAdjustmentReasonDisplay;
-  reasonText?: string;
-  /**
-   * 单价口径注记（批量按人调价专用，如「每人 ¥700 × 2 人」）。
-   * 落库金额是乘出来的合计，光看「+¥1400」事后没人还原得出「每人多少 × 几个人」——
-   * 财务对账、客人问「这笔怎么来的」都要靠这一句。单单调价不传 → 描述一字不变。
-   */
-  unitNote?: string;
-}): {
-  kind: OrderItemKind;
-  description: string;
-  quantity: number;
-  unitPrice: number;
-  amount: number;
-  totalCostCny: number;
-  metadata: Record<string, unknown>;
-} {
-  const label = PRICE_ADJUSTMENT_REASON_LABEL[adj.reasonCode];
-  const reasonText = adj.reasonText?.trim() || undefined;
-  const signed = `${adj.amountCny > 0 ? '+' : '−'}¥${Math.abs(adj.amountCny)}`;
-  const suffix = reasonText ? `：${reasonText}` : '';
-  // 单价注记紧跟合计金额，说明这笔钱是怎么乘出来的；不传即整单口径，描述与此前逐字一致。
-  const unitNote = adj.unitNote?.trim() ? `（${adj.unitNote.trim()}）` : '';
-  return {
-    kind: adj.amountCny > 0 ? OrderItemKind.FEE : OrderItemKind.DISCOUNT,
-    description: `价格调整：${label}（${signed}）${unitNote}${suffix}`,
-    quantity: 1,
-    unitPrice: adj.amountCny,
-    amount: adj.amountCny,
-    // 纯价格调整行无成本侧（优惠/补收杂费/调价都不产生采购成本）→ 显式落 0，不留 NULL。
-    // 留 NULL 会被毛利明细当「缺成本」，把整单毛利拖成「未知」，污染财务视图。
-    totalCostCny: 0,
-    metadata: {
-      priceAdjustment: true,
-      reasonCode: adj.reasonCode,
-      reasonText: reasonText ?? null,
-    },
-  };
-}
-
-/**
- * 规则命中的固定立减行：金额、规则类型和每人金额都写入 metadata 快照。
- * 订单展示/售后只认这份快照，不因运营之后修改规则而漂移。
- */
-export function buildSettlementDiscountItem(input: {
-  hit: SettlementDiscountHit;
-  pax: number;
-  bundleId?: string | null;
-}): {
-  kind: OrderItemKind;
-  description: string;
-  quantity: number;
-  unitPrice: number;
-  amount: number;
-  totalCostCny: number;
-  metadata: Record<string, unknown>;
-} {
-  const totalCny = input.hit.discountPerPersonCny * input.pax;
-  return {
-    kind: OrderItemKind.DISCOUNT,
-    description: `同业立减 ¥${input.hit.discountPerPersonCny}/人 × ${input.pax}人`,
-    quantity: 1,
-    unitPrice: -totalCny,
-    amount: -totalCny,
-    totalCostCny: 0,
-    metadata: {
-      priceAdjustment: true,
-      reasonCode: 'DISCOUNT',
-      settlementDiscount: true,
-      ruleId: input.hit.ruleId,
-      ruleKind: input.hit.kind,
-      discountPerPersonCny: input.hit.discountPerPersonCny,
-      pax: input.pax,
-      bundleId: input.bundleId ?? null,
-    },
-  };
-}
-
-/**
- * 本单结算总价 → 一条系统生成的 SETTLEMENT 差额行（计入 subtotal/total）。
- *   - 业务：代理单与代理谈定整单一口价（结算价），系统照此收钱；服务端权威定价不破坏——
- *     **绝不改各明细行价格**，只按「结算价 − 权威合计」追加一条差额行（原价/差额/原因留痕可审计）。
- *   - diffCny 可正可负（最多两位小数）：正 → FEE、负 → DISCOUNT（与录单调价同口径，财务分类诚实）。
- *   - 描述可读，如「价格调整：代理结算价（−¥5684）」；金额为 0 的场景由调用方跳过（不生成行）。
- *   - metadata 打标 priceAdjustment=true + reasonCode='SETTLEMENT'（只能系统生成，不在人工下拉里）
- *     + settlementPrice=true + 权威合计/结算价快照，供审计与对账识别。
- * 导出供单测复用。
- */
-export function buildSettlementTotalItem(input: {
-  diffCny: number;
-  authoritativeTotalCny: number;
-  settlementTotalCny: number;
-  /**
-   * 建单当天的**日历每人价**（未减代理立减）与**每人立减**。
-   * 只有「结算价日历自动取价」这条路会带；手工结算总价 / 每人结算价一律不带。
-   *
-   * 为什么要单独落这两个数（换人重算结算价 2026-09 拍板）：日历取价此前只把整单总价写进
-   * settlementTotalCny，事后没人还原得出「当时每人是按哪个日历价成交的」——
-   * 加项、单房差、婴儿同价都揉在总价里，÷ 人数只是估算。换人时要拿它跟**换人当天**的日历价
-   * 比差额（日历比日历，见 resolveSwapRepriceQuote），估算不够用。纯加字段、不改任何金额，
-   * 存量单读不到就退回保守分支（NOT_CALENDAR_PRICED，只收换人费不动结算价）。
-   */
-  calendarPerPaxCny?: number | null;
-  calendarDiscountPerPaxCny?: number | null;
-  /**
-   * 建单**当时是否真的减了代理立减**（复审 H3）。
-   *
-   * 建单侧只有在「没有任何手工价通道」时才自动命中立减（见 createOrder 的
-   * hasManualSettlementChannel）；换人侧却无条件再算一次今天的立减 —— 两边不对称，
-   * 手工价单会被平白多减一次立减，或者反过来把立减当成日历涨价再收一遍。
-   * 因此把「建单到底减没减」这一位随基准戳一起盖章：换人时按这一位决定要不要减今天的立减，
-   * 保证减法两边同口径（基准减了 → 今天也减；基准没减 → 今天也不减）。
-   */
-  calendarDiscountApplied?: boolean;
-  /**
-   * 建单那次取价用的**日历定价键**（档次×晚数×出发日 / 逐航段航班号×出发日，见 SwapCalendarKey）。
-   *
-   * 光有每人价还不够：这张单成交之后可能被改档（换 bundleId → 档次晚数变了）或改期（出发日挪了），
-   * 那时「今天的日历价」查的已经是另一格 —— 拿它跟成交那格的价相减，就把改档/改期的价差
-   * 当成日历浮动又收了一遍（改档/改期本身早就各自落过差额行）。把键一起盖章，换人当天先比键。
-   * 与 calendarPerPaxCny 同生共死：取价口径明确（能算出每人价）才有键，缺一不给。
-   */
-  calendarKey?: SwapCalendarKey | null;
-}): {
-  kind: OrderItemKind;
-  description: string;
-  quantity: number;
-  unitPrice: number;
-  amount: number;
-  totalCostCny: number;
-  metadata: Record<string, unknown>;
-} {
-  const signed = `${input.diffCny > 0 ? '+' : '−'}¥${Math.abs(input.diffCny)}`;
-  return {
-    kind: input.diffCny > 0 ? OrderItemKind.FEE : OrderItemKind.DISCOUNT,
-    description: `价格调整：${PRICE_ADJUSTMENT_REASON_LABEL.SETTLEMENT}（${signed}）`,
-    quantity: 1,
-    unitPrice: input.diffCny,
-    amount: input.diffCny,
-    // 结算价差额行是纯价格调整（把整单收敛到谈定价），无成本侧 → 显式落 0，不留 NULL。
-    totalCostCny: 0,
-    metadata: {
-      priceAdjustment: true,
-      reasonCode: 'SETTLEMENT',
-      settlementPrice: true,
-      authoritativeTotalCny: input.authoritativeTotalCny,
-      settlementTotalCny: input.settlementTotalCny,
-      // 日历成交的每人基准（见入参注释）；手工结算价不带这几个键。
-      ...(input.calendarPerPaxCny != null
-        ? {
-            calendarPerPaxCny: input.calendarPerPaxCny,
-            calendarDiscountPerPaxCny: input.calendarDiscountPerPaxCny ?? 0,
-            calendarDiscountApplied: input.calendarDiscountApplied === true,
-            // 定价键（改档/改期后换人据此 fail-closed，见入参注释）。
-            ...(input.calendarKey ? { calendarKey: input.calendarKey } : {}),
-          }
-        : {}),
-    },
-  };
-}
-
-/**
- * 结算价日历取价审计 → 建单当天的「每人日历基准」（换人重算结算价的差价基准）。
- *
- * 只认口径明确的两种形状，其余一律返回 null（宁可不落基准，也不落一个估算出来的数）：
- *   · 套餐日历（source=SETTLEMENT_CALENDAR）：**恰好一条** lines 时取该行 pricePerPersonCny；
- *     多条行分不清换下去的这个人算哪一条（换人重算本身也在这一步跳过，见 resolveSwapRepriceQuote）。
- *   · 机票日历（source=FLIGHT_SETTLEMENT_CALENDAR）：Σ 各航段 pricePerPersonCny（往返各查各的价）。
- * 每人立减取自动立减命中的 perPersonCny（恰好一条命中时才认，同理由）。
- *
- * 返回的是**未减立减的裸日历价 + 每人立减**两个数，与 resolveSwapRepriceQuote 换人当天的取法
- * 逐项对齐：基准 = perPaxCny − discountPerPaxCny。
- * 第三个数 discountApplied =「这一单当时到底减没减立减」（复审 H3）：建单侧只在没有任何手工价
- * 通道时才自动命中立减，换人侧必须照着这一位决定今天减不减，否则同一笔立减会被多减/多收一次。
- * 第四项 key =「这次取的是日历上的哪一格」（档次×晚数×出发日 / 逐航段航班号×出发日）：
- * 改档 / 改期之后那一格已经换人了，换人当天先比键，键变了就不重算（PRICING_KEY_CHANGED）。
- * 键这一维读不出来 → 整份基准返回 null（只有价没有键的基准戳，换人时照样用不了）。
- *
- * 两处调用共用这一份口径：① 建单当场（autoDiscount = 本次命中的立减）；
- * ② 存量单换人时从建单审计里回读（autoDiscount = 审计 blob 里的 autoDiscount 快照，
- *    建单只在真减了立减时才写这个键，见 createOrder 的 settlementCalendarAudit 组装）。
- */
-export function resolveCalendarPerPaxBasis(
-  calendarAudit: Record<string, unknown> | null,
-  autoDiscount: AutoDiscountSummary | null,
-): {
-  perPaxCny: number;
-  discountPerPaxCny: number;
-  discountApplied: boolean;
-  /** 这次取价用的是日历上的哪一格（换人当天先比这个键，见 SwapCalendarKey）。 */
-  key: SwapCalendarKey;
-} | null {
-  if (!calendarAudit) return null;
-  const lines = Array.isArray(calendarAudit.lines)
-    ? (calendarAudit.lines as Array<Record<string, unknown>>)
-    : [];
-  if (lines.length === 0) return null;
-  const perPax = (line: Record<string, unknown>): number | null => {
-    const v = line.pricePerPersonCny;
-    return typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : null;
-  };
-  const str = (v: unknown): string | null => (typeof v === 'string' && v.trim() !== '' ? v : null);
-  let perPaxCny: number | null = null;
-  // 定价键与每人价同生共死：键这一维缺了就整份基准不给 —— 只有价没有键，换人当天照样
-  // fail-closed，落一个用不上的基准戳反而让人以为「这单能重算」。
-  let key: SwapCalendarKey | null = null;
-  if (calendarAudit.source === 'SETTLEMENT_CALENDAR') {
-    if (lines.length !== 1) return null;
-    perPaxCny = perPax(lines[0]);
-    const tier = str(lines[0].tier);
-    const departDate = str(lines[0].departDate) ?? str(calendarAudit.departDate);
-    const nights =
-      typeof lines[0].nights === 'number' && Number.isFinite(lines[0].nights)
-        ? (lines[0].nights as number)
-        : null;
-    if (tier != null && nights != null && departDate != null) {
-      // 本批之前的取价审计行没有 routeKey（当时只有一条线）：按迁移同一口径读成 MFM-DAD。
-      // 新单的审计行一律带 routeKey（resolveBundleSettlementCalendarTotal 派生不到就不取价）。
-      const routeKey = str(lines[0].routeKey) ?? LEGACY_ROUTE_KEY;
-      key = { source: 'BUNDLE_SETTLEMENT_CALENDAR', routeKey, tier, nights, departDate };
-    }
-  } else if (calendarAudit.source === 'FLIGHT_SETTLEMENT_CALENDAR') {
-    let sum = 0;
-    const legs: Array<{ flightNumber: string; departDate: string }> = [];
-    for (const line of lines) {
-      const v = perPax(line);
-      if (v == null) return null;
-      sum = round2(sum + v);
-      const flightNumber = str(line.flightNumber);
-      const departDate = str(line.departDate);
-      if (flightNumber == null || departDate == null) return null;
-      legs.push({ flightNumber, departDate });
-    }
-    perPaxCny = sum;
-    key = { source: 'FLIGHT_SETTLEMENT_CALENDAR', legs };
-  }
-  if (perPaxCny == null || !(perPaxCny > 0) || key == null) return null;
-  const hits = autoDiscount?.hits ?? [];
-  // 立减命中多条 = 多条套餐行，上面已经拦掉；这里只可能是 0 或 1 条。
-  const discountPerPaxCny = hits.length === 1 ? round2(hits[0].perPersonCny) : 0;
-  // 「减没减」看的是有没有命中行，不是金额是否为正：¥0 的立减规则也算减过（今天照样要减）。
-  return { perPaxCny, discountPerPaxCny, discountApplied: hits.length > 0, key };
-}
-
-/**
- * 每人结算价 → 该乘客名下的 SETTLEMENT 差额行（计入 subtotal/total，事务内回填 passengerId）。
- *   - 业务（票务反馈）：同单多人结算价不同，录单逐人填价。落库仍走差额模型，不是手填价：
- *     服务端取「min(每人结算价) × 人数」走整单 SETTLEMENT 收敛，本行只挂「该人价 − min」的
- *     非负差额（=0 的乘客不生成行），订单详情「每人结算价」表按既有派生口径还原逐人价。
- *   - metadata 打标同整单 SETTLEMENT（priceAdjustment + reasonCode='SETTLEMENT' + settlementPrice）
- *     外加 perPassenger=true + 该人结算价/基准价快照 + perPaxIndex（乘客在提交数组中的序号，
- *     事务内据此把行挂到对应 passengerId 上）。
- * 导出供单测复用。
- */
-export function buildPerPassengerSettlementItem(input: {
-  diffCny: number;
-  settlementPerPaxCny: number;
-  basePerPaxCny: number;
-  perPaxIndex: number;
-}): {
-  kind: OrderItemKind;
-  description: string;
-  quantity: number;
-  unitPrice: number;
-  amount: number;
-  totalCostCny: number;
-  metadata: Record<string, unknown>;
-} {
-  return {
-    kind: OrderItemKind.FEE,
-    description: `价格调整：${PRICE_ADJUSTMENT_REASON_LABEL.SETTLEMENT}（+¥${input.diffCny}）`,
-    quantity: 1,
-    unitPrice: input.diffCny,
-    amount: input.diffCny,
-    // 与整单 SETTLEMENT 行同口径：纯价格收敛，无成本侧 → 显式落 0。
-    totalCostCny: 0,
-    metadata: {
-      priceAdjustment: true,
-      reasonCode: 'SETTLEMENT',
-      settlementPrice: true,
-      perPassenger: true,
-      settlementPerPaxCny: input.settlementPerPaxCny,
-      basePerPaxCny: input.basePerPaxCny,
-      perPaxIndex: input.perPaxIndex,
-    },
-  };
-}
-
-/**
- * 前台展示价兜底校验（S1）：expectedTotalCny 存在且与「服务端权威商品价」偏差 > 容差（PRICE_TOLERANCE_CNY，
- * 1 元，容忍逐行取整）→ 抛 PRICE_CHANGED（前台提示刷新重下，绝不静默按新价多收）。
- * 缺省（admin/批量/quote 不带 expectedTotalCny）→ 直接返回，跳过比对（录单路径不受影响）。
- * 导出供单测（匹配通过 / 偏差拒单 / 不传跳过）与 createOrder 共用同一口径，避免漂移。
- */
-export function assertDisplayedTotalMatches(
-  productTotalCny: number,
-  expectedTotalCny?: number | null,
-): void {
-  if (expectedTotalCny == null) return;
-  if (Math.abs(productTotalCny - expectedTotalCny) > PRICE_TOLERANCE_CNY) {
-    throw new PriceChangedError();
-  }
-}
-
-/**
- * 是否给本单自动加散客 RETAIL 立减。**下单（createOrder）与试算（quoteOrder）必须同一口径**，
- * 否则录单页看到的系统价里有立减、真下单时却没有（或反过来），运营对着两个数字无从判断。
- *
- * 口径：
- *   · 有归属代理 → 不加（代理走 AGENT 立减那条链）。createOrder 传的是 resolveOrderAgentId
- *     解析后的权威 agentId，不是 body 里那个原始值。
- *   · 任一「手工价通道」在场 → 不加：手工优惠/团队议价/手填结算总价都视为整体替代方案，
- *     再叠自动立减就是双重砸价（与代理侧 hasManualSettlementChannel 判定同哲学）。
- *
- * 入参用可选字段而非具体 Body 类型：quote 的请求体目前还不带这三个手工通道字段（缺省 undefined
- * ⇒ 与今天行为一致），等它带上时两边自动一起收紧，不会再分叉。
- */
-export function shouldApplyRetailSettlementDiscount(input: {
-  agentId?: string | null;
-  priceAdjustment?: unknown;
-  settlementTotalCny?: number | null;
-  perPassengerSettlementCny?: number[] | null;
-  flightSettlementPriceCny?: number | null;
-}): boolean {
-  if (input.agentId) return false;
-  return (
-    input.priceAdjustment === undefined &&
-    input.settlementTotalCny === undefined &&
-    input.perPassengerSettlementCny === undefined &&
-    input.flightSettlementPriceCny === undefined
-  );
-}
-
-/**
- * 事后补收单房差 → 一条 FEE 定价行（计入 subtotal/total）。
- *   - 金额 = perNightCny × nights（都为正整数 CNY；校验由 roomSupplementBodySchema 完成）。
- *   - 描述可读「补收单房差 ¥X/晚 × N晚」（备注不拼进描述，另落 metadata.note 与审计流水 note）。
- *   - metadata 打标 priceAdjustment=true + reasonCode='ROOM_DIFF' + perNightCny/nights，
- *     便于识别与后续对账；label 展示走 PRICE_ADJUSTMENT_REASON_LABEL['ROOM_DIFF']。
- * 导出供单测复用（金额计算 / 描述 / metadata）。
- */
-export function buildRoomSupplementItem(input: {
-  perNightCny: number;
-  nights: number;
-  note?: string;
-}): {
-  kind: OrderItemKind;
-  description: string;
-  quantity: number;
-  unitPrice: number;
-  amount: number;
-  metadata: Record<string, unknown>;
-} {
-  const amount = input.perNightCny * input.nights;
-  const note = input.note?.trim() || undefined;
-  return {
-    kind: OrderItemKind.FEE,
-    description: `补收单房差 ¥${input.perNightCny}/晚 × ${input.nights}晚`,
-    quantity: 1,
-    unitPrice: amount,
-    amount,
-    metadata: {
-      priceAdjustment: true,
-      reasonCode: 'ROOM_DIFF',
-      perNightCny: input.perNightCny,
-      nights: input.nights,
-      note: note ?? null,
-    },
-  };
-}
-
-// ── 售后升舱（经济舱 → 商务舱）辅助 ────────────────────────────────────────
-/** 舱位中文名（升舱拒绝文案 / 描述快照刷新用）。 */
-const CABIN_ZH_LABEL: Record<string, string> = {
-  ECONOMY: '经济舱',
-  PREMIUM_ECONOMY: '超级经济舱',
-  BUSINESS: '商务舱',
-  FIRST: '头等舱',
-};
-
-/**
- * 升舱差价（CNY，整数）= 每人每航段差价 × 该行人数。
- * 一条 FLIGHT 行 = 一个航段，故不再乘航段数（往返是两条行，各自升舱各自计价）。
- * 纯函数，导出供单测复用。
- */
-export function computeCabinUpgradeDiffCny(upgradeCnyPerLeg: number, quantity: number): number {
-  return Math.max(0, Math.trunc(upgradeCnyPerLeg)) * Math.max(0, Math.trunc(quantity));
-}
-
-/**
- * 升舱后刷新订单行的描述快照。
- *
- * description 是建单时写死的文本（列表/详情/导出都直接显示它），不刷新的话升完舱仍写着「经济舱」。
- * 口径：把描述里的「经济舱」（含「超级/高端/豪华经济舱」写法，整体吃掉前缀，不留「超级商务舱」）
- * 替换为「商务舱」；一处都替换不到（描述里本来就没写舱位）则在末尾追加「 · 商务舱」，
- * 保证结果里一定看得见新舱位。
- * 纯函数，导出供单测复用。
- */
-const ECONOMY_CABIN_TEXT_RE = /(?:超级|高端|豪华)?经济舱/g;
-export function buildUpgradedCabinDescription(description: string): string {
-  if (ECONOMY_CABIN_TEXT_RE.test(description)) {
-    // 带 /g 的正则有 lastIndex 状态，test 后必须归零，否则下次调用会从中途开始匹配。
-    ECONOMY_CABIN_TEXT_RE.lastIndex = 0;
-    return description.replace(ECONOMY_CABIN_TEXT_RE, '商务舱');
-  }
-  ECONOMY_CABIN_TEXT_RE.lastIndex = 0;
-  if (description.includes('商务舱')) return description;
-  return `${description} · 商务舱`;
-}
-
-/** 补房差/换酒店成本口径：每晚成本取值来源（供 metadata.costSource 与审计留痕）。 */
-export type RoomCostSource = 'ITEM_SNAPSHOT' | 'PRODUCT' | 'ZERO';
-
-/**
- * 补收单房差 FEE 行的成本口径（毛利真账）：新增计费房数 × 每晚成本 × 晚数。
- *   - 新增计费房数 addedRooms = 新旧 roomsBilled 之差（≤0 = 本次只收差价不增房 → 成本 0）。
- *   - 晚数 nights 与建行描述「¥X/晚 × N晚」的 N 同源（都来自补收入参）。
- *   - 每晚成本三级回退：① 该单酒店/套餐行下单时的成本快照 unitCostCny（每间每晚）
- *     → ② 现行房型产品 costPriceCny → ③ 都没有 = 0（如实报 0，不虚构成本）。
- *   - costSource 记来源；addedRooms≤0 或无任何成本数据 → 'ZERO'。
- * 纯函数，导出供单测复用（三级回退 + 增房差 + 无增房归零）。
- */
-export function resolveRoomSupplementCost(input: {
-  /** 订单行下单时的每间每晚成本快照（HOTEL 行有；BUNDLE 行建单未快照 → null）。 */
-  snapshotUnitCostCny?: number | null;
-  /** 现行房型产品成本价（回退口径）。 */
-  productCostPriceCny?: number | null;
-  nights: number;
-  addedRooms: number;
-}): { totalCostCny: number; costSource: RoomCostSource } {
-  if (input.addedRooms <= 0) return { totalCostCny: 0, costSource: 'ZERO' };
-  let perNight: number;
-  let costSource: RoomCostSource;
-  if (input.snapshotUnitCostCny != null) {
-    perNight = input.snapshotUnitCostCny;
-    costSource = 'ITEM_SNAPSHOT';
-  } else if (input.productCostPriceCny != null) {
-    perNight = input.productCostPriceCny;
-    costSource = 'PRODUCT';
-  } else {
-    perNight = 0;
-    costSource = 'ZERO';
-  }
-  return {
-    totalCostCny: Math.round(perNight * input.nights * input.addedRooms),
-    costSource,
-  };
-}
-
-/**
- * 换酒店后 HOTEL 行成本重打快照（毛利真账）：按新房型成本价重算，口径对齐建单时的
- * HOTEL 行快照公式（unitCostCny = 每间每晚成本；totalCostCny = 每间每晚 × 晚数 × 房数）。
- *   - 新房型未录成本价（costPriceCny 为 NULL）→ 两栏都写 null（真缺数据，如实报缺，不落 0 虚高）。
- *   - BUNDLE 行不适用（建单时未快照酒店成本，且其 quantity≠晚数、totalCostCny 覆盖整包）——
- *     由调用方跳过，本函数只服务 HOTEL 行。
- * 纯函数，导出供单测复用（重算 + null 语义）。
- */
-export function computeSwapHotelCostSnapshot(input: {
-  newCostPriceCny?: number | null;
-  /** 晚数（HOTEL 行 quantity）。 */
-  nights: number;
-  /** 计费房数（roomsBilled，支持 0.5 间）。 */
-  rooms: number;
-}): { unitCostCny: number | null; totalCostCny: number | null } {
-  if (input.newCostPriceCny == null) return { unitCostCny: null, totalCostCny: null };
-  return {
-    unitCostCny: input.newCostPriceCny,
-    totalCostCny: Math.round(input.newCostPriceCny * input.nights * input.rooms),
-  };
-}
-
-/**
- * 订单详情补录 HOTEL/VISA 的收入与成本快照公式。
- * 售价（unitPriceCny）和成本（costPriceCny）是两条独立数据流：售价可以被运营手改，
- * 成本始终按产品成本快照计算；产品没有成本时两项成本都保持 null。
- */
-export function computeGroundItemAmounts(input: {
-  kind: 'VISA' | 'HOTEL';
-  unitPriceCny: number;
-  quantity: number;
-  rooms?: number;
-  costPriceCny: number | null;
-}): { amount: number; unitCostCny: number | null; totalCostCny: number | null } {
-  const multiplier = input.kind === 'HOTEL' ? (input.rooms ?? 1) : 1;
-  const amount = Math.round(input.unitPriceCny * input.quantity * multiplier);
-  if (input.costPriceCny == null) {
-    return { amount, unitCostCny: null, totalCostCny: null };
-  }
-  return {
-    amount,
-    unitCostCny: input.costPriceCny,
-    totalCostCny: Math.round(input.costPriceCny * input.quantity * multiplier),
-  };
-}
-
-/** 录入默认价：有成本就带出成本；无成本必须由录入人显式填写售价。 */
-export function resolveGroundItemUnitPrice(input: {
-  requestedUnitPriceCny?: number;
-  costPriceCny: number | null;
-  label: string;
-}): number {
-  if (input.requestedUnitPriceCny != null) return input.requestedUnitPriceCny;
-  if (input.costPriceCny == null) {
-    throw new BadRequestError(`该${input.label}产品没有成本价，请手动填写售价`);
-  }
-  return input.costPriceCny;
-}
-
-/**
- * 判定「本单是否有回程航段」——纯函数，与 determineFlightLegs 同一口径
- *（带班次的 FLIGHT 行按 departureTime 升序，存在第 2 段 = 有回程）。
- * 抽出来是为了让物化列 Order.hasReturnLeg 的写入口径可单测，不必起库。
- */
-export function resolveHasReturnLeg(items: ReadonlyArray<FlightLegItem>): boolean {
-  return determineFlightLegs(items).returnScheduleId !== null;
-}
-
-/**
- * 把 Order.hasReturnLeg 物化列同步到当前订单行的真实结构。
- *
- * **必须在同一事务内调用**，且调用点要覆盖所有「增删 FLIGHT 行 / 改 flightScheduleId」的写路径
- * —— 列一旦与订单行脱钩，「回程未开」筛选与单程/往返筛选就会静默给错清单（漏单比多单更糟）。
- * 幂等：重复调用只是把同一个值再写一遍，可安全用作自愈。
- */
-export async function syncOrderHasReturnLeg(
-  tx: Prisma.TransactionClient,
-  orderId: string,
-): Promise<boolean> {
-  const items = await tx.orderItem.findMany({
-    where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
-    select: {
-      flightScheduleId: true,
-      flightSchedule: { select: { departureTime: true, departureTz: true } },
-    },
-  });
-  const hasReturnLeg = resolveHasReturnLeg(items);
-  await tx.order.update({ where: { id: orderId }, data: { hasReturnLeg } });
-  return hasReturnLeg;
-}
-
-/**
- * 把 Order.legFlag 物化列同步到 FLIGHT 行 metadata 的真实状态。
- *
- * 真源永远是行上的快照（noShow / returnReleased / returnRestored / returnVoidedFinal）；
- * 本列只是为了让列表筛选与导出**筛得出来** —— Prisma 的 where 表达不了「关联行的 JSON 里
- * 某个键存在、且它的 at 比另一个键的 at 新」，不物化就只能把全表拉进内存现算。
- *
- * 派生**完全委托** orders.leg-status 的 deriveLegStatus —— 导出列「航段状态」用的就是它，
- * 两边各写一套判断迟早会漂移（本列曾经漏了「取消航段」这一态：取消回程后 legFlag 停在 NONE / NO_SHOW，
- * 导出列却已经写着「回程已作废」，同一张单在筛选和导出里对不上）。
- *
- * 单行状态 → 物化列的映射（优先级同 deriveLegStatus：作废 > 已释放 > 已恢复 > 去程未登机）：
- *   去程已作废      → OUTBOUND_VOIDED   终局（取消航段取消的是去程）
- *   回程已作废      → RETURN_VOIDED     终局（起飞后作废 returnVoidedFinal，或取消航段取消回程）
- *   回程座位已释放  → RETURN_RELEASED   可恢复（班次为空 + 释放晚于最近一次恢复）
- *   回程已恢复      → RETURN_RESTORED   释放过、已恢复回原班次
- *   去程未登机      → NO_SHOW           去程标过 no-show，但回程没被释放（单程单/未勾释放）
- *   一条都没有      → NONE
- *
- * **必须与 syncOrderHasReturnLeg 成对调用**（同一事务、同一批写路径）：两列都是从同一批
- * FLIGHT 行派生的，只同步一个就会出现「列表按回程已释放筛得到、按往返筛不到」这种自相矛盾。
- * 幂等：重复调用只是把同一个值再写一遍，可安全用作自愈。
- */
-export async function syncOrderLegFlag(
-  tx: Prisma.TransactionClient,
-  orderId: string,
-): Promise<OrderLegFlag> {
-  const items = await tx.orderItem.findMany({
-    where: { orderId, kind: OrderItemKind.FLIGHT },
-    select: { kind: true, flightScheduleId: true, metadata: true },
-  });
-  const statuses = new Set(items.map((it) => deriveLegStatus(it)).filter((v) => v != null));
-
-  let legFlag: OrderLegFlag = OrderLegFlag.NONE;
-  if (statuses.has('去程已作废')) {
-    // 去程作废优先于回程作废：两段都取消过的单，最要紧的事实是「去程没了」（整趟行程不成立）。
-    legFlag = OrderLegFlag.OUTBOUND_VOIDED;
-  } else if (statuses.has('回程已作废')) {
-    legFlag = OrderLegFlag.RETURN_VOIDED;
-  } else if (statuses.has('回程座位已释放')) {
-    legFlag = OrderLegFlag.RETURN_RELEASED;
-  } else if (statuses.has('回程已恢复')) {
-    legFlag = OrderLegFlag.RETURN_RESTORED;
-  } else if (statuses.has('去程未登机')) {
-    legFlag = OrderLegFlag.NO_SHOW;
-  }
-
-  await tx.order.update({ where: { id: orderId }, data: { legFlag } });
-  return legFlag;
-}
-
-type PricedOrderItem = {
-  kind: OrderItemKind;
-  description: string;
-  quantity: number;
-  unitPrice: number;
-  amount: number;
-  flightScheduleId?: string;
-  flightCabin?: import('@prisma/client').CabinClass;
-  businessUpgradeCount?: number;
-  hotelRoomTypeId?: string;
-  randomStarTier?: number;
-  hotelCheckIn?: Date;
-  hotelCheckOut?: Date;
-  transferId?: string;
-  visaId?: string;
-  /** 签证预计出行日期（VISA 行专用，可空）：纯签证单的出发日锚点，见 deriveOrderDepartDate 第三级回退。 */
-  visaIntendedDate?: Date;
-  bundleId?: string;
-  roomsBilled?: number;
-  settlementAddOnCny?: number;
-  unitCostCny?: number;
-  totalCostCny?: number;
-  metadata?: Record<string, unknown>;
-};
-
-type AutoDiscountSummary = {
-  hits: Array<{
-    ruleId: string;
-    kind: SettlementDiscountHit['kind'];
-    perPersonCny: number;
-    pax: number;
-  }>;
-  pax: number;
-  totalCny: number;
-};
-
 type RescheduleCommittedContext = {
   orderItemId: string;
   oldScheduleId: string;
@@ -1702,25 +791,6 @@ export interface AgentStatsResult {
   direct: { orders: number; revenueCny: number };
   /** 各代理汇总，按成交额从高到低。*/
   agents: Array<{ agentId: string; agentName: string; orders: number; revenueCny: number }>;
-}
-
-// ── 重复乘客校验：入参 / 出参形状 + 姓名比对键 ────────────────────────────────
-
-/** 参与同班次重复校验的一位乘客（建单入参与库里既有行共用这一份形状）。 */
-export interface DuplicateCheckPassenger {
-  documentNumber?: string | null;
-  lastName?: string | null;
-  firstName?: string | null;
-  fullName?: string | null;
-  chineseName?: string | null;
-}
-
-/** 一条重复命中。documentNumber 为空串 = 对方证件待补、按姓名命中（passengerName 才是那个键）。 */
-export interface DuplicatePassengerConflict {
-  documentNumber: string;
-  orderNumbers: string[];
-  /** 仅「证件待补 + 同名」命中时有值：命中的那位乘客姓名（展示/审计用）。 */
-  passengerName?: string;
 }
 
 /**
@@ -1798,61 +868,6 @@ export async function getSwapFeeOptions(
   return parsed.length > 0 ? parsed : [...DEFAULT_SWAP_FEE_OPTIONS_CNY];
 }
 
-/**
- * 这张**存量**订单建单时那次「结算价日历自动取价」的审计快照（换人重算差价基准的最后一条来源）。
- *
- * 2026-09 之前建的单，SETTLEMENT 行上只有整单结算总价，没有基准戳，光看这一行分不出
- *「日历自动取的价」和「运营手填的结算总价 / 团队议价」—— 后者不是日历成交，日历动没动
- * 跟它一分钱关系都没有，拿日历去「纠正」它就是无中生有地多收/少收。
- * 唯一留在库里的判据是建单时那条 APPLY_SETTLEMENT_TOTAL 审计的 after.settlementCalendar
- *（日历取价时非空、手工价时为 null，见 createOrder 的结算价审计段），它里面存的是
- * `{ source, departDate, lines:[{ pricePerPersonCny, pax, … }], autoDiscount? }` ——
- * **每人价原样躺在 lines 上**，不需要拿总价去除人数。
- *
- * 复审 H1/H2 之后本函数从「返回 true/false」改成「把这个 blob 原样交出来」：
- * 旧口径用它当一道闸、再拿 settlementTotalCny ÷ 占座人数派生基准，而那个总价里揉着
- * 单房差 / 升舱 / 婴儿价 / 儿童折扣 / 指定酒店加价 / 自备签减免，除出来的根本不是日历每人价。
- * 现在直接跑 resolveCalendarPerPaxBasis 读 lines，与建单当场盖章走的是同一份口径。
- *
- * 读不到（审计表没铺 / 查询失败 / 没有这条记录）一律返回 null —— 判不出就不重算，
- * 只收换人费。宁可少做一次自动重算，也不能按猜出来的基准改钱。
- */
-/**
- * 本单**已计提**（含已结算）的佣金合计（CNY）；一条都没有 → null。
- *
- * 佣金在订单转 PAID 时按当时的价格基数一次性计提，之后任何改价都不重算 —— 所以每一条会动
- * total 的路（改结算价 / 改归属 / 换人重算）都得先问一句「这单计提过没有」，有就留一条
- * SETTLEMENT_PRICE_CHANGED_AFTER_COMMISSION 的 WARNING，让财务自己决定要不要人工调整。
- * 三处共用这一份读法，免得各写各的口径（状态集合漏一个就少留一条审计）。
- *
- * 单测常只 mock 用得到的 delegate：**delegate 压根不在**（没铺 commissionRecord）或一条记录都没有
- * → null（当「没计提」）。但**查询本身失败不吞**：往上抛。
- * 这条路上的三个调用方（改结算价 / 改归属 / 换人重算）都在事务里，且都要靠这个数决定留不留
- * 「佣金基数已漂移」的 WARNING —— 把查询异常吞成 null，等于在真出错时静默宣布「本单没计提过佣金」，
- * 该留的审计不留，财务事后对不上账也翻不出是哪一步动的。原本的改结算价路径就是直接查、
- * 出错整事务回滚（响亮失败），抽成公共函数不能顺手把这份响亮改没了。
- */
-async function sumAccruedCommissionCny(
-  client: Prisma.TransactionClient | typeof prisma,
-  orderId: string,
-): Promise<number | null> {
-  const delegate = (
-    client as unknown as {
-      commissionRecord?: {
-        findMany?: (args: unknown) => Promise<Array<{ amount: unknown }>>;
-      };
-    }
-  ).commissionRecord;
-  if (!delegate || typeof delegate.findMany !== 'function') return null;
-  // 查询异常不吞（见方法头）：抛出去让调用方的事务整体回滚，别把「读失败」说成「没计提」。
-  const rows = await delegate.findMany({
-    where: { orderId, status: { in: [CommissionStatus.ACCRUED, CommissionStatus.SETTLED] } },
-    select: { amount: true },
-  });
-  if (!Array.isArray(rows) || rows.length === 0) return null;
-  return round2(rows.reduce((sum, c) => sum + Number(String(c.amount ?? 0)), 0));
-}
-
 async function readOrderSettlementCalendarAudit(
   client: Prisma.TransactionClient | typeof prisma,
   orderId: string,
@@ -1882,19 +897,8 @@ async function readOrderSettlementCalendarAudit(
   return calendar as Record<string, unknown>;
 }
 
-/**
- * service 层内联闸的唯一入口，与路由层的 requireCapability / can() 同一张表。
- *
- * actor 只带 role —— service 的调用签名里没有岗位，也不需要：这里用到的能力受众全是
- * 「管理员 / 内部员工 / 代理」这三档，不看岗位。真正看岗位的两档（财务、航班维护）
- * 在路由层的 requireCapability 上就判完了，进不到这里。
- */
-function actorCan(actor: { role: UserRole }, cap: Capability): boolean {
-  return hasCapability({ role: actor.role }, cap);
-}
-
 export class OrderService {
-  private readonly pricing = new PricingService();
+  readonly pricing = new PricingService();
 
   /**
    * 占位单转正专用的事务内机票建单内核。
@@ -17903,7 +16907,6 @@ export class OrderService {
         data: { status: FulfillmentStatus.CANCELLED, completedAt: now },
       });
 
-
       // ── 6. 物化列 hasReturnLeg 同步（此刻只剩一段有效航段 → 必然回落 false）──
       await syncOrderHasReturnLeg(tx, orderId);
       await syncOrderLegFlag(tx, orderId);
@@ -19762,8 +18765,7 @@ export class OrderService {
     }
 
     return { order, item, blockers, departed, original };
-  }
-}
+  }}
 
 // ── 取消航段：常量 + 订单快照加载 + 对外契约类型 ────────────────────────────────
 
@@ -19994,405 +18996,6 @@ function stripReturnReleasedPrefix(description: string): string {
     if (description.startsWith(prefix)) return description.slice(prefix.length);
   }
   return description;
-}
-
-/**
- * 释放/恢复的座位明细（放几座恢复几座的唯一依据）。
- * 写成 type 而非 interface：它要作为 metadata 快照的一部分赋给 Prisma.InputJsonValue，
- * 只有类型别名才拿得到隐式索引签名（interface 拿不到，会编译不过）。
- */
-export type ReleasedSeatEntry = {
-  scheduleId: string;
-  cabin: CabinClass;
-  quantity: number;
-};
-
-/**
- * 回程行 metadata.returnReleased 的快照形状（防御式读，字段都可能缺）。
- * `returnVoidedFinal` 由「回程起飞后自动作废」的后续 job 补写在**同级 metadata** 上，
- * 恢复端点见到即拒绝 —— 本版不实现那个 job，但结构位置先钉死，届时零迁移接入。
- */
-export interface ReturnReleasedSnapshot {
-  at?: string;
-  byUserId?: string;
-  requestToken?: string;
-  reason?: string;
-  originalDescription?: string;
-  originalScheduleId?: string | null;
-  originalCabin?: CabinClass | null;
-  releasedSeats?: ReleasedSeatEntry[];
-  ticketedAtRelease?: number;
-  /** 释放当时回程是否为「已开票」态（释放会把它清成未开，恢复不自动翻回；老快照缺省 undefined）。 */
-  returnInvoicedAtRelease?: boolean;
-  workOrderReminderId?: string | null;
-  note?: string | null;
-}
-
-/**
- * 航段动作类型（legActionLog 条目的 type）。
- * 每个端点只接受属于自己的那几种：no-show 端点接 NO_SHOW/RELEASE，恢复只接 RESTORE，
- * 取消航段只接 CANCEL_LEG，起飞后作废只接 VOID，按人改期的全员快路径只接
- * RESCHEDULE_ALL —— 跨动作复用同一个 token 一律拒。
- */
-export type LegActionType =
-  | 'NO_SHOW'
-  | 'RELEASE'
-  | 'RESTORE'
-  | 'CANCEL_LEG'
-  | 'VOID'
-  | 'RESCHEDULE_ALL';
-
-/**
- * 一条航段动作流水（no-show / 再释放 / 恢复 / 取消航段 / 作废各一条）。
- * 幂等回放认的就是这里的 requestToken —— 见下方 collectLegActionEntries 的注释。
- */
-export type LegActionLogEntry = {
-  type: LegActionType;
-  requestToken: string;
-  at: string;
-  byUserId: string;
-  /** 本次动了几座（释放 / 恢复才有）。 */
-  seats?: number;
-  /** 本次恢复是否超售（RESTORE 才有）。 */
-  oversold?: boolean;
-  /**
-   * 本次**新增**的超售座数（RESTORE 才有）。
-   * 只记布尔的 oversold 说不出量：同一行释放→恢复→再释放→再恢复反复几轮，
-   * 快照 returnRestored 是覆盖写，只留得下最后一轮 —— 报表按快照统计会漏掉中间几轮的超售。
-   */
-  oversoldBy?: number;
-  /** 本次挤掉了几座他人软预留（他人 ACTIVE 锁位 + 占位单余座；RESTORE 才有）。 */
-  displacedReserved?: number;
-  /**
-   * 本次动作的关键入参指纹（见 legActionFingerprint）。
-   * 回放时逐字比对：同一个 token 换一份请求体再发一次，指纹对不上就拒，绝不静默按上一次的入参回成功。
-   */
-  fingerprint?: string;
-};
-
-/**
- * 关键入参 → 稳定指纹字符串（键排序后 JSON），回放比对用。
- *
- * 只放**会改变落库结果**的字段：
- *   · no-show    { releaseReturn, passengerIds(去重排序) } —— 决定放不放座、给谁打标；
- *   · 取消航段    { leg, feeMode, manualRefundCny, manualFeeCny, overrideReason } —— 决定放哪一段、
- *                 退多少钱（manualRefundCny 与老字段 manualFeeCny 都入指纹，换任一个都会指纹不符）；
- *   · 恢复回程    {} —— 恢复目标（班次/座数）只由释放快照决定，请求体里没有一个字段能改结果，
- *                 allowOversell 只是「没座时要不要继续」的确认位，刻意不入指纹；
- *   · 起飞后作废  {} —— 同上，只有 note。
- * note 一律不入指纹：它是给人看的备注，改了备注不该把一次正当的重试拦成 409。
- */
-function legActionFingerprint(payload: Record<string, unknown>): string {
-  const normalize = (value: unknown): unknown => {
-    if (Array.isArray(value)) return value.map(normalize);
-    if (value != null && typeof value === 'object') {
-      const obj = value as Record<string, unknown>;
-      const out: Record<string, unknown> = {};
-      for (const key of Object.keys(obj).sort()) out[key] = normalize(obj[key]);
-      return out;
-    }
-    return value === undefined ? null : value;
-  };
-  return JSON.stringify(normalize(payload));
-}
-
-/** no-show / 再释放的入参指纹（决定放不放座、给谁打标）。 */
-function noShowFingerprint(input: { releaseReturn: boolean; passengerIds?: string[] }): string {
-  return legActionFingerprint({
-    releaseReturn: input.releaseReturn,
-    passengerIds: [...new Set(input.passengerIds ?? [])].sort(),
-  });
-}
-
-/**
- * 取消航段的入参指纹（决定放哪一段、退多少钱、凭什么覆盖政策）。
- *
- * manualRefundCny 与老字段 manualFeeCny 都入指纹（各自原样入，不做互相换算）：
- * 同一个 token 换任一个字段的值重放都必须指纹不符，绝不能靠「反正最后算出来的钱一样」
- * 就放行——那等于允许运营用老字段悄悄绕过新字段的校验路径再重放一次。
- */
-function cancelLegFingerprint(input: CancelLegBody): string {
-  return legActionFingerprint({
-    leg: input.leg,
-    feeMode: input.feeMode,
-    manualRefundCny:
-      input.feeMode === 'MANUAL' && input.manualRefundCny != null
-        ? Math.trunc(input.manualRefundCny)
-        : null,
-    manualFeeCny: input.feeMode === 'MANUAL' ? Math.trunc(input.manualFeeCny ?? 0) : null,
-    overrideReason: input.overrideReason?.trim() || null,
-  });
-}
-
-/**
- * 按人改期「全员快路径」的入参指纹（决定改哪一行、改到哪、收多少差价）。
- *
- * 这条路径不拆单，直接落到整单改期上 —— 座位真搬、差价真记，重复执行就是重复计费，
- * 所以幂等只能靠 token 绑定：同一个 requestToken 命中且指纹一致才回放，对不上一律 409。
- * feeLabel / note 不入指纹（只影响留痕文案，改个备注重试不该被拦成 409）。
- */
-function rescheduleAllFingerprint(input: {
-  orderItemId?: string;
-  newScheduleId: string;
-  newCabin?: CabinClass;
-  feeCny?: number;
-}): string {
-  return legActionFingerprint({
-    orderItemId: input.orderItemId ?? null,
-    newScheduleId: input.newScheduleId,
-    newCabin: input.newCabin ?? null,
-    feeCny: Math.trunc(input.feeCny ?? 0),
-  });
-}
-
-/** 恢复回程 / 起飞后作废的入参指纹：请求体里没有能改变结果的字段，恒为空对象。 */
-const EMPTY_LEG_ACTION_FINGERPRINT = legActionFingerprint({});
-
-/** 防御式读一行 metadata 上的 legActionLog（形状不符 / 缺 token 的条目直接丢弃）。 */
-function readLegActionLog(metadata: unknown): LegActionLogEntry[] {
-  const raw = readJsonObject(metadata).legActionLog;
-  if (!Array.isArray(raw)) return [];
-  return raw.filter(
-    (e): e is LegActionLogEntry =>
-      e != null &&
-      typeof e === 'object' &&
-      !Array.isArray(e) &&
-      typeof (e as { requestToken?: unknown }).requestToken === 'string' &&
-      (e as { requestToken: string }).requestToken !== '',
-  );
-}
-
-/** 老数据里的快照键 → 动作类型（那批行没有 legActionLog，只能按快照位置反推）。 */
-const LEG_SNAPSHOT_ACTION_TYPE: ReadonlyArray<[string, LegActionType]> = [
-  ['noShow', 'NO_SHOW'],
-  ['returnReleased', 'RELEASE'],
-  ['returnRestored', 'RESTORE'],
-  ['returnLegCancelled', 'CANCEL_LEG'],
-  ['returnVoidedFinal', 'VOID'],
-];
-
-/** 「这个 token 见过没有、是哪种动作、当初的入参指纹是什么」。 */
-export type LegActionTokenLookup = {
-  /** 这张单的任一航段行见过这个 token（= 本次请求是重试）。 */
-  seen: boolean;
-  /** 当初那次是什么动作；老快照只能按快照位置反推，反推不出为 null。 */
-  type: LegActionType | null;
-  /** 当初那次的入参指纹；老数据没有 → null（回放一律 fail-closed）。 */
-  fingerprint: string | null;
-};
-
-/**
- * 该行见过的**全部** requestToken 及其动作类型 / 入参指纹（幂等回放的唯一依据）。
- *
- * 为什么不能只查「当前快照上的 token」：释放 → 恢复 → 再释放 → 再恢复可以反复发生，
- * returnReleased / returnRestored 每次都会被新快照覆盖（旧的压进 history 或直接被顶掉），
- * 于是**中间几轮的 token 就再也扫不到了** —— 那几轮的延迟重试会绕过回放，二次放座 / 二次占座，
- * 座位账凭空多算或少算一批，事后极难查。
- *
- * 现在每次动作都往行上的 legActionLog 追加一条（append-only，永不覆盖），条目里带着**动作类型**
- * 与**入参指纹**。集合同时兜住老数据：本次改动之前落库的行没有 legActionLog，token 只存在于
- * 当前快照与各自的 history 里，一并扫进来（类型按快照位置反推，指纹一律 null）。
- */
-function collectLegActionEntries(metadata: unknown): Map<string, LegActionTokenLookup> {
-  const out = new Map<string, LegActionTokenLookup>();
-  const push = (token: unknown, type: LegActionType | null, fingerprint: unknown): void => {
-    if (typeof token !== 'string' || token === '') return;
-    // 同一个 token 若两处都留了痕，以带指纹的那条为准（流水比快照更权威）。
-    const prior = out.get(token);
-    if (prior?.fingerprint != null) return;
-    out.set(token, {
-      seen: true,
-      type,
-      fingerprint: typeof fingerprint === 'string' && fingerprint !== '' ? fingerprint : null,
-    });
-  };
-  for (const entry of readLegActionLog(metadata)) {
-    push(entry.requestToken, entry.type ?? null, entry.fingerprint);
-  }
-  const meta = readJsonObject(metadata);
-  for (const [key, type] of LEG_SNAPSHOT_ACTION_TYPE) {
-    const snap = readJsonObject(meta[key]);
-    push(snap.requestToken, type, null);
-    for (const history of [snap.history, snap.releaseHistory]) {
-      if (!Array.isArray(history)) continue;
-      for (const item of history) push(readJsonObject(item).requestToken, type, null);
-    }
-  }
-  return out;
-}
-
-/** 这张单的任一航段行见过这个 token 吗（连同当初的动作类型与入参指纹一起回）。 */
-function hasSeenLegActionToken(
-  rows: ReadonlyArray<{ metadata: unknown }>,
-  requestToken: string,
-): LegActionTokenLookup {
-  let fallback: LegActionTokenLookup | null = null;
-  for (const row of rows) {
-    const hit = collectLegActionEntries(row.metadata).get(requestToken);
-    if (!hit) continue;
-    if (hit.fingerprint != null) return hit;
-    fallback = fallback ?? hit;
-  }
-  return fallback ?? { seen: false, type: null, fingerprint: null };
-}
-
-/**
- * 回放前的守闸：动作类型与入参指纹都要对得上，否则 409。
- *
- * 两类不一致各自会造成什么：
- *   · **类型不一致** —— 同一个 token 先用来取消航段、又拿去标 no-show：按 token 命中就回放，
- *     运营会看到「no-show 成功」而实际上什么都没发生（座位早按取消政策放掉、钱也已经结过）。
- *   · **指纹不一致** —— 同 token 换一份请求体重发（弹窗里改了「同时释放回程」的勾选又点重试）：
- *     回放照样回成功，运营以为这次的勾选生效了，实际座位早按上一次的勾选处置完了。
- *
- * 老数据（本次改动之前落库的行）没有指纹，一律 **fail-closed**：宁可让运营换个新请求编号
- * 重新预检一遍，也不能凭「读不出来」就按老入参回一个成功。
- */
-function assertLegActionTokenReplay(
-  lookup: LegActionTokenLookup,
-  accepts: readonly LegActionType[],
-  fingerprint: string,
-): void {
-  if (lookup.type == null || !accepts.includes(lookup.type)) {
-    throw tokenPayloadMismatchError(
-      { reason: 'ACTION_TYPE', priorType: lookup.type, expectedTypes: [...accepts] },
-      '这个请求编号已经用在另一种航段操作上了，请重新预检并用新的请求编号提交。',
-    );
-  }
-  if (lookup.fingerprint == null) {
-    throw tokenPayloadMismatchError(
-      { reason: 'LEGACY_SNAPSHOT', priorType: lookup.type },
-      '这个请求编号的历史留痕里没有入参记录，无法确认与本次是同一个请求；' +
-        '请重新预检并用新的请求编号提交。',
-    );
-  }
-  if (lookup.fingerprint !== fingerprint) {
-    throw tokenPayloadMismatchError({
-      reason: 'PAYLOAD',
-      priorType: lookup.type,
-      priorFingerprint: lookup.fingerprint,
-      currentFingerprint: fingerprint,
-    });
-  }
-}
-
-/** 往行 metadata 追加一条动作流水，返回新的 legActionLog 数组（原数组不改）。 */
-function appendLegActionLog(metadata: unknown, entry: LegActionLogEntry): LegActionLogEntry[] {
-  return [...readLegActionLog(metadata), entry];
-}
-
-/** 按人改期编排入参指纹里归一化后的 roomSplit 行。 */
-type OrchestrationRoomSplitRow = { itemId: string; roomsBilledToMove: number };
-
-/** 拆单流水 snapshot.orchestration 的形状（落库与回放比对共用同一个类型）。 */
-export type SplitOrchestrationSnapshot = Record<
-  string,
-  string | number | null | OrchestrationRoomSplitRow[]
->;
-
-/**
- * orchestration 里**不参与指纹比对**的键：不是请求入参，是首刷时算出来留给回放用的派生值。
- * 拿它们比对等于要求「回放前先把这个值算出来」—— 而回放要解决的恰恰是算不出来。
- */
-const ORCHESTRATION_DERIVED_KEYS: readonly string[] = ['leg'];
-
-/** 编排入参指纹：剔掉派生记录后按键序无关序列化。 */
-function orchestrationFingerprint(snapshot: Record<string, unknown>): string {
-  const inputsOnly: Record<string, unknown> = { ...snapshot };
-  for (const key of ORCHESTRATION_DERIVED_KEYS) delete inputsOnly[key];
-  return canonicalJson(inputsOnly);
-}
-
-/** 从留档的 orchestration 里读回首刷派生的航段（读不出合法值就当没留）。 */
-function readOrchestrationLeg(value: unknown): 'OUTBOUND' | 'RETURN' | null {
-  return value === 'OUTBOUND' || value === 'RETURN' ? value : null;
-}
-
-/**
- * 按人改期的编排入参指纹（拆单流水 snapshot.orchestration 的唯一构造口径）。
- *
- * 落库与比对必须走同一个函数、同一个键序 —— 两处各写一份对象字面量，
- * 早晚会因为键序或缺省值不同而把「同一个请求」判成不一致，运营侧表现为莫名其妙的 409。
- *
- * **进指纹的是「会改变结果的入参」**：
- *   · orderItemId / newScheduleId / newCabin / feeCny —— 改哪一段、改到哪、收多少差价。
- *   · roomSplit —— 每张酒店行搬几间房，直接决定两侧订单的金额与房控占用；同 token 换一份
- *     房数重发，若不比对就会静默回放上一轮的拆法，运营以为新的房数生效了。
- *     行序不是语义（前端按弹窗行序发），这里统一按 itemId 升序、房数转 number 后再落；
- *     不传 = null，与「传了空数组」区分开。
- *
- * **不进指纹的**：feeLabel / note —— 只影响留痕文案，不改变座位、金额、房控任何结果。
- * 把它们纳进来只会让运营改个备注重试就吃 409。
- *
- * `leg` 是**派生记录**而不是入参：它由 orderItemId 在源单上推出来，留档只为了回放时
- * 源单已无该行还能定位航段（见 ORCHESTRATION_DERIVED_KEYS），因此不参与指纹比对。
- */
-function reschedulePassengersOrchestration(
-  input: {
-    orderItemId: string;
-    newScheduleId: string;
-    newCabin?: CabinClass;
-    feeCny?: number;
-    roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
-  },
-  leg: 'OUTBOUND' | 'RETURN' | null,
-): SplitOrchestrationSnapshot {
-  return {
-    orderItemId: input.orderItemId,
-    newScheduleId: input.newScheduleId,
-    newCabin: input.newCabin ?? null,
-    feeCny: Math.trunc(input.feeCny ?? 0),
-    leg,
-    roomSplit:
-      input.roomSplit == null
-        ? null
-        : [...input.roomSplit]
-            .map((row) => ({
-              itemId: row.itemId,
-              roomsBilledToMove: Number(row.roomsBilledToMove),
-            }))
-            .sort((a, b) => (a.itemId < b.itemId ? -1 : a.itemId > b.itemId ? 1 : 0)),
-  };
-}
-
-/** 幂等回放时入参与首刷对不上 —— 稳定 code，前端据此提示换新请求编号重试。 */
-function tokenPayloadMismatchError(
-  detail: Record<string, unknown>,
-  message = '这个请求编号已用于另一次操作，请刷新后重试。',
-): AppError {
-  return new AppError(message, {
-    statusCode: 409,
-    code: 'TOKEN_PAYLOAD_MISMATCH',
-    details: detail,
-  });
-}
-
-/**
- * 改期的幂等键在**订单行锁内**被判定为「已经用过」时的 409。
- *
- * 与 TOKEN_PAYLOAD_MISMATCH 分开是因为成因不同：那个是「同编号换了一份入参」（请求本身有问题），
- * 这个是「同编号的另一次提交正好在并发执行、并且先一步提交了」（请求没问题，只是撞车了）。
- * 客户端刷新后原样重发即可 —— 那时首刷已提交，编排层的回放分支会正常返回成功。
- */
-function rescheduleTokenInFlightError(requestToken: string): AppError {
-  return new AppError('这个请求编号刚刚已经被另一次提交用掉了，请刷新订单确认改期结果后再操作。', {
-    statusCode: 409,
-    code: 'RESCHEDULE_TOKEN_IN_FLIGHT',
-    details: { requestToken },
-  });
-}
-
-/**
- * 「勾了人但一个都没勾」的防御式断言（no-show 预检与执行共用）。
- *
- * `passengerIds` 的语义是**缺省才等于整单**：不传 = 没有按人选择 = 整单全员。
- * 传 `[]` 是另一回事 —— 前端勾选框全部取消时会发出这个形状，把它当成整单
- * 就会给全单的人打 no-show 标、把全单的回程座位放回库存，而请求体看上去毫无异常。
- */
-function assertNonEmptyPassengerSelection(passengerIds: readonly string[] | undefined): void {
-  if (passengerIds != null && passengerIds.length === 0) {
-    throw new BadRequestError('至少选择 1 位乘客；如需对整单操作请不要传乘客名单。');
-  }
 }
 
 /** 本次 no-show 的作用范围：整单 / 需要先按人拆单。 */
@@ -20649,184 +19252,6 @@ type RestoreSeatNeed = {
   reserved: number;
 };
 
-/**
- * 恢复回程时逐舱位的超售三值（快照 returnRestored.seatDetail[] 与审计 after 直接落这个形状）。
- * 写成 type 而非 interface：它要作为 metadata 快照的一部分赋给 Prisma.InputJsonValue，
- * 只有类型别名才拿得到隐式索引签名（口径同 ReleasedSeatEntry）。
- */
-export type OversellSeatDetail = {
-  cabin: CabinClass;
-  /** 本次要占回该舱几座。 */
-  quantity: number;
-  /** 占座**前**该舱超售几座（= sold − capacity，负数表示还有物理空位；锁位/占位不算超售）。 */
-  before: number;
-  /** 占座**后**该舱超售几座。 */
-  after: number;
-  /** 本次**新增**的超售座数 = max(0, after) − max(0, before)，恒 ≥ 0。 */
-  increment: number;
-};
-
-/**
- * 恢复回程的超售口径（预检与执行共用同一份算法，两边不再各算各的）。
- *
- * ── 「超售」的唯一口径 = 纯 `sold vs capacity` ────────────────────────────────
- *   before    = sold − capacity      占座**前**这一舱真的多卖了几座（负数 = 还有物理空位）
- *   after     = before + quantity    占座**后**多卖几座
- *   increment = max(0,after) − max(0,before)   本次**新增**几座超售，恒 ≥ 0
- *
- * ⚠ 这里**不减锁位、不减占位单余座**。那两样是「暂时不让别人卖」的软占用，不是已经卖出去的
- * 座位：航司那边的实际卖出数只有 sold。旧写法用 available（= capacity − sold − 锁位 − 占位）
- * 反推 before，于是一班明明还有 20 个物理空位、只是被锁位/占位单占满时，恢复 2 座会被报成
- *「超售 2 座、班次累计超 2 座」，还可能直接顶到 FLIGHT_NOSHOW_MAX_OVERSELL_SEATS 上限被拒 ——
- * 而这一班一座都没超卖。审计与房控看到的「超售座数」也跟着虚高，风控判断失真。
- * 锁位/占位只参与另一件事：**这次是走 CAS 正常占座还是走超售直加**（那里仍用 available，
- * 见 restoreReturnLeg 的占座循环）—— 别人锁着的位子确实不能当成有座直接抢。
- *
- * ⚠ 增量与累计是两个数，混用过一次就再也看不出班次被卖到了什么程度：
- *   · `oversellBy`   = Σ increment —— **本次新增**几座超售，前端二次确认与「本次 +k」用它；
- *   · `oversoldAfter`= Σ max(0, after) —— 恢复**之后**该班这些舱一共超出几座，风控与上限判定用它。
- *
- * 多舱位（升舱拆座）一律**求和**而不是取最大值：经济舱超 2 + 商务舱超 1 就是这一班超了 3 座。
- */
-export function computeOversellDelta(
-  needs: ReadonlyArray<{ cabin: CabinClass; quantity: number; capacity: number; sold: number }>,
-): { detail: OversellSeatDetail[]; oversellBy: number; oversoldAfter: number } {
-  const detail: OversellSeatDetail[] = needs.map((need) => {
-    const before = need.sold - need.capacity;
-    const after = before + need.quantity;
-    return {
-      cabin: need.cabin,
-      quantity: need.quantity,
-      before,
-      after,
-      increment: Math.max(0, after) - Math.max(0, before),
-    };
-  });
-  return {
-    detail,
-    oversellBy: detail.reduce((n, d) => n + d.increment, 0),
-    oversoldAfter: detail.reduce((n, d) => n + Math.max(0, d.after), 0),
-  };
-}
-
-/**
- * 逐舱「本次会挤掉多少别人的软预留」。
- *
- * 缺口 = quantity − max(0, available)：available 已经把他人锁位与占位余座扣掉了，夹 0 是因为
- * available 为负（班次已超售）时物理空位本来就是 0，负数再往上加会把缺口算大。
- * 缺口里能由软预留兜住的那部分就是被挤掉的预留，上限自然是该舱现有的 reserved；
- * 剩下的部分才是真·物理超售（口径见 computeOversellDelta 的 increment，与本函数各算各的）。
- *
- * 为什么要单独算：sold 没超 capacity 时超售口径是 0，但座位确确实实是从别人锁着的位子里抢来的 ——
- * 只看超售数就会得出「这次恢复零风险」，而对面那张锁位单下一秒下单就会失败，且审计里查不到原因。
- */
-export function computeDisplacedReserved(
-  need: { quantity: number; available: number; reserved: number },
-): number {
-  const shortfall = Math.max(0, need.quantity - Math.max(0, need.available));
-  return Math.max(0, Math.min(shortfall, need.reserved));
-}
-
-/** 恢复回程时逐舱的「挤占软预留」明细（快照与审计 after 直接落这个形状）。 */
-export type DisplacedReservationDetail = {
-  cabin: CabinClass;
-  /** 本次要占回该舱几座。 */
-  quantity: number;
-  /** 其中挤掉了几座别人的软预留（他人 ACTIVE 锁位 + 占位单余座）。 */
-  displacedReserved: number;
-  /** 其中有几座是真·物理超售（= computeOversellDelta 的 increment）。 */
-  physicalIncrement: number;
-};
-
-/**
- * 某班次某舱位的座位现状；该舱位没有配置时返回 null（调用方据此给 blocker）。
- *
- * 三个数各有各的用处，**不能互相替代**：
- *   · capacity / sold —— 「超售了几座」的唯一口径（见 computeOversellDelta）。锁位与占位单
- *     是软占用，不是卖出去的座位，绝不参与超售计算。
- *   · available —— 「现在还能不能直接卖一座」。口径与 takeSeatWithinTx 的 CAS 条件逐项对齐：
- *     capacity − sold − 他人 ACTIVE 锁位 − 占位余座。**不夹 0**，已超售的班次如实返回负数，
- *     否则前端会以为还有位。恢复回程据它决定走 CAS 占座还是走超售直加。
- *   · reserved —— 软预留（他人 ACTIVE 锁位 + 占位单余座）。这批座位**没卖出去**，所以不进
- *     超售口径；但硬占它就是把别人锁着的位子抢走，必须单独算出来、单独留痕（见恢复回程的
- *     RESTORE_RETURN_LEG_DISPLACED_RESERVATION 审计）。
- */
-async function cabinSeatStateWithinTx(
-  db: Prisma.TransactionClient,
-  scheduleId: string,
-  cabin: CabinClass,
-): Promise<{ capacity: number; sold: number; available: number; reserved: number } | null> {
-  const sc = await db.flightSeatClass.findFirst({
-    where: { scheduleId, cabin },
-    select: { capacity: true, sold: true },
-  });
-  if (!sc) return null;
-  const lockedAgg = await db.seatLock.aggregate({
-    _sum: { qty: true },
-    where: {
-      seatClass: { scheduleId, cabin },
-      status: SeatLockStatus.ACTIVE,
-      expiresAt: { gt: new Date() },
-    },
-  });
-  const held = await heldSeatsForCabin(db, scheduleId, cabin);
-  const reserved = (lockedAgg._sum.qty ?? 0) + held;
-  return {
-    capacity: sc.capacity,
-    sold: sc.sold,
-    available: sc.capacity - sc.sold - reserved,
-    reserved,
-  };
-}
-
-/**
- * 给某班某舱的 FlightSeatClass 行上 FOR UPDATE 行锁（幂等，同事务内重复上锁无副作用）。
- *
- * 「锁后重算」是超售上限唯一站得住的实现方式：拿锁之前读到的余位随时可能被并发下单吃掉，
- * 上限判定必须发生在锁内、基于锁后重读的 capacity/sold/locked/held。
- * 单测的 tx mock 不带 $queryRaw，故做存在性判断后再调（缺省视为无需上锁）。
- */
-async function lockSeatClassWithinTx(
-  tx: Prisma.TransactionClient,
-  scheduleId: string,
-  cabin: CabinClass,
-): Promise<void> {
-  if (typeof tx.$queryRaw !== 'function') return;
-  await tx.$queryRaw`
-    SELECT id FROM "FlightSeatClass"
-    WHERE "scheduleId" = ${scheduleId} AND cabin = ${cabin}::"CabinClass"
-    FOR UPDATE
-  `;
-}
-
-/**
- * 超售式占座：先 FOR UPDATE 拿行锁，再无条件 `sold += qty`（**不带余位条件**）。
- *
- * 只在「no-show 释放过的回程要恢复、原班次已卖光、运营显式确认超售」这一条路径上使用。
- * 与 takeSeatWithinTx 的区别就是没有 CAS 条件 —— 所以调用方必须已经：
- *   1) 校验过缺口 ≤ FLIGHT_NOSHOW_MAX_OVERSELL_SEATS；
- *   2) 拿到运营的 allowOversell 确认；
- *   3) 准备好记 CRITICAL 审计。
- * 三条缺一不可，别把它当成普通占座入口复用。
- */
-async function oversellSeatWithinTx(
-  tx: Prisma.TransactionClient,
-  scheduleId: string,
-  cabin: CabinClass,
-  qty: number,
-): Promise<void> {
-  if (qty <= 0) return;
-  await lockSeatClassWithinTx(tx, scheduleId, cabin);
-  const affected = await tx.$executeRaw`
-    UPDATE "FlightSeatClass"
-    SET sold = sold + ${qty}, "updatedAt" = NOW()
-    WHERE "scheduleId" = ${scheduleId} AND cabin = ${cabin}::"CabinClass"
-  `;
-  if (affected !== 1) {
-    throw new ConflictError(`原班次的 ${cabin} 舱位不存在，无法恢复回程座位。`);
-  }
-}
-
 /** 工单标题：「撤名单/退票：单号 · 回程 QH9588 2026-09-10 · 2 人」。 */
 function buildTicketWorkOrderTitle(
   action: string,
@@ -21081,13 +19506,6 @@ async function loadOrderForSplit(db: Prisma.TransactionClient, orderId: string) 
   });
 }
 type SplitSourceOrder = NonNullable<Awaited<ReturnType<typeof loadOrderForSplit>>>;
-
-/** 防御式读 JSON 对象（形状不符按空对象处理）。 */
-function readJsonObject(raw: unknown): Record<string, unknown> {
-  return raw != null && typeof raw === 'object' && !Array.isArray(raw)
-    ? (raw as Record<string, unknown>)
-    : {};
-}
 
 /** 防御式解析分房表房组（形状不符按无分房处理）；label 供人话文案。 */
 function readRoomGroups(
@@ -21928,17 +20346,6 @@ export function computeChangedBundleLine(input: {
   };
 }
 
-// 完整 include 给 serializeOrder 用
-const ORDER_FULL_INCLUDE = {
-  items: true,
-  passengers: true,
-  payments: true,
-  refunds: true,
-  statusEvents: { orderBy: { createdAt: 'asc' } },
-  agent: { select: { id: true, companyName: true, contactName: true, settlementMode: true, prepaymentBalance: true } },
-  user: { select: { id: true, displayName: true, email: true } },
-} as const;
-
 // ── Helpers ────────────────────────────────────────────────────────────
 
 /** listOrders / 三模板导出共用的筛选字段（不含 RBAC / 接单 / 分页）。 */
@@ -22464,1238 +20871,9 @@ export function assertAmountWithinTolerance(
   }
 }
 
-// ── 套餐酒店盖章 ─────────────────────────────────────────────────────
-const DAY_MS = 24 * 60 * 60 * 1000;
-
-/**
- * 套餐关联了酒店房型时，从订单行 metadata（goDate/returnDate）推导入住/退房日期。
- * - returnDate 合法且晚于 goDate → 用 returnDate 做退房日
- * - 否则按 goDate + nights 推退房日（nights 由 resolveBundleNights 解析的单一权威晚数，调用方传入）
- * - 套餐没关联房型、或 goDate 缺失/非法 → 返回 null（不盖章，下单照常）
- *
- * 导出仅供单测使用。
- */
-/**
- * 把住宿区间 [checkIn, checkOut)（半开）展开为逐晚 YYYY-MM-DD（UTC date-only）。
- * 供套餐下单时的酒店房量库存校验用（口径与 getHotelNightlyRemaining / 房控完全一致）。
- * 防御：checkOut <= checkIn 或跨度异常大 → 返回空数组（调用方按"无从校验"跳过，不阻断下单）。
- */
-const MAX_STAY_NIGHTS = 60;
-export function buildStayNightDates(checkIn: Date, checkOut: Date): string[] {
-  const startMs = checkIn.getTime();
-  const endMs = checkOut.getTime();
-  if (!Number.isFinite(startMs) || !Number.isFinite(endMs) || endMs <= startMs) return [];
-  const nights = Math.round((endMs - startMs) / DAY_MS);
-  if (nights < 1 || nights > MAX_STAY_NIGHTS) return [];
-  return Array.from({ length: nights }, (_, i) =>
-    new Date(startMs + i * DAY_MS).toISOString().slice(0, 10),
-  );
-}
-
-/**
- * 把 HOTEL 行 description 里的「日期段」与「晚数段」就地改写成新住宿区间，其余部分原样保留。
- *
- * 为什么用就地改写而不是整条重建：HOTEL 行的 description 历史上有多种形态 ——
- *   · 建单/换酒店：`酒店名 · 房型 · 2026-09-01~2026-09-04 · 3晚 × 1间`
- *   · 后台补录房费：`酒店名 · 房型 × 3晚 × 1间`（没有日期段）
- *   · 更老的存量单：可能是运营手填的自由文本
- * 整条重建会把手填信息冲掉，也会强行给本来没有日期段的行硬塞一段。就地改写只动确实存在的
- * 那两段，其余（酒店名/房型/间数/手填备注）一个字不碰。
- *
- * 只替换第一处匹配：日期段与晚数段在这些格式里都只出现一次，全局替换反而会误伤备注里的日期。
- * 两段都不存在（纯自由文本）→ 原样返回，不报错（描述只是展示，不是权威数据；权威在
- * hotelCheckIn/hotelCheckOut 字段上）。
- *
- * 导出仅供单测使用。
- */
-export function rewriteHotelStayDescription(
-  description: string,
-  stay: { checkIn: string; checkOut: string; nights: number },
-): string {
-  return description
-    .replace(/\d{4}-\d{2}-\d{2}\s*~\s*\d{4}-\d{2}-\d{2}/, `${stay.checkIn}~${stay.checkOut}`)
-    .replace(/\d+(?:\.\d+)?\s*晚/, `${stay.nights}晚`);
-}
-
-// ── 事务内酒店房量闸（新增真实占房的写路径统一入口）─────────────────────────
-/** 对外端点的中性话术：不把包房间数/余量这些内部库存数字回给客人。*/
-export const HOTEL_SOLD_OUT_MESSAGE = '该出发日期酒店可用房量不足，请更换日期或联系客服';
-
-/** 一条「本次打算落库」的酒店占房（口径同 OrderItem 的占房四件套）。*/
-export interface ProspectiveHotelStay {
-  hotelRoomTypeId?: string | null;
-  hotelCheckIn?: Date | null;
-  hotelCheckOut?: Date | null;
-  /** 计费房间数（床位/计费口径，可为 0.5 拼房）；缺省 1，与房控 itemRoomCount 的兜底一致。*/
-  roomsBilled?: number | null;
-  /** 未落位随机档行的档次（3/4）；具体酒店行为空。*/
-  randomStarTier?: number | null;
-}
-
-/**
- * 事务内**随机档**余量闸：把本次要落库的「未落位随机档占房」按「档次 × 住宿区间」归并，
- * 逐组过一遍带行锁的聚合闸（assertRandomTierFitWithinTx）。装不下就抛 BadRequestError、整事务回滚。
- *
- * 与 assertHotelStaysFitWithinTx 是互斥的两半（合起来覆盖全部占房）：
- *   · 那一半管**真酒店的真房量**（物理房间口径 + 性别桶）；
- *   · 这一半管**还没落位的随机档**（同星级聚合的床位口径）—— 随机单没落到任何一家酒店，
- *     拼房能否配对要等落位那一刻由该店当晚性别桶决定，落位走换酒店流程、那里有物理闸把关。
- *
- * 两类行都归到这里（它们占的是同一份聚合余量，必须合并计数）：
- *   · 单独 HOTEL 行的 `randomStarTier`（后台直接录「三星随机」）；
- *   · 房型挂在**随机档占位酒店**上的行（套餐绑定占位房型）—— 占位酒店不是真房源，
- *     tier 取该酒店的 `randomTierPlaceholder`。
- *
- * 为什么必须事务内 + 行锁：聚合闸本身是只读判定，两笔并发单抢同星级最后一间会各自读到
- * 「还剩 1 间」的旧快照双双通过。带锁版先把该档次全部真酒店在该区间的包房周期行
- * `SELECT … FOR UPDATE`，后到的事务要等前一个提交后重新取快照，才真正互斥。
- * 调用方必须在 `prisma.$transaction` 内调用，且本次占房在**同一事务**里落库。
- *
- * 归并同样是必需的：同一单两条随机档行各判一次会双双通过（它们都还没落库、彼此看不见）。
- * 加锁顺序按归并键排序，避免并发事务以不同顺序锁同一批档次造成死锁。
- */
-/** 建单事务闸容忍的随机档超卖明细（按城市 × 档次归并后逐组）。*/
-export interface RandomTierOversellRecord {
-  tier: number;
-  /** 归一后的城市码（随机档按城市圈定；单独随机行 = 存量默认城市）。*/
-  cityCode: string;
-  violations: RandomTierFitViolation[];
-}
-
-export async function assertRandomTierStaysFitWithinTx(
-  tx: Prisma.TransactionClient,
-  stays: ReadonlyArray<ProspectiveHotelStay>,
-  opts: { excludeOrderId?: string; maxOversellRooms?: number; buildMessage?: () => string } = {},
-): Promise<RandomTierOversellRecord[]> {
-  const dated = stays.filter(
-    (s): s is ProspectiveHotelStay & { hotelCheckIn: Date; hotelCheckOut: Date } =>
-      Boolean(s.hotelCheckIn && s.hotelCheckOut),
-  );
-  if (dated.length === 0) return [];
-
-  // 占位酒店房型 → 档次：只对「有房型 id 且无显式 randomStarTier」的行查一次库。
-  const placeholderLookupIds = [
-    ...new Set(
-      dated
-        .filter((s) => s.randomStarTier == null && s.hotelRoomTypeId)
-        .map((s) => s.hotelRoomTypeId as string),
-    ),
-  ];
-  // 随机档按城市圈定：占位酒店行的城市取占位酒店的 cityCode（与档次一起查回）。
-  const placeholderByRoomTypeId = new Map<string, { tier: number; cityCode: string }>();
-  if (placeholderLookupIds.length > 0) {
-    const roomTypes = await tx.hotelRoomType.findMany({
-      where: { id: { in: placeholderLookupIds } },
-      select: { id: true, hotel: { select: { randomTierPlaceholder: true, cityCode: true } } },
-    });
-    for (const rt of roomTypes) {
-      if (rt.hotel.randomTierPlaceholder != null) {
-        placeholderByRoomTypeId.set(rt.id, {
-          tier: rt.hotel.randomTierPlaceholder,
-          cityCode: normalizeCityCode(rt.hotel.cityCode),
-        });
-      }
-    }
-  }
-
-  type TierGroup = { tier: number; cityCode: string; nightDates: string[]; rooms: number };
-  const groups = new Map<string, TierGroup>();
-  for (const stay of dated) {
-    // 单独随机行（randomStarTier 非空）没有酒店也就没有城市 → 存量默认城市；
-    // 占位酒店房型行 → 档次与城市都取占位酒店的。
-    const scope =
-      stay.randomStarTier != null
-        ? { tier: stay.randomStarTier, cityCode: RANDOM_TIER_LEGACY_CITY_CODE }
-        : stay.hotelRoomTypeId
-          ? placeholderByRoomTypeId.get(stay.hotelRoomTypeId)
-          : undefined;
-    // 具体酒店的真房型 → 不归这道闸管（走 assertHotelStaysFitWithinTx）。
-    if (scope == null) continue;
-    const nightDates = buildStayNightDates(stay.hotelCheckIn, stay.hotelCheckOut);
-    // 空 = 区间非法/超长（buildStayNightDates 的防御）→ 无从校验，与既有口径一致不阻断。
-    if (nightDates.length === 0) continue;
-    // 首尾夜唯一确定整段（逐晚连续），连同城市与档次一起可安全用作归并键。
-    const key = `${scope.cityCode}|${scope.tier}|${nightDates[0]}|${nightDates[nightDates.length - 1]}`;
-    const rooms = stay.roomsBilled ?? 1;
-    const existing = groups.get(key);
-    if (existing) {
-      existing.rooms = round2(existing.rooms + rooms);
-    } else {
-      groups.set(key, { tier: scope.tier, cityCode: scope.cityCode, nightDates, rooms });
-    }
-  }
-
-  const tolerated: RandomTierOversellRecord[] = [];
-  for (const key of [...groups.keys()].sort()) {
-    const group = groups.get(key)!;
-    const violations = await assertRandomTierFitWithinTx(
-      tx,
-      { tier: group.tier, cityCode: group.cityCode },
-      group.nightDates,
-      group.rooms,
-      opts,
-    );
-    if (violations.length > 0) {
-      tolerated.push({ tier: group.tier, cityCode: group.cityCode, violations });
-    }
-  }
-  return tolerated;
-}
-
-/**
- * 事务内酒店房量闸：把本次要落库的占房按「酒店 × 住宿区间」归并，逐组过一遍**带行锁**的
- * 物理房间前瞻闸（assertHotelPhysicalFitWithinTx）。装不下就抛 BadRequestError，整事务回滚。
- *
- * 为什么必须是事务内 + 行锁：前瞻闸本身是「查一遍 + 纯内存推算」的只读判定，两个请求同时抢
- * 最后 1 间会各自读到「还剩 1 间」的旧快照双双通过。带锁版先把该酒店该区间的包房周期行
- * `SELECT … FOR UPDATE`，后到的事务要等前一个提交后重新取快照，才真正互斥。
- *
- * 调用方必须满足（否则锁白加）：
- *   1. 在 `prisma.$transaction(async (tx) => { … })` 里调用，把同一个 `tx` 传进来；
- *   2. 本次占房（OrderItem 的 hotelRoomTypeId + hotelCheckIn/hotelCheckOut/roomsBilled）
- *      必须在**同一个事务**里写入 —— 行锁随事务提交才释放；
- *   3. 隔离级别用默认的 READ COMMITTED 即可。
- *
- * 归并口径：同一酒店、同一住宿区间的多条行合并成一笔前瞻占房（整间数相加、拼房客性别桶合并）。
- * 逐行各判一次会让「同单两条行各抢最后一间」双双通过 —— 它们都还没落库，彼此看不见对方。
- * 加锁顺序按归并键排序，避免并发事务以不同顺序锁同一批酒店造成死锁。
- *
- * 跳过两类行（都不是「真酒店的真房量」，不该拿具体酒店的库存去判）：
- *   · 房型查不到 —— 上游各自有 NotFoundError 负责报错，这里不抢它的活；
- *   · 房型挂在**随机档占位酒店**上（randomTierPlaceholder 非空）—— 那不是真房源，
- *     这类行走随机档聚合闸（assertRandomTierFit），与本闸互斥不重叠。
- */
-/** 建单事务闸容忍的具体酒店超卖明细（按酒店×区间归并后逐组）。*/
-export interface HotelStayOversellRecord {
-  hotelId: string;
-  violations: PhysicalFitViolation[];
-}
-
-export async function assertHotelStaysFitWithinTx(
-  tx: Prisma.TransactionClient,
-  stays: ReadonlyArray<ProspectiveHotelStay>,
-  passengers: ReadonlyArray<{ gender?: 'M' | 'F' | 'X' }> | undefined,
-  opts: { excludeOrderId?: string; maxOversellRooms?: number; buildMessage?: () => string } = {},
-): Promise<HotelStayOversellRecord[]> {
-  const rows = stays.filter(
-    (s): s is ProspectiveHotelStay & {
-      hotelRoomTypeId: string;
-      hotelCheckIn: Date;
-      hotelCheckOut: Date;
-    } => Boolean(s.hotelRoomTypeId && s.hotelCheckIn && s.hotelCheckOut),
-  );
-  if (rows.length === 0) return [];
-
-  const roomTypes = await tx.hotelRoomType.findMany({
-    where: { id: { in: [...new Set(rows.map((r) => r.hotelRoomTypeId))] } },
-    select: { id: true, hotelId: true, hotel: { select: { randomTierPlaceholder: true } } },
-  });
-  const roomTypeById = new Map(roomTypes.map((rt) => [rt.id, rt]));
-
-  type FitGroup = {
-    hotelId: string;
-    nightDates: string[];
-    wholeRooms: number;
-    solos: Array<'M' | 'F' | 'U'>;
-  };
-  const groups = new Map<string, FitGroup>();
-  for (const row of rows) {
-    const roomType = roomTypeById.get(row.hotelRoomTypeId);
-    if (!roomType || roomType.hotel.randomTierPlaceholder != null) continue;
-    const nightDates = buildStayNightDates(row.hotelCheckIn, row.hotelCheckOut);
-    // 空 = 区间非法/超长（buildStayNightDates 的防御）→ 无从校验，与既有口径一致不阻断。
-    if (nightDates.length === 0) continue;
-    // 首尾夜唯一确定整段（逐晚连续），可安全用作归并键。
-    const key = `${roomType.hotelId}|${nightDates[0]}|${nightDates[nightDates.length - 1]}`;
-    const prospective = toProspectiveOccupancy(row.roomsBilled ?? 1, passengers);
-    const existing = groups.get(key);
-    if (existing) {
-      existing.wholeRooms += prospective.wholeRooms;
-      existing.solos.push(...prospective.solos);
-    } else {
-      groups.set(key, {
-        hotelId: roomType.hotelId,
-        nightDates,
-        wholeRooms: prospective.wholeRooms,
-        solos: [...prospective.solos],
-      });
-    }
-  }
-
-  const tolerated: HotelStayOversellRecord[] = [];
-  for (const key of [...groups.keys()].sort()) {
-    const group = groups.get(key)!;
-    const violations = await assertHotelPhysicalFitWithinTx(
-      tx,
-      group.hotelId,
-      group.nightDates,
-      { wholeRooms: group.wholeRooms, solos: group.solos },
-      {
-        excludeOrderId: opts.excludeOrderId,
-        maxOversellRooms: opts.maxOversellRooms,
-        // 不传 → 用 assertHotelPhysicalFit 自带的带数字文案（后台录单要看得见差多少间）；
-        // 对外可达的端点（前台下单）显式传中性话术，别把包房间数回给客人。
-        buildMessage: opts.buildMessage,
-      },
-    );
-    if (violations.length > 0) tolerated.push({ hotelId: group.hotelId, violations });
-  }
-  return tolerated;
-}
-
-/**
- * 星级随机档行的成本快照来源：取**同星级酒店**覆盖入住首晚的包房周期切房单价（CNY/间/晚）里
- * 的最高价。随机档行没有具体房型可查价，切房单价就是我们付给酒店的真实每间每晚成本
- * —— 与具体酒店行取 HotelRoomType.costPriceCny 语义一致（都是成本侧，售价另说）。
- *
- * 为什么取**最高**而不是平均/最低：这单最终会被房控落到该星级里的**某一家**酒店，落到哪家
- * 下单这一刻并不知道。取最高 = 最坏情况成本，毛利宁可报低不报高（与「产品未录成本就留空、
- * 绝不落 0 虚高」同一取向）。同一家酒店有多条周期覆盖该晚时，取其有价周期中 dateFrom 最晚
- * 的一条（"最新一次切房的价"，与销控板 unitPrice 展示口径一致）。
- *
- * 该星级一家酒店都没切房 / 都没填价 → undefined（毛利显示「未知」，不落 0 虚高）。
- * 注：不读存量的随机档池周期 —— 随机档已改为同星级酒店的派生聚合，那份数据只留作审计。
- */
-async function resolveRandomTierNightlyCost(
-  randomStarTier: number,
-  checkIn: string,
-): Promise<number | undefined> {
-  const d = new Date(`${checkIn}T00:00:00.000Z`);
-  if (Number.isNaN(d.getTime())) return undefined;
-  const periods = await prisma.hotelBlockPeriod.findMany({
-    where: {
-      // 与 hotel-control 的档次口径同源：星级命中、排除国际五星与占位酒店
-      // （占位酒店不是真房源，它名下的切房单价不是任何真实成本）。
-      hotel: { starRating: randomStarTier, intlFiveStar: false, randomTierPlaceholder: null },
-      dateFrom: { lte: d },
-      dateTo: { gte: d },
-      unitPrice: { not: null },
-    },
-    orderBy: { dateFrom: 'desc' },
-    select: { hotelId: true, unitPrice: true },
-  });
-  // 每家酒店只认其最新一条有价周期（findMany 已按 dateFrom 倒序 → 首次见到的即最新）
-  const latestByHotel = new Map<string, number>();
-  for (const p of periods) {
-    if (!p.hotelId || p.unitPrice == null || latestByHotel.has(p.hotelId)) continue;
-    const price = Number(p.unitPrice.toString());
-    if (Number.isFinite(price)) latestByHotel.set(p.hotelId, price);
-  }
-  if (latestByHotel.size === 0) return undefined;
-  return Math.max(...latestByHotel.values());
-}
-
-/**
- * 团队议价结算价按航段分摊（A9）。
- *
- * `settlementPriceCny` 是「每位出行人**整程**价」，不是「每人每段价」。往返单有两条 FLIGHT 行，
- * 逐行各写满价会把每人收两遍（填 3600 往返 → 每人实收 7200）。这里把整程价切成各段的每人价，
- * **各段之和恰好等于整程价**（按分为单位分配，除不尽的余数全部给第一段），
- * 与结算价日历「去程价 + 回程价求和 = 每人整程价」的口径一致。
- *
- * legCount ≤ 1（单程 / 无航段）→ 原样返回整程价，行为与修正前完全一致。
- * 导出供单测直接断言金额。
- */
-export function splitSettlementPriceAcrossLegs(
-  pricePerPersonCny: number,
-  legCount: number,
-): number[] {
-  if (!Number.isFinite(pricePerPersonCny) || legCount <= 0) return [];
-  if (legCount === 1) return [round2(pricePerPersonCny)];
-  const totalCents = Math.round(pricePerPersonCny * 100);
-  const baseCents = Math.floor(totalCents / legCount);
-  const remainderCents = totalCents - baseCents * legCount;
-  return Array.from({ length: legCount }, (_, i) =>
-    // 余数全给第一段：合计精确等于整程价，且不会出现「每段都多一分」的累积漂移。
-    ((i === 0 ? baseCents + remainderCents : baseCents) / 100),
-  );
-}
-
-/**
- * 套餐「地面部分」权威价（CNY，整数，≥0）—— 录单与售后改档共用的单一口径。
- *
- *   HOTEL 组件（qty=晚数）  = 每间每晚价 × qty × rooms  → 套餐价随房间数涨；
- *     每间每晚价 = linkedHotelNightlyPrice（套餐绑定房型的 basePrice，服务端权威）优先，
- *     回退 components JSON 里的 unitPrice（未绑房型的老套餐才会走到）。
- *     绝不无条件信任 JSON 里的 unitPrice：历史上那可能是占位/过时的畸低值，
- *     会把套餐酒店部分算成几元、整单总价崩塌。
- *   VISA 组件           = 每份单价 × 办签人数（visaHeadCount，已扣自备签人数）。
- *   TRANSFER 等其它组件  = qty × unitPrice（整车/整趟计价，不随人数缩放）。
- *   FLIGHT 组件不计      = 机票由 FLIGHT 行单独动态定价。
- *
- * 套餐折扣（percent-off）不在此扣 —— 由调用方在行金额层统一处理。
- */
-export function computeBundleGroundTotal(input: {
-  /** Bundle.items（JSON）；非数组一律按空处理，绝不因脏数据抛错。 */
-  components: unknown;
-  linkedHotelNightlyPrice: number | null;
-  rooms: number;
-  visaHeadCount: number;
-}): number {
-  const components = Array.isArray(input.components)
-    ? (input.components as Array<{ kind: string; qty: number; unitPrice: number }>)
-    : [];
-  const groundTotal = components
-    .filter((b) => b && b.kind !== 'FLIGHT')
-    .reduce((s, b) => {
-      if (b.kind === 'HOTEL') {
-        const nightlyPrice = input.linkedHotelNightlyPrice ?? b.unitPrice;
-        return s + b.qty * nightlyPrice * input.rooms;
-      }
-      if (b.kind === 'VISA') {
-        // 每份签证单价（unitPrice 写入时已由 products.service 覆盖为 Visa.basePrice/人）× 办签人数。
-        return s + input.visaHeadCount * b.unitPrice;
-      }
-      // TRANSFER 等：固定 qty×unitPrice（整车/整趟计价，按趟不按人头，不随人数缩放）。
-      return s + b.qty * b.unitPrice;
-    }, 0);
-  return Math.max(0, Math.round(groundTotal));
-}
-
-export function resolveBundleHotelStamp(
-  bundle: { hotelRoomTypeId: string | null },
-  metadata: Record<string, unknown> | undefined,
-  nights: number,
-): { hotelRoomTypeId: string; hotelCheckIn: Date; hotelCheckOut: Date } | null {
-  if (!bundle.hotelRoomTypeId) return null;
-  const meta = bundleItemMetadataSchema.parse(metadata ?? {});
-  if (!meta.goDate) return null;
-  const checkIn = new Date(meta.goDate);
-  if (Number.isNaN(checkIn.getTime())) return null;
-  const safeNights = Math.max(1, Math.trunc(nights));
-  const returnDate = meta.returnDate ? new Date(meta.returnDate) : null;
-  const checkOut =
-    returnDate && !Number.isNaN(returnDate.getTime()) && returnDate.getTime() > checkIn.getTime()
-      ? returnDate
-      : new Date(checkIn.getTime() + safeNights * DAY_MS);
-  return {
-    hotelRoomTypeId: bundle.hotelRoomTypeId,
-    hotelCheckIn: checkIn,
-    hotelCheckOut: checkOut,
-  };
-}
-
-// ── 套餐可选升级 add-on 重算（server-priced）─────────────────────────
-/** 写到订单行 metadata.addOns 的升级重算明细（金额单位 CNY，整数）。 */
-export interface BundleAddOnBreakdown {
-  singleCount: number; // 选「一个人住酒店（单人入住）」的人数
-  /**
-   * 选「升舱商务」的人数（整程口径，= max(去程, 回程)）。
-   * 旧字段保留供既有展示/导出读取；真正的每程人数看下面两个分程字段。
-   */
-  businessCount: number;
-  businessCountOutbound: number; // 去程升舱人数（占去程班次的真实商务舱座位）
-  businessCountReturn: number; // 回程升舱人数（单程套餐 legs=1 时恒为 0）
-  // 占座模型（业务需求）：成人 / 占座儿童 / 不占座婴儿
-  adultCount: number; // 成人数（占座、占房）
-  childCount: number; // 占座儿童数（占座、占房；机票按成人价减折扣）
-  infantCount: number; // 不占座婴儿数（不占座、不占房；按婴儿价收）
-  seatPax: number; // 占座人数 = adultCount + childCount（拼房按此计房；businessCount ≤ seatPax）
-  headCount: number; // 全部出行人 = adultCount + childCount + infantCount（都需护照）
-  rooms: number; // 拼房间数 = ceil(seatPax / 2)（婴儿不占房）
-  nights: number; // 计费晚数（用于单人入住房差）
-  legs: number; // 计费航段数（用于升舱商务）
-  singleSupplementCnyPerNight: number; // 该套餐配置的单人入住房差/晚
-  businessUpgradeCnyPerLeg: number; // 该套餐配置的升舱/航段
-  childSeatDiscountCnyPerPerson: number; // 该套餐配置的占座儿童折扣/人
-  infantPriceCny: number; // 该套餐配置的婴儿价/人
-  selfProvidedVisaCount: number; // 自备签证（自行办妥签证）人数：乘客级勾选数 / 旧整单布尔 → 1
-  selfProvidedVisa: boolean; // 是否有自备签证乘客（= selfProvidedVisaCount > 0；向后兼容展示用）
-  selfVisaDeductCny: number; // 该套餐配置的自备签证减免/人
-  singleSupplementTotal: number; // = singleCount × rate × nights
-  // 分程口径 = (去程人数 + 回程人数) × rate；旧整程口径 = businessCount × rate × legs
-  businessUpgradeTotal: number;
-  childSeatDiscountTotal: number; // = childCount × childSeatDiscountCnyPerPerson（机票折扣，负向计入套餐行）
-  infantPriceTotal: number; // = infantCount × infantPriceCny（婴儿机票价，正向计入套餐行）
-  selfVisaDeductTotal: number; // = selfProvidedVisaCount × selfVisaDeductCny（自备签证减免，负向计入套餐行）
-  total: number; // 升级加价 + 婴儿价 − 儿童折扣 − 自备签证减免 的净额（计入套餐行总额）
-}
-
-/**
- * 套餐占座模型归一化（纯函数，向后兼容）。
- * 优先用订单行显式三计数；缺省时用 metadata.adultCount/childCount/infantCount；
- * 若三者都没有，则把旧的 pax（metadata.pax）或行 quantity 视为 adultCount（child/infant = 0），
- * 保证旧客户端/旧订单的占座 + 定价与扩展前完全一致。
- *
- * 导出供单测与 createOrder 共用。
- */
-export interface BundleOccupancyInput {
-  adultCount?: number;
-  childCount?: number;
-  infantCount?: number;
-  quantity?: number;
-  metadata?: Record<string, unknown>;
-}
-export interface BundleOccupancy {
-  adultCount: number;
-  childCount: number;
-  infantCount: number;
-  seatPax: number; // adult + child（占座）
-  headCount: number; // adult + child + infant（出行人）
-  rooms: number; // ceil(seatPax / 2)
-}
-export function resolveBundleOccupancy(item: BundleOccupancyInput): BundleOccupancy {
-  const meta = bundleItemMetadataSchema.parse(item.metadata ?? {});
-  const norm = (v: number | undefined): number | undefined =>
-    v == null ? undefined : Math.max(0, Math.trunc(v));
-  // 显式行字段优先，其次 metadata 字段
-  const adultExplicit = norm(item.adultCount) ?? norm(meta.adultCount);
-  const childExplicit = norm(item.childCount) ?? norm(meta.childCount);
-  const infantExplicit = norm(item.infantCount) ?? norm(meta.infantCount);
-  const hasExplicit =
-    adultExplicit != null || childExplicit != null || infantExplicit != null;
-
-  let adultCount: number;
-  let childCount: number;
-  let infantCount: number;
-  if (hasExplicit) {
-    adultCount = adultExplicit ?? 0;
-    childCount = childExplicit ?? 0;
-    infantCount = infantExplicit ?? 0;
-  } else {
-    // 向后兼容：旧 pax（metadata.pax）或行 quantity → 全部当成成人
-    adultCount = Math.max(0, Math.trunc(meta.pax ?? item.quantity ?? 0));
-    childCount = 0;
-    infantCount = 0;
-  }
-  const seatPax = adultCount + childCount;
-  const headCount = adultCount + childCount + infantCount;
-  const rooms = Math.ceil(seatPax / 2); // 每人 0.5 间；婴儿不占房（旧拼房口径，展示用）
-  return { adultCount, childCount, infantCount, seatPax, headCount, rooms };
-}
-
-// ── 按房型容量算所需房间数（C-v2 核心）────────────────────────────────
-/**
- * 业务口径："每个酒店房型可以 fit 几大人几小孩；选的人数一间房坐不下时，自动加房。"
- * 外加："选了单人入住的人，每人自己独占一间"——独住的人不跟别人挤，也不占别人的床位。
- *
- *   soloRooms   = clamp(singleCount, 0, 成人数)          // 独住者每人 1 间
- *   sharedAdults= 成人数 − soloRooms                      // 其余成人才参与拼间
- *   roomsNeeded = max( soloRooms + max( ceil(sharedAdults / maxAdults),
- *                                       ceil(占座儿童 / maxChildren) ), 1 )
- *
- * - 婴儿不占床 → 不参与计算。
- * - maxChildren=0 且有占座儿童时：把儿童并入成人维度 ceil((sharedAdults+child)/maxAdults)
- *   近似（避免除 0；lone-child packing edge case）。正常配置 maxChildren≥1 不会走到这里。
- * - 套餐没绑房型 / 容量缺失 → 回退默认 2大1小（等价旧 ceil(seatPax/2)-ish 行为）。
- * - singleCount 缺省 0 → 结果与加入该维度之前完全一致（老调用方零影响）。
- *
- * 口径变更记录（原口径：singleCount **不**计入 roomsNeeded，仅作为独立自愿加价项）：
- *   原口径下「2 位成人都勾单人入住」= 1 间 —— 但两个人各自独住物理上就是要 2 间，
- *   房量校验会据此少算、导致超卖，且这个 roomsNeeded 正是喂给物理房间前瞻闸的整间数输入，
- *   输入错了闸再准也白搭。故按「独住者各占一间」修正。
- *   单人入住房差（singleSupplementCnyPerNight × singleCount × nights）仍是**独立**加价项，
- *   由 computeBundleAddOn 另算，与本函数的间数互不重复计价。
- *   仅对新单生效：不回填存量单的 roomsBilled / total。
- *
- * 导出供单测与 createOrder 共用。
- */
-export const DEFAULT_ROOM_MAX_ADULTS = 2;
-export const DEFAULT_ROOM_MAX_CHILDREN = 1;
-export function computeRoomsNeeded(
-  occupancy: Pick<BundleOccupancy, 'adultCount' | 'childCount'>,
-  capacity: { maxAdults?: number | null; maxChildren?: number | null } | null,
-  singleCount = 0,
-): number {
-  const maxAdults = Math.max(1, Math.trunc(capacity?.maxAdults ?? DEFAULT_ROOM_MAX_ADULTS));
-  const maxChildrenRaw = Math.trunc(capacity?.maxChildren ?? DEFAULT_ROOM_MAX_CHILDREN);
-  const adults = Math.max(0, occupancy.adultCount);
-  const children = Math.max(0, occupancy.childCount);
-  // 独住人数夹到 [0, 成人数]：单人入住是成人维度的选项，不能超过成人数、也不能为负。
-  const soloRooms = Math.min(Math.max(0, Math.trunc(singleCount)), adults);
-  const sharedAdults = adults - soloRooms;
-
-  const adultRooms = Math.ceil(sharedAdults / maxAdults);
-  // maxChildren=0 → 该房型不单独承载儿童；把儿童并入成人维度（lone-child packing edge case）。
-  const childRooms =
-    maxChildrenRaw > 0
-      ? Math.ceil(children / maxChildrenRaw)
-      : Math.ceil((sharedAdults + children) / maxAdults);
-  // 独住间与「其余人拼出来的间」相加；整单至少 1 间（0 成人 0 儿童的兜底，与旧口径一致）。
-  return Math.max(soloRooms + Math.max(adultRooms, childRooms), 1);
-}
-
-// ── 物理房间前瞻闸的输入翻译（床位/计费口径 → 物理口径）─────────────────────
-/**
- * 把「本单酒店部分要新增的占房」翻译成物理房间前瞻闸的输入（ProspectiveOccupancy）。
- *
- *   roomsCharged === 0.5（单人拼房；床位/计费口径的半间）→ 1 位拼房客，按性别进桶配对；
- *   其余                                                → 整间数（向上取整防御脏小数），不进拼房桶。
- *
- * 性别口径与房控 pickSoloGender 严格一致（下单后这一单就是被那套口径数进销控板的，
- * 两边必须同一口径，否则闸放行的单会在看板上变成超卖）：
- *   取第一位性别为 M/F 的出行人；X / 未填 / 无出行人 → 'U' —— 保守口径每人独占 1 间，
- *   即「拼单性别未知就把它单独出来」，不参与自动配对。
- *
- * 导出供单测与 createOrder 共用。
- */
-export function toProspectiveOccupancy(
-  roomsCharged: number,
-  passengers: ReadonlyArray<{ gender?: 'M' | 'F' | 'X' }> | undefined,
-): ProspectiveOccupancy {
-  if (roomsCharged === 0.5) {
-    const explicit = passengers?.find((p) => p.gender === 'M' || p.gender === 'F')?.gender;
-    return { wholeRooms: 0, solos: [explicit === 'M' || explicit === 'F' ? explicit : 'U'] };
-  }
-  return { wholeRooms: Math.max(0, Math.ceil(roomsCharged)), solos: [] };
-}
-
-// ── 套餐酒店计费房间数（server-authoritative；含单人拼房 0.5 间口径）──────────
-/**
- * 计算套餐酒店部分应计费的房间数（钱路径，权威计算，不轻信客户端）。
- *
- * 业务口径：一个人报套餐（1 成人 / 0 儿童，婴儿不占房）且**不**独住时，愿意拼房共用一间，
- * 只按 0.5 间收费（床位口径）；独住（singleCount ≥ 1）则照旧收整间 + 单人入住房差。
- * 2 人及以上、或含占座儿童 → 沿用 computeRoomsNeeded 的容量口径（不变）。
- *
- *   isSoloSharing = 绑了套餐房型 且 adultCount===1 且 childCount===0 且 singleCount(缺省0)===0
- *   roomsCharged  = isSoloSharing ? 0.5 : physicalRooms(容量推算)
- *
- * 仅对绑定套餐房型（hotelRoomTypeId 存在）生效；未绑房型的老套餐不走 0.5 口径。
- *
- * server-authoritative：客户端传的 roomsBilled 只能「上调」不能「下压」——最终取
- * max(clientRooms, roomsCharged)。这样单人拼房单不会被 2 人单伪造成 0.5 间少付钱，
- * 同时保留「录单方主动多开房」等向上调整的向后兼容能力。
- *
- * 导出供单测与 createOrder BUNDLE 分支共用（同一份权威口径，避免漂移）。
- */
-export function computeBundleRoomsCharged(params: {
-  occupancy: Pick<BundleOccupancy, 'adultCount' | 'childCount'>;
-  capacity: { maxAdults?: number | null; maxChildren?: number | null } | null;
-  hotelRoomTypeId: string | null;
-  singleCount: number | undefined;
-  clientRoomsBilled: number | undefined;
-}): number {
-  const { occupancy, capacity, hotelRoomTypeId, singleCount, clientRoomsBilled } = params;
-  // singleCount 传进容量口径：独住者各占一间（见 computeRoomsNeeded 的口径变更记录）。
-  // 不会与下方 isSoloSharing 重复加间——isSoloSharing 恒要求 singleCount===0。
-  const physicalRooms = computeRoomsNeeded(occupancy, capacity, singleCount);
-  const isSoloSharing =
-    hotelRoomTypeId != null &&
-    occupancy.adultCount === 1 &&
-    occupancy.childCount === 0 &&
-    (singleCount ?? 0) === 0;
-  const roomsCharged = isSoloSharing ? 0.5 : physicalRooms;
-  // 权威下限：客户端只能上调、不能下压（防止把多人单伪造成 0.5 间）。
-  if (clientRoomsBilled != null) {
-    return Math.max(clientRoomsBilled, roomsCharged);
-  }
-  return roomsCharged;
-}
-
-/**
- * 套餐升级加价权威重算（不信任客户端金额）。公式：
- *   nights = stamp 推导的入住晚数（无房型 → hotelNights ?? 1）
- *   legs   = bundle.legs（来回默认 2）
- *   单人入住房差 = singleCount × singleSupplementCnyPerNight × nights
- *   升舱商务加价 = 分程口径（去程人数 + 回程人数）× businessUpgradeCnyPerLeg
- *                 旧整程口径（businessCount 为数字）沿用 businessCount × businessUpgradeCnyPerLeg × legs
- *   自备签证减免 = selfProvidedVisaCount × selfVisaDeductCny（自行办妥签证的人数，从套餐行扣减）
- * singleCount / businessCount / selfProvidedVisaCount 缺省 0 → total=0 → 套餐价与旧版完全一致（向后兼容）。
- *
- * 升舱分程（去程/回程可以升不同人数）：第 4 个参数传对象 `{ outbound, return }` 即分程口径；
- * 传数字/缺省 = 旧整程口径（每程同人数，× legs），公式原样保留，历史入参重算结果一分不差。
- * 单程套餐（legs=1）下回程人数恒按 0 处理 —— 没有回程航段可占座，也就不该收回程升舱费。
- *
- * selfProvidedVisaCount 语义（两种模式，调用处 priceAndValidateItems 决定 count）：
- *   · 旧整单口径：录单勾「客人自备签证」布尔 true → count=1（整单减一次 −selfVisaDeductCny）。
- *   · 新乘客级：同一订单各乘客各选 → count=勾「自备签」的人数（每人减一次）。
- * count 夹到 [0, headCount]（自备签是按人的，最多全体出行人）。
- *
- * 导出仅供单测使用。
- */
-/**
- * 套餐每人操作费总额（服务端权威，不信客户端）。
- *   操作费 = max(0, trunc(operationFeeCny)) × seatPax（占座人数：成人 + 占座儿童；婴儿不收）
- * operationFeeCny 由 Bundle.operationFeeCny 提供（DB @default(20)，运营可在套餐向导改）；
- * 负值/小数夹到非负整数。计入套餐地面金额，随 discountPct 一并 percent-off，与起价把操作费
- * 计入 originalPerPaxCny 原价再打折的口径一致。导出仅供单测使用。
- */
-export function computeBundleOperationFeeTotal(operationFeeCny: number, seatPax: number): number {
-  // Number(x)||0 兜底：DB 有 @default(20) 保证非空，但防御旧数据/未选字段导致的 undefined→NaN。
-  const perPax = Math.max(0, Math.trunc(Number(operationFeeCny) || 0));
-  const pax = Math.max(0, Math.trunc(Number(seatPax) || 0));
-  return perPax * pax;
-}
-
-/**
- * 套餐乘客级「住宿方式 + 签证」派生（纯函数，向后兼容）。
- *
- * 购物车模式：同一订单每人各选自己的住宿方式（拼房/单住）与签证（随套餐/自备签），价差全部系统算。
- * 优先级（两维各自独立判定，互不干扰）：
- *   · 自备签：passengers 里任一乘客显式提供 visaExempt（true/false 均算「提供」）→ 以勾 true 的人数为权威；
- *            否则回落 item.selfProvidedVisa 布尔（旧整单口径 true → 记 1 次，整单减一次）。
- *   · 单住：  passengers 里任一乘客显式提供 singleRoom → 以勾 true 的人数为权威；
- *            否则回落 item.singleCount（旧 item 级聚合口径）。
- * passengers 缺省（老客户端不传）→ 全部回落旧口径，定价与扩展前完全一致。
- *
- * 导出供单测与 createOrder/quoteOrder 的 priceAndValidateItems BUNDLE 分支共用。
- */
-export function derivePerPaxBundleOptions(
-  item: { selfProvidedVisa?: boolean; singleCount?: number },
-  passengers: ReadonlyArray<{ visaExempt?: boolean; singleRoom?: boolean }> | undefined,
-): { selfProvidedVisaCount: number; singleCount: number | undefined } {
-  const paxVisaProvided = passengers?.some((px) => px.visaExempt !== undefined) ?? false;
-  const paxSingleProvided = passengers?.some((px) => px.singleRoom !== undefined) ?? false;
-  const selfProvidedVisaCount = paxVisaProvided
-    ? (passengers?.filter((px) => px.visaExempt === true).length ?? 0)
-    : (item.selfProvidedVisa === true ? 1 : 0);
-  const singleCount = paxSingleProvided
-    ? (passengers?.filter((px) => px.singleRoom === true).length ?? 0)
-    : item.singleCount;
-  return { selfProvidedVisaCount, singleCount };
-}
-
-/**
- * 套餐升舱差价单一配置源解析（¥/程/座；纯函数，导出供单测与 createOrder/quoteOrder 共用）。
- *   · 套餐 businessUpgradeCnyPerLeg 非 null（含 0）→ 套餐自有覆盖，直接用。
- *   · null =「跟随航班」→ 取该套餐绑定航班的每程差价：去程优先、回程次之
- *     （往返同程对称，computeBundleAddOn 再 × legs 得总加价）。
- *   · 两趟都没绑到航班（或未 include）→ 兜底 DEFAULT_BUSINESS_UPGRADE_CNY_PER_LEG，绝不派生出 0/裸价。
- */
-export function resolveBundleBusinessUpgradeRate(bundle: {
-  businessUpgradeCnyPerLeg: number | null;
-  outboundFlight?: { businessUpgradeCnyPerLeg: number } | null;
-  returnFlight?: { businessUpgradeCnyPerLeg: number } | null;
-}): number {
-  return (
-    bundle.businessUpgradeCnyPerLeg ??
-    bundle.outboundFlight?.businessUpgradeCnyPerLeg ??
-    bundle.returnFlight?.businessUpgradeCnyPerLeg ??
-    DEFAULT_BUSINESS_UPGRADE_CNY_PER_LEG
-  );
-}
-
-/** 升舱分程人数（去程 / 回程各自的升舱人数）。 */
-export interface BundleBusinessUpgradeSplit {
-  outbound?: number;
-  return?: number;
-}
-
-/**
- * BUNDLE 行入参 → computeBundleAddOn 的升舱口径（纯函数，导出供单测与定价分支共用）。
- *   · 分程字段任一显式提供（含 0）→ 分程口径 `{ outbound, return }`；
- *   · 两者都省略 → 回落旧的整程 businessCount（数字/undefined），定价与扩展前完全一致。
- * 「显式 0」必须走分程分支：只升去程（回程 0）正是本次要支持的场景，落到旧口径会按两程都升收钱。
- */
-export function resolveBundleBusinessUpgradeInput(item: {
-  businessCount?: number;
-  businessCountOutbound?: number;
-  businessCountReturn?: number;
-}): number | BundleBusinessUpgradeSplit | undefined {
-  if (item.businessCountOutbound !== undefined || item.businessCountReturn !== undefined) {
-    return { outbound: item.businessCountOutbound, return: item.businessCountReturn };
-  }
-  return item.businessCount;
-}
-
-export function computeBundleAddOn(
-  bundle: {
-    hotelNights: number | null;
-    singleSupplementCnyPerNight: number;
-    businessUpgradeCnyPerLeg: number;
-    childSeatDiscountCnyPerPerson: number;
-    infantPriceCny: number;
-    selfVisaDeductCny: number;
-    legs: number;
-  },
-  hotelStamp: { hotelCheckIn: Date; hotelCheckOut: Date } | null,
-  singleCount: number | undefined,
-  /**
-   * 升舱人数。数字/缺省 = 旧整程口径（每程同人数，× legs 计价）；
-   * 对象 = 分程口径（去程 / 回程各自的人数，合计 × 每程差价）。
-   */
-  businessCount: number | BundleBusinessUpgradeSplit | undefined,
-  occupancy: BundleOccupancy,
-  /** 调用方按 resolveBundleNights 解析的单一权威晚数（无盖章时的回退口径）。 */
-  resolvedNights: number,
-  /**
-   * 自备签证（出行人自行办妥签证）人数 → 每人从套餐行扣减 selfVisaDeductCny。缺省 0。
-   * 旧整单布尔口径由调用处归一化为 count（true → 1）；新乘客级口径为勾选人数。
-   */
-  selfProvidedVisaCount?: number,
-): { total: number; hasAddOn: boolean; breakdown: BundleAddOnBreakdown } {
-  const single = Math.max(0, Math.trunc(singleCount ?? 0));
-  // 自备签人数：夹到 [0, headCount]（按人减免，最多全体出行人）。旧整单布尔已在调用处归一化为 0/1。
-  const selfVisaCount = Math.min(
-    Math.max(0, Math.trunc(selfProvidedVisaCount ?? 0)),
-    occupancy.headCount,
-  );
-  // 计费晚数：优先用盖章推导的真实入住区间，否则回退套餐默认晚数（≥1）
-  const nights = hotelStamp
-    ? Math.max(
-        1,
-        Math.round((hotelStamp.hotelCheckOut.getTime() - hotelStamp.hotelCheckIn.getTime()) / DAY_MS),
-      )
-    : Math.max(1, resolvedNights);
-  const legs = Math.max(1, bundle.legs);
-  const singleRate = Math.max(0, bundle.singleSupplementCnyPerNight);
-  const businessRate = Math.max(0, bundle.businessUpgradeCnyPerLeg);
-  const childDiscountRate = Math.max(0, bundle.childSeatDiscountCnyPerPerson);
-  const infantRate = Math.max(0, bundle.infantPriceCny);
-  const selfVisaRate = Math.max(0, bundle.selfVisaDeductCny);
-
-  // 升舱人数：两种口径共用同一个夹逼（≤ 占座人数；婴儿不占座、不能升舱）。
-  //   · 分程口径（对象）：去/回程各自夹逼，总加价 = (去 + 回) × 每程差价；
-  //     单程套餐 legs=1 → 回程恒 0（没有回程航段可占座，也不该收回程升舱费）。
-  //   · 整程口径（数字/缺省）：**原公式一字不动**（人数 × 每程差价 × legs），历史入参重算结果一分不差；
-  //     分程字段按「每程同人数」派生，供占座拆分与明细文案使用（legs=1 时回程仍为 0）。
-  const clampSeat = (n: number | undefined): number =>
-    Math.min(Math.max(0, Math.trunc(n ?? 0)), occupancy.seatPax);
-  const isSplitInput = typeof businessCount === 'object' && businessCount !== null;
-  const businessOutbound = clampSeat(isSplitInput ? businessCount.outbound : businessCount);
-  const businessReturn =
-    legs >= 2 ? clampSeat(isSplitInput ? businessCount.return : businessCount) : 0;
-  // 旧展示字段（整程口径的「升舱人数」）：取两程较大值 —— 旧入参两程同值时与旧版完全一致。
-  const business = Math.max(businessOutbound, businessReturn);
-
-  const singleSupplementTotal = single * singleRate * nights;
-  const businessUpgradeTotal = isSplitInput
-    ? (businessOutbound + businessReturn) * businessRate
-    : business * businessRate * legs;
-  // 占座儿童机票按成人价减折扣 → 套餐行净减 childCount × 折扣
-  const childSeatDiscountTotal = occupancy.childCount * childDiscountRate;
-  // 不占座婴儿机票收婴儿价（不走经济舱全价）→ 套餐行净加 infantCount × 婴儿价
-  const infantPriceTotal = occupancy.infantCount * infantRate;
-  // 自备签证：自行办妥签证的人数 × 每人减免（乘客级各减一次；旧整单口径 count=1 即整单减一次）
-  const selfVisaDeductTotal = selfVisaCount * selfVisaRate;
-  // 升级加价 + 婴儿价 − 儿童折扣 − 自备签证减免。
-  // 加项净额**允许为负**：自备签/儿童折扣可以大于其它加价，甚至在无任何其它加价时单独存在。
-  // 绝不在此「加项净额」层夹到 0——否则减免只能抵扣其它加价、无加价时一分不减（把套餐行整体价算高）。
-  // 非负保护下沉到 BUNDLE 行金额层（unitPrice×qty + total + 操作费）再统一夹到 0，减免可正常抵扣套餐地面价。
-  const total =
-    singleSupplementTotal +
-    businessUpgradeTotal +
-    infantPriceTotal -
-    childSeatDiscountTotal -
-    selfVisaDeductTotal;
-
-  return {
-    total,
-    // 任一占座升级或儿童/婴儿差价 / 自备签证减免存在 → 视为有 add-on（落 metadata 供运营/财务查看）
-    hasAddOn:
-      single > 0 ||
-      business > 0 ||
-      childSeatDiscountTotal > 0 ||
-      infantPriceTotal > 0 ||
-      selfVisaDeductTotal > 0,
-    breakdown: {
-      singleCount: single,
-      businessCount: business,
-      businessCountOutbound: businessOutbound,
-      businessCountReturn: businessReturn,
-      adultCount: occupancy.adultCount,
-      childCount: occupancy.childCount,
-      infantCount: occupancy.infantCount,
-      seatPax: occupancy.seatPax,
-      headCount: occupancy.headCount,
-      rooms: occupancy.rooms,
-      nights,
-      legs,
-      singleSupplementCnyPerNight: singleRate,
-      businessUpgradeCnyPerLeg: businessRate,
-      childSeatDiscountCnyPerPerson: childDiscountRate,
-      infantPriceCny: infantRate,
-      selfProvidedVisaCount: selfVisaCount,
-      selfProvidedVisa: selfVisaCount > 0,
-      selfVisaDeductCny: selfVisaRate,
-      singleSupplementTotal,
-      businessUpgradeTotal,
-      childSeatDiscountTotal,
-      infantPriceTotal,
-      selfVisaDeductTotal,
-      total,
-    },
-  };
-}
-
-/**
- * 出行人数校验口径（纯函数，与前台 CheckoutPage 的 effectivePax 同源）。
- *
- * 同一批出行人会出现在多条订单行里 —— 往返机票拆成去/回两条 FLIGHT 行（各 quantity=pax），
- * 套餐 / 签证 / 接送也都是「按人」的产品。所需出行人数应是「单程最大人数」，不是各行相加：
- *   - FLIGHT：取各行 quantity 的 MAX（往返同一批人，绝不两段相加）
- *   - BUNDLE：每行 pax 取自 metadata.pax（缺失回退 quantity），多份套餐相加
- *   - VISA / TRANSFER：每行 quantity 相加
- *   - required = max(maxFlightLegQty, bundlePax, visaQty, transferPax)
- * 任一维度为 0 时不约束（required 仍由其余维度决定）；全为 0（无按人产品）→ 返回 0，不校验。
- *
- * 导出供单测与 createOrder 共用。
- */
-export function computeRequiredPassengerCount(items: OrderItemInput[]): number {
-  let maxFlightLegQty = 0;
-  let bundlePax = 0;
-  let visaQty = 0;
-  let transferPax = 0;
-
-  for (const item of items) {
-    if (item.kind === 'FLIGHT') {
-      // 往返两段共享乘客 → 取最大单段人数，不累加
-      maxFlightLegQty = Math.max(maxFlightLegQty, item.quantity);
-    } else if (item.kind === 'BUNDLE') {
-      // 套餐出行人数 = 占座模型 headCount（成人 + 占座儿童 + 不占座婴儿，都需护照）。
-      // 婴儿不占座但是出行人：FLIGHT 行 quantity = seatPax（占座），required 校验按 headCount。
-      // 向后兼容：无三计数时把旧 pax / 行 quantity 当成全成人 → headCount = 旧 pax，结论与旧版一致。
-      const occupancy = resolveBundleOccupancy({
-        adultCount: item.adultCount,
-        childCount: item.childCount,
-        infantCount: item.infantCount,
-        quantity: item.quantity,
-        metadata: item.metadata,
-      });
-      bundlePax += occupancy.headCount;
-    } else if (item.kind === 'VISA') {
-      visaQty += item.quantity;
-    } else if (item.kind === 'TRANSFER') {
-      transferPax += item.quantity;
-    }
-  }
-
-  return Math.max(maxFlightLegQty, bundlePax, visaQty, transferPax);
-}
-
-// ── 售后改单：座位搬移 + 费用流水（事务内复用 createOrder/状态机的同款口径）──
-
-/**
- * 事务内原子「拿座」（CAS，最终防超售）—— 与 createOrder 的 decrementSeat 同款保证。
- *   UPDATE ... SET sold = sold + qty
- *   WHERE sold + qty + 他人ACTIVE锁位 + 占位余座 ≤ capacity
- * affected ≠ 1（售罄/并发抢占/无此舱位）→ 抛 ConflictError，调用方的事务随之回滚。
- *
- * @param excludeUserId 排除其本人锁位不挡自己（下单场景用）；改期由运营操作 → 传 null（所有他人锁位都占余票）。
- */
-export async function takeSeatWithinTx(
-  tx: Prisma.TransactionClient,
-  scheduleId: string,
-  cabin: import('@prisma/client').CabinClass,
-  qty: number,
-  excludeUserId: string | null,
-): Promise<void> {
-  if (qty <= 0) return;
-  if (typeof tx.$queryRaw === 'function') {
-    await tx.$queryRaw`
-      SELECT id FROM "FlightSeatClass"
-      WHERE "scheduleId" = ${scheduleId} AND cabin = ${cabin}::"CabinClass"
-      FOR UPDATE
-    `;
-  }
-  const lockedAgg = await tx.seatLock.aggregate({
-    _sum: { qty: true },
-    where: {
-      seatClass: { scheduleId, cabin },
-      ...(excludeUserId ? { userId: { not: excludeUserId } } : {}),
-      status: SeatLockStatus.ACTIVE,
-      expiresAt: { gt: new Date() },
-    },
-  });
-  const lockedByOthers = lockedAgg._sum.qty ?? 0;
-  const heldQty = await heldSeatsForCabin(tx, scheduleId, cabin);
-  const affected = await tx.$executeRaw`
-    UPDATE "FlightSeatClass"
-    SET sold = sold + ${qty}, "updatedAt" = NOW()
-    WHERE "scheduleId" = ${scheduleId}
-      AND cabin = ${cabin}::"CabinClass"
-      AND sold + ${qty} + ${lockedByOthers} + ${heldQty} <= capacity
-  `;
-  if (affected !== 1) {
-    const sc = await tx.flightSeatClass.findFirst({
-      where: { scheduleId, cabin },
-      select: { capacity: true, sold: true },
-    });
-    const available = sc
-      ? Math.max(0, sc.capacity - sc.sold - lockedByOthers - heldQty)
-      : 0;
-    throw new ConflictError(
-      `${cabin} 余票不足：需要 ${qty} 张，仅剩 ${available} 张（改期目标班次售罄/并发抢占）`,
-    );
-  }
-}
-
-/**
- * 该航段行「已经飞了」吗（座位账口径的唯一判定）。
- *
- * 状态机 `_updateStatusWithinTx` 的**放座分支与重新占座分支共用本函数**，两处必须严格对称：
- *   · 放座侧：飞过的座位已被真实消耗，还回 sold 等于让过去的班次凭空多出可卖余位；
- *   · 占座侧：既然当初没放，就绝不能再占回来 —— 占了就是给飞过去的班次凭空加一份 sold，
- *     此后没有任何路径会释放它（再落取消族仍被这道闸跳过），永久卡账。
- * 只有一边加判定 = 释放与占座不守恒，正是「no-show → 取消 → force 拉回」这条最常见路径。
- *
- * departureTime 存的是真 UTC 瞬间（departureTz 只用于展示折算），故直接与传入时刻比较。
- * 没有班次时间（未联查 / 座位已释放的行）一律按「没飞」处理，交给各自分支的其它闸判断。
- */
-function isLegAlreadyFlown(
-  item: { flightSchedule?: { departureTime: Date | null } | null },
-  atMs: number,
-): boolean {
-  const departAt = item.flightSchedule?.departureTime ?? null;
-  return departAt != null && departAt.getTime() <= atMs;
-}
-
-/**
- * 「该段已起飞 → 不能改期」的统一判定与文案。
- *
- * 改期要「放旧座」，飞过的座位早被真实消耗掉：放回去等于让过去的班次凭空多出可卖余位，
- * 同时又在新班次占一份，两头都是错账。判定口径走共享 helper isLegAlreadyFlown，
- * 时区折算走 lib/flight-time.ts（与全站展示同一口径）。
- *
- * 两处调用必须是同一份闸：
- *   · rescheduleOrderItem（PATCH /orders/:id/reschedule 与航段入口的执行段）；
- *   · reschedulePassengers 拆单前的前置闸 —— 拆单不可回滚，晚一步就会留下一张多余新单，
- *     而且新单同一航段照样已起飞，「到新单重试」永远走不通。
- */
-function assertLegNotFlownForReschedule(item: {
-  flightSchedule?: { departureTime: Date | null; departureTz?: string | null } | null;
-}): void {
-  if (!isLegAlreadyFlown(item, Date.now())) return;
-  const sched = item.flightSchedule;
-  const departAt = sched?.departureTime ?? null;
-  const localWhen =
-    departAt != null
-      ? `${localDateISO(departAt, sched?.departureTz)} ${localHHMM(departAt, sched?.departureTz)}`
-      : '时间未知';
-  throw new BadRequestError(
-    `该段已起飞（当地时间 ${localWhen} 出发），不能改期；` +
-      '客人没登机请走「标记 no-show」处理。',
-  );
-}
-
-/**
- * 释放座位——下限钳制在 0（HIGH 修复第二层防线）。
- *
- * `sold = GREATEST(0, sold - qty)`（原子 SQL）取代普通 `decrement`：即便 businessUpgradeCount
- * 被伪造导致某个分支想释放一个从未真正占用过的舱位（见 sanitizeFlightItemMetadata 的注释——那是
- * 第一层防线，从源头不让伪造值落库），这里也不会把 sold 打成负数并永久卡住（旧版 decrement 没有
- * 下限，负数会一直累积，直到人工去 DB 手动修）。
- *
- * 供状态机释放分支（_updateStatusWithinTx）和 30 分钟超时 worker（queues/worker.ts）复用——两处
- * 都要按 computeBundleSeatSplit 拆分释放，口径必须一致。
- */
-export async function releaseSeatFloored(
-  tx: Prisma.TransactionClient,
-  scheduleId: string,
-  cabin: import('@prisma/client').CabinClass,
-  qty: number,
-): Promise<void> {
-  if (qty <= 0) return;
-  await tx.$executeRaw`
-    UPDATE "FlightSeatClass"
-    SET sold = GREATEST(0, sold - ${qty}), "updatedAt" = NOW()
-    WHERE "scheduleId" = ${scheduleId}
-      AND cabin = ${cabin}::"CabinClass"
-  `;
-}
-
-/**
- * 释放座位 —— **严格版**：放几座就必须真有几座可放，否则整单回滚。
- *
- * 与 releaseSeatFloored（`GREATEST(0, sold − qty)`）的分工：
- *   · 取消航段 / 状态机释放 / 超时 worker 走 floored 版 —— 那些路径是「尽力把座位还回去」，
- *     账面对不上时宁可少还也不能把 sold 打成负数卡死，是 best-effort 语义。
- *   · no-show 释放走**本函数** —— 它的下游是「照释放快照原样占回来」的恢复回程：
- *     释放时 floored 少放了 k 座（sold 本来就不够），快照里却照样记着「放了 N 座」，
- *     恢复时就会按 N 座占回去，凭空把 sold 抬高 k —— 座位账从此永久对不上，且没有任何报错。
- *     所以这里 fail-closed：`sold >= qty` 命中才更新，没命中就抛错让整个事务回滚，
- *     快照与实际释放量因此恒等。
- *
- * 舱位行不存在同样抛（affected === 0）：既然要按快照占回来，行都没了就不该假装释放成功。
- */
-export async function releaseSeatStrictWithinTx(
-  tx: Prisma.TransactionClient,
-  scheduleId: string,
-  cabin: import('@prisma/client').CabinClass,
-  qty: number,
-): Promise<void> {
-  if (qty <= 0) return;
-  // 与 oversellSeatWithinTx / 恢复回程同一把行锁：并发下 sold 的读改写严格串行。
-  await lockSeatClassWithinTx(tx, scheduleId, cabin);
-  const affected = await tx.$executeRaw`
-    UPDATE "FlightSeatClass"
-    SET sold = sold - ${qty}, "updatedAt" = NOW()
-    WHERE "scheduleId" = ${scheduleId}
-      AND cabin = ${cabin}::"CabinClass"
-      AND sold >= ${qty}
-  `;
-  if (affected !== 1) {
-    throw new ConflictError(
-      `库存账对不上：该舱（${CABIN_ZH_LABEL[cabin] ?? cabin}）sold 少于要释放的 ${qty} 座，` +
-        '或该舱位配置已不存在，已回滚，本次一座未放。请先核对该班次库存。',
-    );
-  }
-}
-
-/** 一条售后费用流水（写入 Order.adjustments）。 */
-export interface OrderAdjustmentEntry {
-  type:
-    | 'RESCHEDULE_FEE'
-    | 'SWAP_FEE'
-    | 'SWAP_PRICE_DIFF'
-    | 'SWAP_VISA_DEDUCT_REVERSAL'
-    | 'PRICE_ADJUSTMENT'
-    | string;
-  label: string;
-  amountCny: number;
-  at: string; // ISO 时间
-  by: string | null; // 操作人 userId
-  note?: string;
-  /** 关联出行人（SWAP_VISA_DEDUCT_REVERSAL 幂等去重、PRICE_ADJUSTMENT 按乘客调价用；整单调价为空）。 */
-  passengerId?: string;
-  /**
-   * 被换下去的那位出行人姓名 / 证件号（SWAP_FEE / SWAP_PRICE_DIFF 专用）。
-   * 这个人换完就不在乘客名单里了，passengerId 指向的那条记录已经是**新客**——
-   * 只有这两项还能回答「这笔钱是谁产生的」。
-   */
-  passengerName?: string;
-  passengerDocument?: string;
-  /**
-   * true = 这笔钱不参与每人均摊（换人费 / 换人差价：记在被换下去的人头上）。
-   * 口径与实现见 per-pax-share.ts 的 spreadableAdjustmentCny —— 钱仍在 adjustmentCny 里
-   * （应收/尾款一分不少），只是不摊到留守同行人与新客的每人结算价上。
-   */
-  excludeFromPerPax?: boolean;
-  /** 调价原因码（仅 PRICE_ADJUSTMENT 流水带；财务四类 DISCOUNT/MISC_FEE/CHANGE/OTHER）。 */
-  reasonCode?: string;
-}
-
 // 「价格调整」商品行按乘客分组：实现已抽成叶子模块 order-adjustment-lines.ts（lib/order-money 要用它，
 // 而 lib 不能反向 import 本文件），这里原样 re-export，所有既有 import 路径与算法一字不变。
 export { groupPassengerAdjustments, type AdjustmentLine } from './order-adjustment-lines.js';
-
-/**
- * 不可变地把一条流水追加到 Order.adjustments（JSON 数组）。
- * 旧值非数组（脏数据/旧空默认）时按空数组处理，绝不抛错。
- */
-function appendAdjustment(
-  existing: Prisma.JsonValue | null | undefined,
-  entry: OrderAdjustmentEntry,
-): Prisma.InputJsonValue {
-  const arr = Array.isArray(existing) ? (existing as Prisma.JsonArray) : [];
-  return [...arr, entry as unknown as Prisma.InputJsonValue];
-}
-
-/**
- * 套餐升舱「拆座」模型（纯函数，扣座/退座共用，最终防超售）。
- *
- * 一个航段（FLIGHT 行）下单 `quantity` 人，其中 `businessUpgradeCount` 人选了升舱商务：
- *   - 升舱的人占用真实商务舱座位：BUSINESS += min(businessUpgradeCount, quantity)
- *   - 其余的人留在本行原舱位：原舱 += quantity − 上述商务数
- * 净占座仍 = quantity（不超售商务舱、不持有幽灵经济舱座位）。
- * 只有经济舱航段（cabin === 'ECONOMY'）才会被拆；其他舱位 businessUpgradeCount 视为 0。
- * businessUpgradeCount 缺省/0 → economy=quantity、business=0，与旧版行为完全一致（向后兼容）。
- *
- * 导出仅供单测使用。
- */
-export function computeBundleSeatSplit(
-  cabin: import('@prisma/client').CabinClass,
-  quantity: number,
-  businessUpgradeCount: number | undefined,
-): { sameCabin: number; business: number } {
-  const upgrade =
-    cabin === 'ECONOMY'
-      ? Math.min(Math.max(0, Math.trunc(businessUpgradeCount ?? 0)), quantity)
-      : 0;
-  return { sameCabin: quantity - upgrade, business: upgrade };
-}
-
-/**
- * PTC 码（ADT/CHD/INF，derivePtcByAge 的返回值）→ 建单落库用的系统枚举
- * （ADULT/CHILD/INFANT）。年龄阈值判断已在 derivePtcByAge 里做过，这里只做码值转换。
- */
-function ptcToPassengerType(ptc: string): PassengerType {
-  const map: Record<string, PassengerType> = {
-    ADT: PassengerType.ADULT,
-    CHD: PassengerType.CHILD,
-    INF: PassengerType.INFANT,
-  };
-  return map[ptc] ?? PassengerType.ADULT;
-}
-
-// 导出供单测验证乘客字段落库映射（含 0713 反馈批新增 visaExempt/singleRoom）。
-export function passengerToData(
-  p: PassengerInput,
-  // 服务端权威派生 passengerType 所需的「本单最早出发日」（见下方 passengerType 计算注释）。
-  // 省略该参数 = 维持旧行为（不派生，原样落客户端传值）——占位单转正等其它调用点无需改动。
-  opts?: { authoritativeDepartureDate?: Date | null },
-) {
-  // 自动拆 fullName → lastName/firstName，如果客户端没传（斜线优先，见 splitPassengerFullName）
-  const { lastName: autoLast, firstName: autoFirst } = splitPassengerFullName(p.fullName);
-  // 拆名截断兜底（0831 公测反馈：LAM/MENG IEONG 入库成 LAM+MENG）：名单解析入口可能产出
-  // 「全名是全的、拆名却截断」的组合——散行解析吃不满多词名，录单员手动改全名时解析残留的
-  // 隐藏拆名没跟着改。只纠**截断**（拆名拼回去是全名的前缀但更短）→ 按全名重拆；
-  // 显式传入的、与全名整体不同的姓/名维持优先（既有口径，见 orders.service.test.ts）。
-  // 中文全名不带斜线不受影响（orders.import「中文姓名 + 拉丁 PNR 拆名」组合照旧放行）。
-  const composedProvided =
-    p.lastName || p.firstName ? composePassengerFullName(p.lastName, p.firstName) : null;
-  const normalizedFull = normalizePassengerFullName(p.fullName);
-  const trustProvidedSplit = !(
-    p.fullName.includes('/') &&
-    composedProvided !== null &&
-    composedProvided !== normalizedFull &&
-    normalizedFull.startsWith(composedProvided)
-  );
-  const dateOfBirth = new Date(p.dateOfBirth);
-  const hasValidDob = Boolean(p.dateOfBirth) && !Number.isNaN(dateOfBirth.getTime());
-  // 乘客类型服务端权威派生（覆盖客户端传值）：入口层（前台下单页/批量导入解析层）已尽量按
-  // 「出生日期 + 出发日」派生 passengerType，这里是权威兜底 —— 凡是乘客带出生日期、且本单能
-  // 定出最早出发日（机票行/套餐行）时，用 derivePtcByAge 重算并覆盖，堵住入口漏派生或被篡改的口子
-  // （如成人生日误传/篡改成 INFANT）。无出生日期或订单定不出出发日（纯地面单）→ 保留客户端传值/默认。
-  const passengerType =
-    hasValidDob && opts?.authoritativeDepartureDate
-      ? ptcToPassengerType(derivePtcByAge(dateOfBirth, opts.authoritativeDepartureDate, p.passengerType))
-      : p.passengerType;
-  return {
-    fullName: p.fullName,
-    lastName: trustProvidedSplit ? (p.lastName ?? (autoLast || null)) : autoLast || null,
-    firstName: trustProvidedSplit ? (p.firstName ?? (autoFirst || null)) : autoFirst || null,
-    title: p.title ?? null,
-    gender: p.gender ?? null,
-    documentType: p.documentType,
-    documentNumber: p.documentNumber,
-    dateOfBirth,
-    placeOfBirth: p.placeOfBirth ?? null,
-    nationality: p.nationality,
-    passengerType,
-    chineseName: p.chineseName ?? null,
-    passportIssueDate: p.passportIssueDate ? new Date(p.passportIssueDate) : null,
-    passportIssueCountry: p.passportIssueCountry ?? null,
-    passportIssuePlace: p.passportIssuePlace ?? null,
-    passportExpiry: p.passportExpiry ? new Date(p.passportExpiry) : null,
-    pnr: p.pnr ?? null, // 订座编码：录单带入（共用编码=多行同值）；出票回填会覆盖
-    visaNumber: p.visaNumber ?? null,
-    visaType: p.visaType ?? null,
-    visaIssueDate: p.visaIssueDate ? new Date(p.visaIssueDate) : null,
-    visaEffectiveDate: p.visaEffectiveDate ? new Date(p.visaEffectiveDate) : null,
-    visaExpiry: p.visaExpiry ? new Date(p.visaExpiry) : null,
-    visaPlaceOfIssue: p.visaPlaceOfIssue ?? null,
-    visaCountryOfApplication: p.visaCountryOfApplication ?? null,
-    addressType: p.addressType ?? null,
-    addressDetails: p.addressDetails ?? null,
-    addressCity: p.addressCity ?? null,
-    addressState: p.addressState ?? null,
-    addressCountry: p.addressCountry ?? null,
-    addressZip: p.addressZip ?? null,
-    mealPreference: p.mealPreference,
-    needsWheelchair: p.needsWheelchair ?? false,
-    needsInfantBassinet: p.needsInfantBassinet ?? false,
-    bedPref: p.bedPref ?? null,
-    passportPhotoUrl: p.passportPhotoUrl ?? null,
-    // 套餐乘客级选项（购物车模式）：缺省 false = 随套餐办签 + 拼房（与旧行为一致）。
-    visaExempt: p.visaExempt ?? false,
-    singleRoom: p.singleRoom ?? false,
-  };
-}
-
-/**
- * FTMYYYYMMDD + 5 位随机 — 每天 10 万空间，撞号概率极低。
- * 真撞了也只会在 $transaction 里 P2002 抛出，上层可以重试；MVP 阶段不做自动重试。
- */
-async function generateOrderNumber(): Promise<string> {
-  const d = new Date();
-  const yyyy = d.getUTCFullYear();
-  const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
-  const dd = String(d.getUTCDate()).padStart(2, '0');
-  const suffix = String(randomInt(10000, 99999));
-  return `FTM${yyyy}${mm}${dd}${suffix}`;
-}
 
 // 注意：list() 和 get() 的 passengers select 不同，所以 serialize 用宽松类型
 // 只处理我们关心的 Decimal 字段 → string。其他字段原样透传。
@@ -23766,37 +20944,6 @@ interface OrderLike {
   // 如 listOrders 只 select id/fullName，无 passengerType 字段，故用 Record<string, unknown> 兜底，
   // 与本接口 items/agent 的处理方式一致）。
   passengers?: Array<Record<string, unknown>>;
-}
-
-/** M月D日（本地展示用；departureDate 等按 UTC 零点解析的 date-only 字段沿用同一口径）。 */
-function formatMonthDay(d: Date): string {
-  return `${d.getUTCMonth() + 1}月${d.getUTCDate()}日`;
-}
-
-/** YYYY-MM-DD → M/D（随机档缺口审计使用紧凑日期）。 */
-function formatSlashMonthDay(date: string): string {
-  const [, month, day] = date.split('-');
-  return `${Number(month)}/${Number(day)}`;
-}
-
-/**
- * 航班时刻 HH:MM（24 小时制，**按班次自己的当地时区**折算）。
- * 班次 departureTime/arrivalTime 存 UTC，当地时区另存在 departureTz/arrivalTz——
- * 直接取 UTC 分量会少 8 小时（澳门/北京）或 7 小时（越南），订单详情、前台「我的订单」、
- * 行程单 PDF/邮件全线显示错误时刻。tz 缺失（未联查）时回退 UTC 分量，行为与改动前一致。
- */
-function formatHHMM(d: Date, tz?: string | null): string {
-  if (tz) return localHHMM(d, tz);
-  return `${String(d.getUTCHours()).padStart(2, '0')}:${String(d.getUTCMinutes()).padStart(2, '0')}`;
-}
-
-/**
- * YYYY-MM-DD。传入 tz 时按当地日折算（当地凌晨起飞的班次 UTC 还停在前一天，
- * 不折算会把出发日期写早一天）；不传沿用 UTC 日（date-only 字段本就存 UTC 零点）。
- */
-function formatDateOnly(d: Date, tz?: string | null): string {
-  if (tz) return localDateISO(d, tz);
-  return d.toISOString().slice(0, 10);
 }
 
 /**
@@ -24173,17 +21320,6 @@ function itineraryFieldsForItem(
     bundleHotelName: bundle?.hotelRoomType?.hotel?.name ?? null,
     bundleRoomTypeName: bundle?.hotelRoomType?.name ?? null,
   };
-}
-
-/** 金额保留 2 位小数（CNY，避免浮点累计误差）。 */
-function round2(n: number): number {
-  return Math.round(n * 100) / 100;
-}
-
-// 用 Prisma.Decimal 做钱算术（避免 float 漂移），结果四舍五入到 2 位小数。
-// ROUND_HALF_UP 与文件其余处（round2 的 Math.round）一致。
-function round2Decimal(d: Prisma.Decimal): Prisma.Decimal {
-  return d.toDecimalPlaces(2, Prisma.Decimal.ROUND_HALF_UP);
 }
 
 /**
@@ -24794,11 +21930,7 @@ function maskedItemTravelDate(it: {
   return null;
 }
 
-// 避免 PaymentMethod 未使用告警（未来接支付时会用到）
-void PaymentMethod;
-
 // ── Fulfillment 任务生成（PAID 时触发） ─────────────────────────
-import { FulfillmentStatus, FulfillmentType, VisaRequirement, VisaSubmissionStatus } from '@prisma/client';
 
 // 非套餐订单项：一行 → 一个对应岗任务。
 const KIND_TO_FULFILLMENT_TYPE: Partial<Record<OrderItemKind, FulfillmentType>> = {
@@ -25274,14 +22406,6 @@ async function syncVisaTasksForOrder(
   return { needed: true, cancelledTaskIds: [], createdTaskIds: [task.id] };
 }
 
-export {
-  createFulfillmentTasks,
-  resolveBundleFulfillmentTypes,
-  createVisaTaskAtCreation,
-  evaluateOrderVisaTaskState,
-  syncVisaTasksForOrder,
-};
-
 // ════════════════════════════════════════════════════════════════════
 // 佣金链路计算 — 当订单转 PAID 时调用，为卖家代理 + 所有上级代理创建 CommissionRecord
 //
@@ -25552,15 +22676,4 @@ async function createCommissionsForOrder(
   }
 }
 
-// ────────────────────────────────────────────────────────────────────────────
-// 一次性补提脚本（scripts/backfill-agent-commissions.ts）复用出口。
-//
-// 为什么必须导出、而不是让脚本自己算一遍：计提口径是「按出发日取费率 + 折扣按毛额比例分摊
-// 出净额基数 + 沿代理链取差额费率」三件事的组合，任何一处重写都会与本函数漂移，补出来的钱
-// 就和系统自己算的对不上——钱路径上这种漂移是不可接受的。脚本因此**整段调用本函数**
-// （dry-run 时跑在一个最后回滚的事务里），产出的记录逐分钱都是线上那段代码算的。
-//
-// deriveOrderDepartDate 一并导出只为报表：明细里给财务看的「出发日」必须就是上面 1.5 用作
-// 费率比对基准的那一个日期，另写一份取最早日期的逻辑同样会漂。
-// ────────────────────────────────────────────────────────────────────────────
-export { createCommissionsForOrder, deriveOrderDepartDate };
+export { createFulfillmentTasks, resolveBundleFulfillmentTypes, createVisaTaskAtCreation, evaluateOrderVisaTaskState, syncVisaTasksForOrder, createCommissionsForOrder, deriveOrderDepartDate };
