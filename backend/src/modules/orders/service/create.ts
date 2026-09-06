@@ -31,6 +31,12 @@ import {
 import { resolveBundleNights } from '../../products/bundle-nights.js';
 import { parseVisaExpressTiers, type VisaExpressTier } from '../../products/products.schemas.js';
 import { localDate } from '../../finances/finances.cost.service.js';
+import {
+  computeBundleGroundCost,
+  flightSnapshotKey,
+  loadBundleComponentCosts,
+  resolveFlightCostSnapshots,
+} from './item-cost-snapshot.js';
 import { getSettlementRate } from '../../settlement-rates/settlement-rates.service.js';
 import { BUNDLE_ROUTE_SELECT, bundleRouteKey } from '../../products/bundle-route.js';
 import { getFlightSettlementRate } from '../../settlement-rates/flight-settlement-rates.service.js';
@@ -2968,6 +2974,25 @@ export async function priceAndValidateItems(
     p.amount = Math.round(p.amount * factor);
     p.unitPrice = Math.round(p.unitPrice * factor);
     p.metadata = { ...(p.metadata ?? {}), bundleDiscountPct: pct };
+  }
+
+  // ── 机票行成本快照（含套餐里的机票腿：它们就是带 bundleId 的 FLIGHT 行）──
+  // 成本口径不动 —— resolveFlightItemCost 仍是唯一算法，这里只把它在下单时点的结果落成快照，
+  // 与房/签/车三类行同一写法。算不出成本（班次 override 与周期都没填）→ 留 NULL，报表照旧「未知」。
+  // 放在折扣之后：折扣只改售价、成本与售价无关，先后对结果无影响；摆这里只是要一个
+  // 「priced 定型之后统一补成本」的明确位置。
+  const flightCostRows = priced
+    .filter((p) => p.kind === 'FLIGHT' && p.flightScheduleId)
+    .map((p) => ({ flightScheduleId: p.flightScheduleId as string, quantity: p.quantity }));
+  if (flightCostRows.length > 0) {
+    const snapshots = await resolveFlightCostSnapshots(flightCostRows);
+    for (const p of priced) {
+      if (p.kind !== 'FLIGHT' || !p.flightScheduleId) continue;
+      const snap = snapshots.get(flightSnapshotKey(p.flightScheduleId, p.quantity));
+      if (!snap || snap.totalCostCny == null) continue;
+      p.unitCostCny = snap.unitCostCny ?? undefined;
+      p.totalCostCny = snap.totalCostCny;
+    }
   }
 
   return priced;
