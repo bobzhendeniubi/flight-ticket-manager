@@ -74,6 +74,7 @@ import {
 } from './SingleOrderProductBlock';
 import { formatLocalTime } from '../lib/airports';
 import { composePassengerFullName, normalizePassengerFullName } from '../lib/passengerName';
+import type { SingleOrderPrefill } from './singleOrderPrefill';
 import { groupHotelsByBundleTier, resolveHotelSettlementTier, SETTLEMENT_TIER_ZH } from '../lib/settlement-tier';
 
 /**
@@ -312,12 +313,37 @@ function resolveBundleNights(
   return Math.max(1, raw);
 }
 
+/**
+ * 用预填值搭出初始产品区块。
+ * 没有预填（或预填里一条可录产品都没有）→ 回落到现状：一个机票区块。
+ * 套餐预填恒为单个 BUNDLE 区块（套餐独占一张单的不变式由 buildSingleOrderPrefill 保证）。
+ */
+function blocksFromPrefill(prefill?: SingleOrderPrefill): ProductBlock[] {
+  const kinds: ProductBlockKind[] =
+    prefill && prefill.blockKinds.length > 0
+      ? prefill.blockKinds.slice(0, MAX_PRODUCT_BLOCKS)
+      : ['FLIGHT'];
+  return kinds.map((kind) => {
+    const block = createProductBlock(kind);
+    // 往返只带「往返」这个形态，具体航班 / 班次不带 —— 下一单的行程本来就不同
+    return kind === 'FLIGHT' && prefill?.flightTripType === 'ROUNDTRIP'
+      ? { ...block, tripType: 'ROUNDTRIP' as const }
+      : block;
+  });
+}
+
 interface SingleOrderModalProps {
   onClose: () => void;
   onCreated: () => void;
+  /**
+   * 「以此单为模板」的预填值（见 singleOrderPrefill.ts）：产品类型 / 代理 / 联系人 / 备注
+   * 直接带进表单，出行人与金额一律不带。缺省 = 全新空白录单（现状）。
+   * 只作用于初次挂载时的初始值，之后表单以用户输入为准。
+   */
+  prefill?: SingleOrderPrefill;
 }
 
-export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) {
+export function SingleOrderModal({ onClose, onCreated, prefill }: SingleOrderModalProps) {
   const tokens = useAuth((s) => s.tokens);
   const dialogRef = useDialogA11y(onClose);
   const user = useAuth((s) => s.user);
@@ -328,32 +354,33 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
    * 本单的产品区块列表（唯一真源）。首块的类型由顶部「产品类型」标签切换，
    * 其余块各自带类型下拉 + 删除。不变式：一旦出现套餐区块，列表长度恒为 1（套餐独占）。
    */
-  const [blocks, setBlocks] = useState<ProductBlock[]>(() => [createProductBlock('FLIGHT')]);
+  const [blocks, setBlocks] = useState<ProductBlock[]>(() => blocksFromPrefill(prefill));
   const firstKind: ProductBlockKind = blocks[0]?.kind ?? 'FLIGHT';
   const isBundleOrder = firstKind === 'BUNDLE';
 
   // 联系人（选填；缺省默认=录入人本人，后端缺联系人时也会回退到录入人）
-  const [contactName, setContactName] = useState(recorderLabel);
-  const [contactPhone, setContactPhone] = useState('');
-  const [contactEmail, setContactEmail] = useState('');
+  const [contactName, setContactName] = useState(prefill?.contactName || recorderLabel);
+  const [contactPhone, setContactPhone] = useState(prefill?.contactPhone ?? '');
+  const [contactEmail, setContactEmail] = useState(prefill?.contactEmail ?? '');
 
   // 归属代理（ADMIN/STAFF 代为录单）；'' = 直客/无代理
   const [agents, setAgents] = useState<AgentListItem[]>([]);
   const [agentSearch, setAgentSearch] = useState('');
-  const [agentId, setAgentId] = useState('');
+  const [agentId, setAgentId] = useState(prefill?.agentId ?? '');
 
-  const [notes, setNotes] = useState('');
+  const [notes, setNotes] = useState(prefill?.notes ?? '');
   // 签证状态 + 结构化备注（酒店/签证/付款/特殊要求）
   // 默认值按本单产品派生（见 defaultVisaStatusFor）；用户手动改过下拉后，
   // 由 visaStatusTouchedRef 记住，产品再变也不会覆盖用户的手动选择。
-  const [visaStatus, setVisaStatus] = useState<VisaStatusInput>('NOT_NEEDED');
-  const visaStatusTouchedRef = useRef(false);
+  const [visaStatus, setVisaStatus] = useState<VisaStatusInput>(prefill?.visaStatus ?? 'NOT_NEEDED');
+  // 模板带来的签证状态当作「已经选过」：否则产品派生的默认值会立刻把源单的口径覆盖掉。
+  const visaStatusTouchedRef = useRef(prefill?.visaStatus != null);
   // 签证列隐藏时用户先选「不需要 / 已签证」的意图，只消费一次，避免切换产品后反复覆盖逐位选择。
   const pendingAutoVisaExemptRef = useRef(false);
-  const [noteHotel, setNoteHotel] = useState('');
-  const [noteVisa, setNoteVisa] = useState('');
-  const [notePayment, setNotePayment] = useState('');
-  const [noteSpecial, setNoteSpecial] = useState('');
+  const [noteHotel, setNoteHotel] = useState(prefill?.noteHotel ?? '');
+  const [noteVisa, setNoteVisa] = useState(prefill?.noteVisa ?? '');
+  const [notePayment, setNotePayment] = useState(prefill?.notePayment ?? '');
+  const [noteSpecial, setNoteSpecial] = useState(prefill?.noteSpecial ?? '');
   const [passengers, setPassengers] = useState<PassengerRow[]>([emptyPassenger()]);
   // 最新乘客快照（ref）：批量并发 OCR 时，handleOcrFile 的「护照图上限」要读实时状态，
   // 不能用渲染闭包里的 passengers（并发 worker 之间会读到陈旧值，导致少计/超计）。
@@ -413,7 +440,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
 
   // ── 套餐 ──
   const [bundles, setBundles] = useState<Bundle[]>([]);
-  const [bundleId, setBundleId] = useState('');
+  const [bundleId, setBundleId] = useState(prefill?.bundleId ?? '');
   const [departDate, setDepartDate] = useState('');
   const [adultCount, setAdultCount] = useState<number | null>(1);
   const [childCount, setChildCount] = useState<number | null>(0);
@@ -576,8 +603,18 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 选中后才发现不能用；已下架的酒店专属套餐（如某酒店 2天1晚）应改选同档次随机套餐 + 指定酒店。
   useEffect(() => {
     if (!isBundleOrder || bundles.length > 0) return;
-    api.listBundles(true).then((r) => setBundles(r.bundles)).catch(() => setErr('套餐列表加载失败'));
-  }, [isBundleOrder, bundles.length]);
+    api.listBundles(true)
+      .then((r) => {
+        setBundles(r.bundles);
+        // 「以此单为模板」带来的套餐可能已下架（本列表只含在架）：清掉并说明，
+        // 否则下拉显示空白但 bundleId 还在，运营会一路点到服务端打回「套餐已下架」才明白。
+        if (bundleId && !r.bundles.some((b) => b.id === bundleId)) {
+          setBundleId('');
+          setErr('源单的套餐已下架，请重新选择套餐（可改选同档次随机套餐 + 指定酒店）');
+        }
+      })
+      .catch(() => setErr('套餐列表加载失败'));
+  }, [isBundleOrder, bundles.length, bundleId]);
 
   // 接送列表
   useEffect(() => {
@@ -1749,30 +1786,46 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     setShowRooming(false);
   }
 
-  // 「再录一单」/ 关闭后复位录单态（含分房步骤）
-  function resetForNextOrder(): void {
+  /**
+   * 「再录一单」/「复制上一单」/ 关闭后复位录单态（含分房步骤）。
+   *
+   * 两个按钮共用这一个复位，差别只在 keepCustomer：
+   *   · 再录一单（keepCustomer=false）—— 现状不变：留产品选择，备注 / 签证状态 / 结算价模式清掉。
+   *   · 复制上一单（keepCustomer=true）—— 额外留下**客户侧那一摊**：四类分岗备注 + 通用备注、
+   *     订单签证状态、结算价模式（按人填 or 整单）。同一家代理、同一个联系人连着录好几张时，
+   *     不用一遍遍重敲这些字段。
+   *     （代理归属与联系人本来就不在复位范围内，两个按钮都保留。）
+   *
+   * 两种模式都必清：出行人（换一批人正是新单的意义）、调价金额与结算价数值 ——
+   * 人和钱必须逐单重新决定，绝不能被上一单静默带过来。
+   */
+  function resetForNextOrder(options?: { keepCustomer?: boolean }): void {
+    const keepCustomer = options?.keepCustomer === true;
     setOkOrderNumber(null);
     setCreatedOrder(null);
     setShowRooming(false);
     setRoomingSaved(false);
     setPassengers([emptyPassenger()]);
-    setNotes('');
-    visaStatusTouchedRef.current = false;
-    pendingAutoVisaExemptRef.current = false;
-    setVisaStatus(defaultVisaStatusFor(blockKinds));
-    setNoteHotel('');
-    setNoteVisa('');
-    setNotePayment('');
-    setNoteSpecial('');
+    if (!keepCustomer) {
+      setNotes('');
+      visaStatusTouchedRef.current = false;
+      pendingAutoVisaExemptRef.current = false;
+      setVisaStatus(defaultVisaStatusFor(blockKinds));
+      setNoteHotel('');
+      setNoteVisa('');
+      setNotePayment('');
+      setNoteSpecial('');
+    }
     // 单住 / 自备签是乘客级标记，随 setPassengers([emptyPassenger()]) 一并复位（无独立状态）。
     // 清掉上一单的调价（避免误带到下一单）；系统价随产品状态复位后由 effect 自动重算。
     setAdjustAmount(null);
     setAdjustReason('DISCOUNT');
     setAdjustText('');
     // 结算价通道同款复位：整单结算总价带到下一单会把总额静默收敛到上一单的价；
-    // 每人结算价数值随 setPassengers([emptyPassenger()]) 清空，这里只复位模式开关。
+    // 每人结算价数值随 setPassengers([emptyPassenger()]) 清空，这里只复位模式开关
+    //（复制上一单时模式保留，数值一样清空）。
     setSettlementPrice(null);
-    setPerPaxSettlementOn(false);
+    if (!keepCustomer) setPerPaxSettlementOn(false);
   }
 
   const inputCls = 'mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm';
@@ -1834,14 +1887,29 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               </p>
             )}
 
+            <p className="text-right text-xs text-ink-muted">
+              「再录一单」只留产品与代理；「复制上一单」连备注 / 签证状态 / 结算价模式一起留下，
+              只换出行人 —— 调价与结算价数值两种都不带过来，金额逐单重新决定。
+            </p>
             <div className="flex justify-end gap-2">
               {showRooming && (
                 <button className="btn-ghost text-sm" onClick={() => setShowRooming(false)}>
                   稍后再分（去「房控页」分房）
                 </button>
               )}
-              <button className="btn-secondary text-sm" onClick={resetForNextOrder}>
+              <button
+                className="btn-ghost text-sm"
+                onClick={() => resetForNextOrder()}
+                title="留下产品选择与代理 / 联系人，备注、签证状态、结算价模式都清空"
+              >
                 再录一单
+              </button>
+              <button
+                className="btn-secondary text-sm"
+                onClick={() => resetForNextOrder({ keepCustomer: true })}
+                title="连备注（酒店 / 签证 / 付款 / 特殊要求）、签证状态、结算价模式一起留下，只换出行人；调价与结算价数值不带过来"
+              >
+                复制上一单
               </button>
               <button className="btn-primary text-sm" onClick={onClose}>完成</button>
             </div>
