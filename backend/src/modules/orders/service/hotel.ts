@@ -94,6 +94,10 @@ import {
   SETTLEMENT_TIER_STAR_RATING,
   zhStatus,
 } from './shared.js';
+import {
+  bundleHotelNightsOf,
+  computeSwapBundleCostSnapshot,
+} from './item-cost-snapshot.js';
 import { createFulfillmentTasks, syncVisaTasksForOrder } from './visa-sync.js';
 import type { OrderService } from '../orders.service.js';
 
@@ -218,6 +222,8 @@ export async function swapItemHotel(
             id: true,
             name: true,
             hotelId: true,
+            // 旧房型成本价 → BUNDLE 行按差额挪成本快照（把旧店那一项减出来，见 swapCost 处）。
+            costPriceCny: true,
             // randomTierPlaceholder：原房型可能挂在随机档「占位酒店」上（伪落位行）——
             //   这种行业务上等同未落位随机单，落位时同样要吃「不许降级交付」的星级约束。
             // starRating：自助换酒店的同星级闸要拿它跟目标酒店比（见下方）。
@@ -332,9 +338,22 @@ export async function swapItemHotel(
   // ── 逐晚余量校验（仅跨酒店换房时才需要；同酒店换房型净房量不变，不受本单占用影响）──
   const roomsBilled = item.roomsBilled != null ? Number(item.roomsBilled) : 1;
 
+  // 套餐 HOTEL 组件的晚数合计 —— BUNDLE 行按差额挪成本快照时要用（见下方 bundleSwapCost）。
+  // 单独取一次：上面星级闸里那次 bundle 查询带条件（占位酒店不查），成本这边不能跟着漏。
+  const swapBundleComponents =
+    item.kind === OrderItemKind.BUNDLE && item.bundleId
+      ? (
+          await prisma.bundle.findUnique({
+            where: { id: item.bundleId },
+            select: { items: true },
+          })
+        )?.items
+      : null;
+
   // ── HOTEL 行成本重打快照（Task B）：按新房型成本价 × 晚数(quantity) × 房数(roomsBilled)，
   // 口径对齐建单时的 HOTEL 行快照公式。新房型无成本价 → null（真缺数据，如实报缺）。
-  // BUNDLE 行不重算（建单时未快照酒店成本，其 quantity≠晚数、totalCostCny 覆盖整包）→ 原值不动。
+  const beforeUnitCostCny = item.unitCostCny != null ? Number(item.unitCostCny.toString()) : null;
+  const beforeTotalCostCny = item.totalCostCny != null ? Number(item.totalCostCny.toString()) : null;
   const swapCost =
     item.kind === OrderItemKind.HOTEL
       ? computeSwapHotelCostSnapshot({
@@ -344,11 +363,35 @@ export async function swapItemHotel(
           rooms: roomsBilled,
         })
       : null;
-  // 换酒店前后的成本快照（审计留痕）。BUNDLE 行 after === before（不动）。
-  const beforeUnitCostCny = item.unitCostCny != null ? Number(item.unitCostCny.toString()) : null;
-  const beforeTotalCostCny = item.totalCostCny != null ? Number(item.totalCostCny.toString()) : null;
+
+  // ── BUNDLE 行成本快照跟着换店走（按差额挪住宿那一项）────────────────────────
+  // 套餐行的快照是整包地面成本（住宿 + 签证 + 用车，建单时按组件求和落库）。换酒店只换了
+  // 住宿那一项，所以按差额挪：before + (新每晚成本 − 旧每晚成本) × 套餐 HOTEL 组件晚数 × 房数。
+  // 不整包重算 —— 换酒店流程手上没有办签人数等建单口径参数，硬算会把另外几项算错。
+  // 差额算不出来（建单时本就没算出整包成本 / 新旧任一房型没录成本价）→ 快照转 NULL：
+  // 换完店还留着旧店那个数，等于让报表拿一个已经不成立的成本继续算毛利。
+  const bundleSwapCost =
+    item.kind === OrderItemKind.BUNDLE
+      ? computeSwapBundleCostSnapshot({
+          beforeTotalCostCny,
+          oldCostPriceCny:
+            oldRoomType?.costPriceCny != null ? Number(oldRoomType.costPriceCny.toString()) : null,
+          newCostPriceCny:
+            newRoomType.costPriceCny != null ? Number(newRoomType.costPriceCny.toString()) : null,
+          nights: bundleHotelNightsOf(swapBundleComponents),
+          rooms: roomsBilled,
+        })
+      : null;
+  /** BUNDLE 行是否要改写 totalCostCny（含改写成 NULL 的情形，故不能只看 bundleSwapCost 是否为空）。 */
+  const writeBundleCost = item.kind === OrderItemKind.BUNDLE && beforeTotalCostCny != null;
+
+  // 换酒店前后的成本快照（审计留痕）。
   const afterUnitCostCny = swapCost ? swapCost.unitCostCny : beforeUnitCostCny;
-  const afterTotalCostCny = swapCost ? swapCost.totalCostCny : beforeTotalCostCny;
+  const afterTotalCostCny = swapCost
+    ? swapCost.totalCostCny
+    : writeBundleCost
+      ? bundleSwapCost
+      : beforeTotalCostCny;
   const nightDates =
     item.hotelCheckIn && item.hotelCheckOut
       ? buildStayNightDates(item.hotelCheckIn, item.hotelCheckOut)
@@ -497,6 +540,12 @@ export async function swapItemHotel(
                 swapCost.unitCostCny != null ? new Prisma.Decimal(swapCost.unitCostCny) : null,
               totalCostCny:
                 swapCost.totalCostCny != null ? new Prisma.Decimal(swapCost.totalCostCny) : null,
+            }
+          : {}),
+        // BUNDLE 行：只改整包成本（unitCostCny 建单时就没写，这里也不写）。
+        ...(writeBundleCost
+          ? {
+              totalCostCny: bundleSwapCost != null ? new Prisma.Decimal(bundleSwapCost) : null,
             }
           : {}),
       },

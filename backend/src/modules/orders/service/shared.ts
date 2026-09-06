@@ -975,8 +975,8 @@ export function resolveRoomSupplementCost(input: {
  * 换酒店后 HOTEL 行成本重打快照（毛利真账）：按新房型成本价重算，口径对齐建单时的
  * HOTEL 行快照公式（unitCostCny = 每间每晚成本；totalCostCny = 每间每晚 × 晚数 × 房数）。
  *   - 新房型未录成本价（costPriceCny 为 NULL）→ 两栏都写 null（真缺数据，如实报缺，不落 0 虚高）。
- *   - BUNDLE 行不适用（建单时未快照酒店成本，且其 quantity≠晚数、totalCostCny 覆盖整包）——
- *     由调用方跳过，本函数只服务 HOTEL 行。
+ *   - BUNDLE 行不走本函数（其 quantity≠晚数、totalCostCny 是整包地面成本）——
+ *     换酒店时按住宿那一项的差额挪，见 item-cost-snapshot.computeSwapBundleCostSnapshot。
  * 纯函数，导出供单测复用（重算 + null 语义）。
  */
 export function computeSwapHotelCostSnapshot(input: {
