@@ -1,30 +1,10 @@
-import { z } from 'zod';
-
-export const registerBodySchema = z.object({
-  email: z.string().email().max(255),
-  password: z.string().min(8).max(128),
-  displayName: z.string().min(1).max(100).optional(),
-});
-export type RegisterBody = z.infer<typeof registerBodySchema>;
-
-export const loginBodySchema = z.object({
-  email: z.string().email().max(255),
-  password: z.string().min(1).max(128),
-});
-export type LoginBody = z.infer<typeof loginBodySchema>;
-
-export const changePasswordBodySchema = z.object({
-  currentPassword: z.string().min(1).max(128),
-  newPassword: z.string().min(8).max(128),
-});
-export type ChangePasswordBody = z.infer<typeof changePasswordBodySchema>;
-
-export const refreshBodySchema = z.object({
-  refreshToken: z.string().min(1),
-});
-export type RefreshBody = z.infer<typeof refreshBodySchema>;
-
-export const logoutBodySchema = z.object({
-  refreshToken: z.string().min(1),
-});
-export type LogoutBody = z.infer<typeof logoutBodySchema>;
+/**
+ * 登录 / 注册 / 改密 / 刷新令牌的请求体 —— 定义已搬进 @ftm/contracts（packages/contracts/src/auth.ts）。
+ *
+ * 校验规则一字未改：只把 z.nativeEnum(PrismaEnum) 换成契约包镜像的同值 schema
+ *（枚举漂移测试守着两边一致），helper 的 import 改指契约包里的同一份实现。
+ *
+ * 这里留 re-export 壳子，既有 import 路径全部继续可用；前端从 @ftm/contracts
+ * 取同一份类型，不再手抄。
+ */
+export * from '@ftm/contracts/auth';
