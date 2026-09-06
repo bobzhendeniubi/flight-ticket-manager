@@ -175,8 +175,21 @@ export interface HotelAvailabilityResult {
 }
 
 // ── 套餐可售日期（公开；按 航班+酒店库存 逐日算，可设 blackout 封盘）──────────
-/** 某日不可售的原因：封盘 / 机位售罄 / 满房；可售时为 null。 */
-export type SellableDateReason = 'BLACKOUT' | 'FLIGHT_SOLD_OUT' | 'HOTEL_SOLD_OUT' | null;
+/**
+ * 某日不可售的原因：封盘 / 套餐未绑航班 / 机位售罄 / 满房；可售时为 null。
+ *
+ * 末尾的 `(string & {})` 是**故意**留的开口：后端将来新增 reason（如新航线相关的新分支）时，
+ * 老前端不该因为拿到没见过的字符串就崩或当成"可售"——统一按未知处理，展示兜底文案「暂不可售」
+ * 并照常拦截加购（见 components/SellableReasonChip.tsx）。
+ */
+export type SellableDateReason =
+  | 'BLACKOUT'
+  | 'NO_FLIGHT_BOUND'
+  | 'FLIGHT_SOLD_OUT'
+  | 'HOTEL_SOLD_OUT'
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  | (string & {})
+  | null;
 
 /** GET /products/bundles/:id/sellable-dates 的单日（只回档位，不回原始库存数字）。 */
 export interface SellableDate {
