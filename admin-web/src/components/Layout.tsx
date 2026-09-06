@@ -36,6 +36,8 @@ const NAV: Array<{
   { to: '/hotel-control',   label: '房控',        roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/visa-desk',       label: '签证台',      roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/no-show',         label: 'no-show 处理', roles: ['ADMIN', 'STAFF'],         section: '运营' },
+  // 票号回填挂运营组、紧挨 no-show：这两件事都是票务岗拿航司发来的名单按班次整批处理，动线一致
+  { to: '/ticket-backfill', label: '票号回填',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/reminders',       label: '提醒中心',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/fulfillment-board', label: '工单看板',  roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/marketing',       label: '营销中心',    roles: ['ADMIN', 'STAFF'],          section: '运营' },

@@ -28,6 +28,7 @@ import { AiOcrSettingsPage } from './pages/AiOcrSettingsPage';
 import { FeatureFlagsSettingsPage } from './pages/FeatureFlagsSettingsPage';
 import { RemindersPage } from './pages/RemindersPage';
 import { NoShowBatchPage } from './pages/NoShowBatchPage';
+import { TicketBackfillPage } from './pages/TicketBackfillPage';
 import { NoShowReportPage } from './pages/NoShowReportPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { FulfillmentBoardPage } from './pages/FulfillmentBoardPage';
@@ -331,6 +332,15 @@ export function App() {
           element={
             <Protected adminOnly>
               <NoShowBatchPage />
+            </Protected>
+          }
+        />
+        {/* 票号批量回填：出票代理回名单后，票务岗整班灌真实 PNR/票号（单人改走订单详情乘客卡）。 */}
+        <Route
+          path="/ticket-backfill"
+          element={
+            <Protected adminOnly>
+              <TicketBackfillPage />
             </Protected>
           }
         />

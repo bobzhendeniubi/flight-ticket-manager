@@ -2058,6 +2058,113 @@ export interface NoShowBatchResponse {
   summary: { ok: number; failed: number; releasedSeats: number; replayedCount?: number };
 }
 
+// ── 按航班批量回填票号 ──────────────────────────────────────────────────────
+// 出票走沙箱自动生成号；真实航司出票后照名单一次灌回来。合格性、冲突与要不要覆盖，
+// 全部以服务端 preview 为准，前端只负责勾选与展示（与 no-show 批量同一条纪律）。
+
+export interface TicketBatchSchedule {
+  id: string;
+  flightNumber: string;
+  /** 出发地当地日 YYYY-MM-DD（服务端按 departureTz 折好，前端只渲染不再折） */
+  departDate: string;
+  /** 出发地当地时刻 HH:mm */
+  departTimeLocal: string;
+  seatsSold: number;
+}
+
+export type TicketMatchedBy = 'DOCUMENT' | 'NAME' | 'CHINESE_NAME';
+export type TicketField = 'pnr' | 'eticketNumber';
+
+export interface TicketBatchMatch {
+  /** 名单原文那一行（票务按原文核对） */
+  line: string;
+  /** 命中这位乘客的全部原文行（一行给 PNR、一行给票号时会有两条） */
+  lines: string[];
+  orderId: string;
+  orderNumber: string;
+  orderStatus: OrderStatus;
+  passengerId: string;
+  fullName: string;
+  chineseName: string | null;
+  /** 证件号后 4 位（服务端只给这个） */
+  documentTail: string;
+  matchedBy: TicketMatchedBy;
+  /** 本次要写的号（名单没给这一列就是 null = 不动） */
+  pnr: string | null;
+  eticketNumber: string | null;
+  /** 库里现有的号 */
+  currentPnr: string | null;
+  currentEticketNumber: string | null;
+  /** 库里已有**不一样**的号 → 必须显式勾覆盖才写 */
+  conflict: boolean;
+  conflictFields: TicketField[];
+  /** 库里已经就是这个号 → 写了也没有变化 */
+  unchanged: boolean;
+  /** 名单自己前后矛盾（同一人两个不同号）→ 系统不猜，不给提交 */
+  rosterConflict: boolean;
+  blockers: string[];
+}
+
+export interface TicketBatchAmbiguousCandidate {
+  orderId: string;
+  orderNumber: string;
+  passengerId: string;
+  fullName: string;
+  chineseName: string | null;
+  documentTail: string;
+}
+
+export interface TicketBatchAmbiguousLine {
+  line: string;
+  pnr: string | null;
+  eticketNumber: string | null;
+  candidates: TicketBatchAmbiguousCandidate[];
+}
+
+/** 行本身不可用（格式不对/缺列）——与「人匹配不上」是两回事 */
+export interface TicketBatchInvalidLine {
+  line: string;
+  error: string;
+}
+
+export interface TicketBatchPreview {
+  schedule: TicketBatchSchedule;
+  matched: TicketBatchMatch[];
+  unmatched: Array<{ line: string; identity: string }>;
+  ambiguous: TicketBatchAmbiguousLine[];
+  invalid: TicketBatchInvalidLine[];
+  totalLines: number;
+  processedLines: number;
+  truncated: boolean;
+}
+
+export interface TicketBatchEntry {
+  orderId: string;
+  passengerId: string;
+  pnr?: string | null;
+  eticketNumber?: string | null;
+  /** 库里已有不同号时必须带 true 才覆盖，否则服务端回 TICKET_CONFLICT 跳过 */
+  overwrite?: boolean;
+}
+
+export interface TicketBatchResult {
+  orderId: string;
+  orderNumber: string;
+  passengerId: string;
+  fullName: string;
+  ok: boolean;
+  /** 真正变了值的字段；空数组 = 库里本来就是这个号（重发同一批时全是空） */
+  changedFields: TicketField[];
+  error?: string;
+  code?: string;
+}
+
+export interface TicketBatchResponse {
+  results: TicketBatchResult[];
+  /** changed = 真改了的条数；unchanged = 成功但一个字段都没变（别把它算进「已回填」） */
+  summary: { ok: number; failed: number; changed: number; unchanged: number };
+}
+
 /** no-show 报表行（按班次聚合） */
 export interface NoShowReportRow {
   scheduleId: string;
@@ -5857,6 +5964,37 @@ export const api = {
       }
       return res.blob();
     },
+  },
+
+  // ── 按航班批量回填票号 ────────────────────────────────────────────────
+  // 匹配、冲突判定与要不要覆盖全部由服务端说了算；前端只负责勾选与展示。
+  ticketBackfill: {
+    /**
+     * 干跑：贴名单（或传 .xlsx）→ 逐行解析 + 匹配 + 与库里现值比对，一个字段都不写库。
+     * lines 与 fileBase64 **二选一**，两个都给服务端会 400（猜「以哪个为准」必然有一半时候猜错）。
+     */
+    batchPreview: (
+      token: string,
+      body: { scheduleId: string; lines?: string; fileBase64?: string },
+    ) =>
+      apiFetch<TicketBatchPreview>('/orders/tickets/batch-preview', {
+        method: 'POST',
+        token,
+        body,
+      }),
+    /**
+     * 落库执行。写值本身就是幂等的：库里已经是这个号就一个字段都不写，该条 changedFields 为空。
+     * requestToken 不加锁，只作整批关联号落进审计，重试请沿用同一个，便于事后认出是同一批。
+     */
+    batch: (
+      token: string,
+      body: {
+        requestToken: string;
+        scheduleId: string;
+        entries: TicketBatchEntry[];
+        note?: string;
+      },
+    ) => apiFetch<TicketBatchResponse>('/orders/tickets/batch', { method: 'POST', token, body }),
   },
 
   // Settlements
