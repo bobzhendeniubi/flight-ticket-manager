@@ -17068,17 +17068,25 @@ function ConfirmPaymentSection({
       setErr('金额需为正数');
       return;
     }
-    // 金额留空 = 后端默认按尾款全额入账、可能直接结清（口径见 payments.service confirmManualPayment）。
-    // 财务逐单收齐靠这个默认省事，但对误触是零门槛，先弹一道人为确认。
+    // 「按尾款全额入账」二次确认。两条路都会把本单一次性结清，都要过这道人为确认：
+    //   · 金额留空 —— 后端默认按尾款全额入账（口径见 payments.service confirmManualPayment）；
+    //   · 金额恰好等于尾款全额 —— 表单默认就预填尾款，一路回车即结清。
+    // 以前只认留空，但预填让「留空」几乎不会发生，这道闸实际上从不触发，与财务岗手册写的
+    // 对不上。预填不动（逐单收齐靠它省事），改成金额相等时同样弹——金额类操作多一道确认无害。
     // 已结清后再留空提交没有可默认的尾款，就地拦下，别让后端报「金额必须大于 0」绕一圈。
-    if (amt === undefined && !confirmDuplicate) {
-      if (balance <= 0) {
+    const settlesInFull =
+      amt === undefined || (balance > 0 && Math.abs(amt - balance) < 0.005);
+    if (settlesInFull && !confirmDuplicate) {
+      if (amt === undefined && balance <= 0) {
         setErr('本单已无尾款，追加收款请填写实际到账金额');
         return;
       }
       const okToSettle = await askConfirm({
         title: '按尾款全额入账',
-        body: `未填收款金额，将默认按尾款 ¥${balance.toLocaleString()} 入账并结清本单。确认已实际收到这笔钱？`,
+        body:
+          amt === undefined
+            ? `未填收款金额，将默认按尾款 ¥${balance.toLocaleString()} 入账并结清本单。确认已实际收到这笔钱？`
+            : `这笔金额正好是本单尾款 ¥${balance.toLocaleString()}，入账后本单即结清。确认已实际收到这笔钱？`,
         tone: 'danger',
       });
       if (!okToSettle) return;
