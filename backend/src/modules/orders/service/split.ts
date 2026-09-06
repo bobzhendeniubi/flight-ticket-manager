@@ -62,6 +62,13 @@ import { determineFlightLegItems } from '../ticketing-cap.js';
 import { FulfillmentStatus, FulfillmentType } from '@prisma/client';
 import { readJsonObject, type SplitOrchestrationSnapshot } from './leg-action-log.js';
 import {
+  type SplitConservationRow,
+  sumFlightQuantities,
+  sumFlightUpgradeCounts,
+  sumRoomsBilledHalves,
+  sumTotalCostCents,
+} from './order-ledger.js';
+import {
   actorCan,
   appendAdjustment,
   generateOrderNumber,
@@ -2024,24 +2031,6 @@ export function readRoomGroups(
     });
 }
 
-/** 逐班次舱位数量账（拆单座位守恒断言用）：key = `${scheduleId}|${cabin}` → Σquantity。 */
-export function sumFlightQuantities(
-  items: ReadonlyArray<{
-    kind: OrderItemKind;
-    flightScheduleId: string | null;
-    flightCabin: import('@prisma/client').CabinClass | null;
-    quantity: number;
-  }>,
-): Map<string, number> {
-  const map = new Map<string, number>();
-  for (const it of items) {
-    if (it.kind !== OrderItemKind.FLIGHT || !it.flightScheduleId) continue;
-    const key = `${it.flightScheduleId}|${it.flightCabin ?? 'NONE'}`;
-    map.set(key, (map.get(key) ?? 0) + it.quantity);
-  }
-  return map;
-}
-
 /** 订单行 → 策略层认得的最小形状（Decimal / JSON 都在这里归一化，策略层只见普通数字）。 */
 export function toSplitItemView(item: SplitSourceOrder['items'][number]): SplitItemView {
   return {
@@ -2097,49 +2086,6 @@ export function splitPatchToPrisma(patch: SplitRowPatch): SplitPatchData {
   }
   if (patch.metadata !== undefined) data.metadata = patch.metadata as Prisma.InputJsonValue;
   return data;
-}
-
-/** 守恒断言用的行形状（拆前读 loadOrderForSplit、拆后读两单 findMany，字段一致）。 */
-export interface SplitConservationRow {
-  kind: OrderItemKind;
-  flightScheduleId?: string | null;
-  flightCabin?: import('@prisma/client').CabinClass | null;
-  quantity?: number;
-  metadata?: unknown;
-  roomsBilled?: Prisma.Decimal | number | null;
-  totalCostCny?: Prisma.Decimal | number | null;
-}
-
-/**
- * 逐班次舱位的**升舱位**账：key = `${scheduleId}|${cabin}` → Σ min(升舱人数, 该行座位数)。
- * 升舱位对应的是真实商务舱库存，拆单一旦把它放大就等于凭空占了商务舱座。
- */
-export function sumFlightUpgradeCounts(items: ReadonlyArray<SplitConservationRow>): Map<string, number> {
-  const map = new Map<string, number>();
-  for (const it of items) {
-    if (it.kind !== OrderItemKind.FLIGHT || !it.flightScheduleId) continue;
-    const count = readUpgradeCount(readJsonObject(it.metadata));
-    if (count <= 0) continue;
-    const key = `${it.flightScheduleId}|${it.flightCabin ?? 'NONE'}`;
-    map.set(key, (map.get(key) ?? 0) + Math.min(count, it.quantity ?? 0));
-  }
-  return map;
-}
-
-/** Σ roomsBilled（以「半间」为整数单位，避免 0.5 的浮点尾数）。 */
-export function sumRoomsBilledHalves(items: ReadonlyArray<SplitConservationRow>): number {
-  return items.reduce(
-    (sum, it) => sum + (it.roomsBilled == null ? 0 : Math.round(Number(it.roomsBilled) * 2)),
-    0,
-  );
-}
-
-/** Σ totalCostCny（以「分」为整数单位）。 */
-export function sumTotalCostCents(items: ReadonlyArray<SplitConservationRow>): number {
-  return items.reduce(
-    (sum, it) => sum + (it.totalCostCny == null ? 0 : Math.round(Number(it.totalCostCny) * 100)),
-    0,
-  );
 }
 
 /** 佣金劈分的审计明细（事务外写 CRITICAL 审计用）。 */
