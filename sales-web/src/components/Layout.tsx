@@ -9,6 +9,7 @@ import { MobilePreviewFrame } from './MobilePreviewFrame';
 import { MobileBottomBar } from './MobileBottomBar';
 import { Icon } from './Icon';
 import { WaveDivider } from './WaveDivider';
+import { useActiveDestinationContent } from '../lib/useActiveDestination';
 
 // 浮动 AI 助手懒加载（G1 性能）：AiAssistant 体量大（~40KB），不该进首屏 bundle。
 // React.lazy + Suspense(fallback=null) 让它在外壳挂载后异步拉取 —— 行为与之前完全一致
@@ -480,6 +481,8 @@ function LanguageSwitch({ className }: { className?: string }) {
 /** 多列页脚（E1）— 关于椰岛假期 / 帮助支持 / 法律条款 / 联系我们 + 品牌简介 + 社交 + 底部法律行。
  *  链接全用 react-router <Link>；手机端列堆叠，并留出底部导航高度（pb-24）。 */
 function SiteFooter() {
+  // 页脚品牌简介跟着当前主推目的地走（按目的地分组，见 lib/content.ts）
+  const destination = useActiveDestinationContent();
   const year = new Date().getFullYear();
 
   // 占位公司信息：真实主体名称与 ICP 备案号待法务/运营补全 —— 这里明确标注 placeholder。
@@ -557,7 +560,7 @@ function SiteFooter() {
               </span>
             </Link>
             <p className="mt-4 max-w-xs text-sm leading-relaxed text-ink-soft">
-              澳门⇌岘港海岛专线，机票 + 酒店 + 签证 + 地面服务一价全包。中文客服全程在线，让海岛度假省心又省钱。
+              {destination.footerTagline}
             </p>
             <div className="mt-4 flex flex-wrap gap-2">
               <span className="badge-soft">

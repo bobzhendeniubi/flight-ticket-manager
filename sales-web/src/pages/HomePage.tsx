@@ -11,7 +11,7 @@ import {
   formatLocalTime,
   getAirportOptions,
 } from '../lib/airports';
-import { DANANG_HIGHLIGHTS } from '../lib/content';
+import { getDestinationContent } from '../lib/content';
 import { businessToday } from '../lib/datetime';
 import { useDebouncedValue } from '../lib/useDebouncedValue';
 import { BenefitsStrip } from '../components/BenefitsStrip';
@@ -217,6 +217,8 @@ export function HomePage() {
   // 多于一条活跃航线时改说「N 条直飞航线」+ 逐条列出，避免只提其中一条显得漏卖。
   const originName = AIRPORTS[origin]?.name ?? origin;
   const destName = AIRPORTS[destination]?.name ?? destination;
+  // 景点亮点按当前选中的到达机场取；该目的地还没配内容时退回兜底目的地那组。
+  const destinationContent = getDestinationContent(destination);
   const routeHeadline =
     routes.length > 1 ? `${routes.length} 条海岛直飞航线` : `${originName} ⇌ ${destName} 直飞专线`;
   const routeSub =
@@ -506,14 +508,14 @@ export function HomePage() {
       <HotelsPreviewSection keyword={kw} />
       <TransfersPreviewSection keyword={kw} />
 
-      {/* 岘港亮点 */}
+      {/* 目的地亮点：跟着搜索框里当前选的到达机场走（按目的地分组，见 lib/content.ts） */}
       <section>
         <div className="flex items-end justify-between">
-          <h2 className="text-xl font-bold text-slate-900">岘港必玩</h2>
+          <h2 className="text-xl font-bold text-slate-900">{destinationContent.highlightsTitle}</h2>
           <p className="text-xs text-slate-500">一个行程一次打卡</p>
         </div>
         <div className="mt-4 grid gap-4 md:grid-cols-2 lg:grid-cols-4">
-          {DANANG_HIGHLIGHTS.map((h) => (
+          {destinationContent.highlights.map((h) => (
             <div key={h.title} className="card hover:shadow-md transition">
               <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-brand-50 text-brand">
                 <Icon name="mapPin" className="h-6 w-6" />

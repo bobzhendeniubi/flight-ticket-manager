@@ -1,12 +1,13 @@
-import { useEffect, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { Icon, type IconName } from './Icon';
 import { WaveDivider } from './WaveDivider';
+import { useActiveDestinationContent } from '../lib/useActiveDestination';
 
 /**
  * 椰岛 hero 轮播 —— 落地页中心舞台。
  *
- * 美学：「踏出机舱，岘港的阳光迎面而来」的海岛逃离感。
- *  - 真实热带岘港照片（美溪海滩 / 礁湖 / 度假泳池 / 巴拿金桥 / 会安灯笼）
+ * 美学：「踏出机舱，目的地的阳光迎面而来」的海岛逃离感。
+ *  - 真实热带海岛照片（首屏跟着当前主推目的地走，见 lib/content.ts 的按目的地分组）
  *  - palette 配色渐变 scrim（保证白字对比度）
  *  - 右上角暖阳辉光 sun-glow（缓慢呼吸）+ 太阳圆盘 + 棕榈叶剪影（轻摆）
  *  - 底部漂移波浪分隔（标志性海岛母题）
@@ -35,19 +36,10 @@ interface HeroSlide {
   chips: string[];
 }
 
-// 真实热带岘港 / 越南海岛意象（Unsplash）。首图 eager + fetchpriority，其余 lazy。
-const HERO_SLIDES: HeroSlide[] = [
-  {
-    // 美溪海滩 My Khe — 碧蓝海水 + 白沙
-    photo: 'https://images.unsplash.com/photo-1528127269322-539801943592?w=1600&h=720&fit=crop',
-    scrim: 'linear-gradient(105deg, rgba(10,110,128,.78) 0%, rgba(14,138,160,.55) 46%, rgba(25,184,201,.28) 100%)',
-    kickerIcon: 'plane',
-    kickerEn: 'COCO HOLIDAY · DA NANG',
-    kicker: '澳门出发 · 岘港专线',
-    title: '说走就走的海岛假期',
-    subtitle: '澳门 ↔ 岘港每日直飞 1h45m，落地就是海。机票 · 酒店 · 签证 · 接送，一次订齐。',
-    chips: ['美溪海滩', '巴拿山金桥', '会安古城'],
-  },
+// 与目的地无关的两屏（一价全含 / 会员福利）。介绍目的地的首屏跟着当前航线走，
+// 由 lib/content.ts 的按目的地分组提供——新开一条线只加一组内容，这里不动。
+// 首图 eager + fetchpriority，其余 lazy。
+const GENERIC_SLIDES: HeroSlide[] = [
   {
     // 度假泳池 / 棕榈树 — 一价全含的度假感
     photo: 'https://images.unsplash.com/photo-1582719508461-905c673771fd?w=1600&h=720&fit=crop',
@@ -75,6 +67,12 @@ const HERO_SLIDES: HeroSlide[] = [
 export function HeroCarousel({ greeting }: { greeting?: string | null }) {
   const [idx, setIdx] = useState(0);
   const [paused, setPaused] = useState(false);
+  // 首屏 = 当前主推目的地那一屏，其后接与目的地无关的两屏。
+  const destination = useActiveDestinationContent();
+  const HERO_SLIDES = useMemo<HeroSlide[]>(
+    () => [{ ...destination.heroSlide, kickerIcon: 'plane' as IconName }, ...GENERIC_SLIDES],
+    [destination],
+  );
 
   useEffect(() => {
     if (paused) return;
@@ -82,9 +80,10 @@ export function HeroCarousel({ greeting }: { greeting?: string | null }) {
     if (typeof window !== 'undefined' && window.matchMedia?.('(prefers-reduced-motion: reduce)').matches) {
       return;
     }
-    const t = setInterval(() => setIdx((i) => (i + 1) % HERO_SLIDES.length), AUTO_ADVANCE_MS);
+    const count = HERO_SLIDES.length;
+    const t = setInterval(() => setIdx((i) => (i + 1) % count), AUTO_ADVANCE_MS);
     return () => clearInterval(t);
-  }, [paused]);
+  }, [paused, HERO_SLIDES]);
 
   return (
     <section
