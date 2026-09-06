@@ -141,6 +141,13 @@ import {
   type ProspectiveOccupancy,
   type RandomTierFitViolation,
 } from '../hotel-control/hotel-control.service.js';
+// 城市维度的纯函数直接从 hotel-city 取（不经 hotel-control.service 再导出）：
+// 单测整模块 mock hotel-control.service 时，这几个纯函数不需要跟着 mock。
+import {
+  cityLabel,
+  normalizeCityCode,
+  RANDOM_TIER_LEGACY_CITY_CODE,
+} from '../hotel-control/hotel-city.js';
 import { env } from '../../config/env.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
@@ -2835,7 +2842,7 @@ export class OrderService {
       });
       const randomTierParts = oversoldRandomTiers.map((r) => {
         const worst = r.violations.reduce((a, b) => (b.shortfall > a.shortfall ? b : a));
-        return `随机档缺口（${randomStarTierLabel(r.tier)} ${formatSlashMonthDay(worst.date)} 最大缺 ${worst.shortfall} 间，需向地接加房）`;
+        return `随机档缺口（${cityLabel(r.cityCode)}${randomStarTierLabel(r.tier)} ${formatSlashMonthDay(worst.date)} 最大缺 ${worst.shortfall} 间，需向地接加房）`;
       });
       const auditParts = [
         ...(hotelParts.length > 0
@@ -2866,6 +2873,7 @@ export class OrderService {
           randomTiers: oversoldRandomTiers.map((r) => ({
             kind: 'RANDOM_TIER_SHORTFALL',
             tier: r.tier,
+            cityCode: r.cityCode,
             nights: r.violations.map((v) => ({
               date: v.date,
               remaining: v.remaining,
@@ -3886,10 +3894,16 @@ export class OrderService {
           const stayNights = buildStayNightDates(new Date(item.checkIn), new Date(item.checkOut));
           if (stayNights.length > 0) {
             // 这条分支必为后台录单（上面已按 allowClientPricedGround 拒掉对外角色）→ 直接吃豁免。
-            await assertRandomTierFit(item.randomStarTier, stayNights, rooms, {
-              maxOversellRooms:
-                hotelOversellCapRooms != null ? RANDOM_TIER_INTERNAL_NO_CAP : undefined,
-            });
+            // 单独随机行没有酒店也就没有城市 → 一律归存量默认城市（见 hotel-city.ts）。
+            await assertRandomTierFit(
+              { tier: item.randomStarTier, cityCode: RANDOM_TIER_LEGACY_CITY_CODE },
+              stayNights,
+              rooms,
+              {
+                maxOversellRooms:
+                  hotelOversellCapRooms != null ? RANDOM_TIER_INTERNAL_NO_CAP : undefined,
+              },
+            );
           }
         }
         if (item.hotelRoomTypeId) {
@@ -4061,7 +4075,8 @@ export class OrderService {
                 hotelId: true,
                 // randomTierPlaceholder：套餐绑的可能是「随机N星」的占位酒店房型（历史形态）——
                 //   此时房量闸要走随机档聚合闸而不是具体酒店闸（见下方库存校验小节）。
-                hotel: { select: { isActive: true, randomTierPlaceholder: true } },
+                // cityCode：随机档按城市圈定，套餐的城市 = 它绑的占位酒店的城市。
+                hotel: { select: { isActive: true, randomTierPlaceholder: true, cityCode: true } },
               },
             },
           },
@@ -4128,6 +4143,8 @@ export class OrderService {
           /** 星级闸比对用（占位酒店不参与本闸）。*/
           starRating: number | null;
           intlFiveStar: boolean;
+          /** 随机档按城市圈定：指到占位酒店时，聚合闸的城市取该占位酒店的。*/
+          cityCode: string;
         } | null = null;
         if (
           item.designatedHotelRoomTypeId &&
@@ -4148,6 +4165,7 @@ export class OrderService {
                   randomTierPlaceholder: true,
                   starRating: true,
                   intlFiveStar: true,
+                  cityCode: true,
                 },
               },
             },
@@ -4164,6 +4182,7 @@ export class OrderService {
             randomTierPlaceholder: rt.hotel.randomTierPlaceholder,
             starRating: rt.hotel.starRating ?? null,
             intlFiveStar: rt.hotel.intlFiveStar === true,
+            cityCode: rt.hotel.cityCode,
           };
         }
 
@@ -4302,20 +4321,31 @@ export class OrderService {
           designatedRoomType != null
             ? designatedRoomType.randomTierPlaceholder
             : (bundle.hotelRoomType?.hotel.randomTierPlaceholder ?? null);
+        // 随机档按城市圈定：城市 = 占位酒店（指定的或套餐绑定的）自己的 cityCode
+        const fitPlaceholderCity = normalizeCityCode(
+          designatedRoomType != null
+            ? designatedRoomType.cityCode
+            : bundle.hotelRoomType?.hotel.cityCode,
+        );
         if (hotelStamp && fitHotelId) {
           const nightDates = buildStayNightDates(hotelStamp.hotelCheckIn, hotelStamp.hotelCheckOut);
           if (nightDates.length > 0) {
             // 带 cap = 内部录单：用默认的带数字文案（要看得见差多少间/超没超上限）；
             // 对外端点（豁免缺省）：中性话术，不暴露包房间数等内部库存数字。
             if (fitPlaceholderTier != null) {
-              await assertRandomTierFit(fitPlaceholderTier, nightDates, rooms, {
-                maxOversellRooms:
-                  hotelOversellCapRooms != null ? RANDOM_TIER_INTERNAL_NO_CAP : undefined,
-                buildMessage:
-                  hotelOversellCapRooms != null
-                    ? undefined
-                    : () => '该出发日期酒店可用房量不足，请更换日期或联系客服',
-              });
+              await assertRandomTierFit(
+                { tier: fitPlaceholderTier, cityCode: fitPlaceholderCity },
+                nightDates,
+                rooms,
+                {
+                  maxOversellRooms:
+                    hotelOversellCapRooms != null ? RANDOM_TIER_INTERNAL_NO_CAP : undefined,
+                  buildMessage:
+                    hotelOversellCapRooms != null
+                      ? undefined
+                      : () => '该出发日期酒店可用房量不足，请更换日期或联系客服',
+                },
+              );
             } else {
               await assertHotelPhysicalFit(
                 fitHotelId,
@@ -7900,7 +7930,7 @@ export class OrderService {
             select: {
               id: true,
               hotelId: true,
-              hotel: { select: { randomTierPlaceholder: true } },
+              hotel: { select: { randomTierPlaceholder: true, cityCode: true } },
             },
           })
         : [];
@@ -7920,10 +7950,17 @@ export class OrderService {
       const roomType = item.hotelRoomTypeId ? roomTypeById.get(item.hotelRoomTypeId) : undefined;
       const randomTier = item.randomStarTier ?? roomType?.hotel.randomTierPlaceholder ?? null;
       if (randomTier != null) {
-        scopeKey = `random:${randomTier}:${nightDates.join(',')}`;
+        // 城市：占位酒店行取占位酒店的；单独随机行没有酒店 → 存量默认城市（normalizeCityCode 的空值回落）
+        const randomCity = normalizeCityCode(roomType?.hotel.cityCode);
+        scopeKey = `random:${randomCity}:${randomTier}:${nightDates.join(',')}`;
         if (checked.has(scopeKey)) continue;
         checked.add(scopeKey);
-        const aggregate = await getRandomTierAggregate(randomTier, nightDates, {}, tx);
+        const aggregate = await getRandomTierAggregate(
+          { tier: randomTier, cityCode: randomCity },
+          nightDates,
+          {},
+          tx,
+        );
         result = aggregate;
       } else if (roomType) {
         scopeKey = `hotel:${roomType.hotelId}:${nightDates.join(',')}`;
@@ -13411,10 +13448,17 @@ export class OrderService {
         // 用带锁版：此前虽已在事务内、传了 tx，但没有 FOR UPDATE —— 只读判定挡不住并发，
         // 两笔改期同时挤进同一档次的最后一间会双双通过。带锁版先锁该档次全部真酒店在该
         // 区间的包房周期行，与下方写新日期落库同事务，判定与落库之间不留窗口。
-        await assertRandomTierFitWithinTx(tx, item.randomStarTier!, nightDates, roomsBilled, {
-          excludeOrderId: orderId,
-          maxOversellRooms: RANDOM_TIER_INTERNAL_NO_CAP,
-        });
+        // 单独随机行没有酒店也就没有城市 → 存量默认城市（见 hotel-city.ts）。
+        await assertRandomTierFitWithinTx(
+          tx,
+          { tier: item.randomStarTier!, cityCode: RANDOM_TIER_LEGACY_CITY_CODE },
+          nightDates,
+          roomsBilled,
+          {
+            excludeOrderId: orderId,
+            maxOversellRooms: RANDOM_TIER_INTERNAL_NO_CAP,
+          },
+        );
       }
 
       // ── 减价不能把应付冲成负数（与换酒店同一道闸）──
@@ -22349,9 +22393,11 @@ export interface ProspectiveHotelStay {
  * 归并同样是必需的：同一单两条随机档行各判一次会双双通过（它们都还没落库、彼此看不见）。
  * 加锁顺序按归并键排序，避免并发事务以不同顺序锁同一批档次造成死锁。
  */
-/** 建单事务闸容忍的随机档超卖明细（按档次归并后逐组）。*/
+/** 建单事务闸容忍的随机档超卖明细（按城市 × 档次归并后逐组）。*/
 export interface RandomTierOversellRecord {
   tier: number;
+  /** 归一后的城市码（随机档按城市圈定；单独随机行 = 存量默认城市）。*/
+  cityCode: string;
   violations: RandomTierFitViolation[];
 }
 
@@ -22374,38 +22420,47 @@ export async function assertRandomTierStaysFitWithinTx(
         .map((s) => s.hotelRoomTypeId as string),
     ),
   ];
-  const placeholderTierByRoomTypeId = new Map<string, number>();
+  // 随机档按城市圈定：占位酒店行的城市取占位酒店的 cityCode（与档次一起查回）。
+  const placeholderByRoomTypeId = new Map<string, { tier: number; cityCode: string }>();
   if (placeholderLookupIds.length > 0) {
     const roomTypes = await tx.hotelRoomType.findMany({
       where: { id: { in: placeholderLookupIds } },
-      select: { id: true, hotel: { select: { randomTierPlaceholder: true } } },
+      select: { id: true, hotel: { select: { randomTierPlaceholder: true, cityCode: true } } },
     });
     for (const rt of roomTypes) {
       if (rt.hotel.randomTierPlaceholder != null) {
-        placeholderTierByRoomTypeId.set(rt.id, rt.hotel.randomTierPlaceholder);
+        placeholderByRoomTypeId.set(rt.id, {
+          tier: rt.hotel.randomTierPlaceholder,
+          cityCode: normalizeCityCode(rt.hotel.cityCode),
+        });
       }
     }
   }
 
-  type TierGroup = { tier: number; nightDates: string[]; rooms: number };
+  type TierGroup = { tier: number; cityCode: string; nightDates: string[]; rooms: number };
   const groups = new Map<string, TierGroup>();
   for (const stay of dated) {
-    const tier =
-      stay.randomStarTier ??
-      (stay.hotelRoomTypeId ? placeholderTierByRoomTypeId.get(stay.hotelRoomTypeId) : undefined);
+    // 单独随机行（randomStarTier 非空）没有酒店也就没有城市 → 存量默认城市；
+    // 占位酒店房型行 → 档次与城市都取占位酒店的。
+    const scope =
+      stay.randomStarTier != null
+        ? { tier: stay.randomStarTier, cityCode: RANDOM_TIER_LEGACY_CITY_CODE }
+        : stay.hotelRoomTypeId
+          ? placeholderByRoomTypeId.get(stay.hotelRoomTypeId)
+          : undefined;
     // 具体酒店的真房型 → 不归这道闸管（走 assertHotelStaysFitWithinTx）。
-    if (tier == null) continue;
+    if (scope == null) continue;
     const nightDates = buildStayNightDates(stay.hotelCheckIn, stay.hotelCheckOut);
     // 空 = 区间非法/超长（buildStayNightDates 的防御）→ 无从校验，与既有口径一致不阻断。
     if (nightDates.length === 0) continue;
-    // 首尾夜唯一确定整段（逐晚连续），可安全用作归并键。
-    const key = `${tier}|${nightDates[0]}|${nightDates[nightDates.length - 1]}`;
+    // 首尾夜唯一确定整段（逐晚连续），连同城市与档次一起可安全用作归并键。
+    const key = `${scope.cityCode}|${scope.tier}|${nightDates[0]}|${nightDates[nightDates.length - 1]}`;
     const rooms = stay.roomsBilled ?? 1;
     const existing = groups.get(key);
     if (existing) {
       existing.rooms = round2(existing.rooms + rooms);
     } else {
-      groups.set(key, { tier, nightDates, rooms });
+      groups.set(key, { tier: scope.tier, cityCode: scope.cityCode, nightDates, rooms });
     }
   }
 
@@ -22414,12 +22469,14 @@ export async function assertRandomTierStaysFitWithinTx(
     const group = groups.get(key)!;
     const violations = await assertRandomTierFitWithinTx(
       tx,
-      group.tier,
+      { tier: group.tier, cityCode: group.cityCode },
       group.nightDates,
       group.rooms,
       opts,
     );
-    if (violations.length > 0) tolerated.push({ tier: group.tier, violations });
+    if (violations.length > 0) {
+      tolerated.push({ tier: group.tier, cityCode: group.cityCode, violations });
+    }
   }
   return tolerated;
 }
