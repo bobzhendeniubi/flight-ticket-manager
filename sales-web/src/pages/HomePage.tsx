@@ -1,13 +1,15 @@
 import { FormEvent, useEffect, useState } from 'react';
 import { Link, useSearchParams } from 'react-router-dom';
-import { api, ApiError, type CabinClass, type FlightSearchResult } from '../lib/api';
+import { api, ApiError, type CabinClass, type FlightSearchResult, type PublicRoute } from '../lib/api';
 import {
-  AIRPORT_OPTIONS,
+  AIRPORTS,
   CABIN_LABEL,
   airportLabel,
+  applyPublicAirports,
   formatDuration,
   formatLocalDate,
   formatLocalTime,
+  getAirportOptions,
 } from '../lib/airports';
 import { DANANG_HIGHLIGHTS } from '../lib/content';
 import { businessToday } from '../lib/datetime';
@@ -60,7 +62,8 @@ function todayISO(offsetDays = 1): string {
 export function HomePage() {
   const user = useAuth((s) => s.user);
 
-  // 默认主航线：澳门 → 岘港
+  // 默认主航线：静态兜底为澳门 → 岘港；挂载后拉 /public/routes 用真实第一条航线覆盖
+  // （见下方 effect），拉取失败保持这两个默认值不变，页面不会空白。
   const [tripType, setTripType] = useState<'oneway' | 'roundtrip'>('roundtrip');
   const [origin, setOrigin] = useState('MFM');
   const [destination, setDestination] = useState('DAD');
@@ -68,6 +71,10 @@ export function HomePage() {
   const [returnDate, setReturnDate] = useState(todayISO(7));
   const [cabin, setCabin] = useState<'' | CabinClass>('');
   const [passengers, setPassengers] = useState(1);
+
+  // 活跃航线（公司可能同时卖多条线）+ 出发/到达下拉选项；两者都来自后端聚合端点。
+  const [routes, setRoutes] = useState<PublicRoute[]>([]);
+  const [airportOptions, setAirportOptions] = useState(() => getAirportOptions());
 
   type SearchResultWithLeg = FlightSearchResult & { _leg?: '去程' | '回程' };
   const [results, setResults] = useState<SearchResultWithLeg[] | null>(null);
@@ -110,6 +117,34 @@ export function HomePage() {
   useEffect(() => {
     void loadInitial();
     // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // 拉取活跃航线 + 机场（公开端点），合并进 lib/airports 静态兜底表，并把默认
+  // 出发/到达改成第一条真实航线。失败/暂无数据一律保留静态兜底（仍是澳门⇌岘港），
+  // 绝不清空——公司马上开第二条线也不该让老航线的首屏体验先坏掉。
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      try {
+        const [routesRes, airportsRes] = await Promise.all([
+          api.getPublicRoutes(),
+          api.getPublicAirports(),
+        ]);
+        if (cancelled) return;
+        applyPublicAirports(airportsRes.airports);
+        setAirportOptions(getAirportOptions());
+        setRoutes(routesRes.routes);
+        if (routesRes.routes.length > 0) {
+          setOrigin(routesRes.routes[0].originCode);
+          setDestination(routesRes.routes[0].destinationCode);
+        }
+      } catch {
+        // 拉取失败：静默保留静态兜底，不打断首屏（航班搜索本身有独立的 error 态）
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
   }, []);
 
   const runSearch = async () => {
@@ -178,6 +213,17 @@ export function HomePage() {
     setDestination(origin);
   };
 
+  // 「为什么选我们」专线文案：按当前所选航线现拼，不再写死目的地。
+  // 多于一条活跃航线时改说「N 条直飞航线」+ 逐条列出，避免只提其中一条显得漏卖。
+  const originName = AIRPORTS[origin]?.name ?? origin;
+  const destName = AIRPORTS[destination]?.name ?? destination;
+  const routeHeadline =
+    routes.length > 1 ? `${routes.length} 条海岛直飞航线` : `${originName} ⇌ ${destName} 直飞专线`;
+  const routeSub =
+    routes.length > 1
+      ? routes.map((r) => `${r.origin.name} ↔ ${r.destination.name}`).join(' · ')
+      : `${originName} ↔ ${destName} 每日直飞，机票 + 酒店打包更划算`;
+
   // 关键字过滤航班结果（航班号 / 三字码 / 机场中文名）
   const filterFlights = (list: SearchResultWithLeg[]) =>
     list.filter((r) =>
@@ -233,12 +279,40 @@ export function HomePage() {
             </button>
           </div>
         </div>
+
+        {/* 航线切换：只有拉到 ≥2 条活跃航线（公司开了第二条直飞）才显示；单条线时不打扰用户。 */}
+        {routes.length > 1 && (
+          <div className="mt-3 flex flex-wrap gap-2" role="group" aria-label="选择航线">
+            {routes.map((r) => {
+              const selected = origin === r.originCode && destination === r.destinationCode;
+              return (
+                <button
+                  key={`${r.originCode}-${r.destinationCode}`}
+                  type="button"
+                  className={`rounded-full border px-3 py-1 text-xs font-medium transition ${
+                    selected
+                      ? 'border-brand bg-brand/10 text-brand'
+                      : 'border-slate-300 text-slate-600 hover:bg-slate-50'
+                  }`}
+                  aria-pressed={selected}
+                  onClick={() => {
+                    setOrigin(r.originCode);
+                    setDestination(r.destinationCode);
+                  }}
+                >
+                  {r.origin.name} ⇌ {r.destination.name}
+                </button>
+              );
+            })}
+          </div>
+        )}
+
         <form className="mt-4 grid gap-4 md:grid-cols-12" onSubmit={onSubmit}>
           <div className="md:col-span-3">
             <label className="label" htmlFor="origin">出发</label>
             <select id="origin" className="input" value={origin} onChange={(e) => setOrigin(e.target.value)}>
               <option value="">全部</option>
-              {AIRPORT_OPTIONS.filter((a) => a.active).map((a) => (
+              {airportOptions.filter((a) => a.active).map((a) => (
                 <option key={a.code} value={a.code}>
                   {a.name} ({a.code}){a.country ? ` · ${a.country}` : ''}
                 </option>
@@ -265,7 +339,7 @@ export function HomePage() {
               onChange={(e) => setDestination(e.target.value)}
             >
               <option value="">全部</option>
-              {AIRPORT_OPTIONS.filter((a) => a.active).map((a) => (
+              {airportOptions.filter((a) => a.active).map((a) => (
                 <option key={a.code} value={a.code}>
                   {a.name} ({a.code}){a.country ? ` · ${a.country}` : ''}
                 </option>
@@ -462,8 +536,8 @@ export function HomePage() {
             <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-brand-50 text-brand">
               <Icon name="plane" className="h-6 w-6" />
             </div>
-            <h3 className="mt-2 font-semibold text-slate-900">澳门 ⇌ 岘港海岛专线</h3>
-            <p className="mt-1 text-slate-600">QH9588/9589 澳门 ↔ 岘港每日直飞 1h45m，每天 1 班</p>
+            <h3 className="mt-2 font-semibold text-slate-900">{routeHeadline}</h3>
+            <p className="mt-1 text-slate-600">{routeSub}</p>
           </div>
           <div>
             <div className="flex h-11 w-11 items-center justify-center rounded-xl bg-brand-50 text-brand">

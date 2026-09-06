@@ -1016,6 +1016,30 @@ export interface UploadOrderReceiptResult {
   status: 'OPEN';
 }
 
+// ── 航线 / 机场 / 酒店城市（公开，动态派生，不再由前端写死目的地）──────────────
+/** GET /public/airports、/public/routes 里机场展示信息（中文名 / 城市 / 国家 / IANA 时区）。 */
+export interface PublicAirport {
+  code: string;
+  name: string;
+  city: string;
+  country: string;
+  tz: string;
+}
+
+/** GET /public/routes 返回的一条活跃航线（起降机场对 + 两端展示信息）。 */
+export interface PublicRoute {
+  originCode: string;
+  destinationCode: string;
+  origin: PublicAirport;
+  destination: PublicAirport;
+}
+
+/** GET /public/hotel-cities 返回的一个在架酒店城市（含非机场码，如会安）。 */
+export interface PublicHotelCity {
+  code: string;
+  name: string;
+}
+
 // ── Typed endpoints ───────────────────────────────────────────────────────
 
 export const api = {
@@ -1112,6 +1136,14 @@ export const api = {
   /** 公开收款渠道：买家下单后看到的统一收款码 / 账户（只回启用中的）。 */
   getPublicPaymentChannels: () =>
     apiFetch<{ channels: PublicPaymentChannel[] }>('/public/payment-channels'),
+
+  // ── 航线 / 机场 / 酒店城市（公开，无需登录）───────────────────────────────
+  /** 活跃航线（distinct 起降机场对 + 两端展示信息）；用于首页默认航线 + 航线切换。 */
+  getPublicRoutes: () => apiFetch<{ routes: PublicRoute[] }>('/public/routes'),
+  /** 出现在活跃航班里的机场清单；用于航班搜索的出发/到达下拉。 */
+  getPublicAirports: () => apiFetch<{ airports: PublicAirport[] }>('/public/airports'),
+  /** 在架酒店的 distinct 城市码 + 中文名；用于酒店页目的地下拉。 */
+  getPublicHotelCities: () => apiFetch<{ cities: PublicHotelCity[] }>('/public/hotel-cities'),
   /**
    * 公开上传付款凭证：凭「订单号 + lookupKey（手机号/邮箱/姓氏）」校验后建一条待对账凭证。
    * lookupKey 不匹配后端回 404（apiFetch 抛 ApiError，status=404）；按 IP 限流 10 次/分钟。

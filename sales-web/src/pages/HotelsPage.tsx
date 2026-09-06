@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { api, type Hotel } from '../lib/api';
+import { api, type Hotel, type PublicHotelCity } from '../lib/api';
 import { businessToday } from '../lib/datetime';
 import { useCart } from '../stores/cart';
 import { Icon } from '../components/Icon';
@@ -45,10 +45,20 @@ function todayISO(offsetDays = 0) {
   return businessToday(offsetDays);
 }
 
+/**
+ * 目的地下拉静态兜底：`/public/hotel-cities` 拉取失败/尚未拉取时用这份，
+ * 保证首屏不空白（现役在架城市：岘港 + 会安）。拉取成功后整体替换为后端结果。
+ */
+const DEFAULT_HOTEL_CITIES: PublicHotelCity[] = [
+  { code: 'DAD', name: '岘港' },
+  { code: 'HOA', name: '会安' },
+];
+
 export function HotelsPage() {
   const [hotels, setHotels] = useState<Hotel[]>([]);
   const [load, setLoad] = useState<LoadState>('loading');
   const [city, setCity] = useState('');
+  const [cityOptions, setCityOptions] = useState<PublicHotelCity[]>(DEFAULT_HOTEL_CITIES);
   const [stars, setStars] = useState<'' | '3' | '4' | '5'>('');
   const [maxPrice, setMaxPrice] = useState(4000);
   const [checkIn, setCheckIn] = useState(todayISO(3));
@@ -87,6 +97,23 @@ export function HotelsPage() {
       cancelled = true;
     };
   }, [reloadKey]);
+
+  // 目的地下拉：拉后端在架酒店城市，失败/空结果保留静态兜底（岘港 + 会安），不清空。
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getPublicHotelCities()
+      .then((r) => {
+        if (cancelled || r.cities.length === 0) return;
+        setCityOptions(r.cities);
+      })
+      .catch(() => {
+        // 拉取失败：静默保留静态兜底
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // 全量设施集合（用于多选筛选；不依赖新接口，从已加载酒店聚合）
   const allAmenities = useMemo(() => {
@@ -178,9 +205,10 @@ export function HotelsPage() {
           <div>
             <label className="label">目的地</label>
             <select className="input" value={city} onChange={(e) => setCity(e.target.value)}>
-              <option value="">全部（岘港 + 会安）</option>
-              <option value="DAD">岘港</option>
-              <option value="HOA">会安</option>
+              <option value="">全部（{cityOptions.map((c) => c.name).join(' + ')}）</option>
+              {cityOptions.map((c) => (
+                <option key={c.code} value={c.code}>{c.name}</option>
+              ))}
             </select>
           </div>
           <div>

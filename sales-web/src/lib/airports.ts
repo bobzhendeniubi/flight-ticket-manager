@@ -1,18 +1,24 @@
 /**
- * SHARED with admin-web/src/lib/airports.ts — keep them in sync.
+ * 静态兜底表 + 运行时从后端 `/public/airports` 拉取合并。
  *
- * 公司主营：澳门客户 → 岘港。仅显示这条业务航线相关的机场。
- * 不要加中国大陆机场（PEK/PVG/CAN/SZX 等），避免 demo 时误导业务范围。
+ * 公司马上开第二条直飞航线（目的地未定），前台不能再写死「只有澳门⇌岘港」——
+ * 但首屏渲染时后端请求还没回来，页面不能空白，所以这里保留一份小的静态兜底
+ * （现役主力航线 + 几个规划中目的地），页面加载后调用 `applyPublicAirports()`
+ * 用后端 `GET /public/airports` 的结果原地合并覆盖。拉取失败 / 尚未拉取时，
+ * 行为与合并前完全一致（仍是澳门⇌岘港），不会变空。
+ *
+ * admin-web/src/lib/airports.ts 是独立一份（本次不改，仍是纯静态），两边不再同步。
  */
 export interface AirportInfo {
   code: string;
   name: string; // 中文名
   tz: string; // IANA 时区
-  country: '越南' | '中国香港' | '中国澳门';
-  /** 是否是当前在售航线的机场（true = 现在就在卖，false = 规划中） */
+  country: string;
+  /** 是否是当前在售航线的机场（true = 现在就在卖，false = 规划中 / 未在后端活跃航班里出现） */
   active: boolean;
 }
 
+/** 静态兜底：仅现役主力航线标 active，其余为规划中占位，供后端拉取失败时兜底展示。 */
 export const AIRPORTS: Record<string, AirportInfo> = {
   // 主力航线 — QH9588/9589
   DAD: { code: 'DAD', name: '岘港', tz: 'Asia/Ho_Chi_Minh', country: '越南', active: true },
@@ -26,12 +32,33 @@ export const AIRPORTS: Record<string, AirportInfo> = {
   PQC: { code: 'PQC', name: '富国岛', tz: 'Asia/Ho_Chi_Minh', country: '越南', active: false },
 };
 
-export const AIRPORT_OPTIONS = Object.values(AIRPORTS).map((a) => ({
-  code: a.code,
-  name: a.name,
-  country: a.country,
-  active: a.active,
-}));
+/**
+ * 用后端 `GET /public/airports` 的结果原地合并进 `AIRPORTS`：
+ *   - 返回列表里的机场 → 写入/覆盖并标 active=true（这些就是数据库里真的在卖的机场）；
+ *   - 兜底表里其余机场 → 标 active=false（不再假装"规划中扩展"就是当前在卖）；
+ *   - 传入空数组按"拉取失败/暂无数据"处理，直接跳过，保留调用前的状态（不清空兜底）。
+ * 调用方（HomePage）需在合并后自行触发一次重渲染（如把 getAirportOptions() 的结果存进 state）。
+ */
+export function applyPublicAirports(list: Array<Pick<AirportInfo, 'code' | 'name' | 'tz' | 'country'>>): void {
+  if (!list || list.length === 0) return;
+  const activeCodes = new Set(list.map((a) => a.code));
+  for (const a of list) {
+    AIRPORTS[a.code] = { code: a.code, name: a.name, tz: a.tz, country: a.country, active: true };
+  }
+  for (const code of Object.keys(AIRPORTS)) {
+    if (!activeCodes.has(code)) AIRPORTS[code] = { ...AIRPORTS[code], active: false };
+  }
+}
+
+/** 下拉选项列表——每次调用都从当前 `AIRPORTS` 现算，反映 `applyPublicAirports()` 合并后的最新结果。 */
+export function getAirportOptions(): Array<Pick<AirportInfo, 'code' | 'name' | 'country' | 'active'>> {
+  return Object.values(AIRPORTS).map((a) => ({
+    code: a.code,
+    name: a.name,
+    country: a.country,
+    active: a.active,
+  }));
+}
 
 export function airportLabel(code: string): string {
   const a = AIRPORTS[code];
