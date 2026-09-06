@@ -101,6 +101,22 @@ export const matchCandidatesQuerySchema = z
   });
 export type MatchCandidatesQuery = z.infer<typeof matchCandidatesQuerySchema>;
 
+/** 认款建议一次最多算多少笔流水（与挂账池列表的未认领上限 UNALLOCATED_CAP 对齐）。 */
+export const MATCH_SUGGEST_MAX_RECEIPTS = 1000;
+/** 候选订单默认回看多少天（按下单时间）；可调，上限一年。 */
+export const MATCH_SUGGEST_DEFAULT_SINCE_DAYS = 90;
+
+/**
+ * 认款建议（POST /receipts/match/suggest）——只出建议，不写库。
+ * - receiptIds 缺省 = 全部未认完的流水导入 / 运营水单登记；给了则只算这些（仍须未认完）。
+ * - sinceDays：候选订单按下单时间回看的天数（默认 90）。
+ */
+export const suggestMatchesSchema = z.object({
+  receiptIds: z.array(z.string().min(1).max(64)).max(MATCH_SUGGEST_MAX_RECEIPTS).optional(),
+  sinceDays: z.number().int().min(1).max(365).optional(),
+});
+export type SuggestMatchesInput = z.infer<typeof suggestMatchesSchema>;
+
 // ─────────────────────────────────────────────────────────────────────────────
 // 二维码流水导入（收单平台对账单）
 // ─────────────────────────────────────────────────────────────────────────────

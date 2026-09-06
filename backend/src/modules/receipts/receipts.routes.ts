@@ -14,6 +14,7 @@
  *   POST /receipts/statement/import   流水入池（externalTxnId 唯一去重）
  *   GET  /receipts/statement/export   流水核对表 xlsx（含认款标识）
  *   GET  /receipts/match-candidates?from=&to=&q=  认款工作台：待收款订单候选（日期按订单 createdAt）
+ *   POST /receipts/match/suggest      认款建议（服务端匹配引擎：候选 + 理由 + 置信度；只出建议不入账）
  *
  * 审计在 service 层按资金口径写
  *（REGISTER/ALLOCATE/REVERSE_RECEIPT_ALLOCATION/REFUND_RECEIPT/IMPORT_RECEIPT_STATEMENT）。
@@ -33,6 +34,7 @@ import {
   parseStatementSchema,
   refundReceiptSchema,
   registerReceiptSchema,
+  suggestMatchesSchema,
   verifyClaimReceiptSchema,
 } from './receipts.schemas.js';
 import { statementExportFilename, statementPlatformFileError } from './receipts.statement.js';
@@ -173,6 +175,13 @@ export const receiptRoutes: FastifyPluginAsync = async (app) => {
         .send(Buffer.from(buf as ArrayBuffer));
     },
   );
+
+  // ── 认款建议（服务端匹配引擎；只出建议，不入账、不写库）──
+  // 认款仍走 /:id/allocate 与 /allocate-batch；这里给的只是候选 + 理由 + 置信度。
+  app.post('/match/suggest', { preHandler: [app.authenticate, requireAdminOrStaff] }, async (req) => {
+    const body = suggestMatchesSchema.parse(req.body ?? {});
+    return service.suggestMatches(body);
+  });
 
   // ── 认款工作台：待收款订单候选 ────────────────────────
   app.get(
