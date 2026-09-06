@@ -2,8 +2,9 @@
   "name": "flight-ticket-manager",
   "version": "0.1.0",
   "private": true,
-  "description": "Flight Ticket Manager monorepo (sales-web, miniprogram, admin-web, backend, ml-pricing, infra)",
+  "description": "Flight Ticket Manager monorepo (packages/contracts, sales-web, miniprogram, admin-web, backend, ml-pricing, infra)",
   "workspaces": [
+    "packages/*",
     "backend",
     "sales-web",
     "admin-web",
@@ -11,6 +12,7 @@
     "e2e"
   ],
   "scripts": {
+    "build:contracts": "npm run build --workspace=@ftm/contracts",
     "dev:backend": "npm run dev --workspace=backend",
     "dev:web": "npm run dev --workspace=sales-web",
     "dev:admin": "npm run dev --workspace=admin-web",

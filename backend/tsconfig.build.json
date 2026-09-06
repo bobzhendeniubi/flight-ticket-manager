@@ -4,5 +4,16 @@
     "sourceMap": false,
     "declaration": false
   },
-  "exclude": ["node_modules", "dist", "**/*.test.ts", "**/*.golden.fixtures.ts", "prisma/seed.ts"]
+  "exclude": [
+    "node_modules",
+    "dist",
+    "**/*.test.ts",
+    "**/*.golden.fixtures.ts",
+    "prisma/seed.ts"
+  ],
+  "references": [
+    {
+      "path": "../packages/contracts"
+    }
+  ]
 }
