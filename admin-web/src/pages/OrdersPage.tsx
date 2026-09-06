@@ -26,6 +26,7 @@ import {
 } from '../lib/refundSplit';
 import { OrderAuditTrail } from '../components/OrderAuditTrail';
 import { SingleOrderModal } from '../components/SingleOrderModal';
+import { buildSingleOrderPrefill, type SingleOrderPrefill } from '../components/singleOrderPrefill';
 import {
   RoomingEditor,
   roomingHotelItemsFromOrder,
@@ -1190,6 +1191,9 @@ export function OrdersPage() {
   // 批量创单弹窗 + 单笔录单弹窗 + 列表刷新计数（建单后 +1 触发重新拉单）
   const [showBatchCreate, setShowBatchCreate] = useState(false);
   const [showSingleCreate, setShowSingleCreate] = useState(false);
+  // 「以此单为模板」带进录单弹窗的预填值；null = 空白录单（＋录单 按钮走这条）。
+  // 只在弹窗挂载时消费一次，关闭时清空，避免下一次点「＋ 录单」还带着上一单的备注。
+  const [singleCreatePrefill, setSingleCreatePrefill] = useState<SingleOrderPrefill | null>(null);
   const [refreshNonce, setRefreshNonce] = useState(0);
   // 议价申请队列弹窗（ADMIN/STAFF）+ 待处理数徽标；代理不能手填结算价，只能提申请，
   // 运营在这里集中确认/驳回。徽标只拉一次 total（pageSize=1，不取列表内容），队列内确认/驳回
@@ -2520,7 +2524,11 @@ export function OrdersPage() {
           })()}
           <button
             className="btn-primary text-sm"
-            onClick={() => setShowSingleCreate(true)}
+            onClick={() => {
+              // 走这个入口一律是空白单：清掉上一次「以此单为模板」留下的预填
+              setSingleCreatePrefill(null);
+              setShowSingleCreate(true);
+            }}
             title="按产品类型录一笔订单（机票/酒店/签证/套餐/接送）"
           >
             ＋ 录单
@@ -4540,6 +4548,12 @@ export function OrdersPage() {
           onDelete={() => {
             void deleteOrder(selected);
           }}
+          onUseAsTemplate={(src) => {
+            // 关掉详情抽屉再开录单弹窗：两个都是全屏对话框，叠在一起会抢焦点
+            setSingleCreatePrefill(buildSingleOrderPrefill(src));
+            setSelected(null);
+            setShowSingleCreate(true);
+          }}
           isAdmin={isAdmin}
         />
       )}
@@ -4582,7 +4596,11 @@ export function OrdersPage() {
 
       {showSingleCreate && (
         <SingleOrderModal
-          onClose={() => setShowSingleCreate(false)}
+          prefill={singleCreatePrefill ?? undefined}
+          onClose={() => {
+            setShowSingleCreate(false);
+            setSingleCreatePrefill(null);
+          }}
           onCreated={() => {
             setRefreshNonce((n) => n + 1);
             bumpSeats();
@@ -4899,6 +4917,7 @@ function OrderDrawer({
   onChanged,
   onOrderUpdated,
   onDelete,
+  onUseAsTemplate,
   isAdmin,
 }: {
   order: OrderSummary;
@@ -4909,6 +4928,8 @@ function OrderDrawer({
   onOrderUpdated?: (order: OrderSummary) => void;
   /** 删除订单（内部员工：ADMIN + STAFF） */
   onDelete?: () => void;
+  /** 以此单为模板新建：父级负责关抽屉 + 用该订单的预填打开录单弹窗 */
+  onUseAsTemplate?: (order: OrderSummary) => void;
   isAdmin?: boolean;
 }) {
   const tokens = useAuth((s) => s.tokens);
@@ -4975,6 +4996,28 @@ function OrderDrawer({
   }, [order]);
   // 详情各区块统一读 o（详情优先，兜底列表行）。售后改期/换人后用返回的整单同步 hydrated + 列表行。
   const o = hydrated ?? order;
+  /**
+   * 以此单为模板新建：用补水后的 o（列表快照没有备注/签证状态这些要带走的字段）。
+   * 走与 requestClose 同一条未保存改动确认 —— 不能让「顺手开张新单」把运营刚敲了一半的备注
+   * 悄悄吞掉。真正关抽屉 + 开录单弹窗由父级负责。
+   */
+  const requestUseAsTemplate = useCallback(() => {
+    if (!onUseAsTemplate) return;
+    if (!notesDirty) {
+      onUseAsTemplate(o);
+      return;
+    }
+    void (async () => {
+      const confirmed = await confirm({
+        title: '有未保存的改动',
+        body: '备注 / 签证状态有未保存的改动，去新建订单会丢掉它们，确定继续？',
+        tone: 'danger',
+        confirmText: '继续新建',
+        cancelText: '继续编辑',
+      });
+      if (confirmed) onUseAsTemplate(o);
+    })();
+  }, [notesDirty, confirm, onUseAsTemplate, o]);
   const view = deriveView(o);
   const bal = deriveBalance(o);
   // 换人退款必须等详情补水拿到 refunds 后才能计算净收款；列表快照只有 paidAmount，不能拿它冒充净收款。
@@ -5736,6 +5779,7 @@ function OrderDrawer({
             onSplit={
               isOps && (o.passengers?.length ?? 0) >= 2 ? () => setSplitOpen(true) : undefined
             }
+            onUseAsTemplate={onUseAsTemplate ? requestUseAsTemplate : undefined}
           />
 
           {/* no-show 处理：航司 no-show 名单来了之后，票务在这里标去程 no-show + 释放回程座位。
@@ -12535,11 +12579,14 @@ function formatDdMon(isoDate: string | null | undefined): string | null {
 function OpsToolbar({
   order,
   onSplit,
+  onUseAsTemplate,
 }: {
   order: OrderSummary;
   onAdvance: (next: OrderStatus, reason?: string) => void;
   /** 拆单入口（仅 ADMIN/STAFF 且乘客 ≥ 2 时由父级传入；缺省不渲染按钮） */
   onSplit?: () => void;
+  /** 以此单为模板新建（父级传入；缺省不渲染按钮） */
+  onUseAsTemplate?: () => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
   const [busy, setBusy] = useState<string | null>(null);
@@ -12645,9 +12692,20 @@ function OpsToolbar({
             <Icon name="users" /> 拆单（拆出部分乘客）
           </button>
         )}
+        {onUseAsTemplate && (
+          <button
+            className="col-span-2 rounded border border-slate-300 bg-white px-2 py-1.5 text-xs text-ink-soft transition hover:border-brand/50 hover:bg-brand-50 hover:text-brand-700 disabled:opacity-50"
+            onClick={onUseAsTemplate}
+            disabled={busy !== null}
+            title="照这单的产品类型 / 代理 / 联系人 / 备注开一张新单；出行人、日期与金额都不带过来"
+          >
+            <Icon name="clipboard" /> 以此单为模板新建
+          </button>
+        )}
       </div>
       <p className="mt-2 text-[10px] text-slate-500">
         PNR Excel = 航司提交格式（25 列）；护照 zip 含 README 列出缺照片的乘客。
+        「以此单为模板」只带产品类型与客户侧字段，出行人 / 日期 / 金额一律重填。
       </p>
     </section>
   );
