@@ -39,9 +39,10 @@ import {
   netReceivedCny,
   payableCny as payableOf,
   payablePerPaxCny,
-  perPaxSettlementByPassenger,
   settlementDiscountTotalCny,
 } from '../../lib/order-money.js';
+import { PASSENGER_SHARES_INCLUDE, resolvePassengerShares, sharesAsMaps } from '../orders/passenger-shares.js';
+import { attachPersistedShares } from '../orders/service/passenger-shares.js';
 import { deriveOrderDepartDate, ORDER_STATUS_LABEL_ZH } from '../orders/orders.service.js';
 
 /** 表头固定注脚：对账单是只读视图，别拿它当月结依据。 */
@@ -266,6 +267,8 @@ const STATEMENT_ORDER_SELECT = {
   adjustments: true,
   createdAt: true,
   passengers: { select: { id: true } },
+  // 按人份额（R1）：每人结算价先读库
+  passengerShares: PASSENGER_SHARES_INCLUDE,
   refunds: { where: { status: 'COMPLETED' as const }, select: { amount: true } },
   items: {
     select: {
@@ -338,7 +341,11 @@ export async function buildAgentStatement(
   });
 
   // ── 精筛：按整单出发日的当地年月 ──
-  const inMonth = orders.filter((o) => deriveOrderDepartDate(o.items)?.slice(0, 7) === month);
+  // 按人份额 lazy 回填（R1）：老单顺手落一遍再读回来（失败不影响对账单，照旧派生）。
+  const inMonth = await attachPersistedShares(
+    orders.filter((o) => deriveOrderDepartDate(o.items)?.slice(0, 7) === month),
+    client,
+  );
 
   // ── 佣金：一次查完本批订单在 scope 内的全部记录，按 (orderId, agentId) 归拢 ──
   const commissionByOrderAgent = new Map<string, CommissionRecordShape[]>();
@@ -361,7 +368,8 @@ export async function buildAgentStatement(
     // 应收 / 已收净额 / 每人份额全部走 lib/order-money（审查根因 R2），本文件不自己算钱。
     const payableCny = payableOf(o);
     const receivedCny = netReceivedCny(o, o.refunds);
-    const shares = perPaxSettlementByPassenger(o);
+    // 每人结算价先读库（写路径落的事实），老单没有才派生 —— resolvePassengerShares 一处决定。
+    const shares = sharesAsMaps(resolvePassengerShares(o)).settlement;
     const paxCount = o.passengers.length;
     return {
       orderId: o.id,

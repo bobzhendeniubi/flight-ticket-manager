@@ -839,3 +839,85 @@ describe('serializeOrder · 对外中性航段状态 publicLegStatus', () => {
     });
   });
 });
+
+// ── 按人份额 DTO（R1）：passengerShares / sharesSource / sharesExcludedCny ────────────────
+describe('serializeOrder · 按人份额 DTO', () => {
+  const ALGO = 'per-pax-share@2026-09-04';
+  function sharesOrder(over: Record<string, unknown> = {}) {
+    return {
+      id: 'ord_s',
+      orderNumber: 'CO-S-1',
+      status: 'PAID',
+      subtotal: dec(1000),
+      taxesAndFees: dec(0),
+      discountTotal: dec(0),
+      total: dec(1000),
+      paidAmount: dec(0),
+      prepaymentOffset: dec(0),
+      adjustmentCny: 450,
+      adjustments: [{ type: 'SWAP_FEE', amountCny: 450, excludeFromPerPax: true }],
+      passengers: [
+        { id: 'p1', fullName: 'A', visaExempt: false, singleRoom: false },
+        { id: 'p2', fullName: 'B', visaExempt: true, singleRoom: false },
+      ],
+      items: [
+        { id: 'i1', kind: 'FLIGHT', description: '去程', quantity: 2, unitPrice: dec(400), amount: dec(800) },
+        {
+          id: 'i2',
+          kind: 'FEE',
+          description: '补收',
+          quantity: 1,
+          unitPrice: dec(200),
+          amount: dec(200),
+          passengerId: 'p2',
+          metadata: { priceAdjustment: true, reasonCode: 'MISC_FEE' },
+        },
+      ],
+      ...over,
+    } as unknown as Parameters<typeof serializeOrder>[0];
+  }
+  const persistedRows = [
+    { passengerId: 'p1', settlementCny: dec(400), baseCny: dec(400), adjustmentCny: dec(0), visaCny: dec(0), singleRoomDiffCny: dec(0), discountCny: dec(0), algoVersion: ALGO, computedAt: new Date('2026-09-06T00:00:00Z') },
+    { passengerId: 'p2', settlementCny: dec(600), baseCny: dec(400), adjustmentCny: dec(200), visaCny: dec(0), singleRoomDiffCny: dec(0), discountCny: dec(0), algoVersion: ALGO, computedAt: new Date('2026-09-06T00:00:00Z') },
+  ];
+
+  it('联查到完整一套落库行 → PERSISTED，逐人下发，换人费单独给 sharesExcludedCny', () => {
+    const dto = serializeOrder(sharesOrder({ passengerShares: persistedRows }), orderSerializeRoleCtx(UserRole.ADMIN));
+    expect(dto.sharesSource).toBe('PERSISTED');
+    expect(dto.passengerShares?.map((r) => [r.passengerId, r.settlementCny, r.adjustmentCny])).toEqual([
+      ['p1', 400, 0],
+      ['p2', 600, 200],
+    ]);
+    expect(dto.sharesExcludedCny).toBe(450);
+    expect(dto.sharesComputedAt?.toISOString()).toBe('2026-09-06T00:00:00.000Z');
+  });
+
+  it('没联查 / 老单没回填 → DERIVED，值按 lib/order-money 现算（与落库值同数）', () => {
+    const dto = serializeOrder(sharesOrder(), orderSerializeRoleCtx(UserRole.STAFF));
+    expect(dto.sharesSource).toBe('DERIVED');
+    expect(dto.passengerShares?.map((r) => [r.passengerId, r.settlementCny, r.baseCny, r.adjustmentCny])).toEqual([
+      ['p1', 400, 400, 0],
+      ['p2', 600, 400, 200],
+    ]);
+    expect(dto.sharesComputedAt).toBeNull();
+  });
+
+  it('对外角色（AGENT / CUSTOMER）整组不下发，连联查到的原始行也不带', () => {
+    for (const role of [UserRole.AGENT, UserRole.CUSTOMER]) {
+      const dto = serializeOrder(sharesOrder({ passengerShares: persistedRows }), orderSerializeRoleCtx(role));
+      expect(dto.passengerShares).toBeUndefined();
+      expect(dto.sharesSource).toBeUndefined();
+      expect(dto.sharesExcludedCny).toBeUndefined();
+      expect(JSON.stringify(dto)).not.toContain('algoVersion');
+    }
+  });
+
+  it('窄 select（乘客没 id）→ 整组不下发，不抛', () => {
+    const dto = serializeOrder(
+      sharesOrder({ passengers: [{ fullName: 'A' }], passengerShares: undefined }),
+      orderSerializeRoleCtx(UserRole.ADMIN),
+    );
+    expect(dto.sharesSource).toBeUndefined();
+    expect(dto.passengerShares).toBeUndefined();
+  });
+});

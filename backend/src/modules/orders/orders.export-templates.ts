@@ -29,12 +29,11 @@ import {
   isSettledByPaidAmount,
   outstandingRawCny,
   paidCny,
-  perPaxSettlementByPassenger,
-  perPaxVisaAmountByPassenger,
-  perPaxSingleRoomDiffByPassenger,
   settlePerPaxFallbackCny,
   toCny,
 } from '../../lib/order-money.js';
+import { PASSENGER_SHARES_INCLUDE, resolvePassengerShares, sharesAsMaps } from './passenger-shares.js';
+import { attachPersistedShares } from './service/passenger-shares.js';
 import type { BundleItemJson } from '../../lib/json-types.js';
 import { toAlpha3 } from './nationality.js';
 import {
@@ -447,6 +446,7 @@ export type OrderForTemplateExport = Prisma.OrderGetPayload<{
     agent: { select: { companyName: true; contactName: true } };
     user: { select: { displayName: true; email: true } };
     passengers: true;
+    passengerShares: typeof PASSENGER_SHARES_INCLUDE;
     payments: true;
     refunds: true;
     items: {
@@ -586,6 +586,9 @@ export function buildOrderContext(
   //   · 到账/尾款仍是整单 ÷ 人数（收款按整单发生，没有逐人归属，不臆造）。
   // 尾款口径与财务/提醒/报表对齐：应付 = total + adjustmentCny − prepaymentOffset（代理预付款抵扣）。
   // 全部走 lib/order-money 的同一组函数，本文件不再自己写 `total + adjustmentCny`。
+  // 按人份额（R1）：三张按人表**先读库**（order.passengerShares，写路径落的事实），
+  // 老单没有才派生 —— resolvePassengerShares 一处决定，算法仍只有 lib/order-money 一份。
+  const shares = sharesAsMaps(resolvePassengerShares(order));
 
   return {
     paxCount,
@@ -601,15 +604,15 @@ export function buildOrderContext(
     cabinLabels,
     orderType,
     legStatus: opts?.redactLegStatus === true ? '' : formatOrderLegStatus(order.items),
-    settleByPassenger: perPaxSettlementByPassenger(order),
+    settleByPassenger: shares.settlement,
     // 分子用 spreadableAdjustmentCny 而不是裸 adjustment（复审 M1，与《全岗总表》
     // orders.export-master.ts 的 settlePerPax 同一处修正）：换人费/换人差价挂在**已经不在这张单上**
     // 的被换人头上（excludeFromPerPax），上面那张按人表已经把它们剔除了；兜底若还按裸值算，
     // 同一张导出里「表里的人」和「兜底的人」用的是两套分母，同行人凭空多背一笔换人的钱。
     settlePerPax: settlePerPaxFallbackCny(order, paxCount),
-    visaAmountByPassenger: perPaxVisaAmountByPassenger(order),
+    visaAmountByPassenger: shares.visa,
     allPassengersExempt: allPassengersVisaExempt(order.passengers),
-    singleRoomDiffByPassenger: perPaxSingleRoomDiffByPassenger(order),
+    singleRoomDiffByPassenger: shares.singleRoomDiff,
     paidPerPax: evenShareCny(paidCny(order), paxCount),
     balancePerPax: evenShareCny(outstandingRawCny(order), paxCount),
   };
@@ -1125,6 +1128,8 @@ export async function buildOrderTemplateExportWorkbook(
       agent: { select: { companyName: true, contactName: true } },
       user: { select: { displayName: true, email: true } },
       passengers: true,
+      // 按人份额（R1）：先读库，老单在下面顺手回填
+      passengerShares: PASSENGER_SHARES_INCLUDE,
       payments: true,
       refunds: true,
       items: {
@@ -1145,7 +1150,8 @@ export async function buildOrderTemplateExportWorkbook(
   // 内存精筛（出行/返程/航班日期、航班号×日期绑定、单程/往返）—— 取数 where 的日期条件
   // 故意宽召回（±1 天），加上「关联行 ≥ 2 条」Prisma 表达不了，都在这里按与列表 listOrders
   // 相同的顺序与口径收口。orderIds（勾选导出）/ scheduleId（整班导出）的短路也在里面。
-  const orders = filterExportOrders(fetched, query);
+  // 按人份额 lazy 回填（R1）：库里没有完整一套的老单顺手落一遍再读回来（失败不影响导出，照旧派生）。
+  const orders = await attachPersistedShares(filterExportOrders(fetched, query), client);
 
   // 代理导出（agentScope 非空）：按共享脱敏政策整列裁掉护照 PII / 我方内部人员 /
   // 供应商与成本 / 内部运营指标（见 AGENT_HIDDEN_EXPORT_KEYS）。ADMIN/STAFF 一列不少。

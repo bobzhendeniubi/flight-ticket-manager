@@ -48,12 +48,11 @@ import {
   isSettledByPaidAmount,
   outstandingRawCny,
   paidCny,
-  perPaxSettlementByPassenger,
-  perPaxVisaAmountByPassenger,
-  perPaxSingleRoomDiffByPassenger,
   settlementDiscountTotalCny,
   settlePerPaxFallbackCny,
 } from '../../lib/order-money.js';
+import { PASSENGER_SHARES_INCLUDE, resolvePassengerShares, sharesAsMaps } from './passenger-shares.js';
+import { attachPersistedShares } from './service/passenger-shares.js';
 import { appendHoldOrderSheet, loadHoldExportRows } from './orders.export-hold-orders.js';
 import { GUEST_RECORDED_BY_LABEL } from './orders.service.js';
 import {
@@ -355,6 +354,8 @@ export const MASTER_EXPORT_INCLUDE = {
   agent: { select: { companyName: true, contactName: true } },
   user: { select: { displayName: true, email: true } },
   passengers: true,
+  // 按人份额（R1）：先读库，老单顺手回填
+  passengerShares: PASSENGER_SHARES_INCLUDE,
   payments: true,
   refunds: true,
   costItems: true,
@@ -464,7 +465,9 @@ export function orderToMasterRows(
   // 代理订单会尾款偏大、已结清误显示未结清。口径与 reminders.rules.ts computeBalance /
   // reports.service.ts balanceOf 对齐：应付 = total + adjustmentCny − prepaymentOffset。
   // 全部走 lib/order-money 的同一组函数（审查根因 R2），本文件不再自己写 `total + adjustmentCny`。
-  const settleByPassenger = perPaxSettlementByPassenger(order);
+  // 按人份额（R1）：先读库（写路径落的事实），老单没有才派生 —— resolvePassengerShares 一处决定。
+  const shares = sharesAsMaps(resolvePassengerShares(order));
+  const settleByPassenger = shares.settlement;
   /**
    * 结算价格的均摊兜底 = 可摊应收 ÷ pax；只在乘客不在上表里时用到。
    * 分子用可摊应收而不是裸 adjustmentCny（settlePerPaxFallbackCny）：换人费/换人差价挂在**已经不在这张单上**
@@ -482,7 +485,7 @@ export function orderToMasterRows(
   // 签证金额**按乘客**（自备签 = 0；独立 VISA 行实收在非自备签乘客间均摊；套餐签证挂牌价
   // 快照是每人口径，不再 ÷ 人数）—— 唯一口径在 perPaxVisaAmountByPassenger，与《全岗可用》共用。
   // 本列仍是「挂牌价 / 实收」的核对口径，非实收拆分额。
-  const visaAmountByPassenger = perPaxVisaAmountByPassenger(order);
+  const visaAmountByPassenger = shares.visa;
   // 「全员自备签」在订单级算一次，供 passengerVisaStatusCell 区分「录单联动全员置上」与
   // 「混合单里逐人手勾」（后者订单头 HAS_VISA 时自备签的人要照实写「自备签」）。
   const allPassengersExempt = allPassengersVisaExempt(order.passengers);
@@ -519,7 +522,7 @@ export function orderToMasterRows(
 
   // ── 单房差：按乘客（只记到单住的人）。改前读的 metadata.singleRoomDiff 系统从没写过，整列恒 0；
   // 真实来源是套餐行 addOns.singleSupplementTotal 与补收单房差 FEE 行 —— 见 perPaxSingleRoomDiffByPassenger。
-  const singleRoomDiffByPassenger = perPaxSingleRoomDiffByPassenger(order);
+  const singleRoomDiffByPassenger = shares.singleRoomDiff;
 
   // ── 退款：已完成退款金额合计（lib/order-money，只数 COMPLETED、不四舍五入，÷ 人数后再舍）──
   const refundTotal = completedRefundTotalCny(order.refunds);
@@ -675,7 +678,8 @@ export async function buildMasterExportWorkbook(
   // 故意宽召回（±1 天 + 命中任意航段/入住日），会把返程日或邻日落在窗口内、但整单出发日
   // 不在区间的往返单也捞进来；「关联行 ≥ 2 条」Prisma 也表达不了。都在这里按与列表相同的
   // 顺序与口径收口。
-  const orders = filterExportOrders(fetched, query);
+  // 按人份额 lazy 回填（R1）：库里没有完整一套的老单顺手落一遍再读回来（失败不影响导出，照旧派生）。
+  const orders = await attachPersistedShares(filterExportOrders(fetched, query), client);
 
   // 飞行次数/在订未飞/可用次数：一次性拉回本次导出所有乘客的常旅客档案（无 N+1；几百行
   // 也只有 2~3 条查询，含空表首建兜底，见 orders.export-trip-stats.ts 头部注释）。读到的是

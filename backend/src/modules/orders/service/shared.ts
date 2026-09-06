@@ -3,6 +3,7 @@
 // `export function xxx(svc: OrderService, ...)`，方法里的 `this.` 一律写成 `svc.`——
 // 跨组调用仍走 facade 实例，单测里对 OrderService 实例的 spy 行为不变。
 
+import { PASSENGER_SHARES_INCLUDE } from '../passenger-shares.js';
 import {
   CabinClass,
   CommissionStatus,
@@ -1238,6 +1239,8 @@ export function actorCan(actor: { role: UserRole }, cap: Capability): boolean {
 export const ORDER_FULL_INCLUDE = {
   items: true,
   passengers: true,
+  // 按人份额（R1）：写路径返回的订单 DTO 直接带库里刚落的一套，前端不用再自算
+  passengerShares: PASSENGER_SHARES_INCLUDE,
   payments: true,
   refunds: true,
   statusEvents: { orderBy: { createdAt: 'asc' } },

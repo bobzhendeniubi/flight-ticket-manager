@@ -4,6 +4,13 @@
 // 跨组调用仍走 facade 实例，单测里对 OrderService 实例的 spy 行为不变。
 
 import {
+  PASSENGER_SHARES_INCLUDE,
+  resolvePassengerShares,
+  type PersistedShareLike,
+  type ShareSourceOrder,
+} from '../passenger-shares.js';
+import { attachPersistedShares } from './passenger-shares.js';
+import {
   AuditTargetType,
   OrderItemKind,
   OrderLegFlag,
@@ -231,6 +238,8 @@ export async function listOrders(svc: OrderService, query: ListOrdersQuery, requ
             eticketNumber: true,
           },
         },
+        // 按人份额（R1）：列表只读库，不顺手回填（回填在详情 / 导出 / 回填脚本）
+        passengerShares: PASSENGER_SHARES_INCLUDE,
         agent: { select: { id: true, companyName: true, contactName: true, settlementMode: true, prepaymentBalance: true } },
         user: { select: { id: true, displayName: true, email: true } },
         claimedBy: { select: { id: true, displayName: true, email: true } },
@@ -325,7 +334,7 @@ export async function getAgentStats(svc: OrderService, query: ListOrdersQuery, r
 // 详情
 // ════════════════════════════════════════════════════════════════════
 export async function getOrder(svc: OrderService, id: string, requester: OrderRequester) {
-  const order = await prisma.order.findUnique({
+  const fetched = await prisma.order.findUnique({
     where: { id },
     include: {
       // 联查行程单渲染所需的产品信息（套餐订单「产品内容」板块用；不新增客户端往返）：
@@ -369,6 +378,8 @@ export async function getOrder(svc: OrderService, id: string, requester: OrderRe
         },
       },
       passengers: true, // 含护照/签证/地址全部新字段
+      // 按人份额（R1）：先读库；老单没有就在下面顺手回填一次
+      passengerShares: PASSENGER_SHARES_INCLUDE,
       payments: true,
       refunds: true,
       statusEvents: { orderBy: { createdAt: 'asc' } },
@@ -381,8 +392,11 @@ export async function getOrder(svc: OrderService, id: string, requester: OrderRe
       },
     },
   });
-  if (!order) throw new NotFoundError('订单不存在');
-  await svc.assertCanView(order, requester);
+  if (!fetched) throw new NotFoundError('订单不存在');
+  await svc.assertCanView(fetched, requester);
+  // 按人份额 lazy 回填（R1）：库里没有完整一套（老单 / 算法换版）→ 顺手落一遍再读回来；
+  // 失败（撞锁 / 异常）不影响本次读，DTO 照旧派生并标 DERIVED。
+  const [order] = await attachPersistedShares([fetched]);
   // 套餐 VISA 组件的「最多可停留天数」不在 bundle.items JSON 里（那只存 visaId），需按 visaId 批量查
   // Visa.stayDays（best-effort：查询失败/无签证组件时给空表，itineraryFieldsForItem 照常降级为 null）。
   const visaStayDaysById = await svc.loadBundleVisaStayDays(order.items);
@@ -1280,6 +1294,8 @@ export interface OrderLike {
   // 如 listOrders 只 select id/fullName，无 passengerType 字段，故用 Record<string, unknown> 兜底，
   // 与本接口 items/agent 的处理方式一致）。
   passengers?: Array<Record<string, unknown>>;
+  // 按人份额落库行（PASSENGER_SHARES_INCLUDE 下联查）；没联查 / 老单没回填时 serializeOrder 派生并标 DERIVED。
+  passengerShares?: Array<PersistedShareLike> | null;
 }
 
 /**
@@ -1889,6 +1905,54 @@ export function serializeRefundRecord<T extends { gatewayPayload?: Prisma.JsonVa
   return { ...refund, gatewayPayload: safePayload as Prisma.JsonObject } as T;
 }
 
+/**
+ * 按人份额 DTO（R1）：passengerShares[]（每位在单乘客一行）+ sharesSource（PERSISTED = 读库 / DERIVED = 现算）
+ * + sharesExcludedCny（换人费等不摊条目）+ sharesComputedAt。
+ * 读侧优先级在 resolvePassengerShares：库里完整一套 + 当前算法版本 → PERSISTED；否则派生。
+ * 窄 select 拼不出算法输入（乘客没 id / 行没 kind）时整组不下发，前端按旧后端处理（自算）。
+ */
+function passengerSharesDto(order: OrderLike): {
+  passengerShares?: Array<{
+    passengerId: string;
+    settlementCny: number;
+    baseCny: number;
+    adjustmentCny: number;
+    visaCny: number;
+    singleRoomDiffCny: number;
+    discountCny: number;
+  }>;
+  sharesSource?: 'PERSISTED' | 'DERIVED';
+  sharesExcludedCny?: number;
+  sharesComputedAt?: Date | null;
+} {
+  const passengers = order.passengers;
+  const items = order.items as ReadonlyArray<Record<string, unknown>>;
+  const resolvable =
+    Array.isArray(passengers) &&
+    passengers.every((p) => typeof p.id === 'string') &&
+    Array.isArray(items) &&
+    items.every((it) => typeof it.id === 'string' && typeof it.kind === 'string');
+  if (!resolvable) return {};
+  const source: ShareSourceOrder & { passengerShares?: ReadonlyArray<PersistedShareLike> | null } = {
+    total: order.total,
+    adjustmentCny: order.adjustmentCny,
+    adjustments: order.adjustments,
+    passengers: passengers as unknown as ReadonlyArray<{ id: string; visaExempt?: boolean | null; singleRoom?: boolean | null }>,
+    items: items as unknown as ShareSourceOrder['items'],
+    passengerShares: order.passengerShares ?? null,
+  };
+  const resolved = resolvePassengerShares(source);
+  return {
+    passengerShares: source.passengers.flatMap((p) => {
+      const r = resolved.rows.get(p.id);
+      return r ? [r] : [];
+    }),
+    sharesSource: resolved.source,
+    sharesExcludedCny: resolved.excludedCny,
+    sharesComputedAt: resolved.computedAt,
+  };
+}
+
 // 导出供单测直接验证脱敏口径（redactForExternal）；运行时仍由本模块内部各读取/流转处调用。
 export function serializeOrder<T extends OrderLike>(
   order: T,
@@ -1956,6 +2020,10 @@ export function serializeOrder<T extends OrderLike>(
     adjustmentCny,
     effectivePayable: effectivePayable.toString(),
     balanceDue: balanceDue.toString(),
+    // 按人份额（R1）：内部角色下发；对外角色（AGENT/CUSTOMER）整组不带 —— 逐人拆价是我方内部口径。
+    // 关系数组本身（...order 展开带进来的 passengerShares 原始行）一律覆盖掉，DTO 只认下面这组派生键。
+    passengerShares: undefined,
+    ...(redact ? {} : passengerSharesDto(order)),
     // 订单「出发日期」（列表列用；FLIGHT 最早班次当地出发日 → 回退最早酒店入住日 → null）
     departDate: deriveOrderDepartDate(order.items),
     // ── 状态机元数据（N8）：本单当前状态下的合法流转，直接取自后端权威 ALLOWED_TRANSITIONS。

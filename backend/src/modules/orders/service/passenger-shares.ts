@@ -23,10 +23,15 @@ import { Prisma, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../../db/prisma.js';
 import {
   PASSENGER_SHARE_ALGO_VERSION,
+  PASSENGER_SHARES_INCLUDE,
   assertSharesReconcile,
   computePassengerShareRows,
+  pickPersistedShares,
   type PassengerShareComputation,
+  type PersistedShareLike,
 } from '../passenger-shares.js';
+
+export { PASSENGER_SHARES_INCLUDE };
 
 /** 写点读订单的 select：恰好覆盖 ShareSourceOrder 需要的字段，不多不少。 */
 export const SHARE_SOURCE_SELECT = {
@@ -48,21 +53,6 @@ export const SHARE_SOURCE_SELECT = {
     },
   },
 } satisfies Prisma.OrderSelect;
-
-/** 读侧 include 用：与 pickPersistedShares 需要的字段一致。 */
-export const PASSENGER_SHARES_INCLUDE = {
-  select: {
-    passengerId: true,
-    settlementCny: true,
-    baseCny: true,
-    adjustmentCny: true,
-    visaCny: true,
-    singleRoomDiffCny: true,
-    discountCny: true,
-    algoVersion: true,
-    computedAt: true,
-  },
-} satisfies Prisma.Order$passengerSharesArgs;
 
 export interface PersistSharesResult extends PassengerShareComputation {
   orderId: string;
@@ -242,4 +232,44 @@ export async function backfillPassengerShares(
   }
   const remaining = await countOrdersMissingShares(client);
   return { scanned: ids.length, persisted, locked, failed, remaining };
+}
+
+/**
+ * 读侧「先读库，没有就派生并顺手落库」的落库半边：对一批已读出的订单，挑出库里没有完整份额的，
+ * 顺手回填（NOWAIT，失败不影响读），再把刚落好的行读回来贴到订单对象上（新对象，不改入参）。
+ * 调用方随后用 resolvePassengerShares 就会读到 PERSISTED；回填失败 / 撞锁的单照旧 DERIVED。
+ * mock 客户端（单测）没有事务 / 委托 → 原样返回。
+ */
+export async function attachPersistedShares<
+  T extends {
+    id: string;
+    passengers: ReadonlyArray<{ id: string }>;
+    passengerShares?: ReadonlyArray<PersistedShareLike> | null;
+  },
+>(orders: T[], client: PrismaClient = defaultPrisma, opts: { max?: number } = {}): Promise<T[]> {
+  const missing = orders.filter((o) => o.passengers.length > 0 && !pickPersistedShares(o)).map((o) => o.id);
+  if (missing.length === 0) return orders;
+  const shareClient = client as Partial<PrismaClient>;
+  if (typeof shareClient.$transaction !== 'function' || typeof shareClient.orderPassengerShare?.findMany !== 'function') {
+    return orders;
+  }
+  try {
+    const tally = await lazyPersistPassengerSharesForOrders(missing, { client, max: opts.max });
+    if (tally.PERSISTED === 0) return orders;
+    const fresh = await client.orderPassengerShare.findMany({
+      where: { orderId: { in: missing } },
+      select: { orderId: true, ...PASSENGER_SHARES_INCLUDE.select },
+    });
+    const byOrder = new Map<string, PersistedShareLike[]>();
+    for (const row of fresh) {
+      const list = byOrder.get(row.orderId) ?? [];
+      list.push(row);
+      byOrder.set(row.orderId, list);
+    }
+    return orders.map((o) => (byOrder.has(o.id) ? { ...o, passengerShares: byOrder.get(o.id) } : o));
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.warn('[passenger-shares] attach failed', err instanceof Error ? err.message : err);
+    return orders;
+  }
 }

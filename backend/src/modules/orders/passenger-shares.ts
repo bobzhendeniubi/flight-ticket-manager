@@ -28,6 +28,7 @@ import {
   toCny,
   type MoneyLike,
 } from '../../lib/order-money.js';
+import type { Prisma } from '@prisma/client';
 import { spreadableAdjustmentCny } from './per-pax-share.js';
 import { groupPassengerAdjustments } from './order-adjustment-lines.js';
 
@@ -67,9 +68,28 @@ export interface ShareSourceOrder {
     description: string;
     passengerId?: string | null;
     metadata?: unknown;
-    bundle?: { items: unknown } | null;
+    /** 套餐定义（签证挂牌价老单回退用）；窄 select 没带 items 时按无组件处理 */
+    bundle?: { items?: unknown; [key: string]: unknown } | null;
   }>;
 }
+
+/**
+ * 读侧 include：与 pickPersistedShares 需要的字段一致。所有读订单的 include / select
+ *（ORDER_FULL_INCLUDE / getOrder / listOrders / 三导出 / 分房表 / 代理对账单）都挂这一份。
+ */
+export const PASSENGER_SHARES_INCLUDE = {
+  select: {
+    passengerId: true,
+    settlementCny: true,
+    baseCny: true,
+    adjustmentCny: true,
+    visaCny: true,
+    singleRoomDiffCny: true,
+    discountCny: true,
+    algoVersion: true,
+    computedAt: true,
+  },
+} satisfies Prisma.Order$passengerSharesArgs;
 
 export interface PassengerShareComputation {
   rows: PassengerShareRow[];
@@ -88,7 +108,15 @@ const centsToCny = (cents: number): number => cents / 100;
  */
 export function computePassengerShareRows(order: ShareSourceOrder): PassengerShareComputation {
   const settlement = perPaxSettlementByPassenger(order);
-  const visa = perPaxVisaAmountByPassenger(order);
+  const visa = perPaxVisaAmountByPassenger({
+    passengers: order.passengers,
+    items: order.items.map((it) => ({
+      kind: it.kind,
+      amount: it.amount,
+      metadata: it.metadata,
+      bundle: it.bundle ? { items: it.bundle.items ?? null } : null,
+    })),
+  });
   const singleRoom = perPaxSingleRoomDiffByPassenger(order);
   const { byPassenger } = groupPassengerAdjustments(
     order.items.map((it) => ({
@@ -266,4 +294,22 @@ export function shareRowsEqual(a: ReadonlyArray<PassengerShareRow>, b: ReadonlyA
     const rb = byPid.get(ra.passengerId);
     return rb !== undefined && keys.every((k) => toCents(ra[k]) === toCents(rb[k]));
   });
+}
+
+/** 导出 / 对账单用的三张 Map（passengerId → 金额），与改前 perPax*ByPassenger 的返回形状一致。 */
+export function sharesAsMaps(resolved: ResolvedPassengerShares): {
+  settlement: Map<string, number>;
+  visa: Map<string, number>;
+  singleRoomDiff: Map<string, number>;
+  source: SharesSource;
+} {
+  const settlement = new Map<string, number>();
+  const visa = new Map<string, number>();
+  const singleRoomDiff = new Map<string, number>();
+  for (const [pid, r] of resolved.rows) {
+    settlement.set(pid, r.settlementCny);
+    visa.set(pid, r.visaCny);
+    singleRoomDiff.set(pid, r.singleRoomDiffCny);
+  }
+  return { settlement, visa, singleRoomDiff, source: resolved.source };
 }
