@@ -36,53 +36,43 @@ import { MarketingPage } from './pages/MarketingPage';
 import { ExportCenterPage } from './pages/ExportCenterPage';
 import { LegacyArchivePage } from './pages/LegacyArchivePage';
 import { useAuth } from './stores/auth';
+import { useCapabilities } from './hooks/useCapabilities';
+import type { Capability } from './lib/capabilities';
 import { isAccessTokenFresh } from './lib/token';
 import { ConfirmProvider } from './components/ConfirmDialog';
 
-// AGENT 可访问的页面集合（其他页面默认 ADMIN/STAFF 专属）
-// 真实 RBAC 仍由后端 requireRole 兜底 —— 前端只做导航 UX
-const AGENT_ALLOWED_PATHS = new Set([
-  '/orders',
-  '/customers',
-  '/travelers',
-  '/agents',
-  '/settlements',
-  '/agent-balance',
-  // 导出中心对代理开放：页面内部只列代理能用的三张表（三模板/全岗总表/进单统计），
-  // 且这三张服务端都强制裁列 + 圈到自己与下级代理的订单。
-  '/exports',
-]);
-
 function Protected({
   children,
-  adminOnly = false,
-  financeRole = false,
+  cap,
 }: {
   children: React.ReactNode;
-  /** 只允许 ADMIN/STAFF；AGENT 重定向到自己的 landing 页 */
-  adminOnly?: boolean;
   /**
-   * 仅 ADMIN 或 STAFF+FINANCE（与 Layout 菜单的 financeRole 同口径）。
-   * 数据保护仍在后端 requireFinanceAccess —— 这里只是让非财务岗 STAFF 直接敲 URL 时
-   * 被路由级重定向回 landing，而不是渲染出一个 API 全 403 的报错空页。
+   * 进这个页面需要的能力。不填 = 只要登录（且不是客户）就能进。
+   *
+   * 口径与后端同源：能力清单由 /users/me 下发，与后端 requireCapability 用同一张表算
+   * （见 backend/src/lib/capabilities.ts）。改造前这里是 adminOnly / financeRole 两个布尔，
+   * 各自把「谁能进」在前端又拼了一遍，后端改口径这边不会跟着变——8/24 只改后端半边、
+   * 运营那头按钮还是灰的，就是这么来的。
+   *
+   * 真正的数据保护始终在后端；这里只是别让人直接敲 URL 撞进一个 API 全 403 的空页。
    */
-  financeRole?: boolean;
+  cap?: Capability;
 }) {
   const user = useAuth((s) => s.user);
   const tokens = useAuth((s) => s.tokens);
+  const { can, ready } = useCapabilities();
+
   if (!user || !tokens) return <Navigate to="/login" replace />;
   if (user.role === 'CUSTOMER') return <Navigate to="/login" replace />;
 
-  // AGENT 禁入 admin-only 页 —— 落到默认 landing (/orders)
-  if (adminOnly && user.role === 'AGENT') {
-    return <Navigate to="/orders" replace />;
-  }
-  if (financeRole) {
-    if (user.role === 'AGENT') return <Navigate to="/orders" replace />;
-    // 登录瞬间 user 可能还没带 staffRole（等 /users/me 返回）：先放行渲染，数据由后端闸兜底；
-    // staffRole 已知且不是财务岗才重定向，避免误伤刷新/首登场景。
-    const denied = user.role === 'STAFF' && user.staffRole != null && user.staffRole !== 'FINANCE';
-    if (denied) return <Navigate to="/dashboard" replace />;
+  // 登录瞬间能力清单还没从 /users/me 回来：先放行渲染，数据由后端闸兜底。
+  // 乐观放行是有意的——悲观拦截会让每次登录/刷新都先闪一下重定向。
+  // 与改造前「staffRole 还没回来就先放行」是同一条口径。
+  if (!cap || !ready) return <>{children}</>;
+
+  if (!can(cap)) {
+    // 没这个能力就回各自的落地页，而不是甩一个空白报错页。
+    return <Navigate to={user.role === 'AGENT' ? '/orders' : '/dashboard'} replace />;
   }
   return <>{children}</>;
 }
@@ -94,7 +84,6 @@ function AgentLanding() {
   return <Navigate to={user.role === 'AGENT' ? '/orders' : '/dashboard'} replace />;
 }
 
-void AGENT_ALLOWED_PATHS; // 将来可用于中间件白名单，目前通过 adminOnly 显式标注
 
 // 会话保活策略（对任意 access token TTL 都稳健）：
 // 每分钟体检一次，只有当 access token 进入「临期窗」（见 lib/token 的 REFRESH_SKEW_MS）才续期。
@@ -150,7 +139,7 @@ export function App() {
         <Route
           path="/dashboard"
           element={
-            <Protected adminOnly>
+            <Protected cap="dashboard.view">
               <DashboardPage />
             </Protected>
           }
@@ -158,7 +147,7 @@ export function App() {
         <Route
           path="/orders"
           element={
-            <Protected>
+            <Protected cap="orders.read">
               <OrdersPage />
             </Protected>
           }
@@ -166,7 +155,7 @@ export function App() {
         <Route
           path="/flights"
           element={
-            <Protected adminOnly>
+            <Protected cap="flights.admin_view">
               <FlightsPage />
             </Protected>
           }
@@ -174,7 +163,7 @@ export function App() {
         <Route
           path="/seat-stats"
           element={
-            <Protected adminOnly>
+            <Protected cap="flights.seat_stats.view">
               <SeatStatsPage />
             </Protected>
           }
@@ -182,7 +171,7 @@ export function App() {
         <Route
           path="/seat-allocation"
           element={
-            <Protected adminOnly>
+            <Protected cap="seat_allocation.manage">
               <SeatAllocationPage />
             </Protected>
           }
@@ -190,7 +179,7 @@ export function App() {
         <Route
           path="/hold-orders"
           element={
-            <Protected adminOnly>
+            <Protected cap="hold_orders.manage">
               <HoldOrdersPage />
             </Protected>
           }
@@ -198,7 +187,7 @@ export function App() {
         <Route
           path="/products"
           element={
-            <Protected adminOnly>
+            <Protected cap="products.write">
               <ProductsPage />
             </Protected>
           }
@@ -206,7 +195,7 @@ export function App() {
         <Route
           path="/settlement-rates"
           element={
-            <Protected adminOnly>
+            <Protected cap="settlement_rates.write">
               <SettlementRatesPage />
             </Protected>
           }
@@ -214,7 +203,7 @@ export function App() {
         <Route
           path="/settlement-discounts"
           element={
-            <Protected adminOnly>
+            <Protected cap="settlement_discounts.write">
               <SettlementDiscountsPage />
             </Protected>
           }
@@ -225,7 +214,7 @@ export function App() {
         <Route
           path="/agents"
           element={
-            <Protected>
+            <Protected cap="agents.read">
               <AgentsPage />
             </Protected>
           }
@@ -233,7 +222,7 @@ export function App() {
         <Route
           path="/customers"
           element={
-            <Protected>
+            <Protected cap="customers.manage">
               <CustomersPage />
             </Protected>
           }
@@ -241,7 +230,7 @@ export function App() {
         <Route
           path="/travelers"
           element={
-            <Protected>
+            <Protected cap="travelers.manage">
               <TravelersPage />
             </Protected>
           }
@@ -249,7 +238,7 @@ export function App() {
         <Route
           path="/cancellation-policies"
           element={
-            <Protected adminOnly>
+            <Protected cap="cancellation_policies.manage">
               <CancellationPoliciesPage />
             </Protected>
           }
@@ -257,7 +246,7 @@ export function App() {
         <Route
           path="/audit-logs"
           element={
-            <Protected adminOnly>
+            <Protected cap="audit.read">
               <AuditLogsPage />
             </Protected>
           }
@@ -265,7 +254,7 @@ export function App() {
         <Route
           path="/settlements"
           element={
-            <Protected>
+            <Protected cap="settlements.read">
               <SettlementsPage />
             </Protected>
           }
@@ -273,7 +262,7 @@ export function App() {
         <Route
           path="/agent-balance"
           element={
-            <Protected>
+            <Protected cap="agent_recharges.submit">
               <AgentBalancePage />
             </Protected>
           }
@@ -281,7 +270,7 @@ export function App() {
         <Route
           path="/finances"
           element={
-            <Protected adminOnly financeRole>
+            <Protected cap="finances.view">
               <FinancesPage />
             </Protected>
           }
@@ -289,7 +278,7 @@ export function App() {
         <Route
           path="/reconciliation"
           element={
-            <Protected adminOnly>
+            <Protected cap="receipts.manage">
               <ReconciliationPage />
             </Protected>
           }
@@ -297,7 +286,7 @@ export function App() {
         <Route
           path="/hotel-control"
           element={
-            <Protected adminOnly>
+            <Protected cap="hotel_control.view">
               <HotelControlPage />
             </Protected>
           }
@@ -305,7 +294,7 @@ export function App() {
         <Route
           path="/visa-desk"
           element={
-            <Protected adminOnly>
+            <Protected cap="fulfillment.manage">
               <VisaDeskPage />
             </Protected>
           }
@@ -313,7 +302,7 @@ export function App() {
         <Route
           path="/reminders"
           element={
-            <Protected adminOnly>
+            <Protected cap="reminders.manage">
               <RemindersPage />
             </Protected>
           }
@@ -322,7 +311,7 @@ export function App() {
         <Route
           path="/no-show/report"
           element={
-            <Protected adminOnly>
+            <Protected cap="orders.no_show">
               <NoShowReportPage />
             </Protected>
           }
@@ -330,7 +319,7 @@ export function App() {
         <Route
           path="/no-show"
           element={
-            <Protected adminOnly>
+            <Protected cap="orders.no_show">
               <NoShowBatchPage />
             </Protected>
           }
@@ -339,7 +328,7 @@ export function App() {
         <Route
           path="/ticket-backfill"
           element={
-            <Protected adminOnly>
+            <Protected cap="orders.passengers.write">
               <TicketBackfillPage />
             </Protected>
           }
@@ -347,7 +336,7 @@ export function App() {
         <Route
           path="/fulfillment-board"
           element={
-            <Protected adminOnly>
+            <Protected cap="fulfillment.manage">
               <FulfillmentBoardPage />
             </Protected>
           }
@@ -355,7 +344,7 @@ export function App() {
         <Route
           path="/marketing"
           element={
-            <Protected adminOnly>
+            <Protected cap="marketing.manage">
               <MarketingPage />
             </Protected>
           }
@@ -365,7 +354,7 @@ export function App() {
         <Route
           path="/exports"
           element={
-            <Protected>
+            <Protected cap="orders.export.shared">
               <ExportCenterPage />
             </Protected>
           }
@@ -373,7 +362,7 @@ export function App() {
         <Route
           path="/reports"
           element={
-            <Protected adminOnly financeRole>
+            <Protected cap="reports.view">
               <ReportsPage />
             </Protected>
           }
@@ -381,7 +370,7 @@ export function App() {
         <Route
           path="/legacy-archive"
           element={
-            <Protected adminOnly>
+            <Protected cap="legacy.read">
               <LegacyArchivePage />
             </Protected>
           }
@@ -389,7 +378,7 @@ export function App() {
         <Route
           path="/settings/ai-ocr"
           element={
-            <Protected adminOnly>
+            <Protected cap="settings.ai_ocr.manage">
               <AiOcrSettingsPage />
             </Protected>
           }
@@ -397,7 +386,7 @@ export function App() {
         <Route
           path="/settings/feature-flags"
           element={
-            <Protected adminOnly>
+            <Protected cap="feature_flags.read">
               <FeatureFlagsSettingsPage />
             </Protected>
           }
@@ -405,7 +394,7 @@ export function App() {
         <Route
           path="/settings/staff-roles"
           element={
-            <Protected adminOnly>
+            <Protected cap="users.staff.manage">
               <StaffRolesPage />
             </Protected>
           }

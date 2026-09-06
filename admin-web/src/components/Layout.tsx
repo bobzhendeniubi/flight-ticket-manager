@@ -1,6 +1,8 @@
 import { useEffect, useRef, useState } from 'react';
 import { Link, Navigate, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
+import type { Capability } from '../lib/capabilities';
 import { api, ApiError, AUTH_REFRESH_UNAVAILABLE_CODE } from '../lib/api';
 import { BuildVersionBanner } from './BuildVersionBanner';
 import { ErrorBoundary } from './ErrorBoundary';
@@ -14,52 +16,52 @@ const ROLE_LABEL: Record<string, string> = {
   AGENT: '代理',
 };
 
-// roles: 允许访问该导航的角色集合
-// section: 侧栏分组标题（用于视觉分组，不影响路由 / 角色过滤）
-// financeRole: 仅 ADMIN 或 STAFF+FINANCE 可见
+// cap: 看得见这一项所需的能力，与 App.tsx 的路由守卫、后端 requireCapability 同一张表
+//      （见 backend/src/lib/capabilities.ts）。改造前这里是 roles + financeRole 两个字段，
+//      把「谁能看见」在前端又拼了一遍，与后端各判一次，改口径时总有一边漏掉。
+// section: 侧栏分组标题（只影响视觉分组，不参与权限判断）
 const NAV: Array<{
   to: string;
   label: string;
-  roles: Array<'ADMIN' | 'STAFF' | 'AGENT'>;
+  cap: Capability;
   section: string;
-  financeRole?: boolean;
 }> = [
-  { to: '/dashboard',       label: '仪表盘',      roles: ['ADMIN', 'STAFF'],          section: '概览' },
+  { to: '/dashboard',       label: '仪表盘',      cap: 'dashboard.view',              section: '概览' },
   // 导出中心挂在最上面一组：全系统的导出散在六个模块里，找不到入口是反馈里的常客，
-  // 得放在一眼能看见的地方。全角色可见（代理进去只列他能用的三张表）。
-  { to: '/exports',         label: '导出中心',    roles: ['ADMIN', 'STAFF', 'AGENT'], section: '概览' },
-  { to: '/orders',          label: '订单管理',    roles: ['ADMIN', 'STAFF', 'AGENT'], section: '运营' },
-  { to: '/flights',         label: '航班管理',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
-  { to: '/seat-stats',      label: '座位统计',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
-  { to: '/seat-allocation', label: '切位（包位）', roles: ['ADMIN', 'STAFF'],          section: '运营' },
-  { to: '/hold-orders',     label: '占位单',       roles: ['ADMIN', 'STAFF'],          section: '运营' },
-  { to: '/hotel-control',   label: '房控',        roles: ['ADMIN', 'STAFF'],          section: '运营' },
-  { to: '/visa-desk',       label: '签证台',      roles: ['ADMIN', 'STAFF'],          section: '运营' },
-  { to: '/no-show',         label: 'no-show 处理', roles: ['ADMIN', 'STAFF'],         section: '运营' },
+  // 得放在一眼能看见的地方。代理也可见（进去只列他能用的三张表）。
+  { to: '/exports',         label: '导出中心',    cap: 'orders.export.shared',        section: '概览' },
+  { to: '/orders',          label: '订单管理',    cap: 'orders.read',                 section: '运营' },
+  { to: '/flights',         label: '航班管理',    cap: 'flights.admin_view',          section: '运营' },
+  { to: '/seat-stats',      label: '座位统计',    cap: 'flights.seat_stats.view',     section: '运营' },
+  { to: '/seat-allocation', label: '切位（包位）', cap: 'seat_allocation.manage',      section: '运营' },
+  { to: '/hold-orders',     label: '占位单',       cap: 'hold_orders.manage',          section: '运营' },
+  { to: '/hotel-control',   label: '房控',        cap: 'hotel_control.view',          section: '运营' },
+  { to: '/visa-desk',       label: '签证台',      cap: 'fulfillment.manage',          section: '运营' },
+  { to: '/no-show',         label: 'no-show 处理', cap: 'orders.no_show',             section: '运营' },
   // 票号回填挂运营组、紧挨 no-show：这两件事都是票务岗拿航司发来的名单按班次整批处理，动线一致
-  { to: '/ticket-backfill', label: '票号回填',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
-  { to: '/reminders',       label: '提醒中心',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
-  { to: '/fulfillment-board', label: '工单看板',  roles: ['ADMIN', 'STAFF'],          section: '运营' },
-  { to: '/marketing',       label: '营销中心',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
-  { to: '/products',        label: '产品管理',    roles: ['ADMIN', 'STAFF'],          section: '产品' },
-  { to: '/settlement-rates', label: '结算价日历',  roles: ['ADMIN', 'STAFF'],          section: '产品' },
-  { to: '/settlement-discounts', label: '立减规则', roles: ['ADMIN', 'STAFF'],         section: '产品' },
-  { to: '/cancellation-policies', label: '取消政策', roles: ['ADMIN', 'STAFF'],       section: '产品' },
-  { to: '/agents',          label: '代理管理',    roles: ['ADMIN', 'STAFF', 'AGENT'], section: '客户' },
-  { to: '/customers',       label: '散客管理',    roles: ['ADMIN', 'STAFF', 'AGENT'], section: '客户' },
-  { to: '/travelers',       label: '旅客管理',    roles: ['ADMIN', 'STAFF', 'AGENT'], section: '客户' },
-  { to: '/settlements',     label: '结算单',      roles: ['ADMIN', 'STAFF', 'AGENT'], section: '财务' },
-  { to: '/agent-balance',   label: '余额与认款',  roles: ['ADMIN', 'STAFF', 'AGENT'], section: '财务' },
-  { to: '/reconciliation',  label: '收款对账台',  roles: ['ADMIN', 'STAFF'],          section: '财务' },
-  { to: '/finances',        label: '财务',        roles: ['ADMIN'],                   section: '财务', financeRole: true },
-  // no-show 报表不走 financeRole：出座位/工单口径，运营与票务都要看
-  { to: '/no-show/report',  label: 'no-show 报表', roles: ['ADMIN', 'STAFF'],         section: '财务' },
-  { to: '/reports',         label: '经营报表',    roles: ['ADMIN'],                   section: '财务', financeRole: true },
-  { to: '/legacy-archive',  label: '历史档案',    roles: ['ADMIN', 'STAFF'],          section: '系统' },
-  { to: '/audit-logs',      label: '审计日志',    roles: ['ADMIN', 'STAFF'],          section: '系统' },
-  { to: '/settings/ai-ocr', label: 'AI 识别设置', roles: ['ADMIN'],                   section: '系统' },
-  { to: '/settings/feature-flags', label: '功能开关', roles: ['ADMIN', 'STAFF'],       section: '系统' },
-  { to: '/settings/staff-roles', label: '账号管理',    roles: ['ADMIN'],                   section: '系统' },
+  { to: '/ticket-backfill', label: '票号回填',    cap: 'orders.passengers.write',     section: '运营' },
+  { to: '/reminders',       label: '提醒中心',    cap: 'reminders.manage',            section: '运营' },
+  { to: '/fulfillment-board', label: '工单看板',  cap: 'fulfillment.manage',          section: '运营' },
+  { to: '/marketing',       label: '营销中心',    cap: 'marketing.manage',            section: '运营' },
+  { to: '/products',        label: '产品管理',    cap: 'products.write',              section: '产品' },
+  { to: '/settlement-rates', label: '结算价日历',  cap: 'settlement_rates.write',      section: '产品' },
+  { to: '/settlement-discounts', label: '立减规则', cap: 'settlement_discounts.write', section: '产品' },
+  { to: '/cancellation-policies', label: '取消政策', cap: 'cancellation_policies.manage', section: '产品' },
+  { to: '/agents',          label: '代理管理',    cap: 'agents.read',                 section: '客户' },
+  { to: '/customers',       label: '散客管理',    cap: 'customers.manage',            section: '客户' },
+  { to: '/travelers',       label: '旅客管理',    cap: 'travelers.manage',            section: '客户' },
+  { to: '/settlements',     label: '结算单',      cap: 'settlements.read',            section: '财务' },
+  { to: '/agent-balance',   label: '余额与认款',  cap: 'agent_recharges.submit',      section: '财务' },
+  { to: '/reconciliation',  label: '收款对账台',  cap: 'receipts.manage',             section: '财务' },
+  { to: '/finances',        label: '财务',        cap: 'finances.view',               section: '财务' },
+  // no-show 报表不吃财务岗那道闸：出的是座位/工单口径，运营与票务都要看
+  { to: '/no-show/report',  label: 'no-show 报表', cap: 'orders.no_show',             section: '财务' },
+  { to: '/reports',         label: '经营报表',    cap: 'reports.view',                section: '财务' },
+  { to: '/legacy-archive',  label: '历史档案',    cap: 'legacy.read',                 section: '系统' },
+  { to: '/audit-logs',      label: '审计日志',    cap: 'audit.read',                  section: '系统' },
+  { to: '/settings/ai-ocr', label: 'AI 识别设置', cap: 'settings.ai_ocr.manage',      section: '系统' },
+  { to: '/settings/feature-flags', label: '功能开关', cap: 'feature_flags.read',       section: '系统' },
+  { to: '/settings/staff-roles', label: '账号管理', cap: 'users.staff.manage',         section: '系统' },
 ];
 
 // 侧栏分组渲染顺序（NAV 里出现的 section 都在这里列一遍）
@@ -69,6 +71,7 @@ export function Layout() {
   const user = useAuth((s) => s.user);
   const tokens = useAuth((s) => s.tokens);
   const logout = useAuth((s) => s.logout);
+  const { can, ready: capabilitiesReady } = useCapabilities();
   const navigate = useNavigate();
   const location = useLocation();
 
@@ -137,7 +140,9 @@ export function Layout() {
     api.me(accessToken)
       .then((res) => {
         if (cancelled) return;
-        useAuth.setState({ user: res.user });
+        // 能力清单是与 user 平级的一个字段，合进 user 存起来：
+        // useCapabilities 只认 user.capabilities，前端所有显隐都从这一份读。
+        useAuth.setState({ user: { ...res.user, capabilities: res.capabilities } });
         // 后台允许 ADMIN/STAFF/AGENT；CUSTOMER 踢出
         if (res.user.role === 'CUSTOMER') {
           logout().then(() => navigate('/login', { replace: true }));
@@ -166,14 +171,9 @@ export function Layout() {
     return <Navigate to="/change-password" replace />;
   }
 
-  // 登录瞬间 user 还没有 staffRole，需等 /users/me 返回后才显示财务岗菜单；短暂延迟可接受。
-  const visibleNav = user
-    ? NAV.filter((n) =>
-        n.financeRole
-          ? user.role === 'ADMIN' || (user.role === 'STAFF' && user.staffRole === 'FINANCE')
-          : n.roles.includes(user.role as 'ADMIN' | 'STAFF' | 'AGENT'),
-      )
-    : [];
+  // 登录瞬间能力清单还没从 /users/me 回来，此时先不渲染菜单（而不是渲染全部）：
+  // 宁可空半秒，也别先闪出一屏进去就 403 的入口。清单一到就整齐地铺出来。
+  const visibleNav = user && capabilitiesReady ? NAV.filter((n) => can(n.cap)) : [];
 
   // 当前页标题（用于内容区顶栏的上下文）。
   // 两点讲究：
