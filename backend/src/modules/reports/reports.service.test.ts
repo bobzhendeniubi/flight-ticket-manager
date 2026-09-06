@@ -37,6 +37,24 @@ function salesOrder(id: string, items: ItemFixture[]) {
   return { id, agentId: null, userId: null, agent: null, items };
 }
 
+/** 一条机票航段（航线维度分桶要读航班起降地 + 出发时刻，取最早那条 = 去程）。 */
+function routeLeg(
+  amount: number,
+  origin: string,
+  destination: string,
+  departISO: string,
+): ItemFixture & Record<string, unknown> {
+  return {
+    kind: 'FLIGHT',
+    amount,
+    totalCostCny: null,
+    flightSchedule: {
+      departureTime: new Date(departISO),
+      flight: { originCode: origin, destinationCode: destination },
+    },
+  };
+}
+
 function salesClient(orders: unknown[]): PrismaClient {
   return {
     order: { findMany: vi.fn().mockResolvedValue(orders) },
@@ -231,5 +249,85 @@ describe('getAgentDebtsReport — 与账龄同口径扣已完成退款', () => {
     expect(rows[0]!.agentLabel).toBe('测试代理');
     expect(rows[0]!.orderCount).toBe(1);
     expect(rows[0]!.outstandingCny).toBe(400);
+  });
+});
+
+describe("getSalesReport · dim='route' — 按航线分账", () => {
+  it('两条线各成一桶，收入不串线', async () => {
+    const client = salesClient([
+      salesOrder('o1', [routeLeg(5000, 'MFM', 'DAD', '2026-01-10T02:00:00Z')]),
+      salesOrder('o2', [routeLeg(3000, 'HKG', 'DAD', '2026-01-11T02:00:00Z')]),
+    ]);
+
+    const report = await getSalesReport(RANGE, 'route', client);
+
+    expect(report.rows.map((r) => [r.key, r.revenueCny])).toEqual([
+      ['MFM-DAD', 5000],
+      ['HKG-DAD', 3000],
+    ]);
+    expect(report.rows.find((r) => r.key === 'MFM-DAD')!.label).toBe('MFM→DAD');
+  });
+
+  it('往返单只进去程方向那一桶，两桶相加不超过总收入', async () => {
+    // 同一张单的两条腿：去程 MFM→DAD、回程 DAD→MFM。按「任一航段命中」分桶的话
+    // 这张单会被数两遍，两条线加起来比总数还多——这里钉死它只进去程那一桶。
+    const client = salesClient([
+      salesOrder('o1', [
+        routeLeg(3000, 'MFM', 'DAD', '2026-01-10T02:00:00Z'),
+        routeLeg(3000, 'DAD', 'MFM', '2026-01-14T06:00:00Z'),
+      ]),
+    ]);
+
+    const report = await getSalesReport(RANGE, 'route', client);
+
+    expect(report.rows).toHaveLength(1);
+    expect(report.rows[0]!.key).toBe('MFM-DAD');
+    expect(report.rows[0]!.revenueCny).toBe(6000);
+    expect(report.rows[0]!.orderCount).toBe(1);
+    expect(report.totals.revenueCny).toBe(6000);
+  });
+
+  it('同单的地面行跟着订单归同一条线，不被甩进未知桶', async () => {
+    // 航线是订单级属性：酒店/签证行本身没有航线，逐行判会把它们全甩进未知桶，
+    // 于是「某条线的酒店收入」永远是 0。
+    const client = salesClient([
+      salesOrder('o1', [
+        routeLeg(5000, 'MFM', 'DAD', '2026-01-10T02:00:00Z'),
+        { kind: 'HOTEL', amount: 2000, totalCostCny: 1200 },
+      ]),
+    ]);
+
+    const report = await getSalesReport(RANGE, 'route', client);
+
+    expect(report.rows).toHaveLength(1);
+    expect(report.rows[0]!.key).toBe('MFM-DAD');
+    expect(report.rows[0]!.revenueCny).toBe(7000);
+  });
+
+  it('推不出航线的单归「未知航线」，不被丢掉', async () => {
+    // 这一桶不是噪音：它正是运营要去补绑航班的那批单。藏起来的话
+    // 「为什么各条线加起来对不上总数」就永远查不出来。
+    const client = salesClient([
+      salesOrder('o1', [{ kind: 'VISA', amount: 800, totalCostCny: 300 }]),
+    ]);
+
+    const report = await getSalesReport(RANGE, 'route', client);
+
+    expect(report.rows).toHaveLength(1);
+    expect(report.rows[0]!.key).toBe('unknown');
+    expect(report.rows[0]!.label).toBe('未知航线');
+    expect(report.rows[0]!.revenueCny).toBe(800);
+  });
+
+  it('航线桶同样吃「缺成本 → 毛利未知」那条口径', async () => {
+    const client = salesClient([
+      salesOrder('o1', [routeLeg(5000, 'MFM', 'DAD', '2026-01-10T02:00:00Z')]),
+    ]);
+
+    const report = await getSalesReport(RANGE, 'route', client);
+
+    expect(report.rows[0]!.missingCostItemCount).toBe(1);
+    expect(report.rows[0]!.grossMarginCny).toBeNull();
+    expect(report.rows[0]!.marginPct).toBeNull();
   });
 });
