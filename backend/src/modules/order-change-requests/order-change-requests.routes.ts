@@ -16,6 +16,7 @@ import {
   createOrderChangeRequestBodySchema,
   decideOrderChangeRequestBodySchema,
   listOrderChangeRequestsQuerySchema,
+  previewOrderChangeRequestBodySchema,
 } from './order-change-requests.schemas.js';
 
 const service = new OrderChangeRequestsService();
@@ -54,6 +55,24 @@ export const orderChangeRequestOrderRoutes: FastifyPluginAsync = async (app) => 
       return reply.status(201).send({ request });
     },
   );
+
+  // 三类扩展（拆单 / 取消单程 / 改自备签）提交前的只读预检：把 blockers 与预估退款、
+  // 拆出份额摆给提交方看。只读，不落申请、不写审计。
+  // flag 关着时与提交端点同拒（403 FEATURE_DISABLED），前台据此不渲染这三项。
+  app.post(
+    '/:id/change-requests/preview',
+    { preHandler: [app.authenticate, requireAgentOrOps] },
+    async (req) => {
+      const { id } = req.params as { id: string };
+      const body = previewOrderChangeRequestBodySchema.parse(req.body);
+      return service.previewExtraKind(
+        { userId: req.user.sub, role: req.user.role },
+        id,
+        body.kind,
+        body.payload,
+      );
+    },
+  );
 };
 
 /** 挂在 /order-change-requests 前缀下：批量提交 + 运营队列 + 处理。 */
@@ -88,6 +107,13 @@ export const orderChangeRequestRoutes: FastifyPluginAsync = async (app) => {
   app.get('/', { preHandler: [app.authenticate, requireAgentOrOps] }, async (req) => {
     const query = listOrderChangeRequestsQuerySchema.parse(req.query);
     return service.list({ userId: req.user.sub, role: req.user.role }, query);
+  });
+
+  // 当前能提哪几类：基础四类恒有，扩展三类只在 flag 开着时才出现。
+  // 前台靠它决定申请类型下拉里出不出这三项（/settings/feature-flags 只对运营开放，
+  // 代理读不到，不能拿那条路当判据）。
+  app.get('/kinds', { preHandler: [app.authenticate, requireAgentOrOps] }, async (req) => {
+    return service.availableKinds({ userId: req.user.sub, role: req.user.role });
   });
 
   // 待办角标：运营订单页顶栏那颗红点读的就是这个数。

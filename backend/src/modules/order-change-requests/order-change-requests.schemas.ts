@@ -94,6 +94,13 @@ export const createOrderChangeRequestBodySchema = z.object({
 });
 export type CreateOrderChangeRequestBody = z.infer<typeof createOrderChangeRequestBodySchema>;
 
+/** 三类扩展的提交前预检入参（只读，不落任何东西）。 */
+export const previewOrderChangeRequestBodySchema = z.object({
+  kind: z.nativeEnum(OrderChangeKind),
+  payload: z.record(z.unknown()).default({}),
+});
+export type PreviewOrderChangeRequestBody = z.infer<typeof previewOrderChangeRequestBodySchema>;
+
 /** 一次给多张单提同一类改动；上限 200 与批量改期/批量到账同一档。 */
 export const batchOrderChangeRequestBodySchema = z.object({
   orderIds: z.array(z.string().min(1)).min(1, '至少选一张订单').max(200, '一次最多 200 张订单'),
