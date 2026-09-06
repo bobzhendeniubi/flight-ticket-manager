@@ -5,6 +5,8 @@
  *   - 开发：默认 /api（vite-dev 代理到 http://localhost:4000）
  *   - 生产：VITE_API_BASE=https://api.citur.com（或 /api 走前端 nginx 反代）
  */
+import type { Capability } from './capabilities';
+
 const API_BASE: string = (import.meta.env?.VITE_API_BASE as string | undefined)?.trim() || '/api';
 
 export interface ApiErrorBody {
@@ -232,6 +234,12 @@ export interface AuthUser {
   staffRole?: StaffRole | null;
   displayName: string | null;
   mustChangePassword: boolean;
+  /**
+   * 能力清单：后端按同一张能力表算好后随 /users/me 下发（见 backend/src/lib/capabilities.ts）。
+   * 登录响应里还没有，要等启动时那次 /users/me —— 所以是可选的。读它一律走
+   * useCapabilities()，别在页面里自己判 role。
+   */
+  capabilities?: Capability[];
 }
 
 export interface AuthTokens {
@@ -4412,6 +4420,8 @@ export const api = {
         disabledAt: string | null;
         staffRole: StaffRole | null;
       };
+      /** 后端按能力表现算的清单，与 requireCapability 同源。 */
+      capabilities: Capability[];
     }>('/users/me', { token }),
 
   // 营销中心
