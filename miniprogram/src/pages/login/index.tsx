@@ -90,7 +90,7 @@ export default function LoginPage() {
   return (
     <View className='login-page'>
       <View className='hero'>
-        <Text className='title'>世途旅行</Text>
+        <Text className='title'>椰岛假期</Text>
         <Text className='sub'>{routeText}</Text>
       </View>
 

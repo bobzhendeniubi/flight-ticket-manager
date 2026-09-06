@@ -93,7 +93,7 @@ export default function MePage() {
           onClick={() =>
             Taro.showModal({
               title: '客服',
-              content: 'support@citur.com\n+853 2888 8888',
+              content: 'support@cocoholiday.example\n+853 0000 0000',
               showCancel: false,
             })
           }
@@ -106,7 +106,7 @@ export default function MePage() {
           className='row'
           onClick={() =>
             Taro.showModal({
-              title: '关于世途旅行',
+              title: '关于椰岛假期',
               content: `${routeText}\nM2.5 Release · 小程序 MVP`,
               showCancel: false,
             })
