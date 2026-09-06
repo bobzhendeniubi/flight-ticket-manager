@@ -136,3 +136,57 @@ export function computePerPaxSettlement(input: PerPaxSettlementInput): PerPaxSet
 
   return { rows, payableCny, excludedCny };
 }
+
+// ── 读后端落库份额（R1）─────────────────────────────────────────────────────
+
+/** 后端 OrderPassengerShare 行的最小形状（与 lib/api.ts 的 PassengerShare 结构兼容）。 */
+export interface PersistedPassengerShareLike {
+  passengerId: string;
+  settlementCny: number;
+  adjustmentCny: number;
+}
+
+export type PerPaxSettlementSource = 'PERSISTED' | 'DERIVED';
+
+export interface ResolvedPerPaxSettlement extends PerPaxSettlementResult {
+  /** PERSISTED = 行来自后端落库的 order.passengerShares；DERIVED = 后端没给、前端按上面的算法现算（旧后端 / 窄接口）。 */
+  source: PerPaxSettlementSource;
+}
+
+export interface ResolvePerPaxSettlementInput extends PerPaxSettlementInput {
+  /** 后端下发的按人份额；缺省 / 不完整（少任何一位在单乘客）时退回前端算法。 */
+  passengerShares?: readonly PersistedPassengerShareLike[] | null;
+}
+
+/**
+ * 每人结算价的**唯一取数入口**：先用后端落库的份额（order.passengerShares，每位在单乘客一行），
+ * 没有才退回 computePerPaxSettlement 现算。两条支路的 payableCny / excludedCny 同一口径
+ *（应收 = total + 可摊调整额，excluded = 换人费等不摊条目），只是「每人多少」一个来自库、一个现算。
+ * 之所以优先读库：库里那套是写路径落的事实（拆单搬钱 / 导出 / 对账单读的同一份），前端自算
+ * 只是旧后端兼容——两边余数兜底的乘客顺序不同，同一张单在详情页与导出里那一分钱会落到不同人头上。
+ */
+export function resolvePerPaxSettlement(input: ResolvePerPaxSettlementInput): ResolvedPerPaxSettlement {
+  const { passengerShares, passengerIds } = input;
+  const derived = computePerPaxSettlement(input);
+  if (!Array.isArray(passengerShares) || passengerIds.length === 0) {
+    return { ...derived, source: 'DERIVED' };
+  }
+  const byPid = new Map<string, PersistedPassengerShareLike>();
+  for (const s of passengerShares) {
+    if (
+      s &&
+      typeof s.passengerId === 'string' &&
+      Number.isFinite(s.settlementCny) &&
+      Number.isFinite(s.adjustmentCny)
+    ) {
+      byPid.set(s.passengerId, s);
+    }
+  }
+  const rows: PerPaxSettlementRow[] = [];
+  for (const pid of passengerIds) {
+    const s = byPid.get(pid);
+    if (!s) return { ...derived, source: 'DERIVED' };
+    rows.push({ passengerId: pid, netCny: s.adjustmentCny, settlementCny: s.settlementCny });
+  }
+  return { rows, payableCny: derived.payableCny, excludedCny: derived.excludedCny, source: 'PERSISTED' };
+}

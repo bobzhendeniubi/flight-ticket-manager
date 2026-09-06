@@ -1628,6 +1628,30 @@ export interface OrderAdjustment {
   passengerDocument?: string;
 }
 
+/**
+ * 按人份额（后端 OrderPassengerShare 落库行，serializeOrder 逐单下发；金额 CNY 两位小数）。
+ * settlementCny = baseCny + adjustmentCny；全员 Σ settlementCny + sharesExcludedCny = effectivePayable。
+ * 算法只在后端一份（lib/order-money perPax*）；前端 lib/perPaxSettlement.ts 只在没有本字段时才退回自算。
+ */
+export interface PassengerShare {
+  passengerId: string;
+  /** 每人结算价（应收份额） */
+  settlementCny: number;
+  /** 均摊基准 */
+  baseCny: number;
+  /** 该乘客名下按乘客调价净额 */
+  adjustmentCny: number;
+  /** 签证金额（自备签 = 0） */
+  visaCny: number;
+  /** 单房差（只记到单住乘客） */
+  singleRoomDiffCny: number;
+  /** 立减均摊 */
+  discountCny: number;
+}
+
+/** 份额来源：PERSISTED = 读的是库里落好的；DERIVED = 老单尚未回填，后端现算（读侧会顺手回填）。 */
+export type SharesSource = 'PERSISTED' | 'DERIVED';
+
 /** 回收站行（GET /orders/deleted）：只带回收站表所需的最小字段。 */
 export interface DeletedOrderSummary {
   id: string;
@@ -1682,6 +1706,12 @@ export interface OrderSummary {
   adjustmentCny?: number;
   /** 售后费用明细（改期费 / 换人费）；列表可能为空，详情带出 */
   adjustments?: OrderAdjustment[];
+  /** 按人份额（每位在单乘客一行；内部角色下发，AGENT/CUSTOMER 不带）。旧后端缺省 */
+  passengerShares?: PassengerShare[];
+  /** 份额来源（与 passengerShares 成对；旧后端缺省） */
+  sharesSource?: SharesSource;
+  /** 换人费 / 换人差价等不摊入份额的售后费合计（记在已离开订单的被换人头上）。旧后端缺省 */
+  sharesExcludedCny?: number;
   contactName: string;
   contactPhone: string;
   contactEmail: string | null;

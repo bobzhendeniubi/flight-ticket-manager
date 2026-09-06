@@ -13,7 +13,7 @@ import { businessTzParts, formatDateCn, formatDateTimeSecCn, formatInBusinessTz 
 import { NumberInput } from '../components/NumberInput';
 import { Icon, type IconName } from '../components/Icon';
 import { parseOtaRoster } from '../lib/parseOtaRoster';
-import { computePerPaxSettlement } from '../lib/perPaxSettlement';
+import { resolvePerPaxSettlement } from '../lib/perPaxSettlement';
 import { toOrdersExportFilter } from '../lib/api';
 import type { AgentListItem, OrderAgentStats, OrderImportParseResult } from '../lib/api';
 import { OrderFinanceSection } from '../components/OrderFinanceSection';
@@ -10646,14 +10646,25 @@ function PriceAdjustmentSection({
     const netByPassenger = new Map<string, number>(
       [...grouped.byPassenger.entries()].map(([pid, bucket]) => [pid, bucket.netCny]),
     );
-    return computePerPaxSettlement({
+    // 先读后端落库的按人份额（order.passengerShares，与导出 / 对账单 / 拆单搬钱同一份事实）；
+    // 旧后端 / 窄接口没下发时才退回前端同算法现算（source = DERIVED）。
+    return resolvePerPaxSettlement({
       totalCny: Number(order.total),
       adjustmentCny: order.adjustmentCny,
       adjustments: order.adjustments ?? [],
       passengerIds: order.passengers.map((p) => p.id),
       netByPassenger,
+      passengerShares: order.passengerShares,
     });
-  }, [order.passengers, order.total, order.adjustmentCny, order.adjustments, grouped.byPassenger]);
+  }, [order.passengers, order.total, order.adjustmentCny, order.adjustments, order.passengerShares, grouped.byPassenger]);
+
+  // 份额来源三态：后端已落库 / 后端现算（老单未回填，读一次详情就会回填）/ 前端现算（旧后端没下发）。
+  const shareOrigin: 'PERSISTED' | 'BACKEND_DERIVED' | 'FRONTEND_DERIVED' =
+    perPax?.source === 'PERSISTED'
+      ? order.sharesSource === 'DERIVED'
+        ? 'BACKEND_DERIVED'
+        : 'PERSISTED'
+      : 'FRONTEND_DERIVED';
 
   // 内部角色才可见（对外脱敏时后端也不下发逐项金额；这里再做一道前端权限门）。
   if (!isOps) return null;
@@ -10743,6 +10754,22 @@ function PriceAdjustmentSection({
         <div className="mt-3">
           <p className="text-[11px] leading-snug text-ink-muted">
             每人结算价 = 应收均摊 + 该乘客调整净额（系统派生，不可手填）
+            <span
+              className={`ml-1.5 rounded px-1 py-0.5 text-[10px] font-medium ring-1 ${
+                shareOrigin === 'PERSISTED'
+                  ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'
+                  : 'bg-slate-50 text-slate-600 ring-slate-200'
+              }`}
+              title={
+                shareOrigin === 'PERSISTED'
+                  ? '读的是后端落库的按人份额（写路径落的事实，与导出 / 对账单同一份）'
+                  : shareOrigin === 'BACKEND_DERIVED'
+                    ? '老单尚未回填份额，后端按同一算法现算；打开过详情后会自动回填'
+                    : '后端未下发按人份额（旧后端），前端按同一算法现算'
+              }
+            >
+              {shareOrigin === 'PERSISTED' ? '已落库' : shareOrigin === 'BACKEND_DERIVED' ? '后端现算' : '前端现算'}
+            </span>
           </p>
           <table className="mt-1 w-full text-xs">
             <thead>
@@ -11500,6 +11527,12 @@ function PassengersSection({
     () => groupOrderAdjustments(order.items ?? []).byPassenger,
     [order.items],
   );
+  // 按人份额（R1）：后端逐单下发的每人结算价（库里落好的；老单未回填时后端现算并标 DERIVED）。
+  // 旧后端没下发就不显示，不在前端另算一份。
+  const shareByPassenger = useMemo(
+    () => new Map((order.passengerShares ?? []).map((s) => [s.passengerId, s])),
+    [order.passengerShares],
+  );
 
   // 常旅客次数：按本单乘客证件批量查一次，给每张乘客卡挂「已飞 N / 可用 M」小标
   const tripsByDoc = useTravelerTripsByDoc(order.passengers);
@@ -11517,6 +11550,7 @@ function PassengersSection({
         {order.passengers.map((p) => {
           const passDaysLeft = daysUntil(p.passportExpiry);
           const adjNet = adjustmentByPassenger.get(p.id)?.netCny ?? 0;
+          const share = shareByPassenger.get(p.id);
           const passWarn = passDaysLeft !== null && passDaysLeft < 180;
           const passBlock = passDaysLeft !== null && passDaysLeft < 90;
           const docNo = p.documentNumber?.trim();
@@ -11607,6 +11641,20 @@ function PassengersSection({
                     )}
                     {p.visaExempt && (
                       <span className="ml-2 rounded bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 ring-1 ring-sky-200">自备签</span>
+                    )}
+                    {/* 按人份额（R1）：该乘客的每人结算价 + 来源（已落库 / 现算）。 */}
+                    {share && (
+                      <span
+                        className={`nums ml-2 rounded px-1.5 py-0.5 text-[10px] font-medium ring-1 ${
+                          order.sharesSource === 'PERSISTED'
+                            ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'
+                            : 'bg-slate-50 text-slate-600 ring-slate-200'
+                        }`}
+                        title={`每人结算价（${order.sharesSource === 'PERSISTED' ? '已落库' : '后端现算，打开过详情后会回填'}）：均摊 ¥${share.baseCny.toLocaleString('zh-CN', { minimumFractionDigits: 2 })} + 调整 ${signedCny(share.adjustmentCny)}`}
+                      >
+                        份额 ¥{share.settlementCny.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        {order.sharesSource === 'PERSISTED' ? '' : '·现算'}
+                      </span>
                     )}
                     {/* 按乘客净调价小标（0722）：正=补收（琥珀）、负=优惠（绿）；0 不显示。 */}
                     {adjNet !== 0 && (
