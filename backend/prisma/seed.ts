@@ -340,21 +340,7 @@ async function main() {
     }
   }
 
-  // ── 产品：Hotels / Transfers / Visas / Bundles（upsert 幂等） ──
-  await seedHotels();
-  await seedTransfers();
-  await seedVisas();
-  await seedBundles();
-
-  // ── 取消订单费率（默认每个 kind 一条 isDefault 兜底）──
-  await seedCancellationPolicies();
-
-  // ── Demo 订单（演示后台用：6 条不同状态的样例订单）──
-  await seedDemoOrders(customer.id);
-
-  // ── 上线编造评价（每产品 6~12 条 zh-CN 评价 + 航线评价）──
-  await seedReviews();
-
+  // ── 航班（必须先于产品：套餐绑 QH9589/QH9588 派生航线，空库上先种航班才有得绑）──
   // ── 清理不在列表里的历史航班（只在没有订单关联时） ──
   const keepFlightNumbers = FLIGHT_SEED.map((f) => f.flightNumber);
   const toRemove = await prisma.flight.findMany({
@@ -450,6 +436,21 @@ async function main() {
       }
     }
   }
+
+  // ── 产品：Hotels / Transfers / Visas / Bundles（upsert 幂等） ──
+  await seedHotels();
+  await seedTransfers();
+  await seedVisas();
+  await seedBundles();
+
+  // ── 取消订单费率（默认每个 kind 一条 isDefault 兜底）──
+  await seedCancellationPolicies();
+
+  // ── Demo 订单（演示后台用：6 条不同状态的样例订单）──
+  await seedDemoOrders(customer.id);
+
+  // ── 上线编造评价（每产品 6~12 条 zh-CN 评价 + 航线评价）──
+  await seedReviews();
 
   // ── 日期等级 (DateRanking) — 365 天 ────────────────────────────────
   // DOW 默认：Sun=A, Mon=C, Tue=D, Wed=D, Thu=C, Fri=B, Sat=B
