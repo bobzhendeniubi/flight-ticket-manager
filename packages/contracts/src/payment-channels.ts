@@ -7,6 +7,11 @@ import { dataUrlImageSchema } from './lib/proof-url.js';
 /** kind ∈ {WECHAT, ALIPAY, BANK}（与小程序/前台付款页展示分组一致）。 */
 export const PAYMENT_CHANNEL_KINDS = ['WECHAT', 'ALIPAY', 'BANK'] as const;
 export const paymentChannelKindSchema = z.enum(PAYMENT_CHANNEL_KINDS);
+/**
+ * 三端（后台 / 前台 / 小程序）共用的渠道分组类型，以前各写各的字符串联合。
+ * 单独导出成 type 而不是让前端写 z.infer：前端不该为了一个联合类型去依赖 zod。
+ */
+export type PaymentChannelKind = (typeof PAYMENT_CHANNEL_KINDS)[number];
 
 export const createPaymentChannelSchema = z.object({
   kind: paymentChannelKindSchema,

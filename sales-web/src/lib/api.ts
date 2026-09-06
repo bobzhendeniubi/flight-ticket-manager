@@ -8,6 +8,36 @@
  * 运行时 env 不可用（静态 HTML 已编译）；若要切域名必须重新构建镜像。
  */
 import type { Capability } from './capabilities';
+/**
+ * 枚举类型不再手抄 —— 从 @ftm/contracts 取后端 schema.prisma 的同一份镜像。
+ *
+ * 改这批之前 DocumentType 里有个后端根本不认的 OTHER，是典型的抄本跟正本分家。
+ * import + export 两句都要：本文件下面的接口还要用这些类型，光 re-export 不进本地作用域。
+ */
+import type {
+  PaymentChannelKind as ContractPaymentChannelKind,
+  CabinClass,
+  DocumentType,
+  PassengerType,
+  PaymentMethod,
+  SeatLockStatus,
+  SettlementStatus,
+  UserRole,
+  WaitlistStatus,
+  ProductReviewType,
+} from '@ftm/contracts';
+
+export type {
+  CabinClass,
+  DocumentType,
+  PassengerType,
+  PaymentMethod,
+  SeatLockStatus,
+  SettlementStatus,
+  UserRole,
+  WaitlistStatus,
+};
+
 const API_BASE: string = (import.meta.env?.VITE_API_BASE as string | undefined)?.trim() || '/api';
 export interface ApiErrorBody {
   error: { code: string; message: string; details?: unknown };
@@ -140,8 +170,6 @@ async function apiFetchWithRetry<T>(
 
 // ── 类型 ──────────────────────────────────────────────────────────────────
 
-export type UserRole = 'CUSTOMER' | 'AGENT' | 'STAFF' | 'ADMIN';
-export type CabinClass = 'ECONOMY' | 'PREMIUM_ECONOMY' | 'BUSINESS' | 'FIRST';
 
 export interface AuthUser {
   id: string;
@@ -343,9 +371,6 @@ export type OrderItemKind =
   | 'GUIDE'
   | 'UPGRADE_CHANGE'
   | 'OVERSALE';
-export type DocumentType = 'PASSPORT' | 'ID_CARD' | 'OTHER';
-export type PassengerType = 'ADULT' | 'CHILD' | 'INFANT';
-export type PaymentMethod = 'WECHAT_PAY' | 'ALIPAY' | 'BANK_CARD' | 'AGENT_PREPAYMENT';
 
 /**
  * 对外中性航段状态（镜像后端 orders.leg-status.ts 的 PublicLegStatus）。
@@ -489,7 +514,6 @@ export interface RefundQuote {
 // ── 锁位 ──────────────────────────────────────────────────────────────────
 // 下单前临时占座：单次 ≤9 张 / 固定 10 分钟 / 到期自动回收；
 // 下单时服务端自动消费本人锁位（前端无需改结算流程）。
-export type SeatLockStatus = 'ACTIVE' | 'EXPIRED' | 'CONSUMED' | 'RELEASED';
 
 /** POST /seat-locks 返回的锁位记录 */
 export interface SeatLock {
@@ -520,7 +544,6 @@ export interface MySeatLock {
 
 // ── 候补 ──────────────────────────────────────────────────────────────────
 // 舱位售罄时登记候补（单次 1-9 张 + 联系手机号）；座位释放后按先来先到通知。
-export type WaitlistStatus = 'ACTIVE' | 'NOTIFIED' | 'FULFILLED' | 'CANCELLED';
 
 /** POST /waitlist 返回的候补记录 */
 export interface WaitlistEntry {
@@ -870,7 +893,6 @@ export interface Bundle {
 }
 
 // ── 结算 / 佣金 ────────────────────────────────────────────────────────────
-export type SettlementStatus = 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED' | 'PAID' | 'VOIDED';
 
 export interface SettlementSummary {
   id: string;
@@ -923,7 +945,8 @@ export interface MyAgentProfile {
 }
 
 // ── 评价 / 评论 ─────────────────────────────────────────────────────────────
-export type ReviewProductType = 'BUNDLE' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'FLIGHT';
+/** 评价对象类型 = 后端 Prisma ProductReviewType，取契约包那份。 */
+export type ReviewProductType = ProductReviewType;
 
 /** 单条评价（对标 Klook/携程 评论；后端 GET /reviews 的 item） */
 export interface Review {
@@ -1009,7 +1032,8 @@ export interface MaskedOrder {
  *   accountText：账户/收款信息文字（如银行卡号、户名）；null = 无
  *   note：补充说明（如"备注请填订单号"）；null = 无
  */
-export type PaymentChannelKind = 'WECHAT' | 'ALIPAY' | 'BANK';
+/** 收款渠道分组 = 契约包 payment-channels 那份（与后台、小程序同一口径）。 */
+export type PaymentChannelKind = ContractPaymentChannelKind;
 
 export interface PublicPaymentChannel {
   id: string;
