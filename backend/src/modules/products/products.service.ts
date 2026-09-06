@@ -16,6 +16,7 @@ import {
   computeBundleOriginalPerPaxCny,
   type BundleFlightBinding,
 } from './bundle-pricing.js';
+import { bundleRouteKey, resolveBundleRoute } from './bundle-route.js';
 import {
   assertHotelDeleteAllowed,
   assertHotelNameAllowed,
@@ -578,12 +579,19 @@ export class ProductsService {
     // 按 (去程航班, 回程航班) 组合去重后各查一次：绑了航班的用该航班班次价，未绑的按航线兜底。
     // 业务航线有限（通常 1~3 种组合），既避免 N+1 逐套餐查库，也不让全局最低价污染所有套餐起价。
     const now = new Date();
-    const bindingKey = (ob: string | null, rt: string | null) => `${ob ?? 'route'}|${rt ?? 'route'}`;
+    // 分桶键要带上派生航线：两个套餐都只绑了去程、航线不同的话，光按航班 id 分桶会把
+    // 「按航线取回程最低价」的结果串到另一条航线上（第二条航线上线后立刻会踩到）。
+    const bindingKey = (b: BundleWithRoom) =>
+      `${b.outboundFlightId ?? 'route'}|${b.returnFlightId ?? 'route'}|${bundleRouteKey(b) ?? 'none'}`;
     const uniqueBindings = new Map<string, BundleFlightBinding>();
     for (const b of rows) {
-      const key = bindingKey(b.outboundFlightId, b.returnFlightId);
+      const key = bindingKey(b);
       if (!uniqueBindings.has(key)) {
-        uniqueBindings.set(key, { outboundFlightId: b.outboundFlightId, returnFlightId: b.returnFlightId });
+        uniqueBindings.set(key, {
+          outboundFlightId: b.outboundFlightId,
+          returnFlightId: b.returnFlightId,
+          route: resolveBundleRoute(b),
+        });
       }
     }
     const flightRefByKey = new Map<string, number | null>();
@@ -598,7 +606,7 @@ export class ProductsService {
       serializeBundle(
         b,
         ratings.get(b.id) ?? ZERO_RATING,
-        flightRefByKey.get(bindingKey(b.outboundFlightId, b.returnFlightId)) ?? null,
+        flightRefByKey.get(bindingKey(b)) ?? null,
         selfVisaEffective.get(b.id) ?? null,
       ),
     );
@@ -615,6 +623,7 @@ export class ProductsService {
     const flightRef = await getCheapestRoundTripEconomyCny(new Date(), {
       outboundFlightId: b.outboundFlightId,
       returnFlightId: b.returnFlightId,
+      route: resolveBundleRoute(b),
     });
     return serializeBundle(
       b,
@@ -713,6 +722,7 @@ export class ProductsService {
     const flightRef = await getCheapestRoundTripEconomyCny(new Date(), {
       outboundFlightId: b.outboundFlightId,
       returnFlightId: b.returnFlightId,
+      route: resolveBundleRoute(b),
     });
     return serializeBundle(b, ZERO_RATING, flightRef, await resolveSelfVisaDeductCny(b));
   }
@@ -800,6 +810,7 @@ export class ProductsService {
     const flightRef = await getCheapestRoundTripEconomyCny(new Date(), {
       outboundFlightId: b.outboundFlightId,
       returnFlightId: b.returnFlightId,
+      route: resolveBundleRoute(b),
     });
     return serializeBundle(b, ZERO_RATING, flightRef, await resolveSelfVisaDeductCny(b));
   }

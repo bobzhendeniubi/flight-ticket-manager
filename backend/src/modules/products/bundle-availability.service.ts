@@ -6,14 +6,16 @@
  * 判定口径（与前台 BundlesPage 解析方式一致）：
  *   1. BLACKOUT 优先（不查库）：D ∈ bundle.blackoutDates → 不可售 reason='BLACKOUT'，其余跳过。
  *   2. 机票：套餐 FLIGHT 组件只有自由文本 productName，无班次/航线引用。
- *      固定航线 MFM⇌DAD（与前台/AI 助手一致），去程 D、回程 D+nights；
+ *      航线由**套餐绑定的去/回程航班**派生（resolveBundleRoute，见 bundle-route.ts），
+ *      去程 D、回程 D+nights；没绑航班 = 没航线 = 不可售 reason='NO_FLIGHT_BOUND'；
  *      nights = resolveBundleNights(items, hotelNights)（单一权威口径，见 bundle-nights.ts）。
  *      舱位：任一 FLIGHT 组件 productName 含「商务」→ BUSINESS，否则 ECONOMY。
  *      可售要求去/回两段所选舱位档位均 ≠ 'SOLD_OUT'（口径同六档余位 computeAvailabilityTier）。
- *   3. 酒店：bundle.hotelRoomTypeId 已配置 → 取 [D, D+nights) 整段最差一晚档位：
+ *   3. 没绑航班（route===null）→ 整段区间不可售 reason='NO_FLIGHT_BOUND'，库存判定跳过。
+ *   4. 酒店：bundle.hotelRoomTypeId 已配置 → 取 [D, D+nights) 整段最差一晚档位：
  *      tier==='SOLD_OUT' → 不可售 reason='HOTEL_SOLD_OUT'；
  *      tier===null（整段未配置任何包房周期）→ 不拦截；未关联房型 → 永不拦截。
- *   4. sellable = !blackout && flightsOk && hotelOk。
+ *   5. sellable = !blackout && 有航线 && flightsOk && hotelOk。
  *
  * 性能（强约束，绝不逐日跑重查询）：
  *   - 机票：getRouteSeatTiersByDate 一次 flightSchedule.findMany（出发时间窗）+ 一次 seatLock.groupBy，
@@ -27,12 +29,14 @@ import { CabinClass, SeatLockStatus } from '@prisma/client';
 import type { PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { NotFoundError } from '../../lib/errors.js';
+import { localDateISO } from '../../lib/flight-time.js';
 import {
   computeAvailabilityTier,
   type AvailabilityTier,
 } from '../flights/flights.service.js';
 import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
 import { resolveBundleNights } from './bundle-nights.js';
+import { BUNDLE_ROUTE_SELECT, resolveBundleRoute } from './bundle-route.js';
 import {
   computeHotelAvailabilityTier,
   type HotelAvailabilityTier,
@@ -41,11 +45,10 @@ import { heldSeatsBySeatClass } from '../hold-orders/held-seats.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 
-/** 套餐固定航线（与前台 BundlesPage / AI 助手一致：澳门 ⇌ 岘港）。*/
-export const BUNDLE_ROUTE = { origin: 'MFM', destination: 'DAD' } as const;
-
 export type BundleSellableReason =
   | 'BLACKOUT'
+  /** 套餐没绑去/回程航班 → 派生不出航线 → 不可售（绝不兜底到某条写死航线）。*/
+  | 'NO_FLIGHT_BOUND'
   | 'FLIGHT_SOLD_OUT'
   | 'HOTEL_SOLD_OUT'
   | null;
@@ -78,26 +81,30 @@ function buildDateRange(from: string, to: string): string[] {
 }
 
 /**
- * 把出发地本地日（假定 Asia/Shanghai, UTC+8）折算为 UTC 出发时间窗 [start, end)。
- * 与 FlightService.search 的日期口径完全一致：本地 00:00 = UTC 前一天 16:00。
+ * 「当地日 → UTC 宽窗」：查询时还不知道每一班自己的 departureTz（tz 在行里），
+ * 所以 SQL 侧只能拉一个**必然覆盖**目标当地日的宽区间，再在 JS 内按每班自己的 tz 精确过滤。
+ *
+ * 宽度取 ±14 小时：现役与可预见的 IANA 时区偏移都在 UTC−12…+14 之间，
+ * 当地 00:00 最早对应 UTC 前一天 10:00（+14 区），最晚对应当天 12:00（−12 区），
+ * ±14 小时把两端都包住。宽窗只会多拉几行，绝不会漏班次；精确判定全交给 localDateISO。
  */
-function localDateToUtcWindow(dateISO: string): { start: Date; end: Date } {
-  const [y, m, d] = dateISO.split('-').map(Number);
+const TZ_WINDOW_PAD_MS = 14 * 60 * 60 * 1000;
+
+/** [fromDate 当地 00:00, toDate 当地 24:00) 的 UTC 宽窗（两端各放 14 小时）。*/
+function localDateRangeToUtcWideWindow(
+  fromDate: string,
+  toDate: string,
+): { start: Date; end: Date } {
   return {
-    start: new Date(Date.UTC(y, m - 1, d, -8, 0, 0)),
-    end: new Date(Date.UTC(y, m - 1, d + 1, -8, 0, 0)),
+    start: new Date(toMidnightMs(fromDate) - TZ_WINDOW_PAD_MS),
+    end: new Date(toMidnightMs(toDate) + DAY_MS + TZ_WINDOW_PAD_MS),
   };
-}
-/** UTC 出发时间 → 出发地本地日（Asia/Shanghai）YYYY-MM-DD。*/
-function utcToLocalDateISO(departureTime: Date): string {
-  return new Date(departureTime.getTime() + 8 * 60 * 60 * 1000)
-    .toISOString()
-    .slice(0, 10);
 }
 
 /**
  * 批量取一条航线在 [fromDate, toDate]（出发地本地日）各日、指定舱位的余位档位。
- * 一次 findMany（按出发时间窗）+ 一次 seatLock.groupBy；JS 内按本地日聚合。
+ * 一次 findMany（按出发时间宽窗）+ 一次 seatLock.groupBy；JS 内按**每班自己的 departureTz**
+ * 折当地日再聚合（绝不用固定 +8：新航线可能落在 +7/+9 或别的时区，固定偏移会整日错位）。
  *
  * 同一本地日可能有多个班次 → 取该日可售量之和后折档（只要该日整体还有座即视为有位；
  * 与销售端"该日是否可售"语义一致）。
@@ -112,8 +119,7 @@ export async function getRouteSeatTiersByDate(
   cabin: CabinClass,
   client: PrismaClient = defaultPrisma,
 ): Promise<Map<string, AvailabilityTier>> {
-  const winStart = localDateToUtcWindow(fromDate).start;
-  const winEnd = localDateToUtcWindow(toDate).end;
+  const { start: winStart, end: winEnd } = localDateRangeToUtcWideWindow(fromDate, toDate);
 
   const schedules = await client.flightSchedule.findMany({
     where: {
@@ -124,6 +130,7 @@ export async function getRouteSeatTiersByDate(
     },
     select: {
       departureTime: true,
+      departureTz: true,
       seatClasses: {
         where: { cabin },
         select: { id: true, capacity: true, sold: true },
@@ -148,10 +155,12 @@ export async function getRouteSeatTiersByDate(
   const lockedBySeatClass = new Map(lockSums.map((r) => [r.seatClassId, r._sum.qty ?? 0]));
   const heldBySeatClass = await heldSeatsBySeatClass(client, seatClassIds);
 
-  // 按本地日聚合可售量（同日多班次 → 取和；"该日还有座"即可售）
+  // 按本地日聚合可售量（同日多班次 → 取和；"该日还有座"即可售）。
+  // 宽窗多拉出来的、当地日落在 [fromDate, toDate] 之外的班次在此被丢掉。
   const availByDate = new Map<string, number>();
   for (const s of schedules) {
-    const localDate = utcToLocalDateISO(s.departureTime);
+    const localDate = localDateISO(s.departureTime, s.departureTz);
+    if (localDate < fromDate || localDate > toDate) continue;
     let dayAvail = availByDate.get(localDate) ?? 0;
     for (const c of s.seatClasses) {
       const locked = lockedBySeatClass.get(c.id) ?? 0;
@@ -217,6 +226,7 @@ export async function getBundleSellableDates(
       blackoutDates: true,
       hotelNights: true,
       hotelRoomTypeId: true,
+      ...BUNDLE_ROUTE_SELECT,
     },
   });
   if (!bundle) throw new NotFoundError('套餐不存在');
@@ -227,14 +237,18 @@ export async function getBundleSellableDates(
   const nights = resolveBundleNights(bundle.items, bundle.hotelNights);
   const cabin = resolveCabin(bundle.items);
   const blackoutSet = parseBlackoutSet(bundle.blackoutDates);
+  // 航线由套餐绑定航班派生；没绑 = 没航线 = 不可售（不兜底到任何写死航线，见 bundle-route.ts）。
+  const route = resolveBundleRoute(bundle);
 
   // ── 机票：去程在 [from, to]；回程在 [from+nights, to+nights] ──────────────
   const retFrom = addDaysISO(from, nights);
   const retTo = addDaysISO(to, nights);
-  const [goTiers, retTiers] = await Promise.all([
-    getRouteSeatTiersByDate(BUNDLE_ROUTE.origin, BUNDLE_ROUTE.destination, from, to, cabin, client),
-    getRouteSeatTiersByDate(BUNDLE_ROUTE.destination, BUNDLE_ROUTE.origin, retFrom, retTo, cabin, client),
-  ]);
+  const [goTiers, retTiers] = route
+    ? await Promise.all([
+        getRouteSeatTiersByDate(route.origin, route.destination, from, to, cabin, client),
+        getRouteSeatTiersByDate(route.destination, route.origin, retFrom, retTo, cabin, client),
+      ])
+    : [new Map<string, AvailabilityTier>(), new Map<string, AvailabilityTier>()];
 
   // ── 酒店：一次性拉 [from .. to+nights-1] 的逐晚余量，JS 内切每日窗口 ──────────
   // 最后一个出发日 to 的住宿窗口是 [to, to+nights)，最晚一晚 = to+nights-1。
@@ -265,14 +279,25 @@ export async function getBundleSellableDates(
       return { dateISO, sellable: false, reason: 'BLACKOUT', flightTier: null, hotelTier: null };
     }
 
-    // 2. 机票：去/回两段取更差一档
+    // 2. 没绑航班 = 没航线：整段区间不可售（优先于库存判定，因为根本无从判定）
+    if (!route) {
+      return {
+        dateISO,
+        sellable: false,
+        reason: 'NO_FLIGHT_BOUND',
+        flightTier: null,
+        hotelTier: null,
+      };
+    }
+
+    // 3. 机票：去/回两段取更差一档
     const goTier = goTiers.get(dateISO) ?? null;
     const retTier = retTiers.get(addDaysISO(dateISO, nights)) ?? null;
     const flightTier = worseFlightTier(goTier, retTier);
     const flightsOk =
       goTier !== null && goTier !== 'SOLD_OUT' && retTier !== null && retTier !== 'SOLD_OUT';
 
-    // 3. 酒店：整段最差一晚（未配置房控 hasBlock=false → 不拦截）
+    // 4. 酒店：整段最差一晚（未配置房控 hasBlock=false → 不拦截）
     let hotelTier: HotelAvailabilityTier | null = null;
     let hotelOk = true;
     if (hotelHasBlock) {

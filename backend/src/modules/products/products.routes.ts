@@ -265,7 +265,8 @@ export const productRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // 套餐机票参考价（ADMIN/STAFF）：按传入去/回程航班号取当前最低来回经济舱机票/人；
-  // 两者都空 = 按套餐航线兜底。后台套餐表单据此按「本套餐自己的绑定」实时反推想卖价↔折扣%，
+  // 某段没传航班号 → 该段无参考价（另一段 ×2 兜底），两段都没传 → null —— 航线由绑定航班派生，
+  // 不兜底到任何写死航线。后台套餐表单据此按「本套餐自己的绑定」实时反推想卖价↔折扣%，
   // 保证向导预览起价与卡片同源。静态路径注册在 /bundles/:id 之前，避免被参数路由吃掉。
   app.get('/bundles/flight-ref', adminPre, async (req) => {
     const binding = bundleFlightRefQuerySchema.parse(req.query);
