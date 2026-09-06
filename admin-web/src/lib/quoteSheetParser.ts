@@ -13,8 +13,10 @@
  */
 import type { SettlementTier } from './api';
 
-/** 地面套票一格：出发日 × 晚数 × 档次 → 每人结算价（CNY 整数）。 */
+/** 地面套票一格：航线 × 出发日 × 晚数 × 档次 → 每人结算价（CNY 整数）。 */
 export interface GroundQuoteEntry {
+  /** 航线键（如 MFM-DAD）：报价表里没有这一列，由页面先选航线再粘贴，解析时整批盖上 */
+  routeKey: string;
   departDate: string;
   nights: number;
   tier: SettlementTier;
@@ -156,10 +158,13 @@ function rawPreview(cells: string[]): string {
  * 只认「去程行」：同一行里同时有 晚数单元格 + 含航班号的航段单元格 + 可解析日期 + 至少一档数字价。
  * 四档价格列取航段列右侧连续 4 列，顺序固定；`/`、空、非数字的那一档直接跳过（不写、不清空既有值）。
  * 同一 (出发日, 晚数, 档次) 重复出现时取最后一次（报价表下方的修订覆盖上方）。
+ * routeKey：一张报价表只对应一条航线（运营在页面上先选航线再粘贴），解析出的每一格都盖上它——
+ * 后端写入必填航线，不传会被拒；报价表航段列里的航班号**不**用来反推航线（列序 / 写法不可靠）。
  */
 export function parseGroundQuoteSheet(
   text: string,
   baseMonth: string,
+  routeKey: string,
 ): QuoteSheetResult<GroundQuoteEntry> {
   const skipped: QuoteSheetSkippedRow[] = [];
   const byKey = new Map<string, GroundQuoteEntry>();
@@ -205,6 +210,7 @@ export function parseGroundQuoteSheet(
       if (price === null) return;
       hit += 1;
       byKey.set(`${date}__${nights}__${tier}`, {
+        routeKey,
         departDate: date,
         nights,
         tier,

@@ -2,11 +2,13 @@
  * 结算价日历 · ADMIN/STAFF — 运营维护「出发日期 × 晚数 × 酒店档次」的每人同业结算价（代理不可见）
  *
  * 数据源：backend/src/modules/settlement-rates/*
- *   GET    /settlement-rates?from&to&tier     网格查询（缺省 nights = 返回区间内全部晚数）
- *   PUT    /settlement-rates/batch            批量 upsert（整批保存 / Excel 粘贴块）
- *   DELETE /settlement-rates/:id              删除一格
+ *   GET    /settlement-rates/routes                 可维护航线（下拉，默认第一条；有价的线排前）
+ *   GET    /settlement-rates?routeKey&from&to&tier  网格查询（缺省 nights = 返回区间内全部晚数）
+ *   PUT    /settlement-rates/batch                  批量 upsert（整批保存 / Excel 粘贴块，每格带 routeKey）
+ *   DELETE /settlement-rates/:id                    删除一格
  *
- * 口径：选「起始日期 + 档次」→ 网格（行 = 起始日期起 31 天，列 = 晚数 1–5）。格子直接编辑、整批保存；
+ * 口径：选「航线 + 起始日期 + 档次」→ 网格（行 = 起始日期起 31 天，列 = 晚数 1–5）。每条航线一张独立网格；
+ * 格子直接编辑、整批保存；
  * 支持从 Excel 复制块状粘贴（tab/换行解析，与运营报价表「一个日期分几晚」逐列对应）；
  * 代理下套餐单时按去程出发日期 + 晚数 + 档次在此表自动取每人价。
  *
@@ -22,6 +24,7 @@ import {
   ApiError,
   type SettlementRate,
   type SettlementRateWriteEntry,
+  type SettlementRoute,
   type SettlementTier,
 } from '../lib/api';
 import {
@@ -69,6 +72,9 @@ export function SettlementRatesPage() {
   const [tab, setTab] = useState<RateTab>('GROUND');
   const [windowStart, setWindowStart] = useState<string>(() => todayYmd());
   const [tier, setTier] = useState<SettlementTier>(TIERS[0]);
+  // 航线：来自 /settlement-rates/routes，默认第一条（有价的线排前）；routes=null 还没加载完
+  const [routes, setRoutes] = useState<SettlementRoute[] | null>(null);
+  const [routeKey, setRouteKey] = useState<string | null>(null);
   const [rates, setRates] = useState<SettlementRate[]>([]);
   // 编辑草稿：cellKey → 输入框字符串（空串 = 清空该格）。整批保存时与已加载 rates 对比出增删改。
   const [draft, setDraft] = useState<Map<string, string>>(new Map());
@@ -101,15 +107,40 @@ export function SettlementRatesPage() {
     return rates.reduce((max, r) => (r.updatedAt > max ? r.updatedAt : max), rates[0].updatedAt);
   }, [rates]);
 
+  // 航线列表：进页拉一次，默认选第一条；为空 = 系统里还没有航班 / 套餐可派生出航线
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    api
+      .listSettlementRateRoutes(token)
+      .then((res) => {
+        if (cancelled) return;
+        setRoutes(res.routes);
+        setRouteKey((current) =>
+          current && res.routes.some((r) => r.routeKey === current)
+            ? current
+            : (res.routes[0]?.routeKey ?? null),
+        );
+      })
+      .catch((e: unknown) => {
+        if (cancelled) return;
+        setRoutes([]);
+        setError(e instanceof ApiError ? e.message : '航线列表加载失败');
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token]);
+
   const load = useCallback(async () => {
-    if (!token || days.length === 0) return;
+    if (!token || days.length === 0 || !routeKey) return;
     setLoading(true);
     setError(null);
     try {
       const from = days[0];
       const to = days[days.length - 1];
-      // 不传 nights：一次拉取当前显示范围内该档次下全部晚数（1–5 晚全列齐）
-      const res = await api.listSettlementRates(token, { from, to, tier });
+      // 不传 nights：一次拉取当前显示范围内该航线该档次下全部晚数（1–5 晚全列齐）
+      const res = await api.listSettlementRates(token, { routeKey, from, to, tier });
       setRates(res.rates);
       const next = new Map<string, string>();
       for (const r of res.rates) next.set(cellKey(r.departDate, r.nights), String(r.pricePerPersonCny));
@@ -119,12 +150,12 @@ export function SettlementRatesPage() {
     } finally {
       setLoading(false);
     }
-  }, [token, days, tier]);
+  }, [token, days, tier, routeKey]);
 
   useEffect(() => {
     void load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, windowStart, tier, nonce]);
+  }, [token, windowStart, tier, routeKey, nonce]);
 
   function setCell(date: string, nights: number, value: string) {
     setDraft((prev) => {
@@ -170,7 +201,7 @@ export function SettlementRatesPage() {
   }
 
   async function save() {
-    if (!token) return;
+    if (!token || !routeKey) return;
     setSaving(true);
     setError(null);
     setNotice(null);
@@ -192,7 +223,7 @@ export function SettlementRatesPage() {
           }
           // 仅提交新增/改动的格（幂等 upsert 也可，但少发无谓写）
           if (!existing || existing.pricePerPersonCny !== v) {
-            upserts.push({ tier, nights, departDate: date, pricePerPersonCny: v });
+            upserts.push({ routeKey, tier, nights, departDate: date, pricePerPersonCny: v });
           }
         }
       }
@@ -214,7 +245,9 @@ export function SettlementRatesPage() {
 
   /** 报价表整块粘贴 → 解析预览（纯前端，不写库；运营核对无误再点导入）。 */
   function previewQuoteSheet() {
-    setSheetParsed(parseGroundQuoteSheet(sheetText, windowStart.slice(0, 7)));
+    if (!routeKey) return;
+    // 报价表本身没有航线列：按当前选中的航线整批盖章（先选航线再粘）
+    setSheetParsed(parseGroundQuoteSheet(sheetText, windowStart.slice(0, 7), routeKey));
   }
 
   /**
@@ -222,7 +255,7 @@ export function SettlementRatesPage() {
    * 只写解析到的格，报价表里是「/」或空的档次不动既有值。
    */
   async function importQuoteSheet() {
-    if (!token || !sheetParsed || sheetParsed.entries.length === 0) return;
+    if (!token || !routeKey || !sheetParsed || sheetParsed.entries.length === 0) return;
     setImporting(true);
     setError(null);
     setNotice(null);
@@ -279,7 +312,7 @@ export function SettlementRatesPage() {
           <h1 className="page-title">结算价日历</h1>
           <p className="mt-1 text-xs text-ink-muted">
             {tab === 'GROUND'
-              ? '按「出发日期 × 晚数 × 酒店档次」维护每人同业结算价。代理下配了档次/晚数的套餐单时，系统按去程出发日期在此表自动取每人结算价（代理改不了）。'
+              ? '按「航线 × 出发日期 × 晚数 × 酒店档次」维护每人同业结算价。代理下配了档次/晚数的套餐单时，系统按套餐绑定航班的航线 + 去程出发日期在此表自动取每人结算价（代理改不了）；套餐没绑航班就没有航线，不取价。'
               : '按「出发日期 × 航班号」维护每人机票同业结算价（运营的机票报价表）。代理下纯机票单时，系统按各航段的航班号 + 出发日在此表自动取每人结算价（代理改不了）。'}
           </p>
         </div>
@@ -314,6 +347,25 @@ export function SettlementRatesPage() {
       <section className="card space-y-4">
         {/* 控制区：起始日期 + 窗口导航 + 档次（档次切换即换一张网格） */}
         <div className="flex flex-wrap items-end gap-4">
+          <div>
+            <label className="label">航线</label>
+            <select
+              className="input min-w-[170px]"
+              value={routeKey ?? ''}
+              disabled={dirty || !routes || routes.length === 0}
+              onChange={(e) => {
+                setRouteKey(e.target.value || null);
+                setSheetParsed(null); // 已解析的报价表是按旧航线盖的章，换线后必须重新解析
+              }}
+            >
+              {(routes ?? []).map((r) => (
+                <option key={r.routeKey} value={r.routeKey}>
+                  {r.origin} → {r.destination}
+                  {r.hasRates ? '' : '（暂无价）'}
+                </option>
+              ))}
+            </select>
+          </div>
           <div>
             <label className="label">起始日期</label>
             <input
@@ -456,7 +508,8 @@ export function SettlementRatesPage() {
             {sheetParsed && (
               <div className="space-y-2">
                 <div className="text-xs text-ink">
-                  解析出 <b className="tabular-nums">{sheetParsed.entries.length}</b> 条价格，跳过{' '}
+                  将写入航线 <b>{routeKey}</b>；解析出{' '}
+                  <b className="tabular-nums">{sheetParsed.entries.length}</b> 条价格，跳过{' '}
                   <b className="tabular-nums">{sheetParsed.skipped.length}</b> 行
                   {sheetOutsideWindow.past > 0 &&
                     `；其中 ${sheetOutsideWindow.past} 条为过去日期，已入库但日历不再展示`}
@@ -521,12 +574,18 @@ export function SettlementRatesPage() {
         </details>
 
         <p className="text-[11px] text-ink-muted">
-          提示：行 = 起始日期起 31 天，列 = 晚数（1–5晚），档次在上方切换。可从 Excel 复制一块「日期 ×
+          提示：航线与档次在上方切换（每条航线一张独立网格）；行 = 起始日期起 31 天，列 = 晚数（1–5晚）。可从 Excel 复制一块「日期 ×
           晚数」区域，选中起始格后直接粘贴（Ctrl/⌘+V）批量填充；清空格子并保存即删除该价。
         </p>
 
         {/* 网格：行 = 起始日期起 31 天，列 = 晚数（1–5晚）；档次由上方筛选器切换 */}
-        {loading ? (
+        {routes === null ? (
+          <div className="py-10 text-center text-sm text-ink-muted">加载航线…</div>
+        ) : routes.length === 0 ? (
+          <div className="rounded-md bg-amber-50 px-3 py-6 text-center text-sm text-amber-800 ring-1 ring-amber-200">
+            还没有可维护的航线：请先在「航班」建好航班（或给套餐绑定航班），航线会自动出现在上方下拉里。
+          </div>
+        ) : loading ? (
           <div className="py-10 text-center text-sm text-ink-muted">加载中…</div>
         ) : (
           <div className="overflow-x-auto">

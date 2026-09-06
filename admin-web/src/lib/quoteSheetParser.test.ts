@@ -9,6 +9,9 @@
 import { describe, it, expect } from 'vitest';
 import { parseGroundQuoteSheet, parseOtaQuoteSheet, parseQuoteDate } from './quoteSheetParser';
 
+/** 报价表没有航线列：页面先选航线再粘贴，解析出的每格都盖这条航线。 */
+const ROUTE = 'MFM-DAD';
+
 /** 一行：单元格用制表符连接（Excel 复制出来就是这个形状）。 */
 const row = (...cells: string[]): string => cells.join('\t');
 const sheet = (...lines: string[]): string => lines.join('\n');
@@ -44,7 +47,7 @@ const GROUND_SAMPLE = sheet(
 
 describe('parseGroundQuoteSheet 套票报价表', () => {
   it('只认去程行：公告行 / 表头行 / 回程行 / 空行都不产生条目也不进跳过清单', () => {
-    const { entries, skipped } = parseGroundQuoteSheet(GROUND_SAMPLE, '2026-08');
+    const { entries, skipped } = parseGroundQuoteSheet(GROUND_SAMPLE, '2026-08', ROUTE);
 
     expect(skipped).toEqual([]);
     // 3 个去程行：1晚/2晚 各命中 2 档（后两档是「/」），3晚 命中 4 档 → 8 条
@@ -52,22 +55,22 @@ describe('parseGroundQuoteSheet 套票报价表', () => {
   });
 
   it('四档价格按固定列序落到档次，「/」与空列跳过不写', () => {
-    const { entries } = parseGroundQuoteSheet(GROUND_SAMPLE, '2026-08');
+    const { entries } = parseGroundQuoteSheet(GROUND_SAMPLE, '2026-08', ROUTE);
 
     expect(entries.filter((e) => e.nights === 1)).toEqual([
-      { departDate: '2026-08-07', nights: 1, tier: 'CITY_3STAR', pricePerPersonCny: 1368 },
-      { departDate: '2026-08-07', nights: 1, tier: 'CITY_4STAR', pricePerPersonCny: 1418 },
+      { routeKey: ROUTE, departDate: '2026-08-07', nights: 1, tier: 'CITY_3STAR', pricePerPersonCny: 1368 },
+      { routeKey: ROUTE, departDate: '2026-08-07', nights: 1, tier: 'CITY_4STAR', pricePerPersonCny: 1418 },
     ]);
     expect(entries.filter((e) => e.nights === 3)).toEqual([
-      { departDate: '2026-08-07', nights: 3, tier: 'CITY_3STAR', pricePerPersonCny: 2288 },
-      { departDate: '2026-08-07', nights: 3, tier: 'CITY_4STAR', pricePerPersonCny: 2358 },
-      { departDate: '2026-08-07', nights: 3, tier: 'CITY_5STAR', pricePerPersonCny: 2988 },
-      { departDate: '2026-08-07', nights: 3, tier: 'INTL_5STAR', pricePerPersonCny: 3688 },
+      { routeKey: ROUTE, departDate: '2026-08-07', nights: 3, tier: 'CITY_3STAR', pricePerPersonCny: 2288 },
+      { routeKey: ROUTE, departDate: '2026-08-07', nights: 3, tier: 'CITY_4STAR', pricePerPersonCny: 2358 },
+      { routeKey: ROUTE, departDate: '2026-08-07', nights: 3, tier: 'CITY_5STAR', pricePerPersonCny: 2988 },
+      { routeKey: ROUTE, departDate: '2026-08-07', nights: 3, tier: 'INTL_5STAR', pricePerPersonCny: 3688 },
     ]);
   });
 
   it('去程行的日期取自出发日列，回程行不会覆盖出发日', () => {
-    const { entries } = parseGroundQuoteSheet(GROUND_SAMPLE, '2026-08');
+    const { entries } = parseGroundQuoteSheet(GROUND_SAMPLE, '2026-08', ROUTE);
 
     expect(entries.every((e) => e.departDate === '2026-08-07')).toBe(true);
   });
@@ -78,7 +81,7 @@ describe('parseGroundQuoteSheet 套票报价表', () => {
       row('2026-08-07', '1晚', '星期五', '16:40-17:35', 'QH9589澳门-岘港', '/', '/', '/', '/', '售罄', ''),
     );
 
-    const { entries, skipped } = parseGroundQuoteSheet(text, '2026-08');
+    const { entries, skipped } = parseGroundQuoteSheet(text, '2026-08', ROUTE);
 
     expect(entries).toEqual([]);
     expect(skipped).toHaveLength(1);
@@ -89,7 +92,7 @@ describe('parseGroundQuoteSheet 套票报价表', () => {
   it('晚数超出 1–5 晚的行进跳过清单', () => {
     const text = row('2026-08-07', '7晚', '星期五', '16:40-17:35', 'QH9589澳门-岘港', '3888', '', '', '');
 
-    const { entries, skipped } = parseGroundQuoteSheet(text, '2026-08');
+    const { entries, skipped } = parseGroundQuoteSheet(text, '2026-08', ROUTE);
 
     expect(entries).toEqual([]);
     expect(skipped[0].reason).toContain('超出可维护范围');
@@ -101,7 +104,7 @@ describe('parseGroundQuoteSheet 套票报价表', () => {
       row('1/5', '1晚', '星期一', '16:40-17:35', 'QH9589澳门-岘港', '1568', '', '', ''),
     );
 
-    const { entries } = parseGroundQuoteSheet(text, '2026-08');
+    const { entries } = parseGroundQuoteSheet(text, '2026-08', ROUTE);
 
     expect(entries.map((e) => e.departDate)).toEqual(['2026-08-12', '2027-01-05']);
   });
@@ -112,23 +115,23 @@ describe('parseGroundQuoteSheet 套票报价表', () => {
       row('2026-08-07', '1晚', '星期五', '16:40-17:35', 'QH9589澳门-岘港', '1288', '', '', ''),
     );
 
-    const { entries } = parseGroundQuoteSheet(text, '2026-08');
+    const { entries } = parseGroundQuoteSheet(text, '2026-08', ROUTE);
 
     expect(entries).toEqual([
-      { departDate: '2026-08-07', nights: 1, tier: 'CITY_3STAR', pricePerPersonCny: 1288 },
+      { routeKey: ROUTE, departDate: '2026-08-07', nights: 1, tier: 'CITY_3STAR', pricePerPersonCny: 1288 },
     ]);
   });
 
   it('价格带 ¥ 与千分位逗号照样识别', () => {
     const text = row('2026-08-07', '1晚', '星期五', '16:40-17:35', 'QH9589澳门-岘港', '¥1,368', '', '', '');
 
-    const { entries } = parseGroundQuoteSheet(text, '2026-08');
+    const { entries } = parseGroundQuoteSheet(text, '2026-08', ROUTE);
 
     expect(entries[0].pricePerPersonCny).toBe(1368);
   });
 
   it('空文本安全返回空结果', () => {
-    expect(parseGroundQuoteSheet('', '2026-08')).toEqual({ entries: [], skipped: [] });
+    expect(parseGroundQuoteSheet('', '2026-08', ROUTE)).toEqual({ entries: [], skipped: [] });
   });
 });
 

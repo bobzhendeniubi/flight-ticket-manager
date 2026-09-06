@@ -666,7 +666,7 @@ function AgentExclusiveDiscounts({ agent }: { agent: AgentListItem }) {
         <div className="mt-2 space-y-1.5">
           {rules.map((rule) => (
             <div key={rule.id} className="grid grid-cols-[1fr_auto] gap-x-3 text-xs text-slate-700">
-              <span>{DISCOUNT_TIER_LABEL[rule.tier]} · {rule.nights}晚 · {rule.startDate} 至 {rule.endDate}</span>
+              <span>{rule.routeKey} · {DISCOUNT_TIER_LABEL[rule.tier]} · {rule.nights}晚 · {rule.startDate} 至 {rule.endDate}</span>
               <span className="font-semibold tabular-nums text-indigo-800">−¥{rule.discountPerPersonCny}/人</span>
             </div>
           ))}

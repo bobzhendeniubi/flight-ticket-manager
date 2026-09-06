@@ -26,6 +26,7 @@ import { useDebouncedValue } from '../lib/useDebouncedValue';
 import { useFlightSearchCache, type FlightLeg } from '../lib/useFlightSearchCache';
 import { useHotelAvailability } from '../lib/useHotelAvailability';
 import { useBundleSellableDates } from '../lib/useBundleSellableDates';
+import { bundleRouteKey } from '../lib/bundleRoute';
 import {
   computeRoomsNeeded,
   resolveRoomCapacity,
@@ -319,14 +320,17 @@ function BundleDetailContent({
 
   // 公开散客优惠：按选定出发日查询；请求失败由详情页按 0 兜底，不阻塞浏览。
   const [retailDiscountPerPersonCny, setRetailDiscountPerPersonCny] = useState(0);
+  // 航线从套餐绑定航班派生（与后端同口径）：没绑航班 = 没有航线 = 没有散客立减，不去问
+  const retailRouteKey = bundleRouteKey(b);
   useEffect(() => {
-    if (!b.settlementTier || b.settlementNights == null || !goDate) {
+    if (!b.settlementTier || b.settlementNights == null || !goDate || !retailRouteKey) {
       setRetailDiscountPerPersonCny(0);
       return;
     }
     let cancelled = false;
     setRetailDiscountPerPersonCny(0);
     api.getRetailSettlementDiscount({
+      routeKey: retailRouteKey,
       tier: b.settlementTier,
       nights: b.settlementNights,
       departDate: goDate,
@@ -334,7 +338,7 @@ function BundleDetailContent({
       if (!cancelled) setRetailDiscountPerPersonCny(result?.discountPerPersonCny ?? 0);
     });
     return () => { cancelled = true; };
-  }, [b.settlementNights, b.settlementTier, goDate]);
+  }, [b.settlementNights, b.settlementTier, goDate, retailRouteKey]);
 
   // 套餐 add-on 报价（server-priced，后端返回 number）+ 计费航段数
   const singleSupp = b.singleSupplementCnyPerNight != null ? num(b.singleSupplementCnyPerNight) : null;

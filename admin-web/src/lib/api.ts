@@ -3008,12 +3008,23 @@ export interface Bundle {
   createdAt: string;
 }
 
-// ── 结算价日历（ADMIN/STAFF）— 出发日期 × 晚数 × 酒店档次 → 每人结算价 ─────
+// ── 结算价日历（ADMIN/STAFF）— 航线 × 出发日期 × 晚数 × 酒店档次 → 每人结算价 ─
 // 与 backend/src/modules/settlement-rates/* 对齐
 export type SettlementTier = 'CITY_3STAR' | 'CITY_4STAR' | 'CITY_5STAR' | 'INTL_5STAR';
 
+/** 可维护的航线（GET /settlement-rates/routes）：routeKey = 去程方向「起飞-到达」机场码，如 MFM-DAD */
+export interface SettlementRoute {
+  routeKey: string;
+  origin: string;
+  destination: string;
+  /** 日历里已有该航线的价（运营正在用的线排前面） */
+  hasRates: boolean;
+}
+
 export interface SettlementRate {
   id: string;
+  /** 航线键（如 MFM-DAD）；读写必填，后端不默认航线 */
+  routeKey: string;
   tier: SettlementTier;
   nights: number;
   /** 去程出发日期（YYYY-MM-DD） */
@@ -3028,6 +3039,7 @@ export interface SettlementRate {
 
 /** 批量 upsert 一格（网格整批保存 / Excel 粘贴块） */
 export interface SettlementRateWriteEntry {
+  routeKey: string;
   tier: SettlementTier;
   nights: number;
   departDate: string;
@@ -3041,6 +3053,8 @@ export type SettlementDiscountKind = 'AGENT' | 'AGENT_DEFAULT' | 'RETAIL';
 
 export interface SettlementDiscountRule {
   id: string;
+  /** 航线键（如 MFM-DAD）：规则按航线隔离，是身份列（已落库不可改） */
+  routeKey: string;
   kind: SettlementDiscountKind;
   agentId: string | null;
   tier: SettlementTier;
@@ -3056,6 +3070,7 @@ export interface SettlementDiscountRule {
 
 export interface SettlementDiscountWriteEntry {
   id?: string;
+  routeKey: string;
   kind: SettlementDiscountKind;
   agentId?: string;
   tier: SettlementTier;
@@ -6446,12 +6461,15 @@ export const api = {
   getHotelRecentChanges: (token: string, days = 7) =>
     apiFetch<HotelRecentRoomChanges>(`/hotel-control/recent-changes?days=${days}`, { token }),
 
-  // ── 结算价日历（ADMIN/STAFF）— 出发日期 × 晚数 × 档次网格 ────────────────
+  // ── 结算价日历（ADMIN/STAFF）— 航线 × 出发日期 × 晚数 × 档次网格 ────────
+  /** 可维护航线（日历页 / 立减页的航线下拉），有价的线排前面 */
+  listSettlementRateRoutes: (token: string) =>
+    apiFetch<{ routes: SettlementRoute[] }>('/settlement-rates/routes', { token }),
   listSettlementRates: (
     token: string,
-    params: { from: string; to: string; nights?: number; tier?: SettlementTier },
+    params: { routeKey: string; from: string; to: string; nights?: number; tier?: SettlementTier },
   ) => {
-    const qs = new URLSearchParams({ from: params.from, to: params.to });
+    const qs = new URLSearchParams({ routeKey: params.routeKey, from: params.from, to: params.to });
     if (params.nights != null) qs.set('nights', String(params.nights));
     if (params.tier) qs.set('tier', params.tier);
     return apiFetch<{ rates: SettlementRate[] }>(`/settlement-rates?${qs.toString()}`, { token });
@@ -6469,6 +6487,8 @@ export const api = {
   listSettlementDiscounts: (
     token: string,
     query?: {
+      /** 缺省 = 全部航线（代理详情页看跨航线的专属规则） */
+      routeKey?: string;
       kind?: SettlementDiscountKind;
       agentId?: string;
       tier?: SettlementTier;

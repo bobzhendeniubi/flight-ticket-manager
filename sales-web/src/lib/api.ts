@@ -1302,13 +1302,19 @@ export const api = {
   listTransfers: () => apiFetch<{ transfers: Transfer[] }>('/products/transfers?active=1'),
   listVisas: () => apiFetch<{ visas: Visa[] }>('/products/visas?active=1'),
   listBundles: () => apiFetch<{ bundles: Bundle[] }>('/products/bundles?active=1'),
-  /** 散客套餐详情按出发日查询的公开优惠金额；失败返回 null，由调用方按场景兜底。 */
+  /**
+   * 散客套餐详情按出发日查询的公开优惠金额；失败返回 null，由调用方按场景兜底。
+   * routeKey 必填（后端按航线隔离规则，不传 400）：由 lib/bundleRoute 从套餐绑定航班派生，
+   * 派生不到（套餐没绑航班）就不要来问——没有航线就没有立减。
+   */
   getRetailSettlementDiscount: async (params: {
+    routeKey: string;
     tier: SettlementTier;
     nights: number;
     departDate: string;
   }): Promise<{ discountPerPersonCny: number } | null> => {
     const qs = new URLSearchParams({
+      routeKey: params.routeKey,
       tier: params.tier,
       nights: String(params.nights),
       departDate: params.departDate,

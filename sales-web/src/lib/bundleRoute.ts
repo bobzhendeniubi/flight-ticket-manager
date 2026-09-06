@@ -8,8 +8,11 @@
  *   · 两段都没绑 → null。
  *
  * null **绝不兜底到某条写死航线**：没航线的套餐查不了航段余位，服务端也会把整段可售日期判成
- * 不可售（reason='NO_FLIGHT_BOUND'）。公司第二条航线在即，兜底就意味着新航线的套餐会静默
- * 按老航线查余位、显示老航线的票价。
+ * 不可售（reason='NO_FLIGHT_BOUND'）；散客立减也不去问（后端按航线隔离规则，不接受缺省航线）。
+ * 公司第二条航线在即，兜底就意味着新航线的套餐会静默按老航线查余位、显示老航线的票价。
+ *
+ * routeKey = 去程方向「起飞-到达」机场码（如 MFM-DAD），只用于向 /settlement-discounts/retail-quote
+ * 报航线；权威定价仍在服务端。
  */
 
 export interface BundleRouteFlightLike {
@@ -21,6 +24,10 @@ export interface BundleRouteBundleLike {
   outboundFlight?: BundleRouteFlightLike | null;
   returnFlight?: BundleRouteFlightLike | null;
 }
+
+/** 与后端同名的别名，方便按后端口径书写。 */
+export type RouteFlightLike = BundleRouteFlightLike;
+export type RouteBundleLike = BundleRouteBundleLike;
 
 export interface BundleRoute {
   origin: string;
@@ -44,4 +51,10 @@ export function resolveBundleRoute(bundle: BundleRouteBundleLike): BundleRoute |
   if (retOrigin && retDest) return { origin: retDest, destination: retOrigin };
 
   return null;
+}
+
+/** `${origin}-${destination}`（如 MFM-DAD）；没绑航班 → null。 */
+export function bundleRouteKey(bundle: BundleRouteBundleLike): string | null {
+  const route = resolveBundleRoute(bundle);
+  return route ? `${route.origin}-${route.destination}` : null;
 }
