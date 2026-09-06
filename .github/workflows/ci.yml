@@ -5,6 +5,9 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
+  # e2e 只手动触发（见下面的 e2e job）——它要起 Postgres + Redis + 两个 dev server，
+  # 不该拖慢每次 push 的常规闸。
+  workflow_dispatch:
 
 jobs:
   build-and-test:
@@ -106,3 +109,74 @@ jobs:
           REDIS_URL: redis://localhost:6379
           JWT_ACCESS_SECRET: ci-only-dummy-access-secret-0123456789ab
           JWT_REFRESH_SECRET: ci-only-dummy-refresh-secret-0123456789a
+
+  # ── e2e（Playwright）──────────────────────────────────────────────
+  # 只手动触发（Actions 页 → CI → Run workflow）。发版前跑一次；
+  # 常规 push/PR 不带它，免得每次提交都等 Postgres + 两个 dev server 起来。
+  e2e:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ftm
+          POSTGRES_PASSWORD: ftm_dev_password
+          POSTGRES_DB: ftm_e2e
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U ftm"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        # 全局限流器挂在 Redis 上，缺了它每个请求都会失败——e2e 必须真起一个
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      E2E_DATABASE_URL: postgresql://ftm:ftm_dev_password@127.0.0.1:5432/ftm_e2e?schema=public
+      REDIS_URL: redis://127.0.0.1:6379
+      JWT_ACCESS_SECRET: ci-only-dummy-access-secret-0123456789ab
+      JWT_REFRESH_SECRET: ci-only-dummy-refresh-secret-0123456789a
+      PAYMENT_MODE: sandbox
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install (workspaces)
+        run: npm ci
+
+      - name: Prisma generate
+        run: npm run prisma:generate
+
+      # CI 上要连系统依赖一起装（本地 npm run e2e:install 不带 --with-deps，免得要 sudo）
+      - name: Install Playwright chromium
+        run: npx playwright install --with-deps chromium
+        working-directory: e2e
+
+      # 迁移 + seed 由 e2e 的 globalSetup 负责（含「库名必须含 e2e/test」的护栏）
+      - name: Run e2e
+        run: npm run e2e
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            e2e/playwright-report
+            e2e/test-results
+          retention-days: 7
