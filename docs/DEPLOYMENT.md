@@ -171,7 +171,19 @@ backend 应暴露 `/metrics` (Prometheus 格式)。关键指标：
 
 ## 回滚方案
 
-发版后发现严重 bug：
-1. `docker-compose -f docker-compose.prod.yml pull previous-tag` 或 `git checkout <prev>`
-2. `docker-compose -f docker-compose.prod.yml up -d --force-recreate backend worker`
-3. 如果是 DB migration 问题：先 `npx prisma migrate resolve --rolled-back <migration_name>`，再跑回滚脚本
+实际两套环境（实测 `/opt/ftm` / 测试 `/opt/ftm-staging`）的发版都走
+`infra/deploy.sh`，镜像按 git short sha 打 tag（`ftm-<svc>:<sha>`），发版后
+自动跑 `infra/smoke.sh` 冒烟，冒烟失败会自动回滚——细节见
+`infra/README-environments.md` 的「发版 / 回滚 / 冒烟」几节。这里只记要点：
+
+发版后发现严重 bug，手动回滚：
+```bash
+# 不传 tag = 回到 .deploy-history 里上一条成功记录；只切镜像、不 build、不拉代码
+/opt/ftm/infra/deploy.sh rollback prod
+/opt/ftm-staging/infra/deploy.sh rollback staging <tag>
+```
+
+**回滚不回退数据库迁移。** 如果目标 tag 之后有新迁移，命令会自动比对
+`backend/prisma/migrations/` 目录并拒绝执行，除非确认这些迁移不影响旧代码后
+显式加 `--force`。真要撤销一个有破坏性的迁移（删列/改类型这类），得先手工写
+好对应的 down SQL 在库里跑，回滚命令本身不处理迁移回退。
