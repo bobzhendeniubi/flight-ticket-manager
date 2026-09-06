@@ -17,6 +17,11 @@ import type { Capability } from './capabilities';
  * 本文件下面的接口还要用这些类型，光 re-export 不进本地作用域。
  */
 import type {
+  CreateChildAgentBody,
+  CreatePaymentChannelInput as ContractCreatePaymentChannelInput,
+  SuggestMatchesInput,
+  UpdateAgentBody,
+  UpdatePaymentChannelInput as ContractUpdatePaymentChannelInput,
   FareBucket as ContractFareBucket,
   PriceAdjustmentReason as ContractPriceAdjustmentReason,
   ProductKind as ContractProductKind,
@@ -1072,33 +1077,12 @@ export interface AgentListItem {
   orderCount: number;
 }
 
-export interface CreateChildAgentInput {
-  email: string;
-  password: string;
-  displayName: string;
-  contactName: string;
-  contactPhone: string;
-  companyName?: string;
-  // 不含 prepaymentBalance：建代理余额恒为 0，事后走认款通道（有流水+审计）产生。
-  notes?: string;
-  /** 名单格式绑定（可选） */
-  rosterFormat?: RosterFormat | null;
-  /** 识别词条（每条 ≤20 字，最多 10 条；服务端全局查重） */
-  rosterKeywords?: string[];
-}
+/** POST /agents/children body —— 取契约包那份，字段与后端 zod 逐字同源。 */
+export type CreateChildAgentInput = CreateChildAgentBody;
 
 /** PATCH /agents/:id 请求体：所有字段可选，至少传一个 */
-export interface UpdateAgentInput {
-  companyName?: string;
-  contactName?: string;
-  contactPhone?: string;
-  email?: string;
-  notes?: string;
-  /** 名单格式绑定；null = 清除登记 */
-  rosterFormat?: RosterFormat | null;
-  /** 识别词条（每条 ≤20 字，最多 10 条；服务端全局查重） */
-  rosterKeywords?: string[];
-}
+/** PATCH /agents/:id body（PATCH 语义，至少传一个字段）—— 取契约包那份。 */
+export type UpdateAgentInput = UpdateAgentBody;
 
 // ── 切位（包位）── 与 backend seat-allocation 模块对齐
 
@@ -3874,12 +3858,8 @@ export interface ReceiptMatchSuggestResult {
 }
 
 /** POST /receipts/match/suggest body */
-export interface ReceiptMatchSuggestInput {
-  /** 缺省 = 全部未认完的流水导入 / 运营水单登记；给了则只算这些（≤ 1000） */
-  receiptIds?: string[];
-  /** 候选订单按下单时间回看天数（默认 90，≤ 365） */
-  sinceDays?: number;
-}
+/** POST /receipts/match/suggest body —— 取契约包那份。 */
+export type ReceiptMatchSuggestInput = SuggestMatchesInput;
 
 /** POST /receipts body（后台登记新进账） */
 export interface CreateReceiptInput {
@@ -7597,8 +7577,9 @@ export type PaymentChannelWithAgent = PaymentChannel & {
 };
 
 /** CreatePaymentChannelInput / UpdatePaymentChannelInput 的 agentId 扩展（同上，独立叠加不改原类型）。 */
-export type CreatePaymentChannelWithAgentInput = CreatePaymentChannelInput & { agentId?: string };
-export type UpdatePaymentChannelWithAgentInput = UpdatePaymentChannelInput & { agentId?: string | null };
+// 契约包那份本来就带 agentId（专属代理收款码），不用再自己交叉一层。
+export type CreatePaymentChannelWithAgentInput = ContractCreatePaymentChannelInput;
+export type UpdatePaymentChannelWithAgentInput = ContractUpdatePaymentChannelInput;
 
 export const agentRechargeApi = {
   /** 提交认款申请（AGENT 为自己；ADMIN/STAFF 需在 body 里指定 agentId） */
