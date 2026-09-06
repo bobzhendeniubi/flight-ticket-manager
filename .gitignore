@@ -1,5 +1,3 @@
-
-!.env.example
 # Build outputs
 # CDK
 # Coverage
@@ -23,6 +21,12 @@
 .cache/
 .docker/
 .env
+# C-19：挡住所有 .env 变体（含服务器上的 .env.prod / .env.staging，此前只挡了 .env 和 .env.*.local，
+# 服务器 git add -A 会把生产密钥带进仓库）；两条 example 模板要继续可追踪，负向规则必须排在
+# .env.* 之后（gitignore 按文件内顺序取最后一条匹配规则，放前面会被后面的 .env.* 覆盖回「忽略」）。
+.env.*
+!.env.example
+!.env.*.example
 .env.*.local
 .env.local
 .idea/

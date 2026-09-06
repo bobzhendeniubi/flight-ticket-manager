@@ -64,11 +64,30 @@ echo "▶ 构建并重启…"
 "${COMPOSE[@]}" up -d --build "${SERVICES[@]}"
 
 echo "▶ 等待健康…"
+backend_healthy=false
 for _ in $(seq 1 60); do
-  "${COMPOSE[@]}" ps --format '{{.Service}} {{.Status}}' | grep -q '^backend Up.*healthy' && break
+  if "${COMPOSE[@]}" ps --format '{{.Service}} {{.Status}}' | grep -q '^backend Up.*healthy'; then
+    backend_healthy=true
+    break
+  fi
   sleep 3
 done
 "${COMPOSE[@]}" ps --format '  {{.Service}}\t{{.Status}}'
+
+# C-21：原脚本等待超时只是跳出循环、照样打「✓ 完成」——发坏了也显示成功，
+# 没人会去翻日志。改成健康检查不过就失败退出，把「读日志排障」的动作前移到部署现场；
+# 不做自动回滚（保持脚本简单可预测），回滚交给人工确认后手动执行。
+if [ "$backend_healthy" != true ]; then
+  echo "✗ backend 未在 180 秒内转为 healthy，发版判定失败" >&2
+  echo "▶ 容器状态：" >&2
+  "${COMPOSE[@]}" ps >&2
+  echo "▶ backend 最近 50 行日志：" >&2
+  "${COMPOSE[@]}" logs --tail 50 backend >&2
+  echo "▶ 回滚：确认上一个可用 commit 后手动执行：" >&2
+  echo "    git log --oneline -5   # 找回滚目标 commit" >&2
+  echo "    git checkout <commit> && ${COMPOSE[*]} up -d --build ${SERVICES[*]}" >&2
+  exit 1
+fi
 
 # 只删没有任何容器引用的镜像；运行中的镜像碰不到。
 # 两套环境共用一个 docker 守护进程，这里清的是全机的，不分环境。

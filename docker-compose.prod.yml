@@ -15,7 +15,6 @@
 # 必填 env（.env.prod）：
 #   POSTGRES_PASSWORD       数据库密码
 #   JWT_ACCESS_SECRET       JWT access 令牌密钥（>32 字符）
-#   JWT_REFRESH_SECRET      JWT refresh 密钥
 #   SANDBOX_WEBHOOK_SECRET  支付沙箱 secret
 #   PAYMENT_MODE            sandbox | live
 #   CORS_ORIGINS            https://sales.citur.com,https://admin.citur.com
@@ -83,7 +82,6 @@ services:
       DATABASE_URL: postgresql://ftm:${POSTGRES_PASSWORD}@postgres:5432/ftm?schema=public
       REDIS_URL: redis://redis:6379
       JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET:?must set JWT_ACCESS_SECRET}
-      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET:?must set JWT_REFRESH_SECRET}
       JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-900}
       JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-604800}
       CORS_ORIGINS: ${CORS_ORIGINS:-https://sales.citur.com,https://admin.citur.com}
@@ -105,7 +103,10 @@ services:
       ALIPAY_SIGN_TYPE: ${ALIPAY_SIGN_TYPE:-RSA2}
       ALIPAY_GATEWAY: ${ALIPAY_GATEWAY:-https://openapi.alipay.com/gateway.do}
       SANDBOX_WEBHOOK_SECRET: ${SANDBOX_WEBHOOK_SECRET:-sandbox-test-secret}
-      ENABLE_AUTO_FULFILLMENT: ${ENABLE_AUTO_FULFILLMENT:-true}
+      # B-5：这是 mock 履约——worker 会伪造酒店确认号（HTL-xxxx）、随机派司机名，不是真的订了房/叫了车。
+      # 开着它会让房控/接送看板的「待处理」被自动清空，运营误以为已经订好了。默认关闭；
+      # 只在演示/测试环境需要「假装全自动」时显式设 true，生产环境不得开启。
+      ENABLE_AUTO_FULFILLMENT: ${ENABLE_AUTO_FULFILLMENT:-false}
       # ── OpenAI（AI 助手）── 没设 OPENAI_API_KEY 时 backend 自动 mock 模式
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
@@ -143,13 +144,13 @@ services:
       # 中央 env validator 也对 worker 生效，下面这些是它强制要求的（即使 worker 不直接用 JWT/CORS）
       CORS_ORIGINS: ${CORS_ORIGINS}
       JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
-      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
       JWT_ACCESS_TTL: ${JWT_ACCESS_TTL:-900}
       JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-604800}
       APP_PUBLIC_URL: ${APP_PUBLIC_URL:?must set APP_PUBLIC_URL}
       PAYMENT_MODE: ${PAYMENT_MODE:?must set PAYMENT_MODE}
       SANDBOX_WEBHOOK_SECRET: ${SANDBOX_WEBHOOK_SECRET:-sandbox-test-secret}
-      ENABLE_AUTO_FULFILLMENT: ${ENABLE_AUTO_FULFILLMENT:-true}
+      # B-5：与 backend 保持一致——mock 履约默认关闭，生产环境不得开启（见上方 backend 服务同名变量的注释）。
+      ENABLE_AUTO_FULFILLMENT: ${ENABLE_AUTO_FULFILLMENT:-false}
     command: ["node", "dist/queues/worker.js"]
     # worker 不开 HTTP，必须屏蔽镜像里 backend 的 HEALTHCHECK（curl :4000 永远失败）
     healthcheck:
