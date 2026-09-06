@@ -156,6 +156,7 @@ import {
   assertNoVisaContradiction,
   DERIVABLE_TASK_STATUSES,
   orderVisaDeclarationEvent,
+  ourVisaPassengersWhere,
   rederiveVisaTaskStatus,
   resetVisaTaskProgress,
   transitionPassengerVisa,
@@ -15844,6 +15845,18 @@ export class OrderService {
             severity: AuditSeverity.CRITICAL,
           });
         }
+        // 订单级办结派生对齐（两侧各一次，事务外，与其它写送签进度的路径同一调用点约定）：
+        // 名单一分为二后「非自备签乘客是否全部已送签」两侧各自重算——拆出去的两位已送签的人
+        // 在新单上就该自动办结；源单若是派生办结写的已签证、剩下的人还没送出去则对称回退。
+        // 幂等，重复调用零副作用。
+        await syncOrderVisaCompletion(outcome.result.sourceOrderId, {
+          userId: actor.userId,
+          role: actor.role,
+        });
+        await syncOrderVisaCompletion(outcome.result.targetOrderId, {
+          userId: actor.userId,
+          role: actor.role,
+        });
         return outcome.result;
       } catch (err) {
         if (isUniqueViolation(err, 'orderNumber')) {
@@ -16505,6 +16518,23 @@ export class OrderService {
       splitNote: `由订单 ${order.orderNumber} 拆分创建`,
       actor: { userId: actor.userId, role: actor.role },
     });
+    // 9d. 签证任务状态按**两侧各自的乘客**重派生（拆单审计 #5）：9b/9c 只把源任务的旧聚合状态
+    //   原样镜像给新单，可任务级状态 = 该单非自备签乘客送签进度的最低档 —— 名单一分为二，
+    //   两侧的最低档都可能变（两位已送签的人拆出去，新单该是「已送签」、源单剩下的人才是「待处理」）。
+    //   送签进度随人搬家（乘客保 id 整行移动），这里只按各自名单把任务级状态派生回来；
+    //   touch 用签证台同一口径（三档都可改写，CANCELLED/FAILED 永不复活）。
+    //   一侧再没有要我方送签的人（全员自备签 / 全搬走）→ 不碰它的任务（无人可派生，留给任务有无同步）。
+    for (const sideOrderId of [orderId, target.id]) {
+      const ours = await tx.passenger.findMany({
+        where: ourVisaPassengersWhere(sideOrderId),
+        select: { visaSubmissionStatus: true },
+      });
+      if (ours.length === 0) continue;
+      await rederiveVisaTaskStatus(tx, sideOrderId, {
+        touch: DERIVABLE_TASK_STATUSES,
+        statuses: ours.map((p) => p.visaSubmissionStatus),
+      });
+    }
     await syncOrderHasReturnLeg(tx, orderId);
     await syncOrderLegFlag(tx, orderId);
     await syncOrderHasReturnLeg(tx, target.id);
@@ -21429,6 +21459,12 @@ async function mirrorTicketingTasksForSplit(
       notes: true,
       startedAt: true,
       completedAt: true,
+      // 签证任务的成本三字段 + 签证公司是**人均**口径：签证行按人头劈开，新单那份人均成本与源单同值，
+      // 不镜像过去财务在新单上就对不出这笔签证费属于哪家（与 9c 承接口径一致）。
+      visaUnitCostUsd: true,
+      visaFxRate: true,
+      visaUnitCostCny: true,
+      visaSupplier: true,
     },
   });
   // 按 (源行, 类型) 索引：一条行上可能同时挂着出票与签证任务，只按行取会串类型。
@@ -21444,6 +21480,14 @@ async function mirrorTicketingTasksForSplit(
         notes: [source.notes?.trim() || null, input.splitNote].filter(Boolean).join(' · '),
         startedAt: source.startedAt,
         completedAt: source.completedAt,
+        ...(pair.type === FulfillmentType.VISA_APPLICATION
+          ? {
+              visaUnitCostUsd: source.visaUnitCostUsd,
+              visaFxRate: source.visaFxRate,
+              visaUnitCostCny: source.visaUnitCostCny,
+              visaSupplier: source.visaSupplier,
+            }
+          : {}),
       },
     });
   }
