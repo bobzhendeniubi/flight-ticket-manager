@@ -18,7 +18,7 @@ import {
   SeatLockStatus,
   UserRole,
 } from '@prisma/client';
-import { randomInt } from 'node:crypto';
+import { createHash, randomInt } from 'node:crypto';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import { writeAudit } from '../../lib/audit.js';
@@ -29,6 +29,7 @@ import { PaymentsService } from '../payments/payments.service.js';
 import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
 import {
   attributableReceivedCny,
+  conversionCarryCny,
   holdLedgerTotals,
   perSeatAttributableCny,
   rebaseInstallmentsForRemainingSeats,
@@ -284,6 +285,17 @@ async function availableSeatsForHold(tx: Tx, hold: { seatClassId: string }, seat
   });
   const held = await heldSeatsForSeatClass(tx, hold.seatClassId);
   return seatClass.capacity - seatClass.sold - (locked._sum.qty ?? 0) - held - seatsToOccupy;
+}
+
+/**
+ * F-14：认款幂等键。把请求令牌折成 HoldReceiptAllocation 的主键——同一 token 重放时
+ * 这一行早已存在，直接回放，不会把同一笔到账记成两条认款（收款期「已认」翻倍、
+ * 进账余额多扣一次，只能靠撤销认款纠正）。
+ * 用现有主键而不是新增列：认款表没有可放令牌的字段，主键本身就是唯一约束。
+ */
+function holdAllocationIdForToken(holdOrderId: string, installmentId: string, requestToken: string): string {
+  const digest = createHash('sha256').update(`${holdOrderId}:${installmentId}:${requestToken}`).digest('hex');
+  return `hra_${digest.slice(0, 32)}`;
 }
 
 function activeAllocationTotal(installment: { allocations: Array<{ amountCny: Prisma.Decimal; reversedAt: Date | null }> }): number {
@@ -700,7 +712,8 @@ export class HoldOrderService {
     const totalReceived = hold.installments.reduce((sum, item) => sum + activeAllocationTotal(item), 0);
     const ledger: HoldLedger = { reductions: hold.reductions, conversions: hold.conversions };
     const perSeatCarry = perSeatAttributableCny(totalReceived, availableSeats, ledger);
-    const carryCny = body.seats * perSeatCarry;
+    // B-11：末批（把余座一次转完）连整元 floor 的余数一起结转，预览与实际执行必须同一口径。
+    const carryCny = conversionCarryCny(totalReceived, availableSeats, body.seats, ledger);
     const orderDueCny = Math.max(0, body.seats * hold.perSeatPriceCny - carryCny);
     return { perSeatCarry, carryCny, orderDueCny };
   }
@@ -772,8 +785,9 @@ export class HoldOrderService {
       await lockSeatClass(tx, existing.seatClassId);
       const totalReceived = existing.installments.reduce((sum, item) => sum + activeAllocationTotal(item), 0);
       const ledger: HoldLedger = { reductions: existing.reductions, conversions: existing.conversions };
-      const perSeatCarry = perSeatAttributableCny(totalReceived, availableSeats, ledger);
-      const carryCny = seatsToConvert * perSeatCarry;
+      // B-11：非末批按人均 floor × 人数结转（余数留给后面几批）；末批把可归属实收全部带走，
+      // 否则 floor 截断的那几元会留在一张随即 CONVERTED 的占位单上，既不进订单也不记挂账。
+      const carryCny = conversionCarryCny(totalReceived, availableSeats, seatsToConvert, ledger);
       const remainingSeats = availableSeats - seatsToConvert;
 
       await tx.holdOrder.update({
@@ -1086,7 +1100,19 @@ export class HoldOrderService {
       for (const item of nextInstallments) {
         if (item.status === HoldInstallmentStatus.PAID) await closeOpenHoldDueReminders(tx, item.id, '改价后本期已结清');
       }
-      const nextStatus = deriveHoldStatus(existing, nextInstallments, dateInTimezone(new Date(), existing.flightSchedule.departureTz));
+      const derived = deriveHoldStatus(existing, nextInstallments, dateInTimezone(new Date(), existing.flightSchedule.departureTz));
+      // B-16：待生效的全款占座单（切位）改价不得顺手把状态翻成占座态 —— 那样等于没查过
+      // 一次余量就凭空占上库存。与 allocateInstallment / reduceSeatsInTransaction 同一道闸：
+      // 首期认满且余量够才准进占座态，否则继续钉在 PENDING（改价本身照常落库）。
+      let nextStatus = derived;
+      if (existing.status === HoldOrderStatus.PENDING && existing.occupyOn === HoldOccupyOn.FULL_PAYMENT) {
+        const first = [...nextInstallments].sort((a, b) => a.seq - b.seq)[0];
+        const firstPaid = !!first && first.status === HoldInstallmentStatus.PAID;
+        const remainingSeatsAfterPrice = existing.seats - existing.seatsConverted - existing.seatsCancelled;
+        nextStatus = firstPaid && (await availableSeatsForHold(tx, existing, remainingSeatsAfterPrice)) >= 0
+          ? derived
+          : HoldOrderStatus.PENDING;
+      }
       await tx.holdOrder.update({ where: { id }, data: { perSeatPriceCny: body.perSeatPriceCny, status: nextStatus } });
       return { id, perSeatPriceCny: body.perSeatPriceCny, hold: existing, status: nextStatus };
     });
@@ -1161,10 +1187,13 @@ export class HoldOrderService {
   }
 
   async allocateInstallment(id: string, installmentId: string, body: AllocateHoldInstallmentBody, actor: AuditActor) {
-    const result = await prisma.$transaction(async (tx) =>
-      this._allocateInstallmentWithinTx(tx, id, installmentId, { receiptId: body.receiptId, amountCny: body.amountCny }, actor),
+    const result = await this._runIdempotentAllocation(id, installmentId, body.requestToken, (tx) =>
+      this._allocateInstallmentWithinTx(tx, id, installmentId, { receiptId: body.receiptId, amountCny: body.amountCny, requestToken: body.requestToken }, actor),
     );
-    auditHold(actor, 'ALLOCATE_HOLD_INSTALLMENT', result, { after: { receiptNo: result.receiptNo, installmentId, installmentSeq: result.installmentSeq, amountCny: result.allocated, installmentPaid: result.installmentPaid, holdStatus: result.holdStatus, warning: result.warning } });
+    // 重放没有动钱，不再写一条「又认了一笔」的审计。
+    if (!result.replayed) {
+      auditHold(actor, 'ALLOCATE_HOLD_INSTALLMENT', result, { after: { receiptNo: result.receiptNo, installmentId, installmentSeq: result.installmentSeq, amountCny: result.allocated, installmentPaid: result.installmentPaid, holdStatus: result.holdStatus, warning: result.warning } });
+    }
     return result;
   }
 
@@ -1179,10 +1208,13 @@ export class HoldOrderService {
   async manualReceiptInstallment(
     id: string,
     installmentId: string,
-    body: { amountCny: number; method: PaymentMethod; proofUrl?: string | null; note?: string | null },
+    body: { amountCny: number; method: PaymentMethod; proofUrl?: string | null; note?: string | null; requestToken?: string },
     actor: AuditActor & { userId: string },
   ) {
-    const result = await prisma.$transaction(async (tx) => {
+    const result = await this._runIdempotentAllocation(id, installmentId, body.requestToken, async (tx) => {
+      // F-14：重放判定必须在建进账之前——否则双击会先多出一笔 OPS_CLAIM 进账再被拦。
+      const replay = await this._findAllocationReplayWithinTx(tx, id, installmentId, body.requestToken);
+      if (replay) return replay;
       const receipt = await createOpenReceiptWithinTx(tx, {
         amountCny: body.amountCny,
         method: body.method,
@@ -1191,9 +1223,11 @@ export class HoldOrderService {
         payerNote: body.note ?? null,
         createdById: actor.userId,
       });
-      return this._allocateInstallmentWithinTx(tx, id, installmentId, { receiptId: receipt.id, amountCny: body.amountCny }, actor);
+      return this._allocateInstallmentWithinTx(tx, id, installmentId, { receiptId: receipt.id, amountCny: body.amountCny, requestToken: body.requestToken }, actor);
     });
-    auditHold(actor, 'MANUAL_RECEIPT_HOLD_INSTALLMENT', result, { after: { receiptNo: result.receiptNo, installmentId, installmentSeq: result.installmentSeq, amountCny: result.allocated, installmentPaid: result.installmentPaid, holdStatus: result.holdStatus, unverified: true, note: body.note ?? null } });
+    if (!result.replayed) {
+      auditHold(actor, 'MANUAL_RECEIPT_HOLD_INSTALLMENT', result, { after: { receiptNo: result.receiptNo, installmentId, installmentSeq: result.installmentSeq, amountCny: result.allocated, installmentPaid: result.installmentPaid, holdStatus: result.holdStatus, unverified: true, note: body.note ?? null } });
+    }
     return result;
   }
 
@@ -1206,10 +1240,13 @@ export class HoldOrderService {
     tx: Prisma.TransactionClient,
     id: string,
     installmentId: string,
-    body: { receiptId: string; amountCny: number },
+    body: { receiptId: string; amountCny: number; requestToken?: string },
     actor: AuditActor,
   ) {
     {
+      // F-14：同一请求令牌重放 → 回放首次那条认款，绝不再记一次钱。
+      const replay = await this._findAllocationReplayWithinTx(tx, id, installmentId, body.requestToken);
+      if (replay) return replay;
       const receiptRows = await tx.$queryRaw<Array<{ id: string; receiptNo: string; amountCny: Prisma.Decimal; allocatedCny: Prisma.Decimal; status: ReceiptStatus }>>`
         SELECT id, "receiptNo", "amountCny", "allocatedCny", status FROM "Receipt" WHERE id = ${body.receiptId} FOR UPDATE
       `;
@@ -1230,7 +1267,7 @@ export class HoldOrderService {
       const allocated = activeAllocationTotal(installment);
       const installmentRemaining = installment.amountCny - allocated;
       if (body.amountCny > installmentRemaining) throw new ConflictError(`本期应收 ¥${installment.amountCny}，已认 ¥${allocated.toFixed(2)}，本次最多认 ¥${installmentRemaining.toFixed(2)}`);
-      const allocation = await tx.holdReceiptAllocation.create({ data: { receiptId: body.receiptId, holdOrderId: id, holdInstallmentId: installmentId, amountCny: new Prisma.Decimal(body.amountCny), createdById: actor.userId } });
+      const allocation = await tx.holdReceiptAllocation.create({ data: { ...(body.requestToken ? { id: holdAllocationIdForToken(id, installmentId, body.requestToken) } : {}), receiptId: body.receiptId, holdOrderId: id, holdInstallmentId: installmentId, amountCny: new Prisma.Decimal(body.amountCny), createdById: actor.userId } });
       const newReceiptAllocated = money(receipt.allocatedCny) + body.amountCny;
       await tx.receipt.update({ where: { id: body.receiptId }, data: { allocatedCny: new Prisma.Decimal(newReceiptAllocated), status: newReceiptAllocated >= money(receipt.amountCny) ? ReceiptStatus.ALLOCATED : ReceiptStatus.PARTIALLY_ALLOCATED } });
       const newlyPaid = allocated + body.amountCny >= installment.amountCny;
@@ -1255,8 +1292,68 @@ export class HoldOrderService {
         nextStatus = derived;
       }
       if (nextStatus !== hold.status) await tx.holdOrder.update({ where: { id }, data: { status: nextStatus } });
-      return { id, allocation, holdNo: hold.holdNo, flightScheduleId: hold.flightScheduleId, receiptNo: receipt.receiptNo, installmentSeq: installment.seq, allocated: body.amountCny, installmentPaid: newlyPaid, holdStatus: nextStatus, warning };
+      return { id, allocation, holdNo: hold.holdNo, flightScheduleId: hold.flightScheduleId, receiptNo: receipt.receiptNo, installmentSeq: installment.seq, allocated: body.amountCny, installmentPaid: newlyPaid, holdStatus: nextStatus, warning, replayed: false };
     }
+  }
+
+  /**
+   * F-14：带幂等键跑一次认款事务。
+   *
+   * 事务内的「这个令牌记过没有」只看得见本事务开始前已提交的行；双击的两个请求几乎同时
+   * 到达时两边都会查到「没记过」，后提交的那笔必然撞上确定性主键的唯一约束 —— 那正是
+   * 幂等键在起作用（钱没被记两次），但裸 P2002 会变成 500。这里把它翻译成一次重放返回，
+   * 与撞流水号唯一索引翻 409 是同一套处理。
+   */
+  private async _runIdempotentAllocation<T extends { replayed: boolean }>(
+    id: string,
+    installmentId: string,
+    requestToken: string | undefined,
+    run: (tx: Prisma.TransactionClient) => Promise<T>,
+  ) {
+    try {
+      return await prisma.$transaction(run);
+    } catch (err) {
+      if (!requestToken || !(err instanceof Prisma.PrismaClientKnownRequestError) || err.code !== 'P2002') throw err;
+      const replay = await prisma.$transaction((tx) =>
+        this._findAllocationReplayWithinTx(tx, id, installmentId, requestToken),
+      );
+      if (!replay) throw err;
+      return replay;
+    }
+  }
+
+  /**
+   * F-14：按请求令牌找已经记过的那条认款。找到 = 这是一次重放（双击 / 网络重试 /
+   * 客户端重发），直接把当时那条认款连同当前状态原样返回，不再动钱。
+   * 没带令牌的老客户端拿不到这层保护，行为与从前一致。
+   */
+  private async _findAllocationReplayWithinTx(
+    tx: Prisma.TransactionClient,
+    id: string,
+    installmentId: string,
+    requestToken: string | undefined,
+  ) {
+    if (!requestToken) return null;
+    const allocation = await tx.holdReceiptAllocation.findUnique({
+      where: { id: holdAllocationIdForToken(id, installmentId, requestToken) },
+      include: { receipt: { select: { receiptNo: true } }, holdInstallment: { select: { seq: true, status: true } } },
+    });
+    if (!allocation || allocation.holdOrderId !== id || allocation.holdInstallmentId !== installmentId) return null;
+    const hold = await tx.holdOrder.findUnique({ where: { id }, select: { holdNo: true, flightScheduleId: true, status: true } });
+    if (!hold) throw new NotFoundError('占位单不存在');
+    return {
+      id,
+      allocation,
+      holdNo: hold.holdNo,
+      flightScheduleId: hold.flightScheduleId,
+      receiptNo: allocation.receipt.receiptNo,
+      installmentSeq: allocation.holdInstallment.seq,
+      allocated: money(allocation.amountCny),
+      installmentPaid: allocation.holdInstallment.status === HoldInstallmentStatus.PAID,
+      holdStatus: hold.status,
+      warning: null as string | null,
+      replayed: true,
+    };
   }
 
   async reverseInstallmentAllocation(id: string, installmentId: string, allocationId: string, reason: string, actor: AuditActor) {

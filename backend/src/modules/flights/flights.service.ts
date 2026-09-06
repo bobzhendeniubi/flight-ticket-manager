@@ -312,6 +312,67 @@ export function computeAvailabilityTier(
   return 'AMPLE';
 }
 
+// ── 删班次守卫（单删 / 批量删共用）────────────────────────────────────────
+/** 删班次守卫的判定：OK = 可删，其余为拒绝原因键。 */
+type ScheduleDeleteVerdict = 'OK' | 'NOT_FOUND' | 'SOLD' | 'LOCK_OR_WAITLIST' | 'HOLD_ORDER';
+
+/** 拒绝原因 → 批量删返回体里的简短原因（沿用既有文案，前端已按这些字样展示）。 */
+const SCHEDULE_DELETE_SKIP_REASON: Record<Exclude<ScheduleDeleteVerdict, 'OK'>, string> = {
+  NOT_FOUND: '班次不存在',
+  SOLD: '已售',
+  LOCK_OR_WAITLIST: '有生效中的锁位/候补',
+  HOLD_ORDER: '有占位单记录',
+};
+
+/** 拒绝原因 → 单删抛给运营的完整提示。 */
+const SCHEDULE_DELETE_ERROR_MESSAGE: Record<Exclude<ScheduleDeleteVerdict, 'OK' | 'NOT_FOUND'>, string> = {
+  SOLD: '该班次已有销售，不能删除（请改用售罄）',
+  LOCK_OR_WAITLIST: '该班次有生效中的锁位/候补，暂不能删除',
+  HOLD_ORDER: '该班次已有占位单记录，不能删除（请改用停用，保留历史数据）',
+};
+
+const SCHEDULE_DELETE_GUARD_INCLUDE = {
+  orderItems: { take: 1 },
+  seatClasses: { select: { sold: true } },
+  seatLocks: { where: { status: SeatLockStatus.ACTIVE }, select: { id: true }, take: 1 },
+  seatWaitlists: { where: { status: WaitlistStatus.ACTIVE }, select: { id: true }, take: 1 },
+  holdOrders: { select: { id: true }, take: 1 },
+} satisfies Prisma.FlightScheduleInclude;
+
+/**
+ * 删班次的事务内内核（单删与批量删共用）：先拿锁，锁到手后**在同一事务里**复查守卫，
+ * 判定通过才删。
+ *
+ * C-9：原先是「查一次快照 → 应用层判定 → 删」三步分离且全程无锁无事务。判定与删除
+ * 之间落地的新订单不会让删除失败——`OrderItem.flightScheduleId` 是 ON DELETE SET NULL，
+ * 订单会被静默切断航班归属，`FlightSeatClass`（Cascade）连同刚 CAS 扣减的 sold 一起消失。
+ * 锁必须落在 `FlightSeatClass` 上：下单的 takeSeatWithinTx 只锁舱位行，班次行不是
+ * 两条路径的共享互斥点。舱位行按 id 排序加锁，避免与批量改容量以相反顺序锁同一批行死锁。
+ */
+async function deleteScheduleWithinTx(
+  tx: Prisma.TransactionClient,
+  scheduleId: string,
+): Promise<ScheduleDeleteVerdict> {
+  if (typeof tx.$queryRaw === 'function') {
+    await tx.$queryRaw`SELECT id FROM "FlightSchedule" WHERE id = ${scheduleId} FOR UPDATE`;
+    await tx.$queryRaw`
+      SELECT id FROM "FlightSeatClass" WHERE "scheduleId" = ${scheduleId} ORDER BY id FOR UPDATE
+    `;
+  }
+  const schedule = await tx.flightSchedule.findUnique({
+    where: { id: scheduleId },
+    include: SCHEDULE_DELETE_GUARD_INCLUDE,
+  });
+  if (!schedule) return 'NOT_FOUND';
+  if (schedule.seatClasses.some((c) => c.sold > 0) || schedule.orderItems.length > 0) return 'SOLD';
+  if (schedule.seatLocks.length > 0 || schedule.seatWaitlists.length > 0) return 'LOCK_OR_WAITLIST';
+  if ((schedule.holdOrders?.length ?? 0) > 0) return 'HOLD_ORDER';
+
+  // 守卫在锁内复查通过：硬删（onDelete: Cascade 自动清掉 seatClasses 及其 fareBuckets）
+  await tx.flightSchedule.delete({ where: { id: scheduleId } });
+  return 'OK';
+}
+
 export class FlightService {
   /** 面向销售端的航班搜索 — 仅返回自营、激活且未来出发、且可售座位 > 0 的班次 */
   async search(q: FlightSearchQuery) {
@@ -332,12 +393,16 @@ export class FlightService {
     }
 
     if (q.date) {
-      // 用户给的是出发地本地日期 (假定 Asia/Shanghai, UTC+8)；折算到 UTC 区间
-      const [y, m, d] = q.date.split('-').map(Number);
-      // 本地 00:00 = UTC 前一天 16:00
-      const startUtc = new Date(Date.UTC(y, m - 1, d, -8, 0, 0));
-      const endUtc = new Date(Date.UTC(y, m - 1, d + 1, -8, 0, 0));
-      where.departureTime = { gte: startUtc, lt: endUtc };
+      // C-28：出发日按班次自己的 departureTz 折（现役航线里岘港是 +7、澳门/上海是 +8），
+      // 不再假定全站 UTC+8——否则以 +7 为出发地的红眼班次（当地 23:00-24:00 起飞）会被
+      // 算进前后一天的桶里，客户按当地出发日搜就搜不到。写法与占位单列表同一套：先用
+      // 权威 SQL（双段 AT TIME ZONE）解出命中班次 id，再交给 Prisma 过滤。
+      // departureTime 的「未来出发」条件保持不变——本方法只卖还没起飞的班次。
+      const rows = await prisma.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "FlightSchedule"
+        WHERE ("departureTime" AT TIME ZONE 'UTC' AT TIME ZONE "departureTz")::date = ${q.date}::date
+      `;
+      where.id = { in: rows.map((row) => row.id) };
     }
 
     const schedules = await prisma.flightSchedule.findMany({
@@ -1031,39 +1096,9 @@ export class FlightService {
    * 占位单已纳入删除守卫；旧切位模块按冻结策略不在本链路改动。
    */
   async deleteSchedule(scheduleId: string) {
-    const schedule = await prisma.flightSchedule.findUnique({
-      where: { id: scheduleId },
-      include: {
-        orderItems: { take: 1 },
-        seatClasses: { select: { sold: true } },
-        seatLocks: { where: { status: SeatLockStatus.ACTIVE }, select: { id: true }, take: 1 },
-        seatWaitlists: {
-          where: { status: WaitlistStatus.ACTIVE },
-          select: { id: true },
-          take: 1,
-        },
-        holdOrders: {
-          select: { id: true },
-          take: 1,
-        },
-      },
-    });
-    if (!schedule) throw new NotFoundError('班次不存在');
-
-    const hasSold = schedule.seatClasses.some((c) => c.sold > 0);
-    const hasOrders = schedule.orderItems.length > 0;
-    if (hasSold || hasOrders) {
-      throw new BadRequestError('该班次已有销售，不能删除（请改用售罄）');
-    }
-    if (schedule.seatLocks.length > 0 || schedule.seatWaitlists.length > 0) {
-      throw new BadRequestError('该班次有生效中的锁位/候补，暂不能删除');
-    }
-    if ((schedule.holdOrders?.length ?? 0) > 0) {
-      throw new BadRequestError('该班次已有占位单记录，不能删除（请改用停用，保留历史数据）');
-    }
-
-    // 无销售、无生效锁位/候补/占位单：硬删（onDelete: Cascade 自动清掉 seatClasses 及其 fareBuckets）
-    await prisma.flightSchedule.delete({ where: { id: scheduleId } });
+    const verdict = await prisma.$transaction((tx) => deleteScheduleWithinTx(tx, scheduleId));
+    if (verdict === 'NOT_FOUND') throw new NotFoundError('班次不存在');
+    if (verdict !== 'OK') throw new BadRequestError(SCHEDULE_DELETE_ERROR_MESSAGE[verdict]);
     return { id: scheduleId, deleted: true };
   }
 
@@ -1073,7 +1108,8 @@ export class FlightService {
    * 出发日区间 [from, to]（出发地当地 UTC+8 日，闭区间）内选出班次；flightId 省略=全部航班。
    * 每个班次沿用 deleteSchedule 同口径的"有销售则禁删"守卫（任一舱位 sold>0，或有订单项关联，
    * 或有锁位/候补/任何占位单记录）：命中守卫 → 跳过（不删），记入 skipped；否则硬删（级联清掉舱位 / 仓位阶梯）。
-   * 事务内一次删掉本批可删项，保证要么全部落库、要么整体回滚（已跳过项不参与删除，天然安全）。
+   * 区间扫描只是无锁快照，真正删除在同一事务里按 id 排序逐个走单删内核（锁行 → 复查守卫 → 删）：
+   * 要么全部落库、要么整体回滚，且快照之后才落地的订单/锁位/占位单会在复查这一步被挡回 skipped。
    * 删除成功后写审计（删除数 + 已删/跳过的 scheduleId），批量删的爆炸半径大，必须留痕可追溯。
    * 占位单已纳入删除守卫；旧切位模块按冻结策略不在本链路改动。
    */
@@ -1132,12 +1168,27 @@ export class FlightService {
       }
     }
 
+    const deletedIds: string[] = [];
     if (deletableIds.length > 0) {
-      // 事务内一次删掉所有可删班次（onDelete: Cascade 自动清舱位/阶梯）。
-      await prisma.$transaction([
-        prisma.flightSchedule.deleteMany({ where: { id: { in: deletableIds } } }),
-      ]);
+      // C-9：上面的分流只是一次无锁快照，不能拿它直接 deleteMany。同一事务里按 id 排序
+      // 逐个走单删内核（锁行 → 复查守卫 → 删），快照之后才落地的订单/锁位/占位单会在
+      // 复查这一步把该班次挡回 skipped，而不是被静默删掉航班归属。
+      const ordered = [...deletableIds].sort();
+      await prisma.$transaction(
+        async (tx) => {
+          for (const scheduleId of ordered) {
+            const verdict = await deleteScheduleWithinTx(tx, scheduleId);
+            if (verdict === 'OK') deletedIds.push(scheduleId);
+            else skipped.push({ scheduleId, reason: SCHEDULE_DELETE_SKIP_REASON[verdict] });
+          }
+        },
+        // 整月排期一次删可能上百个班次，逐个锁行 + 复查要多次往返；默认 5s 不够用
+        // （与批量改结算价锁 / 批量收款复核锁同一档配置）。
+        { timeout: 120_000, maxWait: 15_000 },
+      );
+    }
 
+    if (deletedIds.length > 0) {
       // 批量删爆炸半径大 —— 写审计留痕（删除数 + 已删/跳过明细）。
       // 沿用 updateSchedule 的 writeAudit 口径（fire-and-forget，不参与上面的删除事务）。
       const skippedIds = skipped.map((s) => s.scheduleId);
@@ -1146,19 +1197,19 @@ export class FlightService {
         action: 'BATCH_DELETE_SCHEDULES',
         targetType: AuditTargetType.FLIGHT,
         targetId: body.flightId,
-        targetLabel: `批量删除班次 ${deletableIds.length} 条（出发日 ${body.from} ~ ${body.to}${
+        targetLabel: `批量删除班次 ${deletedIds.length} 条（出发日 ${body.from} ~ ${body.to}${
           body.flightId ? `，航班 ${body.flightId}` : '，全部航班'
         }）`,
         after: {
-          deletedCount: deletableIds.length,
-          deletedScheduleIds: deletableIds,
+          deletedCount: deletedIds.length,
+          deletedScheduleIds: deletedIds,
           skippedScheduleIds: skippedIds,
         },
         severity: AuditSeverity.WARNING,
       });
     }
 
-    return { deleted: deletableIds.length, skipped };
+    return { deleted: deletedIds.length, skipped };
   }
 
   /**
@@ -1189,7 +1240,9 @@ export class FlightService {
         where: { id: { in: body.scheduleIds } },
         include: { seatClasses: true },
       });
-      const seatClassIds = lockTargets.flatMap((s) => s.seatClasses.map((c) => c.id));
+      // C-10：按 id 排序加锁，避免两个重叠批次以不同顺序锁同一批舱位行造成死锁
+      // （findMany 不带 ORDER BY，返回行序不保证）。与 lockHotelBlockPeriodsWithinTx 同一纪律。
+      const seatClassIds = [...new Set(lockTargets.flatMap((s) => s.seatClasses.map((c) => c.id)))].sort();
       if (typeof tx.$queryRaw === 'function') {
         for (const seatClassId of seatClassIds) {
           await tx.$queryRaw`

@@ -144,6 +144,30 @@ export async function scheduleNoShowVoidScan(): Promise<void> {
   });
 }
 
+// ── 切位到期自动回池（seat-reclaim）──
+// SeatAllocationService.autoReclaimExpired 此前没有任何调用方，切位到期只能人工点回收；
+// 与 hold-overdue / no-show-void 同一套每小时扫描样板，worker.ts 侧按名字自注册。
+export interface SeatReclaimJobData {
+  requestedAt?: string;
+}
+
+export const seatReclaimQueue = new Queue<SeatReclaimJobData>('seat-reclaim', {
+  connection: bullRedis,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 5000 },
+    removeOnComplete: { age: 7 * 24 * 3600 },
+    removeOnFail: { age: 30 * 24 * 3600 },
+  },
+});
+
+export async function scheduleSeatReclaimScan(): Promise<void> {
+  await seatReclaimQueue.add('scan-seat-reclaim', {}, {
+    jobId: 'seat-reclaim-hourly',
+    repeat: { every: 60 * 60 * 1000 },
+  });
+}
+
 /**
  * 创建锁位时排队：delay 毫秒后若锁仍 ACTIVE 则标 EXPIRED（座位自动回归可售）。
  * jobId 用 `seatlock-<lockId>`，方便下单消费 / 手动释放时 remove() 取消。
@@ -205,6 +229,7 @@ export async function closeQueues(): Promise<void> {
     seatLockQueue.close(),
     holdOverdueQueue.close(),
     noShowVoidQueue.close(),
+    seatReclaimQueue.close(),
     fulfillmentQueueEvents.close(),
   ]);
   await bullRedis.quit();

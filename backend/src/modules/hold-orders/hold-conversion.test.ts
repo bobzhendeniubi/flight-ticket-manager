@@ -165,6 +165,76 @@ describe('HoldOrderService.convert', () => {
     expect(result).toMatchObject({ seats: 2, carryCny: 650, remainingSeats: 6 });
   });
 
+  // B-11：人均可归属实收按整元 floor，非整除时末批必须把余数一起带走 ——
+  // 否则这几元留在一张随即 CONVERTED 的占位单上，既没进新订单也没记挂账，账本对不上。
+  it('末批全转且不能整除：结转全部可归属实收，整元余数不再消失', async () => {
+    const service = new HoldOrderService();
+    // 可归属实收 = 3000 − 挂账 1 = 2999，余座 3；人均 floor=999，按人均算只会结转 2997
+    prismaMock.holdOrder.findUnique.mockResolvedValue(makeHold({
+      seats: 3,
+      reductions: [{ forfeitCny: 0, surplusCny: 1 }],
+      installments: [{
+        id: 'installment_1',
+        seq: 1,
+        amountRule: HoldAmountRule.REMAINDER,
+        perPersonCny: null,
+        amountCny: 3000,
+        seatsBasis: 3,
+        status: HoldInstallmentStatus.PAID,
+        paidAt: new Date(),
+        allocations: [{ amountCny: 3000, reversedAt: null }],
+      }],
+    }));
+
+    const result = await service.convert(
+      'hold_1',
+      conversionBody(
+        [passenger('P1', 'P1001'), passenger('P2', 'P2001'), passenger('P3', 'P3001')],
+        '00000000-0000-4000-8000-0000000000b1',
+      ),
+      { userId: 'user_1', role: 'ADMIN' },
+    );
+
+    expect(result).toMatchObject({ seats: 3, carryCny: 2999, remainingSeats: 0 });
+    expect(paymentMock).toHaveBeenCalledWith(
+      expect.anything(),
+      'order_1',
+      expect.objectContaining({ amount: 2999 }),
+      expect.anything(),
+      expect.anything(),
+    );
+    expect(prismaMock.holdConversionRecord.create).toHaveBeenCalledWith({
+      data: expect.objectContaining({ seats: 3, carryCny: 2999 }),
+    });
+  });
+
+  it('非末批不能整除：仍按人均 floor × 人数结转，余数留给后面几批', async () => {
+    const service = new HoldOrderService();
+    prismaMock.holdOrder.findUnique.mockResolvedValue(makeHold({
+      seats: 3,
+      reductions: [{ forfeitCny: 0, surplusCny: 1 }],
+      installments: [{
+        id: 'installment_1',
+        seq: 1,
+        amountRule: HoldAmountRule.REMAINDER,
+        perPersonCny: null,
+        amountCny: 3000,
+        seatsBasis: 3,
+        status: HoldInstallmentStatus.PAID,
+        paidAt: new Date(),
+        allocations: [{ amountCny: 3000, reversedAt: null }],
+      }],
+    }));
+
+    const result = await service.convert(
+      'hold_1',
+      conversionBody([passenger('P1', 'P1001')], '00000000-0000-4000-8000-0000000000b2'),
+      { userId: 'user_1', role: 'ADMIN' },
+    );
+
+    expect(result).toMatchObject({ seats: 1, carryCny: 999, remainingSeats: 2 });
+  });
+
   it('乘客校验失败发生在事务前，不消费占位余座', async () => {
     const service = new HoldOrderService();
     // 姓名是转正唯一的必填项；格式不对的护照有效期同样在事务前就被拦下。

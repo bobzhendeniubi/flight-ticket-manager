@@ -39,6 +39,7 @@ import { REFUND_REQUESTED_FULFILLMENT_ERROR } from '../modules/fulfillment/fulfi
 import { heldSeatsForSeatClass } from '../modules/hold-orders/held-seats.js';
 import { markOverdueHolds } from '../modules/hold-orders/hold-overdue.js';
 import { voidDepartedReleasedReturnLegs } from '../modules/orders/no-show-void.js';
+import { SeatAllocationService } from '../modules/seat-allocation/seat-allocation.service.js';
 
 /**
  * 超时释放某订单占用的座位——套餐升舱拆座感知 + 下限钳制在 0（MEDIUM 修复）。
@@ -146,6 +147,18 @@ export async function processFulfillmentTask(
   // 模拟 2-5 秒供应商 API 调用
   const simulateDelay = job.data.simulateDelay ?? 2000 + Math.random() * 3000;
   await new Promise((r) => setTimeout(r, simulateDelay));
+
+  // B-5 保险丝：这一整段是**模拟**供应商回执（假票号/假酒店确认号/假司机车牌），没有接
+  // 任何真实供应商 API。若 ENABLE_AUTO_FULFILLMENT 在生产环境被打开（正常应恒为 false，
+  // 默认值收紧见 env.ts），运营会把这些假数据当真已订好房/派好车——打一条显眼 WARN，
+  // 不静默造假。
+  if (env.NODE_ENV === 'production' && process.env.ENABLE_AUTO_FULFILLMENT === 'true') {
+    // eslint-disable-next-line no-console
+    console.warn(
+      `[worker:fulfillment] ⚠ 生产环境 ENABLE_AUTO_FULFILLMENT=true：任务 ${taskId}（${task.type}）` +
+        '即将写入的是模拟数据（假票号/假酒店确认号/假司机车牌），不是真实供应商回执',
+    );
+  }
 
   // 按类型生成结果数据
   const data: Record<string, string> = {};
@@ -460,6 +473,40 @@ void (async () => {
   }
 })();
 
+// 切位到期自动回收（C-11，每小时）：SeatAllocationService.autoReclaimExpired 之前没有任何
+// 调用方——切位过了 reclaimDaysBefore 只能靠人工点「回收」。样板照抄 no-show-void（全库
+// 扫描，没必要并发，concurrency 1）。
+// queue.ts 里的 seatReclaimQueue / scheduleSeatReclaimScan 与 hold-overdue / no-show-void 同一套
+// 每小时 repeat 定义；这里与另两条扫描一样用动态导入自注册（测试环境 mock 掉 queue 时静默跳过）。
+interface SeatReclaimJobData {
+  requestedAt?: string;
+}
+
+const seatReclaimWorker = new Worker<SeatReclaimJobData>(
+  'seat-reclaim',
+  async () => new SeatAllocationService().autoReclaimExpired(),
+  { connection: bullRedis, concurrency: 1 },
+);
+
+seatReclaimWorker.on('failed', (job, err) => {
+  // eslint-disable-next-line no-console
+  console.error(`[worker:seat-reclaim] ✗ job ${job?.id} failed:`, err.message);
+});
+
+void (async () => {
+  try {
+    const module = await import('./queue.js');
+    const scheduleSeatReclaimScan = (
+      module as unknown as { scheduleSeatReclaimScan?: () => Promise<void> }
+    ).scheduleSeatReclaimScan;
+    if (typeof scheduleSeatReclaimScan !== 'function') return;
+    await scheduleSeatReclaimScan();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[worker:seat-reclaim] failed to register repeatable scan:', err);
+  }
+})();
+
 seatLockWorker.on('failed', (job, err) => {
   // eslint-disable-next-line no-console
   console.error(`[worker:seat-lock] ✗ job ${job?.id} failed:`, err.message);
@@ -544,6 +591,7 @@ async function shutdown() {
     seatLockWorker.close(),
     holdOverdueWorker.close(),
     noShowVoidWorker.close(),
+    seatReclaimWorker.close(),
     notificationWorker.close(),
   ]);
   await closeMailer();

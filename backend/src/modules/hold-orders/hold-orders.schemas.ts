@@ -196,9 +196,17 @@ export type UpdateHoldOrderInfoBody = z.infer<typeof updateHoldOrderInfoBodySche
 export const updateHoldOrderAgentBodySchema = z.object({ agentId: z.string().min(1) }).strict();
 export type UpdateHoldOrderAgentBody = z.infer<typeof updateHoldOrderAgentBodySchema>;
 
+/**
+ * F-14：认款请求令牌（同 convertHoldOrder 的幂等口径）。同一个 token 重放只会记一笔钱，
+ * 双击/网络重试不再把同一笔到账认两次。暂为选填——老客户端不带 token 时行为不变；
+ * 前端接上之后应改为必填。
+ */
+const holdRequestTokenSchema = z.string().min(8).max(64).uuid().optional();
+
 export const allocateHoldInstallmentBodySchema = z.object({
   receiptId: z.string().min(1),
   amountCny: z.number().int().min(1),
+  requestToken: holdRequestTokenSchema,
 });
 export type AllocateHoldInstallmentBody = z.infer<typeof allocateHoldInstallmentBodySchema>;
 
@@ -208,6 +216,7 @@ export const manualReceiptHoldInstallmentBodySchema = z.object({
   method: z.enum([PaymentMethod.WECHAT_PAY, PaymentMethod.ALIPAY, PaymentMethod.BANK_CARD]),
   proofUrl: proofUrlSchema.optional(),
   note: z.string().trim().max(500).optional(),
+  requestToken: holdRequestTokenSchema,
 });
 export type ManualReceiptHoldInstallmentBody = z.infer<typeof manualReceiptHoldInstallmentBodySchema>;
 

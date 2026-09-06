@@ -244,6 +244,48 @@ describe('HoldOrderService actions', () => {
     expect(prismaMock.holdOrder.update).toHaveBeenCalledTimes(0);
   });
 
+  // B-16：切位单（occupyOn=FULL_PAYMENT）在 PENDING 期间本就不占座，改价这一步既不查
+  // 余量也不该把它推进占座态；否则等于绕过全站唯一那道「够不够票」判定凭空占上库存。
+  it('待生效的全款占座单改价：首期未认满 → 状态钉在 PENDING，不翻占座态', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(
+      hold({ status: HoldOrderStatus.PENDING, occupyOn: 'FULL_PAYMENT' }),
+    );
+    prismaMock.holdOrder.update.mockResolvedValue({});
+
+    const result = await service.updatePrice('hold_1', { perSeatPriceCny: 1300, reason: '运营确认成本变化' });
+
+    expect(result.status).toBe(HoldOrderStatus.PENDING);
+    expect(prismaMock.holdOrder.update).toHaveBeenCalledWith({
+      where: { id: 'hold_1' },
+      data: { perSeatPriceCny: 1300, status: HoldOrderStatus.PENDING },
+    });
+  });
+
+  it('待生效的全款占座单改价：首期已认满且余量够 → 才允许进占座态', async () => {
+    const paidInstallments = [
+      { ...hold().installments[0], status: HoldInstallmentStatus.PAID, paidAt: new Date(), allocations: [{ amountCny: 6000, reversedAt: null }] },
+      hold().installments[1],
+    ];
+    prismaMock.holdOrder.findUnique.mockResolvedValue(
+      hold({ status: HoldOrderStatus.PENDING, occupyOn: 'FULL_PAYMENT', installments: paidInstallments }),
+    );
+    prismaMock.holdInstallment.findMany.mockResolvedValue(paidInstallments);
+    prismaMock.holdOrder.update.mockResolvedValue({});
+
+    const result = await service.updatePrice('hold_1', { perSeatPriceCny: 1300, reason: '运营确认成本变化' });
+
+    expect(result.status).toBe(HoldOrderStatus.HOLDING);
+  });
+
+  it('非全款占座单（建单即占座）改价：口径不变，照旧按收款计划派生状态', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ occupyOn: 'CREATE' }));
+    prismaMock.holdOrder.update.mockResolvedValue({});
+
+    const result = await service.updatePrice('hold_1', { perSeatPriceCny: 1300, reason: '运营确认成本变化' });
+
+    expect(result.status).toBe(HoldOrderStatus.HOLDING);
+  });
+
   it('改价审计记录 before/after 价格和原因', async () => {
     prismaMock.holdOrder.findUnique.mockResolvedValue(hold());
     prismaMock.holdOrder.update.mockResolvedValue({});

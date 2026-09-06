@@ -32,6 +32,7 @@ const prismaMock = vi.hoisted(() => {
     holdOrder: { groupBy: ReturnType<typeof vi.fn> };
     flightBaggagePolicy: { findMany: ReturnType<typeof vi.fn> };
     auditLog: { create: ReturnType<typeof vi.fn> };
+    $queryRaw: ReturnType<typeof vi.fn>;
     $transaction: ReturnType<typeof vi.fn>;
   } = {
     flight: { findUnique: vi.fn() },
@@ -52,6 +53,8 @@ const prismaMock = vi.hoisted(() => {
     flightBaggagePolicy: { findMany: vi.fn() },
     // 改点路径会 best-effort 写审计（writeAudit → prisma.auditLog.create）；给个空 mock 免噪声
     auditLog: { create: vi.fn() },
+    // 行锁（SELECT ... FOR UPDATE）与按 departureTz 折算出发日的权威 SQL 都走 $queryRaw
+    $queryRaw: vi.fn(async () => [] as unknown[]),
     // $transaction(fn) 直接以同一个 mock 作为 tx 执行回调
     $transaction: vi.fn(async (fn: (tx: unknown) => unknown) => fn(mock)),
   };
@@ -665,6 +668,11 @@ describe('FlightService.listSchedules / listSchedulesInRange · 余位允许为�
 describe('FlightService.search · 公开搜索余位扣减 held', () => {
   const service = new FlightService();
 
+  beforeEach(() => {
+    vi.clearAllMocks();
+    prismaMock.$queryRaw.mockResolvedValue([]);
+  });
+
   it('占位压缩后，搜索不会把不足人数的班次标为可售', async () => {
     const departureTime = new Date(Date.now() + 86400000);
     prismaMock.flightSchedule.findMany.mockResolvedValue([
@@ -698,6 +706,40 @@ describe('FlightService.search · 公开搜索余位扣减 held', () => {
 
     const result = await service.search({ passengers: 2 });
     expect(result).toEqual([]);
+  });
+
+  // C-28：出发日筛选原来硬编码「出发地 = UTC+8」，岘港（Asia/Ho_Chi_Minh, +7）的
+  // 红眼班次会被算进前后一天的桶里搜不到。改为走双段 AT TIME ZONE 的权威 SQL 解 id。
+  it('按出发日筛选：走 departureTz 双段折算的权威 SQL 取 id，不再拼 UTC+8 时间窗', async () => {
+    prismaMock.$queryRaw.mockResolvedValue([{ id: 'sched_dad' }]);
+    prismaMock.flightSchedule.findMany.mockResolvedValue([]);
+    prismaMock.seatLock.groupBy.mockResolvedValue([]);
+    prismaMock.holdOrder.groupBy.mockResolvedValue([]);
+    prismaMock.flightBaggagePolicy.findMany.mockResolvedValue([]);
+
+    await service.search({ passengers: 1, date: '2027-07-10' });
+
+    const sql = (prismaMock.$queryRaw.mock.calls[0][0] as string[]).join('?');
+    expect(sql).toContain("AT TIME ZONE 'UTC'");
+    expect(sql).toContain('AT TIME ZONE "departureTz"');
+    expect(prismaMock.$queryRaw.mock.calls[0][1]).toBe('2027-07-10');
+
+    const where = prismaMock.flightSchedule.findMany.mock.calls[0][0].where;
+    expect(where.id).toEqual({ in: ['sched_dad'] });
+    // 未来出发这一条不被日期筛选覆盖掉（本方法只卖还没起飞的班次）
+    expect(where.departureTime.gte).toBeInstanceOf(Date);
+  });
+
+  it('按出发日筛选：当天没有任何班次命中 → 空集合过滤，不放行全量', async () => {
+    prismaMock.$queryRaw.mockResolvedValue([]);
+    prismaMock.flightSchedule.findMany.mockResolvedValue([]);
+    prismaMock.seatLock.groupBy.mockResolvedValue([]);
+    prismaMock.holdOrder.groupBy.mockResolvedValue([]);
+    prismaMock.flightBaggagePolicy.findMany.mockResolvedValue([]);
+
+    await service.search({ passengers: 1, date: '2027-07-10' });
+
+    expect(prismaMock.flightSchedule.findMany.mock.calls[0][0].where.id).toEqual({ in: [] });
   });
 });
 
@@ -1251,27 +1293,98 @@ describe('FlightService.deleteSchedule', () => {
     await expect(service.deleteSchedule('nope')).rejects.toMatchObject({ statusCode: 404 });
     expect(prismaMock.flightSchedule.delete).not.toHaveBeenCalled();
   });
+
+  // C-9：判定与删除必须在同一事务里，且先拿到与下单路径共享的那把锁（FlightSeatClass 行）
+  // 再复查——否则快照之后落地的订单会被 ON DELETE SET NULL 静默切断航班归属。
+  it('删除全程在一个事务里：先锁班次行与舱位行（FOR UPDATE），锁到手才复查守卫、才删', async () => {
+    prismaMock.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sched_1',
+      isActive: true,
+      orderItems: [],
+      seatClasses: [{ sold: 0 }],
+      seatLocks: [],
+      seatWaitlists: [],
+      holdOrders: [],
+    });
+    prismaMock.flightSchedule.delete.mockResolvedValue({ id: 'sched_1' });
+
+    await service.deleteSchedule('sched_1');
+
+    expect(prismaMock.$transaction).toHaveBeenCalled();
+    const [scheduleLock, seatClassLock] = prismaMock.$queryRaw.mock.calls;
+    expect((scheduleLock[0] as string[]).join('?')).toContain('"FlightSchedule"');
+    expect((scheduleLock[0] as string[]).join('?')).toContain('FOR UPDATE');
+    // 舱位行按 id 排序加锁：与批量改容量同序，避免两把批量操作互相等待成死锁
+    expect((seatClassLock[0] as string[]).join('?')).toContain('"FlightSeatClass"');
+    expect((seatClassLock[0] as string[]).join('?')).toContain('ORDER BY id');
+    expect((seatClassLock[0] as string[]).join('?')).toContain('FOR UPDATE');
+    // 顺序：加锁 → 复查 → 删
+    expect(prismaMock.$queryRaw.mock.invocationCallOrder[1]).toBeLessThan(
+      prismaMock.flightSchedule.findUnique.mock.invocationCallOrder[0],
+    );
+    expect(prismaMock.flightSchedule.findUnique.mock.invocationCallOrder[0]).toBeLessThan(
+      prismaMock.flightSchedule.delete.mock.invocationCallOrder[0],
+    );
+  });
+
+  it('锁到手后复查发现新落地的订单项 → 400 且不删（关掉 TOCTOU 窗口）', async () => {
+    // 复查读到的是锁内最新快照：有订单项 → 拒绝
+    prismaMock.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sched_1',
+      isActive: true,
+      orderItems: [{ id: 'oi_race' }],
+      seatClasses: [{ sold: 1 }],
+      seatLocks: [],
+      seatWaitlists: [],
+      holdOrders: [],
+    });
+
+    await expect(service.deleteSchedule('sched_1')).rejects.toMatchObject({ statusCode: 400 });
+    expect(prismaMock.flightSchedule.delete).not.toHaveBeenCalled();
+  });
 });
 
 // ── batchDeleteSchedules（按出发日区间批量删；已售/有订单的跳过）───────────
 // 复用单删同口径守卫：任一舱位 sold>0 或有订单项关联 → 跳过并回报，其余硬删。
 // 区间筛选交给 prisma.findMany 的 where（这里 mock 其返回），故测试聚焦"分流 + 删除"逻辑。
+// C-9 之后删除本身走单删内核（事务内逐个锁行 + 复查 + delete），不再是一次 deleteMany。
 describe('FlightService.batchDeleteSchedules', () => {
   const service = new FlightService();
+
+  /**
+   * 区间扫描（无锁快照）与锁后复查读到同一批行；要模拟"快照之后才落地的订单"，
+   * 用例可以在调用后单独覆盖 findUnique。
+   */
+  const stubScan = (rows: Array<Record<string, unknown>>) => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue(rows);
+    prismaMock.flightSchedule.findUnique.mockImplementation(
+      async ({ where }: { where: { id: string } }) => rows.find((row) => row.id === where.id) ?? null,
+    );
+  };
+
+  /** 实际被删掉的班次 id（逐个 delete，按调用顺序）。 */
+  const deletedIds = () =>
+    (prismaMock.flightSchedule.delete.mock.calls as Array<[{ where: { id: string } }]>).map(
+      (call) => call[0].where.id,
+    );
 
   beforeEach(() => {
     vi.clearAllMocks();
     prismaMock.holdOrder.groupBy.mockResolvedValue([]);
-    // $transaction 的数组形态：直接 resolve 传入的 promise 数组（本方法只放一个 deleteMany）。
+    // 回调形态：以同一个 mock 作为 tx 执行；数组形态保留兼容其它路径。
     prismaMock.$transaction.mockImplementation(async (ops: unknown) =>
-      Array.isArray(ops) ? Promise.all(ops) : ops,
+      typeof ops === 'function'
+        ? (ops as (tx: unknown) => unknown)(prismaMock)
+        : Array.isArray(ops)
+          ? Promise.all(ops)
+          : ops,
     );
-    prismaMock.flightSchedule.deleteMany.mockResolvedValue({ count: 0 });
+    prismaMock.flightSchedule.delete.mockResolvedValue({ id: 'deleted' });
   });
 
   it('区间内：删无销售班次、跳过已售班次，返回 deleted 计数 + skipped 明细', async () => {
     // findMany 返回区间内命中的班次：sched_a 无销售、sched_b 有已售舱位、sched_c 无销售但有订单项
-    prismaMock.flightSchedule.findMany.mockResolvedValue([
+    stubScan([
       {
         id: 'sched_a',
         flightId: 'flight_1',
@@ -1305,9 +1418,7 @@ describe('FlightService.batchDeleteSchedules', () => {
     });
 
     // 只删无销售且无订单项的 sched_a；sched_b（已售）、sched_c（有订单）跳过
-    expect(prismaMock.flightSchedule.deleteMany).toHaveBeenCalledWith({
-      where: { id: { in: ['sched_a'] } },
-    });
+    expect(deletedIds()).toEqual(['sched_a']);
     expect(result).toEqual({
       deleted: 1,
       skipped: [
@@ -1319,7 +1430,7 @@ describe('FlightService.batchDeleteSchedules', () => {
 
   it('区间内有生效中的锁位/候补（即便无销售/无订单）→ 跳过，不参与硬删', async () => {
     // sched_a 无销售但有生效锁位；sched_b 无销售但有生效候补；sched_c 完全干净可删
-    prismaMock.flightSchedule.findMany.mockResolvedValue([
+    stubScan([
       {
         id: 'sched_a',
         flightId: 'flight_1',
@@ -1353,9 +1464,7 @@ describe('FlightService.batchDeleteSchedules', () => {
     });
 
     // 只删完全干净的 sched_c；sched_a（生效锁位）、sched_b（生效候补）跳过且不进 deleteMany
-    expect(prismaMock.flightSchedule.deleteMany).toHaveBeenCalledWith({
-      where: { id: { in: ['sched_c'] } },
-    });
+    expect(deletedIds()).toEqual(['sched_c']);
     expect(result).toEqual({
       deleted: 1,
       skipped: [
@@ -1366,7 +1475,7 @@ describe('FlightService.batchDeleteSchedules', () => {
   });
 
   it('区间内有生效中的占位单 → skipped 新增占位原因，不参与硬删', async () => {
-    prismaMock.flightSchedule.findMany.mockResolvedValue([
+    stubScan([
       {
         id: 'sched_hold',
         flightId: 'flight_1',
@@ -1384,7 +1493,7 @@ describe('FlightService.batchDeleteSchedules', () => {
       to: '2026-07-31',
     });
 
-    expect(prismaMock.flightSchedule.deleteMany).not.toHaveBeenCalled();
+    expect(prismaMock.flightSchedule.delete).not.toHaveBeenCalled();
     expect(result).toEqual({
       deleted: 0,
       skipped: [{ scheduleId: 'sched_hold', reason: '有占位单记录' }],
@@ -1392,7 +1501,7 @@ describe('FlightService.batchDeleteSchedules', () => {
   });
 
   it('按出发日区间 + flightId 过滤查库（不碰区间外/其他航班）', async () => {
-    prismaMock.flightSchedule.findMany.mockResolvedValue([]);
+    stubScan([]);
 
     await service.batchDeleteSchedules({
       flightId: 'flight_1',
@@ -1408,11 +1517,11 @@ describe('FlightService.batchDeleteSchedules', () => {
       new Date(Date.UTC(2026, 6, 12, -8, 0, 0) + 24 * 3600 * 1000 - 1),
     );
     // 无可删项 → 不触发删除
-    expect(prismaMock.flightSchedule.deleteMany).not.toHaveBeenCalled();
+    expect(prismaMock.flightSchedule.delete).not.toHaveBeenCalled();
   });
 
   it('省略 flightId：跨全部航班按区间筛选（where 不含 flightId）', async () => {
-    prismaMock.flightSchedule.findMany.mockResolvedValue([
+    stubScan([
       {
         id: 'sched_x',
         flightId: 'flight_1',
@@ -1436,14 +1545,12 @@ describe('FlightService.batchDeleteSchedules', () => {
     const call = prismaMock.flightSchedule.findMany.mock.calls[0][0];
     expect(call.where.flightId).toBeUndefined();
     // 两个都无销售 → 一次 deleteMany 删两条
-    expect(prismaMock.flightSchedule.deleteMany).toHaveBeenCalledWith({
-      where: { id: { in: ['sched_x', 'sched_y'] } },
-    });
+    expect(deletedIds()).toEqual(['sched_x', 'sched_y']);
     expect(result).toEqual({ deleted: 2, skipped: [] });
   });
 
   it('区间内全部已售：deleted=0、不调用 deleteMany、全部进 skipped', async () => {
-    prismaMock.flightSchedule.findMany.mockResolvedValue([
+    stubScan([
       {
         id: 'sched_a',
         flightId: 'flight_1',
@@ -1468,7 +1575,7 @@ describe('FlightService.batchDeleteSchedules', () => {
       to: '2026-07-31',
     });
 
-    expect(prismaMock.flightSchedule.deleteMany).not.toHaveBeenCalled();
+    expect(prismaMock.flightSchedule.delete).not.toHaveBeenCalled();
     expect(result).toEqual({
       deleted: 0,
       skipped: [
@@ -1476,6 +1583,66 @@ describe('FlightService.batchDeleteSchedules', () => {
         { scheduleId: 'sched_b', reason: '已售' },
       ],
     });
+  });
+
+  // C-9：区间扫描是无锁快照，扫完到真正删除之间落地的订单必须在锁内复查时被挡住，
+  // 而不是照着旧快照删掉、把新订单的航班归属静默置空。
+  it('快照说可删、锁后复查发现新订单 → 该班次进 skipped 不删，其余照删', async () => {
+    stubScan([
+      {
+        id: 'sched_race',
+        flightId: 'flight_1',
+        orderItems: [],
+        seatClasses: [{ sold: 0 }],
+        seatLocks: [],
+        seatWaitlists: [],
+        holdOrders: [],
+      },
+      {
+        id: 'sched_safe',
+        flightId: 'flight_1',
+        orderItems: [],
+        seatClasses: [{ sold: 0 }],
+        seatLocks: [],
+        seatWaitlists: [],
+        holdOrders: [],
+      },
+    ]);
+    // 锁到手后重读：sched_race 上已经有人下单成功了
+    prismaMock.flightSchedule.findUnique.mockImplementation(
+      async ({ where }: { where: { id: string } }) => ({
+        id: where.id,
+        orderItems: where.id === 'sched_race' ? [{ id: 'oi_race' }] : [],
+        seatClasses: [{ sold: where.id === 'sched_race' ? 1 : 0 }],
+        seatLocks: [],
+        seatWaitlists: [],
+        holdOrders: [],
+      }),
+    );
+
+    const result = await service.batchDeleteSchedules({
+      flightId: 'flight_1',
+      from: '2026-07-01',
+      to: '2026-07-31',
+    });
+
+    expect(deletedIds()).toEqual(['sched_safe']);
+    expect(result).toEqual({
+      deleted: 1,
+      skipped: [{ scheduleId: 'sched_race', reason: '已售' }],
+    });
+  });
+
+  it('逐个删按 id 排序拿锁（与批量改容量同序，避免死锁）', async () => {
+    stubScan([
+      { id: 'sched_z', flightId: 'f1', orderItems: [], seatClasses: [{ sold: 0 }], seatLocks: [], seatWaitlists: [], holdOrders: [] },
+      { id: 'sched_a', flightId: 'f1', orderItems: [], seatClasses: [{ sold: 0 }], seatLocks: [], seatWaitlists: [], holdOrders: [] },
+      { id: 'sched_m', flightId: 'f1', orderItems: [], seatClasses: [{ sold: 0 }], seatLocks: [], seatWaitlists: [], holdOrders: [] },
+    ]);
+
+    await service.batchDeleteSchedules({ from: '2026-07-01', to: '2026-07-31' });
+
+    expect(deletedIds()).toEqual(['sched_a', 'sched_m', 'sched_z']);
   });
 });
 
@@ -1499,6 +1666,33 @@ describe('FlightService.batchUpdateCapacity', () => {
           : ops,
     );
     prismaMock.flightSeatClass.update.mockResolvedValue({});
+    prismaMock.$queryRaw.mockResolvedValue([]);
+  });
+
+  // C-10：findMany 不带 ORDER BY，返回行序不保证；两个重叠批次若以相反顺序锁同一批
+  // 舱位行会死锁（Postgres 杀掉其中一个事务 → 运营看到莫名 500）。锁前先按 id 排序。
+  it('逐行加锁前按 id 排序（与库存代码其余处同一防死锁纪律）', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      {
+        id: 'sched_a',
+        seatClasses: [
+          { id: 'sc_z', cabin: 'BUSINESS', capacity: 20, sold: 0 },
+          { id: 'sc_a', cabin: 'ECONOMY', capacity: 180, sold: 0 },
+        ],
+      },
+      {
+        id: 'sched_b',
+        seatClasses: [{ id: 'sc_m', cabin: 'BUSINESS', capacity: 20, sold: 0 }],
+      },
+    ]);
+
+    await service.batchUpdateCapacity({
+      scheduleIds: ['sched_a', 'sched_b'],
+      seatClasses: [{ cabin: 'BUSINESS', capacity: 7 }],
+    });
+
+    const lockedIds = (prismaMock.$queryRaw.mock.calls as Array<[string[], string]>).map((call) => call[1]);
+    expect(lockedIds).toEqual(['sc_a', 'sc_m', 'sc_z']);
   });
 
   it('业务场景：把命中班次的商务舱容量从 20 改到 7（已售 0）→ 全部 applied', async () => {

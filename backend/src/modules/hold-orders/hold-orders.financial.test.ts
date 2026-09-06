@@ -5,10 +5,12 @@ import {
   HoldOccupyOn,
   HoldOrderStatus,
   HoldOwnerType,
+  PaymentMethod,
+  Prisma,
   ReceiptStatus,
 } from '@prisma/client';
 
-const { prismaMock, auditMock, enqueueMock } = vi.hoisted(() => {
+const { prismaMock, auditMock, enqueueMock, createReceiptMock } = vi.hoisted(() => {
   const mock = {
     holdOrder: { findUnique: vi.fn(), update: vi.fn(), updateMany: vi.fn(), aggregate: vi.fn() },
     holdReceiptAllocation: { create: vi.fn(), findUnique: vi.fn(), update: vi.fn() },
@@ -18,12 +20,18 @@ const { prismaMock, auditMock, enqueueMock } = vi.hoisted(() => {
     $queryRaw: vi.fn(),
     $transaction: vi.fn(),
   };
-  return { prismaMock: mock, auditMock: vi.fn(async () => undefined), enqueueMock: vi.fn(async () => undefined) };
+  return {
+    prismaMock: mock,
+    auditMock: vi.fn(async () => undefined),
+    enqueueMock: vi.fn(async () => undefined),
+    createReceiptMock: vi.fn(),
+  };
 });
 
 vi.mock('../../db/prisma.js', () => ({ prisma: prismaMock }));
 vi.mock('../../lib/audit.js', () => ({ writeAudit: auditMock }));
 vi.mock('../../queues/queue.js', () => ({ enqueueWaitlistCheck: enqueueMock }));
+vi.mock('../receipts/receipts.service.js', () => ({ createOpenReceiptWithinTx: createReceiptMock }));
 
 import { HoldOrderService } from './hold-orders.service.js';
 
@@ -94,6 +102,118 @@ beforeEach(() => {
   prismaMock.holdInstallment.findMany.mockResolvedValue([installment()]);
   prismaMock.receipt.update.mockResolvedValue({});
   prismaMock.holdOrder.update.mockResolvedValue({});
+  createReceiptMock.mockResolvedValue({ id: 'receipt_1', receiptNo: 'RCP001' });
+});
+
+// F-14：认款弹窗双击会把同一笔到账认两次（收款期「已认」翻倍、进账余额多扣一次，
+// 只能靠撤销认款纠正）。请求令牌折成认款行主键 → 同一 token 重放只记一笔钱。
+describe('HoldOrderService 认款幂等（请求令牌）', () => {
+  const requestToken = '00000000-0000-4000-8000-0000000000f1';
+
+  it('带令牌首次认款：认款行用令牌折出的确定性主键落库', async () => {
+    prismaMock.holdReceiptAllocation.findUnique.mockResolvedValue(null);
+    prismaMock.$queryRaw
+      .mockResolvedValueOnce([receipt()])
+      .mockResolvedValueOnce([{ id: 'hold_1' }]);
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold());
+
+    await service.allocateInstallment('hold_1', 'installment_1', { receiptId: 'receipt_1', amountCny: 100, requestToken }, { userId: 'user_1' });
+
+    const created = prismaMock.holdReceiptAllocation.create.mock.calls[0][0].data;
+    expect(created.id).toMatch(/^hra_[0-9a-f]{32}$/u);
+    // 查重用的正是同一个键
+    expect(prismaMock.holdReceiptAllocation.findUnique).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: created.id } }),
+    );
+  });
+
+  it('同一令牌重放：回放首次那笔认款，不再写认款、不再扣进账余额', async () => {
+    prismaMock.holdReceiptAllocation.findUnique.mockResolvedValue({
+      id: 'hra_replay',
+      holdOrderId: 'hold_1',
+      holdInstallmentId: 'installment_1',
+      receiptId: 'receipt_1',
+      amountCny: 100,
+      reversedAt: null,
+      receipt: { receiptNo: 'RCP001' },
+      holdInstallment: { seq: 1, status: HoldInstallmentStatus.PAID },
+    });
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ status: HoldOrderStatus.FULLY_PAID }));
+
+    const result = await service.allocateInstallment('hold_1', 'installment_1', { receiptId: 'receipt_1', amountCny: 100, requestToken }, { userId: 'user_1' });
+
+    expect(result).toMatchObject({ allocated: 100, installmentPaid: true, holdStatus: HoldOrderStatus.FULLY_PAID, replayed: true });
+    expect(prismaMock.holdReceiptAllocation.create).not.toHaveBeenCalled();
+    expect(prismaMock.receipt.update).not.toHaveBeenCalled();
+    expect(prismaMock.holdInstallment.update).not.toHaveBeenCalled();
+    // 没动钱就不该再写一条「又认了一笔」的审计
+    expect(auditMock).not.toHaveBeenCalled();
+  });
+
+  it('两次提交几乎同时到达：后一笔撞唯一约束 → 翻成重放返回，而不是 500', async () => {
+    const existing = {
+      id: 'hra_replay',
+      holdOrderId: 'hold_1',
+      holdInstallmentId: 'installment_1',
+      receiptId: 'receipt_1',
+      amountCny: 100,
+      reversedAt: null,
+      receipt: { receiptNo: 'RCP001' },
+      holdInstallment: { seq: 1, status: HoldInstallmentStatus.PAID },
+    };
+    // 第一次查（本事务开始前还没有那条认款）→ null；写入时撞主键；重查 → 已经在了
+    prismaMock.holdReceiptAllocation.findUnique
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce(existing);
+    prismaMock.$queryRaw
+      .mockResolvedValueOnce([receipt()])
+      .mockResolvedValueOnce([{ id: 'hold_1' }]);
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ status: HoldOrderStatus.FULLY_PAID }));
+    prismaMock.holdReceiptAllocation.create.mockRejectedValueOnce(
+      new Prisma.PrismaClientKnownRequestError('unique', { code: 'P2002', clientVersion: 'test' }),
+    );
+
+    const result = await service.allocateInstallment('hold_1', 'installment_1', { receiptId: 'receipt_1', amountCny: 100, requestToken }, { userId: 'user_1' });
+
+    expect(result).toMatchObject({ allocated: 100, replayed: true });
+  });
+
+  it('不带令牌：口径不变（老客户端照常认款，不受幂等层影响）', async () => {
+    prismaMock.$queryRaw
+      .mockResolvedValueOnce([receipt()])
+      .mockResolvedValueOnce([{ id: 'hold_1' }]);
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold());
+
+    await service.allocateInstallment('hold_1', 'installment_1', { receiptId: 'receipt_1', amountCny: 100 }, { userId: 'user_1' });
+
+    expect(prismaMock.holdReceiptAllocation.findUnique).not.toHaveBeenCalled();
+    expect(prismaMock.holdReceiptAllocation.create.mock.calls[0][0].data.id).toBeUndefined();
+  });
+
+  it('手工到账重放：连 OPS_CLAIM 进账都不再建（重放判定在建进账之前）', async () => {
+    prismaMock.holdReceiptAllocation.findUnique.mockResolvedValue({
+      id: 'hra_replay',
+      holdOrderId: 'hold_1',
+      holdInstallmentId: 'installment_1',
+      receiptId: 'receipt_1',
+      amountCny: 100,
+      reversedAt: null,
+      receipt: { receiptNo: 'RCP001' },
+      holdInstallment: { seq: 1, status: HoldInstallmentStatus.PAID },
+    });
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ status: HoldOrderStatus.FULLY_PAID }));
+
+    const result = await service.manualReceiptInstallment(
+      'hold_1',
+      'installment_1',
+      { amountCny: 100, method: PaymentMethod.WECHAT_PAY, requestToken },
+      { userId: 'user_1' },
+    );
+
+    expect(result).toMatchObject({ allocated: 100, replayed: true });
+    expect(createReceiptMock).not.toHaveBeenCalled();
+    expect(prismaMock.holdReceiptAllocation.create).not.toHaveBeenCalled();
+  });
 });
 
 describe('HoldOrderService installment allocation', () => {

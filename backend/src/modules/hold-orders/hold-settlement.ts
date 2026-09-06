@@ -74,6 +74,25 @@ export function perSeatAttributableCny(
   return Math.max(0, Math.floor(attributableReceivedCny(totalReceived, ledger) / Math.max(1, availableSeats)));
 }
 
+/**
+ * 本次转正实际结转到新订单的金额。
+ *
+ * B-11：人均可归属实收按整元 floor，非末批按「人均 × 人数」结转没问题（余数留在占位单上
+ * 给后面几批）；但**末批**（这一次把余座全转完）若还按人均算，floor 截断的那几元
+ * （上限 = 本次人数 − 1）就永远留在一张随即变成 CONVERTED 的占位单上——既没进新订单，
+ * 也不像减员那样记进挂账，守恒账本从此对不上。所以末批把可归属实收全部带走。
+ */
+export function conversionCarryCny(
+  totalReceived: number,
+  availableSeats: number,
+  seatsToConvert: number,
+  ledger: HoldLedger,
+): number {
+  const attributable = Math.max(0, attributableReceivedCny(totalReceived, ledger));
+  if (seatsToConvert >= availableSeats) return attributable;
+  return seatsToConvert * perSeatAttributableCny(totalReceived, availableSeats, ledger);
+}
+
 function isPaid(item: InstallmentForRebase): boolean {
   return item.amountCny === 0 || activeReceivedCny(item) >= item.amountCny;
 }

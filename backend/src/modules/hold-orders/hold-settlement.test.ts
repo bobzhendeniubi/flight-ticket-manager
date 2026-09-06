@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest';
 import { HoldAmountRule, HoldInstallmentStatus } from '@prisma/client';
 import {
   attributableReceivedCny,
+  conversionCarryCny,
   holdLedgerTotals,
   perSeatAttributableCny,
   rebaseInstallmentsForRemainingSeats,
@@ -17,6 +18,31 @@ describe('占位单转正后账本口径', () => {
     expect(attributableReceivedCny(1001, ledger)).toBe(701);
     // 转走 3 座后，carry=3×floor(1001/10)=300，余数 1 不进入 surplus。
     expect(attributableReceivedCny(1001, { conversions: [{ carryCny: 300 }] }) - 700).toBe(1);
+  });
+
+  // B-11：整元 floor 的余数不能留在一张随即 CONVERTED 的占位单上。
+  describe('conversionCarryCny · 末批把余数一起带走', () => {
+    const ledger = { reductions: [{ forfeitCny: 0, surplusCny: 1 }] };
+
+    it('非末批：仍按人均 floor × 人数，余数留给后面几批', () => {
+      // 可归属实收 2999、余座 3：人均 floor = 999，转 1 人结转 999
+      expect(conversionCarryCny(3000, 3, 1, ledger)).toBe(999);
+      expect(conversionCarryCny(3000, 3, 2, ledger)).toBe(1998);
+    });
+
+    it('末批全转：结转全部可归属实收，2 元余数不再凭空消失', () => {
+      expect(perSeatAttributableCny(3000, 3, ledger) * 3).toBe(2997);
+      expect(conversionCarryCny(3000, 3, 3, ledger)).toBe(2999);
+    });
+
+    it('整除时末批与人均口径一致（回归：常规单不受影响）', () => {
+      expect(conversionCarryCny(3000, 10, 10, {})).toBe(3000);
+      expect(conversionCarryCny(3000, 10, 4, {})).toBe(1200);
+    });
+
+    it('可归属实收被历史账本扣成负数时结转 0，不倒扣', () => {
+      expect(conversionCarryCny(1000, 2, 2, { conversions: [{ carryCny: 1500 }] })).toBe(0);
+    });
   });
 
   it('转正与减员共用座位基数变化后的固定期/尾款重算', () => {
