@@ -20,6 +20,12 @@ import { COUNTED_STATUSES, RECEIVABLE_STATUSES } from '../../lib/order-status-se
 import { type CompletedRefundShape } from '../../lib/net-received.js';
 // 订单金额单一口径（审查根因 R2）：应收 / 应收余额从这里取（内部转调 lib/net-received）。
 import { payableCny, receivableBalanceCny } from '../../lib/order-money.js';
+// 订单 → 航线的唯一派生（最早起飞的航段优先，其次套餐绑定航班，都没有 → 未知航线）。
+import {
+  ORDER_ROUTE_ITEM_SELECT,
+  orderRouteBucketKey,
+  routeKeyLabel,
+} from '../../lib/order-route.js';
 
 export interface DateRange {
   /** ISO date 'YYYY-MM-DD'，包含 */
@@ -28,7 +34,7 @@ export interface DateRange {
   to: string;
 }
 
-export type SalesDim = 'kind' | 'channel' | 'agent';
+export type SalesDim = 'kind' | 'channel' | 'agent' | 'route';
 
 export interface SalesRow {
   key: string;
@@ -192,7 +198,7 @@ function newAcc(key: string, label: string): MutableSalesAcc {
   return { key, label, orderIds: new Set(), revenueCny: 0, costCny: 0, missingCostItemCount: 0 };
 }
 
-/** 销售毛利：按 kind / channel / agent 三个维度聚合区间内订单（按 createdAt 落区间） */
+/** 销售毛利：按 kind / channel / agent / route 四个维度聚合区间内订单（按 createdAt 落区间） */
 export async function getSalesReport(
   range: DateRange,
   dim: SalesDim,
@@ -208,7 +214,15 @@ export async function getSalesReport(
       agentId: true,
       userId: true,
       agent: { select: { companyName: true, contactName: true } },
-      items: { select: { kind: true, amount: true, totalCostCny: true } },
+      items: {
+        select: {
+          kind: true,
+          amount: true,
+          totalCostCny: true,
+          // 航线维度要按订单派生航线分桶；其余维度用不到这两段，多带一层 select 换一份口径统一。
+          ...ORDER_ROUTE_ITEM_SELECT,
+        },
+      },
     },
   });
 
@@ -227,6 +241,11 @@ export async function getSalesReport(
     } else if (dim === 'agent') {
       orderKey = o.agentId ?? DIRECT_KEY;
       orderLabel = agentLabelOf(o.agent);
+    } else if (dim === 'route') {
+      // 航线是**订单级**属性（一张单只归一条线），故与 channel/agent 同样按单分桶，
+      // 而不是逐行判断 —— 同单的酒店/签证行本来就没有航线，逐行判会把它们全甩进未知桶。
+      orderKey = orderRouteBucketKey(o.items);
+      orderLabel = routeKeyLabel(orderKey);
     }
 
     for (const it of o.items) {

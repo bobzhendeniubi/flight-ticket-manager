@@ -273,7 +273,7 @@ export const EXPORT_ENTRIES: ExportEntry[] = [
     id: 'reports',
     group: 'report',
     name: '经营报表',
-    desc: '4 个 sheet：三维度销售毛利（品类 / 渠道 / 代理）+ 应收账龄 + 代理欠款，统一人民币口径。',
+    desc: '5 个 sheet：四维度销售毛利（品类 / 渠道 / 代理 / 航线）+ 应收账龄 + 代理欠款，统一人民币口径。',
     access: 'finance',
     endpoint: 'GET /reports/export',
     param: 'dateRange',
