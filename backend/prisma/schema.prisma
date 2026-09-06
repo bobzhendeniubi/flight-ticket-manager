@@ -362,7 +362,9 @@ model PrepaymentTransaction {
   createdById  String // user id of the admin/agent/system actor
   createdAt    DateTime         @default(now())
 
-  agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  // C-23：预存款流水是资金账本，不许跟着代理账号硬删——Cascade 会把充值/抵扣历史清空，
+  // 余额去向从此对不上账。改 Restrict：要删代理先处理完它的预存流水（软删/停用不受影响）。
+  agent Agent @relation(fields: [agentId], references: [id], onDelete: Restrict)
 
   @@index([agentId, createdAt])
   @@index([orderId])
@@ -428,7 +430,8 @@ model CommissionRule {
   createdAt     DateTime    @default(now())
   updatedAt     DateTime    @updatedAt
 
-  agent Agent @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  // C-23：返佣费率配置是计佣依据，不许跟着代理账号硬删——改 Restrict（软删/停用不受影响）。
+  agent Agent @relation(fields: [agentId], references: [id], onDelete: Restrict)
 
   @@unique([agentId, productKind, effectiveFrom])
   @@index([agentId])
@@ -1384,7 +1387,8 @@ model SettlementDiscountRule {
   createdAt            DateTime                @default(now())
   updatedAt            DateTime                @updatedAt
 
-  agent Agent? @relation(fields: [agentId], references: [id], onDelete: Cascade)
+  // C-23：结算价立减规则同理，不许跟着代理账号硬删——改 Restrict（软删/停用不受影响）。
+  agent Agent? @relation(fields: [agentId], references: [id], onDelete: Restrict)
 
   @@index([kind, agentId, tier, nights, startDate])
   @@index([agentId])
@@ -1539,6 +1543,9 @@ model Review {
   orderId     String? // 关联订单（订单后评价时填）
   createdAt   DateTime          @default(now())
 
+  // 一张订单对同一个产品只留一条评价：防连点重复提交，也防拿同一张单反复刷「已验证」评价。
+  // orderId 可空（非订单来源的评价）——Postgres 唯一索引里 NULL 互不相等，这些行天然不受约束。
+  @@unique([orderId, productType, productId])
   @@index([productType, productId])
 }
 
@@ -2004,7 +2011,9 @@ model Payment {
   createdAt      DateTime      @default(now())
   updatedAt      DateTime      @updatedAt
 
-  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  // C-23：资金子表不许跟着订单硬删——曾经有过硬删账号/订单的先例，Cascade 会把收款流水
+  // 一并清空，钱去哪了从此在库里找不到痕迹。改成 Restrict：要删订单先处理完它的收款记录（软删不受影响）。
+  order Order @relation(fields: [orderId], references: [id], onDelete: Restrict)
 
   @@index([orderId])
   @@index([status])
@@ -2128,7 +2137,8 @@ model Refund {
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
 
-  order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  // C-23：同 Payment——退款记录不许跟着订单硬删丢失，改 Restrict（软删不受影响）。
+  order Order @relation(fields: [orderId], references: [id], onDelete: Restrict)
 
   @@index([orderId])
   @@index([status])
