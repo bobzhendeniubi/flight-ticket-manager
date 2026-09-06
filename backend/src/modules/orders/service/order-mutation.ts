@@ -10,6 +10,9 @@
  *   4. 守恒：事务提交前对点名的订单做前后快照比对（钱 / 座 / 房 / 成本哪些维度不许动）+ 账本恒等式
  *      （subtotal = Σ items、total = subtotal、应收不为负、Σ 每人份额 = 应收、挂人调价行有人），
  *      不平抛错 → 整事务回滚，无半状态。口径全部来自 order-ledger.ts（复用拆单守恒断言的函数）。
+ *   5. 按人份额落库（persistShares: true，审查根因 R1）：守恒通过后，对本次点名 / track 的每张单调
+ *      service/passenger-shares.persistPassengerShares —— 每位在单乘客一行 upsert（算法不在内核里，
+ *      仍是 lib/order-money 的 perPax*），Σ 份额对不上应收同样抛错回滚。改钱 / 改人的动作都该开它。
  *
  * 内核**不改任何业务口径、错误文案、审计 action 名**：它只提供位置与顺序，动作本身仍写在各自模块里。
  * 内核也**不替动作自动写审计**——路由层与各动作已有各自的审计约定，重复写会让财务对账多出一条。
@@ -36,6 +39,7 @@ import {
   type LedgerDimension,
   type OrderLedgerSnapshot,
 } from './order-ledger.js';
+import { persistPassengerShares } from './passenger-shares.js';
 
 export interface MutationActor {
   userId: string;
@@ -79,6 +83,12 @@ export interface OrderMutationSpec<R> {
   /** 默认 true。false 仅供只读预检类调用（当前七条写路径全部 true）。 */
   lockOrder?: boolean;
   conserve?: MutationConservation;
+  /**
+   * true = body 跑完、守恒通过后，对主单 + conserve.orderIds + ctx.track() 追加的每张单落一遍按人份额
+   *（service/passenger-shares.persistPassengerShares）。会改钱（应收 / 售后费 / 行金额）或改人
+   *（拆单搬人 / 换人 / 自备签翻转）的动作都要开；纯状态类动作可不开。
+   */
+  persistShares?: boolean;
 }
 
 export interface OrderMutationCtx {
@@ -157,6 +167,10 @@ export async function runOrderMutation<R>(
       const after = await snapshotOrderLedger(tx, [...tracked]);
       assertLedgerUnchanged(before, after, spec.conserve.unchanged, label);
       assertNoNewLedgerViolations(before, after, label);
+    }
+    // ── 按人份额落库（R1）：守恒通过之后、提交之前；订单不存在（拆单前的新单 id 之类）自动跳过 ──
+    if (spec.persistShares) {
+      for (const id of tracked) await persistPassengerShares(tx, id);
     }
     return { kind: 'done', result, hooks };
   });

@@ -342,3 +342,70 @@ describe('runOrderOrchestration · 两段式编排', () => {
     expect(mockPrisma.$transaction).not.toHaveBeenCalled(); // 编排本身不开事务
   });
 });
+
+describe('runOrderMutation · persistShares（按人份额落库，R1）', () => {
+  /** 带 orderPassengerShare 委托的事务客户端：写点只在委托存在时才落库。 */
+  function txWithShareDelegate() {
+    const delegate = {
+      deleteMany: vi.fn(async () => ({ count: 0 })),
+      upsert: vi.fn(async (args: unknown) => args),
+    };
+    const shareTx = {
+      ...tx,
+      order: { findUnique: vi.fn(async () => ledgerRow()) },
+      orderPassengerShare: delegate,
+    };
+    mockPrisma.$transaction.mockImplementationOnce(async (fn: (t: unknown) => unknown) => fn(shareTx));
+    return { shareTx, delegate };
+  }
+
+  it('persistShares: true → body 与守恒之后，对主单每位乘客 upsert 一行份额', async () => {
+    const { delegate } = txWithShareDelegate();
+    const order: string[] = [];
+    delegate.upsert.mockImplementation(async (args: unknown) => {
+      order.push('persist');
+      return args;
+    });
+    await runOrderMutation(
+      { orderId: 'o1', actor, action: 'X', persistShares: true, conserve: { unchanged: ['paid'] } },
+      async () => {
+        order.push('body');
+        return 1;
+      },
+    );
+    expect(order).toEqual(['body', 'persist']);
+    expect(delegate.upsert).toHaveBeenCalledTimes(1);
+    const args = delegate.upsert.mock.calls[0][0] as {
+      where: { orderId_passengerId: { orderId: string; passengerId: string } };
+      update: { settlementCny: unknown };
+    };
+    expect(args.where.orderId_passengerId).toEqual({ orderId: 'o1', passengerId: 'p1' });
+    expect(String(args.update.settlementCny)).toBe('1000');
+  });
+
+  it('ctx.track 追加的单也落份额；不开 persistShares 则一行不写', async () => {
+    const { delegate } = txWithShareDelegate();
+    await runOrderMutation({ orderId: 'o1', actor, action: 'X', persistShares: true }, async (ctx) => {
+      ctx.track('o2');
+      return 1;
+    });
+    const orderIds = delegate.upsert.mock.calls.map(
+      ([a]) => (a as { where: { orderId_passengerId: { orderId: string } } }).where.orderId_passengerId.orderId,
+    );
+    expect(orderIds.sort()).toEqual(['o1', 'o2']);
+
+    const second = txWithShareDelegate();
+    await runOrderMutation({ orderId: 'o1', actor, action: 'X' }, async () => 1);
+    expect(second.delegate.upsert).not.toHaveBeenCalled();
+  });
+
+  it('body 抛错 → 不落份额（事务整体回滚）', async () => {
+    const { delegate } = txWithShareDelegate();
+    await expect(
+      runOrderMutation({ orderId: 'o1', actor, action: 'X', persistShares: true }, async () => {
+        throw new Error('boom');
+      }),
+    ).rejects.toThrow('boom');
+    expect(delegate.upsert).not.toHaveBeenCalled();
+  });
+});
