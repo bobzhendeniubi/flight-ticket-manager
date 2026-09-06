@@ -2125,6 +2125,18 @@ model Refund {
   status         RefundStatus @default(REQUESTED)
   processedAt    DateTime?
   gatewayPayload Json?
+  // ── 实付登记（2026-09）──────────────────────────────────────────────────
+  // status=COMPLETED 只表示「这笔退款已核准、订单侧已按退款口径扣减」，真正把钱打回给客人
+  // 仍是财务在银行/微信里的手工动作。此前这一步在系统里没有任何痕迹：谁打的、什么时候打的、
+  // 走的哪条渠道、流水号是多少全靠线下表格，于是「核准了一直没打」和「打过又打一次」两类
+  // 事故都查不出来。这五列只记录「钱确实出去了」这一个事实，**不参与任何金额口径**：
+  // 已收净额仍按 status=COMPLETED 扣（见 lib/net-received.ts），退款状态机一个字不改。
+  // 全部可空：paidAt 为空 = 尚未打款（待打款队列的唯一判据），存量数据天然落在队列里。
+  paidAt         DateTime? // 实际打款时间（财务填，可回溯补录）
+  paidMethod     String? // BANK / WECHAT / ALIPAY / CASH / OTHER
+  paidTxnRef     String? // 银行流水号 / 微信支付单号等对方可核对的凭据
+  paidByUserId   String? // 登记这笔打款的内部账号（不做外键：账号注销不该带走资金留痕）
+  paidNote       String? // 备注（如「分两笔退，本条为第二笔」）
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
 
@@ -2132,6 +2144,8 @@ model Refund {
 
   @@index([orderId])
   @@index([status])
+  // 待打款队列热路径：status=COMPLETED 且 paidAt IS NULL，再按 processedAt 排账龄。
+  @@index([status, paidAt])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
