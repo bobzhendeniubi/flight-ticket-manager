@@ -7,7 +7,7 @@
  *   1. 旗子确实能越过「仅运营/管理员可改期」那句话（代理带旗子进得来，不带一律 403）；
  *   2. 已订座/已出票的单，自助一律不碰（换班次会清全单 PNR/票号并翻回开票位）；
  *   3. 窗口在**锁内**再判一次（入口那次是锁外快照，中间可能已出票/已开票/跨过当天 24:00）；
- *   4. 酒店日期随出发日平移时，随机档超售上限按「代理吃标准上限、运营不闸单」分开走。
+ *   4. 酒店日期随出发日平移时，随机档超售上限与录单同口径（代理算内部录单，与运营一样不闸单）。
  *
  * 三条收紧都只对**代理**成立：运营走的是同一条纠错通道、带着同一面旗子，行为一字不变。
  */
@@ -42,6 +42,12 @@ vi.mock('../hotel-control/hotel-control.service.js', async (importOriginal) => {
 });
 
 import { AGENT_SELF_EDIT_REASON, OrderService } from './orders.service.js';
+import { PricingService } from '../pricing/pricing.service.js';
+
+// 锁内「同航班同价」复核会按建单口径重算目标班次单价：固定成与成交单价相等（= 纠错免费）。
+vi.spyOn(PricingService.prototype, 'calculatePrice').mockResolvedValue({
+  averageUnitPrice: 1000,
+} as unknown as Awaited<ReturnType<PricingService['calculatePrice']>>);
 import { BadRequestError, ForbiddenError } from '../../lib/errors.js';
 
 const service = new OrderService();
@@ -124,7 +130,9 @@ function mountReschedule(
         flightScheduleId: 'sch-old',
         flightCabin: 'ECONOMY',
         metadata: null,
-        flightSchedule: { departureTime: OLD_DEPARTURE, departureTz: 'Asia/Shanghai' },
+        // 锁内「同航班同价」复核要读成交单价与航班 id（与 quoteFlightCorrectionDelta 的 select 对齐）。
+        unitPrice: dec(1000),
+        flightSchedule: { flightId: 'fl-1', departureTime: OLD_DEPARTURE, departureTz: 'Asia/Shanghai' },
       })),
       findMany: vi.fn(async (args: { where?: Record<string, unknown> }) => {
         const where = args?.where ?? {};
@@ -152,7 +160,15 @@ function mountReschedule(
       updateMany: vi.fn(async () => ({ count: passengers.length })),
     },
     flightSeatClass: { findFirst: vi.fn(async () => ({ id: 'sc-1' })) },
-    flightSchedule: { findUnique: vi.fn(async () => null) },
+    // 目标班次：同一航班（fl-1）→ 纠错闸的「同航班」成立；其余字段旁路只读不判。
+    flightSchedule: {
+      findUnique: vi.fn(async () => ({
+        id: 'sch-new',
+        flightId: 'fl-1',
+        departureTime: NEW_DEPARTURE,
+        departureTz: 'Asia/Shanghai',
+      })),
+    },
     hotelRoomType: { findMany: vi.fn(async () => []) },
     seatLock: { aggregate: vi.fn(async () => ({ _sum: { qty: 0 } })) },
   };
@@ -290,13 +306,13 @@ describe('rescheduleOrderItem · 平移酒店日期时的随机档上限', () =>
     return opts?.maxOversellRooms;
   }
 
-  it('代理自助 → 吃标准上限（后台可配，缺省 3 间）', async () => {
+  it('代理自助 → 与录单同口径（代理算内部录单：随机档需求池不闸单，不再单独封顶）', async () => {
     mountReschedule({ withRandomTierHotelRow: true });
 
     await service.rescheduleOrderItem('ord-1', { ...CORRECTION_INPUT }, AGENT);
 
     expect(mockAssertRandomTierFitWithinTx).toHaveBeenCalledTimes(1);
-    expect(capPassedToGate()).toBe(3);
+    expect(capPassedToGate()).toBe(Number.POSITIVE_INFINITY);
   });
 
   it('运营 → 沿用内部录单的「需求池不闸单」（不设上限）', async () => {

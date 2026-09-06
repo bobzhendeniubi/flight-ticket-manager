@@ -29,6 +29,13 @@ export interface BatchOrderChangeRequestModalProps {
 
 type BatchKind = 'VISA' | 'FLIGHT';
 
+/**
+ * 单次批量申请的订单条数上限 —— 对齐后端 batchOrderChangeRequestBodySchema 的 .max(200)。
+ * 列表里勾选的硬上限是 500，超过 200 直接发出去会被 Zod 整体打回、一条都不会创建；
+ * 与其余批量端点一样在前端先拦下并提示分批。
+ */
+const BATCH_CHANGE_REQUEST_ORDER_LIMIT = 200;
+
 export function BatchOrderChangeRequestModal({ orderIds, onClose, onDone }: BatchOrderChangeRequestModalProps) {
   const token = useAuth((s) => s.tokens)?.accessToken ?? '';
 
@@ -48,7 +55,8 @@ export function BatchOrderChangeRequestModal({ orderIds, onClose, onDone }: Batc
   const [err, setErr] = useState<string | null>(null);
   const [result, setResult] = useState<{ created: number; skipped: number; results: OrderChangeRequestBatchResultItem[] } | null>(null);
 
-  const canSubmit = kind === 'VISA' ? true : Boolean(newScheduleId);
+  const overLimit = orderIds.length > BATCH_CHANGE_REQUEST_ORDER_LIMIT;
+  const canSubmit = !overLimit && (kind === 'VISA' ? true : Boolean(newScheduleId));
 
   const submit = async (): Promise<void> => {
     if (!token || !canSubmit || submitting) return;
@@ -126,6 +134,11 @@ export function BatchOrderChangeRequestModal({ orderIds, onClose, onDone }: Batc
           </div>
         ) : (
           <>
+            {overLimit && (
+              <div className="rounded-lg border border-amber-300 bg-amber-50 px-3 py-2.5 text-xs leading-relaxed text-amber-900">
+                单次最多批量申请 {BATCH_CHANGE_REQUEST_ORDER_LIMIT} 条订单，请分批操作（当前已选 {orderIds.length} 条）。
+              </div>
+            )}
             <div className="rounded-lg bg-brand-50 px-3 py-2.5 text-xs leading-relaxed text-brand-700">
               提交后不会立即改动这些订单，运营在「改单申请」队列里确认执行才会真正生效；已有待处理同类申请的订单会被跳过。
             </div>

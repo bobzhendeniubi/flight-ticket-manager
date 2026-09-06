@@ -1,6 +1,6 @@
 import { OrderStatus, Prisma, RefundStatus } from '@prisma/client';
 
-import { BadRequestError } from './errors.js';
+import { BadRequestError, ConflictError } from './errors.js';
 
 /**
  * 资金入口统一状态闸。
@@ -186,6 +186,20 @@ export function assertOrderAllowsFundsDisposal(order: FundsGuardOrder, action: s
     throw new BadRequestError(
       `订单 ${order.orderNumber} 当前状态为「${STATUS_LABEL[order.status]}」，不能${action}。`,
     );
+  }
+}
+
+/**
+ * 收款复核锁闸：财务复核完成后锁定本单收款，锁定态下冻结 paidAmount 的一切**人工**变动——
+ * 人工录收款、多付转代理余额、代理余额抵扣、多付转挂账池都走这一道。
+ * 口径边界：网关回调 / 对账认款是真钱到账，必须如实落库，不受此锁约束（见 payments.service 的说明）。
+ */
+export function assertPaymentsNotLocked(
+  order: { orderNumber: string; paymentsLocked: boolean },
+  action: string,
+): void {
+  if (order.paymentsLocked) {
+    throw new ConflictError(`订单 ${order.orderNumber} 收款已锁定（财务复核完成），请先解锁再${action}`);
   }
 }
 

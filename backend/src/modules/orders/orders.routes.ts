@@ -160,6 +160,10 @@ export const expectedAmountBodySchema = z.object({
     .nullable(),
 });
 
+// 下单按 IP 限流：匿名可达 + 25MB 请求体上限，全局 100/min 桶配合放宽的 body 上限等于
+// 一个廉价的带宽/内存放大型 DoS 面（C-22）；收紧到更严的每分钟次数，不影响正常下单节奏。
+const GUEST_ORDER_CREATE_RATE_LIMIT = { max: 20, timeWindow: '1 minute' } as const;
+
 export const orderRoutes: FastifyPluginAsync = async (app) => {
   const service = new OrderService();
 
@@ -170,6 +174,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       preHandler: [app.optionalAuthenticate],
       // 多人团每位乘客可带一张护照图（data-URL），全局 8MB 上限对 9 人团不够 → 单路由放宽到 25MB
       bodyLimit: 25 * 1024 * 1024,
+      config: { rateLimit: GUEST_ORDER_CREATE_RATE_LIMIT },
     },
     async (req, reply) => {
       const body = createOrderBodySchema.parse(req.body);
@@ -3266,7 +3271,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       },
       severity: 'WARNING',
     });
-    return { order, roomControl: audit.roomControl };
+    return { order, roomControl: audit.roomControl, warning: audit.warning ?? null };
   });
 
   // ── 订单详情补录结构化地面项（ADMIN/STAFF）──
@@ -3300,7 +3305,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       },
       severity: 'WARNING',
     });
-    return { order };
+    return { order, warning: audit.warning ?? null };
   });
 
   // ── 事后调价（0722 公测反馈「按乘客调价」；ADMIN/STAFF）──
@@ -3342,7 +3347,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       },
       severity: 'WARNING',
     });
-    return { order };
+    return { order, warning: audit.warning ?? null };
   });
 };
 

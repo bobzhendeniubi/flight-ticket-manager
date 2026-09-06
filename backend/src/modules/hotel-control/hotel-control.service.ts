@@ -1258,7 +1258,7 @@ export async function checkHotelPhysicalFit(
  * @param opts.maxOversellRooms 限额内超售放行（内部录单专用口子）：售罄后运营仍可录单
  *   （当天临时向酒店加房是常态业务），每晚**累计**缺口 ≤ 此值时不抛错、把被容忍的
  *   超卖明细作为返回值交给调用方写 WARNING 审计；任一晚缺口超上限仍拒（防手滑打穿）。
- *   缺省 = 硬闸（前台散客/代理下单必须缺省）。
+ *   缺省 = 硬闸（前台散客下单必须缺省；代理按口径算内部录单，与运营同享限额）。
  * @param opts.buildMessage 定制错误文案（对外端点用中性话术，后台可回明细）。
  * @returns 被 maxOversellRooms 容忍的超卖明细（未开豁免或装得下 → 空数组）。
  */

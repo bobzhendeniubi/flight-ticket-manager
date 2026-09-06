@@ -46,6 +46,10 @@ const ORDER_ACTION_LABELS: Record<string, string> = {
   VOID_RETURN_LEG: '作废回程',
   CANCEL_RETURN_LEG: '取消回程',
   CANCEL_OUTBOUND_LEG: '取消去程',
+  // ── 改单申请（代理提申请 → 运营确认执行）──
+  ORDER_CHANGE_REQUEST_CREATED: '提交改单申请',
+  ORDER_CHANGE_REQUEST_APPROVED: '确认执行改单申请',
+  ORDER_CHANGE_REQUEST_REJECTED: '驳回改单申请',
   // ── 乘客 / 酒店 / 分房 ──
   SWAP_ORDER_PASSENGER: '换人',
   CORRECT_ORDER_PASSENGER: '改出行人信息',

@@ -11,7 +11,6 @@ const EnvSchema = z.object({
   REDIS_URL: z.string().url(),
 
   JWT_ACCESS_SECRET: z.string().min(32, 'JWT_ACCESS_SECRET must be at least 32 characters'),
-  JWT_REFRESH_SECRET: z.string().min(32, 'JWT_REFRESH_SECRET must be at least 32 characters'),
   JWT_ACCESS_TTL: z.coerce.number().int().positive().default(3600), // seconds
   JWT_REFRESH_TTL: z.coerce.number().int().positive().default(60 * 60 * 24 * 30),
 
@@ -142,8 +141,8 @@ const EnvSchema = z.object({
   //      删除周期无豁免（零容忍）。
   //   2) 内部录单限额内超售 —— 销控售罄后运营仍可录单（当天临时向酒店加房是常态业务），
   //      每晚累计缺口 ≤ 上限放行并写 WARNING 审计、销控板显示负数；超上限拒单，
-  //      防手滑（如大团录错日期一次打穿负十几间）。仅后台 ADMIN/STAFF 录单享有，
-  //      前台散客/代理下单仍是硬闸。
+  //      防手滑（如大团录错日期一次打穿负十几间）。内部录单享有——口径拍板：代理（AGENT）
+  //      算内部录单，与 ADMIN/STAFF 同享；只有前台散客（游客 / CUSTOMER）是硬闸。
   // ═══════════════════════════════════════════════════════════
   HOTEL_MAX_OVERSELL_ROOMS: z.coerce.number().int().min(0).default(3),
 
@@ -187,12 +186,11 @@ export const corsOrigins =
     : rawCorsOrigins.split(',').map((s) => s.trim()).filter(Boolean);
 
 // 生产环境拒绝占位 JWT 密钥（防止 .env 模板原样上线）
-if (
-  env.NODE_ENV === 'production' &&
-  (env.JWT_ACCESS_SECRET.includes('change_me') || env.JWT_REFRESH_SECRET.includes('change_me'))
-) {
+// C-28：JWT_REFRESH_SECRET 已删除——refresh token 是存库的随机字符串（RefreshToken 表 + hash），
+// 从不用 JWT 签发/校验，这个变量从来没被实际用来签过任何东西，只在这里挡过占位符。
+if (env.NODE_ENV === 'production' && env.JWT_ACCESS_SECRET.includes('change_me')) {
   // eslint-disable-next-line no-console
-  console.error('❌ JWT secrets are placeholders; generate real ones: openssl rand -base64 48');
+  console.error('❌ JWT_ACCESS_SECRET is a placeholder; generate a real one: openssl rand -base64 48');
   process.exit(1);
 }
 

@@ -4462,11 +4462,13 @@ export const api = {
       token,
       body,
     }),
-  allocateHoldInstallment: (token: string, holdId: string, installmentId: string, body: { receiptId: string; amountCny: number }) =>
+  // F-14：requestToken 可选——后端幂等键上线前老前端/未升级客户端仍可正常调用；
+  // 弹窗侧固定生成一次并在重试时复用同一个 token，双击不再重复入账。
+  allocateHoldInstallment: (token: string, holdId: string, installmentId: string, body: { requestToken?: string; receiptId: string; amountCny: number }) =>
     apiFetch<{ result: { allocation: HoldReceiptAllocation; receiptNo: string; installmentPaid: boolean; holdStatus: HoldOrderStatus; warning: string | null } }>(
       `/hold-orders/${holdId}/installments/${installmentId}/allocate`, { method: 'POST', token, body }),
   // 手工到账：运营凭客户水单直接给某期录钱（建 OPS_CLAIM 进账并认款；财务事后在对账台核实）。
-  manualReceiptHoldInstallment: (token: string, holdId: string, installmentId: string, body: { amountCny: number; method: PaymentMethod; proofUrl?: string; note?: string }) =>
+  manualReceiptHoldInstallment: (token: string, holdId: string, installmentId: string, body: { requestToken?: string; amountCny: number; method: PaymentMethod; proofUrl?: string; note?: string }) =>
     apiFetch<{ result: { allocation: HoldReceiptAllocation; receiptNo: string; installmentPaid: boolean; holdStatus: HoldOrderStatus; warning: string | null } }>(
       `/hold-orders/${holdId}/installments/${installmentId}/manual-receipt`, { method: 'POST', token, body }),
   reverseHoldInstallmentAllocation: (token: string, holdId: string, installmentId: string, allocationId: string, reason: string) =>
@@ -4552,7 +4554,7 @@ export const api = {
           note?: string;
         },
   ) =>
-    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/items/ground`, {
+    apiFetch<{ order: OrderSummary ; warning?: string | null }>(`/orders/${orderId}/items/ground`, {
       method: 'POST',
       token,
       body,
@@ -5497,7 +5499,7 @@ export const api = {
       passengerId?: string;
     },
   ) =>
-    apiFetch<{ order: OrderSummary; roomControl: string | null }>(`/orders/${orderId}/room-supplement`, {
+    apiFetch<{ order: OrderSummary; roomControl: string | null; warning?: string | null }>(`/orders/${orderId}/room-supplement`, {
       method: 'POST',
       token,
       body,
@@ -5520,7 +5522,7 @@ export const api = {
       passengerId?: string;
     },
   ) =>
-    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/price-adjustment`, {
+    apiFetch<{ order: OrderSummary; warning?: string | null }>(`/orders/${orderId}/price-adjustment`, {
       method: 'POST',
       token,
       body,

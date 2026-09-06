@@ -1,4 +1,4 @@
-import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type VoidReturnLegPreview, type OrderLegFlagFilter, type PublicLegStatus, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE, TOKEN_PAYLOAD_MISMATCH_CODE, TOKEN_PAYLOAD_MISMATCH_HINT } from '../lib/api';
 import { useAuth } from '../stores/auth';
@@ -890,6 +890,80 @@ function SwapFeeOptionsSetting({ token }: { token: string }) {
   );
 }
 
+/**
+ * 展开态的乘客子行（一人一行，colSpan 贯穿全表）。
+ *
+ * 从订单行里抽出来单独 memo：每页最多 200 张单，一张单全展开就是十几行，
+ * 勾选/悬浮这类跟乘客无关的页面状态变化本会把这些行全部重渲一遍。
+ * 入参全是标量 + 乘客对象本身（不传整份 Set / 回调），引用不变就跳过重渲。
+ * 展示口径原样保留：证件号一律脱敏（看全号进详情抽屉），列表接口没有的字段缺就不显示。
+ */
+const PassengerSubRow = memo(function PassengerSubRow({
+  passenger: p,
+  index,
+  colSpan,
+  orderHasVisaTask,
+}: {
+  passenger: OrderSummary['passengers'][number];
+  index: number;
+  colSpan: number;
+  /** 本单是否真有签证任务：无签证的单不给每人挂送签进度徽章。 */
+  orderHasVisaTask: boolean;
+}) {
+  const masked = maskDocumentNumber(p.documentNumber);
+  const mark = genderMark(p.gender);
+  const displayName = p.chineseName?.trim() || p.fullName;
+  const submission = p.visaSubmissionStatus ?? 'PENDING';
+  return (
+    <tr className="bg-slate-50">
+      <td colSpan={colSpan} className="!py-1.5 pl-16">
+        <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-0.5 text-[11px] leading-snug">
+          <span className="nums w-4 shrink-0 text-ink-muted">{index + 1}</span>
+          <span className="font-medium text-ink">{displayName}</span>
+          {displayName !== p.fullName ? <span className="text-ink-soft">{p.fullName}</span> : null}
+          {mark ? (
+            <span className="text-[10px] text-ink-soft" title={p.gender ? GENDER_TEXT[p.gender] : undefined}>
+              {mark}
+            </span>
+          ) : null}
+          {p.dateOfBirth ? <span className="nums text-ink-muted">{p.dateOfBirth.slice(0, 10)}</span> : null}
+          {p.nationality ? <span className="text-ink-muted">{p.nationality}</span> : null}
+          {masked ? (
+            <span className="nums font-mono text-ink-soft" title="中段已脱敏，完整证件号见订单详情">
+              {masked}
+            </span>
+          ) : null}
+          {p.passportExpiry ? (
+            <span className="nums text-ink-muted" title="护照有效期">
+              至 {p.passportExpiry.slice(0, 10)}
+            </span>
+          ) : null}
+          {/* 签证：自备签乘客不进送签流程，只标「自备签」；其余仅在本单
+              有签证任务时按送签进度标（无签证的单不挂进度徽章） */}
+          {p.visaExempt ? (
+            <span className="rounded bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 ring-1 ring-sky-200">
+              自备签
+            </span>
+          ) : orderHasVisaTask ? (
+            <span className={`${SUBMISSION_BADGE[submission]} text-[10px]`} title="送签进度">
+              {SUBMISSION_LABEL[submission]}
+            </span>
+          ) : null}
+          {p.singleRoom ? (
+            <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-amber-200">
+              单住
+            </span>
+          ) : null}
+          {p.pnr ? <span className="font-mono tabular-nums text-ink-soft">PNR {p.pnr}</span> : null}
+          {p.eticketNumber ? (
+            <span className="font-mono tabular-nums text-ink-soft">票号 {p.eticketNumber}</span>
+          ) : null}
+        </div>
+      </td>
+    </tr>
+  );
+});
+
 export function OrdersPage() {
   const confirm = useConfirm();
   const highRiskConfirmRef = useRef(false);
@@ -1642,6 +1716,9 @@ export function OrdersPage() {
       setOrders((prev) => prev.filter((o) => o.id !== order.id));
       setSelected((prev) => (prev && prev.id === order.id ? null : prev));
       // 软删不触碰库存/座位账，无需广播座位变更。
+      // 但「共 X 条」与总页数来自服务端 total，只删本地行会让它停在删除前的旧数字；
+      // 与其余批量操作一样走统一刷新入口把总数拉正（页码越界的钳位也在那里）。
+      await refetchCurrentPage();
     } catch (err) {
       // 占座守卫等 4xx 的后端提示（如「请先取消订单释放座位，再删除」）直接透传。
       if (err instanceof ApiError) {
@@ -2289,6 +2366,10 @@ export function OrdersPage() {
       setOrders((prev) => prev.filter((o) => !ids.includes(o.id) || failedIds.has(o.id)));
       setBulkDeleteResult({ succeeded, failed: failures.length, failures });
       setSelectedIds(new Set(failures.map((f) => f.id)));
+      // 「共 X 条」与总页数来自服务端 total：只删本地行会让它停在删除前的旧数字。
+      // 刷新走统一入口（带当前筛选 + 当前页）；刷新失败只点亮列表上方的错误条，
+      // 不影响上面已经落库的删除结果。
+      if (succeeded > 0) await refetchCurrentPage();
     } finally {
       setBulkDeleteSubmitting(false);
       highRiskConfirmRef.current = false;
@@ -4435,72 +4516,20 @@ export function OrdersPage() {
                     不为凑格子发额外请求，也不臆造空值。证件号一律脱敏（maskDocumentNumber），
                     看全号进详情抽屉——子行只作展示，不挂详情点击。 */}
                 {expandedPassengerOrderIds.has(order.id) &&
-                  order.passengers.map((p, pIdx) => {
-                    const masked = maskDocumentNumber(p.documentNumber);
-                    const mark = genderMark(p.gender);
-                    const displayName = p.chineseName?.trim() || p.fullName;
-                    const submission = p.visaSubmissionStatus ?? 'PENDING';
+                  (() => {
                     // 送签进度只在本单真有签证任务时显示（与签证筛选同源）——
                     // 纯机票/不需要签证的单不给每人挂「待处理」，避免误读成有签证在等。
                     const orderHasVisaTask = deriveVisaStatus(order) !== null;
-                    return (
-                      <tr key={p.id} className="bg-slate-50">
-                        <td colSpan={tableColSpan} className="!py-1.5 pl-16">
-                          <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-0.5 text-[11px] leading-snug">
-                            <span className="nums w-4 shrink-0 text-ink-muted">{pIdx + 1}</span>
-                            <span className="font-medium text-ink">{displayName}</span>
-                            {displayName !== p.fullName ? (
-                              <span className="text-ink-soft">{p.fullName}</span>
-                            ) : null}
-                            {mark ? (
-                              <span
-                                className="text-[10px] text-ink-soft"
-                                title={p.gender ? GENDER_TEXT[p.gender] : undefined}
-                              >
-                                {mark}
-                              </span>
-                            ) : null}
-                            {p.dateOfBirth ? (
-                              <span className="nums text-ink-muted">{p.dateOfBirth.slice(0, 10)}</span>
-                            ) : null}
-                            {p.nationality ? <span className="text-ink-muted">{p.nationality}</span> : null}
-                            {masked ? (
-                              <span className="nums font-mono text-ink-soft" title="中段已脱敏，完整证件号见订单详情">
-                                {masked}
-                              </span>
-                            ) : null}
-                            {p.passportExpiry ? (
-                              <span className="nums text-ink-muted" title="护照有效期">
-                                至 {p.passportExpiry.slice(0, 10)}
-                              </span>
-                            ) : null}
-                            {/* 签证：自备签乘客不进送签流程，只标「自备签」；其余仅在本单
-                                有签证任务时按送签进度标（无签证的单不挂进度徽章） */}
-                            {p.visaExempt ? (
-                              <span className="rounded bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 ring-1 ring-sky-200">
-                                自备签
-                              </span>
-                            ) : orderHasVisaTask ? (
-                              <span className={`${SUBMISSION_BADGE[submission]} text-[10px]`} title="送签进度">
-                                {SUBMISSION_LABEL[submission]}
-                              </span>
-                            ) : null}
-                            {p.singleRoom ? (
-                              <span className="rounded bg-amber-50 px-1.5 py-0.5 text-[10px] font-medium text-amber-700 ring-1 ring-amber-200">
-                                单住
-                              </span>
-                            ) : null}
-                            {p.pnr ? (
-                              <span className="font-mono tabular-nums text-ink-soft">PNR {p.pnr}</span>
-                            ) : null}
-                            {p.eticketNumber ? (
-                              <span className="font-mono tabular-nums text-ink-soft">票号 {p.eticketNumber}</span>
-                            ) : null}
-                          </div>
-                        </td>
-                      </tr>
-                    );
-                  })}
+                    return order.passengers.map((p, pIdx) => (
+                      <PassengerSubRow
+                        key={p.id}
+                        passenger={p}
+                        index={pIdx}
+                        colSpan={tableColSpan}
+                        orderHasVisaTask={orderHasVisaTask}
+                      />
+                    ));
+                  })()}
                 </Fragment>
               ))}
               {!loading && filtered.length === 0 && (
@@ -6241,25 +6270,26 @@ function GroundItemModal({
     }
     setSaving(true);
     try {
-      if (kind === 'VISA') {
-        await api.addGroundItem(token, orderId, {
-          kind,
-          visaId: selectedVisaId,
-          quantity,
-          unitPriceCny: priceNumber,
-          note: note.trim() || undefined,
-        });
-      } else {
-        await api.addGroundItem(token, orderId, {
-          kind,
-          hotelRoomTypeId: selectedRoomTypeId,
-          nights,
-          rooms,
-          checkIn: checkIn || undefined,
-          unitPriceCny: priceNumber,
-          note: note.trim() || undefined,
-        });
-      }
+      // 已付单补录会产生新尾款/多付：后端把后果算好带回来，这里与改结算价一样弹出提示。
+      const res =
+        kind === 'VISA'
+          ? await api.addGroundItem(token, orderId, {
+              kind,
+              visaId: selectedVisaId,
+              quantity,
+              unitPriceCny: priceNumber,
+              note: note.trim() || undefined,
+            })
+          : await api.addGroundItem(token, orderId, {
+              kind,
+              hotelRoomTypeId: selectedRoomTypeId,
+              nights,
+              rooms,
+              checkIn: checkIn || undefined,
+              unitPriceCny: priceNumber,
+              note: note.trim() || undefined,
+            });
+      if (res.warning) alert(res.warning);
       await onSaved();
     } catch (err) {
       setError(err instanceof ApiError ? err.message : '保存失败');
@@ -6519,7 +6549,7 @@ function RoomSupplementForm({
       const splitGuide = passengerId
         ? '如该乘客需单独换酒店：先到分房把 TA 单独成组并归属酒店行，再用金额明细该酒店行上的「拆房组」，拆出后对新行换酒店。'
         : '';
-      const successNotes = [res.roomControl, splitGuide].filter(Boolean);
+      const successNotes = [res.roomControl, res.warning, splitGuide].filter(Boolean);
       if (successNotes.length > 0) alert(successNotes.join('\n\n'));
       onSaved();
     } catch (e) {
@@ -10595,6 +10625,8 @@ function PriceAdjustmentSection({
         passengerId: scope === 'WHOLE' ? undefined : scope,
       });
       onOrderUpdated?.(res.order);
+      // 已付单调价形成多付/新尾款：后端算好后果带回，与改结算价一样弹出让运营处置。
+      if (res.warning) alert(res.warning);
       // 复位录入框（保留作用范围，方便连续给同一人调多笔）
       setAmount(null);
       setReasonText('');
@@ -11836,6 +11868,19 @@ function levenshteinDistance(a: string, b: string): number {
 }
 const CORRECTION_DOC_DIFF_LIMIT = 2;
 
+/**
+ * 换人时可给新出行人指定的敬称（值域与后端 swapPassengerBodySchema 的 title 枚举一致）。
+ * 真换人时服务端会把敬称清空、不继承旧人；这里留空即沿用该默认。
+ */
+const SWAP_TITLE_OPTIONS: ReadonlyArray<{ value: string; label: string }> = [
+  { value: 'MR', label: 'MR 先生' },
+  { value: 'MRS', label: 'MRS 女士（已婚）' },
+  { value: 'MS', label: 'MS 女士' },
+  { value: 'MISS', label: 'MISS 小姐' },
+  { value: 'MSTR', label: 'MSTR 男童' },
+  { value: 'DR', label: 'DR 博士' },
+];
+
 // ── 改信息（CORRECTION，纠错不清资料）/ 换人（SWAP，改身份 + 可选重置开票/签证 + 换人费）─────
 function PassengerEditForm({
   orderId,
@@ -11868,6 +11913,8 @@ function PassengerEditForm({
   const [dob, setDob] = useState(passenger.dateOfBirth?.slice(0, 10) ?? '');
   const [gender, setGender] = useState<'M' | 'F' | 'X' | ''>(passenger.gender ?? '');
   const [nationality, setNationality] = useState(passenger.nationality ?? '');
+  // 新出行人敬称（仅换人通道有这个键；留空 = 不带，服务端按「不继承旧人」清空）。
+  const [title, setTitle] = useState('');
   const [resetInvoice, setResetInvoice] = useState(false);
   const [resetVisa, setResetVisa] = useState(false);
   const [feeCny, setFeeCny] = useState<number | null>(null);
@@ -12244,8 +12291,12 @@ function PassengerEditForm({
     }
     setSubmitting(true);
     try {
+      // 敬称是换人通道独有的键（后端 swapPassengerBodySchema 已收）；lib/api.ts 的 body 类型
+      // 还没声明它，先在调用点按契约单独声明后展开，待 api 类型补齐可并回下面的字面量。
+      const swapExtraFields: { title?: string } = title ? { title } : {};
       const res = await api.updateOrderPassenger(token, orderId, passenger.id, {
         mode: 'SWAP',
+        ...swapExtraFields,
         lastName: lastName.trim() || undefined,
         firstName: firstName.trim() || undefined,
         fullName: fullName.trim() || undefined,
@@ -12420,6 +12471,32 @@ function PassengerEditForm({
           )}
         </label>
       </div>
+
+      {/* 换人专属：新出行人的敬称 + 自备签/单住的默认口径提示。
+          敬称随请求一起提交；自备签/单住不在这里改——真换人时服务端一律把新人回落成
+          「随团办签 + 拼房」，改这两项要走各自的专用入口（那两条路会连同签证减免、
+          计费房数一起算对；从换人通道翻标记只写标记不动钱）。 */}
+      {mode === 'SWAP' && (
+        <div className="space-y-1.5 rounded border border-slate-200 bg-white p-2">
+          <label className="block">
+            <span className="text-slate-500">称谓（选填）</span>
+            <select className={inputCls} value={title} onChange={(e) => setTitle(e.target.value)}>
+              <option value="">不填（不继承原出行人）</option>
+              {SWAP_TITLE_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+          </label>
+          {isRealSwapNow && (
+            <p className="text-[10px] leading-relaxed text-slate-500">
+              新出行人默认「随团办签 + 拼房」，乘客类型按出生日期自动判定。
+              需要改自备签或单住，请在换人完成后走订单详情里对应的按人入口——那两条路会同时把签证减免与计费房数算对。
+            </p>
+          )}
+        </div>
+      )}
 
       {mode === 'SWAP' && !isAgentUser && (
         <div className="space-y-1 rounded border border-slate-200 bg-white p-2">

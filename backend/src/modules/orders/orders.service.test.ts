@@ -106,7 +106,7 @@ const {
     },
     orderCostItem: { create: vi.fn() },
     // findMany：订正通道的「历史订正」闸要回查这位出行人此前的 CORRECT_ORDER_PASSENGER 审计。
-    auditLog: { create: vi.fn(), findMany: vi.fn(async () => []) },
+    auditLog: { create: vi.fn(), findMany: vi.fn(async () => []), findFirst: vi.fn(async () => null) },
     seatLock: {
       aggregate: vi.fn(),
       findMany: vi.fn(),

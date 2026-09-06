@@ -278,7 +278,11 @@ function CostItemsCard({
   const confirmLockRef = useRef(false);
   const [items, setItems] = useState<OrderCostItem[]>([]);
   const [loading, setLoading] = useState(true);
-  const [err, setErr] = useState<string | null>(null);
+  // 三个表单各管各的报错：以前共用一个 err，「编辑行没填金额」的红框会连坐刚展开、
+  // 用户还没碰过的新增行（两处红框判定都在比同一个 err 字符串）。
+  const [err, setErr] = useState<string | null>(null); // 卡片级：加载 / 删除
+  const [addErr, setAddErr] = useState<string | null>(null);
+  const [editErr, setEditErr] = useState<string | null>(null);
 
   // 新增表单 inline 行
   const [showAdd, setShowAdd] = useState(false);
@@ -319,10 +323,10 @@ function CostItemsCard({
   async function addItem() {
     if (!token || addSubmitting) return;
     if (draft.amount === null || !(draft.amount > 0)) {
-      setErr('金额需为正数');
+      setAddErr('金额需为正数');
       return;
     }
-    setErr(null);
+    setAddErr(null);
     setAddSubmitting(true);
     try {
       const r = await api.createOrderCostItem(token, orderId, {
@@ -335,7 +339,7 @@ function CostItemsCard({
       setShowAdd(false);
       onChanged?.();
     } catch (e: unknown) {
-      setErr(e instanceof ApiError ? e.message : '新增失败');
+      setAddErr(e instanceof ApiError ? e.message : '新增失败');
     } finally {
       setAddSubmitting(false);
     }
@@ -348,21 +352,22 @@ function CostItemsCard({
       amount: Number(item.amountCny),
       note: item.note ?? '',
     });
-    setErr(null);
+    setEditErr(null);
   }
 
   function cancelEdit() {
     setEditingId(null);
     setEditDraft(EMPTY_DRAFT);
+    setEditErr(null);
   }
 
   async function saveEdit(id: string) {
     if (!token || editSubmitting) return;
     if (editDraft.amount === null || !(editDraft.amount > 0)) {
-      setErr('金额需为正数');
+      setEditErr('金额需为正数');
       return;
     }
-    setErr(null);
+    setEditErr(null);
     setEditSubmitting(true);
     try {
       const r = await api.updateOrderCostItem(token, id, {
@@ -375,7 +380,7 @@ function CostItemsCard({
       setEditDraft(EMPTY_DRAFT);
       onChanged?.();
     } catch (e: unknown) {
-      setErr(e instanceof ApiError ? e.message : '保存失败');
+      setEditErr(e instanceof ApiError ? e.message : '保存失败');
     } finally {
       setEditSubmitting(false);
     }
@@ -418,8 +423,10 @@ function CostItemsCard({
         </div>
       </div>
 
-      {err && (
-        <div className="mx-4 mt-3 rounded-lg border border-rose-200 bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>
+      {(err ?? editErr ?? addErr) && (
+        <div className="mx-4 mt-3 rounded-lg border border-rose-200 bg-rose-50 px-2 py-1 text-xs text-rose-700">
+          {err ?? editErr ?? addErr}
+        </div>
       )}
 
       <div className="overflow-x-auto">
@@ -463,7 +470,7 @@ function CostItemsCard({
                         <NumberInput
                           step={0.01}
                           className={`input nums w-32 ${
-                            err === '金额需为正数' && !(editDraft.amount !== null && editDraft.amount > 0)
+                            editErr === '金额需为正数' && !(editDraft.amount !== null && editDraft.amount > 0)
                               ? 'border-rose-400 bg-rose-50'
                               : ''
                           }`}
@@ -540,7 +547,7 @@ function CostItemsCard({
                   <NumberInput
                     step={0.01}
                     className={`input nums w-32 ${
-                      err === '金额需为正数' && !(draft.amount !== null && draft.amount > 0)
+                      addErr === '金额需为正数' && !(draft.amount !== null && draft.amount > 0)
                         ? 'border-rose-400 bg-rose-50'
                         : ''
                     }`}
@@ -571,6 +578,7 @@ function CostItemsCard({
                       onClick={() => {
                         setShowAdd(false);
                         setDraft(EMPTY_DRAFT);
+                        setAddErr(null);
                       }}
                       disabled={addSubmitting}
                     >
@@ -591,7 +599,7 @@ function CostItemsCard({
             onClick={() => {
               setShowAdd(true);
               setDraft(EMPTY_DRAFT);
-              setErr(null);
+              setAddErr(null);
             }}
           >
             + 新增

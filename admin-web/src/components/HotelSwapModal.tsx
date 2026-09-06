@@ -15,6 +15,11 @@
  *
  * 确认前用 GET /hotel-control/nightly-remaining 预览目标酒店逐晚余量（同酒店换房型时
  * 后端会跳过余量校验——房量净不变，预览也没有意义，故跳过展示）。
+ *
+ * 套餐（BUNDLE）行换到星级与套餐结算档次不符的酒店时，服务端对运营是 block-with-override：
+ * 必须带「放行原因」才放行并留痕。本弹窗拿不到该行所属套餐的结算档次（订单行 DTO 不带），
+ * 所以照改单申请队列的做法——先提交，命中带「放行原因」字样的 400 就把输入框亮出来让运营补填后重提；
+ * 代理自助换酒店服务端是硬拒（没有放行这个口子），因此对代理不展示该输入。
  */
 import { useEffect, useMemo, useState } from 'react';
 import {
@@ -32,6 +37,7 @@ import { useAuth } from '../stores/auth';
 import { Icon } from './Icon';
 import { useDialogA11y } from './Modal';
 import { NumberInput } from './NumberInput';
+import { isStarMismatchApproveError, STAR_MISMATCH_REASON_MAX } from './orderChangeRequestShared';
 import { SearchSelect, type SearchSelectOption } from './SearchSelect';
 
 export interface HotelSwapItemHint {
@@ -89,6 +95,7 @@ export function HotelSwapModal({ orderId, item, locateHint, hideFee, onClose, on
   const dialogRef = useDialogA11y(onClose);
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
+  const isAgentUser = useAuth((s) => s.user?.role) === 'AGENT';
 
   const [hotels, setHotels] = useState<Hotel[] | null>(null);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -107,6 +114,10 @@ export function HotelSwapModal({ orderId, item, locateHint, hideFee, onClose, on
 
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+
+  // 星级不符放行：命中服务端那道闸后才亮出来（换目标酒店时复位——原因是绑在具体那家店上的）
+  const [starMismatchBlocked, setStarMismatchBlocked] = useState(false);
+  const [starMismatchReason, setStarMismatchReason] = useState('');
 
   // ── 加载在架酒店 + 房型（换到的目标选项 + 定位/展示用元数据）──
   useEffect(() => {
@@ -228,8 +239,28 @@ export function HotelSwapModal({ orderId, item, locateHint, hideFee, onClose, on
     };
   }, [token, newRoomTypeId, isSameHotel, checkIn, checkOut]);
 
+  /** 换目标酒店/房型：清掉上一家店的放行原因与拦截态，避免把 A 店的理由带到 B 店。 */
+  function pickRoomType(id: string): void {
+    setNewRoomTypeId(id);
+    setStarMismatchBlocked(false);
+    setStarMismatchReason('');
+  }
+
+  const trimmedStarMismatchReason = starMismatchReason.trim();
+  const starMismatchReasonInvalid =
+    starMismatchBlocked &&
+    (trimmedStarMismatchReason.length === 0 || trimmedStarMismatchReason.length > STAR_MISMATCH_REASON_MAX);
+
   async function submit(): Promise<void> {
     if (!token || !resolvedItem || !newRoomTypeId || submitting) return;
+    if (starMismatchReasonInvalid) {
+      setErr(
+        trimmedStarMismatchReason.length === 0
+          ? '档次不匹配的酒店需要填写放行原因才能换；如选错酒店请改回同档次的店'
+          : `放行原因最多 ${STAR_MISMATCH_REASON_MAX} 字，请精简后重新提交`,
+      );
+      return;
+    }
     setErr(null);
     setSubmitting(true);
     try {
@@ -239,9 +270,15 @@ export function HotelSwapModal({ orderId, item, locateHint, hideFee, onClose, on
         feeCny: hasFee ? (feeCny as number) : undefined,
         feeLabel: hasFee ? '换酒店差价' : undefined,
         note: feeNote.trim() || undefined,
+        designatedHotelStarMismatchReason: trimmedStarMismatchReason || undefined,
       });
       onSwapped(res.order);
     } catch (e: unknown) {
+      // 命中「套餐档次与酒店星级不符」那道闸：亮出放行原因输入，让运营补填后原样重提
+      // （代理自助服务端是硬拒，给输入框只会让人白填一遍）。
+      if (e instanceof ApiError && !isAgentUser && isStarMismatchApproveError(e.message)) {
+        setStarMismatchBlocked(true);
+      }
       setErr(e instanceof ApiError ? e.message : '换酒店失败');
     } finally {
       setSubmitting(false);
@@ -322,7 +359,7 @@ export function HotelSwapModal({ orderId, item, locateHint, hideFee, onClose, on
                 <SearchSelect
                   options={roomTypeOptions}
                   value={newRoomTypeId || null}
-                  onChange={setNewRoomTypeId}
+                  onChange={pickRoomType}
                   placeholder={hotels ? '搜索目标酒店 / 房型…' : '加载中…'}
                   disabled={!hotels}
                   className="mt-1"
@@ -362,6 +399,25 @@ export function HotelSwapModal({ orderId, item, locateHint, hideFee, onClose, on
                   ) : (
                     <div className="mt-1.5 text-xs text-ink-muted">无入住区间数据，无法预览（确认时仍会校验）</div>
                   )}
+                </div>
+              )}
+
+              {starMismatchBlocked && (
+                <div className="rounded-lg border border-amber-300 bg-amber-50 p-3">
+                  <span className="label text-amber-900">
+                    套餐档次与酒店星级不符 · 放行原因（必填，{STAR_MISMATCH_REASON_MAX} 字以内，随订单留档备查）
+                  </span>
+                  <input
+                    className="input mt-1"
+                    value={starMismatchReason}
+                    onChange={(e) => setStarMismatchReason(e.target.value)}
+                    maxLength={STAR_MISMATCH_REASON_MAX}
+                    placeholder="如：原酒店满房，客人同意换到该店"
+                    aria-label="套餐档次与酒店星级不符的放行原因"
+                  />
+                  <p className="mt-1.5 text-[11px] leading-relaxed text-amber-800">
+                    填写后再点「确认换酒店」即可放行；如是选错了店，改回同档次的酒店即可。
+                  </p>
                 </div>
               )}
 

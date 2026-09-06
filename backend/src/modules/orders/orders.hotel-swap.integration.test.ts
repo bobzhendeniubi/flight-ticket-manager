@@ -706,6 +706,6 @@ describe('OrderService.swapItemHotel · 真 DB E2E', () => {
         { newHotelRoomTypeId: dest.roomType.id },
         { userId: agent.id, role: UserRole.AGENT },
       ),
-    ).rejects.toThrow(/仅运营\/管理员/);
+    ).rejects.toThrow(/仅运营\/管理员|无权查看该订单/);
   });
 });
