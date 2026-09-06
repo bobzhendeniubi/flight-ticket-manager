@@ -994,6 +994,10 @@ enum OrderChangeKind {
   VISA   // 订单级签证状态（只允许 需要 / 电子签 / 不需要）
   HOTEL  // 换酒店房型（差价恒 0）
   CABIN  // 升商务舱（差价服务端算）
+  // ↓ 以下三类挂在 feature flag AGENT_CHANGE_REQUEST_EXTRA_KINDS 后面，默认关。
+  SPLIT       // 拆单（按乘客拆出新单；执行走既有 splitOrder，含守恒断言）
+  CANCEL_LEG  // 取消单程航段（去程/回程二选一；退款一律走取消政策，申请里不许自定金额）
+  VISA_EXEMPT // 按人改自备签（确认只放行管理员与签证岗）
 }
 
 enum OrderChangeRequestStatus {

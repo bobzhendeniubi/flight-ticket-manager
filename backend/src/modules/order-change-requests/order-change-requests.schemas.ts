@@ -46,6 +46,45 @@ export const cabinChangeSubmitSchema = z.object({
 });
 export type CabinChangeSubmit = z.infer<typeof cabinChangeSubmitSchema>;
 
+// ── 扩展三类（feature flag AGENT_CHANGE_REQUEST_EXTRA_KINDS，默认关）────────────
+// 共同口径：申请里**一个金额字段都不收**。三个动作各自的钱都由服务端权威算
+//（拆单按每人份额、取消航段按取消政策、改自备签按建单快照费率），
+// 让提交方填数就等于开了一条绕过定价的口子。
+
+/** 拆单：要拆出去的乘客（至少 1 位，且不能是全员 —— 拆单通道自己会拒）。 */
+export const splitChangeSubmitSchema = z.object({
+  passengerIds: z.array(z.string().min(1)).min(1, '至少选择 1 位乘客').max(99),
+  /** 落到拆单动作自己的备注上（进 SPLIT_ORDER 审计），与申请说明 note 是两件事。 */
+  note: z.string().max(200, '备注最多 200 字').optional(),
+});
+export type SplitChangeSubmit = z.infer<typeof splitChangeSubmitSchema>;
+
+/** 取消单程航段：只选去程/回程；退多少一律按取消政策，申请里给不出金额字段。 */
+export const cancelLegChangeSubmitSchema = z.object({
+  leg: z.enum(['OUTBOUND', 'RETURN']),
+  note: z.string().max(200, '备注最多 200 字').optional(),
+});
+export type CancelLegChangeSubmit = z.infer<typeof cancelLegChangeSubmitSchema>;
+
+/** 按人改自备签：哪位乘客 + 改成自备 / 不自备。确认只放行管理员与签证岗（见 service）。 */
+export const visaExemptChangeSubmitSchema = z.object({
+  passengerId: z.string().min(1, 'passengerId 必填'),
+  visaExempt: z.boolean(),
+  note: z.string().max(200, '备注最多 200 字').optional(),
+});
+export type VisaExemptChangeSubmit = z.infer<typeof visaExemptChangeSubmitSchema>;
+
+/** 挂在 flag 后面的三类；提交 / 预检 / 可用类型三处都按这张表判要不要查 flag。 */
+export const FLAGGED_ORDER_CHANGE_KINDS = [
+  OrderChangeKind.SPLIT,
+  OrderChangeKind.CANCEL_LEG,
+  OrderChangeKind.VISA_EXEMPT,
+] as const;
+
+export function isFlaggedOrderChangeKind(kind: OrderChangeKind): boolean {
+  return (FLAGGED_ORDER_CHANGE_KINDS as readonly OrderChangeKind[]).includes(kind);
+}
+
 // ── 路由入参 ────────────────────────────────────────────────────────────────
 
 export const createOrderChangeRequestBodySchema = z.object({
