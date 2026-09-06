@@ -172,3 +172,73 @@ describe('散行乘客 · 多词名（0831 公测反馈：LAM/MENG IEONG 被截�
     expect(r.passengers[0]).toMatchObject({ fullName: 'FANG/BIN', gender: 'M' });
   });
 });
+
+describe('散行乘客 · 未映射 3 位码误判国籍（0905 运营反馈：ZHOU/NIAO FEN 被截成 ZHOU/NIAO 且国籍误填 FEN）', () => {
+  it('未映射 3 位纯字母 token（FEN）不算强国家 token，并入名字，真实国籍（中国大陆）被正确取到', () => {
+    // Arrange
+    const roster =
+      'QH9588 DAD-MFM 2026-09-01\nZHOU/NIAO FEN 女 普通 护照 EN1403318 中国大陆 1979-03-13 2034-8-6';
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert
+    expect(r.passengers).toHaveLength(1);
+    expect(r.passengers[0]).toMatchObject({
+      fullName: 'ZHOU/NIAO FEN',
+      lastName: 'ZHOU',
+      firstName: 'NIAO FEN',
+      gender: 'F',
+      documentNumber: 'EN1403318',
+      nationality: 'CN',
+      dateOfBirth: '1979-03-13',
+      passportExpiry: '2034-08-06',
+    });
+    expect(r.warnings.some((w) => w.includes('国籍码'))).toBe(false);
+  });
+
+  it('映射 3 位码（VNM）仍是强国家 token，正常识别为 VN', () => {
+    // Arrange
+    const roster = 'QH9588 DAD-MFM 2026-09-01\nZHANG/SAN 男 E12345678 VNM 1990-01-01 2030-01-01';
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert
+    expect(r.passengers).toHaveLength(1);
+    expect(r.passengers[0]).toMatchObject({ fullName: 'ZHANG/SAN', nationality: 'VN' });
+  });
+
+  it('全篇只有未映射 3 位码、没有别的国籍证据时，保持原行为：回退取该码为国籍并提示核对', () => {
+    // Arrange
+    const roster = 'QH9588 DAD-MFM 2026-09-01\nLI/HUA 女 EA1234567 XYZ 1990-01-01 2030-01-01';
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert
+    expect(r.passengers).toHaveLength(1);
+    expect(r.passengers[0]).toMatchObject({ fullName: 'LI/HUA', nationality: 'XYZ' });
+    expect(
+      r.warnings.some((w) => w.includes('国籍码「XYZ」为 3 位码且未匹配到已知映射，已按原样保留')),
+    ).toBe(true);
+  });
+
+  it('裸 2 位字母（YU）不算强国家 token，并入名字；中文国名（中国大陆）仍被正确取到', () => {
+    // Arrange
+    const roster =
+      'QH9588 DAD-MFM 2026-09-01\nWANG/XIAO YU 男 中国大陆 E12345678 1990-01-01 2030-01-01';
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert
+    expect(r.passengers).toHaveLength(1);
+    expect(r.passengers[0]).toMatchObject({
+      fullName: 'WANG/XIAO YU',
+      lastName: 'WANG',
+      firstName: 'XIAO YU',
+      nationality: 'CN',
+    });
+  });
+});

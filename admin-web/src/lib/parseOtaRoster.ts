@@ -39,8 +39,10 @@
  *     单独编码
  *  • 乘客行识别特征（三者都命中才算乘客行，避免误伤航段/编码行）：
  *    以「姓/名」（含斜杠的拉丁姓名）开头 + 行内含性别 token（男/女/M/F）+ 含证件号 token（字母+数字混合、长度≥6）。
- *    证件类型词（普通/护照等）忽略；国籍取剩余 token 中第一个能识别为国家的；两个日期按「生日≤今年<有效期」的
- *    合理性顺序分配为出生日期/有效期（判断不出合理顺序时保留原书写顺序）。
+ *    证件类型词（普通/护照等）忽略；国籍优先取剩余 token 中第一个「强国家 token」（中文国名/CN·CHN·CHINA/
+ *    映射到已知国家的 3 位码），没有强 token 时才回退到第一个能被 parseCountry 识别的（含未映射 3 位码/
+ *    裸 2 位字母）；两个日期按「生日≤今年<有效期」的合理性顺序分配为出生日期/有效期（判断不出合理顺序时
+ *    保留原书写顺序）。
  *  • 航段行放宽：航班号 + 两个 3 位大写机场码 + 日期，允许纯空格分隔（无需 - 分隔符）；先跑严格分支（原有
  *    DAD-MFM 语法），结果不全时用宽松分支（空格分隔）补全缺失字段，避免宽松分支误伤/覆盖严格分支已识别的航段。
  *    乘客行的判定发生在航段解析之前——命中乘客行特征就不再尝试当航段解析，避免把生日误当航班日期。
@@ -305,6 +307,23 @@ function isUnmappedThreeLetterCountry(raw: string): boolean {
   return /^[A-Z]{3}$/.test(upper) && !(upper in COUNTRY_3TO2) && upper !== 'CHN';
 }
 
+/**
+ * 0905 运营反馈：raw 是否为「强国家 token」——足以确定就是国籍/签发国的证据，包括：
+ * 中文国名（中国/中国大陆/中国地区、COUNTRY_CN_NAME_TO_2 命中的越南/日本/…）、CN/CHN/CHINA、
+ * 以及 COUNTRY_3TO2 里查得到映射的 3 位码（如 VNM、MAC）。
+ * 未映射的 3 位纯字母（如 FEN，见「ZHOU/NIAO FEN」被误拆成国籍 FEN 的反馈）与裸 2 位大写字母
+ * （如 NA、LI，拼音单音节太多撞 ISO2）都不算强——不足以打断多词姓名吸收，也不足以抢占国籍优先权。
+ */
+function isStrongCountryToken(raw: string): boolean {
+  const v = raw.trim();
+  if (!v) return false;
+  if (/^中国(大陆)?(地区)?$/.test(v)) return true;
+  if (v in COUNTRY_CN_NAME_TO_2) return true;
+  const upper = v.toUpperCase();
+  if (upper === 'CN' || upper === 'CHN' || upper === 'CHINA') return true;
+  return /^[A-Z]{3}$/.test(upper) && upper in COUNTRY_3TO2;
+}
+
 /** 段起始键（乘客名）。注：不能用 \b —— 中文字符非 \w，「乘机人:」间无词边界。 */
 const NAME_KEY = /^(乘机人|乘客|旅客|姓名|name)\s*:?/i;
 
@@ -443,17 +462,19 @@ function parseLoosePassengerLine(line: string, dmy = false): WorkPassenger | nul
   const tokens = restRaw.split(' ').map((t) => t.trim()).filter(Boolean);
   if (tokens.length === 0) return null;
 
-  // 多词名吸收（0831 公测反馈：LAM/MENG IEONG 被截成 LAM/MENG）：港澳台/外籍名常有多个
-  // 词（MENG IEONG、MEI LING），紧跟名后的纯字母 token 若既不是性别词也不是国籍词就并入名。
-  // 单字母（M/F 性别码）与含数字 token（证件号）天然不吸收；吸收在性别/证件识别前进行，
-  // 消费掉的 token 不再参与后续字段判定。
+  // 多词名吸收（0831 公测反馈：LAM/MENG IEONG 被截成 LAM/MENG；0905 运营反馈：ZHOU/NIAO FEN
+  // 被截成 ZHOU/NIAO 且 FEN 被误当国籍码）：港澳台/外籍名常有多个词（MENG IEONG、MEI LING），
+  // 紧跟名后的纯字母 token 若既不是性别词、称谓词，也不是「强国家 token」（见 isStrongCountryToken）
+  // 就并入名。未映射的 3 位纯字母（如 FEN）与裸 2 位大写字母（拼音单音节太多撞 ISO2）都不算强，
+  // 一律并入名字，不打断吸收。单字母（M/F 性别码）与含数字 token（证件号）天然不吸收；吸收在
+  // 性别/证件识别前进行，消费掉的 token 不再参与后续字段判定。
   const firstParts = [firstHead];
   while (tokens.length > 0) {
     const t = tokens[0];
     if (!/^[A-Za-z]{2,}$/.test(t)) break;
     if (/^(?:MR|MRS|MS|MISS|MSTR|MASTER|CHD|INF)$/iu.test(t)) break; // 称谓/类型码不是名
     if (parseGender(t) !== null) break;
-    if (parseCountry(t) !== null) break;
+    if (isStrongCountryToken(t)) break;
     firstParts.push(t);
     tokens.shift();
   }
@@ -471,9 +492,12 @@ function parseLoosePassengerLine(line: string, dmy = false): WorkPassenger | nul
   if (g) px.gender = g;
   px.documentNumber = docToken.toUpperCase();
 
-  // 国籍：证件类型词（普通/护照等）与已消费 token 之外，第一个能被 parseCountry 识别的 token。
+  // 国籍：证件类型词（普通/护照等）与已消费 token 之外，优先取第一个「强国家 token」（中文国名/
+  // CN·CHN·CHINA/映射到已知国家的 3 位码）；一个强 token 都没有时才回退到原逻辑——第一个能被
+  // parseCountry 识别的 token（含未映射 3 位码/裸 2 位字母，仍保留 __nationalityUnmapped 提示）。
   const consumed = new Set([genderToken, docToken]);
-  const countryToken = tokens.find((t) => !consumed.has(t) && parseCountry(t) !== null);
+  const strongCountryToken = tokens.find((t) => !consumed.has(t) && isStrongCountryToken(t));
+  const countryToken = strongCountryToken ?? tokens.find((t) => !consumed.has(t) && parseCountry(t) !== null);
   if (countryToken) {
     const c = parseCountry(countryToken) as string;
     px.nationality = c;
