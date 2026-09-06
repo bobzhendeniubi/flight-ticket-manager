@@ -100,6 +100,7 @@ model User {
   marketingPosters MarketingPoster[]     @relation("MarketingPosterCreator")
   seatLocks        SeatLock[]
   seatWaitlists    SeatWaitlist[]
+  invoiceRequests  Invoice[]             @relation("InvoiceRequestedBy")
 
   @@index([role])
   @@index([createdAt])
@@ -338,6 +339,7 @@ model Agent {
   settlementRequests      SettlementRequest[]
   bundleChangeRequests    BundleChangeRequest[]
   orderChangeRequests     OrderChangeRequest[]
+  invoices                Invoice[]
 
   @@index([isActive])
   @@index([parentAgentId])
@@ -1599,6 +1601,93 @@ model SupplierInvoiceLine {
 
 /// 付款记录 —— 钱真的打出去的那一笔。
 /// 每笔自带汇率：同一张美金账单分两次付，两天的汇率不一样，CNY 实付自然不同。
+// ─────────────────────────────────────────────────────────────────────────────
+// 发票 —— 给客户 / 代理开的**真发票**（增值税专票 / 普票 / 收据）。
+//
+// ⚠️ 与订单上的「开票」三个布尔位（outboundInvoiced / returnInvoiced / systemInvoiced）
+//    **完全无关，且绝不互相影响**。那三个是票务岗的**出票**进度（去程出票没有、回程出票没有、
+//    系统里出票没有），同事口中的「开票」指的就是它们，口径一个字不能动。
+//    本表是财务的**发票**：抬头、税号、发票号、开具日、金额。两件事只是中文撞了名字。
+//    任何一侧的读写都不许联动另一侧 —— 这是本表存在的前提。
+//
+// 一张发票可以关联多张订单（客人攒了几单一起开），故用 InvoiceOrder 中间表。
+// 金额一律服务端按关联订单的应收合计算，不收客户端传的数 —— 发票金额不能由申请方说了算。
+//
+// 状态机（三态，终局唯一）：
+//   REQUESTED —申请—→ 财务开具 —→ ISSUED
+//   REQUESTED / ISSUED —作废—→ VOID（终局，必须填原因）
+// 作废之后这几张订单可以重新申请；未作废前同一张订单不许挂第二张有效发票（防重复开票）。
+// ─────────────────────────────────────────────────────────────────────────────
+enum InvoiceType {
+  VAT_SPECIAL // 增值税专用发票（必须有税号）
+  VAT_GENERAL // 增值税普通发票
+  RECEIPT // 收据
+}
+
+/// 发票记录状态。名字带 Record 是为了跟既有的 InvoiceStatus（订单级「开票」旧单值）区分开，
+/// 两个枚举语义无关，绝不可混用。
+enum InvoiceRecordStatus {
+  REQUESTED // 已申请，等财务开
+  ISSUED // 已开具
+  VOID // 已作废（终局）
+}
+
+model Invoice {
+  id     String              @id @default(cuid())
+  /// 发票抬头（公司名 / 个人名）
+  title  String
+  /// 纳税人识别号；专票必填，普票 / 收据可空
+  taxNo  String?
+  /// 开票信息补充（地址电话、开户行账号），普票常常不用填
+  billingInfo String?
+  type   InvoiceType
+  /// 开票金额（CNY）= Σ 关联订单应收（total + adjustmentCny），服务端算，不收客户端传值
+  amountCny Decimal          @db.Decimal(12, 2)
+  status InvoiceRecordStatus @default(REQUESTED)
+  /// 发票号（开具时填）
+  invoiceNo String?
+  /// 开具日（date-only）
+  issuedAt  DateTime?        @db.Date
+  /// 发票文件 / 扫描件 URL
+  attachmentUrl String?
+  /// 申请方：登录用户；代理申请时同时记归属代理
+  requestedByUserId String?
+  agentId           String?
+  requestNote String?
+  /// 作废留痕
+  voidReason String?
+  voidedAt   DateTime?
+  voidedBy   String? // userId
+  issuedBy   String? // userId
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  requestedBy User?          @relation("InvoiceRequestedBy", fields: [requestedByUserId], references: [id], onDelete: SetNull)
+  agent       Agent?         @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  orders      InvoiceOrder[]
+
+  @@index([status, createdAt])
+  @@index([agentId, status])
+  @@index([requestedByUserId])
+}
+
+/// 发票 ↔ 订单 多对多。一张发票可含多单；一张订单在「未作废」的发票里只许出现一次
+/// （防重复开票，闸在服务层事务里判——状态在 Invoice 上，DB 唯一索引跨不了表）。
+model InvoiceOrder {
+  id        String @id @default(cuid())
+  invoiceId String
+  orderId   String
+  /// 该订单计入本张发票的金额（CNY）—— 建单时按订单应收快照，之后订单改价不追溯已开的票
+  amountCny Decimal @db.Decimal(12, 2)
+  createdAt DateTime @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([invoiceId, orderId])
+  @@index([orderId])
+}
+
 model SupplierPayment {
   id        String   @id @default(cuid())
   invoiceId String
@@ -1918,6 +2007,8 @@ model Order {
   orderChangeRequests  OrderChangeRequest[]
   // 供应商应付账单明细挂过来的反向关系（某笔成本落到哪张订单头上）；纯只读引用
   supplierInvoiceLines SupplierInvoiceLine[]
+  // 给客户/代理开的真发票（与订单上的「开票」三个布尔位无关，见 Invoice 模型注释）
+  invoiceLinks         InvoiceOrder[]
 
   @@index([userId, createdAt])
   @@index([agentId, createdAt])
