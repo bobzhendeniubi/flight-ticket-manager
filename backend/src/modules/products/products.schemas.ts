@@ -87,7 +87,13 @@ export type BundleFlightRefQuery = z.infer<typeof bundleFlightRefQuerySchema>;
 export const createHotelBodySchema = z.object({
   name: z.string().min(1).max(200),
   nameEn: z.string().max(200).optional(),
-  cityCode: z.string().min(2).max(10),
+  // 城市代码：随机档按城市圈定的事实源。归一（去空白 + 大写）在这里做，'dad ' 与 'DAD' 是同一个城市。
+  cityCode: z
+    .string()
+    .trim()
+    .min(2)
+    .max(10)
+    .transform((code) => code.toUpperCase()),
   area: z.string().max(100).optional(),
   address: z.string().min(1).max(500),
   starRating: z.number().int().min(1).max(5),

@@ -17,6 +17,7 @@ import {
   type BundleFlightBinding,
 } from './bundle-pricing.js';
 import { bundleRouteKey, resolveBundleRoute } from './bundle-route.js';
+import { normalizeCityCode } from '../hotel-control/hotel-city.js';
 import {
   assertHotelDeleteAllowed,
   assertHotelNameAllowed,
@@ -274,7 +275,8 @@ export class ProductsService {
           code,
           name: body.name,
           nameEn: body.nameEn,
-          cityCode: body.cityCode,
+          // 城市代码归一后落库（schema 已 trim/大写，这里再兜一层，聚合按等值匹配）
+          cityCode: normalizeCityCode(body.cityCode),
           area: body.area,
           address: body.address,
           starRating: body.starRating,
@@ -317,7 +319,7 @@ export class ProductsService {
       const data: Prisma.HotelUpdateInput = {};
       if (body.name !== undefined) data.name = body.name;
       if (body.nameEn !== undefined) data.nameEn = body.nameEn;
-      if (body.cityCode !== undefined) data.cityCode = body.cityCode;
+      if (body.cityCode !== undefined) data.cityCode = normalizeCityCode(body.cityCode);
       if (body.area !== undefined) data.area = body.area;
       if (body.address !== undefined) data.address = body.address;
       if (body.starRating !== undefined) data.starRating = body.starRating;
