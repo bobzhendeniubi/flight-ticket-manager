@@ -32,6 +32,7 @@ export * from './audit.js';
 export * from './auth.js';
 export * from './bundle-change-requests.js';
 export * from './customers.js';
+export * from './finances.js';
 export * from './flight-settlement-rates.js';
 export * from './flights.js';
 export * from './fulfillment.js';

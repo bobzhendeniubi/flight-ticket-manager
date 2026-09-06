@@ -14,6 +14,8 @@
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { UserRole } from '@prisma/client';
 import { z } from 'zod';
+// 成本快照回填的查询参数：定义在契约包（前后端同一份）
+import { costBackfillQuerySchema } from '@ftm/contracts/finances';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { businessDateISO } from '../../lib/business-time.js';
 import {
@@ -72,15 +74,6 @@ const rangeSchema = z.object({
 const monthlySchema = z.object({
   months: z.coerce.number().int().positive().max(36).optional(),
   routeKey: routeKeyParam,
-});
-
-// 成本快照回填：limit 缺省 = 全量；apply 缺省 false（只算不写，先看清楚要补多少行再动手）。
-const costBackfillSchema = z.object({
-  limit: z.coerce.number().int().positive().max(100_000).optional(),
-  apply: z
-    .enum(['true', 'false'])
-    .optional()
-    .transform((v) => v === 'true'),
 });
 
 // 成本字段：number 或 null（清空）；缺省 = 不改（统一 CNY，无汇率）
@@ -202,7 +195,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     '/cost-snapshots/backfill',
     { preHandler: [app.authenticate, app.requireCapability('finances.cost.backfill')] },
     async (req) => {
-      const q = costBackfillSchema.parse(req.query);
+      const q = costBackfillQuerySchema.parse(req.query);
       const result = await backfillItemCostSnapshots({ limit: q.limit, apply: q.apply });
       // 真写库才留审计（dry-run 只是看一眼，写审计反而是噪音）。
       if (q.apply && result.filled > 0) {
