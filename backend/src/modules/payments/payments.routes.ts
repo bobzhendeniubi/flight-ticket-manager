@@ -327,7 +327,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
   // ── 沙箱测试口 — 仅 development 环境 + ADMIN，生产一律 404 ─────
   app.post(
     '/sandbox-confirm',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    { preHandler: [app.authenticate, app.requireCapability('payments.sandbox_confirm')] },
     async (req, reply) => {
       // 生产环境（NODE_ENV=production）一律 404 — 防止部署时 PAYMENT_MODE 忘改
       if (process.env.NODE_ENV === 'production') {

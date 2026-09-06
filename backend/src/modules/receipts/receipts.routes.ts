@@ -41,7 +41,7 @@ import { statementExportFilename, statementPlatformFileError } from './receipts.
 
 export const receiptRoutes: FastifyPluginAsync = async (app) => {
   const service = new ReceiptsService();
-  const requireAdminOrStaff = app.requireRole(UserRole.ADMIN, UserRole.STAFF);
+  const requireAdminOrStaff = app.requireCapability('receipts.manage');
 
   // ── 挂账池列表 ───────────────────────────────────────
   // 回 { receipts, summary }：summary 是未认领的**服务端全量聚合**（笔数 + 未认余额合计），

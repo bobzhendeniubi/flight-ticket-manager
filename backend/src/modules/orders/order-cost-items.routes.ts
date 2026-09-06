@@ -39,7 +39,7 @@ const updateBodySchema = z
   .refine((v) => Object.keys(v).length > 0, { message: 'no fields to update' });
 
 export const orderCostItemRoutes: FastifyPluginAsync = async (app) => {
-  const requireAdminOrStaff = app.requireRole(UserRole.ADMIN, UserRole.STAFF);
+  const requireAdminOrStaff = app.requireCapability('orders.cost_items.manage');
 
   // ── 列表（按订单） ──────────────────────────────────────────────
   app.get(

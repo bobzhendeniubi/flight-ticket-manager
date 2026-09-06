@@ -104,10 +104,10 @@ function logView(
 
 export const financesRoutes: FastifyPluginAsync = async (app) => {
   const requireFinance = {
-    preHandler: [app.authenticate, app.requireFinanceAccess],
+    preHandler: [app.authenticate, app.requireCapability('finances.view')],
   };
   const requireAdminOrStaff = {
-    preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)],
+    preHandler: [app.authenticate, app.requireCapability('finances.cost.manage')],
   };
 
   app.get('/summary', requireFinance, async (req) => {

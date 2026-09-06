@@ -63,7 +63,7 @@ function logView(
 
 export const reportRoutes: FastifyPluginAsync = async (app) => {
   const requireFinance = {
-    preHandler: [app.authenticate, app.requireFinanceAccess],
+    preHandler: [app.authenticate, app.requireCapability('reports.view')],
   };
 
   // ── 销售毛利（按产品线 / 渠道 / 代理）──

@@ -27,7 +27,7 @@ import {
 
 export const settlementRateRoutes: FastifyPluginAsync = async (app) => {
   const requireStaff = {
-    preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)],
+    preHandler: [app.authenticate, app.requireCapability('settlement_rates.write')],
   };
 
   // ── 可维护航线 ──────────────────────────────────────────────────────────

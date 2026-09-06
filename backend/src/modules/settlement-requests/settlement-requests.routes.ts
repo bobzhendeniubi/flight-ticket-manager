@@ -32,7 +32,7 @@ const service = new SettlementRequestsService();
 
 // ── 挂在 /orders 前缀 ────────────────────────────────────────────────
 export const orderSettlementRequestRoutes: FastifyPluginAsync = async (app) => {
-  const requireAgentOrOps = app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT);
+  const requireAgentOrOps = app.requireCapability('settlement_requests.submit');
 
   // 提交议价申请
   app.post(
@@ -87,8 +87,8 @@ export const orderSettlementRequestRoutes: FastifyPluginAsync = async (app) => {
 
 // ── 挂在 /settlement-requests 前缀 ───────────────────────────────────
 export const settlementRequestRoutes: FastifyPluginAsync = async (app) => {
-  const requireOps = app.requireRole(UserRole.ADMIN, UserRole.STAFF);
-  const requireAgentOrOps = app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT);
+  const requireOps = app.requireCapability('settlement_requests.decide');
+  const requireAgentOrOps = app.requireCapability('settlement_requests.submit');
 
   // 待办队列
   app.get('/', { preHandler: [app.authenticate, requireAgentOrOps] }, async (req) => {

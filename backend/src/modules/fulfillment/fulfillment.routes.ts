@@ -23,7 +23,7 @@ import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 
 export const fulfillmentRoutes: FastifyPluginAsync = async (app) => {
   const service = new FulfillmentService();
-  const pre = { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] };
+  const pre = { preHandler: [app.authenticate, app.requireCapability('fulfillment.manage')] };
 
   app.get('/', pre, async (req) => {
     const q = listFulfillmentQuerySchema.parse(req.query);

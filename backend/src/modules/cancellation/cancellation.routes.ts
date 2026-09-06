@@ -36,7 +36,7 @@ export const cancellationRoutes: FastifyPluginAsync = async (app) => {
   const pre = {
     preHandler: [
       app.authenticate,
-      app.requireRole(UserRole.ADMIN, UserRole.STAFF),
+      app.requireCapability('cancellation_policies.manage'),
     ],
   };
 

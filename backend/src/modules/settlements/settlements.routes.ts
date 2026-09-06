@@ -21,7 +21,7 @@ export const settlementRoutes: FastifyPluginAsync = async (app) => {
 
   app.post(
     '/generate',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('settlements.manage')] },
     async (req, reply) => {
       const body = generateSettlementsBodySchema.parse(req.body);
       const requester = await buildRequester(req.user.sub, req.user.role);
@@ -53,7 +53,7 @@ export const settlementRoutes: FastifyPluginAsync = async (app) => {
 
   app.patch(
     '/:id/status',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('settlements.manage')] },
     async (req) => {
       const { id } = req.params as { id: string };
       const body = updateSettlementStatusBodySchema.parse(req.body);
