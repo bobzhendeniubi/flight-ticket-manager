@@ -367,6 +367,11 @@ const INLINE_GATES: InlineGate[] = [
     cap: 'orders.passengers.write',
     legacy: isOps,
   },
+  {
+    来源: 'orders.routes.ts POST /:id/payments-lock 与 /batch/payments-lock（收款复核锁）',
+    cap: 'orders.payments_lock',
+    legacy: isOps,
+  },
 ];
 
 describe('能力表：与替换前的内联角色判断逐格等价', () => {

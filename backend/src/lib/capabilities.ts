@@ -160,7 +160,12 @@ export const CAPABILITIES = {
     audience: 'OPS_AND_AGENT',
     说明: '代理也能用的导出：三模板、全岗总表、进单统计（服务端强制裁列并圈到自己树内）',
   },
-  'orders.batch_lock': { audience: 'OPS', 说明: '批量锁收款 / 锁结算价 / 批量调价' },
+  'orders.batch_lock': { audience: 'OPS', 说明: '批量锁结算价 / 批量调价' },
+  'orders.payments_lock': {
+    // 收款复核锁：业务录收款 → 财务对账无误 → 锁本单收款。单单与批量是同一件事，同一条能力。
+    audience: 'OPS',
+    说明: '锁定 / 解锁本单收款复核（单单与批量）',
+  },
   'orders.itinerary': { audience: 'OPS_AND_AGENT', 说明: '行程单 PDF 与 PNR 导出' },
 
   // ── 收款 / 认款 ──────────────────────────────────────────────────────────

@@ -65,6 +65,7 @@ export type Capability =
   | 'orders.no_show'
   | 'orders.passengers.swap'
   | 'orders.passengers.write'
+  | 'orders.payments_lock'
   | 'orders.price_adjust'
   | 'orders.read'
   | 'orders.read_deleted'
