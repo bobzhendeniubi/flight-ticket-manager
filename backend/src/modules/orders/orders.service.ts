@@ -114,6 +114,12 @@ import { resolveBundleNights } from '../products/bundle-nights.js';
 import { parseVisaExpressTiers, type VisaExpressTier } from '../products/products.schemas.js';
 import { localDate } from '../finances/finances.cost.service.js';
 import { getSettlementRate } from '../settlement-rates/settlement-rates.service.js';
+// 套餐航线派生唯一入口：结算价日历 / 立减规则按航线取键；派生不到 = 没有航线 = 不取价（不兜底）。
+import {
+  BUNDLE_ROUTE_SELECT,
+  LEGACY_ROUTE_KEY,
+  bundleRouteKey,
+} from '../products/bundle-route.js';
 import { getFlightSettlementRate } from '../settlement-rates/flight-settlement-rates.service.js';
 import {
   resolveAgentSettlementDiscount,
@@ -566,7 +572,11 @@ export type SwapRepriceSkipReason =
 export type SwapCalendarKey =
   | {
       source: 'BUNDLE_SETTLEMENT_CALENDAR';
-      /** 套餐日历的三维键：档次 × 晚数 × 去程出发本地日。 */
+      /**
+       * 套餐日历的四维键：航线 × 档次 × 晚数 × 去程出发本地日。
+       * 航线加进键里，套餐换绑到别的航线（改档到另一条线的套餐）同样算「换了一格」，不按日历重算。
+       */
+      routeKey: string;
       tier: string;
       nights: number;
       departDate: string;
@@ -584,7 +594,7 @@ export type SwapCalendarKey =
 export function calendarKeyFingerprint(key: SwapCalendarKey | null | undefined): string | null {
   if (!key) return null;
   if (key.source === 'BUNDLE_SETTLEMENT_CALENDAR') {
-    return `BUNDLE|${key.tier}|${key.nights}|${key.departDate}`;
+    return `BUNDLE|${key.routeKey}|${key.tier}|${key.nights}|${key.departDate}`;
   }
   const legs = key.legs
     .map((leg) => `${leg.flightNumber}@${leg.departDate}`)
@@ -606,7 +616,12 @@ export function readCalendarKey(raw: unknown): SwapCalendarKey | null {
     const departDate = str(obj.departDate);
     const nights = typeof obj.nights === 'number' && Number.isFinite(obj.nights) ? obj.nights : null;
     if (tier == null || departDate == null || nights == null) return null;
-    return { source: 'BUNDLE_SETTLEMENT_CALENDAR', tier, nights, departDate };
+    // 航线这一维是本批（结算价日历加航线）才盖进键里的。更早落库的键没有它——那时系统只有
+    // 澳门-岘港一条线，迁移也把日历存量行统一回填成 MFM-DAD；这里对存量键做同一个回填读法，
+    // 才不会让所有老单在换人当天一律撞 PRICING_KEY_CHANGED。⚠ 仅限回读**已落库**的键，
+    // 取价侧派生不到航线绝不用它兜底。
+    const routeKey = str(obj.routeKey) ?? LEGACY_ROUTE_KEY;
+    return { source: 'BUNDLE_SETTLEMENT_CALENDAR', routeKey, tier, nights, departDate };
   }
   if (obj.source === 'FLIGHT_SETTLEMENT_CALENDAR') {
     if (!Array.isArray(obj.legs) || obj.legs.length === 0) return null;
@@ -1230,7 +1245,10 @@ export function resolveCalendarPerPaxBasis(
         ? (lines[0].nights as number)
         : null;
     if (tier != null && nights != null && departDate != null) {
-      key = { source: 'BUNDLE_SETTLEMENT_CALENDAR', tier, nights, departDate };
+      // 本批之前的取价审计行没有 routeKey（当时只有一条线）：按迁移同一口径读成 MFM-DAD。
+      // 新单的审计行一律带 routeKey（resolveBundleSettlementCalendarTotal 派生不到就不取价）。
+      const routeKey = str(lines[0].routeKey) ?? LEGACY_ROUTE_KEY;
+      key = { source: 'BUNDLE_SETTLEMENT_CALENDAR', routeKey, tier, nights, departDate };
     }
   } else if (calendarAudit.source === 'FLIGHT_SETTLEMENT_CALENDAR') {
     let sum = 0;
@@ -3109,9 +3127,11 @@ export class OrderService {
       const tier = line.tier as SettlementTier | undefined;
       const nights = Number(line.nights);
       const departDate = typeof line.departDate === 'string' ? line.departDate : null;
+      // 航线随取价行一起来（同一把派生键）；没有航线的行本来就不会进日历取价，这里同样不匹配立减。
+      const routeKey = typeof line.routeKey === 'string' && line.routeKey !== '' ? line.routeKey : null;
       const pax = Math.max(0, Math.trunc(Number(line.pax) || 0));
-      if (!tier || !departDate || !Number.isInteger(nights) || pax <= 0) continue;
-      const hit = await resolveAgentSettlementDiscount(agentId, tier, nights, departDate);
+      if (!tier || !departDate || !routeKey || !Number.isInteger(nights) || pax <= 0) continue;
+      const hit = await resolveAgentSettlementDiscount(agentId, routeKey, tier, nights, departDate);
       if (!hit) continue;
       const bundleId = typeof line.bundleId === 'string' ? line.bundleId : null;
       const item = buildSettlementDiscountItem({ hit, pax, bundleId });
@@ -3159,12 +3179,26 @@ export class OrderService {
 
     const bundles = await prisma.bundle.findMany({
       where: { id: { in: [...new Set(bundleItems.map((item) => item.bundleId))] } },
-      select: { id: true, name: true, settlementTier: true, settlementNights: true },
+      select: {
+        id: true,
+        name: true,
+        settlementTier: true,
+        settlementNights: true,
+        ...BUNDLE_ROUTE_SELECT,
+      },
     });
     const bundleById = new Map(bundles.map((bundle) => [bundle.id, bundle]));
+    // 立减按航线隔离：配了档次/晚数但没绑航班的套餐派生不出航线 → 不匹配立减（不兜底到任何航线）。
     const configured = bundleItems.filter((item) => {
       const bundle = bundleById.get(item.bundleId);
-      return bundle?.settlementTier != null && bundle.settlementNights != null;
+      if (bundle?.settlementTier == null || bundle.settlementNights == null) return false;
+      if (bundleRouteKey(bundle) != null) return true;
+      // eslint-disable-next-line no-console
+      console.warn('[settlement-discounts] 套餐未绑航班，无结算价：不匹配散客立减', {
+        bundleId: bundle.id,
+        bundleName: bundle.name,
+      });
+      return false;
     });
     if (configured.length === 0) return null;
 
@@ -3178,6 +3212,8 @@ export class OrderService {
     for (const item of configured) {
       const bundle = bundleById.get(item.bundleId);
       if (!bundle?.settlementTier || bundle.settlementNights == null) continue;
+      const routeKey = bundleRouteKey(bundle);
+      if (!routeKey) continue; // configured 已滤掉，此处只为收窄类型
       const departDate = await this.resolveBundleItemDepartureLocalDate(body, item);
       if (!departDate) continue;
       const pax = resolveBundleOccupancy({
@@ -3189,6 +3225,7 @@ export class OrderService {
       }).headCount;
       if (pax <= 0) continue;
       const hit = await resolveRetailSettlementDiscount(
+        routeKey,
         bundle.settlementTier as SettlementTier,
         bundle.settlementNights,
         departDate,
@@ -3209,6 +3246,7 @@ export class OrderService {
       // 同业价基准：命中立减的这几张套餐按同一（档次×晚数×出发日）取同业结算价，
       // 累加成本单的「同业价合计」，供下方击穿闸比对。取不到价的行不进基准（宁可不判）。
       const rate = await getSettlementRate(
+        routeKey,
         bundle.settlementTier as SettlementTier,
         bundle.settlementNights,
         departDate,
@@ -3281,14 +3319,28 @@ export class OrderService {
     const bundleIds = [...new Set(bundleItems.map((it) => it.bundleId))];
     const bundles = await prisma.bundle.findMany({
       where: { id: { in: bundleIds } },
-      select: { id: true, name: true, settlementTier: true, settlementNights: true },
+      select: {
+        id: true,
+        name: true,
+        settlementTier: true,
+        settlementNights: true,
+        ...BUNDLE_ROUTE_SELECT,
+      },
     });
     const bundleById = new Map(bundles.map((b) => [b.id, b]));
 
-    // 只处理「档次 + 晚数都配了」的套餐行；未配 → 现状不变（不进结算收敛）。
+    // 只处理「档次 + 晚数都配了 **且派生得出航线**」的套餐行；未配 → 现状不变（不进结算收敛）。
+    // 配了档次/晚数却没绑航班 = 没有航线 = 无结算价：同样不取（绝不兜底到某条既有航线），只留日志。
     const configured = bundleItems.filter((it) => {
       const b = bundleById.get(it.bundleId);
-      return b?.settlementTier != null && b?.settlementNights != null;
+      if (b?.settlementTier == null || b?.settlementNights == null) return false;
+      if (bundleRouteKey(b) != null) return true;
+      // eslint-disable-next-line no-console
+      console.warn('[settlement-calendar] 套餐未绑航班，无结算价：不取日历价', {
+        bundleId: b.id,
+        bundleName: b.name,
+      });
+      return false;
     });
     if (configured.length === 0) return null;
 
@@ -3307,6 +3359,8 @@ export class OrderService {
       const b = bundleById.get(it.bundleId);
       // 未配日历键的套餐行不参与日历取价（现状不变）；带索引遍历保证加项净额与行一一对应。
       if (b?.settlementTier == null || b.settlementNights == null) continue;
+      const routeKey = bundleRouteKey(b);
+      if (routeKey == null) continue; // configured 已滤掉没航线的行，此处只为收窄类型
       const tier = b.settlementTier as SettlementTier;
       const nights = b.settlementNights;
       // 乘客数：套餐占座模型 headCount（成人 + 占座儿童 + 婴儿），与录单其它按人口径同源。
@@ -3317,7 +3371,7 @@ export class OrderService {
         quantity: it.quantity,
         metadata: it.metadata,
       }).headCount;
-      const rate = await getSettlementRate(tier, nights, departYmd);
+      const rate = await getSettlementRate(routeKey, tier, nights, departYmd);
       if (!rate) {
         throw new BadRequestError('该出发日期的结算价未维护，请联系运营');
       }
@@ -3328,6 +3382,8 @@ export class OrderService {
       lines.push({
         bundleId: b.id,
         bundleName: b.name,
+        // 航线随行留痕：立减匹配 / 换人定价键都从这里取同一把键
+        routeKey,
         tier,
         nights,
         departDate: departYmd,
@@ -3335,8 +3391,8 @@ export class OrderService {
         pax,
         addOnCny,
         lineTotalCny,
-        // 人类可读留痕：「结算价日历自动取价：{档次}{晚数}晚 {日期} ¥X/人×N（加项 ±¥Y）」
-        note: `结算价日历自动取价：${tier} ${nights}晚 ${departYmd} ¥${rate.pricePerPersonCny}/人×${pax}${
+        // 人类可读留痕：「结算价日历自动取价：{航线} {档次}{晚数}晚 {日期} ¥X/人×N（加项 ±¥Y）」
+        note: `结算价日历自动取价：${routeKey} ${tier} ${nights}晚 ${departYmd} ¥${rate.pricePerPersonCny}/人×${pax}${
           addOnCny !== 0 ? `，加项 ${addOnCny > 0 ? '+' : '−'}¥${Math.abs(addOnCny)}` : ''
         }`,
       });
@@ -10809,7 +10865,9 @@ export class OrderService {
             flightScheduleId: true,
             hotelCheckIn: true,
             visaIntendedDate: true,
-            bundle: { select: { settlementTier: true, settlementNights: true } },
+            bundle: {
+              select: { settlementTier: true, settlementNights: true, ...BUNDLE_ROUTE_SELECT },
+            },
             flightSchedule: {
               select: {
                 departureTime: true,
@@ -10893,10 +10951,23 @@ export class OrderService {
       // 「今天的日历价 − 成交那天的日历价」这道减法碰不到它们，重算不会把谁身上的加项抹掉。
       const tier = row.bundle!.settlementTier as SettlementTier;
       const nights = row.bundle!.settlementNights as number;
-      // 定价键先比（在查价之前）：改档换了 bundleId → 档次/晚数变了，改期挪了出发日 ——
-      // 两者都把这张单挪到了日历的另一格，今昔两个价不是同一格的价，相减出来的不是日历浮动。
+      // 航线从套餐绑定航班派生（bundle-route.ts 唯一入口）：套餐没绑航班 = 没有航线 = 无结算价，
+      // 不重算（绝不拿某条既有航线兜底——那是按错线的价给人算差价）。
+      const routeKey = bundleRouteKey(row.bundle!);
+      if (routeKey == null) {
+        return skip(
+          'NO_CALENDAR',
+          oldShareCny,
+          false,
+          { note: '套餐未绑航班，无结算价', tier, nights, departDate: departYmd },
+          basisCny,
+        );
+      }
+      // 定价键先比（在查价之前）：改档换了 bundleId → 档次/晚数/航线变了，改期挪了出发日 ——
+      // 都把这张单挪到了日历的另一格，今昔两个价不是同一格的价，相减出来的不是日历浮动。
       const todayKey: SwapCalendarKey = {
         source: 'BUNDLE_SETTLEMENT_CALENDAR',
+        routeKey,
         tier,
         nights,
         departDate: departYmd,
@@ -10905,23 +10976,31 @@ export class OrderService {
       if (keyMismatch) {
         return skip('PRICING_KEY_CHANGED', oldShareCny, false, keyMismatch, basisCny);
       }
-      const rate = await getSettlementRate(tier, nights, departYmd, txClient);
+      const rate = await getSettlementRate(routeKey, tier, nights, departYmd, txClient);
       if (!rate) {
         return skip(
           'NO_CALENDAR',
           oldShareCny,
           false,
-          { note: '该出发日期的结算价未维护', tier, nights, departDate: departYmd },
+          { note: '该出发日期的结算价未维护', routeKey, tier, nights, departDate: departYmd },
           basisCny,
         );
       }
       // 立减只在「基准也减过」时才减（复审 H3）：基准没减 → 今天也不减，减法两边同口径。
       const hit = basis.discountApplied
-        ? await resolveAgentSettlementDiscount(order.agentId, tier, nights, departYmd, txClient)
+        ? await resolveAgentSettlementDiscount(
+            order.agentId,
+            routeKey,
+            tier,
+            nights,
+            departYmd,
+            txClient,
+          )
         : null;
       const perPersonCny = toInt(rate.pricePerPersonCny - (hit?.discountPerPersonCny ?? 0));
       calendarSource = 'BUNDLE_SETTLEMENT_CALENDAR';
       detail = {
+        routeKey,
         tier,
         nights,
         departDate: departYmd,
@@ -14603,10 +14682,26 @@ export class OrderService {
       const lockedTotalCny = Number(locked.total.toString());
       let pricingSource: 'SETTLEMENT_CALENDAR' | 'BUNDLE_PRICE' = 'BUNDLE_PRICE';
       let newTotalCny = round2(lockedTotalCny + (priced.amount - effectiveOldBundleCny));
+      // 人工复核提示（不阻断，随响应回给运营）。
+      const warnings: string[] = [];
+      // 目标套餐的航线从其绑定航班派生（bundle-route.ts 唯一入口）：配了日历键却没绑航班 = 没有航线，
+      // 不取日历价（绝不兜底到某条既有航线），本次按套餐价计并提示运营——与录单侧「不取、不报错」同口径。
+      const newBundleRouteKey = bundleRouteKey(newBundle);
       if (
         locked.agentId &&
         newBundle.settlementTier != null &&
-        newBundle.settlementNights != null
+        newBundle.settlementNights != null &&
+        newBundleRouteKey == null
+      ) {
+        warnings.push(
+          '目标套餐已配置结算价日历但未绑定航班，无法确定航线取价：本次按套餐价计，请核对后手工调价，或先给套餐绑定航班再改档',
+        );
+      }
+      if (
+        locked.agentId &&
+        newBundle.settlementTier != null &&
+        newBundle.settlementNights != null &&
+        newBundleRouteKey != null
       ) {
         if (!departYmd) {
           throw new BadRequestError(
@@ -14614,6 +14709,7 @@ export class OrderService {
           );
         }
         const rate = await getSettlementRate(
+          newBundleRouteKey,
           newBundle.settlementTier,
           newBundle.settlementNights,
           departYmd,
@@ -14628,6 +14724,7 @@ export class OrderService {
         );
         const discountHit = await resolveAgentSettlementDiscount(
           locked.agentId,
+          newBundleRouteKey,
           newBundle.settlementTier,
           newBundle.settlementNights,
           departYmd,
@@ -14652,9 +14749,6 @@ export class OrderService {
           `改档差额 ¥${Math.abs(diffCny)} 超出调价上限（±¥${PRICE_ADJUSTMENT_CAP_CNY}），请复核目标套餐与结算价`,
         );
       }
-
-      // 人工复核提示（不阻断，随响应回给运营）。
-      const warnings: string[] = [];
       if (rowMetadata.designatedHotel) {
         warnings.push('原「指定酒店」及其加价已随本次改档清除，请按新档次重新指定酒店');
       }
@@ -21509,8 +21603,13 @@ const CHANGE_BUNDLE_PRICING_SELECT = {
   hotelNights: true,
   singleSupplementCnyPerNight: true,
   businessUpgradeCnyPerLeg: true,
-  outboundFlight: { select: { businessUpgradeCnyPerLeg: true } },
-  returnFlight: { select: { businessUpgradeCnyPerLeg: true } },
+  // 起降地一并取出：改档按目标套餐派生航线取结算价日历（bundle-route.ts）
+  outboundFlight: {
+    select: { businessUpgradeCnyPerLeg: true, originCode: true, destinationCode: true },
+  },
+  returnFlight: {
+    select: { businessUpgradeCnyPerLeg: true, originCode: true, destinationCode: true },
+  },
   childSeatDiscountCnyPerPerson: true,
   infantPriceCny: true,
   selfVisaDeductCny: true,

@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { SettlementDiscountKind, SettlementTier } from '@prisma/client';
+import { routeKeySchema } from '../settlement-rates/settlement-rates.schemas.js';
 
 const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD');
 const tierSchema = z.nativeEnum(SettlementTier);
@@ -8,6 +9,8 @@ const nightsSchema = z.number().int().min(1).max(5);
 
 export const listDiscountRulesQuerySchema = z
   .object({
+    // 列表可按航线筛（缺省 = 全部航线：代理详情页要看这家代理跨航线的全部专属规则）
+    routeKey: routeKeySchema.optional(),
     kind: kindSchema.optional(),
     agentId: z.string().min(1).optional(),
     tier: tierSchema.optional(),
@@ -24,6 +27,8 @@ export type ListDiscountRulesQuery = z.infer<typeof listDiscountRulesQuerySchema
 export const discountRuleEntrySchema = z
   .object({
     id: z.string().min(1).optional(),
+    // 写入必填：规则按航线隔离，老客户端不传 → 400，不默认航线
+    routeKey: routeKeySchema,
     kind: kindSchema,
     agentId: z.string().min(1).optional(),
     tier: tierSchema,
@@ -55,6 +60,8 @@ export const deleteDiscountRuleParamsSchema = z.object({
 export type DeleteDiscountRuleParams = z.infer<typeof deleteDiscountRuleParamsSchema>;
 
 export const retailQuoteQuerySchema = z.object({
+  // 前台从套餐绑定航班派生（与后端 bundle-route.ts 同口径）；套餐没绑航班就不该来问
+  routeKey: routeKeySchema,
   tier: tierSchema,
   nights: z.coerce.number().int().min(1).max(5),
   departDate: dateStr,

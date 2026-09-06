@@ -51,6 +51,7 @@ export const settlementDiscountRoutes: FastifyPluginAsync = async (app) => {
   app.get('/retail-quote', async (req) => {
     const query = retailQuoteQuerySchema.parse(req.query);
     const hit = await resolveRetailSettlementDiscount(
+      query.routeKey,
       query.tier,
       query.nights,
       query.departDate,
