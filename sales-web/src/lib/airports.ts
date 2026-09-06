@@ -65,6 +65,21 @@ export function airportLabel(code: string): string {
   return a ? `${a.name} (${code})` : code;
 }
 
+/** 只要中文名（如「岘港」）；表里没有就退回机场码本身，不写死任何城市。 */
+export function airportName(code: string): string {
+  return AIRPORTS[code]?.name ?? code;
+}
+
+/**
+ * 机场时区；表里没有 → null。
+ * 调用方拿到 null 时应当**不显示当地时间**，而不是随手兜一个时区——
+ * 兜错时区会把出发日显示成前一天。
+ */
+export function airportTz(code: string | null | undefined): string | null {
+  if (!code) return null;
+  return AIRPORTS[code]?.tz ?? null;
+}
+
 /** IANA 时区 → 中文时区名。未知时区回退原始 IANA 串。 */
 const TZ_LABEL: Record<string, string> = {
   'Asia/Ho_Chi_Minh': '越南时间',

@@ -538,6 +538,16 @@ function BundleDetailContent({
         percentTotal: percentDiscountTotal,
         retailDiscountPerPersonCny,
         singleCount, businessCount,
+        // 航线与航班号写进 meta：购物车行以前把「QH9589 澳门→岘港」写死在渲染里，
+        // 第二条航线一开就会显示成另一条线。航线由绑定航班派生（resolveBundleRoute），
+        // 航班号取实际解析到的班次（未解析到则退回运营绑定的航班号）。
+        ...(routeOrigin && routeDest ? { routeOrigin, routeDest } : {}),
+        ...(outLeg?.flightNumber ?? b.outboundFlight?.flightNumber
+          ? { goFlightNumber: outLeg?.flightNumber ?? b.outboundFlight?.flightNumber ?? '' }
+          : {}),
+        ...(retLeg?.flightNumber ?? b.returnFlight?.flightNumber
+          ? { returnFlightNumber: retLeg?.flightNumber ?? b.returnFlight?.flightNumber ?? '' }
+          : {}),
         ...(outLeg?.scheduleId ? { goLegScheduleId: outLeg.scheduleId } : {}),
         ...(retLeg?.scheduleId ? { retLegScheduleId: retLeg.scheduleId } : {}),
       },
