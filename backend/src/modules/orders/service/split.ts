@@ -94,7 +94,13 @@ import type { OrderService } from '../orders.service.js';
  * 拆单准入闸 + 每人份额评估（preview 与 execute 共用同一口径，避免预检放行、执行另算）。
  * 只读不写；blockers 为空 = 可拆。warnings 是**非阻断**提示，只给运营看，不影响可拆判定。
  */
-export async function assessOrderSplit(svc: OrderService, db: Prisma.TransactionClient, order: SplitSourceOrder, passengerIds: string[], options: { autoSplitRoomGroups?: boolean } = {}): Promise<SplitAssessment> {
+export async function assessOrderSplit(
+  svc: OrderService,
+  db: Prisma.TransactionClient,
+  order: SplitSourceOrder,
+  passengerIds: string[],
+  options: { autoSplitRoomGroups?: boolean } = {},
+): Promise<SplitAssessment> {
   const blockers: string[] = [];
   const warnings: string[] = [];
   const autoSplitRoomGroups = options.autoSplitRoomGroups === true;
@@ -629,7 +635,12 @@ export async function assessOrderSplit(svc: OrderService, db: Prisma.Transaction
  * 拆单预检（只读）：POST /orders/:id/split-preview。
  * 跑全部准入闸 + 份额计算，一次性返回全部不满足的闸（blockers），供运营在弹窗里逐条看。
  */
-export async function previewOrderSplit(svc: OrderService, orderId: string, body: { passengerIds: string[]; autoSplitRoomGroups?: boolean }, actor: { userId: string; role: UserRole }): Promise<{
+export async function previewOrderSplit(
+  svc: OrderService,
+  orderId: string,
+  body: { passengerIds: string[]; autoSplitRoomGroups?: boolean },
+  actor: { userId: string; role: UserRole },
+): Promise<{
     eligible: boolean;
     blockers: string[];
     warnings: string[];
@@ -676,7 +687,12 @@ export async function previewOrderSplit(svc: OrderService, orderId: string, body
  * → OrderSplitRecord 落库。
  * 幂等：同 (sourceOrderId, requestToken) 重试只回放既有结果，绝不二次拆。
  */
-export async function splitOrder(svc: OrderService, orderId: string, input: SplitOrderInput, actor: { userId: string; role: UserRole }): Promise<SplitOrderResult> {
+export async function splitOrder(
+  svc: OrderService,
+  orderId: string,
+  input: SplitOrderInput,
+  actor: { userId: string; role: UserRole },
+): Promise<SplitOrderResult> {
   if (!actorCan(actor, 'orders.split')) {
     throw new ForbiddenError('仅运营/管理员可拆单');
   }
@@ -834,7 +850,14 @@ export async function findSplitReplay(svc: OrderService, orderId: string, reques
 }
 
 /** 拆单事务内核（只在 splitOrder 的 $transaction 里调用）。 */
-export async function executeSplitWithinTx(svc: OrderService, tx: Prisma.TransactionClient, orderId: string, input: SplitOrderInput, actor: { userId: string; role: UserRole }, targetOrderNumber: string): Promise<
+export async function executeSplitWithinTx(
+  svc: OrderService,
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  input: SplitOrderInput,
+  actor: { userId: string; role: UserRole },
+  targetOrderNumber: string,
+): Promise<
     | { kind: 'replayed'; result: SplitOrderResult }
     | {
         kind: 'done';

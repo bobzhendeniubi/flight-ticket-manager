@@ -309,7 +309,13 @@ export async function _assessCancelLeg(svc: OrderService, db: Prisma.Transaction
  * 金额取整到元（调价行是整数 CNY 口径），并夹到 [0, 该航段行金额]：
  * 取消一段航段收的手续费不可能比这段本身还贵。
  */
-export async function _quoteLegCancelFee(svc: OrderService, db: Prisma.TransactionClient, itemId: string, legAmountCny: number, at: Date): Promise<LegCancelPolicyFee | null> {
+export async function _quoteLegCancelFee(
+  svc: OrderService,
+  db: Prisma.TransactionClient,
+  itemId: string,
+  legAmountCny: number,
+  at: Date,
+): Promise<LegCancelPolicyFee | null> {
   const { quoteCancellationForItem } = await import('../../../lib/cancellation.js');
   const full = await db.orderItem.findUnique({
     where: { id: itemId },
@@ -352,7 +358,12 @@ export function _describeLeg(svc: OrderService, item: CancelLegItemSnapshot): Ca
  * 一次性返回**全部**不满足的闸（blockers），而不是命中第一条就停 —— 运营要在一个弹窗里
  * 看完所有待清障项，而不是修一条试一次。
  */
-export async function previewCancelLeg(svc: OrderService, orderId: string, leg: FlightLegSide, actor: { userId: string; role: UserRole }): Promise<CancelLegPreview> {
+export async function previewCancelLeg(
+  svc: OrderService,
+  orderId: string,
+  leg: FlightLegSide,
+  actor: { userId: string; role: UserRole },
+): Promise<CancelLegPreview> {
   if (!actorCan(actor, 'orders.cancel_leg')) {
     throw new ForbiddenError(`仅运营/管理员可取消${LEG_ZH[leg]}`);
   }
@@ -411,7 +422,12 @@ export async function previewCancelReturnLeg(svc: OrderService, orderId: string,
  * metadata.returnLegCancelled 里，与作废动作同一次写入、同一事务，不可能出现
  * 「座放了、标记没落」。座位因此**只会被放一次**。
  */
-export async function cancelLeg(svc: OrderService, orderId: string, input: CancelLegBody, actor: { userId: string; role: UserRole }): Promise<{ order: ReturnType<typeof serializeOrder>; audit: CancelLegAudit }> {
+export async function cancelLeg(
+  svc: OrderService,
+  orderId: string,
+  input: CancelLegBody,
+  actor: { userId: string; role: UserRole },
+): Promise<{ order: ReturnType<typeof serializeOrder>; audit: CancelLegAudit }> {
   const leg = input.leg;
   const legZh = LEG_ZH[leg];
   if (!actorCan(actor, 'orders.cancel_leg')) {
@@ -813,7 +829,12 @@ export async function cancelLeg(svc: OrderService, orderId: string, input: Cance
 }
 
 /** 老路径 POST /orders/:id/cancel-return-leg 的别名（leg 固定 RETURN）。 */
-export async function cancelReturnLeg(svc: OrderService, orderId: string, input: CancelReturnLegBody, actor: { userId: string; role: UserRole }): Promise<{ order: ReturnType<typeof serializeOrder>; audit: CancelLegAudit }> {
+export async function cancelReturnLeg(
+  svc: OrderService,
+  orderId: string,
+  input: CancelReturnLegBody,
+  actor: { userId: string; role: UserRole },
+): Promise<{ order: ReturnType<typeof serializeOrder>; audit: CancelLegAudit }> {
   return svc.cancelLeg(orderId, { ...input, leg: 'RETURN' }, actor);
 }
 
@@ -843,7 +864,13 @@ export async function cancelReturnLeg(svc: OrderService, orderId: string, input:
 // ════════════════════════════════════════════════════════════════════
 
 /** no-show 的准入评估（preview 与 execute 共用同一口径，杜绝预检放行、执行另算）。 */
-export async function _assessNoShow(svc: OrderService, db: Prisma.TransactionClient, orderId: string, passengerIds: string[] | undefined, releaseReturn = true): Promise<{
+export async function _assessNoShow(
+  svc: OrderService,
+  db: Prisma.TransactionClient,
+  orderId: string,
+  passengerIds: string[] | undefined,
+  releaseReturn = true,
+): Promise<{
     order: CancelLegOrderSnapshot;
     outboundItem: CancelLegItemSnapshot | null;
     returnItem: CancelLegItemSnapshot | null;
@@ -1095,7 +1122,12 @@ export function _describeNoShowLeg(svc: OrderService, item: CancelLegItemSnapsho
  * no-show · 预检（只读）：POST /orders/:id/no-show/preview。
  * 一次性返回全部不满足的闸（blockers）+ 全部提示（warnings），供运营在一个弹窗看完。
  */
-export async function previewNoShow(svc: OrderService, orderId: string, body: { passengerIds?: string[]; releaseReturn?: boolean }, actor: { userId: string; role: UserRole }): Promise<NoShowPreview> {
+export async function previewNoShow(
+  svc: OrderService,
+  orderId: string,
+  body: { passengerIds?: string[]; releaseReturn?: boolean },
+  actor: { userId: string; role: UserRole },
+): Promise<NoShowPreview> {
   if (!actorCan(actor, 'orders.no_show')) {
     throw new ForbiddenError('仅运营/管理员可标记 no-show');
   }
@@ -1140,7 +1172,12 @@ export async function previewNoShow(svc: OrderService, orderId: string, body: { 
  * （两步不套一个事务，理由同 reschedulePassengers：两套行锁硬嵌会绞死）。
  * 拆成了但标记失败 → 不回滚拆单（新单本身是合法订单），回 409 让运营到新单重试。
  */
-export async function markNoShow(svc: OrderService, orderId: string, input: NoShowBody, actor: { userId: string; role: UserRole }): Promise<{
+export async function markNoShow(
+  svc: OrderService,
+  orderId: string,
+  input: NoShowBody,
+  actor: { userId: string; role: UserRole },
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     targetOrderId: string;
     audit: NoShowAudit;
@@ -1320,7 +1357,13 @@ export async function markNoShow(svc: OrderService, orderId: string, input: NoSh
  * ⚠ 金额四字段（unitPrice / amount / unitCostCny / totalCostCny）与 subtotal / total
  * 在本方法内**一个都不写**。改这里前先读上面「与取消航段的界线」。
  */
-export async function _executeNoShow(svc: OrderService, targetOrderId: string, input: NoShowBody, actor: { userId: string; role: UserRole }, split: { sourceOrderNumber: string; targetOrderNumber: string } | null): Promise<NoShowAudit> {
+export async function _executeNoShow(
+  svc: OrderService,
+  targetOrderId: string,
+  input: NoShowBody,
+  actor: { userId: string; role: UserRole },
+  split: { sourceOrderNumber: string; targetOrderNumber: string } | null,
+): Promise<NoShowAudit> {
   return prisma.$transaction(async (tx) => {
     // 与改期 / 取消航段 / 超时 worker 同一把行锁 → 座位账严格串行。
     const lockRows = await tx.$queryRaw<Array<{ id: string }>>`
@@ -1850,7 +1893,12 @@ export async function previewRestoreReturnLeg(svc: OrderService, orderId: string
  * （余位变负 = 超售，全站余位本来就不夹 0）；没座且未确认 → 409 让前端弹二次确认。
  * 座位数照释放快照回填，放几座恢复几座。
  */
-export async function restoreReturnLeg(svc: OrderService, orderId: string, input: RestoreReturnLegBody, actor: { userId: string; role: UserRole }): Promise<{ order: ReturnType<typeof serializeOrder>; audit: RestoreReturnLegAudit }> {
+export async function restoreReturnLeg(
+  svc: OrderService,
+  orderId: string,
+  input: RestoreReturnLegBody,
+  actor: { userId: string; role: UserRole },
+): Promise<{ order: ReturnType<typeof serializeOrder>; audit: RestoreReturnLegAudit }> {
   if (!actorCan(actor, 'orders.cancel_leg')) {
     throw new ForbiddenError('仅运营/管理员可恢复回程');
   }
@@ -2321,7 +2369,12 @@ export async function previewVoidReturnLeg(svc: OrderService, orderId: string, a
 }
 
 /** 回程起飞后作废 · 执行：POST /orders/:id/void-return-leg。 */
-export async function voidReturnLeg(svc: OrderService, orderId: string, input: VoidReturnLegBody, actor: { userId: string; role: UserRole }): Promise<{ order: ReturnType<typeof serializeOrder>; audit: VoidReturnLegAudit }> {
+export async function voidReturnLeg(
+  svc: OrderService,
+  orderId: string,
+  input: VoidReturnLegBody,
+  actor: { userId: string; role: UserRole },
+): Promise<{ order: ReturnType<typeof serializeOrder>; audit: VoidReturnLegAudit }> {
   if (!actorCan(actor, 'orders.cancel_leg')) {
     throw new ForbiddenError('仅运营/管理员可作废回程');
   }

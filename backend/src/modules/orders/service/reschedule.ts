@@ -34,7 +34,6 @@ import {
   buildStayNightDates,
   rewriteHotelStayDescription,
 } from './bundle-pricing.js';
-import type { SplitOrderResult } from '../orders.service.js';
 import {
   appendLegActionLog,
   assertLegActionTokenReplay,
@@ -73,6 +72,7 @@ import {
   syncOrderLegFlag,
   zhStatus,
 } from './shared.js';
+import type { SplitOrderResult } from './split.js';
 import type { OrderService } from '../orders.service.js';
 
 export type RescheduleCommittedContext = {
@@ -241,37 +241,42 @@ export async function batchReschedule(svc: OrderService, input: BatchRescheduleB
  *
  * 返回更新后的订单（serializeOrder）。
  */
-export async function rescheduleOrderItem(svc: OrderService, orderId: string, input: {
-      orderItemId?: string;
-      /** 批量改期内部入口：在订单行锁内按真实航段定位订单行。 */
-      leg?: 'OUTBOUND' | 'RETURN';
-      newScheduleId: string;
-      newCabin?: import('@prisma/client').CabinClass;
-      feeCny?: number;
-      feeLabel?: string;
-      note?: string;
-      /** 仅批量入口使用；省略时保持单条改期路由原有行为。 */
-      guard?: { forbidTicketed?: boolean; correction?: boolean };
-      /**
-       * 内部专用旗子：**只**由 correctFlightSchedule 在过完「代理自助改单窗口」闸之后设置，
-       * 用来绕过下面那句「仅运营/管理员可改期」。
-       *
-       * 为什么不是把那句闸整体放开：售后改期会收改期费、撤立减、推状态 —— 那是动钱的操作，
-       * 代理永远碰不得。放开的只有纠错通道（correction=true，差价恒 0）这一条。
-       * 请求体进不来这个字段：两条改期路由的 zod schema（z.object 默认剥未知键）都不含它。
-       */
-      selfServiceCorrection?: boolean;
-      /**
-       * 幂等键（按人改期的全员快路径传）：成功后在同一事务里往该航段行的 legActionLog
-       * 追加一条 RESCHEDULE_ALL 流水，编排层下次拿同一个 token 重试时据此回放。
-       *
-       * 为什么 append 放在这里、而不是等它返回后另起一个事务补写：本方法整个是一个
-       * `prisma.$transaction`，返回时座位与金额都已提交。事务外补写一旦失败（进程被杀、
-       * 连接断开），就留下「钱已收、流水没留」的状态，下次重试认不出回放会再收一次差价。
-       * 而且这一行的 metadata 正是本方法在改（flightChanged 标记），两处分开写必然互相覆盖。
-       */
-      requestToken?: string;
-    }, actor: { userId: string; role: UserRole }): Promise<{
+export async function rescheduleOrderItem(
+  svc: OrderService,
+  orderId: string,
+  input: {
+    orderItemId?: string;
+    /** 批量改期内部入口：在订单行锁内按真实航段定位订单行。 */
+    leg?: 'OUTBOUND' | 'RETURN';
+    newScheduleId: string;
+    newCabin?: import('@prisma/client').CabinClass;
+    feeCny?: number;
+    feeLabel?: string;
+    note?: string;
+    /** 仅批量入口使用；省略时保持单条改期路由原有行为。 */
+    guard?: { forbidTicketed?: boolean; correction?: boolean };
+    /**
+     * 内部专用旗子：**只**由 correctFlightSchedule 在过完「代理自助改单窗口」闸之后设置，
+     * 用来绕过下面那句「仅运营/管理员可改期」。
+     *
+     * 为什么不是把那句闸整体放开：售后改期会收改期费、撤立减、推状态 —— 那是动钱的操作，
+     * 代理永远碰不得。放开的只有纠错通道（correction=true，差价恒 0）这一条。
+     * 请求体进不来这个字段：两条改期路由的 zod schema（z.object 默认剥未知键）都不含它。
+     */
+    selfServiceCorrection?: boolean;
+    /**
+     * 幂等键（按人改期的全员快路径传）：成功后在同一事务里往该航段行的 legActionLog
+     * 追加一条 RESCHEDULE_ALL 流水，编排层下次拿同一个 token 重试时据此回放。
+     *
+     * 为什么 append 放在这里、而不是等它返回后另起一个事务补写：本方法整个是一个
+     * `prisma.$transaction`，返回时座位与金额都已提交。事务外补写一旦失败（进程被杀、
+     * 连接断开），就留下「钱已收、流水没留」的状态，下次重试认不出回放会再收一次差价。
+     * 而且这一行的 metadata 正是本方法在改（flightChanged 标记），两处分开写必然互相覆盖。
+     */
+    requestToken?: string;
+  },
+  actor: { userId: string; role: UserRole },
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -973,7 +978,13 @@ export async function rescheduleOrderItem(svc: OrderService, orderId: string, in
  * 套餐单（该行带 bundleId / 建单时已拆过商务舱座）本次不支持：套餐升舱有自己的份数与拆座模型，
  * 走这里会把两套口径搅在一起。返回 400 引导人工处理。
  */
-export async function upgradeOrderItemCabin(svc: OrderService, orderId: string, orderItemId: string, input: { note?: string }, actor: { userId: string; role: UserRole; agentId?: string }): Promise<{
+export async function upgradeOrderItemCabin(
+  svc: OrderService,
+  orderId: string,
+  orderItemId: string,
+  input: { note?: string },
+  actor: { userId: string; role: UserRole; agentId?: string },
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -1252,7 +1263,14 @@ export async function upgradeOrderItemCabin(svc: OrderService, orderId: string, 
  * 含套餐立减的单改班次仍旧拒绝（rescheduleOrderItem 内的既有闸，报「本单含套餐立减…」）：
  * 立减是按班次+晚数匹配出来的，换班次要重算补差 = 动钱，代理自助不能碰，得找运营。
  */
-export async function correctFlightSchedule(svc: OrderService, orderId: string, itemId: string, newScheduleId: string, actor: { userId: string; role: UserRole; agentId?: string }, options: { allowTicketed?: boolean } = {}): ReturnType<OrderService['rescheduleOrderItem']> {
+export async function correctFlightSchedule(
+  svc: OrderService,
+  orderId: string,
+  itemId: string,
+  newScheduleId: string,
+  actor: { userId: string; role: UserRole; agentId?: string },
+  options: { allowTicketed?: boolean } = {},
+): ReturnType<OrderService['rescheduleOrderItem']> {
   await svc.assertAgentSelfEditAllowed(orderId, actor);
   const isOpsActor = actor.role === UserRole.ADMIN || actor.role === UserRole.STAFF;
   // 自助通道（代理）：同航班 + 同价才算「纠错」，否则是一次改价改产品的售后动作 → 走改单申请。
@@ -1366,17 +1384,22 @@ export async function assertSelfServiceCorrectionIsFreeOfCharge(svc: OrderServic
  * 座位：本方法自己不动座位 —— 拆单不动库存（两单加起来占同一批座），改期的「先放旧再原子拿新」
  *       守卫原样生效。
  */
-export async function reschedulePassengers(svc: OrderService, orderId: string, input: {
-      passengerIds: string[];
-      orderItemId: string;
-      newScheduleId: string;
-      newCabin?: CabinClass;
-      feeCny?: number;
-      feeLabel?: string;
-      note?: string;
-      roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
-      requestToken: string;
-    }, actor: { userId: string; role: UserRole }): Promise<ReschedulePassengersResult> {
+export async function reschedulePassengers(
+  svc: OrderService,
+  orderId: string,
+  input: {
+    passengerIds: string[];
+    orderItemId: string;
+    newScheduleId: string;
+    newCabin?: CabinClass;
+    feeCny?: number;
+    feeLabel?: string;
+    note?: string;
+    roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
+    requestToken: string;
+  },
+  actor: { userId: string; role: UserRole },
+): Promise<ReschedulePassengersResult> {
   if (!actorCan(actor, 'orders.reschedule')) {
     throw new ForbiddenError('仅运营/管理员可按人改期');
   }
@@ -1723,7 +1746,12 @@ export async function reschedulePassengers(svc: OrderService, orderId: string, i
  * 按人改期的汇总审计（拆单的 SPLIT_ORDER×2 与改期的 RESCHEDULE_ORDER_ITEM 各自照记，
  * 这条只补「谁把哪几个人从哪张单挪到哪张单、改到哪个班次」的一览）。
  */
-export async function _auditReschedulePassengers(svc: OrderService, result: ReschedulePassengersResult, actor: { userId: string; role: UserRole }, movedPassengerIds: string[]): Promise<void> {
+export async function _auditReschedulePassengers(
+  svc: OrderService,
+  result: ReschedulePassengersResult,
+  actor: { userId: string; role: UserRole },
+  movedPassengerIds: string[],
+): Promise<void> {
   await writeAudit({
     actor: { userId: actor.userId, role: actor.role },
     action: 'RESCHEDULE_PASSENGERS',

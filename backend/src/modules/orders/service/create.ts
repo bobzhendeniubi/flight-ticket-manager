@@ -363,20 +363,24 @@ export function duplicateForceNoteFor(
  * 调用方必须先在同一事务里消费 HoldOrder 的余座；本方法只负责复用订单号、订单事件、
  * 乘客落库、操作费与订单 CAS 扣座，不自行开启嵌套事务，也不改变普通创单路径。
  */
-export async function createHoldConversionOrderWithinTx(svc: OrderService, tx: Prisma.TransactionClient, input: {
-      holdOrderId: string;
-      holdNo: string;
-      flightScheduleId: string;
-      cabin: CabinClass;
-      quantity: number;
-      unitPriceCny: number;
-      passengers: BatchPassengerInput[];
-      contactName?: string;
-      contactPhone?: string;
-      agentId?: string | null;
-      actorUserId: string | null;
-      allowDuplicatePassengers?: boolean;
-    }) {
+export async function createHoldConversionOrderWithinTx(
+  svc: OrderService,
+  tx: Prisma.TransactionClient,
+  input: {
+    holdOrderId: string;
+    holdNo: string;
+    flightScheduleId: string;
+    cabin: CabinClass;
+    quantity: number;
+    unitPriceCny: number;
+    passengers: BatchPassengerInput[];
+    contactName?: string;
+    contactPhone?: string;
+    agentId?: string | null;
+    actorUserId: string | null;
+    allowDuplicatePassengers?: boolean;
+  },
+) {
   if (input.quantity !== input.passengers.length) {
     throw new BadRequestError(`订单需要 ${input.quantity} 位出行人，当前填了 ${input.passengers.length} 位`);
   }
@@ -1507,7 +1511,11 @@ export async function resolveEarliestFlightDepartureDate(svc: OrderService, item
   return earliestFlightDeparture(scheds.map((s) => ({ kind: 'FLIGHT', flightSchedule: s })));
 }
 
-export async function applyPassportExpiryRule(svc: OrderService, body: CreateOrderBody, pricedItems: Array<{ kind: OrderItemKind; description: string; quantity: number; unitPrice: number; amount: number; totalCostCny?: number }>): Promise<void> {
+export async function applyPassportExpiryRule(
+  svc: OrderService,
+  body: CreateOrderBody,
+  pricedItems: Array<{ kind: OrderItemKind; description: string; quantity: number; unitPrice: number; amount: number; totalCostCny?: number }>,
+): Promise<void> {
   const scheduleIds = body.items
     .filter((i): i is Extract<OrderItemInput, { kind: 'FLIGHT' }> => i.kind === 'FLIGHT')
     .map((i) => i.flightScheduleId);
@@ -1550,7 +1558,12 @@ export async function applyPassportExpiryRule(svc: OrderService, body: CreateOrd
  * 把代理套餐地面日历命中的固定立减写成独立 DISCOUNT 行。
  * 立减行随后参与结算总价收敛，因此「日历价 − 立减」与订单总额保持同一口径。
  */
-export async function applyAgentSettlementDiscount(svc: OrderService, pricedItems: PricedOrderItem[], calendar: { totalCny: number; audit: Record<string, unknown> }, agentId: string): Promise<AutoDiscountSummary | null> {
+export async function applyAgentSettlementDiscount(
+  svc: OrderService,
+  pricedItems: PricedOrderItem[],
+  calendar: { totalCny: number; audit: Record<string, unknown> },
+  agentId: string,
+): Promise<AutoDiscountSummary | null> {
   const lines = Array.isArray(calendar.audit.lines)
     ? (calendar.audit.lines as Array<Record<string, unknown>>)
     : [];
@@ -2009,7 +2022,11 @@ export async function resolveAuthoritativeBundleGoDates(svc: OrderService, items
  *
  * 修正前是反的（goDate 优先），导致 goDate 这个客户端自由字段直接决定结算价与立减命中。
  */
-export async function resolveBundleItemDepartureLocalDate(svc: OrderService, body: Pick<CreateOrderBody, 'items'>, bundleItem: Extract<OrderItemInput, { kind: 'BUNDLE' }>): Promise<string | null> {
+export async function resolveBundleItemDepartureLocalDate(
+  svc: OrderService,
+  body: Pick<CreateOrderBody, 'items'>,
+  bundleItem: Extract<OrderItemInput, { kind: 'BUNDLE' }>,
+): Promise<string | null> {
   const authoritative = (await svc.resolveAuthoritativeBundleGoDates(body.items)).get(
     bundleItem.bundleId,
   );
@@ -2043,7 +2060,12 @@ export async function resolveBundleItemDepartureLocalDate(svc: OrderService, bod
  *
  * 无冲突恒返回 []（含无 FLIGHT 班次 / 无乘客的快速返回）。
  */
-export async function assertNoDuplicatePassengersOnFlights(svc: OrderService, flightScheduleIds: string[], passengers: ReadonlyArray<DuplicateCheckPassenger>, allowDuplicate = false): Promise<DuplicatePassengerConflict[]> {
+export async function assertNoDuplicatePassengersOnFlights(
+  svc: OrderService,
+  flightScheduleIds: string[],
+  passengers: ReadonlyArray<DuplicateCheckPassenger>,
+  allowDuplicate = false,
+): Promise<DuplicatePassengerConflict[]> {
   if (flightScheduleIds.length === 0 || passengers.length === 0) return [];
 
   const documentNumbers = [
@@ -2154,11 +2176,19 @@ export async function assertNoDuplicatePassengersOnFlights(svc: OrderService, fl
  *   缺省（老客户端不传 passengers）→ 全部回落旧口径，定价与扩展前完全一致；性别缺省按
  *   保守口径 'U'（未知 → 独占一间），与房控 pickSoloGender 一致。
  */
-export async function priceAndValidateItems(svc: OrderService, items: OrderItemInput[], flightSettlementPriceCny?: number, passengers?: ReadonlyArray<{
-      visaExempt?: boolean;
-      singleRoom?: boolean;
-      gender?: 'M' | 'F' | 'X';
-    }>, allowClientPricedGround = false, starGate?: DesignatedHotelStarGate, hotelOversellCapRooms?: number) {
+export async function priceAndValidateItems(
+  svc: OrderService,
+  items: OrderItemInput[],
+  flightSettlementPriceCny?: number,
+  passengers?: ReadonlyArray<{
+    visaExempt?: boolean;
+    singleRoom?: boolean;
+    gender?: 'M' | 'F' | 'X';
+  }>,
+  allowClientPricedGround = false,
+  starGate?: DesignatedHotelStarGate,
+  hotelOversellCapRooms?: number,
+) {
   const priced: PricedOrderItem[] = [];
 
   // 套餐去程出发日的权威来源（A7）：同 bundle 的真实 FLIGHT 航段，客户端改不了。
@@ -2955,7 +2985,10 @@ export async function priceAndValidateItems(svc: OrderService, items: OrderItemI
  * 真正的扣减（ECONOMY 减本段人数、BUSINESS 加本段人数）由事务里的原子 CAS 完成，最终防超售；
  * 此处只做事务前的友好预检。
  */
-export async function assertBusinessAvailabilityForBundle(svc: OrderService, legPlan: ReadonlyArray<{ leg: { flightScheduleId?: string }; businessCount: number }>): Promise<void> {
+export async function assertBusinessAvailabilityForBundle(
+  svc: OrderService,
+  legPlan: ReadonlyArray<{ leg: { flightScheduleId?: string }; businessCount: number }>,
+): Promise<void> {
   const now = new Date();
   for (const { leg, businessCount } of legPlan) {
     if (!leg.flightScheduleId) continue;
@@ -3322,7 +3355,12 @@ export async function batchCreateOrders(svc: OrderService, body: BatchCreateOrde
  * 只读（findMany），不落库、不扣座；真正的扣座 + 盖章由逐单 createOrder 的既有链路完成。
  * 返回 { error } 表示优雅失败（调用方逐单以该原因失败，不阻断整批）；成功则返回 { legs, dates }。
  */
-export async function resolveBundleFlightLegs(svc: OrderService, bundleId: string, bundleDepartDate: string | undefined, bundleNightsOverride: number | undefined): Promise<
+export async function resolveBundleFlightLegs(
+  svc: OrderService,
+  bundleId: string,
+  bundleDepartDate: string | undefined,
+  bundleNightsOverride: number | undefined,
+): Promise<
     | { ok: false; error: string }
     | {
         ok: true;

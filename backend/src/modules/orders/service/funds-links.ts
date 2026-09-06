@@ -65,13 +65,17 @@ import type { OrderService } from '../orders.service.js';
  *     互不相干，不会被冲销/查重/认款回溯等路径误认。
  *   · 金额为负 → 手工收款查重（按等额匹配）、认款冲销（按 allocationId/等额匹配）天然不命中。
  */
-export async function _recordOverpayDisposalPayment(svc: OrderService, tx: Prisma.TransactionClient, input: {
-      orderId: string;
-      amountCny: number;
-      method: PaymentMethod;
-      disposal: 'AGENT_BALANCE' | 'RECEIPT_POOL';
-      description: string;
-    }): Promise<void> {
+export async function _recordOverpayDisposalPayment(
+  svc: OrderService,
+  tx: Prisma.TransactionClient,
+  input: {
+    orderId: string;
+    amountCny: number;
+    method: PaymentMethod;
+    disposal: 'AGENT_BALANCE' | 'RECEIPT_POOL';
+    description: string;
+  },
+): Promise<void> {
   await tx.payment.create({
     data: {
       orderId: input.orderId,
@@ -219,7 +223,12 @@ export async function creditOverpayToAgent(svc: OrderService, orderId: string, a
  *   （同走佣金 / 履约任务生成那一套）。
  * 无代理 / 超抵（amount > 尾款）/ 余额不足 → 拒绝；余额不会为负。
  */
-export async function applyAgentBalanceToOrder(svc: OrderService, orderId: string, amount: number, actor: { userId: string; role: UserRole }): Promise<{
+export async function applyAgentBalanceToOrder(
+  svc: OrderService,
+  orderId: string,
+  amount: number,
+  actor: { userId: string; role: UserRole },
+): Promise<{
     ok: true;
     orderId: string;
     orderNumber: string;
@@ -602,11 +611,16 @@ export async function batchSetPaymentsLock(svc: OrderService, orderIds: string[]
  * 换人退款：原订单只做一次退款申请，换人费由运营手填留存，其余净收款待财务批准后退回。
  * 接手订单号只作审计记录，不能把任何 Payment 或 paidAmount 转到另一张订单。
  */
-export async function swapRefund(svc: OrderService, orderId: string, input: {
-      swapFeeCny: number;
-      replacementOrderNumber?: string;
-      reason: string;
-    }, requester: OrderRequester): Promise<{
+export async function swapRefund(
+  svc: OrderService,
+  orderId: string,
+  input: {
+    swapFeeCny: number;
+    replacementOrderNumber?: string;
+    reason: string;
+  },
+  requester: OrderRequester,
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     netPaidCny: number;
     swapFeeCny: number;
@@ -798,7 +812,12 @@ export async function swapRefund(svc: OrderService, orderId: string, input: {
 /**
  * 补填/修改换人退款接手订单号：只更新源订单的记录字段，不创建 Payment、不改任何订单的 paidAmount。
  */
-export async function updateSwapReplacementOrderNumber(svc: OrderService, orderId: string, replacementOrderNumber: string | null, requester: OrderRequester): Promise<{
+export async function updateSwapReplacementOrderNumber(
+  svc: OrderService,
+  orderId: string,
+  replacementOrderNumber: string | null,
+  requester: OrderRequester,
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     beforeReplacementOrderNumber: string | null;
     replacementOrderNumber: string | null;

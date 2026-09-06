@@ -316,7 +316,13 @@ export async function readOrderSettlementCalendarAudit(
  * 返回更新后的出行人（与 getOrder 详情同款序列化：剥离 passportPhotoUrl 大图，
  * 以 hasPassportPhoto 布尔代替）+ 改动字段名列表（审计用，绝不含字段值——PII 红线）。
  */
-export async function selfUpdatePassenger(svc: OrderService, orderId: string, passengerId: string, input: SelfUpdatePassengerBody, requester: OrderRequester): Promise<{
+export async function selfUpdatePassenger(
+  svc: OrderService,
+  orderId: string,
+  passengerId: string,
+  input: SelfUpdatePassengerBody,
+  requester: OrderRequester,
+): Promise<{
     passenger: Record<string, unknown>;
     changedFields: string[];
     orderNumber: string;
@@ -389,7 +395,12 @@ export async function selfUpdatePassenger(svc: OrderService, orderId: string, pa
  * 跨单的 TOCTOU 仍然存在，真正兜底的是事后对账与这条报错的指路。
  * 缺省全局单例，补录通道（不在事务里）行为一字未变。
  */
-export async function assertBackfilledDocumentNotDuplicated(svc: OrderService, orderId: string, documentNumber: string, client: Prisma.TransactionClient = prisma): Promise<void> {
+export async function assertBackfilledDocumentNotDuplicated(
+  svc: OrderService,
+  orderId: string,
+  documentNumber: string,
+  client: Prisma.TransactionClient = prisma,
+): Promise<void> {
   const legs = await client.orderItem.findMany({
     where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
     select: { flightScheduleId: true },
@@ -436,7 +447,13 @@ export async function assertBackfilledDocumentNotDuplicated(svc: OrderService, o
  *
  * 返回更新后的出行人（同 selfUpdatePassenger 序列化口径）+ before/after（审计用）。
  */
-export async function updatePassengerVisaDates(svc: OrderService, orderId: string, passengerId: string, input: UpdatePassengerVisaDatesBody, actor: { userId: string; role: UserRole }): Promise<{
+export async function updatePassengerVisaDates(
+  svc: OrderService,
+  orderId: string,
+  passengerId: string,
+  input: UpdatePassengerVisaDatesBody,
+  actor: { userId: string; role: UserRole },
+): Promise<{
     passenger: Record<string, unknown>;
     orderNumber: string;
     before: { visaIssueDate: string | null; visaEffectiveDate: string | null; visaExpiry: string | null };
@@ -512,7 +529,13 @@ export async function updatePassengerVisaDates(svc: OrderService, orderId: strin
  * 号的**来源**（沙箱自动出票 vs 人工回填）不落库、不加列，靠审计区分：
  * 人工回填必留一条 BACKFILL_PASSENGER_TICKET，查审计就知道这个号是谁什么时候录的。
  */
-export async function updatePassengerTicket(svc: OrderService, orderId: string, passengerId: string, input: UpdatePassengerTicketBody, actor: { userId: string; role: UserRole }): Promise<{
+export async function updatePassengerTicket(
+  svc: OrderService,
+  orderId: string,
+  passengerId: string,
+  input: UpdatePassengerTicketBody,
+  actor: { userId: string; role: UserRole },
+): Promise<{
     passenger: Record<string, unknown>;
     orderNumber: string;
     passengerName: string;
@@ -595,31 +618,37 @@ export async function updatePassengerTicket(svc: OrderService, orderId: string, 
  *
  * 返回更新后的订单（serializeOrder）+ 审计用的原/新身份。
  */
-export async function swapPassenger(svc: OrderService, orderId: string, passengerId: string, input: {
-      lastName?: string;
-      firstName?: string;
-      fullName?: string;
-      chineseName?: string;
-      documentNumber?: string;
-      dateOfBirth?: string;
-      gender?: import('@prisma/client').Gender;
-      nationality?: string;
-      // 新出行人的护照有效期 / 签发日（YYYY-MM-DD）：换人 = 录入一个新人的护照。
-      // 证件号变化时旧人的这两项会被清空，本请求带的值即新人的值（缺有效期且本单按人出行 → 400）。
-      passportExpiry?: string;
-      passportIssueDate?: string;
-      // title/passengerType/visaExempt/singleRoom 已由 swapPassengerBodySchema 暴露透传；
-      // 真换人时用它们作为「显式新值」覆盖默认清洗值（前向兼容：不传则保持既有清洗行为）。
-      title?: string;
-      passengerType?: PassengerType;
-      visaExempt?: boolean;
-      singleRoom?: boolean;
-      resetInvoice?: boolean;
-      resetVisa?: boolean;
-      feeCny?: number;
-      feeLabel?: string;
-      note?: string;
-    }, actor: { userId: string; role: UserRole; agentId?: string }): Promise<{
+export async function swapPassenger(
+  svc: OrderService,
+  orderId: string,
+  passengerId: string,
+  input: {
+    lastName?: string;
+    firstName?: string;
+    fullName?: string;
+    chineseName?: string;
+    documentNumber?: string;
+    dateOfBirth?: string;
+    gender?: import('@prisma/client').Gender;
+    nationality?: string;
+    // 新出行人的护照有效期 / 签发日（YYYY-MM-DD）：换人 = 录入一个新人的护照。
+    // 证件号变化时旧人的这两项会被清空，本请求带的值即新人的值（缺有效期且本单按人出行 → 400）。
+    passportExpiry?: string;
+    passportIssueDate?: string;
+    // title/passengerType/visaExempt/singleRoom 已由 swapPassengerBodySchema 暴露透传；
+    // 真换人时用它们作为「显式新值」覆盖默认清洗值（前向兼容：不传则保持既有清洗行为）。
+    title?: string;
+    passengerType?: PassengerType;
+    visaExempt?: boolean;
+    singleRoom?: boolean;
+    resetInvoice?: boolean;
+    resetVisa?: boolean;
+    feeCny?: number;
+    feeLabel?: string;
+    note?: string;
+  },
+  actor: { userId: string; role: UserRole; agentId?: string },
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -1355,13 +1384,19 @@ export async function swapPassenger(svc: OrderService, orderId: string, passenge
  *     （computePerPaxShares + groupPassengerAdjustments，即 perPaxSettlementByPassenger 的算法；
  *      此处直接调底层两函数而非导出层，避免 service ↔ export-templates 循环依赖）。
  */
-export async function buildSwapBeforeSnapshot(svc: OrderService, tx: Prisma.TransactionClient, orderId: string, passengerId: string, passengerFacts: {
-      chineseName: string | null;
-      dateOfBirth: Date | null;
-      passportExpiry: Date | null;
-      visaExempt: boolean;
-      visaStatus: VisaRequirement | null;
-    }): Promise<SwapBeforeSnapshot> {
+export async function buildSwapBeforeSnapshot(
+  svc: OrderService,
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  passengerId: string,
+  passengerFacts: {
+    chineseName: string | null;
+    dateOfBirth: Date | null;
+    passportExpiry: Date | null;
+    visaExempt: boolean;
+    visaStatus: VisaRequirement | null;
+  },
+): Promise<SwapBeforeSnapshot> {
   // 日期口径：出生日期 / 护照有效期都是「日期本身」（passportExpiry/passportIssueDate 是
   // @db.Date，dateOfBirth 按 UTC 零点写入），按 UTC 直接切片 —— 与签证日期补录
   // （updatePassengerVisaDates）同一个 toYmd 写法，绝不能折 +8 时区（会把日期整体推后一天）。
@@ -1513,7 +1548,12 @@ export async function buildSwapBeforeSnapshot(svc: OrderService, tx: Prisma.Tran
  *
  * 只读，不写任何一行；换人事务与 GET 预览端点跑的是同一份代码（预览所见 = 换人所得）。
  */
-export async function resolveSwapRepriceQuote(svc: OrderService, db: Prisma.TransactionClient | typeof prisma, orderId: string, passengerId: string): Promise<SwapRepriceQuote> {
+export async function resolveSwapRepriceQuote(
+  svc: OrderService,
+  db: Prisma.TransactionClient | typeof prisma,
+  orderId: string,
+  passengerId: string,
+): Promise<SwapRepriceQuote> {
   // 结算价日历是整数每人价（SettlementRate.pricePerPersonCny 是 Int）。基准 / 新价 / 差额 /
   // 差价全线取整：diff 会直接写进 Order.adjustmentCny（**Int 列**），带小数会整事务 500 回滚；
   // 调价行金额也跟着整数，免得订单上冒出「−¥199.67」这种没人解释得清的行（复审 H1）。
@@ -1828,15 +1868,21 @@ export async function resolveSwapRepriceQuote(svc: OrderService, db: Prisma.Tran
  * 改档 / 改期把这张单挪到了另一格之后，今昔两个价压根不是同一格的价，相减出来的不是
  * 「日历动了多少」而是改档 / 改期的价差（那笔钱各自的通道早就收过一次）。键读不出来 → 不重算。
  */
-export async function resolveSwapRepriceBasis(svc: OrderService, db: Prisma.TransactionClient | typeof prisma, orderId: string, order: {
-      passengers: ReadonlyArray<{ id: string }>;
-      items: ReadonlyArray<{
-        passengerId: string | null;
-        metadata: Prisma.JsonValue | null;
-        createdAt?: Date | null;
-      }>;
-      _count?: { splitsIn?: number; splitsOut?: number } | null;
-    }, passengerId: string): Promise<{
+export async function resolveSwapRepriceBasis(
+  svc: OrderService,
+  db: Prisma.TransactionClient | typeof prisma,
+  orderId: string,
+  order: {
+    passengers: ReadonlyArray<{ id: string }>;
+    items: ReadonlyArray<{
+      passengerId: string | null;
+      metadata: Prisma.JsonValue | null;
+      createdAt?: Date | null;
+    }>;
+    _count?: { splitsIn?: number; splitsOut?: number } | null;
+  },
+  passengerId: string,
+): Promise<{
     basisCny: number | null;
     source: string | null;
     /** 基准里已经减过代理立减 → 换人当天也要减；false → 两边都不减（复审 H3）。 */
@@ -1973,7 +2019,12 @@ export async function resolveSwapRepriceBasis(svc: OrderService, db: Prisma.Tran
  * 只读：换人弹窗打开时先告诉经办人「这个人现在算多少钱、按今天的日历重算是多少、旧客要补多少差价、
  * 换人费有哪几档」。与真换人跑同一份取价内核（resolveSwapRepriceQuote），预览所见 = 换人所得。
  */
-export async function swapPreview(svc: OrderService, orderId: string, passengerId: string, actor: { userId: string; role: UserRole; agentId?: string }): Promise<{
+export async function swapPreview(
+  svc: OrderService,
+  orderId: string,
+  passengerId: string,
+  actor: { userId: string; role: UserRole; agentId?: string },
+): Promise<{
     /** 差价基准 = 成交那天的日历每人价；null = 判不出（此时 repriceSkipped 必有值）。 */
     basisCny: number | null;
     oldShareCny: number;
@@ -2036,7 +2087,11 @@ export async function swapPreview(svc: OrderService, orderId: string, passengerI
  * 与 getOrder / 补录同一口径（assertCanView：代理只能碰自己 + 下级代理的单）。
  * 刻意放在事务外、只读一次归属：这是权限判定，不参与后续读-改-写的并发串行。
  */
-export async function assertPassengerEditScope(svc: OrderService, orderId: string, actor: { userId: string; role: UserRole; agentId?: string }): Promise<void> {
+export async function assertPassengerEditScope(
+  svc: OrderService,
+  orderId: string,
+  actor: { userId: string; role: UserRole; agentId?: string },
+): Promise<void> {
   const owner = await prisma.order.findUnique({
     where: { id: orderId },
     select: { userId: true, agentId: true },
@@ -2062,7 +2117,11 @@ export async function assertPassengerEditScope(svc: OrderService, orderId: strin
  * 真正的资金/座位安全由各通道自己的 Order 行锁负责。窗口边界（23:59:59 提交、
  * 00:00:01 才落库）不做额外收紧 —— 差一秒的单本来就该让代理改完，运营次日照样复核。
  */
-export async function assertAgentSelfEditAllowed(svc: OrderService, orderId: string, actor: { userId: string; role: UserRole; agentId?: string }): Promise<void> {
+export async function assertAgentSelfEditAllowed(
+  svc: OrderService,
+  orderId: string,
+  actor: { userId: string; role: UserRole; agentId?: string },
+): Promise<void> {
   if (actor.role === UserRole.ADMIN || actor.role === UserRole.STAFF) return;
   if (actor.role !== UserRole.AGENT) {
     throw new ForbiddenError('仅运营 / 代理可自助改单');
@@ -2114,7 +2173,13 @@ export async function assertAgentSelfEditAllowed(svc: OrderService, orderId: str
  * 权限**不在这里判**：调用方按自己的通道判（运营走 notes 路由的 opsOnly 闸；代理走
  * assertAgentSelfEditAllowed + HAS_VISA 硬拦）。本方法只保证「写进去的状态是自洽的」。
  */
-export async function setOrderVisaStatus(svc: OrderService, orderId: string, visaStatus: VisaRequirement, actor: { userId: string; role: UserRole; agentId?: string }, options: { withOrder?: boolean; noteData?: Prisma.OrderUpdateInput } = {}): Promise<{
+export async function setOrderVisaStatus(
+  svc: OrderService,
+  orderId: string,
+  visaStatus: VisaRequirement,
+  actor: { userId: string; role: UserRole; agentId?: string },
+  options: { withOrder?: boolean; noteData?: Prisma.OrderUpdateInput } = {},
+): Promise<{
     order: ReturnType<typeof serializeOrder> | null;
     changed: boolean;
     before: VisaRequirement | null;
@@ -2199,18 +2264,24 @@ export async function setOrderVisaStatus(svc: OrderService, orderId: string, vis
  * 生日改动仍按建单同款权威口径重派生 passengerType（与换人 1b2 同一段逻辑），
  * 否则把生日从 2019 改成 2009 之后，乘客还挂着「婴儿」类型进出票与分房。
  */
-export async function correctPassenger(svc: OrderService, orderId: string, passengerId: string, input: {
-      lastName?: string;
-      firstName?: string;
-      fullName?: string;
-      chineseName?: string;
-      documentNumber?: string;
-      dateOfBirth?: string;
-      gender?: import('@prisma/client').Gender;
-      nationality?: string;
-      passportExpiry?: string;
-      passportIssueDate?: string;
-    }, requester: OrderRequester): Promise<{
+export async function correctPassenger(
+  svc: OrderService,
+  orderId: string,
+  passengerId: string,
+  input: {
+    lastName?: string;
+    firstName?: string;
+    fullName?: string;
+    chineseName?: string;
+    documentNumber?: string;
+    dateOfBirth?: string;
+    gender?: import('@prisma/client').Gender;
+    nationality?: string;
+    passportExpiry?: string;
+    passportIssueDate?: string;
+  },
+  requester: OrderRequester,
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -2548,12 +2619,18 @@ export async function correctPassenger(svc: OrderService, orderId: string, passe
  * 则批文成本已发生）→ 换人通道补过钱的乘客拒绝（防两套钱法叠加双计）→ 有钱语义时
  * 结算锁 / 开票闸 / 多条钱行拒绝。非 BUNDLE 单（纯机票/签证单等）纯改标记，不动钱。
  */
-export async function setPassengerVisaExempt(svc: OrderService, orderId: string, passengerId: string, input: {
-      visaExempt: boolean;
-      note?: string;
-      /** 送签已在办理时的人为确认：退多少（0=不退）+ 原因。见 orders.schemas 同名字段注释。 */
-      submittedOverride?: { refundCny: number; reason: string };
-    }, actor: { userId: string; role: UserRole }): Promise<{
+export async function setPassengerVisaExempt(
+  svc: OrderService,
+  orderId: string,
+  passengerId: string,
+  input: {
+    visaExempt: boolean;
+    note?: string;
+    /** 送签已在办理时的人为确认：退多少（0=不退）+ 原因。见 orders.schemas 同名字段注释。 */
+    submittedOverride?: { refundCny: number; reason: string };
+  },
+  actor: { userId: string; role: UserRole },
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     warning: string | null;
     /** 幂等短路（目标值与现值相同）：不写审计、不动钱。 */

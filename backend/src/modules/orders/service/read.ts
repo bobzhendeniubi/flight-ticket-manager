@@ -406,7 +406,11 @@ export async function getOrder(svc: OrderService, id: string, requester: OrderRe
  *
  * 仅 ADMIN 可看（与删除权限对称，STAFF 不行）。
  */
-export async function listDeletedOrders(svc: OrderService, query: { page: number; pageSize: number; search?: string }, requester: OrderRequester) {
+export async function listDeletedOrders(
+  svc: OrderService,
+  query: { page: number; pageSize: number; search?: string },
+  requester: OrderRequester,
+) {
   if (!actorCan(requester, 'orders.read_deleted')) {
     throw new ForbiddenError('仅内部员工可查看回收站');
   }
@@ -678,7 +682,11 @@ export async function getOrderItineraryData(svc: OrderService, orderId: string, 
 // ════════════════════════════════════════════════════════════════════
 // 权限校验
 // ════════════════════════════════════════════════════════════════════
-export async function assertCanView(svc: OrderService, order: { userId: string | null; agentId: string | null }, requester: OrderRequester) {
+export async function assertCanView(
+  svc: OrderService,
+  order: { userId: string | null; agentId: string | null },
+  requester: OrderRequester,
+) {
   if (requester.role === 'ADMIN' || requester.role === 'STAFF') return;
   if (requester.role === 'CUSTOMER') {
     // 游客单（userId=null）无登录归属 → 普通客户不可通过此路径查看（走公开 lookup）

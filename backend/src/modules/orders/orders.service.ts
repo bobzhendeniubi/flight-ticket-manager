@@ -25,8 +25,6 @@ import {
 } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import type { ItineraryData } from '../../lib/itinerary-pdf.js';
-import { stripInternalLegPrefix } from './orders.leg-status.js';
-import { groupPassengerAdjustments } from './order-adjustment-lines.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import type {
   BatchCreateOrdersBody,
@@ -307,7 +305,9 @@ export type {
 
 export class OrderService {
   readonly pricing = new PricingService();
-  createHoldConversionOrderWithinTx(tx: Prisma.TransactionClient, input: {
+  createHoldConversionOrderWithinTx(
+    tx: Prisma.TransactionClient,
+    input: {
       holdOrderId: string;
       holdNo: string;
       flightScheduleId: string;
@@ -320,11 +320,17 @@ export class OrderService {
       agentId?: string | null;
       actorUserId: string | null;
       allowDuplicatePassengers?: boolean;
-    }) {
+    },
+  ) {
     return createSvc.createHoldConversionOrderWithinTx(this, tx, input);
   }
 
-  advanceOrderToPaidIfClearedWithinTx(tx: Prisma.TransactionClient, orderId: string, requester: OrderRequester, pendingFulfillmentTaskIds: string[]): Promise<{ fullyPaid: boolean; status: OrderStatus }> {
+  advanceOrderToPaidIfClearedWithinTx(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    requester: OrderRequester,
+    pendingFulfillmentTaskIds: string[],
+  ): Promise<{ fullyPaid: boolean; status: OrderStatus }> {
     return statusSvc.advanceOrderToPaidIfClearedWithinTx(this, tx, orderId, requester, pendingFulfillmentTaskIds);
   }
 
@@ -352,11 +358,18 @@ export class OrderService {
     return createSvc.resolveEarliestFlightDepartureDate(this, items);
   }
 
-  applyPassportExpiryRule(body: CreateOrderBody, pricedItems: Array<{ kind: OrderItemKind; description: string; quantity: number; unitPrice: number; amount: number; totalCostCny?: number }>): Promise<void> {
+  applyPassportExpiryRule(
+    body: CreateOrderBody,
+    pricedItems: Array<{ kind: OrderItemKind; description: string; quantity: number; unitPrice: number; amount: number; totalCostCny?: number }>,
+  ): Promise<void> {
     return createSvc.applyPassportExpiryRule(this, body, pricedItems);
   }
 
-  applyAgentSettlementDiscount(pricedItems: PricedOrderItem[], calendar: { totalCny: number; audit: Record<string, unknown> }, agentId: string): Promise<AutoDiscountSummary | null> {
+  applyAgentSettlementDiscount(
+    pricedItems: PricedOrderItem[],
+    calendar: { totalCny: number; audit: Record<string, unknown> },
+    agentId: string,
+  ): Promise<AutoDiscountSummary | null> {
     return createSvc.applyAgentSettlementDiscount(this, pricedItems, calendar, agentId);
   }
 
@@ -384,19 +397,33 @@ export class OrderService {
     return createSvc.resolveAuthoritativeBundleGoDates(this, items);
   }
 
-  resolveBundleItemDepartureLocalDate(body: Pick<CreateOrderBody, 'items'>, bundleItem: Extract<OrderItemInput, { kind: 'BUNDLE' }>): Promise<string | null> {
+  resolveBundleItemDepartureLocalDate(
+    body: Pick<CreateOrderBody, 'items'>,
+    bundleItem: Extract<OrderItemInput, { kind: 'BUNDLE' }>,
+  ): Promise<string | null> {
     return createSvc.resolveBundleItemDepartureLocalDate(this, body, bundleItem);
   }
 
-  assertNoDuplicatePassengersOnFlights(flightScheduleIds: string[], passengers: ReadonlyArray<DuplicateCheckPassenger>, allowDuplicate = false): Promise<DuplicatePassengerConflict[]> {
+  assertNoDuplicatePassengersOnFlights(
+    flightScheduleIds: string[],
+    passengers: ReadonlyArray<DuplicateCheckPassenger>,
+    allowDuplicate = false,
+  ): Promise<DuplicatePassengerConflict[]> {
     return createSvc.assertNoDuplicatePassengersOnFlights(this, flightScheduleIds, passengers, allowDuplicate);
   }
 
-  priceAndValidateItems(items: OrderItemInput[], flightSettlementPriceCny?: number, passengers?: ReadonlyArray<{
+  priceAndValidateItems(
+    items: OrderItemInput[],
+    flightSettlementPriceCny?: number,
+    passengers?: ReadonlyArray<{
       visaExempt?: boolean;
       singleRoom?: boolean;
       gender?: 'M' | 'F' | 'X';
-    }>, allowClientPricedGround = false, starGate?: DesignatedHotelStarGate, hotelOversellCapRooms?: number) {
+    }>,
+    allowClientPricedGround = false,
+    starGate?: DesignatedHotelStarGate,
+    hotelOversellCapRooms?: number,
+  ) {
     return createSvc.priceAndValidateItems(this, items, flightSettlementPriceCny, passengers, allowClientPricedGround, starGate, hotelOversellCapRooms);
   }
 
@@ -436,13 +463,16 @@ export class OrderService {
     return readSvc.loadBundleVisaStayDays(this, items);
   }
 
-  _recordOverpayDisposalPayment(tx: Prisma.TransactionClient, input: {
+  _recordOverpayDisposalPayment(
+    tx: Prisma.TransactionClient,
+    input: {
       orderId: string;
       amountCny: number;
       method: PaymentMethod;
       disposal: 'AGENT_BALANCE' | 'RECEIPT_POOL';
       description: string;
-    }): Promise<void> {
+    },
+  ): Promise<void> {
     return fundsLinksSvc._recordOverpayDisposalPayment(this, tx, input);
   }
 
@@ -499,11 +529,23 @@ export class OrderService {
     return readSvc.lookupOrderForReceiptUpload(this, orderNumber, lookupKey);
   }
 
-  updateStatus(id: string, toStatus: OrderStatus, requester: OrderRequester, reason?: string, force?: boolean) {
+  updateStatus(
+    id: string,
+    toStatus: OrderStatus,
+    requester: OrderRequester,
+    reason?: string,
+    force?: boolean,
+  ) {
     return statusSvc.updateStatus(this, id, toStatus, requester, reason, force);
   }
 
-  batchUpdateStatus(ids: string[], toStatus: OrderStatus, requester: OrderRequester, reason?: string, force?: boolean): Promise<{
+  batchUpdateStatus(
+    ids: string[],
+    toStatus: OrderStatus,
+    requester: OrderRequester,
+    reason?: string,
+    force?: boolean,
+  ): Promise<{
     successCount: number;
     failureCount: number;
     results: Array<{
@@ -533,7 +575,11 @@ export class OrderService {
     return createSvc.batchCreateOrders(this, body, requester);
   }
 
-  resolveBundleFlightLegs(bundleId: string, bundleDepartDate: string | undefined, bundleNightsOverride: number | undefined): Promise<
+  resolveBundleFlightLegs(
+    bundleId: string,
+    bundleDepartDate: string | undefined,
+    bundleNightsOverride: number | undefined,
+  ): Promise<
     | { ok: false; error: string }
     | {
         ok: true;
@@ -549,7 +595,12 @@ export class OrderService {
     return createSvc.matchBundleScheduleByLocalDate(this, flightId, targetYmd);
   }
 
-  updateItemSettlementPrice(orderId: string, itemId: string, input: UpdateItemSettlementPriceBody, actor: { userId: string; role: UserRole }): Promise<{
+  updateItemSettlementPrice(
+    orderId: string,
+    itemId: string,
+    input: UpdateItemSettlementPriceBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     /** B12：已付款单改价的资金后果提示（多付/新尾款）+ 已计提佣金提示；均无后果时 null。*/
     warning: string | null;
@@ -564,7 +615,10 @@ export class OrderService {
     return pricingAdjustSvc.updateItemSettlementPrice(this, orderId, itemId, input, actor);
   }
 
-  setInvoiceFlags(id: string, flags: { outboundInvoiced?: boolean; returnInvoiced?: boolean; systemInvoiced?: boolean }): Promise<{
+  setInvoiceFlags(
+    id: string,
+    flags: { outboundInvoiced?: boolean; returnInvoiced?: boolean; systemInvoiced?: boolean },
+  ): Promise<{
     id: string;
     orderNumber: string;
     outboundInvoiced: boolean;
@@ -574,7 +628,10 @@ export class OrderService {
     return statusSvc.setInvoiceFlags(this, id, flags);
   }
 
-  batchSetInvoiceFlags(ids: string[], flags: { outboundInvoiced?: boolean; returnInvoiced?: boolean; systemInvoiced?: boolean }): Promise<{
+  batchSetInvoiceFlags(
+    ids: string[],
+    flags: { outboundInvoiced?: boolean; returnInvoiced?: boolean; systemInvoiced?: boolean },
+  ): Promise<{
     succeeded: number;
     failed: number;
     results: Array<{
@@ -644,7 +701,11 @@ export class OrderService {
     return fundsLinksSvc.batchSetPaymentsLock(this, orderIds, locked, userId);
   }
 
-  batchAddPriceAdjustment(orderIds: string[], input: Omit<BatchPriceAdjustmentBody, 'orderIds'>, actor: { userId: string; role: UserRole }): Promise<{
+  batchAddPriceAdjustment(
+    orderIds: string[],
+    input: Omit<BatchPriceAdjustmentBody, 'orderIds'>,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
     updated: number;
     skipped: number;
     results: Array<{
@@ -665,17 +726,30 @@ export class OrderService {
     return pricingAdjustSvc.batchAddPriceAdjustment(this, orderIds, input, actor);
   }
 
-  _updateStatusWithinTx(tx: Prisma.TransactionClient, id: string, toStatus: OrderStatus, requester: OrderRequester, reason: string | undefined, newTaskIdsOut: string[], force?: boolean, releasedSeatClassIdsOut?: string[], invoiceCapWarningsOut?: string[]) {
+  _updateStatusWithinTx(
+    tx: Prisma.TransactionClient,
+    id: string,
+    toStatus: OrderStatus,
+    requester: OrderRequester,
+    reason: string | undefined,
+    newTaskIdsOut: string[],
+    force?: boolean,
+    releasedSeatClassIdsOut?: string[],
+    invoiceCapWarningsOut?: string[],
+  ) {
     return statusSvc._updateStatusWithinTx(this, tx, id, toStatus, requester, reason, newTaskIdsOut, force, releasedSeatClassIdsOut, invoiceCapWarningsOut);
   }
 
-  assertRefundRejectionHotelCapacity(tx: Prisma.TransactionClient, items: ReadonlyArray<{
+  assertRefundRejectionHotelCapacity(
+    tx: Prisma.TransactionClient,
+    items: ReadonlyArray<{
       kind: OrderItemKind;
       hotelRoomTypeId: string | null;
       randomStarTier: number | null;
       hotelCheckIn: Date | null;
       hotelCheckOut: Date | null;
-    }>): Promise<void> {
+    }>,
+  ): Promise<void> {
     return statusSvc.assertRefundRejectionHotelCapacity(this, tx, items);
   }
 
@@ -683,7 +757,12 @@ export class OrderService {
     return statusSvc._computeRefundRatioByKind(this, tx, orderId, toStatus);
   }
 
-  selfUpdatePassenger(orderId: string, passengerId: string, input: SelfUpdatePassengerBody, requester: OrderRequester): Promise<{
+  selfUpdatePassenger(
+    orderId: string,
+    passengerId: string,
+    input: SelfUpdatePassengerBody,
+    requester: OrderRequester,
+  ): Promise<{
     passenger: Record<string, unknown>;
     changedFields: string[];
     orderNumber: string;
@@ -695,7 +774,12 @@ export class OrderService {
     return passengersSvc.assertBackfilledDocumentNotDuplicated(this, orderId, documentNumber, client);
   }
 
-  updatePassengerVisaDates(orderId: string, passengerId: string, input: UpdatePassengerVisaDatesBody, actor: { userId: string; role: UserRole }): Promise<{
+  updatePassengerVisaDates(
+    orderId: string,
+    passengerId: string,
+    input: UpdatePassengerVisaDatesBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
     passenger: Record<string, unknown>;
     orderNumber: string;
     before: { visaIssueDate: string | null; visaEffectiveDate: string | null; visaExpiry: string | null };
@@ -704,7 +788,12 @@ export class OrderService {
     return passengersSvc.updatePassengerVisaDates(this, orderId, passengerId, input, actor);
   }
 
-  updatePassengerTicket(orderId: string, passengerId: string, input: UpdatePassengerTicketBody, actor: { userId: string; role: UserRole }): Promise<{
+  updatePassengerTicket(
+    orderId: string,
+    passengerId: string,
+    input: UpdatePassengerTicketBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
     passenger: Record<string, unknown>;
     orderNumber: string;
     passengerName: string;
@@ -728,7 +817,11 @@ export class OrderService {
     return readSvc.assertCanView(this, order, requester);
   }
 
-  assertCanTransition(order: { userId: string | null; agentId: string | null; status: OrderStatus }, toStatus: OrderStatus, requester: OrderRequester) {
+  assertCanTransition(
+    order: { userId: string | null; agentId: string | null; status: OrderStatus },
+    toStatus: OrderStatus,
+    requester: OrderRequester,
+  ) {
     return statusSvc.assertCanTransition(this, order, toStatus, requester);
   }
 
@@ -744,11 +837,15 @@ export class OrderService {
     return statusSvc.requestCancellation(this, id, reason, requester);
   }
 
-  swapRefund(orderId: string, input: {
+  swapRefund(
+    orderId: string,
+    input: {
       swapFeeCny: number;
       replacementOrderNumber?: string;
       reason: string;
-    }, requester: OrderRequester): Promise<{
+    },
+    requester: OrderRequester,
+  ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     netPaidCny: number;
     swapFeeCny: number;
@@ -766,7 +863,9 @@ export class OrderService {
     return fundsLinksSvc.updateSwapReplacementOrderNumber(this, orderId, replacementOrderNumber, requester);
   }
 
-  rescheduleOrderItem(orderId: string, input: {
+  rescheduleOrderItem(
+    orderId: string,
+    input: {
       orderItemId?: string;
       /** 批量改期内部入口：在订单行锁内按真实航段定位订单行。 */
       leg?: 'OUTBOUND' | 'RETURN';
@@ -796,7 +895,9 @@ export class OrderService {
        * 而且这一行的 metadata 正是本方法在改（flightChanged 标记），两处分开写必然互相覆盖。
        */
       requestToken?: string;
-    }, actor: { userId: string; role: UserRole }): Promise<{
+    },
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -828,7 +929,12 @@ export class OrderService {
     return rescheduleSvc.rescheduleOrderItem(this, orderId, input, actor);
   }
 
-  upgradeOrderItemCabin(orderId: string, orderItemId: string, input: { note?: string }, actor: { userId: string; role: UserRole; agentId?: string }): Promise<{
+  upgradeOrderItemCabin(
+    orderId: string,
+    orderItemId: string,
+    input: { note?: string },
+    actor: { userId: string; role: UserRole; agentId?: string },
+  ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -847,7 +953,10 @@ export class OrderService {
     return rescheduleSvc.upgradeOrderItemCabin(this, orderId, orderItemId, input, actor);
   }
 
-  swapPassenger(orderId: string, passengerId: string, input: {
+  swapPassenger(
+    orderId: string,
+    passengerId: string,
+    input: {
       lastName?: string;
       firstName?: string;
       fullName?: string;
@@ -871,7 +980,9 @@ export class OrderService {
       feeCny?: number;
       feeLabel?: string;
       note?: string;
-    }, actor: { userId: string; role: UserRole; agentId?: string }): Promise<{
+    },
+    actor: { userId: string; role: UserRole; agentId?: string },
+  ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -912,13 +1023,18 @@ export class OrderService {
     return passengersSvc.swapPassenger(this, orderId, passengerId, input, actor);
   }
 
-  buildSwapBeforeSnapshot(tx: Prisma.TransactionClient, orderId: string, passengerId: string, passengerFacts: {
+  buildSwapBeforeSnapshot(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    passengerId: string,
+    passengerFacts: {
       chineseName: string | null;
       dateOfBirth: Date | null;
       passportExpiry: Date | null;
       visaExempt: boolean;
       visaStatus: VisaRequirement | null;
-    }): Promise<SwapBeforeSnapshot> {
+    },
+  ): Promise<SwapBeforeSnapshot> {
     return passengersSvc.buildSwapBeforeSnapshot(this, tx, orderId, passengerId, passengerFacts);
   }
 
@@ -926,7 +1042,10 @@ export class OrderService {
     return passengersSvc.resolveSwapRepriceQuote(this, db, orderId, passengerId);
   }
 
-  resolveSwapRepriceBasis(db: Prisma.TransactionClient | typeof prisma, orderId: string, order: {
+  resolveSwapRepriceBasis(
+    db: Prisma.TransactionClient | typeof prisma,
+    orderId: string,
+    order: {
       passengers: ReadonlyArray<{ id: string }>;
       items: ReadonlyArray<{
         passengerId: string | null;
@@ -934,7 +1053,9 @@ export class OrderService {
         createdAt?: Date | null;
       }>;
       _count?: { splitsIn?: number; splitsOut?: number } | null;
-    }, passengerId: string): Promise<{
+    },
+    passengerId: string,
+  ): Promise<{
     basisCny: number | null;
     source: string | null;
     /** 基准里已经减过代理立减 → 换人当天也要减；false → 两边都不减（复审 H3）。 */
@@ -946,7 +1067,11 @@ export class OrderService {
     return passengersSvc.resolveSwapRepriceBasis(this, db, orderId, order, passengerId);
   }
 
-  swapPreview(orderId: string, passengerId: string, actor: { userId: string; role: UserRole; agentId?: string }): Promise<{
+  swapPreview(
+    orderId: string,
+    passengerId: string,
+    actor: { userId: string; role: UserRole; agentId?: string },
+  ): Promise<{
     /** 差价基准 = 成交那天的日历每人价；null = 判不出（此时 repriceSkipped 必有值）。 */
     basisCny: number | null;
     oldShareCny: number;
@@ -968,7 +1093,13 @@ export class OrderService {
     return passengersSvc.assertAgentSelfEditAllowed(this, orderId, actor);
   }
 
-  correctFlightSchedule(orderId: string, itemId: string, newScheduleId: string, actor: { userId: string; role: UserRole; agentId?: string }, options: { allowTicketed?: boolean } = {}): ReturnType<OrderService['rescheduleOrderItem']> {
+  correctFlightSchedule(
+    orderId: string,
+    itemId: string,
+    newScheduleId: string,
+    actor: { userId: string; role: UserRole; agentId?: string },
+    options: { allowTicketed?: boolean } = {},
+  ): ReturnType<OrderService['rescheduleOrderItem']> {
     return rescheduleSvc.correctFlightSchedule(this, orderId, itemId, newScheduleId, actor, options);
   }
 
@@ -980,7 +1111,12 @@ export class OrderService {
     return rescheduleSvc.assertSelfServiceCorrectionIsFreeOfCharge(this, itemId, newScheduleId);
   }
 
-  setOrderVisaStatus(orderId: string, visaStatus: VisaRequirement, actor: { userId: string; role: UserRole; agentId?: string }, options: { withOrder?: boolean; noteData?: Prisma.OrderUpdateInput } = {}): Promise<{
+  setOrderVisaStatus(
+    orderId: string,
+    visaStatus: VisaRequirement,
+    actor: { userId: string; role: UserRole; agentId?: string },
+    options: { withOrder?: boolean; noteData?: Prisma.OrderUpdateInput } = {},
+  ): Promise<{
     order: ReturnType<typeof serializeOrder> | null;
     changed: boolean;
     before: VisaRequirement | null;
@@ -989,7 +1125,10 @@ export class OrderService {
     return passengersSvc.setOrderVisaStatus(this, orderId, visaStatus, actor, options);
   }
 
-  correctPassenger(orderId: string, passengerId: string, input: {
+  correctPassenger(
+    orderId: string,
+    passengerId: string,
+    input: {
       lastName?: string;
       firstName?: string;
       fullName?: string;
@@ -1000,7 +1139,9 @@ export class OrderService {
       nationality?: string;
       passportExpiry?: string;
       passportIssueDate?: string;
-    }, requester: OrderRequester): Promise<{
+    },
+    requester: OrderRequester,
+  ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -1013,12 +1154,17 @@ export class OrderService {
     return passengersSvc.correctPassenger(this, orderId, passengerId, input, requester);
   }
 
-  setPassengerVisaExempt(orderId: string, passengerId: string, input: {
+  setPassengerVisaExempt(
+    orderId: string,
+    passengerId: string,
+    input: {
       visaExempt: boolean;
       note?: string;
       /** 送签已在办理时的人为确认：退多少（0=不退）+ 原因。见 orders.schemas 同名字段注释。 */
       submittedOverride?: { refundCny: number; reason: string };
-    }, actor: { userId: string; role: UserRole }): Promise<{
+    },
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     warning: string | null;
     /** 幂等短路（目标值与现值相同）：不写审计、不动钱。 */
@@ -1040,7 +1186,12 @@ export class OrderService {
     return passengersSvc.setPassengerVisaExempt(this, orderId, passengerId, input, actor);
   }
 
-  swapItemHotel(orderId: string, itemId: string, input: SwapItemHotelBody, actor: { userId: string; role: UserRole; agentId?: string }): Promise<{
+  swapItemHotel(
+    orderId: string,
+    itemId: string,
+    input: SwapItemHotelBody,
+    actor: { userId: string; role: UserRole; agentId?: string },
+  ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -1068,7 +1219,12 @@ export class OrderService {
     return hotelSvc.swapItemHotel(this, orderId, itemId, input, actor);
   }
 
-  splitHotelItemByRoomGroup(orderId: string, itemId: string, input: SplitRoomGroupBody, actor: { userId: string; role: UserRole }): Promise<{
+  splitHotelItemByRoomGroup(
+    orderId: string,
+    itemId: string,
+    input: SplitRoomGroupBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -1087,7 +1243,12 @@ export class OrderService {
     return hotelSvc.splitHotelItemByRoomGroup(this, orderId, itemId, input, actor);
   }
 
-  rescheduleItemHotel(orderId: string, itemId: string, input: RescheduleItemHotelBody, actor: { userId: string; role: UserRole }): Promise<{
+  rescheduleItemHotel(
+    orderId: string,
+    itemId: string,
+    input: RescheduleItemHotelBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -1101,7 +1262,11 @@ export class OrderService {
     return hotelSvc.rescheduleItemHotel(this, orderId, itemId, input, actor);
   }
 
-  changeOrderAgent(orderId: string, input: { agentId: string | null; reason?: string }, actor: { userId: string; role: UserRole }): Promise<{
+  changeOrderAgent(
+    orderId: string,
+    input: { agentId: string | null; reason?: string },
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     warning: string | null;
     audit: {
@@ -1132,13 +1297,17 @@ export class OrderService {
     return hotelSvc.addGroundItem(this, orderId, input, actor);
   }
 
-  addRoomSupplement(orderId: string, input: {
+  addRoomSupplement(
+    orderId: string,
+    input: {
       perNightCny: number;
       nights: number;
       note?: string;
       idempotencyKey?: string;
       passengerId?: string;
-    }, actor: { userId: string; role: UserRole }): Promise<{
+    },
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -1156,7 +1325,12 @@ export class OrderService {
     return hotelSvc.addRoomSupplement(this, orderId, input, actor);
   }
 
-  addPriceAdjustment(orderId: string, input: OrderPriceAdjustmentBody, actor: { userId: string; role: UserRole }, options?: { viaAgentSelfSettlement?: boolean }): Promise<{
+  addPriceAdjustment(
+    orderId: string,
+    input: OrderPriceAdjustmentBody,
+    actor: { userId: string; role: UserRole },
+    options?: { viaAgentSelfSettlement?: boolean },
+  ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -1172,7 +1346,13 @@ export class OrderService {
     return pricingAdjustSvc.addPriceAdjustment(this, orderId, input, actor, options);
   }
 
-  _addPriceAdjustmentWithinTx(tx: Prisma.TransactionClient, orderId: string, input: OrderPriceAdjustmentBody, actor: { userId: string; role: UserRole }, options?: { unitNote?: string }) {
+  _addPriceAdjustmentWithinTx(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    input: OrderPriceAdjustmentBody,
+    actor: { userId: string; role: UserRole },
+    options?: { unitNote?: string },
+  ) {
     return pricingAdjustSvc._addPriceAdjustmentWithinTx(this, tx, orderId, input, actor, options);
   }
 
@@ -1205,11 +1385,20 @@ export class OrderService {
     return hotelSvc.changeOrderBundle(this, orderId, input, actor);
   }
 
-  assessOrderSplit(db: Prisma.TransactionClient, order: SplitSourceOrder, passengerIds: string[], options: { autoSplitRoomGroups?: boolean } = {}): Promise<SplitAssessment> {
+  assessOrderSplit(
+    db: Prisma.TransactionClient,
+    order: SplitSourceOrder,
+    passengerIds: string[],
+    options: { autoSplitRoomGroups?: boolean } = {},
+  ): Promise<SplitAssessment> {
     return splitSvc.assessOrderSplit(this, db, order, passengerIds, options);
   }
 
-  previewOrderSplit(orderId: string, body: { passengerIds: string[]; autoSplitRoomGroups?: boolean }, actor: { userId: string; role: UserRole }): Promise<{
+  previewOrderSplit(
+    orderId: string,
+    body: { passengerIds: string[]; autoSplitRoomGroups?: boolean },
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
     eligible: boolean;
     blockers: string[];
     warnings: string[];
@@ -1233,7 +1422,13 @@ export class OrderService {
     return splitSvc.findSplitReplay(this, orderId, requestToken);
   }
 
-  executeSplitWithinTx(tx: Prisma.TransactionClient, orderId: string, input: SplitOrderInput, actor: { userId: string; role: UserRole }, targetOrderNumber: string): Promise<
+  executeSplitWithinTx(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    input: SplitOrderInput,
+    actor: { userId: string; role: UserRole },
+    targetOrderNumber: string,
+  ): Promise<
     | { kind: 'replayed'; result: SplitOrderResult }
     | {
         kind: 'done';
@@ -1259,7 +1454,9 @@ export class OrderService {
     return splitSvc.executeSplitWithinTx(this, tx, orderId, input, actor, targetOrderNumber);
   }
 
-  reschedulePassengers(orderId: string, input: {
+  reschedulePassengers(
+    orderId: string,
+    input: {
       passengerIds: string[];
       orderItemId: string;
       newScheduleId: string;
@@ -1269,11 +1466,17 @@ export class OrderService {
       note?: string;
       roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
       requestToken: string;
-    }, actor: { userId: string; role: UserRole }): Promise<ReschedulePassengersResult> {
+    },
+    actor: { userId: string; role: UserRole },
+  ): Promise<ReschedulePassengersResult> {
     return rescheduleSvc.reschedulePassengers(this, orderId, input, actor);
   }
 
-  _auditReschedulePassengers(result: ReschedulePassengersResult, actor: { userId: string; role: UserRole }, movedPassengerIds: string[]): Promise<void> {
+  _auditReschedulePassengers(
+    result: ReschedulePassengersResult,
+    actor: { userId: string; role: UserRole },
+    movedPassengerIds: string[],
+  ): Promise<void> {
     return rescheduleSvc._auditReschedulePassengers(this, result, actor, movedPassengerIds);
   }
 
@@ -1319,7 +1522,12 @@ export class OrderService {
     return legsSvc.cancelReturnLeg(this, orderId, input, actor);
   }
 
-  _assessNoShow(db: Prisma.TransactionClient, orderId: string, passengerIds: string[] | undefined, releaseReturn = true): Promise<{
+  _assessNoShow(
+    db: Prisma.TransactionClient,
+    orderId: string,
+    passengerIds: string[] | undefined,
+    releaseReturn = true,
+  ): Promise<{
     order: CancelLegOrderSnapshot;
     outboundItem: CancelLegItemSnapshot | null;
     returnItem: CancelLegItemSnapshot | null;
@@ -1347,7 +1555,11 @@ export class OrderService {
     return legsSvc._describeNoShowLeg(this, item);
   }
 
-  previewNoShow(orderId: string, body: { passengerIds?: string[]; releaseReturn?: boolean }, actor: { userId: string; role: UserRole }): Promise<NoShowPreview> {
+  previewNoShow(
+    orderId: string,
+    body: { passengerIds?: string[]; releaseReturn?: boolean },
+    actor: { userId: string; role: UserRole },
+  ): Promise<NoShowPreview> {
     return legsSvc.previewNoShow(this, orderId, body, actor);
   }
 
@@ -1359,7 +1571,12 @@ export class OrderService {
     return legsSvc.markNoShow(this, orderId, input, actor);
   }
 
-  _executeNoShow(targetOrderId: string, input: NoShowBody, actor: { userId: string; role: UserRole }, split: { sourceOrderNumber: string; targetOrderNumber: string } | null): Promise<NoShowAudit> {
+  _executeNoShow(
+    targetOrderId: string,
+    input: NoShowBody,
+    actor: { userId: string; role: UserRole },
+    split: { sourceOrderNumber: string; targetOrderNumber: string } | null,
+  ): Promise<NoShowAudit> {
     return legsSvc._executeNoShow(this, targetOrderId, input, actor, split);
   }
 
@@ -1416,8 +1633,6 @@ export class OrderService {
     return legsSvc._assessVoidReturnLeg(this, db, orderId);
   }
 }
-
-// ── 去程 no-show / 回程释放 · 恢复：常量 + 辅助 + 对外契约类型 ─────────────────
 
 /**
  * 内部留痕前缀（no-show / 释放 / 取消航段）与剥前缀函数**都住在 orders.leg-status.ts**：

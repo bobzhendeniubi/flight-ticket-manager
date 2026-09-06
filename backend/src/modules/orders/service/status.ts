@@ -66,7 +66,13 @@ import type { OrderService } from '../orders.service.js';
  * 转正专用的正常收款状态收口。调用方无论是否实际生成结转 Payment 都必须调用：
  * carryCny=0 的零价订单同样按 effectivePayable <= paidAmount 推进 PAID。
  */
-export async function advanceOrderToPaidIfClearedWithinTx(svc: OrderService, tx: Prisma.TransactionClient, orderId: string, requester: OrderRequester, pendingFulfillmentTaskIds: string[]): Promise<{ fullyPaid: boolean; status: OrderStatus }> {
+export async function advanceOrderToPaidIfClearedWithinTx(
+  svc: OrderService,
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  requester: OrderRequester,
+  pendingFulfillmentTaskIds: string[],
+): Promise<{ fullyPaid: boolean; status: OrderStatus }> {
   const order = await tx.order.findUnique({
     where: { id: orderId },
     select: { status: true, total: true, adjustmentCny: true, paidAmount: true, prepaymentOffset: true },
@@ -182,7 +188,14 @@ export async function restoreOrder(svc: OrderService, id: string, requester: Ord
 // ════════════════════════════════════════════════════════════════════
 // 状态流转
 // ════════════════════════════════════════════════════════════════════
-export async function updateStatus(svc: OrderService, id: string, toStatus: OrderStatus, requester: OrderRequester, reason?: string, force?: boolean) {
+export async function updateStatus(
+  svc: OrderService,
+  id: string,
+  toStatus: OrderStatus,
+  requester: OrderRequester,
+  reason?: string,
+  force?: boolean,
+) {
   // 收集事务里创建的任务 id，提交后再入队（避免 worker 在 tx 提交前查不到）
   const pendingFulfillmentTaskIds: string[] = [];
   // 收集释放座位的舱位 id，提交后排队候补检查
@@ -253,7 +266,14 @@ export async function updateStatus(svc: OrderService, id: string, toStatus: Orde
  * 批量状态流转（ADMIN/STAFF 后台用）。
  * 每个 id 独立 transaction，partial failure 不回滚成功项；返回 per-id 结果。
  */
-export async function batchUpdateStatus(svc: OrderService, ids: string[], toStatus: OrderStatus, requester: OrderRequester, reason?: string, force?: boolean): Promise<{
+export async function batchUpdateStatus(
+  svc: OrderService,
+  ids: string[],
+  toStatus: OrderStatus,
+  requester: OrderRequester,
+  reason?: string,
+  force?: boolean,
+): Promise<{
     successCount: number;
     failureCount: number;
     results: Array<{
@@ -322,7 +342,11 @@ export async function batchUpdateStatus(svc: OrderService, ids: string[], toStat
  * 去程/回程班次由订单 FLIGHT 行按 departureTime 升序判定（determineFlightLegs）。
  * 校验 + 更新同包一个事务，缩小并发开票越限窗口。
  */
-export async function setInvoiceFlags(svc: OrderService, id: string, flags: { outboundInvoiced?: boolean; returnInvoiced?: boolean; systemInvoiced?: boolean }): Promise<{
+export async function setInvoiceFlags(
+  svc: OrderService,
+  id: string,
+  flags: { outboundInvoiced?: boolean; returnInvoiced?: boolean; systemInvoiced?: boolean },
+): Promise<{
     id: string;
     orderNumber: string;
     outboundInvoiced: boolean;
@@ -459,7 +483,11 @@ export async function setInvoiceFlags(svc: OrderService, id: string, flags: { ou
  * 单单失败（如超班次开票上限）不影响其余单；逐单结果 + 汇总一并返回，
  * 供路由层逐单写审计、前端展示成功/失败清单（失败列出订单号+原因）。
  */
-export async function batchSetInvoiceFlags(svc: OrderService, ids: string[], flags: { outboundInvoiced?: boolean; returnInvoiced?: boolean; systemInvoiced?: boolean }): Promise<{
+export async function batchSetInvoiceFlags(
+  svc: OrderService,
+  ids: string[],
+  flags: { outboundInvoiced?: boolean; returnInvoiced?: boolean; systemInvoiced?: boolean },
+): Promise<{
     succeeded: number;
     failed: number;
     results: Array<{
@@ -508,7 +536,18 @@ export async function batchSetInvoiceFlags(svc: OrderService, ids: string[], fla
  * 事务内执行状态流转 —— 供 payments.handleCallback 等外部事务复用。
  * 调用方负责包 $transaction 且提交后 enqueue newTaskIdsOut 里的任务。
  */
-export async function _updateStatusWithinTx(svc: OrderService, tx: Prisma.TransactionClient, id: string, toStatus: OrderStatus, requester: OrderRequester, reason: string | undefined, newTaskIdsOut: string[], force?: boolean, releasedSeatClassIdsOut?: string[], invoiceCapWarningsOut?: string[]) {
+export async function _updateStatusWithinTx(
+  svc: OrderService,
+  tx: Prisma.TransactionClient,
+  id: string,
+  toStatus: OrderStatus,
+  requester: OrderRequester,
+  reason: string | undefined,
+  newTaskIdsOut: string[],
+  force?: boolean,
+  releasedSeatClassIdsOut?: string[],
+  invoiceCapWarningsOut?: string[],
+) {
   const order = await tx.order.findUnique({
     where: { id },
     // 联查班次出发时刻：下面的「释放座位」分支要据此跳过已起飞的航段（见那里的注释）。
@@ -1248,13 +1287,17 @@ export async function _updateStatusWithinTx(svc: OrderService, tx: Prisma.Transa
  * 订单状态已在本事务内 CAS 为 PROCESSING，所以当前订单已经被计入 used；只需检查
  * 受管控夜晚是否出现负余量。未配置包房周期的日期按既有口径不拦截。
  */
-export async function assertRefundRejectionHotelCapacity(svc: OrderService, tx: Prisma.TransactionClient, items: ReadonlyArray<{
-      kind: OrderItemKind;
-      hotelRoomTypeId: string | null;
-      randomStarTier: number | null;
-      hotelCheckIn: Date | null;
-      hotelCheckOut: Date | null;
-    }>): Promise<void> {
+export async function assertRefundRejectionHotelCapacity(
+  svc: OrderService,
+  tx: Prisma.TransactionClient,
+  items: ReadonlyArray<{
+    kind: OrderItemKind;
+    hotelRoomTypeId: string | null;
+    randomStarTier: number | null;
+    hotelCheckIn: Date | null;
+    hotelCheckOut: Date | null;
+  }>,
+): Promise<void> {
   const hotelRows = items.filter(
     (item) =>
       (item.kind === OrderItemKind.HOTEL || item.kind === OrderItemKind.BUNDLE) &&
@@ -1465,7 +1508,12 @@ export async function requestChange(svc: OrderService, orderId: string, reason: 
   return { order: serializeOrder(updated, orderSerializeRoleCtx(requester.role)), idempotent: false };
 }
 
-export async function assertCanTransition(svc: OrderService, order: { userId: string | null; agentId: string | null; status: OrderStatus }, toStatus: OrderStatus, requester: OrderRequester) {
+export async function assertCanTransition(
+  svc: OrderService,
+  order: { userId: string | null; agentId: string | null; status: OrderStatus },
+  toStatus: OrderStatus,
+  requester: OrderRequester,
+) {
   if (requester.role === 'ADMIN' || requester.role === 'STAFF') return;
   if (requester.role === 'CUSTOMER') {
     if (!order.userId || order.userId !== requester.userId) throw new ForbiddenError('无权操作该订单');

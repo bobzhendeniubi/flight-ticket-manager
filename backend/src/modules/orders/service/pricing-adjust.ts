@@ -51,7 +51,13 @@ import type { OrderService } from '../orders.service.js';
  * 不动 quantity / flightScheduleId / flightCabin / 库存（扣座与本订正无关）。
  * 返回 serializeOrder（含审计用的 before/after，由路由层 writeAudit 落库）。
  */
-export async function updateItemSettlementPrice(svc: OrderService, orderId: string, itemId: string, input: UpdateItemSettlementPriceBody, actor: { userId: string; role: UserRole }): Promise<{
+export async function updateItemSettlementPrice(
+  svc: OrderService,
+  orderId: string,
+  itemId: string,
+  input: UpdateItemSettlementPriceBody,
+  actor: { userId: string; role: UserRole },
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     /** B12：已付款单改价的资金后果提示（多付/新尾款）+ 已计提佣金提示；均无后果时 null。*/
     warning: string | null;
@@ -276,7 +282,12 @@ export async function updateItemSettlementPrice(svc: OrderService, orderId: stri
  * 带回原因，其余照做。闸门判断不在这里重写一遍，一律由 _addPriceAdjustmentWithinTx 抛出后接住，
  * 口径只有一份。只接住这三类业务异常，库级异常照旧整批抛（事务已脏，不能继续做后面的单）。
  */
-export async function batchAddPriceAdjustment(svc: OrderService, orderIds: string[], input: Omit<BatchPriceAdjustmentBody, 'orderIds'>, actor: { userId: string; role: UserRole }): Promise<{
+export async function batchAddPriceAdjustment(
+  svc: OrderService,
+  orderIds: string[],
+  input: Omit<BatchPriceAdjustmentBody, 'orderIds'>,
+  actor: { userId: string; role: UserRole },
+): Promise<{
     updated: number;
     skipped: number;
     results: Array<{
@@ -441,7 +452,13 @@ export async function batchAddPriceAdjustment(svc: OrderService, orderIds: strin
 // 事后改这个数字不涉及收款，钱不动，见 funds-guard.ts 该函数上方注释）。
 // 并发：FOR UPDATE 锁订单行后再读 items 重算 total（与补房差同款，杜绝丢失更新）。
 // ════════════════════════════════════════════════════════════════════
-export async function addPriceAdjustment(svc: OrderService, orderId: string, input: OrderPriceAdjustmentBody, actor: { userId: string; role: UserRole }, options?: { viaAgentSelfSettlement?: boolean }): Promise<{
+export async function addPriceAdjustment(
+  svc: OrderService,
+  orderId: string,
+  input: OrderPriceAdjustmentBody,
+  actor: { userId: string; role: UserRole },
+  options?: { viaAgentSelfSettlement?: boolean },
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -495,7 +512,14 @@ export async function addPriceAdjustment(svc: OrderService, orderId: string, inp
  * 闸门口径全部留在这里（结算价锁 → 资金闸 → 乘客归属），批量入口逐单捕获这些异常改成
  * 「跳过 + 原因」，绝不另写一套判断，避免两条入口的口径漂移。
  */
-export async function _addPriceAdjustmentWithinTx(svc: OrderService, tx: Prisma.TransactionClient, orderId: string, input: OrderPriceAdjustmentBody, actor: { userId: string; role: UserRole }, options?: { unitNote?: string }) {
+export async function _addPriceAdjustmentWithinTx(
+  svc: OrderService,
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  input: OrderPriceAdjustmentBody,
+  actor: { userId: string; role: UserRole },
+  options?: { unitNote?: string },
+) {
   const { amountCny, reasonCode, reasonText } = input;
   const row = buildPriceAdjustmentItem({
     amountCny,

@@ -135,7 +135,13 @@ import type { OrderService } from '../orders.service.js';
  * 返回值联查与 getOrder 同款富 include（hotelRoomType/bundle.hotelRoomType 等），确保响应
  * 里的 hotelName/roomTypeName 立即正确，调用方不用再刷一次详情。
  */
-export async function swapItemHotel(svc: OrderService, orderId: string, itemId: string, input: SwapItemHotelBody, actor: { userId: string; role: UserRole; agentId?: string }): Promise<{
+export async function swapItemHotel(
+  svc: OrderService,
+  orderId: string,
+  itemId: string,
+  input: SwapItemHotelBody,
+  actor: { userId: string; role: UserRole; agentId?: string },
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -673,7 +679,13 @@ export async function swapItemHotel(svc: OrderService, orderId: string, itemId: 
  * 酒店行再拆）；房组必须存在且未归属到其它行；拆出数（roomFraction，缺省 1）与
  * 源行剩余数都必须是 0.5 的整数倍且 > 0（等于源行全额 → 无需拆分，直接换酒店）。
  */
-export async function splitHotelItemByRoomGroup(svc: OrderService, orderId: string, itemId: string, input: SplitRoomGroupBody, actor: { userId: string; role: UserRole }): Promise<{
+export async function splitHotelItemByRoomGroup(
+  svc: OrderService,
+  orderId: string,
+  itemId: string,
+  input: SplitRoomGroupBody,
+  actor: { userId: string; role: UserRole },
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -946,7 +958,13 @@ export async function splitHotelItemByRoomGroup(svc: OrderService, orderId: stri
  *
  * description 里的日期段与晚数段按新区间就地改写（其余部分原样保留，见 rewriteHotelStayDescription）。
  */
-export async function rescheduleItemHotel(svc: OrderService, orderId: string, itemId: string, input: RescheduleItemHotelBody, actor: { userId: string; role: UserRole }): Promise<{
+export async function rescheduleItemHotel(
+  svc: OrderService,
+  orderId: string,
+  itemId: string,
+  input: RescheduleItemHotelBody,
+  actor: { userId: string; role: UserRole },
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -1196,7 +1214,12 @@ export async function rescheduleItemHotel(svc: OrderService, orderId: string, it
 // 变更之后新产生的佣金/结算按新归属计。回收站单、已退款单、曾用原代理预存余额抵扣的订单拒绝，
 // 目标代理必须存在且在用；warning 字段保留为空以维持 API 形状。
 // ════════════════════════════════════════════════════════════════════
-export async function changeOrderAgent(svc: OrderService, orderId: string, input: { agentId: string | null; reason?: string }, actor: { userId: string; role: UserRole }): Promise<{
+export async function changeOrderAgent(
+  svc: OrderService,
+  orderId: string,
+  input: { agentId: string | null; reason?: string },
+  actor: { userId: string; role: UserRole },
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     warning: string | null;
     audit: {
@@ -1503,7 +1526,12 @@ export async function changeOrderAgent(svc: OrderService, orderId: string, input
  * 订单详情补录一条结构化 HOTEL/VISA 行。
  * 产品只负责提供当前成本与展示名称；落库后的收入单价和成本快照互不回写。
  */
-export async function addGroundItem(svc: OrderService, orderId: string, input: AddGroundItemBody, actor: { userId: string; role: UserRole }): Promise<{
+export async function addGroundItem(
+  svc: OrderService,
+  orderId: string,
+  input: AddGroundItemBody,
+  actor: { userId: string; role: UserRole },
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -1749,13 +1777,18 @@ export async function addGroundItem(svc: OrderService, orderId: string, input: A
   };
 }
 
-export async function addRoomSupplement(svc: OrderService, orderId: string, input: {
-      perNightCny: number;
-      nights: number;
-      note?: string;
-      idempotencyKey?: string;
-      passengerId?: string;
-    }, actor: { userId: string; role: UserRole }): Promise<{
+export async function addRoomSupplement(
+  svc: OrderService,
+  orderId: string,
+  input: {
+    perNightCny: number;
+    nights: number;
+    note?: string;
+    idempotencyKey?: string;
+    passengerId?: string;
+  },
+  actor: { userId: string; role: UserRole },
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
@@ -2033,7 +2066,12 @@ export async function addRoomSupplement(svc: OrderService, orderId: string, inpu
 //   · 升舱行若与旧套餐档次绑定，同样保持不动（响应 warnings 提示人工复核）；
 //   · 指定酒店及其加价随本次改档清除（新档的酒店要重新指定，响应 warnings 提示）。
 // ════════════════════════════════════════════════════════════════════
-export async function changeOrderBundle(svc: OrderService, orderId: string, input: ChangeOrderBundleBody, actor: { userId: string; role: UserRole }): Promise<{
+export async function changeOrderBundle(
+  svc: OrderService,
+  orderId: string,
+  input: ChangeOrderBundleBody,
+  actor: { userId: string; role: UserRole },
+): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
       orderNumber: string;
