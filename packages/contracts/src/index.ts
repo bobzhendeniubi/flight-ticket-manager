@@ -12,4 +12,4 @@
  *
  * 桶文件只 re-export，不定义任何东西。
  */
-export {};
+export * from './enums.js';
