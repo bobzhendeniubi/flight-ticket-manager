@@ -12,6 +12,11 @@
 # 目录不同 → 项目名默认就不同，但仍显式带 -p 以防手滑。
 # STACK 变量只影响 container_name（避免撞名），默认 prod 保证老命令行为不变。
 #
+# IMAGE_TAG：backend/worker/sales-web/admin-web 四个镜像按 git short sha 打 tag
+# （ftm-<svc>:<sha>），deploy.sh 部署时自动 export，build 完再补打一份 :latest。
+# 不传 IMAGE_TAG（手动裸跑 compose）时缺省 latest，行为和拆分前一样。
+# 回滚 = 只切这个 tag 重启，不重新构建、不拉代码，见 infra/deploy.sh rollback。
+#
 # 必填 env（.env.prod）：
 #   POSTGRES_PASSWORD       数据库密码
 #   JWT_ACCESS_SECRET       JWT access 令牌密钥（>32 字符）
@@ -72,6 +77,9 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
+    # 镜像按 git short sha 打 tag（deploy.sh 部署时 export IMAGE_TAG=$(git rev-parse --short HEAD)），
+    # 缺省 latest 保证不传 IMAGE_TAG 时行为跟拆分前一样。四个服务同源改法，回滚靠切这个 tag。
+    image: ftm-backend:${IMAGE_TAG:-latest}
     container_name: ftm-backend-${STACK:-prod}
     restart: unless-stopped
     depends_on:
@@ -130,6 +138,7 @@ services:
     build:
       context: .
       dockerfile: backend/Dockerfile
+    image: ftm-worker:${IMAGE_TAG:-latest}
     container_name: ftm-worker-${STACK:-prod}
     restart: unless-stopped
     depends_on:
@@ -165,6 +174,7 @@ services:
       args:
         # 浏览器运行时访问后端的 URL。同域反代保留 /api；独立域名改成完整 URL
         VITE_API_BASE: ${VITE_API_BASE:-/api}
+    image: ftm-sales-web:${IMAGE_TAG:-latest}
     container_name: ftm-sales-web-${STACK:-prod}
     restart: unless-stopped
     depends_on:
@@ -179,6 +189,7 @@ services:
       dockerfile: admin-web/Dockerfile
       args:
         VITE_API_BASE: ${VITE_API_BASE:-/api}
+    image: ftm-admin-web:${IMAGE_TAG:-latest}
     container_name: ftm-admin-web-${STACK:-prod}
     restart: unless-stopped
     depends_on:
