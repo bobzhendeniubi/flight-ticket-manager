@@ -16,11 +16,9 @@
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
-import {
-  netReceivedCny,
-  sumCompletedRefundCny,
-  type CompletedRefundShape,
-} from '../../lib/net-received.js';
+import { type CompletedRefundShape } from '../../lib/net-received.js';
+// 订单金额单一口径（审查根因 R2）：应收 / 应收余额从这里取（内部转调 lib/net-received）。
+import { payableCny, receivableBalanceCny } from '../../lib/order-money.js';
 
 export interface DateRange {
   /** ISO date 'YYYY-MM-DD'，包含 */
@@ -322,8 +320,7 @@ interface ReceivableOrderShape {
  * 余额会偏小（钱已经退回客户了，账上却还当收着），甚至被误判成没有欠款而从账龄表里消失。
  */
 function balanceOf(o: ReceivableOrderShape): number {
-  const received = netReceivedCny(o, sumCompletedRefundCny(o.refunds));
-  return round2(dec(o.total) + o.adjustmentCny - received);
+  return receivableBalanceCny(o, o.refunds);
 }
 
 /** 应收账龄：所有进行中订单里余额 > 0 的明细 + 账龄桶汇总 */
@@ -353,7 +350,7 @@ export async function getReceivablesReport(
   for (const o of orders) {
     const balance = balanceOf(o);
     if (balance <= 0) continue;
-    const totalCny = round2(dec(o.total) + o.adjustmentCny);
+    const totalCny = payableCny(o);
     const ageDays = Math.max(0, Math.floor((now - o.createdAt.getTime()) / DAY_MS));
     allRows.push({
       orderId: o.id,

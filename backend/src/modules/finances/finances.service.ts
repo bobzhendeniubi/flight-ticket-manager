@@ -23,6 +23,8 @@ import type { Prisma, PrismaClient } from '@prisma/client';
 import { localDate } from './finances.cost.service.js';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+// 订单金额单一口径（审查根因 R2）：REFUNDED 订单的负项走显式变体（不含预存抵扣）。
+import { paidMinusCompletedRefundsCny } from '../../lib/order-money.js';
 import {
   findMatchedPeriod,
   loadPeriodsByFlightIds,
@@ -586,10 +588,12 @@ export async function getFinancesSummary(
       refunds: { where: { status: 'COMPLETED' }, select: { amount: true } },
     },
   });
+  // ⚠️ 这条负项是「paidAmount − Σ已完成退款」，**不含** prepaymentOffset——与 lib/net-received 的
+  // 已收净额差一个预存抵扣（现状全库恒 0，数字今天相同，公式不同）。冲突已登记待拍板，
+  // 此处只改调 lib/order-money 的显式变体，不统一。
   let refundedNetCny = 0;
   for (const o of refundedOrders) {
-    const refundedTotal = o.refunds.reduce((sum, r) => sum + dec(r.amount), 0);
-    refundedNetCny += dec(o.paidAmount) - refundedTotal;
+    refundedNetCny += paidMinusCompletedRefundsCny(o, o.refunds);
   }
   rev.refund += refundedNetCny;
   revenueCny += refundedNetCny;

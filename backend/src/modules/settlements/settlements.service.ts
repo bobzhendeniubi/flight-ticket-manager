@@ -53,6 +53,8 @@ import {
   NotFoundError,
 } from '../../lib/errors.js';
 import { getDescendantAgentIds } from '../../lib/agent-tree.js';
+// 订单金额单一口径（审查根因 R2）：结算单 GMV 按订单总额（不含售后费）聚合。
+import { grossTotalCny } from '../../lib/order-money.js';
 import type {
   GenerateSettlementsBody,
   ListSettlementsQuery,
@@ -283,7 +285,9 @@ export class SettlementService {
       select: { id: true, total: true },
     });
     // order.total 已含套餐折扣、规则立减等折后净额，因此月结 GMV/佣金基数天然按折后价计算；立减不另改佣金链路。
-    const grossRevenue = sellerOrders.reduce((s, o) => s + Number(o.total), 0);
+    // GMV = Σ 订单总额（lib/order-money.grossTotalCny，**不含**售后费 adjustmentCny）——与代理对账单的
+    // 「应收」（含售后费）是两个口径，已登记待拍板，此处只改调不统一。
+    const grossRevenue = sellerOrders.reduce((s, o) => s + grossTotalCny(o), 0);
     const orderCount = sellerOrders.length;
 
     // 3. commissionPaidToChildren: 在上述 relatedOrderIds 里，查 chainDepth < 自己 chainDepth 的 records
