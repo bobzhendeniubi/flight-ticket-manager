@@ -3,10 +3,12 @@
  *
  * 这条通道的立身之本是「钱只由服务端按一条调价通道动」，两条支路各盯一组不变量：
  *   自助直通（代理 + 自家单 + 未锁价）
- *     1. 落 APPROVED（决定人=本人）+ 调用调价通道 + selfApplied=true
+ *     1. 落 APPROVED（决定人=本人）+ 在同一个事务里调调价内核 + selfApplied=true
  *     2. 已锁价 → 回落 PENDING，钱一分不动（照旧等运营）
  *     3. 已进结算单 / 已开票 / 改后低于已收款 → 拒，且不落任何记录
- *     4. 调价通道抛错 → 错误原样透出，刚落的 APPROVED 被撤掉（不留「已生效但没动钱」）
+ *     4. 调价内核抛错 → 错误原样透出，整个事务回滚（不再手工删记录）
+ *     4b. 连提两次 → 第二次读到的是已经改过的应收，只落一次差额（不会叠加两遍）
+ *     4c. 库里留着「APPROVED 但差额行没落」的自助记录 → 409，不按旧应收再算一份
  *   共通
  *     5. 非归属代理提交 → 403（不能替别家的单议价）
  *     6. 同单已有 PENDING → 409（一单一议，不许排队压价）
@@ -119,12 +121,23 @@ function requestFixture(overrides: Record<string, unknown> = {}) {
   };
 }
 
-/** 假的调价通道：确认路径只应该经由它改订单金额。 */
-function fakeOrders(addPriceAdjustment: ReturnType<typeof vi.fn>): OrderService {
-  return { addPriceAdjustment } as unknown as OrderService;
+/**
+ * 假的调价通道：钱只应该经由这两个入口动。
+ *   · addPriceAdjustment —— 运营确认（外壳自己开事务）
+ *   · _addPriceAdjustmentWithinTx —— 代理自助直通（差额行必须挂在提交那一个事务里，与 APPROVED 同生共死）
+ */
+function fakeOrders(
+  addPriceAdjustment: ReturnType<typeof vi.fn>,
+  applyWithinTx: ReturnType<typeof vi.fn>,
+): OrderService {
+  return {
+    addPriceAdjustment,
+    _addPriceAdjustmentWithinTx: applyWithinTx,
+  } as unknown as OrderService;
 }
 
 let addPriceAdjustment: ReturnType<typeof vi.fn>;
+let applyWithinTx: ReturnType<typeof vi.fn>;
 let service: SettlementRequestsService;
 
 beforeEach(() => {
@@ -147,7 +160,8 @@ beforeEach(() => {
   mockPrisma.settlementRequest.create.mockResolvedValue({ id: 'req-1' });
   mockPrisma.settlementRequest.findUniqueOrThrow.mockResolvedValue(requestFixture());
   addPriceAdjustment = vi.fn();
-  service = new SettlementRequestsService(fakeOrders(addPriceAdjustment));
+  applyWithinTx = vi.fn();
+  service = new SettlementRequestsService(fakeOrders(addPriceAdjustment, applyWithinTx));
 });
 
 describe('receivableCny · 应收口径', () => {
@@ -165,7 +179,7 @@ describe('create() · 未锁价自助直通 / 锁价落 PENDING', () => {
     mockPrisma.agent.findUnique.mockResolvedValue({ id: 'agent-1' });
     mockPrisma.order.findUnique.mockResolvedValue(orderFixture());
     mockPrisma.settlementRequest.findFirst.mockResolvedValue(null);
-    addPriceAdjustment.mockResolvedValue({ order: { id: 'order-1' }, audit: { itemId: 'item-9' } });
+    applyWithinTx.mockResolvedValue({ itemId: 'item-9' });
     mockPrisma.settlementRequest.findUniqueOrThrow.mockResolvedValue(
       requestFixture({
         status: SettlementRequestStatus.APPROVED,
@@ -195,9 +209,12 @@ describe('create() · 未锁价自助直通 / 锁价落 PENDING', () => {
     expect(Number(createArgs.data.systemTotalCny.toString())).toBe(13500);
     expect(Number(createArgs.data.requestedTotalCny.toString())).toBe(12800);
 
-    // 钱只经由既有调价通道动：差额 = 12800 − 13500 = −700 → DISCOUNT，且带内部放行标。
-    expect(addPriceAdjustment).toHaveBeenCalledTimes(1);
-    const [orderId, adjustment, actor, options] = addPriceAdjustment.mock.calls[0];
+    // 钱只经由既有调价通道动，且必须在提交那一个事务里落（tx 原样传下去）：
+    // 差额 = 12800 − 13500 = −700 → DISCOUNT。
+    expect(applyWithinTx).toHaveBeenCalledTimes(1);
+    expect(addPriceAdjustment).not.toHaveBeenCalled();
+    const [tx, orderId, adjustment, actor] = applyWithinTx.mock.calls[0];
+    expect(tx).toBe(mockPrisma);
     expect(orderId).toBe('order-1');
     expect(adjustment).toEqual({
       amountCny: -700,
@@ -205,7 +222,6 @@ describe('create() · 未锁价自助直通 / 锁价落 PENDING', () => {
       reasonText: AGENT_SELF_SETTLEMENT_REASON_TEXT,
     });
     expect(actor).toEqual({ userId: 'agent-user-1', role: UserRole.AGENT });
-    expect(options).toEqual({ viaAgentSelfSettlement: true });
 
     // 生成的差额行 id 回写申请
     expect(mockPrisma.settlementRequest.update).toHaveBeenCalledWith({
@@ -224,11 +240,11 @@ describe('create() · 未锁价自助直通 / 锁价落 PENDING', () => {
     mockPrisma.agent.findUnique.mockResolvedValue({ id: 'agent-1' });
     mockPrisma.order.findUnique.mockResolvedValue(orderFixture());
     mockPrisma.settlementRequest.findFirst.mockResolvedValue(null);
-    addPriceAdjustment.mockResolvedValue({ order: {}, audit: { itemId: 'item-10' } });
+    applyWithinTx.mockResolvedValue({ itemId: 'item-10' });
 
     const result = await service.create(AGENT_USER, 'order-1', { requestedTotalCny: 14000 });
 
-    expect(addPriceAdjustment.mock.calls[0][1]).toMatchObject({
+    expect(applyWithinTx.mock.calls[0][2]).toMatchObject({
       amountCny: 500,
       reasonCode: 'MISC_FEE',
     });
@@ -250,7 +266,7 @@ describe('create() · 未锁价自助直通 / 锁价落 PENDING', () => {
     expect(createArgs.data.decidedById).toBeNull();
     // 锁价支路不加前缀：这条要交给运营看，说明就是代理原话。
     expect(createArgs.data.note).toBe('同行价');
-    expect(addPriceAdjustment).not.toHaveBeenCalled();
+    expect(applyWithinTx).not.toHaveBeenCalled();
     expect(result.selfApplied).toBe(false);
     expect(result.appliedDiffCny).toBeNull();
     expect(result.status).toBe(SettlementRequestStatus.PENDING);
@@ -266,7 +282,7 @@ describe('create() · 未锁价自助直通 / 锁价落 PENDING', () => {
     expect(mockPrisma.settlementRequest.create.mock.calls[0][0].data.status).toBe(
       SettlementRequestStatus.PENDING,
     );
-    expect(addPriceAdjustment).not.toHaveBeenCalled();
+    expect(applyWithinTx).not.toHaveBeenCalled();
     expect(result.selfApplied).toBe(false);
   });
 
@@ -280,7 +296,7 @@ describe('create() · 未锁价自助直通 / 锁价落 PENDING', () => {
       service.create(AGENT_USER, 'order-1', { requestedTotalCny: 12800 }),
     ).rejects.toThrow(/已进入结算单/);
     expect(mockPrisma.settlementRequest.create).not.toHaveBeenCalled();
-    expect(addPriceAdjustment).not.toHaveBeenCalled();
+    expect(applyWithinTx).not.toHaveBeenCalled();
   });
 
   it.each(['outboundInvoiced', 'returnInvoiced', 'systemInvoiced'])(
@@ -294,7 +310,7 @@ describe('create() · 未锁价自助直通 / 锁价落 PENDING', () => {
         service.create(AGENT_USER, 'order-1', { requestedTotalCny: 12800 }),
       ).rejects.toThrow('已开票的订单请联系运营改价');
       expect(mockPrisma.settlementRequest.create).not.toHaveBeenCalled();
-      expect(addPriceAdjustment).not.toHaveBeenCalled();
+      expect(applyWithinTx).not.toHaveBeenCalled();
     },
   );
 
@@ -317,32 +333,104 @@ describe('create() · 未锁价自助直通 / 锁价落 PENDING', () => {
       orderFixture({ paidAmount: new Prisma.Decimal(12800) }),
     );
     mockPrisma.settlementRequest.findFirst.mockResolvedValue(null);
-    addPriceAdjustment.mockResolvedValue({ order: {}, audit: { itemId: 'item-11' } });
+    applyWithinTx.mockResolvedValue({ itemId: 'item-11' });
 
     const result = await service.create(AGENT_USER, 'order-1', { requestedTotalCny: 12800 });
     expect(result.selfApplied).toBe(true);
-    expect(addPriceAdjustment).toHaveBeenCalledTimes(1);
+    expect(applyWithinTx).toHaveBeenCalledTimes(1);
   });
 
-  it('自助改价时调价通道抛错 → 错误原样透出，刚落的 APPROVED 被撤掉', async () => {
+  it('自助改价时调价通道抛错 → 错误原样透出，整个事务回滚（不再手工删记录）', async () => {
     mockPrisma.agent.findUnique.mockResolvedValue({ id: 'agent-1' });
     mockPrisma.order.findUnique.mockResolvedValue(orderFixture());
     mockPrisma.settlementRequest.findFirst.mockResolvedValue(null);
-    addPriceAdjustment.mockRejectedValue(new Error('结算价已锁定，请先解锁再修改'));
+    applyWithinTx.mockRejectedValue(new Error('结算价已锁定，请先解锁再修改'));
 
     await expect(
       service.create(AGENT_USER, 'order-1', { requestedTotalCny: 12800 }),
     ).rejects.toThrow(/结算价已锁定/);
 
-    expect(mockPrisma.settlementRequest.deleteMany).toHaveBeenCalledWith({
-      where: {
-        id: 'req-1',
-        status: SettlementRequestStatus.APPROVED,
-        appliedAdjustmentItemId: null,
-      },
-    });
+    // 申请记录与差额行同在一个事务里 → 抛错即整体回滚，不需要（也不该）事后补一刀删除；
+    // 「已生效但没动钱」这种中间态在库里根本不会出现。
+    expect(mockPrisma.settlementRequest.deleteMany).not.toHaveBeenCalled();
     // 差额行没落地 → 不该有「回写差额行 id」这一次
     expect(mockPrisma.settlementRequest.update).not.toHaveBeenCalled();
+  });
+
+  it('同一单连提两次同样的自助改价 → 差额只落一次（第二次读到的是改过的应收）', async () => {
+    // 「事务里改价」的立身之本：差额行与 APPROVED 记录共用同一把订单行锁，第一笔提交后
+    // 应收已经是新的，第二笔再进来算出来的差额是 0 → 400，而不是照旧按 13500 再减一次 700。
+    const state = { total: 13500 };
+    mockPrisma.agent.findUnique.mockResolvedValue({ id: 'agent-1' });
+    mockPrisma.order.findUnique.mockImplementation(async () =>
+      orderFixture({ total: new Prisma.Decimal(state.total) }),
+    );
+    mockPrisma.settlementRequest.findFirst.mockResolvedValue(null);
+    // 事务串行化（模拟订单行锁）：一个事务跑完下一个才开始。
+    let queue: Promise<unknown> = Promise.resolve();
+    mockPrisma.$transaction.mockImplementation(async (arg: unknown) => {
+      if (typeof arg !== 'function') return Promise.all(arg as Promise<unknown>[]);
+      const run = queue.then(() => (arg as (tx: typeof mockPrisma) => Promise<unknown>)(mockPrisma));
+      queue = run.catch(() => undefined);
+      return run;
+    });
+    // 调价内核在同一个事务里把应收改掉（真内核干的就是这件事）。
+    applyWithinTx.mockImplementation(async (_tx, _orderId, adjustment) => {
+      state.total = Math.round((state.total + adjustment.amountCny) * 100) / 100;
+      return { itemId: `item-${state.total}` };
+    });
+
+    const results = await Promise.allSettled([
+      service.create(AGENT_USER, 'order-1', { requestedTotalCny: 12800 }),
+      service.create(AGENT_USER, 'order-1', { requestedTotalCny: 12800 }),
+    ]);
+
+    expect(results.filter((r) => r.status === 'fulfilled')).toHaveLength(1);
+    const rejected = results.find((r) => r.status === 'rejected') as PromiseRejectedResult;
+    expect(rejected.reason).toMatchObject({ statusCode: 400 });
+    // 关键断言：差额只落了一次，应收停在 12800 而不是 12100。
+    expect(applyWithinTx).toHaveBeenCalledTimes(1);
+    expect(state.total).toBe(12800);
+  });
+
+  it('差额行落在提交那一个事务里 —— 事务回调返回时钱已经动过', async () => {
+    // 上一条测的是结果，这条测的是时序：差额行要是等事务提交后再落，订单行锁早就放了，
+    // 下一个并发请求会读到还没变的应收 —— C-1 那笔「800 提两次变 600」就是这么来的。
+    mockPrisma.agent.findUnique.mockResolvedValue({ id: 'agent-1' });
+    mockPrisma.order.findUnique.mockResolvedValue(orderFixture());
+    mockPrisma.settlementRequest.findFirst.mockResolvedValue(null);
+    applyWithinTx.mockResolvedValue({ itemId: 'item-12' });
+    let appliedWhenTxEnded = -1;
+    mockPrisma.$transaction.mockImplementation(async (arg: unknown) => {
+      if (typeof arg !== 'function') return Promise.all(arg as Promise<unknown>[]);
+      const result = await (arg as (tx: typeof mockPrisma) => Promise<unknown>)(mockPrisma);
+      appliedWhenTxEnded = applyWithinTx.mock.calls.length;
+      return result;
+    });
+
+    await service.create(AGENT_USER, 'order-1', { requestedTotalCny: 12800 });
+
+    expect(appliedWhenTxEnded).toBe(1);
+    // 差额行 id 也在同一个事务里回写（不留「APPROVED 但没挂行」的中间态）。
+    expect(mockPrisma.settlementRequest.update).toHaveBeenCalledWith({
+      where: { id: 'req-1' },
+      data: { appliedAdjustmentItemId: 'item-12' },
+    });
+  });
+
+  it('库里留着「APPROVED 但差额行没落」的自助记录 → 409，不按旧应收再算一份', async () => {
+    mockPrisma.agent.findUnique.mockResolvedValue({ id: 'agent-1' });
+    mockPrisma.order.findUnique.mockResolvedValue(orderFixture());
+    // 第一次查（有没有 PENDING）→ 无；第二次查（有没有没落地的自助 APPROVED）→ 有。
+    mockPrisma.settlementRequest.findFirst
+      .mockResolvedValueOnce(null)
+      .mockResolvedValueOnce({ id: 'req-stuck' });
+
+    await expect(
+      service.create(AGENT_USER, 'order-1', { requestedTotalCny: 12800 }),
+    ).rejects.toMatchObject({ statusCode: 409 });
+    expect(mockPrisma.settlementRequest.create).not.toHaveBeenCalled();
+    expect(applyWithinTx).not.toHaveBeenCalled();
   });
 
   it('代理对别家名下的单提交 → 403', async () => {
@@ -353,7 +441,7 @@ describe('create() · 未锁价自助直通 / 锁价落 PENDING', () => {
       /只能对自己名下的订单/,
     );
     expect(mockPrisma.settlementRequest.create).not.toHaveBeenCalled();
-    expect(addPriceAdjustment).not.toHaveBeenCalled();
+    expect(applyWithinTx).not.toHaveBeenCalled();
   });
 
   it('同一订单已有待确认申请 → 409（自助支路同样拒，免得留下没人处理的 PENDING）', async () => {
@@ -365,7 +453,7 @@ describe('create() · 未锁价自助直通 / 锁价落 PENDING', () => {
       service.create(AGENT_USER, 'order-1', { requestedTotalCny: 12800 }),
     ).rejects.toMatchObject({ statusCode: 409 });
     expect(mockPrisma.settlementRequest.create).not.toHaveBeenCalled();
-    expect(addPriceAdjustment).not.toHaveBeenCalled();
+    expect(applyWithinTx).not.toHaveBeenCalled();
   });
 
   it('差额超出单笔调整上限 → 400', async () => {
@@ -576,7 +664,7 @@ describe('指定乘客范围 · 调整净额口径', () => {
     mockPrisma.agent.findUnique.mockResolvedValue({ id: 'agent-1' });
     mockPrisma.order.findUnique.mockResolvedValue(orderFixture());
     mockPrisma.settlementRequest.findFirst.mockResolvedValue(null);
-    addPriceAdjustment.mockResolvedValue({ order: { id: 'order-1' }, audit: { itemId: 'item-7' } });
+    applyWithinTx.mockResolvedValue({ itemId: 'item-7' });
     mockPrisma.settlementRequest.findUniqueOrThrow.mockResolvedValue(
       requestFixture({
         status: SettlementRequestStatus.APPROVED,
@@ -604,8 +692,9 @@ describe('指定乘客范围 · 调整净额口径', () => {
     expect(Number(createArgs.data.requestedTotalCny.toString())).toBe(13000);
     expect(Number(createArgs.data.systemTotalCny.toString())).toBe(13500);
 
-    // 钱照旧只经由既有调价通道动，且带上作用范围。
-    const [orderId, adjustment, , options] = addPriceAdjustment.mock.calls[0];
+    // 钱照旧只经由既有调价通道动（且在提交那一个事务里），并带上作用范围。
+    const [tx, orderId, adjustment] = applyWithinTx.mock.calls[0];
+    expect(tx).toBe(mockPrisma);
     expect(orderId).toBe('order-1');
     expect(adjustment).toEqual({
       amountCny: -500,
@@ -613,7 +702,6 @@ describe('指定乘客范围 · 调整净额口径', () => {
       reasonText: AGENT_SELF_SETTLEMENT_REASON_TEXT,
       passengerId: 'pax-1',
     });
-    expect(options).toEqual({ viaAgentSelfSettlement: true });
 
     // 序列化：差额 = 这笔净额本身（不是「申请价 − 当前应收」）。
     expect(result.selfApplied).toBe(true);
@@ -638,7 +726,7 @@ describe('指定乘客范围 · 调整净额口径', () => {
       service.create(AGENT_USER, 'order-1', { passengerId: 'pax-9', adjustmentCny: -500 }),
     ).rejects.toThrow('指定的乘客不存在或不属于本订单');
     expect(mockPrisma.settlementRequest.create).not.toHaveBeenCalled();
-    expect(addPriceAdjustment).not.toHaveBeenCalled();
+    expect(applyWithinTx).not.toHaveBeenCalled();
   });
 
   it('已锁价的单按人改价 → 照旧落 PENDING，净额存下来等运营确认，钱一分不动', async () => {
@@ -662,7 +750,7 @@ describe('指定乘客范围 · 调整净额口径', () => {
     const createArgs = mockPrisma.settlementRequest.create.mock.calls[0][0];
     expect(createArgs.data.status).toBe(SettlementRequestStatus.PENDING);
     expect(Number(createArgs.data.requestedAdjustmentCny.toString())).toBe(800);
-    expect(addPriceAdjustment).not.toHaveBeenCalled();
+    expect(applyWithinTx).not.toHaveBeenCalled();
     expect(result.selfApplied).toBe(false);
     expect(result.appliedDiffCny).toBeNull();
   });

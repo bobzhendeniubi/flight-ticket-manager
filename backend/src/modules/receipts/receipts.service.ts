@@ -1165,33 +1165,51 @@ export class ReceiptsService {
     input: { externalTxnId?: string | null },
     actor: { userId: string; role: UserRole },
   ): Promise<{ ok: true; receiptId: string; receiptNo: string; verifiedAt: Date }> {
-    const result = await prisma.$transaction(async (tx) => {
-      const receipt = await tx.receipt.findUnique({ where: { id: receiptId } });
-      if (!receipt) throw new NotFoundError('进账不存在');
-      if (receipt.source !== ReceiptSource.OPS_CLAIM) {
-        throw new BadRequestError('只有运营水单登记的到账需要核实（流水导入/财务登记的进账本身就是核实来源）。');
-      }
-      if (receipt.status === ReceiptStatus.REFUNDED) {
-        throw new ConflictError('该笔登记已作废（认款被撤销），无需核实。');
-      }
-      if (receipt.verifiedAt) throw new ConflictError('该笔到账已经核实过了，请刷新列表。');
-      if (actor.role !== UserRole.ADMIN && receipt.createdById === actor.userId) {
-        throw new ConflictError('不能核实自己录入的到账，请由财务或其他同事核实。');
-      }
-      const externalTxnId = input.externalTxnId?.trim() || null;
-      if (externalTxnId) {
-        const dup = await tx.receipt.findUnique({ where: { externalTxnId }, select: { id: true, receiptNo: true } });
-        if (dup && dup.id !== receiptId) {
-          throw new ConflictError(`交易流水号 ${externalTxnId} 已登记在进账 ${dup.receiptNo} 上——同一笔钱别记两次；若确为该流水，请撤销一边再处理。`);
+    const externalTxnIdInput = input.externalTxnId?.trim() || null;
+    let result;
+    try {
+      result = await prisma.$transaction(async (tx) => {
+        const receipt = await tx.receipt.findUnique({ where: { id: receiptId } });
+        if (!receipt) throw new NotFoundError('进账不存在');
+        if (receipt.source !== ReceiptSource.OPS_CLAIM) {
+          throw new BadRequestError('只有运营水单登记的到账需要核实（流水导入/财务登记的进账本身就是核实来源）。');
         }
-      }
-      const verifiedAt = new Date();
-      await tx.receipt.update({
-        where: { id: receiptId },
-        data: { verifiedAt, verifiedById: actor.userId, ...(externalTxnId ? { externalTxnId } : {}) },
+        if (receipt.status === ReceiptStatus.REFUNDED) {
+          throw new ConflictError('该笔登记已作废（认款被撤销），无需核实。');
+        }
+        if (receipt.verifiedAt) throw new ConflictError('该笔到账已经核实过了，请刷新列表。');
+        if (actor.role !== UserRole.ADMIN && receipt.createdById === actor.userId) {
+          throw new ConflictError('不能核实自己录入的到账，请由财务或其他同事核实。');
+        }
+        const externalTxnId = externalTxnIdInput;
+        if (externalTxnId) {
+          const dup = await tx.receipt.findUnique({ where: { externalTxnId }, select: { id: true, receiptNo: true } });
+          if (dup && dup.id !== receiptId) {
+            throw new ConflictError(`交易流水号 ${externalTxnId} 已登记在进账 ${dup.receiptNo} 上——同一笔钱别记两次；若确为该流水，请撤销一边再处理。`);
+          }
+        }
+        const verifiedAt = new Date();
+        await tx.receipt.update({
+          where: { id: receiptId },
+          data: { verifiedAt, verifiedById: actor.userId, ...(externalTxnId ? { externalTxnId } : {}) },
+        });
+        return { receiptNo: receipt.receiptNo, amountCny: Number(receipt.amountCny), verifiedAt, externalTxnId };
       });
-      return { receiptNo: receipt.receiptNo, amountCny: Number(receipt.amountCny), verifiedAt, externalTxnId };
-    });
+    } catch (err) {
+      // 上面那道「先查有没有人占了这个流水号」只看得见**本事务开始前**已存在的行：两个人几乎同时
+      // 给两笔不同的登记填同一个流水号，两边都查到「没占用」，后提交的那笔会撞唯一索引。
+      // 裸 P2002 会变成 500（前端只看到「服务器错误」），这里翻成与上面检查分支同一句 409。
+      if (
+        externalTxnIdInput &&
+        err instanceof Prisma.PrismaClientKnownRequestError &&
+        err.code === 'P2002'
+      ) {
+        throw new ConflictError(
+          `交易流水号 ${externalTxnIdInput} 刚被另一笔进账占用——同一笔钱别记两次；请刷新列表确认是哪一笔。`,
+        );
+      }
+      throw err;
+    }
 
     void writeAudit({
       actor: { userId: actor.userId, role: actor.role },

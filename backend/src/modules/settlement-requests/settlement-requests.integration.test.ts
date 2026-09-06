@@ -4,6 +4,7 @@
  * 覆盖单测（mock Prisma）验证不到的全链路 —— 钱是不是真的动了、锁是不是真的挡得住：
  *   (a) 代理录单当场自填结算总价 → 落 SETTLEMENT 差额行，order.total = 结算价。
  *   (b) 下单后代理自助改价 → APPROVED 记录 + 真差额行 + order.total 收敛到申请价。
+ *   (b2) 并发提两次同样的自助改价 → 真行锁串行化，差额只落一次（应收不会被改两遍）。
  *   (c) 结算价锁定后再提交 → 只落 PENDING，订单金额一分不动。
  *   (d) 锁着的单由运营确认 → 409（调价通道的锁闸挡住），申请留在 PENDING 等解锁。
  *
@@ -133,6 +134,33 @@ describe('代理自助改结算价（真 DB）', () => {
     expect(item.orderId).toBe(order.id);
     expect(Number(item.amount)).toBe(-140);
     expect(item.description).toContain('代理自助改结算价');
+  });
+
+  it('(b2) 同一单并发提两次同样的自助改价 → 差额只落一次（真行锁串行化）', async () => {
+    const agent = await createAgentRequester();
+    const order = await createAgentOrder(agent, { unitPrice: 1000 });
+
+    // 双击/客户端重试：两个请求几乎同时进来。差额行与 APPROVED 记录共用同一把订单行锁，
+    // 第二个请求要么读到已经改过的应收（差额 0 → 400），要么撞上「已有待确认/未落地」的闸 →
+    // 无论哪种，应收都只被改一次，绝不出现「1000 提两次 860」变成 720。
+    const [r1, r2] = await Promise.allSettled([
+      service.create(agent, order.id, { requestedTotalCny: 860 }),
+      service.create(agent, order.id, { requestedTotalCny: 860 }),
+    ]);
+
+    const fulfilled = [r1, r2].filter((r) => r.status === 'fulfilled');
+    expect(fulfilled).toHaveLength(1);
+    expect(await receivableOf(order.id)).toBe(860);
+
+    // 落库的「已生效」记录也只有一条，且挂着真差额行。
+    const rows = await prisma.settlementRequest.findMany({ where: { orderId: order.id } });
+    expect(rows).toHaveLength(1);
+    expect(rows[0].status).toBe(SettlementRequestStatus.APPROVED);
+    expect(rows[0].appliedAdjustmentItemId).toBeTruthy();
+    const adjustmentItems = await prisma.orderItem.findMany({
+      where: { orderId: order.id, description: { contains: '代理自助改结算价' } },
+    });
+    expect(adjustmentItems).toHaveLength(1);
   });
 
   it('(c) 锁价后提交只落 PENDING，(d) 运营确认被锁闸挡回 409，解锁后才生效', async () => {

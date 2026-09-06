@@ -5,12 +5,14 @@ vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { ConflictError, NotFoundError } from '../../lib/errors.js';
 import {
+  createCostPeriod,
   deleteCostPeriod,
   listCostPeriods,
   listSchedulesWithCost,
   patchFlightScheduleCost,
   resolveFlightItemCost,
   setFlightScheduleCostLock,
+  updateCostPeriod,
 } from './finances.cost.service.js';
 
 function itemSchedule(overrides: Partial<{
@@ -24,7 +26,7 @@ function itemSchedule(overrides: Partial<{
   seatClasses: { capacity: number }[];
   departureTime: Date;
   departureTz: string;
-}>) {
+}> = {}) {
   return {
     departureTime: new Date('2026-07-22T10:00:00.000Z'),
     departureTz: 'UTC',
@@ -402,5 +404,126 @@ describe('listCostPeriods — toDto 回传汇率四元组', () => {
     expect(dto.charterSourceAmount).toBeNull();
     expect(dto.charterFxRate).toBeNull();
     expect(dto.charterFxDate).toBeNull();
+  });
+});
+
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('成本周期写入 — 重叠校验必须在事务 + 航班行锁里做', () => {
+  /**
+   * 「先查重叠、后写入」挡不住并发：两个人同时给同一航班录重叠的成本期，各自都查到「无重叠」，
+   * 库里就躺着两条重叠周期，取哪条生效全看排序，毛利算错还没有痕迹。
+   * 这里钉的是时序：查重叠与写入必须发生在同一个事务里，且事务一开始就先锁住航班行。
+   */
+  function txClient(overrides: {
+    overlap?: unknown;
+    existing?: unknown;
+    locked?: Array<{ id: string }>;
+  } = {}) {
+    const calls: string[] = [];
+    const tx = {
+      $queryRaw: vi.fn().mockImplementation(async () => {
+        calls.push('lock');
+        return overrides.locked ?? [{ id: 'f1' }];
+      }),
+      flightCostPeriod: {
+        findFirst: vi.fn().mockImplementation(async () => {
+          calls.push('overlap');
+          return overrides.overlap ?? null;
+        }),
+        findUnique: vi.fn().mockImplementation(async () => overrides.existing ?? null),
+        create: vi.fn().mockImplementation(async () => {
+          calls.push('write');
+          return periodRow();
+        }),
+        update: vi.fn().mockImplementation(async () => {
+          calls.push('write');
+          return periodRow();
+        }),
+      },
+    };
+    const client = {
+      $transaction: vi.fn().mockImplementation(async (cb: (t: unknown) => unknown) => {
+        calls.push('tx-begin');
+        return cb(tx);
+      }),
+      // 事务外的这几个入口一旦被用到就说明改漏了（查重叠/写入跑在了锁外面）
+      flightCostPeriod: {
+        findFirst: vi.fn().mockRejectedValue(new Error('不该在事务外查重叠')),
+        create: vi.fn().mockRejectedValue(new Error('不该在事务外写入')),
+        update: vi.fn().mockRejectedValue(new Error('不该在事务外写入')),
+        findUnique: vi.fn().mockRejectedValue(new Error('不该在事务外读')),
+      },
+    } as unknown as PrismaClient;
+    return { client, tx, calls };
+  }
+
+  function periodRow() {
+    return {
+      id: 'p1',
+      flightId: 'f1',
+      effectiveFrom: new Date('2026-03-01T00:00:00.000Z'),
+      effectiveTo: new Date('2026-03-31T00:00:00.000Z'),
+      charterCostCny: null,
+      airportTaxDepCny: null,
+      airportTaxArrCny: null,
+      fuelCostCny: null,
+      peakSurchargeCny: null,
+      aircraftAdjustCny: null,
+      takeoffDiscountCny: null,
+      charterSourceCurrency: null,
+      charterSourceAmount: null,
+      charterFxRate: null,
+      charterFxDate: null,
+      note: null,
+      updatedAt: new Date('2026-03-01T00:00:00.000Z'),
+      flight: { flightNumber: 'FT100', originCode: 'AAA', destinationCode: 'BBB' },
+    };
+  }
+
+  it('createCostPeriod：开事务 → 锁航班行 → 查重叠 → 写，一步都不在事务外', async () => {
+    const { client, calls } = txClient();
+
+    await createCostPeriod(
+      { flightId: 'f1', effectiveFrom: '2026-03-01', effectiveTo: '2026-03-31' },
+      client,
+    );
+
+    expect(calls).toEqual(['tx-begin', 'lock', 'overlap', 'write']);
+  });
+
+  it('createCostPeriod：锁里查出重叠 → 抛错且不写入', async () => {
+    const { client, tx } = txClient({
+      overlap: {
+        id: 'p-old',
+        effectiveFrom: new Date('2026-03-10T00:00:00.000Z'),
+        effectiveTo: new Date('2026-03-20T00:00:00.000Z'),
+      },
+    });
+
+    await expect(
+      createCostPeriod(
+        { flightId: 'f1', effectiveFrom: '2026-03-01', effectiveTo: '2026-03-31' },
+        client,
+      ),
+    ).rejects.toThrow(/重叠/);
+    expect(tx.flightCostPeriod.create).not.toHaveBeenCalled();
+  });
+
+  it('updateCostPeriod：改日期同样先锁航班行，再在锁里重读本行、查重叠、写', async () => {
+    const { client, calls } = txClient({ existing: periodRow() });
+
+    await updateCostPeriod('p1', { effectiveFrom: '2026-03-05' }, client);
+
+    expect(calls).toEqual(['tx-begin', 'lock', 'overlap', 'write']);
+  });
+
+  it('updateCostPeriod：周期已被并发删掉（锁不到行）→ 抛「周期不存在」，不写库', async () => {
+    const { client, tx } = txClient({ locked: [] });
+
+    await expect(updateCostPeriod('p1', { effectiveFrom: '2026-03-05' }, client)).rejects.toThrow(
+      '周期不存在',
+    );
+    expect(tx.flightCostPeriod.update).not.toHaveBeenCalled();
   });
 });

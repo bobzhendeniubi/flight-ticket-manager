@@ -5,7 +5,8 @@
  * - 结算期 (period) = YYYY-MM，按订单 PAID 时间归属（PAID 发生在 2026-04 就归 2026-04）
  * - 每代理每月 1 张结算单（unique period+agentId）
  * - 字段含义：
- *   grossRevenue            = Σ order.total for orders this agent is the direct seller of, paid in period
+ *   grossRevenue            = Σ order.total，取「本期计佣的那批直销单」（= 本期转 PAID 的单，
+ *                             因为 CommissionRecord 就是在转 PAID 那一刻建的）——与佣金栏同一批订单
  *   commissionEarned        = Σ CommissionRecord.amount where agent=this, status=ACCRUED, in period
  *   commissionPaidToChildren = Σ CommissionRecord.amount for descendant agents, on orders this agent is in chain of
  *                             （信息展示字段；不影响 netCommission 的计算，因 records 已是净额）
@@ -109,70 +110,93 @@ export class SettlementService {
 
       const computed = await this.computeSettlement(aId, period, start, end);
 
-      const settlement = await prisma.$transaction(async (tx) => {
-        let s;
-        if (existing) {
-          // ── 原子 CAS：只允许「非已审核/已支付」的当期结算单被重算 ──
-          // existing.status 是事务外读的快照；此后可能被并发 updateStatus 推到 APPROVED/PAID。
-          // 无 CAS 时 overwrite 分支会无条件把它打回 DRAFT 并解绑 records —— 若已 PAID：offset 已扣、
-          // records 已 SETTLED 却被解绑回 unlinked → 账面孤儿 + 下期 generate 重复计入双付。
-          // 用 updateMany 附加 status notIn[APPROVED,PAID] 一步完成「检查+重置」：拿到行锁的同时确认
-          // 状态可重算，命中 count=1；被并发推进到 APPROVED/PAID 则 count=0 → 拒绝重算（整体回滚）。
-          const casReset = await tx.settlement.updateMany({
-            where: {
-              id: existing.id,
-              status: { notIn: [SettlementStatus.APPROVED, SettlementStatus.PAID] },
-            },
-            data: {
-              orderCount: computed.orderCount,
-              grossRevenue: new Prisma.Decimal(computed.grossRevenue),
-              commissionEarned: new Prisma.Decimal(computed.commissionEarned),
-              commissionPaidToChildren: new Prisma.Decimal(computed.commissionPaidToChildren),
-              netCommission: new Prisma.Decimal(computed.netCommission),
-              prepaymentOffset: new Prisma.Decimal(computed.prepaymentOffset),
-              payableToAgent: new Prisma.Decimal(computed.payableToAgent),
-              status: SettlementStatus.DRAFT,
-              generatedAt: new Date(),
-              approvedAt: null,
-              paidAt: null,
-            },
-          });
-          if (casReset.count !== 1) {
-            throw new ConflictError(
-              `结算单 ${period} 已被并发推进到已审核/已支付，拒绝重算；如需重算请先作废该单`,
-            );
+      let settlement;
+      try {
+        settlement = await prisma.$transaction(async (tx) => {
+          let s;
+          if (existing) {
+            // ── 原子 CAS：只允许「非已审核/已支付」的当期结算单被重算 ──
+            // existing.status 是事务外读的快照；此后可能被并发 updateStatus 推到 APPROVED/PAID。
+            // 无 CAS 时 overwrite 分支会无条件把它打回 DRAFT 并解绑 records —— 若已 PAID：offset 已扣、
+            // records 已 SETTLED 却被解绑回 unlinked → 账面孤儿 + 下期 generate 重复计入双付。
+            // 用 updateMany 附加 status notIn[APPROVED,PAID] 一步完成「检查+重置」：拿到行锁的同时确认
+            // 状态可重算，命中 count=1；被并发推进到 APPROVED/PAID 则 count=0 → 拒绝重算（整体回滚）。
+            const casReset = await tx.settlement.updateMany({
+              where: {
+                id: existing.id,
+                status: { notIn: [SettlementStatus.APPROVED, SettlementStatus.PAID] },
+              },
+              data: {
+                orderCount: computed.orderCount,
+                grossRevenue: new Prisma.Decimal(computed.grossRevenue),
+                commissionEarned: new Prisma.Decimal(computed.commissionEarned),
+                commissionPaidToChildren: new Prisma.Decimal(computed.commissionPaidToChildren),
+                netCommission: new Prisma.Decimal(computed.netCommission),
+                prepaymentOffset: new Prisma.Decimal(computed.prepaymentOffset),
+                payableToAgent: new Prisma.Decimal(computed.payableToAgent),
+                status: SettlementStatus.DRAFT,
+                generatedAt: new Date(),
+                approvedAt: null,
+                paidAt: null,
+              },
+            });
+            if (casReset.count !== 1) {
+              throw new ConflictError(
+                `结算单 ${period} 已被并发推进到已审核/已支付，拒绝重算；如需重算请先作废该单`,
+              );
+            }
+            // 状态已确认可重算且行锁在手：解绑旧 records（回 unlinked），下方再按新计算重新绑定。
+            await tx.commissionRecord.updateMany({
+              where: { settlementId: existing.id },
+              data: { settlementId: null },
+            });
+            s = await tx.settlement.findUniqueOrThrow({ where: { id: existing.id } });
+          } else {
+            s = await tx.settlement.create({
+              data: {
+                period,
+                agentId: aId,
+                orderCount: computed.orderCount,
+                grossRevenue: new Prisma.Decimal(computed.grossRevenue),
+                commissionEarned: new Prisma.Decimal(computed.commissionEarned),
+                commissionPaidToChildren: new Prisma.Decimal(computed.commissionPaidToChildren),
+                netCommission: new Prisma.Decimal(computed.netCommission),
+                prepaymentOffset: new Prisma.Decimal(computed.prepaymentOffset),
+                payableToAgent: new Prisma.Decimal(computed.payableToAgent),
+              },
+            });
           }
-          // 状态已确认可重算且行锁在手：解绑旧 records（回 unlinked），下方再按新计算重新绑定。
-          await tx.commissionRecord.updateMany({
-            where: { settlementId: existing.id },
-            data: { settlementId: null },
-          });
-          s = await tx.settlement.findUniqueOrThrow({ where: { id: existing.id } });
-        } else {
-          s = await tx.settlement.create({
-            data: {
-              period,
-              agentId: aId,
-              orderCount: computed.orderCount,
-              grossRevenue: new Prisma.Decimal(computed.grossRevenue),
-              commissionEarned: new Prisma.Decimal(computed.commissionEarned),
-              commissionPaidToChildren: new Prisma.Decimal(computed.commissionPaidToChildren),
-              netCommission: new Prisma.Decimal(computed.netCommission),
-              prepaymentOffset: new Prisma.Decimal(computed.prepaymentOffset),
-              payableToAgent: new Prisma.Decimal(computed.payableToAgent),
-            },
-          });
-        }
 
-        // 绑定 records 到该 settlement
-        if (computed.recordIds.length > 0) {
-          await tx.commissionRecord.updateMany({
-            where: { id: { in: computed.recordIds } },
-            data: { settlementId: s.id },
+          // 绑定 records 到该 settlement
+          if (computed.recordIds.length > 0) {
+            await tx.commissionRecord.updateMany({
+              where: { id: { in: computed.recordIds } },
+              data: { settlementId: s.id },
+            });
+          }
+          return s;
+        });
+      } catch (err) {
+        // 并发已经把这个代理的当期结算单建走了（period_agentId 唯一键 → P2002）：本条跳过即可，
+        // 不能让一个代理的冲突把整批生成掐断 —— 否则排在冲突项后面的代理一张单都不会生成，
+        // 而管理员从返回体里看不出「后面那些人根本没跑到」。
+        if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+          const winner = await prisma.settlement.findUnique({
+            where: { period_agentId: { period, agentId: aId } },
+            select: { id: true, status: true },
           });
+          if (winner) {
+            generated.push({
+              agentId: aId,
+              settlementId: winner.id,
+              status: winner.status,
+              action: 'skipped-concurrent',
+            });
+            continue;
+          }
         }
-        return s;
-      });
+        throw err;
+      }
 
       generated.push({
         agentId: aId,
@@ -273,15 +297,24 @@ export class SettlementService {
     );
 
     // 2. 作为 seller 的订单数 + GMV（只算本人直销，上级代理的 grossRevenue 由他们自己算）
-    const sellerOrders = await prisma.order.findMany({
-      where: {
-        agentId,
-        status: { in: ['PAID', 'PROCESSING', 'TICKETED', 'COMPLETED'] },
-        // 按 updatedAt 走 PAID 切入本期；简化：用 createdAt
-        createdAt: { gte: start, lt: end },
-      },
-      select: { id: true, total: true },
-    });
+    //
+    // 口径：营收栏与佣金栏取**同一批订单** —— 本期计佣的那批直销单。
+    // CommissionRecord 是在订单真正转 PAID 的那一刻创建的，所以「本期有 ACCRUED 记录」= 本期实付；
+    // 旧口径按 Order.createdAt 圈月，7 月下单 8 月才付的单会把营收记进 7 月账单、佣金记进 8 月账单，
+    // 同一张月结单的两栏永远对不上，财务得跨月人工核对才解释得清。
+    // 退款冲销记录（reversalRecords）关联的是往期订单，**不**并进营收：那部分营收在原月已经算过一次，
+    // 再算一次就是跨月重复计入（佣金侧的追回照旧走 netCommission，不受这里影响）。
+    const earnedOrderIds = Array.from(new Set(earnedRecords.map((r) => r.orderId)));
+    const sellerOrders = earnedOrderIds.length
+      ? await prisma.order.findMany({
+          where: {
+            id: { in: earnedOrderIds },
+            agentId,
+            status: { in: ['PAID', 'PROCESSING', 'TICKETED', 'COMPLETED'] },
+          },
+          select: { id: true, total: true },
+        })
+      : [];
     // order.total 已含套餐折扣、规则立减等折后净额，因此月结 GMV/佣金基数天然按折后价计算；立减不另改佣金链路。
     const grossRevenue = sellerOrders.reduce((s, o) => s + Number(o.total), 0);
     const orderCount = sellerOrders.length;

@@ -16,6 +16,9 @@ import { Prisma, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { ConflictError, NotFoundError } from '../../lib/errors.js';
 
+/** 成本周期读写用的 client：普通 PrismaClient 或事务内的 tx 都收（重叠校验要在事务里跑）。 */
+type CostPeriodClient = PrismaClient | Prisma.TransactionClient;
+
 // ── helpers ──────────────────────────────────────────────────────────────────
 
 function dec(v: Prisma.Decimal | number | null | undefined): number | null {
@@ -337,13 +340,29 @@ export async function listCostPeriods(
   return rows.map(toDto);
 }
 
+/**
+ * 同航班成本周期的写入串行化闸：先锁住这个航班的行，再查重叠。
+ *
+ * 「查重叠 → 写」是先查后写：两个人几乎同时给同一航班录两段重叠的成本期（双击提交，或两个人
+ * 同时录同一航班），各自都在对方提交前查到「无重叠」，结果库里躺着两条重叠周期 ——
+ * findMatchedPeriod 只会取排在前面的那条，另一条在界面上看得见却永远不生效，财务改错了那条
+ * 也没有任何提示，毛利报表长期用错成本还查不出来。库里没有 EXCLUDE 约束兜底（同类场景的立减
+ * 规则有），所以这里靠航班行锁把同一航班的写入排成队。
+ */
+async function lockFlightForCostPeriods(
+  tx: CostPeriodClient,
+  flightId: string,
+): Promise<void> {
+  await tx.$queryRaw`SELECT id FROM "Flight" WHERE id = ${flightId} FOR UPDATE`;
+}
+
 /** 校验：from ≤ to + 同 flightId 不允许跟现有周期重叠（excludeId 用于 update 时排除自己）。抛 Error。 */
 async function assertNoOverlap(
   flightId: string,
   from: Date,
   to: Date,
   excludeId: string | null,
-  client: PrismaClient,
+  client: CostPeriodClient,
 ): Promise<void> {
   if (from.getTime() > to.getTime()) {
     throw new Error('起始日不能晚于结束日');
@@ -372,30 +391,34 @@ export async function createCostPeriod(
 ): Promise<CostPeriodDto> {
   const from = toDateOnly(input.effectiveFrom);
   const to = toDateOnly(input.effectiveTo);
-  await assertNoOverlap(input.flightId, from, to, null, client);
-  const row = await client.flightCostPeriod.create({
-    data: {
-      flightId: input.flightId,
-      effectiveFrom: from,
-      effectiveTo: to,
-      charterCostCny: input.charterCostCny ?? null,
-      airportTaxDepCny: input.airportTaxDepCny ?? null,
-      airportTaxArrCny: input.airportTaxArrCny ?? null,
-      fuelCostCny: input.fuelCostCny ?? null,
-      peakSurchargeCny: input.peakSurchargeCny ?? null,
-      aircraftAdjustCny: input.aircraftAdjustCny ?? null,
-      takeoffDiscountCny: input.takeoffDiscountCny ?? null,
-      charterSourceCurrency: input.charterSourceCurrency ?? null,
-      charterSourceAmount: input.charterSourceAmount ?? null,
-      charterFxRate: input.charterFxRate ?? null,
-      charterFxDate: input.charterFxDate ? toDateOnly(input.charterFxDate) : null,
-      note: input.note ?? null,
-    },
-    include: {
-      flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
-    },
+  // 锁航班行 → 查重叠 → 写，全在一个事务里：并发录入排队进行，后来的那条一定看得见前一条。
+  return client.$transaction(async (tx) => {
+    await lockFlightForCostPeriods(tx, input.flightId);
+    await assertNoOverlap(input.flightId, from, to, null, tx);
+    const row = await tx.flightCostPeriod.create({
+      data: {
+        flightId: input.flightId,
+        effectiveFrom: from,
+        effectiveTo: to,
+        charterCostCny: input.charterCostCny ?? null,
+        airportTaxDepCny: input.airportTaxDepCny ?? null,
+        airportTaxArrCny: input.airportTaxArrCny ?? null,
+        fuelCostCny: input.fuelCostCny ?? null,
+        peakSurchargeCny: input.peakSurchargeCny ?? null,
+        aircraftAdjustCny: input.aircraftAdjustCny ?? null,
+        takeoffDiscountCny: input.takeoffDiscountCny ?? null,
+        charterSourceCurrency: input.charterSourceCurrency ?? null,
+        charterSourceAmount: input.charterSourceAmount ?? null,
+        charterFxRate: input.charterFxRate ?? null,
+        charterFxDate: input.charterFxDate ? toDateOnly(input.charterFxDate) : null,
+        note: input.note ?? null,
+      },
+      include: {
+        flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
+      },
+    });
+    return toDto(row);
   });
-  return toDto(row);
 }
 
 export async function updateCostPeriod(
@@ -403,37 +426,47 @@ export async function updateCostPeriod(
   input: Partial<Omit<PeriodWriteInput, 'flightId'>>,
   client: PrismaClient = defaultPrisma,
 ): Promise<CostPeriodDto> {
-  const existing = await client.flightCostPeriod.findUnique({ where: { id } });
-  if (!existing) throw new Error('周期不存在');
-  const from = input.effectiveFrom ? toDateOnly(input.effectiveFrom) : existing.effectiveFrom;
-  const to = input.effectiveTo ? toDateOnly(input.effectiveTo) : existing.effectiveTo;
-  if (input.effectiveFrom || input.effectiveTo) {
-    await assertNoOverlap(existing.flightId, from, to, id, client);
-  }
-  const data: Prisma.FlightCostPeriodUpdateInput = {};
-  if (input.effectiveFrom) data.effectiveFrom = from;
-  if (input.effectiveTo) data.effectiveTo = to;
-  if (input.charterCostCny !== undefined) data.charterCostCny = input.charterCostCny ?? null;
-  if (input.airportTaxDepCny !== undefined) data.airportTaxDepCny = input.airportTaxDepCny ?? null;
-  if (input.airportTaxArrCny !== undefined) data.airportTaxArrCny = input.airportTaxArrCny ?? null;
-  if (input.fuelCostCny !== undefined) data.fuelCostCny = input.fuelCostCny ?? null;
-  if (input.peakSurchargeCny !== undefined) data.peakSurchargeCny = input.peakSurchargeCny ?? null;
-  if (input.aircraftAdjustCny !== undefined) data.aircraftAdjustCny = input.aircraftAdjustCny ?? null;
-  if (input.takeoffDiscountCny !== undefined) data.takeoffDiscountCny = input.takeoffDiscountCny ?? null;
-  if (input.charterSourceCurrency !== undefined) data.charterSourceCurrency = input.charterSourceCurrency ?? null;
-  if (input.charterSourceAmount !== undefined) data.charterSourceAmount = input.charterSourceAmount ?? null;
-  if (input.charterFxRate !== undefined) data.charterFxRate = input.charterFxRate ?? null;
-  if (input.charterFxDate !== undefined)
-    data.charterFxDate = input.charterFxDate ? toDateOnly(input.charterFxDate) : null;
-  if (input.note !== undefined) data.note = input.note ?? null;
-  const row = await client.flightCostPeriod.update({
-    where: { id },
-    data,
-    include: {
-      flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
-    },
+  // 与 createCostPeriod 同款：先锁住这条周期所属的航班行，再在锁里重读本行、查重叠、写 ——
+  // 锁外读到的日期可能已经被并发改过，按它算重叠等于拿旧值判新账。
+  return client.$transaction(async (tx) => {
+    const locked = await tx.$queryRaw<Array<{ id: string }>>`
+      SELECT f.id FROM "Flight" f
+      JOIN "FlightCostPeriod" p ON p."flightId" = f.id
+      WHERE p.id = ${id}
+      FOR UPDATE OF f`;
+    if (locked.length === 0) throw new Error('周期不存在');
+    const existing = await tx.flightCostPeriod.findUnique({ where: { id } });
+    if (!existing) throw new Error('周期不存在');
+    const from = input.effectiveFrom ? toDateOnly(input.effectiveFrom) : existing.effectiveFrom;
+    const to = input.effectiveTo ? toDateOnly(input.effectiveTo) : existing.effectiveTo;
+    if (input.effectiveFrom || input.effectiveTo) {
+      await assertNoOverlap(existing.flightId, from, to, id, tx);
+    }
+    const data: Prisma.FlightCostPeriodUpdateInput = {};
+    if (input.effectiveFrom) data.effectiveFrom = from;
+    if (input.effectiveTo) data.effectiveTo = to;
+    if (input.charterCostCny !== undefined) data.charterCostCny = input.charterCostCny ?? null;
+    if (input.airportTaxDepCny !== undefined) data.airportTaxDepCny = input.airportTaxDepCny ?? null;
+    if (input.airportTaxArrCny !== undefined) data.airportTaxArrCny = input.airportTaxArrCny ?? null;
+    if (input.fuelCostCny !== undefined) data.fuelCostCny = input.fuelCostCny ?? null;
+    if (input.peakSurchargeCny !== undefined) data.peakSurchargeCny = input.peakSurchargeCny ?? null;
+    if (input.aircraftAdjustCny !== undefined) data.aircraftAdjustCny = input.aircraftAdjustCny ?? null;
+    if (input.takeoffDiscountCny !== undefined) data.takeoffDiscountCny = input.takeoffDiscountCny ?? null;
+    if (input.charterSourceCurrency !== undefined) data.charterSourceCurrency = input.charterSourceCurrency ?? null;
+    if (input.charterSourceAmount !== undefined) data.charterSourceAmount = input.charterSourceAmount ?? null;
+    if (input.charterFxRate !== undefined) data.charterFxRate = input.charterFxRate ?? null;
+    if (input.charterFxDate !== undefined)
+      data.charterFxDate = input.charterFxDate ? toDateOnly(input.charterFxDate) : null;
+    if (input.note !== undefined) data.note = input.note ?? null;
+    const row = await tx.flightCostPeriod.update({
+      where: { id },
+      data,
+      include: {
+        flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
+      },
+    });
+    return toDto(row);
   });
-  return toDto(row);
 }
 
 export async function deleteCostPeriod(
