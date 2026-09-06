@@ -8961,14 +8961,18 @@ function CancelLegForm({
         : 0
       : manualRefundCny ?? 0;
   const projectedTotal = preview ? preview.currentTotalCny - effectiveRefundCny : null;
+  // 退款超上限时不预演「多付」——那是按一个不会被接受的负应收算出来的数，只会误导。
+  const refundOverCap = feeMode === 'MANUAL' && manualRefundCny != null && manualRefundCny > maxRefundCny;
   const projectedOverpay =
-    preview && projectedTotal != null ? Math.max(0, preview.paidAmountCny - projectedTotal) : 0;
+    preview && projectedTotal != null && !refundOverCap ? Math.max(0, preview.paidAmountCny - projectedTotal) : 0;
   // 应收变化那句话（确认弹窗与面板同一份文案）：退款视角，不再提「手续费」——运营反馈里的
   // 真实事故就是把「手续费填 0」读成「不用扣客人的钱」，结果应收被系统按「全额退」算掉了。
   const totalChangeSentence =
     preview == null || projectedTotal == null
       ? ''
-      : effectiveRefundCny === 0
+      : refundOverCap
+        ? `退款金额不能超过 ¥${maxRefundCny.toLocaleString()}（该段金额与本单当前应收 ¥${preview.currentTotalCny.toLocaleString()} 取小），请改小后再提交`
+        : effectiveRefundCny === 0
         ? `本单应收不变 ¥${preview.currentTotalCny.toLocaleString()}（不退款，座位放回可售）`
         : `本单应收将从 ¥${preview.currentTotalCny.toLocaleString()} 降到 ¥${projectedTotal.toLocaleString()}（退 ¥${effectiveRefundCny.toLocaleString()}）`;
   const manualRefundInvalid =
@@ -9129,7 +9133,7 @@ function CancelLegForm({
               <span>
                 按取消政策
                 {hasPolicyFee
-                  ? `：退 ¥${(legItem.amountCny - policyFee!.feeAmountCny).toLocaleString()}（${policyFee!.policyName} · 政策扣 ${policyFee!.feePercent}% · 距起飞 ${Math.round(policyFee!.hoursLeft)} 小时）`
+                  ? `：退 ¥${(legItem.amountCny - policyFee!.feeAmountCny).toLocaleString()}（${policyFee!.policyName.replace(/^[（(](.*)[）)]$/u, '$1')} · 政策扣 ${policyFee!.feePercent}% · 距起飞 ${Math.round(policyFee!.hoursLeft)} 小时）`
                   : '（无适用政策，请手动填退款金额）'}
               </span>
             </label>
