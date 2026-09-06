@@ -48,3 +48,61 @@ jobs:
 
       - name: Sales-web build
         run: npm run build --workspace=sales-web
+
+  # 后端 23 个真 DB 集成测试（backend/src/**/*.integration.test.ts）——单独一个 job，
+  # 与 build-and-test 并行跑，不拖慢那条主干闸；用真 Postgres + Redis service 容器，
+  # 不依赖本机 docker-compose.test.yml（那个是给本地开发用的）。
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ftm_test
+          POSTGRES_PASSWORD: ftm_test
+          POSTGRES_DB: ftm_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd="pg_isready -U ftm_test -d ftm_test"
+          --health-interval=1s
+          --health-timeout=3s
+          --health-retries=30
+      # orders.service 建单时会 best-effort 派发 seat-hold 释放 / 签证任务等队列
+      # 任务（tests/integration/setup.ts 不 mock 这段），没有可连的 Redis 会导致
+      # 相关用例卡到各自 30s testTimeout 才失败——加个真 Redis 而不是空跑侥幸。
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=1s
+          --health-timeout=3s
+          --health-retries=30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install (workspaces)
+        run: npm ci
+
+      - name: Prisma generate
+        run: npm run prisma:generate
+
+      # tests/integration/setup.ts 会自动把 DATABASE_URL 切到 TEST_DATABASE_URL 再
+      # 跑 prisma migrate deploy 同步 schema；这里的 DATABASE_URL 只是让 env.ts 启动
+      # 校验通过的占位值，实际不会被拿去连库。
+      - name: Backend integration tests
+        run: npm run test:integration --workspace=backend
+        env:
+          TEST_DATABASE_URL: postgresql://ftm_test:ftm_test@localhost:55432/ftm_test?schema=public
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+          REDIS_URL: redis://localhost:6379
+          JWT_ACCESS_SECRET: ci-only-dummy-access-secret-0123456789ab
+          JWT_REFRESH_SECRET: ci-only-dummy-refresh-secret-0123456789a
