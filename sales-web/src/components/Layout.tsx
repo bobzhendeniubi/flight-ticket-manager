@@ -2,6 +2,7 @@ import { Suspense, lazy, useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link, Navigate, NavLink, Outlet, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
+import { api } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useCart } from '../stores/cart';
 import { useLanguage, SUPPORTED_LANGUAGES, type SupportedLanguage } from '../i18n';
@@ -66,6 +67,30 @@ export function Layout() {
   const adminUrl = import.meta.env.DEV
     ? 'http://localhost:5174'
     : window.location.origin.replace('store', 'admin');
+
+  // ── 能力清单引导 ──────────────────────────────────────────────────────
+  // /auth/login 的响应里没有能力清单（后端只在 /users/me 上算），所以外壳挂载后补一次，
+  // 把它合进 user 存起来 —— useCapabilities 只认 user.capabilities，路由守卫都从这一份读。
+  // 与后台 admin-web 的 Layout 是同一套做法；改岗后下次进站即生效。
+  const userId = user?.id;
+  useEffect(() => {
+    if (!userId) return;
+    let cancelled = false;
+    // 取当下最新的令牌（刻意不进依赖数组）：轮换后重跑不是目的，但真跑起来时必须用最新那枚。
+    const accessToken = useAuth.getState().tokens?.accessToken;
+    if (!accessToken) return;
+    api
+      .me(accessToken)
+      .then((res) => {
+        if (cancelled) return;
+        useAuth.setState({ user: { ...res.user, capabilities: res.capabilities } });
+      })
+      // 拉不到就维持现状：能力清单只管少给入口，真正的闸在后端，绝不因此打断浏览。
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
 
   if (user?.mustChangePassword && location.pathname !== '/change-password') {
     return <Navigate to="/change-password" replace />;

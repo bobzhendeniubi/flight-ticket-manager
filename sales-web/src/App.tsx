@@ -5,7 +5,8 @@ import { Layout } from './components/Layout';
 import { DetailSkeleton } from './components/LoadingSkeleton';
 import { LoginPage } from './pages/LoginPage';
 import { useAuth } from './stores/auth';
-import type { UserRole } from './lib/api';
+import type { Capability } from './lib/capabilities';
+import { useCapabilities } from './lib/useCapabilities';
 import { REFRESH_SKEW_MS, getAccessTokenExpMs } from './lib/token';
 
 // 路由级代码分割（G1）：每个页面单独 chunk，按需加载，缩小首屏 bundle。
@@ -49,14 +50,26 @@ const NotFoundPage = lazy(() => import('./pages/NotFoundPage'));
 
 function Protected({
   children,
-  roles,
+  cap,
 }: {
   children: React.ReactNode;
-  roles?: UserRole[];
+  /**
+   * 进这个页面需要的能力。不填 = 只要登录。
+   *
+   * 口径与后端同源：能力清单由 /users/me 下发，与后端 requireCapability 用同一张表算
+   * （见 backend/src/lib/capabilities.ts）。改造前这里是一串 roles 数组，把「谁能进」
+   * 在前台又拼了一遍，后端改口径这边不会跟着变。
+   *
+   * 清单还没回来时先放行渲染（乐观）：悲观拦截会让代理刚登录点「我的团队」就被弹回首页；
+   * 真正的数据保护始终在后端，这里只是别让人撞进一个接口全 403 的空页。
+   */
+  cap?: Capability;
 }) {
   const user = useAuth((s) => s.user);
+  const { can, ready } = useCapabilities();
   if (!user) return <Navigate to="/login" replace />;
-  if (roles && !roles.includes(user.role)) return <Navigate to="/" replace />;
+  if (!cap || !ready) return <>{children}</>;
+  if (!can(cap)) return <Navigate to="/" replace />;
   return <>{children}</>;
 }
 
@@ -175,7 +188,7 @@ export function App() {
             <Route
               path="team"
               element={
-                <Protected roles={['AGENT', 'ADMIN', 'STAFF']}>
+                <Protected cap="agents.read">
                   <TeamPage />
                 </Protected>
               }
@@ -183,7 +196,7 @@ export function App() {
             <Route
               path="my-commissions"
               element={
-                <Protected roles={['AGENT', 'ADMIN', 'STAFF']}>
+                <Protected cap="settlements.read">
                   <MyCommissionsPage />
                 </Protected>
               }

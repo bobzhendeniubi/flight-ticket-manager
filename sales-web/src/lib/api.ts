@@ -7,6 +7,7 @@
  *
  * 运行时 env 不可用（静态 HTML 已编译）；若要切域名必须重新构建镜像。
  */
+import type { Capability } from './capabilities';
 const API_BASE: string = (import.meta.env?.VITE_API_BASE as string | undefined)?.trim() || '/api';
 export interface ApiErrorBody {
   error: { code: string; message: string; details?: unknown };
@@ -148,6 +149,11 @@ export interface AuthUser {
   role: UserRole;
   displayName: string | null;
   mustChangePassword: boolean;
+  /**
+   * 能力清单：后端按同一张能力表算好后随 /users/me 下发（见 backend/src/lib/capabilities.ts）。
+   * 登录响应里没有它，Layout 挂载后那次 /users/me 才补上——所以是可选的。
+   */
+  capabilities?: Capability[];
 }
 
 export interface AuthTokens {
@@ -1100,6 +1106,8 @@ export const api = {
         createdAt: string;
         lastLoginAt: string | null;
       };
+      /** 后端按能力表现算的清单，与 requireCapability 同源。 */
+      capabilities: Capability[];
     }>('/users/me', { token }),
 
   // 航班搜索（公开）
