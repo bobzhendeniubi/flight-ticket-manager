@@ -22,7 +22,6 @@ import {
   ForbiddenError,
   NotFoundError,
 } from '../../../lib/errors.js';
-import { writeAuditWithinTx } from '../../../lib/audit.js';
 import { localHHMM, localDateISO } from '../../../lib/flight-time.js';
 import { checkinCloseAt, isCheckinClosed } from '../../../lib/checkin-close.js';
 import { businessDateISO, businessDateTime } from '../../../lib/business-time.js';
@@ -93,6 +92,7 @@ import {
 } from './shared.js';
 import { loadOrderForSplit, type SplitOrderResult } from './split.js';
 import type { OrderService } from '../orders.service.js';
+import { runOrderMutation, type MutationDb } from './order-mutation.js';
 
 // ════════════════════════════════════════════════════════════════════
 // 取消航段（partial cancellation）：POST /orders/:id/cancel-leg
@@ -409,6 +409,189 @@ export async function previewCancelReturnLeg(svc: OrderService, orderId: string,
   return svc.previewCancelLeg(orderId, 'RETURN', actor);
 }
 
+/** 幂等回放（内核 idempotency.find，只在拿到订单行锁后查）：命中返回回放结果，未命中 null。 */
+async function findCancelLegReplay(db: MutationDb, orderId: string, input: CancelLegBody): Promise<CancelLegAudit | null> {
+  const flightRows = await db.orderItem.findMany({
+    where: { orderId, kind: OrderItemKind.FLIGHT },
+    select: { id: true, metadata: true },
+  });
+  const tokenLookup = hasSeenLegActionToken(flightRows, input.requestToken);
+  const replayRow = flightRows.find(
+    (row) =>
+      readJsonObject(readJsonObject(row.metadata).returnLegCancelled).requestToken ===
+      input.requestToken,
+  );
+  if (tokenLookup.seen || replayRow) {
+    // 动作类型 + 入参指纹都要对得上：同一个 token 先取消了回程、又拿来取消去程（或去标
+    // no-show），按 token 命中就回放会让运营看到「取消成功」而实际上什么都没发生 ——
+    // 那一段还占着座、这一次的手续费也没收。老快照没有指纹一律拒（fail-closed）。
+    assertLegActionTokenReplay(tokenLookup, ['CANCEL_LEG'], cancelLegFingerprint(input));
+    if (!replayRow) {
+      // 类型/指纹都对上了却找不到作废快照 —— 说明这个 token 的留痕已经被拆单/改期搬走，
+      // 回放不出真实结果，只能让运营换个新请求编号重来。
+      throw tokenPayloadMismatchError({ reason: 'SNAPSHOT_MISSING', priorType: tokenLookup.type });
+    }
+    const snap = readJsonObject(readJsonObject(replayRow.metadata).returnLegCancelled);
+    const current = await db.order.findUniqueOrThrow({
+      where: { id: orderId },
+      select: { orderNumber: true, total: true, paidAmount: true },
+    });
+    const totalAfter = round2(Number(current.total));
+    const originalAmountCny = Number(snap.originalAmountCny ?? 0);
+    const feeCny = Number(snap.feeCny ?? 0);
+    return {
+      orderNumber: current.orderNumber,
+      // 老快照没有 leg 字段（本端点原先只做回程）→ 按 RETURN 读，语义与当时一致。
+      leg: (snap.leg === 'OUTBOUND' ? 'OUTBOUND' : 'RETURN') as FlightLegSide,
+      returnItemId: replayRow.id,
+      feeItemId: null,
+      workOrderReminderId:
+        typeof snap.workOrderReminderId === 'string' ? snap.workOrderReminderId : null,
+      workOrderTitle: typeof snap.workOrderTitle === 'string' ? snap.workOrderTitle : null,
+      releasedSeats: Array.isArray(snap.releasedSeats)
+        ? (snap.releasedSeats as CancelLegAudit['releasedSeats'])
+        : [],
+      originalAmountCny,
+      feeCny,
+      feeMode: (snap.feeMode === 'MANUAL' ? 'MANUAL' : 'POLICY') as 'POLICY' | 'MANUAL',
+      policyName: typeof snap.policyName === 'string' ? snap.policyName : null,
+      netReductionCny: round2(originalAmountCny - feeCny),
+      totalBefore: Number(snap.totalBeforeCny ?? totalAfter),
+      totalAfter,
+      overpayAfterCny: round2(Math.max(0, Number(current.paidAmount) - totalAfter)),
+      replayed: true,
+    };
+  }
+  return null;
+}
+
+/** 幂等回放（内核 idempotency.find，只在拿到订单行锁后查）：命中返回回放结果，未命中 null。 */
+async function findNoShowReplay(db: MutationDb, targetOrderId: string, input: NoShowBody, split: NoShowAudit['split']): Promise<NoShowAudit | null> {
+  const flightRows = await db.orderItem.findMany({
+    where: { orderId: targetOrderId, kind: OrderItemKind.FLIGHT },
+    select: { id: true, metadata: true },
+  });
+  // 认 token 的口径是「这张单的任一航段行**见过**这个 token」（含 legActionLog 与各 history）——
+  // 只查当前快照上那一个 token 会漏掉「释放→恢复→再释放→再恢复」中间几轮被覆盖掉的 token，
+  // 那几轮的延迟重试就会绕过回放二次放座。详见 collectLegActionTokens 的注释。
+  const tokenLookup = hasSeenLegActionToken(flightRows, input.requestToken);
+  if (tokenLookup.seen) {
+    // ⚠ 回放前先比对**动作类型 + 关键入参**：同一个 token 换一份请求体（弹窗里改了
+    //「同时释放回程」的勾选又点重试）、甚至拿去调另一个端点都是可能的。只按 token 命中
+    // 就回成功，会让运营以为这次的勾选生效了 —— 实际上座位早按上一次的勾选处置完了，
+    // 两边认知从此分叉且审计里看不出来。老数据没有指纹一律拒（fail-closed）。
+    assertLegActionTokenReplay(
+      tokenLookup,
+      ['NO_SHOW', 'RELEASE'],
+      noShowFingerprint(input),
+    );
+    // 回放一律回**当前状态**（不是当初那一轮的快照）：调用方要的是「这单现在是什么样」，
+    // 而中间几轮的快照早已不代表现状。单号同样读真值（整单回放时 split 为 null，
+    // 原来的 `split?.targetOrderNumber ?? ''` 会让审计与响应里的单号变成空串）。
+    const current = await db.order.findUniqueOrThrow({
+      where: { id: targetOrderId },
+      select: { orderNumber: true },
+    });
+    const markedOutboundRow =
+      flightRows.find((row) => readJsonObject(row.metadata).noShow != null) ?? null;
+    const releasedRow =
+      flightRows.find((row) => readJsonObject(row.metadata).returnReleased != null) ?? null;
+    const noShowSnap = readJsonObject(readJsonObject(markedOutboundRow?.metadata).noShow);
+    // 有回程释放留痕就以它为准（它才是座位账的真值），否则回落到去程 noShow 快照里的下游结果。
+    const snap = releasedRow
+      ? readJsonObject(readJsonObject(releasedRow.metadata).returnReleased)
+      : noShowSnap;
+    return {
+      orderNumber: current.orderNumber,
+      outboundItemId: markedOutboundRow?.id ?? '',
+      returnItemId:
+        releasedRow?.id ??
+        (typeof noShowSnap.returnItemId === 'string' ? noShowSnap.returnItemId : null),
+      releasedSeats: Array.isArray(snap.releasedSeats)
+        ? (snap.releasedSeats as NoShowAudit['releasedSeats'])
+        : [],
+      workOrderReminderId:
+        typeof snap.workOrderReminderId === 'string' ? snap.workOrderReminderId : null,
+      workOrderTitle: typeof snap.workOrderTitle === 'string' ? snap.workOrderTitle : null,
+      split,
+      replayed: true,
+    } satisfies NoShowAudit;
+  }
+  return null;
+}
+
+/** 幂等回放（内核 idempotency.find，只在拿到订单行锁后查）：命中返回回放结果，未命中 null。 */
+async function findRestoreReturnLegReplay(db: MutationDb, orderId: string, input: RestoreReturnLegBody): Promise<RestoreReturnLegAudit | null> {
+  const flightRows = await db.orderItem.findMany({
+    where: { orderId, kind: OrderItemKind.FLIGHT },
+    select: { id: true, metadata: true },
+  });
+  // 与 no-show 同一套口径：认「这张单的任一航段行**见过**这个 token」，不是只认当前快照上那一个。
+  // 只认当前快照会漏掉「释放→恢复→再释放→再恢复」中被顶掉的中间几轮 token，
+  // 那几轮的延迟重试会绕过回放二次占座（returnRestored 是覆盖写，连 history 都没有）。
+  const tokenLookup = hasSeenLegActionToken(flightRows, input.requestToken);
+  if (tokenLookup.seen) {
+    // ⚠ 本端点**不比对 allowOversell**（指纹里刻意不含它）：allowOversell 只是「没座时
+    // 要不要继续」的确认位，它不改变恢复的结果 —— 座位照释放快照原样占回来，占几座只由
+    // 快照决定。两次请求这个位不同，落库结果完全一致，拦下来只会让运营看到一条莫名其妙的报错。
+    // 但**动作类型**必须是 RESTORE：这个 token 若是取消航段/no-show 用过的，回放会静默
+    // 回一个「恢复成功」，而这单根本没被恢复过。老数据没指纹一律拒（fail-closed）。
+    assertLegActionTokenReplay(tokenLookup, ['RESTORE'], EMPTY_LEG_ACTION_FINGERPRINT);
+    // 回放一律回**当前状态**：中间某一轮的快照早已不代表这单现在的样子。
+    const restoredRow =
+      flightRows.find((row) => readJsonObject(row.metadata).returnRestored != null) ?? null;
+    const snap = readJsonObject(readJsonObject(restoredRow?.metadata).returnRestored);
+    const current = await db.order.findUniqueOrThrow({
+      where: { id: orderId },
+      select: { orderNumber: true },
+    });
+    return {
+      orderNumber: current.orderNumber,
+      returnItemId: restoredRow?.id ?? '',
+      scheduleId: typeof snap.toScheduleId === 'string' ? snap.toScheduleId : '',
+      cabin: (typeof snap.cabin === 'string' ? snap.cabin : null) as CabinClass | null,
+      quantity: typeof snap.seats === 'number' ? snap.seats : 0,
+      oversold: snap.oversold === true,
+      oversoldBy: typeof snap.oversoldBy === 'number' ? snap.oversoldBy : 0,
+      scheduleOversoldAfter:
+        typeof snap.scheduleOversoldAfter === 'number' ? snap.scheduleOversoldAfter : 0,
+      flightNumber: typeof snap.flightNumber === 'string' ? snap.flightNumber : null,
+      departDate: typeof snap.departDate === 'string' ? snap.departDate : null,
+      // 重放不重新派工单（createTicketWorkOrder 按 ruleKey 幂等，重放这条分支根本不会
+      // 跑到第 6 步），这两个字段在重放场景没有对应历史值可读，且下面调用方只在
+      // !replayed 时才用它们决定推不推企业微信——重放恒为 null 不影响任何判断。
+      workOrderReminderId: null,
+      workOrderTitle: null,
+      replayed: true,
+    } satisfies RestoreReturnLegAudit;
+  }
+  return null;
+}
+
+/** 幂等回放（内核 idempotency.find，只在拿到订单行锁后查）：命中返回回放结果，未命中 null。 */
+async function findVoidReturnLegReplay(db: MutationDb, orderId: string, input: VoidReturnLegBody): Promise<VoidReturnLegAudit | null> {
+  const flightRows = await db.orderItem.findMany({
+    where: { orderId, kind: OrderItemKind.FLIGHT },
+    select: { id: true, metadata: true },
+  });
+  const tokenLookup = hasSeenLegActionToken(flightRows, input.requestToken);
+  if (tokenLookup.seen) {
+    assertLegActionTokenReplay(tokenLookup, ['VOID'], EMPTY_LEG_ACTION_FINGERPRINT);
+    const voidedRow =
+      flightRows.find((row) => readJsonObject(row.metadata).returnVoidedFinal != null) ?? null;
+    const current = await db.order.findUniqueOrThrow({
+      where: { id: orderId },
+      select: { orderNumber: true },
+    });
+    return {
+      orderNumber: current.orderNumber,
+      returnItemId: voidedRow?.id ?? '',
+      replayed: true,
+    } satisfies VoidReturnLegAudit;
+  }
+  return null;
+}
+
 /**
  * 取消航段 · 执行：POST /orders/:id/cancel-leg。
  *
@@ -434,68 +617,19 @@ export async function cancelLeg(
     throw new ForbiddenError(`仅运营/管理员可取消${legZh}`);
   }
 
-  const audit = await prisma.$transaction(async (tx) => {
-    // 与 rescheduleOrderItem / 超时 worker 同一把行锁：谁先拿锁谁先提交，杜绝
-    // 「改期正在搬这条行」与「本端点正在放这条行的座」交错导致的双放 / 幽灵持有。
-    const lockRows = await tx.$queryRaw<Array<{ id: string }>>`
-      SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE
-    `;
-    if (lockRows.length === 0) throw new NotFoundError('订单不存在');
-
-    // ── 0. 幂等回放：同 token 已取消过 → 原样回放，绝不二次放座 / 二次收手续费 ──
-    // 打标键 returnLegCancelled 去程/回程共用（老数据兼容），所以两个方向的重放都命中这里。
-    const flightRows = await tx.orderItem.findMany({
-      where: { orderId, kind: OrderItemKind.FLIGHT },
-      select: { id: true, metadata: true },
-    });
-    const tokenLookup = hasSeenLegActionToken(flightRows, input.requestToken);
-    const replayRow = flightRows.find(
-      (row) =>
-        readJsonObject(readJsonObject(row.metadata).returnLegCancelled).requestToken ===
-        input.requestToken,
-    );
-    if (tokenLookup.seen || replayRow) {
-      // 动作类型 + 入参指纹都要对得上：同一个 token 先取消了回程、又拿来取消去程（或去标
-      // no-show），按 token 命中就回放会让运营看到「取消成功」而实际上什么都没发生 ——
-      // 那一段还占着座、这一次的手续费也没收。老快照没有指纹一律拒（fail-closed）。
-      assertLegActionTokenReplay(tokenLookup, ['CANCEL_LEG'], cancelLegFingerprint(input));
-      if (!replayRow) {
-        // 类型/指纹都对上了却找不到作废快照 —— 说明这个 token 的留痕已经被拆单/改期搬走，
-        // 回放不出真实结果，只能让运营换个新请求编号重来。
-        throw tokenPayloadMismatchError({ reason: 'SNAPSHOT_MISSING', priorType: tokenLookup.type });
-      }
-      const snap = readJsonObject(readJsonObject(replayRow.metadata).returnLegCancelled);
-      const current = await tx.order.findUniqueOrThrow({
-        where: { id: orderId },
-        select: { orderNumber: true, total: true, paidAmount: true },
-      });
-      const totalAfter = round2(Number(current.total));
-      const originalAmountCny = Number(snap.originalAmountCny ?? 0);
-      const feeCny = Number(snap.feeCny ?? 0);
-      return {
-        orderNumber: current.orderNumber,
-        // 老快照没有 leg 字段（本端点原先只做回程）→ 按 RETURN 读，语义与当时一致。
-        leg: (snap.leg === 'OUTBOUND' ? 'OUTBOUND' : 'RETURN') as FlightLegSide,
-        returnItemId: replayRow.id,
-        feeItemId: null,
-        workOrderReminderId:
-          typeof snap.workOrderReminderId === 'string' ? snap.workOrderReminderId : null,
-        workOrderTitle: typeof snap.workOrderTitle === 'string' ? snap.workOrderTitle : null,
-        releasedSeats: Array.isArray(snap.releasedSeats)
-          ? (snap.releasedSeats as CancelLegAudit['releasedSeats'])
-          : [],
-        originalAmountCny,
-        feeCny,
-        feeMode: (snap.feeMode === 'MANUAL' ? 'MANUAL' : 'POLICY') as 'POLICY' | 'MANUAL',
-        policyName: typeof snap.policyName === 'string' ? snap.policyName : null,
-        netReductionCny: round2(originalAmountCny - feeCny),
-        totalBefore: Number(snap.totalBeforeCny ?? totalAfter),
-        totalAfter,
-        overpayAfterCny: round2(Math.max(0, Number(current.paidAmount) - totalAfter)),
-        replayed: true,
-      };
-    }
-
+  // OrderMutation 内核（审查根因 R5）：事务 + 订单行锁（与改期 / 超时 worker 同一把 FOR UPDATE）
+  // + 锁内幂等回放 + 事务内审计 + 守恒断言，全部收在内核里；本函数只剩动作本身。
+  const audit = await runOrderMutation<CancelLegAudit>({
+    orderId,
+    actor,
+    action: leg === 'OUTBOUND' ? 'CANCEL_OUTBOUND_LEG' : 'CANCEL_RETURN_LEG',
+    requestToken: input.requestToken,
+    // 留痕在航段行 metadata 上，必须读锁后的行才作数 → 只在锁内查（不走事务外快路径）。
+    idempotency: { fastPath: false, find: (db) => findCancelLegReplay(db, orderId, input) },
+    // 取消航段动应收（退款）与座位（该段放回库存）；已收一分不动、房量不动。
+    conserve: { unchanged: ['paid', 'rooms'], label: `取消${legZh}` },
+  }, async (ctx) => {
+    const tx = ctx.tx;
     // ── 1. 重跑准入闸（预检放行到执行之间世界可能已经变了）──
     const { order, legItem, blockers, ackWarnings, ticketedCount } = await svc._assessCancelLeg(
       tx,
@@ -758,8 +892,7 @@ export async function cancelLeg(
     // 所以 MANUAL 这一档改在事务内写，要么都成、要么都回滚；POLICY 那档是服务端权威报价，
     // 仍由路由层记 WARNING。
     if (input.feeMode === 'MANUAL') {
-      await writeAuditWithinTx(tx, {
-        actor: { userId: actor.userId, role: actor.role },
+      await ctx.audit({
         action: leg === 'OUTBOUND' ? 'CANCEL_OUTBOUND_LEG' : 'CANCEL_RETURN_LEG',
         targetType: AuditTargetType.ORDER,
         targetId: orderId,
@@ -1364,65 +1497,17 @@ export async function _executeNoShow(
   actor: { userId: string; role: UserRole },
   split: { sourceOrderNumber: string; targetOrderNumber: string } | null,
 ): Promise<NoShowAudit> {
-  return prisma.$transaction(async (tx) => {
-    // 与改期 / 取消航段 / 超时 worker 同一把行锁 → 座位账严格串行。
-    const lockRows = await tx.$queryRaw<Array<{ id: string }>>`
-      SELECT id FROM "Order" WHERE id = ${targetOrderId} FOR UPDATE
-    `;
-    if (lockRows.length === 0) throw new NotFoundError('订单不存在');
-
-    // ── 0. 幂等回放：同 token 已标记过 → 原样回放，绝不二次放座、二次派工单 ──
-    const flightRows = await tx.orderItem.findMany({
-      where: { orderId: targetOrderId, kind: OrderItemKind.FLIGHT },
-      select: { id: true, metadata: true },
-    });
-    // 认 token 的口径是「这张单的任一航段行**见过**这个 token」（含 legActionLog 与各 history）——
-    // 只查当前快照上那一个 token 会漏掉「释放→恢复→再释放→再恢复」中间几轮被覆盖掉的 token，
-    // 那几轮的延迟重试就会绕过回放二次放座。详见 collectLegActionTokens 的注释。
-    const tokenLookup = hasSeenLegActionToken(flightRows, input.requestToken);
-    if (tokenLookup.seen) {
-      // ⚠ 回放前先比对**动作类型 + 关键入参**：同一个 token 换一份请求体（弹窗里改了
-      //「同时释放回程」的勾选又点重试）、甚至拿去调另一个端点都是可能的。只按 token 命中
-      // 就回成功，会让运营以为这次的勾选生效了 —— 实际上座位早按上一次的勾选处置完了，
-      // 两边认知从此分叉且审计里看不出来。老数据没有指纹一律拒（fail-closed）。
-      assertLegActionTokenReplay(
-        tokenLookup,
-        ['NO_SHOW', 'RELEASE'],
-        noShowFingerprint(input),
-      );
-      // 回放一律回**当前状态**（不是当初那一轮的快照）：调用方要的是「这单现在是什么样」，
-      // 而中间几轮的快照早已不代表现状。单号同样读真值（整单回放时 split 为 null，
-      // 原来的 `split?.targetOrderNumber ?? ''` 会让审计与响应里的单号变成空串）。
-      const current = await tx.order.findUniqueOrThrow({
-        where: { id: targetOrderId },
-        select: { orderNumber: true },
-      });
-      const markedOutboundRow =
-        flightRows.find((row) => readJsonObject(row.metadata).noShow != null) ?? null;
-      const releasedRow =
-        flightRows.find((row) => readJsonObject(row.metadata).returnReleased != null) ?? null;
-      const noShowSnap = readJsonObject(readJsonObject(markedOutboundRow?.metadata).noShow);
-      // 有回程释放留痕就以它为准（它才是座位账的真值），否则回落到去程 noShow 快照里的下游结果。
-      const snap = releasedRow
-        ? readJsonObject(readJsonObject(releasedRow.metadata).returnReleased)
-        : noShowSnap;
-      return {
-        orderNumber: current.orderNumber,
-        outboundItemId: markedOutboundRow?.id ?? '',
-        returnItemId:
-          releasedRow?.id ??
-          (typeof noShowSnap.returnItemId === 'string' ? noShowSnap.returnItemId : null),
-        releasedSeats: Array.isArray(snap.releasedSeats)
-          ? (snap.releasedSeats as NoShowAudit['releasedSeats'])
-          : [],
-        workOrderReminderId:
-          typeof snap.workOrderReminderId === 'string' ? snap.workOrderReminderId : null,
-        workOrderTitle: typeof snap.workOrderTitle === 'string' ? snap.workOrderTitle : null,
-        split,
-        replayed: true,
-      } satisfies NoShowAudit;
-    }
-
+  // OrderMutation 内核：事务 + 订单行锁（与改期 / 取消航段 / 超时 worker 同一把）+ 锁内幂等回放
+  // + 守恒断言（no-show 全程钱款不动：应收 / 已收 / 房量 / 成本四维前后恒等；座位本就是要放的）。
+  return runOrderMutation<NoShowAudit>({
+    orderId: targetOrderId,
+    actor,
+    action: 'MARK_NO_SHOW',
+    requestToken: input.requestToken,
+    idempotency: { fastPath: false, find: (db) => findNoShowReplay(db, targetOrderId, input, split) },
+    conserve: { unchanged: ['receivable', 'paid', 'rooms', 'cost'], label: 'no-show' },
+  }, async (ctx) => {
+    const tx = ctx.tx;
     // ── 1. 重跑准入闸（此刻订单里就是该被标记的那批人 → 不再传 passengerIds）──
     const { order, outboundItem, returnItem, returnTicketedCount, blockers, isRerelease } =
       await svc._assessNoShow(tx, targetOrderId, undefined, input.releaseReturn);
@@ -1903,57 +1988,17 @@ export async function restoreReturnLeg(
     throw new ForbiddenError('仅运营/管理员可恢复回程');
   }
 
-  const audit = await prisma.$transaction(async (tx) => {
-    const lockRows = await tx.$queryRaw<Array<{ id: string }>>`
-      SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE
-    `;
-    if (lockRows.length === 0) throw new NotFoundError('订单不存在');
-
-    // ── 0. 幂等回放：同 token 已恢复过 → 原样回放，绝不二次占座 ──
-    const flightRows = await tx.orderItem.findMany({
-      where: { orderId, kind: OrderItemKind.FLIGHT },
-      select: { id: true, metadata: true },
-    });
-    // 与 no-show 同一套口径：认「这张单的任一航段行**见过**这个 token」，不是只认当前快照上那一个。
-    // 只认当前快照会漏掉「释放→恢复→再释放→再恢复」中被顶掉的中间几轮 token，
-    // 那几轮的延迟重试会绕过回放二次占座（returnRestored 是覆盖写，连 history 都没有）。
-    const tokenLookup = hasSeenLegActionToken(flightRows, input.requestToken);
-    if (tokenLookup.seen) {
-      // ⚠ 本端点**不比对 allowOversell**（指纹里刻意不含它）：allowOversell 只是「没座时
-      // 要不要继续」的确认位，它不改变恢复的结果 —— 座位照释放快照原样占回来，占几座只由
-      // 快照决定。两次请求这个位不同，落库结果完全一致，拦下来只会让运营看到一条莫名其妙的报错。
-      // 但**动作类型**必须是 RESTORE：这个 token 若是取消航段/no-show 用过的，回放会静默
-      // 回一个「恢复成功」，而这单根本没被恢复过。老数据没指纹一律拒（fail-closed）。
-      assertLegActionTokenReplay(tokenLookup, ['RESTORE'], EMPTY_LEG_ACTION_FINGERPRINT);
-      // 回放一律回**当前状态**：中间某一轮的快照早已不代表这单现在的样子。
-      const restoredRow =
-        flightRows.find((row) => readJsonObject(row.metadata).returnRestored != null) ?? null;
-      const snap = readJsonObject(readJsonObject(restoredRow?.metadata).returnRestored);
-      const current = await tx.order.findUniqueOrThrow({
-        where: { id: orderId },
-        select: { orderNumber: true },
-      });
-      return {
-        orderNumber: current.orderNumber,
-        returnItemId: restoredRow?.id ?? '',
-        scheduleId: typeof snap.toScheduleId === 'string' ? snap.toScheduleId : '',
-        cabin: (typeof snap.cabin === 'string' ? snap.cabin : null) as CabinClass | null,
-        quantity: typeof snap.seats === 'number' ? snap.seats : 0,
-        oversold: snap.oversold === true,
-        oversoldBy: typeof snap.oversoldBy === 'number' ? snap.oversoldBy : 0,
-        scheduleOversoldAfter:
-          typeof snap.scheduleOversoldAfter === 'number' ? snap.scheduleOversoldAfter : 0,
-        flightNumber: typeof snap.flightNumber === 'string' ? snap.flightNumber : null,
-        departDate: typeof snap.departDate === 'string' ? snap.departDate : null,
-        // 重放不重新派工单（createTicketWorkOrder 按 ruleKey 幂等，重放这条分支根本不会
-        // 跑到第 6 步），这两个字段在重放场景没有对应历史值可读，且下面调用方只在
-        // !replayed 时才用它们决定推不推企业微信——重放恒为 null 不影响任何判断。
-        workOrderReminderId: null,
-        workOrderTitle: null,
-        replayed: true,
-      } satisfies RestoreReturnLegAudit;
-    }
-
+  // OrderMutation 内核：事务 + 订单行锁 + 锁内幂等回放 + 事务内审计（超售放行 / 挤占他人预留两条 CRITICAL）
+  // + 守恒断言（恢复回程钱款不动：应收 / 已收 / 房量 / 成本四维前后恒等；座位本就是要占回来的）。
+  const audit = await runOrderMutation<RestoreReturnLegAudit>({
+    orderId,
+    actor,
+    action: 'RESTORE_RETURN_LEG',
+    requestToken: input.requestToken,
+    idempotency: { fastPath: false, find: (db) => findRestoreReturnLegReplay(db, orderId, input) },
+    conserve: { unchanged: ['receivable', 'paid', 'rooms', 'cost'], label: '恢复回程' },
+  }, async (ctx) => {
+    const tx = ctx.tx;
     // ── 1. 重跑准入闸 ──
     const assessed = await svc._assessRestoreReturnLeg(tx, orderId);
     const item = assessed.releasedItem;
@@ -2146,8 +2191,7 @@ export async function restoreReturnLeg(
       const cabinsZh = oversellDetail
         .map((d) => CABIN_ZH_LABEL[d.cabin] ?? d.cabin)
         .join('/');
-      await writeAuditWithinTx(tx, {
-        actor: { userId: actor.userId, role: actor.role },
+      await ctx.audit({
         action: 'RESTORE_RETURN_LEG_OVERSOLD',
         targetType: AuditTargetType.ORDER,
         targetId: orderId,
@@ -2191,8 +2235,7 @@ export async function restoreReturnLeg(
         .filter((d) => d.displacedReserved > 0)
         .map((d) => `${CABIN_ZH_LABEL[d.cabin] ?? d.cabin} ${d.displacedReserved} 座`)
         .join('、');
-      await writeAuditWithinTx(tx, {
-        actor: { userId: actor.userId, role: actor.role },
+      await ctx.audit({
         action: 'RESTORE_RETURN_LEG_DISPLACED_RESERVATION',
         targetType: AuditTargetType.ORDER,
         targetId: orderId,
@@ -2379,34 +2422,17 @@ export async function voidReturnLeg(
     throw new ForbiddenError('仅运营/管理员可作废回程');
   }
 
-  const audit = await prisma.$transaction(async (tx) => {
-    // 与 no-show / 恢复 / 取消航段同一把行锁：这几条路径都在改同一批 FLIGHT 行的快照。
-    const lockRows = await tx.$queryRaw<Array<{ id: string }>>`
-      SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE
-    `;
-    if (lockRows.length === 0) throw new NotFoundError('订单不存在');
-
-    // ── 0. 幂等回放（口径同恢复回程：认 token + 动作类型 + 入参指纹）──
-    const flightRows = await tx.orderItem.findMany({
-      where: { orderId, kind: OrderItemKind.FLIGHT },
-      select: { id: true, metadata: true },
-    });
-    const tokenLookup = hasSeenLegActionToken(flightRows, input.requestToken);
-    if (tokenLookup.seen) {
-      assertLegActionTokenReplay(tokenLookup, ['VOID'], EMPTY_LEG_ACTION_FINGERPRINT);
-      const voidedRow =
-        flightRows.find((row) => readJsonObject(row.metadata).returnVoidedFinal != null) ?? null;
-      const current = await tx.order.findUniqueOrThrow({
-        where: { id: orderId },
-        select: { orderNumber: true },
-      });
-      return {
-        orderNumber: current.orderNumber,
-        returnItemId: voidedRow?.id ?? '',
-        replayed: true,
-      } satisfies VoidReturnLegAudit;
-    }
-
+  // OrderMutation 内核：事务 + 订单行锁（与 no-show / 恢复 / 取消航段同一把）+ 锁内幂等回放
+  // + 守恒断言（作废只打终态标：应收 / 已收 / 座位 / 房量 / 成本五维前后恒等）。
+  const audit = await runOrderMutation<VoidReturnLegAudit>({
+    orderId,
+    actor,
+    action: 'VOID_RETURN_LEG',
+    requestToken: input.requestToken,
+    idempotency: { fastPath: false, find: (db) => findVoidReturnLegReplay(db, orderId, input) },
+    conserve: { unchanged: ['receivable', 'paid', 'seats', 'rooms', 'cost'], label: '作废回程' },
+  }, async (ctx) => {
+    const tx = ctx.tx;
     // ── 1. 重跑准入闸 ──
     const assessed = await svc._assessVoidReturnLeg(tx, orderId);
     if (assessed.blockers.length > 0 || !assessed.item) {
