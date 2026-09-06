@@ -699,6 +699,64 @@ describe('FlightService.search · 公开搜索余位扣减 held', () => {
     const result = await service.search({ passengers: 2 });
     expect(result).toEqual([]);
   });
+
+  // ── 按日期搜索的当地日折算（S2：不再假定全站 UTC+8）────────────────────────
+  it('按日期搜索：SQL 侧只拉当地日 ±14 小时的 UTC 宽窗，不再按固定 −8 折死区间', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([]);
+    prismaMock.seatLock.groupBy.mockResolvedValue([]);
+    prismaMock.holdOrder.groupBy.mockResolvedValue([]);
+    prismaMock.flightBaggagePolicy.findMany.mockResolvedValue([]);
+
+    await service.search({ passengers: 1, date: '2026-07-10' });
+
+    const calls = prismaMock.flightSchedule.findMany.mock.calls;
+    const where = calls[calls.length - 1][0].where;
+    const pad = 14 * 60 * 60 * 1000;
+    expect(where.departureTime.gte).toEqual(
+      new Date(Date.parse('2026-07-10T00:00:00.000Z') - pad),
+    );
+    expect(where.departureTime.lt).toEqual(
+      new Date(Date.parse('2026-07-11T00:00:00.000Z') + pad),
+    );
+  });
+
+  it('按日期搜索：+7 / +8 / +9 三种 tz 各按自己的当地日归属，宽窗多拉的邻日班次被滤掉', async () => {
+    // 三班都在 UTC 07-09 17:30 ~ 07-10 17:30 之间，但当地日各不相同：
+    //   HCM(+7)   UTC 07-10 17:30 → 当地 07-11 00:30（不属于 07-10）
+    //   Macau(+8) UTC 07-10 04:00 → 当地 07-10 12:00（属于 07-10）
+    //   Tokyo(+9) UTC 07-09 16:00 → 当地 07-10 01:00（属于 07-10）
+    const mkSched = (id: string, iso: string, tz: string) => ({
+      id,
+      flightId: 'flight_1',
+      departureTime: new Date(iso),
+      arrivalTime: new Date(Date.parse(iso) + 3600000),
+      departureTz: tz,
+      arrivalTz: tz,
+      flight: { flightNumber: id, originCode: 'MFM', destinationCode: 'XXX', aircraftType: null },
+      seatClasses: [
+        {
+          id: `sc_${id}`,
+          cabin: 'ECONOMY',
+          capacity: 100,
+          sold: 0,
+          basePrice: { toString: () => '1000' },
+        },
+      ],
+    });
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      mkSched('TZ9', '2026-07-09T16:00:00.000Z', 'Asia/Tokyo'),
+      mkSched('TZ8', '2026-07-10T04:00:00.000Z', 'Asia/Macau'),
+      mkSched('TZ7', '2026-07-10T17:30:00.000Z', 'Asia/Ho_Chi_Minh'),
+    ]);
+    prismaMock.seatLock.groupBy.mockResolvedValue([]);
+    prismaMock.holdOrder.groupBy.mockResolvedValue([]);
+    prismaMock.flightBaggagePolicy.findMany.mockResolvedValue([]);
+
+    const result = await service.search({ passengers: 1, date: '2026-07-10' });
+
+    // +9 的凌晨班和 +8 的白天班都算 07-10；+7 那班当地已是 07-11，必须被滤掉
+    expect(result.map((r) => r.flightNumber).sort()).toEqual(['TZ8', 'TZ9']);
+  });
 });
 
 describe('FlightService.updateSchedule', () => {
@@ -1254,6 +1312,12 @@ describe('FlightService.deleteSchedule', () => {
 });
 
 // ── batchDeleteSchedules（按出发日区间批量删；已售/有订单的跳过）───────────
+/** 宽窗单边留白（与服务实现一致：当地日两端各放 14 小时，覆盖 UTC−12…+14 全部时区）。*/
+const WIDE_PAD_MS = 14 * 60 * 60 * 1000;
+/** 固定夹具起飞时刻：UTC 07-15 00:00 = Asia/Macau 07-15 08:00（稳稳落在 7 月区间内）。*/
+const SCHED_UTC_2026_07_15 = new Date('2026-07-15T00:00:00.000Z');
+/** 同上，8 月区间用。*/
+const SCHED_UTC_2026_08_15 = new Date('2026-08-15T00:00:00.000Z');
 // 复用单删同口径守卫：任一舱位 sold>0 或有订单项关联 → 跳过并回报，其余硬删。
 // 区间筛选交给 prisma.findMany 的 where（这里 mock 其返回），故测试聚焦"分流 + 删除"逻辑。
 describe('FlightService.batchDeleteSchedules', () => {
@@ -1275,6 +1339,8 @@ describe('FlightService.batchDeleteSchedules', () => {
       {
         id: 'sched_a',
         flightId: 'flight_1',
+        departureTime: SCHED_UTC_2026_07_15,
+        departureTz: 'Asia/Macau',
         orderItems: [],
         seatClasses: [{ sold: 0 }, { sold: 0 }],
         seatLocks: [],
@@ -1283,6 +1349,8 @@ describe('FlightService.batchDeleteSchedules', () => {
       {
         id: 'sched_b',
         flightId: 'flight_1',
+        departureTime: SCHED_UTC_2026_07_15,
+        departureTz: 'Asia/Macau',
         orderItems: [],
         seatClasses: [{ sold: 0 }, { sold: 5 }],
         seatLocks: [],
@@ -1291,6 +1359,8 @@ describe('FlightService.batchDeleteSchedules', () => {
       {
         id: 'sched_c',
         flightId: 'flight_1',
+        departureTime: SCHED_UTC_2026_07_15,
+        departureTz: 'Asia/Macau',
         orderItems: [{ id: 'oi_1' }],
         seatClasses: [{ sold: 0 }],
         seatLocks: [],
@@ -1323,6 +1393,8 @@ describe('FlightService.batchDeleteSchedules', () => {
       {
         id: 'sched_a',
         flightId: 'flight_1',
+        departureTime: SCHED_UTC_2026_07_15,
+        departureTz: 'Asia/Macau',
         orderItems: [],
         seatClasses: [{ sold: 0 }],
         seatLocks: [{ id: 'lock_1' }],
@@ -1331,6 +1403,8 @@ describe('FlightService.batchDeleteSchedules', () => {
       {
         id: 'sched_b',
         flightId: 'flight_1',
+        departureTime: SCHED_UTC_2026_07_15,
+        departureTz: 'Asia/Macau',
         orderItems: [],
         seatClasses: [{ sold: 0 }],
         seatLocks: [],
@@ -1339,6 +1413,8 @@ describe('FlightService.batchDeleteSchedules', () => {
       {
         id: 'sched_c',
         flightId: 'flight_1',
+        departureTime: SCHED_UTC_2026_07_15,
+        departureTz: 'Asia/Macau',
         orderItems: [],
         seatClasses: [{ sold: 0 }],
         seatLocks: [],
@@ -1370,6 +1446,8 @@ describe('FlightService.batchDeleteSchedules', () => {
       {
         id: 'sched_hold',
         flightId: 'flight_1',
+        departureTime: SCHED_UTC_2026_07_15,
+        departureTz: 'Asia/Macau',
         orderItems: [],
         seatClasses: [{ sold: 0 }],
         seatLocks: [],
@@ -1400,12 +1478,15 @@ describe('FlightService.batchDeleteSchedules', () => {
       to: '2026-07-12',
     });
 
-    // where 带 flightId + departureTime 区间（本地日 UTC+8 折 UTC：07-10 00:00 = UTC 07-09 16:00）
+    // where 带 flightId + departureTime **宽窗**（当地日两端各放 14 小时；精确到日的判定
+    // 在 JS 内按每班自己的 departureTz 做，SQL 侧不再假定全站 UTC+8）。
     const call = prismaMock.flightSchedule.findMany.mock.calls[0][0];
     expect(call.where.flightId).toBe('flight_1');
-    expect(call.where.departureTime.gte).toEqual(new Date(Date.UTC(2026, 6, 10, -8, 0, 0)));
-    expect(call.where.departureTime.lte).toEqual(
-      new Date(Date.UTC(2026, 6, 12, -8, 0, 0) + 24 * 3600 * 1000 - 1),
+    expect(call.where.departureTime.gte).toEqual(
+      new Date(Date.parse('2026-07-10T00:00:00.000Z') - WIDE_PAD_MS),
+    );
+    expect(call.where.departureTime.lt).toEqual(
+      new Date(Date.parse('2026-07-12T00:00:00.000Z') + 24 * 3600 * 1000 + WIDE_PAD_MS),
     );
     // 无可删项 → 不触发删除
     expect(prismaMock.flightSchedule.deleteMany).not.toHaveBeenCalled();
@@ -1416,6 +1497,8 @@ describe('FlightService.batchDeleteSchedules', () => {
       {
         id: 'sched_x',
         flightId: 'flight_1',
+        departureTime: SCHED_UTC_2026_08_15,
+        departureTz: 'Asia/Macau',
         orderItems: [],
         seatClasses: [{ sold: 0 }],
         seatLocks: [],
@@ -1424,6 +1507,8 @@ describe('FlightService.batchDeleteSchedules', () => {
       {
         id: 'sched_y',
         flightId: 'flight_2',
+        departureTime: SCHED_UTC_2026_08_15,
+        departureTz: 'Asia/Macau',
         orderItems: [],
         seatClasses: [{ sold: 0 }],
         seatLocks: [],
@@ -1447,6 +1532,8 @@ describe('FlightService.batchDeleteSchedules', () => {
       {
         id: 'sched_a',
         flightId: 'flight_1',
+        departureTime: SCHED_UTC_2026_07_15,
+        departureTz: 'Asia/Macau',
         orderItems: [],
         seatClasses: [{ sold: 3 }],
         seatLocks: [],
@@ -1455,6 +1542,8 @@ describe('FlightService.batchDeleteSchedules', () => {
       {
         id: 'sched_b',
         flightId: 'flight_1',
+        departureTime: SCHED_UTC_2026_07_15,
+        departureTz: 'Asia/Macau',
         orderItems: [{ id: 'oi_1' }],
         seatClasses: [{ sold: 0 }],
         seatLocks: [],
@@ -1476,6 +1565,44 @@ describe('FlightService.batchDeleteSchedules', () => {
         { scheduleId: 'sched_b', reason: '已售' },
       ],
     });
+  });
+
+  it('区间端点按每班自己的 departureTz 判定：+9 时区 UTC 07-12 15:30 起飞 = 当地 07-13，不在 [07-10, 07-12] 内', async () => {
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      {
+        id: 'sched_in',
+        flightId: 'flight_1',
+        // +9 当地 07-12 08:30（在区间内）
+        departureTime: new Date('2026-07-11T23:30:00.000Z'),
+        departureTz: 'Asia/Tokyo',
+        orderItems: [],
+        seatClasses: [{ sold: 0 }],
+        seatLocks: [],
+        seatWaitlists: [],
+      },
+      {
+        id: 'sched_out',
+        flightId: 'flight_1',
+        // +9 当地 07-13 00:30（区间外）——按旧的固定 −8 折算会被当成 07-12 而误删
+        departureTime: new Date('2026-07-12T15:30:00.000Z'),
+        departureTz: 'Asia/Tokyo',
+        orderItems: [],
+        seatClasses: [{ sold: 0 }],
+        seatLocks: [],
+        seatWaitlists: [],
+      },
+    ]);
+
+    const result = await service.batchDeleteSchedules({
+      flightId: 'flight_1',
+      from: '2026-07-10',
+      to: '2026-07-12',
+    });
+
+    expect(prismaMock.flightSchedule.deleteMany).toHaveBeenCalledWith({
+      where: { id: { in: ['sched_in'] } },
+    });
+    expect(result).toEqual({ deleted: 1, skipped: [] });
   });
 });
 

@@ -39,6 +39,23 @@ const CABIN_LABEL: Record<CabinClass, string> = {
 
 const pricingService = new PricingService();
 
+// ── 当地日 ⇄ UTC 宽窗（S2：时区折算唯一入口是 lib/flight-time.ts）────────────────
+// 每个班次的时区存在行里（FlightSchedule.departureTz），SQL 查询时还读不到它，所以
+// 「按出发地当地日筛选」只能分两步：SQL 侧拉一个**必然覆盖**目标当地日的 UTC 宽窗，
+// JS 侧再用 localDateISO(departureTime, departureTz) 精确判定。
+// 旧写法是把当地日直接按固定 −8 小时折成 UTC 区间，等于假定全站只有 UTC+8 一个时区；
+// 第二条航线一开（可能落在 +7/+9 或别的时区），端点附近的班次会整日错位地漏查/多查。
+const DAY_MS = 24 * 60 * 60 * 1000;
+/** 宽窗单边留白：现役与可预见的 IANA 偏移都在 UTC−12…+14 之间，±14h 必然包住当地日两端。 */
+const TZ_WINDOW_PAD_MS = 14 * 60 * 60 * 1000;
+/** 按日期搜索时先多拉几条（宽窗会带出前后两天的班次），JS 过滤后再截回 50 条。 */
+const DATE_SEARCH_WIDE_TAKE = 200;
+
+/** 'YYYY-MM-DD' 当日 00:00 UTC 的毫秒数。 */
+function utcMidnightMs(dateISO: string): number {
+  return Date.parse(`${dateISO}T00:00:00.000Z`);
+}
+
 /**
  * 把 zod 校验过的 fareBuckets 输入折叠成 Prisma Json? 写入值。
  * 非空数组 → 原样写入（已按给定顺序，index 0 先卖）。
@@ -332,23 +349,29 @@ export class FlightService {
     }
 
     if (q.date) {
-      // 用户给的是出发地本地日期 (假定 Asia/Shanghai, UTC+8)；折算到 UTC 区间
-      const [y, m, d] = q.date.split('-').map(Number);
-      // 本地 00:00 = UTC 前一天 16:00
-      const startUtc = new Date(Date.UTC(y, m - 1, d, -8, 0, 0));
-      const endUtc = new Date(Date.UTC(y, m - 1, d + 1, -8, 0, 0));
-      where.departureTime = { gte: startUtc, lt: endUtc };
+      // 用户给的是出发地当地日期。查询时还不知道每班自己的 departureTz（tz 在行里），
+      // 所以 SQL 侧只能拉一个必然覆盖该当地日的 UTC 宽窗，精确判定留到 JS（见下面的过滤）。
+      where.departureTime = {
+        gte: new Date(utcMidnightMs(q.date) - TZ_WINDOW_PAD_MS),
+        lt: new Date(utcMidnightMs(q.date) + DAY_MS + TZ_WINDOW_PAD_MS),
+      };
     }
 
-    const schedules = await prisma.flightSchedule.findMany({
-      where,
-      include: {
-        flight: true,
-        seatClasses: true,
-      },
-      orderBy: { departureTime: 'asc' },
-      take: 50,
-    });
+    const schedules = (
+      await prisma.flightSchedule.findMany({
+        where,
+        include: {
+          flight: true,
+          seatClasses: true,
+        },
+        orderBy: { departureTime: 'asc' },
+        // 按日期搜时先多拉一些（宽窗会带出前后两天的班次），JS 内按每班自己的 tz 折当地日
+        // 过滤掉不属于该日的，再截回 50 条；不按日期搜时窗口本就无关时区，直接 take 50。
+        take: q.date ? DATE_SEARCH_WIDE_TAKE : 50,
+      })
+    )
+      .filter((s) => !q.date || localDateISO(s.departureTime, s.departureTz) === q.date)
+      .slice(0, 50);
 
     // 锁位占用：视野内所有舱位一次 groupBy（ACTIVE 且未过期），买家看到真实可售量
     const seatClassIds = schedules.flatMap((s) => s.seatClasses.map((c) => c.id));
@@ -588,25 +611,33 @@ export class FlightService {
    * 取代前端 N+1（每航班一拉）。range 省略则返回全部。
    */
   async listSchedulesInRange(range: { from?: string; to?: string }) {
-    // from/to 是出发地当地(Asia/Macau, UTC+8)日期；折算到 UTC 瞬间，避免 8h 边界偏移。
-    const localDayStartUtc = (d: string) => {
-      const [y, m, dd] = d.split('-').map(Number);
-      return new Date(Date.UTC(y, m - 1, dd, -8, 0, 0));
-    };
+    // from/to 是出发地当地日期，但每班的 tz 在行里、查询前不可知 —— SQL 侧只能拉必然覆盖
+    // 该区间的 UTC 宽窗，再在 JS 内按每班自己的 departureTz 折当地日精确过滤（口径同 search）。
     const where: Prisma.FlightScheduleWhereInput = {};
     if (range.from || range.to) {
       where.departureTime = {};
-      if (range.from) where.departureTime.gte = localDayStartUtc(range.from);
-      if (range.to)
-        where.departureTime.lte = new Date(localDayStartUtc(range.to).getTime() + 24 * 3600 * 1000 - 1);
+      if (range.from) {
+        where.departureTime.gte = new Date(utcMidnightMs(range.from) - TZ_WINDOW_PAD_MS);
+      }
+      if (range.to) {
+        where.departureTime.lt = new Date(utcMidnightMs(range.to) + DAY_MS + TZ_WINDOW_PAD_MS);
+      }
     }
-    const schedules = await prisma.flightSchedule.findMany({
-      where,
-      orderBy: { departureTime: 'asc' },
-      include: {
-        flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
-        seatClasses: true,
-      },
+    const schedules = (
+      await prisma.flightSchedule.findMany({
+        where,
+        orderBy: { departureTime: 'asc' },
+        include: {
+          flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
+          seatClasses: true,
+        },
+      })
+    ).filter((s) => {
+      // 宽窗带出来的、当地日落在 [from, to] 之外的班次在此丢掉（区间端点含两端）。
+      const localDay = localDateISO(s.departureTime, s.departureTz);
+      if (range.from && localDay < range.from) return false;
+      if (range.to && localDay > range.to) return false;
+      return true;
     });
     const [lockedMap, heldMap] = await Promise.all([
       this.lockedMapForSchedules(schedules),
@@ -1070,7 +1101,8 @@ export class FlightService {
   /**
    * 批量删除班次（路由层限 ADMIN/STAFF）。
    * 场景：一天两班、整月排期，运营想按出发日区间删掉其中某档班次，又不想逐个点。
-   * 出发日区间 [from, to]（出发地当地 UTC+8 日，闭区间）内选出班次；flightId 省略=全部航班。
+   * 出发日区间 [from, to]（出发地当地日，按每班自己的 departureTz 折，闭区间）内选出班次；
+   * flightId 省略=全部航班。
    * 每个班次沿用 deleteSchedule 同口径的"有销售则禁删"守卫（任一舱位 sold>0，或有订单项关联，
    * 或有锁位/候补/任何占位单记录）：命中守卫 → 跳过（不删），记入 skipped；否则硬删（级联清掉舱位 / 仓位阶梯）。
    * 事务内一次删掉本批可删项，保证要么全部落库、要么整体回滚（已跳过项不参与删除，天然安全）。
@@ -1081,20 +1113,18 @@ export class FlightService {
     body: { flightId?: string; from: string; to: string },
     actor?: AuditActor,
   ) {
-    // from/to 是出发地当地(UTC+8)日期；折算到 UTC 瞬间（与 listSchedulesInRange 同口径，避免 8h 边界偏移）。
-    const localDayStartUtc = (d: string) => {
-      const [y, m, dd] = d.split('-').map(Number);
-      return new Date(Date.UTC(y, m - 1, dd, -8, 0, 0));
-    };
+    // from/to 是出发地当地日期；SQL 侧拉 UTC 宽窗，JS 内按每班自己的 departureTz 精确过滤
+    // （与 listSchedulesInRange 同口径）。删除是不可逆操作，宁可多拉几行再筛，也绝不用固定 −8
+    // 猜时区——猜错会漏删边界那一班、或误删不在区间里的那一班。
     const where: Prisma.FlightScheduleWhereInput = {
       departureTime: {
-        gte: localDayStartUtc(body.from),
-        lte: new Date(localDayStartUtc(body.to).getTime() + 24 * 3600 * 1000 - 1),
+        gte: new Date(utcMidnightMs(body.from) - TZ_WINDOW_PAD_MS),
+        lt: new Date(utcMidnightMs(body.to) + DAY_MS + TZ_WINDOW_PAD_MS),
       },
       ...(body.flightId ? { flightId: body.flightId } : {}),
     };
 
-    const schedules = await prisma.flightSchedule.findMany({
+    const schedules = (await prisma.flightSchedule.findMany({
       where,
       orderBy: { departureTime: 'asc' },
       include: {
@@ -1111,6 +1141,10 @@ export class FlightService {
           take: 1,
         },
       },
+    })).filter((s) => {
+      // 宽窗带出来的、当地日落在 [from, to] 之外的班次在此丢掉（闭区间）。
+      const localDay = localDateISO(s.departureTime, s.departureTz);
+      return localDay >= body.from && localDay <= body.to;
     });
 
     // 先分流：哪些可删、哪些因已售/有生效锁位、候补或占位单跳过（沿用单删守卫口径）。

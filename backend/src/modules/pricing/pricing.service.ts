@@ -12,6 +12,7 @@
 import { CabinClass } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, NotFoundError } from '../../lib/errors.js';
+import { localDateISO } from '../../lib/flight-time.js';
 import { computeLadderBreakdown } from './pricing.calc.js';
 import { parseFareBuckets } from './pricing.schemas.js';
 
@@ -220,21 +221,17 @@ export class PricingService {
    * 注意：LADDER 模式只把它当作运营内部参考，不参与定价。
    */
   private async resolveDateRank(departureTz: string, departureTime: Date): Promise<string> {
-    // 从 schedule.departureTime 提取出发地本地日期（Asia/Ho_Chi_Minh=+7, Asia/Macau=+8）
-    const offsetHours =
-      departureTz === 'Asia/Macau' ? 8 : departureTz === 'Asia/Ho_Chi_Minh' ? 7 : 8;
-    const localMs = departureTime.getTime() + offsetHours * 3600000;
-    const localDate = new Date(localMs);
-    // 取 UTC midnight 作为 date 查找 key
-    const dateLookup = new Date(
-      Date.UTC(localDate.getUTCFullYear(), localDate.getUTCMonth(), localDate.getUTCDate()),
-    );
+    // 当地日一律走 lib/flight-time.ts 的 localDateISO（唯一入口）：旧版把 tz 映射成硬编码的
+    // +8/+7 小时数，任何新时区（第二条航线）都会静默落到 +8，凌晨/深夜班次的日期等级整档错。
+    const localDateStr = localDateISO(departureTime, departureTz);
+    // 取该当地日的 UTC midnight 作为 DateRanking 的查找键（@db.Date 列，不折时区）
+    const dateLookup = new Date(`${localDateStr}T00:00:00.000Z`);
 
     const ranking = await prisma.dateRanking.findUnique({ where: { date: dateLookup } });
-    // Fallback: 按 DOW 算
+    // Fallback: 按 DOW 算（同样按当地日的星期几，不按 UTC 日）
     const dowFallback: Record<number, string> = {
       0: 'A', 1: 'C', 2: 'D', 3: 'D', 4: 'C', 5: 'B', 6: 'B',
     };
-    return ranking?.rank ?? dowFallback[localDate.getUTCDay()] ?? 'C';
+    return ranking?.rank ?? dowFallback[dateLookup.getUTCDay()] ?? 'C';
   }
 }
