@@ -7,6 +7,8 @@
  *   3. 同一张单被名单点到多人时只跑一次预检，结论分发给这单的每一行；
  *      同一位乘客被多行命中时合并成一条（原文行都留在 lines 里）；
  *   3b. releaseReturn 原样带进逐单预检；名单超上限时 totalLines / truncated 如实回；
+ *   3c. 团期（去程日/回程日）按各自班次 departureTz 折算，不是硬编码某一个时区；单程单
+ *       returnDate 为 null；
  *   4. 对外只出证件号后 4 位；
  *   5. 执行逐单独立：一单失败不影响其它单，失败带稳定 code；
  *   6. 逐单 token 由「整批 token + 订单 id」稳定派生（整批重试才会命中逐单回放）。
@@ -35,6 +37,7 @@ import {
 } from './no-show-roster-match.js';
 import { ForbiddenError, NotFoundError, AppError } from '../../lib/errors.js';
 import type { NoShowPreview } from './orders.service.js';
+import { localDateISO } from '../../lib/flight-time.js';
 
 const ADMIN = { userId: 'admin-1', role: UserRole.ADMIN } as const;
 const AGENT = { userId: 'agent-1', role: UserRole.AGENT } as const;
@@ -48,7 +51,7 @@ function orderRow(over: Record<string, unknown> = {}) {
   return {
     id: 'ord-1',
     orderNumber: 'FTM20260902-001',
-    // 备注随行下发，给票务在单号旁边多一个可读识别标（本表所有行同一班次，没有团期可分）
+    // 备注随行下发，给票务在单号旁边多一个可读识别标
     notes: '两位成人（双床）三星',
     passengers: [
       {
@@ -69,8 +72,16 @@ function orderRow(over: Record<string, unknown> = {}) {
       },
     ],
     items: [
-      { id: 'leg-out', flightScheduleId: 'sch-out', flightSchedule: { departureTime: OUT_DEPART } },
-      { id: 'leg-ret', flightScheduleId: 'sch-ret', flightSchedule: { departureTime: RET_DEPART } },
+      {
+        id: 'leg-out',
+        flightScheduleId: 'sch-out',
+        flightSchedule: { departureTime: OUT_DEPART, departureTz: 'Asia/Shanghai' },
+      },
+      {
+        id: 'leg-ret',
+        flightScheduleId: 'sch-ret',
+        flightSchedule: { departureTime: RET_DEPART, departureTz: 'Asia/Shanghai' },
+      },
     ],
     ...over,
   };
@@ -286,10 +297,60 @@ describe('批量 no-show · 预检', () => {
       hasReturn: true,
       returnTicketed: false,
       returnDeparted: false,
+      outboundDate: localDateISO(OUT_DEPART, 'Asia/Shanghai'),
+      returnDate: localDateISO(RET_DEPART, 'Asia/Shanghai'),
     });
     // 完整证件号一个字符都不许出现在响应里。
     expect(JSON.stringify(r)).not.toContain('E10000001');
     expect(r.unmatched).toEqual(['某位不在名单里的人']);
+  });
+
+  it('团期按各自班次 departureTz 折算，不是同一个硬编码时区', async () => {
+    // 去程用东八区、回程改用东九区：若实现误用了单一时区，两个日期至少一个会算错。
+    mockPrisma.order.findMany.mockResolvedValue([
+      orderRow({
+        items: [
+          {
+            id: 'leg-out',
+            flightScheduleId: 'sch-out',
+            flightSchedule: { departureTime: OUT_DEPART, departureTz: 'Asia/Shanghai' },
+          },
+          {
+            id: 'leg-ret',
+            flightScheduleId: 'sch-ret',
+            flightSchedule: { departureTime: RET_DEPART, departureTz: 'Asia/Tokyo' },
+          },
+        ],
+      }),
+    ]);
+    const r = await previewNoShowBatch(
+      { service: fakeService() },
+      { scheduleId: 'sch-out', names: '陈志远' },
+      ADMIN,
+    );
+    expect(r.matched[0].outboundDate).toBe(localDateISO(OUT_DEPART, 'Asia/Shanghai'));
+    expect(r.matched[0].returnDate).toBe(localDateISO(RET_DEPART, 'Asia/Tokyo'));
+  });
+
+  it('单程单（没有回程行）→ returnDate 为 null', async () => {
+    mockPrisma.order.findMany.mockResolvedValue([
+      orderRow({
+        items: [
+          {
+            id: 'leg-out',
+            flightScheduleId: 'sch-out',
+            flightSchedule: { departureTime: OUT_DEPART, departureTz: 'Asia/Shanghai' },
+          },
+        ],
+      }),
+    ]);
+    const r = await previewNoShowBatch(
+      { service: fakeService() },
+      { scheduleId: 'sch-out', names: '陈志远' },
+      ADMIN,
+    );
+    expect(r.matched[0].outboundDate).toBe(localDateISO(OUT_DEPART, 'Asia/Shanghai'));
+    expect(r.matched[0].returnDate).toBeNull();
   });
 
   it('同一张单被点到 2 人 → 只跑一次预检，结论分发给两行', async () => {

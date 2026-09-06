@@ -8,13 +8,29 @@
  *     贴进去的那几个字，不是我们解析出来的名字。
  *   - 服务端说「整单」的单，被取消勾了同单的某个人之后其实只标部分人（执行时会自动拆单），
  *     这一行给琥珀提示，不让它继续写着「整单」蒙人。
- *   - 订单号下面带一行订单备注：本表只针对一个班次，所有行的出发日期天然相同，没有可区分的
- *     「团期」；运营录单时把团组/客人识别信息写在备注里，拿它当可读标识是现成的。
+ *   - 订单号下面带一行订单备注：运营录单时把团组/客人识别信息写在备注里，拿它当可读标识。
+ *   - 团期 = 去程日→回程日，同一去程班次下按回程日区分团：本表只针对一个已选定的去程班次，
+ *     所有行去程日天然相同，但回程日可能不同，就是不同团。
  *   - 回程一列写「票务已确认 / 票务未确认」而不是「已出票 / 未出票」：这里读的是出票任务的
  *     确认状态，与财务的「开票」（订单上的三个开票位）是完全独立的两件事，字面太像会看串。
  */
 import type { NoShowBatchMatch } from '../../lib/api';
 import { MATCHED_BY_LABEL, matchKey } from './noShowMatch';
+
+/** 'YYYY-MM-DD' → 'MM-DD'（已经是当地日的字符串，纯截取，不再折时区）。 */
+function monthDay(dateISO: string): string {
+  return dateISO.slice(5);
+}
+
+/** 团期展示：MM-DD → MM-DD；单程 MM-DD 单程；缺数据 —。 */
+function formatTripDate(
+  outboundDate: string | null | undefined,
+  returnDate: string | null | undefined,
+): string {
+  if (!outboundDate) return '—';
+  if (!returnDate) return `${monthDay(outboundDate)} 单程`;
+  return `${monthDay(outboundDate)} → ${monthDay(returnDate)}`;
+}
 
 interface Props {
   matched: NoShowBatchMatch[];
@@ -74,9 +90,15 @@ export function NoShowMatchTable({
             </th>
             <th
               className="whitespace-nowrap text-left"
-              title="订单号下面是该单的备注原文，用来认人认团。本表只针对一个班次，所有行出发日期天然相同，没有可区分的「团期」"
+              title="订单号下面是该单的备注原文，用来认人认团"
             >
               订单号 / 备注
+            </th>
+            <th
+              className="whitespace-nowrap text-left"
+              title="团期 = 去程日→回程日，同一去程班次下按回程日区分团"
+            >
+              团期
             </th>
             <th className="whitespace-nowrap text-left">匹配方式</th>
             <th
@@ -135,6 +157,9 @@ export function NoShowMatchTable({
                   ) : (
                     <span className="mt-0.5 block text-[11px] text-ink-muted">无备注</span>
                   )}
+                </td>
+                <td className="nums whitespace-nowrap">
+                  {formatTripDate(m.outboundDate, m.returnDate)}
                 </td>
                 <td className="whitespace-nowrap">
                   {/* 后端加了新匹配方式而前端还没发版时，原样显示比空着强 */}

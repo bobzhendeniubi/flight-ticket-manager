@@ -1950,10 +1950,16 @@ export interface NoShowBatchMatch {
   orderNumber: string;
   /**
    * 订单备注原文（Order.notes），跟在订单号下面当可读识别标。
-   * 这张表针对单一班次，所有行出发日相同、没有「团期」可分，运营习惯把团组/客人信息
-   * 写在备注里，就拿它辅助识别。旧后端不下发时为 undefined，界面留空即可。
+   * 旧后端不下发时为 undefined，界面留空即可。
    */
   notes?: string | null;
+  /**
+   * 团期 = 去程日 → 回程日（各自按所在班次时区折算的当地日 YYYY-MM-DD）。
+   * 这张表针对单一去程班次，所有行去程日天然相同，但同一去程班次下各单回程日可能不同，
+   * 就是不同团，故仍有区分度。单程单 returnDate 为 null；旧后端不下发时为 undefined。
+   */
+  outboundDate?: string | null;
+  returnDate?: string | null;
   passengerId: string;
   fullName: string;
   chineseName: string | null;

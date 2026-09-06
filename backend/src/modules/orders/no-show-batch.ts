@@ -71,12 +71,16 @@ export interface NoShowBatchMatchedRow {
   orderNumber: string;
   /**
    * 订单备注原文（`Order.notes`），给票务在单号旁边多一个可读的识别标。
-   *
-   * 为什么不是「团期」：这张表本来就是针对**单一已选定班次**的，所有行的出发日期天然相同，
-   * 再造一个团期字段既无区分度也无真源。运营录单时习惯往备注里写团组/客人识别信息
-   *（「两位成人（双床）三星」这类），拿它当标识是现成的、不必新增字段。
    */
   notes: string | null;
+  /**
+   * 团期 = 去程日 → 回程日（各自按所在班次的 departureTz 折算的当地日 YYYY-MM-DD）。
+   *
+   * 这张表本来针对**单一已选定班次**，所有行的去程日天然相同——但同一去程班次下各单
+   * 回程日可能不同，就是不同团，所以团期仍有区分度。单程单没有回程行，returnDate 为 null。
+   */
+  outboundDate: string | null;
+  returnDate: string | null;
   passengerId: string;
   fullName: string;
   chineseName: string | null;
@@ -245,10 +249,20 @@ const PREVIEW_CONCURRENCY = 10;
  *      第 3 条是关键：同一个班次既可能是 A 单的去程、也可能是 B 单的回程（往返对飞的团），
  *      漏掉它就会把「回程正等着飞」的客人当成「去程没登机」，直接放掉他的座位。
  */
+/** 一单的团期：去程日必有，回程日单程单为 null（见 NoShowBatchMatchedRow.outboundDate/returnDate）。 */
+interface OrderTripDates {
+  outboundDate: string | null;
+  returnDate: string | null;
+}
+
 async function loadScheduleCandidates(
   client: PrismaClient,
   scheduleId: string,
-): Promise<{ candidates: RosterCandidate[]; notesByOrderId: Map<string, string | null> }> {
+): Promise<{
+  candidates: RosterCandidate[];
+  notesByOrderId: Map<string, string | null>;
+  tripDatesByOrderId: Map<string, OrderTripDates>;
+}> {
   const orders = await client.order.findMany({
     where: {
       deletedAt: null,
@@ -276,7 +290,7 @@ async function loadScheduleCandidates(
         select: {
           id: true,
           flightScheduleId: true,
-          flightSchedule: { select: { departureTime: true } },
+          flightSchedule: { select: { departureTime: true, departureTz: true } },
         },
       },
     },
@@ -284,10 +298,19 @@ async function loadScheduleCandidates(
 
   const out: RosterCandidate[] = [];
   const notesByOrderId = new Map<string, string | null>();
+  const tripDatesByOrderId = new Map<string, OrderTripDates>();
   for (const order of orders) {
-    const { outbound } = determineFlightLegItems(order.items);
+    const { outbound, return: returnItem } = determineFlightLegItems(order.items);
     if (outbound?.flightScheduleId !== scheduleId) continue;
     notesByOrderId.set(order.id, order.notes);
+    tripDatesByOrderId.set(order.id, {
+      outboundDate: outbound?.flightSchedule
+        ? localDateISO(outbound.flightSchedule.departureTime, outbound.flightSchedule.departureTz)
+        : null,
+      returnDate: returnItem?.flightSchedule
+        ? localDateISO(returnItem.flightSchedule.departureTime, returnItem.flightSchedule.departureTz)
+        : null,
+    });
     for (const p of order.passengers) {
       out.push({
         orderId: order.id,
@@ -301,7 +324,7 @@ async function loadScheduleCandidates(
       });
     }
   }
-  return { candidates: out, notesByOrderId };
+  return { candidates: out, notesByOrderId, tripDatesByOrderId };
 }
 
 // ── 预检 ────────────────────────────────────────────────────────────────────
@@ -347,7 +370,10 @@ export async function previewNoShowBatch(
   };
 
   const { lines, totalLines, truncated } = parseRosterLines(input.names);
-  const { candidates, notesByOrderId } = await loadScheduleCandidates(client, input.scheduleId);
+  const { candidates, notesByOrderId, tripDatesByOrderId } = await loadScheduleCandidates(
+    client,
+    input.scheduleId,
+  );
   const { matched, unmatched, ambiguous } = matchRosterLines(lines, candidates);
 
   // 同一位乘客被多行命中（「张三」+「ZHANG/SAN E12345678」）→ 合并成一条，原文行都留着。
@@ -426,6 +452,8 @@ export async function previewNoShowBatch(
       orderId: c.orderId,
       orderNumber: c.orderNumber,
       notes: notesByOrderId.get(c.orderId) ?? null,
+      outboundDate: tripDatesByOrderId.get(c.orderId)?.outboundDate ?? null,
+      returnDate: tripDatesByOrderId.get(c.orderId)?.returnDate ?? null,
       passengerId: c.passengerId,
       fullName: c.fullName,
       chineseName: c.chineseName,

@@ -61,6 +61,9 @@ function pinnedCandidateToMatch(
       hasReturn: sibling.hasReturn,
       returnTicketed: sibling.returnTicketed,
       returnDeparted: sibling.returnDeparted,
+      // 团期是订单级信息（与 no-show 判定无关），同单已预检的另一行有就借来，不必等再补一次预检。
+      outboundDate: sibling.outboundDate,
+      returnDate: sibling.returnDate,
     };
   }
   return {
@@ -72,6 +75,9 @@ function pinnedCandidateToMatch(
     hasReturn: false,
     returnTicketed: false,
     returnDeparted: false,
+    // 同单没有别的已预检行可借：团期留空，表格按「缺数据」显示 —，不装假日期。
+    outboundDate: null,
+    returnDate: null,
     warning: '该单未预检，提交前请确认',
   };
 }
