@@ -13,6 +13,7 @@ import { useState } from 'react';
 import { Link } from 'react-router-dom';
 import { api, type AuditLog } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
 import { summarizePayload } from '../lib/auditFormat';
 import { businessTzParts } from '../lib/datetime';
 
@@ -122,7 +123,7 @@ interface OrderAuditTrailProps {
 export function OrderAuditTrail({ orderId }: OrderAuditTrailProps) {
   const token = useAuth((s) => s.tokens)?.accessToken ?? '';
   const role = useAuth((s) => s.user?.role);
-  const isOps = role === 'ADMIN' || role === 'STAFF';
+  const isOps = useCapabilities().can('audit.read');
 
   const [loaded, setLoaded] = useState(false);
   const [loading, setLoading] = useState(false);

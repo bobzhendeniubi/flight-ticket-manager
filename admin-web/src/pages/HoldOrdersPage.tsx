@@ -26,6 +26,7 @@ import {
 import { CABIN_LABEL, formatLocalDate, formatLocalTime } from '../lib/airports';
 import { formatDateTimeSecCn } from '../lib/datetime';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
 import { HOLD_STATUS_META, holdStatusBadgeClass, holdStatusLabel } from '../lib/orderStatus';
 import { useDialogA11y } from '../components/Modal';
 import { useConfirm } from '../components/ConfirmDialog';
@@ -110,6 +111,7 @@ export function HoldOrdersPage() {
   const askConfirm = useConfirm();
   const actionConfirmRef = useRef(false);
   const user = useAuth((s) => s.user);
+  const { can } = useCapabilities();
   const [flights, setFlights] = useState<AdminFlight[]>([]);
   const [allSchedules, setAllSchedules] = useState<Record<string, AdminSchedule[]>>({});
   const [agents, setAgents] = useState<AgentListItem[]>([]);
@@ -153,7 +155,7 @@ export function HoldOrdersPage() {
         ]);
         setFlights(flightResult.flights);
         setAgents(agentResult.agents.filter((a) => a.isActive));
-        if (user?.role === 'ADMIN' || user?.role === 'STAFF') {
+        if (can('hold_orders.manage')) {
           try { setHoldConfig((await api.getHoldOrderConfig(tokens.accessToken)).config); } catch { /* 配置入口仍可稍后重试 */ }
         }
         setAllSchedules(await fetchScheduleMap(tokens.accessToken, flightResult.flights));
@@ -259,7 +261,7 @@ export function HoldOrdersPage() {
   return (
     <div className="space-y-5">
       <section>
-        <div className="flex items-center justify-between gap-3"><h1 className="page-title">占位单管理</h1>{user?.role === 'ADMIN' && <button className="btn-secondary text-sm" disabled={!holdConfig} onClick={() => setShowConfig(true)}>收款模板设置</button>}</div>
+        <div className="flex items-center justify-between gap-3"><h1 className="page-title">占位单管理</h1>{can('hold_orders.config.write') && <button className="btn-secondary text-sm" disabled={!holdConfig} onClick={() => setShowConfig(true)}>收款模板设置</button>}</div>
         <p className="page-sub">为旅游团、代理或直客临时锁定无名单库存；释放或取消后座位回到公共库存。</p>
       </section>
 

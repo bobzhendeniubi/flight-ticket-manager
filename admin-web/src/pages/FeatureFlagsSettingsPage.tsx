@@ -8,13 +8,13 @@
 import { useEffect, useState } from 'react';
 import { api, ApiError, type FeatureFlagKey, type FeatureFlagView } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
 import { Icon } from '../components/Icon';
 
 export function FeatureFlagsSettingsPage() {
   const tokens = useAuth((s) => s.tokens);
-  const user = useAuth((s) => s.user);
   const token = tokens?.accessToken ?? '';
-  const canEdit = user?.role === 'ADMIN';
+  const canEdit = useCapabilities().can('feature_flags.write');
 
   const [flags, setFlags] = useState<FeatureFlagView[] | null>(null);
   const [loading, setLoading] = useState(true);

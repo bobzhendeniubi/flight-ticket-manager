@@ -14,6 +14,7 @@ import {
   type OrderCostItem,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
 import { NumberInput } from './NumberInput';
 import { Icon } from './Icon';
 import { useConfirm } from './ConfirmDialog';
@@ -51,20 +52,19 @@ export function OrderFinanceSection({
   payableCny,
   onChanged,
 }: OrderFinanceSectionProps) {
-  const user = useAuth((s) => s.user);
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
-  const role = user?.role;
+  const { can } = useCapabilities();
 
-  // AGENT / CUSTOMER 完全不展示此 section
-  if (role !== 'ADMIN' && role !== 'STAFF') return null;
+  // AGENT / CUSTOMER 完全不展示此 section（本段全是应收/收款锁这类运营口径）
+  if (!can('orders.price_adjust')) return null;
 
   return (
     <section className="space-y-4">
       <ExpectedAmountCard
         token={token}
         orderId={orderId}
-        isAdmin={role === 'ADMIN'}
+        isAdmin={can('orders.expected_amount.override_lock')}
         initialAmountCny={initialExpectedAmountCny}
         initialLocked={initialExpectedAmountLocked}
         payableCny={payableCny}

@@ -46,6 +46,7 @@ import {
   VISA_STATUS_LABEL,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
 import { NumberInput } from './NumberInput';
 import { Icon } from './Icon';
 import { PassengerSuggestInput } from './PassengerSuggestInput';
@@ -928,7 +929,7 @@ export function SingleOrderModal({ onClose, onCreated, prefill }: SingleOrderMod
   const adjustError = adjustIsInteger && adjustNeedsText ? '选择「其它」时请填写调整原因说明' : null;
 
   // ── 本单结算总价 ──
-  const isStaffUser = user?.role === 'ADMIN' || user?.role === 'STAFF';
+  const isStaffUser = useCapabilities().can('orders.price_adjust');
   // 代理录单：只看结算价（业务拍板）。系统价/调价是运营概念，对代理隐藏；
   // quote 接口对 AGENT 已在服务端强制归属自家，结算价预览无需先选归属代理。
   // 结算价锁定前代理可以自己填 / 自己改，不经运营审批（锁定后才走议价申请，见订单详情）。

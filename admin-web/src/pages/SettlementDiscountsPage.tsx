@@ -26,6 +26,7 @@ import {
   type SettlementTier,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
 import { Icon } from '../components/Icon';
 import { useConfirm } from '../components/ConfirmDialog';
 
@@ -135,12 +136,11 @@ export function SettlementDiscountsPage() {
   const confirmLockRef = useRef(false);
   const newRowSeqRef = useRef(0);
   const tokens = useAuth((s) => s.tokens);
-  const user = useAuth((s) => s.user);
   const token = tokens?.accessToken ?? '';
   // 立减规则写权限：ADMIN 与内部岗位（STAFF）都可维护 —— 录单岗要按代理口径自己配立减，
   // 每次都绕到管理员那边会让规则永远配不齐。AGENT 进不来本页（路由级 adminOnly 已拦），
   // 故此处只区分内外部；写操作后端仍逐条落审计（UPSERT/DELETE_SETTLEMENT_DISCOUNT）。
-  const canEdit = user?.role === 'ADMIN' || user?.role === 'STAFF';
+  const canEdit = useCapabilities().can('settlement_discounts.write');
   const [searchParams] = useSearchParams();
 
   const [kind, setKind] = useState<SettlementDiscountKind>('AGENT');

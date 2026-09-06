@@ -6,6 +6,7 @@
 import { useCallback, useEffect, useState } from 'react';
 import { ApiError, orderChangeRequestsApi, type OrderChangeRequest, type OrderSummary } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
 import { useConfirm } from './ConfirmDialog';
 import { formatDateTimeSecCn } from '../lib/datetime';
 import {
@@ -43,7 +44,7 @@ export function OrderChangeRequestsPanel({
 }: OrderChangeRequestsPanelProps) {
   const token = useAuth((s) => s.tokens)?.accessToken ?? '';
   const confirm = useConfirm();
-  const isOpsUser = role === 'ADMIN' || role === 'STAFF';
+  const isOpsUser = useCapabilities().can('change_requests.decide');
   const isAgentUser = role === 'AGENT';
 
   const [requests, setRequests] = useState<OrderChangeRequest[]>([]);
