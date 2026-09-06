@@ -16,7 +16,11 @@ import type { Capability } from './capabilities';
  * 从契约包取之后，schema.prisma 一改，这边编译期就红。import + export 两句是必需的：
  * 本文件下面的接口还要用这些类型，光 re-export 不进本地作用域。
  */
+import { BUSINESS_ERROR_CODES } from '@ftm/contracts';
 import type {
+  ApiErrorBody,
+  DuplicateAmountDetails,
+  ReschedulePassengersSplitFailureDetails,
   CreateChildAgentBody,
   CreatePaymentChannelInput as ContractCreatePaymentChannelInput,
   SuggestMatchesInput,
@@ -104,9 +108,7 @@ export type {
 
 const API_BASE: string = (import.meta.env?.VITE_API_BASE as string | undefined)?.trim() || '/api';
 
-export interface ApiErrorBody {
-  error: { code: string; message: string; details?: unknown };
-}
+export type { ApiErrorBody };
 
 export class ApiError extends Error {
   readonly status: number;
@@ -125,20 +127,16 @@ export class ApiError extends Error {
  * 重复乘客拦截错误的稳定 code（后端 DuplicatePassengerError）。前端按 code 判，
  * 绝不靠中文文案匹配。命中即弹「确认仍要录入」二次确认，确认后带 allowDuplicatePassengers 重试。
  */
-export const DUPLICATE_PASSENGER_CODE = 'DUPLICATE_PASSENGER';
+export const DUPLICATE_PASSENGER_CODE = BUSINESS_ERROR_CODES.DUPLICATE_PASSENGER;
 
 /**
  * 手工确认收款「同额软闸」的稳定 code（后端近 windowMinutes 分钟内同订单等额收款拦截）。
  * 前端按 code 判，命中即弹二次确认，确认后带 confirmDuplicate:true 重试。
  */
-export const DUPLICATE_AMOUNT_CODE = 'DUPLICATE_AMOUNT';
+export const DUPLICATE_AMOUNT_CODE = BUSINESS_ERROR_CODES.DUPLICATE_AMOUNT;
 
 /** 同额软闸 details 结构（后端保证：existingPaymentId + amount + windowMinutes）。 */
-export interface DuplicateAmountDetails {
-  existingPaymentId: string;
-  amount: number;
-  windowMinutes: number;
-}
+export type { DuplicateAmountDetails };
 
 /** 从 DUPLICATE_AMOUNT 错误里取 details；非该错误 / 结构异常 → null。 */
 export function duplicateAmountDetails(err: unknown): DuplicateAmountDetails | null {
@@ -177,15 +175,10 @@ export function duplicatePassengerConflictOrderNumbers(err: unknown): string[] {
  * （如新班次售罄）。拆单不回滚——新单是钱与座位都守恒的合法订单。前端按 code 判，命中即
  * 引导运营去新单上重试改期，绝不能当普通失败静默丢弃已拆出的新单号。
  */
-export const SPLIT_DONE_RESCHEDULE_FAILED_CODE = 'SPLIT_DONE_RESCHEDULE_FAILED';
+export const SPLIT_DONE_RESCHEDULE_FAILED_CODE = BUSINESS_ERROR_CODES.SPLIT_DONE_RESCHEDULE_FAILED;
 
 /** reschedulePassengers「已拆单但改期未成功」错误的 details 结构（后端原样透出）。 */
-export interface ReschedulePassengersSplitFailureDetails {
-  newOrderId: string;
-  newOrderNumber: string;
-  passengerCount?: number;
-  reason?: string;
-}
+export type { ReschedulePassengersSplitFailureDetails };
 
 /** 从 reschedulePassengers 的失败里取「已拆单但改期未成功」的新单信息；非该情形 → null。 */
 export function reschedulePassengersSplitFailure(

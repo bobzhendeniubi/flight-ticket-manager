@@ -14,8 +14,10 @@
  * 者覆盖前者会被 TS 直接报错 —— 真撞名了就改从子路径导入（`@ftm/contracts/orders`）。
  */
 
-// 枚举镜像与纯函数 helper
+// 枚举镜像、错误码、公共信封与纯函数 helper
+export * from './common.js';
 export * from './enums.js';
+export * from './errors.js';
 export * from './lib/business-time.js';
 export * from './lib/country-codes.js';
 export * from './lib/flight-time.js';

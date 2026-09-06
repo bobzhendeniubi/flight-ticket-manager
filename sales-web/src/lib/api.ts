@@ -15,6 +15,7 @@ import type { Capability } from './capabilities';
  * import + export 两句都要：本文件下面的接口还要用这些类型，光 re-export 不进本地作用域。
  */
 import type {
+  ApiErrorBody,
   PaymentChannelKind as ContractPaymentChannelKind,
   CabinClass,
   DocumentType,
@@ -39,9 +40,7 @@ export type {
 };
 
 const API_BASE: string = (import.meta.env?.VITE_API_BASE as string | undefined)?.trim() || '/api';
-export interface ApiErrorBody {
-  error: { code: string; message: string; details?: unknown };
-}
+export type { ApiErrorBody };
 
 export class ApiError extends Error {
   readonly status: number;
