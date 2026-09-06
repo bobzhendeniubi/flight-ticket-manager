@@ -56,6 +56,7 @@ const NAV: Array<{
   { to: '/legacy-archive',  label: '历史档案',    roles: ['ADMIN', 'STAFF'],          section: '系统' },
   { to: '/audit-logs',      label: '审计日志',    roles: ['ADMIN', 'STAFF'],          section: '系统' },
   { to: '/settings/ai-ocr', label: 'AI 识别设置', roles: ['ADMIN'],                   section: '系统' },
+  { to: '/settings/feature-flags', label: '功能开关', roles: ['ADMIN', 'STAFF'],       section: '系统' },
   { to: '/settings/staff-roles', label: '账号管理',    roles: ['ADMIN'],                   section: '系统' },
 ];
 

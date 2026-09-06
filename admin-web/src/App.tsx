@@ -25,6 +25,7 @@ import { ReconciliationPage } from './pages/ReconciliationPage';
 import { HotelControlPage } from './pages/HotelControlPage';
 import { VisaDeskPage } from './pages/VisaDeskPage';
 import { AiOcrSettingsPage } from './pages/AiOcrSettingsPage';
+import { FeatureFlagsSettingsPage } from './pages/FeatureFlagsSettingsPage';
 import { RemindersPage } from './pages/RemindersPage';
 import { NoShowBatchPage } from './pages/NoShowBatchPage';
 import { NoShowReportPage } from './pages/NoShowReportPage';
@@ -380,6 +381,14 @@ export function App() {
           element={
             <Protected adminOnly>
               <AiOcrSettingsPage />
+            </Protected>
+          }
+        />
+        <Route
+          path="/settings/feature-flags"
+          element={
+            <Protected adminOnly>
+              <FeatureFlagsSettingsPage />
             </Protected>
           }
         />

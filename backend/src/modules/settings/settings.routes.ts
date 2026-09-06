@@ -19,7 +19,8 @@ import { UserRole, AuditTargetType } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { env } from '../../config/env.js';
 import { writeAudit, actorFromRequest } from '../../lib/audit.js';
-import { BadRequestError } from '../../lib/errors.js';
+import { BadRequestError, NotFoundError } from '../../lib/errors.js';
+import { isFeatureFlagKey, listFeatureFlags, setFeatureFlag } from '../../lib/feature-flags.js';
 
 // ── 工具函数 ────────────────────────────────────────────────
 
@@ -77,6 +78,8 @@ const updateBodySchema = z.object({
 
 export const settingsRoutes: FastifyPluginAsync = async (app) => {
   const adminOnly = [app.authenticate, app.requireRole(UserRole.ADMIN)];
+  // feature flag 列表允许 STAFF 只读查看（运营需要知道某个开关有没有开，改还是只有 ADMIN）
+  const opsView = [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)];
 
   // ── GET /settings/ai-ocr ────────────────────────────────
   app.get('/ai-ocr', { preHandler: adminOnly }, async () => {
@@ -216,5 +219,30 @@ export const settingsRoutes: FastifyPluginAsync = async (app) => {
       const msg = err instanceof Error ? err.message : String(err);
       return { ok: false, message: `连接失败：${msg.slice(0, 200)}` };
     }
+  });
+
+  // ── GET /settings/feature-flags（ADMIN/STAFF 可看）──────────────────────
+  app.get('/feature-flags', { preHandler: opsView }, async () => {
+    return { flags: await listFeatureFlags(prisma) };
+  });
+
+  // ── PUT /settings/feature-flags/:key（仅 ADMIN）──────────────────────────
+  app.put('/feature-flags/:key', { preHandler: adminOnly }, async (req) => {
+    const { key } = req.params as { key: string };
+    if (!isFeatureFlagKey(key)) throw new NotFoundError(`未知的功能开关：${key}`);
+    const body = z.object({ enabled: z.boolean() }).parse(req.body);
+
+    await setFeatureFlag(prisma, key, body.enabled, req.user.sub);
+
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'UPDATE_FEATURE_FLAG',
+      targetType: AuditTargetType.SYSTEM,
+      targetId: key,
+      targetLabel: key,
+      after: { enabled: body.enabled },
+    });
+
+    return { flags: await listFeatureFlags(prisma) };
   });
 };

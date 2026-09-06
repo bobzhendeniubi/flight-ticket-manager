@@ -6714,6 +6714,16 @@ export const api = {
       token,
       body: {},
     }),
+
+  // ── Feature flag（ADMIN/STAFF 可看，改仅 ADMIN）───────────────────────────
+  getFeatureFlags: (token: string) =>
+    apiFetch<{ flags: FeatureFlagView[] }>('/settings/feature-flags', { token }),
+  setFeatureFlag: (token: string, key: FeatureFlagKey, enabled: boolean) =>
+    apiFetch<{ flags: FeatureFlagView[] }>(`/settings/feature-flags/${key}`, {
+      method: 'PUT',
+      token,
+      body: { enabled },
+    }),
 };
 
 // ── 财务模块类型（与 backend/src/modules/finances/finances.service.ts 对齐）──
@@ -7153,6 +7163,16 @@ export interface AiOcrConfigInput {
   baseUrl?: string;
   model?: string;
   enabled?: boolean;
+}
+
+// ── Feature flag（GET/PUT /settings/feature-flags）──────────────────────────
+export type FeatureFlagKey = 'REMINDER_AUTO_GENERATE' | 'REMINDER_WEBHOOK_PUSH' | 'REMINDER_BELL_ALL';
+
+export interface FeatureFlagView {
+  key: FeatureFlagKey;
+  label: string;
+  enabled: boolean;
+  default: boolean;
 }
 
 // ── 代理认款 / 收款码绑代理 ──────────────────────────────────────────────
