@@ -72,6 +72,8 @@ import {
   swapPassengerBodySchema,
   setPassengerVisaExemptBodySchema,
   updateItemSettlementPriceBodySchema,
+  ticketBatchBodySchema,
+  ticketBatchPreviewBodySchema,
   updatePassengerTicketBodySchema,
   updatePassengerVisaDatesBodySchema,
   updateStatusBodySchema,
@@ -131,6 +133,8 @@ import {
   resolveOrderImport,
 } from './orders.import.js';
 import { executeNoShowBatch, previewNoShowBatch } from './no-show-batch.js';
+import { executeTicketBatch, previewTicketBatch } from './ticket-batch.js';
+import { TicketRosterError, parseTicketRosterXlsx } from './ticket-roster.js';
 import {
   buildNoShowReportWorkbook,
   loadNoShowReport,
@@ -3077,6 +3081,115 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           note: body.note ?? null,
         },
         severity: 'WARNING',
+      });
+    }
+
+    return result;
+  });
+
+  // ── 按航班批量回填真实 PNR / 电子票号（ADMIN/STAFF）──────────────────────────
+  //
+  // 票务出完票拿回一份名单，选班次贴进来（或直接传 .xlsx）→ 系统按护照号优先、姓名兜底
+  // 匹配到本班次乘客并把库里现有的号一并摆出来 → 勾选后一键写入。
+  // 与「按航班批量 no-show」同一套手感；但**只动 pnr / eticketNumber 两列**，
+  // 不碰订单状态、履约任务、开票三维布尔，也不发行程单邮件。
+  //
+  // POST /orders/tickets/batch-preview  body: { scheduleId, lines } 或 { scheduleId, fileBase64 }
+  //   只读：一个字段都不写库。响应把 matched / unmatched / ambiguous / invalid 四类分开摆，
+  //   matched 每条都带 currentPnr / currentEticketNumber 与 conflict 标记，
+  //   让票务先看清「这条是新填、原样重填、还是要覆盖一个不一样的号」。
+  app.post('/tickets/batch-preview', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可回填票号' });
+    }
+    const body = ticketBatchPreviewBodySchema.parse(req.body);
+    let lines = body.lines ?? '';
+    if (body.fileBase64 !== undefined) {
+      try {
+        // 表格与粘贴走同一个解析器：单元格用 Tab 拼成一行，再进 parseTicketRosterLines。
+        lines = (await parseTicketRosterXlsx(body.fileBase64)).join('\n');
+      } catch (e) {
+        // 坏文件/超大/.xls/空表 → 400 带中文原因（绝不 500）。
+        throw new BadRequestError(
+          e instanceof TicketRosterError
+            ? e.message
+            : '表格文件无法解析，请确认为有效的 .xlsx 文件（旧 .xls 请先另存为 .xlsx）',
+        );
+      }
+    }
+    return previewTicketBatch({}, { scheduleId: body.scheduleId, lines }, {
+      userId: req.user.sub,
+      role,
+    });
+  });
+
+  // POST /orders/tickets/batch  body: { requestToken, scheduleId, entries, note? }
+  //   幂等靠**写值本身**：库里已经是这个号就一个字段都不写，本条如实回 changedFields: []。
+  //   requestToken 不加锁，只作整批关联号落进审计（同一批重试在审计里认得出是同一批）。
+  //   库里已有**不同**的号时必须逐条带 overwrite:true 才覆盖，否则回 TICKET_CONFLICT 跳过。
+  app.post('/tickets/batch', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      return reply.status(403).send({ error: '仅运营/管理员可回填票号' });
+    }
+    const body = ticketBatchBodySchema.parse(req.body);
+    const result = await executeTicketBatch({}, body, { userId: req.user.sub, role });
+
+    // 整批一条 WARNING 审计：事后要能一眼看出「哪一班、灌了多少条、成了几条、真改了几条」。
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'BACKFILL_PASSENGER_TICKET_BATCH',
+      // 整批的对象是**一个班次**，不是某一张单。AuditTargetType 没有 FLIGHT_SCHEDULE，
+      // 用 FLIGHT + scheduleId（口径同 MARK_NO_SHOW_BATCH）。
+      targetType: 'FLIGHT',
+      targetId: body.scheduleId,
+      targetLabel:
+        `按航班批量回填票号 · ${body.entries.length} 条 · ` +
+        `成功 ${result.summary.ok} / 失败 ${result.summary.failed} · ` +
+        `实际改动 ${result.summary.changed} 条`,
+      after: {
+        scheduleId: body.scheduleId,
+        requestToken: body.requestToken,
+        entryCount: body.entries.length,
+        ok: result.summary.ok,
+        failed: result.summary.failed,
+        changed: result.summary.changed,
+        /** 处理成功但库里本来就是这个号的条数（重发同一批时它会等于成功数）。 */
+        unchanged: result.summary.unchanged,
+        note: body.note ?? null,
+        // 失败明细进审计：事后追「那天为什么这几条没灌上」不必再翻日志。
+        failures: result.results
+          .filter((r) => !r.ok)
+          .map((r) => ({ orderNumber: r.orderNumber, code: r.code ?? null, error: r.error })),
+      },
+      severity: 'WARNING',
+    });
+
+    // 逐条审计：与单人端点落**同一个** action，出行人维度的审计流水不因为「是批量灌的」而缺一段。
+    for (const r of result.results) {
+      // 一个字段都没变的条目不落审计：这一次库里什么都没动，写一条只会让流水上凭空多出
+      // 几条「又填了一次票号」，事后复盘时把重发看成真操作。
+      if (!r.ok || r.changedFields.length === 0) continue;
+      const entry = body.entries.find((e) => e.passengerId === r.passengerId);
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'BACKFILL_PASSENGER_TICKET',
+        targetType: 'TRAVELER',
+        targetId: r.passengerId,
+        targetLabel: `${r.orderNumber} · ${r.fullName}`,
+        after: {
+          batch: true,
+          scheduleId: body.scheduleId,
+          requestToken: body.requestToken,
+          orderId: r.orderId,
+          pnr: entry?.pnr ?? null,
+          eticketNumber: entry?.eticketNumber ?? null,
+          changedFields: r.changedFields,
+          overwrite: entry?.overwrite === true,
+          note: body.note ?? null,
+        },
+        severity: 'INFO',
       });
     }
 

@@ -1829,6 +1829,72 @@ export const noShowBatchBodySchema = z.object({
 });
 export type NoShowBatchBody = z.infer<typeof noShowBatchBodySchema>;
 
+// ── 按航班批量回填票号（POST /orders/tickets/batch-preview | /orders/tickets/batch；ADMIN/STAFF）──
+//
+// 名单两种进法，**二选一**：粘贴文本 lines，或上传 .xlsx（fileBase64，路由层转成同形文本
+// 再进同一个解析器）。两个都给或都不给一律 400 —— 猜「以哪个为准」必然有一半时候猜错。
+
+export const ticketBatchPreviewBodySchema = z
+  .object({
+    scheduleId: dbIdSchema,
+    // 整块粘贴的名单文本，或前端已经切好的字符串数组（拼回带换行的整块文本走同一套解析）。
+    // 上限 40000 字符 ≈ 500 行「姓名 + PNR + 票号」，与 TICKET_ROSTER_MAX_LINES 同量级。
+    lines: z
+      .union([z.string(), z.array(z.string()).max(600, '名单过长，请分批处理')])
+      .transform((v) => (Array.isArray(v) ? v.join('\n') : v))
+      .pipe(z.string().max(40000, '名单过长，请分批处理'))
+      .optional(),
+    /** 上传的 .xlsx（base64）。与 lines 二选一。 */
+    fileBase64: z.string().min(1).optional(),
+  })
+  .strict()
+  .refine((v) => (v.lines !== undefined && v.lines.trim() !== '') !== (v.fileBase64 !== undefined), {
+    message: '请粘贴出票名单，或上传一份 .xlsx（两者二选一）',
+  });
+export type TicketBatchPreviewBody = z.infer<typeof ticketBatchPreviewBodySchema>;
+
+/**
+ * 单次执行的条目上限。
+ *
+ * 比 no-show 的 50 宽得多：这里一条就是一行 UPDATE（不开事务链、不拆单、不动座位账），
+ * 200 条一批的耗时与 50 条几乎没有区别，而一班几百人的名单分四次点比分十次点省事。
+ * 前端超过这个数会自动分片连发。
+ */
+export const TICKET_BATCH_MAX_ENTRIES = 200;
+
+export const ticketBatchBodySchema = z
+  .object({
+    // 整批一个 requestToken。它**不加锁** —— 写票号本来就是幂等的（库里已经是这个号就
+    // 一个字段都不写），token 只作整批的关联号落进审计，让「同一批重试」在审计里认得出来。
+    requestToken: z.string().min(8).max(64).uuid(),
+    scheduleId: dbIdSchema,
+    entries: z
+      .array(
+        z
+          .object({
+            orderId: dbIdSchema,
+            passengerId: dbIdSchema,
+            pnr: z.union([pnrValueSchema, z.null()]).optional(),
+            eticketNumber: z.union([eticketValueSchema, z.null()]).optional(),
+            /** 库里已有**不同**的号时，必须显式带 true 才覆盖（缺省 = 保守跳过并回 TICKET_CONFLICT）。 */
+            overwrite: z.boolean().optional(),
+          })
+          .strict()
+          .refine((e) => e.pnr != null || e.eticketNumber != null, {
+            message: '每一条至少要有 PNR 或电子票号',
+          }),
+      )
+      .min(1, '请至少勾选一条')
+      .max(TICKET_BATCH_MAX_ENTRIES, `单次最多处理 ${TICKET_BATCH_MAX_ENTRIES} 条，请分批执行`)
+      .refine(
+        (list) => new Set(list.map((e) => e.passengerId)).size === list.length,
+        { message: '同一位出行人只能出现一次，请把该乘客的 PNR 与票号合并到一条里' },
+      ),
+    note: z.string().trim().max(200).optional(),
+  })
+  .strict();
+export type TicketBatchBody = z.infer<typeof ticketBatchBodySchema>;
+
 // ── no-show 报表（GET /orders/no-show/report[/export]；ADMIN/STAFF）──────────────
 // 区间按**去程航班的起飞地当地日**取（与全站「出发日期」同口径），不是 no-show 的操作日期。
 
