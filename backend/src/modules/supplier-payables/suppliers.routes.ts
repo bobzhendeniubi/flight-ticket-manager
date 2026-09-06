@@ -7,7 +7,7 @@
  *   PATCH /finances/suppliers/:id        改（含停用 isActive=false）
  *   PUT   /finances/suppliers/link       给酒店 / 签证产品 / 航班挂或解挂供应商
  *
- * 闸：与财务页同一道 requireFinanceAccess（ADMIN 或 STAFF+财务岗）。应付账是钱的另一半，
+ * 闸：能力 finances.supplier_payables.manage（与财务页同一道：ADMIN 或 STAFF+财务岗）。应付账是钱的另一半，
  * 看得到收入毛利的人才该看得到我们欠谁多少。
  *
  * 为什么不塞进 finances.routes.ts：那个文件已经装着损益 / 导出 / 成本周期 / 汇率四摊事，
@@ -56,7 +56,9 @@ const linkBodySchema = z.object({
 });
 
 export const supplierRoutes: FastifyPluginAsync = async (app) => {
-  const requireFinance = { preHandler: [app.authenticate, app.requireFinanceAccess] };
+  const requireFinance = {
+    preHandler: [app.authenticate, app.requireCapability('finances.supplier_payables.manage')],
+  };
 
   app.get('/suppliers', requireFinance, async (req) => {
     const q = listQuerySchema.parse(req.query ?? {});

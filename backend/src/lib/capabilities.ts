@@ -41,7 +41,12 @@ export type Audience =
   /** 仅代理。代理自助专用入口。 */
   | 'AGENT_ONLY'
   /** 管理员 + 代理（内部员工反而进不去的少数自助入口）。 */
-  | 'ADMIN_AND_AGENT';
+  | 'ADMIN_AND_AGENT'
+  /**
+   * 管理员 + 签证岗。目前只有一处：确认「改自备签」类改单申请。
+   * 自备签既是送签口径也是定价输入，翻它同时改签证台的活儿和这张单的应收，收在签证岗手里。
+   */
+  | 'VISA_DESK';
 
 /**
  * staffRole 为空 = 运营/通用岗。这是 2026-08-25 起的既有隐含约定；
@@ -77,6 +82,8 @@ function audienceGrants(audience: Audience, p: Principal): boolean {
       return isAgent;
     case 'ADMIN_AND_AGENT':
       return isAdmin || isAgent;
+    case 'VISA_DESK':
+      return isAdmin || (isStaff && p.staffRole === StaffRole.VISA_DESK);
     default: {
       // 穷尽检查：新增受众忘了处理会在编译期报错，而不是静默放行。
       const never: never = audience;
@@ -190,6 +197,12 @@ export const CAPABILITIES = {
   },
   'reports.view': { audience: 'FINANCE', 说明: '经营报表：销售、应收、代理欠款、四表导出' },
   'refunds.mark_paid': { audience: 'FINANCE', 说明: '退款标记已打款' },
+  'finances.supplier_payables.manage': {
+    // 应付账是钱的另一半：看得到收入毛利的人才该看得到我们欠谁多少，所以与财务页同一道闸。
+    audience: 'FINANCE',
+    说明: '供应商主数据与应付账单：建单、改单、登记与撤销付款、对账',
+  },
+  'invoices.issue': { audience: 'FINANCE', 说明: '开具 / 作废发票（申请与查询只要登录）' },
   'settlements.manage': { audience: 'OPS', 说明: '生成结算单、推进结算单状态' },
   'settlements.read': { audience: 'OPS_AND_AGENT', 说明: '查看结算单与代理对账单（代理看自己与下级）' },
   'settlement_rates.write': { audience: 'OPS', 说明: '结算价日历与航段结算价维护' },
@@ -263,6 +276,11 @@ export const CAPABILITIES = {
   'change_requests.submit': { audience: 'OPS_AND_AGENT', 说明: '提交改单申请（含批量）' },
   'change_requests.decide': { audience: 'OPS', 说明: '确认 / 驳回改单申请（含批量与待办计数）' },
   'change_requests.view_cost': { audience: 'OPS', 说明: '看申请单里的成本差额（代理侧要裁掉）' },
+  'change_requests.approve_visa_exempt': {
+    // 驳回不动订单，仍对所有运营开放；只有「确认」这一步收在签证岗手里。
+    audience: 'VISA_DESK',
+    说明: '确认「改自备签」类改单申请',
+  },
   'bundle_change_requests.submit': { audience: 'OPS_AND_AGENT', 说明: '提交套餐改档申请' },
   'bundle_change_requests.decide': { audience: 'OPS', 说明: '确认 / 驳回套餐改档申请' },
 

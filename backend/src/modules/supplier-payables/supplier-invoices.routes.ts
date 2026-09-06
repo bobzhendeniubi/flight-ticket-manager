@@ -8,7 +8,7 @@
  *   POST   /finances/supplier-invoices/:id/payments            登记付款
  *   DELETE /finances/supplier-invoices/:id/payments/:paymentId 撤销付款（录错了）
  *
- * 闸：requireFinanceAccess（ADMIN 或 STAFF+财务岗），与财务页同权。
+ * 闸：能力 finances.supplier_payables.manage（ADMIN 或 STAFF+财务岗），与财务页同权。
  * 每个写入口都留审计——钱付出去的每一步都要查得到是谁在什么时候记的。
  */
 import type { FastifyPluginAsync } from 'fastify';
@@ -95,7 +95,9 @@ const paymentBodySchema = z.object({
 });
 
 export const supplierInvoiceRoutes: FastifyPluginAsync = async (app) => {
-  const requireFinance = { preHandler: [app.authenticate, app.requireFinanceAccess] };
+  const requireFinance = {
+    preHandler: [app.authenticate, app.requireCapability('finances.supplier_payables.manage')],
+  };
 
   app.get('/supplier-invoices', requireFinance, async (req) => {
     const q = listQuerySchema.parse(req.query ?? {});

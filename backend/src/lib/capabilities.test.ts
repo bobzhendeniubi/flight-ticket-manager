@@ -50,6 +50,9 @@ const isOps: LegacyPredicate = (role) => role === UserRole.ADMIN || role === Use
 const isOpsOrAgent: LegacyPredicate = (role) =>
   role === UserRole.ADMIN || role === UserRole.STAFF || role === UserRole.AGENT;
 const isAdmin: LegacyPredicate = (role) => role === UserRole.ADMIN;
+/** requireFinanceAccess 的逐字转写。 */
+const isFinance: LegacyPredicate = (role, staffRole) =>
+  role === UserRole.ADMIN || (role === UserRole.STAFF && staffRole === StaffRole.FINANCE);
 
 interface InlineGate {
   /** 内联判断所在位置，改完之后仍应指得准。 */
@@ -371,6 +374,26 @@ const INLINE_GATES: InlineGate[] = [
     来源: 'orders.routes.ts POST /:id/payments-lock 与 /batch/payments-lock（收款复核锁）',
     cap: 'orders.payments_lock',
     legacy: isOps,
+  },
+
+  // ── 第二波新增模块（2026-09-06）────────────────────────────────────────────
+  {
+    来源: 'suppliers.routes.ts / supplier-invoices.routes.ts 的 requireFinance（原 requireFinanceAccess）',
+    cap: 'finances.supplier_payables.manage',
+    legacy: isFinance,
+  },
+  {
+    来源: 'invoices.routes.ts POST /:id/issue 与 /:id/void 的 requireFinance（原 requireFinanceAccess）',
+    cap: 'invoices.issue',
+    legacy: isFinance,
+  },
+  {
+    // 原判断：`role === ADMIN → 放行；role === STAFF && staffRole === VISA_DESK → 放行；其余 403`
+    来源: 'order-change-requests.service.ts assertVisaDeskForVisaExempt（确认改自备签只放行管理员与签证岗）',
+    cap: 'change_requests.approve_visa_exempt',
+    legacy: (role, staffRole) =>
+      role === UserRole.ADMIN ||
+      (role === UserRole.STAFF && staffRole === StaffRole.VISA_DESK),
   },
 ];
 

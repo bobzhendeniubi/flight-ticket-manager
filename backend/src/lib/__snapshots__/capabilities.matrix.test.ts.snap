@@ -3,6 +3,7 @@
 exports[`权限矩阵（角色 × 岗位 → 端点放行） > 全部受保护端点的放行结果与快照一致 1`] = `
 "DELETE /cancellation-policies/:id | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 DELETE /finances/cost/periods/:id | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+DELETE /finances/supplier-invoices/:id/payments/:paymentId | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 DELETE /flight-settlement-rates/:id | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 DELETE /flights/schedules/:scheduleId | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=deny AGENT=deny CUSTOMER=deny ANON=deny
 DELETE /hotel-control/block-periods/:id | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
@@ -47,6 +48,11 @@ GET    /finances/orders | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STA
 GET    /finances/orders/:id/pnl-detail | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 GET    /finances/refunds/pending-payout | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 GET    /finances/summary | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+GET    /finances/supplier-invoices | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+GET    /finances/supplier-invoices/:id | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+GET    /finances/supplier-invoices/:id/reconcile | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+GET    /finances/suppliers | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+GET    /finances/suppliers/:id | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 GET    /finances/usd-fx-rates | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 GET    /finances/usd-fx-rates/effective | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 GET    /flight-settlement-rates | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
@@ -74,6 +80,8 @@ GET    /hotel-control/oversell-cap | ADMIN=allow STAFF:运营=allow STAFF:VISA_D
 GET    /hotel-control/passports.zip | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 GET    /hotel-control/random-tier-shortfall | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 GET    /hotel-control/recent-changes | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+GET    /invoices | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=allow CUSTOMER=allow ANON=deny
+GET    /invoices/:id | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=allow CUSTOMER=allow ANON=deny
 GET    /legacy/dashboard | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 GET    /legacy/passenger-history | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 GET    /legacy/stats | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
@@ -182,6 +190,11 @@ HEAD   /finances/orders | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STA
 HEAD   /finances/orders/:id/pnl-detail | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 HEAD   /finances/refunds/pending-payout | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 HEAD   /finances/summary | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+HEAD   /finances/supplier-invoices | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+HEAD   /finances/supplier-invoices/:id | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+HEAD   /finances/supplier-invoices/:id/reconcile | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+HEAD   /finances/suppliers | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+HEAD   /finances/suppliers/:id | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 HEAD   /finances/usd-fx-rates | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 HEAD   /finances/usd-fx-rates/effective | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 HEAD   /flight-settlement-rates | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
@@ -213,6 +226,9 @@ HEAD   /hotel-control/oversell-cap | ADMIN=allow STAFF:运营=allow STAFF:VISA_D
 HEAD   /hotel-control/passports.zip | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 HEAD   /hotel-control/random-tier-shortfall | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 HEAD   /hotel-control/recent-changes | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+HEAD   /invoices | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=allow CUSTOMER=allow ANON=deny
+HEAD   /invoices/ | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=allow CUSTOMER=allow ANON=deny
+HEAD   /invoices/:id | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=allow CUSTOMER=allow ANON=deny
 HEAD   /legacy/dashboard | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 HEAD   /legacy/passenger-history | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 HEAD   /legacy/stats | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
@@ -311,6 +327,8 @@ PATCH  /finances/cost/hotel-room-type/:id | ADMIN=allow STAFF:运营=allow STAFF
 PATCH  /finances/cost/periods/:id | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 PATCH  /finances/cost/transfer/:id | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 PATCH  /finances/cost/visa/:id | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+PATCH  /finances/supplier-invoices/:id | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+PATCH  /finances/suppliers/:id | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 PATCH  /flights/:flightId | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=deny AGENT=deny CUSTOMER=deny ANON=deny
 PATCH  /flights/schedules/:scheduleId | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=deny STAFF:TICKETING=allow STAFF:ROOM_CONTROL=deny STAFF:FINANCE=deny AGENT=deny CUSTOMER=deny ANON=deny
 PATCH  /fulfillment-tasks/:id | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
@@ -356,6 +374,9 @@ POST   /bundle-change-requests/:id/reject | ADMIN=allow STAFF:运营=allow STAFF
 POST   /cancellation-policies | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 POST   /finances/cost/periods | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 POST   /finances/schedules/:id/cost-lock | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+POST   /finances/supplier-invoices | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+POST   /finances/supplier-invoices/:id/payments | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+POST   /finances/suppliers | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 POST   /flights | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=deny STAFF:TICKETING=allow STAFF:ROOM_CONTROL=deny STAFF:FINANCE=deny AGENT=deny CUSTOMER=deny ANON=deny
 POST   /flights/:flightId/toggle | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=deny AGENT=deny CUSTOMER=deny ANON=deny
 POST   /flights/schedules | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=deny STAFF:TICKETING=allow STAFF:ROOM_CONTROL=deny STAFF:FINANCE=deny AGENT=deny CUSTOMER=deny ANON=deny
@@ -383,6 +404,9 @@ POST   /hold-orders/group | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow
 POST   /hold-orders/preview-plan | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 POST   /hotel-control/block-periods | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 POST   /hotel-control/passports-by-names.zip | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+POST   /invoices/:id/issue | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+POST   /invoices/:id/void | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+POST   /invoices/requests | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=allow CUSTOMER=allow ANON=deny
 POST   /marketing/posters/flight-route | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 POST   /ocr/passport | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=allow CUSTOMER=deny ANON=deny
 POST   /order-change-requests/:id/approve | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
@@ -487,6 +511,7 @@ POST   /users/:id/reset-password | ADMIN=allow STAFF:运营=allow STAFF:VISA_DES
 POST   /users/staff | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=deny AGENT=deny CUSTOMER=deny ANON=deny
 POST   /waitlist | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=allow CUSTOMER=allow ANON=deny
 PUT    /agents/:id/commission-rules | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+PUT    /finances/suppliers/link | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 PUT    /finances/usd-fx-rates | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 PUT    /flight-settlement-rates/batch | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 PUT    /flights/:flightId/baggage-policies | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny

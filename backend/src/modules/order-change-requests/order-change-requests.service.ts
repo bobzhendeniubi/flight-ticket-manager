@@ -29,6 +29,7 @@ import {
   NotFoundError,
 } from '../../lib/errors.js';
 import { getDescendantAgentIds } from '../../lib/agent-tree.js';
+import { hasCapability, type Capability } from '../../lib/capabilities.js';
 import { isFeatureEnabled } from '../../lib/feature-flags.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { determineFlightLegItems } from '../orders/ticketing-cap.js';
@@ -130,6 +131,11 @@ export interface OrderChangeRequestActor {
    * 改岗后下一个请求即生效。目前只有「确认改自备签申请」这一处判它。
    */
   staffRole?: StaffRole | null;
+}
+
+/** 本文件内联闸的唯一入口，与路由层的 requireCapability 同一张表（lib/capabilities.ts）。 */
+function actorCan(actor: OrderChangeRequestActor, cap: Capability): boolean {
+  return hasCapability({ role: actor.role, staffRole: actor.staffRole }, cap);
 }
 
 /**
@@ -288,7 +294,7 @@ function serializeOrderChangeRequest(
 
 /** 运营（含管理员）才看得到成本。 */
 function canSeeCost(actor: OrderChangeRequestActor): boolean {
-  return actor.role === UserRole.ADMIN || actor.role === UserRole.STAFF;
+  return actorCan(actor, 'change_requests.view_cost');
 }
 
 /** 金额千分位（¥4,800）：摘要是给人看的，别把裸数字甩上去。 */
@@ -363,7 +369,7 @@ export class OrderChangeRequestsService {
   }
 
   private assertOps(actor: OrderChangeRequestActor, what: string): void {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'change_requests.decide')) {
       throw new ForbiddenError(`仅运营/管理员可${what}改单申请`);
     }
   }
@@ -408,11 +414,7 @@ export class OrderChangeRequestsService {
 
   /** flag 开着时，当前身份能提哪几类（前端据此决定下拉里出不出这三项）。 */
   async availableKinds(actor: OrderChangeRequestActor): Promise<{ kinds: OrderChangeKind[] }> {
-    if (
-      actor.role !== UserRole.ADMIN &&
-      actor.role !== UserRole.STAFF &&
-      actor.role !== UserRole.AGENT
-    ) {
+    if (!actorCan(actor, 'change_requests.submit')) {
       throw new ForbiddenError('无权限查看改单申请');
     }
     const base: OrderChangeKind[] = [
@@ -513,7 +515,7 @@ export class OrderChangeRequestsService {
   /** 提交人身份：AGENT 拿到自己的 agentId（后面按它比归属）；运营返回 null（可代提）。 */
   private async resolveSubmitterAgentId(actor: OrderChangeRequestActor): Promise<string | null> {
     if (actor.role === UserRole.AGENT) return this.resolveOwnAgentId(actor.userId);
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'change_requests.submit')) {
       throw new ForbiddenError('无权限提交改单申请');
     }
     return null;
@@ -1500,8 +1502,7 @@ export class OrderChangeRequestsService {
    * 只有签证岗清楚。所以确认这一步收在签证岗手里；驳回不动订单，仍对所有运营开放。
    */
   private assertVisaDeskForVisaExempt(actor: OrderChangeRequestActor): void {
-    if (actor.role === UserRole.ADMIN) return;
-    if (actor.role === UserRole.STAFF && actor.staffRole === StaffRole.VISA_DESK) return;
+    if (actorCan(actor, 'change_requests.approve_visa_exempt')) return;
     throw new ForbiddenError(ORDER_CHANGE_VISA_EXEMPT_DESK_ONLY_MESSAGE);
   }
 

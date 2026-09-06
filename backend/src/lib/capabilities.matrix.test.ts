@@ -68,6 +68,9 @@ import { publicRoutes } from '../modules/public/public.routes.js';
 import { cancellationRoutes } from '../modules/cancellation/cancellation.routes.js';
 import { reminderRoutes } from '../modules/reminders/reminders.routes.js';
 import { financesRoutes } from '../modules/finances/finances.routes.js';
+import { supplierRoutes } from '../modules/supplier-payables/suppliers.routes.js';
+import { supplierInvoiceRoutes } from '../modules/supplier-payables/supplier-invoices.routes.js';
+import { invoiceRoutes } from '../modules/invoices/invoices.routes.js';
 import { aiRoutes } from '../modules/ai/ai.routes.js';
 import { reviewRoutes, orderReviewRoutes } from '../modules/reviews/reviews.routes.js';
 import {
@@ -163,6 +166,9 @@ async function buildRouteTable(): Promise<{ app: FastifyInstance; routes: Captur
   await app.register(cancellationRoutes, { prefix: '/cancellation-policies' });
   await app.register(reminderRoutes, { prefix: '/reminders' });
   await app.register(financesRoutes, { prefix: '/finances' });
+  await app.register(supplierRoutes, { prefix: '/finances' });
+  await app.register(supplierInvoiceRoutes, { prefix: '/finances' });
+  await app.register(invoiceRoutes, { prefix: '/invoices' });
   await app.register(aiRoutes, { prefix: '/ai' });
   await app.register(reviewRoutes, { prefix: '/reviews' });
   await app.register(ocrRoutes, { prefix: '/ocr' });

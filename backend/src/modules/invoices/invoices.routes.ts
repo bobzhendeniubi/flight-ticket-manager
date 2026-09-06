@@ -9,7 +9,7 @@
  *
  * ⚠️ 与订单上的「开票」三个布尔位（出票进度）无关，本路由不读也不写它们。
  *
- * 闸：申请与查询任意登录用户（服务层按角色裁范围）；开具 / 作废走 requireFinanceAccess，
+ * 闸：申请与查询任意登录用户（服务层按角色裁范围）；开具 / 作废走能力 invoices.issue，
  * 与财务页同权 —— 谁能看毛利，谁才能开票号。
  */
 import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
@@ -71,7 +71,7 @@ async function buildRequester(req: FastifyRequest): Promise<InvoiceRequester> {
 
 export const invoiceRoutes: FastifyPluginAsync = async (app) => {
   const requireLogin = { preHandler: [app.authenticate] };
-  const requireFinance = { preHandler: [app.authenticate, app.requireFinanceAccess] };
+  const requireFinance = { preHandler: [app.authenticate, app.requireCapability('invoices.issue')] };
 
   app.get('/', requireLogin, async (req) => {
     const q = listQuerySchema.parse(req.query ?? {});
