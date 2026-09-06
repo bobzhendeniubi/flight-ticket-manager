@@ -1,0 +1,192 @@
+/**
+ * 收款对账台 / 挂账池 入参校验。
+ */
+import { z } from 'zod';
+import {
+  PaymentMethod,
+  paymentMethodSchema,
+  receiptStatusSchema,
+} from './enums.js';
+import { proofUrlSchema } from './lib/proof-url.js';
+
+/**
+ * 支持导入的收单平台。原本长在后端 receipts.statement.ts —— 那份文件同时还装着
+ * 各平台的表头解析规则，是服务端的活儿；平台清单本身却是契约的一部分（前端上传
+ * 流水时要拿它渲染平台下拉），所以清单搬到这里，解析规则留在后端并从这里 import。
+ */
+export const STATEMENT_PLATFORMS = [
+  'CMB_QR',
+  'YISHOUBAO',
+  'XINGYIFU',
+  'HUISHENGHUO',
+] as const;
+export type StatementPlatform = (typeof STATEMENT_PLATFORMS)[number];
+
+/** 进账金额：> 0，封顶（防手误录入天文数字）。 */
+const amountCnySchema = z.number().positive().max(100_000_000);
+
+/** 日期筛选字段：YYYY-MM-DD（闭区间，后端按北京时换算成时间戳边界）。 */
+const dayStrSchema = z.string().regex(/^\d{4}-\d{2}-\d{2}$/);
+
+/** 登记新进账（财务后台手动）。 */
+export const registerReceiptSchema = z.object({
+  amountCny: amountCnySchema,
+  method: paymentMethodSchema,
+  proofUrl: proofUrlSchema.optional(),
+  payerNote: z.string().max(500).optional(),
+  // 到账时间（财务可手填）；缺省 = 现在
+  receivedAt: z.coerce.date().optional(),
+  // 疑似归属订单（仅提示，不等于已认领）
+  orderHintId: z.string().min(1).max(64).optional(),
+});
+export type RegisterReceiptInput = z.infer<typeof registerReceiptSchema>;
+
+/** 运营水单登记（OPS_CLAIM）财务核实：可选带收单平台交易流水号（写 externalTxnId，天然防同号流水重复入池）。 */
+export const verifyClaimReceiptSchema = z.object({
+  externalTxnId: z.string().trim().max(128).optional(),
+});
+export type VerifyClaimReceiptInput = z.infer<typeof verifyClaimReceiptSchema>;
+
+/** 认领进账到订单（原子、全有或全无）。 */
+export const allocateReceiptSchema = z.object({
+  orderId: z.string().min(1).max(64),
+  amountCny: amountCnySchema,
+});
+export type AllocateReceiptInput = z.infer<typeof allocateReceiptSchema>;
+
+/**
+ * 批量认款（自动配对建议一键执行）。
+ * 编排层——不改单笔语义：逐组复用 allocate 内核（各自独立事务、各自审计），
+ * 某组失败不影响其它组，逐组回结果。上限 100 组防一次请求打满。
+ */
+export const allocateBatchSchema = z.object({
+  items: z
+    .array(
+      z.object({
+        receiptId: z.string().min(1).max(64),
+        orderId: z.string().min(1).max(64),
+        amountCny: amountCnySchema,
+      }),
+    )
+    .min(1)
+    .max(100),
+});
+export type AllocateBatchInput = z.infer<typeof allocateBatchSchema>;
+
+/** 退款剩余未认领部分。 */
+export const refundReceiptSchema = z.object({
+  note: z.string().min(1).max(500),
+});
+export type RefundReceiptInput = z.infer<typeof refundReceiptSchema>;
+
+/** 挂账池列表过滤。 */
+export const listReceiptsQuerySchema = z
+  .object({
+    status: receiptStatusSchema.optional(),
+    // '1' = 只回未认完的（OPEN + PARTIALLY_ALLOCATED）——认款工作台专用，
+    // 防止 take 500 被大量已认款记录占满、把更早的未认款流水挤出池子
+    unallocatedOnly: z.literal('1').optional(),
+    // 关键字：匹配 receiptNo / payerNote / orderHintId / externalTxnId
+    q: z.string().max(120).optional(),
+    // 疑似归属订单 id 精确筛：订单详情「挂账池里有没有本单待认领流水」提示专用
+    orderHintId: z.string().min(1).max(64).optional(),
+    // 到账日期闭区间（按流水交易日期字段 receivedAt，北京时）
+    from: dayStrSchema.optional(),
+    to: dayStrSchema.optional(),
+  })
+  .refine((query) => !query.from || !query.to || query.from <= query.to, {
+    message: '日期区间无效：开始日期晚于结束日期',
+  });
+export type ListReceiptsQuery = z.infer<typeof listReceiptsQuerySchema>;
+
+/**
+ * 认款工作台待收款订单候选过滤。
+ * - from/to：按订单下单日期 createdAt（与候选列表本身「近 400 单」排序口径同轴，
+ *   且 createdAt 恒有值——不会像出发日那样对无航段单为空而把待收订单筛没）。
+ * - q：服务端匹配订单号 / 联系人 / 代理名（公司名或代理联系人），
+ *   跨全量候选搜索，不再受前端已加载 200 条限制。
+ */
+export const matchCandidatesQuerySchema = z
+  .object({
+    from: dayStrSchema.optional(),
+    to: dayStrSchema.optional(),
+    q: z.string().max(120).optional(),
+  })
+  .refine((query) => !query.from || !query.to || query.from <= query.to, {
+    message: '日期区间无效：开始日期晚于结束日期',
+  });
+export type MatchCandidatesQuery = z.infer<typeof matchCandidatesQuerySchema>;
+
+/** 认款建议一次最多算多少笔流水（与挂账池列表的未认领上限 UNALLOCATED_CAP 对齐）。 */
+export const MATCH_SUGGEST_MAX_RECEIPTS = 1000;
+/** 候选订单默认回看多少天（按下单时间）；可调，上限一年。 */
+export const MATCH_SUGGEST_DEFAULT_SINCE_DAYS = 90;
+
+/**
+ * 认款建议（POST /receipts/match/suggest）——只出建议，不写库。
+ * - receiptIds 缺省 = 全部未认完的流水导入 / 运营水单登记；给了则只算这些（仍须未认完）。
+ * - sinceDays：候选订单按下单时间回看的天数（默认 90）。
+ */
+export const suggestMatchesSchema = z.object({
+  receiptIds: z.array(z.string().min(1).max(64)).max(MATCH_SUGGEST_MAX_RECEIPTS).optional(),
+  sinceDays: z.number().int().min(1).max(365).optional(),
+});
+export type SuggestMatchesInput = z.infer<typeof suggestMatchesSchema>;
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 二维码流水导入（收单平台对账单）
+// ─────────────────────────────────────────────────────────────────────────────
+
+// base64 xlsx 上限 ~12MB（收单平台单日流水远小于此；防误传超大文件）
+const STATEMENT_FILE_MAX_BASE64 = 12 * 1024 * 1024;
+
+/** 解析流水文件（仅预览，不写库）。 */
+export const parseStatementSchema = z.object({
+  platform: z.enum(STATEMENT_PLATFORMS, {
+    required_error: '请先选择流水平台',
+    invalid_type_error: '请先选择流水平台',
+  }),
+  fileBase64: z.string().min(1).max(STATEMENT_FILE_MAX_BASE64),
+});
+export type ParseStatementInput = z.infer<typeof parseStatementSchema>;
+
+/**
+ * 导入流水行（预览确认后提交；服务端按 externalTxnId 唯一索引兜底去重）。
+ * - 流水号 trim：防 " TXN1" 与 "TXN1" 被当成两笔分别入库（审计发现#3）。
+ * - 金额加「round 到分后 ≥ 0.01」：防分以下金额 round 成 0 生成僵尸进账（审计发现#6）。
+ * - 方式白名单：收单流水只可能是微信/支付宝/银行卡——AGENT_PREPAYMENT 是内部记账
+ *   方式，不允许经流水导入伪造（审计发现#1 的可行部分）。
+ */
+export const importStatementSchema = z.object({
+  platform: z.enum(STATEMENT_PLATFORMS, {
+    required_error: '请先选择流水平台',
+    invalid_type_error: '请先选择流水平台',
+  }),
+  rows: z
+    .array(
+      z.object({
+        externalTxnId: z.string().trim().min(4).max(64),
+        amountCny: amountCnySchema.refine(
+          (v) => Math.round(v * 100) / 100 >= 0.01,
+          '金额需不少于 0.01 元',
+        ),
+        method: z.enum([PaymentMethod.WECHAT_PAY, PaymentMethod.ALIPAY, PaymentMethod.BANK_CARD]),
+        receivedAt: z.coerce.date(),
+        payerNote: z.string().max(500).optional(),
+      }),
+    )
+    .min(1)
+    .max(2000),
+});
+export type ImportStatementInput = z.infer<typeof importStatementSchema>;
+
+/** 流水核对表导出过滤（到账日期闭区间，北京时；缺省全量分页导出）。 */
+export const exportStatementQuerySchema = z
+  .object({
+    from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+  })
+  .refine((q) => !q.from || !q.to || q.from <= q.to, {
+    message: '导出区间无效：开始日期晚于结束日期',
+  });
+export type ExportStatementQuery = z.infer<typeof exportStatementQuerySchema>;

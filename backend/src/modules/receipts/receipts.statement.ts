@@ -21,14 +21,11 @@ import { businessDateISO, businessDateTime } from '../../lib/business-time.js';
 /** 单文件最多解析行数（收单平台单日流水远小于此；防误传超大文件拖垮内存）。 */
 export const STATEMENT_MAX_ROWS = 2000;
 
-/** 支持的平台及其表头/业务规则注册表。 */
-export const STATEMENT_PLATFORMS = [
-  'CMB_QR',
-  'YISHOUBAO',
-  'XINGYIFU',
-  'HUISHENGHUO',
-] as const;
-export type StatementPlatform = (typeof STATEMENT_PLATFORMS)[number];
+// 平台清单是契约的一部分（前端上传流水要拿它渲染下拉），已搬进 @ftm/contracts；
+// 这里 re-export，本文件既有的 import 方（service / routes / 单测）照旧从这里取。
+import { STATEMENT_PLATFORMS, type StatementPlatform } from '@ftm/contracts/receipts';
+
+export { STATEMENT_PLATFORMS, type StatementPlatform };
 
 /** 解析出的一行流水（未做 DB 去重——那步在 service 里对照现库；ID 此处仍为平台原单号）。 */
 export interface StatementParsedRow {
