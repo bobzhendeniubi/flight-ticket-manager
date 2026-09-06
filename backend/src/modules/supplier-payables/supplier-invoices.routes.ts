@@ -24,6 +24,7 @@ import {
   SUPPLIER_PAY_METHODS,
   updateSupplierInvoice,
 } from './supplier-invoices.service.js';
+import { reconcileSupplierInvoice } from './supplier-payables.reconcile.js';
 
 const dateStr = z.string().regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD');
 const monthStr = z.string().regex(/^\d{4}-(0[1-9]|1[0-2])$/u, '月份格式应为 YYYY-MM');
@@ -113,6 +114,29 @@ export const supplierInvoiceRoutes: FastifyPluginAsync = async (app) => {
   app.get('/supplier-invoices/:id', requireFinance, async (req) => {
     const { id } = req.params as { id: string };
     return { invoice: await getSupplierInvoice(id) };
+  });
+
+  /**
+   * 对账：把这张账单期次内「系统算出来的成本」与账单金额并排列出来，差额标级。
+   * 只读——不改成本口径，也不回写账单。差多少由人判断，系统只负责标出来。
+   */
+  app.get('/supplier-invoices/:id/reconcile', requireFinance, async (req) => {
+    const { id } = req.params as { id: string };
+    const result = await reconcileSupplierInvoice(id);
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'VIEW_FINANCES',
+      targetType: 'SYSTEM',
+      targetId: 'supplier-invoice-reconcile',
+      targetLabel: `应付对账 · ${result.invoice.supplierName}`,
+      after: {
+        invoiceId: id,
+        systemTotalCny: result.systemSide.totalCny,
+        invoiceCny: result.invoice.amountCny,
+        diffLevel: result.diff.level,
+      },
+    });
+    return result;
   });
 
   app.post('/supplier-invoices', requireFinance, async (req) => {
