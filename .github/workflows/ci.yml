@@ -30,6 +30,11 @@ jobs:
       - name: Prisma generate
         run: npm run prisma:generate
 
+      # 契约包要先编：三端的 tsc -b 都有指向它的项目引用，dist 不在就编不过；
+      # vitest 也是从 node_modules/@ftm/contracts 的 dist 里加载它。
+      - name: Build contracts
+        run: npm run build:contracts
+
       # 后端真值闸：build + 单测（集成测试需 Postgres，本地跑，CI 不含）
       - name: Backend build
         run: npm run build --workspace=backend
@@ -98,6 +103,11 @@ jobs:
       - name: Prisma generate
         run: npm run prisma:generate
 
+      # 契约包要先编：三端的 tsc -b 都有指向它的项目引用，dist 不在就编不过；
+      # vitest 也是从 node_modules/@ftm/contracts 的 dist 里加载它。
+      - name: Build contracts
+        run: npm run build:contracts
+
       # tests/integration/setup.ts 会自动把 DATABASE_URL 切到 TEST_DATABASE_URL 再
       # 跑 prisma migrate deploy 同步 schema；这里的 DATABASE_URL 只是让 env.ts 启动
       # 校验通过的占位值，实际不会被拿去连库。
@@ -161,6 +171,11 @@ jobs:
 
       - name: Prisma generate
         run: npm run prisma:generate
+
+      # 契约包要先编：三端的 tsc -b 都有指向它的项目引用，dist 不在就编不过；
+      # vitest 也是从 node_modules/@ftm/contracts 的 dist 里加载它。
+      - name: Build contracts
+        run: npm run build:contracts
 
       # CI 上要连系统依赖一起装（本地 npm run e2e:install 不带 --with-deps，免得要 sudo）
       - name: Install Playwright chromium
