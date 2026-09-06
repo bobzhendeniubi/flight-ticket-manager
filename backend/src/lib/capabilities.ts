@@ -31,7 +31,7 @@ export type Audience =
   | 'OPS_AND_AGENT'
   /** 任何已登录账号（含客户）。守卫层只要求登录，真正的口径在业务里逐单判归属。 */
   | 'ANY_AUTHENTICATED'
-  /** 管理员 + 财务岗。对应既有的 requireFinanceAccess。 */
+  /** 管理员 + 财务岗。即原来的 requireFinanceAccess 那道闸。 */
   | 'FINANCE'
   /**
    * 管理员 + 运营岗 + 票务岗（2026-08-25 拍板的「航班维护岗」）。
@@ -100,7 +100,7 @@ function audienceGrants(audience: Audience, p: Principal): boolean {
  * · payments.verify / payments.unverified 走的是 OPS 而不是 FINANCE——错误文案写着
  *   「仅财务/运营/管理员」，但代码只判 ADMIN||STAFF，任何岗位的员工都能核实到账；
  * · 收款对账台（receipts.*）与成本维护（finances.cost.*）同样是 OPS 而非 FINANCE；
- * · 真正走 requireFinanceAccess 的只有财务页与经营报表两块。
+ * · 走财务岗那道闸的是财务页、经营报表、供应商应付账与发票开具四块。
  */
 export const CAPABILITIES = {
   // ── 订单 ────────────────────────────────────────────────────────────────
