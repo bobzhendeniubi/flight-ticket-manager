@@ -124,8 +124,10 @@ export const orderChangeRequestRoutes: FastifyPluginAsync = async (app) => {
   app.post('/:id/approve', { preHandler: [app.authenticate, requireOps] }, async (req) => {
     const { id } = req.params as { id: string };
     const body = decideOrderChangeRequestBodySchema.parse(req.body ?? {});
+    // staffRole 逐请求从 User 表取回（authenticate 写进 req.staffRole），改岗后下一个
+    // 请求即生效。确认「改自备签」这一类要判岗，别的类不看它。
     const { request, order, audit } = await service.approve(
-      { userId: req.user.sub, role: req.user.role },
+      { userId: req.user.sub, role: req.user.role, staffRole: req.staffRole },
       id,
       body,
     );
@@ -185,7 +187,7 @@ export const orderChangeRequestRoutes: FastifyPluginAsync = async (app) => {
   app.post('/batch-approve', { preHandler: [app.authenticate, requireOps] }, async (req) => {
     const body = batchApproveOrderChangeRequestBodySchema.parse(req.body);
     const { approved, failed, results, approvedRequests } = await service.batchApprove(
-      { userId: req.user.sub, role: req.user.role },
+      { userId: req.user.sub, role: req.user.role, staffRole: req.staffRole },
       body,
     );
     for (const { request, audit } of approvedRequests) {

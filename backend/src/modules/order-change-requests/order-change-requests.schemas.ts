@@ -120,6 +120,10 @@ export const decideOrderChangeRequestBodySchema = z.object({
     .min(1)
     .max(200, '放行原因最多 200 字')
     .optional(),
+  // 取消单程确认专用：预检里「需要回执」的提示（最典型是该段已出票，取消后要票务撤名单/退票）
+  // 的「我已知悉」。这是**点确认的运营**做的判断 —— 提申请的人看不到出票进度，也勾不了。
+  // 缺省 false：有需回执的提示而没勾，取消航段通道会 400 ACKNOWLEDGEMENT_REQUIRED，绝不静默放行。
+  acknowledgeWarnings: z.boolean().optional(),
 });
 export type DecideOrderChangeRequestBody = z.infer<typeof decideOrderChangeRequestBodySchema>;
 
