@@ -534,9 +534,12 @@ model Flight {
   //   + businessUpgradeCnyPerLeg，商务舱自身 basePrice/fareBuckets 不再参与计价。
   // 关闭（默认）：行为与历史完全一致（商务舱按自身 basePrice/阶梯定价）。派生在单一计价点 PricingService.calculatePrice 注入。
   businessPriceLinked      Boolean @default(false)
+  // 应付账挂的供应商（包机款付给哪家航司/包机方）。可空且**不回填**存量。
+  supplierId      String?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
+  supplier        Supplier?             @relation(fields: [supplierId], references: [id], onDelete: SetNull)
   schedules       FlightSchedule[]
   costPeriods     FlightCostPeriod[]
   baggagePolicies FlightBaggagePolicy[]
@@ -545,6 +548,7 @@ model Flight {
   returnBundles   Bundle[]              @relation("BundleReturnFlight")
 
   @@unique([flightNumber])
+  @@index([supplierId])
   @@index([originCode, destinationCode])
   marketingPosters MarketingPoster[]
 }
@@ -1160,13 +1164,18 @@ model Hotel {
   amenities   String[] // e.g., ["wifi", "breakfast", "pool"]
   photos      String[] // S3 URLs
   isActive    Boolean  @default(true)
+  // 应付账挂的供应商（净房账单开给谁）。可空且**不回填**存量：没挂就是没挂，
+  // 应付账单侧按「未挂供应商」如实展示，绝不靠名字猜对应关系。
+  supplierId  String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   roomTypes    HotelRoomType[]
   blockPeriods HotelBlockPeriod[]
+  supplier     Supplier?          @relation(fields: [supplierId], references: [id], onDelete: SetNull)
 
   @@index([cityCode])
+  @@index([supplierId])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1327,12 +1336,18 @@ model Visa {
   requiredDocs       String[] // e.g., ["passport_scan", "photo", "itinerary"]
   // 签证公司/代办渠道名（财务对账用——核对某笔签证金额属于哪家供应商的账单）
   supplier           String?
+  // 应付账挂的供应商实体。与上面那个自由文本 supplier 并存：文本是老口径，谁都能随手写，
+  // 不动它免得存量展示变样；本列是结构化归属，只给应付账单/对账用。可空且**不回填**。
+  supplierId         String?
   soldCount          Int                 @default(0) // 已售份数（展示用，seed 填充）
   isActive           Boolean             @default(true)
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
 
-  orderItems OrderItem[]
+  orderItems    OrderItem[]
+  supplierEntity Supplier?  @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+
+  @@index([supplierId])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1436,6 +1451,46 @@ model UsdFxRate {
   updatedBy     String? // 最近更新人 userId（审计冗余，展示"谁改的"）
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 供应商主数据 —— 我们要把钱付出去的那一端（航司 / 酒店 / 签证公司 / 车队）。
+//
+// 此前系统里只有「单价 / 成本」，没有「这笔成本付给谁」：航司包机款、酒店净房账单、
+// 签证公司美金账单全在 Excel 和微信里，对不上就翻聊天记录。本表只是那摊账的抬头，
+// **不参与任何成本计算口径** —— 毛利照旧按各产品自己的成本字段算，这里一个字都不改。
+//
+// currency = 该供应商开账单的币种（签证公司常年开美金）。CNY 之外的账单要填汇率，
+// 折算出的 CNY 才是入账权威（与包机成本汇率四元组同一套做法）。
+// ─────────────────────────────────────────────────────────────────────────────
+enum SupplierType {
+  AIRLINE // 航司 / 包机方
+  HOTEL // 酒店 / 地接房
+  VISA_AGENCY // 签证公司 / 代办
+  TRANSFER // 车队 / 地面服务
+  OTHER // 其他
+}
+
+model Supplier {
+  id           String       @id @default(cuid())
+  type         SupplierType
+  name         String
+  /// 结算币种（ISO 4217）。账单默认按它开，逐张仍可覆盖。
+  currency     String       @default("CNY") @db.VarChar(3)
+  contactName  String?
+  contactPhone String?
+  note         String?
+  isActive     Boolean      @default(true)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  hotels  Hotel[]
+  visas   Visa[]
+  flights Flight[]
+
+  // 同类型下重名没有意义（酒店类型里只该有一家「岘港明月」）；跨类型可同名。
+  @@unique([type, name])
+  @@index([type, isActive])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
