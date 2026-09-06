@@ -6,7 +6,7 @@
  *   POST /payments/:paymentId/transfer      ADMIN/STAFF 转移已成功收款
  *   GET  /payments/:id                      查询支付状态（登录用户）
  */
-import type { FastifyPluginAsync } from 'fastify';
+import type { FastifyPluginAsync, FastifyRequest } from 'fastify';
 import { z } from 'zod';
 import { PaymentMethod, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
@@ -23,6 +23,12 @@ import {
 } from './payments.schemas.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { appPublicUrl } from '../../config/env.js';
+import { hasCapability, type Capability } from '../../lib/capabilities.js';
+
+/** 本文件内联权限判断的唯一入口，与 preHandler 的 requireCapability 同一张表。 */
+function can(req: FastifyRequest, cap: Capability): boolean {
+  return hasCapability({ role: req.user.role, staffRole: req.staffRole }, cap);
+}
 
 const PROVIDER_TO_METHOD: Record<string, PaymentMethod> = {
   wechat: PaymentMethod.WECHAT_PAY,
@@ -82,7 +88,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     confirmDuplicate: z.boolean().optional(),
   });
   app.post('/manual-confirm', { preHandler: [app.authenticate] }, async (req, reply) => {
-    if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
+    if (!can(req, 'payments.confirm')) {
       return reply.status(403).send({ error: '仅运营/管理员可确认收款' });
     }
     const body = manualConfirmSchema.parse(req.body);
@@ -118,7 +124,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     reason: z.string().trim().min(4).max(200),
   });
   app.post('/:paymentId/reverse', { preHandler: [app.authenticate] }, async (req, reply) => {
-    if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
+    if (!can(req, 'payments.reverse')) {
       return reply.status(403).send({ error: '仅运营/管理员可撤销收款' });
     }
     const { paymentId } = req.params as { paymentId: string };
@@ -133,7 +139,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
   // ── 已成功收款转移到另一订单 ADMIN/STAFF ──
   // POST /payments/:paymentId/transfer
   app.post('/:paymentId/transfer', { preHandler: [app.authenticate] }, async (req, reply) => {
-    if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
+    if (!can(req, 'payments.transfer')) {
       return reply.status(403).send({ error: '仅运营/管理员可转移收款' });
     }
     const { paymentId } = req.params as { paymentId: string };
@@ -148,7 +154,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
   // ── 财务核实一笔人工录入的收款（到账双状态第二段）ADMIN/STAFF ──
   // POST /payments/:paymentId/verify
   app.post('/:paymentId/verify', { preHandler: [app.authenticate] }, async (req, reply) => {
-    if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
+    if (!can(req, 'payments.verify')) {
       return reply.status(403).send({ error: '仅财务/运营/管理员可核实到账' });
     }
     const { paymentId } = req.params as { paymentId: string };
@@ -158,7 +164,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
   // ── 待财务核实的订单收款清单（对账台异常队列）ADMIN/STAFF ──
   // GET /payments/unverified
   app.get('/unverified', { preHandler: [app.authenticate] }, async (req, reply) => {
-    if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
+    if (!can(req, 'payments.verify')) {
       return reply.status(403).send({ error: '仅财务/运营/管理员可查看待核实清单' });
     }
     return { items: await service.listUnverifiedPayments() };
@@ -188,7 +194,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     batchId: z.string().min(8).max(64).optional(),
   });
   app.post('/batch-confirm', { preHandler: [app.authenticate] }, async (req, reply) => {
-    if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
+    if (!can(req, 'payments.confirm')) {
       return reply.status(403).send({ error: '仅运营/管理员可确认收款' });
     }
     const body = batchConfirmSchema.parse(req.body);

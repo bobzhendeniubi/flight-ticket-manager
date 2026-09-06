@@ -13,6 +13,7 @@
 import { SeatLockStatus, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
+import { hasCapability } from '../../lib/capabilities.js';
 import type { CreateSeatLockBody } from './seat-locks.schemas.js';
 import { heldSeatsForSeatClass } from '../hold-orders/held-seats.js';
 
@@ -147,7 +148,7 @@ export class SeatLockService {
     if (!lock) throw new NotFoundError('锁位不存在');
 
     const isOwner = lock.userId === requester.userId;
-    const isOps = requester.role === UserRole.ADMIN || requester.role === UserRole.STAFF;
+    const isOps = hasCapability({ role: requester.role }, 'seat_locks.release_any');
     if (!isOwner && !isOps) throw new ForbiddenError('只能释放自己的锁位');
 
     // 原子 CAS：只在仍 ACTIVE 时释放（已消费/已过期/已释放不可重复操作）
