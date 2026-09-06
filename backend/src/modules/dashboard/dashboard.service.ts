@@ -6,7 +6,9 @@
  * - 变化率：本期 vs 上期（昨天 / 上月）
  * - 活跃代理：最近 30 天有订单的代理数
  */
-import { OrderStatus, Prisma, ReminderStatus, ReminderPriority } from '@prisma/client';
+import { Prisma, ReminderStatus, ReminderPriority } from '@prisma/client';
+// 订单状态集合全站唯一一份（审查根因 R2）：营收 / 日趋势 / 活跃代理走「已付款族」= 占座 − PENDING_PAYMENT。
+import { PAID_LIKE_STATUSES } from '../../lib/order-status-sets.js';
 import { prisma } from '../../db/prisma.js';
 import { businessDateISO, startOfBusinessDayUtc } from '../../lib/business-time.js';
 import { getAlerts } from '../hotel-control/hotel-control.service.js';
@@ -25,10 +27,6 @@ function parseLastRunAtMs(value: string | undefined): number | null {
     return null;
   }
 }
-
-const PAID_LIKE_STATUSES: OrderStatus[] = [
-  'PAID', 'PROCESSING', 'TICKETED', 'COMPLETED', 'CHANGE_REQUESTED', 'CHANGED',
-];
 
 export class DashboardService {
   /**

@@ -88,6 +88,16 @@ import { computePerPaxShares, spreadableAdjustmentCny } from './per-pax-share.js
 import { groupPassengerAdjustments } from './order-adjustment-lines.js';
 // 订单金额单一口径（审查根因 R2）：DTO 的应收 / 尾款从这里取；本文件写路径里的内联清账公式本批不动。
 import { balanceDueCny, payableCny } from '../../lib/order-money.js';
+// 订单状态集合全站唯一一份：占座 / 释放 / 取消族终态在下方原名再导出；代理成交额只认已付款三态。
+// 三个占座/释放/取消族集合起 _LIB 别名再用 `export const` 落成本模块自己的绑定：单测里
+// `vi.mock('./orders.service.js', importOriginal)` 会展开模块命名空间，直接 `export { 导入绑定 }`
+// 在 vite 的 SSR 变换下会生成引用未定义标识符的 getter（ReferenceError），本地 const 则没有这个坑。
+import {
+  AGENT_STATS_PAID_STATUSES,
+  FULFILLMENT_TERMINATING_STATUSES as FULFILLMENT_TERMINATING_STATUSES_LIB,
+  SEAT_HOLDING_STATUSES as SEAT_HOLDING_STATUSES_LIB,
+  SEAT_RELEASING_STATUSES as SEAT_RELEASING_STATUSES_LIB,
+} from '../../lib/order-status-sets.js';
 import {
   deriveRoomsToMove,
   isTerminalLegItem,
@@ -352,16 +362,12 @@ export function buildStarMismatchMessage(
   );
 }
 
-// 哪些状态视为"占用座位"（需要扣库存）
-export const SEAT_HOLDING_STATUSES: OrderStatus[] = [
-  'PENDING_PAYMENT',
-  'PAID',
-  'PROCESSING',
-  'TICKETED',
-  'COMPLETED',
-  'CHANGE_REQUESTED',
-  'CHANGED',
-];
+// 哪些状态视为"占用座位"（需要扣库存）/ 释放型 / 取消族终态：集合本体在 lib/order-status-sets.ts
+// （全站唯一一份，审查根因 R2；对称性由 order-status-sets.test.ts 断言）。这里原名再导出，
+// no-show-batch / ticket-batch / settlement-requests 等既有 import 路径不变；下面的口径注释保留原文。
+export const SEAT_HOLDING_STATUSES: OrderStatus[] = SEAT_HOLDING_STATUSES_LIB;
+export const SEAT_RELEASING_STATUSES: OrderStatus[] = SEAT_RELEASING_STATUSES_LIB;
+export const FULFILLMENT_TERMINATING_STATUSES: OrderStatus[] = FULFILLMENT_TERMINATING_STATUSES_LIB;
 
 // DRAFT 归类为"释放型"而非"既不占座也不释放"的中间地带（CRITICAL 修复）：
 //   createOrder 唯一的建单路径（~389）永远显式写 status: PENDING_PAYMENT（扣座与建单同一事务原子发生），
@@ -376,26 +382,14 @@ export const SEAT_HOLDING_STATUSES: OrderStatus[] = [
 //     DRAFT→H：wasHolding=false, isNewHolding=true → 走"重新占座"分支，原子 CAS + 余位校验（与从
 //              CANCELLED/PAYMENT_TIMEOUT 拉回占座完全同一套保护，不会超卖）
 //     DRAFT→R（如 CANCELLED）：wasHolding=false → 释放→释放，短路不触碰库存（幂等，不会二次释放）
-export const SEAT_RELEASING_STATUSES: OrderStatus[] = [
-  'CANCELLED',
-  'PAYMENT_TIMEOUT',
-  'REFUNDED',
-  'FAILED',
-  'DRAFT',
-  'REFUND_REQUESTED',
-];
+//（SEAT_RELEASING_STATUSES 本体见 lib/order-status-sets.ts，与上方一并再导出。）
 
 // 订单落「取消族」终态 → 履约任务应被终态化（CANCELLED），而非仅靠列表查询过滤隐藏。
 // 隐藏式过滤的问题：任务仍是 PENDING/IN_PROGRESS，force 把订单拉回占座态即"复活"，且统计口径数不到。
 // 注意与 DRAFT 区分：DRAFT 虽在 SEAT_RELEASING_STATUSES 里（座位账口径），但不是取消族终态，
 // 不应把履约任务一并终态化（force H→DRAFT→PAID 的座位来回搬移不涉及"订单被取消"语义）。
 // 导出：路由层的签证矛盾硬闸要用同一份「不参与履约」口径判豁免，不另立一套。
-export const FULFILLMENT_TERMINATING_STATUSES: OrderStatus[] = [
-  'CANCELLED',
-  'REFUNDED',
-  'PAYMENT_TIMEOUT',
-  'FAILED',
-];
+//（FULFILLMENT_TERMINATING_STATUSES 本体见 lib/order-status-sets.ts = 释放型 − {DRAFT, REFUND_REQUESTED}，上方已再导出。）
 
 // ── 代理自助改单窗口（下单当天）─────────────────────────────────────────
 // 口径（运营负责人 + 老板 2026-09-04 拍板）：
@@ -1696,11 +1690,8 @@ function rescheduleCommittedContext(err: unknown): RescheduleCommittedContext | 
  * 与列表卡片标题「仅含已付款订单」同义，也与卡片此前的前端算法逐字一致 ——
  * 待支付单不算成交额，取消/退款族不再是成交。
  */
-const AGENT_STATS_PAID_STATUSES: OrderStatus[] = [
-  OrderStatus.PAID,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-];
+//（AGENT_STATS_PAID_STATUSES 本体见 lib/order-status-sets.ts = 已付款四态 − PROCESSING；与仪表盘 /
+//  客户档案的两个「已付款」集合不同，差异已登记待拍板，不合并。）
 
 /** 代理行查不到（已删/脏数据）时的兜底名，与前台列表同一标签，不静默丢掉这笔成交额。*/
 const AGENT_STATS_UNKNOWN_AGENT_LABEL = '未知代理';

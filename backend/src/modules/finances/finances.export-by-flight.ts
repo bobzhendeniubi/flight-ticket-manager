@@ -18,7 +18,8 @@
  */
 import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
-import { OrderStatus } from '@prisma/client';
+// 订单状态集合全站唯一一份（审查根因 R2）：财务口径含 REFUND_REQUESTED。
+import { COUNTED_STATUSES } from '../../lib/order-status-sets.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import {
@@ -27,17 +28,6 @@ import {
   resolveScheduleCost,
 } from './finances.cost.service.js';
 import { visaItemCostCny } from './finances.service.js';
-
-const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.REFUND_REQUESTED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
 
 interface FlightRow {
   flightNumber: string;

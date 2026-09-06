@@ -23,7 +23,9 @@
  */
 import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
-import { OrderStatus, OrderItemKind } from '@prisma/client';
+import { OrderItemKind } from '@prisma/client';
+// 订单状态集合全站唯一一份（审查根因 R2）：分房走库存口径（退款申请中已释放占房，不进分房表）。
+import { INVENTORY_COUNTED_STATUSES as COUNTED_STATUSES } from '../../lib/order-status-sets.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { BadRequestError } from '../../lib/errors.js';
 import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
@@ -35,17 +37,6 @@ import type { TripStatsMap } from './orders.export-trip-stats.js';
 import { earliestFlightDepartureLocalDate } from './pnr-export.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { businessDateTimeSec } from '../../lib/business-time.js';
-
-/** 分房口径：退款申请中的订单已释放占房，不进入分房表。*/
-const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
 
 /** 导出最长跨度（天）— 超出直接 400，导出不做静默截断。*/
 export const ROOM_ALLOCATION_MAX_DAYS = 14;

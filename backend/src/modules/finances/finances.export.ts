@@ -24,6 +24,8 @@
 import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
+// 订单状态集合全站唯一一份（审查根因 R2）：财务口径含 REFUND_REQUESTED；退款族判「普通退款」。
+import { COUNTED_STATUSES, REFUND_FAMILY_STATUSES, statusIn } from '../../lib/order-status-sets.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import {
   findMatchedPeriod,
@@ -35,17 +37,6 @@ import { isSettledByNetReceived } from '../../lib/order-money.js';
 import { businessDateTime } from '../../lib/business-time.js';
 // 签证成本口径与财务汇总共用同一函数，两处逐字一致（任务实际成本优先 → 产品主数据回退）
 import { visaItemCostCny } from './finances.service.js';
-
-const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.REFUND_REQUESTED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
 
 const ORDER_KIND_LABEL: Record<string, string> = {
   FLIGHT: '机票',
@@ -66,11 +57,6 @@ const STATUS_LABEL: Record<string, string> = {
   CHANGE_REQUESTED: '改期中',
   CHANGED: '已改期',
 };
-
-const REFUND_FAMILY_STATUSES: Set<OrderStatus> = new Set([
-  OrderStatus.REFUND_REQUESTED,
-  OrderStatus.REFUNDED,
-]);
 
 interface FinanceRow {
   agency: string;
@@ -175,7 +161,7 @@ function round2(n: number): number {
 
 function refundType(status: OrderStatus, swapRefundedAt: Date | null): string {
   if (swapRefundedAt) return '换人退款';
-  if (REFUND_FAMILY_STATUSES.has(status)) return '普通退款';
+  if (statusIn(REFUND_FAMILY_STATUSES, status)) return '普通退款';
   return '';
 }
 

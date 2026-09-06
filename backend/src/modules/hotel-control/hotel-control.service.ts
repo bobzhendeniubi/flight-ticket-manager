@@ -25,6 +25,8 @@ import {
   type PrismaClient,
 } from '@prisma/client';
 import { env } from '../../config/env.js';
+// 订单状态集合全站唯一一份（审查根因 R2）：房控走库存口径（不含 REFUND_REQUESTED），下方原名再导出。
+import { INVENTORY_COUNTED_STATUSES } from '../../lib/order-status-sets.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import type { AuditActor } from '../../lib/audit.js';
 import { writeAudit } from '../../lib/audit.js';
@@ -86,16 +88,12 @@ export async function getHotelOversellCapRooms(
   return parsed;
 }
 
-/** 房控有效订单：退款申请中的订单已释放占房，不计入销控、分房与名单。*/
-export const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
+/**
+ * 房控有效订单：退款申请中的订单已释放占房，不计入销控、分房与名单。
+ * 集合本体在 lib/order-status-sets.ts（全站唯一一份，审查根因 R2）= 库存口径 INVENTORY_COUNTED_STATUSES；
+ * 这里保留原导出名，hotel-control.passports 等既有 import 路径不变。
+ */
+export const COUNTED_STATUSES: OrderStatus[] = INVENTORY_COUNTED_STATUSES;
 
 /** 销控板最长跨度（天）—— 超出按 from 起截断。*/
 const MAX_BOARD_DAYS = 120;

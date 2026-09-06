@@ -4,17 +4,12 @@
  * 客户 = User(role=CUSTOMER) + CustomerProfile（扩展画像）。
  * 聚合 totalOrders / totalSpent / lastOrderAt 从 Order 表实时算。
  */
-import { OrderStatus, Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
+// 订单状态集合全站唯一一份（审查根因 R2）：客户档案「已消费」只认已付款四态（不含改签对，登记待拍板）。
+import { PAID_STATUSES } from '../../lib/order-status-sets.js';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, NotFoundError } from '../../lib/errors.js';
 import type { ListCustomersQuery, UpdateCustomerBody } from './customers.schemas.js';
-
-const PAID_STATUSES: OrderStatus[] = [
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-];
 
 export class CustomersService {
   /**

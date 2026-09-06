@@ -14,8 +14,9 @@
  *   - 应收状态集 RECEIVABLE_STATUSES：进行中的六态（不含 COMPLETED / REFUND_REQUESTED）
  */
 import type { Prisma, PrismaClient } from '@prisma/client';
-import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+// 订单状态集合全站唯一一份（审查根因 R2）：营收口径含 REFUND_REQUESTED；应收口径 = 占座 − COMPLETED。
+import { COUNTED_STATUSES, RECEIVABLE_STATUSES } from '../../lib/order-status-sets.js';
 import { type CompletedRefundShape } from '../../lib/net-received.js';
 // 订单金额单一口径（审查根因 R2）：应收 / 应收余额从这里取（内部转调 lib/net-received）。
 import { payableCny, receivableBalanceCny } from '../../lib/order-money.js';
@@ -110,28 +111,8 @@ export interface AgentDebtRow {
   prepaymentBalanceCny: number;
 }
 
-// 计入营收的订单状态（与 finances.service.ts 一致）：
-// 排除 DRAFT/CANCELLED/PAYMENT_TIMEOUT/REFUNDED/FAILED
-const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.REFUND_REQUESTED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
-
-// 应收口径的状态集（进行中六态；不含 COMPLETED / REFUND_REQUESTED）
-const RECEIVABLE_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
+// 计入营收的订单状态 COUNTED_STATUSES（与 finances.service 同一份）与应收口径 RECEIVABLE_STATUSES
+// （进行中六态；不含 COMPLETED / REFUND_REQUESTED）都从 lib/order-status-sets 取（全站唯一一份）。
 
 /** 应收明细最多返回的行数（summary 仍统计全量） */
 const RECEIVABLE_ROW_LIMIT = 500;

@@ -25,6 +25,8 @@ import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 // 订单金额单一口径（审查根因 R2）：REFUNDED 订单的负项走显式变体（不含预存抵扣）。
 import { paidMinusCompletedRefundsCny } from '../../lib/order-money.js';
+// 订单状态集合全站唯一一份：财务口径含 REFUND_REQUESTED、不含 REFUNDED（后者单独补负项，见上）。
+import { COUNTED_STATUSES } from '../../lib/order-status-sets.js';
 import {
   findMatchedPeriod,
   loadPeriodsByFlightIds,
@@ -278,17 +280,6 @@ export interface MonthlyPoint {
 // REFUNDED 不在这个列表里（明确排除，不是遗漏）：REFUNDED 订单不走下面按 OrderItem 展开
 // 的分品类逻辑，而是在 getFinancesSummary 里单独查询、按订单级"已收-已退净额"补一笔负项
 // 到 revenueBreakdown.refund（见该字段注释）——避免"先收后退"的订单整单从统计消失。
-const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.REFUND_REQUESTED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
-
 function toDateOnlyUtc(s: string, endOfDay = false): Date {
   // 'YYYY-MM-DD' → UTC midnight (or 23:59:59.999)
   const [y, m, d] = s.split('-').map((x) => parseInt(x, 10));

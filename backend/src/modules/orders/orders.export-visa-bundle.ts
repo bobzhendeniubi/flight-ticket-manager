@@ -16,7 +16,9 @@
 import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import type { PrismaClient } from '@prisma/client';
-import { OrderStatus, FulfillmentType } from '@prisma/client';
+import { FulfillmentType } from '@prisma/client';
+// 订单状态集合全站唯一一份（审查根因 R2）：签证名单走库存口径（退款申请中已释放应出行名单，不导）。
+import { INVENTORY_COUNTED_STATUSES as COUNTED_STATUSES } from '../../lib/order-status-sets.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { businessDateISO, businessDateTimeSec } from '../../lib/business-time.js';
 import {
@@ -27,17 +29,6 @@ import {
   type OrderForTemplateExport,
 } from './orders.export-templates.js';
 import { extFromUrl, fetchPhoto, sanitize } from './passport-zip.js';
-
-/** 签证名单口径：退款申请中的订单已释放应出行名单，不再导出。*/
-const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
 
 /** 合并签证名单的 xlsx 列 = 《签证专用》全列 + 末尾「有无护照图」（沿用送签表口径）。*/
 const HAS_PHOTO_COLUMN = { header: '有无护照图', key: 'hasPhoto', width: 20 } as const;

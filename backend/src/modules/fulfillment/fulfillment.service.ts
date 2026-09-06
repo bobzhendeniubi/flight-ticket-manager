@@ -22,6 +22,8 @@ import {
   VisaRequirement,
   VisaSubmissionStatus,
 } from '@prisma/client';
+// 订单状态集合全站唯一一份（审查根因 R2）：履约口径 = 库存口径 + REFUND_REQUESTED。
+import { COUNTED_STATUSES } from '../../lib/order-status-sets.js';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import type { AuditActor } from '../../lib/audit.js';
@@ -75,16 +77,7 @@ async function notifyAssigneeChangeToWecom(orderNumber: string, type: Fulfillmen
  * REFUNDED（已退款）/ FAILED（失败）这些"取消族"状态。
  * 订单一旦落入取消族，其履约任务（尤其签证送签）不应再残留在运营看板上。
  */
-const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.REFUND_REQUESTED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
+// ↑ 集合本体在 lib/order-status-sets.ts（全站唯一一份，审查根因 R2）：履约口径 = 库存口径 + REFUND_REQUESTED。
 
 const KIND_TO_TYPE: Record<OrderItemKind, FulfillmentType | null> = {
   FLIGHT: FulfillmentType.FLIGHT_TICKETING,

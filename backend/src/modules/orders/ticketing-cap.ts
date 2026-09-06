@@ -29,6 +29,8 @@
  * - orders.export.ts（整班机导出）：表头显示「已开票 N / 上限 M 张」
  */
 import { OrderItemKind, OrderStatus, PassengerType } from '@prisma/client';
+// 订单状态集合全站唯一一份（审查根因 R2）：开票额度走库存口径。
+import { INVENTORY_COUNTED_STATUSES } from '../../lib/order-status-sets.js';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { BadRequestError, UnprocessableEntityError } from '../../lib/errors.js';
 
@@ -43,15 +45,8 @@ type Db = PrismaClient | Prisma.TransactionClient;
  * 「能标开票」⟺「占额度」——算额度与写标记复用这同一份状态集合，物理上不可能再分叉。
  * 改这里等于同时改两处口径，务必一起想清楚。
  */
-const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
+// ↑ 集合本体在 lib/order-status-sets.ts（全站唯一一份，审查根因 R2）= 库存口径 INVENTORY_COUNTED_STATUSES。
+const COUNTED_STATUSES: OrderStatus[] = INVENTORY_COUNTED_STATUSES;
 
 /**
  * 该订单状态是否占用班次开票额度（= COUNTED_STATUSES 成员）。
