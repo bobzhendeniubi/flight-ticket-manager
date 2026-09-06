@@ -45,10 +45,17 @@ export const updateBlockPeriodBodySchema = z.object({
 });
 export type UpdateBlockPeriodBody = z.infer<typeof updateBlockPeriodBodySchema>;
 
+/**
+ * 城市筛选（可选）：归一后的 Hotel.cityCode（如 DAD）。缺省 = 全部城市、按城市分组输出。
+ * 只做形状校验，归一（trim/大写）在 service 入口做。
+ */
+const cityCodeFilter = z.string().trim().min(2).max(10).optional();
+
 // ── 销控板 / 远期视图 ─────────────────────────────────────────────────────
 export const boardQuerySchema = z.object({
   from: dateStr,
   to: dateStr,
+  cityCode: cityCodeFilter,
 });
 export type BoardQuery = z.infer<typeof boardQuerySchema>;
 
@@ -74,13 +81,18 @@ function dateSpanDays(from: string, to: string): number {
   ) + 1;
 }
 
-/** 随机档每日加房清单：缺省查 from 起 14 天，最多 60 个自然日。 */
+/** 随机档每日加房清单：缺省查 from 起 14 天，最多 60 个自然日；cityCode 缺省 = 全部城市。 */
 export const randomTierShortfallQuerySchema = z
   .object({
     from: randomTierShortfallDate,
     to: randomTierShortfallDate.optional(),
+    cityCode: cityCodeFilter,
   })
-  .transform(({ from, to }) => ({ from, to: to ?? addDaysToDateString(from, 13) }))
+  .transform(({ from, to, cityCode }) => ({
+    from,
+    to: to ?? addDaysToDateString(from, 13),
+    cityCode,
+  }))
   .superRefine((q, ctx) => {
     if (q.from > q.to) {
       ctx.addIssue({ code: z.ZodIssueCode.custom, path: ['to'], message: '起始日不能晚于结束日' });
@@ -132,16 +144,22 @@ export const recentChangesQuerySchema = z.object({
 });
 export type RecentChangesQuery = z.infer<typeof recentChangesQuerySchema>;
 
-// ── 占房下钻（某酒店/某星级随机池某晚，谁占的；销控矩阵红/黄格点击用）──────────
-// hotelId 与 randomStarTier 二选一（口径同包房周期）。
+// ── 占房下钻（某酒店/某城市某星级随机池某晚，谁占的；销控矩阵红/黄格点击用）──────
+// hotelId 与 randomStarTier 二选一（口径同包房周期）；随机池下钻必须带 cityCode
+// （随机档按城市圈定，不带城市就不知道下钻的是哪个池子）。
 export const occupantsQuerySchema = z
   .object({
     hotelId: z.string().min(1).optional(),
     randomStarTier: z.coerce.number().int().pipe(randomStarTierSchema).optional(),
+    cityCode: cityCodeFilter,
     date: dateStr,
   })
   .refine((q) => !!q.hotelId !== (q.randomStarTier != null), {
     message: '请指定一家酒店，或指定一个星级随机池',
+  })
+  .refine((q) => q.randomStarTier == null || !!q.cityCode, {
+    message: '随机池下钻必须指定城市（cityCode）',
+    path: ['cityCode'],
   });
 export type OccupantsQuery = z.infer<typeof occupantsQuerySchema>;
 

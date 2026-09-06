@@ -22,6 +22,7 @@ import {
   type RandomStarTier,
   type BlockPeriodWriteInput,
   type HotelBlockPeriod,
+  type HotelCity,
   type HotelControlAlerts,
   type HotelControlBoard,
   type HotelControlForward,
@@ -150,29 +151,46 @@ export function HotelControlPage() {
 
   const [from, setFrom] = useState<string>(todayStr());
   const [to, setTo] = useState<string>(plusDaysStr(30));
+  // 城市筛选：'' = 全部城市（矩阵按城市分块）。随机档按「城市 × 星级」圈定，两城同档是两个池子。
+  const [cityFilter, setCityFilter] = useState<string>('');
+  const [cityOptions, setCityOptions] = useState<HotelCity[]>([]);
   const [board, setBoard] = useState<HotelControlBoard | null>(null);
   const [forward, setForward] = useState<HotelControlForward | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   // 周期 CRUD 后 +1 触发销控板/远期重拉
   const [boardNonce, setBoardNonce] = useState(0);
-  // 余量格点击下钻（某酒店/某星级随机池某晚，谁占的）；null = 抽屉关闭
+  // 余量格点击下钻（某酒店/某城市某星级随机池某晚，谁占的）；null = 抽屉关闭
   const [drill, setDrill] = useState<{
     hotelId: string;
     hotelName: string;
     /** 非空 = 池组下钻（此时 hotelId 是合成键，不能当酒店 id 传给接口） */
     randomStarTier: RandomStarTier | null;
+    /** 池组下钻必须带城市（随机档按城市圈定） */
+    cityCode: string;
     date: string;
     block: number;
     used: number;
   } | null>(null);
+
+  // 城市下拉候选：酒店 distinct 城市（主营地排最前）；拉不到就退回板上出现的城市
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    api
+      .listHotelCities(token)
+      .then((r) => { if (!cancelled) setCityOptions(r.cities); })
+      .catch(() => { /* 退回 board.cities */ });
+    return () => { cancelled = true; };
+  }, [token]);
 
   useEffect(() => {
     if (!token || !from || !to || from > to) return;
     let cancelled = false;
     setLoading(true);
     setError(null);
-    Promise.all([api.getHotelBoard(token, from, to), api.getHotelForward(token, from, to)])
+    const city = cityFilter || undefined;
+    Promise.all([api.getHotelBoard(token, from, to, city), api.getHotelForward(token, from, to, city)])
       .then(([b, f]) => {
         if (cancelled) return;
         setBoard(b);
@@ -185,7 +203,9 @@ export function HotelControlPage() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [token, from, to, boardNonce]);
+  }, [token, from, to, cityFilter, boardNonce]);
+
+  const cityChoices = cityOptions.length > 0 ? cityOptions : (board?.cities ?? []);
 
   return (
     <div className="space-y-6">
@@ -200,6 +220,18 @@ export function HotelControlPage() {
           </p>
         </div>
         <div className="flex items-end gap-2">
+          <div>
+            <label className="label">城市</label>
+            {/* 随机档按城市圈定：缺省全部城市（矩阵按城市分块），选一个只看那一城 */}
+            <select className="input" value={cityFilter} onChange={(e) => setCityFilter(e.target.value)}>
+              <option value="">全部城市</option>
+              {cityChoices.map((c) => (
+                <option key={c.cityCode} value={c.cityCode}>
+                  {c.cityLabel}（{c.cityCode}）
+                </option>
+              ))}
+            </select>
+          </div>
           <div>
             <label className="label">起始</label>
             <input type="date" className="input" value={from} onChange={(e) => setFrom(e.target.value)} />
@@ -273,8 +305,18 @@ export function HotelControlPage() {
                 </tr>
               </thead>
               <tbody>
-                {board.hotels.map((h) => (
+                {board.hotels.map((h, i) => (
                   <Fragment key={h.hotelId}>
+                    {/* 城市分块标题：板已按城市排好（主营地在前），城市一变就落一行标题 —— 随机档按城市圈定，
+                        岘港三星与会安三星是两个池子，不能混在一张没标城市的矩阵里 */}
+                    {(i === 0 || board.hotels[i - 1].cityCode !== h.cityCode) && (
+                      <tr className="border-t-2 border-indigo-200 bg-indigo-50/70">
+                        <td colSpan={2} className={`${STICKY_COL1} bg-indigo-50 py-1.5 pr-2 text-xs font-semibold text-indigo-800`}>
+                          {h.cityLabel}（{h.cityCode}）
+                        </td>
+                        <td colSpan={board.dates.length} className="bg-indigo-50/70" />
+                      </tr>
+                    )}
                     <tr className="border-t border-slate-200">
                       <td rowSpan={4} className={`${STICKY_COL1} py-2 pr-2 align-top`}>
                         <div className="font-medium text-ink">
@@ -363,6 +405,7 @@ export function HotelControlPage() {
                                 hotelId: h.hotelId,
                                 hotelName: h.hotelName,
                                 randomStarTier: h.randomStarTier,
+                                cityCode: h.cityCode,
                                 date,
                                 block,
                                 used,
@@ -465,6 +508,7 @@ export function HotelControlPage() {
           hotelId={drill.hotelId}
           hotelName={drill.hotelName}
           randomStarTier={drill.randomStarTier}
+          cityCode={drill.cityCode}
           date={drill.date}
           block={drill.block}
           used={drill.used}
@@ -482,6 +526,7 @@ function OccupantsDrawer({
   hotelId,
   hotelName,
   randomStarTier,
+  cityCode,
   date,
   block,
   used,
@@ -491,8 +536,10 @@ function OccupantsDrawer({
   token: string;
   hotelId: string;
   hotelName: string;
-  /** 非空 = 星级随机池下钻（hotelId 是合成键，接口按 randomStarTier 查）。 */
+  /** 非空 = 星级随机池下钻（hotelId 是合成键，接口按 randomStarTier + cityCode 查）。 */
   randomStarTier: RandomStarTier | null;
+  /** 池组所在城市（随机档按城市圈定；具体酒店下钻时只作展示） */
+  cityCode: string;
   date: string;
   block: number;
   used: number;
@@ -513,11 +560,11 @@ function OccupantsDrawer({
     hotelControlOpsApi
       .getHotelOccupants(
         token,
-        randomStarTier != null ? { randomStarTier, date } : { hotelId, date },
+        randomStarTier != null ? { randomStarTier, cityCode, date } : { hotelId, date },
       )
       .then((r) => setOccupants(r.occupants))
       .catch((e: unknown) => setErr(e instanceof ApiError ? e.message : '占房订单加载失败'));
-  }, [token, hotelId, randomStarTier, date]);
+  }, [token, hotelId, randomStarTier, cityCode, date]);
 
   useEffect(() => {
     setOccupants(null);
@@ -641,17 +688,24 @@ function OccupantsDrawer({
 function BoardExport({ token, board }: { token: string; board: HotelControlBoard | null }) {
   const [exportFrom, setExportFrom] = useState<string>(todayStr());
   const [exportTo, setExportTo] = useState<string>(plusDaysStr(30));
+  // 导出城市：'' = 全部城市（表内按城市分块、每块带城市标题）
+  const [exportCity, setExportCity] = useState<string>('');
   const [exporting, setExporting] = useState(false);
+  const exportCityOptions = board?.cities ?? [];
 
   async function handleExport(): Promise<void> {
     if (!token) return;
     setExporting(true);
     try {
-      const blob = await hotelControlOpsApi.downloadBoardExport(token, { from: exportFrom, to: exportTo });
+      const blob = await hotelControlOpsApi.downloadBoardExport(token, {
+        from: exportFrom,
+        to: exportTo,
+        cityCode: exportCity || undefined,
+      });
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `房控导出-${exportFrom}_${exportTo}.xlsx`;
+      a.download = `房控导出-${exportFrom}_${exportTo}${exportCity ? `_${exportCity}` : ''}.xlsx`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -739,10 +793,21 @@ function BoardExport({ token, board }: { token: string; board: HotelControlBoard
         <div>
           <h2 className="text-sm font-semibold text-ink">导出房态（销控矩阵）</h2>
           <p className="mt-1 text-xs text-ink-muted">
-            xlsx：每家酒店 包房/用房/物理房间/余量 四行 × 日期列，与本页矩阵一致（最长 120 天，含「未配包房」标记）。
+            xlsx：每家酒店 包房/用房/物理房间/余量 四行 × 日期列，与本页矩阵一致（最长 120 天，含「未配包房」标记）；按城市分块、每块带城市标题。
           </p>
         </div>
         <div className="flex items-end gap-2">
+          <div>
+            <label className="label">城市</label>
+            <select className="input" value={exportCity} onChange={(e) => setExportCity(e.target.value)}>
+              <option value="">全部城市</option>
+              {exportCityOptions.map((c) => (
+                <option key={c.cityCode} value={c.cityCode}>
+                  {c.cityLabel}（{c.cityCode}）
+                </option>
+              ))}
+            </select>
+          </div>
           <div>
             <label className="label">起始</label>
             <input

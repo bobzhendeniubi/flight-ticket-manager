@@ -3117,6 +3117,12 @@ export interface FlightSettlementRateWriteEntry {
  */
 export type RandomStarTier = 3 | 4 | 5;
 export const RANDOM_STAR_TIERS: RandomStarTier[] = [3, 4, 5];
+
+/** 房控接口的城市筛选片段：空 = 不筛（全部城市）。 */
+function hotelCityQuery(cityCode?: string): string {
+  const code = cityCode?.trim();
+  return code ? `&cityCode=${encodeURIComponent(code)}` : '';
+}
 /** 随机档展示名（与后端 randomStarTierLabel 一致）。 */
 export function randomStarTierLabel(tier: number): string {
   return `${['一', '二', '三', '四', '五'][tier - 1] ?? String(tier)}星随机`;
@@ -3168,16 +3174,25 @@ export interface BlockPeriodWriteInput {
   note?: string | null;
 }
 
+/** 随机档 / 销控板的城市（归一后的 Hotel.cityCode + 展示名；未知码原样） */
+export interface HotelCity {
+  cityCode: string;
+  cityLabel: string;
+}
+
 export interface HotelControlBoardHotel {
   /**
-   * 分组键。具体酒店 = 真实酒店 id；随机档聚合组 = 合成键 `random-star-{tier}`
+   * 分组键。具体酒店 = 真实酒店 id；随机档聚合组 = 合成键 `random-star-{tier}-{city}`
    * —— 聚合组不是酒店，别拿它去调按 hotelId 的接口（护照导出等），判定一律看 randomStarTier。
    */
   hotelId: string;
-  /** 具体酒店 = 酒店名；聚合组 = 「三星随机」/「四星随机」 */
+  /** 具体酒店 = 酒店名；聚合组 = 「岘港三星随机」（带城市，两城同档不撞名） */
   hotelName: string;
-  /** 非空 = 随机档聚合组（同星级酒店合计视图） */
+  /** 非空 = 随机档聚合组（同城市同星级酒店合计视图） */
   randomStarTier: RandomStarTier | null;
+  /** 所属城市（随机档按城市圈定；聚合组 = 它圈定的城市） */
+  cityCode: string;
+  cityLabel: string;
   /** 最新周期（dateFrom 最晚且有价）的切房单价；聚合组无单一单价 → null */
   unitPrice: number | null;
   /**
@@ -3190,6 +3205,8 @@ export interface HotelControlBoardHotel {
 
 export interface HotelControlBoard {
   dates: string[];
+  /** 板上出现的城市（主营地排最前）；矩阵按城市分块出标题用；带 cityCode 筛选时只有一个 */
+  cities: HotelCity[];
   hotels: HotelControlBoardHotel[];
 }
 
@@ -3200,9 +3217,13 @@ export interface HotelControlForward {
   remaining: number[]; // held - occupied（余房）
 }
 
-/** GET /hotel-control/random-tier-shortfall — 每日加房清单（随机档缺口） */
+/** GET /hotel-control/random-tier-shortfall — 每日加房清单（随机档缺口；按城市 × 档次分条） */
 export interface RandomTierShortfallTier {
+  /** 该行圈定的城市（随机档按城市圈定，岘港三星与会安三星是两个池子） */
+  cityCode: string;
+  cityLabel: string;
   tier: RandomStarTier;
+  /** 档次名（不带城市，与销控板列头一致） */
   label: string;
   hasBlock: boolean;
   block: number;
@@ -3221,6 +3242,8 @@ export interface RandomTierShortfallDay {
 export interface RandomTierShortfall {
   from: string;
   to: string;
+  /** 清单覆盖的城市（主营地排最前）；带 cityCode 筛选时只有一个 */
+  cities: HotelCity[];
   days: RandomTierShortfallDay[];
 }
 
@@ -6429,19 +6452,26 @@ export const api = {
   ) => apiFetch<{ period: HotelBlockPeriod }>(`/hotel-control/block-periods/${id}`, { method: 'PATCH', token, body }),
   deleteBlockPeriod: (token: string, id: string) =>
     apiFetch<{ id: string }>(`/hotel-control/block-periods/${id}`, { method: 'DELETE', token }),
-  getHotelBoard: (token: string, from: string, to: string) =>
+  // cityCode 可选：只看一个城市（缺省全部城市、按城市分组）
+  getHotelBoard: (token: string, from: string, to: string, cityCode?: string) =>
     apiFetch<HotelControlBoard>(
-      `/hotel-control/board?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+      `/hotel-control/board?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${hotelCityQuery(cityCode)}`,
       { token },
     ),
-  getHotelForward: (token: string, from: string, to: string) =>
+  getHotelForward: (token: string, from: string, to: string, cityCode?: string) =>
     apiFetch<HotelControlForward>(
-      `/hotel-control/forward?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+      `/hotel-control/forward?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${hotelCityQuery(cityCode)}`,
       { token },
     ),
-  getRandomTierShortfall: (token: string, from: string, to: string, signal?: AbortSignal) =>
+  getRandomTierShortfall: (
+    token: string,
+    from: string,
+    to: string,
+    signal?: AbortSignal,
+    cityCode?: string,
+  ) =>
     apiFetch<RandomTierShortfall>(
-      `/hotel-control/random-tier-shortfall?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+      `/hotel-control/random-tier-shortfall?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${hotelCityQuery(cityCode)}`,
       { token, signal },
     ),
   // 提醒线（超卖加房 / 富余退房 / 班次超开票上限；按需计算，无 cron）
@@ -7372,10 +7402,13 @@ export interface HotelNightlyRemainingResult {
 }
 
 export const hotelControlOpsApi = {
-  /** 房态导出（xlsx）—— 销控矩阵原样导出；ADMIN/STAFF only。 */
-  downloadBoardExport: async (token: string, range: { from: string; to: string }): Promise<Blob> => {
+  /** 房态导出（xlsx）—— 销控矩阵原样导出（按城市分块；cityCode 可选只导一城）；ADMIN/STAFF only。 */
+  downloadBoardExport: async (
+    token: string,
+    range: { from: string; to: string; cityCode?: string },
+  ): Promise<Blob> => {
     const res = await fetch(
-      `${API_BASE}/hotel-control/export?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,
+      `${API_BASE}/hotel-control/export?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}${hotelCityQuery(range.cityCode)}`,
       { headers: { Authorization: `Bearer ${token}` } },
     );
     if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
@@ -7415,16 +7448,17 @@ export const hotelControlOpsApi = {
   },
 
   /**
-   * 占房下钻：某酒店 / 某星级随机池某晚是谁占的（销控矩阵余量格点击用）。
-   * hotelId 与 randomStarTier 二选一（池组的 hotelId 是合成键，不能当酒店 id 传）。
+   * 占房下钻：某酒店 / 某城市某星级随机池某晚是谁占的（销控矩阵余量格点击用）。
+   * hotelId 与 randomStarTier 二选一（池组的 hotelId 是合成键，不能当酒店 id 传）；
+   * 随机池下钻必须带 cityCode（随机档按城市圈定）。
    */
   getHotelOccupants: (
     token: string,
-    params: { hotelId?: string; randomStarTier?: RandomStarTier; date: string },
+    params: { hotelId?: string; randomStarTier?: RandomStarTier; cityCode?: string; date: string },
   ) => {
     const scope =
       params.randomStarTier != null
-        ? `randomStarTier=${params.randomStarTier}`
+        ? `randomStarTier=${params.randomStarTier}${hotelCityQuery(params.cityCode)}`
         : `hotelId=${encodeURIComponent(params.hotelId ?? '')}`;
     return apiFetch<{ occupants: HotelOccupant[] }>(
       `/hotel-control/occupants?${scope}&date=${encodeURIComponent(params.date)}`,

@@ -140,10 +140,10 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
     return getForward(q);
   });
 
-  // ── 每日加房清单（随机档缺口；与销控矩阵共用 getRandomTierAggregate）──────
+  // ── 每日加房清单（随机档缺口；与销控矩阵共用 getRandomTierAggregate；按城市分条）──
   app.get('/random-tier-shortfall', requireStaff, async (req) => {
     const q = randomTierShortfallQuerySchema.parse(req.query);
-    return getRandomTierShortfall(q.from, q.to);
+    return getRandomTierShortfall(q.from, q.to, undefined, { cityCode: q.cityCode });
   });
 
   // ── 提醒线（按需计算，无 cron）────────────────────────────────────────
@@ -201,7 +201,9 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
   app.get('/occupants', requireStaff, async (req) => {
     const q = occupantsQuerySchema.parse(req.query);
     const occupants = await getOccupyingOrders(
-      q.hotelId ? { hotelId: q.hotelId } : { randomStarTier: q.randomStarTier! },
+      q.hotelId
+        ? { hotelId: q.hotelId }
+        : { randomStarTier: q.randomStarTier!, cityCode: q.cityCode! },
       q.date,
     );
     return { occupants };
@@ -223,15 +225,17 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
       action: 'EXPORT_HOTEL_CONTROL_BOARD',
       targetType: 'PRODUCT',
       targetId: 'hotel-control-board',
-      targetLabel: `房控导出 ${q.from}~${q.to}`,
-      after: { from: q.from, to: q.to },
+      targetLabel: `房控导出 ${q.from}~${q.to}${q.cityCode ? ` ${q.cityCode}` : ''}`,
+      after: { from: q.from, to: q.to, cityCode: q.cityCode ?? null },
     });
 
     return reply
       .header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
       .header(
         'Content-Disposition',
-        `attachment; filename="${encodeURIComponent(hotelControlExportFilename(q.from, q.to))}"`,
+        `attachment; filename="${encodeURIComponent(
+          hotelControlExportFilename(q.from, q.to, q.cityCode),
+        )}"`,
       )
       .send(buf);
   });

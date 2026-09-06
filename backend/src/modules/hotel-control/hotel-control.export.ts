@@ -26,7 +26,7 @@
 import ExcelJS from 'exceljs';
 import type { PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
-import { getBoard } from './hotel-control.service.js';
+import { cityGroupTitle, getBoard, normalizeCityCode } from './hotel-control.service.js';
 import type { HotelControlBoard } from './hotel-control.service.js';
 
 const ROW_LABELS = ['包房', '用房(床位)', '物理房间', '余量'] as const;
@@ -44,13 +44,19 @@ const OVERSOLD_FONT = { color: { argb: 'FFFFFFFF' }, bold: true } as const;
 const HOTEL_BAND_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFF3F4F6' } } as const;
 /** 跨酒店当日汇总行底色（浅靛蓝，呼应后台 Console 设计系统主色）。 */
 const SUMMARY_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFE0E7FF' } } as const;
+/** 城市分组标题行底色（深一点的靛蓝，镜像页面按城市分块的视觉）。 */
+const CITY_HEADER_FILL = { type: 'pattern', pattern: 'solid', fgColor: { argb: 'FFC7D2FE' } } as const;
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
+/**
+ * range.cityCode 可选：只导这一个城市。缺省导全部城市，矩阵按城市分块、每块前一行城市标题
+ * （随机档按城市圈定，岘港三星与会安三星是两个池子，不能混在一张没标城市的表里）。
+ */
 export async function buildHotelControlBoardWorkbook(
-  range: { from: string; to: string },
+  range: { from: string; to: string; cityCode?: string },
   client: PrismaClient = defaultPrisma,
 ): Promise<Buffer> {
   const board = await getBoard(range, client);
@@ -81,7 +87,18 @@ export async function buildHotelControlBoardWorkbook(
   });
 
   let rowIdx = 2;
+  let currentCity: string | null = null;
   board.hotels.forEach((hotel, hotelIdx) => {
+    // 城市分组标题行：板已按城市排好序（主营地在前），城市一变就落一行标题、跨全部列合并
+    if (hotel.cityCode !== currentCity) {
+      currentCity = hotel.cityCode;
+      const header = ws.addRow([cityGroupTitle(hotel.cityCode)]);
+      header.font = { bold: true };
+      for (let col = 1; col <= lastCol; col++) header.getCell(col).fill = { ...CITY_HEADER_FILL };
+      ws.mergeCells(rowIdx, 1, rowIdx, lastCol);
+      header.getCell(1).alignment = { vertical: 'middle', horizontal: 'left' };
+      rowIdx++;
+    }
     const startRow = rowIdx;
     const series = seriesByLabel(hotel);
     // 每家酒店 4 行交替底色，隔行区分酒店边界；「未配包房」/超卖高亮覆盖在其上（下方单独 set）
@@ -222,6 +239,8 @@ function appendLegend(ws: ExcelJS.Worksheet, lastCol: number): void {
   }
 
   const notes = [
+    '矩阵按城市分块（每块前一行城市标题）：随机档按「城市 × 星级」圈定，岘港三星与会安三星是两个池子，' +
+      '一个城市的缺口不吃另一个城市的房；每日加房清单与随机档提醒同样按城市分条。',
     '「余量」为床位口径（包房 − 用房(床位)；拼房客各计 0.5，故余量可出现 .5，如 13.5）。' +
       '「物理房间」行是实际占用的整间数（异性不能拼一间、性别未知每人独占），只作展示，不参与余量与高亮判定。',
     '「三星随机 / 四星随机 / 五星随机」不是一家酒店，也不是单独切的库存，而是同星级酒店的合计：' +
@@ -240,7 +259,12 @@ function appendLegend(ws: ExcelJS.Worksheet, lastCol: number): void {
   }
 }
 
-/** 文件名：`房控导出_{from}.xlsx`（单日）/ `房控导出_{from}_{to}.xlsx`（区间）。*/
-export function hotelControlExportFilename(from: string, to: string): string {
-  return from === to ? `房控导出_${from}.xlsx` : `房控导出_${from}_${to}.xlsx`;
+/**
+ * 文件名：`房控导出_{from}.xlsx`（单日）/ `房控导出_{from}_{to}.xlsx`（区间）；
+ * 带城市筛选时追加 `_{cityCode}`（如 `房控导出_2026-09-05_2026-10-05_HOA.xlsx`）。
+ */
+export function hotelControlExportFilename(from: string, to: string, cityCode?: string): string {
+  const range = from === to ? from : `${from}_${to}`;
+  const city = cityCode ? `_${normalizeCityCode(cityCode)}` : '';
+  return `房控导出_${range}${city}.xlsx`;
 }
