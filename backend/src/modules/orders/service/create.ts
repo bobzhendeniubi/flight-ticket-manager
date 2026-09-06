@@ -2497,6 +2497,8 @@ export async function priceAndValidateItems(
               maxAdults: true,
               maxChildren: true,
               basePrice: true,
+              // costPriceCny：套餐行地面成本快照的每间每晚成本（与 basePrice 成对，价/本同源）。
+              costPriceCny: true,
               hotelId: true,
               // randomTierPlaceholder：套餐绑的可能是「随机N星」的占位酒店房型（历史形态）——
               //   此时房量闸要走随机档聚合闸而不是具体酒店闸（见下方库存校验小节）。
@@ -2563,6 +2565,8 @@ export async function priceAndValidateItems(
         maxChildren: number;
         hotelName: string;
         designationSurchargeCnyPerPerson: number;
+        /** 每间每晚成本（产品未录成本 = null）：套餐行地面成本快照取指定房型这一份。*/
+        costPriceCny: Prisma.Decimal | null;
         /** 非空 = 指到了随机档占位酒店（不是真房源）→ 房量闸走随机档聚合闸。*/
         randomTierPlaceholder: number | null;
         /** 星级闸比对用（占位酒店不参与本闸）。*/
@@ -2582,6 +2586,8 @@ export async function priceAndValidateItems(
             hotelId: true,
             maxAdults: true,
             maxChildren: true,
+            // 指定酒店优先：地面成本快照的每间每晚成本取指定房型的（住哪家就用哪家的成本）。
+            costPriceCny: true,
             hotel: {
               select: {
                 name: true,
@@ -2604,6 +2610,7 @@ export async function priceAndValidateItems(
           maxChildren: rt.maxChildren,
           hotelName: rt.hotel.name,
           designationSurchargeCnyPerPerson: rt.hotel.designationSurchargeCnyPerPerson,
+          costPriceCny: rt.costPriceCny,
           randomTierPlaceholder: rt.hotel.randomTierPlaceholder,
           starRating: rt.hotel.starRating ?? null,
           intlFiveStar: rt.hotel.intlFiveStar === true,
@@ -2859,6 +2866,36 @@ export async function priceAndValidateItems(
         .filter((c) => c && c.kind === 'VISA')
         .reduce((acc, c) => acc + (Number(c.qty) || 0) * (Number(c.unitPrice) || 0), 0);
 
+      // ── 套餐行地面成本快照 ────────────────────────────────────────────────
+      // 与售价侧 computeBundleGroundTotal 逐组件同构：HOTEL 按 晚数×每晚成本×rooms、
+      // VISA 按 办签人数×每人成本、TRANSFER 按 qty×每份成本。三个数量口径（rooms /
+      // visaHeadCount / qty）与售价侧同源，价与本走同一条分摊，毛利才对得上。
+      //
+      // 机票分量**不算在这行上**：套餐单里的机票是独立的 FLIGHT 行（带 bundleId），成本
+      // 已由上面的机票快照落在那些行上，这里再加一遍就是双计。也绝不用「机票款=残差」
+      // 反推（口径决议已否决：残差拆分只做展示报表，不驱动定价，更不该驱动成本）。
+      //
+      // 每间每晚成本取**实际要住的那家**：指定酒店优先，其次套餐绑定房型。这与售价侧
+      // 「地面价不换成指定房型价、另收指定差价」的口径**刻意不同** —— 卖的是随机档的价，
+      // 买的却是指定那家的房，成本必须记指定店的真实采购价，差额正是指定加价那笔收入。
+      // 绑的是随机档占位酒店（不是真房源）时通常没录成本 → null → 整行留 NULL（还没落位，
+      // 成本本就未知），等落位后由回填/人工补。
+      const bundleHotelNightlyCostCny =
+        designatedRoomType?.costPriceCny != null
+          ? Number(designatedRoomType.costPriceCny)
+          : bundle.hotelRoomType?.costPriceCny != null
+            ? Number(bundle.hotelRoomType.costPriceCny)
+            : null;
+      const bundleComponentCosts = await loadBundleComponentCosts([bundle.items]);
+      const bundleGroundCostCny = computeBundleGroundCost({
+        components: bundle.items,
+        hotelNightlyCostCny: bundleHotelNightlyCostCny,
+        rooms,
+        visaHeadCount,
+        visaCostByIdCny: bundleComponentCosts.visaCostByIdCny,
+        transferCostByIdCny: bundleComponentCosts.transferCostByIdCny,
+      });
+
       priced.push({
         kind: 'BUNDLE',
         description: item.description,
@@ -2883,6 +2920,8 @@ export async function priceAndValidateItems(
         roomsBilled: rooms,
         // 加项净额（含指定酒店加价，未打折）：结算价日历取价时叠加在日历价之上（报价口径）。
         settlementAddOnCny: addOn.total + designationSurchargeTotal,
+        // 地面成本快照（机票分量在 FLIGHT 行上，见上方口径）；任一组件成本取不到 → 整行 NULL。
+        totalCostCny: bundleGroundCostCny ?? undefined,
         // 把升级选择 + 重算明细 + roomsNeeded + 操作费 + 指定酒店 + 签证挂牌价快照落到订单行 metadata。
         //（admin 内部仍可叫"单房差/升舱"；roomsNeeded 解释酒店部分为何按房价 ×rooms 收费）。
         metadata: {

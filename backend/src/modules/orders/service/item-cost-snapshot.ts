@@ -255,3 +255,47 @@ export async function loadBundleComponentCosts(
   }
   return { visaCostByIdCny, transferCostByIdCny };
 }
+
+/**
+ * 套餐组件里的住宿晚数合计（HOTEL 组件的 qty 之和；没有 HOTEL 组件 = 0）。
+ *
+ * 与 `computeBundleGroundCost` 的 HOTEL 分支同一个 qty —— 换酒店时要按这个晚数把旧店成本
+ * 减出来、新店成本加回去，取别处的晚数（比如盖章区间的日历天数）会与建单时那一项对不上。
+ */
+export function bundleHotelNightsOf(components: unknown): number {
+  if (!Array.isArray(components)) return 0;
+  return (components as Array<{ kind?: string; qty?: unknown }>).reduce(
+    (sum, c) => (c && c.kind === 'HOTEL' ? sum + (Number(c.qty) || 0) : sum),
+    0,
+  );
+}
+
+/**
+ * 换酒店后 BUNDLE 行的成本快照（只调整住宿那一项，其余组件原样不动）。
+ *
+ * 套餐行的快照是整包地面成本（住宿 + 签证 + 用车），换酒店只换了住宿那一项，所以按**差额**
+ * 挪：`before + (新每晚成本 − 旧每晚成本) × 晚数 × 房数`。整包重算做不到 —— 换酒店流程手上
+ * 没有办签人数等建单时的口径参数，硬算会把另外几项算错。
+ *
+ * 三种「算不出来」一律返回 null（= 该行成本未知），绝不留一个换店前的旧数字装作还准：
+ *   · before 为 null（建单时就没算出整包成本）—— 差额没有基数可加；
+ *   · 新房型没录成本价 —— 换完之后是真不知道；
+ *   · 旧房型没录成本价 / 晚数为 0 —— 减不出旧店那一项，差额无从谈起。
+ */
+export function computeSwapBundleCostSnapshot(input: {
+  /** 换店前的整包地面成本快照（OrderItem.totalCostCny）。 */
+  beforeTotalCostCny: number | null;
+  oldCostPriceCny: number | null;
+  newCostPriceCny: number | null;
+  /** 套餐 HOTEL 组件的晚数合计（见 bundleHotelNightsOf）。 */
+  nights: number;
+  /** 计费房数（roomsBilled，支持 0.5 间）。 */
+  rooms: number;
+}): number | null {
+  const { beforeTotalCostCny, oldCostPriceCny, newCostPriceCny, nights, rooms } = input;
+  if (beforeTotalCostCny == null) return null;
+  if (newCostPriceCny == null || oldCostPriceCny == null) return null;
+  if (nights <= 0 || rooms <= 0) return null;
+  const delta = (newCostPriceCny - oldCostPriceCny) * nights * rooms;
+  return Math.max(0, Math.round(beforeTotalCostCny + delta));
+}
