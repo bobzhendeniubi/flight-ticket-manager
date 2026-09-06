@@ -1,5 +1,6 @@
 import { Prisma, SettlementMode, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
+import { hasCapability } from '../../lib/capabilities.js';
 import { hashPassword } from '../../lib/password.js';
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import type { CreateChildAgentBody, UpdateAgentBody } from './agents.schemas.js';
@@ -242,7 +243,7 @@ export class AgentService {
     previousMode: SettlementMode;
     contactName: string;
   }> {
-    if (currentRole !== UserRole.ADMIN) {
+    if (!hasCapability({ role: currentRole }, 'agents.settlement_mode.write')) {
       throw new ForbiddenError('仅管理员可设置代理结算模式');
     }
     const agent = await prisma.agent.findUnique({
@@ -369,7 +370,7 @@ export class AgentService {
     isActive: boolean;
   }) {
     const { currentUserId, currentRole, targetAgentId, isActive } = input;
-    if (currentRole !== UserRole.ADMIN) {
+    if (!hasCapability({ role: currentRole }, 'agents.status.write')) {
       throw new ForbiddenError('仅管理员可停用/启用代理');
     }
 

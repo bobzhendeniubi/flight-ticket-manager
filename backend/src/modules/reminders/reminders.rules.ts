@@ -38,11 +38,18 @@ import {
   ReminderStatus,
   HoldOrderStatus,
   HoldInstallmentStatus,
-  VisaSubmissionStatus,
   type PrismaClient,
 } from '@prisma/client';
 import { businessDateISO } from '../../lib/business-time.js';
+// 「我方要送签的人」/「我方要送签且还没送出去的人」的圈定条件与签证台共用状态机模块的同一份。
+import {
+  ourUnsubmittedVisaPassengersWhere,
+  ourVisaPassengersWhere,
+} from '../fulfillment/visa-state.js';
+// 订单金额单一口径（审查根因 R2）：尾款走 Decimal 精确变体。
+import { balanceDueDecimal } from '../../lib/order-money.js';
 import { localDateISO } from '../../lib/flight-time.js';
+import { RANDOM_TIER_LEGACY_CITY_CODE } from '../hotel-control/hotel-city.js';
 import {
   getRandomTierShortfall,
   type RandomTierShortfallReport,
@@ -165,17 +172,14 @@ export function formatAmount(v: Prisma.Decimal): string {
   return fixed.includes('.') ? fixed.replace(/0+$/, '').replace(/\.$/, '') : fixed;
 }
 
-/** 尾款口径（与财务一致）：total + adjustmentCny − paidAmount − prepaymentOffset */
+/** 尾款口径（与财务一致）：total + adjustmentCny − paidAmount − prepaymentOffset（Decimal 精确，不舍入）—— lib/order-money。 */
 export function computeBalance(order: {
   total: Prisma.Decimal;
   adjustmentCny: number;
   paidAmount: Prisma.Decimal;
   prepaymentOffset: Prisma.Decimal;
 }): Prisma.Decimal {
-  return new Prisma.Decimal(order.total)
-    .plus(order.adjustmentCny)
-    .minus(order.paidAmount)
-    .minus(order.prepaymentOffset);
+  return balanceDueDecimal(order);
 }
 
 // ── 出发时间推导 ────────────────────────────────────────────────────────────
@@ -538,8 +542,18 @@ function formatShortfallNumber(value: number): string {
 }
 
 /**
+ * 随机档提醒的幂等键。存量默认城市沿用老格式 `RANDOMSHORTFALL:{tier}:{date}`（上线那天不会把
+ * 已有的岘港提醒再生成一遍）；其它城市追加 `:{cityCode}` 后缀，两城同档同日各一条。
+ */
+function randomTierShortfallRuleKey(cityCode: string, tier: number, date: string): string {
+  const base = `RANDOMSHORTFALL:${tier}:${date}`;
+  return cityCode === RANDOM_TIER_LEGACY_CITY_CODE ? base : `${base}:${cityCode}`;
+}
+
+/**
  * 规则 10：未来 7 天内随机档有缺口就提醒房控向地接加房。
- * 每个「档次 × 日期」一条候选，但正文复述该档次 7 天内全部缺口，方便一次处理。
+ * 每个「城市 × 档次 × 日期」一条候选（随机档按城市圈定，岘港三星和会安三星各报各的），
+ * 但正文复述该城市该档次 7 天内全部缺口，方便一次处理。
  */
 export function buildRandomTierShortfallCandidates(
   report: RandomTierShortfallReport,
@@ -547,13 +561,15 @@ export function buildRandomTierShortfallCandidates(
 ): ReminderCandidate[] {
   const end = addDaysUtc(today, 6);
   const days = report.days.filter((day) => day.date >= today && day.date <= end);
-  const gapDatesByTier = new Map<number, Array<{ date: string; shortfall: number; roomsToRequest: number }>>();
+  const poolKey = (tier: RandomTierShortfallReport['days'][number]['tiers'][number]): string =>
+    `${tier.cityCode}|${tier.tier}`;
+  const gapDatesByPool = new Map<string, Array<{ date: string; shortfall: number; roomsToRequest: number }>>();
   for (const day of days) {
     for (const tier of day.tiers) {
       if (tier.shortfall <= 0) continue;
-      const entries = gapDatesByTier.get(tier.tier) ?? [];
+      const entries = gapDatesByPool.get(poolKey(tier)) ?? [];
       entries.push({ date: day.date, shortfall: tier.shortfall, roomsToRequest: tier.roomsToRequest });
-      gapDatesByTier.set(tier.tier, entries);
+      gapDatesByPool.set(poolKey(tier), entries);
     }
   }
 
@@ -561,18 +577,20 @@ export function buildRandomTierShortfallCandidates(
   for (const day of days) {
     for (const tier of day.tiers) {
       if (tier.shortfall <= 0) continue;
-      const details = (gapDatesByTier.get(tier.tier) ?? [])
+      const details = (gapDatesByPool.get(poolKey(tier)) ?? [])
         .map(
           (entry) =>
             `${formatShortfallDate(entry.date)} 缺 ${formatShortfallNumber(entry.shortfall)} 间（需加 ${entry.roomsToRequest} 间）`,
         )
         .join('；');
+      // 「岘港三星随机」：城市在前，两城同档一眼分得开
+      const poolLabel = `${tier.cityLabel}${tier.label}`;
       candidates.push({
         rule: 'RANDOM_TIER_SHORTFALL',
-        ruleKey: `RANDOMSHORTFALL:${tier.tier}:${day.date}`,
+        ruleKey: randomTierShortfallRuleKey(tier.cityCode, tier.tier, day.date),
         orderId: null,
-        title: `${tier.label} ${formatShortfallDate(day.date)} 缺 ${formatShortfallNumber(tier.shortfall)} 间，需向地接加房`,
-        body: `未来7天${tier.label}缺口：${details}。请打开房控页「每日加房清单（随机档缺口）」向地接加房；地接确认后到「包房周期」给真酒店切房。`,
+        title: `${poolLabel} ${formatShortfallDate(day.date)} 缺 ${formatShortfallNumber(tier.shortfall)} 间，需向地接加房`,
+        body: `未来7天${poolLabel}缺口：${details}。请打开房控页「每日加房清单（随机档缺口）」向地接加房（清单按城市分条，别在别的城市加房）；地接确认后到「包房周期」给该城市的真酒店切房。`,
         priority: ReminderPriority.HIGH,
         dueAt: today,
       });
@@ -828,10 +846,11 @@ export async function generateRuleReminders(
                   },
                 },
                 // 只取缺照片乘客的姓名；护照大图（base64 可达数 MB）绝不拉到应用层。
-                // 自备签证乘客（visaExempt=true）不催缺件——与签证台同口径（见 fulfillment.service.ts listByOrder）。
+                // 自备签证乘客（visaExempt=true）不催缺件——「我方的人」圈定与签证台共用状态机的同一份
+                // （ourVisaPassengersWhere）；缺件本身由 passportPhotoUrl 单独判定（不改签证状态）。
                 passengers: {
                   where: {
-                    visaExempt: false,
+                    ...ourVisaPassengersWhere(),
                     OR: [{ passportPhotoUrl: null }, { passportPhotoUrl: '' }],
                   },
                   select: { fullName: true },
@@ -1023,11 +1042,11 @@ export async function generateRuleReminders(
     }
   ).passenger;
   if (passengerDelegate && visaOrderById.size > 0) {
+    // 「我方要送签且还没送出去的人」= 状态机派生态 ∉ {SUBMITTED} 且非自备签，圈定条件用同一份。
     const pendingPax = await passengerDelegate.findMany({
       where: {
         orderId: { in: [...visaOrderById.keys()] },
-        visaExempt: false,
-        visaSubmissionStatus: { not: VisaSubmissionStatus.CONFIRMED },
+        ...ourUnsubmittedVisaPassengersWhere(),
       },
       select: { orderId: true, fullName: true },
     });

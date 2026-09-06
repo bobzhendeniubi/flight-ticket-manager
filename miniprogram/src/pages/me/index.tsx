@@ -1,9 +1,10 @@
 /**
  * 我的页面 — 简化版。登录后显示昵称 + 基础导航；未登录显示登录 CTA。
  */
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import Taro from '@tarojs/taro';
 import { View, Text } from '@tarojs/components';
+import { loadPublicRoutes, routeSummaryText } from '../../lib/routes';
 import { useAuth } from '../../stores/auth';
 import { useCart } from '../../stores/cart';
 import './index.scss';
@@ -11,10 +12,22 @@ import './index.scss';
 export default function MePage() {
   const { user, hydrate, hydrated, clear } = useAuth();
   const clearCart = useCart((s) => s.clear);
+  // 「关于」弹窗里的航线摘要（拉不到/暂无数据时回品牌名，不写死目的地）。
+  const [routeText, setRouteText] = useState('椰岛假期');
 
   useEffect(() => {
     if (!hydrated) hydrate();
   }, [hydrate, hydrated]);
+
+  useEffect(() => {
+    let cancelled = false;
+    void loadPublicRoutes().then((routes) => {
+      if (!cancelled) setRouteText(routeSummaryText(routes));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const logout = () => {
     Taro.showModal({
@@ -80,7 +93,7 @@ export default function MePage() {
           onClick={() =>
             Taro.showModal({
               title: '客服',
-              content: 'support@citur.com\n+853 2888 8888',
+              content: 'support@cocoholiday.example\n+853 0000 0000',
               showCancel: false,
             })
           }
@@ -93,8 +106,8 @@ export default function MePage() {
           className='row'
           onClick={() =>
             Taro.showModal({
-              title: '关于世途旅行',
-              content: '澳门 ⇌ 岘港 · 越南专线\nM2.5 Release · 小程序 MVP',
+              title: '关于椰岛假期',
+              content: `${routeText}\nM2.5 Release · 小程序 MVP`,
               showCancel: false,
             })
           }

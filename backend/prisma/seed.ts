@@ -340,21 +340,7 @@ async function main() {
     }
   }
 
-  // ── 产品：Hotels / Transfers / Visas / Bundles（upsert 幂等） ──
-  await seedHotels();
-  await seedTransfers();
-  await seedVisas();
-  await seedBundles();
-
-  // ── 取消订单费率（默认每个 kind 一条 isDefault 兜底）──
-  await seedCancellationPolicies();
-
-  // ── Demo 订单（演示后台用：6 条不同状态的样例订单）──
-  await seedDemoOrders(customer.id);
-
-  // ── 上线编造评价（每产品 6~12 条 zh-CN 评价 + 航线评价）──
-  await seedReviews();
-
+  // ── 航班（必须先于产品：套餐绑 QH9589/QH9588 派生航线，空库上先种航班才有得绑）──
   // ── 清理不在列表里的历史航班（只在没有订单关联时） ──
   const keepFlightNumbers = FLIGHT_SEED.map((f) => f.flightNumber);
   const toRemove = await prisma.flight.findMany({
@@ -450,6 +436,21 @@ async function main() {
       }
     }
   }
+
+  // ── 产品：Hotels / Transfers / Visas / Bundles（upsert 幂等） ──
+  await seedHotels();
+  await seedTransfers();
+  await seedVisas();
+  await seedBundles();
+
+  // ── 取消订单费率（默认每个 kind 一条 isDefault 兜底）──
+  await seedCancellationPolicies();
+
+  // ── Demo 订单（演示后台用：6 条不同状态的样例订单）──
+  await seedDemoOrders(customer.id);
+
+  // ── 上线编造评价（每产品 6~12 条 zh-CN 评价 + 航线评价）──
+  await seedReviews();
 
   // ── 日期等级 (DateRanking) — 365 天 ────────────────────────────────
   // DOW 默认：Sun=A, Mon=C, Tue=D, Wed=D, Thu=C, Fri=B, Sat=B
@@ -729,15 +730,32 @@ async function seedBundles() {
     ],
   };
 
+  // 套餐必须绑航班：航线由绑定航班派生（bundle-route.ts），没绑 = 没航线 = 不可售。
+  // 种子航线 澳门 ⇌ 岘港：去程 QH9589（MFM→DAD）、回程 QH9588（DAD→MFM），都在 FLIGHT_SEED 里。
+  const outboundFlight = await prisma.flight.findUnique({
+    where: { flightNumber: 'QH9589' },
+    select: { id: true },
+  });
+  const returnFlight = await prisma.flight.findUnique({
+    where: { flightNumber: 'QH9588' },
+    select: { id: true },
+  });
+  if (!outboundFlight || !returnFlight) {
+    throw new Error('seedBundles: 种子航班 QH9589/QH9588 缺失，套餐无法绑定航线');
+  }
+  const routeBinding = { outboundFlightId: outboundFlight.id, returnFlightId: returnFlight.id };
+
   const soldCount = randInt(60, 520);
   const existing = await prisma.bundle.findFirst({ where: { name: b.name } });
   if (existing) {
     await prisma.bundle.update({
       where: { id: existing.id },
-      data: { ...b, items: b.items, soldCount, isActive: true },
+      data: { ...b, ...routeBinding, items: b.items, soldCount, isActive: true },
     });
   } else {
-    await prisma.bundle.create({ data: { ...b, items: b.items, soldCount, isActive: true } });
+    await prisma.bundle.create({
+      data: { ...b, ...routeBinding, items: b.items, soldCount, isActive: true },
+    });
   }
 }
 

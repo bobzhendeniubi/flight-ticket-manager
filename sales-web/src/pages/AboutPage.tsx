@@ -2,9 +2,10 @@ import { Link } from 'react-router-dom';
 import { Seo } from '../components/Seo';
 import { Breadcrumb } from '../components/Breadcrumb';
 import { Icon, type IconName } from '../components/Icon';
+import { useActiveDestinationContent } from '../lib/useActiveDestination';
 
 /**
- * 关于我们 — 品牌介绍（椰岛假期 / Coco Holiday，澳门⇌岘港海岛专线）、
+ * 关于我们 — 品牌介绍（椰岛假期 / Coco Holiday，海岛专线）、
  * 「为什么选我们」、信任 / 资质块。Seo。
  *
  * 文案说明（make up）：品牌叙述基于已知事实（海岛专线、一价全包、中文客服）撰写，
@@ -17,7 +18,9 @@ interface Reason {
   desc: string;
 }
 
-const REASONS: Reason[] = [
+/** 「专注一条线」那张卡的正文跟着当前主推目的地走，其余三张与航线无关。 */
+function buildReasons(focusReasonDesc: string): Reason[] {
+  return [
   {
     icon: 'package',
     title: '一价全包，省心',
@@ -26,7 +29,7 @@ const REASONS: Reason[] = [
   {
     icon: 'mapPin',
     title: '专注一条线，专业',
-    desc: '只做澳门⇌岘港海岛专线，对航班、酒店、签证流程熟门熟路，能给到更贴合的行程建议。',
+    desc: focusReasonDesc,
   },
   {
     icon: 'support',
@@ -38,7 +41,8 @@ const REASONS: Reason[] = [
     title: '透明须知，无套路',
     desc: '退改、扣损规则在下单前逐条写清楚，价格提交后锁定，按章办事不玩文字游戏。',
   },
-];
+  ];
+}
 
 interface TrustItem {
   icon: IconName;
@@ -46,19 +50,27 @@ interface TrustItem {
   value: string;
 }
 
-const TRUST: TrustItem[] = [
-  { icon: 'shield', label: '经营资质', value: '正规旅行社（牌照号待补 placeholder）' },
-  { icon: 'plane', label: '主营线路', value: '澳门 ⇌ 岘港海岛专线' },
-  { icon: 'gift', label: '套餐内含', value: '机票 + 酒店 + 签证 + 地面服务' },
-  { icon: 'support', label: '客服支持', value: '中文客服 · 工作时间在线' },
-];
+/** 「主营线路」跟着当前主推目的地走，其余三条与航线无关。 */
+function buildTrust(mainRouteValue: string): TrustItem[] {
+  return [
+    { icon: 'shield', label: '经营资质', value: '正规旅行社（牌照号待补 placeholder）' },
+    { icon: 'plane', label: '主营线路', value: mainRouteValue },
+    { icon: 'gift', label: '套餐内含', value: '机票 + 酒店 + 签证 + 地面服务' },
+    { icon: 'support', label: '客服支持', value: '中文客服 · 工作时间在线' },
+  ];
+}
 
 export default function AboutPage() {
+  // 页面里跟航线走的几处（SEO 描述 / 徽标 / 专注一条线 / 主营线路 / 品牌故事首段）
+  // 统一从当前主推目的地那一组取，见 lib/content.ts。
+  const destination = useActiveDestinationContent();
+  const REASONS = buildReasons(destination.about.focusReasonDesc);
+  const TRUST = buildTrust(destination.about.mainRouteValue);
   return (
     <div className="mx-auto max-w-4xl">
       <Seo
         title="关于我们"
-        description="椰岛假期 · Coco Holiday — 澳门⇌岘港海岛专线，专注机票+酒店+签证+地面服务一价全包的海岛度假。"
+        description={destination.about.seoDescription}
         canonicalPath="/about"
       />
 
@@ -68,7 +80,7 @@ export default function AboutPage() {
       <header className="mt-4 overflow-hidden rounded-3xl border border-slate-200/80 bg-gradient-to-br from-brand-600 to-brand-800 p-8 text-white shadow-lift md:p-12">
         <span className="badge bg-white/15 text-white backdrop-blur">
           <Icon name="mapPin" className="h-3.5 w-3.5" />
-          澳门 ⇌ 岘港 海岛专线
+          {destination.about.routeBadge}
         </span>
         <h1 className="mt-4 text-3xl font-extrabold tracking-tight md:text-4xl">椰岛假期 · Coco Holiday</h1>
         <p className="mt-3 max-w-2xl text-base leading-relaxed text-white/90 md:text-lg">
@@ -81,10 +93,7 @@ export default function AboutPage() {
       <section className="mt-10">
         <h2 className="section-title text-xl">我们是谁</h2>
         <div className="section-sub space-y-3 text-base leading-relaxed text-ink-soft">
-          <p>
-            椰岛假期（Coco Holiday）专注澳门⇌岘港海岛专线，为出行者提供机票 + 酒店 + 签证 + 地面服务的一站式打包预订。
-            相比东拼西凑地分别预订，我们用一个套餐价覆盖整段行程，省下比价和协调的精力。
-          </p>
+          <p>{destination.about.storyLead}</p>
           <p>
             因为只深耕这一条线，我们对航班时刻、酒店选择、签证办理节奏更有把握，也更清楚旅客在每个环节真正在意什么——
             干净的海景房、靠谱的落地接送、看得懂的退改规则。

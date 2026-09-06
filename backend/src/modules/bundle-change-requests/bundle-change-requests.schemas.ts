@@ -1,25 +1,10 @@
 /**
- * 套餐改档申请 · 入参校验。
+ * 套餐改档申请的请求体与查询参数 —— 定义已搬进 @ftm/contracts（packages/contracts/src/bundle-change-requests.ts）。
  *
- * 代理只能提交目标套餐和申请说明，订单改档与重新计价必须等运营确认。
+ * 校验规则一字未改：只把 z.nativeEnum(PrismaEnum) 换成契约包镜像的同值 schema
+ *（枚举漂移测试守着两边一致），helper 的 import 改指契约包里的同一份实现。
+ *
+ * 这里留 re-export 壳子，既有 import 路径全部继续可用；前端从 @ftm/contracts
+ * 取同一份类型，不再手抄。
  */
-import { BundleChangeRequestStatus } from '@prisma/client';
-import { z } from 'zod';
-
-export const createBundleChangeRequestBodySchema = z.object({
-  bundleId: z.string().min(1),
-  note: z.string().max(200, '申请说明最多 200 字').optional(),
-});
-export type CreateBundleChangeRequestBody = z.infer<typeof createBundleChangeRequestBodySchema>;
-
-export const decideBundleChangeRequestBodySchema = z.object({
-  note: z.string().max(200, '备注最多 200 字').optional(),
-});
-export type DecideBundleChangeRequestBody = z.infer<typeof decideBundleChangeRequestBodySchema>;
-
-export const listBundleChangeRequestsQuerySchema = z.object({
-  status: z.nativeEnum(BundleChangeRequestStatus).optional(),
-  page: z.coerce.number().int().min(1).max(100_000).default(1),
-  pageSize: z.coerce.number().int().min(1).max(200).default(50),
-});
-export type ListBundleChangeRequestsQuery = z.infer<typeof listBundleChangeRequestsQuerySchema>;
+export * from '@ftm/contracts/bundle-change-requests';

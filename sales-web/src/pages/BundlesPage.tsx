@@ -52,10 +52,11 @@ import { EmptyState } from '../components/EmptyState';
 import { matchKeyword } from '../components/HomeSections';
 import { useAuth } from '../stores/auth';
 import { useCart } from '../stores/cart';
+import { resolveBundleRoute, type BundleRoute } from '../lib/bundleRoute';
 
-/** 主航线（澳门 ⇌ 岘港）。住宿晚数走 resolveBundleNights（hotelNights → HOTEL qty → 兜底）。 */
-const ROUTE_ORIGIN = 'MFM';
-const ROUTE_DEST = 'DAD';
+// 航线不再写死：每个套餐的航线由它绑定的去/回程航班派生（lib/bundleRoute.ts），
+// 没绑航班 = 没航线 = 不可售（服务端 sellable-dates 会给 reason='NO_FLIGHT_BOUND'）。
+// 住宿晚数走 resolveBundleNights（hotelNights → HOTEL qty → 兜底）。
 
 /** 机票单航段兜底价（搜不到班次时用，避免价格显示为 0） */
 const FALLBACK_PRICE = {
@@ -126,6 +127,8 @@ interface BundleView extends Bundle {
   /** 运营绑定的去/回航班号（选出发日后据此把航段解析到对应班次；null = 未绑定，回退首条）。 */
   outboundFlightNumber: string | null;
   returnFlightNumber: string | null;
+  /** 该套餐的航线（由绑定航班派生，去程方向）；null = 没绑航班 = 不可售。 */
+  route: BundleRoute | null;
   /** 套餐默认出发日（管理员设；null = 未设，前端回退 today+3） */
   defaultDepartDate: string | null;
   rating: ProductRating | null;
@@ -160,6 +163,7 @@ function bundleApiToView(b: ApiBundle): BundleView {
     hotelNights: b.hotelNights ?? null,
     outboundFlightNumber: b.outboundFlight?.flightNumber ?? null,
     returnFlightNumber: b.returnFlight?.flightNumber ?? null,
+    route: resolveBundleRoute(b),
     defaultDepartDate: b.defaultDepartDate ?? null,
     rating: b.rating ?? null,
     reviewCount: b.reviewCount ?? null,
@@ -653,15 +657,26 @@ function ConfigurableBundleCard({
   const displayReturnDate = addDaysISO(cardGoDate, nights);
   const queryReturnDate = addDaysISO(queryCardGo, nights);
 
-  // 触发去/回航段搜索（缓存幂等去重）
+  // 该套餐自己的航线（由绑定航班派生）；没绑航班 → 无航线，不发任何航段查询。
+  const routeOrigin = b.route?.origin ?? null;
+  const routeDest = b.route?.destination ?? null;
+
+  // 触发去/回航段搜索（缓存幂等去重）。无航线时不查——没有"默认航线"可退。
   useEffect(() => {
-    flightCache.ensure(ROUTE_ORIGIN, ROUTE_DEST, queryCardGo);
-    flightCache.ensure(ROUTE_DEST, ROUTE_ORIGIN, queryReturnDate);
-  }, [flightCache, queryCardGo, queryReturnDate]);
+    if (!routeOrigin || !routeDest) return;
+    flightCache.ensure(routeOrigin, routeDest, queryCardGo);
+    flightCache.ensure(routeDest, routeOrigin, queryReturnDate);
+  }, [flightCache, routeOrigin, routeDest, queryCardGo, queryReturnDate]);
 
   // 按运营绑定的航班号解析航段：绑定命中该班，未绑定/未命中回退首条（与旧版一致）。
-  const outLeg = flightCache.getByFlightNumber(ROUTE_ORIGIN, ROUTE_DEST, queryCardGo, b.outboundFlightNumber);
-  const retLeg = flightCache.getByFlightNumber(ROUTE_DEST, ROUTE_ORIGIN, queryReturnDate, b.returnFlightNumber);
+  const outLeg =
+    routeOrigin && routeDest
+      ? flightCache.getByFlightNumber(routeOrigin, routeDest, queryCardGo, b.outboundFlightNumber)
+      : null;
+  const retLeg =
+    routeOrigin && routeDest
+      ? flightCache.getByFlightNumber(routeDest, routeOrigin, queryReturnDate, b.returnFlightNumber)
+      : null;
   const legs = { go: toLegInfo(outLeg), ret: toLegInfo(retLeg) };
 
   const goTier = legTier(outLeg, cabin);
@@ -699,10 +714,10 @@ function ConfigurableBundleCard({
   const sellable = useBundleSellableDates(b.id);
   // 所选出发日不在可售集合时的原因（封盘/机位满/满房）；可售或未知 → null（不拦截）。
   // 仅当窗口已就绪且确有可售日时才据集合判定，避免空窗（加载中/查失败）误拦。
-  const dateReason =
-    sellable.status === 'ready' && sellable.sellableSet.size > 0 && !sellable.sellableSet.has(cardGoDate)
-      ? sellable.reasonOf(cardGoDate)
-      : null;
+  // reasonOf 对"可售日"和"窗口外/未加载的日子"都返回 null，本身就是"未知不拦截"的语义，
+  // 所以不再额外用 sellableSet.size > 0 当加载判据 —— 那个判据会让「整段区间都不可售」
+  // （如套餐没绑航班）静默变成"没有原因"，买家点下去才被后端拒。
+  const dateReason = sellable.status === 'ready' ? sellable.reasonOf(cardGoDate) : null;
 
   // 实时机票单人来回价（搜不到用兜底价）
   const fb = FALLBACK_PRICE[cabin];

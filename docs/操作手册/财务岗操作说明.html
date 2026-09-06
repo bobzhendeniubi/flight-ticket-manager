@@ -315,7 +315,7 @@
 <div class="shot">
   <div class="shot-bar"><span class="dot r"></span><span class="dot y"></span><span class="dot g"></span><span class="shot-title">流水认款工作台（示意）</span></div>
   <div class="shot-body">
-    <div class="panel" style="border-color:#A7F3D0;background:#ECFDF5;"><div class="pt">自动配对建议（金额一对一吻合）· 1 组</div><div class="mrow" style="justify-content:space-between;"><span><b>¥1,810.00</b> <span style="color:#94A3B8;">7/21 21:58 …95101313</span> → <b>FTM2026072100123</b> 张三</span><span class="mbtn"><span class="mark">1</span>一键认款</span></div></div>
+    <div class="panel" style="border-color:#A7F3D0;background:#ECFDF5;"><div class="pt">认款建议 · 高置信度 · 1 组</div><div class="mrow" style="justify-content:space-between;"><span><b>¥1,810.00</b> <span style="color:#94A3B8;">7/21 21:58 …95101313</span> → <b>FTM2026072100123</b> 张三</span><span class="mbtn"><span class="mark">1</span>一键认款</span></div></div>
     <div class="mrow" style="gap:12px;align-items:flex-start;">
       <span class="panel" style="min-width:180px;"><div class="pt"><span class="mark">2</span>未认款流水（拖我）</div><b style="color:var(--green);">微</b> <b>¥544.00</b> <span class="badge b-blue">部分</span><br/><span style="color:#94A3B8;font-size:11px;">7/21 22:27 · …99377527</span></span>
       <span class="panel" style="flex:1;border-style:dashed;"><div class="pt"><span class="mark">3</span>待收款订单（拖到这）</div><b>FTM2026072100456</b> 李四 <span class="badge b-green">金额吻合</span><br/><span style="color:#94A3B8;font-size:11px;">应收 ¥3,840 · 已收 ¥3,296 · <b style="color:var(--amber);">尾款 ¥544</b></span></span>
@@ -323,13 +323,26 @@
   </div>
 </div>
 <ol class="steps">
-  <li><b>最快：一键认款。</b>顶部绿色「自动配对建议」列出金额一对一吻合的组合（恰好一笔流水 ↔ 恰好一张订单），核对无误直接点「一键认款」。</li>
+  <li><b>最快：一键认款。</b>顶部绿色「认款建议 · 高置信度」列出系统算出来的组合，核对无误直接点「一键认款」；勾上几条还能一次性批量认。怎么算出来的见下面第 3 节。</li>
   <li><b>最直观：拖拽。</b>左边流水池里把一笔流水<b>拖</b>到右边订单卡上，弹出金额确认（默认帮你填好），点「确认认款」。</li>
   <li><b>不爱拖：点选。</b>点一下流水（高亮选中）→ 每张订单卡上出现「认款到此单」按钮 → 点目标订单的按钮即可。</li>
 </ol>
 <div class="card">💡 <b>绿框 = 该放哪。</b>选中/拖动流水时，尾款和这笔钱正好相等的订单会亮绿框＋「金额吻合」标签。<br/>💡 <b>钱比尾款多？</b>比如流水 ¥544、订单尾款只差 ¥300：系统默认只认 ¥300，剩下 ¥244 留在池子里（流水显示蓝色「部分」标签），继续认给其他订单。一笔钱付了几张订单、几笔钱凑一张订单，都这么处理。</div>
 
-<h3>3. 第三步：导出核对表（代替线下勾表）</h3>
+<h3>3. 「认款建议」是怎么算出来的</h3>
+<p class="sub">以前这块只认一种线索：一笔流水的金额恰好等于一张订单的尾款。现在改由服务端算，除了金额还看身份线索，算完按把握大小分三档摆出来。<b>不管哪一档，系统都不会自己入账</b>——认款这一下始终得人来点。</p>
+<ol class="steps">
+  <li><b>先找身份线索。</b>付款备注里的订单号、乘客或联系人姓名、代理公司名/代理联系人、联系人手机（全号或尾号 4 位），还有客户自报的疑似订单，都会被认出来。每条建议后面挂着标签写清楚是凭什么推的：<span class="badge b-green">备注含订单号</span> <span class="badge b-green">备注含姓名</span> <span class="badge b-green">付款人=代理</span> <span class="badge b-green">手机尾号吻合</span> <span class="badge b-blue">金额吻合</span> <span class="badge b-blue">时间邻近</span>。</li>
+  <li><b>再分三档。</b>
+    <br/>· <b>高</b>＝金额精确 + 至少一条身份线索 + 双向唯一（这笔钱只推这一张单，这张单也只被这笔钱推中）。这一档才给「一键认款 / 勾选批量认款」。
+    <br/>· <b>中</b>＝金额吻合但备注里没有任何身份线索、或者线索够强但金额只是部分付款。这一档不给一键按钮，点「选中并定位」跳到那张订单，拖一下再确认。
+    <br/>· <b>低</b>＝线索较弱，只摆出来供参考。</li>
+  <li><b>候选订单回看近 90 天。</b>更早的旧单不进建议区，回「待认领」页签按订单号认领。</li>
+</ol>
+<div class="warn">⚠ <b>有意收紧的一条：金额恰好相等、但备注里一个身份线索都没有的，只给「中」档，不给一键认款。</b>同额撞单在旺季很常见（两张单尾款都是 ¥1,810），光凭金额一键认下去很容易认错人。多拖这一下，是防这个。</div>
+<div class="card">💡 <b>组合建议（多笔凑一单 / 一笔付多单）</b>单独摆一块：同一个人同一天分几笔付清一张单、或者一笔钱付了同一个代理的几张单，合计金额精确相等时会被凑出来。这块<b>永远不会是高置信度</b>，中档的可以点「按此组合认款」，点之前确认框会把每一笔怎么认逐条列出来给你看；低档的只展示。</div>
+
+<h3>4. 收尾：导出核对表（代替线下勾表）</h3>
 <ol class="steps">
   <li>页签右上选日期区间（可留空＝全部）→ 点 <b>⬇ 导出核对表</b>。</li>
   <li>导出的 Excel 里每笔流水一行：交易流水号、金额、<b>认款状态（未认款 / 部分认款 / 已认款 / 已退款）</b>、已认金额、未认余额、<b>认到了哪张订单</b>、认款人、认款时间。拿这张表就能直接对账，不用再手工勾。</li>

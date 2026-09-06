@@ -2,6 +2,7 @@ import { Suspense, lazy, useEffect, useState } from 'react';
 import type { FormEvent } from 'react';
 import { Link, Navigate, NavLink, Outlet, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import { useTranslation } from 'react-i18next';
+import { api } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useCart } from '../stores/cart';
 import { useLanguage, SUPPORTED_LANGUAGES, type SupportedLanguage } from '../i18n';
@@ -9,6 +10,7 @@ import { MobilePreviewFrame } from './MobilePreviewFrame';
 import { MobileBottomBar } from './MobileBottomBar';
 import { Icon } from './Icon';
 import { WaveDivider } from './WaveDivider';
+import { useActiveDestinationContent } from '../lib/useActiveDestination';
 
 // 浮动 AI 助手懒加载（G1 性能）：AiAssistant 体量大（~40KB），不该进首屏 bundle。
 // React.lazy + Suspense(fallback=null) 让它在外壳挂载后异步拉取 —— 行为与之前完全一致
@@ -65,6 +67,30 @@ export function Layout() {
   const adminUrl = import.meta.env.DEV
     ? 'http://localhost:5174'
     : window.location.origin.replace('store', 'admin');
+
+  // ── 能力清单引导 ──────────────────────────────────────────────────────
+  // /auth/login 的响应里没有能力清单（后端只在 /users/me 上算），所以外壳挂载后补一次，
+  // 把它合进 user 存起来 —— useCapabilities 只认 user.capabilities，路由守卫都从这一份读。
+  // 与后台 admin-web 的 Layout 是同一套做法；改岗后下次进站即生效。
+  const userId = user?.id;
+  useEffect(() => {
+    if (!userId) return;
+    let cancelled = false;
+    // 取当下最新的令牌（刻意不进依赖数组）：轮换后重跑不是目的，但真跑起来时必须用最新那枚。
+    const accessToken = useAuth.getState().tokens?.accessToken;
+    if (!accessToken) return;
+    api
+      .me(accessToken)
+      .then((res) => {
+        if (cancelled) return;
+        useAuth.setState({ user: { ...res.user, capabilities: res.capabilities } });
+      })
+      // 拉不到就维持现状：能力清单只管少给入口，真正的闸在后端，绝不因此打断浏览。
+      .catch(() => undefined);
+    return () => {
+      cancelled = true;
+    };
+  }, [userId]);
 
   if (user?.mustChangePassword && location.pathname !== '/change-password') {
     return <Navigate to="/change-password" replace />;
@@ -480,6 +506,8 @@ function LanguageSwitch({ className }: { className?: string }) {
 /** 多列页脚（E1）— 关于椰岛假期 / 帮助支持 / 法律条款 / 联系我们 + 品牌简介 + 社交 + 底部法律行。
  *  链接全用 react-router <Link>；手机端列堆叠，并留出底部导航高度（pb-24）。 */
 function SiteFooter() {
+  // 页脚品牌简介跟着当前主推目的地走（按目的地分组，见 lib/content.ts）
+  const destination = useActiveDestinationContent();
   const year = new Date().getFullYear();
 
   // 占位公司信息：真实主体名称与 ICP 备案号待法务/运营补全 —— 这里明确标注 placeholder。
@@ -557,7 +585,7 @@ function SiteFooter() {
               </span>
             </Link>
             <p className="mt-4 max-w-xs text-sm leading-relaxed text-ink-soft">
-              澳门⇌岘港海岛专线，机票 + 酒店 + 签证 + 地面服务一价全包。中文客服全程在线，让海岛度假省心又省钱。
+              {destination.footerTagline}
             </p>
             <div className="mt-4 flex flex-wrap gap-2">
               <span className="badge-soft">

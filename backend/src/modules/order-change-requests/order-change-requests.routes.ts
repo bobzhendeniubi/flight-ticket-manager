@@ -7,7 +7,6 @@
  * 权限分工与套餐改档申请一致：提交 = 运营 + 代理；确认 / 驳回 = 只有运营。
  */
 import type { FastifyPluginAsync } from 'fastify';
-import { UserRole } from '@prisma/client';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { OrderChangeRequestsService } from './order-change-requests.service.js';
 import {
@@ -16,6 +15,7 @@ import {
   createOrderChangeRequestBodySchema,
   decideOrderChangeRequestBodySchema,
   listOrderChangeRequestsQuerySchema,
+  previewOrderChangeRequestBodySchema,
 } from './order-change-requests.schemas.js';
 
 const service = new OrderChangeRequestsService();
@@ -26,7 +26,7 @@ export const ORDER_CHANGE_REQUEST_REJECTED_ACTION = 'ORDER_CHANGE_REQUEST_REJECT
 
 /** 挂在 /orders 前缀下：单张单提交。 */
 export const orderChangeRequestOrderRoutes: FastifyPluginAsync = async (app) => {
-  const requireAgentOrOps = app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT);
+  const requireAgentOrOps = app.requireCapability('change_requests.submit');
 
   app.post(
     '/:id/change-requests',
@@ -54,12 +54,30 @@ export const orderChangeRequestOrderRoutes: FastifyPluginAsync = async (app) => 
       return reply.status(201).send({ request });
     },
   );
+
+  // 三类扩展（拆单 / 取消单程 / 改自备签）提交前的只读预检：把 blockers 与预估退款、
+  // 拆出份额摆给提交方看。只读，不落申请、不写审计。
+  // flag 关着时与提交端点同拒（403 FEATURE_DISABLED），前台据此不渲染这三项。
+  app.post(
+    '/:id/change-requests/preview',
+    { preHandler: [app.authenticate, requireAgentOrOps] },
+    async (req) => {
+      const { id } = req.params as { id: string };
+      const body = previewOrderChangeRequestBodySchema.parse(req.body);
+      return service.previewExtraKind(
+        { userId: req.user.sub, role: req.user.role },
+        id,
+        body.kind,
+        body.payload,
+      );
+    },
+  );
 };
 
 /** 挂在 /order-change-requests 前缀下：批量提交 + 运营队列 + 处理。 */
 export const orderChangeRequestRoutes: FastifyPluginAsync = async (app) => {
-  const requireOps = app.requireRole(UserRole.ADMIN, UserRole.STAFF);
-  const requireAgentOrOps = app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT);
+  const requireOps = app.requireCapability('change_requests.decide');
+  const requireAgentOrOps = app.requireCapability('change_requests.submit');
 
   // 批量提交：一批订单同一类改动（只支持改班次 / 签证状态）。
   app.post('/batch', { preHandler: [app.authenticate, requireAgentOrOps] }, async (req) => {
@@ -90,6 +108,13 @@ export const orderChangeRequestRoutes: FastifyPluginAsync = async (app) => {
     return service.list({ userId: req.user.sub, role: req.user.role }, query);
   });
 
+  // 当前能提哪几类：基础四类恒有，扩展三类只在 flag 开着时才出现。
+  // 前台靠它决定申请类型下拉里出不出这三项（/settings/feature-flags 只对运营开放，
+  // 代理读不到，不能拿那条路当判据）。
+  app.get('/kinds', { preHandler: [app.authenticate, requireAgentOrOps] }, async (req) => {
+    return service.availableKinds({ userId: req.user.sub, role: req.user.role });
+  });
+
   // 待办角标：运营订单页顶栏那颗红点读的就是这个数。
   app.get('/pending-count', { preHandler: [app.authenticate, requireOps] }, async (req) => {
     return service.pendingCount({ userId: req.user.sub, role: req.user.role });
@@ -98,8 +123,10 @@ export const orderChangeRequestRoutes: FastifyPluginAsync = async (app) => {
   app.post('/:id/approve', { preHandler: [app.authenticate, requireOps] }, async (req) => {
     const { id } = req.params as { id: string };
     const body = decideOrderChangeRequestBodySchema.parse(req.body ?? {});
+    // staffRole 逐请求从 User 表取回（authenticate 写进 req.staffRole），改岗后下一个
+    // 请求即生效。确认「改自备签」这一类要判岗，别的类不看它。
     const { request, order, audit } = await service.approve(
-      { userId: req.user.sub, role: req.user.role },
+      { userId: req.user.sub, role: req.user.role, staffRole: req.staffRole },
       id,
       body,
     );
@@ -159,7 +186,7 @@ export const orderChangeRequestRoutes: FastifyPluginAsync = async (app) => {
   app.post('/batch-approve', { preHandler: [app.authenticate, requireOps] }, async (req) => {
     const body = batchApproveOrderChangeRequestBodySchema.parse(req.body);
     const { approved, failed, results, approvedRequests } = await service.batchApprove(
-      { userId: req.user.sub, role: req.user.role },
+      { userId: req.user.sub, role: req.user.role, staffRole: req.staffRole },
       body,
     );
     for (const { request, audit } of approvedRequests) {

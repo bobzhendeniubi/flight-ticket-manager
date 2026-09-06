@@ -18,7 +18,8 @@
  */
 import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
-import { OrderStatus } from '@prisma/client';
+// 订单状态集合全站唯一一份（审查根因 R2）：财务口径含 REFUND_REQUESTED。
+import { COUNTED_STATUSES } from '../../lib/order-status-sets.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import {
@@ -27,17 +28,8 @@ import {
   resolveScheduleCost,
 } from './finances.cost.service.js';
 import { visaItemCostCny } from './finances.service.js';
-
-const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.REFUND_REQUESTED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
+import { parseRouteKey } from '../products/bundle-route.js';
+import { UNKNOWN_ROUTE_KEY } from '../../lib/order-route.js';
 
 interface FlightRow {
   flightNumber: string;
@@ -129,6 +121,11 @@ function countFlightLegs(items: Array<{ kind: string; flightScheduleId?: string 
 
 export async function buildFinanceExportByFlightWorkbook(
   range: { from: string; to: string },
+  /**
+   * 只导这条航线的班次（'MFM-DAD' 形状）；不传 = 全部航线。
+   * 去回两个方向都导 —— 一条线的回程班次也是这条线的成本，只导去程方向会漏掉一半。
+   */
+  routeKey: string | null = null,
   client: PrismaClient = defaultPrisma,
 ): Promise<Buffer> {
   const [y1, m1, d1] = range.from.split('-').map((x) => parseInt(x, 10));
@@ -137,8 +134,23 @@ export async function buildFinanceExportByFlightWorkbook(
   const toD = new Date(Date.UTC(y2, m2 - 1, d2, 23, 59, 59, 999));
 
   // 1) 拉范围内所有班次（含座位）
+  // 航线筛选下推到航班表：本表一行 = 一个班次，航线就是该班次航班的起降地，不必绕订单派生。
+  // 'unknown' 桶按航班筛没有意义（那一桶讲的是「订单推不出航线」），按不筛处理。
+  const routeParsed = routeKey && routeKey !== UNKNOWN_ROUTE_KEY ? parseRouteKey(routeKey) : null;
   const schedules = await client.flightSchedule.findMany({
-    where: { departureTime: { gte: fromD, lte: toD } },
+    where: {
+      departureTime: { gte: fromD, lte: toD },
+      ...(routeParsed
+        ? {
+            flight: {
+              OR: [
+                { originCode: routeParsed.origin, destinationCode: routeParsed.destination },
+                { originCode: routeParsed.destination, destinationCode: routeParsed.origin },
+              ],
+            },
+          }
+        : {}),
+    },
     orderBy: { departureTime: 'asc' },
     include: {
       flight: { select: { id: true, flightNumber: true, originCode: true, destinationCode: true } },
@@ -366,6 +378,11 @@ async function renderWorkbook(rows: FlightRow[]): Promise<Buffer> {
   return Buffer.from(buf);
 }
 
-export function financeExportByFlightFilename(range: { from: string; to: string }): string {
-  return `按航班_${range.from}_${range.to}.xlsx`;
+export function financeExportByFlightFilename(
+  range: { from: string; to: string },
+  /** 圈了航线就写进文件名 —— 两条线各导一份放同一个文件夹时分得清哪份是哪条线。 */
+  routeKey: string | null = null,
+): string {
+  const routeSuffix = routeKey && routeKey !== UNKNOWN_ROUTE_KEY ? `_${routeKey}` : '';
+  return `按航班_${range.from}_${range.to}${routeSuffix}.xlsx`;
 }

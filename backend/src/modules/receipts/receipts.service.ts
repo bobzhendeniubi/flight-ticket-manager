@@ -35,17 +35,29 @@ import {
 } from '../../lib/funds-guard.js';
 import { writeAudit } from '../../lib/audit.js';
 import { outstandingCommissionNetWithinTx, round2 } from '../../lib/commission-net.js';
+// 订单金额单一口径（审查根因 R2）：对账台候选 / 认款建议的应收、已付、尾款（元 / 分）从这里取。
+import { balanceDueCents, balanceDueCny, paidCny, payableCny } from '../../lib/order-money.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { PaymentsService } from '../payments/payments.service.js';
-import type {
-  AllocateBatchInput,
-  AllocateReceiptInput,
-  ExportStatementQuery,
-  ImportStatementInput,
-  ListReceiptsQuery,
-  MatchCandidatesQuery,
-  RegisterReceiptInput,
+import {
+  MATCH_SUGGEST_DEFAULT_SINCE_DAYS,
+  MATCH_SUGGEST_MAX_RECEIPTS,
+  type AllocateBatchInput,
+  type AllocateReceiptInput,
+  type ExportStatementQuery,
+  type ImportStatementInput,
+  type ListReceiptsQuery,
+  type MatchCandidatesQuery,
+  type RegisterReceiptInput,
+  type SuggestMatchesInput,
 } from './receipts.schemas.js';
+import {
+  matchReceipts,
+  toCents,
+  type ComboSuggestion,
+  type MatchOrder,
+  type MatchReceipt,
+} from './receipt-matching.js';
 import {
   parseStatementXlsx,
   buildStatementExportWorkbook,
@@ -1575,10 +1587,9 @@ export class ReceiptsService {
       departureDate: string | null;
     }> = [];
     for (const o of orders) {
-      const totalPayable = round2(Number(o.total) + (o.adjustmentCny ?? 0));
-      const balanceDue = round2(
-        totalPayable - Number(o.paidAmount) - Number(o.prepaymentOffset),
-      );
+      // 应收 / 尾款走 lib/order-money（与 serializeOrder.balanceDue 同一个函数）。
+      const totalPayable = payableCny(o);
+      const balanceDue = balanceDueCny(o);
       if (balanceDue <= 0.005) continue;
       out.push({
         orderId: o.id,
@@ -1595,6 +1606,230 @@ export class ReceiptsService {
       if (out.length >= 200) break;
     }
     return out;
+  }
+
+  // ════════════════════════════════════════════════════════════════════
+  // 认款建议（服务端匹配引擎；只出建议，不入账）
+  // ════════════════════════════════════════════════════════════════════
+  /**
+   * 未认完的流水 × 近 sinceDays 天内尾款 > 0 的活跃订单 → 匹配引擎 → 分档建议。
+   *
+   * - receiptIds 缺省 = 全部未认完的流水导入 / 运营水单登记（STATEMENT_IMPORT / OPS_CLAIM）；
+   *   给了 receiptIds 则只算这些（状态仍须未认完——已认完 / 已退款的静默跳过，不报错）。
+   * - 候选订单不再只回「近 400 单」：按下单时间窗口**分页拉全**，尾款在代码里算
+   *   （total + adjustmentCny − paidAmount − prepaymentOffset，与 matchCandidates / serializeOrder.balanceDue 同口径），
+   *   状态名单与收款资金闸同源（FUNDS_CREDIT_BLOCKED_STATUSES），软删单排除。
+   * - **不写库、不入账。** 返回里的订单 / 流水摘要仅供前端渲染；认款仍走 allocate / allocate-batch，
+   *   全部资金闸（行锁 / 超额 / 状态 / 退款）在那里一字不动。
+   */
+  async suggestMatches(input: SuggestMatchesInput = {}) {
+    const sinceDays = input.sinceDays ?? MATCH_SUGGEST_DEFAULT_SINCE_DAYS;
+    const ids = input.receiptIds && input.receiptIds.length > 0 ? [...new Set(input.receiptIds)] : null;
+
+    const [receiptRows, orderRows] = await Promise.all([
+      prisma.receipt.findMany({
+        where: {
+          status: { in: UNALLOCATED_STATUSES },
+          ...(ids
+            ? { id: { in: ids } }
+            : { source: { in: [ReceiptSource.STATEMENT_IMPORT, ReceiptSource.OPS_CLAIM] } }),
+        },
+        select: {
+          id: true,
+          receiptNo: true,
+          amountCny: true,
+          allocatedCny: true,
+          status: true,
+          method: true,
+          source: true,
+          payerNote: true,
+          externalTxnId: true,
+          orderHintId: true,
+          receivedAt: true,
+        },
+        orderBy: { receivedAt: 'desc' },
+        take: MATCH_SUGGEST_MAX_RECEIPTS,
+      }),
+      this.loadSuggestOrders(sinceDays),
+    ]);
+
+    // 引擎输入（分）
+    const engineReceipts: MatchReceipt[] = receiptRows.map((r) => ({
+      id: r.id,
+      remainingCents: toCents(receiptRemainingCny(r)),
+      receivedAt: r.receivedAt,
+      payerNote: r.payerNote,
+      orderHintId: r.orderHintId,
+    }));
+    const engineOrders: MatchOrder[] = [];
+    const orderInfo = new Map<
+      string,
+      {
+        orderId: string;
+        orderNumber: string;
+        contactName: string;
+        agentName: string | null;
+        departureDate: string | null;
+        totalPayable: number;
+        paidAmount: number;
+        balanceDue: number;
+      }
+    >();
+    for (const o of orderRows) {
+      // 尾款按「分」算：lib/order-money.balanceDueCents（与 matchCandidates / serializeOrder.balanceDue 同口径，
+      // 两位小数输入下按元与按分同值，order-money.test 有断言）。
+      const balanceCents = balanceDueCents(o);
+      if (balanceCents <= 0) continue;
+      engineOrders.push({
+        orderId: o.id,
+        orderNumber: o.orderNumber,
+        contactName: o.contactName,
+        contactPhone: o.contactPhone,
+        passengerNames: o.passengers.flatMap((p) => [p.fullName, p.chineseName ?? '']),
+        agentId: o.agentId,
+        agentNames: o.agent ? [o.agent.companyName ?? '', o.agent.contactName] : [],
+        agentPhone: o.agent?.contactPhone ?? null,
+        createdAt: o.createdAt,
+        balanceDueCents: balanceCents,
+      });
+      orderInfo.set(o.id, {
+        orderId: o.id,
+        orderNumber: o.orderNumber,
+        contactName: o.contactName,
+        agentName: o.agent ? o.agent.companyName || o.agent.contactName : null,
+        departureDate: orderDepartDate(o.items),
+        totalPayable: payableCny(o),
+        paidAmount: paidCny(o),
+        balanceDue: round2(balanceCents / 100),
+      });
+    }
+
+    const result = matchReceipts(engineReceipts, engineOrders);
+
+    // ── 序列化：金额分 → 元；订单 / 流水摘要随建议一起回，前端不必再查 ──
+    const receiptById = new Map(receiptRows.map((r) => [r.id, r]));
+    const cny = (cents: number): number => round2(cents / 100);
+    const summary = { receiptsWithCandidates: 0, high: 0, medium: 0, low: 0, combos: result.combos.length };
+
+    const receipts = result.receipts.map((m) => {
+      const r = receiptById.get(m.receiptId)!;
+      const top = m.candidates[0];
+      summary.receiptsWithCandidates += 1;
+      if (top.confidence === 'HIGH') summary.high += 1;
+      else if (top.confidence === 'MEDIUM') summary.medium += 1;
+      else summary.low += 1;
+      return {
+        receiptId: r.id,
+        receiptNo: r.receiptNo,
+        externalTxnId: r.externalTxnId,
+        payerNote: r.payerNote,
+        method: r.method,
+        source: r.source,
+        receivedAt: r.receivedAt,
+        remainingCny: receiptRemainingCny(r).toFixed(2),
+        candidates: m.candidates.map((c) => ({
+          ...orderInfo.get(c.orderId)!,
+          score: c.score,
+          reasons: c.reasons,
+          confidence: c.confidence,
+          suggestedAmountCny: cny(c.suggestedAmountCents),
+        })),
+      };
+    });
+
+    const combos = result.combos.map((c: ComboSuggestion) => ({
+      type: c.type,
+      confidence: c.confidence,
+      score: c.score,
+      reasons: c.reasons,
+      totalCny: cny(c.totalCents),
+      parts: c.parts.map((p) => {
+        const r = receiptById.get(p.receiptId)!;
+        const o = orderInfo.get(p.orderId)!;
+        return {
+          receiptId: p.receiptId,
+          receiptNo: r.receiptNo,
+          externalTxnId: r.externalTxnId,
+          receiptRemainingCny: receiptRemainingCny(r).toFixed(2),
+          orderId: p.orderId,
+          orderNumber: o.orderNumber,
+          contactName: o.contactName,
+          agentName: o.agentName,
+          orderBalanceDue: o.balanceDue,
+          amountCny: cny(p.amountCents),
+        };
+      }),
+    }));
+
+    return {
+      ok: true as const,
+      generatedAt: new Date(),
+      scanned: {
+        receipts: receiptRows.length,
+        /** 时间窗内的活跃单（含已收齐的） */
+        orders: orderRows.length,
+        /** 其中尾款 > 0、真正参与匹配的 */
+        unpaidOrders: engineOrders.length,
+        sinceDays,
+      },
+      summary,
+      receipts,
+      combos,
+    };
+  }
+
+  /**
+   * 候选订单：近 sinceDays 天内下单、状态不在资金闸黑名单、未软删的**全部**活跃单，
+   * 按 id 游标分页拉，不设总数上限之外的窗口（硬上限 SUGGEST_ORDER_MAX_PAGES 页防失控）。
+   * 尾款 > 0 的过滤放在调用方（需要先算金额）。
+   */
+  private async loadSuggestOrders(sinceDays: number) {
+    const PAGE = 500;
+    const SUGGEST_ORDER_MAX_PAGES = 40; // 2 万单硬停，远超 90 天窗口的实际量
+    const since = new Date(Date.now() - sinceDays * 24 * 60 * 60 * 1000);
+    const select = {
+      id: true,
+      orderNumber: true,
+      contactName: true,
+      contactPhone: true,
+      status: true,
+      createdAt: true,
+      total: true,
+      paidAmount: true,
+      prepaymentOffset: true,
+      adjustmentCny: true,
+      agentId: true,
+      agent: { select: { id: true, companyName: true, contactName: true, contactPhone: true } },
+      passengers: { select: { fullName: true, chineseName: true } },
+      items: {
+        select: {
+          kind: true,
+          hotelCheckIn: true,
+          flightSchedule: { select: { departureTime: true, departureTz: true } },
+        },
+      },
+    } satisfies Prisma.OrderSelect;
+    type Row = Prisma.OrderGetPayload<{ select: typeof select }>;
+
+    const rows: Row[] = [];
+    let cursor: string | undefined;
+    for (let page = 0; page < SUGGEST_ORDER_MAX_PAGES; page += 1) {
+      const batch: Row[] = await prisma.order.findMany({
+        where: {
+          status: { notIn: FUNDS_CREDIT_BLOCKED_STATUSES },
+          deletedAt: null,
+          createdAt: { gte: since },
+        },
+        select,
+        orderBy: { id: 'asc' },
+        take: PAGE,
+        ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      });
+      rows.push(...batch);
+      if (batch.length < PAGE) break;
+      cursor = batch[batch.length - 1].id;
+    }
+    return rows;
   }
 
   // ════════════════════════════════════════════════════════════════════

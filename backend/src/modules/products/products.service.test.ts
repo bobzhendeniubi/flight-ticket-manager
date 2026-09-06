@@ -50,7 +50,10 @@ import {
   getCheapestRoundTripEconomyCny,
   resetCheapestFlightRefCache,
 } from './bundle-pricing.js';
-import { BUNDLE_ROUTE } from './bundle-availability.service.js';
+import { routeKeyOf } from './bundle-route.js';
+
+/** 测试用派生航线（第二条航线口径：航线来自套餐绑定航班，不再是全站常量）。 */
+const KIX_ROUTE = { origin: 'MFM', destination: 'KIX', routeKey: routeKeyOf('MFM', 'KIX') };
 
 describe('deriveHotelNightsFromItems · 套餐写入不变量', () => {
   it('items 含 HOTEL 组件 → hotelNights = HOTEL.qty（真实晚数）', () => {
@@ -910,27 +913,33 @@ describe('getCheapestRoundTripEconomyCny · 机票参考价范围限定（按航
     resetCheapestFlightRefCache();
   });
 
-  it('未绑航班 → 按套餐固定航线过滤（去程 origin→destination，回程 destination→origin），绝不扫全库', async () => {
+  it('未绑该段但有派生航线 → 按该航线过滤（去程 origin→destination，回程 destination→origin），绝不扫全库', async () => {
     // 去程最低 700、回程最低 750 → 来回 = 1450（两段各自估价相加）
     mockPrisma.flightSeatClass.findMany
       .mockResolvedValueOnce([{ basePrice: new Prisma.Decimal(700), fareBuckets: null }])
       .mockResolvedValueOnce([{ basePrice: new Prisma.Decimal(750), fareBuckets: null }]);
 
-    const value = await getCheapestRoundTripEconomyCny(new Date());
+    const value = await getCheapestRoundTripEconomyCny(new Date(), { route: KIX_ROUTE });
 
     expect(value).toBe(1450);
     const calls = mockPrisma.flightSeatClass.findMany.mock.calls;
     expect(calls).toHaveLength(2);
-    // 去程航线过滤
+    // 去程航线过滤（用派生航线，不是写死的老航线）
     expect(calls[0][0].where.schedule.flight).toEqual({
-      originCode: BUNDLE_ROUTE.origin,
-      destinationCode: BUNDLE_ROUTE.destination,
+      originCode: KIX_ROUTE.origin,
+      destinationCode: KIX_ROUTE.destination,
     });
     // 回程航线过滤（方向相反）
     expect(calls[1][0].where.schedule.flight).toEqual({
-      originCode: BUNDLE_ROUTE.destination,
-      destinationCode: BUNDLE_ROUTE.origin,
+      originCode: KIX_ROUTE.destination,
+      destinationCode: KIX_ROUTE.origin,
     });
+  });
+
+  it('既没绑航班也没有派生航线 → 一次库都不查，直接 null（绝不兜底到写死航线）', async () => {
+    const value = await getCheapestRoundTripEconomyCny(new Date());
+    expect(value).toBeNull();
+    expect(mockPrisma.flightSeatClass.findMany).not.toHaveBeenCalled();
   });
 
   it('绑定了去/回程航班 → 只看那趟航班的班次价（schedule.flightId 过滤，优先于航线兜底）', async () => {
@@ -955,13 +964,13 @@ describe('getCheapestRoundTripEconomyCny · 机票参考价范围限定（按航
       .mockResolvedValueOnce([{ basePrice: new Prisma.Decimal(700), fareBuckets: null }])
       .mockResolvedValueOnce([]); // 回程无班次
 
-    const value = await getCheapestRoundTripEconomyCny(new Date());
+    const value = await getCheapestRoundTripEconomyCny(new Date(), { route: KIX_ROUTE });
     expect(value).toBe(1400);
   });
 
   it('两段都查不到班次 → null（套餐原价退化为仅地面）', async () => {
     mockPrisma.flightSeatClass.findMany.mockResolvedValue([]);
-    const value = await getCheapestRoundTripEconomyCny(new Date());
+    const value = await getCheapestRoundTripEconomyCny(new Date(), { route: KIX_ROUTE });
     expect(value).toBeNull();
   });
 });
@@ -990,19 +999,14 @@ describe('ProductsService.getBundleFlightRef · 后台起价换算用机票参�
     expect(calls[1][0].where.schedule.flightId).toBe('flight-back');
   });
 
-  it('未绑航班（两参数都空）→ 按套餐航线兜底；查不到任何班次 → { flightRefRoundTripCny: null }', async () => {
+  it('未绑航班（两参数都空、无派生航线）→ 不查库、{ flightRefRoundTripCny: null }（不兜底到写死航线）', async () => {
     mockPrisma.flightSeatClass.findMany.mockResolvedValue([]);
 
     const service = new ProductsService();
     const res = await service.getBundleFlightRef({ outboundFlightId: null, returnFlightId: null });
 
     expect(res).toEqual({ flightRefRoundTripCny: null });
-    const calls = mockPrisma.flightSeatClass.findMany.mock.calls;
-    // 航线兜底：按 origin→destination / destination→origin 过滤，不是 flightId
-    expect(calls[0][0].where.schedule.flight).toEqual({
-      originCode: BUNDLE_ROUTE.origin,
-      destinationCode: BUNDLE_ROUTE.destination,
-    });
+    expect(mockPrisma.flightSeatClass.findMany).not.toHaveBeenCalled();
   });
 });
 
@@ -1634,6 +1638,7 @@ describe('ProductsService · 随机档占位酒店防呆', () => {
   const ordinaryHotel = {
     id: 'hotel-1',
     name: '海景酒店',
+    cityCode: 'DAD',
     starRating: 4,
     intlFiveStar: false,
     randomTierPlaceholder: null,
@@ -1641,6 +1646,7 @@ describe('ProductsService · 随机档占位酒店防呆', () => {
   const placeholderHotel = {
     id: 'hotel-placeholder',
     name: '随机三星',
+    cityCode: 'DAD',
     starRating: 3,
     intlFiveStar: false,
     randomTierPlaceholder: 3,
@@ -1697,6 +1703,55 @@ describe('ProductsService · 随机档占位酒店防呆', () => {
       name: '随机四星备用池',
     });
     expect(mockPrisma.hotel.update).toHaveBeenCalled();
+  });
+
+  // ── 随机档按城市圈定：占位酒店的城市 = 它承载的套餐的城市，必填 ─────────────
+  it('占位酒店把 cityCode 改成空白 → 拒绝，且不写库', async () => {
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(placeholderHotel);
+    const service = new ProductsService();
+
+    await expect(
+      service.updateHotel('hotel-placeholder', { cityCode: '   ' } as never),
+    ).rejects.toThrow('随机档占位酒店必须填写城市代码');
+    expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+
+  it('存量占位酒店城市为空时，改其它字段也先拦下（逼着补城市）；补上城市后放行并归一写库', async () => {
+    const legacyBlank = { ...placeholderHotel, cityCode: '' };
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(legacyBlank);
+    const service = new ProductsService();
+    await expect(service.updateHotel('hotel-placeholder', { name: '随机三星（岘港）' })).rejects.toThrow(
+      '随机档占位酒店必须填写城市代码',
+    );
+
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(legacyBlank);
+    mockPrisma.hotel.update.mockResolvedValueOnce({});
+    mockPrisma.hotelRoomType.findMany.mockResolvedValueOnce([]);
+    mockPrisma.hotel.findUniqueOrThrow.mockResolvedValueOnce({
+      ...placeholderHotel,
+      cityCode: 'HOA',
+      roomTypes: [],
+    });
+    await expect(
+      service.updateHotel('hotel-placeholder', { name: '随机三星（会安）', cityCode: 'hoa' }),
+    ).resolves.toMatchObject({ cityCode: 'HOA' });
+    // 归一后落库：'hoa' → 'HOA'（聚合按等值匹配，大小写不同不能算两个城市）
+    expect(mockPrisma.hotel.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ cityCode: 'HOA' }) }),
+    );
+  });
+
+  it('普通酒店 cityCode 归一后落库（去空白 + 大写）', async () => {
+    mockPrisma.hotel.findUnique.mockResolvedValueOnce(ordinaryHotel);
+    mockPrisma.hotel.update.mockResolvedValueOnce({});
+    mockPrisma.hotelRoomType.findMany.mockResolvedValueOnce([]);
+    mockPrisma.hotel.findUniqueOrThrow.mockResolvedValueOnce({ ...ordinaryHotel, cityCode: 'BAN', roomTypes: [] });
+    const service = new ProductsService();
+
+    await service.updateHotel('hotel-1', { cityCode: ' ban ' });
+    expect(mockPrisma.hotel.update).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ cityCode: 'BAN' }) }),
+    );
   });
 
   it('占位酒店传 isActive=false → 拒绝；普通酒店下架 → 放行', async () => {

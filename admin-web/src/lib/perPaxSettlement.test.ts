@@ -3,7 +3,7 @@
  * 覆盖：均摊基本场景 / 余数兜底 / 单人调价不影响他人 / adjustmentCny 缺省 / 负数调整 / 0 人。
  */
 import { describe, it, expect } from 'vitest';
-import { computePerPaxSettlement, spreadableAdjustmentCny } from './perPaxSettlement';
+import { computePerPaxSettlement, resolvePerPaxSettlement, spreadableAdjustmentCny } from './perPaxSettlement';
 
 describe('computePerPaxSettlement', () => {
   it('无任何调整 → 平均分摊，合计等于 total', () => {
@@ -208,5 +208,72 @@ describe('spreadableAdjustmentCny', () => {
     // 只有第 3 条（amountCny: 200，合法）被排除，前两条脏数据一律跳过，结果不是 NaN。
     expect(result).toBe(600);
     expect(Number.isFinite(result)).toBe(true);
+  });
+});
+
+describe('resolvePerPaxSettlement（先读后端落库份额，没有才自算）', () => {
+  const base = {
+    totalCny: 3000,
+    adjustmentCny: 450,
+    adjustments: [{ amountCny: 450, excludeFromPerPax: true }],
+    passengerIds: ['p1', 'p2', 'p3'],
+    netByPassenger: new Map([['p2', 800]]),
+  };
+
+  it('后端给了每位在单乘客一行 → PERSISTED，行值照库里的，合计 / 排除额与自算同口径', () => {
+    const res = resolvePerPaxSettlement({
+      ...base,
+      passengerShares: [
+        { passengerId: 'p1', settlementCny: 733.33, adjustmentCny: 0 },
+        { passengerId: 'p2', settlementCny: 1533.33, adjustmentCny: 800 },
+        { passengerId: 'p3', settlementCny: 733.34, adjustmentCny: 0 },
+      ],
+    });
+    expect(res.source).toBe('PERSISTED');
+    expect(res.rows).toEqual([
+      { passengerId: 'p1', netCny: 0, settlementCny: 733.33 },
+      { passengerId: 'p2', netCny: 800, settlementCny: 1533.33 },
+      { passengerId: 'p3', netCny: 0, settlementCny: 733.34 },
+    ]);
+    expect(res.payableCny).toBe(3000);
+    expect(res.excludedCny).toBe(450);
+  });
+
+  it('没给 passengerShares → DERIVED，结果与 computePerPaxSettlement 一字不差', () => {
+    const res = resolvePerPaxSettlement(base);
+    expect(res.source).toBe('DERIVED');
+    expect(res.rows).toEqual(computePerPaxSettlement(base).rows);
+  });
+
+  it('少一位在单乘客的行 / 多余旧行 → 少了退回自算，多了忽略', () => {
+    const missing = resolvePerPaxSettlement({
+      ...base,
+      passengerShares: [{ passengerId: 'p1', settlementCny: 1, adjustmentCny: 0 }],
+    });
+    expect(missing.source).toBe('DERIVED');
+
+    const extra = resolvePerPaxSettlement({
+      ...base,
+      passengerShares: [
+        { passengerId: 'p1', settlementCny: 733.33, adjustmentCny: 0 },
+        { passengerId: 'p2', settlementCny: 1533.33, adjustmentCny: 800 },
+        { passengerId: 'p3', settlementCny: 733.34, adjustmentCny: 0 },
+        { passengerId: 'p-gone', settlementCny: 999, adjustmentCny: 0 },
+      ],
+    });
+    expect(extra.source).toBe('PERSISTED');
+    expect(extra.rows.map((r) => r.passengerId)).toEqual(['p1', 'p2', 'p3']);
+  });
+
+  it('脏行（金额非数字）视为没有该乘客 → 退回自算', () => {
+    const res = resolvePerPaxSettlement({
+      ...base,
+      passengerShares: [
+        { passengerId: 'p1', settlementCny: Number.NaN, adjustmentCny: 0 },
+        { passengerId: 'p2', settlementCny: 1533.33, adjustmentCny: 800 },
+        { passengerId: 'p3', settlementCny: 733.34, adjustmentCny: 0 },
+      ],
+    });
+    expect(res.source).toBe('DERIVED');
   });
 });

@@ -13,7 +13,6 @@
  */
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { env } from '../../config/env.js';
 import { dataUrlImageSchema } from '../../lib/proof-url.js';
@@ -127,7 +126,7 @@ export const ocrRoutes: FastifyPluginAsync = async (app) => {
   app.post(
     '/passport',
     {
-      preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)],
+      preHandler: [app.authenticate, app.requireCapability('ocr.passport')],
     },
     async (req) => {
       const body = ocrBodySchema.parse(req.body);

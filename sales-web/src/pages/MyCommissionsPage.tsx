@@ -19,6 +19,7 @@ import { useEffect, useMemo, useState } from 'react';
 import {
   api,
   ApiError,
+  type MyAgentProfile,
   type SettlementSummary,
   type SettlementDetail,
   type SettlementStatus,
@@ -185,11 +186,14 @@ export function MyCommissionsPage() {
 
   return (
     <div className="space-y-5">
-      <section className="animate-fade-up">
-        <h1 className="text-2xl font-extrabold tracking-tight text-ink">我的分成 · 佣金</h1>
-        <p className="section-sub">
-          按月查看自己 + 下级代理的佣金结算。结算单状态：草稿 → 待审批 → 已核准 → 已支付。
-        </p>
+      <section className="flex flex-wrap items-end justify-between gap-3 animate-fade-up">
+        <div>
+          <h1 className="text-2xl font-extrabold tracking-tight text-ink">我的分成 · 佣金</h1>
+          <p className="section-sub">
+            按月查看自己 + 下级代理的佣金结算。结算单状态：草稿 → 待审批 → 已核准 → 已支付。
+          </p>
+        </div>
+        <StatementDownload />
       </section>
 
       {error && (
@@ -476,6 +480,91 @@ export function MyCommissionsPage() {
           </div>
         </div>
       )}
+    </div>
+  );
+}
+
+/**
+ * 下载对账单 —— 选一个月，把这个月**出发**的订单明细拉成 xlsx。
+ *
+ * 与上面的结算单列表是两件事，页面上要说清楚，否则两个数对不上就会来问：
+ *   · 结算单 = 佣金的账，按下单时间归期，一个月一张；
+ *   · 对账单 = 订单的账（应收/已收/余额/每人结算价/立减/佣金），按**出发日**归月。
+ * 表格抬头也印着同一句口径说明。
+ */
+function StatementDownload() {
+  const tokens = useAuth((s) => s.tokens);
+  const [agent, setAgent] = useState<MyAgentProfile | null>(null);
+  const [month, setMonth] = useState<string>(() => periodOptions(1)[0]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    if (!tokens?.accessToken) return;
+    let cancelled = false;
+    api
+      .getMyAgent(tokens.accessToken)
+      .then((r) => {
+        if (!cancelled) setAgent(r.agent);
+      })
+      .catch(() => {
+        // 拿不到档案就不显示下载入口（内部账号看这页时本来也没有「自己的代理」）
+        if (!cancelled) setAgent(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tokens?.accessToken]);
+
+  if (!agent) return null;
+
+  const onDownload = async (): Promise<void> => {
+    if (!tokens?.accessToken || busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const blob = await api.downloadAgentStatement(tokens.accessToken, agent.id, month);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `对账单_${agent.companyName ?? agent.contactName}_${month}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : '下载失败，请稍后重试');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <div className="flex flex-col items-end gap-1">
+      <div className="flex items-end gap-2">
+        <div>
+          <label className="label text-xs" htmlFor="statement-month">
+            对账月份
+          </label>
+          <select
+            id="statement-month"
+            className="input py-1.5"
+            value={month}
+            onChange={(e) => setMonth(e.target.value)}
+          >
+            {periodOptions(12).map((p) => (
+              <option key={p} value={p}>
+                {p}
+              </option>
+            ))}
+          </select>
+        </div>
+        <button type="button" className="btn-primary" disabled={busy} onClick={onDownload}>
+          {busy ? '生成中…' : '下载对账单'}
+        </button>
+      </div>
+      <p className="text-xs text-ink-muted">按出发日归月，含订单明细与预存款</p>
+      {err && <span className="text-xs text-deal-dark">{err}</span>}
     </div>
   );
 }

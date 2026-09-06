@@ -23,6 +23,17 @@ import type { Prisma, PrismaClient } from '@prisma/client';
 import { localDate } from './finances.cost.service.js';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+// 订单金额单一口径（审查根因 R2）：REFUNDED 订单的负项走显式变体（不含预存抵扣）。
+import { paidMinusCompletedRefundsCny } from '../../lib/order-money.js';
+// 订单状态集合全站唯一一份：财务口径含 REFUND_REQUESTED、不含 REFUNDED（后者单独补负项，见上）。
+import { COUNTED_STATUSES } from '../../lib/order-status-sets.js';
+// 订单 → 航线的唯一派生（最早起飞的航段优先，其次套餐绑定航班，都没有 → 未知航线）。
+import {
+  ORDER_ROUTE_ITEM_SELECT,
+  orderMatchesRoute,
+  UNKNOWN_ROUTE_KEY,
+} from '../../lib/order-route.js';
+import { parseRouteKey, routeKeyOf } from '../products/bundle-route.js';
 import {
   findMatchedPeriod,
   loadPeriodsByFlightIds,
@@ -96,6 +107,8 @@ export interface CostBreakdown {
 
 export interface FinancesSummary {
   range: DateRange;
+  /** 本次统计圈定的航线（null = 全部航线）；'unknown' = 只看推不出航线的单。 */
+  routeKey: string | null;
   /**
    * 总收入口径 = 已下单收入（OrderItem.amount，未扣税费；含 PENDING_PAYMENT，即"预期/已下单
    * 收入"口径，不是"已收款"口径——是否需要另开"只算实收"口径待确认，不擅自改，
@@ -276,17 +289,6 @@ export interface MonthlyPoint {
 // REFUNDED 不在这个列表里（明确排除，不是遗漏）：REFUNDED 订单不走下面按 OrderItem 展开
 // 的分品类逻辑，而是在 getFinancesSummary 里单独查询、按订单级"已收-已退净额"补一笔负项
 // 到 revenueBreakdown.refund（见该字段注释）——避免"先收后退"的订单整单从统计消失。
-const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.REFUND_REQUESTED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
-
 function toDateOnlyUtc(s: string, endOfDay = false): Date {
   // 'YYYY-MM-DD' → UTC midnight (or 23:59:59.999)
   const [y, m, d] = s.split('-').map((x) => parseInt(x, 10));
@@ -347,15 +349,39 @@ export function visaItemCostCny(input: {
 }
 
 /** 计算财务概览（KPI + 按 OrderItem.kind 粗分 + 按财务口径细分） */
+/**
+ * 航班表按航线筛的 where 片段（去回两个方向都算）。
+ *
+ * 一条线的回程航班在库里是反向的那条 Flight（DAD→MFM）。财务问「这条线赚不赚钱」时，
+ * 回程的包机费当然也是这条线的成本，只筛去程方向会漏掉一半。
+ * routeKey 为空 / 形状不对 / 是「未知航线」桶 → 不加任何条件（未知桶按航班筛没有意义，
+ * 那一桶讲的是「订单推不出航线」，不是「航班没有航线」）。
+ */
+function routeDirectionFilter(routeKey: string | null): Prisma.FlightScheduleWhereInput {
+  if (!routeKey || routeKey === UNKNOWN_ROUTE_KEY) return {};
+  const parsed = parseRouteKey(routeKey);
+  if (!parsed) return {};
+  return {
+    flight: {
+      OR: [
+        { originCode: parsed.origin, destinationCode: parsed.destination },
+        { originCode: parsed.destination, destinationCode: parsed.origin },
+      ],
+    },
+  };
+}
+
 export async function getFinancesSummary(
   range: DateRange,
+  /** 只统计这条航线的单（'MFM-DAD' 形状；'unknown' = 推不出航线的单）；不传 = 全部航线。 */
+  routeKey: string | null = null,
   client: PrismaClient = defaultPrisma,
 ): Promise<FinancesSummary> {
   const from = toDateOnlyUtc(range.from);
   const to = toDateOnlyUtc(range.to, true);
 
   // ── 1) 拉订单 + items（含 flightSchedule 全成本字段、产品成本、座位）+ passengers 数 + costItems ──
-  const orders = await client.order.findMany({
+  const allOrders = await client.order.findMany({
     where: { deletedAt: null, createdAt: { gte: from, lte: to }, status: { in: COUNTED_STATUSES } },
     select: {
       id: true,
@@ -371,11 +397,15 @@ export async function getFinancesSummary(
           totalCostCny: true,
           hotelCheckIn: true,
           hotelCheckOut: true,
+          // 套餐绑定航班（按航线筛选时用；其余字段各自的用途见下）。
+          bundle: ORDER_ROUTE_ITEM_SELECT.bundle,
           flightSchedule: {
             select: {
               flightId: true,
               departureTime: true,
               departureTz: true,
+              // 航线派生要航班起降地：与 ORDER_ROUTE_ITEM_SELECT.flightSchedule 同一份形状。
+              flight: { select: { originCode: true, destinationCode: true } },
               costLocked: true,
               charterCostCny: true,
               airportTaxDepCny: true,
@@ -399,6 +429,14 @@ export async function getFinancesSummary(
       },
     },
   });
+
+  // ── 1b) 航线圈定（内存里筛，不下推到 SQL）────────────────────────────────
+  // 订单的航线是「最早起飞那条航段」派生出来的，SQL 表达不了「最早」这个语义：
+  // 往返单在库里既有 MFM→DAD 也有 DAD→MFM 两条腿，下推 where 会让它同时命中两条航线。
+  // 先按区间取回，再用与报表同一个 orderMatchesRoute 精确判定，两处结果必然一致。
+  const orders = routeKey
+    ? allOrders.filter((o) => orderMatchesRoute(o.items, routeKey))
+    : allOrders;
 
   // ── 2) 批量拉相关航班的成本周期（用于 resolution） ──
   const flightIds = Array.from(
@@ -586,10 +624,12 @@ export async function getFinancesSummary(
       refunds: { where: { status: 'COMPLETED' }, select: { amount: true } },
     },
   });
+  // ⚠️ 这条负项是「paidAmount − Σ已完成退款」，**不含** prepaymentOffset——与 lib/net-received 的
+  // 已收净额差一个预存抵扣（现状全库恒 0，数字今天相同，公式不同）。冲突已登记待拍板，
+  // 此处只改调 lib/order-money 的显式变体，不统一。
   let refundedNetCny = 0;
   for (const o of refundedOrders) {
-    const refundedTotal = o.refunds.reduce((sum, r) => sum + dec(r.amount), 0);
-    refundedNetCny += dec(o.paidAmount) - refundedTotal;
+    refundedNetCny += paidMinusCompletedRefundsCny(o, o.refunds);
   }
   rev.refund += refundedNetCny;
   revenueCny += refundedNetCny;
@@ -612,7 +652,12 @@ export async function getFinancesSummary(
 
   // 空座沉没：仍用班次维度 + resolution（charter 可能来自 period）
   const schedulesInRange = await client.flightSchedule.findMany({
-    where: { departureTime: { gte: from, lte: to } },
+    where: {
+      departureTime: { gte: from, lte: to },
+      // 圈了航线就只算这条线的空座沉没成本 —— 不筛的话「只看 A 线」的页面会背上全机队的空座钱。
+      // 去回两个方向都算（一条线的回程也是这条线的成本），见 routeDirectionFilter。
+      ...routeDirectionFilter(routeKey),
+    },
     select: {
       flightId: true,
       departureTime: true,
@@ -660,6 +705,7 @@ export async function getFinancesSummary(
 
   return {
     range,
+    routeKey,
     revenueCny: round(revenueCny),
     costCny: round(costCny),
     grossMarginCny,
@@ -1010,6 +1056,8 @@ export async function getOrderPnlDetail(
 /** 月度趋势（最近 N 个月） */
 export async function getMonthlyTrend(
   months: number,
+  /** 只统计这条航线的单（口径同 getFinancesSummary）；不传 = 全部航线。 */
+  routeKey: string | null = null,
   client: PrismaClient = defaultPrisma,
 ): Promise<MonthlyPoint[]> {
   const n = Math.max(1, Math.min(36, Math.floor(months)));
@@ -1021,14 +1069,22 @@ export async function getMonthlyTrend(
     const monthEnd = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth() - i + 1, 1));
     const monthKey = `${monthStart.getUTCFullYear()}-${String(monthStart.getUTCMonth() + 1).padStart(2, '0')}`;
 
-    const orders = await client.order.findMany({
+    const monthOrders = await client.order.findMany({
       where: {
         deletedAt: null,
         createdAt: { gte: monthStart, lt: monthEnd },
         status: { in: COUNTED_STATUSES },
       },
-      select: { items: { select: { amount: true, totalCostCny: true } } },
+      select: {
+        items: {
+          select: { amount: true, totalCostCny: true, ...ORDER_ROUTE_ITEM_SELECT },
+        },
+      },
     });
+    // 航线圈定在内存里做，口径与概览/报表同一个 orderMatchesRoute（原因见 getFinancesSummary）。
+    const orders = routeKey
+      ? monthOrders.filter((o) => orderMatchesRoute(o.items, routeKey))
+      : monthOrders;
 
     let revenue = 0;
     let cost = 0;

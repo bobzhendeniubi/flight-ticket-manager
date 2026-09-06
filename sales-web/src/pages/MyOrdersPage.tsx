@@ -38,6 +38,7 @@ import { PaymentPanel } from '../components/PaymentPanel';
 import { WriteReviewForm, type WriteReviewFormData } from '../components/WriteReviewForm';
 import { ChangeRequestDialog } from '../components/ChangeRequestDialog';
 import { PassengerPassportModal } from '../components/PassengerPassportModal';
+import { InvoiceRequestSection } from '../components/InvoiceRequestSection';
 
 const STATUS_LABEL: Record<OrderStatus, string> = {
   DRAFT: '草稿',
@@ -420,6 +421,10 @@ export function MyOrdersPage() {
 
       {/* 我的候补 — 有候补记录才显示，挂在锁位下方 */}
       <WaitlistSection token={token} />
+
+      {/* 发票 — 自助申请 + 看进度。一张能开的订单都没有、也没申请过时整块不显示。
+          注意：这是给客户开的真发票，跟后台订单上「开票」那三个出票进度勾无关。 */}
+      <InvoiceRequestSection token={token} orders={orders} />
 
       {loading && <div className="card py-8 text-center text-ink-muted">加载中…</div>}
       {error && <div className="card border-deal/30 bg-deal-light text-sm font-medium text-deal-dark">{error}</div>}

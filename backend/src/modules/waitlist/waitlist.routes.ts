@@ -7,7 +7,6 @@
  * DELETE /waitlist/:id      取消候补（本人或 ADMIN/STAFF）
  */
 import type { FastifyPluginAsync } from 'fastify';
-import { UserRole } from '@prisma/client';
 import { WaitlistService } from './waitlist.service.js';
 import { createWaitlistBodySchema, listWaitlistQuerySchema } from './waitlist.schemas.js';
 
@@ -38,7 +37,7 @@ export const waitlistRoutes: FastifyPluginAsync = async (app) => {
   // ── 运营：某班次候补名单（电话回访用） ──────────────────────────
   app.get(
     '/',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('waitlist.read_all')] },
     async (req) => {
       const q = listWaitlistQuerySchema.parse(req.query);
       const entries = await service.listBySchedule(q.scheduleId);

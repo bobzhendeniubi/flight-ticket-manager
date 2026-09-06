@@ -16,7 +16,7 @@ export default defineAppConfig({
   window: {
     backgroundTextStyle: 'light',
     navigationBarBackgroundColor: '#1e40af',
-    navigationBarTitleText: '世途旅行',
+    navigationBarTitleText: '椰岛假期',
     navigationBarTextStyle: 'white',
   },
   tabBar: {

@@ -23,28 +23,22 @@
  */
 import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
-import { OrderStatus, OrderItemKind } from '@prisma/client';
+import { OrderItemKind } from '@prisma/client';
+// 订单状态集合全站唯一一份（审查根因 R2）：分房走库存口径（退款申请中已释放占房，不进分房表）。
+import { INVENTORY_COUNTED_STATUSES as COUNTED_STATUSES } from '../../lib/order-status-sets.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { BadRequestError } from '../../lib/errors.js';
 import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
-import { fmtDateDMYDash, pnrName, perPaxSettlementByPassenger } from './orders.export-templates.js';
-import { spreadableAdjustmentCny } from './per-pax-share.js';
+import { fmtDateDMYDash, pnrName } from './orders.export-templates.js';
+// 订单金额单一口径（审查根因 R2）：结算价格按人 + 均摊兜底都从这里取，本文件不自己算钱。
+import { settlePerPaxFallbackCny } from '../../lib/order-money.js';
+import { PASSENGER_SHARES_INCLUDE, resolvePassengerShares, sharesAsMaps } from './passenger-shares.js';
+import { attachPersistedShares } from './service/passenger-shares.js';
 import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats.js';
 import type { TripStatsMap } from './orders.export-trip-stats.js';
 import { earliestFlightDepartureLocalDate } from './pnr-export.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { businessDateTimeSec } from '../../lib/business-time.js';
-
-/** 分房口径：退款申请中的订单已释放占房，不进入分房表。*/
-const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
 
 /** 导出最长跨度（天）— 超出直接 400，导出不做静默截断。*/
 export const ROOM_ALLOCATION_MAX_DAYS = 14;
@@ -149,14 +143,6 @@ function fmtDate(d: Date | null | undefined): string {
 }
 
 /** Prisma.Decimal | number | null → number（与其它导出同款）。*/
-function dec(v: Prisma.Decimal | number | null | undefined): number {
-  if (v == null) return 0;
-  return typeof v === 'number' ? v : Number(v.toString());
-}
-
-function round2(n: number): number {
-  return Math.round(n * 100) / 100;
-}
 
 function toDateOnly(s: string): Date {
   // 'YYYY-MM-DD' → UTC midnight，与 Prisma @db.Date 存取口径一致
@@ -285,6 +271,7 @@ export type RoomItemForExport = Prisma.OrderItemGetPayload<{
       include: {
         agent: { select: { companyName: true; contactName: true } };
         passengers: true;
+        passengerShares: typeof PASSENGER_SHARES_INCLUDE;
         items: {
           select: {
             id: true;
@@ -469,12 +456,13 @@ export function buildRoomAllocationSheets(
     // 改前这里自己算「订单总价 ÷ 乘客数」，同单不同价的单导出来全员一个数，且漏了改期费/换人费。
     // 均摊兜底只在乘客不在上表里时用到；除零保护 —— 乘客数至少按 1 算。
     const paxCount = Math.max(1, order.passengers.length);
-    const settleByPassenger = perPaxSettlementByPassenger(order);
-    // 分子用 spreadableAdjustmentCny 而不是裸 adjustmentCny（复审 M1，与《全岗总表》
+    // 按人份额（R1）：先读库（写路径落的事实），老单没有才派生 —— resolvePassengerShares 一处决定。
+    const settleByPassenger = sharesAsMaps(resolvePassengerShares(order)).settlement;
+    // 兜底分子用可摊应收而不是裸 adjustmentCny（settlePerPaxFallbackCny，复审 M1，与《全岗总表》
     // orders.export-master.ts 同一处修正）：换人费/换人差价挂在**已经不在这张单上**的被换人头上
     //（excludeFromPerPax），上面那张按人表已经把它们剔掉了；兜底若还按裸值算，同一张分房表里
     //「表里的人」和「兜底的人」用的是两套分母，留守同行人凭空多背一笔换人的钱。
-    const settleFallback = round2((dec(order.total) + spreadableAdjustmentCny(order)) / paxCount);
+    const settleFallback = settlePerPaxFallbackCny(order, paxCount);
     // 录入时间是「动作发生时刻」，按北京时间输出（容器 TZ 是 UTC，直接取 UTC 分量会少 8 小时）
     const enteredAt = businessDateTimeSec(order.createdAt);
 
@@ -734,6 +722,8 @@ const ROOM_ITEM_INCLUDE = {
     include: {
       agent: { select: { companyName: true, contactName: true } },
       passengers: true,
+      // 按人份额（R1）：结算价格先读库
+      passengerShares: PASSENGER_SHARES_INCLUDE,
       items: {
         select: {
           // id/amount/description/passengerId/metadata：结算价格按人（perPaxSettlementByPassenger）取数用
@@ -854,9 +844,11 @@ export function filterRoomItemsByDepartDate(
 
 /** 把占房 item 集合渲染成分房表 xlsx（区间/出发日两口径共用的收尾）。*/
 async function buildWorkbookFromItems(
-  items: RoomItemForExport[],
+  fetchedItems: RoomItemForExport[],
   client: PrismaClient,
 ): Promise<Buffer> {
+  // 按人份额 lazy 回填（R1）：占房行各自带一份订单，先按订单去重顺手回填，再把落好的行贴回每条占房行。
+  const items = await attachSharesToRoomItems(fetchedItems, client);
   const remainingLookup = await buildDailyRemainingLookup(items, client);
   // 飞行次数：一次性批量拉回本次导出全部乘客的档案快照（无 N+1，见 orders.export-trip-stats.ts），
   // 与全岗总表 /《全岗可用》同一入口 → 同一位乘客在三张表里的数字必然相同。
@@ -881,6 +873,24 @@ async function buildWorkbookFromItems(
 
   const buf = await wb.xlsx.writeBuffer();
   return Buffer.from(buf);
+}
+
+/**
+ * 同一订单跨多条占房行时只回填一次（按订单 id 去重），再把落好的 passengerShares **只合并这一个字段**
+ * 回每条占房行自己的 order 对象（Prisma 给每条行一份订单副本，逐份贴上；不整个换对象，各行的乘客 /
+ * 行数据原样保留）。回填失败 / 撞锁 → 原样返回，照旧派生。
+ */
+async function attachSharesToRoomItems(items: RoomItemForExport[], client: PrismaClient): Promise<RoomItemForExport[]> {
+  const uniqueOrders = [...new Map(items.map((it) => [it.order.id, it.order])).values()];
+  const attached = await attachPersistedShares(uniqueOrders, client);
+  const sharesById = new Map(
+    attached.flatMap((o, i) => (o !== uniqueOrders[i] && o.passengerShares ? [[o.id, o.passengerShares] as const] : [])),
+  );
+  if (sharesById.size === 0) return items;
+  return items.map((it) => {
+    const passengerShares = sharesById.get(it.order.id);
+    return passengerShares ? { ...it, order: { ...it.order, passengerShares } } : it;
+  });
 }
 
 /**

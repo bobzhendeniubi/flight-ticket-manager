@@ -86,7 +86,8 @@ describe('班次成本锁定路由', () => {
     });
 
     expect(res.statusCode).toBe(200);
-    expect(getFinancesSummaryMock).toHaveBeenCalledWith({ from: '2026-08-01', to: '2026-08-24' });
+    // 第二个入参 = 航线筛选（不传 routeKey → null = 全部航线）。
+    expect(getFinancesSummaryMock).toHaveBeenCalledWith({ from: '2026-08-01', to: '2026-08-24' }, null);
   });
 
   it('STAFF 通用岗位访问损益汇总 → 403', async () => {

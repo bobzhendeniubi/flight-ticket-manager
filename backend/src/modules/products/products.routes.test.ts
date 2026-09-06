@@ -2,6 +2,7 @@ import { afterAll, beforeAll, beforeEach, describe, expect, it, vi } from 'vites
 import Fastify, { type FastifyInstance } from 'fastify';
 import { UserRole } from '@prisma/client';
 import { NotFoundError } from '../../lib/errors.js';
+import { hasCapability } from '../../lib/capabilities.js';
 
 const { serviceMock, actorMock, auditMock } = vi.hoisted(() => ({
   serviceMock: {
@@ -60,6 +61,12 @@ describe('产品 CRUD 审计路由', () => {
     app.decorate('optionalAuthenticate', async () => undefined);
     app.decorate('requireRole', (...roles: UserRole[]) => async (req) => {
       if (!roles.includes(req.user.role)) {
+        const { ForbiddenError } = await import('../../lib/errors.js');
+        throw new ForbiddenError();
+      }
+    });
+    app.decorate('requireCapability', (cap: Parameters<typeof hasCapability>[1]) => async (req) => {
+      if (!hasCapability({ role: req.user.role, staffRole: req.staffRole }, cap)) {
         const { ForbiddenError } = await import('../../lib/errors.js');
         throw new ForbiddenError();
       }

@@ -1,24 +1,10 @@
-import { z } from 'zod';
-import { CabinClass } from '@prisma/client';
-
-// ── 创建切位（包位）───────────────────────────────────────────────────────────
-// 从散客池划 seats 座给 agentId 专卖；service 层校验 seats ≤ 当前散客池余票。
-export const createSeatAllocationBodySchema = z.object({
-  flightScheduleId: z.string().min(1),
-  cabin: z.nativeEnum(CabinClass),
-  agentId: z.string().min(1),
-  seats: z.number().int().min(1),
-  // 约定单价（选填；null / 省略 = 按常规售价）
-  unitPriceCny: z.number().int().min(0).nullish(),
-  // 出发前多少天回收未售部分（默认 7）
-  reclaimDaysBefore: z.number().int().min(0).max(365).optional(),
-  notes: z.string().max(500).nullish(),
-});
-export type CreateSeatAllocationBody = z.infer<typeof createSeatAllocationBodySchema>;
-
-// ── 列表筛选（两个都选填；都不填 = 全部 ACTIVE + RECLAIMED）────────────────────
-export const listSeatAllocationsQuerySchema = z.object({
-  flightScheduleId: z.string().min(1).optional(),
-  agentId: z.string().min(1).optional(),
-});
-export type ListSeatAllocationsQuery = z.infer<typeof listSeatAllocationsQuerySchema>;
+/**
+ * 销控配位的请求体 —— 定义已搬进 @ftm/contracts（packages/contracts/src/seat-allocation.ts）。
+ *
+ * 校验规则一字未改：只把 z.nativeEnum(PrismaEnum) 换成契约包镜像的同值 schema
+ *（枚举漂移测试守着两边一致），helper 的 import 改指契约包里的同一份实现。
+ *
+ * 这里留 re-export 壳子，既有 import 路径全部继续可用；前端从 @ftm/contracts
+ * 取同一份类型，不再手抄。
+ */
+export * from '@ftm/contracts/seat-allocation';

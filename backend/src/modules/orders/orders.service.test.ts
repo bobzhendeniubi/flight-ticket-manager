@@ -838,8 +838,9 @@ describe('酒店超售 cap 统一身份口径', () => {
     );
 
     expect(result.successCount).toBe(1);
+    // 随机档按城市圈定：占位酒店的城市（mock 没给 cityCode → 归存量默认城市 DAD）随档次一起传给聚合闸
     expect(mockAssertRandomTierFit).toHaveBeenCalledWith(
-      3,
+      { tier: 3, cityCode: 'DAD' },
       ['2026-09-02'],
       0.5,
       expect.objectContaining({ maxOversellRooms: Number.POSITIVE_INFINITY }),
@@ -3300,7 +3301,9 @@ describe('swapPassengerBodySchema · chineseName', () => {
 
   it('swapPassenger 服务层：chineseName 传入时写入 Prisma.PassengerUpdateInput.chineseName', async () => {
     const service = new OrderService();
-    mockPrisma.order.findUnique.mockResolvedValueOnce({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
+    // 持久 stub（非 once）：换人现在走 OrderMutation 内核，事务内会在动作前后各读一次订单账本快照
+    //（守恒断言），加上换人前现场快照共三次 findUnique —— 三次都得看到同一张单。
+    mockPrisma.order.findUnique.mockResolvedValue({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
     mockPrisma.passenger.findUnique.mockResolvedValueOnce({
       id: 'px1',
       orderId: 'ord1',
@@ -3339,7 +3342,9 @@ describe('swapPassenger · 证件号变化触发旧护照/签证清洗', () => {
   });
 
   function armSwapMocks(existingDoc: string) {
-    mockPrisma.order.findUnique.mockResolvedValueOnce({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
+    // 持久 stub（非 once）：换人现在走 OrderMutation 内核，事务内会在动作前后各读一次订单账本快照
+    //（守恒断言），加上换人前现场快照共三次 findUnique —— 三次都得看到同一张单。
+    mockPrisma.order.findUnique.mockResolvedValue({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
     mockPrisma.passenger.findUnique.mockResolvedValueOnce({
       id: 'px1',
       orderId: 'ord1',
@@ -3454,7 +3459,9 @@ describe('swapPassenger · 证件号变化触发旧护照/签证清洗', () => {
 
   it('证件号变化但换入证件号已在同航班占座订单中 → DuplicatePassengerError，不落库', async () => {
     const service = new OrderService();
-    mockPrisma.order.findUnique.mockResolvedValueOnce({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
+    // 持久 stub（非 once）：换人现在走 OrderMutation 内核，事务内会在动作前后各读一次订单账本快照
+    //（守恒断言），加上换人前现场快照共三次 findUnique —— 三次都得看到同一张单。
+    mockPrisma.order.findUnique.mockResolvedValue({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
     mockPrisma.passenger.findUnique.mockResolvedValueOnce({
       id: 'px1',
       orderId: 'ord1',
@@ -3491,7 +3498,9 @@ describe('swapPassenger · 新出行人护照有效期', () => {
 
   /** @param perPersonItems 本单「按人出行」行数（>0 = 含机票/套餐/签证行 → 有效期必填）。 */
   function armSwapMocks(existingDoc: string, perPersonItems: number) {
-    mockPrisma.order.findUnique.mockResolvedValueOnce({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
+    // 持久 stub（非 once）：换人现在走 OrderMutation 内核，事务内会在动作前后各读一次订单账本快照
+    //（守恒断言），加上换人前现场快照共三次 findUnique —— 三次都得看到同一张单。
+    mockPrisma.order.findUnique.mockResolvedValue({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
     mockPrisma.passenger.findUnique.mockResolvedValueOnce({
       id: 'px1',
       orderId: 'ord1',
@@ -4693,7 +4702,9 @@ describe('swapPassenger · passengerType 服务端权威派生（覆盖客户端
   });
 
   function armMocks(existingPassengerType: string) {
-    mockPrisma.order.findUnique.mockResolvedValueOnce({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
+    // 持久 stub（非 once）：换人现在走 OrderMutation 内核，事务内会在动作前后各读一次订单账本快照
+    //（守恒断言），加上换人前现场快照共三次 findUnique —— 三次都得看到同一张单。
+    mockPrisma.order.findUnique.mockResolvedValue({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
     mockPrisma.passenger.findUnique.mockResolvedValueOnce({
       id: 'px1',
       orderId: 'ord1',
@@ -6012,6 +6023,8 @@ describe('OrderService.createOrder · settlement discount guardrails', () => {
         departDate: '2026-09-01',
         lines: [{
           bundleId: 'bundle-a',
+          // 取价行带航线（与真实 resolveBundleSettlementCalendarTotal 同形）：没航线的行不匹配立减
+          routeKey: 'MFM-DAD',
           tier: 'CITY_3STAR',
           nights: 3,
           departDate: '2026-09-01',
@@ -6095,7 +6108,7 @@ describe('OrderService.createOrder · settlement discount guardrails', () => {
 
   it('散客 RETAIL 立减叠加后 ≤0 → 拒单', async () => {
     const service = prepareService({ authoritativeTotal: 100 });
-    mockPrisma.bundle.findMany.mockResolvedValue([{ id: 'bundle-a', name: '套餐 A', settlementTier: 'CITY_3STAR', settlementNights: 3 }]);
+    mockPrisma.bundle.findMany.mockResolvedValue([{ id: 'bundle-a', name: '套餐 A', settlementTier: 'CITY_3STAR', settlementNights: 3, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null }]);
     mockResolveRetailSettlementDiscount.mockResolvedValue({ ruleId: 'retail-zero', kind: 'RETAIL', discountPerPersonCny: 100 });
     await expect(service.createOrder(bundleBody as never, { userId: 'customer-user', role: 'CUSTOMER' })).rejects.toThrow(
       '优惠叠加后金额异常，请联系客服',
@@ -6107,7 +6120,7 @@ describe('OrderService.createOrder · settlement discount guardrails', () => {
   // 旧行为是「打一条 warn 就放行」，日志没人盯 → 倒挂单照常成交。现改为硬拒。
   it('散客立减击穿同业日历价 → 拒单（不落库）', async () => {
     const service = prepareService({ authoritativeTotal: 200 });
-    mockPrisma.bundle.findMany.mockResolvedValue([{ id: 'bundle-a', name: '套餐 A', settlementTier: 'CITY_3STAR', settlementNights: 3 }]);
+    mockPrisma.bundle.findMany.mockResolvedValue([{ id: 'bundle-a', name: '套餐 A', settlementTier: 'CITY_3STAR', settlementNights: 3, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null }]);
     mockResolveRetailSettlementDiscount.mockResolvedValue({ ruleId: 'retail-low', kind: 'RETAIL', discountPerPersonCny: 50 });
     // 同业价 ¥300/人 × 1人 = 300 > 折后 150 → 击穿。
     mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 300 });
@@ -6127,7 +6140,7 @@ describe('OrderService.createOrder · settlement discount guardrails', () => {
 
   it('同业价取不到（日历未配）→ 无基准可比，维持放行不误伤', async () => {
     const service = prepareService({ authoritativeTotal: 200 });
-    mockPrisma.bundle.findMany.mockResolvedValue([{ id: 'bundle-a', name: '套餐 A', settlementTier: 'CITY_3STAR', settlementNights: 3 }]);
+    mockPrisma.bundle.findMany.mockResolvedValue([{ id: 'bundle-a', name: '套餐 A', settlementTier: 'CITY_3STAR', settlementNights: 3, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null }]);
     mockResolveRetailSettlementDiscount.mockResolvedValue({ ruleId: 'retail-low', kind: 'RETAIL', discountPerPersonCny: 50 });
     mockGetSettlementRate.mockResolvedValue(null);
     await expect(
@@ -6137,7 +6150,7 @@ describe('OrderService.createOrder · settlement discount guardrails', () => {
 
   it('散客折后价恰等于同业价 → 不算击穿，放行', async () => {
     const service = prepareService({ authoritativeTotal: 200 });
-    mockPrisma.bundle.findMany.mockResolvedValue([{ id: 'bundle-a', name: '套餐 A', settlementTier: 'CITY_3STAR', settlementNights: 3 }]);
+    mockPrisma.bundle.findMany.mockResolvedValue([{ id: 'bundle-a', name: '套餐 A', settlementTier: 'CITY_3STAR', settlementNights: 3, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null }]);
     mockResolveRetailSettlementDiscount.mockResolvedValue({ ruleId: 'retail-eq', kind: 'RETAIL', discountPerPersonCny: 50 });
     // 同业价 ¥150/人 × 1人 = 折后 200 − 50 = 150 → 相等，不拦。
     mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 150 });

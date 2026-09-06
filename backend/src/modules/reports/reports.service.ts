@@ -14,13 +14,18 @@
  *   - 应收状态集 RECEIVABLE_STATUSES：进行中的六态（不含 COMPLETED / REFUND_REQUESTED）
  */
 import type { Prisma, PrismaClient } from '@prisma/client';
-import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+// 订单状态集合全站唯一一份（审查根因 R2）：营收口径含 REFUND_REQUESTED；应收口径 = 占座 − COMPLETED。
+import { COUNTED_STATUSES, RECEIVABLE_STATUSES } from '../../lib/order-status-sets.js';
+import { type CompletedRefundShape } from '../../lib/net-received.js';
+// 订单金额单一口径（审查根因 R2）：应收 / 应收余额从这里取（内部转调 lib/net-received）。
+import { payableCny, receivableBalanceCny } from '../../lib/order-money.js';
+// 订单 → 航线的唯一派生（最早起飞的航段优先，其次套餐绑定航班，都没有 → 未知航线）。
 import {
-  netReceivedCny,
-  sumCompletedRefundCny,
-  type CompletedRefundShape,
-} from '../../lib/net-received.js';
+  ORDER_ROUTE_ITEM_SELECT,
+  orderRouteBucketKey,
+  routeKeyLabel,
+} from '../../lib/order-route.js';
 
 export interface DateRange {
   /** ISO date 'YYYY-MM-DD'，包含 */
@@ -29,7 +34,7 @@ export interface DateRange {
   to: string;
 }
 
-export type SalesDim = 'kind' | 'channel' | 'agent';
+export type SalesDim = 'kind' | 'channel' | 'agent' | 'route';
 
 export interface SalesRow {
   key: string;
@@ -112,28 +117,8 @@ export interface AgentDebtRow {
   prepaymentBalanceCny: number;
 }
 
-// 计入营收的订单状态（与 finances.service.ts 一致）：
-// 排除 DRAFT/CANCELLED/PAYMENT_TIMEOUT/REFUNDED/FAILED
-const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.REFUND_REQUESTED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
-
-// 应收口径的状态集（进行中六态；不含 COMPLETED / REFUND_REQUESTED）
-const RECEIVABLE_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
+// 计入营收的订单状态 COUNTED_STATUSES（与 finances.service 同一份）与应收口径 RECEIVABLE_STATUSES
+// （进行中六态；不含 COMPLETED / REFUND_REQUESTED）都从 lib/order-status-sets 取（全站唯一一份）。
 
 /** 应收明细最多返回的行数（summary 仍统计全量） */
 const RECEIVABLE_ROW_LIMIT = 500;
@@ -213,7 +198,7 @@ function newAcc(key: string, label: string): MutableSalesAcc {
   return { key, label, orderIds: new Set(), revenueCny: 0, costCny: 0, missingCostItemCount: 0 };
 }
 
-/** 销售毛利：按 kind / channel / agent 三个维度聚合区间内订单（按 createdAt 落区间） */
+/** 销售毛利：按 kind / channel / agent / route 四个维度聚合区间内订单（按 createdAt 落区间） */
 export async function getSalesReport(
   range: DateRange,
   dim: SalesDim,
@@ -229,7 +214,15 @@ export async function getSalesReport(
       agentId: true,
       userId: true,
       agent: { select: { companyName: true, contactName: true } },
-      items: { select: { kind: true, amount: true, totalCostCny: true } },
+      items: {
+        select: {
+          kind: true,
+          amount: true,
+          totalCostCny: true,
+          // 航线维度要按订单派生航线分桶；其余维度用不到这两段，多带一层 select 换一份口径统一。
+          ...ORDER_ROUTE_ITEM_SELECT,
+        },
+      },
     },
   });
 
@@ -248,6 +241,11 @@ export async function getSalesReport(
     } else if (dim === 'agent') {
       orderKey = o.agentId ?? DIRECT_KEY;
       orderLabel = agentLabelOf(o.agent);
+    } else if (dim === 'route') {
+      // 航线是**订单级**属性（一张单只归一条线），故与 channel/agent 同样按单分桶，
+      // 而不是逐行判断 —— 同单的酒店/签证行本来就没有航线，逐行判会把它们全甩进未知桶。
+      orderKey = orderRouteBucketKey(o.items);
+      orderLabel = routeKeyLabel(orderKey);
     }
 
     for (const it of o.items) {
@@ -322,8 +320,7 @@ interface ReceivableOrderShape {
  * 余额会偏小（钱已经退回客户了，账上却还当收着），甚至被误判成没有欠款而从账龄表里消失。
  */
 function balanceOf(o: ReceivableOrderShape): number {
-  const received = netReceivedCny(o, sumCompletedRefundCny(o.refunds));
-  return round2(dec(o.total) + o.adjustmentCny - received);
+  return receivableBalanceCny(o, o.refunds);
 }
 
 /** 应收账龄：所有进行中订单里余额 > 0 的明细 + 账龄桶汇总 */
@@ -353,7 +350,7 @@ export async function getReceivablesReport(
   for (const o of orders) {
     const balance = balanceOf(o);
     if (balance <= 0) continue;
-    const totalCny = round2(dec(o.total) + o.adjustmentCny);
+    const totalCny = payableCny(o);
     const ageDays = Math.max(0, Math.floor((now - o.createdAt.getTime()) / DAY_MS));
     allRows.push({
       orderId: o.id,

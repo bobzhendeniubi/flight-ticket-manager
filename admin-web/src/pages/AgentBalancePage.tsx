@@ -23,6 +23,7 @@ import {
   type PaymentChannelKind,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
 import { NumberInput } from '../components/NumberInput';
 import { Icon } from '../components/Icon';
 import { formatDateTimeSecCn } from '../lib/datetime';
@@ -98,7 +99,7 @@ export function AgentBalancePage() {
   const user = useAuth((s) => s.user);
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
-  const isStaff = user?.role === 'ADMIN' || user?.role === 'STAFF';
+  const isStaff = useCapabilities().can('agent_recharges.decide');
   const isAgent = user?.role === 'AGENT';
 
   return (

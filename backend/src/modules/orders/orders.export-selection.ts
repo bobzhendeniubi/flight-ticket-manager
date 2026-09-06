@@ -25,7 +25,9 @@
  *   · scheduleId（整班·全岗精确导出）—— 取数已按班次精确圈定，日期类精筛不适用，
  *     但单程/往返筛选照常生效（它与班次无关）。
  */
-import { OrderStatus, Prisma } from '@prisma/client';
+import { Prisma } from '@prisma/client';
+// 订单状态集合全站唯一一份（审查根因 R2）：三模板与全岗总表选单走库存口径，下方原名再导出。
+import { INVENTORY_COUNTED_STATUSES } from '../../lib/order-status-sets.js';
 import {
   applyExportAgentScope,
   buildOrderFilterWhere,
@@ -46,15 +48,7 @@ import {
  * 退款申请中/已退款/已取消/超时/失败已释放库存，不计入任何导出。
  * 三模板与全岗总表共用同一份 —— 各写一份的话，「这张表有这单、那张表没有」将无从解释。
  */
-export const EXPORT_COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
+export const EXPORT_COUNTED_STATUSES = INVENTORY_COUNTED_STATUSES;
 
 /** 选单用到的筛选字段：列表同款筛选 + 勾选导出 / 整班导出两个短路开关。*/
 export type ExportSelectionFilters = OrderListFilters;

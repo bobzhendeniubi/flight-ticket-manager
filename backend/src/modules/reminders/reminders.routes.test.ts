@@ -29,6 +29,9 @@ vi.mock('../../lib/audit.js', () => ({
   writeAudit: vi.fn().mockResolvedValue(undefined),
 }));
 
+const flagMock = vi.hoisted(() => vi.fn());
+vi.mock('../../lib/feature-flags.js', () => ({ isFeatureEnabled: flagMock }));
+
 import { authPlugin } from '../../plugins/auth.js';
 import { registerErrorHandler } from '../../plugins/error-handler.js';
 import { reminderRoutes } from './reminders.routes.js';
@@ -80,6 +83,7 @@ describe('GET /reminders/work-orders/summary', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     prismaMock.$transaction.mockImplementation((ops: Promise<unknown>[]) => Promise.all(ops));
+    flagMock.mockResolvedValue(false); // REMINDER_BELL_ALL 默认关，各用例按需覆盖
   });
 
   it('AGENT 访问 → 403，且不触达 prisma.operationalReminder', async () => {
@@ -216,5 +220,73 @@ describe('GET /reminders/work-orders/summary', () => {
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body).toMatchObject({ open: 0, inProgress: 0, latestAt: null, items: [] });
+  });
+
+  it('REMINDER_BELL_ALL 关闭：响应里完全没有 reminders 字段（与开关之前逐字节一致）', async () => {
+    setUser(UserRole.STAFF);
+    flagMock.mockResolvedValue(false);
+    prismaMock.operationalReminder.count.mockResolvedValueOnce(0);
+    prismaMock.operationalReminder.count.mockResolvedValueOnce(0);
+    prismaMock.operationalReminder.findMany.mockResolvedValueOnce([]);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/reminders/work-orders/summary',
+      headers: { authorization: `Bearer ${tokenFor('staff-1', UserRole.STAFF)}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(Object.prototype.hasOwnProperty.call(body, 'reminders')).toBe(false);
+    // 关闭时不该多打一次 count 去查规则提醒
+    expect(prismaMock.operationalReminder.count).toHaveBeenCalledTimes(2);
+  });
+
+  it('REMINDER_BELL_ALL 开启：新增 reminders.{critical,high}，且排除三类工单前缀', async () => {
+    setUser(UserRole.STAFF);
+    flagMock.mockResolvedValue(true);
+    prismaMock.operationalReminder.count
+      .mockResolvedValueOnce(3) // open（三类工单）
+      .mockResolvedValueOnce(1) // inProgress（三类工单）
+      .mockResolvedValueOnce(5) // CRITICAL（其它规则提醒）
+      .mockResolvedValueOnce(2); // HIGH（其它规则提醒）
+    prismaMock.operationalReminder.findMany.mockResolvedValueOnce([]);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/reminders/work-orders/summary',
+      headers: { authorization: `Bearer ${tokenFor('staff-1', UserRole.STAFF)}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.reminders).toEqual({ critical: 5, high: 2 });
+    // 原有字段不受影响
+    expect(body.open).toBe(3);
+    expect(body.inProgress).toBe(1);
+
+    const expectedRuleKeyFilter = {
+      OR: [
+        { ruleKey: { startsWith: 'NOSHOW_WITHDRAW:' } },
+        { ruleKey: { startsWith: 'NOSHOW_RELIST:' } },
+        { ruleKey: { startsWith: 'LEG_CANCEL_WITHDRAW:' } },
+      ],
+    };
+    expect(prismaMock.operationalReminder.count).toHaveBeenNthCalledWith(3, {
+      where: {
+        ruleKey: { not: null },
+        NOT: expectedRuleKeyFilter,
+        status: { in: [ReminderStatus.OPEN, ReminderStatus.IN_PROGRESS] },
+        priority: ReminderPriority.CRITICAL,
+      },
+    });
+    expect(prismaMock.operationalReminder.count).toHaveBeenNthCalledWith(4, {
+      where: {
+        ruleKey: { not: null },
+        NOT: expectedRuleKeyFilter,
+        status: { in: [ReminderStatus.OPEN, ReminderStatus.IN_PROGRESS] },
+        priority: ReminderPriority.HIGH,
+      },
+    });
   });
 });

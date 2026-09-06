@@ -18,7 +18,6 @@
  *   POST   /hotel-control/passports-by-names.zip    按姓名批量导出护照 zip（body { names: string[], from?, to? } —— from/to 为出发地本地日区间）
  */
 import type { FastifyPluginAsync } from 'fastify';
-import { UserRole } from '@prisma/client';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { buildHotelControlBoardWorkbook, hotelControlExportFilename } from './hotel-control.export.js';
 import {
@@ -66,12 +65,17 @@ import { prisma } from '../../db/prisma.js';
 import { AuditSeverity } from '@prisma/client';
 
 export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
-  const requireStaff = {
-    preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)],
+  // 只读：看板/前瞻/清单/预警/导出/护照包 —— hotel_control.view。
+  const requireView = {
+    preHandler: [app.authenticate, app.requireCapability('hotel_control.view')],
+  };
+  // 变更：包房周期增删改、超售上限 —— hotel_control.manage。
+  const requireManage = {
+    preHandler: [app.authenticate, app.requireCapability('hotel_control.manage')],
   };
 
   // ── 包房周期 CRUD ──────────────────────────────────────────────────────
-  app.get('/block-periods', requireStaff, async (req) => {
+  app.get('/block-periods', requireView, async (req) => {
     const q = listBlockPeriodsQuerySchema.parse(req.query);
     const periods = await listBlockPeriods({
       hotelId: q.hotelId,
@@ -80,7 +84,7 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
     return { periods };
   });
 
-  app.post('/block-periods', requireStaff, async (req, reply) => {
+  app.post('/block-periods', requireManage, async (req, reply) => {
     const body = createBlockPeriodBodySchema.parse(req.body);
     const period = await createBlockPeriod(body);
     void writeAudit({
@@ -95,7 +99,7 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
     return reply.status(201).send({ period });
   });
 
-  app.patch('/block-periods/:id', requireStaff, async (req) => {
+  app.patch('/block-periods/:id', requireManage, async (req) => {
     const { id } = req.params as { id: string };
     const body = updateBlockPeriodBodySchema.parse(req.body);
     const period = await updateBlockPeriod(id, body, undefined, actorFromRequest(req));
@@ -110,7 +114,7 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
     return { period };
   });
 
-  app.delete('/block-periods/:id', requireStaff, async (req) => {
+  app.delete('/block-periods/:id', requireManage, async (req) => {
     const { id } = req.params as { id: string };
     // 删除前先取快照：审计 before 必须能回答「删的是哪家酒店、哪段、几间」，
     // 否则事后只剩一个 id，无从追责。找不到就交给 deleteBlockPeriod 抛 404。
@@ -130,35 +134,35 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ── 销控板 / 远期视图 ──────────────────────────────────────────────────
-  app.get('/board', requireStaff, async (req) => {
+  app.get('/board', requireView, async (req) => {
     const q = boardQuerySchema.parse(req.query);
     return getBoard(q);
   });
 
-  app.get('/forward', requireStaff, async (req) => {
+  app.get('/forward', requireView, async (req) => {
     const q = boardQuerySchema.parse(req.query);
     return getForward(q);
   });
 
-  // ── 每日加房清单（随机档缺口；与销控矩阵共用 getRandomTierAggregate）──────
-  app.get('/random-tier-shortfall', requireStaff, async (req) => {
+  // ── 每日加房清单（随机档缺口；与销控矩阵共用 getRandomTierAggregate；按城市分条）──
+  app.get('/random-tier-shortfall', requireView, async (req) => {
     const q = randomTierShortfallQuerySchema.parse(req.query);
-    return getRandomTierShortfall(q.from, q.to);
+    return getRandomTierShortfall(q.from, q.to, undefined, { cityCode: q.cityCode });
   });
 
   // ── 提醒线（按需计算，无 cron）────────────────────────────────────────
-  app.get('/alerts', requireStaff, async (req) => {
+  app.get('/alerts', requireView, async (req) => {
     const q = alertsQuerySchema.parse(req.query);
     return getAlerts(q.days);
   });
 
   // ── 超售容忍上限（运营可调）：销控售罄后内部录单最多允许打到负几间 ─────────
   // 房控/运营自己改，不用找开发；改动写 WARNING 审计可追溯。0 = 关掉超售口子。
-  app.get('/oversell-cap', requireStaff, async () => {
+  app.get('/oversell-cap', requireView, async () => {
     return { rooms: await getHotelOversellCapRooms(), max: HOTEL_OVERSELL_CAP_MAX };
   });
 
-  app.put('/oversell-cap', requireStaff, async (req) => {
+  app.put('/oversell-cap', requireManage, async (req) => {
     const body = z
       .object({
         rooms: z
@@ -192,29 +196,31 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ── 近期用房变更（读审计流；订单侧改了分房/换酒店/补房差 → 房控可见性）────
-  app.get('/recent-changes', requireStaff, async (req) => {
+  app.get('/recent-changes', requireView, async (req) => {
     const q = recentChangesQuerySchema.parse(req.query);
     return getRecentRoomChanges(q.days);
   });
 
   // ── 占房下钻（某酒店/某星级随机池某晚，谁占的；销控矩阵余量格点击用）──────────
-  app.get('/occupants', requireStaff, async (req) => {
+  app.get('/occupants', requireView, async (req) => {
     const q = occupantsQuerySchema.parse(req.query);
     const occupants = await getOccupyingOrders(
-      q.hotelId ? { hotelId: q.hotelId } : { randomStarTier: q.randomStarTier! },
+      q.hotelId
+        ? { hotelId: q.hotelId }
+        : { randomStarTier: q.randomStarTier!, cityCode: q.cityCode! },
       q.date,
     );
     return { occupants };
   });
 
   // ── 当日余量（给定房型 + 入住区间；分房弹窗徽标用）───────────────────────
-  app.get('/nightly-remaining', requireStaff, async (req) => {
+  app.get('/nightly-remaining', requireView, async (req) => {
     const q = nightlyRemainingQuerySchema.parse(req.query);
     return getNightlyRemainingForRoomType(q.hotelRoomTypeId, q.checkIn, q.checkOut);
   });
 
   // ── 房态导出（xlsx；销控矩阵原样导出，含「未配包房」标记）────────────────
-  app.get('/export', requireStaff, async (req, reply) => {
+  app.get('/export', requireView, async (req, reply) => {
     const q = boardQuerySchema.parse(req.query);
     const buf = await buildHotelControlBoardWorkbook(q);
 
@@ -223,21 +229,23 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
       action: 'EXPORT_HOTEL_CONTROL_BOARD',
       targetType: 'PRODUCT',
       targetId: 'hotel-control-board',
-      targetLabel: `房控导出 ${q.from}~${q.to}`,
-      after: { from: q.from, to: q.to },
+      targetLabel: `房控导出 ${q.from}~${q.to}${q.cityCode ? ` ${q.cityCode}` : ''}`,
+      after: { from: q.from, to: q.to, cityCode: q.cityCode ?? null },
     });
 
     return reply
       .header('Content-Type', 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
       .header(
         'Content-Disposition',
-        `attachment; filename="${encodeURIComponent(hotelControlExportFilename(q.from, q.to))}"`,
+        `attachment; filename="${encodeURIComponent(
+          hotelControlExportFilename(q.from, q.to, q.cityCode),
+        )}"`,
       )
       .send(buf);
   });
 
   // ── 按酒店一键导出护照 zip（选酒店 + 入住日期区间；按订单分文件夹）────────
-  app.get('/passports.zip', requireStaff, async (req, reply) => {
+  app.get('/passports.zip', requireView, async (req, reply) => {
     const q = hotelPassportsQuerySchema.parse(req.query);
     const selection = await collectHotelPassportGroups(q);
 
@@ -278,7 +286,7 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
 
   // ── 按姓名批量导出护照 zip（不限酒店，可选按出发日期过滤；按出发日期分文件夹、
   //    按姓名命名文件，未命中姓名写进 README）────
-  app.post('/passports-by-names.zip', requireStaff, async (req, reply) => {
+  app.post('/passports-by-names.zip', requireView, async (req, reply) => {
     const body = hotelPassportsByNamesBodySchema.parse(req.body);
     const hasRange = Boolean(body.from || body.to);
     const selection = await collectPassportGroupsByNames({

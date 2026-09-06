@@ -11,6 +11,7 @@ import type {
   AuthResult, AuthTokens, CabinClass,
   CancellationQuote,
   FlightSearchResult, OrderSummary, PaymentMethod,
+  PublicAirport, PublicHotelCity, PublicRoute,
 } from './types';
 
 const API_URL: string = typeof API_BASE !== 'undefined' ? API_BASE : 'http://localhost:4000';
@@ -173,6 +174,14 @@ export const api = {
     }
     return apiFetch<{ results: FlightSearchResult[] }>(`/flights/search?${qs.join('&')}`);
   },
+
+  // 航线 / 机场 / 酒店城市（公开，无需登录）——动态派生，不再由前端写死目的地
+  /** 活跃航线（distinct 起降机场对 + 两端展示信息）；用于首页默认航线 + 标题。 */
+  getPublicRoutes: () => apiFetch<{ routes: PublicRoute[] }>('/public/routes'),
+  /** 出现在活跃航班里的机场清单；用于航班搜索的出发/到达选择器。 */
+  getPublicAirports: () => apiFetch<{ airports: PublicAirport[] }>('/public/airports'),
+  /** 在架酒店的 distinct 城市码 + 中文名。 */
+  getPublicHotelCities: () => apiFetch<{ cities: PublicHotelCity[] }>('/public/hotel-cities'),
 
   // 订单 — 创建 / 列表 / 详情
   createOrder: (

@@ -1,21 +1,10 @@
-import { z } from 'zod';
-
-export const listCustomersQuerySchema = z.object({
-  search: z.string().max(120).optional(),       // 姓名/电话/邮箱
-  agentId: z.string().optional(),
-  tag: z.string().max(50).optional(),
-  page: z.coerce.number().int().min(1).default(1),
-  pageSize: z.coerce.number().int().min(1).max(200).default(50),
-});
-export type ListCustomersQuery = z.infer<typeof listCustomersQuerySchema>;
-
-export const updateCustomerBodySchema = z.object({
-  displayName: z.string().min(1).max(120).optional(),
-  phone: z.string().min(5).max(40).optional(),
-  email: z.string().email().optional(),
-  idNumber: z.string().max(40).optional().nullable(),
-  primaryAgentId: z.string().optional().nullable(),
-  tags: z.array(z.string().max(50)).optional(),
-  notes: z.string().max(1000).optional().nullable(),
-});
-export type UpdateCustomerBody = z.infer<typeof updateCustomerBodySchema>;
+/**
+ * 客户资料的请求体 —— 定义已搬进 @ftm/contracts（packages/contracts/src/customers.ts）。
+ *
+ * 校验规则一字未改：只把 z.nativeEnum(PrismaEnum) 换成契约包镜像的同值 schema
+ *（枚举漂移测试守着两边一致），helper 的 import 改指契约包里的同一份实现。
+ *
+ * 这里留 re-export 壳子，既有 import 路径全部继续可用；前端从 @ftm/contracts
+ * 取同一份类型，不再手抄。
+ */
+export * from '@ftm/contracts/customers';

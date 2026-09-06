@@ -686,7 +686,11 @@ describe('OrderService.swapItemHotel · 真 DB E2E', () => {
     ).rejects.toThrow(/下架/);
   });
 
-  it('非 ADMIN/STAFF 调用换酒店 → 拒绝', async () => {
+  // 代理自助改单上线后（b1ec529），非 ADMIN/STAFF 不再一律硬拒——自家单在下单当天窗口内可自助
+  // 换酒店（差价强制归 0）。这里的代理与订单毫无关系，走的是 assertAgentSelfEditAllowed 里
+  // 更早的「能不能看这张单」闸，抛的是「无权查看该订单」而非旧版的「仅运营/管理员」；
+  // 自助窗口内/外的正向用例见 orders.agent-self-edit.test.ts。
+  it('非 ADMIN/STAFF 且非订单归属代理 → 拒绝', async () => {
     const agent = await createUser(UserRole.AGENT);
     const src = await createHotelWithRoomType();
     const dest = await createHotelWithRoomType();
@@ -706,6 +710,6 @@ describe('OrderService.swapItemHotel · 真 DB E2E', () => {
         { newHotelRoomTypeId: dest.roomType.id },
         { userId: agent.id, role: UserRole.AGENT },
       ),
-    ).rejects.toThrow(/仅运营\/管理员/);
+    ).rejects.toThrow(/无权查看该订单/);
   });
 });

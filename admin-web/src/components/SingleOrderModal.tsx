@@ -46,6 +46,7 @@ import {
   VISA_STATUS_LABEL,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
 import { NumberInput } from './NumberInput';
 import { Icon } from './Icon';
 import { PassengerSuggestInput } from './PassengerSuggestInput';
@@ -74,6 +75,7 @@ import {
 } from './SingleOrderProductBlock';
 import { formatLocalTime } from '../lib/airports';
 import { composePassengerFullName, normalizePassengerFullName } from '../lib/passengerName';
+import type { SingleOrderPrefill } from './singleOrderPrefill';
 import { groupHotelsByBundleTier, resolveHotelSettlementTier, SETTLEMENT_TIER_ZH } from '../lib/settlement-tier';
 
 /**
@@ -241,10 +243,28 @@ function parseDob(raw: string): string | null {
   return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
 }
 
-// ── 套餐航段自动派生（去程/回程班次按出发日期匹配；时间按澳门时区显示）──────
-// 套餐固定航线：去程 MFM→DAD（澳门→岘港），回程 DAD→MFM（岘港→澳门，QH9588）。
-const BUNDLE_GO_ORIGIN = 'MFM';
-const BUNDLE_GO_DEST = 'DAD';
+// ── 套餐航段自动派生（去程/回程班次按出发日期匹配；时刻按班次自己的时区显示）──────
+// 航线**不写死**：取所选套餐绑定航班的起降地（去程优先；只绑回程时按回程反推去程方向）。
+// 都没绑 = 没航线 → 不给候选航班、不派生航段，直接提示运营先去套餐里绑航班。
+// 第二条航线（直飞）一开，写死的 MFM→DAD 会让新航线套餐拉到老航线的班次池。
+interface BundleRoute {
+  origin: string;
+  destination: string;
+}
+
+/** 套餐航线（去程方向）；去程绑定优先，只绑回程按回程反推，都没绑 → null。 */
+function resolveBundleRoute(bundle: Bundle | undefined): BundleRoute | null {
+  const out = bundle?.outboundFlight;
+  if (out?.originCode && out?.destinationCode) {
+    return { origin: out.originCode, destination: out.destinationCode };
+  }
+  const ret = bundle?.returnFlight;
+  if (ret?.originCode && ret?.destinationCode) {
+    // 回程是 destination→origin，反推去程方向。
+    return { origin: ret.destinationCode, destination: ret.originCode };
+  }
+  return null;
+}
 
 /** 套餐未配置 hotelNights 且无 HOTEL 组件时的兜底晚数（与后端 bundle-nights.ts 一致）。 */
 const DEFAULT_BUNDLE_NIGHTS = 1;
@@ -294,12 +314,37 @@ function resolveBundleNights(
   return Math.max(1, raw);
 }
 
+/**
+ * 用预填值搭出初始产品区块。
+ * 没有预填（或预填里一条可录产品都没有）→ 回落到现状：一个机票区块。
+ * 套餐预填恒为单个 BUNDLE 区块（套餐独占一张单的不变式由 buildSingleOrderPrefill 保证）。
+ */
+function blocksFromPrefill(prefill?: SingleOrderPrefill): ProductBlock[] {
+  const kinds: ProductBlockKind[] =
+    prefill && prefill.blockKinds.length > 0
+      ? prefill.blockKinds.slice(0, MAX_PRODUCT_BLOCKS)
+      : ['FLIGHT'];
+  return kinds.map((kind) => {
+    const block = createProductBlock(kind);
+    // 往返只带「往返」这个形态，具体航班 / 班次不带 —— 下一单的行程本来就不同
+    return kind === 'FLIGHT' && prefill?.flightTripType === 'ROUNDTRIP'
+      ? { ...block, tripType: 'ROUNDTRIP' as const }
+      : block;
+  });
+}
+
 interface SingleOrderModalProps {
   onClose: () => void;
   onCreated: () => void;
+  /**
+   * 「以此单为模板」的预填值（见 singleOrderPrefill.ts）：产品类型 / 代理 / 联系人 / 备注
+   * 直接带进表单，出行人与金额一律不带。缺省 = 全新空白录单（现状）。
+   * 只作用于初次挂载时的初始值，之后表单以用户输入为准。
+   */
+  prefill?: SingleOrderPrefill;
 }
 
-export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) {
+export function SingleOrderModal({ onClose, onCreated, prefill }: SingleOrderModalProps) {
   const tokens = useAuth((s) => s.tokens);
   const dialogRef = useDialogA11y(onClose);
   const user = useAuth((s) => s.user);
@@ -310,32 +355,33 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
    * 本单的产品区块列表（唯一真源）。首块的类型由顶部「产品类型」标签切换，
    * 其余块各自带类型下拉 + 删除。不变式：一旦出现套餐区块，列表长度恒为 1（套餐独占）。
    */
-  const [blocks, setBlocks] = useState<ProductBlock[]>(() => [createProductBlock('FLIGHT')]);
+  const [blocks, setBlocks] = useState<ProductBlock[]>(() => blocksFromPrefill(prefill));
   const firstKind: ProductBlockKind = blocks[0]?.kind ?? 'FLIGHT';
   const isBundleOrder = firstKind === 'BUNDLE';
 
   // 联系人（选填；缺省默认=录入人本人，后端缺联系人时也会回退到录入人）
-  const [contactName, setContactName] = useState(recorderLabel);
-  const [contactPhone, setContactPhone] = useState('');
-  const [contactEmail, setContactEmail] = useState('');
+  const [contactName, setContactName] = useState(prefill?.contactName || recorderLabel);
+  const [contactPhone, setContactPhone] = useState(prefill?.contactPhone ?? '');
+  const [contactEmail, setContactEmail] = useState(prefill?.contactEmail ?? '');
 
   // 归属代理（ADMIN/STAFF 代为录单）；'' = 直客/无代理
   const [agents, setAgents] = useState<AgentListItem[]>([]);
   const [agentSearch, setAgentSearch] = useState('');
-  const [agentId, setAgentId] = useState('');
+  const [agentId, setAgentId] = useState(prefill?.agentId ?? '');
 
-  const [notes, setNotes] = useState('');
+  const [notes, setNotes] = useState(prefill?.notes ?? '');
   // 签证状态 + 结构化备注（酒店/签证/付款/特殊要求）
   // 默认值按本单产品派生（见 defaultVisaStatusFor）；用户手动改过下拉后，
   // 由 visaStatusTouchedRef 记住，产品再变也不会覆盖用户的手动选择。
-  const [visaStatus, setVisaStatus] = useState<VisaStatusInput>('NOT_NEEDED');
-  const visaStatusTouchedRef = useRef(false);
+  const [visaStatus, setVisaStatus] = useState<VisaStatusInput>(prefill?.visaStatus ?? 'NOT_NEEDED');
+  // 模板带来的签证状态当作「已经选过」：否则产品派生的默认值会立刻把源单的口径覆盖掉。
+  const visaStatusTouchedRef = useRef(prefill?.visaStatus != null);
   // 签证列隐藏时用户先选「不需要 / 已签证」的意图，只消费一次，避免切换产品后反复覆盖逐位选择。
   const pendingAutoVisaExemptRef = useRef(false);
-  const [noteHotel, setNoteHotel] = useState('');
-  const [noteVisa, setNoteVisa] = useState('');
-  const [notePayment, setNotePayment] = useState('');
-  const [noteSpecial, setNoteSpecial] = useState('');
+  const [noteHotel, setNoteHotel] = useState(prefill?.noteHotel ?? '');
+  const [noteVisa, setNoteVisa] = useState(prefill?.noteVisa ?? '');
+  const [notePayment, setNotePayment] = useState(prefill?.notePayment ?? '');
+  const [noteSpecial, setNoteSpecial] = useState(prefill?.noteSpecial ?? '');
   const [passengers, setPassengers] = useState<PassengerRow[]>([emptyPassenger()]);
   // 最新乘客快照（ref）：批量并发 OCR 时，handleOcrFile 的「护照图上限」要读实时状态，
   // 不能用渲染闭包里的 passengers（并发 worker 之间会读到陈旧值，导致少计/超计）。
@@ -395,7 +441,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
 
   // ── 套餐 ──
   const [bundles, setBundles] = useState<Bundle[]>([]);
-  const [bundleId, setBundleId] = useState('');
+  const [bundleId, setBundleId] = useState(prefill?.bundleId ?? '');
   const [departDate, setDepartDate] = useState('');
   const [adultCount, setAdultCount] = useState<number | null>(1);
   const [childCount, setChildCount] = useState<number | null>(0);
@@ -487,22 +533,29 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     api.listAllFlights(token).then((r) => setFlights(r.flights)).catch(() => setErr('航班列表加载失败'));
   }, [token, needsFlightCatalog, flights.length]);
 
-  // 套餐机票航段：选了套餐 + 航班列表就绪后，预拉两个方向（去程 MFM→DAD / 回程 DAD→MFM）
-  // 的全部班次池；后续按「出发日期」本地日期匹配派生具体班次。
+  // 该套餐的航线（由绑定航班派生，去程方向）；没绑航班 → null → 下面一律不拉班次、不派生航段。
+  // 注意要放在下面那个 effect 之前：effect 的依赖数组在渲染期求值，引用在后面声明的 const 会撞 TDZ。
+  const bundleRoute = useMemo(
+    () => resolveBundleRoute(bundles.find((b) => b.id === bundleId)),
+    [bundles, bundleId],
+  );
+
+  // 套餐机票航段：选了套餐 + 航班列表就绪后，预拉该套餐航线两个方向（去程 origin→destination /
+  // 回程 destination→origin）的全部班次池；后续按「出发日期」本地日期匹配派生具体班次。
   // 注意：同一航线上可能有多家航空公司的在飞航班，必须合并所有匹配航班的班次，
   // 不能只取第一条命中航班——否则该航线上其余航空公司的班次会被漏查，
   // 出现"某月份明明有班次却提示没有匹配班次"的假阴性（取决于航班列表返回顺序）。
   useEffect(() => {
-    if (!token || !isBundleOrder || !bundleId || flights.length === 0) {
+    if (!token || !isBundleOrder || !bundleId || flights.length === 0 || !bundleRoute) {
       setBundleGoSchedulePool([]);
       setBundleRetSchedulePool([]);
       return;
     }
     const goFlights = flights.filter(
-      (f) => f.isActive && f.originCode === BUNDLE_GO_ORIGIN && f.destinationCode === BUNDLE_GO_DEST,
+      (f) => f.isActive && f.originCode === bundleRoute.origin && f.destinationCode === bundleRoute.destination,
     );
     const retFlights = flights.filter(
-      (f) => f.isActive && f.originCode === BUNDLE_GO_DEST && f.destinationCode === BUNDLE_GO_ORIGIN,
+      (f) => f.isActive && f.originCode === bundleRoute.destination && f.destinationCode === bundleRoute.origin,
     );
     if (goFlights.length > 0) {
       fetchSchedulesMerged(token, goFlights.map((f) => f.id))
@@ -518,7 +571,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     } else {
       setBundleRetSchedulePool([]);
     }
-  }, [token, isBundleOrder, bundleId, flights]);
+  }, [token, isBundleOrder, bundleId, flights, bundleRoute]);
 
   // 切换套餐 = 换了另一件商品：上一套餐的「档次相关选择」一律不能带过来。
   //   · 手选航班号 —— 不同套餐的绑定/候选航班不同；
@@ -551,8 +604,18 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 选中后才发现不能用；已下架的酒店专属套餐（如某酒店 2天1晚）应改选同档次随机套餐 + 指定酒店。
   useEffect(() => {
     if (!isBundleOrder || bundles.length > 0) return;
-    api.listBundles(true).then((r) => setBundles(r.bundles)).catch(() => setErr('套餐列表加载失败'));
-  }, [isBundleOrder, bundles.length]);
+    api.listBundles(true)
+      .then((r) => {
+        setBundles(r.bundles);
+        // 「以此单为模板」带来的套餐可能已下架（本列表只含在架）：清掉并说明，
+        // 否则下拉显示空白但 bundleId 还在，运营会一路点到服务端打回「套餐已下架」才明白。
+        if (bundleId && !r.bundles.some((b) => b.id === bundleId)) {
+          setBundleId('');
+          setErr('源单的套餐已下架，请重新选择套餐（可改选同档次随机套餐 + 指定酒店）');
+        }
+      })
+      .catch(() => setErr('套餐列表加载失败'));
+  }, [isBundleOrder, bundles.length, bundleId]);
 
   // 接送列表
   useEffect(() => {
@@ -607,24 +670,31 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   // 套餐是否往返（legs≥2）：决定要不要派生回程航段。
   const bundleIsRoundTrip = (bundle?.legs ?? 2) >= 2;
 
-  // 同路线在飞候选航班（去程 MFM→DAD / 回程 DAD→MFM）：用于「未绑定航班号」时判断是否需运营手选。
+  // 同航线在飞候选航班（按该套餐派生出的航线过滤）：用于「未绑定航班号」时判断是否需运营手选。
+  // 没航线（套餐没绑任何航班）→ 空候选，界面走「先去套餐里绑航班」的提示路径。
   const bundleGoFlights = useMemo(
     () =>
-      isBundleOrder
+      isBundleOrder && bundleRoute
         ? flights.filter(
-            (f) => f.isActive && f.originCode === BUNDLE_GO_ORIGIN && f.destinationCode === BUNDLE_GO_DEST,
+            (f) =>
+              f.isActive &&
+              f.originCode === bundleRoute.origin &&
+              f.destinationCode === bundleRoute.destination,
           )
         : [],
-    [isBundleOrder, flights],
+    [isBundleOrder, flights, bundleRoute],
   );
   const bundleRetFlights = useMemo(
     () =>
-      isBundleOrder
+      isBundleOrder && bundleRoute
         ? flights.filter(
-            (f) => f.isActive && f.originCode === BUNDLE_GO_DEST && f.destinationCode === BUNDLE_GO_ORIGIN,
+            (f) =>
+              f.isActive &&
+              f.originCode === bundleRoute.destination &&
+              f.destinationCode === bundleRoute.origin,
           )
         : [],
-    [isBundleOrder, flights],
+    [isBundleOrder, flights, bundleRoute],
   );
 
   // 该套餐去程/回程是否需要运营手选航班号：未绑定 + 同路线有 ≥2 个在飞航班时才需要。
@@ -859,7 +929,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const adjustError = adjustIsInteger && adjustNeedsText ? '选择「其它」时请填写调整原因说明' : null;
 
   // ── 本单结算总价 ──
-  const isStaffUser = user?.role === 'ADMIN' || user?.role === 'STAFF';
+  const isStaffUser = useCapabilities().can('orders.price_adjust');
   // 代理录单：只看结算价（业务拍板）。系统价/调价是运营概念，对代理隐藏；
   // quote 接口对 AGENT 已在服务端强制归属自家，结算价预览无需先选归属代理。
   // 结算价锁定前代理可以自己填 / 自己改，不经运营审批（锁定后才走议价申请，见订单详情）。
@@ -1214,14 +1284,18 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     }
     // 出发日期必填：航段按它自动派生（匹配去程/回程班次本地日期）。
     if (!departDate) return { error: '请选择套餐「出发日期」（用于自动匹配机票航段并扣座）' };
+    // 航线由套餐绑定航班派生；没绑就没航线，谈不上匹配班次 —— 让运营先去套餐里绑航班。
+    if (!bundleRoute) {
+      return { error: '该套餐未绑定去程/回程航班，无法确定航线：请先在「产品 · 套餐」里绑定航班号' };
+    }
     // 去程航段必须派生成功，否则该出发日无对应去程班次 → 不能扣座/进票务待办。
     if (!bundleLegs.go) {
-      return { error: `所选出发日期 ${departDate} 没有匹配的去程班次（${BUNDLE_GO_ORIGIN}→${BUNDLE_GO_DEST}），请换日期或先在航班里建班次` };
+      return { error: `所选出发日期 ${departDate} 没有匹配的去程班次（${bundleRoute.origin}→${bundleRoute.destination}），请换日期或先在航班里建班次` };
     }
     // 往返套餐必须派生出回程；缺回程班次说明回程日期那天没排班。
     const isRoundTrip = (bundle?.legs ?? 2) >= 2;
     if (isRoundTrip && !bundleLegs.ret) {
-      return { error: `回程日期 ${bundleLegs.returnDate} 没有匹配的回程班次（${BUNDLE_GO_DEST}→${BUNDLE_GO_ORIGIN}），请核对套餐晚数/排班` };
+      return { error: `回程日期 ${bundleLegs.returnDate} 没有匹配的回程班次（${bundleRoute.destination}→${bundleRoute.origin}），请核对套餐晚数/排班` };
     }
     const maxSingleBusiness = adults + children;
     // 单住 / 自备签为乘客级派生（购物车模式：每人各选，见出行人表两列）——从行标记统计人数。
@@ -1713,30 +1787,46 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     setShowRooming(false);
   }
 
-  // 「再录一单」/ 关闭后复位录单态（含分房步骤）
-  function resetForNextOrder(): void {
+  /**
+   * 「再录一单」/「复制上一单」/ 关闭后复位录单态（含分房步骤）。
+   *
+   * 两个按钮共用这一个复位，差别只在 keepCustomer：
+   *   · 再录一单（keepCustomer=false）—— 现状不变：留产品选择，备注 / 签证状态 / 结算价模式清掉。
+   *   · 复制上一单（keepCustomer=true）—— 额外留下**客户侧那一摊**：四类分岗备注 + 通用备注、
+   *     订单签证状态、结算价模式（按人填 or 整单）。同一家代理、同一个联系人连着录好几张时，
+   *     不用一遍遍重敲这些字段。
+   *     （代理归属与联系人本来就不在复位范围内，两个按钮都保留。）
+   *
+   * 两种模式都必清：出行人（换一批人正是新单的意义）、调价金额与结算价数值 ——
+   * 人和钱必须逐单重新决定，绝不能被上一单静默带过来。
+   */
+  function resetForNextOrder(options?: { keepCustomer?: boolean }): void {
+    const keepCustomer = options?.keepCustomer === true;
     setOkOrderNumber(null);
     setCreatedOrder(null);
     setShowRooming(false);
     setRoomingSaved(false);
     setPassengers([emptyPassenger()]);
-    setNotes('');
-    visaStatusTouchedRef.current = false;
-    pendingAutoVisaExemptRef.current = false;
-    setVisaStatus(defaultVisaStatusFor(blockKinds));
-    setNoteHotel('');
-    setNoteVisa('');
-    setNotePayment('');
-    setNoteSpecial('');
+    if (!keepCustomer) {
+      setNotes('');
+      visaStatusTouchedRef.current = false;
+      pendingAutoVisaExemptRef.current = false;
+      setVisaStatus(defaultVisaStatusFor(blockKinds));
+      setNoteHotel('');
+      setNoteVisa('');
+      setNotePayment('');
+      setNoteSpecial('');
+    }
     // 单住 / 自备签是乘客级标记，随 setPassengers([emptyPassenger()]) 一并复位（无独立状态）。
     // 清掉上一单的调价（避免误带到下一单）；系统价随产品状态复位后由 effect 自动重算。
     setAdjustAmount(null);
     setAdjustReason('DISCOUNT');
     setAdjustText('');
     // 结算价通道同款复位：整单结算总价带到下一单会把总额静默收敛到上一单的价；
-    // 每人结算价数值随 setPassengers([emptyPassenger()]) 清空，这里只复位模式开关。
+    // 每人结算价数值随 setPassengers([emptyPassenger()]) 清空，这里只复位模式开关
+    //（复制上一单时模式保留，数值一样清空）。
     setSettlementPrice(null);
-    setPerPaxSettlementOn(false);
+    if (!keepCustomer) setPerPaxSettlementOn(false);
   }
 
   const inputCls = 'mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm';
@@ -1798,14 +1888,29 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
               </p>
             )}
 
+            <p className="text-right text-xs text-ink-muted">
+              「再录一单」只留产品与代理；「复制上一单」连备注 / 签证状态 / 结算价模式一起留下，
+              只换出行人 —— 调价与结算价数值两种都不带过来，金额逐单重新决定。
+            </p>
             <div className="flex justify-end gap-2">
               {showRooming && (
                 <button className="btn-ghost text-sm" onClick={() => setShowRooming(false)}>
                   稍后再分（去「房控页」分房）
                 </button>
               )}
-              <button className="btn-secondary text-sm" onClick={resetForNextOrder}>
+              <button
+                className="btn-ghost text-sm"
+                onClick={() => resetForNextOrder()}
+                title="留下产品选择与代理 / 联系人，备注、签证状态、结算价模式都清空"
+              >
                 再录一单
+              </button>
+              <button
+                className="btn-secondary text-sm"
+                onClick={() => resetForNextOrder({ keepCustomer: true })}
+                title="连备注（酒店 / 签证 / 付款 / 特殊要求）、签证状态、结算价模式一起留下，只换出行人；调价与结算价数值不带过来"
+              >
+                复制上一单
               </button>
               <button className="btn-primary text-sm" onClick={onClose}>完成</button>
             </div>
@@ -1911,15 +2016,19 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                             </select>
                           </label>
                         )}
-                        {/* 去程班次状态 */}
-                        {bundleGoNeedsPick && !bundleGoFlightId ? (
+                        {/* 去程班次状态；套餐没绑航班 = 派生不出航线，先让运营去绑 */}
+                        {!bundleRoute ? (
                           <div className="text-[11px] text-amber-600">
-                            该路线有多个航班号，请先选择去程航班号
+                            <Icon name="alert" /> 该套餐未绑定去程/回程航班，无法确定航线：请先在「产品 · 套餐」里绑定航班号
+                          </div>
+                        ) : bundleGoNeedsPick && !bundleGoFlightId ? (
+                          <div className="text-[11px] text-amber-600">
+                            该航线有多个航班号，请先选择去程航班号
                           </div>
                         ) : bundleLegs.go ? (
                           <div className="flex items-center gap-2 text-xs text-slate-700">
                             <span className="rounded bg-brand-50 px-1.5 py-0.5 text-[11px] font-medium text-brand">去程</span>
-                            <span className="font-medium">{BUNDLE_GO_ORIGIN}→{BUNDLE_GO_DEST}</span>
+                            <span className="font-medium">{bundleRoute.origin}→{bundleRoute.destination}</span>
                             <span className="text-slate-500">
                               {localYmd(bundleLegs.go.departureTime, bundleLegs.go.departureTz)}{' '}
                               {formatLocalTime(bundleLegs.go.departureTime, bundleLegs.go.departureTz)}
@@ -1927,16 +2036,16 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                           </div>
                         ) : (
                           <div className="text-[11px] text-rose-600">
-                            <Icon name="alert" /> {departDate} 没有匹配的去程班次（{BUNDLE_GO_ORIGIN}→{BUNDLE_GO_DEST}），请换日期或先建班次
+                            <Icon name="alert" /> {departDate} 没有匹配的去程班次（{bundleRoute.origin}→{bundleRoute.destination}），请换日期或先建班次
                           </div>
                         )}
-                        {/* 回程（仅往返套餐） */}
-                        {bundleIsRoundTrip && (
+                        {/* 回程（仅往返套餐；没航线时上面已提示，不再重复报错） */}
+                        {bundleIsRoundTrip && bundleRoute && (
                           <>
                             {/* 回程航班号手选：同去程逻辑 */}
                             {bundleRetNeedsPick && (
                               <label className="text-[11px] text-slate-500">
-                                回程航班号（该路线有多个航班，请选择）
+                                回程航班号（该航线有多个航班，请选择）
                                 <select
                                   className={inputCls}
                                   value={bundleRetFlightId}
@@ -1953,12 +2062,12 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                             )}
                             {bundleRetNeedsPick && !bundleRetFlightId ? (
                               <div className="text-[11px] text-amber-600">
-                                该路线有多个航班号，请先选择回程航班号
+                                该航线有多个航班号，请先选择回程航班号
                               </div>
                             ) : bundleLegs.ret ? (
                               <div className="flex items-center gap-2 text-xs text-slate-700">
                                 <span className="rounded bg-brand-50 px-1.5 py-0.5 text-[11px] font-medium text-brand">回程</span>
-                                <span className="font-medium">{BUNDLE_GO_DEST}→{BUNDLE_GO_ORIGIN}</span>
+                                <span className="font-medium">{bundleRoute.destination}→{bundleRoute.origin}</span>
                                 <span className="text-slate-500">
                                   {localYmd(bundleLegs.ret.departureTime, bundleLegs.ret.departureTz)}{' '}
                                   {formatLocalTime(bundleLegs.ret.departureTime, bundleLegs.ret.departureTz)}
@@ -1966,7 +2075,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                               </div>
                             ) : (
                               <div className="text-[11px] text-rose-600">
-                                <Icon name="alert" /> 回程日期 {bundleLegs.returnDate} 没有匹配的回程班次（{BUNDLE_GO_DEST}→{BUNDLE_GO_ORIGIN}），请核对套餐晚数/排班
+                                <Icon name="alert" /> 回程日期 {bundleLegs.returnDate} 没有匹配的回程班次（{bundleRoute.destination}→{bundleRoute.origin}），请核对套餐晚数/排班
                               </div>
                             )}
                           </>

@@ -25,6 +25,8 @@ import {
   type PrismaClient,
 } from '@prisma/client';
 import { env } from '../../config/env.js';
+// 订单状态集合全站唯一一份（审查根因 R2）：房控走库存口径（不含 REFUND_REQUESTED），下方原名再导出。
+import { INVENTORY_COUNTED_STATUSES } from '../../lib/order-status-sets.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import type { AuditActor } from '../../lib/audit.js';
 import { writeAudit } from '../../lib/audit.js';
@@ -33,7 +35,22 @@ import { BadRequestError, NotFoundError } from '../../lib/errors.js';
 import { readExplicitRoomCount } from '../../lib/room-count.js';
 import { restoredOversoldSeats } from '../orders/orders.leg-status.js';
 import { fmtDepartureLocalDate } from '../orders/passport-zip.js';
+import {
+  cityLabel,
+  compareCityCodes,
+  normalizeCityCode,
+  RANDOM_TIER_LEGACY_CITY_CODE,
+} from './hotel-city.js';
 import type { CreateBlockPeriodBody, UpdateBlockPeriodBody } from './hotel-control.schemas.js';
+
+export {
+  cityGroupTitle,
+  cityLabel,
+  compareCityCodes,
+  isBlankCityCode,
+  normalizeCityCode,
+  RANDOM_TIER_LEGACY_CITY_CODE,
+} from './hotel-city.js';
 
 // 读模型既可运行在默认 PrismaClient，也可运行在订单状态事务的 TransactionClient 内。
 type HotelControlDbClient = PrismaClient | Prisma.TransactionClient;
@@ -71,16 +88,12 @@ export async function getHotelOversellCapRooms(
   return parsed;
 }
 
-/** 房控有效订单：退款申请中的订单已释放占房，不计入销控、分房与名单。*/
-export const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
+/**
+ * 房控有效订单：退款申请中的订单已释放占房，不计入销控、分房与名单。
+ * 集合本体在 lib/order-status-sets.ts（全站唯一一份，审查根因 R2）= 库存口径 INVENTORY_COUNTED_STATUSES；
+ * 这里保留原导出名，hotel-control.passports 等既有 import 路径不变。
+ */
+export const COUNTED_STATUSES: OrderStatus[] = INVENTORY_COUNTED_STATUSES;
 
 /** 销控板最长跨度（天）—— 超出按 from 起截断。*/
 const MAX_BOARD_DAYS = 120;
@@ -113,6 +126,11 @@ const DAY_MS = 24 * 60 * 60 * 1000;
  * 历史：随机档曾是 HotelBlockPeriod.randomStarTier 的独立切房周期。该建池入口已废止
  * （createBlockPeriod 拒绝新建），存量周期数据保留供审计，但**所有读路径都不再计入**；
  * 占位酒店名下的切房周期同款处理（不计入、不许新建）。
+ *
+ * 城市维度（见 hotel-city.ts）：随机档按 **(cityCode, starRating)** 圈定 ——
+ *   随机N星余量(city, d) = Σ(该城市 starRating=N 且非国际五星且非占位的酒店当晚余量) − 当晚该城市未落位占用
+ * 城市事实源 = Hotel.cityCode：真酒店的城市取自己的列；伪落位行 (b) 的城市取占位酒店的列；
+ * 正规未落位随机单 (a) 行上没有酒店、也就没有城市，一律归存量默认城市 RANDOM_TIER_LEGACY_CITY_CODE。
  */
 export const RANDOM_STAR_TIERS = [3, 4, 5] as const;
 export type RandomStarTier = (typeof RANDOM_STAR_TIERS)[number];
@@ -125,11 +143,73 @@ export function randomStarTierLabel(tier: number): string {
 }
 
 /**
+ * 随机档的作用域 = 城市 × 档次。所有随机档读写路径（聚合 / 下单闸 / 加锁 / 下钻）都吃这个，
+ * 调用方必须显式给城市：真酒店/占位酒店 → 该酒店的 cityCode；单独随机行 → RANDOM_TIER_LEGACY_CITY_CODE。
+ * cityCode 在入口处统一归一（normalizeCityCode），传 'dad ' 与 'DAD' 等价。
+ */
+export interface RandomTierScope {
+  tier: number;
+  cityCode: string;
+}
+
+/** 带城市的随机档展示名：{ tier: 3, cityCode: 'DAD' } → 「岘港三星随机」。*/
+export function randomTierScopeLabel(scope: RandomTierScope): string {
+  return `${cityLabel(scope.cityCode)}${randomStarTierLabel(scope.tier)}`;
+}
+
+/**
  * 销控板里随机档聚合组的分组键。**不是真实酒店 id** —— 前端据 `randomStarTier` 非空
  * 判定聚合组，这个键只用于 React key / 分组归并；把它当 hotelId 传给按酒店的接口不会命中。
+ * 带城市 → `random-star-3-DAD`；不带（存量随机档周期的审计留痕）→ `random-star-3`。
  */
-export function randomPoolGroupKey(tier: number): string {
-  return `random-star-${tier}`;
+export function randomPoolGroupKey(tier: number, cityCode?: string): string {
+  return cityCode ? `random-star-${tier}-${normalizeCityCode(cityCode)}` : `random-star-${tier}`;
+}
+
+/**
+ * 某城市某档次的「未落位」占房行过滤条件（聚合的 pendingUsed / 销控板下钻 / 加房清单同一口径）：
+ *   b) 房型挂在该档次占位酒店上、且占位酒店在该城市 —— 伪落位行；
+ *   a) 无房型 + randomStarTier 命中 —— 正规未落位随机单。行上没有酒店也就没有城市，
+ *      **只计入存量默认城市**；其它城市的池子不看它们（否则同一笔占用会在每个城市各算一遍）。
+ * (a) 显式要求 hotelRoomTypeId 为空 —— 与销控板分组「有房型就归该酒店」同优先级，
+ * 万一出现两列都有值的异常行，两边都把它算成具体酒店的占房，不会被重复计两次。
+ */
+function pendingRandomItemWhere(scope: RandomTierScope): Prisma.OrderItemWhereInput {
+  const cityCode = normalizeCityCode(scope.cityCode);
+  const clauses: Prisma.OrderItemWhereInput[] = [];
+  if (cityCode === RANDOM_TIER_LEGACY_CITY_CODE) {
+    clauses.push({ hotelRoomTypeId: null, randomStarTier: scope.tier });
+  }
+  clauses.push({
+    hotelRoomType: { hotel: { randomTierPlaceholder: scope.tier, cityCode } },
+  });
+  return { OR: clauses };
+}
+
+/** 某城市某档次的真酒店过滤条件（randomTierOfHotel 的等价 where + 城市）。*/
+function tierHotelWhere(scope: RandomTierScope): Prisma.HotelWhereInput {
+  return {
+    starRating: scope.tier,
+    intlFiveStar: false,
+    randomTierPlaceholder: null,
+    cityCode: normalizeCityCode(scope.cityCode),
+  };
+}
+
+/**
+ * 随机档涉及的全部城市：所有酒店的 distinct cityCode（归一后）∪ 存量默认城市
+ * （单独随机行永远归那里，即使那里一家酒店都没有也要能列出它的需求）。主营地排最前。
+ */
+export async function listRandomTierCities(
+  client: HotelControlDbClient = defaultPrisma,
+): Promise<string[]> {
+  const rows = await client.hotel.findMany({
+    select: { cityCode: true },
+    distinct: ['cityCode'],
+  });
+  const codes = new Set<string>([RANDOM_TIER_LEGACY_CITY_CODE]);
+  for (const row of rows) codes.add(normalizeCityCode(row.cityCode));
+  return [...codes].sort(compareCityCodes);
 }
 
 /**
@@ -163,31 +243,21 @@ export function placeholderTierOfHotel(hotel: {
 }
 
 /**
- * 占房行口径的作用域：一家具体酒店，或某个随机档的**未落位随机单**。
+ * 占房行口径的作用域：一家具体酒店，或某城市某随机档的**未落位随机单**。
  * 随机档作用域只描述占房行（销控板下钻用）—— 随机档自己没有包房周期了（见本节头部注释），
- * 它的房量一律由同星级酒店聚合而来。
+ * 它的房量一律由同城市同星级酒店聚合而来。
  */
-export type RoomScope = { hotelId: string } | { randomStarTier: number };
+export type RoomScope = { hotelId: string } | { randomStarTier: number; cityCode: string };
 
 /**
  * 该作用域的占房行过滤条件。
- *
- * 随机档作用域 = 两类「未落位」占房行（与销控板聚合组的用房行同一口径）：
- *   a) 无房型 + randomStarTier 命中该档 —— 正规未落位随机单；
- *   b) 房型挂在该档的占位酒店上 —— 早期假酒店承载随机档留下的伪落位行。
- * (a) 显式要求 hotelRoomTypeId 为空 —— 与销控板分组「有房型就归该酒店」同优先级，
- * 万一出现两列都有值的异常行，两边都把它算成具体酒店的占房，不会被重复计两次。
+ * 随机档作用域 = 该城市该档次的两类「未落位」占房行（pendingRandomItemWhere，与聚合同一口径）。
  * 具体酒店作用域天然不会命中占位酒店 —— 占位酒店不作为酒店组出现在销控板上。
  */
 function scopeItemWhere(scope: RoomScope): Prisma.OrderItemWhereInput {
   return 'hotelId' in scope
     ? { hotelRoomTypeId: { not: null }, hotelRoomType: { hotelId: scope.hotelId } }
-    : {
-        OR: [
-          { hotelRoomTypeId: null, randomStarTier: scope.randomStarTier },
-          { hotelRoomType: { hotel: { randomTierPlaceholder: scope.randomStarTier } } },
-        ],
-      };
+    : pendingRandomItemWhere({ tier: scope.randomStarTier, cityCode: scope.cityCode });
 }
 
 // ── helpers ──────────────────────────────────────────────────────────────
@@ -1383,6 +1453,8 @@ export async function assertHotelPhysicalFitWithinTx(
  */
 export interface RandomTierAggregate {
   hasBlock: boolean;
+  /** 该城市该档次的真酒店家数（0 = 这个城市根本没有这一档的真房源，清单据此省略空行）。*/
+  hotelCount: number;
   block: number[];
   hotelUsed: number[];
   pendingUsed: number[];
@@ -1390,13 +1462,14 @@ export interface RandomTierAggregate {
 }
 
 export async function getRandomTierAggregate(
-  tier: number,
+  scope: RandomTierScope,
   nightDates: readonly string[],
   opts: { excludeOrderId?: string } = {},
   client: HotelControlDbClient = defaultPrisma,
 ): Promise<RandomTierAggregate> {
   const empty: RandomTierAggregate = {
     hasBlock: false,
+    hotelCount: 0,
     block: [],
     hotelUsed: [],
     pendingUsed: [],
@@ -1407,9 +1480,9 @@ export async function getRandomTierAggregate(
   const fromD = toDateOnly(nightDates[0]);
   const toD = toDateOnly(nightDates[nightDates.length - 1]);
 
-  // 该档次的真酒店集合：starRating 命中、非国际五星、非占位酒店（randomTierOfHotel 的等价 where）
+  // 该城市该档次的真酒店集合：城市命中、starRating 命中、非国际五星、非占位酒店
   const hotels = await client.hotel.findMany({
-    where: { starRating: tier, intlFiveStar: false, randomTierPlaceholder: null },
+    where: tierHotelWhere(scope),
     select: { id: true },
   });
   const hotelIds = hotels.map((h) => h.id);
@@ -1438,11 +1511,8 @@ export async function getRandomTierAggregate(
     }),
     client.orderItem.findMany({
       where: {
-        // 两类未落位占用：正规随机单（无房型 + 档次命中）＋ 伪落位（房型挂在该档占位酒店上）
-        OR: [
-          { hotelRoomTypeId: null, randomStarTier: tier },
-          { hotelRoomType: { hotel: { randomTierPlaceholder: tier } } },
-        ],
+        // 该城市该档次的两类未落位占用（见 pendingRandomItemWhere）
+        ...pendingRandomItemWhere(scope),
         ...nightWhere,
         order: orderWhere,
       },
@@ -1455,7 +1525,14 @@ export async function getRandomTierAggregate(
   const hotelUsed = expandUsedByDate(hotelItems, nightDates);
   const pendingUsed = expandUsedByDate(pendingItems, nightDates);
   const remaining = block.map((b, i) => round2(b - hotelUsed[i] - pendingUsed[i]));
-  return { hasBlock: periods.length > 0, block, hotelUsed, pendingUsed, remaining };
+  return {
+    hasBlock: periods.length > 0,
+    hotelCount: hotelIds.length,
+    block,
+    hotelUsed,
+    pendingUsed,
+    remaining,
+  };
 }
 
 /**
@@ -1481,13 +1558,13 @@ export interface RandomTierFitViolation {
 }
 
 export async function assertRandomTierFit(
-  tier: number,
+  scope: RandomTierScope,
   nightDates: readonly string[],
   rooms: number,
   opts: { excludeOrderId?: string; maxOversellRooms?: number; buildMessage?: () => string } = {},
   client: HotelControlDbClient = defaultPrisma,
 ): Promise<RandomTierFitViolation[]> {
-  const agg = await getRandomTierAggregate(tier, nightDates, opts, client);
+  const agg = await getRandomTierAggregate(scope, nightDates, opts, client);
   const isInternalChannel = opts.maxOversellRooms != null;
   // 对外渠道：整段未切房仍视为未纳入管控，不把内部库存信息返回给客人。
   // 内部录单：随机档是需求池，即使整段/某晚 block 为 0，也要把缺口明细交给审计、清单和提醒。
@@ -1507,7 +1584,7 @@ export async function assertRandomTierFit(
       }
       throw new BadRequestError(
         opts.buildMessage?.() ??
-          `${randomStarTierLabel(tier)}余量不足（${nightDates[i]} 同星级酒店合计余量 ${remaining} 间，本次需 ${rooms} 间）` +
+          `${randomTierScopeLabel(scope)}余量不足（${nightDates[i]} 同城市同星级酒店合计余量 ${remaining} 间，本次需 ${rooms} 间）` +
             (opts.maxOversellRooms != null
               ? `，缺口已超出超售容忍上限 ${opts.maxOversellRooms} 间`
               : ''),
@@ -1518,24 +1595,24 @@ export async function assertRandomTierFit(
 }
 
 /**
- * 把「该随机档全部真酒店、覆盖 nightDates 区间」的包房周期行 `SELECT … FOR UPDATE`。
+ * 把「该城市该随机档全部真酒店、覆盖 nightDates 区间」的包房周期行 `SELECT … FOR UPDATE`。
  * 是 `lockHotelBlockPeriodsWithinTx` 的聚合档版本 —— 随机档没有自己的周期表，它的库存
- * 由同星级真酒店（`randomTierOfHotel` 判定，排除国际五星与占位酒店）的周期聚合而来，
+ * 由同城市同星级真酒店（`tierHotelWhere` 判定，排除国际五星与占位酒店）的周期聚合而来，
  * 所以要锁的是这批酒店各自名下的周期行，不是单一酒店。
  *
- * 该档次一家真酒店都没有 → 无行可锁，直接返回（未纳入管控，见 assertRandomTierFit 同款哲学）。
+ * 该城市该档次一家真酒店都没有 → 无行可锁，直接返回（未纳入管控，见 assertRandomTierFit 同款哲学）。
  * 按 id 排序加锁，避免两个事务以不同顺序锁同一批行造成死锁（同 lockHotelBlockPeriodsWithinTx）。
  */
 export async function lockRandomTierBlockPeriodsWithinTx(
   tx: Prisma.TransactionClient,
-  tier: number,
+  scope: RandomTierScope,
   nightDates: readonly string[],
 ): Promise<void> {
   if (nightDates.length === 0) return;
   const fromD = toDateOnly(nightDates[0]);
   const toD = toDateOnly(nightDates[nightDates.length - 1]);
   const hotels = await tx.hotel.findMany({
-    where: { starRating: tier, intlFiveStar: false, randomTierPlaceholder: null },
+    where: tierHotelWhere(scope),
     select: { id: true },
   });
   const hotelIds = hotels.map((h) => h.id);
@@ -1564,29 +1641,35 @@ export async function lockRandomTierBlockPeriodsWithinTx(
  */
 export async function assertRandomTierFitWithinTx(
   tx: Prisma.TransactionClient,
-  tier: number,
+  scope: RandomTierScope,
   nightDates: readonly string[],
   rooms: number,
   opts: { excludeOrderId?: string; maxOversellRooms?: number; buildMessage?: () => string } = {},
 ): Promise<RandomTierFitViolation[]> {
-  await lockRandomTierBlockPeriodsWithinTx(tx, tier, nightDates);
-  return assertRandomTierFit(tier, nightDates, rooms, opts, tx);
+  await lockRandomTierBlockPeriodsWithinTx(tx, scope, nightDates);
+  return assertRandomTierFit(scope, nightDates, rooms, opts, tx);
 }
 
 // ── 销控板（按酒店 × 日期）────────────────────────────────────────────────
 export interface HotelControlBoard {
   dates: string[];
+  /** 板上出现的城市（主营地排最前），供前端按城市分组出标题；带 cityCode 筛选时只有一个。*/
+  cities: Array<{ cityCode: string; cityLabel: string }>;
   hotels: Array<{
     /**
-     * 分组键。具体酒店 = 真实 Hotel.id；随机档聚合组 = 合成键 `random-star-{tier}`
+     * 分组键。具体酒店 = 真实 Hotel.id；随机档聚合组 = 合成键 `random-star-{tier}-{city}`
      * （见 randomPoolGroupKey）—— 聚合组不是酒店，别拿它去调按 hotelId 的接口，
      * 判定聚合组一律看 `randomStarTier` 是否非空。
      */
     hotelId: string;
-    /** 具体酒店 = 酒店名；聚合组 = 「三星随机」/「四星随机」。*/
+    /** 具体酒店 = 酒店名；聚合组 = 「岘港三星随机」（带城市，两城同档不会撞名）。*/
     hotelName: string;
     /** 非空 = 随机档聚合组（3=三星随机、4=四星随机）。*/
     randomStarTier: number | null;
+    /** 所属城市（归一后的 Hotel.cityCode；聚合组 = 它圈定的城市）。*/
+    cityCode: string;
+    /** 城市展示名（未知码原样）。*/
+    cityLabel: string;
     /** 最新周期（dateFrom 最晚且有价）的切房单价；聚合组无单一单价 → null */
     unitPrice: number | null;
     rows: {
@@ -1648,15 +1731,18 @@ function buildDateRange(from: string, to: string): string[] {
 }
 
 export async function getBoard(
-  range: { from: string; to: string },
+  range: { from: string; to: string; cityCode?: string },
   client: PrismaClient = defaultPrisma,
 ): Promise<HotelControlBoard> {
   const dates = buildDateRange(range.from, range.to);
   const fromD = toDateOnly(dates[0]);
   const toD = toDateOnly(dates[dates.length - 1]);
+  // 城市筛选（可选）：只看这一个城市的酒店组与聚合组。过滤在内存里做 —— 正规未落位随机单 (a)
+  // 行上没有酒店，它归存量默认城市这条规则在 where 里表达不出来（见 cityOfBoardRow）。
+  const cityFilter = range.cityCode ? normalizeCityCode(range.cityCode) : null;
 
   // 周期：与 [from, to] 有交集的全部（按 dateFrom 倒序 → 第一条即"最新周期"）
-  // hotel.starRating / intlFiveStar / randomTierPlaceholder 随主查带回，供随机档聚合分组，不额外查库。
+  // hotel.starRating / intlFiveStar / randomTierPlaceholder / cityCode 随主查带回，供随机档聚合分组，不额外查库。
   const periods = await client.hotelBlockPeriod.findMany({
     where: { dateFrom: { lte: toD }, dateTo: { gte: fromD } },
     orderBy: { dateFrom: 'desc' },
@@ -1667,6 +1753,7 @@ export async function getBoard(
           starRating: true,
           intlFiveStar: true,
           randomTierPlaceholder: true,
+          cityCode: true,
         },
       },
     },
@@ -1699,6 +1786,7 @@ export async function getBoard(
               starRating: true,
               intlFiveStar: true,
               randomTierPlaceholder: true,
+              cityCode: true,
             },
           },
         },
@@ -1717,20 +1805,28 @@ export async function getBoard(
   //   · 存量随机档周期（hotelId 为 NULL）；
   //   · 占位酒店（randomTierPlaceholder 非空）—— 它不作为酒店组出现，名下周期不计入包房，
   //     落在它房型上的占房行改由下面的聚合组按「未落位」统计。
-  const groups = new Map<string, { name: string; randomTier: number | null }>();
+  //
+  // 城市：真酒店取自己的 cityCode；聚合组按 (城市, 档次) 各成一组 —— 岘港三星与会安三星是两个池子。
+  const groups = new Map<string, { name: string; randomTier: number | null; cityCode: string }>();
   for (const p of periods) {
     if (!p.hotelId || p.hotel?.randomTierPlaceholder != null) continue;
+    const cityCode = normalizeCityCode(p.hotel?.cityCode);
+    if (cityFilter && cityCode !== cityFilter) continue;
     groups.set(p.hotelId, {
       name: p.hotel?.name ?? p.hotelId,
       randomTier: p.hotel ? randomTierOfHotel(p.hotel) : null,
+      cityCode,
     });
   }
   for (const it of items) {
     if (!it.hotelRoomType || groups.has(it.hotelRoomType.hotelId)) continue;
     if (it.hotelRoomType.hotel.randomTierPlaceholder != null) continue;
+    const cityCode = normalizeCityCode(it.hotelRoomType.hotel.cityCode);
+    if (cityFilter && cityCode !== cityFilter) continue;
     groups.set(it.hotelRoomType.hotelId, {
       name: it.hotelRoomType.hotel.name,
       randomTier: randomTierOfHotel(it.hotelRoomType.hotel),
+      cityCode,
     });
   }
 
@@ -1771,7 +1867,7 @@ export async function getBoard(
 
   const hotelGroups = Array.from(groups.entries())
     .sort(([, a], [, b]) => a.name.localeCompare(b.name, 'zh-CN'))
-    .map(([hotelId, { name: hotelName, randomTier }]) => {
+    .map(([hotelId, { name: hotelName, randomTier, cityCode }]) => {
       const groupPeriods = periods.filter((p) => p.hotelId === hotelId);
       const groupItems = items.filter((it) => it.hotelRoomType?.hotelId === hotelId);
       const latestPriced = groupPeriods.find((p) => p.unitPrice != null);
@@ -1779,6 +1875,8 @@ export async function getBoard(
         hotelId,
         hotelName,
         randomStarTier: null as number | null,
+        cityCode,
+        cityLabel: cityLabel(cityCode),
         unitPrice: latestPriced ? round2(dec(latestPriced.unitPrice)!) : null,
         rows: buildRows(groupPeriods, groupItems),
         /** 该酒店归属的随机档（仅供下面聚合，不进对外 DTO）。*/
@@ -1786,50 +1884,58 @@ export async function getBoard(
       };
     });
 
-  // ── 随机档聚合组（三星随机 / 四星随机 / 五星随机）──────────────────────
-  // 包房 = 同星级真酒店包房合计；用房 = 未落位占用；
-  // 余量 = Σ(同星级酒店余量) − 未落位占用（见文件头「星级随机档」小节的对账恒等）。
+  // ── 随机档聚合组（城市 × 三星随机 / 四星随机 / 五星随机）──────────────────
+  // 包房 = 同城市同星级真酒店包房合计；用房 = 该城市未落位占用；
+  // 余量 = Σ(同城市同星级酒店余量) − 该城市未落位占用（见文件头「星级随机档」小节的对账恒等）。
   //
   // 「未落位占用」收两类行（业务上都还没落到真酒店，见文件头小节）：
-  //   a) 无房型 + randomStarTier 非空 —— 正规未落位随机单，档次取 randomStarTier；
-  //   b) 房型挂在占位酒店上 —— 伪落位行，档次取该占位酒店的 randomTierPlaceholder。
+  //   a) 无房型 + randomStarTier 非空 —— 正规未落位随机单，档次取 randomStarTier，
+  //      城市 = 存量默认城市（行上没有酒店，无从知道城市）；
+  //   b) 房型挂在占位酒店上 —— 伪落位行，档次取该占位酒店的 randomTierPlaceholder，城市取占位酒店的。
   // 上面的酒店分组已把 (b) 排除在酒店组之外，故两处不会重复计一笔。
-  const pendingByTier = new Map<number, typeof items>();
-  const pushPending = (tier: number, it: (typeof items)[number]): void => {
-    const list = pendingByTier.get(tier) ?? [];
-    list.push(it);
-    pendingByTier.set(tier, list);
+  const poolKey = (cityCode: string, tier: number): string => randomPoolGroupKey(tier, cityCode);
+  const pendingByPool = new Map<string, { cityCode: string; tier: number; rows: typeof items }>();
+  const pushPending = (cityCode: string, tier: number, it: (typeof items)[number]): void => {
+    if (cityFilter && cityCode !== cityFilter) return;
+    const key = poolKey(cityCode, tier);
+    const entry = pendingByPool.get(key) ?? { cityCode, tier, rows: [] };
+    entry.rows.push(it);
+    pendingByPool.set(key, entry);
   };
   for (const it of items) {
     const placeholderTier = it.hotelRoomType
       ? placeholderTierOfHotel(it.hotelRoomType.hotel)
       : null;
     if (placeholderTier != null) {
-      pushPending(placeholderTier, it);
+      pushPending(normalizeCityCode(it.hotelRoomType!.hotel.cityCode), placeholderTier, it);
       continue;
     }
     if (it.hotelRoomType || it.randomStarTier == null) continue;
-    pushPending(it.randomStarTier, it);
+    pushPending(RANDOM_TIER_LEGACY_CITY_CODE, it.randomStarTier, it);
   }
-  // 出现条件：该档次有同星级酒店进了销控板（有周期或有占房），或有未落位随机单待落地
-  const tiers = new Set<number>([
-    ...hotelGroups.filter((h) => h.randomTier != null).map((h) => h.randomTier!),
-    ...pendingByTier.keys(),
-  ]);
-  const poolGroups = Array.from(tiers)
-    .sort((a, b) => a - b)
-    .map((tier) => {
-      const tierHotels = hotelGroups.filter((h) => h.randomTier === tier);
-      const pendingRows = buildRows([], pendingByTier.get(tier) ?? []);
+  // 出现条件：该城市该档次有同星级酒店进了销控板（有周期或有占房），或有未落位随机单待落地
+  const pools = new Map<string, { cityCode: string; tier: number }>();
+  for (const h of hotelGroups) {
+    if (h.randomTier == null) continue;
+    pools.set(poolKey(h.cityCode, h.randomTier), { cityCode: h.cityCode, tier: h.randomTier });
+  }
+  for (const [key, { cityCode, tier }] of pendingByPool) pools.set(key, { cityCode, tier });
+  const poolGroups = Array.from(pools.values())
+    .sort((a, b) => compareCityCodes(a.cityCode, b.cityCode) || a.tier - b.tier)
+    .map(({ cityCode, tier }) => {
+      const tierHotels = hotelGroups.filter((h) => h.randomTier === tier && h.cityCode === cityCode);
+      const pendingRows = buildRows([], pendingByPool.get(poolKey(cityCode, tier))?.rows ?? []);
       const sumAt = (pick: (h: (typeof tierHotels)[number]) => number[]) => (i: number) =>
         tierHotels.reduce((sum, h) => sum + (pick(h)[i] ?? 0), 0);
       const blockAt = sumAt((h) => h.rows.block);
       const hotelRemainingAt = sumAt((h) => h.rows.remaining);
       const hotelPhysRemainingAt = sumAt((h) => h.rows.physicalRemaining);
       return {
-        hotelId: randomPoolGroupKey(tier),
-        hotelName: randomStarTierLabel(tier),
+        hotelId: randomPoolGroupKey(tier, cityCode),
+        hotelName: randomTierScopeLabel({ tier, cityCode }),
         randomStarTier: tier as number | null,
+        cityCode,
+        cityLabel: cityLabel(cityCode),
         // 聚合组横跨多家酒店，没有单一切房单价
         unitPrice: null,
         rows: {
@@ -1843,13 +1949,23 @@ export async function getBoard(
       };
     });
 
-  // 聚合组排在最前（房控先看「随机单还剩多少没落地、同星级还够不够」），其余酒店按名称
+  // 按城市分块（主营地排最前）；城市内聚合组排在最前（房控先看「随机单还剩多少没落地、
+  // 同星级还够不够」），其余酒店按名称。
   const hotels = [
     ...poolGroups,
     ...hotelGroups.map(({ randomTier: _tier, ...rest }) => rest),
-  ];
+  ].sort(
+    (a, b) =>
+      compareCityCodes(a.cityCode, b.cityCode) ||
+      Number(b.randomStarTier != null) - Number(a.randomStarTier != null) ||
+      (a.randomStarTier != null && b.randomStarTier != null
+        ? a.randomStarTier - b.randomStarTier
+        : a.hotelName.localeCompare(b.hotelName, 'zh-CN')),
+  );
+  const cityCodes = [...new Set(hotels.map((h) => h.cityCode))].sort(compareCityCodes);
+  const cities = cityCodes.map((cityCode) => ({ cityCode, cityLabel: cityLabel(cityCode) }));
 
-  return { dates, hotels };
+  return { dates, cities, hotels };
 }
 
 // ── 提醒线（超卖加房 / 富余退房 / 班次超开票上限 / 拼房落单临近）──────────
@@ -2306,7 +2422,7 @@ export interface HotelControlForward {
  * 因此**要计入**收客。
  */
 export async function getForward(
-  range: { from: string; to: string },
+  range: { from: string; to: string; cityCode?: string },
   client: PrismaClient = defaultPrisma,
 ): Promise<HotelControlForward> {
   const board = await getBoard(range, client);

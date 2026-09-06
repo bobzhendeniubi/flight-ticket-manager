@@ -12,6 +12,7 @@ import { ocrPassport } from '../lib/passportOcr';
 import { passportFileToDataUrl } from '../lib/passportImage';
 import { api, ApiError, type CreateOrderInput } from '../lib/api';
 import { safeRandomUUID } from '../lib/uuid';
+import { bundleRouteKey } from '../lib/bundleRoute';
 import { BookingNotices } from '../components/BookingNotices';
 import { TrustBadges } from '../components/TrustBadges';
 import { RefundBadge } from '../components/RefundBadge';
@@ -197,7 +198,11 @@ export function CheckoutPage() {
       const entries = await Promise.all(bundleItems.map(async (item) => {
         const bundle = bundles.find((candidate) => candidate.id === item.productId);
         if (!bundle?.settlementTier || bundle.settlementNights == null) return [item.id, 0] as const;
+        // 没绑航班的套餐派生不出航线 → 没有散客立减（后端按航线隔离规则，不接受缺省航线）
+        const routeKey = bundleRouteKey(bundle);
+        if (!routeKey) return [item.id, 0] as const;
         const result = await api.getRetailSettlementDiscount({
+          routeKey,
           tier: bundle.settlementTier,
           nights: bundle.settlementNights,
           departDate: String(item.meta?.goDate),

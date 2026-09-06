@@ -255,7 +255,7 @@ describe('getFinancesSummary — REFUNDED 订单已收-已退净额', () => {
     const client = fakeClient({
       refundedOrders: [{ paidAmount: 1000, refunds: [{ amount: 300 }] }], // 净留存 700
     });
-    const summary = await getFinancesSummary(RANGE, client);
+    const summary = await getFinancesSummary(RANGE, null, client);
 
     expect(summary.revenueBreakdown.refund).toBe(700);
     expect(summary.revenueCny).toBe(700);
@@ -270,7 +270,7 @@ describe('getFinancesSummary — REFUNDED 订单已收-已退净额', () => {
     const client = fakeClient({
       refundedOrders: [{ paidAmount: 1000, refunds: [{ amount: 1000 }] }],
     });
-    const summary = await getFinancesSummary(RANGE, client);
+    const summary = await getFinancesSummary(RANGE, null, client);
 
     expect(summary.revenueBreakdown.refund).toBe(0);
     expect(summary.revenueCny).toBe(0);
@@ -286,7 +286,7 @@ describe('getFinancesSummary — REFUNDED 订单已收-已退净额', () => {
         { paidAmount: 200, refunds: [] }, // 未查到已完成退款记录 → 净 200（如实反映，不臆测）
       ],
     });
-    const summary = await getFinancesSummary(RANGE, client);
+    const summary = await getFinancesSummary(RANGE, null, client);
 
     expect(summary.revenueBreakdown.refund).toBe(500);
     expect(summary.revenueCny).toBe(500);
@@ -306,7 +306,7 @@ describe('getFinancesSummary — REFUNDED 订单已收-已退净额', () => {
       countedOrders,
       refundedOrders: [{ paidAmount: 2000, refunds: [{ amount: 500 }] }], // 净 1500
     });
-    const summary = await getFinancesSummary(RANGE, client);
+    const summary = await getFinancesSummary(RANGE, null, client);
 
     // costCny / costBreakdown 只反映主口径订单的成本快照，REFUNDED 订单不参与
     expect(summary.costCny).toBe(400);
@@ -331,7 +331,7 @@ describe('getFinancesSummary — REFUNDED 订单已收-已退净额', () => {
     const client = fakeClient({
       refundedOrders: [{ paidAmount: 500, refunds: [{ amount: 800 }] }], // 净 -300，异常但如实反映
     });
-    const summary = await getFinancesSummary(RANGE, client);
+    const summary = await getFinancesSummary(RANGE, null, client);
 
     expect(summary.revenueBreakdown.refund).toBe(-300);
     expect(summary.revenueCny).toBe(-300);
@@ -364,7 +364,7 @@ describe('getFinancesSummary — 签证成本按任务实际成本（人均×需
         },
       ],
     });
-    const summary = await getFinancesSummary(RANGE, client);
+    const summary = await getFinancesSummary(RANGE, null, client);
 
     // 226.8 × 3 = 680.4（而非产品口径 300 × 4 = 1200）
     expect(summary.costBreakdown.visa).toBe(680.4);
@@ -392,7 +392,7 @@ describe('getFinancesSummary — 签证成本按任务实际成本（人均×需
         },
       ],
     });
-    const summary = await getFinancesSummary(RANGE, client);
+    const summary = await getFinancesSummary(RANGE, null, client);
 
     // 回退产品口径：300 × 2 = 600
     expect(summary.costBreakdown.visa).toBe(600);
@@ -410,7 +410,7 @@ describe('getMonthlyTrend — 缺成本 → 毛利 null（未知，非 0）', ()
   }
 
   it('全部有成本 → 毛利 = 收入 − 成本，missingCostItemCount = 0', async () => {
-    const points = await getMonthlyTrend(1, trendClient([
+    const points = await getMonthlyTrend(1, null, trendClient([
       { amount: 1000, totalCostCny: 600 },
       { amount: 500, totalCostCny: 200 },
     ]));
@@ -422,7 +422,7 @@ describe('getMonthlyTrend — 缺成本 → 毛利 null（未知，非 0）', ()
   });
 
   it('有一件缺成本 → 毛利 null，不把缺失当 0 造成虚高', async () => {
-    const points = await getMonthlyTrend(1, trendClient([
+    const points = await getMonthlyTrend(1, null, trendClient([
       { amount: 1000, totalCostCny: 600 },
       { amount: 500, totalCostCny: null }, // 缺成本
     ]));

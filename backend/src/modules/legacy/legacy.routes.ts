@@ -1,5 +1,4 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { UserRole } from '@prisma/client';
 import { z } from 'zod';
 import {
   getLegacyPassengerHistory,
@@ -36,7 +35,7 @@ const passengerHistorySchema = z.object({
 });
 
 export const legacyRoutes: FastifyPluginAsync = async (app) => {
-  const staffOnly = { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] };
+  const staffOnly = { preHandler: [app.authenticate, app.requireCapability('legacy.read')] };
 
   app.get('/tickets', staffOnly, async (req) => {
     const query = listQuerySchema.parse(req.query);

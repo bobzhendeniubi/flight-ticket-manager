@@ -16,10 +16,11 @@
  * 调用点约定：任何写 Passenger.visaSubmissionStatus 的路径完成后调用（不在事务内，
  * 与 writeAudit 同一「主操作成功才派生」的时序）。幂等：重复调用无副作用。
  */
-import { FulfillmentStatus, FulfillmentType, VisaRequirement, VisaSubmissionStatus } from '@prisma/client';
+import { FulfillmentStatus, FulfillmentType, VisaRequirement } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { writeAudit, type AuditActor } from '../../lib/audit.js';
 import { isVisaContradiction } from '../orders/visa-need.js';
+import { deriveOrderVisaStates, deriveOrderVisaStatus, writeOrderVisaStatus } from './visa-state.js';
 
 /** 办结派生审计动作名（写/回退共用，回退时按最近一条判断来源）。 */
 export const VISA_AUTO_COMPLETE_ACTION = 'AUTO_COMPLETE_VISA';
@@ -61,17 +62,19 @@ export async function syncOrderVisaCompletion(
     }),
   ]);
 
-  const passengers = roster.filter((p) => !p.visaExempt);
-  const allConfirmed =
-    passengers.length > 0 &&
-    passengers.every((p) => p.visaSubmissionStatus === VisaSubmissionStatus.CONFIRMED);
+  // 办结派生走状态机：非自备签乘客全部 SUBMITTED（至少一位）+ 确有我方任务 → HAS_VISA。
+  // declared 传 null：这里只问「该不该办结」（录单手选的 HAS_VISA 不能被当成办结），
+  // 办结前原档由下方回退路径从审计取。
+  const completed =
+    deriveOrderVisaStatus({
+      declared: null,
+      passengers: deriveOrderVisaStates(order, roster),
+      hasOurVisaTask: ourVisaTaskCount > 0,
+    }) === VisaRequirement.HAS_VISA;
 
-  if (allConfirmed && ourVisaTaskCount > 0) {
+  if (completed) {
     if (order.visaStatus === VisaRequirement.HAS_VISA) return { changed: false };
-    await prisma.order.update({
-      where: { id: orderId },
-      data: { visaStatus: VisaRequirement.HAS_VISA },
-    });
+    await writeOrderVisaStatus(prisma, orderId, VisaRequirement.HAS_VISA);
     await writeAudit({
       actor,
       action: VISA_AUTO_COMPLETE_ACTION,
@@ -110,10 +113,7 @@ export async function syncOrderVisaCompletion(
   if (isVisaContradiction({ visaStatus: restoredTo, passengers: roster })) {
     return { changed: false };
   }
-  await prisma.order.update({
-    where: { id: orderId },
-    data: { visaStatus: restoredTo },
-  });
+  await writeOrderVisaStatus(prisma, orderId, restoredTo);
   await writeAudit({
     actor,
     action: VISA_AUTO_COMPLETE_REVERT_ACTION,

@@ -2,14 +2,17 @@
   "name": "flight-ticket-manager",
   "version": "0.1.0",
   "private": true,
-  "description": "Flight Ticket Manager monorepo (sales-web, miniprogram, admin-web, backend, ml-pricing, infra)",
+  "description": "Flight Ticket Manager monorepo (packages/contracts, sales-web, miniprogram, admin-web, backend, ml-pricing, infra)",
   "workspaces": [
+    "packages/*",
     "backend",
     "sales-web",
     "admin-web",
-    "miniprogram"
+    "miniprogram",
+    "e2e"
   ],
   "scripts": {
+    "build:contracts": "npm run build --workspace=@ftm/contracts",
     "dev:backend": "npm run dev --workspace=backend",
     "dev:web": "npm run dev --workspace=sales-web",
     "dev:admin": "npm run dev --workspace=admin-web",
@@ -20,7 +23,10 @@
     "prisma:migrate": "npm run prisma:migrate --workspace=backend",
     "prisma:generate": "npm run prisma:generate --workspace=backend",
     "prisma:seed": "npm run prisma:seed --workspace=backend",
-    "typecheck": "npm run typecheck --workspaces --if-present"
+    "typecheck": "npm run typecheck --workspaces --if-present",
+    "e2e": "npm run test --workspace=e2e",
+    "e2e:ui": "npm run test:ui --workspace=e2e",
+    "e2e:install": "npm run install:browser --workspace=e2e"
   },
   "//overrides_note": "Taro 4.0.9 peerDep 锁定 webpack@5.91.0；hoist 解析到 5.106.x 会触发 ProgressPlugin schema 校验失败，所以 pin 住",
   "overrides": {

@@ -1,0 +1,18 @@
+{
+  "name": "@ftm/e2e",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Playwright 端到端测试：主链（录单→认款→签证→分房→出票→拆单→换人→取消）+ 页面冒烟",
+  "scripts": {
+    "test": "playwright test",
+    "test:headed": "playwright test --headed",
+    "test:ui": "playwright test --ui",
+    "report": "playwright show-report",
+    "install:browser": "playwright install chromium"
+  },
+  "devDependencies": {
+    "@playwright/test": "1.63.0",
+    "@types/node": "^22.9.0"
+  }
+}

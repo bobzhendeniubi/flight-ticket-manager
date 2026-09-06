@@ -15,9 +15,10 @@
  * POST   /reminders/:id/resolve   完成 / 跳过
  */
 import type { FastifyPluginAsync } from 'fastify';
-import { Prisma, ReminderStatus, UserRole } from '@prisma/client';
+import { Prisma, ReminderPriority, ReminderStatus } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
+import { isFeatureEnabled } from '../../lib/feature-flags.js';
 import {
   createReminderSchema,
   deriveWorkOrderKind,
@@ -28,10 +29,11 @@ import {
   workOrderSummaryQuerySchema,
 } from './reminders.schemas.js';
 import { generateRuleReminders } from './reminders.rules.js';
+import { REMINDER_MANUAL_LAST_RUN_KEY } from './reminders-daily.js';
 
 export const reminderRoutes: FastifyPluginAsync = async (app) => {
   const requireOps = {
-    preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)],
+    preHandler: [app.authenticate, app.requireCapability('reminders.manage')],
   };
 
   app.get('/', requireOps, async (req) => {
@@ -103,6 +105,27 @@ export const reminderRoutes: FastifyPluginAsync = async (app) => {
     const sinceMs = q.since ? new Date(q.since).getTime() : null;
     const filtered = sinceMs === null ? recent : recent.filter((r) => r.createdAt.getTime() > sinceMs);
 
+    // 铃铛全覆盖（REMINDER_BELL_ALL）：除上面三类工单外，再数一遍所有 OPEN/IN_PROGRESS 且
+    // priority ∈ {CRITICAL, HIGH} 的规则提醒（ruleKey 非空 = 规则自动生成，手工创建的不算）。
+    // flag 关时完全不查、response 里也不带这个字段——与开关之前的行为逐字节一致。
+    let reminders: { critical: number; high: number } | undefined;
+    if (await isFeatureEnabled(prisma, 'REMINDER_BELL_ALL')) {
+      const otherRuleWhere: Prisma.OperationalReminderWhereInput = {
+        ruleKey: { not: null },
+        NOT: ruleKeyFilter,
+        status: { in: [ReminderStatus.OPEN, ReminderStatus.IN_PROGRESS] },
+      };
+      const [criticalCount, highCount] = await prisma.$transaction([
+        prisma.operationalReminder.count({
+          where: { ...otherRuleWhere, priority: ReminderPriority.CRITICAL },
+        }),
+        prisma.operationalReminder.count({
+          where: { ...otherRuleWhere, priority: ReminderPriority.HIGH },
+        }),
+      ]);
+      reminders = { critical: criticalCount, high: highCount };
+    }
+
     return {
       open,
       inProgress,
@@ -120,6 +143,7 @@ export const reminderRoutes: FastifyPluginAsync = async (app) => {
         dueAt: r.dueAt ? r.dueAt.toISOString() : null,
         assigneeUserId: r.claimedById,
       })),
+      ...(reminders ? { reminders } : {}),
     };
   });
 
@@ -160,6 +184,14 @@ export const reminderRoutes: FastifyPluginAsync = async (app) => {
       action: 'GENERATE_RULE_REMINDERS',
       targetType: 'SYSTEM',
       after: { created: result.created, skipped: result.skipped, byRule: result.byRule },
+    });
+    // 供仪表盘「提醒上次生成」展示：与自动生成共用同一份「上次生成时间」概念，
+    // 手动/自动各自维护一个 key，仪表盘取两者较晚的一个（见 dashboard.service.ts）。
+    const summary = { at: new Date().toISOString(), created: result.created, byRule: result.byRule };
+    await prisma.systemSetting.upsert({
+      where: { key: REMINDER_MANUAL_LAST_RUN_KEY },
+      create: { key: REMINDER_MANUAL_LAST_RUN_KEY, value: JSON.stringify(summary), updatedById: req.user.sub },
+      update: { value: JSON.stringify(summary), updatedById: req.user.sub },
     });
     return result;
   });

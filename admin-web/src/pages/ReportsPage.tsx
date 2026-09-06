@@ -2,7 +2,7 @@
  * 经营报表 · ADMIN-only
  *
  * 数据源：backend /reports/*
- * - 销售毛利：GET /reports/sales?from&to&dim=kind|channel|agent
+ * - 销售毛利：GET /reports/sales?from&to&dim=kind|channel|agent|route
  * - 应收账龄：GET /reports/receivables（rows 上限 500，汇总为全量）
  * - 代理欠款：GET /reports/agent-debts
  * - 导出：GET /reports/export?from&to → xlsx
@@ -36,7 +36,11 @@ const DIM_LABEL: Record<SalesReportDim, string> = {
   kind: '产品线',
   channel: '渠道',
   agent: '销售代理',
+  // 航线：一张单只归一条线，按最早起飞的航段派生；推不出来的归「未知航线」那一行。
+  route: '航线',
 };
+
+const DIM_ORDER: SalesReportDim[] = ['kind', 'channel', 'agent', 'route'];
 
 // ── helpers ────────────────────────────────────────────────────────────────
 function fmtCny(n: number | null | undefined): string {
@@ -270,7 +274,7 @@ function SalesTab({ token, range }: { token: string; range: { from: string; to: 
   return (
     <section className="space-y-4">
       <div className="inline-flex overflow-hidden rounded-lg border border-slate-200">
-        {(['kind', 'channel', 'agent'] as SalesReportDim[]).map((d) => (
+        {DIM_ORDER.map((d) => (
           <button
             key={d}
             type="button"

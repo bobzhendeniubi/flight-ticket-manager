@@ -32,6 +32,10 @@ interface SeatClassStub {
 function wireSeatClasses(
   seatClasses: SeatClassStub[],
   flight: { businessPriceLinked: boolean; businessUpgradeCnyPerLeg: number },
+  schedule: { departureTz: string; departureTime: Date } = {
+    departureTz: 'Asia/Macau',
+    departureTime: new Date('2026-08-10T02:00:00.000Z'),
+  },
 ): void {
   prismaMock.flightSeatClass.findFirst.mockImplementation(
     async ({ where, include }: { where: { cabin: string }; include?: unknown }) => {
@@ -52,8 +56,8 @@ function wireSeatClasses(
             ...base,
             schedule: {
               id: SCHEDULE_ID,
-              departureTz: 'Asia/Macau',
-              departureTime: new Date('2026-08-10T02:00:00.000Z'),
+              departureTz: schedule.departureTz,
+              departureTime: schedule.departureTime,
               flight,
             },
           }
@@ -155,5 +159,53 @@ describe('PricingService.calculatePrice · 商务舱价格联动经济舱', () =
     const res = await new PricingService().calculatePrice(SCHEDULE_ID, 'ECONOMY', 1);
     expect(res.averageUnitPrice).toBe(1200);
     expect(res.businessLinked).toBeUndefined();
+  });
+});
+
+// ── 日期等级的当地日折算（S2：走 lib/flight-time.ts，不再按 tz 硬编码 +8/+7）────────
+describe('PricingService · 日期等级按班次自己的 departureTz 取当地日', () => {
+  const economyOnly = [{ cabin: 'ECONOMY' as const, capacity: 100, sold: 0, basePrice: 1000 }];
+  const noLink = { businessPriceLinked: false, businessUpgradeCnyPerLeg: 0 };
+
+  it('+9 凌晨班次：UTC 08-09 15:30 在 Asia/Tokyo 是 08-10 00:30 → 查 08-10 那条日期等级', async () => {
+    wireSeatClasses(economyOnly, noLink, {
+      departureTz: 'Asia/Tokyo',
+      departureTime: new Date('2026-08-09T15:30:00.000Z'),
+    });
+    prismaMock.dateRanking.findUnique.mockResolvedValue({ rank: 'A' });
+
+    const res = await new PricingService().calculatePrice(SCHEDULE_ID, 'ECONOMY', 1);
+
+    expect(res.dateRank).toBe('A');
+    // 旧写法（tz 不认识就落 +8）会查成 08-09；正确当地日是 08-10
+    expect(prismaMock.dateRanking.findUnique).toHaveBeenCalledWith({
+      where: { date: new Date('2026-08-10T00:00:00.000Z') },
+    });
+  });
+
+  it('+7 深夜班次：UTC 08-10 17:30 在 Asia/Ho_Chi_Minh 是 08-11 00:30 → 查 08-11', async () => {
+    wireSeatClasses(economyOnly, noLink, {
+      departureTz: 'Asia/Ho_Chi_Minh',
+      departureTime: new Date('2026-08-10T17:30:00.000Z'),
+    });
+    prismaMock.dateRanking.findUnique.mockResolvedValue(null);
+
+    await new PricingService().calculatePrice(SCHEDULE_ID, 'ECONOMY', 1);
+
+    expect(prismaMock.dateRanking.findUnique).toHaveBeenCalledWith({
+      where: { date: new Date('2026-08-11T00:00:00.000Z') },
+    });
+  });
+
+  it('查不到日期等级 → 按**当地日**的星期几兜底（08-10 是周一 → C）', async () => {
+    wireSeatClasses(economyOnly, noLink, {
+      departureTz: 'Asia/Tokyo',
+      departureTime: new Date('2026-08-09T15:30:00.000Z'),
+    });
+    prismaMock.dateRanking.findUnique.mockResolvedValue(null);
+
+    const res = await new PricingService().calculatePrice(SCHEDULE_ID, 'ECONOMY', 1);
+    // 2026-08-10 是周一 → DOW 兜底 'C'（若按 UTC 日 08-09 周日会兜成 'A'）
+    expect(res.dateRank).toBe('C');
   });
 });

@@ -15,6 +15,14 @@ import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatLocalTime } from '../lib/airports';
 import { formatDateTimeSecCn, formatInBusinessTz } from '../lib/datetime';
 import { Icon } from '../components/Icon';
+import { RefundPayoutQueue } from '../components/RefundPayoutQueue';
+import {
+  RouteFilterSelect,
+  UNKNOWN_ROUTE_KEY,
+  useRouteOptions,
+} from '../components/RouteFilterSelect';
+import { SupplierPayablesTab } from './finances/SupplierPayablesTab';
+import { InvoicesTab } from './finances/InvoicesTab';
 import {
   api,
   ApiError,
@@ -37,7 +45,15 @@ import { UsdRateInput } from '../components/UsdRateInput';
 import { useConfirm } from '../components/ConfirmDialog';
 import { useDialogA11y } from '../components/Modal';
 
-type Tab = 'summary' | 'flights' | 'orders' | 'monthly' | 'costs';
+type Tab =
+  | 'summary'
+  | 'flights'
+  | 'orders'
+  | 'monthly'
+  | 'costs'
+  | 'payouts'
+  | 'payables'
+  | 'invoices';
 
 const KIND_LABEL: Record<string, string> = {
   FLIGHT: '机票',
@@ -292,6 +308,12 @@ export function FinancesPage() {
   const [from, setFrom] = useState(daysAgoStr(29));
   const [to, setTo] = useState(todayStr());
 
+  // 航线筛选（空 = 全部航线）：只作用于「按航线口径成立」的三处——概览、月度趋势、按航班导出。
+  // 航班毛利 / 订单毛利两个 tab 本就是逐行明细（航班行自带航线、订单行有单号），不套这个筛选，
+  // 免得让人以为筛过了、其实后端那两个端点根本不吃 routeKey。
+  const [routeKey, setRouteKey] = useState('');
+  const routes = useRouteOptions(tokens?.accessToken ?? '');
+
   const range = useMemo(() => ({ from, to }), [from, to]);
   const token = tokens?.accessToken ?? '';
 
@@ -346,8 +368,9 @@ export function FinancesPage() {
               最近 90 天
             </button>
           </div>
+          <RouteFilterSelect routes={routes} value={routeKey} onChange={setRouteKey} />
           <ExportButton token={token} range={range} />
-          <ExportByFlightButton token={token} range={range} />
+          <ExportByFlightButton token={token} range={range} routeKey={routeKey} />
         </div>
       </header>
 
@@ -367,13 +390,29 @@ export function FinancesPage() {
         <TabBtn active={tab === 'costs'} onClick={() => setTab('costs')}>
           成本维护
         </TabBtn>
+        <TabBtn active={tab === 'payouts'} onClick={() => setTab('payouts')}>
+          待打款
+        </TabBtn>
+        <TabBtn active={tab === 'payables'} onClick={() => setTab('payables')}>
+          供应商应付
+        </TabBtn>
+        <TabBtn active={tab === 'invoices'} onClick={() => setTab('invoices')}>
+          发票
+        </TabBtn>
       </nav>
 
-      {tab === 'summary' && <SummaryTab token={token} range={range} />}
+      {tab === 'summary' && <SummaryTab token={token} range={range} routeKey={routeKey} />}
       {tab === 'flights' && <FlightsTab token={token} range={range} />}
       {tab === 'orders' && <OrdersTab token={token} range={range} />}
-      {tab === 'monthly' && <MonthlyTab token={token} />}
+      {tab === 'monthly' && <MonthlyTab token={token} routeKey={routeKey} />}
       {tab === 'costs' && <CostsTab token={token} />}
+      {/* 待打款：已核准但钱还没打出去的退款。不吃上面的日期区间——队列是「还没做完的事」，
+          按时间段筛会把更早的漏账藏起来，正是本页要暴露的东西。 */}
+      {tab === 'payouts' && <RefundPayoutQueue />}
+      {/* 供应商应付 / 发票：同样不吃上面的日期区间——它们各自带筛选，
+          且账是「还没做完的事」，被 30 天窗口一夹就把更早的漏账藏起来了。 */}
+      {tab === 'payables' && <SupplierPayablesTab token={token} />}
+      {tab === 'invoices' && <InvoicesTab token={token} />}
     </div>
   );
 }
@@ -421,7 +460,16 @@ function ExportButton({ token, range }: { token: string; range: { from: string; 
 }
 
 // ── Export by flight button ────────────────────────────────────────────────
-function ExportByFlightButton({ token, range }: { token: string; range: { from: string; to: string } }) {
+function ExportByFlightButton({
+  token,
+  range,
+  routeKey,
+}: {
+  token: string;
+  range: { from: string; to: string };
+  /** 空 = 全部航线；圈了航线则只导这条线（去回两个方向都导）。 */
+  routeKey: string;
+}) {
   const [busy, setBusy] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
@@ -430,11 +478,12 @@ function ExportByFlightButton({ token, range }: { token: string; range: { from: 
     setBusy(true);
     setErr(null);
     try {
-      const blob = await api.downloadFinanceExportByFlight(token, range);
+      const blob = await api.downloadFinanceExportByFlight(token, range, routeKey || null);
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `按航班_${range.from}_${range.to}.xlsx`;
+      // 文件名带上航线：两条线各导一份放同一个文件夹时分得清哪份是哪条线（口径同后端文件名）。
+      a.download = `按航班_${range.from}_${range.to}${routeKey && routeKey !== UNKNOWN_ROUTE_KEY ? `_${routeKey}` : ''}.xlsx`;
       document.body.appendChild(a);
       a.click();
       a.remove();
@@ -1872,7 +1921,16 @@ function CostRow({
 }
 
 // ── Summary tab ────────────────────────────────────────────────────────────
-function SummaryTab({ token, range }: { token: string; range: { from: string; to: string } }) {
+function SummaryTab({
+  token,
+  range,
+  routeKey,
+}: {
+  token: string;
+  range: { from: string; to: string };
+  /** 空 = 全部航线。 */
+  routeKey: string;
+}) {
   const [data, setData] = useState<FinanceSummary | null>(null);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -1883,7 +1941,7 @@ function SummaryTab({ token, range }: { token: string; range: { from: string; to
     setLoading(true);
     setErr(null);
     api
-      .getFinanceSummary(token, range)
+      .getFinanceSummary(token, range, routeKey || null)
       .then((d) => {
         if (!cancelled) setData(d);
       })
@@ -1896,7 +1954,7 @@ function SummaryTab({ token, range }: { token: string; range: { from: string; to
     return () => {
       cancelled = true;
     };
-  }, [token, range]);
+  }, [token, range, routeKey]);
 
   useEffect(() => load(), [load]);
 
@@ -1922,9 +1980,13 @@ function SummaryTab({ token, range }: { token: string; range: { from: string; to
           hint={`${data.orderCount} 笔订单 · 按 OrderItem.amount 合计`}
         />
         <KpiCard
-          label="区间内成本"
+          label="区间内成本（快照）"
           value={fmtCny(data.costCny)}
-          hint={data.missingCostItemCount > 0 ? `${data.missingCostItemCount} 条目缺成本` : '全部已锁定'}
+          hint={
+            data.missingCostItemCount > 0
+              ? `${data.missingCostItemCount} 条目缺成本 · 下单时锁定的快照`
+              : '下单时锁定的快照，事后改成本不追溯'
+          }
           tone={data.missingCostItemCount > 0 ? 'warn' : 'neutral'}
         />
         <KpiCard
@@ -2087,7 +2149,15 @@ function CostBreakdownTable({ data }: { data: FinanceSummary }) {
   const pct = (n: number): number | null => (denom > 0 ? n / denom : null);
   return (
     <div className="card">
-      <h2 className="text-sm font-semibold text-ink">成本细分</h2>
+      <h2 className="text-sm font-semibold text-ink">成本细分（实时）</h2>
+      {/* 同一页上两套成本数，各有各的用途，标清楚免得对不上时以为是 bug：
+          · 上面 KPI「区间内成本」= 下单那一刻锁定的**快照**（事后改成本周期不追溯，历史订单不变）；
+          · 这张表 = 按**当前**成本周期实时重算（周期改了这里跟着变，用来看现在的成本结构）。
+          两者对不上，通常就是成本周期在下单之后被调过。 */}
+      <p className="mt-1 text-xs text-ink-muted">
+        按<strong>当前</strong>成本周期实时重算；上方「区间内成本」是下单时锁定的快照。两者对不上，
+        一般是成本周期在下单之后调整过。
+      </p>
       <div className="mt-3 overflow-x-auto">
         <table className="w-full text-sm">
           <thead className="text-xs uppercase tracking-wide text-ink-muted">
@@ -2652,7 +2722,7 @@ function OrderPnlDetailModal({
 }
 
 // ── Monthly tab ────────────────────────────────────────────────────────────
-function MonthlyTab({ token }: { token: string }) {
+function MonthlyTab({ token, routeKey }: { token: string; routeKey: string }) {
   const [points, setPoints] = useState<MonthlyPoint[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
@@ -2664,7 +2734,7 @@ function MonthlyTab({ token }: { token: string }) {
     setLoading(true);
     setErr(null);
     api
-      .getFinanceMonthly(token, months)
+      .getFinanceMonthly(token, months, routeKey || null)
       .then((d) => {
         if (!cancelled) setPoints(d.points);
       })
@@ -2677,7 +2747,7 @@ function MonthlyTab({ token }: { token: string }) {
     return () => {
       cancelled = true;
     };
-  }, [token, months]);
+  }, [token, months, routeKey]);
 
   const maxRevenue = useMemo(
     () => Math.max(1, ...points.map((p) => p.revenueCny)),

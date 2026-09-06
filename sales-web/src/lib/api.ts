@@ -7,10 +7,40 @@
  *
  * 运行时 env 不可用（静态 HTML 已编译）；若要切域名必须重新构建镜像。
  */
+import type { Capability } from './capabilities';
+/**
+ * 枚举类型不再手抄 —— 从 @ftm/contracts 取后端 schema.prisma 的同一份镜像。
+ *
+ * 改这批之前 DocumentType 里有个后端根本不认的 OTHER，是典型的抄本跟正本分家。
+ * import + export 两句都要：本文件下面的接口还要用这些类型，光 re-export 不进本地作用域。
+ */
+import type {
+  ApiErrorBody,
+  PaymentChannelKind as ContractPaymentChannelKind,
+  CabinClass,
+  DocumentType,
+  PassengerType,
+  PaymentMethod,
+  SeatLockStatus,
+  SettlementStatus,
+  UserRole,
+  WaitlistStatus,
+  ProductReviewType,
+} from '@ftm/contracts';
+
+export type {
+  CabinClass,
+  DocumentType,
+  PassengerType,
+  PaymentMethod,
+  SeatLockStatus,
+  SettlementStatus,
+  UserRole,
+  WaitlistStatus,
+};
+
 const API_BASE: string = (import.meta.env?.VITE_API_BASE as string | undefined)?.trim() || '/api';
-export interface ApiErrorBody {
-  error: { code: string; message: string; details?: unknown };
-}
+export type { ApiErrorBody };
 
 export class ApiError extends Error {
   readonly status: number;
@@ -139,8 +169,6 @@ async function apiFetchWithRetry<T>(
 
 // ── 类型 ──────────────────────────────────────────────────────────────────
 
-export type UserRole = 'CUSTOMER' | 'AGENT' | 'STAFF' | 'ADMIN';
-export type CabinClass = 'ECONOMY' | 'PREMIUM_ECONOMY' | 'BUSINESS' | 'FIRST';
 
 export interface AuthUser {
   id: string;
@@ -148,6 +176,11 @@ export interface AuthUser {
   role: UserRole;
   displayName: string | null;
   mustChangePassword: boolean;
+  /**
+   * 能力清单：后端按同一张能力表算好后随 /users/me 下发（见 backend/src/lib/capabilities.ts）。
+   * 登录响应里没有它，Layout 挂载后那次 /users/me 才补上——所以是可选的。
+   */
+  capabilities?: Capability[];
 }
 
 export interface AuthTokens {
@@ -175,8 +208,21 @@ export interface HotelAvailabilityResult {
 }
 
 // ── 套餐可售日期（公开；按 航班+酒店库存 逐日算，可设 blackout 封盘）──────────
-/** 某日不可售的原因：封盘 / 机位售罄 / 满房；可售时为 null。 */
-export type SellableDateReason = 'BLACKOUT' | 'FLIGHT_SOLD_OUT' | 'HOTEL_SOLD_OUT' | null;
+/**
+ * 某日不可售的原因：封盘 / 套餐未绑航班 / 机位售罄 / 满房；可售时为 null。
+ *
+ * 末尾的 `(string & {})` 是**故意**留的开口：后端将来新增 reason（如新航线相关的新分支）时，
+ * 老前端不该因为拿到没见过的字符串就崩或当成"可售"——统一按未知处理，展示兜底文案「暂不可售」
+ * 并照常拦截加购（见 components/SellableReasonChip.tsx）。
+ */
+export type SellableDateReason =
+  | 'BLACKOUT'
+  | 'NO_FLIGHT_BOUND'
+  | 'FLIGHT_SOLD_OUT'
+  | 'HOTEL_SOLD_OUT'
+  // eslint-disable-next-line @typescript-eslint/ban-types
+  | (string & {})
+  | null;
 
 /** GET /products/bundles/:id/sellable-dates 的单日（只回档位，不回原始库存数字）。 */
 export interface SellableDate {
@@ -324,9 +370,6 @@ export type OrderItemKind =
   | 'GUIDE'
   | 'UPGRADE_CHANGE'
   | 'OVERSALE';
-export type DocumentType = 'PASSPORT' | 'ID_CARD' | 'OTHER';
-export type PassengerType = 'ADULT' | 'CHILD' | 'INFANT';
-export type PaymentMethod = 'WECHAT_PAY' | 'ALIPAY' | 'BANK_CARD' | 'AGENT_PREPAYMENT';
 
 /**
  * 对外中性航段状态（镜像后端 orders.leg-status.ts 的 PublicLegStatus）。
@@ -470,7 +513,6 @@ export interface RefundQuote {
 // ── 锁位 ──────────────────────────────────────────────────────────────────
 // 下单前临时占座：单次 ≤9 张 / 固定 10 分钟 / 到期自动回收；
 // 下单时服务端自动消费本人锁位（前端无需改结算流程）。
-export type SeatLockStatus = 'ACTIVE' | 'EXPIRED' | 'CONSUMED' | 'RELEASED';
 
 /** POST /seat-locks 返回的锁位记录 */
 export interface SeatLock {
@@ -501,7 +543,6 @@ export interface MySeatLock {
 
 // ── 候补 ──────────────────────────────────────────────────────────────────
 // 舱位售罄时登记候补（单次 1-9 张 + 联系手机号）；座位释放后按先来先到通知。
-export type WaitlistStatus = 'ACTIVE' | 'NOTIFIED' | 'FULFILLED' | 'CANCELLED';
 
 /** POST /waitlist 返回的候补记录 */
 export interface WaitlistEntry {
@@ -851,7 +892,6 @@ export interface Bundle {
 }
 
 // ── 结算 / 佣金 ────────────────────────────────────────────────────────────
-export type SettlementStatus = 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED' | 'PAID' | 'VOIDED';
 
 export interface SettlementSummary {
   id: string;
@@ -895,8 +935,17 @@ export interface SettlementDetail extends SettlementSummary {
   commissions: SettlementCommissionRecord[];
 }
 
+/** GET /agents/me —— 当前登录代理自己的档案（对账单要用它的 id） */
+export interface MyAgentProfile {
+  id: string;
+  companyName: string | null;
+  contactName: string;
+  tier: number;
+}
+
 // ── 评价 / 评论 ─────────────────────────────────────────────────────────────
-export type ReviewProductType = 'BUNDLE' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'FLIGHT';
+/** 评价对象类型 = 后端 Prisma ProductReviewType，取契约包那份。 */
+export type ReviewProductType = ProductReviewType;
 
 /** 单条评价（对标 Klook/携程 评论；后端 GET /reviews 的 item） */
 export interface Review {
@@ -982,7 +1031,8 @@ export interface MaskedOrder {
  *   accountText：账户/收款信息文字（如银行卡号、户名）；null = 无
  *   note：补充说明（如"备注请填订单号"）；null = 无
  */
-export type PaymentChannelKind = 'WECHAT' | 'ALIPAY' | 'BANK';
+/** 收款渠道分组 = 契约包 payment-channels 那份（与后台、小程序同一口径）。 */
+export type PaymentChannelKind = ContractPaymentChannelKind;
 
 export interface PublicPaymentChannel {
   id: string;
@@ -1014,6 +1064,30 @@ export interface UploadOrderReceiptResult {
   receiptNo: string;
   amountCny: string;
   status: 'OPEN';
+}
+
+// ── 航线 / 机场 / 酒店城市（公开，动态派生，不再由前端写死目的地）──────────────
+/** GET /public/airports、/public/routes 里机场展示信息（中文名 / 城市 / 国家 / IANA 时区）。 */
+export interface PublicAirport {
+  code: string;
+  name: string;
+  city: string;
+  country: string;
+  tz: string;
+}
+
+/** GET /public/routes 返回的一条活跃航线（起降机场对 + 两端展示信息）。 */
+export interface PublicRoute {
+  originCode: string;
+  destinationCode: string;
+  origin: PublicAirport;
+  destination: PublicAirport;
+}
+
+/** GET /public/hotel-cities 返回的一个在架酒店城市（含非机场码，如会安）。 */
+export interface PublicHotelCity {
+  code: string;
+  name: string;
 }
 
 // ── Typed endpoints ───────────────────────────────────────────────────────
@@ -1055,6 +1129,8 @@ export const api = {
         createdAt: string;
         lastLoginAt: string | null;
       };
+      /** 后端按能力表现算的清单，与 requireCapability 同源。 */
+      capabilities: Capability[];
     }>('/users/me', { token }),
 
   // 航班搜索（公开）
@@ -1112,6 +1188,14 @@ export const api = {
   /** 公开收款渠道：买家下单后看到的统一收款码 / 账户（只回启用中的）。 */
   getPublicPaymentChannels: () =>
     apiFetch<{ channels: PublicPaymentChannel[] }>('/public/payment-channels'),
+
+  // ── 航线 / 机场 / 酒店城市（公开，无需登录）───────────────────────────────
+  /** 活跃航线（distinct 起降机场对 + 两端展示信息）；用于首页默认航线 + 航线切换。 */
+  getPublicRoutes: () => apiFetch<{ routes: PublicRoute[] }>('/public/routes'),
+  /** 出现在活跃航班里的机场清单；用于航班搜索的出发/到达下拉。 */
+  getPublicAirports: () => apiFetch<{ airports: PublicAirport[] }>('/public/airports'),
+  /** 在架酒店的 distinct 城市码 + 中文名；用于酒店页目的地下拉。 */
+  getPublicHotelCities: () => apiFetch<{ cities: PublicHotelCity[] }>('/public/hotel-cities'),
   /**
    * 公开上传付款凭证：凭「订单号 + lookupKey（手机号/邮箱/姓氏）」校验后建一条待对账凭证。
    * lookupKey 不匹配后端回 404（apiFetch 抛 ApiError，status=404）；按 IP 限流 10 次/分钟。
@@ -1249,13 +1333,19 @@ export const api = {
   listTransfers: () => apiFetch<{ transfers: Transfer[] }>('/products/transfers?active=1'),
   listVisas: () => apiFetch<{ visas: Visa[] }>('/products/visas?active=1'),
   listBundles: () => apiFetch<{ bundles: Bundle[] }>('/products/bundles?active=1'),
-  /** 散客套餐详情按出发日查询的公开优惠金额；失败返回 null，由调用方按场景兜底。 */
+  /**
+   * 散客套餐详情按出发日查询的公开优惠金额；失败返回 null，由调用方按场景兜底。
+   * routeKey 必填（后端按航线隔离规则，不传 400）：由 lib/bundleRoute 从套餐绑定航班派生，
+   * 派生不到（套餐没绑航班）就不要来问——没有航线就没有立减。
+   */
   getRetailSettlementDiscount: async (params: {
+    routeKey: string;
     tier: SettlementTier;
     nights: number;
     departDate: string;
   }): Promise<{ discountPerPersonCny: number } | null> => {
     const qs = new URLSearchParams({
+      routeKey: params.routeKey,
       tier: params.tier,
       nights: String(params.nights),
       departDate: params.departDate,
@@ -1307,6 +1397,25 @@ export const api = {
   },
   getSettlement: (token: string, id: string) =>
     apiFetch<{ settlement: SettlementDetail }>(`/settlements/${id}`, { token }),
+
+  /** 当前登录代理自己的档案（下载对账单要先拿到自己的 agentId） */
+  getMyAgent: (token: string) =>
+    apiFetch<{ agent: MyAgentProfile | null }>('/agents/me', { token }),
+
+  /**
+   * 下载自己（或下级）的月度对账单 xlsx。
+   * 后端按出发日归月，含订单明细 + 合计 + 预存款段；权限与结算单同一棵代理树。
+   */
+  downloadAgentStatement: async (token: string, agentId: string, month: string): Promise<Blob> => {
+    const res = await fetch(
+      `${API_BASE}/agents/${encodeURIComponent(agentId)}/statement?month=${encodeURIComponent(month)}&format=xlsx`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) {
+      throw new ApiError(res.status, { code: 'STATEMENT_FAILED', message: await res.text() });
+    }
+    return res.blob();
+  },
 
   // 评价（公开读；写需订单关联）
   /** GET /reviews — 某产品的评价列表 + 评分聚合（分页） */

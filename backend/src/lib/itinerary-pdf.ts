@@ -90,6 +90,11 @@ function round2(n: number): number {
 /**
  * 应付金额 = total + adjustmentCny（改期费/换人费等售后调整），与订单详情「应收」/
  * effectivePayable 同口径——不能只印裸 total，否则改期费/换人费会在客户凭证上凭空消失。
+ *
+ * ⚠️ 故意**没有**改调 lib/order-money.payableCny：本文件的 round2 带 Number.EPSILON 修正
+ *（'99.995' → '100.00'，itinerary-pdf.test 钉死），order-money 用裸 Math.round（→ 99.99）。
+ * 真实订单 total 是两位小数的 Decimal、adjustmentCny 是整数，两种舍入永远得同一个数，
+ * 但既然测试把它当契约钉住了，本批不改行为，只在 docs/口径决议.md 登记这个舍入变体。
  */
 export function computeEffectivePayable(total: string, adjustmentCny = 0): string {
   return round2(Number(total) + adjustmentCny).toFixed(2);

@@ -4,10 +4,16 @@ ARG NODE_VERSION=22-alpine
 FROM node:${NODE_VERSION} AS builder
 WORKDIR /app
 COPY package.json package-lock.json ./
+# 契约包（@ftm/contracts）是 admin-web 的 workspace 依赖：manifest 要先进来，
+# npm ci 才会把 node_modules/@ftm/contracts 这条 symlink 建出来。
+COPY packages/contracts/package.json ./packages/contracts/
 COPY admin-web/package.json ./admin-web/
-RUN npm ci --workspace=@ftm/admin-web --include-workspace-root
-COPY admin-web ./admin-web
+RUN npm ci --workspace=@ftm/admin-web --workspace=@ftm/contracts --include-workspace-root
 COPY tsconfig.base.json ./
+# 先编契约包：admin-web 的 tsc -b 有指向它的项目引用，dist 不在就编不过。
+COPY packages ./packages
+RUN npm run build --workspace=@ftm/contracts
+COPY admin-web ./admin-web
 ARG VITE_API_BASE=/api
 ENV VITE_API_BASE=$VITE_API_BASE
 WORKDIR /app/admin-web

@@ -13,6 +13,7 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
 import { api, type TravelerProfileSuggestion } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
 import { Icon } from './Icon';
 
 const SUGGEST_DEBOUNCE_MS = 300;
@@ -104,9 +105,8 @@ export function PassengerSuggestInput({
   placeholder,
 }: PassengerSuggestInputProps) {
   const tokens = useAuth((s) => s.tokens);
-  const role = useAuth((s) => s.user)?.role;
   // 仅 ADMIN/STAFF 可用联想（AGENT 完全不发请求、不渲染浮层）
-  const suggestEnabled = role === 'ADMIN' || role === 'STAFF';
+  const suggestEnabled = useCapabilities().can('traveler_profiles.manage');
 
   const [suggestions, setSuggestions] = useState<TravelerProfileSuggestion[]>([]);
   const [open, setOpen] = useState(false);

@@ -82,6 +82,7 @@ const dec = (n: number) => ({ toString: () => String(n) }) as unknown as Prisma.
  */
 const BUNDLE_KEY = {
   source: 'BUNDLE_SETTLEMENT_CALENDAR',
+  routeKey: 'MFM-DAD',
   tier: SettlementTier.CITY_4STAR,
   nights: 4,
   departDate: '2026-10-01',
@@ -154,7 +155,13 @@ const BUNDLE_ROW = (amountCny = 3000, metadata: Record<string, unknown> | null =
   flightScheduleId: null,
   hotelCheckIn: null,
   visaIntendedDate: null,
-  bundle: { settlementTier: SettlementTier.CITY_4STAR, settlementNights: 4 },
+  // 航线从套餐绑定航班派生（bundle-route.ts）：去程 MFM→DAD ⇒ 取价键的第一维 MFM-DAD
+  bundle: {
+    settlementTier: SettlementTier.CITY_4STAR,
+    settlementNights: 4,
+    outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' },
+    returnFlight: null,
+  },
   flightSchedule: null,
 });
 
@@ -1469,6 +1476,97 @@ describe('每人份额收口 · 换进来的新客保住自己的加项（T1）'
 });
 
 /**
+ * 定价键的航线维度：结算价日历按航线隔离后，键 = 航线 × 档次 × 晚数 × 出发日。
+ *   · 本批之前落库的基准戳没有 routeKey——那时系统只有澳门-岘港一条线，按迁移同口径读成 MFM-DAD，
+ *     老单换人照样能重算（不能因为加了一维让存量单集体 fail-closed）。
+ *   · 套餐换绑到别的航线 = 换了一格 → PRICING_KEY_CHANGED，不查日历。
+ *   · 套餐没绑航班 = 没有航线 = 无结算价 → NO_CALENDAR，不查日历，也不兜底到任何航线。
+ */
+describe('swapPreview · 定价键含航线', () => {
+  it('本批之前落的基准戳（没有 routeKey）→ 按 MFM-DAD 读，仍按日历重算', async () => {
+    mountSwap({
+      totalCny: 3000,
+      ratePerPersonCny: 800,
+      items: [
+        BUNDLE_ROW(2700),
+        SETTLEMENT_ROW({
+          amountCny: 300,
+          calendarPerPaxCny: 1000,
+          calendarKey: {
+            source: 'BUNDLE_SETTLEMENT_CALENDAR',
+            tier: SettlementTier.CITY_4STAR,
+            nights: 4,
+            departDate: '2026-10-01',
+          },
+        }),
+        FLIGHT_ROW(),
+      ] as unknown as Array<{ amount: Prisma.Decimal }>,
+    });
+
+    const preview = await new OrderService().swapPreview('ord1', 'pax-1', ADMIN);
+
+    expect(preview.repriceSkipped ?? null).toBeNull();
+    expect(preview.basisCny).toBe(1000);
+    expect(preview.newSettlementCny).toBe(800);
+    // 今天这一格按套餐派生的航线查（MFM-DAD），不是别的线
+    const where = mockPrisma.settlementRate.findUnique.mock.calls[0][0].where;
+    expect(where.routeKey_tier_nights_departDate.routeKey).toBe('MFM-DAD');
+  });
+
+  it('套餐换绑到另一条航线（同档同晚，MFM→CXR）→ PRICING_KEY_CHANGED，不查日历', async () => {
+    mountSwap({
+      totalCny: 3000,
+      ratePerPersonCny: 800,
+      items: [
+        {
+          ...BUNDLE_ROW(2700),
+          bundle: {
+            settlementTier: SettlementTier.CITY_4STAR,
+            settlementNights: 4,
+            outboundFlight: { originCode: 'MFM', destinationCode: 'CXR' },
+            returnFlight: null,
+          },
+        },
+        SETTLEMENT_ROW({ amountCny: 300, calendarPerPaxCny: 1000 }),
+        FLIGHT_ROW(),
+      ] as unknown as Array<{ amount: Prisma.Decimal }>,
+    });
+
+    const preview = await new OrderService().swapPreview('ord1', 'pax-1', ADMIN);
+
+    expect(preview.repriceSkipped).toBe('PRICING_KEY_CHANGED');
+    expect(preview.basisCny).toBe(1000);
+    expect(mockPrisma.settlementRate.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('套餐没绑航班 → 派生不出航线，NO_CALENDAR，不查日历也不兜底航线', async () => {
+    mountSwap({
+      totalCny: 3000,
+      ratePerPersonCny: 800,
+      items: [
+        {
+          ...BUNDLE_ROW(2700),
+          bundle: {
+            settlementTier: SettlementTier.CITY_4STAR,
+            settlementNights: 4,
+            outboundFlight: null,
+            returnFlight: null,
+          },
+        },
+        SETTLEMENT_ROW({ amountCny: 300, calendarPerPaxCny: 1000 }),
+        FLIGHT_ROW(),
+      ] as unknown as Array<{ amount: Prisma.Decimal }>,
+    });
+
+    const preview = await new OrderService().swapPreview('ord1', 'pax-1', ADMIN);
+
+    expect(preview.repriceSkipped).toBe('NO_CALENDAR');
+    expect(preview.newSettlementCny).toBeNull();
+    expect(mockPrisma.settlementRate.findUnique).not.toHaveBeenCalled();
+  });
+});
+
+/**
  * 定价键（PRICING_KEY_CHANGED）：改档 / 改期之后，「今天的日历价」查的已经是**另一格**。
  *
  * 换人重算的整套算式只有在「同一格的今昔两价」之间才成立 —— 那个差额才叫「日历动了多少」。
@@ -1482,7 +1580,12 @@ describe('swapPreview · 定价键变了就不重算（PRICING_KEY_CHANGED）', 
     [
       {
         ...BUNDLE_ROW(2700),
-        bundle: { settlementTier: SettlementTier.CITY_5STAR, settlementNights: 4 },
+        bundle: {
+          settlementTier: SettlementTier.CITY_5STAR,
+          settlementNights: 4,
+          outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' },
+          returnFlight: null,
+        },
       },
       SETTLEMENT_ROW({ amountCny: 300, calendarPerPaxCny: 1000 }),
       FLIGHT_ROW(),
@@ -1583,6 +1686,7 @@ describe('swapPreview · 定价键变了就不重算（PRICING_KEY_CHANGED）', 
     expect(row.metadata.calendarDetail).toMatchObject({
       calendarKey: {
         source: 'BUNDLE_SETTLEMENT_CALENDAR',
+        routeKey: 'MFM-DAD',
         tier: SettlementTier.CITY_4STAR,
         nights: 4,
         departDate: '2026-10-01',
@@ -1638,7 +1742,12 @@ describe('swapPreview · 定价键变了就不重算（PRICING_KEY_CHANGED）', 
       items: [
         {
           ...BUNDLE_ROW(2700),
-          bundle: { settlementTier: SettlementTier.CITY_5STAR, settlementNights: 4 },
+          bundle: {
+          settlementTier: SettlementTier.CITY_5STAR,
+          settlementNights: 4,
+          outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' },
+          returnFlight: null,
+        },
         },
         SETTLEMENT_ROW({ amountCny: 300, calendarPerPaxCny: 1000 }),
         PRIOR_SWAP_ROW({
@@ -1666,7 +1775,12 @@ describe('swapPreview · 定价键变了就不重算（PRICING_KEY_CHANGED）', 
       items: [
         {
           ...BUNDLE_ROW(2700),
-          bundle: { settlementTier: SettlementTier.CITY_5STAR, settlementNights: 4 },
+          bundle: {
+          settlementTier: SettlementTier.CITY_5STAR,
+          settlementNights: 4,
+          outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' },
+          returnFlight: null,
+        },
         },
         SETTLEMENT_ROW({ amountCny: 300, calendarPerPaxCny: null }),
         FLIGHT_ROW(),

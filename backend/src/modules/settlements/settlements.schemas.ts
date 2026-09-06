@@ -1,27 +1,10 @@
-import { z } from 'zod';
-import { SettlementStatus } from '@prisma/client';
-
-// Period: YYYY-MM
-const periodRegex = /^\d{4}-(0[1-9]|1[0-2])$/;
-
-export const generateSettlementsBodySchema = z.object({
-  period: z.string().regex(periodRegex, '格式应为 YYYY-MM'),
-  agentId: z.string().optional(), // 指定某代理；不传则全部代理
-  overwrite: z.boolean().default(false), // true = 覆盖已有（DRAFT/PENDING_APPROVAL 可覆盖，APPROVED/PAID 跳过）
-});
-export type GenerateSettlementsBody = z.infer<typeof generateSettlementsBodySchema>;
-
-export const listSettlementsQuerySchema = z.object({
-  period: z.string().regex(periodRegex).optional(),
-  agentId: z.string().optional(),
-  status: z.nativeEnum(SettlementStatus).optional(),
-  page: z.coerce.number().int().min(1).default(1),
-  pageSize: z.coerce.number().int().min(1).max(200).default(50),
-});
-export type ListSettlementsQuery = z.infer<typeof listSettlementsQuerySchema>;
-
-export const updateSettlementStatusBodySchema = z.object({
-  toStatus: z.nativeEnum(SettlementStatus),
-  notes: z.string().max(500).optional(),
-});
-export type UpdateSettlementStatusBody = z.infer<typeof updateSettlementStatusBodySchema>;
+/**
+ * 代理结算单生成 / 审批的请求体 —— 定义已搬进 @ftm/contracts（packages/contracts/src/settlements.ts）。
+ *
+ * 校验规则一字未改：只把 z.nativeEnum(PrismaEnum) 换成契约包镜像的同值 schema
+ *（枚举漂移测试守着两边一致），helper 的 import 改指契约包里的同一份实现。
+ *
+ * 这里留 re-export 壳子，既有 import 路径全部继续可用；前端从 @ftm/contracts
+ * 取同一份类型，不再手抄。
+ */
+export * from '@ftm/contracts/settlements';

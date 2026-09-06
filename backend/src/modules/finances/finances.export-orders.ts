@@ -11,6 +11,8 @@
  */
 import ExcelJS from 'exceljs';
 import type { PrismaClient } from '@prisma/client';
+// 订单状态集合全站唯一一份（审查根因 R2）：退款族判「普通退款」。
+import { REFUND_FAMILY_STATUSES, statusIn } from '../../lib/order-status-sets.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { getOrderPnl, type DateRange, type OrderPnlRow } from './finances.service.js';
@@ -25,8 +27,6 @@ const STATUS_LABEL: Record<string, string> = {
   CHANGE_REQUESTED: '改期中',
   CHANGED: '已改期',
 };
-
-const REFUND_FAMILY_STATUSES = new Set(['REFUND_REQUESTED', 'REFUNDED']);
 
 // 导出取全量（区间内所有订单，不受列表 100 条上限影响）——财务对账需完整数据
 const EXPORT_LIMIT = 100_000;
@@ -129,7 +129,7 @@ async function loadOrderMeta(
 
 function refundType(status: string, swapRefundedAt: Date | null): string {
   if (swapRefundedAt) return '换人退款';
-  if (REFUND_FAMILY_STATUSES.has(status)) return '普通退款';
+  if (statusIn(REFUND_FAMILY_STATUSES, status)) return '普通退款';
   return '';
 }
 

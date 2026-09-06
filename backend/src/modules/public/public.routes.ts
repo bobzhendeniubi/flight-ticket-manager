@@ -1,12 +1,16 @@
 /**
- * 前台公开（免登录）路由 —— 统一收款码展示 + 客户上传付款凭证。
+ * 前台公开（免登录）路由 —— 统一收款码展示 + 客户上传付款凭证 + 航线/机场/酒店城市聚合。
  *
  * 注册前缀 /public：
  *   GET  /public/payment-channels      只读「启用中」收款渠道（id, kind, label, qrImageUrl, accountText, note）
  *   POST /public/orders/upload-receipt 客户上传付款凭证（仅声明，进挂账池，不给订单加钱）
+ *   GET  /public/routes                活跃航班 distinct 航线（起降机场对 + 展示信息 + 时区）
+ *   GET  /public/airports              出现在活跃航班里的机场清单
+ *   GET  /public/hotel-cities          在架酒店 distinct 城市码 + 中文名
  *
  * 门禁：上传走与公开订单查询完全一致的 orderNo + lookupKey 匹配 + 同等限流 + 6MB 上限。
  * lookupKey 任一命中：手机号 / 邮箱 / 订单联系人姓氏。命中失败一律 404（不泄露哪个字段错）。
+ * 后三个聚合端点为只读展示数据（不含库存/价格），与 payment-channels 同级公开权限。
  */
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
@@ -15,6 +19,7 @@ import { OrderService } from '../orders/orders.service.js';
 import { PaymentChannelsService } from '../payment-channels/payment-channels.service.js';
 import { ReceiptsService } from '../receipts/receipts.service.js';
 import { dataUrlImageSchema } from '../../lib/proof-url.js';
+import { listPublicAirports, listPublicHotelCities, listPublicRoutes } from './public.service.js';
 
 const uploadReceiptBodySchema = z.object({
   orderNo: z.string().min(3).max(40),
@@ -38,6 +43,22 @@ export const publicRoutes: FastifyPluginAsync = async (app) => {
   app.get('/payment-channels', async () => {
     const channels = await channelsService.listActivePublic();
     return { channels };
+  });
+
+  // ── 活跃航线 / 机场 / 酒店城市聚合（公开只读，前端据此动态渲染，不再写死目的地）──
+  app.get('/routes', async () => {
+    const routes = await listPublicRoutes();
+    return { routes };
+  });
+
+  app.get('/airports', async () => {
+    const airports = await listPublicAirports();
+    return { airports };
+  });
+
+  app.get('/hotel-cities', async () => {
+    const cities = await listPublicHotelCities();
+    return { cities };
   });
 
   // ── 客户上传付款凭证（公开，门禁 + 限流 + 6MB） ───────

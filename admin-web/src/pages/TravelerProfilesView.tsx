@@ -20,6 +20,7 @@ import {
 import { exportToCSV } from '../lib/csvExport';
 import { formatDateTimeSecCn } from '../lib/datetime';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
 import { Icon } from '../components/Icon';
 import { useConfirm } from '../components/ConfirmDialog';
 import { useDialogA11y } from '../components/Modal';
@@ -444,8 +445,7 @@ function ProfileDrawer({
 }) {
   const tokens = useAuth((s) => s.tokens);
   const dialogRef = useDialogA11y(onClose);
-  const user = useAuth((s) => s.user);
-  const canReadLegacyHistory = user?.role === 'ADMIN' || user?.role === 'STAFF';
+  const canReadLegacyHistory = useCapabilities().can('legacy.read');
   const [profile, setProfile] = useState<TravelerProfile | null>(null);
   const [trips, setTrips] = useState<TravelerProfileTrip[]>([]);
   const [legacyHistory, setLegacyHistory] = useState<LegacyPassengerHistory | null>(null);

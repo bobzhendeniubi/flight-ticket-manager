@@ -7,9 +7,11 @@
  * PATCH  /orders/:id/status    状态流转（ADMIN/STAFF；客户可取消待支付）
  */
 import type { FastifyPluginAsync, FastifyReply, FastifyRequest } from 'fastify';
+import { hasCapability, type Capability } from '../../lib/capabilities.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { env } from '../../config/env.js';
 import { z } from 'zod';
+import { backfillPassengerShares } from './service/passenger-shares.js';
 import { OrderItemKind, Prisma, UserRole, VisaRequirement, type Passenger } from '@prisma/client';
 import {
   buildStayNightDates,
@@ -64,6 +66,7 @@ import {
   restoreReturnLegBodySchema,
   voidReturnLegBodySchema,
   splitRoomGroupBodySchema,
+  markRefundPaidBodySchema,
   swapRefundBodySchema,
   updateSwapReplacementOrderBodySchema,
   swapFeeOptionsBodySchema,
@@ -71,6 +74,9 @@ import {
   swapPassengerBodySchema,
   setPassengerVisaExemptBodySchema,
   updateItemSettlementPriceBodySchema,
+  ticketBatchBodySchema,
+  ticketBatchPreviewBodySchema,
+  updatePassengerTicketBodySchema,
   updatePassengerVisaDatesBodySchema,
   updateStatusBodySchema,
   visaBundleBodySchema,
@@ -108,6 +114,7 @@ import {
   buildMasterExportWorkbook,
   masterExportFilename,
 } from './orders.export-master.js';
+import { markRefundPaid } from '../finances/finances.refund-payout.js';
 import {
   describeOrderFilters,
   serializableOrderFilters,
@@ -128,6 +135,8 @@ import {
   resolveOrderImport,
 } from './orders.import.js';
 import { executeNoShowBatch, previewNoShowBatch } from './no-show-batch.js';
+import { executeTicketBatch, previewTicketBatch } from './ticket-batch.js';
+import { TicketRosterError, parseTicketRosterXlsx } from './ticket-roster.js';
 import {
   buildNoShowReportWorkbook,
   loadNoShowReport,
@@ -159,6 +168,21 @@ export const expectedAmountBodySchema = z.object({
     .refine((v) => Number(v.toFixed(2)) === v, { message: '预期到账金额最多两位小数（元）' })
     .nullable(),
 });
+
+/**
+ * 本文件里所有**内联**权限判断的唯一入口。
+ *
+ * 订单的权限大头不在 preHandler 上：很多端点得先过归属闸（getOrder → assertCanView）
+ * 或者要按请求体分支（带了议价结算价才要运营），只能写在 handler 里。这些内联判断
+ * 此前一律是手抄的 `role !== ADMIN && role !== STAFF`，同一条口径在本文件出现四十多次，
+ * 改口径必漏。现在它们都走这里，和 preHandler 的 requireCapability、前端 /users/me
+ * 下发的清单是同一张表（lib/capabilities.ts）。
+ *
+ * 岗位由 authenticate 逐请求填进 req.staffRole，改岗下一个请求即生效。
+ */
+function can(req: FastifyRequest, cap: Capability): boolean {
+  return hasCapability({ role: req.user.role, staffRole: req.staffRole }, cap);
+}
 
 export const orderRoutes: FastifyPluginAsync = async (app) => {
   const service = new OrderService();
@@ -210,7 +234,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 指定酒店星级闸同样在此生效（对 AGENT 硬拒 / 对运营不拦）——见 service.quoteOrder。
   app.post(
     '/quote',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.create')] },
     async (req, reply) => {
       const body = quoteOrderBodySchema.parse(req.body);
       const requester = await buildRequester(req.user.sub, req.user.role);
@@ -257,7 +281,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       bodyLimit: 25 * 1024 * 1024,
     },
     async (req, reply) => {
-      if (req.user.role === UserRole.CUSTOMER) {
+      if (!can(req, 'orders.create')) {
         return reply.status(403).send({ error: '客户不可批量建单' });
       }
       const body = batchCreateOrdersBodySchema.parse(req.body);
@@ -269,7 +293,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         return reply.status(400).send({ error: '优惠与团队议价结算价二选一' });
       }
       // 团队议价结算价覆盖机票价：仅 ADMIN/STAFF 可用（AGENT 自助批量建单不得改价）。
-      const isOps = req.user.role === UserRole.ADMIN || req.user.role === UserRole.STAFF;
+      const isOps = can(req, 'orders.price_adjust');
       if (body.settlementPriceCny !== undefined && !isOps) {
         return reply.status(403).send({ error: '仅运营/管理员可指定团队议价结算价' });
       }
@@ -329,7 +353,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 导出空白名单模版（姓名 | 护照号 | 出生日期 | 性别），运营把收单群名单转此格式后上传解析。
   app.get(
     '/roster/template',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.roster.manage')] },
     async (req, reply) => {
       const buf = await buildRosterTemplateWorkbook();
       void writeAudit({
@@ -358,7 +382,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 容错：跳空行 / 容错日期格式 / 单格不可解析只收 warning，不整文件抛错。
   app.post(
     '/roster/parse',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.roster.manage')] },
     async (req) => {
       const body = z
         .object({ fileBase64: z.string().min(1, 'fileBase64 必填') })
@@ -392,12 +416,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 代理身份上传：结算价格 / 选择代理两列忽略并提示（结算价由系统按代理价计算，归属自动为本代理）。
   app.post(
     '/batch-import/parse',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.create')] },
     async (req) => {
       const body = z
         .object({ fileBase64: z.string().min(1, 'fileBase64 必填') })
         .parse(req.body);
-      const isOpsUpload = req.user.role === UserRole.ADMIN || req.user.role === UserRole.STAFF;
       let parsed;
       try {
         parsed = await parseOrderImportXlsx(body.fileBase64);
@@ -410,8 +433,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         );
       }
       const result = await resolveOrderImport(parsed, buildOrderImportMatchDeps(), {
-        includeSettlement: isOpsUpload,
-        includeAgent: isOpsUpload,
+        includeSettlement: can(req, 'orders.settlement_price.write'),
+        includeAgent: can(req, 'orders.agent.write'),
       });
       void writeAudit({
         actor: actorFromRequest(req),
@@ -463,7 +486,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   静态路由，Fastify 优先于 /:id 匹配，故不会被参数路由吞掉。
   app.get(
     '/deleted',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.read_deleted')] },
     async (req) => {
       const q = z
         .object({
@@ -485,7 +508,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       const { id } = req.params as { id: string };
       const requester = await buildRequester(req.user.sub, req.user.role);
       const order = await service.getOrder(id, requester);
-      return { order };
+      // 沙箱自动出票开着吗（env ENABLE_AUTO_FULFILLMENT）。
+      // 订单详情的乘客卡上，PNR/票号旁边那个「演示自动出票」提示以前是**写死**的 ——
+      // 一旦真接了航司、或者把开关关掉改人工回填，界面还会一直管真票号叫演示号。
+      // 这里如实下发一个布尔，前端据此决定要不要挂那个提示（本任务不动开关默认值）。
+      return { order, autoFulfillmentSandbox: process.env.ENABLE_AUTO_FULFILLMENT === 'true' };
     },
   );
 
@@ -519,7 +546,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     { preHandler: [app.authenticate] },
     async (req, reply) => {
       const role = req.user.role;
-      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      if (!can(req, 'orders.write')) {
         return reply.status(403).send({ error: '仅管理员可批量改状态' });
       }
       const body = batchUpdateStatusBodySchema.parse(req.body);
@@ -599,6 +626,51 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       });
 
       return result;
+    },
+  );
+
+  /**
+   * POST /orders/:id/refunds/:refundId/mark-paid
+   * 登记「这笔退款的钱确实打出去了」。ADMIN 或财务岗（能力 refunds.mark_paid，与财务页同一道闸）。
+   *
+   * 与退款状态机无关：Refund.status 一个字不改，订单的已收/尾款一分不动 —— 这里只是给
+   * 「核准之后、真金白银离开公司账户」这一步留一条可查的痕迹（谁打的、几时、走哪条渠道、流水号）。
+   * 重复标记直接 409（见 markRefundPaid 的幂等口径注释）：真打了两笔和点了两次必须能分清。
+   */
+  app.post(
+    '/:id/refunds/:refundId/mark-paid',
+    { preHandler: [app.authenticate, app.requireCapability('refunds.mark_paid')] },
+    async (req) => {
+      const { id, refundId } = req.params as { id: string; refundId: string };
+      const body = markRefundPaidBodySchema.parse(req.body ?? {});
+      const result = await markRefundPaid({
+        orderId: id,
+        refundId,
+        paidAt: body.paidAt ? new Date(body.paidAt) : undefined,
+        paidMethod: body.paidMethod,
+        paidTxnRef: body.paidTxnRef ?? null,
+        paidNote: body.paidNote ?? null,
+        paidByUserId: req.user.sub,
+      });
+
+      // 资金离场，留痕等级同收款纠错：谁在什么时候登记了多少钱出去，必须查得到。
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'MARK_REFUND_PAID',
+        targetType: 'ORDER',
+        targetId: id,
+        targetLabel: result.orderNumber,
+        after: {
+          refundId: result.refundId,
+          amountCny: result.amountCny,
+          paidAt: result.paidAt,
+          paidMethod: result.paidMethod,
+          paidTxnRef: result.paidTxnRef,
+        },
+        severity: 'WARNING',
+      });
+
+      return { refund: result };
     },
   );
 
@@ -770,7 +842,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 代理不能跨代理看订单，所以 AGENT 不放行；客户更不行
   app.get(
     '/export-by-schedule',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.export.ops')] },
     async (req, reply) => {
       const query = z
         .object({ scheduleId: z.string().min(1, 'scheduleId 必填') })
@@ -829,7 +901,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     {
       preHandler: [
         app.authenticate,
-        app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT),
+        app.requireCapability('orders.export.shared'),
       ],
     },
     async (req, reply) => {
@@ -882,7 +954,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     {
       preHandler: [
         app.authenticate,
-        app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT),
+        app.requireCapability('orders.export.shared'),
       ],
     },
     async (req, reply) => {
@@ -949,7 +1021,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     {
       preHandler: [
         app.authenticate,
-        app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT),
+        app.requireCapability('orders.export.shared'),
       ],
     },
     async (req, reply) => {
@@ -1007,7 +1079,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   · departDate：按出发日选订单，导出其全部入住晚（给了它就优先，忽略 from/to）
   app.get(
     '/export-room-allocation',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.export.ops')] },
     async (req, reply) => {
       const query = exportRoomAllocationQuerySchema.parse(req.query);
 
@@ -1059,7 +1131,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 按勾选的订单导出合并签证名单 xlsx（状态不合格/查不到的单静默不计入，仅出合格单）。
   app.post(
     '/visa-roster.xlsx',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.export.ops')] },
     async (req, reply) => {
       const body = visaBundleBodySchema.parse(req.body);
       const xlsxBuf = await buildVisaRosterXlsx(body.orderIds);
@@ -1090,7 +1162,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 按勾选的订单导出全部乘客护照图 zip（不含名单 xlsx）；状态不合格/查不到的单及缺图明细见 zip 内 README。
   app.post(
     '/visa-passports.zip',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.export.ops')] },
     async (req, reply) => {
       const body = visaBundleBodySchema.parse(req.body);
       const zipBuf = await buildVisaPassportsZip(body.orderIds);
@@ -1121,7 +1193,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 代理与客户一律不放行（代理拿到全套护照原图 = 客资无门槛外流）。
   app.get(
     '/:id/passport-photos.zip',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.export.ops')] },
     async (req, reply) => {
       const { id } = req.params as { id: string };
       // 包类型按**入口**声明，不按角色（签证岗/操作岗同为 STAFF，服务端分不出谁是谁）：
@@ -1175,7 +1247,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // POST /orders/:id/claim — ADMIN/STAFF 点"接单"
   app.post('/:id/claim', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.claim')) {
       return reply.status(403).send({ error: '仅运营/管理员可认领订单' });
     }
     const { id } = req.params as { id: string };
@@ -1209,7 +1281,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   状态（CANCELLED/PAYMENT_TIMEOUT/REFUNDED/FAILED/DRAFT）。删除本身绝不触碰库存/座位账。
   app.delete(
     '/:id',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.delete')] },
     async (req) => {
       const { id } = req.params as { id: string };
       const requester = await buildRequester(req.user.sub, req.user.role);
@@ -1233,7 +1305,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   全是释放型状态，恢复绝不凭空占座（依据见 service.restoreOrder 注释）。审计 RESTORE_ORDER。
   app.post(
     '/:id/restore',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.delete')] },
     async (req) => {
       const { id } = req.params as { id: string };
       const requester = await buildRequester(req.user.sub, req.user.role);
@@ -1256,7 +1328,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // PUT /orders/:id/room-assignment
   app.put('/:id/room-assignment', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.hotel.write')) {
       return reply.status(403).send({ error: '仅运营/管理员可分房' });
     }
     const { id } = req.params as { id: string };
@@ -1494,7 +1566,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     const requester = await buildRequester(req.user.sub, req.user.role);
     await service.getOrder(id, requester);
     const role = req.user.role;
-    const isOps = role === UserRole.ADMIN || role === UserRole.STAFF;
+    const isOps = can(req, 'orders.write');
     // internalNotes / 签证状态 / 结构化备注四栏 只有 ADMIN/STAFF 可改
     const opsOnlyTouched =
       body.internalNotes !== undefined ||
@@ -1602,7 +1674,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 翻某航段为已开时校验对应班次开票上限（超限 422）；systemInvoiced 不占额度。
   app.patch('/:id/invoice-flags', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.write')) {
       return reply.status(403).send({ error: '仅运营/管理员可修改开票状态' });
     }
     const { id } = req.params as { id: string };
@@ -1638,7 +1710,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     { preHandler: [app.authenticate] },
     async (req, reply) => {
       const role = req.user.role;
-      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      if (!can(req, 'orders.write')) {
         return reply.status(403).send({ error: '仅运营/管理员可批量修改开票状态' });
       }
       const body = batchSetInvoiceFlagsBodySchema.parse(req.body);
@@ -1666,7 +1738,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 按订单既有航段排序逐单改期；不收改期费，已出票/已完成单默认拦截。
   app.post('/batch-reschedule', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.reschedule')) {
       return reply.status(403).send({ error: '仅运营/管理员可批量改航班' });
     }
     const body = batchRescheduleBodySchema.parse(req.body);
@@ -1754,7 +1826,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 不存在或已软删订单跳过；每个成功订单各写一条审计。
   app.post(
     '/batch/settlement-lock',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.batch_lock')] },
     async (req) => {
       const body = batchSettlementLockBodySchema.parse(req.body);
       const result = await service.batchSetSettlementLock(body.orderIds, body.lock, req.user.sub);
@@ -1784,7 +1856,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 不存在 / 回收站 / 已是目标状态的单逐单跳过并带回原因；每个真正改动的订单各写一条审计。
   app.post(
     '/batch/payments-lock',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.payments_lock')] },
     async (req) => {
       const body = batchPaymentsLockBodySchema.parse(req.body);
       const result = await service.batchSetPaymentsLock(body.orderIds, body.locked, req.user.sub);
@@ -1820,6 +1892,31 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
+  // ── 按人份额一次性回填（ADMIN）───────────────────────────────────────────
+  // POST /orders/passenger-shares/backfill?limit=500
+  // 分批、幂等：只挑「有乘客却缺当前算法版本份额行」的活单，逐单短事务（NOWAIT 行锁）回填；
+  // 撞锁 / 失败的单下次重跑再挑出来。remaining = 0 即回填完成。线上不进容器也能跑：
+  // 上线后由管理员反复调到 remaining 为 0（与 backend/scripts/backfill-passenger-shares.ts 同一内核）。
+  app.post(
+    '/passenger-shares/backfill',
+    { preHandler: [app.authenticate, app.requireCapability('orders.passenger_shares.backfill')] },
+    async (req) => {
+      const query = z
+        .object({ limit: z.coerce.number().int().min(1).max(5000).default(500) })
+        .parse(req.query ?? {});
+      const result = await backfillPassengerShares({ limit: query.limit });
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'BACKFILL_PASSENGER_SHARES',
+        targetType: 'ORDER',
+        targetId: 'passenger-shares-backfill',
+        targetLabel: `按人份额回填 ${result.persisted}/${result.scanned}（剩 ${result.remaining}）`,
+        after: { ...result, limit: query.limit },
+      });
+      return result;
+    },
+  );
+
   // ── 批量事后调价（ADMIN/STAFF）────────────────────────────────────────────
   // POST /orders/batch/price-adjustment
   //   body: { orderIds: string[], mode: 'PER_ORDER'|'PER_PAX', amountCny: int≠0,
@@ -1828,7 +1925,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 锁价单 / 死单 / 回收站单 / 找不到的 id 逐单跳过并带回原因；每笔真调价各写一条审计。
   app.post(
     '/batch/price-adjustment',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.batch_lock')] },
     async (req) => {
       const body = batchPriceAdjustmentBodySchema.parse(req.body);
       const { orderIds, ...input } = body;
@@ -1890,7 +1987,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // PATCH /orders/:id/expected-amount  body: { amountCny: number | null }
   app.patch('/:id/expected-amount', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.price_adjust')) {
       return reply.status(403).send({ error: '仅运营/管理员可修改预期到账金额' });
     }
     const { id } = req.params as { id: string };
@@ -1900,7 +1997,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       select: { id: true, orderNumber: true, expectedAmountLocked: true, expectedAmountCny: true },
     });
     if (!order) return reply.status(404).send({ error: '订单不存在' });
-    if (order.expectedAmountLocked && role !== UserRole.ADMIN) {
+    if (order.expectedAmountLocked && !can(req, 'orders.expected_amount.override_lock')) {
       return reply.status(403).send({ error: '已锁定，请联系管理员' });
     }
     const updated = await prisma.order.update({
@@ -1936,7 +2033,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 财务能锁/解锁，但不能在锁定态下自行改数，改数仍需管理员，审计照写。
   app.post('/:id/expected-amount/lock', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.price_adjust')) {
       return reply.status(403).send({ error: '仅管理员或财务可锁定/解锁预期到账' });
     }
     const { id } = req.params as { id: string };
@@ -1976,7 +2073,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 网关到账 / 对账认款是真钱已落库，不受此锁影响（见 payments.service 注释）。
   app.post('/:id/payments-lock', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.payments_lock')) {
       return reply.status(403).send({ error: '仅管理员或财务可锁定/解锁收款' });
     }
     const { id } = req.params as { id: string };
@@ -2022,7 +2119,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 订单多付（paidAmount > total）→ 把多付额转入归属代理的预存余额，订单回压到恰好结清。
   app.post('/:id/credit-overpay-to-agent', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'payments.overpay.handle')) {
       return reply.status(403).send({ error: '仅运营/管理员可将多付存入代理余额' });
     }
     const { id } = req.params as { id: string };
@@ -2049,7 +2146,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 订单回压到恰好结清；财务后续在收款对账台认领/退款。（游客版「存代理余额」。）
   app.post('/:id/overpay-to-pool', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'payments.overpay.handle')) {
       return reply.status(403).send({ error: '仅运营/管理员可将订单超额转入挂账池' });
     }
     const { id } = req.params as { id: string };
@@ -2076,7 +2173,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 从归属代理预存余额扣 amount，记入订单 paidAmount；抵满则订单转 PAID（含佣金/履约）。
   app.post('/:id/apply-agent-balance', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'payments.overpay.handle')) {
       return reply.status(403).send({ error: '仅运营/管理员可用代理余额抵尾款' });
     }
     const { id } = req.params as { id: string };
@@ -2108,7 +2205,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 把某条 FLIGHT 行就地改到新班次/新舱位（座位先放旧再原子拿新，售罄回滚不泄漏），可选加改期费。
   app.patch('/:id/reschedule', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.reschedule')) {
       return reply.status(403).send({ error: '仅运营/管理员可改期' });
     }
     const { id } = req.params as { id: string };
@@ -2153,7 +2250,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   app.post('/:id/correct-flight', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
     // 客户没有这条通道（代理的自助窗口闸在 service 里判，报错文案与详情页提示同一句）。
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF && role !== UserRole.AGENT) {
+    if (!can(req, 'orders.correct_flight')) {
       return reply.status(403).send({ error: '仅运营 / 代理可纠正航班' });
     }
     const { id } = req.params as { id: string };
@@ -2200,7 +2297,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   app.post('/:id/items/:itemId/upgrade-cabin', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
     // 代理放行到 service：那里按「下单当天 + 自家单」判自助窗口（差价始终服务端算，代理动不了钱）。
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF && role !== UserRole.AGENT) {
+    if (!can(req, 'orders.upgrade_cabin')) {
       return reply.status(403).send({ error: '仅运营/管理员可升舱' });
     }
     const { id, itemId } = req.params as { id: string; itemId: string };
@@ -2245,7 +2342,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 事务内按该 kind 的计价口径重算行金额与 order.subtotal/total（不走 adjustmentCny）。
   app.patch('/:id/items/:itemId/settlement-price', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.settlement_price.write')) {
       return reply.status(403).send({ error: '仅运营/管理员可改结算价' });
     }
     const { id, itemId } = req.params as { id: string; itemId: string };
@@ -2406,14 +2503,14 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 客户拿到它只会照着问「为什么收我这个数」，而客户侧根本没有换人这条通道（复审 L3）。
   app.get('/swap-fee-options', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF && role !== UserRole.AGENT) {
+    if (!can(req, 'orders.swap_fee_options.read')) {
       return reply.status(403).send({ error: '仅运营/代理可查看换人费档位' });
     }
     return { options: await getSwapFeeOptions(prisma) };
   });
 
   app.put('/swap-fee-options', { preHandler: [app.authenticate] }, async (req, reply) => {
-    if (req.user.role !== UserRole.ADMIN) {
+    if (!can(req, 'orders.swap_fee_options.write')) {
       return reply.status(403).send({ error: '仅管理员可修改换人费档位' });
     }
     const body = swapFeeOptionsBodySchema.parse(req.body);
@@ -2448,7 +2545,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     { preHandler: [app.authenticate] },
     async (req, reply) => {
       const role = req.user.role;
-      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      if (!can(req, 'orders.passengers.write')) {
         return reply.status(403).send({ error: '仅运营/管理员可录入签证日期' });
       }
       const { id, passengerId } = req.params as { id: string; passengerId: string };
@@ -2470,6 +2567,49 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
+  // ── 票务台：回填真实 PNR / 电子票号（ADMIN/STAFF）──
+  // PATCH /orders/:id/passengers/:passengerId/ticket
+  // body: { pnr?: string|null, eticketNumber?: string|null, clear?: true, note?: string }
+  //   · 给字符串 = 写入（PNR 5–8 位字母数字；票号 10–17 位数字，真实 13 位与沙箱 17 位都放行）
+  //   · 给 null   = 只清这一个字段；clear:true = 两个一起清（与给值互斥）
+  //
+  // 背景：出票目前走沙箱（履约 worker 自动生成号写回 Passenger），真实航司出票后系统里
+  // **没有人工录入口**。本端点补上它，只动 pnr / eticketNumber 两列 —— 不碰订单状态、
+  // 不碰履约任务、不碰开票三维布尔（开票是「出票进度」口径，与票号是两回事）。
+  //
+  // ⚠ 回填**不发**行程单邮件：票务边录边发，客人会收到一串改来改去的行程单。要发就走
+  //   订单详情既有的「重发行程单邮件」按钮，人点、人负责。
+  //
+  // 号的来源（沙箱自动 vs 人工回填）不落库、不加列 —— 靠这条审计区分。
+  app.patch(
+    '/:id/passengers/:passengerId/ticket',
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      const role = req.user.role;
+      if (!can(req, 'orders.passengers.write')) {
+        return reply.status(403).send({ error: '仅运营/管理员可回填票号' });
+      }
+      const { id, passengerId } = req.params as { id: string; passengerId: string };
+      const body = updatePassengerTicketBodySchema.parse(req.body);
+      const result = await service.updatePassengerTicket(id, passengerId, body, {
+        userId: req.user.sub,
+        role,
+      });
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'BACKFILL_PASSENGER_TICKET',
+        targetType: 'TRAVELER',
+        targetId: passengerId,
+        targetLabel: `${result.orderNumber} · ${result.passengerName}`,
+        before: result.before,
+        after: { ...result.after, changedFields: result.changedFields, note: body.note ?? null },
+        // 清空是破坏性的（票号一没，退票/对账就断了线索）→ WARNING；写入/订正是日常动作 → INFO。
+        severity: body.clear === true ? 'WARNING' : 'INFO',
+      });
+      return { passenger: result.passenger, changedFields: result.changedFields };
+    },
+  );
+
   // ── 建单后按人改自备签（ADMIN/STAFF）──
   // PATCH /orders/:id/passengers/:passengerId/visa-exempt  body: { visaExempt, note? }
   // 与换人通道分离的专用动作：同一个人改办签方式。套餐单由服务端按建单快照费率对称重算应收
@@ -2479,7 +2619,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     { preHandler: [app.authenticate] },
     async (req, reply) => {
       const role = req.user.role;
-      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      if (!can(req, 'orders.passengers.write')) {
         return reply.status(403).send({ error: '仅运营/管理员可改乘客自备签' });
       }
       const { id, passengerId } = req.params as { id: string; passengerId: string };
@@ -2524,7 +2664,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   app.patch('/:id/items/:itemId/hotel', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
     // 代理放行到 service：那里按「下单当天 + 自家单」判自助窗口，并把差价强制归 0。
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF && role !== UserRole.AGENT) {
+    if (!can(req, 'orders.hotel.swap')) {
       return reply.status(403).send({ error: '仅运营/管理员可换酒店' });
     }
     const { id, itemId } = req.params as { id: string; itemId: string };
@@ -2574,7 +2714,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 差额由可选的 feeCny 走售后费行（缺省名「酒店改期差价」）。
   app.patch('/:id/items/:itemId/hotel-reschedule', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.hotel.write')) {
       return reply.status(403).send({ error: '仅运营/管理员可改酒店入住日期' });
     }
     const { id, itemId } = req.params as { id: string; itemId: string };
@@ -2607,7 +2747,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 钱不动：新行 0 元、源行 amount 冻结 → order.total 恒等；库存对称：Σ roomsBilled 恒等。
   app.post(
     '/:id/items/:itemId/split-room-group',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.hotel.write')] },
     async (req) => {
       const { id, itemId } = req.params as { id: string; itemId: string };
       const body = splitRoomGroupBodySchema.parse(req.body);
@@ -2640,7 +2780,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 机票行/班次/座位一律不动；酒店已落位到真实酒店的单先走换酒店。AGENT 不可用。
   app.post(
     '/:id/change-bundle',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.change_bundle')] },
     async (req) => {
       const { id } = req.params as { id: string };
       const body = changeOrderBundleBodySchema.parse(req.body);
@@ -2675,7 +2815,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 财务不回溯：已发生的收款/余额抵扣/佣金按原归属保留，变更后新产生的按新归属。warning 保留为空以稳定 API 形状。
   app.patch('/:id/agent', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.agent.write')) {
       return reply.status(403).send({ error: '仅运营/管理员可更改订单归属代理' });
     }
     const { id } = req.params as { id: string };
@@ -2708,7 +2848,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   movedShareCny / movedPaidCny / hotelItems（供 UI 让运营填 roomSplit）。
   app.post('/:id/split-preview', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.split')) {
       return reply.status(403).send({ error: '仅运营/管理员可拆单' });
     }
     const { id } = req.params as { id: string };
@@ -2722,7 +2862,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   与守恒断言在 service 内完成。
   app.post('/:id/split', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.split')) {
       return reply.status(403).send({ error: '仅运营/管理员可拆单' });
     }
     const { id } = req.params as { id: string };
@@ -2742,7 +2882,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     (fixedLeg?: 'OUTBOUND' | 'RETURN') =>
     async (req: FastifyRequest, reply: FastifyReply) => {
       const role = req.user.role;
-      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      if (!can(req, 'orders.cancel_leg')) {
         return reply.status(403).send({ error: '仅运营/管理员可取消航段' });
       }
       const { id } = req.params as { id: string };
@@ -2767,7 +2907,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     (fixedLeg?: 'OUTBOUND' | 'RETURN') =>
     async (req: FastifyRequest, reply: FastifyReply) => {
       const role = req.user.role;
-      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      if (!can(req, 'orders.cancel_leg')) {
         return reply.status(403).send({ error: '仅运营/管理员可取消航段' });
       }
       const { id } = req.params as { id: string };
@@ -2837,7 +2977,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // POST /orders/:id/no-show/preview  body: { passengerIds? }
   app.post('/:id/no-show/preview', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.no_show')) {
       return reply.status(403).send({ error: '仅运营/管理员可标记 no-show' });
     }
     const { id } = req.params as { id: string };
@@ -2851,7 +2991,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   拆成了但标记失败回 409 SPLIT_DONE_NOSHOW_FAILED（details.newOrderId）。
   app.post('/:id/no-show', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.no_show')) {
       return reply.status(403).send({ error: '仅运营/管理员可标记 no-show' });
     }
     const { id } = req.params as { id: string };
@@ -2905,7 +3045,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   totalLines / processedLines / truncated，界面必须明说这次只看了前多少行。
   app.post('/no-show/batch-preview', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.no_show')) {
       return reply.status(403).send({ error: '仅运营/管理员可标记 no-show' });
     }
     const body = noShowBatchPreviewBodySchema.parse(req.body);
@@ -2917,7 +3057,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   uuid v5 派生 —— 整批重试会命中逐单的既有回放，座位绝不二次释放。
   app.post('/no-show/batch', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.no_show')) {
       return reply.status(403).send({ error: '仅运营/管理员可标记 no-show' });
     }
     const body = noShowBatchBodySchema.parse(req.body);
@@ -2992,6 +3132,115 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     return result;
   });
 
+  // ── 按航班批量回填真实 PNR / 电子票号（ADMIN/STAFF）──────────────────────────
+  //
+  // 票务出完票拿回一份名单，选班次贴进来（或直接传 .xlsx）→ 系统按护照号优先、姓名兜底
+  // 匹配到本班次乘客并把库里现有的号一并摆出来 → 勾选后一键写入。
+  // 与「按航班批量 no-show」同一套手感；但**只动 pnr / eticketNumber 两列**，
+  // 不碰订单状态、履约任务、开票三维布尔，也不发行程单邮件。
+  //
+  // POST /orders/tickets/batch-preview  body: { scheduleId, lines } 或 { scheduleId, fileBase64 }
+  //   只读：一个字段都不写库。响应把 matched / unmatched / ambiguous / invalid 四类分开摆，
+  //   matched 每条都带 currentPnr / currentEticketNumber 与 conflict 标记，
+  //   让票务先看清「这条是新填、原样重填、还是要覆盖一个不一样的号」。
+  app.post('/tickets/batch-preview', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (!can(req, 'orders.passengers.write')) {
+      return reply.status(403).send({ error: '仅运营/管理员可回填票号' });
+    }
+    const body = ticketBatchPreviewBodySchema.parse(req.body);
+    let lines = body.lines ?? '';
+    if (body.fileBase64 !== undefined) {
+      try {
+        // 表格与粘贴走同一个解析器：单元格用 Tab 拼成一行，再进 parseTicketRosterLines。
+        lines = (await parseTicketRosterXlsx(body.fileBase64)).join('\n');
+      } catch (e) {
+        // 坏文件/超大/.xls/空表 → 400 带中文原因（绝不 500）。
+        throw new BadRequestError(
+          e instanceof TicketRosterError
+            ? e.message
+            : '表格文件无法解析，请确认为有效的 .xlsx 文件（旧 .xls 请先另存为 .xlsx）',
+        );
+      }
+    }
+    return previewTicketBatch({}, { scheduleId: body.scheduleId, lines }, {
+      userId: req.user.sub,
+      role,
+    });
+  });
+
+  // POST /orders/tickets/batch  body: { requestToken, scheduleId, entries, note? }
+  //   幂等靠**写值本身**：库里已经是这个号就一个字段都不写，本条如实回 changedFields: []。
+  //   requestToken 不加锁，只作整批关联号落进审计（同一批重试在审计里认得出是同一批）。
+  //   库里已有**不同**的号时必须逐条带 overwrite:true 才覆盖，否则回 TICKET_CONFLICT 跳过。
+  app.post('/tickets/batch', { preHandler: [app.authenticate] }, async (req, reply) => {
+    const role = req.user.role;
+    if (!can(req, 'orders.passengers.write')) {
+      return reply.status(403).send({ error: '仅运营/管理员可回填票号' });
+    }
+    const body = ticketBatchBodySchema.parse(req.body);
+    const result = await executeTicketBatch({}, body, { userId: req.user.sub, role });
+
+    // 整批一条 WARNING 审计：事后要能一眼看出「哪一班、灌了多少条、成了几条、真改了几条」。
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'BACKFILL_PASSENGER_TICKET_BATCH',
+      // 整批的对象是**一个班次**，不是某一张单。AuditTargetType 没有 FLIGHT_SCHEDULE，
+      // 用 FLIGHT + scheduleId（口径同 MARK_NO_SHOW_BATCH）。
+      targetType: 'FLIGHT',
+      targetId: body.scheduleId,
+      targetLabel:
+        `按航班批量回填票号 · ${body.entries.length} 条 · ` +
+        `成功 ${result.summary.ok} / 失败 ${result.summary.failed} · ` +
+        `实际改动 ${result.summary.changed} 条`,
+      after: {
+        scheduleId: body.scheduleId,
+        requestToken: body.requestToken,
+        entryCount: body.entries.length,
+        ok: result.summary.ok,
+        failed: result.summary.failed,
+        changed: result.summary.changed,
+        /** 处理成功但库里本来就是这个号的条数（重发同一批时它会等于成功数）。 */
+        unchanged: result.summary.unchanged,
+        note: body.note ?? null,
+        // 失败明细进审计：事后追「那天为什么这几条没灌上」不必再翻日志。
+        failures: result.results
+          .filter((r) => !r.ok)
+          .map((r) => ({ orderNumber: r.orderNumber, code: r.code ?? null, error: r.error })),
+      },
+      severity: 'WARNING',
+    });
+
+    // 逐条审计：与单人端点落**同一个** action，出行人维度的审计流水不因为「是批量灌的」而缺一段。
+    for (const r of result.results) {
+      // 一个字段都没变的条目不落审计：这一次库里什么都没动，写一条只会让流水上凭空多出
+      // 几条「又填了一次票号」，事后复盘时把重发看成真操作。
+      if (!r.ok || r.changedFields.length === 0) continue;
+      const entry = body.entries.find((e) => e.passengerId === r.passengerId);
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'BACKFILL_PASSENGER_TICKET',
+        targetType: 'TRAVELER',
+        targetId: r.passengerId,
+        targetLabel: `${r.orderNumber} · ${r.fullName}`,
+        after: {
+          batch: true,
+          scheduleId: body.scheduleId,
+          requestToken: body.requestToken,
+          orderId: r.orderId,
+          pnr: entry?.pnr ?? null,
+          eticketNumber: entry?.eticketNumber ?? null,
+          changedFields: r.changedFields,
+          overwrite: entry?.overwrite === true,
+          note: body.note ?? null,
+        },
+        severity: 'INFO',
+      });
+    }
+
+    return result;
+  });
+
   // ── no-show 报表（ADMIN/STAFF；AGENT 不放行）────────────────────────────────
   // 区间按**去程航班的起飞地当地日**取。代理不放行：这张表是整班的库存/超售台账，
   // 跨代理汇总，放开等于把同行的 no-show 情况交出去。
@@ -2999,7 +3248,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // GET /orders/no-show/report?from&to
   app.get(
     '/no-show/report',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.no_show')] },
     async (req) => {
       const { from, to } = noShowReportQuerySchema.parse(req.query);
       const { rows, totals } = await loadNoShowReport(from, to, {
@@ -3026,7 +3275,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // GET /orders/no-show/report/export?from&to → xlsx（汇总 + 逐单明细两个 sheet）
   app.get(
     '/no-show/report/export',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.no_show')] },
     async (req, reply) => {
       const { from, to } = noShowReportQuerySchema.parse(req.query);
       const buf = await buildNoShowReportWorkbook(from, to, {
@@ -3065,7 +3314,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     { preHandler: [app.authenticate] },
     async (req, reply) => {
       const role = req.user.role;
-      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+      if (!can(req, 'orders.cancel_leg')) {
         return reply.status(403).send({ error: '仅运营/管理员可恢复回程' });
       }
       const { id } = req.params as { id: string };
@@ -3078,7 +3327,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   前端弹二次确认后带 allowOversell=true 重提。超售放行按最高等级留痕。
   app.post('/:id/restore-return-leg', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.cancel_leg')) {
       return reply.status(403).send({ error: '仅运营/管理员可恢复回程' });
     }
     const { id } = req.params as { id: string };
@@ -3128,7 +3377,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // POST /orders/:id/void-return-leg/preview
   app.post('/:id/void-return-leg/preview', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.cancel_leg')) {
       return reply.status(403).send({ error: '仅运营/管理员可作废回程' });
     }
     const { id } = req.params as { id: string };
@@ -3138,7 +3387,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // POST /orders/:id/void-return-leg  body: { requestToken, note? }
   app.post('/:id/void-return-leg', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.cancel_leg')) {
       return reply.status(403).send({ error: '仅运营/管理员可作废回程' });
     }
     const { id } = req.params as { id: string };
@@ -3181,7 +3430,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 前端提示运营到新单上重试；同 requestToken 重试幂等（拆单回放 + 已改则不重复收差价）。
   app.post('/:id/reschedule-passengers', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.reschedule')) {
       return reply.status(403).send({ error: '仅运营/管理员可按人改期' });
     }
     const { id } = req.params as { id: string };
@@ -3238,7 +3487,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 仅含 BUNDLE/HOTEL 行的订单可用（纯机票单无住宿 → 400）。
   app.post('/:id/room-supplement', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.hotel.write')) {
       return reply.status(403).send({ error: '仅运营/管理员可补收单房差' });
     }
     const { id } = req.params as { id: string };
@@ -3273,7 +3522,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 售价缺省时由后端按产品 costPriceCny 带出；收入与成本快照分开落库。
   app.post('/:id/items/ground', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.add_ground_item')) {
       return reply.status(403).send({ error: '仅运营/管理员可补录签证或房费' });
     }
     const { id } = req.params as { id: string };
@@ -3311,7 +3560,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   走与录单调价同一路径：追加一条 priceAdjustment 差额行，金额进 subtotal/total（订单总额 = 系统价 + Σ调整）。
   app.post('/:id/price-adjustment', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (!can(req, 'orders.price_adjust')) {
       return reply.status(403).send({ error: '仅运营/管理员可调整订单价格' });
     }
     const { id } = req.params as { id: string };

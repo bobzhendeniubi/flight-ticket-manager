@@ -15,13 +15,22 @@ import {
   OrderChangeRequestStatus,
   OrderItemKind,
   Prisma,
+  StaffRole,
   UserRole,
   VisaRequirement,
 } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { prisma } from '../../db/prisma.js';
-import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
+import {
+  AppError,
+  BadRequestError,
+  ConflictError,
+  ForbiddenError,
+  NotFoundError,
+} from '../../lib/errors.js';
 import { getDescendantAgentIds } from '../../lib/agent-tree.js';
+import { hasCapability, type Capability } from '../../lib/capabilities.js';
+import { isFeatureEnabled } from '../../lib/feature-flags.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { determineFlightLegItems } from '../orders/ticketing-cap.js';
 import {
@@ -33,9 +42,13 @@ import {
 } from '../orders/orders.service.js';
 import {
   cabinChangeSubmitSchema,
+  cancelLegChangeSubmitSchema,
   flightChangeSubmitSchema,
   hotelChangeSubmitSchema,
+  isFlaggedOrderChangeKind,
+  splitChangeSubmitSchema,
   visaChangeSubmitSchema,
+  visaExemptChangeSubmitSchema,
   type BatchApproveOrderChangeRequestBody,
   type BatchOrderChangeRequestBody,
   type CreateOrderChangeRequestBody,
@@ -48,6 +61,23 @@ export const ORDER_CHANGE_DUPLICATE_PENDING_MESSAGE = '该订单已有待处理�
 export const ORDER_CHANGE_VISA_HAS_VISA_MESSAGE = '「已签证」由签证岗确认，改单申请里改不了';
 export const ORDER_CHANGE_BATCH_UNSUPPORTED_KIND_MESSAGE =
   '换酒店 / 升舱要按行选，只能单张单提交，不支持批量';
+/**
+ * flag 关着时三类扩展一律拒 —— **含运营代提**。
+ *
+ * 只拦代理不拦运营等于「关着的时候还是有一条路能走通」：一旦运营从队列里确认执行，
+ * 订单照样被拆 / 被取消航段 / 被改自备签，口径还没拍板就先有了既成事实。
+ * 关 = 零行为变化，这是这个 flag 唯一的意义。
+ */
+export const ORDER_CHANGE_EXTRA_KIND_DISABLED_MESSAGE =
+  '拆单 / 取消单程 / 改自备签的改单申请尚未开放，请联系我们的操作人员处理';
+/** 稳定 code，前端据此判「功能没开」而不是靠中文文案匹配。 */
+export const ORDER_CHANGE_FEATURE_DISABLED_CODE = 'FEATURE_DISABLED';
+/** 改自备签的确认只放行管理员与签证岗（驳回不限岗位——驳回不动订单）。 */
+export const ORDER_CHANGE_VISA_EXEMPT_DESK_ONLY_MESSAGE =
+  '改自备签的申请要由签证岗确认（其他岗位可以驳回）';
+/** 三类扩展都要按单选人 / 选航段，批量给不出这些信息。 */
+export const ORDER_CHANGE_BATCH_EXTRA_KIND_MESSAGE =
+  '拆单 / 取消单程 / 改自备签要逐单选人、选航段，只能单张单提交，不支持批量';
 export const ORDER_CHANGE_REQUEST_REASON_TEXT = '改单申请（运营确认）';
 /**
  * 确认执行的处理中占位有效期：超过视为上次执行中途挂掉，允许再次确认。
@@ -80,6 +110,11 @@ const VISA_LABEL: Record<VisaRequirement, string> = {
   [VisaRequirement.HAS_VISA]: '已签证',
 };
 
+const LEG_LABEL: Record<'OUTBOUND' | 'RETURN', string> = {
+  OUTBOUND: '去程',
+  RETURN: '回程',
+};
+
 const CABIN_LABEL: Record<CabinClass, string> = {
   [CabinClass.ECONOMY]: '经济舱',
   [CabinClass.PREMIUM_ECONOMY]: '超级经济舱',
@@ -91,6 +126,28 @@ export interface OrderChangeRequestActor {
   userId: string;
   role: UserRole;
   agentId?: string;
+  /**
+   * 内部岗位（仅 role=STAFF 有意义）。逐请求从 User 表取回（authenticate 写进 req.staffRole），
+   * 改岗后下一个请求即生效。目前只有「确认改自备签申请」这一处判它。
+   */
+  staffRole?: StaffRole | null;
+}
+
+/** 本文件内联闸的唯一入口，与路由层的 requireCapability 同一张表（lib/capabilities.ts）。 */
+function actorCan(actor: OrderChangeRequestActor, cap: Capability): boolean {
+  return hasCapability({ role: actor.role, staffRole: actor.staffRole }, cap);
+}
+
+/**
+ * 借运营身份跑三个动作各自的只读预检。
+ *
+ * previewOrderSplit / previewCancelLeg 对 actor 只做一件事：role 必须是 ADMIN/STAFF，
+ * 既不按 actor 收窄可见范围，也不写任何东西。而调用点都在归属闸之后
+ * （assertOwnOrderForExtraKind 判过「是不是自家单」），所以按运营身份读同一套准入闸，
+ * 比在这里另抄一份规则安全得多。
+ */
+function assessAsOps(actor: OrderChangeRequestActor): { userId: string; role: UserRole } {
+  return { userId: actor.userId, role: UserRole.STAFF };
 }
 
 /** 提交时要读的订单形状：够拼快照与摘要，不多读一列。 */
@@ -170,6 +227,19 @@ function readPayloadNumber(payload: Prisma.JsonValue, key: string): number | nul
   return typeof value === 'number' && Number.isFinite(value) ? value : null;
 }
 
+/** payload 里读一个字符串数组；不是数组 / 混了非字符串一律滤掉（余下交给通道自己报错）。 */
+function readStringArray(value: unknown): string[] {
+  if (!Array.isArray(value)) return [];
+  return value.filter((v): v is string => typeof v === 'string');
+}
+
+/** payload 里的备注：空 / 缺省回落到统一的「改单申请（运营确认）」，让审计里认得出来路。 */
+function readNote(value: unknown): string {
+  return typeof value === 'string' && value.trim()
+    ? value.trim()
+    : ORDER_CHANGE_REQUEST_REASON_TEXT;
+}
+
 /** 代理侧的 payload：抹掉成本快照键（我方进价，对外身份一个字都不给）。 */
 function stripOpsOnlyPayload(payload: Prisma.JsonValue): Prisma.JsonValue {
   if (payload == null || typeof payload !== 'object' || Array.isArray(payload)) return payload;
@@ -224,7 +294,7 @@ function serializeOrderChangeRequest(
 
 /** 运营（含管理员）才看得到成本。 */
 function canSeeCost(actor: OrderChangeRequestActor): boolean {
-  return actor.role === UserRole.ADMIN || actor.role === UserRole.STAFF;
+  return actorCan(actor, 'change_requests.view_cost');
 }
 
 /** 金额千分位（¥4,800）：摘要是给人看的，别把裸数字甩上去。 */
@@ -244,6 +314,34 @@ export type SerializedOrderChangeRequest = ReturnType<typeof serializeOrderChang
 interface ResolvedChange {
   payload: Prisma.InputJsonObject;
   summary: string;
+}
+
+/**
+ * 三类扩展的预检结果（提交闸与预检端点同一份）。
+ *
+ * 字段一律是**卖价侧 / 提示侧**的东西，一个进价字段都没有 —— 代理看得到它。
+ * 取消航段的预估退款是「按当下取消政策算出来的数」，不是承诺：真金额在确认那一刻重算。
+ */
+export interface ExtraKindAssessment {
+  kind: OrderChangeKind;
+  eligible: boolean;
+  blockers: string[];
+  warnings: string[];
+  cancelLeg: {
+    leg: 'OUTBOUND' | 'RETURN';
+    legLabel: string;
+    flightNumber: string | null;
+    departDate: string | null;
+    /** 预估退款（元）= 该段金额 − 取消政策手续费。 */
+    refundCny: number;
+    policyName: string | null;
+    /** true = 有需要回执的提示（如该段已出票），确认时运营要勾「我已知悉」才放行。 */
+    requiresAcknowledgement: boolean;
+  } | null;
+  split: {
+    movedShareCny: number;
+    shares: Array<{ passengerId: string; fullName: string; shareCny: number }>;
+  } | null;
 }
 
 type SubmitOrder = Prisma.OrderGetPayload<{ select: typeof SUBMIT_ORDER_SELECT }>;
@@ -271,7 +369,7 @@ export class OrderChangeRequestsService {
   }
 
   private assertOps(actor: OrderChangeRequestActor, what: string): void {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'change_requests.decide')) {
       throw new ForbiddenError(`仅运营/管理员可${what}改单申请`);
     }
   }
@@ -287,12 +385,55 @@ export class OrderChangeRequestsService {
     orderId: string,
     body: CreateOrderChangeRequestBody,
   ): Promise<SerializedOrderChangeRequest> {
+    await this.assertKindEnabled(body.kind);
     const ownAgentId = await this.resolveSubmitterAgentId(actor);
+    // 三类扩展的准入闸：跑各自动作的只读预检，有 blocker 当场说清楚，不攒执行不了的申请。
+    // （放在事务外：预检要读佣金/退款/改档申请等一串表，塞进行锁里只会把锁按得更久。
+    //   权威的归属与状态判定仍在 insertRequest 的行锁内重跑。）
+    if (isFlaggedOrderChangeKind(body.kind)) {
+      await this.assertExtraKindEligible(actor, ownAgentId, orderId, body.kind, body.payload);
+    }
     const created = await this.insertRequest(actor, ownAgentId, orderId, body.kind, body.payload, {
       note: body.note,
       batchId: null,
     });
     return serializeOrderChangeRequest(created, { canSeeCost: canSeeCost(actor) });
+  }
+
+  /** flag 关着 → 三类扩展一律 403 FEATURE_DISABLED（代理与运营同拒）。 */
+  private async assertKindEnabled(kind: OrderChangeKind): Promise<void> {
+    if (!isFlaggedOrderChangeKind(kind)) return;
+    const enabled = await isFeatureEnabled(prisma, 'AGENT_CHANGE_REQUEST_EXTRA_KINDS');
+    if (!enabled) {
+      throw new AppError(ORDER_CHANGE_EXTRA_KIND_DISABLED_MESSAGE, {
+        statusCode: 403,
+        code: ORDER_CHANGE_FEATURE_DISABLED_CODE,
+      });
+    }
+  }
+
+  /** flag 开着时，当前身份能提哪几类（前端据此决定下拉里出不出这三项）。 */
+  async availableKinds(actor: OrderChangeRequestActor): Promise<{ kinds: OrderChangeKind[] }> {
+    if (!actorCan(actor, 'change_requests.submit')) {
+      throw new ForbiddenError('无权限查看改单申请');
+    }
+    const base: OrderChangeKind[] = [
+      OrderChangeKind.FLIGHT,
+      OrderChangeKind.VISA,
+      OrderChangeKind.HOTEL,
+      OrderChangeKind.CABIN,
+    ];
+    const extraEnabled = await isFeatureEnabled(prisma, 'AGENT_CHANGE_REQUEST_EXTRA_KINDS');
+    return {
+      kinds: extraEnabled
+        ? [
+            ...base,
+            OrderChangeKind.SPLIT,
+            OrderChangeKind.CANCEL_LEG,
+            OrderChangeKind.VISA_EXEMPT,
+          ]
+        : base,
+    };
   }
 
   /**
@@ -314,9 +455,16 @@ export class OrderChangeRequestsService {
       reason?: string;
     }>;
   }> {
+    // flag 先判：关着的时候错误话术要是「尚未开放」，而不是「不支持批量」。
+    await this.assertKindEnabled(body.kind);
     // 换酒店 / 升舱要按「哪一行」选，批量给不出这个信息，直接拒。
     if (body.kind === OrderChangeKind.HOTEL || body.kind === OrderChangeKind.CABIN) {
       throw new BadRequestError(ORDER_CHANGE_BATCH_UNSUPPORTED_KIND_MESSAGE);
+    }
+    // 三类扩展同理，而且更硬：拆单要选人、取消航段要选段、改自备签要选人，
+    // 一批单套同一份 payload 必然张冠李戴（乘客 id 根本不属于其它单）。
+    if (isFlaggedOrderChangeKind(body.kind)) {
+      throw new BadRequestError(ORDER_CHANGE_BATCH_EXTRA_KIND_MESSAGE);
     }
     const ownAgentId = await this.resolveSubmitterAgentId(actor);
     const batchId = randomUUID();
@@ -367,7 +515,7 @@ export class OrderChangeRequestsService {
   /** 提交人身份：AGENT 拿到自己的 agentId（后面按它比归属）；运营返回 null（可代提）。 */
   private async resolveSubmitterAgentId(actor: OrderChangeRequestActor): Promise<string | null> {
     if (actor.role === UserRole.AGENT) return this.resolveOwnAgentId(actor.userId);
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'change_requests.submit')) {
       throw new ForbiddenError('无权限提交改单申请');
     }
     return null;
@@ -433,6 +581,148 @@ export class OrderChangeRequestsService {
     }
   }
 
+  // ── 三类扩展的准入预检（提交闸与预检端点共用同一份，不各写一套）──────────────
+
+  /**
+   * 归属前置闸：代理拿别家单号来跑预检时直接拒，不让 blockers 文案变成
+   * 「别人订单现在什么状态」的探针。权威判定仍在 insertRequest 的行锁里。
+   */
+  private async assertOwnOrderForExtraKind(
+    ownAgentId: string | null,
+    orderId: string,
+  ): Promise<void> {
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: { agentId: true, deletedAt: true },
+    });
+    if (!order || order.deletedAt) throw new NotFoundError('订单不存在');
+    // ownAgentId 为 null = 运营代提，不收窄（与 insertRequest 同一条口径）。
+    if (ownAgentId && order.agentId !== ownAgentId) {
+      throw new ForbiddenError('只能对自己名下的订单提交改单申请');
+    }
+  }
+
+  /**
+   * 跑三类扩展各自的准入闸，一次性返回全部不满足项（不命中第一条就停）。
+   *
+   * SPLIT / CANCEL_LEG 直接调拆单、取消航段自己的只读预检 —— 那两套闸各有十来条
+   * （回收站 / 占座态 / 资金处置 / 佣金进结算 / 退款中 / 多套餐行 / 各类待处理申请 /
+   * 预存抵扣 / 回程已释放…），在这里抄一份必然抄漏，且随时会与本体漂移。
+   * VISA_EXEMPT 没有对应的只读预检，只做「人在不在本单、值是不是已经一样」这类
+   * 解析级判定；送签进度、结算锁、开票闸那些深层闸留给确认那一刻由通道自己报
+   * （与 FLIGHT / HOTEL 的深层闸同一口径：提交只快照，执行才见真章）。
+   */
+  private async collectExtraKindAssessment(
+    actor: OrderChangeRequestActor,
+    orderId: string,
+    kind: OrderChangeKind,
+    rawPayload: Record<string, unknown>,
+  ): Promise<ExtraKindAssessment> {
+    switch (kind) {
+      case OrderChangeKind.SPLIT: {
+        const input = splitChangeSubmitSchema.parse(rawPayload);
+        const preview = await this.orders.previewOrderSplit(
+          orderId,
+          { passengerIds: input.passengerIds },
+          assessAsOps(actor),
+        );
+        return {
+          kind,
+          eligible: preview.eligible,
+          blockers: preview.blockers,
+          warnings: preview.warnings,
+          cancelLeg: null,
+          split: { movedShareCny: preview.movedShareCny, shares: preview.shares },
+        };
+      }
+      case OrderChangeKind.CANCEL_LEG: {
+        const input = cancelLegChangeSubmitSchema.parse(rawPayload);
+        const preview = await this.orders.previewCancelLeg(orderId, input.leg, assessAsOps(actor));
+        return {
+          kind,
+          eligible: preview.eligible,
+          blockers: preview.blockers,
+          warnings: preview.warnings,
+          cancelLeg: {
+            leg: input.leg,
+            legLabel: LEG_LABEL[input.leg],
+            flightNumber: preview.returnItem?.flightNumber ?? null,
+            departDate: preview.returnItem?.departDate ?? null,
+            // 预估退款 = 该段金额 − 取消政策手续费（与运营弹窗看到的是同一个数）。
+            refundCny: preview.netReductionCny,
+            policyName: preview.policyFee?.policyName ?? null,
+            requiresAcknowledgement: preview.requiresAcknowledgement,
+          },
+          split: null,
+        };
+      }
+      case OrderChangeKind.VISA_EXEMPT: {
+        const input = visaExemptChangeSubmitSchema.parse(rawPayload);
+        const blockers: string[] = [];
+        const order = await prisma.order.findUnique({
+          where: { id: orderId },
+          select: { status: true, deletedAt: true },
+        });
+        if (!order || order.deletedAt) throw new NotFoundError('订单不存在');
+        if (!SEAT_HOLDING_STATUSES.includes(order.status)) {
+          blockers.push(
+            `订单当前状态（${ORDER_STATUS_LABEL_ZH[order.status] ?? order.status}）不可改自备签。`,
+          );
+        }
+        const passenger = await prisma.passenger.findUnique({
+          where: { id: input.passengerId },
+          select: { orderId: true, visaExempt: true },
+        });
+        if (!passenger || passenger.orderId !== orderId) {
+          blockers.push('所选出行人不属于本订单，请刷新后重试。');
+        } else if (passenger.visaExempt === input.visaExempt) {
+          blockers.push(`该出行人已经是「${input.visaExempt ? '自备签' : '随团办签'}」，无需申请。`);
+        }
+        return {
+          kind,
+          eligible: blockers.length === 0,
+          blockers,
+          warnings: [],
+          cancelLeg: null,
+          split: null,
+        };
+      }
+      default:
+        throw new BadRequestError('该改单类型不需要预检');
+    }
+  }
+
+  /** 提交前的硬闸：预检不过 → 400，把全部 blocker 原样带给提交方。 */
+  private async assertExtraKindEligible(
+    actor: OrderChangeRequestActor,
+    ownAgentId: string | null,
+    orderId: string,
+    kind: OrderChangeKind,
+    rawPayload: Record<string, unknown>,
+  ): Promise<void> {
+    await this.assertOwnOrderForExtraKind(ownAgentId, orderId);
+    const assessment = await this.collectExtraKindAssessment(actor, orderId, kind, rawPayload);
+    if (!assessment.eligible) throw new BadRequestError(assessment.blockers.join(' '));
+  }
+
+  /**
+   * 预检端点：三类扩展提交前，把 blockers 与预估退款 / 份额摆给提交方看。
+   * 代理侧「取消单程要显示预估退款」靠的就是这个 —— 取消航段本体的预检端点只对运营开放，
+   * 不能把那条路直接放给代理（它连同成本口径的字段一并返回）。
+   */
+  async previewExtraKind(
+    actor: OrderChangeRequestActor,
+    orderId: string,
+    kind: OrderChangeKind,
+    rawPayload: Record<string, unknown>,
+  ): Promise<ExtraKindAssessment> {
+    await this.assertKindEnabled(kind);
+    if (!isFlaggedOrderChangeKind(kind)) throw new BadRequestError('该改单类型不需要预检');
+    const ownAgentId = await this.resolveSubmitterAgentId(actor);
+    await this.assertOwnOrderForExtraKind(ownAgentId, orderId);
+    return this.collectExtraKindAssessment(actor, orderId, kind, rawPayload);
+  }
+
   // ── 各 kind 的入参解析 + 原值快照 ─────────────────────────────────────────
 
   private async resolveChange(
@@ -450,9 +740,118 @@ export class OrderChangeRequestsService {
         return this.resolveHotelChange(tx, order, rawPayload);
       case OrderChangeKind.CABIN:
         return this.resolveCabinChange(order, rawPayload);
+      case OrderChangeKind.SPLIT:
+        return this.resolveSplitChange(tx, order, rawPayload);
+      case OrderChangeKind.CANCEL_LEG:
+        return this.resolveCancelLegChange(order, rawPayload);
+      case OrderChangeKind.VISA_EXEMPT:
+        return this.resolveVisaExemptChange(tx, order, rawPayload);
       default:
         throw new BadRequestError('未知的改单类型');
     }
+  }
+
+  /**
+   * 拆单：把要拆出去的人记下来，并**在提交这一刻生成 requestToken**。
+   *
+   * token 落在 payload 里而不是确认时现生成：拆单本体按 (源单, token) 幂等，
+   * 同一条申请被点两次确认时第二次只回放既有结果，绝不会拆出第二张新单。
+   * 确认时现生成等于每次重试都是一个新 token —— 幂等键形同虚设。
+   */
+  private async resolveSplitChange(
+    tx: Prisma.TransactionClient,
+    order: SubmitOrder,
+    rawPayload: Record<string, unknown>,
+  ): Promise<ResolvedChange> {
+    const input = splitChangeSubmitSchema.parse(rawPayload);
+    const passengerIds = Array.from(new Set(input.passengerIds));
+    if (passengerIds.length !== input.passengerIds.length) {
+      throw new BadRequestError('拆出乘客列表中有重复项，请刷新后重试');
+    }
+    const roster = await tx.passenger.findMany({
+      where: { orderId: order.id },
+      select: { id: true, fullName: true, chineseName: true },
+    });
+    const picked = passengerIds.map((id) => {
+      const row = roster.find((p) => p.id === id);
+      if (!row) {
+        throw new BadRequestError('所选乘客不属于本订单（可能已被换人/拆走），请刷新后重试');
+      }
+      return row;
+    });
+    if (picked.length >= roster.length) {
+      throw new BadRequestError('至少要留 1 位乘客在原订单；整单转移请走改归属');
+    }
+    const names = picked.map((p) => p.chineseName || p.fullName);
+    return {
+      payload: {
+        passengerIds,
+        requestToken: randomUUID(),
+        note: input.note?.trim() || null,
+      },
+      summary: `拆出 ${picked.length} 人：${names.join('、')}`,
+    };
+  }
+
+  /**
+   * 取消单程航段：只记哪一段。**不快照金额** —— 退多少一律由取消政策在确认那一刻算，
+   * 提交时写一个数进去只会变成「申请上写 ¥3000、实际退了 ¥2800」的纠纷源。
+   * 预估退款走预检端点（同一套报价），看的是当下的数，不冒充承诺。
+   */
+  private resolveCancelLegChange(
+    order: SubmitOrder,
+    rawPayload: Record<string, unknown>,
+  ): ResolvedChange {
+    const input = cancelLegChangeSubmitSchema.parse(rawPayload);
+    // 复用改班次那套按航段定位（含「本单有已释放航段就一律拒，绝不猜」的闸）。
+    const { item, legLabel } = this.resolveFlightItem(order, { leg: input.leg });
+    const departureLocal = item.flightSchedule
+      ? localDateISO(item.flightSchedule.departureTime, item.flightSchedule.departureTz)
+      : null;
+    const flightNo = item.flightSchedule?.flight.flightNumber ?? null;
+    const what = [flightNo, departureLocal].filter(Boolean).join(' ');
+    return {
+      payload: {
+        leg: input.leg,
+        itemId: item.id,
+        flightNo,
+        departureLocal,
+        requestToken: randomUUID(),
+        note: input.note?.trim() || null,
+      },
+      summary: `取消${legLabel}${what ? ` ${what}` : ''}（退款按取消政策计算）`,
+    };
+  }
+
+  /** 按人改自备签：记人 + 目标值 + 原值快照。 */
+  private async resolveVisaExemptChange(
+    tx: Prisma.TransactionClient,
+    order: SubmitOrder,
+    rawPayload: Record<string, unknown>,
+  ): Promise<ResolvedChange> {
+    const input = visaExemptChangeSubmitSchema.parse(rawPayload);
+    const passenger = await tx.passenger.findUnique({
+      where: { id: input.passengerId },
+      select: { id: true, orderId: true, fullName: true, chineseName: true, visaExempt: true },
+    });
+    if (!passenger || passenger.orderId !== order.id) {
+      throw new BadRequestError('所选出行人不属于本订单');
+    }
+    if (passenger.visaExempt === input.visaExempt) {
+      throw new BadRequestError(
+        `该出行人已经是「${input.visaExempt ? '自备签' : '随团办签'}」，无需申请`,
+      );
+    }
+    const name = passenger.chineseName || passenger.fullName;
+    return {
+      payload: {
+        passengerId: passenger.id,
+        visaExempt: input.visaExempt,
+        fromVisaExempt: passenger.visaExempt,
+        note: input.note?.trim() || null,
+      },
+      summary: `${name} 改为${input.visaExempt ? '自备签' : '随团办签'}`,
+    };
   }
 
   /** 按 itemId 或按航段（去程/回程）定位到本单的一条机票行。 */
@@ -751,6 +1150,9 @@ export class OrderChangeRequestsService {
       if (row.status !== OrderChangeRequestStatus.PENDING) {
         throw new ConflictError(`该申请当前状态为 ${row.status}，不可重复处理`);
       }
+      // 判岗要在**占位之前**：抛在这里整个事务回滚，不会留下一条「处理中」的死占位
+      // 让别人干等 5 分钟 TTL。
+      if (row.kind === OrderChangeKind.VISA_EXEMPT) this.assertVisaDeskForVisaExempt(actor);
       // 处理中标记：status 仍是 PENDING（「一单一类一条待处理」的部分唯一索引在执行期间照样生效），
       // 只用 decidedAt 占位；占位超过 APPROVE_CLAIM_TTL_MS 视为上次执行中途挂掉，允许重试。
       if (row.decidedAt && Date.now() - row.decidedAt.getTime() < APPROVE_CLAIM_TTL_MS) {
@@ -792,11 +1194,16 @@ export class OrderChangeRequestsService {
     const alreadyApplied = await this.detectAlreadyApplied(claim.orderId, claim.kind, claim.payload);
 
     let order: unknown;
+    // 执行侧回带的一句话（目前只有拆单用：拆出来的新单号必须让提交方看得见，
+    // 否则代理只知道「批了」，不知道人被拆到哪张单上）。
+    let resultNote: string | undefined;
     if (alreadyApplied) {
       order = await this.orders.getOrder(claim.orderId, opsActor);
     } else {
       try {
-        order = await this.execute(claim.orderId, claim.kind, claim.payload, actor, body);
+        const executed = await this.execute(claim.orderId, claim.kind, claim.payload, actor, body);
+        order = executed.order;
+        resultNote = executed.resultNote;
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         // 没执行成 → 撤掉处理中标记、把原因记下来，申请原样留在队列里（状态一直是 PENDING）。
@@ -804,15 +1211,25 @@ export class OrderChangeRequestsService {
           where: { id, status: OrderChangeRequestStatus.PENDING, appliedAt: null },
           data: { decidedById: null, decidedAt: null, decisionNote: null, applyError: message },
         });
-        throw new BadRequestError(message);
+        // 状态码统一收成 400（既有契约：确认失败一律 400，申请留在 PENDING），
+        // 但底层通道的**稳定 code 原样带出** —— 取消航段的 ACKNOWLEDGEMENT_REQUIRED
+        // 就靠它让前端弹「我已知悉」二次确认。裹成通用 BAD_REQUEST 的话，前端只能回去
+        // 匹配中文文案，文案一改就失灵。
+        throw new AppError(message, {
+          statusCode: 400,
+          code: err instanceof AppError ? err.code : 'BAD_REQUEST',
+          details: err instanceof AppError ? err.details : undefined,
+        });
       }
     }
 
     // 幂等分支要把「这次没真执行」写进备注（运营在队列里一眼看得出）；
-    // 正常分支的备注在占位那一步已经写过，这里不重复覆盖。
+    // 有结果备注的分支（拆单）把新单号并进去。两者都没有时不覆盖 —— 占位那一步已写过运营的备注。
     const decisionNoteOverride = alreadyApplied
       ? [ORDER_CHANGE_ALREADY_APPLIED_NOTE, body.decisionNote?.trim()].filter(Boolean).join('；')
-      : undefined;
+      : resultNote
+        ? [resultNote, body.decisionNote?.trim()].filter(Boolean).join('；')
+        : undefined;
     await this.finalizeApproved(id, decisionNoteOverride);
 
     const finalRow = (await prisma.orderChangeRequest.findUniqueOrThrow({
@@ -881,6 +1298,16 @@ export class OrderChangeRequestsService {
     kind: OrderChangeKind,
     payload: Record<string, unknown>,
   ): Promise<boolean> {
+    // 三类扩展各自带幂等，重试由底层通道自己收口，这里不另做「已生效」判定：
+    //   · 拆单 / 取消航段 —— 按 (订单, requestToken) 回放，token 在提交那一刻就定死了；
+    //   · 改自备签 —— 目标值与现值相同即短路（不写审计不动钱）。
+    if (
+      kind === OrderChangeKind.SPLIT ||
+      kind === OrderChangeKind.CANCEL_LEG ||
+      kind === OrderChangeKind.VISA_EXEMPT
+    ) {
+      return false;
+    }
     if (kind === OrderChangeKind.VISA) {
       const order = await prisma.order.findUnique({
         where: { id: orderId },
@@ -963,7 +1390,7 @@ export class OrderChangeRequestsService {
     payload: Record<string, unknown>,
     actor: OrderChangeRequestActor,
     body: DecideOrderChangeRequestBody,
-  ): Promise<unknown> {
+  ): Promise<{ order: unknown; resultNote?: string }> {
     const opsActor = { userId: actor.userId, role: actor.role, agentId: actor.agentId };
     switch (kind) {
       case OrderChangeKind.FLIGHT: {
@@ -974,7 +1401,7 @@ export class OrderChangeRequestsService {
           String(payload.newScheduleId),
           opsActor,
         );
-        return order;
+        return { order };
       }
       case OrderChangeKind.VISA: {
         const { order } = await this.orders.setOrderVisaStatus(
@@ -982,7 +1409,7 @@ export class OrderChangeRequestsService {
           payload.toVisaStatus as VisaRequirement,
           opsActor,
         );
-        return order;
+        return { order };
       }
       case OrderChangeKind.HOTEL: {
         const { order } = await this.orders.swapItemHotel(
@@ -1001,7 +1428,7 @@ export class OrderChangeRequestsService {
           },
           opsActor,
         );
-        return order;
+        return { order };
       }
       case OrderChangeKind.CABIN: {
         await this.assertCabinDiffUnchanged(payload);
@@ -1011,11 +1438,72 @@ export class OrderChangeRequestsService {
           { note: ORDER_CHANGE_REQUEST_REASON_TEXT },
           opsActor,
         );
-        return order;
+        return { order };
+      }
+      // ── 三类扩展：一律回调既有通道，守恒断言 / 审计 / 幂等全在通道本体里 ──────────
+      case OrderChangeKind.SPLIT: {
+        const result = await this.orders.splitOrder(
+          orderId,
+          {
+            passengerIds: readStringArray(payload.passengerIds),
+            requestToken: String(payload.requestToken),
+            note: readNote(payload.note),
+            // 混合房组**不自动劈半**：那是 no-show / 按人改期编排的专用口径。
+            // 走申请这条路等同手工拆单 —— 同房组闸照旧拒拆，让运营先在分房里把人分开。
+            autoSplitRoomGroups: false,
+          },
+          opsActor,
+        );
+        return {
+          // splitOrder 回的是两侧单号与份额，不是序列化订单；这里补读一次源单给前端刷新。
+          order: await this.orders.getOrder(orderId, opsActor),
+          resultNote: result.replayed
+            ? `已拆出新单 ${result.targetOrderNumber}（重试时发现已拆过，本次未再拆）`
+            : `已拆出新单 ${result.targetOrderNumber}（${result.passengerCount} 人）`,
+        };
+      }
+      case OrderChangeKind.CANCEL_LEG: {
+        const { order } = await this.orders.cancelLeg(
+          orderId,
+          {
+            requestToken: String(payload.requestToken),
+            leg: payload.leg === 'OUTBOUND' ? 'OUTBOUND' : 'RETURN',
+            // 一律按取消政策报价。手工档（feeMode=MANUAL）是运营在订单页当面拍的决定，
+            // 要填金额和原因；申请这条路上没有这两样东西，也不该在确认弹窗里补出来。
+            feeMode: 'POLICY',
+            note: readNote(payload.note),
+            // 「该段已出票」这类需要回执的提示，由点确认的运营勾（提申请的人看不到出票进度）。
+            acknowledgeWarnings: body.acknowledgeWarnings === true,
+          },
+          opsActor,
+        );
+        return { order };
+      }
+      case OrderChangeKind.VISA_EXEMPT: {
+        // 岗位闸已在 approve 的 claim 事务里判过（抛在那里不留死占位）。
+        const { order } = await this.orders.setPassengerVisaExempt(
+          orderId,
+          String(payload.passengerId),
+          { visaExempt: payload.visaExempt === true, note: readNote(payload.note) },
+          opsActor,
+        );
+        return { order };
       }
       default:
         throw new BadRequestError('未知的改单类型');
     }
+  }
+
+  /**
+   * 改自备签的确认只放行管理员与签证岗。
+   *
+   * 自备签既是「这个人要不要我方送签」的口径，也是**定价输入**（套餐按人扣减自备签减免）：
+   * 翻它等于同时改签证台的活儿和这张单的应收，而「客人到底自己有没有签、送签走到哪一步了」
+   * 只有签证岗清楚。所以确认这一步收在签证岗手里；驳回不动订单，仍对所有运营开放。
+   */
+  private assertVisaDeskForVisaExempt(actor: OrderChangeRequestActor): void {
+    if (actorCan(actor, 'change_requests.approve_visa_exempt')) return;
+    throw new ForbiddenError(ORDER_CHANGE_VISA_EXEMPT_DESK_ONLY_MESSAGE);
   }
 
   /** 批量确认：逐条串行执行（每条都会真改订单，不能并发抢同一批座位）。 */

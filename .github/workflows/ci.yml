@@ -5,6 +5,9 @@ on:
     branches: [main, develop]
   pull_request:
     branches: [main, develop]
+  # e2e 只手动触发（见下面的 e2e job）——它要起 Postgres + Redis + 两个 dev server，
+  # 不该拖慢每次 push 的常规闸。
+  workflow_dispatch:
 
 jobs:
   build-and-test:
@@ -27,6 +30,11 @@ jobs:
       - name: Prisma generate
         run: npm run prisma:generate
 
+      # 契约包要先编：三端的 tsc -b 都有指向它的项目引用，dist 不在就编不过；
+      # vitest 也是从 node_modules/@ftm/contracts 的 dist 里加载它。
+      - name: Build contracts
+        run: npm run build:contracts
+
       # 后端真值闸：build + 单测（集成测试需 Postgres，本地跑，CI 不含）
       - name: Backend build
         run: npm run build --workspace=backend
@@ -48,3 +56,142 @@ jobs:
 
       - name: Sales-web build
         run: npm run build --workspace=sales-web
+
+  # 后端 23 个真 DB 集成测试（backend/src/**/*.integration.test.ts）——单独一个 job，
+  # 与 build-and-test 并行跑，不拖慢那条主干闸；用真 Postgres + Redis service 容器，
+  # 不依赖本机 docker-compose.test.yml（那个是给本地开发用的）。
+  integration:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ftm_test
+          POSTGRES_PASSWORD: ftm_test
+          POSTGRES_DB: ftm_test
+        ports:
+          - 55432:5432
+        options: >-
+          --health-cmd="pg_isready -U ftm_test -d ftm_test"
+          --health-interval=1s
+          --health-timeout=3s
+          --health-retries=30
+      # orders.service 建单时会 best-effort 派发 seat-hold 释放 / 签证任务等队列
+      # 任务（tests/integration/setup.ts 不 mock 这段），没有可连的 Redis 会导致
+      # 相关用例卡到各自 30s testTimeout 才失败——加个真 Redis 而不是空跑侥幸。
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd="redis-cli ping"
+          --health-interval=1s
+          --health-timeout=3s
+          --health-retries=30
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install (workspaces)
+        run: npm ci
+
+      - name: Prisma generate
+        run: npm run prisma:generate
+
+      # 契约包要先编：三端的 tsc -b 都有指向它的项目引用，dist 不在就编不过；
+      # vitest 也是从 node_modules/@ftm/contracts 的 dist 里加载它。
+      - name: Build contracts
+        run: npm run build:contracts
+
+      # tests/integration/setup.ts 会自动把 DATABASE_URL 切到 TEST_DATABASE_URL 再
+      # 跑 prisma migrate deploy 同步 schema；这里的 DATABASE_URL 只是让 env.ts 启动
+      # 校验通过的占位值，实际不会被拿去连库。
+      - name: Backend integration tests
+        run: npm run test:integration --workspace=backend
+        env:
+          TEST_DATABASE_URL: postgresql://ftm_test:ftm_test@localhost:55432/ftm_test?schema=public
+          DATABASE_URL: postgresql://ci:ci@localhost:5432/ci
+          REDIS_URL: redis://localhost:6379
+          JWT_ACCESS_SECRET: ci-only-dummy-access-secret-0123456789ab
+          JWT_REFRESH_SECRET: ci-only-dummy-refresh-secret-0123456789a
+
+  # ── e2e（Playwright）──────────────────────────────────────────────
+  # 只手动触发（Actions 页 → CI → Run workflow）。发版前跑一次；
+  # 常规 push/PR 不带它，免得每次提交都等 Postgres + 两个 dev server 起来。
+  e2e:
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_USER: ftm
+          POSTGRES_PASSWORD: ftm_dev_password
+          POSTGRES_DB: ftm_e2e
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd "pg_isready -U ftm"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+      redis:
+        # 全局限流器挂在 Redis 上，缺了它每个请求都会失败——e2e 必须真起一个
+        image: redis:7-alpine
+        ports: ['6379:6379']
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      E2E_DATABASE_URL: postgresql://ftm:ftm_dev_password@127.0.0.1:5432/ftm_e2e?schema=public
+      REDIS_URL: redis://127.0.0.1:6379
+      JWT_ACCESS_SECRET: ci-only-dummy-access-secret-0123456789ab
+      JWT_REFRESH_SECRET: ci-only-dummy-refresh-secret-0123456789a
+      PAYMENT_MODE: sandbox
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - name: Install (workspaces)
+        run: npm ci
+
+      - name: Prisma generate
+        run: npm run prisma:generate
+
+      # 契约包要先编：三端的 tsc -b 都有指向它的项目引用，dist 不在就编不过；
+      # vitest 也是从 node_modules/@ftm/contracts 的 dist 里加载它。
+      - name: Build contracts
+        run: npm run build:contracts
+
+      # CI 上要连系统依赖一起装（本地 npm run e2e:install 不带 --with-deps，免得要 sudo）
+      - name: Install Playwright chromium
+        run: npx playwright install --with-deps chromium
+        working-directory: e2e
+
+      # 迁移 + seed 由 e2e 的 globalSetup 负责（含「库名必须含 e2e/test」的护栏）
+      - name: Run e2e
+        run: npm run e2e
+
+      - name: Upload Playwright report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: playwright-report
+          path: |
+            e2e/playwright-report
+            e2e/test-results
+          retention-days: 7

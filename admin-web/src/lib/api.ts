@@ -5,11 +5,110 @@
  *   - 开发：默认 /api（vite-dev 代理到 http://localhost:4000）
  *   - 生产：VITE_API_BASE=https://api.citur.com（或 /api 走前端 nginx 反代）
  */
+import type { Capability } from './capabilities';
+/**
+ * 枚举类型不再手抄 —— 从 @ftm/contracts 取后端 schema.prisma 的同一份镜像。
+ *
+ * 这些名字以前是在本文件里一行一行敲出来的字符串联合，敲错/漏跟就是「老标签页撞新
+ * 后端」：改这批之前 DocumentType 多一个后端根本不认的 OTHER、StaffRole 少一个新增的
+ * OPERATIONS、AuditTargetType 少 MARKETING、ProductKind 与后端同名枚举压根不是一回事。
+ *
+ * 从契约包取之后，schema.prisma 一改，这边编译期就红。import + export 两句是必需的：
+ * 本文件下面的接口还要用这些类型，光 re-export 不进本地作用域。
+ */
+import { BUSINESS_ERROR_CODES } from '@ftm/contracts';
+import type {
+  ApiErrorBody,
+  DuplicateAmountDetails,
+  ReschedulePassengersSplitFailureDetails,
+  CreateChildAgentBody,
+  CreatePaymentChannelInput as ContractCreatePaymentChannelInput,
+  SuggestMatchesInput,
+  UpdateAgentBody,
+  UpdatePaymentChannelInput as ContractUpdatePaymentChannelInput,
+  FareBucket as ContractFareBucket,
+  PriceAdjustmentReason as ContractPriceAdjustmentReason,
+  ProductKind as ContractProductKind,
+  RosterFormat as ContractRosterFormat,
+  StatementPlatform as ContractStatementPlatform,
+  VisaRequirement,
+  AgentRechargeStatus,
+  AuditSeverity,
+  AuditTargetType,
+  BundleChangeRequestStatus,
+  CabinClass,
+  DocumentType,
+  FulfillmentStatus,
+  FulfillmentType,
+  HoldAmountRule,
+  HoldInstallmentStatus,
+  HoldOccupyOn,
+  HoldOverdueAction,
+  HoldOwnerType,
+  InvoiceStatus,
+  MarketingPosterKind,
+  MarketingPosterStatus,
+  OrderChangeRequestStatus,
+  PassengerType,
+  PaymentMethod,
+  ReceiptSource,
+  ReceiptStatus,
+  ReminderPriority,
+  ReminderStatus,
+  SeatAllocationStatus,
+  SettlementDiscountKind,
+  SettlementMode,
+  SettlementRequestStatus,
+  SettlementStatus,
+  StaffRole,
+  UserRole,
+  VisaEntryType,
+  VisaIssuanceMethod,
+  VisaSubmissionStatus,
+  WaitlistStatus,
+} from '@ftm/contracts';
+
+export type {
+  AgentRechargeStatus,
+  AuditSeverity,
+  AuditTargetType,
+  BundleChangeRequestStatus,
+  CabinClass,
+  DocumentType,
+  FulfillmentStatus,
+  FulfillmentType,
+  HoldAmountRule,
+  HoldInstallmentStatus,
+  HoldOccupyOn,
+  HoldOverdueAction,
+  HoldOwnerType,
+  InvoiceStatus,
+  MarketingPosterKind,
+  MarketingPosterStatus,
+  OrderChangeRequestStatus,
+  PassengerType,
+  PaymentMethod,
+  ReceiptSource,
+  ReceiptStatus,
+  ReminderPriority,
+  ReminderStatus,
+  SeatAllocationStatus,
+  SettlementDiscountKind,
+  SettlementMode,
+  SettlementRequestStatus,
+  SettlementStatus,
+  StaffRole,
+  UserRole,
+  VisaEntryType,
+  VisaIssuanceMethod,
+  VisaSubmissionStatus,
+  WaitlistStatus,
+};
+
+
 const API_BASE: string = (import.meta.env?.VITE_API_BASE as string | undefined)?.trim() || '/api';
 
-export interface ApiErrorBody {
-  error: { code: string; message: string; details?: unknown };
-}
+export type { ApiErrorBody };
 
 export class ApiError extends Error {
   readonly status: number;
@@ -28,20 +127,16 @@ export class ApiError extends Error {
  * 重复乘客拦截错误的稳定 code（后端 DuplicatePassengerError）。前端按 code 判，
  * 绝不靠中文文案匹配。命中即弹「确认仍要录入」二次确认，确认后带 allowDuplicatePassengers 重试。
  */
-export const DUPLICATE_PASSENGER_CODE = 'DUPLICATE_PASSENGER';
+export const DUPLICATE_PASSENGER_CODE = BUSINESS_ERROR_CODES.DUPLICATE_PASSENGER;
 
 /**
  * 手工确认收款「同额软闸」的稳定 code（后端近 windowMinutes 分钟内同订单等额收款拦截）。
  * 前端按 code 判，命中即弹二次确认，确认后带 confirmDuplicate:true 重试。
  */
-export const DUPLICATE_AMOUNT_CODE = 'DUPLICATE_AMOUNT';
+export const DUPLICATE_AMOUNT_CODE = BUSINESS_ERROR_CODES.DUPLICATE_AMOUNT;
 
 /** 同额软闸 details 结构（后端保证：existingPaymentId + amount + windowMinutes）。 */
-export interface DuplicateAmountDetails {
-  existingPaymentId: string;
-  amount: number;
-  windowMinutes: number;
-}
+export type { DuplicateAmountDetails };
 
 /** 从 DUPLICATE_AMOUNT 错误里取 details；非该错误 / 结构异常 → null。 */
 export function duplicateAmountDetails(err: unknown): DuplicateAmountDetails | null {
@@ -80,15 +175,10 @@ export function duplicatePassengerConflictOrderNumbers(err: unknown): string[] {
  * （如新班次售罄）。拆单不回滚——新单是钱与座位都守恒的合法订单。前端按 code 判，命中即
  * 引导运营去新单上重试改期，绝不能当普通失败静默丢弃已拆出的新单号。
  */
-export const SPLIT_DONE_RESCHEDULE_FAILED_CODE = 'SPLIT_DONE_RESCHEDULE_FAILED';
+export const SPLIT_DONE_RESCHEDULE_FAILED_CODE = BUSINESS_ERROR_CODES.SPLIT_DONE_RESCHEDULE_FAILED;
 
 /** reschedulePassengers「已拆单但改期未成功」错误的 details 结构（后端原样透出）。 */
-export interface ReschedulePassengersSplitFailureDetails {
-  newOrderId: string;
-  newOrderNumber: string;
-  passengerCount?: number;
-  reason?: string;
-}
+export type { ReschedulePassengersSplitFailureDetails };
 
 /** 从 reschedulePassengers 的失败里取「已拆单但改期未成功」的新单信息；非该情形 → null。 */
 export function reschedulePassengersSplitFailure(
@@ -221,8 +311,6 @@ async function apiFetchWithRetry<T>(
 
 // ── 类型 ──────────────────────────────────────────────────────────────────
 
-export type UserRole = 'CUSTOMER' | 'AGENT' | 'STAFF' | 'ADMIN';
-export type CabinClass = 'ECONOMY' | 'PREMIUM_ECONOMY' | 'BUSINESS' | 'FIRST';
 
 export interface AuthUser {
   id: string;
@@ -232,6 +320,12 @@ export interface AuthUser {
   staffRole?: StaffRole | null;
   displayName: string | null;
   mustChangePassword: boolean;
+  /**
+   * 能力清单：后端按同一张能力表算好后随 /users/me 下发（见 backend/src/lib/capabilities.ts）。
+   * 登录响应里还没有，要等启动时那次 /users/me —— 所以是可选的。读它一律走
+   * useCapabilities()，别在页面里自己判 role。
+   */
+  capabilities?: Capability[];
 }
 
 export interface AuthTokens {
@@ -263,10 +357,8 @@ export interface AdminFlight {
 
 // 仓位阶梯一档：N 张以该价出售（int 张数 ≥1 / 价格 ≥0）。
 // 按数组顺序由前往后出售（最便宜在前，卖满跳下一档）。
-export interface FareBucket {
-  quota: number;
-  price: number;
-}
+/** 仓位阶梯档位 = 契约包 pricing 那份（后端 fareBuckets Json 列的读写形状）。 */
+export type FareBucket = ContractFareBucket;
 
 export interface AdminScheduleSeat {
   id: string;
@@ -300,6 +392,17 @@ export interface AdminSchedule {
   seatClasses: AdminScheduleSeat[];
 }
 
+/** 一条改价历史（GET /flights/schedules/:id/price-history）。price 为字符串金额。 */
+export interface SchedulePriceHistoryEntry {
+  id: string;
+  cabin: CabinClass;
+  price: string;
+  /** 来源标记：MANUAL = 运营手工改价（原设计的 A/B/C/D 是日期等级）。 */
+  tier: string;
+  /** ISO datetime */
+  observedAt: string;
+}
+
 // ── 跨日期区间班次（GET /flights/schedules?from=&to=）──
 // 单次拉取一段日期内所有航班的班次（含每个班次航班号/航线/出发时间），
 // 用于座位统计页（取代逐航班 listSchedules 的 N+1）。
@@ -315,12 +418,21 @@ export interface RangeScheduleSeat {
   basePrice: string;
 }
 
+/**
+ * 班次去 / 回程方向（后端 flight-direction.ts 派生）。
+ * OUTBOUND = 去程（航线表里的 origin→destination），RETURN = 反向，
+ * UNKNOWN = 活跃航线表里查不到这条线（后端不猜，前端也不猜）。
+ */
+export type FlightDirection = 'OUTBOUND' | 'RETURN' | 'UNKNOWN';
+
 export interface RangeSchedule {
   id: string;
   flightId: string;
   flightNumber: string;
   originCode: string;
   destinationCode: string;
+  /** 去 / 回程：后端按活跃航线表派生；老后端未返回时为 undefined。 */
+  direction?: FlightDirection;
   /** ISO datetime 字符串 */
   departureTime: string;
   departureTz: string;
@@ -330,8 +442,6 @@ export interface RangeSchedule {
 }
 
 // ── 营销中心 · AI 海报 ─────────────────────────────────────────────────────
-export type MarketingPosterKind = 'FLIGHT_ROUTE' | 'CUSTOM';
-export type MarketingPosterStatus = 'GENERATING' | 'READY' | 'NEEDS_REVIEW' | 'FAILED';
 
 export interface MarketingTemplate {
   key: string;
@@ -749,7 +859,8 @@ export type CreateOrderItemInput =
 
 // 签证状态（录单/详情用）；后端 enum → 中文：
 // NOT_NEEDED=不需要 / NEEDED=需要 / E_VISA=电子签(三个月多次) / HAS_VISA=已签证
-export type VisaStatusInput = 'NOT_NEEDED' | 'NEEDED' | 'E_VISA' | 'HAS_VISA';
+/** 录单的签证口径 = 后端 Order.visaStatus（Prisma VisaRequirement），取契约包那份。 */
+export type VisaStatusInput = VisaRequirement;
 
 export const VISA_STATUS_LABEL: Record<VisaStatusInput, string> = {
   NOT_NEEDED: '不需要',
@@ -779,7 +890,8 @@ export interface OrderStructuredNotes {
 // 套餐结构化商务舱库存、升级酒店不走「换酒店」（房控看不到）、改多签不换签证产品（签证岗
 // 看不到）。新录入只允许下面四个财务口径值；旧三值仍保留在展示 label 映射里，避免历史订单行
 // 的 reasonCode 找不到 label 而显示 undefined。
-export type PriceAdjustmentReason = 'DISCOUNT' | 'MISC_FEE' | 'CHANGE' | 'OTHER';
+/** 调价原因 = 契约包 orders 里可录入的那批（历史下线原因另有一份，不在此列）。 */
+export type PriceAdjustmentReason = ContractPriceAdjustmentReason;
 
 // 可录入原因（下拉用）——与后端 priceAdjustmentSchema 的枚举保持一致。
 export const PRICE_ADJUSTMENT_REASON_OPTIONS: PriceAdjustmentReason[] = [
@@ -916,7 +1028,6 @@ export interface CreateOrderInput extends OrderStructuredNotes {
  * - PER_ORDER 逐单到账：每笔订单单独收尾款（默认）。
  * - MONTHLY 月结：订单尾款挂账，月末统一对账，不逐单催款。
  */
-export type SettlementMode = 'PER_ORDER' | 'MONTHLY';
 
 export const SETTLEMENT_MODE_LABEL: Record<SettlementMode, string> = {
   PER_ORDER: '逐单到账',
@@ -924,7 +1035,8 @@ export const SETTLEMENT_MODE_LABEL: Record<SettlementMode, string> = {
 };
 
 // ── 名单格式绑定（批量创单防呆）── 与 backend agents.schemas ROSTER_FORMATS 对齐
-export type RosterFormat = 'COLON_MULTILINE_YMD' | 'INLINE_NUMBERED' | 'COLON_MULTILINE_DMY';
+/** 代理粘贴名单的格式绑定 = 契约包 agents 那份。 */
+export type RosterFormat = ContractRosterFormat;
 
 export const ROSTER_FORMAT_LABEL: Record<RosterFormat, string> = {
   COLON_MULTILINE_YMD: '冒号多行（年-月-日）',
@@ -958,36 +1070,14 @@ export interface AgentListItem {
   orderCount: number;
 }
 
-export interface CreateChildAgentInput {
-  email: string;
-  password: string;
-  displayName: string;
-  contactName: string;
-  contactPhone: string;
-  companyName?: string;
-  // 不含 prepaymentBalance：建代理余额恒为 0，事后走认款通道（有流水+审计）产生。
-  notes?: string;
-  /** 名单格式绑定（可选） */
-  rosterFormat?: RosterFormat | null;
-  /** 识别词条（每条 ≤20 字，最多 10 条；服务端全局查重） */
-  rosterKeywords?: string[];
-}
+/** POST /agents/children body —— 取契约包那份，字段与后端 zod 逐字同源。 */
+export type CreateChildAgentInput = CreateChildAgentBody;
 
 /** PATCH /agents/:id 请求体：所有字段可选，至少传一个 */
-export interface UpdateAgentInput {
-  companyName?: string;
-  contactName?: string;
-  contactPhone?: string;
-  email?: string;
-  notes?: string;
-  /** 名单格式绑定；null = 清除登记 */
-  rosterFormat?: RosterFormat | null;
-  /** 识别词条（每条 ≤20 字，最多 10 条；服务端全局查重） */
-  rosterKeywords?: string[];
-}
+/** PATCH /agents/:id body（PATCH 语义，至少传一个字段）—— 取契约包那份。 */
+export type UpdateAgentInput = UpdateAgentBody;
 
 // ── 切位（包位）── 与 backend seat-allocation 模块对齐
-export type SeatAllocationStatus = 'ACTIVE' | 'RECLAIMED';
 
 export interface CreateSeatAllocationInput {
   flightScheduleId: string;
@@ -1049,11 +1139,6 @@ export type HoldOrderStatus =
   | 'CONVERTED'
   | 'RELEASED'
   | 'CANCELLED';
-export type HoldOwnerType = 'AGENT' | 'CUSTOMER';
-export type HoldInstallmentStatus = 'PENDING' | 'PAID';
-export type HoldAmountRule = 'PER_PERSON_FIXED' | 'REMAINDER';
-export type HoldOverdueAction = 'REMIND_ONLY' | 'AUTO_RELEASE';
-export type HoldOccupyOn = 'CREATE' | 'FULL_PAYMENT';
 
 export interface HoldInstallmentTemplate {
   label: string;
@@ -1255,9 +1340,6 @@ export type OrderItemKind =
   | 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA'
   | 'BUNDLE' | 'INSURANCE' | 'FEE' | 'DISCOUNT'
   | 'GUIDE' | 'UPGRADE_CHANGE' | 'OVERSALE';
-export type DocumentType = 'PASSPORT' | 'ID_CARD' | 'OTHER';
-export type PassengerType = 'ADULT' | 'CHILD' | 'INFANT';
-export type PaymentMethod = 'WECHAT_PAY' | 'ALIPAY' | 'BANK_CARD' | 'AGENT_PREPAYMENT';
 
 /** 收款方式中文标签（订单收款 / 进账对账共用） */
 export const PAYMENT_METHOD_LABEL: Record<PaymentMethod, string> = {
@@ -1411,8 +1493,6 @@ export interface OrderPassenger {
   singleRoom?: boolean | null;
 }
 
-export type ReminderStatus = 'OPEN' | 'IN_PROGRESS' | 'DONE' | 'SKIPPED';
-export type ReminderPriority = 'LOW' | 'NORMAL' | 'HIGH' | 'CRITICAL';
 
 export interface OperationalReminder {
   id: string;
@@ -1435,7 +1515,7 @@ export interface OperationalReminder {
 }
 
 // ── 经营报表（ADMIN-only）────────────────────────────────────────────────
-export type SalesReportDim = 'kind' | 'channel' | 'agent';
+export type SalesReportDim = 'kind' | 'channel' | 'agent' | 'route';
 
 export interface SalesReportRow {
   key: string;
@@ -1520,7 +1600,6 @@ export interface HotelAvailabilityResult {
   nights: number;
 }
 
-export type InvoiceStatus = 'NONE' | 'REQUESTED' | 'ISSUED';
 
 /** 六态开票的维度：去程 / 回程 / 系统。 */
 export type InvoiceLeg = 'outbound' | 'return' | 'system';
@@ -1548,6 +1627,30 @@ export interface OrderAdjustment {
   /** 该条目归属乘客的证件号快照 */
   passengerDocument?: string;
 }
+
+/**
+ * 按人份额（后端 OrderPassengerShare 落库行，serializeOrder 逐单下发；金额 CNY 两位小数）。
+ * settlementCny = baseCny + adjustmentCny；全员 Σ settlementCny + sharesExcludedCny = effectivePayable。
+ * 算法只在后端一份（lib/order-money perPax*）；前端 lib/perPaxSettlement.ts 只在没有本字段时才退回自算。
+ */
+export interface PassengerShare {
+  passengerId: string;
+  /** 每人结算价（应收份额） */
+  settlementCny: number;
+  /** 均摊基准 */
+  baseCny: number;
+  /** 该乘客名下按乘客调价净额 */
+  adjustmentCny: number;
+  /** 签证金额（自备签 = 0） */
+  visaCny: number;
+  /** 单房差（只记到单住乘客） */
+  singleRoomDiffCny: number;
+  /** 立减均摊 */
+  discountCny: number;
+}
+
+/** 份额来源：PERSISTED = 读的是库里落好的；DERIVED = 老单尚未回填，后端现算（读侧会顺手回填）。 */
+export type SharesSource = 'PERSISTED' | 'DERIVED';
 
 /** 回收站行（GET /orders/deleted）：只带回收站表所需的最小字段。 */
 export interface DeletedOrderSummary {
@@ -1603,6 +1706,12 @@ export interface OrderSummary {
   adjustmentCny?: number;
   /** 售后费用明细（改期费 / 换人费）；列表可能为空，详情带出 */
   adjustments?: OrderAdjustment[];
+  /** 按人份额（每位在单乘客一行；内部角色下发，AGENT/CUSTOMER 不带）。旧后端缺省 */
+  passengerShares?: PassengerShare[];
+  /** 份额来源（与 passengerShares 成对；旧后端缺省） */
+  sharesSource?: SharesSource;
+  /** 换人费 / 换人差价等不摊入份额的售后费合计（记在已离开订单的被换人头上）。旧后端缺省 */
+  sharesExcludedCny?: number;
   contactName: string;
   contactPhone: string;
   contactEmail: string | null;
@@ -2058,6 +2167,113 @@ export interface NoShowBatchResponse {
   summary: { ok: number; failed: number; releasedSeats: number; replayedCount?: number };
 }
 
+// ── 按航班批量回填票号 ──────────────────────────────────────────────────────
+// 出票走沙箱自动生成号；真实航司出票后照名单一次灌回来。合格性、冲突与要不要覆盖，
+// 全部以服务端 preview 为准，前端只负责勾选与展示（与 no-show 批量同一条纪律）。
+
+export interface TicketBatchSchedule {
+  id: string;
+  flightNumber: string;
+  /** 出发地当地日 YYYY-MM-DD（服务端按 departureTz 折好，前端只渲染不再折） */
+  departDate: string;
+  /** 出发地当地时刻 HH:mm */
+  departTimeLocal: string;
+  seatsSold: number;
+}
+
+export type TicketMatchedBy = 'DOCUMENT' | 'NAME' | 'CHINESE_NAME';
+export type TicketField = 'pnr' | 'eticketNumber';
+
+export interface TicketBatchMatch {
+  /** 名单原文那一行（票务按原文核对） */
+  line: string;
+  /** 命中这位乘客的全部原文行（一行给 PNR、一行给票号时会有两条） */
+  lines: string[];
+  orderId: string;
+  orderNumber: string;
+  orderStatus: OrderStatus;
+  passengerId: string;
+  fullName: string;
+  chineseName: string | null;
+  /** 证件号后 4 位（服务端只给这个） */
+  documentTail: string;
+  matchedBy: TicketMatchedBy;
+  /** 本次要写的号（名单没给这一列就是 null = 不动） */
+  pnr: string | null;
+  eticketNumber: string | null;
+  /** 库里现有的号 */
+  currentPnr: string | null;
+  currentEticketNumber: string | null;
+  /** 库里已有**不一样**的号 → 必须显式勾覆盖才写 */
+  conflict: boolean;
+  conflictFields: TicketField[];
+  /** 库里已经就是这个号 → 写了也没有变化 */
+  unchanged: boolean;
+  /** 名单自己前后矛盾（同一人两个不同号）→ 系统不猜，不给提交 */
+  rosterConflict: boolean;
+  blockers: string[];
+}
+
+export interface TicketBatchAmbiguousCandidate {
+  orderId: string;
+  orderNumber: string;
+  passengerId: string;
+  fullName: string;
+  chineseName: string | null;
+  documentTail: string;
+}
+
+export interface TicketBatchAmbiguousLine {
+  line: string;
+  pnr: string | null;
+  eticketNumber: string | null;
+  candidates: TicketBatchAmbiguousCandidate[];
+}
+
+/** 行本身不可用（格式不对/缺列）——与「人匹配不上」是两回事 */
+export interface TicketBatchInvalidLine {
+  line: string;
+  error: string;
+}
+
+export interface TicketBatchPreview {
+  schedule: TicketBatchSchedule;
+  matched: TicketBatchMatch[];
+  unmatched: Array<{ line: string; identity: string }>;
+  ambiguous: TicketBatchAmbiguousLine[];
+  invalid: TicketBatchInvalidLine[];
+  totalLines: number;
+  processedLines: number;
+  truncated: boolean;
+}
+
+export interface TicketBatchEntry {
+  orderId: string;
+  passengerId: string;
+  pnr?: string | null;
+  eticketNumber?: string | null;
+  /** 库里已有不同号时必须带 true 才覆盖，否则服务端回 TICKET_CONFLICT 跳过 */
+  overwrite?: boolean;
+}
+
+export interface TicketBatchResult {
+  orderId: string;
+  orderNumber: string;
+  passengerId: string;
+  fullName: string;
+  ok: boolean;
+  /** 真正变了值的字段；空数组 = 库里本来就是这个号（重发同一批时全是空） */
+  changedFields: TicketField[];
+  error?: string;
+  code?: string;
+}
+
+export interface TicketBatchResponse {
+  results: TicketBatchResult[];
+  /** changed = 真改了的条数；unchanged = 成功但一个字段都没变（别把它算进「已回填」） */
+  summary: { ok: number; failed: number; changed: number; unchanged: number };
+}
+
 /** no-show 报表行（按班次聚合） */
 export interface NoShowReportRow {
   scheduleId: string;
@@ -2108,6 +2324,9 @@ export interface WorkOrderSummary {
   /** 最新一条工单的时间（ISO）；无工单为 null。角标靠它判断「有没有新的」 */
   latestAt: string | null;
   items: WorkOrderSummaryItem[];
+  /** 铃铛全覆盖（REMINDER_BELL_ALL 开时才有）：除上面三类工单外，其它规则提醒里
+   * OPEN/IN_PROGRESS 且 priority 为 CRITICAL/HIGH 的计数。flag 关时该字段不存在。 */
+  reminders?: { critical: number; high: number };
 }
 
 /** listOrders 查询参数（与 backend listOrdersQuerySchema 对齐） */
@@ -2313,8 +2532,6 @@ export interface OrderPayment {
 }
 
 // ── Audit / Customers / Travelers / Fulfillment ──────────────────────────
-export type AuditSeverity = 'INFO' | 'WARNING' | 'CRITICAL';
-export type AuditTargetType = 'AGENT' | 'ORDER' | 'FLIGHT' | 'CUSTOMER' | 'TRAVELER' | 'PRICING' | 'COMMISSION' | 'SETTLEMENT' | 'PRODUCT' | 'AUTH' | 'SYSTEM';
 
 export interface AuditLog {
   id: string;
@@ -2554,11 +2771,8 @@ export interface MergeTravelerProfileResult {
   };
 }
 
-export type FulfillmentType = 'FLIGHT_TICKETING' | 'HOTEL_BOOKING' | 'VISA_APPLICATION' | 'TRANSFER_DISPATCH' | 'BUNDLE_COMPOSITE';
-export type FulfillmentStatus = 'PENDING' | 'IN_PROGRESS' | 'CONFIRMED' | 'CANCELLED' | 'FAILED';
 
 /** 乘客送签进度（按人送签用）——三档，与签证台任务状态语义对齐 */
-export type VisaSubmissionStatus = 'PENDING' | 'IN_PROGRESS' | 'CONFIRMED';
 
 /** 签证台乘客明细（仅 VISA_APPLICATION 任务后端附带）*/
 export interface VisaTaskPassenger {
@@ -2726,7 +2940,6 @@ export interface BatchFulfillmentStatusResult {
 }
 
 // ── 候补（ADMIN/STAFF 某班次候补名单，电话回访用）─────────────────────────
-export type WaitlistStatus = 'ACTIVE' | 'NOTIFIED' | 'FULFILLED' | 'CANCELLED';
 
 export interface WaitlistEntry {
   id: string;
@@ -2810,9 +3023,7 @@ export interface Transfer {
 }
 
 /** 签证签发方式（结构化分类，替代靠产品名正则猜测） */
-export type VisaIssuanceMethod = 'E_VISA' | 'STICKER' | 'ARRIVAL' | 'OTHER';
 /** 签证入境次数 */
-export type VisaEntryType = 'SINGLE' | 'MULTIPLE';
 
 /** 一档签证加急（零工/一工/二工…）：档名是定价查表的键，同产品内唯一。 */
 export interface VisaExpressTier {
@@ -3005,12 +3216,23 @@ export interface Bundle {
   createdAt: string;
 }
 
-// ── 结算价日历（ADMIN/STAFF）— 出发日期 × 晚数 × 酒店档次 → 每人结算价 ─────
+// ── 结算价日历（ADMIN/STAFF）— 航线 × 出发日期 × 晚数 × 酒店档次 → 每人结算价 ─
 // 与 backend/src/modules/settlement-rates/* 对齐
 export type SettlementTier = 'CITY_3STAR' | 'CITY_4STAR' | 'CITY_5STAR' | 'INTL_5STAR';
 
+/** 可维护的航线（GET /settlement-rates/routes）：routeKey = 去程方向「起飞-到达」机场码，如 MFM-DAD */
+export interface SettlementRoute {
+  routeKey: string;
+  origin: string;
+  destination: string;
+  /** 日历里已有该航线的价（运营正在用的线排前面） */
+  hasRates: boolean;
+}
+
 export interface SettlementRate {
   id: string;
+  /** 航线键（如 MFM-DAD）；读写必填，后端不默认航线 */
+  routeKey: string;
   tier: SettlementTier;
   nights: number;
   /** 去程出发日期（YYYY-MM-DD） */
@@ -3025,6 +3247,7 @@ export interface SettlementRate {
 
 /** 批量 upsert 一格（网格整批保存 / Excel 粘贴块） */
 export interface SettlementRateWriteEntry {
+  routeKey: string;
   tier: SettlementTier;
   nights: number;
   departDate: string;
@@ -3034,10 +3257,11 @@ export interface SettlementRateWriteEntry {
 
 // ── 结算价立减规则（ADMIN/STAFF）— 出发日期窗口 × 晚数 × 酒店档次 ────────
 // 与 backend/src/modules/settlement-discounts/* 对齐；金额为 CNY/人整数。
-export type SettlementDiscountKind = 'AGENT' | 'AGENT_DEFAULT' | 'RETAIL';
 
 export interface SettlementDiscountRule {
   id: string;
+  /** 航线键（如 MFM-DAD）：规则按航线隔离，是身份列（已落库不可改） */
+  routeKey: string;
   kind: SettlementDiscountKind;
   agentId: string | null;
   tier: SettlementTier;
@@ -3053,6 +3277,7 @@ export interface SettlementDiscountRule {
 
 export interface SettlementDiscountWriteEntry {
   id?: string;
+  routeKey: string;
   kind: SettlementDiscountKind;
   agentId?: string;
   tier: SettlementTier;
@@ -3099,6 +3324,12 @@ export interface FlightSettlementRateWriteEntry {
  */
 export type RandomStarTier = 3 | 4 | 5;
 export const RANDOM_STAR_TIERS: RandomStarTier[] = [3, 4, 5];
+
+/** 房控接口的城市筛选片段：空 = 不筛（全部城市）。 */
+function hotelCityQuery(cityCode?: string): string {
+  const code = cityCode?.trim();
+  return code ? `&cityCode=${encodeURIComponent(code)}` : '';
+}
 /** 随机档展示名（与后端 randomStarTierLabel 一致）。 */
 export function randomStarTierLabel(tier: number): string {
   return `${['一', '二', '三', '四', '五'][tier - 1] ?? String(tier)}星随机`;
@@ -3150,16 +3381,25 @@ export interface BlockPeriodWriteInput {
   note?: string | null;
 }
 
+/** 随机档 / 销控板的城市（归一后的 Hotel.cityCode + 展示名；未知码原样） */
+export interface HotelCity {
+  cityCode: string;
+  cityLabel: string;
+}
+
 export interface HotelControlBoardHotel {
   /**
-   * 分组键。具体酒店 = 真实酒店 id；随机档聚合组 = 合成键 `random-star-{tier}`
+   * 分组键。具体酒店 = 真实酒店 id；随机档聚合组 = 合成键 `random-star-{tier}-{city}`
    * —— 聚合组不是酒店，别拿它去调按 hotelId 的接口（护照导出等），判定一律看 randomStarTier。
    */
   hotelId: string;
-  /** 具体酒店 = 酒店名；聚合组 = 「三星随机」/「四星随机」 */
+  /** 具体酒店 = 酒店名；聚合组 = 「岘港三星随机」（带城市，两城同档不撞名） */
   hotelName: string;
-  /** 非空 = 随机档聚合组（同星级酒店合计视图） */
+  /** 非空 = 随机档聚合组（同城市同星级酒店合计视图） */
   randomStarTier: RandomStarTier | null;
+  /** 所属城市（随机档按城市圈定；聚合组 = 它圈定的城市） */
+  cityCode: string;
+  cityLabel: string;
   /** 最新周期（dateFrom 最晚且有价）的切房单价；聚合组无单一单价 → null */
   unitPrice: number | null;
   /**
@@ -3172,6 +3412,8 @@ export interface HotelControlBoardHotel {
 
 export interface HotelControlBoard {
   dates: string[];
+  /** 板上出现的城市（主营地排最前）；矩阵按城市分块出标题用；带 cityCode 筛选时只有一个 */
+  cities: HotelCity[];
   hotels: HotelControlBoardHotel[];
 }
 
@@ -3182,9 +3424,13 @@ export interface HotelControlForward {
   remaining: number[]; // held - occupied（余房）
 }
 
-/** GET /hotel-control/random-tier-shortfall — 每日加房清单（随机档缺口） */
+/** GET /hotel-control/random-tier-shortfall — 每日加房清单（随机档缺口；按城市 × 档次分条） */
 export interface RandomTierShortfallTier {
+  /** 该行圈定的城市（随机档按城市圈定，岘港三星与会安三星是两个池子） */
+  cityCode: string;
+  cityLabel: string;
   tier: RandomStarTier;
+  /** 档次名（不带城市，与销控板列头一致） */
   label: string;
   hasBlock: boolean;
   block: number;
@@ -3203,6 +3449,8 @@ export interface RandomTierShortfallDay {
 export interface RandomTierShortfall {
   from: string;
   to: string;
+  /** 清单覆盖的城市（主营地排最前）；带 cityCode 筛选时只有一个 */
+  cities: HotelCity[];
   days: RandomTierShortfallDay[];
 }
 
@@ -3276,6 +3524,8 @@ export interface DashboardAlertsSummary {
     overCapacitySchedules: number;
     sharedOddNear: number;
   };
+  /** 提醒规则「上次生成」时间（自动/手动取较晚者），从未生成过为 null。 */
+  reminderLastGeneratedAt: string | null;
 }
 
 export interface DashboardWeeklyPoint { date: string; revenue: number; orders: number }
@@ -3289,7 +3539,6 @@ export interface DashboardTopAgent {
 }
 
 // ── Settlements ──────────────────────────────────────────────────────────
-export type SettlementStatus = 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED' | 'PAID' | 'VOIDED';
 
 /** 结算单绑定的单条 REVERSED（冲销）记录摘要 —— 不论正负金额都透出，供审批页查看。 */
 export interface SettlementReversedRecord {
@@ -3397,9 +3646,7 @@ export interface UpdatePaymentChannelInput {
 }
 
 /** 进账状态：待核销 / 部分核销 / 已核销 / 已退款（对账台统一「核销」口径） */
-export type ReceiptStatus = 'OPEN' | 'PARTIALLY_ALLOCATED' | 'ALLOCATED' | 'REFUNDED';
 /** 进账来源：客户上传 / 后台录入 / 订单超额转入 / 二维码流水导入 */
-export type ReceiptSource = 'CUSTOMER_UPLOAD' | 'STAFF_ENTRY' | 'ORDER_OVERPAY' | 'STATEMENT_IMPORT' | 'OPS_CLAIM';
 
 export const RECEIPT_STATUS_LABEL: Record<ReceiptStatus, string> = {
   OPEN: '待核销',
@@ -3416,7 +3663,8 @@ export const RECEIPT_SOURCE_LABEL: Record<ReceiptSource, string> = {
 };
 
 /** 流水预览行处置：ok=可导入；dup_in_db=库里已有；dup_in_file=文件内重复；skipped_status=非支付成功；invalid=解析失败 */
-export type StatementPlatform = 'CMB_QR' | 'YISHOUBAO' | 'XINGYIFU' | 'HUISHENGHUO';
+/** 支持导入的收单平台 = 契约包 receipts 那份。 */
+export type StatementPlatform = ContractStatementPlatform;
 export type StatementDisposition =
   | 'ok'
   | 'dup_in_db'
@@ -3542,6 +3790,99 @@ export interface ReceiptMatchCandidatesParams {
   /** 匹配 订单号 / 联系人 / 代理名（服务端过滤，跨全量候选） */
   q?: string;
 }
+
+// ── 认款建议（POST /receipts/match/suggest；服务端匹配引擎，只出建议不入账）──
+/** 单笔候选的理由标签（服务端 receipt-matching.ts 的 MatchReason） */
+export type ReceiptMatchReason =
+  | 'AMOUNT_EXACT'
+  | 'AMOUNT_PARTIAL'
+  | 'AMOUNT_COVERS'
+  | 'REMARK_HAS_ORDER_NO'
+  | 'ORDER_HINT'
+  | 'REMARK_HAS_PASSENGER_NAME'
+  | 'PAYER_MATCHES_AGENT'
+  | 'PHONE_TAIL'
+  | 'DATE_NEAR';
+/** 组合建议的理由标签（单笔理由 + 组合专有） */
+export type ReceiptMatchComboReason =
+  | ReceiptMatchReason
+  | 'AMOUNT_SUM_EXACT'
+  | 'SAME_PAYER'
+  | 'SAME_AGENT'
+  | 'SAME_CONTACT'
+  | 'SAME_DAY';
+export type ReceiptMatchConfidence = 'HIGH' | 'MEDIUM' | 'LOW';
+
+/** 建议里随行返回的订单摘要（服务端窗口比工作台候选列表宽，订单不一定在右栏里） */
+export type ReceiptMatchOrderSummary = Pick<
+  ReceiptMatchCandidate,
+  | 'orderId'
+  | 'orderNumber'
+  | 'contactName'
+  | 'agentName'
+  | 'departureDate'
+  | 'totalPayable'
+  | 'paidAmount'
+  | 'balanceDue'
+>;
+
+export interface ReceiptMatchSuggestedOrder extends ReceiptMatchOrderSummary {
+  score: number;
+  reasons: ReceiptMatchReason[];
+  confidence: ReceiptMatchConfidence;
+  /** 建议认款金额 = min(流水未认余额, 订单尾款) */
+  suggestedAmountCny: number;
+}
+
+/** 一笔流水的候选列表（按置信度 → 分数排序，最多 5 张） */
+export interface ReceiptMatchSuggestion {
+  receiptId: string;
+  receiptNo: string;
+  externalTxnId: string | null;
+  payerNote: string | null;
+  method: PaymentMethod;
+  source: ReceiptSource;
+  receivedAt: string;
+  remainingCny: string;
+  candidates: ReceiptMatchSuggestedOrder[];
+}
+
+export interface ReceiptMatchComboPart {
+  receiptId: string;
+  receiptNo: string;
+  externalTxnId: string | null;
+  receiptRemainingCny: string;
+  orderId: string;
+  orderNumber: string;
+  contactName: string;
+  agentName: string | null;
+  orderBalanceDue: number;
+  /** 这一条认多少（元）——多笔凑一单时 = 流水余额；一笔付多单时 = 该单尾款 */
+  amountCny: number;
+}
+
+/** 组合建议：多笔凑一单 / 一笔付多单（永不 HIGH，永远要人看一眼） */
+export interface ReceiptMatchCombo {
+  type: 'MANY_RECEIPTS_ONE_ORDER' | 'ONE_RECEIPT_MANY_ORDERS';
+  confidence: Extract<ReceiptMatchConfidence, 'MEDIUM' | 'LOW'>;
+  score: number;
+  reasons: ReceiptMatchComboReason[];
+  totalCny: number;
+  parts: ReceiptMatchComboPart[];
+}
+
+export interface ReceiptMatchSuggestResult {
+  ok: true;
+  generatedAt: string;
+  scanned: { receipts: number; orders: number; unpaidOrders: number; sinceDays: number };
+  summary: { receiptsWithCandidates: number; high: number; medium: number; low: number; combos: number };
+  receipts: ReceiptMatchSuggestion[];
+  combos: ReceiptMatchCombo[];
+}
+
+/** POST /receipts/match/suggest body */
+/** POST /receipts/match/suggest body —— 取契约包那份。 */
+export type ReceiptMatchSuggestInput = SuggestMatchesInput;
 
 /** POST /receipts body（后台登记新进账） */
 export interface CreateReceiptInput {
@@ -4120,6 +4461,14 @@ export const TOKEN_PAYLOAD_MISMATCH_CODE = 'TOKEN_PAYLOAD_MISMATCH';
 /** TOKEN_PAYLOAD_MISMATCH 的统一提示语（三个提交点共用，口径不分叉）。 */
 export const TOKEN_PAYLOAD_MISMATCH_HINT = '这个请求编号已用于另一次操作，请刷新后重试。';
 
+/**
+ * 航线筛选的 query 片段（`&routeKey=…`）；空 / undefined = 不筛（全部航线）。
+ * 财务概览 / 月度 / 按航班导出三处共用，避免各写各的拼串口径。
+ */
+function routeQuery(routeKey?: string | null): string {
+  return routeKey ? `&routeKey=${encodeURIComponent(routeKey)}` : '';
+}
+
 export const api = {
   login: (email: string, password: string) =>
     apiFetch<AuthResult>('/auth/login', {
@@ -4145,6 +4494,8 @@ export const api = {
         disabledAt: string | null;
         staffRole: StaffRole | null;
       };
+      /** 后端按能力表现算的清单，与 requireCapability 同源。 */
+      capabilities: Capability[];
     }>('/users/me', { token }),
 
   // 营销中心
@@ -4251,6 +4602,12 @@ export const api = {
       token,
       body,
     }),
+  // 某班次的改价历史（最近 10 条，新到旧；ADMIN/STAFF）。从没改过价 → 空数组。
+  listSchedulePriceHistory: (token: string, scheduleId: string) =>
+    apiFetch<{ history: SchedulePriceHistoryEntry[] }>(
+      `/flights/schedules/${scheduleId}/price-history`,
+      { token },
+    ),
   // 删除班次（仅 ADMIN）。后端守 sold>0：有订单关联则拒绝/转停用，
   // result 可能是 { id, deleted: true } 或被停用的班次对象。
   deleteSchedule: (token: string, scheduleId: string) =>
@@ -4349,6 +4706,21 @@ export const api = {
       token,
       body: { isActive },
     }),
+
+  /**
+   * 代理月度对账单 xlsx（Blob 直接下载）。运营/财务替代理下；代理自己在前台也能下同一张表。
+   * 按**出发日**归月（与结算单按下单日归期的口径不同，表格抬头印着这句说明）。
+   */
+  downloadAgentStatement: async (token: string, agentId: string, month: string): Promise<Blob> => {
+    const res = await fetch(
+      `${API_BASE}/agents/${encodeURIComponent(agentId)}/statement?month=${encodeURIComponent(month)}&format=xlsx`,
+      { headers: { Authorization: `Bearer ${token}` } },
+    );
+    if (!res.ok) {
+      throw new ApiError(res.status, { code: 'STATEMENT_FAILED', message: await res.text() });
+    }
+    return res.blob();
+  },
 
   // 切位（包位）——从散客池划座给代理专卖，到期未售回散客池（ADMIN/STAFF）
   createSeatAllocation: (token: string, body: CreateSeatAllocationInput) =>
@@ -4494,8 +4866,11 @@ export const api = {
       pagination: { page: number; pageSize: number; total: number };
     }>(`/orders/${qs.toString() ? '?' + qs.toString() : ''}`, { token });
   },
+  // autoFulfillmentSandbox = 后端的沙箱自动出票开关（env ENABLE_AUTO_FULFILLMENT）现在开着。
+  // 乘客卡上「演示自动出票」提示只在它为 true 时挂 —— 以前写死，接了真航司/关了开关之后
+  // 界面还会一直管真票号叫演示号。可选字段：拿不到就按 false 处理（不挂提示）。
   getOrder: (token: string, id: string) =>
-    apiFetch<{ order: OrderSummary }>(`/orders/${id}`, { token }),
+    apiFetch<{ order: OrderSummary; autoFulfillmentSandbox?: boolean }>(`/orders/${id}`, { token }),
   /**
    * 代理分销统计（GET /orders/agent-stats）：与 listOrders 同一套筛选，后端全量聚合。
    * 分页参数在这里没有意义（统计的是筛选命中的**全部**订单，不是某一页），调用前会剔掉。
@@ -5360,6 +5735,32 @@ export const api = {
       { method: 'PATCH', token, body },
     ),
 
+  // 票务台：回填真实 PNR / 电子票号（仅 ADMIN/STAFF）。
+  // 出票走沙箱自动生成号，真实航司出票之后本来没有任何人工录入口 —— 这就是那个入口。
+  //   · 给字符串 = 写入（PNR 5–8 位字母数字；票号 10–17 位数字，票面的 784-… 连字符可省可留）
+  //   · 给 null   = 只清这一个字段；clear:true = 两个一起清（与给值互斥，同时给会 400）
+  // 只动这两列：不碰订单状态、履约任务、开票状态，**也不会自动发行程单邮件**
+  //（要发走履约区既有的「重发行程单邮件」）。changedFields 为空 = 库里本来就是这个号。
+  updatePassengerTicket: (
+    token: string,
+    orderId: string,
+    passengerId: string,
+    body: {
+      pnr?: string | null;
+      eticketNumber?: string | null;
+      clear?: true;
+      note?: string;
+    },
+  ) =>
+    apiFetch<{
+      passenger: { id: string };
+      changedFields: Array<'pnr' | 'eticketNumber'>;
+    }>(`/orders/${orderId}/passengers/${passengerId}/ticket`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
+
   // 换酒店：把某条 HOTEL 行（或已盖章酒店的 BUNDLE 行）换到另一个房型/酒店。
   // 价格默认冻结（绝不按新房型 basePrice 重算 unitPrice/amount）；可选加/减「换酒店差价」
   // （feeCny 可负，0 会被拒绝——不调整价格请不要传该字段）。返回更新后的订单。
@@ -5675,6 +6076,37 @@ export const api = {
     },
   },
 
+  // ── 按航班批量回填票号 ────────────────────────────────────────────────
+  // 匹配、冲突判定与要不要覆盖全部由服务端说了算；前端只负责勾选与展示。
+  ticketBackfill: {
+    /**
+     * 干跑：贴名单（或传 .xlsx）→ 逐行解析 + 匹配 + 与库里现值比对，一个字段都不写库。
+     * lines 与 fileBase64 **二选一**，两个都给服务端会 400（猜「以哪个为准」必然有一半时候猜错）。
+     */
+    batchPreview: (
+      token: string,
+      body: { scheduleId: string; lines?: string; fileBase64?: string },
+    ) =>
+      apiFetch<TicketBatchPreview>('/orders/tickets/batch-preview', {
+        method: 'POST',
+        token,
+        body,
+      }),
+    /**
+     * 落库执行。写值本身就是幂等的：库里已经是这个号就一个字段都不写，该条 changedFields 为空。
+     * requestToken 不加锁，只作整批关联号落进审计，重试请沿用同一个，便于事后认出是同一批。
+     */
+    batch: (
+      token: string,
+      body: {
+        requestToken: string;
+        scheduleId: string;
+        entries: TicketBatchEntry[];
+        note?: string;
+      },
+    ) => apiFetch<TicketBatchResponse>('/orders/tickets/batch', { method: 'POST', token, body }),
+  },
+
   // Settlements
   listSettlements: (token: string, query?: { period?: string; agentId?: string; status?: SettlementStatus; page?: number; pageSize?: number }) => {
     const qs = new URLSearchParams();
@@ -5713,6 +6145,9 @@ export const api = {
   // 匿名/不传 token 时响应里完全不含这个 key（0702 反馈 6·成本泄漏修复，见 backend products.routes.ts isCostVisible）。
   listHotels: (activeOnly = false, token?: string | null) =>
     apiFetch<{ hotels: Hotel[] }>(`/products/hotels${activeOnly ? '?active=1' : ''}`, { token }),
+  /** 酒店城市清单（distinct cityCode + 家数；主营地排最前）：产品页城市下拉候选，允许新输入。ADMIN/STAFF。 */
+  listHotelCities: (token: string) =>
+    apiFetch<{ cities: Array<HotelCity & { hotelCount: number }> }>('/products/hotels/cities', { token }),
   createHotel: (token: string, body: Record<string, unknown>) =>
     apiFetch<{ hotel: Hotel }>('/products/hotels', { method: 'POST', token, body }),
   updateHotel: (token: string, id: string, body: Record<string, unknown>) =>
@@ -6054,9 +6489,14 @@ export const api = {
     apiFetch<{ ok: boolean }>(`/cancellation-policies/${id}`, { method: 'DELETE', token }),
 
   // 财务模块（ADMIN-only）— 业务 P&L
-  getFinanceSummary: (token: string, range: { from: string; to: string }) =>
+  getFinanceSummary: (
+    token: string,
+    range: { from: string; to: string },
+    /** 航线筛选（'MFM-DAD' 形状 / 'unknown'）；空 = 全部航线。 */
+    routeKey?: string | null,
+  ) =>
     apiFetch<FinanceSummary>(
-      `/finances/summary?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,
+      `/finances/summary?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}${routeQuery(routeKey)}`,
       { token },
     ),
   getFinanceFlights: (token: string, range: { from: string; to: string }, limit = 100) =>
@@ -6073,9 +6513,9 @@ export const api = {
     apiFetch<OrderPnlDetail>(`/finances/orders/${encodeURIComponent(orderId)}/pnl-detail`, {
       token,
     }),
-  getFinanceMonthly: (token: string, months = 6) =>
-    apiFetch<{ months: number; points: MonthlyPoint[] }>(
-      `/finances/monthly?months=${months}`,
+  getFinanceMonthly: (token: string, months = 6, routeKey?: string | null) =>
+    apiFetch<{ months: number; points: MonthlyPoint[]; routeKey: string | null }>(
+      `/finances/monthly?months=${months}${routeQuery(routeKey)}`,
       { token },
     ),
 
@@ -6215,14 +6655,33 @@ export const api = {
   downloadFinanceExportByFlight: async (
     token: string,
     range: { from: string; to: string },
+    routeKey?: string | null,
   ): Promise<Blob> => {
     const res = await fetch(
-      `${API_BASE}/finances/export-by-flight?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,
+      `${API_BASE}/finances/export-by-flight?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}${routeQuery(routeKey)}`,
       { headers: { Authorization: `Bearer ${token}` } },
     );
     if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
     return res.blob();
   },
+
+  // ── 退款待打款队列 + 实付登记 ────────────────────────────────────────────
+  // 「已核准」不等于「钱打出去了」：核准只是账上认了这笔退款，真金白银是财务手工打的。
+  // 队列 = 已核准但还没登记打款的退款；登记只写打款痕迹，不改退款状态、不动订单金额。
+  listPendingRefundPayouts: (token: string) =>
+    apiFetch<PendingRefundPayoutResult>('/finances/refunds/pending-payout', { token }),
+
+  /** 登记某笔退款已实际打款；重复登记后端直接 409（真打两笔和点两次必须分得清）。 */
+  markRefundPaid: (
+    token: string,
+    orderId: string,
+    refundId: string,
+    body: MarkRefundPaidInput,
+  ) =>
+    apiFetch<{ refund: MarkRefundPaidResult }>(
+      `/orders/${orderId}/refunds/${refundId}/mark-paid`,
+      { method: 'POST', token, body },
+    ),
 
   // 财务对账 xlsx 按订单维度导出（一行一订单，订单毛利）
   downloadFinanceExportByOrder: async (
@@ -6279,19 +6738,26 @@ export const api = {
   ) => apiFetch<{ period: HotelBlockPeriod }>(`/hotel-control/block-periods/${id}`, { method: 'PATCH', token, body }),
   deleteBlockPeriod: (token: string, id: string) =>
     apiFetch<{ id: string }>(`/hotel-control/block-periods/${id}`, { method: 'DELETE', token }),
-  getHotelBoard: (token: string, from: string, to: string) =>
+  // cityCode 可选：只看一个城市（缺省全部城市、按城市分组）
+  getHotelBoard: (token: string, from: string, to: string, cityCode?: string) =>
     apiFetch<HotelControlBoard>(
-      `/hotel-control/board?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+      `/hotel-control/board?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${hotelCityQuery(cityCode)}`,
       { token },
     ),
-  getHotelForward: (token: string, from: string, to: string) =>
+  getHotelForward: (token: string, from: string, to: string, cityCode?: string) =>
     apiFetch<HotelControlForward>(
-      `/hotel-control/forward?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+      `/hotel-control/forward?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${hotelCityQuery(cityCode)}`,
       { token },
     ),
-  getRandomTierShortfall: (token: string, from: string, to: string, signal?: AbortSignal) =>
+  getRandomTierShortfall: (
+    token: string,
+    from: string,
+    to: string,
+    signal?: AbortSignal,
+    cityCode?: string,
+  ) =>
     apiFetch<RandomTierShortfall>(
-      `/hotel-control/random-tier-shortfall?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`,
+      `/hotel-control/random-tier-shortfall?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}${hotelCityQuery(cityCode)}`,
       { token, signal },
     ),
   // 提醒线（超卖加房 / 富余退房 / 班次超开票上限；按需计算，无 cron）
@@ -6311,12 +6777,15 @@ export const api = {
   getHotelRecentChanges: (token: string, days = 7) =>
     apiFetch<HotelRecentRoomChanges>(`/hotel-control/recent-changes?days=${days}`, { token }),
 
-  // ── 结算价日历（ADMIN/STAFF）— 出发日期 × 晚数 × 档次网格 ────────────────
+  // ── 结算价日历（ADMIN/STAFF）— 航线 × 出发日期 × 晚数 × 档次网格 ────────
+  /** 可维护航线（日历页 / 立减页的航线下拉），有价的线排前面 */
+  listSettlementRateRoutes: (token: string) =>
+    apiFetch<{ routes: SettlementRoute[] }>('/settlement-rates/routes', { token }),
   listSettlementRates: (
     token: string,
-    params: { from: string; to: string; nights?: number; tier?: SettlementTier },
+    params: { routeKey: string; from: string; to: string; nights?: number; tier?: SettlementTier },
   ) => {
-    const qs = new URLSearchParams({ from: params.from, to: params.to });
+    const qs = new URLSearchParams({ routeKey: params.routeKey, from: params.from, to: params.to });
     if (params.nights != null) qs.set('nights', String(params.nights));
     if (params.tier) qs.set('tier', params.tier);
     return apiFetch<{ rates: SettlementRate[] }>(`/settlement-rates?${qs.toString()}`, { token });
@@ -6334,6 +6803,8 @@ export const api = {
   listSettlementDiscounts: (
     token: string,
     query?: {
+      /** 缺省 = 全部航线（代理详情页看跨航线的专属规则） */
+      routeKey?: string;
       kind?: SettlementDiscountKind;
       agentId?: string;
       tier?: SettlementTier;
@@ -6531,6 +7002,14 @@ export const api = {
       { token },
     );
   },
+  // 认款建议：服务端匹配引擎（金额 + 备注订单号/姓名/代理/手机尾号 + 时间邻近），
+  // 按 HIGH / MEDIUM / LOW 分档 + 组合建议。只出建议不入账——认款仍走 allocateReceipt / allocateReceiptBatch。
+  suggestReceiptMatches: (token: string, body?: ReceiptMatchSuggestInput) =>
+    apiFetch<ReceiptMatchSuggestResult>('/receipts/match/suggest', {
+      method: 'POST',
+      token,
+      body: body ?? {},
+    }),
   // 流水核对表导出（xlsx；含认款状态/认到订单/认款人列）。返回 Blob 直接下载。
   exportReceiptStatement: async (token: string, query?: { from?: string; to?: string }): Promise<Blob> => {
     const qs = new URLSearchParams();
@@ -6575,6 +7054,16 @@ export const api = {
       method: 'POST',
       token,
       body: {},
+    }),
+
+  // ── Feature flag（ADMIN/STAFF 可看，改仅 ADMIN）───────────────────────────
+  getFeatureFlags: (token: string) =>
+    apiFetch<{ flags: FeatureFlagView[] }>('/settings/feature-flags', { token }),
+  setFeatureFlag: (token: string, key: FeatureFlagKey, enabled: boolean) =>
+    apiFetch<{ flags: FeatureFlagView[] }>(`/settings/feature-flags/${key}`, {
+      method: 'PUT',
+      token,
+      body: { enabled },
     }),
 };
 
@@ -6624,8 +7113,62 @@ export interface CostBreakdown {
   other: number;
   total: number;
 }
+// ── 退款待打款队列 ────────────────────────────────────────────────────────────
+/** 打款渠道（与后端 REFUND_PAY_METHODS 同一份白名单）。 */
+export type RefundPayMethod = 'BANK' | 'WECHAT' | 'ALIPAY' | 'CASH' | 'OTHER';
+export const REFUND_PAY_METHOD_LABEL: Record<RefundPayMethod, string> = {
+  BANK: '银行转账',
+  WECHAT: '微信',
+  ALIPAY: '支付宝',
+  CASH: '现金',
+  OTHER: '其他',
+};
+
+export interface PendingRefundPayoutRow {
+  refundId: string;
+  orderId: string;
+  orderNumber: string;
+  contactName: string;
+  agencyLabel: string | null;
+  amountCny: number;
+  reason: string | null;
+  /** 申请日（ISO） */
+  requestedAt: string;
+  /** 核准日（ISO）；老数据可能为空 */
+  approvedAt: string | null;
+  ageDays: number;
+  isSwapRefund: boolean;
+}
+
+export interface PendingRefundPayoutResult {
+  rows: PendingRefundPayoutRow[];
+  totalAmountCny: number;
+  /** 账龄 ≥7 天的笔数 */
+  overdueCount: number;
+}
+
+export interface MarkRefundPaidInput {
+  /** ISO 时间串；省略 = 此刻。允许回溯补录，未来时刻后端拒。 */
+  paidAt?: string;
+  paidMethod: RefundPayMethod;
+  paidTxnRef?: string;
+  paidNote?: string;
+}
+
+export interface MarkRefundPaidResult {
+  refundId: string;
+  orderNumber: string;
+  amountCny: number;
+  paidAt: string;
+  paidMethod: RefundPayMethod;
+  paidTxnRef: string | null;
+  paidNote: string | null;
+}
+
 export interface FinanceSummary {
   range: { from: string; to: string };
+  /** 本次统计圈定的航线（null = 全部航线）；'unknown' = 只看推不出航线的单。 */
+  routeKey: string | null;
   revenueCny: number;
   costCny: number;
   grossMarginCny: number | null; // A5：缺成本时 null（未知）
@@ -6660,7 +7203,6 @@ export interface FlightPnlRow {
 export type CostSource = 'override' | 'period' | 'none';
 
 /** 内部岗位：null=通用运营；财务岗可见财务页与经营报表，导出不裁剪。 */
-export type StaffRole = 'VISA_DESK' | 'TICKETING' | 'ROOM_CONTROL' | 'FINANCE';
 export interface StaffUser {
   id: string;
   email: string | null;
@@ -6871,14 +7413,23 @@ export interface MonthlyPoint {
   orderCount: number;
 }
 
-export type ProductKind = 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'BUNDLE' | 'INSURANCE';
+/**
+ * 退订政策的产品维度。名字容易误导：它对应的库表列是 `CancellationPolicy.productKind`，
+ * 而那一列在 schema.prisma 里的类型是 **OrderItemKind**，不是同名的 Prisma ProductKind
+ *（后者没有 INSURANCE）。所以这里取 OrderItemKind 的子集，值与从前逐字相同；
+ * OrderItemKind 哪天少一档，这里编译期就会红。
+ */
+export type ProductKind = Extract<
+  OrderItemKind,
+  'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'BUNDLE' | 'INSURANCE'
+>;
 
 /**
- * 返佣计提的产品维度 —— 必须与后端 Prisma `enum ProductKind` 逐字对齐
- * （后端没有 INSURANCE 这一档，故这里不能直接复用上面的 ProductKind）。
+ * 返佣计提的产品维度 = 后端 Prisma `enum ProductKind`，现在直接取契约包那份，不再手抄
+ *（上面那个 ProductKind 是退订政策用的 OrderItemKind 子集，两者同名不同物，别混）。
  * 套餐（BUNDLE）是独立一档费率，与机票并列、各配各的，不是复用机票档。
  */
-export type CommissionKind = 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'BUNDLE';
+export type CommissionKind = ContractProductKind;
 
 export interface CancellationTier {
   hoursBeforeDeparture: number;
@@ -6965,6 +7516,16 @@ export interface AiOcrConfigInput {
   enabled?: boolean;
 }
 
+// ── Feature flag（GET/PUT /settings/feature-flags）──────────────────────────
+export type FeatureFlagKey = 'REMINDER_AUTO_GENERATE' | 'REMINDER_WEBHOOK_PUSH' | 'REMINDER_BELL_ALL';
+
+export interface FeatureFlagView {
+  key: FeatureFlagKey;
+  label: string;
+  enabled: boolean;
+  default: boolean;
+}
+
 // ── 代理认款 / 收款码绑代理 ──────────────────────────────────────────────
 // 与 backend agent-recharges 模块对齐（AgentRechargesService 序列化形态）+
 // payment-channels 模块新增的 agentId/agentName 字段（专属代理收款码）。
@@ -6972,7 +7533,6 @@ export interface AiOcrConfigInput {
 // 调用方按 `agentRechargeApi.xxx(token, ...)` 使用，风格与 `api.xxx(token, ...)` 一致。
 
 /** 代理认款状态：待审核 / 已确认到账 / 已驳回 */
-export type AgentRechargeStatus = 'PENDING' | 'CONFIRMED' | 'REJECTED';
 
 export const AGENT_RECHARGE_STATUS_LABEL: Record<AgentRechargeStatus, string> = {
   PENDING: '待审核',
@@ -7056,8 +7616,9 @@ export type PaymentChannelWithAgent = PaymentChannel & {
 };
 
 /** CreatePaymentChannelInput / UpdatePaymentChannelInput 的 agentId 扩展（同上，独立叠加不改原类型）。 */
-export type CreatePaymentChannelWithAgentInput = CreatePaymentChannelInput & { agentId?: string };
-export type UpdatePaymentChannelWithAgentInput = UpdatePaymentChannelInput & { agentId?: string | null };
+// 契约包那份本来就带 agentId（专属代理收款码），不用再自己交叉一层。
+export type CreatePaymentChannelWithAgentInput = ContractCreatePaymentChannelInput;
+export type UpdatePaymentChannelWithAgentInput = ContractUpdatePaymentChannelInput;
 
 export const agentRechargeApi = {
   /** 提交认款申请（AGENT 为自己；ADMIN/STAFF 需在 body 里指定 agentId） */
@@ -7137,10 +7698,13 @@ export interface HotelNightlyRemainingResult {
 }
 
 export const hotelControlOpsApi = {
-  /** 房态导出（xlsx）—— 销控矩阵原样导出；ADMIN/STAFF only。 */
-  downloadBoardExport: async (token: string, range: { from: string; to: string }): Promise<Blob> => {
+  /** 房态导出（xlsx）—— 销控矩阵原样导出（按城市分块；cityCode 可选只导一城）；ADMIN/STAFF only。 */
+  downloadBoardExport: async (
+    token: string,
+    range: { from: string; to: string; cityCode?: string },
+  ): Promise<Blob> => {
     const res = await fetch(
-      `${API_BASE}/hotel-control/export?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,
+      `${API_BASE}/hotel-control/export?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}${hotelCityQuery(range.cityCode)}`,
       { headers: { Authorization: `Bearer ${token}` } },
     );
     if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
@@ -7180,16 +7744,17 @@ export const hotelControlOpsApi = {
   },
 
   /**
-   * 占房下钻：某酒店 / 某星级随机池某晚是谁占的（销控矩阵余量格点击用）。
-   * hotelId 与 randomStarTier 二选一（池组的 hotelId 是合成键，不能当酒店 id 传）。
+   * 占房下钻：某酒店 / 某城市某星级随机池某晚是谁占的（销控矩阵余量格点击用）。
+   * hotelId 与 randomStarTier 二选一（池组的 hotelId 是合成键，不能当酒店 id 传）；
+   * 随机池下钻必须带 cityCode（随机档按城市圈定）。
    */
   getHotelOccupants: (
     token: string,
-    params: { hotelId?: string; randomStarTier?: RandomStarTier; date: string },
+    params: { hotelId?: string; randomStarTier?: RandomStarTier; cityCode?: string; date: string },
   ) => {
     const scope =
       params.randomStarTier != null
-        ? `randomStarTier=${params.randomStarTier}`
+        ? `randomStarTier=${params.randomStarTier}${hotelCityQuery(params.cityCode)}`
         : `hotelId=${encodeURIComponent(params.hotelId ?? '')}`;
     return apiFetch<{ occupants: HotelOccupant[] }>(
       `/hotel-control/occupants?${scope}&date=${encodeURIComponent(params.date)}`,
@@ -7218,7 +7783,6 @@ export const hotelControlOpsApi = {
 //                                                    + 下级名下的，当前前端未使用这条）
 //   POST /settlement-requests/:id/approve|reject    运营确认/驳回（ADMIN/STAFF）
 
-export type SettlementRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
 
 /**
  * 议价申请 —— 详情页「本单申请列表」与运营待办队列共用同一份序列化形状（后端
@@ -7362,7 +7926,6 @@ export const settlementRequestsApi = {
 // ── 套餐改档申请（代理提申请 → 运营确认后执行既有「套餐改档」）── 独立命名空间，
 // 对应 backend/src/modules/bundle-change-requests/*。
 
-export type BundleChangeRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
 
 export interface BundleChangeRequest {
   id: string;
@@ -7456,8 +8019,17 @@ export const bundleChangeRequestsApi = {
 // 对应 backend/src/modules/order-change-requests/*。与「套餐改档申请」并行：改的是
 // 套餐之外的航班/签证状态/酒店/舱位四类字段，运营确认后由服务端直接调用既有的纠错改航班/
 // 签证状态/换酒店/升舱端点，前端不需要重新实现这些动作本身。
-export type OrderChangeRequestKind = 'FLIGHT' | 'VISA' | 'HOTEL' | 'CABIN';
-export type OrderChangeRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
+// SPLIT / CANCEL_LEG / VISA_EXEMPT 三类挂在后端 feature flag AGENT_CHANGE_REQUEST_EXTRA_KINDS
+// 后面（默认关）。前台不猜开没开，一律以 GET /order-change-requests/kinds 的返回为准
+// （/settings/feature-flags 只对运营开放，代理读不到，不能拿那条路当判据）。
+export type OrderChangeRequestKind =
+  | 'FLIGHT'
+  | 'VISA'
+  | 'HOTEL'
+  | 'CABIN'
+  | 'SPLIT'
+  | 'CANCEL_LEG'
+  | 'VISA_EXEMPT';
 /** 改单申请里的签证目标状态：比录单/签证台的 VisaStatusInput 少一档（不收 HAS_VISA——那不是「要改成」的目标，是已完成态）。 */
 export type ChangeRequestVisaStatus = 'NEEDED' | 'E_VISA' | 'NOT_NEEDED';
 
@@ -7465,7 +8037,40 @@ export type OrderChangeRequestPayload =
   | { itemId: string; newScheduleId: string }
   | { toVisaStatus: ChangeRequestVisaStatus }
   | { itemId: string; toHotelRoomTypeId: string }
-  | { itemId: string; toCabin: 'BUSINESS' };
+  | { itemId: string; toCabin: 'BUSINESS' }
+  // 扩展三类。都不带金额字段：拆单按每人份额、取消单程按取消政策、改自备签按建单快照费率，
+  // 三笔钱全由服务端权威算，提交侧填不进去也不该填。
+  | { passengerIds: string[]; note?: string }
+  | { leg: 'OUTBOUND' | 'RETURN'; note?: string }
+  | { passengerId: string; visaExempt: boolean; note?: string };
+
+/**
+ * 三类扩展提交前的只读预检（POST /orders/:id/change-requests/preview）。
+ * eligible=false 时 blockers 是人话逐条，直接摆给提交方看，别自己拼文案。
+ */
+export interface OrderChangeRequestPreview {
+  kind: OrderChangeRequestKind;
+  eligible: boolean;
+  blockers: string[];
+  warnings: string[];
+  /** 取消单程：按当下取消政策算出的预估退款。是**预估不是承诺**——确认那一刻会重算。 */
+  cancelLeg: {
+    leg: 'OUTBOUND' | 'RETURN';
+    legLabel: string;
+    flightNumber: string | null;
+    /** 出发当地日 YYYY-MM-DD（按出发地时区折算，不是 UTC）。 */
+    departDate: string | null;
+    refundCny: number;
+    policyName: string | null;
+    /** true = 有需回执的提示（多为该段已出票），运营确认时要勾「我已知悉」。 */
+    requiresAcknowledgement: boolean;
+  } | null;
+  /** 拆单：随拆搬走的应收份额与每人份额明细。 */
+  split: {
+    movedShareCny: number;
+    shares: Array<{ passengerId: string; fullName: string; shareCny: number }>;
+  } | null;
+}
 
 export interface OrderChangeRequest {
   id: string;
@@ -7554,6 +8159,25 @@ export const orderChangeRequestsApi = {
       results: OrderChangeRequestBatchResultItem[];
     }>('/order-change-requests/batch', { method: 'POST', token, body }),
 
+  /**
+   * 当前身份能提哪几类申请。基础四类恒有；扩展三类只在后端 flag 开着时才回。
+   * 前台据此决定申请类型下拉里出不出「拆单 / 取消单程 / 改自备签」。
+   */
+  getOrderChangeRequestKinds: (token: string) =>
+    apiFetch<{ kinds: OrderChangeRequestKind[] }>('/order-change-requests/kinds', { token }),
+
+  /** 三类扩展提交前的只读预检：blockers + 预估退款 / 拆出份额。不落任何东西。 */
+  previewOrderChangeRequest: (
+    token: string,
+    orderId: string,
+    body: { kind: OrderChangeRequestKind; payload: OrderChangeRequestPayload },
+  ) =>
+    apiFetch<OrderChangeRequestPreview>(`/orders/${orderId}/change-requests/preview`, {
+      method: 'POST',
+      token,
+      body,
+    }),
+
   /** 查询改单申请列表（AGENT 服务端自动收窄到自家范围）。 */
   listOrderChangeRequests: (
     token: string,
@@ -7581,7 +8205,12 @@ export const orderChangeRequestsApi = {
   approveOrderChangeRequest: (
     token: string,
     id: string,
-    body?: { decisionNote?: string; designatedHotelStarMismatchReason?: string },
+    body?: {
+      decisionNote?: string;
+      designatedHotelStarMismatchReason?: string;
+      /** 取消单程专用：该段已出票等「需回执」提示的我已知悉。不勾则后端 400，绝不静默放行。 */
+      acknowledgeWarnings?: boolean;
+    },
   ) =>
     apiFetch<{ request: OrderChangeRequest; order: OrderSummary }>(
       `/order-change-requests/${id}/approve`,

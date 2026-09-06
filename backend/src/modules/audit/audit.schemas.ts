@@ -1,16 +1,10 @@
-import { z } from 'zod';
-import { AuditSeverity, AuditTargetType } from '@prisma/client';
-
-export const listAuditLogsQuerySchema = z.object({
-  actorUserId: z.string().optional(),
-  targetType: z.nativeEnum(AuditTargetType).optional(),
-  targetId: z.string().optional(),
-  action: z.string().max(80).optional(),
-  severity: z.nativeEnum(AuditSeverity).optional(),
-  search: z.string().max(120).optional(), // 模糊 actor/target label
-  from: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-  to: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-  page: z.coerce.number().int().min(1).default(1),
-  pageSize: z.coerce.number().int().min(1).max(500).default(100),
-});
-export type ListAuditLogsQuery = z.infer<typeof listAuditLogsQuerySchema>;
+/**
+ * 审计日志查询参数 —— 定义已搬进 @ftm/contracts（packages/contracts/src/audit.ts）。
+ *
+ * 校验规则一字未改：只把 z.nativeEnum(PrismaEnum) 换成契约包镜像的同值 schema
+ *（枚举漂移测试守着两边一致），helper 的 import 改指契约包里的同一份实现。
+ *
+ * 这里留 re-export 壳子，既有 import 路径全部继续可用；前端从 @ftm/contracts
+ * 取同一份类型，不再手抄。
+ */
+export * from '@ftm/contracts/audit';

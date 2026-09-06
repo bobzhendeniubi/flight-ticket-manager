@@ -1,6 +1,10 @@
 # 排除 node_modules — 镜像内重装
 **/node_modules
 **/dist
+# tsc 的增量状态：dist 已经排除了，要是把本机的 .tsbuildinfo 带进来，
+# 容器里的 tsc -b 会以为「已经是最新的」直接跳过、什么都不编，
+# 然后 runner 阶段 COPY dist 报 not found。两者必须一起排除。
+**/*.tsbuildinfo
 **/.next
 **/build
 **/.turbo

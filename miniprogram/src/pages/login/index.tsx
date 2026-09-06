@@ -7,10 +7,11 @@
  *   - 小程序里 Taro.getUserProfile 必须由用户主动点击按钮触发（不能在 useEffect 里自动调）
  *   - userInfo 拿到 nickName / avatarUrl 只是展示用，真身份 = openid（后端拿 code 换）
  */
-import { useState } from 'react';
+import { useEffect, useState } from 'react';
 import Taro from '@tarojs/taro';
 import { View, Text, Input } from '@tarojs/components';
 import { api, ApiError } from '../../lib/api';
+import { loadPublicRoutes, routeSummaryText } from '../../lib/routes';
 import { useAuth } from '../../stores/auth';
 import './index.scss';
 
@@ -20,6 +21,18 @@ export default function LoginPage() {
   const [email, setEmail] = useState('customer@ftm.local');
   const [password, setPassword] = useState('Password123!');
   const [loading, setLoading] = useState(false);
+  // 航线摘要（拉不到/暂无数据时 routeSummaryText 回品牌名「椰岛假期」，不写死目的地）。
+  const [routeText, setRouteText] = useState('椰岛假期');
+
+  useEffect(() => {
+    let cancelled = false;
+    void loadPublicRoutes().then((routes) => {
+      if (!cancelled) setRouteText(routeSummaryText(routes));
+    });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const loginWechat = async () => {
     setLoading(true);
@@ -77,8 +90,8 @@ export default function LoginPage() {
   return (
     <View className='login-page'>
       <View className='hero'>
-        <Text className='title'>世途旅行</Text>
-        <Text className='sub'>澳门 ⇌ 岘港 · 越南专线</Text>
+        <Text className='title'>椰岛假期</Text>
+        <Text className='sub'>{routeText}</Text>
       </View>
 
       <View className='tabs'>

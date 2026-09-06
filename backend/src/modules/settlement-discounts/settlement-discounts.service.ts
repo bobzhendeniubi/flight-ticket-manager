@@ -1,6 +1,10 @@
 /**
  * 结算价立减规则：固定金额（CNY/人）叠加在结算价日历或散客套餐折扣之后。
  * 规则命中只读 active 规则；订单写入命中结果快照，历史订单不回查本表。
+ *
+ * 航线维度：规则按 routeKey 隔离（去程方向「起飞-到达」机场码，与结算价日历同一把键）。
+ * 命中时 routeKey 由调用方从套餐绑定航班派生（modules/products/bundle-route.ts）——派生不到就不该来问，
+ * 本模块不提供默认航线。同组唯一性 = (routeKey, kind, agentId, tier, nights) 内启用窗口不重叠。
  */
 import { Prisma, SettlementDiscountKind, SettlementTier, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
@@ -15,6 +19,7 @@ export type PrismaLike = Pick<PrismaClient, 'settlementDiscountRule' | '$transac
 
 export interface SettlementDiscountRuleDto {
   id: string;
+  routeKey: string;
   kind: SettlementDiscountKind;
   agentId: string | null;
   tier: SettlementTier;
@@ -37,6 +42,7 @@ export type SettlementDiscountHit = {
 
 type RuleRow = {
   id: string;
+  routeKey: string;
   kind: SettlementDiscountKind;
   agentId: string | null;
   tier: SettlementTier;
@@ -54,6 +60,7 @@ type RuleRow = {
 function serialize(row: RuleRow): SettlementDiscountRuleDto {
   return {
     id: row.id,
+    routeKey: row.routeKey,
     kind: row.kind,
     agentId: row.agentId,
     tier: row.tier,
@@ -81,8 +88,15 @@ function validateEntry(rule: DiscountRuleEntry): void {
   }
 }
 
-function groupKey(rule: { kind: SettlementDiscountKind; agentId?: string | null; tier: SettlementTier; nights: number }): string {
-  return [rule.kind, rule.agentId ?? '', rule.tier, rule.nights].join('|');
+/** 同组键（航线 × 类型 × 归属代理 × 档次 × 晚数）：组内启用窗口不得重叠；不同航线互不冲突。 */
+function groupKey(rule: {
+  routeKey: string;
+  kind: SettlementDiscountKind;
+  agentId?: string | null;
+  tier: SettlementTier;
+  nights: number;
+}): string {
+  return [rule.routeKey, rule.kind, rule.agentId ?? '', rule.tier, rule.nights].join('|');
 }
 
 function overlaps(a: { startDate: string | Date; endDate: string | Date }, b: { startDate: string | Date; endDate: string | Date }): boolean {
@@ -93,10 +107,17 @@ function overlaps(a: { startDate: string | Date; endDate: string | Date }, b: { 
   return aStart <= bEnd && bStart <= aEnd;
 }
 
-function ruleLabel(rule: { id?: string; kind: SettlementDiscountKind; agentId?: string | null; startDate: string | Date; endDate: string | Date }): string {
+function ruleLabel(rule: {
+  id?: string;
+  routeKey: string;
+  kind: SettlementDiscountKind;
+  agentId?: string | null;
+  startDate: string | Date;
+  endDate: string | Date;
+}): string {
   const start = typeof rule.startDate === 'string' ? rule.startDate : utcDateToYmd(rule.startDate);
   const end = typeof rule.endDate === 'string' ? rule.endDate : utcDateToYmd(rule.endDate);
-  return `${rule.id ? `规则 ${rule.id}` : '本批规则'}（${rule.kind}${rule.agentId ? `/${rule.agentId}` : ''}，${start} 至 ${end}）`;
+  return `${rule.id ? `规则 ${rule.id}` : '本批规则'}（${rule.routeKey} ${rule.kind}${rule.agentId ? `/${rule.agentId}` : ''}，${start} 至 ${end}）`;
 }
 
 const KIND_LABELS: Record<SettlementDiscountKind, string> = {
@@ -137,6 +158,11 @@ async function assertIdentityColumnsUnchanged(
       );
     }
     const incomingAgentId = rule.agentId ?? null;
+    if (existing.routeKey !== rule.routeKey) {
+      throw new BadRequestError(
+        `第 ${rowNumber} 行试图把已有规则的航线从「${existing.routeKey}」改为「${rule.routeKey}」——不同航线请用「新增规则」另建一条，原规则可停用或删除`,
+      );
+    }
     if (existing.kind !== rule.kind) {
       throw new BadRequestError(
         `第 ${rowNumber} 行试图把已有规则的类型从「${KIND_LABELS[existing.kind]}」改为「${KIND_LABELS[rule.kind]}」——不同类型请用「新增规则」另建一条，原规则可停用或删除`,
@@ -170,6 +196,7 @@ async function assertNoWindowOverlap(
   const groups = [
     ...new Map(
       activeIncoming.map((rule) => [groupKey(rule), {
+        routeKey: rule.routeKey,
         kind: rule.kind,
         agentId: rule.agentId ?? null,
         tier: rule.tier,
@@ -219,6 +246,7 @@ export async function listDiscountRules(
   }
   const rows = await client.settlementDiscountRule.findMany({
     where: {
+      ...(q.routeKey ? { routeKey: q.routeKey } : {}),
       ...(q.kind ? { kind: q.kind } : {}),
       ...(q.agentId ? { agentId: q.agentId } : {}),
       ...(q.tier ? { tier: q.tier } : {}),
@@ -261,6 +289,7 @@ export async function upsertDiscountRules(
 
   const operations = rules.map((r) => {
     const data = {
+      routeKey: r.routeKey,
       kind: r.kind,
       agentId: r.agentId ?? null,
       tier: r.tier,
@@ -351,6 +380,7 @@ function latestHit(rows: RuleRow[], layer: SettlementDiscountKind): SettlementDi
 }
 
 async function findMatching(
+  routeKey: string,
   kind: SettlementDiscountKind,
   agentId: string | null,
   tier: SettlementTier,
@@ -367,6 +397,7 @@ async function findMatching(
   }
   return (await client.settlementDiscountRule.findMany({
     where: {
+      routeKey,
       kind,
       agentId,
       tier,
@@ -379,14 +410,20 @@ async function findMatching(
   })) as RuleRow[];
 }
 
+/**
+ * 代理立减命中：先专属（AGENT）后兜底（AGENT_DEFAULT），两层都只在**本航线**内找。
+ * routeKey 由调用方从套餐绑定航班派生；派生不到就不该调用（没有航线 = 不匹配立减）。
+ */
 export async function resolveAgentSettlementDiscount(
   agentId: string,
+  routeKey: string,
   tier: SettlementTier,
   nights: number,
   departDate: string,
   client: PrismaLike = defaultPrisma,
 ): Promise<SettlementDiscountHit | null> {
   const specific = await findMatching(
+    routeKey,
     SettlementDiscountKind.AGENT,
     agentId,
     tier,
@@ -398,6 +435,7 @@ export async function resolveAgentSettlementDiscount(
   if (specificHit) return specificHit;
 
   const fallback = await findMatching(
+    routeKey,
     SettlementDiscountKind.AGENT_DEFAULT,
     null,
     tier,
@@ -408,13 +446,16 @@ export async function resolveAgentSettlementDiscount(
   return latestHit(fallback, SettlementDiscountKind.AGENT_DEFAULT);
 }
 
+/** 散客立减命中（RETAIL），同样只在本航线内找。 */
 export async function resolveRetailSettlementDiscount(
+  routeKey: string,
   tier: SettlementTier,
   nights: number,
   departDate: string,
   client: PrismaLike = defaultPrisma,
 ): Promise<SettlementDiscountHit | null> {
   const rows = await findMatching(
+    routeKey,
     SettlementDiscountKind.RETAIL,
     null,
     tier,

@@ -1,17 +1,10 @@
-import { z } from 'zod';
-
-// ── 候补登记 ─────────────────────────────────────────────────────────────
-// 业务规则：售罄/余票不足时登记候补；单次 1-9 张（与锁位上限一致）；留电话供运营回访
-export const createWaitlistBodySchema = z.object({
-  flightScheduleId: z.string().min(1),
-  seatClassId: z.string().min(1),
-  qty: z.number().int().min(1).max(9),
-  contactPhone: z.string().min(1).max(32),
-});
-export type CreateWaitlistBody = z.infer<typeof createWaitlistBodySchema>;
-
-// ── 运营查询：某班次的候补名单 ───────────────────────────────────────────
-export const listWaitlistQuerySchema = z.object({
-  scheduleId: z.string().min(1),
-});
-export type ListWaitlistQuery = z.infer<typeof listWaitlistQuerySchema>;
+/**
+ * 候补登记的请求体 —— 定义已搬进 @ftm/contracts（packages/contracts/src/waitlist.ts）。
+ *
+ * 校验规则一字未改：只把 z.nativeEnum(PrismaEnum) 换成契约包镜像的同值 schema
+ *（枚举漂移测试守着两边一致），helper 的 import 改指契约包里的同一份实现。
+ *
+ * 这里留 re-export 壳子，既有 import 路径全部继续可用；前端从 @ftm/contracts
+ * 取同一份类型，不再手抄。
+ */
+export * from '@ftm/contracts/waitlist';

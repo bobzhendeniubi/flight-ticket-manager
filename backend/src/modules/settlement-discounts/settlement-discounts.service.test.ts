@@ -8,8 +8,11 @@ import {
   upsertDiscountRules,
 } from './settlement-discounts.service.js';
 
+const ROUTE = 'MFM-DAD';
+
 const baseRule = {
   id: 'rule-1',
+  routeKey: ROUTE,
   kind: SettlementDiscountKind.AGENT,
   agentId: 'agent-1',
   tier: SettlementTier.CITY_3STAR,
@@ -30,6 +33,7 @@ function clientWithFindMany(findMany: ReturnType<typeof vi.fn>): PrismaClient {
 
 function entry(overrides: Record<string, unknown> = {}) {
   return {
+    routeKey: ROUTE,
     kind: SettlementDiscountKind.AGENT,
     agentId: 'agent-1',
     tier: SettlementTier.CITY_3STAR,
@@ -57,6 +61,7 @@ describe('resolveAgentSettlementDiscount', () => {
       ]);
     const hit = await resolveAgentSettlementDiscount(
       'agent-1',
+      ROUTE,
       SettlementTier.CITY_3STAR,
       3,
       '2026-08-15',
@@ -82,12 +87,12 @@ describe('resolveAgentSettlementDiscount', () => {
     ]);
     const client = clientWithFindMany(findMany);
     await expect(
-      resolveAgentSettlementDiscount('agent-1', SettlementTier.CITY_3STAR, 3, '2026-08-15', client),
+      resolveAgentSettlementDiscount('agent-1', ROUTE, SettlementTier.CITY_3STAR, 3, '2026-08-15', client),
     ).resolves.toMatchObject({ ruleId: 'default-1', discountPerPersonCny: 100 });
 
     findMany.mockReset().mockResolvedValue([]);
     await expect(
-      resolveAgentSettlementDiscount('agent-1', SettlementTier.CITY_3STAR, 3, '2026-08-15', client),
+      resolveAgentSettlementDiscount('agent-1', ROUTE, SettlementTier.CITY_3STAR, 3, '2026-08-15', client),
     ).resolves.toBeNull();
   });
 });
@@ -104,6 +109,7 @@ describe('resolveRetailSettlementDiscount', () => {
       },
     ]);
     const hit = await resolveRetailSettlementDiscount(
+      ROUTE,
       SettlementTier.CITY_3STAR,
       3,
       '2026-08-15',
@@ -114,6 +120,7 @@ describe('resolveRetailSettlementDiscount', () => {
       kind: SettlementDiscountKind.RETAIL,
       discountPerPersonCny: 80,
     });
+    expect(findMany.mock.calls[0][0].where.routeKey).toBe(ROUTE);
     expect(findMany.mock.calls[0][0].where.kind).toBe(SettlementDiscountKind.RETAIL);
     expect(findMany.mock.calls[0][0].where.agentId).toBeNull();
   });
@@ -139,6 +146,7 @@ describe('resolveRetailSettlementDiscount', () => {
     ]);
     await expect(
       resolveRetailSettlementDiscount(
+        ROUTE,
         SettlementTier.CITY_3STAR,
         3,
         '2026-08-15',
@@ -208,6 +216,7 @@ describe('upsertDiscountRules window validation', () => {
     expect(findMany).toHaveBeenCalledWith(expect.objectContaining({
       where: expect.objectContaining({
         OR: [{
+          routeKey: ROUTE,
           kind: SettlementDiscountKind.AGENT,
           agentId: 'agent-1',
           tier: SettlementTier.CITY_3STAR,
@@ -335,5 +344,69 @@ describe('upsertDiscountRules window validation', () => {
       },
     } as unknown as PrismaClient;
     await expect(deleteDiscountRule('rule-1', client)).resolves.toBeNull();
+  });
+});
+
+describe('立减规则按航线隔离', () => {
+  it('同代理同档同晚同窗口、不同航线 → 不算重叠，各自落库', async () => {
+    const findMany = vi.fn().mockResolvedValue([]);
+    const create = vi.fn().mockImplementation(({ data }) => Promise.resolve({ ...baseRule, ...data, id: `new-${data.routeKey}` }));
+    const client = {
+      settlementDiscountRule: { findMany, update: vi.fn(), create },
+      $transaction: vi.fn((operations: Promise<unknown>[]) => Promise.all(operations)),
+    } as unknown as PrismaClient;
+
+    const rows = await upsertDiscountRules(
+      [entry({ routeKey: 'MFM-DAD' }), entry({ routeKey: 'MFM-CXR' })],
+      'user-1',
+      client,
+    );
+
+    expect(rows.map((r) => r.routeKey)).toEqual(['MFM-DAD', 'MFM-CXR']);
+    // 库内重叠查询按「航线 × 类型 × 代理 × 档次 × 晚数」分组，两条航线是两组
+    const or = findMany.mock.calls.at(-1)?.[0].where.OR as Array<{ routeKey: string }>;
+    expect(or.map((g) => g.routeKey).sort()).toEqual(['MFM-CXR', 'MFM-DAD']);
+    expect(create.mock.calls.map((c) => c[0].data.routeKey)).toEqual(['MFM-DAD', 'MFM-CXR']);
+  });
+
+  it('库内既有另一条航线的同组同窗口启用规则 → 不冲突；同航线才冲突', async () => {
+    const otherRoute = { ...baseRule, id: 'rule-cxr', routeKey: 'MFM-CXR' };
+    const findMany = vi.fn().mockResolvedValue([otherRoute]);
+    const create = vi.fn().mockResolvedValue(baseRule);
+    const client = {
+      settlementDiscountRule: { findMany, update: vi.fn(), create },
+      $transaction: vi.fn((operations: Promise<unknown>[]) => Promise.all(operations)),
+    } as unknown as PrismaClient;
+
+    // 与 rule-cxr 同窗口（8 月）但航线是 MFM-DAD → 放行
+    await expect(
+      upsertDiscountRules([entry({ startDate: '2026-08-01', endDate: '2026-08-31' })], 'user-1', client),
+    ).resolves.toHaveLength(1);
+
+    // 同航线同窗口 → 拒
+    findMany.mockResolvedValue([{ ...otherRoute, routeKey: 'MFM-DAD' }]);
+    await expect(
+      upsertDiscountRules([entry({ startDate: '2026-08-01', endDate: '2026-08-31' })], 'user-1', client),
+    ).rejects.toThrow('出发日期窗口重叠');
+  });
+
+  it('命中只在本航线内找：代理专属 / 兜底 / 散客的 where 都带 routeKey', async () => {
+    const findMany = vi.fn().mockResolvedValue([]);
+    const client = clientWithFindMany(findMany);
+
+    await resolveAgentSettlementDiscount('agent-1', 'MFM-CXR', SettlementTier.CITY_3STAR, 3, '2026-08-15', client);
+    await resolveRetailSettlementDiscount('MFM-CXR', SettlementTier.CITY_3STAR, 3, '2026-08-15', client);
+
+    // 专属 + 兜底 + 散客 = 三次查询，每次都限定在 MFM-CXR，没有一次退回默认航线
+    expect(findMany).toHaveBeenCalledTimes(3);
+    expect(findMany.mock.calls.map((c) => c[0].where.routeKey)).toEqual(['MFM-CXR', 'MFM-CXR', 'MFM-CXR']);
+  });
+
+  it('身份列守卫：改已有规则的航线 → 拒绝，文案提示改用新增规则', async () => {
+    const findMany = vi.fn().mockResolvedValue([baseRule]);
+    const client = clientWithFindMany(findMany);
+    await expect(
+      upsertDiscountRules([entry({ id: 'rule-1', routeKey: 'MFM-CXR' })], 'user-1', client),
+    ).rejects.toThrow('航线从「MFM-DAD」改为「MFM-CXR」——不同航线请用「新增规则」另建一条');
   });
 });

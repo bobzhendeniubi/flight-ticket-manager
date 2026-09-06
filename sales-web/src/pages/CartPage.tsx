@@ -5,7 +5,7 @@ import { Icon, type IconName } from '../components/Icon';
 import { EmptyState } from '../components/EmptyState';
 import { RefundBadge } from '../components/RefundBadge';
 import { TrustBadges } from '../components/TrustBadges';
-import { localYmd } from '../lib/airports';
+import { airportName, airportTz, localYmd } from '../lib/airports';
 import { formatDateTimeCn } from '../lib/datetime';
 
 /** 购物车条目按 kind 映射统一线性图标（取代存储的 emoji 渲染；不改 store 里的 emoji 字段） */
@@ -21,6 +21,49 @@ const CART_KIND_ICON: Record<CartItem['kind'], IconName> = {
 function fmt(v: unknown): string {
   const n = Number(v);
   return Number.isFinite(n) ? n.toLocaleString() : '0';
+}
+
+/** meta 里取一个非空字符串；缺失 / 空串 → null。 */
+function metaStr(meta: CartItem['meta'], key: string): string | null {
+  const v = meta?.[key];
+  if (typeof v !== 'string') return null;
+  const trimmed = v.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * 套餐行的航段摘要（如「QH9589 澳门→岘港 2026-09-10 + QH9588 回程 2026-09-13」）。
+ *
+ * 全部读加购时写进 meta 的航线 / 航班号——以前这一行把航班号和城市写死在渲染里，
+ * 第二条航线一开，买家会在购物车里看到另一条线的航班。旧购物车项（加购时还没有这些
+ * meta）不猜：只报日期，航线写「按所选套餐航线」。
+ */
+function bundleLegLine(meta: CartItem['meta']): string {
+  const goDate = metaStr(meta, 'goDate') ?? '';
+  const returnDate = metaStr(meta, 'returnDate') ?? '';
+  const origin = metaStr(meta, 'routeOrigin');
+  const destination = metaStr(meta, 'routeDest');
+  const goFlight = metaStr(meta, 'goFlightNumber');
+  const returnFlight = metaStr(meta, 'returnFlightNumber');
+
+  if (!origin || !destination) {
+    return `按所选套餐航线 去程 ${goDate} + 回程 ${returnDate}`.trim();
+  }
+  const leg = `${airportName(origin)}→${airportName(destination)}`;
+  const go = `${goFlight ? `${goFlight} ` : ''}${leg} ${goDate}`.trim();
+  const back = `${returnFlight ? `${returnFlight} ` : ''}回程 ${returnDate}`.trim();
+  return `${go} + ${back}`;
+}
+
+/**
+ * 机票行的当地出发日。时区优先取加购时写下的 departureTz，其次按出发机场查时区表；
+ * 两者都没有（很老的购物车项）就不显示日期——兜一个时区会把出发日显示成前一天。
+ */
+function flightLocalDate(meta: CartItem['meta']): string | null {
+  const departureTime = metaStr(meta, 'departureTime');
+  if (!departureTime) return null;
+  const tz = metaStr(meta, 'departureTz') ?? airportTz(metaStr(meta, 'originCode'));
+  return tz ? localYmd(departureTime, tz) : null;
 }
 
 export function CartPage() {
@@ -111,7 +154,7 @@ export function CartPage() {
                     <div className="mt-1.5 space-y-0.5 text-xs text-ink-soft">
                       <div className="inline-flex items-center gap-1">
                         <Icon name="plane" className="h-3 w-3 shrink-0" />
-                        QH9589 澳门→岘港 {String(i.meta?.goDate ?? '')} + QH9588 回程 {String(i.meta?.returnDate ?? '')}
+                        {bundleLegLine(i.meta)}
                       </div>
                       <div>
                         {Number(i.meta?.pax) || 0} 人 · {Number(i.meta?.rooms) || 1} 房 ·
@@ -125,11 +168,9 @@ export function CartPage() {
                   {/* 机票: 显示舱等+日期+人数（dateRank 是内部字段，不展示给客户） */}
                   {i.kind === 'FLIGHT' && i.meta && (
                     <div className="mt-1.5 text-xs text-ink-soft">
-                      {String(i.meta?.cabin ?? '') === 'BUSINESS' ? '商务舱' : '经济舱'} ·{' '}
-                      {i.meta?.departureTime
-                        ? localYmd(String(i.meta.departureTime), String(i.meta.departureTz ?? 'Asia/Macau'))
-                        : ''}{' '}
-                      · {Number(i.meta?.passengers) || 0} 人
+                      {String(i.meta?.cabin ?? '') === 'BUSINESS' ? '商务舱' : '经济舱'}
+                      {flightLocalDate(i.meta) ? ` · ${flightLocalDate(i.meta)}` : ''} ·{' '}
+                      {Number(i.meta?.passengers) || 0} 人
                     </div>
                   )}
                   <p className="mt-1 text-xs text-ink-muted">

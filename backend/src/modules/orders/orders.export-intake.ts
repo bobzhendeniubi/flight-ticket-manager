@@ -13,7 +13,9 @@
  */
 import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
-import { OrderItemKind, OrderStatus } from '@prisma/client';
+import { OrderItemKind } from '@prisma/client';
+// 订单状态集合全站唯一一份（审查根因 R2）：进单统计走库存口径（退款申请中已释放库存，不计）。
+import { INVENTORY_COUNTED_STATUSES as COUNTED_STATUSES } from '../../lib/order-status-sets.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import {
   applyExportAgentScope,
@@ -21,17 +23,6 @@ import {
   type OrderListFilters,
 } from './orders.service.js';
 import { earliestFlightDeparture } from './pnr-export.js';
-
-/** 运营进单统计：退款申请中的订单已释放库存，不再计入。*/
-const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
 
 /** 非套餐订单按品类归组的中文标签。*/
 const KIND_LABEL: Record<string, string> = {

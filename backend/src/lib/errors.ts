@@ -1,6 +1,11 @@
 /**
  * Domain-level error classes. Mapped to HTTP responses by the error-handler plugin.
+ *
+ * 错误码字符串是契约的一部分（前端按 code 分支，从不匹配中文文案），值统一取
+ * @ftm/contracts —— 以前这里写字面量、两个前端各敲一遍，改一个码要记得改三处。
  */
+import { API_ERROR_CODES, BUSINESS_ERROR_CODES } from '@ftm/contracts/errors';
+
 export class AppError extends Error {
   readonly statusCode: number;
   readonly code: string;
@@ -10,14 +15,14 @@ export class AppError extends Error {
     super(message);
     this.name = 'AppError';
     this.statusCode = opts.statusCode ?? 500;
-    this.code = opts.code ?? 'INTERNAL_ERROR';
+    this.code = opts.code ?? API_ERROR_CODES.INTERNAL_ERROR;
     this.details = opts.details;
   }
 }
 
 export class BadRequestError extends AppError {
   constructor(message = 'Bad request', details?: unknown) {
-    super(message, { statusCode: 400, code: 'BAD_REQUEST', details });
+    super(message, { statusCode: 400, code: API_ERROR_CODES.BAD_REQUEST, details });
     this.name = 'BadRequestError';
   }
 }
@@ -29,7 +34,7 @@ export class BadRequestError extends AppError {
  */
 export class DuplicatePassengerError extends AppError {
   constructor(message = '存在重复乘客', details?: unknown) {
-    super(message, { statusCode: 400, code: 'DUPLICATE_PASSENGER', details });
+    super(message, { statusCode: 400, code: BUSINESS_ERROR_CODES.DUPLICATE_PASSENGER, details });
     this.name = 'DuplicatePassengerError';
   }
 }
@@ -41,42 +46,42 @@ export class DuplicatePassengerError extends AppError {
  */
 export class PriceChangedError extends AppError {
   constructor(message = '价格已更新，请刷新页面后重新下单', details?: unknown) {
-    super(message, { statusCode: 400, code: 'PRICE_CHANGED', details });
+    super(message, { statusCode: 400, code: BUSINESS_ERROR_CODES.PRICE_CHANGED, details });
     this.name = 'PriceChangedError';
   }
 }
 
 export class UnauthorizedError extends AppError {
   constructor(message = 'Unauthorized') {
-    super(message, { statusCode: 401, code: 'UNAUTHORIZED' });
+    super(message, { statusCode: 401, code: API_ERROR_CODES.UNAUTHORIZED });
     this.name = 'UnauthorizedError';
   }
 }
 
 export class ForbiddenError extends AppError {
   constructor(message = 'Forbidden') {
-    super(message, { statusCode: 403, code: 'FORBIDDEN' });
+    super(message, { statusCode: 403, code: API_ERROR_CODES.FORBIDDEN });
     this.name = 'ForbiddenError';
   }
 }
 
 export class NotFoundError extends AppError {
   constructor(message = 'Not found') {
-    super(message, { statusCode: 404, code: 'NOT_FOUND' });
+    super(message, { statusCode: 404, code: API_ERROR_CODES.NOT_FOUND });
     this.name = 'NotFoundError';
   }
 }
 
 export class ConflictError extends AppError {
   constructor(message = 'Conflict', details?: unknown) {
-    super(message, { statusCode: 409, code: 'CONFLICT', details });
+    super(message, { statusCode: 409, code: API_ERROR_CODES.CONFLICT, details });
     this.name = 'ConflictError';
   }
 }
 
 export class UnprocessableEntityError extends AppError {
   constructor(message = 'Unprocessable entity', details?: unknown) {
-    super(message, { statusCode: 422, code: 'UNPROCESSABLE_ENTITY', details });
+    super(message, { statusCode: 422, code: API_ERROR_CODES.UNPROCESSABLE_ENTITY, details });
     this.name = 'UnprocessableEntityError';
   }
 }

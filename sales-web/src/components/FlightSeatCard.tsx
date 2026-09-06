@@ -175,6 +175,9 @@ export function FlightSeatCard({
               departureTime: flight.departureTime,
               // 出发地时区：购物车行要按它显示当地出发日，切 UTC 串会写早一天
               departureTz: flight.departureTz,
+              // 航段起降地：购物车行在 departureTz 缺失时按出发机场回查时区，不写死任何时区
+              originCode: flight.originCode,
+              destinationCode: flight.destinationCode,
               cabin: cabin.cabin,
               passengers,
               // dateRank 是内部字段，不放进 cart meta（之前 CartPage 曾把它显示给客户）

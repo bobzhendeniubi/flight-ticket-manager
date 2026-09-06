@@ -13,13 +13,27 @@
 import ExcelJS from 'exceljs';
 import { localDateISO } from '../../lib/flight-time.js';
 import { businessDateISO, businessDateTimeSec } from '../../lib/business-time.js';
-import type { Prisma, PrismaClient, VisaRequirement } from '@prisma/client';
+import type { Prisma, PrismaClient, VisaRequirement, VisaSubmissionStatus } from '@prisma/client';
 import { OrderItemKind, OrderStatus } from '@prisma/client';
+// 「签证状态」列按人取值 = 状态机派生态 → 导出文案；「全员自备签」也用状态机的同一份判定。
+import {
+  allPassengersVisaExempt as allPassengersVisaExemptState,
+  derivePassengerVisaState,
+} from '../fulfillment/visa-state.js';
 // 订单级「明确不需要我方代办（NOT_NEEDED / HAS_VISA）」的唯一判定口径，与建签证任务共用。
-import { orderVisaStatusExplicitlyNotNeeded } from './visa-need.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
-// 「结算价格」按人取值的权威口径：每人份额端口（详见 perPaxSettlementByPassenger）。
-import { computePerPaxShares, spreadableAdjustmentCny } from './per-pax-share.js';
+// 订单金额单一口径（审查根因 R2）：应收/已付/尾款/退款/每人份额全部从这里取，本文件不自己算钱。
+import {
+  completedRefundTotalCny,
+  evenShareCny,
+  isSettledByPaidAmount,
+  outstandingRawCny,
+  paidCny,
+  settlePerPaxFallbackCny,
+  toCny,
+} from '../../lib/order-money.js';
+import { PASSENGER_SHARES_INCLUDE, resolvePassengerShares, sharesAsMaps } from './passenger-shares.js';
+import { attachPersistedShares } from './service/passenger-shares.js';
 import type { BundleItemJson } from '../../lib/json-types.js';
 import { toAlpha3 } from './nationality.js';
 import {
@@ -29,8 +43,7 @@ import {
   type PnrRow,
   PNR_COLUMNS,
 } from './pnr-export.js';
-// groupPassengerAdjustments：按乘客调价分组的唯一口径（与订单详情页金额明细同源）。
-import { GUEST_RECORDED_BY_LABEL, groupPassengerAdjustments } from './orders.service.js';
+import { GUEST_RECORDED_BY_LABEL } from './orders.service.js';
 import { buildExportOrderWhere, filterExportOrders } from './orders.export-selection.js';
 import { formatOrderLegStatus } from './orders.leg-status.js';
 import { determineFlightLegs } from './ticketing-cap.js';
@@ -244,26 +257,34 @@ export function passengerVisaStatusCell(input: {
    */
   allPassengersExempt?: boolean;
 }): string {
-  // 1. 签证台逐人推进的进度（PENDING 不算推进）
+  // 上面四档判定顺序就是状态机 derivePassengerVisaState 的派生优先级（逐人进度 > NOT_NEEDED >
+  // HAS_VISA 混合/全员 > 自备签 > 待处理），这里只做「派生态 → 导出文案」的映射：
+  //   IN_PROGRESS / SUBMITTED → 签证台同一份进度文案；SELF_ARRANGED → 「自备签」；
+  //   NOT_NEEDED / ISSUED / PENDING → 订单级文案（不需要 / 已签证 / 需要·电子签·履约任务回落）。
   const submission = input.passenger.visaSubmissionStatus;
-  if (submission && submission !== 'PENDING') {
-    return VISA_SUBMISSION_LABEL[submission] ?? input.orderVisaLabel;
-  }
-  // 2/3. 订单头明确「不需要 / 已签证」—— 与签证任务判定同一个口径函数
-  if (orderVisaStatusExplicitlyNotNeeded(input.orderVisaStatus)) {
-    // 3. 已签证 + 混合单：这批 visaExempt 是逐人手勾的，不是联动置的，照实写「自备签」
-    if (
-      input.orderVisaStatus === 'HAS_VISA' &&
-      input.passenger.visaExempt === true &&
-      input.allPassengersExempt === false
-    ) {
-      return VISA_EXEMPT_LABEL;
-    }
+  // 老数据 / 非三档字符串（非空且非 PENDING）：沿用现状回落订单级文案，不交给派生猜。
+  if (submission && submission !== 'PENDING' && !(submission in VISA_SUBMISSION_LABEL)) {
     return input.orderVisaLabel;
   }
-  // 4. 逐人手勾的自备签（此时订单头是 NEEDED/E_VISA/未表态，不存在联动批量置的情况）
-  if (input.passenger.visaExempt === true) return VISA_EXEMPT_LABEL;
-  return input.orderVisaLabel;
+  const state = derivePassengerVisaState({
+    orderVisaStatus: input.orderVisaStatus,
+    visaExempt: input.passenger.visaExempt,
+    visaSubmissionStatus: (submission ?? null) as VisaSubmissionStatus | null,
+    // 缺省 / true = 视作录单联动全员置上（跟订单头写「已签证」）；false = 混合单。
+    allPassengersExempt: input.allPassengersExempt !== false,
+  });
+  switch (state) {
+    case 'IN_PROGRESS':
+      return VISA_SUBMISSION_LABEL.IN_PROGRESS;
+    case 'SUBMITTED':
+      return VISA_SUBMISSION_LABEL.CONFIRMED;
+    case 'SELF_ARRANGED':
+      return VISA_EXEMPT_LABEL;
+    case 'NOT_NEEDED':
+    case 'ISSUED':
+    case 'PENDING':
+      return input.orderVisaLabel;
+  }
 }
 
 /**
@@ -274,185 +295,20 @@ export function passengerVisaStatusCell(input: {
 export function allPassengersVisaExempt(
   passengers: ReadonlyArray<{ visaExempt?: boolean | null }>,
 ): boolean {
-  return passengers.length > 0 && passengers.every((p) => p.visaExempt === true);
+  return allPassengersVisaExemptState(passengers);
 }
 
 /**
- * 「结算价格」列的**按乘客**取值 —— 全岗总表与《全岗可用》《签证专用》共用的唯一口径。
- *
- * 改前：整单 total ÷ 人数，四个人一律同一个数。同单不同价的单（某人补签证多收 800、
- * 某人自备签少收 360）导出来看不出差别，与订单详情页「每人结算价」表也对不上。
- *
- * 改后：直接复用权威口径 —— `computePerPaxShares`（backend/src/modules/orders/per-pax-share.ts，
- * 与前端 admin-web/src/lib/perPaxSettlement.ts 逐分对拍、拆单搬钱也走它）：
- *   应收总额 = total + adjustmentCny；基准每人 = (应收 − Σ按乘客调价净额) ÷ 人数；
- *   每人结算价 = 基准每人 + 该乘客调价净额。全员合计恒等于应收总额。
- * 按乘客调价净额取自 `groupPassengerAdjustments`（只认 metadata.priceAdjustment=true 且挂了
- * passengerId 的行；整单调价行留在基准里，不重复计）。
- *
- * 口径变化（需知会运营）：应收含 adjustmentCny（改期费/换人费等售后费，原先不在本列里），
- * 与详情页每人结算价、尾款列（本就含 adjustmentCny）从此同源。
+ * 每人份额三口径（结算价格 / 签证金额 / 单房差 **按乘客**）已搬到 lib/order-money.ts ——
+ * 那是全站订单金额的单一口径入口（审查根因 R2）。这里原样 re-export：全岗总表、分房表、
+ * 代理对账单与各单测的既有 import 路径一字不变，函数对象也是同一个（lib/order-money.test.ts 有断言）。
+ * 算法一个字未动，口径说明见 lib/order-money.ts 各函数头注释。
  */
-export function perPaxSettlementByPassenger(order: {
-  total: Prisma.Decimal | number | null;
-  adjustmentCny?: number | null;
-  /** 售后费流水（换人费/换人差价带 excludeFromPerPax，不参与均摊，见 spreadableAdjustmentCny）。 */
-  adjustments?: unknown;
-  passengers: ReadonlyArray<{ id: string }>;
-  items: ReadonlyArray<{
-    id: string;
-    amount: Prisma.Decimal | number | null;
-    description: string;
-    passengerId?: string | null;
-    metadata?: unknown;
-  }>;
-}): Map<string, number> {
-  const { byPassenger } = groupPassengerAdjustments(
-    order.items.map((it) => ({
-      id: it.id,
-      amount: dec(it.amount),
-      description: it.description,
-      passengerId: it.passengerId ?? null,
-      metadata: it.metadata,
-    })),
-  );
-  const { rows } = computePerPaxShares({
-    totalCny: dec(order.total),
-    // 可摊售后费：换人费/换人差价（excludeFromPerPax）记在被换下去的人头上，不摊给同行人与新客。
-    adjustmentCny: spreadableAdjustmentCny(order),
-    // 按 id 升序传入：computePerPaxShares 把分级余数（那一分钱）兜给**数组最后一位**，
-    // 而 order.passengers 的查询没有 orderBy —— 行序会随任何一次 UPDATE 漂移，
-    // 同一张单两次导出那一分钱可能换人头，财务对数时看着像有人改过价。
-    // 只排序、不动算法（口径仍在 per-pax-share.ts，与前端逐分对拍）；
-    // 返回的是 Map，输出顺序与本处排序无关。
-    passengerIds: [...order.passengers.map((p) => p.id)].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0)),
-    netByPassenger: new Map(
-      Object.entries(byPassenger).map(([pid, bucket]) => [pid, bucket.netCny]),
-    ),
-  });
-  return new Map(rows.map((r) => [r.passengerId, r.shareCny]));
-}
-
-/**
- * 「签证金额」列的**按乘客**取值 —— 全岗总表与《全岗可用》共用的唯一口径。
- *
- * 改前：整单合计 ÷ 人数，四个人一律同一个数。两处失真（运营反馈那张四人单：两人自备签、
- * 套餐签证挂牌价 240/人，导出来四人各 60）：
- *   · 自备签（visaExempt）的客人没走我方签证，套餐价里也按 selfVisaDeductCny 给他减掉了，
- *     这列却照样分到一份；
- *   · 套餐签证挂牌价快照 metadata.visaListSnapshotCny 是**每人**口径（套餐定义 items 的
- *     qty×unitPrice，与 products/bundle-pricing.ts 的 visaPerPax 同源），改前当成整单合计
- *     再 ÷ 人数，多人单被压低 N 倍（单人单恰好看不出来）。
- *
- * 改后：
- *   · 独立 VISA 行的实收金额是整单口径（qty = 买签证的人数）→ 在**非自备签**乘客间均摊；
- *     全员 exempt 却仍有 VISA 行（矛盾数据）时在全员间均摊，钱不凭空消失。
- *   · 套餐签证挂牌价（快照优先；老单无快照回退现行定义 qty×unitPrice，与旧版一致）是每人
- *     口径 → 非自备签乘客各记一份，自备签乘客记 0。
- *   · 自备签乘客 = 0 + 0 = 0。
- * 本列仍是「挂牌价 / 实收」的核对口径：客人付的是折后套餐总价，这里不是实收拆分额。
- */
-export function perPaxVisaAmountByPassenger(order: {
-  passengers: ReadonlyArray<{ id: string; visaExempt?: boolean | null }>;
-  items: ReadonlyArray<{
-    kind: string;
-    amount: Prisma.Decimal | number | null;
-    metadata?: unknown;
-    bundle?: { items: unknown } | null;
-  }>;
-}): Map<string, number> {
-  const standaloneTotal = order.items
-    .filter((it) => it.kind === 'VISA')
-    .reduce((s, it) => s + dec(it.amount), 0);
-  const bundleListPerPax = order.items.reduce((s, it) => {
-    if (it.kind !== 'BUNDLE') return s;
-    // B14 快照优先（2026-07-20）：下单时把签证挂牌价快照进 metadata.visaListSnapshotCny
-    //（含 0 = 当时不含签证组件），历史导出钉死在下单时点，不再随套餐改价漂移。
-    const meta = (it.metadata ?? null) as { visaListSnapshotCny?: unknown } | null;
-    if (meta && typeof meta.visaListSnapshotCny === 'number') {
-      return s + meta.visaListSnapshotCny;
-    }
-    const components = Array.isArray(it.bundle?.items)
-      ? (it.bundle!.items as unknown as BundleItemJson[])
-      : [];
-    return (
-      s +
-      components
-        .filter((c) => c && c.kind === 'VISA')
-        .reduce((acc, c) => acc + (Number(c.qty) || 0) * (Number(c.unitPrice) || 0), 0)
-    );
-  }, 0);
-  const payers = order.passengers.filter((p) => p.visaExempt !== true);
-  const sharers = payers.length > 0 ? payers : order.passengers;
-  const standalonePerPax = sharers.length > 0 ? standaloneTotal / sharers.length : 0;
-  const sharerIds = new Set(sharers.map((p) => p.id));
-  return new Map(
-    order.passengers.map((p) => {
-      const standalone = sharerIds.has(p.id) ? standalonePerPax : 0;
-      const bundle = p.visaExempt === true ? 0 : bundleListPerPax;
-      return [p.id, round2(standalone + bundle)];
-    }),
-  );
-}
-
-/**
- * 「单房差」列的**按乘客**取值 —— 全岗总表与《全岗可用》共用的唯一口径。
- *
- * 改前（全岗总表）读的是订单行 metadata.singleRoomDiff —— 系统从没写过这个字段，整列恒 0；
- *《全岗可用》则干脆留空。单房差的真实来源有两处：
- *   · 下单时的单住：套餐行 metadata.addOns.singleSupplementTotal（= singleCount × 每晚差 × 晚数）；
- *   · 事后补收：kind=FEE、metadata.reasonCode='ROOM_DIFF' 的补收单房差行（addRoomSupplement），
- *     新行带 passengerId 指向转单住的那位乘客；老行没挂人。
- * 这两笔钱都只属于「单住」的乘客（Passenger.singleRoom=true），不该摊给拼房的人。
- *
- * 取值：挂了人的补收行直接记到该乘客；其余（套餐单住小计 + 未挂人的补收行）在**还没有专属补收行的
- * 单住乘客**间均摊。没有任何单住乘客却有钱（脏数据）→ 全员均摊，钱不凭空消失。
- */
-export function perPaxSingleRoomDiffByPassenger(order: {
-  passengers: ReadonlyArray<{ id: string; singleRoom?: boolean | null }>;
-  items: ReadonlyArray<{
-    kind: string;
-    amount: Prisma.Decimal | number | null;
-    passengerId?: string | null;
-    metadata?: unknown;
-  }>;
-}): Map<string, number> {
-  const linked = new Map<string, number>();
-  let pool = 0;
-  for (const it of order.items) {
-    const meta = (it.metadata ?? null) as
-      | { reasonCode?: unknown; addOns?: { singleSupplementTotal?: unknown } | null }
-      | null;
-    if (it.kind === 'FEE' && meta?.reasonCode === 'ROOM_DIFF') {
-      if (it.passengerId) {
-        linked.set(it.passengerId, round2((linked.get(it.passengerId) ?? 0) + dec(it.amount)));
-      } else {
-        pool += dec(it.amount);
-      }
-    } else if (it.kind === 'BUNDLE') {
-      const v = meta?.addOns?.singleSupplementTotal;
-      if (typeof v === 'number') pool += v;
-    }
-  }
-  const singles = order.passengers.filter((p) => p.singleRoom === true);
-  const unlinkedSingles = singles.filter((p) => !linked.has(p.id));
-  const sharers =
-    pool === 0
-      ? []
-      : unlinkedSingles.length > 0
-        ? unlinkedSingles
-        : singles.length > 0
-          ? singles
-          : order.passengers;
-  const sharerIds = new Set(sharers.map((p) => p.id));
-  const share = sharers.length > 0 ? pool / sharers.length : 0;
-  return new Map(
-    order.passengers.map((p) => [
-      p.id,
-      round2((linked.get(p.id) ?? 0) + (sharerIds.has(p.id) ? share : 0)),
-    ]),
-  );
-}
+export {
+  perPaxSettlementByPassenger,
+  perPaxVisaAmountByPassenger,
+  perPaxSingleRoomDiffByPassenger,
+} from '../../lib/order-money.js';
 
 // 注：《全岗可用》模版对齐旧系统口径 —— 乘客类型/性别/证件类型均按旧模版原样
 // 输出枚举/代码（ADULT、M、P），不译中文。
@@ -590,6 +446,7 @@ export type OrderForTemplateExport = Prisma.OrderGetPayload<{
     agent: { select: { companyName: true; contactName: true } };
     user: { select: { displayName: true; email: true } };
     passengers: true;
+    passengerShares: typeof PASSENGER_SHARES_INCLUDE;
     payments: true;
     refunds: true;
     items: {
@@ -728,10 +585,10 @@ export function buildOrderContext(
   //     的单（某人补签证多收、某人自备签少收）逐人可解释，与订单详情页「每人结算价」同源；
   //   · 到账/尾款仍是整单 ÷ 人数（收款按整单发生，没有逐人归属，不臆造）。
   // 尾款口径与财务/提醒/报表对齐：应付 = total + adjustmentCny − prepaymentOffset（代理预付款抵扣）。
-  const total = dec(order.total);
-  const paid = dec(order.paidAmount);
-  const adjustment = order.adjustmentCny ?? 0;
-  const prepaymentOffset = dec(order.prepaymentOffset);
+  // 全部走 lib/order-money 的同一组函数，本文件不再自己写 `total + adjustmentCny`。
+  // 按人份额（R1）：三张按人表**先读库**（order.passengerShares，写路径落的事实），
+  // 老单没有才派生 —— resolvePassengerShares 一处决定，算法仍只有 lib/order-money 一份。
+  const shares = sharesAsMaps(resolvePassengerShares(order));
 
   return {
     paxCount,
@@ -747,17 +604,17 @@ export function buildOrderContext(
     cabinLabels,
     orderType,
     legStatus: opts?.redactLegStatus === true ? '' : formatOrderLegStatus(order.items),
-    settleByPassenger: perPaxSettlementByPassenger(order),
+    settleByPassenger: shares.settlement,
     // 分子用 spreadableAdjustmentCny 而不是裸 adjustment（复审 M1，与《全岗总表》
     // orders.export-master.ts 的 settlePerPax 同一处修正）：换人费/换人差价挂在**已经不在这张单上**
     // 的被换人头上（excludeFromPerPax），上面那张按人表已经把它们剔除了；兜底若还按裸值算，
     // 同一张导出里「表里的人」和「兜底的人」用的是两套分母，同行人凭空多背一笔换人的钱。
-    settlePerPax: round2((total + spreadableAdjustmentCny(order)) / paxCount),
-    visaAmountByPassenger: perPaxVisaAmountByPassenger(order),
+    settlePerPax: settlePerPaxFallbackCny(order, paxCount),
+    visaAmountByPassenger: shares.visa,
     allPassengersExempt: allPassengersVisaExempt(order.passengers),
-    singleRoomDiffByPassenger: perPaxSingleRoomDiffByPassenger(order),
-    paidPerPax: round2(paid / paxCount),
-    balancePerPax: round2(Math.max(0, total + adjustment - paid - prepaymentOffset) / paxCount),
+    singleRoomDiffByPassenger: shares.singleRoomDiff,
+    paidPerPax: evenShareCny(paidCny(order), paxCount),
+    balancePerPax: evenShareCny(outstandingRawCny(order), paxCount),
   };
 }
 
@@ -930,9 +787,9 @@ export function orderToFullRows(
     .sort((a, b) => b.paidAt!.getTime() - a.paidAt!.getTime());
   const lastPayment = succeeded[0];
 
-  // 已完成退款：金额合计 + 最近处理时间
+  // 已完成退款：金额合计（lib/order-money，只数 COMPLETED、不四舍五入）+ 最近处理时间
   const completedRefunds = order.refunds.filter((r) => r.status === 'COMPLETED');
-  const refundTotal = completedRefunds.reduce((s, r) => s + dec(r.amount), 0);
+  const refundTotal = completedRefundTotalCny(order.refunds);
   const lastRefundAt = completedRefunds
     .map((r) => r.processedAt)
     .filter((d): d is Date => Boolean(d))
@@ -969,10 +826,9 @@ export function orderToFullRows(
   // 是否清账：已付 + 预付款抵扣 ≥ 应付（total + adjustmentCny），与上面 ctx.balancePerPax 同口径。
   // 不含 adjustmentCny 会出现"尾款>0 但已清账"的自相矛盾（P2-15b 连带修）；漏 prepaymentOffset
   // 则用预付款抵扣过的代理订单会已结清却误显示未结清。
-  const settled =
-    dec(order.paidAmount) + dec(order.prepaymentOffset) >= dec(order.total) + (order.adjustmentCny ?? 0)
-      ? '是'
-      : '否';
+  // ⚠️ 这是「按已付」口径（不扣已完成退款），与财务导出的「按已收净额」是两个算法——
+  // 冲突已登记待拍板（docs/口径决议.md），此处只改调不统一。
+  const settled = isSettledByPaidAmount(order) ? '是' : '否';
 
   // 六态开票（去程/回程/系统）——「系统开票状态」列反映 systemInvoiced；
   // 「开票状态」列（原手工列）填按航段已开的组合文本：去程/回程分别判定，回程仅在存在回程班次时列出。
@@ -1023,12 +879,12 @@ export function orderToFullRows(
     singleRoomDiffReceived: '',
     visaAmount: ctx.visaAmountByPassenger.get(p.id) ?? 0,
     visaReceived: '',
-    offsetAmount: round2(dec(order.prepaymentOffset) / ctx.paxCount),
+    offsetAmount: evenShareCny(toCny(order.prepaymentOffset), ctx.paxCount),
     offsetReceived: '',
     offsetPerson: '',
     offsetOrder: '',
     settled,
-    refundAmount: round2(refundTotal / ctx.paxCount),
+    refundAmount: evenShareCny(refundTotal, ctx.paxCount),
     refundAt: businessDateTimeSec(lastRefundAt),
     refundChannel: '',
     orderStatus: ORDER_STATUS_LABEL[order.status] ?? order.status,
@@ -1272,6 +1128,8 @@ export async function buildOrderTemplateExportWorkbook(
       agent: { select: { companyName: true, contactName: true } },
       user: { select: { displayName: true, email: true } },
       passengers: true,
+      // 按人份额（R1）：先读库，老单在下面顺手回填
+      passengerShares: PASSENGER_SHARES_INCLUDE,
       payments: true,
       refunds: true,
       items: {
@@ -1292,7 +1150,8 @@ export async function buildOrderTemplateExportWorkbook(
   // 内存精筛（出行/返程/航班日期、航班号×日期绑定、单程/往返）—— 取数 where 的日期条件
   // 故意宽召回（±1 天），加上「关联行 ≥ 2 条」Prisma 表达不了，都在这里按与列表 listOrders
   // 相同的顺序与口径收口。orderIds（勾选导出）/ scheduleId（整班导出）的短路也在里面。
-  const orders = filterExportOrders(fetched, query);
+  // 按人份额 lazy 回填（R1）：库里没有完整一套的老单顺手落一遍再读回来（失败不影响导出，照旧派生）。
+  const orders = await attachPersistedShares(filterExportOrders(fetched, query), client);
 
   // 代理导出（agentScope 非空）：按共享脱敏政策整列裁掉护照 PII / 我方内部人员 /
   // 供应商与成本 / 内部运营指标（见 AGENT_HIDDEN_EXPORT_KEYS）。ADMIN/STAFF 一列不少。

@@ -23,6 +23,9 @@ const STAFF_ROLE_LABEL: Record<StaffRole, string> = {
   TICKETING: '票务岗',
   ROOM_CONTROL: '房控岗',
   FINANCE: '财务岗',
+  // 显式的运营岗，与「不设岗」完全等价（后端 isGeneralOps 两者同权）。
+  // 这一档是 StaffRole 后补的，本页原先靠 api.ts 里手抄的联合类型，抄本没跟上就少了这个选项。
+  OPERATIONS: '运营岗',
 };
 
 function staffRoleOptionLabel(value: string, label: string): string {

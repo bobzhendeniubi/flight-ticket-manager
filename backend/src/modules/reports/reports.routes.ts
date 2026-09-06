@@ -2,10 +2,10 @@
  * 经营报表 API — ADMIN 或 STAFF+财务岗（财务口径，风格对齐 finances 模块）
  *
  * 路由：
- *   GET /reports/sales?from=YYYY-MM-DD&to=YYYY-MM-DD&dim=kind|channel|agent
+ *   GET /reports/sales?from=YYYY-MM-DD&to=YYYY-MM-DD&dim=kind|channel|agent|route
  *   GET /reports/receivables
  *   GET /reports/agent-debts
- *   GET /reports/export?from=YYYY-MM-DD&to=YYYY-MM-DD   （xlsx，4 sheet）
+ *   GET /reports/export?from=YYYY-MM-DD&to=YYYY-MM-DD   （xlsx，5 sheet）
  *
  * 所有访问都写审计日志（VIEW_REPORTS）— 报表数据敏感。
  */
@@ -27,7 +27,7 @@ const dateStr = z
 const salesSchema = z.object({
   from: dateStr.optional(),
   to: dateStr.optional(),
-  dim: z.enum(['kind', 'channel', 'agent']).optional(),
+  dim: z.enum(['kind', 'channel', 'agent', 'route']).optional(),
 });
 
 const rangeSchema = z.object({
@@ -63,7 +63,7 @@ function logView(
 
 export const reportRoutes: FastifyPluginAsync = async (app) => {
   const requireFinance = {
-    preHandler: [app.authenticate, app.requireFinanceAccess],
+    preHandler: [app.authenticate, app.requireCapability('reports.view')],
   };
 
   // ── 销售毛利（按产品线 / 渠道 / 代理）──
@@ -89,7 +89,7 @@ export const reportRoutes: FastifyPluginAsync = async (app) => {
     return { rows };
   });
 
-  // ── xlsx 导出（4 sheet：三维度销售毛利 + 应收与代理欠款）──
+  // ── xlsx 导出（5 sheet：四维度销售毛利 + 应收与代理欠款）──
   app.get('/export', requireFinance, async (req, reply) => {
     const q = rangeSchema.parse(req.query);
     const def = defaultRange();

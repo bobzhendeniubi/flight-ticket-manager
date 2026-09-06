@@ -12,6 +12,7 @@ import { authRoutes } from './modules/auth/auth.routes.js';
 import { userRoutes } from './modules/users/users.routes.js';
 import { flightRoutes } from './modules/flights/flights.routes.js';
 import { agentRoutes } from './modules/agents/agents.routes.js';
+import { agentStatementRoutes } from './modules/agent-statements/agent-statements.routes.js';
 import { orderRoutes } from './modules/orders/orders.routes.js';
 import { orderCostItemRoutes } from './modules/orders/order-cost-items.routes.js';
 import { seatLockRoutes } from './modules/seat-locks/seat-locks.routes.js';
@@ -37,6 +38,9 @@ import { publicRoutes } from './modules/public/public.routes.js';
 import { cancellationRoutes } from './modules/cancellation/cancellation.routes.js';
 import { reminderRoutes } from './modules/reminders/reminders.routes.js';
 import { financesRoutes } from './modules/finances/finances.routes.js';
+import { supplierRoutes } from './modules/supplier-payables/suppliers.routes.js';
+import { supplierInvoiceRoutes } from './modules/supplier-payables/supplier-invoices.routes.js';
+import { invoiceRoutes } from './modules/invoices/invoices.routes.js';
 import { aiRoutes } from './modules/ai/ai.routes.js';
 import { reviewRoutes, orderReviewRoutes } from './modules/reviews/reviews.routes.js';
 import {
@@ -107,6 +111,7 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(userRoutes, { prefix: '/users' });
   await app.register(flightRoutes, { prefix: '/flights' });
   await app.register(agentRoutes, { prefix: '/agents' });
+  await app.register(agentStatementRoutes, { prefix: '/agents' });
   await app.register(orderRoutes, { prefix: '/orders' });
   await app.register(orderReviewRoutes, { prefix: '/orders' });
   await app.register(orderSettlementRequestRoutes, { prefix: '/orders' });
@@ -139,6 +144,9 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(cancellationRoutes, { prefix: '/cancellation-policies' });
   await app.register(reminderRoutes, { prefix: '/reminders' });
   await app.register(financesRoutes, { prefix: '/finances' });
+  await app.register(supplierRoutes, { prefix: '/finances' });
+  await app.register(supplierInvoiceRoutes, { prefix: '/finances' });
+  await app.register(invoiceRoutes, { prefix: '/invoices' });
   await app.register(aiRoutes, { prefix: '/ai' });
   await app.register(reviewRoutes, { prefix: '/reviews' });
   await app.register(ocrRoutes, { prefix: '/ocr' });

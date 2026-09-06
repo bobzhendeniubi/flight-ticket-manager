@@ -26,6 +26,7 @@ import { useDebouncedValue } from '../lib/useDebouncedValue';
 import { useFlightSearchCache, type FlightLeg } from '../lib/useFlightSearchCache';
 import { useHotelAvailability } from '../lib/useHotelAvailability';
 import { useBundleSellableDates } from '../lib/useBundleSellableDates';
+import { bundleRouteKey } from '../lib/bundleRoute';
 import {
   computeRoomsNeeded,
   resolveRoomCapacity,
@@ -52,10 +53,11 @@ import { ErrorRetry } from '../components/ErrorRetry';
 import { EmptyState } from '../components/EmptyState';
 import { Icon, type IconName } from '../components/Icon';
 import { useCart } from '../stores/cart';
+import { resolveBundleRoute } from '../lib/bundleRoute';
 
 // ── 与列表页一致的常量 ────────────────────────────────────────────
-const ROUTE_ORIGIN = 'MFM';
-const ROUTE_DEST = 'DAD';
+// 航线不再写死：本套餐的航线由它绑定的去/回程航班派生（lib/bundleRoute.ts），
+// 没绑航班 = 没航线 = 不可售（服务端 sellable-dates 给 reason='NO_FLIGHT_BOUND'）。
 // 住宿晚数走 resolveBundleNights（hotelNights → HOTEL qty → 兜底），不再用本地默认常量。
 const REVIEW_PAGE_SIZE = 5;
 const SOLD_RECENTLY_THRESHOLD = 30;
@@ -186,7 +188,7 @@ function toReviewItem(r: Review): ReviewItem {
 // ── FAQ（折叠式 disclosure）──────────────────────────────────────
 interface FaqEntry { q: string; a: string }
 const FAQS: FaqEntry[] = [
-  { q: '套餐价格包含哪些？', a: '含往返机票、岘港酒店住宿（含双早）、签证代办与当地接送，以及全程中文客服。具体以本页"套餐包含"清单为准。' },
+  { q: '套餐价格包含哪些？', a: '含往返机票、目的地酒店住宿（含双早）、签证代办与当地接送，以及全程中文客服。具体以本页"套餐包含"清单为准。' },
   { q: '可以只买其中几项吗？', a: '套餐为整体打包优惠价，单项自愿放弃使用不退差价；如需单独购买机票/酒店，请到对应的机票或酒店频道下单。' },
   { q: '想一个人住一间房怎么算？', a: '套餐默认 2 人 1 间（显示为每人价）。想一个人住酒店（单人入住、一人一间房）的，在下单框勾选「一个人住酒店」并选人数即可，按每人每晚加价实时算进总价。' },
   { q: '床型可以指定吗？', a: BED_TYPE_NOTE + '。下单时在订单备注里写明偏好即可。' },
@@ -318,14 +320,17 @@ function BundleDetailContent({
 
   // 公开散客优惠：按选定出发日查询；请求失败由详情页按 0 兜底，不阻塞浏览。
   const [retailDiscountPerPersonCny, setRetailDiscountPerPersonCny] = useState(0);
+  // 航线从套餐绑定航班派生（与后端同口径）：没绑航班 = 没有航线 = 没有散客立减，不去问
+  const retailRouteKey = bundleRouteKey(b);
   useEffect(() => {
-    if (!b.settlementTier || b.settlementNights == null || !goDate) {
+    if (!b.settlementTier || b.settlementNights == null || !goDate || !retailRouteKey) {
       setRetailDiscountPerPersonCny(0);
       return;
     }
     let cancelled = false;
     setRetailDiscountPerPersonCny(0);
     api.getRetailSettlementDiscount({
+      routeKey: retailRouteKey,
       tier: b.settlementTier,
       nights: b.settlementNights,
       departDate: goDate,
@@ -333,7 +338,7 @@ function BundleDetailContent({
       if (!cancelled) setRetailDiscountPerPersonCny(result?.discountPerPersonCny ?? 0);
     });
     return () => { cancelled = true; };
-  }, [b.settlementNights, b.settlementTier, goDate]);
+  }, [b.settlementNights, b.settlementTier, goDate, retailRouteKey]);
 
   // 套餐 add-on 报价（server-priced，后端返回 number）+ 计费航段数
   const singleSupp = b.singleSupplementCnyPerNight != null ? num(b.singleSupplementCnyPerNight) : null;
@@ -353,14 +358,25 @@ function BundleDetailContent({
 
   // 实时机位 / 房量 / 价格
   const flightCache = useFlightSearchCache();
+  // 本套餐自己的航线（由绑定航班派生）；没绑航班 → 无航线，不发任何航段查询。
+  const route = resolveBundleRoute(b);
+  const routeOrigin = route?.origin ?? null;
+  const routeDest = route?.destination ?? null;
   useEffect(() => {
-    flightCache.ensure(ROUTE_ORIGIN, ROUTE_DEST, queryGo);
-    flightCache.ensure(ROUTE_DEST, ROUTE_ORIGIN, queryReturn);
-  }, [flightCache, queryGo, queryReturn]);
+    if (!routeOrigin || !routeDest) return;
+    flightCache.ensure(routeOrigin, routeDest, queryGo);
+    flightCache.ensure(routeDest, routeOrigin, queryReturn);
+  }, [flightCache, routeOrigin, routeDest, queryGo, queryReturn]);
 
   // 按运营绑定的航班号解析航段：绑定命中该班，未绑定/未命中回退首条（与旧版一致）。
-  const outLeg = flightCache.getByFlightNumber(ROUTE_ORIGIN, ROUTE_DEST, queryGo, b.outboundFlight?.flightNumber);
-  const retLeg = flightCache.getByFlightNumber(ROUTE_DEST, ROUTE_ORIGIN, queryReturn, b.returnFlight?.flightNumber);
+  const outLeg =
+    routeOrigin && routeDest
+      ? flightCache.getByFlightNumber(routeOrigin, routeDest, queryGo, b.outboundFlight?.flightNumber)
+      : null;
+  const retLeg =
+    routeOrigin && routeDest
+      ? flightCache.getByFlightNumber(routeDest, routeOrigin, queryReturn, b.returnFlight?.flightNumber)
+      : null;
   const goTier = legTier(outLeg, cabin);
   const retTier = legTier(retLeg, cabin);
   const hotelTier = useHotelAvailability(b.hotelRoomTypeId ?? null, queryGo, queryReturn);
@@ -368,10 +384,10 @@ function BundleDetailContent({
   // 套餐可售日期窗口（按 航班+酒店库存 逐日 + blackout 封盘）。查失败 → PERMISSIVE（空集不硬拦截）。
   const sellable = useBundleSellableDates(b.id);
   // 所选出发日不在可售集合时的原因（封盘/机位满/满房）；可售或未知 → null（不拦截）。
-  const dateReason =
-    sellable.status === 'ready' && sellable.sellableSet.size > 0 && !sellable.sellableSet.has(goDate)
-      ? sellable.reasonOf(goDate)
-      : null;
+  // reasonOf 对"可售日"和"窗口外/未加载的日子"都返回 null，本身就是"未知不拦截"的语义，
+  // 所以不再额外用 sellableSet.size > 0 当加载判据 —— 那个判据会让「整段区间都不可售」
+  // （如套餐没绑航班）静默变成"没有原因"，买家点下去才被后端拒。
+  const dateReason = sellable.status === 'ready' ? sellable.reasonOf(goDate) : null;
 
   // 升级商务舱占真实商务舱库存 → 取去/回航段 BUSINESS 档位；任一段无商务舱/已售罄则不可升舱。
   const goBizTier = legTier(outLeg, 'BUSINESS');
@@ -522,6 +538,16 @@ function BundleDetailContent({
         percentTotal: percentDiscountTotal,
         retailDiscountPerPersonCny,
         singleCount, businessCount,
+        // 航线与航班号写进 meta：购物车行以前把「QH9589 澳门→岘港」写死在渲染里，
+        // 第二条航线一开就会显示成另一条线。航线由绑定航班派生（resolveBundleRoute），
+        // 航班号取实际解析到的班次（未解析到则退回运营绑定的航班号）。
+        ...(routeOrigin && routeDest ? { routeOrigin, routeDest } : {}),
+        ...(outLeg?.flightNumber ?? b.outboundFlight?.flightNumber
+          ? { goFlightNumber: outLeg?.flightNumber ?? b.outboundFlight?.flightNumber ?? '' }
+          : {}),
+        ...(retLeg?.flightNumber ?? b.returnFlight?.flightNumber
+          ? { returnFlightNumber: retLeg?.flightNumber ?? b.returnFlight?.flightNumber ?? '' }
+          : {}),
         ...(outLeg?.scheduleId ? { goLegScheduleId: outLeg.scheduleId } : {}),
         ...(retLeg?.scheduleId ? { retLegScheduleId: retLeg.scheduleId } : {}),
       },

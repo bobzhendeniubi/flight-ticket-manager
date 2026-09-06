@@ -1,10 +1,10 @@
-import { z } from 'zod';
-
-// ── 创建锁位 ─────────────────────────────────────────────────────────────
-// 业务规则（客户确认）：单次最多锁 9 张（含），固定 10 分钟有效
-export const createSeatLockBodySchema = z.object({
-  flightScheduleId: z.string().min(1),
-  seatClassId: z.string().min(1),
-  qty: z.number().int().min(1).max(9),
-});
-export type CreateSeatLockBody = z.infer<typeof createSeatLockBodySchema>;
+/**
+ * 座位锁的请求体 —— 定义已搬进 @ftm/contracts（packages/contracts/src/seat-locks.ts）。
+ *
+ * 校验规则一字未改：只把 z.nativeEnum(PrismaEnum) 换成契约包镜像的同值 schema
+ *（枚举漂移测试守着两边一致），helper 的 import 改指契约包里的同一份实现。
+ *
+ * 这里留 re-export 壳子，既有 import 路径全部继续可用；前端从 @ftm/contracts
+ * 取同一份类型，不再手抄。
+ */
+export * from '@ftm/contracts/seat-locks';

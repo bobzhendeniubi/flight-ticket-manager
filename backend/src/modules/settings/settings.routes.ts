@@ -15,11 +15,12 @@
  */
 import type { FastifyPluginAsync } from 'fastify';
 import { z } from 'zod';
-import { UserRole, AuditTargetType } from '@prisma/client';
+import { AuditTargetType } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { env } from '../../config/env.js';
 import { writeAudit, actorFromRequest } from '../../lib/audit.js';
-import { BadRequestError } from '../../lib/errors.js';
+import { BadRequestError, NotFoundError } from '../../lib/errors.js';
+import { isFeatureFlagKey, listFeatureFlags, setFeatureFlag } from '../../lib/feature-flags.js';
 
 // ── 工具函数 ────────────────────────────────────────────────
 
@@ -76,15 +77,20 @@ const updateBodySchema = z.object({
 // ── 路由 ────────────────────────────────────────────────────
 
 export const settingsRoutes: FastifyPluginAsync = async (app) => {
-  const adminOnly = [app.authenticate, app.requireRole(UserRole.ADMIN)];
+  // AI 识别设置：仅 ADMIN。与下面功能开关虽同属 ADMIN_ONLY 受众，但口径上是两件独立的事，
+  // 各自一个能力 id，别为了少写一行合并成同一个 preHandler 数组。
+  const aiOcrManage = [app.authenticate, app.requireCapability('settings.ai_ocr.manage')];
+  // feature flag 列表允许 STAFF 只读查看（运营需要知道某个开关有没有开，改还是只有 ADMIN）
+  const featureFlagsRead = [app.authenticate, app.requireCapability('feature_flags.read')];
+  const featureFlagsWrite = [app.authenticate, app.requireCapability('feature_flags.write')];
 
   // ── GET /settings/ai-ocr ────────────────────────────────
-  app.get('/ai-ocr', { preHandler: adminOnly }, async () => {
+  app.get('/ai-ocr', { preHandler: aiOcrManage }, async () => {
     return readPublicConfig();
   });
 
   // ── PUT /settings/ai-ocr ────────────────────────────────
-  app.put('/ai-ocr', { preHandler: adminOnly }, async (req) => {
+  app.put('/ai-ocr', { preHandler: aiOcrManage }, async (req) => {
     const body = updateBodySchema.parse(req.body);
 
     const existing = await prisma.aiOcrConfig.findFirst();
@@ -146,7 +152,7 @@ export const settingsRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ── POST /settings/ai-ocr/test ──────────────────────────
-  app.post('/ai-ocr/test', { preHandler: adminOnly }, async () => {
+  app.post('/ai-ocr/test', { preHandler: aiOcrManage }, async () => {
     const row = await prisma.aiOcrConfig.findFirst();
     const apiKey =
       (row?.enabled !== false && row?.apiKey) ||
@@ -216,5 +222,30 @@ export const settingsRoutes: FastifyPluginAsync = async (app) => {
       const msg = err instanceof Error ? err.message : String(err);
       return { ok: false, message: `连接失败：${msg.slice(0, 200)}` };
     }
+  });
+
+  // ── GET /settings/feature-flags（ADMIN/STAFF 可看）──────────────────────
+  app.get('/feature-flags', { preHandler: featureFlagsRead }, async () => {
+    return { flags: await listFeatureFlags(prisma) };
+  });
+
+  // ── PUT /settings/feature-flags/:key（仅 ADMIN）──────────────────────────
+  app.put('/feature-flags/:key', { preHandler: featureFlagsWrite }, async (req) => {
+    const { key } = req.params as { key: string };
+    if (!isFeatureFlagKey(key)) throw new NotFoundError(`未知的功能开关：${key}`);
+    const body = z.object({ enabled: z.boolean() }).parse(req.body);
+
+    await setFeatureFlag(prisma, key, body.enabled, req.user.sub);
+
+    void writeAudit({
+      actor: actorFromRequest(req),
+      action: 'UPDATE_FEATURE_FLAG',
+      targetType: AuditTargetType.SYSTEM,
+      targetId: key,
+      targetLabel: key,
+      after: { enabled: body.enabled },
+    });
+
+    return { flags: await listFeatureFlags(prisma) };
   });
 };

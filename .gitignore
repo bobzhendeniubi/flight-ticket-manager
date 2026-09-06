@@ -58,3 +58,9 @@ yarn-error.log*
 .claude/worktrees/
 **/.swc/
 .gstack/
+
+# Playwright e2e 产物（截图 / 视频 / trace / HTML 报告）
+test-results/
+playwright-report/
+blob-report/
+.playwright/

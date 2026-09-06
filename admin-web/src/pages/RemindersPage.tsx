@@ -7,6 +7,7 @@
  * - 行操作：认领 / 完成 / 跳过（填原因）/ 释放
  */
 import { useEffect, useMemo, useState } from 'react';
+import { useSearchParams } from 'react-router-dom';
 import {
   api,
   ApiError,
@@ -94,8 +95,16 @@ export function RemindersPage() {
   const user = useAuth((s) => s.user);
   const token = tokens?.accessToken ?? '';
 
+  // 顶栏铃铛「工单 N · 提醒 M」的点击深链会带 ?priority=CRITICAL|HIGH——只在首次挂载时
+  // 读一次当初始值，不做持续双向同步（避免筛选器与地址栏来回抢主导权）。
+  const [searchParams] = useSearchParams();
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('');
-  const [priorityFilter, setPriorityFilter] = useState<PriorityFilter>('');
+  const [priorityFilter, setPriorityFilter] = useState<PriorityFilter>(() => {
+    const fromUrl = searchParams.get('priority');
+    return fromUrl === 'CRITICAL' || fromUrl === 'HIGH' || fromUrl === 'NORMAL' || fromUrl === 'LOW'
+      ? fromUrl
+      : '';
+  });
   const [sourceFilter, setSourceFilter] = useState<SourceFilter>('');
   const [mineOnly, setMineOnly] = useState(false);
   const [page, setPage] = useState(1);

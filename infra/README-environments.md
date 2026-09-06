@@ -29,11 +29,69 @@
 
 # 只重建部分服务
 /opt/ftm-staging/infra/deploy.sh staging backend worker
+
+# 冒烟失败先自己看看，暂时不想自动回滚
+/opt/ftm/infra/deploy.sh prod --no-auto-rollback
 ```
 
-脚本会 `git pull` → 重建 → 等健康 → **清悬空镜像**。最后一步别省：每次 build 都会把
-上一版镜像变成 `<none>` 但磁盘还占着，backend+worker 各约 1GB。2026-08-24 曾因此
+流程：`git pull` → 按 git short sha 打镜像 tag（`ftm-<svc>:<sha>`，同时补一份
+`:latest`）构建重启 → 等健康 → **跑 `infra/smoke.sh`** → 冒烟失败就自动
+`rollback` 到上一个成功版本（除非传了 `--no-auto-rollback`）→ **清旧镜像**
+→ 把这次的 tag / commit 全 sha / 耗时 / 结果追加写进 `<环境目录>/.deploy-history`
+（tab 分隔，一行一条；会以未加入版本库的形式留在部署目录里，跟 `backups/` 一样）。
+
+镜像清理只保留**两套环境各自最近 5 个成功 tag**（并集）∪ 正在跑的镜像 ∪ `latest`，
+其余 tag 连同每次 build 产生的悬空 `<none>` 镜像一起清掉。别省这一步：以前没有
+tag、旧镜像变成 `<none>` 也占着磁盘，backend+worker 各约 1GB，2026-08-24 曾因此
 累积到 38G、磁盘 74%。
+
+## 回滚
+
+```bash
+# 不传 tag = 回到 .deploy-history 里「上一条成功记录」
+/opt/ftm/infra/deploy.sh rollback prod
+
+# 回到指定 tag（.deploy-history 里的 IMAGE_TAG 那一列，也就是 git short sha）
+/opt/ftm-staging/infra/deploy.sh rollback staging a1b2c3d
+```
+
+回滚只做一件事：把 `docker-compose.prod.yml` 里四个服务的 `IMAGE_TAG` 切到目标
+tag 后 `compose up -d`——**不 build、不拉代码、不碰数据库**，几秒钟内切完。
+
+**回滚不回退数据库迁移。** 如果目标 tag 之后有新提交加了
+`backend/prisma/migrations/`，回滚脚本会比较当前 HEAD 与目标 tag 对应 commit
+的迁移目录差异，发现有差异就直接拒绝并打印出是哪些迁移文件，因为旧代码不一定
+认得住新迁移建的列/表/约束——这种情况先确认这些迁移是不是「新增可空列/新增表」
+这类不影响旧代码的安全迁移，确认没问题再加 `--force` 跳过检查。**永远不要**
+无脑加 `--force`：真正需要撤销一个有破坏性的迁移，得手工写 down 脚本，回滚
+命令帮不了这个忙。
+
+## 冒烟
+
+```bash
+# deploy.sh 部署健康后会自动跑；也可以单独手动跑一遍
+/opt/ftm/infra/smoke.sh prod
+```
+
+依次探 `/readyz` → 登录 → 10 个只读接口（订单/航班/套餐/酒店/提醒工单/报表/
+结算价日历/代理/审计日志/仪表盘）→ 套餐非空则试算一次 → 导出一份表校验是
+xlsx。每步打印 `OK`/`FAIL` 和耗时，任何一步失败整体以非零退出。
+
+登录需要 `.env.prod` / `.env.staging` 里配 `SMOKE_EMAIL` / `SMOKE_PASSWORD`
+（两个新变量，`infra/env.staging.example` 已给了空位）——建一个只读权限够用
+（能看订单/航班/套餐/报表）的账号，别拿真人日常账号顶上去。两个变量缺一个，
+冒烟脚本只跑免登录的 `/readyz` 探活，会打印提示但不算失败。
+
+## 本地演练（DRY_RUN）
+
+`deploy.sh` 和 `smoke.sh` 都支持 `DRY_RUN=1`：只打印会执行的命令/发出的请求，
+不真的碰 git / docker / 网络，用来在本地核对分支逻辑对不对。
+
+```bash
+DRY_RUN=1 bash infra/deploy.sh prod
+DRY_RUN=1 bash infra/deploy.sh rollback staging a1b2c3d
+DRY_RUN=1 SMOKE_EMAIL=x@x.com SMOKE_PASSWORD=x bash infra/smoke.sh prod
+```
 
 ## 让测试环境跑别的分支
 
@@ -137,6 +195,9 @@ reload 后**第一件事是确认实测四个站点还活着**，再看测试站
 - 两套的 compose 命令必须带各自的 `-p`（`ftm` / `ftm-staging`），**项目名串了数据卷就串了**。
 - `.env.prod` / `.env.staging` 只在服务器上，不进版本库，切分支和拉代码都不会动它们。
 - SSH key 叫 `~/.ssh/ftm_staging`，但那台机器是实测环境——名字是历史遗留，别被误导。
+- `<环境目录>/.deploy-history` 也只在服务器上（不进版本库，`git status` 会显示成未跟踪文件，
+  跟 `backups/` 一样正常），回滚靠它挑「上一条成功」——误删这个文件不影响线上服务，
+  但下次 `rollback` 不传 tag 就没法自动挑目标了，得显式传 tag。
 
 ## 查两套各自的状态
 

@@ -144,6 +144,30 @@ export async function scheduleNoShowVoidScan(): Promise<void> {
   });
 }
 
+// 提醒每日自动生成：每天北京时间 08:30 跑一次（受 REMINDER_AUTO_GENERATE feature flag 控制，
+// worker 里关着直接 return）。cron 表达式走 BullMQ 的 `repeat: { pattern, tz }`，tz 用
+// IANA 时区名让库自己处理夏令时/跨年这类边界，不用像 hold-overdue 那样在 worker 里手动折算。
+export interface ReminderDailyJobData {
+  requestedAt?: string;
+}
+
+export const reminderDailyQueue = new Queue<ReminderDailyJobData>('reminder-daily', {
+  connection: bullRedis,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 5000 },
+    removeOnComplete: { age: 7 * 24 * 3600, count: 100 },
+    removeOnFail: { age: 30 * 24 * 3600 },
+  },
+});
+
+export async function scheduleReminderDailyScan(): Promise<void> {
+  await reminderDailyQueue.add('generate-daily-reminders', {}, {
+    jobId: 'reminder-daily-0830',
+    repeat: { pattern: '30 8 * * *', tz: 'Asia/Shanghai' },
+  });
+}
+
 /**
  * 创建锁位时排队：delay 毫秒后若锁仍 ACTIVE 则标 EXPIRED（座位自动回归可售）。
  * jobId 用 `seatlock-<lockId>`，方便下单消费 / 手动释放时 remove() 取消。
@@ -205,6 +229,7 @@ export async function closeQueues(): Promise<void> {
     seatLockQueue.close(),
     holdOverdueQueue.close(),
     noShowVoidQueue.close(),
+    reminderDailyQueue.close(),
     fulfillmentQueueEvents.close(),
   ]);
   await bullRedis.quit();

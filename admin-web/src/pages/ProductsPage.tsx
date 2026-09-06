@@ -75,10 +75,19 @@ type MockHotelWithCost = Omit<MockHotel, 'roomTypes'> & {
   intlFiveStar?: boolean;
   // 指定酒店加价（CNY/人）：套餐录单点名住本酒店时按占座人数加收；0 = 指定不加价。
   designationSurchargeCnyPerPerson?: number;
+  // 非空 = 随机档占位酒店（值 = 档次）。占位酒店的城市就是它承载的套餐的城市，表单里城市必填。
+  randomTierPlaceholder?: number | null;
 };
 type MockTransferWithCost = MockTransfer & { costPriceCny?: number | null };
 
 type Section = 'hotels' | 'transfers' | 'visas' | 'bundles';
+
+/** 城市代码候选的兜底（老下拉的三项）；后端 distinct cityCode 拉到后与之合并。 */
+const HOTEL_CITY_FALLBACK: ReadonlyArray<{ cityCode: string; cityLabel: string }> = [
+  { cityCode: 'DAD', cityLabel: '岘港' },
+  { cityCode: 'HOA', cityLabel: '会安' },
+  { cityCode: 'BAN', cityLabel: '巴拿山' },
+];
 
 const SECTIONS: { key: Section; label: string; icon: 'hotel' | 'car' | 'visa' | 'gift' }[] = [
   { key: 'hotels', label: '酒店', icon: 'hotel' },
@@ -113,6 +122,7 @@ function hotelApiToMock(h: Hotel): MockHotelWithCost {
     stars: (h.starRating as 3 | 4 | 5) ?? 4,
     intlFiveStar: h.intlFiveStar ?? false,
     designationSurchargeCnyPerPerson: h.designationSurchargeCnyPerPerson ?? 0,
+    randomTierPlaceholder: h.randomTierPlaceholder ?? null,
     basePrice: Number(h.basePrice ?? 0),
     // 0702 反馈 2：serializeHotel 现在发 rating:{average,count} 对象，不是旧 Decimal 字符串——
     // Number(对象) = NaN，写回 create/update 会被 JSON 序列化成 null，后端 z.number() 校验直接拒绝
@@ -2329,6 +2339,27 @@ function HotelEditorForm({
   const [name, setName] = useState(hotel.name);
   const [nameEn, setNameEn] = useState(hotel.nameEn);
   const [cityCode, setCityCode] = useState(hotel.cityCode || 'DAD');
+  // 城市代码候选 = 后端 distinct cityCode（主营地排最前）∪ 三个老下拉项；允许直接输入新码（新城市开站不改代码）。
+  // 随机档按城市圈定：占位酒店的城市就是它承载的套餐的城市，必填。
+  const editorToken = useAuth((s) => s.tokens?.accessToken ?? '');
+  const [cityOptions, setCityOptions] = useState<Array<{ cityCode: string; cityLabel: string }>>(
+    () => [...HOTEL_CITY_FALLBACK],
+  );
+  useEffect(() => {
+    if (!editorToken) return;
+    let cancelled = false;
+    api
+      .listHotelCities(editorToken)
+      .then((r) => {
+        if (cancelled) return;
+        const merged = new Map(HOTEL_CITY_FALLBACK.map((c) => [c.cityCode, c] as const));
+        for (const c of r.cities) merged.set(c.cityCode, { cityCode: c.cityCode, cityLabel: c.cityLabel });
+        setCityOptions([...merged.values()]);
+      })
+      .catch(() => { /* 退回三个老下拉项 */ });
+    return () => { cancelled = true; };
+  }, [editorToken]);
+  const isPlaceholder = hotel.randomTierPlaceholder != null;
   const [area, setArea] = useState(hotel.area);
   const [address, setAddress] = useState(hotel.address ?? '');
   const [stars, setStars] = useState<3 | 4 | 5>(hotel.stars);
@@ -2403,12 +2434,31 @@ function HotelEditorForm({
             <input className="input" maxLength={4} value={emoji} onChange={(e) => setEmoji(e.target.value)} />
           </div>
           <div>
-            <label className="label text-xs">城市代码</label>
-            <select className="input" value={cityCode} onChange={(e) => setCityCode(e.target.value)}>
-              <option value="DAD">DAD 岘港</option>
-              <option value="HOA">HOA 会安</option>
-              <option value="BAN">BAN 巴拿山</option>
-            </select>
+            <label className="label text-xs">
+              城市代码
+              {isPlaceholder && <span className="ml-1 text-amber-700">（占位酒店必填）</span>}
+            </label>
+            {/* 可输入下拉：候选来自后端 distinct cityCode，也接受新码；统一大写，两端空白不算 */}
+            <input
+              required
+              list="hotel-city-codes"
+              className="input uppercase"
+              value={cityCode}
+              placeholder="如 DAD"
+              maxLength={10}
+              onChange={(e) => setCityCode(e.target.value.toUpperCase().trim())}
+            />
+            <datalist id="hotel-city-codes">
+              {cityOptions.map((c) => (
+                <option key={c.cityCode} value={c.cityCode}>
+                  {c.cityLabel}
+                </option>
+              ))}
+            </datalist>
+            <p className="mt-1 text-[11px] text-ink-muted">
+              {cityOptions.find((c) => c.cityCode === cityCode)?.cityLabel ?? '新城市：直接输入代码即可'}
+              {isPlaceholder && ' · 随机档按城市圈定，这家占位酒店的城市就是它承载的套餐的城市'}
+            </p>
           </div>
           <div>
             <label className="label text-xs">区域</label>

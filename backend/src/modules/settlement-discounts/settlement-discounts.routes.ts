@@ -22,7 +22,7 @@ export const settlementDiscountRoutes: FastifyPluginAsync = async (app) => {
   // 代理 / 散客够不到本模块的读写路由（仅 /retail-quote 公开，且只回金额、不暴露规则与代理信息）。
   // 每次写入 / 删除都落审计（UPSERT_SETTLEMENT_DISCOUNTS / DELETE_SETTLEMENT_DISCOUNT），可追责到人。
   const requireStaff = {
-    preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)],
+    preHandler: [app.authenticate, app.requireCapability('settlement_discounts.write')],
   };
 
   app.get('/', requireStaff, async (req) => {
@@ -51,6 +51,7 @@ export const settlementDiscountRoutes: FastifyPluginAsync = async (app) => {
   app.get('/retail-quote', async (req) => {
     const query = retailQuoteQuerySchema.parse(req.query);
     const hit = await resolveRetailSettlementDiscount(
+      query.routeKey,
       query.tier,
       query.nights,
       query.departDate,
@@ -67,7 +68,7 @@ export const settlementDiscountRoutes: FastifyPluginAsync = async (app) => {
       action: 'DELETE_SETTLEMENT_DISCOUNT',
       targetType: 'PRICING',
       targetId: id,
-      targetLabel: `立减规则 ${removed.kind}/${removed.tier}/${removed.nights}晚/${removed.startDate}至${removed.endDate}`,
+      targetLabel: `立减规则 ${removed.routeKey}/${removed.kind}/${removed.tier}/${removed.nights}晚/${removed.startDate}至${removed.endDate}`,
       before: removed,
       after: null,
     });

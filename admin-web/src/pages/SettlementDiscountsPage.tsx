@@ -1,8 +1,9 @@
 /**
  * 结算价立减规则 · ADMIN/STAFF — 维护代理专属、代理默认、散客三层规则。
  *
- * 规则按「档次 × 晚数 × 出发日窗口」匹配；同一层同一组键的启用窗口不能重叠，
- * 冲突信息由后端返回并原样展示给运营。
+ * 规则按「航线 × 档次 × 晚数 × 出发日窗口」匹配；同一航线同一层同一组键的启用窗口不能重叠，
+ * 冲突信息由后端返回并原样展示给运营。航线在页面顶部切换（数据来自 /settlement-rates/routes，
+ * 与结算价日历共用一份下拉），每条航线各自一套规则；已落库的行航线不可改（身份列）。
  *
  * 页面按晚数分区（1 晚 / 2 晚 / … 各一块）：
  *   - 晚数是分区归属，不是行内可改字段——已有行不再提供晚数下拉。
@@ -21,9 +22,11 @@ import {
   type SettlementDiscountKind,
   type SettlementDiscountRule,
   type SettlementDiscountWriteEntry,
+  type SettlementRoute,
   type SettlementTier,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
 import { Icon } from '../components/Icon';
 import { useConfirm } from '../components/ConfirmDialog';
 
@@ -50,6 +53,7 @@ const KIND_TABS: Array<{ kind: SettlementDiscountKind; label: string; hint: stri
 interface DraftRule {
   rowKey: string;
   id: string;
+  routeKey: string;
   kind: SettlementDiscountKind;
   agentId: string | null;
   tier: SettlementTier;
@@ -73,6 +77,7 @@ function toDraft(rule: SettlementDiscountRule): DraftRule {
   return {
     rowKey: rule.id,
     id: rule.id,
+    routeKey: rule.routeKey,
     kind: rule.kind,
     agentId: rule.agentId,
     tier: rule.tier,
@@ -86,6 +91,7 @@ function toDraft(rule: SettlementDiscountRule): DraftRule {
 }
 
 function blankDraft(
+  routeKey: string,
   kind: SettlementDiscountKind,
   agentId: string | null,
   nights: number,
@@ -95,6 +101,7 @@ function blankDraft(
   return {
     rowKey,
     id: '',
+    routeKey,
     kind,
     agentId: kind === 'AGENT' ? agentId : null,
     tier: TIERS[0],
@@ -129,15 +136,17 @@ export function SettlementDiscountsPage() {
   const confirmLockRef = useRef(false);
   const newRowSeqRef = useRef(0);
   const tokens = useAuth((s) => s.tokens);
-  const user = useAuth((s) => s.user);
   const token = tokens?.accessToken ?? '';
   // 立减规则写权限：ADMIN 与内部岗位（STAFF）都可维护 —— 录单岗要按代理口径自己配立减，
   // 每次都绕到管理员那边会让规则永远配不齐。AGENT 进不来本页（路由级 adminOnly 已拦），
   // 故此处只区分内外部；写操作后端仍逐条落审计（UPSERT/DELETE_SETTLEMENT_DISCOUNT）。
-  const canEdit = user?.role === 'ADMIN' || user?.role === 'STAFF';
+  const canEdit = useCapabilities().can('settlement_discounts.write');
   const [searchParams] = useSearchParams();
 
   const [kind, setKind] = useState<SettlementDiscountKind>('AGENT');
+  // 航线：来自 /settlement-rates/routes（与结算价日历共用一份下拉），默认第一条；规则按航线隔离
+  const [routes, setRoutes] = useState<SettlementRoute[] | null>(null);
+  const [routeKey, setRouteKey] = useState<string | null>(null);
   const [selectedAgentId, setSelectedAgentId] = useState(() => searchParams.get('agentId') ?? '');
   const [agents, setAgents] = useState<AgentListItem[]>([]);
   const [rules, setRules] = useState<DraftRule[]>([]);
@@ -189,8 +198,29 @@ export function SettlementDiscountsPage() {
       });
   }, [token]);
 
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    api.listSettlementRateRoutes(token)
+      .then((result) => {
+        if (cancelled) return;
+        setRoutes(result.routes);
+        setRouteKey((current) =>
+          current && result.routes.some((r) => r.routeKey === current)
+            ? current
+            : (result.routes[0]?.routeKey ?? null),
+        );
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setRoutes([]);
+        setError('航线列表加载失败，请刷新重试');
+      });
+    return () => { cancelled = true; };
+  }, [token]);
+
   const load = useCallback(async () => {
-    if (!token || (kind === 'AGENT' && !selectedAgentId)) {
+    if (!token || !routeKey || (kind === 'AGENT' && !selectedAgentId)) {
       setRules([]);
       setRowErrors({});
       setLoading(false);
@@ -202,6 +232,7 @@ export function SettlementDiscountsPage() {
     setRowErrors({});
     try {
       const result = await api.listSettlementDiscounts(token, {
+        routeKey,
         kind,
         ...(kind === 'AGENT' ? { agentId: selectedAgentId } : {}),
       });
@@ -211,7 +242,7 @@ export function SettlementDiscountsPage() {
     } finally {
       setLoading(false);
     }
-  }, [kind, selectedAgentId, token]);
+  }, [kind, routeKey, selectedAgentId, token]);
 
   useEffect(() => {
     void load();
@@ -235,10 +266,13 @@ export function SettlementDiscountsPage() {
   }
 
   function addRule(nights: number): void {
-    if (!canEdit || (kind === 'AGENT' && !selectedAgentId)) return;
+    if (!canEdit || !routeKey || (kind === 'AGENT' && !selectedAgentId)) return;
     newRowSeqRef.current += 1;
     const rowKey = `new-${newRowSeqRef.current}`;
-    setRules((current) => [...current, blankDraft(kind, selectedAgentId || null, nights, rowKey)]);
+    setRules((current) => [
+      ...current,
+      blankDraft(routeKey, kind, selectedAgentId || null, nights, rowKey),
+    ]);
     setError(null);
     setNotice(null);
   }
@@ -266,6 +300,7 @@ export function SettlementDiscountsPage() {
     try {
       const payload: SettlementDiscountWriteEntry[] = rules.map((rule) => ({
         ...(rule.id ? { id: rule.id } : {}),
+        routeKey: rule.routeKey,
         kind: rule.kind,
         ...(rule.kind === 'AGENT' && rule.agentId ? { agentId: rule.agentId } : {}),
         tier: rule.tier,
@@ -476,7 +511,7 @@ export function SettlementDiscountsPage() {
       <section className="flex flex-wrap items-start justify-between gap-3">
         <div>
           <h1 className="page-title">立减规则</h1>
-          <p className="page-sub">按档次、晚数与出发日窗口维护结算价立减；同组启用窗口不可重叠。</p>
+          <p className="page-sub">按航线、档次、晚数与出发日窗口维护结算价立减；同一航线的同组启用窗口不可重叠。</p>
         </div>
         <Link to="/settlement-rates" className="btn-secondary text-sm">查看结算价日历</Link>
       </section>
@@ -499,6 +534,22 @@ export function SettlementDiscountsPage() {
               </button>
             ))}
           </div>
+          <div className="flex flex-wrap items-end gap-3">
+          <label className="min-w-[180px] text-xs text-ink-muted">
+            航线
+            <select
+              className="input mt-1"
+              value={routeKey ?? ''}
+              onChange={(e) => setRouteKey(e.target.value || null)}
+              disabled={!routes || routes.length === 0}
+            >
+              {(routes ?? []).map((r) => (
+                <option key={r.routeKey} value={r.routeKey}>
+                  {r.origin} → {r.destination}
+                </option>
+              ))}
+            </select>
+          </label>
           {kind === 'AGENT' && (
             <label className="min-w-[260px] text-xs text-ink-muted">
               指定代理
@@ -517,6 +568,7 @@ export function SettlementDiscountsPage() {
               </select>
             </label>
           )}
+          </div>
         </div>
 
         <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-ink-muted">
@@ -525,8 +577,8 @@ export function SettlementDiscountsPage() {
         </div>
 
         <p className="rounded-md bg-slate-50 px-3 py-2 text-xs text-ink-muted ring-1 ring-slate-200">
-          晚数按分区归属；已保存的规则，晚数与档次都不可再改（改了等于把另一条规则原地覆盖）。
-          要换晚数或档次：在目标晚数分区「+ 新增规则」另建一条，再把原来那条停用或删除。
+          规则按航线隔离（上方切换航线，每条航线各自一套）；晚数按分区归属。已保存的规则，航线、晚数与档次都不可再改
+          （改了等于把另一条规则原地覆盖）。要换航线、晚数或档次：切到目标航线 / 晚数分区「+ 新增规则」另建一条，再把原来那条停用或删除。
           金额、出发日窗口、启用状态和备注随时可改。
         </p>
 

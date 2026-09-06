@@ -9,6 +9,7 @@ import { api, ApiError, ROSTER_FORMAT_LABEL, SETTLEMENT_MODE_LABEL, type AgentLi
 import { useAuth } from '../stores/auth';
 import { Icon } from '../components/Icon';
 import { useDialogA11y } from '../components/Modal';
+import { useCapabilities } from '../hooks/useCapabilities';
 
 const TIER_LABEL = ['', '1级·总代', '2级·区代', '3级·门店', '4级', '5级'];
 const TIER_COLOR = ['', 'bg-red-100 text-red-700', 'bg-amber-100 text-amber-700', 'bg-blue-100 text-blue-700', 'bg-slate-100 text-slate-600', 'bg-slate-100 text-slate-600'];
@@ -26,9 +27,9 @@ export function AgentsPage() {
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
   const isAdmin = user?.role === 'ADMIN' || user?.role === 'STAFF';
-  // 重置代理登录密码是敏感操作，只放给 ADMIN——STAFF 仍可看/改代理资料，但不给重置密码入口。
-  // 内部员工（ADMIN/STAFF）都可帮代理重置密码；后端限定 STAFF 只能重置 AGENT 账号
-  const canResetAgentPassword = user?.role === 'ADMIN' || user?.role === 'STAFF';
+  // 重置代理登录密码：内部员工（ADMIN/STAFF）都可帮代理重置；后端限定 STAFF 只能重置 AGENT 账号
+  // —— 重置内部同事的密码是另一条能力（users.reset_staff_password，仅管理员）。
+  const canResetAgentPassword = useCapabilities().can('users.reset_agent_password');
 
   const [agents, setAgents] = useState<AgentListItem[] | null>(null);
   const [agentsLoaded, setAgentsLoaded] = useState(false);
@@ -666,7 +667,7 @@ function AgentExclusiveDiscounts({ agent }: { agent: AgentListItem }) {
         <div className="mt-2 space-y-1.5">
           {rules.map((rule) => (
             <div key={rule.id} className="grid grid-cols-[1fr_auto] gap-x-3 text-xs text-slate-700">
-              <span>{DISCOUNT_TIER_LABEL[rule.tier]} · {rule.nights}晚 · {rule.startDate} 至 {rule.endDate}</span>
+              <span>{rule.routeKey} · {DISCOUNT_TIER_LABEL[rule.tier]} · {rule.nights}晚 · {rule.startDate} 至 {rule.endDate}</span>
               <span className="font-semibold tabular-nums text-indigo-800">−¥{rule.discountPerPersonCny}/人</span>
             </div>
           ))}
@@ -754,6 +755,7 @@ function InfoTab({
   return (
     <div className="space-y-4">
       <SettlementModeCard agent={agent} isAdmin={isAdmin} onChanged={onChanged} />
+      <AgentStatementCard agent={agent} />
       {isAdmin && <AgentExclusiveDiscounts agent={agent} />}
 
       {canEdit && !editing && (
@@ -849,6 +851,90 @@ function InfoTab({
       )}
     </div>
   );
+}
+
+/**
+ * 对账单下载卡片 —— 运营/财务替代理下同一张表（代理自己在前台也能下）。
+ *
+ * 与「结算单」是两件事，卡片上要写清楚，不然两个数对不上就会有人来问：
+ *   · 结算单（财务 → 结算单）= 佣金的账，按下单时间归期，一个代理一月一张；
+ *   · 对账单 = 订单的账（应收/已收/余额/每人结算价/立减/佣金），按**出发日**归月，
+ *     含本代理与全部下级；表格抬头也印着同一句口径说明。
+ * 内容与代理自助下载的完全一致：没有成本、没有证件，随手转给代理也不会漏内部信息。
+ */
+function AgentStatementCard({ agent }: { agent: AgentListItem }) {
+  const tokens = useAuth((s) => s.tokens);
+  const [month, setMonth] = useState<string>(() => statementMonthOptions(1)[0]);
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const onDownload = async (): Promise<void> => {
+    if (!tokens || busy) return;
+    setBusy(true);
+    setErr(null);
+    try {
+      const blob = await api.downloadAgentStatement(tokens.accessToken, agent.id, month);
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `对账单_${agent.companyName || agent.contactName}_${month}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      URL.revokeObjectURL(url);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '下载失败');
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  return (
+    <section className="rounded-md border border-slate-200 p-3">
+      <div className="flex items-center justify-between gap-2">
+        <div>
+          <h3 className="text-sm font-semibold text-slate-900">月度对账单</h3>
+          <p className="mt-0.5 text-xs text-slate-500">
+            按出发日归月，含本代理与下级的订单明细、合计与预存款；不含成本与证件信息，可直接转给代理。
+          </p>
+        </div>
+      </div>
+      <div className="mt-2 flex items-end gap-2">
+        <div>
+          <label className="label text-xs" htmlFor={`statement-month-${agent.id}`}>
+            月份
+          </label>
+          <select
+            id={`statement-month-${agent.id}`}
+            className="input py-1.5"
+            value={month}
+            onChange={(e) => setMonth(e.target.value)}
+          >
+            {statementMonthOptions(12).map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
+        </div>
+        <button type="button" className="btn-secondary text-xs px-3 py-2" disabled={busy} onClick={onDownload}>
+          {busy ? '生成中…' : '⬇ 下载对账单'}
+        </button>
+      </div>
+      {err && <div className="mt-2 rounded bg-rose-50 px-2 py-1 text-xs text-rose-700">{err}</div>}
+    </section>
+  );
+}
+
+/** 最近 n 个自然月的 'YYYY-MM'（倒序，本月在前）。 */
+function statementMonthOptions(months: number): string[] {
+  const now = new Date();
+  const out: string[] = [];
+  for (let i = 0; i < months; i++) {
+    const d = new Date(now.getFullYear(), now.getMonth() - i, 1);
+    out.push(`${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}`);
+  }
+  return out;
 }
 
 // 结算方式卡片：展示 逐单到账 / 月结；ADMIN 可切换（调 setAgentSettlementMode）。
@@ -952,14 +1038,12 @@ const emptyCommissionDraft = (): Record<CommissionTabKind, string> =>
 function CommissionTab({ agent }: { agent: AgentListItem }) {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
-  const role = useAuth((s) => s.user?.role);
   // 返佣费率写权限：ADMIN 与内部岗位（STAFF）都可维护——返佣口径归财务，每次都绕管理员配
-  // 会让费率永远配不齐。⚠️ AGENT 是能打开本页签的（/agents 在 App.tsx 的
-  // AGENT_ALLOWED_PATHS 里，代理详情抽屉的「佣金规则」tab 本身没有额外角色门），
-  // 只是 canEdit 落到只读态——AGENT 查看自己/下级的费率是只读展示，不是没入口。
-  // 与后端 PUT /agents/:id/commission-rules 的 requireRole(ADMIN, STAFF) 必须保持同步：
+  // 会让费率永远配不齐。⚠️ AGENT 是能打开本页签的（/agents 在 App.tsx 的 AGENT_ALLOWED_PATHS 里，
+  // 代理详情抽屉的「佣金规则」tab 本身没有额外角色门），只是 canEdit 落到只读态。
+  // 与后端 PUT /agents/:id/commission-rules 挂的是同一条能力：
   // 只放后端不放前端，页面仍渲染只读态，使用者看到的就是「没有权限」（立减规则那次的教训）。
-  const canEdit = role === 'ADMIN' || role === 'STAFF';
+  const canEdit = useCapabilities().can('agents.commission_rules.manage');
   type Kind = CommissionTabKind;
   const KINDS = COMMISSION_KINDS;
 

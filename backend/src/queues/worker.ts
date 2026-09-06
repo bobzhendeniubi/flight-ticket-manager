@@ -30,6 +30,7 @@ import {
   type SeatLockJobData,
   type HoldOverdueJobData,
   type NoShowVoidJobData,
+  type ReminderDailyJobData,
   type WaitlistCheckJobData,
 } from './queue.js';
 import { closeMailer } from '../lib/mailer.js';
@@ -39,6 +40,7 @@ import { REFUND_REQUESTED_FULFILLMENT_ERROR } from '../modules/fulfillment/fulfi
 import { heldSeatsForSeatClass } from '../modules/hold-orders/held-seats.js';
 import { markOverdueHolds } from '../modules/hold-orders/hold-overdue.js';
 import { voidDepartedReleasedReturnLegs } from '../modules/orders/no-show-void.js';
+import { runDailyReminderGeneration } from '../modules/reminders/reminders-daily.js';
 
 /**
  * 超时释放某订单占用的座位——套餐升舱拆座感知 + 下限钳制在 0（MEDIUM 修复）。
@@ -460,6 +462,31 @@ void (async () => {
   }
 })();
 
+// 提醒每日自动生成（每天北京时间 08:30）：flag 关时 runDailyReminderGeneration 内部直接
+// return，不生成也不推送——worker 这层不用重复判断。样板同 hold-overdue / no-show-void：
+// concurrency 1（全库扫描，没必要并发）+ 自注册 repeat。
+const reminderDailyWorker = new Worker<ReminderDailyJobData>(
+  'reminder-daily',
+  async () => runDailyReminderGeneration(prisma),
+  { connection: bullRedis, concurrency: 1 },
+);
+
+reminderDailyWorker.on('failed', (job, err) => {
+  // eslint-disable-next-line no-console
+  console.error(`[worker:reminder-daily] ✗ job ${job?.id} failed:`, err.message);
+});
+
+void (async () => {
+  try {
+    const module = await import('./queue.js');
+    if (!Object.prototype.hasOwnProperty.call(module, 'scheduleReminderDailyScan')) return;
+    await module.scheduleReminderDailyScan();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[worker:reminder-daily] failed to register repeatable scan:', err);
+  }
+})();
+
 seatLockWorker.on('failed', (job, err) => {
   // eslint-disable-next-line no-console
   console.error(`[worker:seat-lock] ✗ job ${job?.id} failed:`, err.message);
@@ -544,6 +571,7 @@ async function shutdown() {
     seatLockWorker.close(),
     holdOverdueWorker.close(),
     noShowVoidWorker.close(),
+    reminderDailyWorker.close(),
     notificationWorker.close(),
   ]);
   await closeMailer();

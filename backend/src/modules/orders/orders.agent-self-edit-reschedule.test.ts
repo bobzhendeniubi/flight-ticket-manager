@@ -152,7 +152,9 @@ function mountReschedule(
       updateMany: vi.fn(async () => ({ count: passengers.length })),
     },
     flightSeatClass: { findFirst: vi.fn(async () => ({ id: 'sc-1' })) },
-    flightSchedule: { findUnique: vi.fn(async () => null) },
+    // findMany：改期后重打机票行成本快照要按新班次取成本（见 item-cost-snapshot.ts）。
+    // 返回空 = 查不到班次 → 快照转 NULL，与「班次没录成本」同一条分支，不影响本文件的断言。
+    flightSchedule: { findUnique: vi.fn(async () => null), findMany: vi.fn(async () => []) },
     hotelRoomType: { findMany: vi.fn(async () => []) },
     seatLock: { aggregate: vi.fn(async () => ({ _sum: { qty: 0 } })) },
   };

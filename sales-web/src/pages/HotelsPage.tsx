@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useNavigate, useSearchParams } from 'react-router-dom';
-import { api, type Hotel } from '../lib/api';
+import { api, type Hotel, type PublicHotelCity } from '../lib/api';
 import { businessToday } from '../lib/datetime';
 import { useCart } from '../stores/cart';
 import { Icon } from '../components/Icon';
@@ -45,10 +45,20 @@ function todayISO(offsetDays = 0) {
   return businessToday(offsetDays);
 }
 
+/**
+ * 目的地下拉静态兜底：`/public/hotel-cities` 拉取失败/尚未拉取时用这份，
+ * 保证首屏不空白（现役在架城市：岘港 + 会安）。拉取成功后整体替换为后端结果。
+ */
+const DEFAULT_HOTEL_CITIES: PublicHotelCity[] = [
+  { code: 'DAD', name: '岘港' },
+  { code: 'HOA', name: '会安' },
+];
+
 export function HotelsPage() {
   const [hotels, setHotels] = useState<Hotel[]>([]);
   const [load, setLoad] = useState<LoadState>('loading');
   const [city, setCity] = useState('');
+  const [cityOptions, setCityOptions] = useState<PublicHotelCity[]>(DEFAULT_HOTEL_CITIES);
   const [stars, setStars] = useState<'' | '3' | '4' | '5'>('');
   const [maxPrice, setMaxPrice] = useState(4000);
   const [checkIn, setCheckIn] = useState(todayISO(3));
@@ -87,6 +97,23 @@ export function HotelsPage() {
       cancelled = true;
     };
   }, [reloadKey]);
+
+  // 目的地下拉：拉后端在架酒店城市，失败/空结果保留静态兜底（岘港 + 会安），不清空。
+  useEffect(() => {
+    let cancelled = false;
+    api
+      .getPublicHotelCities()
+      .then((r) => {
+        if (cancelled || r.cities.length === 0) return;
+        setCityOptions(r.cities);
+      })
+      .catch(() => {
+        // 拉取失败：静默保留静态兜底
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   // 全量设施集合（用于多选筛选；不依赖新接口，从已加载酒店聚合）
   const allAmenities = useMemo(() => {
@@ -132,6 +159,15 @@ export function HotelsPage() {
     Math.round((new Date(checkOut).getTime() - new Date(checkIn).getTime()) / 86400000),
   );
 
+  // SEO 描述按当前目的地生成：选了某城就写那座城，没选就列出在架城市（下拉同源）。
+  // 以前这里写死「岘港 / 会安」，新开一座城要改代码才对得上。
+  const seoDestinations = useMemo(() => {
+    const selected = cityOptions.find((c) => c.code === city);
+    if (selected) return selected.name;
+    const names = cityOptions.map((c) => c.name).filter(Boolean);
+    return names.length > 0 ? names.join(' / ') : '各海岛';
+  }, [cityOptions, city]);
+
   /** 卡片内直接加购：取最便宜房型 × 1 间 × nights 晚（不打断列表流，详情页可精选房型）。 */
   const quickAdd = (h: Hotel) => {
     // basePrice 已是该房型最终单价（含倍率），priceMultiplier 为遗留字段，不再参与计价，
@@ -164,7 +200,7 @@ export function HotelsPage() {
     <div className="space-y-6">
       <Seo
         title="酒店预订"
-        description="覆盖岘港 / 会安等海岛目的地的精选酒店，房型、设施、真实点评一目了然，与航班打包更划算。"
+        description={`覆盖${seoDestinations}等海岛目的地的精选酒店，房型、设施、真实点评一目了然，与航班打包更划算。`}
         canonicalPath="/hotels"
       />
 
@@ -178,9 +214,10 @@ export function HotelsPage() {
           <div>
             <label className="label">目的地</label>
             <select className="input" value={city} onChange={(e) => setCity(e.target.value)}>
-              <option value="">全部（岘港 + 会安）</option>
-              <option value="DAD">岘港</option>
-              <option value="HOA">会安</option>
+              <option value="">全部（{cityOptions.map((c) => c.name).join(' + ')}）</option>
+              {cityOptions.map((c) => (
+                <option key={c.code} value={c.code}>{c.name}</option>
+              ))}
             </select>
           </div>
           <div>

@@ -6,9 +6,12 @@
 import { useCallback, useEffect, useState } from 'react';
 import { ApiError, orderChangeRequestsApi, type OrderChangeRequest, type OrderSummary } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
 import { useConfirm } from './ConfirmDialog';
 import { formatDateTimeSecCn } from '../lib/datetime';
 import {
+  ACKNOWLEDGEMENT_REQUIRED_CODE,
+  extraKindConfirmHint,
   formatSignedCny,
   isStarMismatchApproveError,
   ORDER_CHANGE_REQUEST_KIND_LABEL,
@@ -41,7 +44,7 @@ export function OrderChangeRequestsPanel({
 }: OrderChangeRequestsPanelProps) {
   const token = useAuth((s) => s.tokens)?.accessToken ?? '';
   const confirm = useConfirm();
-  const isOpsUser = role === 'ADMIN' || role === 'STAFF';
+  const isOpsUser = useCapabilities().can('change_requests.decide');
   const isAgentUser = role === 'AGENT';
 
   const [requests, setRequests] = useState<OrderChangeRequest[]>([]);
@@ -82,14 +85,35 @@ export function OrderChangeRequestsPanel({
   }, [token, orderId, isAgentUser, isOpsUser]);
   useEffect(() => load(), [load, refreshNonce]);
 
-  /** 确认执行，途中若命中「放行原因」类 400（指定酒店星级与套餐档次不符），弹窗补填理由后原样重试一次。 */
+  /**
+   * 确认执行，带两条补料重试：
+   *   · 「放行原因」类 400（指定酒店星级与套餐档次不符）→ 弹窗补填理由后原样重试；
+   *   · ACKNOWLEDGEMENT_REQUIRED（取消单程，多为该段已出票）→ 把提示原文摆出来，
+   *     二次确认后带 acknowledgeWarnings 重试。按稳定 code 判，不匹配中文文案。
+   * 两条都只补一次料、重试一次；补不上就把原错误原样抛出去，绝不静默放行。
+   */
   const approveWithStarMismatchRetry = async (request: OrderChangeRequest, decisionNote: string) => {
     try {
       return await orderChangeRequestsApi.approveOrderChangeRequest(token, request.id, {
         decisionNote: decisionNote || undefined,
       });
     } catch (e: unknown) {
-      if (!(e instanceof ApiError) || !isStarMismatchApproveError(e.message)) throw e;
+      if (!(e instanceof ApiError)) throw e;
+      if (e.code === ACKNOWLEDGEMENT_REQUIRED_CODE) {
+        const acknowledged = await confirm({
+          title: '这一步需要善后，确认继续？',
+          body: `${e.message}\n\n确认后仍会执行取消，请记得跟进后续处理。`,
+          tone: 'danger',
+          confirmText: '我已知悉，继续',
+          cancelText: '取消',
+        });
+        if (!acknowledged) throw e; // 没勾 = 维持原错误
+        return await orderChangeRequestsApi.approveOrderChangeRequest(token, request.id, {
+          decisionNote: decisionNote || undefined,
+          acknowledgeWarnings: true,
+        });
+      }
+      if (!isStarMismatchApproveError(e.message)) throw e;
       const reason = window.prompt(
         `${e.message}\n请填写「套餐档次与酒店星级不符 · 放行原因」（必填，${STAR_MISMATCH_REASON_MAX} 字以内，随订单留档备查）：`,
         '',
@@ -117,7 +141,7 @@ export function OrderChangeRequestsPanel({
       title: action === 'approve' ? '确认执行改单申请？' : '驳回改单申请？',
       body:
         action === 'approve'
-          ? `确认后将按「${request.summary ?? ORDER_CHANGE_REQUEST_KIND_LABEL[request.kind]}」直接执行。${moneyLine}`
+          ? `确认后将按「${request.summary ?? ORDER_CHANGE_REQUEST_KIND_LABEL[request.kind]}」直接执行。${moneyLine}${extraKindConfirmHint(request.kind)}`
           : '驳回后订单不变，代理会看到驳回原因。',
       tone: action === 'approve' ? 'default' : 'danger',
       confirmText: action === 'approve' ? '确认执行' : '驳回',

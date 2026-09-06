@@ -25,8 +25,8 @@ import {
 
 export const agentRechargeRoutes: FastifyPluginAsync = async (app) => {
   const service = new AgentRechargesService();
-  const requireAdminOrStaff = app.requireRole(UserRole.ADMIN, UserRole.STAFF);
-  const requireAnyStaffRole = app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT);
+  const requireAdminOrStaff = app.requireCapability('agent_recharges.decide');
+  const requireAnyStaffRole = app.requireCapability('agent_recharges.submit');
 
   // ── 提交认款申请 ─────────────────────────────────────
   app.post(
@@ -64,7 +64,7 @@ export const agentRechargeRoutes: FastifyPluginAsync = async (app) => {
   // ── AGENT：应付款渠道 ────────────────────────────────
   app.get(
     '/my-channels',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.AGENT)] },
+    { preHandler: [app.authenticate, app.requireCapability('agent_recharges.my_channels')] },
     async (req) => {
       const result = await service.myChannels({ userId: req.user.sub, role: req.user.role });
       return result;

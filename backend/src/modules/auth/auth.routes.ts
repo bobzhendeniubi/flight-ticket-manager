@@ -1,5 +1,4 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { UserRole } from '@prisma/client';
 import { z } from 'zod';
 import {
   loginBodySchema,
@@ -28,7 +27,7 @@ export const authRoutes: FastifyPluginAsync = async (app) => {
   // 后端裸开=UI 伪装而非权限。游客可免登录下单，正式账号走此受控入口或 /wechat 微信登录。
   app.post(
     '/register',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('users.create_account')] },
     async (req, reply) => {
       const body = registerBodySchema.parse(req.body);
       const result = await service.register(body, {

@@ -18,30 +18,38 @@ import { PricingService } from '../modules/pricing/pricing.service.js';
 import { CabinClass, SeatLockStatus } from '@prisma/client';
 import { heldSeatsBySeatClass } from '../modules/hold-orders/held-seats.js';
 import { businessDateISO, businessDateTime } from './business-time.js';
-import { localDateTime } from './flight-time.js';
+import { localDateISO, localDateTime } from './flight-time.js';
+import { cityName } from './airports.js';
 
 const MAX_TOOL_ITERATIONS = 8; // 防止 loop 失控
 
 // ── 系统提示词 ───────────────────────────────────────────────
-const SYSTEM_PROMPT = `你是「世途旅行」的客服 AI 助手，帮客户预订澳门 ⇌ 岘港旅行的全套产品。
+/**
+ * 系统提示词模板。`{{ROUTES}}` 会被替换成实时的在飞航线清单（见 buildSystemPrompt）——
+ * 航线**绝不写死**：公司第二条航线在即，提示词里钉死「澳门⇌岘港」会让助手对新航线一问三不知，
+ * 或者张口就把客户往老航线上引。
+ */
+const SYSTEM_PROMPT_TEMPLATE = `你是「椰岛假期」的客服 AI 助手，帮客户预订我们在飞航线的全套旅行产品。
+
+{{ROUTES}}
 
 # 你能搜的 5 类产品（都通过 tool 调用，不要凭记忆）
-- ✈️ **机票** — search_flights / get_flight_price（只有 MFM ⇌ DAD 这条线）
+- ✈️ **机票** — search_flights / get_flight_price（只飞上面「在飞航线」里列的这些线）
 - 🛂 **签证** — search_visas（越南最常用；东南亚 7 国都有）
-- 🏨 **酒店** — search_hotels（岘港多家；返回各房型 ¥/晚）
+- 🏨 **酒店** — search_hotels（目的地各城市，返回各房型 ¥/晚）
 - 🚗 **接送** — search_transfers（机场接送 / 包车）
 - 🎁 **套餐** — search_bundles（一价全包：机票+酒店+接送+签证 + 让利）
 
 # 工作流程
 1. 听用户说想要什么（去程日期 / 回程日期 / 人数 / 是否含酒店签证接送 / 是否要套餐）
-2. **【硬规则】机票永远按往返查**——这是世途的主营业务，95% 客户都是来回行程。
+2. **【硬规则】机票永远按往返查**——这是我们的主营业务，95% 客户都是来回行程。
    - 用户没说"单程"两个字 → 必须按往返做
    - 用户只说了一个日期 → **先反问** "回程哪天回？" 不要直接做单程
    - 用户说了"明天去"（没说回） → **追问** "您计划玩几天？什么时候回？"
    - 只有用户明确写"我只要单程"、"one way"、"不要回程" → 才做单程
-   - 调 search_flights 两次：
-     · 去程：origin=MFM, destination=DAD, date=去程日期
-     · 回程：origin=DAD, destination=MFM, date=回程日期
+   - 调 search_flights 两次（origin/destination 用上面「在飞航线」里客户选中的那条）：
+     · 去程：origin=出发地, destination=目的地, date=去程日期
+     · 回程：把 origin / destination 对调, date=回程日期
 3. 用人话总结 2-3 个组合给用户（去 + 回 一对一对介绍，不要散列）
 4. 用户选定后用 propose_order 生成"订单草稿"
    - **往返必须 2 个 FLIGHT items**（去程 + 回程都加进 items 数组）
@@ -56,7 +64,7 @@ const SYSTEM_PROMPT = `你是「世途旅行」的客服 AI 助手，帮客户�
 - TRANSFER: { kind:'TRANSFER', transferId, qty (车次/趟数) }
 - BUNDLE: { kind:'BUNDLE', bundleId, pax (人数), rooms? }
 
-混搭例：用户要"5 月 1 号 2 人去岘港 3 晚 + 越南签证 + 接机"
+混搭例：用户要"5 月 1 号 2 人去某目的地 3 晚 + 当地签证 + 接机"
 items=[
   {kind:'FLIGHT', scheduleId:'...', cabin:'ECONOMY', passengers:2},
   {kind:'HOTEL', hotelRoomTypeId:'...', checkIn:'2026-05-01', checkOut:'2026-05-04', rooms:1},
@@ -72,7 +80,7 @@ items=[
 # 【重要】BUNDLE 定价规则（避免漏付）
 - BUNDLE 单 item **只含地面服务**（酒店/接送/签证）的让利价，**不含机票**
 - 推 BUNDLE 时 propose_order 必须同时加 **2 个 FLIGHT items**（去程 + 回程）才算完整
-- 例：用户要"5/1-5/4 2 人岘港全包套餐"，items 应该是：
+- 例：用户要"5/1-5/4 2 人全包套餐"，items 应该是：
   · BUNDLE { bundleId, pax: 2, rooms: 1 }
   · FLIGHT { scheduleId: 去程, cabin: 'ECONOMY', passengers: 2 }
   · FLIGHT { scheduleId: 回程, cabin: 'ECONOMY', passengers: 2 }
@@ -103,28 +111,101 @@ items=[
 - 每次最多介绍 3 个选项；多了用户记不住
 - 主动追问关键缺失信息（出发日期 / 人数 / 舱位偏好 / 是否需要签证）
 - 用 ¥ 而不是 RMB
-- 出发地默认澳门 (MFM)，目的地默认岘港 (DAD)
+- 客户没说去哪：只有一条在飞航线时直接按那条做，有多条时先问他想去哪个目的地——不要替他猜
 
 # 当前默认参数（用户没说就用这些）
-- origin: MFM, destination: DAD
+- origin / destination：见上面「在飞航线」（多条时先问客户）
 - cabin: ECONOMY
 - passengers: 1`;
 
+/** 一条在飞航线（有未来在售班次的自营航班）。 */
+export interface ActiveRoute {
+  origin: string;
+  destination: string;
+}
+
+const ROUTES_CACHE_TTL_MS = 5 * 60 * 1000;
+let routesCache: { at: number; routes: ActiveRoute[] } | null = null;
+
+/** 供测试清空在飞航线缓存。 */
+export function resetActiveRoutesCache(): void {
+  routesCache = null;
+}
+
 /**
- * 系统提示词 + 当前时间。
+ * 在飞航线：启用的自营航班里，还有未来在售班次的那些，按 origin→destination 去重。
+ * 查不到 → 空数组（提示词里会明说"目前没有在售航班"，助手不许编航线）。
+ * 5 分钟内存缓存 —— 每轮对话都查一次库不值当，航线本身也不会分钟级变化。
+ */
+async function getActiveRoutes(now: Date = new Date()): Promise<ActiveRoute[]> {
+  if (routesCache && now.getTime() - routesCache.at < ROUTES_CACHE_TTL_MS) return routesCache.routes;
+  let flights: Array<{ originCode: string; destinationCode: string }> = [];
+  try {
+    flights = await prisma.flight.findMany({
+      where: {
+        isActive: true,
+        schedules: { some: { isActive: true, departureTime: { gte: now } } },
+      },
+      select: { originCode: true, destinationCode: true },
+      orderBy: [{ originCode: 'asc' }, { destinationCode: 'asc' }],
+    });
+  } catch {
+    // 查库失败不能把整轮对话打死；按"暂时不知道航线"处理，提示词会让助手别编。
+    return [];
+  }
+  const seen = new Set<string>();
+  const routes: ActiveRoute[] = [];
+  for (const f of flights) {
+    const key = `${f.originCode}-${f.destinationCode}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    routes.push({ origin: f.originCode, destination: f.destinationCode });
+  }
+  routesCache = { at: now.getTime(), routes };
+  return routes;
+}
+
+/** 提示词里的「在飞航线」小节（实时数据；空 = 明说没有，别编）。 */
+function renderRoutesSection(routes: ActiveRoute[]): string {
+  if (routes.length === 0) {
+    return `# 在飞航线
+- 系统当前查不到任何在售航班。**不要编航线、不要报任何航班**，请客户稍后再问，或转人工。`;
+  }
+  return `# 在飞航线（唯一可售范围，来自系统实时数据）
+${routes.map((r) => `- ${r.origin} → ${r.destination}`).join('\n')}
+- 这份清单之外的航线一律没有；客户问别的目的地就直说暂时不飞，**绝不编造**。`;
+}
+
+/**
+ * 系统提示词 + 在飞航线 + 当前时间。
  *
  * 模型没有时钟，不给它「今天是几号」它就会拿训练时的日期猜，把「明天」算错一天。
  * 服务器容器 TZ=UTC，所以这里必须显式折成北京时间并标注 —— 模型会把这句话原样
  * 念给客户听，标注错了等于当着客户面报错时间。航班时刻另有口径（见 search_flights
  * 返回的 departureLocalTime，按班次自己的时区折），不受这里影响。
+ *
+ * 航线同理：不写死，每次开新会话时按库里在飞的航班实时生成。
  */
-function buildSystemPrompt(now: Date = new Date()): string {
-  return `${SYSTEM_PROMPT}
+async function buildSystemPrompt(now: Date = new Date()): Promise<string> {
+  const routes = await getActiveRoutes(now);
+  return `${SYSTEM_PROMPT_TEMPLATE.replace('{{ROUTES}}', renderRoutesSection(routes))}
 
 # 当前时间
 - 现在是 ${businessDateTime(now)}（北京时间）；今天 = ${businessDateISO(now)}
 - 客户说「今天 / 明天 / 下周三」都按这个日期算，不要凭记忆猜年份
 - 航班时刻一律念工具返回的 departureLocalTime / arrivalLocalTime（机场当地时间），不要念 UTC 的 departureTime`;
+}
+
+/**
+ * search_hotels 的 cityCode 参数说明里那个「例 XXX(某城)」的占位符。
+ * 写死一个城市，第二条航线一开就是在教模型去错的城市查酒店；每轮按在飞航线实时替换。
+ */
+const CITY_CODE_EXAMPLE_SLOT = '{{CITY_CODE_EXAMPLE}}';
+
+/** 按在飞航线生成一个城市码例子（取第一条航线的目的地）；查不到航线就不举例。 */
+function cityCodeExample(routes: readonly ActiveRoute[]): string {
+  const code = routes[0]?.destination;
+  return code ? `，例 ${code}(${cityName(code)})` : '';
 }
 
 // ── 工具定义（OpenAI Chat Completions tool 格式）─────────────
@@ -134,13 +215,14 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     function: {
       name: 'search_flights',
       description:
-        '搜索澳门 ⇌ 岘港的航班。返回班次列表，每个班次含多个舱位的动态价、日期等级、余位。' +
+        '搜索我们在飞航线的航班（可售航线见系统提示里的「在飞航线」）。' +
+        '返回班次列表，每个班次含多个舱位的动态价、日期等级、余位。' +
         '如果客户没指定日期，date 留空就返回全部未来 50 个班次。',
       parameters: {
         type: 'object',
         properties: {
-          origin: { type: 'string', description: '出发地 IATA 代码，默认 MFM（澳门）' },
-          destination: { type: 'string', description: '目的地 IATA 代码，默认 DAD（岘港）' },
+          origin: { type: 'string', description: '出发地 IATA 代码；省略 = 不限出发地' },
+          destination: { type: 'string', description: '目的地 IATA 代码；省略 = 不限目的地' },
           date: { type: 'string', description: 'YYYY-MM-DD 出发日期。可省略 = 不限。' },
           cabin: {
             type: 'string',
@@ -194,7 +276,11 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       parameters: {
         type: 'object',
         properties: {
-          cityCode: { type: 'string', description: '城市代码，例 DAD(岘港)；省略 = 所有城市' },
+          // description 里的例子在 buildTools 里按在飞航线实时替换（占位符见 CITY_CODE_EXAMPLE_SLOT）
+          cityCode: {
+            type: 'string',
+            description: `城市代码${CITY_CODE_EXAMPLE_SLOT}；省略 = 所有城市`,
+          },
         },
       },
     },
@@ -285,6 +371,23 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   },
 ];
 
+/**
+ * 本轮实际发给模型的工具定义 = TOOLS，但把参数说明里的城市码例子换成在飞航线的目的地。
+ * 只做字符串替换、不改结构；航线查不到时例子整段消失（不举例好过举错的例）。
+ */
+export async function buildTools(
+  now: Date = new Date(),
+): Promise<OpenAI.Chat.Completions.ChatCompletionTool[]> {
+  const example = cityCodeExample(await getActiveRoutes(now));
+  return TOOLS.map((tool) => {
+    const serialized = JSON.stringify(tool);
+    if (!serialized.includes(CITY_CODE_EXAMPLE_SLOT)) return tool;
+    return JSON.parse(
+      serialized.split(CITY_CODE_EXAMPLE_SLOT).join(example),
+    ) as OpenAI.Chat.Completions.ChatCompletionTool;
+  });
+}
+
 // ── 工具执行 ─────────────────────────────────────────────────
 const pricingService = new PricingService();
 
@@ -296,30 +399,49 @@ interface ToolExecutionResult {
 
 async function executeSearchFlights(input: Record<string, unknown>): Promise<ToolExecutionResult> {
   try {
-    const origin = (input.origin as string) ?? 'MFM';
-    const destination = (input.destination as string) ?? 'DAD';
+    // 航线**不设默认值**：模型没给就不按航线过滤（在飞航线只有一条时结果自然就是那条），
+    // 绝不再默默填 MFM→DAD —— 第二条航线一开，那等于把客户的问题答到另一条线上去。
+    const origin = typeof input.origin === 'string' && input.origin.trim() ? input.origin.trim().toUpperCase() : undefined;
+    const destination =
+      typeof input.destination === 'string' && input.destination.trim()
+        ? input.destination.trim().toUpperCase()
+        : undefined;
     const date = input.date as string | undefined;
     const passengers = (input.passengers as number) ?? 1;
     const cabin = input.cabin as CabinClass | undefined;
 
     const where: Record<string, unknown> = {
-      flight: { originCode: origin, destinationCode: destination, isActive: true },
+      flight: {
+        isActive: true,
+        ...(origin ? { originCode: origin } : {}),
+        ...(destination ? { destinationCode: destination } : {}),
+      },
     };
     if (date) {
-      const [y, m, d] = date.split('-').map(Number);
-      const startUtc = new Date(Date.UTC(y, m - 1, d, -8, 0, 0));
-      const endUtc = new Date(Date.UTC(y, m - 1, d + 1, -8, 0, 0));
-      where.departureTime = { gte: startUtc, lt: endUtc };
+      // 当地日 → UTC 宽窗（两端各放 14 小时，覆盖 UTC−12…+14 全部时区），精确判定在下面
+      // 用每班自己的 departureTz 做。旧写法固定 −8，新航线落在别的时区就整日错位。
+      const dayStartMs = Date.parse(`${date}T00:00:00.000Z`);
+      const padMs = 14 * 60 * 60 * 1000;
+      const dayMs = 24 * 60 * 60 * 1000;
+      where.departureTime = {
+        gte: new Date(dayStartMs - padMs),
+        lt: new Date(dayStartMs + dayMs + padMs),
+      };
     } else {
       where.departureTime = { gte: new Date() };
     }
 
-    const schedules = await prisma.flightSchedule.findMany({
-      where,
-      include: { flight: true, seatClasses: true },
-      orderBy: { departureTime: 'asc' },
-      take: 20, // AI 上下文友好：最多 20 个班次
-    });
+    const schedules = (
+      await prisma.flightSchedule.findMany({
+        where,
+        include: { flight: true, seatClasses: true },
+        orderBy: { departureTime: 'asc' },
+        // 按日期查时宽窗会带出前后两天，先多拉再按当地日过滤，最后仍截到 20 条（AI 上下文友好）
+        take: date ? 80 : 20,
+      })
+    )
+      .filter((s) => !date || localDateISO(s.departureTime, s.departureTz) === date)
+      .slice(0, 20);
 
     const seatClassIds = schedules.flatMap((s) => s.seatClasses.map((c) => c.id));
     const lockSums = seatClassIds.length > 0
@@ -955,10 +1077,13 @@ export async function runChatTurn(
   // 第一次进对话时把 system 加上；后续 history 已含
   const hasSystem = history.some((m) => m.role === 'system');
   const messages: ChatMessage[] = [
-    ...(hasSystem ? [] : [{ role: 'system' as const, content: buildSystemPrompt() }]),
+    ...(hasSystem ? [] : [{ role: 'system' as const, content: await buildSystemPrompt() }]),
     ...history,
     { role: 'user', content: userMessage },
   ];
+
+  // 工具定义里的城市码例子按在飞航线实时生成（不写死某个目的地）
+  const tools = await buildTools();
 
   let toolCalls = 0;
   let totalPrompt = 0;
@@ -971,7 +1096,7 @@ export async function runChatTurn(
     const response = await client.chat.completions.create({
       model: env.OPENAI_MODEL,
       messages,
-      tools: TOOLS,
+      tools,
       // gpt-5-mini 等 reasoning 模型不接受 temperature，省略让默认生效
     });
 
@@ -1049,11 +1174,16 @@ async function mockTurn(history: ChatMessage[], userMessage: string): Promise<Ch
 
   try {
     if (intent.kind === 'greeting') {
-      reply = '你好！我可以帮你订澳门 ↔ 岘港的机票、岘港酒店、接送、越南签证，或者一价全包套餐。\n\n你可以这样说：\n· "明天去岘港，2 人经济舱"\n· "下周三去岘港，3 晚海景酒店"\n· "越南签证，急加"\n· "看下套餐推荐"';
+      // 问候语里不写死目的地：航线取库里在飞的第一条，一条都没有就只说品类。
+      const [greetRoute] = await getActiveRoutes();
+      const routeLabel = greetRoute ? `${greetRoute.origin} ↔ ${greetRoute.destination}` : '我们在飞航线';
+      reply = `你好！我可以帮你订${routeLabel}的机票、目的地酒店、接送、签证，或者一价全包套餐。\n\n你可以这样说：\n· "明天出发，2 人经济舱"\n· "下周三出发，3 晚海景酒店"\n· "办签证，要加急"\n· "看下套餐推荐"`;
     } else if (intent.kind === 'flight') {
+      // 航线取库里第一条在飞航线（只有一条线时就是它）；一条都没有则不带航线过滤。
+      const [firstRoute] = await getActiveRoutes();
       const flights = await executeSearchFlights({
-        origin: 'MFM',
-        destination: 'DAD',
+        origin: firstRoute?.origin,
+        destination: firstRoute?.destination,
         date: intent.date,
         cabin: intent.cabin,
         passengers: intent.passengers,
@@ -1070,7 +1200,8 @@ async function mockTurn(history: ChatMessage[], userMessage: string): Promise<Ch
           if (prop.ok && prop.data) {
             proposals.push(prop.data as Record<string, unknown>);
             const dateLabel = intent.date ?? '最近一天';
-            reply = `好的，给你找到 ${dateLabel} 澳门 → 岘港的航班，${intent.passengers} 人 ${cabinLabel(selectedCabin)}。\n方案已经准备好，确认下单点 "确认" 即可。`;
+            const legLabel = firstRoute ? `${firstRoute.origin} → ${firstRoute.destination} ` : '';
+            reply = `好的，给你找到 ${dateLabel} ${legLabel}的航班，${intent.passengers} 人 ${cabinLabel(selectedCabin)}。\n方案已经准备好，确认下单点 "确认" 即可。`;
           } else {
             reply = `找到航班但生成方案时出错了：${prop.ok ? '未知错误' : prop.error}。可以试着说 "${results[0].flightNumber} ${intent.passengers} 人经济舱" 让我再试一次。`;
           }
@@ -1078,7 +1209,7 @@ async function mockTurn(history: ChatMessage[], userMessage: string): Promise<Ch
           reply = `${intent.date ? intent.date : '该日期'} 暂时没有符合条件的航班。我们的 QH9588/9589 每天 1 班，可以换个日期试试。`;
         }
       } else {
-        reply = '航班查询失败，请稍后重试。或者直接说 "明天去岘港 2 人经济舱"。';
+        reply = '航班查询失败，请稍后重试。或者直接说 "明天出发 2 人经济舱"。';
       }
     } else if (intent.kind === 'hotel') {
       const hotels = await executeSearchHotels({});
@@ -1089,7 +1220,7 @@ async function mockTurn(history: ChatMessage[], userMessage: string): Promise<Ch
           const r = rooms[0]?.basePrice as number | undefined;
           return r && (!acc || r < acc) ? r : acc;
         }, 0);
-        reply = `岘港和会安一带我们直签了 ${hs.length} 家酒店${cheapest ? `，价格从 ¥${cheapest}/晚起` : ''}：\n` +
+        reply = `目的地我们直签了 ${hs.length} 家酒店${cheapest ? `，价格从 ¥${cheapest}/晚起` : ''}：\n` +
           hs.slice(0, 3).map((h, i) => `${i + 1}. ${h.name} — ${h.starRating}★ · ${h.highlight ?? ''}`).join('\n') +
           '\n\n告诉我哪家 + 几晚，我帮你算总价。';
       } else {
@@ -1110,7 +1241,7 @@ async function mockTurn(history: ChatMessage[], userMessage: string): Promise<Ch
       const ts = await executeSearchTransfers({});
       if (ts.ok && Array.isArray((ts.data as Record<string, unknown>)?.transfers)) {
         const tr = (ts.data as { transfers: Array<Record<string, unknown>> }).transfers;
-        reply = `岘港接送/包车有 ${tr.length} 种车型：\n` +
+        reply = `当地接送/包车有 ${tr.length} 种车型：\n` +
           tr.slice(0, 4).map((t, i) => `${i + 1}. ${t.name} — ¥${t.basePrice}起`).join('\n') +
           '\n\n说一下日期 + 起止地点，我帮你算价。';
       } else {
@@ -1127,7 +1258,7 @@ async function mockTurn(history: ChatMessage[], userMessage: string): Promise<Ch
         reply = '套餐列表加载失败。';
       }
     } else {
-      reply = `我没完全 get 到你的意思。你可以试着说：\n· "明天 2 人去岘港，经济舱"\n· "推荐岘港 3 晚海景酒店"\n· "越南签证"\n· "套餐推荐"`;
+      reply = `我没完全 get 到你的意思。你可以试着说：\n· "明天 2 人出发，经济舱"\n· "推荐 3 晚海景酒店"\n· "办签证"\n· "套餐推荐"`;
     }
   } catch (err) {
     reply = `本地演示遇到点小问题：${err instanceof Error ? err.message : String(err)}\n可以稍等再试。`;

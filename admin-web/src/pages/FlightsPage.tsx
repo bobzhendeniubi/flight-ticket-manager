@@ -1,12 +1,14 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, ApiError, type AdminFlight, type BaggagePolicyInput, type CabinClass, type FareBucket, type FlightBaggagePolicy } from '../lib/api';
+import { api, ApiError, type AdminFlight, type BaggagePolicyInput, type CabinClass, type FareBucket, type FlightBaggagePolicy, type SchedulePriceHistoryEntry } from '../lib/api';
 import { AIRPORT_OPTIONS, CABIN_LABEL, airportLabel, formatLocalDate, formatLocalTime, localToUtcIso, tzLabel } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import { NumberInput } from '../components/NumberInput';
 import { Icon } from '../components/Icon';
+import { formatDateTimeCn } from '../lib/datetime';
 import { useConfirm } from '../components/ConfirmDialog';
 import { useDialogA11y } from '../components/Modal';
+import { useCapabilities } from '../hooks/useCapabilities';
 
 interface ScheduleSeat {
   id: string;
@@ -35,7 +37,7 @@ interface AdminSchedule {
 
 export function FlightsPage() {
   const tokens = useAuth((s) => s.tokens);
-  const user = useAuth((s) => s.user);
+  const { can, ready: capsReady } = useCapabilities();
   const seatsVersion = useFlightSeats((s) => s.seatsVersion);
   const bumpSeats = useFlightSeats((s) => s.bumpSeats);
 
@@ -117,17 +119,15 @@ export function FlightsPage() {
     }
   };
 
-  if (user?.role !== 'ADMIN' && user?.role !== 'STAFF') {
+  if (capsReady && !can('flights.admin_view')) {
     return <div className="card text-ink-soft">仅管理员/运营可访问此页面。</div>;
   }
 
-  // 航班维护岗 = ADMIN，或 STAFF 里的「运营（未设岗）/ 票务岗」：建航班、加班次、改班次归他们。
-  // 与后端 flights.routes.ts 的 requireFlightMaintenance 同口径。
-  // 登录瞬间 staffRole 可能还没回来（等 /users/me）：此时按放行渲染，数据保护由后端闸兜底——
-  // 与 App.tsx 里 financeRole 的判定同一取舍，避免误伤刷新 / 首登场景。
-  const canManageFlights =
-    user.role === 'ADMIN' ||
-    (user.role === 'STAFF' && (user.staffRole == null || user.staffRole === 'TICKETING'));
+  // 航班维护岗 = 能力 flights.maintain（ADMIN，或 STAFF 里的「运营（未设岗）/ 票务岗」）：
+  // 建航班、加班次、改班次归他们。与后端 flights.routes.ts 挂的是同一条能力。
+  // 登录瞬间能力清单可能还没回来（等 /users/me）：此时按放行渲染，数据保护由后端闸兜底——
+  // 与 App.tsx 里路由守卫的取舍一致，避免误伤刷新 / 首登场景。
+  const canManageFlights = !capsReady || can('flights.maintain');
 
   if (error) {
     return <div className="card border-rose-200 bg-rose-50 text-rose-700">{error}</div>;
@@ -210,8 +210,8 @@ export function FlightsPage() {
                     </button>
                   </>
                 )}
-                {/* 删除不可恢复、升舱差价与整线停售影响整条航线 —— 这三件仅 ADMIN */}
-                {user.role === 'ADMIN' && (
+                {/* 删除不可恢复、升舱差价与整线停售影响整条航线 —— 这三件走 flights.dangerous */}
+                {can('flights.dangerous') && (
                   <>
                     <button
                       type="button"
@@ -1264,7 +1264,7 @@ function DaySchedule({
 }) {
   const tokens = useAuth((s) => s.tokens);
   // 删除班次不可恢复，与「批量删除班次」同口径 —— 仅 ADMIN；其余编辑动作跟随 canEdit（航班维护岗）。
-  const isAdmin = useAuth((s) => s.user?.role === 'ADMIN');
+  const isAdmin = useCapabilities().can('flights.dangerous');
   const confirm = useConfirm();
   const highRiskConfirmRef = useRef(false);
   const econ = getCabin(schedule, 'ECONOMY');
@@ -1295,6 +1295,25 @@ function DaySchedule({
 
   // 该班次的总已售（任一舱位 sold>0 即视为"已有销售"，禁止删除）。
   const totalSold = (schedule.seatClasses ?? []).reduce((sum, c) => sum + c.sold, 0);
+
+  // 改价历史（最近 10 条）：默认收起，展开时才拉——一屏几十个班次，不能全都自动打一枪。
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [history, setHistory] = useState<SchedulePriceHistoryEntry[] | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyErr, setHistoryErr] = useState<string | null>(null);
+  const loadHistory = useCallback(async () => {
+    if (!tokens) return;
+    setHistoryLoading(true);
+    setHistoryErr(null);
+    try {
+      const r = await api.listSchedulePriceHistory(tokens.accessToken, schedule.id);
+      setHistory(r.history);
+    } catch (e) {
+      setHistoryErr(e instanceof ApiError ? e.message : '改价历史加载失败');
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [tokens, schedule.id]);
 
   // 仓位阶梯草稿（按舱位）—— 初值取自该舱位已有阶梯，深拷贝避免改到 props。
   const [econLadder, setEconLadder] = useState<FareBucket[]>(
@@ -1368,6 +1387,8 @@ function DaySchedule({
       }
       await api.updateSchedule(tokens.accessToken, schedule.id, { seatClasses });
       setSavedMsg('✅ 已保存');
+      // 改价刚落库，历史面板展开着就顺手刷一下（收起时不打这一枪）
+      if (historyOpen) void loadHistory();
       await onSaved();
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : '保存失败');
@@ -1827,6 +1848,45 @@ function DaySchedule({
         </div>
       )}
 
+      {/* 改价历史（最近 10 条）：只读时间线，回答「这个价什么时候变的」。
+          谁改的看审计日志（改价会写一条 UPDATE_SCHEDULE_PRICE，带 before/after 和操作人）。 */}
+      <div className="mt-3">
+        <button
+          type="button"
+          className="text-xs font-medium text-brand hover:text-brand-dark"
+          onClick={() => {
+            const next = !historyOpen;
+            setHistoryOpen(next);
+            if (next && history === null) void loadHistory();
+          }}
+        >
+          {historyOpen ? '收起改价历史' : '改价历史（最近 10 条）'}
+        </button>
+        {historyOpen && (
+          <div className="mt-2 rounded-md border border-slate-200 bg-slate-50/60 p-2">
+            {historyLoading && <div className="text-xs text-ink-muted">加载中…</div>}
+            {historyErr && <div className="text-xs text-rose-700">{historyErr}</div>}
+            {!historyLoading && !historyErr && history !== null && history.length === 0 && (
+              <div className="text-xs text-ink-muted">这个班次还没有改过价。</div>
+            )}
+            {!historyLoading && !historyErr && history !== null && history.length > 0 && (
+              <ul className="space-y-1">
+                {history.map((h) => (
+                  <li key={h.id} className="flex flex-wrap items-baseline gap-2 text-xs">
+                    <span className="text-ink-muted">{formatDateTimeCn(h.observedAt)}</span>
+                    <span className="text-ink-soft">{CABIN_LABEL[h.cabin] ?? h.cabin}</span>
+                    <span className="font-semibold text-ink">¥{Number(h.price).toFixed(0)}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <p className="mt-1.5 text-[11px] text-ink-muted">
+              时间为北京时间；改价人与改动前后值见「系统 · 审计日志」。
+            </p>
+          </div>
+        )}
+      </div>
+
       {err && <div className="mt-2 rounded-md bg-red-50 px-3 py-2 text-xs text-red-700">{err}</div>}
 
       <div className="mt-3 flex flex-wrap items-center justify-end gap-2">
@@ -1984,7 +2044,7 @@ function BulkEditPanel({
   const tokens = useAuth((s) => s.tokens);
   // 批量改容量爆炸半径大（一次能把整月班次改成超售），后端仍限 ADMIN —— 非 ADMIN 不给这个选项，
   // 免得选了才吃 403。单班次改容量在 DaySchedule 里，航班维护岗照旧可改。
-  const isAdmin = useAuth((s) => s.user?.role === 'ADMIN');
+  const isAdmin = useCapabilities().can('flights.dangerous');
   const askConfirm = useConfirm();
   const highRiskConfirmRef = useRef(false);
 
@@ -2722,6 +2782,14 @@ function NewScheduleForm({
     return d.toISOString().slice(0, 10);
   }
 
+  // 时区：该航班已有班次 → 沿用最近一班；一班都没有 → 表单里让运营指定（同批量建班次口径）。
+  const tzInherit = useInheritedScheduleTz(flight.id);
+  const [departureTz, setDepartureTz] = useState('');
+  const [arrivalTz, setArrivalTz] = useState('');
+  const effectiveDepartureTz = tzInherit.status === 'inherited' ? tzInherit.tz.departureTz : departureTz;
+  const effectiveArrivalTz = tzInherit.status === 'inherited' ? tzInherit.tz.arrivalTz : arrivalTz;
+  const tzReady = isValidIanaTz(effectiveDepartureTz) && isValidIanaTz(effectiveArrivalTz);
+
   const [date, setDate] = useState(defaultDate());
   const [departTime, setDepartTime] = useState('09:00');
   const [durationHours, setDurationHours] = useState<number | null>(2);
@@ -2736,6 +2804,10 @@ function NewScheduleForm({
     e.preventDefault();
     if (!tokens) return;
     setErr(null);
+    if (!tzReady) {
+      setErr('请先选择出发地/到达地时区（该航班还没有班次可沿用）');
+      return;
+    }
     setSubmitting(true);
     try {
       const dHours = durationHours ?? 1;
@@ -2743,20 +2815,17 @@ function NewScheduleForm({
       const econPr = econPrice ?? 0;
       const bizCap = bizCapacity ?? 0;
       const bizPr = bizPrice ?? 0;
-      // Asia/Shanghai (UTC+8) — 把本地 date+time 换算到 UTC ISO
-      const [y, m, d] = date.split('-').map(Number);
-      const [h, mi] = departTime.split(':').map(Number);
-      const depUTC = new Date(Date.UTC(y, m - 1, d, h - 8, mi, 0)).toISOString();
-      const arrUTC = new Date(
-        Date.UTC(y, m - 1, d, h - 8, mi, 0) + dHours * 3600 * 1000,
-      ).toISOString();
+      // 运营填的是**出发地当地**日期 + 当地钟点，按该班次自己的时区折回 UTC
+      // （localToUtcIso 是唯一入口；旧写法写死 Asia/Shanghai + 手算 −8，越南航班整片差 1 小时）。
+      const depUTC = localToUtcIso(date, departTime, effectiveDepartureTz);
+      const arrUTC = new Date(Date.parse(depUTC) + dHours * 3600 * 1000).toISOString();
 
       await api.createSchedule(tokens.accessToken, {
         flightId: flight.id,
         departureTime: depUTC,
         arrivalTime: arrUTC,
-        departureTz: 'Asia/Shanghai',
-        arrivalTz: 'Asia/Shanghai',
+        departureTz: effectiveDepartureTz,
+        arrivalTz: effectiveArrivalTz,
         seatClasses: [
           { cabin: 'ECONOMY', capacity: econCap, basePrice: econPr },
           ...(bizCap > 0
@@ -2778,12 +2847,19 @@ function NewScheduleForm({
         为 <span className="text-brand">{flight.flightNumber}</span> 添加新班次
       </h3>
       <form className="mt-3 grid gap-3 md:grid-cols-6" onSubmit={onSubmit}>
+        <ScheduleTzFields
+          inherit={tzInherit}
+          departureTz={departureTz}
+          arrivalTz={arrivalTz}
+          setDepartureTz={setDepartureTz}
+          setArrivalTz={setArrivalTz}
+        />
         <div className="md:col-span-2">
-          <label className="label">出发日期（本地）</label>
+          <label className="label">出发日期（出发地当地）</label>
           <input type="date" className="input" value={date} onChange={(e) => setDate(e.target.value)} />
         </div>
         <div>
-          <label className="label">出发时间</label>
+          <label className="label">出发时间（出发地当地）</label>
           <input type="time" className="input" value={departTime} onChange={(e) => setDepartTime(e.target.value)} />
         </div>
         <div>
@@ -2840,12 +2916,180 @@ function NewScheduleForm({
 
         <div className="md:col-span-6 flex justify-end gap-3">
           <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
-          <button type="submit" className="btn-primary" disabled={submitting}>
+          <button type="submit" className="btn-primary" disabled={submitting || !tzReady}>
             {submitting ? '创建中…' : '添加班次'}
           </button>
         </div>
       </form>
     </section>
+  );
+}
+
+// ── 班次时区（S2：不再按机场码猜时区）────────────────────────────────────────
+// 起降时区显式落在班次上（FlightSchedule.departureTz/arrivalTz），全站的时刻展示与
+// 「当地日」折算都按它走（后端唯一入口 lib/flight-time.ts）。旧写法按机场码猜
+// （originCode==='DAD' → 越南，其余一律澳门；单班次表单更是写死 Asia/Shanghai），
+// 第二条航线一开，新目的地会被默认成澳门时区，整片班次时刻差几个小时且毫无提示。
+//
+// 新口径：该航班已有班次 → 沿用**最近一班**的 departureTz/arrivalTz（同一航班号的时区不会变）；
+// 一班都没有 → 表单里让运营自己选（常用区下拉 + 「其他」手输任意 IANA 名）。
+
+/** 常用时区候选；不在列表里的走「其他」手输。 */
+const COMMON_TZ_OPTIONS = [
+  'Asia/Macau',
+  'Asia/Ho_Chi_Minh',
+  'Asia/Shanghai',
+  'Asia/Hong_Kong',
+  'Asia/Taipei',
+  'Asia/Bangkok',
+  'Asia/Singapore',
+  'Asia/Kuala_Lumpur',
+  'Asia/Manila',
+  'Asia/Tokyo',
+  'Asia/Seoul',
+  'Asia/Jakarta',
+];
+
+/** 运行时是否认识这个 IANA 时区名（手输的必须校验，落库一个假时区全站时刻就错了）。 */
+function isValidIanaTz(tz: string): boolean {
+  const t = tz.trim();
+  if (!t) return false;
+  try {
+    new Intl.DateTimeFormat('en-US', { timeZone: t });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+type InheritedTz = { departureTz: string; arrivalTz: string };
+type TzInheritState =
+  | { status: 'loading' }
+  /** 该航班已有班次 → 沿用最近一班的时区，表单不再问运营。 */
+  | { status: 'inherited'; tz: InheritedTz }
+  /** 该航班一班都没有（或拉取失败）→ 运营必须自己选时区。 */
+  | { status: 'ask' };
+
+/**
+ * 取该航班「最近一班」的起降时区（按 departureTime 倒序第一条）。
+ * 一班都没有、或接口失败 → 'ask'（让运营在表单里选，绝不替他猜一个）。
+ */
+function useInheritedScheduleTz(flightId: string): TzInheritState {
+  const tokens = useAuth((s) => s.tokens);
+  const [state, setState] = useState<TzInheritState>({ status: 'loading' });
+  useEffect(() => {
+    if (!tokens) {
+      setState({ status: 'ask' });
+      return;
+    }
+    let cancelled = false;
+    setState({ status: 'loading' });
+    api
+      .listSchedules(tokens.accessToken, flightId)
+      .then((r) => {
+        if (cancelled) return;
+        const latest = [...r.schedules].sort((a, b) =>
+          a.departureTime < b.departureTime ? 1 : a.departureTime > b.departureTime ? -1 : 0,
+        )[0];
+        if (latest?.departureTz && latest?.arrivalTz) {
+          setState({
+            status: 'inherited',
+            tz: { departureTz: latest.departureTz, arrivalTz: latest.arrivalTz },
+          });
+        } else {
+          setState({ status: 'ask' });
+        }
+      })
+      .catch(() => {
+        if (!cancelled) setState({ status: 'ask' });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tokens, flightId]);
+  return state;
+}
+
+/** 单个时区选择器：常用区下拉 + 「其他」手输任意 IANA 名。 */
+function TzSelect({
+  label,
+  value,
+  onChange,
+}: {
+  label: string;
+  value: string;
+  onChange: (tz: string) => void;
+}) {
+  const isCustom = value !== '' && !COMMON_TZ_OPTIONS.includes(value);
+  const [custom, setCustom] = useState(isCustom);
+  const invalid = value.trim() !== '' && !isValidIanaTz(value);
+  return (
+    <div>
+      <label className="label">{label}</label>
+      <select
+        className="input"
+        value={custom ? '__custom__' : value}
+        onChange={(e) => {
+          if (e.target.value === '__custom__') {
+            setCustom(true);
+            onChange('');
+            return;
+          }
+          setCustom(false);
+          onChange(e.target.value);
+        }}
+      >
+        <option value="">请选择时区…</option>
+        {COMMON_TZ_OPTIONS.map((tz) => (
+          <option key={tz} value={tz}>
+            {tzLabel(tz)}（{tz}）
+          </option>
+        ))}
+        <option value="__custom__">其他（手动输入 IANA 时区名）</option>
+      </select>
+      {custom && (
+        <input
+          className="input mt-1"
+          placeholder="如 Asia/Tokyo"
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+        />
+      )}
+      {invalid && <p className="mt-1 text-xs text-rose-600">不是有效的 IANA 时区名</p>}
+    </div>
+  );
+}
+
+/** 时区区块：已有班次时只显示「沿用最近一班」，否则给两个选择器。 */
+function ScheduleTzFields({
+  inherit,
+  departureTz,
+  arrivalTz,
+  setDepartureTz,
+  setArrivalTz,
+}: {
+  inherit: TzInheritState;
+  departureTz: string;
+  arrivalTz: string;
+  setDepartureTz: (tz: string) => void;
+  setArrivalTz: (tz: string) => void;
+}) {
+  if (inherit.status === 'loading') {
+    return <div className="md:col-span-2 self-end text-xs text-slate-500">正在读取该航班已有班次的时区…</div>;
+  }
+  if (inherit.status === 'inherited') {
+    return (
+      <div className="md:col-span-2 self-end text-xs text-slate-600">
+        时区沿用该航班最近一班：出发 {tzLabel(inherit.tz.departureTz)}（{inherit.tz.departureTz}） · 到达{' '}
+        {tzLabel(inherit.tz.arrivalTz)}（{inherit.tz.arrivalTz}）
+      </div>
+    );
+  }
+  return (
+    <>
+      <TzSelect label="出发地时区（该航班首班，需指定）" value={departureTz} onChange={setDepartureTz} />
+      <TzSelect label="到达地时区" value={arrivalTz} onChange={setArrivalTz} />
+    </>
   );
 }
 
@@ -2866,6 +3110,14 @@ function BulkScheduleForm({
     d.setDate(d.getDate() + offset);
     return d.toISOString().slice(0, 10);
   }
+
+  // 时区：该航班已有班次 → 沿用最近一班；一班都没有 → 下面两个选择器让运营指定。
+  const tzInherit = useInheritedScheduleTz(flight.id);
+  const [departureTz, setDepartureTz] = useState('');
+  const [arrivalTz, setArrivalTz] = useState('');
+  const effectiveDepartureTz = tzInherit.status === 'inherited' ? tzInherit.tz.departureTz : departureTz;
+  const effectiveArrivalTz = tzInherit.status === 'inherited' ? tzInherit.tz.arrivalTz : arrivalTz;
+  const tzReady = isValidIanaTz(effectiveDepartureTz) && isValidIanaTz(effectiveArrivalTz);
 
   const [startDate, setStartDate] = useState(addDays(30));
   const [endDate, setEndDate] = useState(addDays(90));
@@ -2906,6 +3158,7 @@ function BulkScheduleForm({
     e.preventDefault();
     if (!tokens) return;
     if (previewCount === 0) { alert('没有日期可创建，检查日期范围和星期几'); return; }
+    if (!tzReady) { alert('请先选择出发地/到达地时区（该航班还没有班次可沿用）'); return; }
     if (!confirm(`将创建 ${previewCount} 个班次，确认？`)) return;
 
     setSubmitting(true);
@@ -2915,10 +3168,9 @@ function BulkScheduleForm({
     const e2 = new Date(endDate);
     let done = 0, errors = 0;
 
-    const depTz = flight.originCode === 'DAD' ? 'Asia/Ho_Chi_Minh' : 'Asia/Macau';
-    const arrTz = flight.destinationCode === 'DAD' ? 'Asia/Ho_Chi_Minh' : 'Asia/Macau';
-    const [hour, minute] = departTime.split(':').map(Number);
-    const offsetHours = depTz === 'Asia/Macau' ? 8 : 7;
+    // 时区来自「沿用最近一班」或运营选择，绝不按机场码猜。
+    const depTz = effectiveDepartureTz;
+    const arrTz = effectiveArrivalTz;
     const dMin = durationMinutes ?? 0;
     const econCap = econCapacity ?? 0;
     const econPr = econPrice ?? 0;
@@ -2928,11 +3180,11 @@ function BulkScheduleForm({
     for (let d = new Date(s); d <= e2; d.setDate(d.getDate() + 1)) {
       if (!weekdays.has(d.getDay())) continue;
       try {
-        const y = d.getFullYear();
-        const m = d.getMonth();
-        const day = d.getDate();
-        const depUTC = new Date(Date.UTC(y, m, day, hour - offsetHours, minute, 0)).toISOString();
-        const arrUTC = new Date(Date.UTC(y, m, day, hour - offsetHours, minute, 0) + dMin * 60 * 1000).toISOString();
+        // 运营填的是**当地**日期 + 当地钟点，按该班次自己的 depTz 折回 UTC
+        // （localToUtcIso 是唯一入口，镜像后端 lib/flight-time.ts 的 localToUtc）。
+        const ymd = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+        const depUTC = localToUtcIso(ymd, departTime, depTz);
+        const arrUTC = new Date(Date.parse(depUTC) + dMin * 60 * 1000).toISOString();
         await api.createSchedule(tokens.accessToken, {
           flightId: flight.id,
           departureTime: depUTC,
@@ -2989,8 +3241,15 @@ function BulkScheduleForm({
             ))}
           </div>
         </div>
+        <ScheduleTzFields
+          inherit={tzInherit}
+          departureTz={departureTz}
+          arrivalTz={arrivalTz}
+          setDepartureTz={setDepartureTz}
+          setArrivalTz={setArrivalTz}
+        />
         <div>
-          <label className="label">出发时间（本地）</label>
+          <label className="label">出发时间（出发地当地）</label>
           <input type="time" className="input" value={departTime} onChange={(e) => setDepartTime(e.target.value)} />
         </div>
         <div>
@@ -3030,7 +3289,7 @@ function BulkScheduleForm({
 
         <div className="md:col-span-4 flex justify-end gap-3">
           <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
-          <button type="submit" className="btn-primary" disabled={submitting || previewCount === 0}>
+          <button type="submit" className="btn-primary" disabled={submitting || previewCount === 0 || !tzReady}>
             {submitting ? `创建中 ${progress.done}/${progress.total}...` : `批量创建 ${previewCount} 个班次`}
           </button>
         </div>

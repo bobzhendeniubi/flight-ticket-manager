@@ -19,20 +19,27 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { parseFareBuckets } from '../pricing/pricing.schemas.js';
-import { BUNDLE_ROUTE } from './bundle-availability.service.js';
+import type { BundleRoute } from './bundle-route.js';
 
 const CACHE_TTL_MS = 5 * 60 * 1000;
 /**
- * 机票参考价内存缓存，按「绑定组合」分键（去程航班 id / 回程航班 id，未绑 = 'route'）。
+ * 机票参考价内存缓存，按「绑定组合 + 派生航线」分键（去程航班 id / 回程航班 id / routeKey）。
  * 单一全局缓存曾让不同套餐互相污染起价（任一套餐先算出的值被所有套餐共享）；按 key 分桶后
  * 各绑定组合独立缓存，既不退化成每次都查库，也不再串味。
+ * routeKey 进键是第二条航线上线的前提：两个套餐都只绑了去程、航线不同却共享 key 会串价。
  */
 const cacheByKey = new Map<string, { value: number | null; at: number }>();
 
-/** 套餐绑定的去/回程航班（模板绑法：只绑航班号，不绑某天）；null/省略 = 未绑，按航线兜底。 */
+/**
+ * 套餐绑定的去/回程航班（模板绑法：只绑航班号，不绑某天）。
+ * 某段未绑（null/省略）时用 route 按航线取该段最低价；route 也没有 = 该段无参考价（null），
+ * **绝不兜底到任何写死航线**（见 bundle-route.ts 的口径说明）。
+ */
 export interface BundleFlightBinding {
   outboundFlightId?: string | null;
   returnFlightId?: string | null;
+  /** 套餐派生航线（去程方向 origin→destination，回程反向）；未绑航班 = null。 */
+  route?: BundleRoute | null;
 }
 
 /** 供测试/运维在需要时清空机票参考价缓存（避免跨用例的缓存串味）。 */
@@ -79,12 +86,14 @@ function combineRoundTrip(outboundMin: number | null, returnMin: number | null):
  *
  * 范围限定（务必按航线/航班过滤，绝不扫全库 —— 否则任一无关航线的低价会污染所有套餐起价）：
  *   - 绑定了具体航班（outboundFlightId/returnFlightId 非空）→ 该段只看那趟航班的班次价；
- *   - 未绑航班 → 按套餐固定航线兜底：去程 BUNDLE_ROUTE.origin→destination，回程 destination→origin。
+ *   - 未绑该段但有派生航线（binding.route，由另一段的绑定航班推出）→ 按该航线过滤：
+ *     去程 route.origin→route.destination，回程 route.destination→route.origin；
+ *   - 既没绑该段、也没有航线 → 该段无参考价（null），**不兜底到任何写死航线**。
  * 来回价 = 去程最低 + 回程最低（两段各自估价再相加，贴合运营「按段结算」口径）；
  * 某段查不到任何班次 → 用另一段 ×2 兜底（对称假设），两段皆空 → null（套餐原价退化为仅地面）。
  *
- * 缓存：按 (outboundFlightId ?? 'route')|(returnFlightId ?? 'route') 分键，5 分钟 TTL；
- * 不同绑定组合互不串味（旧版单一全局缓存会让所有套餐共享同一份可能不准的参考价）。
+ * 缓存：按 (outboundFlightId ?? 'route')|(returnFlightId ?? 'route')|routeKey 分键，5 分钟 TTL；
+ * 不同绑定组合/不同航线互不串味（旧版单一全局缓存会让所有套餐共享同一份可能不准的参考价）。
  */
 export async function getCheapestRoundTripEconomyCny(
   now: Date,
@@ -92,26 +101,27 @@ export async function getCheapestRoundTripEconomyCny(
 ): Promise<number | null> {
   const outboundFlightId = binding?.outboundFlightId ?? null;
   const returnFlightId = binding?.returnFlightId ?? null;
-  const cacheKey = `${outboundFlightId ?? 'route'}|${returnFlightId ?? 'route'}`;
+  const route = binding?.route ?? null;
+  const cacheKey = `${outboundFlightId ?? 'route'}|${returnFlightId ?? 'route'}|${route?.routeKey ?? 'none'}`;
   const cached = cacheByKey.get(cacheKey);
   if (cached && now.getTime() - cached.at < CACHE_TTL_MS) return cached.value;
 
-  const outboundSchedule: Prisma.FlightScheduleWhereInput = outboundFlightId
-    ? { flightId: outboundFlightId, departureTime: { gte: now } }
-    : {
-        departureTime: { gte: now },
-        flight: { originCode: BUNDLE_ROUTE.origin, destinationCode: BUNDLE_ROUTE.destination },
-      };
-  const returnSchedule: Prisma.FlightScheduleWhereInput = returnFlightId
-    ? { flightId: returnFlightId, departureTime: { gte: now } }
-    : {
-        departureTime: { gte: now },
-        flight: { originCode: BUNDLE_ROUTE.destination, destinationCode: BUNDLE_ROUTE.origin },
-      };
+  /** 某段的班次过滤条件：绑了航班按航班；否则按派生航线；都没有 → null（该段不查库、无参考价）。 */
+  const legWhere = (
+    flightId: string | null,
+    origin: string | undefined,
+    destination: string | undefined,
+  ): Prisma.FlightScheduleWhereInput | null => {
+    if (flightId) return { flightId, departureTime: { gte: now } };
+    if (!origin || !destination) return null;
+    return { departureTime: { gte: now }, flight: { originCode: origin, destinationCode: destination } };
+  };
+  const outboundSchedule = legWhere(outboundFlightId, route?.origin, route?.destination);
+  const returnSchedule = legWhere(returnFlightId, route?.destination, route?.origin);
 
   const [outboundMin, returnMin] = await Promise.all([
-    cheapestOneWayEconomyCny(outboundSchedule),
-    cheapestOneWayEconomyCny(returnSchedule),
+    outboundSchedule ? cheapestOneWayEconomyCny(outboundSchedule) : Promise.resolve(null),
+    returnSchedule ? cheapestOneWayEconomyCny(returnSchedule) : Promise.resolve(null),
   ]);
 
   const value = combineRoundTrip(outboundMin, returnMin);

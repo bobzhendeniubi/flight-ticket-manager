@@ -1,8 +1,9 @@
 /**
- * 经营报表 xlsx 导出 — 4 个 sheet：
+ * 经营报表 xlsx 导出 — 5 个 sheet：
  *   1. 销售毛利·按产品线（dim=kind）
  *   2. 销售毛利·按渠道（dim=channel）
  *   3. 销售毛利·按代理（dim=agent）
+ *   4. 销售毛利·按航线（dim=route）
  *   4. 应收与代理欠款（应收账龄明细 + 桶汇总 + 代理欠款，三块合一）
  *
  * 复用 reports.service 的聚合函数；金额列统一数字格式 '#,##0.00'。
@@ -191,10 +192,11 @@ export async function buildReportsExportWorkbook(
   range: DateRange,
   client: PrismaClient = defaultPrisma,
 ): Promise<Buffer> {
-  const [byKind, byChannel, byAgent, receivables, agentDebts] = await Promise.all([
+  const [byKind, byChannel, byAgent, byRoute, receivables, agentDebts] = await Promise.all([
     getSalesReport(range, 'kind', client),
     getSalesReport(range, 'channel', client),
     getSalesReport(range, 'agent', client),
+    getSalesReport(range, 'route', client),
     getReceivablesReport(client),
     getAgentDebtsReport(client),
   ]);
@@ -206,6 +208,8 @@ export async function buildReportsExportWorkbook(
   addSalesSheet(wb, '销售毛利·按产品线', byKind, (key) => KIND_LABEL[key] ?? key);
   addSalesSheet(wb, '销售毛利·按渠道', byChannel, (_key, label) => label);
   addSalesSheet(wb, '销售毛利·按代理', byAgent, (_key, label) => label);
+  // 按航线：第二条线上线后「哪条线赚钱」的答案就在这张 sheet 上。
+  addSalesSheet(wb, '销售毛利·按航线', byRoute, (_key, label) => label);
   addReceivablesSheet(wb, receivables, agentDebts);
 
   const buf = await wb.xlsx.writeBuffer();

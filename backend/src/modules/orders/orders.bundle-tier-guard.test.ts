@@ -702,15 +702,36 @@ describe('changeOrderBundle · 套餐改档', () => {
     expect(diffRow.data.amount).toEqual(new Prisma.Decimal(-1000));
   });
 
+  it('代理单 + 目标套餐配了日历键但没绑航班 → 派生不出航线，不取日历价（不兜底航线），按套餐价计', async () => {
+    mountOrder({ agentId: 'ag-1' });
+    // 档次/晚数都配了，但 outboundFlight / returnFlight 都是 null（mountNewBundle 默认）
+    mountNewBundle({ settlementTier: 'CITY_4STAR', settlementNights: 2 });
+    mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 3000 });
+    // 套餐价 2 晚 × ¥2500 = ¥5000（原应收 4000 → 差额 +1000）
+    const tx = mountTx(5000);
+
+    await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, ADMIN).catch(() => undefined);
+
+    expect(mockGetSettlementRate).not.toHaveBeenCalled();
+    const diffRow = tx.orderItem.create.mock.calls[0][0] as { data: Record<string, unknown> };
+    expect(diffRow.data.amount).toEqual(new Prisma.Decimal(1000));
+    expect((diffRow.data.metadata as Record<string, unknown>).pricingSource).toBe('BUNDLE_PRICE');
+  });
+
   it('代理单 + 目标套餐配了日历键 → 走结算价日历取价（每人价 × 人数）', async () => {
     mountOrder({ agentId: 'ag-1' });
-    mountNewBundle({ settlementTier: 'CITY_4STAR', settlementNights: 2 });
+    mountNewBundle({
+      settlementTier: 'CITY_4STAR',
+      settlementNights: 2,
+      outboundFlight: { businessUpgradeCnyPerLeg: 0, originCode: 'MFM', destinationCode: 'DAD' },
+    });
     mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 3000 });
     const tx = mountTx(6000);
 
     await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, ADMIN).catch(() => undefined);
 
-    expect(mockGetSettlementRate).toHaveBeenCalledWith('CITY_4STAR', 2, '2026-09-01');
+    // 航线从目标套餐绑定的航班派生（MFM→DAD），作为取价键的第一维
+    expect(mockGetSettlementRate).toHaveBeenCalledWith('MFM-DAD', 'CITY_4STAR', 2, '2026-09-01');
     // 日历总价 3000 × 2 人 = 6000；原应收 4000 → 差额 +2000。
     const diffRow = tx.orderItem.create.mock.calls[0][0] as { data: Record<string, unknown> };
     expect(diffRow.data.amount).toEqual(new Prisma.Decimal(2000));
@@ -721,7 +742,11 @@ describe('changeOrderBundle · 套餐改档', () => {
 
   it('代理单命中立减 → 从日历总价里减（口径同录单）', async () => {
     mountOrder({ agentId: 'ag-1' });
-    mountNewBundle({ settlementTier: 'CITY_4STAR', settlementNights: 2 });
+    mountNewBundle({
+      settlementTier: 'CITY_4STAR',
+      settlementNights: 2,
+      outboundFlight: { businessUpgradeCnyPerLeg: 0, originCode: 'MFM', destinationCode: 'DAD' },
+    });
     mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 3000 });
     mockAgentDiscount.mockResolvedValue({ ruleId: 'r-1', kind: 'AGENT', discountPerPersonCny: 200 });
     const tx = mountTx(5600);
@@ -735,7 +760,11 @@ describe('changeOrderBundle · 套餐改档', () => {
 
   it('代理单日历价当日未维护 → 拒单（宁可不改，也不按错价成交）', async () => {
     mountOrder({ agentId: 'ag-1' });
-    mountNewBundle({ settlementTier: 'CITY_4STAR', settlementNights: 2 });
+    mountNewBundle({
+      settlementTier: 'CITY_4STAR',
+      settlementNights: 2,
+      outboundFlight: { businessUpgradeCnyPerLeg: 0, originCode: 'MFM', destinationCode: 'DAD' },
+    });
     mockGetSettlementRate.mockResolvedValue(null);
     const tx = mountTx(4000);
 

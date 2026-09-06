@@ -62,6 +62,10 @@ enum StaffRole {
   TICKETING // 票务岗
   ROOM_CONTROL // 房控岗
   FINANCE // 财务岗（财务页 + 经营报表；导出不裁剪，等同通用）
+  // 运营岗 = 通用岗，与 staffRole 留空完全等价（判定见 lib/capabilities.ts 的 isGeneralOps）。
+  // 2026-09-06 才补的显式选项：此前只能靠留空表达「运营」，界面上看着像忘了设岗。
+  // 存量 null 不回填，两种写法长期并存。
+  OPERATIONS
 }
 
 model User {
@@ -100,6 +104,7 @@ model User {
   marketingPosters MarketingPoster[]     @relation("MarketingPosterCreator")
   seatLocks        SeatLock[]
   seatWaitlists    SeatWaitlist[]
+  invoiceRequests  Invoice[]             @relation("InvoiceRequestedBy")
 
   @@index([role])
   @@index([createdAt])
@@ -338,6 +343,7 @@ model Agent {
   settlementRequests      SettlementRequest[]
   bundleChangeRequests    BundleChangeRequest[]
   orderChangeRequests     OrderChangeRequest[]
+  invoices                Invoice[]
 
   @@index([isActive])
   @@index([parentAgentId])
@@ -534,9 +540,12 @@ model Flight {
   //   + businessUpgradeCnyPerLeg，商务舱自身 basePrice/fareBuckets 不再参与计价。
   // 关闭（默认）：行为与历史完全一致（商务舱按自身 basePrice/阶梯定价）。派生在单一计价点 PricingService.calculatePrice 注入。
   businessPriceLinked      Boolean @default(false)
+  // 应付账挂的供应商（包机款付给哪家航司/包机方）。可空且**不回填**存量。
+  supplierId      String?
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
+  supplier        Supplier?             @relation(fields: [supplierId], references: [id], onDelete: SetNull)
   schedules       FlightSchedule[]
   costPeriods     FlightCostPeriod[]
   baggagePolicies FlightBaggagePolicy[]
@@ -545,6 +554,7 @@ model Flight {
   returnBundles   Bundle[]              @relation("BundleReturnFlight")
 
   @@unique([flightNumber])
+  @@index([supplierId])
   @@index([originCode, destinationCode])
   marketingPosters MarketingPoster[]
 }
@@ -610,6 +620,9 @@ model FlightSchedule {
   seatWaitlists   SeatWaitlist[]
   seatAllocations SeatAllocation[]
   holdOrders      HoldOrder[]
+  // 应付账单挂过来的反向关系（航司包机款一班一张）；只读引用，不影响班次的任何语义
+  supplierInvoices     SupplierInvoice[]
+  supplierInvoiceLines SupplierInvoiceLine[]
 
   @@index([flightId, departureTime])
   @@index([departureTime])
@@ -994,6 +1007,10 @@ enum OrderChangeKind {
   VISA   // 订单级签证状态（只允许 需要 / 电子签 / 不需要）
   HOTEL  // 换酒店房型（差价恒 0）
   CABIN  // 升商务舱（差价服务端算）
+  // ↓ 以下三类挂在 feature flag AGENT_CHANGE_REQUEST_EXTRA_KINDS 后面，默认关。
+  SPLIT       // 拆单（按乘客拆出新单；执行走既有 splitOrder，含守恒断言）
+  CANCEL_LEG  // 取消单程航段（去程/回程二选一；退款一律走取消政策，申请里不许自定金额）
+  VISA_EXEMPT // 按人改自备签（确认只放行管理员与签证岗）
 }
 
 enum OrderChangeRequestStatus {
@@ -1156,13 +1173,18 @@ model Hotel {
   amenities   String[] // e.g., ["wifi", "breakfast", "pool"]
   photos      String[] // S3 URLs
   isActive    Boolean  @default(true)
+  // 应付账挂的供应商（净房账单开给谁）。可空且**不回填**存量：没挂就是没挂，
+  // 应付账单侧按「未挂供应商」如实展示，绝不靠名字猜对应关系。
+  supplierId  String?
   createdAt   DateTime @default(now())
   updatedAt   DateTime @updatedAt
 
   roomTypes    HotelRoomType[]
   blockPeriods HotelBlockPeriod[]
+  supplier     Supplier?          @relation(fields: [supplierId], references: [id], onDelete: SetNull)
 
   @@index([cityCode])
+  @@index([supplierId])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1190,6 +1212,8 @@ model HotelBlockPeriod {
   updatedAt      DateTime @updatedAt
 
   hotel Hotel? @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+  // 应付账单明细挂过来的反向关系（只读引用，不影响包房周期本身的任何语义）
+  supplierInvoiceLines SupplierInvoiceLine[]
 
   @@index([hotelId, dateFrom, dateTo])
   @@index([randomStarTier, dateFrom, dateTo])
@@ -1323,17 +1347,24 @@ model Visa {
   requiredDocs       String[] // e.g., ["passport_scan", "photo", "itinerary"]
   // 签证公司/代办渠道名（财务对账用——核对某笔签证金额属于哪家供应商的账单）
   supplier           String?
+  // 应付账挂的供应商实体。与上面那个自由文本 supplier 并存：文本是老口径，谁都能随手写，
+  // 不动它免得存量展示变样；本列是结构化归属，只给应付账单/对账用。可空且**不回填**。
+  supplierId         String?
   soldCount          Int                 @default(0) // 已售份数（展示用，seed 填充）
   isActive           Boolean             @default(true)
   createdAt          DateTime            @default(now())
   updatedAt          DateTime            @updatedAt
 
-  orderItems OrderItem[]
+  orderItems    OrderItem[]
+  supplierEntity Supplier?  @relation(fields: [supplierId], references: [id], onDelete: SetNull)
+
+  @@index([supplierId])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-// 结算价日历 — 运营按「出发日期 × 晚数 × 酒店档次」维护的同业结算价（每人 CNY）。
-// 代理下套餐单时按去程出发日期 + 套餐配置的档次/晚数自动取价（服务端权威定价）。
+// 结算价日历 — 运营按「航线 × 出发日期 × 晚数 × 酒店档次」维护的同业结算价（每人 CNY）。
+// 代理下套餐单时按套餐绑定航班派生的航线 + 去程出发日期 + 套餐配置的档次/晚数自动取价
+// （服务端权威定价；航线派生唯一入口见 modules/products/bundle-route.ts）。
 // 商务舱升舱差价由航班级联动另行解决，不在本表；本表只管地面档次 × 晚数的整包每人价。
 // ─────────────────────────────────────────────────────────────────────────────
 enum SettlementTier {
@@ -1345,17 +1376,20 @@ enum SettlementTier {
 
 model SettlementRate {
   id                String         @id @default(cuid())
+  // 航线键（去程方向「起飞-到达」机场码，如 MFM-DAD）。存量行由迁移统一回填为 MFM-DAD
+  //（迁移前系统只有这一条线）；取价时从套餐绑定航班派生，派生不到 = 无航线 = 不取价。
+  routeKey          String
   tier              SettlementTier
   nights            Int // 住宿晚数（1–5）
   departDate        DateTime       @db.Date // 去程出发日期（date-only）
   pricePerPersonCny Int // 每人结算价（CNY，整数）
-  // 扩展点：当前单一航线（澳门-岘港），note 可记航线/备注；未来按航线区分时再拆列。
   note              String?
   updatedBy         String? // 最近更新人 userId（审计冗余，展示"谁改的"）
   createdAt         DateTime       @default(now())
   updatedAt         DateTime       @updatedAt
 
-  @@unique([tier, nights, departDate])
+  @@unique([routeKey, tier, nights, departDate])
+  @@index([routeKey])
   @@index([departDate])
 }
 
@@ -1371,6 +1405,10 @@ enum SettlementDiscountKind {
 
 model SettlementDiscountRule {
   id                   String                  @id @default(cuid())
+  // 航线键（同 SettlementRate.routeKey）：规则按航线隔离，命中时与日历用同一把派生键。
+  // 同组唯一性 = (routeKey, kind, agentId, tier, nights) 内启用窗口不重叠——应用层校验 +
+  // 数据库排他约束（迁移里手写的 EXCLUDE，Prisma schema 表达不了）双保险。
+  routeKey             String
   kind                 SettlementDiscountKind
   agentId              String? // kind=AGENT 必填；其余必须为 null（服务端校验）
   tier                 SettlementTier
@@ -1386,7 +1424,9 @@ model SettlementDiscountRule {
 
   agent Agent? @relation(fields: [agentId], references: [id], onDelete: Cascade)
 
-  @@index([kind, agentId, tier, nights, startDate])
+  // 显式命名：默认拼接名超过 Postgres 63 字符标识符上限，会被截断导致 schema/DB 漂移。
+  @@index([routeKey, kind, agentId, tier, nights, startDate], map: "SettlementDiscountRule_route_kind_agent_tier_nights_start_idx")
+  @@index([routeKey])
   @@index([agentId])
 }
 
@@ -1422,6 +1462,255 @@ model UsdFxRate {
   updatedBy     String? // 最近更新人 userId（审计冗余，展示"谁改的"）
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 供应商主数据 —— 我们要把钱付出去的那一端（航司 / 酒店 / 签证公司 / 车队）。
+//
+// 此前系统里只有「单价 / 成本」，没有「这笔成本付给谁」：航司包机款、酒店净房账单、
+// 签证公司美金账单全在 Excel 和微信里，对不上就翻聊天记录。本表只是那摊账的抬头，
+// **不参与任何成本计算口径** —— 毛利照旧按各产品自己的成本字段算，这里一个字都不改。
+//
+// currency = 该供应商开账单的币种（签证公司常年开美金）。CNY 之外的账单要填汇率，
+// 折算出的 CNY 才是入账权威（与包机成本汇率四元组同一套做法）。
+// ─────────────────────────────────────────────────────────────────────────────
+enum SupplierType {
+  AIRLINE // 航司 / 包机方
+  HOTEL // 酒店 / 地接房
+  VISA_AGENCY // 签证公司 / 代办
+  TRANSFER // 车队 / 地面服务
+  OTHER // 其他
+}
+
+model Supplier {
+  id           String       @id @default(cuid())
+  type         SupplierType
+  name         String
+  /// 结算币种（ISO 4217）。账单默认按它开，逐张仍可覆盖。
+  currency     String       @default("CNY") @db.VarChar(3)
+  contactName  String?
+  contactPhone String?
+  note         String?
+  isActive     Boolean      @default(true)
+  createdAt    DateTime     @default(now())
+  updatedAt    DateTime     @updatedAt
+
+  hotels   Hotel[]
+  visas    Visa[]
+  flights  Flight[]
+  invoices SupplierInvoice[]
+
+  // 同类型下重名没有意义（酒店类型里只该有一家「岘港明月」）；跨类型可同名。
+  @@unique([type, name])
+  @@index([type, isActive])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 供应商应付账单 + 付款记录
+//
+// 账单期次三种（periodKind）：
+//   FLIGHT_SCHEDULE  按航班班次开 —— 航司包机款就是这么结的，一班一张
+//   MONTH            按月开 —— 酒店净房、签证公司月结
+//   CUSTOM           自定义区间 —— 剩下那些不规整的
+//
+// 币种口径（与包机成本汇率四元组同一套做法）：
+//   amount    = 供应商账单上印的那个数，原币（签证公司常年开美金）
+//   fxRate    = 原币→CNY；CNY 账单留空
+//   amountCny = 折算后的人民币，**入账权威**；折完就固化，之后改汇率表绝不追溯
+//
+// 核销 = Σ 付款 对 账单金额，**按原币比**：欠 1000 美金就得付够 1000 美金，
+// 中间汇率怎么动都不改变「这张账付清没有」。CNY 侧只是实付折人民币的记录。
+// ─────────────────────────────────────────────────────────────────────────────
+enum SupplierInvoicePeriodKind {
+  FLIGHT_SCHEDULE // 按航班班次
+  MONTH // 按月（periodMonth = YYYY-MM）
+  CUSTOM // 自定义区间（periodFrom ~ periodTo）
+}
+
+/// DRAFT / DISPUTED 是**人工态**：账单还没认，或者认了但有争议，两者都不许登记付款，
+/// 状态也不随付款自动跳。CONFIRMED / PARTIALLY_PAID / PAID 是**派生态**：认了之后
+/// 状态由 Σ 付款推导，人手改不动（改也会被下一次付款覆盖回去）。
+enum SupplierInvoiceStatus {
+  DRAFT // 草稿：刚录进来，还没跟供应商对上
+  CONFIRMED // 已确认：账认了，一分没付
+  PARTIALLY_PAID // 部分付款
+  PAID // 已付清
+  DISPUTED // 有争议：金额对不上，挂起不付
+}
+
+model SupplierInvoice {
+  id         String                    @id @default(cuid())
+  supplierId String
+  /// 供应商账单号（对方给的那串），可空——微信发张图过来的账单常常没有号
+  invoiceNo  String?
+  periodKind SupplierInvoicePeriodKind
+  /// periodKind=FLIGHT_SCHEDULE 时指向具体班次
+  flightScheduleId String?
+  /// periodKind=MONTH 时的 YYYY-MM
+  periodMonth      String?  @db.VarChar(7)
+  /// periodKind=CUSTOM 时的闭区间；MONTH / FLIGHT_SCHEDULE 也会派生填上，方便统一按区间查
+  periodFrom       DateTime? @db.Date
+  periodTo         DateTime? @db.Date
+  currency   String                @default("CNY") @db.VarChar(3)
+  amount     Decimal               @db.Decimal(14, 2) // 原币金额
+  fxRate     Decimal?              @db.Decimal(12, 6) // 原币→CNY；CNY 账单留空
+  amountCny  Decimal               @db.Decimal(14, 2) // 折算后 CNY（入账权威）
+  status     SupplierInvoiceStatus @default(DRAFT)
+  /// 账单附件（对方发来的 PDF / 截图）URL
+  attachmentUrl String?
+  note          String?
+  createdBy     String? // userId（审计冗余）
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  supplier       Supplier              @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  flightSchedule FlightSchedule?       @relation(fields: [flightScheduleId], references: [id], onDelete: SetNull)
+  lines          SupplierInvoiceLine[]
+  payments       SupplierPayment[]
+
+  @@index([supplierId, status])
+  @@index([periodMonth])
+  @@index([flightScheduleId])
+  @@index([periodFrom, periodTo])
+}
+
+/// 账单明细行（可选）。填了就能把「系统算的成本」逐项钉到「供应商账单的哪一行」上；
+/// 不填也能用 —— 整张账单对总额同样成立，明细是给对不上时下钻用的。
+model SupplierInvoiceLine {
+  id        String  @id @default(cuid())
+  invoiceId String
+  label     String
+  /// 数量（人数 / 房夜 / 件数，随科目而定），纯记录，不参与任何金额推导
+  quantity  Decimal? @db.Decimal(12, 2)
+  amount    Decimal  @db.Decimal(14, 2) // 原币
+  amountCny Decimal  @db.Decimal(14, 2)
+  /// 挂靠对象（三选零或一）：班次 / 包房周期 / 订单
+  flightScheduleId   String?
+  hotelBlockPeriodId String?
+  orderId            String?
+  note      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoice          SupplierInvoice   @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  flightSchedule   FlightSchedule?   @relation(fields: [flightScheduleId], references: [id], onDelete: SetNull)
+  hotelBlockPeriod HotelBlockPeriod? @relation(fields: [hotelBlockPeriodId], references: [id], onDelete: SetNull)
+  order            Order?            @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@index([invoiceId])
+  @@index([flightScheduleId])
+  @@index([hotelBlockPeriodId])
+  @@index([orderId])
+}
+
+/// 付款记录 —— 钱真的打出去的那一笔。
+/// 每笔自带汇率：同一张美金账单分两次付，两天的汇率不一样，CNY 实付自然不同。
+// ─────────────────────────────────────────────────────────────────────────────
+// 发票 —— 给客户 / 代理开的**真发票**（增值税专票 / 普票 / 收据）。
+//
+// ⚠️ 与订单上的「开票」三个布尔位（outboundInvoiced / returnInvoiced / systemInvoiced）
+//    **完全无关，且绝不互相影响**。那三个是票务岗的**出票**进度（去程出票没有、回程出票没有、
+//    系统里出票没有），同事口中的「开票」指的就是它们，口径一个字不能动。
+//    本表是财务的**发票**：抬头、税号、发票号、开具日、金额。两件事只是中文撞了名字。
+//    任何一侧的读写都不许联动另一侧 —— 这是本表存在的前提。
+//
+// 一张发票可以关联多张订单（客人攒了几单一起开），故用 InvoiceOrder 中间表。
+// 金额一律服务端按关联订单的应收合计算，不收客户端传的数 —— 发票金额不能由申请方说了算。
+//
+// 状态机（三态，终局唯一）：
+//   REQUESTED —申请—→ 财务开具 —→ ISSUED
+//   REQUESTED / ISSUED —作废—→ VOID（终局，必须填原因）
+// 作废之后这几张订单可以重新申请；未作废前同一张订单不许挂第二张有效发票（防重复开票）。
+// ─────────────────────────────────────────────────────────────────────────────
+enum InvoiceType {
+  VAT_SPECIAL // 增值税专用发票（必须有税号）
+  VAT_GENERAL // 增值税普通发票
+  RECEIPT // 收据
+}
+
+/// 发票记录状态。名字带 Record 是为了跟既有的 InvoiceStatus（订单级「开票」旧单值）区分开，
+/// 两个枚举语义无关，绝不可混用。
+enum InvoiceRecordStatus {
+  REQUESTED // 已申请，等财务开
+  ISSUED // 已开具
+  VOID // 已作废（终局）
+}
+
+model Invoice {
+  id     String              @id @default(cuid())
+  /// 发票抬头（公司名 / 个人名）
+  title  String
+  /// 纳税人识别号；专票必填，普票 / 收据可空
+  taxNo  String?
+  /// 开票信息补充（地址电话、开户行账号），普票常常不用填
+  billingInfo String?
+  type   InvoiceType
+  /// 开票金额（CNY）= Σ 关联订单应收（total + adjustmentCny），服务端算，不收客户端传值
+  amountCny Decimal          @db.Decimal(12, 2)
+  status InvoiceRecordStatus @default(REQUESTED)
+  /// 发票号（开具时填）
+  invoiceNo String?
+  /// 开具日（date-only）
+  issuedAt  DateTime?        @db.Date
+  /// 发票文件 / 扫描件 URL
+  attachmentUrl String?
+  /// 申请方：登录用户；代理申请时同时记归属代理
+  requestedByUserId String?
+  agentId           String?
+  requestNote String?
+  /// 作废留痕
+  voidReason String?
+  voidedAt   DateTime?
+  voidedBy   String? // userId
+  issuedBy   String? // userId
+  createdAt  DateTime @default(now())
+  updatedAt  DateTime @updatedAt
+
+  requestedBy User?          @relation("InvoiceRequestedBy", fields: [requestedByUserId], references: [id], onDelete: SetNull)
+  agent       Agent?         @relation(fields: [agentId], references: [id], onDelete: SetNull)
+  orders      InvoiceOrder[]
+
+  @@index([status, createdAt])
+  @@index([agentId, status])
+  @@index([requestedByUserId])
+}
+
+/// 发票 ↔ 订单 多对多。一张发票可含多单；一张订单在「未作废」的发票里只许出现一次
+/// （防重复开票，闸在服务层事务里判——状态在 Invoice 上，DB 唯一索引跨不了表）。
+model InvoiceOrder {
+  id        String @id @default(cuid())
+  invoiceId String
+  orderId   String
+  /// 该订单计入本张发票的金额（CNY）—— 建单时按订单应收快照，之后订单改价不追溯已开的票
+  amountCny Decimal @db.Decimal(12, 2)
+  createdAt DateTime @default(now())
+
+  invoice Invoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  order   Order   @relation(fields: [orderId], references: [id], onDelete: Cascade)
+
+  @@unique([invoiceId, orderId])
+  @@index([orderId])
+}
+
+model SupplierPayment {
+  id        String   @id @default(cuid())
+  invoiceId String
+  paidOn    DateTime @db.Date // 付款日（date-only，业务日）
+  amount    Decimal  @db.Decimal(14, 2) // 原币（与账单同币种）
+  fxRate    Decimal? @db.Decimal(12, 6) // 本笔付款当日汇率；CNY 账单留空
+  amountCny Decimal  @db.Decimal(14, 2) // 本笔折人民币实付
+  method    String   @db.VarChar(16) // BANK / WECHAT / ALIPAY / CASH / OTHER
+  reference String? // 银行流水号 / 转账单号
+  payerLabel String? // 付款人（谁去银行打的）
+  note      String?
+  createdBy String? // userId（审计冗余）
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoice SupplierInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+  @@index([paidOn])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1720,6 +2009,12 @@ model Order {
   settlementRequests SettlementRequest[]
   bundleChangeRequests BundleChangeRequest[]
   orderChangeRequests  OrderChangeRequest[]
+  // 供应商应付账单明细挂过来的反向关系（某笔成本落到哪张订单头上）；纯只读引用
+  supplierInvoiceLines SupplierInvoiceLine[]
+  // 给客户/代理开的真发票（与订单上的「开票」三个布尔位无关，见 Invoice 模型注释）
+  invoiceLinks         InvoiceOrder[]
+  // 按人份额落库（审查根因 R1）：每位在单乘客一行，由 service/passenger-shares.ts 唯一写点维护
+  passengerShares      OrderPassengerShare[]
 
   @@index([userId, createdAt])
   @@index([agentId, createdAt])
@@ -1947,8 +2242,49 @@ model Passenger {
   order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
   // 按乘客调价行（0722）：本乘客名下的价格调整 OrderItem（SetNull——清人不丢金额，只失归属）。
   adjustmentItems OrderItem[]
+  // 本乘客在所在订单上的份额行（随乘客级联删除；拆单搬人后由写点重算两侧）。
+  shares          OrderPassengerShare[]
 
   @@index([orderId])
+}
+
+// ── 按人份额（审查根因 R1：业务按人算账、系统按订单建模）─────────────────────────
+// 每人份额此前是「每次现算」的派生值（per-pax-share.ts + lib/order-money perPax*），前后端各一份实现，
+// 导出 / 详情 / 对账单 / 拆单各自在读的时候重算。本表把每次写路径算出来的结果**作为事实落库**：
+//   · 算法不变：仍是 lib/order-money 的 perPaxSettlementByPassenger / perPaxVisaAmountByPassenger /
+//     perPaxSingleRoomDiffByPassenger（唯一算法），本表只存结果；落库值与派生值必须逐分相等；
+//   · 唯一写点：service/passenger-shares.ts 的 persistPassengerShares（挂在每条改钱 / 改人的写路径末尾，
+//     内核路径由 runOrderMutation 的 persistShares 选项统一挂）；
+//   · 读侧优先读本表，没有（老单）就派生并顺手回填（lazy backfill）；
+//   · 一行 = 一位**当前在单**的乘客；拆单搬人后源单的旧行由写点删掉、新单补建。
+// settlementCny = baseCny + adjustmentCny；Σ settlementCny + 换人费等不摊条目 = 应收（payableCny）。
+model OrderPassengerShare {
+  id          String @id @default(cuid())
+  orderId     String
+  passengerId String
+  /// 每人结算价（应收份额）= baseCny + adjustmentCny —— perPaxSettlementByPassenger
+  settlementCny     Decimal @db.Decimal(12, 2)
+  /// 均摊基准：(可摊应收 − Σ按人调价净额) ÷ 人数，余数兜给 id 序最后一位
+  baseCny           Decimal @db.Decimal(12, 2)
+  /// 该乘客名下「按乘客调价」净额（groupPassengerAdjustments.byPassenger[pid].netCny）
+  adjustmentCny     Decimal @db.Decimal(12, 2)
+  /// 签证金额（自备签 = 0；套餐挂牌价快照每人口径）—— perPaxVisaAmountByPassenger
+  visaCny           Decimal @db.Decimal(12, 2)
+  /// 单房差（只记到单住乘客）—— perPaxSingleRoomDiffByPassenger
+  singleRoomDiffCny Decimal @db.Decimal(12, 2)
+  /// 立减均摊（未撤销立减快照行 |amount| 之和 ÷ 人数，两位小数；整单发生的钱按既定口径均摊）
+  discountCny       Decimal @db.Decimal(12, 2)
+  /// 算法版本戳：算法改口径时换值，回填脚本据此挑出旧版本行重算
+  algoVersion String
+  computedAt  DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  order     Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  passenger Passenger @relation(fields: [passengerId], references: [id], onDelete: Cascade)
+
+  @@unique([orderId, passengerId])
+  @@index([passengerId])
 }
 
 model OrderStatusEvent {
@@ -2125,6 +2461,18 @@ model Refund {
   status         RefundStatus @default(REQUESTED)
   processedAt    DateTime?
   gatewayPayload Json?
+  // ── 实付登记（2026-09）──────────────────────────────────────────────────
+  // status=COMPLETED 只表示「这笔退款已核准、订单侧已按退款口径扣减」，真正把钱打回给客人
+  // 仍是财务在银行/微信里的手工动作。此前这一步在系统里没有任何痕迹：谁打的、什么时候打的、
+  // 走的哪条渠道、流水号是多少全靠线下表格，于是「核准了一直没打」和「打过又打一次」两类
+  // 事故都查不出来。这五列只记录「钱确实出去了」这一个事实，**不参与任何金额口径**：
+  // 已收净额仍按 status=COMPLETED 扣（见 lib/net-received.ts），退款状态机一个字不改。
+  // 全部可空：paidAt 为空 = 尚未打款（待打款队列的唯一判据），存量数据天然落在队列里。
+  paidAt         DateTime? // 实际打款时间（财务填，可回溯补录）
+  paidMethod     String? // BANK / WECHAT / ALIPAY / CASH / OTHER
+  paidTxnRef     String? // 银行流水号 / 微信支付单号等对方可核对的凭据
+  paidByUserId   String? // 登记这笔打款的内部账号（不做外键：账号注销不该带走资金留痕）
+  paidNote       String? // 备注（如「分两笔退，本条为第二笔」）
   createdAt      DateTime     @default(now())
   updatedAt      DateTime     @updatedAt
 
@@ -2132,6 +2480,8 @@ model Refund {
 
   @@index([orderId])
   @@index([status])
+  // 待打款队列热路径：status=COMPLETED 且 paidAt IS NULL，再按 processedAt 排账龄。
+  @@index([status, paidAt])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

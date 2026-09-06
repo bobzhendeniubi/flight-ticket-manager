@@ -13,6 +13,7 @@ import { SeatLockStatus, UserRole, WaitlistStatus } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import type { CreateWaitlistBody } from './waitlist.schemas.js';
+import { hasCapability } from '../../lib/capabilities.js';
 import { heldSeatsForSeatClass } from '../hold-orders/held-seats.js';
 
 export interface WaitlistRequester {
@@ -109,7 +110,7 @@ export class WaitlistService {
     if (!entry) throw new NotFoundError('候补记录不存在');
 
     const isOwner = entry.userId === requester.userId;
-    const isOps = requester.role === UserRole.ADMIN || requester.role === UserRole.STAFF;
+    const isOps = hasCapability({ role: requester.role }, 'waitlist.cancel_any');
     if (!isOwner && !isOps) throw new ForbiddenError('只能取消自己的候补');
 
     // 原子 CAS：只在仍 ACTIVE/NOTIFIED 时取消（已成交/已取消不可重复操作）

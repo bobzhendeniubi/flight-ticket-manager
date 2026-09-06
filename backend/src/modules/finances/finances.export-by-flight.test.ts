@@ -65,6 +65,7 @@ describe('buildFinanceExportByFlightWorkbook — 空座成本列', () => {
     await workbook.xlsx.load(
       (await buildFinanceExportByFlightWorkbook(
         { from: '2026-07-22', to: '2026-07-22' },
+        null,
         client,
       )) as unknown as Parameters<typeof workbook.xlsx.load>[0],
     );
@@ -154,6 +155,7 @@ describe('buildFinanceExportByFlightWorkbook — 释放/作废的航段腿不进
     await workbook.xlsx.load(
       (await buildFinanceExportByFlightWorkbook(
         { from: '2026-09-10', to: '2026-09-10' },
+        null,
         client,
       )) as unknown as Parameters<typeof workbook.xlsx.load>[0],
     );

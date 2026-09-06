@@ -24,6 +24,7 @@ vi.mock('../../lib/audit.js', () => ({
 import { userRoutes } from './users.routes.js';
 import { registerErrorHandler } from '../../plugins/error-handler.js';
 import { writeAudit } from '../../lib/audit.js';
+import { hasCapability, type Capability } from '../../lib/capabilities.js';
 
 let app: FastifyInstance;
 let authenticatedUserId = 'admin-1';
@@ -36,6 +37,16 @@ beforeAll(async () => {
   });
   app.decorate('requireRole', (...roles: UserRole[]) => async (req) => {
     if (!roles.includes(req.user.role)) {
+      const { ForbiddenError } = await import('../../lib/errors.js');
+      throw new ForbiddenError();
+    }
+  });
+  // users.routes.ts 现在用 requireCapability 判权限（见 capabilities.ts），这个手搭的假 app
+  // 没有走真实 authPlugin，得自己补一个等价的假装饰器，否则插件注册期直接报
+  // "app.requireCapability is not a function"。判定逻辑复用同一个 hasCapability 纯函数，
+  // 不会跟生产口径漂移。用例都没切换 staffRole，这里恒传 undefined 即可。
+  app.decorate('requireCapability', (cap: Capability) => async (req) => {
+    if (!hasCapability({ role: req.user.role, staffRole: undefined }, cap)) {
       const { ForbiddenError } = await import('../../lib/errors.js');
       throw new ForbiddenError();
     }

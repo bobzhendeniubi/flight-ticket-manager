@@ -53,6 +53,10 @@ import {
   NotFoundError,
 } from '../../lib/errors.js';
 import { getDescendantAgentIds } from '../../lib/agent-tree.js';
+// 订单金额单一口径（审查根因 R2）：结算单 GMV 按订单总额（不含售后费）聚合。
+import { grossTotalCny } from '../../lib/order-money.js';
+// 订单状态集合全站唯一一份：GMV 选单只认已付款四态。
+import { PAID_STATUSES } from '../../lib/order-status-sets.js';
 import type {
   GenerateSettlementsBody,
   ListSettlementsQuery,
@@ -276,14 +280,17 @@ export class SettlementService {
     const sellerOrders = await prisma.order.findMany({
       where: {
         agentId,
-        status: { in: ['PAID', 'PROCESSING', 'TICKETED', 'COMPLETED'] },
+        // 已付款四态（lib/order-status-sets.PAID_STATUSES，不含改签对——与仪表盘的已付款族不同，登记待拍板）
+        status: { in: PAID_STATUSES },
         // 按 updatedAt 走 PAID 切入本期；简化：用 createdAt
         createdAt: { gte: start, lt: end },
       },
       select: { id: true, total: true },
     });
     // order.total 已含套餐折扣、规则立减等折后净额，因此月结 GMV/佣金基数天然按折后价计算；立减不另改佣金链路。
-    const grossRevenue = sellerOrders.reduce((s, o) => s + Number(o.total), 0);
+    // GMV = Σ 订单总额（lib/order-money.grossTotalCny，**不含**售后费 adjustmentCny）——与代理对账单的
+    // 「应收」（含售后费）是两个口径，已登记待拍板，此处只改调不统一。
+    const grossRevenue = sellerOrders.reduce((s, o) => s + grossTotalCny(o), 0);
     const orderCount = sellerOrders.length;
 
     // 3. commissionPaidToChildren: 在上述 relatedOrderIds 里，查 chainDepth < 自己 chainDepth 的 records

@@ -22,14 +22,54 @@ import {
   VisaRequirement,
   VisaSubmissionStatus,
 } from '@prisma/client';
+// 订单状态集合全站唯一一份（审查根因 R2）：履约口径 = 库存口径 + REFUND_REQUESTED。
+import { COUNTED_STATUSES } from '../../lib/order-status-sets.js';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import type { AuditActor } from '../../lib/audit.js';
+import { isFeatureEnabled } from '../../lib/feature-flags.js';
+import { pushWecomMarkdown } from '../../lib/wecom-webhook.js';
 import { syncOrderVisaCompletion, type VisaCompletionOutcome } from './visa-completion.js';
+// 签证列的唯一写点与任务状态的唯一重派生点都在状态机模块；本文件不再直写
+// Passenger.visaSubmissionStatus / FulfillmentTask(VISA).status。
+import {
+  asVisaSubmissionStatus,
+  DERIVABLE_TASK_STATUSES,
+  derivePassengerVisaState,
+  isVisaSubmissionStatus,
+  ourVisaPassengersWhere,
+  rederiveVisaTaskStatus,
+  transitionPassengerVisa,
+  visaProgressEvent,
+  writePassengerVisaProgress,
+} from './visa-state.js';
 import type { ListFulfillmentQuery, UpdateFulfillmentBody } from './fulfillment.schemas.js';
 
 export const REFUND_REQUESTED_FULFILLMENT_ERROR =
   '订单退款申请中，库存已释放，不可继续履约；如退款被驳回可恢复操作';
+
+/** 任务类型 → 岗位中文名（企业微信 @ 提示用）。 */
+const FULFILLMENT_TYPE_ROLE_LABEL: Record<FulfillmentType, string> = {
+  [FulfillmentType.FLIGHT_TICKETING]: '票务岗',
+  [FulfillmentType.HOTEL_BOOKING]: '房控/地接',
+  [FulfillmentType.VISA_APPLICATION]: '签证岗',
+  [FulfillmentType.TRANSFER_DISPATCH]: '接送岗',
+  [FulfillmentType.BUNDLE_COMPOSITE]: '操作部',
+};
+
+/**
+ * 履约任务被指派后即时推一条企业微信通知——受 REMINDER_WEBHOOK_PUSH flag 控制
+ *（关闭或未配置 WECOM_WEBHOOK_URL 都是 no-op）。按任务类型 @ 岗位而非具体某个人：
+ * 群机器人没法精确 @ 到某个人，且产品文案不该写死内部同事姓名（见仓库 CLAUDE.md 铁律）。
+ */
+async function notifyAssigneeChangeToWecom(orderNumber: string, type: FulfillmentType): Promise<void> {
+  if (!(await isFeatureEnabled(prisma, 'REMINDER_WEBHOOK_PUSH'))) return;
+  const role = FULFILLMENT_TYPE_ROLE_LABEL[type] ?? '操作部';
+  await pushWecomMarkdown(
+    `### 履约任务新指派\n@${role} 有新工单：订单 ${orderNumber} 待处理。`,
+    'fulfillment-assigned',
+  );
+}
 
 /**
  * 计入履约任务列表 / 签证台的父订单状态——与订单/财务导出的 COUNTED_STATUSES 同一补集口径：
@@ -37,16 +77,7 @@ export const REFUND_REQUESTED_FULFILLMENT_ERROR =
  * REFUNDED（已退款）/ FAILED（失败）这些"取消族"状态。
  * 订单一旦落入取消族，其履约任务（尤其签证送签）不应再残留在运营看板上。
  */
-const COUNTED_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.REFUND_REQUESTED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
+// ↑ 集合本体在 lib/order-status-sets.ts（全站唯一一份，审查根因 R2）：履约口径 = 库存口径 + REFUND_REQUESTED。
 
 const KIND_TO_TYPE: Record<OrderItemKind, FulfillmentType | null> = {
   FLIGHT: FulfillmentType.FLIGHT_TICKETING,
@@ -258,63 +289,10 @@ export function visaRequirementWhere(
 }
 
 /**
- * 送签进度的推进次序（低→高）——派生任务级状态时取「最早（最低）」那一档。
+ * 任务级状态派生（乘客送签进度最低档 → 任务级状态）已迁入状态机模块 visa-state.ts，
+ * 语义一字未改；这里 re-export 给既有调用方（orders.service / 测试）。
  */
-const VISA_SUBMISSION_RANK: Record<VisaSubmissionStatus, number> = {
-  [VisaSubmissionStatus.PENDING]: 0,
-  [VisaSubmissionStatus.IN_PROGRESS]: 1,
-  [VisaSubmissionStatus.CONFIRMED]: 2,
-};
-
-/**
- * 乘客送签进度 → 任务级 FulfillmentStatus 的恒等映射（成员同名，语义一致）。
- * 只覆盖三档送签进度；CANCELLED/FAILED 是任务级独有态，不由乘客派生（见 rederiveVisaTasksForOrder）。
- */
-const SUBMISSION_TO_TASK: Record<VisaSubmissionStatus, FulfillmentStatus> = {
-  [VisaSubmissionStatus.PENDING]: FulfillmentStatus.PENDING,
-  [VisaSubmissionStatus.IN_PROGRESS]: FulfillmentStatus.IN_PROGRESS,
-  [VisaSubmissionStatus.CONFIRMED]: FulfillmentStatus.CONFIRMED,
-};
-
-/**
- * 派生口径：全部需签乘客到达某档，任务才算该档；只要有人更早，任务保持较早那一档。
- *   实现 = 取所有非自备签乘客送签进度里**最低**的一档，再恒等映射到任务级状态。
- * 无非自备签乘客（空数组）→ PENDING（无人可送，保持待处理）。
- */
-export function deriveVisaTaskStatus(statuses: VisaSubmissionStatus[]): FulfillmentStatus {
-  if (statuses.length === 0) return FulfillmentStatus.PENDING;
-  let lowest = statuses[0];
-  for (const s of statuses) {
-    if (VISA_SUBMISSION_RANK[s] < VISA_SUBMISSION_RANK[lowest]) lowest = s;
-  }
-  return SUBMISSION_TO_TASK[lowest];
-}
-
-/**
- * 任务级三档进度状态（可由乘客派生 / 被派生覆盖）——CANCELLED/FAILED 为终态，不在此列，
- * 派生只在这三档之间流转，永不复活终态。
- */
-const DERIVABLE_TASK_STATUSES: FulfillmentStatus[] = [
-  FulfillmentStatus.PENDING,
-  FulfillmentStatus.IN_PROGRESS,
-  FulfillmentStatus.CONFIRMED,
-];
-
-/**
- * 任务级状态是否属于「可映射到乘客送签进度」的三档（成员名与 VisaSubmissionStatus 逐字相同）。
- * 为真时可安全把该值当作 VisaSubmissionStatus 使用（见 asVisaSubmissionStatus）。
- */
-function isVisaSubmissionStatus(s: FulfillmentStatus): boolean {
-  return DERIVABLE_TASK_STATUSES.includes(s);
-}
-
-/**
- * 把已确认属于三档进度的任务级状态转成乘客级 VisaSubmissionStatus（同名枚举值，运行时等值）。
- * 调用前须 isVisaSubmissionStatus(s) 为真。
- */
-function asVisaSubmissionStatus(s: FulfillmentStatus): VisaSubmissionStatus {
-  return s as unknown as VisaSubmissionStatus;
-}
+export { deriveVisaTaskStatus } from './visa-state.js';
 
 /** Prisma.Decimal | number | null → number | null（签证金额序列化用） */
 function decOrNull(v: Prisma.Decimal | number | null | undefined): number | null {
@@ -386,7 +364,8 @@ export class FulfillmentService {
       }),
       prisma.passenger.findMany({
         // 自备签证乘客（visaExempt=true）不进签证台：客人自行办妥签证，无需送签。
-        where: { orderId, visaExempt: false },
+        // 圈定条件与统计条 / 护照包 / 提醒共用状态机模块的同一份。
+        where: ourVisaPassengersWhere(orderId),
         select: {
           id: true,
           fullName: true,
@@ -717,17 +696,28 @@ export class FulfillmentService {
       const grouped = statOrderIds.length
         ? await prisma.passenger.groupBy({
             by: ['visaSubmissionStatus'],
-            where: { orderId: { in: statOrderIds }, visaExempt: false },
+            // 三档分组 = 状态机六态在「我方的人」上的投影：SUBMITTED→已送 / IN_PROGRESS→材料准备 /
+            // 其余（PENDING，含订单头 NOT_NEEDED/HAS_VISA 派生的态）→待送。按列 groupBy 是为了不把
+            // 整个筛选范围的乘客拉到应用层，数字与按态计数恒等。
+            where: { orderId: { in: statOrderIds }, ...ourVisaPassengersWhere() },
             _count: { _all: true },
           })
         : [];
-      const countOf = (s: VisaSubmissionStatus) =>
-        grouped.find((g) => g.visaSubmissionStatus === s)?._count._all ?? 0;
-      passengerStats = {
-        pending: countOf(VisaSubmissionStatus.PENDING),
-        inProgress: countOf(VisaSubmissionStatus.IN_PROGRESS),
-        confirmed: countOf(VisaSubmissionStatus.CONFIRMED),
-      };
+      // 三个数按**派生态**归桶（PENDING→待送 / IN_PROGRESS→材料准备 / SUBMITTED→已送）：圈定的都是
+      // 我方的人（visaExempt=false），订单头对派生不起作用，故只喂送签进度；数字与按列计数恒等。
+      passengerStats = { pending: 0, inProgress: 0, confirmed: 0 };
+      for (const g of grouped) {
+        const state = derivePassengerVisaState({
+          orderVisaStatus: null,
+          visaExempt: false,
+          visaSubmissionStatus: g.visaSubmissionStatus,
+          allPassengersExempt: false,
+        });
+        const n = g._count._all;
+        if (state === 'SUBMITTED') passengerStats.confirmed += n;
+        else if (state === 'IN_PROGRESS') passengerStats.inProgress += n;
+        else passengerStats.pending += n;
+      }
     }
 
     return {
@@ -919,10 +909,12 @@ export class FulfillmentService {
       body.status !== undefined &&
       isVisaSubmissionStatus(body.status)
     ) {
-      await prisma.passenger.updateMany({
-        where: { orderId: updated.orderItem.orderId, visaExempt: false },
-        data: { visaSubmissionStatus: asVisaSubmissionStatus(body.status) },
-      });
+      // 整单形态的进度写入（状态机唯一写点）：整单非自备签乘客一起到该档。
+      await writePassengerVisaProgress(
+        prisma,
+        { orderId: updated.orderItem.orderId },
+        asVisaSubmissionStatus(body.status),
+      );
       // 订单级办结派生：整单推到「已送签」→ 订单自动已签证；从已送签退回 → 对称撤销。
       await this.syncCompletionForOrders([updated.orderItem.orderId], actor);
     }
@@ -939,6 +931,17 @@ export class FulfillmentService {
           },
         });
       }
+    }
+
+    // 指派变化（旧值 → 新的非空指派）时即时推企业微信通知；不在任何事务内，直接
+    // fire-and-forget。只认「指派到了具体某人」这个方向，清空指派（assigneeUserId: null）
+    // 不通知——没有接手人，通知了也没人对应负责。
+    if (
+      body.assigneeUserId !== undefined &&
+      body.assigneeUserId !== existing.assigneeUserId &&
+      body.assigneeUserId != null
+    ) {
+      void notifyAssigneeChangeToWecom(updated.orderItem.order.orderNumber, updated.type);
     }
 
     return {
@@ -1056,23 +1059,9 @@ export class FulfillmentService {
   }
 
   private async rederiveVisaTasksForOrder(orderId: string): Promise<FulfillmentStatus> {
-    const passengers = await prisma.passenger.findMany({
-      where: { orderId, visaExempt: false },
-      select: { visaSubmissionStatus: true },
-    });
-    const derived = deriveVisaTaskStatus(passengers.map((p) => p.visaSubmissionStatus));
-    await prisma.fulfillmentTask.updateMany({
-      where: {
-        orderItem: { orderId },
-        type: FulfillmentType.VISA_APPLICATION,
-        status: { in: DERIVABLE_TASK_STATUSES },
-      },
-      data: {
-        status: derived,
-        completedAt: derived === FulfillmentStatus.CONFIRMED ? new Date() : null,
-      },
-    });
-    return derived;
+    // 唯一重派生点在状态机模块。签证台口径：三档都可被改写（退回一人，任务就跟着退回）；
+    // CANCELLED / FAILED 永不复活。
+    return rederiveVisaTaskStatus(prisma, orderId, { touch: DERIVABLE_TASK_STATUSES });
   }
 
   /**
@@ -1100,7 +1089,8 @@ export class FulfillmentService {
         id: true,
         orderId: true,
         visaExempt: true,
-        order: { select: { status: true, deletedAt: true } },
+        visaSubmissionStatus: true,
+        order: { select: { status: true, deletedAt: true, visaStatus: true } },
       },
     });
     const byId = new Map(passengers.map((p) => [p.id, p]));
@@ -1114,10 +1104,21 @@ export class FulfillmentService {
         failures.push({ id, error: '乘客不存在' });
         continue;
       }
-      if (p.visaExempt) {
-        failures.push({ id, error: '该乘客自备签证，无需送签' });
+      // 签证守卫走状态机转移表（自备签乘客不推进度，文案只定义一份）
+      const transition = transitionPassengerVisa(
+        {
+          orderVisaStatus: p.order.visaStatus,
+          visaExempt: p.visaExempt,
+          visaSubmissionStatus: p.visaSubmissionStatus,
+          allPassengersExempt: false,
+        },
+        visaProgressEvent(toStatus, p.visaSubmissionStatus),
+      );
+      if (!transition.ok) {
+        failures.push({ id, error: transition.reason });
         continue;
       }
+      // 父订单存活是订单是否参与履约的口径（非签证守卫），与任务级 update 同一存活闸
       if (p.order.deletedAt || !COUNTED_STATUSES.includes(p.order.status)) {
         failures.push({
           id,
@@ -1131,10 +1132,8 @@ export class FulfillmentService {
 
     let visaCompletion: Array<Exclude<VisaCompletionOutcome, { changed: false }>> = [];
     if (okIds.length > 0) {
-      await prisma.passenger.updateMany({
-        where: { id: { in: okIds } },
-        data: { visaSubmissionStatus: toStatus },
-      });
+      // 按人形态的进度写入（状态机唯一写点）
+      await writePassengerVisaProgress(prisma, { passengerIds: okIds }, toStatus);
       // 逐单重新派生任务级状态（受影响订单去重后处理）
       for (const orderId of affectedOrders) {
         await this.rederiveVisaTasksForOrder(orderId);

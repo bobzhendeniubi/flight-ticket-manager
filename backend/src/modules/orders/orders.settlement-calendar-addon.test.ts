@@ -71,7 +71,15 @@ function baseBody(): CreateOrderBody {
 beforeEach(() => {
   vi.clearAllMocks();
   mockPrisma.bundle.findMany.mockResolvedValue([
-    { id: 'b-1', name: '三星 2天1晚', settlementTier: 'THREE_STAR', settlementNights: 1 },
+    {
+      id: 'b-1',
+      name: '三星 2天1晚',
+      settlementTier: 'THREE_STAR',
+      settlementNights: 1,
+      // 航线从绑定航班派生（bundle-route.ts）：没绑航班的套餐取不到日历价，见下方专项用例
+      outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' },
+      returnFlight: null,
+    },
   ]);
   mockPrisma.flightSchedule.findMany.mockResolvedValue([
     { departureTime: new Date('2026-09-01T00:30:00Z'), departureTz: 'Asia/Macau' },
@@ -98,6 +106,40 @@ describe('resolveBundleSettlementCalendarTotal · 加项净额叠加在日历价
     const r = await resolveCalendar(baseBody(), [-100]);
     expect(r!.totalCny).toBe(2900);
     expect(String(r!.audit.lines[0].note)).toContain('加项 −¥100');
+  });
+
+  it('配了日历键但未绑航班的套餐 → 派生不出航线，取不到价且不报错（返回 null，不查日历、不兜底航线）', async () => {
+    mockPrisma.bundle.findMany.mockResolvedValue([
+      {
+        id: 'b-1',
+        name: '三星 2天1晚（没绑航班）',
+        settlementTier: 'THREE_STAR',
+        settlementNights: 1,
+        outboundFlight: null,
+        returnFlight: null,
+      },
+    ]);
+    const r = await resolveCalendar(baseBody(), [740]);
+    expect(r).toBeNull();
+    expect(mockGetSettlementRate).not.toHaveBeenCalled();
+  });
+
+  it('取价行留痕带航线，且按套餐航线查日历（不是默认航线）', async () => {
+    mockPrisma.bundle.findMany.mockResolvedValue([
+      {
+        id: 'b-1',
+        name: '三星 2天1晚（芽庄线）',
+        settlementTier: 'THREE_STAR',
+        settlementNights: 1,
+        outboundFlight: { originCode: 'MFM', destinationCode: 'CXR' },
+        returnFlight: null,
+      },
+    ]);
+    mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 1500 });
+    const r = await resolveCalendar(baseBody(), [0]);
+    expect(mockGetSettlementRate).toHaveBeenCalledWith('MFM-CXR', 'THREE_STAR', 1, '2026-09-01');
+    expect(r?.audit.lines[0]).toMatchObject({ routeKey: 'MFM-CXR', tier: 'THREE_STAR', nights: 1 });
+    expect(String(r?.audit.lines[0].note)).toContain('MFM-CXR');
   });
 
   it('未配日历键的套餐 → 返回 null（现状不变，不进结算收敛）', async () => {

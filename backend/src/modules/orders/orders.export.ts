@@ -9,7 +9,8 @@ import ExcelJS from 'exceljs';
 import { localDateISO } from '../../lib/flight-time.js';
 import { businessDateTime } from '../../lib/business-time.js';
 import type { Prisma, PrismaClient } from '@prisma/client';
-import { OrderStatus } from '@prisma/client';
+// 订单状态集合全站唯一一份（审查根因 R2）：整班运营导出 = 所有占座中订单。
+import { SEAT_HOLDING_STATUSES } from '../../lib/order-status-sets.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { toAlpha3 } from './nationality.js';
 import { countIssuedPassengers, getScheduleSeatCapacity } from './ticketing-cap.js';
@@ -31,16 +32,6 @@ import { formatOrderLegStatus, isReturnCurrentlyReleased } from './orders.leg-st
  * 排除：DRAFT / CANCELLED / PAYMENT_TIMEOUT / FAILED / REFUND_REQUESTED / REFUNDED。
  * 与房控/开票额度的运营库存口径一致，但查询维度不同（班次 vs 时间段）。
  */
-const SEAT_HOLDING_STATUSES: OrderStatus[] = [
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-];
-
 const STATUS_LABEL: Record<string, string> = {
   PENDING_PAYMENT: '待支付',
   PAID: '已支付',

@@ -2,6 +2,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type VoidReturnLegPreview, type OrderLegFlagFilter, type PublicLegStatus, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE, TOKEN_PAYLOAD_MISMATCH_CODE, TOKEN_PAYLOAD_MISMATCH_HINT } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
   type FulfillmentStatus,
@@ -12,7 +13,7 @@ import { businessTzParts, formatDateCn, formatDateTimeSecCn, formatInBusinessTz 
 import { NumberInput } from '../components/NumberInput';
 import { Icon, type IconName } from '../components/Icon';
 import { parseOtaRoster } from '../lib/parseOtaRoster';
-import { computePerPaxSettlement } from '../lib/perPaxSettlement';
+import { resolvePerPaxSettlement } from '../lib/perPaxSettlement';
 import { toOrdersExportFilter } from '../lib/api';
 import type { AgentListItem, OrderAgentStats, OrderImportParseResult } from '../lib/api';
 import { OrderFinanceSection } from '../components/OrderFinanceSection';
@@ -26,6 +27,7 @@ import {
 } from '../lib/refundSplit';
 import { OrderAuditTrail } from '../components/OrderAuditTrail';
 import { SingleOrderModal } from '../components/SingleOrderModal';
+import { buildSingleOrderPrefill, type SingleOrderPrefill } from '../components/singleOrderPrefill';
 import {
   RoomingEditor,
   roomingHotelItemsFromOrder,
@@ -896,11 +898,14 @@ export function OrdersPage() {
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
   const bumpSeats = useFlightSeats((s) => s.bumpSeats);
-  const isAdmin = user?.role === 'ADMIN';
-  // 删单 / 回收站 = 内部员工（ADMIN + STAFF）共有权限，与 isAdmin 分开：
-  // isAdmin 另外还管「强制改状态」等绕过状态机的口子，不能一起放开。
-  const canManageDeleted = user?.role === 'ADMIN' || user?.role === 'STAFF';
-  // 运营岗（ADMIN + STAFF）：批量工具条里绝大多数动作是运营权限，代理不该看见一排必然 403 的按钮。
+  const { can } = useCapabilities();
+  // 强制改状态 = 绕过状态机的口子，只有管理员算数（后端 orders.force_status 同）。
+  const canForceStatus = can('orders.force_status');
+  // 换人费档位是全局配置，也只放管理员。
+  const canEditSwapFeeOptions = can('orders.swap_fee_options.write');
+  // 删单 / 回收站 = 内部员工共有权限，与上面两条分开：强制改状态不能跟着一起放开。
+  const canManageDeleted = can('orders.delete');
+  // 运营岗：批量工具条里绝大多数动作是运营权限，代理不该看见一排必然 403 的按钮。
   // 代理唯一能用的批量动作是「批量改备注」——后端 PATCH /orders/:id/notes 的 notes 字段对其放行。
   const isOps = user?.role === 'ADMIN' || user?.role === 'STAFF';
   // 深链承接：从签证台等页面带 ?q=订单号 跳入时用于填充搜索框并自动开详情抽屉
@@ -1118,9 +1123,9 @@ export function OrdersPage() {
   // 强制模式默认关：强制把已取消/超时等「非占座」订单拉回 PAID/PROCESSING 等「占座」状态时会
   // 重新占座（余位不足会被拒绝），必须是运营每次主动勾选的动作，不能默认开着让人顺手误触。
   const [forceMode, setForceMode] = useState(false);
-  // 强制通道仅管理员可见可用：勾选框本身按 isAdmin 隐藏（见下方渲染），这里再兜底一层——
+  // 强制通道仅管理员可见可用：勾选框本身按 canForceStatus 隐藏（见下方渲染），这里再兜底一层——
   // 即便 forceMode 状态因某种原因残留 true，非管理员在这里读到的永远是 false。
-  const effectiveForceMode = isAdmin && forceMode;
+  const effectiveForceMode = canForceStatus && forceMode;
   // 批量改签证状态：无批量端点，逐单调用「改备注」端点（updateOrderNotes）的 visaStatus 字段。
   const [bulkVisaStatus, setBulkVisaStatus] = useState<VisaStatusInput | ''>('');
   const [bulkVisaSubmitting, setBulkVisaSubmitting] = useState(false);
@@ -1190,6 +1195,9 @@ export function OrdersPage() {
   // 批量创单弹窗 + 单笔录单弹窗 + 列表刷新计数（建单后 +1 触发重新拉单）
   const [showBatchCreate, setShowBatchCreate] = useState(false);
   const [showSingleCreate, setShowSingleCreate] = useState(false);
+  // 「以此单为模板」带进录单弹窗的预填值；null = 空白录单（＋录单 按钮走这条）。
+  // 只在弹窗挂载时消费一次，关闭时清空，避免下一次点「＋ 录单」还带着上一单的备注。
+  const [singleCreatePrefill, setSingleCreatePrefill] = useState<SingleOrderPrefill | null>(null);
   const [refreshNonce, setRefreshNonce] = useState(0);
   // 议价申请队列弹窗（ADMIN/STAFF）+ 待处理数徽标；代理不能手填结算价，只能提申请，
   // 运营在这里集中确认/驳回。徽标只拉一次 total（pageSize=1，不取列表内容），队列内确认/驳回
@@ -2520,7 +2528,11 @@ export function OrdersPage() {
           })()}
           <button
             className="btn-primary text-sm"
-            onClick={() => setShowSingleCreate(true)}
+            onClick={() => {
+              // 走这个入口一律是空白单：清掉上一次「以此单为模板」留下的预填
+              setSingleCreatePrefill(null);
+              setShowSingleCreate(true);
+            }}
             title="按产品类型录一笔订单（机票/酒店/签证/套餐/接送）"
           >
             ＋ 录单
@@ -2718,7 +2730,7 @@ export function OrdersPage() {
               <Icon name="trash" /> 回收站
             </button>
           )}
-          {isAdmin && (
+          {canEditSwapFeeOptions && (
             <button
               type="button"
               className={showSwapFeeSettings ? 'btn-primary text-sm' : 'btn-ghost text-sm'}
@@ -2857,7 +2869,7 @@ export function OrdersPage() {
             </div>
           )}
           {/* 换人费标准（预填选项）：运营/管理员自己改，不用找开发；换人表单据此渲染快捷选项 + 默认预填。 */}
-          {isAdmin && showSwapFeeSettings && tokens?.accessToken && (
+          {canEditSwapFeeOptions && showSwapFeeSettings && tokens?.accessToken && (
             <SwapFeeOptionsSetting token={tokens.accessToken} />
           )}
         </div>
@@ -3383,7 +3395,7 @@ export function OrdersPage() {
                 <option key={s} value={s}>{orderStatusLabel(s)}</option>
               ))}
             </select>
-            {isAdmin && (
+            {canForceStatus && (
               <label className="flex items-center gap-1.5 text-sm text-ink-soft">
                 <input
                   type="checkbox"
@@ -4540,7 +4552,13 @@ export function OrdersPage() {
           onDelete={() => {
             void deleteOrder(selected);
           }}
-          isAdmin={isAdmin}
+          onUseAsTemplate={(src) => {
+            // 关掉详情抽屉再开录单弹窗：两个都是全屏对话框，叠在一起会抢焦点
+            setSingleCreatePrefill(buildSingleOrderPrefill(src));
+            setSelected(null);
+            setShowSingleCreate(true);
+          }}
+          canForceStatus={canForceStatus}
         />
       )}
 
@@ -4582,7 +4600,11 @@ export function OrdersPage() {
 
       {showSingleCreate && (
         <SingleOrderModal
-          onClose={() => setShowSingleCreate(false)}
+          prefill={singleCreatePrefill ?? undefined}
+          onClose={() => {
+            setShowSingleCreate(false);
+            setSingleCreatePrefill(null);
+          }}
           onCreated={() => {
             setRefreshNonce((n) => n + 1);
             bumpSeats();
@@ -4896,10 +4918,11 @@ function OrderDrawer({
   order,
   onClose,
   onAdvance,
-  onChanged,
+  onChanged: onChangedProp,
   onOrderUpdated,
   onDelete,
-  isAdmin,
+  onUseAsTemplate,
+  canForceStatus,
 }: {
   order: OrderSummary;
   onClose: () => void;
@@ -4909,7 +4932,9 @@ function OrderDrawer({
   onOrderUpdated?: (order: OrderSummary) => void;
   /** 删除订单（内部员工：ADMIN + STAFF） */
   onDelete?: () => void;
-  isAdmin?: boolean;
+  /** 以此单为模板新建：父级负责关抽屉 + 用该订单的预填打开录单弹窗 */
+  onUseAsTemplate?: (order: OrderSummary) => void;
+  canForceStatus?: boolean;
 }) {
   const tokens = useAuth((s) => s.tokens);
   const confirm = useConfirm();
@@ -4939,8 +4964,8 @@ function OrderDrawer({
   const bumpSeats = useFlightSeats((s) => s.bumpSeats);
   // 内部角色（ADMIN/STAFF）才看逐项拆价折叠区；AGENT/CUSTOMER 只看「产品内容 + 订单总价」，不露内部金额明细。
   const canSeeInternal = role === 'ADMIN' || role === 'STAFF';
-  // 删单同为内部员工权限；与 isAdmin（强制改状态）分开判断。
-  const canManageDeleted = role === 'ADMIN' || role === 'STAFF';
+  // 删单同为内部员工权限；与 canForceStatus（强制改状态）分开判断。
+  const canManageDeleted = useCapabilities().can('orders.delete');
   // 改单申请（代理自助窗口关闭后的入口）：提交弹窗开关 + 一个刷新计数器，
   // 提交成功后 bump 它让下方「改单申请 · 待处理」小面板重新拉一次，不用整抽屉重挂载。
   const [showChangeRequestModal, setShowChangeRequestModal] = useState(false);
@@ -4949,6 +4974,9 @@ function OrderDrawer({
   // 恒显示「—」。抽屉打开时用 getOrder 拉全量详情，之后所有子区块都读 hydrated（拿不到时兜底列表行）。
   const [hydrated, setHydrated] = useState<OrderSummary | null>(null);
   const [hydrating, setHydrating] = useState(false);
+  // 后端的沙箱自动出票开关现状（详情接口随行下发）。乘客卡的「演示自动出票」提示只认它，
+  // 不再写死 —— 接了真航司/把开关关掉之后，界面不该继续管真票号叫演示号。
+  const [autoFulfillmentSandbox, setAutoFulfillmentSandbox] = useState(false);
   // 补水失败不能静默吞掉——否则用户对着列表快照（护照/备注等字段陈旧）编辑还以为是最新。
   // 记一个失败标记，在抽屉里给出轻量提示 + 重试；重试复用同一 loader。
   const [hydrateFailed, setHydrateFailed] = useState(false);
@@ -4958,12 +4986,32 @@ function OrderDrawer({
     setHydrating(true);
     setHydrateFailed(false);
     api.getOrder(token, order.id)
-      .then((r) => { if (!cancelled) setHydrated(r.order); })
+      .then((r) => {
+        if (cancelled) return;
+        setHydrated(r.order);
+        // 沙箱自动出票开着吗（后端读 env ENABLE_AUTO_FULFILLMENT 如实下发）。
+        // 乘客卡的「演示自动出票」提示据此挂 —— 拿不到就按 false：宁可不提示，
+        // 也不要在一个真票号旁边挂「这是演示号」的错标。
+        setAutoFulfillmentSandbox(r.autoFulfillmentSandbox === true);
+      })
       .catch(() => { if (!cancelled) setHydrateFailed(true); })
       .finally(() => { if (!cancelled) setHydrating(false); });
     return () => { cancelled = true; };
   }, [token, order.id]);
   useEffect(() => hydrate(), [hydrate]);
+  /**
+   * 抽屉里任何改动了订单的操作（认款 / 撤销收款 / 改价 / 加减项…）都走这里：
+   * **先把本抽屉重新补水，再通知父级刷列表**。
+   *
+   * 抽屉里有两处各自取数：上面「付款情况」卡读补水快照 o（getOrder 的结果），下面「收款」
+   * 区自己拉 payments。以前 onChanged 只 bump 列表的 refreshNonce，补水快照原地不动——
+   * 认款成功后收款区已显示已结清，上方付款情况卡还写着「¥0 / 应收 ¥X」，同一屏自相矛盾。
+   * 统一到 getOrder 这一个来源后两块必然同步。
+   */
+  const onChanged = useCallback(() => {
+    hydrate();
+    onChangedProp?.();
+  }, [hydrate, onChangedProp]);
   // 父级在状态流转/发起退款申请成功后 setSelected 传回**全量**订单（带 payments/refunds，
   // 与 getOrder 同一序列化路径）；列表行是精简快照（恒无这两字段）。仅当传入全量订单时
   // 同步 hydrated，否则保留已补水的详情——不同步的话，从抽屉里点「申请退款/同意退款」
@@ -4975,6 +5023,28 @@ function OrderDrawer({
   }, [order]);
   // 详情各区块统一读 o（详情优先，兜底列表行）。售后改期/换人后用返回的整单同步 hydrated + 列表行。
   const o = hydrated ?? order;
+  /**
+   * 以此单为模板新建：用补水后的 o（列表快照没有备注/签证状态这些要带走的字段）。
+   * 走与 requestClose 同一条未保存改动确认 —— 不能让「顺手开张新单」把运营刚敲了一半的备注
+   * 悄悄吞掉。真正关抽屉 + 开录单弹窗由父级负责。
+   */
+  const requestUseAsTemplate = useCallback(() => {
+    if (!onUseAsTemplate) return;
+    if (!notesDirty) {
+      onUseAsTemplate(o);
+      return;
+    }
+    void (async () => {
+      const confirmed = await confirm({
+        title: '有未保存的改动',
+        body: '备注 / 签证状态有未保存的改动，去新建订单会丢掉它们，确定继续？',
+        tone: 'danger',
+        confirmText: '继续新建',
+        cancelText: '继续编辑',
+      });
+      if (confirmed) onUseAsTemplate(o);
+    })();
+  }, [notesDirty, confirm, onUseAsTemplate, o]);
   const view = deriveView(o);
   const bal = deriveBalance(o);
   // 换人退款必须等详情补水拿到 refunds 后才能计算净收款；列表快照只有 paidAmount，不能拿它冒充净收款。
@@ -5152,7 +5222,7 @@ function OrderDrawer({
   // 用未按角色收窄的 machineNext 判定：代理看到的空工具条是"这些流转不归你做"，不是"这单走到头了"。
   const isTerminal = machineNext.length === 0;
   // 管理员强制可选的「越过状态机」目标：所有其它状态里、不在标准流转内的（标准流转已经是普通按钮）。
-  const forceTargets: OrderStatus[] = isAdmin
+  const forceTargets: OrderStatus[] = canForceStatus
     ? (Object.keys(ORDER_STATUS_META) as OrderStatus[]).filter(
         (s) => s !== o.status && !machineNext.includes(s),
       )
@@ -5264,7 +5334,11 @@ function OrderDrawer({
           )}
 
           {/* 乘客（读 hydrated → 护照号/生日/国籍/类型 真实显示）*/}
-          <PassengersSection order={o} onOrderUpdated={handleOrderUpdated} />
+          <PassengersSection
+            order={o}
+            onOrderUpdated={handleOrderUpdated}
+            autoFulfillmentSandbox={autoFulfillmentSandbox}
+          />
 
           {/* 开票（六态：去程 / 回程 / 系统 三个独立开关）*/}
           <InvoiceFlagsSection order={o} onOrderUpdated={handleOrderUpdated} />
@@ -5612,7 +5686,9 @@ function OrderDrawer({
             orderId={o.id}
             initialExpectedAmountCny={o.expectedAmountCny}
             initialExpectedAmountLocked={o.expectedAmountLocked}
-            payableCny={Number(o.total) + Number(o.adjustmentCny ?? 0)}
+            // 权威应付一律读后端 effectivePayable（deriveBalance 已优先取它，老后端才回落本地公式），
+            // 不在前端再抄一遍 total + adjustmentCny——后端 lib/order-money 是唯一口径。
+            payableCny={bal.payable}
             onChanged={onChanged}
           />
 
@@ -5736,6 +5812,7 @@ function OrderDrawer({
             onSplit={
               isOps && (o.passengers?.length ?? 0) >= 2 ? () => setSplitOpen(true) : undefined
             }
+            onUseAsTemplate={onUseAsTemplate ? requestUseAsTemplate : undefined}
           />
 
           {/* no-show 处理：航司 no-show 名单来了之后，票务在这里标去程 no-show + 释放回程座位。
@@ -5847,11 +5924,11 @@ function OrderDrawer({
                 <div className="w-full rounded-lg border border-slate-200 bg-slate-50/60 p-3 text-xs text-ink-muted">
                   {isTerminal
                     ? `当前为终态「${orderStatusLabel(o.status)}」，没有后续流转。${
-                        isAdmin ? '如需异常订正，可用下方「管理员强制改状态」。' : ''
+                        canForceStatus ? '如需异常订正，可用下方「管理员强制改状态」。' : ''
                       }`
                     : isOps
                       ? `「${orderStatusLabel(o.status)}」状态下无标准流转操作。${
-                          isAdmin ? '如需异常订正，可用下方「管理员强制改状态」。' : ''
+                          canForceStatus ? '如需异常订正，可用下方「管理员强制改状态」。' : ''
                         }`
                       : `「${orderStatusLabel(o.status)}」状态下暂无可由您发起的操作，如需退款 / 改期请联系我方操作。`}
                 </div>
@@ -5897,7 +5974,7 @@ function OrderDrawer({
 
             {/* 管理员强制改状态：越过状态机的目标（异常订正用）。被安全规则拦下的操作（如已退款订单
                 拉回占座、余位不足重新占座）后端会拒绝并弹出具体原因，不会静默失败。 */}
-            {isAdmin && forceTargets.length > 0 && (
+            {canForceStatus && forceTargets.length > 0 && (
               <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50/70 p-3">
                 <div className="flex flex-wrap items-center gap-2">
                   <label className="text-xs font-medium text-amber-800">管理员强制改状态</label>
@@ -6627,7 +6704,16 @@ const FF_TYPE_LABEL: Record<FulfillmentTask['type'], { icon: IconName; label: st
 };
 
 // 履约进度已按运营要求移出订单详情抽屉；组件保留（导出以备后续页面复用，也避免未引用告警）。
-export function FulfillmentSection({ orderId }: { orderId: string }) {
+// autoFulfillmentSandbox 由挂载方从订单详情接口取（后端读 env ENABLE_AUTO_FULFILLMENT）：
+// 「演示自动出票」标以前写死在这里，接了真航司/关掉开关之后会一直管真票号叫演示号。
+// 缺省 false —— 拿不到开关状态时宁可不挂标，也不要在真票号旁边挂个错的。
+export function FulfillmentSection({
+  orderId,
+  autoFulfillmentSandbox = false,
+}: {
+  orderId: string;
+  autoFulfillmentSandbox?: boolean;
+}) {
   const confirm = useConfirm();
   const highRiskConfirmRef = useRef(false);
   const tokens = useAuth((s) => s.tokens);
@@ -6727,10 +6813,10 @@ export function FulfillmentSection({ orderId }: { orderId: string }) {
                     value={
                       <span className="inline-flex items-center gap-1.5">
                         <span className="font-mono">{data.pnr ?? '（未生成）'}</span>
-                        {data.pnr && (
+                        {data.pnr && autoFulfillmentSandbox && (
                           <span
                             className="rounded bg-amber-100 px-1.5 py-0.5 text-[10px] font-medium text-amber-700"
-                            title="此 PNR/电子票号为系统演示自动出票生成，非真实航司 PNR；正式对接航司后以真实出票为准。"
+                            title="后台的沙箱自动出票开关目前开着：这组 PNR/票号可能是系统演示自动出票生成的，非真实航司号。拿到航司真号后请在乘客卡上回填覆盖。"
                           >
                             演示自动出票
                           </span>
@@ -10560,14 +10646,25 @@ function PriceAdjustmentSection({
     const netByPassenger = new Map<string, number>(
       [...grouped.byPassenger.entries()].map(([pid, bucket]) => [pid, bucket.netCny]),
     );
-    return computePerPaxSettlement({
+    // 先读后端落库的按人份额（order.passengerShares，与导出 / 对账单 / 拆单搬钱同一份事实）；
+    // 旧后端 / 窄接口没下发时才退回前端同算法现算（source = DERIVED）。
+    return resolvePerPaxSettlement({
       totalCny: Number(order.total),
       adjustmentCny: order.adjustmentCny,
       adjustments: order.adjustments ?? [],
       passengerIds: order.passengers.map((p) => p.id),
       netByPassenger,
+      passengerShares: order.passengerShares,
     });
-  }, [order.passengers, order.total, order.adjustmentCny, order.adjustments, grouped.byPassenger]);
+  }, [order.passengers, order.total, order.adjustmentCny, order.adjustments, order.passengerShares, grouped.byPassenger]);
+
+  // 份额来源三态：后端已落库 / 后端现算（老单未回填，读一次详情就会回填）/ 前端现算（旧后端没下发）。
+  const shareOrigin: 'PERSISTED' | 'BACKEND_DERIVED' | 'FRONTEND_DERIVED' =
+    perPax?.source === 'PERSISTED'
+      ? order.sharesSource === 'DERIVED'
+        ? 'BACKEND_DERIVED'
+        : 'PERSISTED'
+      : 'FRONTEND_DERIVED';
 
   // 内部角色才可见（对外脱敏时后端也不下发逐项金额；这里再做一道前端权限门）。
   if (!isOps) return null;
@@ -10657,6 +10754,22 @@ function PriceAdjustmentSection({
         <div className="mt-3">
           <p className="text-[11px] leading-snug text-ink-muted">
             每人结算价 = 应收均摊 + 该乘客调整净额（系统派生，不可手填）
+            <span
+              className={`ml-1.5 rounded px-1 py-0.5 text-[10px] font-medium ring-1 ${
+                shareOrigin === 'PERSISTED'
+                  ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'
+                  : 'bg-slate-50 text-slate-600 ring-slate-200'
+              }`}
+              title={
+                shareOrigin === 'PERSISTED'
+                  ? '读的是后端落库的按人份额（写路径落的事实，与导出 / 对账单同一份）'
+                  : shareOrigin === 'BACKEND_DERIVED'
+                    ? '老单尚未回填份额，后端按同一算法现算；打开过详情后会自动回填'
+                    : '后端未下发按人份额（旧后端），前端按同一算法现算'
+              }
+            >
+              {shareOrigin === 'PERSISTED' ? '已落库' : shareOrigin === 'BACKEND_DERIVED' ? '后端现算' : '前端现算'}
+            </span>
           </p>
           <table className="mt-1 w-full text-xs">
             <thead>
@@ -11230,8 +11343,7 @@ function useLegacyHistoryByDoc(
   passengers: OrderSummary['passengers'],
 ): Map<string, LegacyPassengerHistory> {
   const token = useAuth((s) => s.tokens)?.accessToken ?? '';
-  const role = useAuth((s) => s.user?.role);
-  const canReadLegacyHistory = role === 'ADMIN' || role === 'STAFF';
+  const canReadLegacyHistory = useCapabilities().can('legacy.read');
   const [rows, setRows] = useState<Map<string, LegacyPassengerHistory>>(new Map());
   const docs = useMemo(
     () => [...new Set(passengers.map((p) => p.documentNumber?.trim().toUpperCase()).filter((doc): doc is string => Boolean(doc)))].slice(0, 100),
@@ -11263,7 +11375,20 @@ function useLegacyHistoryByDoc(
   return rows;
 }
 
-function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onOrderUpdated?: (order: OrderSummary) => void }) {
+function PassengersSection({
+  order,
+  onOrderUpdated,
+  autoFulfillmentSandbox = false,
+}: {
+  order: OrderSummary;
+  onOrderUpdated?: (order: OrderSummary) => void;
+  /**
+   * 后端沙箱自动出票开关现在是开着的（详情接口下发）。
+   * 只有它为 true 时，票号旁边才挂「演示自动出票」提示 —— 关了开关或接了真航司之后，
+   * 这个标必须自己消失，不能靠改代码。
+   */
+  autoFulfillmentSandbox?: boolean;
+}) {
   const navigate = useNavigate();
   const [editingId, setEditingId] = useState<string | null>(null);
   // 改信息（CORRECTION，纠错不清资料）/ 换人（SWAP，既有清资料语义）——同一张表单两种模式。
@@ -11271,10 +11396,11 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
   const [lightbox, setLightbox] = useState<{ photoUrl: string; title: string } | null>(null);
   // B1：签证日期内联编辑（订单侧入口——HAS_VISA/全员自备签的单进不了签证台，这里是它们唯一可达的录入口）
   const [visaEditId, setVisaEditId] = useState<string | null>(null);
+  // 票号内联编辑（票务岗回填真实 PNR / 电子票号）——单人一改；整班请走「票号批量回填」页。
+  const [ticketEditId, setTicketEditId] = useState<string | null>(null);
 
   // 建单后按人改自备签（专用端点，非换人通道）：仅内部可编辑角色可见（AGENT 不给）。
-  const role = useAuth((s) => s.user?.role);
-  const canToggleVisaExempt = role === 'ADMIN' || role === 'STAFF';
+  const canToggleVisaExempt = useCapabilities().can('orders.passengers.write');
   const confirm = useConfirm();
   const [visaExemptBusyId, setVisaExemptBusyId] = useState<string | null>(null);
   const [visaExemptErr, setVisaExemptErr] = useState<string | null>(null);
@@ -11401,6 +11527,12 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
     () => groupOrderAdjustments(order.items ?? []).byPassenger,
     [order.items],
   );
+  // 按人份额（R1）：后端逐单下发的每人结算价（库里落好的；老单未回填时后端现算并标 DERIVED）。
+  // 旧后端没下发就不显示，不在前端另算一份。
+  const shareByPassenger = useMemo(
+    () => new Map((order.passengerShares ?? []).map((s) => [s.passengerId, s])),
+    [order.passengerShares],
+  );
 
   // 常旅客次数：按本单乘客证件批量查一次，给每张乘客卡挂「已飞 N / 可用 M」小标
   const tripsByDoc = useTravelerTripsByDoc(order.passengers);
@@ -11418,6 +11550,7 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
         {order.passengers.map((p) => {
           const passDaysLeft = daysUntil(p.passportExpiry);
           const adjNet = adjustmentByPassenger.get(p.id)?.netCny ?? 0;
+          const share = shareByPassenger.get(p.id);
           const passWarn = passDaysLeft !== null && passDaysLeft < 180;
           const passBlock = passDaysLeft !== null && passDaysLeft < 90;
           const docNo = p.documentNumber?.trim();
@@ -11435,6 +11568,21 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                   onCancel={() => setVisaEditId(null)}
                   onSaved={(updated) => {
                     setVisaEditId(null);
+                    onOrderUpdated?.(updated);
+                  }}
+                />
+              </li>
+            );
+          }
+          if (ticketEditId === p.id) {
+            return (
+              <li key={p.id} className="rounded-md border border-emerald-300 bg-emerald-50/50 p-3">
+                <PassengerTicketInline
+                  orderId={order.id}
+                  passenger={p}
+                  onCancel={() => setTicketEditId(null)}
+                  onSaved={(updated) => {
+                    setTicketEditId(null);
                     onOrderUpdated?.(updated);
                   }}
                 />
@@ -11494,6 +11642,20 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                     {p.visaExempt && (
                       <span className="ml-2 rounded bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 ring-1 ring-sky-200">自备签</span>
                     )}
+                    {/* 按人份额（R1）：该乘客的每人结算价 + 来源（已落库 / 现算）。 */}
+                    {share && (
+                      <span
+                        className={`nums ml-2 rounded px-1.5 py-0.5 text-[10px] font-medium ring-1 ${
+                          order.sharesSource === 'PERSISTED'
+                            ? 'bg-emerald-50 text-emerald-700 ring-emerald-200'
+                            : 'bg-slate-50 text-slate-600 ring-slate-200'
+                        }`}
+                        title={`每人结算价（${order.sharesSource === 'PERSISTED' ? '已落库' : '后端现算，打开过详情后会回填'}）：均摊 ¥${share.baseCny.toLocaleString('zh-CN', { minimumFractionDigits: 2 })} + 调整 ${signedCny(share.adjustmentCny)}`}
+                      >
+                        份额 ¥{share.settlementCny.toLocaleString('zh-CN', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}
+                        {order.sharesSource === 'PERSISTED' ? '' : '·现算'}
+                      </span>
+                    )}
                     {/* 按乘客净调价小标（0722）：正=补收（琥珀）、负=优惠（绿）；0 不显示。 */}
                     {adjNet !== 0 && (
                       <span
@@ -11534,6 +11696,15 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                     >
                       签证日期
                     </button>
+                    {canToggleVisaExempt && (
+                      <button
+                        className="ml-2 text-[11px] font-normal text-emerald-700 hover:text-emerald-900"
+                        onClick={() => setTicketEditId(p.id)}
+                        title="回填航司出票后的真实 PNR / 电子票号（整班一次灌请走「票号批量回填」页）"
+                      >
+                        票号
+                      </button>
+                    )}
                     {canToggleVisaExempt && (
                       <button
                         className="ml-2 text-[11px] font-normal text-amber-700 hover:text-amber-900 disabled:opacity-50"
@@ -11582,6 +11753,23 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                         <dt>签证有效期</dt><dd className="font-mono">{p.visaExpiry.slice(0, 10)}</dd>
                       </>
                     )}
+                    {/* PNR / 电子票号：一直显示（没有就是「—」）—— 票务岗要一眼看出这个人到底
+                        有没有票号，「字段不存在」和「还没出票」在界面上必须是同一件事的两种写法，
+                        不能靠「有值才出现」让人猜。沙箱开着时才在旁边挂「演示自动出票」。 */}
+                    <dt>PNR</dt>
+                    <dd className="font-mono">
+                      {p.pnr ?? '—'}
+                      {p.pnr && autoFulfillmentSandbox && (
+                        <span
+                          className="ml-1.5 rounded bg-amber-100 px-1 py-0.5 text-[10px] font-medium text-amber-700"
+                          title="后台的沙箱自动出票开关目前开着：订单转已支付后系统会自动生成一组演示用的 PNR/票号。拿到航司真号后请点上方「票号」回填覆盖。"
+                        >
+                          演示自动出票
+                        </span>
+                      )}
+                    </dd>
+                    <dt>电子票号</dt>
+                    <dd className="font-mono">{p.eticketNumber ?? '—'}</dd>
                   </dl>
                 </div>
                 {p.passportPhotoUrl && (
@@ -11806,6 +11994,139 @@ function PassengerVisaDatesInline({
       <div className="flex justify-end gap-2">
         <button type="button" className="btn-ghost text-xs" onClick={onCancel} disabled={saving}>取消</button>
         <button type="button" className="btn-primary text-xs disabled:opacity-50" onClick={save} disabled={saving}>
+          {saving ? '保存中…' : '保存'}
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── 票号内联编辑（票务岗回填真实 PNR / 电子票号）─────────────────────────────
+// 出票走沙箱自动生成号，真实航司出票之后系统里本来没有任何人工录入口。这是单人那个口；
+// 整班一次灌走「票号批量回填」页（导航 · 运营组）。
+//
+// 三条要在界面上说清楚的事（都写在表单里，不指望人记得）：
+//   1. 留空 = 不动这一列；要清掉请点「清空票号」（与「什么都没填就保存」区分开）。
+//   2. 保存**不会**发行程单邮件 —— 边录边发，客人会收到一串行程单。要发走履约区的「重发行程单邮件」。
+//   3. 库里已经就是这个号时，后端回 changedFields: []，这里如实说「没有变化」，不谎报「已保存」。
+function PassengerTicketInline({
+  orderId,
+  passenger,
+  onCancel,
+  onSaved,
+}: {
+  orderId: string;
+  passenger: { id: string; fullName: string; pnr?: string | null; eticketNumber?: string | null };
+  onCancel: () => void;
+  onSaved: (updated: OrderSummary) => void;
+}) {
+  const tokens = useAuth((s) => s.tokens);
+  const token = tokens?.accessToken ?? '';
+  const confirm = useConfirm();
+  const [pnr, setPnr] = useState(passenger.pnr ?? '');
+  const [eticketNumber, setEticketNumber] = useState(passenger.eticketNumber ?? '');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  const save = async () => {
+    if (!token || saving) return;
+    const nextPnr = pnr.trim();
+    const nextTicket = eticketNumber.trim();
+    // 两格都空 = 这次调用没有意义（要清空请走下面那个按钮，语义不同，别让人误清）。
+    if (nextPnr === '' && nextTicket === '') {
+      setErr('请填写 PNR 或电子票号；要清空已有票号请点「清空票号」。');
+      return;
+    }
+    setSaving(true);
+    setErr(null);
+    try {
+      const res = await api.updatePassengerTicket(token, orderId, passenger.id, {
+        // 留空 = 不动这一列（不传该字段），不是「清空」。
+        ...(nextPnr === '' ? {} : { pnr: nextPnr }),
+        ...(nextTicket === '' ? {} : { eticketNumber: nextTicket }),
+      });
+      if (res.changedFields.length === 0) window.alert('填的号与系统里现有的完全一致，没有改动。');
+      const r = await api.getOrder(token, orderId); // 重拉整单让抽屉/列表同步
+      onSaved(r.order);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const clearAll = async () => {
+    if (!token || saving) return;
+    const ok = await confirm({
+      title: `确认清空 ${passenger.fullName} 的票号？`,
+      body: 'PNR 与电子票号会一起清空。票号一没，这个人的退票/对账就断了线索，请确认是录错了要撤掉。',
+      tone: 'danger',
+      confirmText: '清空',
+    });
+    if (!ok) return;
+    setSaving(true);
+    setErr(null);
+    try {
+      await api.updatePassengerTicket(token, orderId, passenger.id, { clear: true });
+      const r = await api.getOrder(token, orderId);
+      onSaved(r.order);
+    } catch (e) {
+      setErr(e instanceof ApiError ? e.message : '清空失败');
+    } finally {
+      setSaving(false);
+    }
+  };
+
+  const hasExisting = Boolean(passenger.pnr || passenger.eticketNumber);
+  const inputCls = 'mt-0.5 w-full rounded-md border border-slate-300 px-2 py-1 font-mono text-xs';
+  return (
+    <div className="space-y-2 text-xs">
+      <div className="font-medium text-slate-900">票号 · {passenger.fullName}</div>
+      <div className="grid grid-cols-2 gap-2">
+        <label className="block text-[11px] text-slate-500">
+          PNR（订座编码）
+          <input
+            className={inputCls}
+            value={pnr}
+            placeholder="5–8 位字母数字"
+            onChange={(e) => setPnr(e.target.value)}
+          />
+        </label>
+        <label className="block text-[11px] text-slate-500">
+          电子票号
+          <input
+            className={inputCls}
+            value={eticketNumber}
+            placeholder="10–17 位数字，784-… 的横杠可省可留"
+            onChange={(e) => setEticketNumber(e.target.value)}
+          />
+        </label>
+      </div>
+      <p className="text-[11px] text-slate-400">
+        留空 = 不动这一列（不是清空）。保存<span className="font-medium text-slate-500">不会</span>
+        自动给客人发行程单，需要时请用履约区的「重发行程单邮件」。
+      </p>
+      {err && <div className="text-[11px] text-rose-600">{err}</div>}
+      <div className="flex items-center justify-end gap-2">
+        {hasExisting && (
+          <button
+            type="button"
+            className="mr-auto text-[11px] text-rose-600 hover:text-rose-800 disabled:opacity-50"
+            onClick={() => void clearAll()}
+            disabled={saving}
+          >
+            清空票号
+          </button>
+        )}
+        <button type="button" className="btn-ghost text-xs" onClick={onCancel} disabled={saving}>
+          取消
+        </button>
+        <button
+          type="button"
+          className="btn-primary text-xs disabled:opacity-50"
+          onClick={() => void save()}
+          disabled={saving}
+        >
           {saving ? '保存中…' : '保存'}
         </button>
       </div>
@@ -12304,7 +12625,7 @@ function PassengerEditForm({
     : null;
 
   return (
-    <div className="space-y-2 text-xs">
+    <div className="space-y-2 text-xs" data-testid="passenger-edit-form">
       <div className="font-medium text-brand">{mode === 'CORRECTION' ? '改信息' : '换人'} · {passenger.fullName}</div>
 
       {/* 护照 OCR：上传照片自动识别并预填下方字段（与录单同款，AI 优先、本地兜底）。用户可改后提交。 */}
@@ -12535,11 +12856,14 @@ function formatDdMon(isoDate: string | null | undefined): string | null {
 function OpsToolbar({
   order,
   onSplit,
+  onUseAsTemplate,
 }: {
   order: OrderSummary;
   onAdvance: (next: OrderStatus, reason?: string) => void;
   /** 拆单入口（仅 ADMIN/STAFF 且乘客 ≥ 2 时由父级传入；缺省不渲染按钮） */
   onSplit?: () => void;
+  /** 以此单为模板新建（父级传入；缺省不渲染按钮） */
+  onUseAsTemplate?: () => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
   const [busy, setBusy] = useState<string | null>(null);
@@ -12645,9 +12969,20 @@ function OpsToolbar({
             <Icon name="users" /> 拆单（拆出部分乘客）
           </button>
         )}
+        {onUseAsTemplate && (
+          <button
+            className="col-span-2 rounded border border-slate-300 bg-white px-2 py-1.5 text-xs text-ink-soft transition hover:border-brand/50 hover:bg-brand-50 hover:text-brand-700 disabled:opacity-50"
+            onClick={onUseAsTemplate}
+            disabled={busy !== null}
+            title="照这单的产品类型 / 代理 / 联系人 / 备注开一张新单；出行人、日期与金额都不带过来"
+          >
+            <Icon name="clipboard" /> 以此单为模板新建
+          </button>
+        )}
       </div>
       <p className="mt-2 text-[10px] text-slate-500">
         PNR Excel = 航司提交格式（25 列）；护照 zip 含 README 列出缺照片的乘客。
+        「以此单为模板」只带产品类型与客户侧字段，出行人 / 日期 / 金额一律重填。
       </p>
     </section>
   );
@@ -13810,7 +14145,7 @@ function NotesSection({
 
   // 内部口径（签证状态 + 内部备注 + 结构化四栏）只对运营开放；代理只写客户备注那一栏。
   // 后端 PATCH /orders/:id/notes 也是这个口径：notes 对 AGENT 放行，internalNotes/visaStatus/note* 仅 ops。
-  const canEditInternal = role === 'ADMIN' || role === 'STAFF';
+  const canEditInternal = useCapabilities().can('orders.write');
   const isAgent = role === 'AGENT';
   // 代理自助修改窗口（下单当天，北京时间）：窗口内代理也能改订单级签证状态（三档，见下方选项）；
   // 窗口外只读展示，改动须走改单申请（后续波次）。
@@ -13992,8 +14327,8 @@ function NotesSection({
 }
 
 function RemindersSection({ order }: { order: OrderSummary }) {
+  const canManageReminders = useCapabilities().can('reminders.manage');
   const tokens = useAuth((s) => s.tokens);
-  const role = useAuth((s) => s.user?.role);
   const [reminders, setReminders] = useState(order.reminders ?? []);
   const [newTitle, setNewTitle] = useState('');
   const [newPriority, setNewPriority] = useState<'LOW' | 'NORMAL' | 'HIGH' | 'CRITICAL'>('NORMAL');
@@ -14034,7 +14369,7 @@ function RemindersSection({ order }: { order: OrderSummary }) {
   const STATUS_LABEL: Record<string, string> = { OPEN: '未处理', IN_PROGRESS: '处理中', DONE: '✓ 完成', SKIPPED: '⊘ 跳过' };
 
   // 运营待办/提醒是内部协作口径，只对内部角色开放；AGENT/CUSTOMER 整块不渲染（后端对其也不下发 reminders）。
-  if (role !== 'ADMIN' && role !== 'STAFF') return null;
+  if (!canManageReminders) return null;
 
   return (
     <section>
@@ -16612,8 +16947,7 @@ function ConfirmPaymentSection({
   onChanged?: () => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
-  const role = useAuth((s) => s.user?.role);
-  const canTransferPayment = role === 'ADMIN' || role === 'STAFF';
+  const canTransferPayment = useCapabilities().can('payments.transfer');
   const token = tokens?.accessToken ?? '';
   const navigate = useNavigate();
   // 跳收款对账台并带上本单订单号，那边据此预填核销表单的订单搜索框。
@@ -16785,17 +17119,25 @@ function ConfirmPaymentSection({
       setErr('金额需为正数');
       return;
     }
-    // 金额留空 = 后端默认按尾款全额入账、可能直接结清（口径见 payments.service confirmManualPayment）。
-    // 财务逐单收齐靠这个默认省事，但对误触是零门槛，先弹一道人为确认。
+    // 「按尾款全额入账」二次确认。两条路都会把本单一次性结清，都要过这道人为确认：
+    //   · 金额留空 —— 后端默认按尾款全额入账（口径见 payments.service confirmManualPayment）；
+    //   · 金额恰好等于尾款全额 —— 表单默认就预填尾款，一路回车即结清。
+    // 以前只认留空，但预填让「留空」几乎不会发生，这道闸实际上从不触发，与财务岗手册写的
+    // 对不上。预填不动（逐单收齐靠它省事），改成金额相等时同样弹——金额类操作多一道确认无害。
     // 已结清后再留空提交没有可默认的尾款，就地拦下，别让后端报「金额必须大于 0」绕一圈。
-    if (amt === undefined && !confirmDuplicate) {
-      if (balance <= 0) {
+    const settlesInFull =
+      amt === undefined || (balance > 0 && Math.abs(amt - balance) < 0.005);
+    if (settlesInFull && !confirmDuplicate) {
+      if (amt === undefined && balance <= 0) {
         setErr('本单已无尾款，追加收款请填写实际到账金额');
         return;
       }
       const okToSettle = await askConfirm({
         title: '按尾款全额入账',
-        body: `未填收款金额，将默认按尾款 ¥${balance.toLocaleString()} 入账并结清本单。确认已实际收到这笔钱？`,
+        body:
+          amt === undefined
+            ? `未填收款金额，将默认按尾款 ¥${balance.toLocaleString()} 入账并结清本单。确认已实际收到这笔钱？`
+            : `这笔金额正好是本单尾款 ¥${balance.toLocaleString()}，入账后本单即结清。确认已实际收到这笔钱？`,
         tone: 'danger',
       });
       if (!okToSettle) return;
