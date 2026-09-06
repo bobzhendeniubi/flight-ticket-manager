@@ -5,6 +5,7 @@ import { StaffRole, UserRole } from '@prisma/client';
 import { env } from '../config/env.js';
 import { AppError, ForbiddenError, UnauthorizedError } from '../lib/errors.js';
 import { prisma } from '../db/prisma.js';
+import { CAPABILITIES, hasCapability, type Capability } from '../lib/capabilities.js';
 
 export interface AccessTokenPayload {
   sub: string; // user id
@@ -30,6 +31,16 @@ declare module 'fastify' {
     ) => (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
     /** Requires ADMIN or STAFF with the finance staff role. */
     requireFinanceAccess: (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
+    /**
+     * Factory: returns a preHandler that requires one capability（见 lib/capabilities.ts）。
+     *
+     * 这是权限判断的**唯一**入口，取代散在各路由里的内联 role 比较。
+     * 它与前端 /users/me 返回的 capabilities 用同一张表算，前后端不会再各判一次而漂移。
+     * 岗位逐请求从 User 表取回（authenticate 已填好 req.staffRole），改岗下一个请求即生效。
+     */
+    requireCapability: (
+      cap: Capability,
+    ) => (req: FastifyRequest, reply: FastifyReply) => Promise<void>;
   }
   interface FastifyRequest {
     /** Set by `authenticate`; may be undefined on `optionalAuthenticate` routes. */
@@ -171,5 +182,16 @@ export const authPlugin = fp(async function authPlugin(app: FastifyInstance) {
       req.user.role === UserRole.ADMIN ||
       (req.user.role === UserRole.STAFF && req.staffRole === StaffRole.FINANCE);
     if (!allowed) throw new ForbiddenError('需要财务岗权限');
+  });
+
+  app.decorate('requireCapability', function requireCapability(cap: Capability) {
+    return async function capabilityGuard(req: FastifyRequest, _reply: FastifyReply) {
+      // requireCapability 之前必然跑过 authenticate —— 防御性再判一次。
+      if (!req.user) throw new UnauthorizedError();
+      if (!hasCapability({ role: req.user.role, staffRole: req.staffRole }, cap)) {
+        // 文案沿用能力表里的说明，运营看到的是「要干的这件事」而不是一串角色枚举。
+        throw new ForbiddenError(`需要权限：${CAPABILITIES[cap].说明}`);
+      }
+    };
   });
 });

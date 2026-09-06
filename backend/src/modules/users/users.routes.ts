@@ -5,6 +5,7 @@ import { prisma } from '../../db/prisma.js';
 import { AuthService } from '../auth/auth.service.js';
 import { BadRequestError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
+import { capabilitiesFor } from '../../lib/capabilities.js';
 
 /** 与 auth.service 的登出/全撤销口径一致：打到过去，避开 refresh 并发宽限窗。 */
 function expireImmediately(): Date {
@@ -33,7 +34,10 @@ export const userRoutes: FastifyPluginAsync = async (app) => {
       },
     });
     if (!user) throw new NotFoundError('User not found');
-    return { user };
+    // 能力清单随 /users/me 一起回：前端据此显隐菜单与按钮，与后端 requireCapability
+    // 用的是同一张表、同一个纯函数，不会再出现「按钮亮着但一点就 403」或反过来的情况。
+    // 现算不缓存 —— 改岗后下一次 /users/me 拿到的就是新的。
+    return { user, capabilities: capabilitiesFor(user) };
   });
 
   // ── A20 岗位细分（2026-07-20 拍板「全改」）────────────────────────────
