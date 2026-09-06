@@ -2,6 +2,7 @@ import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'rea
 import { useSearchParams, useNavigate } from 'react-router-dom';
 import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type VoidReturnLegPreview, type OrderLegFlagFilter, type PublicLegStatus, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE, TOKEN_PAYLOAD_MISMATCH_CODE, TOKEN_PAYLOAD_MISMATCH_HINT } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
   type FulfillmentStatus,
@@ -897,11 +898,14 @@ export function OrdersPage() {
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
   const bumpSeats = useFlightSeats((s) => s.bumpSeats);
-  const isAdmin = user?.role === 'ADMIN';
-  // 删单 / 回收站 = 内部员工（ADMIN + STAFF）共有权限，与 isAdmin 分开：
-  // isAdmin 另外还管「强制改状态」等绕过状态机的口子，不能一起放开。
-  const canManageDeleted = user?.role === 'ADMIN' || user?.role === 'STAFF';
-  // 运营岗（ADMIN + STAFF）：批量工具条里绝大多数动作是运营权限，代理不该看见一排必然 403 的按钮。
+  const { can } = useCapabilities();
+  // 强制改状态 = 绕过状态机的口子，只有管理员算数（后端 orders.force_status 同）。
+  const canForceStatus = can('orders.force_status');
+  // 换人费档位是全局配置，也只放管理员。
+  const canEditSwapFeeOptions = can('orders.swap_fee_options.write');
+  // 删单 / 回收站 = 内部员工共有权限，与上面两条分开：强制改状态不能跟着一起放开。
+  const canManageDeleted = can('orders.delete');
+  // 运营岗：批量工具条里绝大多数动作是运营权限，代理不该看见一排必然 403 的按钮。
   // 代理唯一能用的批量动作是「批量改备注」——后端 PATCH /orders/:id/notes 的 notes 字段对其放行。
   const isOps = user?.role === 'ADMIN' || user?.role === 'STAFF';
   // 深链承接：从签证台等页面带 ?q=订单号 跳入时用于填充搜索框并自动开详情抽屉
@@ -1119,9 +1123,9 @@ export function OrdersPage() {
   // 强制模式默认关：强制把已取消/超时等「非占座」订单拉回 PAID/PROCESSING 等「占座」状态时会
   // 重新占座（余位不足会被拒绝），必须是运营每次主动勾选的动作，不能默认开着让人顺手误触。
   const [forceMode, setForceMode] = useState(false);
-  // 强制通道仅管理员可见可用：勾选框本身按 isAdmin 隐藏（见下方渲染），这里再兜底一层——
+  // 强制通道仅管理员可见可用：勾选框本身按 canForceStatus 隐藏（见下方渲染），这里再兜底一层——
   // 即便 forceMode 状态因某种原因残留 true，非管理员在这里读到的永远是 false。
-  const effectiveForceMode = isAdmin && forceMode;
+  const effectiveForceMode = canForceStatus && forceMode;
   // 批量改签证状态：无批量端点，逐单调用「改备注」端点（updateOrderNotes）的 visaStatus 字段。
   const [bulkVisaStatus, setBulkVisaStatus] = useState<VisaStatusInput | ''>('');
   const [bulkVisaSubmitting, setBulkVisaSubmitting] = useState(false);
@@ -2726,7 +2730,7 @@ export function OrdersPage() {
               <Icon name="trash" /> 回收站
             </button>
           )}
-          {isAdmin && (
+          {canEditSwapFeeOptions && (
             <button
               type="button"
               className={showSwapFeeSettings ? 'btn-primary text-sm' : 'btn-ghost text-sm'}
@@ -2865,7 +2869,7 @@ export function OrdersPage() {
             </div>
           )}
           {/* 换人费标准（预填选项）：运营/管理员自己改，不用找开发；换人表单据此渲染快捷选项 + 默认预填。 */}
-          {isAdmin && showSwapFeeSettings && tokens?.accessToken && (
+          {canEditSwapFeeOptions && showSwapFeeSettings && tokens?.accessToken && (
             <SwapFeeOptionsSetting token={tokens.accessToken} />
           )}
         </div>
@@ -3391,7 +3395,7 @@ export function OrdersPage() {
                 <option key={s} value={s}>{orderStatusLabel(s)}</option>
               ))}
             </select>
-            {isAdmin && (
+            {canForceStatus && (
               <label className="flex items-center gap-1.5 text-sm text-ink-soft">
                 <input
                   type="checkbox"
@@ -4554,7 +4558,7 @@ export function OrdersPage() {
             setSelected(null);
             setShowSingleCreate(true);
           }}
-          isAdmin={isAdmin}
+          canForceStatus={canForceStatus}
         />
       )}
 
@@ -4918,7 +4922,7 @@ function OrderDrawer({
   onOrderUpdated,
   onDelete,
   onUseAsTemplate,
-  isAdmin,
+  canForceStatus,
 }: {
   order: OrderSummary;
   onClose: () => void;
@@ -4930,7 +4934,7 @@ function OrderDrawer({
   onDelete?: () => void;
   /** 以此单为模板新建：父级负责关抽屉 + 用该订单的预填打开录单弹窗 */
   onUseAsTemplate?: (order: OrderSummary) => void;
-  isAdmin?: boolean;
+  canForceStatus?: boolean;
 }) {
   const tokens = useAuth((s) => s.tokens);
   const confirm = useConfirm();
@@ -4960,8 +4964,8 @@ function OrderDrawer({
   const bumpSeats = useFlightSeats((s) => s.bumpSeats);
   // 内部角色（ADMIN/STAFF）才看逐项拆价折叠区；AGENT/CUSTOMER 只看「产品内容 + 订单总价」，不露内部金额明细。
   const canSeeInternal = role === 'ADMIN' || role === 'STAFF';
-  // 删单同为内部员工权限；与 isAdmin（强制改状态）分开判断。
-  const canManageDeleted = role === 'ADMIN' || role === 'STAFF';
+  // 删单同为内部员工权限；与 canForceStatus（强制改状态）分开判断。
+  const canManageDeleted = useCapabilities().can('orders.delete');
   // 改单申请（代理自助窗口关闭后的入口）：提交弹窗开关 + 一个刷新计数器，
   // 提交成功后 bump 它让下方「改单申请 · 待处理」小面板重新拉一次，不用整抽屉重挂载。
   const [showChangeRequestModal, setShowChangeRequestModal] = useState(false);
@@ -5218,7 +5222,7 @@ function OrderDrawer({
   // 用未按角色收窄的 machineNext 判定：代理看到的空工具条是"这些流转不归你做"，不是"这单走到头了"。
   const isTerminal = machineNext.length === 0;
   // 管理员强制可选的「越过状态机」目标：所有其它状态里、不在标准流转内的（标准流转已经是普通按钮）。
-  const forceTargets: OrderStatus[] = isAdmin
+  const forceTargets: OrderStatus[] = canForceStatus
     ? (Object.keys(ORDER_STATUS_META) as OrderStatus[]).filter(
         (s) => s !== o.status && !machineNext.includes(s),
       )
@@ -5918,11 +5922,11 @@ function OrderDrawer({
                 <div className="w-full rounded-lg border border-slate-200 bg-slate-50/60 p-3 text-xs text-ink-muted">
                   {isTerminal
                     ? `当前为终态「${orderStatusLabel(o.status)}」，没有后续流转。${
-                        isAdmin ? '如需异常订正，可用下方「管理员强制改状态」。' : ''
+                        canForceStatus ? '如需异常订正，可用下方「管理员强制改状态」。' : ''
                       }`
                     : isOps
                       ? `「${orderStatusLabel(o.status)}」状态下无标准流转操作。${
-                          isAdmin ? '如需异常订正，可用下方「管理员强制改状态」。' : ''
+                          canForceStatus ? '如需异常订正，可用下方「管理员强制改状态」。' : ''
                         }`
                       : `「${orderStatusLabel(o.status)}」状态下暂无可由您发起的操作，如需退款 / 改期请联系我方操作。`}
                 </div>
@@ -5968,7 +5972,7 @@ function OrderDrawer({
 
             {/* 管理员强制改状态：越过状态机的目标（异常订正用）。被安全规则拦下的操作（如已退款订单
                 拉回占座、余位不足重新占座）后端会拒绝并弹出具体原因，不会静默失败。 */}
-            {isAdmin && forceTargets.length > 0 && (
+            {canForceStatus && forceTargets.length > 0 && (
               <div className="mt-3 rounded-lg border border-amber-200 bg-amber-50/70 p-3">
                 <div className="flex flex-wrap items-center gap-2">
                   <label className="text-xs font-medium text-amber-800">管理员强制改状态</label>
@@ -11310,8 +11314,7 @@ function useLegacyHistoryByDoc(
   passengers: OrderSummary['passengers'],
 ): Map<string, LegacyPassengerHistory> {
   const token = useAuth((s) => s.tokens)?.accessToken ?? '';
-  const role = useAuth((s) => s.user?.role);
-  const canReadLegacyHistory = role === 'ADMIN' || role === 'STAFF';
+  const canReadLegacyHistory = useCapabilities().can('legacy.read');
   const [rows, setRows] = useState<Map<string, LegacyPassengerHistory>>(new Map());
   const docs = useMemo(
     () => [...new Set(passengers.map((p) => p.documentNumber?.trim().toUpperCase()).filter((doc): doc is string => Boolean(doc)))].slice(0, 100),
@@ -11368,8 +11371,7 @@ function PassengersSection({
   const [ticketEditId, setTicketEditId] = useState<string | null>(null);
 
   // 建单后按人改自备签（专用端点，非换人通道）：仅内部可编辑角色可见（AGENT 不给）。
-  const role = useAuth((s) => s.user?.role);
-  const canToggleVisaExempt = role === 'ADMIN' || role === 'STAFF';
+  const canToggleVisaExempt = useCapabilities().can('orders.passengers.write');
   const confirm = useConfirm();
   const [visaExemptBusyId, setVisaExemptBusyId] = useState<string | null>(null);
   const [visaExemptErr, setVisaExemptErr] = useState<string | null>(null);
@@ -14093,7 +14095,7 @@ function NotesSection({
 
   // 内部口径（签证状态 + 内部备注 + 结构化四栏）只对运营开放；代理只写客户备注那一栏。
   // 后端 PATCH /orders/:id/notes 也是这个口径：notes 对 AGENT 放行，internalNotes/visaStatus/note* 仅 ops。
-  const canEditInternal = role === 'ADMIN' || role === 'STAFF';
+  const canEditInternal = useCapabilities().can('orders.write');
   const isAgent = role === 'AGENT';
   // 代理自助修改窗口（下单当天，北京时间）：窗口内代理也能改订单级签证状态（三档，见下方选项）；
   // 窗口外只读展示，改动须走改单申请（后续波次）。
@@ -14275,8 +14277,8 @@ function NotesSection({
 }
 
 function RemindersSection({ order }: { order: OrderSummary }) {
+  const canManageReminders = useCapabilities().can('reminders.manage');
   const tokens = useAuth((s) => s.tokens);
-  const role = useAuth((s) => s.user?.role);
   const [reminders, setReminders] = useState(order.reminders ?? []);
   const [newTitle, setNewTitle] = useState('');
   const [newPriority, setNewPriority] = useState<'LOW' | 'NORMAL' | 'HIGH' | 'CRITICAL'>('NORMAL');
@@ -14317,7 +14319,7 @@ function RemindersSection({ order }: { order: OrderSummary }) {
   const STATUS_LABEL: Record<string, string> = { OPEN: '未处理', IN_PROGRESS: '处理中', DONE: '✓ 完成', SKIPPED: '⊘ 跳过' };
 
   // 运营待办/提醒是内部协作口径，只对内部角色开放；AGENT/CUSTOMER 整块不渲染（后端对其也不下发 reminders）。
-  if (role !== 'ADMIN' && role !== 'STAFF') return null;
+  if (!canManageReminders) return null;
 
   return (
     <section>
@@ -16895,8 +16897,7 @@ function ConfirmPaymentSection({
   onChanged?: () => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
-  const role = useAuth((s) => s.user?.role);
-  const canTransferPayment = role === 'ADMIN' || role === 'STAFF';
+  const canTransferPayment = useCapabilities().can('payments.transfer');
   const token = tokens?.accessToken ?? '';
   const navigate = useNavigate();
   // 跳收款对账台并带上本单订单号，那边据此预填核销表单的订单搜索框。
