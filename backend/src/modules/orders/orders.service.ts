@@ -155,9 +155,18 @@ import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
 import { OPERATION_FEE_CNY_PER_ORDER } from './order-cost-items.service.js';
 import { bundleItemMetadataSchema } from './orders.schemas.js';
 import { derivePtcByAge, earliestFlightDeparture } from './pnr-export.js';
-// 按人送签的任务级状态派生（纯函数）：与签证台同一口径。依赖方向安全——
-// fulfillment.service 只 import prisma/errors/自身 schemas，不回头 import orders 模块，无环。
-import { deriveVisaTaskStatus } from '../fulfillment/fulfillment.service.js';
+// 乘客级签证状态机（fulfillment/visa-state）：三列的唯一写点 + 带守卫的转移表。依赖方向安全——
+// visa-state 只 import prisma 枚举 / errors / orders/visa-need（纯判定），不回头 import orders 模块，无环。
+import {
+  assertNoVisaContradiction,
+  DERIVABLE_TASK_STATUSES,
+  orderVisaDeclarationEvent,
+  rederiveVisaTaskStatus,
+  resetVisaTaskProgress,
+  transitionPassengerVisa,
+  writeOrderVisaStatus,
+  writePassengerVisaExempt,
+} from '../fulfillment/visa-state.js';
 import {
   syncOrderVisaCompletion,
   VISA_AUTO_COMPLETE_ACTION,
@@ -2163,9 +2172,8 @@ export class OrderService {
     // 到期漏送签。录单页的软提示拦不住（提示上线后仍有新单落进来），故收在服务端。
     // 空名单 / 部分自备签一律放行（豁免口径见 isVisaContradiction）。
     // 批量创单（batchCreateOrders）逐单调用本方法，一并受本闸约束。
-    if (isVisaContradiction({ visaStatus: body.visaStatus, passengers: body.passengers })) {
-      throw new BadRequestError(VISA_CONTRADICTION_MESSAGE);
-    }
+    // 闸与文案在状态机模块只定义一份（建单 / 换人 / 改自备签 / 改订单签证状态四条写入路径共用）。
+    assertNoVisaContradiction({ visaStatus: body.visaStatus, passengers: body.passengers });
 
     // 护照有效期必填（业务拍板，2026-07）：后台（ADMIN/STAFF）新建订单且含按人产品
     // （机票/套餐/签证——出行人必填的产品类型）时，每位出行人必须带护照有效期。
@@ -11696,17 +11704,26 @@ export class OrderService {
 
     const orderInactive =
       Boolean(current.deletedAt) || FULFILLMENT_TERMINATING_STATUSES.includes(current.status);
-    if (!orderInactive && isVisaContradiction({ visaStatus, passengers: current.passengers })) {
-      throw new BadRequestError(VISA_CONTRADICTION_MESSAGE);
+    if (!orderInactive) {
+      assertNoVisaContradiction({ visaStatus, passengers: current.passengers });
     }
 
-    const changed = current.visaStatus !== visaStatus;
+    // 订单级声明走状态机转移表（DECLARE_*）：changed = 档位真变了才跑任务同步。
+    // 订单级事件不看乘客列，事实只需订单头；allPassengersExempt 只影响派生态文案，不影响写入。
+    const declaration = transitionPassengerVisa(
+      {
+        orderVisaStatus: current.visaStatus,
+        visaExempt: false,
+        visaSubmissionStatus: null,
+        allPassengersExempt: false,
+      },
+      orderVisaDeclarationEvent(visaStatus),
+    );
+    const changed = declaration.ok && declaration.changed;
     // 签证状态 + 备注四栏 + 签证任务同步，一个事务落地：要么都生效，要么一个字都不落。
+    // 备注四栏与签证状态是同一次提交 → 即便档位没变也要落这一条 UPDATE（noteData 要写）。
     await prisma.$transaction(async (tx) => {
-      await tx.order.update({
-        where: { id: orderId },
-        data: { ...(options.noteData ?? {}), visaStatus },
-      });
+      await writeOrderVisaStatus(tx, orderId, visaStatus, options.noteData);
       if (changed) {
         await syncVisaTasksForOrder(tx, orderId, { userId: actor.userId, role: actor.role });
       }
