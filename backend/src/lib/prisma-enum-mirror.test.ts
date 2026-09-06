@@ -17,6 +17,7 @@
  */
 import { describe, it, expect } from 'vitest';
 import * as PrismaNamespace from '@prisma/client';
+import * as Mirrors from '@ftm/contracts/enums';
 import { PRISMA_ENUM_MIRRORS } from '@ftm/contracts/enums';
 
 /**
@@ -56,6 +57,15 @@ describe('Prisma 枚举镜像 · @ftm/contracts 与 schema.prisma 不许分家',
       expect([...(mirror ?? [])].sort()).toEqual(Object.values(prismaEnum).sort());
     });
   }
+
+  // 镜像还导出了与 Prisma 同名同形的值对象（{ KEY: 'KEY' }），让 `OrderStatus.CANCELLED`
+  // 这种值引用能从契约包直接搬过来。形状不一致就不是 drop-in 了，一并对账。
+  it('值对象与 Prisma 生成的对象逐键相等（drop-in 不能只是像）', () => {
+    const asRecord = Mirrors as unknown as Record<string, unknown>;
+    for (const [name, prismaEnum] of Object.entries(prismaEnums)) {
+      expect(asRecord[name], `${name} 缺少同名值对象`).toEqual(prismaEnum);
+    }
+  });
 
   it('镜像里没有重复值（复制粘贴时手抖）', () => {
     for (const [name, values] of Object.entries(PRISMA_ENUM_MIRRORS)) {
