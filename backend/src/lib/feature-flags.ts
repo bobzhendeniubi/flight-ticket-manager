@@ -40,6 +40,13 @@ export const FEATURE_FLAGS = {
     label: '顶栏铃铛全覆盖 —— 除撤名单/退票三类工单外，铃铛再统计所有紧急/高优先级的规则提醒',
     defaultEnabled: false,
   },
+  AGENT_CHANGE_REQUEST_EXTRA_KINDS: {
+    key: 'feature.AGENT_CHANGE_REQUEST_EXTRA_KINDS',
+    label:
+      '改单申请扩三类 —— 合作方可申请「拆单 / 取消单程 / 改自备签」，运营确认后由系统调既有通道执行。' +
+      '关着时这三类无论谁提交都拒绝，合作方端也不出现这三个入口',
+    defaultEnabled: false,
+  },
 } as const satisfies Record<string, FeatureFlagDef>;
 
 export type FeatureFlagKey = keyof typeof FEATURE_FLAGS;

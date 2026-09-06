@@ -22,7 +22,7 @@ beforeEach(() => {
 });
 
 describe('feature-flags · 注册表', () => {
-  it('三个 flag 全部默认 false', () => {
+  it('全部 flag 默认 false（上线当天一律关着，口径确认后再手动开）', () => {
     for (const def of Object.values(FEATURE_FLAGS)) {
       expect(def.defaultEnabled).toBe(false);
     }
@@ -36,6 +36,7 @@ describe('feature-flags · 注册表', () => {
 
   it('isFeatureFlagKey 只认注册表里的键', () => {
     expect(isFeatureFlagKey('REMINDER_AUTO_GENERATE')).toBe(true);
+    expect(isFeatureFlagKey('AGENT_CHANGE_REQUEST_EXTRA_KINDS')).toBe(true);
     expect(isFeatureFlagKey('NOT_A_REAL_FLAG')).toBe(false);
   });
 });
@@ -114,13 +115,11 @@ describe('isFeatureEnabled · 60 秒进程内缓存', () => {
 });
 
 describe('listFeatureFlags', () => {
-  it('返回全部三个 flag 的当前状态', async () => {
+  it('返回注册表里全部 flag 的当前状态', async () => {
     const db = client({ value: 'true' });
     const views = await listFeatureFlags(db as never);
-    expect(views).toHaveLength(3);
+    expect(views).toHaveLength(Object.keys(FEATURE_FLAGS).length);
     expect(views.every((v) => v.enabled === true)).toBe(true);
-    expect(views.map((v) => v.key).sort()).toEqual(
-      ['REMINDER_AUTO_GENERATE', 'REMINDER_BELL_ALL', 'REMINDER_WEBHOOK_PUSH'].sort(),
-    );
+    expect(views.map((v) => v.key).sort()).toEqual(Object.keys(FEATURE_FLAGS).sort());
   });
 });
