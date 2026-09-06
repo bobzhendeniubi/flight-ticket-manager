@@ -7,6 +7,7 @@ import { RefundBadge } from '../components/RefundBadge';
 import { TrustBadges } from '../components/TrustBadges';
 import { localYmd } from '../lib/airports';
 import { formatDateTimeCn } from '../lib/datetime';
+import { bundleLineTotal, useRetailDiscountByItemId } from '../lib/bundleLineTotal';
 
 /** 购物车条目按 kind 映射统一线性图标（取代存储的 emoji 渲染；不改 store 里的 emoji 字段） */
 const CART_KIND_ICON: Record<CartItem['kind'], IconName> = {
@@ -34,7 +35,13 @@ export function CartPage() {
 
   // 只结算勾选的产品（代理可挑着付，剩下的留在车里）
   const selectedItems = useMemo(() => items.filter(isSelected), [items]);
-  const selectedTotal = selectedItems.reduce((sum, i) => sum + (Number(i.unitPrice) * Number(i.qty) || 0), 0);
+  // F-9：套餐行改用与结算页相同的算法（按当前散客优惠费率重算），
+  // 不再用加购那一刻的 unitPrice 快照，避免「加购物车→结账」之间总价无声变化。
+  const retailDiscountByItemId = useRetailDiscountByItemId(items);
+  const selectedTotal = selectedItems.reduce(
+    (sum, i) => sum + bundleLineTotal(i, retailDiscountByItemId[i.id]),
+    0,
+  );
   const selectedCount = selectedItems.reduce((s, i) => s + (Number(i.qty) || 0), 0);
   const allSelected = items.length > 0 && selectedItems.length === items.length;
 
@@ -156,7 +163,9 @@ export function CartPage() {
                   </div>
                   <div className="min-w-[80px] text-right sm:w-24">
                     <div className="hidden text-xs text-ink-muted sm:block">¥{fmt(i.unitPrice)}</div>
-                    <div className="price text-sm sm:text-base">¥{fmt(i.unitPrice * i.qty)}</div>
+                    <div className="price text-sm sm:text-base">
+                      ¥{fmt(bundleLineTotal(i, retailDiscountByItemId[i.id]))}
+                    </div>
                   </div>
                   <button
                     className="flex h-8 flex-shrink-0 items-center rounded-lg border border-slate-200 px-2.5 text-xs font-medium whitespace-nowrap text-ink-soft transition hover:border-deal/50 hover:bg-deal-light hover:text-deal sm:py-1.5"

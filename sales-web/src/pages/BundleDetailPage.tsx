@@ -129,51 +129,6 @@ function legLine(r: FlightSearchResult | null | undefined, dateISO: string): str
   return `${r.flightNumber} · ${formatMonthDay(dateISO)} ${formatLocalTime(r.departureTime, r.departureTz)} → ${formatLocalTime(r.arrivalTime, r.arrivalTz)}`;
 }
 
-// ── 评论 make-up：API 无真实评价时的兜底样本（公测期不显得冷清）────────
-// 真实 API 有数据则优先用真实数据；为零时回退到这批拟造样本（标注"实拍体验"语气）。
-const MADE_UP_REVIEWS: ReviewItem[] = [
-  {
-    id: 'mk-1', rating: 5, title: '省心，全程不用自己操心',
-    body: '机票酒店签证接送一次搞定，落地就有车接，中文客服回复很快。岘港海边的酒店含双早，房间能看到海，性价比很高，下次还来。',
-    authorName: '林女士', verified: true, tripType: '情侣出游', createdAt: addDaysISO(todayISO(0), -6) + 'T08:00:00Z',
-    reply: '谢谢您的认可！期待下次再为您安排海岛行程~',
-  },
-  {
-    id: 'mk-2', rating: 5, title: '带爸妈出行的首选',
-    body: '老人不会英文，有接送和中文客服完全没压力。出票很快，行程单清楚。酒店升级了海景房，前台沟通顺畅。',
-    authorName: '陈先生', verified: true, tripType: '家庭亲子', createdAt: addDaysISO(todayISO(0), -13) + 'T10:30:00Z',
-  },
-  {
-    id: 'mk-3', rating: 4, title: '整体很好，签证稍微等了两天',
-    body: '签证比预计多等了一天，提前预订就没问题。机票时刻不错，回程是下午的航班，不用赶早。酒店早餐种类丰富。',
-    authorName: '王先生', verified: true, tripType: '朋友结伴', createdAt: addDaysISO(todayISO(0), -21) + 'T14:00:00Z',
-  },
-  {
-    id: 'mk-4', rating: 5, title: '第二次回购了',
-    body: '上次去过一次这条线，这次直接复购。价格透明，没有隐形消费，接送师傅很准时。值得推荐给身边朋友。',
-    authorName: '赵女士', verified: true, tripType: '蜜月', createdAt: addDaysISO(todayISO(0), -34) + 'T09:15:00Z',
-    reply: '老朋友啦！感谢一路信任，已为您备注偏好~',
-  },
-  {
-    id: 'mk-5', rating: 5, title: '一价全含真的香',
-    body: '比自己分开订划算不少，关键是省事。客服全程跟进，出行前还发了值机提醒。岘港天气好，玩得很开心。',
-    authorName: '刘先生', verified: true, tripType: '商务差旅', createdAt: addDaysISO(todayISO(0), -48) + 'T16:40:00Z',
-  },
-  {
-    id: 'mk-6', rating: 4, title: '体验不错，建议多备几套房型',
-    body: '房型选择如果再多一点就更好了。其余都很满意，接送和早餐都到位，整体超出预期。',
-    authorName: '周女士', verified: true, tripType: '朋友结伴', createdAt: addDaysISO(todayISO(0), -60) + 'T11:20:00Z',
-  },
-];
-
-const MADE_UP_SUMMARY = (() => {
-  const dist: Record<'5' | '4' | '3' | '2' | '1', number> = { '5': 0, '4': 0, '3': 0, '2': 0, '1': 0 };
-  for (const r of MADE_UP_REVIEWS) dist[String(r.rating) as '5' | '4' | '3' | '2' | '1'] += 1;
-  const count = MADE_UP_REVIEWS.length;
-  const average = count ? MADE_UP_REVIEWS.reduce((s, r) => s + r.rating, 0) / count : 0;
-  return { average, count, distribution: dist };
-})();
-
 /** API Review → ReviewList 的 ReviewItem（reply: null → undefined）。 */
 function toReviewItem(r: Review): ReviewItem {
   return {
@@ -549,16 +504,11 @@ function BundleDetailContent({
   const soldCount = b.soldCount ?? 0;
   const showScarcity = !soldOut && soldCount >= SOLD_RECENTLY_THRESHOLD;
 
-  // 评价：API 优先；为零回退到 make-up 样本（公测期）
+  // 评价：只展示真实数据，为零时走诚实的空状态（F-2：不再拿虚构评价充数）
   const reviews = useReviews(b.id);
-  const usingMadeUp = reviews.status === 'ready' && reviews.total === 0;
-  const reviewItems = usingMadeUp
-    ? MADE_UP_REVIEWS.slice(0, reviews.shownMadeUp)
-    : reviews.items.map(toReviewItem);
-  const summary = usingMadeUp ? MADE_UP_SUMMARY : reviews.summary;
-  const canLoadMore = usingMadeUp
-    ? reviews.shownMadeUp < MADE_UP_REVIEWS.length
-    : reviews.items.length < reviews.total;
+  const reviewItems = reviews.items.map(toReviewItem);
+  const summary = reviews.summary;
+  const canLoadMore = reviews.items.length < reviews.total;
 
   // Product JSON-LD（结构化数据，利于搜索/分享）
   const jsonLd = useMemo(() => {
@@ -577,18 +527,18 @@ function BundleDetailContent({
         url: typeof window !== 'undefined' ? window.location.href : `/bundles/${b.id}`,
       },
     };
-    const agg = usingMadeUp ? MADE_UP_SUMMARY : rating;
-    if (agg && agg.count > 0) {
+    // F-2：JSON-LD 只在有真实评价时输出 aggregateRating，不再用虚构样本喂 SEO
+    if (rating && rating.count > 0) {
       ld.aggregateRating = {
         '@type': 'AggregateRating',
-        ratingValue: Number(agg.average.toFixed(1)),
-        reviewCount: agg.count,
+        ratingValue: Number(rating.average.toFixed(1)),
+        reviewCount: rating.count,
         bestRating: 5,
         worstRating: 1,
       };
     }
     return ld;
-  }, [b, total, soldOut, rating, usingMadeUp]);
+  }, [b, total, soldOut, rating]);
 
   return (
     <main className="mx-auto w-full max-w-5xl px-4 pb-28 pt-4 md:pb-10">
@@ -607,13 +557,8 @@ function BundleDetailContent({
         <h1 className="text-2xl font-extrabold tracking-tight text-ink md:text-3xl">{b.name}</h1>
         {b.tagline && <p className="mt-1.5 text-sm text-ink-soft md:text-base">{b.tagline}</p>}
         <div className="mt-2.5 flex flex-wrap items-center gap-x-3 gap-y-1.5 text-xs">
-          {(rating ?? (usingMadeUp ? MADE_UP_SUMMARY : null)) && (
-            <StarRating
-              value={(rating ?? MADE_UP_SUMMARY).average}
-              size="sm"
-              showValue
-              count={(rating ?? MADE_UP_SUMMARY).count}
-            />
+          {rating && (
+            <StarRating value={rating.average} size="sm" showValue count={rating.count} />
           )}
           {soldCount > 0 && <span className="text-ink-muted">已售 {soldCount.toLocaleString()}</span>}
           {showScarcity && <ScarcityBadge kind="soldRecently" text="近期热订" />}
@@ -745,7 +690,7 @@ function BundleDetailContent({
                       type="button"
                       className="btn-secondary text-sm"
                       disabled={reviews.loadingMore}
-                      onClick={() => (usingMadeUp ? reviews.showMoreMadeUp() : reviews.loadMore())}
+                      onClick={() => reviews.loadMore()}
                     >
                       {reviews.loadingMore ? '加载中…' : '加载更多评价'}
                     </button>
@@ -963,7 +908,8 @@ function BundleDetailContent({
                   <div className="flex min-w-0 items-center gap-2">
                     <span className="rounded bg-indigo-100 px-1.5 py-0.5 font-medium text-indigo-700">升级</span>
                     <span className="truncate text-slate-700">
-                      {isSolo ? '独住 · 单房差' : `单人入住 ×${singleCount}`}
+                      {/* F-8：买家口径统一用「单人入住」，别再冒出商家内部术语「单房差」 */}
+                      {isSolo ? '独住 · 单人入住' : `单人入住 ×${singleCount}`}
                     </span>
                   </div>
                   <span className="nums whitespace-nowrap text-slate-600">+¥{singleAddOn.toLocaleString()}</span>
@@ -1087,15 +1033,12 @@ function useReviews(bundleId: string) {
   const [status, setStatus] = useState<'loading' | 'ready' | 'error'>('loading');
   const [loadingMore, setLoadingMore] = useState(false);
   const [reloadKey, setReloadKey] = useState(0);
-  // make-up 样本当前展示条数（API 为零时启用）
-  const [shownMadeUp, setShownMadeUp] = useState(REVIEW_PAGE_SIZE);
 
   useEffect(() => {
     let cancelled = false;
     setStatus('loading');
     setItems([]);
     setPage(1);
-    setShownMadeUp(REVIEW_PAGE_SIZE);
     api
       .listReviews({ productType: 'BUNDLE', productId: bundleId, page: 1, limit: REVIEW_PAGE_SIZE })
       .then((r) => {
@@ -1126,10 +1069,9 @@ function useReviews(bundleId: string) {
       .finally(() => setLoadingMore(false));
   };
 
-  const showMoreMadeUp = () => setShownMadeUp((n) => Math.min(MADE_UP_REVIEWS.length, n + REVIEW_PAGE_SIZE));
   const reload = () => setReloadKey((k) => k + 1);
 
-  return { items, total, summary, status, loadingMore, loadMore, reload, shownMadeUp, showMoreMadeUp };
+  return { items, total, summary, status, loadingMore, loadMore, reload };
 }
 
 // ── 小组件 ───────────────────────────────────────────────────────

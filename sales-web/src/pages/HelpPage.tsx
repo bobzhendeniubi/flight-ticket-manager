@@ -1,5 +1,5 @@
-import { useMemo, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useEffect, useMemo, useState } from 'react';
+import { Link, useLocation } from 'react-router-dom';
 import { Seo } from '../components/Seo';
 import { Breadcrumb } from '../components/Breadcrumb';
 import { EmptyState } from '../components/EmptyState';
@@ -167,6 +167,54 @@ const FAQ_GROUPS: FaqGroup[] = [
       },
     ],
   },
+  // F-7：页脚「服务条款」「隐私政策」链接的落地锚点——只写系统里已有的真实规则
+  // （下单页/退改政策原文一致），不新增、不编造任何法律条款或公司资质。
+  {
+    id: 'terms',
+    title: '服务条款',
+    icon: 'info',
+    faqs: [
+      {
+        q: '套餐 / 订单是怎么计价、确认的？',
+        a: '海岛套餐为机票 + 酒店 + 签证 + 地面服务整体打包销售；提交订单时系统会重新核算并锁定金额，之后不受库存价格波动影响。机票、酒店、签证、地面服务任一单项自愿放弃使用，均不退差价。',
+      },
+      {
+        q: '取消 / 改期怎么算，扣损标准是什么？',
+        a: '按「常见问题 · 退改」列出的标准执行：① 起飞前几天被打包出境（需提供打包证明）且仍在销售期内，扣损 ¥500/人，其余费用退回；② 起飞当天 12:00 之前（或起飞前一天 12:00 以后）被打包或被告知黑名单，扣损 ¥800/人，其余退回；③ 起飞当天 12:00 之后被打包的，损失由客人自行承担。如遇航班取消、大面积延误等不可抗力，我们协助免费改期或按未发生费用退款。',
+      },
+      {
+        q: '出行人资料填写有什么要求？',
+        a: '请确保出行人姓名与护照完全一致，护照有效期需距回程日期 6 个月以上；资料填写错误可能导致无法出票或无法出入境，由此产生的影响需由填写方承担。',
+      },
+      {
+        q: '恶意占位 / 提交虚假资料会怎样？',
+        a: '恶意占位、提交虚假资料或多次下单不付款的账号将被列入黑名单，并按规则追收已产生的损失。',
+      },
+    ],
+  },
+  {
+    id: 'privacy',
+    title: '隐私政策',
+    icon: 'user',
+    faqs: [
+      {
+        q: '下单会收集我的哪些信息？',
+        a: '下单需要出行人姓名、护照号、出生日期、国籍、联系电话；含机票 / 套餐 / 签证的订单需额外填写护照有效期，可选上传护照照片用于自动识别辅助填表。这些信息随订单一起提交给我们处理。',
+      },
+      {
+        q: '这些资料用来做什么？',
+        a: '仅用于处理本次预订相关的出票、酒店入住、签证代办、行程确认与客服跟进，不用于本单以外的用途。',
+      },
+      {
+        q: '资料存放在哪里、谁能看到？',
+        a: '资料随订单保存在我们的系统里，仅由处理你这笔订单的客服 / 签证岗等经办人员在核实与办理时查阅；上传的护照照片会先压缩再随订单一起提交存档，不作其他用途。',
+      },
+      {
+        q: '想查询、更正或要求删除我的资料，怎么联系？',
+        a: '请通过下方「联系我们」提供订单号，客服会协助查询、更正或处理你的资料请求。',
+      },
+    ],
+  },
 ];
 
 /** 大小写不敏感的简单匹配（问题或答案命中即保留）。 */
@@ -178,6 +226,17 @@ function matchFaq(faq: Faq, kw: string): boolean {
 
 export default function HelpPage() {
   const [query, setQuery] = useState('');
+  const location = useLocation();
+
+  // F-7：从页脚「服务条款/隐私政策」等外部入口带 #help-xxx 跳过来时，React Router
+  // 的客户端跳转不会像整页加载那样自动滚到锚点，这里手动补一次（等分组渲染完再滚，
+  // 避免元素还没挂载时 scrollIntoView 找不到目标）。
+  useEffect(() => {
+    if (!location.hash) return;
+    const id = location.hash.slice(1);
+    const el = document.getElementById(id);
+    el?.scrollIntoView({ block: 'start' });
+  }, [location.hash]);
 
   // 按搜索词过滤每组的 FAQ；组内无命中则整组隐藏
   const filteredGroups = useMemo(() => {

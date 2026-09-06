@@ -48,7 +48,13 @@ export function Seo({ title, description, image, canonicalPath, jsonLd }: SeoPro
 
       {canonical && <link rel="canonical" href={canonical} />}
 
-      {jsonLd && <script type="application/ld+json">{JSON.stringify(jsonLd)}</script>}
+      {/* F-12：运营后台可编辑文本（酒店亮点/套餐 tagline 等）字面出现 "</script>" 会提前截断标签，
+          把 "<" 转成 "<" 是标准 JSON-LD 防护写法，不影响 JSON.parse 结果 */}
+      {jsonLd && (
+        <script type="application/ld+json">
+          {JSON.stringify(jsonLd).replace(/</g, '\\u003c')}
+        </script>
+      )}
     </Helmet>
   );
 }

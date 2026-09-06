@@ -1061,13 +1061,13 @@ function ConfigurableBundleCard({
             <span className="text-slate-600 tabular-nums whitespace-nowrap">+¥{infantPriceTotal.toLocaleString()}</span>
           </div>
         )}
-        {/* 升级 add-on 明细行（选了才显示）；单人预订独住时显示为「独住·单房差」 */}
+        {/* 升级 add-on 明细行（选了才显示）；F-8：买家口径统一用「单人入住」，单人预订独住时显示为「独住·单人入住」 */}
         {singleCount > 0 && (
           <div className="flex items-center justify-between text-xs">
             <div className="flex items-center gap-2 min-w-0">
               <span className="rounded bg-indigo-100 px-1.5 py-0.5 font-medium text-indigo-700">升级</span>
               <span className="text-slate-700 truncate">
-                {isSolo ? '独住 · 单房差' : `单人入住 ×${singleCount}`}
+                {isSolo ? '独住 · 单人入住' : `单人入住 ×${singleCount}`}
               </span>
             </div>
             <span className="text-slate-600 tabular-nums whitespace-nowrap">+¥{singleAddOn.toLocaleString()}</span>

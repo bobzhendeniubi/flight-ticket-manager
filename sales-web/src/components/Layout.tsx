@@ -482,9 +482,9 @@ function LanguageSwitch({ className }: { className?: string }) {
 function SiteFooter() {
   const year = new Date().getFullYear();
 
-  // 占位公司信息：真实主体名称与 ICP 备案号待法务/运营补全 —— 这里明确标注 placeholder。
   const COMPANY_NAME = '椰岛假期'; // 页脚展示品牌名（公司主体名称按要求不对外展示）
-  const ICP = 'ICP 备案号：待补（placeholder）';
+  // F-7：真实 ICP 备案号还没有 —— 未配置就不渲染这一行，绝不留"待补"占位文字给生产站访客/监管抽查看到。
+  const icpNumber = import.meta.env.VITE_ICP_NUMBER?.trim();
 
   const columns: Array<{
     title: string;
@@ -595,16 +595,20 @@ function SiteFooter() {
           </nav>
         </div>
 
-        {/* 底部法律行 — 公司名称占位 + ICP 占位 + © */}
+        {/* 底部法律行 — © + （有备案号才显示）ICP + 服务条款/隐私政策 */}
         <div className="mt-10 flex flex-col gap-2 border-t border-slate-200/70 pt-6 text-xs text-ink-muted sm:flex-row sm:items-center sm:justify-between">
           <span>
             © {year} {COMPANY_NAME} · 保留所有权利
           </span>
           <span className="flex flex-wrap items-center gap-x-3 gap-y-1">
-            <span>{ICP}</span>
-            <span aria-hidden className="hidden sm:inline text-ink/20">·</span>
-            <Link to="/help" className="transition-colors hover:text-brand-700">服务条款（待补）</Link>
-            <Link to="/help" className="transition-colors hover:text-brand-700">隐私政策（待补）</Link>
+            {icpNumber && (
+              <>
+                <span>ICP 备案号：{icpNumber}</span>
+                <span aria-hidden className="hidden sm:inline text-ink/20">·</span>
+              </>
+            )}
+            <Link to="/help#help-terms" className="transition-colors hover:text-brand-700">服务条款</Link>
+            <Link to="/help#help-privacy" className="transition-colors hover:text-brand-700">隐私政策</Link>
           </span>
         </div>
       </div>
