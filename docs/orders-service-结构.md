@@ -96,6 +96,8 @@ const audit = await runOrderMutation<CancelLegAudit>(
 3. **锁内幂等复查**：`find(tx)` 命中 → 回放（并发同 token 双击，后到者在锁内命中）。`fastPath: false` 的动作只做这一次（留痕在航段行 metadata 上，必须读锁后的行才作数）。
 4. **body → 守恒 → 提交 → 钩子**：`conserve` 声明了就在 body 前后各读一次账本快照（`order-ledger.snapshotOrderLedger`），点名维度 Σ 不等或账本恒等式**新**出现不平 → 抛错 → 整事务回滚；提交后按注册顺序 `await` 钩子。
 
+5. **按人份额落库**（`persistShares: true`，审查根因 R1，2026-09-06）：守恒通过后对主单 + `conserve.orderIds` + `ctx.track()` 的每张单调 `service/passenger-shares.persistPassengerShares`（每位在单乘客一行 upsert，Σ 份额对不上应收同样回滚）。七条已接路径全部开了；未接内核的改钱路径在各自事务末尾直接调同一个写点。业务口径见 `docs/系统逻辑全解.md` §4a。
+
 内核**不替动作自动写审计**（路由层与各动作已有各自约定，重复写会让财务对账多一条），也**不能嵌套**：body 里不能再调会自己开 `prisma.$transaction` 的方法（Prisma 交互式事务不可嵌套，内层拿全局 client 另开连接会撞上外层刚拿的行锁）。两段式编排用 `runOrderOrchestration`（无事务、无锁，只统一幂等快路径与「全部段落提交后」的钩子）。
 
 ### 守恒口径（`service/order-ledger.ts`，全部复用既有函数）
