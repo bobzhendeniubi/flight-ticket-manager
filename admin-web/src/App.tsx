@@ -31,6 +31,7 @@ import { NoShowReportPage } from './pages/NoShowReportPage';
 import { ReportsPage } from './pages/ReportsPage';
 import { FulfillmentBoardPage } from './pages/FulfillmentBoardPage';
 import { MarketingPage } from './pages/MarketingPage';
+import { ExportCenterPage } from './pages/ExportCenterPage';
 import { LegacyArchivePage } from './pages/LegacyArchivePage';
 import { useAuth } from './stores/auth';
 import { isAccessTokenFresh } from './lib/token';
@@ -45,6 +46,9 @@ const AGENT_ALLOWED_PATHS = new Set([
   '/agents',
   '/settlements',
   '/agent-balance',
+  // 导出中心对代理开放：页面内部只列代理能用的三张表（三模板/全岗总表/进单统计），
+  // 且这三张服务端都强制裁列 + 圈到自己与下级代理的订单。
+  '/exports',
 ]);
 
 function Protected({
@@ -342,6 +346,16 @@ export function App() {
           element={
             <Protected adminOnly>
               <MarketingPage />
+            </Protected>
+          }
+        />
+        {/* 导出中心：全角色可进（含代理），页面内部按角色只列本人能用的导出；
+            真正的权限闸在后端，前端只做导航 UX。 */}
+        <Route
+          path="/exports"
+          element={
+            <Protected>
+              <ExportCenterPage />
             </Protected>
           }
         />
