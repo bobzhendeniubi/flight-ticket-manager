@@ -12348,7 +12348,7 @@ function PassengerEditForm({
     : null;
 
   return (
-    <div className="space-y-2 text-xs">
+    <div className="space-y-2 text-xs" data-testid="passenger-edit-form">
       <div className="font-medium text-brand">{mode === 'CORRECTION' ? '改信息' : '换人'} · {passenger.fullName}</div>
 
       {/* 护照 OCR：上传照片自动识别并预填下方字段（与录单同款，AI 优先、本地兜底）。用户可改后提交。 */}
