@@ -1,8 +1,8 @@
 /**
- * lib/exportCatalog · 导出中心目录的角色过滤 / 分组 / 最近导出记录回归。
+ * lib/exportCatalog · 导出中心目录的能力过滤 / 分组 / 最近导出记录回归。
  *
  * 这三件事是导出中心唯一有判断的部分（页面其余是控件与下载动作，靠 build 闸兜）：
- *   · 角色过滤漂了 → 代理会在导出中心看到禁代理的导出入口（点了才被后端 403，白跑一趟）；
+ *   · 能力过滤漂了 → 代理会在导出中心看到禁代理的导出入口（点了才被后端 403，白跑一趟）；
  *   · 分组漏了空组过滤 → 代理页面出现 6 个空标题；
  *   · 最近导出解析不设防 → localStorage 被改坏（或换了结构）整页崩。
  */
@@ -19,13 +19,24 @@ import {
   type ExportEntry,
   type RecentExport,
 } from './exportCatalog';
+import type { Capability } from './capabilities';
 
-const ADMIN = { role: 'ADMIN' } as const;
-const STAFF = { role: 'STAFF' } as const;
-const FINANCE_STAFF = { role: 'STAFF', staffRole: 'FINANCE' } as const;
-const TICKETING_STAFF = { role: 'STAFF', staffRole: 'TICKETING' } as const;
-const AGENT = { role: 'AGENT' } as const;
-const CUSTOMER = { role: 'CUSTOMER' } as const;
+/**
+ * 各身份持有的**导出相关**能力，抄自后端能力表（backend/src/lib/capabilities.ts）：
+ *   orders.export.shared —— 运营 + 代理；orders.export.ops —— 仅运营；finances.view —— 管理员或财务岗。
+ * 「角色 → 能力」那一层由后端的能力矩阵与前后端镜像测试钉住，这里只管「能力 → 看得见哪几条」。
+ */
+function viewer(...caps: Capability[]) {
+  const held = new Set<Capability>(caps);
+  return { can: (cap: Capability) => held.has(cap) };
+}
+
+const ADMIN = viewer('orders.export.shared', 'orders.export.ops', 'finances.view');
+const STAFF = viewer('orders.export.shared', 'orders.export.ops');
+const FINANCE_STAFF = viewer('orders.export.shared', 'orders.export.ops', 'finances.view');
+const TICKETING_STAFF = viewer('orders.export.shared', 'orders.export.ops');
+const AGENT = viewer('orders.export.shared');
+const CUSTOMER = viewer();
 
 function entryById(id: string): ExportEntry {
   const found = EXPORT_ENTRIES.find((e) => e.id === id);
@@ -90,7 +101,7 @@ describe('canAccessExport', () => {
     expect(canAccessExport(financeOnly, ADMIN)).toBe(true);
     expect(canAccessExport(financeOnly, FINANCE_STAFF)).toBe(true);
     expect(canAccessExport(financeOnly, TICKETING_STAFF)).toBe(false);
-    // staffRole 还没从 /users/me 回来时按「不是财务岗」处理：少给入口，不谎报权限
+    // 能力清单还没从 /users/me 回来时 can() 一律 false：少给入口，不谎报权限
     expect(canAccessExport(financeOnly, STAFF)).toBe(false);
     expect(canAccessExport(financeOnly, AGENT)).toBe(false);
   });

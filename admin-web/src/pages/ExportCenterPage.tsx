@@ -25,6 +25,7 @@ import {
   type RecentExport,
 } from '../lib/exportCatalog';
 import { useAuth } from '../stores/auth';
+import { useCapabilities } from '../hooks/useCapabilities';
 import { Icon } from '../components/Icon';
 import {
   EXPORT_TEMPLATE_LABEL,
@@ -52,10 +53,11 @@ function shiftDays(n: number): string {
 export function ExportCenterPage() {
   const user = useAuth((s) => s.user);
   const token = useAuth((s) => s.tokens?.accessToken) ?? '';
+  const { can } = useCapabilities();
 
   const groups = useMemo(
-    () => (user ? groupExportEntries({ role: user.role, staffRole: user.staffRole }) : []),
-    [user],
+    () => groupExportEntries({ can }),
+    [can],
   );
   const isAgent = user?.role === 'AGENT';
   const needsSchedules = useMemo(

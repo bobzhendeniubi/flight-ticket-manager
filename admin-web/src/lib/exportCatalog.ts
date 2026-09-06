@@ -1,5 +1,5 @@
 /**
- * 导出中心 · 目录数据 + 角色过滤（纯函数，无 React / 无 DOM）
+ * 导出中心 · 目录数据 + 能力过滤（纯函数，无 React / 无 DOM）
  *
  * 背景：全系统 18 个 xlsx/zip 导出端点散在订单 / 航班 / 房控 / 签证台 / 财务 / 收款六个模块里，
  * 运营要记 18 个入口，「功能早有只是没找到」是反馈里的常客。本文件把这 18 个导出集中登记成
@@ -11,7 +11,7 @@
  *   · 本目录只描述「有哪些导出、谁能看见」，不发请求 —— 真正调 api.ts 的是 ExportCenterPage。
  *   · 各页原有的导出按钮**一个都不删**：这里是第二入口（能一次看全），不是唯一入口。
  */
-import type { StaffRole, UserRole } from './api';
+import type { Capability } from './capabilities';
 
 // ── 岗位分组 ──────────────────────────────────────────────────────────
 export type ExportGroupKey =
@@ -291,36 +291,32 @@ export const EXPORT_ENTRIES: ExportEntry[] = [
   },
 ];
 
-// ── 角色过滤 ──────────────────────────────────────────────────────────
+// ── 能力过滤 ──────────────────────────────────────────────────────────
+/**
+ * 三档访问级别各自对应的能力（见 backend/src/lib/capabilities.ts）。
+ * 这里不再自己拼 role/staffRole —— 谁持有哪条能力由后端算好随 /users/me 下发，
+ * 与后端各导出端点挂的 requireCapability 是同一张表。
+ */
+const ACCESS_CAPABILITY: Record<ExportAccess, Capability> = {
+  staffAndAgent: 'orders.export.shared',
+  staff: 'orders.export.ops',
+  finance: 'finances.view',
+};
+
 export interface ExportViewer {
-  role: UserRole;
-  /** STAFF 的岗位；null / undefined = 通用运营岗。 */
-  staffRole?: StaffRole | null;
+  /** 能力判定，来自 hooks/useCapabilities 的 can。 */
+  can: (cap: Capability) => boolean;
 }
 
 /**
- * 该角色能不能看到这条导出。
+ * 当前身份能不能看到这条导出。
  *
  * 与后端 RBAC 的关系：这里只做导航 UX（少给一个入口，不等于放行），真正的闸在后端
- * requireRole / requireFinance / resolveExportAgentScope。宁可前端少给，不可前端多给。
- * CUSTOMER 不进后台，一律 false。
+ * requireCapability / resolveExportAgentScope。宁可前端少给，不可前端多给 ——
+ * 能力清单还没从 /users/me 回来时 can() 一律 false，这一格会在清单回来后自己出现。
  */
 export function canAccessExport(entry: ExportEntry, viewer: ExportViewer): boolean {
-  const { role, staffRole } = viewer;
-  if (role === 'CUSTOMER') return false;
-  switch (entry.access) {
-    case 'staffAndAgent':
-      return role === 'ADMIN' || role === 'STAFF' || role === 'AGENT';
-    case 'staff':
-      return role === 'ADMIN' || role === 'STAFF';
-    case 'finance':
-      // 与侧栏 financeRole 同口径：ADMIN，或 STAFF 且岗位是财务。
-      // 登录瞬间 staffRole 还没回来（undefined）时按「不是财务岗」处理 —— 少给入口不伤人，
-      // /users/me 回来后这一格自己会出现。
-      return role === 'ADMIN' || (role === 'STAFF' && staffRole === 'FINANCE');
-    default:
-      return false;
-  }
+  return viewer.can(ACCESS_CAPABILITY[entry.access]);
 }
 
 export function visibleExportEntries(viewer: ExportViewer, entries = EXPORT_ENTRIES): ExportEntry[] {
