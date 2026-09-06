@@ -7,9 +7,9 @@
  *   订单归属；游客需 orderNumber+phone 与订单匹配。缺省 productType/productId 时
  *   对订单里所有可评产品各建一条。
  */
-import { OrderItemKind, ProductReviewType, type Prisma } from '@prisma/client';
+import { OrderItemKind, OrderStatus, Prisma, ProductReviewType } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
-import { BadRequestError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
+import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import { maskFamilyName } from '../orders/orders.service.js';
 import type { CreateOrderReviewBody, ListReviewsQuery } from './reviews.schemas.js';
 
@@ -23,6 +23,19 @@ export interface ProductRatingAggregate {
   average: number;
   count: number;
 }
+
+/**
+ * 能评价的订单状态 = 已成行。
+ *
+ * 「verified:true」的分量全靠这道闸：不卡状态的话，建一张待支付单就能给任意产品刷已验证好评/差评。
+ * 取 ALLOWED_TRANSITIONS 里出票之后的三个状态：出票完成 / 已完成 / 已改期（改期后仍会飞）。
+ * 出票前（草稿/待支付/已支付/处理中）没消费过，取消/退款/支付超时/出票失败则根本没成行。
+ */
+const REVIEWABLE_STATUSES: OrderStatus[] = [
+  OrderStatus.TICKETED,
+  OrderStatus.COMPLETED,
+  OrderStatus.CHANGED,
+];
 
 // OrderItemKind → ProductReviewType（仅可评产品；FEE/DISCOUNT/INSURANCE 等不可评）
 const ITEM_KIND_TO_REVIEW_TYPE: Partial<Record<OrderItemKind, ProductReviewType>> = {
@@ -122,7 +135,12 @@ export class ReviewsService {
       where: { id: orderId },
       include: { items: true },
     });
-    if (!order) throw new NotFoundError('订单不存在');
+    if (!order || order.deletedAt) throw new NotFoundError('订单不存在');
+
+    // 状态门槛：没成行的单不能评价（含回收站单，上一行已拦）
+    if (!REVIEWABLE_STATUSES.includes(order.status)) {
+      throw new BadRequestError('该订单还没出行完成，暂时不能评价');
+    }
 
     // 权限：登录用户必须是订单本人；游客必须 orderNumber+phone 匹配
     if (auth) {
@@ -149,24 +167,33 @@ export class ReviewsService {
       throw new BadRequestError('该订单没有可评价的产品，或指定的产品不在订单内');
     }
 
-    const created = await prisma.$transaction(
-      targets.map((t) =>
-        prisma.review.create({
-          data: {
-            productType: t.productType,
-            productId: t.productId,
-            rating: body.rating,
-            title: body.title ?? null,
-            body: body.body,
-            authorName,
-            verified: true,
-            tripType: body.tripType ?? null,
-            orderId: order.id,
-          },
-        }),
-      ),
-    );
-    return { created };
+    try {
+      const created = await prisma.$transaction(
+        targets.map((t) =>
+          prisma.review.create({
+            data: {
+              productType: t.productType,
+              productId: t.productId,
+              rating: body.rating,
+              title: body.title ?? null,
+              body: body.body,
+              authorName,
+              verified: true,
+              tripType: body.tripType ?? null,
+              orderId: order.id,
+            },
+          }),
+        ),
+      );
+      return { created };
+    } catch (err) {
+      // (orderId, productType, productId) 唯一索引兜底：同一单同一产品只留一条评价，
+      // 连点提交或换个入口再评都在库这一层被挡住（并发也进不来第二条）。
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
+        throw new ConflictError('该订单已评价过此产品');
+      }
+      throw err;
+    }
   }
 
   /**

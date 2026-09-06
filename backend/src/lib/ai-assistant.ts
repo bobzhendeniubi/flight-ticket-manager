@@ -23,7 +23,8 @@ import { localDateTime } from './flight-time.js';
 const MAX_TOOL_ITERATIONS = 8; // 防止 loop 失控
 
 // ── 系统提示词 ───────────────────────────────────────────────
-const SYSTEM_PROMPT = `你是「世途旅行」的客服 AI 助手，帮客户预订澳门 ⇌ 岘港旅行的全套产品。
+// 前台品牌铁律：对客户露出的只能是「椰岛假期 / Coco Holiday」，法律主体名不进任何客户可见文案。
+const SYSTEM_PROMPT = `你是「椰岛假期」的客服 AI 助手，帮客户预订澳门 ⇌ 岘港旅行的全套产品。
 
 # 你能搜的 5 类产品（都通过 tool 调用，不要凭记忆）
 - ✈️ **机票** — search_flights / get_flight_price（只有 MFM ⇌ DAD 这条线）
@@ -34,7 +35,7 @@ const SYSTEM_PROMPT = `你是「世途旅行」的客服 AI 助手，帮客户�
 
 # 工作流程
 1. 听用户说想要什么（去程日期 / 回程日期 / 人数 / 是否含酒店签证接送 / 是否要套餐）
-2. **【硬规则】机票永远按往返查**——这是世途的主营业务，95% 客户都是来回行程。
+2. **【硬规则】机票永远按往返查**——这是椰岛假期的主营业务，95% 客户都是来回行程。
    - 用户没说"单程"两个字 → 必须按往返做
    - 用户只说了一个日期 → **先反问** "回程哪天回？" 不要直接做单程
    - 用户说了"明天去"（没说回） → **追问** "您计划玩几天？什么时候回？"
@@ -937,6 +938,34 @@ function getClient(): OpenAI | null {
   return _client;
 }
 
+/** 客户端可以原样回传的角色：一轮对话就由这三种组成（assistant 的 tool_calls ↔ tool 结果成对） */
+const REPLAYABLE_ROLES = new Set(['user', 'assistant', 'tool']);
+
+/**
+ * 剥掉客户端历史里不该由客户端提供的消息。
+ *
+ * 本接口匿名可达且历史完全由前端管理，只要放行 role:'system' 就等于把系统提示词的写权
+ * 交给调用方（业务规则、话术边界、工具使用约束会被整条顶掉）。system 与其它非对话角色
+ * （developer / function 等）一律丢弃；user/assistant/tool 的相对顺序原样保留，
+ * 不打断 assistant.tool_calls ↔ role:'tool' 的配对。
+ */
+export function sanitizeChatHistory(history: ChatMessage[]): ChatMessage[] {
+  if (!Array.isArray(history)) return [];
+  return history.filter(
+    (m): m is ChatMessage =>
+      Boolean(m) && typeof m === 'object' && REPLAYABLE_ROLES.has((m as { role?: unknown }).role as string),
+  );
+}
+
+/** 拼一轮要发给模型的 messages：服务端系统提示词永远排第一条，然后是清洗过的历史 + 本轮用户消息。 */
+export function buildTurnMessages(history: ChatMessage[], userMessage: string): ChatMessage[] {
+  return [
+    { role: 'system', content: buildSystemPrompt() },
+    ...sanitizeChatHistory(history),
+    { role: 'user', content: userMessage },
+  ];
+}
+
 /**
  * 跑一轮对话：手动 tool-use loop
  *   1. 把历史 messages + 新用户消息 → OpenAI
@@ -947,18 +976,14 @@ export async function runChatTurn(
   history: ChatMessage[],
   userMessage: string,
 ): Promise<ChatTurnResult> {
+  // 清洗后的历史既进模型，也进 mock 分支回传的 messages —— 不让越权消息在往返里活下来
+  const safeHistory = sanitizeChatHistory(history);
   const client = getClient();
   if (!client) {
-    return mockTurn(history, userMessage);
+    return mockTurn(safeHistory, userMessage);
   }
 
-  // 第一次进对话时把 system 加上；后续 history 已含
-  const hasSystem = history.some((m) => m.role === 'system');
-  const messages: ChatMessage[] = [
-    ...(hasSystem ? [] : [{ role: 'system' as const, content: buildSystemPrompt() }]),
-    ...history,
-    { role: 'user', content: userMessage },
-  ];
+  const messages = buildTurnMessages(safeHistory, userMessage);
 
   let toolCalls = 0;
   let totalPrompt = 0;
@@ -1020,7 +1045,7 @@ export async function runChatTurn(
     // 自动 fallback 到本地智能 mock，让 demo 不中断
     // eslint-disable-next-line no-console
     console.warn('[ai] LLM call failed, falling back to mock:', err instanceof Error ? err.message : String(err));
-    return mockTurn(history, userMessage);
+    return mockTurn(safeHistory, userMessage);
   }
 
   return {

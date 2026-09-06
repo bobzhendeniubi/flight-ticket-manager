@@ -371,7 +371,8 @@ export class PaymentsService {
       paymentId: payment.id,
       orderNumber: order.orderNumber,
       amountYuan: Number(order.total),
-      title: `世途旅行 订单 ${order.orderNumber}`,
+      // 微信支付原生确认页展示这一行 —— 前台品牌只能是「椰岛假期」，法律主体名不露出
+      title: `椰岛假期 订单 ${order.orderNumber}`,
       notifyUrl: `${baseUrl}/payments/webhook/${adapterSlug(body.method)}`,
       returnUrl: body.returnUrl,
     });
@@ -702,7 +703,8 @@ export class PaymentsService {
       assertOrderAcceptsFunds(order);
       // 收款复核锁（准入开关，非金额校验）：财务/出纳复核无误后锁定本单收款，
       // 锁定态下拒绝一切「人工录入」收款（本方法 = 人工确认；批量确认逐单复用本方法，一并受阻）。
-      // 口径边界：此锁只拦人工录入。网关 webhook / 线上支付回调（handleCallback）与对账认款
+      // 口径边界：此锁拦的是 paidAmount 的一切人工变动（人工录入、多付转余额、余额抵扣、转挂账池，
+      // 后三者在 orders.service 里各自判锁）。网关 webhook / 线上支付回调（handleCallback）与对账认款
       // （receipts.allocate → _creditOrderPaymentWithinTx）都不走此路径——真钱已到账必须落库，绝不拦。
       if (order.paymentsLocked) {
         throw new ConflictError('收款已锁定（财务复核完成），请先解锁再录收款');
@@ -1985,7 +1987,8 @@ export class PaymentsService {
       paymentId: payment.id,
       orderNumber: order.orderNumber,
       amountYuan: Number(order.total),
-      title: `世途旅行 订单 ${order.orderNumber}`,
+      // 微信支付原生确认页展示这一行 —— 前台品牌只能是「椰岛假期」，法律主体名不露出
+      title: `椰岛假期 订单 ${order.orderNumber}`,
       notifyUrl: `${baseUrl}/payments/webhook/wechat`,
       openid,
     });

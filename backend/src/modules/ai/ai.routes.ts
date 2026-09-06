@@ -16,10 +16,49 @@ import { runChatTurn, type ChatMessage } from '../../lib/ai-assistant.js';
 // AI 回合按 IP 限流：每分钟最多 10 次真实模型调用/IP（每次可能多轮 tool-use，成本高）。
 const AI_CHAT_RATE_LIMIT = { max: 10, timeWindow: '1 minute' } as const;
 
+// 历史消息长度上限：user/assistant 是人读的文本；tool 是服务端塞回去的工具结果 JSON
+//（一次航班搜索能返回几十个班次），所以两档分开给，宽到不误伤正常往返即可。
+const MAX_TEXT_CHARS = 16_000;
+const MAX_TOOL_RESULT_CHARS = 60_000;
+
+// 客户端能回传的三种角色。system 不在其中：本接口匿名可达，放行 role:'system'
+// 等于把系统提示词的写权交给调用方（业务规则、话术边界会被整条顶掉）——
+// 一律**丢弃**而不是报错：服务端自己注入的 system 也在前端回传的 messages 里，报错会卡死正常的第二轮。
+const REPLAYABLE_ROLES = new Set(['user', 'assistant', 'tool']);
+
+// 形状校验按 role 分别做；passthrough 保留 tool_calls / refusal 等 SDK 自带字段，不破坏往返。
+const historyMessageSchema = z.discriminatedUnion('role', [
+  z.object({ role: z.literal('user'), content: z.string().max(MAX_TEXT_CHARS, '历史消息过长') }).passthrough(),
+  z
+    .object({
+      role: z.literal('assistant'),
+      // 带 tool_calls 的 assistant 消息 content 为 null
+      content: z.string().max(MAX_TEXT_CHARS, '历史消息过长').nullable().optional(),
+    })
+    .passthrough(),
+  z
+    .object({
+      role: z.literal('tool'),
+      content: z.string().max(MAX_TOOL_RESULT_CHARS, '历史消息过长'),
+      tool_call_id: z.string().min(1).max(200),
+    })
+    .passthrough(),
+]);
+
 const chatBodySchema = z.object({
-  // 历史 messages 让前端管理（无服务端 session 状态）
-  // 形状很灵活（user / assistant / tool / system 四种 role），运行时校验由 OpenAI SDK 兜底
-  messages: z.array(z.unknown()).max(40, '对话太长了，请清空重开'),
+  // 历史 messages 让前端管理（无服务端 session 状态）；先按角色白名单裁剪，再逐条校形状
+  messages: z
+    .array(z.unknown())
+    .max(40, '对话太长了，请清空重开')
+    .transform((raw) =>
+      raw.filter(
+        (m) =>
+          Boolean(m) &&
+          typeof m === 'object' &&
+          REPLAYABLE_ROLES.has((m as { role?: unknown }).role as string),
+      ),
+    )
+    .pipe(z.array(historyMessageSchema)),
   userMessage: z.string().min(1).max(2000, '消息太长'),
 });
 
