@@ -161,3 +161,37 @@ export interface OrderSummary {
   items: OrderItem[];
   passengers: OrderPassenger[];
 }
+
+// ── 收款方式 / 付款凭证（公开，F-6 线下收款兜底）─────────────────────────
+// 与 sales-web/src/lib/api.ts 的同名类型保持一致（后端 serializePublicPaymentChannel 同一份契约）。
+/** 公开收款渠道分组（与 PaymentMethod 是不同维度）。 */
+export type PaymentChannelKind = 'WECHAT' | 'ALIPAY' | 'BANK';
+
+/** GET /public/payment-channels 返回的单条渠道（只回启用中的）。 */
+export interface PublicPaymentChannel {
+  id: string;
+  kind: PaymentChannelKind;
+  label: string;
+  qrImageUrl: string | null;
+  accountText: string | null;
+  note: string | null;
+}
+
+/** POST /public/orders/upload-receipt 入参（订单号 + lookupKey 校验，同公开查单）。 */
+export interface UploadOrderReceiptInput {
+  orderNo: string;
+  lookupKey: string;
+  amountCny?: number;
+  method?: PaymentMethod;
+  /** data:image/...;base64 的付款凭证图，≤6MB（后端 dataUrlImageSchema 强制）。 */
+  proofUrl: string;
+}
+
+/** POST /public/orders/upload-receipt 返回（201）。 */
+export interface UploadOrderReceiptResult {
+  ok: true;
+  receiptId: string;
+  receiptNo: string;
+  amountCny: string;
+  status: 'OPEN';
+}

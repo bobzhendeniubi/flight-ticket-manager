@@ -3,7 +3,8 @@ export default function (cfg: Record<string, unknown>) {
     ...cfg,
     defineConstants: {
       ...(cfg.defineConstants as Record<string, unknown>),
-      // TODO: 正式上线前换回 https://api.citur.com（域名 + HTTPS + WeChat 后台白名单）
+      // TODO: 正式上线前换回 https://api.citurtravel.com（域名 + HTTPS + WeChat 后台白名单；
+      // 此前写的 api.citur.com 是笔误，正确域名见 CLAUDE.md「域名与 DNS」）
       // 当前 staging 直连阿里云 HK，WeChat DevTools 需勾"不校验合法域名"才能跑 HTTP
       API_BASE: JSON.stringify('http://47.83.249.163/api'),
     },

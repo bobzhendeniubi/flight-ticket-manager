@@ -16,7 +16,8 @@ export default defineAppConfig({
   window: {
     backgroundTextStyle: 'light',
     navigationBarBackgroundColor: '#1e40af',
-    navigationBarTitleText: '世途旅行',
+    // F-4：前台消费者品牌统一为「椰岛假期」，「世途旅行」仅法律主体不对外露出（CLAUDE.md 铁律）
+    navigationBarTitleText: '椰岛假期',
     navigationBarTextStyle: 'white',
   },
   tabBar: {

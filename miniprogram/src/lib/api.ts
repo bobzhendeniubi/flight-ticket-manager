@@ -11,6 +11,7 @@ import type {
   AuthResult, AuthTokens, CabinClass,
   CancellationQuote,
   FlightSearchResult, OrderSummary, PaymentMethod,
+  PublicPaymentChannel, UploadOrderReceiptInput, UploadOrderReceiptResult,
 } from './types';
 
 const API_URL: string = typeof API_BASE !== 'undefined' ? API_BASE : 'http://localhost:4000';
@@ -189,8 +190,12 @@ export const api = {
     },
   ) => apiFetch<{ order: OrderSummary }>('/orders/', { method: 'POST', token, body }),
 
+  // 契约核对（F-6 顺手项）：后端 listOrdersQuerySchema（orders.schemas.ts）没有 `mine` 字段——
+  // Zod 会静默丢弃未声明的 query key；CUSTOMER 角色的可见范围已由 resolveListOrdersWhere
+  // （orders.service.ts）强制收窄成 `where.userId = requester.userId`，与 query 无关。
+  // 旧的 `?mine=1` 从未真正生效，是一处死参数，去掉以免误导后来者以为它是必需的。
   listMyOrders: (token: string) =>
-    apiFetch<{ orders: OrderSummary[] }>('/orders?mine=1', { token }),
+    apiFetch<{ orders: OrderSummary[] }>('/orders/', { token }),
 
   getOrder: (token: string, id: string) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${id}`, { token }),
@@ -222,5 +227,17 @@ export const api = {
       method: 'POST',
       token,
       body: { orderId },
+    }),
+
+  // ── 收款方式 / 付款凭证（公开，无需登录，F-6 线下收款兜底）──────────────
+  // 照 sales-web 的 getPublicPaymentChannels/uploadOrderReceipt（sales-web/src/lib/api.ts）：
+  // 微信 JSAPI 预下单在 PAYMENT_MODE!=live 时 fail-closed（见 payment-adapters.ts），
+  // 小程序端在预下单失败时展示这一套线下收款码 + 上传凭证兜底，不让客户对着必败按钮卡死。
+  getPublicPaymentChannels: () =>
+    apiFetch<{ channels: PublicPaymentChannel[] }>('/public/payment-channels'),
+  uploadOrderReceipt: (input: UploadOrderReceiptInput) =>
+    apiFetch<UploadOrderReceiptResult>('/public/orders/upload-receipt', {
+      method: 'POST',
+      body: input,
     }),
 };

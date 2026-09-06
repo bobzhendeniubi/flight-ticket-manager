@@ -7,7 +7,8 @@
  *
  * API base：
  *   - 开发：通过 `Taro.request` 访问 http://localhost:4000（需在微信开发者工具关"不校验合法域名"）
- *   - 生产：https://api.citur.com，需要在微信公众平台后台"服务器配置"白名单里加
+ *   - 生产：https://api.citurtravel.com（正式域名，见 CLAUDE.md「域名与 DNS」；此前注释写的
+ *     api.citur.com 是笔误），需要在微信公众平台后台"服务器配置"白名单里加
  */
 import path from 'path';
 

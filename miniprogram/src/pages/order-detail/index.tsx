@@ -15,9 +15,10 @@ import Taro from '@tarojs/taro';
 import { View, Text, ScrollView } from '@tarojs/components';
 import { api, ApiError } from '../../lib/api';
 import type { OrderSummary, OrderStatus } from '../../lib/types';
-import { formatDateTimeCn } from '../../lib/datetime';
+import { formatDateTimeCn, parseIsoUtcMs } from '../../lib/datetime';
 import { legStatusNote } from '../../lib/legStatus';
 import { useAuth } from '../../stores/auth';
+import { PaymentFallback } from '../../components/PaymentFallback';
 import './index.scss';
 
 const STATUS_LABEL: Record<OrderStatus, { label: string; color: string }> = {
@@ -44,6 +45,8 @@ export default function OrderDetailPage() {
   const [paying, setPaying] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [countdown, setCountdown] = useState<number | null>(null);
+  // F-6：微信 JSAPI 预下单失败，或 wx.requestPayment 非用户主动取消的失败 → 展示线下收款兜底
+  const [payFallback, setPayFallback] = useState(false);
 
   useEffect(() => {
     if (!hydrated) hydrate();
@@ -67,10 +70,14 @@ export default function OrderDetailPage() {
   useEffect(() => { void load(); }, [load]);
 
   // 倒计时（只在 PENDING_PAYMENT 展示）
+  // F-12：用 lib/datetime.ts 的 parseIsoUtcMs 代替裸 new Date(iso) —— 小程序 iOS 端对日期
+  // 字符串解析历来挑格式，该文件本身已明确写了「不要用 new Date(iso) 直接解析」的理由。
+  // 解析失败（理论上不会发生：后端固定给标准 ISO）时按已过期处理，倒计时归零更安全。
   useEffect(() => {
     if (!order || order.status !== 'PENDING_PAYMENT' || !order.paymentExpiresAt) return;
     const tick = () => {
-      const left = new Date(order.paymentExpiresAt!).getTime() - Date.now();
+      const expiresAtMs = parseIsoUtcMs(order.paymentExpiresAt!);
+      const left = expiresAtMs === null ? 0 : expiresAtMs - Date.now();
       setCountdown(Math.max(0, Math.floor(left / 1000)));
     };
     tick();
@@ -81,8 +88,23 @@ export default function OrderDetailPage() {
   const pay = async () => {
     if (!order || !tokens) return;
     setPaying(true);
+
+    // F-6：预下单本身失败（如 PAYMENT_MODE 未开通、后端 500）——这是「支付未开通」场景，
+    // 拿不到 wx.requestPayment 需要的参数，直接展示线下收款兜底，不进入第二步
+    let params: Awaited<ReturnType<typeof api.wechatMiniappPrepay>>;
     try {
-      const params = await api.wechatMiniappPrepay(tokens.accessToken, order.id);
+      params = await api.wechatMiniappPrepay(tokens.accessToken, order.id);
+    } catch (e) {
+      setPayFallback(true);
+      Taro.showToast({
+        title: e instanceof ApiError ? e.message : '在线支付暂不可用，请用下方线下收款方式',
+        icon: 'none',
+      });
+      setPaying(false);
+      return;
+    }
+
+    try {
       // 调微信支付
       await new Promise<void>((resolve, reject) => {
         Taro.requestPayment({
@@ -100,10 +122,14 @@ export default function OrderDetailPage() {
       setTimeout(load, 1500);
       setTimeout(load, 4000);
     } catch (e) {
-      // sandbox 下 wx.requestPayment 一定失败；这是预期的
+      // sandbox 下 wx.requestPayment 一定失败；这是预期的。用户主动取消不算「支付未开通」，
+      // 不弹线下收款兜底（可能只是改主意，让 ta 直接重试）；其余失败（含 sandbox 假签名必败）
+      // 视同支付路径不可用，展示兜底
       const msg = (e as { errMsg?: string })?.errMsg ?? '支付失败或已取消';
+      const cancelled = msg.includes('cancel');
+      if (!cancelled) setPayFallback(true);
       Taro.showToast({
-        title: msg.includes('cancel') ? '已取消支付' : msg,
+        title: cancelled ? '已取消支付' : msg,
         icon: 'none',
       });
     } finally {
@@ -197,6 +223,16 @@ export default function OrderDetailPage() {
         >
           {paying ? '支付中…' : `立即支付 ¥${Number(order.total).toLocaleString()}`}
         </View>
+      )}
+
+      {/* F-6：预下单失败 / wx.requestPayment 非取消性失败 → 线下收款兜底（收款码 + 上传凭证），
+          不让客户对着一个必败的支付按钮反复重试却没有任何出路 */}
+      {order.status === 'PENDING_PAYMENT' && countdown !== null && countdown > 0 && payFallback && (
+        <PaymentFallback
+          orderNo={order.orderNumber}
+          lookupKey={order.contactPhone}
+          amountDueCny={Number(order.total) - Number(order.paidAmount)}
+        />
       )}
 
       {/* 取消订单 — PAID/PROCESSING/TICKETED 状态可申请，按规则计算手续费 */}

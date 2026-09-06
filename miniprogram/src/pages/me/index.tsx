@@ -79,8 +79,10 @@ export default function MePage() {
           className='row'
           onClick={() =>
             Taro.showModal({
-              title: '客服',
-              content: 'support@citur.com\n+853 2888 8888',
+              title: '联系客服',
+              // F-4：不编造新联系方式——旧文案是「世途」品牌域名+未核实号码，
+              // 真实客服联系方式待运营录入后台公开配置前先留中性占位文案。
+              content: '客服邮箱、电话：待补\n如需帮助，请联系为你下单的代理或客服人员',
               showCancel: false,
             })
           }
@@ -93,7 +95,8 @@ export default function MePage() {
           className='row'
           onClick={() =>
             Taro.showModal({
-              title: '关于世途旅行',
+              // F-4：前台消费者品牌统一为「椰岛假期」，「世途旅行」仅法律主体不对外露出
+              title: '关于椰岛假期',
               content: '澳门 ⇌ 岘港 · 越南专线\nM2.5 Release · 小程序 MVP',
               showCancel: false,
             })

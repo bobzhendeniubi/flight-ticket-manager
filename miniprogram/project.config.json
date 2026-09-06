@@ -1,7 +1,7 @@
 {
   "miniprogramRoot": "dist/",
   "projectname": "flight-ticket-manager-mp",
-  "description": "世途旅行 · 客户端小程序",
+  "description": "椰岛假期 · 客户端小程序",
   "appid": "touristappid",
   "setting": {
     "urlCheck": false,

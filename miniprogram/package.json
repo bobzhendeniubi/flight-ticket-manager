@@ -2,7 +2,7 @@
   "name": "flight-ticket-manager-miniprogram",
   "version": "0.1.0",
   "private": true,
-  "description": "世途旅行 客户端微信小程序 (Taro 4 + React + TypeScript)",
+  "description": "椰岛假期 客户端微信小程序 (Taro 4 + React + TypeScript)",
   "templateInfo": {
     "name": "default",
     "typescript": true,
