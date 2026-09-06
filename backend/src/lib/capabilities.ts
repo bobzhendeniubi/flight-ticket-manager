@@ -159,6 +159,12 @@ export const CAPABILITIES = {
 
   // ── 航班 ────────────────────────────────────────────────────────────────
   'flights.read': { audience: 'OPS_AND_AGENT', 说明: '查看航班与班次（代理侧裁掉成本字段）' },
+  'flights.admin_view': {
+    // 页面级能力：后台「航班管理」页对全体内部员工开放，代理进不去（改造前是 roles:[ADMIN,STAFF]）。
+    // 与 flights.read（接口级，代理也有，用于前台/代理侧选班次）不是一回事，别合并。
+    audience: 'OPS',
+    说明: '后台航班管理页：查看航班与班次列表',
+  },
   'flights.maintain': {
     audience: 'FLIGHT_MAINTENANCE',
     说明: '航班维护：建航班、建班次、改单班次、批量改时刻（运营岗或票务岗）',

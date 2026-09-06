@@ -10,6 +10,8 @@
  * 改完之后这张表就是回归网——能力表编码错了，这里立刻红。
  * legacy 那一列必须是**替换前源码的逐字转写**，不许「顺手修正」，否则这测试就白写了。
  */
+import { readFileSync } from 'node:fs';
+import { fileURLToPath } from 'node:url';
 import { describe, expect, it } from 'vitest';
 import { StaffRole, UserRole } from '@prisma/client';
 import {
@@ -281,6 +283,24 @@ describe('能力表自身的不变量', () => {
 
   it('客户拿不到任何后台能力', () => {
     expect(capabilitiesFor({ role: UserRole.CUSTOMER, staffRole: null })).toEqual([]);
+  });
+
+  /**
+   * 前端镜像一致性：admin-web/src/lib/capabilities.ts 手抄了同一批 id，两边必须一字不差。
+   *
+   * 这不是洁癖。漂了会静默坏事，而且是两个方向各坏一种：
+   * · 前端多一个后端没有的 id —— 谁都拿不到它，挂着它的菜单/页面对**所有人**消失
+   *   （2026-09-06 就这么把「航班管理」整页藏了：前端写 flights.admin_view，后端表里根本没有）；
+   * · 前端少一个 —— 该显示的按钮永远不显示，运营报「没有权限」，后端其实是放行的。
+   * 前端不引后端代码（构建边界），所以只能靠这条测试钉住。
+   */
+  it('前端能力清单镜像与后端逐字一致', () => {
+    const mirrorPath = fileURLToPath(
+      new URL('../../../admin-web/src/lib/capabilities.ts', import.meta.url),
+    );
+    const mirror = readFileSync(mirrorPath, 'utf8');
+    const mirrored = [...mirror.matchAll(/^\s*\|\s*'([a-z_.]+)'/gm)].map((m) => m[1]).sort();
+    expect(mirrored).toEqual([...ALL_CAPABILITIES].sort());
   });
 
   it('每个能力都有说明，id 用「域.动作」形式', () => {
