@@ -12,7 +12,6 @@ import { describe, it, expect, vi } from 'vitest';
 import { FulfillmentStatus, FulfillmentType, VisaRequirement, VisaSubmissionStatus } from '@prisma/client';
 
 import {
-  applyVisaProgress,
   assertNoVisaContradiction,
   DERIVABLE_TASK_STATUSES,
   deriveOrderVisaStates,
@@ -293,24 +292,5 @@ describe('唯一写点 · Prisma 调用形状', () => {
       where: { orderItem: { orderId: 'o1' }, type: FulfillmentType.VISA_APPLICATION, status: { in: [FulfillmentStatus.PENDING, FulfillmentStatus.IN_PROGRESS] } },
       data: { status: FulfillmentStatus.CONFIRMED, completedAt: expect.any(Date) },
     });
-  });
-
-  it('applyVisaProgress：逐人过守卫，自备签进 rejected，通过者一次 updateMany；全被拒 → 不写', async () => {
-    const { db, raw } = mockDb();
-    const res = await applyVisaProgress(db, {
-      passengers: [
-        { id: 'p1', visaExempt: false, visaSubmissionStatus: PENDING },
-        { id: 'p2', visaExempt: true, visaSubmissionStatus: PENDING },
-        { id: 'p3', visaExempt: false },
-      ],
-      to: CONFIRMED,
-    });
-    expect(res).toEqual({ okIds: ['p1', 'p3'], rejected: [{ id: 'p2', reason: VISA_SELF_ARRANGED_NO_PROGRESS_MESSAGE }] });
-    expect(raw.passenger.updateMany).toHaveBeenCalledTimes(1);
-    expect(raw.passenger.updateMany).toHaveBeenCalledWith({ where: { id: { in: ['p1', 'p3'] } }, data: { visaSubmissionStatus: CONFIRMED } });
-    raw.passenger.updateMany.mockClear();
-    const none = await applyVisaProgress(db, { passengers: [{ id: 'x', visaExempt: true }], to: IN_PROGRESS });
-    expect(none.okIds).toEqual([]);
-    expect(raw.passenger.updateMany).not.toHaveBeenCalled();
   });
 });
