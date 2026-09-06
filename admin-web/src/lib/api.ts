@@ -315,12 +315,21 @@ export interface RangeScheduleSeat {
   basePrice: string;
 }
 
+/**
+ * 班次去 / 回程方向（后端 flight-direction.ts 派生）。
+ * OUTBOUND = 去程（航线表里的 origin→destination），RETURN = 反向，
+ * UNKNOWN = 活跃航线表里查不到这条线（后端不猜，前端也不猜）。
+ */
+export type FlightDirection = 'OUTBOUND' | 'RETURN' | 'UNKNOWN';
+
 export interface RangeSchedule {
   id: string;
   flightId: string;
   flightNumber: string;
   originCode: string;
   destinationCode: string;
+  /** 去 / 回程：后端按活跃航线表派生；老后端未返回时为 undefined。 */
+  direction?: FlightDirection;
   /** ISO datetime 字符串 */
   departureTime: string;
   departureTz: string;

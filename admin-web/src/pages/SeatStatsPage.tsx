@@ -14,12 +14,13 @@
  *     斜纹琥珀 = 占位，两段相加封顶 100%；超售时百分比如实 > 100%（条封顶但标红）。
  *   - 超售 = 余票为负时的欠座数（航司减配 / 换机型把容量压到已售之下）。
  *     销售侧照旧按容量拒卖，这里标红是提醒去与航司 / 操作部协调。
- *   - 行底色只区分航向（去程 = 澳门出发 = 淡黄底；回程 = 白底），沿用老销售控位表的看法，
+ *   - 行底色只区分航向（去程 = 淡黄底；回程与方向未知 = 白底），沿用老销售控位表的看法，
  *     不带状态语义——状态色（超售红 / 占位琥珀）留给行内文字，底色不去抢它们。
+ *     方向由后端按活跃航线表派生（direction 字段），不再按起飞机场写死。
  *   - 日期区间为闭区间（between 起始/截止），服务端按 from/to 过滤
  */
 import { useCallback, useEffect, useMemo, useState } from 'react';
-import { api, ApiError, type RangeSchedule } from '../lib/api';
+import { api, ApiError, type FlightDirection, type RangeSchedule } from '../lib/api';
 import { airportLabel, CABIN_LABEL, formatLocalDate, formatLocalTime, localYmd, tzLabel } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 import { Icon } from '../components/Icon';
@@ -48,9 +49,12 @@ function totalOccupancyRate(sold: number, held: number, capacity: number): numbe
   return capacity > 0 ? (sold + held) / capacity : 0;
 }
 
-// 业务上澳门（MFM）出发 = 去程，其余 = 回程。排序与行底色共用这一个判断。
-function isOutbound(originCode: string): boolean {
-  return originCode === 'MFM';
+// 去 / 回程由后端按活跃航线表派生（backend/src/modules/flights/flight-direction.ts）：
+// 航线表里的 routeKey 就是去程方向的「起飞-到达」，命中即去程、反向即回程、查不到 = UNKNOWN。
+// 以前这里写死「起飞地 = MFM 即去程」，第二条航线一开会把新线的去程当回程画。
+// UNKNOWN 一律按回程处理（留白）——底色只是阅读辅助，宁可少涂也不涂错。
+function isOutbound(direction: FlightDirection | undefined): boolean {
+  return direction === 'OUTBOUND';
 }
 
 // 本地日期 YYYY-MM-DD（用 getFullYear/getMonth/getDate，避免 toISOString 的 UTC 偏移）
@@ -69,6 +73,8 @@ interface ScheduleStat {
   flightNumber: string;
   origin: string;
   dest: string;
+  /** 后端派生的去 / 回程；老后端未返回时 undefined（按回程留白）。 */
+  direction?: FlightDirection;
   departureTime: string;
   departureTz: string;
   seatClasses: RangeSchedule['seatClasses'];
@@ -130,6 +136,7 @@ export function SeatStatsPage() {
         flightNumber: s.flightNumber,
         origin: s.originCode,
         dest: s.destinationCode,
+        direction: s.direction,
         departureTime: s.departureTime,
         departureTz: s.departureTz,
         seatClasses: s.seatClasses,
@@ -332,14 +339,16 @@ export function SeatStatsPage() {
               )}
               {!loading &&
                 filtered.map((s) => (
-                  // 去程整行淡黄底（对齐老销售控位表：澳门出发那一段是黄的），回程留白。
+                  // 去程整行淡黄底（对齐老销售控位表：去程那一段是黄的），回程留白。
                   // 只到 yellow-50 这个浓度：既明显浅于占位斜纹的琥珀（amber-400/200），
                   // 不跟进度条抢眼，行内 rose/amber 语义色也照旧压得住。
                   // hover 用 ! 提权，否则被 .table-admin tbody tr:hover 的 slate 底盖掉、
                   // 鼠标一扫底色就没了。
                   <tr
                     key={s.id}
-                    className={isOutbound(s.origin) ? 'bg-yellow-50 hover:!bg-yellow-100/70' : undefined}
+                    className={
+                      isOutbound(s.direction) ? 'bg-yellow-50 hover:!bg-yellow-100/70' : undefined
+                    }
                   >
                     <td>
                       <div className="font-medium text-ink">

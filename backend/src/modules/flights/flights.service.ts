@@ -18,6 +18,7 @@ import type { FareBucketsInput } from '../pricing/pricing.schemas.js';
 import { localDate } from '../finances/finances.cost.service.js';
 import { localDateISO, localDateTime, localToUtc } from '../../lib/flight-time.js';
 import { heldSeatsBySeatClass } from '../hold-orders/held-seats.js';
+import { loadOutboundRouteKeys, resolveFlightDirection } from './flight-direction.js';
 import type { FareBucket } from '../pricing/pricing.calc.js';
 import type {
   BaggagePolicyItem,
@@ -639,9 +640,12 @@ export class FlightService {
       if (range.to && localDay > range.to) return false;
       return true;
     });
-    const [lockedMap, heldMap] = await Promise.all([
+    const [lockedMap, heldMap, outboundRouteKeys] = await Promise.all([
       this.lockedMapForSchedules(schedules),
       this.heldMapForSchedules(schedules),
+      // 去 / 回程由活跃航线表派生（flight-direction.ts），不再按「起飞地 = 澳门」写死——
+      // 第二条航线一开，写死的判定会把新线的去程当回程。一次性载入，避免逐班次查表。
+      loadOutboundRouteKeys(prisma),
     ]);
     return schedules.map((s) => ({
       id: s.id,
@@ -649,6 +653,12 @@ export class FlightService {
       flightNumber: s.flight.flightNumber,
       originCode: s.flight.originCode,
       destinationCode: s.flight.destinationCode,
+      // 'OUTBOUND' 去程 / 'RETURN' 回程 / 'UNKNOWN' 航线表里查不到（不猜）
+      direction: resolveFlightDirection(
+        s.flight.originCode,
+        s.flight.destinationCode,
+        outboundRouteKeys,
+      ),
       departureTime: s.departureTime.toISOString(),
       departureTz: s.departureTz,
       // 关柜提前分钟数：no-show 批量页选完班次、还没预检之前，角标要按这一班自己的值粗估，

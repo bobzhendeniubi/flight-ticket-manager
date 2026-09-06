@@ -31,6 +31,10 @@ const prismaMock = vi.hoisted(() => {
     seatLock: { groupBy: ReturnType<typeof vi.fn> };
     holdOrder: { groupBy: ReturnType<typeof vi.fn> };
     flightBaggagePolicy: { findMany: ReturnType<typeof vi.fn> };
+    // 座位统计的去 / 回程判定要读活跃航线表（flight-direction.loadOutboundRouteKeys）
+    settlementRate: { findMany: ReturnType<typeof vi.fn> };
+    settlementDiscountRule: { findMany: ReturnType<typeof vi.fn> };
+    bundle: { findMany: ReturnType<typeof vi.fn> };
     auditLog: { create: ReturnType<typeof vi.fn> };
     $transaction: ReturnType<typeof vi.fn>;
   } = {
@@ -50,6 +54,10 @@ const prismaMock = vi.hoisted(() => {
     seatLock: { groupBy: vi.fn() },
     holdOrder: { groupBy: vi.fn() },
     flightBaggagePolicy: { findMany: vi.fn() },
+    // 航线表三源：默认空（= 航线表里查不到 → direction UNKNOWN），按用例覆写
+    settlementRate: { findMany: vi.fn(async () => []) },
+    settlementDiscountRule: { findMany: vi.fn(async () => []) },
+    bundle: { findMany: vi.fn(async () => []) },
     // 改点路径会 best-effort 写审计（writeAudit → prisma.auditLog.create）；给个空 mock 免噪声
     auditLog: { create: vi.fn() },
     // $transaction(fn) 直接以同一个 mock 作为 tx 执行回调
@@ -571,6 +579,9 @@ describe('FlightService.listSchedules / listSchedulesInRange · 余位允许为�
     vi.clearAllMocks();
     prismaMock.seatLock.groupBy.mockResolvedValue([]); // 默认无锁位
     prismaMock.holdOrder.groupBy.mockResolvedValue([]); // 默认无占位
+    prismaMock.settlementRate.findMany.mockResolvedValue([]); // 默认航线表为空
+    prismaMock.settlementDiscountRule.findMany.mockResolvedValue([]);
+    prismaMock.bundle.findMany.mockResolvedValue([]);
   });
 
   const seatClass = (over: Record<string, unknown> = {}) => ({
@@ -659,6 +670,42 @@ describe('FlightService.listSchedules / listSchedulesInRange · 余位允许为�
       locked: 0,
       available: -9,
     });
+  });
+
+  it('listSchedulesInRange：去 / 回程按活跃航线表派生，不看起飞机场', async () => {
+    // 航线表只有 CAN-KIX 这一条线（起飞地不是澳门）
+    prismaMock.settlementRate.findMany.mockResolvedValue([{ routeKey: 'CAN-KIX' }]);
+    prismaMock.flightSchedule.findMany.mockResolvedValue([
+      {
+        id: 'sched_out',
+        flightId: 'flight_out',
+        flight: { flightNumber: 'XX1', originCode: 'CAN', destinationCode: 'KIX' },
+        departureTime: new Date('2026-07-01T01:00:00.000Z'),
+        departureTz: 'Asia/Macau',
+        seatClasses: [seatClass()],
+      },
+      {
+        id: 'sched_back',
+        flightId: 'flight_back',
+        flight: { flightNumber: 'XX2', originCode: 'KIX', destinationCode: 'CAN' },
+        departureTime: new Date('2026-07-01T09:00:00.000Z'),
+        departureTz: 'Asia/Macau',
+        seatClasses: [seatClass()],
+      },
+      {
+        // 航线表里没有的线：不猜方向
+        id: 'sched_other',
+        flightId: 'flight_other',
+        flight: { flightNumber: 'XX3', originCode: 'MFM', destinationCode: 'PVG' },
+        departureTime: new Date('2026-07-01T10:00:00.000Z'),
+        departureTz: 'Asia/Macau',
+        seatClasses: [seatClass()],
+      },
+    ]);
+
+    const rows = await service.listSchedulesInRange({});
+
+    expect(rows.map((r) => r.direction)).toEqual(['OUTBOUND', 'RETURN', 'UNKNOWN']);
   });
 });
 
