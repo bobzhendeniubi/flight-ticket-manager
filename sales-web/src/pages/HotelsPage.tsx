@@ -159,6 +159,15 @@ export function HotelsPage() {
     Math.round((new Date(checkOut).getTime() - new Date(checkIn).getTime()) / 86400000),
   );
 
+  // SEO 描述按当前目的地生成：选了某城就写那座城，没选就列出在架城市（下拉同源）。
+  // 以前这里写死「岘港 / 会安」，新开一座城要改代码才对得上。
+  const seoDestinations = useMemo(() => {
+    const selected = cityOptions.find((c) => c.code === city);
+    if (selected) return selected.name;
+    const names = cityOptions.map((c) => c.name).filter(Boolean);
+    return names.length > 0 ? names.join(' / ') : '各海岛';
+  }, [cityOptions, city]);
+
   /** 卡片内直接加购：取最便宜房型 × 1 间 × nights 晚（不打断列表流，详情页可精选房型）。 */
   const quickAdd = (h: Hotel) => {
     // basePrice 已是该房型最终单价（含倍率），priceMultiplier 为遗留字段，不再参与计价，
@@ -191,7 +200,7 @@ export function HotelsPage() {
     <div className="space-y-6">
       <Seo
         title="酒店预订"
-        description="覆盖岘港 / 会安等海岛目的地的精选酒店，房型、设施、真实点评一目了然，与航班打包更划算。"
+        description={`覆盖${seoDestinations}等海岛目的地的精选酒店，房型、设施、真实点评一目了然，与航班打包更划算。`}
         canonicalPath="/hotels"
       />
 
