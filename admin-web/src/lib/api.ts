@@ -6,6 +6,96 @@
  *   - 生产：VITE_API_BASE=https://api.citur.com（或 /api 走前端 nginx 反代）
  */
 import type { Capability } from './capabilities';
+/**
+ * 枚举类型不再手抄 —— 从 @ftm/contracts 取后端 schema.prisma 的同一份镜像。
+ *
+ * 这些名字以前是在本文件里一行一行敲出来的字符串联合，敲错/漏跟就是「老标签页撞新
+ * 后端」：改这批之前 DocumentType 多一个后端根本不认的 OTHER、StaffRole 少一个新增的
+ * OPERATIONS、AuditTargetType 少 MARKETING、ProductKind 与后端同名枚举压根不是一回事。
+ *
+ * 从契约包取之后，schema.prisma 一改，这边编译期就红。import + export 两句是必需的：
+ * 本文件下面的接口还要用这些类型，光 re-export 不进本地作用域。
+ */
+import type {
+  FareBucket as ContractFareBucket,
+  PriceAdjustmentReason as ContractPriceAdjustmentReason,
+  ProductKind as ContractProductKind,
+  RosterFormat as ContractRosterFormat,
+  StatementPlatform as ContractStatementPlatform,
+  VisaRequirement,
+  AgentRechargeStatus,
+  AuditSeverity,
+  AuditTargetType,
+  BundleChangeRequestStatus,
+  CabinClass,
+  DocumentType,
+  FulfillmentStatus,
+  FulfillmentType,
+  HoldAmountRule,
+  HoldInstallmentStatus,
+  HoldOccupyOn,
+  HoldOverdueAction,
+  HoldOwnerType,
+  InvoiceStatus,
+  MarketingPosterKind,
+  MarketingPosterStatus,
+  OrderChangeRequestStatus,
+  PassengerType,
+  PaymentMethod,
+  ReceiptSource,
+  ReceiptStatus,
+  ReminderPriority,
+  ReminderStatus,
+  SeatAllocationStatus,
+  SettlementDiscountKind,
+  SettlementMode,
+  SettlementRequestStatus,
+  SettlementStatus,
+  StaffRole,
+  UserRole,
+  VisaEntryType,
+  VisaIssuanceMethod,
+  VisaSubmissionStatus,
+  WaitlistStatus,
+} from '@ftm/contracts';
+
+export type {
+  AgentRechargeStatus,
+  AuditSeverity,
+  AuditTargetType,
+  BundleChangeRequestStatus,
+  CabinClass,
+  DocumentType,
+  FulfillmentStatus,
+  FulfillmentType,
+  HoldAmountRule,
+  HoldInstallmentStatus,
+  HoldOccupyOn,
+  HoldOverdueAction,
+  HoldOwnerType,
+  InvoiceStatus,
+  MarketingPosterKind,
+  MarketingPosterStatus,
+  OrderChangeRequestStatus,
+  PassengerType,
+  PaymentMethod,
+  ReceiptSource,
+  ReceiptStatus,
+  ReminderPriority,
+  ReminderStatus,
+  SeatAllocationStatus,
+  SettlementDiscountKind,
+  SettlementMode,
+  SettlementRequestStatus,
+  SettlementStatus,
+  StaffRole,
+  UserRole,
+  VisaEntryType,
+  VisaIssuanceMethod,
+  VisaSubmissionStatus,
+  WaitlistStatus,
+};
+
 
 const API_BASE: string = (import.meta.env?.VITE_API_BASE as string | undefined)?.trim() || '/api';
 
@@ -223,8 +313,6 @@ async function apiFetchWithRetry<T>(
 
 // ── 类型 ──────────────────────────────────────────────────────────────────
 
-export type UserRole = 'CUSTOMER' | 'AGENT' | 'STAFF' | 'ADMIN';
-export type CabinClass = 'ECONOMY' | 'PREMIUM_ECONOMY' | 'BUSINESS' | 'FIRST';
 
 export interface AuthUser {
   id: string;
@@ -271,10 +359,8 @@ export interface AdminFlight {
 
 // 仓位阶梯一档：N 张以该价出售（int 张数 ≥1 / 价格 ≥0）。
 // 按数组顺序由前往后出售（最便宜在前，卖满跳下一档）。
-export interface FareBucket {
-  quota: number;
-  price: number;
-}
+/** 仓位阶梯档位 = 契约包 pricing 那份（后端 fareBuckets Json 列的读写形状）。 */
+export type FareBucket = ContractFareBucket;
 
 export interface AdminScheduleSeat {
   id: string;
@@ -358,8 +444,6 @@ export interface RangeSchedule {
 }
 
 // ── 营销中心 · AI 海报 ─────────────────────────────────────────────────────
-export type MarketingPosterKind = 'FLIGHT_ROUTE' | 'CUSTOM';
-export type MarketingPosterStatus = 'GENERATING' | 'READY' | 'NEEDS_REVIEW' | 'FAILED';
 
 export interface MarketingTemplate {
   key: string;
@@ -777,7 +861,8 @@ export type CreateOrderItemInput =
 
 // 签证状态（录单/详情用）；后端 enum → 中文：
 // NOT_NEEDED=不需要 / NEEDED=需要 / E_VISA=电子签(三个月多次) / HAS_VISA=已签证
-export type VisaStatusInput = 'NOT_NEEDED' | 'NEEDED' | 'E_VISA' | 'HAS_VISA';
+/** 录单的签证口径 = 后端 Order.visaStatus（Prisma VisaRequirement），取契约包那份。 */
+export type VisaStatusInput = VisaRequirement;
 
 export const VISA_STATUS_LABEL: Record<VisaStatusInput, string> = {
   NOT_NEEDED: '不需要',
@@ -807,7 +892,8 @@ export interface OrderStructuredNotes {
 // 套餐结构化商务舱库存、升级酒店不走「换酒店」（房控看不到）、改多签不换签证产品（签证岗
 // 看不到）。新录入只允许下面四个财务口径值；旧三值仍保留在展示 label 映射里，避免历史订单行
 // 的 reasonCode 找不到 label 而显示 undefined。
-export type PriceAdjustmentReason = 'DISCOUNT' | 'MISC_FEE' | 'CHANGE' | 'OTHER';
+/** 调价原因 = 契约包 orders 里可录入的那批（历史下线原因另有一份，不在此列）。 */
+export type PriceAdjustmentReason = ContractPriceAdjustmentReason;
 
 // 可录入原因（下拉用）——与后端 priceAdjustmentSchema 的枚举保持一致。
 export const PRICE_ADJUSTMENT_REASON_OPTIONS: PriceAdjustmentReason[] = [
@@ -944,7 +1030,6 @@ export interface CreateOrderInput extends OrderStructuredNotes {
  * - PER_ORDER 逐单到账：每笔订单单独收尾款（默认）。
  * - MONTHLY 月结：订单尾款挂账，月末统一对账，不逐单催款。
  */
-export type SettlementMode = 'PER_ORDER' | 'MONTHLY';
 
 export const SETTLEMENT_MODE_LABEL: Record<SettlementMode, string> = {
   PER_ORDER: '逐单到账',
@@ -952,7 +1037,8 @@ export const SETTLEMENT_MODE_LABEL: Record<SettlementMode, string> = {
 };
 
 // ── 名单格式绑定（批量创单防呆）── 与 backend agents.schemas ROSTER_FORMATS 对齐
-export type RosterFormat = 'COLON_MULTILINE_YMD' | 'INLINE_NUMBERED' | 'COLON_MULTILINE_DMY';
+/** 代理粘贴名单的格式绑定 = 契约包 agents 那份。 */
+export type RosterFormat = ContractRosterFormat;
 
 export const ROSTER_FORMAT_LABEL: Record<RosterFormat, string> = {
   COLON_MULTILINE_YMD: '冒号多行（年-月-日）',
@@ -1015,7 +1101,6 @@ export interface UpdateAgentInput {
 }
 
 // ── 切位（包位）── 与 backend seat-allocation 模块对齐
-export type SeatAllocationStatus = 'ACTIVE' | 'RECLAIMED';
 
 export interface CreateSeatAllocationInput {
   flightScheduleId: string;
@@ -1077,11 +1162,6 @@ export type HoldOrderStatus =
   | 'CONVERTED'
   | 'RELEASED'
   | 'CANCELLED';
-export type HoldOwnerType = 'AGENT' | 'CUSTOMER';
-export type HoldInstallmentStatus = 'PENDING' | 'PAID';
-export type HoldAmountRule = 'PER_PERSON_FIXED' | 'REMAINDER';
-export type HoldOverdueAction = 'REMIND_ONLY' | 'AUTO_RELEASE';
-export type HoldOccupyOn = 'CREATE' | 'FULL_PAYMENT';
 
 export interface HoldInstallmentTemplate {
   label: string;
@@ -1283,9 +1363,6 @@ export type OrderItemKind =
   | 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA'
   | 'BUNDLE' | 'INSURANCE' | 'FEE' | 'DISCOUNT'
   | 'GUIDE' | 'UPGRADE_CHANGE' | 'OVERSALE';
-export type DocumentType = 'PASSPORT' | 'ID_CARD' | 'OTHER';
-export type PassengerType = 'ADULT' | 'CHILD' | 'INFANT';
-export type PaymentMethod = 'WECHAT_PAY' | 'ALIPAY' | 'BANK_CARD' | 'AGENT_PREPAYMENT';
 
 /** 收款方式中文标签（订单收款 / 进账对账共用） */
 export const PAYMENT_METHOD_LABEL: Record<PaymentMethod, string> = {
@@ -1439,8 +1516,6 @@ export interface OrderPassenger {
   singleRoom?: boolean | null;
 }
 
-export type ReminderStatus = 'OPEN' | 'IN_PROGRESS' | 'DONE' | 'SKIPPED';
-export type ReminderPriority = 'LOW' | 'NORMAL' | 'HIGH' | 'CRITICAL';
 
 export interface OperationalReminder {
   id: string;
@@ -1548,7 +1623,6 @@ export interface HotelAvailabilityResult {
   nights: number;
 }
 
-export type InvoiceStatus = 'NONE' | 'REQUESTED' | 'ISSUED';
 
 /** 六态开票的维度：去程 / 回程 / 系统。 */
 export type InvoiceLeg = 'outbound' | 'return' | 'system';
@@ -2451,8 +2525,6 @@ export interface OrderPayment {
 }
 
 // ── Audit / Customers / Travelers / Fulfillment ──────────────────────────
-export type AuditSeverity = 'INFO' | 'WARNING' | 'CRITICAL';
-export type AuditTargetType = 'AGENT' | 'ORDER' | 'FLIGHT' | 'CUSTOMER' | 'TRAVELER' | 'PRICING' | 'COMMISSION' | 'SETTLEMENT' | 'PRODUCT' | 'AUTH' | 'SYSTEM';
 
 export interface AuditLog {
   id: string;
@@ -2692,11 +2764,8 @@ export interface MergeTravelerProfileResult {
   };
 }
 
-export type FulfillmentType = 'FLIGHT_TICKETING' | 'HOTEL_BOOKING' | 'VISA_APPLICATION' | 'TRANSFER_DISPATCH' | 'BUNDLE_COMPOSITE';
-export type FulfillmentStatus = 'PENDING' | 'IN_PROGRESS' | 'CONFIRMED' | 'CANCELLED' | 'FAILED';
 
 /** 乘客送签进度（按人送签用）——三档，与签证台任务状态语义对齐 */
-export type VisaSubmissionStatus = 'PENDING' | 'IN_PROGRESS' | 'CONFIRMED';
 
 /** 签证台乘客明细（仅 VISA_APPLICATION 任务后端附带）*/
 export interface VisaTaskPassenger {
@@ -2864,7 +2933,6 @@ export interface BatchFulfillmentStatusResult {
 }
 
 // ── 候补（ADMIN/STAFF 某班次候补名单，电话回访用）─────────────────────────
-export type WaitlistStatus = 'ACTIVE' | 'NOTIFIED' | 'FULFILLED' | 'CANCELLED';
 
 export interface WaitlistEntry {
   id: string;
@@ -2948,9 +3016,7 @@ export interface Transfer {
 }
 
 /** 签证签发方式（结构化分类，替代靠产品名正则猜测） */
-export type VisaIssuanceMethod = 'E_VISA' | 'STICKER' | 'ARRIVAL' | 'OTHER';
 /** 签证入境次数 */
-export type VisaEntryType = 'SINGLE' | 'MULTIPLE';
 
 /** 一档签证加急（零工/一工/二工…）：档名是定价查表的键，同产品内唯一。 */
 export interface VisaExpressTier {
@@ -3184,7 +3250,6 @@ export interface SettlementRateWriteEntry {
 
 // ── 结算价立减规则（ADMIN/STAFF）— 出发日期窗口 × 晚数 × 酒店档次 ────────
 // 与 backend/src/modules/settlement-discounts/* 对齐；金额为 CNY/人整数。
-export type SettlementDiscountKind = 'AGENT' | 'AGENT_DEFAULT' | 'RETAIL';
 
 export interface SettlementDiscountRule {
   id: string;
@@ -3467,7 +3532,6 @@ export interface DashboardTopAgent {
 }
 
 // ── Settlements ──────────────────────────────────────────────────────────
-export type SettlementStatus = 'DRAFT' | 'PENDING_APPROVAL' | 'APPROVED' | 'PAID' | 'VOIDED';
 
 /** 结算单绑定的单条 REVERSED（冲销）记录摘要 —— 不论正负金额都透出，供审批页查看。 */
 export interface SettlementReversedRecord {
@@ -3575,9 +3639,7 @@ export interface UpdatePaymentChannelInput {
 }
 
 /** 进账状态：待核销 / 部分核销 / 已核销 / 已退款（对账台统一「核销」口径） */
-export type ReceiptStatus = 'OPEN' | 'PARTIALLY_ALLOCATED' | 'ALLOCATED' | 'REFUNDED';
 /** 进账来源：客户上传 / 后台录入 / 订单超额转入 / 二维码流水导入 */
-export type ReceiptSource = 'CUSTOMER_UPLOAD' | 'STAFF_ENTRY' | 'ORDER_OVERPAY' | 'STATEMENT_IMPORT' | 'OPS_CLAIM';
 
 export const RECEIPT_STATUS_LABEL: Record<ReceiptStatus, string> = {
   OPEN: '待核销',
@@ -3594,7 +3656,8 @@ export const RECEIPT_SOURCE_LABEL: Record<ReceiptSource, string> = {
 };
 
 /** 流水预览行处置：ok=可导入；dup_in_db=库里已有；dup_in_file=文件内重复；skipped_status=非支付成功；invalid=解析失败 */
-export type StatementPlatform = 'CMB_QR' | 'YISHOUBAO' | 'XINGYIFU' | 'HUISHENGHUO';
+/** 支持导入的收单平台 = 契约包 receipts 那份。 */
+export type StatementPlatform = ContractStatementPlatform;
 export type StatementDisposition =
   | 'ok'
   | 'dup_in_db'
@@ -7121,7 +7184,6 @@ export interface FlightPnlRow {
 export type CostSource = 'override' | 'period' | 'none';
 
 /** 内部岗位：null=通用运营；财务岗可见财务页与经营报表，导出不裁剪。 */
-export type StaffRole = 'VISA_DESK' | 'TICKETING' | 'ROOM_CONTROL' | 'FINANCE';
 export interface StaffUser {
   id: string;
   email: string | null;
@@ -7332,14 +7394,23 @@ export interface MonthlyPoint {
   orderCount: number;
 }
 
-export type ProductKind = 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'BUNDLE' | 'INSURANCE';
+/**
+ * 退订政策的产品维度。名字容易误导：它对应的库表列是 `CancellationPolicy.productKind`，
+ * 而那一列在 schema.prisma 里的类型是 **OrderItemKind**，不是同名的 Prisma ProductKind
+ *（后者没有 INSURANCE）。所以这里取 OrderItemKind 的子集，值与从前逐字相同；
+ * OrderItemKind 哪天少一档，这里编译期就会红。
+ */
+export type ProductKind = Extract<
+  OrderItemKind,
+  'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'BUNDLE' | 'INSURANCE'
+>;
 
 /**
- * 返佣计提的产品维度 —— 必须与后端 Prisma `enum ProductKind` 逐字对齐
- * （后端没有 INSURANCE 这一档，故这里不能直接复用上面的 ProductKind）。
+ * 返佣计提的产品维度 = 后端 Prisma `enum ProductKind`，现在直接取契约包那份，不再手抄
+ *（上面那个 ProductKind 是退订政策用的 OrderItemKind 子集，两者同名不同物，别混）。
  * 套餐（BUNDLE）是独立一档费率，与机票并列、各配各的，不是复用机票档。
  */
-export type CommissionKind = 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA' | 'BUNDLE';
+export type CommissionKind = ContractProductKind;
 
 export interface CancellationTier {
   hoursBeforeDeparture: number;
@@ -7443,7 +7514,6 @@ export interface FeatureFlagView {
 // 调用方按 `agentRechargeApi.xxx(token, ...)` 使用，风格与 `api.xxx(token, ...)` 一致。
 
 /** 代理认款状态：待审核 / 已确认到账 / 已驳回 */
-export type AgentRechargeStatus = 'PENDING' | 'CONFIRMED' | 'REJECTED';
 
 export const AGENT_RECHARGE_STATUS_LABEL: Record<AgentRechargeStatus, string> = {
   PENDING: '待审核',
@@ -7693,7 +7763,6 @@ export const hotelControlOpsApi = {
 //                                                    + 下级名下的，当前前端未使用这条）
 //   POST /settlement-requests/:id/approve|reject    运营确认/驳回（ADMIN/STAFF）
 
-export type SettlementRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
 
 /**
  * 议价申请 —— 详情页「本单申请列表」与运营待办队列共用同一份序列化形状（后端
@@ -7837,7 +7906,6 @@ export const settlementRequestsApi = {
 // ── 套餐改档申请（代理提申请 → 运营确认后执行既有「套餐改档」）── 独立命名空间，
 // 对应 backend/src/modules/bundle-change-requests/*。
 
-export type BundleChangeRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
 
 export interface BundleChangeRequest {
   id: string;
@@ -7942,7 +8010,6 @@ export type OrderChangeRequestKind =
   | 'SPLIT'
   | 'CANCEL_LEG'
   | 'VISA_EXEMPT';
-export type OrderChangeRequestStatus = 'PENDING' | 'APPROVED' | 'REJECTED';
 /** 改单申请里的签证目标状态：比录单/签证台的 VisaStatusInput 少一档（不收 HAS_VISA——那不是「要改成」的目标，是已完成态）。 */
 export type ChangeRequestVisaStatus = 'NEEDED' | 'E_VISA' | 'NOT_NEEDED';
 

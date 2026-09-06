@@ -41,6 +41,9 @@ const TARGET_ICON: Record<TargetType, IconName> = {
   AUTH: 'lock',
   SYSTEM: 'settings',
   SETTLEMENT: 'wallet',
+  // 营销（海报）—— 后端 marketing.routes 一直在写这类审计，本页原先靠手抄的联合类型，
+  // 抄本里没有这一档，于是这些行的图标和名称都是空的。
+  MARKETING: 'camera',
 };
 
 const TARGET_LABEL: Record<TargetType, string> = {
@@ -55,6 +58,7 @@ const TARGET_LABEL: Record<TargetType, string> = {
   AUTH: '登录',
   SYSTEM: '系统',
   SETTLEMENT: '结算',
+  MARKETING: '营销',
 };
 
 interface AuditView {
