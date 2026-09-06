@@ -377,6 +377,10 @@ export function transitionPassengerVisa(
       );
     case 'SWAP_PASSENGER': {
       // 显式带值 > 证件变化回落 false（旧人自备签的 true 绝不继承）> 保持原值。进度不动（现状）。
+      // 「事件给出了明确值」（显式带值 / 真换人回落）就进 write——换人是一条 UPDATE 同时写身份列与
+      // 自备签列，即便新值与旧值相同也照写（幂等），与换人通道既有的落库形状一致；
+      // changed 仍只表示值是否真的变了（调用方据此决定要不要跑任务同步）。
+      const resolved = event.visaExempt !== undefined || event.documentChanged;
       const visaExempt =
         event.visaExempt !== undefined
           ? event.visaExempt
@@ -391,9 +395,25 @@ export function transitionPassengerVisa(
         to: derivePassengerVisaState(next),
         facts: next,
         changed,
-        write: changed ? { passenger: { visaExempt } } : {},
+        write: resolved ? { passenger: { visaExempt } } : {},
       };
     }
+  }
+}
+
+/**
+ * 订单级录单档 → 声明事件（录单 / 改备注 / 改单申请 / 代理自助改签证状态共用的翻译）。
+ */
+export function orderVisaDeclarationEvent(visaStatus: VisaRequirement): PassengerVisaEvent {
+  switch (visaStatus) {
+    case VisaRequirement.NOT_NEEDED:
+      return { type: 'DECLARE_NOT_NEEDED' };
+    case VisaRequirement.HAS_VISA:
+      return { type: 'DECLARE_HAS_VISA' };
+    case VisaRequirement.E_VISA:
+      return { type: 'DECLARE_NEEDED', visaStatus: 'E_VISA' };
+    case VisaRequirement.NEEDED:
+      return { type: 'DECLARE_NEEDED', visaStatus: 'NEEDED' };
   }
 }
 
@@ -459,13 +479,18 @@ export async function writePassengerVisaProgress(
   return res.count;
 }
 
-/** Passenger.visaExempt 的唯一写点（建单后）；进度列随事件一起写（转移表决定）。 */
+/**
+ * Passenger.visaExempt 的唯一写点（建单后）；进度列随事件一起写（转移表决定）。
+ * `extra` 是要与签证列同一条 UPDATE 落库的其它列（换人通道的身份/护照列）——换人在界面上是
+ * 一次提交，落库也必须是一次；签证列后写、压过 extra 里的同名键。
+ */
 export async function writePassengerVisaExempt(
   db: VisaDb,
   passengerId: string,
   data: { visaExempt: boolean; visaSubmissionStatus?: VisaSubmissionStatus },
+  extra?: Prisma.PassengerUpdateInput,
 ): Promise<void> {
-  await db.passenger.update({ where: { id: passengerId }, data });
+  await db.passenger.update({ where: { id: passengerId }, data: { ...(extra ?? {}), ...data } });
 }
 
 /**
@@ -496,14 +521,15 @@ export async function rederiveVisaTaskStatus(
   orderId: string,
   opts: { touch: ReadonlyArray<FulfillmentStatus>; statuses?: ReadonlyArray<VisaSubmissionStatus> },
 ): Promise<FulfillmentStatus> {
-  const statuses =
+  const statuses = (
     opts.statuses ??
     (
       await db.passenger.findMany({
         where: ourVisaPassengersWhere(orderId),
         select: { visaSubmissionStatus: true },
       })
-    ).map((p) => p.visaSubmissionStatus);
+    ).map((p) => p.visaSubmissionStatus)
+  ).map((s) => s ?? VisaSubmissionStatus.PENDING); // 老数据缺列一律按待处理
   const derived = deriveVisaTaskStatus(statuses);
   await db.fulfillmentTask.updateMany({
     where: {
@@ -517,4 +543,31 @@ export async function rederiveVisaTaskStatus(
     },
   });
   return derived;
+}
+
+/**
+ * 换人 resetVisa：该单 VISA 任务回「待处理」（新出行人重新送签）—— 任务级重置的唯一写点。
+ *
+ * 只重置活动态（IN_PROGRESS / CONFIRMED / FAILED）→ PENDING，绝不碰 CANCELLED：
+ * CANCELLED 是取消族订单终态化任务留下的终态记录，把它一并 PENDING 化会「复活」已取消订单的
+ * 履约任务（看板凭空冒出可执行任务、统计口径错乱）。CANCELLED 永远冻结为终态。
+ *
+ * 注意（现状，见收口方案「状态机」一节的矛盾清单）：这里只重置**任务**，乘客级送签进度不动——
+ * 换人事件 SWAP_PASSENGER 本身也不重置进度。返回被重置的任务数。
+ */
+export async function resetVisaTaskProgress(db: VisaDb, orderId: string): Promise<number> {
+  const reset = await db.fulfillmentTask.updateMany({
+    where: {
+      type: FulfillmentType.VISA_APPLICATION,
+      orderItem: { orderId },
+      status: { notIn: [FulfillmentStatus.PENDING, FulfillmentStatus.CANCELLED] },
+    },
+    data: {
+      status: FulfillmentStatus.PENDING,
+      startedAt: null,
+      completedAt: null,
+      failureReason: null,
+    },
+  });
+  return reset.count;
 }

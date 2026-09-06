@@ -18,10 +18,12 @@ import {
   deriveOrderVisaStatus,
   derivePassengerVisaState,
   deriveVisaTaskStatus,
+  orderVisaDeclarationEvent,
   ourUnsubmittedVisaPassengersWhere,
   ourVisaPassengersWhere,
   PASSENGER_VISA_STATE_LABEL,
   rederiveVisaTaskStatus,
+  resetVisaTaskProgress,
   transitionPassengerVisa,
   VISA_NEED_CONFIRM_SUBMITTED_MESSAGE,
   VISA_SELF_ARRANGED_NO_PROGRESS_MESSAGE,
@@ -211,6 +213,27 @@ describe('transitionPassengerVisa · 转移表与守卫', () => {
     });
     expect(transitionPassengerVisa(facts({ visaExempt: false }), { type: 'SWAP_PASSENGER', documentChanged: true, visaExempt: true })).toMatchObject({ changed: true, write: { passenger: { visaExempt: true } } });
     expect(transitionPassengerVisa(facts({ visaExempt: true }), { type: 'SWAP_PASSENGER', documentChanged: false })).toMatchObject({ changed: false, write: {} });
+    // 真换人且旧人本就随团办签：值没变（changed=false），但换人那条 UPDATE 仍带 visaExempt=false
+    //（事件给出了明确值，与换人通道既有落库形状一致）
+    expect(transitionPassengerVisa(facts({ visaExempt: false }), { type: 'SWAP_PASSENGER', documentChanged: true })).toMatchObject({
+      changed: false,
+      write: { passenger: { visaExempt: false } },
+    });
+  });
+});
+
+describe('orderVisaDeclarationEvent · 录单档翻译', () => {
+  it('四档各对应一个声明事件，经转移表落到对应的订单列写入', () => {
+    expect(orderVisaDeclarationEvent(NOT_NEEDED)).toEqual({ type: 'DECLARE_NOT_NEEDED' });
+    expect(orderVisaDeclarationEvent(HAS_VISA)).toEqual({ type: 'DECLARE_HAS_VISA' });
+    expect(orderVisaDeclarationEvent(NEEDED)).toEqual({ type: 'DECLARE_NEEDED', visaStatus: 'NEEDED' });
+    expect(orderVisaDeclarationEvent(E_VISA)).toEqual({ type: 'DECLARE_NEEDED', visaStatus: 'E_VISA' });
+    for (const s of [NOT_NEEDED, NEEDED, E_VISA, HAS_VISA]) {
+      const t = transitionPassengerVisa(facts({ orderVisaStatus: null }), orderVisaDeclarationEvent(s));
+      expect(t).toMatchObject({ ok: true, changed: true, write: { order: { visaStatus: s } } });
+    }
+    // 同档重复声明 → 幂等（changed=false，不写）
+    expect(transitionPassengerVisa(facts({ orderVisaStatus: NEEDED }), orderVisaDeclarationEvent(NEEDED))).toMatchObject({ ok: true, changed: false, write: {} });
   });
 });
 
@@ -266,6 +289,9 @@ describe('唯一写点 · Prisma 调用形状', () => {
     const { db, raw } = mockDb();
     await writePassengerVisaExempt(db, 'p1', { visaExempt: true, visaSubmissionStatus: PENDING });
     expect(raw.passenger.update).toHaveBeenCalledWith({ where: { id: 'p1' }, data: { visaExempt: true, visaSubmissionStatus: PENDING } });
+    // 换人：身份列与签证列同一条 UPDATE；签证列后写压过 extra 里的同名键
+    await writePassengerVisaExempt(db, 'p1', { visaExempt: false }, { fullName: 'NEW', visaExempt: true });
+    expect(raw.passenger.update).toHaveBeenLastCalledWith({ where: { id: 'p1' }, data: { fullName: 'NEW', visaExempt: false } });
     await writeOrderVisaStatus(db, 'o1', NEEDED, { noteVisa: '备注' });
     expect(raw.order.update).toHaveBeenCalledWith({ where: { id: 'o1' }, data: { noteVisa: '备注', visaStatus: NEEDED } });
     await writeOrderVisaStatus(db, 'o1', HAS_VISA);
@@ -291,6 +317,25 @@ describe('唯一写点 · Prisma 调用形状', () => {
     expect(raw.fulfillmentTask.updateMany).toHaveBeenLastCalledWith({
       where: { orderItem: { orderId: 'o1' }, type: FulfillmentType.VISA_APPLICATION, status: { in: [FulfillmentStatus.PENDING, FulfillmentStatus.IN_PROGRESS] } },
       data: { status: FulfillmentStatus.CONFIRMED, completedAt: expect.any(Date) },
+    });
+  });
+
+  it('rederiveVisaTaskStatus：老数据缺送签进度按待处理', async () => {
+    const { db, raw } = mockDb();
+    raw.passenger.findMany.mockResolvedValueOnce([{ visaSubmissionStatus: null }, { visaSubmissionStatus: CONFIRMED }]);
+    expect(await rederiveVisaTaskStatus(db, 'o1', { touch: DERIVABLE_TASK_STATUSES })).toBe(FulfillmentStatus.PENDING);
+  });
+
+  it('resetVisaTaskProgress：换人重置只动活动态（IN_PROGRESS/CONFIRMED/FAILED → PENDING），绝不碰 CANCELLED', async () => {
+    const { db, raw } = mockDb();
+    expect(await resetVisaTaskProgress(db, 'o1')).toBe(1);
+    expect(raw.fulfillmentTask.updateMany).toHaveBeenCalledWith({
+      where: {
+        type: FulfillmentType.VISA_APPLICATION,
+        orderItem: { orderId: 'o1' },
+        status: { notIn: [FulfillmentStatus.PENDING, FulfillmentStatus.CANCELLED] },
+      },
+      data: { status: FulfillmentStatus.PENDING, startedAt: null, completedAt: null, failureReason: null },
     });
   });
 });
