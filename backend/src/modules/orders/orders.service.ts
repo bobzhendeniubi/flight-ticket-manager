@@ -52,6 +52,7 @@ import {
   UnprocessableEntityError,
 } from '../../lib/errors.js';
 import type { ItineraryData } from '../../lib/itinerary-pdf.js';
+import { hasCapability, type Capability } from '../../lib/capabilities.js';
 import { writeAudit, writeAuditWithinTx } from '../../lib/audit.js';
 import {
   composePassengerFullName,
@@ -1887,6 +1888,17 @@ async function readOrderSettlementCalendarAudit(
   return calendar as Record<string, unknown>;
 }
 
+/**
+ * service 层内联闸的唯一入口，与路由层的 requireCapability / can() 同一张表。
+ *
+ * actor 只带 role —— service 的调用签名里没有岗位，也不需要：这里用到的能力受众全是
+ * 「管理员 / 内部员工 / 代理」这三档，不看岗位。真正看岗位的两档（财务、航班维护）
+ * 在路由层的 requireCapability 上就判完了，进不到这里。
+ */
+function actorCan(actor: { role: UserRole }, cap: Capability): boolean {
+  return hasCapability({ role: actor.role }, cap);
+}
+
 export class OrderService {
   private readonly pricing = new PricingService();
 
@@ -2081,7 +2093,7 @@ export class OrderService {
       body.flightSettlementPriceCny !== undefined
     ) {
       const role = isGuest ? undefined : requester.role;
-      const isOps = role === UserRole.ADMIN || role === UserRole.STAFF;
+      const isOps = role != null && actorCan({ role }, 'orders.price_adjust');
       const isAgentSelfSettlement =
         role === UserRole.AGENT &&
         !body.priceAdjustment &&
@@ -4963,7 +4975,7 @@ export class OrderService {
    * 仅 ADMIN 可删（STAFF 不行）；返回删除前后的最小快照供路由层写审计。
    */
   async softDeleteOrder(id: string, requester: OrderRequester) {
-    if (requester.role !== UserRole.ADMIN && requester.role !== UserRole.STAFF) {
+    if (!actorCan(requester, 'orders.delete')) {
       throw new ForbiddenError('仅内部员工可删除订单');
     }
     // 只找未删的订单（已删的再次删 → 视为不存在，幂等）
@@ -5020,7 +5032,7 @@ export class OrderService {
     query: { page: number; pageSize: number; search?: string },
     requester: OrderRequester,
   ) {
-    if (requester.role !== UserRole.ADMIN && requester.role !== UserRole.STAFF) {
+    if (!actorCan(requester, 'orders.read_deleted')) {
       throw new ForbiddenError('仅内部员工可查看回收站');
     }
     const where: Prisma.OrderWhereInput = { deletedAt: { not: null } };
@@ -5119,7 +5131,7 @@ export class OrderService {
    * 未删 / 不存在的订单 → NotFound（findFirst 只匹配 deletedAt 非空，幂等）。
    */
   async restoreOrder(id: string, requester: OrderRequester) {
-    if (requester.role !== UserRole.ADMIN && requester.role !== UserRole.STAFF) {
+    if (!actorCan(requester, 'orders.delete')) {
       throw new ForbiddenError('仅内部员工可恢复订单');
     }
     const order = await prisma.order.findFirst({
@@ -5261,7 +5273,7 @@ export class OrderService {
     total: number;
     agentBalanceAfter: number;
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'payments.overpay.handle')) {
       throw new ForbiddenError('仅运营/管理员可将多付存入代理余额');
     }
 
@@ -5375,7 +5387,7 @@ export class OrderService {
     status: OrderStatus;
     agentBalanceAfter: number;
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'payments.overpay.handle')) {
       throw new ForbiddenError('仅运营/管理员可用代理余额抵尾款');
     }
     const apply = round2(amount);
@@ -5519,7 +5531,7 @@ export class OrderService {
     receiptId: string;
     receiptNo: string;
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'payments.overpay.handle')) {
       throw new ForbiddenError('仅运营/管理员可将订单超额转入挂账池');
     }
 
@@ -5834,16 +5846,11 @@ export class OrderService {
     // 仅 ADMIN/STAFF 可用，散客/AGENT 携带一律 400。放在最顶端（早于任何 prisma 调用）→ 未触库即拒。
     if (
       body.manualUnitPriceCny !== undefined &&
-      requester.role !== UserRole.ADMIN &&
-      requester.role !== UserRole.STAFF
+      !actorCan(requester, 'orders.price_adjust')
     ) {
       throw new BadRequestError('无权手动录入结算单价');
     }
-    if (
-      hasDiscount &&
-      requester.role !== UserRole.ADMIN &&
-      requester.role !== UserRole.STAFF
-    ) {
+    if (hasDiscount && !actorCan(requester, 'orders.price_adjust')) {
       throw new BadRequestError('无权录入优惠');
     }
 
@@ -6272,7 +6279,7 @@ export class OrderService {
       reason?: string;
     };
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.settlement_price.write')) {
       throw new ForbiddenError('仅运营/管理员可改结算价');
     }
     const unitPriceCny = input.unitPriceCny;
@@ -7013,7 +7020,7 @@ export class OrderService {
       after?: { subtotal: string; total: string };
     }>;
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.price_adjust')) {
       throw new ForbiddenError('仅运营/管理员可调整订单价格');
     }
     const { mode, amountCny, reasonCode, reasonText } = input;
@@ -7182,7 +7189,7 @@ export class OrderService {
 
     const allowed = ALLOWED_TRANSITIONS[order.status];
     // ADMIN 可用 force=true 跳过状态机；其他角色或非 force 调用走标准检查
-    const isAdminForce = force === true && requester.role === 'ADMIN';
+    const isAdminForce = force === true && actorCan(requester, 'orders.force_status');
     if (!allowed.includes(toStatus) && !isAdminForce) {
       // 高频误操作单独给指引：已收款的单不能一键取消——钱账要走退款通道，申请后机位立即释放。
       const cancelPaidHint =
@@ -8228,7 +8235,7 @@ export class OrderService {
     before: { visaIssueDate: string | null; visaEffectiveDate: string | null; visaExpiry: string | null };
     after: { visaIssueDate: string | null; visaEffectiveDate: string | null; visaExpiry: string | null };
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.passengers.write')) {
       throw new ForbiddenError('仅运营/管理员可录入签证日期');
     }
 
@@ -8312,7 +8319,7 @@ export class OrderService {
     /** 本次真正变了值的字段（两个都没变时为空数组 —— 回填同一个号是幂等的，不是错误）。 */
     changedFields: Array<'pnr' | 'eticketNumber'>;
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.passengers.write')) {
       throw new ForbiddenError('仅运营/管理员可回填票号');
     }
 
@@ -8702,7 +8709,7 @@ export class OrderService {
     refundAmountCny: number;
     refundId: string;
   }> {
-    if (requester.role !== UserRole.ADMIN && requester.role !== UserRole.STAFF) {
+    if (!actorCan(requester, 'orders.passengers.write')) {
       throw new ForbiddenError('仅运营/管理员可做换人退款');
     }
     const reason = input.reason.trim();
@@ -8896,7 +8903,7 @@ export class OrderService {
     beforeReplacementOrderNumber: string | null;
     replacementOrderNumber: string | null;
   }> {
-    if (requester.role !== UserRole.ADMIN && requester.role !== UserRole.STAFF) {
+    if (!actorCan(requester, 'orders.passengers.write')) {
       throw new ForbiddenError('仅运营/管理员可补填接手订单号');
     }
 
@@ -9052,11 +9059,7 @@ export class OrderService {
   }> {
     // 代理自助纠错（correctFlightSchedule）已在上游过完归属 + 下单当天窗口闸，从此处放行；
     // 其余一切改期入口维持原样只认运营/管理员（自助旗子请求体注入不进来）。
-    if (
-      actor.role !== UserRole.ADMIN &&
-      actor.role !== UserRole.STAFF &&
-      !input.selfServiceCorrection
-    ) {
+    if (!actorCan(actor, 'orders.reschedule') && !input.selfServiceCorrection) {
       throw new ForbiddenError('仅运营/管理员可改期');
     }
     // 改期差价可正可负（与换酒店差价 / 酒店改期差价同一 adjustmentCny 机制）：改到更便宜的班次
@@ -10100,7 +10103,7 @@ export class OrderService {
     //     但在审计里打 feeOffList，运营复核时一眼能挑出来。
     const isInternalActor = actor.role === UserRole.ADMIN || actor.role === UserRole.STAFF;
     if (!isInternalActor) {
-      if (actor.role !== UserRole.AGENT) {
+      if (!actorCan(actor, 'orders.passengers.swap')) {
         throw new ForbiddenError('仅运营/管理员可换人');
       }
       await this.assertPassengerEditScope(orderId, actor);
@@ -11429,7 +11432,7 @@ export class OrderService {
   }> {
     const isInternalActor = actor.role === UserRole.ADMIN || actor.role === UserRole.STAFF;
     if (!isInternalActor) {
-      if (actor.role !== UserRole.AGENT) {
+      if (!actorCan(actor, 'orders.passengers.swap')) {
         throw new ForbiddenError('仅运营/代理可查看换人预览');
       }
       // 归属闸与换人同一口径（代理只能看自己 + 下级代理的单）。
@@ -12154,7 +12157,7 @@ export class OrderService {
       retainCny: number;
     } | null;
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.passengers.write')) {
       throw new ForbiddenError('仅运营/管理员可改乘客自备签');
     }
 
@@ -13126,7 +13129,7 @@ export class OrderService {
       };
     };
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.hotel.write')) {
       throw new ForbiddenError('仅运营/管理员可拆分房组');
     }
 
@@ -13400,7 +13403,7 @@ export class OrderService {
     };
   }> {
     // 权限口径与机票改期/换酒店完全一致（路由层也断言一次，双闸）。
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.hotel.write')) {
       throw new ForbiddenError('仅运营/管理员可改酒店入住日期');
     }
     const feeCny = Math.trunc(input.feeCny ?? 0);
@@ -13653,7 +13656,7 @@ export class OrderService {
       usedAgentBalance: boolean;
     };
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.agent.write')) {
       throw new ForbiddenError('仅运营/管理员可更改订单归属代理');
     }
     const newAgentId = input.agentId ?? null;
@@ -13967,7 +13970,7 @@ export class OrderService {
       visaTaskCreated: boolean;
     };
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.add_ground_item')) {
       throw new ForbiddenError('仅运营/管理员可补录签证或房费');
     }
 
@@ -14224,7 +14227,7 @@ export class OrderService {
       roomControl: string | null;
     };
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.hotel.write')) {
       throw new ForbiddenError('仅运营/管理员可补收单房差');
     }
     const { perNightCny, nights } = input;
@@ -14499,7 +14502,7 @@ export class OrderService {
       after: { subtotal: string; total: string };
     };
   }> {
-    const isOps = actor.role === UserRole.ADMIN || actor.role === UserRole.STAFF;
+    const isOps = actorCan(actor, 'orders.price_adjust');
     const isAgentSelfSettlement =
       actor.role === UserRole.AGENT && options?.viaAgentSelfSettlement === true;
     if (!isOps && !isAgentSelfSettlement) {
@@ -14712,7 +14715,7 @@ export class OrderService {
       warnings: string[];
     };
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.change_bundle')) {
       throw new ForbiddenError('仅运营/管理员可更改套餐档次');
     }
     const note = input.note?.trim() || null;
@@ -15701,7 +15704,7 @@ export class OrderService {
     commission: { mode: 'NONE' | 'SPLIT' | 'BLOCKED'; amountCny: number; reversalCny: number };
     roomGroupConflict: boolean;
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.split')) {
       throw new ForbiddenError('仅运营/管理员可拆单');
     }
     const order = await loadOrderForSplit(prisma, orderId);
@@ -15740,7 +15743,7 @@ export class OrderService {
     input: SplitOrderInput,
     actor: { userId: string; role: UserRole },
   ): Promise<SplitOrderResult> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.split')) {
       throw new ForbiddenError('仅运营/管理员可拆单');
     }
 
@@ -16940,7 +16943,7 @@ export class OrderService {
     },
     actor: { userId: string; role: UserRole },
   ): Promise<ReschedulePassengersResult> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.reschedule')) {
       throw new ForbiddenError('仅运营/管理员可按人改期');
     }
 
@@ -17592,7 +17595,7 @@ export class OrderService {
     leg: FlightLegSide,
     actor: { userId: string; role: UserRole },
   ): Promise<CancelLegPreview> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.cancel_leg')) {
       throw new ForbiddenError(`仅运营/管理员可取消${LEG_ZH[leg]}`);
     }
     const { order, legItem, blockers, warnings, ackWarnings } = await this._assessCancelLeg(
@@ -17660,7 +17663,7 @@ export class OrderService {
   ): Promise<{ order: ReturnType<typeof serializeOrder>; audit: CancelLegAudit }> {
     const leg = input.leg;
     const legZh = LEG_ZH[leg];
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.cancel_leg')) {
       throw new ForbiddenError(`仅运营/管理员可取消${legZh}`);
     }
 
@@ -18361,7 +18364,7 @@ export class OrderService {
     body: { passengerIds?: string[]; releaseReturn?: boolean },
     actor: { userId: string; role: UserRole },
   ): Promise<NoShowPreview> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.no_show')) {
       throw new ForbiddenError('仅运营/管理员可标记 no-show');
     }
     assertNonEmptyPassengerSelection(body.passengerIds);
@@ -18414,7 +18417,7 @@ export class OrderService {
     targetOrderId: string;
     audit: NoShowAudit;
   }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.no_show')) {
       throw new ForbiddenError('仅运营/管理员可标记 no-show');
     }
     // schema 已经把 `[]` 挡在门外；这里再挡一次是给绕过 schema 的内部调用兜底 ——
@@ -19056,7 +19059,7 @@ export class OrderService {
     orderId: string,
     actor: { userId: string; role: UserRole },
   ): Promise<RestoreReturnLegPreview> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.cancel_leg')) {
       throw new ForbiddenError('仅运营/管理员可恢复回程');
     }
     const assessed = await this._assessRestoreReturnLeg(prisma, orderId);
@@ -19135,7 +19138,7 @@ export class OrderService {
     input: RestoreReturnLegBody,
     actor: { userId: string; role: UserRole },
   ): Promise<{ order: ReturnType<typeof serializeOrder>; audit: RestoreReturnLegAudit }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.cancel_leg')) {
       throw new ForbiddenError('仅运营/管理员可恢复回程');
     }
 
@@ -19595,7 +19598,7 @@ export class OrderService {
     orderId: string,
     actor: { userId: string; role: UserRole },
   ): Promise<VoidReturnLegPreview> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.cancel_leg')) {
       throw new ForbiddenError('仅运营/管理员可作废回程');
     }
     const assessed = await this._assessVoidReturnLeg(prisma, orderId);
@@ -19613,7 +19616,7 @@ export class OrderService {
     input: VoidReturnLegBody,
     actor: { userId: string; role: UserRole },
   ): Promise<{ order: ReturnType<typeof serializeOrder>; audit: VoidReturnLegAudit }> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    if (!actorCan(actor, 'orders.cancel_leg')) {
       throw new ForbiddenError('仅运营/管理员可作废回程');
     }
 
