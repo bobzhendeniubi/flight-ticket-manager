@@ -4846,6 +4846,15 @@ function toRoomingPassengers(order: OrderSummary): RoomingPassenger[] {
     .map((p) => ({ id: p.id, name: p.fullName, gender: p.gender ?? null }));
 }
 
+// 「酒店情况」卡标题后缀：跟着实际分房走。未分房不带后缀；全部整间 = 单住/整间；
+// 任一半间才是拼房。0905 公测反馈：此前写死「· 拼房」，客人已分大床单住仍显示拼房。
+function roomingHeadline(order: OrderSummary): string {
+  const groups = (order.roomAssignment?.roomGroups ?? []).filter((g) => (g.passengerIds?.length ?? 0) > 0);
+  if (groups.length === 0) return '酒店情况';
+  const hasShared = groups.some((g) => g.roomFraction === 0.5);
+  return hasShared ? '酒店情况 · 拼房' : '酒店情况 · 单住/整间';
+}
+
 // 分房情况一句话摘要（详情「酒店情况」用；等价旧系统备注里的拼房说明）。
 function roomingSummary(order: OrderSummary): string {
   const groups = (order.roomAssignment?.roomGroups ?? []).filter((g) => (g.passengerIds?.length ?? 0) > 0);
@@ -5266,7 +5275,7 @@ function OrderDrawer({
             {(needsRooming || hotelName) && (
               <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
                 <div className="flex items-center justify-between gap-2">
-                  <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">酒店情况 · 拼房</div>
+                  <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">{roomingHeadline(o)}</div>
                   <div className="flex items-center gap-2">
                     {/* 事后补收单房差（仅 ADMIN/STAFF）：X元/晚 × N晚，记账、房控可见 */}
                     {isOps && (
