@@ -534,7 +534,7 @@ describe('createOrder · 机票日历与手工价互斥（手工价一律优先�
   it('GROUND 套餐日历 + 优惠 + 指定酒店加项并存 → 总额 = 日历价 + 加价×人数 − 优惠×人数', async () => {
     stubCreateOrderPrisma();
     mockPrisma.bundle.findMany.mockResolvedValue([
-      { id: 'b-1', name: '三星套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+      { id: 'b-1', name: '三星套餐', settlementTier: 'THREE_STAR', settlementNights: 1, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null },
     ]);
     mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 1500 });
     const service = makeGroundService();
@@ -564,7 +564,7 @@ describe('createOrder · 机票日历与手工价互斥（手工价一律优先�
   it('普通 DISCOUNT 无结构化标记：套餐日历吞掉调价，机票日历仍阻断接管', async () => {
     stubCreateOrderPrisma();
     mockPrisma.bundle.findMany.mockResolvedValue([
-      { id: 'b-1', name: '三星套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+      { id: 'b-1', name: '三星套餐', settlementTier: 'THREE_STAR', settlementNights: 1, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null },
     ]);
     mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 1500 });
     await makeGroundService().createOrder(

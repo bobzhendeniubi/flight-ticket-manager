@@ -106,7 +106,7 @@ describe('OrderService.quoteOrder · settlementPreview', () => {
       metadata: { goDate: '2026-09-01' },
     };
     mockPrisma.bundle.findMany.mockResolvedValue([
-      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null },
     ]);
     const service = new OrderService();
     stubPricing(service, [
@@ -138,7 +138,7 @@ describe('OrderService.quoteOrder · settlementPreview', () => {
       metadata: { goDate: '2026-09-01' },
     };
     mockPrisma.bundle.findMany.mockResolvedValue([
-      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null },
     ]);
     mockGetSettlementRate.mockResolvedValue(null);
     const service = new OrderService();
@@ -168,7 +168,7 @@ describe('OrderService.quoteOrder · settlementPreview', () => {
       metadata: { goDate: '2026-09-01' },
     };
     mockPrisma.bundle.findMany.mockResolvedValue([
-      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null },
     ]);
     mockResolveAgentSettlementDiscount.mockResolvedValue({
       ruleId: 'discount-1',
@@ -218,7 +218,7 @@ describe('OrderService.quoteOrder · settlementPreview', () => {
       metadata: { goDate: '2026-09-01' },
     };
     mockPrisma.bundle.findMany.mockResolvedValue([
-      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null },
     ]);
     mockResolveAgentSettlementDiscount.mockResolvedValue({
       ruleId: 'discount-1',
@@ -259,7 +259,7 @@ describe('OrderService.quoteOrder · settlementPreview', () => {
       metadata: { goDate: '2026-09-01' },
     };
     mockPrisma.bundle.findMany.mockResolvedValue([
-      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null },
     ]);
     mockResolveAgentSettlementDiscount.mockResolvedValue({
       ruleId: 'discount-1',
@@ -307,10 +307,10 @@ describe('OrderService.quoteOrder · settlementPreview', () => {
       metadata: { goDate: '2026-09-15' },
     };
     mockPrisma.bundle.findMany.mockResolvedValue([
-      { id: 'bundle-a', name: '套餐 A', settlementTier: 'THREE_STAR', settlementNights: 1 },
-      { id: 'bundle-b', name: '套餐 B', settlementTier: 'FOUR_STAR', settlementNights: 2 },
+      { id: 'bundle-a', name: '套餐 A', settlementTier: 'THREE_STAR', settlementNights: 1, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null },
+      { id: 'bundle-b', name: '套餐 B', settlementTier: 'FOUR_STAR', settlementNights: 2, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null },
     ]);
-    mockResolveRetailSettlementDiscount.mockImplementation(async (_tier, _nights, departDate) => ({
+    mockResolveRetailSettlementDiscount.mockImplementation(async (_routeKey, _tier, _nights, departDate) => ({
       ruleId: departDate === '2026-09-01' ? 'retail-a' : 'retail-b',
       kind: 'RETAIL',
       discountPerPersonCny: departDate === '2026-09-01' ? 80 : 120,
@@ -341,12 +341,14 @@ describe('OrderService.quoteOrder · settlementPreview', () => {
     ]));
     expect(mockResolveRetailSettlementDiscount).toHaveBeenNthCalledWith(
       1,
+      'MFM-DAD',
       'THREE_STAR',
       1,
       '2026-09-01',
     );
     expect(mockResolveRetailSettlementDiscount).toHaveBeenNthCalledWith(
       2,
+      'MFM-DAD',
       'FOUR_STAR',
       2,
       '2026-09-15',
@@ -366,7 +368,7 @@ describe('OrderService.quoteOrder · settlementPreview', () => {
       metadata: { goDate: '2026-09-01' },
     };
     mockPrisma.bundle.findMany.mockResolvedValue([
-      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null },
     ]);
     mockGetSettlementRate.mockResolvedValue(null);
     mockResolveRetailSettlementDiscount.mockResolvedValue({
@@ -403,7 +405,7 @@ describe('OrderService.quoteOrder · settlementPreview', () => {
       metadata: { goDate: '2026-09-01' },
     };
     mockPrisma.bundle.findMany.mockResolvedValue([
-      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null },
     ]);
     mockResolveRetailSettlementDiscount.mockResolvedValue({
       ruleId: 'retail-discount-1',
@@ -489,7 +491,7 @@ describe('shouldApplyRetailSettlementDiscount · 下单与试算的同一把尺'
       metadata: { goDate: '2026-09-01' },
     };
     mockPrisma.bundle.findMany.mockResolvedValue([
-      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null },
     ]);
     mockResolveRetailSettlementDiscount.mockResolvedValue({
       ruleId: 'retail-1',
@@ -524,7 +526,7 @@ describe('shouldApplyRetailSettlementDiscount · 下单与试算的同一把尺'
       metadata: { goDate: '2026-09-01' },
     };
     mockPrisma.bundle.findMany.mockResolvedValue([
-      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1 },
+      { id: 'bundle-1', name: '套餐', settlementTier: 'THREE_STAR', settlementNights: 1, outboundFlight: { originCode: 'MFM', destinationCode: 'DAD' }, returnFlight: null },
     ]);
     // 同业价压到折后价（1500）以下，避开渠道倒挂闸——本例验的不是那道闸。
     mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 500 });
