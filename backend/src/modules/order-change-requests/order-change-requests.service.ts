@@ -1209,7 +1209,15 @@ export class OrderChangeRequestsService {
           where: { id, status: OrderChangeRequestStatus.PENDING, appliedAt: null },
           data: { decidedById: null, decidedAt: null, decisionNote: null, applyError: message },
         });
-        throw new BadRequestError(message);
+        // 状态码统一收成 400（既有契约：确认失败一律 400，申请留在 PENDING），
+        // 但底层通道的**稳定 code 原样带出** —— 取消航段的 ACKNOWLEDGEMENT_REQUIRED
+        // 就靠它让前端弹「我已知悉」二次确认。裹成通用 BAD_REQUEST 的话，前端只能回去
+        // 匹配中文文案，文案一改就失灵。
+        throw new AppError(message, {
+          statusCode: 400,
+          code: err instanceof AppError ? err.code : 'BAD_REQUEST',
+          details: err instanceof AppError ? err.details : undefined,
+        });
       }
     }
 
