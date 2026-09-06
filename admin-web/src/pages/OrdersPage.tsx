@@ -4914,7 +4914,7 @@ function OrderDrawer({
   order,
   onClose,
   onAdvance,
-  onChanged,
+  onChanged: onChangedProp,
   onOrderUpdated,
   onDelete,
   onUseAsTemplate,
@@ -4995,6 +4995,19 @@ function OrderDrawer({
     return () => { cancelled = true; };
   }, [token, order.id]);
   useEffect(() => hydrate(), [hydrate]);
+  /**
+   * 抽屉里任何改动了订单的操作（认款 / 撤销收款 / 改价 / 加减项…）都走这里：
+   * **先把本抽屉重新补水，再通知父级刷列表**。
+   *
+   * 抽屉里有两处各自取数：上面「付款情况」卡读补水快照 o（getOrder 的结果），下面「收款」
+   * 区自己拉 payments。以前 onChanged 只 bump 列表的 refreshNonce，补水快照原地不动——
+   * 认款成功后收款区已显示已结清，上方付款情况卡还写着「¥0 / 应收 ¥X」，同一屏自相矛盾。
+   * 统一到 getOrder 这一个来源后两块必然同步。
+   */
+  const onChanged = useCallback(() => {
+    hydrate();
+    onChangedProp?.();
+  }, [hydrate, onChangedProp]);
   // 父级在状态流转/发起退款申请成功后 setSelected 传回**全量**订单（带 payments/refunds，
   // 与 getOrder 同一序列化路径）；列表行是精简快照（恒无这两字段）。仅当传入全量订单时
   // 同步 hydrated，否则保留已补水的详情——不同步的话，从抽屉里点「申请退款/同意退款」
