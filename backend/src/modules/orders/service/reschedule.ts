@@ -74,6 +74,7 @@ import {
 } from './shared.js';
 import type { SplitOrderResult } from './split.js';
 import type { OrderService } from '../orders.service.js';
+import { runOrderOrchestration, type OrderOrchestrationCtx } from './order-mutation.js';
 
 export type RescheduleCommittedContext = {
   orderItemId: string;
@@ -1384,26 +1385,45 @@ export async function assertSelfServiceCorrectionIsFreeOfCharge(svc: OrderServic
  * 座位：本方法自己不动座位 —— 拆单不动库存（两单加起来占同一批座），改期的「先放旧再原子拿新」
  *       守卫原样生效。
  */
+export interface ReschedulePassengersInput {
+  passengerIds: string[];
+  orderItemId: string;
+  newScheduleId: string;
+  newCabin?: CabinClass;
+  feeCny?: number;
+  feeLabel?: string;
+  note?: string;
+  roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
+  requestToken: string;
+}
+
 export async function reschedulePassengers(
   svc: OrderService,
   orderId: string,
-  input: {
-    passengerIds: string[];
-    orderItemId: string;
-    newScheduleId: string;
-    newCabin?: CabinClass;
-    feeCny?: number;
-    feeLabel?: string;
-    note?: string;
-    roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
-    requestToken: string;
-  },
+  input: ReschedulePassengersInput,
   actor: { userId: string; role: UserRole },
 ): Promise<ReschedulePassengersResult> {
   if (!actorCan(actor, 'orders.reschedule')) {
     throw new ForbiddenError('仅运营/管理员可按人改期');
   }
+  // OrderMutation 内核 · 编排模式：按人改期 = 拆单（自己一个事务，已接内核）+ 对新单 / 本单改期
+  //（rescheduleOrderItem 自己一个事务）。两段各自持锁、各自守恒，编排层没有能包住两者的事务
+  //（Prisma 交互式事务不可嵌套），内核在这里只统一「全部段落提交后」的汇总审计顺序。
+  // 幂等仍在 body 里：拆单流水 (源单, token) 的编排快照比对 + 全员分支的航段行 token 回放——
+  // 回放命中后还要继续对新单改期（rescheduleOrderItem 按 token 自行回放），不是查到即返回。
+  return runOrderOrchestration<ReschedulePassengersResult>(
+    { orderId, actor, action: 'RESCHEDULE_PASSENGERS', requestToken: input.requestToken },
+    (ctx) => reschedulePassengersWithin(svc, orderId, input, actor, ctx),
+  );
+}
 
+async function reschedulePassengersWithin(
+  svc: OrderService,
+  orderId: string,
+  input: ReschedulePassengersInput,
+  actor: { userId: string; role: UserRole },
+  ctx: OrderOrchestrationCtx,
+): Promise<ReschedulePassengersResult> {
   // ── 1. 读源单：乘客名册 + 带班次的机票行（判去程/回程用）──
   const order = await prisma.order.findUnique({
     where: { id: orderId },
@@ -1618,7 +1638,8 @@ export async function reschedulePassengers(
         split: null,
       },
     };
-    await svc._auditReschedulePassengers(result, actor, movedIds);
+    // 汇总审计在改期事务提交后写（内核 afterCommit；与原先 await 顺序一致）。
+    ctx.afterCommit(() => svc._auditReschedulePassengers(result, actor, movedIds));
     return result;
   }
 
@@ -1738,7 +1759,8 @@ export async function reschedulePassengers(
       split: { movedShareCny: split.movedShareCny, movedPaidCny: split.movedPaidCny },
     },
   };
-  await svc._auditReschedulePassengers(result, actor, movedIds);
+  // 汇总审计在拆单 + 改期两段都提交后写（内核 afterCommit；与原先 await 顺序一致）。
+  ctx.afterCommit(() => svc._auditReschedulePassengers(result, actor, movedIds));
   return result;
 }
 
