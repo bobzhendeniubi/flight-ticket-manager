@@ -25,7 +25,6 @@ import {
   ForbiddenError,
   NotFoundError,
 } from '../../../lib/errors.js';
-import { writeAudit } from '../../../lib/audit.js';
 import { splitPassengerFullName } from '../../../lib/passenger-name.js';
 import { levenshteinDistance, TYPO_MAX_EDIT_DISTANCE } from '../../../lib/edit-distance.js';
 import { orderVisaStatusRequiresVisa } from '../visa-need.js';
@@ -105,6 +104,7 @@ import {
 } from './shared.js';
 import { syncVisaTasksForOrder } from './visa-sync.js';
 import type { OrderService } from '../orders.service.js';
+import { runOrderMutation } from './order-mutation.js';
 
 // ── 类型 ────────────────────────────────────────────────────────────────
 
@@ -714,12 +714,24 @@ export async function swapPassenger(
   const resetInvoice = isInternalActor ? Boolean(input.resetInvoice) : false;
   const resetVisa = isInternalActor ? Boolean(input.resetVisa) : true;
 
-  const result = await prisma.$transaction(async (tx) => {
+  // OrderMutation 内核（审查根因 R5）：事务 + 订单行锁 + 事务内审计 + 守恒断言
+  //（换人只动应收 / 售后费：已收、座位、房量、成本四维前后必须恒等，不平整事务回滚）。
+  // 换人没有 requestToken（前端不带、路由 schema 也没有），幂等留待后续批次单独拍板。
+  // 下方按列读锁行的 SELECT … FOR UPDATE 保留原样：同一事务内对同一行重复上锁无副作用，
+  // 它读出来的列后面各闸都要用。
+  const result = await runOrderMutation({
+    orderId,
+    actor,
+    action: 'SWAP_PASSENGER',
+    conserve: { unchanged: ['paid', 'seats', 'rooms', 'cost'], label: '换人' },
+  }, async (ctx) => {
+    const tx = ctx.tx;
     // Order 行锁（与改期 rescheduleOrderItem / worker 超时释放 / 到账入账同一把 FOR UPDATE 行锁）：
     // 换人要读-改-写 adjustmentCny/adjustments，无锁会与并发改期/换人 lost-update（一方覆盖另一方的流水）。
     const orderRows = await tx.$queryRaw<
       Array<{
         id: string;
+        orderNumber: string;
         adjustmentCny: number;
         adjustments: Prisma.JsonValue;
         status: OrderStatus;
@@ -733,7 +745,7 @@ export async function swapPassenger(
         // 结算价锁：锁着的单不重算结算价（财务已按这个应收对过账），见下方「1f」。
         settlementLocked: boolean | null;
       }>
-    >`SELECT id, "adjustmentCny", adjustments, status, "deletedAt", "visaStatus", "outboundInvoiced", "returnInvoiced", "systemInvoiced", "settlementLocked" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+    >`SELECT id, "orderNumber", "adjustmentCny", adjustments, status, "deletedAt", "visaStatus", "outboundInvoiced", "returnInvoiced", "systemInvoiced", "settlementLocked" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
     const order = orderRows[0];
     if (!order) throw new NotFoundError('订单不存在');
 
@@ -1280,13 +1292,36 @@ export async function swapPassenger(
       select: { fullName: true, documentNumber: true },
     });
 
+    // ── 换人重算撞上已计提佣金 → 单独留一条 WARNING 审计（复审 M2），**与换人同一事务** ──
+    // 与「改结算价」「改归属」两条路同一个 action、同一批字段：佣金按计提当时的价格基数一次算死，
+    // 换人重算改了 total 却不重算佣金，财务要能一眼捞出所有「基数已变、佣金没动」的单。
+    // 原先在事务提交后 await 写；改进事务是内核口径——资金动作的留痕与动作同生共死。
+    if (repricedSubtotalCny != null && repriceCommissionCny !== null) {
+      await ctx.audit({
+        action: 'SETTLEMENT_PRICE_CHANGED_AFTER_COMMISSION',
+        targetType: 'ORDER',
+        targetId: orderId,
+        targetLabel: order.orderNumber,
+        before: { accruedCommissionCny: repriceCommissionCny },
+        after: {
+          total: repricedSubtotalCny.toString(),
+          orderItemId: repriceItemId,
+          // 佣金不随换人重算，这条审计就是「基数已变、佣金没动」的留痕。
+          commissionRecalculated: false,
+          reason: '换人重算结算价',
+          passengerId,
+        },
+        severity: AuditSeverity.WARNING,
+      });
+    }
+
     return {
       beforeIdentity,
       beforeSnapshot,
       afterIdentity: afterPassenger,
       visaTasksReset,
       clearedProfile: documentChanged,
-      // 佣金基数漂移（M2）：换人重算真的改了 total 且本单已计提佣金 → 事务外补一条 WARNING 审计。
+      // 佣金基数漂移（M2）：换人重算真的改了 total 且本单已计提佣金（审计已在上方事务内写）。
       repriceCommissionCny: repricedSubtotalCny != null ? repriceCommissionCny : null,
       repricedTotalCny: repricedSubtotalCny,
       repriceItemId,
@@ -1310,30 +1345,6 @@ export async function swapPassenger(
     where: { id: orderId },
     include: ORDER_FULL_INCLUDE,
   });
-
-  // ── 换人重算撞上已计提佣金 → 单独留一条 WARNING 审计（复审 M2）────────────────
-  // 与「改结算价」「改归属」两条路同一个 action、同一批字段：佣金按计提当时的价格基数一次算死，
-  // 换人重算改了 total 却不重算佣金，财务要能一眼捞出所有「基数已变、佣金没动」的单。
-  // await 而非 fire-and-forget：与那两条路同口径，落审计后再返回。
-  if (result.repriceCommissionCny !== null) {
-    await writeAudit({
-      actor: { userId: actor.userId, role: actor.role },
-      action: 'SETTLEMENT_PRICE_CHANGED_AFTER_COMMISSION',
-      targetType: 'ORDER',
-      targetId: orderId,
-      targetLabel: finalOrder.orderNumber,
-      before: { accruedCommissionCny: result.repriceCommissionCny },
-      after: {
-        total: result.repricedTotalCny?.toString() ?? null,
-        orderItemId: result.repriceItemId,
-        // 佣金不随换人重算，这条审计就是「基数已变、佣金没动」的留痕。
-        commissionRecalculated: false,
-        reason: '换人重算结算价',
-        passengerId,
-      },
-      severity: AuditSeverity.WARNING,
-    });
-  }
 
   // 代理填的换人费不在配置档位里 → 审计打标（不拦，见上方口径）。档位读挂了一律不打标：
   // 档位只是建议，读不到就没有「off list」这回事，不能凭读失败给人扣个异常帽子。

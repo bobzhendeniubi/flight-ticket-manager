@@ -3301,7 +3301,9 @@ describe('swapPassengerBodySchema · chineseName', () => {
 
   it('swapPassenger 服务层：chineseName 传入时写入 Prisma.PassengerUpdateInput.chineseName', async () => {
     const service = new OrderService();
-    mockPrisma.order.findUnique.mockResolvedValueOnce({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
+    // 持久 stub（非 once）：换人现在走 OrderMutation 内核，事务内会在动作前后各读一次订单账本快照
+    //（守恒断言），加上换人前现场快照共三次 findUnique —— 三次都得看到同一张单。
+    mockPrisma.order.findUnique.mockResolvedValue({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
     mockPrisma.passenger.findUnique.mockResolvedValueOnce({
       id: 'px1',
       orderId: 'ord1',
@@ -3340,7 +3342,9 @@ describe('swapPassenger · 证件号变化触发旧护照/签证清洗', () => {
   });
 
   function armSwapMocks(existingDoc: string) {
-    mockPrisma.order.findUnique.mockResolvedValueOnce({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
+    // 持久 stub（非 once）：换人现在走 OrderMutation 内核，事务内会在动作前后各读一次订单账本快照
+    //（守恒断言），加上换人前现场快照共三次 findUnique —— 三次都得看到同一张单。
+    mockPrisma.order.findUnique.mockResolvedValue({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
     mockPrisma.passenger.findUnique.mockResolvedValueOnce({
       id: 'px1',
       orderId: 'ord1',
@@ -3455,7 +3459,9 @@ describe('swapPassenger · 证件号变化触发旧护照/签证清洗', () => {
 
   it('证件号变化但换入证件号已在同航班占座订单中 → DuplicatePassengerError，不落库', async () => {
     const service = new OrderService();
-    mockPrisma.order.findUnique.mockResolvedValueOnce({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
+    // 持久 stub（非 once）：换人现在走 OrderMutation 内核，事务内会在动作前后各读一次订单账本快照
+    //（守恒断言），加上换人前现场快照共三次 findUnique —— 三次都得看到同一张单。
+    mockPrisma.order.findUnique.mockResolvedValue({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
     mockPrisma.passenger.findUnique.mockResolvedValueOnce({
       id: 'px1',
       orderId: 'ord1',
@@ -3492,7 +3498,9 @@ describe('swapPassenger · 新出行人护照有效期', () => {
 
   /** @param perPersonItems 本单「按人出行」行数（>0 = 含机票/套餐/签证行 → 有效期必填）。 */
   function armSwapMocks(existingDoc: string, perPersonItems: number) {
-    mockPrisma.order.findUnique.mockResolvedValueOnce({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
+    // 持久 stub（非 once）：换人现在走 OrderMutation 内核，事务内会在动作前后各读一次订单账本快照
+    //（守恒断言），加上换人前现场快照共三次 findUnique —— 三次都得看到同一张单。
+    mockPrisma.order.findUnique.mockResolvedValue({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
     mockPrisma.passenger.findUnique.mockResolvedValueOnce({
       id: 'px1',
       orderId: 'ord1',
@@ -4694,7 +4702,9 @@ describe('swapPassenger · passengerType 服务端权威派生（覆盖客户端
   });
 
   function armMocks(existingPassengerType: string) {
-    mockPrisma.order.findUnique.mockResolvedValueOnce({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
+    // 持久 stub（非 once）：换人现在走 OrderMutation 内核，事务内会在动作前后各读一次订单账本快照
+    //（守恒断言），加上换人前现场快照共三次 findUnique —— 三次都得看到同一张单。
+    mockPrisma.order.findUnique.mockResolvedValue({ id: 'ord1', adjustmentCny: 0, adjustments: [] });
     mockPrisma.passenger.findUnique.mockResolvedValueOnce({
       id: 'px1',
       orderId: 'ord1',
