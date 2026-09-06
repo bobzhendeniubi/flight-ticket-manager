@@ -19,6 +19,7 @@ import { CabinClass, SeatLockStatus } from '@prisma/client';
 import { heldSeatsBySeatClass } from '../modules/hold-orders/held-seats.js';
 import { businessDateISO, businessDateTime } from './business-time.js';
 import { localDateISO, localDateTime } from './flight-time.js';
+import { cityName } from './airports.js';
 
 const MAX_TOOL_ITERATIONS = 8; // 防止 loop 失控
 
@@ -195,6 +196,18 @@ async function buildSystemPrompt(now: Date = new Date()): Promise<string> {
 - 航班时刻一律念工具返回的 departureLocalTime / arrivalLocalTime（机场当地时间），不要念 UTC 的 departureTime`;
 }
 
+/**
+ * search_hotels 的 cityCode 参数说明里那个「例 XXX(某城)」的占位符。
+ * 写死一个城市，第二条航线一开就是在教模型去错的城市查酒店；每轮按在飞航线实时替换。
+ */
+const CITY_CODE_EXAMPLE_SLOT = '{{CITY_CODE_EXAMPLE}}';
+
+/** 按在飞航线生成一个城市码例子（取第一条航线的目的地）；查不到航线就不举例。 */
+function cityCodeExample(routes: readonly ActiveRoute[]): string {
+  const code = routes[0]?.destination;
+  return code ? `，例 ${code}(${cityName(code)})` : '';
+}
+
 // ── 工具定义（OpenAI Chat Completions tool 格式）─────────────
 const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
   {
@@ -263,7 +276,11 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
       parameters: {
         type: 'object',
         properties: {
-          cityCode: { type: 'string', description: '城市代码，例 DAD(岘港)；省略 = 所有城市' },
+          // description 里的例子在 buildTools 里按在飞航线实时替换（占位符见 CITY_CODE_EXAMPLE_SLOT）
+          cityCode: {
+            type: 'string',
+            description: `城市代码${CITY_CODE_EXAMPLE_SLOT}；省略 = 所有城市`,
+          },
         },
       },
     },
@@ -353,6 +370,23 @@ const TOOLS: OpenAI.Chat.Completions.ChatCompletionTool[] = [
     },
   },
 ];
+
+/**
+ * 本轮实际发给模型的工具定义 = TOOLS，但把参数说明里的城市码例子换成在飞航线的目的地。
+ * 只做字符串替换、不改结构；航线查不到时例子整段消失（不举例好过举错的例）。
+ */
+export async function buildTools(
+  now: Date = new Date(),
+): Promise<OpenAI.Chat.Completions.ChatCompletionTool[]> {
+  const example = cityCodeExample(await getActiveRoutes(now));
+  return TOOLS.map((tool) => {
+    const serialized = JSON.stringify(tool);
+    if (!serialized.includes(CITY_CODE_EXAMPLE_SLOT)) return tool;
+    return JSON.parse(
+      serialized.split(CITY_CODE_EXAMPLE_SLOT).join(example),
+    ) as OpenAI.Chat.Completions.ChatCompletionTool;
+  });
+}
 
 // ── 工具执行 ─────────────────────────────────────────────────
 const pricingService = new PricingService();
@@ -1048,6 +1082,9 @@ export async function runChatTurn(
     { role: 'user', content: userMessage },
   ];
 
+  // 工具定义里的城市码例子按在飞航线实时生成（不写死某个目的地）
+  const tools = await buildTools();
+
   let toolCalls = 0;
   let totalPrompt = 0;
   let totalCompletion = 0;
@@ -1059,7 +1096,7 @@ export async function runChatTurn(
     const response = await client.chat.completions.create({
       model: env.OPENAI_MODEL,
       messages,
-      tools: TOOLS,
+      tools,
       // gpt-5-mini 等 reasoning 模型不接受 temperature，省略让默认生效
     });
 
