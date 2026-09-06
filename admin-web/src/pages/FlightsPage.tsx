@@ -1,10 +1,11 @@
 import { FormEvent, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { api, ApiError, type AdminFlight, type BaggagePolicyInput, type CabinClass, type FareBucket, type FlightBaggagePolicy } from '../lib/api';
+import { api, ApiError, type AdminFlight, type BaggagePolicyInput, type CabinClass, type FareBucket, type FlightBaggagePolicy, type SchedulePriceHistoryEntry } from '../lib/api';
 import { AIRPORT_OPTIONS, CABIN_LABEL, airportLabel, formatLocalDate, formatLocalTime, localToUtcIso, tzLabel } from '../lib/airports';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import { NumberInput } from '../components/NumberInput';
 import { Icon } from '../components/Icon';
+import { formatDateTimeCn } from '../lib/datetime';
 import { useConfirm } from '../components/ConfirmDialog';
 import { useDialogA11y } from '../components/Modal';
 
@@ -1296,6 +1297,25 @@ function DaySchedule({
   // 该班次的总已售（任一舱位 sold>0 即视为"已有销售"，禁止删除）。
   const totalSold = (schedule.seatClasses ?? []).reduce((sum, c) => sum + c.sold, 0);
 
+  // 改价历史（最近 10 条）：默认收起，展开时才拉——一屏几十个班次，不能全都自动打一枪。
+  const [historyOpen, setHistoryOpen] = useState(false);
+  const [history, setHistory] = useState<SchedulePriceHistoryEntry[] | null>(null);
+  const [historyLoading, setHistoryLoading] = useState(false);
+  const [historyErr, setHistoryErr] = useState<string | null>(null);
+  const loadHistory = useCallback(async () => {
+    if (!tokens) return;
+    setHistoryLoading(true);
+    setHistoryErr(null);
+    try {
+      const r = await api.listSchedulePriceHistory(tokens.accessToken, schedule.id);
+      setHistory(r.history);
+    } catch (e) {
+      setHistoryErr(e instanceof ApiError ? e.message : '改价历史加载失败');
+    } finally {
+      setHistoryLoading(false);
+    }
+  }, [tokens, schedule.id]);
+
   // 仓位阶梯草稿（按舱位）—— 初值取自该舱位已有阶梯，深拷贝避免改到 props。
   const [econLadder, setEconLadder] = useState<FareBucket[]>(
     econ?.fareBuckets ? econ.fareBuckets.map((b) => ({ ...b })) : [],
@@ -1368,6 +1388,8 @@ function DaySchedule({
       }
       await api.updateSchedule(tokens.accessToken, schedule.id, { seatClasses });
       setSavedMsg('✅ 已保存');
+      // 改价刚落库，历史面板展开着就顺手刷一下（收起时不打这一枪）
+      if (historyOpen) void loadHistory();
       await onSaved();
     } catch (e) {
       setErr(e instanceof ApiError ? e.message : '保存失败');
@@ -1826,6 +1848,45 @@ function DaySchedule({
           {ladderMsg && <div className="text-xs text-emerald-700">{ladderMsg}</div>}
         </div>
       )}
+
+      {/* 改价历史（最近 10 条）：只读时间线，回答「这个价什么时候变的」。
+          谁改的看审计日志（改价会写一条 UPDATE_SCHEDULE_PRICE，带 before/after 和操作人）。 */}
+      <div className="mt-3">
+        <button
+          type="button"
+          className="text-xs font-medium text-brand hover:text-brand-dark"
+          onClick={() => {
+            const next = !historyOpen;
+            setHistoryOpen(next);
+            if (next && history === null) void loadHistory();
+          }}
+        >
+          {historyOpen ? '收起改价历史' : '改价历史（最近 10 条）'}
+        </button>
+        {historyOpen && (
+          <div className="mt-2 rounded-md border border-slate-200 bg-slate-50/60 p-2">
+            {historyLoading && <div className="text-xs text-ink-muted">加载中…</div>}
+            {historyErr && <div className="text-xs text-rose-700">{historyErr}</div>}
+            {!historyLoading && !historyErr && history !== null && history.length === 0 && (
+              <div className="text-xs text-ink-muted">这个班次还没有改过价。</div>
+            )}
+            {!historyLoading && !historyErr && history !== null && history.length > 0 && (
+              <ul className="space-y-1">
+                {history.map((h) => (
+                  <li key={h.id} className="flex flex-wrap items-baseline gap-2 text-xs">
+                    <span className="text-ink-muted">{formatDateTimeCn(h.observedAt)}</span>
+                    <span className="text-ink-soft">{CABIN_LABEL[h.cabin] ?? h.cabin}</span>
+                    <span className="font-semibold text-ink">¥{Number(h.price).toFixed(0)}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+            <p className="mt-1.5 text-[11px] text-ink-muted">
+              时间为北京时间；改价人与改动前后值见「系统 · 审计日志」。
+            </p>
+          </div>
+        )}
+      </div>
 
       {err && <div className="mt-2 rounded-md bg-red-50 px-3 py-2 text-xs text-red-700">{err}</div>}
 

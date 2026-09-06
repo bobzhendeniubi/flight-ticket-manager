@@ -35,6 +35,9 @@ const prismaMock = vi.hoisted(() => {
     settlementRate: { findMany: ReturnType<typeof vi.fn> };
     settlementDiscountRule: { findMany: ReturnType<typeof vi.fn> };
     bundle: { findMany: ReturnType<typeof vi.fn> };
+    // 改价留痕：PriceHistory 挂在按班次 upsert 的 PricingConfig 下
+    pricingConfig: { upsert: ReturnType<typeof vi.fn>; findUnique: ReturnType<typeof vi.fn> };
+    priceHistory: { createMany: ReturnType<typeof vi.fn>; findMany: ReturnType<typeof vi.fn> };
     auditLog: { create: ReturnType<typeof vi.fn> };
     $transaction: ReturnType<typeof vi.fn>;
   } = {
@@ -58,6 +61,11 @@ const prismaMock = vi.hoisted(() => {
     settlementRate: { findMany: vi.fn(async () => []) },
     settlementDiscountRule: { findMany: vi.fn(async () => []) },
     bundle: { findMany: vi.fn(async () => []) },
+    pricingConfig: {
+      upsert: vi.fn(async () => ({ id: 'pc_1' })),
+      findUnique: vi.fn(async () => null),
+    },
+    priceHistory: { createMany: vi.fn(async () => ({ count: 0 })), findMany: vi.fn(async () => []) },
     // 改点路径会 best-effort 写审计（writeAudit → prisma.auditLog.create）；给个空 mock 免噪声
     auditLog: { create: vi.fn() },
     // $transaction(fn) 直接以同一个 mock 作为 tx 执行回调
@@ -582,6 +590,10 @@ describe('FlightService.listSchedules / listSchedulesInRange · 余位允许为�
     prismaMock.settlementRate.findMany.mockResolvedValue([]); // 默认航线表为空
     prismaMock.settlementDiscountRule.findMany.mockResolvedValue([]);
     prismaMock.bundle.findMany.mockResolvedValue([]);
+    prismaMock.pricingConfig.upsert.mockResolvedValue({ id: 'pc_1' });
+    prismaMock.pricingConfig.findUnique.mockResolvedValue(null);
+    prismaMock.priceHistory.createMany.mockResolvedValue({ count: 0 });
+    prismaMock.priceHistory.findMany.mockResolvedValue([]);
   });
 
   const seatClass = (over: Record<string, unknown> = {}) => ({
@@ -1206,6 +1218,95 @@ describe('FlightService.updateSchedule · 改点当天唯一性', () => {
     });
     expect(prismaMock.flightSchedule.findMany).not.toHaveBeenCalled();
     expect(prismaMock.flightSeatClass.update).toHaveBeenCalled();
+  });
+
+  // ── 改价留痕（价格历史 + 审计）──────────────────────────────────────────
+  it('改价 → 写一行价格历史（MANUAL 来源）+ 一条 UPDATE_SCHEDULE_PRICE 审计', async () => {
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(baseSchedule());
+    const after = baseSchedule();
+    after.seatClasses[0].basePrice = decimal(3500);
+    prismaMock.flightSchedule.findUniqueOrThrow.mockResolvedValue(after);
+
+    await service.updateSchedule('sched_1', {
+      seatClasses: [{ cabin: 'ECONOMY', basePrice: 3500 }],
+    });
+
+    expect(prismaMock.pricingConfig.upsert).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { flightScheduleId: 'sched_1' } }),
+    );
+    expect(prismaMock.priceHistory.createMany).toHaveBeenCalledWith({
+      data: [{ pricingConfigId: 'pc_1', cabin: 'ECONOMY', price: '3500', tier: 'MANUAL' }],
+    });
+    expect(prismaMock.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ action: 'UPDATE_SCHEDULE_PRICE' }),
+      }),
+    );
+  });
+
+  it('传了 basePrice 但价格没变 → 不写历史也不写改价审计', async () => {
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(baseSchedule());
+    prismaMock.flightSchedule.findUniqueOrThrow.mockResolvedValue(baseSchedule());
+
+    await service.updateSchedule('sched_1', {
+      seatClasses: [{ cabin: 'ECONOMY', basePrice: 3000 }],
+    });
+
+    expect(prismaMock.priceHistory.createMany).not.toHaveBeenCalled();
+    expect(prismaMock.auditLog.create).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ action: 'UPDATE_SCHEDULE_PRICE' }),
+      }),
+    );
+  });
+
+  it('只改容量 → 不写价格历史', async () => {
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(baseSchedule());
+    const after = baseSchedule();
+    after.seatClasses[0].capacity = 220;
+    prismaMock.flightSchedule.findUniqueOrThrow.mockResolvedValue(after);
+
+    await service.updateSchedule('sched_1', {
+      seatClasses: [{ cabin: 'ECONOMY', capacity: 220 }],
+    });
+
+    expect(prismaMock.priceHistory.createMany).not.toHaveBeenCalled();
+  });
+
+  it('listSchedulePriceHistory：从没改过价（无 PricingConfig）→ 空数组', async () => {
+    prismaMock.pricingConfig.findUnique.mockResolvedValue(null);
+    await expect(service.listSchedulePriceHistory('sched_1')).resolves.toEqual([]);
+    expect(prismaMock.priceHistory.findMany).not.toHaveBeenCalled();
+  });
+
+  it('listSchedulePriceHistory：按 observedAt 倒序取最近 10 条', async () => {
+    prismaMock.pricingConfig.findUnique.mockResolvedValue({ id: 'pc_1' });
+    prismaMock.priceHistory.findMany.mockResolvedValue([
+      {
+        id: 'ph_1',
+        cabin: 'ECONOMY',
+        price: decimal(3500),
+        tier: 'MANUAL',
+        observedAt: new Date('2026-09-05T02:00:00.000Z'),
+      },
+    ]);
+
+    const rows = await service.listSchedulePriceHistory('sched_1');
+
+    expect(prismaMock.priceHistory.findMany).toHaveBeenCalledWith({
+      where: { pricingConfigId: 'pc_1' },
+      orderBy: { observedAt: 'desc' },
+      take: 10,
+    });
+    expect(rows).toEqual([
+      {
+        id: 'ph_1',
+        cabin: 'ECONOMY',
+        price: '3500',
+        tier: 'MANUAL',
+        observedAt: '2026-09-05T02:00:00.000Z',
+      },
+    ]);
   });
 
   // ── A11 已售班次改点闸（2026-07-17）：sold>0 改时刻必须显式确认 ──

@@ -175,6 +175,18 @@ export const flightRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
+  // 某班次的改价历史（最近 10 条，新到旧）。只读，权限与座位统计页一致：ADMIN/STAFF。
+  // 注册在 PATCH/DELETE /schedules/:scheduleId 之前无所谓——路径段不同，不会互相吃掉。
+  app.get(
+    '/schedules/:scheduleId/price-history',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req) => {
+      const { scheduleId } = req.params as { scheduleId: string };
+      const history = await service.listSchedulePriceHistory(scheduleId);
+      return { history };
+    },
+  );
+
   // ── 行李规则（航班 × 舱等；ADMIN/STAFF 维护）──
   app.get(
     '/:flightId/baggage-policies',

@@ -300,6 +300,17 @@ export interface AdminSchedule {
   seatClasses: AdminScheduleSeat[];
 }
 
+/** 一条改价历史（GET /flights/schedules/:id/price-history）。price 为字符串金额。 */
+export interface SchedulePriceHistoryEntry {
+  id: string;
+  cabin: CabinClass;
+  price: string;
+  /** 来源标记：MANUAL = 运营手工改价（原设计的 A/B/C/D 是日期等级）。 */
+  tier: string;
+  /** ISO datetime */
+  observedAt: string;
+}
+
 // ── 跨日期区间班次（GET /flights/schedules?from=&to=）──
 // 单次拉取一段日期内所有航班的班次（含每个班次航班号/航线/出发时间），
 // 用于座位统计页（取代逐航班 listSchedules 的 N+1）。
@@ -4507,6 +4518,12 @@ export const api = {
       token,
       body,
     }),
+  // 某班次的改价历史（最近 10 条，新到旧；ADMIN/STAFF）。从没改过价 → 空数组。
+  listSchedulePriceHistory: (token: string, scheduleId: string) =>
+    apiFetch<{ history: SchedulePriceHistoryEntry[] }>(
+      `/flights/schedules/${scheduleId}/price-history`,
+      { token },
+    ),
   // 删除班次（仅 ADMIN）。后端守 sold>0：有订单关联则拒绝/转停用，
   // result 可能是 { id, deleted: true } 或被停用的班次对象。
   deleteSchedule: (token: string, scheduleId: string) =>

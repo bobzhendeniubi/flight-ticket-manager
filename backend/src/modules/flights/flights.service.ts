@@ -40,6 +40,12 @@ const CABIN_LABEL: Record<CabinClass, string> = {
 
 const pricingService = new PricingService();
 
+/** 手工改价写进 PriceHistory.tier 的来源标记（原设计的 A/B/C/D 是日期等级，手工改价没有等级）。 */
+const MANUAL_PRICE_TIER = 'MANUAL';
+
+/** 改价历史默认返回条数（后台详情里「最近 10 条」）。 */
+const PRICE_HISTORY_PAGE_SIZE = 10;
+
 // ── 当地日 ⇄ UTC 宽窗（S2：时区折算唯一入口是 lib/flight-time.ts）────────────────
 // 每个班次的时区存在行里（FlightSchedule.departureTz），SQL 查询时还读不到它，所以
 // 「按出发地当地日筛选」只能分两步：SQL 侧拉一个**必然覆盖**目标当地日的 UTC 宽窗，
@@ -940,6 +946,49 @@ export class FlightService {
       });
     }
 
+    // ── 改价留痕：价格历史 + 审计 ──────────────────────────────────────────
+    // 班次改价此前既不写审计也不写历史，改完就只剩一个新数字，事后查「什么时候谁改的」
+    // 无从查起。这里两样都补：PriceHistory 存「某班次某舱位在某时点是多少钱」的时间线
+    //（给运营看趋势），AuditLog 存 before/after/actor（给追责用）。只在价格真变了时写。
+    const priceChanges = seatUpdates
+      .filter((upd) => upd.basePrice !== undefined)
+      .flatMap((upd) => {
+        const before = seatClassByCabin.get(upd.cabin);
+        const after = updated.seatClasses.find((c) => c.cabin === upd.cabin);
+        if (!before || !after) return [];
+        // basePrice 是 Decimal，统一转成字符串比较 / 记录：Decimal 与 number 混用（测试夹具、
+        // 不同 driver）时 .equals 不一定存在，浮点相减又会在分位上误判。
+        const beforePrice = String(before.basePrice);
+        const afterPrice = String(after.basePrice);
+        if (Number(beforePrice) === Number(afterPrice)) return [];
+        return [{ cabin: upd.cabin, before: beforePrice, after: afterPrice }];
+      });
+    if (priceChanges.length > 0) {
+      await this.recordPriceHistory(scheduleId, priceChanges);
+      await writeAudit({
+        actor: actor ?? {},
+        action: 'UPDATE_SCHEDULE_PRICE',
+        targetType: AuditTargetType.FLIGHT,
+        targetId: scheduleId,
+        targetLabel: `班次 ${scheduleId} 改价（${priceChanges
+          .map((c) => `${CABIN_LABEL[c.cabin]} ¥${c.before}→¥${c.after}`)
+          .join('、')}）`,
+        before: {
+          seatClasses: priceChanges.map((c) => ({
+            cabin: c.cabin,
+            basePrice: c.before,
+          })),
+        },
+        after: {
+          seatClasses: priceChanges.map((c) => ({
+            cabin: c.cabin,
+            basePrice: c.after,
+          })),
+        },
+        severity: AuditSeverity.INFO,
+      });
+    }
+
     // ── 超售审计：容量被压到 sold + held 之下（航司减配/换机型）──────────────
     // 库存变成"账面欠座"，需要人工与航司/操作部协调，必须可追溯到人和时点。
     if (oversoldSeatChanges.length > 0) {
@@ -973,6 +1022,63 @@ export class FlightService {
     }
 
     return this.serializeSchedule(updated);
+  }
+
+  /**
+   * 改价历史落库（PriceHistory）。
+   *
+   * PriceHistory 挂在 PricingConfig 下（PricingConfig 与班次 1:1），所以先按班次
+   * upsert 一条 PricingConfig。PricingConfig 目前全仓无人读取（动态定价走 fareBuckets /
+   * basePrice），upsert 出来的是一条纯挂载点，`tiers: []` 不参与任何计价——**不动定价**。
+   *
+   * tier 列在原设计里是 A/B/C/D 日期等级；手工改价没有等级，统一写 MANUAL 标明来源，
+   * 将来若真接了按等级采样，两种来源靠这一列就能分开。
+   */
+  private async recordPriceHistory(
+    scheduleId: string,
+    changes: Array<{ cabin: CabinClass; after: string }>,
+  ): Promise<void> {
+    if (changes.length === 0) return;
+    try {
+      const config = await prisma.pricingConfig.upsert({
+        where: { flightScheduleId: scheduleId },
+        create: { flightScheduleId: scheduleId, tiers: [] },
+        update: {},
+        select: { id: true },
+      });
+      await prisma.priceHistory.createMany({
+        data: changes.map((c) => ({
+          pricingConfigId: config.id,
+          cabin: c.cabin,
+          price: c.after,
+          tier: MANUAL_PRICE_TIER,
+        })),
+      });
+    } catch {
+      // 留痕失败不能把改价本身打回去（价格已经落库了）。审计那条是主留痕，这里是给运营
+      // 看趋势的辅助时间线，失败就少一行，不重试、不报错。
+    }
+  }
+
+  /** 某班次最近 N 条改价历史（新到旧）。没建过 PricingConfig = 从没改过价 → 空数组。 */
+  async listSchedulePriceHistory(scheduleId: string, limit = PRICE_HISTORY_PAGE_SIZE) {
+    const config = await prisma.pricingConfig.findUnique({
+      where: { flightScheduleId: scheduleId },
+      select: { id: true },
+    });
+    if (!config) return [];
+    const rows = await prisma.priceHistory.findMany({
+      where: { pricingConfigId: config.id },
+      orderBy: { observedAt: 'desc' },
+      take: limit,
+    });
+    return rows.map((r) => ({
+      id: r.id,
+      cabin: r.cabin,
+      price: r.price.toString(),
+      tier: r.tier,
+      observedAt: r.observedAt.toISOString(),
+    }));
   }
 
   /**
