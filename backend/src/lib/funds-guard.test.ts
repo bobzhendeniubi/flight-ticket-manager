@@ -5,9 +5,11 @@ import {
   assertOrderAcceptsFunds,
   assertOrderAllowsFundsDisposal,
   assertOrderAllowsFundsReversal,
+  assertOrderAllowsPriceAdjustment,
   FUNDS_CREDIT_BLOCKED_STATUSES,
   FUNDS_DISPOSE_BLOCKED_STATUSES,
   FUNDS_REVERSAL_BLOCKED_STATUSES,
+  PRICE_ADJUSTMENT_BLOCKED_STATUSES,
 } from './funds-guard.js';
 import { BadRequestError } from './errors.js';
 
@@ -137,5 +139,55 @@ describe('funds-guard · 撤销闸 assertOrderAllowsFundsReversal', () => {
     expect(() => assertOrderAllowsFundsDisposal(live(OrderStatus.CANCELLED), '处置资金')).toThrow(
       BadRequestError,
     );
+  });
+});
+
+describe('funds-guard · 调价闸 assertOrderAllowsPriceAdjustment（运营反馈：换人手续费改价）', () => {
+  it('放行 CANCELLED —— 已取消单的应收就是取消/换人手续费，钱不动，允许改这个数', () => {
+    expect(PRICE_ADJUSTMENT_BLOCKED_STATUSES).not.toContain(OrderStatus.CANCELLED);
+    expect(() => assertOrderAllowsPriceAdjustment(live(OrderStatus.CANCELLED))).not.toThrow();
+  });
+
+  it('允许对活跃单调价（PENDING_PAYMENT / PAID / PROCESSING / TICKETED / COMPLETED / FAILED）', () => {
+    for (const s of [
+      OrderStatus.PENDING_PAYMENT,
+      OrderStatus.PAID,
+      OrderStatus.PROCESSING,
+      OrderStatus.TICKETED,
+      OrderStatus.COMPLETED,
+      OrderStatus.FAILED,
+    ]) {
+      expect(() => assertOrderAllowsPriceAdjustment(live(s))).not.toThrow();
+    }
+  });
+
+  it('拒绝 REFUNDED / REFUND_REQUESTED / PAYMENT_TIMEOUT / DRAFT，文案是调价口径（非收款口径）', () => {
+    expect(PRICE_ADJUSTMENT_BLOCKED_STATUSES).toEqual([
+      OrderStatus.REFUNDED,
+      OrderStatus.REFUND_REQUESTED,
+      OrderStatus.PAYMENT_TIMEOUT,
+      OrderStatus.DRAFT,
+    ]);
+    for (const s of PRICE_ADJUSTMENT_BLOCKED_STATUSES) {
+      expect(() => assertOrderAllowsPriceAdjustment(live(s))).toThrow(BadRequestError);
+      // 文案必须是「不能再调价」，不能沿用收款闸的「不能记录收款」（那会误导运营去找恢复订单入口）。
+      expect(() => assertOrderAllowsPriceAdjustment(live(s))).toThrow(/不能再调价/);
+    }
+  });
+
+  it('REFUNDED 的调价拒绝文案指向退款/挂账池出路', () => {
+    expect(() => assertOrderAllowsPriceAdjustment(live(OrderStatus.REFUNDED))).toThrow(
+      /当前状态为「已退款」，不能再调价.*退款/,
+    );
+  });
+
+  it('拒绝软删单调价（即便状态本身允许）', () => {
+    expect(() =>
+      assertOrderAllowsPriceAdjustment({
+        orderNumber: 'T-1',
+        status: OrderStatus.CANCELLED,
+        deletedAt: new Date(),
+      }),
+    ).toThrow(BadRequestError);
   });
 });

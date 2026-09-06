@@ -192,6 +192,51 @@ describe('addPriceAdjustment · 权限与归属', () => {
     expect(tx.order.update).not.toHaveBeenCalled();
   });
 
+  // 运营反馈：换人时先调价把应收改到只剩手续费金额、再把订单标记「已取消」；事后运营还要能
+  // 改这个手续费数字（如换人费从 350.5 改成 200）。调价闸放行 CANCELLED——钱不动，只改应收。
+  it('已取消单（CANCELLED）→ 调价闸放行，正常落调整行（运营反馈：换人手续费改价）', async () => {
+    const tx = makeTx({ status: 'CANCELLED' });
+    mockPrisma.$transaction.mockImplementation(async (cb: (t: typeof tx) => unknown) => cb(tx));
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValue({
+      id: 'order-1',
+      orderNumber: 'FT-1',
+      status: 'CANCELLED',
+      total: new Prisma.Decimal(4800),
+      subtotal: new Prisma.Decimal(4800),
+      taxesAndFees: new Prisma.Decimal(0),
+      discountTotal: new Prisma.Decimal(0),
+      paidAmount: new Prisma.Decimal(0),
+      prepaymentOffset: new Prisma.Decimal(0),
+      adjustmentCny: 0,
+      items: [],
+      passengers: [],
+    });
+
+    const result = await service.addPriceAdjustment(
+      'order-1',
+      { amountCny: -200, reasonCode: 'CHANGE', reasonText: '换人手续费改价' },
+      { userId: 'u-staff', role: 'STAFF' as never },
+    );
+
+    expect(tx.orderItem.create).toHaveBeenCalledTimes(1);
+    expect(tx.order.update).toHaveBeenCalledTimes(1);
+    expect(result.audit.after.total).toBe('4800'); // 5000 − 200
+  });
+
+  it('已退款单（REFUNDED）→ BadRequestError，文案是调价口径（不是「不能记录收款」）', async () => {
+    const tx = makeTx({ status: 'REFUNDED' });
+    mockPrisma.$transaction.mockImplementation(async (cb: (t: typeof tx) => unknown) => cb(tx));
+
+    await expect(
+      service.addPriceAdjustment('order-1', { amountCny: 200, reasonCode: 'MISC_FEE' }, {
+        userId: 'u-staff',
+        role: 'STAFF' as never,
+      }),
+    ).rejects.toThrow(/当前状态为「已退款」，不能再调价/);
+    expect(tx.orderItem.create).not.toHaveBeenCalled();
+    expect(tx.order.update).not.toHaveBeenCalled();
+  });
+
   it('passengerId 不属于本单 → BadRequestError（事务内早拦，绝不落调整行）', async () => {
     // $transaction 直接以 tx mock 调用回调。
     const tx = {

@@ -125,6 +125,57 @@ export function assertOrderAcceptsFunds(order: FundsGuardOrder): void {
 }
 
 /**
+ * 拒绝「调价」（事后追加差额行，改 order.total）的订单状态。
+ *
+ * 刻意比收款闸（FUNDS_CREDIT_BLOCKED_STATUSES）少拦一档：**CANCELLED 放行**。
+ *
+ * 为什么已取消单要放开调价（运营反馈）：换人/取消场景的实操是先把订单调价到只剩手续费金额、
+ * 再把订单标记「已取消」——已取消单的应收（total）本来就是这笔手续费的最终定格，运营事后要
+ * 改这个手续费数字（比如换人费从 350.5 改成 200）是这类单上唯一还会碰的钱。调价只改应收，
+ * 不动 paidAmount、不产生任何新的收款或退款事实——钱一分不挪，不会像收款闸拦的「往死单里塞
+ * 钱」那样造成账实分叉，收款闸的拒绝文案（「不能记录收款」）在这里反而是误导：运营既不是要
+ * 收款，也没有恢复订单的入口，会卡在死胡同里。
+ *
+ * 仍然拒绝的四档，理由与收款闸一致，只是换成调价口径：
+ *   REFUNDED          —— 退款已按当时的 total 结清，事后再改 total 会让「退了多少」和
+ *                        「该收多少」对不上，且不产生新的资金动作去弥合差额。
+ *   REFUND_REQUESTED  —— 应退额是按申请那一刻的应收快照算的，调价会把这个快照算错。
+ *   PAYMENT_TIMEOUT   —— 座位已释放，应先恢复到待付款重新占座，再谈应收调整。
+ *   DRAFT             —— 草稿单尚未成形，不应挂真实的资金调整。
+ */
+export const PRICE_ADJUSTMENT_BLOCKED_STATUSES: OrderStatus[] = [
+  OrderStatus.REFUNDED,
+  OrderStatus.REFUND_REQUESTED,
+  OrderStatus.PAYMENT_TIMEOUT,
+  OrderStatus.DRAFT,
+];
+
+const PRICE_ADJUSTMENT_BLOCKED_STATUS_REASON: Partial<Record<OrderStatus, string>> = {
+  [OrderStatus.REFUNDED]: '退款已按当时应收结清，如需补退/补收请走退款流程或挂账池。',
+  [OrderStatus.REFUND_REQUESTED]:
+    '退款审批中的应退额是按申请那一刻的应收快照计算的，调价会把快照算错；请先驳回退款申请（转回处理中）再调价。',
+  [OrderStatus.PAYMENT_TIMEOUT]: '座位已释放，请先恢复到待付款重新占座，再调整应收。',
+  [OrderStatus.DRAFT]: '草稿单尚未成形，不应挂真实资金调整。',
+};
+
+/**
+ * 调价闸：订单是否可以事后追加一笔价格调整（正=补收/负=优惠）。
+ * 软删单一律拒绝（与其它资金闸一致）；状态闸见 PRICE_ADJUSTMENT_BLOCKED_STATUSES 上方注释——
+ * 已取消单放行，钱不动，只是把应收数字改对。
+ */
+export function assertOrderAllowsPriceAdjustment(order: FundsGuardOrder): void {
+  if (order.deletedAt) {
+    throw new BadRequestError(`订单 ${order.orderNumber} 已在回收站，不能调价。请先恢复订单再操作。`);
+  }
+  const reason = PRICE_ADJUSTMENT_BLOCKED_STATUS_REASON[order.status];
+  if (reason) {
+    throw new BadRequestError(
+      `订单 ${order.orderNumber} 当前状态为「${STATUS_LABEL[order.status]}」，不能再调价：${reason}`,
+    );
+  }
+}
+
+/**
  * 处置闸：订单是否可以处置自身资金（多付转存/转挂账池、改结算价）。
  */
 export function assertOrderAllowsFundsDisposal(order: FundsGuardOrder, action: string): void {

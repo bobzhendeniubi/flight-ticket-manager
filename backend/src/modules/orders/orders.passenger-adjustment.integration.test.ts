@@ -7,7 +7,9 @@
  *   - 整单调价回归：不带 passengerId → 差额行 passengerId=NULL、计入 total（与录单整单调价同口径）
  *   - 负调整（优惠）→ kind=DISCOUNT、total 下降
  *   - passengerId 不属于本单 → BadRequestError，不新增任何行、total 不变
- *   - 死单（CANCELLED）→ 资金闸拒绝（assertOrderAcceptsFunds），不新增任何行
+ *   - 已取消单（CANCELLED）→ 调价闸放行（assertOrderAllowsPriceAdjustment，运营反馈：
+ *     换人/取消手续费本来就靠调价定格，事后改这个数字不涉及收款），整单与按乘客调价均成功、
+ *     total 正确更新；已退款/软删单仍拒绝，文案是调价口径（不是收款口径）
  *
  * 跑：
  *   1. docker compose -f ../docker-compose.test.yml up -d
@@ -150,10 +152,78 @@ describe('OrderService.addPriceAdjustment · 真 DB E2E', () => {
     expect(Number(reloaded.total)).toBe(6000);
   });
 
-  it('死单（CANCELLED）→ 资金闸拒绝，不新增行', async () => {
+  // 运营反馈：换人时先把订单调价到只剩手续费金额、再标记「已取消」——已取消单的应收就是这笔
+  // 手续费的最终定格，运营事后要能改这个数字（如换人费从 350.5 改成 200）。调价只改应收，
+  // 不动 paidAmount，不产生任何收款/退款事实，钱不动。
+  it('已取消单整单调价：-150 再 +200 均成功，total 正确更新（换人手续费改价场景）', async () => {
+    const actor = await adminActor();
+    // 起点：total=6000（模拟换人前的应收）。
+    const order = await createOrderWithPassengers(6000, 0);
+    await prisma.order.update({ where: { id: order.id }, data: { status: OrderStatus.CANCELLED } });
+
+    // 第一笔：-150（把应收往下调，比如手续费从更高的数改低）。
+    const first = await service.addPriceAdjustment(
+      order.id,
+      { amountCny: -150, reasonCode: 'CHANGE', reasonText: '换人手续费改价' },
+      actor,
+    );
+    expect(first.audit.after.total).toBe('5850'); // 6000 − 150
+    const afterFirst = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(afterFirst.total)).toBe(5850);
+    expect(afterFirst.status).toBe(OrderStatus.CANCELLED); // 调价不改变订单状态
+
+    // 第二笔：+200（同一张已取消单上再改一次，运营反馈的原始场景就是要能反复改这个数）。
+    const second = await service.addPriceAdjustment(
+      order.id,
+      { amountCny: 200, reasonCode: 'CHANGE', reasonText: '换人手续费改价' },
+      actor,
+    );
+    expect(second.audit.after.total).toBe('6050'); // 5850 + 200
+    const afterSecond = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(afterSecond.total)).toBe(6050);
+
+    const items = await prisma.orderItem.findMany({ where: { orderId: order.id } });
+    expect(items).toHaveLength(3); // 原 BUNDLE 行 + 两条调价行
+  });
+
+  it('已取消单按乘客调价同样成功', async () => {
+    const actor = await adminActor();
+    const order = await createOrderWithPassengers(6000, 0);
+    await prisma.order.update({ where: { id: order.id }, data: { status: OrderStatus.CANCELLED } });
+    const pax = order.passengers[0];
+
+    const result = await service.addPriceAdjustment(
+      order.id,
+      { amountCny: 100, reasonCode: 'MISC_FEE', passengerId: pax.id },
+      actor,
+    );
+
+    expect(result.audit.after.total).toBe('6100');
+    const fee = await prisma.orderItem.findFirst({
+      where: { orderId: order.id, kind: OrderItemKind.FEE, passengerId: pax.id },
+    });
+    expect(fee).toBeTruthy();
+  });
+
+  it('已退款单（REFUNDED）→ 调价闸拒绝，文案是调价口径（不是收款口径），不新增行', async () => {
     const actor = await adminActor();
     const order = await createOrderWithPassengers();
-    await prisma.order.update({ where: { id: order.id }, data: { status: OrderStatus.CANCELLED } });
+    await prisma.order.update({ where: { id: order.id }, data: { status: OrderStatus.REFUNDED } });
+
+    await expect(
+      service.addPriceAdjustment(order.id, { amountCny: 200, reasonCode: 'MISC_FEE' }, actor),
+    ).rejects.toThrow(/当前状态为「已退款」，不能再调价/);
+
+    const items = await prisma.orderItem.findMany({ where: { orderId: order.id } });
+    expect(items).toHaveLength(1); // 仍只有原 BUNDLE 行
+    const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(Number(reloaded.total)).toBe(6000); // total 不变
+  });
+
+  it('软删单（回收站）→ 调价闸拒绝，即便状态本身是可调价的', async () => {
+    const actor = await adminActor();
+    const order = await createOrderWithPassengers();
+    await prisma.order.update({ where: { id: order.id }, data: { deletedAt: new Date() } });
 
     await expect(
       service.addPriceAdjustment(order.id, { amountCny: 200, reasonCode: 'MISC_FEE' }, actor),

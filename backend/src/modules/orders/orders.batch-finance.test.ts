@@ -4,7 +4,8 @@
  * 覆盖：
  *   1. 入参口径：orderIds 1~500、重复 id 收敛成一份、按人调价的原因/金额沿用单单那套校验。
  *   2. batchSetPaymentsLock：不存在 / 回收站 / 已是目标状态逐单跳过，其余照改（不整批失败）。
- *   3. batchAddPriceAdjustment：PER_PAX 按占座人数乘（婴儿不计）、锁价单与死单跳过、
+ *   3. batchAddPriceAdjustment：PER_PAX 按占座人数乘（婴儿不计）、锁价单/已退款单/回收站单跳过、
+ *      已取消单放行（与单单入口同一道调价闸，运营反馈：换人手续费改价场景）、
  *      乘出来顶破单笔上限的单跳过、非运营身份直接 403。
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
@@ -262,28 +263,31 @@ describe('OrderService.batchAddPriceAdjustment', () => {
     expect(Number(mockPrisma.orderItem.create.mock.calls[0][0].data.amount.toString())).toBe(40);
   });
 
-  it('混合批：锁价单 / 死单 / 回收站单 / 找不到的 id 逐单跳过，其余照做', async () => {
+  it('混合批：锁价单 / 已退款单 / 回收站单 / 找不到的 id 逐单跳过，已取消单放行，其余照做', async () => {
     const tx = txFor({
       o1: { orderNumber: 'ORD-001' },
       o2: { orderNumber: 'ORD-002', settlementLocked: true },
-      o3: { orderNumber: 'ORD-003', status: OrderStatus.CANCELLED },
+      o3: { orderNumber: 'ORD-003', status: OrderStatus.REFUNDED },
       o4: { orderNumber: 'ORD-004', deletedAt: new Date() },
+      // 运营反馈：换人手续费改价场景——批量调价与单单调价共用同一道闸，已取消单同样放行。
+      o5: { orderNumber: 'ORD-005', status: OrderStatus.CANCELLED },
     });
     runInTx(tx);
 
     const res = await service.batchAddPriceAdjustment(
-      ['o1', 'o2', 'o3', 'o4', 'missing'],
+      ['o1', 'o2', 'o3', 'o4', 'o5', 'missing'],
       feeInput,
       OPS,
     );
 
-    expect(res).toMatchObject({ updated: 1, skipped: 4 });
-    expect(mockPrisma.orderItem.create).toHaveBeenCalledTimes(1);
+    expect(res).toMatchObject({ updated: 2, skipped: 4 });
+    expect(mockPrisma.orderItem.create).toHaveBeenCalledTimes(2);
     const byId = Object.fromEntries(res.results.map((r) => [r.orderId, r]));
     expect(byId.o1).toMatchObject({ ok: true, appliedAmountCny: 40 });
     expect(byId.o2).toMatchObject({ ok: false, reason: '结算价已锁定，请先解锁再修改' });
-    expect(byId.o3.reason).toContain('不能记录收款');
+    expect(byId.o3.reason).toContain('不能再调价');
     expect(byId.o4.reason).toContain('回收站');
+    expect(byId.o5).toMatchObject({ ok: true, appliedAmountCny: 40 });
     expect(byId.missing).toMatchObject({ ok: false, orderNumber: null, reason: '订单不存在' });
     // 跳过的单一律不落金额
     for (const id of ['o2', 'o3', 'o4', 'missing']) {

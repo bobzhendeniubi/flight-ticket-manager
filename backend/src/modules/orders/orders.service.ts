@@ -106,6 +106,7 @@ import {
 import {
   assertOrderAcceptsFunds,
   assertOrderAllowsFundsDisposal,
+  assertOrderAllowsPriceAdjustment,
   FUNDS_DISPOSE_BLOCKED_STATUSES,
   sumCompletedRefundsWithinTx,
 } from '../../lib/funds-guard.js';
@@ -14235,7 +14236,9 @@ export class OrderService {
   // 该乘客的应收份额（金额明细逐人可解释）；空 = 整单调价（现行为不变）。
   //
   // 服务端权威定价底线：绝不改任何既有明细行价格，只加差额行 + 审计留痕（reasonCode/经手/时间）。
-  // 资金闸：assertOrderAcceptsFunds —— 已取消/已退款/超时/草稿单不许再抬/降 total（防二次退款）。
+  // 资金闸：assertOrderAllowsPriceAdjustment —— 已退款/退款申请中/支付超时/草稿单不许再改
+  // total（防二次退款/快照算错）；已取消单放行（运营反馈：换人/取消手续费本来就是靠调价定格，
+  // 事后改这个数字不涉及收款，钱不动，见 funds-guard.ts 该函数上方注释）。
   // 并发：FOR UPDATE 锁订单行后再读 items 重算 total（与补房差同款，杜绝丢失更新）。
   // ════════════════════════════════════════════════════════════════════
   async addPriceAdjustment(
@@ -14348,8 +14351,9 @@ export class OrderService {
       throw new ConflictError('结算价已锁定，请先解锁再修改');
     }
     // 资金闸：调价新增/降低差额行会改 order.total —— total 是应退额与取消手续费的计算基数。
-    // 死单（已取消/已退款/支付超时/草稿）若还能调价，等于凭空改动死单应收，可被算出二次退款。
-    assertOrderAcceptsFunds(order);
+    // 已退款/退款申请中/支付超时/草稿单若还能调价，可被算出二次退款或算错退款快照；
+    // 已取消单放行——它的 total 就是取消/换人手续费，运营改这个数字不产生任何收款/退款事实。
+    assertOrderAllowsPriceAdjustment(order);
 
     // passengerId 归属校验：非空必须属于本单，否则 400（不接受跨单/不存在的乘客）。
     let passengerName: string | null = null;
