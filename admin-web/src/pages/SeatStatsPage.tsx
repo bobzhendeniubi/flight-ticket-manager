@@ -18,7 +18,7 @@
  *     不带状态语义——状态色（超售红 / 占位琥珀）留给行内文字，底色不去抢它们。
  *   - 日期区间为闭区间（between 起始/截止），服务端按 from/to 过滤
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { api, ApiError, type RangeSchedule } from '../lib/api';
 import { airportLabel, CABIN_LABEL, formatLocalDate, formatLocalTime, localYmd, tzLabel } from '../lib/airports';
 import { useAuth } from '../stores/auth';
@@ -95,8 +95,11 @@ export function SeatStatsPage() {
   // 默认显示未来 30 天
   const [from, setFrom] = useState<string>(todayStr());
   const [to, setTo] = useState<string>(daysFromTodayStr(30));
+  // F-25：请求序号防护——快速切日期区间/航班号时，晚到的旧响应不能覆盖当前筛选的结果。
+  const loadRequestIdRef = useRef(0);
 
   const load = useCallback(async () => {
+    const requestId = ++loadRequestIdRef.current;
     if (!tokens) return;
     setLoading(true);
     setError(null);
@@ -105,11 +108,12 @@ export function SeatStatsPage() {
         from: from || undefined,
         to: to || undefined,
       });
+      if (requestId !== loadRequestIdRef.current) return; // 已被更晚一次请求作废
       setSchedules(r.schedules);
     } catch (err) {
-      setError(err instanceof ApiError ? err.message : '加载失败');
+      if (requestId === loadRequestIdRef.current) setError(err instanceof ApiError ? err.message : '加载失败');
     } finally {
-      setLoading(false);
+      if (requestId === loadRequestIdRef.current) setLoading(false);
     }
     // seatsVersion 入参：任一座位变更后自动重拉
   }, [tokens, from, to, seatsVersion]);

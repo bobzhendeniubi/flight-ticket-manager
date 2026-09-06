@@ -80,6 +80,24 @@ export function AgentsPage() {
   }, [reload]);
 
   // ── 过滤 + 排序 ──
+  // 排序单独抽出来：表格视图（筛选后列表）和树形视图（全量列表）要用同一套排序口径，
+  // 否则切一下视图行序就变了。
+  const sortAgents = useCallback(
+    (list: AgentListItem[]): AgentListItem[] => {
+      const mult = sortDir === 'asc' ? 1 : -1;
+      return list.slice().sort((a, b) => {
+        switch (sortKey) {
+          case 'tier': return (a.tier - b.tier) * mult;
+          case 'balance': return (Number(a.prepaymentBalance) - Number(b.prepaymentBalance)) * mult;
+          case 'orders': return (a.orderCount - b.orderCount) * mult;
+          case 'children': return (a.childCount - b.childCount) * mult;
+          case 'createdAt': return a.createdAt.localeCompare(b.createdAt) * mult;
+        }
+      });
+    },
+    [sortKey, sortDir],
+  );
+
   const filtered = useMemo(() => {
     if (!agents) return [];
     let list = agents.slice();
@@ -99,18 +117,8 @@ export function AgentsPage() {
     if (filterBalance === 'mid') list = list.filter((a) => Number(a.prepaymentBalance) >= 5000 && Number(a.prepaymentBalance) < 50000);
     if (filterBalance === 'high') list = list.filter((a) => Number(a.prepaymentBalance) >= 50000);
 
-    list.sort((a, b) => {
-      const mult = sortDir === 'asc' ? 1 : -1;
-      switch (sortKey) {
-        case 'tier': return (a.tier - b.tier) * mult;
-        case 'balance': return (Number(a.prepaymentBalance) - Number(b.prepaymentBalance)) * mult;
-        case 'orders': return (a.orderCount - b.orderCount) * mult;
-        case 'children': return (a.childCount - b.childCount) * mult;
-        case 'createdAt': return a.createdAt.localeCompare(b.createdAt) * mult;
-      }
-    });
-    return list;
-  }, [agents, search, filterTier, filterStatus, filterBalance, sortKey, sortDir]);
+    return sortAgents(list);
+  }, [agents, search, filterTier, filterStatus, filterBalance, sortAgents]);
 
   // ── 汇总 KPI ──
   const kpi = useMemo(() => {
@@ -124,7 +132,12 @@ export function AgentsPage() {
     };
   }, [agents]);
 
-  const tree = useMemo(() => buildTree(filtered), [filtered]);
+  // 命中集合 = 筛选结果；树按全量建好后再裁剪，父子层级才是真的。
+  const matchedIds = useMemo(() => new Set(filtered.map((a) => a.id)), [filtered]);
+  const tree = useMemo(
+    () => pruneTree(buildTree(sortAgents(agents ?? []), matchedIds)),
+    [agents, matchedIds, sortAgents],
+  );
 
   if (error) return (
     <div className="card border-rose-200 bg-rose-50 text-rose-700">
@@ -1271,11 +1284,19 @@ function KpiCard({ label, value, sub }: { label: string; value: string; sub: str
 // ═══════════════════════════════════════════════════════════════
 interface AgentNodeData extends AgentListItem {
   children: AgentNodeData[];
+  /** 是否命中当前筛选；false = 只为保住层级而保留的上级，界面上淡化展示 */
+  matched: boolean;
 }
 
-function buildTree(flat: AgentListItem[]): AgentNodeData[] {
+/**
+ * 建树必须喂**全量**代理，不能喂筛选后的列表。
+ * 喂筛选结果的话，父级只要没同时满足筛选条件就不在 map 里，子级会被 else 分支当成顶级代理，
+ * 层级看着就是错的（卡片上的「下级数」是全量口径，又和树里渲染出来的子节点数对不上），
+ * 核对返佣/结算归属时很容易看走眼。筛选改由 pruneTree + matched 标记表达。
+ */
+function buildTree(flat: AgentListItem[], matchedIds?: ReadonlySet<string>): AgentNodeData[] {
   const byId = new Map<string, AgentNodeData>();
-  flat.forEach((a) => byId.set(a.id, { ...a, children: [] }));
+  flat.forEach((a) => byId.set(a.id, { ...a, children: [], matched: matchedIds ? matchedIds.has(a.id) : true }));
   const roots: AgentNodeData[] = [];
   byId.forEach((node) => {
     if (node.parentAgentId && byId.has(node.parentAgentId)) {
@@ -1285,6 +1306,19 @@ function buildTree(flat: AgentListItem[]): AgentNodeData[] {
     }
   });
   return roots;
+}
+
+/**
+ * 裁剪：只留「自己命中筛选」或「子孙里有命中」的分支。
+ * 未命中但挡在中间的上级会被保留（撑住层级），由 matched=false 在界面上淡化区分。
+ */
+function pruneTree(nodes: AgentNodeData[]): AgentNodeData[] {
+  const kept: AgentNodeData[] = [];
+  for (const node of nodes) {
+    const children = pruneTree(node.children);
+    if (node.matched || children.length > 0) kept.push({ ...node, children });
+  }
+  return kept;
 }
 
 function AgentTreeNode({
@@ -1299,7 +1333,11 @@ function AgentTreeNode({
 }) {
   return (
     <li>
-      <div className="card flex flex-wrap items-start justify-between gap-3" style={{ marginLeft: depth * 24 }}>
+      {/* 未命中筛选的上级只是撑层级用的，淡化 + 标注，别让人以为它也符合当前筛选条件 */}
+      <div
+        className={`card flex flex-wrap items-start justify-between gap-3${node.matched ? '' : ' opacity-60'}`}
+        style={{ marginLeft: depth * 24 }}
+      >
         <div className="min-w-0 flex-1">
           <div className="flex items-center gap-2 flex-wrap">
             <span className={`rounded-md px-2 py-0.5 text-xs font-semibold ${TIER_COLOR[node.tier]}`}>
@@ -1309,6 +1347,7 @@ function AgentTreeNode({
               {node.companyName || node.contactName}
             </h3>
             {!node.isActive && <span className="badge-neutral">已停用</span>}
+            {!node.matched && <span className="badge-neutral">上级 · 不符合当前筛选</span>}
           </div>
           <div className="mt-1 text-sm text-slate-600">
             <span className="mr-3 inline-flex items-center gap-1"><Icon name="user" /> {node.contactName}</span>

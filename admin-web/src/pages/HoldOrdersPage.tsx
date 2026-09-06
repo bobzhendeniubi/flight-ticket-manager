@@ -97,7 +97,9 @@ function KpiCard({ label, value, tone }: { label: string; value: string; tone: '
   return <div className={`card border ${toneClass}`}><div className="text-xs text-ink-muted">{label}</div><div className="mt-1 text-xl font-semibold nums">{value}</div></div>;
 }
 
-function newConversionRequestToken(): string {
+// 幂等 token：转正/认款/手工到账共用同一个生成器，弹窗打开时生成一次、重试复用同一个
+// （F-14：给认款/手工到账补上和转正一样的幂等键，双击不再重复入账）。
+function newRequestToken(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') return crypto.randomUUID();
   const hex = Array.from({ length: 32 }, () => Math.floor(Math.random() * 16).toString(16));
   hex[12] = '4';
@@ -944,7 +946,7 @@ function ConvertModal({
 }) {
   const dialogRef = useDialogA11y(onCancel);
   const remaining = order.seats - order.seatsConverted - order.seatsCancelled;
-  const [requestToken] = useState(newConversionRequestToken);
+  const [requestToken] = useState(newRequestToken);
   const [rows, setRows] = useState<BatchOrderPassenger[]>([{ fullName: '', documentNumber: '', dateOfBirth: '', passportExpiry: '', nationality: 'CN' }]);
   const [contactName, setContactName] = useState(order.groupName ?? '');
   const [contactPhone, setContactPhone] = useState('');
@@ -1035,6 +1037,8 @@ function ManualReceiptModal({ order, installment, token, onCancel, onDone }: { o
   const dialogRef = useDialogA11y(onCancel);
   const already = installment.allocations.filter((a) => !a.reversedAt).reduce((sum, a) => sum + Number(a.amountCny), 0);
   const due = Math.max(0, installment.amountCny - already);
+  // F-14：手工到账同样是资金入账，比照转正补幂等 token，弹窗打开时生成一次、重试复用同一个。
+  const [requestToken] = useState(newRequestToken);
   const [amount, setAmount] = useState(due);
   const [method, setMethod] = useState<'WECHAT_PAY' | 'ALIPAY' | 'BANK_CARD'>('WECHAT_PAY');
   const [note, setNote] = useState('');
@@ -1050,9 +1054,10 @@ function ManualReceiptModal({ order, installment, token, onCancel, onDone }: { o
   };
   const submit = async () => {
     if (amount < 1 || amount > due) { setError(`请输入不超过本期未收余额 ¥${due.toLocaleString()} 的金额`); return; }
+    if (busy) return;
     setBusy(true);
     try {
-      const result = await api.manualReceiptHoldInstallment(token, order.id, installment.id, { amountCny: amount, method, proofUrl: proofUrl ?? undefined, note: note.trim() || undefined });
+      const result = await api.manualReceiptHoldInstallment(token, order.id, installment.id, { requestToken, amountCny: amount, method, proofUrl: proofUrl ?? undefined, note: note.trim() || undefined });
       await onDone(result.result.warning);
     } catch (err) { setError(err instanceof Error ? err.message : '手工到账失败'); setBusy(false); }
   };
@@ -1077,6 +1082,10 @@ function AllocateModal({ order, installment, token, onCancel, onDone }: { order:
   const [amount, setAmount] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  // F-14：认款弹窗原来没有 busy 锁，双击/网络慢连点会把同一笔到账钱记两次；
+  // 照抄同页 ReduceModal/ManualReceiptModal 的写法补上，并比照转正加幂等 token。
+  const [busy, setBusy] = useState(false);
+  const [requestToken] = useState(newRequestToken);
   const already = installment.allocations.filter((a) => !a.reversedAt).reduce((sum, a) => sum + Number(a.amountCny), 0);
   const due = Math.max(0, installment.amountCny - already);
   useEffect(() => {
@@ -1087,10 +1096,12 @@ function AllocateModal({ order, installment, token, onCancel, onDone }: { order:
     if (selected) setAmount(Math.min(due, Number(selected.remainingCny)));
   }, [receiptId, receipts, due]);
   const submit = async () => {
+    if (busy) return;
     if (!receiptId || amount < 1 || amount > due) { setError(`请输入不超过本期未认余额 ¥${due.toLocaleString()} 的金额`); return; }
-    try { const result = await api.allocateHoldInstallment(token, order.id, installment.id, { receiptId, amountCny: amount }); await onDone(result.result.warning); } catch (err) { setError(err instanceof Error ? err.message : '认款失败'); }
+    setBusy(true);
+    try { const result = await api.allocateHoldInstallment(token, order.id, installment.id, { requestToken, receiptId, amountCny: amount }); await onDone(result.result.warning); } catch (err) { setError(err instanceof Error ? err.message : '认款失败'); } finally { setBusy(false); }
   };
-  return <div ref={dialogRef} role="dialog" aria-modal="true" aria-label={`认款 · ${order.holdNo} · ${installment.label}`} tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}><div className="w-full max-w-lg rounded-lg bg-white shadow-xl" onClick={(e) => e.stopPropagation()}><div className="flex items-center justify-between border-b border-slate-200 px-5 py-3"><h2 className="text-lg font-semibold">认款 · {order.holdNo} · {installment.label}</h2><button onClick={onCancel} className="text-xl text-slate-400">×</button></div><div className="space-y-4 px-5 py-4"><p className="text-sm text-ink-muted">本期应收 ¥{installment.amountCny.toLocaleString()}，未认 ¥{due.toLocaleString()}</p>{loading ? <p className="text-sm text-ink-muted">加载挂账池…</p> : receipts.length === 0 ? <p className="rounded bg-amber-50 px-3 py-2 text-sm text-amber-800">挂账池暂无可认流水——请先在财务 · 流水页登记或导入这笔收款，再回来认款</p> : <select className="input" value={receiptId} onChange={(e) => setReceiptId(e.target.value)}><option value="">选择 OPEN/部分认款流水</option>{receipts.map((r) => <option key={r.id} value={r.id}>{r.receiptNo} · 余额 ¥{Number(r.remainingCny).toLocaleString()} · {formatDateTimeSecCn(r.receivedAt)}</option>)}</select>}<input className="input" type="number" min={1} max={due} value={amount || ''} disabled={!receiptId} onChange={(e) => setAmount(Number(e.target.value))} placeholder="认款金额（元）" />{error && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}<div className="flex justify-end gap-3"><button className="btn-secondary" onClick={onCancel}>取消</button><button className="btn-primary" disabled={loading || !receiptId} title={!loading && !receiptId ? '请先选择流水' : undefined} onClick={() => void submit()}>确认认款</button></div></div></div></div>;
+  return <div ref={dialogRef} role="dialog" aria-modal="true" aria-label={`认款 · ${order.holdNo} · ${installment.label}`} tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}><div className="w-full max-w-lg rounded-lg bg-white shadow-xl" onClick={(e) => e.stopPropagation()}><div className="flex items-center justify-between border-b border-slate-200 px-5 py-3"><h2 className="text-lg font-semibold">认款 · {order.holdNo} · {installment.label}</h2><button onClick={onCancel} className="text-xl text-slate-400">×</button></div><div className="space-y-4 px-5 py-4"><p className="text-sm text-ink-muted">本期应收 ¥{installment.amountCny.toLocaleString()}，未认 ¥{due.toLocaleString()}</p>{loading ? <p className="text-sm text-ink-muted">加载挂账池…</p> : receipts.length === 0 ? <p className="rounded bg-amber-50 px-3 py-2 text-sm text-amber-800">挂账池暂无可认流水——请先在财务 · 流水页登记或导入这笔收款，再回来认款</p> : <select className="input" value={receiptId} onChange={(e) => setReceiptId(e.target.value)}><option value="">选择 OPEN/部分认款流水</option>{receipts.map((r) => <option key={r.id} value={r.id}>{r.receiptNo} · 余额 ¥{Number(r.remainingCny).toLocaleString()} · {formatDateTimeSecCn(r.receivedAt)}</option>)}</select>}<input className="input" type="number" min={1} max={due} value={amount || ''} disabled={!receiptId} onChange={(e) => setAmount(Number(e.target.value))} placeholder="认款金额（元）" />{error && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}<div className="flex justify-end gap-3"><button className="btn-secondary" onClick={onCancel}>取消</button><button className="btn-primary" disabled={busy || loading || !receiptId} title={!loading && !receiptId ? '请先选择流水' : undefined} onClick={() => void submit()}>{busy ? '认款中…' : '确认认款'}</button></div></div></div></div>;
 }
 
 function ReduceModal({ order, token, onCancel, onDone }: { order: HoldOrderListItem; token: string; onCancel: () => void; onDone: () => Promise<void> }) {
@@ -1112,8 +1123,10 @@ function ConfigModal({ config, token, onCancel, onDone }: { config: HoldOrderCon
   const [action, setAction] = useState(config.overdueAction);
   const [ratio, setRatio] = useState(config.defaultFreeCancelRatio * 100);
   const [error, setError] = useState<string | null>(null);
-  const save = async () => { if (rows.length < 1 || rows.length > 6 || rows.filter((r) => r.amountRule === 'REMAINDER').length !== 1 || rows[rows.length - 1].amountRule !== 'REMAINDER' || ratio < 0 || ratio > 50) { setError('模板需 1-6 期，尾款恰好一期且在最后，免损比例 0-50%'); return; } try { const result = await api.updateHoldOrderConfig(token, { installments: rows, overdueAction: action, defaultFreeCancelRatio: ratio / 100 }); onDone(result.config); } catch (err) { setError(err instanceof Error ? err.message : '保存模板失败'); } };
-  return <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="收款模板设置" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}><div className="w-full max-w-2xl rounded-lg bg-white shadow-xl" onClick={(e) => e.stopPropagation()}><div className="flex items-center justify-between border-b border-slate-200 px-5 py-3"><h2 className="text-lg font-semibold">收款模板设置</h2><button onClick={onCancel} className="text-xl text-slate-400">×</button></div><div className="space-y-3 px-5 py-4"><div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr><th className="text-left">名称</th><th className="text-left">金额规则</th><th>每人金额</th><th>起飞前天数</th><th></th></tr></thead><tbody>{rows.map((row, index) => <tr key={index}><td><input className="input h-8" value={row.label} onChange={(e) => setRows((old) => old.map((r, i) => i === index ? { ...r, label: e.target.value } : r))} /></td><td><select className="input h-8" value={row.amountRule} onChange={(e) => setRows((old) => old.map((r, i) => i === index ? { ...r, amountRule: e.target.value as 'PER_PERSON_FIXED' | 'REMAINDER', perPersonCny: e.target.value === 'REMAINDER' ? undefined : r.perPersonCny ?? 0 } : r))}><option value="PER_PERSON_FIXED">每人固定</option><option value="REMAINDER">尾款余款</option></select></td><td><input className="input h-8 w-24" type="number" disabled={row.amountRule === 'REMAINDER'} value={row.perPersonCny ?? ''} onChange={(e) => setRows((old) => old.map((r, i) => i === index ? { ...r, perPersonCny: Number(e.target.value) } : r))} /></td><td><input className="input h-8 w-24" type="number" min={0} value={row.dueOffsetDays ?? ''} onChange={(e) => setRows((old) => old.map((r, i) => i === index ? { ...r, dueOffsetDays: e.target.value === '' ? null : Number(e.target.value) } : r))} /></td><td><button className="btn-ghost-danger text-xs" disabled={rows.length <= 1} onClick={() => setRows((old) => old.filter((_, i) => i !== index))}>删除</button></td></tr>)}</tbody></table></div><button className="btn-secondary text-xs" disabled={rows.length >= 6} onClick={() => setRows((old) => [...old, { label: '新收款期', amountRule: 'REMAINDER', dueOffsetDays: 0 }])}>+ 添加一期</button><div className="grid gap-3 sm:grid-cols-2"><div><label className="label">逾期动作</label><select className="input" value={action} onChange={(e) => setAction(e.target.value as 'REMIND_ONLY' | 'AUTO_RELEASE')}><option value="REMIND_ONLY">标记逾期并提醒</option><option value="AUTO_RELEASE">自动释放</option></select></div><div><label className="label">默认免损比例（%）</label><input className="input" type="number" min={0} max={50} value={ratio} onChange={(e) => setRatio(Number(e.target.value))} /></div></div>{error && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}<div className="flex justify-end gap-3"><button className="btn-secondary" onClick={onCancel}>取消</button><button className="btn-primary" onClick={() => void save()}>保存</button></div></div></div></div>;
+  // F-25：保存按钮原来没有提交中禁用，双击会并发发出两次覆盖式更新（产生重复审计记录）。
+  const [busy, setBusy] = useState(false);
+  const save = async () => { if (busy) return; if (rows.length < 1 || rows.length > 6 || rows.filter((r) => r.amountRule === 'REMAINDER').length !== 1 || rows[rows.length - 1].amountRule !== 'REMAINDER' || ratio < 0 || ratio > 50) { setError('模板需 1-6 期，尾款恰好一期且在最后，免损比例 0-50%'); return; } setBusy(true); try { const result = await api.updateHoldOrderConfig(token, { installments: rows, overdueAction: action, defaultFreeCancelRatio: ratio / 100 }); onDone(result.config); } catch (err) { setError(err instanceof Error ? err.message : '保存模板失败'); } finally { setBusy(false); } };
+  return <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="收款模板设置" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}><div className="w-full max-w-2xl rounded-lg bg-white shadow-xl" onClick={(e) => e.stopPropagation()}><div className="flex items-center justify-between border-b border-slate-200 px-5 py-3"><h2 className="text-lg font-semibold">收款模板设置</h2><button onClick={onCancel} className="text-xl text-slate-400">×</button></div><div className="space-y-3 px-5 py-4"><div className="overflow-x-auto"><table className="w-full text-xs"><thead><tr><th className="text-left">名称</th><th className="text-left">金额规则</th><th>每人金额</th><th>起飞前天数</th><th></th></tr></thead><tbody>{rows.map((row, index) => <tr key={index}><td><input className="input h-8" value={row.label} onChange={(e) => setRows((old) => old.map((r, i) => i === index ? { ...r, label: e.target.value } : r))} /></td><td><select className="input h-8" value={row.amountRule} onChange={(e) => setRows((old) => old.map((r, i) => i === index ? { ...r, amountRule: e.target.value as 'PER_PERSON_FIXED' | 'REMAINDER', perPersonCny: e.target.value === 'REMAINDER' ? undefined : r.perPersonCny ?? 0 } : r))}><option value="PER_PERSON_FIXED">每人固定</option><option value="REMAINDER">尾款余款</option></select></td><td><input className="input h-8 w-24" type="number" disabled={row.amountRule === 'REMAINDER'} value={row.perPersonCny ?? ''} onChange={(e) => setRows((old) => old.map((r, i) => i === index ? { ...r, perPersonCny: Number(e.target.value) } : r))} /></td><td><input className="input h-8 w-24" type="number" min={0} value={row.dueOffsetDays ?? ''} onChange={(e) => setRows((old) => old.map((r, i) => i === index ? { ...r, dueOffsetDays: e.target.value === '' ? null : Number(e.target.value) } : r))} /></td><td><button className="btn-ghost-danger text-xs" disabled={rows.length <= 1} onClick={() => setRows((old) => old.filter((_, i) => i !== index))}>删除</button></td></tr>)}</tbody></table></div><button className="btn-secondary text-xs" disabled={rows.length >= 6} onClick={() => setRows((old) => [...old, { label: '新收款期', amountRule: 'REMAINDER', dueOffsetDays: 0 }])}>+ 添加一期</button><div className="grid gap-3 sm:grid-cols-2"><div><label className="label">逾期动作</label><select className="input" value={action} onChange={(e) => setAction(e.target.value as 'REMIND_ONLY' | 'AUTO_RELEASE')}><option value="REMIND_ONLY">标记逾期并提醒</option><option value="AUTO_RELEASE">自动释放</option></select></div><div><label className="label">默认免损比例（%）</label><input className="input" type="number" min={0} max={50} value={ratio} onChange={(e) => setRatio(Number(e.target.value))} /></div></div>{error && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}<div className="flex justify-end gap-3"><button className="btn-secondary" onClick={onCancel}>取消</button><button className="btn-primary" disabled={busy} onClick={() => void save()}>{busy ? '保存中…' : '保存'}</button></div></div></div></div>;
 }
 
 function PriceModal({ order, onCancel, onSubmit }: { order: HoldOrderListItem; onCancel: () => void; onSubmit: (price: number, reason: string) => Promise<void> }) {
@@ -1121,15 +1134,19 @@ function PriceModal({ order, onCancel, onSubmit }: { order: HoldOrderListItem; o
   const [price, setPrice] = useState(order.perSeatPriceCny);
   const [reason, setReason] = useState('');
   const [error, setError] = useState<string | null>(null);
+  // F-25：改价保存按钮原来没有提交中禁用，双击会并发触发两次改价请求。
+  const [busy, setBusy] = useState(false);
   const submit = async () => {
+    if (busy) return;
     if (price < 0 || !reason.trim()) { setError('新价和改价原因均为必填'); return; }
-    try { await onSubmit(price, reason.trim()); } catch (err) { setError(err instanceof Error ? err.message : '改价失败'); }
+    setBusy(true);
+    try { await onSubmit(price, reason.trim()); } catch (err) { setError(err instanceof Error ? err.message : '改价失败'); setBusy(false); }
   };
   return (
     <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="调整锁定结算价" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}>
       <div className="w-full max-w-md rounded-lg bg-white shadow-xl" onClick={(e) => e.stopPropagation()}>
         <div className="flex items-center justify-between border-b border-slate-200 px-5 py-3"><h2 className="text-lg font-semibold">调整锁定结算价</h2><button onClick={onCancel} className="text-xl text-slate-400">×</button></div>
-        <div className="space-y-4 px-5 py-4"><p className="text-sm text-ink-muted">占位单 {order.holdNo} · 原价 ¥{order.perSeatPriceCny}/人</p><div><label className="label">新价（元/人）</label><input className="input" type="number" min={0} value={price} onChange={(e) => setPrice(Number(e.target.value))} /></div><div><label className="label">改价原因（必填）</label><textarea className="input min-h-24" maxLength={200} value={reason} onChange={(e) => setReason(e.target.value)} /></div>{error && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}<div className="flex justify-end gap-3"><button className="btn-secondary" onClick={onCancel}>取消</button><button className="btn-primary" onClick={() => void submit()}>保存改价</button></div></div>
+        <div className="space-y-4 px-5 py-4"><p className="text-sm text-ink-muted">占位单 {order.holdNo} · 原价 ¥{order.perSeatPriceCny}/人</p><div><label className="label">新价（元/人）</label><input className="input" type="number" min={0} value={price} onChange={(e) => setPrice(Number(e.target.value))} /></div><div><label className="label">改价原因（必填）</label><textarea className="input min-h-24" maxLength={200} value={reason} onChange={(e) => setReason(e.target.value)} /></div>{error && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}<div className="flex justify-end gap-3"><button className="btn-secondary" onClick={onCancel}>取消</button><button className="btn-primary" disabled={busy} onClick={() => void submit()}>{busy ? '保存中…' : '保存改价'}</button></div></div>
       </div>
     </div>
   );
@@ -1141,13 +1158,17 @@ function InfoModal({ order, agents, onCancel, onSubmit }: { order: HoldOrderList
   const [notes, setNotes] = useState(order.notes ?? '');
   const [agentId, setAgentId] = useState(order.agentId ?? '');
   const [error, setError] = useState<string | null>(null);
+  // F-25：编辑信息保存按钮原来没有提交中禁用，双击会并发触发两次覆盖式更新。
+  const [busy, setBusy] = useState(false);
   // 当前归属的代理可能已停用而不在可选列表里：补一个占位选项，避免下拉显示成空白。
   const currentAgentMissing = order.ownerType === 'AGENT' && !!order.agentId && !agents.some((a) => a.id === order.agentId);
   const agentChanged = order.ownerType === 'AGENT' && agentId !== (order.agentId ?? '');
   const submit = async () => {
+    if (busy) return;
     if (order.ownerType === 'CUSTOMER' && !groupName.trim()) { setError('直客占位团名不能清空'); return; }
     if (order.ownerType === 'AGENT' && !agentId) { setError('代理占位必须选择归属代理'); return; }
-    try { await onSubmit(groupName.trim(), notes.trim(), agentId); } catch (err) { setError(err instanceof Error ? err.message : '保存失败'); }
+    setBusy(true);
+    try { await onSubmit(groupName.trim(), notes.trim(), agentId); } catch (err) { setError(err instanceof Error ? err.message : '保存失败'); setBusy(false); }
   };
   return (
     <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="编辑占位单" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}>
@@ -1170,7 +1191,7 @@ function InfoModal({ order, agents, onCancel, onSubmit }: { order: HoldOrderList
           <div><label className="label">团名{order.ownerType === 'CUSTOMER' ? '（必填）' : ''}</label><input className="input" maxLength={120} value={groupName} onChange={(e) => setGroupName(e.target.value)} /></div>
           <div><label className="label">备注</label><textarea className="input min-h-24" maxLength={500} value={notes} onChange={(e) => setNotes(e.target.value)} /></div>
           {error && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}
-          <div className="flex justify-end gap-3"><button className="btn-secondary" onClick={onCancel}>取消</button><button className="btn-primary" onClick={() => void submit()}>保存</button></div>
+          <div className="flex justify-end gap-3"><button className="btn-secondary" onClick={onCancel}>取消</button><button className="btn-primary" disabled={busy} onClick={() => void submit()}>{busy ? '保存中…' : '保存'}</button></div>
         </div>
       </div>
     </div>

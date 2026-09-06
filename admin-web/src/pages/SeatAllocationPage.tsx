@@ -10,7 +10,7 @@
  * 切位以「单程班次」（flightScheduleId）为单位：出发日期 + 航班号即可定位一个班次，
  * 无返程日期维度（往返各自是独立班次）。
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import {
   api,
   type AdminFlight,
@@ -63,6 +63,8 @@ export function SeatAllocationPage() {
 
   const [allocations, setAllocations] = useState<SeatAllocationListItem[]>([]);
   const [allocLoading, setAllocLoading] = useState(false);
+  // F-25：请求序号防护——快速切班次时，晚到的旧响应不能覆盖当前选中班次的结果。
+  const allocRequestIdRef = useRef(0);
   const [loading, setLoading] = useState(true);
   const [showForm, setShowForm] = useState(false);
   const [showBulk, setShowBulk] = useState(false);
@@ -165,8 +167,9 @@ export function SeatAllocationPage() {
 
   // 拉当前班次的切位列表（真实持久化）
   const refetchAllocations = useCallback(async () => {
+    const requestId = ++allocRequestIdRef.current;
     if (!tokens || !selectedScheduleId) {
-      setAllocations([]);
+      if (requestId === allocRequestIdRef.current) setAllocations([]);
       return;
     }
     setAllocLoading(true);
@@ -174,11 +177,12 @@ export function SeatAllocationPage() {
       const r = await api.listSeatAllocations(tokens.accessToken, {
         flightScheduleId: selectedScheduleId,
       });
+      if (requestId !== allocRequestIdRef.current) return; // 已被更晚一次请求作废
       setAllocations(r.allocations);
     } catch (err) {
-      setError(err instanceof Error ? err.message : '加载切位失败');
+      if (requestId === allocRequestIdRef.current) setError(err instanceof Error ? err.message : '加载切位失败');
     } finally {
-      setAllocLoading(false);
+      if (requestId === allocRequestIdRef.current) setAllocLoading(false);
     }
   }, [tokens, selectedScheduleId]);
 

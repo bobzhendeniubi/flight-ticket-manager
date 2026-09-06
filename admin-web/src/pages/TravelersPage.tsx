@@ -33,6 +33,9 @@ function travelerApiToMock(t: Traveler): MockTraveler {
   };
 }
 
+// F-27：固定拉一页（500 条）超量会静默截断查不到人；改成显示真实 pagination.total + 加载更多。
+const SAVED_TRAVELERS_PAGE_SIZE = 500;
+
 function SavedTravelersView() {
   const tokens = useAuth((s) => s.tokens);
   const [travelers, setTravelers] = useState<MockTraveler[]>([]);
@@ -44,18 +47,31 @@ function SavedTravelersView() {
   const [ageRange, setAgeRange] = useState<'' | 'child' | 'adult' | 'senior'>('');
   const [selected, setSelected] = useState<MockTraveler | null>(null);
   const [reloadNonce, setReloadNonce] = useState(0);
+  const [page, setPage] = useState(1);
+  const [totalCount, setTotalCount] = useState(0);
+
+  // 手动重试（reloadNonce 变化）或换账号时回到第 1 页，清空已加载的旧数据。
+  useEffect(() => {
+    setPage(1);
+    setTravelers([]);
+  }, [tokens?.accessToken, reloadNonce]);
 
   useEffect(() => {
     if (!tokens?.accessToken) return;
     let cancelled = false;
     setLoading(true);
     setError(null);
-    api.listTravelers(tokens.accessToken, { pageSize: 500 })
-      .then((r) => { if (!cancelled) setTravelers(r.travelers.map(travelerApiToMock)); })
+    api.listTravelers(tokens.accessToken, { page, pageSize: SAVED_TRAVELERS_PAGE_SIZE })
+      .then((r) => {
+        if (cancelled) return;
+        const mapped = r.travelers.map(travelerApiToMock);
+        setTravelers((prev) => (page === 1 ? mapped : [...prev, ...mapped]));
+        setTotalCount(r.pagination.total);
+      })
       .catch((e) => { if (!cancelled) setError(e instanceof ApiError ? e.message : '加载失败'); })
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
-  }, [tokens?.accessToken, reloadNonce]);
+  }, [tokens?.accessToken, reloadNonce, page]);
 
   const nationalities = useMemo(() => {
     const set = new Set<string>();
@@ -93,13 +109,14 @@ function SavedTravelersView() {
   const kpi = useMemo(() => {
     const ages = travelers.map((t) => calcAge(t.dateOfBirth));
     return {
-      total: travelers.length,
+      // F-27：总数改用后端 pagination.total（真实总数），不再恒等于「已加载条数」
+      total: totalCount,
       children: ages.filter((a) => a < 12).length,
       adults: ages.filter((a) => a >= 12 && a < 60).length,
       seniors: ages.filter((a) => a >= 60).length,
       totalTrips: travelers.reduce((s, t) => s + t.tripCount, 0),
     };
-  }, [travelers]);
+  }, [travelers, totalCount]);
 
   const handleExport = () => {
     exportToCSV('旅客名单', filtered, [
@@ -249,6 +266,20 @@ function SavedTravelersView() {
             </tbody>
           </table>
         </div>
+        {/* F-27：真实总数 + 加载更多，超过一页不再悄悄查不到人 */}
+        {totalCount > travelers.length && (
+          <div className="flex items-center justify-between border-t border-slate-100 px-4 py-2.5 text-xs text-ink-muted">
+            <span>已加载 {travelers.length} / 共 {totalCount} 位</span>
+            <button
+              type="button"
+              className="btn-secondary px-2.5 py-1 text-xs disabled:opacity-50"
+              disabled={loading}
+              onClick={() => setPage((p) => p + 1)}
+            >
+              {loading ? '加载中…' : '加载更多'}
+            </button>
+          </div>
+        )}
       </section>
 
       {selected && (

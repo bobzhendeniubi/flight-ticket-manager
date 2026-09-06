@@ -9,6 +9,14 @@ import { exportToCSV } from '../lib/csvExport';
 import { formatDateTimeSecCn } from '../lib/datetime';
 import { Icon, type IconName } from '../components/Icon';
 import { useDialogA11y } from '../components/Modal';
+import { useConfirm } from '../components/ConfirmDialog';
+
+/**
+ * 终态状态：后端状态机里 PAID / VOIDED 都没有转出路径，点下去系统内再也回不来，
+ * 只能线下纠正。抽屉里它们又和「撤回审核」「打回草稿」这类可逆按钮挨着渲染，
+ * 所以这两步必须二次确认（与本页其它资金操作同等谨慎级别）。
+ */
+const TERMINAL_STATUSES: readonly SettlementStatus[] = ['PAID', 'VOIDED'];
 
 const STATUS_INFO: Record<SettlementStatus, { label: string; color: string }> = {
   DRAFT: { label: '草稿', color: 'badge-neutral' },
@@ -25,6 +33,7 @@ function ymdNow(): string {
 
 export function SettlementsPage() {
   const tokens = useAuth((s) => s.tokens);
+  const confirm = useConfirm();
   const [settlements, setSettlements] = useState<SettlementSummary[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -114,6 +123,21 @@ export function SettlementsPage() {
 
   const advance = async (toStatus: SettlementStatus) => {
     if (!selected || !tokens?.accessToken) return;
+    // 终态不可撤回：先把代理、结算期、金额摆出来让财务确认一遍再走。
+    if (TERMINAL_STATUSES.includes(toStatus)) {
+      const agentName = selected.agent.companyName ?? selected.agent.contactName;
+      const payable = `¥${Number(selected.payableToAgent).toLocaleString()}`;
+      const isPaid = toStatus === 'PAID';
+      const ok = await confirm({
+        title: isPaid ? '确认标记为已支付？' : '确认作废这张结算单？',
+        body:
+          `${agentName} · ${selected.period} 期 · 应付 ${payable}\n\n` +
+          `确认后结算单进入「${isPaid ? '已支付' : '已作废'}」终态，系统里没有撤回入口，只能线下纠正。`,
+        tone: 'danger',
+        confirmText: isPaid ? '确认已支付' : '确认作废',
+      });
+      if (!ok) return;
+    }
     try {
       const res = await api.updateSettlementStatus(tokens.accessToken, selected.id, toStatus);
       setSelected(res.settlement);

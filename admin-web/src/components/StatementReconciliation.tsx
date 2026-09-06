@@ -216,10 +216,18 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
     );
   }, [candidates, orderQuery]);
 
+  // F-15：订单侧一旦有筛选（关键词/下单日期区间），`candidates` 就是后端按这些条件
+  // 过滤过的窄集合——不是全量待收订单。若还拿它算“金额一对一吻合”，本该有两张
+  // 同额订单的情况会因为其中一张被筛掉而误判成“唯一吻合”，一键认款可能把钱错认
+  // 到另一张订单。保守处理：筛选生效时直接停用自动配对建议（手动拖拽/点选认款
+  // 不受影响，仍有逐笔二次确认），而不是拿这份不完整的候选集继续算。
+  const orderFiltersActive = !!(orderQuery.trim() || orderFrom || orderTo);
+
   // 自动配对建议：金额一对一吻合（恰好一笔未认款流水 ↔ 恰好一张待收订单）。
   // 用完整 openPool 而非展示池——「只看流水导入」只是视图过滤，
   // 若拿过滤后的池算唯一性，两笔同金额流水会被误判成一对一（审计发现#5）。
   const suggestions = useMemo(() => {
+    if (orderFiltersActive) return [];
     const byAmountReceipts = new Map<string, Receipt[]>();
     for (const r of openPool) {
       const key = Number(r.remainingCny).toFixed(2);
@@ -238,7 +246,7 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
       }
     }
     return out.slice(0, 20);
-  }, [openPool, candidates]);
+  }, [openPool, candidates, orderFiltersActive]);
 
   // 勾选中的建议组数（只算当前有效建议里被勾的，重载后失效的旧勾选不计入）
   const selectedCount = useMemo(
@@ -631,6 +639,13 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
       {notice && (
         <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-800">
           <Icon name="check" /> {notice}
+        </div>
+      )}
+
+      {/* F-15：订单侧筛选生效时候选集不完整，自动配对建议已停用——提示财务改用手动拖拽/点选认款 */}
+      {orderFiltersActive && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+          订单已按关键词/日期筛选，当前仅在筛选结果内查看——为避免把钱错认到被筛掉的同额订单，自动配对建议已停用。清空订单筛选可恢复；筛选中仍可手动拖拽/选中流水认款到指定订单。
         </div>
       )}
 

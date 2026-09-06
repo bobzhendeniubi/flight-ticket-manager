@@ -15,7 +15,7 @@
  *   2.「📋 粘贴报价表」——整块粘贴运营 OTA 报价表原文，由 lib/quoteSheetParser 解析出
  *      （出发日 × 航班号）后预览确认，直接走批量 upsert 写库并重拉网格。
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { formatDateTimeSecCn } from '../lib/datetime';
 import { Icon } from './Icon';
 import {
@@ -48,9 +48,22 @@ function cellKey(date: string, flightNumber: string): string {
   return `${date}__${flightNumber}`;
 }
 
-export function FlightSettlementRatesPanel() {
+export function FlightSettlementRatesPanel({
+  onDirtyChange,
+}: {
+  /**
+   * 向上报「网格里有未保存改动」。本面板挂在页签下，切走就整个卸载、草稿随之消失；
+   * 页签那层拿到这个状态才能在切走前拦一句。
+   */
+  onDirtyChange?: (dirty: boolean) => void;
+} = {}) {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
+  /**
+   * 请求序号：快速连点翻页时网络时序可能反转，晚回来的旧窗口响应会盖住当前窗口——
+   * 表头是新日期、格子是旧日期的价，运营照着编辑保存就把价写到错误的日期上。只认最后一次请求。
+   */
+  const reqSeqRef = useRef(0);
 
   const [windowStart, setWindowStart] = useState<string>(() => todayYmd());
   const [flights, setFlights] = useState<AdminFlight[]>([]);
@@ -111,6 +124,7 @@ export function FlightSettlementRatesPanel() {
 
   const load = useCallback(async () => {
     if (!token || days.length === 0) return;
+    const seq = ++reqSeqRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -119,6 +133,7 @@ export function FlightSettlementRatesPanel() {
         from: days[0],
         to: days[days.length - 1],
       });
+      if (seq !== reqSeqRef.current) return; // 已有更新的请求发出，丢弃这次的旧响应
       setRates(res.rates);
       const next = new Map<string, string>();
       for (const r of res.rates) {
@@ -126,9 +141,10 @@ export function FlightSettlementRatesPanel() {
       }
       setDraft(next);
     } catch (e: unknown) {
+      if (seq !== reqSeqRef.current) return;
       setError(e instanceof ApiError ? e.message : '机票结算价加载失败');
     } finally {
-      setLoading(false);
+      if (seq === reqSeqRef.current) setLoading(false);
     }
   }, [token, days]);
 
@@ -263,6 +279,11 @@ export function FlightSettlementRatesPanel() {
     }
     return false;
   }, [draft, days, flightNumbers, rateByKey]);
+
+  // 把「有未保存改动」报给页签那层：切走页签会卸载本面板、草稿随之消失，得先拦一句。
+  useEffect(() => {
+    onDirtyChange?.(dirty);
+  }, [dirty, onDirtyChange]);
 
   // 解析结果里当前网格看不到的部分（照样入库，但要提示运营去哪儿核对）
   const sheetOutsideGrid = useMemo(() => {

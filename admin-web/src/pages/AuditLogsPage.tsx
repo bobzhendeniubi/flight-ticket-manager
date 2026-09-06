@@ -60,6 +60,7 @@ const TARGET_LABEL: Record<TargetType, string> = {
 interface AuditView {
   id: string;
   timestamp: string;
+  actorUserId: string | null;
   actor: string;
   actorRole: string;
   ip: string;
@@ -80,6 +81,7 @@ function toView(l: AuditLog): AuditView {
   return {
     id: l.id,
     timestamp: l.createdAt,
+    actorUserId: l.actorUserId,
     actor: l.actorLabel ?? 'system',
     actorRole: l.actorRole ?? 'SYSTEM',
     ip: l.ipAddress ?? 'system',
@@ -96,70 +98,102 @@ function toView(l: AuditLog): AuditView {
   };
 }
 
+// F-22：日期区间用浏览器本地日期（与仓库里 FinancesPage.tsx 的 todayStr/daysAgoStr
+// 同一写法），仅用于 <input type="date"> 默认值，不涉及业务时区换算。
+function todayStr(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+function daysAgoStr(n: number): string {
+  const d = new Date();
+  d.setDate(d.getDate() - n);
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+const DEFAULT_WINDOW_DAYS = 90;
+const PAGE_SIZE = 200;
+
 export function AuditLogsPage() {
   const tokens = useAuth((s) => s.tokens);
   const [logs, setLogs] = useState<AuditView[]>([]);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [search, setSearch] = useState('');
+  // F-22：actorFilter 存 actorUserId（后端按 id 过滤），下拉候选见 actorOptions。
   const [actorFilter, setActorFilter] = useState('');
   const [targetFilter, setTargetFilter] = useState<'' | TargetType>('');
   const [severityFilter, setSeverityFilter] = useState<'' | Severity>('');
+  // 到账日期区间默认「最近 90 天」，与下方 KPI 的「最近 90 天」文案对齐（可调窄/调宽）。
+  const [from, setFrom] = useState(daysAgoStr(DEFAULT_WINDOW_DAYS - 1));
+  const [to, setTo] = useState(todayStr());
+  const [page, setPage] = useState(1);
+  const [pagination, setPagination] = useState({ page: 1, pageSize: PAGE_SIZE, total: 0 });
+  // 见过的操作人集合，跨页/跨筛选累积（不是全量用户名单，只是「本次会话里见过的」）。
+  const [actorOptions, setActorOptions] = useState<Array<{ id: string; label: string }>>([]);
   const [selected, setSelected] = useState<AuditView | null>(null);
   const dialogRef = useDialogA11y(() => setSelected(null), selected !== null);
 
+  // 筛选条件（不含 page 本身）变化时回到第 1 页，避免「翻到第 5 页后换筛选，结果是空的」。
+  useEffect(() => {
+    setPage(1);
+  }, [search, actorFilter, targetFilter, severityFilter, from, to]);
+
+  // F-22：from/to/actorUserId/targetType/severity/search 全部接后端查询参数（真分页），
+  // 不再是"只在最新 200 条里筛"；search 防抖 300ms，避免每敲一个字都打后端。
   useEffect(() => {
     if (!tokens?.accessToken) return;
     let cancelled = false;
-    setLoading(true);
-    api
-      .listAuditLogs(tokens.accessToken, { pageSize: 200 })
-      .then((r) => {
-        if (!cancelled) setLogs(r.logs.map(toView));
-      })
-      .catch((e) => {
-        if (!cancelled) setError(e instanceof ApiError ? e.message : '加载失败');
-      })
-      .finally(() => {
-        if (!cancelled) setLoading(false);
-      });
+    const t = setTimeout(() => {
+      setLoading(true);
+      setError(null);
+      const params: Record<string, string | number> = { page, pageSize: PAGE_SIZE };
+      if (search.trim()) params.search = search.trim();
+      if (actorFilter) params.actorUserId = actorFilter;
+      if (targetFilter) params.targetType = targetFilter;
+      if (severityFilter) params.severity = severityFilter;
+      if (from) params.from = from;
+      if (to) params.to = to;
+      api
+        .listAuditLogs(tokens.accessToken, params)
+        .then((r) => {
+          if (cancelled) return;
+          const views = r.logs.map(toView);
+          setLogs(views);
+          setPagination(r.pagination);
+          setActorOptions((prev) => {
+            const byId = new Map(prev.map((a) => [a.id, a] as const));
+            for (const l of views) {
+              if (l.actorUserId) byId.set(l.actorUserId, { id: l.actorUserId, label: l.actor });
+            }
+            return Array.from(byId.values()).sort((a, b) => a.label.localeCompare(b.label));
+          });
+        })
+        .catch((e) => {
+          if (!cancelled) setError(e instanceof ApiError ? e.message : '加载失败');
+        })
+        .finally(() => {
+          if (!cancelled) setLoading(false);
+        });
+    }, 300);
     return () => {
       cancelled = true;
+      clearTimeout(t);
     };
-  }, [tokens?.accessToken]);
+  }, [tokens?.accessToken, page, search, actorFilter, targetFilter, severityFilter, from, to]);
 
-  const actors = useMemo(() => {
-    const set = new Set<string>();
-    logs.forEach((l) => set.add(l.actor));
-    return Array.from(set).sort();
-  }, [logs]);
+  // 后端已按全部条件过滤+排序，这里不再做二次客户端过滤/排序（F-22 之前的口径）。
+  const filtered = logs;
 
-  const filtered = useMemo(() => {
-    return logs
-      .filter((l) => {
-        if (search) {
-          const q = search.toLowerCase();
-          const haystack = [l.rawAction, l.actionLabel, l.targetLabel, l.diffSummary]
-            .join(' ')
-            .toLowerCase();
-          if (!haystack.includes(q)) return false;
-        }
-        if (actorFilter && l.actor !== actorFilter) return false;
-        if (targetFilter && l.targetType !== targetFilter) return false;
-        if (severityFilter && l.severity !== severityFilter) return false;
-        return true;
-      })
-      .sort((a, b) => b.timestamp.localeCompare(a.timestamp));
-  }, [logs, search, actorFilter, targetFilter, severityFilter]);
-
+  // F-22：总日志数改用后端 pagination.total（当前筛选条件下的真实总数），
+  // 不再是恒等于 min(实际总数,200) 的假总数；关键/警告/今日三个 KPI 仍是当前页近似值，
+  // 和之前一样只覆盖本页，未在本次修复范围内改造成服务端聚合。
   const kpi = useMemo(
     () => ({
-      total: logs.length,
+      total: pagination.total,
       critical: logs.filter((l) => l.severity === 'CRITICAL').length,
       warning: logs.filter((l) => l.severity === 'WARNING').length,
       today: logs.filter((l) => l.timestamp.startsWith(new Date().toISOString().slice(0, 10))).length,
     }),
-    [logs],
+    [logs, pagination.total],
   );
 
   return (
@@ -203,7 +237,7 @@ export function AuditLogsPage() {
             )
           }
         >
-          <Icon name="download" /> 导出 CSV
+          <Icon name="download" /> 导出当前页 CSV
         </button>
       </section>
 
@@ -215,14 +249,16 @@ export function AuditLogsPage() {
       )}
 
       <section className="grid gap-3 md:grid-cols-4">
-        <Kpi label="总日志数" value={kpi.total.toString()} sub="最近 90 天" />
-        <Kpi label="关键事件" value={kpi.critical.toString()} sub="支付 / 结算 / 权限" />
-        <Kpi label="警告事件" value={kpi.warning.toString()} sub="退款 / 强制改状态" />
-        <Kpi label="今日动作" value={kpi.today.toString()} sub="截至现在" />
+        {/* F-22：total 来自后端 pagination（当前筛选条件下的真实总数），sub 显示实际查询的日期区间，
+            不再是恒等于 min(实际总数,200) 且文案写死"最近 90 天"的假 KPI */}
+        <Kpi label="总日志数" value={kpi.total.toString()} sub={`${from || '不限'} ~ ${to || '不限'}`} />
+        <Kpi label="关键事件" value={kpi.critical.toString()} sub="本页近似值" />
+        <Kpi label="警告事件" value={kpi.warning.toString()} sub="本页近似值" />
+        <Kpi label="今日动作" value={kpi.today.toString()} sub="本页近似值" />
       </section>
 
       <section className="card">
-        <div className="grid gap-3 md:grid-cols-5">
+        <div className="grid gap-3 md:grid-cols-6">
           <div className="md:col-span-2">
             <label className="label text-xs">搜索</label>
             <input
@@ -236,9 +272,9 @@ export function AuditLogsPage() {
             <label className="label text-xs">操作人</label>
             <select className="input" value={actorFilter} onChange={(e) => setActorFilter(e.target.value)}>
               <option value="">全部</option>
-              {actors.map((a) => (
-                <option key={a} value={a}>
-                  {a}
+              {actorOptions.map((a) => (
+                <option key={a.id} value={a.id}>
+                  {a.label}
                 </option>
               ))}
             </select>
@@ -270,6 +306,14 @@ export function AuditLogsPage() {
               <option value="WARNING">警告</option>
               <option value="INFO">一般</option>
             </select>
+          </div>
+          <div>
+            <label className="label text-xs">日期从</label>
+            <input className="input" type="date" value={from} onChange={(e) => setFrom(e.target.value)} />
+          </div>
+          <div>
+            <label className="label text-xs">日期到</label>
+            <input className="input" type="date" value={to} onChange={(e) => setTo(e.target.value)} />
           </div>
         </div>
       </section>
@@ -338,6 +382,31 @@ export function AuditLogsPage() {
           </table>
         </div>
       </section>
+
+      {/* F-22：真分页——之前固定拉 200 条，筛选/操作人搜索命中窗口外的记录会直接查不到且无提示 */}
+      {pagination.total > 0 && (
+        <div className="flex items-center justify-between text-xs text-ink-muted">
+          <span>
+            共 {pagination.total} 条 · 第 {pagination.page} / {Math.max(1, Math.ceil(pagination.total / pagination.pageSize))} 页
+          </span>
+          <div className="flex gap-2">
+            <button
+              className="btn-secondary px-2 py-1 text-xs disabled:opacity-50"
+              disabled={page <= 1 || loading}
+              onClick={() => setPage((p) => Math.max(1, p - 1))}
+            >
+              上一页
+            </button>
+            <button
+              className="btn-secondary px-2 py-1 text-xs disabled:opacity-50"
+              disabled={page * pagination.pageSize >= pagination.total || loading}
+              onClick={() => setPage((p) => p + 1)}
+            >
+              下一页
+            </button>
+          </div>
+        </div>
+      )}
 
       {selected && (
         <div

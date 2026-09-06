@@ -359,7 +359,7 @@ function CreatePolicyModal({
 }: {
   existingKinds: Set<ProductKind>;
   onCancel: () => void;
-  onSubmit: (body: Record<string, unknown>) => void;
+  onSubmit: (body: Record<string, unknown>) => void | Promise<void>;
 }) {
   const dialogRef = useDialogA11y(onCancel);
   const KIND_OPTIONS: ProductKind[] = ['FLIGHT', 'HOTEL', 'TRANSFER', 'VISA', 'BUNDLE'];
@@ -375,6 +375,24 @@ function CreatePolicyModal({
 
   const isOverride = !!scope.trim();
   const valid = name.trim().length > 0 && tiers.length > 0;
+  // F-27：提交按钮原来没有提交中禁用，双击会并发发出两次创建请求（后端唯一约束兜底不产生
+  // 脏数据，但会弹出多余的失败提示，属体验噪音）。
+  const [submitting, setSubmitting] = useState(false);
+  const submit = async () => {
+    if (submitting) return;
+    setSubmitting(true);
+    try {
+      await onSubmit({
+        productKind,
+        name,
+        tiers: tiers.map(draftToTier),
+        scope: scope.trim() || undefined,
+        isDefault: !isOverride && !existingKinds.has(productKind),
+      });
+    } finally {
+      setSubmitting(false);
+    }
+  };
 
   return (
     <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="新建取消策略" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}>
@@ -468,18 +486,10 @@ function CreatePolicyModal({
           <button className="btn-secondary" onClick={onCancel}>取消</button>
           <button
             className="btn-primary"
-            disabled={!valid}
-            onClick={() =>
-              onSubmit({
-                productKind,
-                name,
-                tiers: tiers.map(draftToTier),
-                scope: scope.trim() || undefined,
-                isDefault: !isOverride && !existingKinds.has(productKind),
-              })
-            }
+            disabled={!valid || submitting}
+            onClick={() => void submit()}
           >
-            创建
+            {submitting ? '创建中…' : '创建'}
           </button>
         </div>
       </div>

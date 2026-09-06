@@ -145,9 +145,13 @@ export function ReconciliationPage() {
   const [err, setErr] = useState<string | null>(null);
   const [showRegister, setShowRegister] = useState(false);
 
+  // F-25：三个 load* 原来直接 setState，网络时序反转时旧响应会覆盖新结果；
+  // 改成返回一个 cancel 函数（同 StatementReconciliation.tsx 的既有写法），
+  // 由调用方在发起下一次加载前调用，晚到的旧响应不再落地。
   // 加载进账列表（用于待核销/已核销/已退款 + KPI 计算）
   const loadReceipts = useCallback(() => {
-    if (!token) return;
+    if (!token) return () => {};
+    let cancelled = false;
     setLoading(true);
     setErr(null);
     const params = {
@@ -157,39 +161,54 @@ export function ReconciliationPage() {
     };
     api
       .listReceipts(token, Object.keys(params).length ? params : undefined)
-      .then((r) => setReceipts(r.receipts))
-      .catch((e: unknown) => setErr(e instanceof ApiError ? e.message : '加载进账失败'))
-      .finally(() => setLoading(false));
+      .then((r) => { if (!cancelled) setReceipts(r.receipts); })
+      .catch((e: unknown) => { if (!cancelled) setErr(e instanceof ApiError ? e.message : '加载进账失败'); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
   }, [token, q, from, to]);
 
   // 加载全部流水（仅在切到「全部流水」页签时拉）
   const loadLedger = useCallback(() => {
-    if (!token) return;
+    if (!token) return () => {};
+    let cancelled = false;
     setLoading(true);
     setErr(null);
     api
       .getReceiptLedger(token)
-      .then((r) => setLedger(r.entries))
-      .catch((e: unknown) => setErr(e instanceof ApiError ? e.message : '加载流水失败'))
-      .finally(() => setLoading(false));
+      .then((r) => { if (!cancelled) setLedger(r.entries); })
+      .catch((e: unknown) => { if (!cancelled) setErr(e instanceof ApiError ? e.message : '加载流水失败'); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
   }, [token]);
 
   // 加载待核实队列（订单人工收款 + 占位单手工到账，两路并行）
   const loadUnverified = useCallback(() => {
-    if (!token) return;
+    if (!token) return () => {};
+    let cancelled = false;
     setLoading(true);
     setErr(null);
     Promise.all([api.listUnverifiedPayments(token), api.listUnverifiedClaims(token)])
-      .then(([p, c]) => { setUnverifiedPayments(p.items); setUnverifiedClaims(c.items); })
-      .catch((e: unknown) => setErr(e instanceof ApiError ? e.message : '加载待核实清单失败'))
-      .finally(() => setLoading(false));
+      .then(([p, c]) => { if (!cancelled) { setUnverifiedPayments(p.items); setUnverifiedClaims(c.items); } })
+      .catch((e: unknown) => { if (!cancelled) setErr(e instanceof ApiError ? e.message : '加载待核实清单失败'); })
+      .finally(() => { if (!cancelled) setLoading(false); });
+    return () => { cancelled = true; };
   }, [token]);
 
+  // F-25：搜索框原来每敲一个字就因 q 变化触发 loadReceipts 引用更新、effect 重跑，
+  // 相当于每敲一个字打一次后端；改成 300ms 防抖（对齐 StatementReconciliation.tsx
+  // 已有的 debounce 写法），同时借 cancelLoad 兜住上面新增的竞态保护。
   useEffect(() => {
     if (tab === 'channels' || tab === 'statement') return; // 渠道管理/流水工作台自带加载
-    if (tab === 'ledger') loadLedger();
-    else if (tab === 'unverified') loadUnverified();
-    else loadReceipts();
+    let cancelLoad: (() => void) | undefined;
+    const t = setTimeout(() => {
+      if (tab === 'ledger') cancelLoad = loadLedger();
+      else if (tab === 'unverified') cancelLoad = loadUnverified();
+      else cancelLoad = loadReceipts();
+    }, 300);
+    return () => {
+      clearTimeout(t);
+      cancelLoad?.();
+    };
   }, [tab, loadReceipts, loadLedger, loadUnverified]);
 
   // 页签角标要在任何页签下都可见 → 进页面就拉一次待核实计数
@@ -341,14 +360,12 @@ export function ReconciliationPage() {
               onChange={(e) => setTo(e.target.value)}
               aria-label="到账日期到"
             />
+            {/* F-25：改成 300ms 防抖自动查询后，原来的 Enter 立即触发是死代码（防抖 effect 已经会跑），已删除 */}
             <input
               className="input py-1.5"
               placeholder="搜进账号 / 流水号 / 付款备注 / 订单提示"
               value={q}
               onChange={(e) => setQ(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') loadReceipts();
-              }}
             />
           </div>
         )}

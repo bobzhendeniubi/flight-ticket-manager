@@ -159,6 +159,24 @@ function reverseFlightOption(flightId: string, options: FlightOption[]): FlightO
   return matches.length === 1 ? matches[0]! : null;
 }
 
+/**
+ * 「同步到配对航班」的机场税互换。
+ *
+ * airportTaxDepCny / airportTaxArrCny 是按**出发地 / 目的地**分的（见 schema 与按航班导出的
+ * 「机场税去 / 机场税回」两列）。配对航班是反向班次——它的出发机场正是本航班的到达机场，
+ * 所以原样照抄会让配对那一行的两个数字对调。这里在发出前先换回来。
+ * （两者之和不变，总毛利/单座成本不受影响，错的只是细分口径。）
+ */
+function swapAirportTaxForPair<
+  T extends { airportTaxDepCny?: number | null; airportTaxArrCny?: number | null },
+>(body: T): T {
+  return {
+    ...body,
+    airportTaxDepCny: body.airportTaxArrCny ?? null,
+    airportTaxArrCny: body.airportTaxDepCny ?? null,
+  };
+}
+
 function reverseSchedule(
   row: FinanceScheduleRow,
   rows: FinanceScheduleRow[],
@@ -910,7 +928,8 @@ function CostPeriodNewForm({
       await api.createCostPeriod(token, body);
       if (syncPair && pairedFlight) {
         try {
-          await api.createCostPeriod(token, { ...body, flightId: pairedFlight.id });
+          // 配对航班的出发机场 = 本航班的到达机场，机场税两列必须对调后再发。
+          await api.createCostPeriod(token, { ...swapAirportTaxForPair(body), flightId: pairedFlight.id });
         } catch (e: unknown) {
           setErr(
             `已保存 ${flightOptions.find((option) => option.id === flightId)?.flightNumber ?? flightId}，同步 ${pairedFlight.flightNumber} 失败：${e instanceof ApiError ? e.message : '保存失败'}`,
@@ -1183,7 +1202,8 @@ function CostPeriodRow({
       await api.updateCostPeriod(token, period.id, body);
       if (syncPair && pairedPeriod) {
         try {
-          await api.updateCostPeriod(token, pairedPeriod.id, body);
+          // 配对航班的出发机场 = 本航班的到达机场，机场税两列必须对调后再发。
+          await api.updateCostPeriod(token, pairedPeriod.id, swapAirportTaxForPair(body));
         } catch (e: unknown) {
           setSaveNotice(
             '已保存 ' + period.flightNumber + '，同步 ' + pairedPeriod.flightNumber + ' 失败：' +
@@ -1498,7 +1518,8 @@ function FlightScheduleCostRow({
           return;
         }
         try {
-          await api.patchFlightScheduleCost(token, pairedRow.scheduleId, body);
+          // 配对班次的出发机场 = 本班次的到达机场，机场税两列必须对调后再发。
+          await api.patchFlightScheduleCost(token, pairedRow.scheduleId, swapAirportTaxForPair(body));
         } catch (e: unknown) {
           if (e instanceof ApiError && e.status === 409) {
             setSaveNotice(`已保存 ${row.flightNumber}，配对班次已锁定，未同步`);

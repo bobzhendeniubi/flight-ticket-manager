@@ -1,32 +1,49 @@
 import { FormEvent, useEffect, useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useAuth } from '../stores/auth';
+import { ApiError } from '../lib/api';
+
+// F-27：登录失败提示按后端 code 映射成中文——UNAUTHORIZED 目前是唯一一处会把英文原文
+// 'Invalid email or password' 透到界面的地方（后端 auth.service.ts 故意账号不存在/密码错
+// 共用同一句，防用户枚举，这个安全设计不变，只是文案中文化）；其余 code（如 FORBIDDEN /
+// WRONG_PORTAL）后端本就给的是中文文案，原样透传即可，不需要在这里重复维护一遍。
+function mapLoginError(err: unknown): string {
+  if (err instanceof ApiError) {
+    if (err.code === 'UNAUTHORIZED') return '邮箱或密码不正确';
+    return err.message || '登录失败';
+  }
+  return '登录失败';
+}
 
 // 极简 console 登录页：居中卡片 + 克制靛蓝，工具气质
 export function LoginPage() {
   const login = useAuth((s) => s.login);
   const isLoading = useAuth((s) => s.isLoading);
-  const error = useAuth((s) => s.error);
   const clearError = useAuth((s) => s.clearError);
   const user = useAuth((s) => s.user);
   const navigate = useNavigate();
 
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     if (user) navigate('/dashboard', { replace: true });
   }, [user, navigate]);
 
-  useEffect(() => clearError(), [clearError]);
+  useEffect(() => {
+    clearError();
+    setError(null);
+  }, [clearError]);
 
   const onSubmit = async (e: FormEvent) => {
     e.preventDefault();
+    setError(null);
     try {
       await login(email, password);
       navigate('/dashboard', { replace: true });
-    } catch {
-      // error rendered via store
+    } catch (err) {
+      setError(mapLoginError(err));
     }
   };
 

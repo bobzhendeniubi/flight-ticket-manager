@@ -13,7 +13,7 @@
  * 只做展示 + 选择，不掌管「选中的 id 对应什么价格」这类业务逻辑——那些由调用方通过
  * options 的 priceLabel 传入，SearchSelect 本身不关心价格口径。
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useEffect, useId, useMemo, useRef, useState } from 'react';
 
 export interface SearchSelectOption {
   id: string;
@@ -46,6 +46,9 @@ export function SearchSelect({
   const [open, setOpen] = useState(false);
   // query = 用户正在输入的搜索关键字；未聚焦编辑时展示已选项的 label（见下方 displayValue）。
   const [query, setQuery] = useState('');
+  // F-27：键盘高亮项索引（方向键移动、Enter 确认），下拉收起/过滤结果变化时归零。
+  const [highlightedIndex, setHighlightedIndex] = useState(0);
+  const listboxId = useId();
 
   const selected = useMemo(() => options.find((o) => o.id === value) ?? null, [options, value]);
 
@@ -57,6 +60,11 @@ export function SearchSelect({
     if (!q) return options;
     return options.filter((o) => o.label.toLowerCase().includes(q));
   }, [options, query]);
+
+  // 过滤结果变化（打字/重新打开）时，高亮项回到第一项，避免残留一个已经不在列表里的索引。
+  useEffect(() => {
+    setHighlightedIndex(0);
+  }, [filtered]);
 
   // 点击组件外部 → 收起下拉（不清空已选值，未点选新项时保留原选中）。
   useEffect(() => {
@@ -88,6 +96,25 @@ export function SearchSelect({
       setOpen(false);
       setQuery('');
       inputRef.current?.blur();
+      return;
+    }
+    if (e.key === 'ArrowDown') {
+      e.preventDefault();
+      if (!open) { setOpen(true); return; }
+      setHighlightedIndex((i) => Math.min(i + 1, filtered.length - 1));
+      return;
+    }
+    if (e.key === 'ArrowUp') {
+      e.preventDefault();
+      if (!open) { setOpen(true); return; }
+      setHighlightedIndex((i) => Math.max(i - 1, 0));
+      return;
+    }
+    if (e.key === 'Enter') {
+      if (!open) return;
+      e.preventDefault();
+      const target = filtered[highlightedIndex];
+      if (target) selectOption(target);
     }
   }
 
@@ -97,6 +124,12 @@ export function SearchSelect({
         <input
           ref={inputRef}
           type="text"
+          role="combobox"
+          aria-expanded={open}
+          aria-controls={listboxId}
+          aria-haspopup="listbox"
+          aria-autocomplete="list"
+          aria-activedescendant={open && filtered.length > 0 ? `${listboxId}-option-${highlightedIndex}` : undefined}
           className="input pr-6 text-xs"
           value={displayValue}
           placeholder={placeholder}
@@ -113,17 +146,25 @@ export function SearchSelect({
         </span>
       </div>
       {open && (
-        <div className="absolute left-0 right-0 top-full z-[60] mt-1 max-h-56 overflow-auto rounded-lg border border-slate-200 bg-white py-1 text-xs shadow-pop">
+        <div
+          id={listboxId}
+          role="listbox"
+          className="absolute left-0 right-0 top-full z-[60] mt-1 max-h-56 overflow-auto rounded-lg border border-slate-200 bg-white py-1 text-xs shadow-pop"
+        >
           {filtered.length === 0 && (
             <div className="px-3 py-2 text-ink-muted">无匹配结果</div>
           )}
-          {filtered.map((o) => (
+          {filtered.map((o, idx) => (
             <button
               key={o.id}
+              id={`${listboxId}-option-${idx}`}
+              role="option"
+              aria-selected={o.id === value}
               type="button"
               className={`block w-full truncate px-3 py-1.5 text-left hover:bg-brand-50 ${
                 o.id === value ? 'bg-brand-50/60 font-medium text-brand-700' : 'text-ink'
-              }`}
+              } ${idx === highlightedIndex ? 'bg-brand-50' : ''}`}
+              onMouseEnter={() => setHighlightedIndex(idx)}
               onClick={() => selectOption(o)}
             >
               {o.priceLabel ? `${o.label} · ¥${o.priceLabel}` : o.label}

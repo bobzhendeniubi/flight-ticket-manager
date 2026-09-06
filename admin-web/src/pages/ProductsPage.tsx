@@ -100,6 +100,34 @@ function hotelPhotos(h: MockHotel): string[] {
   return Array.from(new Set(list));
 }
 
+/**
+ * 房型行 → 后端提交体。
+ *
+ * 关键是那个 `id`：后端 updateHotel 先按 id、再按名称匹配现有房型，两样都匹配不上就当「新建 + 删旧」，
+ * 而 Bundle.hotelRoomTypeId / OrderItem.hotelRoomTypeId 两条外键都是 ON DELETE SET NULL——
+ * 不带 id 时运营只要改一次房型名，套餐和历史订单的房型引用就被静默清空：
+ * 套餐从此退化到 JSON 里的过时占位价、房控台也丢了这单占房，全程没有任何报错。
+ * 所以已有房型必须原样把 id 送回去；新建房型没有 id，省略即可（新建接口本就不读这个字段）。
+ */
+export function roomTypesPayload(
+  basePrice: number,
+  roomTypes: RoomTypeWithCost[],
+): Array<Record<string, unknown>> {
+  return roomTypes.map((rt) => ({
+    ...(rt.id ? { id: rt.id } : {}),
+    name: rt.name,
+    bedType: rt.bedType,
+    capacity: rt.sleeps,
+    basePrice: basePrice * rt.priceMult,
+    priceMultiplier: rt.priceMult,
+    maxAdults: rt.maxAdults ?? 2,
+    maxChildren: rt.maxChildren ?? 1,
+    // 净房价（仅内部，前台不展示）：留空 = 未录 → 省略字段（房型行是整行覆盖式提交，
+    // 后端把"省略"当"未录"清空，语义上与"不改"无关）。
+    costPriceCny: rt.costPriceCny ?? undefined,
+  }));
+}
+
 // ─── API → Mock 适配器（保留现有 UI，不改子组件） ───────────────────
 function hotelApiToMock(h: Hotel): MockHotelWithCost {
   return {
@@ -126,6 +154,8 @@ function hotelApiToMock(h: Hotel): MockHotelWithCost {
     amenities: h.amenities,
     highlight: h.highlight ?? '',
     roomTypes: h.roomTypes.map((rt) => ({
+      // 房型主键必须一路带到编辑表单再回传，后端才认得出「这是同一间房，只是改了名」。
+      id: rt.id,
       name: rt.name,
       priceMult: rt.priceMultiplier ? Number(rt.priceMultiplier) : 1,
       sleeps: rt.capacity,
@@ -463,14 +493,7 @@ export function ProductsPage() {
           // 不该也不能由本表单手改。
           reviewCount: n.reviewCount, emoji: n.emoji,
           highlight: n.highlight, amenities: n.amenities, photos: hotelPhotos(n),
-          roomTypes: n.roomTypes.map((rt) => ({
-            name: rt.name, bedType: rt.bedType, capacity: rt.sleeps,
-            basePrice: n.basePrice * rt.priceMult, priceMultiplier: rt.priceMult,
-            maxAdults: rt.maxAdults ?? 2, maxChildren: rt.maxChildren ?? 1,
-            // 净房价（仅内部，前台不展示）：留空 = 未录 → 省略字段（房型行是整行覆盖式提交，
-            // 后端把"省略"当"未录"清空，语义上与"不改"无关——新建本就没有"不改"这回事）。
-            costPriceCny: rt.costPriceCny ?? undefined,
-          })),
+          roomTypes: roomTypesPayload(n.basePrice, n.roomTypes),
         });
       }
       for (const n of next) {
@@ -483,13 +506,8 @@ export function ProductsPage() {
             basePrice: n.basePrice, reviewCount: n.reviewCount,
             emoji: n.emoji, highlight: n.highlight, amenities: n.amenities,
             photos: hotelPhotos(n),
-            roomTypes: n.roomTypes.map((rt) => ({
-              name: rt.name, bedType: rt.bedType, capacity: rt.sleeps,
-              basePrice: n.basePrice * rt.priceMult, priceMultiplier: rt.priceMult,
-              maxAdults: rt.maxAdults ?? 2, maxChildren: rt.maxChildren ?? 1,
-              // 留空 = 清空成本价（房型行整行覆盖式提交；表单已用现值预填，未改动就会原样送回）。
-              costPriceCny: rt.costPriceCny ?? undefined,
-            })),
+            // 带 id 提交 = 后端原地更新；改名不再触发「删旧建新」。
+            roomTypes: roomTypesPayload(n.basePrice, n.roomTypes),
           });
         }
       }
@@ -581,6 +599,9 @@ export function ProductsPage() {
           await api.updateVisa(tk, n.id, {
             // basePrice 曾漏传：与 createVisa 字段列表不一致，导致「编辑」改了办理费、
             // PATCH 200 但价格没变（后端 undefined 字段=不改，静默丢弃）——与 Transfer 同一类缺陷。
+            // destinationCountry / visaType 是同一个坑的另外两个字段：表单能改，但从不回传，
+            // 运营改国家代码或签证类型永远存不进去（visaType 还被导出/护照包命名等下游读取）。
+            destinationCountry: n.countryCode, visaType: n.type,
             country: n.country, flag: n.flag, visaName: n.type,
             processingDays: n.processingDays, basePrice: n.basePrice, expressSurcharge: n.expressSurcharge,
             validityMonths: n.validityMonths, highlight: n.highlight,
@@ -2240,7 +2261,9 @@ function NewBundleWizard({
                   bundlePrice,
                   discountPct: pct,
                   groundDiscount: 0,
-                  flightPax: 2,
+                  // 沿用原值：这里曾硬编码 2，运营只是改个文案保存一下，flightPax 就被悄悄改写成 2
+                  // （它是前台「起/人」价格除数、后台原价反推的分母）。新建套餐才用默认 2。
+                  flightPax: initial?.flightPax ?? 2,
                   suitableFor,
                   active: initial?.active ?? true,
                   // 管理端可编辑排序值：留空 = 排最后
@@ -2355,6 +2378,9 @@ function HotelEditorForm({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    // 重入锁：网络卡时双击「保存」/连按回车会各触发一次 onSave，新建场景就是两条一模一样的记录
+    // （产品名没有唯一约束）。只认第一次。
+    if (saved) return;
     const cleanPhotos = photos.map((p) => p.trim()).filter(Boolean);
     const cleanRooms = roomTypes
       .map((rt) => ({ ...rt, name: rt.name.trim(), bedType: rt.bedType.trim() }))
@@ -2378,7 +2404,9 @@ function HotelEditorForm({
       roomTypes: cleanRooms,
     };
     setSaved(true);
-    setTimeout(() => onSave(updated), 600);
+    // 立即提交：原来排 600ms 定时器，点了「保存」再点「取消」弹窗当场关闭、定时器却没被清，
+    // 600ms 后照样把改动写进去 —— 运营以为取消成功，其实已生效。
+    onSave(updated);
   };
 
   return (
@@ -2471,8 +2499,8 @@ function HotelEditorForm({
         {saved && <div className="rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">保存中…</div>}
 
         <div className="flex justify-end gap-3">
-          <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
-          <button type="submit" className="btn-primary">{submitLabel}</button>
+          <button type="button" className="btn-secondary" onClick={onCancel} disabled={saved}>取消</button>
+          <button type="submit" className="btn-primary" disabled={saved}>{submitLabel}</button>
         </div>
       </form>
     </section>
@@ -2694,6 +2722,8 @@ function TransferEditorForm({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    // 重入锁 + 去掉人为延时，理由同酒店编辑表单（双击建两条、点了取消却照样保存）。
+    if (saved) return;
     const updated: MockTransferWithCost = {
       ...form,
       basePrice: basePrice ?? 0,
@@ -2702,7 +2732,7 @@ function TransferEditorForm({
       features: featuresText.split(',').map(s => s.trim()).filter(Boolean),
     };
     setSaved(true);
-    setTimeout(() => onSave(updated), 800);
+    onSave(updated);
   };
 
   return (
@@ -2762,8 +2792,8 @@ function TransferEditorForm({
         {saved && <div className="md:col-span-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">保存中…</div>}
 
         <div className="md:col-span-3 flex justify-end gap-3">
-          <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
-          <button type="submit" className="btn-primary">{submitLabel}</button>
+          <button type="button" className="btn-secondary" onClick={onCancel} disabled={saved}>取消</button>
+          <button type="submit" className="btn-primary" disabled={saved}>{submitLabel}</button>
         </div>
       </form>
     </section>
@@ -2845,6 +2875,8 @@ function VisaEditorForm({
 
   const handleSubmit = (e: React.FormEvent) => {
     e.preventDefault();
+    // 重入锁 + 去掉人为延时，理由同酒店编辑表单（双击建两条、点了取消却照样保存）。
+    if (saved) return;
     // 档位校验（与后端 zod 同口径，提前在前端拦一遍给出可读提示）：
     // 档名是定价查表的键 —— 空档名/重名会让「这一档到底多少钱」不确定，一律不放行。
     const normalizedTiers: VisaExpressTier[] = tiers.map((t) => ({
@@ -2881,7 +2913,7 @@ function VisaEditorForm({
       expressTiers: normalizedTiers,
     };
     setSaved(true);
-    setTimeout(() => onSave(updated), 800);
+    onSave(updated);
   };
 
   return (
@@ -3051,8 +3083,8 @@ function VisaEditorForm({
         {saved && <div className="md:col-span-3 rounded-lg border border-emerald-200 bg-emerald-50 px-3 py-2 text-sm text-emerald-700">保存中…</div>}
 
         <div className="md:col-span-3 flex justify-end gap-3">
-          <button type="button" className="btn-secondary" onClick={onCancel}>取消</button>
-          <button type="submit" className="btn-primary">{submitLabel}</button>
+          <button type="button" className="btn-secondary" onClick={onCancel} disabled={saved}>取消</button>
+          <button type="submit" className="btn-primary" disabled={saved}>{submitLabel}</button>
         </div>
       </form>
     </section>

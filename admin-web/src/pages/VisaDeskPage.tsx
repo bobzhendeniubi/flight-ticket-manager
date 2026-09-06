@@ -202,6 +202,19 @@ function subStatus(p: VisaTaskPassenger): VisaSubmissionStatus {
   return p.visaSubmissionStatus ?? 'PENDING';
 }
 
+/**
+ * 'YYYY-MM-DDTHH:mm:ss.sssZ' → 'YYYY-MM-DD'（防御式截断；已是纯日期时原样返回）。
+ *
+ * 签证三个日期在库里是 @db.Date，过 JSON 是完整 ISO 串。不截断的话：
+ * `<input type="date">` 认不出这个值、回显空白（容易被当成"没录过"）；
+ * 而且草稿会把原始 ISO 串一起提交，后端 `^\d{4}-\d{2}-\d{2}$` 直接 400——
+ * 连同一次新填的那个字段也保存不进去。仓库里 HotelSwapModal / RoomingEditor 都是这么截的。
+ */
+function dateOnly(s: string | null | undefined): string | null {
+  if (!s) return null;
+  return s.slice(0, 10);
+}
+
 /** 出行人签证日期三项（出签日/生效日/有效期）；null = 该字段未录入 */
 interface PassengerVisaDates {
   visaIssueDate: string | null;
@@ -841,9 +854,11 @@ function OrderGroup({
         const m: Record<string, PassengerVisaDates> = {};
         for (const p of res.order.passengers ?? []) {
           m[p.id] = {
-            visaIssueDate: p.visaIssueDate ?? null,
-            visaEffectiveDate: p.visaEffectiveDate ?? null,
-            visaExpiry: p.visaExpiry ?? null,
+            // @db.Date 过 JSON 是完整 ISO 串，必须截成 'YYYY-MM-DD'：否则 date 输入框回显空白，
+            // 且草稿原样回传会被后端正则拒掉，整次保存 400。
+            visaIssueDate: dateOnly(p.visaIssueDate),
+            visaEffectiveDate: dateOnly(p.visaEffectiveDate),
+            visaExpiry: dateOnly(p.visaExpiry),
           };
         }
         setVisaDatesMap(m);

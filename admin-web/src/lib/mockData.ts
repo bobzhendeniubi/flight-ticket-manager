@@ -7,6 +7,13 @@
 
 // ── 岘港酒店 ───────────────────────────────────────────────────────
 export interface HotelRoomType {
+  /**
+   * 后端房型主键；编辑酒店时必须原样回传，后端才会「原地更新」而不是「删旧建新」。
+   * 丢了它 → 改个房型名就等于换 id，套餐 Bundle.hotelRoomTypeId 与历史 OrderItem.hotelRoomTypeId
+   * 会被外键 ON DELETE SET NULL 静默置空（套餐退化到占位价、房控丢这单占房），全程无报错。
+   * mock 数据与新建房型没有 id，故可空。
+   */
+  id?: string;
   name: string;
   priceMult: number; // 倍率相对于 basePrice
   sleeps: number;

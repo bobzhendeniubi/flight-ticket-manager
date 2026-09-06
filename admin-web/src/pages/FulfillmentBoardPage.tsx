@@ -17,10 +17,26 @@ import {
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 
-const PAGE_SIZE = 200;
+// F-19：原来固定拉 200 条、四种状态混排 orderBy createdAt desc——CONFIRMED/FAILED 是终态、
+// 只增不减，日积月累会把真正卡着没处理的 PENDING/IN_PROGRESS 老任务挤出这 200 条窗口，
+// 看板反而"越卡越可能看不见"。改成默认只拉未完成状态（不占用行数配额，见 StatusScope），
+// PAGE_SIZE 相应调大（对齐 VisaDeskPage.tsx 的 500），超量时给 pagination.total 提示而不是静默截断。
+const PAGE_SIZE = 500;
 const HOUR_MS = 60 * 60 * 1000;
 const SLA_RED_HOURS = 48;
 const SLA_AMBER_HOURS = 72;
+
+/** 状态范围：默认只看未完成（PENDING/IN_PROGRESS），避免与终态任务抢 200 条窗口；
+ *  「全部状态」是显式选项，供需要回看已确认/失败历史的场景使用。 */
+type StatusScope = 'OPEN' | 'ALL';
+const STATUS_SCOPE_PARAM: Record<StatusScope, string | undefined> = {
+  OPEN: 'PENDING,IN_PROGRESS',
+  ALL: undefined,
+};
+const STATUS_SCOPE_OPTIONS: Array<{ value: StatusScope; label: string }> = [
+  { value: 'OPEN', label: '只看未完成（默认）' },
+  { value: 'ALL', label: '全部状态（含已确认 / 失败）' },
+];
 
 const TYPE_META: Record<FulfillmentType, { label: string; badge: string }> = {
   FLIGHT_TICKETING: { label: '出票', badge: 'badge-info' },
@@ -100,11 +116,17 @@ export function FulfillmentBoardPage() {
 
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('');
   const [mineOnly, setMineOnly] = useState(false);
+  // F-19：默认只看未完成，见上方 StatusScope 注释
+  const [statusScope, setStatusScope] = useState<StatusScope>('OPEN');
 
   const [tasks, setTasks] = useState<FulfillmentTask[]>([]);
+  const [totalCount, setTotalCount] = useState<number | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const [refreshNonce, setRefreshNonce] = useState(0);
+  // 「今日已确认」独立于 statusScope 单独拉（OPEN 模式下主查询根本不含 CONFIRMED，
+  // 不能再从 tasks 里数），避免这条 KPI 因为切到「只看未完成」就变成假的 0。
+  const [confirmedTodayCount, setConfirmedTodayCount] = useState(0);
 
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
   const [batchTarget, setBatchTarget] = useState<FulfillmentStatus>('IN_PROGRESS');
@@ -124,12 +146,14 @@ export function FulfillmentBoardPage() {
     api
       .listFulfillmentTasks(token, {
         pageSize: PAGE_SIZE,
+        status: STATUS_SCOPE_PARAM[statusScope],
         type: typeFilter || undefined,
         assigneeUserId: mineOnly ? (user?.id ?? undefined) : undefined,
       })
       .then((res) => {
         if (cancelled) return;
         setTasks(res.tasks);
+        setTotalCount(res.pagination?.total ?? res.tasks.length);
       })
       .catch((e: unknown) => {
         if (cancelled) return;
@@ -137,6 +161,32 @@ export function FulfillmentBoardPage() {
       })
       .finally(() => {
         if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token, statusScope, typeFilter, mineOnly, user?.id, refreshNonce]);
+
+  // 今日已确认：不受 statusScope 影响，单独按 CONFIRMED 拉一次（拉不到不阻断主看板）。
+  useEffect(() => {
+    if (!token) return;
+    let cancelled = false;
+    api
+      .listFulfillmentTasks(token, {
+        pageSize: PAGE_SIZE,
+        status: 'CONFIRMED',
+        type: typeFilter || undefined,
+        assigneeUserId: mineOnly ? (user?.id ?? undefined) : undefined,
+      })
+      .then((res) => {
+        if (cancelled) return;
+        const today = todayYmd();
+        setConfirmedTodayCount(
+          res.tasks.filter((t) => (t.completedAt ?? t.updatedAt).slice(0, 10) === today).length,
+        );
+      })
+      .catch(() => {
+        /* 辅助 KPI，拉不到不阻断主看板 */
       });
     return () => {
       cancelled = true;
@@ -158,20 +208,17 @@ export function FulfillmentBoardPage() {
     }));
   }, [tasks]);
 
-  // 页头统计（按载入数据计算）
+  // 页头统计（按载入数据计算；pending/inProgress/urgent48 现在始终来自未完成任务的完整拉取，
+  // 不再受终态任务挤占窗口影响。confirmedToday 见上方独立 effect）
   const stats = useMemo(() => {
-    const today = todayYmd();
     const pending = tasks.filter((t) => t.status === 'PENDING').length;
     const inProgress = tasks.filter((t) => t.status === 'IN_PROGRESS').length;
     const urgent48 = tasks.filter((t) => {
       const lvl = slaLevel(t, nowMs);
       return lvl === 'red48' || lvl === 'overdue';
     }).length;
-    const confirmedToday = tasks.filter(
-      (t) => t.status === 'CONFIRMED' && (t.completedAt ?? t.updatedAt).slice(0, 10) === today,
-    ).length;
-    return { pending, inProgress, urgent48, confirmedToday };
-  }, [tasks, nowMs]);
+    return { pending, inProgress, urgent48, confirmedToday: confirmedTodayCount };
+  }, [tasks, nowMs, confirmedTodayCount]);
 
   const toggleTask = (id: string) => {
     setSelectedIds((prev) => {
@@ -286,6 +333,33 @@ export function FulfillmentBoardPage() {
         </label>
       </section>
 
+      {/* F-19：状态范围——默认只看未完成，避免与终态任务抢窗口；「全部状态」是显式选项 */}
+      <section className="flex flex-wrap items-center gap-2">
+        <span className="text-xs text-ink-muted">范围</span>
+        {STATUS_SCOPE_OPTIONS.map((opt) => (
+          <button
+            key={opt.value}
+            type="button"
+            onClick={() => {
+              setStatusScope(opt.value);
+              clearSelection();
+            }}
+            className={`rounded-full border px-3 py-1 text-sm font-medium transition ${
+              statusScope === opt.value
+                ? 'border-brand bg-brand text-white'
+                : 'border-slate-200 bg-white text-ink-soft hover:bg-slate-50'
+            }`}
+          >
+            {opt.label}
+          </button>
+        ))}
+        {!loading && totalCount != null && totalCount > tasks.length && (
+          <span className="badge-warning">
+            后端命中 {totalCount} 条，本次一次最多加载 {PAGE_SIZE} 条，请缩小筛选范围
+          </span>
+        )}
+      </section>
+
       {error && (
         <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-2.5 text-sm text-rose-700">
           {error}
@@ -293,7 +367,11 @@ export function FulfillmentBoardPage() {
       )}
 
       <section className="grid grid-cols-1 gap-4 md:grid-cols-4">
-        {columns.map((col) => (
+        {columns.map((col) => {
+          // OPEN 范围下 status 参数只带 PENDING/IN_PROGRESS，CONFIRMED/FAILED 这两列
+          // 压根没请求——「空」和「没拉」是两回事，分开提示避免误判成真的零积压。
+          const notFetched = statusScope === 'OPEN' && col.status !== 'PENDING' && col.status !== 'IN_PROGRESS';
+          return (
           <div key={col.status} className="flex flex-col gap-2">
             <div className="flex items-center justify-between px-1">
               <h2 className="text-sm font-semibold text-ink">{col.label}</h2>
@@ -305,7 +383,12 @@ export function FulfillmentBoardPage() {
                   加载中…
                 </div>
               )}
-              {!loading && col.tasks.length === 0 && (
+              {!loading && notFetched && (
+                <div className="rounded-xl border border-dashed border-slate-200 py-6 text-center text-xs text-ink-muted">
+                  「只看未完成」范围下不加载此列，切到「全部状态」查看
+                </div>
+              )}
+              {!loading && !notFetched && col.tasks.length === 0 && (
                 <div className="rounded-xl border border-dashed border-slate-200 py-6 text-center text-xs text-ink-muted">
                   空
                 </div>
@@ -356,7 +439,8 @@ export function FulfillmentBoardPage() {
                 })}
             </div>
           </div>
-        ))}
+          );
+        })}
       </section>
 
       {batchResult && (

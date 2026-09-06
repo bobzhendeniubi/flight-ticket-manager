@@ -15,7 +15,7 @@
  *   2.「📋 粘贴报价表」——整块粘贴运营报价表原文，由 lib/quoteSheetParser 解析出
  *      （出发日 × 晚数 × 四个档次）后预览确认，直接走批量 upsert 写库并重拉网格。
  */
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Icon } from '../components/Icon';
 import {
   api,
@@ -41,6 +41,7 @@ import {
 import { FlightSettlementRatesPanel } from '../components/FlightSettlementRatesPanel';
 import { formatDateTimeSecCn } from '../lib/datetime';
 import { useAuth } from '../stores/auth';
+import { useConfirm } from '../components/ConfirmDialog';
 
 // 页签：地面整包价（档次 × 晚数）/ 机票结算价（航班号 × 出发日）——两张表各管各的
 type RateTab = 'GROUND' | 'FLIGHT';
@@ -65,8 +66,17 @@ function cellKey(date: string, nights: number): string {
 export function SettlementRatesPage() {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
+  const confirm = useConfirm();
+  /**
+   * 请求序号：快速连点翻页 / 切档次时网络时序可能反转，晚回来的旧响应会盖住当前选择——
+   * 表头写着新档次、格子里是旧档次的价，运营照着编辑保存就把价写进错误的日期/档次组合。
+   * 只认最后一次发出的请求。
+   */
+  const reqSeqRef = useRef(0);
 
   const [tab, setTab] = useState<RateTab>('GROUND');
+  // 机票页签的未保存状态（由子面板上报）：切走会把它整个卸载，草稿一起没。
+  const [flightDirty, setFlightDirty] = useState(false);
   const [windowStart, setWindowStart] = useState<string>(() => todayYmd());
   const [tier, setTier] = useState<SettlementTier>(TIERS[0]);
   const [rates, setRates] = useState<SettlementRate[]>([]);
@@ -103,6 +113,7 @@ export function SettlementRatesPage() {
 
   const load = useCallback(async () => {
     if (!token || days.length === 0) return;
+    const seq = ++reqSeqRef.current;
     setLoading(true);
     setError(null);
     try {
@@ -110,14 +121,16 @@ export function SettlementRatesPage() {
       const to = days[days.length - 1];
       // 不传 nights：一次拉取当前显示范围内该档次下全部晚数（1–5 晚全列齐）
       const res = await api.listSettlementRates(token, { from, to, tier });
+      if (seq !== reqSeqRef.current) return; // 已有更新的请求发出，丢弃这次的旧响应
       setRates(res.rates);
       const next = new Map<string, string>();
       for (const r of res.rates) next.set(cellKey(r.departDate, r.nights), String(r.pricePerPersonCny));
       setDraft(next);
     } catch (e: unknown) {
+      if (seq !== reqSeqRef.current) return;
       setError(e instanceof ApiError ? e.message : '结算价加载失败');
     } finally {
-      setLoading(false);
+      if (seq === reqSeqRef.current) setLoading(false);
     }
   }, [token, days, tier]);
 
@@ -259,6 +272,22 @@ export function SettlementRatesPage() {
 
   const daySet = useMemo(() => new Set(days), [days]);
 
+  /**
+   * 切档次会整体重拉并替换 draft，还没「整批保存」的格子会无声消失、找不回来。
+   * 日期导航那几个按钮走的是 disabled={dirty}，档次这里不能也 disable（会把人锁死在一个档次），
+   * 所以改成先问一句。
+   */
+  const confirmDiscardDraft = useCallback(async (): Promise<boolean> => {
+    if (!dirty) return true;
+    return confirm({
+      title: '放弃未保存的结算价改动？',
+      body: '当前网格里有还没「整批保存」的改动。切换档次会重新加载数据并覆盖这些改动，无法找回。',
+      tone: 'danger',
+      confirmText: '放弃改动',
+      cancelText: '继续编辑',
+    });
+  }, [confirm, dirty]);
+
   // 解析结果里落在当前显示范围外的条目数（照样入库，但当前网格看不到）
   const sheetOutsideWindow = useMemo(() => {
     if (!sheetParsed) return { past: 0, outside: 0 };
@@ -296,7 +325,22 @@ export function SettlementRatesPage() {
           <button
             key={value}
             type="button"
-            onClick={() => setTab(value)}
+            onClick={() => {
+              if (value === tab) return;
+              // 只有离开「机票结算价」才会真丢东西：地面网格的草稿存在本页组件里，切回来还在。
+              if (tab !== 'FLIGHT' || !flightDirty) { setTab(value); return; }
+              void confirm({
+                title: '放弃未保存的机票结算价改动？',
+                body: '机票结算价网格里有还没「整批保存」的改动。切换页签会关掉这张网格，改动无法找回。',
+                tone: 'danger',
+                confirmText: '放弃改动',
+                cancelText: '继续编辑',
+              }).then((ok) => {
+                if (!ok) return;
+                setFlightDirty(false);
+                setTab(value);
+              });
+            }}
             className={
               value === tab
                 ? '-mb-px border-b-2 border-indigo-600 px-4 py-2 text-sm font-semibold text-indigo-700'
@@ -308,7 +352,7 @@ export function SettlementRatesPage() {
         ))}
       </div>
 
-      {tab === 'FLIGHT' && <FlightSettlementRatesPanel />}
+      {tab === 'FLIGHT' && <FlightSettlementRatesPanel onDirtyChange={setFlightDirty} />}
       {tab === 'GROUND' && (
 
       <section className="card space-y-4">
@@ -363,7 +407,10 @@ export function SettlementRatesPage() {
                 <button
                   key={t}
                   type="button"
-                  onClick={() => setTier(t)}
+                  onClick={() => {
+                    if (t === tier) return;
+                    void confirmDiscardDraft().then((ok) => { if (ok) setTier(t); });
+                  }}
                   className={
                     t === tier
                       ? 'rounded-md bg-indigo-600 px-3 py-1.5 text-sm font-semibold text-white'

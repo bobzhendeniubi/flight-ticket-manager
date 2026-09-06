@@ -139,8 +139,13 @@ export function SettlementDiscountsPage() {
 
   const [kind, setKind] = useState<SettlementDiscountKind>('AGENT');
   const [selectedAgentId, setSelectedAgentId] = useState(() => searchParams.get('agentId') ?? '');
+  // 取消「放弃改动」后用来把代理下拉重挂回原选项（见 changeSelectedAgent）
+  const [agentSelectNonce, setAgentSelectNonce] = useState(0);
   const [agents, setAgents] = useState<AgentListItem[]>([]);
   const [rules, setRules] = useState<DraftRule[]>([]);
+  // 上一次从后端加载到的原样快照：与 rules 一比就知道有没有未保存改动（本页原来没有 dirty 概念，
+  // 切 Tab / 换代理会直接 load() 覆盖 rules，运营填了一半的行就这么无声没了）。
+  const [baseline, setBaseline] = useState<DraftRule[]>([]);
   const [rowErrors, setRowErrors] = useState<Record<string, string>>({});
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
@@ -192,6 +197,7 @@ export function SettlementDiscountsPage() {
   const load = useCallback(async () => {
     if (!token || (kind === 'AGENT' && !selectedAgentId)) {
       setRules([]);
+      setBaseline([]);
       setRowErrors({});
       setLoading(false);
       return;
@@ -205,7 +211,9 @@ export function SettlementDiscountsPage() {
         kind,
         ...(kind === 'AGENT' ? { agentId: selectedAgentId } : {}),
       });
-      setRules(result.rules.map(toDraft));
+      const drafts = result.rules.map(toDraft);
+      setRules(drafts);
+      setBaseline(drafts);
     } catch (e: unknown) {
       setError(e instanceof ApiError ? e.message : '立减规则加载失败');
     } finally {
@@ -217,10 +225,48 @@ export function SettlementDiscountsPage() {
     void load();
   }, [load]);
 
+  /** 编辑区与上次加载的快照有出入 = 有未保存改动（新增行、改金额/窗口/启用/备注都算）。 */
+  const dirty = useMemo(() => JSON.stringify(rules) !== JSON.stringify(baseline), [rules, baseline]);
+
+  /** 切 Tab / 换代理都会 load() 整体覆盖 rules，未保存的行会无声消失——先问一句。 */
+  async function confirmDiscardDraft(): Promise<boolean> {
+    if (!dirty) return true;
+    if (confirmLockRef.current) return false;
+    confirmLockRef.current = true;
+    try {
+      return await confirm({
+        title: '放弃未保存的立减规则改动？',
+        body: '当前编辑区里有还没保存的改动。切换后会重新加载规则并覆盖这些改动，无法找回。',
+        tone: 'danger',
+        confirmText: '放弃改动',
+        cancelText: '继续编辑',
+      });
+    } finally {
+      confirmLockRef.current = false;
+    }
+  }
+
   function changeKind(next: SettlementDiscountKind): void {
-    setKind(next);
-    setError(null);
-    setNotice(null);
+    if (next === kind) return;
+    void confirmDiscardDraft().then((ok) => {
+      if (!ok) return;
+      setKind(next);
+      setError(null);
+      setNotice(null);
+    });
+  }
+
+  function changeSelectedAgent(next: string): void {
+    if (next === selectedAgentId) return;
+    void confirmDiscardDraft().then((ok) => {
+      if (ok) {
+        setSelectedAgentId(next);
+        return;
+      }
+      // 选择放弃 = 留在原代理：受控 select 在 state 没变时不会自己弹回原选项（没有重渲染），
+      // 靠换 key 重挂一次把下拉拨回去，免得界面显示 A 实际在编辑 B 的规则。
+      setAgentSelectNonce((n) => n + 1);
+    });
   }
 
   function updateRule(rowKey: string, patch: Partial<DraftRule>): void {
@@ -308,6 +354,8 @@ export function SettlementDiscountsPage() {
     try {
       await api.deleteSettlementDiscount(token, rule.id);
       setRules((current) => current.filter((item) => item.rowKey !== rowKey));
+      // 快照同步删掉这行，否则「已经落库的删除」会被当成未保存改动。
+      setBaseline((current) => current.filter((item) => item.rowKey !== rowKey));
       setNotice('已删除');
     } catch (e: unknown) {
       setError(e instanceof ApiError ? e.message : '删除失败');
@@ -503,9 +551,10 @@ export function SettlementDiscountsPage() {
             <label className="min-w-[260px] text-xs text-ink-muted">
               指定代理
               <select
+                key={agentSelectNonce}
                 className="input mt-1"
                 value={selectedAgentId}
-                onChange={(e) => setSelectedAgentId(e.target.value)}
+                onChange={(e) => changeSelectedAgent(e.target.value)}
                 disabled={!canEdit && agents.length === 0}
               >
                 <option value="">请选择代理…</option>
