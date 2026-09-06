@@ -69,12 +69,7 @@ import {
 import { CANCELLABLE_STATUSES } from '../../lib/cancellation.js';
 import { canonicalJson } from '../../lib/canonical-json.js';
 import { levenshteinDistance, TYPO_MAX_EDIT_DISTANCE } from '../../lib/edit-distance.js';
-import {
-  orderNeedsVisaTask,
-  orderVisaStatusRequiresVisa,
-  isVisaContradiction,
-  VISA_CONTRADICTION_MESSAGE,
-} from './visa-need.js';
+import { orderNeedsVisaTask, orderVisaStatusRequiresVisa } from './visa-need.js';
 import {
   deriveLegStatus,
   isReturnCurrentlyReleased,
@@ -10241,7 +10236,8 @@ export class OrderService {
       }
       if (input.title !== undefined) data.title = input.title;
       if (input.passengerType !== undefined) data.passengerType = input.passengerType;
-      if (input.visaExempt !== undefined) data.visaExempt = input.visaExempt;
+      // visaExempt 不在这里直写：自备签列由签证状态机的 SWAP_PASSENGER 转移决定（见下方 1b），
+      // 与身份列同一条 UPDATE 落库（writePassengerVisaExempt 的 extra）。
       if (input.singleRoom !== undefined) data.singleRoom = input.singleRoom;
 
       // ── 1b. 换人检测：证件号变化 = 真换人（非改错别字）→ 清除旧出行人残留的
@@ -10306,10 +10302,10 @@ export class OrderService {
         data.pnr = null;
         data.eticketNumber = null;
         // 乘客级选项回落安全默认（未显式带新值时）：
-        //   · visaExempt=false → 新人默认「随套餐办签」，不会被签证台漏掉（旧人自备签的 true 绝不继承）。
+        //   · visaExempt=false → 新人默认「随套餐办签」，不会被签证台漏掉（旧人自备签的 true 绝不继承）
+        //     —— 这一条由签证状态机的 SWAP_PASSENGER 转移给出（见紧接其后的 swapVisa）。
         //   · singleRoom=false → 新人默认「拼房」（业务默认；房控按新人重新分房）。
         //   · title=null / passengerType=ADULT（schema 默认）→ 敬称/乘客类型随人走，不继承旧人。
-        if (data.visaExempt === undefined) data.visaExempt = false;
         if (data.singleRoom === undefined) data.singleRoom = false;
         if (data.title === undefined) data.title = null;
         if (data.passengerType === undefined) data.passengerType = PassengerType.ADULT;
@@ -10323,9 +10319,21 @@ export class OrderService {
       // 签证台看不见这单（判定见 visa-need.ts）。只拒绝、不替客人改任何标记。
       // 只在本次结果为「自备签」时才查名单（换回随团办签、或本就不是自备签的请求零额外开销）。
       // 上方已拦掉取消族终态与回收站单，故此处无需再判「不参与履约」。
-      // 放在 1b 之后：证件号变化时 1b 已把未显式带值的 visaExempt 回落 false，此处读到的是最终值。
-      const resolvedVisaExempt =
-        data.visaExempt !== undefined ? data.visaExempt === true : passenger.visaExempt === true;
+      // 自备签列由状态机的 SWAP_PASSENGER 转移决定：显式带值 > 真换人回落 false（旧人自备签的
+      // true 绝不继承）> 保持原值；送签进度不动（现状）。事件给出明确值时 write 带 visaExempt，
+      // 与身份列同一条 UPDATE 落库（下方 writePassengerVisaExempt 的 extra）。
+      const swapVisa = transitionPassengerVisa(
+        {
+          orderVisaStatus: order.visaStatus,
+          visaExempt: passenger.visaExempt,
+          visaSubmissionStatus: null,
+          allPassengersExempt: false,
+        },
+        { type: 'SWAP_PASSENGER', visaExempt: input.visaExempt, documentChanged },
+      );
+      if (!swapVisa.ok) throw new ConflictError(swapVisa.reason);
+      const swapVisaWrite = swapVisa.write.passenger;
+      const resolvedVisaExempt = swapVisa.facts.visaExempt === true;
       if (resolvedVisaExempt && orderVisaStatusRequiresVisa(order.visaStatus)) {
         const roster = await tx.passenger.findMany({
           where: { orderId },
@@ -10334,9 +10342,7 @@ export class OrderService {
         const projected = roster.map((p) =>
           p.id === passengerId ? { visaExempt: true } : { visaExempt: p.visaExempt },
         );
-        if (isVisaContradiction({ visaStatus: order.visaStatus, passengers: projected })) {
-          throw new BadRequestError(VISA_CONTRADICTION_MESSAGE);
-        }
+        assertNoVisaContradiction({ visaStatus: order.visaStatus, passengers: projected });
       }
 
       // ── 1b2. 出行人类型服务端权威派生（覆盖客户端传值）：出生日期变化（改错别字或真换人都算）时，
@@ -10410,7 +10416,13 @@ export class OrderService {
         visaStatus: order.visaStatus ?? null,
       });
 
-      await tx.passenger.update({ where: { id: passengerId }, data });
+      // 身份列 + 自备签列一条 UPDATE：状态机给出自备签写入时走唯一写点（extra 带身份列），
+      // 否则本次不碰签证列，只是一条普通的身份订正。
+      if (swapVisaWrite?.visaExempt !== undefined) {
+        await writePassengerVisaExempt(tx, passengerId, { visaExempt: swapVisaWrite.visaExempt }, data);
+      } else {
+        await tx.passenger.update({ where: { id: passengerId }, data });
+      }
 
       // ── 1d. 换人价回滚（自备签 true→false 时把旧客的自备签减免加回来）──────────────────
       // 证件变更会把 visaExempt 强制回落 false（新客进签证台随团办签，见上方 1b），但订单 BUNDLE 行
@@ -10421,7 +10433,7 @@ export class OrderService {
       // 只处理 true→false（少收的钱路径）；false→true（新客改自备签）不在此自动打折，避免误减，
       //   需要时走显式重定价。
       const oldVisaExempt = passenger.visaExempt === true;
-      const newVisaExempt = data.visaExempt !== undefined ? data.visaExempt === true : oldVisaExempt;
+      const newVisaExempt = swapVisa.facts.visaExempt === true;
       // 幂等：同一乘客的自备签减免只冲一次。多次换人 true→false→true→false 会反复命中 true→false，
       // 若不去重会每次都把减免加回来 → 过冲多收。检查 order.adjustments 是否已有该乘客的
       // SWAP_VISA_DEDUCT_REVERSAL（下方入账时按 passengerId 留痕），有则本次不再冲。
@@ -10541,22 +10553,10 @@ export class OrderService {
       //   CANCELLED 是取消族订单终态化任务（见 _updateStatusWithinTx P2-16）留下的终态记录——
       //   若把它一并 PENDING 化，会「复活」已取消订单的履约任务（看板凭空冒出可执行任务、统计口径错乱）。
       //   与 A2 一致：CANCELLED 永远冻结为终态，任何"重开/复活"路径都不得触碰。
+      //   任务级重置的唯一写点在状态机模块（resetVisaTaskProgress），SQL 形状照抄。
       let visaTasksReset = 0;
       if (resetVisa) {
-        const reset = await tx.fulfillmentTask.updateMany({
-          where: {
-            type: FulfillmentType.VISA_APPLICATION,
-            orderItem: { orderId },
-            status: { notIn: [FulfillmentStatus.PENDING, FulfillmentStatus.CANCELLED] },
-          },
-          data: {
-            status: FulfillmentStatus.PENDING,
-            startedAt: null,
-            completedAt: null,
-            failureReason: null,
-          },
-        });
-        visaTasksReset = reset.count;
+        visaTasksReset = await resetVisaTaskProgress(tx, orderId);
       }
 
       // ── 3b. 自备签变更 → 签证任务事件驱动同步（条10）────────────────────────
