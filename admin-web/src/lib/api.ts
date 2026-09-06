@@ -1515,7 +1515,7 @@ export interface OperationalReminder {
 }
 
 // ── 经营报表（ADMIN-only）────────────────────────────────────────────────
-export type SalesReportDim = 'kind' | 'channel' | 'agent';
+export type SalesReportDim = 'kind' | 'channel' | 'agent' | 'route';
 
 export interface SalesReportRow {
   key: string;
@@ -4431,6 +4431,14 @@ export const TOKEN_PAYLOAD_MISMATCH_CODE = 'TOKEN_PAYLOAD_MISMATCH';
 /** TOKEN_PAYLOAD_MISMATCH 的统一提示语（三个提交点共用，口径不分叉）。 */
 export const TOKEN_PAYLOAD_MISMATCH_HINT = '这个请求编号已用于另一次操作，请刷新后重试。';
 
+/**
+ * 航线筛选的 query 片段（`&routeKey=…`）；空 / undefined = 不筛（全部航线）。
+ * 财务概览 / 月度 / 按航班导出三处共用，避免各写各的拼串口径。
+ */
+function routeQuery(routeKey?: string | null): string {
+  return routeKey ? `&routeKey=${encodeURIComponent(routeKey)}` : '';
+}
+
 export const api = {
   login: (email: string, password: string) =>
     apiFetch<AuthResult>('/auth/login', {
@@ -6451,9 +6459,14 @@ export const api = {
     apiFetch<{ ok: boolean }>(`/cancellation-policies/${id}`, { method: 'DELETE', token }),
 
   // 财务模块（ADMIN-only）— 业务 P&L
-  getFinanceSummary: (token: string, range: { from: string; to: string }) =>
+  getFinanceSummary: (
+    token: string,
+    range: { from: string; to: string },
+    /** 航线筛选（'MFM-DAD' 形状 / 'unknown'）；空 = 全部航线。 */
+    routeKey?: string | null,
+  ) =>
     apiFetch<FinanceSummary>(
-      `/finances/summary?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,
+      `/finances/summary?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}${routeQuery(routeKey)}`,
       { token },
     ),
   getFinanceFlights: (token: string, range: { from: string; to: string }, limit = 100) =>
@@ -6470,9 +6483,9 @@ export const api = {
     apiFetch<OrderPnlDetail>(`/finances/orders/${encodeURIComponent(orderId)}/pnl-detail`, {
       token,
     }),
-  getFinanceMonthly: (token: string, months = 6) =>
-    apiFetch<{ months: number; points: MonthlyPoint[] }>(
-      `/finances/monthly?months=${months}`,
+  getFinanceMonthly: (token: string, months = 6, routeKey?: string | null) =>
+    apiFetch<{ months: number; points: MonthlyPoint[]; routeKey: string | null }>(
+      `/finances/monthly?months=${months}${routeQuery(routeKey)}`,
       { token },
     ),
 
@@ -6612,9 +6625,10 @@ export const api = {
   downloadFinanceExportByFlight: async (
     token: string,
     range: { from: string; to: string },
+    routeKey?: string | null,
   ): Promise<Blob> => {
     const res = await fetch(
-      `${API_BASE}/finances/export-by-flight?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}`,
+      `${API_BASE}/finances/export-by-flight?from=${encodeURIComponent(range.from)}&to=${encodeURIComponent(range.to)}${routeQuery(routeKey)}`,
       { headers: { Authorization: `Bearer ${token}` } },
     );
     if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
@@ -7123,6 +7137,8 @@ export interface MarkRefundPaidResult {
 
 export interface FinanceSummary {
   range: { from: string; to: string };
+  /** 本次统计圈定的航线（null = 全部航线）；'unknown' = 只看推不出航线的单。 */
+  routeKey: string | null;
   revenueCny: number;
   costCny: number;
   grossMarginCny: number | null; // A5：缺成本时 null（未知）
