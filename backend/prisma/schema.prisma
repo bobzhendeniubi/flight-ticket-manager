@@ -2013,6 +2013,8 @@ model Order {
   supplierInvoiceLines SupplierInvoiceLine[]
   // 给客户/代理开的真发票（与订单上的「开票」三个布尔位无关，见 Invoice 模型注释）
   invoiceLinks         InvoiceOrder[]
+  // 按人份额落库（审查根因 R1）：每位在单乘客一行，由 service/passenger-shares.ts 唯一写点维护
+  passengerShares      OrderPassengerShare[]
 
   @@index([userId, createdAt])
   @@index([agentId, createdAt])
@@ -2240,8 +2242,49 @@ model Passenger {
   order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
   // 按乘客调价行（0722）：本乘客名下的价格调整 OrderItem（SetNull——清人不丢金额，只失归属）。
   adjustmentItems OrderItem[]
+  // 本乘客在所在订单上的份额行（随乘客级联删除；拆单搬人后由写点重算两侧）。
+  shares          OrderPassengerShare[]
 
   @@index([orderId])
+}
+
+// ── 按人份额（审查根因 R1：业务按人算账、系统按订单建模）─────────────────────────
+// 每人份额此前是「每次现算」的派生值（per-pax-share.ts + lib/order-money perPax*），前后端各一份实现，
+// 导出 / 详情 / 对账单 / 拆单各自在读的时候重算。本表把每次写路径算出来的结果**作为事实落库**：
+//   · 算法不变：仍是 lib/order-money 的 perPaxSettlementByPassenger / perPaxVisaAmountByPassenger /
+//     perPaxSingleRoomDiffByPassenger（唯一算法），本表只存结果；落库值与派生值必须逐分相等；
+//   · 唯一写点：service/passenger-shares.ts 的 persistPassengerShares（挂在每条改钱 / 改人的写路径末尾，
+//     内核路径由 runOrderMutation 的 persistShares 选项统一挂）；
+//   · 读侧优先读本表，没有（老单）就派生并顺手回填（lazy backfill）；
+//   · 一行 = 一位**当前在单**的乘客；拆单搬人后源单的旧行由写点删掉、新单补建。
+// settlementCny = baseCny + adjustmentCny；Σ settlementCny + 换人费等不摊条目 = 应收（payableCny）。
+model OrderPassengerShare {
+  id          String @id @default(cuid())
+  orderId     String
+  passengerId String
+  /// 每人结算价（应收份额）= baseCny + adjustmentCny —— perPaxSettlementByPassenger
+  settlementCny     Decimal @db.Decimal(12, 2)
+  /// 均摊基准：(可摊应收 − Σ按人调价净额) ÷ 人数，余数兜给 id 序最后一位
+  baseCny           Decimal @db.Decimal(12, 2)
+  /// 该乘客名下「按乘客调价」净额（groupPassengerAdjustments.byPassenger[pid].netCny）
+  adjustmentCny     Decimal @db.Decimal(12, 2)
+  /// 签证金额（自备签 = 0；套餐挂牌价快照每人口径）—— perPaxVisaAmountByPassenger
+  visaCny           Decimal @db.Decimal(12, 2)
+  /// 单房差（只记到单住乘客）—— perPaxSingleRoomDiffByPassenger
+  singleRoomDiffCny Decimal @db.Decimal(12, 2)
+  /// 立减均摊（未撤销立减快照行 |amount| 之和 ÷ 人数，两位小数；整单发生的钱按既定口径均摊）
+  discountCny       Decimal @db.Decimal(12, 2)
+  /// 算法版本戳：算法改口径时换值，回填脚本据此挑出旧版本行重算
+  algoVersion String
+  computedAt  DateTime @default(now())
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  order     Order     @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  passenger Passenger @relation(fields: [passengerId], references: [id], onDelete: Cascade)
+
+  @@unique([orderId, passengerId])
+  @@index([passengerId])
 }
 
 model OrderStatusEvent {
