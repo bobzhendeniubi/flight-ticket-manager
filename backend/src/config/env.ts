@@ -157,6 +157,14 @@ const EnvSchema = z.object({
   // 两者互不复用，各自独立取值。
   // ═══════════════════════════════════════════════════════════
   FLIGHT_NOSHOW_MAX_OVERSELL_SEATS: z.coerce.number().int().min(0).default(5),
+
+  // ═══════════════════════════════════════════════════════════
+  // 企业微信群机器人 webhook（提醒汇总 / 工单事件 / 履约指派通知）
+  // 未配置时 pushWecomMarkdown 直接 no-op（{skipped:true}），不报错、不重试——
+  // 群推送是增强能力，配没配都不该影响任何业务流程。
+  // 获取方式：企业微信群 → 群设置 → 群机器人 → 添加 → 复制 Webhook 地址。
+  // ═══════════════════════════════════════════════════════════
+  WECOM_WEBHOOK_URL: z.string().url().optional(),
 });
 
 export type Env = z.infer<typeof EnvSchema>;
