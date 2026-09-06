@@ -6,7 +6,11 @@
  *   - 右侧 = 待收款订单盒子（尾款 > 0 的近期订单），把流水拖进订单 = 认款。
  *   - 拖到订单（或选中流水后点订单上的「认款到此单」）→ 行内确认金额 → 原子认领。
  *   - 选中/拖动流水时，金额与尾款吻合的订单亮「金额吻合」绿框，一眼看到该放哪。
- *   - 顶部「自动配对建议」：金额一对一吻合的（一笔流水 ↔ 一张订单）一键认款。
+ *   - 顶部「认款建议」：由服务端匹配引擎（POST /receipts/match/suggest）给出，按置信度分档：
+ *       HIGH   = 金额精确 + 身份线索（备注订单号/姓名/代理/手机尾号）+ 双向唯一 → 可勾选批量 / 单条一键认款；
+ *       MEDIUM / LOW = 只展示候选 + 理由标签，点「选中并定位」后走拖拽/点选的常规认款路径；
+ *       组合建议（多笔凑一单 / 一笔付多单）单独一块，MEDIUM 的可按组合确认后批量认款，LOW 只展示。
+ *     不管哪一档，入账都走既有 allocate / allocate-batch 接口——建议只是建议，钱的闸门在服务端不变。
  *
  * 流水导入：上传收单平台 xlsx → 解析预览（可导入/重复/非成功/无效 分色）→ 确认入池。
  * 重复导入天然幂等：交易流水号唯一索引，已认过的行状态不丢。
@@ -21,6 +25,11 @@ import {
   type PaymentMethod,
   type Receipt,
   type ReceiptMatchCandidate,
+  type ReceiptMatchCombo,
+  type ReceiptMatchComboReason,
+  type ReceiptMatchConfidence,
+  type ReceiptMatchSuggestion,
+  type ReceiptMatchSuggestResult,
   type StatementDisposition,
   type StatementPlatform,
   type StatementPreviewResult,
@@ -72,6 +81,60 @@ const DISPOSITION_META: Record<StatementDisposition, { label: string; cls: strin
   invalid: { label: '无法解析', cls: 'bg-rose-50 text-rose-700' },
 };
 
+/** 建议理由标签（服务端 reason 码 → 财务看得懂的短语） */
+const REASON_LABEL: Record<ReceiptMatchComboReason, string> = {
+  AMOUNT_EXACT: '金额吻合',
+  AMOUNT_PARTIAL: '部分付款',
+  AMOUNT_COVERS: '金额大于尾款',
+  REMARK_HAS_ORDER_NO: '备注含订单号',
+  ORDER_HINT: '自报订单',
+  REMARK_HAS_PASSENGER_NAME: '备注含姓名',
+  PAYER_MATCHES_AGENT: '付款人=代理',
+  PHONE_TAIL: '手机尾号吻合',
+  DATE_NEAR: '时间邻近',
+  AMOUNT_SUM_EXACT: '合计吻合',
+  SAME_PAYER: '同付款人',
+  SAME_AGENT: '同代理',
+  SAME_CONTACT: '同联系人',
+  SAME_DAY: '同一天',
+};
+
+const CONFIDENCE_META: Record<
+  ReceiptMatchConfidence,
+  { label: string; badge: string; box: string; hint: string }
+> = {
+  HIGH: {
+    label: '高',
+    badge: 'badge-success',
+    box: 'border-emerald-200 bg-emerald-50/50',
+    hint: '金额精确 + 身份线索 + 唯一对应。核对无误可勾选批量认款。',
+  },
+  MEDIUM: {
+    label: '中',
+    badge: 'badge-warning',
+    box: 'border-amber-200 bg-amber-50/40',
+    hint: '金额吻合但缺身份线索、或线索强但只是部分付款。请点「选中并定位」后拖到订单确认。',
+  },
+  LOW: {
+    label: '低',
+    badge: 'badge-neutral',
+    box: 'border-slate-200 bg-slate-50/60',
+    hint: '线索较弱，仅供参考。',
+  },
+};
+
+const COMBO_TYPE_LABEL: Record<ReceiptMatchCombo['type'], string> = {
+  MANY_RECEIPTS_ONE_ORDER: '多笔凑一单',
+  ONE_RECEIPT_MANY_ORDERS: '一笔付多单',
+};
+
+/** 认款目标订单的最小引用（建议里的订单不一定在右栏候选列表里） */
+interface OrderRef {
+  orderId: string;
+  orderNumber: string;
+  contactName: string;
+}
+
 const STATEMENT_PLATFORM_OPTIONS: Array<{
   value: StatementPlatform;
   label: string;
@@ -118,6 +181,10 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
   const [selectedSug, setSelectedSug] = useState<Set<string>>(new Set());
   // 认款请求进行中（防连点：双击「确认认款/一键认款/批量认款」会重复入账）
   const [allocating, setAllocating] = useState(false);
+  // 服务端认款建议（随池子重载刷新；加载失败不影响工作台本身，只在建议区提示）
+  const [suggest, setSuggest] = useState<ReceiptMatchSuggestResult | null>(null);
+  const [suggestLoading, setSuggestLoading] = useState(false);
+  const [suggestErr, setSuggestErr] = useState<string | null>(null);
 
   // 导入流程
   const [preview, setPreview] = useState<StatementPreviewResult | null>(null);
@@ -162,6 +229,32 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
         if (cancelled) return;
         setReceipts(r.receipts);
         setCandidates(c.orders);
+        // 建议：把当前池子里未认完的流水 id 交给服务端算（与池子筛选同步；服务端自己拉 90 天候选单）。
+        // 不等建议回来就先把工作台画出来——建议是锦上添花，拖拽认款不依赖它。
+        setSelectedSug(new Set());
+        setSuggestErr(null);
+        const ids = r.receipts
+          .filter((x) => x.status === 'OPEN' || x.status === 'PARTIALLY_ALLOCATED')
+          .map((x) => x.id);
+        if (ids.length === 0) {
+          setSuggest(null);
+          setSuggestLoading(false);
+          return;
+        }
+        setSuggestLoading(true);
+        api
+          .suggestReceiptMatches(token, { receiptIds: ids })
+          .then((s) => {
+            if (!cancelled) setSuggest(s);
+          })
+          .catch((e: unknown) => {
+            if (cancelled) return;
+            setSuggest(null);
+            setSuggestErr(e instanceof ApiError ? e.message : '认款建议加载失败');
+          })
+          .finally(() => {
+            if (!cancelled) setSuggestLoading(false);
+          });
       })
       .catch((e: unknown) => {
         if (cancelled) return;
@@ -216,42 +309,38 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
     );
   }, [candidates, orderQuery]);
 
-  // 自动配对建议：金额一对一吻合（恰好一笔未认款流水 ↔ 恰好一张待收订单）。
-  // 用完整 openPool 而非展示池——「只看流水导入」只是视图过滤，
-  // 若拿过滤后的池算唯一性，两笔同金额流水会被误判成一对一（审计发现#5）。
-  const suggestions = useMemo(() => {
-    const byAmountReceipts = new Map<string, Receipt[]>();
-    for (const r of openPool) {
-      const key = Number(r.remainingCny).toFixed(2);
-      byAmountReceipts.set(key, [...(byAmountReceipts.get(key) ?? []), r]);
+  // 服务端建议按「该流水最佳候选的置信度」分组。HIGH 组每笔恰好一张候选（引擎保证双向唯一）。
+  // 只保留仍在当前未认款池里的流水——建议是上一次池子快照算的，认掉/筛掉的不再展示。
+  const grouped = useMemo(() => {
+    const inPool = new Set(openPool.map((r) => r.id));
+    const high: ReceiptMatchSuggestion[] = [];
+    const medium: ReceiptMatchSuggestion[] = [];
+    const low: ReceiptMatchSuggestion[] = [];
+    for (const s of suggest?.receipts ?? []) {
+      const top = s.candidates[0];
+      if (!top || !inPool.has(s.receiptId)) continue;
+      if (top.confidence === 'HIGH') high.push(s);
+      else if (top.confidence === 'MEDIUM') medium.push(s);
+      else low.push(s);
     }
-    const byAmountOrders = new Map<string, ReceiptMatchCandidate[]>();
-    for (const o of candidates) {
-      const key = o.balanceDue.toFixed(2);
-      byAmountOrders.set(key, [...(byAmountOrders.get(key) ?? []), o]);
-    }
-    const out: Array<{ receipt: Receipt; order: ReceiptMatchCandidate }> = [];
-    for (const [key, rs] of byAmountReceipts) {
-      const os = byAmountOrders.get(key);
-      if (rs.length === 1 && os && os.length === 1) {
-        out.push({ receipt: rs[0], order: os[0] });
-      }
-    }
-    return out.slice(0, 20);
-  }, [openPool, candidates]);
+    const combos = (suggest?.combos ?? []).filter((c) =>
+      c.parts.every((p) => inPool.has(p.receiptId)),
+    );
+    return { high, medium, low, combos };
+  }, [suggest, openPool]);
 
-  // 勾选中的建议组数（只算当前有效建议里被勾的，重载后失效的旧勾选不计入）
+  // 勾选中的 HIGH 组数（只算当前有效建议里被勾的，重载后失效的旧勾选不计入）
   const selectedCount = useMemo(
-    () => suggestions.filter((s) => selectedSug.has(s.receipt.id)).length,
-    [suggestions, selectedSug],
+    () => grouped.high.filter((s) => selectedSug.has(s.receiptId)).length,
+    [grouped.high, selectedSug],
   );
 
-  // ── 认款（拖放 / 点选 / 建议一键 共用入口；in-flight 期间拒绝二次提交）──
-  async function allocate(receiptId: string, orderId: string, amount: number): Promise<void> {
+  // ── 认款（拖放 / 点选 / HIGH 建议一键 共用入口；in-flight 期间拒绝二次提交）──
+  // order 传引用而非 id：建议里的订单来自服务端 90 天窗口，不一定在右栏候选列表里。
+  async function allocate(receiptId: string, order: OrderRef, amount: number): Promise<void> {
     if (allocating || allocationConfirmRef.current) return;
     const receipt = openPool.find((r) => r.id === receiptId);
-    const order = candidates.find((o) => o.orderId === orderId);
-    if (!receipt || !order) return;
+    if (!receipt) return;
     allocationConfirmRef.current = true;
     const ok = await askConfirm({
       title: '确认认款？',
@@ -266,7 +355,7 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
     setNotice(null);
     setAllocating(true);
     try {
-      await api.allocateReceipt(token, receiptId, { orderId, amountCny: amount });
+      await api.allocateReceipt(token, receiptId, { orderId: order.orderId, amountCny: amount });
       setNotice(`已认款：${fmtCny(amount)} → ${order.orderNumber} · ${order.contactName}`);
       setActiveReceiptId(null);
       setConfirmTarget(null);
@@ -280,7 +369,7 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
     }
   }
 
-  // ── 批量认款（勾选的建议组一键执行；仅金额一对一吻合的组）──────────────────
+  // ── 批量认款（只有 HIGH 组可勾选；复用 allocate-batch，逐组独立事务）──────────
   function toggleSug(receiptId: string): void {
     setSelectedSug((prev) => {
       const next = new Set(prev);
@@ -292,23 +381,21 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
 
   function toggleSelectAll(): void {
     setSelectedSug((prev) =>
-      prev.size === suggestions.length && suggestions.length > 0
+      prev.size === grouped.high.length && grouped.high.length > 0
         ? new Set()
-        : new Set(suggestions.map((s) => s.receipt.id)),
+        : new Set(grouped.high.map((s) => s.receiptId)),
     );
   }
 
-  async function runBatch(): Promise<void> {
-    if (allocating || allocationConfirmRef.current) return;
-    // 只认「当前建议里且被勾选」的组——过滤掉重载后已失效的旧勾选
-    const chosen = suggestions.filter((s) => selectedSug.has(s.receipt.id));
-    if (chosen.length === 0) return;
+  /** 批量认款的共用收口：复用 allocate-batch，逐组回结果，成败分开提示。 */
+  async function runAllocateBatch(
+    items: Array<{ receiptId: string; orderId: string; amountCny: number }>,
+    confirm: { title: string; body: React.ReactNode },
+    failLabel: string,
+  ): Promise<void> {
+    if (allocating || allocationConfirmRef.current || items.length === 0) return;
     allocationConfirmRef.current = true;
-    const ok = await askConfirm({
-      title: '确认批量认款？',
-      body: `确认批量认款 ${chosen.length} 组？每组把整笔流水认款到金额一对一吻合的订单。`,
-      tone: 'danger',
-    });
+    const ok = await askConfirm({ ...confirm, tone: 'danger' });
     if (!ok) {
       allocationConfirmRef.current = false;
       return;
@@ -317,14 +404,9 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
     setNotice(null);
     setAllocating(true);
     try {
-      const items = chosen.map((s) => ({
-        receiptId: s.receipt.id,
-        orderId: s.order.orderId,
-        amountCny: Number(s.receipt.remainingCny),
-      }));
       const res = await api.allocateReceiptBatch(token, items);
       const { succeeded, failed } = res.summary;
-      setNotice(`批量认款完成：成功 ${succeeded} 组${failed > 0 ? `，失败 ${failed} 组` : ''}`);
+      setNotice(`${failLabel}完成：成功 ${succeeded} 组${failed > 0 ? `，失败 ${failed} 组` : ''}`);
       if (failed > 0) {
         const firstFail = res.results.find((r) => !r.ok);
         if (firstFail && !firstFail.ok) setErr(`有 ${failed} 组未成功，例如：${firstFail.error}`);
@@ -335,11 +417,61 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
       load();
       onMutated?.();
     } catch (e: unknown) {
-      setErr(e instanceof ApiError ? e.message : '批量认款失败');
+      setErr(e instanceof ApiError ? e.message : `${failLabel}失败`);
     } finally {
       setAllocating(false);
       allocationConfirmRef.current = false;
     }
+  }
+
+  /** HIGH 组勾选批量：每笔认到它唯一的 HIGH 候选，金额 = 服务端建议额（min(流水余额, 尾款)）。 */
+  function runBatch(): Promise<void> {
+    // 只认「当前建议里且被勾选」的组——过滤掉重载后已失效的旧勾选
+    const chosen = grouped.high.filter((s) => selectedSug.has(s.receiptId));
+    return runAllocateBatch(
+      chosen.map((s) => ({
+        receiptId: s.receiptId,
+        orderId: s.candidates[0].orderId,
+        amountCny: s.candidates[0].suggestedAmountCny,
+      })),
+      {
+        title: '确认批量认款？',
+        body: `确认批量认款 ${chosen.length} 组？每组把流水按建议金额认款到高置信度候选订单（金额精确 + 身份线索 + 唯一对应）。`,
+      },
+      '批量认款',
+    );
+  }
+
+  /** 组合建议按组执行（仅 MEDIUM 组合开放）：确认框逐条列出每一笔怎么认。 */
+  function runCombo(combo: ReceiptMatchCombo): Promise<void> {
+    return runAllocateBatch(
+      combo.parts.map((p) => ({ receiptId: p.receiptId, orderId: p.orderId, amountCny: p.amountCny })),
+      {
+        title: `确认按「${COMBO_TYPE_LABEL[combo.type]}」认款？`,
+        body: (
+          <div className="space-y-1 text-sm">
+            <div>共 {combo.parts.length} 条，合计 {fmtCny(combo.totalCny)}：</div>
+            <ul className="list-disc space-y-0.5 pl-5 text-xs">
+              {combo.parts.map((p) => (
+                <li key={`${p.receiptId}-${p.orderId}`}>
+                  {fmtCny(p.amountCny)}（{p.externalTxnId ? `流水号…${p.externalTxnId.slice(-8)}` : p.receiptNo}）
+                  → {p.orderNumber} · {p.contactName}
+                </li>
+              ))}
+            </ul>
+            <div className="text-xs text-ink-muted">逐条独立入账，某条失败不影响其它条；请先核对每一笔。</div>
+          </div>
+        ),
+      },
+      '组合认款',
+    );
+  }
+
+  /** MEDIUM / LOW 建议：选中这笔流水并把订单号填进右栏筛选，让财务沿常规拖拽/点选路径确认。 */
+  function locate(receiptId: string, orderNumber: string): void {
+    setActiveReceiptId(receiptId);
+    setConfirmTarget(null);
+    setOrderQuery(orderNumber);
   }
 
   function handleDropToOrder(orderId: string, e: React.DragEvent): void {
@@ -555,7 +687,7 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
             receipt={confirmReceipt}
             order={o}
             submitting={allocating}
-            onConfirm={(amount) => void allocate(confirmReceipt.id, o.orderId, amount)}
+            onConfirm={(amount) => void allocate(confirmReceipt.id, o, amount)}
             onCancel={() => setConfirmTarget(null)}
           />
         )}
@@ -634,68 +766,217 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
         </div>
       )}
 
-      {/* 自动配对建议（可多选/全选后批量认款；仅金额一对一吻合的组） */}
-      {suggestions.length > 0 && (
-        <div className="rounded-xl border border-emerald-200 bg-emerald-50/50 p-3">
-          <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-            <label className="flex items-center gap-1.5 text-xs font-medium uppercase tracking-wide text-emerald-800">
-              <input
-                type="checkbox"
-                checked={selectedCount === suggestions.length && suggestions.length > 0}
-                ref={(el) => {
-                  if (el) el.indeterminate = selectedCount > 0 && selectedCount < suggestions.length;
-                }}
-                onChange={toggleSelectAll}
-              />
-              自动配对建议（金额一对一吻合）· {suggestions.length} 组
-            </label>
-            <button
-              type="button"
-              className="btn-primary px-3 py-1 text-xs disabled:opacity-50"
-              disabled={allocating || selectedCount === 0}
-              onClick={() => void runBatch()}
-            >
-              {allocating ? '认款中…' : `批量认款${selectedCount > 0 ? ` ${selectedCount} 组` : ''}`}
-            </button>
+      {/* 认款建议（服务端匹配引擎）：HIGH 可勾选批量；MEDIUM / LOW 只展示 + 选中定位；组合单独一块 */}
+      {(suggestLoading || suggestErr || suggest) && openPool.length > 0 && (
+        <div className="space-y-2">
+          <div className="flex flex-wrap items-center justify-between gap-2 px-1">
+            <span className="text-xs font-medium uppercase tracking-wide text-ink-muted">
+              认款建议
+              {suggest && (
+                <span className="ml-2 normal-case tracking-normal text-ink-muted">
+                  高 {grouped.high.length} · 中 {grouped.medium.length} · 低 {grouped.low.length} · 组合{' '}
+                  {grouped.combos.length}
+                  <span className="ml-2">
+                    （候选单回看近 {suggest.scanned.sinceDays} 天，待收 {suggest.scanned.unpaidOrders} 单）
+                  </span>
+                </span>
+              )}
+            </span>
+            {suggestLoading && <span className="text-xs text-ink-muted">建议计算中…</span>}
           </div>
-          <div className="space-y-1.5">
-            {suggestions.map(({ receipt, order }) => (
-              <div
-                key={`${receipt.id}-${order.orderId}`}
-                className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-white px-3 py-1.5 text-sm shadow-sm"
-              >
-                <label className="flex items-center gap-2">
+          {suggestErr && (
+            <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-xs text-amber-800">
+              {suggestErr}（不影响手动拖拽认款）
+            </div>
+          )}
+
+          {/* HIGH：可勾选批量认款 / 单条一键认款 */}
+          {grouped.high.length > 0 && (
+            <div className={`rounded-xl border p-3 ${CONFIDENCE_META.HIGH.box}`}>
+              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                <label className="flex items-center gap-1.5 text-xs font-medium text-emerald-800">
                   <input
                     type="checkbox"
-                    checked={selectedSug.has(receipt.id)}
-                    onChange={() => toggleSug(receipt.id)}
+                    checked={selectedCount === grouped.high.length && grouped.high.length > 0}
+                    ref={(el) => {
+                      if (el) el.indeterminate = selectedCount > 0 && selectedCount < grouped.high.length;
+                    }}
+                    onChange={toggleSelectAll}
                   />
-                  <span>
-                    <b className="nums">{fmtCny(Number(receipt.remainingCny))}</b>
-                    <span className="ml-1.5 text-xs text-ink-muted">
-                      {fmtDateTime(receipt.receivedAt)}
-                      {receipt.externalTxnId && (
-                        <span className="ml-1 font-mono">…{receipt.externalTxnId.slice(-8)}</span>
-                      )}
-                    </span>
-                    <span className="mx-2 text-ink-muted">→</span>
-                    <span className="font-mono text-xs">{order.orderNumber}</span>
-                    <span className="ml-1.5">{order.contactName}</span>
-                  </span>
+                  <span className={CONFIDENCE_META.HIGH.badge}>高置信度</span>
+                  {grouped.high.length} 笔 · {CONFIDENCE_META.HIGH.hint}
                 </label>
                 <button
                   type="button"
-                  className="btn-secondary px-2.5 py-1 text-xs disabled:opacity-50"
-                  disabled={allocating}
-                  onClick={() =>
-                    void allocate(receipt.id, order.orderId, Number(receipt.remainingCny))
-                  }
+                  className="btn-primary px-3 py-1 text-xs disabled:opacity-50"
+                  disabled={allocating || selectedCount === 0}
+                  onClick={() => void runBatch()}
                 >
-                  {allocating ? '认款中…' : '一键认款'}
+                  {allocating ? '认款中…' : `批量认款${selectedCount > 0 ? ` ${selectedCount} 组` : ''}`}
                 </button>
               </div>
-            ))}
-          </div>
+              <div className="space-y-1.5">
+                {grouped.high.map((s) => {
+                  const c = s.candidates[0];
+                  return (
+                    <div
+                      key={s.receiptId}
+                      className="flex flex-wrap items-center justify-between gap-2 rounded-lg bg-white px-3 py-1.5 text-sm shadow-sm"
+                    >
+                      <label className="flex min-w-0 flex-wrap items-center gap-2">
+                        <input
+                          type="checkbox"
+                          checked={selectedSug.has(s.receiptId)}
+                          onChange={() => toggleSug(s.receiptId)}
+                        />
+                        <SuggestionReceiptLabel s={s} />
+                        <span className="text-ink-muted">→</span>
+                        <span className="font-mono text-xs">{c.orderNumber}</span>
+                        <span>{c.contactName}</span>
+                        {c.agentName && <span className="text-xs text-ink-muted">· {c.agentName}</span>}
+                        <span className="nums text-xs text-ink-soft">尾款 {fmtCny(c.balanceDue)}</span>
+                        <ReasonTags reasons={c.reasons} />
+                      </label>
+                      <button
+                        type="button"
+                        className="btn-secondary px-2.5 py-1 text-xs disabled:opacity-50"
+                        disabled={allocating}
+                        onClick={() => void allocate(s.receiptId, c, c.suggestedAmountCny)}
+                      >
+                        {allocating ? '认款中…' : `一键认款 ${fmtCny(c.suggestedAmountCny)}`}
+                      </button>
+                    </div>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
+          {/* MEDIUM / LOW：只展示候选 + 理由；「选中并定位」后走拖拽/点选常规路径 */}
+          {(['MEDIUM', 'LOW'] as const).map((level) => {
+            const list = level === 'MEDIUM' ? grouped.medium : grouped.low;
+            if (list.length === 0) return null;
+            const meta = CONFIDENCE_META[level];
+            return (
+              <details key={level} className={`rounded-xl border p-3 ${meta.box}`} open={level === 'MEDIUM'}>
+                <summary className="cursor-pointer text-xs font-medium text-ink">
+                  <span className={meta.badge}>{meta.label}置信度</span>
+                  <span className="ml-1.5">{list.length} 笔</span>
+                  <span className="ml-2 font-normal text-ink-muted">{meta.hint}</span>
+                </summary>
+                <div className="mt-2 space-y-1.5">
+                  {list.map((s) => (
+                    <div key={s.receiptId} className="rounded-lg bg-white px-3 py-1.5 text-sm shadow-sm">
+                      <SuggestionReceiptLabel s={s} />
+                      <div className="mt-1 space-y-1">
+                        {s.candidates.map((c) => (
+                          <div
+                            key={c.orderId}
+                            className="flex flex-wrap items-center justify-between gap-2 border-t border-slate-100 pt-1 text-xs"
+                          >
+                            <span className="flex min-w-0 flex-wrap items-center gap-1.5">
+                              <span className={CONFIDENCE_META[c.confidence].badge}>
+                                {CONFIDENCE_META[c.confidence].label}
+                              </span>
+                              <span className="font-mono">{c.orderNumber}</span>
+                              <span className="text-ink">{c.contactName}</span>
+                              {c.agentName && <span className="text-ink-muted">· {c.agentName}</span>}
+                              <span className="nums text-ink-soft">
+                                尾款 {fmtCny(c.balanceDue)} · 建议认 {fmtCny(c.suggestedAmountCny)}
+                              </span>
+                              <ReasonTags reasons={c.reasons} />
+                            </span>
+                            <button
+                              type="button"
+                              className="btn-ghost px-2 py-0.5 text-xs"
+                              onClick={() => locate(s.receiptId, c.orderNumber)}
+                              title="选中这笔流水，并把该订单筛到右栏；再拖过去或点「认款到此单」确认"
+                            >
+                              选中并定位 →
+                            </button>
+                          </div>
+                        ))}
+                      </div>
+                    </div>
+                  ))}
+                </div>
+              </details>
+            );
+          })}
+
+          {/* 组合建议：多笔凑一单 / 一笔付多单 */}
+          {grouped.combos.length > 0 && (
+            <details className="rounded-xl border border-sky-200 bg-sky-50/40 p-3" open>
+              <summary className="cursor-pointer text-xs font-medium text-ink">
+                <span className="badge-info">组合建议</span>
+                <span className="ml-1.5">{grouped.combos.length} 组</span>
+                <span className="ml-2 font-normal text-ink-muted">
+                  多笔凑一单 / 一笔付多单，合计金额精确相等。中置信度的可按组合确认后批量认款；低置信度只供参考。
+                </span>
+              </summary>
+              <div className="mt-2 space-y-1.5">
+                {grouped.combos.map((combo) => {
+                  const key = `${combo.type}:${combo.parts.map((p) => `${p.receiptId}>${p.orderId}`).join('|')}`;
+                  return (
+                    <div key={key} className="rounded-lg bg-white px-3 py-1.5 text-sm shadow-sm">
+                      <div className="flex flex-wrap items-center justify-between gap-2">
+                        <span className="flex flex-wrap items-center gap-1.5 text-xs">
+                          <span className={CONFIDENCE_META[combo.confidence].badge}>
+                            {CONFIDENCE_META[combo.confidence].label}
+                          </span>
+                          <b>{COMBO_TYPE_LABEL[combo.type]}</b>
+                          <span className="nums">合计 {fmtCny(combo.totalCny)}</span>
+                          <ReasonTags reasons={combo.reasons} />
+                        </span>
+                        {combo.confidence === 'MEDIUM' ? (
+                          <button
+                            type="button"
+                            className="btn-secondary px-2.5 py-1 text-xs disabled:opacity-50"
+                            disabled={allocating}
+                            onClick={() => void runCombo(combo)}
+                          >
+                            {allocating ? '认款中…' : `按此组合认款（${combo.parts.length} 条）`}
+                          </button>
+                        ) : (
+                          <span className="text-[11px] text-ink-muted">仅供参考，请手动逐笔拖拽</span>
+                        )}
+                      </div>
+                      <ul className="mt-1 space-y-0.5 text-xs text-ink-soft">
+                        {combo.parts.map((p) => (
+                          <li key={`${p.receiptId}-${p.orderId}`} className="flex flex-wrap items-center gap-1.5">
+                            <span className="nums font-medium text-ink">{fmtCny(p.amountCny)}</span>
+                            <span className="font-mono text-ink-muted">
+                              {p.externalTxnId ? `…${p.externalTxnId.slice(-8)}` : p.receiptNo}
+                            </span>
+                            <span className="text-ink-muted">→</span>
+                            <span className="font-mono">{p.orderNumber}</span>
+                            <span>{p.contactName}</span>
+                            {p.agentName && <span className="text-ink-muted">· {p.agentName}</span>}
+                            <span className="nums text-ink-muted">（尾款 {fmtCny(p.orderBalanceDue)}）</span>
+                            <button
+                              type="button"
+                              className="btn-ghost px-1.5 py-0 text-[11px]"
+                              onClick={() => locate(p.receiptId, p.orderNumber)}
+                            >
+                              定位
+                            </button>
+                          </li>
+                        ))}
+                      </ul>
+                    </div>
+                  );
+                })}
+              </div>
+            </details>
+          )}
+
+          {suggest &&
+            !suggestLoading &&
+            grouped.high.length + grouped.medium.length + grouped.low.length + grouped.combos.length === 0 && (
+              <div className="rounded-lg border border-dashed border-slate-300 px-3 py-2 text-xs text-ink-muted">
+                当前池子里的流水没有找到可靠的候选订单（金额与备注都对不上），请手动拖拽认款。
+              </div>
+            )}
         </div>
       )}
 
@@ -813,6 +1094,42 @@ export function StatementReconciliation({ token, onMutated }: StatementReconcili
         />
       )}
     </div>
+  );
+}
+
+// ── 建议区小件 ───────────────────────────────────────────────────────────────
+/** 理由标签串（服务端 reason 码 → 中文短语）。 */
+function ReasonTags({ reasons }: { reasons: ReceiptMatchComboReason[] }) {
+  return (
+    <span className="flex flex-wrap items-center gap-1">
+      {reasons.map((r) => (
+        <span key={r} className="rounded bg-slate-100 px-1.5 py-0.5 text-[10px] text-slate-600">
+          {REASON_LABEL[r] ?? r}
+        </span>
+      ))}
+    </span>
+  );
+}
+
+/** 建议行里的流水摘要：金额 · 时间 · 流水号尾 8 位 · 付款备注。 */
+function SuggestionReceiptLabel({ s }: { s: ReceiptMatchSuggestion }) {
+  const mb = methodBadge(s.method);
+  return (
+    <span className="inline-flex min-w-0 flex-wrap items-center gap-1.5">
+      <span className={`inline-flex h-5 w-5 items-center justify-center rounded text-xs font-medium ${mb.cls}`}>
+        {mb.text}
+      </span>
+      <b className="nums">{fmtCny(Number(s.remainingCny))}</b>
+      <span className="text-xs text-ink-muted">
+        {fmtDateTime(s.receivedAt)}
+        {s.externalTxnId && <span className="ml-1 font-mono">…{s.externalTxnId.slice(-8)}</span>}
+      </span>
+      {s.payerNote && (
+        <span className="max-w-[16rem] truncate text-xs text-ink-soft" title={s.payerNote}>
+          备注：{s.payerNote}
+        </span>
+      )}
+    </span>
   );
 }
 

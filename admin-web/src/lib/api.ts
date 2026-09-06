@@ -3543,6 +3543,103 @@ export interface ReceiptMatchCandidatesParams {
   q?: string;
 }
 
+// ── 认款建议（POST /receipts/match/suggest；服务端匹配引擎，只出建议不入账）──
+/** 单笔候选的理由标签（服务端 receipt-matching.ts 的 MatchReason） */
+export type ReceiptMatchReason =
+  | 'AMOUNT_EXACT'
+  | 'AMOUNT_PARTIAL'
+  | 'AMOUNT_COVERS'
+  | 'REMARK_HAS_ORDER_NO'
+  | 'ORDER_HINT'
+  | 'REMARK_HAS_PASSENGER_NAME'
+  | 'PAYER_MATCHES_AGENT'
+  | 'PHONE_TAIL'
+  | 'DATE_NEAR';
+/** 组合建议的理由标签（单笔理由 + 组合专有） */
+export type ReceiptMatchComboReason =
+  | ReceiptMatchReason
+  | 'AMOUNT_SUM_EXACT'
+  | 'SAME_PAYER'
+  | 'SAME_AGENT'
+  | 'SAME_CONTACT'
+  | 'SAME_DAY';
+export type ReceiptMatchConfidence = 'HIGH' | 'MEDIUM' | 'LOW';
+
+/** 建议里随行返回的订单摘要（服务端窗口比工作台候选列表宽，订单不一定在右栏里） */
+export type ReceiptMatchOrderSummary = Pick<
+  ReceiptMatchCandidate,
+  | 'orderId'
+  | 'orderNumber'
+  | 'contactName'
+  | 'agentName'
+  | 'departureDate'
+  | 'totalPayable'
+  | 'paidAmount'
+  | 'balanceDue'
+>;
+
+export interface ReceiptMatchSuggestedOrder extends ReceiptMatchOrderSummary {
+  score: number;
+  reasons: ReceiptMatchReason[];
+  confidence: ReceiptMatchConfidence;
+  /** 建议认款金额 = min(流水未认余额, 订单尾款) */
+  suggestedAmountCny: number;
+}
+
+/** 一笔流水的候选列表（按置信度 → 分数排序，最多 5 张） */
+export interface ReceiptMatchSuggestion {
+  receiptId: string;
+  receiptNo: string;
+  externalTxnId: string | null;
+  payerNote: string | null;
+  method: PaymentMethod;
+  source: ReceiptSource;
+  receivedAt: string;
+  remainingCny: string;
+  candidates: ReceiptMatchSuggestedOrder[];
+}
+
+export interface ReceiptMatchComboPart {
+  receiptId: string;
+  receiptNo: string;
+  externalTxnId: string | null;
+  receiptRemainingCny: string;
+  orderId: string;
+  orderNumber: string;
+  contactName: string;
+  agentName: string | null;
+  orderBalanceDue: number;
+  /** 这一条认多少（元）——多笔凑一单时 = 流水余额；一笔付多单时 = 该单尾款 */
+  amountCny: number;
+}
+
+/** 组合建议：多笔凑一单 / 一笔付多单（永不 HIGH，永远要人看一眼） */
+export interface ReceiptMatchCombo {
+  type: 'MANY_RECEIPTS_ONE_ORDER' | 'ONE_RECEIPT_MANY_ORDERS';
+  confidence: Extract<ReceiptMatchConfidence, 'MEDIUM' | 'LOW'>;
+  score: number;
+  reasons: ReceiptMatchComboReason[];
+  totalCny: number;
+  parts: ReceiptMatchComboPart[];
+}
+
+export interface ReceiptMatchSuggestResult {
+  ok: true;
+  generatedAt: string;
+  scanned: { receipts: number; orders: number; unpaidOrders: number; sinceDays: number };
+  summary: { receiptsWithCandidates: number; high: number; medium: number; low: number; combos: number };
+  receipts: ReceiptMatchSuggestion[];
+  combos: ReceiptMatchCombo[];
+}
+
+/** POST /receipts/match/suggest body */
+export interface ReceiptMatchSuggestInput {
+  /** 缺省 = 全部未认完的流水导入 / 运营水单登记；给了则只算这些（≤ 1000） */
+  receiptIds?: string[];
+  /** 候选订单按下单时间回看天数（默认 90，≤ 365） */
+  sinceDays?: number;
+}
+
 /** POST /receipts body（后台登记新进账） */
 export interface CreateReceiptInput {
   amountCny: number;
@@ -6531,6 +6628,14 @@ export const api = {
       { token },
     );
   },
+  // 认款建议：服务端匹配引擎（金额 + 备注订单号/姓名/代理/手机尾号 + 时间邻近），
+  // 按 HIGH / MEDIUM / LOW 分档 + 组合建议。只出建议不入账——认款仍走 allocateReceipt / allocateReceiptBatch。
+  suggestReceiptMatches: (token: string, body?: ReceiptMatchSuggestInput) =>
+    apiFetch<ReceiptMatchSuggestResult>('/receipts/match/suggest', {
+      method: 'POST',
+      token,
+      body: body ?? {},
+    }),
   // 流水核对表导出（xlsx；含认款状态/认到订单/认款人列）。返回 Blob 直接下载。
   exportReceiptStatement: async (token: string, query?: { from?: string; to?: string }): Promise<Blob> => {
     const qs = new URLSearchParams();
