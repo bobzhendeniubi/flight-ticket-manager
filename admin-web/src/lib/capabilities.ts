@@ -67,6 +67,7 @@ export type Capability =
   | 'orders.hotel.write'
   | 'orders.itinerary'
   | 'orders.no_show'
+  | 'orders.passenger_shares.backfill'
   | 'orders.passengers.swap'
   | 'orders.passengers.write'
   | 'orders.payments_lock'

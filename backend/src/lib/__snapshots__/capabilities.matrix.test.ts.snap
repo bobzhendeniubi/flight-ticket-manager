@@ -462,6 +462,7 @@ POST   /orders/batch/price-adjustment | ADMIN=allow STAFF:运营=allow STAFF:VIS
 POST   /orders/batch/settlement-lock | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 POST   /orders/no-show/batch | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=allow CUSTOMER=allow ANON=deny
 POST   /orders/no-show/batch-preview | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=allow CUSTOMER=allow ANON=deny
+POST   /orders/passenger-shares/backfill | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=deny AGENT=deny CUSTOMER=deny ANON=deny
 POST   /orders/quote | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=allow CUSTOMER=deny ANON=deny
 POST   /orders/roster/parse | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 POST   /orders/tickets/batch | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=allow CUSTOMER=allow ANON=deny

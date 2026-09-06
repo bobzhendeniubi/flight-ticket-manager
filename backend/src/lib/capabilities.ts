@@ -156,6 +156,10 @@ export const CAPABILITIES = {
     说明: '查看换人费档位（代理换人也要填这笔钱，界面得能预填）',
   },
   'orders.swap_fee_options.write': { audience: 'ADMIN_ONLY', 说明: '改换人费档位' },
+  'orders.passenger_shares.backfill': {
+    audience: 'ADMIN_ONLY',
+    说明: '一次性回填按人份额（分批、幂等；上线后跑到 remaining 为 0）',
+  },
   'orders.change_bundle': { audience: 'OPS', 说明: '套餐改档' },
   'orders.delete': { audience: 'OPS', 说明: '删单与回收站恢复（2026-08-24 放开给内部员工）' },
   'orders.read_deleted': { audience: 'OPS', 说明: '查看回收站' },

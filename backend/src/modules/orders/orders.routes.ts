@@ -11,6 +11,7 @@ import { hasCapability, type Capability } from '../../lib/capabilities.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { env } from '../../config/env.js';
 import { z } from 'zod';
+import { backfillPassengerShares } from './service/passenger-shares.js';
 import { OrderItemKind, Prisma, UserRole, VisaRequirement, type Passenger } from '@prisma/client';
 import {
   buildStayNightDates,
@@ -1888,6 +1889,31 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           ...(r.reason ? { reason: r.reason } : {}),
         })),
       };
+    },
+  );
+
+  // ── 按人份额一次性回填（ADMIN）───────────────────────────────────────────
+  // POST /orders/passenger-shares/backfill?limit=500
+  // 分批、幂等：只挑「有乘客却缺当前算法版本份额行」的活单，逐单短事务（NOWAIT 行锁）回填；
+  // 撞锁 / 失败的单下次重跑再挑出来。remaining = 0 即回填完成。线上不进容器也能跑：
+  // 上线后由管理员反复调到 remaining 为 0（与 backend/scripts/backfill-passenger-shares.ts 同一内核）。
+  app.post(
+    '/passenger-shares/backfill',
+    { preHandler: [app.authenticate, app.requireCapability('orders.passenger_shares.backfill')] },
+    async (req) => {
+      const query = z
+        .object({ limit: z.coerce.number().int().min(1).max(5000).default(500) })
+        .parse(req.query ?? {});
+      const result = await backfillPassengerShares({ limit: query.limit });
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'BACKFILL_PASSENGER_SHARES',
+        targetType: 'ORDER',
+        targetId: 'passenger-shares-backfill',
+        targetLabel: `按人份额回填 ${result.persisted}/${result.scanned}（剩 ${result.remaining}）`,
+        after: { ...result, limit: query.limit },
+      });
+      return result;
     },
   );
 
