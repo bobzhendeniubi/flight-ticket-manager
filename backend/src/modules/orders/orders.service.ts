@@ -17318,6 +17318,8 @@ export class OrderService {
 
     const netReductionCny = legItem ? round2(legAmountCny - (policyFee?.feeAmountCny ?? 0)) : 0;
     const totalAfterCny = round2(currentTotalCny - netReductionCny);
+    // 手动填退款金额的前端上限：退多少都不能超过该段本身的钱，也不能把本单应收退成负数。
+    const maxRefundCny = legItem ? Math.min(Math.round(legAmountCny), currentTotalCny) : 0;
 
     return {
       leg,
@@ -17329,6 +17331,7 @@ export class OrderService {
       returnItem: legItem ? this._describeLeg(legItem) : null,
       policyFee,
       netReductionCny,
+      maxRefundCny,
       currentTotalCny,
       paidAmountCny,
       overpayAfterCny: round2(Math.max(0, paidAmountCny - totalAfterCny)),
@@ -17451,26 +17454,42 @@ export class OrderService {
 
       const legAmountCny = round2(Number(legItem.amount));
       const totalBeforeCny = round2(Number(order.total));
+      const legAmountRounded = Math.round(legAmountCny);
 
-      // ── 2. 手续费：服务端权威定价 ──────────────────────────────────────────
-      // POLICY = 按取消政策对该航段行报价；MANUAL = 手工覆盖，必须带原因（schema 已强制）
-      // 且不超过该航段行金额。请求体里其它任何金额一律不认，退款金额也不由本端点决定。
+      // ── 2. 手续费 / 退款：服务端权威定价 ──────────────────────────────────
+      // POLICY = 按取消政策对该航段行报价；MANUAL = 运营手工填「退给客人多少钱」
+      // （manualRefundCny，退款视角；老字段 manualFeeCny 仍兼容，都给时以退款金额为准）。
+      // 两档都必须满足：0 ≤ 退款 ≤ min(该航段行金额, 本单当前应收) —— 退款不能把
+      // 本单应收退成负数，也不能比这段本身的钱还多。请求体里其它任何金额一律不认。
       const now = new Date();
       const policyFee = await this._quoteLegCancelFee(tx, legItem.id, legAmountCny, now);
+      const maxRefundCny = Math.min(legAmountRounded, totalBeforeCny);
       let feeCny: number;
       if (input.feeMode === 'MANUAL') {
-        const manual = Math.trunc(input.manualFeeCny ?? 0);
-        if (manual > Math.round(legAmountCny)) {
+        const refundCny =
+          input.manualRefundCny != null
+            ? Math.trunc(input.manualRefundCny)
+            : legAmountRounded - Math.trunc(input.manualFeeCny ?? 0);
+        if (refundCny < 0 || refundCny > maxRefundCny) {
           throw new BadRequestError(
-            `手工手续费 ¥${manual} 超过${legZh}航段金额 ¥${legAmountCny}：` +
-              `取消一段航段收的手续费不能比这段本身还贵。`,
+            `退款金额 ¥${refundCny} 不在允许范围内：退款不能超过本单当前应收 ¥${totalBeforeCny}，` +
+              `也不能超过${legZh}航段金额 ¥${legAmountRounded}。`,
           );
         }
-        feeCny = manual;
+        feeCny = legAmountRounded - refundCny;
       } else {
         feeCny = policyFee?.feeAmountCny ?? 0;
       }
       const netReductionCny = round2(legAmountCny - feeCny);
+      // POLICY 档理论上不会触发（_quoteLegCancelFee 已把 feeAmountCny 夹到 [0, 该行金额]），
+      // 但该行金额本身可能大于本单当前应收（如同单已有其它调价把 total 压低过）——
+      // 命中即拒，指路手动填退款金额，绝不让 total 落库为负。
+      if (netReductionCny > totalBeforeCny) {
+        throw new BadRequestError(
+          `按取消政策退款 ¥${netReductionCny} 超过本单当前应收 ¥${totalBeforeCny}：` +
+            `请改用「手动填退款金额」，把退款金额压到 ¥${totalBeforeCny} 以内。`,
+        );
+      }
 
       // ── 3. 放该段座位（按下单时的升舱拆座镜像各退各舱，与改期「释放旧座」同一 helper）──
       // 只在事务内、只对占座态订单（闸 2 已断言）、只放一次（闸 0 幂等）——座位账三条对称约束。
@@ -17536,6 +17555,9 @@ export class OrderService {
         originalScheduleId: legScheduleId,
         originalCabin: legCabin,
         feeCny,
+        // 退给客人的金额（= 该航段行金额 − feeCny，与 netReductionCny 同一个数，
+        // 换个名字落痕方便直接按「退了多少钱」核对，不用再心算）。
+        refundCny: netReductionCny,
         feeMode: input.feeMode,
         overrideReason: input.overrideReason?.trim() || null,
         note: input.note?.trim() || null,
@@ -17686,6 +17708,7 @@ export class OrderService {
             leg,
             feeMode: input.feeMode,
             manualFeeCny: feeCny,
+            refundCny: netReductionCny,
             overrideReason: input.overrideReason?.trim() || null,
             policyName: policyFee?.policyName ?? null,
             policyFeeCny: policyFee?.feeAmountCny ?? null,
@@ -19520,6 +19543,11 @@ export interface CancelLegPreview {
   policyFee: LegCancelPolicyFee | null;
   /** 应收下降额 = 该航段行金额 − 手续费。 */
   netReductionCny: number;
+  /**
+   * 手动填退款金额的上限 = min(该航段行金额, 本单当前应收)。前端用它给退款输入框
+   * 设上限提示；服务端在执行时按同一口径再校验一次（权威判定不在前端）。
+   */
+  maxRefundCny: number;
   currentTotalCny: number;
   paidAmountCny: number;
   /** 取消后的多收额 = max(0, 已收 − 取消后应收)；由既有多收/退款流程处置，本端点不打款。 */
@@ -19712,7 +19740,8 @@ export type LegActionLogEntry = {
  *
  * 只放**会改变落库结果**的字段：
  *   · no-show    { releaseReturn, passengerIds(去重排序) } —— 决定放不放座、给谁打标；
- *   · 取消航段    { leg, feeMode, manualFeeCny, overrideReason } —— 决定放哪一段、收多少钱；
+ *   · 取消航段    { leg, feeMode, manualRefundCny, manualFeeCny, overrideReason } —— 决定放哪一段、
+ *                 退多少钱（manualRefundCny 与老字段 manualFeeCny 都入指纹，换任一个都会指纹不符）；
  *   · 恢复回程    {} —— 恢复目标（班次/座数）只由释放快照决定，请求体里没有一个字段能改结果，
  *                 allowOversell 只是「没座时要不要继续」的确认位，刻意不入指纹；
  *   · 起飞后作废  {} —— 同上，只有 note。
@@ -19740,11 +19769,21 @@ function noShowFingerprint(input: { releaseReturn: boolean; passengerIds?: strin
   });
 }
 
-/** 取消航段的入参指纹（决定放哪一段、收多少钱、凭什么覆盖政策）。 */
+/**
+ * 取消航段的入参指纹（决定放哪一段、退多少钱、凭什么覆盖政策）。
+ *
+ * manualRefundCny 与老字段 manualFeeCny 都入指纹（各自原样入，不做互相换算）：
+ * 同一个 token 换任一个字段的值重放都必须指纹不符，绝不能靠「反正最后算出来的钱一样」
+ * 就放行——那等于允许运营用老字段悄悄绕过新字段的校验路径再重放一次。
+ */
 function cancelLegFingerprint(input: CancelLegBody): string {
   return legActionFingerprint({
     leg: input.leg,
     feeMode: input.feeMode,
+    manualRefundCny:
+      input.feeMode === 'MANUAL' && input.manualRefundCny != null
+        ? Math.trunc(input.manualRefundCny)
+        : null,
     manualFeeCny: input.feeMode === 'MANUAL' ? Math.trunc(input.manualFeeCny ?? 0) : null,
     overrideReason: input.overrideReason?.trim() || null,
   });

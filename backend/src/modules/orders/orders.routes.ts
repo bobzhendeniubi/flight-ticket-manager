@@ -2757,10 +2757,12 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     previewCancelLegHandler('RETURN'),
   );
 
-  // POST /orders/:id/cancel-leg  body: { requestToken, leg?, feeMode, manualFeeCny?, overrideReason?, note? }
-  //   执行取消航段：该段座位放回库存、订单变单程、手续费按取消政策（或带原因的手工覆盖）
-  //   落一条调价行。服务端权威定价：请求体不接受「应退多少」，本端点也不打款——
-  //   降完应收后的多收走既有多付/退款流程。幂等：同 (订单, requestToken) 重试只回放。
+  // POST /orders/:id/cancel-leg
+  //   body: { requestToken, leg?, feeMode, manualRefundCny?, manualFeeCny?, overrideReason?, note? }
+  //   执行取消航段：该段座位放回库存、订单变单程、手续费按取消政策（或带原因的手工填退款金额，
+  //   老字段 manualFeeCny 仍兼容）落一条调价行。服务端权威定价：退款金额不能把本单应收退成
+  //   负数，超出直接 400。本端点也不打款——降完应收后的多收走既有多付/退款流程。
+  //   幂等：同 (订单, requestToken) 重试只回放。
   const cancelLegHandler =
     (fixedLeg?: 'OUTBOUND' | 'RETURN') =>
     async (req: FastifyRequest, reply: FastifyReply) => {
@@ -2807,6 +2809,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
             workOrderReminderId: audit.workOrderReminderId,
             acknowledgedWarnings: body.acknowledgeWarnings === true,
             netReductionCny: audit.netReductionCny,
+            // 退给客人的金额，与 netReductionCny 同一个数（POLICY 档没有手动覆盖，
+            // 换个名字落痕方便直接按「退了多少钱」核对）。
+            refundCny: audit.netReductionCny,
             totalCny: audit.totalAfter,
             overpayAfterCny: audit.overpayAfterCny,
             replayed: audit.replayed,

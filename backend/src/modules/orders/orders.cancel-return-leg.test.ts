@@ -52,12 +52,19 @@ const TOKEN = '00000000-0000-4000-8000-0000000cafe1';
 // 取消航段的入参指纹（键排序后 JSON）。**写死字面量**，不从 service import 那个函数：
 // 它是落库的持久化契约，格式一改这里就该红，跟着实现走就永远测不出静默漂移。
 const cancelLegFp = (
-  over: Partial<{ leg: string; feeMode: string; manualFeeCny: number | null; overrideReason: string | null }> = {},
+  over: Partial<{
+    leg: string;
+    feeMode: string;
+    manualFeeCny: number | null;
+    manualRefundCny: number | null;
+    overrideReason: string | null;
+  }> = {},
 ): string =>
   JSON.stringify({
     feeMode: 'POLICY',
     leg: 'RETURN',
     manualFeeCny: null,
+    manualRefundCny: null,
     overrideReason: null,
     ...over,
   });
@@ -456,6 +463,8 @@ describe('取消回程 · POLICY 模式手续费', () => {
     });
     expect(preview.netReductionCny).toBe(2400);
     expect(preview.currentTotalCny).toBe(TOTAL_BEFORE);
+    // 手动填退款金额的上限 = min(回程行金额 3000, 本单当前应收 8000) = 3000
+    expect(preview.maxRefundCny).toBe(3000);
     // 已收 8000、取消后应收 5600 → 多收 2400（由既有多付/退款流程处置，本端点不打款）
     expect(preview.overpayAfterCny).toBe(2400);
     expect(preview.returnItem).toMatchObject({
@@ -512,6 +521,20 @@ describe('取消回程 · POLICY 模式手续费', () => {
     expect(tx.orderItem.create).not.toHaveBeenCalled();
     expect(audit.totalAfter).toBe(TOTAL_BEFORE - RET_AMOUNT);
   });
+
+  it('按政策退款会把应收打负 → 400，指路手动填退款金额（本单当前应收已被压得很低）', async () => {
+    // 本单当前应收（2000）小于回程行金额（3000）：政策报价再低也会把 total 打负。
+    const lowTotalSnapshot = orderSnapshot({
+      subtotal: new Prisma.Decimal(2000),
+      total: new Prisma.Decimal(2000),
+      paidAmount: new Prisma.Decimal(2000),
+    });
+    const tx = mountTx({ snapshot: lowTotalSnapshot });
+    await expect(service.cancelReturnLeg('ord-1', body(), ADMIN)).rejects.toBeInstanceOf(
+      BadRequestError,
+    );
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+  });
 });
 
 // ══════════════════════════════════════════════════════════════════════════
@@ -528,13 +551,23 @@ describe('取消回程 · MANUAL 手工覆盖', () => {
     expect(JSON.stringify(parsed)).toContain('必须填写原因');
   });
 
-  it('手工模式缺金额 → schema 拒收', () => {
+  it('手工模式缺金额（manualRefundCny 与老字段 manualFeeCny 都没给）→ schema 拒收', () => {
     const parsed = cancelReturnLegBodySchema.safeParse({
       requestToken: TOKEN,
       feeMode: 'MANUAL',
       overrideReason: '航司特批',
     });
     expect(parsed.success).toBe(false);
+  });
+
+  it('只给 manualRefundCny（不给老字段 manualFeeCny）→ schema 通过', () => {
+    const parsed = cancelReturnLegBodySchema.safeParse({
+      requestToken: TOKEN,
+      feeMode: 'MANUAL',
+      manualRefundCny: 0,
+      overrideReason: '客人已自行改乘其他航班',
+    });
+    expect(parsed.success).toBe(true);
   });
 
   it('手工金额超过回程行金额 → 400，且座位未被释放（整事务不成立）', async () => {
@@ -547,6 +580,69 @@ describe('取消回程 · MANUAL 手工覆盖', () => {
       ),
     ).rejects.toBeInstanceOf(BadRequestError);
     expect(tx.orderItem.update).not.toHaveBeenCalled();
+  });
+
+  it('退款金额 0 → 客人自弃不退不收，应收不变，手续费行 = 该段全额', async () => {
+    const tx = mountTx();
+    const { audit } = await service.cancelReturnLeg(
+      'ord-1',
+      body({ feeMode: 'MANUAL', manualRefundCny: 0, overrideReason: '客人已自行改乘其他航班' }),
+      ADMIN,
+    );
+    expect(audit.feeMode).toBe('MANUAL');
+    expect(audit.feeCny).toBe(RET_AMOUNT);
+    expect(audit.netReductionCny).toBe(0);
+    expect(audit.totalAfter).toBe(TOTAL_BEFORE);
+
+    const feeCall = tx.orderItem.create.mock.calls[0][0];
+    expect(feeCall.data.amount).toEqual(new Prisma.Decimal(RET_AMOUNT));
+
+    const snapshot = tx.orderItem.update.mock.calls[0][0].data.metadata.returnLegCancelled;
+    expect(snapshot.refundCny).toBe(0);
+    expect(snapshot.feeCny).toBe(RET_AMOUNT);
+  });
+
+  it('退款金额超过本单当前应收 → 400（不能把应收退成负数）', async () => {
+    // 本单当前应收（2000）小于回程行金额（3000）：退款上限被应收卡住，不是行金额。
+    const lowTotalSnapshot = orderSnapshot({
+      subtotal: new Prisma.Decimal(2000),
+      total: new Prisma.Decimal(2000),
+      paidAmount: new Prisma.Decimal(2000),
+    });
+    const tx = mountTx({ snapshot: lowTotalSnapshot });
+    await expect(
+      service.cancelReturnLeg(
+        'ord-1',
+        body({ feeMode: 'MANUAL', manualRefundCny: 2500, overrideReason: '航司特批' }),
+        ADMIN,
+      ),
+    ).rejects.toBeInstanceOf(BadRequestError);
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+  });
+
+  it('老字段 manualFeeCny 仍可用：未传 manualRefundCny 时按 legAmount − manualFeeCny 换算退款', async () => {
+    const tx = mountTx();
+    const { audit } = await service.cancelReturnLeg(
+      'ord-1',
+      body({ feeMode: 'MANUAL', manualFeeCny: 100, overrideReason: '航司特批' }),
+      ADMIN,
+    );
+    expect(audit.feeCny).toBe(100);
+    const snapshot = tx.orderItem.update.mock.calls[0][0].data.metadata.returnLegCancelled;
+    expect(snapshot.refundCny).toBe(RET_AMOUNT - 100);
+  });
+
+  it('manualRefundCny 与老字段 manualFeeCny 同时给出 → 以 manualRefundCny 为准', async () => {
+    const tx = mountTx();
+    const { audit } = await service.cancelReturnLeg(
+      'ord-1',
+      body({ feeMode: 'MANUAL', manualRefundCny: 500, manualFeeCny: 999, overrideReason: '航司特批' }),
+      ADMIN,
+    );
+    // 退款 500 → 手续费 3000-500=2500，不是老字段 manualFeeCny=999 对应的退款 2001
+    expect(audit.feeCny).toBe(RET_AMOUNT - 500);
+    const snapshot = tx.orderItem.update.mock.calls[0][0].data.metadata.returnLegCancelled;
+    expect(snapshot.refundCny).toBe(500);
   });
 
   it('正常手工覆盖：调价行按手工金额，原因只进快照不进行描述', async () => {

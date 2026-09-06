@@ -8866,8 +8866,9 @@ function RescheduleForm({
 }
 
 // ── 取消航段：被取消那一段的座位放回库存重新销售，本单变单程（取消回程→单去程、
-// 取消去程→单回程），手续费按取消政策算（运营可手动覆盖但须填覆盖原因）。
-// 打开即 preview：不合格列 blockers 且禁用确认；合格展示该航段/手续费/降额，
+// 取消去程→单回程），退款默认按取消政策算；运营也可手动填「退给客人多少钱」
+// （默认 0 = 客人自弃不退不收，应收不变），但须填覆盖原因。
+// 打开即 preview：不合格列 blockers 且禁用确认；合格展示该航段/退款/应收变化，
 // 确认前 useConfirm() 二次确认。────────────────────────────────────────────
 function CancelLegForm({
   orderId,
@@ -8893,7 +8894,9 @@ function CancelLegForm({
   /** 取消这一段后本单剩下的那一段（文案用）：取消回程→单去程，取消去程→单回程。 */
   const survivorZh = leg === 'OUTBOUND' ? '回程' : '去程';
   const [feeMode, setFeeMode] = useState<'POLICY' | 'MANUAL'>('POLICY');
-  const [manualFeeCny, setManualFeeCny] = useState<number | null>(null);
+  // 手动档权威字段（退款视角）：退给客人多少钱。默认 0 = 客人自弃不退不收，应收不变——
+  // 运营反馈里最常见的场景（客人自己改乘别的航班，钱不动，座位放回去卖）。
+  const [manualRefundCny, setManualRefundCny] = useState<number | null>(0);
   const [overrideReason, setOverrideReason] = useState('');
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -8947,33 +8950,40 @@ function CancelLegForm({
   const needsAck = Boolean(preview?.requiresAcknowledgement) || ackRequiredByServer;
   const policyFee = preview?.policyFee ?? null;
   const hasPolicyFee = policyFee != null;
-  // 本地估算展示用（权威数字来自提交后返回的 audit）：按当前选中的手续费口径重算降额/多付。
-  const effectiveFeeCny = feeMode === 'POLICY' ? policyFee?.feeAmountCny ?? 0 : manualFeeCny ?? 0;
-  const effectiveNetReduction = legItem ? legItem.amountCny - effectiveFeeCny : 0;
-  const projectedTotal = preview ? preview.currentTotalCny - effectiveNetReduction : null;
+  // 手动填退款金额的上限（后端算好给的：min(该航段行金额, 本单当前应收)）。
+  const maxRefundCny = preview?.maxRefundCny ?? 0;
+  // 本地估算展示用（权威数字来自提交后返回的 audit）：按当前选中的口径重算退款/多付。
+  // POLICY 档退款 = 该航段行金额 − 政策手续费；MANUAL 档退款就是运营填的那个数（默认 0）。
+  const effectiveRefundCny =
+    feeMode === 'POLICY'
+      ? legItem
+        ? legItem.amountCny - (policyFee?.feeAmountCny ?? 0)
+        : 0
+      : manualRefundCny ?? 0;
+  const projectedTotal = preview ? preview.currentTotalCny - effectiveRefundCny : null;
   const projectedOverpay =
     preview && projectedTotal != null ? Math.max(0, preview.paidAmountCny - projectedTotal) : 0;
-  // 应收变化那句话（确认弹窗与面板同一份文案）。
-  // 手续费恰好等于航段金额时降额为 0 ——「从 ¥X 降到 ¥X」读起来像出了 bug，直接说不变。
+  // 应收变化那句话（确认弹窗与面板同一份文案）：退款视角，不再提「手续费」——运营反馈里的
+  // 真实事故就是把「手续费填 0」读成「不用扣客人的钱」，结果应收被系统按「全额退」算掉了。
   const totalChangeSentence =
-    preview == null
+    preview == null || projectedTotal == null
       ? ''
-      : projectedTotal == null || projectedTotal === preview.currentTotalCny
-        ? `本单应收不变（航段金额与手续费相抵，仍为 ¥${preview.currentTotalCny.toLocaleString()}）`
-        : `本单应收将从 ¥${preview.currentTotalCny.toLocaleString()} 降到 ¥${projectedTotal.toLocaleString()}`;
-  const manualFeeInvalid =
+      : effectiveRefundCny === 0
+        ? `本单应收不变 ¥${preview.currentTotalCny.toLocaleString()}（不退款，座位放回可售）`
+        : `本单应收将从 ¥${preview.currentTotalCny.toLocaleString()} 降到 ¥${projectedTotal.toLocaleString()}（退 ¥${effectiveRefundCny.toLocaleString()}）`;
+  const manualRefundInvalid =
     feeMode === 'MANUAL' &&
-    (manualFeeCny == null ||
-      manualFeeCny < 0 ||
-      !Number.isInteger(manualFeeCny) ||
-      (legItem != null && manualFeeCny > legItem.amountCny) ||
+    (manualRefundCny == null ||
+      manualRefundCny < 0 ||
+      !Number.isInteger(manualRefundCny) ||
+      manualRefundCny > maxRefundCny ||
       !overrideReason.trim());
 
   const submit = async () => {
     if (!token || submitting || !preview?.eligible || !legItem || projectedTotal == null) return;
     setErr(null);
-    if (manualFeeInvalid) {
-      setErr(`请填写有效的手续费（整数、不超过${legZh}行金额）与覆盖原因`);
+    if (manualRefundInvalid) {
+      setErr(`请填写有效的退款金额（整数、0 ≤ 金额 ≤ ¥${maxRefundCny.toLocaleString()}）与覆盖原因`);
       return;
     }
     if (needsAck && !acknowledged) {
@@ -8982,7 +8992,7 @@ function CancelLegForm({
     }
     const confirmed = await confirm({
       title: `取消${legZh}（改单${survivorZh}）`,
-      body: `${legZh}座位将立即放回库存重新销售，本单变为单${survivorZh}，不可撤销。\n\n手续费 ¥${effectiveFeeCny.toLocaleString()}，${totalChangeSentence}。${
+      body: `${legZh}座位将立即放回库存重新销售，本单变为单${survivorZh}，不可撤销。\n\n${totalChangeSentence}。${
         projectedOverpay > 0
           ? `\n\n客户已多付 ¥${projectedOverpay.toLocaleString()}，确认后请到付款情况处理多收（转预存款/退款）。`
           : ''
@@ -8997,13 +9007,15 @@ function CancelLegForm({
         requestToken: requestTokenRef.current,
         leg,
         feeMode,
-        manualFeeCny: feeMode === 'MANUAL' ? manualFeeCny ?? undefined : undefined,
+        manualRefundCny: feeMode === 'MANUAL' ? manualRefundCny ?? undefined : undefined,
         overrideReason: feeMode === 'MANUAL' ? overrideReason.trim() : undefined,
         note: note.trim() || undefined,
         acknowledgeWarnings: needsAck ? true : undefined,
       });
       alert(
-        `已取消${legZh}，应收 ¥${res.audit.totalBefore.toLocaleString()} → ¥${res.audit.totalAfter.toLocaleString()}，手续费 ¥${res.audit.feeCny.toLocaleString()}` +
+        (res.audit.totalAfter === res.audit.totalBefore
+          ? `已取消${legZh}，不退款，本单应收不变 ¥${res.audit.totalAfter.toLocaleString()}，座位已放回可售`
+          : `已取消${legZh}，退 ¥${(res.audit.totalBefore - res.audit.totalAfter).toLocaleString()}，本单应收 ¥${res.audit.totalBefore.toLocaleString()} → ¥${res.audit.totalAfter.toLocaleString()}`) +
           (res.audit.workOrderReminderId ? '\n已给票务派工单（撤名单/退票）。' : ''),
       );
       onSaved(res.order);
@@ -9117,8 +9129,8 @@ function CancelLegForm({
               <span>
                 按取消政策
                 {hasPolicyFee
-                  ? ` ¥${policyFee!.feeAmountCny.toLocaleString()}（${policyFee!.policyName} · ${policyFee!.feePercent}% · 距起飞 ${Math.round(policyFee!.hoursLeft)} 小时）`
-                  : '（无适用政策，请手动填写）'}
+                  ? `：退 ¥${(legItem.amountCny - policyFee!.feeAmountCny).toLocaleString()}（${policyFee!.policyName} · 政策扣 ${policyFee!.feePercent}% · 距起飞 ${Math.round(policyFee!.hoursLeft)} 小时）`
+                  : '（无适用政策，请手动填退款金额）'}
               </span>
             </label>
             <label className="flex items-center gap-1.5">
@@ -9129,7 +9141,7 @@ function CancelLegForm({
                 disabled={submitting}
                 onChange={() => setFeeMode('MANUAL')}
               />
-              <span>手动填写</span>
+              <span>手动填退款金额</span>
             </label>
           </div>
 
@@ -9137,15 +9149,15 @@ function CancelLegForm({
             <div className="space-y-2 rounded border border-amber-200 bg-amber-50/60 p-2">
               <label className="block">
                 <span className="text-slate-500">
-                  手续费（¥，整数，≤ {legZh}行金额 ¥{legItem.amountCny.toLocaleString()}）
+                  退给客人的金额（¥，整数；0 = 客人自弃不退不收；最多 ¥{maxRefundCny.toLocaleString()}）
                 </span>
                 <NumberInput
-                  value={manualFeeCny}
-                  onChange={setManualFeeCny}
+                  value={manualRefundCny}
+                  onChange={setManualRefundCny}
                   integerOnly
-                  max={legItem.amountCny}
+                  max={maxRefundCny}
                   disabled={submitting}
-                  placeholder="请输入手续费金额"
+                  placeholder="0"
                   className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
                 />
               </label>
@@ -9156,7 +9168,7 @@ function CancelLegForm({
                   value={overrideReason}
                   onChange={(e) => setOverrideReason(e.target.value)}
                   disabled={submitting}
-                  placeholder="如：客户提前告知 / 特殊约定"
+                  placeholder="如：客人已自行出行，不退款 / 客户提前告知"
                 />
               </label>
             </div>
@@ -9173,7 +9185,7 @@ function CancelLegForm({
           </label>
 
           <div className="rounded bg-slate-50 px-2 py-1.5 text-slate-700">
-            {totalChangeSentence}（手续费 ¥{effectiveFeeCny.toLocaleString()}）
+            {totalChangeSentence}
             {projectedOverpay > 0 && (
               <div className="mt-1 text-amber-700">
                 客户已多付 ¥{projectedOverpay.toLocaleString()}，确认后请到付款情况处理多收（转预存款/退款）。
@@ -9190,7 +9202,7 @@ function CancelLegForm({
           className="flex-1 rounded bg-red-600 px-2 py-1.5 font-medium text-white disabled:opacity-50"
           onClick={submit}
           disabled={
-            submitting || previewLoading || !preview?.eligible || manualFeeInvalid || (needsAck && !acknowledged)
+            submitting || previewLoading || !preview?.eligible || manualRefundInvalid || (needsAck && !acknowledged)
           }
         >
           {submitting ? '提交中…' : `确认取消${legZh}`}

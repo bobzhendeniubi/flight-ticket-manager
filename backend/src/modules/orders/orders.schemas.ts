@@ -1606,11 +1606,18 @@ export type SplitOrderBody = z.infer<typeof splitOrderBodySchema>;
 //   leg=OUTBOUND 取消去程，保留回程 → 单回程单（客人去程 noshow、只留回程的场景）。
 // leg 缺省为 RETURN：老前端与老调用方不带该字段时行为完全不变。
 //
-// 金额口径（服务端权威定价，请求体不接受任何「应退多少」）：
+// 金额口径（服务端权威定价，请求体除下面这两个手动档字段外不接受任何金额）：
 //   feeMode=POLICY  → 手续费由服务端按取消政策对**被取消那一行**报价，请求体不带金额；
-//   feeMode=MANUAL  → 运营手工覆盖，必须同时给出金额与原因（原因进审计与调价行文案）。
-// 上限：手工金额 ≤ 被取消航段行金额（由 service 校验，schema 只管格式与调价行通用上限）。
-// 退多少钱不由本端点决定：它只把应收降下来，多收部分走既有多收/退款流程。
+//   feeMode=MANUAL  → 运营手工填「退给客人多少钱」（退款视角，manualRefundCny），
+//                     必须同时给出原因（原因进审计与调价行文案）。默认口径 0 = 客人自弃、
+//                     不退不收，应收不变——运营反馈里最常见的场景（客人自己改乘别的航班，
+//                     钱不动，座位放回去卖），不用先补收杂费再倒算手续费。
+//                     `manualFeeCny`（要扣留不退的手续费）保留向后兼容老标签页；两个字段
+//                     都给时以 manualRefundCny 为准，二选一必填其一。
+// 上限：0 ≤ manualRefundCny ≤ min(被取消航段行金额, 本单当前应收)（由 service 校验，
+// 超出直接 400 并说明「退款不能超过本单当前应收 ¥X」；schema 只管格式与调价行通用上限）。
+// POLICY 档同样受这条闸约束：极端场景下按政策算出的退款超过当前应收时一律 400，
+// 提示改走手动填退款金额。
 // requestToken 为幂等键：同 (订单, token) 重试只回放既有结果，绝不二次放座、二次收手续费。
 export const flightLegSideSchema = z.enum(['OUTBOUND', 'RETURN']);
 export type FlightLegSide = z.infer<typeof flightLegSideSchema>;
@@ -1626,6 +1633,15 @@ export const cancelLegBodySchema = z
     requestToken: z.string().min(8).max(64).uuid(),
     leg: flightLegSideSchema.default('RETURN'),
     feeMode: z.enum(['POLICY', 'MANUAL']),
+    // 手动档权威字段（退款视角）：退给客人多少钱。默认 0 = 客人自弃，不退不收，应收不变。
+    // 上限（≤ 该航段行金额 且 ≤ 本单当前应收）由 service 校验；schema 只管格式。
+    manualRefundCny: z
+      .number()
+      .int('退款金额必须为整数（CNY）')
+      .min(0, '退款金额不能为负')
+      .max(PRICE_ADJUSTMENT_CAP_CNY, `退款金额超出上限（${PRICE_ADJUSTMENT_CAP_CNY}）`)
+      .optional(),
+    /** @deprecated 改用 manualRefundCny（退款视角）；仅为老标签页保留。两者都给时以 manualRefundCny 为准。 */
     manualFeeCny: z
       .number()
       .int('手续费必须为整数（CNY）')
@@ -1639,12 +1655,12 @@ export const cancelLegBodySchema = z
     // ACKNOWLEDGEMENT_REQUIRED，绝不静默放行（已出票的段被取消是需要票务善后的动作）。
     acknowledgeWarnings: z.boolean().optional(),
   })
-  .refine((v) => v.feeMode !== 'MANUAL' || v.manualFeeCny != null, {
-    message: '手工指定手续费时必须填写金额（整数 CNY，可为 0）',
-    path: ['manualFeeCny'],
+  .refine((v) => v.feeMode !== 'MANUAL' || v.manualRefundCny != null || v.manualFeeCny != null, {
+    message: '手动填写时必须填写退给客人的金额（整数 CNY，可为 0）',
+    path: ['manualRefundCny'],
   })
   .refine((v) => v.feeMode !== 'MANUAL' || Boolean(v.overrideReason?.trim()), {
-    message: '手工覆盖取消政策手续费时必须填写原因',
+    message: '手动填写覆盖取消政策手续费时必须填写原因',
     path: ['overrideReason'],
   });
 export type CancelLegBody = z.infer<typeof cancelLegBodySchema>;

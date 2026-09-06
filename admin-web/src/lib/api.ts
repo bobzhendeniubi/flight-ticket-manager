@@ -3886,6 +3886,8 @@ export interface CancelLegPreview {
   } | null;
   /** 本单应收降幅 = 该航段行金额 − 手续费 */
   netReductionCny: number;
+  /** 手动填退款金额的上限 = min(该航段行金额, 本单当前应收)；前端据此给输入框设上限提示。 */
+  maxRefundCny: number;
   currentTotalCny: number;
   paidAmountCny: number;
   /** > 0 = 应收降低后客户已多付这么多，需要到付款情况处理多收（转预存款/退款） */
@@ -5120,9 +5122,9 @@ export const api = {
       body: { leg },
     }),
   // 取消航段提交：该段座位放回库存重新销售，订单变单程（取消回程→单去程，取消去程→单回程）。
-  // 手续费默认按取消政策自动算（feeMode:'POLICY'），运营也可手动覆盖（feeMode:'MANUAL' +
-  // manualFeeCny + 必填 overrideReason）。requestToken 幂等键（crypto.randomUUID，
-  // 同一次表单提交内复用同一个 token）。
+  // 退款默认按取消政策自动算（feeMode:'POLICY'），运营也可手动填「退给客人多少钱」
+  // （feeMode:'MANUAL' + manualRefundCny + 必填 overrideReason；0 = 客人自弃不退不收）。
+  // requestToken 幂等键（crypto.randomUUID，同一次表单提交内复用同一个 token）。
   cancelLeg: (
     token: string,
     orderId: string,
@@ -5130,6 +5132,9 @@ export const api = {
       requestToken: string;
       leg: FlightLegSide;
       feeMode: 'POLICY' | 'MANUAL';
+      /** 手动档权威字段（退款视角）：退给客人多少钱，整数 CNY，0 = 客人自弃不退不收。 */
+      manualRefundCny?: number;
+      /** @deprecated 改用 manualRefundCny；仅为老标签页兼容保留。 */
       manualFeeCny?: number;
       overrideReason?: string;
       note?: string;
