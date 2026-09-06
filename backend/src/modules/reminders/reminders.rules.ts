@@ -38,10 +38,14 @@ import {
   ReminderStatus,
   HoldOrderStatus,
   HoldInstallmentStatus,
-  VisaSubmissionStatus,
   type PrismaClient,
 } from '@prisma/client';
 import { businessDateISO } from '../../lib/business-time.js';
+// 「我方要送签的人」/「我方要送签且还没送出去的人」的圈定条件与签证台共用状态机模块的同一份。
+import {
+  ourUnsubmittedVisaPassengersWhere,
+  ourVisaPassengersWhere,
+} from '../fulfillment/visa-state.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { RANDOM_TIER_LEGACY_CITY_CODE } from '../hotel-control/hotel-city.js';
 import {
@@ -843,10 +847,11 @@ export async function generateRuleReminders(
                   },
                 },
                 // 只取缺照片乘客的姓名；护照大图（base64 可达数 MB）绝不拉到应用层。
-                // 自备签证乘客（visaExempt=true）不催缺件——与签证台同口径（见 fulfillment.service.ts listByOrder）。
+                // 自备签证乘客（visaExempt=true）不催缺件——「我方的人」圈定与签证台共用状态机的同一份
+                // （ourVisaPassengersWhere）；缺件本身由 passportPhotoUrl 单独判定（不改签证状态）。
                 passengers: {
                   where: {
-                    visaExempt: false,
+                    ...ourVisaPassengersWhere(),
                     OR: [{ passportPhotoUrl: null }, { passportPhotoUrl: '' }],
                   },
                   select: { fullName: true },
@@ -1038,11 +1043,11 @@ export async function generateRuleReminders(
     }
   ).passenger;
   if (passengerDelegate && visaOrderById.size > 0) {
+    // 「我方要送签且还没送出去的人」= 状态机派生态 ∉ {SUBMITTED} 且非自备签，圈定条件用同一份。
     const pendingPax = await passengerDelegate.findMany({
       where: {
         orderId: { in: [...visaOrderById.keys()] },
-        visaExempt: false,
-        visaSubmissionStatus: { not: VisaSubmissionStatus.CONFIRMED },
+        ...ourUnsubmittedVisaPassengersWhere(),
       },
       select: { orderId: true, fullName: true },
     });

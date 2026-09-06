@@ -13,10 +13,14 @@
 import ExcelJS from 'exceljs';
 import { localDateISO } from '../../lib/flight-time.js';
 import { businessDateISO, businessDateTimeSec } from '../../lib/business-time.js';
-import type { Prisma, PrismaClient, VisaRequirement } from '@prisma/client';
+import type { Prisma, PrismaClient, VisaRequirement, VisaSubmissionStatus } from '@prisma/client';
 import { OrderItemKind, OrderStatus } from '@prisma/client';
+// 「签证状态」列按人取值 = 状态机派生态 → 导出文案；「全员自备签」也用状态机的同一份判定。
+import {
+  allPassengersVisaExempt as allPassengersVisaExemptState,
+  derivePassengerVisaState,
+} from '../fulfillment/visa-state.js';
 // 订单级「明确不需要我方代办（NOT_NEEDED / HAS_VISA）」的唯一判定口径，与建签证任务共用。
-import { orderVisaStatusExplicitlyNotNeeded } from './visa-need.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 // 「结算价格」按人取值的权威口径：每人份额端口（详见 perPaxSettlementByPassenger）。
 import { computePerPaxShares, spreadableAdjustmentCny } from './per-pax-share.js';
@@ -244,26 +248,34 @@ export function passengerVisaStatusCell(input: {
    */
   allPassengersExempt?: boolean;
 }): string {
-  // 1. 签证台逐人推进的进度（PENDING 不算推进）
+  // 上面四档判定顺序就是状态机 derivePassengerVisaState 的派生优先级（逐人进度 > NOT_NEEDED >
+  // HAS_VISA 混合/全员 > 自备签 > 待处理），这里只做「派生态 → 导出文案」的映射：
+  //   IN_PROGRESS / SUBMITTED → 签证台同一份进度文案；SELF_ARRANGED → 「自备签」；
+  //   NOT_NEEDED / ISSUED / PENDING → 订单级文案（不需要 / 已签证 / 需要·电子签·履约任务回落）。
   const submission = input.passenger.visaSubmissionStatus;
-  if (submission && submission !== 'PENDING') {
-    return VISA_SUBMISSION_LABEL[submission] ?? input.orderVisaLabel;
-  }
-  // 2/3. 订单头明确「不需要 / 已签证」—— 与签证任务判定同一个口径函数
-  if (orderVisaStatusExplicitlyNotNeeded(input.orderVisaStatus)) {
-    // 3. 已签证 + 混合单：这批 visaExempt 是逐人手勾的，不是联动置的，照实写「自备签」
-    if (
-      input.orderVisaStatus === 'HAS_VISA' &&
-      input.passenger.visaExempt === true &&
-      input.allPassengersExempt === false
-    ) {
-      return VISA_EXEMPT_LABEL;
-    }
+  // 老数据 / 非三档字符串（非空且非 PENDING）：沿用现状回落订单级文案，不交给派生猜。
+  if (submission && submission !== 'PENDING' && !(submission in VISA_SUBMISSION_LABEL)) {
     return input.orderVisaLabel;
   }
-  // 4. 逐人手勾的自备签（此时订单头是 NEEDED/E_VISA/未表态，不存在联动批量置的情况）
-  if (input.passenger.visaExempt === true) return VISA_EXEMPT_LABEL;
-  return input.orderVisaLabel;
+  const state = derivePassengerVisaState({
+    orderVisaStatus: input.orderVisaStatus,
+    visaExempt: input.passenger.visaExempt,
+    visaSubmissionStatus: (submission ?? null) as VisaSubmissionStatus | null,
+    // 缺省 / true = 视作录单联动全员置上（跟订单头写「已签证」）；false = 混合单。
+    allPassengersExempt: input.allPassengersExempt !== false,
+  });
+  switch (state) {
+    case 'IN_PROGRESS':
+      return VISA_SUBMISSION_LABEL.IN_PROGRESS;
+    case 'SUBMITTED':
+      return VISA_SUBMISSION_LABEL.CONFIRMED;
+    case 'SELF_ARRANGED':
+      return VISA_EXEMPT_LABEL;
+    case 'NOT_NEEDED':
+    case 'ISSUED':
+    case 'PENDING':
+      return input.orderVisaLabel;
+  }
 }
 
 /**
@@ -274,7 +286,7 @@ export function passengerVisaStatusCell(input: {
 export function allPassengersVisaExempt(
   passengers: ReadonlyArray<{ visaExempt?: boolean | null }>,
 ): boolean {
-  return passengers.length > 0 && passengers.every((p) => p.visaExempt === true);
+  return allPassengersVisaExemptState(passengers);
 }
 
 /**

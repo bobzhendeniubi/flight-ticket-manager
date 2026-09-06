@@ -33,6 +33,7 @@ import { syncOrderVisaCompletion, type VisaCompletionOutcome } from './visa-comp
 import {
   asVisaSubmissionStatus,
   DERIVABLE_TASK_STATUSES,
+  derivePassengerVisaState,
   isVisaSubmissionStatus,
   ourVisaPassengersWhere,
   rederiveVisaTaskStatus,
@@ -709,13 +710,21 @@ export class FulfillmentService {
             _count: { _all: true },
           })
         : [];
-      const countOf = (s: VisaSubmissionStatus) =>
-        grouped.find((g) => g.visaSubmissionStatus === s)?._count._all ?? 0;
-      passengerStats = {
-        pending: countOf(VisaSubmissionStatus.PENDING),
-        inProgress: countOf(VisaSubmissionStatus.IN_PROGRESS),
-        confirmed: countOf(VisaSubmissionStatus.CONFIRMED),
-      };
+      // 三个数按**派生态**归桶（PENDING→待送 / IN_PROGRESS→材料准备 / SUBMITTED→已送）：圈定的都是
+      // 我方的人（visaExempt=false），订单头对派生不起作用，故只喂送签进度；数字与按列计数恒等。
+      passengerStats = { pending: 0, inProgress: 0, confirmed: 0 };
+      for (const g of grouped) {
+        const state = derivePassengerVisaState({
+          orderVisaStatus: null,
+          visaExempt: false,
+          visaSubmissionStatus: g.visaSubmissionStatus,
+          allPassengersExempt: false,
+        });
+        const n = g._count._all;
+        if (state === 'SUBMITTED') passengerStats.confirmed += n;
+        else if (state === 'IN_PROGRESS') passengerStats.inProgress += n;
+        else passengerStats.pending += n;
+      }
     }
 
     return {
