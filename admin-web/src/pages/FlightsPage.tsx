@@ -8,6 +8,7 @@ import { Icon } from '../components/Icon';
 import { formatDateTimeCn } from '../lib/datetime';
 import { useConfirm } from '../components/ConfirmDialog';
 import { useDialogA11y } from '../components/Modal';
+import { useCapabilities } from '../hooks/useCapabilities';
 
 interface ScheduleSeat {
   id: string;
@@ -36,7 +37,7 @@ interface AdminSchedule {
 
 export function FlightsPage() {
   const tokens = useAuth((s) => s.tokens);
-  const user = useAuth((s) => s.user);
+  const { can, ready: capsReady } = useCapabilities();
   const seatsVersion = useFlightSeats((s) => s.seatsVersion);
   const bumpSeats = useFlightSeats((s) => s.bumpSeats);
 
@@ -118,17 +119,15 @@ export function FlightsPage() {
     }
   };
 
-  if (user?.role !== 'ADMIN' && user?.role !== 'STAFF') {
+  if (capsReady && !can('flights.admin_view')) {
     return <div className="card text-ink-soft">仅管理员/运营可访问此页面。</div>;
   }
 
-  // 航班维护岗 = ADMIN，或 STAFF 里的「运营（未设岗）/ 票务岗」：建航班、加班次、改班次归他们。
-  // 与后端 flights.routes.ts 的 requireFlightMaintenance 同口径。
-  // 登录瞬间 staffRole 可能还没回来（等 /users/me）：此时按放行渲染，数据保护由后端闸兜底——
-  // 与 App.tsx 里 financeRole 的判定同一取舍，避免误伤刷新 / 首登场景。
-  const canManageFlights =
-    user.role === 'ADMIN' ||
-    (user.role === 'STAFF' && (user.staffRole == null || user.staffRole === 'TICKETING'));
+  // 航班维护岗 = 能力 flights.maintain（ADMIN，或 STAFF 里的「运营（未设岗）/ 票务岗」）：
+  // 建航班、加班次、改班次归他们。与后端 flights.routes.ts 挂的是同一条能力。
+  // 登录瞬间能力清单可能还没回来（等 /users/me）：此时按放行渲染，数据保护由后端闸兜底——
+  // 与 App.tsx 里路由守卫的取舍一致，避免误伤刷新 / 首登场景。
+  const canManageFlights = !capsReady || can('flights.maintain');
 
   if (error) {
     return <div className="card border-rose-200 bg-rose-50 text-rose-700">{error}</div>;
@@ -211,8 +210,8 @@ export function FlightsPage() {
                     </button>
                   </>
                 )}
-                {/* 删除不可恢复、升舱差价与整线停售影响整条航线 —— 这三件仅 ADMIN */}
-                {user.role === 'ADMIN' && (
+                {/* 删除不可恢复、升舱差价与整线停售影响整条航线 —— 这三件走 flights.dangerous */}
+                {can('flights.dangerous') && (
                   <>
                     <button
                       type="button"
@@ -1265,7 +1264,7 @@ function DaySchedule({
 }) {
   const tokens = useAuth((s) => s.tokens);
   // 删除班次不可恢复，与「批量删除班次」同口径 —— 仅 ADMIN；其余编辑动作跟随 canEdit（航班维护岗）。
-  const isAdmin = useAuth((s) => s.user?.role === 'ADMIN');
+  const isAdmin = useCapabilities().can('flights.dangerous');
   const confirm = useConfirm();
   const highRiskConfirmRef = useRef(false);
   const econ = getCabin(schedule, 'ECONOMY');
@@ -2045,7 +2044,7 @@ function BulkEditPanel({
   const tokens = useAuth((s) => s.tokens);
   // 批量改容量爆炸半径大（一次能把整月班次改成超售），后端仍限 ADMIN —— 非 ADMIN 不给这个选项，
   // 免得选了才吃 403。单班次改容量在 DaySchedule 里，航班维护岗照旧可改。
-  const isAdmin = useAuth((s) => s.user?.role === 'ADMIN');
+  const isAdmin = useCapabilities().can('flights.dangerous');
   const askConfirm = useConfirm();
   const highRiskConfirmRef = useRef(false);
 

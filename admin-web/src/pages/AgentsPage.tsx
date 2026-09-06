@@ -9,6 +9,7 @@ import { api, ApiError, ROSTER_FORMAT_LABEL, SETTLEMENT_MODE_LABEL, type AgentLi
 import { useAuth } from '../stores/auth';
 import { Icon } from '../components/Icon';
 import { useDialogA11y } from '../components/Modal';
+import { useCapabilities } from '../hooks/useCapabilities';
 
 const TIER_LABEL = ['', '1级·总代', '2级·区代', '3级·门店', '4级', '5级'];
 const TIER_COLOR = ['', 'bg-red-100 text-red-700', 'bg-amber-100 text-amber-700', 'bg-blue-100 text-blue-700', 'bg-slate-100 text-slate-600', 'bg-slate-100 text-slate-600'];
@@ -26,9 +27,9 @@ export function AgentsPage() {
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
   const isAdmin = user?.role === 'ADMIN' || user?.role === 'STAFF';
-  // 重置代理登录密码是敏感操作，只放给 ADMIN——STAFF 仍可看/改代理资料，但不给重置密码入口。
-  // 内部员工（ADMIN/STAFF）都可帮代理重置密码；后端限定 STAFF 只能重置 AGENT 账号
-  const canResetAgentPassword = user?.role === 'ADMIN' || user?.role === 'STAFF';
+  // 重置代理登录密码：内部员工（ADMIN/STAFF）都可帮代理重置；后端限定 STAFF 只能重置 AGENT 账号
+  // —— 重置内部同事的密码是另一条能力（users.reset_staff_password，仅管理员）。
+  const canResetAgentPassword = useCapabilities().can('users.reset_agent_password');
 
   const [agents, setAgents] = useState<AgentListItem[] | null>(null);
   const [agentsLoaded, setAgentsLoaded] = useState(false);
@@ -1037,14 +1038,12 @@ const emptyCommissionDraft = (): Record<CommissionTabKind, string> =>
 function CommissionTab({ agent }: { agent: AgentListItem }) {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
-  const role = useAuth((s) => s.user?.role);
   // 返佣费率写权限：ADMIN 与内部岗位（STAFF）都可维护——返佣口径归财务，每次都绕管理员配
-  // 会让费率永远配不齐。⚠️ AGENT 是能打开本页签的（/agents 在 App.tsx 的
-  // AGENT_ALLOWED_PATHS 里，代理详情抽屉的「佣金规则」tab 本身没有额外角色门），
-  // 只是 canEdit 落到只读态——AGENT 查看自己/下级的费率是只读展示，不是没入口。
-  // 与后端 PUT /agents/:id/commission-rules 的 requireRole(ADMIN, STAFF) 必须保持同步：
+  // 会让费率永远配不齐。⚠️ AGENT 是能打开本页签的（/agents 在 App.tsx 的 AGENT_ALLOWED_PATHS 里，
+  // 代理详情抽屉的「佣金规则」tab 本身没有额外角色门），只是 canEdit 落到只读态。
+  // 与后端 PUT /agents/:id/commission-rules 挂的是同一条能力：
   // 只放后端不放前端，页面仍渲染只读态，使用者看到的就是「没有权限」（立减规则那次的教训）。
-  const canEdit = role === 'ADMIN' || role === 'STAFF';
+  const canEdit = useCapabilities().can('agents.commission_rules.manage');
   type Kind = CommissionTabKind;
   const KINDS = COMMISSION_KINDS;
 
