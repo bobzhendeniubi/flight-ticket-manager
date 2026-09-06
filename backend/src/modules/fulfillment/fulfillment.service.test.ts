@@ -243,6 +243,77 @@ describe('FulfillmentService.update — 退款申请中禁止确认履约', () =
   });
 });
 
+describe('FulfillmentService.update — 非 CONFIRMED 状态流转同样需要 CAS（C-18）', () => {
+  /** 装一个非 CONFIRMED 流转场景：existing 首次读到旧快照，updateMany 之后 findUnique 再读一次落库结果 */
+  function stubTask(opts: { updateManyCount: number }) {
+    const existing = {
+      id: 't1',
+      type: FulfillmentType.HOTEL_BOOKING,
+      status: FulfillmentStatus.PENDING,
+      orderItem: {
+        orderId: 'o1',
+        order: { status: OrderStatus.PAID, deletedAt: null },
+      },
+    };
+    const refetched = {
+      id: 't1',
+      orderItemId: 'oi1',
+      type: FulfillmentType.HOTEL_BOOKING,
+      status: FulfillmentStatus.CANCELLED,
+      data: null,
+      notes: null,
+      attempts: 0,
+      scheduledAt: null,
+      startedAt: null,
+      completedAt: new Date(),
+      failureReason: null,
+      assigneeUserId: null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      orderItem: {
+        id: 'oi1',
+        kind: 'HOTEL',
+        description: '酒店',
+        quantity: 1,
+        orderId: 'o1',
+        order: { id: 'o1', orderNumber: 'A001' },
+      },
+    };
+    const findUnique = vi.fn().mockResolvedValueOnce(existing).mockResolvedValue(refetched);
+    const updateMany = vi.fn().mockResolvedValue({ count: opts.updateManyCount });
+    const update = vi.fn();
+    (prisma as unknown as { fulfillmentTask: unknown }).fulfillmentTask = {
+      findUnique,
+      updateMany,
+      update,
+    };
+    return { findUnique, updateMany, update };
+  }
+
+  it('取消/失败等非 CONFIRMED 流转走条件更新（where 带旧 status），不再用裸 update 覆盖', async () => {
+    const { updateMany, update } = stubTask({ updateManyCount: 1 });
+    const service = new FulfillmentService();
+
+    await service.update('t1', { status: FulfillmentStatus.CANCELLED });
+
+    expect(updateMany).toHaveBeenCalledWith({
+      where: { id: 't1', status: FulfillmentStatus.PENDING },
+      data: expect.objectContaining({ status: FulfillmentStatus.CANCELLED }),
+    });
+    // 不再直接裸 update：并发场景下裸 update 会无条件覆盖别人刚写入的结果
+    expect(update).not.toHaveBeenCalled();
+  });
+
+  it('并发下条件更新影响 0 行（状态已被别的操作抢先改写）→ 409 ConflictError，不覆盖', async () => {
+    const { updateMany } = stubTask({ updateManyCount: 0 });
+    const service = new FulfillmentService();
+
+    await expect(service.update('t1', { status: FulfillmentStatus.FAILED })).rejects.toBeInstanceOf(
+      ConflictError,
+    );
+  });
+});
+
 describe('FulfillmentService.update — 签证公司（visaSupplier）持久化', () => {
   /** 装一个签证任务的 prisma stub，返回 update() 的调用记录 */
   function stubVisaTask(type = 'VISA_APPLICATION') {

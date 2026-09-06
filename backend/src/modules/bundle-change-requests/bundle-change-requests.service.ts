@@ -3,7 +3,7 @@
  *
  * 提交 / 驳回只改申请表；真正会改套餐行、住宿和订单金额的动作只发生在 approve()。
  */
-import { BundleChangeRequestStatus, OrderStatus, Prisma, UserRole } from '@prisma/client';
+import { BundleChangeRequestStatus, OrderItemKind, OrderStatus, Prisma, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import { getDescendantAgentIds } from '../../lib/agent-tree.js';
@@ -24,6 +24,12 @@ export const BUNDLE_CHANGE_REQUEST_REASON_TEXT = '代理改档申请（运营确
 export const APPROVE_CLAIM_TTL_MS = 2 * 60 * 1000;
 export const BUNDLE_CHANGE_NIGHTS_WARNING =
   '目标套餐晚数与原套餐不同：酒店离店日已按新晚数重算，但回程航班不会自动改，请到回程航段行另行改期';
+/**
+ * C-28：changeOrderBundle 已经成功把订单改成目标套餐、但收尾回写申请状态那一步中途
+ * 挂掉（进程被杀/连接断开）时的兜底提示——订单侧的改动已经生效，不会因为这条提示重来一遍。
+ */
+export const BUNDLE_CHANGE_ALREADY_APPLIED_NOTE =
+  '本次未重复执行改档：订单当前套餐已是目标套餐（大概率是上一次确认已经执行成功，只是回写申请状态那一步中途失败），本次仅补记申请状态';
 
 export interface BundleChangeRequestActor {
   userId: string;
@@ -335,26 +341,54 @@ export class BundleChangeRequestsService {
       };
     });
 
-    let applied: Awaited<ReturnType<OrderService['changeOrderBundle']>>;
-    try {
-      applied = await this.orders.changeOrderBundle(
-        claim.orderId,
-        {
-          bundleId: claim.toBundleId,
-          note: `${BUNDLE_CHANGE_REQUEST_REASON_TEXT}${claim.note ? `：${claim.note}` : ''}`,
-        },
-        actor,
-      );
-    } catch (err) {
-      // 改档没落地 → 撤掉处理中标记，申请原样留在队列里（状态一直是 PENDING，不存在撞唯一索引的问题）。
-      await prisma.bundleChangeRequest.updateMany({
-        where: { id, status: BundleChangeRequestStatus.PENDING, appliedAt: null },
-        data: { decidedById: null, decidedAt: null, decisionNote: null },
-      });
-      throw err;
+    // ── 幂等（C-28）：订单当前套餐是不是已经等于目标套餐 ────────────────────────
+    // 成因与 order-change-requests 的 detectAlreadyApplied 同一类：changeOrderBundle
+    // 上次可能已经执行成功，只是紧接着回写申请状态那一步中途挂掉（进程被杀/连接断开）——
+    // 申请仍卡在 PENDING，占位过期后允许重试。不判断的话，重试会直接撞上
+    // resolveChangeableBundleRow「目标套餐与当前套餐相同」的拒绝，这条申请永远确认不掉，
+    // 驳回也驳不掉（订单侧其实已经真的改过了）。
+    const bundleItem = await prisma.orderItem.findFirst({
+      where: { orderId: claim.orderId, kind: OrderItemKind.BUNDLE },
+      select: { id: true, bundleId: true },
+    });
+    const alreadyApplied = bundleItem?.bundleId === claim.toBundleId;
+
+    let applied: Awaited<ReturnType<OrderService['changeOrderBundle']>> | null = null;
+    if (!alreadyApplied) {
+      try {
+        applied = await this.orders.changeOrderBundle(
+          claim.orderId,
+          {
+            bundleId: claim.toBundleId,
+            note: `${BUNDLE_CHANGE_REQUEST_REASON_TEXT}${claim.note ? `：${claim.note}` : ''}`,
+          },
+          actor,
+        );
+      } catch (err) {
+        // 改档没落地 → 撤掉处理中标记，申请原样留在队列里（状态一直是 PENDING，不存在撞唯一索引的问题）。
+        await prisma.bundleChangeRequest.updateMany({
+          where: { id, status: BundleChangeRequestStatus.PENDING, appliedAt: null },
+          data: { decidedById: null, decidedAt: null, decisionNote: null },
+        });
+        throw err;
+      }
     }
 
-    const changeAudit = applied.audit;
+    // 幂等分支没有真的调用 changeOrderBundle、拿不到真实 diff——不编造数字，
+    // 用 0 与专门的提示说明这次只是补记状态，让运营看得出这条与正常执行分支不一样。
+    const changeAudit = applied
+      ? applied.audit
+      : {
+          orderNumber: claim.orderNumber,
+          orderItemId: bundleItem?.id ?? '',
+          before: { bundleId: claim.toBundleId },
+          after: { bundleId: claim.toBundleId },
+          diffCny: 0,
+          diffItemId: null as string | null,
+          pricingSource: 'BUNDLE_PRICE' as const,
+          note: BUNDLE_CHANGE_ALREADY_APPLIED_NOTE,
+          warnings: [BUNDLE_CHANGE_ALREADY_APPLIED_NOTE],
+        };
     const warnings = [...changeAudit.warnings];
     if (claim.nightsChanged) warnings.push(BUNDLE_CHANGE_NIGHTS_WARNING);
     await prisma.bundleChangeRequest.update({
@@ -373,7 +407,9 @@ export class BundleChangeRequestsService {
     });
     return {
       request: serializeBundleChangeRequest(finalRow as BundleChangeRequestRow),
-      order: applied.order,
+      order: applied
+        ? applied.order
+        : await this.orders.getOrder(claim.orderId, { userId: actor.userId, role: actor.role }),
       diffCny: changeAudit.diffCny,
       warnings,
       changeAudit,

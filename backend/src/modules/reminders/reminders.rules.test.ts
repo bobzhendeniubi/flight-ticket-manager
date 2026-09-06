@@ -8,7 +8,7 @@
  *   4. ruleKey 幂等：generateRuleReminders 跑两遍，第二遍 created = 0
  */
 import { describe, it, expect, vi } from 'vitest';
-import { OrderStatus, Prisma, ReminderPriority, type PrismaClient } from '@prisma/client';
+import { OrderStatus, Prisma, ReminderPriority, ReminderStatus, type PrismaClient } from '@prisma/client';
 import {
   addDaysUtc,
   addMonthsUtc,
@@ -736,6 +736,184 @@ describe('RECEIPT_UNVERIFIED 到账核实提醒规则', () => {
 
   it('挂账不足 2 天 → 不触发（给财务留正常处理时间）', () => {
     expect(buildReceiptVerifyCandidates(receipt('2026-07-08T04:00:00Z'), TODAY)).toEqual([]);
+  });
+});
+
+// ── B-14 / C-7-4：触发条件消失后自动核销存量提醒 ────────────────────────────
+describe('generateRuleReminders — 触发条件消失后自动核销（B-14/C-7-4）', () => {
+  const NOW2 = new Date('2026-07-09T06:00:00Z');
+  const departSoon2 = addDaysUtc(businessDateISO(NOW2), 2);
+
+  /** ruleKey → 行状态（模拟 OperationalReminder 唯一索引 + status 列，支持按 id 关闭）。 */
+  function makeMockPrisma(
+    order: Record<string, unknown> | null,
+    preexisting: Array<{ id: string; ruleKey: string; status: ReminderStatus }>,
+  ) {
+    const rows = new Map(preexisting.map((r) => [r.id, { ...r }]));
+    const mock = {
+      order: { findMany: vi.fn(async () => (order ? [order] : [])) },
+      fulfillmentTask: { findMany: vi.fn(async () => []) },
+      holdOrder: { findMany: vi.fn(async () => []) },
+      operationalReminder: {
+        findMany: vi.fn(
+          async (args: {
+            where: { ruleKey?: { in: string[] }; status?: { in: ReminderStatus[] } };
+          }) => {
+            const ruleKeyIn = args.where.ruleKey?.in ?? [];
+            const statusIn = args.where.status?.in;
+            return [...rows.values()].filter(
+              (r) => ruleKeyIn.includes(r.ruleKey) && (!statusIn || statusIn.includes(r.status)),
+            );
+          },
+        ),
+        createMany: vi.fn(async () => ({ count: 0 })),
+        updateMany: vi.fn(
+          async (args: {
+            where: { id: { in: string[] } };
+            data: { status: ReminderStatus; resolvedNote?: string };
+          }) => {
+            let count = 0;
+            for (const id of args.where.id.in) {
+              const row = rows.get(id);
+              if (row) {
+                row.status = args.data.status;
+                count += 1;
+              }
+            }
+            return { count };
+          },
+        ),
+      },
+    };
+    return { mock: mock as unknown as PrismaClient, raw: mock, rows };
+  }
+
+  function baseOrder(overrides: Record<string, unknown>) {
+    return {
+      id: 'ord_x',
+      orderNumber: 'FTM2026070900099',
+      contactName: '测试联系人',
+      status: OrderStatus.PAID,
+      total: new Prisma.Decimal('5000'),
+      paidAmount: new Prisma.Decimal('2000'),
+      prepaymentOffset: new Prisma.Decimal('0'),
+      adjustmentCny: 0,
+      items: [flightItem(`${departSoon2}T02:00:00Z`)],
+      passengers: [],
+      ...overrides,
+    };
+  }
+
+  it('BALANCE_DUE：尾款已付清（balance<=0）→ 存量 OPEN 提醒自动标记 DONE，备注「条件已解除」', async () => {
+    const order = baseOrder({ paidAmount: new Prisma.Decimal('5000') }); // 付清
+    const ruleKey = `BALANCE:ord_x:${departSoon2}`;
+    const { mock, rows } = makeMockPrisma(order, [
+      { id: 'r1', ruleKey, status: ReminderStatus.OPEN },
+    ]);
+
+    await generateRuleReminders(mock, 'user_sys', NOW2);
+
+    expect(rows.get('r1')).toMatchObject({ status: ReminderStatus.DONE });
+  });
+
+  it('尾款仍未付清 → 存量提醒保持 OPEN，不误关', async () => {
+    const order = baseOrder({}); // paidAmount 2000 < total 5000，仍欠款
+    const ruleKey = `BALANCE:ord_x:${departSoon2}`;
+    const { mock, rows } = makeMockPrisma(order, [
+      { id: 'r1', ruleKey, status: ReminderStatus.OPEN },
+    ]);
+
+    await generateRuleReminders(mock, 'user_sys', NOW2);
+
+    expect(rows.get('r1')).toMatchObject({ status: ReminderStatus.OPEN });
+  });
+
+  it('运营已手工处理过（SKIPPED）→ 不覆盖既有结论', async () => {
+    const order = baseOrder({ paidAmount: new Prisma.Decimal('5000') });
+    const ruleKey = `BALANCE:ord_x:${departSoon2}`;
+    const { mock, rows } = makeMockPrisma(order, [
+      { id: 'r1', ruleKey, status: ReminderStatus.SKIPPED },
+    ]);
+
+    await generateRuleReminders(mock, 'user_sys', NOW2);
+
+    expect(rows.get('r1')).toMatchObject({ status: ReminderStatus.SKIPPED });
+  });
+
+  it('TICKET_MISSING：全员票号已回填 → 自动核销', async () => {
+    const order = baseOrder({
+      passengers: [
+        { id: 'pax_1', fullName: '张三', passportExpiry: null, eticketNumber: '999-1234567890' },
+      ],
+    });
+    const ruleKey = `TICKET:ord_x:${departSoon2}`;
+    const { mock, rows } = makeMockPrisma(order, [
+      { id: 'r1', ruleKey, status: ReminderStatus.OPEN },
+    ]);
+
+    await generateRuleReminders(mock, 'user_sys', NOW2);
+
+    expect(rows.get('r1')).toMatchObject({ status: ReminderStatus.DONE });
+  });
+
+  it('ROOM_UNASSIGNED：分房表已填人 → 自动核销', async () => {
+    const order = baseOrder({
+      items: [hotelItem(departSoon2)],
+      roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] },
+    });
+    const ruleKey = `ROOMASSIGN:ord_x:${departSoon2}`;
+    const { mock, rows } = makeMockPrisma(order, [
+      { id: 'r1', ruleKey, status: ReminderStatus.OPEN },
+    ]);
+
+    await generateRuleReminders(mock, 'user_sys', NOW2);
+
+    expect(rows.get('r1')).toMatchObject({ status: ReminderStatus.DONE });
+  });
+
+  it('PASSPORT_EXPIRY：护照已续期（有效期覆盖到出发+6个月之后）→ 自动核销', async () => {
+    const order = baseOrder({
+      passengers: [
+        {
+          id: 'pax_1',
+          fullName: '张三',
+          passportExpiry: new Date(`${addMonthsUtc(departSoon2, 12)}T00:00:00Z`),
+        },
+      ],
+    });
+    const ruleKey = `PPEXP:pax_1:${departSoon2}`;
+    const { mock, rows } = makeMockPrisma(order, [
+      { id: 'r1', ruleKey, status: ReminderStatus.OPEN },
+    ]);
+
+    await generateRuleReminders(mock, 'user_sys', NOW2);
+
+    expect(rows.get('r1')).toMatchObject({ status: ReminderStatus.DONE });
+  });
+
+  it('VISA_NOT_SUBMITTED：签证任务仍在办但全员已确认送签（0 待送签）→ 自动核销', async () => {
+    const visaOrder = {
+      id: 'ord_visa',
+      orderNumber: 'FTM2026070900097',
+      deletedAt: null,
+      items: [flightItem(`${departSoon2}T02:00:00Z`)],
+      passengers: [{ fullName: '张三' }],
+    };
+    const ruleKey = `VISASUBMIT:ord_visa:${departSoon2}`;
+    const { mock, raw, rows } = makeMockPrisma(null, [
+      { id: 'r1', ruleKey, status: ReminderStatus.OPEN },
+    ]);
+    (raw as unknown as { fulfillmentTask: { findMany: ReturnType<typeof vi.fn> } }).fulfillmentTask = {
+      findMany: vi.fn(async () => [{ id: 'task_1', orderItem: { order: visaOrder } }]),
+    };
+    (raw as unknown as { passenger: { findMany: ReturnType<typeof vi.fn> } }).passenger = {
+      // 无人待送签 = 全员已确认
+      findMany: vi.fn(async () => []),
+    };
+
+    await generateRuleReminders(mock, 'user_sys', NOW2);
+
+    expect(rows.get('r1')).toMatchObject({ status: ReminderStatus.DONE });
   });
 });
 

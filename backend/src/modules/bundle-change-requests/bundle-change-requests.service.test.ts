@@ -5,7 +5,7 @@ const { mockPrisma, mockGetDescendantAgentIds } = vi.hoisted(() => ({
   mockPrisma: {
     agent: { findUnique: vi.fn() },
     order: { findUnique: vi.fn() },
-    orderItem: { findUnique: vi.fn() },
+    orderItem: { findUnique: vi.fn(), findFirst: vi.fn() },
     bundle: { findUnique: vi.fn() },
     bundleChangeRequest: {
       create: vi.fn(),
@@ -29,7 +29,12 @@ vi.mock('../orders/orders.service.js', async (importOriginal) => {
   return original;
 });
 
-import { BUNDLE_CHANGE_NIGHTS_WARNING, BUNDLE_CHANGE_REQUEST_REASON_TEXT, BundleChangeRequestsService } from './bundle-change-requests.service.js';
+import {
+  BUNDLE_CHANGE_ALREADY_APPLIED_NOTE,
+  BUNDLE_CHANGE_NIGHTS_WARNING,
+  BUNDLE_CHANGE_REQUEST_REASON_TEXT,
+  BundleChangeRequestsService,
+} from './bundle-change-requests.service.js';
 
 const AGENT = { userId: 'agent-user-1', role: UserRole.AGENT };
 const ADMIN = { userId: 'admin-1', role: UserRole.ADMIN };
@@ -106,6 +111,8 @@ beforeEach(() => {
   });
   mockPrisma.$queryRaw.mockResolvedValue([]);
   mockPrisma.orderItem.findUnique.mockResolvedValue({ description: '旧套餐快照' });
+  // 默认「未上次执行过」（幂等分支不命中），C-28 专用测试会自己覆盖这个值。
+  mockPrisma.orderItem.findFirst.mockResolvedValue(null);
   mockPrisma.bundle.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) => {
     if (where.id === 'bundle-new') {
       return { id: 'bundle-new', name: '新套餐', isActive: true, settlementNights: 3 };
@@ -281,6 +288,32 @@ describe('approve() · 确认后调用既有改档通道', () => {
     });
     await expect(service.approve(ADMIN, 'request-1', {})).resolves.toBeTruthy();
     expect(changeOrderBundle).toHaveBeenCalledTimes(1);
+  });
+
+  // C-28：changeOrderBundle 上次已经把订单改成目标套餐，但收尾回写申请状态那一步中途挂掉
+  // （进程被杀/连接断开）——申请仍卡在 PENDING，占位过期后允许重试。不做幂等判断的话，
+  // 重试会撞上 resolveChangeableBundleRow「目标套餐与当前套餐相同」的拒绝，永远确认不掉。
+  it('订单套餐已等于目标套餐（上次执行成功但收尾状态未落库）→ 直接补记状态，不重复改档', async () => {
+    prepareApprove({ decidedAt: new Date(Date.now() - 10 * 60 * 1000) }); // 占位已过期，允许重试
+    mockPrisma.orderItem.findFirst.mockResolvedValue({ id: 'bundle-item-1', bundleId: 'bundle-new' });
+    const getOrder = vi.fn().mockResolvedValue({ id: 'order-1', status: 'PENDING_PAYMENT' });
+    service = new BundleChangeRequestsService({ changeOrderBundle, getOrder } as unknown as ConstructorParameters<typeof BundleChangeRequestsService>[0]);
+
+    const result = await service.approve(ADMIN, 'request-1', {});
+
+    expect(changeOrderBundle).not.toHaveBeenCalled();
+    expect(getOrder).toHaveBeenCalledWith('order-1', { userId: ADMIN.userId, role: ADMIN.role });
+    expect(mockPrisma.bundleChangeRequest.update).toHaveBeenCalledWith({
+      where: { id: 'request-1' },
+      data: expect.objectContaining({
+        status: BundleChangeRequestStatus.APPROVED,
+        appliedDiffCny: expect.any(Prisma.Decimal),
+        appliedDiffItemId: null,
+      }),
+    });
+    expect(result.diffCny).toBe(0);
+    expect(result.changeAudit.note).toBe(BUNDLE_CHANGE_ALREADY_APPLIED_NOTE);
+    expect(result.order).toEqual({ id: 'order-1', status: 'PENDING_PAYMENT' });
   });
 
   it('晚数不同 → warnings 追加回程改期提示；晚数相同不追加', async () => {

@@ -747,6 +747,33 @@ export interface GenerateRuleRemindersResult {
 }
 
 /**
+ * 触发条件消失后自动核销存量提醒（B-14/C-7-4）。
+ * 通用 helper，照抄 hold-orders.service.ts closeOpenHoldDueReminders /
+ * orders.service.ts 回程释放收口的写法——按精确 ruleKey 命中、只动仍 OPEN/IN_PROGRESS
+ * 的（运营已经手工处理过的 DONE/SKIPPED 不覆盖他的结论）——只是把「顶替用哪几个 key」
+ * 换成调用方给出的「现在已经站不住脚了」的精确 ruleKey 全集。
+ */
+async function closeResolvedRuleReminders(
+  prisma: PrismaClient,
+  resolvedRuleKeys: string[],
+  now: Date,
+): Promise<void> {
+  if (resolvedRuleKeys.length === 0) return;
+  const staleOpen = await prisma.operationalReminder.findMany({
+    where: {
+      ruleKey: { in: resolvedRuleKeys },
+      status: { in: [ReminderStatus.OPEN, ReminderStatus.IN_PROGRESS] },
+    },
+    select: { id: true },
+  });
+  if (staleOpen.length === 0) return;
+  await prisma.operationalReminder.updateMany({
+    where: { id: { in: staleOpen.map((r) => r.id) } },
+    data: { status: ReminderStatus.DONE, resolvedAt: now, resolvedNote: '条件已解除' },
+  });
+}
+
+/**
  * 扫描全库并落库自动提醒（幂等）。
  * 性能：订单量千级 —— 一次 order.findMany（不拉护照大图等 blob 字段）+
  * 一次 fulfillmentTask.findMany + 一次 ruleKey in 查重 + 一次 createMany。
@@ -1022,6 +1049,9 @@ export async function generateRuleReminders(
       };
     }
   ).passenger;
+  // 提到外层作用域：下面「触发条件消失自动核销」判定「已送签」也要用它——
+  // 有在办签证任务但这里查出 0 个待送签乘客 = 全员已确认。
+  const namesByOrder = new Map<string, string[]>();
   if (passengerDelegate && visaOrderById.size > 0) {
     const pendingPax = await passengerDelegate.findMany({
       where: {
@@ -1031,7 +1061,6 @@ export async function generateRuleReminders(
       },
       select: { orderId: true, fullName: true },
     });
-    const namesByOrder = new Map<string, string[]>();
     for (const pax of pendingPax) {
       const list = namesByOrder.get(pax.orderId) ?? [];
       list.push(pax.fullName);
@@ -1075,6 +1104,63 @@ export async function generateRuleReminders(
     if (!byKey.has(c.ruleKey)) byKey.set(c.ruleKey, c);
   }
   const unique = [...byKey.values()];
+
+  // ── 触发条件消失后自动核销（B-14/C-7-4）─────────────────────────────────
+  // 与下面「顶替」（supersede，规则 11 那一对）不是一回事：顶替是"换个新说法接着催同一件
+  // 事"；这里是"这件事已经不用再催了"——尾款收齐/票号回填/分房完成/护照换新/全员已送签。
+  // 放在「无候选提前返回」之前：balance 收齐后这一轮本来就不会再生成 BALANCE_DUE 候选，
+  // 若跟在提前返回之后才跑，等于永远跑不到。
+  // 只用本轮已经查到的数据判定，判不出结论（字段没查/这单本轮没扫到）时保守不关，交给
+  // 下一轮真正扫到它、或人工在待办列表里手动点完成——不确定就不动，比错误自动核销安全。
+  const resolvedRuleKeys: string[] = [];
+  for (const order of orders) {
+    const departure = deriveDepartureDate(order.items);
+    if (!departure) continue;
+    // 1) 尾款已付：不看催收窗口是否还在——balance<=0 就该关，哪怕单子后来被改期到窗口外。
+    if (!computeBalance(order).greaterThan(0)) {
+      resolvedRuleKeys.push(`BALANCE:${order.id}:${departure}`);
+    }
+    // 2) 已出票：要求每个乘客都有确凿的非空票号；字段缺失/未知（老口径没取）不算数，保守不关。
+    if (
+      order.items.some((item) => item.flightSchedule) &&
+      order.passengers.length > 0 &&
+      order.passengers.every(
+        (p) => typeof p.eticketNumber === 'string' && p.eticketNumber.trim() !== '',
+      )
+    ) {
+      resolvedRuleKeys.push(`TICKET:${order.id}:${departure}`);
+    }
+    // 3) 护照已续期：与生成候选同一 minExpiry 公式，按人判定。
+    const minExpiry = addMonthsUtc(departure, PASSPORT_MIN_VALID_MONTHS);
+    for (const pax of order.passengers) {
+      if (pax.passportExpiry && utcDateStr(pax.passportExpiry) >= minExpiry) {
+        resolvedRuleKeys.push(`PPEXP:${pax.id}:${departure}`);
+      }
+    }
+    // 4) 房已分：roomAssignment === undefined 表示这一轮调用方没查这个字段（老口径），
+    //    不能当「未分房已解除」；只有明确查到且非空才算数。
+    if (order.roomAssignment !== undefined) {
+      const checkIns = order.items
+        .map((item) => item.hotelCheckIn)
+        .filter((d): d is Date => d !== null)
+        .map((d) => d.getTime());
+      if (checkIns.length > 0 && hasRoomAssignment(order.roomAssignment)) {
+        const firstCheckIn = utcDateStr(new Date(Math.min(...checkIns)));
+        resolvedRuleKeys.push(`ROOMASSIGN:${order.id}:${firstCheckIn}`);
+      }
+    }
+  }
+  // 5) 已送签：要求本轮确实查到了这单仍有在办签证任务（否则不知道，保守不判），
+  //    且非自备签乘客里查出 0 个待送签——全员已确认。
+  if (passengerDelegate) {
+    for (const [orderId, visaOrder] of visaOrderById) {
+      if ((namesByOrder.get(orderId)?.length ?? 0) > 0) continue;
+      const visaDeparture = deriveDepartureDate(visaOrder.items);
+      if (visaDeparture) resolvedRuleKeys.push(`VISASUBMIT:${orderId}:${visaDeparture}`);
+    }
+  }
+  await closeResolvedRuleReminders(prisma, resolvedRuleKeys, now);
+
   if (unique.length === 0) return { created: 0, skipped: 0, byRule: {} };
 
   // 幂等：一次性查出已存在的 ruleKey，过滤后 createMany（skipDuplicates 兜底并发竞争）

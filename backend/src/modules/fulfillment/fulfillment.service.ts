@@ -907,6 +907,19 @@ export class FulfillmentService {
       }
       updated = await prisma.fulfillmentTask.findUnique({ where: { id }, include: taskInclude });
       if (!updated) throw new NotFoundError('履约任务不存在');
+    } else if (body.status !== undefined && body.status !== existing.status) {
+      // C-18：CONFIRMED 之外的状态流转（取消/失败/进行中等）同样要 CAS——否则两名运营
+      // 几乎同时基于同一份旧快照分别把任务改成不同状态，后写的裸 update 会无条件覆盖先写
+      // 的结果（连带已经产生的副作用，如乘客送签进度回填），且不会有任何冲突提示。
+      const guarded = await prisma.fulfillmentTask.updateMany({
+        where: { id, status: existing.status },
+        data,
+      });
+      if (guarded.count !== 1) {
+        throw new ConflictError('履约任务状态已被并发修改，请重试');
+      }
+      updated = await prisma.fulfillmentTask.findUnique({ where: { id }, include: taskInclude });
+      if (!updated) throw new NotFoundError('履约任务不存在');
     } else {
       updated = await prisma.fulfillmentTask.update({ where: { id }, data, include: taskInclude });
     }
