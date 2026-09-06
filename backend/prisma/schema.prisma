@@ -614,6 +614,9 @@ model FlightSchedule {
   seatWaitlists   SeatWaitlist[]
   seatAllocations SeatAllocation[]
   holdOrders      HoldOrder[]
+  // 应付账单挂过来的反向关系（航司包机款一班一张）；只读引用，不影响班次的任何语义
+  supplierInvoices     SupplierInvoice[]
+  supplierInvoiceLines SupplierInvoiceLine[]
 
   @@index([flightId, departureTime])
   @@index([departureTime])
@@ -1203,6 +1206,8 @@ model HotelBlockPeriod {
   updatedAt      DateTime @updatedAt
 
   hotel Hotel? @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+  // 应付账单明细挂过来的反向关系（只读引用，不影响包房周期本身的任何语义）
+  supplierInvoiceLines SupplierInvoiceLine[]
 
   @@index([hotelId, dateFrom, dateTo])
   @@index([randomStarTier, dateFrom, dateTo])
@@ -1484,13 +1489,135 @@ model Supplier {
   createdAt    DateTime     @default(now())
   updatedAt    DateTime     @updatedAt
 
-  hotels  Hotel[]
-  visas   Visa[]
-  flights Flight[]
+  hotels   Hotel[]
+  visas    Visa[]
+  flights  Flight[]
+  invoices SupplierInvoice[]
 
   // 同类型下重名没有意义（酒店类型里只该有一家「岘港明月」）；跨类型可同名。
   @@unique([type, name])
   @@index([type, isActive])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 供应商应付账单 + 付款记录
+//
+// 账单期次三种（periodKind）：
+//   FLIGHT_SCHEDULE  按航班班次开 —— 航司包机款就是这么结的，一班一张
+//   MONTH            按月开 —— 酒店净房、签证公司月结
+//   CUSTOM           自定义区间 —— 剩下那些不规整的
+//
+// 币种口径（与包机成本汇率四元组同一套做法）：
+//   amount    = 供应商账单上印的那个数，原币（签证公司常年开美金）
+//   fxRate    = 原币→CNY；CNY 账单留空
+//   amountCny = 折算后的人民币，**入账权威**；折完就固化，之后改汇率表绝不追溯
+//
+// 核销 = Σ 付款 对 账单金额，**按原币比**：欠 1000 美金就得付够 1000 美金，
+// 中间汇率怎么动都不改变「这张账付清没有」。CNY 侧只是实付折人民币的记录。
+// ─────────────────────────────────────────────────────────────────────────────
+enum SupplierInvoicePeriodKind {
+  FLIGHT_SCHEDULE // 按航班班次
+  MONTH // 按月（periodMonth = YYYY-MM）
+  CUSTOM // 自定义区间（periodFrom ~ periodTo）
+}
+
+/// DRAFT / DISPUTED 是**人工态**：账单还没认，或者认了但有争议，两者都不许登记付款，
+/// 状态也不随付款自动跳。CONFIRMED / PARTIALLY_PAID / PAID 是**派生态**：认了之后
+/// 状态由 Σ 付款推导，人手改不动（改也会被下一次付款覆盖回去）。
+enum SupplierInvoiceStatus {
+  DRAFT // 草稿：刚录进来，还没跟供应商对上
+  CONFIRMED // 已确认：账认了，一分没付
+  PARTIALLY_PAID // 部分付款
+  PAID // 已付清
+  DISPUTED // 有争议：金额对不上，挂起不付
+}
+
+model SupplierInvoice {
+  id         String                    @id @default(cuid())
+  supplierId String
+  /// 供应商账单号（对方给的那串），可空——微信发张图过来的账单常常没有号
+  invoiceNo  String?
+  periodKind SupplierInvoicePeriodKind
+  /// periodKind=FLIGHT_SCHEDULE 时指向具体班次
+  flightScheduleId String?
+  /// periodKind=MONTH 时的 YYYY-MM
+  periodMonth      String?  @db.VarChar(7)
+  /// periodKind=CUSTOM 时的闭区间；MONTH / FLIGHT_SCHEDULE 也会派生填上，方便统一按区间查
+  periodFrom       DateTime? @db.Date
+  periodTo         DateTime? @db.Date
+  currency   String                @default("CNY") @db.VarChar(3)
+  amount     Decimal               @db.Decimal(14, 2) // 原币金额
+  fxRate     Decimal?              @db.Decimal(12, 6) // 原币→CNY；CNY 账单留空
+  amountCny  Decimal               @db.Decimal(14, 2) // 折算后 CNY（入账权威）
+  status     SupplierInvoiceStatus @default(DRAFT)
+  /// 账单附件（对方发来的 PDF / 截图）URL
+  attachmentUrl String?
+  note          String?
+  createdBy     String? // userId（审计冗余）
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  supplier       Supplier              @relation(fields: [supplierId], references: [id], onDelete: Restrict)
+  flightSchedule FlightSchedule?       @relation(fields: [flightScheduleId], references: [id], onDelete: SetNull)
+  lines          SupplierInvoiceLine[]
+  payments       SupplierPayment[]
+
+  @@index([supplierId, status])
+  @@index([periodMonth])
+  @@index([flightScheduleId])
+  @@index([periodFrom, periodTo])
+}
+
+/// 账单明细行（可选）。填了就能把「系统算的成本」逐项钉到「供应商账单的哪一行」上；
+/// 不填也能用 —— 整张账单对总额同样成立，明细是给对不上时下钻用的。
+model SupplierInvoiceLine {
+  id        String  @id @default(cuid())
+  invoiceId String
+  label     String
+  /// 数量（人数 / 房夜 / 件数，随科目而定），纯记录，不参与任何金额推导
+  quantity  Decimal? @db.Decimal(12, 2)
+  amount    Decimal  @db.Decimal(14, 2) // 原币
+  amountCny Decimal  @db.Decimal(14, 2)
+  /// 挂靠对象（三选零或一）：班次 / 包房周期 / 订单
+  flightScheduleId   String?
+  hotelBlockPeriodId String?
+  orderId            String?
+  note      String?
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoice          SupplierInvoice   @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+  flightSchedule   FlightSchedule?   @relation(fields: [flightScheduleId], references: [id], onDelete: SetNull)
+  hotelBlockPeriod HotelBlockPeriod? @relation(fields: [hotelBlockPeriodId], references: [id], onDelete: SetNull)
+  order            Order?            @relation(fields: [orderId], references: [id], onDelete: SetNull)
+
+  @@index([invoiceId])
+  @@index([flightScheduleId])
+  @@index([hotelBlockPeriodId])
+  @@index([orderId])
+}
+
+/// 付款记录 —— 钱真的打出去的那一笔。
+/// 每笔自带汇率：同一张美金账单分两次付，两天的汇率不一样，CNY 实付自然不同。
+model SupplierPayment {
+  id        String   @id @default(cuid())
+  invoiceId String
+  paidOn    DateTime @db.Date // 付款日（date-only，业务日）
+  amount    Decimal  @db.Decimal(14, 2) // 原币（与账单同币种）
+  fxRate    Decimal? @db.Decimal(12, 6) // 本笔付款当日汇率；CNY 账单留空
+  amountCny Decimal  @db.Decimal(14, 2) // 本笔折人民币实付
+  method    String   @db.VarChar(16) // BANK / WECHAT / ALIPAY / CASH / OTHER
+  reference String? // 银行流水号 / 转账单号
+  payerLabel String? // 付款人（谁去银行打的）
+  note      String?
+  createdBy String? // userId（审计冗余）
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  invoice SupplierInvoice @relation(fields: [invoiceId], references: [id], onDelete: Cascade)
+
+  @@index([invoiceId])
+  @@index([paidOn])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1789,6 +1916,8 @@ model Order {
   settlementRequests SettlementRequest[]
   bundleChangeRequests BundleChangeRequest[]
   orderChangeRequests  OrderChangeRequest[]
+  // 供应商应付账单明细挂过来的反向关系（某笔成本落到哪张订单头上）；纯只读引用
+  supplierInvoiceLines SupplierInvoiceLine[]
 
   @@index([userId, createdAt])
   @@index([agentId, createdAt])
