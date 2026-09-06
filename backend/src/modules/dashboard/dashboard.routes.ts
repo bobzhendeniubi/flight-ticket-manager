@@ -9,7 +9,6 @@
  * GET /dashboard/pending-aging/orders   下钻：某一档的待支付单明细
  */
 import type { FastifyPluginAsync } from 'fastify';
-import { UserRole } from '@prisma/client';
 import { z } from 'zod';
 import { DashboardService } from './dashboard.service.js';
 import { PendingAgingService, PENDING_AGING_BUCKETS } from './pending-aging.service.js';
@@ -34,7 +33,7 @@ const pendingAgingOrdersQuerySchema = z.object({
 export const dashboardRoutes: FastifyPluginAsync = async (app) => {
   const service = new DashboardService();
   const pendingAging = new PendingAgingService();
-  const pre = { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] };
+  const pre = { preHandler: [app.authenticate, app.requireCapability('dashboard.view')] };
 
   app.get('/kpi', pre, async () => {
     return { kpi: await service.getKpi() };

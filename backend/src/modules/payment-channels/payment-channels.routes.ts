@@ -10,7 +10,6 @@
  * 前台公开「只读启用中渠道」走 /public/payment-channels（见 public.routes）。
  */
 import type { FastifyPluginAsync } from 'fastify';
-import { UserRole } from '@prisma/client';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { PaymentChannelsService } from './payment-channels.service.js';
 import {
@@ -20,16 +19,16 @@ import {
 
 export const paymentChannelRoutes: FastifyPluginAsync = async (app) => {
   const service = new PaymentChannelsService();
-  const requireAdminOrStaff = app.requireRole(UserRole.ADMIN, UserRole.STAFF);
+  const requirePaymentChannelsManage = app.requireCapability('payment_channels.manage');
 
   // ── 列表 ─────────────────────────────────────────────
-  app.get('/', { preHandler: [app.authenticate, requireAdminOrStaff] }, async () => {
+  app.get('/', { preHandler: [app.authenticate, requirePaymentChannelsManage] }, async () => {
     const channels = await service.list();
     return { channels };
   });
 
   // ── 新建 ─────────────────────────────────────────────
-  app.post('/', { preHandler: [app.authenticate, requireAdminOrStaff] }, async (req, reply) => {
+  app.post('/', { preHandler: [app.authenticate, requirePaymentChannelsManage] }, async (req, reply) => {
     const body = createPaymentChannelSchema.parse(req.body);
     const channel = await service.create(body);
     void writeAudit({
@@ -44,7 +43,7 @@ export const paymentChannelRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ── 编辑 ─────────────────────────────────────────────
-  app.patch('/:id', { preHandler: [app.authenticate, requireAdminOrStaff] }, async (req) => {
+  app.patch('/:id', { preHandler: [app.authenticate, requirePaymentChannelsManage] }, async (req) => {
     const { id } = req.params as { id: string };
     const body = updatePaymentChannelSchema.parse(req.body);
     const channel = await service.update(id, body);
@@ -60,7 +59,7 @@ export const paymentChannelRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ── 删除 ─────────────────────────────────────────────
-  app.delete('/:id', { preHandler: [app.authenticate, requireAdminOrStaff] }, async (req) => {
+  app.delete('/:id', { preHandler: [app.authenticate, requirePaymentChannelsManage] }, async (req) => {
     const { id } = req.params as { id: string };
     const result = await service.remove(id);
     void writeAudit({

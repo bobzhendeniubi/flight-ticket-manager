@@ -5,7 +5,6 @@
  * /bundle-change-requests 前缀：运营待办队列、确认、驳回。
  */
 import type { FastifyPluginAsync } from 'fastify';
-import { UserRole } from '@prisma/client';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { BundleChangeRequestsService } from './bundle-change-requests.service.js';
 import {
@@ -17,7 +16,7 @@ import {
 const service = new BundleChangeRequestsService();
 
 export const orderBundleChangeRequestRoutes: FastifyPluginAsync = async (app) => {
-  const requireAgentOrOps = app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT);
+  const requireAgentOrOps = app.requireCapability('bundle_change_requests.submit');
 
   app.post(
     '/:id/bundle-change-requests',
@@ -60,8 +59,8 @@ export const orderBundleChangeRequestRoutes: FastifyPluginAsync = async (app) =>
 };
 
 export const bundleChangeRequestRoutes: FastifyPluginAsync = async (app) => {
-  const requireOps = app.requireRole(UserRole.ADMIN, UserRole.STAFF);
-  const requireAgentOrOps = app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT);
+  const requireOps = app.requireCapability('bundle_change_requests.decide');
+  const requireAgentOrOps = app.requireCapability('bundle_change_requests.submit');
 
   app.get('/', { preHandler: [app.authenticate, requireAgentOrOps] }, async (req) => {
     const query = listBundleChangeRequestsQuerySchema.parse(req.query);

@@ -5,7 +5,7 @@ import { prisma } from '../../db/prisma.js';
 import { AuthService } from '../auth/auth.service.js';
 import { BadRequestError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
-import { capabilitiesFor } from '../../lib/capabilities.js';
+import { capabilitiesFor, hasCapability } from '../../lib/capabilities.js';
 
 /** 与 auth.service 的登出/全撤销口径一致：打到过去，避开 refresh 并发宽限窗。 */
 function expireImmediately(): Date {
@@ -43,7 +43,7 @@ export const userRoutes: FastifyPluginAsync = async (app) => {
   // ── A20 岗位细分（2026-07-20 拍板「全改」）────────────────────────────
   // 内部账号列表 + 赋岗位。岗位决定导出裁剪：专岗账号的全岗总表被强制裁到本岗模板
   //（见 orders.routes /export/master），改 query 参数也拿不到订单成本/结算价。
-  const adminOnly = { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] };
+  const adminOnly = { preHandler: [app.authenticate, app.requireCapability('users.staff.manage')] };
 
   // 列出内部账号（ADMIN + STAFF）及其岗位
   app.get('/staff', adminOnly, async () => {
@@ -205,7 +205,7 @@ export const userRoutes: FastifyPluginAsync = async (app) => {
   // 否则员工可借重置接管管理员/同事账号（越权）。
   app.post(
     '/:id/reset-password',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('users.reset_agent_password')] },
     async (req) => {
     const { id } = req.params as { id: string };
     const body = z.object({ newPassword: z.string().min(8).max(128) }).parse(req.body);
@@ -215,7 +215,12 @@ export const userRoutes: FastifyPluginAsync = async (app) => {
       select: { id: true, email: true, displayName: true, mustChangePassword: true, role: true },
     });
     if (!target) throw new NotFoundError('用户不存在');
-    if (req.user.role !== UserRole.ADMIN && target.role !== UserRole.AGENT) {
+    // 目标不是代理（即内部账号）时，preHandler 的 users.reset_agent_password 不够用，
+    // 还得再有 users.reset_staff_password（仅管理员）——两条能力合起来才等价于原先的内联判断。
+    if (
+      target.role !== UserRole.AGENT &&
+      !hasCapability({ role: req.user.role, staffRole: req.staffRole }, 'users.reset_staff_password')
+    ) {
       throw new ForbiddenError('员工只能重置代理账号的密码；内部账号请找管理员');
     }
 

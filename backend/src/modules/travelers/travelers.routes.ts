@@ -32,14 +32,11 @@ export const travelerRoutes: FastifyPluginAsync = async (app) => {
   const profilesService = new TravelerProfilesService();
   const benefitsService = new TravelerBenefitsService(profilesService);
   const pre = {
-    preHandler: [
-      app.authenticate,
-      app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT),
-    ],
+    preHandler: [app.authenticate, app.requireCapability('travelers.manage')],
   };
   // 旅客档案（跨订单聚合，含游客单乘机人与消费画像）—— 内部资产，不对 AGENT 开放
   const preStaff = {
-    preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)],
+    preHandler: [app.authenticate, app.requireCapability('traveler_profiles.manage')],
   };
 
   // ── 旅客档案（TravelerProfile）——静态段 /profiles 先于参数段 /:id 注册 ──

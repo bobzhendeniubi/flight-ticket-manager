@@ -16,7 +16,7 @@
  * 列表接口会直接被撑爆。前端列表只显示名称/状态/时间，点进详情才拉图。
  */
 import type { FastifyPluginAsync } from 'fastify';
-import { AuditTargetType, Prisma, UserRole } from '@prisma/client';
+import { AuditTargetType, Prisma } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { POSTER_TEMPLATES } from './marketing.templates.js';
@@ -35,7 +35,7 @@ import {
 
 export const marketingRoutes: FastifyPluginAsync = async (app) => {
   const requireOps = {
-    preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)],
+    preHandler: [app.authenticate, app.requireCapability('marketing.manage')],
   };
 
   app.get('/templates', requireOps, async () => ({ templates: POSTER_TEMPLATES }));

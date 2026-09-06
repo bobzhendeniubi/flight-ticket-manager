@@ -15,7 +15,7 @@
  * POST   /reminders/:id/resolve   完成 / 跳过
  */
 import type { FastifyPluginAsync } from 'fastify';
-import { Prisma, ReminderPriority, ReminderStatus, UserRole } from '@prisma/client';
+import { Prisma, ReminderPriority, ReminderStatus } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { isFeatureEnabled } from '../../lib/feature-flags.js';
@@ -33,7 +33,7 @@ import { REMINDER_MANUAL_LAST_RUN_KEY } from './reminders-daily.js';
 
 export const reminderRoutes: FastifyPluginAsync = async (app) => {
   const requireOps = {
-    preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)],
+    preHandler: [app.authenticate, app.requireCapability('reminders.manage')],
   };
 
   app.get('/', requireOps, async (req) => {

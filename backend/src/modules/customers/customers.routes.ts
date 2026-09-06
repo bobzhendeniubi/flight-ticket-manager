@@ -15,10 +15,7 @@ import { ForbiddenError } from '../../lib/errors.js';
 export const customerRoutes: FastifyPluginAsync = async (app) => {
   const service = new CustomersService();
   const pre = {
-    preHandler: [
-      app.authenticate,
-      app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT),
-    ],
+    preHandler: [app.authenticate, app.requireCapability('customers.manage')],
   };
 
   /**

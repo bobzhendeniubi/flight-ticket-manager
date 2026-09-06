@@ -1,5 +1,5 @@
 import type { FastifyPluginAsync } from 'fastify';
-import { Prisma, ProductKind, UserRole } from '@prisma/client';
+import { Prisma, ProductKind } from '@prisma/client';
 import { z } from 'zod';
 import { prisma } from '../../db/prisma.js';
 import { NotFoundError } from '../../lib/errors.js';
@@ -20,7 +20,7 @@ export const agentRoutes: FastifyPluginAsync = async (app) => {
   // 列表：AGENT 看自己 + 所有后代；ADMIN/STAFF 看全部
   app.get(
     '/',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)] },
+    { preHandler: [app.authenticate, app.requireCapability('agents.read')] },
     async (req) => {
       const agents = await service.listVisibleAgents(req.user.sub, req.user.role);
       return { agents };
@@ -30,7 +30,7 @@ export const agentRoutes: FastifyPluginAsync = async (app) => {
   // 当前登录用户自己的 agent profile（AGENT 专用）
   app.get(
     '/me',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.AGENT, UserRole.ADMIN)] },
+    { preHandler: [app.authenticate, app.requireCapability('agents.self.read')] },
     async (req) => {
       const agent = await service.getByUserId(req.user.sub);
       return { agent };
@@ -42,7 +42,7 @@ export const agentRoutes: FastifyPluginAsync = async (app) => {
   //  - ADMIN/STAFF: POST /agents/children?parentId=xxx  可指定；省略 = 建 1 级代理
   app.post(
     '/children',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)] },
+    { preHandler: [app.authenticate, app.requireCapability('agents.create_child')] },
     async (req, reply) => {
       const body = createChildAgentBodySchema.parse(req.body);
       const { parentId } = (req.query as { parentId?: string }) ?? {};
@@ -71,7 +71,7 @@ export const agentRoutes: FastifyPluginAsync = async (app) => {
   // PATCH /agents/:id/settlement-mode  body: { settlementMode }
   app.patch(
     '/:id/settlement-mode',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    { preHandler: [app.authenticate, app.requireCapability('agents.settlement_mode.write')] },
     async (req) => {
       const { id } = req.params as { id: string };
       const body = setSettlementModeBodySchema.parse(req.body);
@@ -95,7 +95,7 @@ export const agentRoutes: FastifyPluginAsync = async (app) => {
   // PATCH /agents/:id
   app.patch(
     '/:id',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)] },
+    { preHandler: [app.authenticate, app.requireCapability('agents.write')] },
     async (req) => {
       const { id } = req.params as { id: string };
       const body = updateAgentBodySchema.parse(req.body);
@@ -126,7 +126,7 @@ export const agentRoutes: FastifyPluginAsync = async (app) => {
   // PATCH /agents/:id/status  body: { isActive }
   app.patch(
     '/:id/status',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN)] },
+    { preHandler: [app.authenticate, app.requireCapability('agents.status.write')] },
     async (req) => {
       const { id } = req.params as { id: string };
       const body = setAgentStatusBodySchema.parse(req.body);
@@ -212,7 +212,7 @@ export const agentRoutes: FastifyPluginAsync = async (app) => {
 
   app.get(
     '/:id/commission-rules',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('agents.commission_rules.manage')] },
     async (req) => {
       const { id } = req.params as { id: string };
       const agent = await prisma.agent.findUnique({ where: { id }, select: { id: true } });
@@ -268,13 +268,13 @@ export const agentRoutes: FastifyPluginAsync = async (app) => {
   );
 
   // 写权限放开至内部岗位（ADMIN + STAFF）：返佣政策的口径归财务，只让 ADMIN 写会让财务每次配费率
-  // 都要绕人，规则永远配不齐。代理/散客够不到本路由（AGENT 角色不在 requireRole 名单里）。
+  // 都要绕人，规则永远配不齐。代理/散客够不到本路由（agents.commission_rules.manage 只授予 OPS）。
   // 动费率=动钱，审计照旧 severity=WARNING 逐次留痕，改了什么、谁改的都查得到。
   // ⚠️ 前端 CommissionTab 的 canEdit 必须同步放开——只改后端会让页面仍渲染只读态，
   //    使用者看到的就是「没有权限」（立减规则那次已经踩过这个半提交陷阱）。
   app.put(
     '/:id/commission-rules',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('agents.commission_rules.manage')] },
     async (req) => {
       const { id } = req.params as { id: string };
       const body = putCommissionRulesBodySchema.parse(req.body);

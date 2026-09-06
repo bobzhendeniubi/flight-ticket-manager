@@ -4,12 +4,12 @@
  * GET /audit-logs  按 actor/target/严重度/时间范围过滤 + 分页
  */
 import type { FastifyPluginAsync } from 'fastify';
-import { Prisma, UserRole } from '@prisma/client';
+import { Prisma } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { listAuditLogsQuerySchema } from './audit.schemas.js';
 
 export const auditRoutes: FastifyPluginAsync = async (app) => {
-  const pre = { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] };
+  const pre = { preHandler: [app.authenticate, app.requireCapability('audit.read')] };
 
   app.get('/', pre, async (req) => {
     const q = listAuditLogsQuerySchema.parse(req.query);

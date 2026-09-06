@@ -7,7 +7,6 @@
  * 权限分工与套餐改档申请一致：提交 = 运营 + 代理；确认 / 驳回 = 只有运营。
  */
 import type { FastifyPluginAsync } from 'fastify';
-import { UserRole } from '@prisma/client';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { OrderChangeRequestsService } from './order-change-requests.service.js';
 import {
@@ -27,7 +26,7 @@ export const ORDER_CHANGE_REQUEST_REJECTED_ACTION = 'ORDER_CHANGE_REQUEST_REJECT
 
 /** 挂在 /orders 前缀下：单张单提交。 */
 export const orderChangeRequestOrderRoutes: FastifyPluginAsync = async (app) => {
-  const requireAgentOrOps = app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT);
+  const requireAgentOrOps = app.requireCapability('change_requests.submit');
 
   app.post(
     '/:id/change-requests',
@@ -77,8 +76,8 @@ export const orderChangeRequestOrderRoutes: FastifyPluginAsync = async (app) => 
 
 /** 挂在 /order-change-requests 前缀下：批量提交 + 运营队列 + 处理。 */
 export const orderChangeRequestRoutes: FastifyPluginAsync = async (app) => {
-  const requireOps = app.requireRole(UserRole.ADMIN, UserRole.STAFF);
-  const requireAgentOrOps = app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT);
+  const requireOps = app.requireCapability('change_requests.decide');
+  const requireAgentOrOps = app.requireCapability('change_requests.submit');
 
   // 批量提交：一批订单同一类改动（只支持改班次 / 签证状态）。
   app.post('/batch', { preHandler: [app.authenticate, requireAgentOrOps] }, async (req) => {
