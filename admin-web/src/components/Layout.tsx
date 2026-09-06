@@ -25,6 +25,9 @@ const NAV: Array<{
   financeRole?: boolean;
 }> = [
   { to: '/dashboard',       label: '仪表盘',      roles: ['ADMIN', 'STAFF'],          section: '概览' },
+  // 导出中心挂在最上面一组：全系统的导出散在六个模块里，找不到入口是反馈里的常客，
+  // 得放在一眼能看见的地方。全角色可见（代理进去只列他能用的三张表）。
+  { to: '/exports',         label: '导出中心',    roles: ['ADMIN', 'STAFF', 'AGENT'], section: '概览' },
   { to: '/orders',          label: '订单管理',    roles: ['ADMIN', 'STAFF', 'AGENT'], section: '运营' },
   { to: '/flights',         label: '航班管理',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
   { to: '/seat-stats',      label: '座位统计',    roles: ['ADMIN', 'STAFF'],          section: '运营' },
