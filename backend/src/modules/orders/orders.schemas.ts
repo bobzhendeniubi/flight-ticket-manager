@@ -14,6 +14,14 @@ import {
 import { normalizePassengerFullName } from '../../lib/passenger-name.js';
 import { COUNTRY_ALPHA3_TO_ALPHA2 } from '../../lib/country-codes.js';
 import { businessDateISO } from '../../lib/business-time.js';
+import {
+  ETICKET_FORMAT_MESSAGE,
+  PNR_FORMAT_MESSAGE,
+  isValidEticketNumber,
+  isValidPnr,
+  normalizeEticketNumber,
+  normalizePnr,
+} from './ticket-number.js';
 
 // 团队议价结算价上限（CNY/人）。防误输天价；正常机票远低于此。
 export const SETTLEMENT_PRICE_CAP_CNY = 100_000;
@@ -355,6 +363,46 @@ export const updatePassengerVisaDatesBodySchema = z
     message: '请至少提供一个需要更新的字段',
   });
 export type UpdatePassengerVisaDatesBody = z.infer<typeof updatePassengerVisaDatesBodySchema>;
+
+// ── 票务台：回填真实 PNR / 电子票号（PATCH /orders/:id/passengers/:passengerId/ticket；ADMIN/STAFF）──
+//
+// 出票目前是沙箱自动生成号（履约 worker），真实航司出票之后系统里**没有任何人工录入口** ——
+// 票务只能眼看着单子上挂着一个对不上账的号。本端点就是那个入口。
+//
+// 语义三条，互斥且明说：
+//   · clear: true          两个字段一起清空（贴错了整条撤掉）；此时不许再带 pnr / eticketNumber，
+//                          「一边说清空一边给值」不猜意图，直接 400。
+//   · pnr / eticketNumber  给字符串 = 写入（归一化后校验），给 null = **只**清这一个字段。
+//   · 两者都不给且没 clear  这次调用没有意义 → 400。
+//
+// 归一化/校验口径全部来自 ticket-number.ts（与整班批量回填同一份内核，两条路收得进的东西完全一样）。
+const pnrValueSchema = z
+  .string()
+  .transform((v) => normalizePnr(v))
+  .refine((v) => isValidPnr(v), { message: PNR_FORMAT_MESSAGE });
+
+const eticketValueSchema = z
+  .string()
+  .transform((v) => normalizeEticketNumber(v))
+  .refine((v) => isValidEticketNumber(v), { message: ETICKET_FORMAT_MESSAGE });
+
+export const updatePassengerTicketBodySchema = z
+  .object({
+    pnr: z.union([pnrValueSchema, z.null()]).optional(),
+    eticketNumber: z.union([eticketValueSchema, z.null()]).optional(),
+    /** true = 两个字段一起清空。与 pnr / eticketNumber 互斥。 */
+    clear: z.literal(true).optional(),
+    /** 回填来源备注（记进审计，便于事后追「这个号是照哪份出票单录的」）。 */
+    note: z.string().trim().max(200).optional(),
+  })
+  .strict()
+  .refine((v) => !(v.clear === true && (v.pnr !== undefined || v.eticketNumber !== undefined)), {
+    message: '「清空」与「填写票号」不能同时提交，请二选一',
+  })
+  .refine((v) => v.clear === true || v.pnr !== undefined || v.eticketNumber !== undefined, {
+    message: '请至少填写 PNR 或电子票号（要清空请传 clear:true）',
+  });
+export type UpdatePassengerTicketBody = z.infer<typeof updatePassengerTicketBodySchema>;
 
 // ── 前台自助：改签申请（POST /orders/:id/change-request）──
 export const changeRequestBodySchema = z.object({

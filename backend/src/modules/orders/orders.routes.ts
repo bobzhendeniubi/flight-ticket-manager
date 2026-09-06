@@ -72,6 +72,7 @@ import {
   swapPassengerBodySchema,
   setPassengerVisaExemptBodySchema,
   updateItemSettlementPriceBodySchema,
+  updatePassengerTicketBodySchema,
   updatePassengerVisaDatesBodySchema,
   updateStatusBodySchema,
   visaBundleBodySchema,
@@ -2514,6 +2515,49 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         after: result.after,
       });
       return { passenger: result.passenger };
+    },
+  );
+
+  // ── 票务台：回填真实 PNR / 电子票号（ADMIN/STAFF）──
+  // PATCH /orders/:id/passengers/:passengerId/ticket
+  // body: { pnr?: string|null, eticketNumber?: string|null, clear?: true, note?: string }
+  //   · 给字符串 = 写入（PNR 5–8 位字母数字；票号 10–17 位数字，真实 13 位与沙箱 17 位都放行）
+  //   · 给 null   = 只清这一个字段；clear:true = 两个一起清（与给值互斥）
+  //
+  // 背景：出票目前走沙箱（履约 worker 自动生成号写回 Passenger），真实航司出票后系统里
+  // **没有人工录入口**。本端点补上它，只动 pnr / eticketNumber 两列 —— 不碰订单状态、
+  // 不碰履约任务、不碰开票三维布尔（开票是「出票进度」口径，与票号是两回事）。
+  //
+  // ⚠ 回填**不发**行程单邮件：票务边录边发，客人会收到一串改来改去的行程单。要发就走
+  //   订单详情既有的「重发行程单邮件」按钮，人点、人负责。
+  //
+  // 号的来源（沙箱自动 vs 人工回填）不落库、不加列 —— 靠这条审计区分。
+  app.patch(
+    '/:id/passengers/:passengerId/ticket',
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      const role = req.user.role;
+      if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+        return reply.status(403).send({ error: '仅运营/管理员可回填票号' });
+      }
+      const { id, passengerId } = req.params as { id: string; passengerId: string };
+      const body = updatePassengerTicketBodySchema.parse(req.body);
+      const result = await service.updatePassengerTicket(id, passengerId, body, {
+        userId: req.user.sub,
+        role,
+      });
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'BACKFILL_PASSENGER_TICKET',
+        targetType: 'TRAVELER',
+        targetId: passengerId,
+        targetLabel: `${result.orderNumber} · ${result.passengerName}`,
+        before: result.before,
+        after: { ...result.after, changedFields: result.changedFields, note: body.note ?? null },
+        // 清空是破坏性的（票号一没，退票/对账就断了线索）→ WARNING；写入/订正是日常动作 → INFO。
+        severity: body.clear === true ? 'WARNING' : 'INFO',
+      });
+      return { passenger: result.passenger, changedFields: result.changedFields };
     },
   );
 

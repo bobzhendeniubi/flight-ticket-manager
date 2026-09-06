@@ -212,6 +212,7 @@ import type {
   SplitRoomGroupBody,
   SwapItemHotelBody,
   UpdateItemSettlementPriceBody,
+  UpdatePassengerTicketBody,
   UpdatePassengerVisaDatesBody,
 } from './orders.schemas.js';
 
@@ -8272,6 +8273,93 @@ export class OrderService {
       orderNumber: order.orderNumber,
       before,
       after,
+    };
+  }
+
+  /**
+   * 票务台：回填 / 订正 / 清空某位出行人的真实 PNR 与电子票号（ADMIN/STAFF）。
+   *
+   * 为什么需要这个方法：出票目前走沙箱（履约 worker 延时后生成号并自动写回 Passenger），
+   * 真实航司出票之后系统里没有任何人工录入口 —— 票务拿到真票号也录不进去。本方法就是那个入口。
+   *
+   * 边界（有意克制，别把它做成第二个「改单」）：
+   *   · **只动 pnr / eticketNumber 两列**。不碰订单状态、不碰履约任务、不碰开票三维布尔
+   *     （开票模型是「出票进度」口径，见 docs/口径决议.md，与票号是两回事，不许在这里联动）。
+   *   · **不发行程单邮件**。沙箱出票会自动发，人工回填**不发** —— 票务边录边发，客人一天收
+   *     十几封改来改去的行程单。要发就走订单详情既有的「重发行程单邮件」，人点，人负责。
+   *   · 状态闸只有一条：**回收站里的单不给回填**。已取消 / 已退款的单照样放行 ——
+   *     真实场景恰恰是「票出了、单取消了，退票要拿票号去跟航司对」，这时候拦住才是帮倒忙。
+   *
+   * 号的**来源**（沙箱自动出票 vs 人工回填）不落库、不加列，靠审计区分：
+   * 人工回填必留一条 BACKFILL_PASSENGER_TICKET，查审计就知道这个号是谁什么时候录的。
+   */
+  async updatePassengerTicket(
+    orderId: string,
+    passengerId: string,
+    input: UpdatePassengerTicketBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    passenger: Record<string, unknown>;
+    orderNumber: string;
+    passengerName: string;
+    before: { pnr: string | null; eticketNumber: string | null };
+    after: { pnr: string | null; eticketNumber: string | null };
+    /** 本次真正变了值的字段（两个都没变时为空数组 —— 回填同一个号是幂等的，不是错误）。 */
+    changedFields: Array<'pnr' | 'eticketNumber'>;
+  }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可回填票号');
+    }
+
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: { id: true, orderNumber: true, deletedAt: true },
+    });
+    if (!order) throw new NotFoundError('订单不存在');
+    if (order.deletedAt !== null) {
+      throw new ConflictError('订单在回收站，请先恢复该单再回填票号');
+    }
+
+    const passenger = await prisma.passenger.findUnique({
+      where: { id: passengerId },
+      select: { id: true, orderId: true, fullName: true, pnr: true, eticketNumber: true },
+    });
+    if (!passenger || passenger.orderId !== orderId) {
+      throw new NotFoundError('出行人不存在或不属于该订单');
+    }
+
+    const before = { pnr: passenger.pnr, eticketNumber: passenger.eticketNumber };
+    // schema 已保证三者互斥（clear 与两个值不同框、且至少给一个），这里只负责翻译成落库值。
+    const next = {
+      pnr: input.clear === true ? null : input.pnr === undefined ? before.pnr : input.pnr,
+      eticketNumber:
+        input.clear === true
+          ? null
+          : input.eticketNumber === undefined
+            ? before.eticketNumber
+            : input.eticketNumber,
+    };
+
+    const changedFields: Array<'pnr' | 'eticketNumber'> = [];
+    if (next.pnr !== before.pnr) changedFields.push('pnr');
+    if (next.eticketNumber !== before.eticketNumber) changedFields.push('eticketNumber');
+
+    // 一个字段都没变：不写库（免得白刷 updatedAt），如实回 changedFields: [] 让调用方照实说。
+    const updated =
+      changedFields.length === 0
+        ? await prisma.passenger.findUniqueOrThrow({ where: { id: passengerId } })
+        : await prisma.passenger.update({
+            where: { id: passengerId },
+            data: { pnr: next.pnr, eticketNumber: next.eticketNumber },
+          });
+
+    return {
+      passenger: serializePassengerRecord(updated as unknown as Record<string, unknown>),
+      orderNumber: order.orderNumber,
+      passengerName: passenger.fullName,
+      before,
+      after: { pnr: updated.pnr, eticketNumber: updated.eticketNumber },
+      changedFields,
     };
   }
 
