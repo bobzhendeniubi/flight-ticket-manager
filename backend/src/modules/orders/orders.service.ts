@@ -1428,29 +1428,7 @@ export class OrderService {
     input: SplitOrderInput,
     actor: { userId: string; role: UserRole },
     targetOrderNumber: string,
-  ): Promise<
-    | { kind: 'replayed'; result: SplitOrderResult }
-    | {
-        kind: 'done';
-        result: SplitOrderResult;
-        preTotalCny: number;
-        prePaidCny: number;
-        sourceTotalAfterCny: number;
-        /** 新单落库 total（份额 − 随拆分摊的售后费）——审计的 targetTotal 就取它。 */
-        targetTotalCny: number;
-        sourcePaidAfterCny: number;
-        allShareRows: Array<{ passengerId: string; netCny: number; shareCny: number }>;
-        passengerSummary: Array<{ id: string; name: string; moved: boolean }>;
-        /** 佣金劈分明细（非空 → 事务外补一条 CRITICAL 审计 SPLIT_ORDER_COMMISSION）。 */
-        commissionSplit: SplitCommissionAudit[];
-        /**
-         * 预存抵扣随拆搬移明细（非零 → 事务外补一条 CRITICAL 审计）。
-         * 老的 PrepaymentTransaction(OFFSET) 流水仍按单指向源单，搬移只改订单侧的物化列，
-         * 财务对账时要能一眼看到「这一单的抵扣被拆走了多少、去了哪张单」。
-         */
-        prepaymentOffsetSplit: { beforeCny: number; keptCny: number; movedCny: number } | null;
-      }
-  > {
+  ): ReturnType<typeof splitSvc.executeSplitWithinTx> {
     return splitSvc.executeSplitWithinTx(this, tx, orderId, input, actor, targetOrderNumber);
   }
 

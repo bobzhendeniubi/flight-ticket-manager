@@ -27,7 +27,6 @@ import {
   ForbiddenError,
   NotFoundError,
 } from '../../../lib/errors.js';
-import { writeAudit } from '../../../lib/audit.js';
 import { isReturnCurrentlyReleased } from '../orders.leg-status.js';
 import { computePerPaxShares, spreadableAdjustmentCny } from '../per-pax-share.js';
 import { groupPassengerAdjustments } from '../order-adjustment-lines.js';
@@ -68,6 +67,7 @@ import {
   sumRoomsBilledHalves,
   sumTotalCostCents,
 } from './order-ledger.js';
+import { runOrderMutation, type MutationDb } from './order-mutation.js';
 import {
   actorCan,
   appendAdjustment,
@@ -704,120 +704,133 @@ export async function splitOrder(
     throw new ForbiddenError('仅运营/管理员可拆单');
   }
 
-  // 幂等快路径：同 (源单, token) 已拆过 → 直接回放，不进事务。
-  const replay = await svc.findSplitReplay(orderId, input.requestToken);
-  if (replay) return replay;
-
   // 订单号撞号（P2002）重试环 ≤3 次：Postgres 里语句失败会废掉整个事务，
   // 所以重试必须在事务外整体重来（每轮换一个新订单号），不能在事务内捕获后继续。
   let lastError: unknown = null;
   for (let attempt = 0; attempt < 3; attempt++) {
     const targetOrderNumber = await generateOrderNumber();
     try {
-      const outcome = await prisma.$transaction(async (tx) => {
-        return svc.executeSplitWithinTx(tx, orderId, input, actor, targetOrderNumber);
-      });
-      if (outcome.kind === 'replayed') return outcome.result;
+      // OrderMutation 内核（审查根因 R5）：幂等快路径（同 (源单, token) 已拆过 → 直接回放，不进事务）、
+      // 事务 + 源单行锁 + 锁内幂等复查、事务内审计、提交后钩子，全部收在内核里。
+      // 守恒断言仍是 executeSplitWithinTx §11 那份更细的（含开票人数 / 佣金 / 逐侧占座）；
+      // 内核的通用五维快照是它的子集，这里不重复读一遍。
+      return await runOrderMutation<SplitOrderResult>(
+        {
+          orderId,
+          actor,
+          action: 'SPLIT_ORDER',
+          requestToken: input.requestToken,
+          idempotency: { find: (db) => findSplitReplayIn(db, orderId, input.requestToken) },
+        },
+        async (ctx) => {
+          const outcome = await svc.executeSplitWithinTx(
+            ctx.tx,
+            orderId,
+            input,
+            actor,
+            targetOrderNumber,
+          );
 
-      // 审计（事务外，与全站 writeAudit 口径一致）：两条 SPLIT_ORDER，各挂一侧订单。
-      const auditBefore = {
-        total: outcome.preTotalCny,
-        paidAmount: outcome.prePaidCny,
-        passengers: outcome.passengerSummary,
-        perPaxRows: outcome.allShareRows,
-      };
-      const auditAfter = {
-        sourceOrderNumber: outcome.result.sourceOrderNumber,
-        targetOrderNumber: outcome.result.targetOrderNumber,
-        sourceTotal: outcome.sourceTotalAfterCny,
-        // 新单**落库的 total**（= 份额 − 随拆分摊的售后费），与 sourceTotal 同口径。
-        // 从前这里写的是份额 movedShareCny：有售后费的单两者不等，
-        // 一条审计里两侧却按两种口径记，财务照着对账永远差一个售后费。
-        targetTotal: outcome.targetTotalCny,
-        // 份额单独留一个字段（只增不删，读审计的前端 auditFormat 不受影响）。
-        movedShareCny: outcome.result.movedShareCny,
-        sourcePaid: outcome.sourcePaidAfterCny,
-        targetPaid: outcome.result.movedPaidCny,
-        movedPassengerIds: input.passengerIds,
-        note: input.note ?? null,
-      };
-      await writeAudit({
-        actor: { userId: actor.userId, role: actor.role },
-        action: 'SPLIT_ORDER',
-        targetType: AuditTargetType.ORDER,
-        targetId: outcome.result.sourceOrderId,
-        targetLabel: outcome.result.sourceOrderNumber,
-        before: auditBefore,
-        after: auditAfter,
-        severity: AuditSeverity.CRITICAL,
-      });
-      await writeAudit({
-        actor: { userId: actor.userId, role: actor.role },
-        action: 'SPLIT_ORDER',
-        targetType: AuditTargetType.ORDER,
-        targetId: outcome.result.targetOrderId,
-        targetLabel: outcome.result.targetOrderNumber,
-        before: auditBefore,
-        after: auditAfter,
-        severity: AuditSeverity.CRITICAL,
-      });
-      // 佣金被劈开过 → 单独一条 CRITICAL 审计：财务日后对账时，「这条佣金怎么变成两条的」
-      // 得有一处说得清（rate / chainDepth 未变、Σ amount 未变，只是分配到了两张单）。
-      if (outcome.commissionSplit.length > 0) {
-        await writeAudit({
-          actor: { userId: actor.userId, role: actor.role },
-          action: 'SPLIT_ORDER_COMMISSION',
-          targetType: AuditTargetType.ORDER,
-          targetId: outcome.result.sourceOrderId,
-          targetLabel: outcome.result.sourceOrderNumber,
-          before: {
-            records: outcome.commissionSplit.map((c) => ({
-              commissionId: c.commissionId,
-              agentId: c.agentId,
-              amountCny: c.beforeAmountCny,
-              rate: c.rate,
-              chainDepth: c.chainDepth,
-            })),
-          },
-          after: {
+          // 审计**进事务**（原先事务外 fire-and-forget）：拆单是资金 / 库存动作，
+          // 「谁把哪些人、多少钱拆到了哪张单」必须与拆单本身同生共死。两条 SPLIT_ORDER，各挂一侧订单。
+          const auditBefore = {
+            total: outcome.preTotalCny,
+            paidAmount: outcome.prePaidCny,
+            passengers: outcome.passengerSummary,
+            perPaxRows: outcome.allShareRows,
+          };
+          const auditAfter = {
+            sourceOrderNumber: outcome.result.sourceOrderNumber,
             targetOrderNumber: outcome.result.targetOrderNumber,
-            records: outcome.commissionSplit,
-          },
-          severity: AuditSeverity.CRITICAL,
-        });
-      }
-      // 预存抵扣被搬走过 → 单独一条 CRITICAL 审计：预存流水（PrepaymentTransaction）
-      // 仍按单指向源单，订单侧的抵扣列却已分到两张单，财务对账时得有一处说得清。
-      if (outcome.prepaymentOffsetSplit) {
-        await writeAudit({
-          actor: { userId: actor.userId, role: actor.role },
-          action: 'SPLIT_ORDER_PREPAYMENT_OFFSET',
-          targetType: AuditTargetType.ORDER,
-          targetId: outcome.result.sourceOrderId,
-          targetLabel: outcome.result.sourceOrderNumber,
-          before: { prepaymentOffsetCny: outcome.prepaymentOffsetSplit.beforeCny },
-          after: {
-            targetOrderNumber: outcome.result.targetOrderNumber,
-            sourcePrepaymentOffsetCny: outcome.prepaymentOffsetSplit.keptCny,
-            targetPrepaymentOffsetCny: outcome.prepaymentOffsetSplit.movedCny,
-            note: '预存抵扣按份额随拆搬移；预存流水仍按单挂在源单，请财务据本条对账',
-          },
-          severity: AuditSeverity.CRITICAL,
-        });
-      }
-      // 订单级办结派生对齐（两侧各一次，事务外，与其它写送签进度的路径同一调用点约定）：
-      // 名单一分为二后「非自备签乘客是否全部已送签」两侧各自重算——拆出去的两位已送签的人
-      // 在新单上就该自动办结；源单若是派生办结写的已签证、剩下的人还没送出去则对称回退。
-      // 幂等，重复调用零副作用。
-      await syncOrderVisaCompletion(outcome.result.sourceOrderId, {
-        userId: actor.userId,
-        role: actor.role,
-      });
-      await syncOrderVisaCompletion(outcome.result.targetOrderId, {
-        userId: actor.userId,
-        role: actor.role,
-      });
-      return outcome.result;
+            sourceTotal: outcome.sourceTotalAfterCny,
+            // 新单**落库的 total**（= 份额 − 随拆分摊的售后费），与 sourceTotal 同口径。
+            // 从前这里写的是份额 movedShareCny：有售后费的单两者不等，
+            // 一条审计里两侧却按两种口径记，财务照着对账永远差一个售后费。
+            targetTotal: outcome.targetTotalCny,
+            // 份额单独留一个字段（只增不删，读审计的前端 auditFormat 不受影响）。
+            movedShareCny: outcome.result.movedShareCny,
+            sourcePaid: outcome.sourcePaidAfterCny,
+            targetPaid: outcome.result.movedPaidCny,
+            movedPassengerIds: input.passengerIds,
+            note: input.note ?? null,
+          };
+          await ctx.audit({
+            action: 'SPLIT_ORDER',
+            targetType: AuditTargetType.ORDER,
+            targetId: outcome.result.sourceOrderId,
+            targetLabel: outcome.result.sourceOrderNumber,
+            before: auditBefore,
+            after: auditAfter,
+            severity: AuditSeverity.CRITICAL,
+          });
+          await ctx.audit({
+            action: 'SPLIT_ORDER',
+            targetType: AuditTargetType.ORDER,
+            targetId: outcome.result.targetOrderId,
+            targetLabel: outcome.result.targetOrderNumber,
+            before: auditBefore,
+            after: auditAfter,
+            severity: AuditSeverity.CRITICAL,
+          });
+          // 佣金被劈开过 → 单独一条 CRITICAL 审计：财务日后对账时，「这条佣金怎么变成两条的」
+          // 得有一处说得清（rate / chainDepth 未变、Σ amount 未变，只是分配到了两张单）。
+          if (outcome.commissionSplit.length > 0) {
+            await ctx.audit({
+              action: 'SPLIT_ORDER_COMMISSION',
+              targetType: AuditTargetType.ORDER,
+              targetId: outcome.result.sourceOrderId,
+              targetLabel: outcome.result.sourceOrderNumber,
+              before: {
+                records: outcome.commissionSplit.map((c) => ({
+                  commissionId: c.commissionId,
+                  agentId: c.agentId,
+                  amountCny: c.beforeAmountCny,
+                  rate: c.rate,
+                  chainDepth: c.chainDepth,
+                })),
+              },
+              after: {
+                targetOrderNumber: outcome.result.targetOrderNumber,
+                records: outcome.commissionSplit,
+              },
+              severity: AuditSeverity.CRITICAL,
+            });
+          }
+          // 预存抵扣被搬走过 → 单独一条 CRITICAL 审计：预存流水（PrepaymentTransaction）
+          // 仍按单指向源单，订单侧的抵扣列却已分到两张单，财务对账时得有一处说得清。
+          if (outcome.prepaymentOffsetSplit) {
+            await ctx.audit({
+              action: 'SPLIT_ORDER_PREPAYMENT_OFFSET',
+              targetType: AuditTargetType.ORDER,
+              targetId: outcome.result.sourceOrderId,
+              targetLabel: outcome.result.sourceOrderNumber,
+              before: { prepaymentOffsetCny: outcome.prepaymentOffsetSplit.beforeCny },
+              after: {
+                targetOrderNumber: outcome.result.targetOrderNumber,
+                sourcePrepaymentOffsetCny: outcome.prepaymentOffsetSplit.keptCny,
+                targetPrepaymentOffsetCny: outcome.prepaymentOffsetSplit.movedCny,
+                note: '预存抵扣按份额随拆搬移；预存流水仍按单挂在源单，请财务据本条对账',
+              },
+              severity: AuditSeverity.CRITICAL,
+            });
+          }
+          // 订单级办结派生对齐（两侧各一次，**事务提交后**，与其它写送签进度的路径同一调用点约定）：
+          // 名单一分为二后「非自备签乘客是否全部已送签」两侧各自重算——拆出去的两位已送签的人
+          // 在新单上就该自动办结；源单若是派生办结写的已签证、剩下的人还没送出去则对称回退。
+          // 幂等，重复调用零副作用。
+          ctx.afterCommit(async () => {
+            await syncOrderVisaCompletion(outcome.result.sourceOrderId, {
+              userId: actor.userId,
+              role: actor.role,
+            });
+            await syncOrderVisaCompletion(outcome.result.targetOrderId, {
+              userId: actor.userId,
+              role: actor.role,
+            });
+          });
+          return outcome.result;
+        },
+      );
     } catch (err) {
       if (isUniqueViolation(err, 'orderNumber')) {
         lastError = err;
@@ -836,7 +849,19 @@ export async function splitOrder(
 
 /** 幂等回放：查 (sourceOrderId, requestToken) 既有拆单流水，命中则还原响应。 */
 export async function findSplitReplay(svc: OrderService, orderId: string, requestToken: string): Promise<SplitOrderResult | null> {
-  const prior = await prisma.orderSplitRecord.findUnique({
+  return findSplitReplayIn(prisma, orderId, requestToken);
+}
+
+/**
+ * 同上，但客户端由调用方指定：OrderMutation 内核在事务外用裸 prisma 走快路径，
+ * 拿到源单行锁后再用 tx 复查一次（并发同 token 双击，后到者在锁内命中回放）。
+ */
+export async function findSplitReplayIn(
+  db: MutationDb,
+  orderId: string,
+  requestToken: string,
+): Promise<SplitOrderResult | null> {
+  const prior = await db.orderSplitRecord.findUnique({
     where: { sourceOrderId_requestToken: { sourceOrderId: orderId, requestToken } },
     include: {
       sourceOrder: { select: { orderNumber: true } },
@@ -856,7 +881,11 @@ export async function findSplitReplay(svc: OrderService, orderId: string, reques
   };
 }
 
-/** 拆单事务内核（只在 splitOrder 的 $transaction 里调用）。 */
+/**
+ * 拆单事务内核（只在 splitOrder 的 runOrderMutation 里调用）。
+ * 源单行锁与锁内幂等复查已由 OrderMutation 内核完成：进到这里时源单行已 FOR UPDATE、
+ * 同 (源单, token) 的既有拆单流水已排除。
+ */
 export async function executeSplitWithinTx(
   svc: OrderService,
   tx: Prisma.TransactionClient,
@@ -864,57 +893,25 @@ export async function executeSplitWithinTx(
   input: SplitOrderInput,
   actor: { userId: string; role: UserRole },
   targetOrderNumber: string,
-): Promise<
-    | { kind: 'replayed'; result: SplitOrderResult }
-    | {
-        kind: 'done';
-        result: SplitOrderResult;
-        preTotalCny: number;
-        prePaidCny: number;
-        sourceTotalAfterCny: number;
-        /** 新单落库 total（份额 − 随拆分摊的售后费）——审计的 targetTotal 就取它。 */
-        targetTotalCny: number;
-        sourcePaidAfterCny: number;
-        allShareRows: Array<{ passengerId: string; netCny: number; shareCny: number }>;
-        passengerSummary: Array<{ id: string; name: string; moved: boolean }>;
-        /** 佣金劈分明细（非空 → 事务外补一条 CRITICAL 审计 SPLIT_ORDER_COMMISSION）。 */
-        commissionSplit: SplitCommissionAudit[];
-        /**
-         * 预存抵扣随拆搬移明细（非零 → 事务外补一条 CRITICAL 审计）。
-         * 老的 PrepaymentTransaction(OFFSET) 流水仍按单指向源单，搬移只改订单侧的物化列，
-         * 财务对账时要能一眼看到「这一单的抵扣被拆走了多少、去了哪张单」。
-         */
-        prepaymentOffsetSplit: { beforeCny: number; keptCny: number; movedCny: number } | null;
-      }
-  > {
-  // ── 0. 锁源单行（与改结算价/认款同一把锁），锁内幂等复查 ──
-  const locked = await tx.$queryRaw<Array<{ id: string }>>`
-    SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
-  if (locked.length === 0) throw new NotFoundError('订单不存在');
-  const priorInTx = await tx.orderSplitRecord.findUnique({
-    where: {
-      sourceOrderId_requestToken: { sourceOrderId: orderId, requestToken: input.requestToken },
-    },
-    include: {
-      sourceOrder: { select: { orderNumber: true } },
-      targetOrder: { select: { orderNumber: true } },
-    },
-  });
-  if (priorInTx) {
-    return {
-      kind: 'replayed',
-      result: {
-        sourceOrderId: priorInTx.sourceOrderId,
-        sourceOrderNumber: priorInTx.sourceOrder.orderNumber,
-        targetOrderId: priorInTx.targetOrderId,
-        targetOrderNumber: priorInTx.targetOrder.orderNumber,
-        movedShareCny: round2(Number(priorInTx.movedShareCny)),
-        movedPaidCny: round2(Number(priorInTx.movedPaidCny)),
-        passengerCount: priorInTx.passengerCount,
-        replayed: true,
-      },
-    };
-  }
+): Promise<{
+  result: SplitOrderResult;
+  preTotalCny: number;
+  prePaidCny: number;
+  sourceTotalAfterCny: number;
+  /** 新单落库 total（份额 − 随拆分摊的售后费）——审计的 targetTotal 就取它。 */
+  targetTotalCny: number;
+  sourcePaidAfterCny: number;
+  allShareRows: Array<{ passengerId: string; netCny: number; shareCny: number }>;
+  passengerSummary: Array<{ id: string; name: string; moved: boolean }>;
+  /** 佣金劈分明细（非空 → 内核事务内补一条 CRITICAL 审计 SPLIT_ORDER_COMMISSION）。 */
+  commissionSplit: SplitCommissionAudit[];
+  /**
+   * 预存抵扣随拆搬移明细（非零 → 内核事务内补一条 CRITICAL 审计）。
+   * 老的 PrepaymentTransaction(OFFSET) 流水仍按单指向源单，搬移只改订单侧的物化列，
+   * 财务对账时要能一眼看到「这一单的抵扣被拆走了多少、去了哪张单」。
+   */
+  prepaymentOffsetSplit: { beforeCny: number; keptCny: number; movedCny: number } | null;
+}> {
 
   // ── 1. 锁后读权威快照 + 重跑全部准入闸（fail-closed：预检放过的这里也要再拦一次）──
   const order = await loadOrderForSplit(tx, orderId);
@@ -1823,7 +1820,6 @@ export async function executeSplitWithinTx(
   );
 
   return {
-    kind: 'done',
     result: {
       sourceOrderId: orderId,
       sourceOrderNumber: order.orderNumber,
