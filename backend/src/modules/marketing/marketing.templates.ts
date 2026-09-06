@@ -6,8 +6,14 @@
  */
 import { findAirlineBrand, type AirlineBrand } from './airline-brands.js';
 
+// 版式 key 清单是契约的一部分（后台下拉取值 = 请求体枚举），已搬进 @ftm/contracts。
+// 这里 import 回来反过来约束下面的注册表：少一套或多一套版式，POSTER_TEMPLATES 就编译不过。
+import { POSTER_TEMPLATE_KEYS, type PosterTemplateKey } from '@ftm/contracts/marketing';
+
+export { POSTER_TEMPLATE_KEYS, type PosterTemplateKey };
+
 export interface PosterTemplate {
-  key: string;
+  key: PosterTemplateKey;
   /** 后台下拉里显示的名字。 */
   label: string;
   /** 一句话说明这套版式适合什么场景。 */
@@ -62,12 +68,12 @@ export const POSTER_TEMPLATES = [
   },
 ] as const satisfies readonly PosterTemplate[];
 
-export type PosterTemplateKey = (typeof POSTER_TEMPLATES)[number]['key'];
-
-/** 供 schema 使用的模板 key，始终从实际模板清单派生。 */
-export const POSTER_TEMPLATE_KEYS = POSTER_TEMPLATES.map(
-  (template) => template.key,
-) as [PosterTemplateKey, ...PosterTemplateKey[]];
+// 反向对账：注册表必须恰好覆盖契约里的每一套版式。少一套这里编译不过（下面的
+// Record 缺 key），多一套则上面的 PosterTemplate.key 会先报错。
+const _templatesCoverEveryKey: Record<PosterTemplateKey, true> = Object.fromEntries(
+  POSTER_TEMPLATES.map((template) => [template.key, true]),
+) as Record<PosterTemplateKey, true>;
+void _templatesCoverEveryKey;
 
 export function isPosterTemplateKey(value: string): value is PosterTemplateKey {
   return POSTER_TEMPLATES.some((template) => template.key === value);
