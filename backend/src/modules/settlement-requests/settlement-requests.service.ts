@@ -33,6 +33,8 @@ import { hasCapability } from '../../lib/capabilities.js';
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import { getDescendantAgentIds } from '../../lib/agent-tree.js';
 import { OrderService, SEAT_HOLDING_STATUSES } from '../orders/orders.service.js';
+// 订单金额单一口径（审查根因 R2）：议价申请的「应收」从这里取。
+import { payableCny } from '../../lib/order-money.js';
 import { PRICE_ADJUSTMENT_CAP_CNY } from '../orders/orders.schemas.js';
 import type {
   CreateSettlementRequestBody,
@@ -60,9 +62,9 @@ export const AGENT_SELF_SETTLEMENT_REASON_TEXT = '代理自助改结算价';
 /** 自助直通落库时给申请说明加的前缀（队列里一眼看出这条不是等运营处理的）。 */
 const AGENT_SELF_SETTLEMENT_NOTE_PREFIX = '代理自助';
 
-/** 应收口径：total + adjustmentCny（与订单详情「应收」/尾款 balanceDue 一字一致）。 */
+/** 应收口径：total + adjustmentCny（与订单详情「应收」/尾款 balanceDue 一字一致）—— lib/order-money.payableCny。 */
 export function receivableCny(order: { total: Prisma.Decimal; adjustmentCny: number }): number {
-  return round2(Number(order.total.toString()) + order.adjustmentCny);
+  return payableCny(order);
 }
 
 export interface SettlementRequestActor {

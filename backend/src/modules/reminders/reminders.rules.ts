@@ -46,6 +46,8 @@ import {
   ourUnsubmittedVisaPassengersWhere,
   ourVisaPassengersWhere,
 } from '../fulfillment/visa-state.js';
+// 订单金额单一口径（审查根因 R2）：尾款走 Decimal 精确变体。
+import { balanceDueDecimal } from '../../lib/order-money.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { RANDOM_TIER_LEGACY_CITY_CODE } from '../hotel-control/hotel-city.js';
 import {
@@ -170,17 +172,14 @@ export function formatAmount(v: Prisma.Decimal): string {
   return fixed.includes('.') ? fixed.replace(/0+$/, '').replace(/\.$/, '') : fixed;
 }
 
-/** 尾款口径（与财务一致）：total + adjustmentCny − paidAmount − prepaymentOffset */
+/** 尾款口径（与财务一致）：total + adjustmentCny − paidAmount − prepaymentOffset（Decimal 精确，不舍入）—— lib/order-money。 */
 export function computeBalance(order: {
   total: Prisma.Decimal;
   adjustmentCny: number;
   paidAmount: Prisma.Decimal;
   prepaymentOffset: Prisma.Decimal;
 }): Prisma.Decimal {
-  return new Prisma.Decimal(order.total)
-    .plus(order.adjustmentCny)
-    .minus(order.paidAmount)
-    .minus(order.prepaymentOffset);
+  return balanceDueDecimal(order);
 }
 
 // ── 出发时间推导 ────────────────────────────────────────────────────────────

@@ -28,8 +28,7 @@
  *                        立减是否入基数**待拍板**（现状不含，保持）
  *   订单总额 total      = 仪表盘营收 / 代理成交额 / 结算单 GMV 的 DB 聚合口径（不含售后费）
  */
-import type { Prisma } from '@prisma/client';
-import { OrderItemKind, ProductKind } from '@prisma/client';
+import { OrderItemKind, Prisma, ProductKind } from '@prisma/client';
 import {
   netReceivedCny as netReceivedFromLib,
   sumCompletedRefundCny,
@@ -142,14 +141,18 @@ export function balanceDueCents(order: BalanceOrderShape): number {
   );
 }
 
-/** 提醒引擎用的 Decimal 精确尾款（total + adjustmentCny − paidAmount − prepaymentOffset，不四舍五入）。 */
+/** 提醒引擎用的 Decimal 精确尾款（total + adjustmentCny − paidAmount − prepaymentOffset，不四舍五入）。
+ * 镜像 reminders.rules computeBalance 原式：先 `new Prisma.Decimal(total)` 再链式加减。 */
 export function balanceDueDecimal(order: {
   total: Prisma.Decimal;
   adjustmentCny: number;
   paidAmount: Prisma.Decimal;
   prepaymentOffset: Prisma.Decimal;
 }): Prisma.Decimal {
-  return order.total.plus(order.adjustmentCny).minus(order.paidAmount).minus(order.prepaymentOffset);
+  return new Prisma.Decimal(order.total)
+    .plus(order.adjustmentCny)
+    .minus(order.paidAmount)
+    .minus(order.prepaymentOffset);
 }
 
 /**

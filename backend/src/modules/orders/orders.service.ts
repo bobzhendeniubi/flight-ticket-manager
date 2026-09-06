@@ -86,6 +86,8 @@ import {
 import type { LegStatusItemLike, PublicLegStatus } from './orders.leg-status.js';
 import { computePerPaxShares, spreadableAdjustmentCny } from './per-pax-share.js';
 import { groupPassengerAdjustments } from './order-adjustment-lines.js';
+// 订单金额单一口径（审查根因 R2）：DTO 的应收 / 尾款从这里取；本文件写路径里的内联清账公式本批不动。
+import { balanceDueCny, payableCny } from '../../lib/order-money.js';
 import {
   deriveRoomsToMove,
   isTerminalLegItem,
@@ -24458,12 +24460,12 @@ export function serializeOrder<T extends OrderLike>(
   //   balanceDue       = effectivePayable − paidAmount − prepaymentOffset（尾款；负数表示多付）
   //     · prepaymentOffset（代理预存抵扣）视同已付，必须一并扣减，否则详情尾款与报表/提醒/导出对不平。
   // 不改 total/subtotal（机票基础价不重算），只在结清口径上暴露派生值，前端统一用此尾款。
+  // 两者都从 lib/order-money 取（审查根因 R2 的单一口径入口），本函数不再自己写 total + adjustmentCny。
+  // adjustmentCny 原样透出给前端；totalNum 只喂套餐按人头单价派生（不参与应收/尾款）。
   const adjustmentCny = order.adjustmentCny ?? 0;
   const totalNum = Number(order.total.toString());
-  const paidNum = Number(order.paidAmount.toString());
-  const prepaymentOffsetNum = Number(order.prepaymentOffset.toString());
-  const effectivePayable = round2(totalNum + adjustmentCny);
-  const balanceDue = round2(effectivePayable - paidNum - prepaymentOffsetNum);
+  const effectivePayable = payableCny(order);
+  const balanceDue = balanceDueCny(order);
   // 按 passengerType 统计人数（订单详情行程单「人数」板块用；未 include passengers/无 passengerType
   // 字段时安全落 0，不强行断言——如 listOrders 的 passengers select 只带 id/fullName）。
   const passengerTypeOf = (p: Record<string, unknown>): string =>

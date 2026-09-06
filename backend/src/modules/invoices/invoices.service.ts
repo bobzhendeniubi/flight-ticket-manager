@@ -26,6 +26,8 @@ import {
 } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { businessDateISO } from '../../lib/business-time.js';
+// 订单金额单一口径（审查根因 R2）：开票金额 = 应收，从这里取。
+import { payableCny } from '../../lib/order-money.js';
 import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 
 export const INVOICE_TYPE_LABEL: Record<InvoiceType, string> = {
@@ -264,12 +266,12 @@ export function assertOrdersOwned(
   }
 }
 
-/** 订单的开票金额口径 = 应收 = total + adjustmentCny（与「尾款」同一套应付口径）。 */
+/** 订单的开票金额口径 = 应收 = total + adjustmentCny（与「尾款」同一套应付口径）—— lib/order-money.payableCny。 */
 export function orderInvoiceableCny(order: {
   total: Prisma.Decimal | number;
   adjustmentCny: number;
 }): number {
-  return round2(dec(order.total) + order.adjustmentCny);
+  return payableCny(order);
 }
 
 export async function requestInvoice(
