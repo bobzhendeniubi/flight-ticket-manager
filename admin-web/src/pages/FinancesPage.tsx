@@ -16,6 +16,8 @@ import { formatLocalTime } from '../lib/airports';
 import { formatDateTimeSecCn, formatInBusinessTz } from '../lib/datetime';
 import { Icon } from '../components/Icon';
 import { RefundPayoutQueue } from '../components/RefundPayoutQueue';
+import { SupplierPayablesTab } from './finances/SupplierPayablesTab';
+import { InvoicesTab } from './finances/InvoicesTab';
 import {
   api,
   ApiError,
@@ -38,7 +40,15 @@ import { UsdRateInput } from '../components/UsdRateInput';
 import { useConfirm } from '../components/ConfirmDialog';
 import { useDialogA11y } from '../components/Modal';
 
-type Tab = 'summary' | 'flights' | 'orders' | 'monthly' | 'costs' | 'payouts';
+type Tab =
+  | 'summary'
+  | 'flights'
+  | 'orders'
+  | 'monthly'
+  | 'costs'
+  | 'payouts'
+  | 'payables'
+  | 'invoices';
 
 const KIND_LABEL: Record<string, string> = {
   FLIGHT: '机票',
@@ -371,6 +381,12 @@ export function FinancesPage() {
         <TabBtn active={tab === 'payouts'} onClick={() => setTab('payouts')}>
           待打款
         </TabBtn>
+        <TabBtn active={tab === 'payables'} onClick={() => setTab('payables')}>
+          供应商应付
+        </TabBtn>
+        <TabBtn active={tab === 'invoices'} onClick={() => setTab('invoices')}>
+          发票
+        </TabBtn>
       </nav>
 
       {tab === 'summary' && <SummaryTab token={token} range={range} />}
@@ -381,6 +397,10 @@ export function FinancesPage() {
       {/* 待打款：已核准但钱还没打出去的退款。不吃上面的日期区间——队列是「还没做完的事」，
           按时间段筛会把更早的漏账藏起来，正是本页要暴露的东西。 */}
       {tab === 'payouts' && <RefundPayoutQueue />}
+      {/* 供应商应付 / 发票：同样不吃上面的日期区间——它们各自带筛选，
+          且账是「还没做完的事」，被 30 天窗口一夹就把更早的漏账藏起来了。 */}
+      {tab === 'payables' && <SupplierPayablesTab token={token} />}
+      {tab === 'invoices' && <InvoicesTab token={token} />}
     </div>
   );
 }
