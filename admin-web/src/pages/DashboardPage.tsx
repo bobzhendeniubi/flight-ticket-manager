@@ -190,6 +190,35 @@ function KpiCard({
   );
 }
 
+/** 距今小时数，向下取整；未来时间（时钟漂移）钳到 0。 */
+function hoursSince(iso: string): number {
+  const diffMs = Date.now() - new Date(iso).getTime();
+  return Math.max(0, Math.floor(diffMs / (60 * 60 * 1000)));
+}
+
+const REMINDER_STALE_HOURS = 24;
+
+/**
+ * 「提醒上次生成」一行：不管上面预警条是红是绿是灰，都要单独交代一句「这个数是什么时候
+ * 跑出来的」——0 待办可能是真清零，也可能是压根没人跑过生成规则扫描，两者天差地别。
+ * 从未生成过 / 超过 24 小时未生成 都标琥珀色；正常范围内用中性灰。
+ */
+function ReminderFreshnessNote({ at }: { at: string | null }) {
+  const stale = at === null || hoursSince(at) >= REMINDER_STALE_HOURS;
+  const text = at === null ? '提醒上次生成：从未' : `提醒上次生成：${hoursSince(at)} 小时前`;
+  return (
+    <Link
+      to="/reminders"
+      className={`inline-flex items-center gap-1 text-xs underline-offset-2 hover:underline ${
+        stale ? 'font-medium text-amber-600' : 'text-ink-muted'
+      }`}
+      title={at === null ? '尚未跑过规则扫描，待办数字可能不反映真实风险' : undefined}
+    >
+      {text}
+    </Link>
+  );
+}
+
 /**
  * 今日预警条：把散在各页的预警数聚成一眼可见的一条（提醒中心待办 + 房控四类）。
  * 全为 0 时渲染一条安静的绿色状态；加载失败/未返回时整条不渲染（不挡仪表盘）。
@@ -213,6 +242,7 @@ function AlertsSummaryBar({ alerts }: { alerts: DashboardAlertsSummary | null })
       <section className="flex items-center gap-2 rounded-lg border border-emerald-200 bg-emerald-50 px-4 py-2.5 text-sm text-emerald-700">
         <span className="h-1.5 w-1.5 rounded-full bg-emerald-500" />
         今日预警：暂无 —— 待办与房控预警均已清零。
+        <ReminderFreshnessNote at={alerts.reminderLastGeneratedAt} />
         <Link to="/reminders" className="ml-auto text-xs text-emerald-700 underline underline-offset-2 hover:text-emerald-900">
           去提醒中心生成今日提醒
         </Link>
@@ -240,6 +270,7 @@ function AlertsSummaryBar({ alerts }: { alerts: DashboardAlertsSummary | null })
           <span className="font-semibold">{c.count}</span>
         </Link>
       ))}
+      <ReminderFreshnessNote at={alerts.reminderLastGeneratedAt} />
       <span className="ml-auto text-xs opacity-70">点击数字进对应页面处理</span>
     </section>
   );

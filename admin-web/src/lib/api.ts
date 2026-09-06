@@ -3276,6 +3276,8 @@ export interface DashboardAlertsSummary {
     overCapacitySchedules: number;
     sharedOddNear: number;
   };
+  /** 提醒规则「上次生成」时间（自动/手动取较晚者），从未生成过为 null。 */
+  reminderLastGeneratedAt: string | null;
 }
 
 export interface DashboardWeeklyPoint { date: string; revenue: number; orders: number }

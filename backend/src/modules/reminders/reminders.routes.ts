@@ -28,6 +28,7 @@ import {
   workOrderSummaryQuerySchema,
 } from './reminders.schemas.js';
 import { generateRuleReminders } from './reminders.rules.js';
+import { REMINDER_MANUAL_LAST_RUN_KEY } from './reminders-daily.js';
 
 export const reminderRoutes: FastifyPluginAsync = async (app) => {
   const requireOps = {
@@ -160,6 +161,14 @@ export const reminderRoutes: FastifyPluginAsync = async (app) => {
       action: 'GENERATE_RULE_REMINDERS',
       targetType: 'SYSTEM',
       after: { created: result.created, skipped: result.skipped, byRule: result.byRule },
+    });
+    // 供仪表盘「提醒上次生成」展示：与自动生成共用同一份「上次生成时间」概念，
+    // 手动/自动各自维护一个 key，仪表盘取两者较晚的一个（见 dashboard.service.ts）。
+    const summary = { at: new Date().toISOString(), created: result.created, byRule: result.byRule };
+    await prisma.systemSetting.upsert({
+      where: { key: REMINDER_MANUAL_LAST_RUN_KEY },
+      create: { key: REMINDER_MANUAL_LAST_RUN_KEY, value: JSON.stringify(summary), updatedById: req.user.sub },
+      update: { value: JSON.stringify(summary), updatedById: req.user.sub },
     });
     return result;
   });

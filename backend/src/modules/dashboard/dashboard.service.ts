@@ -10,6 +10,21 @@ import { OrderStatus, Prisma, ReminderStatus, ReminderPriority } from '@prisma/c
 import { prisma } from '../../db/prisma.js';
 import { businessDateISO, startOfBusinessDayUtc } from '../../lib/business-time.js';
 import { getAlerts } from '../hotel-control/hotel-control.service.js';
+import { REMINDER_AUTO_LAST_RUN_KEY, REMINDER_MANUAL_LAST_RUN_KEY } from '../reminders/reminders-daily.js';
+
+/** SystemSetting 里的 {auto,manual}LastRun 是 JSON 字符串 `{ at, created, byRule }`；
+ * 解析失败 / 缺字段一律当「没跑过」，不让脏值把仪表盘炸掉。 */
+function parseLastRunAtMs(value: string | undefined): number | null {
+  if (!value) return null;
+  try {
+    const parsed = JSON.parse(value) as { at?: unknown };
+    if (typeof parsed.at !== 'string') return null;
+    const ms = new Date(parsed.at).getTime();
+    return Number.isNaN(ms) ? null : ms;
+  } catch {
+    return null;
+  }
+}
 
 const PAID_LIKE_STATUSES: OrderStatus[] = [
   'PAID', 'PROCESSING', 'TICKETED', 'COMPLETED', 'CHANGE_REQUESTED', 'CHANGED',
@@ -26,13 +41,23 @@ export class DashboardService {
   async getAlertsSummary() {
     // 「待办」= 未完成（新建待处理 + 已认领处理中）；DONE/SKIPPED 不算。
     const openStatuses = [ReminderStatus.OPEN, ReminderStatus.IN_PROGRESS];
-    const [pending, critical, hotelAlerts] = await Promise.all([
+    const [pending, critical, hotelAlerts, autoLastRun, manualLastRun] = await Promise.all([
       prisma.operationalReminder.count({ where: { status: { in: openStatuses } } }),
       prisma.operationalReminder.count({
         where: { status: { in: openStatuses }, priority: ReminderPriority.CRITICAL },
       }),
       getAlerts(14),
+      prisma.systemSetting.findUnique({ where: { key: REMINDER_AUTO_LAST_RUN_KEY } }),
+      prisma.systemSetting.findUnique({ where: { key: REMINDER_MANUAL_LAST_RUN_KEY } }),
     ]);
+    // 「提醒上次生成」= 自动/手动两条时间线里较晚的一条；两条都没有 → null（前端标「从未」）。
+    // 消灭「0 待办 = 没风险」的假象——0 可能是真清零，也可能是压根没人跑过生成。
+    const lastRunCandidates = [
+      parseLastRunAtMs(autoLastRun?.value),
+      parseLastRunAtMs(manualLastRun?.value),
+    ].filter((ms): ms is number => ms !== null);
+    const reminderLastGeneratedAt =
+      lastRunCandidates.length > 0 ? new Date(Math.max(...lastRunCandidates)).toISOString() : null;
     return {
       reminders: { pending, critical },
       hotel: {
@@ -41,6 +66,7 @@ export class DashboardService {
         overCapacitySchedules: hotelAlerts.overCapacitySchedules.length,
         sharedOddNear: hotelAlerts.sharedOddNear.length,
       },
+      reminderLastGeneratedAt,
     };
   }
 
