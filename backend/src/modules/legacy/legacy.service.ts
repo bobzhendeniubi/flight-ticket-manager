@@ -1,5 +1,6 @@
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
+import { startOfBusinessDayUtc } from '../../lib/business-time.js';
 
 export interface LegacyTicketListQuery {
   q?: string;
@@ -13,10 +14,18 @@ export interface LegacyTicketListQuery {
   pageSize: number;
 }
 
+/**
+ * 'YYYY-MM-DD' → 当天北京业务日零点对应的 UTC 时刻（区间下界 gte）。
+ *
+ * C-8：legacyCreateTime 是老系统录入这条档案的真实动作时刻（DateTime，非 @db.Date），
+ * 原来按裸 UTC 午夜切会把北京时间 00:00–07:59 录入的老票据划进前一天，
+ * 筛选结果与其它按北京日口径的报表/仪表盘对不上。
+ */
 function dateStart(value: string): Date {
-  return new Date(`${value}T00:00:00.000Z`);
+  return startOfBusinessDayUtc(new Date(`${value}T00:00:00Z`));
 }
 
+/** 区间上界（exclusive）：次日北京业务日零点，构成 [dateFrom, dateTo] 两端闭合的整天区间。*/
 function dateEndExclusive(value: string): Date {
   const date = dateStart(value);
   date.setUTCDate(date.getUTCDate() + 1);

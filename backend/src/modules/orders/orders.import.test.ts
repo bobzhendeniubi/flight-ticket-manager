@@ -20,6 +20,7 @@ import {
   OrderImportError,
   parseOrderImportXlsx,
   resolveOrderImport,
+  scheduleMatchWindow,
   ORDER_IMPORT_MAX_BYTES,
   type OrderImportMatchDeps,
   type OrderImportScheduleLite,
@@ -466,5 +467,33 @@ describe('matchCabinText', () => {
     expect(matchCabinText('超级经济舱')).toBe('PREMIUM_ECONOMY');
     expect(matchCabinText('')).toBeNull();
     expect(matchCabinText('豪华太空舱')).toBeNull();
+  });
+});
+
+// ── scheduleMatchWindow：findSchedules 粗召回窗口（C-7，纯函数、不连库）──────
+describe('scheduleMatchWindow — 批量导入班次匹配的粗召回时间窗口', () => {
+  it('单日批次：下界与上界都各放宽 1 天（红眼容差）', () => {
+    const { min, max } = scheduleMatchWindow(['2026-07-13']);
+    expect(min.toISOString()).toBe('2026-07-12T00:00:00.000Z');
+    expect(max.toISOString()).toBe('2026-07-14T00:00:00.000Z');
+  });
+
+  it('多日批次：下界取最早日期再减 1 天，上界取最晚日期再加 1 天', () => {
+    const { min, max } = scheduleMatchWindow(['2026-07-15', '2026-07-13', '2026-07-20']);
+    expect(min.toISOString()).toBe('2026-07-12T00:00:00.000Z');
+    expect(max.toISOString()).toBe('2026-07-21T00:00:00.000Z');
+  });
+
+  it('放宽后的窗口能覆盖批次最早一天的红眼航班（当地凌晨起飞，UTC 分量落在前一天）', () => {
+    // 当地时间（UTC+7）2026-07-13 00:40 起飞 == UTC 2026-07-12T17:40Z；批次最早一天是 07-13。
+    const redEyeDepartureUtc = new Date('2026-07-12T17:40:00.000Z');
+    const { min, max } = scheduleMatchWindow(['2026-07-13', '2026-07-15']);
+    expect(redEyeDepartureUtc >= min && redEyeDepartureUtc < max).toBe(true);
+  });
+
+  it('未放宽下界会漏掉这条红眼班次（回归对照：证明放宽确有必要）', () => {
+    const redEyeDepartureUtc = new Date('2026-07-12T17:40:00.000Z');
+    const unwidenedMin = new Date('2026-07-13T00:00:00.000Z');
+    expect(redEyeDepartureUtc < unwidenedMin).toBe(true);
   });
 });

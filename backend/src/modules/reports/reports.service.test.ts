@@ -111,6 +111,32 @@ describe('getSalesReport — 缺成本时毛利报「未知」而不是虚高数
   });
 });
 
+describe('getSalesReport — 日期区间按北京业务日切，而不是裸 UTC 午夜（C-8）', () => {
+  it('from/to 折算成北京业务日边界（[gte 当天北京零点, lt 次日北京零点)）', async () => {
+    const findMany = vi.fn().mockResolvedValue([]);
+    const client = { order: { findMany } } as unknown as PrismaClient;
+
+    await getSalesReport({ from: '2026-09-01', to: '2026-09-01' }, 'kind', client);
+
+    const { createdAt } = findMany.mock.calls[0]![0].where;
+    // 北京 2026-09-01 00:00 = UTC 2026-08-31T16:00Z；次日北京零点（上界，exclusive）= UTC 2026-09-01T16:00Z
+    expect(createdAt.gte.toISOString()).toBe('2026-08-31T16:00:00.000Z');
+    expect(createdAt.lt.toISOString()).toBe('2026-09-01T16:00:00.000Z');
+  });
+
+  it('北京时间凌晨下单的订单落在当天区间内（旧的裸 UTC 午夜口径会把它划进前一天）', async () => {
+    const findMany = vi.fn().mockResolvedValue([]);
+    const client = { order: { findMany } } as unknown as PrismaClient;
+
+    await getSalesReport({ from: '2026-09-01', to: '2026-09-01' }, 'kind', client);
+
+    const { gte, lt } = findMany.mock.calls[0]![0].where.createdAt;
+    // 北京 2026-09-01 03:00 下单 = UTC 2026-08-31T19:00Z
+    const orderCreatedAt = new Date('2026-08-31T19:00:00.000Z');
+    expect(orderCreatedAt >= gte && orderCreatedAt < lt).toBe(true);
+  });
+});
+
 interface ReceivableFixture {
   orderNumber: string;
   total: number;

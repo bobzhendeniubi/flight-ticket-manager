@@ -147,6 +147,29 @@ describe('departureDateOf — 最早出发日', () => {
     expect(departureDateOf(items)).toBe('2026-08-01');
   });
 
+  it('红眼航班：出发瞬时 UTC 分量落在前一天时，按出发地当地日返回而非裸 UTC（C-28）', () => {
+    // 当地时间（Asia/Ho_Chi_Minh, UTC+7）2026-07-13 00:40 起飞 == UTC 2026-07-12T17:40Z。
+    // 裸按 UTC 折会显示 2026-07-12，让这单看起来比实际更紧急（提前一天）。
+    const items = [
+      {
+        kind: 'FLIGHT',
+        hotelCheckIn: null,
+        flightSchedule: {
+          departureTime: new Date('2026-07-12T17:40:00.000Z'),
+          departureTz: 'Asia/Ho_Chi_Minh',
+        },
+      },
+    ];
+    expect(departureDateOf(items)).toBe('2026-07-13');
+  });
+
+  it('未联查 departureTz 的旧调用方 → 回退裸 UTC（行为不变）', () => {
+    const items = [
+      { kind: 'FLIGHT', hotelCheckIn: null, flightSchedule: { departureTime: new Date('2026-07-12T17:40:00.000Z') } },
+    ];
+    expect(departureDateOf(items)).toBe('2026-07-12');
+  });
+
   it('有机票行时不被酒店日期干扰（机票优先）', () => {
     const items = [
       { kind: 'HOTEL', hotelCheckIn: new Date('2026-08-01T00:00:00Z'), flightSchedule: null },

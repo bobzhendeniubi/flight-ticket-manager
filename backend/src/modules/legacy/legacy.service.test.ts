@@ -32,6 +32,19 @@ describe('历史档案查询服务', () => {
     }));
   });
 
+  it('dateFrom/dateTo 折算成北京业务日边界，而不是裸 UTC 午夜（C-8）', async () => {
+    prismaMock.legacyTicket.findMany.mockResolvedValue([]);
+    prismaMock.legacyTicket.count.mockResolvedValue(0);
+    await listLegacyTickets({ dateFrom: '2026-09-01', dateTo: '2026-09-01', page: 1, pageSize: 20 });
+    const where = prismaMock.legacyTicket.findMany.mock.calls[0]![0].where;
+    // 北京 2026-09-01 00:00 = UTC 2026-08-31T16:00Z；次日北京零点（上界，exclusive）= UTC 2026-09-01T16:00Z
+    expect(where.legacyCreateTime.gte.toISOString()).toBe('2026-08-31T16:00:00.000Z');
+    expect(where.legacyCreateTime.lt.toISOString()).toBe('2026-09-01T16:00:00.000Z');
+    // 北京时间凌晨 03:00 录入的老票据（UTC 2026-08-31T19:00Z）落在这个区间内，不会被划进前一天。
+    const legacyCreatedAt = new Date('2026-08-31T19:00:00.000Z');
+    expect(legacyCreatedAt >= where.legacyCreateTime.gte && legacyCreatedAt < where.legacyCreateTime.lt).toBe(true);
+  });
+
   it('passes an exact data issue filter to the archive query', async () => {
     prismaMock.legacyTicket.findMany.mockResolvedValue([]);
     prismaMock.legacyTicket.count.mockResolvedValue(0);

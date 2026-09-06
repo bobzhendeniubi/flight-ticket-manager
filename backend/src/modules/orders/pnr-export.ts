@@ -36,9 +36,21 @@ function ageInYearsAt(dob: Date, at: Date): number {
   return age;
 }
 
+/** age → PTC 码：<2 岁 INF、2–<12 岁 CHD、≥12 岁 ADT；负数（生日晚于出发日，数据异常）→ null 交调用方回退。*/
+function ptcFromAge(age: number): string | null {
+  if (age < 0) return null;
+  if (age < 2) return 'INF';
+  if (age < 12) return 'CHD';
+  return 'ADT';
+}
+
 /**
  * PTC 按「出发日 − 出生日期」实足年龄推算（航司口径）：<2 岁 INF、2–<12 岁 CHD、≥12 岁 ADT。
  * 出生日期缺失、或出发日取不到（纯地面单/无航班行）→ 回退录入的 passengerType，不阻断导出。
+ *
+ * 注意（C-6）：departureDate 必须是「出发地当地日」（可用 UTC 零点表示，如
+ * earliestFlightDeparture 折算后的返回值），不能是裸的航班出发瞬时——红眼航班当地日与 UTC 日
+ * 不同，用瞬时会在生日恰逢出发当天时把年龄多算/少算一天，边界误判 PTC。
  */
 export function derivePtcByAge(
   dob: Date | null | undefined,
@@ -46,11 +58,26 @@ export function derivePtcByAge(
   fallbackPassengerType: string,
 ): string {
   if (!dob || !departureDate) return passengerTypeCode(fallbackPassengerType);
-  const age = ageInYearsAt(dob, departureDate);
-  if (age < 0) return passengerTypeCode(fallbackPassengerType); // 生日晚于出发日：数据异常，回退录入值
-  if (age < 2) return 'INF';
-  if (age < 12) return 'CHD';
-  return 'ADT';
+  const ptc = ptcFromAge(ageInYearsAt(dob, departureDate));
+  return ptc ?? passengerTypeCode(fallbackPassengerType);
+}
+
+/**
+ * PTC 推算的当地日版本（C-6 新 helper）：直接接收已折算好的「出发地当地日」字符串
+ * （YYYY-MM-DD，如 earliestFlightDepartureLocalDate 的返回值），而不是要求调用方先把
+ * 本地日包回一个 UTC 零点 Date 再传给 derivePtcByAge——语义更直白，供后续调用方
+ * （如 orders.service.ts 的乘客类型服务端权威派生）逐步切换到「先拿本地日字符串」的写法。
+ * 生日/当地出发日缺失 → 回退录入的 passengerType，与 derivePtcByAge 同口径。
+ */
+export function derivePtcByLocalDate(
+  dob: Date | null | undefined,
+  departureLocalDate: string | null | undefined,
+  fallbackPassengerType: string,
+): string {
+  if (!dob || !departureLocalDate) return passengerTypeCode(fallbackPassengerType);
+  const departureDate = new Date(`${departureLocalDate}T00:00:00.000Z`);
+  const ptc = ptcFromAge(ageInYearsAt(dob, departureDate));
+  return ptc ?? passengerTypeCode(fallbackPassengerType);
 }
 
 /**
@@ -64,15 +91,38 @@ function deriveTitle(title: string | null | undefined, gender: string | null | u
   return '';
 }
 
-/** 订单 FLIGHT 行里最早的出发时间（票务岗口径的"去程"）；无 FLIGHT 行（纯地面单）→ null。*/
+/**
+ * 订单 FLIGHT 行里最早的出发时间（票务岗口径的"去程"）；无 FLIGHT 行（纯地面单）→ null。
+ *
+ * C-6 修复：返回值折算成「出发地当地日的 UTC 零点」而不是裸瞬时——下游全部通过
+ * getUTCDate()/getUTCMonth()/getUTCFullYear() 读日期分量（PNR 文件名、derivePtcByAge 年龄
+ * 判定、进单统计出发日分组列），红眼航班当地凌晨起飞时瞬时的 UTC 分量会落在前一天，
+ * 这里统一折算一次，调用方全部不用改代码就能拿到当地日。联查了 departureTz 才折算；
+ * 旧调用方（未在 select 里带 departureTz）保持裸 UTC 回退，行为不变（见 orders.service.ts
+ * 待跟进的三处调用，需要它们各自的 select 补上 departureTz 才能吃到这个修复）。
+ * 只需要日期字符串（不需要包回 Date）的场景改用 earliestFlightDepartureLocalDate。
+ */
 export function earliestFlightDeparture(
-  items: Array<{ kind: string; flightSchedule?: { departureTime: Date } | null }> | null | undefined,
+  items:
+    | Array<{
+        kind: string;
+        flightSchedule?: { departureTime: Date; departureTz?: string | null } | null;
+      }>
+    | null
+    | undefined,
 ): Date | null {
-  const departures = (items ?? [])
-    .filter((it) => it.kind === 'FLIGHT' && it.flightSchedule)
-    .map((it) => it.flightSchedule!.departureTime);
-  if (departures.length === 0) return null;
-  return departures.reduce((min, d) => (d < min ? d : min));
+  let earliest: { at: Date; tz: string | null } | null = null;
+  for (const it of items ?? []) {
+    if (it.kind !== 'FLIGHT' || !it.flightSchedule) continue;
+    const at = it.flightSchedule.departureTime;
+    if (earliest === null || at < earliest.at) {
+      earliest = { at, tz: it.flightSchedule.departureTz ?? null };
+    }
+  }
+  if (!earliest) return null;
+  if (!earliest.tz) return earliest.at;
+  const localDate = localDateISO(earliest.at, earliest.tz);
+  return new Date(`${localDate}T00:00:00.000Z`);
 }
 
 /**
@@ -198,9 +248,10 @@ export function passengerToRow(p: Passenger, departureDate?: Date | null): PnrRo
 export interface PnrOrderInput {
   orderNumber: string;
   passengers: Passenger[];
-  // FLIGHT 行（含关联班次出发时间）—— 用于按「出发日 − 出生日期」自动推 PTC；
+  // FLIGHT 行（含关联班次出发时间+时区）—— 用于按「出发地当地日 − 出生日期」自动推 PTC；
+  // departureTz 缺失时 earliestFlightDeparture 回退裸 UTC（C-6：联查了时区才能折算当地日）。
   // 纯地面单（无机票行）传空/不传，PTC 回退录入的 passengerType。
-  items?: Array<{ kind: string; flightSchedule?: { departureTime: Date } | null }>;
+  items?: Array<{ kind: string; flightSchedule?: { departureTime: Date; departureTz?: string | null } | null }>;
 }
 
 export async function buildPnrWorkbook(order: PnrOrderInput): Promise<Buffer> {

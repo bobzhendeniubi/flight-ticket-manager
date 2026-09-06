@@ -16,6 +16,7 @@
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import { startOfBusinessDayUtc } from '../../lib/business-time.js';
 import {
   netReceivedCny,
   sumCompletedRefundCny,
@@ -151,21 +152,18 @@ const CHANNEL_LABELS: Record<string, string> = {
 const DIRECT_KEY = 'direct';
 const DIRECT_LABEL = '直客';
 
-function toDateOnlyUtc(s: string, endOfDay = false): Date {
-  // 'YYYY-MM-DD' → UTC midnight (or 23:59:59.999) — 与 finances 一致
-  const [y, m, d] = s.split('-').map((x) => parseInt(x, 10));
-  if (!y || !m || !d) throw new Error(`invalid date: ${s}`);
-  return new Date(
-    Date.UTC(
-      y,
-      m - 1,
-      d,
-      endOfDay ? 23 : 0,
-      endOfDay ? 59 : 0,
-      endOfDay ? 59 : 0,
-      endOfDay ? 999 : 0,
-    ),
-  );
+/**
+ * 'YYYY-MM-DD' 起止日期 → 北京业务日整段区间 [gte, lt)。
+ *
+ * C-8：原来（toDateOnlyUtc）按 UTC 午夜切窗口——Order.createdAt 是「下单动作发生时刻」的
+ * 真实 DateTime（不带 @db.Date），按项目约定这类系统戳该折到北京日再切，否则北京时间
+ * 00:00–07:59 下的单会被划进前一天，报表口径与仪表盘/订单列表（都按北京日）对不上。
+ */
+function businessDayRangeUtc(range: DateRange): { gte: Date; lt: Date } {
+  const gte = startOfBusinessDayUtc(new Date(`${range.from}T00:00:00Z`));
+  const toDayStart = startOfBusinessDayUtc(new Date(`${range.to}T00:00:00Z`));
+  const lt = new Date(toDayStart.getTime() + DAY_MS); // 「to」这天结束＝次日北京零点（Asia/Shanghai 无夏令时，固定 +8）
+  return { gte, lt };
 }
 
 function dec(v: Prisma.Decimal | number | null | undefined): number {
@@ -219,11 +217,10 @@ export async function getSalesReport(
   dim: SalesDim,
   client: PrismaClient = defaultPrisma,
 ): Promise<SalesReport> {
-  const from = toDateOnlyUtc(range.from);
-  const to = toDateOnlyUtc(range.to, true);
+  const { gte, lt } = businessDayRangeUtc(range);
 
   const orders = await client.order.findMany({
-    where: { deletedAt: null, createdAt: { gte: from, lte: to }, status: { in: COUNTED_STATUSES } },
+    where: { deletedAt: null, createdAt: { gte, lt }, status: { in: COUNTED_STATUSES } },
     select: {
       id: true,
       agentId: true,

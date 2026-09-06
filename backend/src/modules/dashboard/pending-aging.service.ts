@@ -18,6 +18,7 @@
  */
 import type { Prisma } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
+import { earliestFlightDepartureLocalDate } from '../orders/pnr-export.js';
 
 const HOUR_MS = 3_600_000;
 const DAY_MS = 24 * HOUR_MS;
@@ -112,26 +113,35 @@ export function bucketCreatedAtWhere(bucket: PendingAgingBucket, now: Date): Pri
 type ItemLike = {
   kind: string;
   hotelCheckIn: Date | null;
-  flightSchedule: { departureTime: Date } | null;
+  // departureTz 可选：C-28 修复需要它才能把红眼航班折到出发地当地日；未联查时
+  // earliestFlightDepartureLocalDate 回退裸 UTC（旧行为不变，不会比修复前更差）。
+  flightSchedule: { departureTime: Date; departureTz?: string | null } | null;
   /** 签证预计出行日期（VISA 行专用，@db.Date）：纯签证单的出发日锚点；缺省/null = 未填 */
   visaIntendedDate?: Date | null;
 };
 
 /**
- * 订单行 → 最早出发日（YYYY-MM-DD, UTC）。
- * 机票行取 departureTime，没有机票行则退到酒店入住日，再没有则退到签证预计出行日期
- * （纯签证单的业务日期锚点）；都没有 → null。
- * 与订单列表的出行日期口径同源（FLIGHT: departureTime；HOTEL: hotelCheckIn；VISA: visaIntendedDate）。
+ * 订单行 → 最早出发日（YYYY-MM-DD）。
+ * 机票行取 departureTime——按出发地当地日折算（C-28：红眼航班当地凌晨起飞时 UTC 分量落在
+ * 前一天，仪表盘会把这单显示得比实际更紧急，提前一天）；没有机票行则退到酒店入住日，
+ * 再没有则退到签证预计出行日期（纯签证单的业务日期锚点）；都没有 → null。
+ * hotelCheckIn / visaIntendedDate 是 @db.Date（库里存 UTC 午夜的纯日历日），按 UTC 切
+ * 才是对的，不能套用北京业务日/航班当地日那套折算（否则会把日期整体推错）。
+ * 与订单列表的出行日期口径同源（FLIGHT: departureTime 当地日；HOTEL: hotelCheckIn；VISA: visaIntendedDate）。
  */
 export function departureDateOf(items: ItemLike[]): string | null {
+  const flightLocalDate = earliestFlightDepartureLocalDate(
+    items
+      .filter((it): it is ItemLike & { flightSchedule: NonNullable<ItemLike['flightSchedule']> } =>
+        Boolean(it.flightSchedule),
+      )
+      .map((it) => ({ kind: 'FLIGHT', flightSchedule: it.flightSchedule })),
+  );
+  if (flightLocalDate) return flightLocalDate;
+
   const times: number[] = [];
   for (const it of items) {
-    if (it.flightSchedule) times.push(it.flightSchedule.departureTime.getTime());
-  }
-  if (times.length === 0) {
-    for (const it of items) {
-      if (it.hotelCheckIn) times.push(it.hotelCheckIn.getTime());
-    }
+    if (it.hotelCheckIn) times.push(it.hotelCheckIn.getTime());
   }
   if (times.length === 0) {
     for (const it of items) {
@@ -214,7 +224,8 @@ export class PendingAgingService {
               kind: true,
               hotelCheckIn: true,
               visaIntendedDate: true,
-              flightSchedule: { select: { departureTime: true } },
+              // departureTz：C-28 修复所需，见 departureDateOf 顶部注释。
+              flightSchedule: { select: { departureTime: true, departureTz: true } },
             },
           },
         },

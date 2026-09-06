@@ -24,8 +24,14 @@ import {
 
 const D = (s: string): Date => new Date(`${s}T00:00:00.000Z`);
 
-/** 单个 FLIGHT 行：出发日字符串，或 { 出发日, 航班号 }。*/
-type FlightLegOpt = string | { date: string; flightNumber?: string };
+/**
+ * 单个 FLIGHT 行：出发日字符串，或 { 出发日, 航班号, 时区, 精确出发瞬时 }。
+ * departureAt 缺省时用 `${date}T00:00:00Z` 当出发瞬时（多数用例只关心日历日，用 UTC 零点最直观）；
+ * 需要构造「UTC 分量落在前一天」的红眼场景时传 departureAt + tz 精确控制瞬时与时区。
+ */
+type FlightLegOpt =
+  | string
+  | { date: string; flightNumber?: string; tz?: string; departureAt?: string };
 
 /** 造一张进单统计所需最小订单（只含 passengers + items 相关字段）。*/
 function order(opts: {
@@ -37,13 +43,22 @@ function order(opts: {
 }): OrderForIntakeExport {
   const items: OrderForIntakeExport['items'] = [];
   for (const f of opts.flights ?? []) {
-    const { date, flightNumber } = typeof f === 'string' ? { date: f, flightNumber: '' } : f;
+    // tz 默认北京（UTC+8）：既有用例的出发瞬时都是 `${date}T00:00:00Z`，按 UTC+8 折算当地日
+    // 只会把钟点往后挪（不会跨零点回退到前一天），因此不改变任何既有用例的既定预期。
+    const { date, flightNumber, tz, departureAt } =
+      typeof f === 'string' ? { date: f, flightNumber: '', tz: undefined, departureAt: undefined } : f;
     items.push({
       kind: 'FLIGHT',
       hotelCheckIn: null,
       // flight 关系在 schema 里非空（每个 FlightSchedule 必属一个 Flight）；「无航班号」用空串模拟
       // 数据缺口（而非 null），与生产代码里 `it.flightSchedule?.flight?.flightNumber` 的假值判断口径一致。
-      flightSchedule: { departureTime: D(date), flight: { flightNumber: flightNumber ?? '' } },
+      flightSchedule: {
+        departureTime: departureAt ? new Date(departureAt) : D(date),
+        // C-6 回归：departureTz 缺失时 earliestFlightDeparture 会回退裸 UTC，这里显式带上时区
+        // 让 intakeDepartDate 走当地日折算分支（与生产 select 已补 departureTz 的改动对齐）。
+        departureTz: tz ?? 'Asia/Shanghai',
+        flight: { flightNumber: flightNumber ?? '' },
+      },
       bundle: null,
     });
   }
@@ -71,6 +86,19 @@ function order(opts: {
 describe('intakeDepartDate', () => {
   it('取去程最早航段出发日', () => {
     expect(intakeDepartDate(order({ paxCount: 1, flights: ['2026-07-22', '2026-07-20'] }))).toBe('2026-07-20');
+  });
+
+  it('红眼航班：出发瞬时 UTC 分量落在前一天时，仍按出发地当地日分组（C-6）', () => {
+    // UTC 2026-07-12T17:40Z == 当地（Asia/Ho_Chi_Minh, UTC+7）2026-07-13 00:40 起飞。
+    // 裸按 UTC 折会把这单归到 07-12（早一天），运营核对当日进单会漏这单/多前一天一单。
+    expect(
+      intakeDepartDate(
+        order({
+          paxCount: 1,
+          flights: [{ date: '2026-07-13', departureAt: '2026-07-12T17:40:00.000Z', tz: 'Asia/Ho_Chi_Minh' }],
+        }),
+      ),
+    ).toBe('2026-07-13');
   });
 
   it('纯地面单回落最早入住日', () => {

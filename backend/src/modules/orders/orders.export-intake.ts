@@ -60,7 +60,9 @@ export type OrderForIntakeExport = Prisma.OrderGetPayload<{
         kind: true;
         hotelCheckIn: true;
         flightSchedule: {
-          select: { departureTime: true; flight: { select: { flightNumber: true } } };
+          // departureTz：C-6 修复——不联查时区就没法把红眼航班折到出发地当地日，
+          // earliestFlightDeparture 会裸回退 UTC，出发日期分组列在当地凌晨起飞的班次上早报一天。
+          select: { departureTime: true; departureTz: true; flight: { select: { flightNumber: true } } };
         };
         bundle: { select: { code: true; name: true } };
       };

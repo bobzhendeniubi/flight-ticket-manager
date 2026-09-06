@@ -14,7 +14,13 @@
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
 import type { Passenger } from '@prisma/client';
-import { passengerToRow, derivePtcByAge, earliestFlightDeparture, pnrExportFilename } from './pnr-export.js';
+import {
+  passengerToRow,
+  derivePtcByAge,
+  derivePtcByLocalDate,
+  earliestFlightDeparture,
+  pnrExportFilename,
+} from './pnr-export.js';
 
 const D = (s: string): Date => new Date(`${s}T00:00:00.000Z`);
 
@@ -234,6 +240,101 @@ describe('earliestFlightDeparture — 取订单 FLIGHT 行最早出发时间', (
     expect(earliestFlightDeparture([{ kind: 'HOTEL', flightSchedule: null }])).toBeNull();
     expect(earliestFlightDeparture([])).toBeNull();
     expect(earliestFlightDeparture(undefined)).toBeNull();
+  });
+});
+
+describe('earliestFlightDeparture — 红眼航班按出发地当地日折算，而非裸 UTC（C-6）', () => {
+  it('当地日与 UTC 日不同时，返回值折到当地日（UTC 零点表示，供 getUTC* 直读）', () => {
+    // 当地时间（Asia/Ho_Chi_Minh, UTC+7）2026-07-13 00:40 起飞 == UTC 2026-07-12T17:40Z。
+    const items = [
+      {
+        kind: 'FLIGHT',
+        flightSchedule: {
+          departureTime: new Date('2026-07-12T17:40:00.000Z'),
+          departureTz: 'Asia/Ho_Chi_Minh',
+        },
+      },
+    ];
+    expect(earliestFlightDeparture(items)).toEqual(D('2026-07-13'));
+  });
+
+  it('多段机票仍按真实瞬时先后取最早一段，只是把该段折成当地日', () => {
+    const items = [
+      // 更晚出发的一段（当地日 07-14）
+      {
+        kind: 'FLIGHT',
+        flightSchedule: {
+          departureTime: new Date('2026-07-13T17:00:00.000Z'),
+          departureTz: 'Asia/Ho_Chi_Minh',
+        },
+      },
+      // 真正最早的一段：UTC 07-12 17:40 == 当地 07-13 00:40
+      {
+        kind: 'FLIGHT',
+        flightSchedule: {
+          departureTime: new Date('2026-07-12T17:40:00.000Z'),
+          departureTz: 'Asia/Ho_Chi_Minh',
+        },
+      },
+    ];
+    expect(earliestFlightDeparture(items)).toEqual(D('2026-07-13'));
+  });
+
+  it('未联查 departureTz 的旧调用方 → 回退裸 UTC（行为不变，待各自 select 补上 tz 才吃到修复）', () => {
+    const items = [{ kind: 'FLIGHT', flightSchedule: { departureTime: D('2026-07-12') } }];
+    expect(earliestFlightDeparture(items)).toEqual(D('2026-07-12'));
+  });
+});
+
+describe('端到端：红眼航班的 PTC 与 PNR 文件名按当地日而非 UTC 日判定（C-6）', () => {
+  it('乘客恰好在当地出发日当天满 12 岁 → ADT，不会被"UTC 早一天"误判成 CHD', () => {
+    // 当地出发日 2026-07-13；出生日期 2014-07-13 → 当地口径恰好满 12 岁。
+    // 若仍按裸 UTC（07-12）判，实足年龄会被误判为差一天不满 12 岁 → 误判成 CHD。
+    const departureLocal = earliestFlightDeparture([
+      {
+        kind: 'FLIGHT',
+        flightSchedule: {
+          departureTime: new Date('2026-07-12T17:40:00.000Z'),
+          departureTz: 'Asia/Ho_Chi_Minh',
+        },
+      },
+    ]);
+    expect(derivePtcByAge(D('2014-07-13'), departureLocal, 'ADULT')).toBe('ADT');
+  });
+
+  it('PNR 文件名按当地出发日而非 UTC 日（红眼航班不再早报一天）', () => {
+    const departureLocal = earliestFlightDeparture([
+      {
+        kind: 'FLIGHT',
+        flightSchedule: {
+          departureTime: new Date('2026-07-12T17:40:00.000Z'),
+          departureTz: 'Asia/Ho_Chi_Minh',
+        },
+      },
+    ]);
+    expect(pnrExportFilename('WT2026', departureLocal)).toBe('13JUL WT2026.xlsx');
+  });
+});
+
+describe('derivePtcByLocalDate — 直接接收当地日字符串（C-6 新 helper：dob, 当地出发日 YYYY-MM-DD, fallbackPassengerType）', () => {
+  it('与「先折算出发地当地日、再传给 derivePtcByAge」等价', () => {
+    expect(derivePtcByLocalDate(D('2014-07-13'), '2026-07-13', 'ADULT')).toBe('ADT');
+    expect(derivePtcByLocalDate(D('2014-07-14'), '2026-07-13', 'ADULT')).toBe('CHD');
+  });
+
+  it('边界值与 derivePtcByAge 同口径：<2 INF / 2–<12 CHD / ≥12 ADT', () => {
+    expect(derivePtcByLocalDate(D('2024-07-13'), '2026-07-13', 'ADULT')).toBe('CHD');
+    expect(derivePtcByLocalDate(D('2024-07-14'), '2026-07-13', 'ADULT')).toBe('INF');
+  });
+
+  it('缺生日或缺当地出发日 → 回退录入的 passengerType', () => {
+    expect(derivePtcByLocalDate(null, '2026-07-13', 'CHILD')).toBe('CHD');
+    expect(derivePtcByLocalDate(D('1990-01-01'), null, 'INFANT')).toBe('INF');
+    expect(derivePtcByLocalDate(D('1990-01-01'), undefined, 'ADULT')).toBe('ADT');
+  });
+
+  it('生日晚于当地出发日（数据异常）→ 回退录入值，不产生负年龄', () => {
+    expect(derivePtcByLocalDate(D('2027-01-01'), '2026-07-13', 'ADULT')).toBe('ADT');
   });
 });
 

@@ -567,6 +567,24 @@ export function matchAgentText(text: string, agents: OrderImportAgentLite[]): Or
   };
 }
 
+/**
+ * 班次匹配的粗召回时间窗口 [min, max)（纯函数，便于不连库单测这段窗口算法）。
+ *
+ * C-7：下界也要放宽 1 天，不能只宽上界。运营表格填的是当地出发日期；批次最早一天若恰好是
+ * 红眼航班（当地凌晨起飞），其 departureTime 的 UTC 分量会落在前一天，早于未放宽的 min，
+ * SQL 粗召回直接漏掉这条班次——后面按 localDateISO 精筛的候选集里根本没有它，导致整批
+ * 「查无班次」。两端各放宽 1 天，多召回的行交给下面的 localDateISO 精筛按当地日过滤掉，
+ * 不会误配到别的日期。
+ */
+export function scheduleMatchWindow(dates: string[]): { min: Date; max: Date } {
+  const sorted = [...dates].sort();
+  const min = new Date(`${sorted[0]}T00:00:00Z`);
+  min.setUTCDate(min.getUTCDate() - 1);
+  const max = new Date(`${sorted[sorted.length - 1]}T00:00:00Z`);
+  max.setUTCDate(max.getUTCDate() + 1);
+  return { min, max };
+}
+
 /** 生产用匹配依赖：查库找班次 + 拉在职代理。*/
 export function buildOrderImportMatchDeps(): OrderImportMatchDeps {
   return {
@@ -579,10 +597,7 @@ export function buildOrderImportMatchDeps(): OrderImportMatchDeps {
     async findSchedules(pairs) {
       if (pairs.length === 0) return [];
       const flightNos = [...new Set(pairs.map((p) => p.flightNo))];
-      const dates = pairs.map((p) => p.date).sort();
-      const min = new Date(`${dates[0]}T00:00:00Z`);
-      const max = new Date(`${dates[dates.length - 1]}T00:00:00Z`);
-      max.setUTCDate(max.getUTCDate() + 1);
+      const { min, max } = scheduleMatchWindow(pairs.map((p) => p.date));
       const schedules = await prisma.flightSchedule.findMany({
         where: {
           departureTime: { gte: min, lt: max },
