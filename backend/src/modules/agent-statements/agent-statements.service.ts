@@ -33,8 +33,15 @@ import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { BadRequestError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import { getDescendantAgentIds } from '../../lib/agent-tree.js';
 import { businessDateISO } from '../../lib/business-time.js';
-import { netReceivedCny, sumCompletedRefundCny } from '../../lib/net-received.js';
-import { perPaxSettlementByPassenger } from '../orders/orders.export-templates.js';
+// 订单金额单一口径（审查根因 R2）：应收 / 已收净额 / 人均 / 立减 / 每人份额全部从这里取。
+// payableCny 起别名：本文件行内有同名局部变量（对账单行的字段名），避免遮蔽。
+import {
+  netReceivedCny,
+  payableCny as payableOf,
+  payablePerPaxCny,
+  perPaxSettlementByPassenger,
+  settlementDiscountTotalCny,
+} from '../../lib/order-money.js';
 import { deriveOrderDepartDate, ORDER_STATUS_LABEL_ZH } from '../orders/orders.service.js';
 
 /** 表头固定注脚：对账单是只读视图，别拿它当月结依据。 */
@@ -208,15 +215,7 @@ function productSummary(
 function settlementDiscountCny(
   items: ReadonlyArray<{ amount: Prisma.Decimal | number | null; metadata: unknown }>,
 ): number {
-  let sum = 0;
-  for (const item of items) {
-    const metadata = item.metadata;
-    if (metadata == null || typeof metadata !== 'object' || Array.isArray(metadata)) continue;
-    const m = metadata as { settlementDiscount?: unknown; settlementDiscountRevoked?: unknown };
-    if (m.settlementDiscount !== true || m.settlementDiscountRevoked === true) continue;
-    sum += Math.abs(dec(item.amount));
-  }
-  return round2(sum);
+  return round2(settlementDiscountTotalCny(items));
 }
 
 /** 佣金记录的最小形状（本模块只关心金额、状态、是否已并单）。 */
@@ -359,8 +358,9 @@ export async function buildAgentStatement(
     ownerId ? netCommissionCny(commissionByOrderAgent.get(`${orderId}::${ownerId}`) ?? []) : 0;
 
   const rows: AgentStatementRow[] = inMonth.map((o) => {
-    const payableCny = round2(dec(o.total) + (o.adjustmentCny ?? 0));
-    const receivedCny = netReceivedCny(o, sumCompletedRefundCny(o.refunds));
+    // 应收 / 已收净额 / 每人份额全部走 lib/order-money（审查根因 R2），本文件不自己算钱。
+    const payableCny = payableOf(o);
+    const receivedCny = netReceivedCny(o, o.refunds);
     const shares = perPaxSettlementByPassenger(o);
     const paxCount = o.passengers.length;
     return {
@@ -378,7 +378,10 @@ export async function buildAgentStatement(
       balanceCny: round2(payableCny - receivedCny),
       // 人均口径 = 应收 ÷ 人数（Σ 每人份额恒等于应收，见 per-pax-share.ts）；
       // 逐人不同时由 settlementPerPaxRange 补出真实区间，不拿一个平均数糊弄过去。
-      settlementPerPaxCny: paxCount > 0 ? round2(payableCny / paxCount) : 0,
+      // ⚠️ 这是「应收 ÷ 人数」（换人费也摊），与导出兜底的「可摊应收 ÷ 人数」（换人费不摊）
+      // 是两个数——lib/order-money 里各自命名（payablePerPaxCny vs settlePerPaxFallbackCny），
+      // 冲突已登记待拍板，此处只改调不统一。
+      settlementPerPaxCny: paxCount > 0 ? payablePerPaxCny(o, paxCount) : 0,
       settlementPerPaxRange: rangeLabel([...shares.values()]),
       settlementDiscountCny: settlementDiscountCny(o.items),
       commissionOwnerCny: commissionOf(o.id, o.agentId),

@@ -35,6 +35,8 @@ import {
 } from '../../lib/funds-guard.js';
 import { writeAudit } from '../../lib/audit.js';
 import { outstandingCommissionNetWithinTx, round2 } from '../../lib/commission-net.js';
+// 订单金额单一口径（审查根因 R2）：对账台候选 / 认款建议的应收、已付、尾款（元 / 分）从这里取。
+import { balanceDueCents, balanceDueCny, paidCny, payableCny } from '../../lib/order-money.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { PaymentsService } from '../payments/payments.service.js';
 import {
@@ -1585,10 +1587,9 @@ export class ReceiptsService {
       departureDate: string | null;
     }> = [];
     for (const o of orders) {
-      const totalPayable = round2(Number(o.total) + (o.adjustmentCny ?? 0));
-      const balanceDue = round2(
-        totalPayable - Number(o.paidAmount) - Number(o.prepaymentOffset),
-      );
+      // 应收 / 尾款走 lib/order-money（与 serializeOrder.balanceDue 同一个函数）。
+      const totalPayable = payableCny(o);
+      const balanceDue = balanceDueCny(o);
       if (balanceDue <= 0.005) continue;
       out.push({
         orderId: o.id,
@@ -1675,11 +1676,9 @@ export class ReceiptsService {
       }
     >();
     for (const o of orderRows) {
-      const balanceCents =
-        toCents(o.total) +
-        (o.adjustmentCny ?? 0) * 100 -
-        toCents(o.paidAmount) -
-        toCents(o.prepaymentOffset);
+      // 尾款按「分」算：lib/order-money.balanceDueCents（与 matchCandidates / serializeOrder.balanceDue 同口径，
+      // 两位小数输入下按元与按分同值，order-money.test 有断言）。
+      const balanceCents = balanceDueCents(o);
       if (balanceCents <= 0) continue;
       engineOrders.push({
         orderId: o.id,
@@ -1699,8 +1698,8 @@ export class ReceiptsService {
         contactName: o.contactName,
         agentName: o.agent ? o.agent.companyName || o.agent.contactName : null,
         departureDate: orderDepartDate(o.items),
-        totalPayable: round2(Number(o.total) + (o.adjustmentCny ?? 0)),
-        paidAmount: Number(o.paidAmount),
+        totalPayable: payableCny(o),
+        paidAmount: paidCny(o),
         balanceDue: round2(balanceCents / 100),
       });
     }
