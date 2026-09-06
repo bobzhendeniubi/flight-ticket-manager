@@ -5686,7 +5686,9 @@ function OrderDrawer({
             orderId={o.id}
             initialExpectedAmountCny={o.expectedAmountCny}
             initialExpectedAmountLocked={o.expectedAmountLocked}
-            payableCny={Number(o.total) + Number(o.adjustmentCny ?? 0)}
+            // 权威应付一律读后端 effectivePayable（deriveBalance 已优先取它，老后端才回落本地公式），
+            // 不在前端再抄一遍 total + adjustmentCny——后端 lib/order-money 是唯一口径。
+            payableCny={bal.payable}
             onChanged={onChanged}
           />
 
