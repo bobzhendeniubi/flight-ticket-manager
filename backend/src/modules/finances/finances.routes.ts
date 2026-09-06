@@ -7,6 +7,7 @@
  *   GET /finances/flights?from=...&to=...&limit=100
  *   GET /finances/orders?from=...&to=...&limit=100
  *   GET /finances/monthly?months=6
+ *   POST /finances/cost-snapshots/backfill?limit=&apply=  存量机票/套餐行成本快照回填
  *
  * 所有访问都写审计日志（VIEW_FINANCES）— 财务数据敏感。
  */
@@ -45,6 +46,7 @@ import {
   financeExportByOrderFilename,
 } from './finances.export-orders.js';
 import { listPendingRefundPayouts } from './finances.refund-payout.js';
+import { backfillItemCostSnapshots } from './finances.cost-backfill.js';
 
 const dateStr = z
   .string()
@@ -58,6 +60,15 @@ const rangeSchema = z.object({
 
 const monthlySchema = z.object({
   months: z.coerce.number().int().positive().max(36).optional(),
+});
+
+// 成本快照回填：limit 缺省 = 全量；apply 缺省 false（只算不写，先看清楚要补多少行再动手）。
+const costBackfillSchema = z.object({
+  limit: z.coerce.number().int().positive().max(100_000).optional(),
+  apply: z
+    .enum(['true', 'false'])
+    .optional()
+    .transform((v) => v === 'true'),
 });
 
 // 成本字段：number 或 null（清空）；缺省 = 不改（统一 CNY，无汇率）
@@ -160,6 +171,33 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     logView(req, { route: 'monthly', months });
     const points = await getMonthlyTrend(months);
     return { months, points };
+  });
+
+  // ── 存量成本快照回填（机票行 / 套餐行）────────────────────────────────────
+  // 这两类行的成本快照 2026-09-06 才开始落库，之前的单一律 NULL，于是存量区间的毛利
+  // 全报「未知」。这条端点把现在算得出来的成本补进去；口径与幂等见 finances.cost-backfill.ts。
+  // 缺省 apply=false（只算不写）——先看清楚要补多少行、有多少行补不上，再决定要不要写。
+  // 挂成本维护那道闸（finances.cost.manage）：它改的是成本数据，不是查询。
+  app.post('/cost-snapshots/backfill', requireAdminOrStaff, async (req) => {
+    const q = costBackfillSchema.parse(req.query);
+    const result = await backfillItemCostSnapshots({ limit: q.limit, apply: q.apply });
+    // 真写库才留审计（dry-run 只是看一眼，写审计反而是噪音）。
+    if (q.apply && result.filled > 0) {
+      await writeAudit({
+        actor: actorFromRequest(req),
+        action: 'BACKFILL_ITEM_COST_SNAPSHOTS',
+        targetType: 'SYSTEM',
+        targetId: 'cost-snapshots',
+        targetLabel: `订单行成本快照回填 · 补上 ${result.filled} 行`,
+        after: {
+          ...result,
+          limit: q.limit ?? null,
+          note: '成本周期无版本历史，回填按当前周期定义 + 航段出发日计算；套餐办签人数取当前乘客名单。',
+        },
+        severity: 'CRITICAL',
+      });
+    }
+    return result;
   });
 
   // ── xlsx 导出（一行/乘客）──
