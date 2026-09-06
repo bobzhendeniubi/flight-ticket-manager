@@ -37,13 +37,23 @@ import {
   nameWithTitle,
   orderVisaStatusLabel,
   passengerVisaStatusCell,
-  perPaxSettlementByPassenger,
-  perPaxVisaAmountByPassenger,
-  perPaxSingleRoomDiffByPassenger,
   allPassengersVisaExempt,
   pnrName,
   withoutAgentHiddenColumns,
 } from './orders.export-templates.js';
+// 订单金额单一口径（审查根因 R2）：应收/已付/尾款/退款/立减/每人份额全部从这里取，本文件不自己算钱。
+import {
+  completedRefundTotalCny,
+  evenShareCny,
+  isSettledByPaidAmount,
+  outstandingRawCny,
+  paidCny,
+  perPaxSettlementByPassenger,
+  perPaxVisaAmountByPassenger,
+  perPaxSingleRoomDiffByPassenger,
+  settlementDiscountTotalCny,
+  settlePerPaxFallbackCny,
+} from '../../lib/order-money.js';
 import { appendHoldOrderSheet, loadHoldExportRows } from './orders.export-hold-orders.js';
 import { GUEST_RECORDED_BY_LABEL } from './orders.service.js';
 import {
@@ -51,7 +61,6 @@ import {
   filterExportOrders,
   type ExportSelectionFilters,
 } from './orders.export-selection.js';
-import { spreadableAdjustmentCny } from './per-pax-share.js';
 import { determineFlightLegs } from './ticketing-cap.js';
 import { formatOrderLegStatus } from './orders.leg-status.js';
 
@@ -450,39 +459,24 @@ export function orderToMasterRows(
   // 表、《全岗可用》/《签证专用》模板、拆单搬钱同一份算法。
   // 其余金额列（到账/尾款/立减/单房差/签证/退款/订单成本）仍是整单 ÷ 乘客数：这些钱按整单发生，
   // 没有逐人归属，不臆造。
-  const total = dec(order.total);
-  const paid = dec(order.paidAmount);
   // 售后费（改期费/换人费等）走 adjustmentCny，不在 total 里；代理预付款抵扣走 prepaymentOffset。
   // 尾款/是否清账都要把两者算进「应付」，否则售后费从表上直接消失（P1-9），且用预付款抵扣过的
   // 代理订单会尾款偏大、已结清误显示未结清。口径与 reminders.rules.ts computeBalance /
   // reports.service.ts balanceOf 对齐：应付 = total + adjustmentCny − prepaymentOffset。
-  const adjustment = order.adjustmentCny ?? 0;
-  const prepaymentOffset = dec(order.prepaymentOffset);
+  // 全部走 lib/order-money 的同一组函数（审查根因 R2），本文件不再自己写 `total + adjustmentCny`。
   const settleByPassenger = perPaxSettlementByPassenger(order);
   /**
    * 结算价格的均摊兜底 = 可摊应收 ÷ pax；只在乘客不在上表里时用到。
-   * 分子用 spreadableAdjustmentCny 而不是裸 adjustmentCny：换人费/换人差价挂在**已经不在这张单上**
+   * 分子用可摊应收而不是裸 adjustmentCny（settlePerPaxFallbackCny）：换人费/换人差价挂在**已经不在这张单上**
    * 的被换人头上（excludeFromPerPax），上面那张按人表已经把它们剔除了；兜底若还按裸值算，
    * 同一张导出里「表里的人」和「兜底的人」用的是两套分母，同行人凭空多背一笔换人的钱。
    */
-  const settlePerPax = round2((total + spreadableAdjustmentCny(order)) / paxCount);
-  const settlementDiscountTotal = order.items.reduce((sum, item) => {
-    const metadata = item.metadata;
-    if (
-      metadata == null ||
-      typeof metadata !== 'object' ||
-      Array.isArray(metadata) ||
-      (metadata as { settlementDiscount?: unknown }).settlementDiscount !== true ||
-      (metadata as { settlementDiscountRevoked?: unknown }).settlementDiscountRevoked === true
-    ) {
-      return sum;
-    }
-    return sum + Math.abs(dec(item.amount));
-  }, 0);
-  const settlementDiscountPerPax = round2(settlementDiscountTotal / paxCount);
-  const paidPerPax = round2(paid / paxCount);
-  const balancePerPax = round2(Math.max(0, total + adjustment - paid - prepaymentOffset) / paxCount);
-  const settled = paid + prepaymentOffset >= total + adjustment ? '是' : '否';
+  const settlePerPax = settlePerPaxFallbackCny(order, paxCount);
+  const settlementDiscountPerPax = evenShareCny(settlementDiscountTotalCny(order.items), paxCount);
+  const paidPerPax = evenShareCny(paidCny(order), paxCount);
+  const balancePerPax = evenShareCny(outstandingRawCny(order), paxCount);
+  // ⚠️ 「按已付」口径（不扣已完成退款），与财务导出的「按已收净额」是两个算法——冲突已登记待拍板。
+  const settled = isSettledByPaidAmount(order) ? '是' : '否';
 
   // ── 签证：金额 + 状态 ──
   // 签证金额**按乘客**（自备签 = 0；独立 VISA 行实收在非自备签乘客间均摊；套餐签证挂牌价
@@ -527,10 +521,8 @@ export function orderToMasterRows(
   // 真实来源是套餐行 addOns.singleSupplementTotal 与补收单房差 FEE 行 —— 见 perPaxSingleRoomDiffByPassenger。
   const singleRoomDiffByPassenger = perPaxSingleRoomDiffByPassenger(order);
 
-  // ── 退款：已完成退款金额合计 ──
-  const refundTotal = order.refunds
-    .filter((r) => r.status === 'COMPLETED')
-    .reduce((s, r) => s + dec(r.amount), 0);
+  // ── 退款：已完成退款金额合计（lib/order-money，只数 COMPLETED、不四舍五入，÷ 人数后再舍）──
+  const refundTotal = completedRefundTotalCny(order.refunds);
 
   // ── 订单成本（OrderCostItem）：类别 金额，多条 ' + ' 连接 ──
   const orderCost = order.costItems
@@ -635,7 +627,7 @@ export function orderToMasterRows(
       visaNote: p.visaExempt === true ? visaNoteExempt : visaNote,
       invoiceStatus,
       settled,
-      refundAmount: round2(refundTotal / paxCount),
+      refundAmount: evenShareCny(refundTotal, paxCount),
       passportIssuePlace: p.passportIssuePlace ?? p.passportIssueCountry ?? '',
       placeOfBirth: p.placeOfBirth ?? '',
       orderNumber: order.orderNumber,

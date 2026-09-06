@@ -27,8 +27,9 @@ import { OrderStatus, OrderItemKind } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { BadRequestError } from '../../lib/errors.js';
 import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
-import { fmtDateDMYDash, pnrName, perPaxSettlementByPassenger } from './orders.export-templates.js';
-import { spreadableAdjustmentCny } from './per-pax-share.js';
+import { fmtDateDMYDash, pnrName } from './orders.export-templates.js';
+// 订单金额单一口径（审查根因 R2）：结算价格按人 + 均摊兜底都从这里取，本文件不自己算钱。
+import { perPaxSettlementByPassenger, settlePerPaxFallbackCny } from '../../lib/order-money.js';
 import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats.js';
 import type { TripStatsMap } from './orders.export-trip-stats.js';
 import { earliestFlightDepartureLocalDate } from './pnr-export.js';
@@ -149,14 +150,6 @@ function fmtDate(d: Date | null | undefined): string {
 }
 
 /** Prisma.Decimal | number | null → number（与其它导出同款）。*/
-function dec(v: Prisma.Decimal | number | null | undefined): number {
-  if (v == null) return 0;
-  return typeof v === 'number' ? v : Number(v.toString());
-}
-
-function round2(n: number): number {
-  return Math.round(n * 100) / 100;
-}
 
 function toDateOnly(s: string): Date {
   // 'YYYY-MM-DD' → UTC midnight，与 Prisma @db.Date 存取口径一致
@@ -470,11 +463,11 @@ export function buildRoomAllocationSheets(
     // 均摊兜底只在乘客不在上表里时用到；除零保护 —— 乘客数至少按 1 算。
     const paxCount = Math.max(1, order.passengers.length);
     const settleByPassenger = perPaxSettlementByPassenger(order);
-    // 分子用 spreadableAdjustmentCny 而不是裸 adjustmentCny（复审 M1，与《全岗总表》
+    // 兜底分子用可摊应收而不是裸 adjustmentCny（settlePerPaxFallbackCny，复审 M1，与《全岗总表》
     // orders.export-master.ts 同一处修正）：换人费/换人差价挂在**已经不在这张单上**的被换人头上
     //（excludeFromPerPax），上面那张按人表已经把它们剔掉了；兜底若还按裸值算，同一张分房表里
     //「表里的人」和「兜底的人」用的是两套分母，留守同行人凭空多背一笔换人的钱。
-    const settleFallback = round2((dec(order.total) + spreadableAdjustmentCny(order)) / paxCount);
+    const settleFallback = settlePerPaxFallbackCny(order, paxCount);
     // 录入时间是「动作发生时刻」，按北京时间输出（容器 TZ 是 UTC，直接取 UTC 分量会少 8 小时）
     const enteredAt = businessDateTimeSec(order.createdAt);
 

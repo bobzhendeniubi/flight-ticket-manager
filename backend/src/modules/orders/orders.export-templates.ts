@@ -22,12 +22,18 @@ import {
 } from '../fulfillment/visa-state.js';
 // 订单级「明确不需要我方代办（NOT_NEEDED / HAS_VISA）」的唯一判定口径，与建签证任务共用。
 import { prisma as defaultPrisma } from '../../db/prisma.js';
-// 「结算价格」按人取值的权威口径在 lib/order-money（perPaxSettlementByPassenger）；此处只用可摊售后费。
-import { spreadableAdjustmentCny } from './per-pax-share.js';
+// 订单金额单一口径（审查根因 R2）：应收/已付/尾款/退款/每人份额全部从这里取，本文件不自己算钱。
 import {
+  completedRefundTotalCny,
+  evenShareCny,
+  isSettledByPaidAmount,
+  outstandingRawCny,
+  paidCny,
   perPaxSettlementByPassenger,
   perPaxVisaAmountByPassenger,
   perPaxSingleRoomDiffByPassenger,
+  settlePerPaxFallbackCny,
+  toCny,
 } from '../../lib/order-money.js';
 import type { BundleItemJson } from '../../lib/json-types.js';
 import { toAlpha3 } from './nationality.js';
@@ -579,10 +585,7 @@ export function buildOrderContext(
   //     的单（某人补签证多收、某人自备签少收）逐人可解释，与订单详情页「每人结算价」同源；
   //   · 到账/尾款仍是整单 ÷ 人数（收款按整单发生，没有逐人归属，不臆造）。
   // 尾款口径与财务/提醒/报表对齐：应付 = total + adjustmentCny − prepaymentOffset（代理预付款抵扣）。
-  const total = dec(order.total);
-  const paid = dec(order.paidAmount);
-  const adjustment = order.adjustmentCny ?? 0;
-  const prepaymentOffset = dec(order.prepaymentOffset);
+  // 全部走 lib/order-money 的同一组函数，本文件不再自己写 `total + adjustmentCny`。
 
   return {
     paxCount,
@@ -603,12 +606,12 @@ export function buildOrderContext(
     // orders.export-master.ts 的 settlePerPax 同一处修正）：换人费/换人差价挂在**已经不在这张单上**
     // 的被换人头上（excludeFromPerPax），上面那张按人表已经把它们剔除了；兜底若还按裸值算，
     // 同一张导出里「表里的人」和「兜底的人」用的是两套分母，同行人凭空多背一笔换人的钱。
-    settlePerPax: round2((total + spreadableAdjustmentCny(order)) / paxCount),
+    settlePerPax: settlePerPaxFallbackCny(order, paxCount),
     visaAmountByPassenger: perPaxVisaAmountByPassenger(order),
     allPassengersExempt: allPassengersVisaExempt(order.passengers),
     singleRoomDiffByPassenger: perPaxSingleRoomDiffByPassenger(order),
-    paidPerPax: round2(paid / paxCount),
-    balancePerPax: round2(Math.max(0, total + adjustment - paid - prepaymentOffset) / paxCount),
+    paidPerPax: evenShareCny(paidCny(order), paxCount),
+    balancePerPax: evenShareCny(outstandingRawCny(order), paxCount),
   };
 }
 
@@ -781,9 +784,9 @@ export function orderToFullRows(
     .sort((a, b) => b.paidAt!.getTime() - a.paidAt!.getTime());
   const lastPayment = succeeded[0];
 
-  // 已完成退款：金额合计 + 最近处理时间
+  // 已完成退款：金额合计（lib/order-money，只数 COMPLETED、不四舍五入）+ 最近处理时间
   const completedRefunds = order.refunds.filter((r) => r.status === 'COMPLETED');
-  const refundTotal = completedRefunds.reduce((s, r) => s + dec(r.amount), 0);
+  const refundTotal = completedRefundTotalCny(order.refunds);
   const lastRefundAt = completedRefunds
     .map((r) => r.processedAt)
     .filter((d): d is Date => Boolean(d))
@@ -820,10 +823,9 @@ export function orderToFullRows(
   // 是否清账：已付 + 预付款抵扣 ≥ 应付（total + adjustmentCny），与上面 ctx.balancePerPax 同口径。
   // 不含 adjustmentCny 会出现"尾款>0 但已清账"的自相矛盾（P2-15b 连带修）；漏 prepaymentOffset
   // 则用预付款抵扣过的代理订单会已结清却误显示未结清。
-  const settled =
-    dec(order.paidAmount) + dec(order.prepaymentOffset) >= dec(order.total) + (order.adjustmentCny ?? 0)
-      ? '是'
-      : '否';
+  // ⚠️ 这是「按已付」口径（不扣已完成退款），与财务导出的「按已收净额」是两个算法——
+  // 冲突已登记待拍板（docs/口径决议.md），此处只改调不统一。
+  const settled = isSettledByPaidAmount(order) ? '是' : '否';
 
   // 六态开票（去程/回程/系统）——「系统开票状态」列反映 systemInvoiced；
   // 「开票状态」列（原手工列）填按航段已开的组合文本：去程/回程分别判定，回程仅在存在回程班次时列出。
@@ -874,12 +876,12 @@ export function orderToFullRows(
     singleRoomDiffReceived: '',
     visaAmount: ctx.visaAmountByPassenger.get(p.id) ?? 0,
     visaReceived: '',
-    offsetAmount: round2(dec(order.prepaymentOffset) / ctx.paxCount),
+    offsetAmount: evenShareCny(toCny(order.prepaymentOffset), ctx.paxCount),
     offsetReceived: '',
     offsetPerson: '',
     offsetOrder: '',
     settled,
-    refundAmount: round2(refundTotal / ctx.paxCount),
+    refundAmount: evenShareCny(refundTotal, ctx.paxCount),
     refundAt: businessDateTimeSec(lastRefundAt),
     refundChannel: '',
     orderStatus: ORDER_STATUS_LABEL[order.status] ?? order.status,

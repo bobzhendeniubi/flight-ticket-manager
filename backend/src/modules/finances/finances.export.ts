@@ -30,7 +30,8 @@ import {
   loadPeriodsByFlightIds,
   resolveScheduleCost,
 } from './finances.cost.service.js';
-import { netReceivedCny, sumCompletedRefundCny } from '../../lib/net-received.js';
+// 订单金额单一口径（审查根因 R2）：「是否清账」走 lib/order-money（内部转调 lib/net-received）。
+import { isSettledByNetReceived } from '../../lib/order-money.js';
 import { businessDateTime } from '../../lib/business-time.js';
 // 签证成本口径与财务汇总共用同一函数，两处逐字一致（任务实际成本优先 → 产品主数据回退）
 import { visaItemCostCny } from './finances.service.js';
@@ -333,9 +334,9 @@ function orderToRows(order: OrderForExport, periodsMap: PeriodsMap): FinanceRow[
   // 是否清账：应收合计 = total + adjustmentCny（改期费/换人费等售后费用，不改 total 本身，
   // 单独叠加在这笔调整字段上）；已收净额走 lib/net-received.ts 的统一口径
   // （paidAmount + prepaymentOffset − Σ COMPLETED Refund），与 reports.service.ts balanceOf 同源。
-  const payableCny = round2(totalRevenue + (order.adjustmentCny ?? 0));
-  const receivedCny = netReceivedCny(order, sumCompletedRefundCny(order.refunds));
-  const settled = receivedCny >= payableCny ? '是' : '否';
+  // ⚠️ 这是「按已收净额」口径（扣已完成退款），与三模板 / 全岗总表的「按已付」是两个算法——
+  // 冲突已登记待拍板（docs/口径决议.md），此处只改调 lib/order-money 不统一。
+  const settled = isSettledByNetReceived(order, order.refunds) ? '是' : '否';
 
   const hotelPerPax = hotelCostCnyOrder / paxCount;
   const transferPerPax = transferCostCnyOrder / paxCount;
