@@ -12,6 +12,7 @@
  */
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import { NotFoundError } from '../../lib/errors.js';
 
 export type OrderCostCategoryDto =
   | 'GUIDE_SERVICE'
@@ -99,7 +100,14 @@ export async function create(
   return toDto(row);
 }
 
-/** 更新一条成本明细（部分字段） */
+/**
+ * 更新一条成本明细（部分字段）
+ *
+ * C-17：routes 层先 findUnique 确认存在、再调这里 update，两次查询之间没有锁——
+ * 并发下这条记录可能被另一个请求先删掉，Prisma 会抛 P2025（Record to update not found）。
+ * 照 finances.cost.service.ts:deleteCostPeriod 的写法接住，转成 404 而不是让裸 Prisma 错误
+ * 冒到全局兜底变成不可行动的 500。
+ */
 export async function update(
   id: string,
   input: UpdateOrderCostItemInput,
@@ -109,18 +117,32 @@ export async function update(
   if (input.category !== undefined) data.category = input.category;
   if (input.amountCny !== undefined) data.amountCny = new Prisma.Decimal(input.amountCny);
   if (input.note !== undefined) data.note = input.note;
-  const row = await client.orderCostItem.update({
-    where: { id },
-    data,
-  });
-  return toDto(row);
+  try {
+    const row = await client.orderCostItem.update({
+      where: { id },
+      data,
+    });
+    return toDto(row);
+  } catch (e: unknown) {
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2025') {
+      throw new NotFoundError('成本明细不存在或已被删除');
+    }
+    throw e;
+  }
 }
 
-/** 删除一条成本明细 */
+/** 删除一条成本明细（同上：先查后删窗口内可能已被并发删除，P2025 → 404） */
 export async function remove(
   id: string,
   client: PrismaClient = defaultPrisma,
 ): Promise<{ id: string }> {
-  await client.orderCostItem.delete({ where: { id } });
-  return { id };
+  try {
+    await client.orderCostItem.delete({ where: { id } });
+    return { id };
+  } catch (e: unknown) {
+    if (e instanceof Prisma.PrismaClientKnownRequestError && e.code === 'P2025') {
+      throw new NotFoundError('成本明细不存在或已被删除');
+    }
+    throw e;
+  }
 }

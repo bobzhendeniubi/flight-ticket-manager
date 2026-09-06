@@ -1,6 +1,24 @@
 import type { FastifyInstance, FastifyError } from 'fastify';
 import { ZodError } from 'zod';
+import { Prisma } from '@prisma/client';
 import { AppError } from '../lib/errors.js';
+
+/**
+ * C-17：Prisma 已知错误码 → HTTP 状态码的兜底映射。
+ * 各模块理论上该在业务层手工 catch 并转译成 AppError（如 finances.cost.service.ts
+ * 的 deleteCostPeriod 对 P2025 → NotFoundError），但漏做手工 catch 的模块（如
+ * order-cost-items 的先查后写窗口）会让裸 Prisma 错误直接冒到这里，此前只会落进
+ * 500 兜底、前端看不出是并发冲突还是记录已被删除。这里只做兜底，不代替各模块自己
+ * 更精确的 catch（后者能给出更贴合业务场景的文案）。
+ */
+const PRISMA_ERROR_MAP: Record<string, { statusCode: number; code: string; message: string }> = {
+  // 唯一约束冲突（如并发下重复创建同一条记录）
+  P2002: { statusCode: 409, code: 'CONFLICT', message: '记录已存在或与现有数据冲突' },
+  // 更新/删除时记录已不存在（多为并发下被其他请求先一步删除）
+  P2025: { statusCode: 404, code: 'NOT_FOUND', message: 'Not found' },
+  // 事务冲突（如写冲突、事务超时），语义上可重试
+  P2034: { statusCode: 409, code: 'CONFLICT', message: '事务冲突，请重试' },
+};
 
 export function registerErrorHandler(app: FastifyInstance): void {
   app.setErrorHandler((err, req, reply) => {
@@ -56,6 +74,22 @@ export function registerErrorHandler(app: FastifyInstance): void {
           code: fe.code ?? 'BAD_REQUEST',
           message: fe.message,
         },
+      });
+    }
+
+    // Prisma 已知错误码（C-17）：模块没自己 catch 时的安全网，见上方 PRISMA_ERROR_MAP 注释
+    if (err instanceof Prisma.PrismaClientKnownRequestError) {
+      const mapped = PRISMA_ERROR_MAP[err.code];
+      if (mapped) {
+        req.log.info({ code: err.code }, 'prisma known error (mapped by global handler)');
+        return reply.status(mapped.statusCode).send({
+          error: { code: mapped.code, message: mapped.message },
+        });
+      }
+      // 其它 Prisma 错误码保持 500，但日志里带上 code 方便排查（此前完全看不出是不是 Prisma 抛的）
+      req.log.error({ err, code: err.code }, 'unhandled prisma error');
+      return reply.status(500).send({
+        error: { code: 'INTERNAL_ERROR', message: 'Internal server error' },
       });
     }
 

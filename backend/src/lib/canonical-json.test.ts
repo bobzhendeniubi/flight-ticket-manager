@@ -45,4 +45,24 @@ describe('canonicalJson', () => {
     // @ts-expect-error 入参收窄到「JSON.stringify 一定给得出字符串」的那些值（排除顶层 undefined）
     expect(canonicalJson(undefined)).toBeUndefined();
   });
+
+  // C-28：Date 实例没有自有可枚举属性，不特殊处理会被静默序列化成 {}，
+  // 两个不同的 Date 会被判成同一份指纹——这里验证已按 toISOString() 兜底，不再折叠成空对象。
+  it('Date 实例序列化成 ISO 字符串，而不是折叠成 {}', () => {
+    const d = new Date('2026-09-05T12:00:00.000Z');
+    expect(canonicalJson(d)).toBe(JSON.stringify(d.toISOString()));
+    expect(canonicalJson(d)).not.toBe('{}');
+  });
+
+  it('嵌套在对象里的不同 Date 值判不同（此前会因折叠成 {} 而被误判相同）', () => {
+    const a = { at: new Date('2026-09-05T00:00:00.000Z') };
+    const b = { at: new Date('2026-09-06T00:00:00.000Z') };
+    expect(canonicalJson(a)).not.toBe(canonicalJson(b));
+  });
+
+  it('相同 Date 值（不同实例）判相同', () => {
+    const a = { at: new Date('2026-09-05T00:00:00.000Z') };
+    const b = { at: new Date('2026-09-05T00:00:00.000Z') };
+    expect(canonicalJson(a)).toBe(canonicalJson(b));
+  });
 });

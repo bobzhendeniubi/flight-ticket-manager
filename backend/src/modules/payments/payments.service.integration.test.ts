@@ -541,11 +541,16 @@ describe('PaymentsService.handleCallback · R4/R5 兄弟 Payment 作废 + 迟到
     });
   }
 
-  /** 触发 sandbox 网关回调（验签通过 → 标 SUCCEEDED / 走后续账目）。 */
+  /**
+   * 触发 sandbox 网关回调（验签通过 → 标 SUCCEEDED / 走后续账目）。
+   * C-28 修复后 payment-adapters 不再对 SANDBOX_WEBHOOK_SECRET 兜底默认值（缺失即拒绝校验），
+   * 这里显式把它配上，而不是继续假设一个约定俗成的默认值。
+   */
   function fireCallback(method: PaymentMethod, paymentId: string, amountYuan: number) {
+    process.env.SANDBOX_WEBHOOK_SECRET = process.env.SANDBOX_WEBHOOK_SECRET ?? 'sandbox-test-secret';
     return service.handleCallback(
       method,
-      { 'x-sandbox-secret': process.env.SANDBOX_WEBHOOK_SECRET ?? 'sandbox-test-secret' },
+      { 'x-sandbox-secret': process.env.SANDBOX_WEBHOOK_SECRET },
       { paymentId, transactionId: `TX-${paymentId}`, amountYuan },
     );
   }

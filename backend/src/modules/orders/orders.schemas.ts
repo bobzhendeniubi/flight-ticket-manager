@@ -660,7 +660,13 @@ export const listOrdersQuerySchema = z.object({
   flightDateTo: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
   // 接单状态过滤
   claimedById: z.string().optional(),   // 指定 ops
-  unclaimedOnly: z.coerce.boolean().optional(),
+  // C-28：z.coerce.boolean() 底层是 Boolean(value)——query 字符串 "false"（非空串）会被判成
+  // true。改成跟下面 invoiced 字段一样显式只认 'true'/'false'，避免 ?unclaimedOnly=false
+  // 被误判为「只看未接单」。
+  unclaimedOnly: z
+    .union([z.boolean(), z.enum(['true', 'false'])])
+    .transform((v) => v === true || v === 'true')
+    .optional(),
   // ops 确认的三个筛选（航班号 / 乘客姓名 / 开票状态）
   // 航班号（不区分大小写）。口径随同时给出的日期维度收口（0831 票务反馈，精筛见
   // filterOrderIdsByLegFlightNumber / filterOrderIdsByFlightDate）：
@@ -874,9 +880,10 @@ export type BatchUpdateStatusBody = z.infer<typeof batchUpdateStatusBodySchema>;
 
 // ── 批量开票（票务岗，ADMIN/STAFF）─────────────────────────────────────────
 // 逐单按航段翻转 outboundInvoiced/returnInvoiced/systemInvoiced（复用单条 setInvoiceFlags 语义）；
-// flags 至少选一项，orderIds 上限对齐 batchUpdateStatusBodySchema。
+// flags 至少选一项。B-13：上限是开票自己的口径（docs/口径决议.md 2026-07-08「批量开票单次上限
+// 50」），不跟 batchUpdateStatusBodySchema 的 100 对齐——此前误抄成了无关端点的上限。
 export const batchSetInvoiceFlagsBodySchema = z.object({
-  orderIds: z.array(z.string().min(1)).min(1).max(100),
+  orderIds: z.array(z.string().min(1)).min(1).max(50),
   flags: z
     .object({
       outboundInvoiced: z.boolean().optional(),
@@ -1517,7 +1524,14 @@ export type RoomSupplementBody = z.infer<typeof roomSupplementBodySchema>;
 // ── 订单详情补录结构化地面项（POST /orders/:id/items/ground；ADMIN/STAFF）──
 // unitPriceCny 省略时由服务端按产品 costPriceCny 带出，显式传值表示运营手改售价。
 const groundItemCommonSchema = z.object({
-  unitPriceCny: z.number().finite().nonnegative('售价不能为负').optional(),
+  // C-16：漏了上限，手滑多打几个 0 会在写入 Decimal(10,2) 列时 numeric field overflow，
+  // 抛出裸 Prisma 错误变成不可行动的 500。照 updateItemSettlementPriceBodySchema 同款上限补上。
+  unitPriceCny: z
+    .number()
+    .finite()
+    .nonnegative('售价不能为负')
+    .max(SETTLEMENT_PRICE_CAP_CNY, `售价超出上限（${SETTLEMENT_PRICE_CAP_CNY}）`)
+    .optional(),
   note: z.string().max(500).optional(),
 });
 

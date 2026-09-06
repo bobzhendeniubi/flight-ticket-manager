@@ -82,6 +82,19 @@ describe('SandboxAdapter.verifyCallback', () => {
   const adapter = new SandboxAdapter(PaymentMethod.WECHAT_PAY);
   const validSecret = 'sandbox-test-secret';
 
+  // C-28：SandboxAdapter 不再对 SANDBOX_WEBHOOK_SECRET 兜底硬编码默认值，
+  // 除「未配置」这条用例外，其余用例都需要显式把密钥配上才能测「校验本身」的行为。
+  beforeEach(() => {
+    process.env.SANDBOX_WEBHOOK_SECRET = validSecret;
+  });
+
+  it('SANDBOX_WEBHOOK_SECRET 未配置 → 拒绝校验（抛错，fail-closed，C-28）', () => {
+    delete process.env.SANDBOX_WEBHOOK_SECRET;
+    expect(() => adapter.verifyCallback({ 'x-sandbox-secret': validSecret }, { paymentId: 'p1' })).toThrow(
+      /SANDBOX_WEBHOOK_SECRET/,
+    );
+  });
+
   it('header 匹配 + body 完整 → valid=true 返回字段', () => {
     const r = adapter.verifyCallback(
       { 'x-sandbox-secret': validSecret },
@@ -223,5 +236,17 @@ describe('createMiniappJsapiPayment — fail-closed guard（P1 安全）', () =>
     process.env.NODE_ENV = 'test';
     const r = await createMiniappJsapiPayment(baseInput);
     expect(r.paySign).toBe('SANDBOX_MOCK_SIGN');
+  });
+
+  // C-25：nonceStr 曾用 Math.random 拼 base36 生成，非密码学安全随机；
+  // 换成 crypto.randomBytes 后应为 32 位十六进制、且两次调用不同（基本的随机性校验）。
+  it('nonceStr 改用 CSPRNG 后是 32 位十六进制且每次不同', async () => {
+    process.env.PAYMENT_MODE = 'sandbox';
+    process.env.NODE_ENV = 'test';
+    const r1 = await createMiniappJsapiPayment(baseInput);
+    const r2 = await createMiniappJsapiPayment(baseInput);
+    expect(r1.nonceStr).toMatch(/^[0-9a-f]{32}$/);
+    expect(r2.nonceStr).toMatch(/^[0-9a-f]{32}$/);
+    expect(r1.nonceStr).not.toBe(r2.nonceStr);
   });
 });

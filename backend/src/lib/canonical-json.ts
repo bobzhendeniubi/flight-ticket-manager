@@ -28,6 +28,12 @@ export type CanonicalJsonInput = NonNullable<unknown> | null;
 /** 递归重建：对象换成按键名升序的新对象，数组逐个处理但不重排，其余原样返回。 */
 function sortDeep(value: unknown): unknown {
   if (Array.isArray(value)) return value.map(sortDeep);
+  // C-28：Date 实例 typeof 是 'object'，但没有自有可枚举属性——Object.keys(new Date()) 是
+  // 空数组，不特殊处理的话会被下面的循环静默序列化成 {}，两个不同的 Date 会被判成同一份指纹。
+  // 目前 canonicalJson 的两个调用方（orchestrationFingerprint/legActionFingerprint）入参都不含
+  // Date 字段，暂时触发不到；这里照 JSON.stringify 的行为提前转成 ISO 字符串兜底，防止未来有
+  // 调用方往指纹对象里加一个 Date 字段时悄悄踩这个坑。
+  if (value instanceof Date) return value.toISOString();
   if (value === null || typeof value !== 'object') return value;
   const source = value as Record<string, unknown>;
   const out: Record<string, unknown> = {};

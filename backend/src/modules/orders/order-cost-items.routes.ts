@@ -15,6 +15,7 @@ import { z } from 'zod';
 import { OrderCostCategory, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
+import { SETTLEMENT_PRICE_CAP_CNY } from './orders.schemas.js';
 import {
   create as createCostItem,
   listByOrder,
@@ -24,16 +25,28 @@ import {
 
 const categoryEnum = z.nativeEnum(OrderCostCategory);
 
+// C-16：此前无上限，财务手滑多打两个 0（如 99999999999）过了 zod 校验后写入
+// Decimal(12,2) 列会触发 Postgres numeric field overflow，抛出裸 Prisma 错误、落进
+// error-handler.ts 的 500 兜底，前端只看到「Internal server error」看不出哪个字段填错了。
+// 成本明细有正有负（如 COMP_GIFT 赠送费用可记为负），照 priceAdjustmentAmountSchema 的写法
+// 按绝对值封顶，复用 SETTLEMENT_PRICE_CAP_CNY 这个已有的「单笔金额」上限口径。
+const amountCnySchema = z
+  .number()
+  .finite()
+  .refine((v) => Math.abs(v) <= SETTLEMENT_PRICE_CAP_CNY, {
+    message: `金额超出上限（±${SETTLEMENT_PRICE_CAP_CNY}）`,
+  });
+
 const createBodySchema = z.object({
   category: categoryEnum,
-  amountCny: z.number().finite(),
+  amountCny: amountCnySchema,
   note: z.string().max(500).optional().nullable(),
 });
 
 const updateBodySchema = z
   .object({
     category: categoryEnum.optional(),
-    amountCny: z.number().finite().optional(),
+    amountCny: amountCnySchema.optional(),
     note: z.string().max(500).nullable().optional(),
   })
   .refine((v) => Object.keys(v).length > 0, { message: 'no fields to update' });

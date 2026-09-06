@@ -13,6 +13,27 @@
 import crypto from 'node:crypto';
 import { PaymentMethod } from '@prisma/client';
 
+// ── 集中读取散落各处的 process.env（C-28 汇报）───────────────────────────
+// PAYMENT_MODE / SANDBOX_WEBHOOK_SECRET 尚未纳入 config/env.ts 的 EnvSchema（需要终审确认后补），
+// 这里先把本文件里原本到处裸读的 process.env.* 收拢到一处；仍按调用时机读取（不在模块顶层
+// 定死成常量），因为现有 payment-adapters.test.ts 靠运行时改写 process.env 动态切换分支来验证
+// fail-closed 行为，定死成常量会读到模块加载时的旧值、把这些安全测试改坏。
+// NODE_ENV / SANDBOX_PAY_URL_PATH 虽已在 EnvSchema 里有校验，但 env.ts 的 `env` 单例是进程启动时
+// 算好就不再变的（见 config/env.ts:176 `export const env = loadEnv()`），同样的动态测试依赖，
+// 故这两处也保留 process.env 直接读取，只做位置集中，不改读取源。
+function getPaymentModeEnv(): string {
+  return process.env.PAYMENT_MODE ?? 'sandbox';
+}
+function getNodeEnv(): string | undefined {
+  return process.env.NODE_ENV;
+}
+function getSandboxPayUrlPath(): string {
+  return process.env.SANDBOX_PAY_URL_PATH || '/sandbox-pay';
+}
+function getSandboxWebhookSecret(): string | undefined {
+  return process.env.SANDBOX_WEBHOOK_SECRET;
+}
+
 export interface CreatePaymentInput {
   paymentId: string;        // 我们的 Payment.id（作为 out_trade_no）
   orderNumber: string;       // 订单号（展示）
@@ -60,7 +81,7 @@ export class SandboxAdapter implements PaymentAdapter {
   async createPayment(input: CreatePaymentInput): Promise<CreatePaymentResult> {
     // 模拟一个可跳转的付款页。路径由 SANDBOX_PAY_URL_PATH env 控制（默认 /sandbox-pay）
     const fakeTxId = 'SBX' + Date.now() + crypto.randomBytes(4).toString('hex');
-    const sandboxPath = process.env.SANDBOX_PAY_URL_PATH || '/sandbox-pay';
+    const sandboxPath = getSandboxPayUrlPath();
     return {
       paymentUrl: `${sandboxPath}?paymentId=${encodeURIComponent(input.paymentId)}&amount=${input.amountYuan}`,
       transactionId: fakeTxId,
@@ -71,9 +92,15 @@ export class SandboxAdapter implements PaymentAdapter {
 
   verifyCallback(headers: Record<string, string | string[] | undefined>, body: unknown) {
     // Sandbox 回调：body = { paymentId, transactionId, amountYuan }
-    // 校验 header 里的 "x-sandbox-secret" 必须匹配 env.SANDBOX_WEBHOOK_SECRET
+    // 校验 header 里的 "x-sandbox-secret" 必须匹配 SANDBOX_WEBHOOK_SECRET
+    // C-28：不再兜底成硬编码的 'sandbox-test-secret'——密钥没配就直接拒绝校验（抛错），
+    // 避免「忘记配置时反而全部放行」（未配置时 header 与 secret 都会是 undefined，若不提前
+    // 拒绝，两者宽松相等会被判定为匹配）。
+    const secret = getSandboxWebhookSecret();
+    if (!secret) {
+      throw new Error('SANDBOX_WEBHOOK_SECRET 未配置，拒绝校验沙箱回调');
+    }
     const h = headers['x-sandbox-secret'];
-    const secret = process.env.SANDBOX_WEBHOOK_SECRET ?? 'sandbox-test-secret';
     if (h !== secret) {
       return { valid: false, reason: 'x-sandbox-secret mismatch' };
     }
@@ -343,12 +370,12 @@ export async function createMiniappJsapiPayment(input: {
   signType: 'RSA' | 'MD5' | 'HMAC-SHA256';
   paySign: string;
 }> {
-  const mode = process.env.PAYMENT_MODE ?? 'sandbox';
+  const mode = getPaymentModeEnv();
 
   if (mode !== 'live') {
     // P1 fail-closed：生产环境绝对不允许回 mock 参数
     // 即使 PAYMENT_MODE 被意外设成 sandbox，也不能在 NODE_ENV=production 下放行
-    if (process.env.NODE_ENV === 'production') {
+    if (getNodeEnv() === 'production') {
       throw new Error(
         'PAYMENT_MODE != "live" 但 NODE_ENV=production — 拒绝返回 mock 支付参数',
       );
@@ -398,14 +425,16 @@ export async function createMiniappJsapiPayment(input: {
 }
 
 function genNonce(): string {
-  return Math.random().toString(36).slice(2, 18) + Math.random().toString(36).slice(2, 18);
+  // C-25：Math.random 是可预测的伪随机数，签名串里本该随机的 nonceStr 不该用它生成；
+  // 换成 CSPRNG（网关目前未启用，属于休眠代码，顺手修）。
+  return crypto.randomBytes(16).toString('hex');
 }
 
 // ══════════════════════════════════════════════════════════════════
 // Registry — 根据 env.PAYMENT_MODE 切换
 // ══════════════════════════════════════════════════════════════════
 export function getPaymentAdapter(method: PaymentMethod): PaymentAdapter {
-  const mode = process.env.PAYMENT_MODE ?? 'sandbox';
+  const mode = getPaymentModeEnv();
   if (mode === 'live') {
     switch (method) {
       case PaymentMethod.WECHAT_PAY: return new WeChatPayAdapter();
@@ -419,7 +448,7 @@ export function getPaymentAdapter(method: PaymentMethod): PaymentAdapter {
   // 一旦 PAYMENT_MODE 被误配成非 live，匿名回调即可把订单刷成 PAID。此处 fail-closed，
   // 与 /payments/sandbox-confirm、createMiniappJsapiPayment 的 NODE_ENV 兜底一致——
   // 配错时支付直接失败，绝不接受伪造回调。
-  if (process.env.NODE_ENV === 'production') {
+  if (getNodeEnv() === 'production') {
     throw new Error(
       '生产环境未启用真实支付适配器：PAYMENT_MODE 必须为 live（当前非 live，已拒绝使用沙箱验签）',
     );
