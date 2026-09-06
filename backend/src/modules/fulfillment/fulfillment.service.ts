@@ -25,11 +25,36 @@ import {
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import type { AuditActor } from '../../lib/audit.js';
+import { isFeatureEnabled } from '../../lib/feature-flags.js';
+import { pushWecomMarkdown } from '../../lib/wecom-webhook.js';
 import { syncOrderVisaCompletion, type VisaCompletionOutcome } from './visa-completion.js';
 import type { ListFulfillmentQuery, UpdateFulfillmentBody } from './fulfillment.schemas.js';
 
 export const REFUND_REQUESTED_FULFILLMENT_ERROR =
   '订单退款申请中，库存已释放，不可继续履约；如退款被驳回可恢复操作';
+
+/** 任务类型 → 岗位中文名（企业微信 @ 提示用）。 */
+const FULFILLMENT_TYPE_ROLE_LABEL: Record<FulfillmentType, string> = {
+  [FulfillmentType.FLIGHT_TICKETING]: '票务岗',
+  [FulfillmentType.HOTEL_BOOKING]: '房控/地接',
+  [FulfillmentType.VISA_APPLICATION]: '签证岗',
+  [FulfillmentType.TRANSFER_DISPATCH]: '接送岗',
+  [FulfillmentType.BUNDLE_COMPOSITE]: '操作部',
+};
+
+/**
+ * 履约任务被指派后即时推一条企业微信通知——受 REMINDER_WEBHOOK_PUSH flag 控制
+ *（关闭或未配置 WECOM_WEBHOOK_URL 都是 no-op）。按任务类型 @ 岗位而非具体某个人：
+ * 群机器人没法精确 @ 到某个人，且产品文案不该写死内部同事姓名（见仓库 CLAUDE.md 铁律）。
+ */
+async function notifyAssigneeChangeToWecom(orderNumber: string, type: FulfillmentType): Promise<void> {
+  if (!(await isFeatureEnabled(prisma, 'REMINDER_WEBHOOK_PUSH'))) return;
+  const role = FULFILLMENT_TYPE_ROLE_LABEL[type] ?? '操作部';
+  await pushWecomMarkdown(
+    `### 履约任务新指派\n@${role} 有新工单：订单 ${orderNumber} 待处理。`,
+    'fulfillment-assigned',
+  );
+}
 
 /**
  * 计入履约任务列表 / 签证台的父订单状态——与订单/财务导出的 COUNTED_STATUSES 同一补集口径：
@@ -939,6 +964,17 @@ export class FulfillmentService {
           },
         });
       }
+    }
+
+    // 指派变化（旧值 → 新的非空指派）时即时推企业微信通知；不在任何事务内，直接
+    // fire-and-forget。只认「指派到了具体某人」这个方向，清空指派（assigneeUserId: null）
+    // 不通知——没有接手人，通知了也没人对应负责。
+    if (
+      body.assigneeUserId !== undefined &&
+      body.assigneeUserId !== existing.assigneeUserId &&
+      body.assigneeUserId != null
+    ) {
+      void notifyAssigneeChangeToWecom(updated.orderItem.order.orderNumber, updated.type);
     }
 
     return {
