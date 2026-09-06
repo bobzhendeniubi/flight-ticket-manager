@@ -217,7 +217,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 指定酒店星级闸同样在此生效（对 AGENT 硬拒 / 对运营不拦）——见 service.quoteOrder。
   app.post(
     '/quote',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.create')] },
     async (req, reply) => {
       const body = quoteOrderBodySchema.parse(req.body);
       const requester = await buildRequester(req.user.sub, req.user.role);
@@ -336,7 +336,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 导出空白名单模版（姓名 | 护照号 | 出生日期 | 性别），运营把收单群名单转此格式后上传解析。
   app.get(
     '/roster/template',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.roster.manage')] },
     async (req, reply) => {
       const buf = await buildRosterTemplateWorkbook();
       void writeAudit({
@@ -365,7 +365,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 容错：跳空行 / 容错日期格式 / 单格不可解析只收 warning，不整文件抛错。
   app.post(
     '/roster/parse',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.roster.manage')] },
     async (req) => {
       const body = z
         .object({ fileBase64: z.string().min(1, 'fileBase64 必填') })
@@ -399,7 +399,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 代理身份上传：结算价格 / 选择代理两列忽略并提示（结算价由系统按代理价计算，归属自动为本代理）。
   app.post(
     '/batch-import/parse',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.create')] },
     async (req) => {
       const body = z
         .object({ fileBase64: z.string().min(1, 'fileBase64 必填') })
@@ -470,7 +470,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   静态路由，Fastify 优先于 /:id 匹配，故不会被参数路由吞掉。
   app.get(
     '/deleted',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.read_deleted')] },
     async (req) => {
       const q = z
         .object({
@@ -615,7 +615,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
 
   /**
    * POST /orders/:id/refunds/:refundId/mark-paid
-   * 登记「这笔退款的钱确实打出去了」。ADMIN 或财务岗（requireFinanceAccess，与财务页同一道闸）。
+   * 登记「这笔退款的钱确实打出去了」。ADMIN 或财务岗（能力 refunds.mark_paid，与财务页同一道闸）。
    *
    * 与退款状态机无关：Refund.status 一个字不改，订单的已收/尾款一分不动 —— 这里只是给
    * 「核准之后、真金白银离开公司账户」这一步留一条可查的痕迹（谁打的、几时、走哪条渠道、流水号）。
@@ -623,7 +623,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
    */
   app.post(
     '/:id/refunds/:refundId/mark-paid',
-    { preHandler: [app.authenticate, app.requireFinanceAccess] },
+    { preHandler: [app.authenticate, app.requireCapability('refunds.mark_paid')] },
     async (req) => {
       const { id, refundId } = req.params as { id: string; refundId: string };
       const body = markRefundPaidBodySchema.parse(req.body ?? {});
@@ -826,7 +826,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 代理不能跨代理看订单，所以 AGENT 不放行；客户更不行
   app.get(
     '/export-by-schedule',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.export.ops')] },
     async (req, reply) => {
       const query = z
         .object({ scheduleId: z.string().min(1, 'scheduleId 必填') })
@@ -885,7 +885,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     {
       preHandler: [
         app.authenticate,
-        app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT),
+        app.requireCapability('orders.export.shared'),
       ],
     },
     async (req, reply) => {
@@ -938,7 +938,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     {
       preHandler: [
         app.authenticate,
-        app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT),
+        app.requireCapability('orders.export.shared'),
       ],
     },
     async (req, reply) => {
@@ -1005,7 +1005,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     {
       preHandler: [
         app.authenticate,
-        app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT),
+        app.requireCapability('orders.export.shared'),
       ],
     },
     async (req, reply) => {
@@ -1063,7 +1063,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   · departDate：按出发日选订单，导出其全部入住晚（给了它就优先，忽略 from/to）
   app.get(
     '/export-room-allocation',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.export.ops')] },
     async (req, reply) => {
       const query = exportRoomAllocationQuerySchema.parse(req.query);
 
@@ -1115,7 +1115,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 按勾选的订单导出合并签证名单 xlsx（状态不合格/查不到的单静默不计入，仅出合格单）。
   app.post(
     '/visa-roster.xlsx',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.export.ops')] },
     async (req, reply) => {
       const body = visaBundleBodySchema.parse(req.body);
       const xlsxBuf = await buildVisaRosterXlsx(body.orderIds);
@@ -1146,7 +1146,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 按勾选的订单导出全部乘客护照图 zip（不含名单 xlsx）；状态不合格/查不到的单及缺图明细见 zip 内 README。
   app.post(
     '/visa-passports.zip',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.export.ops')] },
     async (req, reply) => {
       const body = visaBundleBodySchema.parse(req.body);
       const zipBuf = await buildVisaPassportsZip(body.orderIds);
@@ -1177,7 +1177,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 代理与客户一律不放行（代理拿到全套护照原图 = 客资无门槛外流）。
   app.get(
     '/:id/passport-photos.zip',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.export.ops')] },
     async (req, reply) => {
       const { id } = req.params as { id: string };
       // 包类型按**入口**声明，不按角色（签证岗/操作岗同为 STAFF，服务端分不出谁是谁）：
@@ -1265,7 +1265,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   状态（CANCELLED/PAYMENT_TIMEOUT/REFUNDED/FAILED/DRAFT）。删除本身绝不触碰库存/座位账。
   app.delete(
     '/:id',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.delete')] },
     async (req) => {
       const { id } = req.params as { id: string };
       const requester = await buildRequester(req.user.sub, req.user.role);
@@ -1289,7 +1289,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   全是释放型状态，恢复绝不凭空占座（依据见 service.restoreOrder 注释）。审计 RESTORE_ORDER。
   app.post(
     '/:id/restore',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.delete')] },
     async (req) => {
       const { id } = req.params as { id: string };
       const requester = await buildRequester(req.user.sub, req.user.role);
@@ -1810,7 +1810,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 不存在或已软删订单跳过；每个成功订单各写一条审计。
   app.post(
     '/batch/settlement-lock',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.batch_lock')] },
     async (req) => {
       const body = batchSettlementLockBodySchema.parse(req.body);
       const result = await service.batchSetSettlementLock(body.orderIds, body.lock, req.user.sub);
@@ -1840,7 +1840,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 不存在 / 回收站 / 已是目标状态的单逐单跳过并带回原因；每个真正改动的订单各写一条审计。
   app.post(
     '/batch/payments-lock',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.batch_lock')] },
     async (req) => {
       const body = batchPaymentsLockBodySchema.parse(req.body);
       const result = await service.batchSetPaymentsLock(body.orderIds, body.locked, req.user.sub);
@@ -1884,7 +1884,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 锁价单 / 死单 / 回收站单 / 找不到的 id 逐单跳过并带回原因；每笔真调价各写一条审计。
   app.post(
     '/batch/price-adjustment',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.batch_lock')] },
     async (req) => {
       const body = batchPriceAdjustmentBodySchema.parse(req.body);
       const { orderIds, ...input } = body;
@@ -2706,7 +2706,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 钱不动：新行 0 元、源行 amount 冻结 → order.total 恒等；库存对称：Σ roomsBilled 恒等。
   app.post(
     '/:id/items/:itemId/split-room-group',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.hotel.write')] },
     async (req) => {
       const { id, itemId } = req.params as { id: string; itemId: string };
       const body = splitRoomGroupBodySchema.parse(req.body);
@@ -2739,7 +2739,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 机票行/班次/座位一律不动；酒店已落位到真实酒店的单先走换酒店。AGENT 不可用。
   app.post(
     '/:id/change-bundle',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.change_bundle')] },
     async (req) => {
       const { id } = req.params as { id: string };
       const body = changeOrderBundleBodySchema.parse(req.body);
@@ -3207,7 +3207,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // GET /orders/no-show/report?from&to
   app.get(
     '/no-show/report',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.no_show')] },
     async (req) => {
       const { from, to } = noShowReportQuerySchema.parse(req.query);
       const { rows, totals } = await loadNoShowReport(from, to, {
@@ -3234,7 +3234,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // GET /orders/no-show/report/export?from&to → xlsx（汇总 + 逐单明细两个 sheet）
   app.get(
     '/no-show/report/export',
-    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    { preHandler: [app.authenticate, app.requireCapability('orders.no_show')] },
     async (req, reply) => {
       const { from, to } = noShowReportQuerySchema.parse(req.query);
       const buf = await buildNoShowReportWorkbook(from, to, {
