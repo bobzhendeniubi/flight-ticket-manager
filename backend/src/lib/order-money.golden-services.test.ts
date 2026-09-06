@@ -219,7 +219,7 @@ describe('黄金 · 财务概览 REFUNDED 负项（paidAmount − 已完成退�
       flightSchedule: { findMany: vi.fn().mockResolvedValue([]) },
       flightCostPeriod: { findMany: vi.fn().mockResolvedValue([]) },
     } as unknown as PrismaClient;
-    const summary = await getFinancesSummary({ from: '2026-08-01', to: '2026-08-31' }, client);
+    const summary = await getFinancesSummary({ from: '2026-08-01', to: '2026-08-31' }, null, client);
     // 300 + 5300 = 5600：F2 的预存抵扣 500 **没有**被算进这条负项（与 lib/net-received 的 5800 不同）
     expect(summary.revenueBreakdown.refund).toMatchInlineSnapshot(`5600`);
     expect(summary.revenueCny).toMatchInlineSnapshot(`5600`);

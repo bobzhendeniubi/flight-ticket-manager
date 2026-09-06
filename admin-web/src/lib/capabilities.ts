@@ -30,6 +30,7 @@ export type Capability =
   | 'feature_flags.read'
   | 'feature_flags.write'
   | 'finances.cost.manage'
+  | 'finances.cost.backfill'
   | 'finances.supplier_payables.manage'
   | 'finances.view'
   | 'flights.admin_view'

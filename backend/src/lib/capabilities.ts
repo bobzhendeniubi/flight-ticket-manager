@@ -195,6 +195,13 @@ export const CAPABILITIES = {
     audience: 'OPS',
     说明: '成本维护：成本周期、各类成本价、美元汇率、班次成本锁（现状不限财务岗）',
   },
+  'finances.cost.backfill': {
+    // 比 finances.cost.manage 更紧一档：改一条成本周期只影响那条线那段日期，回填一按
+    // 会一次性重写整本订单簿上机票/套餐行的成本，报表与概览的毛利跟着全变。这种全局改数
+    // 只给 ADMIN。
+    audience: 'ADMIN_ONLY',
+    说明: '存量订单行成本快照回填（一次性重写全库机票/套餐行成本）',
+  },
   'reports.view': { audience: 'FINANCE', 说明: '经营报表：销售、应收、代理欠款、四表导出' },
   'refunds.mark_paid': { audience: 'FINANCE', 说明: '退款标记已打款' },
   'finances.supplier_payables.manage': {

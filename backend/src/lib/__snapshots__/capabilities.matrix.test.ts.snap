@@ -372,6 +372,7 @@ POST   /auth/register | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STA
 POST   /bundle-change-requests/:id/approve | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 POST   /bundle-change-requests/:id/reject | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 POST   /cancellation-policies | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
+POST   /finances/cost-snapshots/backfill | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=deny AGENT=deny CUSTOMER=deny ANON=deny
 POST   /finances/cost/periods | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 POST   /finances/schedules/:id/cost-lock | ADMIN=allow STAFF:运营=allow STAFF:VISA_DESK=allow STAFF:TICKETING=allow STAFF:ROOM_CONTROL=allow STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny
 POST   /finances/supplier-invoices | ADMIN=allow STAFF:运营=deny STAFF:VISA_DESK=deny STAFF:TICKETING=deny STAFF:ROOM_CONTROL=deny STAFF:FINANCE=allow AGENT=deny CUSTOMER=deny ANON=deny

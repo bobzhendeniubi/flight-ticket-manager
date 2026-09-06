@@ -3,10 +3,10 @@
  * 损益/报表/导出等查询放开到 ADMIN 或 STAFF+财务岗；成本维护（周期/班次/产品成本 + 成本锁定）仍按 ADMIN/STAFF。
  *
  * 路由：
- *   GET /finances/summary?from=YYYY-MM-DD&to=YYYY-MM-DD
+ *   GET /finances/summary?from=YYYY-MM-DD&to=YYYY-MM-DD&routeKey=MFM-DAD
  *   GET /finances/flights?from=...&to=...&limit=100
  *   GET /finances/orders?from=...&to=...&limit=100
- *   GET /finances/monthly?months=6
+ *   GET /finances/monthly?months=6&routeKey=MFM-DAD
  *   POST /finances/cost-snapshots/backfill?limit=&apply=  存量机票/套餐行成本快照回填
  *
  * 所有访问都写审计日志（VIEW_FINANCES）— 财务数据敏感。
@@ -52,14 +52,26 @@ const dateStr = z
   .string()
   .regex(/^\d{4}-\d{2}-\d{2}$/u, '日期格式应为 YYYY-MM-DD');
 
+/**
+ * 航线筛选参数（'MFM-DAD' 形状，或 'unknown' = 推不出航线的单）。
+ * 缺省 / 空串 = 不筛（全部航线）——前端下拉的「全部」项传空串。
+ */
+const routeKeyParam = z
+  .string()
+  .max(32)
+  .optional()
+  .transform((v) => (v && v.length > 0 ? v : null));
+
 const rangeSchema = z.object({
   from: dateStr.optional(),
   to: dateStr.optional(),
   limit: z.coerce.number().int().positive().max(500).optional(),
+  routeKey: routeKeyParam,
 });
 
 const monthlySchema = z.object({
   months: z.coerce.number().int().positive().max(36).optional(),
+  routeKey: routeKeyParam,
 });
 
 // 成本快照回填：limit 缺省 = 全量；apply 缺省 false（只算不写，先看清楚要补多少行再动手）。
@@ -101,7 +113,14 @@ function defaultRange(): { from: string; to: string } {
 
 function logView(
   req: FastifyRequest,
-  detail: { route: string; range?: { from: string; to: string }; months?: number; orderId?: string },
+  detail: {
+    route: string;
+    range?: { from: string; to: string };
+    months?: number;
+    orderId?: string;
+    /** 圈定的航线（未圈 = 省略）——审计里看得出这次查的是哪条线的数。 */
+    routeKey?: string;
+  },
 ): void {
   void writeAudit({
     actor: actorFromRequest(req),
@@ -125,8 +144,8 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     const q = rangeSchema.parse(req.query);
     const def = defaultRange();
     const range = { from: q.from ?? def.from, to: q.to ?? def.to };
-    logView(req, { route: 'summary', range });
-    return getFinancesSummary(range);
+    logView(req, { route: 'summary', range, routeKey: q.routeKey ?? undefined });
+    return getFinancesSummary(range, q.routeKey);
   });
 
   app.get('/flights', requireFinance, async (req) => {
@@ -168,37 +187,42 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
   app.get('/monthly', requireFinance, async (req) => {
     const q = monthlySchema.parse(req.query);
     const months = q.months ?? 6;
-    logView(req, { route: 'monthly', months });
-    const points = await getMonthlyTrend(months);
-    return { months, points };
+    logView(req, { route: 'monthly', months, routeKey: q.routeKey ?? undefined });
+    const points = await getMonthlyTrend(months, q.routeKey);
+    return { months, points, routeKey: q.routeKey };
   });
 
   // ── 存量成本快照回填（机票行 / 套餐行）────────────────────────────────────
   // 这两类行的成本快照 2026-09-06 才开始落库，之前的单一律 NULL，于是存量区间的毛利
   // 全报「未知」。这条端点把现在算得出来的成本补进去；口径与幂等见 finances.cost-backfill.ts。
   // 缺省 apply=false（只算不写）——先看清楚要补多少行、有多少行补不上，再决定要不要写。
-  // 挂成本维护那道闸（finances.cost.manage）：它改的是成本数据，不是查询。
-  app.post('/cost-snapshots/backfill', requireAdminOrStaff, async (req) => {
-    const q = costBackfillSchema.parse(req.query);
-    const result = await backfillItemCostSnapshots({ limit: q.limit, apply: q.apply });
-    // 真写库才留审计（dry-run 只是看一眼，写审计反而是噪音）。
-    if (q.apply && result.filled > 0) {
-      await writeAudit({
-        actor: actorFromRequest(req),
-        action: 'BACKFILL_ITEM_COST_SNAPSHOTS',
-        targetType: 'SYSTEM',
-        targetId: 'cost-snapshots',
-        targetLabel: `订单行成本快照回填 · 补上 ${result.filled} 行`,
-        after: {
-          ...result,
-          limit: q.limit ?? null,
-          note: '成本周期无版本历史，回填按当前周期定义 + 航段出发日计算；套餐办签人数取当前乘客名单。',
-        },
-        severity: 'CRITICAL',
-      });
-    }
-    return result;
-  });
+  // 只给 ADMIN（finances.cost.backfill）：改一条成本周期只影响那条线那段日期，这一按却会
+  // 一次性重写整本订单簿上机票/套餐行的成本，报表与概览的毛利跟着全变——比成本维护重一档。
+  app.post(
+    '/cost-snapshots/backfill',
+    { preHandler: [app.authenticate, app.requireCapability('finances.cost.backfill')] },
+    async (req) => {
+      const q = costBackfillSchema.parse(req.query);
+      const result = await backfillItemCostSnapshots({ limit: q.limit, apply: q.apply });
+      // 真写库才留审计（dry-run 只是看一眼，写审计反而是噪音）。
+      if (q.apply && result.filled > 0) {
+        await writeAudit({
+          actor: actorFromRequest(req),
+          action: 'BACKFILL_ITEM_COST_SNAPSHOTS',
+          targetType: 'SYSTEM',
+          targetId: 'cost-snapshots',
+          targetLabel: `订单行成本快照回填 · 补上 ${result.filled} 行`,
+          after: {
+            ...result,
+            limit: q.limit ?? null,
+            note: '成本周期无版本历史，回填按当前周期定义 + 航段出发日计算；套餐办签人数取当前乘客名单。',
+          },
+          severity: 'CRITICAL',
+        });
+      }
+      return result;
+    },
+  );
 
   // ── xlsx 导出（一行/乘客）──
   app.get('/export', requireFinance, async (req, reply) => {
@@ -224,8 +248,8 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     const q = rangeSchema.parse(req.query);
     const def = defaultRange();
     const range = { from: q.from ?? def.from, to: q.to ?? def.to };
-    logView(req, { route: 'export-by-flight', range });
-    const buf = await buildFinanceExportByFlightWorkbook(range);
+    logView(req, { route: 'export-by-flight', range, routeKey: q.routeKey ?? undefined });
+    const buf = await buildFinanceExportByFlightWorkbook(range, q.routeKey);
     return reply
       .header(
         'Content-Type',
@@ -233,7 +257,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
       )
       .header(
         'Content-Disposition',
-        `attachment; filename="${encodeURIComponent(financeExportByFlightFilename(range))}"`,
+        `attachment; filename="${encodeURIComponent(financeExportByFlightFilename(range, q.routeKey))}"`,
       )
       .send(buf);
   });
