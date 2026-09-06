@@ -227,10 +227,14 @@ export function TicketBackfillPage() {
         collected.push(...res.results);
         setSubmitProgress({ done: i + 1, total: chunks.length });
       }
-      setResults(collected);
       // 写完了重新拉一次匹配：库里现值变了，「现有 → 新值」两列必须跟着变，
       // 否则票务看着一屏「待覆盖」，其实已经写进去了。
+      //
+      // ⚠ 顺序不能反：runPreview 开头会清空 results（换一份名单重新匹配时本就该清），
+      // 所以「本次回填了多少条」必须**等它跑完之后**再写回去 —— 先写会被这次刷新抹掉，
+      // 票务点完提交只看到一屏刷新后的表，完全不知道刚才成了几条。
       if (rosterText.trim()) await runPreview({ lines: rosterText });
+      setResults(collected);
     } catch (e) {
       // 已经成功的片不回滚（服务端一条一事务）；把已收到的结果照实摆出来。
       if (collected.length > 0) setResults(collected);
