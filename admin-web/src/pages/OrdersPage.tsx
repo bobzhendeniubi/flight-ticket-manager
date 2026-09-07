@@ -1263,6 +1263,10 @@ export function OrdersPage() {
   const [bulkFlightScheduleId, setBulkFlightScheduleId] = useState('');
   const [bulkRescheduleLeg, setBulkRescheduleLeg] = useState<'OUTBOUND' | 'RETURN'>('OUTBOUND');
   const [bulkRescheduleAllowTicketed, setBulkRescheduleAllowTicketed] = useState(false);
+  // 显示已起飞班次（补录）：勾上才列出过去的班次；选中已起飞班次提交时带 allowDepartedTarget。
+  const [bulkShowDepartedSchedules, setBulkShowDepartedSchedules] = useState(false);
+  // 该段客人未乘坐（录错日期）：源段已起飞也放行（allowFlownSource，纠错语义专用）。
+  const [bulkFlownSourceConfirmed, setBulkFlownSourceConfirmed] = useState(false);
   const [bulkRescheduleNote, setBulkRescheduleNote] = useState('');
   const [bulkRescheduleSubmitting, setBulkRescheduleSubmitting] = useState(false);
   const [bulkRescheduleResult, setBulkRescheduleResult] = useState<{
@@ -1894,7 +1898,20 @@ export function OrdersPage() {
     schedules: bulkFlightSchedules,
     loadingSchedules: bulkFlightSchedulesLoading,
     error: bulkFlightOptionsError,
-  } = useFlightScheduleOptions(tokens?.accessToken ?? '', bulkFlightId, selectedIds.size > 0);
+    departedHiddenCount: bulkDepartedHiddenCount,
+  } = useFlightScheduleOptions(
+    tokens?.accessToken ?? '',
+    bulkFlightId,
+    selectedIds.size > 0,
+    isOps && bulkShowDepartedSchedules,
+  );
+  // 选中的目标班次已起飞（只有勾了「显示已起飞班次」才可能选到）→ 提交带 allowDepartedTarget。
+  const bulkTargetDeparted = useMemo(() => {
+    const target = bulkFlightSchedules.find((s) => s.id === bulkFlightScheduleId);
+    return target ? isScheduleDeparted(target) : false;
+  }, [bulkFlightScheduleId, bulkFlightSchedules]);
+  const bulkAllowDepartedTarget = isOps && bulkShowDepartedSchedules && bulkTargetDeparted;
+  const bulkAllowFlownSource = isOps && bulkFlownSourceConfirmed;
   const bulkAgentOptions: SearchSelectOption[] = useMemo(
     () => bulkAgents.map((agent) => ({
       id: agent.id,
@@ -2316,6 +2333,12 @@ export function OrdersPage() {
       `新班次余位不足的订单会失败并回滚，其余订单不受影响。本操作不收改期费。` +
       (bulkRescheduleAllowTicketed
         ? '\n\n已勾选同时修改已出票/已完成订单：系统里的座位会搬到新班次，但真实机票仍需人工去航司改签。'
+        : '') +
+      (bulkAllowFlownSource
+        ? '\n\n【录错】已勾选「该段客人未乘坐（录错日期）」：原班次已起飞的订单也会按录错放行改航班。'
+        : '') +
+      (bulkAllowDepartedTarget
+        ? '\n\n【补录】所选目标班次已经起飞：只有客人当天确实乘坐了该班次、事后补录才这么做。确认目标日期没有点错？'
         : ''),
     )) return;
     setBulkRescheduleSubmitting(true);
@@ -2326,6 +2349,8 @@ export function OrdersPage() {
         leg: bulkRescheduleLeg,
         newScheduleId: bulkFlightScheduleId,
         allowTicketed: bulkRescheduleAllowTicketed,
+        ...(bulkAllowDepartedTarget ? { allowDepartedTarget: true } : {}),
+        ...(bulkAllowFlownSource ? { allowFlownSource: true } : {}),
         note: bulkRescheduleNote.trim() || undefined,
       });
       setBulkRescheduleResult({
@@ -3768,7 +3793,9 @@ export function OrdersPage() {
               >
                 <option value="">{bulkFlightSchedulesLoading ? '班次加载中…' : '选择新班次…'}</option>
                 {bulkFlightSchedules.map((schedule) => (
-                  <option key={schedule.id} value={schedule.id}>{scheduleLabel(schedule)}</option>
+                  <option key={schedule.id} value={schedule.id}>
+                    {scheduleLabel(schedule)}{isScheduleDeparted(schedule) ? '（已起飞）' : ''}
+                  </option>
                 ))}
               </select>
               <label className="flex items-center gap-1.5 text-sm text-ink-soft">
@@ -3825,9 +3852,49 @@ export function OrdersPage() {
                 <span className="ml-1 text-amber-700">（系统里座位会搬到新班次，但真实机票需要人工去航司改签）</span>
               </span>
             </label>
+            {isOps && (
+              <label className="flex items-start gap-2 text-xs text-ink-soft">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 accent-brand"
+                  checked={bulkShowDepartedSchedules}
+                  onChange={(e) => {
+                    setBulkShowDepartedSchedules(e.target.checked);
+                    // 取消勾选时若选中的是已起飞班次，它会从下拉里消失，选择随之清空。
+                    if (!e.target.checked && bulkTargetDeparted) setBulkFlightScheduleId('');
+                  }}
+                  disabled={bulkRescheduleSubmitting}
+                />
+                <span>
+                  显示已起飞班次（补录）
+                  <span className="ml-1 text-amber-700">（仅客人当天确实乘坐了该班次、事后补录时使用；改到已起飞班次会二次确认）</span>
+                </span>
+              </label>
+            )}
+            {isOps && (
+              <label className="flex items-start gap-2 text-xs text-ink-soft">
+                <input
+                  type="checkbox"
+                  className="mt-0.5 accent-brand"
+                  checked={bulkFlownSourceConfirmed}
+                  onChange={(e) => setBulkFlownSourceConfirmed(e.target.checked)}
+                  disabled={bulkRescheduleSubmitting}
+                />
+                <span>
+                  该段客人未乘坐（录错日期）
+                  <span className="ml-1 text-amber-700">（原班次已起飞但属录错的订单也放行改航班；原班次早于建单时间的录错不用勾，系统自动放行）</span>
+                </span>
+              </label>
+            )}
             <div className="text-xs text-ink-soft">
               已选 {selectedIds.size} 单 · 含回程航段 {selectedReturnLegOrderCount} 单 · 已出票/已完成 {selectedTicketedOrderCount} 单
+              {bulkFlightId && !bulkFlightSchedulesLoading && bulkDepartedHiddenCount > 0 && (
+                <> · 已隐藏 {bulkDepartedHiddenCount} 个已起飞班次</>
+              )}
             </div>
+            {bulkAllowDepartedTarget && (
+              <div className="text-xs text-amber-800">所选目标班次已起飞，将按「事后补录」提交，请再核对一遍日期是否点错。</div>
+            )}
             {bulkRescheduleLeg === 'RETURN' && selectedReturnLegOrderCount === 0 && (
               <div className="text-xs text-rose-700">所选订单没有回程航段，不能批量改回程。</div>
             )}
@@ -7024,10 +7091,27 @@ function scheduleLabel(s: AdminSchedule): string {
   return `${dep} → ${arr}`;
 }
 
-/** 改期表单与批量改航班共用的航班/班次加载逻辑。 */
-function useFlightScheduleOptions(token: string, flightId: string, enabled = true) {
+/** 班次已起飞（departureTime 是 UTC 瞬间，直接比 now；与后端 isScheduleDeparted 同口径）。 */
+function isScheduleDeparted(s: Pick<AdminSchedule, 'departureTime'>): boolean {
+  return new Date(s.departureTime).getTime() <= Date.now();
+}
+
+/**
+ * 改期表单与批量改航班共用的航班/班次加载逻辑。
+ *
+ * 班次下拉**默认只列还没起飞的班次**（0906 实测事故：想点 09-08 点成了一个月前的 08-08，
+ * 下拉把过去的班次也列了出来）。运营勾「显示已起飞班次（补录）」才把过去的班次列出来
+ *（includeDeparted），提交时要带 allowDepartedTarget 让后端放行；代理永远看不到已起飞班次。
+ * departedHiddenCount = 本次被隐藏的已起飞班次数，供表单提示「已隐藏 N 个已起飞班次」。
+ */
+function useFlightScheduleOptions(
+  token: string,
+  flightId: string,
+  enabled = true,
+  includeDeparted = false,
+) {
   const [flights, setFlights] = useState<AdminFlight[]>([]);
-  const [schedules, setSchedules] = useState<AdminSchedule[]>([]);
+  const [allSchedules, setAllSchedules] = useState<AdminSchedule[]>([]);
   const [loadingSchedules, setLoadingSchedules] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -7043,7 +7127,7 @@ function useFlightScheduleOptions(token: string, flightId: string, enabled = tru
 
   useEffect(() => {
     if (!enabled || !token || !flightId) {
-      setSchedules([]);
+      setAllSchedules([]);
       setLoadingSchedules(false);
       return;
     }
@@ -7051,13 +7135,19 @@ function useFlightScheduleOptions(token: string, flightId: string, enabled = tru
     setError(null);
     setLoadingSchedules(true);
     api.listSchedules(token, flightId)
-      .then((r) => { if (!cancelled) setSchedules(r.schedules.filter((s) => s.isActive)); })
+      .then((r) => { if (!cancelled) setAllSchedules(r.schedules.filter((s) => s.isActive)); })
       .catch(() => { if (!cancelled) setError('班次加载失败'); })
       .finally(() => { if (!cancelled) setLoadingSchedules(false); });
     return () => { cancelled = true; };
   }, [enabled, flightId, token]);
 
-  return { flights, schedules, loadingSchedules, error };
+  const schedules = useMemo(
+    () => (includeDeparted ? allSchedules : allSchedules.filter((s) => !isScheduleDeparted(s))),
+    [allSchedules, includeDeparted],
+  );
+  const departedHiddenCount = includeDeparted ? 0 : allSchedules.length - schedules.length;
+
+  return { flights, schedules, loadingSchedules, error, departedHiddenCount };
 }
 
 // ── 套餐行程单卡片（订单详情「产品内容」板块，套餐订单专属，展示在原始金额行上方）────
@@ -8677,6 +8767,9 @@ function RescheduleForm({
 }) {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
+  const role = useAuth((s) => s.user?.role);
+  // 两个「已起飞」放行开关只给运营岗；代理（自助纠错）看不到，后端也不认。
+  const isOps = role === 'ADMIN' || role === 'STAFF';
   const [flightId, setFlightId] = useState('');
   const [newScheduleId, setNewScheduleId] = useState('');
   const [newCabin, setNewCabin] = useState<CabinClass | ''>(item.flightCabin ?? '');
@@ -8684,13 +8777,23 @@ function RescheduleForm({
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // 显示已起飞班次（补录）：勾上才列出过去的班次，选中已起飞班次提交时带 allowDepartedTarget。
+  const [showDepartedSchedules, setShowDepartedSchedules] = useState(false);
+  // 纠错专用：该段客人未乘坐（录错日期）→ allowFlownSource，让后端放行已起飞的源段。
+  const [sourceNotBoarded, setSourceNotBoarded] = useState(false);
   // 默认全选＝整单改期；取消勾选部分人＝拆成新单单独改期。
   const [selectedIds, setSelectedIds] = useState<Set<string>>(() => new Set(passengers.map((p) => p.id)));
   // 已拆单但改期失败：留在表单上的红字提示，不随下一次操作自动消失（除非取消关闭）。
   const [splitFailure, setSplitFailure] = useState<{ newOrderNumber: string; message: string } | null>(null);
   // 幂等键：本表单打开期间只生成一次，提交失败重试复用同一个 token，避免网络抖动二次拆单。
   const requestTokenRef = useRef<string>(crypto.randomUUID());
-  const { flights, schedules, loadingSchedules, error: optionsError } = useFlightScheduleOptions(token, flightId);
+  const {
+    flights,
+    schedules,
+    loadingSchedules,
+    error: optionsError,
+    departedHiddenCount,
+  } = useFlightScheduleOptions(token, flightId, true, isOps && showDepartedSchedules);
 
   useEffect(() => {
     if (optionsError) setErr(optionsError);
@@ -8698,6 +8801,12 @@ function RescheduleForm({
 
   const selectedSchedule = schedules.find((s) => s.id === newScheduleId);
   const cabinOptions = selectedSchedule?.seatClasses ?? [];
+  // 选中的目标班次已起飞：只有运营勾了「显示已起飞班次（补录）」才可能选到，提交要带放行开关。
+  const selectedIsDeparted = selectedSchedule ? isScheduleDeparted(selectedSchedule) : false;
+  const allowDepartedTarget = isOps && showDepartedSchedules && selectedIsDeparted;
+  const allowFlownSource = isOps && Boolean(isCorrection) && sourceNotBoarded;
+  const DEPARTED_TARGET_CONFIRM =
+    '\n\n【补录】所选目标班次已经起飞：只有客人当天确实乘坐了该班次、事后补录才这么做。确认目标日期没有点错？';
   // 纠错口径不支持按人拆单（POST /orders/:id/correct-flight 只收 itemId + newScheduleId）：
   // 不展示乘客勾选，整单一起纠错。
   const showPassengerPicker = passengers.length >= 2 && !isCorrection;
@@ -8723,14 +8832,21 @@ function RescheduleForm({
     if (isCorrection) {
       if (
         !confirm(
-          '按纠错口径改航班：不收改期费、价格不变，座位按新班次余座检查；套餐单酒店日期随之平移。确定？',
+          '按纠错口径改航班：不收改期费、价格不变，座位按新班次余座检查；套餐单酒店日期随之平移。确定？' +
+            (allowFlownSource
+              ? '\n\n【录错】已勾选「该段客人未乘坐（录错日期）」：原班次已起飞，系统会按录错处理直接放行改航班。'
+              : '') +
+            (allowDepartedTarget ? DEPARTED_TARGET_CONFIRM : ''),
         )
       ) {
         return;
       }
       setSubmitting(true);
       try {
-        const res = await api.correctFlightSchedule(token, orderId, item.id, newScheduleId);
+        const res = await api.correctFlightSchedule(token, orderId, item.id, newScheduleId, {
+          allowDepartedTarget,
+          allowFlownSource,
+        });
         onSaved(res.order);
       } catch (e) {
         // 后端 400（如「本单含套餐立减…」）原样展示。
@@ -8746,7 +8862,7 @@ function RescheduleForm({
         '\n套餐单也能这么拆：金额按占座比例劈，住宿按人头搬，同房组会自动劈成两个半组（房控后续配回一间）。' +
         (hasTicketedPassenger ? `\n${TICKETED_RESCHEDULE_HINT}` : '')
       : '确认改期？座位会移动到新班次（新班次售罄会被拒绝）；出发日期变动时本单酒店入住/离店日期会同步平移（新日期房量不足会整体拒绝），如填了改期差价将计入订单应收（可正可负）。';
-    if (!confirm(confirmMsg)) return;
+    if (!confirm(confirmMsg + (allowDepartedTarget ? DEPARTED_TARGET_CONFIRM : ''))) return;
     setSubmitting(true);
     try {
       const res = await api.reschedulePassengers(token, orderId, {
@@ -8759,6 +8875,8 @@ function RescheduleForm({
         feeLabel: feeCny != null && feeCny !== 0 ? '改期差价' : undefined,
         note: note.trim() || undefined,
         requestToken: requestTokenRef.current,
+        // 目标班次已起飞的补录放行（只有勾了「显示已起飞班次」且选中的是已起飞班次才带）。
+        ...(allowDepartedTarget ? { allowDepartedTarget: true } : {}),
       });
       if (res.splitPerformed && res.newOrder) {
         alert(`已拆出新单 ${res.newOrder.orderNumber} 并改期`);
@@ -8804,6 +8922,23 @@ function RescheduleForm({
         <p className="rounded bg-slate-50 px-2 py-1 leading-snug text-slate-500">
           纠错口径：不收改期费、价格不变，只搬座位；套餐单酒店日期会随之平移。
         </p>
+      )}
+      {isCorrection && isOps && (
+        <label className="flex items-start gap-2 rounded border border-amber-200 bg-amber-50/60 px-2 py-1 text-[11px] leading-snug text-amber-800">
+          <input
+            type="checkbox"
+            className="mt-0.5 accent-amber-600"
+            checked={sourceNotBoarded}
+            onChange={(e) => setSourceNotBoarded(e.target.checked)}
+            disabled={submitting}
+          />
+          <span>
+            该段客人未乘坐（录错日期）
+            <span className="ml-1 text-amber-700">
+              —— 原班次已起飞但属录错，勾上后放行改航班；原班次早于建单时间的录错不用勾，系统自动放行。
+            </span>
+          </span>
+        </label>
       )}
 
       {showPassengerPicker && (
@@ -8881,10 +9016,43 @@ function RescheduleForm({
         >
           <option value="">选择班次…</option>
           {schedules.map((s) => (
-            <option key={s.id} value={s.id}>{scheduleLabel(s)}</option>
+            <option key={s.id} value={s.id}>
+              {scheduleLabel(s)}{isScheduleDeparted(s) ? '（已起飞）' : ''}
+            </option>
           ))}
         </select>
+        {flightId && !loadingSchedules && departedHiddenCount > 0 && (
+          <span className="mt-0.5 block text-[11px] leading-snug text-slate-500">
+            已隐藏 {departedHiddenCount} 个已起飞班次，请核对目标日期。
+          </span>
+        )}
       </label>
+      {isOps && (
+        <label className="flex items-start gap-2 text-[11px] leading-snug text-slate-600">
+          <input
+            type="checkbox"
+            className="mt-0.5 accent-brand"
+            checked={showDepartedSchedules}
+            onChange={(e) => {
+              setShowDepartedSchedules(e.target.checked);
+              // 取消勾选时若选中的是已起飞班次，它会从下拉里消失，选择随之清空。
+              if (!e.target.checked && selectedIsDeparted) setNewScheduleId('');
+            }}
+            disabled={submitting}
+          />
+          <span>
+            显示已起飞班次（补录）
+            <span className="ml-1 text-amber-700">
+              —— 仅客人当天确实乘坐了该班次、事后补录时使用；改到已起飞班次会二次确认。
+            </span>
+          </span>
+        </label>
+      )}
+      {allowDepartedTarget && (
+        <p className="rounded bg-amber-50 px-2 py-1 text-[11px] leading-snug text-amber-800">
+          所选目标班次已起飞，将按「事后补录」提交。请再核对一遍日期是否点错。
+        </p>
+      )}
 
       {!isCorrection && (
         <label className="block">

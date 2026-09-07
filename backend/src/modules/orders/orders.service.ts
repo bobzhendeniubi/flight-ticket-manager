@@ -6637,6 +6637,10 @@ export class OrderService {
         toDeparture: Date | null;
         feeCny: number;
         statusChanged: boolean;
+        /** 目标已起飞靠放行开关过闸（回包异常回读分支无从判定 → 缺省）。 */
+        departedTargetAllowed?: boolean;
+        /** 源段已起飞靠纠错出口过闸的口径（同上，回读分支缺省）。 */
+        flownSourceAllowed?: FlownSourceAllowance | null;
       };
     }>;
   }> {
@@ -6657,6 +6661,10 @@ export class OrderService {
         toDeparture: Date | null;
         feeCny: number;
         statusChanged: boolean;
+        /** 目标已起飞靠放行开关过闸（回包异常回读分支无从判定 → 缺省）。 */
+        departedTargetAllowed?: boolean;
+        /** 源段已起飞靠纠错出口过闸的口径（同上，回读分支缺省）。 */
+        flownSourceAllowed?: FlownSourceAllowance | null;
       };
     }> = [];
     let succeeded = 0;
@@ -6671,6 +6679,9 @@ export class OrderService {
             newScheduleId: input.newScheduleId,
             note: input.note,
             guard: { forbidTicketed: !input.allowTicketed, correction: true },
+            // 两个「已起飞」放行开关：路由已限 ADMIN/STAFF，service 内仍按角色再判。
+            ...(input.allowDepartedTarget ? { allowDepartedTarget: true } : {}),
+            ...(input.allowFlownSource ? { allowFlownSource: true } : {}),
           },
           actor,
         );
@@ -8852,6 +8863,17 @@ export class OrderService {
        * 而且这一行的 metadata 正是本方法在改（flightChanged 标记），两处分开写必然互相覆盖。
        */
       requestToken?: string;
+      /**
+       * 目标班次已起飞也放行（客人今天实际飞了那班，事后补录）。只认 ADMIN/STAFF
+       *（assertTargetScheduleNotDeparted 内按角色判，代理自助传了也不认）；缺省/false 一律拒。
+       */
+      allowDepartedTarget?: boolean;
+      /**
+       * 源段已起飞也放行（运营确认「该段客人未乘坐（录错）」）。只在 guard.correction=true 且
+       * ADMIN/STAFF 下生效（assertLegNotFlownForReschedule 内判）；售后改期传了也不认。
+       * 源段起飞早于建单时间的纠错不需要这个旗子，自动放行。
+       */
+      allowFlownSource?: boolean;
     },
     actor: { userId: string; role: UserRole },
   ): Promise<{
@@ -8873,6 +8895,10 @@ export class OrderService {
       toDepartureLocal: string | null;
       feeCny: number;
       statusChanged: boolean;
+      /** 目标班次已起飞、靠运营的 allowDepartedTarget 放行（false = 目标未起飞，正常路径）。 */
+      departedTargetAllowed: boolean;
+      /** 源段已起飞、靠纠错出口放行的口径（null = 源段未起飞，正常路径）。 */
+      flownSourceAllowed: FlownSourceAllowance | null;
       /** 随出发日平移自动同步的酒店行（未平移/无酒店行 = 空数组），日期为 YYYY-MM-DD。 */
       hotelDateSync: Array<{
         orderItemId: string;
@@ -9074,7 +9100,23 @@ export class OrderService {
       // 放回去等于让一个过去的班次凭空多出可卖余位，同时又在新班次占一份，两头都是错账。
       // 判定与文案抽到 assertLegNotFlownForReschedule：按人改期在拆单**之前**要跑同一份闸
       //（见 reschedulePassengers 步骤 3b），两处必须是同一份时刻口径、同一句人话。
-      assertLegNotFlownForReschedule(item);
+      // 纠错语义（correction）有出口：源段早于建单自动放行 / 运营显式 allowFlownSource 放行，
+      // 放行口径随 scratch 带出去进审计。本单其余航段只在要拒的时候才查（提示去/回程可能互换）。
+      const flownSourceAllowed: FlownSourceAllowance | null = isLegAlreadyFlown(item, Date.now())
+        ? assertLegNotFlownForReschedule(item, {
+            order,
+            correction: input.guard?.correction === true,
+            allowFlownSource: input.allowFlownSource,
+            actorRole: actor.role,
+            legs: await (async () => {
+              const rows = await tx.orderItem.findMany({
+                where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+                select: { flightSchedule: { select: { departureTime: true } } },
+              });
+              return Array.isArray(rows) ? rows : [];
+            })(),
+          })
+        : null;
 
       const oldScheduleId = item.flightScheduleId;
       const oldCabin = item.flightCabin;
@@ -9130,11 +9172,22 @@ export class OrderService {
       // 新班次必须存在且有该舱位（友好报错；最终防超售仍靠下面的原子 CAS）
       const newSeatClass = await tx.flightSeatClass.findFirst({
         where: { scheduleId: newScheduleId, cabin: newCabin },
-        select: { id: true },
+        // 顺带取目标班次的出发时刻：下面「目标已起飞」闸用，不另起一次查询。
+        select: { id: true, schedule: { select: { departureTime: true, departureTz: true } } },
       });
       if (!newSeatClass) {
         throw new BadRequestError('目标班次不存在该舱位，无法改期');
       }
+      // ── 目标班次已起飞 → 一律拒（四条改期入口 + 改单申请执行同一份判定）────────────
+      // 放在任何座位搬移之前：拒了就一个座都没动。同班次同舱（sameSeat）不搬座、目标即源段，
+      // 源段那道闸已经判过，这里不重复拦。仅 ADMIN/STAFF 显式传 allowDepartedTarget 放行
+      //（客人今天实际飞了那班、事后补录），放行口径进审计。
+      const departedTargetAllowed = sameSeat
+        ? false
+        : assertTargetScheduleNotDeparted(newSeatClass.schedule ?? null, {
+            actorRole: actor.role,
+            allowDepartedTarget: input.allowDepartedTarget,
+          });
 
       // 套餐升舱拆座：该行下单时可能把 businessUpgradeCount 个座拆到了商务舱。
       // 改期同样按原拆分「先放旧、再拿新」，否则商务/经济会错位泄漏。
@@ -9498,6 +9551,8 @@ export class OrderService {
         newCabin,
         statusChanged,
         hotelDateSync,
+        departedTargetAllowed,
+        flownSourceAllowed,
       };
     });
 
@@ -9536,6 +9591,8 @@ export class OrderService {
             : null,
           feeCny,
           statusChanged: scratch.statusChanged,
+          departedTargetAllowed: scratch.departedTargetAllowed,
+          flownSourceAllowed: scratch.flownSourceAllowed,
           hotelDateSync: scratch.hotelDateSync,
         },
       };
@@ -11379,7 +11436,13 @@ export class OrderService {
     itemId: string,
     newScheduleId: string,
     actor: { userId: string; role: UserRole; agentId?: string },
-    options: { allowTicketed?: boolean } = {},
+    options: {
+      allowTicketed?: boolean;
+      /** 目标班次已起飞也放行（事后补录）。只对 ADMIN/STAFF 生效，代理带了一律不认。 */
+      allowDepartedTarget?: boolean;
+      /** 源段已起飞也放行（运营确认「该段客人未乘坐（录错）」）。只对 ADMIN/STAFF 生效。 */
+      allowFlownSource?: boolean;
+    } = {},
   ): ReturnType<OrderService['rescheduleOrderItem']> {
     await this.assertAgentSelfEditAllowed(orderId, actor);
     const isOpsActor = actor.role === UserRole.ADMIN || actor.role === UserRole.STAFF;
@@ -11389,6 +11452,9 @@ export class OrderService {
     }
     // 已出票单放行开关只认运营（L1）：代理带 allowTicketed 一律不认，仍旧被 forbidTicketed 拦住。
     const allowTicketed = isOpsActor && options.allowTicketed === true;
+    // 两个「已起飞」放行开关同样只认运营（service 内按角色再判一次；这里不传就是双保险）。
+    const allowDepartedTarget = isOpsActor && options.allowDepartedTarget === true;
+    const allowFlownSource = isOpsActor && options.allowFlownSource === true;
     return this.rescheduleOrderItem(
       orderId,
       {
@@ -11398,6 +11464,8 @@ export class OrderService {
         feeCny: 0,
         guard: { correction: true, forbidTicketed: !allowTicketed },
         selfServiceCorrection: true,
+        ...(allowDepartedTarget ? { allowDepartedTarget: true } : {}),
+        ...(allowFlownSource ? { allowFlownSource: true } : {}),
       },
       actor,
     );
@@ -16796,6 +16864,8 @@ export class OrderService {
       note?: string;
       roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
       requestToken: string;
+      /** 目标班次已起飞也放行（事后补录）。本入口只有 ADMIN/STAFF 进得来，直接透传。 */
+      allowDepartedTarget?: boolean;
     },
     actor: { userId: string; role: UserRole },
   ): Promise<ReschedulePassengersResult> {
@@ -16809,6 +16879,8 @@ export class OrderService {
       select: {
         id: true,
         orderNumber: true,
+        // 「已起飞」闸的提示文案要判「航段是否早于建单」（错误日期让去/回程互换的信号）。
+        createdAt: true,
         passengers: { select: { id: true } },
         items: {
           // 不夹 flightScheduleId：全员分支要按 legActionLog 查这个 token 见过没有，
@@ -16995,6 +17067,7 @@ export class OrderService {
           note: input.note,
           // 幂等键：改期与流水同一事务提交，下次同 token 重试据此回放（上面 3a）。
           requestToken: input.requestToken,
+          ...(input.allowDepartedTarget ? { allowDepartedTarget: true } : {}),
         },
         actor,
       );
@@ -17026,8 +17099,31 @@ export class OrderService {
     // 与勾了谁无关，晚到 rescheduleOrderItem 里才判就会留下一张多余的新单，
     // 而且新单同一航段照样已起飞，前端提示的「到新单上重试改期」永远走不通。
     // 判定与文案跟改期端点共用 assertLegNotFlownForReschedule（同一份时区折算）。
+    // 按人改期是售后语义（correction=false）：源段已起飞没有出口，纠错请走纠错改航班。
     const selectedLeg = leg === 'OUTBOUND' ? sourceLegs.outbound : sourceLegs.return;
-    if (!replaySplit && selectedLeg) assertLegNotFlownForReschedule(selectedLeg);
+    if (!replaySplit && selectedLeg) {
+      assertLegNotFlownForReschedule(selectedLeg, {
+        order,
+        correction: false,
+        actorRole: actor.role,
+        legs: order.items,
+      });
+    }
+
+    // ── 3c. 目标班次已起飞：同样在拆单**之前**拦（fail-closed）──────────────────
+    // 与 3b 同理：闸若只留在 rescheduleOrderItem 里，会先拆出一张不可回滚的新单再报错。
+    // 判定与单条改期同一份（assertTargetScheduleNotDeparted）；ADMIN/STAFF 显式补录才放行。
+    if (!replaySplit) {
+      const targetSchedule = await prisma.flightSchedule.findUnique({
+        where: { id: input.newScheduleId },
+        select: { departureTime: true, departureTz: true },
+      });
+      if (!targetSchedule) throw new NotFoundError('目标班次不存在');
+      assertTargetScheduleNotDeparted(targetSchedule, {
+        actorRole: actor.role,
+        allowDepartedTarget: input.allowDepartedTarget,
+      });
+    }
 
     // ── 4. 部分乘客：先拆单（幂等，服务端权威算钱），失败则整体失败、什么都没发生 ──
     // 1b 已经命中并比对过入参时直接用那份回放结果，不必再进 splitOrder 兜一圈。
@@ -17079,6 +17175,7 @@ export class OrderService {
             feeCny: input.feeCny,
             feeLabel: input.feeLabel,
             note: input.note,
+            ...(input.allowDepartedTarget ? { allowDepartedTarget: true } : {}),
           },
           actor,
         );
@@ -23209,20 +23306,120 @@ function isLegAlreadyFlown(
  *   · rescheduleOrderItem（PATCH /orders/:id/reschedule 与航段入口的执行段）；
  *   · reschedulePassengers 拆单前的前置闸 —— 拆单不可回滚，晚一步就会留下一张多余新单，
  *     而且新单同一航段照样已起飞，「到新单重试」永远走不通。
+ *
+ * 纠错出口（0906 实测事故的第二半：错改到 08-08 之后 7 次想改回全被本闸拦死，没有出口）：
+ *   · 只在 correction 语义（correct-flight / 批量改航班）且操作人是 ADMIN/STAFF 时开；
+ *   · 源段起飞早于本单建单时间 → 自动放行（返回 'BEFORE_ORDER_CREATED'：这段不可能真飞过）；
+ *   · 否则要运营显式传 allowFlownSource=true（返回 'OPERATOR_CONFIRMED'，审计 WARNING 留痕）；
+ *   · 售后改期 / 代理自助 / 按人改期一律照旧拒。
+ * 放行后的放座照走 releaseSeatFloored：过去班次多出的余位不可卖，无害；新班次照常原子 takeSeat。
  */
-function assertLegNotFlownForReschedule(item: {
-  flightSchedule?: { departureTime: Date | null; departureTz?: string | null } | null;
-}): void {
-  if (!isLegAlreadyFlown(item, Date.now())) return;
+export function assertLegNotFlownForReschedule(
+  item: {
+    flightSchedule?: { departureTime: Date | null; departureTz?: string | null } | null;
+  },
+  ctx: {
+    /** 建单时间：源段起飞早于建单 = 这段客人不可能真飞过（录错日期的铁证）。 */
+    order: { createdAt?: Date | null };
+    /** 纠错语义（correct-flight / 批量改航班的 guard.correction）才开「已起飞源段」的出口。 */
+    correction: boolean;
+    /** 运营显式确认「该段客人未乘坐（录错）」；只在纠错语义 + ADMIN/STAFF 下生效。 */
+    allowFlownSource?: boolean;
+    actorRole: UserRole;
+    /** 本单全部有效航段：只用来判「去/回程标签是否可能因错误日期互换」的提示文案。 */
+    legs?: ReadonlyArray<{ flightSchedule?: { departureTime: Date | null } | null }>;
+  },
+): FlownSourceAllowance | null {
+  if (!isLegAlreadyFlown(item, Date.now())) return null;
   const sched = item.flightSchedule;
   const departAt = sched?.departureTime ?? null;
+  const createdAtMs = ctx.order.createdAt?.getTime() ?? null;
+  const isBeforeOrderCreated = (leg: { flightSchedule?: { departureTime: Date | null } | null }) => {
+    const at = leg.flightSchedule?.departureTime ?? null;
+    return at != null && createdAtMs != null && at.getTime() < createdAtMs;
+  };
+  const sourceBeforeOrderCreated = isBeforeOrderCreated(item);
+  const ops = isOpsRole(ctx.actorRole);
+
+  // 纠错出口只对运营开：售后改期、代理自助纠错、按人改期一律不放（代理不能自证「没飞」）。
+  if (ctx.correction && ops) {
+    if (sourceBeforeOrderCreated) return 'BEFORE_ORDER_CREATED';
+    if (ctx.allowFlownSource === true) return 'OPERATOR_CONFIRMED';
+  }
+
   const localWhen =
     departAt != null
       ? `${localDateISO(departAt, sched?.departureTz)} ${localHHMM(departAt, sched?.departureTz)}`
       : '时间未知';
-  throw new BadRequestError(
+  let message =
     `该段已起飞（当地时间 ${localWhen} 出发），不能改期；` +
-      '客人没登机请走「标记 no-show」处理。',
+    '客人没登机请走「标记 no-show」处理。';
+  if (ops) {
+    message += sourceBeforeOrderCreated
+      ? '该段起飞时间早于本单建单时间，客人不可能真的乘坐——如属录错日期，请改走「纠错改航班」，系统会自动放行。'
+      : '如属录错日期，请在纠错改航班里勾选「该段客人未乘坐（录错）」。';
+  }
+  // 错误日期会让 determineFlightLegItems（按起飞时刻排）把去/回程标签互换：运营点「改回程」
+  // 拦下的其实是原来的去程。凡本单有任一航段早于建单时间，就把这层点明。
+  const legsMaySwap =
+    sourceBeforeOrderCreated || (ctx.legs ?? []).some((leg) => isBeforeOrderCreated(leg));
+  if (legsMaySwap) {
+    message += '本单航段去/回程顺序可能已因错误日期互换，请先核对再选目标班次。';
+  }
+  throw new BadRequestError(message);
+}
+
+/** 运营岗（ADMIN/STAFF）—— 改期两道「已起飞」闸的放行开关只认这两个角色。 */
+function isOpsRole(role: UserRole): boolean {
+  return role === UserRole.ADMIN || role === UserRole.STAFF;
+}
+
+/**
+ * 「改期放行了已起飞的源段」的口径留痕（审计 after.flownSourceAllowed）：
+ *   · BEFORE_ORDER_CREATED —— 源段起飞早于建单时间，自动放行（这段不可能真飞过）；
+ *   · OPERATOR_CONFIRMED —— 运营勾选「该段客人未乘坐（录错）」显式放行（审计 WARNING）。
+ */
+export type FlownSourceAllowance = 'BEFORE_ORDER_CREATED' | 'OPERATOR_CONFIRMED';
+
+/**
+ * 班次已起飞吗（目标班次侧的唯一判定，与 isLegAlreadyFlown 同一口径：departureTime 存 UTC 瞬间）。
+ * 没有出发时刻一律按「未起飞」处理 —— 与 isLegAlreadyFlown 的 null 语义对称，交给其它闸判断。
+ * 改单申请执行前的复检（assertTargetScheduleStillUsable）也复用本函数，四条改期入口 + 申请执行
+ * 判「目标已起飞」的是同一份代码。
+ */
+export function isScheduleDeparted(
+  schedule: { departureTime: Date | null } | null | undefined,
+  atMs: number = Date.now(),
+): boolean {
+  const departAt = schedule?.departureTime ?? null;
+  return departAt != null && departAt.getTime() <= atMs;
+}
+
+/**
+ * 「目标班次已起飞 → 一律拒」的统一闸（0906 实测事故：想点 09-08 点成 08-08，
+ * 前端班次下拉把过去的班次也列了出来，后端只校验目标舱位存在，座位就这么搬进了一个月前的班次）。
+ *
+ * 仅 ADMIN/STAFF 显式传 allowDepartedTarget=true 放行（场景：客人今天实际飞了那班，事后补录）；
+ * 代理自助纠错与改单申请执行永不放行（前者角色不对，后者根本不传这个旗子）。
+ * 返回 true = 这次是靠放行开关过的闸（审计 after.allowDepartedTarget 记这个值）。
+ */
+export function assertTargetScheduleNotDeparted(
+  schedule: { departureTime: Date | null; departureTz?: string | null } | null | undefined,
+  opts: { actorRole: UserRole; allowDepartedTarget?: boolean },
+): boolean {
+  if (!isScheduleDeparted(schedule)) return false;
+  const ops = isOpsRole(opts.actorRole);
+  if (ops && opts.allowDepartedTarget === true) return true;
+  const departAt = schedule?.departureTime ?? null;
+  const localWhen =
+    departAt != null
+      ? `${localDateISO(departAt, schedule?.departureTz)} ${localHHMM(departAt, schedule?.departureTz)}`
+      : '时间未知';
+  throw new BadRequestError(
+    `目标班次已起飞（当地时间 ${localWhen} 出发），不能改到已起飞的班次，请核对目标日期是否点错；` +
+      (ops
+        ? '如客人当天确实乘坐了该班次、需要事后补录，请勾选「显示已起飞班次（补录）」后再提交。'
+        : '如需事后补录请联系运营处理。'),
   );
 }
 

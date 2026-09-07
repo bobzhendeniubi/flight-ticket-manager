@@ -1700,6 +1700,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
             departure: fmt(r.audit.toDeparture),
             feeCny: r.audit.feeCny,
             statusChanged: r.audit.statusChanged,
+            // 「已起飞」两道闸的放行留痕：目标已起飞靠开关过 / 源段已起飞靠哪种口径过。
+            allowDepartedTarget: r.audit.departedTargetAllowed ?? false,
+            flownSourceAllowed: r.audit.flownSourceAllowed ?? null,
             note: body.note,
             ...(r.notice ? { notice: r.notice } : {}),
           },
@@ -1743,6 +1746,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         failureDetailsTotal: failureDetails.length,
         failureDetailsTruncated: failureDetails.length > failureAuditLimit,
         allowTicketed: body.allowTicketed,
+        allowDepartedTarget: body.allowDepartedTarget ?? false,
+        allowFlownSource: body.allowFlownSource ?? false,
         note: body.note,
       },
       severity: result.failed > 0 ? 'WARNING' : 'INFO',
@@ -2142,6 +2147,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         feeCny: audit.feeCny,
         statusChanged: audit.statusChanged,
         note: body.note,
+        // 「已起飞」两道闸的放行留痕（售后改期只可能是 allowDepartedTarget；源段出口不对售后开）。
+        allowDepartedTarget: audit.departedTargetAllowed,
+        flownSourceAllowed: audit.flownSourceAllowed,
         // 酒店入住随出发日平移的同步明细（空数组 = 本次未平移/无酒店行）
         hotelDateSync: audit.hotelDateSync,
       },
@@ -2169,8 +2177,12 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       body.itemId,
       body.newScheduleId,
       { userId: req.user.sub, role, agentId: requester.agentId },
-      // 已出票单放行只对运营生效（service 内按角色再判一次，代理传了也不认）。
-      { allowTicketed: body.allowTicketed },
+      // 三个放行开关都只对运营生效（service 内按角色再判一次，代理传了也不认）。
+      {
+        allowTicketed: body.allowTicketed,
+        allowDepartedTarget: body.allowDepartedTarget,
+        allowFlownSource: body.allowFlownSource,
+      },
     );
     void writeAudit({
       actor: actorFromRequest(req),
@@ -2190,6 +2202,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         correction: true,
         feeCny: 0,
         selfService: role === UserRole.AGENT,
+        // 「已起飞」两道闸的放行留痕：目标已起飞靠开关过 / 源段已起飞靠哪种口径过。
+        allowDepartedTarget: audit.departedTargetAllowed,
+        flownSourceAllowed: audit.flownSourceAllowed,
         hotelDateSync: audit.hotelDateSync,
       },
       severity: 'WARNING',
@@ -3220,6 +3235,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           feeCny: detail.feeCny,
           statusChanged: detail.statusChanged,
           note: body.note,
+          allowDepartedTarget: detail.departedTargetAllowed,
+          flownSourceAllowed: detail.flownSourceAllowed,
           hotelDateSync: detail.hotelDateSync,
           // 按人改期专属：这次改的是从源单拆出来的新单
           splitFromOrderNumber: result.splitPerformed ? result.audit.orderNumber : null,

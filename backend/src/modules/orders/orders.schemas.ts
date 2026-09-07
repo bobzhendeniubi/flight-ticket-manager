@@ -907,6 +907,16 @@ export const batchSetInvoiceFlagsBodySchema = z.object({
 });
 export type BatchSetInvoiceFlagsBody = z.infer<typeof batchSetInvoiceFlagsBodySchema>;
 
+// ── 改期两道「已起飞」闸的放行开关（四条改期入口共用，服务端按角色判，代理传了不认）──
+// allowDepartedTarget：目标班次已起飞也放行（客人今天实际飞了那班，事后补录）。仅 ADMIN/STAFF。
+// allowFlownSource：源段已起飞也放行（运营确认「该段客人未乘坐（录错）」）。仅纠错语义
+//（correct-flight / 批量改航班）+ ADMIN/STAFF；售后改期 / 按人改期即便带上也照旧拒。
+// 源段起飞早于建单时间的纠错不需要开关，服务端自动放行。缺省 / false = 一律拒。
+const departedGuardFlagsSchema = {
+  allowDepartedTarget: z.boolean().optional(),
+  allowFlownSource: z.boolean().optional(),
+} as const;
+
 // ── 批量改航班（录入纠错，ADMIN/STAFF）────────────────────────────────────
 // 按订单解析去程/回程航段；不接收费用字段，纠错只搬座位、不收改期费。
 export const batchRescheduleBodySchema = z.object({
@@ -918,6 +928,7 @@ export const batchRescheduleBodySchema = z.object({
   leg: z.enum(['OUTBOUND', 'RETURN']),
   newScheduleId: z.string().min(1, 'newScheduleId 必填'),
   allowTicketed: z.boolean().optional().default(false),
+  ...departedGuardFlagsSchema,
   note: z.string().max(500).optional(),
 });
 export type BatchRescheduleBody = z.infer<typeof batchRescheduleBodySchema>;
@@ -1170,6 +1181,8 @@ export const rescheduleOrderBodySchema = z.object({
   feeCny: rescheduleFeeSchema, // 改期差价（CNY，整数，可正可负；0/缺省=不调整价格）
   feeLabel: z.string().max(120).optional(), // 自定义费用名（缺省"改期差价"）
   note: z.string().max(500).optional(),
+  // 售后改期只认 allowDepartedTarget；allowFlownSource 在售后语义下服务端不放行（见上）。
+  ...departedGuardFlagsSchema,
 });
 export type RescheduleOrderBody = z.infer<typeof rescheduleOrderBodySchema>;
 
@@ -1184,6 +1197,8 @@ export const correctFlightBodySchema = z.object({
   itemId: z.string().min(1, 'itemId 必填'),
   newScheduleId: z.string().min(1, 'newScheduleId 必填'),
   allowTicketed: z.boolean().optional().default(false),
+  // 两个「已起飞」放行开关与 allowTicketed 同款：只对 ADMIN/STAFF 生效，代理带上一律不认。
+  ...departedGuardFlagsSchema,
 });
 export type CorrectFlightBody = z.infer<typeof correctFlightBodySchema>;
 
@@ -1886,5 +1901,7 @@ export const reschedulePassengersBodySchema = z.object({
   note: z.string().max(200).optional(),
   roomSplit: splitOrderBodySchema.shape.roomSplit,
   requestToken: z.string().min(8).max(64).uuid(),
+  // 按人改期是售后语义：只认 allowDepartedTarget（拆单前就判目标已起飞）；allowFlownSource 不放行。
+  ...departedGuardFlagsSchema,
 });
 export type ReschedulePassengersBody = z.infer<typeof reschedulePassengersBodySchema>;

@@ -5109,6 +5109,8 @@ export const api = {
       feeLabel?: string;
       note?: string;
       requestToken: string;
+      /** 目标班次已起飞也放行（客人今天实际飞了那班，事后补录）。缺省 = 目标已起飞一律拒。 */
+      allowDepartedTarget?: boolean;
     },
   ) =>
     apiFetch<ReschedulePassengersResult>(`/orders/${orderId}/reschedule-passengers`, {
@@ -5119,11 +5121,26 @@ export const api = {
   // 纠错改航班（录错班次专用，单单版）：不收改期费、价格不动，座位按新班次余座检查；
   // 套餐单酒店日期随之平移。ADMIN/STAFF 任何时候可用；AGENT 仅本单 agentSelfEdit.open
   // 窗口内（下单当天）可用——窗口关闭服务端 403，message 为窗口关闭提示，原样展示。
-  correctFlightSchedule: (token: string, orderId: string, itemId: string, newScheduleId: string) =>
+  // 两个「已起飞」放行开关只对 ADMIN/STAFF 生效（服务端按角色判，代理带上一律不认）：
+  //   allowDepartedTarget = 目标班次已起飞也放行（事后补录）；
+  //   allowFlownSource   = 源段已起飞也放行（运营确认「该段客人未乘坐（录错）」）。
+  // 源段起飞早于建单时间的纠错服务端自动放行，不需要开关。
+  correctFlightSchedule: (
+    token: string,
+    orderId: string,
+    itemId: string,
+    newScheduleId: string,
+    opts: { allowDepartedTarget?: boolean; allowFlownSource?: boolean } = {},
+  ) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/correct-flight`, {
       method: 'POST',
       token,
-      body: { itemId, newScheduleId },
+      body: {
+        itemId,
+        newScheduleId,
+        ...(opts.allowDepartedTarget ? { allowDepartedTarget: true } : {}),
+        ...(opts.allowFlownSource ? { allowFlownSource: true } : {}),
+      },
     }),
   // 批量改航班（录入纠错）：服务端按订单既有航段解析并逐单搬座位，不收改期费。
   batchRescheduleOrders: (
@@ -5133,6 +5150,10 @@ export const api = {
       leg: 'OUTBOUND' | 'RETURN';
       newScheduleId: string;
       allowTicketed?: boolean;
+      /** 目标班次已起飞也放行（事后补录）；同 correctFlightSchedule 的开关语义。 */
+      allowDepartedTarget?: boolean;
+      /** 源段已起飞也放行（运营确认「该段客人未乘坐（录错）」）。 */
+      allowFlownSource?: boolean;
       note?: string;
     },
   ) =>

@@ -22,6 +22,8 @@ const { mockPrisma } = vi.hoisted(() => ({
     orderItem: { findMany: vi.fn() },
     orderSplitRecord: { findUnique: vi.fn() },
     auditLog: { create: vi.fn() },
+    // 拆单前的「目标班次已起飞」前置闸要读目标班次出发时刻（缺省给一个未来班次）。
+    flightSchedule: { findUnique: vi.fn() },
   },
 }));
 
@@ -122,6 +124,11 @@ beforeEach(() => {
   mockPrisma.auditLog.create.mockResolvedValue({});
   // 缺省：这个 requestToken 还没拆过单（未命中回放）
   mockPrisma.orderSplitRecord.findUnique.mockResolvedValue(null);
+  // 缺省：目标班次还没起飞（拆单前的目标闸放行）
+  mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+    departureTime: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+    departureTz: 'Asia/Shanghai',
+  });
   mockPrisma.order.findUniqueOrThrow.mockResolvedValue(serializableOrder());
   mockPrisma.orderItem.findMany.mockResolvedValue([
     { id: 'leg-out-moved', flightScheduleId: 'sch-out' },
@@ -969,6 +976,41 @@ describe('按人改期 · 已起飞航段的前置闸', () => {
     expect(err).toBeInstanceOf(BadRequestError);
     expect(err.message).toContain('2020-01-01 10:00');
     expect(err.message).toContain('标记 no-show');
+  });
+
+  // ── 目标班次已起飞：同样在拆单之前拦（0906 实测事故：目标点成了一个月前的班次）──
+  it('部分乘客改到已起飞的目标班次 → 拆单前就拒，拆单与改期一次都没被调用', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(sourceSnapshot());
+    mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+      departureTime: new Date(Date.now() - 60 * 60 * 1000),
+      departureTz: 'Asia/Shanghai',
+    });
+    const split = vi.spyOn(service, 'splitOrder');
+    const reschedule = vi.spyOn(service, 'rescheduleOrderItem');
+
+    await expect(service.reschedulePassengers('o1', body(), admin)).rejects.toThrow(/目标班次已起飞/u);
+    expect(split).not.toHaveBeenCalled();
+    expect(reschedule).not.toHaveBeenCalled();
+  });
+
+  it('运营带 allowDepartedTarget 改到已起飞的目标班次 → 放行，开关透传到新单改期', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(sourceSnapshot());
+    mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+      departureTime: new Date(Date.now() - 60 * 60 * 1000),
+      departureTz: 'Asia/Shanghai',
+    });
+    const split = vi.spyOn(service, 'splitOrder').mockResolvedValue(splitOutcome());
+    const reschedule = vi
+      .spyOn(service, 'rescheduleOrderItem')
+      .mockResolvedValue(rescheduleOutcome() as never);
+
+    await service.reschedulePassengers('o1', body({ allowDepartedTarget: true }), admin);
+    expect(split).toHaveBeenCalledTimes(1);
+    expect(reschedule).toHaveBeenCalledWith(
+      'o2',
+      expect.objectContaining({ leg: 'OUTBOUND', allowDepartedTarget: true }),
+      admin,
+    );
   });
 
   it('未起飞的回程不受影响：照常拆单再改期', async () => {

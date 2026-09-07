@@ -27,6 +27,7 @@ import { determineFlightLegItems } from '../orders/ticketing-cap.js';
 import {
   computeCabinUpgradeDiffCny,
   computeSwapHotelCostSnapshot,
+  isScheduleDeparted,
   ORDER_STATUS_LABEL_ZH,
   OrderService,
   SEAT_HOLDING_STATUSES,
@@ -911,13 +912,16 @@ export class OrderChangeRequestsService {
   /**
    * 改班次执行前复检目标班次：提交到确认之间隔着几小时甚至几天，班次可能已经停售或已起飞。
    * 提交时那一刻的快照不作数，执行前一律重读现状（与 payload 只作展示留痕的口径一致）。
+   *
+   * 「已起飞」判定复用改期入口同一份 isScheduleDeparted；改单申请执行**永不放行**已起飞的
+   * 目标班次（下游 correctFlightSchedule 也不会收到 allowDepartedTarget，两层都拒）。
    */
   private async assertTargetScheduleStillUsable(scheduleId: string): Promise<void> {
     const target = await prisma.flightSchedule.findUnique({
       where: { id: scheduleId },
       select: { id: true, isActive: true, departureTime: true },
     });
-    if (!target || !target.isActive || target.departureTime.getTime() <= Date.now()) {
+    if (!target || !target.isActive || isScheduleDeparted(target)) {
       throw new BadRequestError(ORDER_CHANGE_STALE_SCHEDULE_MESSAGE);
     }
   }

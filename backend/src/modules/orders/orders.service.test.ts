@@ -207,6 +207,9 @@ import {
   assertDisplayedTotalMatches,
   computeGroundItemAmounts,
   resolveGroundItemUnitPrice,
+  assertTargetScheduleNotDeparted,
+  assertLegNotFlownForReschedule,
+  isScheduleDeparted,
 } from './orders.service.js';
 import { AppError, BadRequestError, PriceChangedError } from '../../lib/errors.js';
 import type { OrderItemInput } from './orders.schemas.js';
@@ -5315,6 +5318,312 @@ describe('OrderService.rescheduleOrderItem · 占座状态守卫', () => {
 // 写审计「已收 ¥X」。悄悄清零就成了「审计说收了、账上没这笔钱」，事后对账对不上，
 // 而运营当场看到的是一次成功。要单独收/退一笔钱请走按乘客调价。
 // ══════════════════════════════════════════════════════════════════════════
+describe('OrderService.rescheduleOrderItem · 已起飞班次闸（目标班次一律拒 / 源段纠错出口）', () => {
+  // 0906 实测事故复刻：售后改期把回程从 9/7 点成了 **08-08**（想点 09-08），座位搬进一个月前的班次；
+  // 之后 7 次想改回全被「该段已起飞」拦死。两道闸：目标已起飞一律拒（运营显式补录才放行）、
+  // 源段已起飞只在纠错语义开出口（早于建单自动放行 / 运营确认放行）。日期全部相对「今天」取。
+  const DAY = 24 * 3600_000;
+  const future = (days: number) => new Date(Date.now() + days * DAY);
+  const past = (days: number) => new Date(Date.now() - days * DAY);
+  const ADMIN = { userId: 'admin1', role: 'ADMIN' as const };
+  const STAFF = { userId: 'staff1', role: 'STAFF' as const };
+
+  /** 单航段单：源段 sourceDepart、目标班次 targetDepart、建单时间 createdAt。 */
+  function mount(opts: { sourceDepart: Date; targetDepart: Date; createdAt: Date }) {
+    mockPrisma.order.findUnique.mockReset().mockResolvedValue({
+      id: 'ord1',
+      status: 'PAID',
+      deletedAt: null,
+      adjustmentCny: 0,
+      adjustments: [],
+      createdAt: opts.createdAt,
+      outboundInvoiced: false,
+      returnInvoiced: false,
+      systemInvoiced: false,
+      settlementLocked: false,
+    });
+    mockPrisma.orderItem.findUnique.mockReset().mockResolvedValue({
+      id: 'it1',
+      orderId: 'ord1',
+      kind: 'FLIGHT',
+      quantity: 1,
+      bundleId: null,
+      flightScheduleId: 'sched-old',
+      flightCabin: 'ECONOMY',
+      metadata: {},
+      flightSchedule: { departureTime: opts.sourceDepart, departureTz: 'Asia/Shanghai' },
+    });
+    mockPrisma.orderItem.findMany.mockReset().mockImplementation(
+      async (args: { where?: { kind?: string; hotelCheckIn?: unknown } }) => {
+        if (args.where?.kind === 'DISCOUNT') return [];
+        if (args.where?.hotelCheckIn) return [];
+        return [
+          {
+            id: 'it1',
+            flightScheduleId: 'sched-new',
+            flightSchedule: { departureTime: opts.targetDepart, departureTz: 'Asia/Shanghai' },
+          },
+        ];
+      },
+    );
+    mockPrisma.passenger.updateMany.mockReset().mockResolvedValue({ count: 1 });
+    // 目标班次的出发时刻随舱位一起取（service 在 flightSeatClass 上联查 schedule）。
+    mockPrisma.flightSeatClass.findFirst.mockReset().mockResolvedValue({
+      id: 'seat-new',
+      schedule: { departureTime: opts.targetDepart, departureTz: 'Asia/Shanghai' },
+    });
+    mockPrisma.seatLock.aggregate.mockReset().mockResolvedValue({ _sum: { qty: 0 } });
+    mockPrisma.$queryRaw.mockReset().mockResolvedValue([{ id: 'ord1' }] as never);
+    mockPrisma.$executeRaw.mockReset().mockResolvedValue(1);
+    mockPrisma.orderItem.update.mockReset().mockResolvedValue({});
+    mockPrisma.order.update.mockReset().mockResolvedValue({});
+    mockPrisma.flightSchedule.findUnique.mockReset().mockResolvedValue({
+      departureTime: opts.targetDepart,
+      departureTz: 'Asia/Shanghai',
+      flight: { flightNumber: 'XX101' },
+    });
+    mockPrisma.order.findUniqueOrThrow.mockReset().mockResolvedValue(fakeFullOrder());
+  }
+
+  function makeService() {
+    const service = new OrderService();
+    vi.spyOn(service, '_updateStatusWithinTx').mockResolvedValue(undefined as never);
+    return service;
+  }
+
+  // ── 目标班次已起飞 ─────────────────────────────────────────────────────────
+  it('目标班次已起飞 → 拒（运营未显式补录），一个座都没搬', async () => {
+    const service = makeService();
+    mount({ sourceDepart: future(30), targetDepart: past(2), createdAt: past(10) });
+
+    await expect(
+      service.rescheduleOrderItem('ord1', { orderItemId: 'it1', newScheduleId: 'sched-new' }, ADMIN),
+    ).rejects.toThrow(/目标班次已起飞/);
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+    expect(mockPrisma.orderItem.update).not.toHaveBeenCalled();
+  });
+
+  it('目标班次已起飞 + 纠错语义（correction）同样拒：纠错出口只对源段开，不对目标开', async () => {
+    const service = makeService();
+    mount({ sourceDepart: future(30), targetDepart: past(2), createdAt: past(10) });
+
+    await expect(
+      service.rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'it1', newScheduleId: 'sched-new', guard: { correction: true } },
+        STAFF,
+      ),
+    ).rejects.toThrow(/目标班次已起飞/);
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('运营显式传 allowDepartedTarget → 放行（事后补录），审计记 departedTargetAllowed=true', async () => {
+    const service = makeService();
+    mount({ sourceDepart: future(30), targetDepart: past(2), createdAt: past(10) });
+
+    const result = await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'it1', newScheduleId: 'sched-new', allowDepartedTarget: true },
+      ADMIN,
+    );
+
+    expect(result.audit.departedTargetAllowed).toBe(true);
+    expect(result.audit.flownSourceAllowed).toBeNull();
+    // 放旧座 + 拿新座照常走（源段没飞，旧座真的还在账上）
+    expect(mockPrisma.$executeRaw).toHaveBeenCalled();
+    expect(mockPrisma.orderItem.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 'it1' } }),
+    );
+  });
+
+  it('目标班次未起飞 → 正常路径，审计两个放行字段都是「没用到」', async () => {
+    const service = makeService();
+    mount({ sourceDepart: future(30), targetDepart: future(35), createdAt: past(10) });
+
+    const result = await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'it1', newScheduleId: 'sched-new', allowDepartedTarget: true },
+      ADMIN,
+    );
+    expect(result.audit.departedTargetAllowed).toBe(false);
+    expect(result.audit.flownSourceAllowed).toBeNull();
+  });
+
+  it('assertTargetScheduleNotDeparted：代理传了 allowDepartedTarget 也拒；运营传了才放；未起飞恒 false', () => {
+    const departed = { departureTime: past(1), departureTz: 'Asia/Shanghai' };
+    expect(() =>
+      assertTargetScheduleNotDeparted(departed, { actorRole: 'AGENT', allowDepartedTarget: true }),
+    ).toThrow(/目标班次已起飞/);
+    expect(() =>
+      assertTargetScheduleNotDeparted(departed, { actorRole: 'ADMIN', allowDepartedTarget: false }),
+    ).toThrow(/勾选「显示已起飞班次（补录）」/);
+    expect(assertTargetScheduleNotDeparted(departed, { actorRole: 'STAFF', allowDepartedTarget: true })).toBe(true);
+    expect(assertTargetScheduleNotDeparted(departed, { actorRole: 'ADMIN', allowDepartedTarget: true })).toBe(true);
+    expect(
+      assertTargetScheduleNotDeparted({ departureTime: future(1) }, { actorRole: 'AGENT' }),
+    ).toBe(false);
+    // 没有出发时刻 = 未起飞（与 isLegAlreadyFlown 的 null 语义对称）
+    expect(isScheduleDeparted({ departureTime: null })).toBe(false);
+    expect(isScheduleDeparted(null)).toBe(false);
+    expect(isScheduleDeparted({ departureTime: past(1) })).toBe(true);
+  });
+
+  it('correctFlightSchedule：运营带两个放行开关 → 原样透传给改期事务', async () => {
+    const service = new OrderService();
+    const spy = vi
+      .spyOn(service, 'rescheduleOrderItem')
+      .mockResolvedValue({ order: { id: 'ord1' }, audit: {} } as never);
+
+    await service.correctFlightSchedule('ord1', 'it1', 'sched-new', STAFF, {
+      allowDepartedTarget: true,
+      allowFlownSource: true,
+    });
+    expect(spy).toHaveBeenCalledWith(
+      'ord1',
+      expect.objectContaining({
+        guard: { correction: true, forbidTicketed: true },
+        allowDepartedTarget: true,
+        allowFlownSource: true,
+      }),
+      STAFF,
+    );
+
+    // 不带开关 → 入参里根本没有这两个键（与既有「纠错固定入参」用例保持逐字一致）
+    await service.correctFlightSchedule('ord1', 'it1', 'sched-new', STAFF);
+    expect(spy.mock.calls[1][1]).not.toHaveProperty('allowDepartedTarget');
+    expect(spy.mock.calls[1][1]).not.toHaveProperty('allowFlownSource');
+    spy.mockRestore();
+  });
+
+  // ── 源段已起飞：纠错出口 ─────────────────────────────────────────────────
+  it('源段起飞早于建单时间 + 纠错 → 自动放行，flownSourceAllowed=BEFORE_ORDER_CREATED', async () => {
+    const service = makeService();
+    // 建单 10 天前，源段却在 30 天前起飞：客人不可能真飞过这一段（正是录错成 08-08 的现场）
+    mount({ sourceDepart: past(30), targetDepart: future(5), createdAt: past(10) });
+
+    const result = await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'it1', newScheduleId: 'sched-new', guard: { correction: true }, feeCny: 0 },
+      ADMIN,
+    );
+
+    expect(result.audit.flownSourceAllowed).toBe('BEFORE_ORDER_CREATED');
+    expect(result.audit.departedTargetAllowed).toBe(false);
+    // 旧班次照走 releaseSeatFloored、新班次照常原子拿座
+    expect(mockPrisma.$executeRaw).toHaveBeenCalled();
+    expect(mockPrisma.orderItem.update).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { id: 'it1' } }),
+    );
+  });
+
+  it('源段起飞晚于建单 + 纠错但未勾 allowFlownSource → 拒，文案指路勾选「该段客人未乘坐（录错）」', async () => {
+    const service = makeService();
+    mount({ sourceDepart: past(2), targetDepart: future(5), createdAt: past(10) });
+
+    await expect(
+      service.rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'it1', newScheduleId: 'sched-new', guard: { correction: true }, feeCny: 0 },
+        ADMIN,
+      ),
+    ).rejects.toThrow(/勾选「该段客人未乘坐（录错）」/);
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('源段起飞晚于建单 + 纠错 + 运营 allowFlownSource → 放行，flownSourceAllowed=OPERATOR_CONFIRMED', async () => {
+    const service = makeService();
+    mount({ sourceDepart: past(2), targetDepart: future(5), createdAt: past(10) });
+
+    const result = await service.rescheduleOrderItem(
+      'ord1',
+      {
+        orderItemId: 'it1',
+        newScheduleId: 'sched-new',
+        guard: { correction: true },
+        feeCny: 0,
+        allowFlownSource: true,
+      },
+      STAFF,
+    );
+    expect(result.audit.flownSourceAllowed).toBe('OPERATOR_CONFIRMED');
+    expect(mockPrisma.$executeRaw).toHaveBeenCalled();
+  });
+
+  it('售后改期（非纠错）源段早于建单 → 仍拒，即便带了 allowFlownSource；文案点明去/回程可能互换并指路纠错', async () => {
+    const service = makeService();
+    mount({ sourceDepart: past(30), targetDepart: future(5), createdAt: past(10) });
+
+    const err = await service
+      .rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'it1', newScheduleId: 'sched-new', allowFlownSource: true },
+        ADMIN,
+      )
+      .catch((e: Error) => e);
+    expect(err).toBeInstanceOf(BadRequestError);
+    expect((err as Error).message).toContain('已起飞');
+    expect((err as Error).message).toContain('标记 no-show');
+    expect((err as Error).message).toContain('改走「纠错改航班」');
+    expect((err as Error).message).toContain('去/回程顺序可能已因错误日期互换');
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('assertLegNotFlownForReschedule：代理自助纠错不吃任何出口（早于建单也不自动放、带开关也不认）', () => {
+    const flownBeforeCreated = {
+      flightSchedule: { departureTime: past(30), departureTz: 'Asia/Shanghai' },
+    };
+    expect(() =>
+      assertLegNotFlownForReschedule(flownBeforeCreated, {
+        order: { createdAt: past(10) },
+        correction: true,
+        allowFlownSource: true,
+        actorRole: 'AGENT',
+      }),
+    ).toThrow(/已起飞/);
+    // 代理看不到勾选项，文案不指路勾选
+    const err = (() => {
+      try {
+        assertLegNotFlownForReschedule(flownBeforeCreated, {
+          order: { createdAt: past(10) },
+          correction: true,
+          actorRole: 'AGENT',
+        });
+        return null;
+      } catch (e) {
+        return e as Error;
+      }
+    })();
+    expect(err?.message).not.toContain('勾选');
+    // 运营 + 纠错 + 早于建单 → 自动放行
+    expect(
+      assertLegNotFlownForReschedule(flownBeforeCreated, {
+        order: { createdAt: past(10) },
+        correction: true,
+        actorRole: 'STAFF',
+      }),
+    ).toBe('BEFORE_ORDER_CREATED');
+    // 源段没飞 → null（正常路径）
+    expect(
+      assertLegNotFlownForReschedule(
+        { flightSchedule: { departureTime: future(3), departureTz: 'Asia/Shanghai' } },
+        { order: { createdAt: past(10) }, correction: false, actorRole: 'ADMIN' },
+      ),
+    ).toBeNull();
+  });
+
+  it('rescheduleOrderBodySchema / correctFlightBodySchema 接受两个可选开关，缺省不写默认值', () => {
+    const parsed = rescheduleOrderBodySchema.parse({
+      orderItemId: 'it1',
+      newScheduleId: 'sched-new',
+      allowDepartedTarget: true,
+    });
+    expect(parsed.allowDepartedTarget).toBe(true);
+    expect(parsed.allowFlownSource).toBeUndefined();
+    const plain = rescheduleOrderBodySchema.parse({ orderItemId: 'it1', newScheduleId: 'sched-new' });
+    expect(plain).not.toHaveProperty('allowDepartedTarget');
+  });
+});
+
 describe('OrderService.rescheduleOrderItem · 同班次同舱位带差价一律拒绝', () => {
   const armSameSeat = () => {
     mockPrisma.order.findUnique.mockReset().mockResolvedValue({
