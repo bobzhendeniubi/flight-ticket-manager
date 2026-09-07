@@ -197,6 +197,20 @@ export const updateHoldOrderAgentBodySchema = z.object({ agentId: z.string().min
 export type UpdateHoldOrderAgentBody = z.infer<typeof updateHoldOrderAgentBodySchema>;
 
 /**
+ * 改出发团期（换班次）：建单选错日期、或团期整体挪动时的订正通道。
+ * cabin 缺省沿用原舱位（只换日期不换舱是最常见的一种）；note 只作为改期原因写进审计，
+ * 不覆盖占位单自己的备注。锁价、收款计划、团号、状态一律不动。
+ */
+export const changeHoldScheduleBodySchema = z
+  .object({
+    flightScheduleId: z.string().min(1),
+    cabin: cabinSchema.optional(),
+    note: z.string().trim().max(200).optional(),
+  })
+  .strict();
+export type ChangeHoldScheduleBody = z.infer<typeof changeHoldScheduleBodySchema>;
+
+/**
  * F-14：认款请求令牌（同 convertHoldOrder 的幂等口径）。同一个 token 重放只会记一笔钱，
  * 双击/网络重试不再把同一笔到账认两次。暂为选填——老客户端不带 token 时行为不变；
  * 前端接上之后应改为必填。

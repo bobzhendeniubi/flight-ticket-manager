@@ -387,7 +387,9 @@ export function HoldOrdersPage() {
                     <td className="text-xs text-ink-muted">{formatDateTimeSecCn(order.createdAt)}</td>
                     <td className="whitespace-nowrap text-right">
                       <button className="mr-2 text-xs font-medium text-brand-700 disabled:text-ink-muted" disabled={!holding || busy} onClick={() => setPriceOrder(order)}>改价</button>
-                      <button className="mr-2 text-xs font-medium text-brand-700 disabled:text-ink-muted" disabled={!holding || busy} onClick={() => setInfoOrder(order)}>编辑</button>
+                      {/* 编辑口径与后端一致：只有终态单（已转正/已释放/已取消）不可编辑；
+                          待生效的切位单也要能改团期，录错日期最常见的就是它。 */}
+                      <button className="mr-2 text-xs font-medium text-brand-700 disabled:text-ink-muted" disabled={!(holding || order.status === 'PENDING') || busy} onClick={() => setInfoOrder(order)}>编辑</button>
                       {canConvert && <button className={`mr-2 text-xs font-semibold disabled:text-ink-muted ${order.status === 'FULLY_PAID' ? 'btn-primary px-2 py-1' : 'text-brand-700'}`} disabled={busy} onClick={() => setConvertOrder(order)}>导入名单转正</button>}
                       <button className="mr-2 text-xs font-medium text-amber-700 disabled:text-ink-muted" disabled={!canRelease || busy} onClick={() => void runAction(order, 'release')}>释放</button>
                       <button className="mr-2 text-xs font-medium text-brand-700 disabled:text-ink-muted" disabled={!canReduce || busy} onClick={() => setReduceOrder(order)}>减员</button>
@@ -459,18 +461,27 @@ export function HoldOrdersPage() {
         <InfoModal
           order={infoOrder}
           agents={agents}
+          schedules={allSchedules[infoOrder.flightSchedule.flight.id] ?? []}
           onCancel={() => setInfoOrder(null)}
-          onSubmit={async (groupName, notes, agentId) => {
+          onSubmit={async (groupName, notes, agentId, scheduleId) => {
             if (!tokens) return;
             setBusy(true);
             try {
-              // 先改团名/备注，再改归属：任一步失败弹窗留在原地展示后端原因。
+              // 先改团名/备注，再改归属，最后改期：任一步失败弹窗留在原地展示后端原因。
               await api.updateHoldOrderInfo(tokens.accessToken, infoOrder.id, { groupName, notes });
               const agentChanged = infoOrder.ownerType === 'AGENT' && !!agentId && agentId !== infoOrder.agentId;
               if (agentChanged) await api.updateHoldOrderAgent(tokens.accessToken, infoOrder.id, { agentId });
+              const scheduleChanged = !!scheduleId && scheduleId !== infoOrder.flightSchedule.id;
+              let scheduleWarning: string | null = null;
+              if (scheduleChanged) {
+                const changed = await api.changeHoldSchedule(tokens.accessToken, infoOrder.id, { flightScheduleId: scheduleId });
+                scheduleWarning = changed.result.warning;
+              }
               setInfoOrder(null);
-              await reload();
-              notify(agentChanged ? '归属代理与占位单信息已更新' : '团名 / 备注已更新');
+              // 改期动了两个班次的余位，班次表要一起刷。
+              await (scheduleChanged ? Promise.all([reload(), reloadSchedules()]) : reload());
+              if (scheduleChanged) notify(scheduleWarning ? `出发团期已改，锁价不变；${scheduleWarning}` : '出发团期已改，锁价与收款计划不变');
+              else notify(agentChanged ? '归属代理与占位单信息已更新' : '团名 / 备注已更新');
             } finally {
               setBusy(false);
             }
@@ -1152,23 +1163,51 @@ function PriceModal({ order, onCancel, onSubmit }: { order: HoldOrderListItem; o
   );
 }
 
-function InfoModal({ order, agents, onCancel, onSubmit }: { order: HoldOrderListItem; agents: AgentListItem[]; onCancel: () => void; onSubmit: (groupName: string, notes: string, agentId: string) => Promise<void> }) {
+function InfoModal({ order, agents, schedules, onCancel, onSubmit }: { order: HoldOrderListItem; agents: AgentListItem[]; schedules: AdminSchedule[]; onCancel: () => void; onSubmit: (groupName: string, notes: string, agentId: string, scheduleId: string) => Promise<void> }) {
   const dialogRef = useDialogA11y(onCancel);
+  const askConfirm = useConfirm();
   const [groupName, setGroupName] = useState(order.groupName ?? '');
   const [notes, setNotes] = useState(order.notes ?? '');
   const [agentId, setAgentId] = useState(order.agentId ?? '');
+  const [scheduleId, setScheduleId] = useState(order.flightSchedule.id);
   const [error, setError] = useState<string | null>(null);
   // F-25：编辑信息保存按钮原来没有提交中禁用，双击会并发触发两次覆盖式更新。
   const [busy, setBusy] = useState(false);
   // 当前归属的代理可能已停用而不在可选列表里：补一个占位选项，避免下拉显示成空白。
   const currentAgentMissing = order.ownerType === 'AGENT' && !!order.agentId && !agents.some((a) => a.id === order.agentId);
   const agentChanged = order.ownerType === 'AGENT' && agentId !== (order.agentId ?? '');
+  // 改期只在同一航班的未起飞班次之间选（换航班是另一件事，不在这条订正通道里做）。
+  const scheduleOptions = useMemo(
+    () => schedules
+      .filter((s) => s.isActive && new Date(s.departureTime).getTime() > Date.now())
+      .sort((a, b) => a.departureTime.localeCompare(b.departureTime)),
+    [schedules],
+  );
+  // 当前班次可能已超出班次表的拉取窗口：补一个占位选项，避免下拉显示成空白。
+  const currentScheduleMissing = !scheduleOptions.some((s) => s.id === order.flightSchedule.id);
+  const scheduleLabel = (departureTime: string, tz: string) =>
+    `${formatLocalDate(departureTime, tz)} ${formatLocalTime(departureTime, tz)} 出发`;
+  const currentScheduleLabel = scheduleLabel(order.flightSchedule.departureTime, order.flightSchedule.departureTz);
+  const scheduleChanged = scheduleId !== order.flightSchedule.id;
+  const occupiedSeats = order.seats - order.seatsConverted - order.seatsCancelled;
   const submit = async () => {
     if (busy) return;
     if (order.ownerType === 'CUSTOMER' && !groupName.trim()) { setError('直客占位团名不能清空'); return; }
     if (order.ownerType === 'AGENT' && !agentId) { setError('代理占位必须选择归属代理'); return; }
+    if (scheduleChanged) {
+      const target = scheduleOptions.find((s) => s.id === scheduleId);
+      const targetLabel = target ? scheduleLabel(target.departureTime, target.departureTz) : '所选班次';
+      const ok = await askConfirm({
+        title: `确认把占位单 ${order.holdNo} 改到新的出发团期？`,
+        body: [
+          `占位 ${occupiedSeats} 座将从 ${currentScheduleLabel} 改到 ${targetLabel}，锁价 ¥${order.perSeatPriceCny}/人不变。`,
+          order.seatsConverted > 0 ? `已转正 ${order.seatsConverted} 座不跟随，需要在订单里改期。` : '',
+        ].filter(Boolean).join('\n\n'),
+      });
+      if (!ok) return;
+    }
     setBusy(true);
-    try { await onSubmit(groupName.trim(), notes.trim(), agentId); } catch (err) { setError(err instanceof Error ? err.message : '保存失败'); setBusy(false); }
+    try { await onSubmit(groupName.trim(), notes.trim(), agentId, scheduleId); } catch (err) { setError(err instanceof Error ? err.message : '保存失败'); setBusy(false); }
   };
   return (
     <div ref={dialogRef} role="dialog" aria-modal="true" aria-label="编辑占位单" tabIndex={-1} className="fixed inset-0 z-50 flex items-center justify-center bg-slate-900/50 p-4" onClick={onCancel}>
@@ -1188,6 +1227,22 @@ function InfoModal({ order, agents, onCancel, onSubmit }: { order: HoldOrderList
               )}
             </div>
           )}
+          <div>
+            <label className="label">出发日期 · 班次</label>
+            <select className="input" value={scheduleId} onChange={(e) => setScheduleId(e.target.value)}>
+              {currentScheduleMissing && <option value={order.flightSchedule.id}>{currentScheduleLabel}（当前）</option>}
+              {scheduleOptions.map((item) => (
+                <option key={item.id} value={item.id}>{scheduleLabel(item.departureTime, item.departureTz)}</option>
+              ))}
+            </select>
+            <p className="mt-1 text-xs text-ink-muted">{order.flightSchedule.flight.flightNumber} · 只列同一航班未起飞的班次；锁价与收款计划不随改期变动。</p>
+            {scheduleChanged && (
+              <p className="mt-2 rounded bg-amber-50 px-3 py-2 text-xs text-amber-800">
+                占位 {occupiedSeats} 座将改到新班次，保存前会再确认一次；目标班次余位不足会被拒绝。
+                {order.seatsConverted > 0 && `已转正的 ${order.seatsConverted} 座不跟随，需要到订单里改期。`}
+              </p>
+            )}
+          </div>
           <div><label className="label">团名{order.ownerType === 'CUSTOMER' ? '（必填）' : ''}</label><input className="input" maxLength={120} value={groupName} onChange={(e) => setGroupName(e.target.value)} /></div>
           <div><label className="label">备注</label><textarea className="input min-h-24" maxLength={500} value={notes} onChange={(e) => setNotes(e.target.value)} /></div>
           {error && <p className="rounded bg-rose-50 px-3 py-2 text-sm text-rose-700">{error}</p>}

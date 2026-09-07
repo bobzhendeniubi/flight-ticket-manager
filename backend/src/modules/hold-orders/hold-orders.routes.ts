@@ -8,6 +8,7 @@ import { actorFromRequest } from '../../lib/audit.js';
 import { HoldOrderService } from './hold-orders.service.js';
 import {
   allocateHoldInstallmentBodySchema,
+  changeHoldScheduleBodySchema,
   manualReceiptHoldInstallmentBodySchema,
   createHoldGroupBodySchema,
   createHoldOrderBodySchema,
@@ -151,5 +152,13 @@ export const holdOrderRoutes: FastifyPluginAsync = async (app) => {
     const { id } = req.params as { id: string };
     const body = updateHoldOrderAgentBodySchema.parse(req.body);
     return { result: await service.updateAgent(id, body, actorFromRequest(req)) };
+  });
+
+  // 改出发团期（换班次）：建单选错日期或团期挪动的订正通道；锁价与收款计划不动，
+  // 已转正座位不跟随（那部分是正式订单，要改得在订单里改期）。
+  app.patch('/:id/schedule', pre, async (req) => {
+    const { id } = req.params as { id: string };
+    const body = changeHoldScheduleBodySchema.parse(req.body);
+    return { result: await service.changeSchedule(id, body, actorFromRequest(req)) };
   });
 };

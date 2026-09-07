@@ -23,7 +23,7 @@ import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import { writeAudit } from '../../lib/audit.js';
 import type { AuditActor } from '../../lib/audit.js';
-import { heldSeatsForSeatClass } from './held-seats.js';
+import { heldSeatsForSeatClass, SEAT_HOLDING_STATUSES } from './held-seats.js';
 import { OrderService } from '../orders/orders.service.js';
 import { PaymentsService } from '../payments/payments.service.js';
 import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
@@ -47,6 +47,7 @@ import {
 import { computeReduction, type ReductionResult } from './hold-reduction.js';
 import type {
   AllocateHoldInstallmentBody,
+  ChangeHoldScheduleBody,
   CreateHoldGroupBody,
   CreateHoldOrderBody,
   ListHoldOrdersQuery,
@@ -273,18 +274,32 @@ async function seatsAvailableForNewHold(tx: Tx, seatClassId: string, seats: numb
   return seatClass.capacity - seatClass.sold - (locked._sum.qty ?? 0) - held - seats;
 }
 
-async function availableSeatsForHold(tx: Tx, hold: { seatClassId: string }, seatsToOccupy: number): Promise<number> {
+/**
+ * 某舱位在占掉 seatsToOccupy 座之后还剩几张（<0 即不够）。占位单的余量判定全部经过这里，
+ * 口径与建单一致：capacity − sold − 未过期 ACTIVE 锁位 − 占位余座 − 本次要占的座。
+ * excludeHoldOrderId 只有改期传（见 heldSeatsForSeatClass 注释）。
+ */
+async function availableSeatsForSeatClass(
+  tx: Tx,
+  seatClassId: string,
+  seatsToOccupy: number,
+  excludeHoldOrderId?: string,
+): Promise<number> {
   const rows = await tx.$queryRaw<Array<{ capacity: number; sold: number }>>`
-    SELECT capacity, sold FROM "FlightSeatClass" WHERE id = ${hold.seatClassId} FOR UPDATE
+    SELECT capacity, sold FROM "FlightSeatClass" WHERE id = ${seatClassId} FOR UPDATE
   `;
   const seatClass = rows[0];
   if (!seatClass) throw new NotFoundError('舱位不存在');
   const locked = await tx.seatLock.aggregate({
     _sum: { qty: true },
-    where: { seatClassId: hold.seatClassId, status: SeatLockStatus.ACTIVE, expiresAt: { gt: new Date() } },
+    where: { seatClassId, status: SeatLockStatus.ACTIVE, expiresAt: { gt: new Date() } },
   });
-  const held = await heldSeatsForSeatClass(tx, hold.seatClassId);
+  const held = await heldSeatsForSeatClass(tx, seatClassId, excludeHoldOrderId);
   return seatClass.capacity - seatClass.sold - (locked._sum.qty ?? 0) - held - seatsToOccupy;
+}
+
+async function availableSeatsForHold(tx: Tx, hold: { seatClassId: string }, seatsToOccupy: number): Promise<number> {
+  return availableSeatsForSeatClass(tx, hold.seatClassId, seatsToOccupy);
 }
 
 /**
@@ -1184,6 +1199,122 @@ export class HoldOrderService {
       after: { agentId: body.agentId, seatsConverted: result.hold.seatsConverted },
     });
     return { id, agentId: body.agentId, seatsConverted: result.hold.seatsConverted };
+  }
+
+  /**
+   * 改出发团期（换班次）：建单选错日期、或整团团期挪动时的订正通道。
+   *
+   * 只搬「这张占位单还占着的座」——座位从原舱位挪到目标舱位，锁价 / 收款计划 / 团号 / 状态
+   * 全都不动（钱和节奏是跟着团走的，不随日期变）。已转正的那部分座位已经是正式订单，
+   * 不跟随占位单改期，要改得去订单侧走改期。
+   *
+   * 余位判定复用全站唯一那套口径（availableSeatsForSeatClass），只是把本单排除在
+   * 「其他占位」之外；PENDING 的切位单本就不占座，只换绑定不查余位。
+   */
+  async changeSchedule(id: string, body: ChangeHoldScheduleBody, actor?: AuditActor) {
+    const result = await prisma.$transaction(async (tx) => {
+      await lockHold(tx, id);
+      const existing = await findHold(tx, id);
+      if (!existing) throw new NotFoundError('占位单不存在');
+      const terminalStatuses: HoldOrderStatus[] = [HoldOrderStatus.CONVERTED, HoldOrderStatus.RELEASED, HoldOrderStatus.CANCELLED];
+      if (terminalStatuses.includes(existing.status)) {
+        throw new ConflictError(`占位单当前状态不可改期（${HOLD_STATUS_LABEL[existing.status]}）`);
+      }
+      const currentCabin = existing.seatClass.cabin as CabinClass;
+      const cabin = body.cabin ?? currentCabin;
+      if (body.flightScheduleId === existing.flightScheduleId && cabin === currentCabin) {
+        throw new BadRequestError('目标班次与当前班次相同');
+      }
+
+      const target = await tx.flightSchedule.findUnique({
+        where: { id: body.flightScheduleId },
+        select: {
+          id: true,
+          isActive: true,
+          departureTime: true,
+          departureTz: true,
+          flight: { select: { flightNumber: true } },
+        },
+      });
+      if (!target) throw new NotFoundError('航班班次不存在');
+      if (!target.isActive) throw new BadRequestError('目标班次已停用，不能改到该班次');
+      const now = new Date();
+      if (target.departureTime.getTime() <= now.getTime()) {
+        throw new BadRequestError('目标班次已起飞，不能改到该班次');
+      }
+
+      // 目标舱位行加锁：与建单同一把锁，改期与建单/锁位/下单在同一条队列里排。
+      const rows = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "FlightSeatClass"
+        WHERE "scheduleId" = ${target.id} AND cabin = ${cabin}::"CabinClass" FOR UPDATE
+      `;
+      const targetSeatClass = rows[0];
+      if (!targetSeatClass) throw new NotFoundError('目标班次没有该舱位');
+
+      const seatsToOccupy = existing.seats - existing.seatsConverted - existing.seatsCancelled;
+      // 占座态口径与库存聚合同源（SEAT_HOLDING_STATUSES）：PENDING 的切位单还没占座，
+      // 只换绑定不查余位——它真正占座是在收满款走 retryOccupy 那一步，届时照旧查余位。
+      const isOccupying = SEAT_HOLDING_STATUSES.includes(existing.status);
+      if (isOccupying && seatsToOccupy > 0) {
+        const available = await availableSeatsForSeatClass(tx, targetSeatClass.id, seatsToOccupy, id);
+        if (available < 0) {
+          throw new ConflictError(
+            `目标班次余位不足：需要占位 ${seatsToOccupy} 张，仅剩 ${Math.max(0, available + seatsToOccupy)} 张可占`,
+          );
+        }
+      }
+
+      await tx.holdOrder.update({
+        where: { id },
+        data: { flightScheduleId: target.id, seatClassId: targetSeatClass.id },
+      });
+
+      return {
+        hold: existing,
+        target,
+        targetSeatClassId: targetSeatClass.id,
+        cabin,
+        currentCabin,
+        seatsToOccupy,
+        isOccupying,
+      };
+    });
+
+    const before = {
+      flightScheduleId: result.hold.flightScheduleId,
+      flightNumber: result.hold.flightSchedule.flight.flightNumber,
+      departureDate: dateInTimezone(result.hold.flightSchedule.departureTime, result.hold.flightSchedule.departureTz),
+      cabin: result.currentCabin,
+      seatClassId: result.hold.seatClassId,
+    };
+    const after = {
+      flightScheduleId: result.target.id,
+      flightNumber: result.target.flight.flightNumber,
+      departureDate: dateInTimezone(result.target.departureTime, result.target.departureTz),
+      cabin: result.cabin,
+      seatClassId: result.targetSeatClassId,
+      seats: result.seatsToOccupy,
+      seatsConverted: result.hold.seatsConverted,
+      ...(body.note ? { note: body.note } : {}),
+    };
+    auditHold(actor, 'CHANGE_HOLD_SCHEDULE', result.hold, { before, after });
+    // 座位从原舱位退回池子，候补队列照旧要被叫醒（与释放/减员同一处理）。
+    if (result.isOccupying && result.seatsToOccupy > 0) await enqueueWaitlist(result.hold.seatClassId);
+    return {
+      id,
+      flightScheduleId: result.target.id,
+      seatClassId: result.targetSeatClassId,
+      cabin: result.cabin,
+      status: result.hold.status,
+      perSeatPriceCny: result.hold.perSeatPriceCny,
+      seats: result.seatsToOccupy,
+      seatsConverted: result.hold.seatsConverted,
+      before,
+      after,
+      warning: result.hold.seatsConverted > 0
+        ? `已转正 ${result.hold.seatsConverted} 座不随占位单改期，需在订单里改期`
+        : null,
+    };
   }
 
   async allocateInstallment(id: string, installmentId: string, body: AllocateHoldInstallmentBody, actor: AuditActor) {

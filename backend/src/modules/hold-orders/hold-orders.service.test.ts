@@ -19,6 +19,7 @@ const { prismaMock, auditMock, enqueueWaitlistCheckMock } = vi.hoisted(() => {
     holdInstallment: { update: vi.fn(), findMany: vi.fn() },
     seatLock: { aggregate: vi.fn() },
     agent: { findUnique: vi.fn() },
+    flightSchedule: { findUnique: vi.fn() },
     $queryRaw: vi.fn(),
     $transaction: vi.fn(),
   };
@@ -64,6 +65,7 @@ function hold(overrides: Record<string, unknown> = {}) {
       { id: 'i2', seq: 2, label: '尾款', amountRule: HoldAmountRule.REMAINDER, perPersonCny: null, amountCny: 18000, seatsBasis: 20, status: HoldInstallmentStatus.PENDING, paidAt: null, dueDate: new Date('2027-09-10T00:00:00Z'), allocations: [] },
     ],
     reductions: [],
+    seatClass: { cabin: CabinClass.ECONOMY },
     flightSchedule: { id: 'schedule_1', departureTime: new Date('2026-09-20T00:00:00Z'), departureTz: 'UTC', flight: { flightNumber: 'CA1' } },
     ...overrides,
   };
@@ -80,6 +82,7 @@ beforeEach(() => {
     _sum: { seats: 20, seatsConverted: 0, seatsCancelled: 0 },
   });
   prismaMock.agent.findUnique.mockResolvedValue({ id: 'agent_1' });
+  prismaMock.flightSchedule.findUnique.mockResolvedValue({ departureTime: new Date(), departureTz: 'UTC' });
   prismaMock.holdOrder.create.mockResolvedValue(hold());
   prismaMock.holdOrder.update.mockResolvedValue({});
   prismaMock.holdInstallment.findMany.mockResolvedValue(hold().installments);
@@ -425,6 +428,163 @@ describe('HoldOrderService.updateAgent', () => {
 
     prismaMock.agent.findUnique.mockResolvedValue({ id: 'agent_2', isActive: false });
     await expect(service.updateAgent('hold_1', { agentId: 'agent_2' }, { userId: 'user_1' })).rejects.toThrow('已停用');
+    expect(prismaMock.holdOrder.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('HoldOrderService.changeSchedule', () => {
+  const targetSchedule = {
+    id: 'schedule_2',
+    isActive: true,
+    departureTime: new Date('2027-03-18T02:00:00Z'),
+    departureTz: 'UTC',
+    flight: { flightNumber: 'CA9' },
+  };
+
+  function mockTargetSeatClass() {
+    // lockHold / 目标舱位 FOR UPDATE / 余位读取共用同一个 $queryRaw 桩
+    prismaMock.$queryRaw.mockResolvedValue([
+      { id: 'seat_class_2', scheduleId: 'schedule_2', capacity: 100, sold: 10 },
+    ]);
+  }
+
+  it('占座中改期成功：换绑班次与舱位行，锁价与状态不变，审计留新旧班次', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold());
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(targetSchedule);
+    mockTargetSeatClass();
+
+    const result = await service.changeSchedule('hold_1', { flightScheduleId: 'schedule_2', note: '团期整体后移' }, { userId: 'user_1' });
+
+    expect(prismaMock.holdOrder.update).toHaveBeenCalledWith({
+      where: { id: 'hold_1' },
+      data: { flightScheduleId: 'schedule_2', seatClassId: 'seat_class_2' },
+    });
+    expect(result).toMatchObject({
+      id: 'hold_1',
+      flightScheduleId: 'schedule_2',
+      seatClassId: 'seat_class_2',
+      cabin: CabinClass.ECONOMY,
+      status: HoldOrderStatus.HOLDING,
+      perSeatPriceCny: 1200,
+      seats: 20,
+      warning: null,
+    });
+    expect(auditMock).toHaveBeenCalledWith(expect.objectContaining({
+      action: 'CHANGE_HOLD_SCHEDULE',
+      before: expect.objectContaining({ flightScheduleId: 'schedule_1', flightNumber: 'CA1', departureDate: '2026-09-20', cabin: CabinClass.ECONOMY }),
+      after: expect.objectContaining({ flightScheduleId: 'schedule_2', flightNumber: 'CA9', departureDate: '2027-03-18', cabin: CabinClass.ECONOMY, seats: 20, note: '团期整体后移' }),
+    }));
+    // 座位从原舱位退回池子，候补要被叫醒
+    expect(enqueueWaitlistCheckMock).toHaveBeenCalledWith('seat_class_1');
+  });
+
+  it('目标班次余位不足 → 409 报余位，不换绑', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold());
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(targetSchedule);
+    mockTargetSeatClass();
+    prismaMock.holdOrder.aggregate.mockResolvedValue({
+      _sum: { seats: 80, seatsConverted: 0, seatsCancelled: 0 },
+    });
+
+    await expect(
+      service.changeSchedule('hold_1', { flightScheduleId: 'schedule_2' }, { userId: 'user_1' }),
+    ).rejects.toThrow('目标班次余位不足：需要占位 20 张，仅剩 5 张可占');
+    expect(prismaMock.holdOrder.update).not.toHaveBeenCalled();
+  });
+
+  it('余位判定按现有口径，且把本单排除在「其他占位」之外', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold());
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(targetSchedule);
+    mockTargetSeatClass();
+
+    await service.changeSchedule('hold_1', { flightScheduleId: 'schedule_2' }, { userId: 'user_1' });
+
+    expect(prismaMock.holdOrder.aggregate).toHaveBeenCalledWith({
+      _sum: { seats: true, seatsConverted: true, seatsCancelled: true },
+      where: { seatClassId: 'seat_class_2', status: { in: expect.any(Array) }, id: { not: 'hold_1' } },
+    });
+  });
+
+  it('目标班次已起飞 → 拒绝', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold());
+    prismaMock.flightSchedule.findUnique.mockResolvedValue({ ...targetSchedule, departureTime: new Date('2020-01-01T00:00:00Z') });
+    mockTargetSeatClass();
+
+    await expect(
+      service.changeSchedule('hold_1', { flightScheduleId: 'schedule_2' }, { userId: 'user_1' }),
+    ).rejects.toThrow('已起飞');
+    expect(prismaMock.holdOrder.update).not.toHaveBeenCalled();
+  });
+
+  it('目标班次已停用 → 拒绝', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold());
+    prismaMock.flightSchedule.findUnique.mockResolvedValue({ ...targetSchedule, isActive: false });
+    mockTargetSeatClass();
+
+    await expect(
+      service.changeSchedule('hold_1', { flightScheduleId: 'schedule_2' }, { userId: 'user_1' }),
+    ).rejects.toThrow('已停用');
+    expect(prismaMock.holdOrder.update).not.toHaveBeenCalled();
+  });
+
+  it('待生效的全款占座单（本就不占座）只换绑定，不校验余位', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ status: HoldOrderStatus.PENDING, occupyOn: 'FULL_PAYMENT' }));
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(targetSchedule);
+    mockTargetSeatClass();
+    // 目标舱位已被占满：占座态会被拒，PENDING 不查余位所以照样换绑
+    prismaMock.holdOrder.aggregate.mockResolvedValue({
+      _sum: { seats: 90, seatsConverted: 0, seatsCancelled: 0 },
+    });
+
+    const result = await service.changeSchedule('hold_1', { flightScheduleId: 'schedule_2' }, { userId: 'user_1' });
+
+    expect(result.status).toBe(HoldOrderStatus.PENDING);
+    expect(prismaMock.holdOrder.update).toHaveBeenCalledWith({
+      where: { id: 'hold_1' },
+      data: { flightScheduleId: 'schedule_2', seatClassId: 'seat_class_2' },
+    });
+    expect(prismaMock.holdOrder.aggregate).not.toHaveBeenCalled();
+  });
+
+  it('已部分转正：只搬占位余座，已转正座位不跟随并回提示', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ seatsConverted: 8 }));
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(targetSchedule);
+    mockTargetSeatClass();
+
+    const result = await service.changeSchedule('hold_1', { flightScheduleId: 'schedule_2' }, { userId: 'user_1' });
+
+    expect(result.seats).toBe(12);
+    expect(result.seatsConverted).toBe(8);
+    expect(result.warning).toBe('已转正 8 座不随占位单改期，需在订单里改期');
+  });
+
+  it('换舱位：目标舱位按传入 cabin 取，缺省沿用原舱位', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold());
+    prismaMock.flightSchedule.findUnique.mockResolvedValue(targetSchedule);
+    mockTargetSeatClass();
+
+    const result = await service.changeSchedule('hold_1', { flightScheduleId: 'schedule_2', cabin: CabinClass.BUSINESS }, { userId: 'user_1' });
+
+    expect(result.cabin).toBe(CabinClass.BUSINESS);
+  });
+
+  it('目标班次与当前班次舱位都相同 → 拒绝', async () => {
+    prismaMock.holdOrder.findUnique.mockResolvedValue(hold());
+
+    await expect(
+      service.changeSchedule('hold_1', { flightScheduleId: 'schedule_1' }, { userId: 'user_1' }),
+    ).rejects.toThrow('与当前班次相同');
+    expect(prismaMock.holdOrder.update).not.toHaveBeenCalled();
+  });
+
+  it('终态占位单（已转正/已释放/已取消）不能改期', async () => {
+    for (const status of [HoldOrderStatus.CONVERTED, HoldOrderStatus.RELEASED, HoldOrderStatus.CANCELLED]) {
+      prismaMock.holdOrder.findUnique.mockResolvedValue(hold({ status }));
+
+      await expect(
+        service.changeSchedule('hold_1', { flightScheduleId: 'schedule_2' }, { userId: 'user_1' }),
+      ).rejects.toThrow('当前状态不可改期');
+    }
     expect(prismaMock.holdOrder.update).not.toHaveBeenCalled();
   });
 });

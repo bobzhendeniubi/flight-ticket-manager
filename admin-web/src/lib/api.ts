@@ -4462,6 +4462,28 @@ export const api = {
       token,
       body,
     }),
+  // 改出发团期（换班次）：座位从原班次挪到目标班次；锁价 / 收款计划 / 团号 / 状态一律不动，
+  // 已转正座位不跟随（warning 带回提示文案）。cabin 缺省沿用原舱位。
+  changeHoldSchedule: (
+    token: string,
+    id: string,
+    body: { flightScheduleId: string; cabin?: CabinClass; note?: string },
+  ) =>
+    apiFetch<{ result: {
+      id: string;
+      flightScheduleId: string;
+      seatClassId: string;
+      cabin: CabinClass;
+      status: HoldOrderStatus;
+      perSeatPriceCny: number;
+      seats: number;
+      seatsConverted: number;
+      warning: string | null;
+    } }>(`/hold-orders/${id}/schedule`, {
+      method: 'PATCH',
+      token,
+      body,
+    }),
   // F-14：requestToken 可选——后端幂等键上线前老前端/未升级客户端仍可正常调用；
   // 弹窗侧固定生成一次并在重试时复用同一个 token，双击不再重复入账。
   allocateHoldInstallment: (token: string, holdId: string, installmentId: string, body: { requestToken?: string; receiptId: string; amountCny: number }) =>

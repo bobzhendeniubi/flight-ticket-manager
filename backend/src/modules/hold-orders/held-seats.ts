@@ -36,15 +36,27 @@ function heldFromSums(sums: {
   return (sums.seats ?? 0) - (sums.seatsConverted ?? 0) - (sums.seatsCancelled ?? 0);
 }
 
+/**
+ * 某舱位上的占位余座。
+ *
+ * excludeHoldOrderId：把某一张占位单排除在「其他占位」之外。占位单改期要问的是
+ * 「目标舱位除了这张单以外还剩多少」——本单的座位是跟着它一起搬过去的，不能既算作
+ * 目标舱位的存量占用、又算作本次要占的座（等于同一批座位要了两遍）。其余读点一律不传。
+ */
 export async function heldSeatsForSeatClass(
   db: HoldSeatsDbClient,
   seatClassId: string,
+  excludeHoldOrderId?: string,
 ): Promise<number> {
   const delegate = holdOrderDelegate(db);
   if (!delegate) return 0;
   const sums = await delegate.aggregate({
     _sum: { seats: true, seatsConverted: true, seatsCancelled: true },
-    where: { seatClassId, status: { in: SEAT_HOLDING_STATUSES } },
+    where: {
+      seatClassId,
+      status: { in: SEAT_HOLDING_STATUSES },
+      ...(excludeHoldOrderId ? { id: { not: excludeHoldOrderId } } : {}),
+    },
   });
   return heldFromSums(sums._sum);
 }
