@@ -91,8 +91,14 @@ describe('orderPriceAdjustmentBodySchema', () => {
     expect(orderPriceAdjustmentBodySchema.safeParse({ amountCny: 0, reasonCode: 'DISCOUNT' }).success).toBe(false);
   });
 
-  it('拒绝：非整数金额', () => {
-    expect(orderPriceAdjustmentBodySchema.safeParse({ amountCny: 12.5, reasonCode: 'MISC_FEE' }).success).toBe(false);
+  // 0906 运营反馈：代理结算价/拆单常见半元差额，放开到两位小数（口径同 settlementTotalCny）。
+  it('合法：两位小数金额（半元差额，0906 反馈）', () => {
+    expect(orderPriceAdjustmentBodySchema.safeParse({ amountCny: 12.5, reasonCode: 'MISC_FEE' }).success).toBe(true);
+    expect(orderPriceAdjustmentBodySchema.safeParse({ amountCny: -80.55, reasonCode: 'DISCOUNT' }).success).toBe(true);
+  });
+
+  it('拒绝：三位及以上小数金额', () => {
+    expect(orderPriceAdjustmentBodySchema.safeParse({ amountCny: 12.555, reasonCode: 'MISC_FEE' }).success).toBe(false);
   });
 
   it('拒绝：「其它」原因未补说明', () => {

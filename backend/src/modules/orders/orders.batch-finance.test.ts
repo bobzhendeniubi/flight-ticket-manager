@@ -243,6 +243,35 @@ describe('OrderService.batchAddPriceAdjustment', () => {
     );
   });
 
+  // 0906 运营反馈：调价金额放开到两位小数后，PER_PAX 的乘法不能带浮点尾巴
+  // （如 0.1 × 3 在 JS 里是 0.30000000000000004）——半元差额必须干干净净地乘出来。
+  it('PER_PAX 小数金额：0.5 × 3 人 = 1.5，无浮点尾巴', async () => {
+    const tx = txFor({
+      o1: {
+        orderNumber: 'ORD-001',
+        passengers: [PassengerType.ADULT, PassengerType.ADULT, PassengerType.ADULT],
+      },
+    });
+    runInTx(tx);
+
+    const res = await service.batchAddPriceAdjustment(
+      ['o1'],
+      { mode: 'PER_PAX', amountCny: 0.5, reasonCode: 'MISC_FEE' },
+      OPS,
+    );
+
+    expect(res).toMatchObject({ updated: 1, skipped: 0 });
+    expect(res.results[0]).toMatchObject({ ok: true, appliedAmountCny: 1.5, unitAmountCny: 0.5, seatPax: 3 });
+    const created = mockPrisma.orderItem.create.mock.calls[0][0];
+    expect(Number(created.data.amount.toString())).toBe(1.5);
+    expect(mockPrisma.order.update).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: { id: 'o1' },
+        data: expect.objectContaining({ subtotal: new Prisma.Decimal(1001.5) }),
+      }),
+    );
+  });
+
   it('PER_ORDER 按整单一笔，不乘人数', async () => {
     const tx = txFor({
       o1: {

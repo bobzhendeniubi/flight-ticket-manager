@@ -10672,8 +10672,8 @@ function PriceAdjustmentSection({
 
   async function submit(): Promise<void> {
     setErr(null);
-    if (amount === null || !Number.isInteger(amount) || amount === 0) {
-      setErr('请输入非 0 的整数金额（正=补收 / 负=优惠）');
+    if (amount === null || amount === 0 || Number(amount.toFixed(2)) !== amount) {
+      setErr('请输入非 0 的金额，最多两位小数（正=补收 / 负=优惠）');
       return;
     }
     if (reasonCode === 'OTHER' && !reasonText.trim()) {
@@ -10846,13 +10846,13 @@ function PriceAdjustmentSection({
             </label>
           </div>
           <label className="block">
-            <span className="text-[11px] font-medium text-ink-muted">金额（CNY，正=补收 / 负=优惠）</span>
+            <span className="text-[11px] font-medium text-ink-muted">金额（CNY，最多两位小数，正=补收 / 负=优惠）</span>
             <NumberInput
               value={amount}
               onChange={setAmount}
-              integerOnly
               allowNegative
-              placeholder="如 200 或 -80"
+              step={0.01}
+              placeholder="如 200 或 -80.5"
               className="input mt-0.5 w-full"
             />
           </label>
@@ -17942,8 +17942,8 @@ function BulkPriceAdjustModal({
       setErr(`一次最多处理 ${BULK_SELECTION_HARD_CAP} 单，请缩小选择`);
       return;
     }
-    if (amount === null || !Number.isInteger(amount) || amount === 0) {
-      setErr('请输入非 0 的整数金额（正=补收 / 负=优惠）');
+    if (amount === null || amount === 0 || Number(amount.toFixed(2)) !== amount) {
+      setErr('请输入非 0 的金额，最多两位小数（正=补收 / 负=优惠）');
       return;
     }
     if (Math.abs(amount) > PRICE_ADJUSTMENT_AMOUNT_LIMIT) {
@@ -18039,13 +18039,13 @@ function BulkPriceAdjustModal({
               </div>
             </div>
             <label className="block">
-              <span className="text-[11px] font-medium text-ink-muted">金额（CNY，正数补收，负数优惠）</span>
+              <span className="text-[11px] font-medium text-ink-muted">金额（CNY，最多两位小数，正数补收，负数优惠）</span>
               <NumberInput
                 value={amount}
                 onChange={setAmount}
-                integerOnly
                 allowNegative
-                placeholder="如 200 或 -80"
+                step={0.01}
+                placeholder="如 200 或 -80.5"
                 className="input mt-0.5 w-full"
                 disabled={submitting}
               />

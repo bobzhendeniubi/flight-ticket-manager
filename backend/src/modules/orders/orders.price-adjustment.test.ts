@@ -96,6 +96,24 @@ describe('priceAdjustmentSchema · 原因收窄为纯财务类（堵运营旁路
   });
 });
 
+// 0906 运营反馈：代理结算价/拆单常见半元差额（如 +920.5），整数口径永远抹不平——
+// 放开到两位小数，口径同 settlementTotalCny/perPassengerSettlementCny。
+describe('priceAdjustmentSchema · 金额允许两位小数（0906 半元差额反馈）', () => {
+  it.each([700.5, -80.5, 920.55, 0.01])('两位小数 %s → 通过', (amountCny) => {
+    const result = priceAdjustmentSchema.safeParse({ amountCny, reasonCode: 'MISC_FEE' });
+    expect(result.success).toBe(true);
+  });
+
+  it.each([700.555, -80.123, 0.001])('三位及以上小数 %s → 拒绝', (amountCny) => {
+    const result = priceAdjustmentSchema.safeParse({ amountCny, reasonCode: 'MISC_FEE' });
+    expect(result.success).toBe(false);
+  });
+
+  it('整数依旧通过（旧行为不变）', () => {
+    expect(priceAdjustmentSchema.safeParse({ amountCny: 700, reasonCode: 'MISC_FEE' }).success).toBe(true);
+  });
+});
+
 describe('OrderService.quoteOrder', () => {
   it('只算不落库：返回权威总价，且不写任何库/不开事务', async () => {
     const res = await service.quoteOrder({

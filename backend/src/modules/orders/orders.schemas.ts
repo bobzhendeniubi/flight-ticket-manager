@@ -24,7 +24,7 @@ export const POST_SALE_FEE_CAP_CNY = 100_000;
 // ── 录单调价/加项（ADMIN/STAFF 录单专用）──────────────────────────────────
 // 业务场景：录单时有优惠 / 补收杂费 / 行程变更改期费等需要在系统权威价上手工加减金额。
 // 此处只承载「一笔调整」的金额 + 原因；不放开裸手填整单价（服务端权威定价仍是安全底线）。
-// 金额（CNY，整数）可正（加钱）可负（减价/优惠），0 无意义 → 拒绝。
+// 金额（CNY，最多两位小数）可正（加钱）可负（减价/优惠），0 无意义 → 拒绝。
 //
 // 原因收窄为纯财务类：升舱/升级酒店/签证改多签曾经也在这个下拉里，但会造成运营隐形——
 // 升舱不占套餐结构化商务舱库存、升级酒店不走「换酒店」（房控看不到）、改多签不换签证产品
@@ -89,10 +89,12 @@ export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReasonDisplay,
 };
 
 // 调价金额校验（录单调价与「按乘客/整单事后调价」共用同一口径，避免两处漂移）：
-//   可正（加钱）可负（减价），整数 CNY；0 无意义（不调整就别传该字段）；|金额| ≤ 上限。
+//   可正（加钱）可负（减价），最多两位小数 CNY（口径同结算价 settlementTotalCny / perPassengerSettlementCny，
+//   代理结算价/拆单常见半元差额，整数口径永远抹不平半块钱——0905 运营反馈）；
+//   0 无意义（不调整就别传该字段）；|金额| ≤ 上限。
 const priceAdjustmentAmountSchema = z
   .number()
-  .int('调整金额必须为整数（CNY）')
+  .refine((v) => Number(v.toFixed(2)) === v, { message: '调整金额最多两位小数（元）' })
   .refine((v) => v !== 0, { message: '调整金额不能为 0（不调整请勿传该字段）' })
   .refine((v) => Math.abs(v) <= PRICE_ADJUSTMENT_CAP_CNY, {
     message: `调整金额超出上限（±${PRICE_ADJUSTMENT_CAP_CNY}）`,

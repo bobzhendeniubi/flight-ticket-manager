@@ -2704,7 +2704,9 @@ export class OrderService {
         targetType: 'ORDER',
         targetId: order.id,
         targetLabel: order.orderNumber,
-        before: { total: (adjustedTotal - amountCny).toString() },
+        // round2：amountCny 现允许两位小数，减法会漂（如 3.14 − 3.05 = 0.09000000000003），
+        // 审计留痕的「调整前总额」不该带着浮点尾巴。
+        before: { total: round2(adjustedTotal - amountCny).toString() },
         after: {
           total: adjustedTotal.toString(),
           amountCny,
@@ -6997,7 +6999,9 @@ export class OrderService {
               });
               continue;
             }
-            applied = amountCny * seatPax;
+            // round2：amountCny 现允许两位小数，浮点乘法会漂（如 0.1 × 3 = 0.30000000000000004），
+            // 统一到分再落库/比对上限，避免半元差额行带着看不见的浮点尾巴进账。
+            applied = round2(amountCny * seatPax);
             unitAmountCny = amountCny;
             paxCount = seatPax;
             // 乘出来的钱可能顶破单笔调整上限 —— 那是单单入口会当场拒绝的金额，批量也不该悄悄写进去。

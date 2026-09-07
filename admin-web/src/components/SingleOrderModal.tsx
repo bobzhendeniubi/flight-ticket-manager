@@ -852,8 +852,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   }, [isBundleOrder, passengers, visaExemptSubmitted, visaStatus]);
   const visaSubmitBlocked = visaContradiction?.blocking === true;
 
-  // 调价有效性：金额为非 0 整数即视为「要调价」；「其它」原因必须补说明。
-  const adjustIsInteger = adjustAmount !== null && Number.isInteger(adjustAmount) && adjustAmount !== 0;
+  // 调价有效性：金额非 0 且最多两位小数（半元差额也要能填）即视为「要调价」；「其它」原因必须补说明。
+  const adjustIsInteger =
+    adjustAmount !== null && adjustAmount !== 0 && Number(adjustAmount.toFixed(2)) === adjustAmount;
   const adjustNeedsText = adjustReason === 'OTHER' && adjustText.trim().length === 0;
   const hasValidAdjustment = adjustIsInteger && !adjustNeedsText;
   const adjustError = adjustIsInteger && adjustNeedsText ? '选择「其它」时请填写调整原因说明' : null;
@@ -2826,9 +2827,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                       className={inputCls}
                       value={adjustAmount}
                       onChange={setAdjustAmount}
-                      integerOnly
+                      step={0.01}
                       allowNegative
-                      placeholder="如 700 或 -200"
+                      placeholder="如 700 或 -200.5"
                     />
                   </label>
                   <label className="text-xs text-slate-500">
