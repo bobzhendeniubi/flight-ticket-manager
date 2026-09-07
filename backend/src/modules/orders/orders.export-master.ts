@@ -42,7 +42,7 @@ import {
   perPaxSingleRoomDiffByPassenger,
   allPassengersVisaExempt,
   pnrName,
-  withoutAgentHiddenColumns,
+  AGENT_HIDDEN_EXPORT_KEYS,
 } from './orders.export-templates.js';
 import { appendHoldOrderSheet, loadHoldExportRows } from './orders.export-hold-orders.js';
 import { GUEST_RECORDED_BY_LABEL } from './orders.service.js';
@@ -304,7 +304,11 @@ const MASTER_COLUMNS: MasterColumn[] = [
 ];
 
 /**
- * 代理视角的**白名单**（运营反馈 0903：代理导出的全岗总表只保留这 13 列，其余一律不给）。
+ * 代理视角的**白名单**（运营反馈 0903：代理导出的全岗总表只保留这 13 列，其余一律不给；
+ * 0906 运营需求：在这基础上**加且只加**「护照号」「证件有效期」两列 → 15 列——代理导出
+ * 只能导自家 + 下级的单，这两项本就是这些出行人交给代理、再由代理交给我方录入系统的，
+ * 不算新泄露面。出生日期/性别/国籍/签发地等其余护照 PII 依旧不给，见下方
+ * MASTER_AGENT_PASSPORT_ALLOW_KEYS 的放行范围说明。不带人名。
  *
  * 为什么是白名单不是黑名单：护照 PII / 内部人员 / 供应商成本 / 内部运营指标用共享黑名单
  * AGENT_HIDDEN_EXPORT_KEYS 已经裁掉了，但运营要的比这更少——代理自己的账目列（立减 / 尾款 /
@@ -326,16 +330,35 @@ export const AGENT_MASTER_ALLOWED_KEYS: ReadonlySet<keyof MasterRow> = new Set<k
   'cabin',
   'settlePrice',
   'visaStatus',
+  'documentNumber', // 0906 加列：护照号（代理自家 + 下级单，本就是代理交来的证件）
+  'expiryDate', // 0906 加列：证件有效期
+]);
+
+/**
+ * 与共享黑名单 AGENT_HIDDEN_EXPORT_KEYS 的**唯一分歧点**：护照号（documentNumber）与
+ * 证件有效期（expiryDate）两列，本表（全岗总表）的代理视图单独放行（0906 运营需求）；
+ * 三模板（orders.export-templates.ts 的《全岗可用》/《票务专用》/《签证专用》）不引用
+ * 这个集合，代理视角照样吃共享黑名单整列裁掉——不能直接改 AGENT_HIDDEN_EXPORT_KEYS 本身，
+ * 否则三模板会跟着漏放（黑名单是全站共用的唯一一份，见该文件头部口径说明）。
+ * 出生日期/性别/国籍/签发地/出生地等其余护照 PII 不在这个放行集合里，仍旧照共享黑名单裁掉。
+ */
+const MASTER_AGENT_PASSPORT_ALLOW_KEYS: ReadonlySet<keyof MasterRow> = new Set<keyof MasterRow>([
+  'documentNumber',
+  'expiryDate',
 ]);
 
 /** 按岗位视图筛出可见列（role=all/缺省 → 全部；agent → 白名单；否则保留 roles 命中或未限定 role 的列）。*/
 export function visibleColumns(role: MasterExportRole): MasterColumn[] {
   if (role === 'all') return MASTER_COLUMNS;
   // 代理视角：先过共享脱敏黑名单（与三模板同一份口径，护照 PII / 内部人员 / 供应商成本 / 内部指标），
-  // 再过本表专属白名单（运营拍板的 13 列）。两道都过才给——黑名单保证"敏感的一定没有"，
-  // 白名单保证"没点名的一定没有"。
+  // 但护照号/证件有效期两列本表单独放行（MASTER_AGENT_PASSPORT_ALLOW_KEYS，不改黑名单本身，
+  // 三模板不受影响）；再过本表专属白名单（运营拍板的 15 列）。两道都过才给——黑名单保证
+  // "敏感的一定没有"，白名单保证"没点名的一定没有"。
   if (role === 'agent') {
-    return withoutAgentHiddenColumns(MASTER_COLUMNS).filter((c) => AGENT_MASTER_ALLOWED_KEYS.has(c.key));
+    const afterSharedBlacklist = MASTER_COLUMNS.filter(
+      (c) => MASTER_AGENT_PASSPORT_ALLOW_KEYS.has(c.key) || !AGENT_HIDDEN_EXPORT_KEYS.has(c.key),
+    );
+    return afterSharedBlacklist.filter((c) => AGENT_MASTER_ALLOWED_KEYS.has(c.key));
   }
   return MASTER_COLUMNS.filter((c) => !c.roles || c.roles.includes(role));
 }

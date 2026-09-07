@@ -707,7 +707,7 @@ describe('visibleColumns（role 裁列）', () => {
     expect(headers).not.toContain('可用次数');
   });
 
-  it('agent（代理）= 运营拍板的 13 列白名单，且顺序与全岗序一致（0903 运营反馈模版）', () => {
+  it('agent（代理）= 运营拍板的 13 列白名单 + 0906 加列（护照号/证件有效期）共 15 列，且顺序与全岗序一致', () => {
     const headers = visibleColumns('agent').map((c) => c.header);
     expect(headers).toEqual([
       '序号',
@@ -723,26 +723,29 @@ describe('visibleColumns（role 裁列）', () => {
       '舱位等级',
       '结算价格',
       '签证状态',
+      '证件编号', // 0906 加列：护照号
+      '证件有效期', // 0906 加列：护照有效期
     ]);
   });
 
-  it('agent（代理）白名单之外一律不给：护照 PII / 内部人员 / 供应商成本 / 内部指标 / 代理账目列', () => {
+  it('agent（代理）白名单之外一律不给：除护照号/证件有效期外的护照 PII / 内部人员 / 供应商成本 / 内部指标 / 代理账目列', () => {
     const headers = visibleColumns('agent').map((c) => c.header);
+    // 0906 运营拍板：白名单在原 13 列之外只加这两列，其余护照 PII 依旧不给。
+    expect(headers).toContain('证件编号');
+    expect(headers).toContain('证件有效期');
     for (const h of [
       // 内部账与成本 / 风控
       '订单成本',
       '签证公司',
       '签证备注',
       '航段状态',
-      // 护照/身份 PII
+      // 护照/身份 PII（护照号/证件有效期已于 0906 单独放行，不在此列）
       '乘客生日',
       '乘客类型',
       '性别',
       '国籍',
       '证件类型',
-      '证件编号',
       '证件签发日',
-      '证件有效期',
       '护照签发地',
       '出生地',
       // 纯内部运营信息
@@ -765,9 +768,15 @@ describe('visibleColumns（role 裁列）', () => {
     ]) {
       expect(headers).not.toContain(h);
     }
-    // 白名单是共享黑名单的子集之外再收窄：任何黑名单 key 都不可能出现在 agent 视图
+    // 白名单是共享黑名单的子集之外再收窄，唯一例外是 0906 单独放行的 documentNumber/expiryDate
+    // （见 orders.export-master.ts 的 MASTER_AGENT_PASSPORT_ALLOW_KEYS）：
+    // 黑名单其余 key 都不可能出现在 agent 视图。
     const agentKeys = new Set(visibleColumns('agent').map((c) => c.key as string));
-    for (const k of AGENT_HIDDEN_EXPORT_KEYS) expect(agentKeys.has(k)).toBe(false);
+    const MASTER_AGENT_PASSPORT_ALLOW_KEYS = new Set(['documentNumber', 'expiryDate']);
+    for (const k of AGENT_HIDDEN_EXPORT_KEYS) {
+      if (MASTER_AGENT_PASSPORT_ALLOW_KEYS.has(k)) continue;
+      expect(agentKeys.has(k)).toBe(false);
+    }
   });
 
   it('所有视图都保留通用列（序号/代理机构/乘客中文名）；订单编号内部视图都有、代理白名单不含', () => {
