@@ -283,8 +283,9 @@ const BULK_ORDER_LIMIT = 100;
 // 勾选导出单次上限 —— 与后端 MAX_EXPORT_ORDER_IDS 对齐。真分页后勾选可以跨页累加，
 // 翻三页各全选一次就能勾出 600 条，不在前端先拦，点导出才被服务端整体 400 打回。
 const EXPORT_SELECTION_LIMIT = 500;
-// 导出只收「仍占座」的状态（与后端 EXPORT_COUNTED_STATUSES 同一份清单）：运营把状态筛成
-// 已取消/已退款/超时再点导出，服务端会给一张空表——按钮上直接说清，别让人导完才发现。
+// 主导出只收「仍占座」的状态（与后端 EXPORT_COUNTED_STATUSES 同一份清单）：运营把状态筛成
+// 已取消/已退款/超时再点主导出，服务端会给一张空表——按钮上直接说清，并指向旁边的
+// 「已取消/退款单导出」，别让人导完才发现。
 const EXPORTABLE_STATUSES: ReadonlySet<OrderStatus> = new Set<OrderStatus>([
   'PENDING_PAYMENT',
   'PAID',
@@ -293,6 +294,15 @@ const EXPORTABLE_STATUSES: ReadonlySet<OrderStatus> = new Set<OrderStatus>([
   'COMPLETED',
   'CHANGE_REQUESTED',
   'CHANGED',
+]);
+// 已释放座位的状态（与后端 EXPORT_RELEASED_STATUSES 同一份清单）：主导出一条都不导，
+// 单独走「已取消/退款单导出」按钮（scope=released）。DRAFT 不在内（草稿单没占过座）。
+const RELEASED_EXPORT_STATUSES: ReadonlySet<OrderStatus> = new Set<OrderStatus>([
+  'CANCELLED',
+  'REFUND_REQUESTED',
+  'REFUNDED',
+  'PAYMENT_TIMEOUT',
+  'FAILED',
 ]);
 const BATCH_RESCHEDULE_ORDER_LIMIT = 500;
 // 批量锁收款 / 批量调价没有各自的后端条数上限（不像上面几个批量端点有 Zod .max()），
@@ -1145,6 +1155,8 @@ export function OrdersPage() {
   const [exporting, setExporting] = useState(false);
   // 全岗总表导出（一行/乘客·字段全）
   const [exportingMaster, setExportingMaster] = useState(false);
+  // 已取消/退款单导出（全岗总表格式 + scope=released）——主导出不含这些单，单独一个入口
+  const [exportingReleased, setExportingReleased] = useState(false);
   // 进单统计导出（公测反馈·票务：出发日期 × 产品/团期 × 人数）
   const [exportingIntake, setExportingIntake] = useState(false);
   // 票务开票快捷导出 — 某日某航段需开票订单（《票务专用》= 航司 PNR 模板）
@@ -1291,20 +1303,27 @@ export function OrdersPage() {
 
   // 导出按钮上的条数口径：无勾选时 = 后端命中总数（列表与导出现在是同一套筛选，含状态）。
   // 两个例外必须在按钮上说出来，否则数字就是假的：
-  //   · 状态筛成释放型（已取消/已退款/超时…）→ 导出为空表，按钮禁用并直说；
+  //   · 状态筛成释放型（已取消/已退款/超时…）→ 主导出为空表，按钮禁用并指向「已取消/退款单导出」；
   //   · 接单状态筛选（只看未接单）导出端点不收 → 不报条数，只说「按筛选（不含接单状态）」。
   const exportStatusBlocked = Boolean(statusFilter) && !EXPORTABLE_STATUSES.has(statusFilter as OrderStatus);
   const exportIgnoresClaim = claimFilter !== '';
   const exportScopeLabel = exportStatusBlocked
-    ? '该状态不进导出'
+    ? '该状态走取消单导出'
     : exportIgnoresClaim
       ? '按筛选，不含接单状态'
       : `筛选命中 ${ordersTotal ?? 0} 条`;
   const exportScopeTitle = exportStatusBlocked
-    ? '已取消/已退款/支付超时等已释放座位的订单不进任何导出；请把「状态」改回全部或占座中的状态再导。'
+    ? '已取消/已退款/支付超时等已释放座位的订单不进主导出；要导这批单请点右边的「已取消/退款单导出」，或把「状态」改回全部/占座中的状态再用本按钮。'
     : exportIgnoresClaim
       ? '导出端点不认「接单状态」筛选，会按其余筛选导出全部命中订单（含已接单的）。'
-      : `按上方筛选导出命中的全部 ${ordersTotal ?? 0} 条（不只是当前页）；未筛状态时已取消/已退款/超时的单不进导出，实际行数可能略少`;
+      : `按上方筛选导出命中的全部 ${ordersTotal ?? 0} 条（不只是当前页）；未筛状态时已取消/已退款/超时的单不进导出（要这批单请用「已取消/退款单导出」），实际行数可能略少`;
+  // 「已取消/退款单导出」按筛选走（不按勾选）。状态筛成占座类（如已出票）与本入口天然矛盾，
+  // 直接禁用并说清怎么办 —— 好过导回一张按别的口径出的表，让人对着数字猜。
+  const releasedExportConflict =
+    Boolean(statusFilter) && !RELEASED_EXPORT_STATUSES.has(statusFilter as OrderStatus);
+  const releasedExportTitle = releasedExportConflict
+    ? '当前「状态」筛的是占座中的订单，与本入口冲突；把状态改回全部，或选已取消/退款申请中/已退款/支付超时/失败其中之一，再点本按钮。'
+    : '导出已取消、退款申请中、已退款、支付超时、失败的订单（座位已释放）——主导出不含这些单。沿用上方其余筛选（下单时间/出行日期/代理/渠道等），按筛选导出，不按勾选。';
 
   // 列表请求参数 = 共用筛选 + 状态 + 当前页。
   const listQuery = useMemo<ListOrdersParams>(
@@ -2543,6 +2562,43 @@ export function OrdersPage() {
     }
   };
 
+  // 已取消/退款单导出 — 全岗总表同一张表，只是范围换成「已释放座位的单」（scope=released）。
+  // 主导出（上面两个按钮）的口径一个字没动：不筛状态时仍只导有效单。运营要对账取消/退款单
+  // 就走这里，两边互不干扰。按筛选导出，不按勾选（勾选场景上面两个按钮已经能导取消单了）。
+  const handleReleasedExport = async () => {
+    if (!tokens?.accessToken) return;
+    setExportingReleased(true);
+    try {
+      // 状态若筛的是释放型状态（如只要「已退款」），随 exportFilter 带上，后端收窄到那一个；
+      // 筛的是占座类状态时按钮本就禁用，走不到这里。
+      const blob = await api.exportMaster(tokens.accessToken, {
+        ...exportFilter,
+        role: 'all',
+        scope: 'released',
+      });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      // 文件名区间标签与全岗总表同口径：优先出行日期，没填就用下单时间，都没填写「全部」。
+      const resolvedTravel = travelDateRange(travelFrom, travelTo);
+      const rangeLabel =
+        resolvedTravel.travelFrom || resolvedTravel.travelTo
+          ? `${resolvedTravel.travelFrom || '全部'}_${resolvedTravel.travelTo || '全部'}`
+          : createdFromParam || createdToParam
+            ? `${(createdFromParam || '全部').replace(/:/g, '-')}_${(createdToParam || '全部').replace(/:/g, '-')}`
+            : '全部_全部';
+      a.download = `已取消退款单_${rangeLabel}.xlsx`;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      alert(err instanceof ApiError ? `导出失败：${err.message}` : '导出失败');
+    } finally {
+      setExportingReleased(false);
+    }
+  };
+
   // 进单统计导出（公测反馈·票务）— 按当前筛选（尤其下单时间窗口）导出「出发日期 × 产品/团期」进单表。
   const handleIntakeExport = async () => {
     if (!tokens?.accessToken) return;
@@ -2746,7 +2802,7 @@ export function OrdersPage() {
             onClick={() => void handleTemplateExport()}
             title={
               selectedIds.size > 0
-                ? `只导出已勾选的 ${selectedIds.size} 条订单（忽略上方筛选）`
+                ? `只导出已勾选的 ${selectedIds.size} 条订单（忽略上方筛选）。勾选导出按勾选为准，含已取消/退款的单——勾了就导，不会被状态筛掉。`
                 : `${exportScopeTitle}；「下单时间」周期用于佣金/提成/客户统计`
             }
           >
@@ -2762,7 +2818,7 @@ export function OrdersPage() {
             onClick={() => void handleMasterExport()}
             title={
               selectedIds.size > 0
-                ? `只导出已勾选的 ${selectedIds.size} 条订单（全岗综合台账，忽略上方筛选）`
+                ? `只导出已勾选的 ${selectedIds.size} 条订单（全岗综合台账，忽略上方筛选）。勾选导出按勾选为准，含已取消/退款的单——勾了就导，不会被状态筛掉。`
                 : `全岗综合台账：一行一位乘客，涵盖机票/酒店/签证/付款全字段。${exportScopeTitle}；不筛=全部。`
             }
           >
@@ -2771,6 +2827,18 @@ export function OrdersPage() {
               : selectedIds.size > 0
                 ? <><Icon name="list" /> 导出全岗总表（已勾选 {selectedIds.size} 条）</>
                 : <><Icon name="list" /> 导出全岗总表（{exportScopeLabel}）</>}
+          </button>
+          {/* 已取消/退款单导出 —— 主导出不含这批单（座位已释放），单独一个入口给运营对账。
+              全岗总表同一张表、同一套筛选，只把范围换成 scope=released。按筛选导，不按勾选。 */}
+          <button
+            className="btn-secondary text-sm"
+            disabled={loading || exportingReleased || releasedExportConflict}
+            onClick={() => void handleReleasedExport()}
+            title={releasedExportTitle}
+          >
+            {exportingReleased
+              ? '导出中…'
+              : <><Icon name="download" /> 已取消/退款单导出</>}
           </button>
           <button
             className="btn-secondary text-sm"

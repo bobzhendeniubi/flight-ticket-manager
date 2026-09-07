@@ -13,7 +13,9 @@
  *      故意宽召回。另叠加：
  *        · includeAnchorless —— 导出独有：一个日期锚点都没有的**签证单**也取回
  *          （纯签证单不能因为没填预计出行日期就整批从岗位手上消失）；
- *        · EXPORT_COUNTED_STATUSES —— 排除释放型状态（已取消/超时/失败/退款申请中）；
+ *        · 状态闸 —— 按 scope 二选一：缺省 active 走 EXPORT_COUNTED_STATUSES（排除已取消/
+ *          超时/失败/退款类），released 走 EXPORT_RELEASED_STATUSES（只导这批，独立入口用）；
+ *          勾选导出不叠状态闸（详见 applyExportStatusScope）；
  *        · agentScope —— 代理只导自己 + 下级（AND 交集，勾选导出同受此闸）。
  *
  *   2. 内存精筛（filterExportOrders）—— Prisma where 表达不了的部分：
@@ -21,7 +23,7 @@
  *      各分支的口径注释在各自的实现文件里，本模块只负责按正确顺序串起来。
  *
  * 两个短路口径原样保留，不能顺手统一：
- *   · orderIds（勾选导出）—— 用户勾了哪些就导哪些，取数与精筛全部短路；
+ *   · orderIds（勾选导出）—— 用户勾了哪些就导哪些，取数与精筛全部短路，状态闸也不叠；
  *   · scheduleId（整班·全岗精确导出）—— 取数已按班次精确圈定，日期类精筛不适用，
  *     但单程/往返筛选照常生效（它与班次无关）。
  */
@@ -56,8 +58,31 @@ export const EXPORT_COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.CHANGED,
 ];
 
-/** 选单用到的筛选字段：列表同款筛选 + 勾选导出 / 整班导出两个短路开关。*/
-export type ExportSelectionFilters = OrderListFilters;
+/**
+ * 已释放座位的订单：已取消 / 退款申请中 / 已退款 / 支付超时 / 失败。
+ *
+ * 主导出（scope=active）一条都不导，这是有意的：名单、送签、分房这些表是拿去办事的，
+ * 混进取消单会照着做无用功。但运营确实要单独把这批单捞出来对账，故给一个**独立入口**
+ *（scope=released），而不是把它们塞回主导出——两边口径互不影响。
+ *
+ * DRAFT 不在内：草稿单从来没占过座、也没成过单，不属于「取消/退款」这件事。
+ */
+export const EXPORT_RELEASED_STATUSES: OrderStatus[] = [
+  OrderStatus.CANCELLED,
+  OrderStatus.REFUND_REQUESTED,
+  OrderStatus.REFUNDED,
+  OrderStatus.PAYMENT_TIMEOUT,
+  OrderStatus.FAILED,
+];
+
+/**
+ * 导出范围：active=有效单（缺省，即现状）；released=已取消/退款类单（独立入口）。
+ * 只切换状态集合这一条，日期/代理/渠道/勾选等其余筛选两种范围下完全一致。
+ */
+export type ExportScope = 'active' | 'released';
+
+/** 选单用到的筛选字段：列表同款筛选 + 勾选导出 / 整班导出两个短路开关 + 导出范围。*/
+export type ExportSelectionFilters = OrderListFilters & { scope?: ExportScope };
 
 /**
  * 取数 where：列表同款筛选 + 无锚点签证单召回 + 有效状态 + 代理可见集合。
@@ -77,10 +102,42 @@ export function buildExportOrderWhere(
   const effectiveQuery = opts?.agentScope != null ? withoutAgentHiddenFilters(query) : query;
   const where = buildOrderFilterWhere(effectiveQuery, { includeAnchorless: true });
   const and = Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : [];
-  and.push({ status: { in: EXPORT_COUNTED_STATUSES } });
+  applyExportStatusScope(where, and, query);
   if (opts?.extraAnd?.length) and.push(...opts.extraAnd);
   where.AND = and;
   return applyExportAgentScope(where, opts?.agentScope);
+}
+
+/**
+ * 状态闸：按导出范围决定这次导哪一组状态。三条互斥的路，都写在这一处。
+ *
+ * 1) 勾选导出（orderIds）—— **不叠任何状态闸**：勾了哪些就导哪些。
+ *    此前这里照叠 COUNTED_STATUSES，于是运营勾了几张已取消单点导出，那几行**静默消失**，
+ *    表里既没有行也没有提示，只能挨个数才发现少了。软删仍然不导（buildOrderFilterWhere
+ *    的 orderIds 短路里就带着 deletedAt: null），那是「这单已经不存在」，与状态无关。
+ * 2) scope=released —— 已取消/退款类单的独立入口。
+ *    query.status 明确给了且本就属于该集合（例：只要「已退款」）→ 收窄到那一个状态；
+ *    否则按整组释放型状态导。后一支要连 where.status 一起清掉：占座类状态（例「已出票」）
+ *    与本范围天然矛盾，留着它会 AND 成空表，运营拿到一张没有行、也没有原因的表。
+ *    调用方（运营后台）在按钮上已把这种矛盾拦掉，这里是服务端兜底。
+ * 3) 缺省 scope=active —— 现状：只导仍占座的有效单。
+ */
+function applyExportStatusScope(
+  where: Prisma.OrderWhereInput,
+  and: Prisma.OrderWhereInput[],
+  query: ExportSelectionFilters,
+): void {
+  if (query.orderIds && query.orderIds.length > 0) return;
+
+  if (query.scope === 'released') {
+    const pickedOne =
+      query.status && EXPORT_RELEASED_STATUSES.includes(query.status) ? query.status : null;
+    if (!pickedOne) delete where.status; // 与本范围矛盾的占座类状态筛选，清掉而不是 AND 成空表
+    and.push({ status: { in: pickedOne ? [pickedOne] : EXPORT_RELEASED_STATUSES } });
+    return;
+  }
+
+  and.push({ status: { in: EXPORT_COUNTED_STATUSES } });
 }
 
 /**
@@ -158,6 +215,9 @@ export function describeOrderFilters(query: ExportSelectionFilters): string {
     const v = query[key];
     return v === undefined || v === '' ? [] : [`${label}=${String(v)}`];
   });
+  // 导出范围放在最前：同一批筛选条件下，导的是有效单还是取消/退款单，
+  // 是这份表最要紧的一句话，事后查审计一眼要看见。
+  if (query.scope === 'released') parts.unshift('范围=已取消/退款单');
   // invoiced 是布尔，单独成句（false 也要出现，不能被 falsy 吞掉）。
   if (query.invoiced !== undefined) parts.push(`已开票=${query.invoiced ? '是' : '否'}`);
   return parts.length > 0 ? parts.join('，') : '全部';
@@ -173,6 +233,8 @@ export function serializableOrderFilters(
     out[key] = v === undefined || v === '' ? null : String(v);
   }
   out.invoiced = query.invoiced ?? null;
+  // 范围恒落值（缺省写 active），别让「老版本没这个字段」与「这次导的是有效单」长得一样。
+  out.scope = query.scope ?? 'active';
   return out;
 }
 

@@ -22,6 +22,7 @@ import {
   filterExportOrders,
   serializableOrderFilters,
   EXPORT_COUNTED_STATUSES,
+  EXPORT_RELEASED_STATUSES,
   type ExportSelectionFilters,
 } from './orders.export-selection.js';
 
@@ -191,6 +192,81 @@ describe('buildExportOrderWhere · 取数 where', () => {
     }) as Where;
     expect(and(where)).toContainEqual({ items: { some: { kind: 'FLIGHT' } } });
     expect(and(where)).toContainEqual({ status: { in: EXPORT_COUNTED_STATUSES } });
+  });
+
+  // ── 导出范围 scope（已取消/退款单的独立入口）────────────────────────────
+  // 主导出口径不动是硬要求：名单/送签/分房这些拿去办事的表混进取消单，就会照着做无用功。
+  // 取消/退款单单独走 scope=released，两套状态集合零交集、互不影响。
+  describe('scope · 导出范围', () => {
+    it('缺省 = active：仍只导有效单（主导出口径一个字没变）', () => {
+      expect(and(buildExportOrderWhere(f({})) as Where)).toContainEqual({
+        status: { in: EXPORT_COUNTED_STATUSES },
+      });
+      expect(and(buildExportOrderWhere(f({ scope: 'active' })) as Where)).toContainEqual({
+        status: { in: EXPORT_COUNTED_STATUSES },
+      });
+    });
+
+    it('released：整组释放型状态；DRAFT 不在内（草稿单没占过座，不属于取消/退款）', () => {
+      const where = buildExportOrderWhere(f({ scope: 'released' })) as Where;
+      expect(and(where)).toContainEqual({ status: { in: EXPORT_RELEASED_STATUSES } });
+      expect(EXPORT_RELEASED_STATUSES).toEqual([
+        'CANCELLED',
+        'REFUND_REQUESTED',
+        'REFUNDED',
+        'PAYMENT_TIMEOUT',
+        'FAILED',
+      ]);
+      expect(EXPORT_RELEASED_STATUSES).not.toContain('DRAFT');
+      // 两套集合零交集 —— 同一张单只会出现在其中一个入口里，不会两边都导出来。
+      expect(EXPORT_RELEASED_STATUSES.filter((s) => EXPORT_COUNTED_STATUSES.includes(s))).toEqual(
+        [],
+      );
+    });
+
+    it('released + 明确给了释放型状态：收窄到那一个（只要「已退款」）', () => {
+      const where = buildExportOrderWhere(f({ scope: 'released', status: 'REFUNDED' })) as Where;
+      expect(and(where)).toContainEqual({ status: { in: ['REFUNDED'] } });
+    });
+
+    it('released + 占座类状态：清掉矛盾的状态筛选，按整组导（不 AND 成空表）', () => {
+      const where = buildExportOrderWhere(f({ scope: 'released', status: 'TICKETED' })) as Where;
+      expect(where.status).toBeUndefined();
+      expect(and(where)).toContainEqual({ status: { in: EXPORT_RELEASED_STATUSES } });
+    });
+
+    it('released：日期 / 渠道 / 代理等其余筛选照常生效', () => {
+      const where = buildExportOrderWhere(
+        f({ scope: 'released', channel: 'direct', from: '2026-09-01' }),
+      ) as Where;
+      expect(and(where)).toContainEqual({ agentId: null });
+      expect(where.createdAt).toBeDefined();
+      expect(and(where)).toContainEqual({ status: { in: EXPORT_RELEASED_STATUSES } });
+    });
+
+    it('released + agentScope：代理也能导，但只圈到自己 + 下级', () => {
+      const where = buildExportOrderWhere(f({ scope: 'released' }), {
+        agentScope: ['agt-self', 'agt-child'],
+      }) as Where;
+      expect(and(where)).toContainEqual({ agentId: { in: ['agt-self', 'agt-child'] } });
+      expect(and(where)).toContainEqual({ status: { in: EXPORT_RELEASED_STATUSES } });
+    });
+
+    it('勾选导出不叠状态闸：勾了已取消单也导，软删仍不导', () => {
+      const where = buildExportOrderWhere(f({ orderIds: ['o1', 'o2'] })) as Where;
+      expect(where.id).toEqual({ in: ['o1', 'o2'] });
+      expect(where.deletedAt).toBeNull();
+      expect(and(where).some((c) => 'status' in c)).toBe(false);
+    });
+
+    it('审计摘要点名范围，结构化留痕缺省落 active', () => {
+      expect(describeOrderFilters(f({ scope: 'released', agentId: 'agt-1' }))).toContain(
+        '范围=已取消/退款单',
+      );
+      expect(describeOrderFilters(f({}))).toBe('全部');
+      expect(serializableOrderFilters(f({ scope: 'released' })).scope).toBe('released');
+      expect(serializableOrderFilters(f({})).scope).toBe('active');
+    });
   });
 });
 

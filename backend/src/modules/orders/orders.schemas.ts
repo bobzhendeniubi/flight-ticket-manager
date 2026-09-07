@@ -745,6 +745,12 @@ export const orderIdsQuerySchema = z
     message: `一次最多导出 ${MAX_EXPORT_ORDER_IDS} 条勾选订单`,
   });
 
+// ── 导出范围：active（缺省）= 有效单 / released = 已取消·退款类单 ──────────
+// 主导出口径不动（不筛状态时仍只导仍占座的有效单）；运营要对账取消/退款单时走
+// scope=released 这个独立入口，两边互不影响。状态集合见
+// orders.export-selection.ts 的 EXPORT_COUNTED_STATUSES / EXPORT_RELEASED_STATUSES。
+export const exportScopeQuerySchema = z.enum(['active', 'released']).optional();
+
 // ── 三模板筛选导出（全岗可用 / 票务专用 / 签证专用）────────────────────────
 // 与 listOrders 共用同一组筛选字段（status/agentId/kind/search/from/to/
 // travelFrom/travelTo/flightNumber/passengerName/invoiceStatus），外加 template。
@@ -785,6 +791,8 @@ export const exportTemplatesQuerySchema = listOrdersQuerySchema
     tripType: z.enum(['oneway', 'roundtrip']).optional(),
     // 勾选导出：给了就以这批 id 为准（忽略其余筛选），无则按上面的筛选条件。
     orderIds: orderIdsQuerySchema,
+    // 导出范围：缺省 active=有效单（现状）；released=已取消/退款类单的独立入口。
+    scope: exportScopeQuerySchema,
   });
 export type ExportTemplatesQuery = z.infer<typeof exportTemplatesQuerySchema>;
 
@@ -826,6 +834,9 @@ export const exportMasterQuerySchema = listOrdersQuerySchema
     role: z.enum(['all', 'ticketing', 'visa']).optional(),
     // 勾选导出：给了就以这批 id 为准（忽略上述筛选，见 buildOrderFilterWhere）。
     orderIds: orderIdsQuerySchema,
+    // 导出范围：缺省 active=有效单（现状）；released=已取消/退款类单的独立入口
+    //（运营后台「已取消/退款单导出」按钮走的就是本表 + scope=released）。
+    scope: exportScopeQuerySchema,
   });
 export type ExportMasterQuery = z.infer<typeof exportMasterQuerySchema>;
 

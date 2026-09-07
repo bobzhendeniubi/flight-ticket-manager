@@ -4,6 +4,7 @@
  * 覆盖两处：
  *   1) orderIdsQuerySchema / exportTemplatesQuerySchema — 逗号分隔 & 重复参数、去重、去空、上限校验。
  *   2) buildOrderFilterWhere — 给了 orderIds 就以 id 集合为准（忽略其余筛选）；无则按现有筛选。
+ *   3) buildExportOrderWhere — 勾选导出不叠状态闸（勾了已取消单也导），软删仍排除。
  */
 import { describe, it, expect, vi } from 'vitest';
 
@@ -16,6 +17,7 @@ import {
   MAX_EXPORT_ORDER_IDS,
 } from './orders.schemas.js';
 import { applyExportAgentScope, buildOrderFilterWhere } from './orders.service.js';
+import { buildExportOrderWhere } from './orders.export-selection.js';
 
 describe('orderIdsQuerySchema — 勾选 id 规整', () => {
   it('逗号分隔字符串 → 去重后的数组', () => {
@@ -96,16 +98,19 @@ describe('buildOrderFilterWhere — 勾选导出 vs 筛选导出', () => {
     expect(Array.isArray(where.AND)).toBe(true);
   });
 
-  it('给了 orderIds：调用方仍可在 where.AND 追加 COUNTED_STATUSES 保护', () => {
-    // 复刻各导出入口的叠加方式，确认 id 集合 + 状态保护共存。
-    const where = buildOrderFilterWhere({
+  it('给了 orderIds：导出入口不再叠状态闸（勾了已取消单也导，软删仍不导）', () => {
+    // 旧口径是「id 集合 + COUNTED_STATUSES 保护共存」——于是勾了几张已取消单点导出，
+    // 那几行静默消失，表里既没有行也没有提示，只能挨个数才发现少了。
+    // 新口径：勾选导出以勾选为准，状态一律不闸。
+    const where = buildExportOrderWhere({
       orderIds: ['a'],
-    } as Parameters<typeof buildOrderFilterWhere>[0]);
+    } as Parameters<typeof buildExportOrderWhere>[0]);
     const and = Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : [];
-    and.push({ status: { in: ['PAID'] } as never });
-    where.AND = and;
     expect(where.id).toEqual({ in: ['a'] });
-    expect(where.AND).toEqual([{ status: { in: ['PAID'] } }]);
+    expect(and.some((c) => c !== null && typeof c === 'object' && 'status' in c)).toBe(false);
+    expect(where.status).toBeUndefined();
+    // 软删的单即便被勾中也不导（那是「这单已经不存在」，与状态无关）。
+    expect(where.deletedAt).toBeNull();
   });
 });
 

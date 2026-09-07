@@ -2243,6 +2243,14 @@ export interface OrdersExportFilterParams {
   legFlag?: OrderLegFlagFilter;
   /** 勾选导出：给了就只导这批订单（后端以 id 集合为准，忽略其余筛选）。上限 500 条。 */
   orderIds?: string[];
+  /**
+   * 导出范围。缺省（等价 'active'）= 主导出口径：不筛状态时只导仍占座的有效单，
+   * 已取消 / 退款申请中 / 已退款 / 支付超时 / 失败一概不进。
+   * 'released' = 反过来，**只**导上面那批已释放座位的单 —— 运营对账用的独立入口，
+   * 主导出口径不因此变动一个字。
+   * 两种范围下日期 / 代理 / 渠道等其余筛选完全一致；勾选导出（orderIds）不受本参数影响。
+   */
+  scope?: 'active' | 'released';
 }
 
 /** GET /orders/export-templates 查询参数 = 导出共用筛选 + template（+ 可选班次） */
