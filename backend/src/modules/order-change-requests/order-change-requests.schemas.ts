@@ -8,6 +8,7 @@
  */
 import { OrderChangeKind, OrderChangeRequestStatus, VisaRequirement } from '@prisma/client';
 import { z } from 'zod';
+import { POST_SALE_FEE_CAP_CNY } from '../orders/orders.schemas.js';
 
 /** 申请说明：提交人填的一句话。 */
 const noteSchema = z.string().max(200, '申请说明最多 200 字').optional();
@@ -64,8 +65,35 @@ export const batchOrderChangeRequestBodySchema = z.object({
 });
 export type BatchOrderChangeRequestBody = z.infer<typeof batchOrderChangeRequestBodySchema>;
 
+/**
+ * 改班次申请的执行方式（运营在**点确认这一刻**选，代理提交侧没有这些字段）。
+ *
+ *   · CORRECTION（缺省 = 一直以来的行为）：走纠错通道，差价恒 0、不撤立减、不推状态。
+ *   · AFTER_SALES：行程真的变了，按售后改期办 —— 收改期费、撤套餐立减、推状态，
+ *     与运营手工走 PATCH /orders/:id/reschedule 完全同一条路径同一套语义。
+ *
+ * feeCny 只允许 ≥0：售后改期本身支持负差价（改到便宜班次退差），但那是运营主动发起的
+ * 退费决定，不该藏在「确认一条代理申请」这个动作里 —— 要退差走改期表单本身。
+ * 上限沿用售后费同一档，金额口径不在这里另起一套。
+ */
+export const orderChangeExecutionSchema = z.object({
+  mode: z.enum(['CORRECTION', 'AFTER_SALES']),
+  feeCny: z
+    .number()
+    .int('改期费必须为整数（CNY）')
+    .min(0, '改期费不能为负')
+    .max(POST_SALE_FEE_CAP_CNY, `改期费超出上限（${POST_SALE_FEE_CAP_CNY}）`)
+    .optional(),
+  feeLabel: z.string().trim().max(120, '费用名目最多 120 字').optional(),
+  note: z.string().max(500, '备注最多 500 字').optional(),
+});
+export type OrderChangeExecution = z.infer<typeof orderChangeExecutionSchema>;
+
 export const decideOrderChangeRequestBodySchema = z.object({
   decisionNote: z.string().max(200, '备注最多 200 字').optional(),
+  // 改班次专用：执行方式（纠错 / 按售后改期收费）。缺省 = 纠错，与历史行为一字不差。
+  // 其余 kind 传了会在 service 里按 kind 拒掉（400），不静默忽略。
+  execution: orderChangeExecutionSchema.optional(),
   // 换酒店确认专用：套餐档次与换入酒店星级不符时，换酒店通道要求写明放行原因才过
   //（字段名与录单/换酒店端点一致，前端一套表单复用）。其余 kind 传了也不起作用。
   designatedHotelStarMismatchReason: z

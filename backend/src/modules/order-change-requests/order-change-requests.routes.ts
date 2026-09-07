@@ -120,6 +120,9 @@ export const orderChangeRequestRoutes: FastifyPluginAsync = async (app) => {
         decidedById: request.decidedById,
         decisionNote: request.decisionNote,
         appliedAt: request.appliedAt,
+        // 改班次申请的执行方式：纠错（不动钱）还是按售后改期（收改期费、撤立减、推状态）。
+        // 同一条申请两种走法差着一笔真金白银，审计里必须看得出来。
+        execution: { mode: audit.executionMode ?? 'CORRECTION', feeCny: audit.executionFeeCny ?? 0 },
       },
       severity: 'WARNING',
     });
@@ -179,6 +182,8 @@ export const orderChangeRequestRoutes: FastifyPluginAsync = async (app) => {
           requestedById: audit.requestedById,
           decidedById: request.decidedById,
           appliedAt: request.appliedAt,
+          // 批量确认没有执行方式入口，一律纠错执行（不动钱）。
+          execution: { mode: audit.executionMode ?? 'CORRECTION', feeCny: audit.executionFeeCny ?? 0 },
           batchApprove: true,
         },
         severity: 'WARNING',

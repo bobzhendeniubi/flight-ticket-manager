@@ -7546,6 +7546,19 @@ export interface OrderChangeRequest {
   createdAt: string;
 }
 
+/**
+ * 改班次申请的执行方式（运营在确认那一刻二选一，代理提交侧没有这些字段）：
+ *   · CORRECTION（缺省）：纠错执行 —— 差价恒 0、不撤立减、不推状态；
+ *   · AFTER_SALES：按售后改期执行 —— 收改期费、撤销套餐立减、按售后语义推状态。
+ * feeCny 为整数 CNY 且 ≥0（要退差价走改期表单本身，不从确认申请这条路走）。
+ */
+export interface OrderChangeExecution {
+  mode: 'CORRECTION' | 'AFTER_SALES';
+  feeCny?: number;
+  feeLabel?: string;
+  note?: string;
+}
+
 export interface OrderChangeRequestBatchResultItem {
   orderId: string;
   orderNumber: string | null;
@@ -7630,11 +7643,16 @@ export const orderChangeRequestsApi = {
 
   /** 运营确认执行：服务端调用既有纠错改航班/签证状态/换酒店/升舱端点并重新计价（如涉及）。
    *  失败为 400（申请仍留在 PENDING，applyError 会被服务端记下，message 原样展示即可）；
-   *  其中「放行原因」类 400（指定酒店星级与套餐档次不符）可带 designatedHotelStarMismatchReason 重试。 */
+   *  其中「放行原因」类 400（指定酒店星级与套餐档次不符）可带 designatedHotelStarMismatchReason 重试。
+   *  execution 只对 FLIGHT 申请有效（其余 kind 传了服务端 400）：缺省 = 纠错执行（不动钱）。 */
   approveOrderChangeRequest: (
     token: string,
     id: string,
-    body?: { decisionNote?: string; designatedHotelStarMismatchReason?: string },
+    body?: {
+      decisionNote?: string;
+      designatedHotelStarMismatchReason?: string;
+      execution?: OrderChangeExecution;
+    },
   ) =>
     apiFetch<{ request: OrderChangeRequest; order: OrderSummary }>(
       `/order-change-requests/${id}/approve`,

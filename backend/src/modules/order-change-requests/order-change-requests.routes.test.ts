@@ -350,6 +350,70 @@ describe('改单申请路由', () => {
       expect(serviceMocks.approve).not.toHaveBeenCalled();
     });
 
+    it('按售后改期执行 → execution 原样透传，审计带模式与改期费', async () => {
+      serviceMocks.approve.mockResolvedValue({
+        ...approved,
+        audit: {
+          ...approved.audit,
+          kind: OrderChangeKind.FLIGHT,
+          summary: '去程 2026-09-12 QH0001 → 2026-09-13 QH0001',
+          executionMode: 'AFTER_SALES',
+          executionFeeCny: 800,
+        },
+      });
+      const res = await call('POST', '/order-change-requests/req-1/approve', UserRole.ADMIN, {
+        execution: { mode: 'AFTER_SALES', feeCny: 800, feeLabel: '改期费', note: '客人自行改期' },
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(serviceMocks.approve).toHaveBeenCalledWith(
+        { userId: 'u-ADMIN', role: UserRole.ADMIN },
+        'req-1',
+        { execution: { mode: 'AFTER_SALES', feeCny: 800, feeLabel: '改期费', note: '客人自行改期' } },
+      );
+      expect(writeAudit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'ORDER_CHANGE_REQUEST_APPROVED',
+          after: expect.objectContaining({
+            execution: { mode: 'AFTER_SALES', feeCny: 800 },
+          }),
+        }),
+      );
+    });
+
+    it('不带 execution → 审计仍记一笔纠错执行（不动钱）', async () => {
+      serviceMocks.approve.mockResolvedValue({
+        ...approved,
+        audit: { ...approved.audit, executionMode: 'CORRECTION', executionFeeCny: 0 },
+      });
+      const res = await call('POST', '/order-change-requests/req-1/approve', UserRole.STAFF, {});
+
+      expect(res.statusCode).toBe(200);
+      expect(writeAudit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          after: expect.objectContaining({ execution: { mode: 'CORRECTION', feeCny: 0 } }),
+        }),
+      );
+    });
+
+    it('改期费为负 → 400（zod），不触服务', async () => {
+      const res = await call('POST', '/order-change-requests/req-1/approve', UserRole.ADMIN, {
+        execution: { mode: 'AFTER_SALES', feeCny: -100 },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error.message).toContain('改期费不能为负');
+      expect(serviceMocks.approve).not.toHaveBeenCalled();
+    });
+
+    it('改期费不是整数 → 400（zod），不触服务', async () => {
+      const res = await call('POST', '/order-change-requests/req-1/approve', UserRole.ADMIN, {
+        execution: { mode: 'AFTER_SALES', feeCny: 12.5 },
+      });
+      expect(res.statusCode).toBe(400);
+      expect(res.json().error.message).toContain('改期费必须为整数');
+      expect(serviceMocks.approve).not.toHaveBeenCalled();
+    });
+
     it('执行失败 → 400 把原因回给运营，不写确认审计', async () => {
       serviceMocks.approve.mockRejectedValue(
         new BadRequestError('本单含套餐立减，改班次要重算补差'),

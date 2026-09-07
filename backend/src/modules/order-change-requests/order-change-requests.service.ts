@@ -67,6 +67,12 @@ export const ORDER_CHANGE_STALE_SCHEDULE_MESSAGE = '目标班次已停售或已�
 export const ORDER_CHANGE_ALREADY_APPLIED_NOTE = '已按申请内容生效（重试时发现已执行）';
 /** 有人正在执行这条申请时点驳回。 */
 export const ORDER_CHANGE_REJECT_IN_FLIGHT_MESSAGE = '该申请正在执行中，请稍后刷新';
+/** 执行方式（纠错 / 按售后改期）只对改班次申请有意义，别的 kind 传了一律拒（不静默忽略）。 */
+export const ORDER_CHANGE_EXECUTION_KIND_MESSAGE = '只有改班次申请可以选择执行方式';
+/** 按售后改期执行时写进确认备注的留痕前缀（申请表没有单独的「执行方式」列）。 */
+export const ORDER_CHANGE_AFTER_SALES_APPLIED_NOTE = '按售后改期执行';
+/** 售后改期路径下缺省的费用名目（与改期表单缺省一致）。 */
+export const ORDER_CHANGE_RESCHEDULE_FEE_LABEL = '改期费';
 /** 收尾回写状态时发现申请已被别的操作改掉（驳回/另一次确认）。 */
 export const ORDER_CHANGE_STATUS_RACED_MESSAGE = '申请状态已被其他操作改变';
 /** 收尾回写状态的重试次数：连接抖动/瞬时超时不该让「订单已改完」的单卡在 PENDING。 */
@@ -162,7 +168,17 @@ interface DecisionAudit {
   requestedById: string;
   kind: OrderChangeKind;
   summary: string;
+  /**
+   * 本次改班次申请走的执行方式（非 FLIGHT 恒为 CORRECTION —— 那几类通道本来就不动钱）。
+   * 审计里必须落这一笔：同一条申请按纠错执行还是按售后改期执行，差的是一笔真金白银。
+   */
+  executionMode?: OrderChangeExecutionMode;
+  /** 按售后改期执行时实收的改期费（CNY）；纠错执行为 0。驳回不带（null）。 */
+  executionFeeCny?: number | null;
 }
+
+/** 执行方式：纠错（不动钱，缺省）/ 按售后改期（收改期费、撤立减、推状态）。 */
+type OrderChangeExecutionMode = 'CORRECTION' | 'AFTER_SALES';
 
 /** payload 里读一个数字字段；缺失 / 不是有限数一律 null（老申请没有这些快照键）。 */
 function readPayloadNumber(payload: Prisma.JsonValue, key: string): number | null {
@@ -752,6 +768,11 @@ export class OrderChangeRequestsService {
       if (row.status !== OrderChangeRequestStatus.PENDING) {
         throw new ConflictError(`该申请当前状态为 ${row.status}，不可重复处理`);
       }
+      // 执行方式只有改班次申请认（签证/换酒店/升舱各有各的既有口径，没有「按售后改期收费」这回事）。
+      // 传错了直接拒，不静默按纠错执行 —— 运营以为收了改期费、系统一分没收，是最坏的一种沉默。
+      if (body.execution && row.kind !== OrderChangeKind.FLIGHT) {
+        throw new BadRequestError(ORDER_CHANGE_EXECUTION_KIND_MESSAGE);
+      }
       // 处理中标记：status 仍是 PENDING（「一单一类一条待处理」的部分唯一索引在执行期间照样生效），
       // 只用 decidedAt 占位；占位超过 APPROVE_CLAIM_TTL_MS 视为上次执行中途挂掉，允许重试。
       if (row.decidedAt && Date.now() - row.decidedAt.getTime() < APPROVE_CLAIM_TTL_MS) {
@@ -785,6 +806,9 @@ export class OrderChangeRequestsService {
     });
 
     const opsActor = { userId: actor.userId, role: actor.role, agentId: actor.agentId };
+    // 执行方式：缺省纠错（历史行为）；只有 FLIGHT 能是 AFTER_SALES（上面的闸已保证）。
+    const executionMode: OrderChangeExecutionMode = body.execution?.mode ?? 'CORRECTION';
+    const executionFeeCny = executionMode === 'AFTER_SALES' ? (body.execution?.feeCny ?? 0) : 0;
 
     // ── 幂等：订单早已是申请里的目标状态 → 不再执行第二遍 ──────────────────────
     // 成因是「执行成功了，但收尾回写状态那一步没落地」（进程被杀、连接断在中间）：
@@ -809,11 +833,21 @@ export class OrderChangeRequestsService {
       }
     }
 
+    // ── 确认备注的留痕 ────────────────────────────────────────────────────────
     // 幂等分支要把「这次没真执行」写进备注（运营在队列里一眼看得出）；
-    // 正常分支的备注在占位那一步已经写过，这里不重复覆盖。
-    const decisionNoteOverride = alreadyApplied
-      ? [ORDER_CHANGE_ALREADY_APPLIED_NOTE, body.decisionNote?.trim()].filter(Boolean).join('；')
-      : undefined;
+    // 按售后改期执行的也要写一句（申请表没有「执行方式」列，队列回看只有这一处能看出
+    // 这条申请到底收没收改期费）。正常纠错分支的备注在占位那一步已经写过，不重复覆盖。
+    const afterSalesNote =
+      !alreadyApplied && executionMode === 'AFTER_SALES'
+        ? `${ORDER_CHANGE_AFTER_SALES_APPLIED_NOTE}（${ORDER_CHANGE_RESCHEDULE_FEE_LABEL} ¥${formatCny(executionFeeCny)}）`
+        : null;
+    const noteParts = [
+      alreadyApplied ? ORDER_CHANGE_ALREADY_APPLIED_NOTE : null,
+      afterSalesNote,
+      body.decisionNote?.trim() || null,
+    ].filter(Boolean);
+    const decisionNoteOverride =
+      alreadyApplied || afterSalesNote ? noteParts.join('；') : undefined;
     await this.finalizeApproved(id, decisionNoteOverride);
 
     const finalRow = (await prisma.orderChangeRequest.findUniqueOrThrow({
@@ -830,6 +864,9 @@ export class OrderChangeRequestsService {
         requestedById: claim.requestedById,
         kind: claim.kind,
         summary: claim.summary,
+        executionMode,
+        // 幂等分支这次并没有真执行，也就没收钱 —— 别在审计里记一笔并不存在的改期费。
+        executionFeeCny: alreadyApplied ? 0 : executionFeeCny,
       },
     };
   }
@@ -960,6 +997,11 @@ export class OrderChangeRequestsService {
   /**
    * 真正改订单的一步：一律回调运营侧既有通道，actor = 点确认的那个运营
    * （所以自助窗口闸、自助差价归零那套代理规则统统不适用，走的就是运营路径）。
+   *
+   * 改班次一类有两条通道，由运营在确认这一刻二选一（body.execution，缺省纠错）：
+   *   · 纠错 correctFlightSchedule —— 本来就该录成这班，差价恒 0、不撤立减、不推状态；
+   *   · 售后改期 rescheduleOrderItem —— 行程真的变了，收改期费、撤立减、推状态。
+   * 其余三类（签证/换酒店/升舱）只有各自那一条既有口径，没有执行方式可选。
    */
   private async execute(
     orderId: string,
@@ -971,7 +1013,26 @@ export class OrderChangeRequestsService {
     const opsActor = { userId: actor.userId, role: actor.role, agentId: actor.agentId };
     switch (kind) {
       case OrderChangeKind.FLIGHT: {
+        // 目标班次的现势复检两种执行方式都要跑：已停售/已起飞的班次，收不收改期费都改不过去。
         await this.assertTargetScheduleStillUsable(String(payload.newScheduleId));
+        if (body.execution?.mode === 'AFTER_SALES') {
+          // ── 行程真的变了：走售后改期这条既有路径 ────────────────────────────────
+          // 与运营手工点 PATCH /orders/:id/reschedule 完全同一个方法同一套语义：收改期费、
+          // 撤套餐立减、推状态、作废旧票号。两个「已起飞放行」开关一律不传 ——
+          // 那是运营在改期表单上逐单确认的例外，不该从确认一条代理申请里溜进来。
+          const { order } = await this.orders.rescheduleOrderItem(
+            orderId,
+            {
+              orderItemId: String(payload.itemId),
+              newScheduleId: String(payload.newScheduleId),
+              feeCny: body.execution.feeCny ?? 0,
+              feeLabel: body.execution.feeLabel?.trim() || ORDER_CHANGE_RESCHEDULE_FEE_LABEL,
+              note: body.execution.note?.trim() || ORDER_CHANGE_REQUEST_REASON_TEXT,
+            },
+            opsActor,
+          );
+          return order;
+        }
         const { order } = await this.orders.correctFlightSchedule(
           orderId,
           String(payload.itemId),

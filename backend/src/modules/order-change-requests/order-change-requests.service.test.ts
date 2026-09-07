@@ -42,6 +42,7 @@ vi.mock('../../lib/agent-tree.js', () => ({ getDescendantAgentIds: mockGetDescen
 import {
   ORDER_CHANGE_BATCH_UNSUPPORTED_KIND_MESSAGE,
   ORDER_CHANGE_DUPLICATE_PENDING_MESSAGE,
+  ORDER_CHANGE_EXECUTION_KIND_MESSAGE,
   ORDER_CHANGE_VISA_HAS_VISA_MESSAGE,
   OrderChangeRequestsService,
 } from './order-change-requests.service.js';
@@ -139,6 +140,8 @@ function requestFixture(overrides: Record<string, unknown> = {}) {
 
 let ordersStub: {
   correctFlightSchedule: ReturnType<typeof vi.fn>;
+  /** 售后改期通道（改班次申请选「按售后改期执行」时走它）。 */
+  rescheduleOrderItem: ReturnType<typeof vi.fn>;
   setOrderVisaStatus: ReturnType<typeof vi.fn>;
   swapItemHotel: ReturnType<typeof vi.fn>;
   upgradeOrderItemCabin: ReturnType<typeof vi.fn>;
@@ -167,6 +170,7 @@ beforeEach(() => {
 
   ordersStub = {
     correctFlightSchedule: vi.fn(),
+    rescheduleOrderItem: vi.fn(),
     setOrderVisaStatus: vi.fn(),
     swapItemHotel: vi.fn(),
     upgradeOrderItemCabin: vi.fn(),
@@ -533,6 +537,88 @@ describe('approve() · 运营一键执行', () => {
         }),
       }),
     );
+  });
+
+  it('改班次 · 缺省（不传 execution）→ 仍走纠错通道，不碰售后改期', async () => {
+    primeApprove(OrderChangeKind.FLIGHT, { itemId: 'item-out', newScheduleId: 'sched-new' });
+    ordersStub.correctFlightSchedule.mockResolvedValue({ order: { id: 'order-1' }, audit: {} });
+
+    const res = await service.approve(ADMIN, 'req-1', {});
+
+    expect(ordersStub.correctFlightSchedule).toHaveBeenCalled();
+    expect(ordersStub.rescheduleOrderItem).not.toHaveBeenCalled();
+    expect(res.audit.executionMode).toBe('CORRECTION');
+    expect(res.audit.executionFeeCny).toBe(0);
+  });
+
+  it('改班次 · 按售后改期执行 → 调改期通道并透传改期费/名目/备注', async () => {
+    primeApprove(OrderChangeKind.FLIGHT, { itemId: 'item-out', newScheduleId: 'sched-new' });
+    ordersStub.rescheduleOrderItem.mockResolvedValue({ order: { id: 'order-1' }, audit: {} });
+
+    const res = await service.approve(ADMIN, 'req-1', {
+      execution: { mode: 'AFTER_SALES', feeCny: 800, feeLabel: '改期费', note: '客人自行改期' },
+    });
+
+    expect(ordersStub.correctFlightSchedule).not.toHaveBeenCalled();
+    expect(ordersStub.rescheduleOrderItem).toHaveBeenCalledWith(
+      'order-1',
+      {
+        orderItemId: 'item-out',
+        newScheduleId: 'sched-new',
+        feeCny: 800,
+        feeLabel: '改期费',
+        note: '客人自行改期',
+      },
+      { userId: 'admin-1', role: UserRole.ADMIN, agentId: undefined },
+    );
+    expect(res.audit.executionMode).toBe('AFTER_SALES');
+    expect(res.audit.executionFeeCny).toBe(800);
+    // 「已起飞放行」两个开关一律不从确认通道溜进去
+    const passed = ordersStub.rescheduleOrderItem.mock.calls[0][1];
+    expect(passed.allowDepartedTarget).toBeUndefined();
+    expect(passed.allowFlownSource).toBeUndefined();
+  });
+
+  it('改班次 · 按售后改期执行 → 确认备注留下执行方式与改期费', async () => {
+    primeApprove(OrderChangeKind.FLIGHT, { itemId: 'item-out', newScheduleId: 'sched-new' });
+    ordersStub.rescheduleOrderItem.mockResolvedValue({ order: { id: 'order-1' }, audit: {} });
+
+    await service.approve(ADMIN, 'req-1', {
+      execution: { mode: 'AFTER_SALES', feeCny: 800 },
+      decisionNote: '已与代理确认',
+    });
+
+    expect(mockPrisma.orderChangeRequest.updateMany).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          decisionNote: '按售后改期执行（改期费 ¥800）；已与代理确认',
+        }),
+      }),
+    );
+  });
+
+  it('改班次 · 按售后改期执行 → 目标班次复检照跑，停售一样拒', async () => {
+    primeApprove(OrderChangeKind.FLIGHT, { itemId: 'item-out', newScheduleId: 'sched-new' });
+    mockPrisma.flightSchedule.findUnique.mockResolvedValue({
+      id: 'sched-new',
+      isActive: false,
+      departureTime: new Date(Date.now() + 7 * 24 * 60 * 60 * 1000),
+    });
+
+    await expect(
+      service.approve(ADMIN, 'req-1', { execution: { mode: 'AFTER_SALES', feeCny: 800 } }),
+    ).rejects.toThrow('目标班次已停售或已起飞，请驳回后重新申请');
+    expect(ordersStub.rescheduleOrderItem).not.toHaveBeenCalled();
+  });
+
+  it('非改班次申请传 execution → 400，一个通道都不碰', async () => {
+    primeApprove(OrderChangeKind.VISA, { toVisaStatus: VisaRequirement.NOT_NEEDED });
+
+    await expect(
+      service.approve(ADMIN, 'req-1', { execution: { mode: 'AFTER_SALES', feeCny: 800 } }),
+    ).rejects.toThrow(ORDER_CHANGE_EXECUTION_KIND_MESSAGE);
+    expect(ordersStub.setOrderVisaStatus).not.toHaveBeenCalled();
+    expect(ordersStub.rescheduleOrderItem).not.toHaveBeenCalled();
   });
 
   it('目标班次已停售 → 400 指路重提，申请留 PENDING', async () => {
