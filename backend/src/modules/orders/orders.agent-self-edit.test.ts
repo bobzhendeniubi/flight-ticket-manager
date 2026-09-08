@@ -753,7 +753,8 @@ describe('setOrderVisaStatus', () => {
     expect(res.after).toBe(VisaRequirement.NEEDED);
     expect(tx.order.update).toHaveBeenCalledWith({
       where: { id: 'o1' },
-      data: { visaStatus: VisaRequirement.NEEDED },
+      // visaAutoCompletedFrom 一并清空：人手定的口径就是新的真值，自动办结存的旧原值作废
+      data: { visaStatus: VisaRequirement.NEEDED, visaAutoCompletedFrom: null },
     });
     // 只开一个事务：签证状态、备注、任务同步全在里头（M2 原子性）。
     expect(mockPrisma.$transaction).toHaveBeenCalledTimes(1);
@@ -788,11 +789,35 @@ describe('setOrderVisaStatus', () => {
     expect(tx.order.update).toHaveBeenCalledTimes(1);
     expect(tx.order.update).toHaveBeenCalledWith({
       where: { id: 'o1' },
-      data: { noteVisa: '客人自己办签', visaStatus: VisaRequirement.NEEDED },
+      data: {
+        noteVisa: '客人自己办签',
+        visaStatus: VisaRequirement.NEEDED,
+        visaAutoCompletedFrom: null,
+      },
     });
     // M5：withOrder:false 时不回读整单（notes 端点只回 { ok: true }，不必白拼一次富联查）。
     expect(res.order).toBeNull();
     expect(mockPrisma.order.findUniqueOrThrow).not.toHaveBeenCalled();
+  });
+
+  /**
+   * 自动办结（全员已送签）把订单冲成「已签证」时会把录单原口径存进 visaAutoCompletedFrom，
+   * 签证台的「签证口径」按「该列 ?? visaStatus」筛。人手再定一次口径 → 那一列必须清空，
+   * 否则这单会继续挂在办结前那一档里，与人手选的档位对不上。
+   */
+  it('手改签证状态 → 清空自动办结存下的录单原口径（人手定的是新真值）', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(
+      visaOrderRow({ visaStatus: VisaRequirement.HAS_VISA }),
+    );
+    const tx = mountTx();
+    mountFinalRead();
+    await service.setOrderVisaStatus('o1', VisaRequirement.E_VISA, STAFF);
+    const data = tx.order.update.mock.calls[0][0].data as Record<string, unknown>;
+    expect(data.visaStatus).toBe(VisaRequirement.E_VISA);
+    expect(data.visaAutoCompletedFrom).toBeNull();
+    // 显式 null 而非 undefined：undefined 在 Prisma 里是「这列不写」，旧原值会留在库里
+    expect('visaAutoCompletedFrom' in data).toBe(true);
+    expect(data.visaAutoCompletedFrom).not.toBeUndefined();
   });
 
   it('矛盾组合被拒时 → 事务一次都不开，备注也一个字不落库', async () => {

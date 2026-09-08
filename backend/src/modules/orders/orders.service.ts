@@ -11679,7 +11679,10 @@ export class OrderService {
     await prisma.$transaction(async (tx) => {
       await tx.order.update({
         where: { id: orderId },
-        data: { ...(options.noteData ?? {}), visaStatus },
+        // visaAutoCompletedFrom 一并清空：那一列存的是「自动办结前的录单口径」，签证台的
+        // 「签证口径」筛选读「该列 ?? visaStatus」。人手定的口径就是新的真值，旧的原值再留着
+        // 会让这单继续挂在办结前那一档里。
+        data: { ...(options.noteData ?? {}), visaStatus, visaAutoCompletedFrom: null },
       });
       if (changed) {
         await syncVisaTasksForOrder(tx, orderId, { userId: actor.userId, role: actor.role });
@@ -16191,6 +16194,8 @@ export class OrderService {
         paymentsLockedAt: order.paymentsLockedAt,
         paymentsLockedBy: order.paymentsLockedBy,
         visaStatus: order.visaStatus,
+        // 自动办结前的录单口径跟随：不抄的话拆出的新单在签证台会错落进「已签证」档。
+        visaAutoCompletedFrom: order.visaAutoCompletedFrom,
         claimedById: order.claimedById,
         claimedAt: order.claimedAt,
         notes: [`由订单 ${order.orderNumber} 拆分创建`, order.notes?.trim() || null]

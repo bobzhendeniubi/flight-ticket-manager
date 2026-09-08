@@ -2705,15 +2705,19 @@ export interface ListFulfillmentParams {
    */
   agentQuery?: string;
   /**
-   * 签证口径筛选（签证台「签证口径」）——前四档逐字对应订单级 Order.visaStatus：
+   * 签证口径筛选（签证台「签证口径」）——前四档逐字对应订单级**录单**签证口径：
    * NEEDED=需要签证 / E_VISA=电子签 / HAS_VISA=已签证 / NOT_NEEDED=未签证（不需要·自备签），
-   * 外加 'UNSET'=未标注（录单从没填过签证状态，库里为空）。省略 = 全部。
+   * 外加 'UNSET'=未标注（录单从没填过签证状态）。省略 = 全部。
    * 注意 'UNSET'（没表态）与 'NOT_NEEDED'（明确说了不需要办）是两回事。
+   *
+   * 后端按「自动办结前的原值 ?? 当前 visaStatus」比对：全员已送签后系统把订单标成「已签证」，
+   * 但这一档筛选仍按录单当时填的算，办结不把单从「电子签 / 需要签证」档里冲走。
+   * 因此 HAS_VISA 档只含录单手选已签证（客人自带签证）的单。
    */
   visaRequirement?: VisaStatusInput | 'UNSET';
   /**
-   * 签发方式筛选（产品结构化字段 ?? 录单回退）；'NONE'=未标注。
-   * 与 visaRequirement 是两根不同的轴；当前签证台界面不暴露此项，参数保留备用。
+   * 签发方式筛选（产品结构化字段 ?? 录单口径回退）；'NONE'=未标注。
+   * 与 visaRequirement 是两根不同的轴，同时给就是 AND。
    */
   issuanceMethod?: VisaIssuanceMethod | 'NONE';
   /** 出发日期单日筛选（YYYY-MM-DD，向后兼容；新前端用区间 from/to） */

@@ -21,6 +21,7 @@ import {
   type FulfillmentStatus,
   type FulfillmentTask,
   type ListFulfillmentParams,
+  type VisaIssuanceMethod,
   type VisaSubmissionStatus,
   type VisaTaskCostInput,
   type VisaTaskPassenger,
@@ -134,11 +135,13 @@ const FILTER_OPTIONS: Array<{ value: StatusFilter; label: string }> = [
 ];
 
 /**
- * 签证口径筛选（走后端 visaRequirement 参数）——逐字对应订单级录单「签证状态」四档；
- * '' = 全部（默认，不筛）。录单没填签证状态的单不属于任何一档，只在「全部」下可见。
+ * 签证口径筛选（走后端 visaRequirement 参数）——逐字对应订单级**录单**「签证状态」四档；
+ * '' = 全部（默认，不筛）。录单没填签证状态的单归在「未标注」档。
  *
- * 注：签发方式（电子签/贴纸签/落地签）是另一根轴，后端 issuanceMethod 参数仍在，
- * 只是界面上先不暴露——要加回来把下拉接上即可。
+ * 口径按录单当时填的算：全员已送签后系统会把订单标成「已签证」，但这一档筛选读的是办结前
+ * 的录单原值，办结不会把单从「电子签 / 需要签证」档里冲走（公测反馈）。
+ *
+ * 注：签发方式（电子签/贴纸签/落地签）是另一根轴，走后端 issuanceMethod 参数，见下。
  */
 type VisaRequirementFilter = '' | 'NEEDED' | 'E_VISA' | 'HAS_VISA' | 'NOT_NEEDED' | 'UNSET';
 
@@ -153,8 +156,28 @@ const VISA_REQUIREMENT_OPTIONS: Array<{ value: VisaRequirementFilter; label: str
 ];
 
 /**
+ * 签发方式筛选（走后端 issuanceMethod 参数）—— 与「签证口径」是两根不同的轴，同时选就是 AND。
+ *
+ * 后端口径：有效签发方式 = 签证产品的结构化字段 ?? 录单口径回退（电子签→电子签，
+ * 需要签证→落地签）。所以纯机票行的单也筛得到，与任务行上的类型徽章同源。
+ * 'NONE' = 未标注：产品没标、录单口径也推不出来。
+ */
+type IssuanceMethodFilter = '' | VisaIssuanceMethod | 'NONE';
+
+const ISSUANCE_METHOD_OPTIONS: Array<{ value: IssuanceMethodFilter; label: string }> = [
+  { value: '', label: '全部' },
+  { value: 'E_VISA', label: '电子签' },
+  { value: 'STICKER', label: '贴纸签' },
+  { value: 'ARRIVAL', label: '落地签' },
+  { value: 'OTHER', label: '其它' },
+  { value: 'NONE', label: '未标注' },
+];
+
+/**
  * 这两档在「待办」视图下必然空手而归 —— 订单不需要我方代办签证时，系统会把还没人动手的
  * 签证任务自动置成「已取消」，而「待办」只看待处理 + 材料准备。
+ * 注意「已签证」档现在只含**录单手选已签证**（客人自带签证）的单：全员已送签后被系统办结的
+ * 单按录单原值留在「电子签 / 需要签证」档里，不会跑到这一档来。
  * 选中即自动切「全部状态」并在下方说明原因；切回其它档时把用户原来的状态选择还回去。
  *
  * 「未标注」**不在此列**：录单没填签证状态不影响任务该不该办，这批单的任务照常走
@@ -1222,6 +1245,8 @@ export function VisaDeskPage() {
   const [statusFilter, setStatusFilter] = useState<StatusFilter>('OPEN');
   // 签证口径（走后端 visaRequirement）；'' = 全部
   const [visaRequirementFilter, setVisaRequirementFilter] = useState<VisaRequirementFilter>('');
+  // 签发方式（走后端 issuanceMethod）；'' = 全部。与签证口径是两根轴，同时选就是 AND
+  const [issuanceMethodFilter, setIssuanceMethodFilter] = useState<IssuanceMethodFilter>('');
   /**
    * 被「已签证 / 未签证」两档顶掉之前，用户自己选的那个状态筛选。
    * 切回其它档时还回去；用户在被顶期间又手动改了状态 → 以他的新选择为准，暂存作废。
@@ -1338,6 +1363,7 @@ export function VisaDeskPage() {
       type: 'VISA_APPLICATION',
       status: STATUS_FILTER_PARAM[statusFilter],
       visaRequirement: visaRequirementFilter || undefined,
+      issuanceMethod: issuanceMethodFilter || undefined,
       departureDateFrom: departureFrom || undefined,
       departureDateTo: departureTo || undefined,
       notesQuery: debouncedNotesQuery || undefined,
@@ -1366,6 +1392,7 @@ export function VisaDeskPage() {
     token,
     statusFilter,
     visaRequirementFilter,
+    issuanceMethodFilter,
     departureFrom,
     departureTo,
     debouncedNotesQuery,
@@ -1380,6 +1407,7 @@ export function VisaDeskPage() {
   }, [
     statusFilter,
     visaRequirementFilter,
+    issuanceMethodFilter,
     departureFrom,
     departureTo,
     notesQueryInput,
@@ -1843,9 +1871,30 @@ export function VisaDeskPage() {
               </p>
             ) : (
               <p className="mt-1 max-w-[14rem] text-xs text-ink-muted">
-                按录单「签证状态」筛选；录单没填的单归在「未标注」档
+                按录单「签证状态」筛选（全员已送签后被系统标成已签证的单，仍留在录单原来那一档）；
+                录单没填的归在「未标注」。「已签证」档只剩录单手选已签证、客人自带签证的单。
               </p>
             )}
+          </div>
+          <div>
+            <label className="label">签发方式</label>
+            <select
+              className="input max-w-[10rem] py-1.5"
+              value={issuanceMethodFilter}
+              onChange={(e) => {
+                setIssuanceMethodFilter(e.target.value as IssuanceMethodFilter);
+                clearSelection();
+              }}
+            >
+              {ISSUANCE_METHOD_OPTIONS.map((o) => (
+                <option key={o.value} value={o.value}>
+                  {o.label}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 max-w-[10rem] text-xs text-ink-muted">
+              与签证口径是两根轴，可叠加筛
+            </p>
           </div>
           <div>
             <label className="label">出发日期区间</label>

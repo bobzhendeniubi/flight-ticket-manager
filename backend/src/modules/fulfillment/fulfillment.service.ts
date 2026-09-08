@@ -94,6 +94,74 @@ const FALLBACK_ORDER_STATUSES: VisaRequirement[] = ORDER_STATUS_ISSUANCE_FALLBAC
 );
 
 /**
+ * ── 签证台读侧的唯一口径：**录单口径 = visaAutoCompletedFrom ?? visaStatus** ──
+ *
+ * 全员已送签时自动办结（fulfillment/visa-completion.ts）会把订单的 visaStatus 从
+ * 「电子签 / 需要签证」改写成「已签证」，同时把原值存进 visaAutoCompletedFrom。
+ * 签证台问的是"录单当时把这单记成什么口径"，不是"现在办到哪一步"——办到哪一步由任务状态
+ * 那根轴回答。所以这里一律原值优先（公测反馈：电子签的已送签单一条都筛不出来，正是因为
+ * 它们被办结冲进了「已签证」档）。
+ *
+ * 由此签证台「已签证」档只剩录单手选已签证的单（客人自带签证）。订单列表 / 导出的绿标
+ * 不受影响 —— 那边读的仍是 visaStatus 本身。
+ */
+export type RecordedVisaOrder = {
+  visaStatus: VisaRequirement | null;
+  visaAutoCompletedFrom?: VisaRequirement | null;
+};
+
+/** 内存侧口径入口（查询层对应 recordedVisaEquals / RECORDED_VISA_UNSET / recordedVisaNotIn）。 */
+export function recordedVisaRequirement(
+  order: RecordedVisaOrder | null | undefined,
+): VisaRequirement | null {
+  if (!order) return null;
+  return order.visaAutoCompletedFrom ?? order.visaStatus ?? null;
+}
+
+/**
+ * 查询层的同一口径 —— Prisma 没有 coalesce，用 OR 手写：
+ *   录单口径 = X  ⇔  visaAutoCompletedFrom = X  或（visaAutoCompletedFrom 为空 且 visaStatus = X）
+ */
+function recordedVisaEquals(status: VisaRequirement): Prisma.OrderWhereInput {
+  return {
+    OR: [
+      { visaAutoCompletedFrom: status },
+      { AND: [{ visaAutoCompletedFrom: null }, { visaStatus: status }] },
+    ],
+  };
+}
+
+/** 录单口径为空 = 两列都是 NULL（录单从没填过签证状态）。 */
+const RECORDED_VISA_UNSET: Prisma.OrderWhereInput = {
+  AND: [{ visaAutoCompletedFrom: null }, { visaStatus: null }],
+};
+
+/**
+ * 录单口径不落在给定档位里（口径为空也算不落在里面）。
+ * 可空列上 `notIn` 遇 NULL 不成立（SQL 里 NULL NOT IN (...) 得 NULL 而非真），所以每一级的
+ * NULL 都显式写出来，不赖实现细节。
+ */
+function recordedVisaNotIn(statuses: VisaRequirement[]): Prisma.OrderWhereInput {
+  return {
+    OR: [
+      { visaAutoCompletedFrom: { notIn: statuses } },
+      {
+        AND: [
+          { visaAutoCompletedFrom: null },
+          { OR: [{ visaStatus: null }, { visaStatus: { notIn: statuses } }] },
+        ],
+      },
+    ],
+  };
+}
+
+/** 读侧要算录单口径的查询一律用这份 select，别只 select visaStatus。 */
+const RECORDED_VISA_SELECT = {
+  visaStatus: true,
+  visaAutoCompletedFrom: true,
+} as const;
+
+/**
  * 任务的有效签证分类（签发方式 / 入境次数）+ 各自的出处。
  *
  * **签发方式**优先取签证产品的结构化字段；产品缺失（录单单子多为纯机票行，签证信息只落在
@@ -115,16 +183,18 @@ export function effectiveVisaClassification(
     | { issuanceMethod: VisaIssuanceMethod | null; entryType: VisaEntryType | null }
     | null
     | undefined,
-  orderVisaStatus: VisaRequirement | null | undefined,
+  order: RecordedVisaOrder | null | undefined,
 ): {
   issuanceMethod: VisaIssuanceMethod | null;
   entryType: VisaEntryType | null;
   issuanceSource: VisaClassificationSource | null;
   entrySource: VisaClassificationSource | null;
 } {
+  // 回退读**录单口径**（自动办结前的原值优先）：办结后的单仍按录单当时的电子签 / 需要签证
+  // 归类，徽章的 ORDER_STATUS 证据来源同此口径。整单口径见 recordedVisaRequirement。
+  const recorded = recordedVisaRequirement(order);
   const issuanceFromOrder =
-    ORDER_STATUS_ISSUANCE_FALLBACK.find((r) => r.orderStatus === orderVisaStatus)?.issuanceMethod ??
-    null;
+    ORDER_STATUS_ISSUANCE_FALLBACK.find((r) => r.orderStatus === recorded)?.issuanceMethod ?? null;
   const issuanceFromProduct = visa?.issuanceMethod ?? null;
   const issuanceMethod = issuanceFromProduct ?? issuanceFromOrder;
   const entryType = visa?.entryType ?? null;
@@ -164,12 +234,10 @@ export function issuanceMethodWhere(
   };
 
   if (filter === 'NONE') {
-    // 未标注 = 产品侧未标注 且 订单级也不在「有回退来源」的状态里
+    // 未标注 = 产品侧未标注 且 录单口径也不在「有回退来源」的状态里
     // （否则会回退成电子签 / 落地签，就不算未标注了）。
-    // 显式列出 NULL，不依赖 `notIn` 对可空列是否兜 NULL 的实现细节
-    // （SQL 里 NULL NOT IN (...) 得 NULL 而非真）。
     const orderHasNoFallback: Prisma.OrderItemWhereInput = {
-      order: { OR: [{ visaStatus: null }, { visaStatus: { notIn: FALLBACK_ORDER_STATUSES } }] },
+      order: recordedVisaNotIn(FALLBACK_ORDER_STATUSES),
     };
     return { AND: [productUnset, orderHasNoFallback] };
   }
@@ -181,7 +249,7 @@ export function issuanceMethodWhere(
     return {
       OR: [
         { visa: { is: { issuanceMethod: filter } } },
-        { AND: [productUnset, { order: { visaStatus: fallbackOrderStatus } }] },
+        { AND: [productUnset, { order: recordedVisaEquals(fallbackOrderStatus) }] },
       ],
     };
   }
@@ -238,12 +306,15 @@ export function agentQueryWhere(term: string): Prisma.OrderItemWhereInput {
 }
 
 /**
- * 「签证口径」筛选下沉到查询层 —— 直接比订单级 Order.visaStatus，不做任何推断或回退。
+ * 「签证口径」筛选下沉到查询层 —— 比**录单口径**（visaAutoCompletedFrom ?? visaStatus），
+ * 不做任何签发方式方向的推断。
  *
  * 这与上面的 issuanceMethodWhere（签发方式，带「产品字段 ?? 录单回退」）是**两根不同的轴**：
- * 本函数问的是"录单当时把这单的签证口径记成了什么"，一个字段一个答案，没有二义。
+ * 本函数问的是"录单当时把这单的签证口径记成了什么"，一个答案，没有二义。全员已送签后的
+ * 自动办结不改变这个答案（公测反馈：电子签的已送签单一条都筛不出来），代价是「已签证」档
+ * 只剩录单手选已签证的单 —— 那正是这一档该有的语义。
  *
- * 'UNSET' = 未标注：录单从没填过签证状态（库里 visaStatus IS NULL）。这一档必须显式存在——
+ * 'UNSET' = 未标注：录单从没填过签证状态（两列都 IS NULL）。这一档必须显式存在——
  * 四档是枚举的四个成员，NULL 不在其中，没有这一档时这批单在任何一档下都不出现，
  * 只有「全部」能看到，签证岗一筛就会以为单少了（**这不是小数**：清查时开发库 171 条签证
  * 任务里 107 条 visaStatus 为空）。「未标注」与「未签证(NOT_NEEDED)」是两回事：
@@ -252,9 +323,8 @@ export function agentQueryWhere(term: string): Prisma.OrderItemWhereInput {
 export function visaRequirementWhere(
   filter: VisaRequirement | 'UNSET',
 ): Prisma.OrderItemWhereInput {
-  // 未标注 = 订单级签证状态为 NULL；Prisma 的 `visaStatus: null` 生成 IS NULL（可空列上正确）
-  if (filter === 'UNSET') return { order: { visaStatus: null } };
-  return { order: { visaStatus: filter } };
+  if (filter === 'UNSET') return { order: RECORDED_VISA_UNSET };
+  return { order: recordedVisaEquals(filter) };
 }
 
 /**
@@ -380,8 +450,8 @@ export class FulfillmentService {
           fulfillmentTasks: { orderBy: { createdAt: 'asc' } },
           // 本签证 item 关联的签证产品结构化分类（签发方式/入境次数），与 visaName 平级下发
           visa: { select: { visaName: true, issuanceMethod: true, entryType: true } },
-          // 订单级录单签证状态 —— 产品结构化字段缺失时的分类回退来源
-          order: { select: { visaStatus: true } },
+          // 订单级录单签证口径（含自动办结前的原值）—— 产品结构化字段缺失时的分类回退来源
+          order: { select: RECORDED_VISA_SELECT },
         },
       }),
       prisma.passenger.findMany({
@@ -401,7 +471,7 @@ export class FulfillmentService {
     return items.flatMap((it) => {
       // 分类回退：签发方式在产品字段缺失时回退订单级录单签证状态（E_VISA=电子签 / NEEDED=落地签）；
       // 入境次数只认产品字段。两者各自带 source 下发，前端据此区分实色/浅色
-      const visaClass = effectiveVisaClassification(it.visa, it.order.visaStatus);
+      const visaClass = effectiveVisaClassification(it.visa, it.order);
       return it.fulfillmentTasks.map((t) => ({
         ...serializeTask(t, it),
         // 签证任务附带乘客护照明细 + 签证产品结构化分类；其他类型任务不返回
@@ -582,8 +652,9 @@ export class FulfillmentService {
                   contactPhone: true,
                   status: true,
                   notes: true,
-                  // 订单级录单签证状态 —— 产品结构化字段缺失时的分类回退来源
-                  visaStatus: true,
+                  // 订单级录单签证口径（含自动办结前的原值）—— 分类回退与「签证口径」筛选同源；
+                  // visaAutoCompletedFrom 只供服务端算口径，不随响应下发（下面按需剥掉）
+                  ...RECORDED_VISA_SELECT,
                   // 所属代理（公测反馈：签证台需直接看到归属，不必点进订单详情）；
                   // 走同一主查询的嵌套 select，不新增每行子查询
                   agent: { select: { companyName: true, contactName: true } },
@@ -739,9 +810,9 @@ export class FulfillmentService {
         // 分类回退：签发方式在产品字段缺失时回退订单级录单签证状态（E_VISA=电子签 / NEEDED=落地签），
         // 签证台「签证类型」筛选/徽章两边口径由此对齐（见 issuanceMethodWhere）；
         // 入境次数只认产品字段，无回退
-        const visaClass = effectiveVisaClassification(t.orderItem.visa, order.visaStatus);
+        const visaClass = effectiveVisaClassification(t.orderItem.visa, order);
         // 所属代理名（口径与订单模块导出/看板一致：公司名优先，回退联系人名；无代理 = 直客）
-        const { agent, ...orderRest } = order;
+        const { agent, visaAutoCompletedFrom: _autoFrom, ...orderRest } = order;
         const agentName = agent ? agent.companyName || agent.contactName : null;
         return {
           ...serializeTask(t, t.orderItem),

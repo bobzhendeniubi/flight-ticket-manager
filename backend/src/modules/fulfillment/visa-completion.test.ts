@@ -2,7 +2,8 @@
  * 订单级签证办结派生（syncOrderVisaCompletion）· 单测（mock Prisma）
  *
  * 口径（签证岗 2026-08-30）：非自备签乘客全部「已送签」且确有我方签证任务 → 订单自动置
- * 已签证（HAS_VISA）；任一乘客退回 → 仅当已签证是本派生写的（审计可查）才对称回退原档。
+ * 已签证（HAS_VISA），录单原口径存进 visaAutoCompletedFrom；任一乘客退回 → 仅当已签证是本
+ * 派生写的（该列非空，或列为空时审计可查）才对称回退原档并清空该列。
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 
@@ -25,7 +26,12 @@ import {
 const actor = { userId: 'u1', role: 'STAFF' as const };
 
 function mount(opts: {
-  order?: { visaStatus: string | null; deletedAt?: Date | null } | null;
+  order?: {
+    visaStatus: string | null;
+    // 自动办结前的录单口径（列）；省略 = 未被办结过
+    visaAutoCompletedFrom?: string | null;
+    deletedAt?: Date | null;
+  } | null;
   // 全名单（不带 visaExempt 视为随团办签）：办结判定只看非自备签那部分。
   passengers?: Array<{ visaSubmissionStatus: string; visaExempt?: boolean }>;
   taskCount?: number;
@@ -37,7 +43,9 @@ function mount(opts: {
       : {
           id: 'o1',
           orderNumber: 'ORD-1',
-          visaStatus: opts.order?.visaStatus ?? 'NEEDED',
+          // 显式传 null（录单没填过）要留住 null，不能被默认值 'NEEDED' 顶掉
+          visaStatus: opts.order ? opts.order.visaStatus : 'NEEDED',
+          visaAutoCompletedFrom: opts.order?.visaAutoCompletedFrom ?? null,
           deletedAt: opts.order?.deletedAt ?? null,
         },
   );
@@ -60,11 +68,36 @@ describe('syncOrderVisaCompletion · 办结写入', () => {
     expect(res).toEqual({ changed: true, kind: 'COMPLETED', orderNumber: 'ORD-1' });
     expect(mockPrisma.order.update).toHaveBeenCalledWith({
       where: { id: 'o1' },
-      data: { visaStatus: 'HAS_VISA' },
+      // 录单原口径落列：签证台「签证口径」筛选读「本列 ?? visaStatus」，办结不冲掉录单档位
+      data: { visaStatus: 'HAS_VISA', visaAutoCompletedFrom: 'NEEDED' },
     });
     const audit = mockPrisma.auditLog.create.mock.calls[0][0].data;
     expect(audit.action).toBe(VISA_AUTO_COMPLETE_ACTION);
     expect(audit.before).toEqual({ visaStatus: 'NEEDED' });
+  });
+
+  it('原口径为电子签 → 办结时原样存进 visaAutoCompletedFrom（签证台仍按电子签筛得到）', async () => {
+    mount({
+      order: { visaStatus: 'E_VISA' },
+      passengers: [{ visaSubmissionStatus: 'CONFIRMED' }],
+    });
+    await syncOrderVisaCompletion('o1', actor);
+    expect(mockPrisma.order.update).toHaveBeenCalledWith({
+      where: { id: 'o1' },
+      data: { visaStatus: 'HAS_VISA', visaAutoCompletedFrom: 'E_VISA' },
+    });
+  });
+
+  it('录单没填过签证状态 → 原值 NULL 也照存 NULL（不猜一个档位出来）', async () => {
+    mount({
+      order: { visaStatus: null },
+      passengers: [{ visaSubmissionStatus: 'CONFIRMED' }],
+    });
+    await syncOrderVisaCompletion('o1', actor);
+    expect(mockPrisma.order.update).toHaveBeenCalledWith({
+      where: { id: 'o1' },
+      data: { visaStatus: 'HAS_VISA', visaAutoCompletedFrom: null },
+    });
   });
 
   it('已是 HAS_VISA → 幂等不重写', async () => {
@@ -125,11 +158,35 @@ describe('syncOrderVisaCompletion · 对称回退', () => {
     });
     expect(mockPrisma.order.update).toHaveBeenCalledWith({
       where: { id: 'o1' },
-      data: { visaStatus: 'E_VISA' },
+      data: { visaStatus: 'E_VISA', visaAutoCompletedFrom: null },
     });
     expect(mockPrisma.auditLog.create.mock.calls[0][0].data.action).toBe(
       VISA_AUTO_COMPLETE_REVERT_ACTION,
     );
+  });
+
+  it('原口径列非空 → 直接按它恢复并清空该列，不必翻审计', async () => {
+    mount({
+      order: { visaStatus: 'HAS_VISA', visaAutoCompletedFrom: 'E_VISA' },
+      passengers: [{ visaSubmissionStatus: 'PENDING' }],
+      lastAudit: null,
+    });
+    const res = await syncOrderVisaCompletion('o1', actor);
+    expect(res).toMatchObject({ changed: true, kind: 'REVERTED', restoredTo: 'E_VISA' });
+    expect(mockPrisma.order.update).toHaveBeenCalledWith({
+      where: { id: 'o1' },
+      data: { visaStatus: 'E_VISA', visaAutoCompletedFrom: null },
+    });
+    expect(mockPrisma.auditLog.findFirst).not.toHaveBeenCalled();
+  });
+
+  it('原口径列与审计不一致时以列为准（列是办结当时写的权威值）', async () => {
+    mount({
+      order: { visaStatus: 'HAS_VISA', visaAutoCompletedFrom: 'NOT_NEEDED' },
+      passengers: [{ visaSubmissionStatus: 'PENDING' }],
+      lastAudit: { action: VISA_AUTO_COMPLETE_ACTION, before: { visaStatus: 'E_VISA' } },
+    });
+    expect(await syncOrderVisaCompletion('o1', actor)).toMatchObject({ restoredTo: 'NOT_NEEDED' });
   });
 
   it('审计里原档缺失/不合法 → 回退到 NEEDED 兜底', async () => {

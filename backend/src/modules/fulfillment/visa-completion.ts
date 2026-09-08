@@ -5,13 +5,14 @@
  * 且本单确有我方签证任务（存在非 CANCELLED 的 VISA_APPLICATION）→ 订单 visaStatus
  * 自动写 HAS_VISA（已签证）。签证岗从此不用回头改订单状态，订单列表/导出徽标随之变绿。
  *
- * 回退对称：任一乘客从已送签退回 → 若订单的已签证是**本派生写的**（以审计里最近一条
- * AUTO_COMPLETE_VISA / AUTO_COMPLETE_VISA_REVERT 判定），恢复办结前的原档（写入时存在
- * 审计 before 里）。录单人手选的「已签证」（客人自带签证）没有办结审计，不受回退影响。
+ * 办结时把原口径落进 `Order.visaAutoCompletedFrom` 列，回退按它恢复并清空该列；审计照写，
+ * 只在该列为空时兜底（本列上线前的存量单、以及拆单承接过来的单）。录单人手选的「已签证」
+ * （客人自带签证）既无该列也无办结审计，不受回退影响。
  *
- * 为什么用审计流水而不是加列：办结来源只在「回退」这一处需要，且审计本就要留
- * （谁把单标成已签证是要能查的）；fire-and-forget 的审计极小概率写失败时，仅损失
- * 自动回退（可人工改回），不影响任何钱与任务的正确性。
+ * 为什么从「只看审计」改成加一列：签证台的「签证口径」筛选要按**录单口径**分档
+ * （公测反馈：电子签的已送签单一条都筛不出来 —— 办结把 E_VISA 冲成了 HAS_VISA）。查询层
+ * 没法翻审计的 JSON 找原值，只有落成列才进得了 where。顺带让回退不再依赖 fire-and-forget
+ * 的审计写入。
  *
  * 调用点约定：任何写 Passenger.visaSubmissionStatus 的路径完成后调用（不在事务内，
  * 与 writeAudit 同一「主操作成功才派生」的时序）。幂等：重复调用无副作用。
@@ -31,6 +32,40 @@ export type VisaCompletionOutcome =
   | { changed: true; kind: 'REVERTED'; orderNumber: string; restoredTo: VisaRequirement };
 
 /**
+ * 回退目标 = 办结前的录单口径。返回 null = 这单的「已签证」不是本派生写的，不许碰。
+ *
+ * 两级：
+ *   ① `Order.visaAutoCompletedFrom` 列（本模块办结时写的，权威）；
+ *   ② 该列为空时翻审计兜底 —— 覆盖本列上线前就已办结的存量单，以及拆单承接过来的单
+ *      （拆单只补写了 AUTO_COMPLETE_VISA 审计）。取最近一条办结/回退审计，是回退就说明
+ *      已经退过一轮，不再重复退。
+ * 审计里原档缺失或不是合法枚举 → 兜底「需要签证」：这单确实是我方在办签，退回待办总比
+ * 留在「已签证」里漏掉强。
+ */
+async function resolveRestoreTarget(
+  orderId: string,
+  autoCompletedFrom: VisaRequirement | null,
+): Promise<VisaRequirement | null> {
+  if (autoCompletedFrom) return autoCompletedFrom;
+
+  const lastAuto = await prisma.auditLog.findFirst({
+    where: {
+      targetType: 'ORDER',
+      targetId: orderId,
+      action: { in: [VISA_AUTO_COMPLETE_ACTION, VISA_AUTO_COMPLETE_REVERT_ACTION] },
+    },
+    orderBy: { createdAt: 'desc' },
+    select: { action: true, before: true },
+  });
+  if (!lastAuto || lastAuto.action !== VISA_AUTO_COMPLETE_ACTION) return null;
+
+  const beforeStatus = (lastAuto.before as { visaStatus?: string } | null)?.visaStatus;
+  return beforeStatus && (Object.values(VisaRequirement) as string[]).includes(beforeStatus)
+    ? (beforeStatus as VisaRequirement)
+    : VisaRequirement.NEEDED;
+}
+
+/**
  * 重算并落写一个订单的「已签证」办结状态。返回本次是否改动（调用方可用于回显/汇总）。
  */
 export async function syncOrderVisaCompletion(
@@ -39,7 +74,13 @@ export async function syncOrderVisaCompletion(
 ): Promise<VisaCompletionOutcome> {
   const order = await prisma.order.findUnique({
     where: { id: orderId },
-    select: { id: true, orderNumber: true, visaStatus: true, deletedAt: true },
+    select: {
+      id: true,
+      orderNumber: true,
+      visaStatus: true,
+      visaAutoCompletedFrom: true,
+      deletedAt: true,
+    },
   });
   // 回收站单不派生：签证台本就看不见它，别在暗处翻状态。
   if (!order || order.deletedAt) return { changed: false };
@@ -70,7 +111,12 @@ export async function syncOrderVisaCompletion(
     if (order.visaStatus === VisaRequirement.HAS_VISA) return { changed: false };
     await prisma.order.update({
       where: { id: orderId },
-      data: { visaStatus: VisaRequirement.HAS_VISA },
+      // 录单口径存进 visaAutoCompletedFrom：签证台的「签证口径」筛选读「本列 ?? visaStatus」，
+      // 办结不再把这单从「电子签 / 需要签证」档里冲走。原值为 NULL 就照存 NULL。
+      data: {
+        visaStatus: VisaRequirement.HAS_VISA,
+        visaAutoCompletedFrom: order.visaStatus,
+      },
     });
     await writeAudit({
       actor,
@@ -86,22 +132,8 @@ export async function syncOrderVisaCompletion(
 
   // 未达办结条件：仅当现值 HAS_VISA 且是本派生写的才回退。
   if (order.visaStatus !== VisaRequirement.HAS_VISA) return { changed: false };
-  const lastAuto = await prisma.auditLog.findFirst({
-    where: {
-      targetType: 'ORDER',
-      targetId: orderId,
-      action: { in: [VISA_AUTO_COMPLETE_ACTION, VISA_AUTO_COMPLETE_REVERT_ACTION] },
-    },
-    orderBy: { createdAt: 'desc' },
-    select: { action: true, before: true },
-  });
-  if (!lastAuto || lastAuto.action !== VISA_AUTO_COMPLETE_ACTION) return { changed: false };
-
-  const beforeStatus = (lastAuto.before as { visaStatus?: string } | null)?.visaStatus;
-  const restoredTo =
-    beforeStatus && (Object.values(VisaRequirement) as string[]).includes(beforeStatus)
-      ? (beforeStatus as VisaRequirement)
-      : VisaRequirement.NEEDED;
+  const restoredTo = await resolveRestoreTarget(orderId, order.visaAutoCompletedFrom);
+  if (!restoredTo) return { changed: false };
   // 回退前的矛盾闸：本单现在已全员自备签时，把订单级恢复成「需要签证 / 电子签」会造出
   // 「订单说要我方办、却没有一位出行人要办」的矛盾单 —— 不建任务、签证台看不见（判定见
   // visa-need.ts 的 isVisaContradiction），正是要根治的漏签形态。此时保留「已签证」不回退：
@@ -112,7 +144,8 @@ export async function syncOrderVisaCompletion(
   }
   await prisma.order.update({
     where: { id: orderId },
-    data: { visaStatus: restoredTo },
+    // 回退即「这单不再是办结派生出来的已签证」→ 原口径列一并清空，否则它会继续被筛选当真值读。
+    data: { visaStatus: restoredTo, visaAutoCompletedFrom: null },
   });
   await writeAudit({
     actor,

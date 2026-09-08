@@ -30,6 +30,7 @@ import {
   passengerQueryWhere,
   resolveVisaUnitCost,
   visaRequirementWhere,
+  recordedVisaRequirement,
 } from './fulfillment.service.js';
 
 describe('FulfillmentService.batchUpdateStatus', () => {
@@ -582,7 +583,7 @@ describe('effectiveVisaClassification — 签发方式可回退录单状态；�
     expect(
       effectiveVisaClassification(
         { issuanceMethod: VisaIssuanceMethod.STICKER, entryType: VisaEntryType.SINGLE },
-        VisaRequirement.E_VISA,
+        { visaStatus: VisaRequirement.E_VISA },
       ),
     ).toEqual({
       issuanceMethod: 'STICKER',
@@ -593,7 +594,7 @@ describe('effectiveVisaClassification — 签发方式可回退录单状态；�
   });
 
   it('无产品 + 录单签证状态=E_VISA → 签发方式回退电子签（标 ORDER_STATUS）；入境次数留空', () => {
-    expect(effectiveVisaClassification(null, VisaRequirement.E_VISA)).toEqual({
+    expect(effectiveVisaClassification(null, { visaStatus: VisaRequirement.E_VISA })).toEqual({
       issuanceMethod: 'E_VISA',
       entryType: null,
       issuanceSource: 'ORDER_STATUS',
@@ -605,7 +606,7 @@ describe('effectiveVisaClassification — 签发方式可回退录单状态；�
     expect(
       effectiveVisaClassification(
         { issuanceMethod: VisaIssuanceMethod.E_VISA, entryType: null },
-        VisaRequirement.E_VISA,
+        { visaStatus: VisaRequirement.E_VISA },
       ),
     ).toEqual({
       issuanceMethod: 'E_VISA',
@@ -619,7 +620,7 @@ describe('effectiveVisaClassification — 签发方式可回退录单状态；�
     expect(
       effectiveVisaClassification(
         { issuanceMethod: null, entryType: VisaEntryType.SINGLE },
-        VisaRequirement.E_VISA,
+        { visaStatus: VisaRequirement.E_VISA },
       ),
     ).toEqual({
       issuanceMethod: 'E_VISA',
@@ -633,14 +634,14 @@ describe('effectiveVisaClassification — 签发方式可回退录单状态；�
     expect(
       effectiveVisaClassification(
         { issuanceMethod: VisaIssuanceMethod.E_VISA, entryType: VisaEntryType.SINGLE },
-        VisaRequirement.E_VISA,
+        { visaStatus: VisaRequirement.E_VISA },
       ).entryType,
     ).toBe('SINGLE');
   });
 
   it('无产品 + 录单签证状态=NEEDED → 签发方式回退落地签（标 ORDER_STATUS）；入境次数留空', () => {
     // 签证岗反馈：录单选「需要签证」= 由我们代办落地签，之前全落进「未标注」桶按落地签筛不出来
-    expect(effectiveVisaClassification(null, VisaRequirement.NEEDED)).toEqual({
+    expect(effectiveVisaClassification(null, { visaStatus: VisaRequirement.NEEDED })).toEqual({
       issuanceMethod: 'ARRIVAL',
       entryType: null,
       issuanceSource: 'ORDER_STATUS',
@@ -652,7 +653,7 @@ describe('effectiveVisaClassification — 签发方式可回退录单状态；�
     expect(
       effectiveVisaClassification(
         { issuanceMethod: VisaIssuanceMethod.STICKER, entryType: null },
-        VisaRequirement.NEEDED,
+        { visaStatus: VisaRequirement.NEEDED },
       ),
     ).toEqual({
       issuanceMethod: 'STICKER',
@@ -664,7 +665,7 @@ describe('effectiveVisaClassification — 签发方式可回退录单状态；�
 
   it('无产品 + 录单签证状态=HAS_VISA/NOT_NEEDED/null（都不办签）→ 未标注（值与出处全 null）', () => {
     for (const status of [VisaRequirement.HAS_VISA, VisaRequirement.NOT_NEEDED, null]) {
-      expect(effectiveVisaClassification(null, status)).toEqual({
+      expect(effectiveVisaClassification(null, { visaStatus: status })).toEqual({
         issuanceMethod: null,
         entryType: null,
         issuanceSource: null,
@@ -922,6 +923,8 @@ describe('issuanceMethodWhere — 签发方式筛选下沉后与内存回退口�
     label: string;
     visa: { issuanceMethod: VisaIssuanceMethod | null; entryType: null } | null;
     visaStatus: VisaRequirement | null;
+    /** 自动办结前的录单口径（列）；省略 = 未被办结过 */
+    visaAutoCompletedFrom?: VisaRequirement | null;
   }
   const cases: FallbackCase[] = [
     { label: '产品标了电子签', visa: { issuanceMethod: VisaIssuanceMethod.E_VISA, entryType: null }, visaStatus: null },
@@ -935,6 +938,31 @@ describe('issuanceMethodWhere — 签发方式筛选下沉后与内存回退口�
     { label: '产品未标 + 录单已签证（不办签，无回退）', visa: null, visaStatus: VisaRequirement.HAS_VISA },
     { label: '产品未标 + 录单不需要签证（不办签，无回退）', visa: null, visaStatus: VisaRequirement.NOT_NEEDED },
     { label: '产品未标 + 订单级为空', visa: null, visaStatus: null },
+    // 全员已送签后被自动办结的单：visaStatus 已被冲成 HAS_VISA，录单原口径存在列里
+    {
+      label: '已办结（原口径电子签）—— 回退仍按电子签算',
+      visa: null,
+      visaStatus: VisaRequirement.HAS_VISA,
+      visaAutoCompletedFrom: VisaRequirement.E_VISA,
+    },
+    {
+      label: '已办结（原口径需要签证）—— 回退仍按落地签算',
+      visa: null,
+      visaStatus: VisaRequirement.HAS_VISA,
+      visaAutoCompletedFrom: VisaRequirement.NEEDED,
+    },
+    {
+      label: '已办结（原口径电子签）+ 产品标了贴纸签 —— 产品优先',
+      visa: { issuanceMethod: VisaIssuanceMethod.STICKER, entryType: null },
+      visaStatus: VisaRequirement.HAS_VISA,
+      visaAutoCompletedFrom: VisaRequirement.E_VISA,
+    },
+    {
+      label: '录单手选已签证（未被办结，列为空）—— 无回退来源',
+      visa: null,
+      visaStatus: VisaRequirement.HAS_VISA,
+      visaAutoCompletedFrom: null,
+    },
   ];
 
   const ALL_FILTERS: Array<VisaIssuanceMethod | 'NONE'> = [
@@ -960,20 +988,40 @@ describe('issuanceMethodWhere — 签发方式筛选下沉后与内存回退口�
       if (is === null) return c.visa === null;
       return c.visa !== null && c.visa.issuanceMethod === (is.issuanceMethod ?? null);
     }
-    if ('order' in where) {
-      const o = where.order as WhereNode;
-      if (Array.isArray(o.OR)) return (o.OR as WhereNode[]).some((w) => matchesWhere({ order: w }, c));
-      const vs = o.visaStatus as VisaRequirement | { notIn: VisaRequirement[] } | null;
-      if (vs === null) return c.visaStatus === null;
-      if (typeof vs === 'object') return c.visaStatus !== null && !vs.notIn.includes(c.visaStatus);
-      return c.visaStatus === vs;
-    }
+    if ('order' in where) return matchesOrderNode(where.order as WhereNode, c);
     throw new Error(`未支持的 where 形状：${JSON.stringify(where)}`);
+  }
+
+  /**
+   * Order 侧子句求值 —— 覆盖「录单口径 = visaAutoCompletedFrom ?? visaStatus」展开出的
+   * AND / OR / 单字段三种节点。字段比较同样复刻 SQL 的 NULL 语义。
+   */
+  function matchesOrderNode(o: WhereNode, c: FallbackCase): boolean {
+    if (Array.isArray(o.AND)) return (o.AND as WhereNode[]).every((w) => matchesOrderNode(w, c));
+    if (Array.isArray(o.OR)) return (o.OR as WhereNode[]).some((w) => matchesOrderNode(w, c));
+    const entries = Object.entries(o);
+    if (entries.length !== 1) throw new Error(`未支持的 order 子句：${JSON.stringify(o)}`);
+    const [field, cond] = entries[0];
+    const actual =
+      field === 'visaStatus'
+        ? c.visaStatus
+        : field === 'visaAutoCompletedFrom'
+          ? (c.visaAutoCompletedFrom ?? null)
+          : (() => {
+              throw new Error(`未支持的 order 字段：${field}`);
+            })();
+    if (cond === null) return actual === null;
+    if (typeof cond === 'object') {
+      // NULL NOT IN (...) 得 NULL 而非真 → NULL 行不命中 notIn
+      const { notIn } = cond as { notIn: VisaRequirement[] };
+      return actual !== null && !notIn.includes(actual);
+    }
+    return actual === cond;
   }
 
   it('对齐性质：每个筛选桶命中的单 === 内存分类算出该桶的单（逐 case × 逐筛选值）', () => {
     for (const c of cases) {
-      const eff = effectiveVisaClassification(c.visa, c.visaStatus);
+      const eff = effectiveVisaClassification(c.visa, c);
       for (const filter of ALL_FILTERS) {
         const inMemoryBucket =
           filter === 'NONE' ? eff.issuanceMethod === null : eff.issuanceMethod === filter;
@@ -983,10 +1031,20 @@ describe('issuanceMethodWhere — 签发方式筛选下沉后与内存回退口�
     }
   });
 
+  /** 录单口径等值的 coalesce 展开形状（与 visaRequirementWhere 同一张口径） */
+  function recordedEquals(status: VisaRequirement) {
+    return {
+      OR: [
+        { visaAutoCompletedFrom: status },
+        { AND: [{ visaAutoCompletedFrom: null }, { visaStatus: status }] },
+      ],
+    };
+  }
+
   it('回退出来的电子签单：内存口径判为 E_VISA —— 下沉后的 where 必须含订单级回退分支', () => {
     // 先钉住内存真值：产品未标 + 录单 E_VISA → 有效签发方式 = E_VISA
     for (const c of cases) {
-      const eff = effectiveVisaClassification(c.visa, c.visaStatus);
+      const eff = effectiveVisaClassification(c.visa, c);
       if (!c.visa?.issuanceMethod && c.visaStatus === VisaRequirement.E_VISA) {
         expect(eff.issuanceMethod).toBe(VisaIssuanceMethod.E_VISA);
       }
@@ -1001,7 +1059,7 @@ describe('issuanceMethodWhere — 签发方式筛选下沉后与内存回退口�
     expect(where.OR[1]).toEqual({
       AND: [
         { OR: [{ visa: { is: null } }, { visa: { is: { issuanceMethod: null } } }] },
-        { order: { visaStatus: 'E_VISA' } },
+        { order: recordedEquals(VisaRequirement.E_VISA) },
       ],
     });
   });
@@ -1009,7 +1067,7 @@ describe('issuanceMethodWhere — 签发方式筛选下沉后与内存回退口�
   it('落地签同样含回退分支：产品未标 + 录单「需要签证」的单必须筛得到（签证岗反馈）', () => {
     // 先钉住内存真值：产品未标 + 录单 NEEDED → 有效签发方式 = ARRIVAL
     for (const c of cases) {
-      const eff = effectiveVisaClassification(c.visa, c.visaStatus);
+      const eff = effectiveVisaClassification(c.visa, c);
       if (!c.visa?.issuanceMethod && c.visaStatus === VisaRequirement.NEEDED) {
         expect(eff.issuanceMethod).toBe(VisaIssuanceMethod.ARRIVAL);
       }
@@ -1022,7 +1080,7 @@ describe('issuanceMethodWhere — 签发方式筛选下沉后与内存回退口�
     expect(where.OR[1]).toEqual({
       AND: [
         { OR: [{ visa: { is: null } }, { visa: { is: { issuanceMethod: null } } }] },
-        { order: { visaStatus: 'NEEDED' } },
+        { order: recordedEquals(VisaRequirement.NEEDED) },
       ],
     });
   });
@@ -1041,9 +1099,20 @@ describe('issuanceMethodWhere — 签发方式筛选下沉后与内存回退口�
     expect(where.AND[0]).toEqual({
       OR: [{ visa: { is: null } }, { visa: { is: { issuanceMethod: null } } }],
     });
-    // 显式列出 NULL：SQL 里 NULL NOT IN (...) 得 NULL 而非真，不能只靠 notIn
+    // 显式列出 NULL：SQL 里 NULL NOT IN (...) 得 NULL 而非真，不能只靠 notIn。
+    // 判的是**录单口径**不在回退档里：原值列不在 → 命中；原值列为空才回落到 visaStatus。
     expect(where.AND[1]).toEqual({
-      order: { OR: [{ visaStatus: null }, { visaStatus: { notIn: ['E_VISA', 'NEEDED'] } }] },
+      order: {
+        OR: [
+          { visaAutoCompletedFrom: { notIn: ['E_VISA', 'NEEDED'] } },
+          {
+            AND: [
+              { visaAutoCompletedFrom: null },
+              { OR: [{ visaStatus: null }, { visaStatus: { notIn: ['E_VISA', 'NEEDED'] } }] },
+            ],
+          },
+        ],
+      },
     });
   });
 
@@ -1344,10 +1413,11 @@ describe('FulfillmentService.batchUpdateVisaPassengerStatus', () => {
 
 // ── 签证台「签证口径」四档 + 「客人搜索」的 where 下沉 ───────────────────────────
 
-describe('visaRequirementWhere — 签证口径四档直比订单级 visaStatus', () => {
+describe('visaRequirementWhere — 签证口径四档比「录单口径」（自动办结前的原值优先）', () => {
   /**
-   * 四档逐字对应 Order.visaStatus 枚举，无推断无回退（与 issuanceMethodWhere 的
-   * 「产品字段 ?? 录单回退」是两根不同的轴，别互相串味）。
+   * 录单口径 = visaAutoCompletedFrom ?? visaStatus。Prisma 没有 coalesce，展开成
+   * 「列 = X」或「列为空 且 visaStatus = X」两支。四档逐字对应 VisaRequirement 枚举，
+   * 与 issuanceMethodWhere 的「产品字段 ?? 录单回退」是两根不同的轴，别互相串味。
    */
   const cases: Array<{ label: string; filter: VisaRequirement }> = [
     { label: '需要签证', filter: VisaRequirement.NEEDED },
@@ -1356,36 +1426,68 @@ describe('visaRequirementWhere — 签证口径四档直比订单级 visaStatus'
     { label: '未签证（不需要·自备签）', filter: VisaRequirement.NOT_NEEDED },
   ];
 
+  /** 期望的 coalesce 展开形状 */
+  function expectedEquals(status: VisaRequirement) {
+    return {
+      OR: [
+        { visaAutoCompletedFrom: status },
+        { AND: [{ visaAutoCompletedFrom: null }, { visaStatus: status }] },
+      ],
+    };
+  }
+
   for (const c of cases) {
-    it(`${c.label} → order.visaStatus = ${c.filter}`, () => {
-      expect(visaRequirementWhere(c.filter)).toEqual({ order: { visaStatus: c.filter } });
+    it(`${c.label} → 录单口径 = ${c.filter}（两支：原值列 或 列为空时的 visaStatus）`, () => {
+      expect(visaRequirementWhere(c.filter)).toEqual({ order: expectedEquals(c.filter) });
     });
   }
 
+  it('电子签档命中「已办结但录单原口径是电子签」的单（公测反馈：这批单原先一条都筛不出来）', () => {
+    const where = visaRequirementWhere(VisaRequirement.E_VISA).order as {
+      OR: Array<Record<string, unknown>>;
+    };
+    // 第一支只看原口径列，与当前 visaStatus 无关 → 办结成 HAS_VISA 的单照样命中
+    expect(where.OR[0]).toEqual({ visaAutoCompletedFrom: VisaRequirement.E_VISA });
+    // 第二支才是没被办结过的单：原口径列为空时才回落到 visaStatus
+    expect(where.OR[1]).toEqual({
+      AND: [{ visaAutoCompletedFrom: null }, { visaStatus: VisaRequirement.E_VISA }],
+    });
+  });
+
+  it('「已签证」档只剩录单手选已签证的单（被办结的单原值列非空，落不进这一档的第二支）', () => {
+    const where = visaRequirementWhere(VisaRequirement.HAS_VISA).order as {
+      OR: Array<Record<string, unknown>>;
+    };
+    // 第二支强制要求原值列为空 —— 办结派生出来的 HAS_VISA 一律不在其中
+    expect(where.OR[1]).toEqual({
+      AND: [{ visaAutoCompletedFrom: null }, { visaStatus: VisaRequirement.HAS_VISA }],
+    });
+  });
+
   it('四档互不重叠：每档只认自己那一个枚举值（等值比对，不是集合/范围）', () => {
-    const produced = cases.map((c) => visaRequirementWhere(c.filter).order);
-    const statuses = produced.map((o) => (o as { visaStatus: VisaRequirement }).visaStatus);
+    const statuses = cases.map(
+      (c) =>
+        (
+          (visaRequirementWhere(c.filter).order as { OR: Array<Record<string, unknown>> })
+            .OR[0] as { visaAutoCompletedFrom: VisaRequirement }
+        ).visaAutoCompletedFrom,
+    );
     expect(new Set(statuses).size).toBe(4);
   });
 
-  it('不做任何回退：已签证/未签证两档不会被改写成签发方式口径', () => {
-    // 这两档在 ORDER_STATUS_ISSUANCE_FALLBACK 里没有回退来源，本函数也不该去碰那张表
-    expect(visaRequirementWhere(VisaRequirement.HAS_VISA)).toEqual({
-      order: { visaStatus: VisaRequirement.HAS_VISA },
-    });
-    expect(visaRequirementWhere(VisaRequirement.NOT_NEEDED)).toEqual({
-      order: { visaStatus: VisaRequirement.NOT_NEEDED },
-    });
-  });
-
-  it("'UNSET'（未标注）→ order.visaStatus = null（IS NULL），不是某个枚举值", () => {
+  it("'UNSET'（未标注）→ 两列都 IS NULL，不是某个枚举值", () => {
     const where = visaRequirementWhere('UNSET');
-    expect(where).toEqual({ order: { visaStatus: null } });
+    expect(where).toEqual({
+      order: { AND: [{ visaAutoCompletedFrom: null }, { visaStatus: null }] },
+    });
     // 显式钉住 null 而非 undefined：undefined 在 Prisma 里等于「这个条件不存在」，
     // 会把「未标注」悄悄退化成「全部」——正是这一档要防的静默失效。
-    const { visaStatus } = (where.order ?? {}) as { visaStatus?: unknown };
-    expect(visaStatus).toBeNull();
-    expect(visaStatus).not.toBeUndefined();
+    const { AND } = (where.order ?? {}) as { AND: Array<Record<string, unknown>> };
+    for (const clause of AND) {
+      const value = Object.values(clause)[0];
+      expect(value).toBeNull();
+      expect(value).not.toBeUndefined();
+    }
   });
 
   it("'UNSET' 与「未签证(NOT_NEEDED)」是两档，不可互相顶替", () => {
@@ -1395,10 +1497,40 @@ describe('visaRequirementWhere — 签证口径四档直比订单级 visaStatus'
     );
   });
 
-  it('五档两两不同：四个枚举值 + 一个 NULL', () => {
+  it('五档两两不同：四个枚举值 + 一个两列全空', () => {
     const all = [...cases.map((c) => c.filter), 'UNSET' as const];
     const serialized = all.map((f) => JSON.stringify(visaRequirementWhere(f)));
     expect(new Set(serialized).size).toBe(5);
+  });
+});
+
+describe('recordedVisaRequirement — 录单口径（自动办结前的原值优先）', () => {
+  it('未被办结过（原值列为空）→ 就是 visaStatus 本身', () => {
+    expect(
+      recordedVisaRequirement({ visaStatus: VisaRequirement.E_VISA, visaAutoCompletedFrom: null }),
+    ).toBe(VisaRequirement.E_VISA);
+  });
+
+  it('已被自动办结 → 读原值列，不读被冲成的「已签证」', () => {
+    expect(
+      recordedVisaRequirement({
+        visaStatus: VisaRequirement.HAS_VISA,
+        visaAutoCompletedFrom: VisaRequirement.E_VISA,
+      }),
+    ).toBe(VisaRequirement.E_VISA);
+  });
+
+  it('录单手选已签证（客人自带签证）→ 仍是已签证', () => {
+    expect(
+      recordedVisaRequirement({ visaStatus: VisaRequirement.HAS_VISA, visaAutoCompletedFrom: null }),
+    ).toBe(VisaRequirement.HAS_VISA);
+  });
+
+  it('两列都空 / 订单缺失 → null（未标注）', () => {
+    expect(recordedVisaRequirement({ visaStatus: null, visaAutoCompletedFrom: null })).toBeNull();
+    expect(recordedVisaRequirement({ visaStatus: null })).toBeNull();
+    expect(recordedVisaRequirement(null)).toBeNull();
+    expect(recordedVisaRequirement(undefined)).toBeNull();
   });
 });
 
@@ -1468,7 +1600,7 @@ describe('FulfillmentService.list — 新筛选下沉到 where（count 与列表
   /** list() 的必填分页参数（schema 有默认值，这里显式给） */
   const paging = { page: 1, pageSize: 50 } as const;
 
-  it('visaRequirement 下沉为 orderItem.AND 里的 order.visaStatus 等值条件', async () => {
+  it('visaRequirement 下沉为 orderItem.AND 里的「录单口径」等值条件', async () => {
     const { findMany } = mockListPrisma();
     await new FulfillmentService().list({
       ...paging,
@@ -1478,9 +1610,7 @@ describe('FulfillmentService.list — 新筛选下沉到 where（count 与列表
     const { where } = findMany.mock.calls[0][0] as {
       where: { orderItem: { AND?: unknown[] } };
     };
-    expect(where.orderItem.AND).toContainEqual({
-      order: { visaStatus: VisaRequirement.HAS_VISA },
-    });
+    expect(where.orderItem.AND).toContainEqual(visaRequirementWhere(VisaRequirement.HAS_VISA));
   });
 
   it('passengerQuery 下沉为 orderItem.AND 里的乘客子查询', async () => {
@@ -1505,7 +1635,7 @@ describe('FulfillmentService.list — 新筛选下沉到 where（count 与列表
       where: { orderItem: { AND?: unknown[] } };
     };
     expect(where.orderItem.AND).toHaveLength(2);
-    expect(where.orderItem.AND).toContainEqual({ order: { visaStatus: VisaRequirement.NEEDED } });
+    expect(where.orderItem.AND).toContainEqual(visaRequirementWhere(VisaRequirement.NEEDED));
     expect(where.orderItem.AND).toContainEqual(passengerQueryWhere('E1234567'));
   });
 
