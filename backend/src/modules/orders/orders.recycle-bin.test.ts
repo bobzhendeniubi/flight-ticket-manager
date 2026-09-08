@@ -202,6 +202,8 @@ describe('listDeletedOrders · search 分词（与主列表同口径：词间 AN
               { fullName: { contains: term, mode: 'insensitive' } },
               { chineseName: { contains: term, mode: 'insensitive' } },
               { documentNumber: { contains: term, mode: 'insensitive' } },
+              // 旧身份（换人/订正之前的姓名 + 证件号）：回收站与主列表同口径，一起吃这一支。
+              { formerIdentities: { contains: term, mode: 'insensitive' } },
             ],
           },
         },
@@ -269,6 +271,7 @@ describe('listDeletedOrders · search 分词（与主列表同口径：词间 AN
             { fullName: { contains: 'EA1234567', mode: 'insensitive' } },
             { chineseName: { contains: 'EA1234567', mode: 'insensitive' } },
             { documentNumber: { contains: 'EA1234567', mode: 'insensitive' } },
+            { formerIdentities: { contains: 'EA1234567', mode: 'insensitive' } },
           ],
         },
       },

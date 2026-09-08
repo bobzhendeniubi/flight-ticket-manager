@@ -1760,3 +1760,139 @@ describe('佣金计提读取 · 查询失败要响亮（不吞成「没计提」
     expect(commissionAudits).toHaveLength(0);
   });
 });
+
+/**
+ * 旧身份留痕（Passenger.formerIdentities）：换人是就地覆盖同一条乘客行，
+ * 不留一份旧姓名/旧证件号，订单管理的搜索框事后就再也搜不出这张单
+ * （运营反馈：订单换人之后，搜换之前的人要能搜出来）。
+ * 断言看的是 passenger.update 那一笔真的带上了追加后的值 —— 追加、不覆盖、不重复堆段。
+ */
+describe('换人 · 旧身份留痕（formerIdentities）', () => {
+  /** 取换人那一次 passenger.update 的 data。 */
+  function lastPassengerUpdateData(): Record<string, unknown> {
+    const call = mockPrisma.passenger.update.mock.calls.at(-1) as
+      | [{ data: Record<string, unknown> }]
+      | undefined;
+    return call?.[0]?.data ?? {};
+  }
+
+  it('首次换人：把换前的拼音名 中文名 证件号拼成一段写进去', async () => {
+    mountSwap({ totalCny: 3000, ratePerPersonCny: 1000 });
+    mockPrisma.passenger.findUnique.mockResolvedValue({
+      id: 'pax-1',
+      orderId: 'ord1',
+      fullName: 'OLD/PERSON',
+      documentNumber: 'OLD111',
+      visaExempt: false,
+      passengerType: 'ADULT',
+      pnr: null,
+      eticketNumber: null,
+      chineseName: '旧人',
+      dateOfBirth: null,
+      passportExpiry: null,
+      formerIdentities: null,
+    });
+
+    await new OrderService().swapPassenger('ord1', 'pax-1', swapBody(450), ADMIN);
+
+    expect(lastPassengerUpdateData().formerIdentities).toBe('OLD/PERSON 旧人 OLD111');
+  });
+
+  it('再次换人：用「 | 」追加在已有历史之后（绝不覆盖前一段）', async () => {
+    mountSwap({ totalCny: 3000, ratePerPersonCny: 1000 });
+    mockPrisma.passenger.findUnique.mockResolvedValue({
+      id: 'pax-1',
+      orderId: 'ord1',
+      fullName: 'SECOND/PERSON',
+      documentNumber: 'SEC222',
+      visaExempt: false,
+      passengerType: 'ADULT',
+      pnr: null,
+      eticketNumber: null,
+      chineseName: null,
+      dateOfBirth: null,
+      passportExpiry: null,
+      formerIdentities: 'OLD/PERSON 旧人 OLD111',
+    });
+
+    await new OrderService().swapPassenger('ord1', 'pax-1', swapBody(450), ADMIN);
+
+    expect(lastPassengerUpdateData().formerIdentities).toBe(
+      'OLD/PERSON 旧人 OLD111 | SECOND/PERSON SEC222',
+    );
+  });
+
+  it('换回同一套身份：这一段已经在历史里 → 不重复堆段（这次不写这一列）', async () => {
+    mountSwap({ totalCny: 3000, ratePerPersonCny: 1000 });
+    mockPrisma.passenger.findUnique.mockResolvedValue({
+      id: 'pax-1',
+      orderId: 'ord1',
+      fullName: 'OLD/PERSON',
+      documentNumber: 'OLD111',
+      visaExempt: false,
+      passengerType: 'ADULT',
+      pnr: null,
+      eticketNumber: null,
+      chineseName: null,
+      dateOfBirth: null,
+      passportExpiry: null,
+      formerIdentities: 'OLD/PERSON OLD111',
+    });
+
+    await new OrderService().swapPassenger('ord1', 'pax-1', swapBody(450), ADMIN);
+
+    expect(lastPassengerUpdateData()).not.toHaveProperty('formerIdentities');
+  });
+
+  it('不出接口：订单详情里的乘客不带 formerIdentities（旧身份不跨人露出）', async () => {
+    mountSwap({ totalCny: 3000, ratePerPersonCny: 1000 });
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValue({
+      ...fakeFullOrder(),
+      passengers: [
+        {
+          id: 'pax-1',
+          fullName: 'NEW/PERSON',
+          documentNumber: 'NEW999',
+          passportPhotoUrl: null,
+          formerIdentities: 'OLD/PERSON OLD111',
+        },
+      ],
+    });
+
+    const { order } = await new OrderService().swapPassenger(
+      'ord1',
+      'pax-1',
+      swapBody(450),
+      ADMIN,
+    );
+
+    expect(order.passengers[0]).not.toHaveProperty('formerIdentities');
+  });
+
+  it('不是换人的小修（证件号没变、只改生日）→ 不留段', async () => {
+    mountSwap({ totalCny: 3000, ratePerPersonCny: 1000 });
+    mockPrisma.passenger.findUnique.mockResolvedValue({
+      id: 'pax-1',
+      orderId: 'ord1',
+      fullName: 'OLD/PERSON',
+      documentNumber: 'OLD111',
+      visaExempt: false,
+      passengerType: 'ADULT',
+      pnr: null,
+      eticketNumber: null,
+      chineseName: null,
+      dateOfBirth: null,
+      passportExpiry: null,
+      formerIdentities: null,
+    });
+
+    await new OrderService().swapPassenger(
+      'ord1',
+      'pax-1',
+      { dateOfBirth: '1990-01-01' },
+      ADMIN,
+    );
+
+    expect(lastPassengerUpdateData()).not.toHaveProperty('formerIdentities');
+  });
+});

@@ -4,6 +4,8 @@
  * 两件事都发生在「取数 where」这一层，故合并一个文件：
  *   1) buildSearchTermClause —— 搜索词要能命中订单项名称（产品名/酒店名/签证名）。
  *      此前只认订单号/联系人/电话/乘客名/证件号/备注，按产品名搜一律空手而归。
+ *      同一支乘客子查询还要吃 formerIdentities（换人/订正前的旧身份）——
+ *      运营反馈：订单换人之后，搜换之前那个人的名字/证件号也要能搜出这张单。
  *   2) buildOrderFilterWhere 的出行日期分支 —— 纯签证单的日期锚点。
  *      · 有锚点（填了签证预计出行日期 visaIntendedDate）：列表与导出都按区间命中；
  *      · 无锚点（连日期都没填）：**仅导出**路径（includeAnchorless: true）把它取回，
@@ -43,6 +45,28 @@ describe('buildSearchTermClause · 搜索吃产品名（订单项 description）
     expect(or).toContainEqual({ noteVisa: { contains: 'abc', mode: 'insensitive' } });
     expect(or.some((c) => 'passengers' in c)).toBe(true);
     expect(or).toHaveLength(11);
+  });
+
+  it('乘客子查询里含 formerIdentities：换人之后搜换之前那个人也能命中', () => {
+    const clause = buildSearchTermClause('ZHANG');
+    const or = clause.OR as Array<Record<string, unknown>>;
+    const passengerBlock = or.find((c) => 'passengers' in c) as {
+      passengers: { some: { OR: Array<Record<string, unknown>> } };
+    };
+    expect(passengerBlock.passengers.some.OR).toContainEqual({
+      formerIdentities: { contains: 'ZHANG', mode: 'insensitive' },
+    });
+    // 现值三项一个都没少（旧身份是新增的第四支，不是替换）。
+    expect(passengerBlock.passengers.some.OR).toHaveLength(4);
+  });
+
+  it('「乘客姓名」贴名单筛选同样吃 formerIdentities（贴老名单能认出已换人的那几位）', () => {
+    const where = buildOrderFilterWhere({ passengerName: '王小明 李四' });
+    const or = (where.passengers as { some: { OR: Array<Record<string, unknown>> } }).some.OR;
+    expect(or).toContainEqual({ formerIdentities: { contains: '王小明', mode: 'insensitive' } });
+    expect(or).toContainEqual({ formerIdentities: { contains: '李四', mode: 'insensitive' } });
+    // 每个词三支（拼音名 / 中文名 / 旧身份）。
+    expect(or).toHaveLength(6);
   });
 
   it('多词搜索：每个词各自成一个 OR 块、词间 AND（产品名与乘客名可分别命中同一单）', () => {

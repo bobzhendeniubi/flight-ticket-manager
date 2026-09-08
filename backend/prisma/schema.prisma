@@ -1904,6 +1904,9 @@ model Passenger {
 
   // ── 护照扩展（出票 + 签证用）──
   chineseName          String? // 中文姓名（OCR 识别或手工填写）
+  // 曾用身份（换人 / 改信息改了姓名或证件号时追加：英文名 中文名 证件号，多次以「 | 」分隔）。
+  // 只做搜索召回用（订单搜索 / 乘客姓名贴名单能搜到换前的人），不参与任何业务判定。
+  formerIdentities     String?
   passportIssueDate    DateTime? @db.Date // 护照签发日期
   passportIssueCountry String? // 颁发国 ISO-2，如 CHN
   passportIssuePlace   String? // 护照签发地点（城市/机关文本，OCR 识别或手填，选填）

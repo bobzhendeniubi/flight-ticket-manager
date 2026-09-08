@@ -3717,7 +3717,11 @@ describe('correctPassenger · 订正证件资料', () => {
     await service.correctPassenger('ord1', 'px1', { documentNumber: 'E12345078' }, OPS);
 
     const data = mockPrisma.passenger.update.mock.calls[0][0].data;
-    expect(data).toEqual({ documentNumber: 'E12345078' });
+    // 除证件号外只多一列 formerIdentities（旧身份留痕：改完还要能按错的那个证件号搜出这张单）。
+    expect(data).toEqual({
+      documentNumber: 'E12345078',
+      formerIdentities: 'ZHANG/SAN 张三 E12345Q78',
+    });
     // 换人通道会把下面这些随人清空 —— 订正一个都不许碰（连键都不该出现）
     for (const cleared of [
       'passportPhotoUrl',
@@ -3786,6 +3790,26 @@ describe('correctPassenger · 订正证件资料', () => {
     await service.correctPassenger('ord1', 'px1', { chineseName: '张叁' }, OPS);
 
     expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('只订正生日 → 不留旧身份段（一个搜得到的值都没丢）', async () => {
+    const service = new OrderService();
+    armCorrectMocks();
+
+    await service.correctPassenger('ord1', 'px1', { dateOfBirth: '1990-02-02' }, OPS);
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data).not.toHaveProperty('formerIdentities');
+  });
+
+  it('订正中文名 → 旧身份留一段（运营手里那张单子上写的往往还是错的那个名字）', async () => {
+    const service = new OrderService();
+    armCorrectMocks();
+
+    await service.correctPassenger('ord1', 'px1', { chineseName: '张叁' }, OPS);
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data.formerIdentities).toBe('ZHANG/SAN 张三 E12345Q78');
   });
 
   it('订正后的证件号已在同班次的有效订单里占座 → 拒（同一人不能占两份座）', async () => {
@@ -7660,7 +7684,7 @@ describe('buildOrderFilterWhere · 搜索/乘客姓名含中文名（公测反�
     }>;
   }
 
-  it('单词 search → 一个 OR 匹配块，含乘客 fullName/chineseName/documentNumber 模糊匹配', () => {
+  it('单词 search → 一个 OR 匹配块，含乘客 fullName/chineseName/documentNumber/旧身份 模糊匹配', () => {
     const where = buildOrderFilterWhere({ search: '张伟' });
     const clauses = searchClauses(where);
     expect(clauses).toHaveLength(1);
@@ -7672,6 +7696,8 @@ describe('buildOrderFilterWhere · 搜索/乘客姓名含中文名（公测反�
       { fullName: { contains: '张伟', mode: 'insensitive' } },
       { chineseName: { contains: '张伟', mode: 'insensitive' } },
       { documentNumber: { contains: '张伟', mode: 'insensitive' } },
+      // 换人/订正之前的旧身份：换完人还要能按换之前那个人搜出这张单。
+      { formerIdentities: { contains: '张伟', mode: 'insensitive' } },
     ]);
   });
 
@@ -7711,13 +7737,15 @@ describe('buildOrderFilterWhere · 搜索/乘客姓名含中文名（公测反�
     ).toHaveLength(1);
   });
 
-  it('passengerName → fullName 与 chineseName 任一命中', () => {
+  it('passengerName → fullName / chineseName / 旧身份任一命中', () => {
     const where = buildOrderFilterWhere({ passengerName: '李娜' });
     expect(where.passengers).toEqual({
       some: {
         OR: [
           { fullName: { contains: '李娜', mode: 'insensitive' } },
           { chineseName: { contains: '李娜', mode: 'insensitive' } },
+          // 换人/订正之前的旧身份：贴老名单时已换过人的那几位同样要被认出来。
+          { formerIdentities: { contains: '李娜', mode: 'insensitive' } },
         ],
       },
     });
@@ -7728,8 +7756,8 @@ describe('buildOrderFilterWhere · 搜索/乘客姓名含中文名（公测反�
     const names = Array.from({ length: 30 }, (_, i) => `团员${i + 1}`);
     const where = buildOrderFilterWhere({ passengerName: names.join(' ') });
     const or = (where.passengers as { some: { OR: unknown[] } }).some.OR;
-    // 30 个词 × 2 个字段（fullName/chineseName）= 60 个候选
-    expect(or).toHaveLength(60);
+    // 30 个词 × 3 个字段（fullName/chineseName/formerIdentities）= 90 个候选
+    expect(or).toHaveLength(90);
     expect(or).toContainEqual({ fullName: { contains: '团员30', mode: 'insensitive' } });
   });
 

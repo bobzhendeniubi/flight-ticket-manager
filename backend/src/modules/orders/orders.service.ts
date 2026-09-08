@@ -694,6 +694,50 @@ const CORRECTABLE_IDENTITY_FIELDS = [
  */
 const CORRECTION_NAME_FIELDS = ['fullName', 'lastName', 'firstName'] as const;
 
+// ── 旧身份留痕（Passenger.formerIdentities）────────────────────────────────
+/**
+ * 段与段之间的分隔符。换人 / 订正都复用同一条列，一位出行人换过几轮就留几段。
+ */
+const FORMER_IDENTITY_SEPARATOR = ' | ';
+
+/**
+ * 把一位出行人「改动之前」的身份拼成一段：拼音名 / 中文名 / 证件号，有值的用空格连起来。
+ *
+ * 运营需求：订单换人之后，订单管理的搜索框里搜**换之前**那个人（名字或证件号）也要能搜出这张单。
+ * 换人是就地覆盖同一条 Passenger 行，旧值只剩审计流水里有；审计表与 Order 没有 Prisma 关系，
+ * 搜索的 where 够不着 —— 所以把旧身份原样冗余进乘客行，让搜索子句像搜现值一样搜它。
+ * 导出仅供 orders.service 内部与单测使用。
+ */
+export function formatFormerIdentitySegment(identity: {
+  fullName?: string | null;
+  chineseName?: string | null;
+  documentNumber?: string | null;
+}): string {
+  return [identity.fullName, identity.chineseName, identity.documentNumber]
+    .map((value) => (value ?? '').trim())
+    .filter((value) => value !== '')
+    .join(' ');
+}
+
+/**
+ * 把一段旧身份**追加**到已有的 formerIdentities（绝不覆盖，历史一段都不能丢）。
+ *
+ * 返回 undefined = 这次不必写库：段是空的（旧值三项全空），或这一段已经在历史里
+ * （同一位出行人来回改回同一个名字时不重复堆段）。
+ * 导出仅供 orders.service 内部与单测使用。
+ */
+export function appendFormerIdentity(
+  existing: string | null | undefined,
+  segment: string,
+): string | undefined {
+  if (segment === '') return undefined;
+  const current = (existing ?? '').trim();
+  if (current === '') return segment;
+  const seen = current.split(FORMER_IDENTITY_SEPARATOR).map((part) => part.trim());
+  if (seen.includes(segment)) return undefined;
+  return `${current}${FORMER_IDENTITY_SEPARATOR}${segment}`;
+}
+
 /**
  * 只改姓名（证件号不动）时允许的最大编辑距离。比证件号那道闸（TYPO_MAX_EDIT_DISTANCE=2）松一格：
  * 姓名订正常见的漏音节 / 姓名颠倒一个字就能差到 3，而真换人差得远不止 3。
@@ -10092,6 +10136,8 @@ export class OrderService {
           chineseName: true,
           dateOfBirth: true,
           passportExpiry: true,
+          // 旧身份留痕：换人时把换前的姓名/证件号追加进去（搜索要能搜到换之前的人，见下方 1e2）。
+          formerIdentities: true,
         },
       });
       if (!passenger || passenger.orderId !== orderId) {
@@ -10305,6 +10351,37 @@ export class OrderService {
         visaExempt: passenger.visaExempt === true,
         visaStatus: order.visaStatus ?? null,
       });
+
+      // ── 1e2. 旧身份留痕（供搜索回溯换之前的人）────────────────────────────
+      // 换人是就地覆盖同一条 Passenger 行：写完这一笔，旧名字/旧证件号在库里就不存在了，
+      // 订单管理搜索框再也搜不出这张单（运营反馈：换人之后要能搜出换之前的人）。
+      // 所以在覆盖之前，把旧的拼音名/中文名/证件号拼成一段追加到 formerIdentities，
+      // 由 buildSearchTermClause 与「乘客姓名」贴名单筛选一并 contains。
+      // 只在身份三项真的变了时才追加：改生日/性别/自备签这类小修不产生新段（改错别字也会留段——
+      // 运营记的往往就是那个错名字，留着反而找得到）。
+      // 判据是「有没有**丢掉**一个原本搜得到的值」，不是「字段动没动」：
+      // 从空补上中文名不算（旧身份一个字都没少，留段只是把现值抄一遍）。
+      const oldChineseName = (passenger.chineseName ?? '').trim();
+      // 证件号变化时 1b 会把本次没带新值的 chineseName 清成 null —— 旧中文名同样是「丢了」。
+      const nextChineseName =
+        input.chineseName !== undefined
+          ? (input.chineseName ?? '').trim()
+          : documentChanged
+            ? ''
+            : oldChineseName;
+      const swapIdentityLost =
+        (input.fullName !== undefined &&
+          (passenger.fullName ?? '').trim() !== '' &&
+          input.fullName !== passenger.fullName) ||
+        (oldChineseName !== '' && nextChineseName !== oldChineseName) ||
+        (documentChanged && (passenger.documentNumber ?? '').trim() !== '');
+      if (swapIdentityLost) {
+        const nextFormerIdentities = appendFormerIdentity(
+          passenger.formerIdentities,
+          formatFormerIdentitySegment(passenger),
+        );
+        if (nextFormerIdentities !== undefined) data.formerIdentities = nextFormerIdentities;
+      }
 
       await tx.passenger.update({ where: { id: passengerId }, data });
 
@@ -11737,6 +11814,8 @@ export class OrderService {
           passengerType: true,
           passportExpiry: true,
           passportIssueDate: true,
+          // 旧身份留痕：姓名/证件号真改了才追加一段（见下方写入前那段）。
+          formerIdentities: true,
           // 票务现势：代理订正闸要读（已订座/已出票的人不给代理改票面身份）。
           pnr: true,
           eticketNumber: true,
@@ -11953,6 +12032,27 @@ export class OrderService {
             ),
           );
         }
+      }
+
+      // ── 旧身份留痕（与换人同一条列、同一段格式）──────────────────────────
+      // 订正也会把票面身份就地覆盖：运营手里那张单子上写的往往还是**错的那个名字**，
+      // 改完就搜不出来了。拼音名/中文名/证件号真的被改掉才留段；只改生日/性别/国籍不留。
+      // 判据同换人：只在**丢掉**一个原本搜得到的值时才留段（从空补上不算）。
+      const oldChineseName = (passenger.chineseName ?? '').trim();
+      const correctionIdentityLost =
+        (input.fullName !== undefined &&
+          (passenger.fullName ?? '').trim() !== '' &&
+          input.fullName !== passenger.fullName) ||
+        (input.chineseName !== undefined &&
+          oldChineseName !== '' &&
+          (input.chineseName ?? '').trim() !== oldChineseName) ||
+        (documentChanging && oldDocument !== '');
+      if (correctionIdentityLost) {
+        const nextFormerIdentities = appendFormerIdentity(
+          passenger.formerIdentities,
+          formatFormerIdentitySegment(passenger),
+        );
+        if (nextFormerIdentities !== undefined) data.formerIdentities = nextFormerIdentities;
       }
 
       const updated = await tx.passenger.update({ where: { id: passengerId }, data });
@@ -21901,6 +22001,7 @@ export function splitSearchTerms(search: string, limit: number = MAX_SEARCH_TERM
  * - 订单号 / 联系人 / 联系电话（历史字段，保持原语义）；
  * - 乘客中/英文名（公测反馈：搜索框要能按乘客姓名搜到订单）；
  * - 乘客护照号 documentNumber（运营需求：按证件号定位订单）；
+ * - 乘客的旧身份 formerIdentities（运营反馈：换人之后，搜换之前那个人也要能搜出这张单）；
  * - 订单级备注六栏 notes/internalNotes/noteHotel/noteVisa/notePayment/noteSpecial；
  * - 订单项名称 OrderItem.description（公测反馈：搜产品名/酒店名/签证名要能搜到订单）——
  *   运营记得住「客人买的是哪个产品」的次数，不比记得住订单号少；此前搜索只认订单号/人/备注，
@@ -21926,6 +22027,9 @@ export function buildSearchTermClause(term: string): Prisma.OrderWhereInput {
               { fullName: { contains: term, mode: 'insensitive' } },
               { chineseName: { contains: term, mode: 'insensitive' } },
               { documentNumber: { contains: term, mode: 'insensitive' } },
+              // 换人 / 订正之前的旧身份（姓名 + 证件号拼段）——运营反馈：换完人还要能按
+              // 换之前那个人搜出这张单。旧值只在同一条乘客行上冗余，不必连审计表。
+              { formerIdentities: { contains: term, mode: 'insensitive' } },
             ],
           },
         },
@@ -22264,6 +22368,8 @@ export function buildOrderFilterWhere(
         OR: terms.flatMap((term) => [
           { fullName: { contains: term, mode: 'insensitive' } },
           { chineseName: { contains: term, mode: 'insensitive' } },
+          // 换人 / 订正之前的旧身份：贴一整团的老名单时，已经换过人的那几位同样要被认出来。
+          { formerIdentities: { contains: term, mode: 'insensitive' } },
         ]),
       },
     };
@@ -24324,10 +24430,15 @@ function serializePassengerRecord<P extends Record<string, unknown>>(
   p: P,
   opts: { keepPhotoUrl?: boolean } = {},
 ): Record<string, unknown> {
-  if (!('passportPhotoUrl' in p)) return p;
-  const hasPassportPhoto = p.passportPhotoUrl != null;
-  if (opts.keepPhotoUrl) return { ...p, hasPassportPhoto };
-  const { passportPhotoUrl: _stripped, ...rest } = p;
+  // formerIdentities（换人/订正前的旧身份）只服务服务端搜索，一律不出接口：
+  // 它装的是**上一位出行人**的姓名 + 证件号，接单方换了人之后，新客/代理打开订单详情
+  // 就能读到前一位客人的护照号 —— 这条列不该跨人露出。「换人记录」界面读的是审计流水，
+  // 不依赖这一列。
+  const { formerIdentities: _former, ...visible } = p as Record<string, unknown>;
+  if (!('passportPhotoUrl' in visible)) return visible;
+  const hasPassportPhoto = visible.passportPhotoUrl != null;
+  if (opts.keepPhotoUrl) return { ...visible, hasPassportPhoto };
+  const { passportPhotoUrl: _stripped, ...rest } = visible;
   return { ...rest, hasPassportPhoto };
 }
 
