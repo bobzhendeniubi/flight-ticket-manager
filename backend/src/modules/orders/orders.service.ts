@@ -1466,6 +1466,43 @@ export function buildUpgradedCabinDescription(description: string): string {
   return `${description} · 商务舱`;
 }
 
+// ── 改自备签后刷新套餐行描述 ─────────────────────────────────────────────
+/** 录单端拼套餐行描述时各段的连接符（「套餐名 · 出发日 · 2成人 · 自备签×1」）。 */
+const BUNDLE_DESCRIPTION_SEPARATOR = ' · ';
+/** 描述里的自备签人数段：录单端写法固定为 `自备签×N`，0 人时不写该段。 */
+const SELF_VISA_COUNT_SEGMENT_RE = /^自备签×\d+$/;
+
+/**
+ * 按乘客现势刷新套餐行描述里的「自备签×N」段。
+ *
+ * description 是建单时录单端拼死的文本（列表/详情/导出直接显示）；改自备签只更新
+ * amount/metadata 不刷描述的话，行上仍写着旧人数（乘客已改回随团、描述还是「自备签×1」）。
+ * 口径与录单端同一拼法：各段以「 · 」连接，自备签段写作 `自备签×N`；
+ *   · count>0：已有该段 → 就地改数字；没有 → 末尾追加；
+ *   · count=0：去掉该段（录单端 0 人本就不写）。
+ * 其余各段一字不动。纯函数，导出供单测复用。
+ */
+export function rewriteSelfVisaCountDescription(description: string, count: number): string {
+  const n = Math.max(0, Math.trunc(Number(count) || 0));
+  const kept = description
+    .split(BUNDLE_DESCRIPTION_SEPARATOR)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0 && !SELF_VISA_COUNT_SEGMENT_RE.test(s));
+  if (n > 0) kept.push(`自备签×${n}`);
+  return kept.join(BUNDLE_DESCRIPTION_SEPARATOR);
+}
+
+/**
+ * 已开票单改价 / 改自备签的非阻断警示（开票状态与改价解耦，见运营反馈 2026-09-08）。
+ * 只在应收真的变了（delta≠0）才给一句；金额带正负号，让票务一眼看出发票该多开还是少开。
+ */
+function formatSignedCny(deltaCny: number): string {
+  return `${deltaCny > 0 ? '+' : '−'}¥${Math.abs(deltaCny)}`;
+}
+function buildInvoicedChangeWarning(deltaCny: number): string {
+  return `本单已开票，本次应收变动 ${formatSignedCny(deltaCny)}，请通知票务核对发票金额。`;
+}
+
 /** 补房差/换酒店成本口径：每晚成本取值来源（供 metadata.costSource 与审计留痕）。 */
 export type RoomCostSource = 'ITEM_SNAPSHOT' | 'PRODUCT' | 'ZERO';
 
@@ -6231,7 +6268,7 @@ export class OrderService {
     actor: { userId: string; role: UserRole },
   ): Promise<{
     order: ReturnType<typeof serializeOrder>;
-    /** B12：已付款单改价的资金后果提示（多付/新尾款）+ 已计提佣金提示；均无后果时 null。*/
+    /** B12：已付款单改价的资金后果提示（多付/新尾款）+ 已计提佣金提示 + 已开票提示；均无后果时 null。*/
     warning: string | null;
     audit: {
       orderNumber: string;
@@ -6239,6 +6276,8 @@ export class OrderService {
       before: { unitPrice: string; amount: string; subtotal: string; total: string };
       after: { unitPrice: string; amount: string; subtotal: string; total: string };
       reason?: string;
+      /** 改价时本单已开票（任一维度）且应收真的变了：票务要对发票，审计据此可筛。 */
+      invoicedAtChange: boolean;
     };
   }> {
     if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
@@ -6275,14 +6314,10 @@ export class OrderService {
       // 资金处置闸：结算价直接改 item.amount 与 order.total（也是取消手续费基数），
       // 死单/软删单不许改——否则可在退款前偷偷抬价操纵应退额，或改回收站单的应收。
       assertOrderAllowsFundsDisposal(order, '修改结算价');
-      // 开票闸（B12）：任一维度已开票后改结算价，发票金额与订单金额必然脱钩——
-      // 发票是已交付下游的凭证，改价必须先冲开票状态（票务台改回未开）、改完价再重开。
-      if (order.outboundInvoiced || order.returnInvoiced || order.systemInvoiced) {
-        throw new BadRequestError(
-          '该订单已有开票记录（去程/回程/系统任一已开），改结算价会使发票与订单金额不一致。' +
-            '请先在票务台把对应开票状态改回「未开」，改价后再重新开票。',
-        );
-      }
+      // 开票不闸（运营反馈 2026-09-08）：开票状态与改价是两件事，调价通道本就不看开票位，
+      // 这里硬拦只会逼操作人「改回未开→改价→再标已开」绕一圈。改为非阻断：已开票且应收
+      // 真的变了 → 返回警示让票务核对发票 + 审计打 invoicedAtChange 标记，可追溯。
+      const invoiced = order.outboundInvoiced || order.returnInvoiced || order.systemInvoiced;
 
       // 锁**之后**才读 items：锁之前读到的快照可能已被并发改价写脏，拿它重算等于锁了个寂寞。
       const items = await tx.orderItem.findMany({
@@ -6369,8 +6404,12 @@ export class OrderService {
             '请补收该差额或确认本次改价金额无误。';
         }
       }
-      // 佣金提示与资金提示并列返回：两件事互不覆盖（可能同时成立）。
-      warning = [warning, commissionWarning].filter(Boolean).join(' ') || null;
+      // 已开票提示：发票是已交付下游的凭证，应收变了要让票务对一次发票金额（不拦，只提醒）。
+      const invoiceDeltaCny = round2(newTotal - Number(order.total.toString()));
+      const invoicedAtChange = invoiced && invoiceDeltaCny !== 0;
+      const invoiceWarning = invoicedAtChange ? buildInvoicedChangeWarning(invoiceDeltaCny) : null;
+      // 资金 / 佣金 / 开票三类提示并列返回：互不覆盖（可能同时成立）。
+      warning = [warning, commissionWarning, invoiceWarning].filter(Boolean).join(' ') || null;
 
       return {
         orderNumber: order.orderNumber,
@@ -6384,6 +6423,7 @@ export class OrderService {
         afterTotal: updated.total.toString(),
         warning,
         accruedCommissionCny,
+        invoicedAtChange,
       };
     });
 
@@ -6434,6 +6474,7 @@ export class OrderService {
           total: scratch.afterTotal,
         },
         reason: input.reason,
+        invoicedAtChange: scratch.invoicedAtChange,
       },
     };
   }
@@ -12116,7 +12157,8 @@ export class OrderService {
    *
    * 守卫（依序）：占座态 + 未软删 → 幂等短路 → false→true 需送签进度仍为 PENDING（已在办理
    * 则批文成本已发生）→ 换人通道补过钱的乘客拒绝（防两套钱法叠加双计）→ 有钱语义时
-   * 结算锁 / 开票闸 / 多条钱行拒绝。非 BUNDLE 单（纯机票/签证单等）纯改标记，不动钱。
+   * 结算锁 / 多条钱行拒绝。非 BUNDLE 单（纯机票/签证单等）纯改标记，不动钱。
+   * 开票不闸（与调价通道同口径）：已开票且应收变了 → warning 提醒票务核对 + 审计 invoicedAtChange。
    */
   async setPassengerVisaExempt(
     orderId: string,
@@ -12145,6 +12187,8 @@ export class OrderService {
       refundCny: number | null;
       /** 已送签人为确认路径：批文成本留存金额（其余路径 0）。 */
       retainCny: number;
+      /** 翻转时本单已开票（任一维度）且应收真的变了：票务要对发票，审计据此可筛。 */
+      invoicedAtChange: boolean;
     } | null;
   }> {
     if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
@@ -12257,7 +12301,7 @@ export class OrderService {
       // ── 5. 钱（仅 BUNDLE 行有钱的语义）：预检 → 翻标记 → 行重算 ────────────
       const bundleItems = await tx.orderItem.findMany({
         where: { orderId, kind: OrderItemKind.BUNDLE },
-        select: { id: true, quantity: true, amount: true, metadata: true },
+        select: { id: true, quantity: true, amount: true, metadata: true, description: true },
       });
       const readAddOnSnapshot = (raw: unknown): Partial<BundleAddOnBreakdown> | null => {
         const meta =
@@ -12279,13 +12323,9 @@ export class OrderService {
         if (order.settlementLocked) {
           throw new ConflictError('结算价已锁定，改自备签会变更套餐应收，请先解锁结算价再操作');
         }
-        // 开票闸（与改结算价同口径）：发票是已交付下游的凭证，改价必须先冲开票状态再改。
-        if (order.outboundInvoiced || order.returnInvoiced || order.systemInvoiced) {
-          throw new ConflictError(
-            '该订单已有开票记录（去程/回程/系统任一已开），改自备签会使发票与订单金额不一致。' +
-              '请先在票务台把对应开票状态改回「未开」，改完后如需可重新开票。',
-          );
-        }
+        // 开票不闸（运营反馈 2026-09-08）：开票状态与改办签方式是两件事，调价通道本就不看
+        // 开票位，这里硬拦只会逼操作人「改回未开→翻自备签→再标已开」绕一圈。已开票且应收
+        // 真的变了 → 事务末尾给非阻断警示 + 审计 invoicedAtChange 标记（见 5d）。
         if (moneyLines.length > 1) {
           throw new ConflictError(
             '本单存在多条含自备签减免的套餐行，系统无法自动分摊差额，请人工核对后走调价通道处理',
@@ -12395,6 +12435,12 @@ export class OrderService {
               ...lineMeta,
               addOns: newAddOn.breakdown,
             } as unknown as Prisma.InputJsonValue,
+            // 描述同步：行描述是建单时拼死的「… · 自备签×N」，人数变了尾巴也要跟上
+            // （否则乘客已改回随团、行上还写着自备签×1）。人数取重算后的权威快照。
+            description: rewriteSelfVisaCountDescription(
+              line.description,
+              newAddOn.breakdown.selfProvidedVisaCount,
+            ),
           },
         });
         // 锁内重新聚合最新 items 算 subtotal/total（与改结算价同款，天然吃到并发已提交的改动）。
@@ -12476,6 +12522,14 @@ export class OrderService {
         }
       }
 
+      // ── 5d. 已开票提示（非阻断）：应收变了要让票务对一次发票金额；纯改标记（delta=0）不提。
+      // 净变动按「行重算差额 + 批文成本留存」算：已送签少退路径下客人实际只少付 refund。
+      const netDeltaCny = round2(totalDeltaCny + retainCny);
+      const invoicedAtChange =
+        (order.outboundInvoiced || order.returnInvoiced || order.systemInvoiced) &&
+        netDeltaCny !== 0;
+      const invoiceWarning = invoicedAtChange ? buildInvoicedChangeWarning(netDeltaCny) : null;
+
       return {
         noop: false as const,
         orderNumber: order.orderNumber,
@@ -12483,7 +12537,9 @@ export class OrderService {
         totalDeltaCny,
         refundCnyApplied,
         retainCny,
-        warning,
+        // 任务警示与开票警示并列返回：两件事互不覆盖（可能同时成立）。
+        warning: [warning, invoiceWarning].filter(Boolean).join(' ') || null,
+        invoicedAtChange,
       };
     });
 
@@ -12515,6 +12571,7 @@ export class OrderService {
         // 已送签人为确认（非该路径时为 null/0）：实退给客人 / 批文成本留存
         refundCny: scratch.refundCnyApplied,
         retainCny: scratch.retainCny,
+        invoicedAtChange: scratch.invoicedAtChange,
       },
     };
   }

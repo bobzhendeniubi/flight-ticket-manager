@@ -10,7 +10,9 @@
  *   5. BUNDLE 单翻转钱对称：false→true 减一份快照费率 / true→false 加回一份；
  *      metadata.addOns 快照同步（selfProvidedVisaCount / selfVisaDeductTotal）；
  *      subtotal/total 按锁内聚合写回。
- *   6. 结算锁 / 开票闸：有钱语义时 → ConflictError（且不写乘客）。
+ *   6. 结算锁：有钱语义时 → ConflictError（且不写乘客）；开票不闸（与调价通道同口径）：
+ *      放行 + warning 提醒票务核对 + audit.invoicedAtChange=true；纯改标记（无钱）不提。
+ *   6b. 行描述同步：翻转后「自备签×N」尾段跟随权威人数（0 人去段）。
  *   7. 非 BUNDLE 单：纯改标记，不动任何行金额与订单总额。
  *   8. visaSubmissionStatus 双向置回 PENDING（true→false 连 CONFIRMED 也重置）。
  */
@@ -32,7 +34,7 @@ vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
 
 import { Prisma } from '@prisma/client';
 
-import { OrderService } from './orders.service.js';
+import { OrderService, rewriteSelfVisaCountDescription } from './orders.service.js';
 import { ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import { setPassengerVisaExemptBodySchema } from './orders.schemas.js';
 
@@ -253,12 +255,43 @@ describe('OrderService.setPassengerVisaExempt · 权限与守卫', () => {
   });
 });
 
+/** 建单时录单端拼的套餐行描述（与 SingleOrderModal 同一拼法：各段「 · 」连接，0 人不写自备签段）。 */
+const bundleDescription = (snapshotCount: number) =>
+  ['椰岛5晚', '2026-09-10出发', '2成人', snapshotCount > 0 ? `自备签×${snapshotCount}` : null]
+    .filter(Boolean)
+    .join(' · ');
+
+describe('rewriteSelfVisaCountDescription · 行描述自备签尾段', () => {
+  it('已有「自备签×1」→ 就地改成新人数', () => {
+    expect(rewriteSelfVisaCountDescription('椰岛5晚 · 2成人 · 自备签×1', 2)).toBe(
+      '椰岛5晚 · 2成人 · 自备签×2',
+    );
+  });
+  it('人数归 0 → 去掉该段（录单端 0 人本就不写）', () => {
+    expect(rewriteSelfVisaCountDescription('椰岛5晚 · 2成人 · 自备签×1', 0)).toBe(
+      '椰岛5晚 · 2成人',
+    );
+  });
+  it('原描述没有该段且人数>0 → 末尾追加', () => {
+    expect(rewriteSelfVisaCountDescription('椰岛5晚 · 2成人', 1)).toBe('椰岛5晚 · 2成人 · 自备签×1');
+  });
+  it('原描述没有该段且人数=0 → 原样', () => {
+    expect(rewriteSelfVisaCountDescription('椰岛5晚 · 2成人', 0)).toBe('椰岛5晚 · 2成人');
+  });
+  it('其余各段一字不动（单住/升舱段不受影响）', () => {
+    expect(
+      rewriteSelfVisaCountDescription('椰岛5晚 · 2成人 · 单住×1 · 去程升舱×1 · 自备签×2', 1),
+    ).toBe('椰岛5晚 · 2成人 · 单住×1 · 去程升舱×1 · 自备签×1');
+  });
+});
+
 describe('OrderService.setPassengerVisaExempt · BUNDLE 钱路径（行重算，对称可逆）', () => {
   const bundleLine = (amountCny: number, snapshotCount: number) => ({
     id: 'item-b1',
     quantity: 2,
     amount: new Prisma.Decimal(amountCny),
     metadata: { addOns: baseSnapshot(snapshotCount) },
+    description: bundleDescription(snapshotCount),
   });
 
   it('false→true：套餐行减一份快照费率（¥300），快照同步为 1 人自备签', async () => {
@@ -335,12 +368,96 @@ describe('OrderService.setPassengerVisaExempt · BUNDLE 钱路径（行重算，
     expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
   });
 
-  it('已开票（任一维度）+ 有钱语义 → ConflictError，且不写乘客', async () => {
-    mount({ bundleLines: [bundleLine(5000, 0)], invoiced: true });
-    await expect(
-      service.setPassengerVisaExempt('o1', 'p1', { visaExempt: true }, actor),
-    ).rejects.toBeInstanceOf(ConflictError);
-    expect(mockPrisma.passenger.update).not.toHaveBeenCalled();
+  it('已开票（任一维度）+ 有钱语义 → 放行不拦：钱照改，warning 提醒票务核对，audit.invoicedAtChange=true', async () => {
+    mount({
+      bundleLines: [bundleLine(5000, 0)],
+      invoiced: true,
+      passengersAfterFlip: [{ visaExempt: true }, { visaExempt: false }],
+      nonExemptAfterFlip: [{ visaSubmissionStatus: 'PENDING' }],
+      aggregateAfterCny: 4700,
+    });
+    const res = await service.setPassengerVisaExempt('o1', 'p1', { visaExempt: true }, actor);
+
+    expect(mockPrisma.passenger.update).toHaveBeenCalled();
+    expect(mockPrisma.orderItem.update).toHaveBeenCalled();
+    expect(res.audit?.totalDeltaCny).toBe(-300);
+    expect(res.audit?.invoicedAtChange).toBe(true);
+    expect(res.warning).toContain('已开票');
+    expect(res.warning).toContain('−¥300');
+    expect(res.warning).toContain('票务');
+  });
+
+  it('已开票 + 改回随团（应收 +¥300）→ warning 带正号金额', async () => {
+    mount({
+      passenger: { visaExempt: true, visaSubmissionStatus: 'PENDING' },
+      bundleLines: [bundleLine(4700, 1)],
+      invoiced: true,
+      passengersAfterFlip: [{ visaExempt: false }, { visaExempt: false }],
+      nonExemptAfterFlip: [{ visaSubmissionStatus: 'PENDING' }, { visaSubmissionStatus: 'PENDING' }],
+      aggregateAfterCny: 5000,
+    });
+    const res = await service.setPassengerVisaExempt('o1', 'p1', { visaExempt: false }, actor);
+    expect(res.audit?.invoicedAtChange).toBe(true);
+    expect(res.warning).toContain('+¥300');
+  });
+
+  it('未开票 + 有钱语义 → 不提开票，audit.invoicedAtChange=false', async () => {
+    mount({
+      bundleLines: [bundleLine(5000, 0)],
+      passengersAfterFlip: [{ visaExempt: true }, { visaExempt: false }],
+      nonExemptAfterFlip: [{ visaSubmissionStatus: 'PENDING' }],
+      aggregateAfterCny: 4700,
+    });
+    const res = await service.setPassengerVisaExempt('o1', 'p1', { visaExempt: true }, actor);
+    expect(res.audit?.invoicedAtChange).toBe(false);
+    expect(res.warning ?? '').not.toContain('已开票');
+  });
+
+  it('已开票但无钱语义（快照费率 0）→ 应收没变，不提开票', async () => {
+    mount({
+      invoiced: true,
+      bundleLines: [
+        {
+          id: 'item-b1',
+          quantity: 2,
+          amount: new Prisma.Decimal(5000),
+          metadata: { addOns: { ...baseSnapshot(0), selfVisaDeductCny: 0 } },
+          description: bundleDescription(0),
+        },
+      ],
+      passengersAfterFlip: [{ visaExempt: true }, { visaExempt: false }],
+      nonExemptAfterFlip: [{ visaSubmissionStatus: 'PENDING' }],
+    });
+    const res = await service.setPassengerVisaExempt('o1', 'p1', { visaExempt: true }, actor);
+    expect(res.audit?.totalDeltaCny).toBe(0);
+    expect(res.audit?.invoicedAtChange).toBe(false);
+    expect(res.warning ?? '').not.toContain('已开票');
+  });
+
+  it('行描述同步：false→true 尾段变「自备签×1」；true→false 归 0 去段', async () => {
+    mount({
+      bundleLines: [bundleLine(5000, 0)],
+      passengersAfterFlip: [{ visaExempt: true }, { visaExempt: false }],
+      nonExemptAfterFlip: [{ visaSubmissionStatus: 'PENDING' }],
+      aggregateAfterCny: 4700,
+    });
+    await service.setPassengerVisaExempt('o1', 'p1', { visaExempt: true }, actor);
+    expect(mockPrisma.orderItem.update.mock.calls[0][0].data.description).toBe(
+      '椰岛5晚 · 2026-09-10出发 · 2成人 · 自备签×1',
+    );
+
+    vi.clearAllMocks();
+    mount({
+      passenger: { visaExempt: true, visaSubmissionStatus: 'PENDING' },
+      bundleLines: [bundleLine(4700, 1)],
+      passengersAfterFlip: [{ visaExempt: false }, { visaExempt: false }],
+      nonExemptAfterFlip: [{ visaSubmissionStatus: 'PENDING' }, { visaSubmissionStatus: 'PENDING' }],
+      aggregateAfterCny: 5000,
+    });
+    await service.setPassengerVisaExempt('o1', 'p1', { visaExempt: false }, actor);
+    expect(mockPrisma.orderItem.update.mock.calls[0][0].data.description).toBe(
+      '椰岛5晚 · 2026-09-10出发 · 2成人',
+    );
   });
 
   it('BUNDLE 行快照费率为 0 → 无钱语义：结算锁不拦，纯改标记', async () => {
@@ -447,6 +564,7 @@ describe('OrderService.setPassengerVisaExempt · 已送签人为确认（submitt
     quantity: 2,
     amount: new Prisma.Decimal(amountCny),
     metadata: { addOns: baseSnapshot(snapshotCount) },
+    description: bundleDescription(snapshotCount),
   });
   const submittedMount = (extra: Parameters<typeof mount>[0] = {}) =>
     mount({

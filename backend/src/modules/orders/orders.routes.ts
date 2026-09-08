@@ -2281,7 +2281,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       targetId: id,
       targetLabel: audit.orderNumber,
       before: { orderItemId: audit.orderItemId, ...audit.before },
-      after: { ...audit.after, reason: audit.reason },
+      // invoicedAtChange：改价时本单已开票且应收变了（开票不闸，改为提醒票务核对发票）。
+      after: { ...audit.after, reason: audit.reason, invoicedAtChange: audit.invoicedAtChange },
       severity: 'WARNING',
     });
     return { order, warning };
@@ -2530,6 +2531,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
             refundCny: audit.refundCny,
             retainCny: audit.retainCny,
             overrideReason: body.submittedOverride?.reason ?? null,
+            // 翻转时本单已开票且应收变了（开票不闸，改为提醒票务核对发票）：审计据此可筛。
+            invoicedAtChange: audit.invoicedAtChange,
           },
           severity: 'WARNING',
         });

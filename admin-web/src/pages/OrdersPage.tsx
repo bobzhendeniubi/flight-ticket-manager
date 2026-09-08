@@ -10503,7 +10503,7 @@ function SettlementPriceForm({
         unitPriceCny: newPrice,
         reason: reason.trim() || undefined,
       });
-      // B12：已付款单改价的资金后果（多付/新尾款）——后端算清楚，这里必须让运营看见。
+      // B12：已付款单改价的资金后果（多付/新尾款）/ 已开票单应收变动请票务核对——后端算清楚，这里必须让运营看见。
       if (res.warning) alert(res.warning);
       onSaved(res.order);
     } catch (e: unknown) {
@@ -11564,6 +11564,7 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
     try {
       const res = await api.setPassengerVisaExempt(token, order.id, p.id, { visaExempt: next });
       onOrderUpdated?.(res.order);
+      // 后端警示（已开票单应收变动请票务核对 / 签证任务残留等）不拦操作，只弹出来让人看见。
       if (res.warning) window.alert(res.warning);
     } catch (e) {
       // 送签已在办理 → 人为确认（签证岗口径：退不退/退多少当场定，系统不硬拦也不自动退）。
@@ -11603,7 +11604,7 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
         }
         return;
       }
-      // 其余失败把后端错误文案原样展示（结算锁/开票闸等都有明确指引）。
+      // 其余失败把后端错误文案原样展示（结算锁/多条钱行等都有明确指引；开票状态不再拦改自备签）。
       setVisaExemptErr(e instanceof ApiError ? e.message : '改自备签失败，请稍后重试');
     } finally {
       setVisaExemptBusyId(null);

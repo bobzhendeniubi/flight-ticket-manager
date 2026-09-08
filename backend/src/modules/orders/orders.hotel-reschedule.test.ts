@@ -42,11 +42,17 @@ beforeEach(() => {
 // A. 改结算价：放开 HOTEL 行
 // ══════════════════════════════════════════════════════════════════════════
 describe('updateItemSettlementPrice · 放开单订酒店行', () => {
+  /** 事务回调的返回值（serializeOrder 在事务外才抛，这里先把事务内算出的 warning/标记留下来）。 */
+  let scratch: { warning: string | null; invoicedAtChange: boolean } | undefined;
+
   function mountSettlement(item: {
     kind: OrderItemKind;
     quantity: number;
     roomsBilled?: Prisma.Decimal | null;
+    /** 订单任一维度已开票（开票不闸：只提醒票务核对，不拦改价）。 */
+    invoiced?: boolean;
   }) {
+    scratch = undefined;
     const tx = {
       $queryRaw: vi.fn(async () => [
         {
@@ -57,7 +63,7 @@ describe('updateItemSettlementPrice · 放开单订酒店行', () => {
           subtotal: new Prisma.Decimal(2400),
           total: new Prisma.Decimal(2400),
           paidAmount: new Prisma.Decimal(0),
-          outboundInvoiced: false,
+          outboundInvoiced: item.invoiced ?? false,
           returnInvoiced: false,
           systemInvoiced: false,
           settlementLocked: false,
@@ -84,9 +90,42 @@ describe('updateItemSettlementPrice · 放开单订酒店行', () => {
         })),
       },
     };
-    mockPrisma.$transaction.mockImplementation(async (fn: (t: unknown) => unknown) => fn(tx));
+    mockPrisma.$transaction.mockImplementation(async (fn: (t: unknown) => unknown) => {
+      const result = await fn(tx);
+      scratch = result as typeof scratch;
+      return result;
+    });
     return tx;
   }
+
+  it('已开票（任一维度）→ 不拦改价：行照改，warning 提醒票务核对（带应收变动金额），invoicedAtChange=true', async () => {
+    const tx = mountSettlement({ kind: OrderItemKind.FLIGHT, quantity: 3, invoiced: true });
+
+    await service
+      .updateItemSettlementPrice('ord-1', 'item-1', { unitPriceCny: 1000 }, ADMIN)
+      .catch(() => undefined);
+
+    expect(tx.orderItem.update).toHaveBeenCalledWith({
+      where: { id: 'item-1' },
+      data: { unitPrice: new Prisma.Decimal(1000), amount: new Prisma.Decimal(3000) },
+    });
+    expect(scratch?.invoicedAtChange).toBe(true);
+    // 应收 2400 → 3000：+¥600
+    expect(scratch?.warning).toContain('已开票');
+    expect(scratch?.warning).toContain('+¥600');
+    expect(scratch?.warning).toContain('票务');
+  });
+
+  it('未开票 → 不提开票，invoicedAtChange=false', async () => {
+    mountSettlement({ kind: OrderItemKind.FLIGHT, quantity: 3 });
+
+    await service
+      .updateItemSettlementPrice('ord-1', 'item-1', { unitPriceCny: 1000 }, ADMIN)
+      .catch(() => undefined);
+
+    expect(scratch?.invoicedAtChange).toBe(false);
+    expect(scratch?.warning ?? '').not.toContain('已开票');
+  });
 
   it('HOTEL 行按「每间每晚 × 晚数 × 房数」重算金额（2 间 3 晚 × ¥1000 = ¥6000）', async () => {
     const tx = mountSettlement({
