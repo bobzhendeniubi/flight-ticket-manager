@@ -1697,11 +1697,14 @@ function ProductCostEditors({ token }: { token: string }) {
   const [transfers, setTransfers] = useState<Transfer[]>([]);
   const [loading, setLoading] = useState(true);
   const [msg, setMsg] = useState<string | null>(null);
+  // 首次加载才显示「加载中」占位；保存后的静默刷新不卸载表格，否则行内的「已保存」提示会被冲掉。
+  const hasLoadedRef = useRef(false);
 
   const load = useCallback(() => {
     let cancelled = false;
-    setLoading(true);
-    Promise.all([api.listHotels(false), api.listVisas(false), api.listTransfers(false)])
+    if (!hasLoadedRef.current) setLoading(true);
+    // 必须带 token：后端对匿名请求整列剥掉 costPriceCny（成本防泄漏），不带就永远显示空白。
+    Promise.all([api.listHotels(false, token), api.listVisas(false, token), api.listTransfers(false, token)])
       .then(([h, v, t]) => {
         if (cancelled) return;
         setHotels(h.hotels);
@@ -1712,12 +1715,14 @@ function ProductCostEditors({ token }: { token: string }) {
         if (!cancelled) setMsg('产品列表加载失败');
       })
       .finally(() => {
-        if (!cancelled) setLoading(false);
+        if (cancelled) return;
+        hasLoadedRef.current = true;
+        setLoading(false);
       });
     return () => {
       cancelled = true;
     };
-  }, []);
+  }, [token]);
 
   useEffect(() => load(), [load]);
 
@@ -1844,6 +1849,7 @@ function CostRow({
   );
   const [saving, setSaving] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
 
   async function save(): Promise<void> {
     setSaving(true);
@@ -1854,6 +1860,7 @@ function CostRow({
         vals[f.key] = draft[f.key] ?? null;
       }
       await onSave(vals);
+      setSavedAt(Date.now());
     } catch (e: unknown) {
       setSaveErr(e instanceof ApiError ? e.message : '保存失败');
     } finally {
@@ -1887,6 +1894,7 @@ function CostRow({
           {saving ? '…' : '保存'}
         </button>
         {saveErr && <div className="text-xs text-rose-600 mt-0.5">{saveErr}</div>}
+        {!saveErr && savedAt != null && <div className="mt-0.5 text-xs text-emerald-600">已保存</div>}
       </td>
     </tr>
   );
