@@ -883,6 +883,32 @@ describe('《签证专用》visa 行 — 签证公司列', () => {
     expect(rows[0].visaSupplier).toBe('越南领区签证代办, 岘港代办B');
   });
 
+  // 财务反馈同一批：同一签证产品不同批次会换送签公司，产品主数据里的默认供应商表达不了
+  // 「这一单实际找的谁」。签证台在签证任务上填的实际送签公司优先，产品供应商只作回落。
+  it('签证任务上填了实际送签公司 → 压过产品主数据供应商', () => {
+    const order = fixtureRoundTrip();
+    const visaItem = order.items.find((it) => (it as { kind: string }).kind === 'VISA') as {
+      fulfillmentTasks: Array<Record<string, unknown>>;
+    };
+    visaItem.fulfillmentTasks = [
+      { type: 'VISA_APPLICATION', status: 'IN_PROGRESS', visaSupplier: '乙签证服务' },
+    ];
+    const rows = orderToVisaRows(order, buildOrderContext(order));
+    expect(rows[0].visaSupplier).toBe('乙签证服务');
+  });
+
+  it('签证任务上是空白 → 回落产品主数据供应商，不导出一列空白', () => {
+    const order = fixtureRoundTrip();
+    const visaItem = order.items.find((it) => (it as { kind: string }).kind === 'VISA') as {
+      fulfillmentTasks: Array<Record<string, unknown>>;
+    };
+    visaItem.fulfillmentTasks = [
+      { type: 'VISA_APPLICATION', status: 'IN_PROGRESS', visaSupplier: '   ' },
+    ];
+    const rows = orderToVisaRows(order, buildOrderContext(order));
+    expect(rows[0].visaSupplier).toBe('越南领区签证代办');
+  });
+
   it('VISA 行 supplier 缺失 → 签证公司列留空（不编造）', () => {
     const order = fixtureRoundTrip();
     const visaItem = order.items.find((it) => (it as { kind: string }).kind === 'VISA') as {

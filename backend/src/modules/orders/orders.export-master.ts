@@ -129,6 +129,17 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
+/**
+ * 「有值才出数、没值留空」的数值单元格（与 dec 的区别：dec 把 null 当 0）。
+ * 签证成本三列专用 —— 空白与 0 在财务眼里是两件事：空 = 签证台还没填，0 = 确实不花钱。
+ * 不做四舍五入：金额字段库里已是 2 位小数、汇率是 6 位，round2 会把汇率截坏。
+ */
+function numOrBlank(v: Prisma.Decimal | number | null | undefined): number | '' {
+  if (v == null) return '';
+  const n = typeof v === 'number' ? v : Number(v.toString());
+  return Number.isFinite(n) ? n : '';
+}
+
 function fmtDate(d: Date | null | undefined): string {
   if (!d) return '';
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
@@ -178,7 +189,12 @@ export interface MasterRow {
   settleReceived: number; // 已到账金额（人均）
   singleRoomDiff: number; // 单房差（按乘客：只记到单住的人）
   visaAmount: number; // 签证金额（人均）
-  visaSupplier: string; // 签证公司（供应商/代办渠道，多签证去重逗号拼接）— 财务对账用，缺失留空
+  visaSupplier: string; // 签证公司（实际送签公司；签证任务优先，回落产品主数据供应商）— 财务对账用，缺失留空
+  // 签证实际成本三列（人均口径，取签证任务上签证岗填的结构化成本）——未填一律留空，不回退产品
+  // 主数据成本：这三列的意义就是让财务看见「签证台到底填没填这单的进价」，回退会把空当成有。
+  visaUnitCostCny: number | ''; // 签证成本(人均¥)：入账权威
+  visaUnitCostUsd: number | ''; // 签证成本(美金)：签证公司账单币种原值
+  visaFxRate: number | ''; // 签证汇率：USD→CNY，折算当时固化
   visaStatus: string; // 签证状态（按乘客：自备签 / 送签进度，回落订单级 + 履约任务）
   visaNote: string; // 签证备注 = [签证任务备注, 订单「签证情况」备注] 去空去重后 " / " 拼接（任务备注在前）
   invoiceStatus: string; // 开票状态：三布尔（去程/回程/系统）组合文案，'/' 连接；都未开 = "未开"
@@ -274,7 +290,39 @@ const MASTER_COLUMNS: MasterColumn[] = [
   { header: '已到账金额', key: 'settleReceived', width: 12, roles: ['all'] },
   { header: '单房差', key: 'singleRoomDiff', width: 8, roles: ['all'] },
   { header: '签证金额', key: 'visaAmount', width: 10, roles: ['all', 'visa'] },
-  { header: '签证公司', key: 'visaSupplier', width: 16, roles: ['all', 'visa'] },
+  {
+    header: '签证公司',
+    key: 'visaSupplier',
+    width: 16,
+    note: '本次实际送签的签证公司（签证台在签证任务上填的）；没填才回落签证产品主数据里的默认供应商。',
+    roles: ['all', 'visa'],
+  },
+  // 签证实际成本三列（财务反馈：签证成本此前只能从「签证备注」的自由文本里认，无法精确匹配成本）。
+  // roles 只给 all：成本是内部财务口径，签证岗视图不需要；代理视图另走白名单（AGENT_MASTER_ALLOWED_KEYS），
+  // 白名单不点名就一列都拿不到，新列天然不外泄。
+  {
+    header: '签证成本(人均¥)',
+    key: 'visaUnitCostCny',
+    width: 14,
+    note:
+      '签证台在该单签证任务上填的**人均**实际进价（人民币，入账权威）。\n' +
+      '空 = 签证台还没填这单的成本，不是 0，也不代表产品主数据里没有默认成本。',
+    roles: ['all'],
+  },
+  {
+    header: '签证成本(美金)',
+    key: 'visaUnitCostUsd',
+    width: 14,
+    note: '签证公司按美金开账单时的人均原值；空 = 未填或直接按人民币记的成本。',
+    roles: ['all'],
+  },
+  {
+    header: '签证汇率',
+    key: 'visaFxRate',
+    width: 10,
+    note: '美金成本折人民币的汇率（录入当时固化，不随后续汇率变动）；空 = 未按美金记成本。',
+    roles: ['all'],
+  },
   { header: '签证状态', key: 'visaStatus', width: 10, roles: ['all', 'visa'] },
   {
     header: '签证备注',
@@ -384,7 +432,19 @@ export const MASTER_EXPORT_INCLUDE = {
       // 套餐(BUNDLE)行关联的套餐定义：取 items JSON 以捞出签证组件的挂牌价（qty×unitPrice）。
       bundle: { select: { items: true } },
       // notes：签证任务备注（运营在签证台给任务填的备注）——「签证备注」列取数用。
-      fulfillmentTasks: { select: { type: true, status: true, notes: true } },
+      // visaSupplier / visaUnitCost* / visaFxRate：签证台填的实际送签公司与人均进价 ——
+      //「签证公司」与「签证成本」三列取数用（结构化字段，不再从备注文本里认成本）。
+      fulfillmentTasks: {
+        select: {
+          type: true,
+          status: true,
+          notes: true,
+          visaSupplier: true,
+          visaUnitCostUsd: true,
+          visaFxRate: true,
+          visaUnitCostCny: true,
+        },
+      },
     },
   },
 } satisfies Prisma.OrderInclude;
@@ -519,9 +579,12 @@ export function orderToMasterRows(
   // 每行再按本乘客取值（自备签 / 送签进度）—— 见 passengerVisaStatusCell。
   // 不限 kind —— 套餐(BUNDLE)含签证时 VISA_APPLICATION 任务挂在 BUNDLE 行上（无独立 VISA 行），
   // 只从 VISA 行找会让套餐含签证单的签证状态漏显；跨全部行找可覆盖套餐单。
-  const visaTask = order.items
-    .flatMap((it) => it.fulfillmentTasks)
-    .find((t) => t.type === 'VISA_APPLICATION');
+  // 逐条筛而不是 find 第一条：签证公司/成本要看全部签证任务（见下）。`?? []` 兜底关联未取回
+  // 的行（历史 fixture / 精简 select 里 fulfillmentTasks 可能缺失），免得整张表导不出来。
+  const visaTasks = order.items
+    .flatMap((it) => it.fulfillmentTasks ?? [])
+    .filter((t) => t?.type === 'VISA_APPLICATION');
+  const visaTask = visaTasks[0];
   const orderVisaLabel = orderVisaStatusLabel(order.visaStatus, visaTask?.status);
   // 签证备注（运营要求单列）：签证任务备注（签证台手填，如代办渠道/价格）在前，
   // 订单「签证情况」结构化备注（noteVisa）在后，去空去重后 " / " 拼接。两者常年被揉进
@@ -536,15 +599,35 @@ export function orderToMasterRows(
   // 自备签乘客没走我方送签：签证任务备注（签证台记的代办渠道/进价，如「XX 65 美金」）
   // 不属于他们，只保留订单「签证情况」备注；「签证公司」同理留空（见行内）。
   const visaNoteExempt = typeof order.noteVisa === 'string' ? order.noteVisa.trim() : '';
-  // 签证公司（财务反馈：需清晰核对某笔签证金额属于哪家供应商）：取独立 VISA 行关联产品的 supplier，
-  // 多签证产品去重后逗号拼接；无 supplier 留空。套餐内签证组件无独立供应商字段，故只认 VISA 行。
-  const visaSupplier = Array.from(
+  // 签证公司（财务反馈：需清晰核对某笔签证金额属于哪家供应商）：
+  //   ① 优先签证任务上的 visaSupplier —— 这是**本次实际**送签的公司（同一签证产品不同批次会换公司），
+  //      多条任务去重后逗号拼接；
+  //   ② 任务上没填才回落独立 VISA 行关联产品的 supplier（产品主数据的默认供应商），同样去重拼接。
+  // 套餐(BUNDLE)内的签证组件没有独立供应商字段，回落只认 VISA 行 —— 但套餐单的签证任务挂在
+  // BUNDLE 行上，所以走 ① 的套餐单照样能出公司名。
+  const visaSupplierFromTasks = Array.from(
+    new Set(visaTasks.map((t) => t.visaSupplier?.trim() ?? '').filter(Boolean)),
+  ).join(', ');
+  const visaSupplierFromProduct = Array.from(
     new Set(
       order.items
         .filter((it) => it.kind === 'VISA' && it.visa?.supplier)
         .map((it) => it.visa!.supplier!),
     ),
   ).join(', ');
+  const visaSupplier = visaSupplierFromTasks || visaSupplierFromProduct;
+
+  // 签证实际成本（人均）：签证台在签证任务上填的结构化成本。**不回退**产品主数据 costPriceCny——
+  // 这三列就是给财务看「签证台到底填没填这单的进价」的，回退等于把没填的单也显示成有成本。
+  // 一单多条签证任务（同单多个签证产品）极少见：这里取**第一条填了成本的任务**，不做求和 ——
+  // 三列是同一笔进价的「美金 × 汇率 = 人民币」核对口径，求和会让美金/汇率两列失去意义；
+  // 真出现同单两笔不同进价，仍以签证台/财务汇总（按任务逐条计）为准，本表只作核对。
+  const visaCostTask = visaTasks.find(
+    (t) => t.visaUnitCostCny != null || t.visaUnitCostUsd != null || t.visaFxRate != null,
+  );
+  const visaUnitCostCny = numOrBlank(visaCostTask?.visaUnitCostCny);
+  const visaUnitCostUsd = numOrBlank(visaCostTask?.visaUnitCostUsd);
+  const visaFxRate = numOrBlank(visaCostTask?.visaFxRate);
 
   // ── 单房差：按乘客（只记到单住的人）。改前读的 metadata.singleRoomDiff 系统从没写过，整列恒 0；
   // 真实来源是套餐行 addOns.singleSupplementTotal 与补收单房差 FEE 行 —— 见 perPaxSingleRoomDiffByPassenger。
@@ -647,6 +730,10 @@ export function orderToMasterRows(
       // 签证金额按人（自备签 = 0）—— 见 perPaxVisaAmountByPassenger。
       visaAmount: visaAmountByPassenger.get(p.id) ?? 0,
       visaSupplier: p.visaExempt === true ? '' : visaSupplier,
+      // 自备签乘客没走我方送签：这单的签证进价不属于他们，三列一并留空（与签证公司/签证备注同口径）。
+      visaUnitCostCny: p.visaExempt === true ? '' : visaUnitCostCny,
+      visaUnitCostUsd: p.visaExempt === true ? '' : visaUnitCostUsd,
+      visaFxRate: p.visaExempt === true ? '' : visaFxRate,
       // 订单级原值一并传入：「不需要 / 已签证」两档要压过录单联动批量置上的 visaExempt；
       // 全员 exempt 与否也一并传入，混合单里的自备签照实写 —— 详见 passengerVisaStatusCell。
       visaStatus: passengerVisaStatusCell({

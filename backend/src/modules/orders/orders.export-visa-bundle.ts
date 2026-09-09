@@ -146,8 +146,12 @@ export async function queryOrdersByIdsForVisa(
           visa: { select: { code: true, visaName: true, visaType: true, supplier: true } },
           transfer: { select: { code: true } },
           bundle: { select: { code: true } },
-          // notes 用于「签证备注」列（visaTaskNoteOf）；类型经 `as OrderForTemplateExport[]` 收口
-          fulfillmentTasks: { select: { type: true, status: true, notes: true } },
+          // notes 用于「签证备注」列（visaTaskNoteOf）；visaSupplier 用于「签证公司」列
+          //（visaSupplierOf 优先取任务级实际送签公司，不取回这一列名单就只会回落产品默认供应商）。
+          // 类型经 `as OrderForTemplateExport[]` 收口
+          fulfillmentTasks: {
+            select: { type: true, status: true, notes: true, visaSupplier: true },
+          },
         },
       },
     },

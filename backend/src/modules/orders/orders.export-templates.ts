@@ -90,6 +90,12 @@ export const AGENT_HIDDEN_EXPORT_KEYS: ReadonlySet<string> = new Set([
   'costAmount', // 《全岗可用》订单成本·金额
   'visaSupplier', // 签证公司 = 我方签证供应商
   'visaNote', // 签证备注（实际内容含供应商与进价）
+  // 全岗总表·签证成本三列（签证台填的人均实际进价）。全岗总表的代理视图另走白名单，
+  // 白名单不点名就一列都拿不到；这里一并列进黑名单是第二道闸 —— 以后哪张表新加同名列，
+  // 不必再想一遍"代理能不能看"。
+  'visaUnitCostCny',
+  'visaUnitCostUsd',
+  'visaFxRate',
   // 2. 内部风控
   'legStatus', // 航段状态（带超售座数）
   // 3. 护照/身份 PII
@@ -603,7 +609,8 @@ export type OrderForTemplateExport = Prisma.OrderGetPayload<{
         visa: { select: { code: true; visaName: true; visaType: true; supplier: true } };
         transfer: { select: { code: true } };
         bundle: { select: { code: true; items: true } };
-        fulfillmentTasks: { select: { type: true; status: true } };
+        // visaSupplier：本次实际送签的签证公司（「签证公司」列优先取它，见 visaSupplierOf）
+        fulfillmentTasks: { select: { type: true; status: true; visaSupplier: true } };
       };
     };
   };
@@ -1186,10 +1193,24 @@ export const VISA_COLUMNS: Array<{ header: string; key: keyof VisaRow; width: nu
   { header: '航段状态', key: 'legStatus', width: 20 },
 ];
 
-// 签证公司（财务反馈：需清晰核对某笔签证金额属于哪家供应商）：取订单 VISA 行关联产品的 supplier，
-// 多签证产品去重后逗号拼接；无 supplier 留空。仅认独立 VISA 行——套餐内签证组件无独立供应商字段。
-// 《全岗可用》与《签证专用》共用取数点。
+// 签证公司（财务反馈：需清晰核对某笔签证金额属于哪家供应商）：
+//   ① 优先签证任务（VISA_APPLICATION）上的 visaSupplier —— **本次实际**送签的公司，同一签证产品
+//      不同批次会换公司，产品主数据表达不了；多条任务去重后逗号拼接。套餐单的签证任务挂在 BUNDLE
+//      行上，走这条也能出公司名。
+//   ② 任务没填才回落独立 VISA 行关联产品的 supplier（产品默认供应商），同样去重拼接；都没有则留空。
+// 《全岗可用》与《签证专用》共用取数点，与全岗总表（orders.export-master.ts）同一口径。
 export function visaSupplierOf(order: OrderForTemplateExport): string {
+  const fromTasks = Array.from(
+    new Set(
+      order.items
+        // `?? []` / `t?.` 兜底关联未取回的行（精简 select 的调用方），免得整张表导不出来
+        .flatMap((it) => it.fulfillmentTasks ?? [])
+        .filter((t) => t?.type === 'VISA_APPLICATION')
+        .map((t) => t.visaSupplier?.trim() ?? '')
+        .filter(Boolean),
+    ),
+  ).join(', ');
+  if (fromTasks) return fromTasks;
   return Array.from(
     new Set(
       order.items
@@ -1283,7 +1304,8 @@ export async function buildOrderTemplateExportWorkbook(
           visa: { select: { code: true, visaName: true, visaType: true, supplier: true } },
           transfer: { select: { code: true } },
           bundle: { select: { code: true, items: true } },
-          fulfillmentTasks: { select: { type: true, status: true } },
+          // visaSupplier：「签证公司」列优先取任务级实际送签公司（见 visaSupplierOf）
+          fulfillmentTasks: { select: { type: true, status: true, visaSupplier: true } },
         },
       },
     },

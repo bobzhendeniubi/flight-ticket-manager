@@ -1485,6 +1485,185 @@ describe('全岗总表 — 签证状态按乘客取值', () => {
   });
 });
 
+// ── 签证成本三列 + 签证公司任务级优先（财务反馈）────────────────────────────────
+// 反馈：签证成本此前只能从「签证备注」的自由文本里认（备注里写「某渠道 65 美金」），
+// 无法精确匹配成本。系统里签证任务早有结构化的人均成本（美金 / 汇率 / 人民币）与实际送签
+// 公司，只是没进这张表 —— 本批把三列成本补进全岗总表，并把「签证公司」改成任务级优先。
+describe('全岗总表 · 签证成本三列与签证公司', () => {
+  type TaskFixture = Record<string, unknown>;
+
+  /** 覆盖 VISA 行上的履约任务（fixture 默认只有一条无成本的 VISA_APPLICATION）。*/
+  function setVisaTasks(order: OrderForMasterExport, tasks: TaskFixture[]): void {
+    const o = order as unknown as {
+      items: Array<{ kind: string; fulfillmentTasks: TaskFixture[] }>;
+    };
+    o.items.find((it) => it.kind === 'VISA')!.fulfillmentTasks = tasks;
+  }
+
+  it('签证任务填了人均成本（美金 × 汇率 = 人民币）→ 三列照实出数，每位乘客都是人均口径', () => {
+    const order = fixtureRoundTripBundle();
+    setVisaTasks(order, [
+      {
+        type: 'VISA_APPLICATION',
+        status: 'IN_PROGRESS',
+        visaUnitCostUsd: 65,
+        visaFxRate: 7.2,
+        visaUnitCostCny: 468,
+      },
+    ]);
+    const rows = orderToMasterRows(order);
+    expect(rows.map((r) => r.visaUnitCostCny)).toEqual([468, 468]);
+    expect(rows.map((r) => r.visaUnitCostUsd)).toEqual([65, 65]);
+    expect(rows.map((r) => r.visaFxRate)).toEqual([7.2, 7.2]);
+  });
+
+  // 空白与 0 是两件事：空 = 签证台还没填这单的进价，0 = 这单确实不花钱。
+  // 也不许回退签证产品主数据的默认成本 —— 这三列存在的意义就是让财务看见「填没填」。
+  it('签证台没填成本 → 三列留空（不是 0，也不回退产品主数据成本）', () => {
+    const order = fixtureRoundTripBundle();
+    const rows = orderToMasterRows(order);
+    expect(rows.map((r) => r.visaUnitCostCny)).toEqual(['', '']);
+    expect(rows.map((r) => r.visaUnitCostUsd)).toEqual(['', '']);
+    expect(rows.map((r) => r.visaFxRate)).toEqual(['', '']);
+  });
+
+  it('只填了人民币（没走美金账单）→ 人民币列有数、美金与汇率两列留空', () => {
+    const order = fixtureRoundTripBundle();
+    setVisaTasks(order, [
+      { type: 'VISA_APPLICATION', status: 'CONFIRMED', visaUnitCostCny: 200 },
+    ]);
+    const [row] = orderToMasterRows(order);
+    expect(row.visaUnitCostCny).toBe(200);
+    expect(row.visaUnitCostUsd).toBe('');
+    expect(row.visaFxRate).toBe('');
+  });
+
+  it('自备签乘客：签证成本三列与签证公司一并留空（没走我方送签，这笔进价不属于他们）', () => {
+    const order = fixtureRoundTripBundle();
+    setVisaTasks(order, [
+      {
+        type: 'VISA_APPLICATION',
+        status: 'IN_PROGRESS',
+        visaSupplier: '甲签证服务',
+        visaUnitCostUsd: 65,
+        visaFxRate: 7.2,
+        visaUnitCostCny: 468,
+      },
+    ]);
+    const o = order as unknown as { passengers: Array<Record<string, unknown>> };
+    o.passengers = [
+      { ...o.passengers[0], visaExempt: true },
+      { ...o.passengers[1], visaExempt: false },
+    ];
+    const rows = orderToMasterRows(order);
+    expect(rows.map((r) => r.visaUnitCostCny)).toEqual(['', 468]);
+    expect(rows.map((r) => r.visaUnitCostUsd)).toEqual(['', 65]);
+    expect(rows.map((r) => r.visaFxRate)).toEqual(['', 7.2]);
+    expect(rows.map((r) => r.visaSupplier)).toEqual(['', '甲签证服务']);
+  });
+
+  // 同一签证产品不同批次会换送签公司：产品主数据里的默认供应商表达不了「这一单实际找的谁」。
+  it('签证公司：任务上填了实际送签公司 → 压过签证产品主数据里的默认供应商', () => {
+    const order = fixtureRoundTripBundle();
+    setVisaTasks(order, [
+      { type: 'VISA_APPLICATION', status: 'IN_PROGRESS', visaSupplier: '乙签证服务' },
+    ]);
+    expect(orderToMasterRows(order).map((r) => r.visaSupplier)).toEqual([
+      '乙签证服务',
+      '乙签证服务',
+    ]);
+  });
+
+  it('签证公司：任务上是空白（空串/空格）→ 回落产品主数据供应商，不导出一列空白', () => {
+    const order = fixtureRoundTripBundle();
+    setVisaTasks(order, [
+      { type: 'VISA_APPLICATION', status: 'IN_PROGRESS', visaSupplier: '   ' },
+    ]);
+    expect(orderToMasterRows(order)[0].visaSupplier).toBe('越南A签证公司');
+  });
+
+  // 套餐(BUNDLE)单没有独立 VISA 行，签证任务挂在 BUNDLE 行上：回落逻辑（只认 VISA 行的产品
+  // 供应商）在这类单上永远是空的，任务级取数才能让套餐含签证的单也出公司名与成本。
+  it('套餐单（任务挂 BUNDLE 行、无独立 VISA 行）：公司与成本照样出', () => {
+    const order = fixtureBundleHotelStampedOnBundleItem();
+    const o = order as unknown as {
+      items: Array<{ kind: string; fulfillmentTasks: TaskFixture[] }>;
+    };
+    o.items.find((it) => it.kind === 'BUNDLE')!.fulfillmentTasks = [
+      {
+        type: 'VISA_APPLICATION',
+        status: 'CONFIRMED',
+        visaSupplier: '丙签证服务',
+        visaUnitCostUsd: 30,
+        visaFxRate: 7.1,
+        visaUnitCostCny: 213,
+      },
+    ];
+    const [row] = orderToMasterRows(order);
+    expect(row.visaSupplier).toBe('丙签证服务');
+    expect(row.visaUnitCostCny).toBe(213);
+    expect(row.visaUnitCostUsd).toBe(30);
+    expect(row.visaFxRate).toBe(7.1);
+  });
+
+  // 一单多条签证任务（同单多个签证产品）极少见：成本三列取第一条**已填成本**的任务，不求和
+  //（三列是「美金 × 汇率 = 人民币」同一笔进价的核对口径，求和会让美金/汇率失去意义）；
+  // 签证公司则是多条任务去重拼接，看得出这单找了几家。
+  it('一单两条签证任务：成本取第一条已填的，公司多家去重拼接', () => {
+    const order = fixtureRoundTripBundle();
+    setVisaTasks(order, [
+      { type: 'VISA_APPLICATION', status: 'IN_PROGRESS', visaSupplier: '甲签证服务' },
+      {
+        type: 'VISA_APPLICATION',
+        status: 'CONFIRMED',
+        visaSupplier: '乙签证服务',
+        visaUnitCostCny: 300,
+      },
+    ]);
+    const [row] = orderToMasterRows(order);
+    expect(row.visaUnitCostCny).toBe(300);
+    expect(row.visaSupplier).toBe('甲签证服务, 乙签证服务');
+  });
+
+  it('非签证任务（如出票任务）上的字段不参与取数', () => {
+    const order = fixtureRoundTripBundle();
+    setVisaTasks(order, [
+      { type: 'TICKET_ISSUE', status: 'CONFIRMED', visaSupplier: '不该出现', visaUnitCostCny: 999 },
+    ]);
+    const [row] = orderToMasterRows(order);
+    expect(row.visaUnitCostCny).toBe('');
+    expect(row.visaSupplier).toBe('越南A签证公司'); // 回落产品主数据
+  });
+
+  // 列可见性：成本是内部财务口径 —— 签证岗视图不需要，代理视图更不能有。
+  it('三列只在 all 视图出现，紧挨「签证公司」；签证/票务/代理视图都没有', () => {
+    const all = visibleColumns('all').map((c) => c.header);
+    const supplierAt = all.indexOf('签证公司');
+    expect(all.slice(supplierAt + 1, supplierAt + 4)).toEqual([
+      '签证成本(人均¥)',
+      '签证成本(美金)',
+      '签证汇率',
+    ]);
+    for (const role of ['ticketing', 'visa', 'agent'] as const) {
+      const headers = visibleColumns(role).map((c) => c.header);
+      expect(headers).not.toContain('签证成本(人均¥)');
+      expect(headers).not.toContain('签证成本(美金)');
+      expect(headers).not.toContain('签证汇率');
+    }
+  });
+
+  // 代理视图靠白名单（点名才给）；三列同时也进了共享脱敏黑名单，两道闸都拦得住。
+  it('三列在共享脱敏黑名单里，代理视图取不到', () => {
+    for (const key of ['visaUnitCostCny', 'visaUnitCostUsd', 'visaFxRate']) {
+      expect(AGENT_HIDDEN_EXPORT_KEYS.has(key)).toBe(true);
+    }
+    const agentKeys = new Set(visibleColumns('agent').map((c) => c.key as string));
+    expect(agentKeys.has('visaUnitCostCny')).toBe(false);
+    expect(agentKeys.has('visaUnitCostUsd')).toBe(false);
+    expect(agentKeys.has('visaFxRate')).toBe(false);
+  });
+});
+
 // ── 结算价格按乘客（运营反馈）──────────────────────────────────────────────────
 // 反馈：同单四人结算价各不相同，导出来却是订单总价四等分。
 // 口径：每人结算价 = 应收均摊 + 该乘客调价净额（权威算法 per-pax-share.ts，
