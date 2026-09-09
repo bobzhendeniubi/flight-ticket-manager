@@ -114,6 +114,7 @@ import {
 import { resolveBundleNights } from '../products/bundle-nights.js';
 import { parseVisaExpressTiers, type VisaExpressTier } from '../products/products.schemas.js';
 import { localDate } from '../finances/finances.cost.service.js';
+import { resolveHotelStayUnitCostCny } from '../finances/hotel-cost.service.js';
 import { getSettlementRate } from '../settlement-rates/settlement-rates.service.js';
 import { getFlightSettlementRate } from '../settlement-rates/flight-settlement-rates.service.js';
 import {
@@ -3928,13 +3929,26 @@ export class OrderService {
         if (item.hotelRoomTypeId) {
           const rt = await prisma.hotelRoomType.findUnique({
             where: { id: item.hotelRoomTypeId },
-            select: { basePrice: true, costPriceCny: true, hotel: { select: { isActive: true } } },
+            select: {
+              basePrice: true,
+              costPriceCny: true,
+              hotel: { select: { isActive: true } },
+              // 按日期区间的净房价：有入住日期时逐晚取价（区间价优先，否则缺省价）
+              costPeriods: { select: { effectiveFrom: true, effectiveTo: true, costPriceCny: true } },
+            },
           });
           if (!rt) throw new NotFoundError(`酒店房型 ${item.hotelRoomTypeId} 不存在`);
           if (!rt.hotel.isActive) throw new BadRequestError('酒店已下架');
           unitPrice = Number(rt.basePrice);
-          // 成本快照（每间每晚）：产品未录成本 → undefined → 毛利「未知」，不落 0 虚高。
-          hotelUnitCost = rt.costPriceCny != null ? Number(rt.costPriceCny) : undefined;
+          // 成本快照（每间每晚 = 住宿期内平均净房价；无入住日期 → 缺省净房价）：
+          // 产品未录成本（或任一晚取不到价）→ undefined → 毛利「未知」，不落 0 虚高。
+          hotelUnitCost =
+            resolveHotelStayUnitCostCny({
+              periods: rt.costPeriods,
+              baseCostCny: rt.costPriceCny,
+              checkIn: item.checkIn,
+              checkOut: item.checkOut,
+            }) ?? undefined;
           // A3：拒绝偏离服务端权威价超容差的提交（仅有产品 id 时校验，无 id 走信任旧路径）。
           // 0.5 间：金额随 roomsBilled 缩放，容差按同一房间数口径比较，避免误判价格变动。
           assertAmountWithinTolerance('酒店', item.unitPrice, unitPrice, item.quantity * rooms);
@@ -12711,6 +12725,8 @@ export class OrderService {
           hotelId: true,
           // 新房型成本价 → 重打 HOTEL 行成本快照（每间每晚 × 晚数 × 房数）。
           costPriceCny: true,
+          // 按日期区间的净房价：按本行入住区间逐晚取价（区间价优先，否则缺省价）
+          costPeriods: { select: { effectiveFrom: true, effectiveTo: true, costPriceCny: true } },
           hotel: {
             select: {
               name: true,
@@ -12816,8 +12832,13 @@ export class OrderService {
     const swapCost =
       item.kind === OrderItemKind.HOTEL
         ? computeSwapHotelCostSnapshot({
-            newCostPriceCny:
-              newRoomType.costPriceCny != null ? Number(newRoomType.costPriceCny.toString()) : null,
+            // 每间每晚 = 本行入住区间内的平均净房价（按日期区间取价）；无日期 → 缺省净房价。
+            newCostPriceCny: resolveHotelStayUnitCostCny({
+              periods: newRoomType.costPeriods,
+              baseCostCny: newRoomType.costPriceCny,
+              checkIn: item.hotelCheckIn,
+              checkOut: item.hotelCheckOut,
+            }),
             nights: item.quantity,
             rooms: roomsBilled,
           })
@@ -14059,6 +14080,9 @@ export class OrderService {
 
       let productName: string;
       let costPriceCny: number | null;
+      // 成本快照用的每晚成本：签证 = 产品成本；酒店 = 入住期内平均净房价（按日期区间取价，
+      // 无入住日期 → 缺省净房价）。缺省售价仍按房型缺省成本带出（售价侧口径不变）。
+      let snapshotCostPriceCny: number | null;
       let unitPriceCny: number;
       let quantity: number;
       let rooms: number | undefined;
@@ -14087,6 +14111,7 @@ export class OrderService {
         if (!visa.isActive) throw new BadRequestError('签证产品已下架');
         productName = visa.visaName ?? visa.visaType ?? visa.country ?? visa.destinationCountry;
         costPriceCny = visa.costPriceCny == null ? null : Number(visa.costPriceCny);
+        snapshotCostPriceCny = costPriceCny;
         unitPriceCny = resolveGroundItemUnitPrice({
           requestedUnitPriceCny: input.unitPriceCny,
           costPriceCny,
@@ -14112,6 +14137,8 @@ export class OrderService {
             id: true,
             name: true,
             costPriceCny: true,
+            // 按日期区间的净房价：有入住日期时逐晚取价（区间价优先，否则缺省价）
+            costPeriods: { select: { effectiveFrom: true, effectiveTo: true, costPriceCny: true } },
             hotel: { select: { name: true, isActive: true } },
           },
         });
@@ -14139,6 +14166,12 @@ export class OrderService {
             throw new BadRequestError('入住日期无效');
           }
         }
+        snapshotCostPriceCny = resolveHotelStayUnitCostCny({
+          periods: roomType.costPeriods,
+          baseCostCny: roomType.costPriceCny,
+          checkIn: hotelCheckIn,
+          checkOut: hotelCheckOut,
+        });
       }
 
       // ── 酒店房量闸（CRITICAL 修复，与建单同一把闸）───────────────────────────
@@ -14173,7 +14206,7 @@ export class OrderService {
         unitPriceCny,
         quantity,
         rooms,
-        costPriceCny,
+        costPriceCny: snapshotCostPriceCny,
       });
       const created = await tx.orderItem.create({
         data: {
@@ -14411,7 +14444,15 @@ export class OrderService {
             bundle: {
               select: {
                 hotelRoomTypeId: true,
-                hotelRoomType: { select: { maxAdults: true, maxChildren: true, costPriceCny: true } },
+                hotelRoomType: {
+                  select: {
+                    maxAdults: true,
+                    maxChildren: true,
+                    costPriceCny: true,
+                    // 按日期区间的净房价：回退产品成本时按本行入住区间逐晚取价
+                    costPeriods: { select: { effectiveFrom: true, effectiveTo: true, costPriceCny: true } },
+                  },
+                },
               },
             },
           },
@@ -14491,10 +14532,15 @@ export class OrderService {
             const resolvedCost = resolveRoomSupplementCost({
               snapshotUnitCostCny:
                 bundleItem.unitCostCny != null ? Number(bundleItem.unitCostCny.toString()) : null,
-              productCostPriceCny:
-                bundleItem.bundle.hotelRoomType?.costPriceCny != null
-                  ? Number(bundleItem.bundle.hotelRoomType.costPriceCny.toString())
-                  : null,
+              // 每晚产品成本 = 本行入住区间内的平均净房价（按日期区间取价）；无日期 → 缺省净房价。
+              productCostPriceCny: bundleItem.bundle.hotelRoomType
+                ? resolveHotelStayUnitCostCny({
+                    periods: bundleItem.bundle.hotelRoomType.costPeriods,
+                    baseCostCny: bundleItem.bundle.hotelRoomType.costPriceCny,
+                    checkIn: bundleItem.hotelCheckIn,
+                    checkOut: bundleItem.hotelCheckOut,
+                  })
+                : null,
               nights,
               addedRooms,
             });

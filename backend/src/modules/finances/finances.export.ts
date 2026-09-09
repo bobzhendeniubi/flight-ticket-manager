@@ -30,6 +30,7 @@ import {
   loadPeriodsByFlightIds,
   resolveScheduleCost,
 } from './finances.cost.service.js';
+import { hotelStayCostCny, loadHotelCostPeriodsByRoomTypeIds } from './hotel-cost.service.js';
 import { netReceivedCny, sumCompletedRefundCny } from '../../lib/net-received.js';
 import { businessDateTime } from '../../lib/business-time.js';
 // 签证成本口径与财务汇总共用同一函数，两处逐字一致（任务实际成本优先 → 产品主数据回退）
@@ -208,9 +209,14 @@ type OrderForExport = Prisma.OrderGetPayload<{
 
 type ScheduleForResolution = NonNullable<OrderForExport['items'][number]['flightSchedule']>;
 type PeriodsMap = Awaited<ReturnType<typeof loadPeriodsByFlightIds>>;
+type HotelPeriodsMap = Awaited<ReturnType<typeof loadHotelCostPeriodsByRoomTypeIds>>;
 
 /** 把一张订单展开成 N 行（每位乘客一行）*/
-function orderToRows(order: OrderForExport, periodsMap: PeriodsMap): FinanceRow[] {
+function orderToRows(
+  order: OrderForExport,
+  periodsMap: PeriodsMap,
+  hotelPeriodsMap: HotelPeriodsMap = new Map(),
+): FinanceRow[] {
   const paxCount = Math.max(1, order.passengers.length);
   // 需签乘客数（非自备签）—— 签证实际成本按此人均折算
   const visaPax = order.passengers.filter((p) => !p.visaExempt).length;
@@ -282,8 +288,17 @@ function orderToRows(order: OrderForExport, periodsMap: PeriodsMap): FinanceRow[
     // 房费列凭空少一截、毛利凭空多一截——快照是这类行唯一的成本来源，必须先读。
     if (it.totalCostCny != null) {
       hotelCostCnyOrder += dec(it.totalCostCny);
-    } else if (it.hotelRoomType?.costPriceCny != null) {
-      hotelCostCnyOrder += dec(it.hotelRoomType.costPriceCny) * nights * it.quantity;
+    } else if (it.hotelRoomType) {
+      // 按晚取价（区间净房价优先，否则缺省 costPriceCny）× quantity；无日期 → 缺省价 × 1 晚；
+      // 任一晚取不到价 → 不计（真缺数据不虚构）。
+      const stay = hotelStayCostCny({
+        periods: it.hotelRoomTypeId ? hotelPeriodsMap.get(it.hotelRoomTypeId) : undefined,
+        baseCostCny: it.hotelRoomType.costPriceCny,
+        checkIn: it.hotelCheckIn,
+        checkOut: it.hotelCheckOut,
+        nights: 1,
+      });
+      if (stay != null) hotelCostCnyOrder += stay * it.quantity;
     }
     // 房型名：随机档还没落到具体酒店（hotelRoomTypeId 空 + randomStarTier 非空），
     // 标成「N 星随机（未落位）」，别让"入住酒店"列空着，看不出这行是哪种房
@@ -486,11 +501,16 @@ export async function buildFinanceExportWorkbook(
     ),
   );
   const periodsMap = await loadPeriodsByFlightIds(flightIds, client);
+  // 酒店房型净房价区间（无快照老单回退实时算时按晚取价）：一次性 load 进 Map，不 N+1
+  const hotelPeriodsMap = await loadHotelCostPeriodsByRoomTypeIds(
+    orders.flatMap((o) => o.items.filter((i) => i.kind === 'HOTEL').map((i) => i.hotelRoomTypeId)),
+    client,
+  );
 
   const rows: FinanceRow[] = [];
   for (const o of orders) {
     if (o.passengers.length === 0) continue;
-    rows.push(...orderToRows(o, periodsMap));
+    rows.push(...orderToRows(o, periodsMap, hotelPeriodsMap));
   }
 
   const wb = new ExcelJS.Workbook();

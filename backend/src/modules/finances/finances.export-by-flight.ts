@@ -26,6 +26,7 @@ import {
   loadPeriodsByFlightIds,
   resolveScheduleCost,
 } from './finances.cost.service.js';
+import { hotelStayCostCny, loadHotelCostPeriodsByRoomTypeIds } from './hotel-cost.service.js';
 import { visaItemCostCny } from './finances.service.js';
 
 const COUNTED_STATUSES: OrderStatus[] = [
@@ -190,6 +191,11 @@ export async function buildFinanceExportByFlightWorkbook(
   // 4) 周期预加载（航班维度的成本生效解析）
   const flightIds = Array.from(new Set(schedules.map((s) => s.flight.id)));
   const periodsMap = await loadPeriodsByFlightIds(flightIds, client);
+  // 酒店房型净房价区间（无快照老单回退实时算时按晚取价）：一次性 load 进 Map，不 N+1
+  const hotelPeriodsMap = await loadHotelCostPeriodsByRoomTypeIds(
+    orders.flatMap((o) => o.items.filter((i) => i.kind === 'HOTEL').map((i) => i.hotelRoomTypeId)),
+    client,
+  );
 
   // 5) 每个班次聚合
   const rows: FlightRow[] = schedules.map<FlightRow>((s) => {
@@ -259,18 +265,17 @@ export async function buildFinanceExportByFlightWorkbook(
           // 整班毛利凭空虚高——快照是这类行唯一的成本来源，必须先读。
           if (it.totalCostCny != null) {
             hotelOrder += dec(it.totalCostCny);
-          } else if (it.hotelRoomType?.costPriceCny != null) {
-            let nights = 1;
-            if (it.hotelCheckIn && it.hotelCheckOut) {
-              nights = Math.max(
-                1,
-                Math.round(
-                  (it.hotelCheckOut.getTime() - it.hotelCheckIn.getTime()) /
-                    (1000 * 60 * 60 * 24),
-                ),
-              );
-            }
-            hotelOrder += dec(it.hotelRoomType.costPriceCny) * nights * it.quantity;
+          } else if (it.hotelRoomType) {
+            // 按晚取价（区间净房价优先，否则缺省 costPriceCny）× quantity；无日期 → 缺省价 × 1 晚；
+            // 任一晚取不到价 → 不计（真缺数据不虚构）。
+            const stay = hotelStayCostCny({
+              periods: it.hotelRoomTypeId ? hotelPeriodsMap.get(it.hotelRoomTypeId) : undefined,
+              baseCostCny: it.hotelRoomType.costPriceCny,
+              checkIn: it.hotelCheckIn,
+              checkOut: it.hotelCheckOut,
+              nights: 1,
+            });
+            if (stay != null) hotelOrder += stay * it.quantity;
           }
         } else if (it.kind === 'VISA') {
           // 签证成本与汇总/按乘客导出同口径（visaItemCostCny）：任务实际人均成本 × 需签乘客数

@@ -34,6 +34,14 @@ vi.mock('./finances.cost.service.js', () => ({
   updateCostPeriod: vi.fn(),
 }));
 
+const hotelCostPeriodMocks = vi.hoisted(() => ({
+  createHotelRoomTypeCostPeriod: vi.fn(),
+  deleteHotelRoomTypeCostPeriod: vi.fn(),
+  listHotelRoomTypeCostPeriods: vi.fn(),
+  updateHotelRoomTypeCostPeriod: vi.fn(),
+}));
+vi.mock('./hotel-cost.service.js', () => hotelCostPeriodMocks);
+
 const writeAuditMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 vi.mock('../../lib/audit.js', () => ({
   actorFromRequest: vi.fn((req: { user?: { sub: string; role: UserRole } }) => ({
@@ -203,5 +211,137 @@ describe('班次成本锁定路由', () => {
 
     expect(res.statusCode).toBe(403);
     expect(patchFlightScheduleCostMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('酒店房型净房价按日期区间路由（ADMIN/STAFF）', () => {
+  let app: FastifyInstance;
+
+  beforeAll(async () => {
+    app = Fastify({ logger: false });
+    await app.register(authPlugin);
+    registerErrorHandler(app);
+    await app.register(financesRoutes, { prefix: '/finances' });
+    await app.ready();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    prismaMock.user.findUnique.mockResolvedValue({
+      disabledAt: null,
+      authVersion: 0,
+      staffRole: null,
+      agentProfile: { isActive: true },
+    });
+  });
+
+  function tokenFor(sub: string, role: UserRole): string {
+    return app.jwt.sign({ sub, role });
+  }
+
+  const periodDto = {
+    id: 'hp1',
+    roomTypeId: 'rt1',
+    effectiveFrom: '2026-10-01',
+    effectiveTo: '2026-10-07',
+    costPriceCny: 900,
+    note: null,
+    updatedAt: '2026-09-01T00:00:00.000Z',
+  };
+
+  it('STAFF 新增区间 → 200，按房型 id + 校验后的 body 调服务，并写 UPDATE_FINANCE_COST 审计', async () => {
+    hotelCostPeriodMocks.createHotelRoomTypeCostPeriod.mockResolvedValue(periodDto);
+    const res = await app.inject({
+      method: 'POST',
+      url: '/finances/cost/hotel-room-type/rt1/periods',
+      headers: { authorization: `Bearer ${tokenFor('staff-1', UserRole.STAFF)}` },
+      payload: { effectiveFrom: '2026-10-01', effectiveTo: '2026-10-07', costPriceCny: 900, note: '国庆' },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ period: periodDto });
+    expect(hotelCostPeriodMocks.createHotelRoomTypeCostPeriod).toHaveBeenCalledWith('rt1', {
+      effectiveFrom: '2026-10-01',
+      effectiveTo: '2026-10-07',
+      costPriceCny: 900,
+      note: '国庆',
+    });
+    expect(writeAuditMock).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'UPDATE_FINANCE_COST', targetId: 'hotel-room-type:rt1:period:hp1' }),
+    );
+  });
+
+  it('区间重叠 → 服务抛 ConflictError → 409，中文消息原样透出', async () => {
+    hotelCostPeriodMocks.createHotelRoomTypeCostPeriod.mockRejectedValue(
+      new ConflictError('日期区间与该房型现有区间重叠（2026-10-01 → 2026-10-07）'),
+    );
+    const res = await app.inject({
+      method: 'POST',
+      url: '/finances/cost/hotel-room-type/rt1/periods',
+      headers: { authorization: `Bearer ${tokenFor('admin-1', UserRole.ADMIN)}` },
+      payload: { effectiveFrom: '2026-10-05', effectiveTo: '2026-10-10', costPriceCny: 800 },
+    });
+    expect(res.statusCode).toBe(409);
+    expect(res.json().error.message).toContain('重叠');
+    expect(writeAuditMock).not.toHaveBeenCalled();
+  });
+
+  it('日期格式不对 / 净房价为负 → 400，不调服务', async () => {
+    const bad = await app.inject({
+      method: 'PATCH',
+      url: '/finances/cost/hotel-room-type-periods/hp1',
+      headers: { authorization: `Bearer ${tokenFor('staff-1', UserRole.STAFF)}` },
+      payload: { effectiveFrom: '2026/10/01' },
+    });
+    expect(bad.statusCode).toBe(400);
+    const negative = await app.inject({
+      method: 'POST',
+      url: '/finances/cost/hotel-room-type/rt1/periods',
+      headers: { authorization: `Bearer ${tokenFor('staff-1', UserRole.STAFF)}` },
+      payload: { effectiveFrom: '2026-10-01', effectiveTo: '2026-10-07', costPriceCny: -1 },
+    });
+    expect(negative.statusCode).toBe(400);
+    expect(hotelCostPeriodMocks.updateHotelRoomTypeCostPeriod).not.toHaveBeenCalled();
+    expect(hotelCostPeriodMocks.createHotelRoomTypeCostPeriod).not.toHaveBeenCalled();
+  });
+
+  it('PATCH / DELETE / GET 走对应服务；DELETE 审计 targetId 带房型 id', async () => {
+    hotelCostPeriodMocks.updateHotelRoomTypeCostPeriod.mockResolvedValue({ ...periodDto, costPriceCny: 950 });
+    hotelCostPeriodMocks.deleteHotelRoomTypeCostPeriod.mockResolvedValue({ id: 'hp1', roomTypeId: 'rt1' });
+    hotelCostPeriodMocks.listHotelRoomTypeCostPeriods.mockResolvedValue([periodDto]);
+    const auth = { authorization: `Bearer ${tokenFor('staff-1', UserRole.STAFF)}` };
+
+    const patched = await app.inject({
+      method: 'PATCH',
+      url: '/finances/cost/hotel-room-type-periods/hp1',
+      headers: auth,
+      payload: { costPriceCny: 950 },
+    });
+    expect(patched.statusCode).toBe(200);
+    expect(hotelCostPeriodMocks.updateHotelRoomTypeCostPeriod).toHaveBeenCalledWith('hp1', { costPriceCny: 950 });
+
+    const deleted = await app.inject({ method: 'DELETE', url: '/finances/cost/hotel-room-type-periods/hp1', headers: auth });
+    expect(deleted.statusCode).toBe(200);
+    expect(deleted.json()).toEqual({ id: 'hp1' });
+    expect(writeAuditMock).toHaveBeenCalledWith(
+      expect.objectContaining({ action: 'UPDATE_FINANCE_COST', targetId: 'hotel-room-type:rt1:period:hp1' }),
+    );
+
+    const listed = await app.inject({ method: 'GET', url: '/finances/cost/hotel-room-type/rt1/periods', headers: auth });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json()).toEqual({ periods: [periodDto] });
+  });
+
+  it('AGENT 一律 403，不触碰服务', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/finances/cost/hotel-room-type/rt1/periods',
+      headers: { authorization: `Bearer ${tokenFor('agent-1', UserRole.AGENT)}` },
+    });
+    expect(res.statusCode).toBe(403);
+    expect(hotelCostPeriodMocks.listHotelRoomTypeCostPeriods).not.toHaveBeenCalled();
   });
 });

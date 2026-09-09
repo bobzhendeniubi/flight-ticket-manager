@@ -6173,6 +6173,28 @@ export const api = {
   deleteCostPeriod: (token: string, id: string) =>
     apiFetch<{ id: string }>(`/finances/cost/periods/${id}`, { method: 'DELETE', token }),
 
+  // 酒店房型净房价按日期区间 CRUD（区间价优先于房型缺省净房价；同房型区间不得重叠 → 409）
+  listHotelRoomTypeCostPeriods: (token: string, roomTypeId: string) =>
+    apiFetch<{ periods: HotelRoomTypeCostPeriodDto[] }>(
+      `/finances/cost/hotel-room-type/${encodeURIComponent(roomTypeId)}/periods`,
+      { token },
+    ),
+  createHotelRoomTypeCostPeriod: (token: string, roomTypeId: string, body: HotelRoomTypeCostPeriodWriteInput) =>
+    apiFetch<{ period: HotelRoomTypeCostPeriodDto }>(
+      `/finances/cost/hotel-room-type/${encodeURIComponent(roomTypeId)}/periods`,
+      { method: 'POST', token, body },
+    ),
+  updateHotelRoomTypeCostPeriod: (token: string, id: string, body: Partial<HotelRoomTypeCostPeriodWriteInput>) =>
+    apiFetch<{ period: HotelRoomTypeCostPeriodDto }>(
+      `/finances/cost/hotel-room-type-periods/${encodeURIComponent(id)}`,
+      { method: 'PATCH', token, body },
+    ),
+  deleteHotelRoomTypeCostPeriod: (token: string, id: string) =>
+    apiFetch<{ id: string }>(`/finances/cost/hotel-room-type-periods/${encodeURIComponent(id)}`, {
+      method: 'DELETE',
+      token,
+    }),
+
   // 订单杂项成本（OrderCostItem）CRUD
   listOrderCostItems: (token: string, orderId: string) =>
     apiFetch<{ items: OrderCostItem[] }>(`/orders/${orderId}/cost-items`, { token }),
@@ -6836,6 +6858,23 @@ export interface CostPeriodWriteInput {
   charterSourceAmount?: number | null;
   charterFxRate?: number | null;
   charterFxDate?: string | null;
+  note?: string | null;
+}
+
+/** 酒店房型净房价按日期区间（含 effectiveTo 当晚；没被区间覆盖的日子用房型缺省 costPriceCny） */
+export interface HotelRoomTypeCostPeriodDto {
+  id: string;
+  roomTypeId: string;
+  effectiveFrom: string; // YYYY-MM-DD
+  effectiveTo: string; // YYYY-MM-DD
+  costPriceCny: number;
+  note: string | null;
+  updatedAt: string;
+}
+export interface HotelRoomTypeCostPeriodWriteInput {
+  effectiveFrom: string;
+  effectiveTo: string;
+  costPriceCny: number;
   note?: string | null;
 }
 

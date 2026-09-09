@@ -44,6 +44,12 @@ import {
   buildFinanceExportByOrderWorkbook,
   financeExportByOrderFilename,
 } from './finances.export-orders.js';
+import {
+  createHotelRoomTypeCostPeriod,
+  deleteHotelRoomTypeCostPeriod,
+  listHotelRoomTypeCostPeriods,
+  updateHotelRoomTypeCostPeriod,
+} from './hotel-cost.service.js';
 
 const dateStr = z
   .string()
@@ -73,6 +79,14 @@ const flightCostSchema = z.object({
   takeoffDiscountCny: signedCostNum,
 });
 const hotelCostSchema = z.object({ costPriceCny: costNum });
+// 酒店房型净房价按日期区间：区间价必填（非负），起止日 YYYY-MM-DD（含 effectiveTo 当晚）
+const hotelCostPeriodWriteSchema = z.object({
+  effectiveFrom: dateStr,
+  effectiveTo: dateStr,
+  costPriceCny: z.number().nonnegative().max(99_999_999),
+  note: z.string().max(200).nullable().optional(),
+});
+const hotelCostPeriodPatchSchema = hotelCostPeriodWriteSchema.partial();
 const visaCostSchema = z.object({ costPriceCny: costNum });
 const transferCostSchema = z.object({ costPriceCny: costNum });
 
@@ -364,6 +378,36 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     const result = await patchHotelRoomTypeCost(id, data);
     auditCost(req, `hotel-room-type:${id}`, data);
     return result;
+  });
+
+  // ── 酒店房型净房价按日期区间（ADMIN/STAFF）：区间价优先于房型缺省净房价；同房型区间不得重叠（409）──
+  app.get('/cost/hotel-room-type/:id/periods', requireAdminOrStaff, async (req) => {
+    const { id } = req.params as { id: string };
+    const periods = await listHotelRoomTypeCostPeriods(id);
+    return { periods };
+  });
+
+  app.post('/cost/hotel-room-type/:id/periods', requireAdminOrStaff, async (req) => {
+    const { id } = req.params as { id: string };
+    const body = hotelCostPeriodWriteSchema.parse(req.body);
+    const period = await createHotelRoomTypeCostPeriod(id, body);
+    auditCost(req, `hotel-room-type:${id}:period:${period.id}`, { op: 'create', ...body });
+    return { period };
+  });
+
+  app.patch('/cost/hotel-room-type-periods/:pid', requireAdminOrStaff, async (req) => {
+    const { pid } = req.params as { pid: string };
+    const body = hotelCostPeriodPatchSchema.parse(req.body);
+    const period = await updateHotelRoomTypeCostPeriod(pid, body);
+    auditCost(req, `hotel-room-type:${period.roomTypeId}:period:${pid}`, { op: 'update', ...body });
+    return { period };
+  });
+
+  app.delete('/cost/hotel-room-type-periods/:pid', requireAdminOrStaff, async (req) => {
+    const { pid } = req.params as { pid: string };
+    const result = await deleteHotelRoomTypeCostPeriod(pid);
+    auditCost(req, `hotel-room-type:${result.roomTypeId}:period:${pid}`, { op: 'delete' });
+    return { id: result.id };
   });
 
   app.patch('/cost/visa/:id', requireAdminOrStaff, async (req) => {

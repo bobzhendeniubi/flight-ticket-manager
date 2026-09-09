@@ -170,8 +170,9 @@ interface CountedOrderItemFixture {
   totalCostCny: number | null;
   hotelCheckIn: Date | null;
   hotelCheckOut: Date | null;
+  hotelRoomTypeId?: string | null;
   flightSchedule: null;
-  hotelRoomType: null;
+  hotelRoomType: { costPriceCny: number | null } | null;
   visa: { costPriceCny: number | null } | null;
   transfer: null;
   fulfillmentTasks?: { visaUnitCostCny: number | null }[];
@@ -224,13 +225,28 @@ function visaItem(opts: {
   };
 }
 
+/** 酒店房型净房价区间 fixture（无快照老单回退实时算房费时按晚取价）。 */
+interface HotelCostPeriodFixture {
+  roomTypeId: string;
+  effectiveFrom: Date;
+  effectiveTo: Date;
+  costPriceCny: number;
+}
+
 function fakeClient(opts: {
   countedOrders?: CountedOrderFixture[];
   refundedOrders?: RefundedOrderFixture[];
+  hotelCostPeriods?: HotelCostPeriodFixture[];
 }): PrismaClient {
   const countedOrders = opts.countedOrders ?? [];
   const refundedOrders = opts.refundedOrders ?? [];
+  const hotelCostPeriods = opts.hotelCostPeriods ?? [];
   return {
+    hotelRoomTypeCostPeriod: {
+      findMany: vi.fn(async (args: { where: { roomTypeId: { in: string[] } } }) =>
+        hotelCostPeriods.filter((p) => args.where.roomTypeId.in.includes(p.roomTypeId)),
+      ),
+    },
     order: {
       findMany: vi.fn(async (args: { where: { status?: unknown } }) => {
         const status = args.where.status;
@@ -249,6 +265,77 @@ function fakeClient(opts: {
     },
   } as unknown as PrismaClient;
 }
+
+describe('getFinancesSummary — 无快照酒店行回退按日期区间取净房价', () => {
+  function legacyHotelItem(overrides: Partial<CountedOrderItemFixture> = {}): CountedOrderItemFixture {
+    return {
+      ...hotelItem(3000, null),
+      hotelRoomTypeId: 'rt1',
+      hotelRoomType: { costPriceCny: 400 },
+      // 09-30 / 10-01 / 10-02 三晚
+      hotelCheckIn: new Date('2026-09-30T00:00:00.000Z'),
+      hotelCheckOut: new Date('2026-10-03T00:00:00.000Z'),
+      ...overrides,
+    };
+  }
+  const PEAK: HotelCostPeriodFixture = {
+    roomTypeId: 'rt1',
+    effectiveFrom: new Date('2026-10-01T00:00:00.000Z'),
+    effectiveTo: new Date('2026-10-07T00:00:00.000Z'),
+    costPriceCny: 900,
+  };
+
+  it('区间覆盖的晚按区间价、其余按缺省价逐晚累加 × quantity；周期一次性批量加载', async () => {
+    const client = fakeClient({
+      countedOrders: [{ id: 'o1', total: 3000, passengers: [{ id: 'p1' }], costItems: [], items: [legacyHotelItem()] }],
+      hotelCostPeriods: [PEAK],
+    });
+    const summary = await getFinancesSummary(RANGE, client);
+    // 400 + 900 + 900 = 2200
+    expect(summary.costBreakdown.hotel).toBe(2200);
+    const findMany = (client as unknown as { hotelRoomTypeCostPeriod: { findMany: ReturnType<typeof vi.fn> } })
+      .hotelRoomTypeCostPeriod.findMany;
+    expect(findMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('没设区间 → 缺省价 × 晚数（原口径）；有快照的行仍优先用快照', async () => {
+    const client = fakeClient({
+      countedOrders: [
+        {
+          id: 'o1',
+          total: 6000,
+          passengers: [{ id: 'p1' }],
+          costItems: [],
+          items: [legacyHotelItem(), legacyHotelItem({ totalCostCny: 100 })],
+        },
+      ],
+      hotelCostPeriods: [],
+    });
+    const summary = await getFinancesSummary(RANGE, client);
+    // 400 × 3 晚 + 快照 100
+    expect(summary.costBreakdown.hotel).toBe(1300);
+  });
+
+  it('缺省价为空且区间没覆盖全部住宿 → 该行不计成本（真缺数据不虚构）；无入住日期 → 缺省价 × 1 晚', async () => {
+    const client = fakeClient({
+      countedOrders: [
+        {
+          id: 'o1',
+          total: 6000,
+          passengers: [{ id: 'p1' }],
+          costItems: [],
+          items: [
+            legacyHotelItem({ hotelRoomType: { costPriceCny: null } }),
+            legacyHotelItem({ hotelCheckIn: null, hotelCheckOut: null }),
+          ],
+        },
+      ],
+      hotelCostPeriods: [PEAK],
+    });
+    const summary = await getFinancesSummary(RANGE, client);
+    expect(summary.costBreakdown.hotel).toBe(400);
+  });
+});
 
 describe('getFinancesSummary — REFUNDED 订单已收-已退净额', () => {
   it('先收后退（部分退款）：净额计入 revenue，而不是从统计消失', async () => {

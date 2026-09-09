@@ -21,6 +21,7 @@
  */
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { localDate } from './finances.cost.service.js';
+import { hotelStayCostCny, loadHotelCostPeriodsByRoomTypeIds } from './hotel-cost.service.js';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import {
@@ -371,6 +372,8 @@ export async function getFinancesSummary(
           totalCostCny: true,
           hotelCheckIn: true,
           hotelCheckOut: true,
+          // 无快照老单回退实时算房费时，按房型的净房价日期区间逐晚取价
+          hotelRoomTypeId: true,
           flightSchedule: {
             select: {
               flightId: true,
@@ -407,6 +410,11 @@ export async function getFinancesSummary(
     ),
   );
   const periodsMap = await loadPeriodsByFlightIds(flightIds, client);
+  // 酒店房型净房价区间（无快照老单回退实时算时按晚取价）：一次性 load 进 Map，不 N+1
+  const hotelPeriodsMap = await loadHotelCostPeriodsByRoomTypeIds(
+    orders.flatMap((o) => o.items.filter((i) => i.kind === 'HOTEL').map((i) => i.hotelRoomTypeId)),
+    client,
+  );
 
   // ── 3) 聚合 ──
   const categoryMap = new Map<string, CategoryBreakdown>();
@@ -509,17 +517,18 @@ export async function getFinancesSummary(
       switch (it.kind) {
         case 'HOTEL': {
           rev.hotel += amt;
-          // 优先用 snapshot；否则按 costPriceCny × nights × quantity 算
+          // 优先用 snapshot；否则按晚取价（区间净房价优先，否则缺省 costPriceCny）累加 × quantity；
+          // 无入住日期 → 缺省价 × 1 晚 × quantity（原口径）；任一晚取不到价 → 不计（真缺数据不虚构）。
           if (cSnap != null) cost.hotel += cSnap;
-          else if (it.hotelRoomType?.costPriceCny != null) {
-            const perNight = dec(it.hotelRoomType.costPriceCny);
-            let nights = 1;
-            if (it.hotelCheckIn && it.hotelCheckOut) {
-              nights = Math.max(1, Math.round(
-                (it.hotelCheckOut.getTime() - it.hotelCheckIn.getTime()) / (1000 * 60 * 60 * 24),
-              ));
-            }
-            cost.hotel += perNight * nights * it.quantity;
+          else if (it.hotelRoomType) {
+            const stay = hotelStayCostCny({
+              periods: it.hotelRoomTypeId ? hotelPeriodsMap.get(it.hotelRoomTypeId) : undefined,
+              baseCostCny: it.hotelRoomType.costPriceCny,
+              checkIn: it.hotelCheckIn,
+              checkOut: it.hotelCheckOut,
+              nights: 1,
+            });
+            if (stay != null) cost.hotel += stay * it.quantity;
           }
           break;
         }

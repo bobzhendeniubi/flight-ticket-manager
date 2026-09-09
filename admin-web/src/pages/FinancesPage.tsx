@@ -11,7 +11,7 @@
  * 成本更新：demo 估算回填脚本已删除（2026-07-17 审计 #19：按售价比例伪造成本是给事故写邀请函）——缺成本一律如实留空/标未知；
  * 真实生产应由 staff 在 Flights/Hotels/Visa/Transfer 管理页录入。
  */
-import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState, type ReactNode } from 'react';
 import { formatLocalTime } from '../lib/airports';
 import { formatDateTimeSecCn, formatInBusinessTz } from '../lib/datetime';
 import { Icon } from '../components/Icon';
@@ -29,6 +29,8 @@ import {
   type FinanceScheduleRow,
   type CostPeriodDto,
   type CostPeriodWriteInput,
+  type HotelRoomTypeCostPeriodDto,
+  type HotelRoomTypeCostPeriodWriteInput,
   type UsdFxRateDto,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
@@ -1735,26 +1737,29 @@ function ProductCostEditors({ token }: { token: string }) {
       {/* 酒店房型 */}
       <div className="card">
         <h2 className="text-sm font-semibold text-ink">酒店净房价（按房型）</h2>
+        <p className="mt-1 text-xs text-slate-500">
+          按日期区间设了净房价的日子按区间算，没设的日子用缺省值；录单时按入住每晚累加进成本快照，已录订单的快照不追溯。
+        </p>
         <table className="mt-3 w-full text-sm">
           <thead className="text-xs uppercase tracking-wide text-ink-muted">
             <tr className="border-b border-slate-200">
               <th className="py-2 text-left font-normal">酒店 / 房型</th>
               <th className="py-2 text-right font-normal">挂牌价(CNY)</th>
-              <th className="py-2 text-right font-normal">净房价(CNY/晚)</th>
+              <th className="py-2 text-right font-normal">缺省净房价(CNY/晚)</th>
               <th className="py-2 text-right font-normal"></th>
             </tr>
           </thead>
           <tbody>
             {hotels.flatMap((h) =>
               (h.roomTypes ?? []).map((rt) => (
-                <CostRow
+                <HotelRoomTypeCostRows
                   key={rt.id}
+                  token={token}
+                  roomTypeId={rt.id}
                   label={`${h.name} · ${rt.name}`}
                   basePrice={rt.basePrice}
-                  fields={[
-                    { key: 'costPriceCny', value: rt.costPriceCny },
-                  ]}
-                  onSave={async (vals) => {
+                  costPriceCny={rt.costPriceCny}
+                  onSaveDefault={async (vals) => {
                     await api.patchHotelRoomTypeCost(token, rt.id, vals);
                     load();
                   }}
@@ -1833,16 +1838,314 @@ interface CostField {
   value: string | null;
 }
 
+/**
+ * 酒店房型一行：缺省净房价（CostRow）+ 「按日期区间 ▸」展开的区间列表/编辑面板。
+ * 展开面板挂在下一行（colSpan 撑满），只在展开时才拉该房型的区间，列表不预加载。
+ */
+function HotelRoomTypeCostRows({
+  token,
+  roomTypeId,
+  label,
+  basePrice,
+  costPriceCny,
+  onSaveDefault,
+}: {
+  token: string;
+  roomTypeId: string;
+  label: string;
+  basePrice: string | null;
+  costPriceCny: string | null;
+  onSaveDefault: (vals: Record<string, number | null>) => Promise<void>;
+}) {
+  const [expanded, setExpanded] = useState(false);
+  return (
+    <>
+      <CostRow
+        label={label}
+        basePrice={basePrice}
+        fields={[{ key: 'costPriceCny', value: costPriceCny }]}
+        onSave={onSaveDefault}
+        labelExtra={
+          <button
+            type="button"
+            onClick={() => setExpanded((v) => !v)}
+            aria-expanded={expanded}
+            className="ml-2 text-xs text-brand hover:underline"
+          >
+            按日期区间 {expanded ? '▾' : '▸'}
+          </button>
+        }
+      />
+      {expanded && (
+        <tr className="border-b border-slate-100 last:border-0">
+          <td colSpan={4} className="pb-3 pt-0">
+            <HotelRoomTypeCostPeriodsPanel token={token} roomTypeId={roomTypeId} />
+          </td>
+        </tr>
+      )}
+    </>
+  );
+}
+
+/** 某房型的净房价区间列表 + 行内新增/编辑/删除（交互照抄航班成本周期编辑器）。 */
+function HotelRoomTypeCostPeriodsPanel({ token, roomTypeId }: { token: string; roomTypeId: string }) {
+  const confirm = useConfirm();
+  const confirmLockRef = useRef(false);
+  const [periods, setPeriods] = useState<HotelRoomTypeCostPeriodDto[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [err, setErr] = useState<string | null>(null);
+  const [showNew, setShowNew] = useState(false);
+
+  const load = useCallback(() => {
+    let cancelled = false;
+    setErr(null);
+    api
+      .listHotelRoomTypeCostPeriods(token, roomTypeId)
+      .then((d) => {
+        if (!cancelled) setPeriods([...d.periods].sort((a, b) => a.effectiveFrom.localeCompare(b.effectiveFrom)));
+      })
+      .catch((e: unknown) => {
+        if (!cancelled) setErr(e instanceof ApiError ? e.message : '净房价区间加载失败');
+      })
+      .finally(() => {
+        if (!cancelled) setLoading(false);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token, roomTypeId]);
+
+  useEffect(() => load(), [load]);
+
+  async function onDelete(id: string): Promise<void> {
+    if (confirmLockRef.current) return;
+    confirmLockRef.current = true;
+    if (!(await confirm({
+      title: '确认删除该净房价区间？',
+      body: '删除后这段日期回退到房型缺省净房价；已录订单的成本快照不受影响。',
+      tone: 'danger',
+    }))) {
+      confirmLockRef.current = false;
+      return;
+    }
+    try {
+      await api.deleteHotelRoomTypeCostPeriod(token, id);
+      load();
+    } catch (e: unknown) {
+      alert(e instanceof ApiError ? e.message : '删除失败');
+    } finally {
+      confirmLockRef.current = false;
+    }
+  }
+
+  return (
+    <div className="ml-4 rounded-lg border border-slate-200 bg-canvas p-3">
+      <div className="flex flex-wrap items-center justify-between gap-2">
+        <span className="text-xs text-ink-soft">按日期区间的净房价（含结束日当晚；区间之间不得重叠）</span>
+        <button
+          type="button"
+          onClick={() => setShowNew((v) => !v)}
+          className={showNew ? 'btn-secondary py-1 text-xs' : 'btn-primary py-1 text-xs'}
+        >
+          {showNew ? '× 取消' : '+ 新增区间'}
+        </button>
+      </div>
+
+      {showNew && (
+        <HotelRoomTypeCostPeriodForm
+          initial={null}
+          onSubmit={async (body) => {
+            await api.createHotelRoomTypeCostPeriod(token, roomTypeId, body);
+            setShowNew(false);
+            load();
+          }}
+          onCancel={() => setShowNew(false)}
+        />
+      )}
+
+      {loading ? (
+        <div className="mt-2 text-xs text-slate-500">加载区间…</div>
+      ) : err ? (
+        <div className="mt-2 text-xs text-rose-600">{err}</div>
+      ) : (
+        <table className="mt-2 w-full text-xs">
+          <thead className="text-ink-muted">
+            <tr className="border-b border-slate-200">
+              <th className="min-w-[104px] py-1 text-left font-normal">起始</th>
+              <th className="min-w-[104px] py-1 text-left font-normal">结束</th>
+              <th className="min-w-[104px] py-1 text-right font-normal">净房价(CNY/晚)</th>
+              <th className="min-w-[132px] py-1 text-left font-normal">备注</th>
+              <th className="min-w-[96px] py-1 text-right font-normal"></th>
+            </tr>
+          </thead>
+          <tbody>
+            {periods.length === 0 && (
+              <tr>
+                <td colSpan={5} className="py-2 text-center text-ink-muted">
+                  暂无区间 · 所有日期都用缺省净房价
+                </td>
+              </tr>
+            )}
+            {periods.map((p) => (
+              <HotelRoomTypeCostPeriodRow
+                key={p.id}
+                period={p}
+                token={token}
+                onSaved={load}
+                onDelete={() => onDelete(p.id)}
+              />
+            ))}
+          </tbody>
+        </table>
+      )}
+    </div>
+  );
+}
+
+function HotelRoomTypeCostPeriodRow({
+  period,
+  token,
+  onSaved,
+  onDelete,
+}: {
+  period: HotelRoomTypeCostPeriodDto;
+  token: string;
+  onSaved: () => void;
+  onDelete: () => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  if (editing) {
+    return (
+      <tr className="border-b border-slate-100 last:border-0">
+        <td colSpan={5} className="py-1">
+          <HotelRoomTypeCostPeriodForm
+            initial={period}
+            onSubmit={async (body) => {
+              await api.updateHotelRoomTypeCostPeriod(token, period.id, body);
+              setEditing(false);
+              onSaved();
+            }}
+            onCancel={() => setEditing(false)}
+          />
+        </td>
+      </tr>
+    );
+  }
+  return (
+    <tr className="border-b border-slate-100 last:border-0">
+      <td className="py-1 text-slate-600">{period.effectiveFrom}</td>
+      <td className="py-1 text-slate-600">{period.effectiveTo}</td>
+      <td className="py-1 text-right tabular-nums">
+        ¥{period.costPriceCny.toLocaleString('zh-CN', { minimumFractionDigits: 0, maximumFractionDigits: 2 })}
+      </td>
+      <td className="py-1 text-ink-muted">{period.note ?? '—'}</td>
+      <td className="py-1 text-right">
+        <button type="button" onClick={() => setEditing(true)} className="btn-secondary px-2 py-0.5 text-xs">
+          改
+        </button>{' '}
+        <button type="button" onClick={onDelete} className="btn-secondary px-2 py-0.5 text-xs text-rose-600">
+          删
+        </button>
+      </td>
+    </tr>
+  );
+}
+
+/** 区间新增/编辑表单（行内）：起止日 + 净房价 + 备注；重叠/起止倒置由后端 409 报回来原样展示。 */
+function HotelRoomTypeCostPeriodForm({
+  initial,
+  onSubmit,
+  onCancel,
+}: {
+  initial: HotelRoomTypeCostPeriodDto | null;
+  onSubmit: (body: HotelRoomTypeCostPeriodWriteInput) => Promise<void>;
+  onCancel: () => void;
+}) {
+  const [from, setFrom] = useState<string>(initial?.effectiveFrom ?? todayStr());
+  const [to, setTo] = useState<string>(initial?.effectiveTo ?? todayStr());
+  const [price, setPrice] = useState<number | null>(initial?.costPriceCny ?? null);
+  const [note, setNote] = useState<string>(initial?.note ?? '');
+  const [saving, setSaving] = useState(false);
+  const [err, setErr] = useState<string | null>(null);
+
+  async function submit(): Promise<void> {
+    if (price == null) {
+      setErr('请填写该区间的净房价');
+      return;
+    }
+    if (from > to) {
+      setErr('起始日不能晚于结束日');
+      return;
+    }
+    setSaving(true);
+    setErr(null);
+    try {
+      await onSubmit({
+        effectiveFrom: from,
+        effectiveTo: to,
+        costPriceCny: price,
+        note: note.trim() === '' ? null : note.trim(),
+      });
+    } catch (e: unknown) {
+      setErr(e instanceof ApiError ? e.message : initial ? '保存失败' : '创建失败');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  const dateCls = 'w-[120px] rounded-lg border border-slate-200 px-1.5 py-0.5 text-xs focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
+  const numCls = 'w-[104px] rounded-lg border border-slate-200 px-1.5 py-0.5 text-right text-xs nums focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
+  const textCls = 'w-[160px] rounded-lg border border-slate-200 px-1.5 py-0.5 text-xs focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
+
+  return (
+    <div className="mt-2 flex flex-wrap items-end gap-2 rounded-lg border border-slate-200 bg-surface p-2">
+      <label className="text-xs text-ink-soft">
+        起始
+        <input type="date" value={from} onChange={(e) => setFrom(e.target.value)} className={`${dateCls} mt-0.5 block`} />
+      </label>
+      <label className="text-xs text-ink-soft">
+        结束（含当晚）
+        <input type="date" value={to} onChange={(e) => setTo(e.target.value)} className={`${dateCls} mt-0.5 block`} />
+      </label>
+      <label className="text-xs text-ink-soft">
+        净房价(CNY/晚)
+        <NumberInput step={0.01} value={price} onChange={setPrice} className={`${numCls} mt-0.5 block`} />
+      </label>
+      <label className="text-xs text-ink-soft">
+        备注
+        <input
+          type="text"
+          value={note}
+          maxLength={200}
+          placeholder="如：国庆 / 周末价"
+          onChange={(e) => setNote(e.target.value)}
+          className={`${textCls} mt-0.5 block`}
+        />
+      </label>
+      <button type="button" onClick={submit} disabled={saving} className="btn-primary px-2 py-1 text-xs">
+        {saving ? '…' : initial ? '保存' : '创建'}
+      </button>
+      <button type="button" onClick={onCancel} disabled={saving} className="btn-secondary px-2 py-1 text-xs">
+        取消
+      </button>
+      {err && <div className="w-full text-xs text-rose-600">{err}</div>}
+    </div>
+  );
+}
+
 function CostRow({
   label,
   basePrice,
   fields,
   onSave,
+  labelExtra,
 }: {
   label: string;
   basePrice: string | null;
   fields: CostField[];
   onSave: (vals: Record<string, number | null>) => Promise<void>;
+  /** 名称后追加的小控件（如「按日期区间 ▸」展开钮）。 */
+  labelExtra?: ReactNode;
 }) {
   const [draft, setDraft] = useState<Record<string, number | null>>(
     Object.fromEntries(fields.map((f) => [f.key, f.value == null || f.value === '' ? null : Number(f.value)])),
@@ -1870,7 +2173,10 @@ function CostRow({
 
   return (
     <tr className="border-b border-slate-100 last:border-0">
-      <td className="py-2 text-slate-900">{label}</td>
+      <td className="py-2 text-slate-900">
+        {label}
+        {labelExtra}
+      </td>
       <td className="py-2 text-right tabular-nums text-slate-500">
         {basePrice ? `¥${Number(basePrice).toLocaleString('zh-CN')}` : '—'}
       </td>

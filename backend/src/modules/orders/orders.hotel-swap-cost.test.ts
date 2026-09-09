@@ -8,8 +8,10 @@
  *
  * 售价冻结、BUNDLE 行不重算、审计 before/after 等全链路 → 见 orders.hotel-swap.integration.test.ts。
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, vi } from 'vitest';
+vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 import { computeSwapHotelCostSnapshot } from './orders.service.js';
+import { resolveHotelStayUnitCostCny } from '../finances/hotel-cost.service.js';
 
 describe('computeSwapHotelCostSnapshot · 换酒店后 HOTEL 行成本重打快照', () => {
   it('新房型有成本价 → 每间每晚 × 晚数 × 房数', () => {
@@ -31,5 +33,34 @@ describe('computeSwapHotelCostSnapshot · 换酒店后 HOTEL 行成本重打快�
     const snap = computeSwapHotelCostSnapshot({ newCostPriceCny: 333, nights: 3, rooms: 0.5 });
     // 333 × 3 × 0.5 = 499.5 → round → 500
     expect(snap).toEqual({ unitCostCny: 333, totalCostCny: 500 });
+  });
+
+  it('新房型净房价按日期区间浮动：每间每晚取入住期内的平均值，总成本 = 逐晚合计 × 房数', () => {
+    // 换酒店接线口径：newCostPriceCny = resolveHotelStayUnitCostCny(新房型区间, 缺省价, 本行入住区间)
+    const unit = resolveHotelStayUnitCostCny({
+      periods: [{ effectiveFrom: '2026-10-01', effectiveTo: '2026-10-07', costPriceCny: 900 }],
+      baseCostCny: 400,
+      checkIn: new Date('2026-09-30T00:00:00.000Z'),
+      checkOut: new Date('2026-10-03T00:00:00.000Z'),
+    });
+    // 09-30(400) + 10-01(900) + 10-02(900) = 2200 ÷ 3 = 733.33
+    expect(unit).toBe(733.33);
+    const snap = computeSwapHotelCostSnapshot({ newCostPriceCny: unit, nights: 3, rooms: 2 });
+    // 733.33 × 3 × 2 = 4399.98 → round → 4400（= 逐晚合计 2200 × 2 间）
+    expect(snap).toEqual({ unitCostCny: 733.33, totalCostCny: 4400 });
+  });
+
+  it('新房型无缺省价且区间没覆盖全部住宿 → 平均每晚 null → 快照两栏 null（不落 0）', () => {
+    const unit = resolveHotelStayUnitCostCny({
+      periods: [{ effectiveFrom: '2026-10-01', effectiveTo: '2026-10-07', costPriceCny: 900 }],
+      baseCostCny: null,
+      checkIn: new Date('2026-09-30T00:00:00.000Z'),
+      checkOut: new Date('2026-10-03T00:00:00.000Z'),
+    });
+    expect(unit).toBeNull();
+    expect(computeSwapHotelCostSnapshot({ newCostPriceCny: unit, nights: 3, rooms: 2 })).toEqual({
+      unitCostCny: null,
+      totalCostCny: null,
+    });
   });
 });

@@ -1217,12 +1217,34 @@ model HotelRoomType {
   createdAt       DateTime @default(now())
   updatedAt       DateTime @updatedAt
 
-  hotel      Hotel                @relation(fields: [hotelId], references: [id], onDelete: Cascade)
-  inventory  HotelRoomInventory[]
-  orderItems OrderItem[]
-  bundles    Bundle[]
+  hotel       Hotel                     @relation(fields: [hotelId], references: [id], onDelete: Cascade)
+  inventory   HotelRoomInventory[]
+  orderItems  OrderItem[]
+  bundles     Bundle[]
+  // 按日期区间的净房价（周末/节假日/淡旺季浮动）；没被区间覆盖的日子用上面的缺省 costPriceCny
+  costPeriods HotelRoomTypeCostPeriod[]
 
   @@unique([hotelId, name])
+}
+
+/// 酒店房型净房价按日期区间维护（财务成本侧）。
+/// 同一房型的区间不得重叠；覆盖某晚的区间价优先于房型缺省 costPriceCny。
+/// 只影响录单/换酒店/补录时的成本快照与无快照老单的报表回退，不影响售价、库存、房控切房单价。
+model HotelRoomTypeCostPeriod {
+  id            String   @id @default(cuid())
+  roomTypeId    String
+  // 生效起止日（date-only，含 effectiveTo 当晚）
+  effectiveFrom DateTime @db.Date
+  effectiveTo   DateTime @db.Date
+  // 该区间的净房价（CNY/间/晚）
+  costPriceCny  Decimal  @db.Decimal(10, 2)
+  note          String?
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
+
+  roomType HotelRoomType @relation(fields: [roomTypeId], references: [id], onDelete: Cascade)
+
+  @@index([roomTypeId, effectiveFrom, effectiveTo])
 }
 
 model HotelRoomInventory {
