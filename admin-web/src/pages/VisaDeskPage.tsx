@@ -79,6 +79,8 @@ interface PlannedBatchAction {
   run: () => Promise<BatchFulfillmentStatusResult>;
   /** 该项完全成功后清掉对应输入框 */
   clearInput: () => void;
+  /** 成功后在结果面板里顺带带一句提醒（如「N 单备注写了价格但未设金额」），不阻断保存 */
+  hint?: string;
 }
 
 interface BatchActionOutcome extends BatchFulfillmentStatusResult {
@@ -86,6 +88,8 @@ interface BatchActionOutcome extends BatchFulfillmentStatusResult {
   label: string;
   /** 整项请求失败（没拿到逐条结果）时的原因 */
   error: string | null;
+  /** 成功后顺带展示的提醒文案（不阻断） */
+  hint?: string;
 }
 // 列表单页拉取上限（与后端 listFulfillmentQuerySchema.pageSize 一致）
 const PAGE_SIZE = 500;
@@ -588,6 +592,35 @@ function visaCostSummary(task: FulfillmentTask): string {
   return `¥${cny}/人`;
 }
 
+// ── 备注里写了价格但没设金额的提示（签证岗习惯把进价写进备注，备注不进成本核算）──
+/** 备注是否像是写了美金价格：出现「美金/美元/USD/$」之一 */
+const NOTES_PRICE_HINT_RE = /美金|美元|USD|\$/i;
+/** 签证公司格防呆：内容是「纯金额（可带美金/美元/USD 单位）」，说明填错格子了 */
+const PURE_AMOUNT_RE = /^\d+(?:\.\d+)?\s*(?:美金|美元|USD)?$/i;
+
+/** 该任务是否要提示「备注写了价格但未设金额」：备注含价格关键词 + 尚未设人均成本 */
+function needsNotesPriceHint(task: Pick<FulfillmentTask, 'notes' | 'visaUnitCostCny'>): boolean {
+  return task.visaUnitCostCny == null && NOTES_PRICE_HINT_RE.test(task.notes ?? '');
+}
+
+/**
+ * 从备注里试着解析出「<签证公司><金额>美金」（如「斯玛特65美金」「林总54美金」），
+ * 供「按备注带入」按钮预填用。纯启发式，解析不出就返回 null——只是预填，从不自动落库，
+ * 由人确认后手动保存。
+ */
+function parseNotesPriceHint(
+  notes: string | null | undefined,
+): { supplier: string; usd: number } | null {
+  if (!notes) return null;
+  const m = notes.match(/([^\d\s,，。;；:：.]{1,20}?)\s*(\d+(?:\.\d+)?)\s*(?:美金|美元|USD|\$)/i);
+  if (!m) return null;
+  const supplier = m[1].trim();
+  const usd = Number(m[2]);
+  // 公司名至少要有一个真正的字/字母——排除纯标点残留（如「31.5美金」本身没公司名可带）
+  if (!supplier || !/\p{L}/u.test(supplier) || !Number.isFinite(usd)) return null;
+  return { supplier, usd };
+}
+
 interface VisaCostControlProps {
   task: FulfillmentTask;
   token: string;
@@ -627,6 +660,18 @@ function VisaCostControl({ task, token, defaultFxRate, onSaved }: VisaCostContro
     setEditing(true);
   };
 
+  /**
+   * 「按备注带入」：把从备注解析出的公司/美金单价预填进弹层，汇率仍走 startEdit 的当日默认值。
+   * 只是预填，不自动保存——人确认无误后仍要点「保存」。
+   */
+  const startEditFromHint = () => {
+    startEdit();
+    const hint = parseNotesPriceHint(task.notes);
+    if (!hint) return;
+    setSupplier(hint.supplier);
+    setUsd(String(hint.usd));
+  };
+
   const usdNum = parseCostNum(usd);
   const rateNum = parseCostNum(rate);
   // 美金+汇率齐备 → 预览自动折算人民币（与后端口径一致）
@@ -634,6 +679,12 @@ function VisaCostControl({ task, token, defaultFxRate, onSaved }: VisaCostContro
     usdNum != null && rateNum != null ? Math.round(usdNum * rateNum * 100) / 100 : null;
 
   const save = async () => {
+    // 防呆：签证公司格填成了纯金额（如「31.5美金」）——那是美金单价，不是公司名
+    const supplierTrimmed = supplier.trim();
+    if (supplierTrimmed && PURE_AMOUNT_RE.test(supplierTrimmed)) {
+      setError('这里填签证公司名称，金额请填左边的美金单价');
+      return;
+    }
     let payload: VisaTaskCostInput;
     if (usdNum != null || rateNum != null) {
       // 想用美金折算：单价与汇率须同时给
@@ -691,6 +742,26 @@ function VisaCostControl({ task, token, defaultFxRate, onSaved }: VisaCostContro
         >
           {visaCostSummary(task)}
         </span>
+        {/* 备注里写了价格但没设金额：备注不进成本核算，提醒改走「设金额/公司」 */}
+        {needsNotesPriceHint(task) &&
+          (() => {
+            const hint = parseNotesPriceHint(task.notes);
+            return (
+              <div className="max-w-[9rem] rounded border border-amber-300 bg-amber-50 px-1.5 py-1 text-center text-[10px] text-amber-700">
+                <p>备注里写了价格但未设金额——备注不进成本核算，请点「设金额/公司」填美金单价</p>
+                {hint && (
+                  <button
+                    type="button"
+                    className="mt-0.5 text-[10px] font-medium text-amber-800 underline"
+                    onClick={startEditFromHint}
+                    title={`按备注带入：公司=${hint.supplier}，美金单价=${hint.usd}`}
+                  >
+                    按备注带入
+                  </button>
+                )}
+              </div>
+            );
+          })()}
         <button type="button" className="btn-ghost py-0.5 px-2 text-[11px]" onClick={startEdit}>
           {task.visaUnitCostCny != null || task.visaSupplier ? '改金额/公司' : '设金额/公司'}
         </button>
@@ -817,6 +888,8 @@ function OrderGroup({
   const [noteBaseline, setNoteBaseline] = useState(task.notes ?? '');
   const [savingNote, setSavingNote] = useState(false);
   const [noteSaved, setNoteSaved] = useState(false);
+  // 保存的备注像是写了价格但任务还没设金额 → 保存成功提示旁顺带带一句提醒（不阻断保存）
+  const [noteSavedPriceHint, setNoteSavedPriceHint] = useState(false);
   const [noteError, setNoteError] = useState<string | null>(null);
   const noteFocusedRef = useRef(false);
   const noteSavedTimerRef = useRef<number | null>(null);
@@ -986,8 +1059,13 @@ function OrderGroup({
       setNoteBaseline(next);
       setNoteDraft(next);
       setNoteSaved(true);
+      // 备注像是写了价格、任务又还没设金额 → 提示一次「该去设金额」，不阻断这次保存
+      setNoteSavedPriceHint(needsNotesPriceHint({ notes: next, visaUnitCostCny: task.visaUnitCostCny }));
       if (noteSavedTimerRef.current !== null) window.clearTimeout(noteSavedTimerRef.current);
-      noteSavedTimerRef.current = window.setTimeout(() => setNoteSaved(false), 2500);
+      noteSavedTimerRef.current = window.setTimeout(() => {
+        setNoteSaved(false);
+        setNoteSavedPriceHint(false);
+      }, 2500);
       onChanged();
     } catch (e: unknown) {
       setNoteError(e instanceof ApiError ? e.message : '备注保存失败');
@@ -1121,6 +1199,11 @@ function OrderGroup({
           )}
           {noteSaved && !noteDirty && (
             <div className="mt-0.5 text-[10px] text-emerald-600">已保存</div>
+          )}
+          {noteSaved && noteSavedPriceHint && !noteDirty && (
+            <div className="mt-0.5 max-w-xs text-[10px] text-amber-600">
+              备注里写了价格但未设金额——备注不进成本核算，请在右侧「设金额/公司」里填美金单价
+            </div>
           )}
           {noteError && <div className="mt-0.5 text-[10px] text-rose-600">{noteError}</div>}
         </td>
@@ -1666,6 +1749,10 @@ export function VisaDeskPage() {
 
     if (wants('note') && (isSingle || hasNotePlan)) {
       const next = batchNote.trim();
+      // 备注像是写了价格 → 数一下这批里有几单还没设金额，成功后顺带提醒（不阻断保存）
+      const priceHintCount = NOTES_PRICE_HINT_RE.test(next)
+        ? taskIds.filter((id) => tasks.find((t) => t.id === id)?.visaUnitCostCny == null).length
+        : 0;
       actions.push({
         key: 'note',
         label: '备注',
@@ -1675,11 +1762,19 @@ export function VisaDeskPage() {
         danger: true,
         run: () => api.batchUpdateFulfillmentNotes(authToken, taskIds, next),
         clearInput: () => setBatchNote(''),
+        hint:
+          priceHintCount > 0
+            ? `其中 ${priceHintCount} 单备注写了价格但未设金额——备注不进成本核算，请用「设金额/公司」补上`
+            : undefined,
       });
     }
 
     if (wants('supplier') && (isSingle || hasSupplierPlan)) {
       const next = batchSupplier.trim();
+      // 防呆：签证公司格填成了纯金额（如「31.5美金」）——那是美金单价，不是公司名
+      if (next && PURE_AMOUNT_RE.test(next)) {
+        return { actions: [], error: '这里填签证公司名称，金额请填左边的美金单价' };
+      }
       actions.push({
         key: 'supplier',
         label: '签证公司',
@@ -1778,7 +1873,13 @@ export function VisaDeskPage() {
       for (const action of actions) {
         try {
           const res = await action.run();
-          outcomes.push({ key: action.key, label: action.label, ...res, error: null });
+          outcomes.push({
+            key: action.key,
+            label: action.label,
+            ...res,
+            error: null,
+            hint: res.failureCount === 0 ? action.hint : undefined,
+          });
           if (res.failureCount === 0) action.clearInput();
         } catch (e: unknown) {
           outcomes.push({
@@ -2246,6 +2347,7 @@ export function VisaDeskPage() {
                     ))}
                   </ul>
                 )}
+                {r.hint && <p className="mt-1 text-amber-600">{r.hint}</p>}
               </li>
             ))}
           </ul>
