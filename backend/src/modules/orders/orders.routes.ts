@@ -1259,12 +1259,20 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
 
   // ── 套票分房（管理员设置 / 修改）──
   // PUT /orders/:id/room-assignment
+  //   角色：ADMIN/STAFF 全部订单；AGENT 自 2026-09 起可给自家（含下级）订单分房——录单后那个
+  //   「需要分房吗？」入口对代理本来就显示，只是保存被这里挡了，导致代理单大面积没分房表。
+  //   归属校验与 notes / 换酒店同一口径（service.getOrder → assertCanView：无权 403、不存在 404）。
+  //   客户仍不可分房（拼房是运营/代理的事）。
   app.put('/:id/room-assignment', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
-      return reply.status(403).send({ error: '仅运营/管理员可分房' });
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF && role !== UserRole.AGENT) {
+      return reply.status(403).send({ error: '仅运营 / 代理可分房' });
     }
     const { id } = req.params as { id: string };
+    if (role === UserRole.AGENT) {
+      const requester = await buildRequester(req.user.sub, role);
+      await service.getOrder(id, requester);
+    }
     const body = z
       .object({
         roomGroups: z.array(
