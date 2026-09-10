@@ -63,6 +63,12 @@ describe('getFlightSettlementRate', () => {
     const client = { flightSettlementRate: { findUnique } } as unknown as PrismaClient;
     expect(await getFlightSettlementRate('QH9588', '2026-08-12', client)).toBeNull();
   });
+
+  it('当日价为 0（运营清格）→ 视同未维护返回 null，不能被当成 0 元结算价', async () => {
+    const findUnique = vi.fn().mockResolvedValue(rateRow({ pricePerPersonCny: 0 }));
+    const client = { flightSettlementRate: { findUnique } } as unknown as PrismaClient;
+    expect(await getFlightSettlementRate('QH9589', '2026-08-10', client)).toBeNull();
+  });
 });
 
 describe('listFlightRates', () => {

@@ -80,6 +80,13 @@ describe('getSettlementRate', () => {
     const dto = await getSettlementRate(SettlementTier.INTL_5STAR, 3, '2026-08-01', client);
     expect(dto).toBeNull();
   });
+
+  it('当日价为 0（运营清格）→ 视同未维护返回 null，不能被当成 0 元结算价', async () => {
+    const findUnique = vi.fn().mockResolvedValue(rateRow({ pricePerPersonCny: 0 }));
+    const client = { settlementRate: { findUnique } } as unknown as PrismaClient;
+    const dto = await getSettlementRate(SettlementTier.CITY_3STAR, 1, '2026-07-24', client);
+    expect(dto).toBeNull();
+  });
 });
 
 describe('listRates', () => {

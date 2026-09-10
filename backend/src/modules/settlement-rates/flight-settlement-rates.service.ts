@@ -136,5 +136,6 @@ export async function getFlightSettlementRate(
       },
     },
   });
-  return row ? serialize(row) : null;
+  // 0 元格视同未维护：运营清格的习惯是把价改成 0，照 0 取价会让差额行把代理单收敛成 0 元单。
+  return row && row.pricePerPersonCny > 0 ? serialize(row) : null;
 }

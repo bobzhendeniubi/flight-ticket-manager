@@ -14925,7 +14925,8 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
             pricePerPersonCny:
               res.rates.find(
                 (r) => r.flightNumber === leg.flightNumber && r.departDate === leg.departDate,
-              )?.pricePerPersonCny ?? null,
+              // 0 元格服务端视同未维护（不取价），提示也按未维护显示，别让运营看到「日历价 ¥0」
+              )?.pricePerPersonCny || null,
           })),
         );
       })

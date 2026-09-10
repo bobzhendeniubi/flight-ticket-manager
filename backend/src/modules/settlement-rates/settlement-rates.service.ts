@@ -156,5 +156,6 @@ export async function getSettlementRate(
       },
     },
   });
-  return row ? serialize(row) : null;
+  // 0 元格视同未维护（与机票日历同口径）：照 0 取价会把代理套餐单收敛成 0 元单。
+  return row && row.pricePerPersonCny > 0 ? serialize(row) : null;
 }
