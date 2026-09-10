@@ -1010,6 +1010,26 @@ export const batchPassengerInputSchema = passengerInputWithRequiredExpirySchema.
 });
 export type BatchPassengerInput = z.infer<typeof batchPassengerInputSchema>;
 
+/**
+ * 批量创单专用的乘客输入：在共用名单口径之上多一个「逐人结算价」。
+ *
+ * **刻意不加在 batchPassengerInputSchema 上**：那份 schema 同时供占位单转正使用，转正通道没有
+ * 逐人议价这回事，加上去等于多一个「收得下、永远不生效」的静默字段（口径漂移的种子）。
+ */
+export const batchCreateOrdersPassengerInputSchema = batchPassengerInputSchema.extend({
+  // 该乘客的团队议价结算价（CNY，**每位出行人整程价**，≥0，最多两位小数）。
+  // 口径与整批 settlementPriceCny 完全一致（同一条机票行覆盖通道，往返按航段分摊），
+  // 只是作用范围收到这一位：填了按自己的价成交，留空沿用整批价。
+  // 仅 ADMIN/STAFF 生效（路由层 403 早拦 + 服务端按认证身份 400，见 batchCreateOrders）。
+  settlementPriceCny: z
+    .number()
+    .min(0, '结算价不能为负')
+    .max(SETTLEMENT_PRICE_CAP_CNY, `结算价超出上限（${SETTLEMENT_PRICE_CAP_CNY}）`)
+    .refine((v) => Number(v.toFixed(2)) === v, { message: '结算价最多两位小数（元）' })
+    .optional(),
+});
+export type BatchCreateOrdersPassengerInput = z.infer<typeof batchCreateOrdersPassengerInputSchema>;
+
 export const batchCreateOrdersBodySchema = z
   .object({
     // ── 产品类型（B5 新增）──────────────────────────────────────────────────────
@@ -1083,9 +1103,10 @@ export const batchCreateOrdersBodySchema = z
     batchId: z.string().min(8).max(100).optional(),
     // 每位 → 一单。note 为该乘客个别备注（选填），与整批备注合并写入本人订单 notes。
     // 批量/OTA 入单是新建路径 → 护照有效期必填（见 passengerInputWithRequiredExpirySchema 注释）。
+    // settlementPriceCny（逐人结算价，选填）优先于整批 settlementPriceCny，见下方 superRefine 的互斥校验。
     passengers: z
       .array(
-        batchPassengerInputSchema,
+        batchCreateOrdersPassengerInputSchema,
       )
       .min(1)
       .max(100),
@@ -1149,6 +1170,38 @@ export const batchCreateOrdersBodySchema = z
         message: '优惠与团队议价结算价二选一',
         path: ['discountPerPersonCny'],
       });
+    }
+    // ── 逐人结算价（passengers[].settlementPriceCny）的适用范围与互斥 ──────────────
+    // 与整批 settlementPriceCny 同一条通道（覆盖机票行价），所以互斥关系照抄整批那套：
+    // 与优惠、与 OTA 手动结算单价两两互斥；并且只适用于机票批量（套餐地面价由服务端权威计算，
+    // 逐人价只能盖到套餐里的机票航段 → 半生效，不如直接拒掉）。
+    const perPaxSettlementIndexes = val.passengers.flatMap((passenger, index) =>
+      passenger.settlementPriceCny === undefined ? [] : [index],
+    );
+    if (perPaxSettlementIndexes.length > 0) {
+      if (pt === 'BUNDLE') {
+        perPaxSettlementIndexes.forEach((index) => {
+          ctx.addIssue({
+            code: z.ZodIssueCode.custom,
+            message: '逐人结算价仅适用于机票批量创单',
+            path: ['passengers', index, 'settlementPriceCny'],
+          });
+        });
+      }
+      if (hasDiscount) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: '优惠与团队议价结算价二选一',
+          path: ['discountPerPersonCny'],
+        });
+      }
+      if (val.manualUnitPriceCny !== undefined) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: '结算单价与团队议价结算价二选一，请勿同时填写',
+          path: ['manualUnitPriceCny'],
+        });
+      }
     }
   });
 export type BatchCreateOrdersBody = z.infer<typeof batchCreateOrdersBodySchema>;

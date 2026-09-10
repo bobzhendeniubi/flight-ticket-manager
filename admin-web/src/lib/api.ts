@@ -485,6 +485,12 @@ export interface BatchOrderPassenger {
   /** BUNDLE 批量创单行级指定酒店：传服务端解析出的房型 id。 */
   designatedHotelRoomTypeId?: string;
   /**
+   * 该乘客的团队议价结算价（每人整程价，CNY，最多两位小数）。仅机票批量 + ADMIN/STAFF 可用。
+   * 与整批 settlementPriceCny 同一条通道：填了按本人这个价成交，留空沿用整批价；
+   * 与 manualUnitPriceCny / discountPerPersonCny 互斥（后端 400）。
+   */
+  settlementPriceCny?: number;
+  /**
    * 乘客类型（成人/儿童/婴儿）。旧系统表格导入解析层已按「出生日期 + 出发日」派生（见
    * OrderImportParsedRow.passenger.passengerType）；有值才带，缺省回落后端 schema 默认（成人）
    * ——服务端 createOrder 仍会按出生日期 + 航班出发日权威兜底重派生，此处只是不丢入口层已有的判断。

@@ -1,8 +1,8 @@
 /**
- * 批量收款复核锁 / 批量事后调价 · 路由级单测（鉴权、去重、回包、逐单审计）
+ * 批量收款复核锁 / 批量事后调价 / 批量建单议价鉴权 · 路由级单测（鉴权、去重、回包、逐单审计）
  *
- * 服务层口径见 orders.batch-finance.test.ts；这里只管路由这一层：
- *   1. 仅 ADMIN/STAFF 可达（代理/客户 403，且不触服务）。
+ * 服务层口径见 orders.batch-finance.test.ts、orders.batch-manual-price.test.ts；这里只管路由这一层：
+ *   1. 仅 ADMIN/STAFF 可达（代理/客户 403，且不触服务）——含批量建单的结算价通道（整批价 / 逐人价同权）。
  *   2. 重复勾选的订单号在入参处收敛成一份再进服务。
  *   3. 只给真正改动的订单写审计，且带 batch 标记（与单单入口共用 action，靠旗子区分入口）。
  */
@@ -21,6 +21,7 @@ vi.mock('../../db/prisma.js', () => ({ prisma: prismaMock }));
 
 const batchSetPaymentsLockMock = vi.hoisted(() => vi.fn());
 const batchAddPriceAdjustmentMock = vi.hoisted(() => vi.fn());
+const batchCreateOrdersMock = vi.hoisted(() => vi.fn());
 vi.mock('./orders.service.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('./orders.service.js')>();
   return {
@@ -28,6 +29,7 @@ vi.mock('./orders.service.js', async (importOriginal) => {
     OrderService: vi.fn().mockImplementation(() => ({
       batchSetPaymentsLock: batchSetPaymentsLockMock,
       batchAddPriceAdjustment: batchAddPriceAdjustmentMock,
+      batchCreateOrders: batchCreateOrdersMock,
     })),
   };
 });
@@ -222,5 +224,46 @@ describe('批量收款锁 / 批量调价路由', () => {
     });
     expect(res.statusCode).toBe(400);
     expect(batchAddPriceAdjustmentMock).not.toHaveBeenCalled();
+  });
+
+  // ── 批量建单的结算价通道：整批价与名单逐人价同权（仅运营），代理一律 403 ───────────
+  function batchCreateBody(passengers: Array<Record<string, unknown>>): Record<string, unknown> {
+    return {
+      productType: 'FLIGHT_ONEWAY',
+      outboundScheduleId: 's-1',
+      flightCabin: 'ECONOMY',
+      description: 'QH9588 DAD→MFM 2026-08-15 经济舱',
+      passengers,
+    };
+  }
+  const batchPax = (settlementPriceCny?: number): Record<string, unknown> => ({
+    fullName: 'WU/FEILAI',
+    documentNumber: 'EB9452866',
+    dateOfBirth: '1983-09-20',
+    nationality: 'CN',
+    passportExpiry: '2030-01-01',
+    ...(settlementPriceCny === undefined ? {} : { settlementPriceCny }),
+  });
+
+  it('AGENT 在名单里填逐人结算价 → 403，不进服务', async () => {
+    const res = await post(
+      '/orders/batch',
+      tokenFor('agent-1', UserRole.AGENT),
+      batchCreateBody([batchPax(3200)]),
+    );
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toEqual({ error: '仅运营/管理员可指定团队议价结算价' });
+    expect(batchCreateOrdersMock).not.toHaveBeenCalled();
+  });
+
+  it('AGENT 名单不填结算价 → 不被这道闸拦（照旧进服务）', async () => {
+    batchCreateOrdersMock.mockResolvedValue({ successCount: 1, failureCount: 0, results: [] });
+    const res = await post(
+      '/orders/batch',
+      tokenFor('agent-1', UserRole.AGENT),
+      batchCreateBody([batchPax()]),
+    );
+    expect(res.statusCode).toBe(201);
+    expect(batchCreateOrdersMock).toHaveBeenCalledTimes(1);
   });
 });

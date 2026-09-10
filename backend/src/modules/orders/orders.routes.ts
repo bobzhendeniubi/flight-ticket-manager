@@ -267,15 +267,22 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       }
       const body = batchCreateOrdersBodySchema.parse(req.body);
       const hasDiscount = body.discountPerPersonCny !== undefined && body.discountPerPersonCny > 0;
+      // 逐人结算价（名单里逐行填的「结算价/人」）：与整批 settlementPriceCny 同一条通道、同一套
+      // 权限与互斥关系，只是作用范围收到填了的那几位；留空的乘客仍回落整批价。
+      const perPaxSettlementCount = body.passengers.filter(
+        (passenger) => passenger.settlementPriceCny !== undefined,
+      ).length;
+      const hasPerPaxSettlementPrice = perPaxSettlementCount > 0;
+      const hasAnySettlementPrice = body.settlementPriceCny !== undefined || hasPerPaxSettlementPrice;
       if (body.manualUnitPriceCny !== undefined && hasDiscount) {
         return reply.status(400).send({ error: '优惠与手动结算单价二选一' });
       }
-      if (body.settlementPriceCny !== undefined && hasDiscount) {
+      if (hasAnySettlementPrice && hasDiscount) {
         return reply.status(400).send({ error: '优惠与团队议价结算价二选一' });
       }
       // 团队议价结算价覆盖机票价：仅 ADMIN/STAFF 可用（AGENT 自助批量建单不得改价）。
       const isOps = req.user.role === UserRole.ADMIN || req.user.role === UserRole.STAFF;
-      if (body.settlementPriceCny !== undefined && !isOps) {
+      if (hasAnySettlementPrice && !isOps) {
         return reply.status(403).send({ error: '仅运营/管理员可指定团队议价结算价' });
       }
       // OTA 手动结算单价：仅 ADMIN/STAFF 可用（AGENT 自助批量建单不得手动定价）。
@@ -286,7 +293,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         return reply.status(403).send({ error: '仅运营/管理员可录入优惠' });
       }
       // 手动结算单价与团队议价结算价语义冲突（前者保留系统权威价 + 调差，后者直接覆盖机票价）→ 二选一。
-      if (body.manualUnitPriceCny !== undefined && body.settlementPriceCny !== undefined) {
+      if (body.manualUnitPriceCny !== undefined && hasAnySettlementPrice) {
         return reply.status(400).send({ error: '结算单价与团队议价结算价二选一，请勿同时填写' });
       }
       const requester = await buildRequester(req.user.sub, req.user.role);
@@ -305,21 +312,22 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           failureCount: result.failureCount,
           // 团队议价结算价覆盖（如有）— 审计谁、改成多少、团期备注
           settlementPriceCny: body.settlementPriceCny ?? null,
+          // 名单里逐行单独议价的人数（如有）：逐人价优先于整批价，逐单金额在各子单审计里可查
+          perPaxSettlementCount: hasPerPaxSettlementPrice ? perPaxSettlementCount : null,
           // OTA 手动结算单价（如有）— 保留系统权威价 + 差额调整行，此处记录录入的每人结算单价
           manualUnitPriceCny: body.manualUnitPriceCny ?? null,
           discountPerPersonCny: hasDiscount ? body.discountPerPersonCny : null,
-          priceOverride:
-            body.settlementPriceCny !== undefined
-              ? 'TEAM_SETTLEMENT'
-              : body.manualUnitPriceCny !== undefined
-                ? 'OTA_MANUAL'
-                : null,
+          priceOverride: hasAnySettlementPrice
+            ? 'TEAM_SETTLEMENT'
+            : body.manualUnitPriceCny !== undefined
+              ? 'OTA_MANUAL'
+              : null,
           groupNote: body.groupNote ?? null,
         },
         // 改价是敏感操作 → 提级到 WARNING（便于审计检索）
         severity:
           result.failureCount > 0 ||
-          body.settlementPriceCny !== undefined ||
+          hasAnySettlementPrice ||
           body.manualUnitPriceCny !== undefined ||
           hasDiscount
             ? 'WARNING'

@@ -14438,6 +14438,12 @@ interface BatchRow {
   dateOfBirth: string;
   /** 该乘客的个别备注（选填）：客人各自的特殊要求，随本人订单单独存。留空则只写整批备注。 */
   note?: string;
+  /**
+   * 该乘客的团队议价结算价（每人整程价，CNY，最多两位小数；选填）。
+   * 与整批「结算价/人」同一条通道：填了按本人这个价成交，留空沿用整批价（整批也留空则走
+   * 结算价日历 / 动态定价）。仅机票批量 + 运营可填，提交时只带 > 0 的值。
+   */
+  settlementPriceCny?: number | null;
   /** 套餐行级选项：只作用于该乘客自己的子单。 */
   visaExempt?: boolean;
   /**
@@ -15103,6 +15109,16 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const validRows = rows.filter((row) => row.fullName.trim() && row.documentNumber.trim() && parseDob(row.dateOfBirth));
   const hasBatchManualSettlementPrice = manualUnitPriceCny !== null && manualUnitPriceCny > 0;
   const hasBatchTeamSettlementPrice = settlementPriceCny !== null && settlementPriceCny > 0;
+  // 逐人结算价：与整批结算价同一条通道、同一显隐条件（仅运营 + 机票批量）。
+  // 套餐批量的地面价由服务端权威计算，逐人价盖不住 → 整列不给，避免「填了不生效」。
+  const canEnterPerPaxSettlementPrice =
+    isOps && (productType === 'FLIGHT_ONEWAY' || productType === 'FLIGHT_ROUNDTRIP');
+  const perPaxSettlementRowCount = canEnterPerPaxSettlementPrice
+    ? rows.filter((row) => row.settlementPriceCny !== null && (row.settlementPriceCny ?? 0) > 0).length
+    : 0;
+  const hasBatchPerPaxSettlementPrice = perPaxSettlementRowCount > 0;
+  // 逐人价**不**进这个开关：它只影响填了价的那几行，留空的行照旧走日历 ——
+  // 下方的日历试算正是给留空行看的，整块隐掉反而少了信息。
   const batchSettlementCalendarSuppressed =
     hasBatchManualSettlementPrice || hasBatchTeamSettlementPrice;
   const hasBatchManualDiscount = (discountPerPersonCny ?? 0) > 0;
@@ -15729,6 +15745,17 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       Number.isInteger(discountPerPersonCny) && discountPerPersonCny > 0
         ? discountPerPersonCny
         : undefined;
+    // 逐人结算价（名单行级议价）：与整批价同一条通道、同一套互斥关系，提交时只带 > 0 的值。
+    // 行级价在场时该乘客按自己的价成交，其余乘客沿用整批价（都没有则走日历 / 动态价）。
+    const perPaxPriceFor = (row: BatchRow): number | undefined =>
+      canEnterPerPaxSettlementPrice &&
+      row.settlementPriceCny !== null &&
+      row.settlementPriceCny !== undefined &&
+      Number.isFinite(row.settlementPriceCny) &&
+      row.settlementPriceCny > 0
+        ? Math.round(row.settlementPriceCny * 100) / 100
+        : undefined;
+    const hasPerPaxPrice = validRows.some((r) => perPaxPriceFor(r) !== undefined);
     if (teamPrice !== undefined && manualPrice !== undefined) {
       setErr('「结算单价（手动）」与「团队议价结算价」二选一，请只填其中一个');
       return;
@@ -15739,6 +15766,14 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     }
     if (teamPrice !== undefined && discountValue !== undefined) {
       setErr('优惠与团队议价结算价二选一');
+      return;
+    }
+    if (hasPerPaxPrice && manualPrice !== undefined) {
+      setErr('「结算单价（手动）」与名单里的「结算价/人」二选一，请只填其中一个');
+      return;
+    }
+    if (hasPerPaxPrice && discountValue !== undefined) {
+      setErr('优惠与名单里的「结算价/人」二选一');
       return;
     }
     // 手填价复读确认（A17）：肥指错误（¥1000 打成 ¥100/¥0）靠让录单人重读一遍数字拦一道。
@@ -15796,11 +15831,16 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         ...(productType === 'BUNDLE' && r.designatedHotelRoomTypeId
           ? { designatedHotelRoomTypeId: r.designatedHotelRoomTypeId }
           : {}),
+        // 本人议价（选填）：有值才带，留空由后端沿用整批价。
+        ...(perPaxPriceFor(r) !== undefined ? { settlementPriceCny: perPaxPriceFor(r) } : {}),
         note: r.note?.trim() || undefined,
       })),
       ...(teamPrice !== undefined
         ? { settlementPriceCny: teamPrice, groupNote: groupNote.trim() || undefined }
-        : {}),
+        // 整批价留空、只逐人议价时团期备注同样该带上（同一块表单填的）。
+        : hasPerPaxPrice && groupNote.trim()
+          ? { groupNote: groupNote.trim() }
+          : {}),
       ...(manualPrice !== undefined ? { manualUnitPriceCny: manualPrice } : {}),
       ...(discountValue !== undefined ? { discountPerPersonCny: discountValue } : {}),
       // 幂等 batchId：整批重试/双击每张子单只建一次（后端派生 `batch:{batchId}:{index}`）。
@@ -16200,7 +16240,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 </div>
               </div>
               <div className="scrollbar-visible max-h-60 overflow-x-auto overflow-y-auto rounded-md border border-slate-200">
-                <table className={`${productType === 'BUNDLE' ? 'min-w-[1160px]' : 'min-w-[1030px]'} w-full text-sm`}>
+                <table className={`${productType === 'BUNDLE' ? 'min-w-[1160px]' : canEnterPerPaxSettlementPrice ? 'min-w-[1170px]' : 'min-w-[1030px]'} w-full text-sm`}>
                   <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
                     <tr>
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">姓名</th>
@@ -16216,6 +16256,12 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       )}
                       {productType === 'BUNDLE' && (
                         <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">指定酒店</th>
+                      )}
+                      {canEnterPerPaxSettlementPrice && (
+                        <th className="min-w-[140px] whitespace-nowrap px-2 py-1.5 text-left font-normal">
+                          结算价/人（¥）
+                          <span className="ml-1 text-[10px] text-slate-400">留空按整批结算价</span>
+                        </th>
                       )}
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">备注（选填）</th>
                       <th className="min-w-[110px] whitespace-nowrap px-2 py-1.5 text-left font-normal">护照 OCR</th>
@@ -16440,6 +16486,21 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                             })()}
                           </td>
                         )}
+                        {canEnterPerPaxSettlementPrice && (
+                          <td className="px-2 py-1 align-top">
+                            <NumberInput
+                              className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm disabled:bg-slate-100"
+                              value={r.settlementPriceCny ?? null}
+                              onChange={(v) => setRow(i, { settlementPriceCny: v })}
+                              min={0}
+                              step={0.01}
+                              disabled={hasBatchManualSettlementPrice || hasBatchManualDiscount}
+                              placeholder={
+                                hasBatchTeamSettlementPrice ? `留空 = ¥${settlementPriceCny}` : '留空 = 整批价'
+                              }
+                            />
+                          </td>
+                        )}
                         <td className="px-2 py-1 align-top">
                           <input
                             className="w-full rounded border border-slate-300 px-1.5 py-1 text-sm"
@@ -16511,7 +16572,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       </tr>
                       {reviewHint && (
                         <tr className="border-t-0">
-                          <td colSpan={productType === 'BUNDLE' ? 10 : 9} className={`${ocrErrorHint ? 'bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200' : 'bg-amber-50 text-amber-700'} px-2 py-1 text-[11px]`}>
+                          <td colSpan={(productType === 'BUNDLE' ? 10 : 9) + (canEnterPerPaxSettlementPrice ? 1 : 0)} className={`${ocrErrorHint ? 'bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200' : 'bg-amber-50 text-amber-700'} px-2 py-1 text-[11px]`}>
                             <Icon name="alert" /> {reviewHint}
                           </td>
                         </tr>
@@ -16822,6 +16883,11 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
             {isOps && agentId && batchSettlementCalendarSuppressed && !hasBatchManualDiscount && (
               <p className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-600">
                 已填手工结算价，结算价日历不生效
+              </p>
+            )}
+            {hasBatchPerPaxSettlementPrice && !batchSettlementCalendarSuppressed && (
+              <p className="rounded-md border border-slate-200 bg-slate-50 px-3 py-2 text-[11px] text-slate-600">
+                名单里有 {perPaxSettlementRowCount} 位填了自己的结算价，按本人的价成交；其余乘客按下方口径
               </p>
             )}
             {((isOps && agentId) || isAgentUser) && !batchSettlementCalendarSuppressed &&

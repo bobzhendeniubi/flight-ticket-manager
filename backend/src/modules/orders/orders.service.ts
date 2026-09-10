@@ -5927,14 +5927,32 @@ export class OrderService {
     }>;
   }> {
     const hasDiscount = body.discountPerPersonCny !== undefined && body.discountPerPersonCny > 0;
+    // 逐人结算价（名单逐行填的「结算价/人」）：与整批 settlementPriceCny 同一条机票行覆盖通道，
+    // 优先级「本人填的 > 整批填的 > 留空（结算价日历 / 动态价）」。权限与互斥照抄整批那一套，
+    // 全部放在最顶端（早于任何 prisma 调用）→ 未触库即拒，不产生部分建单。
+    const hasPerPaxSettlementPrice = body.passengers.some(
+      (passenger) => passenger.settlementPriceCny !== undefined,
+    );
+    const hasAnySettlementPrice = body.settlementPriceCny !== undefined || hasPerPaxSettlementPrice;
     if (body.discountPerPersonCny !== undefined && body.discountPerPersonCny > 20_000) {
       throw new BadRequestError('单人优惠不能超过 ¥20000');
     }
     if (body.manualUnitPriceCny !== undefined && hasDiscount) {
       throw new BadRequestError('优惠与手动结算单价二选一');
     }
-    if (body.settlementPriceCny !== undefined && hasDiscount) {
+    if (hasAnySettlementPrice && hasDiscount) {
       throw new BadRequestError('优惠与团队议价结算价二选一');
+    }
+    if (body.manualUnitPriceCny !== undefined && hasPerPaxSettlementPrice) {
+      throw new BadRequestError('结算单价与团队议价结算价二选一，请勿同时填写');
+    }
+    // 逐人结算价同样只给运营（服务端按认证身份判，不信前端；与路由层 403 双保险）。
+    if (
+      hasPerPaxSettlementPrice &&
+      requester.role !== UserRole.ADMIN &&
+      requester.role !== UserRole.STAFF
+    ) {
+      throw new BadRequestError('无权指定团队议价结算价');
     }
     // OTA 手动结算单价权限（服务端按认证身份判，不信前端；与 createOrder 的 priceAdjustment 同口径）：
     // 仅 ADMIN/STAFF 可用，散客/AGENT 携带一律 400。放在最顶端（早于任何 prisma 调用）→ 未触库即拒。
@@ -6201,7 +6219,9 @@ export class OrderService {
             agentId: body.agentId,
             // 团队议价结算价（CNY/人）覆盖机票动态价；仅 ADMIN/STAFF（路由层已断言）。
             // 仅作用于 FLIGHT 行；BUNDLE 走 createOrder 的 server-priced 套餐定价，此值对其无效。
-            flightSettlementPriceCny: body.settlementPriceCny,
+            // 优先用该乘客自己填的结算价（名单行级议价），留空才沿用整批价；两者都留空 → undefined，
+            // 照旧走结算价日历 / 动态定价。口径完全同源，一批单里「价格来源」列不会分叉。
+            flightSettlementPriceCny: passenger.settlementPriceCny ?? body.settlementPriceCny,
             // OTA 手动结算单价 → 差额调整行（每单一致；createOrder 再按身份复核权限 + 审计落库）。
             priceAdjustment: manualPriceAdjustment ?? discountAdjustment,
             // 透传重复乘客强录 flag（createOrder 内再按身份收口 + 逐单审计/备注留痕）。
