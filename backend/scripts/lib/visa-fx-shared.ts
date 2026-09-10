@@ -1,11 +1,11 @@
 /**
  * 签证任务成本回填 / 汇率重算两个一次性脚本共用的取数与写库约定（不含业务判定）。
  *
- *   - 「汇率按签证公司不同」是财务口径：脚本取汇率一律**只认该公司自己的汇率行**
- *     （UsdFxRate.supplier = 公司名，trim 后精确匹配），**不回落通用行**——通用行是签证台手工设金额时
- *     的兜底，拿来批量改钱会把一家公司的汇率套到另一家头上。公司没有专属汇率 → 交清单，不动。
+ *   - 「汇率跟供应商合同走」是财务口径：脚本取汇率一律**只认该公司自己的汇率行**
+ *     （FxRate.name = 公司名（汇率名称）、currency = USD，trim 后精确匹配），**不回落通用行**——通用行是签证台
+ *     手工设金额时的兜底，拿来批量改钱会把一家公司的汇率套到另一家头上。公司没有专属汇率 → 交清单，不动。
  *   - 公司名口径 = 任务 visaSupplier 优先（填成金额的脏值不算公司），空则该任务关联签证产品的 Visa.supplier。
- *   - `--seed-rates` 在 --apply 时先按公司把汇率行插进 UsdFxRate（同公司同生效日已有则跳过）；
+ *   - `--seed-rates` 在 --apply 时先按公司把汇率行插进 FxRate（name = 公司名，currency = USD；同名同生效日已有则跳过）；
  *     dry-run 时不写库，但取数会把种子当成「已经存在」来预演，报告与真跑一致。
  *   - 「美金 × 汇率 → 人民币」仍由线上 resolveVisaUnitCost 折算，这里不做乘法。
  */
@@ -14,10 +14,10 @@ import { prisma } from '../../src/db/prisma.js';
 import { writeAudit } from '../../src/lib/audit.js';
 import {
   getUsdFxRate,
-  normalizeFxSupplier,
+  normalizeFxName,
   utcDateToYmd,
   ymdToUtcDate,
-  type UsdFxRateDto,
+  type FxRateDto,
 } from '../../src/modules/finances/finances.fx.service.js';
 import { isAmountOnlySupplier } from '../../src/modules/fulfillment/visa-note-cost.js';
 
@@ -41,7 +41,7 @@ export function decOrNull(v: Prisma.Decimal | null): number | null {
 
 /** 空字符串 / 纯空白一律当「没填」。 */
 export function blankToNull(s: string | null | undefined): string | null {
-  return normalizeFxSupplier(s);
+  return normalizeFxName(s);
 }
 
 export function csvCell(v: string | number | null): string {
@@ -71,7 +71,7 @@ export function parseSeedRates(arg: string): SeedRate[] {
     if (part.trim() === '') continue;
     const m = /^\s*([^=]+?)\s*=\s*(\d+(?:\.\d+)?)\s*$/u.exec(part);
     if (!m) throw new Error(`--seed-rates 格式应为 公司=汇率[,公司=汇率]：${part}`);
-    const supplier = normalizeFxSupplier(m[1]);
+    const supplier = normalizeFxName(m[1]);
     const rate = Number(m[2]);
     if (supplier == null || isAmountOnlySupplier(supplier)) {
       throw new Error(`--seed-rates 公司名不合法：${part}`);
@@ -97,8 +97,8 @@ export interface SeedResult {
 }
 
 /**
- * 按公司插种子汇率行（生效日 = seedFrom）。同公司同生效日已有 → 跳过（不覆盖财务手工维护的值）。
- * dry-run 只判定会插哪些、不写库。--apply 每插一条写一条审计（SEED_USD_FX_RATE）。
+ * 按公司插种子汇率行（汇率名称 = 公司名，币种 USD，生效日 = seedFrom）。同名同生效日已有 → 跳过（不覆盖财务手工维护的值）。
+ * dry-run 只判定会插哪些、不写库。--apply 每插一条写一条审计（SEED_FX_RATE）。
  */
 export async function seedSupplierRates(
   seeds: readonly SeedRate[],
@@ -110,8 +110,8 @@ export async function seedSupplierRates(
   const inserted: SeedRate[] = [];
   const skipped: SeedRate[] = [];
   for (const seed of seeds) {
-    const existing = await prisma.usdFxRate.findFirst({
-      where: { supplier: seed.supplier, effectiveFrom },
+    const existing = await prisma.fxRate.findFirst({
+      where: { name: seed.supplier, currency: 'USD', effectiveFrom },
       select: { id: true, rate: true },
     });
     if (existing) {
@@ -128,9 +128,10 @@ export async function seedSupplierRates(
       console.log(`${logPrefix} [dry-run] 将插入种子汇率 ${seed.supplier} ${seedFrom} 起 ${seed.rate}`);
       continue;
     }
-    const row = await prisma.usdFxRate.create({
+    const row = await prisma.fxRate.create({
       data: {
-        supplier: seed.supplier,
+        name: seed.supplier,
+        currency: 'USD',
         effectiveFrom,
         rate: seed.rate,
         note: '脚本按财务口径按公司初始化',
@@ -141,11 +142,11 @@ export async function seedSupplierRates(
     console.log(`${logPrefix} 已插入种子汇率 ${seed.supplier} ${seedFrom} 起 ${seed.rate}`);
     void writeAudit({
       actor: { label: logPrefix, role: 'SYSTEM' },
-      action: 'SEED_USD_FX_RATE',
+      action: 'SEED_FX_RATE',
       targetType: 'SYSTEM',
       targetId: row.id,
-      targetLabel: `美金汇率 ${seed.supplier} ${seedFrom} 起 ${seed.rate}`,
-      after: { supplier: seed.supplier, effectiveFrom: seedFrom, rate: seed.rate },
+      targetLabel: `汇率 USD ${seed.supplier} ${seedFrom} 起 ${seed.rate}`,
+      after: { name: seed.supplier, currency: 'USD', effectiveFrom: seedFrom, rate: seed.rate },
     });
   }
   return { inserted, skipped };
@@ -180,10 +181,10 @@ export function fxSupplierForTask(t: TaskSupplierInput): TaskSupplier {
 // ── 按公司取汇率（只认公司行 + 种子预演 + 缓存）────────────────────────────────
 
 export type FxResolution =
-  /** 命中该公司自己的汇率行（或 dry-run 里预演的种子行） */
+  /** 命中该公司自己的汇率行（汇率名称 = 公司名；或 dry-run 里预演的种子行） */
   | { kind: 'SUPPLIER'; supplier: string; rate: number; effectiveFrom: string; source: 'FX_TABLE' | 'SEED' }
-  /** 该公司没有专属汇率，线上签证台会回落到这条通用行 —— 脚本不动，只报 */
-  | { kind: 'GENERIC_ONLY'; supplier: string | null; generic: UsdFxRateDto }
+  /** 该公司没有专属汇率，线上签证台会回落到这条 USD 通用行 —— 脚本不动，只报 */
+  | { kind: 'GENERIC_ONLY'; supplier: string | null; generic: FxRateDto }
   /** 公司行、通用行都没有 → 缺汇率 */
   | { kind: 'NONE'; supplier: string | null };
 
@@ -210,8 +211,9 @@ export class SupplierFxResolver {
   }
 
   private async lookup(businessDate: string, supplier: string | null): Promise<FxResolution> {
+    // 只认 USD 币种、汇率名称 = 公司名的行（getUsdFxRate 内部 = getFxRate({ currency: 'USD', name: 公司 })）
     const row = await getUsdFxRate(businessDate, supplier, prisma);
-    const dbOwn = row && row.supplier != null ? row : null;
+    const dbOwn = row && row.name != null ? row : null;
     const seedRate = supplier != null ? this.seedBySupplier.get(supplier) : undefined;
     const seedApplies =
       supplier != null && seedRate != null && this.seedFrom != null && this.seedFrom <= businessDate;
@@ -228,7 +230,7 @@ export class SupplierFxResolver {
     if (dbOwn) {
       return {
         kind: 'SUPPLIER',
-        supplier: dbOwn.supplier as string,
+        supplier: dbOwn.name as string,
         rate: dbOwn.rate,
         effectiveFrom: dbOwn.effectiveFrom,
         source: 'FX_TABLE',
@@ -242,7 +244,7 @@ export class SupplierFxResolver {
 // ── 通用行报告（财务确认用途 / 要不要删）────────────────────────────────────────
 
 export interface GenericRowTally {
-  row: UsdFxRateDto;
+  row: FxRateDto;
   /** 仍会回落到这条通用行的任务数（公司为空 / 未知公司） */
   fallbackTasks: number;
   noSupplierTasks: number;
@@ -266,15 +268,15 @@ export class GenericFallbackTally {
     this.byRowId.set(res.generic.id, entry);
   }
 
-  /** 库里全部通用行（含没人回落的），与命中次数合并；财务据此判断每条通用行的用途。 */
+  /** 库里全部 USD 通用行（含没人回落的），与命中次数合并；财务据此判断每条通用行的用途。 */
   async report(logPrefix: string): Promise<void> {
-    const rows = await prisma.usdFxRate.findMany({
-      where: { supplier: null },
+    const rows = await prisma.fxRate.findMany({
+      where: { name: null, currency: 'USD' },
       orderBy: { effectiveFrom: 'desc' },
     });
     /* eslint-disable no-console */
     console.log('');
-    console.log(`${logPrefix} ── 通用汇率行（supplier 为空）核对 ──`);
+    console.log(`${logPrefix} ── USD 通用汇率行（汇率名称为空）核对 ──`);
     if (rows.length === 0) {
       console.log('  库里没有通用行。');
       return;

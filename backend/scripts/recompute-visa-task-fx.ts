@@ -15,7 +15,7 @@
  *     脚本不自己写乘法）；美金单价永远不动。
  *   - visaSupplier 是「31.5美金」这类填错格的金额 → 公司名改成产品供应商（既有回填脚本的目标 B 口径），
  *     再按该公司重算；关联不到产品的进「缺汇率」清单。
- *   - `--seed-rates` 按公司把财务口径的汇率行插进 UsdFxRate（生效日 = --seed-from，同公司同日已有则跳过）；
+ *   - `--seed-rates` 按公司把财务口径的汇率行插进 FxRate（汇率名称 = 公司名、币种 USD，生效日 = --seed-from，同名同日已有则跳过）；
  *     dry-run 不插，但取数按「已插入」预演，报告与真跑一致。
  *
  * 幂等：改后汇率 = 公司汇率，重跑取到同一汇率 → 0 条待改。留档表 CREATE TABLE IF NOT EXISTS，重跑只追加。
@@ -161,7 +161,7 @@ function buildCsv(planned: readonly PlannedRow[], review: readonly ReviewRow[]):
       '任务id',
       '订单号',
       '任务创建日(北京)',
-      '取数公司',
+      '取数公司（汇率名称）',
       '公司来源',
       '美金',
       '原汇率',

@@ -861,12 +861,19 @@ export function serializeHotel(
     latitude: h.latitude?.toString() ?? null,
     longitude: h.longitude?.toString() ?? null,
     roomTypes: h.roomTypes.map((rt) => {
-      const { costPriceCny, ...rtRest } = rt;
+      // 成本三列（人民币 / 越南盾 / 越南盾汇率名）都是内部结算数据，一律跟 includeCost 走
+      const { costPriceCny, costPriceVnd, costFxName, ...rtRest } = rt;
       return {
         ...rtRest,
         basePrice: rt.basePrice.toString(),
         priceMultiplier: rt.priceMultiplier?.toString() ?? null,
-        ...(includeCost ? { costPriceCny: costPriceCny?.toString() ?? null } : {}),
+        ...(includeCost
+          ? {
+              costPriceCny: costPriceCny?.toString() ?? null,
+              costPriceVnd: costPriceVnd?.toString() ?? null,
+              costFxName: costFxName ?? null,
+            }
+          : {}),
       };
     }),
   };

@@ -21,7 +21,7 @@
  */
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { localDate } from './finances.cost.service.js';
-import { hotelStayCostCny, loadHotelCostPeriodsByRoomTypeIds } from './hotel-cost.service.js';
+import { hotelStayCostCny, loadHotelCostFxRatesIfNeeded, loadHotelCostPeriodsByRoomTypeIds } from './hotel-cost.service.js';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import {
@@ -390,7 +390,7 @@ export async function getFinancesSummary(
               seatClasses: { select: { capacity: true } },
             },
           },
-          hotelRoomType: { select: { costPriceCny: true } },
+          hotelRoomType: { select: { costPriceCny: true, costPriceVnd: true, costFxName: true } },
           visa: { select: { costPriceCny: true } },
           transfer: { select: { costPriceCny: true } },
           // 签证任务的结构化实际成本（人均 CNY）；每个 VISA item 对应一条 VISA_APPLICATION 任务
@@ -411,8 +411,14 @@ export async function getFinancesSummary(
   );
   const periodsMap = await loadPeriodsByFlightIds(flightIds, client);
   // 酒店房型净房价区间（无快照老单回退实时算时按晚取价）：一次性 load 进 Map，不 N+1
+  const hotelItems = orders.flatMap((o) => o.items.filter((i) => i.kind === 'HOTEL'));
   const hotelPeriodsMap = await loadHotelCostPeriodsByRoomTypeIds(
-    orders.flatMap((o) => o.items.filter((i) => i.kind === 'HOTEL').map((i) => i.hotelRoomTypeId)),
+    hotelItems.map((i) => i.hotelRoomTypeId),
+    client,
+  );
+  // 越南盾价源的 VND 汇率行：有越南盾才拉，一次 load 进 Map 按晚查
+  const hotelFxRates = await loadHotelCostFxRatesIfNeeded(
+    { periodsMap: hotelPeriodsMap, bases: hotelItems.map((i) => i.hotelRoomType) },
     client,
   );
 
@@ -524,6 +530,9 @@ export async function getFinancesSummary(
             const stay = hotelStayCostCny({
               periods: it.hotelRoomTypeId ? hotelPeriodsMap.get(it.hotelRoomTypeId) : undefined,
               baseCostCny: it.hotelRoomType.costPriceCny,
+              baseCostVnd: it.hotelRoomType.costPriceVnd,
+              baseFxName: it.hotelRoomType.costFxName,
+              fxRates: hotelFxRates,
               checkIn: it.hotelCheckIn,
               checkOut: it.hotelCheckOut,
               nights: 1,

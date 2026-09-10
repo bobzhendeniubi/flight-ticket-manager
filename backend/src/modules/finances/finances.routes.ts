@@ -35,10 +35,13 @@ import {
   updateCostPeriod,
 } from './finances.cost.service.js';
 import {
-  getUsdFxRate,
+  FX_CURRENCIES,
+  getFxRate,
+  listEffectiveFxRates,
+  listFxNameOptions,
+  listFxRates,
   listFxSupplierOptions,
-  listUsdFxRates,
-  upsertUsdFxRate,
+  upsertFxRate,
 } from './finances.fx.service.js';
 import { buildFinanceExportWorkbook, financeExportFilename } from './finances.export.js';
 import {
@@ -83,15 +86,42 @@ const flightCostSchema = z.object({
   aircraftAdjustCny: signedCostNum,
   takeoffDiscountCny: signedCostNum,
 });
-const hotelCostSchema = z.object({ costPriceCny: costNum });
-// 酒店房型净房价按日期区间：区间价必填（非负），起止日 YYYY-MM-DD（含 effectiveTo 当晚）
-const hotelCostPeriodWriteSchema = z.object({
-  effectiveFrom: dateStr,
-  effectiveTo: dateStr,
-  costPriceCny: z.number().nonnegative().max(99_999_999),
-  note: z.string().max(200).nullable().optional(),
-});
-const hotelCostPeriodPatchSchema = hotelCostPeriodWriteSchema.partial();
+// 酒店净房价：人民币或越南盾二选一（同一次提交不能两个都给数）；costFxName = 越南盾按哪条 VND 汇率行折算（空 = 通用行）
+const fxNameStr = z.string().max(100);
+const hotelCostSchema = z
+  .object({
+    costPriceCny: costNum,
+    costPriceVnd: z.number().nonnegative().max(9_999_999_999).nullable().optional(),
+    costFxName: fxNameStr.nullable().optional(),
+  })
+  .refine((b) => !(b.costPriceCny != null && b.costPriceVnd != null), {
+    message: '净房价填人民币或越南盾其中一个',
+  });
+// 酒店房型净房价按日期区间：区间价必填（人民币或越南盾二选一，非负），起止日 YYYY-MM-DD（含 effectiveTo 当晚）
+const hotelCostPeriodWriteSchema = z
+  .object({
+    effectiveFrom: dateStr,
+    effectiveTo: dateStr,
+    costPriceCny: z.number().nonnegative().max(99_999_999).nullable().optional(),
+    costPriceVnd: z.number().nonnegative().max(9_999_999_999).nullable().optional(),
+    costFxName: fxNameStr.nullable().optional(),
+    note: z.string().max(200).nullable().optional(),
+  })
+  .refine((b) => (b.costPriceCny != null) !== (b.costPriceVnd != null), {
+    message: '区间净房价填人民币或越南盾其中一个',
+  });
+const hotelCostPeriodPatchSchema = z
+  .object({
+    effectiveFrom: dateStr.optional(),
+    effectiveTo: dateStr.optional(),
+    costPriceCny: z.number().nonnegative().max(99_999_999).nullable().optional(),
+    costPriceVnd: z.number().nonnegative().max(9_999_999_999).nullable().optional(),
+    costFxName: fxNameStr.nullable().optional(),
+    note: z.string().max(200).nullable().optional(),
+  })
+  .refine((b) => !(b.costPriceCny != null && b.costPriceVnd != null), {
+    message: '区间净房价填人民币或越南盾其中一个',
+  });
 const visaCostSchema = z.object({ costPriceCny: costNum });
 const transferCostSchema = z.object({ costPriceCny: costNum });
 
@@ -431,51 +461,88 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     return result;
   });
 
-  // ── 美金汇率表（按签证公司 × 生效日）──────────────────────────────────────────
-  // 财务按签证公司各加一条「某日起 x.xx」，区间由同公司下一条的生效日隐含；公司留空 = 通用行，
-  // 只在该公司没有汇率时兜底。签证台设金额时按任务的签证公司自动带出当日汇率，
-  // 折算值当场固化在任务上 —— 之后改汇率表绝不追溯已入账的旧任务。
-  // 读写都放开到 ADMIN/STAFF：签证岗要读当日汇率，财务岗要维护。
-  const fxSupplierStr = z.string().max(100);
-  const usdFxRateUpsertSchema = z.object({
-    supplier: fxSupplierStr.nullable().optional(),
+  // ── 汇率表（命名清单：汇率名称 × 币种 × 生效日）──────────────────────────────
+  // 汇率跟供应商合同走：一个供应商一条名称（签证公司名 / 「酒店越南盾」…），汇率变了按生效日加新行，
+  // 区间由同名称同币种下一条的生效日隐含；名称留空 = 该币种通用行，只在该名称没有汇率时兜底。
+  // 记法按财务习惯：USD 行 = 1 美金折多少人民币；VND 行 = 多少越南盾折 1 人民币。
+  // 签证台按签证公司名自动带 USD 汇率；酒店成本录越南盾时选用 VND 汇率行。折算值当场固化在业务单据上，
+  // 之后改汇率表绝不追溯已入账的旧单据。读写都放开到 ADMIN/STAFF：签证岗要读当日汇率，财务岗要维护。
+  // 路径：新前端走 /fx-rates*；/usd-fx-rates* 保留为 USD 别名（supplier = 汇率名称）。
+  const fxCurrency = z.enum(FX_CURRENCIES);
+  const fxRateUpsertSchema = z.object({
+    name: fxNameStr.nullable().optional(),
+    /** 旧字段名（USD 别名路径），等价 name */
+    supplier: fxNameStr.nullable().optional(),
+    currency: fxCurrency.default('USD'),
     effectiveFrom: dateStr,
-    rate: z.number().positive().max(1000),
+    // VND 记法是「多少越南盾折 1 人民币」（3740 量级），上限放到百万
+    rate: z.number().positive().max(1_000_000),
     note: z.string().max(200).nullable().optional(),
   });
 
-  app.get('/usd-fx-rates', requireAdminOrStaff, async () => {
-    const rates = await listUsdFxRates();
-    return { rates };
-  });
-
-  /** 汇率表「签证公司」输入候选（产品供应商 ∪ 任务签证公司，去重）。 */
-  app.get('/usd-fx-rates/supplier-options', requireAdminOrStaff, async () => {
-    const suppliers = await listFxSupplierOptions();
-    return { suppliers };
-  });
-
-  /**
-   * 取某公司某日生效的汇率：先该公司 ≤date 的最新一条，没有回落通用行；都没有 → { rate: null }，
-   * 前端据此让用户手填。supplier 省略/空 = 只看通用行。
-   */
-  app.get('/usd-fx-rates/effective', requireAdminOrStaff, async (req) => {
-    const q = z.object({ date: dateStr, supplier: fxSupplierStr.optional() }).parse(req.query);
-    const rate = await getUsdFxRate(q.date, q.supplier ?? null);
-    return { rate };
-  });
-
-  app.put('/usd-fx-rates', requireAdminOrStaff, async (req) => {
-    const body = usdFxRateUpsertSchema.parse(req.body);
-    const rate = await upsertUsdFxRate(body, req.user.sub);
-    void writeAudit({
-      actor: actorFromRequest(req),
-      action: 'UPSERT_USD_FX_RATE',
-      targetType: 'SYSTEM',
-      targetId: rate.id,
-      targetLabel: `美金汇率 ${rate.supplier ?? '通用'} ${rate.effectiveFrom} 起 ${rate.rate}`,
-      after: rate,
+  for (const prefix of ['/fx-rates', '/usd-fx-rates'] as const) {
+    app.get(prefix, requireAdminOrStaff, async () => {
+      const rates = await listFxRates();
+      return { rates };
     });
-    return { rate };
-  });
+
+    /** 汇率名称候选（按币种）：USD = 签证供应商候选；VND = 酒店/车队越南盾建议项；都并上表里已有名称。 */
+    app.get(`${prefix}/name-options`, requireAdminOrStaff, async () => {
+      const options = await listFxNameOptions();
+      return { options };
+    });
+
+    /** 旧接口：汇率表「签证公司」输入候选（产品供应商 ∪ 任务签证公司，去重）。 */
+    app.get(`${prefix}/supplier-options`, requireAdminOrStaff, async () => {
+      const suppliers = await listFxSupplierOptions();
+      return { suppliers };
+    });
+
+    /**
+     * 取某名称某日生效的汇率：先该名称 ≤date 的最新一条，没有回落同币种通用行；都没有 → { rate: null }，
+     * 前端据此让用户手填。name/supplier 省略/空 = 只看通用行；currency 缺省 USD。
+     */
+    app.get(`${prefix}/effective`, requireAdminOrStaff, async (req) => {
+      const q = z
+        .object({
+          date: dateStr,
+          currency: fxCurrency.default('USD'),
+          name: fxNameStr.optional(),
+          supplier: fxNameStr.optional(),
+        })
+        .parse(req.query);
+      const rate = await getFxRate({ date: q.date, currency: q.currency, name: q.name ?? q.supplier ?? null });
+      return { rate };
+    });
+
+    /** 某币种在目标日每个名称各一条生效汇率（含通用行），供「选用哪条汇率」下拉。 */
+    app.get(`${prefix}/effective-list`, requireAdminOrStaff, async (req) => {
+      const q = z.object({ date: dateStr, currency: fxCurrency.default('USD') }).parse(req.query);
+      const rates = await listEffectiveFxRates(q);
+      return { rates };
+    });
+
+    app.put(prefix, requireAdminOrStaff, async (req) => {
+      const body = fxRateUpsertSchema.parse(req.body);
+      const rate = await upsertFxRate(
+        {
+          name: body.name ?? body.supplier ?? null,
+          currency: body.currency,
+          effectiveFrom: body.effectiveFrom,
+          rate: body.rate,
+          note: body.note,
+        },
+        req.user.sub,
+      );
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'UPSERT_FX_RATE',
+        targetType: 'SYSTEM',
+        targetId: rate.id,
+        targetLabel: `汇率 ${rate.currency} ${rate.name ?? '通用'} ${rate.effectiveFrom} 起 ${rate.rate}`,
+        after: rate,
+      });
+      return { rate };
+    });
+  }
 };

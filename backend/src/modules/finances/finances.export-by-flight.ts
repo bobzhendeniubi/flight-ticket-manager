@@ -26,7 +26,7 @@ import {
   loadPeriodsByFlightIds,
   resolveScheduleCost,
 } from './finances.cost.service.js';
-import { hotelStayCostCny, loadHotelCostPeriodsByRoomTypeIds } from './hotel-cost.service.js';
+import { hotelStayCostCny, loadHotelCostFxRatesIfNeeded, loadHotelCostPeriodsByRoomTypeIds } from './hotel-cost.service.js';
 import { visaItemCostCny } from './finances.service.js';
 
 const COUNTED_STATUSES: OrderStatus[] = [
@@ -175,7 +175,7 @@ export async function buildFinanceExportByFlightWorkbook(
             costItems: { select: { category: true, amountCny: true } },
             items: {
               include: {
-                hotelRoomType: { select: { costPriceCny: true } },
+                hotelRoomType: { select: { costPriceCny: true, costPriceVnd: true, costFxName: true } },
                 visa: { select: { costPriceCny: true } },
                 transfer: { select: { costPriceCny: true } },
                 fulfillmentTasks: {
@@ -192,8 +192,14 @@ export async function buildFinanceExportByFlightWorkbook(
   const flightIds = Array.from(new Set(schedules.map((s) => s.flight.id)));
   const periodsMap = await loadPeriodsByFlightIds(flightIds, client);
   // 酒店房型净房价区间（无快照老单回退实时算时按晚取价）：一次性 load 进 Map，不 N+1
+  const hotelItems = orders.flatMap((o) => o.items.filter((i) => i.kind === 'HOTEL'));
   const hotelPeriodsMap = await loadHotelCostPeriodsByRoomTypeIds(
-    orders.flatMap((o) => o.items.filter((i) => i.kind === 'HOTEL').map((i) => i.hotelRoomTypeId)),
+    hotelItems.map((i) => i.hotelRoomTypeId),
+    client,
+  );
+  // 越南盾价源的 VND 汇率行：有越南盾才拉，一次 load 进 Map 按晚查
+  const hotelFxRates = await loadHotelCostFxRatesIfNeeded(
+    { periodsMap: hotelPeriodsMap, bases: hotelItems.map((i) => i.hotelRoomType) },
     client,
   );
 
@@ -271,6 +277,9 @@ export async function buildFinanceExportByFlightWorkbook(
             const stay = hotelStayCostCny({
               periods: it.hotelRoomTypeId ? hotelPeriodsMap.get(it.hotelRoomTypeId) : undefined,
               baseCostCny: it.hotelRoomType.costPriceCny,
+              baseCostVnd: it.hotelRoomType.costPriceVnd,
+              baseFxName: it.hotelRoomType.costFxName,
+              fxRates: hotelFxRates,
               checkIn: it.hotelCheckIn,
               checkOut: it.hotelCheckOut,
               nights: 1,

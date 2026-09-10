@@ -114,7 +114,13 @@ import {
 import { resolveBundleNights } from '../products/bundle-nights.js';
 import { parseVisaExpressTiers, type VisaExpressTier } from '../products/products.schemas.js';
 import { localDate } from '../finances/finances.cost.service.js';
-import { resolveHotelStayUnitCostCny } from '../finances/hotel-cost.service.js';
+import {
+  buildHotelCostSourceSnapshot,
+  loadHotelCostFxRatesIfNeeded,
+  resolveHotelStayUnitCost,
+  resolveHotelStayUnitCostCny,
+  type HotelCostSourceSnapshot,
+} from '../finances/hotel-cost.service.js';
 import { getSettlementRate } from '../settlement-rates/settlement-rates.service.js';
 import { getFlightSettlementRate } from '../settlement-rates/flight-settlement-rates.service.js';
 import {
@@ -1563,6 +1569,20 @@ export function computeSwapHotelCostSnapshot(input: {
     unitCostCny: input.newCostPriceCny,
     totalCostCny: Math.round(input.newCostPriceCny * input.nights * input.rooms),
   };
+}
+
+/**
+ * 把酒店成本快照的「价源」并进订单行 metadata（Json 合并写，不覆盖已有 key）：
+ * metadata.costSource = { currency, unitAmountPerNight | nightly[], fxName, fxRate, fxEffectiveFrom, nights }。
+ * unitCostCny / totalCostCny 语义不变（仍是折好的人民币），这里只记「怎么折出来的」。没有价源 → 原样返回。
+ */
+export function withHotelCostSource(
+  metadata: Record<string, unknown> | null | undefined,
+  costSource: HotelCostSourceSnapshot | null,
+  key: 'costSource' | 'hotelCostSource' = 'costSource',
+): Record<string, unknown> | undefined {
+  if (!costSource) return metadata ?? undefined;
+  return { ...(metadata ?? {}), [key]: costSource };
 }
 
 /**
@@ -3896,6 +3916,7 @@ export class OrderService {
         const rooms = item.roomsBilled ?? 1;
         // 成本快照（每间每晚）：仅有产品 id 时可从 DB 取；无 id 的自由行手录成本未知 → 留空。
         let hotelUnitCost: number | undefined;
+        let hotelCostSource: HotelCostSourceSnapshot | null = null;
         // ── 星级随机档行（三星随机 / 四星随机）：不指定酒店，占同星级酒店的合计余量 ──
         // 校验放这里而不是 zod：orderItemInputSchema 是 discriminatedUnion，不接受 ZodEffects。
         if (item.randomStarTier != null) {
@@ -3932,23 +3953,41 @@ export class OrderService {
             select: {
               basePrice: true,
               costPriceCny: true,
+              costPriceVnd: true,
+              costFxName: true,
               hotel: { select: { isActive: true } },
-              // 按日期区间的净房价：有入住日期时逐晚取价（区间价优先，否则缺省价）
-              costPeriods: { select: { effectiveFrom: true, effectiveTo: true, costPriceCny: true } },
+              // 按日期区间的净房价：有入住日期时逐晚取价（区间价优先，否则缺省价；越南盾按当晚汇率折）
+              costPeriods: {
+                select: {
+                  effectiveFrom: true,
+                  effectiveTo: true,
+                  costPriceCny: true,
+                  costPriceVnd: true,
+                  costFxName: true,
+                },
+              },
             },
           });
           if (!rt) throw new NotFoundError(`酒店房型 ${item.hotelRoomTypeId} 不存在`);
           if (!rt.hotel.isActive) throw new BadRequestError('酒店已下架');
           unitPrice = Number(rt.basePrice);
           // 成本快照（每间每晚 = 住宿期内平均净房价；无入住日期 → 缺省净房价）：
-          // 产品未录成本（或任一晚取不到价）→ undefined → 毛利「未知」，不落 0 虚高。
-          hotelUnitCost =
-            resolveHotelStayUnitCostCny({
-              periods: rt.costPeriods,
-              baseCostCny: rt.costPriceCny,
-              checkIn: item.checkIn,
-              checkOut: item.checkOut,
-            }) ?? undefined;
+          // 产品未录成本（或任一晚取不到价 / 越南盾缺汇率）→ undefined → 毛利「未知」，不落 0 虚高。
+          // 越南盾价源才拉 VND 汇率行（一次 load 进 Map 按晚查）；价源写进 metadata.costSource。
+          const hotelCost = resolveHotelStayUnitCost({
+            periods: rt.costPeriods,
+            baseCostCny: rt.costPriceCny,
+            baseCostVnd: rt.costPriceVnd,
+            baseFxName: rt.costFxName,
+            fxRates: await loadHotelCostFxRatesIfNeeded(
+              { periodsMap: new Map([[item.hotelRoomTypeId, rt.costPeriods]]), bases: [rt] },
+              prisma,
+            ),
+            checkIn: item.checkIn,
+            checkOut: item.checkOut,
+          });
+          hotelUnitCost = hotelCost.unitCostCny ?? undefined;
+          hotelCostSource = buildHotelCostSourceSnapshot(hotelCost.detail);
           // A3：拒绝偏离服务端权威价超容差的提交（仅有产品 id 时校验，无 id 走信任旧路径）。
           // 0.5 间：金额随 roomsBilled 缩放，容差按同一房间数口径比较，避免误判价格变动。
           assertAmountWithinTolerance('酒店', item.unitPrice, unitPrice, item.quantity * rooms);
@@ -3972,7 +4011,8 @@ export class OrderService {
           // 总成本与 amount 同口径缩放（×qty×rooms），保证毛利 = amount − totalCostCny 诚实。
           totalCostCny:
             hotelUnitCost != null ? Math.round(hotelUnitCost * item.quantity * rooms) : undefined,
-          metadata: item.metadata,
+          // 成本价源（币种 / 原币单价 / 汇率）并进 metadata.costSource，其余 key 原样保留
+          metadata: withHotelCostSource(item.metadata, hotelCostSource),
         });
       } else if (item.kind === 'TRANSFER') {
         let unitPrice = item.unitPrice;
@@ -12684,6 +12724,8 @@ export class OrderService {
         // 换酒店前的成本快照（审计 before / 保留 BUNDLE 行原值不动的依据）。
         unitCostCny: true,
         totalCostCny: true,
+        // 重打快照时把新价源并进 metadata.costSource（Json 合并写，其余 key 不动）
+        metadata: true,
       },
     });
     if (!item || item.orderId !== orderId) {
@@ -12725,8 +12767,12 @@ export class OrderService {
           hotelId: true,
           // 新房型成本价 → 重打 HOTEL 行成本快照（每间每晚 × 晚数 × 房数）。
           costPriceCny: true,
-          // 按日期区间的净房价：按本行入住区间逐晚取价（区间价优先，否则缺省价）
-          costPeriods: { select: { effectiveFrom: true, effectiveTo: true, costPriceCny: true } },
+          costPriceVnd: true,
+          costFxName: true,
+          // 按日期区间的净房价：按本行入住区间逐晚取价（区间价优先，否则缺省价；越南盾按当晚汇率折）
+          costPeriods: {
+            select: { effectiveFrom: true, effectiveTo: true, costPriceCny: true, costPriceVnd: true, costFxName: true },
+          },
           hotel: {
             select: {
               name: true,
@@ -12829,20 +12875,36 @@ export class OrderService {
     // ── HOTEL 行成本重打快照（Task B）：按新房型成本价 × 晚数(quantity) × 房数(roomsBilled)，
     // 口径对齐建单时的 HOTEL 行快照公式。新房型无成本价 → null（真缺数据，如实报缺）。
     // BUNDLE 行不重算（建单时未快照酒店成本，其 quantity≠晚数、totalCostCny 覆盖整包）→ 原值不动。
-    const swapCost =
+    // 每间每晚 = 本行入住区间内的平均净房价（按日期区间取价；越南盾按当晚汇率折）；无日期 → 缺省净房价。
+    const swapUnit =
       item.kind === OrderItemKind.HOTEL
-        ? computeSwapHotelCostSnapshot({
-            // 每间每晚 = 本行入住区间内的平均净房价（按日期区间取价）；无日期 → 缺省净房价。
-            newCostPriceCny: resolveHotelStayUnitCostCny({
-              periods: newRoomType.costPeriods,
-              baseCostCny: newRoomType.costPriceCny,
-              checkIn: item.hotelCheckIn,
-              checkOut: item.hotelCheckOut,
-            }),
-            nights: item.quantity,
-            rooms: roomsBilled,
+        ? resolveHotelStayUnitCost({
+            periods: newRoomType.costPeriods,
+            baseCostCny: newRoomType.costPriceCny,
+            baseCostVnd: newRoomType.costPriceVnd,
+            baseFxName: newRoomType.costFxName,
+            fxRates: await loadHotelCostFxRatesIfNeeded(
+              { periodsMap: new Map([[newRoomType.id, newRoomType.costPeriods]]), bases: [newRoomType] },
+              prisma,
+            ),
+            checkIn: item.hotelCheckIn,
+            checkOut: item.hotelCheckOut,
           })
         : null;
+    const swapCost = swapUnit
+      ? computeSwapHotelCostSnapshot({
+          newCostPriceCny: swapUnit.unitCostCny,
+          nights: item.quantity,
+          rooms: roomsBilled,
+        })
+      : null;
+    // 新价源并进 metadata.costSource（无价源 → metadata 不动）
+    const swapMetadata = swapUnit
+      ? withHotelCostSource(
+          (item.metadata ?? null) as Record<string, unknown> | null,
+          buildHotelCostSourceSnapshot(swapUnit.detail),
+        )
+      : undefined;
     // 换酒店前后的成本快照（审计留痕）。BUNDLE 行 after === before（不动）。
     const beforeUnitCostCny = item.unitCostCny != null ? Number(item.unitCostCny.toString()) : null;
     const beforeTotalCostCny = item.totalCostCny != null ? Number(item.totalCostCny.toString()) : null;
@@ -13000,6 +13062,7 @@ export class OrderService {
                   swapCost.unitCostCny != null ? new Prisma.Decimal(swapCost.unitCostCny) : null,
                 totalCostCny:
                   swapCost.totalCostCny != null ? new Prisma.Decimal(swapCost.totalCostCny) : null,
+                ...(swapMetadata ? { metadata: swapMetadata as Prisma.InputJsonValue } : {}),
               }
             : {}),
         },
@@ -14083,6 +14146,8 @@ export class OrderService {
       // 成本快照用的每晚成本：签证 = 产品成本；酒店 = 入住期内平均净房价（按日期区间取价，
       // 无入住日期 → 缺省净房价）。缺省售价仍按房型缺省成本带出（售价侧口径不变）。
       let snapshotCostPriceCny: number | null;
+      // 酒店行的成本价源（币种 / 原币单价 / 汇率）→ metadata.costSource；VISA 行恒 null
+      let groundCostSource: HotelCostSourceSnapshot | null = null;
       let unitPriceCny: number;
       let quantity: number;
       let rooms: number | undefined;
@@ -14137,8 +14202,12 @@ export class OrderService {
             id: true,
             name: true,
             costPriceCny: true,
-            // 按日期区间的净房价：有入住日期时逐晚取价（区间价优先，否则缺省价）
-            costPeriods: { select: { effectiveFrom: true, effectiveTo: true, costPriceCny: true } },
+            costPriceVnd: true,
+            costFxName: true,
+            // 按日期区间的净房价：有入住日期时逐晚取价（区间价优先，否则缺省价；越南盾按当晚汇率折）
+            costPeriods: {
+              select: { effectiveFrom: true, effectiveTo: true, costPriceCny: true, costPriceVnd: true, costFxName: true },
+            },
             hotel: { select: { name: true, isActive: true } },
           },
         });
@@ -14166,12 +14235,20 @@ export class OrderService {
             throw new BadRequestError('入住日期无效');
           }
         }
-        snapshotCostPriceCny = resolveHotelStayUnitCostCny({
+        const hotelCost = resolveHotelStayUnitCost({
           periods: roomType.costPeriods,
           baseCostCny: roomType.costPriceCny,
+          baseCostVnd: roomType.costPriceVnd,
+          baseFxName: roomType.costFxName,
+          fxRates: await loadHotelCostFxRatesIfNeeded(
+            { periodsMap: new Map([[roomType.id, roomType.costPeriods]]), bases: [roomType] },
+            tx,
+          ),
           checkIn: hotelCheckIn,
           checkOut: hotelCheckOut,
         });
+        snapshotCostPriceCny = hotelCost.unitCostCny;
+        groundCostSource = buildHotelCostSourceSnapshot(hotelCost.detail);
       }
 
       // ── 酒店房量闸（CRITICAL 修复，与建单同一把闸）───────────────────────────
@@ -14224,10 +14301,10 @@ export class OrderService {
           visaId: input.kind === 'VISA' ? input.visaId : null,
           visaIntendedDate,
           roomsBilled: input.kind === 'HOTEL' ? new Prisma.Decimal(rooms!) : null,
-          metadata: {
-            source: 'ORDER_GROUND_ITEM',
-            note: input.note ?? null,
-          } as Prisma.InputJsonValue,
+          metadata: withHotelCostSource(
+            { source: 'ORDER_GROUND_ITEM', note: input.note ?? null },
+            groundCostSource,
+          ) as Prisma.InputJsonValue,
         },
       });
 
@@ -14408,6 +14485,9 @@ export class OrderService {
       // 仅在套餐行计费房数真正上调（新增房间）时，按每晚成本 × 晚数 × 新增房数落实成本。
       let feeTotalCostCny = 0;
       let feeCostSource: RoomCostSource = 'ZERO';
+      // 走「现行房型成本价」口径时记下价源（币种 / 原币单价 / 汇率）→ metadata.hotelCostSource
+      //（metadata.costSource 这个 key 在本行已是 ITEM_SNAPSHOT/PRODUCT/ZERO 三态字符串，不覆盖）
+      let feeHotelCostSource: HotelCostSourceSnapshot | null = null;
       if (input.passengerId) {
         const pax = await tx.passenger.findUnique({
           where: { id: input.passengerId },
@@ -14449,8 +14529,18 @@ export class OrderService {
                     maxAdults: true,
                     maxChildren: true,
                     costPriceCny: true,
-                    // 按日期区间的净房价：回退产品成本时按本行入住区间逐晚取价
-                    costPeriods: { select: { effectiveFrom: true, effectiveTo: true, costPriceCny: true } },
+                    costPriceVnd: true,
+                    costFxName: true,
+                    // 按日期区间的净房价：回退产品成本时按本行入住区间逐晚取价（越南盾按当晚汇率折）
+                    costPeriods: {
+                      select: {
+                        effectiveFrom: true,
+                        effectiveTo: true,
+                        costPriceCny: true,
+                        costPriceVnd: true,
+                        costFxName: true,
+                      },
+                    },
                   },
                 },
               },
@@ -14529,23 +14619,37 @@ export class OrderService {
             // 新增计费房数 = 新旧 roomsBilled 之差（旧值未设时保守取 0，基线未知不虚构成本）。
             // 每晚成本三级回退：套餐行下单快照 → 现行房型成本价 → 0。晚数与描述里的 N 同源。
             const addedRooms = before == null ? 0 : Math.max(0, roomsCharged - before);
+            // 每晚产品成本 = 本行入住区间内的平均净房价（按日期区间取价；越南盾按当晚汇率折）；无日期 → 缺省净房价。
+            const productRoomType = bundleItem.bundle.hotelRoomType;
+            const productCost = productRoomType
+              ? resolveHotelStayUnitCost({
+                  periods: productRoomType.costPeriods,
+                  baseCostCny: productRoomType.costPriceCny,
+                  baseCostVnd: productRoomType.costPriceVnd,
+                  baseFxName: productRoomType.costFxName,
+                  fxRates: await loadHotelCostFxRatesIfNeeded(
+                    {
+                      periodsMap: new Map([[bundleItem.bundle.hotelRoomTypeId ?? '', productRoomType.costPeriods]]),
+                      bases: [productRoomType],
+                    },
+                    tx,
+                  ),
+                  checkIn: bundleItem.hotelCheckIn,
+                  checkOut: bundleItem.hotelCheckOut,
+                })
+              : null;
             const resolvedCost = resolveRoomSupplementCost({
               snapshotUnitCostCny:
                 bundleItem.unitCostCny != null ? Number(bundleItem.unitCostCny.toString()) : null,
-              // 每晚产品成本 = 本行入住区间内的平均净房价（按日期区间取价）；无日期 → 缺省净房价。
-              productCostPriceCny: bundleItem.bundle.hotelRoomType
-                ? resolveHotelStayUnitCostCny({
-                    periods: bundleItem.bundle.hotelRoomType.costPeriods,
-                    baseCostCny: bundleItem.bundle.hotelRoomType.costPriceCny,
-                    checkIn: bundleItem.hotelCheckIn,
-                    checkOut: bundleItem.hotelCheckOut,
-                  })
-                : null,
+              productCostPriceCny: productCost?.unitCostCny ?? null,
               nights,
               addedRooms,
             });
             feeTotalCostCny = resolvedCost.totalCostCny;
             feeCostSource = resolvedCost.costSource;
+            if (resolvedCost.costSource === 'PRODUCT' && productCost) {
+              feeHotelCostSource = buildHotelCostSourceSnapshot(productCost.detail);
+            }
             roomControl += `；套餐行计费房数 ${before ?? '未设'} → ${roomsCharged}（房控/分房自动跟进）`;
           } else {
             roomControl += `；计费房数维持 ${before}（权威重算 ${roomsCharged} 未超过现值，只升不降）`;
@@ -14567,7 +14671,11 @@ export class OrderService {
           unitPrice: new Prisma.Decimal(row.unitPrice),
           amount: new Prisma.Decimal(row.amount),
           totalCostCny: new Prisma.Decimal(feeTotalCostCny),
-          metadata: { ...row.metadata, costSource: feeCostSource } as Prisma.InputJsonValue,
+          metadata: withHotelCostSource(
+            { ...row.metadata, costSource: feeCostSource },
+            feeHotelCostSource,
+            'hotelCostSource',
+          ) as Prisma.InputJsonValue,
           // 挂到转单住的那位乘客：这行带 priceAdjustment=true，不挂人会被每人结算价
           //（groupPassengerAdjustments）当整单调价摊给全员；导出「单房差」列也按它归属到人。
           // 未指定乘客（老入口/整单补收）→ null，仍走整单口径。

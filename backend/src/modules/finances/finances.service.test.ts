@@ -172,7 +172,7 @@ interface CountedOrderItemFixture {
   hotelCheckOut: Date | null;
   hotelRoomTypeId?: string | null;
   flightSchedule: null;
-  hotelRoomType: { costPriceCny: number | null } | null;
+  hotelRoomType: { costPriceCny: number | null; costPriceVnd?: number | null; costFxName?: string | null } | null;
   visa: { costPriceCny: number | null } | null;
   transfer: null;
   fulfillmentTasks?: { visaUnitCostCny: number | null }[];
@@ -230,21 +230,41 @@ interface HotelCostPeriodFixture {
   roomTypeId: string;
   effectiveFrom: Date;
   effectiveTo: Date;
-  costPriceCny: number;
+  costPriceCny: number | null;
+  costPriceVnd?: number | null;
+  costFxName?: string | null;
+}
+
+/** 汇率行 fixture（DB 形态）：酒店越南盾价源回退实时算时按当晚折人民币。 */
+interface FxRateFixture {
+  id: string;
+  name: string | null;
+  currency: 'USD' | 'VND';
+  effectiveFrom: Date;
+  rate: number;
 }
 
 function fakeClient(opts: {
   countedOrders?: CountedOrderFixture[];
   refundedOrders?: RefundedOrderFixture[];
   hotelCostPeriods?: HotelCostPeriodFixture[];
+  fxRates?: FxRateFixture[];
 }): PrismaClient {
   const countedOrders = opts.countedOrders ?? [];
   const refundedOrders = opts.refundedOrders ?? [];
   const hotelCostPeriods = opts.hotelCostPeriods ?? [];
+  const fxRates = opts.fxRates ?? [];
   return {
     hotelRoomTypeCostPeriod: {
       findMany: vi.fn(async (args: { where: { roomTypeId: { in: string[] } } }) =>
         hotelCostPeriods.filter((p) => args.where.roomTypeId.in.includes(p.roomTypeId)),
+      ),
+    },
+    fxRate: {
+      findMany: vi.fn(async (args: { where: { currency: string } }) =>
+        fxRates
+          .filter((r) => r.currency === args.where.currency)
+          .map((r) => ({ ...r, note: null, updatedBy: null, updatedAt: new Date('2026-09-01T00:00:00.000Z') })),
       ),
     },
     order: {
@@ -296,6 +316,42 @@ describe('getFinancesSummary — 无快照酒店行回退按日期区间取净�
     const findMany = (client as unknown as { hotelRoomTypeCostPeriod: { findMany: ReturnType<typeof vi.fn> } })
       .hotelRoomTypeCostPeriod.findMany;
     expect(findMany).toHaveBeenCalledTimes(1);
+  });
+
+  it('越南盾价源：区间越南盾按当晚生效的 VND 汇率行 ÷ 折人民币（跨汇率生效日），缺省人民币照旧；汇率行一次性加载', async () => {
+    const client = fakeClient({
+      countedOrders: [{ id: 'o1', total: 3000, passengers: [{ id: 'p1' }], costItems: [], items: [legacyHotelItem()] }],
+      hotelCostPeriods: [{ ...PEAK, costPriceCny: null, costPriceVnd: 3_740_000, costFxName: '酒店越南盾' }],
+      fxRates: [
+        { id: 'fx-a', name: '酒店越南盾', currency: 'VND', effectiveFrom: new Date('2026-01-01T00:00:00.000Z'), rate: 3740 },
+        { id: 'fx-b', name: '酒店越南盾', currency: 'VND', effectiveFrom: new Date('2026-10-02T00:00:00.000Z'), rate: 3700 },
+        { id: 'fx-usd', name: '酒店越南盾', currency: 'USD', effectiveFrom: new Date('2026-01-01T00:00:00.000Z'), rate: 7.2 },
+      ],
+    });
+    const summary = await getFinancesSummary(RANGE, client);
+    // 09-30：缺省 ¥400；10-01：3,740,000 ÷ 3740 = ¥1000；10-02：3,740,000 ÷ 3700 = ¥1010.81 → 2410.81
+    expect(summary.costBreakdown.hotel).toBeCloseTo(2410.81, 2);
+    const fxFindMany = (client as unknown as { fxRate: { findMany: ReturnType<typeof vi.fn> } }).fxRate.findMany;
+    expect(fxFindMany).toHaveBeenCalledTimes(1);
+    expect(fxFindMany.mock.calls[0]![0].where).toMatchObject({ currency: 'VND' });
+  });
+
+  it('越南盾缺汇率 → 该行房费不计（不落 0）；没有越南盾价源时不查汇率表', async () => {
+    const missing = fakeClient({
+      countedOrders: [{ id: 'o1', total: 3000, passengers: [{ id: 'p1' }], costItems: [], items: [legacyHotelItem()] }],
+      hotelCostPeriods: [{ ...PEAK, costPriceCny: null, costPriceVnd: 3_740_000, costFxName: '酒店越南盾' }],
+      fxRates: [],
+    });
+    const summary = await getFinancesSummary(RANGE, missing);
+    expect(summary.costBreakdown.hotel).toBe(0);
+
+    const cnyOnly = fakeClient({
+      countedOrders: [{ id: 'o1', total: 3000, passengers: [{ id: 'p1' }], costItems: [], items: [legacyHotelItem()] }],
+      hotelCostPeriods: [PEAK],
+    });
+    await getFinancesSummary(RANGE, cnyOnly);
+    const fxFindMany = (cnyOnly as unknown as { fxRate: { findMany: ReturnType<typeof vi.fn> } }).fxRate.findMany;
+    expect(fxFindMany).not.toHaveBeenCalled();
   });
 
   it('没设区间 → 缺省价 × 晚数（原口径）；有快照的行仍优先用快照', async () => {

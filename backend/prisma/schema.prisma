@@ -1212,6 +1212,11 @@ model HotelRoomType {
   basePrice       Decimal  @db.Decimal(10, 2)
   // 净房价（CNY/晚）— 付给酒店的真实成本；NULL 时按 basePrice × 0.70 估算
   costPriceCny    Decimal? @db.Decimal(10, 2)
+  // 净房价（越南盾/晚）：酒店按越南盾结算时填这格，系统按当晚生效的 VND 汇率行折人民币。
+  // 与 costPriceCny 同一行只能填一个（zod + 服务层校验）；两者都在时以越南盾为准（越南盾是更晚的显式选择）。
+  costPriceVnd    Decimal? @db.Decimal(14, 2)
+  // 用哪条 VND 汇率行折算（FxRate.name）；NULL = 该币种通用行
+  costFxName      String?
   priceMultiplier Decimal? @db.Decimal(5, 2) // 相对 hotel.basePrice 的倍率（可选，用于 UI 快速报价）
   photos          String[]
   createdAt       DateTime @default(now())
@@ -1236,8 +1241,11 @@ model HotelRoomTypeCostPeriod {
   // 生效起止日（date-only，含 effectiveTo 当晚）
   effectiveFrom DateTime @db.Date
   effectiveTo   DateTime @db.Date
-  // 该区间的净房价（CNY/间/晚）
-  costPriceCny  Decimal  @db.Decimal(10, 2)
+  // 该区间的净房价：人民币（CNY/间/晚）或越南盾（VND/间/晚）二选一（zod + 服务层校验）
+  costPriceCny  Decimal? @db.Decimal(10, 2)
+  costPriceVnd  Decimal? @db.Decimal(14, 2)
+  // 越南盾按哪条 VND 汇率行折算（FxRate.name）；NULL = 该币种通用行
+  costFxName    String?
   note          String?
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
@@ -1442,20 +1450,24 @@ model FlightSettlementRate {
 /// 汇率按公司不同是财务口径：各签证公司结算链路不同（有的美金直折，有的经第三方货币链式折算）。
 /// 折算结果**当场固化**在业务单据上（如签证任务的 visaFxRate / visaUnitCostCny），
 /// 之后改这张表**绝不追溯**已折算的旧单据。
-model UsdFxRate {
+model FxRate {
   id            String   @id @default(cuid())
-  /// 签证公司（与任务 visaSupplier / 产品 Visa.supplier 同一套名字，trim 后精确匹配）；
-  /// 空 = 通用/缺省行，只在该公司没有汇率时兜底。通用行同生效日不重复由服务层校验（多个 NULL 不撞唯一约束）。
-  supplier      String?
-  effectiveFrom DateTime @db.Date // 生效日（date-only）；同公司同一天只允许一条，upsert 幂等键
-  rate          Decimal  @db.Decimal(12, 6) // USD→CNY 汇率（正数）
+  /// 汇率名称（跟供应商合同走，一个供应商一条）：签证公司名（与任务 visaSupplier / 产品 Visa.supplier 同一套名字，
+  /// trim 后精确匹配）或「酒店越南盾」「车队越南盾」这类地接结算名；
+  /// 空 = 该币种的通用/缺省行，只在该名称没有汇率时兜底。通用行同币种同生效日不重复由服务层校验（多个 NULL 不撞唯一约束）。
+  name          String?
+  /// 币种：USD / VND（服务层 zod 收窄）。记法按财务习惯：
+  ///   USD 行 rate = 1 美金折多少人民币（7.2）；VND 行 rate = 多少越南盾折 1 人民币（3740）。
+  currency      String   @default("USD")
+  effectiveFrom DateTime @db.Date // 生效日（date-only）；同名称同币种同一天只允许一条，upsert 幂等键
+  rate          Decimal  @db.Decimal(12, 6) // 汇率（正数，记法见 currency）
   note          String?
   updatedBy     String? // 最近更新人 userId（审计冗余，展示"谁改的"）
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
 
-  @@unique([supplier, effectiveFrom])
-  @@index([effectiveFrom])
+  @@unique([name, currency, effectiveFrom])
+  @@index([currency, effectiveFrom])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

@@ -2670,18 +2670,23 @@ export interface VisaTaskCostInput {
   visaSupplier?: string | null;
 }
 
+/** 汇率表币种：USD（1 美金折多少人民币）/ VND（多少越南盾折 1 人民币） */
+export type FxCurrency = 'USD' | 'VND';
+
 /**
- * 美金汇率（按签证公司 × 生效日）：财务按公司各加一条「某日起 x.xx」，区间由同公司下一条的生效日隐含；
- * 公司留空 = 通用行，只在该公司没有汇率时兜底。
- * 取数 = 先该公司「生效日 ≤ 目标日期的最新一条」，没有回落通用行；折算值当场固化在任务上，改表不追溯旧任务。
+ * 汇率表（命名清单：汇率名称 × 币种 × 生效日）：汇率跟供应商合同走，一个供应商一条名称
+ *（签证公司名 / 「酒店越南盾」…），汇率变了按生效日加新行，区间由同名称同币种下一条的生效日隐含；
+ * 名称留空 = 该币种通用行，只在该名称没有汇率时兜底。
+ * 取数 = 先该名称「生效日 ≤ 目标日期的最新一条」，没有回落通用行；折算值当场固化在业务单据上，改表不追溯旧单据。
  */
-export interface UsdFxRateDto {
+export interface FxRateDto {
   id: string;
-  /** 签证公司；null = 通用/缺省行 */
-  supplier: string | null;
+  /** 汇率名称；null = 该币种通用/缺省行 */
+  name: string | null;
+  currency: FxCurrency;
   /** 生效日 YYYY-MM-DD */
   effectiveFrom: string;
-  /** USD→CNY 汇率 */
+  /** USD 行 = 1 美金折多少人民币；VND 行 = 多少越南盾折 1 人民币 */
   rate: number;
   note: string | null;
   /** 最近更新人 userId */
@@ -2766,6 +2771,10 @@ export interface HotelRoomType {
   basePrice: string;
   priceMultiplier: string | null;
   costPriceCny: string | null;
+  /** 缺省净房价（越南盾/晚；与 costPriceCny 二选一）；仅 ADMIN/STAFF 下发 */
+  costPriceVnd?: string | null;
+  /** 越南盾按哪条 VND 汇率行折算；null = 通用行 */
+  costFxName?: string | null;
   /** 可住大人数（后端默认 2） */
   maxAdults: number;
   /** 可加小孩数（后端默认 1） */
@@ -6250,10 +6259,11 @@ export const api = {
       { token },
     );
   },
+  /** 房型缺省净房价：人民币或越南盾二选一（给了一边后端清另一边）；costFxName = 越南盾按哪条 VND 汇率行折算 */
   patchHotelRoomTypeCost: (
     token: string,
     id: string,
-    body: Partial<{ costPriceCny: number | null }>,
+    body: Partial<{ costPriceCny: number | null; costPriceVnd: number | null; costFxName: string | null }>,
   ) => apiFetch<{ id: string }>(`/finances/cost/hotel-room-type/${id}`, { method: 'PATCH', token, body }),
   patchVisaCost: (
     token: string,
@@ -6266,30 +6276,32 @@ export const api = {
     body: Partial<{ costPriceCny: number | null }>,
   ) => apiFetch<{ id: string }>(`/finances/cost/transfer/${id}`, { method: 'PATCH', token, body }),
 
-  // ── 美金汇率表（按签证公司 × 生效日）──────────────────────────────────────────
-  // 列表按公司分组（通用行最后）、同公司生效日倒序（最近生效的在最前）
-  listUsdFxRates: (token: string) =>
-    apiFetch<{ rates: UsdFxRateDto[] }>('/finances/usd-fx-rates', { token }),
-  /** 汇率表「签证公司」输入候选（产品供应商 ∪ 任务签证公司，去重） */
-  listUsdFxRateSupplierOptions: (token: string) =>
-    apiFetch<{ suppliers: string[] }>('/finances/usd-fx-rates/supplier-options', { token }),
+  // ── 汇率表（命名清单：汇率名称 × 币种 × 生效日）──────────────────────────────
+  // 列表按币种、名称分组（通用行最后）、同名称生效日倒序（最近生效的在最前）
+  listFxRates: (token: string) => apiFetch<{ rates: FxRateDto[] }>('/finances/fx-rates', { token }),
+  /** 汇率名称候选（按币种）：USD = 签证供应商候选；VND = 酒店/车队越南盾建议项；都并上表里已有名称 */
+  listFxNameOptions: (token: string) =>
+    apiFetch<{ options: Record<FxCurrency, string[]> }>('/finances/fx-rates/name-options', { token }),
   /**
-   * 取某公司某日生效的汇率：先该公司 ≤date 最新一条，没有回落通用行（返回的 rate.supplier 为 null
-   * 即表示回落）；都没有 → { rate: null }，前端让用户手填。supplier 省略/空 = 只看通用行。
+   * 取某名称某日生效的汇率：先该名称 ≤date 最新一条，没有回落同币种通用行（返回的 rate.name 为 null
+   * 即表示回落）；都没有 → { rate: null }，前端让用户手填。name 省略/空 = 只看通用行。
    */
-  getEffectiveUsdFxRate: (token: string, date: string, supplier?: string | null) => {
-    const q = new URLSearchParams({ date });
-    const name = supplier?.trim() ?? '';
-    if (name) q.set('supplier', name);
-    return apiFetch<{ rate: UsdFxRateDto | null }>(`/finances/usd-fx-rates/effective?${q}`, {
-      token,
-    });
+  getEffectiveFxRate: (token: string, q: { date: string; currency: FxCurrency; name?: string | null }) => {
+    const qs = new URLSearchParams({ date: q.date, currency: q.currency });
+    const name = q.name?.trim() ?? '';
+    if (name) qs.set('name', name);
+    return apiFetch<{ rate: FxRateDto | null }>(`/finances/fx-rates/effective?${qs}`, { token });
   },
-  /** 按（公司 × 生效日）幂等 upsert（同公司同一天重复提交只覆盖不新增；supplier 空 = 通用行） */
-  upsertUsdFxRate: (
+  /** 某币种在目标日每个名称各一条生效汇率（含通用行），供「选用哪条汇率」下拉 */
+  listEffectiveFxRates: (token: string, q: { date: string; currency: FxCurrency }) => {
+    const qs = new URLSearchParams({ date: q.date, currency: q.currency });
+    return apiFetch<{ rates: FxRateDto[] }>(`/finances/fx-rates/effective-list?${qs}`, { token });
+  },
+  /** 按（名称 × 币种 × 生效日）幂等 upsert（同键重复提交只覆盖不新增；name 空 = 通用行） */
+  upsertFxRate: (
     token: string,
-    body: { supplier?: string | null; effectiveFrom: string; rate: number; note?: string | null },
-  ) => apiFetch<{ rate: UsdFxRateDto }>('/finances/usd-fx-rates', { method: 'PUT', token, body }),
+    body: { name?: string | null; currency: FxCurrency; effectiveFrom: string; rate: number; note?: string | null },
+  ) => apiFetch<{ rate: FxRateDto }>('/finances/fx-rates', { method: 'PUT', token, body }),
 
   // 财务核对 xlsx 导出（Blob 直接下载）
   downloadFinanceExport: async (
@@ -6875,20 +6887,27 @@ export interface CostPeriodWriteInput {
   note?: string | null;
 }
 
-/** 酒店房型净房价按日期区间（含 effectiveTo 当晚；没被区间覆盖的日子用房型缺省 costPriceCny） */
+/**
+ * 酒店房型净房价按日期区间（含 effectiveTo 当晚；没被区间覆盖的日子用房型缺省价）。
+ * 区间价人民币或越南盾二选一；越南盾按 costFxName 指定的 VND 汇率行（null = 通用行）逐晚折人民币。
+ */
 export interface HotelRoomTypeCostPeriodDto {
   id: string;
   roomTypeId: string;
   effectiveFrom: string; // YYYY-MM-DD
   effectiveTo: string; // YYYY-MM-DD
-  costPriceCny: number;
+  costPriceCny: number | null;
+  costPriceVnd: number | null;
+  costFxName: string | null;
   note: string | null;
   updatedAt: string;
 }
 export interface HotelRoomTypeCostPeriodWriteInput {
   effectiveFrom: string;
   effectiveTo: string;
-  costPriceCny: number;
+  costPriceCny?: number | null;
+  costPriceVnd?: number | null;
+  costFxName?: string | null;
   note?: string | null;
 }
 

@@ -25,6 +25,7 @@ import {
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import type { AuditActor } from '../../lib/audit.js';
+import { toCny } from '../finances/finances.fx.service.js';
 import { syncOrderVisaCompletion, type VisaCompletionOutcome } from './visa-completion.js';
 import type { ListFulfillmentQuery, UpdateFulfillmentBody } from './fulfillment.schemas.js';
 
@@ -405,10 +406,8 @@ export function resolveVisaUnitCost(input: {
 }): { usd: number | null; rate: number | null; cny: number | null } {
   const usd = input.visaUnitCostUsd ?? null;
   const rate = input.visaFxRate ?? null;
-  const cny =
-    usd != null && rate != null
-      ? Math.round(usd * rate * 100) / 100
-      : (input.visaUnitCostCny ?? null);
+  // 美金记法 = 1 美金折多少人民币 → 与汇率表 toCny 同一处折算（两位小数）
+  const cny = usd != null && rate != null ? toCny(usd, 'USD', rate) : (input.visaUnitCostCny ?? null);
   return { usd, rate, cny };
 }
 

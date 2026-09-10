@@ -14,7 +14,7 @@
  */
 import { Prisma, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
-import { ConflictError, NotFoundError } from '../../lib/errors.js';
+import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 
 /** 成本周期读写用的 client：普通 PrismaClient 或事务内的 tx 都收（重叠校验要在事务里跑）。 */
 type CostPeriodClient = PrismaClient | Prisma.TransactionClient;
@@ -902,12 +902,31 @@ export async function patchFlightScheduleCost(
   return { id };
 }
 
+/**
+ * 房型缺省净房价：人民币或越南盾二选一。
+ *   - 给了越南盾（非空）→ 切成越南盾行：costPriceCny 清空，costFxName 记用哪条 VND 汇率行（空 = 通用行）；
+ *   - 给了人民币（非空）→ 切成人民币行：costPriceVnd / costFxName 清空；
+ *   - 显式 null = 清空对应格；只传 costFxName = 只换汇率行。
+ * 两边同时给数由路由 zod 先拦；这里再兜一次。
+ */
 export async function patchHotelRoomTypeCost(
   id: string,
-  data: { costPriceCny?: number | null },
+  data: { costPriceCny?: number | null; costPriceVnd?: number | null; costFxName?: string | null },
   client: PrismaClient = defaultPrisma,
 ): Promise<{ id: string }> {
-  await client.hotelRoomType.update({ where: { id }, data });
+  if (data.costPriceCny != null && data.costPriceVnd != null) {
+    throw new BadRequestError('净房价填人民币或越南盾其中一个');
+  }
+  const update: Prisma.HotelRoomTypeUpdateInput = {};
+  if (data.costPriceCny !== undefined) update.costPriceCny = data.costPriceCny;
+  if (data.costPriceVnd !== undefined) update.costPriceVnd = data.costPriceVnd;
+  if (data.costFxName !== undefined) update.costFxName = data.costFxName?.trim() || null;
+  if (data.costPriceVnd != null) update.costPriceCny = null;
+  if (data.costPriceCny != null) {
+    update.costPriceVnd = null;
+    update.costFxName = null;
+  }
+  await client.hotelRoomType.update({ where: { id }, data: update });
   return { id };
 }
 
