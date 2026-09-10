@@ -1795,14 +1795,14 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
             {/* 没分房也不丢：任何时候都能到「房控页」按订单再分。入口文案说明清楚。 */}
             {roomingPassengers.length > 0 && !roomingSaved && (
               <p className="text-xs text-ink-muted">
-                现在不分也没关系 —— 之后可到「房控页」按订单随时补分房。
+                现在不分也没关系 —— 之后可到{isAgentUser ? '订单详情' : '「房控页」'}按订单随时补分房。
               </p>
             )}
 
             <div className="flex justify-end gap-2">
               {showRooming && (
                 <button className="btn-ghost text-sm" onClick={() => setShowRooming(false)}>
-                  稍后再分（去「房控页」分房）
+                  稍后再分（去{isAgentUser ? '订单详情' : '「房控页」'}分房）
                 </button>
               )}
               <button className="btn-secondary text-sm" onClick={resetForNextOrder}>
