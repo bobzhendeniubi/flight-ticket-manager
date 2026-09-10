@@ -12,10 +12,14 @@
  *     parseVisaNoteCost 判定（纯函数 + 单测），脚本里没有第二份解析规则。
  *   - 「美金 + 汇率 → 人民币」由线上那一个 resolveVisaUnitCost 折算（签证台手工填成本走的同一函数），
  *     脚本不自己写乘法与四舍五入。
- *   - 汇率取「任务创建当天（北京时间）生效的汇率」，即 finances 的 getUsdFxRate（生效日 ≤ 当天的最新一条）。
- *     取不到且未给 --fallback-rate → 该条跳过并进「缺汇率」清单，绝不臆造汇率。
- *     ⚠️ 汇率表若只维护了近期几条，8 月及更早的任务大概率取不到，需要财务先补历史生效日，
- *        或用 --fallback-rate 明确指定一个统一口径（会原样固化到每条 visaFxRate 上）。
+ *   - **汇率按签证公司不同**（财务口径）：取「该公司在任务创建当天（北京时间）的生效汇率」，
+ *     **只认该公司自己的汇率行**（UsdFxRate.supplier = 公司名），不回落通用行——通用行只是签证台
+ *     手填时的兜底，拿来批量入账会把一家的汇率套到另一家头上。公司 = 回填后的签证公司
+ *     （目标 A 为备注里的公司 / 已填的正经公司名；目标 B 为产品供应商）。
+ *     公司没有专属汇率且未给 --fallback-rate → 该条跳过并进「缺汇率」清单，绝不臆造汇率；
+ *     --fallback-rate 只在公司汇率也没有时才用（会原样固化到每条 visaFxRate 上）。
+ *     ⚠️ 汇率表若还没按公司维护，可用 --seed-rates/--seed-from 先按公司插生效行（见 scripts/lib/visa-fx-shared.ts），
+ *        dry-run 会按「已插入」预演，--apply 才真插。
  *
  * 处理两类目标（互斥，同一条任务只会命中其一）：
  *   目标 A —— visaUnitCostCny 为空、且备注能解析出「公司 + 美金」：
@@ -43,13 +47,17 @@
  * 用法（backend/ 目录下）：
  *   npx tsx scripts/backfill-visa-task-cost-from-notes.ts                        # dry-run 全量预览
  *   npx tsx scripts/backfill-visa-task-cost-from-notes.ts --out=/tmp/签证进价回填.csv  # 预览 + 导 CSV 给财务
- *   npx tsx scripts/backfill-visa-task-cost-from-notes.ts --fallback-rate=6.7344 # 无当日汇率时统一按此折算
+ *   npx tsx scripts/backfill-visa-task-cost-from-notes.ts --seed-rates='甲公司=7.2,乙公司=7.0856' --seed-from=2026-01-01
+ *                                                                                  # 预演按公司种子汇率（示例值）
+ *   npx tsx scripts/backfill-visa-task-cost-from-notes.ts --fallback-rate=7.2      # 公司也无汇率时统一按此折算
  *   npx tsx scripts/backfill-visa-task-cost-from-notes.ts --limit=1 --apply      # 先真回填一条试水
  *   npx tsx scripts/backfill-visa-task-cost-from-notes.ts --apply                # 真正写库
  *
  * 参数：
  *   --apply              真正写库（不加 = dry-run，只读）
- *   --fallback-rate=N    任务创建当天取不到生效汇率时用这个汇率（> 0）；不传 = 不折算、进「缺汇率」清单
+ *   --seed-rates=公司=汇率,…  按公司插种子汇率行（同公司同生效日已有则跳过；dry-run 只预演）；须同时给 --seed-from
+ *   --seed-from=YYYY-MM-DD  种子汇率的生效日
+ *   --fallback-rate=N    该公司取不到专属汇率时用这个汇率（> 0）；不传 = 不折算、进「缺汇率」清单
  *   --limit=N            只处理前 N 条候选任务（按创建时间升序），用于试水
  *   --out=路径            把逐条明细写成 CSV；**拒绝覆盖已存在的文件**。不传则 dry-run 时把 CSV 打到 stdout
  *
@@ -77,28 +85,32 @@ import { FulfillmentType, Prisma } from '@prisma/client';
 import { prisma } from '../src/db/prisma.js';
 import { writeAudit } from '../src/lib/audit.js';
 import { businessDateISO } from '../src/lib/business-time.js';
-import { getUsdFxRate } from '../src/modules/finances/finances.fx.service.js';
 import { resolveVisaUnitCost } from '../src/modules/fulfillment/fulfillment.service.js';
 import {
   isAmountOnlySupplier,
   parseAmountOnlySupplier,
   parseVisaNoteCost,
 } from '../src/modules/fulfillment/visa-note-cost.js';
+import {
+  AUDIT_FLUSH_WAIT_MS,
+  GenericFallbackTally,
+  SKIP_SAMPLE_LIMIT,
+  SupplierFxResolver,
+  TX_MAX_WAIT_MS,
+  TX_TIMEOUT_MS,
+  blankToNull,
+  csvCell,
+  decOrNull,
+  parseSeedRates,
+  parseYmd,
+  seedSupplierRates,
+  type SeedRate,
+} from './lib/visa-fx-shared.js';
 
 const LOG_PREFIX = '[backfill-visa-task-cost-from-notes]';
 
 /** 留档表名（一次性脚本约定：_bak_<日期>_<用途>，跑完留库供财务/后续追溯）。 */
 const BACKUP_TABLE = '_bak_0908_visa_cost_backfill';
-
-/** 每条任务一个事务（留档行 + update 原子）。 */
-const TX_TIMEOUT_MS = 20_000;
-const TX_MAX_WAIT_MS = 10_000;
-
-/** 即发即忘的审计需要一点时间落库，收尾等一等（best-effort，与其它一次性脚本一致）。 */
-const AUDIT_FLUSH_WAIT_MS = 3_000;
-
-/** 打印跳过样例的条数上限。 */
-const SKIP_SAMPLE_LIMIT = 20;
 
 /** 金额比对容差（两位小数口径，半分以内视为同一笔）。 */
 const AMOUNT_EPSILON = 0.005;
@@ -106,15 +118,27 @@ const AMOUNT_EPSILON = 0.005;
 interface CliOptions {
   apply: boolean;
   fallbackRate?: number;
+  seeds: SeedRate[];
+  seedFrom: string | null;
   limit?: number;
   out?: string;
 }
 
 function parseArgs(argv: readonly string[]): CliOptions {
-  const opts: CliOptions = { apply: false };
+  const opts: CliOptions = { apply: false, seeds: [], seedFrom: null };
   for (const arg of argv) {
     if (arg === '--apply') {
       opts.apply = true;
+      continue;
+    }
+    const seeds = /^--seed-rates=(.+)$/u.exec(arg);
+    if (seeds) {
+      opts.seeds = parseSeedRates(seeds[1]);
+      continue;
+    }
+    const seedFrom = /^--seed-from=(.+)$/u.exec(arg);
+    if (seedFrom) {
+      opts.seedFrom = parseYmd(seedFrom[1], '--seed-from');
       continue;
     }
     const rate = /^--fallback-rate=(\d+(?:\.\d+)?)$/u.exec(arg);
@@ -136,18 +160,10 @@ function parseArgs(argv: readonly string[]): CliOptions {
     }
     throw new Error(`未知参数: ${arg}`);
   }
+  if ((opts.seeds.length > 0) !== (opts.seedFrom != null)) {
+    throw new Error('--seed-rates 与 --seed-from 需同时给');
+  }
   return opts;
-}
-
-/** Prisma.Decimal | null → number | null（与 fulfillment.service 的 decOrNull 同口径）。 */
-function decOrNull(v: Prisma.Decimal | null): number | null {
-  return v == null ? null : Number(v.toString());
-}
-
-/** 空字符串 / 纯空白一律当「没填」。 */
-function blankToNull(s: string | null): string | null {
-  const trimmed = s?.trim() ?? '';
-  return trimmed === '' ? null : trimmed;
 }
 
 type RowKind = 'NOTE' | 'SUPPLIER_FIELD';
@@ -169,8 +185,10 @@ interface PlannedRow {
   afterRate: number;
   afterCny: number;
   afterSupplier: string | null;
-  /** 汇率来源：库里当天生效汇率 / --fallback-rate */
-  rateSource: 'FX_TABLE' | 'FALLBACK';
+  /** 取汇率用的公司（= 回填后的签证公司）；null = 没有公司名，只能靠 --fallback-rate */
+  rateSupplier: string | null;
+  /** 汇率来源：该公司在汇率表里的当天生效行 / 预演的种子行 / --fallback-rate */
+  rateSource: 'FX_TABLE' | 'SEED' | 'FALLBACK';
   /** 目标 B 关联不到签证产品（套餐行无 visaId）→ 公司名只能留空 */
   supplierUnresolved: boolean;
 }
@@ -189,25 +207,6 @@ interface ReviewRow {
   noteUsd: number | null;
 }
 
-/** 汇率按业务日缓存：431 条任务大多集中在少数几天，避免逐条查库。 */
-class FxRateCache {
-  private readonly cache = new Map<string, number | null>();
-
-  async get(businessDate: string): Promise<number | null> {
-    const hit = this.cache.get(businessDate);
-    if (hit !== undefined) return hit;
-    const row = await getUsdFxRate(businessDate, prisma);
-    const rate = row ? row.rate : null;
-    this.cache.set(businessDate, rate);
-    return rate;
-  }
-}
-
-function csvCell(v: string | number | null): string {
-  if (v == null) return '';
-  const s = String(v);
-  return /[",\n]/u.test(s) ? `"${s.replace(/"/gu, '""')}"` : s;
-}
 
 function buildCsv(planned: readonly PlannedRow[], review: readonly ReviewRow[]): string {
   const lines: string[] = [];
@@ -226,6 +225,7 @@ function buildCsv(planned: readonly PlannedRow[], review: readonly ReviewRow[]):
       '新汇率',
       '新人民币',
       '新签证公司',
+      '取数公司',
       '汇率来源',
       '备注原文',
       '说明',
@@ -249,7 +249,12 @@ function buildCsv(planned: readonly PlannedRow[], review: readonly ReviewRow[]):
         r.afterRate,
         r.afterCny,
         r.afterSupplier,
-        r.rateSource === 'FX_TABLE' ? '当日生效汇率' : 'fallback-rate',
+        r.rateSupplier,
+        r.rateSource === 'FX_TABLE'
+          ? '该公司当日生效汇率'
+          : r.rateSource === 'SEED'
+            ? '该公司种子汇率'
+            : 'fallback-rate',
         r.sourceNotes,
         r.supplierUnresolved ? '关联不到签证产品，公司名留空待人工补' : '',
       ]
@@ -270,6 +275,7 @@ function buildCsv(planned: readonly PlannedRow[], review: readonly ReviewRow[]):
         r.beforeCny,
         r.beforeSupplier,
         r.noteUsd,
+        '',
         '',
         '',
         '',
@@ -361,10 +367,18 @@ async function main(): Promise<void> {
   console.log(
     `${LOG_PREFIX} 签证任务 ${tasks.length} 条` +
       (opts.apply ? ' | 模式: --apply（会写库）' : ' | 模式: dry-run（只读）') +
-      (opts.fallbackRate ? ` | 无当日汇率时按 ${opts.fallbackRate} 折算` : ''),
+      (opts.fallbackRate ? ` | 公司无专属汇率时按 ${opts.fallbackRate} 折算` : '') +
+      (opts.seeds.length
+        ? ` | 种子汇率 ${opts.seedFrom} 起：${opts.seeds.map((x) => `${x.supplier}=${x.rate}`).join('，')}`
+        : ''),
   );
 
-  const fx = new FxRateCache();
+  if (opts.seeds.length > 0 && opts.seedFrom) {
+    await seedSupplierRates(opts.seeds, opts.seedFrom, opts.apply, LOG_PREFIX);
+  }
+
+  const fx = new SupplierFxResolver(opts.seeds, opts.seedFrom);
+  const genericTally = new GenericFallbackTally();
   const planned: PlannedRow[] = [];
   const review: ReviewRow[] = [];
   const missingRate: ReviewRow[] = [];
@@ -433,11 +447,26 @@ async function main(): Promise<void> {
       continue;
     }
 
+    // 公司名：空着、或被填成了金额时才写；已经是正经公司名的绝不覆盖。
+    const shouldWriteSupplier = beforeSupplier == null || supplierIsAmount;
+    const afterSupplier = shouldWriteSupplier ? supplierFromSource : beforeSupplier;
+
+    // 汇率按（回填后的）签证公司取：只认公司自己的行；没有才用 --fallback-rate，再没有进「缺汇率」
     const businessDate = businessDateISO(t.createdAt);
-    const tableRate = await fx.get(businessDate);
-    const rate = tableRate ?? opts.fallbackRate ?? null;
+    const res = await fx.resolve(businessDate, afterSupplier);
+    if (res.kind === 'GENERIC_ONLY') genericTally.add(res);
+    const companyRate = res.kind === 'SUPPLIER' ? res.rate : null;
+    const rate = companyRate ?? opts.fallbackRate ?? null;
     if (rate == null) {
-      missingRate.push({ ...base, reason: `任务创建日 ${businessDate} 无生效汇率` });
+      missingRate.push({
+        ...base,
+        reason:
+          afterSupplier == null
+            ? '没有签证公司，无法按公司取汇率'
+            : res.kind === 'GENERIC_ONLY'
+              ? `「${afterSupplier}」在 ${businessDate} 无专属汇率（只有通用行 ${res.generic.rate}，不用）`
+              : `「${afterSupplier}」在 ${businessDate} 无专属汇率`,
+      });
       continue;
     }
 
@@ -446,9 +475,6 @@ async function main(): Promise<void> {
       missingRate.push({ ...base, reason: `折算失败（美金 ${usd} × 汇率 ${rate}）` });
       continue;
     }
-
-    // 公司名：空着、或被填成了金额时才写；已经是正经公司名的绝不覆盖。
-    const shouldWriteSupplier = beforeSupplier == null || supplierIsAmount;
     planned.push({
       taskId: t.id,
       orderId,
@@ -463,8 +489,9 @@ async function main(): Promise<void> {
       afterUsd: usd,
       afterRate: rate,
       afterCny: resolved.cny,
-      afterSupplier: shouldWriteSupplier ? supplierFromSource : beforeSupplier,
-      rateSource: tableRate != null ? 'FX_TABLE' : 'FALLBACK',
+      afterSupplier,
+      rateSupplier: afterSupplier,
+      rateSource: res.kind === 'SUPPLIER' ? res.source : 'FALLBACK',
       supplierUnresolved: shouldWriteSupplier && supplierUnresolved,
     });
   }
@@ -527,6 +554,7 @@ async function main(): Promise<void> {
           visaSupplier: row.afterSupplier,
           source: row.kind === 'NOTE' ? 'notes' : 'visaSupplier',
           sourceNotes: row.sourceNotes,
+          rateSupplier: row.rateSupplier,
           rateSource: row.rateSource,
         },
       });
@@ -540,6 +568,7 @@ async function main(): Promise<void> {
     distribution.set(key, (distribution.get(key) ?? 0) + 1);
   }
   const fallbackCount = planned.filter((r) => r.rateSource === 'FALLBACK').length;
+  const seedCount = planned.filter((r) => r.rateSource === 'SEED').length;
   const supplierUnresolvedCount = planned.filter((r) => r.supplierUnresolved).length;
 
   /* eslint-disable no-console */
@@ -551,7 +580,7 @@ async function main(): Promise<void> {
       `公司名格填成金额 ${planned.filter((r) => r.kind === 'SUPPLIER_FIELD').length} 条）` +
       (opts.apply ? ` | 实际写库 ${appliedCount} 条` : ''),
   );
-  console.log(`  其中用 --fallback-rate 折算 ${fallbackCount} 条`);
+  console.log(`  其中按公司汇率表折算 ${planned.length - fallbackCount - seedCount} 条 / 按预演种子汇率 ${seedCount} 条 / 用 --fallback-rate ${fallbackCount} 条`);
   console.log(`  其中关联不到签证产品、公司名留空 ${supplierUnresolvedCount} 条`);
   console.log(`  已填成本无需处理 ${alreadyFilled} 条`);
   console.log(`  缺汇率跳过 ${missingRate.length} 条`);
@@ -592,6 +621,8 @@ async function main(): Promise<void> {
     }
   }
 
+  await genericTally.report(LOG_PREFIX);
+
   const csv = buildCsv(planned, [...review, ...missingRate, ...skipped]);
   if (opts.out) {
     writeFileSync(opts.out, `﻿${csv}\n`, 'utf8');
@@ -620,7 +651,7 @@ async function main(): Promise<void> {
   }
   /* eslint-enable no-console */
 
-  if (opts.apply && appliedCount > 0) {
+  if (opts.apply && (appliedCount > 0 || opts.seeds.length > 0)) {
     await new Promise((resolve) => setTimeout(resolve, AUDIT_FLUSH_WAIT_MS));
   }
 }

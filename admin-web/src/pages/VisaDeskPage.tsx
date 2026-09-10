@@ -598,6 +598,82 @@ const NOTES_PRICE_HINT_RE = /美金|美元|USD|\$/i;
 /** 签证公司格防呆：内容是「纯金额（可带美金/美元/USD 单位）」，说明填错格子了 */
 const PURE_AMOUNT_RE = /^\d+(?:\.\d+)?\s*(?:美金|美元|USD)?$/i;
 
+/** 汇率取数结果：rate 为 null = 该公司与通用行都没有当日汇率；fromGeneric = 回落到了通用行 */
+interface FxRateLookupResult {
+  rate: number | null;
+  fromGeneric: boolean;
+}
+/** 按签证公司取「当日生效汇率」（页面级带缓存）；supplier 空 = 只看通用行 */
+type FxRateLookup = (supplier: string | null) => Promise<FxRateLookupResult>;
+
+/** 公司输入变化后再去取汇率的防抖（输入一个字取一次太浪费） */
+const FX_LOOKUP_DEBOUNCE_MS = 300;
+
+/**
+ * 「汇率取数公司」：输入框里的签证公司优先（填成金额的脏值不算公司），空则回退签证产品默认供应商。
+ * 与后端回填/重算脚本的「任务 visaSupplier 优先，空则产品 supplier」同口径。
+ */
+function fxSupplierFor(supplierInput: string | null | undefined, productSupplier: string | null | undefined): string | null {
+  const own = supplierInput?.trim() ?? '';
+  if (own && !PURE_AMOUNT_RE.test(own)) return own;
+  const product = productSupplier?.trim() ?? '';
+  return product || null;
+}
+
+function todayYmd(): string {
+  const today = new Date();
+  return `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(
+    today.getDate(),
+  ).padStart(2, '0')}`;
+}
+
+/**
+ * 页面级「按公司取当日汇率」：财务在财务页按签证公司 × 生效日维护。
+ * 只做「默认值」：带进汇率输入框，仍可手改；折算值保存时固化在任务上，之后财务改汇率表不会追溯已入账的任务。
+ * 同一公司只请求一次（按公司缓存）；取不到就让用户手填，不打断签证台主流程。
+ */
+function useFxRateLookup(token: string): FxRateLookup {
+  const cacheRef = useRef(new Map<string, Promise<FxRateLookupResult>>());
+  useEffect(() => {
+    cacheRef.current = new Map();
+  }, [token]);
+  return useCallback(
+    (supplier: string | null) => {
+      const key = supplier ?? '';
+      const hit = cacheRef.current.get(key);
+      if (hit) return hit;
+      const pending: Promise<FxRateLookupResult> = token
+        ? api
+            .getEffectiveUsdFxRate(token, todayYmd(), supplier)
+            .then((d) => ({
+              rate: d.rate?.rate ?? null,
+              fromGeneric: d.rate != null && d.rate.supplier == null && supplier != null,
+            }))
+            .catch(() => {
+              // 取失败不缓存，下次再试；当下让用户手填
+              cacheRef.current.delete(key);
+              return { rate: null, fromGeneric: false };
+            })
+        : Promise.resolve({ rate: null, fromGeneric: false });
+      cacheRef.current.set(key, pending);
+      return pending;
+    },
+    [token],
+  );
+}
+
+/** 汇率格提示文案：按谁带出的 / 没带出让人手填 */
+function fxHintText(supplier: string | null, result: FxRateLookupResult): string {
+  if (result.rate == null) {
+    return supplier
+      ? `「${supplier}」无当日汇率（通用行也没有），请手填`
+      : '未维护当日汇率，请手填';
+  }
+  if (supplier && !result.fromGeneric) return `汇率已按「${supplier}」当日汇率表带出（${result.rate}），可手改`;
+  if (supplier && result.fromGeneric) return `「${supplier}」没有专属汇率，已按通用汇率带出（${result.rate}），可手改`;
+  return `汇率已按通用汇率表带出（${result.rate}），可手改`;
+}
+
 /** 该任务是否要提示「备注写了价格但未设金额」：备注含价格关键词 + 尚未设人均成本 */
 function needsNotesPriceHint(task: Pick<FulfillmentTask, 'notes' | 'visaUnitCostCny'>): boolean {
   return task.visaUnitCostCny == null && NOTES_PRICE_HINT_RE.test(task.notes ?? '');
@@ -624,16 +700,17 @@ function parseNotesPriceHint(
 interface VisaCostControlProps {
   task: FulfillmentTask;
   token: string;
-  /** 当日生效的美金汇率（来自汇率表）；未维护=null，此时汇率格留空由人手填 */
-  defaultFxRate: number | null;
+  /** 按签证公司取当日生效汇率（页面级缓存）；取不到 → 汇率格留空由人手填 */
+  lookupFxRate: FxRateLookup;
   onSaved: () => void;
 }
 /**
  * 签证人均成本 + 签证公司编辑：美金单价 × 汇率（自动折人民币）或直填人民币。
- * 汇率默认带出**当日生效汇率**（仍可手改）；折算值当场固化在任务上，
- * 之后财务改汇率表不会追溯本条。保存即调 setVisaTaskCost；清空三格保存 = 回退产品主数据成本。
+ * 汇率默认按**任务的签证公司**（空则产品默认供应商）带出当日生效汇率（仍可手改）；公司输入变化时重新带，
+ * 但汇率格一旦被人手改过就不再覆盖。折算值当场固化在任务上，之后财务改汇率表不会追溯本条。
+ * 保存即调 setVisaTaskCost；清空三格保存 = 回退产品主数据成本。
  */
-function VisaCostControl({ task, token, defaultFxRate, onSaved }: VisaCostControlProps) {
+function VisaCostControl({ task, token, lookupFxRate, onSaved }: VisaCostControlProps) {
   const [editing, setEditing] = useState(false);
   const [usd, setUsd] = useState('');
   const [rate, setRate] = useState('');
@@ -641,24 +718,46 @@ function VisaCostControl({ task, token, defaultFxRate, onSaved }: VisaCostContro
   const [supplier, setSupplier] = useState('');
   const [saving, setSaving] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  // 汇率格是否用了汇率表带出的默认值（给出「当日汇率」提示，避免用户以为是历史值）
-  const [rateFromTable, setRateFromTable] = useState(false);
+  // 汇率格提示（按哪家公司带出 / 没带出让人手填）；null = 不提示（本条已固化过汇率或人手改过）
+  const [rateHint, setRateHint] = useState<string | null>(null);
+  // 汇率格被人手改过 → 公司再变也不覆盖（本条已固化过汇率时视同手改，绝不被新汇率覆盖）
+  const [rateTouched, setRateTouched] = useState(false);
 
   const startEdit = () => {
     setUsd(task.visaUnitCostUsd != null ? String(task.visaUnitCostUsd) : '');
-    // 本条已固化过汇率 → 原样回显（绝不被新汇率覆盖）；未设置过才带当日生效汇率
+    // 本条已固化过汇率 → 原样回显（绝不被新汇率覆盖）；未设置过才按公司带当日生效汇率（见下方 effect）
     if (task.visaFxRate != null) {
       setRate(String(task.visaFxRate));
-      setRateFromTable(false);
+      setRateTouched(true);
     } else {
-      setRate(defaultFxRate != null ? String(defaultFxRate) : '');
-      setRateFromTable(defaultFxRate != null);
+      setRate('');
+      setRateTouched(false);
     }
+    setRateHint(null);
     setCny(task.visaUnitCostCny != null ? String(task.visaUnitCostCny) : '');
     setSupplier(task.visaSupplier ?? '');
     setError(null);
     setEditing(true);
   };
+
+  // 公司（输入框优先，空则产品默认供应商）变化 → 重新带当日汇率；汇率格被人手改过则不覆盖
+  const productSupplier = task.visaProductSupplier ?? null;
+  useEffect(() => {
+    if (!editing || rateTouched) return;
+    let cancelled = false;
+    const timer = setTimeout(() => {
+      const fxSupplier = fxSupplierFor(supplier, productSupplier);
+      void lookupFxRate(fxSupplier).then((result) => {
+        if (cancelled) return;
+        setRate(result.rate != null ? String(result.rate) : '');
+        setRateHint(fxHintText(fxSupplier, result));
+      });
+    }, FX_LOOKUP_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [editing, rateTouched, supplier, productSupplier, lookupFxRate]);
 
   /**
    * 「按备注带入」：把从备注解析出的公司/美金单价预填进弹层，汇率仍走 startEdit 的当日默认值。
@@ -798,12 +897,14 @@ function VisaCostControl({ task, token, defaultFxRate, onSaved }: VisaCostContro
           placeholder="汇率"
           value={rate}
           disabled={saving}
-          onChange={(e) => setRate(e.target.value)}
+          onChange={(e) => {
+            setRate(e.target.value);
+            setRateTouched(true);
+            setRateHint(null);
+          }}
         />
       </div>
-      {rateFromTable && (
-        <div className="text-[10px] text-ink-muted">汇率已按当日汇率表带出，可手改</div>
-      )}
+      {rateHint && <div className="text-[10px] text-ink-muted">{rateHint}</div>}
       {autoCny != null && (
         <div className="text-[11px] text-emerald-700">= ¥{autoCny}/人（自动折算）</div>
       )}
@@ -854,8 +955,8 @@ interface OrderGroupProps {
   onTogglePassenger: (passengerId: string) => void;
   onToggleOrderPassengers: (passengerIds: string[]) => void;
   token: string;
-  /** 当日生效的美金汇率（透传给签证金额控件做默认值）；未维护=null */
-  defaultFxRate: number | null;
+  /** 按签证公司取当日汇率（透传给签证金额控件做默认值） */
+  lookupFxRate: FxRateLookup;
   onChanged: () => void;
 }
 function OrderGroup({
@@ -866,7 +967,7 @@ function OrderGroup({
   onTogglePassenger,
   onToggleOrderPassengers,
   token,
-  defaultFxRate,
+  lookupFxRate,
   onChanged,
 }: OrderGroupProps) {
   const passengers = task.passengers ?? [];
@@ -1251,7 +1352,7 @@ function OrderGroup({
               <VisaCostControl
                 task={task}
                 token={token}
-                defaultFxRate={defaultFxRate}
+                lookupFxRate={lookupFxRate}
                 onSaved={onChanged}
               />
             </div>
@@ -1408,34 +1509,14 @@ export function VisaDeskPage() {
   const [batchSupplierSubmitting, setBatchSupplierSubmitting] = useState(false);
 
   /**
-   * 当日生效的美金汇率（财务在财务页按生效日维护）。
+   * 按签证公司取当日生效汇率（财务在财务页按公司 × 生效日维护）。
    * 只做「默认值」：带进汇率输入框，仍可手改；折算值保存时固化在任务上，
-   * 之后财务改汇率表不会追溯已入账的任务。未维护 → null，汇率格留空由人手填。
+   * 之后财务改汇率表不会追溯已入账的任务。取不到 → 汇率格留空由人手填。
    */
-  const [todayFxRate, setTodayFxRate] = useState<number | null>(null);
-  useEffect(() => {
-    if (!token) return;
-    let cancelled = false;
-    const today = new Date();
-    const ymd = `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(
-      today.getDate(),
-    ).padStart(2, '0')}`;
-    api
-      .getEffectiveUsdFxRate(token, ymd)
-      .then((d) => {
-        if (cancelled) return;
-        const rate = d.rate?.rate ?? null;
-        setTodayFxRate(rate);
-        // 汇率表有值且用户还没动过输入框 → 预填批量汇率格（仍可手改）
-        if (rate != null) setBatchCostRate((prev) => (prev === '' ? String(rate) : prev));
-      })
-      .catch(() => {
-        // 静默：取不到汇率就让用户手填，不打断签证台主流程
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [token]);
+  const lookupFxRate = useFxRateLookup(token);
+  // 批量汇率格被人手改过 → 勾选/公司再变也不覆盖
+  const [batchRateTouched, setBatchRateTouched] = useState(false);
+  const [batchFxHint, setBatchFxHint] = useState<string | null>(null);
 
   useEffect(() => {
     if (!token) return;
@@ -1630,6 +1711,51 @@ export function VisaDeskPage() {
       ),
     [selectedPassengerIds, passengerToTask],
   );
+
+  /**
+   * 批量设金额的「汇率取数公司」：批量签证公司输入框填了就按它（这一批马上要设成它）；
+   * 否则看所勾选任务各自的公司（任务 visaSupplier 优先，空则产品供应商）——
+   * 一致 → 按该公司取；不一致 → 汇率格留空让人填并提示。
+   */
+  const batchFxSupplier = useMemo<
+    { kind: 'SINGLE'; supplier: string | null } | { kind: 'MIXED'; suppliers: string[] }
+  >(() => {
+    const typed = fxSupplierFor(batchSupplier, null);
+    if (typed) return { kind: 'SINGLE', supplier: typed };
+    const seen = new Map<string, FulfillmentTask>();
+    for (const pid of selectedPassengerIds) {
+      const t = passengerToTask.get(pid);
+      if (t && !seen.has(t.id)) seen.set(t.id, t);
+    }
+    const suppliers = new Set<string | null>();
+    for (const t of seen.values()) suppliers.add(fxSupplierFor(t.visaSupplier, t.visaProductSupplier));
+    if (suppliers.size <= 1) return { kind: 'SINGLE', supplier: [...suppliers][0] ?? null };
+    return { kind: 'MIXED', suppliers: [...suppliers].map((x) => x ?? '（未填）') };
+  }, [batchSupplier, selectedPassengerIds, passengerToTask]);
+
+  useEffect(() => {
+    if (batchRateTouched) return;
+    if (batchFxSupplier.kind === 'MIXED') {
+      setBatchCostRate('');
+      setBatchFxHint(
+        `所选任务的签证公司不一致（${batchFxSupplier.suppliers.join(' / ')}），汇率请手填，或先统一签证公司`,
+      );
+      return;
+    }
+    let cancelled = false;
+    const { supplier } = batchFxSupplier;
+    const timer = setTimeout(() => {
+      void lookupFxRate(supplier).then((result) => {
+        if (cancelled) return;
+        setBatchCostRate(result.rate != null ? String(result.rate) : '');
+        setBatchFxHint(fxHintText(supplier, result));
+      });
+    }, FX_LOOKUP_DEBOUNCE_MS);
+    return () => {
+      cancelled = true;
+      clearTimeout(timer);
+    };
+  }, [batchFxSupplier, batchRateTouched, lookupFxRate]);
 
   const handleDownloadVisaRoster = async () => {
     if (!token || selectedOrderIds.length === 0 || rosterDownloading) return;
@@ -1831,6 +1957,8 @@ export function VisaDeskPage() {
         clearInput: () => {
           setBatchCostUsd('');
           setBatchCostCny('');
+          // 汇率格回到「跟着公司带」状态，下一批勾选按新公司重新带出
+          setBatchRateTouched(false);
         },
       });
     }
@@ -2276,7 +2404,11 @@ export function VisaDeskPage() {
               value={batchCostRate}
               placeholder="汇率"
               disabled={anyBatchBusy}
-              onChange={(e) => setBatchCostRate(e.target.value)}
+              onChange={(e) => {
+                setBatchCostRate(e.target.value);
+                setBatchRateTouched(true);
+                setBatchFxHint(null);
+              }}
             />
             {batchCostAutoCny != null && (
               <span className="text-xs text-emerald-700">= ¥{batchCostAutoCny}/人</span>
@@ -2302,7 +2434,7 @@ export function VisaDeskPage() {
             </button>
             <span className="text-[11px] text-ink-muted">
               作用于所选 {selectedTaskIds.length} 单签证任务；三格留空 = 清空回退产品成本（需走「只应用金额」；「执行」对留空的金额一律不改）
-              {todayFxRate != null && `；汇率已按当日汇率表带出（${todayFxRate}），可手改`}
+              {batchFxHint && `；${batchFxHint}`}
             </span>
           </div>
           {downloadError && <p className="mt-2 text-xs text-rose-600">{downloadError}</p>}
@@ -2494,7 +2626,7 @@ export function VisaDeskPage() {
                     onTogglePassenger={togglePassenger}
                     onToggleOrderPassengers={toggleOrderPassengers}
                     token={token}
-                    defaultFxRate={todayFxRate}
+                    lookupFxRate={lookupFxRate}
                     onChanged={() => setRefreshNonce((n) => n + 1)}
                   />
                 ))

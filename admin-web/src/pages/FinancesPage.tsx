@@ -503,16 +503,21 @@ function CostsTab({ token }: { token: string }) {
 
 // ── 美金汇率（按生效日）──────────────────────────────────────────────────────
 /**
- * 财务维护「某日起 USD→CNY 用哪个汇率」。只填生效日、不填结束日：
- * 区间由下一条的生效日隐含，因此无空洞、无重叠。
- * 签证台设金额时自动带出当日生效汇率，折算值**当场固化**在任务上——
+ * 财务维护「某签证公司某日起 USD→CNY 用哪个汇率」。按签证公司各维护一条串；只填生效日、不填结束日：
+ * 区间由同公司下一条的生效日隐含，因此无空洞、无重叠。公司留空 = 通用行，只在该公司没有汇率时兜底。
+ * 签证台设金额时按任务的签证公司自动带出当日生效汇率，折算值**当场固化**在任务上——
  * 之后改这张表不会追溯已入账的旧任务。
  */
+const FX_GENERIC_KEY = '';
+const FX_SUPPLIER_DATALIST_ID = 'fx-supplier-options';
+
 function UsdFxRateEditor({ token }: { token: string }) {
   const [rates, setRates] = useState<UsdFxRateDto[]>([]);
+  const [supplierOptions, setSupplierOptions] = useState<string[]>([]);
   const [loading, setLoading] = useState(true);
   const [err, setErr] = useState<string | null>(null);
 
+  const [newSupplier, setNewSupplier] = useState('');
   const [newFrom, setNewFrom] = useState(todayStr());
   const [newRate, setNewRate] = useState<number | null>(null);
   const [newNote, setNewNote] = useState('');
@@ -523,10 +528,11 @@ function UsdFxRateEditor({ token }: { token: string }) {
     let cancelled = false;
     setLoading(true);
     setErr(null);
-    api
-      .listUsdFxRates(token)
-      .then((d) => {
-        if (!cancelled) setRates(d.rates);
+    Promise.all([api.listUsdFxRates(token), api.listUsdFxRateSupplierOptions(token)])
+      .then(([ratesRes, optionsRes]) => {
+        if (cancelled) return;
+        setRates(ratesRes.rates);
+        setSupplierOptions(optionsRes.suppliers);
       })
       .catch((e: unknown) => {
         if (!cancelled) setErr(e instanceof ApiError ? e.message : '汇率列表加载失败');
@@ -541,22 +547,46 @@ function UsdFxRateEditor({ token }: { token: string }) {
 
   useEffect(() => load(), [load]);
 
-  // 当前生效的那条 = 生效日 ≤ 今天的最新一条（列表已按生效日倒序）
-  const current = useMemo(() => {
+  /**
+   * 按签证公司分组（后端已按公司、生效日倒序排好，这里只切组）；每组「当前生效」= 生效日 ≤ 今天的最新一条。
+   * 通用行（supplier null）单独一组排最后——它只是兜底。
+   */
+  const groups = useMemo(() => {
     const today = todayStr();
-    return rates.find((r) => r.effectiveFrom <= today) ?? null;
+    const byKey = new Map<string, UsdFxRateDto[]>();
+    for (const r of rates) {
+      const key = r.supplier ?? FX_GENERIC_KEY;
+      const list = byKey.get(key) ?? [];
+      byKey.set(key, [...list, r]);
+    }
+    return [...byKey.entries()].map(([key, rows]) => ({
+      key,
+      supplier: key === FX_GENERIC_KEY ? null : key,
+      rows,
+      currentId: rows.find((r) => r.effectiveFrom <= today)?.id ?? null,
+    }));
   }, [rates]);
+
+  // 输入候选 = 后端候选 ∪ 汇率表里已有的公司名（自由输入仍允许）
+  const datalistOptions = useMemo(() => {
+    const names = new Set<string>(supplierOptions);
+    for (const r of rates) if (r.supplier) names.add(r.supplier);
+    return [...names];
+  }, [supplierOptions, rates]);
 
   async function save(): Promise<void> {
     if (newRate == null || newRate <= 0) {
       setErr('汇率需大于 0');
       return;
     }
-    // 同一生效日已有记录时按覆盖处理（后端按生效日幂等 upsert）
-    const existing = rates.find((r) => r.effectiveFrom === newFrom);
+    const supplier = newSupplier.trim() === '' ? null : newSupplier.trim();
+    // 同公司同一生效日已有记录时按覆盖处理（后端按公司 × 生效日幂等 upsert）
+    const existing = rates.find((r) => r.supplier === supplier && r.effectiveFrom === newFrom);
     if (
       existing &&
-      !confirm(`${newFrom} 已有汇率 ${existing.rate}，确认覆盖为 ${newRate}？`)
+      !confirm(
+        `${supplier ?? '通用'} ${newFrom} 已有汇率 ${existing.rate}，确认覆盖为 ${newRate}？`,
+      )
     ) {
       return;
     }
@@ -564,6 +594,7 @@ function UsdFxRateEditor({ token }: { token: string }) {
     setErr(null);
     try {
       await api.upsertUsdFxRate(token, {
+        supplier,
         effectiveFrom: newFrom,
         rate: newRate,
         note: newNote.trim() === '' ? null : newNote.trim(),
@@ -581,16 +612,25 @@ function UsdFxRateEditor({ token }: { token: string }) {
   return (
     <div className="card">
       <div className="flex flex-wrap items-center justify-between gap-2">
-        <h2 className="text-sm font-semibold text-ink">美金汇率（按生效日）</h2>
-        {current && (
+        <h2 className="text-sm font-semibold text-ink">美金汇率（按签证公司 × 生效日）</h2>
+        {groups.length > 0 && (
           <span className="text-xs text-ink-soft">
-            当前生效：<span className="font-semibold text-ink nums">{current.rate}</span>
-            （{current.effectiveFrom} 起）
+            当前生效：
+            {groups.map((g) => {
+              const cur = g.rows.find((r) => r.id === g.currentId);
+              return (
+                <span key={g.key} className="ml-2">
+                  {g.supplier ?? '通用'}{' '}
+                  <span className="font-semibold text-ink nums">{cur ? cur.rate : '—'}</span>
+                </span>
+              );
+            })}
           </span>
         )}
       </div>
       <p className="mt-1 text-xs text-ink-muted">
-        只填生效日，不填结束日 —— 区间由下一条的生效日隐含，不会有空洞或重叠。签证台设金额时自动带出当日汇率。
+        按签证公司各维护一条，签证台按任务的签证公司自动带汇率；留空的通用行只在该公司没有汇率时兜底。
+        只填生效日，不填结束日 —— 区间由同公司下一条的生效日隐含。
         <span className="font-medium text-amber-700">
           新汇率只影响此后的折算，已入账任务不受影响。
         </span>
@@ -600,6 +640,26 @@ function UsdFxRateEditor({ token }: { token: string }) {
 
       {/* 新增 / 覆盖一行 */}
       <div className="mt-3 flex flex-wrap items-end gap-2 rounded-lg border border-slate-200 bg-slate-50/60 p-3">
+        <div>
+          <label className="label" htmlFor="fx-supplier">
+            签证公司（留空 = 通用）
+          </label>
+          <input
+            id="fx-supplier"
+            type="text"
+            list={FX_SUPPLIER_DATALIST_ID}
+            className="input w-40 py-1.5 text-sm"
+            placeholder="选择或输入公司名"
+            value={newSupplier}
+            disabled={saving}
+            onChange={(e) => setNewSupplier(e.target.value)}
+          />
+          <datalist id={FX_SUPPLIER_DATALIST_ID}>
+            {datalistOptions.map((name) => (
+              <option key={name} value={name} />
+            ))}
+          </datalist>
+        </div>
         <div>
           <label className="label" htmlFor="fx-effective-from">
             生效日
@@ -634,7 +694,7 @@ function UsdFxRateEditor({ token }: { token: string }) {
             id="fx-note"
             type="text"
             className="input py-1.5 text-sm"
-            placeholder="如 月初挂牌"
+            placeholder="如 对方通知调整"
             value={newNote}
             disabled={saving}
             onChange={(e) => setNewNote(e.target.value)}
@@ -652,12 +712,13 @@ function UsdFxRateEditor({ token }: { token: string }) {
 
       {loading ? (
         <div className="mt-3 text-sm text-slate-500">加载汇率…</div>
-      ) : rates.length === 0 ? (
+      ) : groups.length === 0 ? (
         <div className="mt-3 text-sm text-ink-muted">尚未维护任何汇率（签证台的汇率格需手填）</div>
       ) : (
         <table className="mt-3 w-full text-sm">
           <thead className="text-xs uppercase tracking-wide text-ink-muted">
             <tr className="border-b border-slate-200">
+              <th className="py-2 text-left font-normal">签证公司</th>
               <th className="py-2 text-left font-normal">生效日</th>
               <th className="py-2 text-right font-normal">汇率</th>
               <th className="py-2 text-left font-normal">备注</th>
@@ -665,20 +726,36 @@ function UsdFxRateEditor({ token }: { token: string }) {
             </tr>
           </thead>
           <tbody>
-            {rates.map((r) => (
-              <tr key={r.id} className="border-b border-slate-100 last:border-0">
-                <td className="py-2 text-slate-900 nums">
-                  {r.effectiveFrom}
-                  {current?.id === r.id && <span className="badge-success ml-2">当前生效</span>}
-                </td>
-                <td className="py-2 text-right tabular-nums text-slate-900">{r.rate}</td>
-                <td className="py-2 text-ink-soft">{r.note ?? '—'}</td>
-                <td className="py-2 text-xs text-ink-muted">
-                  {fmtDate(r.updatedAt)}
-                  {r.updatedBy && ` · ${r.updatedBy.slice(0, 8)}…`}
-                </td>
-              </tr>
-            ))}
+            {groups.map((g) =>
+              g.rows.map((r, i) => (
+                <tr
+                  key={r.id}
+                  className={
+                    i === 0 && g.key !== groups[0].key
+                      ? 'border-t-2 border-slate-200 border-b border-b-slate-100 last:border-b-0'
+                      : 'border-b border-slate-100 last:border-0'
+                  }
+                >
+                  <td className="py-2 text-slate-900">
+                    {i === 0 ? (
+                      g.supplier ?? <span className="text-ink-muted">通用（兜底）</span>
+                    ) : (
+                      ''
+                    )}
+                  </td>
+                  <td className="py-2 text-slate-900 nums">
+                    {r.effectiveFrom}
+                    {g.currentId === r.id && <span className="badge-success ml-2">当前生效</span>}
+                  </td>
+                  <td className="py-2 text-right tabular-nums text-slate-900">{r.rate}</td>
+                  <td className="py-2 text-ink-soft">{r.note ?? '—'}</td>
+                  <td className="py-2 text-xs text-ink-muted">
+                    {fmtDate(r.updatedAt)}
+                    {r.updatedBy && ` · ${r.updatedBy.slice(0, 8)}…`}
+                  </td>
+                </tr>
+              )),
+            )}
           </tbody>
         </table>
       )}

@@ -1436,18 +1436,26 @@ model FlightSettlementRate {
   @@index([departDate])
 }
 
-/// 美金汇率表（按「生效日」维护）——财务加一条「某日起 x.xx」，区间由下一条的生效日隐含，
-/// 因此天然无空洞、无重叠。取数口径 = 「生效日 ≤ 目标日期的最新一条」，无更早记录则取不到。
+/// 美金汇率表（按「签证公司 × 生效日」维护）——财务按公司各加一条「某日起 x.xx」，区间由同公司
+/// 下一条的生效日隐含，因此天然无空洞、无重叠。取数口径 = 先取该公司「生效日 ≤ 目标日期的最新一条」，
+/// 该公司没有任何可用记录时回落通用行（supplier 为空），通用行也没有则取不到。
+/// 汇率按公司不同是财务口径：各签证公司结算链路不同（有的美金直折，有的经第三方货币链式折算）。
 /// 折算结果**当场固化**在业务单据上（如签证任务的 visaFxRate / visaUnitCostCny），
 /// 之后改这张表**绝不追溯**已折算的旧单据。
 model UsdFxRate {
   id            String   @id @default(cuid())
-  effectiveFrom DateTime @unique @db.Date // 生效日（date-only）；同一天只允许一条，upsert 幂等键
+  /// 签证公司（与任务 visaSupplier / 产品 Visa.supplier 同一套名字，trim 后精确匹配）；
+  /// 空 = 通用/缺省行，只在该公司没有汇率时兜底。通用行同生效日不重复由服务层校验（多个 NULL 不撞唯一约束）。
+  supplier      String?
+  effectiveFrom DateTime @db.Date // 生效日（date-only）；同公司同一天只允许一条，upsert 幂等键
   rate          Decimal  @db.Decimal(12, 6) // USD→CNY 汇率（正数）
   note          String?
   updatedBy     String? // 最近更新人 userId（审计冗余，展示"谁改的"）
   createdAt     DateTime @default(now())
   updatedAt     DateTime @updatedAt
+
+  @@unique([supplier, effectiveFrom])
+  @@index([effectiveFrom])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

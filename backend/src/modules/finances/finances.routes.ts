@@ -34,7 +34,12 @@ import {
   setFlightScheduleCostLock,
   updateCostPeriod,
 } from './finances.cost.service.js';
-import { getUsdFxRate, listUsdFxRates, upsertUsdFxRate } from './finances.fx.service.js';
+import {
+  getUsdFxRate,
+  listFxSupplierOptions,
+  listUsdFxRates,
+  upsertUsdFxRate,
+} from './finances.fx.service.js';
 import { buildFinanceExportWorkbook, financeExportFilename } from './finances.export.js';
 import {
   buildFinanceExportByFlightWorkbook,
@@ -426,11 +431,14 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     return result;
   });
 
-  // ── 美金汇率表（按生效日）────────────────────────────────────────────────────
-  // 财务加一条「某日起 x.xx」，区间由下一条的生效日隐含。签证台设金额时自动带出当日汇率，
+  // ── 美金汇率表（按签证公司 × 生效日）──────────────────────────────────────────
+  // 财务按签证公司各加一条「某日起 x.xx」，区间由同公司下一条的生效日隐含；公司留空 = 通用行，
+  // 只在该公司没有汇率时兜底。签证台设金额时按任务的签证公司自动带出当日汇率，
   // 折算值当场固化在任务上 —— 之后改汇率表绝不追溯已入账的旧任务。
   // 读写都放开到 ADMIN/STAFF：签证岗要读当日汇率，财务岗要维护。
+  const fxSupplierStr = z.string().max(100);
   const usdFxRateUpsertSchema = z.object({
+    supplier: fxSupplierStr.nullable().optional(),
     effectiveFrom: dateStr,
     rate: z.number().positive().max(1000),
     note: z.string().max(200).nullable().optional(),
@@ -441,10 +449,19 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
     return { rates };
   });
 
-  /** 取某日生效的汇率（≤date 的最新一条）；未维护 → { rate: null }，前端据此让用户手填。 */
+  /** 汇率表「签证公司」输入候选（产品供应商 ∪ 任务签证公司，去重）。 */
+  app.get('/usd-fx-rates/supplier-options', requireAdminOrStaff, async () => {
+    const suppliers = await listFxSupplierOptions();
+    return { suppliers };
+  });
+
+  /**
+   * 取某公司某日生效的汇率：先该公司 ≤date 的最新一条，没有回落通用行；都没有 → { rate: null }，
+   * 前端据此让用户手填。supplier 省略/空 = 只看通用行。
+   */
   app.get('/usd-fx-rates/effective', requireAdminOrStaff, async (req) => {
-    const q = z.object({ date: dateStr }).parse(req.query);
-    const rate = await getUsdFxRate(q.date);
+    const q = z.object({ date: dateStr, supplier: fxSupplierStr.optional() }).parse(req.query);
+    const rate = await getUsdFxRate(q.date, q.supplier ?? null);
     return { rate };
   });
 
@@ -456,7 +473,7 @@ export const financesRoutes: FastifyPluginAsync = async (app) => {
       action: 'UPSERT_USD_FX_RATE',
       targetType: 'SYSTEM',
       targetId: rate.id,
-      targetLabel: `美金汇率 ${rate.effectiveFrom} 起 ${rate.rate}`,
+      targetLabel: `美金汇率 ${rate.supplier ?? '通用'} ${rate.effectiveFrom} 起 ${rate.rate}`,
       after: rate,
     });
     return { rate };

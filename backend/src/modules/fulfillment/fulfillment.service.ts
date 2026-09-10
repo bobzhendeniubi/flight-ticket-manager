@@ -449,7 +449,7 @@ export class FulfillmentService {
         include: {
           fulfillmentTasks: { orderBy: { createdAt: 'asc' } },
           // 本签证 item 关联的签证产品结构化分类（签发方式/入境次数），与 visaName 平级下发
-          visa: { select: { visaName: true, issuanceMethod: true, entryType: true } },
+          visa: { select: { visaName: true, issuanceMethod: true, entryType: true, supplier: true } },
           // 订单级录单签证口径（含自动办结前的原值）—— 产品结构化字段缺失时的分类回退来源
           order: { select: RECORDED_VISA_SELECT },
         },
@@ -480,6 +480,8 @@ export class FulfillmentService {
           ? {
               passengers: serializedPassengers,
               visaName: it.visa?.visaName ?? null,
+              // 签证产品默认供应商：任务未填签证公司时，签证台据此带出该公司的汇率
+              visaProductSupplier: it.visa?.supplier ?? null,
               visaIssuanceMethod: visaClass.issuanceMethod,
               visaEntryType: visaClass.entryType,
               // 出处标：PRODUCT=产品结构化标注（确证）/ ORDER_STATUS=录单回退（推断）
@@ -643,7 +645,7 @@ export class FulfillmentService {
             include: {
               // 本签证 item 关联的签证产品（用于 #7：单次/多次签名称 + 结构化签发方式/入境次数分类
               // + stayDays：非 15 天单次的特殊情况徽标）
-              visa: { select: { visaName: true, issuanceMethod: true, entryType: true, stayDays: true } },
+              visa: { select: { visaName: true, issuanceMethod: true, entryType: true, stayDays: true, supplier: true } },
               order: {
                 select: {
                   id: true,
@@ -818,6 +820,8 @@ export class FulfillmentService {
           ...serializeTask(t, t.orderItem),
           // #7：本签证产品名称（单次/多次签等）置于任务顶层
           visaName: t.orderItem.visa?.visaName ?? null,
+          // 签证产品默认供应商：任务未填签证公司时，签证台据此带出该公司的汇率
+          visaProductSupplier: t.orderItem.visa?.supplier ?? null,
           // 签证结构化分类（签发方式/入境次数）；产品与订单级都未标注 = null
           visaIssuanceMethod: visaClass.issuanceMethod,
           visaEntryType: visaClass.entryType,

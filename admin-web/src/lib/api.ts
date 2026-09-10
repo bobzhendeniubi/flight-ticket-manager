@@ -2633,6 +2633,8 @@ export interface FulfillmentTask {
   };
   /** 签证产品名（含"…单次"/"…多次"）；非签证任务或缺失 → null */
   visaName?: string | null;
+  /** 签证产品默认供应商（Visa.supplier）；任务未填签证公司时，签证台据此带出该公司的汇率 */
+  visaProductSupplier?: string | null;
   /** 签证产品签发方式（结构化分类）；非签证任务/未设置/缺失 → null */
   visaIssuanceMethod?: VisaIssuanceMethod | null;
   /** 签证产品入境次数（结构化分类）；非签证任务/未设置/缺失 → null */
@@ -2669,11 +2671,14 @@ export interface VisaTaskCostInput {
 }
 
 /**
- * 美金汇率（按生效日）：财务加一条「某日起 x.xx」，区间由下一条的生效日隐含。
- * 取数 = 「生效日 ≤ 目标日期的最新一条」；折算值当场固化在任务上，改表不追溯旧任务。
+ * 美金汇率（按签证公司 × 生效日）：财务按公司各加一条「某日起 x.xx」，区间由同公司下一条的生效日隐含；
+ * 公司留空 = 通用行，只在该公司没有汇率时兜底。
+ * 取数 = 先该公司「生效日 ≤ 目标日期的最新一条」，没有回落通用行；折算值当场固化在任务上，改表不追溯旧任务。
  */
 export interface UsdFxRateDto {
   id: string;
+  /** 签证公司；null = 通用/缺省行 */
+  supplier: string | null;
   /** 生效日 YYYY-MM-DD */
   effectiveFrom: string;
   /** USD→CNY 汇率 */
@@ -6261,20 +6266,29 @@ export const api = {
     body: Partial<{ costPriceCny: number | null }>,
   ) => apiFetch<{ id: string }>(`/finances/cost/transfer/${id}`, { method: 'PATCH', token, body }),
 
-  // ── 美金汇率表（按生效日）────────────────────────────────────────────────────
-  // 列表按生效日倒序（最近生效的在最前）
+  // ── 美金汇率表（按签证公司 × 生效日）──────────────────────────────────────────
+  // 列表按公司分组（通用行最后）、同公司生效日倒序（最近生效的在最前）
   listUsdFxRates: (token: string) =>
     apiFetch<{ rates: UsdFxRateDto[] }>('/finances/usd-fx-rates', { token }),
-  /** 取某日生效的汇率（≤date 最新一条）；未维护 → { rate: null }，前端让用户手填 */
-  getEffectiveUsdFxRate: (token: string, date: string) =>
-    apiFetch<{ rate: UsdFxRateDto | null }>(
-      `/finances/usd-fx-rates/effective?date=${encodeURIComponent(date)}`,
-      { token },
-    ),
-  /** 按生效日幂等 upsert（同一天重复提交只覆盖不新增） */
+  /** 汇率表「签证公司」输入候选（产品供应商 ∪ 任务签证公司，去重） */
+  listUsdFxRateSupplierOptions: (token: string) =>
+    apiFetch<{ suppliers: string[] }>('/finances/usd-fx-rates/supplier-options', { token }),
+  /**
+   * 取某公司某日生效的汇率：先该公司 ≤date 最新一条，没有回落通用行（返回的 rate.supplier 为 null
+   * 即表示回落）；都没有 → { rate: null }，前端让用户手填。supplier 省略/空 = 只看通用行。
+   */
+  getEffectiveUsdFxRate: (token: string, date: string, supplier?: string | null) => {
+    const q = new URLSearchParams({ date });
+    const name = supplier?.trim() ?? '';
+    if (name) q.set('supplier', name);
+    return apiFetch<{ rate: UsdFxRateDto | null }>(`/finances/usd-fx-rates/effective?${q}`, {
+      token,
+    });
+  },
+  /** 按（公司 × 生效日）幂等 upsert（同公司同一天重复提交只覆盖不新增；supplier 空 = 通用行） */
   upsertUsdFxRate: (
     token: string,
-    body: { effectiveFrom: string; rate: number; note?: string | null },
+    body: { supplier?: string | null; effectiveFrom: string; rate: number; note?: string | null },
   ) => apiFetch<{ rate: UsdFxRateDto }>('/finances/usd-fx-rates', { method: 'PUT', token, body }),
 
   // 财务核对 xlsx 导出（Blob 直接下载）

@@ -42,6 +42,14 @@ const hotelCostPeriodMocks = vi.hoisted(() => ({
 }));
 vi.mock('./hotel-cost.service.js', () => hotelCostPeriodMocks);
 
+const fxMocks = vi.hoisted(() => ({
+  getUsdFxRate: vi.fn(),
+  listFxSupplierOptions: vi.fn(),
+  listUsdFxRates: vi.fn(),
+  upsertUsdFxRate: vi.fn(),
+}));
+vi.mock('./finances.fx.service.js', () => fxMocks);
+
 const writeAuditMock = vi.hoisted(() => vi.fn().mockResolvedValue(undefined));
 vi.mock('../../lib/audit.js', () => ({
   actorFromRequest: vi.fn((req: { user?: { sub: string; role: UserRole } }) => ({
@@ -343,5 +351,167 @@ describe('酒店房型净房价按日期区间路由（ADMIN/STAFF）', () => {
     });
     expect(res.statusCode).toBe(403);
     expect(hotelCostPeriodMocks.listHotelRoomTypeCostPeriods).not.toHaveBeenCalled();
+  });
+});
+
+describe('美金汇率表路由（按签证公司 × 生效日）', () => {
+  let app: FastifyInstance;
+
+  beforeAll(async () => {
+    app = Fastify({ logger: false });
+    await app.register(authPlugin);
+    registerErrorHandler(app);
+    await app.register(financesRoutes, { prefix: '/finances' });
+    await app.ready();
+  });
+
+  afterAll(async () => {
+    await app.close();
+  });
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  function tokenFor(sub: string, role: UserRole): string {
+    return app.jwt.sign({ sub, role });
+  }
+
+  const fxDto = {
+    id: 'fx1',
+    supplier: '甲公司',
+    effectiveFrom: '2026-01-01',
+    rate: 7.2,
+    note: null,
+    updatedBy: 'staff-1',
+    updatedAt: '2026-09-09T00:00:00.000Z',
+  };
+
+  it('GET /effective 透传 date + supplier 给服务；省略 supplier 时传 null（只看通用行）', async () => {
+    fxMocks.getUsdFxRate.mockResolvedValue(fxDto);
+    const auth = { authorization: `Bearer ${tokenFor('staff-1', UserRole.STAFF)}` };
+
+    const withSupplier = await app.inject({
+      method: 'GET',
+      url: '/finances/usd-fx-rates/effective?date=2026-09-09&supplier=' + encodeURIComponent('甲公司'),
+      headers: auth,
+    });
+    expect(withSupplier.statusCode).toBe(200);
+    expect(withSupplier.json()).toEqual({ rate: fxDto });
+    expect(fxMocks.getUsdFxRate).toHaveBeenCalledWith('2026-09-09', '甲公司');
+
+    fxMocks.getUsdFxRate.mockResolvedValue(null);
+    const generic = await app.inject({
+      method: 'GET',
+      url: '/finances/usd-fx-rates/effective?date=2026-09-09',
+      headers: auth,
+    });
+    expect(generic.statusCode).toBe(200);
+    expect(generic.json()).toEqual({ rate: null });
+    expect(fxMocks.getUsdFxRate).toHaveBeenLastCalledWith('2026-09-09', null);
+  });
+
+  it('GET /effective 日期格式不对 → 400，不调服务', async () => {
+    const res = await app.inject({
+      method: 'GET',
+      url: '/finances/usd-fx-rates/effective?date=2026/09/09',
+      headers: { authorization: `Bearer ${tokenFor('staff-1', UserRole.STAFF)}` },
+    });
+    expect(res.statusCode).toBe(400);
+    expect(fxMocks.getUsdFxRate).not.toHaveBeenCalled();
+  });
+
+  it('PUT 带 supplier 透传给服务并审计（targetLabel 带公司名）；不带 supplier 也能存通用行', async () => {
+    fxMocks.upsertUsdFxRate.mockResolvedValue(fxDto);
+    const auth = { authorization: `Bearer ${tokenFor('staff-1', UserRole.STAFF)}` };
+
+    const res = await app.inject({
+      method: 'PUT',
+      url: '/finances/usd-fx-rates',
+      headers: auth,
+      payload: { supplier: '甲公司', effectiveFrom: '2026-01-01', rate: 7.2 },
+    });
+    expect(res.statusCode).toBe(200);
+    expect(res.json()).toEqual({ rate: fxDto });
+    expect(fxMocks.upsertUsdFxRate).toHaveBeenCalledWith(
+      { supplier: '甲公司', effectiveFrom: '2026-01-01', rate: 7.2 },
+      'staff-1',
+    );
+    expect(writeAuditMock).toHaveBeenCalledWith(
+      expect.objectContaining({
+        action: 'UPSERT_USD_FX_RATE',
+        targetId: 'fx1',
+        targetLabel: expect.stringContaining('甲公司'),
+      }),
+    );
+
+    fxMocks.upsertUsdFxRate.mockResolvedValue({ ...fxDto, id: 'fx2', supplier: null, rate: 6.7 });
+    const generic = await app.inject({
+      method: 'PUT',
+      url: '/finances/usd-fx-rates',
+      headers: auth,
+      payload: { effectiveFrom: '2026-01-01', rate: 6.7 },
+    });
+    expect(generic.statusCode).toBe(200);
+    expect(fxMocks.upsertUsdFxRate).toHaveBeenLastCalledWith(
+      { effectiveFrom: '2026-01-01', rate: 6.7 },
+      'staff-1',
+    );
+    expect(writeAuditMock).toHaveBeenLastCalledWith(
+      expect.objectContaining({ targetLabel: expect.stringContaining('通用') }),
+    );
+  });
+
+  it('PUT 汇率 ≤ 0 / supplier 超长 → 400，不调服务', async () => {
+    const auth = { authorization: `Bearer ${tokenFor('staff-1', UserRole.STAFF)}` };
+    const zero = await app.inject({
+      method: 'PUT',
+      url: '/finances/usd-fx-rates',
+      headers: auth,
+      payload: { effectiveFrom: '2026-01-01', rate: 0 },
+    });
+    expect(zero.statusCode).toBe(400);
+    const tooLong = await app.inject({
+      method: 'PUT',
+      url: '/finances/usd-fx-rates',
+      headers: auth,
+      payload: { supplier: 'x'.repeat(101), effectiveFrom: '2026-01-01', rate: 7.2 },
+    });
+    expect(tooLong.statusCode).toBe(400);
+    expect(fxMocks.upsertUsdFxRate).not.toHaveBeenCalled();
+    expect(writeAuditMock).not.toHaveBeenCalled();
+  });
+
+  it('GET 列表 / GET 公司候选 走对应服务', async () => {
+    fxMocks.listUsdFxRates.mockResolvedValue([fxDto]);
+    fxMocks.listFxSupplierOptions.mockResolvedValue(['甲公司', '乙公司']);
+    const auth = { authorization: `Bearer ${tokenFor('staff-1', UserRole.STAFF)}` };
+
+    const listed = await app.inject({ method: 'GET', url: '/finances/usd-fx-rates', headers: auth });
+    expect(listed.statusCode).toBe(200);
+    expect(listed.json()).toEqual({ rates: [fxDto] });
+
+    const options = await app.inject({
+      method: 'GET',
+      url: '/finances/usd-fx-rates/supplier-options',
+      headers: auth,
+    });
+    expect(options.statusCode).toBe(200);
+    expect(options.json()).toEqual({ suppliers: ['甲公司', '乙公司'] });
+  });
+
+  it('AGENT 一律 403，不触碰服务', async () => {
+    const auth = { authorization: `Bearer ${tokenFor('agent-1', UserRole.AGENT)}` };
+    for (const url of [
+      '/finances/usd-fx-rates',
+      '/finances/usd-fx-rates/supplier-options',
+      '/finances/usd-fx-rates/effective?date=2026-09-09',
+    ]) {
+      const res = await app.inject({ method: 'GET', url, headers: auth });
+      expect(res.statusCode).toBe(403);
+    }
+    expect(fxMocks.listUsdFxRates).not.toHaveBeenCalled();
+    expect(fxMocks.listFxSupplierOptions).not.toHaveBeenCalled();
+    expect(fxMocks.getUsdFxRate).not.toHaveBeenCalled();
   });
 });
