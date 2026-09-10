@@ -243,3 +243,38 @@ describe('buildFinanceExportWorkbook — 退款类型结构化列', () => {
     expect(ws.getRow(4).getCell(refundTypeCol).value).toBe('');
   });
 });
+
+describe('buildFinanceExportWorkbook — 车费成本口径：录单快照优先', () => {
+  const TRANSFER_COST_COL = 24; // COLUMNS 第 24 项 = '车费(RMB)'
+  function transferItem(overrides: Record<string, unknown>) {
+    return {
+      kind: 'TRANSFER',
+      description: '机场接送',
+      quantity: 2,
+      unitPrice: 150,
+      amount: 300,
+      totalCostCny: null,
+      metadata: null,
+      flightSchedule: null,
+      hotelRoomType: null,
+      visa: null,
+      fulfillmentTasks: [],
+      transfer: { costPriceCny: 100, costPriceVnd: null, costFxName: null },
+      ...overrides,
+    };
+  }
+
+  it('有录单快照 totalCostCny → 车费取快照，不按产品现行结算价重算', async () => {
+    const order = makeOrder({ orderNumber: 'FTM0101', items: [transferItem({ totalCostCny: 250 })] });
+    const buf = await buildFinanceExportWorkbook(RANGE, fakeClient([order]));
+    const ws = (await loadWorkbook(buf)).getWorksheet('财务核对收入明细')!;
+    expect(ws.getRow(2).getCell(TRANSFER_COST_COL).value).toBe(250);
+  });
+
+  it('无快照的老单 → 回退产品现行结算价 × 数量', async () => {
+    const order = makeOrder({ orderNumber: 'FTM0102', items: [transferItem({})] });
+    const buf = await buildFinanceExportWorkbook(RANGE, fakeClient([order]));
+    const ws = (await loadWorkbook(buf)).getWorksheet('财务核对收入明细')!;
+    expect(ws.getRow(2).getCell(TRANSFER_COST_COL).value).toBe(200);
+  });
+});

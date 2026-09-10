@@ -339,19 +339,24 @@ function orderToRows(
       visaCostCnyOrder += cost;
     }
     if (it.kind === 'TRANSFER' && it.transfer) {
-      // 产品现行结算价 × quantity（越南盾按服务日 = 去程出发日 → 下单日 生效的 VND 汇率行折人民币；
-      // 缺汇率 / 没录成本 → 不计，真缺数据不虚构）。
-      const unit = resolveTransferUnitCost({
-        ...it.transfer,
-        date: resolveTransferServiceDate({
-          outboundDepartureDate: earliestDepartureLocalDate(
-            order.items.flatMap((f) => (f.kind === 'FLIGHT' && f.flightSchedule ? [f.flightSchedule] : [])),
-          ),
-          orderCreatedAt: order.createdAt,
-        }),
-        fxRates: transferFxRates,
-      }).cny;
-      if (unit != null) transferCostCnyOrder += unit * it.quantity;
+      // 录单快照 totalCostCny 优先（当时的汇率 × 实际价格已固化，汇率后来变了不追溯，与财务汇总同口径）；
+      // 无快照的老单才按产品现行结算价 × quantity 现算（越南盾按服务日 = 去程出发日 → 下单日 生效的
+      // VND 汇率行折人民币；缺汇率 / 没录成本 → 不计，真缺数据不虚构）。
+      if (it.totalCostCny != null) {
+        transferCostCnyOrder += dec(it.totalCostCny);
+      } else {
+        const unit = resolveTransferUnitCost({
+          ...it.transfer,
+          date: resolveTransferServiceDate({
+            outboundDepartureDate: earliestDepartureLocalDate(
+              order.items.flatMap((f) => (f.kind === 'FLIGHT' && f.flightSchedule ? [f.flightSchedule] : [])),
+            ),
+            orderCreatedAt: order.createdAt,
+          }),
+          fxRates: transferFxRates,
+        }).cny;
+        if (unit != null) transferCostCnyOrder += unit * it.quantity;
+      }
     }
   }
 
