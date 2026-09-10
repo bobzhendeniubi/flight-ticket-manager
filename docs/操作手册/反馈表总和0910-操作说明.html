@@ -1,0 +1,154 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>反馈表总和（9/10）三项变化 操作说明 — 世途旅行·运营控制台</title>
+<style>
+  :root{
+    --indigo:#4F46E5; --indigo-dark:#4338CA; --indigo-50:#EEF2FF;
+    --ink:#0F172A; --ink-soft:#334155; --muted:#64748B;
+    --bg:#F1F5F9; --card:#FFFFFF; --line:#E2E8F0;
+    --amber-bg:#FFFBEB; --amber-line:#FDE68A;
+    --green:#059669; --green-bg:#ECFDF5;
+    --red-bg:#FEF2F2;
+    --blue-bg:#EFF6FF;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Inter','PingFang SC','Hiragino Sans GB','Microsoft YaHei',system-ui,-apple-system,sans-serif;color:var(--ink-soft);background:var(--bg);line-height:1.85;font-size:15px}
+  .page{max-width:900px;margin:0 auto;background:var(--card);padding:40px 44px 72px;box-shadow:0 0 24px rgba(15,23,42,.06)}
+  h1,h2,h3{color:var(--ink);line-height:1.35}
+  h1{font-size:26px;margin:0 0 6px}
+  h2{font-size:20px;margin:40px 0 12px;padding:10px 14px;background:var(--indigo-50);border-left:5px solid var(--indigo);border-radius:0 8px 8px 0}
+  h3{font-size:16.5px;margin:24px 0 8px;color:var(--indigo-dark)}
+  p{margin:10px 0}
+  .sub{color:var(--muted);font-size:13.5px;margin:0 0 4px}
+  .cover{border-bottom:3px solid var(--indigo);padding-bottom:18px;margin-bottom:22px}
+  .cover .brand{display:inline-block;background:var(--indigo);color:#fff;font-weight:700;font-size:13px;padding:3px 12px;border-radius:999px;letter-spacing:.5px;margin-bottom:10px}
+  .lead{background:var(--indigo-50);border-radius:10px;padding:14px 18px;margin:16px 0 8px;color:var(--ink);font-size:15.5px}
+  .shot{margin:14px 0 4px;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
+  .shot img{display:block;width:100%;height:auto}
+  .shot.narrow{max-width:560px}
+  .cap{color:var(--muted);font-size:13px;margin:4px 0 16px;text-align:center}
+  .tip,.info,.warn,.danger{border-radius:10px;padding:12px 16px;margin:14px 0}
+  .tip{background:var(--green-bg);border:1px solid #A7F3D0}
+  .info{background:var(--blue-bg);border:1px solid #BFDBFE}
+  .warn{background:var(--amber-bg);border:1px solid var(--amber-line)}
+  .danger{background:var(--red-bg);border:1px solid #FECACA}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14.5px}
+  table.doc th,table.doc td{border:1px solid var(--line);padding:8px 12px;text-align:left;vertical-align:top}
+  table.doc th{background:#F8FAFC;color:var(--ink)}
+  table.money td{border-bottom:1px solid var(--line);padding:8px 12px}
+  table.money td:first-child{color:var(--muted);width:220px}
+  ol.steps{padding-left:22px}
+  ol.steps li{margin:6px 0}
+  .toc{background:#F8FAFC;border:1px solid var(--line);border-radius:10px;padding:12px 18px 12px 34px;margin:14px 0 6px}
+  .toc li{margin:3px 0}
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="cover">
+  <span class="brand">运营控制台</span>
+  <h1>反馈表总和（9/10）三项变化 操作说明</h1>
+  <p class="sub">批量创单按人填结算价 · 撤销收款谁录的谁能撤 · 机票报价表填 0 的含义　·　2026-09-10</p>
+</div>
+
+<div class="lead">
+「后台使用反馈表总和」里还没标已修改的 5 条，这次一起收口：2 条其实早就上线了（导出里自备签和不需要签证已经分开；取消的单开票和机票已经点不动），
+另外 3 条是这次改的，下面按条说怎么用。
+</div>
+
+<ol class="toc">
+  <li><a href="#s1">批量创单：名单里每个人可以单独填结算价</a></li>
+  <li><a href="#s2">撤销收款：自己录的、财务还没核实的，自己能撤</a></li>
+  <li><a href="#s3">批量创单「自动 +100」是怎么回事，以及报价表填 0 的含义</a></li>
+</ol>
+
+<h2 id="s1">一、批量创单：名单里每个人可以单独填结算价</h2>
+
+<p><strong>解决了什么：</strong>批量创单以前只有整批一个「结算价/人」，同一批里有人谈的价不一样就得分两批录。现在乘客名单表最右边多了一列<strong>「结算价/人（¥）」</strong>，谁的价不一样就在谁那一行填。</p>
+
+<h3>怎么操作</h3>
+<ol class="steps">
+  <li>订单管理 → 「批量创单」，产品类型选单程或往返机票（套餐批量没有这一列，套餐价由系统按结算价日历算）。</li>
+  <li>名单表往右拉到最后一列「结算价/人（¥）」，只给价不一样的人填；其他人留空。</li>
+  <li>下面「旅游团」块里的整批「结算价/人」照旧：留空的人按它走；整批也留空就按结算价日历 / 系统价。</li>
+  <li>底部会提示「名单里有 N 位填了自己的结算价」，核对一下人数再点「批量创建」。</li>
+</ol>
+
+<div class="shot"><img src="shots-2026-09-10-反馈表总和/01-批量创单-结算价列.png"></div>
+<p class="cap">名单表最右一列「结算价/人（¥）」，留空 = 按整批结算价</p>
+
+<div class="shot"><img src="shots-2026-09-10-反馈表总和/02-批量创单-填了逐人价.png"></div>
+<p class="cap">填了之后底部有提示：几位按本人的价成交，其余按整批口径</p>
+
+<h3>价格怎么算</h3>
+<table class="money">
+  <tr><td>优先级</td><td>本人填的 &gt; 整批填的 &gt; 都留空（结算价日历 / 系统动态价）</td></tr>
+  <tr><td>填的是什么价</td><td>每位出行人的<strong>整程价</strong>，往返单系统会自动按去程/回程分摊，不会收两遍</td></tr>
+  <tr><td>订单里怎么显示</td><td>和整批结算价一样：机票行价格来源标「团队议价」，订单详情能看到本人价和分摊</td></tr>
+  <tr><td>谁能填</td><td>运营 / 管理员。代理自助批量录单看不到这一列</td></tr>
+</table>
+
+<div class="warn">
+「结算价/人」和 OTA 线上单的「结算单价」、「优惠」是二选一的，填了任何一个人的结算价就不能再填 OTA 结算单价或优惠，提交时会拦下来并说明。
+</div>
+
+<h2 id="s2">二、撤销收款：自己录的、财务还没核实的，自己能撤</h2>
+
+<p><strong>解决了什么：</strong>9 月 6 日起撤销收款只有财务岗能点，运营录错一笔金额也得找财务。现在改成：<strong>谁录的款，在财务核实之前自己可以撤销</strong>，撤了重新录就行；财务已经核实过的那笔，还是只有财务能动。</p>
+
+<h3>规则一句话</h3>
+<table class="doc">
+  <tr><th>你是</th><th>这笔款</th><th>能不能撤</th></tr>
+  <tr><td>财务岗 / 管理员</td><td>任何一笔</td><td>能</td></tr>
+  <tr><td>运营</td><td>自己录的，财务还没核实</td><td>能</td></tr>
+  <tr><td>运营</td><td>自己录的，财务已核实</td><td>不能，按钮置灰，找财务</td></tr>
+  <tr><td>运营</td><td>别人录的</td><td>不能，按钮置灰，找财务</td></tr>
+</table>
+
+<h3>怎么操作</h3>
+<ol class="steps">
+  <li>打开订单详情，往下到「收款」区，每笔收款右边有「撤销」按钮。</li>
+  <li>能撤的按钮是亮的，点了填原因（至少 4 个字）确认即可；钱退回未认款，订单已收金额同步减少。</li>
+  <li>不能撤的按钮是灰的，鼠标放上去会写明原因（「财务已核实」或「只能撤销自己录入的收款」），直接找财务处理。</li>
+</ol>
+
+<div class="shot"><img src="shots-2026-09-10-反馈表总和/03-撤销收款-运营看到别人录的.png"></div>
+<p class="cap">运营看别人录的那笔：撤销按钮置灰，鼠标放上去写着该找谁</p>
+
+<div class="info">
+「跨单转移」按钮现在只有财务岗能看到（以前运营点了也是报错），「收款对账台」里的「核实」按钮非财务岗也是灰的。认款本身（人工确认 / 批量到账）没变，运营照常做。
+</div>
+
+<div class="warn">
+认款流水（从收款对账台认上去的钱）不走这个撤销，仍要到收款对账台里「撤销认款」，那样钱才会退回挂账池。
+</div>
+
+<h2 id="s3">三、批量创单「自动 +100」是怎么回事，以及报价表填 0 的含义</h2>
+
+<p><strong>反馈说：</strong>批量创单保存后结算价会自动 +100。<strong>查下来：</strong>不是系统自己加，是<strong>结算价日历（机票报价表）</strong>在起作用——代理的纯机票单留空结算价时，系统按报价表里「航班号 × 出发日」那一格取同业价，再和系统价做差额记一行「代理结算价」。那单报价表填的是 900，系统价 800，就显示 +100；同一天系统价 1000 的单就显示 −100，代理实付都是 900。</p>
+
+<h3>不想按报价表走怎么办</h3>
+<ol class="steps">
+  <li>批量创单页选好航班和班次后，「结算价/人」输入框下面会写「日历价 ¥X/人，留空 = 代理单按日历自动取价」——这就是提前告诉你会按多少收。</li>
+  <li>想按别的价：直接在「结算价/人」（整批）或名单里那个人的「结算价/人」填上，填了就不走报价表。</li>
+  <li>报价表本身不对：到「结算价日历 → 机票」里改那一格。</li>
+</ol>
+
+<div class="shot"><img src="shots-2026-09-10-反馈表总和/04-机票结算价日历.png"></div>
+<p class="cap">结算价日历 → 机票：按航班号 × 出发日维护每人同业价</p>
+
+<div class="danger">
+<strong>报价表里填 0 ＝ 这一格没维护，不是「结算价 0 元」。</strong>以前把某天改成 0 会让系统按 0 元取价、把代理单打成 0 元单，现在已经改成：0 视同没填，代理单回落到系统动态价（套餐日历同理，会提示「结算价未维护」）。不想让某天走报价表就填 0 或删掉那一格都可以。
+</div>
+
+<p style="margin-top:44px;color:#94A3B8;font-size:12.5px;border-top:1px solid #E2E8F0;padding-top:12px">
+世途旅行 · 运营控制台　|　反馈表总和（9/10）三项变化操作说明　|　2026-09-10　|　文中金额与单号为演示数据
+</p>
+
+</div>
+</body>
+</html>
