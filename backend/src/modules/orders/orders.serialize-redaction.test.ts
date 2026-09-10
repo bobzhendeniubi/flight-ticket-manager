@@ -418,7 +418,31 @@ describe('serializeOrder · 收款记录标注与脱敏', () => {
     expect(p.receiptNo).toBe('RCP2026072400001');
     expect(p.externalTxnId).toBe('TXN-9988');
     expect(p.amount).toBe('500');
-    // 关键：原始网关载荷不外泄
+    // 关键：原始网关载荷不外泄（只许白名单字段逐个重映射）
+    expect(p.gatewayPayload).toBeUndefined();
+    expect(p.note).toBeUndefined();
+    expect(p.manual).toBeUndefined();
+    expect(p.source).toBeUndefined();
+    // 录入人 id 是内部视角的白名单字段：收款区据此判断「这笔是不是我录的」，
+    // 才能按 2026-09-10 口径只在本人录入且财务未核实的那笔上给运营撤销入口。
+    expect(p.confirmedById).toBe('user_ops_secret');
+  });
+
+  it('对外角色（代理）：录入人 id 不下发，原始载荷同样不外泄', () => {
+    const out = serializeOrder(
+      {
+        ...buildOrder(),
+        payments: [
+          {
+            ...paymentBase,
+            gatewayPayload: { manual: true, note: '客户微信转账', confirmedBy: 'user_ops_secret' },
+          },
+        ],
+      },
+      orderSerializeRoleCtx(UserRole.AGENT),
+    ) as Record<string, any>;
+    const p = out.payments[0];
+    expect(p.confirmedById).toBeUndefined();
     expect(p.gatewayPayload).toBeUndefined();
     expect(JSON.stringify(p)).not.toContain('user_ops_secret');
   });

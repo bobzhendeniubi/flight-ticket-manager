@@ -18,6 +18,7 @@ import {
   PaymentStatus,
   Prisma,
   ReceiptSource,
+  StaffRole,
   UserRole,
 } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
@@ -37,6 +38,7 @@ import {
   sumCompletedRefundsWithinTx,
 } from '../../lib/funds-guard.js';
 import { writeAudit } from '../../lib/audit.js';
+import { hasFinanceAccess } from '../../lib/finance-access.js';
 import { outstandingCommissionNetWithinTx, round2 } from '../../lib/commission-net.js';
 // 超收拆分要在同一事务里建挂账进账。receipts.service 反向 import 本模块的 PaymentsService，
 // 构成模块环——但两侧都只在「方法体 / 类字段初始化」里用到对方，且 createOpenReceiptWithinTx 是
@@ -915,11 +917,17 @@ export class PaymentsService {
    * 将 Payment 以 CAS 方式标记 REFUNDED，并从订单 paidAmount 减回。对账认款必须走
    * receipts.reverseAllocation，否则不会同步回补 Receipt/ReceiptAllocation。
    * 订单状态、佣金和履约任务不回退。
+   *
+   * 权限（2026-09-10 折中口径，见 docs/口径决议.md）：
+   *   · 财务岗（ADMIN / STAFF+财务岗）—— 不论谁录、是否已核实，都能撤销；
+   *   · 其余运营（非财务岗 STAFF）—— 只能撤销「本人录入 + 财务尚未核实」的那一笔，
+   *     即手误录错后自己纠正重录；钱一旦被财务对过流水，就必须回到财务手里处理。
+   * 判定放在服务层而不是路由前置闸：得先读出这笔收款的录入人与核实状态才判得出来。
    */
   async reverseManualPayment(
     paymentId: string,
     input: { reason: string },
-    actor: { userId: string; role: UserRole },
+    actor: { userId: string; role: UserRole; staffRole?: StaffRole | null },
   ): Promise<{
     ok: true;
     paymentId: string;
@@ -978,6 +986,23 @@ export class PaymentsService {
         throw new ConflictError(
           '该笔收款当前不是已入账状态（可能已被撤销），无法撤销。请刷新后确认。',
         );
+      }
+
+      // ── 撤销权限（财务岗 or 运营自撤）────────────────────────────────
+      // 「谁录的」= gatewayPayload.confirmedBy（人工/批量认款写入的录入人 userId，没有外键）；
+      // 「已核实」= Payment.verifiedAt 非空（到账双状态的第二段，财务对过流水才落）。
+      // 两个判定都来自这笔收款自身，所以必须在事务内读到 payment 之后才做。
+      const confirmedById = typeof payload?.confirmedBy === 'string' ? payload.confirmedBy : null;
+      const verifiedBefore = payment.verifiedAt != null;
+      const financeAccess = hasFinanceAccess(actor.role, actor.staffRole);
+      if (!financeAccess) {
+        // 先判归属再判核实：非本人录的不该知道这笔是不是已核实，且「不是你录的」才是首要原因。
+        if (confirmedById === null || confirmedById !== actor.userId) {
+          throw new ForbiddenError('只能撤销自己录入且财务尚未核实的收款');
+        }
+        if (verifiedBefore) {
+          throw new ForbiddenError('该收款财务已核实，请联系财务撤销');
+        }
       }
 
       // 订单行锁 + 事务内读最新 paidAmount，与 confirmManualPayment / reverseAllocation 一致。
@@ -1067,6 +1092,10 @@ export class PaymentsService {
         orderBalanceDue: balanceDue,
         wasFullyPaid,
         stillFullyPaid,
+        // 审计用：selfReversal=true 代表这是非财务岗运营撤自己录的账（财务事后据此筛「运营自撤」），
+        // verifiedBefore=true 只可能出现在财务撤销上（运营自撤已核实的那条路被上面拦掉了）。
+        selfReversal: !financeAccess,
+        verifiedBefore,
       };
     });
 
@@ -1086,6 +1115,8 @@ export class PaymentsService {
         orderStatus: result.orderStatus,
         wasFullyPaid: result.wasFullyPaid,
         stillFullyPaid: result.stillFullyPaid,
+        selfReversal: result.selfReversal,
+        verifiedBefore: result.verifiedBefore,
       },
       severity: 'CRITICAL',
     });

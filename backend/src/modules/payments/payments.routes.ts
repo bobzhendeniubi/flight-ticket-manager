@@ -132,8 +132,12 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
   const reverseManualPaymentSchema = z.object({
     reason: z.string().trim().min(4).max(200),
   });
-  // 口径：撤销认款限财务岗（认款 manual-confirm / batch-confirm 保留运营）。
-  app.post('/:paymentId/reverse', { preHandler: [app.authenticate, app.requireFinanceAccess] }, async (req, reply) => {
+  // 口径（2026-09-10 折中）：财务岗可撤任意一笔；运营只能撤「本人录入 + 财务尚未核实」的那笔
+  //（手误录错后自己纠正重录）。核实 / 转移 / 流水导入仍限财务岗不变。
+  // 这里**不能**挂 requireFinanceAccess —— 否则运营一律 403，自撤那条路根本进不来。
+  // 逐笔判定（录入人、核实状态）在 service 里读到这笔收款后做；staffRole 由 authenticate
+  // 逐请求从 User 表取回，改岗下一个请求即生效。
+  app.post('/:paymentId/reverse', { preHandler: [app.authenticate] }, async (req, reply) => {
     if (req.user.role !== UserRole.ADMIN && req.user.role !== UserRole.STAFF) {
       return reply.status(403).send({ error: '仅运营/管理员可撤销收款' });
     }
@@ -142,7 +146,7 @@ export const paymentRoutes: FastifyPluginAsync = async (app) => {
     return service.reverseManualPayment(
       paymentId,
       { reason: body.reason },
-      { userId: req.user.sub, role: req.user.role },
+      { userId: req.user.sub, role: req.user.role, staffRole: req.staffRole ?? null },
     );
   });
 

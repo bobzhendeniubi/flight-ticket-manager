@@ -16994,7 +16994,13 @@ function ConfirmPaymentSection({
 }) {
   const tokens = useAuth((s) => s.tokens);
   const role = useAuth((s) => s.user?.role);
-  const canTransferPayment = role === 'ADMIN' || role === 'STAFF';
+  const staffRole = useAuth((s) => s.user?.staffRole);
+  const myUserId = useAuth((s) => s.user?.id);
+  // 财务岗判定与后端 hasFinanceAccess 同口径（ADMIN 视同财务）；登录瞬间 staffRole 还没回来
+  // （等 /users/me），此时按非财务渲染，真正的闸在后端，最坏只是少显示一个按钮。
+  const isFinance = role === 'ADMIN' || (role === 'STAFF' && staffRole === 'FINANCE');
+  // 跨单转移 = 动钱，限财务岗（口径同后端 requireFinanceAccess）。
+  const canTransferPayment = isFinance;
   const token = tokens?.accessToken ?? '';
   const navigate = useNavigate();
   // 跳收款对账台并带上本单订单号，那边据此预填核销表单的订单搜索框。
@@ -17245,12 +17251,35 @@ function ConfirmPaymentSection({
     }
   }
 
+  /**
+   * 这笔收款当前这个人能不能撤（与后端 reverseManualPayment 的闸一一对应，2026-09-10 口径）：
+   *   · 财务岗 → 任意一笔都能撤；
+   *   · 运营   → 只有「本人录入 + 财务尚未核实」的那一笔（手误录错自己纠正后重录）。
+   * 返回 null = 可撤；返回字符串 = 不可撤的原因，直接拿去当按钮 title。
+   * confirmedById 为空 = 网关到账或历史数据，运营一律不许撤，交回财务。
+   */
+  function reverseBlockedReason(p: OrderPayment): string | null {
+    if (isFinance) return null;
+    if (!p.confirmedById || p.confirmedById !== myUserId) {
+      return '只能撤销自己录入的收款，这笔请联系财务撤销';
+    }
+    if (p.verified) return '财务已核实，请联系财务撤销';
+    return null;
+  }
+
   async function reversePayment(p: OrderPayment): Promise<void> {
     if (!token || submitting || p.status === 'REFUNDED') return;
+    // 认款的判定先行：这条路不管谁点都只有「去对账台」一个答案，别被权限文案盖掉这个指引。
     if (p.reconciled === true) {
       window.alert(
         `这笔收款来自收款对账台的认款（流水 ${p.externalTxnId || p.receiptNo || '—'}）。请到「收款对账台」找到该笔进账，展开认领明细后撤销——那条路径会同时把钱退回挂账池。`,
       );
+      return;
+    }
+    // 按钮已按岗位 disabled，这里再兜一次（防误触 / 旧标签页），文案与后端 403 一致。
+    const blocked = reverseBlockedReason(p);
+    if (blocked) {
+      window.alert(blocked);
       return;
     }
     const reason = window.prompt(
@@ -17707,11 +17736,14 @@ function ConfirmPaymentSection({
                             转移
                           </button>
                         )}
+                        {/* 撤销：财务岗任意一笔可点；运营只有自己录入且财务未核实的那笔可点，
+                            其余置灰并在 title 里说清该找谁（藏起来运营会以为功能没了，反复来问）。 */}
                         <button
                           type="button"
                           className="btn-ghost-danger px-1.5 py-0.5 text-[11px] disabled:cursor-not-allowed disabled:opacity-50"
                           onClick={() => void reversePayment(p)}
-                          disabled={submitting}
+                          disabled={submitting || reverseBlockedReason(p) !== null}
+                          title={reverseBlockedReason(p) ?? undefined}
                         >
                           撤销
                         </button>

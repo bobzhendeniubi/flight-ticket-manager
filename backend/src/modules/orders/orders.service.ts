@@ -24794,15 +24794,22 @@ function redactItemMetadataForExternal(metadata: unknown): unknown {
 
 /**
  * 收款记录序列化：只透出安全字段 + 认款来源标注，绝不外泄 gatewayPayload 其余内容
- *（内部 confirmedBy / 原始网关载荷等一律不下发）。
+ *（原始网关载荷一律不下发）。
  *
  * 认款标注（reconciled）判定：
  *   1) 新数据：gatewayPayload.source === 'reconciliation' → 直接取 receiptNo / externalTxnId。
  *   2) 旧数据兼容：gatewayPayload.note 以「对账认领 」开头 → 视为认款，并从 note 提取 receiptNo。
  * 其余（手工确认 / 网关到账）reconciled=false，前端标为「手工确认」。
+ *
+ * confirmedById（录入人 userId）只给内部视角：收款区据此判断「这笔是不是我录的」，
+ * 才能按 2026-09-10 口径只在本人录入且财务未核实的那笔上显示撤销按钮。对外角色
+ *（AGENT / CUSTOMER，redactForExternal=true）一律不下发 —— 与 paymentsLockedBy 同档。
  */
 const RECONCILE_NOTE_PREFIX = '对账认领 ';
-function serializePaymentRecord(p: NonNullable<OrderLike['payments']>[number]): {
+function serializePaymentRecord(
+  p: NonNullable<OrderLike['payments']>[number],
+  opts: { redactForExternal: boolean },
+): {
   id: string;
   method: PaymentMethod;
   amount: string;
@@ -24815,6 +24822,7 @@ function serializePaymentRecord(p: NonNullable<OrderLike['payments']>[number]): 
   externalTxnId: string | null;
   verified: boolean;
   verifiedAt: Date | null;
+  confirmedById?: string | null;
   transferredOut?: boolean;
   transferredIn?: boolean;
   transferredToOrderNumber?: string | null;
@@ -24858,6 +24866,10 @@ function serializePaymentRecord(p: NonNullable<OrderLike['payments']>[number]): 
     // 到账双状态：财务核过流水才算 verified（认款/网关创建即核实；人工录入待财务核实）。
     verified: p.verifiedAt != null,
     verifiedAt: p.verifiedAt ?? null,
+    // 录入人（仅内部视角）：人工/批量认款把录入人 userId 埋在 gatewayPayload.confirmedBy，没有外键。
+    ...(opts.redactForExternal
+      ? {}
+      : { confirmedById: typeof payload?.confirmedBy === 'string' ? payload.confirmedBy : null }),
     ...(transferredOut
       ? { transferredOut: true, transferredToOrderNumber }
       : {}),
@@ -25006,11 +25018,13 @@ export function serializeOrder<T extends OrderLike>(
     paymentsLocked: redact ? undefined : (order.paymentsLocked ?? false),
     paymentsLockedAt: redact ? undefined : (order.paymentsLockedAt ?? null),
     paymentsLockedBy: redact ? undefined : (order.paymentsLockedBy ?? null),
-    // 收款记录：显式重映射，只透出安全字段 + 认款标注（reconciled/receiptNo/externalTxnId），
-    // 剥掉 gatewayPayload 原始载荷（confirmedBy 等内部字段绝不外泄）。未联查 payments 时不加此键。
+    // 收款记录：显式重映射，只透出安全字段 + 认款标注（reconciled/receiptNo/externalTxnId）
+    // + 内部视角的录入人（confirmedById），剥掉 gatewayPayload 原始载荷。未联查 payments 时不加此键。
     ...(Array.isArray(order.payments)
       ? {
-          payments: order.payments.map(serializePaymentRecord),
+          payments: order.payments.map((p) =>
+            serializePaymentRecord(p, { redactForExternal: redact }),
+          ),
           // 未经财务核实的已收金额（正额 SUCCEEDED 且 verifiedAt 为空之和）。
           // 出票/推进终态前的界面提示据此显示「这单 ¥xxx 到账未经财务核实」；仅内部可见。
           ...(redact

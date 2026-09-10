@@ -2320,6 +2320,9 @@ export interface OrderPayment {
   // 到账双状态：财务核过流水才 verified=true（人工录入的到账在核实前为 false，出票前提示用）。
   verified?: boolean;
   verifiedAt?: string | null;
+  // 录入人 userId（仅内部视角下发；网关到账与历史数据为 null）。收款区据此判断「这笔是不是我录的」——
+  // 运营只能撤销自己录入且财务尚未核实的那一笔（2026-09-10 口径）。
+  confirmedById?: string | null;
   transferredOut?: boolean;
   transferredIn?: boolean;
   transferredToOrderNumber?: string | null;

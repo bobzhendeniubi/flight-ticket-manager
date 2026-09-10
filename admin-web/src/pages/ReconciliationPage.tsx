@@ -432,6 +432,12 @@ function UnverifiedQueue({
   onAfterMutation: () => void;
 }) {
   const confirm = useConfirm();
+  const role = useAuth((s) => s.user?.role);
+  const staffRole = useAuth((s) => s.user?.staffRole);
+  // 核实 = 把钱定性为「已对上流水」，限财务岗（口径同后端 requireFinanceAccess，ADMIN 视同财务）。
+  // 非财务岗照样能看这张队列（知道哪些钱还没核实），但按钮置灰——以前不灰，点下去只会吃 403。
+  // 登录瞬间 staffRole 还没回来（等 /users/me），此时按非财务渲染，真正的闸在后端。
+  const isFinance = role === 'ADMIN' || (role === 'STAFF' && staffRole === 'FINANCE');
   const [busyId, setBusyId] = useState<string | null>(null);
   const [rowErr, setRowErr] = useState<string | null>(null);
   const ageDays = (iso: string) => Math.floor((Date.now() - new Date(iso).getTime()) / (24 * 3600 * 1000));
@@ -537,7 +543,13 @@ function UnverifiedQueue({
                   <td className="px-3 py-2 text-xs">{overdue ? <span className="font-semibold text-rose-700">{days} 天 · 超期</span> : `${days} 天`}</td>
                   <td className="px-3 py-2">{row.proofUrl ? <ProofImageViewer src={row.proofUrl} alt="水单截图" /> : <span className="text-xs text-ink-muted">无</span>}</td>
                   <td className="px-3 py-2 text-right">
-                    <button type="button" className="btn-secondary px-2 py-1 text-xs" disabled={busyId === row.key} onClick={() => void verify(row)}>
+                    <button
+                      type="button"
+                      className="btn-secondary px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-50"
+                      disabled={busyId === row.key || !isFinance}
+                      title={isFinance ? undefined : '核实到账限财务岗，请由财务核实'}
+                      onClick={() => void verify(row)}
+                    >
                       {busyId === row.key ? '核实中…' : '核实'}
                     </button>
                   </td>

@@ -4,6 +4,7 @@ import fastifyJwt from '@fastify/jwt';
 import { StaffRole, UserRole } from '@prisma/client';
 import { env } from '../config/env.js';
 import { AppError, ForbiddenError, UnauthorizedError } from '../lib/errors.js';
+import { hasFinanceAccess } from '../lib/finance-access.js';
 import { prisma } from '../db/prisma.js';
 
 export interface AccessTokenPayload {
@@ -167,9 +168,6 @@ export const authPlugin = fp(async function authPlugin(app: FastifyInstance) {
   app.decorate('requireFinanceAccess', async function requireFinanceAccess(req, _reply) {
     // 岗位逐请求从 User 表取回，改岗后下一个请求立即生效，不依赖 access token 内容。
     if (!req.user) throw new UnauthorizedError();
-    const allowed =
-      req.user.role === UserRole.ADMIN ||
-      (req.user.role === UserRole.STAFF && req.staffRole === StaffRole.FINANCE);
-    if (!allowed) throw new ForbiddenError('需要财务岗权限');
+    if (!hasFinanceAccess(req.user.role, req.staffRole)) throw new ForbiddenError('需要财务岗权限');
   });
 });
