@@ -1949,22 +1949,28 @@ function ProductCostEditors({ token }: { token: string }) {
       {/* 接送 */}
       <div className="card">
         <h2 className="text-sm font-semibold text-ink">地面服务车队结算价</h2>
+        <p className="mt-1 text-xs text-ink-muted">
+          可录人民币或越南盾（越南盾按所选汇率行、按订单去程出发日的汇率折人民币，缺汇率时成本记空）。
+        </p>
         <table className="mt-3 w-full text-sm">
           <thead className="text-xs uppercase tracking-wide text-ink-muted">
             <tr className="border-b border-slate-200">
               <th className="py-2 text-left font-normal">车型 / 线路</th>
               <th className="py-2 text-right font-normal">挂牌价(CNY)</th>
-              <th className="py-2 text-right font-normal">结算价(CNY)</th>
+              <th className="py-2 text-right font-normal">结算价（人民币或越南盾）</th>
               <th className="py-2 text-right font-normal"></th>
             </tr>
           </thead>
           <tbody>
             {transfers.map((t) => (
-              <CostRow
+              <TransferCostRow
                 key={t.id}
                 label={`${t.name} · ${t.originArea}→${t.destArea}`}
                 basePrice={t.basePrice}
-                fields={[{ key: 'costPriceCny', value: t.costPriceCny }]}
+                costPriceCny={t.costPriceCny}
+                costPriceVnd={t.costPriceVnd ?? null}
+                costFxName={t.costFxName ?? null}
+                vndRates={vndRates}
                 onSave={async (vals) => {
                   await api.patchTransferCost(token, t.id, vals);
                   load();
@@ -1978,15 +1984,81 @@ function ProductCostEditors({ token }: { token: string }) {
   );
 }
 
+/** 车队越南盾结算价默认选用的汇率名称（与汇率表的建议候选一致）。 */
+const TRANSFER_VND_FX_NAME = '车队越南盾';
+
+/** 车队一行：结算价（人民币或越南盾二选一）+ 保存；交互照抄酒店房型缺省价行（无日期区间）。 */
+function TransferCostRow({
+  label,
+  basePrice,
+  costPriceCny,
+  costPriceVnd,
+  costFxName,
+  vndRates,
+  onSave,
+}: {
+  label: string;
+  basePrice: string | null;
+  costPriceCny: string | null;
+  costPriceVnd: string | null;
+  costFxName: string | null;
+  vndRates: readonly FxRateDto[];
+  onSave: (vals: { costPriceCny: number | null; costPriceVnd: number | null; costFxName: string | null }) => Promise<void>;
+}) {
+  const [draft, setDraft] = useState<CostPriceValue>(() => costPriceValueOf({ costPriceCny, costPriceVnd, costFxName }));
+  const [saving, setSaving] = useState(false);
+  const [saveErr, setSaveErr] = useState<string | null>(null);
+  const [savedAt, setSavedAt] = useState<number | null>(null);
+
+  async function save(): Promise<void> {
+    setSaving(true);
+    setSaveErr(null);
+    try {
+      await onSave(costPricePatchOf(draft));
+      setSavedAt(Date.now());
+    } catch (e: unknown) {
+      setSaveErr(e instanceof ApiError ? e.message : '保存失败');
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  return (
+    <tr className="border-b border-slate-100 last:border-0">
+      <td className="py-2 text-slate-900">{label}</td>
+      <td className="py-2 text-right tabular-nums text-slate-500">
+        {basePrice ? `¥${Number(basePrice).toLocaleString('zh-CN')}` : '—'}
+      </td>
+      <td className="py-2 text-right">
+        <CostPriceFields
+          value={draft}
+          onChange={setDraft}
+          vndRates={vndRates}
+          disabled={saving}
+          unitLabel="份"
+          defaultFxName={TRANSFER_VND_FX_NAME}
+        />
+      </td>
+      <td className="py-2 text-right">
+        <button type="button" onClick={() => void save()} disabled={saving} className="btn-secondary px-2 py-1 text-xs">
+          {saving ? '…' : '保存'}
+        </button>
+        {saveErr && <div className="mt-0.5 text-xs text-rose-600">{saveErr}</div>}
+        {!saveErr && savedAt != null && <div className="mt-0.5 text-xs text-emerald-600">已保存</div>}
+      </td>
+    </tr>
+  );
+}
+
 interface CostField {
   key: string;
   value: string | null;
 }
 
-type HotelCostCurrency = 'CNY' | 'VND';
+type CostCurrency = 'CNY' | 'VND';
 
-interface HotelCostPriceValue {
-  currency: HotelCostCurrency;
+interface CostPriceValue {
+  currency: CostCurrency;
   cny: number | null;
   vnd: number | null;
   /** 越南盾按哪条 VND 汇率行折算；'' = 通用行 */
@@ -1994,18 +2066,18 @@ interface HotelCostPriceValue {
 }
 
 /** 房型 / 区间上的三列 → 编辑态初值（两边都有数以越南盾为准，与后端取价口径一致）。 */
-function hotelCostPriceValueOf(src: {
+function costPriceValueOf(src: {
   costPriceCny: number | string | null | undefined;
   costPriceVnd: number | string | null | undefined;
   costFxName: string | null | undefined;
-}): HotelCostPriceValue {
+}): CostPriceValue {
   const cny = src.costPriceCny == null || src.costPriceCny === '' ? null : Number(src.costPriceCny);
   const vnd = src.costPriceVnd == null || src.costPriceVnd === '' ? null : Number(src.costPriceVnd);
   return { currency: vnd != null ? 'VND' : 'CNY', cny, vnd, fxName: src.costFxName ?? '' };
 }
 
 /** 编辑态 → PATCH / 写入体（人民币或越南盾二选一；越南盾行才带汇率名称）。 */
-function hotelCostPricePatchOf(v: HotelCostPriceValue): {
+function costPricePatchOf(v: CostPriceValue): {
   costPriceCny: number | null;
   costPriceVnd: number | null;
   costFxName: string | null;
@@ -2043,7 +2115,7 @@ function VndCnyPreview({ vnd, fxName, vndRates }: { vnd: number | null; fxName: 
 }
 
 /** 只读展示：¥x 或 ₫x（按 <汇率名> 3740 ≈ ¥y）。 */
-function HotelCostPriceText({ value, vndRates }: { value: HotelCostPriceValue; vndRates: readonly FxRateDto[] }) {
+function CostPriceText({ value, vndRates }: { value: CostPriceValue; vndRates: readonly FxRateDto[] }) {
   if (value.currency === 'VND') {
     if (value.vnd == null) return <span className="text-ink-muted">—</span>;
     const fx = effectiveFxRate(vndRates, 'VND', value.fxName, todayStr());
@@ -2061,21 +2133,26 @@ function HotelCostPriceText({ value, vndRates }: { value: HotelCostPriceValue; v
 }
 
 /**
- * 净房价输入组：币种切换（人民币 / 越南盾）+ 金额 + （越南盾时）汇率名称下拉 + ≈ ¥ 预览。
- * 缺省价行与区间表单共用。
+ * 成本价输入组（酒店净房价 / 车队结算价共用）：币种切换（人民币 / 越南盾）+ 金额 +（越南盾时）汇率名称下拉 + ≈ ¥ 预览。
+ *   unitLabel     金额占位的计量单位（酒店「晚」、车队「份」）
+ *   defaultFxName 切到越南盾且尚未选汇率名时的默认候选（车队 =「车队越南盾」）；汇率表暂无也列出来可选
  */
-function HotelCostPriceFields({
+function CostPriceFields({
   value,
   onChange,
   vndRates,
   disabled,
   size = 'sm',
+  unitLabel = '晚',
+  defaultFxName,
 }: {
-  value: HotelCostPriceValue;
-  onChange: (next: HotelCostPriceValue) => void;
+  value: CostPriceValue;
+  onChange: (next: CostPriceValue) => void;
   vndRates: readonly FxRateDto[];
   disabled?: boolean;
   size?: 'sm' | 'xs';
+  unitLabel?: string;
+  defaultFxName?: string;
 }) {
   const inputCls =
     size === 'xs'
@@ -2085,14 +2162,22 @@ function HotelCostPriceFields({
     size === 'xs'
       ? 'rounded-lg border border-slate-200 px-1.5 py-0.5 text-xs focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20'
       : 'rounded-lg border border-slate-200 px-2 py-1 text-sm focus:border-brand focus:outline-none focus:ring-2 focus:ring-brand/20';
-  const fxOptions = vndFxNameOptions(vndRates);
+  const tableOptions = vndFxNameOptions(vndRates);
+  // 默认候选（如「车队越南盾」）汇率表里还没有也列出来，选了会在预览里提示去汇率表维护
+  const fxOptions =
+    defaultFxName && !tableOptions.includes(defaultFxName) ? [...tableOptions, defaultFxName] : tableOptions;
   return (
     <div className="flex flex-wrap items-center justify-end gap-1.5">
       <select
         className={selectCls}
         value={value.currency}
         disabled={disabled}
-        onChange={(e) => onChange({ ...value, currency: e.target.value as HotelCostCurrency })}
+        onChange={(e) => {
+          const currency = e.target.value as CostCurrency;
+          // 切到越南盾且还没选汇率名 → 带上默认候选；切回人民币不动汇率名（来回切不丢选择）
+          const fxName = currency === 'VND' && !value.fxName && defaultFxName ? defaultFxName : value.fxName;
+          onChange({ ...value, currency, fxName });
+        }}
         title="人民币或越南盾二选一"
       >
         <option value="CNY">人民币 ¥</option>
@@ -2105,7 +2190,7 @@ function HotelCostPriceFields({
           disabled={disabled}
           onChange={(n) => onChange({ ...value, cny: n })}
           className={`w-28 ${inputCls}`}
-          placeholder="CNY/晚"
+          placeholder={`CNY/${unitLabel}`}
         />
       ) : (
         <>
@@ -2115,7 +2200,7 @@ function HotelCostPriceFields({
             disabled={disabled}
             onChange={(n) => onChange({ ...value, vnd: n })}
             className={`w-32 ${inputCls}`}
-            placeholder="VND/晚"
+            placeholder={`VND/${unitLabel}`}
           />
           <select
             className={selectCls}
@@ -2167,8 +2252,8 @@ function HotelRoomTypeCostRows({
   onSaveDefault: (vals: { costPriceCny: number | null; costPriceVnd: number | null; costFxName: string | null }) => Promise<void>;
 }) {
   const [expanded, setExpanded] = useState(false);
-  const [draft, setDraft] = useState<HotelCostPriceValue>(() =>
-    hotelCostPriceValueOf({ costPriceCny, costPriceVnd, costFxName }),
+  const [draft, setDraft] = useState<CostPriceValue>(() =>
+    costPriceValueOf({ costPriceCny, costPriceVnd, costFxName }),
   );
   const [saving, setSaving] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
@@ -2178,7 +2263,7 @@ function HotelRoomTypeCostRows({
     setSaving(true);
     setSaveErr(null);
     try {
-      await onSaveDefault(hotelCostPricePatchOf(draft));
+      await onSaveDefault(costPricePatchOf(draft));
       setSavedAt(Date.now());
     } catch (e: unknown) {
       setSaveErr(e instanceof ApiError ? e.message : '保存失败');
@@ -2205,7 +2290,7 @@ function HotelRoomTypeCostRows({
           {basePrice ? `¥${Number(basePrice).toLocaleString('zh-CN')}` : '—'}
         </td>
         <td className="py-2 text-right">
-          <HotelCostPriceFields value={draft} onChange={setDraft} vndRates={vndRates} disabled={saving} />
+          <CostPriceFields value={draft} onChange={setDraft} vndRates={vndRates} disabled={saving} />
         </td>
         <td className="py-2 text-right">
           <button type="button" onClick={() => void save()} disabled={saving} className="btn-secondary px-2 py-1 text-xs">
@@ -2390,7 +2475,7 @@ function HotelRoomTypeCostPeriodRow({
       <td className="py-1 text-slate-600">{period.effectiveFrom}</td>
       <td className="py-1 text-slate-600">{period.effectiveTo}</td>
       <td className="py-1 text-right tabular-nums">
-        <HotelCostPriceText value={hotelCostPriceValueOf(period)} vndRates={vndRates} />
+        <CostPriceText value={costPriceValueOf(period)} vndRates={vndRates} />
       </td>
       <td className="py-1 text-ink-muted">{period.note ?? '—'}</td>
       <td className="py-1 text-right">
@@ -2419,8 +2504,8 @@ function HotelRoomTypeCostPeriodForm({
 }) {
   const [from, setFrom] = useState<string>(initial?.effectiveFrom ?? todayStr());
   const [to, setTo] = useState<string>(initial?.effectiveTo ?? todayStr());
-  const [price, setPrice] = useState<HotelCostPriceValue>(() =>
-    initial ? hotelCostPriceValueOf(initial) : { currency: 'CNY', cny: null, vnd: null, fxName: '' },
+  const [price, setPrice] = useState<CostPriceValue>(() =>
+    initial ? costPriceValueOf(initial) : { currency: 'CNY', cny: null, vnd: null, fxName: '' },
   );
   const [note, setNote] = useState<string>(initial?.note ?? '');
   const [saving, setSaving] = useState(false);
@@ -2442,7 +2527,7 @@ function HotelRoomTypeCostPeriodForm({
       await onSubmit({
         effectiveFrom: from,
         effectiveTo: to,
-        ...hotelCostPricePatchOf(price),
+        ...costPricePatchOf(price),
         note: note.trim() === '' ? null : note.trim(),
       });
     } catch (e: unknown) {
@@ -2468,7 +2553,7 @@ function HotelRoomTypeCostPeriodForm({
       <div className="text-xs text-ink-soft">
         净房价/晚
         <div className="mt-0.5">
-          <HotelCostPriceFields value={price} onChange={setPrice} vndRates={vndRates} disabled={saving} size="xs" />
+          <CostPriceFields value={price} onChange={setPrice} vndRates={vndRates} disabled={saving} size="xs" />
         </div>
       </div>
       <label className="text-xs text-ink-soft">

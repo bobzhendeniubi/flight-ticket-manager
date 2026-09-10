@@ -31,6 +31,12 @@ import {
   resolveScheduleCost,
 } from './finances.cost.service.js';
 import { hotelStayCostCny, loadHotelCostFxRatesIfNeeded, loadHotelCostPeriodsByRoomTypeIds } from './hotel-cost.service.js';
+import {
+  earliestDepartureLocalDate,
+  loadTransferCostFxRatesIfNeeded,
+  resolveTransferServiceDate,
+  resolveTransferUnitCost,
+} from './transfer-cost.service.js';
 import { netReceivedCny, sumCompletedRefundCny } from '../../lib/net-received.js';
 import { businessDateTime } from '../../lib/business-time.js';
 // 签证成本口径与财务汇总共用同一函数，两处逐字一致（任务实际成本优先 → 产品主数据回退）
@@ -200,7 +206,7 @@ type OrderForExport = Prisma.OrderGetPayload<{
         };
         hotelRoomType: { select: { name: true; costPriceCny: true; costPriceVnd: true; costFxName: true } };
         visa: { select: { costPriceCny: true } };
-        transfer: { select: { costPriceCny: true } };
+        transfer: { select: { costPriceCny: true; costPriceVnd: true; costFxName: true } };
         fulfillmentTasks: { select: { type: true; visaUnitCostCny: true } };
       };
     };
@@ -211,6 +217,7 @@ type ScheduleForResolution = NonNullable<OrderForExport['items'][number]['flight
 type PeriodsMap = Awaited<ReturnType<typeof loadPeriodsByFlightIds>>;
 type HotelPeriodsMap = Awaited<ReturnType<typeof loadHotelCostPeriodsByRoomTypeIds>>;
 type HotelFxRates = Awaited<ReturnType<typeof loadHotelCostFxRatesIfNeeded>>;
+type TransferFxRates = Awaited<ReturnType<typeof loadTransferCostFxRatesIfNeeded>>;
 
 /** 把一张订单展开成 N 行（每位乘客一行）*/
 function orderToRows(
@@ -218,6 +225,7 @@ function orderToRows(
   periodsMap: PeriodsMap,
   hotelPeriodsMap: HotelPeriodsMap = new Map(),
   hotelFxRates: HotelFxRates = undefined,
+  transferFxRates: TransferFxRates = undefined,
 ): FinanceRow[] {
   const paxCount = Math.max(1, order.passengers.length);
   // 需签乘客数（非自备签）—— 签证实际成本按此人均折算
@@ -331,7 +339,19 @@ function orderToRows(
       visaCostCnyOrder += cost;
     }
     if (it.kind === 'TRANSFER' && it.transfer) {
-      transferCostCnyOrder += dec(it.transfer.costPriceCny) * it.quantity;
+      // 产品现行结算价 × quantity（越南盾按服务日 = 去程出发日 → 下单日 生效的 VND 汇率行折人民币；
+      // 缺汇率 / 没录成本 → 不计，真缺数据不虚构）。
+      const unit = resolveTransferUnitCost({
+        ...it.transfer,
+        date: resolveTransferServiceDate({
+          outboundDepartureDate: earliestDepartureLocalDate(
+            order.items.flatMap((f) => (f.kind === 'FLIGHT' && f.flightSchedule ? [f.flightSchedule] : [])),
+          ),
+          orderCreatedAt: order.createdAt,
+        }),
+        fxRates: transferFxRates,
+      }).cny;
+      if (unit != null) transferCostCnyOrder += unit * it.quantity;
     }
   }
 
@@ -487,7 +507,7 @@ export async function buildFinanceExportWorkbook(
           },
           hotelRoomType: { select: { name: true, costPriceCny: true, costPriceVnd: true, costFxName: true } },
           visa: { select: { costPriceCny: true } },
-          transfer: { select: { costPriceCny: true } },
+          transfer: { select: { costPriceCny: true, costPriceVnd: true, costFxName: true } },
           // 签证任务结构化实际成本（人均 CNY）；每个 VISA item 对应一条 VISA_APPLICATION 任务
           fulfillmentTasks: { where: { type: 'VISA_APPLICATION' }, select: { type: true, visaUnitCostCny: true } },
         },
@@ -517,11 +537,16 @@ export async function buildFinanceExportWorkbook(
     { periodsMap: hotelPeriodsMap, bases: hotelItems.map((i) => i.hotelRoomType) },
     client,
   );
+  // 车队越南盾结算价的 VND 汇率行：有越南盾才拉，一次 load 进 Map 按服务日查（不 N+1）
+  const transferFxRates = await loadTransferCostFxRatesIfNeeded(
+    orders.flatMap((o) => o.items.filter((i) => i.kind === 'TRANSFER').map((i) => i.transfer)),
+    client,
+  );
 
   const rows: FinanceRow[] = [];
   for (const o of orders) {
     if (o.passengers.length === 0) continue;
-    rows.push(...orderToRows(o, periodsMap, hotelPeriodsMap, hotelFxRates));
+    rows.push(...orderToRows(o, periodsMap, hotelPeriodsMap, hotelFxRates, transferFxRates));
   }
 
   const wb = new ExcelJS.Workbook();

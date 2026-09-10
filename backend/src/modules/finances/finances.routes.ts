@@ -123,7 +123,16 @@ const hotelCostPeriodPatchSchema = z
     message: '区间净房价填人民币或越南盾其中一个',
   });
 const visaCostSchema = z.object({ costPriceCny: costNum });
-const transferCostSchema = z.object({ costPriceCny: costNum });
+// 车队结算价：人民币或越南盾二选一（同一次提交不能两个都给数）；costFxName = 越南盾按哪条 VND 汇率行折算（空 = 通用行）
+const transferCostSchema = z
+  .object({
+    costPriceCny: costNum,
+    costPriceVnd: z.number().nonnegative().max(9_999_999_999).nullable().optional(),
+    costFxName: fxNameStr.nullable().optional(),
+  })
+  .refine((b) => !(b.costPriceCny != null && b.costPriceVnd != null), {
+    message: '结算价填人民币或越南盾其中一个',
+  });
 
 /**
  * 缺省区间 = 最近 30 天，末端锚在**北京业务日**的今天（口径同 reports.routes.ts）。

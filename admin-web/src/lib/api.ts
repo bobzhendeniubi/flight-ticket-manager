@@ -2832,6 +2832,10 @@ export interface Transfer {
   photo: string | null;
   isActive: boolean;
   costPriceCny: string | null;
+  /** 结算价（越南盾/份；与 costPriceCny 二选一）；仅 ADMIN/STAFF 下发 */
+  costPriceVnd?: string | null;
+  /** 越南盾按哪条 VND 汇率行折算；null = 通用行 */
+  costFxName?: string | null;
   createdAt: string;
 }
 
@@ -6270,10 +6274,11 @@ export const api = {
     id: string,
     body: Partial<{ costPriceCny: number | null }>,
   ) => apiFetch<{ id: string }>(`/finances/cost/visa/${id}`, { method: 'PATCH', token, body }),
+  /** 车队结算价：人民币或越南盾二选一（给了一边后端清另一边）；costFxName = 越南盾按哪条 VND 汇率行折算 */
   patchTransferCost: (
     token: string,
     id: string,
-    body: Partial<{ costPriceCny: number | null }>,
+    body: Partial<{ costPriceCny: number | null; costPriceVnd: number | null; costFxName: string | null }>,
   ) => apiFetch<{ id: string }>(`/finances/cost/transfer/${id}`, { method: 'PATCH', token, body }),
 
   // ── 汇率表（命名清单：汇率名称 × 币种 × 生效日）──────────────────────────────

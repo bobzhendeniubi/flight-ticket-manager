@@ -22,6 +22,7 @@ vi.mock('./finances.service.js', () => ({
 const setFlightScheduleCostLockMock = vi.hoisted(() => vi.fn());
 const patchFlightScheduleCostMock = vi.hoisted(() => vi.fn());
 const patchHotelRoomTypeCostMock = vi.hoisted(() => vi.fn());
+const patchTransferCostMock = vi.hoisted(() => vi.fn());
 vi.mock('./finances.cost.service.js', () => ({
   createCostPeriod: vi.fn(),
   deleteCostPeriod: vi.fn(),
@@ -30,7 +31,7 @@ vi.mock('./finances.cost.service.js', () => ({
   patchFlightScheduleCost: patchFlightScheduleCostMock,
   patchHotelRoomTypeCost: patchHotelRoomTypeCostMock,
   patchVisaCost: vi.fn(),
-  patchTransferCost: vi.fn(),
+  patchTransferCost: patchTransferCostMock,
   setFlightScheduleCostLock: setFlightScheduleCostLockMock,
   updateCostPeriod: vi.fn(),
 }));
@@ -576,6 +577,37 @@ describe('汇率表路由（汇率名称 × 币种 × 生效日；/fx-rates 与 
       costPriceVnd: 1_500_000,
       costFxName: '酒店越南盾',
     });
+  });
+
+  it('PATCH /cost/transfer/:id：人民币与越南盾同时给数 → 400；越南盾 + 汇率名称透传；人民币照旧', async () => {
+    patchTransferCostMock.mockResolvedValue({ id: 't1' });
+    const auth = { authorization: `Bearer ${tokenFor('staff-1', UserRole.STAFF)}` };
+    const both = await app.inject({
+      method: 'PATCH',
+      url: '/finances/cost/transfer/t1',
+      headers: auth,
+      payload: { costPriceCny: 300, costPriceVnd: 1_500_000 },
+    });
+    expect(both.statusCode).toBe(400);
+    expect(patchTransferCostMock).not.toHaveBeenCalled();
+
+    const vnd = await app.inject({
+      method: 'PATCH',
+      url: '/finances/cost/transfer/t1',
+      headers: auth,
+      payload: { costPriceVnd: 1_500_000, costFxName: '车队越南盾' },
+    });
+    expect(vnd.statusCode).toBe(200);
+    expect(patchTransferCostMock).toHaveBeenCalledWith('t1', { costPriceVnd: 1_500_000, costFxName: '车队越南盾' });
+
+    const cny = await app.inject({
+      method: 'PATCH',
+      url: '/finances/cost/transfer/t1',
+      headers: auth,
+      payload: { costPriceCny: 300 },
+    });
+    expect(cny.statusCode).toBe(200);
+    expect(patchTransferCostMock).toHaveBeenLastCalledWith('t1', { costPriceCny: 300 });
   });
 
   it('AGENT 一律 403，不触碰服务', async () => {

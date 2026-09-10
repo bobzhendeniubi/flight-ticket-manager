@@ -174,12 +174,14 @@ interface CountedOrderItemFixture {
   flightSchedule: null;
   hotelRoomType: { costPriceCny: number | null; costPriceVnd?: number | null; costFxName?: string | null } | null;
   visa: { costPriceCny: number | null } | null;
-  transfer: null;
+  transfer: { costPriceCny: number | null; costPriceVnd?: number | null; costFxName?: string | null } | null;
   fulfillmentTasks?: { visaUnitCostCny: number | null }[];
 }
 
 interface CountedOrderFixture {
   id: string;
+  /** 车队越南盾回退实时折算的服务日回退层（无航段时按下单日）；老 fixture 不带 */
+  createdAt?: Date;
   total: number;
   passengers: { id: string; visaExempt?: boolean }[];
   costItems: { category: string; amountCny: number }[];
@@ -352,6 +354,66 @@ describe('getFinancesSummary — 无快照酒店行回退按日期区间取净�
     await getFinancesSummary(RANGE, cnyOnly);
     const fxFindMany = (cnyOnly as unknown as { fxRate: { findMany: ReturnType<typeof vi.fn> } }).fxRate.findMany;
     expect(fxFindMany).not.toHaveBeenCalled();
+  });
+
+  it('车队越南盾结算价：无快照老单按服务日（去程出发日 → 下单日）生效的 VND 汇率行折人民币 × quantity；缺汇率不计', async () => {
+    const transferItem = (overrides: Partial<CountedOrderItemFixture> = {}): CountedOrderItemFixture => ({
+      kind: 'TRANSFER',
+      amount: 600,
+      quantity: 2,
+      totalCostCny: null,
+      hotelCheckIn: null,
+      hotelCheckOut: null,
+      flightSchedule: null,
+      hotelRoomType: null,
+      visa: null,
+      transfer: { costPriceCny: null, costPriceVnd: 3_740_000, costFxName: '车队越南盾' },
+      ...overrides,
+    });
+    const fxRates: FxRateFixture[] = [
+      { id: 'fx-a', name: '车队越南盾', currency: 'VND', effectiveFrom: new Date('2026-01-01T00:00:00.000Z'), rate: 3740 },
+      { id: 'fx-b', name: '车队越南盾', currency: 'VND', effectiveFrom: new Date('2026-01-10T00:00:00.000Z'), rate: 3700 },
+    ];
+    // 无航段 → 服务日 = 下单日（北京业务日 01-05）→ 3740 行：3,740,000 ÷ 3740 = ¥1000 × 2 份
+    const byCreated = fakeClient({
+      countedOrders: [
+        { id: 'o1', createdAt: new Date('2026-01-05T00:00:00.000Z'), total: 600, passengers: [{ id: 'p1' }], costItems: [], items: [transferItem()] },
+      ],
+      fxRates,
+    });
+    expect((await getFinancesSummary(RANGE, byCreated)).costBreakdown.transfer).toBe(2000);
+    const fxFindMany = (byCreated as unknown as { fxRate: { findMany: ReturnType<typeof vi.fn> } }).fxRate.findMany;
+    expect(fxFindMany).toHaveBeenCalledTimes(1);
+
+    // 有快照的行优先快照；人民币价源照旧 × quantity
+    const mixed = fakeClient({
+      countedOrders: [
+        {
+          id: 'o2',
+          createdAt: new Date('2026-01-05T00:00:00.000Z'),
+          total: 900,
+          passengers: [{ id: 'p1' }],
+          costItems: [],
+          items: [transferItem({ totalCostCny: 100 }), transferItem({ transfer: { costPriceCny: 300 } })],
+        },
+      ],
+      fxRates,
+    });
+    expect((await getFinancesSummary(RANGE, mixed)).costBreakdown.transfer).toBe(100 + 300 * 2);
+
+    // 越南盾缺汇率 → 该行不计（不落 0）；全人民币车队不查汇率表
+    const missing = fakeClient({
+      countedOrders: [
+        { id: 'o3', createdAt: new Date('2026-01-05T00:00:00.000Z'), total: 600, passengers: [{ id: 'p1' }], costItems: [], items: [transferItem()] },
+      ],
+      fxRates: [],
+    });
+    expect((await getFinancesSummary(RANGE, missing)).costBreakdown.transfer).toBe(0);
+    const cnyOnly = fakeClient({
+      countedOrders: [{ id: 'o4', total: 600, passengers: [{ id: 'p1' }], costItems: [], items: [transferItem({ transfer: { costPriceCny: 300 } })] }],
+    });
+    await getFinancesSummary(RANGE, cnyOnly);
+    expect((cnyOnly as unknown as { fxRate: { findMany: ReturnType<typeof vi.fn> } }).fxRate.findMany).not.toHaveBeenCalled();
   });
 
   it('没设区间 → 缺省价 × 晚数（原口径）；有快照的行仍优先用快照', async () => {

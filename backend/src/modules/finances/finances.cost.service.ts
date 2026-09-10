@@ -939,11 +939,30 @@ export async function patchVisaCost(
   return { id };
 }
 
+/**
+ * 车队结算价：人民币或越南盾二选一（与酒店缺省净房价同一套规则）。
+ *   - 给了越南盾（非空）→ 切成越南盾行：costPriceCny 清空，costFxName 记用哪条 VND 汇率行（空 = 通用行）；
+ *   - 给了人民币（非空）→ 切成人民币行：costPriceVnd / costFxName 清空；
+ *   - 显式 null = 清空对应格；只传 costFxName = 只换汇率行。
+ * 两边同时给数由路由 zod 先拦；这里再兜一次。
+ */
 export async function patchTransferCost(
   id: string,
-  data: { costPriceCny?: number | null },
+  data: { costPriceCny?: number | null; costPriceVnd?: number | null; costFxName?: string | null },
   client: PrismaClient = defaultPrisma,
 ): Promise<{ id: string }> {
-  await client.transfer.update({ where: { id }, data });
+  if (data.costPriceCny != null && data.costPriceVnd != null) {
+    throw new BadRequestError('结算价填人民币或越南盾其中一个');
+  }
+  const update: Prisma.TransferUpdateInput = {};
+  if (data.costPriceCny !== undefined) update.costPriceCny = data.costPriceCny;
+  if (data.costPriceVnd !== undefined) update.costPriceVnd = data.costPriceVnd;
+  if (data.costFxName !== undefined) update.costFxName = data.costFxName?.trim() || null;
+  if (data.costPriceVnd != null) update.costPriceCny = null;
+  if (data.costPriceCny != null) {
+    update.costPriceVnd = null;
+    update.costFxName = null;
+  }
+  await client.transfer.update({ where: { id }, data: update });
   return { id };
 }

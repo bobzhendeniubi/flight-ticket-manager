@@ -27,6 +27,12 @@ import {
   resolveScheduleCost,
 } from './finances.cost.service.js';
 import { hotelStayCostCny, loadHotelCostFxRatesIfNeeded, loadHotelCostPeriodsByRoomTypeIds } from './hotel-cost.service.js';
+import {
+  earliestDepartureLocalDate,
+  loadTransferCostFxRatesIfNeeded,
+  resolveTransferServiceDate,
+  resolveTransferUnitCost,
+} from './transfer-cost.service.js';
 import { visaItemCostCny } from './finances.service.js';
 
 const COUNTED_STATUSES: OrderStatus[] = [
@@ -177,7 +183,9 @@ export async function buildFinanceExportByFlightWorkbook(
               include: {
                 hotelRoomType: { select: { costPriceCny: true, costPriceVnd: true, costFxName: true } },
                 visa: { select: { costPriceCny: true } },
-                transfer: { select: { costPriceCny: true } },
+                transfer: { select: { costPriceCny: true, costPriceVnd: true, costFxName: true } },
+                // 车队越南盾回退实时折算时的服务日 = 本单最早航段当地日（没有航段 → 下单日）
+                flightSchedule: { select: { departureTime: true, departureTz: true } },
                 fulfillmentTasks: {
                   where: { type: 'VISA_APPLICATION' },
                   select: { visaUnitCostCny: true },
@@ -200,6 +208,11 @@ export async function buildFinanceExportByFlightWorkbook(
   // 越南盾价源的 VND 汇率行：有越南盾才拉，一次 load 进 Map 按晚查
   const hotelFxRates = await loadHotelCostFxRatesIfNeeded(
     { periodsMap: hotelPeriodsMap, bases: hotelItems.map((i) => i.hotelRoomType) },
+    client,
+  );
+  // 车队越南盾结算价的 VND 汇率行：有越南盾才拉，一次 load 进 Map 按服务日查（不 N+1）
+  const transferFxRates = await loadTransferCostFxRatesIfNeeded(
+    orders.flatMap((o) => o.items.filter((i) => i.kind === 'TRANSFER').map((i) => i.transfer)),
     client,
   );
 
@@ -300,7 +313,19 @@ export async function buildFinanceExportByFlightWorkbook(
           });
           visaOrder += cost;
         } else if (it.kind === 'TRANSFER' && it.transfer) {
-          transferOrder += dec(it.transfer.costPriceCny) * it.quantity;
+          // 产品现行结算价 × quantity（越南盾按服务日 = 去程出发日 → 下单日 生效的 VND 汇率行折人民币；
+          // 缺汇率 / 没录成本 → 不计，真缺数据不虚构）。
+          const unit = resolveTransferUnitCost({
+            ...it.transfer,
+            date: resolveTransferServiceDate({
+              outboundDepartureDate: earliestDepartureLocalDate(
+                o.items.flatMap((f) => (f.kind === 'FLIGHT' && f.flightSchedule ? [f.flightSchedule] : [])),
+              ),
+              orderCreatedAt: o.createdAt,
+            }),
+            fxRates: transferFxRates,
+          }).cny;
+          if (unit != null) transferOrder += unit * it.quantity;
         }
       }
       hotelCost += hotelOrder / legCount;

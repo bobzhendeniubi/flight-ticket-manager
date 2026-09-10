@@ -121,6 +121,13 @@ import {
   resolveHotelStayUnitCostCny,
   type HotelCostSourceSnapshot,
 } from '../finances/hotel-cost.service.js';
+import {
+  earliestDepartureLocalDate,
+  loadTransferCostFxRatesIfNeeded,
+  resolveTransferServiceDate,
+  resolveTransferUnitCost,
+  type TransferServiceDate,
+} from '../finances/transfer-cost.service.js';
 import { getSettlementRate } from '../settlement-rates/settlement-rates.service.js';
 import { getFlightSettlementRate } from '../settlement-rates/flight-settlement-rates.service.js';
 import {
@@ -3824,6 +3831,30 @@ export class OrderService {
     // 纯地面套餐（无同 bundle 航段）→ map 里没有该 bundleId，保持原 goDate 现状不变。
     const authoritativeBundleGoDates = await this.resolveAuthoritativeBundleGoDates(items);
 
+    // 车队越南盾结算价按「服务日」生效的汇率折人民币。OrderItem 没有接送日期字段 → 用订单去程出发日
+    // （本单最早航段的当地日）→ 没有航段用今天（订单尚未落库，「下单日」= 今天）。
+    // 只在遇到越南盾价源时才查一次班次，人民币车队行零额外查询。
+    let transferServiceDateMemo: TransferServiceDate | null = null;
+    const resolveTransferServiceDateOnce = async (): Promise<TransferServiceDate> => {
+      if (transferServiceDateMemo) return transferServiceDateMemo;
+      const scheduleIds = [
+        ...new Set(
+          items.flatMap((i) => (i.kind === 'FLIGHT' && i.flightScheduleId ? [i.flightScheduleId] : [])),
+        ),
+      ];
+      const schedules =
+        scheduleIds.length === 0
+          ? []
+          : await prisma.flightSchedule.findMany({
+              where: { id: { in: scheduleIds } },
+              select: { departureTime: true, departureTz: true },
+            });
+      transferServiceDateMemo = resolveTransferServiceDate({
+        outboundDepartureDate: earliestDepartureLocalDate(schedules),
+      });
+      return transferServiceDateMemo;
+    };
+
     // 本单所有 BUNDLE 行选「升舱商务」的总人数（多份套餐叠加），去程 / 回程各自一份 ——
     // 同一批客人可以只升去程、或去回程升的人数不同。循环结束后按航段落到对应 FLIGHT 行：
     // 第一条经济舱航段 = 去程，其余（回程）取回程人数；每段各占用自己那一份真实商务舱座位。
@@ -4017,15 +4048,27 @@ export class OrderService {
       } else if (item.kind === 'TRANSFER') {
         let unitPrice = item.unitPrice;
         let transferUnitCost: number | undefined;
+        // 成本价源（币种 / 原币单价 / 汇率 / 按哪天折）→ metadata.costSource；没录成本 → 不写
+        let transferCostSource: Record<string, unknown> | null = null;
         if (item.transferId) {
           const t = await prisma.transfer.findUnique({
             where: { id: item.transferId },
-            select: { basePrice: true, costPriceCny: true, isActive: true },
+            select: { basePrice: true, costPriceCny: true, costPriceVnd: true, costFxName: true, isActive: true },
           });
           if (!t) throw new NotFoundError(`接送产品 ${item.transferId} 不存在`);
           if (!t.isActive) throw new BadRequestError('接送产品已下架');
           unitPrice = Number(t.basePrice);
-          transferUnitCost = t.costPriceCny != null ? Number(t.costPriceCny) : undefined;
+          // 成本快照：人民币直取；越南盾按服务日生效的 VND 汇率行折（缺汇率 → undefined → 毛利「未知」，不落 0）。
+          // 越南盾价源才拉汇率行 / 查班次日期，人民币行与改前零差别。
+          const transferCost = resolveTransferUnitCost({
+            costPriceCny: t.costPriceCny,
+            costPriceVnd: t.costPriceVnd,
+            costFxName: t.costFxName,
+            date: t.costPriceVnd != null ? await resolveTransferServiceDateOnce() : undefined,
+            fxRates: await loadTransferCostFxRatesIfNeeded([t], prisma),
+          });
+          transferUnitCost = transferCost.cny ?? undefined;
+          transferCostSource = transferCost.source;
           assertAmountWithinTolerance('接送', item.unitPrice, unitPrice, item.quantity);
         } else if (!allowClientPricedGround) {
           throw new BadRequestError('接送行必须选择系统内的接送产品，不能自定义价格');
@@ -4040,7 +4083,10 @@ export class OrderService {
           unitCostCny: transferUnitCost,
           totalCostCny:
             transferUnitCost != null ? Math.round(transferUnitCost * item.quantity) : undefined,
-          metadata: item.metadata,
+          // 价源并进 metadata.costSource（Json 合并写，其余 key 原样保留）；没有价源 → 原样
+          metadata: transferCostSource
+            ? { ...(item.metadata ?? {}), costSource: transferCostSource }
+            : item.metadata,
         });
       } else if (item.kind === 'VISA') {
         let unitPrice = item.unitPrice;

@@ -1286,6 +1286,11 @@ model Transfer {
   basePrice    Decimal  @db.Decimal(10, 2)
   // 司机/车队结算价（CNY）— NULL 时按 basePrice × 0.65 估算
   costPriceCny Decimal? @db.Decimal(10, 2)
+  // 车队结算价（越南盾/份）：车队按越南盾结算时填这格，系统按服务日生效的 VND 汇率行折人民币。
+  // 与 costPriceCny 同一行只能填一个（zod + 服务层校验）；两者都在时以越南盾为准（与酒店净房价同口径）。
+  costPriceVnd Decimal? @db.Decimal(14, 2)
+  // 用哪条 VND 汇率行折算（FxRate.name）；NULL = 该币种通用行
+  costFxName   String?
   features     String[] // e.g., ["中文司机", "免费等候 60 分钟"]
   duration     String? // "约 15 分钟"
   soldCount    Int      @default(0) // 已售份数（展示用，seed 填充）

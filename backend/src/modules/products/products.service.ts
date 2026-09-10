@@ -884,11 +884,18 @@ export function serializeTransfer(
   rating: ProductRatingAggregate = ZERO_RATING,
   includeCost = true,
 ) {
-  const { costPriceCny, ...rest } = t;
+  // 成本三列（人民币 / 越南盾 / 越南盾汇率名）都是内部结算数据，一律跟 includeCost 走
+  const { costPriceCny, costPriceVnd, costFxName, ...rest } = t;
   return {
     ...rest,
     basePrice: t.basePrice.toString(),
-    ...(includeCost ? { costPriceCny: costPriceCny?.toString() ?? null } : {}),
+    ...(includeCost
+      ? {
+          costPriceCny: costPriceCny?.toString() ?? null,
+          costPriceVnd: costPriceVnd?.toString() ?? null,
+          costFxName: costFxName ?? null,
+        }
+      : {}),
     rating,
     reviewCount: rating.count,
     soldCount: t.soldCount,
