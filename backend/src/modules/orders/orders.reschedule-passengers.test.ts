@@ -36,8 +36,10 @@ const service = new OrderService();
 const admin = { userId: 'admin-1', role: 'ADMIN' as const };
 const TOKEN = '00000000-0000-4000-8000-00000000abcd';
 
-const OUT_DEPART = new Date('2026-09-10T02:00:00.000Z');
-const RET_DEPART = new Date('2026-09-15T02:00:00.000Z');
+// 相对当前时间取未来日期：写死日期会在那天过后被「已起飞不许改期」前置闸拦下，整组用例自然过期。
+const DAY_MS = 24 * 60 * 60 * 1000;
+const OUT_DEPART = new Date(Date.now() + 30 * DAY_MS);
+const RET_DEPART = new Date(OUT_DEPART.getTime() + 5 * DAY_MS);
 /** 已经飞走的去程（用于「已起飞不许改期」的前置闸用例）。 */
 const FLOWN_DEPART = new Date('2020-01-01T02:00:00.000Z');
 
@@ -102,7 +104,7 @@ const rescheduleOutcome = (orderNumber = 'FTM20260901-TGT') => ({
     fromDeparture: OUT_DEPART,
     toScheduleId: 'sch-new',
     toCabin: 'ECONOMY' as const,
-    toDeparture: new Date('2026-09-12T02:00:00.000Z'),
+    toDeparture: new Date(OUT_DEPART.getTime() + 2 * DAY_MS),
     feeCny: 300,
     statusChanged: false,
     hotelDateSync: [],
