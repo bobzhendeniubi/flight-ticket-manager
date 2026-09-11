@@ -45,7 +45,8 @@ function installment(overrides: Record<string, unknown> = {}) {
     amountRule: HoldAmountRule.PER_PERSON_FIXED,
     perPersonCny: 100,
     amountCny: 100,
-    dueDate: new Date('2026-09-10T00:00:00Z'),
+    // 相对当前时间：写死日期过期后期数会被判 OVERDUE，整组用例自然失效
+    dueDate: new Date(Date.now() + 30 * 24 * 60 * 60 * 1000),
     status: HoldInstallmentStatus.PENDING,
     paidAt: null,
     allocations: [],
