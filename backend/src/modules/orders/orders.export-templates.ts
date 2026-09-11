@@ -160,12 +160,19 @@ const FULFILLMENT_STATUS_LABEL: Record<string, string> = {
   FAILED: '失败',
 };
 
-/** 订单级签证状态（录单时选择，与履约任务状态区分）。全岗总表导出（orders.export-master.ts）共用。*/
+/**
+ * 订单级签证状态（录单时选择，与履约任务状态区分）。全岗总表导出（orders.export-master.ts）共用。
+ *
+ * 运营口径（0910 反馈）：导出表不区分「自备签」与「不需要」——NOT_NEEDED（订单头选的不需要）
+ * 与 HAS_VISA（订单头选的已签证，即全员自备签）在导出表里统一写「不需要签证」，与乘客级
+ * VISA_EXEMPT_LABEL（逐人手勾的自备签）同一份文案。后台页面（签证台/订单列表/订单详情，
+ * 各自另有一份独立映射）不受影响，仍按原文案区分显示——只有导出表把三档合并。
+ */
 export const VISA_REQUIREMENT_LABEL: Record<string, string> = {
-  NOT_NEEDED: '不需要',
+  NOT_NEEDED: '不需要签证',
   NEEDED: '需要',
   E_VISA: '电子签',
-  HAS_VISA: '已签证',
+  HAS_VISA: '不需要签证',
 };
 
 /**
@@ -179,8 +186,12 @@ const VISA_SUBMISSION_LABEL: Record<string, string> = {
   CONFIRMED: '已送签',
 };
 
-/** 乘客级「自备签」的导出文案：客人自行办妥签证，不进送签名单。 */
-const VISA_EXEMPT_LABEL = '自备签';
+/**
+ * 乘客级「自备签」的导出文案：客人自行办妥签证，不进送签名单。
+ * 运营口径（0910 反馈）：导出表不区分自备签与不需要，与 VISA_REQUIREMENT_LABEL 的
+ * NOT_NEEDED / HAS_VISA 合并成同一份文案——见该常量旁的说明。
+ */
+const VISA_EXEMPT_LABEL = '不需要签证';
 
 /**
  * 订单级签证状态文案（现状口径）：录单时选的订单级 visaStatus 优先，
@@ -205,6 +216,12 @@ export function orderVisaStatusLabel(
  *
  * 为什么不能整单一个值（运营反馈）：一张单里，自备签的客人导出来跟着整单走、
  * 订单头一表态就全员一个词，复查的同事没法从表上分辨谁办到哪一步。
+ *
+ * 0910 运营口径更新：下面 2/3/4 档里提到的「不需要」「已签证」「自备签」三种文案，
+ * 现在在导出表里统一渲染成同一个词「不需要签证」（见 VISA_REQUIREMENT_LABEL /
+ * VISA_EXEMPT_LABEL）。**下面的档位判定逻辑本身不变**——仍要分清是订单头结论、
+ * 混合单逐人手勾、还是联动批量置，因为这个判定结果还驱动签证金额/签证公司/签证
+ * 备注三列（自备签 = 0 / 留空），只是「签证状态」这一列三档撞在一起看不出差异了。
  *
  * 判定顺序（谁更能代表这位乘客谁在前）：
  *   1. 该乘客送签进度已推进（IN_PROGRESS 材料准备 / CONFIRMED 已送签）→ 用签证台同一份文案。

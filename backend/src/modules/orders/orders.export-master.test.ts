@@ -1282,7 +1282,8 @@ describe('全岗总表 — 签证状态按乘客取值', () => {
   it('需要签证的三人单：自备签 / 已送签 / 待处理 → 三行三个不同值', () => {
     const order = fixtureMixedVisa();
     const rows = orderToMasterRows(order);
-    expect(rows.map((r) => r.visaStatus)).toEqual(['自备签', '已送签', '需要']);
+    // 0910 运营口径：自备签在导出表统一写「不需要签证」（不再是「自备签」）。
+    expect(rows.map((r) => r.visaStatus)).toEqual(['不需要签证', '已送签', '需要']);
   });
 
   it('送签进度「材料准备」用签证台同一份文案', () => {
@@ -1295,29 +1296,31 @@ describe('全岗总表 — 签证状态按乘客取值', () => {
   // 订单级「不需要 / 已签证」压过 visaExempt：录单弹窗选这两档时会把该单全员批量置
   // visaExempt=true（"自动置上"的标记不落库），先看 visaExempt 会把每一张「不需要签证」
   // 的单整单导成「自备签」—— 业务结论被换成了另一件事。只有逐人推进的送签进度压得过订单头。
-  it('订单级「不需要签证」：exempt 的人跟订单头写「不需要」，有送签进度的仍按进度', () => {
+  it('订单级「不需要签证」：exempt 的人跟订单头写「不需要签证」，有送签进度的仍按进度', () => {
     const order = fixtureMixedVisa();
     (order as unknown as { visaStatus: string }).visaStatus = 'NOT_NEEDED';
+    // 0910 运营口径：NOT_NEEDED 的导出文案由「不需要」改成「不需要签证」。
     expect(orderToMasterRows(order).map((r) => r.visaStatus)).toEqual([
-      '不需要',
+      '不需要签证',
       '已送签',
-      '不需要',
+      '不需要签证',
     ]);
   });
 
-  // 「已签证」与「不需要」不同：混合单（有人 exempt、有人不是）里的 exempt 只能是逐人手勾的
-  //（联动是全员一起置），照实写「自备签」；没进度的非 exempt 乘客才跟订单头写「已签证」。
-  it('订单级「已签证」的混合单：exempt 的人写「自备签」，已送签的写「已送签」，其余「已签证」', () => {
+  // 0910 运营口径更新：混合单里 exempt（自备签）与订单头 HAS_VISA 的导出文案已合并成同一个
+  // 词「不需要签证」，这条用例原本用来验证两者"照实区分"，合并后失去区分意义——保留用例
+  // 是为了锁住"两条判定路径都落到同一份新文案"，不是继续验证区分本身。
+  it('订单级「已签证」的混合单：exempt 与非 exempt 现在导出同一个词「不需要签证」，已送签的仍按进度', () => {
     const order = fixtureMixedVisa();
     (order as unknown as { visaStatus: string }).visaStatus = 'HAS_VISA';
     expect(orderToMasterRows(order).map((r) => r.visaStatus)).toEqual([
-      '自备签',
+      '不需要签证',
       '已送签',
-      '已签证',
+      '不需要签证',
     ]);
   });
 
-  it('「已签证」+ 全员联动置 exempt 且无送签进度 → 全员「已签证」，不是全员「自备签」', () => {
+  it('「已签证」+ 全员联动置 exempt 且无送签进度 → 全员「不需要签证」', () => {
     const order = fixtureMixedVisa();
     const o = order as unknown as {
       visaStatus: string;
@@ -1330,13 +1333,13 @@ describe('全岗总表 — 签证状态按乘客取值', () => {
       visaSubmissionStatus: 'PENDING',
     }));
     expect(orderToMasterRows(order).map((r) => r.visaStatus)).toEqual([
-      '已签证',
-      '已签证',
-      '已签证',
+      '不需要签证',
+      '不需要签证',
+      '不需要签证',
     ]);
   });
 
-  it('「不需要签证」+ 全员联动置 exempt 且无送签进度 → 全员「不需要」，不是全员「自备签」', () => {
+  it('「不需要签证」+ 全员联动置 exempt 且无送签进度 → 全员「不需要签证」', () => {
     const order = fixtureMixedVisa();
     const o = order as unknown as {
       visaStatus: string;
@@ -1349,16 +1352,17 @@ describe('全岗总表 — 签证状态按乘客取值', () => {
       visaSubmissionStatus: 'PENDING',
     }));
     expect(orderToMasterRows(order).map((r) => r.visaStatus)).toEqual([
-      '不需要',
-      '不需要',
-      '不需要',
+      '不需要签证',
+      '不需要签证',
+      '不需要签证',
     ]);
   });
 
   // 运营反馈的四人单：两人自备签、两人由我方送签且已送签 → 非自备签全员已送签，系统自动把
-  // 订单头办结成「已签证」（visa-completion.ts）。改前自备签的两人跟订单头也写「已签证」，
-  // 看不出谁自己办、谁我们办；现在照实写「自备签」，与订单列表子行的徽章一致。
-  it('订单头「已签证」的四人单：两人自备签 + 两人已送签，两组分得开', () => {
+  // 订单头办结成「已签证」（visa-completion.ts）。0910 起自备签/已签证导出文案合并为
+  // 「不需要签证」；已送签的两人仍按各自进度显示，判定路径本身不变（仍影响签证金额/公司/
+  // 备注三列），只是「签证状态」这一列文案撞在一起了。
+  it('订单头「已签证」的四人单：两人自备签 + 两人已送签，导出统一「不需要签证」/「已送签」', () => {
     const order = fixtureMixedVisa();
     const o = order as unknown as {
       visaStatus: string;
@@ -1373,8 +1377,8 @@ describe('全岗总表 — 签证状态按乘客取值', () => {
       { ...submitted, id: 'p4', documentNumber: 'E33334444' },
     ];
     expect(orderToMasterRows(order).map((r) => r.visaStatus)).toEqual([
-      '自备签',
-      '自备签',
+      '不需要签证',
+      '不需要签证',
       '已送签',
       '已送签',
     ]);
@@ -1791,9 +1795,10 @@ describe('全岗总表 — 结算价格按乘客取值', () => {
     // 基准每人 = (3792 + 960) / 4 = 1188 → 自备签两人 828、送签两人 1068，合计 3792
     expect(rows.map((r) => r.settlePrice)).toEqual([828, 828, 1068, 1068]);
     expect(rows.reduce((s, r) => s + r.settlePrice, 0)).toBe(3792);
-    // 订单头是「已签证」（非自备签全员已送签后系统自动办结）→ 混合单：前两人照实写「自备签」，
-    // 后两人按各自送签进度写「已送签」；金额仍逐人可解释（自备签那两位少收 360）。
-    expect(rows.map((r) => r.visaStatus)).toEqual(['自备签', '自备签', '已送签', '已送签']);
+    // 订单头是「已签证」（非自备签全员已送签后系统自动办结）→ 混合单：0910 起前两人的
+    // 「自备签」导出文案与「不需要签证」合并；后两人按各自送签进度写「已送签」；
+    // 金额仍逐人可解释（自备签那两位少收 360）。
+    expect(rows.map((r) => r.visaStatus)).toEqual(['不需要签证', '不需要签证', '已送签', '已送签']);
   });
 
   it('售后费（adjustmentCny）计入应收：与详情页每人结算价、尾款列同源', () => {

@@ -1200,7 +1200,8 @@ describe('《全岗可用》full 模版 — 签证状态按乘客取值', () => 
   it('需要签证的三人单：自备签 / 已送签 / 待处理 → 三行三个不同值', () => {
     const order = fixtureMixedVisa();
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows.map((r) => r.visaStatus)).toEqual(['自备签', '已送签', '需要']);
+    // 0910 运营口径：自备签在导出表统一写「不需要签证」（不再是「自备签」）。
+    expect(rows.map((r) => r.visaStatus)).toEqual(['不需要签证', '已送签', '需要']);
   });
 
   it('送签进度「材料准备」用签证台同一份文案', () => {
@@ -1213,23 +1214,25 @@ describe('《全岗可用》full 模版 — 签证状态按乘客取值', () => 
 
   // 订单级「不需要 / 已签证」压过 visaExempt（录单弹窗选这两档时会把全员批量置自备签，
   // 那个"自动置上"的标记不落库）；只有逐人推进的送签进度才压得过订单头。
-  it('订单级「不需要签证」：exempt 的人跟订单头写「不需要」，有送签进度的仍按进度', () => {
+  it('订单级「不需要签证」：exempt 的人跟订单头写「不需要签证」，有送签进度的仍按进度', () => {
     const order = fixtureMixedVisa();
     (order as unknown as { visaStatus: string }).visaStatus = 'NOT_NEEDED';
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows.map((r) => r.visaStatus)).toEqual(['不需要', '已送签', '不需要']);
+    // 0910 运营口径：NOT_NEEDED 的导出文案由「不需要」改成「不需要签证」。
+    expect(rows.map((r) => r.visaStatus)).toEqual(['不需要签证', '已送签', '不需要签证']);
   });
 
-  // 「已签证」与「不需要」不同：混合单里的 exempt 只能是逐人手勾的（联动是全员一起置），
-  // 照实写「自备签」；没进度的非 exempt 乘客才跟订单头写「已签证」。
-  it('订单级「已签证」的混合单：exempt 的人写「自备签」，已送签的写「已送签」，其余「已签证」', () => {
+  // 0910 运营口径更新：混合单里 exempt（自备签）与订单头 HAS_VISA 的导出文案已合并成同一个
+  // 词「不需要签证」，这条用例原本用来验证两者"照实区分"，合并后失去区分意义——保留用例
+  // 是为了锁住"两条判定路径都落到同一份新文案"，不是继续验证区分本身。
+  it('订单级「已签证」的混合单：exempt 与非 exempt 现在导出同一个词「不需要签证」，已送签的仍按进度', () => {
     const order = fixtureMixedVisa();
     (order as unknown as { visaStatus: string }).visaStatus = 'HAS_VISA';
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows.map((r) => r.visaStatus)).toEqual(['自备签', '已送签', '已签证']);
+    expect(rows.map((r) => r.visaStatus)).toEqual(['不需要签证', '已送签', '不需要签证']);
   });
 
-  it('「已签证」+ 全员联动置 exempt 且无送签进度 → 全员「已签证」，不是全员「自备签」', () => {
+  it('「已签证」+ 全员联动置 exempt 且无送签进度 → 全员「不需要签证」', () => {
     const order = fixtureMixedVisa();
     const o = order as unknown as {
       visaStatus: string;
@@ -1238,11 +1241,11 @@ describe('《全岗可用》full 模版 — 签证状态按乘客取值', () => 
     o.visaStatus = 'HAS_VISA';
     o.passengers = o.passengers.map((p) => ({ ...p, visaExempt: true, visaSubmissionStatus: 'PENDING' }));
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows.map((r) => r.visaStatus)).toEqual(['已签证', '已签证', '已签证']);
+    expect(rows.map((r) => r.visaStatus)).toEqual(['不需要签证', '不需要签证', '不需要签证']);
   });
 
   // ── 录单联动把全员置 exempt 之后，「不需要」这个结论不能被吃掉 ────────────────
-  it('「不需要签证」+ 全员联动置 exempt 且无送签进度 → 全员「不需要」，不是全员「自备签」', () => {
+  it('「不需要签证」+ 全员联动置 exempt 且无送签进度 → 全员「不需要签证」', () => {
     const order = fixtureMixedVisa();
     const o = order as unknown as {
       visaStatus: string;
@@ -1255,7 +1258,7 @@ describe('《全岗可用》full 模版 — 签证状态按乘客取值', () => 
       visaSubmissionStatus: 'PENDING',
     }));
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows.map((r) => r.visaStatus)).toEqual(['不需要', '不需要', '不需要']);
+    expect(rows.map((r) => r.visaStatus)).toEqual(['不需要签证', '不需要签证', '不需要签证']);
   });
 
   it('「不需要签证」+ 某人已送签 → 该人「已送签」（逐人事实压过订单头）', () => {
@@ -1268,12 +1271,13 @@ describe('《全岗可用》full 模版 — 签证状态按乘客取值', () => 
     o.passengers = o.passengers.map((p) => ({ ...p, visaExempt: true, visaSubmissionStatus: 'PENDING' }));
     o.passengers[1] = { ...o.passengers[1], visaSubmissionStatus: 'CONFIRMED' };
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows.map((r) => r.visaStatus)).toEqual(['不需要', '已送签', '不需要']);
+    expect(rows.map((r) => r.visaStatus)).toEqual(['不需要签证', '已送签', '不需要签证']);
   });
 
   // 运营反馈的四人单：两人自备签、两人我方送签且已送签 → 系统自动办结订单头为「已签证」。
-  // 自备签的两人照实写「自备签」（改前跟订单头写「已签证」，与订单列表子行徽章对不上）。
-  it('「已签证」四人单（两人 exempt 无进度 + 两人已送签）→ 自备签/自备签/已送签/已送签', () => {
+  // 0910 起自备签/已签证导出文案合并为「不需要签证」；已送签的两人仍按各自进度显示，
+  // 判定路径本身不变（见 passengerVisaStatusCell 注释），只是文案撞在一起了。
+  it('「已签证」四人单（两人 exempt 无进度 + 两人已送签）→ 不需要签证/不需要签证/已送签/已送签', () => {
     const order = fixtureMixedVisa();
     const o = order as unknown as {
       visaStatus: string;
@@ -1288,7 +1292,7 @@ describe('《全岗可用》full 模版 — 签证状态按乘客取值', () => 
       { ...base, id: 'q4', visaExempt: false, visaSubmissionStatus: 'CONFIRMED' },
     ];
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows.map((r) => r.visaStatus)).toEqual(['自备签', '自备签', '已送签', '已送签']);
+    expect(rows.map((r) => r.visaStatus)).toEqual(['不需要签证', '不需要签证', '已送签', '已送签']);
   });
 
   // ── 签证金额 / 签证公司 也按乘客（同一批反馈）────────────────────────────────
@@ -1299,7 +1303,7 @@ describe('《全岗可用》full 模版 — 签证状态按乘客取值', () => 
     expect(rows.map((r) => r.visaSupplier)).toEqual(['', '越南领区签证代办', '越南领区签证代办']);
   });
 
-  it('「需要签证」+ 某人 exempt → 该人「自备签」，其余「需要」（逐人手勾的自备签照旧）', () => {
+  it('「需要签证」+ 某人 exempt → 该人「不需要签证」，其余「需要」（逐人手勾的自备签照旧，只是文案改名）', () => {
     const order = fixtureMixedVisa();
     const o = order as unknown as {
       visaStatus: string;
@@ -1313,7 +1317,7 @@ describe('《全岗可用》full 模版 — 签证状态按乘客取值', () => 
     }));
     o.passengers[1] = { ...o.passengers[1], visaExempt: true };
     const rows = orderToFullRows(order, buildOrderContext(order));
-    expect(rows.map((r) => r.visaStatus)).toEqual(['需要', '自备签', '需要']);
+    expect(rows.map((r) => r.visaStatus)).toEqual(['需要', '不需要签证', '需要']);
   });
 
   it('老数据（乘客无送签字段）→ 整列沿用订单级/履约任务文案，与改动前一致', () => {
