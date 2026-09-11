@@ -599,6 +599,38 @@ function maskDocumentNumber(raw: string | null | undefined): string | null {
 /** 性别中文（展开面板用；列表主行仍用 M/F 短标，见 genderMark）。 */
 const GENDER_TEXT: Record<string, string> = { M: '男', F: '女', X: '其他' };
 
+/** 出行人类型小标（内容列护照信息用）：只标婴儿/儿童，成人不占位。 */
+const PASSENGER_TYPE_MARK: Record<string, string> = { CHILD: '童', INFANT: '婴' };
+
+/**
+ * 内容列的护照信息摘要（运营原话：内容页只要看护照信息——姓名/性别/生日/护照号/有效期，
+ * 航班日期、套餐这些列表后面已经有列了，不用在内容里重复）。
+ * 证件号一律脱敏（maskDocumentNumber，看全号进详情）；护照号/有效期缺就显示「未填」；
+ * 有效期临期（<180 天，与详情页 daysUntil 同一口径）用现有琥珀色样式提示。
+ */
+function passengerPassportSummary(p: OrderSummary['passengers'][number]): {
+  nameLine: string;
+  typeMark: string | null;
+  genderText: string | null;
+  dob: string | null;
+  maskedDoc: string;
+  expiryText: string;
+  expiryWarn: boolean;
+} {
+  const typeMark = p.passengerType ? PASSENGER_TYPE_MARK[p.passengerType] ?? null : null;
+  const chineseName = p.chineseName?.trim();
+  const daysLeft = daysUntil(p.passportExpiry);
+  return {
+    nameLine: chineseName ? `${p.fullName} ${chineseName}` : p.fullName,
+    typeMark,
+    genderText: p.gender ? GENDER_TEXT[p.gender] ?? null : null,
+    dob: p.dateOfBirth ? p.dateOfBirth.slice(0, 10) : null,
+    maskedDoc: maskDocumentNumber(p.documentNumber) ?? '未填',
+    expiryText: p.passportExpiry ? p.passportExpiry.slice(0, 10) : '未填',
+    expiryWarn: daysLeft !== null && daysLeft < 180,
+  };
+}
+
 // ── 列显示配置（用户自选列）────────────────────────────────────────────
 // 各岗位关心的列不同（票务不看尾款、财务不看签证、签证岗嫌订单号占地方），与其为谁砍一列，
 // 不如让每个人自己收起用不上的列。勾选存本机 localStorage，不进后端、不影响别人。
@@ -913,17 +945,27 @@ const PassengerSubRow = memo(function PassengerSubRow({
   index,
   colSpan,
   orderHasVisaTask,
+  tripsRow,
+  tripsStatus,
 }: {
   passenger: OrderSummary['passengers'][number];
   index: number;
   colSpan: number;
   /** 本单是否真有签证任务：无签证的单不给每人挂送签进度徽章。 */
   orderHasVisaTask: boolean;
+  /** 常旅客次数档案（按证件批量查，展开时按需拉；查不到档案就是 undefined）。 */
+  tripsRow?: TravelerProfileLookupRow;
+  /** 本次批量查询状态：展开态才会发起请求，查询中/失败都要跟「无记录」区分开。 */
+  tripsStatus?: TravelerTripsLookupStatus;
 }) {
   const masked = maskDocumentNumber(p.documentNumber);
   const mark = genderMark(p.gender);
   const displayName = p.chineseName?.trim() || p.fullName;
   const submission = p.visaSubmissionStatus ?? 'PENDING';
+  const typeMark = p.passengerType ? PASSENGER_TYPE_MARK[p.passengerType] ?? null : null;
+  // 临期同一口径：<180 天用现有琥珀色样式提示（与内容列护照摘要 passengerPassportSummary 一致）。
+  const expiryDaysLeft = daysUntil(p.passportExpiry);
+  const expiryWarn = expiryDaysLeft !== null && expiryDaysLeft < 180;
   return (
     <tr className="bg-slate-50">
       <td colSpan={colSpan} className="!py-1.5 pl-16">
@@ -931,6 +973,7 @@ const PassengerSubRow = memo(function PassengerSubRow({
           <span className="nums w-4 shrink-0 text-ink-muted">{index + 1}</span>
           <span className="font-medium text-ink">{displayName}</span>
           {displayName !== p.fullName ? <span className="text-ink-soft">{p.fullName}</span> : null}
+          {typeMark ? <span className="text-[10px] text-ink-soft">{typeMark}</span> : null}
           {mark ? (
             <span className="text-[10px] text-ink-soft" title={p.gender ? GENDER_TEXT[p.gender] : undefined}>
               {mark}
@@ -944,7 +987,7 @@ const PassengerSubRow = memo(function PassengerSubRow({
             </span>
           ) : null}
           {p.passportExpiry ? (
-            <span className="nums text-ink-muted" title="护照有效期">
+            <span className={`nums ${expiryWarn ? 'font-medium text-amber-600' : 'text-ink-muted'}`} title="护照有效期">
               至 {p.passportExpiry.slice(0, 10)}
             </span>
           ) : null}
@@ -968,11 +1011,57 @@ const PassengerSubRow = memo(function PassengerSubRow({
           {p.eticketNumber ? (
             <span className="font-mono tabular-nums text-ink-soft">票号 {p.eticketNumber}</span>
           ) : null}
+          {/* 常旅客次数：运营原话「可用次数=飞行次数+在订未飞」，系统口径不动
+              （可用=已飞−已核销，核销闸仍按它拦），这里只把三个数摆出来给运营直接看，
+              不用再点进详情或导出。展开时按需拉，查询中/失败/无档案三态分开显示。 */}
+          <TravelerTripsMiniBadge tripsRow={tripsRow} tripsStatus={tripsStatus} />
         </div>
       </td>
     </tr>
   );
 });
+
+/** 乘客子行里的常旅客次数小徽章：查询中 / 查询失败静默显示「—」/ 三个数全 0 显示「无记录」/ 否则三个数并排。 */
+function TravelerTripsMiniBadge({
+  tripsRow,
+  tripsStatus,
+}: {
+  tripsRow?: TravelerProfileLookupRow;
+  tripsStatus?: TravelerTripsLookupStatus;
+}) {
+  const title = '可用 = 已飞 − 已核销；在订未飞不计入可用';
+  if (tripsStatus === 'loading') {
+    return <span className="text-[10px] text-ink-soft">次数查询中…</span>;
+  }
+  if (tripsStatus === 'error') {
+    return (
+      <span className="text-[10px] text-ink-soft" title="常旅客次数查询失败">
+        —
+      </span>
+    );
+  }
+  const tripCount = tripsRow?.tripCount ?? 0;
+  const pendingTripCount = tripsRow?.pendingTripCount ?? 0;
+  const availableTrips = tripsRow?.availableTrips ?? 0;
+  if (tripCount === 0 && pendingTripCount === 0 && availableTrips === 0) {
+    return (
+      <span
+        className="rounded bg-slate-50 px-1.5 py-0.5 text-[10px] font-medium text-slate-400 ring-1 ring-slate-200"
+        title={title}
+      >
+        无记录
+      </span>
+    );
+  }
+  return (
+    <span
+      className="nums rounded bg-slate-50 px-1.5 py-0.5 text-[10px] font-medium text-slate-600 ring-1 ring-slate-200"
+      title={title}
+    >
+      已飞 {tripCount} · 在订未飞 {pendingTripCount} · 可用 {availableTrips}
+    </span>
+  );
+}
 
 export function OrdersPage() {
   const confirm = useConfirm();
@@ -1534,6 +1623,17 @@ export function OrdersPage() {
   const currentPage = Math.min(page, totalPages);
   const pageStart = (currentPage - 1) * pageSize;
   const paged = filtered;
+
+  // 常旅客次数（乘客子行小徽章）：只查当前已展开子行的那些订单的乘客，
+  // 没人展开就不发请求——「按需拉」，不为不可见的 200 行整页预取。
+  const expandedTripsPassengers = useMemo(
+    () =>
+      expandedPassengerOrderIds.size === 0
+        ? []
+        : paged.flatMap(({ order }) => (expandedPassengerOrderIds.has(order.id) ? order.passengers : [])),
+    [paged, expandedPassengerOrderIds],
+  );
+  const { rows: expandedTripsByDoc, status: expandedTripsStatus } = useTravelerTripsByDoc(expandedTripsPassengers);
 
   // ── 深链承接（?q=订单号）─────────────────────────────────────
   // 从签证台订单号点入时：先把订单号填进搜索框（前端过滤已支持订单号），
@@ -2544,6 +2644,9 @@ export function OrdersPage() {
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
+      if (skippedCancelledCount > 0) {
+        alert(`已跳过 ${skippedCancelledCount} 张已取消/退款单（开票表不含此类订单）`);
+      }
     } catch (err) {
       alert(err instanceof ApiError ? `导出失败：${err.message}` : '导出失败');
     } finally {
@@ -2649,9 +2752,6 @@ export function OrdersPage() {
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
-      if (skippedCancelledCount > 0) {
-        alert(`已跳过 ${skippedCancelledCount} 张已取消/退款单（开票表不含此类订单）`);
-      }
     } catch (err) {
       alert(err instanceof ApiError ? `导出失败：${err.message}` : '导出失败');
     } finally {
@@ -4328,41 +4428,15 @@ export function OrdersPage() {
                   </td>
                   )}
                   <td>
-                    {/* 乘客姓名放列首＋放大一档（text-xs→text-sm，与下方航段摘要相当）：
-                        运营原话「内容的名字放前面，放大点，主要是体现乘客的名字和航班」。
-                        以下三处行为全部保留，未改动：搜索命中优先展示命中者/未命中平铺前3位+「等N人」/
-                        性别小标独立淡色 span/悬浮看全部姓名/truncate 截断。 */}
+                    {/* 内容列以护照信息为主（运营原话：内容页展示护照信息——姓名/性别/生日/护照号/
+                        有效期；航班日期、套餐这些列表后面已经有列了，不用在内容里重复展示）。
+                        默认平铺前 3 位，超过 3 位用「还有 N 位」按钮展开全部——展开沿用的还是
+                        下面已有的 expandedPassengerOrderIds / PassengerSubRow 那套子行机制，
+                        没有另起一套。搜索命中某乘客时把命中者排到最前面（保留原「命中优先」
+                        的行为，不再只挑命中者单独平铺一份）。 */}
                     {order.passengers.length > 0 && (() => {
-                      // 姓名提亮（加粗+正文色，一眼可见）+ 性别小标（M/F；列表接口未回传性别时
-                      // 自然不标，不占位）。字母紧贴姓名会糊成一团（"张三M"），用独立小号淡色 span 隔开。
-                      const names = order.passengers.map((p) => p.chineseName?.trim() || p.fullName);
-                      const genders = order.passengers.map((p) => genderMark(p.gender));
-                      // 拼音（反馈：中文名后加拼音方便核对）：有中文名时才需要额外标注，
-                      // 拼音就是证件姓名（fullName，护照格式如 MA/GUANBEI）；本来就只显示
-                      // fullName 的乘客不重复标注。
-                      const pinyins = order.passengers.map((p) => (p.chineseName?.trim() ? p.fullName : null));
-                      const titleText = names
-                        .map((n, i) => {
-                          const base = pinyins[i] ? `${n} ${pinyins[i]}` : n;
-                          return genders[i] ? `${base}（${genders[i]}）` : base;
-                        })
-                        .join('、');
-                      // 逐人都标拼音（运营要核对每个人，不只是第一个）：单行放不下三对
-                      // "中文 拼音" 时改让这格换行，而不是藏起拼音——见下方 whitespace-normal。
-                      const nameNode = (idx: number, emphasized: boolean, showPinyin: boolean) => (
-                        <span key={idx} className={emphasized ? 'font-semibold text-brand' : 'font-semibold text-ink'}>
-                          {names[idx]}
-                          {genders[idx] ? (
-                            <span className="ml-0.5 text-[10px] font-normal text-ink-soft">{genders[idx]}</span>
-                          ) : null}
-                          {showPinyin && pinyins[idx] ? (
-                            <span className="ml-1 text-[10px] font-normal text-ink-soft">{pinyins[idx]}</span>
-                          ) : null}
-                        </span>
-                      );
                       const terms = splitSearchTerms(search);
-                      // 搜索命中某乘客时优先展示命中者（「张三 +3 同行」），不再平铺全部同行人。
-                      // 分词后任一词命中即算命中（与 filtered 的 AND 口径不同：这里只挑「展示谁」）。
+                      // 分词后任一词命中即算命中（与 filtered 的 AND 口径不同：这里只挑「谁排最前」）。
                       const hitIdx = terms.length
                         ? order.passengers.findIndex((p) =>
                             terms.some(
@@ -4373,42 +4447,55 @@ export function OrdersPage() {
                             ),
                           )
                         : -1;
-                      if (hitIdx >= 0) {
-                        const companions = names.length - 1;
-                        return (
-                          <div className="max-w-xs truncate text-sm" title={titleText}>
-                            {nameNode(hitIdx, true, true)}
-                            {companions > 0 ? <span className="text-ink-muted"> +{companions} 同行</span> : null}
-                          </div>
-                        );
-                      }
-                      const shownCount = Math.min(names.length, 3);
-                      const hasMore = names.length > shownCount;
+                      const allIdx = order.passengers.map((_, i) => i);
+                      const orderedIdx = hitIdx >= 0 ? [hitIdx, ...allIdx.filter((i) => i !== hitIdx)] : allIdx;
+                      const shownIdx = orderedIdx.slice(0, Math.min(order.passengers.length, 3));
                       return (
-                        <div className="max-w-xs whitespace-normal break-words text-sm" title={titleText}>
-                          {Array.from({ length: shownCount }, (_, i) => (
-                            <span key={i}>
-                              {i > 0 ? <span className="text-ink-muted">、</span> : null}
-                              {nameNode(i, false, true)}
-                            </span>
-                          ))}
-                          {hasMore ? <span className="text-ink-muted"> 等{names.length}人</span> : null}
+                        <div className="max-w-xs whitespace-normal break-words text-xs leading-snug">
+                          {shownIdx.map((i) => {
+                            const p = order.passengers[i];
+                            const s = passengerPassportSummary(p);
+                            return (
+                              <div
+                                key={p.id}
+                                className={`flex flex-wrap items-baseline gap-x-1 ${i === hitIdx ? 'text-brand' : 'text-ink'}`}
+                              >
+                                <span className="font-semibold">{s.nameLine}</span>
+                                {s.typeMark ? (
+                                  <span className="text-[10px] font-normal text-ink-soft">{s.typeMark}</span>
+                                ) : null}
+                                {s.genderText ? <span className="text-ink-muted">· {s.genderText}</span> : null}
+                                {s.dob ? <span className="nums text-ink-muted">· {s.dob}</span> : null}
+                                <span
+                                  className="nums font-mono text-ink-soft"
+                                  title="中段已脱敏，完整证件号见订单详情"
+                                >
+                                  · {s.maskedDoc}
+                                </span>
+                                <span className={`nums ${s.expiryWarn ? 'font-medium text-amber-600' : 'text-ink-muted'}`}>
+                                  · 有效期 {s.expiryText}
+                                </span>
+                              </div>
+                            );
+                          })}
                         </div>
                       );
                     })()}
-                    <div
-                      className="mt-0.5 max-w-xs truncate text-ink"
-                      title={view.legNotice ? `${view.itemSummary} · ${view.legNotice}` : view.itemSummary}
-                    >
-                      {view.itemSummary}
-                      {view.legNotice && <span className="text-ink-muted"> · {view.legNotice}</span>}
-                    </div>
+                    {/* 航段状态短标（去程no-show / 回程已释放…）：订单级标记，不是航班日期/套餐
+                        描述，运营没说不要，单独一行留着。 */}
+                    {view.legNotice && (
+                      <div className="mt-0.5 max-w-xs truncate text-[11px] text-ink-muted" title={view.legNotice}>
+                        {view.legNotice}
+                      </div>
+                    )}
                     <div className="mt-0.5 flex flex-wrap items-center gap-1.5 text-xs text-ink-muted">
                       {/* 一单多产品（机票+酒店混挂）时全部标出来，不再只显示首行的那一个 */}
                       {view.itemKinds.map((k) => (
                         <KindBadge key={k} kind={k} />
                       ))}
-                      {/* 「N 人 ▾」= 展开乘客明细（列表核对护照用；证件号脱敏，看全号进详情） */}
+                      {/* 展开/收起乘客子行（PNR/票号/签证进度/单住等，列表核对用；证件号仍脱敏，
+                          看全号进详情）。超过 3 人时按钮显示还差几位没在上面列出；≤3 人时上面已经
+                          列全了，按钮只用来再看这些额外字段。 */}
                       <button
                         type="button"
                         className="rounded px-1 text-xs text-ink-muted hover:bg-slate-100 hover:text-brand"
@@ -4416,12 +4503,15 @@ export function OrdersPage() {
                         title={
                           expandedPassengerOrderIds.has(order.id)
                             ? '收起乘客明细'
-                            : '展开乘客明细（姓名/性别/护照号，护照号中段已脱敏）'
+                            : '展开乘客明细（含 PNR/票号/签证进度等，护照号中段已脱敏）'
                         }
                         onClick={() => togglePassengerPanel(order.id)}
                       >
-                        <span className="nums font-medium text-ink">{order.passengers.length}</span> 人{' '}
-                        {expandedPassengerOrderIds.has(order.id) ? '▴' : '▾'}
+                        {expandedPassengerOrderIds.has(order.id)
+                          ? '收起 ▴'
+                          : order.passengers.length > 3
+                            ? `还有 ${order.passengers.length - 3} 位 ▾`
+                            : '明细 ▾'}
                       </button>
                     </div>
                     {/* 住宿摘要（房控/操作部反馈：一眼看出住哪）：已落位＝酒店名·房型；
@@ -4665,15 +4755,23 @@ export function OrdersPage() {
                     // 送签进度只在本单真有签证任务时显示（与签证筛选同源）——
                     // 纯机票/不需要签证的单不给每人挂「待处理」，避免误读成有签证在等。
                     const orderHasVisaTask = deriveVisaStatus(order) !== null;
-                    return order.passengers.map((p, pIdx) => (
-                      <PassengerSubRow
-                        key={p.id}
-                        passenger={p}
-                        index={pIdx}
-                        colSpan={tableColSpan}
-                        orderHasVisaTask={orderHasVisaTask}
-                      />
-                    ));
+                    return order.passengers.map((p, pIdx) => {
+                      const docNo = p.documentNumber?.trim();
+                      const tripsRow = docNo
+                        ? expandedTripsByDoc.get(travelerDocKey(p.documentType ?? 'PASSPORT', docNo))
+                        : undefined;
+                      return (
+                        <PassengerSubRow
+                          key={p.id}
+                          passenger={p}
+                          index={pIdx}
+                          colSpan={tableColSpan}
+                          orderHasVisaTask={orderHasVisaTask}
+                          tripsRow={tripsRow}
+                          tripsStatus={expandedTripsStatus}
+                        />
+                      );
+                    });
                   })()}
                 </Fragment>
               ))}
@@ -11506,14 +11604,21 @@ function travelerDocKey(documentType: DocumentType, documentNumber: string): str
   return `${documentType}|${documentNumber}`;
 }
 
+/** useTravelerTripsByDoc 的请求状态：idle=还没查（没证件可查）；查询中/失败要跟「查到了但是无档案」分开显示。 */
+type TravelerTripsLookupStatus = 'idle' | 'loading' | 'error' | 'ready';
+
+// 运营原话：「可用次数应该是飞行次数和在订未飞相加」；老板拍板先只把三个数摆到界面上，
+// 系统「可用」口径不动（可用=已飞−已核销，核销闸仍按它拦）——「在订未飞」是否计入可用，
+// 待运营确认取消口径后再改，这里三个数并排给运营自己心算，不改系统计算结果。
 function PassengerTripsBadge({ row }: { row: TravelerProfileLookupRow }) {
   const hit = row.tripCount >= TRAVELER_BENEFIT_TRIP_THRESHOLD;
   const title =
     `常旅客 ${row.travelerNo}：已飞 ${row.tripCount} 次 · 在订未飞 ${row.pendingTripCount} 次 · ` +
-    `已核销 ${row.redeemedTrips} 次 · 可用 ${row.availableTrips} 次` +
+    `已核销 ${row.redeemedTrips} 次 · 可用 ${row.availableTrips} 次\n` +
+    `口径：可用 = 已飞 − 已核销；在订未飞不计入可用` +
     (hit ? `\n已飞满 ${TRAVELER_BENEFIT_TRIP_THRESHOLD} 次，够航司权益门槛` : '');
   return (
-    <span title={title}>
+    <span title={title} className="inline-flex items-center gap-1">
       <span
         className={`ml-2 rounded px-1.5 py-0.5 text-[10px] font-medium ring-1 ${
           hit
@@ -11523,31 +11628,35 @@ function PassengerTripsBadge({ row }: { row: TravelerProfileLookupRow }) {
       >
         <Icon name="plane" /> 已飞 {row.tripCount}
       </span>
-      {/* 可用 ≠ 已飞 ⇒ 有核销（或退改把已飞拉回来了），必须单列，否则会被当成还能兑 */}
-      {row.availableTrips !== row.tripCount && (
-        <span
-          className={`ml-1 rounded px-1.5 py-0.5 text-[10px] font-medium ring-1 ${
-            row.availableTrips < 0
-              ? 'bg-red-50 text-red-700 ring-red-200'
-              : 'bg-slate-50 text-slate-600 ring-slate-200'
-          }`}
-        >
-          可用 {row.availableTrips}
-        </span>
-      )}
+      {/* 原来只在「可用≠已飞」时才单列在订未飞/可用（藏在 title 里），运营要求直接在界面上
+          看到，不用悬浮也不用导出——三个数改成恒定并排显示。 */}
+      <span className="rounded bg-slate-50 px-1.5 py-0.5 text-[10px] font-medium text-slate-600 ring-1 ring-slate-200">
+        在订未飞 {row.pendingTripCount}
+      </span>
+      <span
+        className={`rounded px-1.5 py-0.5 text-[10px] font-medium ring-1 ${
+          row.availableTrips < 0
+            ? 'bg-red-50 text-red-700 ring-red-200'
+            : 'bg-slate-50 text-slate-600 ring-slate-200'
+        }`}
+      >
+        可用 {row.availableTrips}
+      </span>
     </span>
   );
 }
 
 /**
- * 按本单乘客证件批量查常旅客次数（抽屉打开时一次），返回 证件key → 台账行。
- * 没建档的证件不在结果里（不显示徽章、不占位）；接口失败静默降级，绝不挡住抽屉。
+ * 按证件批量查常旅客次数，返回 证件key → 台账行 + 请求状态。
+ * 没建档的证件不在结果里（不显示徽章、不占位）；接口失败静默降级（status='error'），绝不挡住页面。
+ * 传空数组（如列表页未展开任何乘客子行时）不发请求——「按需拉」，不为不可见的行预取。
  */
 function useTravelerTripsByDoc(
   passengers: OrderSummary['passengers'],
-): Map<string, TravelerProfileLookupRow> {
+): { rows: Map<string, TravelerProfileLookupRow>; status: TravelerTripsLookupStatus } {
   const token = useAuth((s) => s.tokens)?.accessToken ?? '';
   const [rows, setRows] = useState<Map<string, TravelerProfileLookupRow>>(new Map());
+  const [status, setStatus] = useState<TravelerTripsLookupStatus>('idle');
 
   // 去重后的证件清单；用稳定字符串做依赖，避免每次渲染新数组触发重查
   const docs = useMemo(() => {
@@ -11565,17 +11674,22 @@ function useTravelerTripsByDoc(
   useEffect(() => {
     if (!token || docs.length === 0) {
       setRows(new Map());
+      setStatus('idle');
       return;
     }
     let cancelled = false;
+    setStatus('loading');
     api
       .lookupTravelerProfiles(token, docs)
       .then((r) => {
         if (cancelled) return;
         setRows(new Map(r.results.map((x) => [travelerDocKey(x.documentType, x.documentNumber), x])));
+        setStatus('ready');
       })
       .catch(() => {
-        /* 常旅客次数是锦上添花：查不到就不显示徽章，不打扰订单详情 */
+        /* 常旅客次数是锦上添花：查不到就不显示徽章，不打扰订单详情；列表子行用 status='error' 显示「—」 */
+        if (cancelled) return;
+        setStatus('error');
       });
     return () => {
       cancelled = true;
@@ -11584,7 +11698,7 @@ function useTravelerTripsByDoc(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [token, docsKey]);
 
-  return rows;
+  return { rows, status };
 }
 
 function useLegacyHistoryByDoc(
@@ -11765,7 +11879,7 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
   );
 
   // 常旅客次数：按本单乘客证件批量查一次，给每张乘客卡挂「已飞 N / 可用 M」小标
-  const tripsByDoc = useTravelerTripsByDoc(order.passengers);
+  const { rows: tripsByDoc } = useTravelerTripsByDoc(order.passengers);
   const legacyByDoc = useLegacyHistoryByDoc(order.passengers);
 
   return (
