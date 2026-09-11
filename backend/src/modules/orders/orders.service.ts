@@ -1500,12 +1500,13 @@ const CABIN_ZH_LABEL: Record<string, string> = {
 };
 
 /**
- * 升舱差价（CNY，整数）= 每人每航段差价 × 该行人数。
+ * 升舱差价（CNY，整数）= 每人每航段差价 × **占座人数**（成人 + 儿童；婴儿不占座、不收升舱差价，
+ * 2026-09-11 拍板）。调用方传 flightSeatQuantity(item)，不要传 item.quantity（那是含婴儿的出行人数）。
  * 一条 FLIGHT 行 = 一个航段，故不再乘航段数（往返是两条行，各自升舱各自计价）。
  * 纯函数，导出供单测复用。
  */
-export function computeCabinUpgradeDiffCny(upgradeCnyPerLeg: number, quantity: number): number {
-  return Math.max(0, Math.trunc(upgradeCnyPerLeg)) * Math.max(0, Math.trunc(quantity));
+export function computeCabinUpgradeDiffCny(upgradeCnyPerLeg: number, seatQuantity: number): number {
+  return Math.max(0, Math.trunc(upgradeCnyPerLeg)) * Math.max(0, Math.trunc(seatQuantity));
 }
 
 /**
@@ -10422,7 +10423,8 @@ export class OrderService {
    *
    * 与「改期」的分工：改期解决**航变/换班次**（可顺带改舱位、差价手填进改期费）；本方法解决
    * **纯升舱**——不换班次、不手填金额，差价由服务端按 `Flight.businessUpgradeCnyPerLeg`
-   * （¥/程/座，与建单加购升舱同一个配置源）× 该行人数权威计算，客户端传不进金额。
+   * （¥/程/座，与建单加购升舱同一个配置源）× **占座人数**（flightSeatQuantity：成人 + 儿童，
+   * 婴儿不占座也不收升舱差价，2026-09-11 拍板）权威计算，客户端传不进金额。
    *
    * 单事务内：
    *   1. Order 行 FOR UPDATE（与改期/超时释放/到账入账同一把行锁，座位与金额都要串行）。
@@ -10449,7 +10451,12 @@ export class OrderService {
       scheduleId: string;
       fromCabin: CabinClass;
       toCabin: CabinClass;
+      /** 该行出行人数（含婴儿）。 */
       quantity: number;
+      /** 计价 / 搬座的占座人数（成人 + 儿童）。 */
+      seatQuantity: number;
+      /** 不计差价、不搬座的婴儿人数 = quantity − seatQuantity。 */
+      infantCount: number;
       upgradeCnyPerLeg: number;
       diffCny: number;
       subtotalBefore: number;
@@ -10588,9 +10595,13 @@ export class OrderService {
         throw new BadRequestError('该航班未配置商务舱差价，请先在航班管理维护');
       }
       const quantity = item.quantity;
-      const diffCny = computeCabinUpgradeDiffCny(upgradeCnyPerLeg, quantity);
-      // 座位搬移按占座数（婴儿不占座；老行缺省回落 quantity）；差价仍按 quantity 算，本次不动钱的口径。
+      // 座位搬移与差价都按占座数（婴儿不占座、不收升舱差价；老行缺省回落 quantity，与现状一致）。
       const seatQuantity = flightSeatQuantity(item);
+      const infantCount = Math.max(0, quantity - seatQuantity);
+      if (seatQuantity <= 0) {
+        throw new BadRequestError('该行没有占座乘客（婴儿不占座），没有座位可升舱、也不收升舱差价');
+      }
+      const diffCny = computeCabinUpgradeDiffCny(upgradeCnyPerLeg, seatQuantity);
 
       // ── 座位对称搬移（同事务原子；任一步失败整单回滚，绝不出现「经济舱放了、商务舱没拿到」）──
       // 放座用 floored 版本（与状态机释放同口径，不会把 sold 打成负数）；拿座用 CAS（最终防超售）。
@@ -10644,6 +10655,10 @@ export class OrderService {
               toCabin: CabinClass.BUSINESS,
               upgradeCnyPerLeg,
               quantity,
+              // 按占座 seatQuantity 人计价（婴儿 infantCount 人不计）——排障 / 对账时一眼看清口径。
+              seatQuantity,
+              infantCount,
+              pricingBasis: 'SEAT_PAX',
               diffCny,
               note: input.note ?? null,
             },
@@ -10652,12 +10667,13 @@ export class OrderService {
       });
 
       // ── 差价成一条独立收入行（科目 UPGRADE_CHANGE = 升舱/改期收入）──
+      // 行数量 = 占座人数（与差价同口径：unitPrice × quantity = amount 恒成立）；婴儿人数落 metadata。
       const created = await tx.orderItem.create({
         data: {
           orderId,
           kind: OrderItemKind.UPGRADE_CHANGE,
-          description: `升舱商务 ×${quantity}人`,
-          quantity,
+          description: `升舱商务 ×${seatQuantity}人${infantCount > 0 ? `（婴儿 ${infantCount} 人不计）` : ''}`,
+          quantity: seatQuantity,
           unitPrice: new Prisma.Decimal(upgradeCnyPerLeg),
           amount: new Prisma.Decimal(diffCny),
           metadata: {
@@ -10667,6 +10683,9 @@ export class OrderService {
             fromCabin: CabinClass.ECONOMY,
             toCabin: CabinClass.BUSINESS,
             upgradeCnyPerLeg,
+            seatQuantity,
+            infantCount,
+            pricingBasis: 'SEAT_PAX',
             note: input.note ?? null,
           } as Prisma.InputJsonValue,
         },
@@ -10694,6 +10713,8 @@ export class OrderService {
         fromCabin: CabinClass.ECONOMY,
         toCabin: CabinClass.BUSINESS,
         quantity,
+        seatQuantity,
+        infantCount,
         upgradeCnyPerLeg,
         diffCny,
         subtotalBefore,

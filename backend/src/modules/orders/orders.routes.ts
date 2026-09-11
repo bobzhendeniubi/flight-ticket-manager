@@ -2320,6 +2320,10 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       after: {
         cabin: audit.toCabin,
         quantity: audit.quantity,
+        // 差价按占座 seatQuantity 人计（婴儿 infantCount 人不计，2026-09-11 拍板）。
+        seatQuantity: audit.seatQuantity,
+        infantCount: audit.infantCount,
+        pricingBasis: 'SEAT_PAX',
         upgradeCnyPerLeg: audit.upgradeCnyPerLeg,
         diffCny: audit.diffCny,
         upgradeItemId: audit.upgradeItemId,

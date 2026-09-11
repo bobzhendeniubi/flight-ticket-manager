@@ -4133,8 +4133,10 @@ export interface RestoreCancelledOrderResult {
     invoiceCapWarnings: string[];
     /** 非阻断提示（如回程仍处于已释放态，恢复后要再走「恢复回程」）。 */
     warnings: string[];
-    /** 恒 false：佣金不随恢复重建，财务按口径另行补提。 */
+    /** 本次是否把取消时冲销的代理佣金恢复计提了（只在落到已支付且确有冲销记录时为 true）。 */
     commissionsReaccrued: boolean;
+    /** 恢复计提的佣金合计（CNY）；未恢复为 0。 */
+    commissionsReaccruedCny: number;
     replayed: boolean;
   };
 }

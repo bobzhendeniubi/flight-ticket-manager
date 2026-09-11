@@ -299,10 +299,34 @@ describe('create() · 提交只落申请', () => {
       toCabin: 'BUSINESS',
       fromCabin: 'ECONOMY',
       diffCny: 4800,
+      seatQuantity: 2,
+      infantCount: 0,
     });
     expect(data.summary).toBe('经济舱 → 商务舱（补差 ¥4,800）');
     // 补差所有角色都看得见（这笔钱最终由代理的客人出）
     expect(request.amountCny).toBe(4800);
+  });
+
+  it('升舱申请 · 1 成人 + 1 婴儿：补差只按占座 1 人算（婴儿不占座不收差价），摘要写明口径', async () => {
+    const base = orderFixture();
+    const items = base.items as Array<Record<string, unknown>>;
+    mockPrisma.order.findUnique.mockResolvedValue(
+      orderFixture({
+        items: items.map((it) =>
+          it.id === 'item-out' ? { ...it, quantity: 2, metadata: { seatQuantity: 1, infantCount: 1 } } : it,
+        ),
+      }),
+    );
+
+    const request = await service.create(ADMIN, 'order-1', {
+      kind: OrderChangeKind.CABIN,
+      payload: { itemId: 'item-out' },
+    });
+
+    const data = mockPrisma.orderChangeRequest.create.mock.calls[0][0].data;
+    expect(data.payload).toMatchObject({ diffCny: 2400, seatQuantity: 1, infantCount: 1 });
+    expect(data.summary).toBe('经济舱 → 商务舱（补差 ¥2,400，按占座 1 人计，婴儿 1 人不计）');
+    expect(request.amountCny).toBe(2400);
   });
 
   it('升舱申请 · 代理侧同样看得到补差金额', async () => {

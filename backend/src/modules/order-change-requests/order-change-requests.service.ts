@@ -24,6 +24,7 @@ import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '.
 import { getDescendantAgentIds } from '../../lib/agent-tree.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { determineFlightLegItems } from '../orders/ticketing-cap.js';
+import { flightSeatQuantity } from '../orders/flight-seat-quantity.js';
 import {
   computeCabinUpgradeDiffCny,
   computeSwapHotelCostSnapshot,
@@ -113,8 +114,10 @@ const SUBMIT_ORDER_SELECT = {
     select: {
       id: true,
       kind: true,
-      // 升舱差价 = 每人每航段 × 该行人数；换酒店成本 = 每间每晚 × 晚数(quantity) × 房数。
+      // 升舱差价 = 每人每航段 × 占座人数（flightSeatQuantity 读 metadata.seatQuantity，婴儿不计）；
+      // 换酒店成本 = 每间每晚 × 晚数(quantity) × 房数。
       quantity: true,
+      metadata: true,
       roomsBilled: true,
       totalCostCny: true,
       flightScheduleId: true,
@@ -645,11 +648,17 @@ export class OrderChangeRequestsService {
 
     // ── 补差要在提交这一刻算清楚并写进摘要 ──────────────────────────────────────
     // 升舱是这四类改单里**唯一动钱**的一类：执行时 upgradeOrderItemCabin 会按
-    // 「每人每航段差价 × 该行人数」抬 total，这笔钱最终由代理的客人出。
-    // 不在申请上写明金额，等于让人闭眼签字。取价口径与执行侧同一个纯函数。
+    // 「每人每航段差价 × 占座人数」抬 total（婴儿不占座、不收差价，2026-09-11 拍板），
+    // 这笔钱最终由代理的客人出。不在申请上写明金额，等于让人闭眼签字。
+    // 取价口径与执行侧同一个纯函数 + 同一个占座数口径（flightSeatQuantity）。
+    const seatQuantity = flightSeatQuantity(item);
+    const infantCount = Math.max(0, item.quantity - seatQuantity);
+    if (seatQuantity <= 0) {
+      throw new BadRequestError('该行没有占座乘客（婴儿不占座），没有座位可升舱、也不收升舱差价');
+    }
     const diffCny = computeCabinUpgradeDiffCny(
       item.flightSchedule?.flight.businessUpgradeCnyPerLeg ?? 0,
-      item.quantity,
+      seatQuantity,
     );
     if (diffCny <= 0) {
       // 与升舱通道同一句话：没配差价就没法报价，先去航班管理补，别攒一条执行不了的申请。
@@ -657,10 +666,18 @@ export class OrderChangeRequestsService {
     }
 
     return {
-      payload: { itemId: item.id, toCabin: CabinClass.BUSINESS, fromCabin, diffCny },
+      payload: {
+        itemId: item.id,
+        toCabin: CabinClass.BUSINESS,
+        fromCabin,
+        diffCny,
+        seatQuantity,
+        infantCount,
+      },
       summary:
         `${CABIN_LABEL[fromCabin]} → ${CABIN_LABEL[CabinClass.BUSINESS]}` +
-        `（补差 ¥${formatCny(diffCny)}）`,
+        `（补差 ¥${formatCny(diffCny)}` +
+        `${infantCount > 0 ? `，按占座 ${seatQuantity} 人计，婴儿 ${infantCount} 人不计` : ''}）`,
     };
   }
 
@@ -978,13 +995,15 @@ export class OrderChangeRequestsService {
       where: { id: itemId },
       select: {
         quantity: true,
+        metadata: true,
         flightSchedule: { select: { flight: { select: { businessUpgradeCnyPerLeg: true } } } },
       },
     });
     if (!item) return; // 行不在了：交给升舱通道自己报「订单项不存在」
+    // 与提交时同一口径：按占座人数（婴儿不计）算，否则申请上写的金额和执行扣的金额对不上。
     const current = computeCabinUpgradeDiffCny(
       item.flightSchedule?.flight.businessUpgradeCnyPerLeg ?? 0,
-      item.quantity,
+      flightSeatQuantity(item),
     );
     if (current !== snapshot) {
       throw new BadRequestError(

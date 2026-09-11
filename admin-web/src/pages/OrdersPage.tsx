@@ -8813,7 +8813,17 @@ function BundleChangeModal({
   );
 }
 
-// ── 升舱（经济舱 → 商务舱）：差价由服务端按航班配置 × 人数算，运营不手填 ──────
+// ── 升舱（经济舱 → 商务舱）：差价由服务端按航班配置 × 占座人数算，运营不手填 ──────
+/** FLIGHT 行占座人数（婴儿不占座）：metadata.seatQuantity 夹在 [0, quantity]，缺省回落 quantity（与后端同口径）。 */
+function flightSeatPaxOfItem(item: Pick<OrderItem, 'quantity' | 'metadata'>): number {
+  const quantity = Math.max(0, Math.trunc(item.quantity));
+  const meta = item.metadata;
+  if (meta == null || typeof meta !== 'object' || Array.isArray(meta)) return quantity;
+  const raw = (meta as Record<string, unknown>).seatQuantity;
+  if (typeof raw !== 'number' || !Number.isFinite(raw) || raw < 0) return quantity;
+  return Math.min(Math.trunc(raw), quantity);
+}
+
 function CabinUpgradePanel({
   orderId,
   item,
@@ -8854,7 +8864,10 @@ function CabinUpgradePanel({
     return () => { cancelled = true; };
   }, [token, item.flightNumber, item.route]);
 
-  const pax = item.quantity;
+  // 差价按占座人数算（成人 + 儿童；婴儿不占座也不收升舱差价，2026-09-11 拍板）——
+  // 与后端 flightSeatQuantity 同口径：读 FLIGHT 行 metadata.seatQuantity（夹在 [0, quantity]），缺省回落 quantity。
+  const pax = flightSeatPaxOfItem(item);
+  const infantCount = Math.max(0, item.quantity - pax);
   const totalCny = perLegCny != null ? perLegCny * pax : null;
 
   const submit = async () => {
@@ -8889,9 +8902,14 @@ function CabinUpgradePanel({
           <>
             每人每航段 ¥{perLegCny.toLocaleString()} × {pax}人 ={' '}
             <span className="font-semibold">¥{totalCny.toLocaleString()}</span>
+            {infantCount > 0 && `（婴儿 ${infantCount} 人不占座、不计差价）`}
           </>
         ) : (
-          <>差价按该航班配置的升舱差价 × {pax}人 计算，<span className="font-semibold">以服务端计算为准</span>。</>
+          <>
+            差价按该航班配置的升舱差价 × {pax}人 计算
+            {infantCount > 0 && `（婴儿 ${infantCount} 人不占座、不计差价）`}，
+            <span className="font-semibold">以服务端计算为准</span>。
+          </>
         )}
         <div className="mt-0.5 text-[11px] text-indigo-700/80">
           金额由系统按航班配置自动计算，不需要手填；差价单独记一条「升舱/改期」收入行，订单状态不变。

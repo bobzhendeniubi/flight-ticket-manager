@@ -6,7 +6,8 @@
  * 目标舱固定商务舱，差价由服务端按航班的升舱差价源 × 人数权威计算。
  *
  * 覆盖：
- *   1. computeCabinUpgradeDiffCny：差价 = 每人每航段 × 人数（含 0/负数兜底）。
+ *   1. computeCabinUpgradeDiffCny：差价 = 每人每航段 × 占座人数（含 0/负数兜底）；
+ *      婴儿不占座也不收差价（1 成人 + 1 婴儿只收 1 份、只搬 1 座；婴儿单独一单拒绝升舱）。
  *   2. buildUpgradedCabinDescription：描述快照刷新（替换/追加/幂等/超级经济舱写法）。
  *   3. upgradeItemCabinBodySchema：请求体只收备注，任何金额字段都进不来。
  *   4. 权限：客户 → ForbiddenError（未触库）；代理走「下单当天自助改单」窗口闸
@@ -147,7 +148,7 @@ function cabinOfRawCall(call: unknown[]): string | undefined {
   return call.slice(1).find((v): v is string => v === 'ECONOMY' || v === 'BUSINESS');
 }
 
-describe('computeCabinUpgradeDiffCny · 升舱差价 = 每人每航段 × 人数', () => {
+describe('computeCabinUpgradeDiffCny · 升舱差价 = 每人每航段 × 占座人数', () => {
   it('¥700/程/座 × 2 人 = ¥1400', () => {
     expect(computeCabinUpgradeDiffCny(700, 2)).toBe(1400);
   });
@@ -283,6 +284,66 @@ describe('OrderService.upgradeOrderItemCabin · 成功路径', () => {
       subtotalBefore: 10000,
       subtotalAfter: 11400,
     });
+  });
+});
+
+describe('OrderService.upgradeOrderItemCabin · 差价按占座人数（婴儿不占座、不收差价）', () => {
+  it('1 成人 + 1 婴儿升舱：只收 1 份差价、只搬 1 座；行与审计记清「按占座 1 人计价（婴儿 1 人不计）」', async () => {
+    const tx = buildTx({
+      itemQuantity: 2,
+      itemMetadata: { seatQuantity: 1, infantCount: 1 },
+      upgradeCnyPerLeg: 700,
+    });
+    mountTx(tx);
+
+    const { audit } = await service.upgradeOrderItemCabin('o1', 'it-1', {}, ADMIN);
+
+    // 座位：放经济舱 1 座、拿商务舱 1 座（婴儿不占座）
+    expect(tx.$executeRaw).toHaveBeenCalledTimes(2);
+    for (const call of tx.$executeRaw.mock.calls as unknown[][]) {
+      expect(call.slice(1)).toContain(1);
+      expect(call.slice(1)).not.toContain(2);
+    }
+
+    // 差价：¥700 × 1 = ¥700（不是 × 2）
+    const createArg = tx.orderItem.create.mock.calls[0]![0] as { data: Record<string, unknown> };
+    expect(createArg.data.kind).toBe('UPGRADE_CHANGE');
+    expect(createArg.data.description).toBe('升舱商务 ×1人（婴儿 1 人不计）');
+    expect(createArg.data.quantity).toBe(1);
+    expect(Number(String(createArg.data.amount))).toBe(700);
+    expect(createArg.data.metadata).toMatchObject({ seatQuantity: 1, infantCount: 1, pricingBasis: 'SEAT_PAX' });
+
+    // 机票行 metadata 的升舱快照同样记清口径
+    const updateArg = tx.orderItem.update.mock.calls[0]![0] as { data: { metadata: Record<string, unknown> } };
+    expect(updateArg.data.metadata.cabinUpgrade).toMatchObject({
+      quantity: 2,
+      seatQuantity: 1,
+      infantCount: 1,
+      pricingBasis: 'SEAT_PAX',
+      diffCny: 700,
+    });
+
+    // 总额只抬 ¥700
+    const orderUpdate = tx.order.update.mock.calls[0]![0] as { data: Record<string, unknown> };
+    expect(Number(String(orderUpdate.data.subtotal))).toBe(10700);
+
+    expect(audit).toMatchObject({ quantity: 2, seatQuantity: 1, infantCount: 1, diffCny: 700 });
+  });
+
+  it('没有 seatQuantity 的老行：占座数回落 quantity，差价与以前完全一致', async () => {
+    const tx = buildTx({ itemQuantity: 3, itemMetadata: null, upgradeCnyPerLeg: 700 });
+    mountTx(tx);
+    const { audit } = await service.upgradeOrderItemCabin('o1', 'it-1', {}, ADMIN);
+    expect(audit).toMatchObject({ quantity: 3, seatQuantity: 3, infantCount: 0, diffCny: 2100 });
+  });
+
+  it('婴儿单独一单（seatQuantity=0）→ BadRequestError，一座不动、一分不收', async () => {
+    const tx = buildTx({ itemQuantity: 1, itemMetadata: { seatQuantity: 0, infantCount: 1 } });
+    mountTx(tx);
+    await expect(service.upgradeOrderItemCabin('o1', 'it-1', {}, ADMIN)).rejects.toBeInstanceOf(BadRequestError);
+    expect(tx.$executeRaw).not.toHaveBeenCalled();
+    expect(tx.orderItem.create).not.toHaveBeenCalled();
+    expect(tx.order.update).not.toHaveBeenCalled();
   });
 });
 
