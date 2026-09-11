@@ -17,6 +17,12 @@
 import { OrderItemKind } from '@prisma/client';
 import { readExplicitRoomCount } from '../../lib/room-count.js';
 import { stripInternalLegPrefix } from './orders.leg-status.js';
+import {
+  FLIGHT_INFANT_COUNT_KEY,
+  FLIGHT_SEAT_QUANTITY_KEY,
+  flightSeatQuantity,
+  hasExplicitFlightSeatQuantity,
+} from './flight-seat-quantity.js';
 
 // ── 通用小工具 ──────────────────────────────────────────────────────────────
 const round2 = (n: number): number => Math.round(n * 100) / 100;
@@ -311,6 +317,19 @@ export function moveFlightLike(item: SplitItemView, ctx: SplitContext): SplitMov
     keepMeta.businessUpgradeCount = keptUpgrade;
     moveMeta.businessUpgradeCount = movedUpgrade;
   }
+  // 占座数（婴儿不占座）随拆分账：纯机票行的 quantity 含婴儿、metadata.seatQuantity 才是座位数。
+  // 两侧照抄同一个 seatQuantity 会让取消时多放一次座，故按「拆出几座 / 留守几座」重新分：
+  //   拆出侧 = min(moveQty, 原占座数)（moveQty 本就按占座人头算，婴儿不在里面）；留守侧 = 差额。
+  // Σ 恒等于原占座数。没显式写过占座数的老行不凭空加键（继续回落 quantity）。
+  const seatSplitApplies = item.kind === OrderItemKind.FLIGHT && hasExplicitFlightSeatQuantity(item);
+  if (seatSplitApplies) {
+    const seatQty = flightSeatQuantity(item);
+    const movedSeatQty = Math.min(moveQty, seatQty);
+    keepMeta[FLIGHT_SEAT_QUANTITY_KEY] = seatQty - movedSeatQty;
+    moveMeta[FLIGHT_SEAT_QUANTITY_KEY] = movedSeatQty;
+    keepMeta[FLIGHT_INFANT_COUNT_KEY] = ctx.keptOccupancy.infantCount;
+    moveMeta[FLIGHT_INFANT_COUNT_KEY] = ctx.movedOccupancy.infantCount;
+  }
   // no-show 名单要跟着人走：拆走的人不能还挂在源单的未登机名单上。
   // 新单侧的 noShow 快照由 inheritableItemMetadata 整块剥掉（既定设计，要标就在新单重标）；
   // 源单侧过去是 `{ ...md }` 原样保留，被拆走的人仍留在 passengerIds 里 ——
@@ -318,7 +337,8 @@ export function moveFlightLike(item: SplitItemView, ctx: SplitContext): SplitMov
   // 裁剪后为空数组也保留 noShow 对象：标记本身没被撤销，只是名单空了。
   const trimmedNoShow = trimNoShowRoster(md.noShow, ctx.movedIdSet);
   if (trimmedNoShow != null) keepMeta.noShow = trimmedNoShow;
-  const keepMetaChanged = md.businessUpgradeCount != null || trimmedNoShow != null;
+  const keepMetaChanged =
+    md.businessUpgradeCount != null || trimmedNoShow != null || seatSplitApplies;
 
   return {
     mode: 'SPLIT',

@@ -209,7 +209,10 @@ export interface ProductBlockBuildContext {
   hotels: readonly Hotel[];
   visas: readonly Visa[];
   transfers: readonly Transfer[];
-  /** 机票行人数 = 本单有效出行人数（往返共用同一批出行人，人数不翻倍）。 */
+  /**
+   * 机票行 quantity = 本单有效出行人数（往返共用同一批出行人，人数不翻倍；**含婴儿**）。
+   * 占座数（婴儿不占座）由服务端按出生日期 × 出发日权威派生并写进行 metadata，前端不传。
+   */
   seatPax: number;
 }
 
@@ -379,8 +382,10 @@ export interface ProductBlockFieldsProps {
   /** 班次加载失败等非阻断错误回传给弹窗顶部统一展示；须传稳定引用（如 setState）。 */
   onLoadError: (message: string) => void;
   inputCls: string;
-  /** 机票行数量按此计（本单有效出行人数），仅用于提示文案。 */
+  /** 占座人数（有效出行人里的非婴儿），仅用于提示文案；提交的 quantity 仍是全部出行人数。 */
   seatPax: number;
+  /** 婴儿人数（不占座），仅用于提示文案；缺省 0。 */
+  infantPax?: number;
 }
 
 export function ProductBlockFields({
@@ -394,6 +399,7 @@ export function ProductBlockFields({
   onLoadError,
   inputCls,
   seatPax,
+  infantPax = 0,
 }: ProductBlockFieldsProps) {
   // 本区块自己的班次列表（每个机票区块各选各的航班，互不干扰）
   const [schedules, setSchedules] = useState<AdminSchedule[]>([]);
@@ -637,7 +643,8 @@ export function ProductBlockFields({
 
         <p className="text-[11px] text-slate-400">
           数量按下方有效出行人数自动计（每人 1 张{block.tripType === 'ROUNDTRIP' ? '，去程/回程各一张' : ''}）
-          {seatPax > 0 ? ` · 当前 ${seatPax} 人` : ''}。
+          {seatPax + infantPax > 0 ? ` · 当前 ${seatPax + infantPax} 人` : ''}
+          {infantPax > 0 ? ` · 占座 ${seatPax} 人（婴儿 ${infantPax} 人不占座）` : ''}。
         </p>
       </div>
     );

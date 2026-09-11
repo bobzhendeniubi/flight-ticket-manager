@@ -5927,8 +5927,11 @@ describe('OrderService.rescheduleOrderItem · 换班次即作废原票', () => {
   const OUT_ISO = new Date(Date.now() + 30 * 24 * 3600_000).toISOString();
   const RET_ISO = new Date(Date.now() + 37 * 24 * 3600_000).toISOString();
 
-  /** 一张往返单：outbound-item（去程）+ return-item（回程）。 */
-  function mountRoundTrip(targetItemId: 'outbound-item' | 'return-item', opts: { adjustmentCny?: number } = {}) {
+  /** 一张往返单：outbound-item（去程）+ return-item（回程）；legPatch 同时打到两条航段行上。 */
+  function mountRoundTrip(
+    targetItemId: 'outbound-item' | 'return-item',
+    opts: { adjustmentCny?: number; legPatch?: Record<string, unknown> } = {},
+  ) {
     const legs = [
       {
         id: 'outbound-item',
@@ -5952,7 +5955,7 @@ describe('OrderService.rescheduleOrderItem · 换班次即作废原票', () => {
         metadata: {},
         flightSchedule: { departureTime: new Date(RET_ISO) },
       },
-    ];
+    ].map((l) => ({ ...l, ...(opts.legPatch ?? {}) }));
     mockPrisma.order.findUnique.mockReset().mockResolvedValue({
       id: 'ord1',
       status: 'PAID',
@@ -5988,6 +5991,31 @@ describe('OrderService.rescheduleOrderItem · 换班次即作废原票', () => {
     mockPrisma.flightSchedule.findUnique.mockReset().mockResolvedValue({ departureTime: new Date(OUT_ISO) });
     mockPrisma.order.findUniqueOrThrow.mockReset().mockResolvedValue(fakeFullOrder());
   }
+
+  it('婴儿不占座：quantity 2、seatQuantity 1 的去程改班次 → 放旧 1 座、拿新 1 座（不是 2）', async () => {
+    const service = new OrderService();
+    mountRoundTrip('outbound-item', {
+      legPatch: { quantity: 2, metadata: { seatQuantity: 1, infantCount: 1 } },
+    });
+
+    await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'outbound-item', newScheduleId: 'schedNew' },
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    // 座位账两条原子 SQL：放旧走 GREATEST(0, sold − qty)，拿新走 sold = sold + qty；
+    // ${qty} 都是第 1 个占位符、${scheduleId} 第 2 个。按 SQL 文本挑出来断言，不依赖调用顺序。
+    const seatCalls = mockPrisma.$executeRaw.mock.calls.map((c) => ({
+      sql: (c[0] as readonly string[]).join('?'),
+      qty: c[1],
+      scheduleId: c[2],
+    }));
+    const release = seatCalls.filter((c) => c.sql.includes('GREATEST(0, sold -'));
+    const take = seatCalls.filter((c) => c.sql.includes('sold = sold +'));
+    expect(release).toEqual([{ sql: expect.any(String), qty: 1, scheduleId: 'schedOut' }]);
+    expect(take).toEqual([{ sql: expect.any(String), qty: 1, scheduleId: 'schedNew' }]);
+  });
 
   it('改去程 → 清全单票号，并只把去程开票位翻回未开', async () => {
     const service = new OrderService();

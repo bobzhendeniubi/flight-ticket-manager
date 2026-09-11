@@ -368,6 +368,120 @@ describe('OrderService._updateStatusWithinTx · 既有释放/占座路径不受�
     expect(mockPrisma.seatLock.aggregate).not.toHaveBeenCalled();
   });
 
+  // ── 婴儿不占座：占座数读 metadata.seatQuantity（与建单扣座同口径），老行缺省回落 quantity ──
+  it('释放：1 成人 + 1 婴儿（quantity 2、seatQuantity 1）→ 只放 1 座', async () => {
+    const order = buildOrder({
+      status: OrderStatus.PENDING_PAYMENT,
+      items: [flightItem({ quantity: 2, metadata: { seatQuantity: 1, infantCount: 1 } })],
+    });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(order);
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.$executeRaw.mockResolvedValueOnce(1);
+    mockPrisma.flightSeatClass.findFirst.mockResolvedValueOnce({ id: 'sc1' });
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.PAYMENT_TIMEOUT });
+
+    const releasedIds: string[] = [];
+    await service._updateStatusWithinTx(
+      tx,
+      'ord1',
+      OrderStatus.PAYMENT_TIMEOUT,
+      adminRequester,
+      undefined,
+      [],
+      false,
+      releasedIds,
+    );
+
+    expect(mockPrisma.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.$executeRaw.mock.calls[0][1]).toBe(1); // qty = 占座数，不是 quantity 2
+    expect(releasedIds).toEqual(['sc1']);
+  });
+
+  it('释放：婴儿单独一单（seatQuantity 0）→ 一座不放、不报错', async () => {
+    const order = buildOrder({
+      status: OrderStatus.PENDING_PAYMENT,
+      items: [flightItem({ quantity: 1, metadata: { seatQuantity: 0, infantCount: 1 } })],
+    });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(order);
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.CANCELLED });
+
+    const releasedIds: string[] = [];
+    const result = await service._updateStatusWithinTx(
+      tx,
+      'ord1',
+      OrderStatus.CANCELLED,
+      adminRequester,
+      undefined,
+      [],
+      false,
+      releasedIds,
+    );
+
+    expect(result.status).toBe(OrderStatus.CANCELLED);
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+    expect(releasedIds).toEqual([]);
+  });
+
+  it('释放：老行没有 seatQuantity → 回落 quantity（现状不变）', async () => {
+    const order = buildOrder({
+      status: OrderStatus.PENDING_PAYMENT,
+      items: [flightItem({ quantity: 2, metadata: null })],
+    });
+    mockPrisma.order.findUnique.mockResolvedValueOnce(order);
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.$executeRaw.mockResolvedValueOnce(1);
+    mockPrisma.flightSeatClass.findFirst.mockResolvedValueOnce({ id: 'sc1' });
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.PAYMENT_TIMEOUT });
+
+    await service._updateStatusWithinTx(
+      tx,
+      'ord1',
+      OrderStatus.PAYMENT_TIMEOUT,
+      adminRequester,
+      undefined,
+      [],
+      false,
+      [],
+    );
+
+    expect(mockPrisma.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.$executeRaw.mock.calls[0][1]).toBe(2);
+  });
+
+  it('重新占座（force PAYMENT_TIMEOUT → PAID）：seatQuantity 1 → CAS 只占 1 座，与释放分支对称', async () => {
+    const order = buildOrder({
+      status: OrderStatus.PAYMENT_TIMEOUT,
+      items: [flightItem({ quantity: 2, metadata: { seatQuantity: 1, infantCount: 1 } })],
+    });
+    mockPrisma.order.findUnique
+      .mockResolvedValueOnce(order)
+      .mockResolvedValueOnce({ visaStatus: null });
+    mockPrisma.order.updateMany.mockResolvedValueOnce({ count: 1 });
+    mockPrisma.orderStatusEvent.create.mockResolvedValueOnce({});
+    mockPrisma.seatLock.aggregate.mockResolvedValueOnce({ _sum: { qty: null } });
+    mockPrisma.$executeRaw.mockResolvedValueOnce(1);
+    mockPrisma.orderItem.findMany.mockResolvedValueOnce([]);
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValueOnce({ ...order, status: OrderStatus.PAID });
+
+    await service._updateStatusWithinTx(
+      tx,
+      'ord1',
+      OrderStatus.PAID,
+      adminRequester,
+      undefined,
+      [],
+      true,
+      [],
+    );
+
+    expect(mockPrisma.$executeRaw).toHaveBeenCalledTimes(1);
+    expect(mockPrisma.$executeRaw.mock.calls[0][1]).toBe(1);
+  });
+
   it('PAID → PROCESSING：占座 → 占座之间不触碰座位台账（不会双重扣减）', async () => {
     const order = buildOrder({ status: OrderStatus.PAID });
     mockPrisma.order.findUnique.mockResolvedValueOnce(order);

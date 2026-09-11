@@ -35,6 +35,7 @@ import {
 import { closeMailer } from '../lib/mailer.js';
 import { sendItineraryEmail } from '../lib/itinerary-email.js';
 import { computeBundleSeatSplit, releaseSeatFloored } from '../modules/orders/orders.service.js';
+import { flightSeatQuantity } from '../modules/orders/flight-seat-quantity.js';
 import { REFUND_REQUESTED_FULFILLMENT_ERROR } from '../modules/fulfillment/fulfillment.service.js';
 import { heldSeatsForSeatClass } from '../modules/hold-orders/held-seats.js';
 import { markOverdueHolds } from '../modules/hold-orders/hold-overdue.js';
@@ -73,7 +74,8 @@ export async function releaseOrderSeatsForTimeout(
     if (item.kind !== OrderItemKind.FLIGHT || !item.flightScheduleId || !item.flightCabin) continue;
     const meta = (item.metadata ?? {}) as { businessUpgradeCount?: unknown };
     const rawUpgrade = typeof meta.businessUpgradeCount === 'number' ? meta.businessUpgradeCount : 0;
-    const split = computeBundleSeatSplit(item.flightCabin, item.quantity, rawUpgrade);
+    // 占座数口径（婴儿不占座）：与建单扣座 / 状态机释放同读 metadata.seatQuantity，缺省回落 quantity。
+    const split = computeBundleSeatSplit(item.flightCabin, flightSeatQuantity(item), rawUpgrade);
     await releaseSeatFloored(tx, item.flightScheduleId, CabinClass.BUSINESS, split.business);
     await releaseSeatFloored(tx, item.flightScheduleId, item.flightCabin, split.sameCabin);
   }

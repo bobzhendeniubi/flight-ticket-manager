@@ -156,6 +156,13 @@ import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
 import { OPERATION_FEE_CNY_PER_ORDER } from './order-cost-items.service.js';
 import { bundleItemMetadataSchema } from './orders.schemas.js';
 import { derivePtcByAge, earliestFlightDeparture, earliestFlightDepartureLocalDate } from './pnr-export.js';
+// 机票行占座数唯一口径（婴儿不占座）：所有座位账站点读 flightSeatQuantity，金额/乘客数校验仍按 quantity。
+import {
+  flightSeatQuantity,
+  resolveFlightSeatQuantity,
+  stripClientFlightSeatMetadata,
+  withFlightSeatMetadata,
+} from './flight-seat-quantity.js';
 // 按人送签的任务级状态派生（纯函数）：与签证台同一口径。依赖方向安全——
 // fulfillment.service 只 import prisma/errors/自身 schemas，不回头 import orders 模块，无环。
 import { deriveVisaTaskStatus } from '../fulfillment/fulfillment.service.js';
@@ -514,7 +521,8 @@ function sanitizeFlightItemMetadata(
 ): Record<string, unknown> {
   if (!metadata) return {};
   const { businessUpgradeCount: _ignoredClientValue, ...rest } = metadata;
-  return rest;
+  // 占座数 / 婴儿数同理只能由服务端写（见 flight-seat-quantity.ts）：客户端传 seatQuantity=0 就能下一张不占座的单。
+  return stripClientFlightSeatMetadata(rest);
 }
 
 /**
@@ -2063,6 +2071,12 @@ export class OrderService {
             amount: new Prisma.Decimal(input.quantity * input.unitPriceCny),
             flightScheduleId: input.flightScheduleId,
             flightCabin: input.cabin,
+            // 占位单的座位就是按人头留的（转正消费几个占位余座就占几座），占座数显式 = quantity，
+            // 与下方 takeSeatWithinTx 的 quantity 同数；之后取消/改期读 metadata.seatQuantity 才对称。
+            metadata: withFlightSeatMetadata(undefined, {
+              seatQuantity: input.quantity,
+              infantCount: 0,
+            }) as Prisma.InputJsonValue,
           },
         },
         passengers: {
@@ -2322,6 +2336,20 @@ export class OrderService {
     const starMismatchOverrides: DesignatedHotelStarMismatchOverride[] = [];
     // 具体酒店超售容忍：统一按内部录单身份解析；随机档另走需求池不闸单口径。
     const hotelOversellCapRooms = await resolveHotelOversellCap(requester);
+    // 出行人类型服务端权威派生（passengerToData）所需的「本单最早出发日」：与护照有效期规则
+    // 同一口径（服务端查 DB，客户端改不了），事务外查一次，供写 Passenger 与算占座数时使用。
+    const authoritativeDepartureDate = await this.resolveEarliestFlightDepartureDate(body.items);
+    // 机票行占座数（婴儿不占座）：只信服务端按「出生日期 × 最早出发日」派生后的 passengerType，
+    // 不信客户端传的 INFANT。纯机票单 quantity 含婴儿，占座数 = min(quantity, 非婴儿人数)；
+    // 套餐机票腿 quantity 本就是 seatPax，公式结果不变（见 flight-seat-quantity.ts）。
+    const infantCount = body.passengers.filter(
+      (px) =>
+        passengerToData(px, { authoritativeDepartureDate }).passengerType === PassengerType.INFANT,
+    ).length;
+    const flightSeatContext = {
+      nonInfantPax: Math.max(0, body.passengers.length - infantCount),
+      infantCount,
+    };
     const pricedItems = await this.priceAndValidateItems(
       body.items,
       body.flightSettlementPriceCny,
@@ -2332,6 +2360,7 @@ export class OrderService {
       // 星级闸按认证身份判权限（不信前端）：游客无角色 → null，与 AGENT/CUSTOMER 同样硬拒。
       { role: requesterRole ?? null, overrides: starMismatchOverrides },
       hotelOversellCapRooms,
+      flightSeatContext,
     );
 
     // 散客 RETAIL 立减判定与 quote 共用 shouldApplyRetailSettlementDiscount，两边不会再分叉。
@@ -2594,7 +2623,13 @@ export class OrderService {
 
       for (const p of pricedItems) {
         if (p.kind !== 'FLIGHT' || !p.flightScheduleId || !p.flightCabin) continue;
-        const split = computeBundleSeatSplit(p.flightCabin, p.quantity, p.businessUpgradeCount);
+        // 占座数口径（婴儿不占座）：读 priceAndValidateItems 盖在 metadata.seatQuantity 上的服务端派生值；
+        // 婴儿单独一单 = 0 座 → 两段 decrementSeat 都短路，不进 CAS、不报余票不足。金额仍按 quantity。
+        const split = computeBundleSeatSplit(
+          p.flightCabin,
+          flightSeatQuantity(p),
+          p.businessUpgradeCount,
+        );
         // 升舱的人占商务舱真实座位
         await decrementSeat(p.flightScheduleId, 'BUSINESS', split.business);
         // 其余人占本行原舱位（经济舱减掉升舱人数；非经济舱行 split.business=0，等于全额扣原舱）
@@ -3822,8 +3857,20 @@ export class OrderService {
     // 当天临时向酒店加房是常态业务）。缺省 = 硬闸——前台散客必须缺省。
     // 这里只影响**事务外友好预检**；权威判定与 WARNING 审计在建单事务内（createOrder）。
     hotelOversellCapRooms?: number,
+    // 机票行占座数上下文（婴儿不占座）：仅 createOrder 传（按服务端派生的 passengerType 数出来）。
+    //   传了 → 每条 FLIGHT 行 metadata 盖 seatQuantity = min(quantity, nonInfantPax) 与 infantCount，
+    //          余票预检也按占座数（婴儿单独一单 0 座，售罄班次照样能录）；
+    //   缺省（试算 / 批量预定价）→ 不盖章，座位账回落 quantity（与旧行为一致）。
+    flightSeatContext?: { nonInfantPax: number; infantCount: number },
   ) {
     const priced: PricedOrderItem[] = [];
+    const flightSeatStamp = (quantity: number): Record<string, unknown> | null =>
+      flightSeatContext
+        ? withFlightSeatMetadata(undefined, {
+            seatQuantity: resolveFlightSeatQuantity(quantity, flightSeatContext.nonInfantPax),
+            infantCount: flightSeatContext.infantCount,
+          })
+        : null;
 
     // 套餐去程出发日的权威来源（A7）：同 bundle 的真实 FLIGHT 航段，客户端改不了。
     // 房控占房盖章（下方 resolveBundleHotelStamp）此前直接吃客户端自由字段 metadata.goDate，
@@ -3918,10 +3965,15 @@ export class OrderService {
           continue;
         }
         // 动态定价重算 — 这是唯一权威价格源（无议价结算价时）
+        // 余票预检按占座数（婴儿不占座；缺上下文 = quantity），价格仍按 quantity 张算 —— 不动钱。
+        const seatStamp = flightSeatStamp(item.quantity);
         const pricing = await this.pricing.calculatePrice(
           item.flightScheduleId,
           item.flightCabin,
           item.quantity,
+          seatStamp
+            ? { seatDemand: flightSeatQuantity({ quantity: item.quantity, metadata: seatStamp }) }
+            : undefined,
         );
         priced.push({
           kind: 'FLIGHT',
@@ -5251,6 +5303,351 @@ export class OrderService {
       select: { id: true, orderNumber: true, status: true, deletedAt: true },
     });
     return { before: order, after: updated };
+  }
+
+  /**
+   * 已取消单恢复：POST /orders/:id/restore-cancelled（ADMIN/STAFF）。
+   *
+   * 口径（2026-09-11 拍板）：已取消 / 已超时 → 待支付，重新扣座 / 占房，库存不够就拒；
+   * 原本付清过（状态事件里到过 PAID）且实收仍覆盖应收 → 直接回已支付（走既有 →PAID 钩子重建履约任务）。
+   *
+   * 准入（全部 fail-closed）：
+   *   · 状态 ∈ {CANCELLED, PAYMENT_TIMEOUT}；REFUNDED 一律拒（钱已退，要重开请重新下单）；
+   *   · 未软删；无处理中的退款申请（先批准/驳回再来）；
+   *   · 无已起飞航段（飞过的座位早被真实消耗，占回来是给过去的班次凭空加 sold，永久卡账）；
+   *   · 回程未走到「起飞后作废」终态。
+   * 库存：
+   *   · 机票按 flightSeatQuantity（婴儿不占座）走 _updateStatusWithinTx 既有的重新占座分支
+   *    （FOR UPDATE + 他人锁位 + 占位单 held + CAS），不另抄一份；余位不足 → 409 OVERSELL_CONFIRMATION_REQUIRED，
+   *     运营二次确认带 allowOversell 后按 no-show 恢复回程同一套口径超售（上限 FLIGHT_NOSHOW_MAX_OVERSELL_SEATS）；
+   *   · 酒店 / 随机档走建单同一把事务内房量闸（assertHotelStaysFitWithinTx / assertRandomTierStaysFitWithinTx），
+   *     内部录单限额内放行、超限用带数字文案拒，不认 allowOversell；
+   *   · 开票额度复检由 _updateStatusWithinTx 的取消族恢复分支顺带做（超限自动清标记 + 带回警示语）。
+   * 幂等：同 requestToken 重试只回放（token 落在 Order.adjustments 的 ORDER_RESTORED 流水上——
+   *   纯酒店单没有航段行、legActionLog 落不下，流水是所有订单都有的留痕位）。
+   * 已释放的回程行（flightScheduleId 为 null）重新占座分支天然跳过：恢复后要再走「恢复回程」。
+   *
+   * ⚠ 佣金不在此重建：取消时已整单冲销（REVERSED），createCommissionsForOrder 按档幂等把 REVERSED 也算
+   *   「已计提过」（防 force 复活重复计佣），恢复到 PAID 后代理佣金仍是冲销态 —— 需财务按口径另行补提，
+   *   响应 audit.commissionsReaccrued=false 明示，绝不在这里偷偷动钱。
+   */
+  async restoreCancelledOrder(
+    orderId: string,
+    input: RestoreCancelledOrderBody,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{ order: ReturnType<typeof serializeOrder>; audit: RestoreCancelledOrderAudit }> {
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可恢复已取消订单');
+    }
+    const requester: OrderRequester = { userId: actor.userId, role: actor.role, actorType: 'USER' };
+    const pendingFulfillmentTaskIds: string[] = [];
+    const invoiceCapWarnings: string[] = [];
+    const retakenSeats: RetakenSeatRecord[] = [];
+    const note = input.note?.trim() || null;
+
+    const audit = await prisma.$transaction(async (tx) => {
+      const lockRows = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE
+      `;
+      if (lockRows.length === 0) throw new NotFoundError('订单不存在');
+
+      const order = await tx.order.findUnique({
+        where: { id: orderId },
+        select: {
+          id: true,
+          orderNumber: true,
+          status: true,
+          deletedAt: true,
+          userId: true,
+          agentId: true,
+          total: true,
+          paidAmount: true,
+          adjustmentCny: true,
+          adjustments: true,
+          items: {
+            select: {
+              id: true,
+              kind: true,
+              description: true,
+              quantity: true,
+              flightScheduleId: true,
+              flightCabin: true,
+              hotelRoomTypeId: true,
+              hotelCheckIn: true,
+              hotelCheckOut: true,
+              roomsBilled: true,
+              randomStarTier: true,
+              metadata: true,
+              flightSchedule: {
+                select: {
+                  departureTime: true,
+                  departureTz: true,
+                  flight: { select: { flightNumber: true } },
+                },
+              },
+            },
+          },
+          passengers: { select: { gender: true } },
+          refunds: { select: { status: true } },
+        },
+      });
+      if (!order) throw new NotFoundError('订单不存在');
+
+      // ── 0. 幂等回放：同 token 已恢复过 → 原样回放，绝不二次占座 ──
+      const priorEntry = readOrderAdjustments(order.adjustments).find(
+        (e) => e.type === ORDER_RESTORED_ADJUSTMENT_TYPE && e.requestToken === input.requestToken,
+      );
+      if (priorEntry) {
+        const d = priorEntry.detail ?? {};
+        return {
+          orderNumber: order.orderNumber,
+          fromStatus: (typeof d.fromStatus === 'string' ? d.fromStatus : order.status) as OrderStatus,
+          toStatus: (typeof d.toStatus === 'string' ? d.toStatus : order.status) as OrderStatus,
+          seats: [],
+          seatTotal: typeof d.seatTotal === 'number' ? d.seatTotal : 0,
+          oversold: d.oversold === true,
+          oversoldBy: typeof d.oversoldBy === 'number' ? d.oversoldBy : 0,
+          displacedReserved: typeof d.displacedReserved === 'number' ? d.displacedReserved : 0,
+          hotelOversold: [],
+          randomTierOversold: [],
+          paymentExpiresAt: typeof d.paymentExpiresAt === 'string' ? d.paymentExpiresAt : null,
+          invoiceCapWarnings: [],
+          warnings: [],
+          commissionsReaccrued: false,
+          replayed: true,
+        } satisfies RestoreCancelledOrderAudit;
+      }
+
+      // ── 1. 准入闸 ──
+      const blockers: string[] = [];
+      if (order.deletedAt) {
+        blockers.push('订单在回收站（已软删），不能恢复；如需操作请先从回收站恢复订单。');
+      }
+      if (order.status === OrderStatus.REFUNDED) {
+        blockers.push('订单已退款（钱已退回），不能恢复占座；如需重开请重新下单。');
+      } else if (!RESTORABLE_CANCELLED_STATUSES.includes(order.status)) {
+        blockers.push(
+          `订单当前状态为「${zhStatus(order.status)}」，只有「已取消」「支付超时」的订单可以恢复。`,
+        );
+      }
+      const hasPendingRefund = order.refunds.some(
+        (r) =>
+          r.status === RefundStatus.REQUESTED ||
+          r.status === RefundStatus.APPROVED ||
+          r.status === RefundStatus.PROCESSING,
+      );
+      if (hasPendingRefund) {
+        blockers.push('本单还有处理中的退款申请，请先由财务批准或驳回该退款，再恢复订单。');
+      }
+      const now = new Date();
+      for (const item of order.items) {
+        if (item.kind !== OrderItemKind.FLIGHT || !item.flightScheduleId) continue;
+        if (isLegAlreadyFlown(item, now.getTime())) {
+          const sched = item.flightSchedule;
+          const flightNo = sched?.flight?.flightNumber ?? '航班未知';
+          const day = sched?.departureTime
+            ? localDateISO(sched.departureTime, sched.departureTz)
+            : '日期未知';
+          blockers.push(`已起飞的航段不能恢复：${item.description}（${flightNo} ${day}）。`);
+        }
+      }
+      const releaseState = resolveReturnReleaseState(order.items);
+      if (releaseState.voidedFinal) {
+        blockers.push('本单回程已过期作废（原班次已飞完），不能恢复。');
+      }
+      if (blockers.length > 0) throw new BadRequestError(blockers.join('；'));
+
+      const warnings: string[] = [];
+      if (releaseState.releasedNow && releaseState.item?.flightScheduleId == null) {
+        warnings.push(
+          '回程航段仍处于「已释放」状态，本次恢复不会占回回程座位；客人若要回程，恢复后请再用「恢复回程」。',
+        );
+      }
+
+      // ── 2. 目标状态：原本付清过且实收仍覆盖应收 → PAID；否则 PENDING_PAYMENT ──
+      const paidNum = round2(Number(order.paidAmount.toString()));
+      const dueNum = round2(Number(order.total.toString()) + Number(order.adjustmentCny ?? 0));
+      const paidEventCount = await tx.orderStatusEvent.count({
+        where: { orderId, toStatus: OrderStatus.PAID },
+      });
+      const toStatus: OrderStatus =
+        paidEventCount > 0 && paidNum + 0.001 >= dueNum
+          ? OrderStatus.PAID
+          : OrderStatus.PENDING_PAYMENT;
+
+      // ── 3. 酒店 / 随机档房量闸（建单同一把带行锁的事务内闸；订单仍是取消态，本单未计入占用）──
+      const stays: ProspectiveHotelStay[] = order.items
+        .filter(
+          (it) =>
+            (it.kind === OrderItemKind.HOTEL || it.kind === OrderItemKind.BUNDLE) &&
+            it.hotelCheckIn != null &&
+            it.hotelCheckOut != null,
+        )
+        .map((it) => ({
+          hotelRoomTypeId: it.hotelRoomTypeId,
+          hotelCheckIn: it.hotelCheckIn,
+          hotelCheckOut: it.hotelCheckOut,
+          roomsBilled: it.roomsBilled != null ? Number(it.roomsBilled.toString()) : null,
+          randomStarTier: it.randomStarTier,
+        }));
+      const hotelOversellCapRooms = await getHotelOversellCapRooms();
+      const hotelOversold = await assertHotelStaysFitWithinTx(
+        tx,
+        stays,
+        order.passengers.map((p) => ({ gender: p.gender ?? undefined })),
+        { maxOversellRooms: hotelOversellCapRooms },
+      );
+      const randomTierOversold = await assertRandomTierStaysFitWithinTx(tx, stays, {
+        maxOversellRooms: RANDOM_TIER_INTERNAL_NO_CAP,
+      });
+
+      // ── 4. 状态落地 + 重新占座（既有分支）+ 开票额度复检 + →PAID 钩子 ──
+      await this._updateStatusWithinTx(
+        tx,
+        orderId,
+        toStatus,
+        requester,
+        note ? `恢复已取消订单（重新占座）：${note}` : '恢复已取消订单（重新占座）',
+        pendingFulfillmentTaskIds,
+        undefined,
+        undefined,
+        invoiceCapWarnings,
+        { via: 'restore', allowOversell: input.allowOversell === true, retakenSeatsOut: retakenSeats },
+      );
+
+      // ── 5. 支付超时：后台/代理单 null（永不自动退位）；散客单重新给 30 分钟并重入队 ──
+      // 恢复后若留旧时间戳，超时 worker 会把刚占回的座秒放。身份口径同建单 isStaffEnteredOrder：
+      // 有代理归属即代理单；否则看下单人的角色（内部/代理账号 = 后台单；客户/游客 = 散客单）。
+      let staffEntered = order.agentId != null;
+      if (!staffEntered && order.userId) {
+        const owner = await tx.user.findUnique({ where: { id: order.userId }, select: { role: true } });
+        staffEntered = owner != null && STAFF_ENTRY_ROLES.includes(owner.role);
+      }
+      const paymentExpiresAt =
+        toStatus === OrderStatus.PENDING_PAYMENT && !staffEntered
+          ? new Date(now.getTime() + RETAIL_PAYMENT_TIMEOUT_MS)
+          : null;
+
+      const seatTotal = retakenSeats.reduce((n, r) => n + r.quantity, 0);
+      const oversoldBy = retakenSeats.reduce((n, r) => n + r.oversoldBy, 0);
+      const displacedReserved = retakenSeats.reduce((n, r) => n + r.displacedReserved, 0);
+      const oversold = oversoldBy > 0;
+
+      // ── 6. 留痕流水（金额恒 0）——幂等键就落在这里 ──
+      const adjustments = appendAdjustment(order.adjustments, {
+        type: ORDER_RESTORED_ADJUSTMENT_TYPE,
+        label:
+          `恢复已取消订单：${zhStatus(order.status)} → ${zhStatus(toStatus)}` +
+          `（重新占座 ${seatTotal} 座${oversold ? `，超售 ${oversoldBy} 座` : ''}，钱款不动）`,
+        amountCny: 0,
+        at: now.toISOString(),
+        by: actor.userId,
+        note: note ?? undefined,
+        requestToken: input.requestToken,
+        detail: {
+          fromStatus: order.status,
+          toStatus,
+          seatTotal,
+          oversold,
+          oversoldBy,
+          displacedReserved,
+          paymentExpiresAt: paymentExpiresAt ? paymentExpiresAt.toISOString() : null,
+        },
+      });
+      await tx.order.update({
+        where: { id: orderId },
+        data: { paymentExpiresAt, adjustments },
+      });
+
+      // ── 7. 回待支付：签证任务按建单口径补回（取消时被终态化成 CANCELLED，不补就从签证台消失到付款）──
+      if (toStatus === OrderStatus.PENDING_PAYMENT) {
+        await createVisaTaskAtCreation(tx, orderId, { reviveCancelled: true });
+      }
+
+      // ── 8. 超售 / 挤占预留的 CRITICAL 审计——**必须与占座同一事务**（口径同恢复回程）──
+      if (oversold || displacedReserved > 0) {
+        const seatsZh = retakenSeats
+          .filter((r) => r.oversoldBy > 0 || r.displacedReserved > 0)
+          .map(
+            (r) =>
+              `${r.itemLabel} ${CABIN_ZH_LABEL[r.cabin] ?? r.cabin}` +
+              `${r.oversoldBy > 0 ? ` 超售 +${r.oversoldBy}（累计 ${r.scheduleOversoldAfter}）` : ''}` +
+              `${r.displacedReserved > 0 ? ` 挤占预留 ${r.displacedReserved} 座` : ''}`,
+          )
+          .join('、');
+        await writeAuditWithinTx(tx, {
+          actor: { userId: actor.userId, role: actor.role },
+          action: 'RESTORE_CANCELLED_ORDER_OVERSOLD',
+          targetType: AuditTargetType.ORDER,
+          targetId: orderId,
+          targetLabel: `${order.orderNumber} · 恢复订单超售放行（${seatsZh}）`,
+          before: { status: order.status },
+          after: {
+            fromStatus: order.status,
+            toStatus,
+            seats: retakenSeats,
+            seatTotal,
+            oversold,
+            oversoldBy,
+            displacedReserved,
+            maxOversell: env.FLIGHT_NOSHOW_MAX_OVERSELL_SEATS,
+            hotelOversold,
+            randomTierOversold,
+            paymentExpiresAt: paymentExpiresAt ? paymentExpiresAt.toISOString() : null,
+            note,
+            replayed: false,
+          },
+          severity: AuditSeverity.CRITICAL,
+        });
+      }
+
+      return {
+        orderNumber: order.orderNumber,
+        fromStatus: order.status,
+        toStatus,
+        seats: retakenSeats,
+        seatTotal,
+        oversold,
+        oversoldBy,
+        displacedReserved,
+        hotelOversold,
+        randomTierOversold,
+        paymentExpiresAt: paymentExpiresAt ? paymentExpiresAt.toISOString() : null,
+        invoiceCapWarnings,
+        warnings,
+        commissionsReaccrued: false,
+        replayed: false,
+      } satisfies RestoreCancelledOrderAudit;
+    });
+
+    if (!audit.replayed) {
+      // 事务提交后：履约任务入队（与 updateStatus 同一套）+ 散客单重新排队超时释放。
+      if (pendingFulfillmentTaskIds.length > 0 && process.env.ENABLE_AUTO_FULFILLMENT === 'true') {
+        const { fulfillmentQueue } = await import('../../queues/queue.js');
+        for (const taskId of pendingFulfillmentTaskIds) {
+          void fulfillmentQueue.add('auto-fulfill', { taskId }, { jobId: taskId, delay: 1000 }).catch((e) => {
+            // eslint-disable-next-line no-console
+            console.error('[orders] failed to enqueue fulfillment task:', e);
+          });
+        }
+      }
+      if (audit.paymentExpiresAt) {
+        const holdMs = Math.max(0, new Date(audit.paymentExpiresAt).getTime() - Date.now());
+        try {
+          const { scheduleSeatHoldRelease } = await import('../../queues/queue.js');
+          await scheduleSeatHoldRelease(orderId, holdMs);
+        } catch (err) {
+          // eslint-disable-next-line no-console
+          console.error('[orders] failed to schedule seat-hold release after restore for', orderId, err);
+        }
+      }
+    }
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+    return { order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)), audit };
   }
 
   /**
@@ -7717,7 +8114,8 @@ export class OrderService {
         // 退座时也要按同一拆分各退各舱（否则会少退商务舱、多退经济舱）。
         const meta = (item.metadata ?? {}) as { businessUpgradeCount?: unknown };
         const rawUpgrade = typeof meta.businessUpgradeCount === 'number' ? meta.businessUpgradeCount : 0;
-        const split = computeBundleSeatSplit(item.flightCabin, item.quantity, rawUpgrade);
+        // 占座数口径（婴儿不占座）：与建单扣座同读 metadata.seatQuantity，老行缺省回落 quantity。
+        const split = computeBundleSeatSplit(item.flightCabin, flightSeatQuantity(item), rawUpgrade);
         await releaseSeat(item.flightScheduleId, 'BUSINESS', split.business);
         await releaseSeat(item.flightScheduleId, item.flightCabin, split.sameCabin);
       }
@@ -7800,7 +8198,8 @@ export class OrderService {
         // （否则会少占商务舱、多占经济舱，或漏占其中一段）。
         const meta = (item.metadata ?? {}) as { businessUpgradeCount?: unknown };
         const rawUpgrade = typeof meta.businessUpgradeCount === 'number' ? meta.businessUpgradeCount : 0;
-        const split = computeBundleSeatSplit(item.flightCabin, item.quantity, rawUpgrade);
+        // 占座数口径（婴儿不占座）：与上方放座分支严格对称，同读 metadata.seatQuantity。
+        const split = computeBundleSeatSplit(item.flightCabin, flightSeatQuantity(item), rawUpgrade);
         await retakeSeat(item.flightScheduleId, 'BUSINESS', split.business, item.description);
         await retakeSeat(item.flightScheduleId, item.flightCabin, split.sameCabin, item.description);
       }
@@ -9434,16 +9833,19 @@ export class OrderService {
       const rawUpgrade = typeof meta.businessUpgradeCount === 'number' ? meta.businessUpgradeCount : 0;
 
       if (!sameSeat) {
+        // 占座数口径（婴儿不占座）：放旧 / 拿新都按 metadata.seatQuantity，老行缺省回落 quantity；
+        // 婴儿单独一单 = 0 座 → 只改班次不动库存（两段 release / take 都短路）。
+        const seatQty = flightSeatQuantity(item);
         // ── 1. 释放旧座（按原拆分各退各舱）──
         // 用**有下限**版本 releaseSeatFloored（sold = GREATEST(0, sold − qty)），与状态机释放分支同口径：
         // 即便 businessUpgradeCount 被伪造导致想释放一个从未真正占用的舱位，也不会把 sold 打成负数卡账。
-        const oldSplit = computeBundleSeatSplit(oldCabin, item.quantity, rawUpgrade);
+        const oldSplit = computeBundleSeatSplit(oldCabin, seatQty, rawUpgrade);
         await releaseSeatFloored(tx, oldScheduleId, 'BUSINESS', oldSplit.business);
         await releaseSeatFloored(tx, oldScheduleId, oldCabin, oldSplit.sameCabin);
 
         // ── 2. 原子拿新座（同款 CAS；售罄 → 抛错，整事务回滚，旧座不会真被放掉）──
         // 拆座只对经济舱行成立；新舱位非经济舱则 split.business=0，全额拿新原舱。
-        const newSplit = computeBundleSeatSplit(newCabin, item.quantity, rawUpgrade);
+        const newSplit = computeBundleSeatSplit(newCabin, seatQty, rawUpgrade);
         await takeSeatWithinTx(tx, newScheduleId, 'BUSINESS', newSplit.business, null);
         await takeSeatWithinTx(tx, newScheduleId, newCabin, newSplit.sameCabin, null);
       }
@@ -10016,12 +10418,14 @@ export class OrderService {
       }
       const quantity = item.quantity;
       const diffCny = computeCabinUpgradeDiffCny(upgradeCnyPerLeg, quantity);
+      // 座位搬移按占座数（婴儿不占座；老行缺省回落 quantity）；差价仍按 quantity 算，本次不动钱的口径。
+      const seatQuantity = flightSeatQuantity(item);
 
       // ── 座位对称搬移（同事务原子；任一步失败整单回滚，绝不出现「经济舱放了、商务舱没拿到」）──
       // 放座用 floored 版本（与状态机释放同口径，不会把 sold 打成负数）；拿座用 CAS（最终防超售）。
-      await releaseSeatFloored(tx, item.flightScheduleId, CabinClass.ECONOMY, quantity);
+      await releaseSeatFloored(tx, item.flightScheduleId, CabinClass.ECONOMY, seatQuantity);
       try {
-        await takeSeatWithinTx(tx, item.flightScheduleId, CabinClass.BUSINESS, quantity, null);
+        await takeSeatWithinTx(tx, item.flightScheduleId, CabinClass.BUSINESS, seatQuantity, null);
       } catch (e) {
         // takeSeatWithinTx 的文案面向改期场景（「改期目标班次售罄」），这里换成升舱语境
         // ——错误类型不变（仍是 409），余位数字重新取一次，运营看到的就是本班次商务舱实况。
@@ -10047,7 +10451,7 @@ export class OrderService {
             ? Math.max(0, businessSeat.capacity - businessSeat.sold - locked - held)
             : 0;
           throw new ConflictError(
-            `商务舱余位不足：升舱需要 ${quantity} 座，该班次商务舱仅剩 ${remain} 座`,
+            `商务舱余位不足：升舱需要 ${seatQuantity} 座，该班次商务舱仅剩 ${remain} 座`,
           );
         }
         throw e;
@@ -11784,7 +12188,10 @@ export class OrderService {
     if (!target) throw new NotFoundError('目标班次不存在');
 
     const fromPrice = Number(item.unitPrice.toString());
-    const pricing = await this.pricing.calculatePrice(newScheduleId, item.flightCabin, item.quantity);
+    // 余票预检按占座数（婴儿不占座），价格仍按本行人数取平均（与建单 FLIGHT 行同口径）。
+    const pricing = await this.pricing.calculatePrice(newScheduleId, item.flightCabin, item.quantity, {
+      seatDemand: flightSeatQuantity(item),
+    });
     const toPrice = pricing.averageUnitPrice;
     return {
       fromPrice,
@@ -18166,7 +18573,8 @@ export class OrderService {
         const meta = readJsonObject(legItem.metadata);
         const rawUpgrade =
           typeof meta.businessUpgradeCount === 'number' ? meta.businessUpgradeCount : 0;
-        const split = computeBundleSeatSplit(legCabin, legItem.quantity, rawUpgrade);
+        // 占座数口径（婴儿不占座）：与建单扣座同读 metadata.seatQuantity，老行缺省回落 quantity。
+        const split = computeBundleSeatSplit(legCabin, flightSeatQuantity(legItem), rawUpgrade);
         await releaseSeatFloored(tx, legScheduleId, 'BUSINESS', split.business);
         await releaseSeatFloored(tx, legScheduleId, legCabin, split.sameCabin);
         if (split.business > 0) {
@@ -19048,7 +19456,12 @@ export class OrderService {
           const meta = readJsonObject(returnItem.metadata);
           const rawUpgrade =
             typeof meta.businessUpgradeCount === 'number' ? meta.businessUpgradeCount : 0;
-          const seatSplit = computeBundleSeatSplit(retCabin, returnItem.quantity, rawUpgrade);
+          // 占座数口径（婴儿不占座）：释放快照 releasedSeats 按此记录，恢复回程照快照占回，天然对称。
+          const seatSplit = computeBundleSeatSplit(
+            retCabin,
+            flightSeatQuantity(returnItem),
+            rawUpgrade,
+          );
           // 严格版释放（放不出就整单回滚）：释放量与写进快照的 releasedSeats 必须恒等，
           // 否则恢复回程会照快照多占回来 —— 见 releaseSeatStrictWithinTx 的注释。
           await releaseSeatStrictWithinTx(tx, retScheduleId, 'BUSINESS', seatSplit.business);

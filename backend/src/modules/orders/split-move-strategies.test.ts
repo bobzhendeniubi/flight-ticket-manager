@@ -221,6 +221,67 @@ describe('moveFlightLike · 按人数行', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
+describe('moveFlightLike · 占座数（metadata.seatQuantity，婴儿不占座）随拆分账', () => {
+  it('纯机票 2 大 1 婴（quantity 3、seatQuantity 2）拆走 1 位大人 → 拆出 1 座 / 留守 1 座，Σ 恒等', () => {
+    const c = ctx({
+      movedIdSet: new Set(['p1']),
+      movedOccupancy: occ(1),
+      keptOccupancy: occ(1, 0, 1), // 留守 1 大 + 1 婴
+    });
+    const plan = moveFlightLike(
+      item({ quantity: 3, amount: 3000, metadata: { seatQuantity: 2, infantCount: 1 } }),
+      c,
+    );
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    expect(plan.move.metadata).toMatchObject({ seatQuantity: 1, infantCount: 0 });
+    expect(plan.keep.metadata).toMatchObject({ seatQuantity: 1, infantCount: 1 });
+  });
+
+  it('拆走「大人 + 婴儿」：拆出侧 1 座、留守侧 1 座，婴儿数跟人走', () => {
+    const c = ctx({
+      movedIdSet: new Set(['p1', 'p3']),
+      movedOccupancy: occ(1, 0, 1),
+      keptOccupancy: occ(1),
+    });
+    const plan = moveFlightLike(
+      item({ quantity: 3, amount: 3000, metadata: { seatQuantity: 2, infantCount: 1 } }),
+      c,
+    );
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    expect(plan.move.metadata).toMatchObject({ seatQuantity: 1, infantCount: 1 });
+    expect(plan.keep.metadata).toMatchObject({ seatQuantity: 1, infantCount: 0 });
+  });
+
+  it('整行搬走（WHOLE）→ seatQuantity 原样继承（不在剥除清单里）', () => {
+    const plan = moveFlightLike(
+      item({ quantity: 1, metadata: { seatQuantity: 1, infantCount: 0 } }),
+      ctx(),
+    );
+    expect(plan.mode).toBe('WHOLE');
+    if (plan.mode !== 'WHOLE') throw new Error('unreachable');
+    expect(plan.update.metadata).toMatchObject({ seatQuantity: 1 });
+  });
+
+  it('老行没有 seatQuantity → 两侧都不凭空加键（继续回落 quantity）', () => {
+    const plan = moveFlightLike(item(), ctx());
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    expect(plan.keep.metadata).toBeUndefined();
+    expect(plan.move.metadata).not.toHaveProperty('seatQuantity');
+  });
+
+  it('签证行（按人头）不走占座数分账', () => {
+    const plan = moveFlightLike(
+      item({ kind: OrderItemKind.VISA, quantity: 3, metadata: { seatQuantity: 2 } }),
+      ctx(),
+    );
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    expect(plan.keep.metadata).toBeUndefined();
+    // 拆出侧原样继承源行 metadata（非 FLIGHT 行本就不该有这个键，这里只验不被重算）
+    expect((plan.move.metadata as Record<string, unknown>).seatQuantity).toBe(2);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
 describe('planItemMove · 终态航段行不随拆', () => {
   it('回程已过期作废（returnVoidedFinal）→ NONE，整块留源单', () => {
     const view = item({ quantity: 3, metadata: { returnVoidedFinal: { at: '2026-09-02T00:00:00.000Z' } } });

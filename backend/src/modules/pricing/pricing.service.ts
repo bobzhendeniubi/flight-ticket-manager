@@ -52,11 +52,16 @@ export class PricingService {
    * 计算指定班次、舱位、数量的动态价格。
    *
    * 不修改 sold — 只读查询。
+   *
+   * @param opts.seatDemand 余票预检按几座算（缺省 = qty）。婴儿不占座：纯机票单 quantity 含婴儿，
+   *   建单时按服务端派生的占座数传入（见 flight-seat-quantity.ts）；金额仍按 qty 算，不动钱。
+   *   婴儿单独一单 seatDemand=0 → 售罄班次照样能录（它一座都不占）。
    */
   async calculatePrice(
     scheduleId: string,
     cabin: CabinClass,
     qty: number,
+    opts?: { seatDemand?: number },
   ): Promise<PriceResult> {
     // 1. 查 FlightSeatClass
     const seatClass = await prisma.flightSeatClass.findFirst({
@@ -71,10 +76,12 @@ export class PricingService {
     const basePrice = Number(basePriceDec);
 
     // 余票检查（两种模式都保持这条不变 —— 容量是硬上限，与定价模式无关）
+    // 按「占座数」预检（婴儿不占座），缺省与 qty 相同；夹在 [0, qty]，不信任比 qty 还大的入参。
+    const seatDemand = Math.min(qty, Math.max(0, Math.trunc(opts?.seatDemand ?? qty)));
     const available = capacity - sold;
-    if (qty > available) {
+    if (seatDemand > available) {
       throw new BadRequestError(
-        `${cabin} 余票仅 ${available} 张，不够 ${qty} 张。` +
+        `${cabin} 余票仅 ${available} 张，不够 ${seatDemand} 张。` +
           (available > 0 ? `最多可购 ${available} 张。` : '已售罄。'),
       );
     }

@@ -223,6 +223,8 @@ const emptyPassenger = (): PassengerRow => ({ fullName: '', documentNumber: '', 
 
 /** 护照有效期距出发日不足此天数 → 录单提示（不拦截；业务口径：临期护照也可开票）。 */
 const PASSPORT_EXPIRY_HINT_DAYS = 90;
+/** 婴儿阈值（实足年龄 <2 岁不占座），与服务端 PTC 派生同口径；仅用于录单提示文案。 */
+const INFANT_MAX_AGE_YEARS = 2;
 
 /** 宽松生日解析 → YYYY-MM-DD；接受 1990-01-01 / 1990/1/1 / 1990.1.1，非法返回 null。 */
 function parseDob(raw: string): string | null {
@@ -741,6 +743,30 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     return `护照有效期不足 ${PASSPORT_EXPIRY_HINT_DAYS} 天（相对出发日 ${earliest}）：${names.join('、')}。仍可下单开票，请先与客人确认目的地的护照有效期要求；有效期不足 6 个月会自动加收临期附加费。`;
   }, [isBundleOrder, departDate, blocks, passengers]);
 
+  // 机票区块「占座 N 人（婴儿 M 人不占座）」提示：按出生日期 × 最早机票出发日算实足年龄，
+  // <2 岁记婴儿（与服务端 derivePtcByAge 同阈值）。**仅展示**——提交的 quantity 仍是全部出行人数，
+  // 占座数由服务端按派生后的乘客类型权威写入，这里算错也不会影响座位账。套餐单另有三计数，不走这里。
+  const flightInfantPax = useMemo(() => {
+    if (isBundleOrder) return 0;
+    const departYmds = blocks
+      .filter((b) => b.kind === 'FLIGHT' && b.scheduleDate)
+      .map((b) => b.scheduleDate);
+    if (departYmds.length === 0) return 0;
+    const earliest = departYmds.reduce((min, d) => (d < min ? d : min));
+    const depart = new Date(`${earliest}T00:00:00Z`);
+    if (Number.isNaN(depart.getTime())) return 0;
+    return validPassengers.filter((p) => {
+      const dobYmd = parseDob(p.dateOfBirth);
+      if (!dobYmd) return false;
+      const dob = new Date(`${dobYmd}T00:00:00Z`);
+      let age = depart.getUTCFullYear() - dob.getUTCFullYear();
+      const monthDiff = depart.getUTCMonth() - dob.getUTCMonth();
+      if (monthDiff < 0 || (monthDiff === 0 && depart.getUTCDate() < dob.getUTCDate())) age -= 1;
+      return age >= 0 && age < INFANT_MAX_AGE_YEARS;
+    }).length;
+  }, [isBundleOrder, blocks, validPassengers]);
+  const flightSeatPax = Math.max(0, validPassengers.length - flightInfantPax);
+
   // ── 套餐乘客级「住法 + 签证」（购物车模式）──
   // 住法列：套餐单都显示；签证列：套餐含签证组件，或配了自备签减免额（selfVisaDeductCny>0）时显示。
   //   旧口径只看减免额（「无价差 = 展示无意义」），但自备签同时决定该乘客**进不进签证台**——
@@ -1196,6 +1222,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     hotels,
     visas,
     transfers,
+    // 机票行 quantity = 全部出行人数（含婴儿）：服务端乘客数校验要求二者相等；
+    // 占座数（婴儿不占座）由服务端权威派生写进行 metadata，这里不减婴儿。
     seatPax: Math.max(1, validPassengers.length || 1),
   };
 
@@ -2137,7 +2165,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   transfers={transfers}
                   onLoadError={setErr}
                   inputCls={inputCls}
-                  seatPax={validPassengers.length}
+                  seatPax={flightSeatPax}
+                  infantPax={flightInfantPax}
                 />
               )}
             </div>
@@ -2158,7 +2187,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                 transfers={transfers}
                 onLoadError={setErr}
                 inputCls={inputCls}
-                seatPax={validPassengers.length}
+                seatPax={flightSeatPax}
+                infantPax={flightInfantPax}
               />
             ))}
 
