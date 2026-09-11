@@ -1,0 +1,168 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>反馈表总和（9/11）七项变化 操作说明 — 世途旅行·运营控制台</title>
+<style>
+  :root{
+    --indigo:#4F46E5; --indigo-dark:#4338CA; --indigo-50:#EEF2FF;
+    --ink:#0F172A; --ink-soft:#334155; --muted:#64748B;
+    --bg:#F1F5F9; --card:#FFFFFF; --line:#E2E8F0;
+    --amber-bg:#FFFBEB; --amber-line:#FDE68A;
+    --green:#059669; --green-bg:#ECFDF5;
+    --red-bg:#FEF2F2;
+    --blue-bg:#EFF6FF;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Inter','PingFang SC','Hiragino Sans GB','Microsoft YaHei',system-ui,-apple-system,sans-serif;color:var(--ink-soft);background:var(--bg);line-height:1.85;font-size:15px}
+  .page{max-width:900px;margin:0 auto;background:var(--card);padding:40px 44px 72px;box-shadow:0 0 24px rgba(15,23,42,.06)}
+  h1,h2,h3{color:var(--ink);line-height:1.35}
+  h1{font-size:26px;margin:0 0 6px}
+  h2{font-size:20px;margin:40px 0 12px;padding:10px 14px;background:var(--indigo-50);border-left:5px solid var(--indigo);border-radius:0 8px 8px 0}
+  h3{font-size:16.5px;margin:24px 0 8px;color:var(--indigo-dark)}
+  p{margin:10px 0}
+  .sub{color:var(--muted);font-size:13.5px;margin:0 0 4px}
+  .cover{border-bottom:3px solid var(--indigo);padding-bottom:18px;margin-bottom:22px}
+  .cover .brand{display:inline-block;background:var(--indigo);color:#fff;font-weight:700;font-size:13px;padding:3px 12px;border-radius:999px;letter-spacing:.5px;margin-bottom:10px}
+  .lead{background:var(--indigo-50);border-radius:10px;padding:14px 18px;margin:16px 0 8px;color:var(--ink);font-size:15.5px}
+  .shot{margin:14px 0 4px;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
+  .shot img{display:block;width:100%;height:auto}
+  .shot.narrow{max-width:560px}
+  .cap{color:var(--muted);font-size:13px;margin:4px 0 16px;text-align:center}
+  .tip,.info,.warn,.danger{border-radius:10px;padding:12px 16px;margin:14px 0}
+  .tip{background:var(--green-bg);border:1px solid #A7F3D0}
+  .info{background:var(--blue-bg);border:1px solid #BFDBFE}
+  .warn{background:var(--amber-bg);border:1px solid var(--amber-line)}
+  .danger{background:var(--red-bg);border:1px solid #FECACA}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14.5px}
+  table.doc th,table.doc td{border:1px solid var(--line);padding:8px 12px;text-align:left;vertical-align:top}
+  table.doc th{background:#F8FAFC;color:var(--ink)}
+  ol.steps{padding-left:22px}
+  ol.steps li{margin:6px 0}
+  .toc{background:#F8FAFC;border:1px solid var(--line);border-radius:10px;padding:12px 18px 12px 34px;margin:14px 0 6px}
+  .toc li{margin:3px 0}
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="cover">
+  <span class="brand">运营控制台</span>
+  <h1>反馈表总和（9/11）七项变化 操作说明</h1>
+  <p class="sub">婴儿不占座 · 已取消单可恢复 · 内容列改护照信息 · 可用次数 · 票务导出剔取消单 · 导出签证文案 · 套餐批量按人结算价　·　2026-09-11</p>
+</div>
+
+<div class="lead">
+在线反馈表 9 月 10 日晚更新的 7 条，这次全部做了并已上线。下面按条说：一句"解决了什么"，再给操作步骤和截图。
+</div>
+
+<ol class="toc">
+  <li><a href="#s1">婴儿不占座了</a></li>
+  <li><a href="#s2">已取消 / 支付超时的订单可以恢复，重新占座占房</a></li>
+  <li><a href="#s3">订单列表内容列改成护照信息</a></li>
+  <li><a href="#s4">订单页直接看已飞 / 在订未飞 / 可用次数</a></li>
+  <li><a href="#s5">票务开票导出不再混进已取消单</a></li>
+  <li><a href="#s6">导出表签证状态：自备签和不需要签证合并</a></li>
+  <li><a href="#s7">套餐批量创单也能按人填结算价</a></li>
+</ol>
+
+<h2 id="s1">一、婴儿不占座了</h2>
+
+<p><strong>解决了什么：</strong>婴儿单独录一张单（或和大人同单）以前也会扣掉一个机位，座位统计跟着多算。现在系统按出生日期自动认出婴儿（出发日不满 2 周岁），机票行只按<strong>成人 + 儿童</strong>扣座，婴儿不占座。金额、乘客人数、出票额度都不变。</p>
+
+<h3>怎么操作</h3>
+<ol class="steps">
+  <li>录单和以前一样，正常填出生日期即可，不用额外选"婴儿"。</li>
+  <li>单笔录单的机票区块会显示「占座 N 人（婴儿 M 人不占座）」，核对一眼就行。</li>
+  <li>婴儿单独一张单：机位扣 0 个，订单照常建，价格按你填的结算价走。</li>
+</ol>
+
+<div class="info">
+上线前录进去的婴儿单已经统一清查过：只有一张多占了座，已经把那个机位退回航班库存。之后录的单不会再多占。
+</div>
+
+<div class="warn">
+两条还没定的口径先说明：①升舱差价目前仍按乘客人数算（1 大 1 婴升舱收 2 份差价）；②换人或改生日把成人改成婴儿（或反过来）时，机位数不会自动加减。这两条需要的话告诉我们。
+</div>
+
+<h2 id="s2">二、已取消 / 支付超时的订单可以恢复，重新占座占房</h2>
+
+<p><strong>解决了什么：</strong>以前订单取消了只能重新录一张。现在订单详情里可以直接"恢复"，系统按原航段、原酒店重新扣座扣房；库存不够会拒绝，不会偷偷超卖。</p>
+
+<h3>怎么操作</h3>
+<ol class="steps">
+  <li>打开已取消（或支付超时）订单的详情，最下面展开「更多操作（状态流转）」。</li>
+  <li>点「恢复订单（重新占座）」，确认弹窗里写着会重新扣座扣房。</li>
+  <li>恢复后订单回到<strong>待支付</strong>；如果这张单原本已付清且钱还在单上，直接回到<strong>已支付</strong>，履约任务会重新生成。</li>
+  <li>机位不够时会再弹一次确认，问你要不要按超售放行（会记关键审计）；酒店房量不够直接拒绝，提示缺哪家哪晚。</li>
+</ol>
+
+<div class="shot"><img src="shots-2026-09-11-反馈表总和2/04-已取消单-恢复订单按钮.png"></div>
+<p class="cap">已取消单详情 → 更多操作 → 「恢复订单（重新占座）」</p>
+
+<table class="doc">
+  <tr><th>情况</th><th>结果</th></tr>
+  <tr><td>已取消 / 支付超时，没付过或没付清</td><td>恢复为待支付，机位房量重新占上</td></tr>
+  <tr><td>已取消，原本付清且钱还在单上</td><td>恢复为已支付，履约任务重建</td></tr>
+  <tr><td>已退款（钱已退回去）</td><td>不能恢复，请重新录单</td></tr>
+  <tr><td>有进行中的退款申请</td><td>先让财务批准或驳回退款，再恢复</td></tr>
+  <tr><td>任一航段已经起飞</td><td>不能恢复</td></tr>
+  <tr><td>机位不够</td><td>二次确认后可按超售放行；超过上限拒绝</td></tr>
+  <tr><td>酒店房量不够</td><td>拒绝，提示缺几间</td></tr>
+</table>
+
+<div class="warn">
+后台录的单和代理单恢复后<strong>不会</strong>再自动超时释放机位；散客单恢复后 30 分钟不付款仍会自动释放。
+代理佣金不随恢复自动重提，需要财务按口径补提。
+</div>
+
+<h2 id="s3">三、订单列表内容列改成护照信息</h2>
+
+<p><strong>解决了什么：</strong>内容列以前显示航班和套餐文字，后面本来就有航班号和日期列，重复了。现在内容列每位乘客一行：<strong>姓名（中文名）· 性别 · 生日 · 证件号 · 有效期</strong>，婴儿 / 儿童带小标，护照临期（不足 180 天）琥珀色提示。</p>
+
+<div class="shot"><img src="shots-2026-09-11-反馈表总和2/01-列表-内容列护照信息.png"></div>
+<p class="cap">内容列：每人一行护照信息；超过 3 人折叠成「还有 N 位」，点开看全</p>
+
+<div class="info">
+列表里证件号仍是打码的，全号在订单详情里看（和以前一样）。产品类型徽章、住宿摘要、航段状态标保留。
+</div>
+
+<h2 id="s4">四、订单页直接看已飞 / 在订未飞 / 可用次数</h2>
+
+<p><strong>解决了什么：</strong>以前要导出才能看次数。现在列表里点开乘客明细，每个人后面直接显示「已飞 N · 在订未飞 M · 可用 K」；订单详情的乘客卡片也把"在订未飞"摆成明文。</p>
+
+<div class="shot"><img src="shots-2026-09-11-反馈表总和2/02-列表-展开子行次数.png"></div>
+<p class="cap">展开乘客明细：每人一组次数徽章（演示数据都是 0，显示「无记录」）</p>
+
+<div class="warn">
+「可用」的算法没有改，仍然是<strong>已飞 − 已核销</strong>（权益核销按它拦）；在订未飞单独显示、不计入可用。
+运营提的"可用 = 已飞 + 在订未飞"我们还想确认一件事：<strong>在订未飞的单后来取消了，这一次怎么算？</strong>请回复后我们再定要不要改口径。
+</div>
+
+<h2 id="s5">五、票务开票导出不再混进已取消单</h2>
+
+<p><strong>解决了什么：</strong>票务开票导出默认本来就不含已取消单，但在列表里勾选了行（包括已取消的）再导出，勾中的取消单会一起进开票表。现在票务模板不管勾没勾选，一律剔除已取消 / 退款类订单，导出后会提示「已跳过 N 张已取消/退款单」。票务开票导出面板里的预览计数也同口径。</p>
+
+<div class="shot"><img src="shots-2026-09-11-反馈表总和2/03-票务开票导出面板.png"></div>
+<p class="cap">票务开票导出面板：预览与导出都不含已取消 / 退款单</p>
+
+<div class="info">
+《全岗可用》《签证专用》和全岗总表（全部岗位）不变：勾选了什么就导什么，已取消单要看请用「已取消/退款单导出」。
+</div>
+
+<h2 id="s6">六、导出表签证状态：自备签和不需要签证合并</h2>
+
+<p><strong>解决了什么：</strong>《全岗可用》和全岗总表的签证状态列以前分「不需要 / 已签证 / 自备签」三种，运营说这三种对你们是一回事。现在都显示为<strong>「不需要签证」</strong>。签证金额、签证公司、备注列不变（自备签金额仍是 0），签证台页面不受影响。</p>
+
+<h2 id="s7">七、套餐批量创单也能按人填结算价</h2>
+
+<p><strong>解决了什么：</strong>9 月 10 日机票批量创单已经能按人填结算价，套餐批量创单也补上了。名单每行的「结算价/人」填的是这个人<strong>整单的价</strong>（含单房差、升舱、指定酒店加价），留空的人按结算价日历走。和 OTA 结算单价、批量优惠仍然二选一。</p>
+
+<p style="margin-top:44px;color:#94A3B8;font-size:12.5px;border-top:1px solid #E2E8F0;padding-top:12px">
+世途旅行 · 运营控制台　|　反馈表总和（9/11）七项变化操作说明　|　2026-09-11　|　文中金额与单号为演示数据
+</p>
+
+</div>
+</body>
+</html>
