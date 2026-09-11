@@ -62,6 +62,7 @@ import {
   noShowPreviewBodySchema,
   noShowReportQuerySchema,
   restoreReturnLegBodySchema,
+  restoreCancelledOrderBodySchema,
   voidReturnLegBodySchema,
   splitRoomGroupBodySchema,
   swapRefundBodySchema,
@@ -1273,6 +1274,52 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         severity: 'WARNING',
       });
       return { ok: true, id: after.id, deletedAt: after.deletedAt };
+    },
+  );
+
+  // POST /orders/:id/restore-cancelled — 已取消 / 支付超时的订单恢复占位（ADMIN + STAFF；代理 403）。
+  //   body: { requestToken, allowOversell?, note? }。已取消 → 待支付（原本付清过且实收仍覆盖应收 → 已支付），
+  //   重新扣座 / 占房；机票余位不足 → 409 OVERSELL_CONFIRMATION_REQUIRED（前端二次确认后带 allowOversell 重提，
+  //   超售放行按最高等级留痕）；酒店/随机档走内部录单既有超售限额，超限 400。同 requestToken 重试只回放。
+  //   与上面 /:id/restore（回收站恢复，只翻 deletedAt）是两件事：那条从不动座位账，这条就是为了重新占座。
+  app.post(
+    '/:id/restore-cancelled',
+    { preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)] },
+    async (req) => {
+      const { id } = req.params as { id: string };
+      const body = restoreCancelledOrderBodySchema.parse(req.body);
+      const { order, audit } = await service.restoreCancelledOrder(id, body, {
+        userId: req.user.sub,
+        role: req.user.role,
+      });
+      // 超售 / 挤占预留的 CRITICAL 审计已在 service 的占座事务里写过（与占座同生共死），
+      // 这里只记普通恢复那一档，免得同一次放行在审计里出现两次；回放不再记。
+      if (!audit.replayed && !audit.oversold && audit.displacedReserved === 0) {
+        void writeAudit({
+          actor: actorFromRequest(req),
+          action: 'RESTORE_CANCELLED_ORDER',
+          targetType: 'ORDER',
+          targetId: id,
+          targetLabel: `${audit.orderNumber} · 恢复已取消订单（重新占座 ${audit.seatTotal} 座）`,
+          before: { status: audit.fromStatus },
+          after: {
+            fromStatus: audit.fromStatus,
+            toStatus: audit.toStatus,
+            seats: audit.seats,
+            seatTotal: audit.seatTotal,
+            oversold: false,
+            hotelOversold: audit.hotelOversold,
+            randomTierOversold: audit.randomTierOversold,
+            paymentExpiresAt: audit.paymentExpiresAt,
+            invoiceCapWarnings: audit.invoiceCapWarnings,
+            commissionsReaccrued: audit.commissionsReaccrued,
+            note: body.note ?? null,
+            replayed: false,
+          },
+          severity: 'WARNING',
+        });
+      }
+      return { order, audit };
     },
   );
 

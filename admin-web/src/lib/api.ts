@@ -4103,6 +4103,42 @@ export interface RestoreReturnLegPreview {
   warnings?: string[];
 }
 
+/** POST /orders/:id/restore-cancelled 的回包：恢复后的整单 + 占回明细。 */
+export interface RestoreCancelledOrderResult {
+  order: OrderSummary;
+  audit: {
+    orderNumber: string;
+    fromStatus: OrderStatus;
+    toStatus: OrderStatus;
+    seats: Array<{
+      scheduleId: string;
+      cabin: string;
+      quantity: number;
+      itemLabel: string;
+      oversold: boolean;
+      oversoldBy: number;
+      scheduleOversoldAfter: number;
+      displacedReserved: number;
+    }>;
+    seatTotal: number;
+    oversold: boolean;
+    oversoldBy: number;
+    displacedReserved: number;
+    /** 内部录单限额内放行的酒店超卖明细（空 = 房量够）。 */
+    hotelOversold: unknown[];
+    randomTierOversold: unknown[];
+    /** 后台/代理单 null（永不自动超时）；散客单 now+30min。 */
+    paymentExpiresAt: string | null;
+    /** 开票额度复检清掉的标记提示（有就要弹给票务台）。 */
+    invoiceCapWarnings: string[];
+    /** 非阻断提示（如回程仍处于已释放态，恢复后要再走「恢复回程」）。 */
+    warnings: string[];
+    /** 恒 false：佣金不随恢复重建，财务按口径另行补提。 */
+    commissionsReaccrued: boolean;
+    replayed: boolean;
+  };
+}
+
 export interface RestoreReturnLegResult {
   order: OrderSummary;
   audit: {
@@ -5316,6 +5352,19 @@ export const api = {
     body: { requestToken: string; allowOversell?: boolean; note?: string },
   ) =>
     apiFetch<RestoreReturnLegResult>(`/orders/${orderId}/restore-return-leg`, {
+      method: 'POST',
+      token,
+      body,
+    }),
+  // 已取消 / 支付超时的订单恢复占位（ADMIN/STAFF）：→ 待支付（原本付清过 → 已支付），重新扣座扣房。
+  // 机票余位不足时后端 409 OVERSELL_CONFIRMATION_REQUIRED，二次确认后带 allowOversell:true 用同一个
+  // requestToken 重提（幂等键不换，不会重复占座）；酒店/随机档超限直接 400，不认这个位。
+  restoreCancelledOrder: (
+    token: string,
+    orderId: string,
+    body: { requestToken: string; allowOversell?: boolean; note?: string },
+  ) =>
+    apiFetch<RestoreCancelledOrderResult>(`/orders/${orderId}/restore-cancelled`, {
       method: 'POST',
       token,
       body,

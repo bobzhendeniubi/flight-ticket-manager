@@ -1,6 +1,6 @@
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type VoidReturnLegPreview, type OrderLegFlagFilter, type PublicLegStatus, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE, TOKEN_PAYLOAD_MISMATCH_CODE, TOKEN_PAYLOAD_MISMATCH_HINT } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type RestoreCancelledOrderResult, type VoidReturnLegPreview, type OrderLegFlagFilter, type PublicLegStatus, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE, TOKEN_PAYLOAD_MISMATCH_CODE, TOKEN_PAYLOAD_MISMATCH_HINT } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -5289,6 +5289,69 @@ function OrderDrawer({
   // 运营专属（ADMIN/STAFF）：更改归属代理 + 事后补收单房差。复用上面已解析的 role。
   const isOps = role === 'ADMIN' || role === 'STAFF';
   const [agentEditOpen, setAgentEditOpen] = useState(false);
+  // 已取消 / 支付超时 → 恢复占位（运营/管理员）。不是状态机流转（后端 CANCELLED 仍是终态），
+  // 走专用端点：重新扣座扣房、库存不够就拒；航段余位不足时后端 409 让运营二次确认超售，
+  // 重提沿用同一个 requestToken（幂等键不换，不会重复占座）。后端拒绝原因原样弹出。
+  const [restoringCancelled, setRestoringCancelled] = useState(false);
+  const canRestoreCancelled = isOps && (o.status === 'CANCELLED' || o.status === 'PAYMENT_TIMEOUT');
+  const restoreCancelled = async () => {
+    if (!token || highRiskConfirmRef.current) return;
+    highRiskConfirmRef.current = true;
+    try {
+      const ok = await confirm({
+        title: `恢复订单 ${o.orderNumber}（重新占座）？`,
+        body:
+          `订单将从「${orderStatusLabel(o.status)}」恢复为待支付（此前已付清的单恢复为已支付），` +
+          '系统会按原航段、原酒店重新扣座扣房；余位/房量不足会被拒绝并说明原因。\n\n' +
+          '后台/代理录入的单恢复后不会自动超时释放；前台散客单重新给 30 分钟支付时限。\n' +
+          '钱款与收款记录不动；退款申请中、已退款、航段已起飞的单不能恢复。',
+        tone: 'danger',
+        confirmText: '恢复并重新占座',
+      });
+      if (!ok) return;
+      const requestToken = crypto.randomUUID();
+      setRestoringCancelled(true);
+      const submit = (allowOversell?: boolean) =>
+        api.restoreCancelledOrder(token, o.id, { requestToken, allowOversell });
+      let res: RestoreCancelledOrderResult;
+      try {
+        res = await submit();
+      } catch (e) {
+        // 只有「余位不足、后端允许超售放行」这一种失败可以二次确认重提；其余原因原样弹出。
+        if (!(e instanceof ApiError) || e.code !== OVERSELL_CONFIRMATION_REQUIRED_CODE) throw e;
+        const again = await confirm({
+          title: '航段余位不足，确认超售恢复？',
+          body: `${e.message}\n\n确认后将超出该舱位余位直接占座并记关键审计；超过系统超售上限仍会被拒绝。`,
+          tone: 'danger',
+          confirmText: '确认超售并恢复',
+        });
+        if (!again) return;
+        res = await submit(true);
+      }
+      onOrderUpdated?.(res.order);
+      bumpSeats();
+      onChanged?.();
+      const lines = [
+        `订单已恢复为「${orderStatusLabel(res.audit.toStatus)}」，重新占座 ${res.audit.seatTotal} 座` +
+          (res.audit.oversold ? `（其中超售 ${res.audit.oversoldBy} 座，已记关键审计）` : '') +
+          (res.audit.displacedReserved > 0
+            ? `（占用了 ${res.audit.displacedReserved} 座他人临时锁位/占位余座）`
+            : '') +
+          '。',
+        ...res.audit.warnings,
+        ...res.audit.invoiceCapWarnings,
+      ];
+      if (res.audit.toStatus === 'PAID' && o.agent) {
+        lines.push('代理佣金不随恢复自动重建，请财务按口径补提。');
+      }
+      alert(lines.join('\n'));
+    } catch (e) {
+      alert(e instanceof ApiError ? `恢复失败：${e.message}` : '恢复失败');
+    } finally {
+      setRestoringCancelled(false);
+      highRiskConfirmRef.current = false;
+    }
+  };
   // 拆单（split PNR 售后逃生门）：仅 ADMIN/STAFF 且乘客 ≥ 2 时 OpsToolbar 才给入口。
   const [splitOpen, setSplitOpen] = useState(false);
   // no-show 处理面板（仅 ADMIN/STAFF；本单有去程航段且没标过 no-show 才给入口）。
@@ -6052,6 +6115,26 @@ function OrderDrawer({
                 </button>
               ))}
             </div>
+            {/* 已取消 / 支付超时 → 恢复占位（运营/管理员）：专用端点，不是状态机流转。
+                重新扣座扣房、库存不够就拒；航段余位不足可二次确认超售（记关键审计）。 */}
+            {canRestoreCancelled && (
+              <div className="mt-3 rounded-lg border border-emerald-200 bg-emerald-50/60 p-3">
+                <div className="flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    className="btn-secondary text-sm"
+                    disabled={restoringCancelled}
+                    onClick={() => void restoreCancelled()}
+                    title="恢复为待支付（已付清的单恢复为已支付），按原航段/酒店重新扣座扣房；库存不够会被拒绝"
+                  >
+                    <Icon name="refresh" /> {restoringCancelled ? '恢复中…' : '恢复订单（重新占座）'}
+                  </button>
+                  <span className="text-[11px] text-emerald-800">
+                    重新扣座扣房，余位/房量不足会被拒绝；后台/代理单恢复后不会自动超时释放。
+                  </span>
+                </div>
+              </div>
+            )}
             <p className="mt-3 text-xs text-ink-muted">
               ⓘ 状态变更会真实写入数据库并记录操作事件。仅显示当前状态允许的流转；不在此列的目标需管理员强制。
             </p>

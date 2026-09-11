@@ -1916,6 +1916,19 @@ export const restoreReturnLegBodySchema = z.object({
 });
 export type RestoreReturnLegBody = z.infer<typeof restoreReturnLegBodySchema>;
 
+// ── 已取消单恢复（POST /orders/:id/restore-cancelled；ADMIN/STAFF）──────────────
+// 运营需求：已取消/超时的订单要能「恢复权限，重新占位」。恢复 = 已取消/已超时 → 待支付
+//（原本付清过且实收仍覆盖应收 → 已支付），重新扣座/占房；库存不够就拒。
+// requestToken 为幂等键：同 (订单, token) 重试只回放既有结果，绝不二次占座。
+export const restoreCancelledOrderBodySchema = z.object({
+  requestToken: z.string().min(8).max(64).uuid(),
+  // 航段余位不足时的「确认超售」回执；缺省 false → 服务端回 409 OVERSELL_CONFIRMATION_REQUIRED。
+  // 只管机票座位：酒店/随机档走内部录单既有的超售限额口径，超限一律拒，不认这个位。
+  allowOversell: z.boolean().default(false),
+  note: z.string().max(200).optional(),
+});
+export type RestoreCancelledOrderBody = z.infer<typeof restoreCancelledOrderBodySchema>;
+
 // ── 回程起飞后作废（POST /orders/:id/void-return-leg；ADMIN/STAFF）────────────────
 // 「已释放」不是终态：no-show 把回程座位放回库存后，这一行会一直挂在单上等人处置。
 // 原班次一飞走，「恢复回程」就走不通了，而提醒还在一直催 —— 作废给这一行一个终态。

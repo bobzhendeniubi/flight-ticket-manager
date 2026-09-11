@@ -210,6 +210,7 @@ import type {
   FlightLegSide,
   NoShowBody,
   RestoreReturnLegBody,
+  RestoreCancelledOrderBody,
   VoidReturnLegBody,
   PublicOrderLookupQuery,
   QuoteOrderBody,
@@ -394,6 +395,41 @@ export const FULFILLMENT_TERMINATING_STATUSES: OrderStatus[] = [
   'PAYMENT_TIMEOUT',
   'FAILED',
 ];
+
+// ── 已取消单恢复（POST /orders/:id/restore-cancelled）────────────────────────────
+// 口径（2026-09-11 拍板）：已取消 / 已超时的订单可由运营/管理员恢复 → 待支付（原本付清过且实收仍
+// 覆盖应收 → 已支付），恢复即重新扣座 / 占房，库存不够就拒。REFUNDED 一律不可恢复（钱已退）。
+// 状态机白名单里 CANCELLED 仍是终态：这条边只对 restoreCancelledOrder 的内部调用放行
+//（见 _updateStatusWithinTx 的 via:'restore'），普通 PATCH /status 照旧要 ADMIN force。
+export const RESTORABLE_CANCELLED_STATUSES: OrderStatus[] = ['CANCELLED', 'PAYMENT_TIMEOUT'];
+
+/** 恢复时逐舱位的占回明细（审计 after 与响应 audit 同用这个形状）。 */
+export type RetakenSeatRecord = {
+  scheduleId: string;
+  cabin: CabinClass;
+  quantity: number;
+  itemLabel: string;
+  /** 本次是否走了超售直加（CAS 占不到座、运营已确认 allowOversell）。 */
+  oversold: boolean;
+  /** 本次**新增**的超售座数（纯 sold vs capacity 口径，锁位/占位不算）。 */
+  oversoldBy: number;
+  /** 占回之后该班该舱累计超出几座（0 = 未超）。 */
+  scheduleOversoldAfter: number;
+  /** 本次挤掉了几座他人软预留（他人 ACTIVE 锁位 + 占位单余座）。 */
+  displacedReserved: number;
+};
+
+/**
+ * _updateStatusWithinTx 的内部调用选项——只给服务内部的编排函数用，绝不经路由透传：
+ *   · via:'restore'：restoreCancelledOrder 专用，放行 CANCELLED/PAYMENT_TIMEOUT → PENDING_PAYMENT/PAID
+ *     这条边，并把重新占座分支的「余位不足」从 400 换成可二次确认的 409（allowOversell 放行超售）。
+ *   · retakenSeatsOut：把占回的座位逐舱收集出来给审计用。
+ */
+export interface UpdateStatusInternalOpts {
+  via?: 'restore';
+  allowOversell?: boolean;
+  retakenSeatsOut?: RetakenSeatRecord[];
+}
 
 // ── 代理自助改单窗口（下单当天）─────────────────────────────────────────
 // 口径（运营负责人 + 老板 2026-09-04 拍板）：
@@ -2385,10 +2421,6 @@ export class OrderService {
     // 护照有效期规则（相对出发日）：<90 天禁止下单；不足 6 个月每人 +200 临期附加费
     await this.applyPassportExpiryRule(body, pricedItems);
 
-    // 出行人类型服务端权威派生（passengerToData）所需的「本单最早出发日」：与护照有效期规则
-    // 同一口径（服务端查 DB，客户端改不了），事务外查一次，供下方写 Passenger 时使用。
-    const authoritativeDepartureDate = await this.resolveEarliestFlightDepartureDate(body.items);
-
     // 录单调价/加项（权限已在上方按认证身份校验）：追加一条独立定价行，计入 subtotal/total。
     if (body.priceAdjustment) {
       pricedItems.push(buildPriceAdjustmentItem(body.priceAdjustment));
@@ -3952,6 +3984,8 @@ export class OrderService {
             bundleId: item.bundleId,
             metadata: {
               ...sanitizeFlightItemMetadata(item.metadata),
+              // 占座数（婴儿不占座）：服务端派生，见 flightSeatStamp；试算路径不盖章
+              ...(flightSeatStamp(item.quantity) ?? {}),
               // 审计：标记本行价格来自团队议价结算价（非动态价）
               priceOverride: 'TEAM_SETTLEMENT',
               // 谈定的**每人整程**议价（不随航段拆分变化，供后台/导出显示原始口径）
@@ -3986,6 +4020,7 @@ export class OrderService {
           bundleId: item.bundleId,
           metadata: {
             ...sanitizeFlightItemMetadata(item.metadata),
+            ...(seatStamp ?? {}),
             dateRank: pricing.dateRank,
             dateMultiplier: pricing.dateMultiplier,
             perSeatBreakdown: pricing.perSeatBreakdown,
@@ -7738,6 +7773,7 @@ export class OrderService {
      * 调用方给了数组就能把提示带回给操作者；不给也照样复检、照样清标记（只是没人看见提示）。
      */
     invoiceCapWarningsOut?: string[],
+    opts?: UpdateStatusInternalOpts,
   ) {
     const order = await tx.order.findUnique({
       where: { id },
@@ -7757,7 +7793,13 @@ export class OrderService {
     const allowed = ALLOWED_TRANSITIONS[order.status];
     // ADMIN 可用 force=true 跳过状态机；其他角色或非 force 调用走标准检查
     const isAdminForce = force === true && requester.role === 'ADMIN';
-    if (!allowed.includes(toStatus) && !isAdminForce) {
+    // 已取消单恢复（restoreCancelledOrder 内部调用）：只放行「取消族 → 待支付/已支付」这一条边，
+    // 其余目标照旧走白名单；普通 PATCH /status 拿不到 opts，CANCELLED 对它仍是终态。
+    const isRestoreVia =
+      opts?.via === 'restore' &&
+      RESTORABLE_CANCELLED_STATUSES.includes(order.status) &&
+      (toStatus === OrderStatus.PENDING_PAYMENT || toStatus === OrderStatus.PAID);
+    if (!allowed.includes(toStatus) && !isAdminForce && !isRestoreVia) {
       // 高频误操作单独给指引：已收款的单不能一键取消——钱账要走退款通道，申请后机位立即释放。
       const cancelPaidHint =
         toStatus === 'CANCELLED' && allowed.includes('REFUND_REQUESTED')
@@ -8166,7 +8208,21 @@ export class OrderService {
             AND cabin = ${cabin}::"CabinClass"
             AND sold + ${qty} + ${lockedByOthers} + ${heldQty} <= capacity
         `;
-        if (affected !== 1) {
+        if (affected === 1) {
+          // CAS 命中 = sold + qty ≤ capacity − 软预留，物理上没超、也没挤别人的预留。
+          opts?.retakenSeatsOut?.push({
+            scheduleId,
+            cabin,
+            quantity: qty,
+            itemLabel,
+            oversold: false,
+            oversoldBy: 0,
+            scheduleOversoldAfter: 0,
+            displacedReserved: 0,
+          });
+          return;
+        }
+        {
           const sc = await tx.flightSeatClass.findFirst({
             where: { scheduleId, cabin },
             select: { capacity: true, sold: true },
@@ -8174,6 +8230,66 @@ export class OrderService {
           const available = sc
             ? Math.max(0, sc.capacity - sc.sold - lockedByOthers - heldQty)
             : 0;
+          // ── 已取消单恢复：余位不足不是死路，让运营二次确认后按 no-show 恢复回程同一套口径超售 ──
+          // 上限、增量/累计、挤占软预留三件事的算法都照抄 computeOversellDelta / computeDisplacedReserved，
+          // 舱位行已在上面 FOR UPDATE 锁住，这里读到的 capacity/sold 就是锁内真值。
+          if (opts?.via === 'restore') {
+            const label = `${itemLabel}（${CABIN_ZH_LABEL[cabin] ?? cabin}）`;
+            if (!sc) {
+              throw new BadRequestError(`${label} 的舱位配置已不存在，无法重新占座，请先在航班维护里补齐。`);
+            }
+            const reserved = lockedByOthers + heldQty;
+            const { detail, oversellBy, oversoldAfter } = computeOversellDelta([
+              { cabin, quantity: qty, capacity: sc.capacity, sold: sc.sold },
+            ]);
+            const displacedReserved = computeDisplacedReserved({
+              quantity: qty,
+              available: sc.capacity - sc.sold - reserved,
+              reserved,
+            });
+            if (opts.allowOversell !== true) {
+              throw new AppError(
+                `${label} 余位不足：需要 ${qty} 座，仅剩 ${available} 座。确认超售后可继续恢复。`,
+                {
+                  statusCode: 409,
+                  code: 'OVERSELL_CONFIRMATION_REQUIRED',
+                  details: {
+                    scheduleId,
+                    cabin,
+                    quantity: qty,
+                    available,
+                    oversellBy,
+                    oversoldAfter,
+                    displacedReserved,
+                  },
+                },
+              );
+            }
+            const maxOversell = env.FLIGHT_NOSHOW_MAX_OVERSELL_SEATS;
+            if (oversoldAfter > maxOversell) {
+              throw new AppError(
+                `${label} 超售将超过上限 ${maxOversell} 座（占回后该舱累计超出 ${oversoldAfter} 座，` +
+                  `本次新增 ${oversellBy} 座）。请先向航司加位、或联系管理员调整上限后再恢复。`,
+                {
+                  statusCode: 409,
+                  code: 'OVERSELL_LIMIT_EXCEEDED',
+                  details: { scheduleId, cabin, oversellBy, oversoldAfter, maxOversell },
+                },
+              );
+            }
+            await oversellSeatWithinTx(tx, scheduleId, cabin, qty);
+            opts.retakenSeatsOut?.push({
+              scheduleId,
+              cabin,
+              quantity: qty,
+              itemLabel,
+              oversold: oversellBy > 0,
+              oversoldBy: oversellBy,
+              scheduleOversoldAfter: detail[0]?.after != null ? Math.max(0, detail[0].after) : oversoldAfter,
+              displacedReserved,
+            });
+            return;
+          }
           if (order.status === OrderStatus.REFUND_REQUESTED && toStatus === OrderStatus.PROCESSING) {
             throw new BadRequestError(
               `座位已被售出，无法驳回退款申请，请协调换班次或继续退款。${itemLabel}需要${qty}个座位，当前仅剩${available}个。`,
@@ -21350,6 +21466,47 @@ export async function voidReleasedReturnLegWithinTx(
   }
 }
 
+/** Order.adjustments 里「已取消单恢复」流水的 type（幂等键 requestToken 就落在这条上）。 */
+export const ORDER_RESTORED_ADJUSTMENT_TYPE = 'ORDER_RESTORED';
+
+/** 防御式读 Order.adjustments（形状不符的条目直接丢弃）。 */
+function readOrderAdjustments(raw: Prisma.JsonValue | null | undefined): OrderAdjustmentEntry[] {
+  if (!Array.isArray(raw)) return [];
+  const out: OrderAdjustmentEntry[] = [];
+  for (const e of raw) {
+    if (e == null || typeof e !== 'object' || Array.isArray(e)) continue;
+    if (typeof (e as { type?: unknown }).type !== 'string') continue;
+    out.push(e as unknown as OrderAdjustmentEntry);
+  }
+  return out;
+}
+
+/** POST /orders/:id/restore-cancelled 的审计明细（响应 audit 与路由层 WARNING 审计同用）。 */
+export interface RestoreCancelledOrderAudit {
+  orderNumber: string;
+  fromStatus: OrderStatus;
+  toStatus: OrderStatus;
+  /** 逐舱位占回明细（回放时为空数组，只带合计）。 */
+  seats: RetakenSeatRecord[];
+  seatTotal: number;
+  oversold: boolean;
+  oversoldBy: number;
+  displacedReserved: number;
+  /** 内部录单限额内放行的具体酒店超卖明细（空 = 房量够）。 */
+  hotelOversold: HotelStayOversellRecord[];
+  /** 随机档需求池缺口明细（空 = 够）。 */
+  randomTierOversold: RandomTierOversellRecord[];
+  /** 恢复后的支付超时（后台/代理单 null；散客单 now+30min）。 */
+  paymentExpiresAt: string | null;
+  /** 开票额度复检清掉的标记提示（由 _updateStatusWithinTx 带回）。 */
+  invoiceCapWarnings: string[];
+  /** 非阻断提示（如回程仍处于已释放态，恢复后要再走「恢复回程」）。 */
+  warnings: string[];
+  /** 恒 false：佣金不在恢复时重建（见 restoreCancelledOrder 注释），财务按口径另行补提。 */
+  commissionsReaccrued: boolean;
+  replayed: boolean;
+}
+
 /** POST /orders/:id/restore-return-leg 的审计明细。 */
 export interface RestoreReturnLegAudit {
   orderNumber: string;
@@ -24362,6 +24519,13 @@ export interface OrderAdjustmentEntry {
   passengerName?: string;
   passengerDocument?: string;
   /**
+   * 幂等键（ORDER_RESTORED 专用）：已取消单恢复的回放判定认的是「本单 adjustments 里见过这个 token」——
+   * 纯酒店单没有航段行、legActionLog 落不下，流水是全部订单都有的唯一留痕位。
+   */
+  requestToken?: string;
+  /** 与该条流水绑定的结构化明细（ORDER_RESTORED：from/to 状态、占回座数等，回放时原样带回）。 */
+  detail?: Record<string, string | number | boolean | null>;
+  /**
    * true = 这笔钱不参与每人均摊（换人费 / 换人差价：记在被换下去的人头上）。
    * 口径与实现见 per-pax-share.ts 的 spreadableAdjustmentCny —— 钱仍在 adjustmentCny 里
    * （应收/尾款一分不少），只是不摊到留守同行人与新客的每人结算价上。
@@ -25947,6 +26111,10 @@ async function resolveVisaTaskAnchor(
 async function createVisaTaskAtCreation(
   tx: Prisma.TransactionClient,
   orderId: string,
+  // reviveCancelled：已取消单恢复回待支付时用——取消时签证任务被终态化成 CANCELLED，按「任意签证任务
+  // 已存在」的建单口径永远不会再建，这单就从签证台消失直到付款。与 createFulfillmentTasks 的
+  // 「CANCELLED 视为不存在」对齐；建单路径不传，行为一字不变。
+  options?: { reviveCancelled?: boolean },
 ): Promise<string[]> {
   const order = await tx.order.findUnique({
     where: { id: orderId },
@@ -25958,14 +26126,18 @@ async function createVisaTaskAtCreation(
       id: true,
       kind: true,
       bundleId: true,
-      fulfillmentTasks: { select: { type: true } },
+      fulfillmentTasks: { select: { type: true, status: true } },
     },
   });
   if (items.length === 0) return [];
 
-  // 幂等：已存在任意签证任务 → 不重复建
+  // 幂等：已存在任意签证任务 → 不重复建（reviveCancelled 时 CANCELLED 的不算，见参数注释）
   const alreadyHasVisaTask = items.some((item) =>
-    item.fulfillmentTasks.some((t) => t.type === FulfillmentType.VISA_APPLICATION),
+    item.fulfillmentTasks.some(
+      (t) =>
+        t.type === FulfillmentType.VISA_APPLICATION &&
+        (!options?.reviveCancelled || t.status !== FulfillmentStatus.CANCELLED),
+    ),
   );
   if (alreadyHasVisaTask) return [];
 
