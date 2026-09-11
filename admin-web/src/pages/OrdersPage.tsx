@@ -5439,8 +5439,10 @@ function OrderDrawer({
         ...res.audit.warnings,
         ...res.audit.invoiceCapWarnings,
       ];
-      if (res.audit.toStatus === 'PAID' && o.agent) {
-        lines.push('代理佣金不随恢复自动重建，请财务按口径补提。');
+      // 佣金口径（2026-09-11）：恢复的单佣金也算——落到已支付时后端已把取消冲销的佣金恢复计提；
+      // 回待支付的在收款转已支付时恢复（后端 warnings 已说明）；已进结算流程的部分同样由 warnings 提示财务。
+      if (res.audit.commissionsReaccrued) {
+        lines.push(`代理佣金已恢复计提 ¥${res.audit.commissionsReaccruedCny.toLocaleString()}。`);
       }
       alert(lines.join('\n'));
     } catch (e) {

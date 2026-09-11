@@ -10,8 +10,11 @@
  *   4. 已起飞航段 / REFUNDED / 退款申请中 一律拒；
  *   5. 幂等：同 requestToken 重放不二次占座、不二次落状态；
  *   6. 支付超时：后台单 paymentExpiresAt=null 不入队；散客单 now+30min 并重入队；
- *   7. 付清单回 PAID 且履约任务重建（CANCELLED 的任务视为不存在）；佣金不重建（commissionsReaccrued=false）；
- *   8. 权限：AGENT 403。
+ *   7. 付清单回 PAID 且履约任务重建（CANCELLED 的任务视为不存在）；
+ *   8. 权限：AGENT 403；
+ *   9. 佣金恢复计提（2026-09-11 拍板「恢复的单佣金也算」）：回 PAID 时取消冲销的佣金另建等额 ACCRUED
+ *      记录（冲销记录不动）；已结算的不动只给 warnings；幂等（已有存活记录 / 同 token 回放不重复）；
+ *      回待支付的在之后收款推 PAID 时恢复；admin force 老路径与「恢复后又取消」的单不恢复。
  */
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { CabinClass, OrderItemKind, OrderStatus, Prisma, UserRole } from '@prisma/client';
@@ -24,7 +27,7 @@ const { mockPrisma, hotelControlMocks, queueMocks } = vi.hoisted(() => ({
       updateMany: vi.fn(),
       update: vi.fn(),
     },
-    orderStatusEvent: { create: vi.fn(), count: vi.fn() },
+    orderStatusEvent: { create: vi.fn(), count: vi.fn(), findFirst: vi.fn() },
     orderItem: { findMany: vi.fn() },
     hotelRoomType: { findMany: vi.fn() },
     flightSeatClass: { findFirst: vi.fn() },
@@ -33,7 +36,13 @@ const { mockPrisma, hotelControlMocks, queueMocks } = vi.hoisted(() => ({
     refund: { aggregate: vi.fn(), count: vi.fn(), findMany: vi.fn(), updateMany: vi.fn() },
     payment: { aggregate: vi.fn(), updateMany: vi.fn() },
     fulfillmentTask: { updateMany: vi.fn(), create: vi.fn(), count: vi.fn() },
-    commissionRecord: { findFirst: vi.fn(), create: vi.fn(), findMany: vi.fn(), update: vi.fn() },
+    commissionRecord: {
+      findFirst: vi.fn(),
+      create: vi.fn(),
+      findMany: vi.fn(),
+      update: vi.fn(),
+      count: vi.fn(),
+    },
     auditLog: { create: vi.fn() },
     user: { findUnique: vi.fn() },
     passenger: { findMany: vi.fn() },
@@ -165,6 +174,9 @@ function mount(order = buildOrder(), opts: { ownerRole?: UserRole | null } = {})
   mockPrisma.order.update.mockResolvedValue({});
   mockPrisma.orderStatusEvent.create.mockResolvedValue({});
   mockPrisma.orderStatusEvent.count.mockResolvedValue(0);
+  mockPrisma.orderStatusEvent.findFirst.mockResolvedValue(null);
+  mockPrisma.commissionRecord.count.mockResolvedValue(0);
+  mockPrisma.commissionRecord.create.mockResolvedValue({ id: 'cr-new' });
   mockPrisma.orderItem.findMany.mockResolvedValue([]);
   mockPrisma.hotelRoomType.findMany.mockResolvedValue([]);
   mockPrisma.seatLock.aggregate.mockResolvedValue({ _sum: { qty: null } });
@@ -436,7 +448,7 @@ describe('restoreCancelledOrder · 幂等 / 支付超时 / 回 PAID', () => {
     expect(queueMocks.scheduleSeatHoldRelease).toHaveBeenCalledWith('ord1', expect.any(Number));
   });
 
-  it('付清过的单（到过 PAID 且实收 ≥ 应收）→ 回 PAID，履约任务重建，佣金不重建', async () => {
+  it('付清过的单（到过 PAID 且实收 ≥ 应收）→ 回 PAID，履约任务重建；无代理归属不触佣金', async () => {
     mount(buildOrder({ paidAmount: new Prisma.Decimal(1000) }));
     mockPrisma.orderStatusEvent.count.mockResolvedValue(1);
     // createFulfillmentTasks：取消时被终态化的 FLIGHT_TICKETING 视为不存在 → 重建 PENDING。
@@ -462,8 +474,10 @@ describe('restoreCancelledOrder · 幂等 / 支付超时 / 回 PAID', () => {
         data: expect.objectContaining({ orderItemId: 'item1', type: 'FLIGHT_TICKETING', status: 'PENDING' }),
       }),
     );
-    // 无代理归属 → 不会触达佣金计提；有归属时 createCommissionsForOrder 也按档幂等跳过 REVERSED 档。
+    // 无代理归属 → 不会触达佣金计提，也没有可恢复的冲销记录。
     expect(mockPrisma.commissionRecord.create).not.toHaveBeenCalled();
+    expect(audit.commissionsReaccrued).toBe(false);
+    expect(audit.commissionsReaccruedCny).toBe(0);
   });
 
   it('到过 PAID 但实收不足应收 → 回待支付而非已支付', async () => {
@@ -471,5 +485,259 @@ describe('restoreCancelledOrder · 幂等 / 支付超时 / 回 PAID', () => {
     mockPrisma.orderStatusEvent.count.mockResolvedValue(1);
     const { audit } = await service.restoreCancelledOrder('ord1', { requestToken: TOKEN, allowOversell: false }, ADMIN);
     expect(audit.toStatus).toBe(OrderStatus.PENDING_PAYMENT);
+  });
+});
+
+// ── 佣金恢复计提（2026-09-11 拍板：恢复的单佣金也算）────────────────────────────
+type CommissionRowOverrides = Partial<{
+  id: string;
+  agentId: string;
+  productKind: string;
+  chainDepth: number;
+  baseAmount: number;
+  rate: number;
+  amount: number;
+  status: string;
+  settlementId: string | null;
+  createdAt: Date;
+}>;
+
+/** 一条 CommissionRecord 行（默认：卖家代理 FLIGHT 档、取消时被翻成 REVERSED 的正数死行）。 */
+function commissionRow(o: CommissionRowOverrides = {}) {
+  return {
+    id: o.id ?? 'cr-dead-1',
+    agentId: o.agentId ?? 'ag-1',
+    productKind: o.productKind ?? 'FLIGHT',
+    chainDepth: o.chainDepth ?? 0,
+    baseAmount: new Prisma.Decimal(o.baseAmount ?? 1000),
+    rate: new Prisma.Decimal(o.rate ?? 0.05),
+    amount: new Prisma.Decimal(o.amount ?? 50),
+    status: o.status ?? 'REVERSED',
+    settlementId: o.settlementId ?? null,
+    createdAt: o.createdAt ?? PAST,
+  };
+}
+
+/** 装配一张付清过的代理单（回 PAID），并给出本单现有的佣金记录。 */
+function mountPaidAgentOrder(rows: ReturnType<typeof commissionRow>[], orderOverrides: Record<string, unknown> = {}) {
+  mount(buildOrder({ agentId: 'ag-1', paidAmount: new Prisma.Decimal(1000), ...orderOverrides }));
+  mockPrisma.orderStatusEvent.count.mockResolvedValue(1);
+  // createFulfillmentTasks / createCommissionsForOrder 共用的 orderItem.findMany：一条 FLIGHT 行。
+  mockPrisma.orderItem.findMany.mockResolvedValue([
+    { id: 'item1', kind: OrderItemKind.FLIGHT, bundleId: null, fulfillmentTasks: [] },
+  ]);
+  mockPrisma.commissionRecord.findMany.mockResolvedValue(rows);
+  let seq = 0;
+  mockPrisma.commissionRecord.create.mockImplementation(async () => ({ id: `cr-new-${++seq}` }));
+}
+
+const createdCommissionRows = () =>
+  mockPrisma.commissionRecord.create.mock.calls.map((c) => (c[0] as { data: Record<string, unknown> }).data);
+
+describe('restoreCancelledOrder · 佣金恢复计提', () => {
+  it('代理单回 PAID：取消时冲销的每档每级各建一条等额 ACCRUED 记录，冲销记录不动，记审计', async () => {
+    mountPaidAgentOrder([
+      commissionRow({ id: 'cr-dead-seller', chainDepth: 0, amount: 50 }),
+      commissionRow({ id: 'cr-dead-parent', agentId: 'ag-parent', chainDepth: 1, amount: 20 }),
+    ]);
+
+    const { audit } = await service.restoreCancelledOrder('ord1', { requestToken: TOKEN, allowOversell: false }, ADMIN);
+
+    expect(audit.toStatus).toBe(OrderStatus.PAID);
+    expect(audit.commissionsReaccrued).toBe(true);
+    expect(audit.commissionsReaccruedCny).toBe(70);
+
+    const created = createdCommissionRows();
+    expect(created).toHaveLength(2);
+    expect(created).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ agentId: 'ag-1', chainDepth: 0, status: 'ACCRUED', settlementId: null }),
+        expect.objectContaining({ agentId: 'ag-parent', chainDepth: 1, status: 'ACCRUED', settlementId: null }),
+      ]),
+    );
+    expect(created.map((d) => Number(String(d.amount))).sort()).toEqual([20, 50]);
+    // 冲销记录原样保留：不翻状态、不改金额
+    expect(mockPrisma.commissionRecord.update).not.toHaveBeenCalled();
+
+    // 审计：哪条死行 → 哪条新记录
+    const auditCalls = mockPrisma.auditLog.create.mock.calls.map(
+      (c) => (c[0] as { data: { action: string; after: Record<string, unknown> } }).data,
+    );
+    const reaccrual = auditCalls.find((a) => a.action === 'COMMISSION_REACCRUED_ON_RESTORE');
+    expect(reaccrual).toBeDefined();
+    expect(reaccrual!.after.records).toEqual(
+      expect.arrayContaining([expect.objectContaining({ fromRecordId: 'cr-dead-seller', newRecordId: expect.stringMatching(/^cr-new-/) })]),
+    );
+
+    // 流水 detail 记下真实结果（回放时原样带回）
+    const updateArg = mockPrisma.order.update.mock.calls[0][0] as { data: { adjustments: Array<{ type: string; detail: Record<string, unknown> }> } };
+    const entry = updateArg.data.adjustments.find((e) => e.type === ORDER_RESTORED_ADJUSTMENT_TYPE);
+    expect(entry?.detail).toMatchObject({ commissionsReaccrued: true, commissionsReaccruedCny: 70 });
+  });
+
+  it('已结算的佣金不动：原 SETTLED 记录与负数补偿行都不碰、不新建，只给 warnings 提醒财务', async () => {
+    mountPaidAgentOrder([
+      commissionRow({ id: 'cr-settled', status: 'SETTLED', settlementId: 'st-1', amount: 50 }),
+      commissionRow({ id: 'cr-comp', status: 'REVERSED', amount: -50, baseAmount: -1000 }),
+    ]);
+
+    const { audit } = await service.restoreCancelledOrder('ord1', { requestToken: TOKEN, allowOversell: false }, ADMIN);
+
+    expect(audit.toStatus).toBe(OrderStatus.PAID);
+    expect(audit.commissionsReaccrued).toBe(false);
+    expect(audit.commissionsReaccruedCny).toBe(0);
+    expect(mockPrisma.commissionRecord.create).not.toHaveBeenCalled();
+    expect(mockPrisma.commissionRecord.update).not.toHaveBeenCalled();
+    expect(audit.warnings.some((w) => w.includes('已结算') && w.includes('请财务'))).toBe(true);
+  });
+
+  it('幂等：该档已有存活的 ACCRUED 记录（此前已恢复过）→ 不再新建', async () => {
+    mountPaidAgentOrder([
+      commissionRow({ id: 'cr-dead-1', status: 'REVERSED', amount: 50 }),
+      commissionRow({ id: 'cr-live', status: 'ACCRUED', amount: 50, createdAt: new Date() }),
+    ]);
+
+    const { audit } = await service.restoreCancelledOrder('ord1', { requestToken: TOKEN, allowOversell: false }, ADMIN);
+
+    expect(audit.commissionsReaccrued).toBe(false);
+    expect(mockPrisma.commissionRecord.create).not.toHaveBeenCalled();
+    expect(audit.warnings).toEqual([]);
+  });
+
+  it('再次取消后再次恢复：两条死行只从最近一条复制一份，绝不叠加', async () => {
+    mountPaidAgentOrder([
+      commissionRow({ id: 'cr-dead-old', amount: 50, createdAt: new Date(PAST.getTime() - 1000) }),
+      commissionRow({ id: 'cr-dead-new', amount: 50, createdAt: PAST }),
+    ]);
+
+    const { audit } = await service.restoreCancelledOrder('ord1', { requestToken: TOKEN, allowOversell: false }, ADMIN);
+
+    expect(audit.commissionsReaccruedCny).toBe(50);
+    expect(createdCommissionRows()).toHaveLength(1);
+    const reaccrual = mockPrisma.auditLog.create.mock.calls
+      .map((c) => (c[0] as { data: { action: string; after: { records: Array<{ fromRecordId: string }> } } }).data)
+      .find((a) => a.action === 'COMMISSION_REACCRUED_ON_RESTORE');
+    expect(reaccrual?.after.records[0]?.fromRecordId).toBe('cr-dead-new');
+  });
+
+  it('同 requestToken 回放：带回流水里记的恢复结果，不再新建记录', async () => {
+    mount(
+      buildOrder({
+        agentId: 'ag-1',
+        status: OrderStatus.PAID,
+        adjustments: [
+          {
+            type: ORDER_RESTORED_ADJUSTMENT_TYPE,
+            label: '恢复已取消订单',
+            amountCny: 0,
+            at: new Date().toISOString(),
+            by: 'admin-1',
+            requestToken: TOKEN,
+            detail: {
+              fromStatus: 'CANCELLED',
+              toStatus: 'PAID',
+              seatTotal: 1,
+              oversold: false,
+              commissionsReaccrued: true,
+              commissionsReaccruedCny: 70,
+            },
+          },
+        ],
+      }),
+    );
+    const { audit } = await service.restoreCancelledOrder('ord1', { requestToken: TOKEN, allowOversell: false }, ADMIN);
+    expect(audit.replayed).toBe(true);
+    expect(audit.commissionsReaccrued).toBe(true);
+    expect(audit.commissionsReaccruedCny).toBe(70);
+    expect(mockPrisma.commissionRecord.create).not.toHaveBeenCalled();
+    expect(mockPrisma.commissionRecord.findMany).not.toHaveBeenCalled();
+  });
+
+  it('代理单回待支付：不恢复佣金，只在确有冲销记录时提示「收款转已支付时自动恢复」', async () => {
+    mount(buildOrder({ agentId: 'ag-1' }));
+    mockPrisma.commissionRecord.count.mockResolvedValue(1);
+
+    const { audit } = await service.restoreCancelledOrder('ord1', { requestToken: TOKEN, allowOversell: false }, ADMIN);
+
+    expect(audit.toStatus).toBe(OrderStatus.PENDING_PAYMENT);
+    expect(audit.commissionsReaccrued).toBe(false);
+    expect(mockPrisma.commissionRecord.create).not.toHaveBeenCalled();
+    expect(audit.warnings.some((w) => w.includes('自动恢复计提'))).toBe(true);
+  });
+
+  it('代理单回待支付且本无冲销记录（从未付过款）：不提示佣金', async () => {
+    mount(buildOrder({ agentId: 'ag-1' }));
+    mockPrisma.commissionRecord.count.mockResolvedValue(0);
+    const { audit } = await service.restoreCancelledOrder('ord1', { requestToken: TOKEN, allowOversell: false }, ADMIN);
+    expect(audit.warnings.some((w) => w.includes('佣金'))).toBe(false);
+  });
+});
+
+describe('恢复到待支付后的收款 / force 老路径 · 佣金', () => {
+  const REQ = { userId: 'admin-1', role: UserRole.ADMIN, actorType: 'USER' as const };
+
+  function mountPendingRestoredOrder(o: { restoredAt: Date; lastCancelAt: Date | null; status?: OrderStatus }) {
+    mount(
+      buildOrder({
+        agentId: 'ag-1',
+        status: o.status ?? OrderStatus.PENDING_PAYMENT,
+        paidAmount: new Prisma.Decimal(1000),
+        adjustments: [
+          {
+            type: ORDER_RESTORED_ADJUSTMENT_TYPE,
+            label: '恢复已取消订单',
+            amountCny: 0,
+            at: o.restoredAt.toISOString(),
+            by: 'admin-1',
+            requestToken: '11111111-0000-4000-8000-000000000001',
+            detail: { fromStatus: 'CANCELLED', toStatus: 'PENDING_PAYMENT' },
+          },
+        ],
+      }),
+    );
+    mockPrisma.orderStatusEvent.findFirst.mockResolvedValue(
+      o.lastCancelAt ? { createdAt: o.lastCancelAt } : null,
+    );
+    mockPrisma.orderItem.findMany.mockResolvedValue([
+      { id: 'item1', kind: OrderItemKind.FLIGHT, bundleId: null, fulfillmentTasks: [] },
+    ]);
+    mockPrisma.commissionRecord.findMany.mockResolvedValue([commissionRow({ amount: 50 })]);
+  }
+
+  it('恢复到待支付 → 之后正常收款推 PAID：曾被恢复且此后未再取消 → 恢复计提', async () => {
+    const restoredAt = new Date();
+    mountPendingRestoredOrder({ restoredAt, lastCancelAt: new Date(restoredAt.getTime() - 3600_000) });
+
+    await service.updateStatus('ord1', OrderStatus.PAID, REQ, '收款到账');
+
+    expect(createdCommissionRows()).toEqual([
+      expect.objectContaining({ agentId: 'ag-1', status: 'ACCRUED', settlementId: null }),
+    ]);
+  });
+
+  it('恢复后又被取消（取消事件晚于恢复留痕）→ admin force 复活不恢复佣金', async () => {
+    const restoredAt = new Date(Date.now() - 2 * 3600_000);
+    mountPendingRestoredOrder({
+      restoredAt,
+      lastCancelAt: new Date(restoredAt.getTime() + 3600_000),
+      status: OrderStatus.CANCELLED,
+    });
+
+    await service.updateStatus('ord1', OrderStatus.PAID, REQ, '误操作复活', true);
+
+    expect(mockPrisma.commissionRecord.create).not.toHaveBeenCalled();
+  });
+
+  it('从未恢复过的已取消单 admin force → PAID：老路径不变，不重复付佣', async () => {
+    mount(buildOrder({ agentId: 'ag-1', paidAmount: new Prisma.Decimal(1000) }));
+    mockPrisma.orderItem.findMany.mockResolvedValue([
+      { id: 'item1', kind: OrderItemKind.FLIGHT, bundleId: null, fulfillmentTasks: [] },
+    ]);
+    mockPrisma.commissionRecord.findMany.mockResolvedValue([commissionRow({ amount: 50 })]);
+
+    await service.updateStatus('ord1', OrderStatus.PAID, REQ, '误操作复活', true);
+
+    expect(mockPrisma.commissionRecord.create).not.toHaveBeenCalled();
+    expect(mockPrisma.orderStatusEvent.findFirst).not.toHaveBeenCalled();
   });
 });

@@ -429,6 +429,11 @@ export interface UpdateStatusInternalOpts {
   via?: 'restore';
   allowOversell?: boolean;
   retakenSeatsOut?: RetakenSeatRecord[];
+  /**
+   * 恢复路径落到 PAID 时，取消冲销的佣金恢复计提的结果带回给调用方（与 retakenSeatsOut 同一套 out 参数约定）。
+   * 只在 via:'restore' 或「曾被恢复且此后未再取消」的正常付款推 PAID 时有内容。
+   */
+  commissionReaccrualOut?: { records: ReaccruedCommissionRecord[]; totalCny: number; warnings: string[] };
 }
 
 // ── 代理自助改单窗口（下单当天）─────────────────────────────────────────
@@ -5362,9 +5367,11 @@ export class OrderService {
    *   纯酒店单没有航段行、legActionLog 落不下，流水是所有订单都有的留痕位）。
    * 已释放的回程行（flightScheduleId 为 null）重新占座分支天然跳过：恢复后要再走「恢复回程」。
    *
-   * ⚠ 佣金不在此重建：取消时已整单冲销（REVERSED），createCommissionsForOrder 按档幂等把 REVERSED 也算
-   *   「已计提过」（防 force 复活重复计佣），恢复到 PAID 后代理佣金仍是冲销态 —— 需财务按口径另行补提，
-   *   响应 audit.commissionsReaccrued=false 明示，绝不在这里偷偷动钱。
+   * 佣金（2026-09-11 拍板：恢复的单佣金也算）：取消时整单冲销（REVERSED）的代理佣金，在本单落到
+   *   已支付时由 →PAID 钩子调 reaccrueCommissionsForRestoredOrder 恢复计提——冲销记录不动、另建等额
+   *   ACCRUED 记录（理由见该函数注释）；直接恢复到已支付的当场恢复，恢复到待支付的在之后收款推
+   *   已支付时恢复。已进结算流程的佣金一律不动，warnings 提醒财务。audit.commissionsReaccrued /
+   *   commissionsReaccruedCny 是本次真实结果；回放按流水里记的结果原样回。
    */
   async restoreCancelledOrder(
     orderId: string,
@@ -5378,6 +5385,11 @@ export class OrderService {
     const pendingFulfillmentTaskIds: string[] = [];
     const invoiceCapWarnings: string[] = [];
     const retakenSeats: RetakenSeatRecord[] = [];
+    const commissionReaccrual: NonNullable<UpdateStatusInternalOpts['commissionReaccrualOut']> = {
+      records: [],
+      totalCny: 0,
+      warnings: [],
+    };
     const note = input.note?.trim() || null;
 
     const audit = await prisma.$transaction(async (tx) => {
@@ -5448,7 +5460,9 @@ export class OrderService {
           paymentExpiresAt: typeof d.paymentExpiresAt === 'string' ? d.paymentExpiresAt : null,
           invoiceCapWarnings: [],
           warnings: [],
-          commissionsReaccrued: false,
+          commissionsReaccrued: d.commissionsReaccrued === true,
+          commissionsReaccruedCny:
+            typeof d.commissionsReaccruedCny === 'number' ? d.commissionsReaccruedCny : 0,
           replayed: true,
         } satisfies RestoreCancelledOrderAudit;
       }
@@ -5547,8 +5561,24 @@ export class OrderService {
         undefined,
         undefined,
         invoiceCapWarnings,
-        { via: 'restore', allowOversell: input.allowOversell === true, retakenSeatsOut: retakenSeats },
+        {
+          via: 'restore',
+          allowOversell: input.allowOversell === true,
+          retakenSeatsOut: retakenSeats,
+          commissionReaccrualOut: commissionReaccrual,
+        },
       );
+      const commissionsReaccrued = commissionReaccrual.records.length > 0;
+      warnings.push(...commissionReaccrual.warnings);
+      // 回待支付的代理单：佣金要等收款推到已支付时才恢复计提，先把话说在前面（只在确有冲销记录时提示）。
+      if (toStatus === OrderStatus.PENDING_PAYMENT && order.agentId) {
+        const reversedCount = await tx.commissionRecord.count({
+          where: { orderId, status: CommissionStatus.REVERSED, amount: { gt: 0 } },
+        });
+        if (reversedCount > 0) {
+          warnings.push('取消时冲销的代理佣金将在本单收款转「已支付」时自动恢复计提。');
+        }
+      }
 
       // ── 5. 支付超时：后台/代理单 null（永不自动退位）；散客单重新给 30 分钟并重入队 ──
       // 恢复后若留旧时间戳，超时 worker 会把刚占回的座秒放。身份口径同建单 isStaffEnteredOrder：
@@ -5573,7 +5603,8 @@ export class OrderService {
         type: ORDER_RESTORED_ADJUSTMENT_TYPE,
         label:
           `恢复已取消订单：${zhStatus(order.status)} → ${zhStatus(toStatus)}` +
-          `（重新占座 ${seatTotal} 座${oversold ? `，超售 ${oversoldBy} 座` : ''}，钱款不动）`,
+          `（重新占座 ${seatTotal} 座${oversold ? `，超售 ${oversoldBy} 座` : ''}，钱款不动` +
+          `${commissionsReaccrued ? `，代理佣金恢复计提 ¥${commissionReaccrual.totalCny}` : ''}）`,
         amountCny: 0,
         at: now.toISOString(),
         by: actor.userId,
@@ -5587,6 +5618,8 @@ export class OrderService {
           oversoldBy,
           displacedReserved,
           paymentExpiresAt: paymentExpiresAt ? paymentExpiresAt.toISOString() : null,
+          commissionsReaccrued,
+          commissionsReaccruedCny: commissionReaccrual.totalCny,
         },
       });
       await tx.order.update({
@@ -5650,7 +5683,8 @@ export class OrderService {
         paymentExpiresAt: paymentExpiresAt ? paymentExpiresAt.toISOString() : null,
         invoiceCapWarnings,
         warnings,
-        commissionsReaccrued: false,
+        commissionsReaccrued,
+        commissionsReaccruedCny: commissionReaccrual.totalCny,
         replayed: false,
       } satisfies RestoreCancelledOrderAudit;
     });
@@ -8407,6 +8441,27 @@ export class OrderService {
       if (order.agentId) {
         // 带上 orderNumber：零计提审计要能让人凭订单号直接查（函数内部再查一次会多一次事务内往返）。
         await createCommissionsForOrder(tx, order.id, order.agentId, order.orderNumber);
+        // 已取消单恢复（2026-09-11 拍板：恢复的单佣金也算）：取消时整单冲销的佣金在这里恢复计提。
+        // 两条触发路径：① restoreCancelledOrder 直接恢复到已支付（via:'restore'）；② 先恢复到待支付、
+        // 之后正常收款推到已支付——靠 Order.adjustments 里的 ORDER_RESTORED 留痕判「曾被恢复且此后
+        // 没再取消」。admin force CANCELLED→PAID 的老路径两者都不满足，仍由 createCommissionsForOrder
+        // 的幂等闸挡住不重复付佣。
+        const isRestoredOrder =
+          opts?.via === 'restore' || (await isOrderRestoredSinceLastCancel(tx, order));
+        if (isRestoredOrder) {
+          const outcome = await reaccrueCommissionsForRestoredOrder(
+            tx,
+            { id: order.id, orderNumber: order.orderNumber, agentId: order.agentId },
+            { userId: requester.userId, role: requester.role },
+          );
+          if (opts?.commissionReaccrualOut) {
+            opts.commissionReaccrualOut.records.push(...outcome.records);
+            opts.commissionReaccrualOut.totalCny = round2(
+              opts.commissionReaccrualOut.totalCny + outcome.totalCny,
+            );
+            opts.commissionReaccrualOut.warnings.push(...outcome.warnings);
+          }
+        }
       }
       const newIds = await createFulfillmentTasks(tx, order.id);
       newTaskIdsOut.push(...newIds);
@@ -21481,6 +21536,30 @@ function readOrderAdjustments(raw: Prisma.JsonValue | null | undefined): OrderAd
   return out;
 }
 
+/**
+ * 这张单是否「曾被恢复、且恢复之后没有再被取消」——恢复到待支付后正常收款推到已支付时，
+ * 据此决定要不要把取消冲销的佣金恢复计提（见 _updateStatusWithinTx 的 →PAID 钩子）。
+ * 判据：Order.adjustments 里最近一条 ORDER_RESTORED 的时间 ≥ 最近一次进入取消族状态的事件时间。
+ * 没有恢复留痕的单（绝大多数）一次库都不查。
+ */
+async function isOrderRestoredSinceLastCancel(
+  tx: Prisma.TransactionClient,
+  order: { id: string; adjustments: Prisma.JsonValue | null },
+): Promise<boolean> {
+  const restoredAtMs = readOrderAdjustments(order.adjustments)
+    .filter((e) => e.type === ORDER_RESTORED_ADJUSTMENT_TYPE)
+    .map((e) => new Date(e.at).getTime())
+    .filter((ms) => Number.isFinite(ms))
+    .reduce((max, ms) => Math.max(max, ms), Number.NEGATIVE_INFINITY);
+  if (!Number.isFinite(restoredAtMs)) return false;
+  const lastCancel = await tx.orderStatusEvent.findFirst({
+    where: { orderId: order.id, toStatus: { in: RESTORABLE_CANCELLED_STATUSES } },
+    orderBy: { createdAt: 'desc' },
+    select: { createdAt: true },
+  });
+  return lastCancel == null || lastCancel.createdAt.getTime() <= restoredAtMs;
+}
+
 /** POST /orders/:id/restore-cancelled 的审计明细（响应 audit 与路由层 WARNING 审计同用）。 */
 export interface RestoreCancelledOrderAudit {
   orderNumber: string;
@@ -21502,8 +21581,10 @@ export interface RestoreCancelledOrderAudit {
   invoiceCapWarnings: string[];
   /** 非阻断提示（如回程仍处于已释放态，恢复后要再走「恢复回程」）。 */
   warnings: string[];
-  /** 恒 false：佣金不在恢复时重建（见 restoreCancelledOrder 注释），财务按口径另行补提。 */
+  /** 本次是否把取消时冲销的代理佣金恢复计提了（只在落到已支付且确有冲销记录时为 true）。 */
   commissionsReaccrued: boolean;
+  /** 恢复计提的佣金合计（CNY）；未恢复为 0。 */
+  commissionsReaccruedCny: number;
   replayed: boolean;
 }
 
@@ -26429,6 +26510,9 @@ async function createCommissionsForOrder(
   //     正数，代理凭空多拿一份——这正是原闸要防的事故，语义必须原样保留。
   //   · 补提脚本要补的是「从来没建过记录」的档，那种档在这张表里一条都没有（任何 status 都没有），
   //     所以不区分 status 不会挡住补提。
+  //   · 已取消单**恢复**（restoreCancelledOrder）要把取消时冲销的佣金恢复回来，但不在这里放闸：
+  //     那是 reaccrueCommissionsForRestoredOrder 的事（只在恢复路径触发，另建等额 ACCRUED 记录、
+  //     冲销记录不动，见文件末尾）；force 复活的老路径不经过它，本闸语义原样保留。
   const accruedKindRows = await tx.commissionRecord.findMany({
     where: { orderId },
     select: { productKind: true },
@@ -26644,6 +26728,175 @@ async function createCommissionsForOrder(
       },
     });
   }
+}
+
+// ────────────────────────────────────────────────────────────────────────────
+// 已取消单恢复后的佣金恢复计提（2026-09-11 拍板：恢复的单佣金也算）。
+//
+// 取消 / 支付超时时 _updateStatusWithinTx 把本单佣金整单冲销：
+//   · ACCRUED（尚未进结算单）→ 原地翻成 REVERSED（amount 仍为正 = 「死行」）；
+//   · SETTLED（钱已付给代理）→ 原记录不动，另建一条负数 REVERSED 补偿行等下期结算追回。
+// createCommissionsForOrder 的幂等闸把 REVERSED 也算作「这一档已计提过」（防 admin force
+// 复活一张已释放单重复付佣），所以恢复到已支付后佣金停在冲销态——这里专门把它们恢复回来。
+//
+// 做法 = **保留冲销记录不动，新建一批等额 ACCRUED 记录**（而不是把死行翻回 ACCRUED）：
+//   · CommissionRecord 没有 reversedAt / 冲销原因列，死行可能已被某期结算单 generate 时
+//     绑上 settlementId（作为 0 元死行留痕）；翻回 ACCRUED 会让它变成「挂在已支付结算单上的
+//     应计佣金」——既不会再被付、也不会被下期扫到，钱凭空消失；
+//   · 死行的 createdAt 是原计提日，翻回去会落进一个可能已关闭的结算期，同样永远漏付；
+//     新建记录 createdAt=当下，自然进入当期结算；
+//   · 账是只增不改的：取消冲销与恢复计提各留各的记录，审计 COMMISSION_REACCRUED_ON_RESTORE
+//     记清「哪条死行 → 哪条新记录」（restoredFrom 关联落审计，不加列、不迁移）。
+//
+// 恢复范围 = 每个 (代理, 档, 链路层级) 分组里「**没有任何存活正数记录**」的那些：从该组
+// 最近一条正数 REVERSED 死行等额复制。已进结算流程的（ACCRUED 挂了 settlementId /
+// SETTLEMENT_REQUESTED / SETTLED）一律不动——SETTLED 组的原记录仍存活，本函数天然跳过，
+// 其负数补偿行照旧在下期结算追回，用 warnings 提醒财务核对。
+// 幂等：新记录一落地该组就有存活正数记录，再跑一遍是空操作（同 requestToken 回放、
+// 恢复到待支付后再付款、并发重试都靠这条）。再次取消会把新记录翻成 REVERSED，
+// 再次恢复按同一规则从最近的死行再复制一次——每次恢复都只多一份、绝不叠加。
+// ────────────────────────────────────────────────────────────────────────────
+export interface ReaccruedCommissionRecord {
+  fromRecordId: string;
+  newRecordId: string;
+  agentId: string;
+  productKind: ProductKind;
+  chainDepth: number;
+  amountCny: number;
+}
+
+export interface CommissionReaccrualOutcome {
+  records: ReaccruedCommissionRecord[];
+  totalCny: number;
+  /** 未自动恢复的部分（已结算 / 已挂结算单）与需要财务跟进的提示。 */
+  warnings: string[];
+}
+
+const NO_COMMISSION_REACCRUAL: CommissionReaccrualOutcome = Object.freeze({
+  records: [],
+  totalCny: 0,
+  warnings: [],
+}) as CommissionReaccrualOutcome;
+
+async function reaccrueCommissionsForRestoredOrder(
+  tx: Prisma.TransactionClient,
+  order: { id: string; orderNumber: string; agentId: string | null },
+  actor: { userId: string; role: UserRole },
+): Promise<CommissionReaccrualOutcome> {
+  if (!order.agentId) return NO_COMMISSION_REACCRUAL;
+
+  const rows = await tx.commissionRecord.findMany({
+    where: { orderId: order.id },
+    orderBy: { createdAt: 'asc' },
+    select: {
+      id: true,
+      agentId: true,
+      productKind: true,
+      chainDepth: true,
+      baseAmount: true,
+      rate: true,
+      amount: true,
+      status: true,
+      settlementId: true,
+    },
+  });
+  if (rows.length === 0) return NO_COMMISSION_REACCRUAL;
+
+  type Row = (typeof rows)[number];
+  const groups = new Map<string, Row[]>();
+  for (const row of rows) {
+    const key = `${row.agentId}|${row.productKind}|${row.chainDepth}`;
+    groups.set(key, [...(groups.get(key) ?? []), row]);
+  }
+
+  const records: ReaccruedCommissionRecord[] = [];
+  const warnings: string[] = [];
+  let settledUntouchedCount = 0;
+  let settledUntouchedCny = 0;
+  let sourceBoundToSettlementCount = 0;
+
+  for (const group of groups.values()) {
+    const isPositive = (r: Row) => r.amount.greaterThan(0);
+    const live = group.filter((r) => r.status !== CommissionStatus.REVERSED && isPositive(r));
+    // 取消冲销留下的两种痕迹：ACCRUED 原地翻牌的正数死行；SETTLED 另建的负数补偿（追回）行。
+    const dead = group.filter((r) => r.status === CommissionStatus.REVERSED && isPositive(r));
+    const clawbacks = group.filter((r) => r.status === CommissionStatus.REVERSED && r.amount.lessThan(0));
+    if (dead.length === 0 && clawbacks.length === 0) continue; // 这一档从未被冲销 → 无需恢复
+
+    if (live.length > 0) {
+      // 已进结算流程（SETTLED / SETTLEMENT_REQUESTED / 挂了结算单的 ACCRUED）的原记录仍存活：
+      // 一律不动；取消时为它建的负数补偿行会在下期结算追回，需财务按口径处理。
+      const inSettlement = live.filter(
+        (r) => r.status !== CommissionStatus.ACCRUED || r.settlementId != null,
+      );
+      if (inSettlement.length > 0) {
+        settledUntouchedCount += inSettlement.length;
+        settledUntouchedCny += inSettlement.reduce((s, r) => s + Number(r.amount.toString()), 0);
+      }
+      continue;
+    }
+    if (dead.length === 0) continue; // 只剩追回行、没有可复制的原记录（脏数据）→ 不猜金额
+
+    const source = dead[dead.length - 1]!; // 最近一条死行（按 createdAt 升序取尾）
+    const created = await tx.commissionRecord.create({
+      data: {
+        agentId: source.agentId,
+        orderId: order.id,
+        productKind: source.productKind,
+        baseAmount: source.baseAmount,
+        rate: source.rate,
+        amount: source.amount,
+        chainDepth: source.chainDepth,
+        status: CommissionStatus.ACCRUED,
+        settlementId: null,
+      },
+      select: { id: true },
+    });
+    if (source.settlementId != null) sourceBoundToSettlementCount += 1;
+    records.push({
+      fromRecordId: source.id,
+      newRecordId: created.id,
+      agentId: source.agentId,
+      productKind: source.productKind,
+      chainDepth: source.chainDepth,
+      amountCny: round2(Number(source.amount.toString())),
+    });
+  }
+
+  const totalCny = round2(records.reduce((s, r) => s + r.amountCny, 0));
+  if (settledUntouchedCount > 0) {
+    warnings.push(
+      `本单有 ${settledUntouchedCount} 条已结算 / 已进结算单的代理佣金（合计 ¥${round2(settledUntouchedCny)}）` +
+        '未自动恢复：取消时为其登记的冲销追回仍会在下期结算生效，请财务按口径核对处理。',
+    );
+  }
+  if (sourceBoundToSettlementCount > 0) {
+    warnings.push(
+      `有 ${sourceBoundToSettlementCount} 条取消时冲销的佣金记录已挂在结算单上，本次已另建新记录恢复计提；` +
+        '该期结算单如尚未支付，请财务重新生成后再核对。',
+    );
+  }
+
+  if (records.length > 0) {
+    await writeAuditWithinTx(tx, {
+      actor: { userId: actor.userId, role: actor.role },
+      action: 'COMMISSION_REACCRUED_ON_RESTORE',
+      targetType: AuditTargetType.ORDER,
+      targetId: order.id,
+      targetLabel: `${order.orderNumber} · 恢复订单佣金恢复计提（${records.length} 条，¥${totalCny}）`,
+      before: { reversedRecordIds: records.map((r) => r.fromRecordId) },
+      after: {
+        orderNumber: order.orderNumber,
+        sellerAgentId: order.agentId,
+        records,
+        totalCny,
+        warnings,
+      },
+      severity: AuditSeverity.WARNING,
+    });
+  }
+
+  return { records, totalCny, warnings };
 }
 
 // ────────────────────────────────────────────────────────────────────────────
