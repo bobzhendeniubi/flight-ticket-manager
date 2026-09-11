@@ -85,6 +85,10 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(cors, {
     origin: corsOrigins,
     credentials: true,
+    // 票务模板导出（勾选导出剔除已取消/退款单）要把剔了几张回给前端弹提示，
+    // 跨子域（admin.citurtravel.com → api.citurtravel.com）下浏览器默认不放行读自定义响应头，
+    // 必须显式暴露，否则前端 fetch 拿到的这个头恒为 undefined。
+    exposedHeaders: ['X-Export-Skipped-Cancelled'],
   });
   await app.register(rateLimit, {
     max: 100,

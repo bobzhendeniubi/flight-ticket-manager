@@ -18,6 +18,7 @@ import type { Prisma } from '@prisma/client';
 import { exportMasterQuerySchema } from './orders.schemas.js';
 import {
   buildExportOrderWhere,
+  countExportSkippedCancelled,
   describeOrderFilters,
   filterExportOrders,
   serializableOrderFilters,
@@ -259,6 +260,23 @@ describe('buildExportOrderWhere · 取数 where', () => {
       expect(and(where).some((c) => 'status' in c)).toBe(false);
     });
 
+    // 票务口径例外（票务反馈「导出不要有已取消的订单」）：开票表混进已取消/退款单没有业务
+    // 意义，勾选导出也要剔除；full/visa 模板与不传 template 时维持上面这条「不叠状态闸」现状。
+    it('票务口径（template=ticketing）：勾选导出仍剔除已取消/退款类单', () => {
+      const where = buildExportOrderWhere(
+        f({ orderIds: ['o1', 'o2'], template: 'ticketing' }),
+      ) as Where;
+      expect(where.id).toEqual({ in: ['o1', 'o2'] });
+      expect(and(where)).toContainEqual({ status: { notIn: EXPORT_RELEASED_STATUSES } });
+    });
+
+    it('非票务模板（full/visa，即不传 template）：勾选导出照旧不叠状态闸（现状不变）', () => {
+      const full = buildExportOrderWhere(f({ orderIds: ['o1'], template: 'full' })) as Where;
+      expect(and(full).some((c) => 'status' in c)).toBe(false);
+      const visa = buildExportOrderWhere(f({ orderIds: ['o1'], template: 'visa' })) as Where;
+      expect(and(visa).some((c) => 'status' in c)).toBe(false);
+    });
+
     it('审计摘要点名范围，结构化留痕缺省落 active', () => {
       expect(describeOrderFilters(f({ scope: 'released', agentId: 'agt-1' }))).toContain(
         '范围=已取消/退款单',
@@ -409,5 +427,49 @@ describe('审计留痕：筛选摘要', () => {
     expect(after.from).toBeNull();
     expect(after.channel).toBeNull();
     expect(after.invoiced).toBeNull();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════
+// countExportSkippedCancelled —— 响应头 X-Export-Skipped-Cancelled 的计数来源。
+describe('countExportSkippedCancelled', () => {
+  const fakeClient = (count: number) => ({
+    order: { count: vi.fn().mockResolvedValue(count) },
+  });
+
+  it('票务口径 + 勾选导出：按 id 集合精确数出已取消/退款类单数', async () => {
+    const client = fakeClient(2);
+    const n = await countExportSkippedCancelled(
+      f({ orderIds: ['o1', 'o2', 'o3'], template: 'ticketing' }),
+      client as never,
+    );
+    expect(n).toBe(2);
+    expect(client.order.count).toHaveBeenCalledWith({
+      where: { id: { in: ['o1', 'o2', 'o3'] }, status: { in: EXPORT_RELEASED_STATUSES } },
+    });
+  });
+
+  it('票务口径但没勾选（按筛选导出）→ 0，不查库', async () => {
+    const client = fakeClient(99);
+    const n = await countExportSkippedCancelled(f({ template: 'ticketing' }), client as never);
+    expect(n).toBe(0);
+    expect(client.order.count).not.toHaveBeenCalled();
+  });
+
+  it('非票务模板（full/visa）即便勾选导出也恒 0（现状不剔单）', async () => {
+    const client = fakeClient(99);
+    const full = await countExportSkippedCancelled(
+      f({ orderIds: ['o1'], template: 'full' }),
+      client as never,
+    );
+    const visa = await countExportSkippedCancelled(
+      f({ orderIds: ['o1'], template: 'visa' }),
+      client as never,
+    );
+    const untagged = await countExportSkippedCancelled(f({ orderIds: ['o1'] }), client as never);
+    expect(full).toBe(0);
+    expect(visa).toBe(0);
+    expect(untagged).toBe(0);
+    expect(client.order.count).not.toHaveBeenCalled();
   });
 });

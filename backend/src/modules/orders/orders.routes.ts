@@ -111,6 +111,7 @@ import {
 import {
   describeOrderFilters,
   serializableOrderFilters,
+  countExportSkippedCancelled,
 } from './orders.export-selection.js';
 import {
   buildIntakeExportWorkbook,
@@ -850,6 +851,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       const requester = await buildRequester(req.user.sub, req.user.role);
       const agentScope = await service.resolveExportAgentScope(requester);
       const buf = await buildOrderTemplateExportWorkbook(query, undefined, { agentScope });
+      // 票务模板勾选导出剔了几张已取消/退款单（见 orders.export-selection.ts），放进响应头
+      // 告知前端——0 也带，别让「有没有这个头」本身变成要猜的事。
+      const skippedCancelledCount = await countExportSkippedCancelled(query);
 
       void writeAudit({
         actor: actorFromRequest(req),
@@ -869,6 +873,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           'Content-Disposition',
           `attachment; filename="${encodeURIComponent(orderTemplateExportFilename(query.template))}"`,
         )
+        .header('X-Export-Skipped-Cancelled', String(skippedCancelledCount))
         .send(buf);
     },
   );
@@ -921,6 +926,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       const buf = await buildMasterExportWorkbook({ ...query, role: effectiveRole }, undefined, {
         agentScope,
       });
+      // role='ticketing' 走的是与三模板票务口径同一份剔单逻辑（见 orders.export-master.ts），
+      // 剔了几张已取消/退款单同样回响应头；其余 role 恒为 0（现状不变，见函数注释）。
+      const skippedCancelledCount = await countExportSkippedCancelled(
+        effectiveRole === 'ticketing' ? { ...query, template: 'ticketing' } : query,
+      );
 
       void writeAudit({
         actor: actorFromRequest(req),
@@ -948,6 +958,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           'Content-Disposition',
           `attachment; filename="${encodeURIComponent(masterExportFilename(query))}"`,
         )
+        .header('X-Export-Skipped-Cancelled', String(skippedCancelledCount))
         .send(buf);
     },
   );

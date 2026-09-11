@@ -781,7 +781,13 @@ export async function buildMasterExportWorkbook(
   // 选单：与列表 listOrders 完全一致的筛选 + 有效状态 + 代理可见集合，
   // 走共享选单（orders.export-selection.ts，与三模板同一份，含「无锚点签证单也取回」的
   // 导出专属口径）。勾选导出（orderIds）在里面短路。
-  const where = buildExportOrderWhere(query, { agentScope: opts?.agentScope });
+  // role='ticketing' 换算成三模板同一个 template 标记：勾选导出时票务口径仍要剔除
+  // 已取消/退款类单（开票表混进这类单没有业务意义），其余 role（all/visa/agent）不传，
+  // 现状不变（见 orders.export-selection.ts 的 applyExportStatusScope）。
+  const where = buildExportOrderWhere(
+    role === 'ticketing' ? { ...query, template: 'ticketing' } : query,
+    { agentScope: opts?.agentScope },
+  );
 
   const fetched = (await client.order.findMany({
     where,

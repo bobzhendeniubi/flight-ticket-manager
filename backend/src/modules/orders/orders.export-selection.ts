@@ -27,7 +27,8 @@
  *   · scheduleId（整班·全岗精确导出）—— 取数已按班次精确圈定，日期类精筛不适用，
  *     但单程/往返筛选照常生效（它与班次无关）。
  */
-import { OrderStatus, Prisma } from '@prisma/client';
+import { OrderStatus, Prisma, type PrismaClient } from '@prisma/client';
+import { prisma as defaultPrisma } from '../../db/prisma.js';
 import {
   applyExportAgentScope,
   buildOrderFilterWhere,
@@ -82,7 +83,17 @@ export const EXPORT_RELEASED_STATUSES: OrderStatus[] = [
 export type ExportScope = 'active' | 'released';
 
 /** 选单用到的筛选字段：列表同款筛选 + 勾选导出 / 整班导出两个短路开关 + 导出范围。*/
-export type ExportSelectionFilters = OrderListFilters & { scope?: ExportScope };
+export type ExportSelectionFilters = OrderListFilters & {
+  scope?: ExportScope;
+  /**
+   * 导出口径标记：'ticketing' = 票务模板（orders.export-templates.ts 的 template='ticketing'，
+   * 或全岗总表 role='ticketing' 由调用方换算成同一个标记，见 orders.export-master.ts）。
+   * 仅供 applyExportStatusScope 判断"勾选导出（orderIds）时是否仍要剔除已取消/退款单"——
+   * 开票表混进这类单没有业务意义，不属于"用户勾了就该原样出现"的范畴（详见该函数注释）。
+   * full/visa 模板与全岗总表 role=all 不传本字段，行为与改动前一致（勾选导出不叠状态闸）。
+   */
+  template?: 'full' | 'ticketing' | 'visa';
+};
 
 /**
  * 取数 where：列表同款筛选 + 无锚点签证单召回 + 有效状态 + 代理可见集合。
@@ -111,10 +122,15 @@ export function buildExportOrderWhere(
 /**
  * 状态闸：按导出范围决定这次导哪一组状态。三条互斥的路，都写在这一处。
  *
- * 1) 勾选导出（orderIds）—— **不叠任何状态闸**：勾了哪些就导哪些。
+ * 1) 勾选导出（orderIds）—— 默认**不叠任何状态闸**：勾了哪些就导哪些。
  *    此前这里照叠 COUNTED_STATUSES，于是运营勾了几张已取消单点导出，那几行**静默消失**，
  *    表里既没有行也没有提示，只能挨个数才发现少了。软删仍然不导（buildOrderFilterWhere
  *    的 orderIds 短路里就带着 deletedAt: null），那是「这单已经不存在」，与状态无关。
+ *    例外：票务口径（query.template === 'ticketing'）—— 开票表混进已取消/退款单没有任何
+ *    业务意义（票都不用开了），这不算"用户勾了就该出现"，故仍剔除 EXPORT_RELEASED_STATUSES。
+ *    为了不再"静默"：调用方（orders.routes.ts）会把被剔掉的张数放进响应头
+ *    X-Export-Skipped-Cancelled 告知运营，而不是像旧版那样悄悄少几行。full/visa 模板、
+ *    全岗总表 role=all 不传 template，行为不变。
  * 2) scope=released —— 已取消/退款类单的独立入口。
  *    query.status 明确给了且本就属于该集合（例：只要「已退款」）→ 收窄到那一个状态；
  *    否则按整组释放型状态导。后一支要连 where.status 一起清掉：占座类状态（例「已出票」）
@@ -127,7 +143,13 @@ function applyExportStatusScope(
   and: Prisma.OrderWhereInput[],
   query: ExportSelectionFilters,
 ): void {
-  if (query.orderIds && query.orderIds.length > 0) return;
+  if (query.orderIds && query.orderIds.length > 0) {
+    // 票务口径例外：勾选导出也剔除已取消/退款类单（见函数头注释 1)）。
+    if (query.template === 'ticketing') {
+      and.push({ status: { notIn: EXPORT_RELEASED_STATUSES } });
+    }
+    return;
+  }
 
   if (query.scope === 'released') {
     const pickedOne =
@@ -138,6 +160,24 @@ function applyExportStatusScope(
   }
 
   and.push({ status: { in: EXPORT_COUNTED_STATUSES } });
+}
+
+/**
+ * 票务口径下，勾选导出（orderIds）里有多少张因「已取消/退款类」被剔除——供路由把这个数字
+ * 放进响应头 X-Export-Skipped-Cancelled，告知运营「剔了几张」而不是让表悄悄变短。
+ *
+ * 非票务口径（template 不是 'ticketing'，或没勾选 orderIds）恒为 0——那些模板/入口现状
+ * 不变，不剔单，也没有"被剔掉"这件事。
+ */
+export async function countExportSkippedCancelled(
+  query: ExportSelectionFilters,
+  client: PrismaClient = defaultPrisma,
+): Promise<number> {
+  if (query.template !== 'ticketing') return 0;
+  if (!query.orderIds || query.orderIds.length === 0) return 0;
+  return client.order.count({
+    where: { id: { in: query.orderIds }, status: { in: EXPORT_RELEASED_STATUSES } },
+  });
 }
 
 /**

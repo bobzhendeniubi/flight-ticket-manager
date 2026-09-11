@@ -4743,6 +4743,26 @@ export class OrderService {
     if (query.claimedById) where.claimedById = query.claimedById;
     if (query.unclaimedOnly) where.claimedById = null;
 
+    // 票务快捷导出面板的预览专用：与票务模板导出剔单同口径（EXPORT_RELEASED_STATUSES，
+    // 见 orders.export-selection.ts 的同名常量，这里不反向 import 以免与该文件的既有依赖方向
+    // 成环，两处状态集合需同步维护）。缺省/false 不加这条，列表默认行为不变。
+    if (query.excludeReleased) {
+      const releasedStatusGuard: Prisma.OrderWhereInput = {
+        status: {
+          notIn: [
+            OrderStatus.CANCELLED,
+            OrderStatus.REFUND_REQUESTED,
+            OrderStatus.REFUNDED,
+            OrderStatus.PAYMENT_TIMEOUT,
+            OrderStatus.FAILED,
+          ],
+        },
+      };
+      const and = Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : [];
+      and.push(releasedStatusGuard);
+      where.AND = and;
+    }
+
     // 出行日期 / 返程日期精确细筛（两段式）：buildOrderFilterWhere 的 travelFrom/travelTo、
     // returnFrom/returnTo 都只做 ±1 天粗窗口（防 UTC/本地日边界漏单），会把「去程 7/10、回程
     // 7/11」这类整单出发日/返程日在窗口外的往返单也粗召回。

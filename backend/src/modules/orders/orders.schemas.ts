@@ -669,6 +669,13 @@ export const listOrdersQuerySchema = z.object({
     .union([z.boolean(), z.enum(['true', 'false'])])
     .transform((v) => v === true || v === 'true')
     .optional(),
+  // 票务快捷导出面板的预览专用：与票务模板导出同口径剔除已取消/退款类单（EXPORT_RELEASED_STATUSES，
+  // 见 orders.export-selection.ts），让「预览看到的条数」与「实际导出的条数」对得上。
+  // 缺省/false = 不筛，列表默认行为不变——本参数只由预览查询主动带上，不影响订单列表页。
+  excludeReleased: z
+    .union([z.boolean(), z.enum(['true', 'false'])])
+    .transform((v) => v === true || v === 'true')
+    .optional(),
   // ops 确认的三个筛选（航班号 / 乘客姓名 / 开票状态）
   // 航班号（不区分大小写）。口径随同时给出的日期维度收口（0831 票务反馈，精筛见
   // filterOrderIdsByLegFlightNumber / filterOrderIdsByFlightDate）：

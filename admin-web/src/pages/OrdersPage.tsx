@@ -1458,7 +1458,9 @@ export function OrdersPage() {
     let cancelled = false;
     setTkPreviewLoading(true);
     const t = setTimeout(() => {
-      const query: ListOrdersParams = { pageSize: 5, travelFrom: tkDate, travelTo: tkDate, invoiceLeg: tkLeg, invoiced: tkInvoiced };
+      // excludeReleased：与票务模板导出同口径剔除已取消/退款类单（票务反馈「导出不要有已取消
+      // 的订单」），否则这里数出来的「匹配 N 条」会比实际导出的行数多，运营对不上账。
+      const query: ListOrdersParams = { pageSize: 5, travelFrom: tkDate, travelTo: tkDate, invoiceLeg: tkLeg, invoiced: tkInvoiced, excludeReleased: true };
       const trimmedFlightNumber = tkFlightNumber.trim();
       if (trimmedFlightNumber) query.flightNumber = trimmedFlightNumber;
       if (tkKind) query.kind = tkKind;
@@ -2518,17 +2520,22 @@ export function OrdersPage() {
     setTkExporting(true);
     try {
       const trimmedFlightNumber = tkFlightNumber.trim();
-      const blob = await api.downloadOrdersTemplateExport(tokens.accessToken, {
-        template: 'ticketing',
-        travelFrom: tkDate || undefined, // 出发日当天（起=止）
-        travelTo: tkDate || undefined,
-        invoiceLeg: tkLeg, // 去程 / 回程
-        invoiced: tkInvoiced, // 未开 / 已开
-        flightNumber: trimmedFlightNumber || undefined, // 航班号（选填，缩小同日多航班范围）
-        kind: tkKind || undefined, // 订单类型（选填：机票单/套餐单，避免同航班混单）
-        tripType: tkTripType || undefined, // 行程类型（选填：单程/往返，票务岗反馈）
-        orderIds: selected.length > 0 ? selected : undefined,
-      });
+      // 用带响应头的版本：票务口径下勾选导出会剔除已取消/退款单（后端 orders.export-
+      // selection.ts），skippedCancelledCount 就是剔了几张——剔了就得告知运营，不能悄悄变短。
+      const { blob, skippedCancelledCount } = await api.downloadOrdersTemplateExportWithMeta(
+        tokens.accessToken,
+        {
+          template: 'ticketing',
+          travelFrom: tkDate || undefined, // 出发日当天（起=止）
+          travelTo: tkDate || undefined,
+          invoiceLeg: tkLeg, // 去程 / 回程
+          invoiced: tkInvoiced, // 未开 / 已开
+          flightNumber: trimmedFlightNumber || undefined, // 航班号（选填，缩小同日多航班范围）
+          kind: tkKind || undefined, // 订单类型（选填：机票单/套餐单，避免同航班混单）
+          tripType: tkTripType || undefined, // 行程类型（选填：单程/往返，票务岗反馈）
+          orderIds: selected.length > 0 ? selected : undefined,
+        },
+      );
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
@@ -2642,6 +2649,9 @@ export function OrdersPage() {
       a.click();
       a.remove();
       setTimeout(() => URL.revokeObjectURL(url), 1000);
+      if (skippedCancelledCount > 0) {
+        alert(`已跳过 ${skippedCancelledCount} 张已取消/退款单（开票表不含此类订单）`);
+      }
     } catch (err) {
       alert(err instanceof ApiError ? `导出失败：${err.message}` : '导出失败');
     } finally {

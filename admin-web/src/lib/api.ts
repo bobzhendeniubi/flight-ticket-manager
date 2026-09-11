@@ -2144,6 +2144,11 @@ export interface ListOrdersParams {
    */
   flightDateFrom?: string; // 航班日期起
   flightDateTo?: string; // 航班日期止
+  /**
+   * 票务快捷导出面板预览专用：与票务模板导出同口径剔除已取消/退款类单，让预览条数与
+   * 实际导出条数对得上。缺省/false = 不筛，不影响订单列表页默认行为。
+   */
+  excludeReleased?: boolean;
   claimedById?: string;
   unclaimedOnly?: string; // '1' = 只看未接单
   /**
@@ -5006,6 +5011,33 @@ export const api = {
     });
     if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
     return res.blob();
+  },
+  /**
+   * 票务快捷导出面板专用：与 downloadOrdersTemplateExport 同一个请求，多带回响应头
+   * X-Export-Skipped-Cancelled——票务口径下勾选导出会剔除已取消/退款单（后端 orders.export-
+   * selection.ts），这个数字用来告诉运营「剔了几张」而不是让表悄悄变短。不改
+   * downloadOrdersTemplateExport 本身：它还有另外两处调用（三模板筛选导出面板 / 航班页导出），
+   * 改共享函数的返回形状会连带牵动它们。
+   */
+  downloadOrdersTemplateExportWithMeta: async (
+    token: string,
+    params: OrdersTemplateExportParams,
+  ): Promise<{ blob: Blob; skippedCancelledCount: number }> => {
+    const qs = new URLSearchParams();
+    for (const [k, v] of Object.entries(params)) {
+      if (v === undefined || v === '') continue;
+      if (k === 'orderIds' && Array.isArray(v)) {
+        if (v.length > 0) qs.set('orderIds', v.join(','));
+        continue;
+      }
+      qs.set(k, String(v));
+    }
+    const res = await fetch(`${API_BASE}/orders/export-templates?${qs.toString()}`, {
+      headers: { Authorization: `Bearer ${token}` },
+    });
+    if (!res.ok) throw new ApiError(res.status, { code: 'EXPORT_FAILED', message: await res.text() });
+    const skippedCancelledCount = Number(res.headers.get('X-Export-Skipped-Cancelled') ?? '0') || 0;
+    return { blob: await res.blob(), skippedCancelledCount };
   },
   // 全岗总表导出（PRIMARY 综合导出：一行/乘客，字段全）；ADMIN/STAFF only。
   // GET /orders/export/master + 与三模板导出**同名同义**的整套筛选（见 OrdersExportFilterParams）

@@ -7645,6 +7645,56 @@ describe('OrderService.listOrders · 列表序列化透出航班号', () => {
   });
 });
 
+// ── listOrders · excludeReleased（票务快捷导出面板预览专用）─────────────────────
+// 与票务模板导出剔单同口径：勾了 template='ticketing' 的导出会剔除已取消/退款类单，
+// 预览若不带同一个闸，运营会看到「预览 12 条、导出只有 9 条」的落差。本参数缺省不生效，
+// 不改列表默认行为。
+describe('OrderService.listOrders · excludeReleased', () => {
+  const service = new OrderService();
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    mockPrisma.$transaction.mockImplementation(async (fnOrOps: unknown) =>
+      Array.isArray(fnOrOps)
+        ? Promise.all(fnOrOps)
+        : (fnOrOps as (tx: unknown) => Promise<unknown>)(mockTx),
+    );
+  });
+
+  it('excludeReleased=true → where 叠加 status notIn 已取消/退款类五态', async () => {
+    mockPrisma.order.findMany.mockResolvedValue([]);
+    mockPrisma.order.count.mockResolvedValue(0);
+
+    await service.listOrders(
+      { page: 1, pageSize: 50, excludeReleased: true } as never,
+      { userId: 'admin1', role: 'ADMIN' },
+    );
+
+    const where = mockPrisma.order.findMany.mock.calls[0][0].where as {
+      AND?: Array<{ status?: { notIn?: string[] } }>;
+    };
+    const releasedGuard = where.AND?.find((c) => c.status?.notIn);
+    expect(releasedGuard?.status?.notIn).toEqual(
+      expect.arrayContaining(['CANCELLED', 'REFUND_REQUESTED', 'REFUNDED', 'PAYMENT_TIMEOUT', 'FAILED']),
+    );
+  });
+
+  it('未给 excludeReleased（缺省）→ 不加该闸，列表默认行为不变', async () => {
+    mockPrisma.order.findMany.mockResolvedValue([]);
+    mockPrisma.order.count.mockResolvedValue(0);
+
+    await service.listOrders({ page: 1, pageSize: 50 } as never, {
+      userId: 'admin1',
+      role: 'ADMIN',
+    });
+
+    const where = mockPrisma.order.findMany.mock.calls[0][0].where as {
+      AND?: Array<{ status?: { notIn?: string[] } }>;
+    };
+    expect(where.AND?.some((c) => c.status?.notIn)).not.toBe(true);
+  });
+});
+
 // ── 床位/计费口径 → 物理房间前瞻闸输入的翻译：toProspectiveOccupancy ────────────
 describe('toProspectiveOccupancy', () => {
   it('0.5 间（单人拼房）→ 1 位拼房客，按第一位 M/F 出行人的性别进桶', () => {
