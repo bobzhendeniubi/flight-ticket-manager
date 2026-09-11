@@ -1018,8 +1018,12 @@ export type BatchPassengerInput = z.infer<typeof batchPassengerInputSchema>;
  */
 export const batchCreateOrdersPassengerInputSchema = batchPassengerInputSchema.extend({
   // 该乘客的团队议价结算价（CNY，**每位出行人整程价**，≥0，最多两位小数）。
-  // 口径与整批 settlementPriceCny 完全一致（同一条机票行覆盖通道，往返按航段分摊），
-  // 只是作用范围收到这一位：填了按自己的价成交，留空沿用整批价。
+  // 按产品类型分流到单笔录单已有的两条通道（见 batchCreateOrders）：
+  //   · 机票批量：口径与整批 settlementPriceCny 完全一致（同一条机票行覆盖通道，往返按航段分摊），
+  //     只是作用范围收到这一位：填了按自己的价成交，留空沿用整批价。
+  //   · 套餐批量：一人一单，这个价就是该子单的「本单结算总价」（含单房差/升舱/指定酒店加价的整单
+  //     成交价），走 createOrder 的 settlementTotalCny → SETTLEMENT 差额行留痕，手工价优先于结算价
+  //     日历；留空照旧按日历自动取价。
   // 仅 ADMIN/STAFF 生效（路由层 403 早拦 + 服务端按认证身份 400，见 batchCreateOrders）。
   settlementPriceCny: z
     .number()
@@ -1171,23 +1175,14 @@ export const batchCreateOrdersBodySchema = z
         path: ['discountPerPersonCny'],
       });
     }
-    // ── 逐人结算价（passengers[].settlementPriceCny）的适用范围与互斥 ──────────────
-    // 与整批 settlementPriceCny 同一条通道（覆盖机票行价），所以互斥关系照抄整批那套：
-    // 与优惠、与 OTA 手动结算单价两两互斥；并且只适用于机票批量（套餐地面价由服务端权威计算，
-    // 逐人价只能盖到套餐里的机票航段 → 半生效，不如直接拒掉）。
-    const perPaxSettlementIndexes = val.passengers.flatMap((passenger, index) =>
-      passenger.settlementPriceCny === undefined ? [] : [index],
+    // ── 逐人结算价（passengers[].settlementPriceCny）的互斥 ─────────────────────────
+    // 机票批量与整批 settlementPriceCny 同一条通道（覆盖机票行价），套餐批量走子单「本单结算总价」
+    // 通道；两条通道都是「把应收收敛到谈定价」，所以互斥关系照抄整批那套：与优惠、与 OTA 手动
+    // 结算单价两两互斥（同时填等于双重调价）。
+    const hasPerPaxSettlementPrice = val.passengers.some(
+      (passenger) => passenger.settlementPriceCny !== undefined,
     );
-    if (perPaxSettlementIndexes.length > 0) {
-      if (pt === 'BUNDLE') {
-        perPaxSettlementIndexes.forEach((index) => {
-          ctx.addIssue({
-            code: z.ZodIssueCode.custom,
-            message: '逐人结算价仅适用于机票批量创单',
-            path: ['passengers', index, 'settlementPriceCny'],
-          });
-        });
-      }
+    if (hasPerPaxSettlementPrice) {
       if (hasDiscount) {
         ctx.addIssue({
           code: z.ZodIssueCode.custom,

@@ -224,17 +224,45 @@ describe('batchCreateOrders · 逐人结算价（passengers[].settlementPriceCny
     ...(settlementPriceCny === undefined ? {} : { settlementPriceCny }),
   });
 
-  /** 装配：捕获每张子单传给 createOrder 的 flightSettlementPriceCny。 */
-  function wireCapture(): { captured: () => Array<number | undefined> } {
+  /** 装配：捕获每张子单传给 createOrder 的两条结算价通道（机票行覆盖价 / 本单结算总价）。 */
+  function wireCapture(): {
+    captured: () => Array<number | undefined>;
+    capturedTotals: () => Array<number | undefined>;
+  } {
     vi.spyOn(service as never, 'assertNoDuplicatePassengersOnFlights').mockResolvedValue(undefined as never);
     const captured: Array<number | undefined> = [];
+    const capturedTotals: Array<number | undefined> = [];
     vi.spyOn(service as never, 'createOrder').mockImplementation((async (body: {
       flightSettlementPriceCny?: number;
+      settlementTotalCny?: number;
     }) => {
       captured.push(body.flightSettlementPriceCny);
+      capturedTotals.push(body.settlementTotalCny);
       return { id: `o-${captured.length}`, orderNumber: `N-${captured.length}` };
     }) as never);
-    return { captured: () => captured };
+    return { captured: () => captured, capturedTotals: () => capturedTotals };
+  }
+
+  /** 套餐批量 body（一人一单）；套餐航段解析走 spy，不触库。 */
+  function bundleBody(passengers: ReturnType<typeof pax>[]): BatchCreateOrdersBody {
+    return {
+      productType: 'BUNDLE',
+      bundleId: 'bundle-1',
+      bundleDepartDate: '2026-10-01',
+      bundleNights: 4,
+      description: '岘港 4 晚四星',
+      agentId: 'agent-1',
+      passengers,
+    } as unknown as BatchCreateOrdersBody;
+  }
+
+  function wireBundleLegs(): void {
+    vi.spyOn(service as never, 'resolveBundleFlightLegs').mockResolvedValue({
+      ok: true,
+      legs: [],
+      dates: { goDate: '2026-10-01', returnDate: '2026-10-05' },
+      businessUpgradeCnyPerLeg: null,
+    } as never);
   }
 
   it('乘客自填结算价覆盖整批价，留空的乘客回落整批价', async () => {
@@ -253,7 +281,7 @@ describe('batchCreateOrders · 逐人结算价（passengers[].settlementPriceCny
   });
 
   it('整批价与逐人价都留空 → 不走议价通道（照旧结算价日历 / 动态定价）', async () => {
-    const { captured } = wireCapture();
+    const { captured, capturedTotals } = wireCapture();
 
     await service.batchCreateOrders(
       baseBody({ passengers: [pax('WU/FEILAI', 'EB9452866')] } as Partial<BatchCreateOrdersBody>),
@@ -261,6 +289,62 @@ describe('batchCreateOrders · 逐人结算价（passengers[].settlementPriceCny
     );
 
     expect(captured()).toEqual([undefined]);
+    expect(capturedTotals()).toEqual([undefined]);
+  });
+
+  it('机票批量的逐人价只走机票行覆盖通道，不带本单结算总价', async () => {
+    const { capturedTotals } = wireCapture();
+
+    await service.batchCreateOrders(
+      baseBody({ passengers: [pax('WU/FEILAI', 'EB9452866', 3200)] } as Partial<BatchCreateOrdersBody>),
+      { userId: 'u-admin', role: 'ADMIN' } as never,
+    );
+
+    expect(capturedTotals()).toEqual([undefined]);
+  });
+
+  it('套餐批量：乘客自填结算价 → 该子单的「本单结算总价」，留空的乘客照旧走结算价日历', async () => {
+    const { captured, capturedTotals } = wireCapture();
+    wireBundleLegs();
+
+    const res = await service.batchCreateOrders(
+      bundleBody([pax('WU/FEILAI', 'EB9452866', 3200), pax('LI/MING', 'EB9452867')]),
+      { userId: 'u-admin', role: 'ADMIN' } as never,
+    );
+
+    expect(res.successCount).toBe(2);
+    // 套餐子单的机票航段行不吃逐人价（那是整批 settlementPriceCny 的事），逐人价落到整单结算价。
+    expect(captured()).toEqual([undefined, undefined]);
+    expect(capturedTotals()).toEqual([3200, undefined]);
+  });
+
+  it('套餐批量：AGENT 携带逐人结算价同样 BadRequestError 且未触库', async () => {
+    const createSpy = vi.spyOn(service as never, 'createOrder');
+
+    await expect(
+      service.batchCreateOrders(bundleBody([pax('WU/FEILAI', 'EB9452866', 3200)]), {
+        userId: 'u-agent',
+        role: 'AGENT',
+        agentId: 'agent-1',
+      } as never),
+    ).rejects.toThrow('无权指定团队议价结算价');
+
+    expect(mockPrisma.user.findUnique).not.toHaveBeenCalled();
+    expect(createSpy).not.toHaveBeenCalled();
+  });
+
+  it('套餐批量：逐人结算价与批量优惠互斥，且未触库', async () => {
+    await expect(
+      service.batchCreateOrders(
+        {
+          ...bundleBody([pax('WU/FEILAI', 'EB9452866', 3200)]),
+          discountPerPersonCny: 50,
+        } as BatchCreateOrdersBody,
+        { userId: 'u-admin', role: 'ADMIN' } as never,
+      ),
+    ).rejects.toThrow('优惠与团队议价结算价二选一');
+
+    expect(mockPrisma.user.findUnique).not.toHaveBeenCalled();
   });
 
   it('AGENT 携带逐人结算价 → BadRequestError（路由层 403 的服务端双保险），且未触库', async () => {
@@ -303,7 +387,7 @@ describe('batchCreateOrders · 逐人结算价（passengers[].settlementPriceCny
     expect(mockPrisma.user.findUnique).not.toHaveBeenCalled();
   });
 
-  it('schema：逐人结算价受上限 / 两位小数约束，且套餐批量一律拒', () => {
+  it('schema：逐人结算价受上限 / 两位小数约束，套餐批量同样可填（与优惠互斥）', () => {
     expect(
       batchCreateOrdersBodySchema.safeParse(
         baseBody({ passengers: [pax('WU/FEILAI', 'EB9452866', 3200.5)] } as Partial<BatchCreateOrdersBody>),
@@ -331,10 +415,21 @@ describe('batchCreateOrders · 逐人结算价（passengers[].settlementPriceCny
       description: '套餐',
       passengers: [pax('WU/FEILAI', 'EB9452866', 3200)],
     });
-    expect(bundle.success).toBe(false);
-    expect(bundle.success ? '' : bundle.error.issues.map((issue) => issue.message).join(' ')).toContain(
-      '逐人结算价仅适用于机票批量创单',
-    );
+    expect(bundle.success).toBe(true);
+
+    const bundleWithDiscount = batchCreateOrdersBodySchema.safeParse({
+      productType: 'BUNDLE',
+      bundleId: 'bundle-1',
+      description: '套餐',
+      discountPerPersonCny: 50,
+      passengers: [pax('WU/FEILAI', 'EB9452866', 3200)],
+    });
+    expect(bundleWithDiscount.success).toBe(false);
+    expect(
+      bundleWithDiscount.success
+        ? ''
+        : bundleWithDiscount.error.issues.map((issue) => issue.message).join(' '),
+    ).toContain('优惠与团队议价结算价二选一');
   });
 });
 

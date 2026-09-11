@@ -14439,9 +14439,11 @@ interface BatchRow {
   /** 该乘客的个别备注（选填）：客人各自的特殊要求，随本人订单单独存。留空则只写整批备注。 */
   note?: string;
   /**
-   * 该乘客的团队议价结算价（每人整程价，CNY，最多两位小数；选填）。
-   * 与整批「结算价/人」同一条通道：填了按本人这个价成交，留空沿用整批价（整批也留空则走
-   * 结算价日历 / 动态定价）。仅机票批量 + 运营可填，提交时只带 > 0 的值。
+   * 该乘客的团队议价结算价（每人整程价，CNY，最多两位小数；选填）。仅运营可填，提交时只带 > 0 的值。
+   *   · 机票批量：与整批「结算价/人」同一条通道：填了按本人这个价成交，留空沿用整批价（整批也留空
+   *     则走结算价日历 / 动态定价）。
+   *   · 套餐批量：一人一单，这个价就是本人子单的整单成交价（含单房差 / 升舱 / 指定酒店加价），
+   *     服务端按差额留痕落账；留空照旧按结算价日历自动取价。与批量优惠互斥。
    */
   settlementPriceCny?: number | null;
   /** 套餐行级选项：只作用于该乘客自己的子单。 */
@@ -15109,10 +15111,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   const validRows = rows.filter((row) => row.fullName.trim() && row.documentNumber.trim() && parseDob(row.dateOfBirth));
   const hasBatchManualSettlementPrice = manualUnitPriceCny !== null && manualUnitPriceCny > 0;
   const hasBatchTeamSettlementPrice = settlementPriceCny !== null && settlementPriceCny > 0;
-  // 逐人结算价：与整批结算价同一条通道、同一显隐条件（仅运营 + 机票批量）。
-  // 套餐批量的地面价由服务端权威计算，逐人价盖不住 → 整列不给，避免「填了不生效」。
-  const canEnterPerPaxSettlementPrice =
-    isOps && (productType === 'FLIGHT_ONEWAY' || productType === 'FLIGHT_ROUNDTRIP');
+  // 逐人结算价：仅运营可填（后端对 AGENT 一律 403）。机票批量走整批结算价同一条通道；
+  // 套餐批量一人一单，逐人价即该子单的整单成交价（服务端 settlementTotalCny 差额留痕，优先于日历）。
+  const canEnterPerPaxSettlementPrice = isOps;
   const perPaxSettlementRowCount = canEnterPerPaxSettlementPrice
     ? rows.filter((row) => row.settlementPriceCny !== null && (row.settlementPriceCny ?? 0) > 0).length
     : 0;
@@ -16240,7 +16241,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 </div>
               </div>
               <div className="scrollbar-visible max-h-60 overflow-x-auto overflow-y-auto rounded-md border border-slate-200">
-                <table className={`${productType === 'BUNDLE' ? 'min-w-[1160px]' : canEnterPerPaxSettlementPrice ? 'min-w-[1170px]' : 'min-w-[1030px]'} w-full text-sm`}>
+                <table className={`${productType === 'BUNDLE' ? (canEnterPerPaxSettlementPrice ? 'min-w-[1300px]' : 'min-w-[1160px]') : canEnterPerPaxSettlementPrice ? 'min-w-[1170px]' : 'min-w-[1030px]'} w-full text-sm`}>
                   <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
                     <tr>
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">姓名</th>
@@ -16260,7 +16261,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       {canEnterPerPaxSettlementPrice && (
                         <th className="min-w-[140px] whitespace-nowrap px-2 py-1.5 text-left font-normal">
                           结算价/人（¥）
-                          <span className="ml-1 text-[10px] text-slate-400">留空按整批结算价</span>
+                          <span className="ml-1 text-[10px] text-slate-400">
+                            {productType === 'BUNDLE' ? '本人整单价，留空按日历取价' : '留空按整批结算价'}
+                          </span>
                         </th>
                       )}
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">备注（选填）</th>
@@ -16496,7 +16499,11 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                               step={0.01}
                               disabled={hasBatchManualSettlementPrice || hasBatchManualDiscount}
                               placeholder={
-                                hasBatchTeamSettlementPrice ? `留空 = ¥${settlementPriceCny}` : '留空 = 整批价'
+                                productType === 'BUNDLE'
+                                  ? '留空 = 日历价'
+                                  : hasBatchTeamSettlementPrice
+                                    ? `留空 = ¥${settlementPriceCny}`
+                                    : '留空 = 整批价'
                               }
                             />
                           </td>
@@ -16790,16 +16797,21 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 <label className="block text-xs text-slate-500 md:w-1/2">
                   优惠（¥/人）
                   <NumberInput
-                    className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                    className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm disabled:bg-slate-100"
                     value={discountPerPersonCny}
                     onChange={setDiscountPerPersonCny}
                     min={0}
                     step={1}
                     integerOnly
-                    placeholder="如 50"
+                    disabled={hasBatchPerPaxSettlementPrice}
+                    placeholder={hasBatchPerPaxSettlementPrice ? '名单已填逐人结算价' : '如 50'}
                   />
                 </label>
-                <p className="mt-2 text-[11px] text-sky-700">ⓘ 每张子单按该单出行人数生成「同业优惠」调整行；套餐结算价按结算价日历自动取价，无需也不可手填。</p>
+                <p className="mt-2 text-[11px] text-sky-700">
+                  ⓘ 每张子单按该单出行人数生成「同业优惠」调整行。套餐结算价默认按结算价日历自动取价；
+                  某位客人价格不同，在上方名单「结算价/人」填本人整单价（含单房差 / 升舱 / 指定酒店加价），
+                  系统按差额留痕落账。优惠与逐人结算价二选一。
+                </p>
               </div>
             )}
 

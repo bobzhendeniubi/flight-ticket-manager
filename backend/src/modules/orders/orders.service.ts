@@ -6217,11 +6217,25 @@ export class OrderService {
             noteSpecial: mergedNoteSpecial,
             // 整批归属代理（ADMIN/STAFF 录单）；AGENT 自助仍归属本人。
             agentId: body.agentId,
-            // 团队议价结算价（CNY/人）覆盖机票动态价；仅 ADMIN/STAFF（路由层已断言）。
-            // 仅作用于 FLIGHT 行；BUNDLE 走 createOrder 的 server-priced 套餐定价，此值对其无效。
-            // 优先用该乘客自己填的结算价（名单行级议价），留空才沿用整批价；两者都留空 → undefined，
-            // 照旧走结算价日历 / 动态定价。口径完全同源，一批单里「价格来源」列不会分叉。
-            flightSettlementPriceCny: passenger.settlementPriceCny ?? body.settlementPriceCny,
+            // 团队议价结算价（仅 ADMIN/STAFF，路由层已断言）按产品类型分流到单笔录单已有的两条通道：
+            //   · 机票批量：覆盖机票行动态价（flightSettlementPriceCny）。优先用该乘客自己填的结算价
+            //     （名单行级议价），留空才沿用整批价；两者都留空 → undefined，照旧走结算价日历 / 动态
+            //     定价。口径完全同源，一批单里「价格来源」列不会分叉。
+            //   · 套餐批量：一人一单，乘客自己填的价就是这张子单的「本单结算总价」（含单房差 / 升舱 /
+            //     指定酒店加价的整单成交价）→ createOrder 按「结算价 − 权威合计」生成 SETTLEMENT 差额行
+            //     留痕，手工价优先于结算价日历；留空照旧按日历自动取价。整批 settlementPriceCny 对套餐
+            //     子单维持原状（只盖机票航段行）。
+            ...(isBundle
+              ? {
+                  flightSettlementPriceCny: body.settlementPriceCny,
+                  ...(passenger.settlementPriceCny !== undefined
+                    ? { settlementTotalCny: passenger.settlementPriceCny }
+                    : {}),
+                }
+              : {
+                  flightSettlementPriceCny:
+                    passenger.settlementPriceCny ?? body.settlementPriceCny,
+                }),
             // OTA 手动结算单价 → 差额调整行（每单一致；createOrder 再按身份复核权限 + 审计落库）。
             priceAdjustment: manualPriceAdjustment ?? discountAdjustment,
             // 透传重复乘客强录 flag（createOrder 内再按身份收口 + 逐单审计/备注留痕）。
