@@ -24172,6 +24172,8 @@ export function splitSearchTerms(search: string, limit: number = MAX_SEARCH_TERM
  * - 订单项名称 OrderItem.description（公测反馈：搜产品名/酒店名/签证名要能搜到订单）——
  *   运营记得住「客人买的是哪个产品」的次数，不比记得住订单号少；此前搜索只认订单号/人/备注，
  *   按产品名搜一律空手而归。与乘客子查询同构（items.some.description），词间 AND 语义不变。
+ * - 代理名称 Agent.companyName/contactName（运营反馈：搜索框标注了「代理」却从没接代理表，
+ *   搜代理名一律搜不到）。直客单 agentId=null，关联为空时该分支自然不命中，不影响直客单搜索。
  * 导出：主列表与回收站（listDeletedOrders）共用本口径，另供单测断言 where 形状。
  */
 export function buildSearchTermClause(term: string): Prisma.OrderWhereInput {
@@ -24202,6 +24204,15 @@ export function buildSearchTermClause(term: string): Prisma.OrderWhereInput {
       },
       // 产品名（航段/酒店/签证/套餐的行描述）——任一订单项命中即命中该订单。
       { items: { some: { description: { contains: term, mode: 'insensitive' } } } },
+      // 代理名称（公司名/联系人名）——直客单 agent 关联为空，不影响其余分支命中。
+      {
+        agent: {
+          OR: [
+            { companyName: { contains: term, mode: 'insensitive' } },
+            { contactName: { contains: term, mode: 'insensitive' } },
+          ],
+        },
+      },
     ],
   };
 }

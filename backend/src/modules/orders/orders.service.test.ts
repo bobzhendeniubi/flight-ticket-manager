@@ -7795,6 +7795,19 @@ describe('buildOrderFilterWhere · 搜索/乘客姓名含中文名（公测反�
     }
   });
 
+  it('search 命中代理名称（公司名/联系人名），直客单 agent 关联为空不影响其余分支', () => {
+    const where = buildOrderFilterWhere({ search: '总代' });
+    const [clause] = searchClauses(where);
+    expect(clause.OR).toContainEqual({
+      agent: {
+        OR: [
+          { companyName: { contains: '总代', mode: 'insensitive' } },
+          { contactName: { contains: '总代', mode: 'insensitive' } },
+        ],
+      },
+    });
+  });
+
   it('多词 search → 每词一个 OR 块、词间 AND（两词分别命中同单两位乘客时订单命中）', () => {
     const where = buildOrderFilterWhere({ search: '陈志远，林晓梅' });
     const clauses = searchClauses(where);

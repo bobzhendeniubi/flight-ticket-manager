@@ -3551,7 +3551,7 @@ export function OrdersPage() {
           <div className="border-t border-slate-100 pt-4">
           <div className="mb-2 flex flex-wrap items-baseline gap-x-2 text-xs">
             <span className="font-semibold text-ink-soft">找人</span>
-            <span className="text-ink-muted">乘客姓名可一次贴整团名单；大搜索框全字段模糊匹配</span>
+            <span className="text-ink-muted">乘客姓名可一次贴整团名单；大搜索框全字段模糊匹配（含备注、产品名、代理）</span>
           </div>
           <div className="grid gap-4 md:grid-cols-5">
           <div>
@@ -3571,10 +3571,10 @@ export function OrdersPage() {
             </div>
           </div>
           <div className="md:col-span-4">
-            <label className="label">搜索（订单号 / 客户 / 乘客中英文名 / 护照号 / 代理）</label>
+            <label className="label">搜索（订单号 / 客户 / 乘客中英文名 / 护照号 / 备注 / 产品名 / 代理）</label>
             <input
               className="input"
-              placeholder="如 FTM2026 / 张伟 / E12345678 / 总代"
+              placeholder="如 FTM2026 / 张伟 / E12345678 / 改期 / 总代"
               value={search}
               onChange={(e) => setSearch(e.target.value)}
             />

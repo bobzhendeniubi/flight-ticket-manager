@@ -44,7 +44,8 @@ describe('buildSearchTermClause · 搜索吃产品名（订单项 description）
     expect(or).toContainEqual({ contactPhone: { contains: 'abc' } });
     expect(or).toContainEqual({ noteVisa: { contains: 'abc', mode: 'insensitive' } });
     expect(or.some((c) => 'passengers' in c)).toBe(true);
-    expect(or).toHaveLength(11);
+    // 12 支：9 订单级字段 + 乘客子查询 + 产品名(items) + 代理名(agent)。
+    expect(or).toHaveLength(12);
   });
 
   it('乘客子查询里含 formerIdentities：换人之后搜换之前那个人也能命中', () => {
