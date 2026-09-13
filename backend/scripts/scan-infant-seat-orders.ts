@@ -1,30 +1,37 @@
 /**
- * 存量「婴儿多占座」清查 / 回填脚本（婴儿不占座口径上线后的一次性对账）。
+ * 存量「机票行占座数 ≠ 当前乘客类型」清查 / 回填脚本（婴儿不占座口径的一次性对账 + 漂移复查）。
  *
  * 背景：机票行的占座数此前直接吃 `quantity`（含婴儿），纯机票单里的婴儿也被扣了 1 座
  *（公测反馈：婴儿单独一张单占了位）。新口径把占座数独立成 `metadata.seatQuantity`
  *（见 src/modules/orders/flight-seat-quantity.ts），历史行没有这个键 → 座位账回落 quantity，
- * 也就是继续多占。本脚本把这批单找出来，`--fix` 时补上 seatQuantity 并把多占的 sold 回减。
+ * 也就是继续多占。
  *
- * 选单口径：占座态订单（SEAT_HOLDING_STATUSES，非回收站）里含 INFANT 乘客的单；
- * 逐条**活**机票行（有班次、非作废/取消航段残骸）比对：
+ * 第二类漂移（运营反馈「换人 / 改生日把成人改成婴儿或反过来，机位数不会自动加减」）：
+ * 建单盖过章之后，换人 / 订正改了乘客类型，盖章与 sold 都没跟着动 —— 婴儿改成人的单**少占**一座
+ *（照旧能被别人卖掉），成人改婴儿的单多占一座。在线路径已由 resyncFlightSeatsWithinTx 收口，
+ * 本脚本负责把收口之前漂过的存量找出来。
+ *
+ * 选单口径：占座态订单（SEAT_HOLDING_STATUSES，非回收站）里含活机票行的单，逐单按**当前**乘客
+ * 类型跑与在线路径同一份纯函数 planFlightSeatResync：
  *   期望占座 = min(quantity, 非婴儿人数)（与建单同一公式 resolveFlightSeatQuantity）；
  *   当前占座 = flightSeatQuantity(行)（缺省 = quantity）；
- *   列出「seatQuantity 缺省」或「当前占座 > 期望占座」的行，多占座数 = 当前 − 期望。
+ *   命中 = 任一活机票行「当前占座 ≠ 期望占座」或「盖章缺省 / 婴儿数盖章过期」，且
+ *          （本单含婴儿 或 该行盖过章）—— 没盖过章又没有婴儿的老行不可能因婴儿口径漂移，不碰。
  *
- * --fix 做什么（一张单一个事务）：
- *   · 每条候选行 metadata 补 seatQuantity（= 期望占座）与 infantCount；
- *   · 多占座数 > 0 且班次**尚未起飞**的行：按升舱拆分（businessUpgradeCount）逐舱
- *     releaseSeatFloored 回减 FlightSeatClass.sold —— 与状态机释放同一 helper、同一拆分口径；
- *   · 已起飞的班次只补键不回减 sold（座位已被真实消耗，与状态机「已飞航段不放座」同口径；
- *     补键是为了之后任何释放路径都不会再按 quantity 多放）；
- *   · 每张单落一条 CRITICAL 审计 INFANT_SEAT_BACKFILL（before/after 带逐行明细），可据此回溯。
+ * --fix 做什么（一张单一个事务，Order 行 FOR UPDATE 后按锁后状态跑）：
+ *   直接调 OrderService.resyncFlightSeatsWithinTx（与换人 / 订正在线路径**同一份**占放座逻辑）：
+ *   · 每条候选行 metadata 重盖 seatQuantity（= 期望占座）与 infantCount；
+ *   · 多占（Δ<0）且班次**尚未起飞**：按升舱拆分逐舱 releaseSeatFloored 回减 sold；
+ *   · 少占（Δ>0）且尚未起飞：takeSeatWithinTx CAS 占回 —— 班次已售罄则该单整体回滚、打印出来
+ *     交人工处理（改期 / 改单申请），绝不超售；
+ *   · 已起飞的班次只重盖章不动 sold（座位已被真实消耗，与状态机「已飞航段不放座」同口径）；
+ *   · 每张单落一条 FLIGHT_SEAT_RESYNC 审计（reason=backfill，before/after 带逐行明细），可据此回溯。
  * 一个字都不动钱：unitPrice / amount / quantity 原样。
  *
  * 用法（backend/ 目录下）：
  *   npx tsx scripts/scan-infant-seat-orders.ts                # dry-run 全量预览（只读）
  *   npx tsx scripts/scan-infant-seat-orders.ts --limit=20     # 只看前 20 张候选单
- *   npx tsx scripts/scan-infant-seat-orders.ts --fix          # 补键 + 回减多占的 sold
+ *   npx tsx scripts/scan-infant-seat-orders.ts --fix          # 重盖章 + 回减 / 占回 sold
  *
  * 连接串：走 Prisma 默认的 DATABASE_URL 环境变量，与后端服务同一个 src/db/prisma.js 客户端。
  *
@@ -39,31 +46,20 @@
  *       npx tsx scripts/scan-infant-seat-orders.ts --fix      # 核对无误再执行
  *   （docker compose 每个子命令都要带 --env-file 与 -p，否则报 PAYMENT_MODE is missing 或串到另一套环境。）
  */
-import {
-  AuditSeverity,
-  OrderItemKind,
-  PassengerType,
-  Prisma,
-  type CabinClass,
-} from '@prisma/client';
+import { OrderItemKind, Prisma, type OrderStatus } from '@prisma/client';
 import { prisma } from '../src/db/prisma.js';
-import { writeAuditWithinTx } from '../src/lib/audit.js';
+import { ConflictError } from '../src/lib/errors.js';
+import { OrderService, SEAT_HOLDING_STATUSES } from '../src/modules/orders/orders.service.js';
 import {
-  SEAT_HOLDING_STATUSES,
-  computeBundleSeatSplit,
-  releaseSeatFloored,
-} from '../src/modules/orders/orders.service.js';
-import {
-  flightSeatQuantity,
-  hasExplicitFlightSeatQuantity,
-  resolveFlightSeatQuantity,
-  withFlightSeatMetadata,
-} from '../src/modules/orders/flight-seat-quantity.js';
-import { isTerminalLegItem } from '../src/modules/orders/split-move-strategies.js';
+  planFlightSeatResync,
+  type FlightSeatResyncPlan,
+  type FlightSeatResyncRowPlan,
+} from '../src/modules/orders/flight-seat-resync.js';
 
 const LOG_PREFIX = '[scan-infant-seat-orders]';
 const TX_TIMEOUT_MS = 30_000;
 const TX_MAX_WAIT_MS = 15_000;
+const PAGE_SIZE = 500;
 
 interface CliOptions {
   fix: boolean;
@@ -80,36 +76,15 @@ function parseArgs(argv: readonly string[]): CliOptions {
   return { fix, limit: limitRaw };
 }
 
-function readJsonObject(raw: unknown): Record<string, unknown> {
-  return raw != null && typeof raw === 'object' && !Array.isArray(raw)
-    ? (raw as Record<string, unknown>)
-    : {};
-}
-
-/** 一条需要处理的机票行（dry-run 打印 / --fix 落库共用同一份判定结果）。 */
-interface SeatFinding {
-  itemId: string;
-  description: string;
-  flightNumber: string | null;
-  departureTime: Date | null;
-  cabin: CabinClass;
-  scheduleId: string;
-  quantity: number;
-  currentSeat: number;
-  expectedSeat: number;
-  excess: number;
-  hadExplicitSeatQuantity: boolean;
-  departed: boolean;
-  businessUpgradeCount: number;
-}
-
 interface OrderFinding {
   orderId: string;
   orderNumber: string;
-  status: string;
-  passengerCount: number;
-  infantCount: number;
-  rows: SeatFinding[];
+  status: OrderStatus;
+  plan: FlightSeatResyncPlan;
+  /** 需要写的行（与 resyncFlightSeatsWithinTx 会动的行同一份判定）。 */
+  rows: FlightSeatResyncRowPlan[];
+  /** 行 → 航班号（只用于打印）。 */
+  flightNumberByItemId: Map<string, string | null>;
 }
 
 const ORDER_SELECT = {
@@ -118,7 +93,7 @@ const ORDER_SELECT = {
   status: true,
   passengers: { select: { passengerType: true } },
   items: {
-    where: { kind: OrderItemKind.FLIGHT },
+    where: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
     select: {
       id: true,
       description: true,
@@ -135,157 +110,135 @@ const ORDER_SELECT = {
 
 type OrderRow = Prisma.OrderGetPayload<{ select: typeof ORDER_SELECT }>;
 
-function assessOrder(order: OrderRow, now: Date): OrderFinding | null {
-  const infantCount = order.passengers.filter(
-    (p) => p.passengerType === PassengerType.INFANT,
-  ).length;
-  if (infantCount === 0) return null;
-  const nonInfantPax = Math.max(0, order.passengers.length - infantCount);
-  const rows: SeatFinding[] = [];
-  for (const item of order.items) {
-    if (!item.flightScheduleId || !item.flightCabin) continue;
-    const meta = readJsonObject(item.metadata);
-    if (isTerminalLegItem(meta)) continue;
-    const currentSeat = flightSeatQuantity(item);
-    const expectedSeat = resolveFlightSeatQuantity(item.quantity, nonInfantPax);
-    const hadExplicit = hasExplicitFlightSeatQuantity(item);
-    if (hadExplicit && currentSeat <= expectedSeat) continue;
-    const departureTime = item.flightSchedule?.departureTime ?? null;
-    rows.push({
-      itemId: item.id,
-      description: item.description,
-      flightNumber: item.flightSchedule?.flight?.flightNumber ?? null,
-      departureTime,
-      cabin: item.flightCabin,
-      scheduleId: item.flightScheduleId,
-      quantity: item.quantity,
-      currentSeat,
-      expectedSeat,
-      excess: Math.max(0, currentSeat - expectedSeat),
-      hadExplicitSeatQuantity: hadExplicit,
-      departed: departureTime != null && departureTime.getTime() <= now.getTime(),
-      businessUpgradeCount:
-        typeof meta.businessUpgradeCount === 'number' ? meta.businessUpgradeCount : 0,
-    });
-  }
-  if (rows.length === 0) return null;
+/**
+ * 与在线路径同一份纯函数算 Δ；命中条件多一层「本单含婴儿 或 该行盖过章」——
+ * 没盖过章又没有婴儿的老行，占座数 = quantity 本就是对的，不因这次清查平白盖章 / 动账。
+ */
+function assessOrder(order: OrderRow, nowMs: number): OrderFinding | null {
+  const plan = planFlightSeatResync(order.items, order.passengers, nowMs);
+  if (!plan.changed) return null;
+  const qualifies = plan.rows.some(
+    (r) => r.needsWrite && (plan.infantCount > 0 || r.hadExplicitSeatQuantity),
+  );
+  if (!qualifies) return null;
   return {
     orderId: order.id,
     orderNumber: order.orderNumber,
     status: order.status,
-    passengerCount: order.passengers.length,
-    infantCount,
-    rows,
+    plan,
+    rows: plan.rows.filter((r) => r.needsWrite),
+    flightNumberByItemId: new Map(
+      order.items.map((it) => [it.id, it.flightSchedule?.flight?.flightNumber ?? null]),
+    ),
   };
 }
 
-function formatRow(row: SeatFinding): string {
-  const when = row.departureTime ? row.departureTime.toISOString().slice(0, 10) : '未知日期';
-  const flag = row.hadExplicitSeatQuantity ? '' : '（seatQuantity 缺省）';
-  const departed = row.departed ? '（已起飞，只补键不回减）' : '';
+function formatRow(finding: OrderFinding, row: FlightSeatResyncRowPlan): string {
+  const flightNumber = finding.flightNumberByItemId.get(row.itemId) ?? '?';
+  const flags: string[] = [];
+  if (!row.hadExplicitSeatQuantity) flags.push('seatQuantity 缺省');
+  if (row.delta === 0) flags.push('只重盖章');
+  if (row.departed && row.delta !== 0) flags.push('已起飞，只盖章不动账');
+  if (row.seatCappedByQuantity) flags.push('套餐腿被 quantity 夹住，座加不上');
+  const deltaText =
+    row.delta > 0
+      ? `少占 ${row.delta}（要占回）`
+      : row.delta < 0
+        ? `多占 ${-row.delta}（要回减）`
+        : 'Δ 0';
   return (
-    `    ${row.flightNumber ?? '?'} ${when} ${row.cabin} · quantity ${row.quantity} · ` +
-    `当前占 ${row.currentSeat} 座 → 应占 ${row.expectedSeat} 座 · 多占 ${row.excess}${flag}${departed}`
+    `    ${flightNumber} ${row.description} ${row.cabin} · quantity ${row.quantity} · ` +
+    `当前占 ${row.oldSeat} 座 → 应占 ${row.newSeat} 座 · ${deltaText}` +
+    (flags.length > 0 ? `（${flags.join('；')}）` : '')
   );
 }
 
-/** 逐舱回减多占的 sold：按升舱拆分分别算「当前」与「期望」两份拆分，差额各退各舱。 */
-async function releaseExcess(tx: Prisma.TransactionClient, row: SeatFinding): Promise<void> {
-  const current = computeBundleSeatSplit(row.cabin, row.currentSeat, row.businessUpgradeCount);
-  const expected = computeBundleSeatSplit(row.cabin, row.expectedSeat, row.businessUpgradeCount);
-  await releaseSeatFloored(tx, row.scheduleId, 'BUSINESS', current.business - expected.business);
-  await releaseSeatFloored(tx, row.scheduleId, row.cabin, current.sameCabin - expected.sameCabin);
-}
-
-async function fixOrder(finding: OrderFinding): Promise<void> {
-  await prisma.$transaction(
+async function fixOrder(
+  finding: OrderFinding,
+): Promise<{ rows: number; seatDelta: number } | null> {
+  const service = new OrderService();
+  return prisma.$transaction(
     async (tx) => {
-      await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${finding.orderId} FOR UPDATE`;
-      for (const row of finding.rows) {
-        const existing = await tx.orderItem.findUnique({
-          where: { id: row.itemId },
-          select: { metadata: true },
-        });
-        const metadata = withFlightSeatMetadata(readJsonObject(existing?.metadata), {
-          seatQuantity: row.expectedSeat,
-          infantCount: finding.infantCount,
-        });
-        await tx.orderItem.update({
-          where: { id: row.itemId },
-          data: { metadata: metadata as Prisma.InputJsonValue },
-        });
-        if (row.excess > 0 && !row.departed) {
-          await releaseExcess(tx, row);
-        }
-      }
-      await writeAuditWithinTx(tx, {
+      // 与换人 / 订正入口同一把 Order 行锁；状态按锁后现势重读（dry-run 到 --fix 之间可能已取消）。
+      const locked = await tx.$queryRaw<Array<{ status: OrderStatus; deletedAt: Date | null }>>`
+        SELECT status, "deletedAt" FROM "Order" WHERE id = ${finding.orderId} FOR UPDATE
+      `;
+      const current = locked[0];
+      if (!current || current.deletedAt) return null;
+      return service.resyncFlightSeatsWithinTx(tx, {
+        orderId: finding.orderId,
+        orderStatus: current.status,
+        reason: 'backfill',
+        passengerId: null,
         actor: { label: 'scan-infant-seat-orders', role: 'SYSTEM' },
-        action: 'INFANT_SEAT_BACKFILL',
-        targetType: 'ORDER',
-        targetId: finding.orderId,
-        targetLabel: `${finding.orderNumber} · 婴儿不占座回填 · ${finding.rows.length} 条机票行`,
-        severity: AuditSeverity.CRITICAL,
-        before: {
-          rows: finding.rows.map((r) => ({
-            itemId: r.itemId,
-            seatQuantity: r.hadExplicitSeatQuantity ? r.currentSeat : null,
-            quantity: r.quantity,
-          })),
-        },
-        after: {
-          passengerCount: finding.passengerCount,
-          infantCount: finding.infantCount,
-          rows: finding.rows.map((r) => ({
-            itemId: r.itemId,
-            scheduleId: r.scheduleId,
-            cabin: r.cabin,
-            seatQuantity: r.expectedSeat,
-            soldReleased: r.departed ? 0 : r.excess,
-            departed: r.departed,
-          })),
-        },
       });
     },
     { timeout: TX_TIMEOUT_MS, maxWait: TX_MAX_WAIT_MS },
   );
 }
 
+/** 分页捞占座态且含活机票行的单（在内存里判定，避免对 JSON 键做数据库过滤）。 */
+async function* iterateCandidateOrders(): AsyncGenerator<OrderRow> {
+  let cursor: string | undefined;
+  for (;;) {
+    const page = await prisma.order.findMany({
+      where: {
+        deletedAt: null,
+        status: { in: SEAT_HOLDING_STATUSES },
+        items: { some: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } } },
+      },
+      orderBy: { id: 'asc' },
+      take: PAGE_SIZE,
+      ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
+      select: ORDER_SELECT,
+    });
+    for (const order of page) yield order;
+    if (page.length < PAGE_SIZE) return;
+    cursor = page[page.length - 1].id;
+  }
+}
+
 async function main(): Promise<void> {
   const { fix, limit } = parseArgs(process.argv.slice(2));
   console.log(`${LOG_PREFIX} 模式：${fix ? '写库（--fix）' : 'dry-run（只读）'}`);
 
-  const orders = await prisma.order.findMany({
-    where: {
-      deletedAt: null,
-      status: { in: SEAT_HOLDING_STATUSES },
-      passengers: { some: { passengerType: PassengerType.INFANT } },
-      items: { some: { kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } } },
-    },
-    orderBy: { createdAt: 'asc' },
-    ...(limit ? { take: limit } : {}),
-    select: ORDER_SELECT,
-  });
-  console.log(`${LOG_PREFIX} 占座态且含婴儿的机票单：${orders.length} 张`);
+  const nowMs = Date.now();
+  const findings: OrderFinding[] = [];
+  let scanned = 0;
+  for await (const order of iterateCandidateOrders()) {
+    scanned += 1;
+    const finding = assessOrder(order, nowMs);
+    if (!finding) continue;
+    findings.push(finding);
+    if (limit && findings.length >= limit) break;
+  }
+  console.log(
+    `${LOG_PREFIX} 已扫占座态机票单：${scanned} 张${limit ? `（候选达 --limit=${limit} 后停止）` : ''}`,
+  );
 
-  const now = new Date();
-  const findings = orders
-    .map((o) => assessOrder(o, now))
-    .filter((f): f is OrderFinding => f != null);
-  let totalExcess = 0;
-  let releasable = 0;
+  let over = 0;
+  let under = 0;
+  let overReleasable = 0;
+  let underRetakeable = 0;
   for (const f of findings) {
     console.log(
-      `${LOG_PREFIX} ${f.orderNumber}（${f.status}，${f.passengerCount} 人 · 婴儿 ${f.infantCount}）`,
+      `${LOG_PREFIX} ${f.orderNumber}（${f.status}，${f.plan.passengerCount} 人 · 婴儿 ${f.plan.infantCount}）`,
     );
     for (const row of f.rows) {
-      console.log(formatRow(row));
-      totalExcess += row.excess;
-      if (!row.departed) releasable += row.excess;
+      console.log(formatRow(f, row));
+      if (row.delta < 0) {
+        over += -row.delta;
+        if (!row.departed) overReleasable += -row.delta;
+      } else if (row.delta > 0) {
+        under += row.delta;
+        if (!row.departed) underRetakeable += row.delta;
+      }
     }
   }
   console.log(
     `${LOG_PREFIX} 需处理：${findings.length} 张单 / ${findings.reduce((n, f) => n + f.rows.length, 0)} 条机票行 · ` +
-      `多占合计 ${totalExcess} 座（其中未起飞可回减 ${releasable} 座）`,
+      `多占合计 ${over} 座（未起飞可回减 ${overReleasable}）· ` +
+      `少占合计 ${under} 座（未起飞要占回 ${underRetakeable}，售罄则该单回滚待人工）`,
   );
   if (!fix) {
     console.log(`${LOG_PREFIX} dry-run 结束：一行库都没写；确认无误后加 --fix 执行。`);
@@ -293,16 +246,34 @@ async function main(): Promise<void> {
   }
 
   let fixed = 0;
+  const soldOut: string[] = [];
   for (const f of findings) {
     try {
-      await fixOrder(f);
+      const result = await fixOrder(f);
+      if (!result) {
+        console.log(`${LOG_PREFIX} 跳过 ${f.orderNumber}（锁后已无需处理 / 已进回收站）`);
+        continue;
+      }
       fixed += 1;
-      console.log(`${LOG_PREFIX} 已回填 ${f.orderNumber}`);
+      const signed = `${result.seatDelta >= 0 ? '+' : ''}${result.seatDelta}`;
+      console.log(
+        `${LOG_PREFIX} 已回填 ${f.orderNumber}：${result.rows} 条机票行，座位账净变化 ${signed}`,
+      );
     } catch (err) {
+      if (err instanceof ConflictError) {
+        soldOut.push(f.orderNumber);
+        console.error(
+          `${LOG_PREFIX} ${f.orderNumber} 占回失败（已回滚该单，待人工改期 / 改单申请）：${err.message}`,
+        );
+        continue;
+      }
       console.error(`${LOG_PREFIX} 回填 ${f.orderNumber} 失败（已回滚该单）：`, err);
     }
   }
   console.log(`${LOG_PREFIX} 完成：${fixed}/${findings.length} 张单已回填。`);
+  if (soldOut.length > 0) {
+    console.log(`${LOG_PREFIX} 售罄待人工（${soldOut.length}）：${soldOut.join('、')}`);
+  }
 }
 
 main()

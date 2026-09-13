@@ -170,6 +170,14 @@ import {
   stripClientFlightSeatMetadata,
   withFlightSeatMetadata,
 } from './flight-seat-quantity.js';
+// 换人 / 订正跨过婴儿边界后的占座数重对账（纯函数层；事务内落账见 resyncFlightSeatsWithinTx）。
+import {
+  FLIGHT_SEAT_RESYNC_REASON_ZH,
+  flightSeatResyncShortageMessage,
+  isInfantBoundaryCrossed,
+  planFlightSeatResync,
+  type FlightSeatResyncReason,
+} from './flight-seat-resync.js';
 // 按人送签的任务级状态派生（纯函数）：与签证台同一口径。依赖方向安全——
 // fulfillment.service 只 import prisma/errors/自身 schemas，不回头 import orders 模块，无环。
 import { deriveVisaTaskStatus } from '../fulfillment/fulfillment.service.js';
@@ -11183,6 +11191,25 @@ export class OrderService {
 
       await tx.passenger.update({ where: { id: passengerId }, data });
 
+      // ── 1c2. 乘客类型跨过「婴儿 ↔ 占座乘客」边界 → 机票行占座数与座位账同事务重对账 ────
+      // 换人（新人是婴儿 / 旧人是婴儿）或改生日把成人改成婴儿、婴儿改成成人时，占座数
+      // metadata.seatQuantity 还是建单那次盖的章，FlightSeatClass.sold 也没跟着加减。
+      // 成人 ↔ 儿童不动座位（都占座），只有跨婴儿边界才跑；余票不足硬拒、整个换人回滚。
+      {
+        const seatTypeBefore = passenger.passengerType ?? null;
+        const seatTypeAfter =
+          typeof data.passengerType === 'string' ? data.passengerType : seatTypeBefore;
+        if (isInfantBoundaryCrossed(seatTypeBefore, seatTypeAfter)) {
+          await this.resyncFlightSeatsWithinTx(tx, {
+            orderId,
+            orderStatus: order.status,
+            reason: 'swap',
+            passengerId,
+            actor: { userId: actor.userId, role: actor.role },
+          });
+        }
+      }
+
       // ── 1d. 换人价回滚（自备签 true→false 时把旧客的自备签减免加回来）──────────────────
       // 证件变更会把 visaExempt 强制回落 false（新客进签证台随团办签，见上方 1b），但订单 BUNDLE 行
       // 仍扣着旧客的自备签减免 selfVisaDeductTotal → 新客要送签、钱却少收。这里按「每人自备签减免」把
@@ -11535,6 +11562,161 @@ export class OrderService {
         clearedProfile: result.clearedProfile,
       },
     };
+  }
+
+  /**
+   * 换人 / 订正跨过「婴儿 ↔ 占座乘客」边界后，把本单机票行的占座数与座位账拉回一致（事务内）。
+   *
+   * 口径（运营反馈「换人或改生日把成人改成婴儿（或反过来）时机位数不会自动加减」的收口）：
+   *   · 重查本单全部乘客的 passengerType → 非婴儿人数；逐条活机票行算
+   *     应占 = resolveFlightSeatQuantity(quantity, 非婴儿人数)、现占 = flightSeatQuantity(行)，
+   *     Δ = 应占 − 现占（纯函数 planFlightSeatResync，与建单 / 状态机同一对读写口径）；
+   *   · 订单在占座态（SEAT_HOLDING_STATUSES）才动座位账：Δ>0 走 takeSeatWithinTx（CAS 防超售，
+   *     余票不足抛 ConflictError → 整个换人 / 订正事务回滚，代理与运营同样硬拒，不给超售开关）；
+   *     Δ<0 走 releaseSeatFloored；套餐升舱按 computeBundleSeatSplit 拆两舱各算各的差；
+   *   · 已起飞航段只重盖章不动 sold（口径同 isLegAlreadyFlown：飞过的座位已被真实消耗，
+   *     盖章是为了之后任何放座路径不再按旧数放）；非占座态同理只盖章（座位本就不在账上）；
+   *   · 重盖 metadata.seatQuantity / infantCount（withFlightSeatMetadata），落一条 FLIGHT_SEAT_RESYNC
+   *     审计（before/after 带逐行 old/new/Δ 与 reason=swap|correct）。
+   *   · 金额 / quantity / 乘客数校验一律不动（理由见 flight-seat-quantity.ts 头注释）。
+   *     套餐机票腿 quantity = seatPax，婴儿改成人时应占被 quantity 夹住、座加不上 ——
+   *     这类行在审计里标 seatCappedByQuantity 且升级为 WARNING，加座要由运营走改档 / 改人数。
+   *
+   * 没有任何行需要写（Δ 全 0 且盖章已是最新）→ 不写库、不写审计，返回 null。
+   * 调用方须已持有 Order 行锁（换人 / 订正入口都 FOR UPDATE 了），并保证 orderStatus 是锁后读到的现势。
+   *
+   * 非 private：存量清查脚本 scripts/scan-infant-seat-orders.ts 的 --fix 也走这一份口径
+   *（reason='backfill'，actor 为 SYSTEM 标签），避免脚本自己再抄一遍占/放座逻辑而慢慢分叉。
+   */
+  async resyncFlightSeatsWithinTx(
+    tx: Prisma.TransactionClient,
+    input: {
+      orderId: string;
+      orderStatus: OrderStatus;
+      reason: FlightSeatResyncReason;
+      /** 触发本次重对账的乘客（脚本回填没有具体乘客 → null）。 */
+      passengerId: string | null;
+      actor: { userId?: string; label?: string; role: UserRole | 'SYSTEM' };
+    },
+  ): Promise<{ rows: number; seatDelta: number } | null> {
+    const [flightRows, passengers] = await Promise.all([
+      tx.orderItem.findMany({
+        where: {
+          orderId: input.orderId,
+          kind: OrderItemKind.FLIGHT,
+          flightScheduleId: { not: null },
+        },
+        select: {
+          id: true,
+          description: true,
+          quantity: true,
+          flightScheduleId: true,
+          flightCabin: true,
+          metadata: true,
+          flightSchedule: { select: { departureTime: true } },
+        },
+      }),
+      tx.passenger.findMany({
+        where: { orderId: input.orderId },
+        select: { passengerType: true },
+      }),
+    ]);
+    const plan = planFlightSeatResync(flightRows, passengers, Date.now());
+    if (!plan.changed) return null;
+
+    const holding = SEAT_HOLDING_STATUSES.includes(input.orderStatus);
+    let seatDelta = 0;
+    const auditRows: Array<Record<string, unknown>> = [];
+    for (const row of plan.rows) {
+      if (!row.needsWrite) continue;
+      const applyToLedger = holding && !row.departed && row.delta !== 0;
+      if (applyToLedger) {
+        // 升舱拆座镜像：现占 / 应占各拆一次，两舱差额各占各放（与清查脚本 releaseExcess 同法）。
+        const before = computeBundleSeatSplit(row.cabin, row.oldSeat, row.businessUpgradeCount);
+        const after = computeBundleSeatSplit(row.cabin, row.newSeat, row.businessUpgradeCount);
+        const moves: Array<{ cabin: import('@prisma/client').CabinClass; qty: number }> = [
+          { cabin: 'BUSINESS', qty: after.business - before.business },
+          { cabin: row.cabin, qty: after.sameCabin - before.sameCabin },
+        ];
+        for (const move of moves) {
+          if (move.qty > 0) {
+            try {
+              await takeSeatWithinTx(tx, row.scheduleId, move.cabin, move.qty, null);
+            } catch (e) {
+              // 文案换成换人 / 订正语境（原文面向改期）；错误类型不变（仍 409），整事务回滚。
+              if (e instanceof ConflictError) {
+                throw new ConflictError(
+                  flightSeatResyncShortageMessage({
+                    description: row.description,
+                    cabinLabel: CABIN_ZH_LABEL[move.cabin] ?? move.cabin,
+                    need: move.qty,
+                  }),
+                );
+              }
+              throw e;
+            }
+          } else if (move.qty < 0) {
+            await releaseSeatFloored(tx, row.scheduleId, move.cabin, -move.qty);
+          }
+        }
+        seatDelta += row.delta;
+      }
+      await tx.orderItem.update({
+        where: { id: row.itemId },
+        data: {
+          metadata: withFlightSeatMetadata(row.metadata, {
+            seatQuantity: row.newSeat,
+            infantCount: plan.infantCount,
+          }) as Prisma.InputJsonValue,
+        },
+      });
+      auditRows.push({
+        itemId: row.itemId,
+        scheduleId: row.scheduleId,
+        cabin: row.cabin,
+        quantity: row.quantity,
+        oldSeatQuantity: row.hadExplicitSeatQuantity ? row.oldSeat : null,
+        oldSeatEffective: row.oldSeat,
+        newSeatQuantity: row.newSeat,
+        delta: row.delta,
+        soldApplied: applyToLedger,
+        departed: row.departed,
+        seatCappedByQuantity: row.seatCappedByQuantity,
+      });
+    }
+
+    // 座加不上（套餐腿被 quantity 夹住）或 Δ≠0 却没动账（已起飞 / 非占座态）→ WARNING，运营要看得见。
+    const needsAttention = auditRows.some(
+      (r) =>
+        (r.seatCappedByQuantity === true && plan.nonInfantPax > (r.quantity as number)) ||
+        (r.delta !== 0 && r.soldApplied !== true),
+    );
+    await writeAuditWithinTx(tx, {
+      actor: input.actor,
+      action: 'FLIGHT_SEAT_RESYNC',
+      targetType: 'ORDER',
+      targetId: input.orderId,
+      targetLabel: `机票行占座数重对账 · ${FLIGHT_SEAT_RESYNC_REASON_ZH[input.reason]} · ${auditRows.length} 条机票行`,
+      severity: needsAttention ? AuditSeverity.WARNING : AuditSeverity.INFO,
+      before: {
+        rows: auditRows.map((r) => ({
+          itemId: r.itemId,
+          seatQuantity: r.oldSeatQuantity,
+          seatEffective: r.oldSeatEffective,
+        })),
+      },
+      after: {
+        reason: input.reason,
+        passengerId: input.passengerId,
+        orderStatus: input.orderStatus,
+        passengerCount: plan.passengerCount,
+        infantCount: plan.infantCount,
+        nonInfantPax: plan.nonInfantPax,
+        seatDelta,
+        rows: auditRows,
+      },
+    });
+    return { rows: auditRows.length, seatDelta };
   }
 
   /**
@@ -12860,6 +13042,24 @@ export class OrderService {
       }
 
       const updated = await tx.passenger.update({ where: { id: passengerId }, data });
+
+      // ── 乘客类型跨过「婴儿 ↔ 占座乘客」边界 → 机票行占座数与座位账同事务重对账 ─────
+      // 与换人 1c2 同一个 helper：订正生日把成人改成婴儿要放座、婴儿改成成人要占座，
+      // 余票不足硬拒、整次订正回滚（代理与运营同一口径，不给超售开关）。
+      {
+        const seatTypeBefore = passenger.passengerType ?? null;
+        const seatTypeAfter =
+          typeof data.passengerType === 'string' ? data.passengerType : seatTypeBefore;
+        if (isInfantBoundaryCrossed(seatTypeBefore, seatTypeAfter)) {
+          await this.resyncFlightSeatsWithinTx(tx, {
+            orderId,
+            orderStatus: order.status,
+            reason: 'correct',
+            passengerId,
+            actor: { userId: requester.userId, role: requester.role },
+          });
+        }
+      }
 
       // 审计 before/after：只记**真的变了**的身份字段（PII 口径与换人审计一致——
       // 换人审计本就落姓名与证件号，订正不比它更敏感）。
