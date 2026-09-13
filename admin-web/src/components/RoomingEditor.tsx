@@ -12,12 +12,17 @@
  */
 import { useMemo, useState } from 'react';
 import type { HotelAvailabilityTier, HotelNightlyRemainingResult, RoomGroup } from '../lib/api';
+import { randomStarTierLabel } from '../lib/api';
 import { Icon } from './Icon';
+import { passengerDisplayName, passengerNameTitle } from '../lib/passengerDisplayName';
 
 // ── 类型 ─────────────────────────────────────────────────────────────────
 export interface RoomingPassenger {
   id: string;
+  /** 拼音全名（护照口径 fullName）；中文名缺失时 chip 上显示的就是它。 */
   name: string;
+  /** 中文姓名（可选）：有就优先显示，拼音退到悬停提示里。 */
+  chineseName?: string | null;
   gender?: string | null;
 }
 
@@ -392,6 +397,9 @@ export function RoomingEditor({
   // ── 渲染一枚出行人 chip ──────────────────────────────────────────────────
   function PassengerChip({ p }: { p: RoomingPassenger }) {
     const g = genderBadge(p.gender);
+    // 中文名优先（运营分房时按中文名认人）；拼音全名不丢，进 tooltip 供对护照。
+    const display = passengerDisplayName(p.name, p.chineseName);
+    const latin = passengerNameTitle(p.name, p.chineseName);
     return (
       <span
         draggable
@@ -402,9 +410,9 @@ export function RoomingEditor({
         }}
         onDragEnd={() => setDragId(null)}
         className="inline-flex cursor-grab select-none items-center gap-1.5 rounded-lg border border-slate-200 bg-white px-2.5 py-1 text-sm text-ink shadow-sm transition hover:border-brand/40 hover:bg-brand-50 active:cursor-grabbing"
-        title="拖到右侧房间盒子"
+        title={latin ? `${latin} · 拖到右侧房间盒子` : '拖到右侧房间盒子'}
       >
-        <span className="font-medium">{p.name}</span>
+        <span className="font-medium">{display || '—'}</span>
         {g && (
           <span className={`text-xs ${g === '男' ? 'text-brand-700' : 'text-rose-600'}`}>{g}</span>
         )}

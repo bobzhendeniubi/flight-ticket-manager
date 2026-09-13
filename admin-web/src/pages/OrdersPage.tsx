@@ -31,6 +31,7 @@ import {
   roomingHotelItemsFromOrder,
   type RoomingPassenger,
 } from '../components/RoomingEditor';
+import { passengerDisplayName } from '../lib/passengerDisplayName';
 import { HotelSwapModal } from '../components/HotelSwapModal';
 import { SplitOrderModal } from '../components/SplitOrderModal';
 import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
@@ -5115,7 +5116,12 @@ function orderHasRooming(order: OrderSummary): boolean {
 function toRoomingPassengers(order: OrderSummary): RoomingPassenger[] {
   return order.passengers
     .filter((p) => p.documentNumber !== 'N/A')
-    .map((p) => ({ id: p.id, name: p.fullName, gender: p.gender ?? null }));
+    .map((p) => ({
+      id: p.id,
+      name: p.fullName,
+      chineseName: p.chineseName ?? null,
+      gender: p.gender ?? null,
+    }));
 }
 
 // 「酒店情况」卡标题后缀：跟着实际分房走。未分房不带后缀；全部整间 = 单住/整间；
@@ -5131,10 +5137,13 @@ function roomingHeadline(order: OrderSummary): string {
 function roomingSummary(order: OrderSummary): string {
   const groups = (order.roomAssignment?.roomGroups ?? []).filter((g) => (g.passengerIds?.length ?? 0) > 0);
   if (groups.length === 0) return '未分房';
-  const nameById = new Map(order.passengers.map((p) => [p.id, p.fullName]));
+  // 名字按中文名优先展示（与分房编辑器 / 分房表导出同口径）
+  const nameById = new Map(
+    order.passengers.map((p) => [p.id, passengerDisplayName(p.fullName, p.chineseName)]),
+  );
   return groups
     .map((g) => {
-      const names = g.passengerIds.map((id) => nameById.get(id) ?? '?').join('、');
+      const names = g.passengerIds.map((id) => nameById.get(id) || '?').join('、');
       const frac = g.roomFraction === 0.5 ? '半间(拼房)' : '整间';
       const type = g.roomType ? ` ${g.roomType}` : '';
       return `${frac}${type}：${names}`;

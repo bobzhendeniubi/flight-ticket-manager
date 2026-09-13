@@ -1648,6 +1648,7 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       .map((p) => ({
         id: p.id,
         name: p.fullName,
+        chineseName: p.chineseName ?? null,
         gender: p.gender ?? null,
       }));
   }, [createdOrder]);

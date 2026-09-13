@@ -34,6 +34,8 @@ import {
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEditor';
+import { passengerDisplayName } from '../lib/passengerDisplayName';
+import { orderStatusBadgeClass, orderStatusLabel } from '../lib/orderStatus';
 import { HotelSwapModal } from '../components/HotelSwapModal';
 import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
 import { useConfirm } from '../components/ConfirmDialog';
@@ -959,36 +961,89 @@ function toRoomingPassengers(order: OrderSummary): RoomingPassenger[] {
     .map((p) => ({
       id: p.id,
       name: p.fullName,
+      chineseName: p.chineseName ?? null,
       gender: p.gender ?? null,
     }));
 }
 
+/** 候选订单行的中文名摘要：最多列 CANDIDATE_NAME_LIMIT 个，多出来的记成「+N」。 */
+const CANDIDATE_NAME_LIMIT = 4;
+function candidateNames(order: OrderSummary): string {
+  const names = (order.passengers ?? [])
+    .filter((p) => p.documentNumber !== 'N/A')
+    .map((p) => passengerDisplayName(p.fullName, p.chineseName))
+    .filter((n) => n);
+  if (names.length === 0) return '（无出行人）';
+  const head = names.slice(0, CANDIDATE_NAME_LIMIT).join('、');
+  const rest = names.length - CANDIDATE_NAME_LIMIT;
+  return rest > 0 ? `${head} +${rest}` : head;
+}
+
+/** 候选订单行的住宿摘要：酒店名 · 入住~退房；两者都没有就直说没有住宿行。 */
+function candidateStay(order: OrderSummary): string {
+  const hotel = hotelNameFromOrder(order);
+  const stay = hotelStayFromOrder(order);
+  const range = stay ? `${stay.checkIn} ~ ${stay.checkOut}` : '';
+  return [hotel, range].filter((s) => s).join(' · ') || '无住宿行';
+}
+
+/** 候选订单一次最多列多少条（再多就让运营缩范围，避免一屏几百行）。 */
+const ROOMING_CANDIDATE_PAGE_SIZE = 20;
+
 function RoomingSection({ token, board }: { token: string; board: HotelControlBoard | null }) {
-  const [orderNo, setOrderNo] = useState('');
+  // 找单条件：关键词（人名 / 订单号 / 联系人，走列表同款 search）+ 团期（出发日期区间）
+  const [keyword, setKeyword] = useState('');
+  const [travelFrom, setTravelFrom] = useState('');
+  const [travelTo, setTravelTo] = useState('');
+  // 候选列表：null = 还没查过（不显示空态），[] = 查过但没命中
+  const [candidates, setCandidates] = useState<OrderSummary[] | null>(null);
+  const [candidateTotal, setCandidateTotal] = useState(0);
+  const [searching, setSearching] = useState(false);
   const [order, setOrder] = useState<OrderSummary | null>(null);
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
   const [savedAt, setSavedAt] = useState<number | null>(null);
 
-  async function lookup(): Promise<void> {
-    const q = orderNo.trim();
-    if (!q) return;
+  const canSearch = Boolean(keyword.trim() || travelFrom || travelTo);
+
+  /** 查候选：三个条件任填其一即可（人名找人、团期整团扫、两者叠加最准）。 */
+  async function searchCandidates(): Promise<void> {
+    if (!canSearch || searching) return;
+    setSearching(true);
+    setErr(null);
+    setCandidates(null);
+    setOrder(null);
+    setSavedAt(null);
+    try {
+      // search 一栏通吃订单号 / 中文名 / 拼音名 / 联系人（与订单列表同口径）；
+      // 团期用出发日期区间（travelFrom/travelTo），后端按整单出发日精确细筛。
+      const res = await api.listOrders(token, {
+        ...(keyword.trim() ? { search: keyword.trim() } : {}),
+        ...(travelFrom ? { travelFrom } : {}),
+        ...(travelTo ? { travelTo } : {}),
+        pageSize: ROOMING_CANDIDATE_PAGE_SIZE,
+      });
+      setCandidates(res.orders);
+      setCandidateTotal(res.pagination?.total ?? res.orders.length);
+    } catch (e: unknown) {
+      setCandidates(null);
+      setErr(e instanceof ApiError ? e.message : '订单查询失败');
+    } finally {
+      setSearching(false);
+    }
+  }
+
+  /** 选中一条候选 → 拉详情（完整出行人 + 现有分房）→ 进分房编辑器。 */
+  async function pickOrder(candidateId: string): Promise<void> {
     setLoading(true);
     setErr(null);
     setOrder(null);
     setSavedAt(null);
     try {
-      // 列表按订单号模糊查 → 精确匹配优先 → getOrder 取完整出行人 + 现有分房
-      const res = await api.listOrders(token, { search: q, pageSize: 10 });
-      const hit = res.orders.find((o) => o.orderNumber === q) ?? res.orders[0];
-      if (!hit) {
-        setErr('未找到该订单号对应的订单');
-        return;
-      }
-      const detail = await api.getOrder(token, hit.id);
+      const detail = await api.getOrder(token, candidateId);
       setOrder(detail.order);
     } catch (e: unknown) {
-      setErr(e instanceof ApiError ? e.message : '订单查询失败');
+      setErr(e instanceof ApiError ? e.message : '订单详情加载失败');
     } finally {
       setLoading(false);
     }
@@ -1021,28 +1076,108 @@ function RoomingSection({ token, board }: { token: string; board: HotelControlBo
     <section className="card">
       <h2 className="text-sm font-semibold text-ink">订单分房（拖拽）</h2>
       <p className="mt-1 text-xs text-ink-muted">
-        输入订单号查出订单，把出行人拖进房间决定谁和谁一起住。保存写入该订单的分房表（分房表导出会读取）。
+        按人名或订单号找单（可再加团期缩小范围），从候选里点一条，把出行人拖进房间决定谁和谁一起住。
+        保存写入该订单的分房表（分房表导出会读取）。
       </p>
 
       <div className="mt-3 flex flex-wrap items-end gap-2">
         <div className="grow sm:grow-0">
-          <label className="label">订单号</label>
+          <label className="label">人名 / 订单号</label>
           <input
-            className="input sm:w-64"
-            placeholder="如 ST-20260625-0001"
-            value={orderNo}
-            onChange={(e) => setOrderNo(e.target.value)}
+            className="input sm:w-56"
+            placeholder="如 张三 / ST-20260625-0001"
+            value={keyword}
+            onChange={(e) => setKeyword(e.target.value)}
             onKeyDown={(e) => {
-              if (e.key === 'Enter') void lookup();
+              if (e.key === 'Enter') void searchCandidates();
             }}
           />
         </div>
-        <button className="btn-primary" onClick={() => void lookup()} disabled={loading || !orderNo.trim()}>
-          {loading ? '查询中…' : '查订单'}
+        <div>
+          <label className="label">团期（出发日期）起</label>
+          <input
+            type="date"
+            className="input sm:w-40"
+            value={travelFrom}
+            onChange={(e) => setTravelFrom(e.target.value)}
+          />
+        </div>
+        <div>
+          <label className="label">止</label>
+          <input
+            type="date"
+            className="input sm:w-40"
+            value={travelTo}
+            onChange={(e) => setTravelTo(e.target.value)}
+          />
+        </div>
+        <button
+          className="btn-primary"
+          onClick={() => void searchCandidates()}
+          disabled={searching || !canSearch}
+        >
+          {searching ? '查询中…' : '查订单'}
         </button>
+        {(keyword || travelFrom || travelTo || candidates) && (
+          <button
+            className="btn-ghost"
+            onClick={() => {
+              setKeyword('');
+              setTravelFrom('');
+              setTravelTo('');
+              setCandidates(null);
+              setCandidateTotal(0);
+              setErr(null);
+            }}
+          >
+            清空
+          </button>
+        )}
       </div>
 
       {err && <div className="mt-3 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">{err}</div>}
+
+      {searching && <div className="mt-3 text-sm text-ink-muted">查询中…</div>}
+
+      {!searching && candidates?.length === 0 && (
+        <div className="mt-3 rounded-lg border border-slate-200 bg-slate-50 px-3 py-2 text-sm text-ink-muted">
+          没找到匹配的订单。换个名字写法（中文名 / 拼音）或放宽团期再试。
+        </div>
+      )}
+
+      {!searching && candidates && candidates.length > 0 && (
+        <div className="mt-3">
+          <div className="mb-1 text-xs text-ink-soft">
+            命中 {candidateTotal} 条
+            {candidateTotal > candidates.length && `，先列前 ${candidates.length} 条（再缩小范围看后面的）`}
+            ；点一条进入分房。
+          </div>
+          <ul className="divide-y divide-slate-100 overflow-hidden rounded-lg border border-slate-200">
+            {candidates.map((c) => (
+              <li key={c.id}>
+                <button
+                  className={`flex w-full flex-wrap items-center gap-x-3 gap-y-1 px-3 py-2 text-left text-sm transition hover:bg-brand-50 ${
+                    order?.id === c.id ? 'bg-brand-50' : 'bg-white'
+                  }`}
+                  onClick={() => void pickOrder(c.id)}
+                  disabled={loading}
+                >
+                  <span className="font-mono text-xs text-ink">{c.orderNumber}</span>
+                  <span className={orderStatusBadgeClass(c.status)}>{orderStatusLabel(c.status)}</span>
+                  <span className="font-medium text-ink">{candidateNames(c)}</span>
+                  <span className="text-xs text-ink-muted">{c.passengers?.length ?? 0} 人</span>
+                  <span className="text-xs text-ink-soft">
+                    出发 {c.departDate ? c.departDate.slice(0, 10) : '—'}
+                  </span>
+                  <span className="text-xs text-ink-soft">{candidateStay(c)}</span>
+                </button>
+              </li>
+            ))}
+          </ul>
+        </div>
+      )}
+
+      {loading && <div className="mt-3 text-sm text-ink-muted">订单加载中…</div>}
 
       {order && (
         <div className="mt-4">
