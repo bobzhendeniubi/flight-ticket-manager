@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>反馈表总和（9/13）七项反馈 操作说明 — 世途旅行·运营控制台</title>
+<style>
+  :root{
+    --indigo:#4F46E5; --indigo-dark:#4338CA; --indigo-50:#EEF2FF;
+    --ink:#0F172A; --ink-soft:#334155; --muted:#64748B;
+    --bg:#F1F5F9; --card:#FFFFFF; --line:#E2E8F0;
+    --amber-bg:#FFFBEB; --amber-line:#FDE68A;
+    --green:#059669; --green-bg:#ECFDF5;
+    --red-bg:#FEF2F2;
+    --blue-bg:#EFF6FF;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Inter','PingFang SC','Hiragino Sans GB','Microsoft YaHei',system-ui,-apple-system,sans-serif;color:var(--ink-soft);background:var(--bg);line-height:1.85;font-size:15px}
+  .page{max-width:900px;margin:0 auto;background:var(--card);padding:40px 44px 72px;box-shadow:0 0 24px rgba(15,23,42,.06)}
+  h1,h2,h3{color:var(--ink);line-height:1.35}
+  h1{font-size:26px;margin:0 0 6px}
+  h2{font-size:20px;margin:40px 0 12px;padding:10px 14px;background:var(--indigo-50);border-left:5px solid var(--indigo);border-radius:0 8px 8px 0}
+  h3{font-size:16.5px;margin:24px 0 8px;color:var(--indigo-dark)}
+  p{margin:10px 0}
+  .sub{color:var(--muted);font-size:13.5px;margin:0 0 4px}
+  .cover{border-bottom:3px solid var(--indigo);padding-bottom:18px;margin-bottom:22px}
+  .cover .brand{display:inline-block;background:var(--indigo);color:#fff;font-weight:700;font-size:13px;padding:3px 12px;border-radius:999px;letter-spacing:.5px;margin-bottom:10px}
+  .lead{background:var(--indigo-50);border-radius:10px;padding:14px 18px;margin:16px 0 8px;color:var(--ink);font-size:15.5px}
+  .shot{margin:14px 0 4px;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
+  .shot img{display:block;width:100%;height:auto}
+  .shot.narrow{max-width:560px}
+  .cap{color:var(--muted);font-size:13px;margin:4px 0 16px;text-align:center}
+  .tip,.info,.warn,.danger{border-radius:10px;padding:12px 16px;margin:14px 0}
+  .tip{background:var(--green-bg);border:1px solid #A7F3D0}
+  .info{background:var(--blue-bg);border:1px solid #BFDBFE}
+  .warn{background:var(--amber-bg);border:1px solid var(--amber-line)}
+  .danger{background:var(--red-bg);border:1px solid #FECACA}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14.5px}
+  table.doc th,table.doc td{border:1px solid var(--line);padding:8px 12px;text-align:left;vertical-align:top}
+  table.doc th{background:#F8FAFC;color:var(--ink)}
+  ol.steps{padding-left:22px}
+  ol.steps li{margin:6px 0}
+  .toc{background:#F8FAFC;border:1px solid var(--line);border-radius:10px;padding:12px 18px 12px 34px;margin:14px 0 6px}
+  .toc li{margin:3px 0}
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="cover">
+  <span class="brand">运营控制台</span>
+  <h1>反馈表总和（9/13）七项反馈 操作说明</h1>
+  <p class="sub">分房中文名与找单 · 每人结算价 · 0911 遗留五条 · 代理自助改期换酒店单住 · 星级导出 · 搜索备注　·　2026-09-13</p>
+</div>
+
+<div class="lead">
+在线反馈表 9 月 12 日重写的 7 条，除「三人间」要先问清用量外，其余全部做了。下面按表里的顺序说：一句"解决了什么"，再给操作步骤和截图。
+</div>
+
+<ol class="toc">
+  <li><a href="#s1">分房：人名显示中文，按人名 / 团期找单</a></li>
+  <li><a href="#s2">订单列表：每人的结算价直接看</a></li>
+  <li><a href="#s3">三人间：先问你们几个问题</a></li>
+  <li><a href="#s4">0911 遗留五条：婴儿边界调座 / 已起飞可恢复 / 证件号全号 / 备注进内容列 / 批量结算价参照</a></li>
+  <li><a href="#s5">代理账号：出票前自助改期、换酒店、改单住拼住</a></li>
+  <li><a href="#s6">酒店星级改了导出不对</a></li>
+  <li><a href="#s7">搜索备注</a></li>
+</ol>
+
+<h2 id="s1">一、分房：人名显示中文，按人名 / 团期找单</h2>
+<p><strong>解决了什么：</strong>分房弹窗里以前只显示拼音名，认人要对护照；房控页的「订单分房」只能先拿到订单号再查。现在分房弹窗按中文名显示（鼠标停上去看拼音全名），房控页可以直接输人名或订单号、再加团期（出发日期区间）把候选单列出来，点一条进去分。</p>
+<h3>怎么操作</h3>
+<ol class="steps">
+  <li>房控 → 「订单分房（拖拽）」：在「人名 / 订单号」里输名字（中文、拼音、护照号都行），需要的话填团期起止，点「查订单」。</li>
+  <li>候选列表每行显示订单号、状态、中文名（最多 4 个）、人数、出发日期、酒店和入住区间；点一行进入分房编辑器。</li>
+  <li>编辑器里的人名是中文名，拖进房间盒子保存即可；编辑器关掉后候选还在，可以接着点下一张。</li>
+</ol>
+<div class="shot"><img src="shots-2026-09-13-反馈表总和3/05-房控-按人名找单候选.png"></div>
+<p class="cap">房控页 → 订单分房：按人名找单，列出候选</p>
+<div class="shot narrow"><img src="shots-2026-09-13-反馈表总和3/06-分房编辑器-中文名.png"></div>
+<p class="cap">分房编辑器：乘客按中文名显示</p>
+<div class="warn">
+两张不同订单的人合住一间房，这次<strong>没有做</strong>：系统里房间是挂在单张订单上的，要另立项。现在的做法仍是各自在自己的单里标半间。
+</div>
+
+<h2 id="s2">二、订单列表：每人的结算价直接看</h2>
+<p><strong>解决了什么：</strong>以前每人结算价只在订单详情的「价格调整」区有一张表，列表上看不到。现在订单列表「内容」列每位乘客那一行末尾直接显示「结算 ¥X」，全员加起来等于整单应收，不用点进去。</p>
+<div class="shot"><img src="shots-2026-09-13-反馈表总和3/01-列表-内容列明细与备注.png"></div>
+<p class="cap">订单列表内容列：一人一行，行末是这个人的结算价；最下面一行是备注</p>
+<div class="info">代理账号在有按人调价或改期 / 换人费的单上不显示这个数（他们那边拿不到逐人明细，宁可不给也不给错数）；没有调价的普通单照常显示。</div>
+
+<h2 id="s3">三、三人间：先问你们几个问题</h2>
+<p>三个人拖进一个房间盒子现在就能保存，只是系统没有"三分之一间"的算法：房费仍按两人一间加单房差算，房控也按两人一间算房量。要真做要动库存、房控、拆单和五张导出表，所以想先问清楚：</p>
+<ol class="steps">
+  <li>一个月里真要三个人住一间的大概有几单？</li>
+  <li>一般是什么组合：一家三口这种固定的，还是散客临时凑的？</li>
+  <li>酒店那边给的是加床还是家庭房，房费按间还是按人？</li>
+</ol>
+<p>回了再定做不做、怎么做。</p>
+
+<h2 id="s4">四、0911 遗留五条</h2>
+
+<h3>4.1 换人 / 改生日把成人改成婴儿（或反过来），机位自动加减</h3>
+<p>换人或改乘客信息让乘客在「婴儿」和「成人 / 儿童」之间变动时，系统在同一笔操作里自动加减该单的机位：成人改婴儿放一个座，婴儿改成人占一个座。婴儿改成人时如果班次已售罄会直接拒绝，提示先改期或提交改单申请。金额和乘客人数不变；已起飞的航段不动座位。</p>
+<div class="warn">套餐单的机票行只按占座人数建，婴儿改成人时机位加不上，仍要按改人数处理（系统会记一条提醒审计）。上线后我们会跑一次清查，把之前换过人的单补齐。</div>
+
+<h3>4.2 任何一段已经起飞也可以恢复</h3>
+<p>已取消 / 支付超时的单，就算有航段已经起飞也能恢复了。点「恢复订单」会多弹一次确认，列出哪些航段已起飞（不再占座）、哪些航段会重新扣座；已起飞的段不占座，只对没飞的段扣座，余位不够照旧会再问一次超售。全部飞完的单：付清的直接变「已完成」，没付清的回到待支付催款、不占座、不会再自动超时。</p>
+<div class="shot narrow"><img src="shots-2026-09-13-反馈表总和3/04-恢复订单-已起飞航段确认.png"></div>
+<p class="cap">恢复含已起飞航段的单：第二道确认，写清哪些段不再占座</p>
+<div class="info">恢复后回程如果还是「已释放」，照旧要再点一次「恢复回程」。佣金按 9/11 的口径照样恢复计提，钱款不动。</div>
+
+<h3>4.3 证件号不打码</h3>
+<p>订单列表内容列和展开的乘客明细里，证件号现在显示完整号码，不用再点进详情核对。代理登录看自家单也是全号（他们本来在详情和导出里就能看到）。导出给代理的名单模板仍按原来的口径裁掉证件列，没有变。</p>
+
+<h3>4.4 备注放进内容列，代理那列窄点，内容像明细一样</h3>
+<ol class="steps">
+  <li>备注挪到「内容」列最下面一行，而且六栏都显示（备注 / 内部 / 酒店 / 签证 / 款项 / 特殊），鼠标停上去看全文。以前填在酒店备注、签证备注里的内容在列表上是看不见的。</li>
+  <li>「客户 / 代理」那一列变窄，只剩客户名、电话、代理名。</li>
+  <li>内容列一人一行全列出来：姓名、中文名、性别、生日、证件号、有效期、国籍、结算价；不再只显示前 3 位。8 人以上的大团先显示 6 位，点「还有 N 位」看全。</li>
+  <li>点「明细 ▾」展开后，子行不再重复上面的身份信息，只剩签证进度、单住、PNR、票号、常旅客次数。</li>
+</ol>
+
+<h3>4.7 套餐批量创单按人填结算价：填的时候有参照</h3>
+<p>套餐批量创单的名单里，「结算价 / 人」这一列之前就是保存前填的，这次补上参照：选好套餐和出发日期后，每行输入框的灰字变成「留空 = ¥X」（系统会按这一行的单住 / 自备签 / 升舱 / 指定酒店 / 成人儿童算出这个人的价），下面小字显示「系统价 ¥Y」；填了价之后显示与系统价的差额；名单下方有汇总条「已填 N 人 合计 ¥A · 系统价 ¥B · 差额 ±¥C」。某一行差额超过上限会红字提示并拦住提交。</p>
+
+<h2 id="s5">五、代理账号：出票前自助改期、换酒店、改单住拼住</h2>
+<p><strong>解决了什么：</strong>代理以前只能在下单当天做同航班同价的纠错，套餐单的换酒店按钮又被藏在内部明细里根本看不到。现在代理对自家（含下级）的单，出票前随时可以：</p>
+<table class="doc">
+  <tr><th>动作</th><th>入口</th><th>钱怎么算</th><th>限制</th></tr>
+  <tr><td>改期（含按人改期）</td><td>订单详情 → 行程操作（点开）→ 机票行「改期」</td><td>差价按新旧班次系统价自动算，计入应收，可正可负</td><td>已出票 / 已开票 / 已订座的单不能自助，请提交改单申请；已起飞航段不能改</td></tr>
+  <tr><td>换酒店（含指定酒店）</td><td>行程操作 → 住宿行「换酒店」</td><td>同档次内按指定酒店加价 / 房型价差自动算</td><td>只能换同星级；升降星走「申请改档」；随机档落位找运营</td></tr>
+  <tr><td>酒店改期</td><td>行程操作 → 住宿行「改期」</td><td>按本行每晚价 × 晚数变化自动算</td><td>入住日已到不能自助</td></tr>
+  <tr><td>改单住 / 改拼住</td><td>乘客卡片 → 「改单住」/「改拼住」</td><td>按建单时的单房差费率 × 晚数自动补收或退</td><td>已入住 / 已完成 / 已取消不可改；婴儿不能单住</td></tr>
+</table>
+<div class="shot"><img src="shots-2026-09-13-反馈表总和3/08-代理-改期换酒店按钮.png"></div>
+<p class="cap">代理视角：套餐单的「行程操作」点开后能看到「换酒店」「改期」</p>
+<div class="shot narrow"><img src="shots-2026-09-13-反馈表总和3/09-代理-提交改单申请随时可用.png"></div>
+<p class="cap">「提交改单申请」按钮现在随时都在，不用等自助窗口关闭</p>
+<div class="shot narrow"><img src="shots-2026-09-13-反馈表总和3/03-详情-改单住改拼住.png"></div>
+<p class="cap">乘客卡片上的「改单住 / 改拼住」（运营与代理都能用）</p>
+<div class="info">运营侧：代理的这些操作在审计里带 selfService 标记可以筛出来；单住 / 拼住切换会自动挪计费房数，房量不足会被拒或按超售限额提示加房。</div>
+
+<h2 id="s6">六、酒店星级改了导出不对</h2>
+<p><strong>怎么回事：</strong>那张单是套餐从四星改成了三星。改档只改了套餐行，没同步刷新分房表里记的酒店名，而导出的「酒店类型」列优先取分房表，所以印出的还是「四星 2天1晚」。</p>
+<p><strong>现在：</strong>改档后分房表房组、机票航段描述会一起跟着改；随机档没落位的行在分房表、导出里统一显示「X星随机（待落位）」，不再把套餐名当酒店名。存量已经错的单要等上线后跑一次纠正脚本，之后重新导出就对了（房控手填的真实酒店名不会被动）。</p>
+
+<h2 id="s7">七、搜索备注</h2>
+<p>订单列表的大搜索框其实一直能搜备注（六栏都搜），只是没有写出来。现在搜索框说明写清楚了：订单号 / 客户 / 乘客中英文名 / 护照号 / 备注 / 产品名 / 代理，顺带把「搜代理名」真正接上了（之前标着代理其实搜不到）。</p>
+<div class="shot"><img src="shots-2026-09-13-反馈表总和3/02-搜索框-可搜备注.png"></div>
+<p class="cap">搜索框：可搜备注、产品名、代理名</p>
+
+</div>
+</body>
+</html>
