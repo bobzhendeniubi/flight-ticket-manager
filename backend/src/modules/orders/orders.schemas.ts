@@ -1436,6 +1436,20 @@ export const setPassengerVisaExemptBodySchema = z.object({
 export type SetPassengerVisaExemptBody = z.infer<typeof setPassengerVisaExemptBodySchema>;
 
 /**
+ * PATCH /orders/:id/passengers/:passengerId/single-room —— 建单后按人改单住 / 拼住（专用端点）。
+ *
+ * 与「补收单房差」（POST /orders/:id/room-supplement，运营手填每晚 ¥X × N 晚、单向）不同：
+ * 这里是对称、可逆的开关，金额由服务端按套餐行建单快照的单房差费率 × 晚数算 —— body 不收任何金额。
+ * ADMIN/STAFF 任意时候；AGENT 限自家（含下级）单。requestToken 为幂等键（同 token 重试只回放）。
+ */
+export const setPassengerSingleRoomBodySchema = z.object({
+  singleRoom: z.boolean(),
+  requestToken: z.string().min(8).max(64).optional(),
+  note: z.string().max(200).optional(),
+});
+export type SetPassengerSingleRoomBody = z.infer<typeof setPassengerSingleRoomBodySchema>;
+
+/**
  * PATCH /orders/:id/passengers/:passengerId 的「换人语义字段」——只出现在换人（swap）语义里、
  * 补录 schema（selfUpdatePassengerBodySchema）里没有的键。请求体带其中任一，即表达「换成另一个人 /
  * 重置开票或签证 / 收换人费」的意图，唯一指向换人分支。

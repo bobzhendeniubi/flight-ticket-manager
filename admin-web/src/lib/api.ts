@@ -5560,6 +5560,21 @@ export const api = {
       { method: 'PATCH', token, body },
     ),
 
+  // 建单后按人改单住 / 拼住（专用端点；ADMIN/STAFF 任意时候，AGENT 限自家含下级的单）。
+  // 对称可逆：单住 → 按套餐建单快照的单房差费率 × 晚数补收一条 FEE 行；拼住 → 同额退一条 DISCOUNT 行，
+  // 都挂到该乘客名下；套餐行计费房数同步重算。body 不收任何金额；requestToken 为幂等键（同 token 重试只回放）。
+  // 结算价已锁 / 已入住 / 多条套餐行 → 服务端拒，message 原样展示。
+  setPassengerSingleRoom: (
+    token: string,
+    orderId: string,
+    passengerId: string,
+    body: { singleRoom: boolean; requestToken?: string; note?: string },
+  ) =>
+    apiFetch<{ order: OrderSummary; warning?: string | null }>(
+      `/orders/${orderId}/passengers/${passengerId}/single-room`,
+      { method: 'PATCH', token, body },
+    ),
+
   // 签证台：出签后补录出行人的 出签日/生效日/有效期（仅 ADMIN/STAFF）。
   // 这三项是签证岗出签后才拿得到的信息，录单时无法预先知道（票务岗反馈：录单时不需要，
   // 已从录单表单移除），改由签证台在出签后调用本端点补录。

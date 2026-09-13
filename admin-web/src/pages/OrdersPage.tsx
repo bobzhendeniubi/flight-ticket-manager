@@ -5584,15 +5584,20 @@ function OrderDrawer({
               <span>
                 {o.agentSelfEdit?.open ? (
                   <>
-                    今天内可自助修改航班/签证状态/酒店/舱位（至 北京时间{' '}
+                    今天内可自助纠错航班/签证状态/升舱（至 北京时间{' '}
                     {o.agentSelfEdit.until ? formatInBusinessTz(o.agentSelfEdit.until, { hour: '2-digit', minute: '2-digit', hour12: false }) : '—'}
-                    ）
+                    ）；改期 / 换酒店 / 单住拼住出票前随时可自助，差价按系统价自动计入应收
                   </>
                 ) : (
-                  <>自助修改已关闭：{o.agentSelfEdit?.reason || '下单当天可自助修改，次日起请提交改单申请'}</>
+                  <>
+                    当天纠错窗口已关闭：{o.agentSelfEdit?.reason || '下单当天可自助纠错，次日起请提交改单申请'}
+                    {agentRescheduleClosedReason(o) == null
+                      ? '；改期 / 换酒店 / 单住拼住出票前仍可自助，差价按系统价自动计入应收'
+                      : `；改期：${agentRescheduleClosedReason(o)}`}
+                  </>
                 )}
               </span>
-              {o.agentSelfEdit?.open === false && (
+              {role === 'AGENT' && (
                 <button
                   type="button"
                   className="btn-secondary shrink-0 px-2 py-1 text-xs"
@@ -6028,10 +6033,13 @@ function OrderDrawer({
                 {/* 套餐订单：原始行金额明细折叠隐藏（公测反馈原始金额行「不太实用」），
                     默认收起，点开仍可见 + 改期/改结算价 操作照旧可用。非套餐订单不受影响（见下方 else 分支）。
                     对外脱敏：整段是逐项拆价（我方内部口径），仅内部角色可见；AGENT/CUSTOMER 只看上方产品内容 + 订单总价。 */}
-                {canSeeInternal && (
+                {/* 代理也渲染这一段（2026-09-13 放开改期 / 换酒店 / 酒店改期给代理自家单）：行级金额、单价、成本
+                    等内部口径由后端按角色脱敏（AGENT 响应里根本没有 amount/unitPrice），OrderItemRow 缺失时不渲染，
+                    代理点开只看到各行的操作按钮 —— 与下方非套餐分支对代理的展示完全一致。 */}
+                {(canSeeInternal || role === 'AGENT') && (
                   <details className="mt-2 rounded-lg border border-slate-200 bg-white">
                     <summary className="cursor-pointer select-none px-3 py-2 text-xs font-medium text-ink-muted hover:text-ink">
-                      金额明细（点开）
+                      {canSeeInternal ? '金额明细（点开）' : '行程操作：改期 / 换酒店（点开）'}
                     </summary>
                     <ul className="space-y-2 border-t border-slate-100 p-3 text-sm">
                       {(o.items ?? []).map((it) => (
@@ -6050,6 +6058,8 @@ function OrderDrawer({
                           outboundLegItemId={outboundFlightLegId(o)}
                           returnLegItemId={returnFlightLegId(o)}
                           agentSelfEditOpen={o.agentSelfEdit?.open === true}
+                          agentRescheduleOpen={role === 'AGENT' && agentRescheduleClosedReason(o) == null}
+                          agentHotelOpsOpen={role === 'AGENT' && agentHotelOpsOpen(o)}
                         />
                       ))}
                     </ul>
@@ -6074,6 +6084,8 @@ function OrderDrawer({
                     outboundLegItemId={outboundFlightLegId(o)}
                     returnLegItemId={returnFlightLegId(o)}
                     agentSelfEditOpen={o.agentSelfEdit?.open === true}
+                    agentRescheduleOpen={role === 'AGENT' && agentRescheduleClosedReason(o) == null}
+                    agentHotelOpsOpen={role === 'AGENT' && agentHotelOpsOpen(o)}
                   />
                 ))}
               </ul>
@@ -7757,6 +7769,39 @@ function returnFlightLegId(o: OrderSummary): string | null {
 /** 按人改期的原票作废提示（确认弹窗与勾选面板共用同一句，口径不分叉）。 */
 const TICKETED_RESCHEDULE_HINT = '已出票的乘客：拆出后改期会作废其原票，需票务台重开。';
 
+/** 代理售后自助不可用的订单状态（已完成 / 取消族 / 退款族 / 超时 / 草稿 —— 与后端占座态口径一致）。 */
+const AGENT_AFTER_SALES_CLOSED_STATUSES = new Set<string>([
+  'COMPLETED',
+  'CANCELLED',
+  'REFUND_REQUESTED',
+  'REFUNDED',
+  'PAYMENT_TIMEOUT',
+  'DRAFT',
+  'FAILED',
+]);
+
+/**
+ * 代理售后改期（出票前任意时候）此刻能不能做；null = 可做，否则返回原因（与后端
+ * computeAgentAfterSalesGate 同一口径：已出票 / 三开票位任一已开 / 任一乘客有 PNR 或票号 / 状态不对）。
+ * 按钮据此显示或隐藏 —— 后端照样再判一遍，这里只是别让代理点了必 403 的按钮。
+ */
+function agentRescheduleClosedReason(o: OrderSummary): string | null {
+  if (o.status === 'TICKETED') return '已出票，请提交改单申请';
+  if (AGENT_AFTER_SALES_CLOSED_STATUSES.has(o.status)) return `订单「${orderStatusLabel(o.status)}」不可自助修改`;
+  if (o.outboundInvoiced === true || o.returnInvoiced === true || o.systemInvoiced === true) {
+    return '已开票，请提交改单申请';
+  }
+  if ((o.passengers ?? []).some((p) => Boolean(p.pnr?.trim() || p.eticketNumber?.trim()))) {
+    return '已订座/已出票，请提交改单申请由运营处理';
+  }
+  return null;
+}
+
+/** 代理住宿类售后自助（换酒店 / 酒店改期 / 单住拼住）：不看票，只看订单还活着且未完成。 */
+function agentHotelOpsOpen(o: OrderSummary): boolean {
+  return !AGENT_AFTER_SALES_CLOSED_STATUSES.has(o.status);
+}
+
 /** 改期乘客勾选列表用：本单出行人 + 每人是否已出票（按人改期的原票作废提示据此显示）。
  *  判定两层：乘客自己的 PNR/票号，或订单级航段开票位已开（列表接口可能不回票号，
  *  开票位是全岗都拿得到的兜底信号，此时按「全员已出票」提示，宁可多提示不可漏）。 */
@@ -7982,6 +8027,8 @@ function OrderItemRow({
   outboundLegItemId,
   returnLegItemId,
   agentSelfEditOpen,
+  agentRescheduleOpen,
+  agentHotelOpsOpen,
 }: {
   orderId: string;
   item: OrderItem;
@@ -8007,11 +8054,18 @@ function OrderItemRow({
   returnLegItemId?: string | null;
   /** 代理自助修改窗口（order.agentSelfEdit.open）：本单下单当天为 true，只对 role===AGENT 生效 */
   agentSelfEditOpen?: boolean;
+  /** 代理售后改期（出票前任意时候、自家单）：agentRescheduleClosedReason(o)==null 时为 true，只对 role===AGENT 生效 */
+  agentRescheduleOpen?: boolean;
+  /** 代理住宿类售后自助（换酒店 / 酒店改期）：订单活着且未完成时为 true，只对 role===AGENT 生效 */
+  agentHotelOpsOpen?: boolean;
 }) {
   const role = useAuth((st) => st.user?.role);
-  // 代理自助纠错：仅本单下单当天窗口内（后端 agentSelfEdit.open）——改航班/换酒店/升舱三个入口，
+  // 代理自助纠错：仅本单下单当天窗口内（后端 agentSelfEdit.open）——改航班/升舱两个入口，
   // 与 ADMIN/STAFF 的 canOperate 是两条并行的开门条件，互不覆盖。
   const canAgentSelfEdit = role === 'AGENT' && Boolean(agentSelfEditOpen);
+  // 代理售后改期 / 住宿类自助（2026-09-13 放开：不绑当天窗口，出票前随时可做，差价由系统算）。
+  const canAgentReschedule = role === 'AGENT' && Boolean(agentRescheduleOpen);
+  const canAgentHotelOps = role === 'AGENT' && Boolean(agentHotelOpsOpen);
   const [rescheduleMode, setRescheduleMode] = useState<'NONE' | 'RESCHEDULE' | 'CORRECTION'>('NONE');
   const rescheduling = rescheduleMode !== 'NONE';
   const [editingPrice, setEditingPrice] = useState(false);
@@ -8182,10 +8236,11 @@ function OrderItemRow({
           {item.amount != null && (
             <div className="nums text-sm font-medium text-ink">¥{Number(item.amount).toLocaleString()}</div>
           )}
-          {canOperate && isFlight && !legCancelled && !returnReleased && !noShowLocked && !rescheduling && !editingPrice && !upgradingCabin && (
+          {(canOperate || canAgentReschedule) && isFlight && !legCancelled && !returnReleased && !noShowLocked && !rescheduling && !editingPrice && !upgradingCabin && (
             <button
               className="text-[11px] font-medium text-brand hover:text-brand-dark"
               onClick={() => setRescheduleMode('RESCHEDULE')}
+              title={canOperate ? undefined : '出票前可改期到其他班次；差价按新旧班次系统价自动计算并计入应收'}
             >
               改期
             </button>
@@ -8357,7 +8412,7 @@ function OrderItemRow({
               {settlementLocked && <span className="text-[11px] text-slate-500">已锁定</span>}
             </>
           )}
-          {(canOperate || canAgentSelfEdit) && isHotelRow && (
+          {(canOperate || canAgentSelfEdit || canAgentHotelOps) && isHotelRow && (
             <button
               className="text-[11px] font-medium text-brand hover:text-brand-dark"
               onClick={() => setSwappingHotel(true)}
@@ -8374,7 +8429,7 @@ function OrderItemRow({
               拆房组
             </button>
           )}
-          {canOperate && canRescheduleHotel && !reschedulingHotel && !editingPrice && (
+          {(canOperate || canAgentHotelOps) && canRescheduleHotel && !reschedulingHotel && !editingPrice && (
             <button
               className="text-[11px] font-medium text-brand hover:text-brand-dark"
               onClick={() => setReschedulingHotel(true)}
@@ -9109,7 +9164,9 @@ function RescheduleForm({
       ? `将把勾选的 ${selectedIds.size} 位乘客拆成新订单并改期到 ${selectedSchedule ? scheduleLabel(selectedSchedule) : '新班次'}；原单其余乘客不变。` +
         '\n套餐单也能这么拆：金额按占座比例劈，住宿按人头搬，同房组会自动劈成两个半组（房控后续配回一间）。' +
         (hasTicketedPassenger ? `\n${TICKETED_RESCHEDULE_HINT}` : '')
-      : '确认改期？座位会移动到新班次（新班次售罄会被拒绝）；出发日期变动时本单酒店入住/离店日期会同步平移（新日期房量不足会整体拒绝），如填了改期差价将计入订单应收（可正可负）。';
+      : isOps
+        ? '确认改期？座位会移动到新班次（新班次售罄会被拒绝）；出发日期变动时本单酒店入住/离店日期会同步平移（新日期房量不足会整体拒绝），如填了改期差价将计入订单应收（可正可负）。'
+        : '确认改期？座位会移动到新班次（新班次售罄会被拒绝）；出发日期变动时本单酒店入住/离店日期会同步平移（新日期房量不足会整体拒绝）。差价按新旧班次的系统价自动计算并计入订单应收（改到便宜班次会退差）。';
     if (!confirm(confirmMsg + (allowDepartedTarget ? DEPARTED_TARGET_CONFIRM : ''))) return;
     setSubmitting(true);
     try {
@@ -9302,7 +9359,7 @@ function RescheduleForm({
         </p>
       )}
 
-      {!isCorrection && (
+      {!isCorrection && isOps && (
         <label className="block">
           <span className="text-slate-500">新舱位（可选）</span>
           <select
@@ -9322,7 +9379,13 @@ function RescheduleForm({
         </label>
       )}
 
-      {!isCorrection && (
+      {/* 代理售后改期：金额字段不给（服务端也不认），差价由系统按新旧班次建单口径自动算。 */}
+      {!isCorrection && !isOps && (
+        <p className="rounded bg-slate-50 px-2 py-1 text-[11px] leading-snug text-slate-600">
+          差价由系统按新旧班次价格自动计算并计入订单应收（改到便宜班次会退差）；已出票的单请提交改单申请。
+        </p>
+      )}
+      {!isCorrection && isOps && (
         <label className="block">
           <span className="text-slate-500">改期差价（可负，¥）</span>
           <NumberInput
@@ -10836,6 +10899,8 @@ function HotelRescheduleForm({
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+  // 代理售后：差价字段不给（服务端按本行单价 × 晚数变化 × 间数自动算，请求体金额不认）。
+  const isOps = useAuth((s) => s.user?.role) !== 'AGENT';
 
   const nights = countNightsBetween(checkIn, checkOut);
   const currentNights = countNightsBetween(currentCheckIn, currentCheckOut);
@@ -10856,8 +10921,9 @@ function HotelRescheduleForm({
       setErr('新入住/退房日期与当前相同，无需改期');
       return;
     }
-    const feeHint =
-      feeCny != null && feeCny !== 0
+    const feeHint = !isOps
+      ? '晚数变化按本行每晚价自动补收/退差并计入订单应收；同晚数纯平移不改价。'
+      : feeCny != null && feeCny !== 0
         ? `差价 ${feeCny > 0 ? '+' : '−'}¥${Math.abs(feeCny).toLocaleString()} 将计入订单应收。`
         : '未填差价：订单金额保持不变（晚数变化不会自动改价）。';
     if (
@@ -10916,11 +10982,14 @@ function HotelRescheduleForm({
         {nights !== null && currentNights !== null && nights !== currentNights && (
           <span className="text-amber-700">
             {' '}
-            · 晚数由 {currentNights} 变为 {nights}，订单金额不会自动调整，请按需填写差价
+            {isOps
+              ? ` · 晚数由 ${currentNights} 变为 ${nights}，订单金额不会自动调整，请按需填写差价`
+              : ` · 晚数由 ${currentNights} 变为 ${nights}，差价按本行每晚价自动补收/退差`}
           </span>
         )}
       </div>
 
+      {isOps && (
       <label className="block">
         <span className="text-slate-500">差价（¥，可选；可负，减价填负数）</span>
         <NumberInput
@@ -10931,6 +11000,7 @@ function HotelRescheduleForm({
           className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
         />
       </label>
+      )}
 
       <label className="block">
         <span className="text-slate-500">原因 / 备注（可选）</span>
@@ -11810,6 +11880,40 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
   const confirm = useConfirm();
   const [visaExemptBusyId, setVisaExemptBusyId] = useState<string | null>(null);
   const [visaExemptErr, setVisaExemptErr] = useState<string | null>(null);
+  // 建单后按人改单住 / 拼住（专用端点）：运营任意时候；代理限自家单且订单活着未完成（后端再判归属）。
+  // 单房差按套餐建单快照费率 × 晚数由服务端自动补收 / 退，计费房数同步；共用上面的错误提示条。
+  const canToggleSingleRoom =
+    role === 'ADMIN' || role === 'STAFF' || (role === 'AGENT' && agentHotelOpsOpen(order));
+  const [singleRoomBusyId, setSingleRoomBusyId] = useState<string | null>(null);
+  const toggleSingleRoom = async (p: OrderSummary['passengers'][number]) => {
+    if (singleRoomBusyId || visaExemptBusyId) return;
+    const token = useAuth.getState().tokens?.accessToken;
+    if (!token) return;
+    const next = !p.singleRoom;
+    const ok = await confirm({
+      title: next ? `确认把 ${p.fullName} 改为单人入住？` : `确认把 ${p.fullName} 改为拼住？`,
+      body: next
+        ? '套餐单将按建单时的单房差费率 × 晚数自动补收一笔单房差（挂在该乘客名下），计费房数同步上调；纯酒店行订单只改标记。'
+        : '套餐单将按建单时的单房差费率 × 晚数自动退回一笔单房差（挂在该乘客名下），计费房数同步下调；纯酒店行订单只改标记。',
+      tone: 'danger',
+    });
+    if (!ok) return;
+    setVisaExemptErr(null);
+    setSingleRoomBusyId(p.id);
+    try {
+      const res = await api.setPassengerSingleRoom(token, order.id, p.id, {
+        singleRoom: next,
+        requestToken: crypto.randomUUID(),
+      });
+      onOrderUpdated?.(res.order);
+      if (res.warning) alert(res.warning);
+    } catch (e) {
+      // 后端文案已有明确指引（结算锁 / 已入住 / 多条套餐行 / 归属），原样展示。
+      setVisaExemptErr(e instanceof ApiError ? e.message : '改单住/拼住失败，请稍后重试');
+    } finally {
+      setSingleRoomBusyId(null);
+    }
+  };
   const toggleVisaExempt = async (p: OrderSummary['passengers'][number]) => {
     if (visaExemptBusyId) return;
     const token = useAuth.getState().tokens?.accessToken;
@@ -12079,6 +12183,20 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                         }
                       >
                         {visaExemptBusyId === p.id ? '保存中…' : p.visaExempt ? '改回随团' : '改自备签'}
+                      </button>
+                    )}
+                    {canToggleSingleRoom && p.passengerType !== 'INFANT' && (
+                      <button
+                        className="ml-2 text-[11px] font-normal text-teal-700 hover:text-teal-900 disabled:opacity-50"
+                        disabled={singleRoomBusyId !== null || visaExemptBusyId !== null}
+                        onClick={() => void toggleSingleRoom(p)}
+                        title={
+                          p.singleRoom
+                            ? '改拼住：套餐单按建单快照的单房差费率 × 晚数自动退一笔单房差；计费房数同步下调'
+                            : '改单住：套餐单按建单快照的单房差费率 × 晚数自动补收一笔单房差；计费房数同步上调'
+                        }
+                      >
+                        {singleRoomBusyId === p.id ? '保存中…' : p.singleRoom ? '改拼住' : '改单住'}
                       </button>
                     )}
                   </div>

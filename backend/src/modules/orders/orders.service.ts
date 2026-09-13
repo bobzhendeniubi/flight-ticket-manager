@@ -547,6 +547,65 @@ export function computeAgentSelfEditWindow(
   return { open: true, until, reason: null };
 }
 
+// ── 代理售后自助（出票前任意时候）────────────────────────────────────────
+// 与上面的「下单当天纠错窗口」是两条并行口径（2026-09-13 拍板）：
+//   · 纠错窗口：当天、不动钱（航班纠错 / 签证状态 / 升舱）—— 原样保留；
+//   · 售后自助：出票前任何时候，代理可对自家单（含下级代理的单）做**动钱但由系统计价**的三件事
+//     —— 改期（差价按新旧班次建单口径自动算）、换酒店（指定酒店加价 / 房型价差自动算）、
+//     单住↔拼住（单房差按建单快照费率自动补/退）。运营手填金额的口子对代理一律不开。
+//   · 已出票（状态已出票 / 三个开票位任一已开 / 任一乘客已有 PNR 或票号）→ 改期一律拒，
+//     指路改单申请：票已经在航司出了，改班次要票务去航司操作，不是系统里搬座位就完事。
+//   · 住宿类动作（换酒店 / 酒店改期 / 单住拼住）不看票：票和住哪是两件事；入住日已过才拒。
+/** 代理售后自助被拒的原因（面向界面的中文；前端直接展示，别另写一套措辞）。 */
+export const AGENT_AFTER_SALES_REASON = {
+  TICKETED: '已出票，请提交改单申请',
+  INVOICED: '已开票，请提交改单申请',
+  BOOKED: '已订座/已出票，请提交改单申请由运营处理',
+  DELETED: '订单已在回收站，请联系运营',
+  CHECKED_IN: '入住日期已过，请联系运营处理',
+} as const;
+
+export type AgentAfterSalesKind = 'FLIGHT_RESCHEDULE' | 'HOTEL';
+
+/**
+ * 纯函数：代理此刻能不能对这张单做某类售后自助动作。归属（自家 + 下级）不在这里判——
+ * 那要查库，由 assertAgentAfterSalesAllowed 先过 assertCanView 再调本函数。
+ *
+ *   FLIGHT_RESCHEDULE：未软删 且 状态 ∈ 占座态 −{已出票, 已完成} 且 三开票位全未开
+ *                      且 无任何乘客持有 PNR / 票号。
+ *   HOTEL           ：未软删 且 状态 ∈ 占座态 −{已完成}（已出票的单照样能换酒店 / 改单住）。
+ * 结算价锁不在这里判：各通道事务内那句「结算价已锁定，请先解锁」是全仓统一的锁闸，
+ * 代理与运营撞的是同一句话。
+ */
+export function computeAgentAfterSalesGate(
+  order: {
+    status: OrderStatus;
+    deletedAt?: Date | null;
+    outboundInvoiced?: boolean | null;
+    returnInvoiced?: boolean | null;
+    systemInvoiced?: boolean | null;
+    passengers?: ReadonlyArray<{ pnr?: string | null; eticketNumber?: string | null }>;
+  },
+  kind: AgentAfterSalesKind,
+): { open: boolean; reason: string | null } {
+  const closed = (reason: string) => ({ open: false, reason });
+  if (order.deletedAt) return closed(AGENT_AFTER_SALES_REASON.DELETED);
+  if (!SEAT_HOLDING_STATUSES.includes(order.status) || order.status === OrderStatus.COMPLETED) {
+    return closed(`订单「${zhStatus(order.status)}」不可自助修改`);
+  }
+  if (kind === 'FLIGHT_RESCHEDULE') {
+    if (order.status === OrderStatus.TICKETED) return closed(AGENT_AFTER_SALES_REASON.TICKETED);
+    if (order.outboundInvoiced || order.returnInvoiced || order.systemInvoiced) {
+      return closed(AGENT_AFTER_SALES_REASON.INVOICED);
+    }
+    const booked = (order.passengers ?? []).some(
+      (p) => (p.pnr ?? '').trim() !== '' || (p.eticketNumber ?? '').trim() !== '',
+    );
+    if (booked) return closed(AGENT_AFTER_SALES_REASON.BOOKED);
+  }
+  return { open: true, reason: null };
+}
+
 // ── 前台自助端点的状态闸 ────────────────────────────────────────────────
 // 出行人护照资料自助补录：出票流程启动前（含处理中）可改；出票后锁定走客服。
 const SELF_EDITABLE_PASSENGER_STATUSES: OrderStatus[] = ['PENDING_PAYMENT', 'PAID', 'PROCESSING'];
@@ -9861,6 +9920,14 @@ export class OrderService {
        */
       selfServiceCorrection?: boolean;
       /**
+       * 内部专用旗子：**只**由 rescheduleOrderItemAsAgent / reschedulePassengersAsAgent 在过完
+       * 「代理售后自助」闸（归属 + 未出票）之后设置。走的是**售后改期**语义（撤立减、推状态），
+       * 与纠错旗子的区别在钱：差价不由请求体给，而是在事务锁内按 quoteFlightCorrectionDelta
+       * （目标班次建单口径单价 − 本行成交单价）× 本行人数算出来 —— 代理动不了金额，但要按系统价补/退差。
+       * 请求体同样进不来这个字段（schema 不含）。
+       */
+      agentAfterSales?: boolean;
+      /**
        * 幂等键（按人改期的全员快路径传）：成功后在同一事务里往该航段行的 legActionLog
        * 追加一条 RESCHEDULE_ALL 流水，编排层下次拿同一个 token 重试时据此回放。
        *
@@ -9917,18 +9984,23 @@ export class OrderService {
     };
   }> {
     // 代理自助纠错（correctFlightSchedule）已在上游过完归属 + 下单当天窗口闸，从此处放行；
-    // 其余一切改期入口维持原样只认运营/管理员（自助旗子请求体注入不进来）。
+    // 代理售后改期（rescheduleOrderItemAsAgent / reschedulePassengersAsAgent）同理，上游已过
+    // 归属 + 未出票闸。其余一切改期入口维持原样只认运营/管理员（两面旗子请求体都注入不进来）。
     if (
       actor.role !== UserRole.ADMIN &&
       actor.role !== UserRole.STAFF &&
-      !input.selfServiceCorrection
+      !input.selfServiceCorrection &&
+      !input.agentAfterSales
     ) {
       throw new ForbiddenError('仅运营/管理员可改期');
     }
+    // 「真·代理售后」= 带售后旗子**且**操作人是代理：差价由系统算、请求体金额一律不认。
+    const isAgentAfterSales = input.agentAfterSales === true && actor.role === UserRole.AGENT;
     // 改期差价可正可负（与换酒店差价 / 酒店改期差价同一 adjustmentCny 机制）：改到更便宜的班次
     // 本来就该退客人钱，旧版 Math.max(0, …) 把负数钳成 0，运营只能另开收款单反向操作。
     // 上限仍由 schema 的 ±POST_SALE_FEE_CAP_CNY 把关。
-    const feeCny = Math.trunc(input.feeCny ?? 0);
+    // 代理售后：先按 0 起步，事务锁内解析出订单行后再按系统口径赋值（见下方 sameSeat 之后）。
+    let feeCny = isAgentAfterSales ? 0 : Math.trunc(input.feeCny ?? 0);
 
     const scratch = await prisma.$transaction(async (tx) => {
       // R2 并发串行（与超时 worker 配对）：先对本订单 Order 行 FOR UPDATE，再往下读 items / 搬座位。
@@ -9992,6 +10064,23 @@ export class OrderService {
         // 不复核就是一个「先过闸、再改价、免费换更贵班次」的窗口。
         if (input.orderItemId) {
           await this.assertSelfServiceCorrectionIsFreeOfCharge(input.orderItemId, input.newScheduleId, tx);
+        }
+      }
+
+      // ── 代理售后改期：锁内复查「未出票」闸 ───────────────────────────────────
+      // 入口那道 assertAgentAfterSalesAllowed 同样是锁外快照：从判完到拿锁之间票务可能刚好
+      // 出了票 / 开了票。拿锁住的这一行 + 现势乘客名册重跑同一份纯函数，文案与入口同一句。
+      if (isAgentAfterSales) {
+        const bookedRows = await tx.passenger.findMany({
+          where: { orderId },
+          select: { pnr: true, eticketNumber: true },
+        });
+        const gate = computeAgentAfterSalesGate(
+          { ...order, passengers: bookedRows },
+          'FLIGHT_RESCHEDULE',
+        );
+        if (!gate.open) {
+          throw new ForbiddenError(gate.reason ?? AGENT_AFTER_SALES_REASON.TICKETED);
         }
       }
 
@@ -10146,6 +10235,17 @@ export class OrderService {
 
       // 无变化（同班次同舱位）→ 不做座位搬移，避免无意义的放/拿
       const sameSeat = oldScheduleId === newScheduleId && oldCabin === newCabin;
+
+      // ── 代理售后改期的系统差价（锁内算，不信任何请求体金额）────────────────────
+      // 与纠错比价同一份计算（quoteFlightCorrectionDelta：目标班次按建单口径重算的单价 −
+      // 本行成交单价，按本行人数取平均），乘本行人数得到整行差价；可正可负（改到便宜班次退差），
+      // 取整到元与运营手填口径一致。同班次不搬座 → 差价恒 0（不会走到「同座还带差价」那句拒）。
+      // 目标班次余位不够本行人数时 calculatePrice 会抛「余票仅 N 张」—— 那正是这次改期做不成的
+      // 真实原因，照原样抛出、一个座都不搬。
+      if (isAgentAfterSales && !sameSeat) {
+        const quote = await this.quoteFlightCorrectionDelta(item.id, newScheduleId, tx);
+        feeCny = Math.round(quote.deltaCny * item.quantity);
+      }
 
       // ── 同班次同舱位还带着差价 = 自相矛盾的请求，直接拒 ──────────────────────
       // 不能改成「静默不收」：本方法返回的 audit 里带的是请求里的 feeCny，路由照它写审计
@@ -12657,6 +12757,117 @@ export class OrderService {
   }
 
   /**
+   * 代理售后自助闸（改期 / 换酒店 / 酒店改期 / 单住拼住 四条通道共用；出票前任意时候）。
+   *
+   *   · ADMIN/STAFF：直接放行（运营本来就随时能改）。
+   *   · CUSTOMER：403。
+   *   · AGENT：先过归属（assertCanView：只能碰自己 + 下级代理的单），再过
+   *     computeAgentAfterSalesGate（按动作类型判已出票 / 开票 / 订座 / 状态 / 回收站），
+   *     关闭则把 reason 原样抛给界面。
+   *
+   * 与 assertAgentSelfEditAllowed 一样刻意放在事务外、只读一次：这是权限判定；
+   * 各通道事务内会拿 FOR UPDATE 锁住的现势再跑一遍同一份纯函数（锁内复查）。
+   */
+  async assertAgentAfterSalesAllowed(
+    orderId: string,
+    actor: { userId: string; role: UserRole; agentId?: string },
+    kind: AgentAfterSalesKind,
+  ): Promise<void> {
+    if (actor.role === UserRole.ADMIN || actor.role === UserRole.STAFF) return;
+    if (actor.role !== UserRole.AGENT) {
+      throw new ForbiddenError('仅运营 / 代理可自助改单');
+    }
+    const order = await prisma.order.findUnique({
+      where: { id: orderId },
+      select: {
+        userId: true,
+        agentId: true,
+        status: true,
+        deletedAt: true,
+        outboundInvoiced: true,
+        returnInvoiced: true,
+        systemInvoiced: true,
+        passengers: { select: { pnr: true, eticketNumber: true } },
+      },
+    });
+    if (!order) throw new NotFoundError('订单不存在');
+    await this.assertCanView(order, {
+      userId: actor.userId,
+      role: actor.role,
+      agentId: actor.agentId,
+    });
+    const gate = computeAgentAfterSalesGate(order, kind);
+    if (!gate.open) {
+      throw new ForbiddenError(gate.reason ?? AGENT_AFTER_SALES_REASON.TICKETED);
+    }
+  }
+
+  /**
+   * 代理售后改期（整单 / 单条机票行）：出票前任何时候，改自家单到新班次，差价由系统算。
+   *
+   * 请求体里只认 orderItemId / newScheduleId / note —— feeCny / feeLabel / newCabin /
+   * allowDepartedTarget / allowFlownSource 这些运营专属字段一律丢弃（不是「不认」而是根本
+   * 不透传：代理动不了金额、也开不了已起飞放行）。差价 = (目标班次建单口径单价 − 本行成交单价)
+   * × 本行人数，在 rescheduleOrderItem 事务锁内按 quoteFlightCorrectionDelta 算（见 agentAfterSales）。
+   */
+  async rescheduleOrderItemAsAgent(
+    orderId: string,
+    body: { orderItemId: string; newScheduleId: string; note?: string },
+    actor: { userId: string; role: UserRole; agentId?: string },
+  ): ReturnType<OrderService['rescheduleOrderItem']> {
+    if (actor.role !== UserRole.AGENT) {
+      throw new ForbiddenError('本入口仅供代理使用');
+    }
+    await this.assertAgentAfterSalesAllowed(orderId, actor, 'FLIGHT_RESCHEDULE');
+    return this.rescheduleOrderItem(
+      orderId,
+      {
+        orderItemId: body.orderItemId,
+        newScheduleId: body.newScheduleId,
+        note: body.note,
+        agentAfterSales: true,
+      },
+      { userId: actor.userId, role: actor.role },
+    );
+  }
+
+  /**
+   * 代理售后按人改期：与 rescheduleOrderItemAsAgent 同一口径（出票前 / 自家单 / 系统计价），
+   * 勾部分人时先拆单再对新单改期（拆单闸对这条编排放行，见 splitOrder 的 viaAgentReschedule）。
+   * 已出票闸放在拆单**之前**：拆单不可回滚，先拒才不会留下一张多余的新单。
+   */
+  async reschedulePassengersAsAgent(
+    orderId: string,
+    body: {
+      passengerIds: string[];
+      orderItemId: string;
+      newScheduleId: string;
+      note?: string;
+      roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
+      requestToken: string;
+    },
+    actor: { userId: string; role: UserRole; agentId?: string },
+  ): Promise<ReschedulePassengersResult> {
+    if (actor.role !== UserRole.AGENT) {
+      throw new ForbiddenError('本入口仅供代理使用');
+    }
+    await this.assertAgentAfterSalesAllowed(orderId, actor, 'FLIGHT_RESCHEDULE');
+    return this.reschedulePassengers(
+      orderId,
+      {
+        passengerIds: body.passengerIds,
+        orderItemId: body.orderItemId,
+        newScheduleId: body.newScheduleId,
+        note: body.note,
+        roomSplit: body.roomSplit,
+        requestToken: body.requestToken,
+        agentAfterSales: true,
+      },
+      { userId: actor.userId, role: actor.role },
+    );
+  }
+
+  /**
    * 航班纠错（代理下单当天自助 / 运营任意时候）：把某条 FLIGHT 行改到正确的班次。
    *
    * 与「售后改期」的分工：改期是**行程真的变了**（航变/客人要改），要收改期费、撤立减、推状态；
@@ -13719,6 +13930,433 @@ export class OrderService {
   }
 
   /**
+   * 建单后按人改单住 / 拼住（专用端点，PATCH /orders/:id/passengers/:passengerId/single-room）。
+   *
+   * 与「事后补收单房差」（addRoomSupplement）的分工：那条是运营手填「每晚 ¥X × N 晚」的单向补收；
+   * 本方法是**对称、可逆、系统计价**的开关，运营与代理（自家含下级的单）都能用：
+   *   · 拼住 → 单住：按套餐行建单快照的单房差费率（addOns.singleSupplementCnyPerNight）× 晚数
+   *     新增一条 FEE 行（形状与补收单房差完全一致：reasonCode=ROOM_DIFF，挂到该乘客名下）；
+   *   · 单住 → 拼住：同一费率 × 晚数新增一条 **DISCOUNT** 行（负金额，同样 reasonCode=ROOM_DIFF
+   *     挂到该乘客），把此前收的单房差退回 —— 不删旧行、不改旧行，账面上一进一出各有留痕。
+   *   · 两个方向都同步 Passenger.singleRoom 与套餐行计费房数 roomsBilled：按权威公式
+   *     computeBundleRoomsCharged 算「翻转前 / 翻转后」各应计几间，取差值挪动现值（保留运营
+   *     手工多开的房间，不用权威值整体覆盖）；房数上调要过与补录地面项 / 换酒店同一把房量闸。
+   *   · 费率为 0 / 无套餐行（纯酒店行订单）→ 纯改标记不动钱，warning 说明；多条套餐行 → 拒
+   *     （系统判不出归属，请走补收单房差 / 调价通道）。
+   *
+   * 守卫：占座态且未完成 + 未软删 → 幂等短路（目标值 = 现值）→ 婴儿不能单住 → 入住日已到/已过拒
+   * → 有钱语义时结算价锁（与本仓其它售后动作同一句「结算价已锁定，请先解锁」）。
+   * 开票不闸（与改自备签 / 调价通道同口径）：已开票且应收变了 → warning 提醒票务核对 + 审计标记。
+   * requestToken 为幂等键（落在新增行的 idempotencyKey）：同 token 重试只回放、绝不二次记账。
+   */
+  async setPassengerSingleRoom(
+    orderId: string,
+    passengerId: string,
+    input: { singleRoom: boolean; requestToken?: string; note?: string },
+    actor: { userId: string; role: UserRole; agentId?: string },
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    warning: string | null;
+    /** 幂等短路（目标值与现值相同 / 同 token 回放）：不写审计、不动钱。 */
+    idempotent: boolean;
+    audit: {
+      orderNumber: string;
+      passengerId: string;
+      passengerName: string;
+      before: { singleRoom: boolean; roomsBilled: number | null };
+      after: { singleRoom: boolean; roomsBilled: number | null };
+      /** 本次入账金额（正 = 补收单房差，负 = 退单房差，0 = 纯改标记）。 */
+      amountCny: number;
+      perNightCny: number;
+      nights: number;
+      /** 新增的 FEE / DISCOUNT 行 id（纯改标记为 null）。 */
+      itemId: string | null;
+      invoicedAtChange: boolean;
+      roomControl: string | null;
+    } | null;
+  }> {
+    // 运营直通；代理过归属 + 状态闸；客户 403。
+    await this.assertAgentAfterSalesAllowed(orderId, actor, 'HOTEL');
+
+    const scratch = await prisma.$transaction(async (tx) => {
+      // Order 行锁（与补收单房差 / 改自备签同一把 FOR UPDATE）：要读-改-写 items 合计与 roomsBilled。
+      const orderRows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          orderNumber: string;
+          status: OrderStatus;
+          deletedAt: Date | null;
+          adjustments: Prisma.JsonValue;
+          settlementLocked: boolean;
+          outboundInvoiced: boolean;
+          returnInvoiced: boolean;
+          systemInvoiced: boolean;
+        }>
+      >`SELECT id, "orderNumber", status, "deletedAt", adjustments, "settlementLocked", "outboundInvoiced", "returnInvoiced", "systemInvoiced" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      const order = orderRows[0];
+      if (!order) throw new NotFoundError('订单不存在');
+
+      // ── 1. 有效订单守卫 ────────────────────────────────────────────────
+      if (order.deletedAt) {
+        throw new BadRequestError('订单在回收站（已软删），不可改单住/拼住；如需操作请先恢复');
+      }
+      if (!SEAT_HOLDING_STATUSES.includes(order.status) || order.status === OrderStatus.COMPLETED) {
+        throw new BadRequestError(
+          `订单当前状态（${zhStatus(order.status)}）不可改单住/拼住：仅占座中、未完成的有效订单可改`,
+        );
+      }
+      // 代理售后自助锁内复查（入口那次是锁外快照）。
+      if (actor.role === UserRole.AGENT) {
+        const gate = computeAgentAfterSalesGate(order, 'HOTEL');
+        if (!gate.open) throw new ForbiddenError(gate.reason ?? AGENT_AFTER_SALES_REASON.DELETED);
+      }
+
+      // ── 2. 幂等回放：同 requestToken 已落过行（双击 / 超时重发）→ 什么都不做 ──
+      if (input.requestToken) {
+        const dup = await tx.orderItem.findUnique({
+          where: { idempotencyKey: input.requestToken },
+          select: { id: true, orderId: true },
+        });
+        if (dup) {
+          if (dup.orderId !== orderId) throw new BadRequestError('请求编号已用于其它订单，不能复用');
+          return { noop: true as const };
+        }
+      }
+
+      const passenger = await tx.passenger.findUnique({
+        where: { id: passengerId },
+        select: { id: true, orderId: true, fullName: true, singleRoom: true, passengerType: true },
+      });
+      if (!passenger || passenger.orderId !== orderId) {
+        throw new BadRequestError('指定的乘客不存在或不属于本订单');
+      }
+      // ── 3. 幂等短路：目标值与现值相同 ──
+      if (passenger.singleRoom === input.singleRoom) return { noop: true as const };
+      if (input.singleRoom && passenger.passengerType === 'INFANT') {
+        throw new BadRequestError('婴儿不占床位，不能设为单人入住');
+      }
+
+      // ── 4. 住宿行：套餐行（费率快照 + 计费房数）；纯酒店行订单只改标记 ──
+      const bundleItems = await tx.orderItem.findMany({
+        where: { orderId, kind: OrderItemKind.BUNDLE },
+        orderBy: { createdAt: 'asc' },
+        select: {
+          id: true,
+          metadata: true,
+          roomsBilled: true,
+          hotelRoomTypeId: true,
+          hotelCheckIn: true,
+          hotelCheckOut: true,
+          randomStarTier: true,
+          unitCostCny: true,
+          bundle: {
+            select: {
+              hotelRoomTypeId: true,
+              hotelRoomType: {
+                select: {
+                  maxAdults: true,
+                  maxChildren: true,
+                  costPriceCny: true,
+                  costPriceVnd: true,
+                  costFxName: true,
+                  costPeriods: {
+                    select: {
+                      effectiveFrom: true,
+                      effectiveTo: true,
+                      costPriceCny: true,
+                      costPriceVnd: true,
+                      costFxName: true,
+                    },
+                  },
+                },
+              },
+            },
+          },
+        },
+      });
+      const hotelRowCount =
+        bundleItems.length > 0
+          ? 0
+          : await tx.orderItem.count({ where: { orderId, kind: OrderItemKind.HOTEL } });
+      if (bundleItems.length === 0 && hotelRowCount === 0) {
+        throw new BadRequestError('该订单不含酒店/套餐行，无法改单住/拼住');
+      }
+      if (bundleItems.length > 1) {
+        throw new ConflictError(
+          '本单存在多条套餐行，系统无法自动判定单房差归属，请走「补收单房差」/ 调价通道人工处理',
+        );
+      }
+      const bundleItem = bundleItems[0] ?? null;
+      // 入住日已到/已过：客人可能已在店里，房型变动要地接与酒店当面协调 → 找运营。
+      if (bundleItem?.hotelCheckIn && formatDateOnly(bundleItem.hotelCheckIn) <= businessDateISO(new Date())) {
+        throw new BadRequestError('入住日期已到/已过，单住/拼住请联系运营处理');
+      }
+
+      // ── 5. 单房差费率与晚数：建单快照优先（与建单同一份费率），晚数缺失回落住宿区间 ──
+      const snapshot = bundleItem ? readJsonObject(readJsonObject(bundleItem.metadata).addOns) : {};
+      const intNN = (v: unknown): number => Math.max(0, Math.trunc(Number(v ?? 0) || 0));
+      const perNightCny = intNN(snapshot.singleSupplementCnyPerNight);
+      const stayNights =
+        bundleItem?.hotelCheckIn && bundleItem.hotelCheckOut
+          ? buildStayNightDates(bundleItem.hotelCheckIn, bundleItem.hotelCheckOut).length
+          : 0;
+      const nights = intNN(snapshot.nights) || stayNights;
+      const amountAbs = perNightCny * nights;
+      const signedAmount = input.singleRoom ? amountAbs : -amountAbs;
+      if (amountAbs > 0 && order.settlementLocked) {
+        throw new ConflictError('结算价已锁定，改单住/拼住会变更应收，请先解锁结算价再操作');
+      }
+
+      // ── 6. 翻乘客标记 ──
+      await tx.passenger.update({ where: { id: passenger.id }, data: { singleRoom: input.singleRoom } });
+
+      // ── 7. 套餐行计费房数：按权威公式算翻转前后差值，挪动现值（保留运营手工多开的房） ──
+      let roomControl: string | null = `乘客 ${passenger.fullName} 已改为${input.singleRoom ? '单人入住' : '拼住'}`;
+      const roomsBefore = bundleItem?.roomsBilled == null ? null : Number(bundleItem.roomsBilled.toString());
+      let roomsAfter = roomsBefore;
+      let roomsDelta = 0;
+      if (bundleItem) {
+        const singleAfter = await tx.passenger.count({ where: { orderId, singleRoom: true } });
+        const singleBefore = singleAfter + (input.singleRoom ? -1 : 1);
+        const occupancy = resolveBundleOccupancy({
+          metadata: (bundleItem.metadata ?? {}) as Record<string, unknown>,
+        });
+        const capacity = bundleItem.bundle?.hotelRoomType ?? null;
+        const stampRoomTypeId = bundleItem.bundle?.hotelRoomTypeId ?? bundleItem.hotelRoomTypeId;
+        const chargedBefore = computeBundleRoomsCharged({
+          occupancy,
+          capacity,
+          hotelRoomTypeId: stampRoomTypeId,
+          singleCount: singleBefore,
+          clientRoomsBilled: undefined,
+        });
+        const chargedAfter = computeBundleRoomsCharged({
+          occupancy,
+          capacity,
+          hotelRoomTypeId: stampRoomTypeId,
+          singleCount: singleAfter,
+          clientRoomsBilled: undefined,
+        });
+        const authoritativeDelta = chargedAfter - chargedBefore;
+        roomsAfter =
+          roomsBefore == null
+            ? chargedAfter
+            : Math.max(chargedAfter, Math.round((roomsBefore + authoritativeDelta) * 2) / 2);
+        roomsDelta = roomsBefore == null ? 0 : roomsAfter - roomsBefore;
+        if (roomsAfter !== roomsBefore) {
+          if (roomsBefore != null && roomsAfter > roomsBefore) {
+            // 房数上调要过房量闸（与补收单房差 / 补录地面项 / 换酒店同一把）：先释放本单占房，
+            // 再把抬房后的本行与本单其余占房行一起加回去；内部录单口径的超售上限。
+            const siblingStays = await tx.orderItem.findMany({
+              where: { orderId, id: { not: bundleItem.id } },
+              select: {
+                hotelRoomTypeId: true,
+                hotelCheckIn: true,
+                hotelCheckOut: true,
+                roomsBilled: true,
+                randomStarTier: true,
+              },
+            });
+            const prospectiveStays: ProspectiveHotelStay[] = [
+              {
+                hotelRoomTypeId: bundleItem.hotelRoomTypeId,
+                hotelCheckIn: bundleItem.hotelCheckIn,
+                hotelCheckOut: bundleItem.hotelCheckOut,
+                roomsBilled: roomsAfter,
+                randomStarTier: bundleItem.randomStarTier,
+              },
+              ...siblingStays.map((it) => ({
+                hotelRoomTypeId: it.hotelRoomTypeId,
+                hotelCheckIn: it.hotelCheckIn,
+                hotelCheckOut: it.hotelCheckOut,
+                roomsBilled: it.roomsBilled == null ? null : Number(it.roomsBilled.toString()),
+                randomStarTier: it.randomStarTier,
+              })),
+            ];
+            const stayPassengers = await tx.passenger.findMany({
+              where: { orderId },
+              select: { gender: true },
+            });
+            const stayGenders = stayPassengers.map((p) => ({ gender: p.gender ?? undefined }));
+            const tolerated = await assertHotelStaysFitWithinTx(tx, prospectiveStays, stayGenders, {
+              excludeOrderId: orderId,
+              maxOversellRooms: await getHotelOversellCapRooms(tx),
+            });
+            await assertRandomTierStaysFitWithinTx(tx, prospectiveStays, {
+              excludeOrderId: orderId,
+              maxOversellRooms: RANDOM_TIER_INTERNAL_NO_CAP,
+            });
+            if (tolerated.length > 0) {
+              roomControl += '；酒店房量已超售（限额内放行），请尽快向酒店加房';
+            }
+          }
+          await tx.orderItem.update({
+            where: { id: bundleItem.id },
+            data: { roomsBilled: new Prisma.Decimal(roomsAfter) },
+          });
+          roomControl += `；套餐行计费房数 ${roomsBefore ?? '未设'} → ${roomsAfter}（房控/分房自动跟进）`;
+        } else {
+          roomControl += `；计费房数维持 ${roomsBefore ?? '未设'}`;
+        }
+      } else {
+        roomControl += '；本单为酒店行订单，房数请在分房面板调整（标记已生效）';
+      }
+
+      // ── 8. 钱：FEE（补收）/ DISCOUNT（退）行，挂到该乘客；成本随房数增减对称落 ──
+      let createdItemId: string | null = null;
+      let warning: string | null = null;
+      if (amountAbs > 0) {
+        let costCny = 0;
+        let costSource: RoomCostSource = 'ZERO';
+        let hotelCostSource: HotelCostSourceSnapshot | null = null;
+        if (bundleItem && roomsDelta !== 0) {
+          const productRoomType = bundleItem.bundle?.hotelRoomType ?? null;
+          const productCost = productRoomType
+            ? resolveHotelStayUnitCost({
+                periods: productRoomType.costPeriods,
+                baseCostCny: productRoomType.costPriceCny,
+                baseCostVnd: productRoomType.costPriceVnd,
+                baseFxName: productRoomType.costFxName,
+                fxRates: await loadHotelCostFxRatesIfNeeded(
+                  {
+                    periodsMap: new Map([[bundleItem.bundle?.hotelRoomTypeId ?? '', productRoomType.costPeriods]]),
+                    bases: [productRoomType],
+                  },
+                  tx,
+                ),
+                checkIn: bundleItem.hotelCheckIn,
+                checkOut: bundleItem.hotelCheckOut,
+              })
+            : null;
+          const resolved = resolveRoomSupplementCost({
+            snapshotUnitCostCny:
+              bundleItem.unitCostCny != null ? Number(bundleItem.unitCostCny.toString()) : null,
+            productCostPriceCny: productCost?.unitCostCny ?? null,
+            nights,
+            addedRooms: Math.abs(roomsDelta),
+          });
+          costCny = roomsDelta > 0 ? resolved.totalCostCny : -resolved.totalCostCny;
+          costSource = resolved.costSource;
+          if (resolved.costSource === 'PRODUCT' && productCost) {
+            hotelCostSource = buildHotelCostSourceSnapshot(productCost.detail);
+          }
+        }
+        const note = input.note?.trim() || undefined;
+        const row = input.singleRoom
+          ? buildRoomSupplementItem({ perNightCny, nights, note })
+          : {
+              kind: OrderItemKind.DISCOUNT,
+              description: `退单房差 ¥${perNightCny}/晚 × ${nights}晚`,
+              quantity: 1,
+              unitPrice: -amountAbs,
+              amount: -amountAbs,
+              metadata: {
+                priceAdjustment: true,
+                reasonCode: 'ROOM_DIFF',
+                perNightCny: -perNightCny,
+                nights,
+                note: note ?? null,
+              } as Record<string, unknown>,
+            };
+        const created = await tx.orderItem.create({
+          data: {
+            orderId,
+            kind: row.kind,
+            description: row.description,
+            quantity: row.quantity,
+            unitPrice: new Prisma.Decimal(row.unitPrice),
+            amount: new Prisma.Decimal(row.amount),
+            totalCostCny: new Prisma.Decimal(costCny),
+            metadata: withHotelCostSource(
+              {
+                ...row.metadata,
+                costSource,
+                singleRoomToggle: { direction: input.singleRoom ? 'ON' : 'OFF' },
+              },
+              hotelCostSource,
+              'hotelCostSource',
+            ) as Prisma.InputJsonValue,
+            passengerId: passenger.id,
+            idempotencyKey: input.requestToken ?? null,
+          },
+        });
+        createdItemId = created.id;
+
+        // 合计按锁内现势重聚（含刚建的行）：与补收单房差同一口径（total = subtotal，无税费/折扣层）。
+        const sum = await tx.orderItem.aggregate({ where: { orderId }, _sum: { amount: true } });
+        const newSubtotal = round2(Number(sum._sum.amount?.toString() ?? '0'));
+        const log = appendAdjustment(order.adjustments, {
+          type: input.singleRoom ? 'ROOM_SUPPLEMENT' : 'ROOM_SUPPLEMENT_REFUND',
+          label: row.description,
+          amountCny: signedAmount,
+          at: new Date().toISOString(),
+          by: actor.userId,
+          note,
+          passengerId: passenger.id,
+        });
+        await tx.order.update({
+          where: { id: orderId },
+          data: {
+            subtotal: new Prisma.Decimal(newSubtotal),
+            total: new Prisma.Decimal(newSubtotal),
+            adjustments: log,
+          },
+        });
+      } else {
+        warning = bundleItem
+          ? '本单套餐未配单房差费率，本次只改单住/拼住标记，不动订单金额'
+          : '本单为酒店行订单，本次只改单住/拼住标记，不动订单金额';
+      }
+
+      const invoicedAtChange =
+        (order.outboundInvoiced || order.returnInvoiced || order.systemInvoiced) && signedAmount !== 0;
+      const invoiceWarning = invoicedAtChange ? buildInvoicedChangeWarning(signedAmount) : null;
+
+      return {
+        noop: false as const,
+        orderNumber: order.orderNumber,
+        passengerName: passenger.fullName,
+        roomsBefore,
+        roomsAfter,
+        amountCny: signedAmount,
+        perNightCny,
+        nights,
+        itemId: createdItemId,
+        roomControl,
+        invoicedAtChange,
+        warning: [warning, invoiceWarning].filter(Boolean).join(' ') || null,
+      };
+    });
+
+    const finalOrder = await prisma.order.findUniqueOrThrow({
+      where: { id: orderId },
+      include: ORDER_FULL_INCLUDE,
+    });
+    const serialized = serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role));
+    if (scratch.noop) {
+      return { order: serialized, warning: null, idempotent: true, audit: null };
+    }
+    return {
+      order: serialized,
+      warning: scratch.warning,
+      idempotent: false,
+      audit: {
+        orderNumber: scratch.orderNumber,
+        passengerId,
+        passengerName: scratch.passengerName,
+        before: { singleRoom: !input.singleRoom, roomsBilled: scratch.roomsBefore },
+        after: { singleRoom: input.singleRoom, roomsBilled: scratch.roomsAfter },
+        amountCny: scratch.amountCny,
+        perNightCny: scratch.perNightCny,
+        nights: scratch.nights,
+        itemId: scratch.itemId,
+        invoicedAtChange: scratch.invoicedAtChange,
+        roomControl: scratch.roomControl,
+      },
+    };
+  }
+
+  /**
    * 换酒店：把订单里某条 HOTEL 行（或已盖章酒店的 BUNDLE 行）就地换到另一个房型/酒店，
    * 并（可选）加/减「换酒店差价」。
    *
@@ -13786,13 +14424,15 @@ export class OrderService {
       starMismatchOverride: DesignatedHotelStarMismatchOverride | null;
     };
   }> {
-    // 代理自助换酒店（下单当天、自家单）：过窗口闸后放行；客户与过期窗口一律 403。
+    // 代理自助换酒店（出票前任意时候、自家含下级的单）：过售后自助闸（归属 + 状态）后放行；
+    // 客户一律 403。此前绑「下单当天」窗口，2026-09-13 拍板放开：换酒店不看票，只看入住日。
     const isSelfService = actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF;
-    if (isSelfService) {
-      await this.assertAgentSelfEditAllowed(orderId, actor);
-    }
-    // 自助通道差价恒 0（请求里填了也不认）：代理自助只改「住哪」，动钱一律走运营。
-    const feeCny = isSelfService ? 0 : Math.trunc(input.feeCny ?? 0);
+    await this.assertAgentAfterSalesAllowed(orderId, actor, 'HOTEL');
+    // 自助通道差价不吃请求体（填了也不认），由系统按同档次口径算（见下方 selfServiceFee）：
+    //   · 套餐行 = (新酒店指定加价/人 − 原指定加价/人) × 占座人数（指定酒店加价的既有口径）；
+    //   · 单独 HOTEL 行 = (新房型挂牌价 − 本行成交单价) × 晚数 × 间数。
+    // 运营手填差价照旧。
+    let feeCny = isSelfService ? 0 : Math.trunc(input.feeCny ?? 0);
 
     const item = await prisma.orderItem.findUnique({
       where: { id: itemId },
@@ -13809,6 +14449,8 @@ export class OrderService {
         hotelCheckIn: true,
         hotelCheckOut: true,
         roomsBilled: true,
+        // 代理自助差价的计价基数（单独 HOTEL 行：本行成交的每间每晚价）。
+        unitPrice: true,
         // 换酒店前的成本快照（审计 before / 保留 BUNDLE 行原值不动的依据）。
         unitCostCny: true,
         totalCostCny: true,
@@ -13853,6 +14495,8 @@ export class OrderService {
           id: true,
           name: true,
           hotelId: true,
+          // 代理自助（单独 HOTEL 行）的系统差价基数：新房型挂牌价（与建单 HOTEL 行取价同源）。
+          basePrice: true,
           // 新房型成本价 → 重打 HOTEL 行成本快照（每间每晚 × 晚数 × 房数）。
           costPriceCny: true,
           costPriceVnd: true,
@@ -13870,6 +14514,8 @@ export class OrderService {
               // 占位酒店不是真房源，不参与本闸。
               intlFiveStar: true,
               randomTierPlaceholder: true,
+              // 代理自助（套餐行）的系统差价基数：该酒店的「指定酒店加价 ¥/人」（与录单同源）。
+              designationSurchargeCnyPerPerson: true,
             },
           },
         },
@@ -13896,9 +14542,10 @@ export class OrderService {
     }
 
     // ── 自助换酒店只许「同星级」（HIGH 修复）──────────────────────────────────
-    // 差价被强制归 0 的前提是「换的是同一档住宿」。不比星级的话，自助通道就是一条免费升星的路：
-    // 三星换五星，房量真的占过去、成本真的抬上去，我方一分钱收不到；反过来降星则是悄悄降级
-    // 交付，客人买的档次没兑现，事后只能靠客诉才发现。
+    // 系统差价只覆盖「同一档住宿内的差别」（指定酒店加价 / 房型价差）。不比星级的话，自助通道
+    // 就是一条绕开改档定价的路：三星换五星，房量真的占过去、成本真的抬上去，我方按加价口径
+    // 收不到档次差；反过来降星则是悄悄降级交付，客人买的档次没兑现，事后只能靠客诉才发现。
+    // 跨档次请走改档申请（套餐单）/ 找运营（单订酒店）。
     // 现势星级来源：具体酒店行看当前酒店（含挂在占位酒店上的伪落位行）；未落位随机行看它买的档次。
     // 取不到现势星级（数据异常）一律按不符处理 —— 自助口子上宁可少放行。
     if (isSelfService) {
@@ -13906,7 +14553,16 @@ export class OrderService {
         ? item.randomStarTier
         : (oldRoomType?.hotel.starRating ?? null);
       if (currentStar == null || newRoomType.hotel.starRating !== currentStar) {
-        throw new BadRequestError('当日自助只能换同星级酒店，升降星请提交改单申请');
+        throw new BadRequestError('代理只能换同星级酒店，升降星请提交改档申请或联系运营');
+      }
+      // 随机档占房行（还没落到任何酒店、由房控按需求池统一落位）：代理自己挑店落位等于把
+      // 「N 星随机」当指定酒店买 —— 落位归运营/房控，代理走运营。
+      if (isRandomPoolRow) {
+        throw new BadRequestError('随机档酒店由运营统一安排落位，如需指定酒店请联系运营');
+      }
+      // 入住日已到/已过（北京业务日）：客人可能已在店里，换店要地接与酒店当面协调 → 找运营。
+      if (item.hotelCheckIn && formatDateOnly(item.hotelCheckIn) <= businessDateISO(new Date())) {
+        throw new BadRequestError(AGENT_AFTER_SALES_REASON.CHECKED_IN);
       }
     }
 
@@ -13932,7 +14588,7 @@ export class OrderService {
         if (isSelfService) {
           throw new BadRequestError(
             `${buildStarMismatchMessage(swapBundle.settlementTier, newRoomType.hotel)}。` +
-              '套餐档次与酒店星级不符，请联系运营处理。',
+              '套餐档次与酒店星级不符，请提交改档申请或联系运营处理。',
           );
         }
         const reason = input.designatedHotelStarMismatchReason?.trim();
@@ -13959,6 +14615,46 @@ export class OrderService {
 
     // ── 逐晚余量校验（仅跨酒店换房时才需要；同酒店换房型净房量不变，不受本单占用影响）──
     const roomsBilled = item.roomsBilled != null ? Number(item.roomsBilled) : 1;
+
+    // ── 代理自助的系统差价（同星级已由上面那道闸保证）────────────────────────────
+    //   · 套餐行：钱是按档次收的，同档次内换店只差「指定酒店加价」—— 差价 = (新店加价/人 − 原店
+    //     加价/人) × 占座人数，与录单指定酒店同一份费率源（Hotel.designationSurchargeCnyPerPerson）。
+    //     原店加价从本行建单留痕 metadata.designatedHotel 读（随机档 / 未指定 → 0）；换完把留痕
+    //     改写成新店，下次再换才有正确的基数。占位酒店不是真房源，加价按 0。
+    //   · 单独 HOTEL 行：按房型挂牌价成交（建单同源）→ 差价 = (新房型挂牌价 − 本行成交单价) × 晚数 × 间数。
+    //     行价本身仍冻结（与运营路径同一套「行价冻结、差额走售后费」哲学）。
+    let designatedHotelMetadata: Record<string, unknown> | undefined;
+    if (isSelfService) {
+      if (item.kind === OrderItemKind.BUNDLE) {
+        const meta = readJsonObject(item.metadata);
+        const prior = readJsonObject(meta.designatedHotel);
+        const priorRate = Math.max(0, Math.trunc(Number(prior.surchargeCnyPerPerson ?? 0) || 0));
+        const priorPax = Math.max(0, Math.trunc(Number(prior.pax ?? 0) || 0));
+        const pax = priorPax > 0 ? priorPax : resolveBundleOccupancy({ metadata: meta }).seatPax;
+        const newRate =
+          newRoomType.hotel.randomTierPlaceholder != null
+            ? 0
+            : Math.max(0, Math.trunc(Number(newRoomType.hotel.designationSurchargeCnyPerPerson) || 0));
+        feeCny = (newRate - priorRate) * pax;
+        designatedHotelMetadata = {
+          ...meta,
+          designatedHotel: {
+            hotelRoomTypeId: newRoomType.id,
+            hotelId: newRoomType.hotelId,
+            hotelName: newRoomType.hotel.name,
+            surchargeCnyPerPerson: newRate,
+            pax,
+            totalCny: newRate * pax,
+          },
+        };
+      } else {
+        const newUnit = newRoomType.basePrice != null ? Number(newRoomType.basePrice.toString()) : NaN;
+        if (!Number.isFinite(newUnit)) {
+          throw new BadRequestError('目标房型未配挂牌价，无法自动计算差价，请联系运营处理');
+        }
+        feeCny = Math.round((newUnit - Number(item.unitPrice.toString())) * item.quantity * roomsBilled);
+      }
+    }
 
     // ── HOTEL 行成本重打快照（Task B）：按新房型成本价 × 晚数(quantity) × 房数(roomsBilled)，
     // 口径对齐建单时的 HOTEL 行快照公式。新房型无成本价 → null（真缺数据，如实报缺）。
@@ -14056,13 +14752,13 @@ export class OrderService {
         throw new ConflictError('结算价已锁定，请先解锁再换酒店');
       }
 
-      // ── 自助窗口锁内复查（L3）───────────────────────────────────────────────
-      // 入口那次判定是锁外快照：从判完到拿锁之间订单可能已出票/已开票/已锁结算价，或者
-      // 跨过了北京业务日 24:00。拿刚锁住的这一行重跑同一份纯函数，报错文案也是同一句。
+      // ── 代理售后自助锁内复查 ───────────────────────────────────────────────
+      // 入口那次判定是锁外快照：从判完到拿锁之间订单可能已取消/进回收站。拿刚锁住的这一行
+      // 重跑同一份纯函数（HOTEL 口径：不看票，只看状态与回收站），报错文案也是同一句。
       if (actor.role === UserRole.AGENT) {
-        const window = computeAgentSelfEditWindow(order);
-        if (!window.open) {
-          throw new ForbiddenError(window.reason ?? AGENT_SELF_EDIT_REASON.NEXT_DAY);
+        const gate = computeAgentAfterSalesGate(order, 'HOTEL');
+        if (!gate.open) {
+          throw new ForbiddenError(gate.reason ?? AGENT_AFTER_SALES_REASON.DELETED);
         }
       }
 
@@ -14153,6 +14849,10 @@ export class OrderService {
                 ...(swapMetadata ? { metadata: swapMetadata as Prisma.InputJsonValue } : {}),
               }
             : {}),
+          // 代理自助换套餐指定酒店：把「指定酒店」留痕改写成新店（下次再换才有正确的加价基数）。
+          ...(designatedHotelMetadata
+            ? { metadata: designatedHotelMetadata as Prisma.InputJsonValue }
+            : {}),
         },
       });
 
@@ -14160,7 +14860,8 @@ export class OrderService {
       if (feeCny !== 0) {
         const log = appendAdjustment(order.adjustments, {
           type: 'HOTEL_SWAP_FEE',
-          label: input.feeLabel || '换酒店差价',
+          // 代理自助：费用名不吃请求体，统一系统缺省名。
+          label: isSelfService ? '换酒店差价' : input.feeLabel || '换酒店差价',
           amountCny: feeCny,
           at: new Date().toISOString(),
           by: actor.userId,
@@ -14589,7 +15290,7 @@ export class OrderService {
     orderId: string,
     itemId: string,
     input: RescheduleItemHotelBody,
-    actor: { userId: string; role: UserRole },
+    actor: { userId: string; role: UserRole; agentId?: string },
   ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
@@ -14601,11 +15302,11 @@ export class OrderService {
       untrackedNights: string[];
     };
   }> {
-    // 权限口径与机票改期/换酒店完全一致（路由层也断言一次，双闸）。
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
-      throw new ForbiddenError('仅运营/管理员可改酒店入住日期');
-    }
-    const feeCny = Math.trunc(input.feeCny ?? 0);
+    // 权限口径与机票改期/换酒店一致：运营随时可改；代理只改自家（含下级）单、入住日未过。
+    // 代理的差价不看请求体：按本行冻结单价 × 晚数变化 × 间数由系统算（见下方）。
+    const isAgentAfterSales = actor.role === UserRole.AGENT;
+    await this.assertAgentAfterSalesAllowed(orderId, actor, 'HOTEL');
+    let feeCny = isAgentAfterSales ? 0 : Math.trunc(input.feeCny ?? 0);
 
     // ── 新区间解析与校验（date-only：与建单/房控同款 UTC 零点口径）──
     // 逐字回读 ISO 日期：`2026-02-31` 这类不存在的日期会被 Date 悄悄顺延到 3 月，回读能揪出来。
@@ -14644,6 +15345,8 @@ export class OrderService {
         hotelCheckIn: true,
         hotelCheckOut: true,
         roomsBilled: true,
+        // 代理售后差价的计价基数：本行冻结的每间每晚成交价。
+        unitPrice: true,
       },
     });
     if (!item || item.orderId !== orderId) {
@@ -14667,6 +15370,20 @@ export class OrderService {
     const beforeNights = buildStayNightDates(item.hotelCheckIn, item.hotelCheckOut).length;
 
     const roomsBilled = item.roomsBilled != null ? Number(item.roomsBilled.toString()) : 1;
+    if (isAgentAfterSales) {
+      // 入住日已到/已过（北京业务日）：客人可能已在店里，挪区间要地接与酒店当面协调 → 找运营。
+      // 新区间也不许挪到过去（补录是运营的事）。
+      const today = businessDateISO(new Date());
+      if (beforeCheckIn <= today) {
+        throw new BadRequestError(AGENT_AFTER_SALES_REASON.CHECKED_IN);
+      }
+      if (input.newCheckIn < today) {
+        throw new BadRequestError('新入住日期不能早于今天，请联系运营处理');
+      }
+      // 系统差价 = 本行冻结单价（每间每晚）× 晚数变化 × 间数：多住补、少住退；同晚数纯平移 = 0。
+      // 行价本身仍冻结不动（与运营路径同一套「行价冻结、差额走售后费」哲学）。
+      feeCny = Math.round(Number(item.unitPrice.toString()) * (newNights - beforeNights) * roomsBilled);
+    }
     // 具体酒店行要按酒店维度锁包房周期 + 判物理余量；随机档行没有落到酒店，走聚合闸。
     const roomType = item.hotelRoomTypeId
       ? await prisma.hotelRoomType.findUnique({
@@ -14797,7 +15514,8 @@ export class OrderService {
       if (feeCny !== 0) {
         const log = appendAdjustment(order.adjustments, {
           type: 'HOTEL_RESCHEDULE_FEE',
-          label: input.feeLabel || '酒店改期差价',
+          // 代理售后：费用名不吃请求体（金额都不认，名字也不认），统一系统缺省名。
+          label: isAgentAfterSales ? '酒店改期差价' : input.feeLabel || '酒店改期差价',
           amountCny: feeCny,
           at: new Date().toISOString(),
           by: actor.userId,
@@ -17122,7 +17840,10 @@ export class OrderService {
     input: SplitOrderInput,
     actor: { userId: string; role: UserRole },
   ): Promise<SplitOrderResult> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    // 代理只能经「售后按人改期」编排进来拆单（viaAgentReschedule 由 reschedulePassengers 内部设置，
+    // 拆单路由的 schema 不含它）；直接调拆单端点仍旧 403。
+    const viaAgentReschedule = input.viaAgentReschedule === true && actor.role === UserRole.AGENT;
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF && !viaAgentReschedule) {
       throw new ForbiddenError('仅运营/管理员可拆单');
     }
 
@@ -18295,12 +19016,18 @@ export class OrderService {
       note?: string;
       roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
       requestToken: string;
-      /** 目标班次已起飞也放行（事后补录）。本入口只有 ADMIN/STAFF 进得来，直接透传。 */
+      /** 目标班次已起飞也放行（事后补录）。只对 ADMIN/STAFF 生效（代理入口根本不透传）。 */
       allowDepartedTarget?: boolean;
+      /**
+       * 内部专用旗子：**只**由 reschedulePassengersAsAgent 在过完「代理售后自助」闸后设置。
+       * 拆单闸与改期闸据此对代理放行；差价由 rescheduleOrderItem 锁内按系统口径算，feeCny 不透传。
+       */
+      agentAfterSales?: boolean;
     },
     actor: { userId: string; role: UserRole },
   ): Promise<ReschedulePassengersResult> {
-    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF) {
+    const isAgentAfterSales = input.agentAfterSales === true && actor.role === UserRole.AGENT;
+    if (actor.role !== UserRole.ADMIN && actor.role !== UserRole.STAFF && !isAgentAfterSales) {
       throw new ForbiddenError('仅运营/管理员可按人改期');
     }
 
@@ -18499,6 +19226,7 @@ export class OrderService {
           // 幂等键：改期与流水同一事务提交，下次同 token 重试据此回放（上面 3a）。
           requestToken: input.requestToken,
           ...(input.allowDepartedTarget ? { allowDepartedTarget: true } : {}),
+          ...(isAgentAfterSales ? { agentAfterSales: true } : {}),
         },
         actor,
       );
@@ -18573,6 +19301,8 @@ export class OrderService {
           // 编排入参留档：下次同 token 重试时 1b 据此比对（换班次/换费用/换房数 → 409），
           // 并把这次派生出的航段一起留着，供源单已无该行时的回放使用。
           orchestration: reschedulePassengersOrchestration(input, leg),
+          // 代理售后按人改期：拆单闸对这条编排放行（归属 + 未出票已在入口判过）。
+          ...(isAgentAfterSales ? { viaAgentReschedule: true } : {}),
         },
         actor,
       ));
@@ -18607,6 +19337,7 @@ export class OrderService {
             feeLabel: input.feeLabel,
             note: input.note,
             ...(input.allowDepartedTarget ? { allowDepartedTarget: true } : {}),
+            ...(isAgentAfterSales ? { agentAfterSales: true } : {}),
           },
           actor,
         );
@@ -22376,6 +23107,11 @@ export interface SplitOrderInput {
    */
   orchestration?: SplitOrchestrationSnapshot;
   requestToken: string;
+  /**
+   * 内部专用：代理售后按人改期的编排层设置 → 拆单闸对 AGENT 放行。
+   * 拆单路由的 zod schema 不含此键（z.object 默认剥未知键），请求体注入不进来。
+   */
+  viaAgentReschedule?: boolean;
 }
 
 /** 拆单执行/回放的统一响应形状。 */

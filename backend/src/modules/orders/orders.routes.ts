@@ -70,6 +70,7 @@ import {
   swapFeeOptionsBodySchema,
   swapItemHotelBodySchema,
   swapPassengerBodySchema,
+  setPassengerSingleRoomBodySchema,
   setPassengerVisaExemptBodySchema,
   updateItemSettlementPriceBodySchema,
   updatePassengerVisaDatesBodySchema,
@@ -2194,20 +2195,29 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     return result;
   });
 
-  // ── 售后改单：改期（ADMIN/STAFF）──
+  // ── 售后改单：改期（ADMIN/STAFF 任意时候；AGENT 限自家含下级的单、出票前）──
   // PATCH /orders/:id/reschedule  body: { orderItemId, newScheduleId, newCabin?, feeCny?, feeLabel?, note? }
   // 把某条 FLIGHT 行就地改到新班次/新舱位（座位先放旧再原子拿新，售罄回滚不泄漏），可选加改期费。
+  // 代理：feeCny / feeLabel / newCabin / 两个已起飞放行开关一律不透传（差价由服务端按建单口径算）；
+  // 已出票 / 已开票 / 已订座 → 403 指路改单申请（票务要去航司操作）。
   app.patch('/:id/reschedule', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF && role !== UserRole.AGENT) {
       return reply.status(403).send({ error: '仅运营/管理员可改期' });
     }
     const { id } = req.params as { id: string };
     const body = rescheduleOrderBodySchema.parse(req.body);
-    const { order, audit } = await service.rescheduleOrderItem(id, body, {
-      userId: req.user.sub,
-      role,
-    });
+    const { order, audit } =
+      role === UserRole.AGENT
+        ? await service.rescheduleOrderItemAsAgent(
+            id,
+            { orderItemId: body.orderItemId, newScheduleId: body.newScheduleId, note: body.note },
+            { userId: req.user.sub, role, agentId: (await buildRequester(req.user.sub, role)).agentId },
+          )
+        : await service.rescheduleOrderItem(id, body, {
+            userId: req.user.sub,
+            role,
+          });
     const fmt = (d: Date | null) => (d ? d.toISOString() : null);
     void writeAudit({
       actor: actorFromRequest(req),
@@ -2626,12 +2636,65 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     },
   );
 
-  // ── 售后改单：换酒店（ADMIN/STAFF）──
+  // ── 建单后按人改单住 / 拼住（ADMIN/STAFF 任意时候；AGENT 限自家含下级的单）──
+  // PATCH /orders/:id/passengers/:passengerId/single-room  body: { singleRoom, requestToken?, note? }
+  // 对称可逆的开关：单房差按套餐行建单快照费率 × 晚数由服务端算（补收 FEE 行 / 退 DISCOUNT 行，
+  // 都挂到该乘客），同步 Passenger.singleRoom 与套餐行计费房数；body 不收任何金额。
+  app.patch(
+    '/:id/passengers/:passengerId/single-room',
+    { preHandler: [app.authenticate] },
+    async (req, reply) => {
+      const role = req.user.role;
+      if (role !== UserRole.ADMIN && role !== UserRole.STAFF && role !== UserRole.AGENT) {
+        return reply.status(403).send({ error: '仅运营 / 代理可改乘客单住/拼住' });
+      }
+      const { id, passengerId } = req.params as { id: string; passengerId: string };
+      const body = setPassengerSingleRoomBodySchema.parse(req.body);
+      const requester = await buildRequester(req.user.sub, role);
+      const { order, warning, audit } = await service.setPassengerSingleRoom(id, passengerId, body, {
+        userId: req.user.sub,
+        role,
+        agentId: requester.agentId,
+      });
+      // 幂等短路（目标值与现值相同 / 同 token 回放）不写审计——什么都没发生。
+      if (audit) {
+        void writeAudit({
+          actor: actorFromRequest(req),
+          action: 'SET_PASSENGER_SINGLE_ROOM',
+          targetType: 'ORDER',
+          targetId: id,
+          targetLabel: audit.orderNumber,
+          before: {
+            passengerId: audit.passengerId,
+            passengerName: audit.passengerName,
+            singleRoom: audit.before.singleRoom,
+            roomsBilled: audit.before.roomsBilled,
+          },
+          after: {
+            singleRoom: audit.after.singleRoom,
+            roomsBilled: audit.after.roomsBilled,
+            amountCny: audit.amountCny,
+            perNightCny: audit.perNightCny,
+            nights: audit.nights,
+            itemId: audit.itemId,
+            roomControl: audit.roomControl,
+            invoicedAtChange: audit.invoicedAtChange,
+            note: body.note,
+            selfService: role === UserRole.AGENT,
+          },
+          severity: 'WARNING',
+        });
+      }
+      return { order, warning };
+    },
+  );
+
+  // ── 售后改单：换酒店（ADMIN/STAFF 任意时候；AGENT 限自家含下级的单）──
   // PATCH /orders/:id/items/:itemId/hotel  body: { newHotelRoomTypeId, feeCny?, feeLabel?, note? }
   // 价格默认冻结（绝不按新房型 basePrice 重算 unitPrice/amount）；只换住哪，可选加/减差价。
   app.patch('/:id/items/:itemId/hotel', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    // 代理放行到 service：那里按「下单当天 + 自家单」判自助窗口，并把差价强制归 0。
+    // 代理放行到 service：那里判归属（自家含下级）+ 同星级，差价按系统口径算（请求体金额不认）。
     if (role !== UserRole.ADMIN && role !== UserRole.STAFF && role !== UserRole.AGENT) {
       return reply.status(403).send({ error: '仅运营/管理员可换酒店' });
     }
@@ -2652,7 +2715,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       before: { orderItemId: audit.orderItemId, ...audit.before },
       after: {
         ...audit.after,
-        // audit.feeCny 是服务端真正生效的差价：代理自助通道恒 0（请求里填了也不认）。
+        // audit.feeCny 是服务端真正生效的差价：代理自助通道由系统按同档次口径算（请求里填了也不认）。
         feeCny: audit.feeCny,
         untrackedNights: audit.untrackedNights,
         note: body.note,
@@ -2682,14 +2745,17 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 差额由可选的 feeCny 走售后费行（缺省名「酒店改期差价」）。
   app.patch('/:id/items/:itemId/hotel-reschedule', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    // 代理放行到 service：那里判归属（自家含下级）+ 入住日未过，差价按本行单价 × 晚数变化算。
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF && role !== UserRole.AGENT) {
       return reply.status(403).send({ error: '仅运营/管理员可改酒店入住日期' });
     }
     const { id, itemId } = req.params as { id: string; itemId: string };
     const body = rescheduleItemHotelBodySchema.parse(req.body);
+    const hotelRescheduleRequester = await buildRequester(req.user.sub, role);
     const { order, audit } = await service.rescheduleItemHotel(id, itemId, body, {
       userId: req.user.sub,
       role,
+      agentId: hotelRescheduleRequester.agentId,
     });
     void writeAudit({
       actor: actorFromRequest(req),
@@ -3289,15 +3355,31 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   // 前端提示运营到新单上重试；同 requestToken 重试幂等（拆单回放 + 已改则不重复收差价）。
   app.post('/:id/reschedule-passengers', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
-    if (role !== UserRole.ADMIN && role !== UserRole.STAFF) {
+    // 代理：限自家（含下级）单、出票前；feeCny / feeLabel / newCabin / allowDepartedTarget 不透传，
+    // 差价由服务端按建单口径算（见 service.reschedulePassengersAsAgent）。
+    if (role !== UserRole.ADMIN && role !== UserRole.STAFF && role !== UserRole.AGENT) {
       return reply.status(403).send({ error: '仅运营/管理员可按人改期' });
     }
     const { id } = req.params as { id: string };
     const body = reschedulePassengersBodySchema.parse(req.body);
-    const result = await service.reschedulePassengers(id, body, {
-      userId: req.user.sub,
-      role,
-    });
+    const result =
+      role === UserRole.AGENT
+        ? await service.reschedulePassengersAsAgent(
+            id,
+            {
+              passengerIds: body.passengerIds,
+              orderItemId: body.orderItemId,
+              newScheduleId: body.newScheduleId,
+              note: body.note,
+              roomSplit: body.roomSplit,
+              requestToken: body.requestToken,
+            },
+            { userId: req.user.sub, role, agentId: (await buildRequester(req.user.sub, role)).agentId },
+          )
+        : await service.reschedulePassengers(id, body, {
+            userId: req.user.sub,
+            role,
+          });
 
     // 改期审计与单条改期口径一致（挂在**实际被改期的那张单**上：拆过则是新单）；
     // 拆单的 SPLIT_ORDER×2 与本次的 RESCHEDULE_PASSENGERS 汇总由 service 内部照记。

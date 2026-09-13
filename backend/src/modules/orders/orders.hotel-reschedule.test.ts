@@ -290,15 +290,39 @@ function mountReschedule(
 const NEW_STAY = { newCheckIn: '2026-09-05', newCheckOut: '2026-09-09' } as const;
 
 describe('rescheduleItemHotel · 入参与行类型守卫', () => {
-  it('非 ADMIN/STAFF → 拒（服务层也把关，不只靠路由）', async () => {
+  it('客户 → 拒（服务层也把关，不只靠路由）', async () => {
     await expect(
       service.rescheduleItemHotel(
         'ord-1',
         'item-1',
         { ...NEW_STAY },
-        { userId: 'a-1', role: UserRole.AGENT },
+        { userId: 'c-1', role: UserRole.CUSTOMER },
       ),
-    ).rejects.toThrow('仅运营/管理员可改酒店入住日期');
+    ).rejects.toThrow('仅运营 / 代理可自助改单');
+  });
+
+  it('代理改别人家的单 → 归属闸 403，一行订单项都不读', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue({
+      userId: null,
+      agentId: 'ag-other',
+      status: 'PAID',
+      deletedAt: null,
+      outboundInvoiced: false,
+      returnInvoiced: false,
+      systemInvoiced: false,
+      passengers: [],
+    });
+    // 代理树里只有自己（ag-1）→ ag-other 的单不在可见集合里。
+    mockPrisma.$queryRaw.mockResolvedValue([{ id: 'ag-1' }]);
+    await expect(
+      service.rescheduleItemHotel(
+        'ord-1',
+        'item-1',
+        { ...NEW_STAY },
+        { userId: 'a-1', role: UserRole.AGENT, agentId: 'ag-1' },
+      ),
+    ).rejects.toThrow('无权查看该订单');
+    expect(mockPrisma.orderItem.findUnique).not.toHaveBeenCalled();
   });
 
   it('退房日期不晚于入住日期 → 拒', async () => {

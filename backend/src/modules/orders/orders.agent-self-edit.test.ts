@@ -410,6 +410,8 @@ describe('swapItemHotel · 自助差价', () => {
       hotelCheckIn: new Date('2026-10-01T00:00:00.000Z'),
       hotelCheckOut: new Date('2026-10-03T00:00:00.000Z'),
       roomsBilled: 1,
+      // 代理自助换酒店的系统差价基数：本行成交单价 vs 新房型挂牌价（下面 rt-new 同价 → 差价 0）。
+      unitPrice: dec(500),
       unitCostCny: null,
       totalCostCny: null,
     });
@@ -427,6 +429,7 @@ describe('swapItemHotel · 自助差价', () => {
               id: 'rt-new',
               name: '海景房',
               hotelId: 'h1', // 同酒店 → needsHotelFitCheck=false，不必铺房控
+              basePrice: dec(500),
               costPriceCny: null,
               hotel: {
                 name: '椰岛酒店',
@@ -478,7 +481,7 @@ describe('swapItemHotel · 自助差价', () => {
 
   const body = { newHotelRoomTypeId: 'rt-new', feeCny: 500, feeLabel: '升级差价' };
 
-  it('代理当天自助换酒店 → 差价被强制归 0，不动 adjustmentCny', async () => {
+  it('代理自助换同价房型 → 差价由系统算得 0（请求体里的 feeCny 不认），不动 adjustmentCny', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(openOrderRow());
     const tx = mountSwap();
     const { audit } = await service.swapItemHotel('o1', 'i1', body, AGENT);
@@ -487,7 +490,7 @@ describe('swapItemHotel · 自助差价', () => {
     expect(tx.order.update).not.toHaveBeenCalled();
   });
 
-  it('运营换酒店 → 差价照原样生效（自助归零只针对代理通道）', async () => {
+  it('运营换酒店 → 差价照原样生效（系统计价只针对代理通道）', async () => {
     const tx = mountSwap();
     const { audit } = await service.swapItemHotel('o1', 'i1', body, STAFF);
     expect(audit.feeCny).toBe(500);
@@ -560,7 +563,7 @@ describe('swapItemHotel · 自助差价', () => {
         { newHotelRoomTypeId: 'rt-new', designatedHotelStarMismatchReason: '客人自己要求' },
         AGENT,
       ),
-    ).rejects.toThrow('套餐档次与酒店星级不符，请联系运营处理');
+    ).rejects.toThrow('套餐档次与酒店星级不符，请提交改档申请或联系运营处理');
     // 一个字都没落库
     expect(tx.orderItem.update).not.toHaveBeenCalled();
   });
@@ -620,7 +623,7 @@ describe('swapItemHotel · 自助差价', () => {
     );
     await expect(
       service.swapItemHotel('o1', 'i1', { newHotelRoomTypeId: 'rt-new' }, AGENT),
-    ).rejects.toThrow('当日自助只能换同星级酒店，升降星请提交改单申请');
+    ).rejects.toThrow('代理只能换同星级酒店，升降星请提交改档申请或联系运营');
     expect(tx.orderItem.update).not.toHaveBeenCalled();
   });
 
@@ -653,13 +656,19 @@ describe('swapItemHotel · 自助差价', () => {
     expect(tx.orderItem.update).toHaveBeenCalledTimes(1);
   });
 
-  it('代理次日换酒店 → 403，一行订单项都不读', async () => {
+  it('代理次日换酒店 → 不再受「下单当天」窗口约束（出票前任意时候），照常进入换酒店流程', async () => {
     mockPrisma.order.findUnique.mockResolvedValue(
       openOrderRow({ createdAt: new Date(Date.now() - 3 * DAY_MS) }),
     );
-    await expect(service.swapItemHotel('o1', 'i1', body, AGENT)).rejects.toThrow(
-      AGENT_SELF_EDIT_REASON.NEXT_DAY,
-    );
+    const tx = mountSwap();
+    const { audit } = await service.swapItemHotel('o1', 'i1', body, AGENT);
+    expect(audit.after.hotelRoomTypeId).toBe('rt-new');
+    expect(tx.orderItem.update).toHaveBeenCalledTimes(1);
+  });
+
+  it('代理换别人家的单 → 归属闸 403，一行订单项都不读', async () => {
+    mockPrisma.order.findUnique.mockResolvedValue(openOrderRow({ agentId: 'ag-other' }));
+    await expect(service.swapItemHotel('o1', 'i1', body, AGENT)).rejects.toThrow('无权查看该订单');
     expect(mockPrisma.orderItem.findUnique).not.toHaveBeenCalled();
   });
 });

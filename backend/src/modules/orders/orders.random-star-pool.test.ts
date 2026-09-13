@@ -217,10 +217,11 @@ describe('星级随机档落位：具体酒店行行为不变（回归）', () =
     ).rejects.toThrow('仅运营 / 代理可自助改单');
   });
 
-  // 代理自 0904 起有「下单当天自助换酒店」的口子（差价强制归 0）；过了当天照旧拒，
-  // 池行不因为是随机档就放宽窗口。窗口口径见 orders.agent-self-edit.test.ts。
-  it('代理过了下单当天 → 仍拒，且一行订单项都不读', async () => {
+  // 代理售后自助换酒店（2026-09-13 起不绑下单当天窗口）：随机档池行例外 —— 落位归运营/房控
+  // 按需求池统一安排，代理自己挑店等于把「N 星随机」当指定酒店买。
+  it('代理（自家单、过了下单当天）对池行落位 → 仍拒：随机档由运营统一落位', async () => {
     mockPrisma.orderItem.findUnique.mockResolvedValue(poolItem(4));
+    mockPrisma.hotelRoomType.findUnique.mockResolvedValue(targetRoomType(4));
     mockPrisma.order.findUnique.mockResolvedValue({
       userId: null,
       agentId: 'ag-1',
@@ -231,7 +232,10 @@ describe('星级随机档落位：具体酒店行行为不变（回归）', () =
       returnInvoiced: false,
       systemInvoiced: false,
       settlementLocked: false,
+      passengers: [],
     });
+    // 代理树里只有自己 → 归属闸放行，拦住它的是池行那道闸。
+    mockPrisma.$queryRaw.mockResolvedValue([{ id: 'ag-1' }]);
 
     await expect(
       service.swapItemHotel('order-1', 'item-1', swapBody, {
@@ -239,7 +243,6 @@ describe('星级随机档落位：具体酒店行行为不变（回归）', () =
         role: UserRole.AGENT,
         agentId: 'ag-1',
       }),
-    ).rejects.toThrow('下单当天可自助修改，次日起请提交改单申请');
-    expect(mockPrisma.orderItem.findUnique).not.toHaveBeenCalled();
+    ).rejects.toThrow('随机档酒店由运营统一安排落位');
   });
 });
