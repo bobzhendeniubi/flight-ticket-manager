@@ -7,7 +7,9 @@
  *   2. 机票余位不足：未确认 → 409 OVERSELL_CONFIRMATION_REQUIRED；确认后限额内超售放行 + CRITICAL 审计；
  *      超上限 → 409 OVERSELL_LIMIT_EXCEEDED；
  *   3. 酒店房量不足 → 400（走建单同一把事务内房量闸），且不碰座位账；
- *   4. 已起飞航段 / REFUNDED / 退款申请中 一律拒；
+ *   4. REFUNDED / 退款申请中 一律拒；已起飞航段（2026-09-13 起）改确认制：缺 allowFlownLegs → 409
+ *      FLOWN_LEGS_CONFIRMATION_REQUIRED；确认后已飞段不占座、只对未飞段扣座；全飞 + 付清 → 落 COMPLETED 终态，
+ *      全飞 + 未付清 → 待支付且不占座不设超时；回程已作废（returnVoidedFinal）不再拒；事务内记 WARNING 审计；
  *   5. 幂等：同 requestToken 重放不二次占座、不二次落状态；
  *   6. 支付超时：后台单 paymentExpiresAt=null 不入队；散客单 now+30min 并重入队；
  *   7. 付清单回 PAID 且履约任务重建（CANCELLED 的任务视为不存在）；
@@ -341,19 +343,256 @@ describe('restoreCancelledOrder · 取消 → 恢复重新占座', () => {
   });
 });
 
-describe('restoreCancelledOrder · 准入闸', () => {
-  it('有已起飞的航段 → 400「已起飞的航段不能恢复」', async () => {
-    mount(
-      buildOrder({
-        items: [flightItem({ flightSchedule: { departureTime: PAST, departureTz: 'Asia/Shanghai', flight: { flightNumber: 'QH9588' } } })],
+// ── 已起飞航段（2026-09-13 拍板：任一航段已起飞也要能恢复，改确认制）────────────────
+const FLOWN_SCHED = { departureTime: PAST, departureTz: 'Asia/Shanghai', flight: { flightNumber: 'QH9588' } };
+const RETURN_SCHED = { departureTime: FUTURE, departureTz: 'Asia/Ho_Chi_Minh', flight: { flightNumber: 'QH9587' } };
+
+/** 去程已飞（sched1）+ 回程未飞（sched2）的往返单。 */
+function roundTripOutboundFlown(extra: Record<string, unknown> = {}) {
+  return buildOrder({
+    items: [
+      flightItem({ id: 'out', description: 'QH9588 广州→芽庄', flightScheduleId: 'sched1', flightSchedule: FLOWN_SCHED }),
+      flightItem({ id: 'ret', description: 'QH9587 芽庄→广州', flightScheduleId: 'sched2', flightSchedule: RETURN_SCHED }),
+    ],
+    ...extra,
+  });
+}
+
+/** 全部航段都已飞的往返单。 */
+function roundTripAllFlown(extra: Record<string, unknown> = {}) {
+  return buildOrder({
+    items: [
+      flightItem({ id: 'out', description: 'QH9588 广州→芽庄', flightScheduleId: 'sched1', flightSchedule: FLOWN_SCHED }),
+      flightItem({
+        id: 'ret',
+        description: 'QH9587 芽庄→广州',
+        flightScheduleId: 'sched2',
+        flightSchedule: { ...RETURN_SCHED, departureTime: PAST },
       }),
-    );
-    await expect(
-      service.restoreCancelledOrder('ord1', { requestToken: TOKEN, allowOversell: false }, ADMIN),
-    ).rejects.toThrow(/已起飞的航段不能恢复/);
-    expect(mockPrisma.order.updateMany).not.toHaveBeenCalled();
+    ],
+    ...extra,
+  });
+}
+
+const restoreWithFlown = (actor: typeof ADMIN | typeof STAFF = ADMIN) =>
+  service.restoreCancelledOrder('ord1', { requestToken: TOKEN, allowOversell: false, allowFlownLegs: true }, actor);
+
+const statusUpdates = () =>
+  mockPrisma.order.updateMany.mock.calls.map((c) => {
+    const arg = c[0] as { where: { status?: string }; data: { status?: string } };
+    return { from: arg.where.status, to: arg.data.status };
   });
 
+describe('restoreCancelledOrder · 已起飞航段（确认制，已飞段不占座）', () => {
+  it('仅去程已飞、未带 allowFlownLegs → 409 FLOWN_LEGS_CONFIRMATION_REQUIRED，载荷分清不占座/会扣座，状态不落地', async () => {
+    mount(roundTripOutboundFlown());
+    const err = await service
+      .restoreCancelledOrder('ord1', { requestToken: TOKEN, allowOversell: false }, ADMIN)
+      .catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AppError);
+    expect((err as AppError).statusCode).toBe(409);
+    expect((err as AppError).code).toBe('FLOWN_LEGS_CONFIRMATION_REQUIRED');
+    const details = (err as AppError).details as {
+      flownLegs: Array<{ itemId: string; flightNumber: string; seatQuantity: number }>;
+      retakeLegs: Array<{ itemId: string }>;
+      returnVoidedFinal: boolean;
+      allLegsDone: boolean;
+      projectedToStatus: string;
+    };
+    expect(details.flownLegs).toEqual([expect.objectContaining({ itemId: 'out', flightNumber: 'QH9588', seatQuantity: 1 })]);
+    expect(details.retakeLegs).toEqual([expect.objectContaining({ itemId: 'ret' })]);
+    expect(details.returnVoidedFinal).toBe(false);
+    expect(details.allLegsDone).toBe(false);
+    expect(details.projectedToStatus).toBe(OrderStatus.PENDING_PAYMENT);
+    expect(mockPrisma.order.updateMany).not.toHaveBeenCalled();
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('仅去程已飞 + allowFlownLegs → 只对回程扣座，去程列入 flownLegs，事务内记 WARNING 审计', async () => {
+    mount(roundTripOutboundFlown());
+    const { audit } = await restoreWithFlown(STAFF);
+
+    expect(audit.toStatus).toBe(OrderStatus.PENDING_PAYMENT);
+    // 只有回程那一行进占座 CAS（去程被 isLegAlreadyFlown 跳过）。
+    expect(executeRawQtys()).toEqual([1]);
+    expect(audit.seatTotal).toBe(1);
+    expect(audit.seats).toEqual([expect.objectContaining({ scheduleId: 'sched2', quantity: 1 })]);
+    expect(audit.flownLegs).toEqual([expect.objectContaining({ itemId: 'out', flightNumber: 'QH9588' })]);
+    expect(audit.flownLegsConfirmed).toBe(true);
+    expect(audit.finalizedCompleted).toBe(false);
+    expect(audit.warnings.some((w) => w.includes('已起飞的航段未重新占座'))).toBe(true);
+    expect(mockPrisma.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: 'RESTORE_CANCELLED_ORDER_FLOWN_LEGS',
+          severity: 'WARNING',
+          actorUserId: 'staff-1',
+          after: expect.objectContaining({
+            flownLegs: [expect.objectContaining({ itemId: 'out' })],
+            retakeLegs: [expect.objectContaining({ itemId: 'ret' })],
+            toStatus: OrderStatus.PENDING_PAYMENT,
+          }),
+        }),
+      }),
+    );
+    // 流水留痕带确认标记。
+    const updateArg = mockPrisma.order.update.mock.calls[0][0] as {
+      data: { adjustments: Array<{ detail: Record<string, unknown> }> };
+    };
+    expect(updateArg.data.adjustments[0].detail).toEqual(
+      expect.objectContaining({ flownLegsConfirmed: true, flownLegItemIds: 'out', finalizedCompleted: false }),
+    );
+  });
+
+  it('仅去程已飞 + 回程余位不足 → 仍走既有 409 OVERSELL_CONFIRMATION_REQUIRED（两道确认可串联）', async () => {
+    mount(roundTripOutboundFlown());
+    mockPrisma.$executeRaw.mockResolvedValue(0);
+    mockPrisma.flightSeatClass.findFirst.mockResolvedValue({ capacity: 10, sold: 10 });
+    const err = await restoreWithFlown().catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(AppError);
+    expect((err as AppError).code).toBe('OVERSELL_CONFIRMATION_REQUIRED');
+    expect((err as AppError).details).toEqual(expect.objectContaining({ scheduleId: 'sched2' }));
+  });
+
+  it('全部航段已飞 + 付清 + allowFlownLegs → 先 PAID 再落 COMPLETED 终态，一座不占，不设超时', async () => {
+    mount(roundTripAllFlown({ paidAmount: new Prisma.Decimal(1000) }), { ownerRole: UserRole.CUSTOMER });
+    mockPrisma.orderStatusEvent.count.mockResolvedValue(1);
+    mockPrisma.orderItem.findMany.mockResolvedValue([
+      { id: 'out', kind: OrderItemKind.FLIGHT, bundleId: null, fulfillmentTasks: [] },
+    ]);
+
+    const { audit } = await restoreWithFlown();
+
+    expect(audit.toStatus).toBe(OrderStatus.COMPLETED);
+    expect(audit.finalizedCompleted).toBe(true);
+    expect(audit.seatTotal).toBe(0);
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+    // 状态两跳都在同一事务：CANCELLED→PAID（via restore，跑 →PAID 钩子），PAID→COMPLETED（CAS 期望 PAID）。
+    expect(statusUpdates()).toEqual([
+      { from: OrderStatus.CANCELLED, to: OrderStatus.PAID },
+      { from: OrderStatus.PAID, to: OrderStatus.COMPLETED },
+    ]);
+    expect(mockPrisma.orderStatusEvent.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ fromStatus: OrderStatus.PAID, toStatus: OrderStatus.COMPLETED, actorUserId: 'admin-1' }),
+      }),
+    );
+    // →PAID 钩子照跑：履约任务按既有口径补建。
+    expect(mockPrisma.fulfillmentTask.create).toHaveBeenCalled();
+    // 散客单也不设支付超时（终态没有超时可言）。
+    expect(audit.paymentExpiresAt).toBeNull();
+    expect(queueMocks.scheduleSeatHoldRelease).not.toHaveBeenCalled();
+    expect(audit.warnings.some((w) => w.includes('直接恢复为「已完成」'))).toBe(true);
+  });
+
+  it('全部航段已飞 + 未付清（散客单）→ 待支付应收态，一座不占，不设 30 分钟超时', async () => {
+    mount(roundTripAllFlown(), { ownerRole: UserRole.CUSTOMER });
+    const { audit } = await restoreWithFlown();
+    expect(audit.toStatus).toBe(OrderStatus.PENDING_PAYMENT);
+    expect(audit.finalizedCompleted).toBe(false);
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+    expect(statusUpdates()).toEqual([{ from: OrderStatus.CANCELLED, to: OrderStatus.PENDING_PAYMENT }]);
+    expect(audit.paymentExpiresAt).toBeNull();
+    expect(queueMocks.scheduleSeatHoldRelease).not.toHaveBeenCalled();
+  });
+
+  it('回程已过期作废（returnVoidedFinal）不再拒：未确认 409；确认后付清单落 COMPLETED', async () => {
+    const voidedReturn = flightItem({
+      id: 'ret',
+      description: 'QH9587 芽庄→广州',
+      flightScheduleId: null,
+      flightSchedule: null,
+      metadata: {
+        seatQuantity: 1,
+        returnReleased: { at: PAST.toISOString(), originalScheduleId: 'sched2' },
+        returnVoidedFinal: { at: new Date().toISOString(), byUserId: 'SYSTEM' },
+      },
+    });
+    const order = buildOrder({
+      items: [flightItem({ id: 'out', flightScheduleId: 'sched1', flightSchedule: FLOWN_SCHED }), voidedReturn],
+      paidAmount: new Prisma.Decimal(1000),
+    });
+    mount(order);
+    mockPrisma.orderStatusEvent.count.mockResolvedValue(1);
+
+    const err = await service
+      .restoreCancelledOrder('ord1', { requestToken: TOKEN, allowOversell: false }, ADMIN)
+      .catch((e: unknown) => e);
+    expect((err as AppError).code).toBe('FLOWN_LEGS_CONFIRMATION_REQUIRED');
+    expect(((err as AppError).details as { returnVoidedFinal: boolean }).returnVoidedFinal).toBe(true);
+
+    vi.resetAllMocks();
+    mount(order);
+    mockPrisma.orderStatusEvent.count.mockResolvedValue(1);
+    const { audit } = await restoreWithFlown();
+    expect(audit.returnVoidedFinal).toBe(true);
+    expect(audit.toStatus).toBe(OrderStatus.COMPLETED);
+    expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
+  });
+
+  it('去程已飞、回程仍处于「已释放」等处置 → 不落终态（回 PAID），提示走「恢复回程」', async () => {
+    const releasedReturn = flightItem({
+      id: 'ret',
+      flightScheduleId: null,
+      flightSchedule: null,
+      metadata: { seatQuantity: 1, returnReleased: { at: PAST.toISOString(), originalScheduleId: 'sched2' } },
+    });
+    mount(
+      buildOrder({
+        items: [flightItem({ id: 'out', flightScheduleId: 'sched1', flightSchedule: FLOWN_SCHED }), releasedReturn],
+        paidAmount: new Prisma.Decimal(1000),
+      }),
+    );
+    mockPrisma.orderStatusEvent.count.mockResolvedValue(1);
+    const { audit } = await restoreWithFlown();
+    expect(audit.toStatus).toBe(OrderStatus.PAID);
+    expect(audit.finalizedCompleted).toBe(false);
+    expect(audit.warnings.some((w) => w.includes('恢复回程'))).toBe(true);
+    expect(statusUpdates()).toEqual([{ from: OrderStatus.CANCELLED, to: OrderStatus.PAID }]);
+  });
+
+  it('没有已起飞航段的普通单：不需要 allowFlownLegs，flownLegsConfirmed=false', async () => {
+    mount();
+    const { audit } = await service.restoreCancelledOrder('ord1', { requestToken: TOKEN, allowOversell: false }, ADMIN);
+    expect(audit.flownLegs).toEqual([]);
+    expect(audit.flownLegsConfirmed).toBe(false);
+    expect(mockPrisma.auditLog.create).not.toHaveBeenCalled();
+  });
+
+  it('同 requestToken 回放：带回流水里的确认标记与终态标记', async () => {
+    mount(
+      buildOrder({
+        status: OrderStatus.COMPLETED,
+        adjustments: [
+          {
+            type: ORDER_RESTORED_ADJUSTMENT_TYPE,
+            label: '恢复已取消订单',
+            amountCny: 0,
+            at: new Date().toISOString(),
+            by: 'admin-1',
+            requestToken: TOKEN,
+            detail: {
+              fromStatus: 'CANCELLED',
+              toStatus: 'COMPLETED',
+              seatTotal: 0,
+              flownLegsConfirmed: true,
+              finalizedCompleted: true,
+              returnVoidedFinal: false,
+            },
+          },
+        ],
+      }),
+    );
+    const { audit } = await restoreWithFlown();
+    expect(audit.replayed).toBe(true);
+    expect(audit.toStatus).toBe(OrderStatus.COMPLETED);
+    expect(audit.flownLegsConfirmed).toBe(true);
+    expect(audit.finalizedCompleted).toBe(true);
+    expect(mockPrisma.order.updateMany).not.toHaveBeenCalled();
+  });
+});
+
+describe('restoreCancelledOrder · 准入闸', () => {
   it('REFUNDED 一律拒（钱已退）', async () => {
     mount(buildOrder({ status: OrderStatus.REFUNDED }));
     await expect(

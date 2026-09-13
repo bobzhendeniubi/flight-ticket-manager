@@ -1925,6 +1925,11 @@ export const restoreCancelledOrderBodySchema = z.object({
   // 航段余位不足时的「确认超售」回执；缺省 false → 服务端回 409 OVERSELL_CONFIRMATION_REQUIRED。
   // 只管机票座位：酒店/随机档走内部录单既有的超售限额口径，超限一律拒，不认这个位。
   allowOversell: z.boolean().default(false),
+  // 「任一航段已起飞也要能恢复」（运营需求，2026-09-13 拍板）的确认回执：
+  // 有已起飞航段（或回程已过期作废）时，缺省 false → 服务端回 409 FLOWN_LEGS_CONFIRMATION_REQUIRED，
+  // 载荷列出哪些航段已起飞（不再占座）、哪些会重新扣座；运营确认后带 true 重提。
+  // 与 allowOversell 可串联：先过这一道，再由重新占座分支判余位。
+  allowFlownLegs: z.boolean().default(false),
   note: z.string().max(200).optional(),
 });
 export type RestoreCancelledOrderBody = z.infer<typeof restoreCancelledOrderBodySchema>;

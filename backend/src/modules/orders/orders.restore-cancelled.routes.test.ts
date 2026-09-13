@@ -57,6 +57,10 @@ const baseAudit = {
   invoiceCapWarnings: [],
   warnings: [],
   commissionsReaccrued: false,
+  flownLegs: [],
+  flownLegsConfirmed: false,
+  returnVoidedFinal: false,
+  finalizedCompleted: false,
   replayed: false,
 };
 
@@ -110,7 +114,7 @@ describe('POST /orders/:id/restore-cancelled', () => {
     expect(res.json()).toEqual({ order: { id: 'o1' }, audit: baseAudit });
     expect(serviceMocks.restoreCancelledOrder).toHaveBeenCalledWith(
       'o1',
-      { requestToken: TOKEN, allowOversell: true, note: '客人又要走了' },
+      { requestToken: TOKEN, allowOversell: true, allowFlownLegs: false, note: '客人又要走了' },
       { userId: 'u-STAFF', role: UserRole.STAFF },
     );
     expect(writeAudit).toHaveBeenCalledWith(
@@ -132,6 +136,28 @@ describe('POST /orders/:id/restore-cancelled', () => {
     });
     const res = await call(UserRole.ADMIN, { requestToken: TOKEN, allowOversell: true });
     expect(res.statusCode).toBe(200);
+    expect(writeAudit).not.toHaveBeenCalled();
+  });
+
+  it('已起飞航段确认放行 → 透传 allowFlownLegs，路由不再重复记审计（WARNING 已在 service 事务内落）', async () => {
+    serviceMocks.restoreCancelledOrder.mockResolvedValue({
+      order: { id: 'o1' },
+      audit: {
+        ...baseAudit,
+        toStatus: 'COMPLETED',
+        seatTotal: 0,
+        flownLegs: [{ itemId: 'i1', itemLabel: 'QH9588 广州→芽庄', flightNumber: 'QH9588', departureDate: '2026-09-01', seatQuantity: 1 }],
+        flownLegsConfirmed: true,
+        finalizedCompleted: true,
+      },
+    });
+    const res = await call(UserRole.STAFF, { requestToken: TOKEN, allowFlownLegs: true });
+    expect(res.statusCode).toBe(200);
+    expect(serviceMocks.restoreCancelledOrder).toHaveBeenCalledWith(
+      'o1',
+      { requestToken: TOKEN, allowOversell: false, allowFlownLegs: true },
+      { userId: 'u-STAFF', role: UserRole.STAFF },
+    );
     expect(writeAudit).not.toHaveBeenCalled();
   });
 

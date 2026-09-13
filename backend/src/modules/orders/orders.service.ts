@@ -435,6 +435,20 @@ export type RetakenSeatRecord = {
 };
 
 /**
+ * 恢复时逐航段的去向（409 FLOWN_LEGS_CONFIRMATION_REQUIRED 载荷、审计 after、响应 audit 同用这个形状）。
+ * 已起飞的航段列在 flownLegs（不再占座）；仍在班次上且未起飞的列在 retakeLegs（会重新扣座）。
+ */
+export type RestoreLegRecord = {
+  itemId: string;
+  itemLabel: string;
+  flightNumber: string;
+  /** 班次出发日（按 departureTz 折算的本地日期）；班次时间缺失时为 null。 */
+  departureDate: string | null;
+  /** 该行的占座数口径（婴儿不占座，同 flightSeatQuantity）。 */
+  seatQuantity: number;
+};
+
+/**
  * _updateStatusWithinTx 的内部调用选项——只给服务内部的编排函数用，绝不经路由透传：
  *   · via:'restore'：restoreCancelledOrder 专用，放行 CANCELLED/PAYMENT_TIMEOUT → PENDING_PAYMENT/PAID
  *     这条边，并把重新占座分支的「余位不足」从 400 换成可二次确认的 409（allowOversell 放行超售）。
@@ -5369,9 +5383,21 @@ export class OrderService {
    *
    * 准入（全部 fail-closed）：
    *   · 状态 ∈ {CANCELLED, PAYMENT_TIMEOUT}；REFUNDED 一律拒（钱已退，要重开请重新下单）；
-   *   · 未软删；无处理中的退款申请（先批准/驳回再来）；
-   *   · 无已起飞航段（飞过的座位早被真实消耗，占回来是给过去的班次凭空加 sold，永久卡账）；
-   *   · 回程未走到「起飞后作废」终态。
+   *   · 未软删；无处理中的退款申请（先批准/驳回再来）。
+   * 已起飞航段（2026-09-13 拍板「任何一段已经起飞也要可以恢复」，改确认制）：
+   *   · 已起飞的航段**不再占座**（飞过的座位早被真实消耗，占回来是给过去的班次凭空加 sold，永久卡账——
+   *     _updateStatusWithinTx 的重新占座分支本就按 isLegAlreadyFlown 跳过，这里只是不再整单拒）；
+   *     只对还没起飞、仍在班次上的航段重新扣座，余位不够照旧 409 OVERSELL_CONFIRMATION_REQUIRED；
+   *   · 有已起飞航段或回程已「起飞后作废」（returnVoidedFinal）→ 缺 allowFlownLegs 时回 409
+   *     FLOWN_LEGS_CONFIRMATION_REQUIRED，载荷列出 flownLegs（不占座）/ retakeLegs（会扣座）；
+   *     运营确认后带 allowFlownLegs 重提，事务内记 WARNING 审计 RESTORE_CANCELLED_ORDER_FLOWN_LEGS；
+   *   · 全部航段都已起飞（或回程已作废，且没有仍处于「已释放」等处置的回程行）：
+   *       付清 → 先按既有 via:'restore' 恢复到 PAID（跑 →PAID 钩子：佣金恢复计提 / 履约任务补建 /
+   *              PENDING 支付作废），再在同一事务里落 COMPLETED 终态（PAID→COMPLETED 是占座→占座，
+   *              状态机对 COMPLETED 没有任何副作用钩子，见 _finalizeRestoredFlownOrderWithinTx）；
+   *       未付清 → PENDING_PAYMENT（应收态）且不占座、不设支付超时（没有座位可放，超时只会把单再取消一次）。
+   *   · 与 no-show「恢复回程」（_assessRestoreReturnLeg）口径不同：那条按**关柜**时刻判起飞、且要把
+   *     已释放的回程重新占回原班次；这里按**计划起飞时刻**（isLegAlreadyFlown）判、已飞段一律不占。
    * 库存：
    *   · 机票按 flightSeatQuantity（婴儿不占座）走 _updateStatusWithinTx 既有的重新占座分支
    *    （FOR UPDATE + 他人锁位 + 占位单 held + CAS），不另抄一份；余位不足 → 409 OVERSELL_CONFIRMATION_REQUIRED，
@@ -5479,6 +5505,10 @@ export class OrderService {
           commissionsReaccrued: d.commissionsReaccrued === true,
           commissionsReaccruedCny:
             typeof d.commissionsReaccruedCny === 'number' ? d.commissionsReaccruedCny : 0,
+          flownLegs: [],
+          flownLegsConfirmed: d.flownLegsConfirmed === true,
+          returnVoidedFinal: d.returnVoidedFinal === true,
+          finalizedCompleted: d.finalizedCompleted === true,
           replayed: true,
         } satisfies RestoreCancelledOrderAudit;
       }
@@ -5504,30 +5534,31 @@ export class OrderService {
       if (hasPendingRefund) {
         blockers.push('本单还有处理中的退款申请，请先由财务批准或驳回该退款，再恢复订单。');
       }
-      const now = new Date();
-      for (const item of order.items) {
-        if (item.kind !== OrderItemKind.FLIGHT || !item.flightScheduleId) continue;
-        if (isLegAlreadyFlown(item, now.getTime())) {
-          const sched = item.flightSchedule;
-          const flightNo = sched?.flight?.flightNumber ?? '航班未知';
-          const day = sched?.departureTime
-            ? localDateISO(sched.departureTime, sched.departureTz)
-            : '日期未知';
-          blockers.push(`已起飞的航段不能恢复：${item.description}（${flightNo} ${day}）。`);
-        }
-      }
-      const releaseState = resolveReturnReleaseState(order.items);
-      if (releaseState.voidedFinal) {
-        blockers.push('本单回程已过期作废（原班次已飞完），不能恢复。');
-      }
       if (blockers.length > 0) throw new BadRequestError(blockers.join('；'));
 
-      const warnings: string[] = [];
-      if (releaseState.releasedNow && releaseState.item?.flightScheduleId == null) {
-        warnings.push(
-          '回程航段仍处于「已释放」状态，本次恢复不会占回回程座位；客人若要回程，恢复后请再用「恢复回程」。',
-        );
+      // ── 1b. 航段去向分类（2026-09-13 拍板：任一航段已起飞也要能恢复，改确认制）──
+      // 已起飞的航段不再挡恢复、也**不重新占座**（座位早随班次消耗；重新占座分支按同一把
+      // isLegAlreadyFlown 跳过，这里只是把结论提前算出来给运营看、给审计留）；未起飞且仍在班次上
+      // 的航段照旧重新扣座。回程已「起飞后作废」（returnVoidedFinal）同样不再挡，只是不占座。
+      const now = new Date();
+      const flownLegs: RestoreLegRecord[] = [];
+      const retakeLegs: RestoreLegRecord[] = [];
+      for (const item of order.items) {
+        if (item.kind !== OrderItemKind.FLIGHT || !item.flightScheduleId) continue;
+        const rec = describeRestoreLeg(item);
+        if (isLegAlreadyFlown(item, now.getTime())) flownLegs.push(rec);
+        else retakeLegs.push(rec);
       }
+      const releaseState = resolveReturnReleaseState(order.items);
+      const returnVoidedFinal = releaseState.voidedFinal;
+      const returnStillReleased =
+        releaseState.releasedNow && releaseState.item?.flightScheduleId == null;
+      const hasFlightRows = order.items.some((it) => it.kind === OrderItemKind.FLIGHT);
+      const needsFlownConfirmation = flownLegs.length > 0 || returnVoidedFinal;
+      // 「没有任何航段还能占」：有航段的单、没有可重新扣座的段、且不存在仍等处置的已释放回程
+      //（那种要留给「恢复回程」/ 自动作废收口，不能替它拍板成终态）。
+      const allLegsDone =
+        hasFlightRows && needsFlownConfirmation && retakeLegs.length === 0 && !returnStillReleased;
 
       // ── 2. 目标状态：原本付清过且实收仍覆盖应收 → PAID；否则 PENDING_PAYMENT ──
       const paidNum = round2(Number(order.paidAmount.toString()));
@@ -5535,10 +5566,62 @@ export class OrderService {
       const paidEventCount = await tx.orderStatusEvent.count({
         where: { orderId, toStatus: OrderStatus.PAID },
       });
-      const toStatus: OrderStatus =
-        paidEventCount > 0 && paidNum + 0.001 >= dueNum
-          ? OrderStatus.PAID
-          : OrderStatus.PENDING_PAYMENT;
+      const settledAsPaid = paidEventCount > 0 && paidNum + 0.001 >= dueNum;
+      // 交给 _updateStatusWithinTx（via:'restore' 只放行这两条边）的目标；
+      // 全部航段都已起飞且付清的单，随后在同一事务里再落 COMPLETED 终态（见 4b）。
+      const restoreToStatus: OrderStatus = settledAsPaid
+        ? OrderStatus.PAID
+        : OrderStatus.PENDING_PAYMENT;
+      const finalizedCompleted = allLegsDone && settledAsPaid;
+      const toStatus: OrderStatus = finalizedCompleted ? OrderStatus.COMPLETED : restoreToStatus;
+
+      // ── 2b. 已起飞航段确认闸：缺 allowFlownLegs → 409，载荷把去向讲清楚，运营确认后重提 ──
+      if (needsFlownConfirmation && input.allowFlownLegs !== true) {
+        const flownZh = flownLegs.map((l) => `${l.itemLabel}（${l.flightNumber} ${l.departureDate ?? '日期未知'}）`);
+        const parts: string[] = [];
+        if (flownZh.length > 0) parts.push(`已起飞的航段不再占座：${flownZh.join('、')}`);
+        if (returnVoidedFinal) parts.push('回程已过期作废，不再占座');
+        parts.push(
+          retakeLegs.length > 0
+            ? `仅对未起飞的航段重新扣座：${retakeLegs.map((l) => l.itemLabel).join('、')}`
+            : finalizedCompleted
+              ? '本单没有可重新占座的航段，恢复后将直接落「已完成」'
+              : '本单没有可重新占座的航段，恢复后落待支付（应收态），不占座',
+        );
+        throw new AppError(`${parts.join('；')}。确认后可继续恢复。`, {
+          statusCode: 409,
+          code: 'FLOWN_LEGS_CONFIRMATION_REQUIRED',
+          details: {
+            flownLegs,
+            retakeLegs,
+            returnVoidedFinal,
+            allLegsDone,
+            projectedToStatus: toStatus,
+          },
+        });
+      }
+
+      const warnings: string[] = [];
+      if (returnStillReleased) {
+        warnings.push(
+          '回程航段仍处于「已释放」状态，本次恢复不会占回回程座位；客人若要回程，恢复后请再用「恢复回程」。',
+        );
+      }
+      if (flownLegs.length > 0) {
+        warnings.push(
+          `已起飞的航段未重新占座（座位已随班次消耗）：${flownLegs.map((l) => l.itemLabel).join('、')}。`,
+        );
+      }
+      if (returnVoidedFinal) {
+        warnings.push('回程已过期作废，本次恢复不占回回程座位。');
+      }
+      if (allLegsDone) {
+        warnings.push(
+          finalizedCompleted
+            ? '本单所有航段均已起飞，已直接恢复为「已完成」，未重新占座。'
+            : '本单所有航段均已起飞，已恢复为待支付（应收态），未重新占座、不设支付超时。',
+        );
+      }
 
       // ── 3. 酒店 / 随机档房量闸（建单同一把带行锁的事务内闸；订单仍是取消态，本单未计入占用）──
       const stays: ProspectiveHotelStay[] = order.items
@@ -5566,13 +5649,16 @@ export class OrderService {
         maxOversellRooms: RANDOM_TIER_INTERNAL_NO_CAP,
       });
 
-      // ── 4. 状态落地 + 重新占座（既有分支）+ 开票额度复检 + →PAID 钩子 ──
+      // ── 4. 状态落地 + 重新占座（既有分支，已起飞段自动跳过）+ 开票额度复检 + →PAID 钩子 ──
+      const restoreReason = needsFlownConfirmation
+        ? '恢复已取消订单（已起飞航段不占座，仅未起飞航段重新占座）'
+        : '恢复已取消订单（重新占座）';
       await this._updateStatusWithinTx(
         tx,
         orderId,
-        toStatus,
+        restoreToStatus,
         requester,
-        note ? `恢复已取消订单（重新占座）：${note}` : '恢复已取消订单（重新占座）',
+        note ? `${restoreReason}：${note}` : restoreReason,
         pendingFulfillmentTaskIds,
         undefined,
         undefined,
@@ -5584,6 +5670,10 @@ export class OrderService {
           commissionReaccrualOut: commissionReaccrual,
         },
       );
+      // ── 4b. 全部航段已起飞且付清：PAID → COMPLETED 终态（同一事务；→PAID 钩子已跑完）──
+      if (finalizedCompleted) {
+        await this._finalizeRestoredFlownOrderWithinTx(tx, orderId, requester, note);
+      }
       const commissionsReaccrued = commissionReaccrual.records.length > 0;
       warnings.push(...commissionReaccrual.warnings);
       // 回待支付的代理单：佣金要等收款推到已支付时才恢复计提，先把话说在前面（只在确有冲销记录时提示）。
@@ -5604,8 +5694,10 @@ export class OrderService {
         const owner = await tx.user.findUnique({ where: { id: order.userId }, select: { role: true } });
         staffEntered = owner != null && STAFF_ENTRY_ROLES.includes(owner.role);
       }
+      // 全部航段已起飞的散客单也不设超时：超时释放的意义是放座，这里一座没占，
+      // 再排一个 30 分钟只会把运营刚恢复的应收单再取消一次。
       const paymentExpiresAt =
-        toStatus === OrderStatus.PENDING_PAYMENT && !staffEntered
+        toStatus === OrderStatus.PENDING_PAYMENT && !staffEntered && !allLegsDone
           ? new Date(now.getTime() + RETAIL_PAYMENT_TIMEOUT_MS)
           : null;
 
@@ -5619,7 +5711,9 @@ export class OrderService {
         type: ORDER_RESTORED_ADJUSTMENT_TYPE,
         label:
           `恢复已取消订单：${zhStatus(order.status)} → ${zhStatus(toStatus)}` +
-          `（重新占座 ${seatTotal} 座${oversold ? `，超售 ${oversoldBy} 座` : ''}，钱款不动` +
+          `（重新占座 ${seatTotal} 座${oversold ? `，超售 ${oversoldBy} 座` : ''}` +
+          `${flownLegs.length > 0 ? `，已起飞 ${flownLegs.length} 段不占座` : ''}` +
+          `${returnVoidedFinal ? '，回程已作废不占座' : ''}，钱款不动` +
           `${commissionsReaccrued ? `，代理佣金恢复计提 ¥${commissionReaccrual.totalCny}` : ''}）`,
         amountCny: 0,
         at: now.toISOString(),
@@ -5636,6 +5730,11 @@ export class OrderService {
           paymentExpiresAt: paymentExpiresAt ? paymentExpiresAt.toISOString() : null,
           commissionsReaccrued,
           commissionsReaccruedCny: commissionReaccrual.totalCny,
+          flownLegsConfirmed: needsFlownConfirmation,
+          // 流水 detail 只收标量：逐段明细在 RESTORE_CANCELLED_ORDER_FLOWN_LEGS 审计里，这里留行 id 便于回查。
+          flownLegItemIds: flownLegs.map((l) => l.itemId).join(','),
+          returnVoidedFinal,
+          finalizedCompleted,
         },
       });
       await tx.order.update({
@@ -5646,6 +5745,44 @@ export class OrderService {
       // ── 7. 回待支付：签证任务按建单口径补回（取消时被终态化成 CANCELLED，不补就从签证台消失到付款）──
       if (toStatus === OrderStatus.PENDING_PAYMENT) {
         await createVisaTaskAtCreation(tx, orderId, { reviveCancelled: true });
+      }
+
+      // ── 7b. 已起飞航段放行的 WARNING 审计——与状态落地同一事务（flownLegs + 操作人是事后唯一现场）──
+      // 路由层的普通 RESTORE_CANCELLED_ORDER 审计对这一档不再重复记（同超售那一档的处理）。
+      if (needsFlownConfirmation) {
+        const flownZh = flownLegs.map((l) => `${l.itemLabel} ${l.flightNumber} ${l.departureDate ?? ''}`.trim());
+        await writeAuditWithinTx(tx, {
+          actor: { userId: actor.userId, role: actor.role },
+          action: 'RESTORE_CANCELLED_ORDER_FLOWN_LEGS',
+          targetType: AuditTargetType.ORDER,
+          targetId: orderId,
+          targetLabel:
+            `${order.orderNumber} · 恢复订单放行已起飞航段` +
+            `（${flownZh.length > 0 ? flownZh.join('、') : '回程已作废'}；${zhStatus(toStatus)}）`,
+          before: { status: order.status },
+          after: {
+            fromStatus: order.status,
+            toStatus,
+            flownLegs,
+            retakeLegs,
+            returnVoidedFinal,
+            finalizedCompleted,
+            seats: retakenSeats,
+            seatTotal,
+            oversold,
+            oversoldBy,
+            displacedReserved,
+            hotelOversold,
+            randomTierOversold,
+            paymentExpiresAt: paymentExpiresAt ? paymentExpiresAt.toISOString() : null,
+            invoiceCapWarnings,
+            commissionsReaccrued,
+            commissionsReaccruedCny: commissionReaccrual.totalCny,
+            note,
+            replayed: false,
+          },
+          severity: AuditSeverity.WARNING,
+        });
       }
 
       // ── 8. 超售 / 挤占预留的 CRITICAL 审计——**必须与占座同一事务**（口径同恢复回程）──
@@ -5678,6 +5815,9 @@ export class OrderService {
             hotelOversold,
             randomTierOversold,
             paymentExpiresAt: paymentExpiresAt ? paymentExpiresAt.toISOString() : null,
+            flownLegs,
+            returnVoidedFinal,
+            finalizedCompleted,
             note,
             replayed: false,
           },
@@ -5701,6 +5841,10 @@ export class OrderService {
         warnings,
         commissionsReaccrued,
         commissionsReaccruedCny: commissionReaccrual.totalCny,
+        flownLegs,
+        flownLegsConfirmed: needsFlownConfirmation,
+        returnVoidedFinal,
+        finalizedCompleted,
         replayed: false,
       } satisfies RestoreCancelledOrderAudit;
     });
@@ -5733,6 +5877,44 @@ export class OrderService {
       include: ORDER_FULL_INCLUDE,
     });
     return { order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)), audit };
+  }
+
+  /**
+   * restoreCancelledOrder 专用：全部航段都已起飞（或回程已作废）且原本付清的单，
+   * 在 via:'restore' 恢复到 PAID 之后、同一事务里落 COMPLETED 终态。
+   *
+   * 为什么不走 _updateStatusWithinTx：状态机白名单里 PAID→COMPLETED 不是一条边（要经 TICKETED，
+   * 而 TICKETED 是航段开票标记的派生），via:'restore' 也只放行取消族→待支付/已支付；ADMIN force
+   * 又把 STAFF 挡在门外。这里逐项对照过该函数对 COMPLETED 的处理（截至 2026-09-13）：
+   *   · PAID→COMPLETED 是占座态→占座态（SEAT_HOLDING_STATUSES 两边都在），座位账零动作；
+   *   · COMPLETED 不在 FULFILLMENT_TERMINATING_STATUSES / SEAT_RELEASING_STATUSES，无履约终态化、无佣金冲销；
+   *   · 没有 →COMPLETED 专属钩子（Refund 同步只看 REFUNDED/CANCELLED/REFUND_REQUESTED）。
+   * 所以等价动作只有两件：CAS 状态 + 状态事件。→PAID 钩子（佣金恢复计提、履约任务补建、PENDING 支付作废）
+   * 已在前一步跑完，不在此重复。若日后状态机给 COMPLETED 加了钩子，这里要同步。
+   */
+  private async _finalizeRestoredFlownOrderWithinTx(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    requester: OrderRequester,
+    note: string | null,
+  ): Promise<void> {
+    const cas = await tx.order.updateMany({
+      where: { id: orderId, status: OrderStatus.PAID },
+      data: { status: OrderStatus.COMPLETED },
+    });
+    if (cas.count !== 1) {
+      throw new ConflictError('订单状态已被并发修改（期望「已支付」，请重试）');
+    }
+    const reason = '恢复已取消订单：所有航段均已起飞，直接落已完成（未重新占座）';
+    await tx.orderStatusEvent.create({
+      data: {
+        orderId,
+        fromStatus: OrderStatus.PAID,
+        toStatus: OrderStatus.COMPLETED,
+        actorUserId: requester.userId,
+        reason: note ? `${reason}：${note}` : reason,
+      },
+    });
   }
 
   /**
@@ -21840,6 +22022,20 @@ export interface RestoreCancelledOrderAudit {
   commissionsReaccrued: boolean;
   /** 恢复计提的佣金合计（CNY）；未恢复为 0。 */
   commissionsReaccruedCny: number;
+  /**
+   * 已起飞、本次**没有**重新占座的航段（座位早随班次消耗；2026-09-13 起允许恢复，需运营确认）。
+   * 回放时为空数组，只带 flownLegsConfirmed。
+   */
+  flownLegs: RestoreLegRecord[];
+  /** 本次是否走了「已起飞航段 / 回程已作废」的确认放行（allowFlownLegs=true 才能到这里）。 */
+  flownLegsConfirmed: boolean;
+  /** 回程是否已处于「起飞后作废」终态（恢复时不再占座，也不再挡恢复）。 */
+  returnVoidedFinal: boolean;
+  /**
+   * 全部航段都已起飞（或回程已作废）且原本付清 → 恢复后直接落「已完成」终态（没有座位可占、没有履约可做）。
+   * 未付清的同类单落待支付（应收态）且不占座、不设支付超时。
+   */
+  finalizedCompleted: boolean;
   replayed: boolean;
 }
 
@@ -24633,6 +24829,31 @@ function isLegAlreadyFlown(
 ): boolean {
   const departAt = item.flightSchedule?.departureTime ?? null;
   return departAt != null && departAt.getTime() <= atMs;
+}
+
+/**
+ * 已取消单恢复：把一条 FLIGHT 行摘成给运营看 / 给审计留的航段去向记录（RestoreLegRecord）。
+ * 出发日按 departureTz 折算（全站展示同一口径）；座位数走 flightSeatQuantity（婴儿不占座）。
+ */
+function describeRestoreLeg(item: {
+  id: string;
+  description: string;
+  quantity: number;
+  metadata: Prisma.JsonValue | null;
+  flightSchedule?: {
+    departureTime: Date | null;
+    departureTz: string | null;
+    flight?: { flightNumber: string | null } | null;
+  } | null;
+}): RestoreLegRecord {
+  const sched = item.flightSchedule ?? null;
+  return {
+    itemId: item.id,
+    itemLabel: item.description,
+    flightNumber: sched?.flight?.flightNumber ?? '航班未知',
+    departureDate: sched?.departureTime ? localDateISO(sched.departureTime, sched.departureTz) : null,
+    seatQuantity: flightSeatQuantity(item),
+  };
 }
 
 /**

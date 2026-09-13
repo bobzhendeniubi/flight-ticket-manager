@@ -1278,9 +1278,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   );
 
   // POST /orders/:id/restore-cancelled — 已取消 / 支付超时的订单恢复占位（ADMIN + STAFF；代理 403）。
-  //   body: { requestToken, allowOversell?, note? }。已取消 → 待支付（原本付清过且实收仍覆盖应收 → 已支付），
+  //   body: { requestToken, allowOversell?, allowFlownLegs?, note? }。已取消 → 待支付（原本付清过且实收仍覆盖应收 → 已支付），
   //   重新扣座 / 占房；机票余位不足 → 409 OVERSELL_CONFIRMATION_REQUIRED（前端二次确认后带 allowOversell 重提，
   //   超售放行按最高等级留痕）；酒店/随机档走内部录单既有超售限额，超限 400。同 requestToken 重试只回放。
+  //   有已起飞航段 / 回程已作废 → 409 FLOWN_LEGS_CONFIRMATION_REQUIRED（确认后带 allowFlownLegs 重提：已起飞段不占座、
+  //   只对未起飞段扣座；全飞且付清直接落已完成），这一档的 WARNING 审计在 service 事务内落，这里不再重复记。
   //   与上面 /:id/restore（回收站恢复，只翻 deletedAt）是两件事：那条从不动座位账，这条就是为了重新占座。
   app.post(
     '/:id/restore-cancelled',
@@ -1292,9 +1294,14 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         userId: req.user.sub,
         role: req.user.role,
       });
-      // 超售 / 挤占预留的 CRITICAL 审计已在 service 的占座事务里写过（与占座同生共死），
-      // 这里只记普通恢复那一档，免得同一次放行在审计里出现两次；回放不再记。
-      if (!audit.replayed && !audit.oversold && audit.displacedReserved === 0) {
+      // 超售 / 挤占预留的 CRITICAL 审计、已起飞航段放行的 WARNING 审计都已在 service 的占座事务里写过
+      //（与占座同生共死），这里只记普通恢复那一档，免得同一次放行在审计里出现两次；回放不再记。
+      if (
+        !audit.replayed &&
+        !audit.oversold &&
+        audit.displacedReserved === 0 &&
+        !audit.flownLegsConfirmed
+      ) {
         void writeAudit({
           actor: actorFromRequest(req),
           action: 'RESTORE_CANCELLED_ORDER',

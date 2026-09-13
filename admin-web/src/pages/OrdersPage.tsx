@@ -5402,29 +5402,66 @@ function OrderDrawer({
           `订单将从「${orderStatusLabel(o.status)}」恢复为待支付（此前已付清的单恢复为已支付），` +
           '系统会按原航段、原酒店重新扣座扣房；余位/房量不足会被拒绝并说明原因。\n\n' +
           '后台/代理录入的单恢复后不会自动超时释放；前台散客单重新给 30 分钟支付时限。\n' +
-          '钱款与收款记录不动；退款申请中、已退款、航段已起飞的单不能恢复。',
+          '钱款与收款记录不动；退款申请中、已退款的单不能恢复。' +
+          '已有航段起飞的单可以恢复，但已起飞的航段不会再占座（系统会再确认一次）。',
         tone: 'danger',
         confirmText: '恢复并重新占座',
       });
       if (!ok) return;
       const requestToken = crypto.randomUUID();
       setRestoringCancelled(true);
-      const submit = (allowOversell?: boolean) =>
-        api.restoreCancelledOrder(token, o.id, { requestToken, allowOversell });
-      let res: RestoreCancelledOrderResult;
-      try {
-        res = await submit();
-      } catch (e) {
-        // 只有「余位不足、后端允许超售放行」这一种失败可以二次确认重提；其余原因原样弹出。
-        if (!(e instanceof ApiError) || e.code !== OVERSELL_CONFIRMATION_REQUIRED_CODE) throw e;
-        const again = await confirm({
-          title: '航段余位不足，确认超售恢复？',
-          body: `${e.message}\n\n确认后将超出该舱位余位直接占座并记关键审计；超过系统超售上限仍会被拒绝。`,
-          tone: 'danger',
-          confirmText: '确认超售并恢复',
-        });
-        if (!again) return;
-        res = await submit(true);
+      // 两道可串联的二次确认（同一个 requestToken 重提，幂等键不换）：
+      //   ① FLOWN_LEGS_CONFIRMATION_REQUIRED：有已起飞航段 / 回程已作废 → 列出不占座的航段，确认后带 allowFlownLegs；
+      //   ② OVERSELL_CONFIRMATION_REQUIRED：未起飞航段余位不足 → 确认后再带 allowOversell。
+      // 其余失败原因原样弹出。
+      const flags: { allowFlownLegs?: boolean; allowOversell?: boolean } = {};
+      const submit = () => api.restoreCancelledOrder(token, o.id, { requestToken, ...flags });
+      let res: RestoreCancelledOrderResult | null = null;
+      while (res === null) {
+        try {
+          res = await submit();
+        } catch (e) {
+          if (!(e instanceof ApiError)) throw e;
+          if (e.code === FLOWN_LEGS_CONFIRMATION_REQUIRED_CODE && !flags.allowFlownLegs) {
+            const d = flownLegsConfirmationDetails(e);
+            const legLine = (l: { itemLabel: string; flightNumber: string; departureDate: string | null }) =>
+              `· ${l.itemLabel}（${l.flightNumber}${l.departureDate ? ` ${l.departureDate}` : ''}）`;
+            const sections: string[] = [];
+            if (d.flownLegs.length > 0) {
+              sections.push(`以下航段已起飞，恢复后不会再占座（座位已随班次消耗）：\n${d.flownLegs.map(legLine).join('\n')}`);
+            }
+            if (d.returnVoidedFinal) sections.push('回程已过期作废，恢复后不会占回回程座位。');
+            sections.push(
+              d.retakeLegs.length > 0
+                ? `只对未起飞的航段重新扣座：\n${d.retakeLegs.map(legLine).join('\n')}`
+                : d.projectedToStatus === 'COMPLETED'
+                  ? '本单没有可重新占座的航段，恢复后将直接落「已完成」。'
+                  : '本单没有可重新占座的航段，恢复后落待支付（应收态），不占座、不设支付超时。',
+            );
+            sections.push('钱款不动；取消时冲销的代理佣金按既有口径恢复计提。本次放行会记审计。');
+            const again = await confirm({
+              title: '订单含已起飞航段，确认恢复？',
+              body: sections.join('\n\n'),
+              tone: 'danger',
+              confirmText: '确认，已起飞航段不占座',
+            });
+            if (!again) return;
+            flags.allowFlownLegs = true;
+            continue;
+          }
+          if (e.code === OVERSELL_CONFIRMATION_REQUIRED_CODE && !flags.allowOversell) {
+            const again = await confirm({
+              title: '航段余位不足，确认超售恢复？',
+              body: `${e.message}\n\n确认后将超出该舱位余位直接占座并记关键审计；超过系统超售上限仍会被拒绝。`,
+              tone: 'danger',
+              confirmText: '确认超售并恢复',
+            });
+            if (!again) return;
+            flags.allowOversell = true;
+            continue;
+          }
+          throw e;
+        }
       }
       onOrderUpdated?.(res.order);
       bumpSeats();

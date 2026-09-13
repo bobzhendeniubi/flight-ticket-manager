@@ -4137,8 +4137,27 @@ export interface RestoreCancelledOrderResult {
     commissionsReaccrued: boolean;
     /** 恢复计提的佣金合计（CNY）；未恢复为 0。 */
     commissionsReaccruedCny: number;
+    /** 已起飞、本次没有重新占座的航段（2026-09-13 起允许恢复，需运营确认）。回放时为空数组。 */
+    flownLegs: RestoreLegRecord[];
+    /** 本次是否走了「已起飞航段 / 回程已作废」的确认放行。 */
+    flownLegsConfirmed: boolean;
+    /** 回程是否已处于「起飞后作废」终态（不再占座，也不再挡恢复）。 */
+    returnVoidedFinal: boolean;
+    /** 全部航段已起飞且付清 → 恢复后直接落「已完成」终态。 */
+    finalizedCompleted: boolean;
     replayed: boolean;
   };
+}
+
+/** 恢复已取消订单时逐航段的去向记录（409 FLOWN_LEGS_CONFIRMATION_REQUIRED 载荷与回包 audit 同用）。 */
+export interface RestoreLegRecord {
+  itemId: string;
+  itemLabel: string;
+  flightNumber: string;
+  /** 班次出发日（按班次时区折算的本地日期 YYYY-MM-DD）；班次时间缺失时为 null。 */
+  departureDate: string | null;
+  /** 该行占座数（婴儿不占座）。 */
+  seatQuantity: number;
 }
 
 export interface RestoreReturnLegResult {
@@ -4185,6 +4204,39 @@ export interface VoidReturnLegResult {
 
 /** 恢复回程需要超售、但没带 allowOversell 时后端拒绝的稳定 code（details: {available, oversellBy}）。 */
 export const OVERSELL_CONFIRMATION_REQUIRED_CODE = 'OVERSELL_CONFIRMATION_REQUIRED';
+
+/**
+ * 恢复已取消订单时「有已起飞航段 / 回程已作废」需要运营确认的稳定 code（409）。
+ * 已起飞的航段不再占座（座位早随班次消耗），只对未起飞航段重新扣座；确认后带 allowFlownLegs 重提。
+ * 可与 OVERSELL_CONFIRMATION_REQUIRED 串联：先过这一道，再由重新占座分支判余位。
+ */
+export const FLOWN_LEGS_CONFIRMATION_REQUIRED_CODE = 'FLOWN_LEGS_CONFIRMATION_REQUIRED';
+
+/** 409 FLOWN_LEGS_CONFIRMATION_REQUIRED 的 details 载荷。 */
+export interface FlownLegsConfirmationDetails {
+  /** 已起飞、恢复后不会重新占座的航段。 */
+  flownLegs: RestoreLegRecord[];
+  /** 未起飞、恢复时会重新扣座的航段。 */
+  retakeLegs: RestoreLegRecord[];
+  /** 回程已「起飞后作废」（不占座）。 */
+  returnVoidedFinal: boolean;
+  /** 没有任何航段还能占（全飞 / 回程已作废）。 */
+  allLegsDone: boolean;
+  /** 确认后订单将落到的状态（全飞 + 付清 = COMPLETED）。 */
+  projectedToStatus: OrderStatus;
+}
+
+/** 防御式读取 FLOWN_LEGS_CONFIRMATION_REQUIRED 的 details（形状不符时按空载荷处理，确认弹窗仍能弹出）。 */
+export function flownLegsConfirmationDetails(err: ApiError): FlownLegsConfirmationDetails {
+  const d = (err.details ?? {}) as Partial<FlownLegsConfirmationDetails>;
+  return {
+    flownLegs: Array.isArray(d.flownLegs) ? d.flownLegs : [],
+    retakeLegs: Array.isArray(d.retakeLegs) ? d.retakeLegs : [],
+    returnVoidedFinal: d.returnVoidedFinal === true,
+    allLegsDone: d.allLegsDone === true,
+    projectedToStatus: (d.projectedToStatus ?? 'PENDING_PAYMENT') as OrderStatus,
+  };
+}
 
 /**
  * 带了 allowOversell 但超售量会超过系统上限时后端拒绝的稳定 code。
@@ -5364,7 +5416,7 @@ export const api = {
   restoreCancelledOrder: (
     token: string,
     orderId: string,
-    body: { requestToken: string; allowOversell?: boolean; note?: string },
+    body: { requestToken: string; allowOversell?: boolean; allowFlownLegs?: boolean; note?: string },
   ) =>
     apiFetch<RestoreCancelledOrderResult>(`/orders/${orderId}/restore-cancelled`, {
       method: 'POST',
