@@ -1,6 +1,6 @@
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type RestoreCancelledOrderResult, type VoidReturnLegPreview, type OrderLegFlagFilter, type PublicLegStatus, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE, TOKEN_PAYLOAD_MISMATCH_CODE, TOKEN_PAYLOAD_MISMATCH_HINT } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type RestoreCancelledOrderResult, type VoidReturnLegPreview, type OrderLegFlagFilter, type PublicLegStatus, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE, FLOWN_LEGS_CONFIRMATION_REQUIRED_CODE, flownLegsConfirmationDetails, TOKEN_PAYLOAD_MISMATCH_CODE, TOKEN_PAYLOAD_MISMATCH_HINT } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -319,26 +319,33 @@ const VISA_REQUIREMENT_BADGE: Record<VisaStatusInput, { label: string; cls: stri
   HAS_VISA: { label: '已签证', cls: 'badge-success' },
 };
 
-// 性别小标（列表乘客名后缀）：M→M F→F，其余（X/未录）不标。口径对齐导出/PNR，统一用 M/F 而非中文男女。
-function genderMark(g?: string | null): string {
-  if (g === 'M') return 'M';
-  if (g === 'F') return 'F';
-  return '';
-}
+// 备注六栏（运营反馈：备注放进「内容」列，客户/代理那一列就能收窄）。顺序即展示顺序。
+const ORDER_NOTE_FIELDS = [
+  { key: 'notes', label: '备注' },
+  { key: 'internalNotes', label: '内部' },
+  { key: 'noteHotel', label: '酒店' },
+  { key: 'noteVisa', label: '签证' },
+  { key: 'notePayment', label: '款项' },
+  { key: 'noteSpecial', label: '特殊' },
+] as const;
 
-// 备注预览（票务反馈：线上单靠备注判断是否单独编码出票）：取 notes → internalNotes 的首个非空行
-// 做行内截断展示；title 悬浮给两段全文。无备注返回 null。
-function deriveNotesPreview(o: OrderSummary): { firstLine: string; fullText: string } | null {
-  const notes = (o.notes ?? '').trim();
-  const internal = (o.internalNotes ?? '').trim();
-  if (!notes && !internal) return null;
-  const source = notes || internal;
-  const firstLine = source.split('\n').map((l) => l.trim()).find(Boolean) ?? '';
-  if (!firstLine) return null;
-  const fullText = [notes && `备注：${notes}`, internal && `内部备注：${internal}`]
-    .filter(Boolean)
-    .join('\n');
-  return { firstLine, fullText };
+// 备注汇总（票务反馈：线上单靠备注判断是否单独编码出票）：六栏各取首个非空行，按
+// 「备注：… · 内部：… · 酒店：…」拼成一行，行内截断；title 悬浮给分段全文。全空返回 null。
+// 此前只看 notes / internalNotes 两栏，录单填在「酒店/签证/款项/特殊」四栏里的话列表上根本看不见。
+function deriveNotesSummary(o: OrderSummary): { line: string; fullText: string } | null {
+  const parts: Array<{ label: string; firstLine: string; full: string }> = [];
+  for (const field of ORDER_NOTE_FIELDS) {
+    const raw = (o[field.key] ?? '').trim();
+    if (!raw) continue;
+    const firstLine = raw.split('\n').map((l) => l.trim()).find(Boolean);
+    if (!firstLine) continue;
+    parts.push({ label: field.label, firstLine, full: raw });
+  }
+  if (parts.length === 0) return null;
+  return {
+    line: parts.map((x) => `${x.label}：${x.firstLine}`).join(' · '),
+    fullText: parts.map((x) => `${x.label}：${x.full}`).join('\n'),
+  };
 }
 
 // 搜索分词（与后端 search 分词口径一致）：按 空格/半角逗号/中文逗号/顿号 切词，词间 AND。
@@ -586,27 +593,27 @@ function deriveHotelLine(o: OrderSummary): string | null {
 }
 
 /**
- * 证件号脱敏（列表口径）：保留头 4 位 + 尾 2 位，中段打星（EJ6912324 → EJ69***24）。
- * 列表是「多人同屏扫读」的场景，看全号请进详情抽屉——PII 只在需要时才完整暴露。
+ * 证件号（列表口径）：一律显示完整号码，不再中段打码。
+ * 依据：列表接口本来就整串下发证件号（不分角色），订单详情的乘客卡一直显示全号，
+ * 代理的全岗总表导出也单独放行了「护照号 / 证件有效期」两列——只在列表打码谁也拦不住，
+ * 反倒逼着核对护照的岗位一个个点进详情。空值返回 null，由调用方决定显示「未填」。
  */
-function maskDocumentNumber(raw: string | null | undefined): string | null {
+function displayDocumentNumber(raw: string | null | undefined): string | null {
   const s = (raw ?? '').trim();
-  if (!s) return null;
-  if (s.length <= 4) return `${s.slice(0, 1)}${'*'.repeat(Math.max(1, s.length - 1))}`;
-  if (s.length <= 6) return `${s.slice(0, 2)}${'*'.repeat(s.length - 3)}${s.slice(-1)}`;
-  return `${s.slice(0, 4)}${'*'.repeat(s.length - 6)}${s.slice(-2)}`;
+  return s ? s : null;
 }
 
-/** 性别中文（展开面板用；列表主行仍用 M/F 短标，见 genderMark）。 */
+/** 性别中文（内容列乘客行用）。 */
 const GENDER_TEXT: Record<string, string> = { M: '男', F: '女', X: '其他' };
 
 /** 出行人类型小标（内容列护照信息用）：只标婴儿/儿童，成人不占位。 */
 const PASSENGER_TYPE_MARK: Record<string, string> = { CHILD: '童', INFANT: '婴' };
 
 /**
- * 内容列的护照信息摘要（运营原话：内容页只要看护照信息——姓名/性别/生日/护照号/有效期，
- * 航班日期、套餐这些列表后面已经有列了，不用在内容里重复）。
- * 证件号一律脱敏（maskDocumentNumber，看全号进详情）；护照号/有效期缺就显示「未填」；
+ * 内容列的乘客明细摘要（运营原话：内容像明细这样展示是最好的）。
+ * 一人一行：姓名 中文名 [婴/童] · 性别 · 生日 · 证件号 · 有效期 · 国籍。
+ * 航班日期、套餐这些列表后面已经有列了，不在内容里重复。
+ * 证件号显示全号（见 displayDocumentNumber）；护照号/有效期缺就显示「未填」；
  * 有效期临期（<180 天，与详情页 daysUntil 同一口径）用现有琥珀色样式提示。
  */
 function passengerPassportSummary(p: OrderSummary['passengers'][number]): {
@@ -614,9 +621,10 @@ function passengerPassportSummary(p: OrderSummary['passengers'][number]): {
   typeMark: string | null;
   genderText: string | null;
   dob: string | null;
-  maskedDoc: string;
+  docNo: string;
   expiryText: string;
   expiryWarn: boolean;
+  nationality: string | null;
 } {
   const typeMark = p.passengerType ? PASSENGER_TYPE_MARK[p.passengerType] ?? null : null;
   const chineseName = p.chineseName?.trim();
@@ -626,10 +634,54 @@ function passengerPassportSummary(p: OrderSummary['passengers'][number]): {
     typeMark,
     genderText: p.gender ? GENDER_TEXT[p.gender] ?? null : null,
     dob: p.dateOfBirth ? p.dateOfBirth.slice(0, 10) : null,
-    maskedDoc: maskDocumentNumber(p.documentNumber) ?? '未填',
+    docNo: displayDocumentNumber(p.documentNumber) ?? '未填',
     expiryText: p.passportExpiry ? p.passportExpiry.slice(0, 10) : '未填',
     expiryWarn: daysLeft !== null && daysLeft < 180,
+    nationality: p.nationality?.trim() || null,
   };
+}
+
+/**
+ * 内容列平铺乘客的折叠阈值（运营原话：现在这样不仅展示不完人，还有点长）。
+ * 默认一人一行**全部**平铺；只有 8 人及以上的大团才折叠成前 6 行 + 「还有 N 位」，
+ * 免得一张大团单吃掉整屏。展开用的还是行下方那个「明细 ▾」按钮，没另起一套。
+ */
+const CONTENT_PASSENGER_COLLAPSE_AT = 8;
+const CONTENT_PASSENGER_COLLAPSED_ROWS = 6;
+
+/**
+ * 列表内容列的「每人结算价」（票务原话：把每个人的结算价单独展示方便我们检查）。
+ * 与订单详情「价格调整」区同一口径（computePerPaxSettlement，禁止另算一份）：
+ *   应收总额 = total + 可摊调整额；基准每人 = (应收总额 − Σ 按乘客调价净额) / 人数；
+ *   每人结算价 = 基准每人 + 该乘客净额。单人单直接等于整单应收（列表侧不设 ≥2 人门槛）。
+ * 数据不够算就整列不显示（返回 null），绝不猜一个数出来：
+ *   · 代理视角后端剥掉了行级 amount 与售后流水 adjustments，逐人净额与「不摊入同行人」的
+ *     排除项都无从得知，硬算会把某个人的补收平摊给全团；
+ *   · total / adjustmentCny 不是数字（窄接口或脏数据）同理。
+ */
+function deriveListPerPaxSettlement(o: OrderSummary): Map<string, number> | null {
+  const passengers = o.passengers ?? [];
+  if (passengers.length === 0) return null;
+  const totalCny = Number(o.total);
+  if (!Number.isFinite(totalCny)) return null;
+  const adjustmentCny = Number(o.adjustmentCny ?? 0);
+  if (!Number.isFinite(adjustmentCny)) return null;
+  const items = o.items ?? [];
+  for (const it of items) {
+    // 调价行的金额被脱敏（对外角色不下发 item.amount）→ 逐人净额算不出来。
+    if (isPriceAdjustmentItem(it.metadata) && !Number.isFinite(Number(it.amount))) return null;
+  }
+  // 有售后费却拿不到明细流水 → 判断不了哪几笔挂在已离开订单的被换人身上（不该摊给同行人）。
+  if (adjustmentCny !== 0 && !Array.isArray(o.adjustments)) return null;
+  const { byPassenger } = groupOrderAdjustments(items);
+  const { rows } = computePerPaxSettlement({
+    totalCny,
+    adjustmentCny,
+    adjustments: o.adjustments ?? [],
+    passengerIds: passengers.map((p) => p.id),
+    netByPassenger: new Map([...byPassenger.entries()].map(([pid, b]) => [pid, b.netCny])),
+  });
+  return new Map(rows.map((r) => [r.passengerId, r.settlementCny]));
 }
 
 // ── 列显示配置（用户自选列）────────────────────────────────────────────
@@ -939,7 +991,12 @@ function SwapFeeOptionsSetting({ token }: { token: string }) {
  * 从订单行里抽出来单独 memo：每页最多 200 张单，一张单全展开就是十几行，
  * 勾选/悬浮这类跟乘客无关的页面状态变化本会把这些行全部重渲一遍。
  * 入参全是标量 + 乘客对象本身（不传整份 Set / 回调），引用不变就跳过重渲。
- * 展示口径原样保留：证件号一律脱敏（看全号进详情抽屉），列表接口没有的字段缺就不显示。
+ *
+ * 只放**内容列平铺行里没有的**信息：签证（自备签 / 送签进度）、单住、PNR、票号、
+ * 常旅客次数。身份信息（性别/生日/国籍/证件号/护照有效期）已经在内容列一人一行摆出来了，
+ * 子行不再重复一遍——此前前 3 位乘客在两个地方各出现一次，看着像重复数据。
+ * 常旅客次数留在子行是因为它要按证件另发一次批量查询，只在展开时才拉，不能挪到默认平铺行。
+ * 列表接口没有的字段缺就不显示，不为凑格子发额外请求，也不臆造空值。
  */
 const PassengerSubRow = memo(function PassengerSubRow({
   passenger: p,
@@ -959,39 +1016,16 @@ const PassengerSubRow = memo(function PassengerSubRow({
   /** 本次批量查询状态：展开态才会发起请求，查询中/失败都要跟「无记录」区分开。 */
   tripsStatus?: TravelerTripsLookupStatus;
 }) {
-  const masked = maskDocumentNumber(p.documentNumber);
-  const mark = genderMark(p.gender);
   const displayName = p.chineseName?.trim() || p.fullName;
   const submission = p.visaSubmissionStatus ?? 'PENDING';
-  const typeMark = p.passengerType ? PASSENGER_TYPE_MARK[p.passengerType] ?? null : null;
-  // 临期同一口径：<180 天用现有琥珀色样式提示（与内容列护照摘要 passengerPassportSummary 一致）。
-  const expiryDaysLeft = daysUntil(p.passportExpiry);
-  const expiryWarn = expiryDaysLeft !== null && expiryDaysLeft < 180;
   return (
     <tr className="bg-slate-50">
       <td colSpan={colSpan} className="!py-1.5 pl-16">
         <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-0.5 text-[11px] leading-snug">
           <span className="nums w-4 shrink-0 text-ink-muted">{index + 1}</span>
+          {/* 姓名只作锚点：告诉运营这一行的徽标是谁的；身份字段见内容列的平铺行。 */}
           <span className="font-medium text-ink">{displayName}</span>
           {displayName !== p.fullName ? <span className="text-ink-soft">{p.fullName}</span> : null}
-          {typeMark ? <span className="text-[10px] text-ink-soft">{typeMark}</span> : null}
-          {mark ? (
-            <span className="text-[10px] text-ink-soft" title={p.gender ? GENDER_TEXT[p.gender] : undefined}>
-              {mark}
-            </span>
-          ) : null}
-          {p.dateOfBirth ? <span className="nums text-ink-muted">{p.dateOfBirth.slice(0, 10)}</span> : null}
-          {p.nationality ? <span className="text-ink-muted">{p.nationality}</span> : null}
-          {masked ? (
-            <span className="nums font-mono text-ink-soft" title="中段已脱敏，完整证件号见订单详情">
-              {masked}
-            </span>
-          ) : null}
-          {p.passportExpiry ? (
-            <span className={`nums ${expiryWarn ? 'font-medium text-amber-600' : 'text-ink-muted'}`} title="护照有效期">
-              至 {p.passportExpiry.slice(0, 10)}
-            </span>
-          ) : null}
           {/* 签证：自备签乘客不进送签流程，只标「自备签」；其余仅在本单
               有签证任务时按送签进度标（无签证的单不挂进度徽章） */}
           {p.visaExempt ? (
@@ -1122,7 +1156,8 @@ export function OrdersPage() {
   const visibleColumnCount = ORDER_COLUMNS.filter((c) => columnVisibility[c.key]).length;
   const hiddenColumnCount = ORDER_COLUMNS.length - visibleColumnCount;
   const tableColSpan = ORDER_FIXED_COLUMN_COUNT + visibleColumnCount;
-  // 乘客明细展开（列表核对护照用，行内展开、按订单记忆；证件号在列表一律脱敏，看全号请进详情）。
+  // 乘客明细展开（行内展开、按订单记忆）：一个开关管两件事——内容列把 8 人以上大团剩下的
+  // 乘客也平铺出来，同时展开子行补签证进度/单住/PNR/票号/常旅客次数。证件号在内容列直接给全号。
   const [expandedPassengerOrderIds, setExpandedPassengerOrderIds] = useState<Set<string>>(new Set());
   const togglePassengerPanel = useCallback((orderId: string) => {
     setExpandedPassengerOrderIds((prev) => {
@@ -4405,36 +4440,28 @@ export function OrdersPage() {
                         防止撑宽整表；悬浮看全文。 */}
                     {/* 客户名弱化（运营原话：主角是乘客和航班，不是客户/录单人）：
                         字重 font-medium→常规、颜色 text-ink→text-ink-soft，不再抢眼。 */}
-                    <div className="max-w-[11rem] truncate text-ink-soft" title={view.customerName}>
+                    {/* 宽度 11rem→9rem（运营原话：代理那一列就可以窄点）——原先挂在这一列
+                        第四行的备注预览已经挪进「内容」列底部，这列只剩客户名/电话/代理名三行。 */}
+                    <div className="max-w-[9rem] truncate text-ink-soft" title={view.customerName}>
                       {view.customerName}
                     </div>
                     <div className="text-xs text-ink-muted">{order.contactPhone}</div>
                     {view.agentName && (
-                      <div className="badge-info mt-0.5 max-w-[11rem] truncate" title={view.agentName}>
+                      <div className="badge-info mt-0.5 max-w-[9rem] truncate" title={view.agentName}>
                         {view.agentName}
                       </div>
                     )}
-                    {/* 备注预览（票务反馈）：线上单靠备注判断是否单独编码出票，行内给首行截断，悬浮看全文 */}
-                    {(() => {
-                      const np = deriveNotesPreview(order);
-                      return np ? (
-                        <div
-                          className="mt-0.5 max-w-[11rem] truncate text-[11px] text-amber-700"
-                          title={np.fullText}
-                        >
-                          <Icon name="clipboard" /> {np.firstLine}
-                        </div>
-                      ) : null;
-                    })()}
                   </td>
                   )}
                   <td>
-                    {/* 内容列以护照信息为主（运营原话：内容页展示护照信息——姓名/性别/生日/护照号/
-                        有效期；航班日期、套餐这些列表后面已经有列了，不用在内容里重复展示）。
-                        默认平铺前 3 位，超过 3 位用「还有 N 位」按钮展开全部——展开沿用的还是
-                        下面已有的 expandedPassengerOrderIds / PassengerSubRow 那套子行机制，
-                        没有另起一套。搜索命中某乘客时把命中者排到最前面（保留原「命中优先」
-                        的行为，不再只挑命中者单独平铺一份）。 */}
+                    {/* 内容列 = 乘客明细（运营原话：内容像明细这样展示是最好的）。一人一行：
+                        姓名 中文名 [婴/童] · 性别 · 生日 · 证件号 · 有效期 · 国籍 · 结算价；
+                        航班日期、套餐这些列表后面已经有列了，不用在内容里重复展示。
+                        **默认全部平铺**（此前硬编码只平铺前 3 位，运营原话「展示不完人」），
+                        8 人及以上的大团才折叠成前 6 行 +「还有 N 位」，用行下方那个按钮展开——
+                        展开沿用的还是 expandedPassengerOrderIds / PassengerSubRow 那套机制，
+                        没有另起一套；展开后子行只补平铺行里没有的（签证/单住/PNR/票号/次数）。
+                        搜索命中某乘客时把命中者排到最前面。 */}
                     {order.passengers.length > 0 && (() => {
                       const terms = splitSearchTerms(search);
                       // 分词后任一词命中即算命中（与 filtered 的 AND 口径不同：这里只挑「谁排最前」）。
@@ -4450,12 +4477,20 @@ export function OrdersPage() {
                         : -1;
                       const allIdx = order.passengers.map((_, i) => i);
                       const orderedIdx = hitIdx >= 0 ? [hitIdx, ...allIdx.filter((i) => i !== hitIdx)] : allIdx;
-                      const shownIdx = orderedIdx.slice(0, Math.min(order.passengers.length, 3));
+                      const collapsed =
+                        !expandedPassengerOrderIds.has(order.id) &&
+                        order.passengers.length >= CONTENT_PASSENGER_COLLAPSE_AT;
+                      const shownIdx = collapsed
+                        ? orderedIdx.slice(0, CONTENT_PASSENGER_COLLAPSED_ROWS)
+                        : orderedIdx;
+                      // 每人结算价（票务反馈）：与详情「价格调整」区同一口径；算不出来就整列不显示。
+                      const perPax = deriveListPerPaxSettlement(order);
                       return (
-                        <div className="max-w-xs whitespace-normal break-words text-xs leading-snug">
+                        <div className="max-w-2xl whitespace-normal break-words text-xs leading-snug">
                           {shownIdx.map((i) => {
                             const p = order.passengers[i];
                             const s = passengerPassportSummary(p);
+                            const settlementCny = perPax?.get(p.id);
                             return (
                               <div
                                 key={p.id}
@@ -4467,15 +4502,23 @@ export function OrdersPage() {
                                 ) : null}
                                 {s.genderText ? <span className="text-ink-muted">· {s.genderText}</span> : null}
                                 {s.dob ? <span className="nums text-ink-muted">· {s.dob}</span> : null}
-                                <span
-                                  className="nums font-mono text-ink-soft"
-                                  title="中段已脱敏，完整证件号见订单详情"
-                                >
-                                  · {s.maskedDoc}
+                                <span className="nums font-mono text-ink-soft" title="证件号">
+                                  · {s.docNo}
                                 </span>
                                 <span className={`nums ${s.expiryWarn ? 'font-medium text-amber-600' : 'text-ink-muted'}`}>
                                   · 有效期 {s.expiryText}
                                 </span>
+                                {s.nationality ? (
+                                  <span className="text-ink-muted">· {s.nationality}</span>
+                                ) : null}
+                                {settlementCny !== undefined ? (
+                                  <span
+                                    className="nums font-medium text-ink-soft"
+                                    title="每人结算价 = 整单应收按人均摊 + 该乘客名下按人调价；全员合计等于整单应收"
+                                  >
+                                    · 结算 ¥{settlementCny.toLocaleString()}
+                                  </span>
+                                ) : null}
                               </div>
                             );
                           })}
@@ -4485,7 +4528,7 @@ export function OrdersPage() {
                     {/* 航段状态短标（去程no-show / 回程已释放…）：订单级标记，不是航班日期/套餐
                         描述，运营没说不要，单独一行留着。 */}
                     {view.legNotice && (
-                      <div className="mt-0.5 max-w-xs truncate text-[11px] text-ink-muted" title={view.legNotice}>
+                      <div className="mt-0.5 max-w-2xl truncate text-[11px] text-ink-muted" title={view.legNotice}>
                         {view.legNotice}
                       </div>
                     )}
@@ -4494,9 +4537,9 @@ export function OrdersPage() {
                       {view.itemKinds.map((k) => (
                         <KindBadge key={k} kind={k} />
                       ))}
-                      {/* 展开/收起乘客子行（PNR/票号/签证进度/单住等，列表核对用；证件号仍脱敏，
-                          看全号进详情）。超过 3 人时按钮显示还差几位没在上面列出；≤3 人时上面已经
-                          列全了，按钮只用来再看这些额外字段。 */}
+                      {/* 展开/收起乘客子行（签证进度/单住/PNR/票号/常旅客次数——上面平铺行里
+                          没有的那些）。8 人及以上的大团上面只平铺了前 6 位，按钮显示还差几位；
+                          不足 8 人时上面已经列全了，按钮只用来再看这些额外字段。 */}
                       <button
                         type="button"
                         className="rounded px-1 text-xs text-ink-muted hover:bg-slate-100 hover:text-brand"
@@ -4504,14 +4547,14 @@ export function OrdersPage() {
                         title={
                           expandedPassengerOrderIds.has(order.id)
                             ? '收起乘客明细'
-                            : '展开乘客明细（含 PNR/票号/签证进度等，护照号中段已脱敏）'
+                            : '展开乘客明细（签证进度 / 单住 / PNR / 票号 / 常旅客次数）'
                         }
                         onClick={() => togglePassengerPanel(order.id)}
                       >
                         {expandedPassengerOrderIds.has(order.id)
                           ? '收起 ▴'
-                          : order.passengers.length > 3
-                            ? `还有 ${order.passengers.length - 3} 位 ▾`
+                          : order.passengers.length >= CONTENT_PASSENGER_COLLAPSE_AT
+                            ? `还有 ${order.passengers.length - CONTENT_PASSENGER_COLLAPSED_ROWS} 位 ▾`
                             : '明细 ▾'}
                       </button>
                     </div>
@@ -4521,10 +4564,24 @@ export function OrdersPage() {
                       const hotelLine = deriveHotelLine(order);
                       return hotelLine ? (
                         <div
-                          className="mt-0.5 max-w-xs truncate text-[11px] text-emerald-700"
+                          className="mt-0.5 max-w-2xl truncate text-[11px] text-emerald-700"
                           title={hotelLine}
                         >
                           <Icon name="hotel" size={12} /> {hotelLine}
+                        </div>
+                      ) : null;
+                    })()}
+                    {/* 备注（运营原话：把备注也放到内容里面）：六栏（备注/内部/酒店/签证/款项/特殊）
+                        各取首行拼一行，行内截断，悬浮看分段全文。原先它挤在「客户 / 代理」列第四行，
+                        既占宽又只看得到两栏。 */}
+                    {(() => {
+                      const np = deriveNotesSummary(order);
+                      return np ? (
+                        <div
+                          className="mt-0.5 max-w-2xl truncate text-[11px] text-amber-700"
+                          title={np.fullText}
+                        >
+                          <Icon name="clipboard" /> {np.line}
                         </div>
                       ) : null;
                     })()}
@@ -4746,11 +4803,10 @@ export function OrdersPage() {
                     </div>
                   </td>
                 </tr>
-                {/* 乘客子行（展开态）：每人一整行（colSpan 贯穿全表），承接原行内面板的
-                    全部字段；另补签证徽标（自备签 / 送签进度）、单住、票号（PNR/票号有值
-                    才显示）。列表接口没有的字段（出生日期/国籍/护照有效期）缺就不显示，
-                    不为凑格子发额外请求，也不臆造空值。证件号一律脱敏（maskDocumentNumber），
-                    看全号进详情抽屉——子行只作展示，不挂详情点击。 */}
+                {/* 乘客子行（展开态）：每人一整行（colSpan 贯穿全表），只放**内容列平铺行里
+                    没有的**信息——签证徽标（自备签 / 送签进度）、单住、PNR、票号、常旅客次数
+                    （有值才显示）。身份字段（性别/生日/国籍/证件号/护照有效期）已在内容列
+                    一人一行摆出来了，子行不再重复。子行只作展示，不挂详情点击。 */}
                 {expandedPassengerOrderIds.has(order.id) &&
                   (() => {
                     // 送签进度只在本单真有签证任务时显示（与签证筛选同源）——
