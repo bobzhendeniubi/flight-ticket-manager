@@ -15584,6 +15584,226 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     discountPerPersonCny,
   ]);
 
+  // ── 套餐批量：按行试算系统价（逐人结算价的参照物）──────────────────────────
+  // 名单里的「结算价/人」填的是**这一行本人的整单成交价**（含单房差 / 升舱 / 指定酒店加价）。
+  // 原先填的时候一格空白、没有任何参照数，只能凭记忆敲。这里按每行的真实参数
+  // （住法 / 签证 / 升舱 / 指定酒店 + 生日推出的成人儿童婴儿）各试算一次：
+  //   · 试算 items 的形状与后端逐单构造子单 items 的形状一致，拿到的就是这张子单的系统价；
+  //   · 参数组合相同的行合并成一次请求（按参数键去重 + 结果缓存），50 人名单通常 1~3 次；
+  //   · 试算失败不阻断录单，输入框回落原来的「留空 = 日历价」文案。
+  // 一轮最多试算多少种参数组合：名单参数极度分散时（人人指定不同酒店）宁可少给几行参照数，
+  // 也不把试算接口打成 50 连发。
+  const BATCH_ROW_QUOTE_MAX_COMBOS = 12;
+  // 差额上限（镜像后端 PRICE_ADJUSTMENT_CAP_CNY，口径同单笔录单）：超出提交必被拒，前端先拦。
+  const BATCH_SETTLEMENT_DIFF_CAP_CNY = 100_000;
+
+  /** 单行试算结果：systemTotalCny = 该子单权威合计（差额基准）；blankTotalCny = 留空时按日历成交的价（日历缺价为 null）。 */
+  interface BatchRowQuote {
+    systemTotalCny: number;
+    blankTotalCny: number | null;
+  }
+  const [batchRowQuotes, setBatchRowQuotes] = useState<Record<string, BatchRowQuote | null>>({});
+
+  // 逐行试算计划：keys 与 rows 同序（无需/不可试算的行为 null），requests 是去重后的待试算集合。
+  const batchRowQuotePlan = useMemo(() => {
+    const empty = {
+      keys: [] as Array<string | null>,
+      requests: [] as Array<{
+        key: string;
+        items: CreateOrderItemInput[];
+        passengers: Array<{ visaExempt: boolean; singleRoom: boolean }>;
+      }>,
+    };
+    const go = batchBundleQuoteLegs.go;
+    if (productType !== 'BUNDLE' || !canEnterPerPaxSettlementPrice || !bundleId || !go) return empty;
+    // 往返套餐没匹配到回程班次时整批本就建不成单，参照价也不试算（与批量预览同口径）。
+    if (!batchBundleQuoteLegs.ret && (selectedBundle?.legs ?? 2) >= 2) return empty;
+    // 同一批里所有行共用的上下文（套餐 / 出发日 / 班次 / 归属代理 / 手填优惠）进键，
+    // 换套餐、换日期、换代理都会自然换一批键，缓存不会串味。
+    const contextKey = [
+      bundleId,
+      batchBundleDepartDate,
+      go.id,
+      batchBundleQuoteLegs.ret?.id ?? '-',
+      batchBundleQuoteLegs.returnDate || '-',
+      agentId || '-',
+      hasBatchManualDiscount ? String(discountPerPersonCny ?? 0) : '-',
+    ].join('|');
+    const flightLegs: CreateOrderItemInput[] = [
+      {
+        kind: 'FLIGHT',
+        description: '批量预览 · 套餐去程',
+        quantity: 1,
+        flightScheduleId: go.id,
+        flightCabin: 'ECONOMY',
+        bundleId,
+        metadata: { batchQuote: true },
+      },
+      ...(batchBundleQuoteLegs.ret
+        ? [{
+            kind: 'FLIGHT' as const,
+            description: '批量预览 · 套餐回程',
+            quantity: 1,
+            flightScheduleId: batchBundleQuoteLegs.ret.id,
+            flightCabin: 'ECONOMY' as const,
+            bundleId,
+            metadata: { batchQuote: true },
+          }]
+        : []),
+    ];
+    const requests = new Map<string, (typeof empty.requests)[number]>();
+    const keys = rows.map((row) => {
+      if (!row.fullName.trim() || !row.documentNumber.trim() || !parseDob(row.dateOfBirth)) return null;
+      const ageGroup = deriveBatchAgeGroup(row.dateOfBirth, batchBundleDepartDate);
+      const adultCount = ageGroup === 'CHILD' || ageGroup === 'INFANT' ? 0 : 1;
+      const childCount = ageGroup === 'CHILD' ? 1 : 0;
+      const infantCount = ageGroup === 'INFANT' ? 1 : 0;
+      // 与提交时的行级选项同一道闸：套餐不提供单住/升舱时勾了也不算数。
+      const singleRoom = canOfferBundleSingle && row.singleRoom === true;
+      const businessUpgrade = canOfferBundleBusiness && row.businessUpgrade === true;
+      const visaExempt = row.visaExempt === true;
+      const roomTypeId = row.designatedHotelRoomTypeId ?? '';
+      const key = `${contextKey}#${adultCount}${childCount}${infantCount}|${singleRoom ? 1 : 0}|${businessUpgrade ? 1 : 0}|${visaExempt ? 1 : 0}|${roomTypeId || '-'}`;
+      if (!requests.has(key)) {
+        requests.set(key, {
+          key,
+          items: [
+            ...flightLegs,
+            {
+              kind: 'BUNDLE',
+              description: '批量预览 · 套餐',
+              quantity: 1,
+              bundleId,
+              unitPrice: 0,
+              singleCount: singleRoom ? 1 : 0,
+              businessCount: businessUpgrade ? 1 : 0,
+              adultCount,
+              childCount,
+              infantCount,
+              ...(roomTypeId ? { designatedHotelRoomTypeId: roomTypeId } : {}),
+              metadata: {
+                goDate: batchBundleDepartDate,
+                ...(batchBundleQuoteLegs.returnDate ? { returnDate: batchBundleQuoteLegs.returnDate } : {}),
+              },
+            },
+          ],
+          passengers: [{ visaExempt, singleRoom }],
+        });
+      }
+      return key;
+    });
+    return { keys, requests: [...requests.values()].slice(0, BATCH_ROW_QUOTE_MAX_COMBOS) };
+  }, [
+    productType,
+    canEnterPerPaxSettlementPrice,
+    bundleId,
+    selectedBundle,
+    batchBundleDepartDate,
+    batchBundleQuoteLegs,
+    agentId,
+    hasBatchManualDiscount,
+    discountPerPersonCny,
+    canOfferBundleSingle,
+    canOfferBundleBusiness,
+    rows,
+  ]);
+
+  // 在途键：名单还在敲字时 rows 每次变化都会重跑本 effect，没有这道去重就会把同一个键
+  // 反复重发（结果按参数键缓存，重发只是白打接口）。
+  const batchRowQuoteInflightRef = useRef<Set<string>>(new Set());
+
+  // 缺哪个键补哪个（已试算过的、试算失败的、在途的都不再发）；防抖 400ms，与批量预览同节奏。
+  useEffect(() => {
+    if (!token) return;
+    const pending = batchRowQuotePlan.requests.filter(
+      (req) => batchRowQuotes[req.key] === undefined && !batchRowQuoteInflightRef.current.has(req.key),
+    );
+    if (pending.length === 0) return;
+    const timer = setTimeout(() => {
+      pending.forEach((req) => batchRowQuoteInflightRef.current.add(req.key));
+      void Promise.all(
+        pending.map(async (req) => {
+          try {
+            const res = await api.quoteOrder(token, {
+              items: req.items,
+              passengers: req.passengers,
+              ...(agentId ? { agentId } : {}),
+              // 手填优惠在场时随试算发送，抑制一笔真下单并不会生效的自动立减（与批量预览同口径）。
+              ...(hasBatchManualDiscount
+                ? {
+                    priceAdjustment: {
+                      amountCny: -(discountPerPersonCny ?? 0),
+                      reasonCode: 'DISCOUNT' as const,
+                    },
+                  }
+                : {}),
+            });
+            const quote: BatchRowQuote = {
+              systemTotalCny: res.total,
+              blankTotalCny: res.settlementPreview?.ok === true ? res.settlementPreview.totalCny : null,
+            };
+            return [req.key, quote] as const;
+          } catch {
+            // 失败只是少一个参照数，绝不阻断录单：记 null 表示「试过了、没拿到」，不再重发。
+            return [req.key, null] as const;
+          }
+        }),
+      ).then((entries) => {
+        // 结果只按参数键落缓存（参数完全决定价格），迟到的回包也不会串到别的行上。
+        entries.forEach(([key]) => batchRowQuoteInflightRef.current.delete(key));
+        setBatchRowQuotes((prev) => ({ ...prev, ...Object.fromEntries(entries) }));
+      });
+    }, 400);
+    return () => clearTimeout(timer);
+  }, [token, agentId, hasBatchManualDiscount, discountPerPersonCny, batchRowQuotePlan, batchRowQuotes]);
+
+  /** 某行的试算结果（未试算 / 试算失败均为 null）。 */
+  function batchRowQuoteAt(index: number): BatchRowQuote | null {
+    const key = batchRowQuotePlan.keys[index] ?? null;
+    return key ? batchRowQuotes[key] ?? null : null;
+  }
+
+  // 逐人结算价汇总：已填几人、合计多少、这几人的系统价合计与差额；差额超上限的行号单列出来。
+  const batchPerPaxSettlementSummary = useMemo(() => {
+    if (productType !== 'BUNDLE' || !canEnterPerPaxSettlementPrice) return null;
+    let filledCount = 0;
+    let sumCny = 0;
+    let systemKnownCount = 0;
+    let systemSumCny = 0;
+    const overCapLines: number[] = [];
+    rows.forEach((row, index) => {
+      const price = row.settlementPriceCny;
+      // 与提交口径一致：只有「有效行 + 填了正数」才会带进 payload。
+      if (price === null || price === undefined || !(price > 0)) return;
+      if (!row.fullName.trim() || !row.documentNumber.trim() || !parseDob(row.dateOfBirth)) return;
+      filledCount += 1;
+      sumCny += price;
+      const key = batchRowQuotePlan.keys[index];
+      const quote = key ? batchRowQuotes[key] : undefined;
+      if (!quote) return;
+      systemKnownCount += 1;
+      systemSumCny += quote.systemTotalCny;
+      // 上限是**逐单**判的（每行一张子单），不是整批合计——按后端同一口径逐行比。
+      const diffCny = Math.round((price - quote.systemTotalCny) * 100) / 100;
+      if (Math.abs(diffCny) > BATCH_SETTLEMENT_DIFF_CAP_CNY) overCapLines.push(index + 1);
+    });
+    if (filledCount === 0) return null;
+    const allSystemKnown = systemKnownCount === filledCount;
+    return {
+      filledCount,
+      sumCny: Math.round(sumCny * 100) / 100,
+      systemSumCny: allSystemKnown ? Math.round(systemSumCny * 100) / 100 : null,
+      diffCny: allSystemKnown ? Math.round((sumCny - systemSumCny) * 100) / 100 : null,
+      overCapLines,
+    };
+  }, [productType, canEnterPerPaxSettlementPrice, rows, batchRowQuotePlan, batchRowQuotes]);
+
+  const batchPerPaxSettlementError =
+    batchPerPaxSettlementSummary && batchPerPaxSettlementSummary.overCapLines.length > 0
+      ? `第 ${batchPerPaxSettlementSummary.overCapLines.join('、')} 行结算价与系统价差额超出调价上限` +
+        `（±¥${BATCH_SETTLEMENT_DIFF_CAP_CNY.toLocaleString('zh-CN')}），请复核`
+      : null;
+
   // 套餐行级指定酒店与单笔录单共用酒店数据源；选店后前端只解析房型 id，价格/占房仍由服务端权威计算。
   useEffect(() => {
     if (!token || productType !== 'BUNDLE') {
@@ -16063,6 +16283,12 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     // 需要签证 + 全员自备签 = 整批永远进不了签证台，硬拦（按钮也已禁用，这里兜住程序化提交）。
     if (batchVisaSubmitBlocked && batchVisaContradiction) {
       setErr(batchVisaContradiction.text);
+      return;
+    }
+
+    // 逐人结算价差额超上限：后端逐单也会 400，前端先拦，省一次必败的整批提交。
+    if (batchPerPaxSettlementError) {
+      setErr(batchPerPaxSettlementError);
       return;
     }
 
@@ -16668,6 +16894,14 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       const ageGroup = productType === 'BUNDLE'
                         ? deriveBatchAgeGroup(r.dateOfBirth, batchBundleDepartDate)
                         : null;
+                      // 本行的系统价试算（套餐批量；未试算/失败为 null）+ 已填价与系统价的差额。
+                      const rowQuote = productType === 'BUNDLE' ? batchRowQuoteAt(i) : null;
+                      const rowSettlementDiff =
+                        rowQuote && r.settlementPriceCny !== null && r.settlementPriceCny !== undefined && r.settlementPriceCny > 0
+                          ? Math.round((r.settlementPriceCny - rowQuote.systemTotalCny) * 100) / 100
+                          : null;
+                      const rowSettlementOverCap =
+                        rowSettlementDiff !== null && Math.abs(rowSettlementDiff) > BATCH_SETTLEMENT_DIFF_CAP_CNY;
                       // 识别失败（AI 未配置/失败/网络异常）优先展示错误文案，样式升级为红色
                       const ocrErrorHint = r.ocrFailed && r.ocrStage ? r.ocrStage : null;
                       const reviewHint = ocrErrorHint ?? ocrReviewHintText({
@@ -16891,12 +17125,27 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                               disabled={hasBatchManualSettlementPrice || hasBatchManualDiscount}
                               placeholder={
                                 productType === 'BUNDLE'
-                                  ? '留空 = 日历价'
+                                  ? rowQuote
+                                    ? `留空 = ¥${Math.round(rowQuote.blankTotalCny ?? rowQuote.systemTotalCny).toLocaleString('zh-CN')}`
+                                    : '留空 = 日历价'
                                   : hasBatchTeamSettlementPrice
                                     ? `留空 = ¥${settlementPriceCny}`
                                     : '留空 = 整批价'
                               }
                             />
+                            {rowQuote && (
+                              <span className="mt-0.5 block whitespace-nowrap text-[10px] text-slate-500">
+                                系统价 ¥{rowQuote.systemTotalCny.toLocaleString('zh-CN')}
+                                {rowSettlementDiff !== null && (
+                                  <> · 差额 {rowSettlementDiff >= 0 ? '+' : '−'}¥{Math.abs(rowSettlementDiff).toLocaleString('zh-CN')}</>
+                                )}
+                              </span>
+                            )}
+                            {rowSettlementOverCap && (
+                              <span className="mt-0.5 block text-[10px] leading-tight text-rose-600">
+                                差额超出调价上限（±¥{BATCH_SETTLEMENT_DIFF_CAP_CNY.toLocaleString('zh-CN')}），请复核
+                              </span>
+                            )}
                           </td>
                         )}
                         <td className="px-2 py-1 align-top">
@@ -16981,6 +17230,34 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                   </tbody>
                 </table>
               </div>
+              {/* 逐人结算价汇总：填的时候就看得到合计与系统价差额，不必等提交后逐单核对。 */}
+              {batchPerPaxSettlementSummary && (
+                <div
+                  className={`mt-1.5 rounded-md border px-2.5 py-1.5 text-[11px] ${
+                    batchPerPaxSettlementError
+                      ? 'border-rose-200 bg-rose-50 text-rose-700'
+                      : 'border-slate-200 bg-slate-50 text-slate-600'
+                  }`}
+                >
+                  <span>
+                    已填 {batchPerPaxSettlementSummary.filledCount} 人 合计 ¥
+                    {batchPerPaxSettlementSummary.sumCny.toLocaleString('zh-CN')}
+                  </span>
+                  {batchPerPaxSettlementSummary.systemSumCny !== null && batchPerPaxSettlementSummary.diffCny !== null ? (
+                    <span>
+                      {' · '}这 {batchPerPaxSettlementSummary.filledCount} 人系统价 ¥
+                      {batchPerPaxSettlementSummary.systemSumCny.toLocaleString('zh-CN')}
+                      {' · '}差额 {batchPerPaxSettlementSummary.diffCny >= 0 ? '+' : '−'}¥
+                      {Math.abs(batchPerPaxSettlementSummary.diffCny).toLocaleString('zh-CN')}
+                    </span>
+                  ) : (
+                    <span className="text-slate-400">{' · '}部分行系统价试算中或暂不可用</span>
+                  )}
+                  {batchPerPaxSettlementError && (
+                    <span className="mt-0.5 block font-medium">{batchPerPaxSettlementError}</span>
+                  )}
+                </div>
+              )}
               <p className="mt-1 text-[11px] text-slate-400">
                 <Icon name="camera" />「批量传护照」可一次多选，自动逐张识别并生成乘客行；护照图最多 {BATCH_MAX_PHOTO_PASSENGERS} 张/批，超出请分批录入。识别有需人工核对的字段时会在对应行下方标黄提示。
               </p>
@@ -17360,8 +17637,12 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 <button
                   className="btn-primary text-sm disabled:opacity-50"
                   onClick={() => void submit()}
-                  disabled={submitting || batchVisaSubmitBlocked}
-                  title={batchVisaSubmitBlocked ? batchVisaContradiction?.text : undefined}
+                  disabled={submitting || batchVisaSubmitBlocked || batchPerPaxSettlementError !== null}
+                  title={
+                    batchVisaSubmitBlocked
+                      ? batchVisaContradiction?.text
+                      : batchPerPaxSettlementError ?? undefined
+                  }
                 >
                   {submitting ? '创建中…' : `批量创建 ${validRows.length} 单`}
                 </button>
