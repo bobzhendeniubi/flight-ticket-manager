@@ -689,6 +689,167 @@ describe('changeOrderBundle · 套餐改档', () => {
     expect(await warningsOf(1)).not.toContain('套餐行占房由');
   });
 
+  // ── 改档后派生文本跟着落位走：分房表房组 + 机票腿 description ──────────────────────
+  // 反馈：改档四星→三星后产品内容已是三星，导出「酒店类型」仍印「四星 2天1晚 岘港」——
+  // 房组 hotelName 是改档前分房弹窗按套餐行 description 首段存下来的套餐名，改档没刷它，
+  // 而导出刻意优先取房组文本。
+  describe('改档后派生文本跟着落位走（分房表房组 + 机票腿 description）', () => {
+    const roomAssignmentFixture = () => ({
+      roomGroups: [
+        {
+          id: 'g1',
+          hotelName: '三星 3天2晚',
+          roomType: '',
+          passengerIds: ['p1'],
+          orderItemId: 'item-bundle',
+          roomFraction: 0.5,
+          splitPairKey: 'k1',
+        },
+        { id: 'g2', hotelName: '别的手填酒店', roomType: '大床', passengerIds: ['p2'], orderItemId: 'item-hotel-other' },
+      ],
+    });
+    const flightLeg = (id: string, leg: string) =>
+      plainAdjustmentItem(0, {
+        id,
+        kind: OrderItemKind.FLIGHT,
+        description: `三星 3天2晚 · ${leg}（经济舱）`,
+        metadata: {},
+      });
+    type OrderUpdateArg = { data: { roomAssignment?: { roomGroups: Array<Record<string, unknown>> } } };
+    const groupsWritten = (tx: ReturnType<typeof mountTx>) =>
+      (tx.order.update.mock.calls[0][0] as OrderUpdateArg).data.roomAssignment?.roomGroups;
+
+    it('新档是随机档（结算档次四星、不绑房型）→ 归属套餐行的房组改成「四星随机（待落位）」/「待落位」，其它键与其它组原样；机票腿前缀换成新套餐名', async () => {
+      mountOrder({
+        roomAssignment: roomAssignmentFixture(),
+        items: [bundleItem(), flightLeg('item-go', '去程'), flightLeg('item-back', '回程')],
+      });
+      mountNewBundle({ settlementTier: 'CITY_4STAR' });
+      const tx = mountTx(5000);
+
+      await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF).catch(() => undefined);
+
+      const groups = groupsWritten(tx) ?? [];
+      expect(groups[0]).toEqual({
+        id: 'g1',
+        hotelName: '四星随机（待落位）',
+        roomType: '待落位',
+        passengerIds: ['p1'],
+        orderItemId: 'item-bundle',
+        roomFraction: 0.5,
+        splitPairKey: 'k1',
+      });
+      expect(groups[1]).toEqual(roomAssignmentFixture().roomGroups[1]);
+      // 机票腿：只换精确前缀；套餐行自身（calls[0]）走的是换绑 update，不在这里
+      const descUpdates = tx.orderItem.update.mock.calls.slice(1).map((c) => c[0]);
+      expect(descUpdates).toEqual([
+        { where: { id: 'item-go' }, data: { description: '四星 3天2晚 · 去程（经济舱）' } },
+        { where: { id: 'item-back' }, data: { description: '四星 3天2晚 · 回程（经济舱）' } },
+      ]);
+    });
+
+    it('新档绑真酒店房型 → 房组改成「酒店名」/「房型名」', async () => {
+      mountOrder({ roomAssignment: roomAssignmentFixture() });
+      mountNewBundle({
+        hotelRoomTypeId: 'rt-real',
+        hotelRoomType: {
+          maxAdults: 2,
+          maxChildren: 1,
+          basePrice: new Prisma.Decimal(1000),
+          name: '豪华双床',
+          hotel: { name: '岘港明月酒店', randomTierPlaceholder: null },
+        },
+      });
+      const tx = mountTx(5000, { roomTypes: [{ id: 'rt-real', hotelId: 'h-1' }], blockRooms: 5, existingRooms: [1] });
+
+      await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF).catch(() => undefined);
+
+      expect(groupsWritten(tx)?.[0]).toMatchObject({ hotelName: '岘港明月酒店', roomType: '豪华双床' });
+    });
+
+    it('新档房型挂在随机档占位酒店上（伪落位）→ 写「X星随机（待落位）」，不写占位酒店字面名', async () => {
+      mountOrder({ roomAssignment: roomAssignmentFixture() });
+      mountNewBundle({
+        hotelRoomTypeId: 'rt-ph',
+        hotelRoomType: {
+          maxAdults: 2,
+          maxChildren: 1,
+          basePrice: new Prisma.Decimal(1000),
+          name: '标准间',
+          hotel: { name: '随机四星', randomTierPlaceholder: 4 },
+        },
+      });
+      const tx = mountTx(5000, { roomTypes: [{ id: 'rt-ph', hotelId: 'h-ph', randomTierPlaceholder: 4 }] });
+      // 占位酒店走随机档聚合闸：它要读同星级真酒店清单（tx.hotel）；这里给空清单 = 未纳入管控，闸不判。
+      Object.assign(tx, { hotel: { findMany: vi.fn(async () => []) } });
+
+      await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF).catch(() => undefined);
+
+      expect(groupsWritten(tx)?.[0]).toMatchObject({ hotelName: '四星随机（待落位）', roomType: '待落位' });
+    });
+
+    it('本行无归属组 → 只刷「无归属 + hotelName 恰好是旧套餐名」的老房组；归属到其它行的同名组不动', async () => {
+      mountOrder({
+        roomAssignment: {
+          roomGroups: [
+            { id: 'g1', hotelName: '三星 3天2晚', roomType: '', passengerIds: ['p1'] },
+            { id: 'g2', hotelName: '三星 3天2晚', roomType: '', passengerIds: ['p2'], orderItemId: 'item-other' },
+            { id: 'g3', hotelName: '手填酒店', roomType: '', passengerIds: ['p3'] },
+          ],
+        },
+      });
+      mountNewBundle({ settlementTier: 'CITY_4STAR' });
+      const tx = mountTx(5000);
+
+      await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF).catch(() => undefined);
+
+      expect((groupsWritten(tx) ?? []).map((g) => g.hotelName)).toEqual(['四星随机（待落位）', '三星 3天2晚', '手填酒店']);
+    });
+
+    it('新档解析不出落位（无房型、无结算档次）→ 分房表不动、总额 update 不带 roomAssignment，响应 warnings 提示去分房里核对', async () => {
+      mountOrder({ roomAssignment: roomAssignmentFixture() });
+      mountNewBundle();
+      const tx = mountTx(5000);
+      mockPrisma.order.findUniqueOrThrow.mockResolvedValue({
+        id: 'ord-1',
+        orderNumber: 'FTM-0001',
+        status: 'PAID',
+        currency: 'CNY',
+        total: new Prisma.Decimal(5000),
+        subtotal: new Prisma.Decimal(5000),
+        taxesAndFees: new Prisma.Decimal(0),
+        discountTotal: new Prisma.Decimal(0),
+        paidAmount: new Prisma.Decimal(0),
+        prepaymentOffset: new Prisma.Decimal(0),
+        adjustmentCny: 0,
+        adjustments: [],
+        items: [],
+        passengers: [],
+        payments: [],
+        refunds: [],
+        statusEvents: [],
+        createdAt: new Date('2026-08-01T00:00:00.000Z'),
+        updatedAt: new Date('2026-08-01T00:00:00.000Z'),
+      });
+
+      const res = await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF);
+
+      expect((tx.order.update.mock.calls[0][0] as OrderUpdateArg).data).not.toHaveProperty('roomAssignment');
+      expect(res.audit.warnings.join()).toContain('分房表房组的酒店名未能自动刷新');
+    });
+
+    it('没有分房表 → 不刷、不报（无事发生）', async () => {
+      mountOrder({ roomAssignment: null });
+      mountNewBundle({ settlementTier: 'CITY_4STAR' });
+      const tx = mountTx(5000);
+
+      await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF).catch(() => undefined);
+
+      expect((tx.order.update.mock.calls[0][0] as OrderUpdateArg).data).not.toHaveProperty('roomAssignment');
+      expect(tx.orderItem.update).toHaveBeenCalledTimes(1);
+    });
+  });
+
   it('降档（新档更便宜）→ 差额行为负、落 DISCOUNT 行', async () => {
     mountOrder();
     mountNewBundle({ items: [{ kind: 'HOTEL', qty: 2, unitPrice: 1500 }] });

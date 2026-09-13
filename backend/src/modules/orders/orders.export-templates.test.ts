@@ -496,6 +496,30 @@ describe('《全岗可用》full 模版 — 套餐单酒店/签证/备注取值'
   const order = fixtureBundle();
   const [r1] = orderToFullRows(order, buildOrderContext(order));
 
+  it('套餐行房型挂在随机档占位酒店上 → 酒店类型出「X星随机（待落位）」，不印占位酒店字面名', () => {
+    const o = fixtureBundle();
+    (o.items.find((it) => it.kind === 'BUNDLE') as unknown as { hotelRoomType: unknown }).hotelRoomType = {
+      name: '标准间',
+      hotel: { name: '随机五星', code: 'RND5', randomTierPlaceholder: 5 },
+    };
+    const [row] = orderToFullRows(o, buildOrderContext(o));
+    expect(row.hotelInfo).toBe('五星随机（待落位）');
+  });
+
+  it('分房组文本是套餐名残留（含「N天N晚」）→ 按归属行落位出，不印套餐名；房控手填的真实酒店名仍跟房控走', () => {
+    const o = fixtureBundle();
+    (o.items.find((it) => it.kind === 'BUNDLE') as unknown as { id: string }).id = 'item-bundle';
+    const pax = o.passengers[0].id;
+    const withGroup = (hotelName: string) => {
+      (o as unknown as { roomAssignment: unknown }).roomAssignment = {
+        roomGroups: [{ id: 'g1', hotelName, roomType: '', passengerIds: [pax], orderItemId: 'item-bundle' }],
+      };
+      return orderToFullRows(o, buildOrderContext(o))[0].hotelInfo;
+    };
+    expect(withGroup('岘港3天2晚随机')).toBe('岘港五星');
+    expect(withGroup('椰林湾度假村')).toBe('椰林湾度假村');
+  });
+
   it('酒店类型：BUNDLE 行上关联的酒店也算，只出酒店名', () => {
     expect(r1.hotelInfo).toBe('岘港五星');
   });

@@ -35,10 +35,11 @@ import { buildExportOrderWhere, filterExportOrders } from './orders.export-selec
 import { formatOrderLegStatus } from './orders.leg-status.js';
 import { determineFlightLegs } from './ticketing-cap.js';
 import {
+  attributedRoomGroupHotelName,
   parseRoomGroups,
-  randomStarTierLabel,
   resolveExportHotelName,
 } from './orders.export-room-allocation.js';
+import { resolveRoomGroupPlacement } from './room-group-placement.js';
 import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats.js';
 import type { TripStatsMap } from './orders.export-trip-stats.js';
 import type { ExportTemplatesQuery } from './orders.schemas.js';
@@ -622,7 +623,9 @@ export type OrderForTemplateExport = Prisma.OrderGetPayload<{
             flight: { select: { flightNumber: true; originCode: true; destinationCode: true } };
           };
         };
-        hotelRoomType: { select: { name: true; hotel: { select: { name: true; code: true } } } };
+        hotelRoomType: {
+          select: { name: true; hotel: { select: { name: true; code: true; randomTierPlaceholder: true } } };
+        };
         visa: { select: { code: true; visaName: true; visaType: true; supplier: true } };
         transfer: { select: { code: true } };
         bundle: { select: { code: true; items: true } };
@@ -735,15 +738,12 @@ export function buildOrderContext(
   // 任何「关联了酒店房型」的订单行都算（不限 kind）：套餐(BUNDLE)把房型盖在 BUNDLE 行上、
   // 无独立 HOTEL 行，只认 kind==='HOTEL' 会让套餐单的酒店列整列空白（0720 公测反馈：导出缺酒店信息）。
   // Set 去重防同名重复。「星级随机」还没落到具体酒店的行（hotelRoomTypeId 为空、randomStarTier
-  // 非空）同样要出内容 —— 标「X星随机（待落位）」，与分房表共用同一文案（randomStarTierLabel），
-  // 否则这类单的酒店列整列空白。
+  // 非空，或房型挂在随机档占位酒店上）同样要出内容 —— 标「X星随机（待落位）」，与分房表 / 订单
+  // 列表共用同一口径（resolveRoomGroupPlacement），否则这类单的酒店列整列空白或印成占位酒店字面名。
   const hotelNameSet = new Set<string>();
   for (const it of order.items) {
-    if (it.hotelRoomType) {
-      hotelNameSet.add(it.hotelRoomType.hotel.name);
-    } else if (it.randomStarTier != null) {
-      hotelNameSet.add(randomStarTierLabel(it.randomStarTier));
-    }
+    const placement = resolveRoomGroupPlacement(it);
+    if (placement) hotelNameSet.add(placement.hotelName);
   }
   const hotelNames = Array.from(hotelNameSet).join(' / ');
 
@@ -1027,8 +1027,12 @@ export function orderToFullRows(
     notes,
     // 酒店类型（乘客行级，0722 财务反馈；0901 运营反馈只出酒店名不拼房型）：
     // 优先该乘客分房组的实际酒店（房控排房结果），无分房组 → 回退订单项口径 ctx.hotelInfo
-    // （现状值），绝不留空。
-    hotelInfo: resolveExportHotelName(group, ctx.hotelInfo),
+    // （现状值），绝不留空；房组文本是套餐名残留时按归属行落位出（见 resolveExportHotelName）。
+    hotelInfo: resolveExportHotelName(
+      group,
+      ctx.hotelInfo,
+      attributedRoomGroupHotelName(group, order.items),
+    ),
     chineseName: p.chineseName ?? p.fullName,
     passengerName: nameWithTitle(p, departureDate),
     cleanName: pnrName(p),
@@ -1255,8 +1259,12 @@ export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext
     notes: ctx.notes,
     // 酒店类型（乘客行级，0722 财务反馈；0901 运营反馈只出酒店名不拼房型）：
     // 优先该乘客分房组的实际酒店（房控），无分房组 → 回退订单项口径 ctx.hotelInfo
-    // （现状值），绝不留空。
-    hotelInfo: resolveExportHotelName(group, ctx.hotelInfo),
+    // （现状值），绝不留空；房组文本是套餐名残留时按归属行落位出（见 resolveExportHotelName）。
+    hotelInfo: resolveExportHotelName(
+      group,
+      ctx.hotelInfo,
+      attributedRoomGroupHotelName(group, order.items),
+    ),
     visaNote: '',
     // 结算价格按人（与《全岗可用》/全岗总表同一口径）：同一位乘客在三张表里的数字必然相同。
     settlePrice: ctx.settleByPassenger.get(p.id) ?? ctx.settlePerPax,
@@ -1317,7 +1325,10 @@ export async function buildOrderTemplateExportWorkbook(
           flightSchedule: {
             include: { flight: { select: { flightNumber: true, originCode: true, destinationCode: true } } },
           },
-          hotelRoomType: { select: { name: true, hotel: { select: { name: true, code: true } } } },
+          // randomTierPlaceholder：房型挂在随机档占位酒店上 = 未落位，「酒店类型」按「X星随机（待落位）」出
+          hotelRoomType: {
+            select: { name: true, hotel: { select: { name: true, code: true, randomTierPlaceholder: true } } },
+          },
           visa: { select: { code: true, visaName: true, visaType: true, supplier: true } },
           transfer: { select: { code: true } },
           bundle: { select: { code: true, items: true } },

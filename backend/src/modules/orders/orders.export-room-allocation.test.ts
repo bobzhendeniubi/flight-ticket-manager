@@ -29,6 +29,9 @@ import {
   roomAllocationExportFilename,
   roomAllocationExportFilenameByDepart,
   COLUMNS,
+  attributedRoomGroupHotelName,
+  describeRoomItem,
+  resolveExportHotelName,
   type RoomItemForExport,
 } from './orders.export-room-allocation.js';
 import type { TripStatsMap } from './orders.export-trip-stats.js';
@@ -1160,5 +1163,73 @@ describe('分房表结算价格按乘客', () => {
     // (4800 + 200) / 2 = 2500
     expect(r1.settlePrice).toBe(2500);
     expect(r2.settlePrice).toBe(2500);
+  });
+});
+
+// ── 占位酒店（伪落位）与套餐名残留：导出口径与订单列表 / 分房弹窗对齐 ────────────────────────
+describe('describeRoomItem / resolveExportHotelName — 占位酒店与套餐名残留', () => {
+  it('房型挂在随机档占位酒店上 → 按「X星随机（待落位）」出，hotelId 置空（余房无从算起），容量沿用房型', () => {
+    expect(
+      describeRoomItem({
+        hotelRoomType: {
+          hotelId: 'h-ph',
+          name: '标准间',
+          bedType: '双床',
+          capacity: 2,
+          hotel: { name: '随机三星', randomTierPlaceholder: 3 },
+        },
+        randomStarTier: null,
+      }),
+    ).toEqual({
+      hotelName: '三星随机（待落位）',
+      roomTypeName: '待落位',
+      bedType: null,
+      capacity: 2,
+      hotelId: null,
+      pending: true,
+    });
+  });
+
+  it('真酒店 FK → 酒店名 / 房型名 / 床型 / 容量 / hotelId 原样，pending=false', () => {
+    expect(
+      describeRoomItem({
+        hotelRoomType: { hotelId: 'h-1', name: '大床房', bedType: '大床', capacity: 2, hotel: { name: '明月酒店', randomTierPlaceholder: null } },
+      }),
+    ).toEqual({ hotelName: '明月酒店', roomTypeName: '大床房', bedType: '大床', capacity: 2, hotelId: 'h-1', pending: false });
+  });
+
+  it('联查没带 randomTierPlaceholder（旧调用方）→ 按真酒店显示，不误判', () => {
+    expect(
+      describeRoomItem({ hotelRoomType: { name: 'x', bedType: null, hotel: { name: '真酒店' } } }).pending,
+    ).toBe(false);
+  });
+
+  const bundleTextGroup = { id: 'g', hotelName: '四星 2天1晚 岘港', roomType: '', passengerIds: [] };
+
+  it('resolveExportHotelName：房组文本是套餐名 → 优先归属行落位，其次订单项口径；两者都解析不出才原样', () => {
+    expect(resolveExportHotelName(bundleTextGroup, '明月酒店', '三星随机（待落位）')).toBe('三星随机（待落位）');
+    expect(resolveExportHotelName(bundleTextGroup, '明月酒店', null)).toBe('明月酒店');
+    expect(resolveExportHotelName(bundleTextGroup, '', null)).toBe('四星 2天1晚 岘港');
+  });
+
+  it('resolveExportHotelName：非套餐名文本一律跟房控走（第三参不参与）；空文本仍回退订单项口径', () => {
+    const manual = { id: 'g', hotelName: '岘港 A酒店(待定/换房中)', roomType: '', passengerIds: [] };
+    expect(resolveExportHotelName(manual, '明月酒店', '别的')).toBe('岘港 A酒店(待定/换房中)');
+    expect(resolveExportHotelName({ ...manual, hotelName: '  ' }, '明月酒店', '别的')).toBe('明月酒店');
+    expect(resolveExportHotelName(undefined, '明月酒店')).toBe('明月酒店');
+  });
+
+  it('attributedRoomGroupHotelName：按 orderItemId 找归属行落位；无归属 / 找不到行 / 行无落位 → null', () => {
+    const items = [
+      { id: 'it-real', hotelRoomType: { name: '大床', hotel: { name: '明月酒店', randomTierPlaceholder: null } } },
+      { id: 'it-ph', hotelRoomType: { name: '标准', hotel: { name: '随机四星', randomTierPlaceholder: 4 } } },
+      { id: 'it-none', hotelRoomType: null, randomStarTier: null },
+    ];
+    expect(attributedRoomGroupHotelName({ ...bundleTextGroup, orderItemId: 'it-real' }, items)).toBe('明月酒店');
+    expect(attributedRoomGroupHotelName({ ...bundleTextGroup, orderItemId: 'it-ph' }, items)).toBe('四星随机（待落位）');
+    expect(attributedRoomGroupHotelName({ ...bundleTextGroup, orderItemId: 'it-none' }, items)).toBeNull();
+    expect(attributedRoomGroupHotelName({ ...bundleTextGroup, orderItemId: 'ghost' }, items)).toBeNull();
+    expect(attributedRoomGroupHotelName(bundleTextGroup, items)).toBeNull();
+    expect(attributedRoomGroupHotelName(undefined, items)).toBeNull();
   });
 });

@@ -32,7 +32,12 @@ import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats.js';
 import type { TripStatsMap } from './orders.export-trip-stats.js';
 import { toAlpha3 } from './nationality.js';
-import { parseRoomGroups, resolveExportHotelName } from './orders.export-room-allocation.js';
+import {
+  attributedRoomGroupHotelName,
+  parseRoomGroups,
+  resolveExportHotelName,
+} from './orders.export-room-allocation.js';
+import { resolveRoomGroupPlacement } from './room-group-placement.js';
 import {
   nameWithTitle,
   orderVisaStatusLabel,
@@ -427,7 +432,10 @@ export const MASTER_EXPORT_INCLUDE = {
           flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
         },
       },
-      hotelRoomType: { select: { name: true, hotel: { select: { name: true } } } },
+      // randomTierPlaceholder：房型挂在随机档占位酒店上 = 未落位，「酒店中文名称」按「X星随机（待落位）」出
+      hotelRoomType: {
+        select: { name: true, hotel: { select: { name: true, randomTierPlaceholder: true } } },
+      },
       visa: { select: { visaName: true, visaType: true, supplier: true } },
       // 套餐(BUNDLE)行关联的套餐定义：取 items JSON 以捞出签证组件的挂牌价（qty×unitPrice）。
       bundle: { select: { items: true } },
@@ -518,11 +526,12 @@ export function orderToMasterRows(
   // 作为「酒店中文名称」列的**回退**值（0722 财务反馈）：乘客没有分房记录时用它，保持现状。
   // 任何"关联了酒店房型"的订单行都算（不限 kind）：套餐(BUNDLE)把房型盖在 BUNDLE 行上、
   // 无独立 HOTEL 行，若只认 kind==='HOTEL' 会漏掉套餐单的酒店名。Set 去重防同名重复计。
+  // 房型挂在随机档占位酒店上的行按「X星随机（待落位）」出（与列表 / 分房表同口径），不印占位酒店字面名。
   const hotelNamesFallback = Array.from(
     new Set(
       order.items
         .filter((it) => it.hotelRoomType)
-        .map((it) => it.hotelRoomType!.hotel.name)
+        .map((it) => resolveRoomGroupPlacement(it)?.hotelName ?? '')
         .filter(Boolean),
     ),
   ).join(' / ');
@@ -706,8 +715,13 @@ export function orderToMasterRows(
       agency,
       notes,
       // 酒店中文名称（乘客行级，0722 财务反馈）：优先该乘客分房组的实际酒店（房控排房结果），
-      // 无分房组 → 回退订单项口径 hotelNamesFallback（现状值），绝不留空。
-      hotelName: resolveExportHotelName(group, hotelNamesFallback),
+      // 无分房组 → 回退订单项口径 hotelNamesFallback（现状值），绝不留空；房组文本是套餐名残留时
+      // 按归属行落位出（见 resolveExportHotelName）。
+      hotelName: resolveExportHotelName(
+        group,
+        hotelNamesFallback,
+        attributedRoomGroupHotelName(group, order.items),
+      ),
       chineseName: p.chineseName ?? p.fullName,
       // 称谓统一 MR/MS（不分年龄，0723 票务口径）；出发日仅供其他年龄派生场景沿用签名。
       passengerName: nameWithTitle(p, legs[0]?.departureTime ?? null),

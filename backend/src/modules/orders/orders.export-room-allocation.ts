@@ -34,6 +34,11 @@ import type { TripStatsMap } from './orders.export-trip-stats.js';
 import { earliestFlightDepartureLocalDate } from './pnr-export.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { businessDateTimeSec } from '../../lib/business-time.js';
+import {
+  PENDING_PLACEMENT_ROOM_TYPE,
+  isBundleLikeHotelText,
+  resolveRoomGroupPlacement,
+} from './room-group-placement.js';
 
 /** 分房口径：退款申请中的订单已释放占房，不进入分房表。*/
 const COUNTED_STATUSES: OrderStatus[] = [
@@ -169,28 +174,9 @@ function sheetNameForDate(date: string): string {
   return `${Number(m)}-${Number(d)}`;
 }
 
-/** randomStarTier（星级随机档）→ 中文星级；枚举外的档次回落「N星」，绝不丢档次信息。*/
-const STAR_TIER_CN: Record<number, string> = {
-  2: '二星',
-  3: '三星',
-  4: '四星',
-  5: '五星',
-  6: '六星',
-};
-
-/** 未落位行的房型格文案（酒店都没定，房型无从谈起）。*/
-export const PENDING_PLACEMENT_ROOM_TYPE = '待落位';
-
-/**
- * 「星级随机」未落位行在各张导出表里的酒店格文案：`X星随机（待落位）`。
- * 口径唯一入口 —— 分房表的酒店分组名与《全岗可用》/《签证专用》的「酒店类型」列共用，
- * 两处文案必须一致，运营对表时才不会以为是两种东西。
- * tier 为空 → 返回空串（调用方自行决定回落，本函数不编造档次）。
- */
-export function randomStarTierLabel(tier: number | null | undefined): string {
-  if (tier == null) return '';
-  return `${STAR_TIER_CN[tier] ?? `${tier}星`}随机（${PENDING_PLACEMENT_ROOM_TYPE}）`;
-}
+// 「待落位」文案与「X星随机（待落位）」档次名的**定义**已收口到 room-group-placement.ts
+//（售后刷新房组 / 回填脚本 / 导出三处共用同一份；本模块原样再导出，调用方的 import 路径不变）。
+export { PENDING_PLACEMENT_ROOM_TYPE, randomStarTierLabel } from './room-group-placement.js';
 
 /** 占房行的酒店/房型呈现口径（已落位取 FK 房型，未落位取星级随机档）。*/
 export interface RoomItemPlacement {
@@ -208,32 +194,42 @@ export interface RoomItemPlacement {
   pending: boolean;
 }
 
-/** 占房行 → 酒店/房型呈现（已落位 / 未落位两态的唯一判定入口）。*/
+/**
+ * 占房行 → 酒店/房型呈现（已落位 / 未落位两态的唯一判定入口）。
+ * 「未落位」有两种形态，口径与订单列表（serializeOrder 的 hotelPendingTier）一致：
+ *   a) 无 FK、只有 randomStarTier 的随机行；
+ *   b) 房型挂在随机档**占位酒店**上（hotel.randomTierPlaceholder 非空）—— 那不是真房源，
+ *      不能把占位酒店的字面名印进表里，同样按「X星随机（待落位）」出。
+ * 联查没带 randomTierPlaceholder 的旧调用方安全落 null，按真酒店显示，不误判。
+ */
 export function describeRoomItem(it: {
   hotelRoomType: {
     hotelId?: string | null;
     name: string;
-    bedType: string | null;
+    bedType?: string | null;
     capacity?: number | null;
-    hotel: { name: string };
+    hotel: { name: string; randomTierPlaceholder?: number | null };
   } | null;
   randomStarTier?: number | null;
 }): RoomItemPlacement {
-  if (it.hotelRoomType) {
+  const placement = resolveRoomGroupPlacement(it);
+  if (it.hotelRoomType && placement && !placement.pending) {
     return {
-      hotelName: it.hotelRoomType.hotel.name,
-      roomTypeName: it.hotelRoomType.name,
-      bedType: it.hotelRoomType.bedType,
+      hotelName: placement.hotelName,
+      roomTypeName: placement.roomType,
+      bedType: it.hotelRoomType.bedType ?? null,
       capacity: it.hotelRoomType.capacity ?? null,
       hotelId: it.hotelRoomType.hotelId ?? null,
       pending: false,
     };
   }
   return {
-    hotelName: randomStarTierLabel(it.randomStarTier),
+    hotelName: placement?.hotelName ?? '',
     roomTypeName: PENDING_PLACEMENT_ROOM_TYPE,
     bedType: null,
-    capacity: null,
+    // 占位酒店的房型也可能配了容量（打包用），随机行没有 → null 回落缺省 2 人/间
+    capacity: it.hotelRoomType?.capacity ?? null,
+    // 占位酒店不是真房源：当日余房无从算起，与随机行同样标「—」
     hotelId: null,
     pending: true,
   };
@@ -259,15 +255,44 @@ export function parseRoomGroups(roomAssignment: unknown): RoomGroup[] {
  *   1. 该乘客所在分房组的实际酒店 group.hotelName —— 房控人工排房结果（可能是自由文本），
  *      原样返回、不做匹配清洗（房控换过酒店时，导出跟房控走）；
  *   2. 无分房组 / 分房组没填酒店名 → 回退订单项酒店口径 fallbackHotelName（录单时选的房型所属
- *      酒店，现状值），绝不留空。
+ *      酒店，现状值），绝不留空；
+ *   3. 例外：房组文本明显是套餐名（含「N天N晚」）→ 以归属行落位 attributedHotelName（其次
+ *      fallbackHotelName）为准，见函数内注释。
  * group.hotelName 仅用 trim 判空（判它到底填没填），采用时用原值。
  */
 export function resolveExportHotelName(
   group: RoomGroup | undefined,
   fallbackHotelName: string,
+  attributedHotelName?: string | null,
 ): string {
   const fromRoomControl = group?.hotelName;
-  return fromRoomControl && fromRoomControl.trim() ? fromRoomControl : fallbackHotelName;
+  if (!fromRoomControl || !fromRoomControl.trim()) return fallbackHotelName;
+  // 例外：房组文本明显是**套餐名**（含「N天N晚」）—— 那不是房控排的酒店，是早期分房弹窗把套餐行
+  // description 首段当酒店名存下来的残留（套餐改档后尤其会印成改档前的档次）。这种文本按行上
+  // 的落位（归属行 FK / 占位档次，其次订单项口径）出，解析不出来才原样保留。
+  if (isBundleLikeHotelText(fromRoomControl)) {
+    const resolved = attributedHotelName?.trim() || fallbackHotelName.trim();
+    if (resolved) return resolved;
+  }
+  return fromRoomControl;
+}
+
+/**
+ * 乘客所在房组的**归属行**落位名（给 resolveExportHotelName 第三参用）：
+ * 房组带 orderItemId 且能在本单明细里找到该行 → 该行 FK 酒店 / 占位档次；否则 null。
+ */
+export function attributedRoomGroupHotelName(
+  group: RoomGroup | undefined,
+  items: ReadonlyArray<{
+    id: string;
+    hotelRoomType: { name: string; hotel: { name: string; randomTierPlaceholder?: number | null } } | null;
+    randomStarTier?: number | null;
+  }>,
+): string | null {
+  if (!group?.orderItemId) return null;
+  const item = items.find((it) => it.id === group.orderItemId);
+  if (!item) return null;
+  return resolveRoomGroupPlacement(item)?.hotelName ?? null;
 }
 
 export type RoomItemForExport = Prisma.OrderItemGetPayload<{
@@ -278,7 +303,7 @@ export type RoomItemForExport = Prisma.OrderItemGetPayload<{
         name: true;
         bedType: true;
         capacity: true;
-        hotel: { select: { name: true } };
+        hotel: { select: { name: true; randomTierPlaceholder: true } };
       };
     };
     order: {
@@ -727,7 +752,8 @@ const ROOM_ITEM_INCLUDE = {
       name: true,
       bedType: true,
       capacity: true,
-      hotel: { select: { name: true } },
+      // randomTierPlaceholder：房型挂在随机档占位酒店上 = 未落位，按「X星随机（待落位）」出（describeRoomItem）
+      hotel: { select: { name: true, randomTierPlaceholder: true } },
     },
   },
   order: {

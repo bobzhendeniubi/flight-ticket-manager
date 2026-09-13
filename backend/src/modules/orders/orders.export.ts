@@ -172,7 +172,7 @@ type OrderForExport = Prisma.OrderGetPayload<{
             name: true;
             bedType: true;
             capacity: true;
-            hotel: { select: { name: true } };
+            hotel: { select: { name: true; randomTierPlaceholder: true } };
           };
         };
         visa: { select: { visaName: true; visaType: true; country: true } };
@@ -491,7 +491,8 @@ export async function buildOrdersBySchedule(
               name: true,
               bedType: true,
               capacity: true,
-              hotel: { select: { name: true } },
+              // randomTierPlaceholder：占位酒店上的伪落位行按「X星随机（待落位）」出（describeRoomItem）
+              hotel: { select: { name: true, randomTierPlaceholder: true } },
             },
           },
           visa: { select: { visaName: true, visaType: true, country: true } },

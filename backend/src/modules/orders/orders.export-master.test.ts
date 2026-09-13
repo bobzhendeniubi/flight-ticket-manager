@@ -664,6 +664,40 @@ describe('酒店中文名称跟房控实际数据（乘客行级）', () => {
     const [r1] = orderToMasterRows(order);
     expect(r1.hotelName).toBe('岘港 A酒店(待定/换房中)');
   });
+
+  // 反馈：套餐改档后产品内容已是三星，导出仍印「四星 2天1晚 岘港」—— 房组 hotelName 是早期分房弹窗
+  // 把套餐行 description 首段（套餐名）存下来的残留，不是房控排的酒店。
+  it('分房组文本是套餐名残留（含「N天N晚」）→ 不当酒店印，按归属行 FK 落位出', () => {
+    const order = fixtureRoundTripBundle();
+    (order.items.find((it) => it.kind === 'HOTEL') as unknown as { id: string }).id = 'item-hotel';
+    (order as unknown as { roomAssignment: unknown }).roomAssignment = {
+      roomGroups: [{ id: 'g1', hotelName: '四星 2天1晚 岘港', roomType: '', passengerIds: ['p1'], orderItemId: 'item-hotel' }],
+    };
+    const [r1] = orderToMasterRows(order);
+    expect(r1.hotelName).toBe('明月酒店');
+  });
+
+  it('套餐名残留 + 归属行房型挂在随机档占位酒店上 → 出「X星随机（待落位）」；无分房组乘客的回退口径同样不印占位酒店字面名', () => {
+    const order = fixtureRoundTripBundle();
+    const hotelItem = order.items.find((it) => it.kind === 'HOTEL') as unknown as { id: string; hotelRoomType: unknown };
+    hotelItem.id = 'item-hotel';
+    hotelItem.hotelRoomType = { name: '标准间', hotel: { name: '随机三星', randomTierPlaceholder: 3 } };
+    (order as unknown as { roomAssignment: unknown }).roomAssignment = {
+      roomGroups: [{ id: 'g1', hotelName: '四星 2天1晚 岘港', roomType: '', passengerIds: ['p1'], orderItemId: 'item-hotel' }],
+    };
+    const [r1, r2] = orderToMasterRows(order);
+    expect(r1.hotelName).toBe('三星随机（待落位）');
+    expect(r2.hotelName).toBe('三星随机（待落位）');
+  });
+
+  it('套餐名残留但房组无归属 → 回退订单项口径（有 FK 就用 FK，不留套餐名）', () => {
+    const order = fixtureRoundTripBundle();
+    (order as unknown as { roomAssignment: unknown }).roomAssignment = {
+      roomGroups: [{ id: 'g1', hotelName: '四星 2天1晚 岘港', roomType: '', passengerIds: ['p1'] }],
+    };
+    const [r1] = orderToMasterRows(order);
+    expect(r1.hotelName).toBe('明月酒店');
+  });
 });
 
 describe('visibleColumns（role 裁列）', () => {

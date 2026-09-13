@@ -196,10 +196,27 @@ function emptyBox(): RoomBox {
   };
 }
 
+/** 未落位行的房型文案（与后端 PENDING_PLACEMENT_ROOM_TYPE 同文案）。 */
+const PENDING_PLACEMENT_ROOM_TYPE = '待落位';
+
+/** 随机档未落位行写进房组的酒店名：「X星随机（待落位）」（与后端导出 / 售后刷新同一文案）。 */
+function pendingPlacementHotelName(tier: number): string {
+  return `${randomStarTierLabel(tier)}（${PENDING_PLACEMENT_ROOM_TYPE}）`;
+}
+
 /**
  * 从订单行派生「可归属酒店行清单」（调用方传给 hotelItems）：HOTEL 行 + 已盖章酒店房型的
- * BUNDLE 行（服务端归属校验就认这两类）。展示名 = 酒店 · 房型 · 入住~退房；酒店名优先
- * 联查落的 item.hotelName，回退 description 首段（「酒店名 · 房型 · …」拼串）。
+ * BUNDLE 行（服务端归属校验就认这两类）。展示名 = 酒店 · 房型 · 入住~退房。
+ *
+ * 归属组保存时写进 hotelName 的酒店名，口径与后端房组落位名（resolveRoomGroupPlacement）一致：
+ *   · 随机档未落位（item.hotelPendingTier 非空：房型挂在占位酒店上）→「X星随机（待落位）」；
+ *   · 已落位真酒店 → 联查落的 item.hotelName；
+ *   · HOTEL 行没联查到酒店名（旧调用方 / 详情接口不带联查）→ 回退 description 首段
+ *     （HOTEL 行 description 是「酒店名 · 房型 · …」拼串，首段就是酒店名）；
+ *   · BUNDLE 行没联查到酒店名 → **留空**，绝不拿 description 首段顶上：套餐行的 description
+ *     是套餐名（「三星 2天1晚 岘港」），存进房组会被导出当成酒店印出来，改档后还停在旧档。
+ *     留空时服务端 / 导出按行上 FK 落位回落，比错名安全。
+ * 展示 label 仍可拿 description 首段撑行名（只是给人认行，不落库）。
  */
 export function roomingHotelItemsFromOrder(
   items: ReadonlyArray<{
@@ -207,6 +224,7 @@ export function roomingHotelItemsFromOrder(
     kind?: string;
     description: string;
     hotelName?: string | null;
+    hotelPendingTier?: number | null;
     roomTypeName?: string | null;
     hotelRoomTypeId?: string | null;
     hotelCheckIn?: string | null;
@@ -216,12 +234,21 @@ export function roomingHotelItemsFromOrder(
   return items
     .filter((it) => it.kind === 'HOTEL' || (it.kind === 'BUNDLE' && it.hotelRoomTypeId))
     .map((it) => {
-      const itemHotelName = it.hotelName?.trim() || it.description.split(' · ')[0]?.trim() || '';
+      const pendingTier = it.hotelPendingTier ?? null;
+      const descriptionHead = it.description.split(' · ')[0]?.trim() || '';
+      const itemHotelName =
+        pendingTier != null
+          ? pendingPlacementHotelName(pendingTier)
+          : it.hotelName?.trim() || (it.kind === 'HOTEL' ? descriptionHead : '');
       const range =
         it.hotelCheckIn && it.hotelCheckOut
           ? `${dateOnly(it.hotelCheckIn)}~${dateOnly(it.hotelCheckOut)}`
           : '';
-      const label = [itemHotelName || '酒店行', it.roomTypeName?.trim(), range]
+      const label = [
+        itemHotelName || descriptionHead || '酒店行',
+        pendingTier != null ? undefined : it.roomTypeName?.trim(),
+        range,
+      ]
         .filter((s): s is string => !!s)
         .join(' · ');
       return { id: it.id, label, hotelName: itemHotelName };

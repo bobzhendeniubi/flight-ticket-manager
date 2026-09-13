@@ -150,6 +150,13 @@ import {
   type ProspectiveOccupancy,
   type RandomTierFitViolation,
 } from '../hotel-control/hotel-control.service.js';
+import {
+  readRoomGroupArray,
+  refreshRoomGroupsForItem,
+  renameBundlePrefixedDescription,
+  resolveRoomGroupPlacement,
+  roomGroupItemId,
+} from './room-group-placement.js';
 import { env } from '../../config/env.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
@@ -13784,56 +13791,30 @@ export class OrderService {
       }
 
       // ── 3. 分房表里属于本行的组 → 改名到新酒店+新房型（HIGH 修复 + 归属精确匹配）──
-      // 优先按 orderItemId == 本行精确匹配（split-room-group / 分房保存写入的归属字段）——
-      // 这是数据模型上百分百的"这组人就是这一行的客人"，跨酒店/同酒店多行都不会误伤。
-      // 无任何组归属到本行时回退旧口径：(hotelName, roomType) 二元组匹配 —— 一个订单有 2 条
-      // HOTEL 行都住"同一家酒店"（不同房型/不同批客人）时，只换其中一行，二元组比单凭酒店名
-      // 更贴近"这条订单行"的身份；已归属到**其它行**的组绝不参与二元组匹配（名字撞上也不改）。
-      // 同时把 roomType 也一并改写到新房型名（旧版只改 hotelName，遗留一个在目标酒店根本
-      // 不存在的旧房型名，分房表看着货不对板）。
-      // 随机单落位（无 oldRoomType）没有「旧酒店名」可匹配 → 只走 orderItemId 精确匹配，
-      // 绝不拿 undefined 去比对分房组的 hotelName（那会把所有没填酒店名的组一并误改）。
-      const roomAssignmentRaw = order.roomAssignment;
-      if (roomAssignmentRaw && typeof roomAssignmentRaw === 'object' && !Array.isArray(roomAssignmentRaw)) {
-        const groups = (roomAssignmentRaw as { roomGroups?: unknown }).roomGroups;
-        if (Array.isArray(groups)) {
-          const groupItemId = (g: unknown): string | null => {
-            if (g == null || typeof g !== 'object') return null;
-            const v = (g as { orderItemId?: unknown }).orderItemId;
-            return typeof v === 'string' && v.length > 0 ? v : null;
-          };
-          const hasOwnAttribution = groups.some((g) => groupItemId(g) === item.id);
-          let changed = false;
-          const newGroups = groups.map((g) => {
-            if (g == null || typeof g !== 'object') return g;
-            const attributedTo = groupItemId(g);
-            const matched = hasOwnAttribution
-              ? attributedTo === item.id
-              : oldRoomType != null &&
-                attributedTo == null &&
-                (g as { hotelName?: unknown }).hotelName === oldRoomType.hotel.name &&
-                (g as { roomType?: unknown }).roomType === oldRoomType.name;
-            if (matched) {
-              changed = true;
-              return {
-                ...(g as Record<string, unknown>),
-                hotelName: newRoomType.hotel.name,
-                roomType: newRoomType.name,
-              };
-            }
-            return g;
+      // 匹配与改写收口在 room-group-placement.refreshRoomGroupsForItem（套餐改档同一份，两处不再各写一遍）：
+      //   · 优先按 orderItemId == 本行精确匹配（split-room-group / 分房保存写入的归属字段）——
+      //     这是数据模型上百分百的"这组人就是这一行的客人"，跨酒店/同酒店多行都不会误伤；
+      //   · 无任何组归属到本行时回退旧口径：(hotelName, roomType) 二元组匹配 —— 一个订单有 2 条
+      //     HOTEL 行都住"同一家酒店"（不同房型/不同批客人）时，只换其中一行，二元组比单凭酒店名
+      //     更贴近"这条订单行"的身份；已归属到**其它行**的组绝不参与二元组匹配（名字撞上也不改）；
+      //   · 随机单落位（无 oldRoomType）没有「旧酒店名」可匹配 → 只走精确归属，绝不拿 undefined
+      //     去比对分房组的 hotelName（那会把所有没填酒店名的组一并误改）。
+      // hotelName 与 roomType 一并改写到新房型（旧版只改 hotelName，留下一个在目标酒店根本不存在的
+      // 旧房型名）；新落位名走 resolveRoomGroupPlacement —— 万一目标房型挂在随机档占位酒店上，
+      // 写的是「X星随机（待落位）」而不是占位酒店的字面名。
+      const nextPlacement = resolveRoomGroupPlacement({ hotelRoomType: newRoomType });
+      if (nextPlacement) {
+        const refreshed = refreshRoomGroupsForItem(order.roomAssignment, item.id, nextPlacement, {
+          legacyMatch: (g) =>
+            oldRoomType != null &&
+            g.hotelName === oldRoomType.hotel.name &&
+            g.roomType === oldRoomType.name,
+        });
+        if (refreshed.changed) {
+          await tx.order.update({
+            where: { id: orderId },
+            data: { roomAssignment: refreshed.roomAssignment as Prisma.InputJsonValue },
           });
-          if (changed) {
-            await tx.order.update({
-              where: { id: orderId },
-              data: {
-                roomAssignment: {
-                  ...(roomAssignmentRaw as Record<string, unknown>),
-                  roomGroups: newGroups,
-                } as Prisma.InputJsonValue,
-              },
-            });
-          }
         }
       }
 
@@ -15753,6 +15734,8 @@ export class OrderService {
           total: true,
           paidAmount: true,
           adjustments: true,
+          // roomAssignment：改档后同事务刷新属于套餐行的房组落位名（见 1b′）。
+          roomAssignment: true,
           items: { select: CHANGE_BUNDLE_ITEM_SELECT },
         },
       });
@@ -15987,6 +15970,55 @@ export class OrderService {
         },
       });
 
+      // 1b′. 派生文本跟着落位走：分房表房组 + 机票腿等派生行的 description。
+      //   · 房组 hotelName / roomType 是「归属行落位」的照抄（分房弹窗按行预填），不刷就停在旧档
+      //     （「四星 2天1晚 岘港」）；而三张导出表的「酒店」列刻意优先取房组文本（跟房控走），
+      //     于是改档后产品内容已是三星、导出仍印四星。
+      //   · 口径 = room-group-placement.resolveRoomGroupPlacement（与换酒店流程同一份）：
+      //     新档盖了真酒店房型 → 酒店名 + 房型名；新档是随机档（房型挂在占位酒店上 / 没盖房型）
+      //     → 「X星随机（待落位）」+「待落位」，档次取占位酒店的档次或套餐结算档次。
+      //   · 归属精确匹配优先；本行无归属组时，只认「无归属 + hotelName 恰好等于旧套餐名」的老房组
+      //     （早期分房弹窗把套餐名当酒店名存下来的残留），其它手填文本一律不动。
+      const stampedRoomType =
+        priced.hotelStamp != null &&
+        newBundle.hotelRoomType != null &&
+        priced.hotelStamp.hotelRoomTypeId === newBundle.hotelRoomTypeId
+          ? newBundle.hotelRoomType
+          : null;
+      const nextPlacement = resolveRoomGroupPlacement({
+        hotelRoomType: stampedRoomType,
+        randomStarTier:
+          stampedRoomType == null && newBundle.settlementTier != null
+            ? SETTLEMENT_TIER_STAR_RATING[newBundle.settlementTier]
+            : null,
+      });
+      let roomAssignmentAfterChange: Prisma.InputJsonValue | undefined;
+      if (nextPlacement) {
+        const oldBundleName = oldBundle?.name ?? null;
+        const refreshed = refreshRoomGroupsForItem(locked.roomAssignment, bundleRow.id, nextPlacement, {
+          legacyMatch: (g) => oldBundleName != null && g.hotelName === oldBundleName,
+        });
+        if (refreshed.changed) {
+          roomAssignmentAfterChange = refreshed.roomAssignment as Prisma.InputJsonValue;
+        }
+      } else if (
+        (readRoomGroupArray(locked.roomAssignment) ?? []).some(
+          (g) => roomGroupItemId(g) === bundleRow.id,
+        )
+      ) {
+        warnings.push('新档未解析出住宿落位，分房表房组的酒店名未能自动刷新，请在分房里核对');
+      }
+      // 机票腿等派生行的 description 以套餐名为前缀（「<套餐名> · 去程（经济舱）」）：换成新套餐名。
+      // 只认精确前缀（差额行「套餐改档差额：…」等不是这个前缀，自然不动）。
+      if (oldBundle?.name) {
+        for (const it of locked.items) {
+          if (it.id === bundleRow.id || typeof it.description !== 'string') continue;
+          const renamed = renameBundlePrefixedDescription(it.description, oldBundle.name, newBundle.name);
+          if (renamed == null) continue;
+          await tx.orderItem.update({ where: { id: it.id }, data: { description: renamed } });
+        }
+      }
+
       // 1c. 差额行（正=补收 FEE、负=优惠 DISCOUNT）。差额为 0 时不建行（改档本身仍留审计）。
       let diffItemId: string | null = null;
       if (diffCny !== 0) {
@@ -16041,6 +16073,8 @@ export class OrderService {
           subtotal: new Prisma.Decimal(newSubtotal),
           total: new Prisma.Decimal(newSubtotal),
           adjustments: log,
+          // 1b′ 刷新过的分房表随总额收敛同一笔 update 落库（没变就不带这个键）。
+          ...(roomAssignmentAfterChange !== undefined ? { roomAssignment: roomAssignmentAfterChange } : {}),
         },
       });
 
@@ -22655,6 +22689,8 @@ function isUniqueViolation(err: unknown, fieldHint: string): boolean {
 export const CHANGE_BUNDLE_ITEM_SELECT = {
   id: true,
   kind: true,
+  // description：改档后把机票腿等「<旧套餐名> · …」前缀的派生行改写成新套餐名（只认精确前缀）。
+  description: true,
   quantity: true,
   amount: true,
   bundleId: true,
@@ -22787,7 +22823,17 @@ const CHANGE_BUNDLE_PRICING_SELECT = {
   legs: true,
   settlementTier: true,
   settlementNights: true,
-  hotelRoomType: { select: { maxAdults: true, maxChildren: true, basePrice: true, hotelId: true } },
+  hotelRoomType: {
+    select: {
+      maxAdults: true,
+      maxChildren: true,
+      basePrice: true,
+      hotelId: true,
+      // name / hotel：改档后刷新分房表房组的落位名（真酒店名+房型名，或占位酒店 → 「X星随机（待落位）」）。
+      name: true,
+      hotel: { select: { name: true, randomTierPlaceholder: true } },
+    },
+  },
 } as const;
 
 /**
