@@ -17137,6 +17137,22 @@ export class OrderService {
 
       // 人工复核提示（不阻断，随响应回给运营）。
       const warnings: string[] = [];
+      // §八「套餐改档」防御：resolveChangeableBundleRow 已经在锁后复检里挡掉「任一酒店/套餐行
+      // 落了真实酒店」的单（settled 分支），共享成员必须归属真实酒店行（§三），所以按现有闸的
+      // 结构本分支正常不可达——这里只是防御性兜底：万一未来放宽了那道闸，到达即解绑 + 警告，
+      // 不能让改档在「房还合住着」的情况下改掉档次/房型/落位。
+      for (const it of locked.items) {
+        if (it.kind !== OrderItemKind.HOTEL && it.kind !== OrderItemKind.BUNDLE) continue;
+        const unbindResult = await unbindSharedRoomMembersForItem(tx, {
+          orderId,
+          orderItemId: it.id,
+          reason: '套餐改档解绑（防御分支）',
+        });
+        if (unbindResult.unbound.length === 0) continue;
+        warnings.push(
+          ...formatUnbindWarning(unbindResult.unbound, actor.role === UserRole.AGENT ? 'agent' : 'internal'),
+        );
+      }
       if (rowMetadata.designatedHotel) {
         warnings.push('原「指定酒店」及其加价已随本次改档清除，请按新档次重新指定酒店');
       }
