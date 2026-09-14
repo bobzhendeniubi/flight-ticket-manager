@@ -243,6 +243,24 @@ export interface SaveSharedRoomsResult {
   warnings: string[];
 }
 
+/**
+ * 单张受影响订单的分房审计负载（§七：每张涉及订单各写一条 UPDATE_ROOM_ASSIGNMENT，
+ * before/after 带 roomAssignment 与 roomsBilled；after 另带 sharedRoomId + 同房其它订单号——
+ * 这是内部审计，允许带对方单号，不受 §十对外角色 DTO 的脱敏约束）。
+ */
+interface OrderRoomAssignmentAuditPayload {
+  orderId: string;
+  orderNumber: string;
+  beforeRoomAssignment: unknown;
+  /** itemId → 变更前 roomsBilled（null=该行落库前也是 null）。*/
+  beforeRoomsBilled: Record<string, number | null>;
+  afterRoomAssignment: unknown;
+  /** itemId → 变更后 roomsBilled（本次显式回写到的每一行）。*/
+  afterRoomsBilled: Record<string, number>;
+  /** sharedRoomId → 同房其它订单号（本单参与的每一间共享房各一条）。*/
+  sharedRooms: Record<string, string[]>;
+}
+
 /** 一次事务内的订单快照（锁后重读）。*/
 interface LockedOrderRow {
   id: string;
@@ -260,6 +278,8 @@ interface LockedOrderRow {
     hotelId: string | null;
     randomStarTier: number | null;
     metadata: unknown;
+    /** 落库前的 roomsBilled 快照（审计 before 用）。*/
+    roomsBilled: number | null;
   }>;
 }
 
@@ -285,6 +305,7 @@ async function loadLockedOrders(
           hotelCheckOut: true,
           randomStarTier: true,
           metadata: true,
+          roomsBilled: true,
           hotelRoomType: { select: { hotelId: true } },
         },
       },
@@ -308,6 +329,7 @@ async function loadLockedOrders(
         hotelId: it.hotelRoomType?.hotelId ?? null,
         randomStarTier: it.randomStarTier,
         metadata: it.metadata,
+        roomsBilled: it.roomsBilled == null ? null : Number(it.roomsBilled.toString()),
       })),
     });
   }
@@ -356,6 +378,17 @@ function readBillingFraction(g: Record<string, unknown>): number {
   return 1;
 }
 
+/**
+ * 幂等占位哨兵：`sharedRoomRequest.create` 先写这个值占住 requestToken，跑完真正的业务逻辑
+ * 才会被最终结果覆盖。resultJson 列是必填 Json（非 nullable），不能用 SQL NULL 当哨兵，
+ * 所以用一个真结果永远不会长这样的形状（finalResult 恒有 rooms/dissolved/warnings 三个键，
+ * 从不带 __pending）来判定「这行是不是还没跑完」。
+ */
+const PENDING_SENTINEL = { __pending: true } as const;
+function isPendingSentinel(value: unknown): boolean {
+  return !!value && typeof value === 'object' && (value as Record<string, unknown>).__pending === true;
+}
+
 export async function saveSharedRooms(
   body: SaveSharedRoomsBody,
   actor: AuditActor,
@@ -371,16 +404,29 @@ export async function saveSharedRooms(
   });
 
   // ── 幂等：requestToken 唯一，先占位再算——占位成功才是「第一次」，占位失败读现存记录回放/冲突 ──
+  //
+  // 占位成功之后，本函数任何一步失败（400/409/其它异常）都必须把占位行删掉：否则占位行的
+  // resultJson 停在 PENDING_SENTINEL，下次同 token 同指纹重试会被 existing.fingerprint ===
+  // fingerprint 命中、直接回放一个「看起来成功但没有 rooms/dissolved」的假结果——前端按 200
+  // 处理，实际什么都没落库。见下方 try/finally：reserved 为 true 时，退出前若没有把
+  // resultJson 换成真结果，一律删掉占位行，让同 token 重试真正重新跑一遍。
+  let reserved = false;
   try {
     await client.sharedRoomRequest.create({
-      data: { requestToken: body.requestToken, fingerprint, resultJson: {} },
+      data: { requestToken: body.requestToken, fingerprint, resultJson: PENDING_SENTINEL },
     });
+    reserved = true;
   } catch (err) {
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
       const existing = await client.sharedRoomRequest.findUnique({
         where: { requestToken: body.requestToken },
       });
       if (existing && existing.fingerprint === fingerprint) {
+        if (isPendingSentinel(existing.resultJson)) {
+          // 上一次占位后还没写出真结果——可能仍在处理中，也可能失败后占位没删干净（极端竞态：
+          // 两个进程同时占位失败又同时想删）。不能当「已经成功」回放，请调用方换新 token 重试。
+          throw new ConflictError('该请求编号上一次保存尚未完成，请使用新的请求编号重试');
+        }
         return existing.resultJson as unknown as SaveSharedRoomsResult;
       }
       throw new ConflictError('该请求编号已用于另一次不同的跨单分房保存，请刷新后重试');
@@ -388,6 +434,22 @@ export async function saveSharedRooms(
     throw err;
   }
 
+  try {
+    return await saveSharedRoomsInner(body, actor, client);
+  } catch (err) {
+    if (reserved) {
+      // 最佳努力清理占位——删失败也不能吞掉原始错误，原始错误才是调用方需要看到的。
+      await client.sharedRoomRequest.delete({ where: { requestToken: body.requestToken } }).catch(() => {});
+    }
+    throw err;
+  }
+}
+
+async function saveSharedRoomsInner(
+  body: SaveSharedRoomsBody,
+  actor: AuditActor,
+  client: PrismaClient,
+): Promise<SaveSharedRoomsResult> {
   const checkInD = new Date(`${body.checkIn}T00:00:00.000Z`);
   const checkOutD = new Date(`${body.checkOut}T00:00:00.000Z`);
   const nightDates = expandNights(body.checkIn, body.checkOut);
@@ -566,9 +628,16 @@ export async function saveSharedRooms(
         newGroupsByOrder.set(entry.orderId, arr);
       }
     }
-    // 新建/更新的共享房：给每个 group 所在订单追加一个共享房组
+    // 新建/更新的共享房：给每个 group 所在订单追加一个共享房组。
+    //
+    // 新房的 id 在这里（写订单 JSON 镜像）与下面「落库」段（真正 tx.sharedRoom.create）分两处
+    // 用到——必须是同一个值，否则订单 JSON 里的 sharedRoomId 会指向一个数据库里根本不存在的
+    // 幽灵 id（两处各自调用 randomUUID() 就会各生成一个，谁也不认识谁）。resolvedRoomIds 按
+    // body.rooms 的下标一一对应，在这整个函数里只生成一次、两处复用同一份。
+    const resolvedRoomIds = body.rooms.map((r) => r.sharedRoomId ?? randomUUID());
     const roomTypeCache = new Map<string, { name: string }>();
-    for (const room of body.rooms) {
+    for (let roomIndex = 0; roomIndex < body.rooms.length; roomIndex++) {
+      const room = body.rooms[roomIndex];
       if (!roomTypeCache.has(room.hotelRoomTypeId)) {
         const rt = await tx.hotelRoomType.findUnique({
           where: { id: room.hotelRoomTypeId },
@@ -576,7 +645,7 @@ export async function saveSharedRooms(
         });
         roomTypeCache.set(room.hotelRoomTypeId, { name: rt?.name ?? '' });
       }
-      const sharedRoomId = room.sharedRoomId ?? randomUUID();
+      const sharedRoomId = resolvedRoomIds[roomIndex];
       for (const g of room.groups) {
         const arr = newGroupsByOrder.get(g.orderId) ?? [];
         arr.push({
@@ -617,7 +686,8 @@ export async function saveSharedRooms(
         activeMemberOrderIds: [],
       });
     }
-    for (const room of body.rooms) {
+    for (let roomIndex = 0; roomIndex < body.rooms.length; roomIndex++) {
+      const room = body.rooms[roomIndex];
       const activeOrderIds = [
         ...new Set(
           room.groups
@@ -629,7 +699,7 @@ export async function saveSharedRooms(
         ),
       ];
       nextSharedRooms.push({
-        sharedRoomId: room.sharedRoomId,
+        sharedRoomId: resolvedRoomIds[roomIndex], // 新房也带上——与订单 JSON/落库用的是同一个 id
         checkIn: checkInD,
         checkOut: checkOutD,
         activeMemberOrderIds: activeOrderIds,
@@ -652,9 +722,10 @@ export async function saveSharedRooms(
       });
       await tx.sharedRoomMember.deleteMany({ where: { sharedRoomId: roomId } });
     }
-    for (const room of body.rooms) {
-      let sharedRoomId = room.sharedRoomId;
-      if (sharedRoomId) {
+    for (let roomIndex = 0; roomIndex < body.rooms.length; roomIndex++) {
+      const room = body.rooms[roomIndex];
+      const sharedRoomId = resolvedRoomIds[roomIndex]; // 与订单 JSON 镜像里写的必须是同一个 id
+      if (room.sharedRoomId) {
         const updated = await tx.sharedRoom.update({
           where: { id: sharedRoomId },
           data: {
@@ -669,6 +740,7 @@ export async function saveSharedRooms(
       } else {
         const created = await tx.sharedRoom.create({
           data: {
+            id: sharedRoomId, // 显式传 id，覆盖 @default(cuid())——必须等于上面 JSON 里已经写的值
             hotelId: body.hotelId,
             hotelRoomTypeId: room.hotelRoomTypeId,
             checkIn: checkInD,
@@ -678,7 +750,6 @@ export async function saveSharedRooms(
           },
           select: { id: true, version: true },
         });
-        sharedRoomId = created.id;
         savedRooms.push({ sharedRoomId: created.id, version: created.version });
       }
       for (const g of room.groups) {
@@ -696,6 +767,8 @@ export async function saveSharedRooms(
       }
     }
 
+    // 每张受影响订单的审计负载（事务内收集，事务外才 writeAudit——审计不参与业务事务）。
+    const orderAuditPayloads: OrderRoomAssignmentAuditPayload[] = [];
     for (const [orderId, groups] of newGroupsByOrder) {
       const order = orders.get(orderId);
       if (!order) continue;
@@ -705,20 +778,62 @@ export async function saveSharedRooms(
       });
       // roomsBilled：按 orderItemId 去重后求和（同一行若被拆成多个 group——正常只会有一个
       // 普通组 + 至多多个共享组，见 §三「一条酒店行可能同时有普通房和多个共享房」——按行累加）。
-      // 只改本次 groups 实际引用到的行；本单与本次改动无关的其它酒店行原样不动。
-      // 引用到的行一律显式写（哪怕算出 0 也写 0，不留 null——null 会重新激活 metadata 兜底）。
       const roomsByItemId = new Map<string, number>();
       for (const g of groups) {
         const itemId = groupOrderItemId(g);
         if (!itemId) continue;
         roomsByItemId.set(itemId, (roomsByItemId.get(itemId) ?? 0) + readBillingFraction(g));
       }
-      for (const [itemId, rooms] of roomsByItemId) {
+      // 显式回写的行 = 本次新 groups 引用到的行 ∪ 变更前旧 groups 引用过的行。前者按新值写
+      // （哪怕算出 0 也写 0，不留 null——null 会重新激活 metadata 兜底）；后者若这次不再被
+      // 任何组引用（乘客被整体搬去挂在另一条行的房组/共享房），同样要显式写 0——否则那条行
+      // 的乘客已经没有任何房组承载，roomsBilled 却还停在搬走前的旧值，两本账对不上。
+      // 变更前后都没有房组引用过的行（从未分房，roomsBilled 是录单时算的）保持不动。
+      const oldGroupsForOrder = parseRoomGroups(order.roomAssignment);
+      const oldItemIds = new Set(
+        oldGroupsForOrder.map((g) => groupOrderItemId(g)).filter((v): v is string => v != null),
+      );
+      const itemIdsToWrite = new Set<string>([...roomsByItemId.keys(), ...oldItemIds]);
+      const afterRoomsBilled: Record<string, number> = {};
+      for (const itemId of itemIdsToWrite) {
+        const rooms = roundFraction(roomsByItemId.get(itemId) ?? 0);
+        afterRoomsBilled[itemId] = rooms;
         await tx.orderItem.update({
           where: { id: itemId },
-          data: { roomsBilled: new Prisma.Decimal(roundFraction(rooms)) },
+          data: { roomsBilled: new Prisma.Decimal(rooms) },
         });
       }
+
+      // 本单参与的共享房 → 同房其它订单号（内部审计，可以带单号）。
+      const sharedIdsForOrder = [
+        ...new Set(groups.map((g) => groupSharedId(g)).filter((v): v is string => v != null)),
+      ];
+      const coMemberOrderNumbersBySharedRoomId: Record<string, string[]> = {};
+      for (const sid of sharedIdsForOrder) {
+        const members = await tx.sharedRoomMember.findMany({
+          where: { sharedRoomId: sid, orderId: { not: orderId } },
+          select: { orderId: true },
+        });
+        const otherOrderIds = [...new Set(members.map((m) => m.orderId))];
+        const otherOrders =
+          otherOrderIds.length > 0
+            ? await tx.order.findMany({
+                where: { id: { in: otherOrderIds } },
+                select: { orderNumber: true },
+              })
+            : [];
+        coMemberOrderNumbersBySharedRoomId[sid] = otherOrders.map((o) => o.orderNumber);
+      }
+
+      orderAuditPayloads.push({
+        orderId,
+        orderNumber: order.orderNumber,
+        beforeRoomAssignment: order.roomAssignment,
+        beforeRoomsBilled: Object.fromEntries(order.items.map((it) => [it.id, it.roomsBilled])),
+        afterRoomAssignment: { roomGroups: groups },
+        afterRoomsBilled,
+        sharedRooms: coMemberOrderNumbersBySharedRoomId,
+      });
     }
 
     const finalResult: SaveSharedRoomsResult = {
@@ -730,17 +845,44 @@ export async function saveSharedRooms(
       where: { requestToken: body.requestToken },
       data: { resultJson: finalResult as unknown as Prisma.InputJsonValue },
     });
-    return finalResult;
+    // 主单：受影响订单里 id 最小的一个，给 SAVE_SHARED_ROOMS 总览审计条挂载（本条本身
+    // 只是「这次保存做了什么」的总览，逐单细节在上面 orderAuditPayloads 里）。
+    const primaryOrderId = [...orders.keys()].sort()[0] ?? null;
+    return { finalResult, orderAuditPayloads, primaryOrderId };
   });
 
-  void writeAudit({
-    actor,
-    action: 'SAVE_SHARED_ROOMS',
-    targetType: 'PRODUCT',
-    targetId: body.hotelId,
-    targetLabel: `${body.hotelId} ${body.checkIn}→${body.checkOut}`,
-    after: { rooms: result.rooms, dissolved: result.dissolved, requestToken: body.requestToken },
-  });
+  const { finalResult, orderAuditPayloads, primaryOrderId } = result;
 
-  return result;
+  for (const payload of orderAuditPayloads) {
+    void writeAudit({
+      actor,
+      action: 'UPDATE_ROOM_ASSIGNMENT',
+      targetType: 'ORDER',
+      targetId: payload.orderId,
+      targetLabel: payload.orderNumber,
+      before: { roomAssignment: payload.beforeRoomAssignment, roomsBilled: payload.beforeRoomsBilled },
+      after: {
+        roomAssignment: payload.afterRoomAssignment,
+        roomsBilled: payload.afterRoomsBilled,
+        sharedRooms: payload.sharedRooms,
+      },
+    });
+  }
+  if (primaryOrderId) {
+    void writeAudit({
+      actor,
+      action: 'SAVE_SHARED_ROOMS',
+      targetType: 'ORDER',
+      targetId: primaryOrderId,
+      targetLabel: `${body.hotelId} ${body.checkIn}→${body.checkOut}`,
+      after: {
+        rooms: finalResult.rooms,
+        dissolved: finalResult.dissolved,
+        requestToken: body.requestToken,
+        orderIds: orderAuditPayloads.map((p) => p.orderId),
+      },
+    });
+  }
+
+  return finalResult;
 }
