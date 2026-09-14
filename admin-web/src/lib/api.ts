@@ -1504,13 +1504,27 @@ export interface RoomGroup {
   roomType: string;
   passengerIds: string[];
   notes?: string;
-  /** 占房间数：整间=1（缺省），拼房半间=0.5。例：7人3.5间。 */
+  /**
+   * 占房间数：整间=1（缺省），拼房半间=0.5。例：7人3.5间。
+   * 允许 0——仅限跨单分房的共享组（该组带 sharedRoomId 时，主单让份场景）；普通组传 0 服务端 400。
+   */
   roomFraction?: number;
   /**
    * 房组归属的订单行 id（本单 HOTEL/BUNDLE 行；服务端校验）。带归属时房控/导出按该行
    * 计酒店与间数，「拆房组 → 按组换酒店」也靠它。缺省 = 旧口径（整单计数）。
    */
   orderItemId?: string;
+  /**
+   * 跨单分房共享房 id（服务端镜像写入，只读）。带值的组与他单合住，分房编辑器应锁定
+   * 除备注外的全部字段——改动请去房控页「跨单分房」。客户端发来的这个字段服务端一律
+   * 忽略（orders.routes.ts room-assignment 的 zod 未声明该键）。
+   */
+  sharedRoomId?: string;
+  /**
+   * 拆单半间配对键（服务端写入，只读）。编辑器重存分房时应原样透传，不能因重新构造
+   * 房组对象而丢失（丢失会导致两个半间配不回一间）；服务端对旧组也会兜底搬运。
+   */
+  splitPairKey?: string;
 }
 
 export interface RoomAssignment {
@@ -7544,7 +7558,122 @@ export const hotelControlOpsApi = {
       `/hotel-control/nightly-remaining?hotelRoomTypeId=${encodeURIComponent(params.hotelRoomTypeId)}&checkIn=${encodeURIComponent(params.checkIn)}&checkOut=${encodeURIComponent(params.checkOut)}`,
       { token },
     ),
+
+  /**
+   * 跨单分房工作台读模型：本酒店本入住区间（精确匹配 checkIn/checkOut）内全部有效订单
+   * 的乘客与酒店行 + 既有共享房列表。ADMIN/STAFF only，代理不开放。
+   * 对应 backend/src/modules/hotel-control/hotel-control.shared-rooms.ts getSharedRoomWorkbench。
+   */
+  getSharedRoomWorkbench: (
+    token: string,
+    params: { hotelId: string; checkIn: string; checkOut: string },
+  ) =>
+    apiFetch<SharedRoomWorkbench>(
+      `/hotel-control/shared-rooms/workbench?hotelId=${encodeURIComponent(params.hotelId)}&checkIn=${encodeURIComponent(params.checkIn)}&checkOut=${encodeURIComponent(params.checkOut)}`,
+      { token },
+    ),
+
+  /**
+   * 跨单分房保存：新建/改动共享房（Σ份额须=1，服务端 400）+ 整间解散。ADMIN/STAFF only。
+   * requestToken 幂等（同 token 同指纹回放首次结果，同 token 不同指纹 409）；
+   * expectedVersions 版本 CAS 不匹配 409「该房间已被他人修改，请刷新后重试」。
+   * 对应 backend/src/modules/hotel-control/hotel-control.shared-rooms.ts saveSharedRooms。
+   */
+  saveSharedRooms: (token: string, body: SaveSharedRoomsBody) =>
+    apiFetch<SaveSharedRoomsResult>('/hotel-control/shared-rooms', { method: 'PUT', token, body }),
 };
+
+// ── 跨单分房工作台类型（§七，v2 方案）── 字段与形状照抄后端实现（真值以代码为准）：
+// backend/src/modules/hotel-control/hotel-control.shared-rooms.ts + hotel-control.schemas.ts。
+
+export interface SharedRoomWorkbenchPassenger {
+  id: string;
+  fullName: string;
+  chineseName: string | null;
+  gender: string | null;
+}
+
+export interface SharedRoomWorkbenchOrderItem {
+  id: string;
+  hotelRoomTypeId: string;
+  roomTypeName: string;
+  roomsBilled: number | null;
+  /** 当前所在位置：null=未分房；普通房组给 groupId；共享房给 sharedRoomId。 */
+  currentGroupId: string | null;
+  currentSharedRoomId: string | null;
+}
+
+export interface SharedRoomWorkbenchOrder {
+  orderId: string;
+  orderNumber: string;
+  status: OrderStatus;
+  agentId: string | null;
+  passengers: SharedRoomWorkbenchPassenger[];
+  items: SharedRoomWorkbenchOrderItem[];
+  /**
+   * 本单在本酒店本区间的房组是否已全部补齐 orderItemId 归属；false = 不能拉进共享房
+   * （部分有归属部分没有），须先在分房编辑器给全部房组补齐归属订单行。
+   */
+  fullyAttributed: boolean;
+}
+
+export interface SharedRoomWorkbenchRoomMember {
+  orderId: string;
+  orderItemId: string;
+  passengerId: string;
+  roomFraction: number;
+}
+
+export interface SharedRoomWorkbenchRoom {
+  sharedRoomId: string;
+  hotelRoomTypeId: string;
+  version: number;
+  notes: string | null;
+  members: SharedRoomWorkbenchRoomMember[];
+}
+
+export interface SharedRoomWorkbench {
+  hotelId: string;
+  checkIn: string;
+  checkOut: string;
+  orders: SharedRoomWorkbenchOrder[];
+  sharedRooms: SharedRoomWorkbenchRoom[];
+}
+
+/** PUT /hotel-control/shared-rooms 请求体里一间房的一个成员组（来自某张订单的某条酒店行）。 */
+export interface SaveSharedRoomGroupInput {
+  orderId: string;
+  orderItemId: string;
+  passengerIds: string[];
+  /** 计费份额，0.5 步进，允许 0（拍板默认：一间房里第一张单 1、其余 0）。 */
+  roomFraction: number;
+}
+
+export interface SaveSharedRoomInput {
+  /** 缺省 = 新建（服务端生成 id）；非空 = 改动既有共享房（须在 expectedVersions 给出期望版本）。 */
+  sharedRoomId?: string;
+  hotelRoomTypeId: string;
+  notes?: string;
+  groups: SaveSharedRoomGroupInput[];
+}
+
+export interface SaveSharedRoomsBody {
+  hotelId: string;
+  checkIn: string;
+  checkOut: string;
+  requestToken: string;
+  /** 版本 CAS：key = sharedRoomId，只需对本次改动到的既有房间给出期望版本。 */
+  expectedVersions?: Record<string, number>;
+  rooms: SaveSharedRoomInput[];
+  /** 要整间解散的共享房 id（成员清空、状态 DISSOLVED；对应订单房组退回普通房组）。 */
+  dissolve?: string[];
+}
+
+export interface SaveSharedRoomsResult {
+  rooms: Array<{ sharedRoomId: string; version: number }>;
+  dissolved: string[];
+  warnings: string[];
+}
 
 // ── 结算价 / 议价申请（代理对自家单：锁价前自己改立即生效，锁价后走「提交申请 → 运营确认」）── 独立命名空间，
 // 不改动上方既有 `api` 对象字面量（并发改动风险，同 hotelControlOpsApi 一带的写法）。
