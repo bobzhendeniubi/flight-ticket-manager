@@ -356,6 +356,17 @@ function readBillingFraction(g: Record<string, unknown>): number {
   return 1;
 }
 
+/**
+ * 幂等占位哨兵：`sharedRoomRequest.create` 先写这个值占住 requestToken，跑完真正的业务逻辑
+ * 才会被最终结果覆盖。resultJson 列是必填 Json（非 nullable），不能用 SQL NULL 当哨兵，
+ * 所以用一个真结果永远不会长这样的形状（finalResult 恒有 rooms/dissolved/warnings 三个键，
+ * 从不带 __pending）来判定「这行是不是还没跑完」。
+ */
+const PENDING_SENTINEL = { __pending: true } as const;
+function isPendingSentinel(value: unknown): boolean {
+  return !!value && typeof value === 'object' && (value as Record<string, unknown>).__pending === true;
+}
+
 export async function saveSharedRooms(
   body: SaveSharedRoomsBody,
   actor: AuditActor,
@@ -371,16 +382,29 @@ export async function saveSharedRooms(
   });
 
   // ── 幂等：requestToken 唯一，先占位再算——占位成功才是「第一次」，占位失败读现存记录回放/冲突 ──
+  //
+  // 占位成功之后，本函数任何一步失败（400/409/其它异常）都必须把占位行删掉：否则占位行的
+  // resultJson 停在 PENDING_SENTINEL，下次同 token 同指纹重试会被 existing.fingerprint ===
+  // fingerprint 命中、直接回放一个「看起来成功但没有 rooms/dissolved」的假结果——前端按 200
+  // 处理，实际什么都没落库。见下方 try/finally：reserved 为 true 时，退出前若没有把
+  // resultJson 换成真结果，一律删掉占位行，让同 token 重试真正重新跑一遍。
+  let reserved = false;
   try {
     await client.sharedRoomRequest.create({
-      data: { requestToken: body.requestToken, fingerprint, resultJson: {} },
+      data: { requestToken: body.requestToken, fingerprint, resultJson: PENDING_SENTINEL },
     });
+    reserved = true;
   } catch (err) {
     if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
       const existing = await client.sharedRoomRequest.findUnique({
         where: { requestToken: body.requestToken },
       });
       if (existing && existing.fingerprint === fingerprint) {
+        if (isPendingSentinel(existing.resultJson)) {
+          // 上一次占位后还没写出真结果——可能仍在处理中，也可能失败后占位没删干净（极端竞态：
+          // 两个进程同时占位失败又同时想删）。不能当「已经成功」回放，请调用方换新 token 重试。
+          throw new ConflictError('该请求编号上一次保存尚未完成，请使用新的请求编号重试');
+        }
         return existing.resultJson as unknown as SaveSharedRoomsResult;
       }
       throw new ConflictError('该请求编号已用于另一次不同的跨单分房保存，请刷新后重试');
@@ -388,6 +412,22 @@ export async function saveSharedRooms(
     throw err;
   }
 
+  try {
+    return await saveSharedRoomsInner(body, actor, client);
+  } catch (err) {
+    if (reserved) {
+      // 最佳努力清理占位——删失败也不能吞掉原始错误，原始错误才是调用方需要看到的。
+      await client.sharedRoomRequest.delete({ where: { requestToken: body.requestToken } }).catch(() => {});
+    }
+    throw err;
+  }
+}
+
+async function saveSharedRoomsInner(
+  body: SaveSharedRoomsBody,
+  actor: AuditActor,
+  client: PrismaClient,
+): Promise<SaveSharedRoomsResult> {
   const checkInD = new Date(`${body.checkIn}T00:00:00.000Z`);
   const checkOutD = new Date(`${body.checkOut}T00:00:00.000Z`);
   const nightDates = expandNights(body.checkIn, body.checkOut);

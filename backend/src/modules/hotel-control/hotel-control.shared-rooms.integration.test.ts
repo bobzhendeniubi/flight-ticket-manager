@@ -487,4 +487,54 @@ describe('saveSharedRooms · 真 DB E2E', () => {
     expect(Number(itemA.roomsBilled)).toBe(1);
     expect(Number(itemB.roomsBilled)).toBe(0);
   });
+
+  it('幂等占位不留假成功：第一次因订单非有效状态 400 后，同 token 重试真正重新跑一遍并按当前数据给结果', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    // orderB 先是 CANCELLED（不在 COUNTED_STATUSES）——第一次保存必然 400。
+    const orderBRaw = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    await prisma.order.update({ where: { id: orderBRaw.id }, data: { status: OrderStatus.CANCELLED } });
+
+    const token = requestToken();
+    const payload = {
+      hotelId: hotel.id,
+      checkIn: CHECK_IN,
+      checkOut: CHECK_OUT,
+      requestToken: token,
+      rooms: [
+        {
+          hotelRoomTypeId: roomType.id,
+          groups: [
+            {
+              orderId: orderA.id,
+              orderItemId: orderA.items[0].id,
+              passengerIds: [orderA.passengers[0].id],
+              roomFraction: 1,
+            },
+            {
+              orderId: orderBRaw.id,
+              orderItemId: orderBRaw.items[0].id,
+              passengerIds: [orderBRaw.passengers[0].id],
+              roomFraction: 0,
+            },
+          ],
+        },
+      ],
+      dissolve: [],
+    };
+
+    await expect(saveSharedRooms(payload, actor)).rejects.toThrow(/房控有效状态/);
+    // 失败后占位行必须已经被删掉——不是留着一个 resultJson 为占位哨兵的行。
+    const afterFailure = await prisma.sharedRoomRequest.findUnique({ where: { requestToken: token } });
+    expect(afterFailure).toBeNull();
+
+    // 现在把 orderB 修复成有效状态，用**完全相同**的 payload（同 token 同指纹）重试。
+    await prisma.order.update({ where: { id: orderBRaw.id }, data: { status: OrderStatus.PAID } });
+    const retried = await saveSharedRooms(payload, actor);
+    expect(retried.rooms).toHaveLength(1); // 真正重新跑了一遍，不是回放一个空占位
+
+    const itemA = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderA.items[0].id } });
+    expect(Number(itemA.roomsBilled)).toBe(1);
+  });
 });
