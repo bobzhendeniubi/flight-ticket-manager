@@ -61,6 +61,7 @@ import {
   updateBlockPeriod,
   HOTEL_OVERSELL_CAP_MAX,
   HOTEL_OVERSELL_CAP_SETTING_KEY,
+  OCCUPYING_ORDERS_DETAIL_NOTE,
 } from './hotel-control.service.js';
 import { getRandomTierShortfall } from './hotel-control.shortfall.js';
 import { getSharedRoomWorkbench, saveSharedRooms } from './hotel-control.shared-rooms.js';
@@ -211,7 +212,9 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
       q.hotelId ? { hotelId: q.hotelId } : { randomStarTier: q.randomStarTier! },
       q.date,
     );
-    return { occupants };
+    // detailNote：跨单分房下钻新增三列（sharedRoomCount / billedRoomFraction /
+    // physicalRoomsDeduped）口径不同，不能跨单直接相加，见 OCCUPYING_ORDERS_DETAIL_NOTE。
+    return { occupants, detailNote: OCCUPYING_ORDERS_DETAIL_NOTE };
   });
 
   // ── 当日余量（给定房型 + 入住区间；分房弹窗徽标用）───────────────────────

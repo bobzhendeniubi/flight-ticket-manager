@@ -2646,6 +2646,25 @@ export interface HotelOccupantDto {
   checkIn: string; // YYYY-MM-DD（该行入住日）
   checkOut: string; // YYYY-MM-DD（该行退房日）
   agentName: string; // 无代理 = '直客'
+  /**
+   * 跨单分房下钻（§十一）：该单在本次查询 scope（酒店 + 该晚）内参与的 ACTIVE 共享房去重数
+   * （SharedRoomMember 按 sharedRoomId 去重；仅 hotelId 作用域有意义，随机档恒为 0——共享房
+   * 只允许真实酒店真实房型）。同一订单在本次结果里出现多行时，三列取的是**整单**口径，
+   * 每行重复展示同一个数字（与 rooms 逐行不同）。
+   */
+  sharedRoomCount: number;
+  /**
+   * 计费份额：该单在本次查询 scope 内、本晚所有占房行 roomsBilled 之和（见 itemRoomCount；
+   * 已含普通房组份额与共享成员份额，可能是 0.5 步进，也可能因共享份额为 0 而小于 sharedRoomCount）。
+   */
+  billedRoomFraction: number;
+  /**
+   * 去重物理房：整单普通房组去重间数（assignedPhysicalRooms，已排除共享房组，避免重复计）
+   * + 参与共享房数（sharedRoomCount，去重不看份额）。与 billedRoomFraction 是两套不同口径的数，
+   * 详见响应里的 OCCUPYING_ORDERS_DETAIL_NOTE——三列均不能跨单直接相加去凑总物理房间数，
+   * 销控板 used 才是权威合计。
+   */
+  physicalRoomsDeduped: number;
 }
 
 /**
@@ -2692,32 +2711,98 @@ export async function getOccupyingOrders(
     },
   });
 
+  // ── §十一 下钻新增三列：按订单去重聚合（scope 限定为本次查询的酒店 + 该晚）──────────
+  // 计费份额：本次结果集里同一订单可能有多行（一单两店/两房型），逐行 roomsBilled 求和。
+  const billedByOrder = new Map<string, number>();
+  for (const it of items) {
+    billedByOrder.set(it.order.id, round2((billedByOrder.get(it.order.id) ?? 0) + itemRoomCount(it)));
+  }
+  // 参与共享房数：查 SharedRoomMember，按 (hotelId, ACTIVE, checkIn<=该晚<checkOut) 过滤，
+  // 只对 hotelId 作用域有意义（随机档/占位酒店不接受共享房，见 §四）。防御式：单测常用只 mock
+  // orderItem 的 client，没有 sharedRoomMember 委托时按「本环境不支持共享房」回落 0（同
+  // computeSharedRoomPhysicalByDate 的兜底哲学），不抛错。
+  const sharedRoomsByOrder = new Map<string, Set<string>>();
+  if ('hotelId' in roomScope) {
+    const delegate = (
+      client as unknown as {
+        sharedRoomMember?: {
+          findMany: (args: unknown) => Promise<Array<{ orderId: string; sharedRoomId: string }>>;
+        };
+      }
+    ).sharedRoomMember;
+    const orderIds = Array.from(new Set(items.map((it) => it.order.id)));
+    if (delegate && orderIds.length > 0) {
+      const memberRows = await delegate.findMany({
+        where: {
+          orderId: { in: orderIds },
+          sharedRoom: {
+            hotelId: roomScope.hotelId,
+            status: 'ACTIVE',
+            checkIn: { lte: d },
+            checkOut: { gt: d },
+          },
+        },
+        select: { orderId: true, sharedRoomId: true },
+      });
+      for (const row of memberRows) {
+        let set = sharedRoomsByOrder.get(row.orderId);
+        if (!set) {
+          set = new Set();
+          sharedRoomsByOrder.set(row.orderId, set);
+        }
+        set.add(row.sharedRoomId);
+      }
+    }
+  }
+  // 去重物理房的「普通房组」分量：整单口径（assignedPhysicalRooms 已排除共享组），按订单缓存
+  // 避免同一订单的多行重复计算。
+  const normalPhysicalByOrder = new Map<string, number>();
+  const normalPhysicalRooms = (order: { id: string; roomAssignment: unknown }): number => {
+    const cached = normalPhysicalByOrder.get(order.id);
+    if (cached != null) return cached;
+    const val = assignedPhysicalRooms(order.roomAssignment) ?? 0;
+    normalPhysicalByOrder.set(order.id, val);
+    return val;
+  };
+
   return items
     .filter((it) => it.hotelCheckIn != null && it.hotelCheckOut != null)
-    .map((it) => ({
-      orderId: it.order.id,
-      orderNumber: it.order.orderNumber,
-      status: it.order.status,
-      contactName: it.order.contactName,
-      passengerCount: it.order.passengers.filter((p) => p.documentNumber !== 'N/A').length,
-      passengerNames: it.order.passengers
-        .filter((p) => p.documentNumber !== 'N/A')
-        .map((p) => p.chineseName?.trim() || p.fullName),
-      // 归属口径优先（一单两店时本行只显示自己组的数，与合计口径同一把尺）；
-      // 整单无归属（旧数据）回退整单盒子数，再回退行级 roomsBilled/metadata。
-      rooms:
-        assignedRoomsForItem(
-          it.order.roomAssignment,
-          it.id,
-          it.hotelRoomType?.hotel?.name ?? null,
-        ) ??
-        assignedPhysicalRooms(it.order.roomAssignment) ??
-        itemRoomCount(it),
-      checkIn: fmtDateOnly(it.hotelCheckIn!),
-      checkOut: fmtDateOnly(it.hotelCheckOut!),
-      agentName: it.order.agent?.companyName ?? '直客',
-    }));
+    .map((it) => {
+      const sharedRoomIds = sharedRoomsByOrder.get(it.order.id);
+      const sharedRoomCount = sharedRoomIds?.size ?? 0;
+      return {
+        orderId: it.order.id,
+        orderNumber: it.order.orderNumber,
+        status: it.order.status,
+        contactName: it.order.contactName,
+        passengerCount: it.order.passengers.filter((p) => p.documentNumber !== 'N/A').length,
+        passengerNames: it.order.passengers
+          .filter((p) => p.documentNumber !== 'N/A')
+          .map((p) => p.chineseName?.trim() || p.fullName),
+        // 归属口径优先（一单两店时本行只显示自己组的数，与合计口径同一把尺）；
+        // 整单无归属（旧数据）回退整单盒子数，再回退行级 roomsBilled/metadata。
+        rooms:
+          assignedRoomsForItem(
+            it.order.roomAssignment,
+            it.id,
+            it.hotelRoomType?.hotel?.name ?? null,
+          ) ??
+          assignedPhysicalRooms(it.order.roomAssignment) ??
+          itemRoomCount(it),
+        checkIn: fmtDateOnly(it.hotelCheckIn!),
+        checkOut: fmtDateOnly(it.hotelCheckOut!),
+        agentName: it.order.agent?.companyName ?? '直客',
+        sharedRoomCount,
+        billedRoomFraction: billedByOrder.get(it.order.id) ?? 0,
+        physicalRoomsDeduped: round2(normalPhysicalRooms(it.order) + sharedRoomCount),
+      };
+    });
 }
+
+/** getOccupyingOrders 响应里对三列新增明细的口径说明（不可跨单直接相加）。*/
+export const OCCUPYING_ORDERS_DETAIL_NOTE =
+  '参与共享房数 / 计费份额 / 去重物理房三列口径不同、按订单展示（同订单多行会重复出现同一个数字），' +
+  '不能跨单直接相加去凑总物理房间数；本晚该酒店的物理房间合计以销控板用房数为准。';
 
 // ── 当日余量（给定房型 + 入住区间；分房弹窗徽标用）───────────────────────────
 export interface HotelNightlyRemainingResult {
