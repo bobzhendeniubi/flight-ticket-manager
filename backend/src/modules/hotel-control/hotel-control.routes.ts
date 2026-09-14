@@ -16,6 +16,8 @@
  *   GET    /hotel-control/export?from&to           房态导出（xlsx，销控矩阵原样导出）
  *   GET    /hotel-control/passports.zip?hotelId&from&to     按酒店导出护照 zip
  *   POST   /hotel-control/passports-by-names.zip    按姓名批量导出护照 zip（body { names: string[], from?, to? } —— from/to 为出发地本地日区间）
+ *   GET    /hotel-control/shared-rooms/workbench?hotelId&checkIn&checkOut  跨单分房工作台读模型
+ *   PUT    /hotel-control/shared-rooms              跨单分房保存（新建/改动/解散共享房，见 §七）
  */
 import type { FastifyPluginAsync } from 'fastify';
 import { UserRole } from '@prisma/client';
@@ -61,6 +63,11 @@ import {
   HOTEL_OVERSELL_CAP_SETTING_KEY,
 } from './hotel-control.service.js';
 import { getRandomTierShortfall } from './hotel-control.shortfall.js';
+import { getSharedRoomWorkbench, saveSharedRooms } from './hotel-control.shared-rooms.js';
+import {
+  sharedRoomWorkbenchQuerySchema,
+  saveSharedRoomsBodySchema,
+} from './hotel-control.schemas.js';
 import { z } from 'zod';
 import { prisma } from '../../db/prisma.js';
 import { AuditSeverity } from '@prisma/client';
@@ -332,5 +339,17 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
         )}"`,
       )
       .send(buf);
+  });
+
+  // ── 跨单分房工作台（§七）：ADMIN/STAFF only，代理不开放 ───────────────────
+  app.get('/shared-rooms/workbench', requireStaff, async (req) => {
+    const q = sharedRoomWorkbenchQuerySchema.parse(req.query);
+    return getSharedRoomWorkbench(q.hotelId, q.checkIn, q.checkOut);
+  });
+
+  app.put('/shared-rooms', requireStaff, async (req) => {
+    const body = saveSharedRoomsBodySchema.parse(req.body);
+    const result = await saveSharedRooms(body, actorFromRequest(req));
+    return result;
   });
 };

@@ -154,3 +154,42 @@ export const nightlyRemainingQuerySchema = z
   })
   .refine((q) => q.checkIn < q.checkOut, { message: '入住日必须早于退房日' });
 export type NightlyRemainingQuery = z.infer<typeof nightlyRemainingQuerySchema>;
+
+// ── 跨单分房工作台（§七）────────────────────────────────────────────────
+export const sharedRoomWorkbenchQuerySchema = z
+  .object({
+    hotelId: z.string().min(1),
+    checkIn: dateStr,
+    checkOut: dateStr,
+  })
+  .refine((q) => q.checkIn < q.checkOut, { message: '入住日必须早于退房日' });
+export type SharedRoomWorkbenchQuery = z.infer<typeof sharedRoomWorkbenchQuerySchema>;
+
+const sharedRoomGroupInputSchema = z.object({
+  orderId: z.string().min(1),
+  orderItemId: z.string().min(1),
+  passengerIds: z.array(z.string().min(1)).min(1, '房间成员不能为空'),
+  // 份额允许 0（主单让份场景），0.5 步进；Σ份额=1 的硬校验在 service 层做（需要跨 groups 聚合）。
+  roomFraction: z.number().multipleOf(0.5).min(0).max(20),
+});
+
+const sharedRoomInputSchema = z.object({
+  // 缺省 = 新建（服务端生成 id）；非空 = 改动既有共享房（需过 expectedVersions CAS）。
+  sharedRoomId: z.string().min(1).optional(),
+  hotelRoomTypeId: z.string().min(1),
+  notes: z.string().max(500).optional(),
+  groups: z.array(sharedRoomGroupInputSchema).min(1, '房间至少要有一组成员'),
+});
+
+export const saveSharedRoomsBodySchema = z.object({
+  hotelId: z.string().min(1),
+  checkIn: dateStr,
+  checkOut: dateStr,
+  requestToken: z.string().min(1).max(200),
+  // 版本 CAS：key = sharedRoomId，只需对本次改动到的既有房间给出期望版本。
+  expectedVersions: z.record(z.string(), z.number().int().min(1)).optional(),
+  rooms: z.array(sharedRoomInputSchema).default([]),
+  // 要整间解散的共享房 id（成员清空、状态 DISSOLVED；对应订单房组退回普通房组）。
+  dissolve: z.array(z.string().min(1)).default([]),
+});
+export type SaveSharedRoomsBody = z.infer<typeof saveSharedRoomsBodySchema>;
