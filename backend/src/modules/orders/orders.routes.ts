@@ -19,7 +19,10 @@ import {
   SWAP_FEE_OPTIONS_SETTING_KEY,
   type OrderRequester,
 } from './orders.service.js';
-import { assertHotelPhysicalFitWithinTx } from '../hotel-control/hotel-control.service.js';
+import {
+  assertHotelFitAfterChange,
+  type PhysicalOccupancyItem,
+} from '../hotel-control/hotel-control.service.js';
 import {
   batchCreateOrdersBodySchema,
   batchRescheduleBodySchema,
@@ -82,7 +85,7 @@ import { prisma } from '../../db/prisma.js';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
 import { businessDateISO } from '../../lib/business-time.js';
 import { computeCancellationQuote } from '../../lib/cancellation.js';
-import { BadRequestError } from '../../lib/errors.js';
+import { BadRequestError, NotFoundError } from '../../lib/errors.js';
 import { buildPnrWorkbook, pnrExportFilename, earliestFlightDeparture } from './pnr-export.js';
 import {
   buildPassportPhotoZip,
@@ -166,6 +169,21 @@ export const expectedAmountBodySchema = z.object({
 // 下单按 IP 限流：匿名可达 + 25MB 请求体上限，全局 100/min 桶配合放宽的 body 上限等于
 // 一个廉价的带宽/内存放大型 DoS 面（C-22）；收紧到更严的每分钟次数，不影响正常下单节奏。
 const GUEST_ORDER_CREATE_RATE_LIMIT = { max: 20, timeWindow: '1 minute' } as const;
+
+// ── 房组 JSON 防御式解析（room-assignment 端点的跨单分房 reconcile 专用）────────
+// 与 hotel-control.service.ts 里同名逻辑保持同一套防御规则，但那边是私有函数、
+// 这边只需要读 id/sharedRoomId/splitPairKey 几个字段，不值得为此跨模块导出内部细节。
+function parseRoomGroupsLocal(roomAssignment: unknown): Array<Record<string, unknown>> {
+  if (roomAssignment == null || typeof roomAssignment !== 'object') return [];
+  const groups = (roomAssignment as { roomGroups?: unknown }).roomGroups;
+  if (!Array.isArray(groups)) return [];
+  return groups.filter((g): g is Record<string, unknown> => g != null && typeof g === 'object');
+}
+function readGroupField(g: Record<string, unknown> | undefined, key: string): string | null {
+  if (!g) return null;
+  const v = g[key];
+  return typeof v === 'string' && v.length > 0 ? v : null;
+}
 
 export const orderRoutes: FastifyPluginAsync = async (app) => {
   const service = new OrderService();
@@ -1337,6 +1355,12 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
   //   「需要分房吗？」入口对代理本来就显示，只是保存被这里挡了，导致代理单大面积没分房表。
   //   归属校验与 notes / 换酒店同一口径（service.getOrder → assertCanView：无权 403、不存在 404）。
   //   客户仍不可分房（拼房是运营/代理的事）。
+  //
+  //   跨单分房（§五「改」）：客户端发来的 sharedRoomId / splitPairKey 一律不进 zod（收了也当没收），
+  //   服务端以锁后现状为准原样保留——防止代理/前端伪造键篡改物理占用。带 sharedRoomId 的房组
+  //   只允许改 notes：乘客/酒店名/房型/份额/归属改动或整组删除 → 400，指去房控页跨单分房调整。
+  //   roomFraction=0 仅服务端判定「本来就是共享组」时放行。锁序先 Order（本处理器自己 FOR UPDATE）
+  //   后酒店（assertHotelFitAfterChange 内部锁包房周期行）。
   app.put('/:id/room-assignment', { preHandler: [app.authenticate] }, async (req, reply) => {
     const role = req.user.role;
     if (role !== UserRole.ADMIN && role !== UserRole.STAFF && role !== UserRole.AGENT) {
@@ -1357,11 +1381,14 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
             passengerIds: z.array(z.string()),
             notes: z.string().optional(),
             // 半间/拼房：0.5 = 占半间（与他人拼），默认 1 间。Σ roomFraction = 该单实际占房间数。
-            // 只允许 0.5 步进（Decimal(4,1)），拒绝脏小数被静默四舍五入；0 间组不入此校验。
-            roomFraction: z.number().multipleOf(0.5).min(0.5).max(20).optional(),
+            // 0 仅限跨单分房的共享组（服务端按锁后现状判定，见下方 reconcile）；
+            // 普通组传 0 → 400。只允许 0.5 步进（Decimal(4,1)），拒绝脏小数被静默四舍五入。
+            roomFraction: z.number().multipleOf(0.5).min(0).max(20).optional(),
             // 房组归属的订单行（可选，split-room-group / 新版前端写入）：房控按它把房组
             // 计到该行所在酒店，roomsBilled 也按它分行落。缺省 = 旧口径（整单计数 + 塌缩首行）。
             orderItemId: z.string().min(1).optional(),
+            // sharedRoomId / splitPairKey 故意不声明——zod 默认剥离未声明字段，客户端发来也白发；
+            // 这两个键只可能来自服务端自己 reconcile 时从锁后旧状态搬运过去。
           }),
         ),
       })
@@ -1396,10 +1423,6 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     }
     const hasAttribution = attributedIds.length > 0;
 
-    // 本次分房的物理间数 = 有乘客的房间盒子数。真正的房量判定在下方写 roomAssignment 的
-    // 那个事务里做（带包房周期行锁），见那里的注释。
-    const assignedRooms = body.roomGroups.filter((g) => g.passengerIds.length > 0).length;
-
     // ── B10 提示收集（不阻断，回给前端弹给运营看）───────────────────────────
     const warnings: string[] = [];
 
@@ -1422,9 +1445,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     }
 
     // 分房总间数（含 0.5 拼房）→ 写回酒店订单行的 roomsBilled，房控据此按真实间数计（如 7 人 3.5 间）。
+    // 用 ?? 而非 > 0 判断——显式 0（共享组让份）要原样保留，不能被兜底成 1。
     const totalRooms = body.roomGroups.reduce((s, g) => s + (g.roomFraction ?? 1), 0);
-    // Σ roomFraction 按房组归属分行落（解除「全部塌缩进首行」）：带 orderItemId 的组记到
-    // 各自订单行；无归属的组维持旧口径 —— 合并进首个带房型的行。
     const roomsByItem = new Map<string, number>();
     let unattachedRooms = 0;
     for (const g of body.roomGroups) {
@@ -1435,81 +1457,128 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         unattachedRooms += fraction;
       }
     }
-    // 金额分叉提示（B10）：roomsBilled 是房控口径也是计价参照——拖拽改它不会重算订单金额。
-    // 把「计费房数变了但钱没变」明示给运营，需要调价走补房差 / 改结算价通道，别让两本账静默漂移。
-    const prevAgg = await prisma.orderItem.aggregate({
-      where: { orderId: id, hotelRoomTypeId: { not: null } },
-      _sum: { roomsBilled: true },
-    });
-    const prevRooms = prevAgg._sum.roomsBilled == null ? null : Number(prevAgg._sum.roomsBilled.toString());
     const hotelItemCount = await prisma.orderItem.count({
       where: { orderId: id, hotelRoomTypeId: { not: null } },
     });
+
+    let prevRooms: number | null = null;
     await prisma.$transaction(async (tx) => {
-      // ── 物理房间口径前瞻闸（口径同下单闸 / 销控板看板）────────────────────────
-      // 分房表一旦落库，销控板就按「有乘客的房间盒子数」直计本单物理间数（assignedPhysicalRooms）——
-      // 也就是说分房本身会改变物理占房。多开一个房间盒子 = 多占一间，必须过闸。
-      // 逐酒店判定：本单在该酒店的所有行取住宿区间并集（对齐 expandAssignedPhysicalByDate 的订单级去重）。
-      // allowNonWorsening：存量单可能在切闸前就已物理超卖，房控重排分房去补救时不该被自己造成的
-      // 存量超卖挡住 —— 只拦「改完比改前更差」的操作。
-      // **事务内互斥版**：判定与落库同一事务、先锁包房周期行，中间没有窗口 ——
-      // 只读判定 + 事务外执行 = 两个并发分房各自读到旧快照双双通过，闸再准也拦不住。
-      if (assignedRooms > 0) {
-        const hotelItems = await tx.orderItem.findMany({
-          where: { orderId: id, hotelRoomTypeId: { not: null } },
-          select: {
-            id: true,
-            hotelCheckIn: true,
-            hotelCheckOut: true,
-            hotelRoomType: { select: { hotelId: true, hotel: { select: { name: true } } } },
-          },
-        });
-        const byHotel = new Map<string, { nights: Set<string>; itemIds: Set<string>; name: string }>();
-        for (const it of hotelItems) {
-          const hotelId = it.hotelRoomType?.hotelId;
-          if (!hotelId || !it.hotelCheckIn || !it.hotelCheckOut) continue;
-          const agg =
-            byHotel.get(hotelId) ??
-            {
-              nights: new Set<string>(),
-              itemIds: new Set<string>(),
-              name: it.hotelRoomType?.hotel?.name ?? '',
-            };
-          if (!byHotel.has(hotelId)) byHotel.set(hotelId, agg);
-          agg.itemIds.add(it.id);
-          for (const d of buildStayNightDates(it.hotelCheckIn, it.hotelCheckOut)) agg.nights.add(d);
+      // ── 先锁 Order（§六「锁序先 Order 后酒店」）──────────────────────────
+      // 读旧房组、判定共享组是否被非法改动、写新房组，全程持有本单的行锁——避免两个并发
+      // 保存各自读到同一份旧状态、都判定「没碰共享组」、又各自覆盖对方已提交的改动。
+      await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${id} FOR UPDATE`;
+      const lockedOrder = await tx.order.findUnique({
+        where: { id },
+        select: { roomAssignment: true },
+      });
+      if (!lockedOrder) throw new NotFoundError('订单不存在');
+
+      const oldGroups = parseRoomGroupsLocal(lockedOrder.roomAssignment);
+      const oldById = new Map(oldGroups.map((g) => [readGroupField(g, 'id'), g]));
+
+      // ── reconcile：带 sharedRoomId 的旧组只许改 notes；其余字段一律以旧值为准，
+      //    客户端改动即 400。splitPairKey 对新旧任一侧盒子都原样搬运（finding 9 的服务端修法）。
+      const finalGroups: Array<Record<string, unknown>> = [];
+      const newIds = new Set(body.roomGroups.map((g) => g.id));
+      for (const g of body.roomGroups) {
+        const old = oldById.get(g.id);
+        const oldSharedRoomId = old ? readGroupField(old, 'sharedRoomId') : null;
+        const oldSplitPairKey = old ? readGroupField(old, 'splitPairKey') : null;
+
+        if (oldSharedRoomId) {
+          const samePax =
+            JSON.stringify([...g.passengerIds].sort()) ===
+            JSON.stringify([...((old?.passengerIds as string[] | undefined) ?? [])].sort());
+          const sameOrderItem = (g.orderItemId ?? null) === (readGroupField(old, 'orderItemId') ?? null);
+          const sameHotelName = g.hotelName === (old?.hotelName ?? '');
+          const sameRoomType = g.roomType === (old?.roomType ?? '');
+          const oldFraction = old?.roomFraction == null ? 1 : Number(old.roomFraction);
+          const sameFraction = (g.roomFraction ?? 1) === oldFraction;
+          if (!samePax || !sameOrderItem || !sameHotelName || !sameRoomType || !sameFraction) {
+            throw new BadRequestError(
+              `房间「${g.hotelName}·${g.roomType}」与他单合住，请在房控页「跨单分房」里调整（这里只能改备注）`,
+            );
+          }
+          finalGroups.push({
+            ...old,
+            notes: g.notes ?? (old?.notes as string | undefined),
+          });
+          continue;
         }
-        // 逐酒店的本单新物理间数：带归属的分房按房组归属分酒店计（orderItemId ∈ 该酒店行 ∪
-        // 无归属组按酒店名匹配）；整单无归属（旧数据/旧前端）回退整单口径 —— 每家都按总数判。
-        const groupsWithPax = body.roomGroups.filter((g) => g.passengerIds.length > 0);
-        // 按酒店 id 排序加锁，避免并发分房以不同顺序锁同一批酒店造成死锁。
-        for (const hotelId of [...byHotel.keys()].sort()) {
-          const agg = byHotel.get(hotelId)!;
-          const roomsForHotel = hasAttribution
-            ? groupsWithPax.filter((g) =>
-                g.orderItemId ? agg.itemIds.has(g.orderItemId) : g.hotelName === agg.name,
-              ).length
-            : assignedRooms;
-          await assertHotelPhysicalFitWithinTx(
-            tx,
-            hotelId,
-            [...agg.nights].sort(),
-            { wholeRooms: roomsForHotel, solos: [] },
-            {
-              excludeOrderId: id,
-              allowNonWorsening: true,
-              buildMessage: (violations) =>
-                `分房间数超出该酒店包房量：${violations
-                  .map((v) => `${v.date}（包房 ${v.block} 间，分完后需 ${v.physicalUsed} 间）`)
-                  .join('；')}。请减少房间数，或联系房控加房 / 换酒店。`,
-            },
+
+        if ((g.roomFraction ?? 1) === 0) {
+          throw new BadRequestError(`房间「${g.hotelName}·${g.roomType}」不与他单合住，roomFraction 不能为 0`);
+        }
+        finalGroups.push({
+          ...g,
+          ...(oldSplitPairKey ? { splitPairKey: oldSplitPairKey } : {}),
+        });
+      }
+      // 旧组里带 sharedRoomId 但这次没出现在新payload里 = 试图整组删除 → 400
+      for (const old of oldGroups) {
+        const oldId = readGroupField(old, 'id');
+        if (oldId && readGroupField(old, 'sharedRoomId') && !newIds.has(oldId)) {
+          throw new BadRequestError(
+            `房间「${old.hotelName ?? ''}·${old.roomType ?? ''}」与他单合住，不能直接删除，请在房控页「跨单分房」里调整`,
           );
         }
       }
 
+      // ── §五闸：本单在各酒店变更后的占房快照（用 finalGroups，不是原始 body）────
+      const hotelItems = await tx.orderItem.findMany({
+        where: { orderId: id, hotelRoomTypeId: { not: null } },
+        select: {
+          id: true,
+          hotelCheckIn: true,
+          hotelCheckOut: true,
+          metadata: true,
+          hotelRoomType: { select: { hotelId: true } },
+        },
+      });
+      const hotelIds = new Set(
+        hotelItems.map((it) => it.hotelRoomType?.hotelId).filter((v): v is string => !!v),
+      );
+      const nextItemsAtHotel = new Map<string, PhysicalOccupancyItem[]>();
+      const finalRoomAssignment = { roomGroups: finalGroups };
+      nextItemsAtHotel.set(
+        id,
+        hotelItems.map((it) => ({
+          id: it.id,
+          hotelCheckIn: it.hotelCheckIn,
+          hotelCheckOut: it.hotelCheckOut,
+          roomsBilled: null,
+          metadata: it.metadata,
+          order: { id, roomAssignment: finalRoomAssignment, passengers: [] },
+        })),
+      );
+      for (const hotelId of [...hotelIds].sort()) {
+        const nights = new Set<string>();
+        for (const it of hotelItems) {
+          if (it.hotelRoomType?.hotelId !== hotelId || !it.hotelCheckIn || !it.hotelCheckOut) continue;
+          for (const d of buildStayNightDates(it.hotelCheckIn, it.hotelCheckOut)) nights.add(d);
+        }
+        await assertHotelFitAfterChange(tx, hotelId, [...nights].sort(), {
+          affectedOrderIds: [id],
+          nextOrderItems: nextItemsAtHotel,
+          options: {
+            allowNonWorsening: true,
+            buildMessage: (violations) =>
+              `分房间数超出该酒店包房量：${violations
+                .map((v) => `${v.date}（包房 ${v.block} 间，分完后需 ${v.physicalUsed} 间）`)
+                .join('；')}。请减少房间数，或联系房控加房 / 换酒店。`,
+          },
+        });
+      }
+
+      const prevAgg = await tx.orderItem.aggregate({
+        where: { orderId: id, hotelRoomTypeId: { not: null } },
+        _sum: { roomsBilled: true },
+      });
+      prevRooms = prevAgg._sum.roomsBilled == null ? null : Number(prevAgg._sum.roomsBilled.toString());
+
       await tx.order.update({
         where: { id },
-        data: { roomAssignment: body as unknown as object },
+        data: { roomAssignment: finalRoomAssignment as unknown as object },
       });
       // 先清空本单所有酒店行的 roomsBilled，避免多酒店行残留旧值导致房控按行 Σ 重复计数。
       await tx.orderItem.updateMany({
