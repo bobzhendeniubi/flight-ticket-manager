@@ -100,6 +100,14 @@ export interface SharedRoomWorkbenchRoom {
      *  只是不能再作为「本次改动」的一部分被重新校验其订单有效性——原样重存时会走
      *  isUnchangedMember 的放行分支。*/
     isActive: boolean;
+    /** 该成员所属订单号（供灰色只读 chip 显示"哪张单"，不是敏感信息——房控本就是内部
+     *  ADMIN/STAFF 视图，不受 §十对外角色 DTO 的脱敏约束）。*/
+    orderNumber: string;
+    /** 姓名快照：失效（已取消/软删订单）的成员也要查得到，chip 才能显示人名而不是空白。
+     *  直接走 SharedRoomMember → Passenger 的关系查，不经过按 COUNTED_STATUSES 过滤的
+     *  订单池，所以不受订单是否有效影响。*/
+    chineseName: string | null;
+    name: string;
   }>;
 }
 
@@ -227,7 +235,11 @@ export async function getSharedRoomWorkbench(
           // 单（getSharedRoomWorkbench 的主查询按 COUNTED_STATUSES 过滤），共享房的成员
           // 却不受这道过滤限制，会带出已取消/软删的历史成员。前端需要这两个字段来把它们
           // 标成只读，不能让运营对着一个看起来正常的姓名 chip 操作却被保存接口 400。
-          order: { select: { status: true, deletedAt: true } },
+          order: { select: { status: true, deletedAt: true, orderNumber: true } },
+          // 姓名快照：直接走 SharedRoomMember → Passenger 的关系查（不经过按
+          // COUNTED_STATUSES 过滤的订单池），失效订单的成员也查得到，灰色 chip 才有人名
+          // 可显示，不是空白。
+          passenger: { select: { fullName: true, chineseName: true } },
         },
       },
     },
@@ -250,6 +262,9 @@ export async function getSharedRoomWorkbench(
         roomFraction: Number(m.roomFraction.toString()),
         orderStatus: m.order.status,
         isActive: m.order.deletedAt == null && COUNTED_STATUSES.includes(m.order.status),
+        orderNumber: m.order.orderNumber,
+        chineseName: m.passenger.chineseName,
+        name: m.passenger.fullName,
       })),
     })),
   };

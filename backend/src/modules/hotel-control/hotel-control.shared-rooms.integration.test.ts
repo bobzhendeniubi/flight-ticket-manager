@@ -1507,7 +1507,7 @@ describe('saveSharedRooms · 真 DB E2E · 房组 id 不泄露 sharedRoomId（as
 describe('saveSharedRooms · 真 DB E2E · 未变更的失效成员不阻断保存（astra B6）', () => {
   afterEach(() => flushFireAndForgetAudit());
 
-  it('读模型：成员带 orderStatus / isActive，取消单的成员 isActive=false', async () => {
+  it('读模型：成员带 orderStatus / isActive / orderNumber / 姓名快照，取消单的成员 isActive=false 且姓名不为空', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4);
     const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
@@ -1553,8 +1553,12 @@ describe('saveSharedRooms · 真 DB E2E · 未变更的失效成员不阻断保�
     expect(room).toBeDefined();
     const memberA = room!.members.find((m) => m.orderId === orderA.id);
     const memberB = room!.members.find((m) => m.orderId === orderB.id);
-    expect(memberA).toMatchObject({ orderStatus: 'PAID', isActive: true });
-    expect(memberB).toMatchObject({ orderStatus: 'CANCELLED', isActive: false });
+    expect(memberA).toMatchObject({ orderStatus: 'PAID', isActive: true, orderNumber: orderA.orderNumber });
+    expect(memberA?.name).toBeTruthy();
+    // 失效（已取消）订单的成员也要查得到姓名快照，灰色 chip 才能显示人名而不是空白——
+    // 不能因为订单不在有效订单池里就连姓名都查不到。
+    expect(memberB).toMatchObject({ orderStatus: 'CANCELLED', isActive: false, orderNumber: orderB.orderNumber });
+    expect(memberB?.name).toBeTruthy();
   });
 
   it('未变更的失效成员原样带过去 → 放行；同一失效成员的份额被改动 → 仍 400', async () => {
