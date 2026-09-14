@@ -394,7 +394,8 @@ async function computeHotelOversellAfterPeriodChange(
       },
     },
   });
-  const occupied = computePhysicalUsedForItems(items, dates, null);
+  const sharedRoomPhysical = await computeSharedRoomPhysicalByDate(hotelId, dates, client);
+  const occupied = computePhysicalUsedForItems(items, dates, null, sharedRoomPhysical);
 
   const violations: HotelOversellCheck['violations'] = [];
   dates.forEach((date, i) => {
@@ -727,6 +728,22 @@ function groupOrderItemId(g: Record<string, unknown>): string | null {
   return typeof v === 'string' && v.length > 0 ? v : null;
 }
 
+/**
+ * 房组的共享房 id（跨单分房镜像字段，Order.roomAssignment.roomGroups[].sharedRoomId）；
+ * 无 / 形状不符返回 null。
+ *
+ * ⚠ 带 sharedRoomId 的房组**一律不参与**本文件基于 JSON 的物理间数聚合
+ * （physicalRoomsOfGroups / expandAssignedPhysicalByDate 的桶求和）——它们的物理占用
+ * 由 computeSharedRoomPhysicalByDate 基于 SharedRoom/SharedRoomMember 表逐晚去重计算，
+ * 与份额（roomFraction，可能是 0）无关。两套口径分别计算、调用方（computePhysicalUsedForItems）
+ * 相加，避免 0 份额被 groupRoomFraction 兜底读成 1 间（重复计），也避免同一间房被
+ * 两条订单 JSON 各自 ceil 一次（多算）。
+ */
+function groupSharedRoomId(g: Record<string, unknown>): string | null {
+  const v = g.sharedRoomId;
+  return typeof v === 'string' && v.length > 0 ? v : null;
+}
+
 /** 房组的计费间数（roomFraction；缺省 / 形状不符按整间 1）。*/
 function groupRoomFraction(g: Record<string, unknown>): number {
   if (g.roomFraction == null) return 1;
@@ -770,6 +787,7 @@ function physicalRoomsOfGroups(groups: ReadonlyArray<Record<string, unknown>>): 
   const byBucket = new Map<string, number>();
   for (const g of groups) {
     if (!groupHasPassengers(g)) continue;
+    if (groupSharedRoomId(g) != null) continue; // 共享房另计，见 computeSharedRoomPhysicalByDate
     const key = groupBucketKey(g);
     byBucket.set(key, (byBucket.get(key) ?? 0) + groupRoomFraction(g));
   }
@@ -899,6 +917,7 @@ export function expandAssignedPhysicalByDate<T extends PhysicalOccupancyItem>(
     const out = new Map<string, number>();
     for (const g of groups) {
       if (!groupHasPassengers(g)) continue;
+      if (groupSharedRoomId(g) != null) continue; // 共享房另计，见 computeSharedRoomPhysicalByDate
       const key = groupBucketKey(g);
       out.set(key, (out.get(key) ?? 0) + groupRoomFraction(g));
     }
@@ -981,6 +1000,76 @@ export function expandAssignedPhysicalByDate<T extends PhysicalOccupancyItem>(
     for (let i = 0; i < dates.length; i++) assignedPhysical[i] += ceilHalfGrid(arr[i]);
   }
   return { assignedPhysical, fallbackItems };
+}
+
+// ── 共享房（跨单分房）物理口径 ──────────────────────────────────────────────
+/**
+ * 共享房逐晚去重物理间数（§四）：SharedRoom 按「同一真实酒店、逐晚存在有效成员」去重计 1 —
+ * 与份额（roomFraction，可能是 0）无关，与成员人数无关。
+ *
+ * 某晚计入的条件：`checkIn <= 该晚 < checkOut` 且至少一名成员所属订单处于房控有效状态
+ * （COUNTED_STATUSES）且未软删。取的是**成员当前所属订单的实时状态**（不是 SharedRoom
+ * 自己的 checkIn/checkOut 兜底判定成员是否还有效——分房表口径永远以成员表 + 订单状态为准）。
+ *
+ * 与基于 JSON 的 physicalRoomsOfGroups / expandAssignedPhysicalByDate 是两套互斥口径：
+ * 后者已在 groupSharedRoomId 处跳过带 sharedRoomId 的房组，调用方（computePhysicalUsedForItems）
+ * 把两者相加即为完整物理间数，不会重复计、也不会漏计。
+ */
+interface SharedRoomPhysicalRow {
+  checkIn: Date;
+  checkOut: Date;
+  members: Array<{ order: { status: OrderStatus; deletedAt: Date | null } }>;
+}
+
+export async function computeSharedRoomPhysicalByDate(
+  hotelId: string,
+  dates: readonly string[],
+  client: HotelControlDbClient = defaultPrisma,
+): Promise<number[]> {
+  const out = new Array<number>(dates.length).fill(0);
+  if (dates.length === 0) return out;
+  const fromD = toDateOnly(dates[0]);
+  const toD = toDateOnly(dates[dates.length - 1]);
+
+  // 防御式：单测常用手搭的 mock client（只 mock 用到的 delegate），没有 sharedRoom 时
+  // 回落「本次没有共享房」而不是炸——与 getHotelOversellCapRooms 的 systemSetting 兜底同哲学。
+  const delegate = (
+    client as unknown as {
+      sharedRoom?: { findMany: (args: unknown) => Promise<SharedRoomPhysicalRow[]> };
+    }
+  ).sharedRoom;
+  if (!delegate) return out;
+
+  const rooms = await delegate.findMany({
+    where: {
+      hotelId,
+      status: 'ACTIVE',
+      checkIn: { lte: toD },
+      checkOut: { gt: fromD },
+    },
+    select: {
+      checkIn: true,
+      checkOut: true,
+      members: {
+        select: {
+          order: { select: { status: true, deletedAt: true } },
+        },
+      },
+    },
+  });
+
+  for (const room of rooms) {
+    const hasValidMember = room.members.some(
+      (m) => m.order.deletedAt == null && COUNTED_STATUSES.includes(m.order.status),
+    );
+    if (!hasValidMember) continue;
+    const checkIn = fmtDateOnly(room.checkIn);
+    const checkOut = fmtDateOnly(room.checkOut);
+    for (let i = 0; i < dates.length; i++) {
+      if (checkIn <= dates[i] && dates[i] < checkOut) out[i] += 1;
+    }
+  }
+  return out;
 }
 
 /**
@@ -1082,7 +1171,8 @@ export async function getHotelNightlyRemaining(
   // 物理房间口径（与销控板 getBoard / 房态导出同口径）：权威分房表订单按「有乘客的
   // roomGroup 数」直计整间；无分房表订单按性别分桶推算真实占用整间数（异性不能拼）——
   // 避免"男+女各半间已分 2 房"被塌缩的 roomsBilled=1.0 误算成 1 间。
-  const physicalUsed = computePhysicalUsedForItems(items, nightDates, null);
+  const sharedRoomPhysical = await computeSharedRoomPhysicalByDate(hotelId, nightDates, client);
+  const physicalUsed = computePhysicalUsedForItems(items, nightDates, null, sharedRoomPhysical);
   const physicalRemaining = block.map((b, i) => round2(b - physicalUsed[i]));
 
   return {
@@ -1130,13 +1220,18 @@ export interface PhysicalFitResult {
 }
 
 /**
- * 物理房间口径占房（逐晚），可选叠加一笔「打算新增的占房」。
- * 口径与销控板 getBoard / physicalRemaining 完全一致，纯内存推算，不额外查库。
+ * 物理房间口径占房（逐晚），可选叠加一笔「打算新增的占房」+ 共享房去重物理间数。
+ * 口径与销控板 getBoard / physicalRemaining 完全一致，纯内存推算，不额外查库
+ * （sharedRoomPhysical 由调用方另行查库传入——见 computeSharedRoomPhysicalByDate）。
+ *
+ * @param sharedRoomPhysical 该酒店逐晚的共享房去重物理间数；null = 调用方未接入共享房口径
+ *   （历史调用点尚未升级，行为等同「本批无共享房」，不影响既有结果）。
  */
 function computePhysicalUsedForItems<T extends PhysicalOccupancyItem>(
   items: ReadonlyArray<T>,
   dates: readonly string[],
   prospective: ProspectiveOccupancy | null,
+  sharedRoomPhysical: readonly number[] | null = null,
 ): number[] {
   const { assignedPhysical, fallbackItems } = expandAssignedPhysicalByDate(items, dates);
   // 拆单劈出的半间行（无分房表侧）先按配对键配回整间，不进性别推算 ——
@@ -1159,7 +1254,9 @@ function computePhysicalUsedForItems<T extends PhysicalOccupancyItem>(
   const used = baseUsed.map((v) => round2(v + solos.length * 0.5 + extraWhole));
 
   const fallbackPhysical = computePhysicalUsed(used, buckets);
-  return fallbackPhysical.map((v, i) => round2(v + assignedPhysical[i] + pairedPhysical[i]));
+  return fallbackPhysical.map((v, i) =>
+    round2(v + assignedPhysical[i] + pairedPhysical[i] + (sharedRoomPhysical?.[i] ?? 0)),
+  );
 }
 
 /**
@@ -1230,8 +1327,12 @@ export async function checkHotelPhysicalFit(
   });
 
   const block = expandBlockByDate(periods, nightDates);
-  const physicalUsedBefore = computePhysicalUsedForItems(items, nightDates, null);
-  const physicalUsedAfter = computePhysicalUsedForItems(items, nightDates, prospective);
+  // 共享房不受 excludeOrderId/excludeOrderItemIds 影响——这两个参数是「排除本单既有占房，
+  // 避免自己跟自己撞」的整单/整行级豁免，共享房的去重物理量本就与份额、发起方订单无关，
+  // before/after 都用同一份实时共享房状态才准确（真正的“变更前后”对比由 assertHotelFitAfterChange 做）。
+  const sharedRoomPhysical = await computeSharedRoomPhysicalByDate(hotelId, nightDates, client);
+  const physicalUsedBefore = computePhysicalUsedForItems(items, nightDates, null, sharedRoomPhysical);
+  const physicalUsedAfter = computePhysicalUsedForItems(items, nightDates, prospective, sharedRoomPhysical);
 
   const violations: PhysicalFitViolation[] = [];
   nightDates.forEach((date, i) => {
