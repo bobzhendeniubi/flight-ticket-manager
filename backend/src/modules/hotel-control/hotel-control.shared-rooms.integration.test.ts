@@ -537,4 +537,117 @@ describe('saveSharedRooms · 真 DB E2E', () => {
     const itemA = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderA.items[0].id } });
     expect(Number(itemA.roomsBilled)).toBe(1);
   });
+
+  it('roomsBilled：一单两条酒店行，行 X 的乘客整体挪进挂在行 Y 的共享房后，行 X 显式清零（不留旧值）', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderX = await prisma.order.create({
+      data: {
+        orderNumber: uniq('ORD'),
+        status: OrderStatus.PAID,
+        subtotal: new Prisma.Decimal(2400),
+        total: new Prisma.Decimal(2400),
+        paidAmount: new Prisma.Decimal(2400),
+        contactName: 'Test User',
+        contactPhone: '13800138000',
+        // 旧状态：行 X 的普通房组已归属行 X，乘客 p1 住这里。
+        roomAssignment: Prisma.JsonNull,
+        items: {
+          create: [
+            {
+              kind: OrderItemKind.HOTEL,
+              description: '行X',
+              quantity: 2,
+              unitPrice: new Prisma.Decimal(600),
+              amount: new Prisma.Decimal(1200),
+              hotelRoomTypeId: roomType.id,
+              hotelCheckIn: new Date(`${CHECK_IN}T00:00:00.000Z`),
+              hotelCheckOut: new Date(`${CHECK_OUT}T00:00:00.000Z`),
+              roomsBilled: new Prisma.Decimal(1), // 挪空前的旧值——修复后必须变成 0，不能停在 1
+            },
+            {
+              kind: OrderItemKind.HOTEL,
+              description: '行Y',
+              quantity: 2,
+              unitPrice: new Prisma.Decimal(600),
+              amount: new Prisma.Decimal(1200),
+              hotelRoomTypeId: roomType.id,
+              hotelCheckIn: new Date(`${CHECK_IN}T00:00:00.000Z`),
+              hotelCheckOut: new Date(`${CHECK_OUT}T00:00:00.000Z`),
+              roomsBilled: null, // 行 Y 之前从未分房
+            },
+          ],
+        },
+        passengers: {
+          create: [
+            {
+              fullName: 'PAX 1',
+              documentType: 'PASSPORT',
+              documentNumber: uniq('P'),
+              dateOfBirth: new Date('1990-01-01'),
+              nationality: 'CHN',
+            },
+          ],
+        },
+      },
+      include: { items: true, passengers: true },
+    });
+    const itemX = orderX.items[0];
+    const itemY = orderX.items[1];
+    // 补上旧房组（归属行 X，全归属——满足「首次拉进共享房前必须全归属」的前提）。
+    await prisma.order.update({
+      where: { id: orderX.id },
+      data: {
+        roomAssignment: {
+          roomGroups: [
+            {
+              id: 'gx',
+              hotelName: '',
+              roomType: '',
+              passengerIds: [orderX.passengers[0].id],
+              orderItemId: itemX.id,
+              roomFraction: 1,
+            },
+          ],
+        },
+      },
+    });
+    const orderOther = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    // 共享房挂在行 Y 上——orderX 唯一的乘客从行 X 搬到行 Y 的共享房。
+    await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderX.id,
+                orderItemId: itemY.id,
+                passengerIds: [orderX.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderOther.id,
+                orderItemId: orderOther.items[0].id,
+                passengerIds: [orderOther.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    const reloadedX = await prisma.orderItem.findUniqueOrThrow({ where: { id: itemX.id } });
+    const reloadedY = await prisma.orderItem.findUniqueOrThrow({ where: { id: itemY.id } });
+    expect(Number(reloadedX.roomsBilled)).toBe(0); // 显式清零——不是残留的旧值 1，也不是 null
+    expect(Number(reloadedY.roomsBilled)).toBe(1);
+  });
 });

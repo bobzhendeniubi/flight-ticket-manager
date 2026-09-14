@@ -745,18 +745,27 @@ async function saveSharedRoomsInner(
       });
       // roomsBilled：按 orderItemId 去重后求和（同一行若被拆成多个 group——正常只会有一个
       // 普通组 + 至多多个共享组，见 §三「一条酒店行可能同时有普通房和多个共享房」——按行累加）。
-      // 只改本次 groups 实际引用到的行；本单与本次改动无关的其它酒店行原样不动。
-      // 引用到的行一律显式写（哪怕算出 0 也写 0，不留 null——null 会重新激活 metadata 兜底）。
       const roomsByItemId = new Map<string, number>();
       for (const g of groups) {
         const itemId = groupOrderItemId(g);
         if (!itemId) continue;
         roomsByItemId.set(itemId, (roomsByItemId.get(itemId) ?? 0) + readBillingFraction(g));
       }
-      for (const [itemId, rooms] of roomsByItemId) {
+      // 显式回写的行 = 本次新 groups 引用到的行 ∪ 变更前旧 groups 引用过的行。前者按新值写
+      // （哪怕算出 0 也写 0，不留 null——null 会重新激活 metadata 兜底）；后者若这次不再被
+      // 任何组引用（乘客被整体搬去挂在另一条行的房组/共享房），同样要显式写 0——否则那条行
+      // 的乘客已经没有任何房组承载，roomsBilled 却还停在搬走前的旧值，两本账对不上。
+      // 变更前后都没有房组引用过的行（从未分房，roomsBilled 是录单时算的）保持不动。
+      const oldGroupsForOrder = parseRoomGroups(order.roomAssignment);
+      const oldItemIds = new Set(
+        oldGroupsForOrder.map((g) => groupOrderItemId(g)).filter((v): v is string => v != null),
+      );
+      const itemIdsToWrite = new Set<string>([...roomsByItemId.keys(), ...oldItemIds]);
+      for (const itemId of itemIdsToWrite) {
+        const rooms = roundFraction(roomsByItemId.get(itemId) ?? 0);
         await tx.orderItem.update({
           where: { id: itemId },
-          data: { roomsBilled: new Prisma.Decimal(roundFraction(rooms)) },
+          data: { roomsBilled: new Prisma.Decimal(rooms) },
         });
       }
     }
