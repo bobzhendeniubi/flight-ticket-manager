@@ -28,6 +28,7 @@ import { AGENT_HIDDEN_EXPORT_KEYS } from './orders.export-templates.js';
 import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 import { SNAPSHOT_STALE_MS } from '../travelers/traveler-profiles.service.js';
+import { RoomNumberer } from './room-identity.js';
 
 const D = (s: string): Date => new Date(`${s}T00:00:00.000Z`);
 
@@ -1884,5 +1885,162 @@ describe('全岗总表 · 航段状态列', () => {
     };
     const [row] = orderToMasterRows(order);
     expect(row.legStatus).toBe('回程已恢复（超售 1 座）');
+  });
+});
+
+/** 跨单分房（§九验收反例 11）：全岗总表不再自编号，改用共享 RoomNumberer + sharedRoomId。*/
+function fixtureSharedRoomOrder(opts: {
+  id: string;
+  orderNumber: string;
+  passengerId: string;
+  groupId: string;
+  sharedRoomId: string;
+  roomFraction: number;
+  hotelId: string;
+  hotelName: string;
+  checkIn: string;
+}): OrderForMasterExport {
+  return {
+    id: opts.id,
+    orderNumber: opts.orderNumber,
+    status: 'PAID',
+    invoiceStatus: 'NONE',
+    outboundInvoiced: false,
+    returnInvoiced: false,
+    systemInvoiced: false,
+    adjustmentCny: 0,
+    visaStatus: null,
+    total: 5000,
+    paidAmount: 5000,
+    notes: null,
+    noteHotel: null,
+    noteVisa: null,
+    notePayment: null,
+    noteSpecial: null,
+    guestName: null,
+    createdAt: D('2026-08-01'),
+    roomAssignment: {
+      roomGroups: [
+        {
+          id: opts.groupId,
+          hotelName: opts.hotelName,
+          roomType: '大床房',
+          passengerIds: [opts.passengerId],
+          roomFraction: opts.roomFraction,
+          orderItemId: 'item-hotel',
+          sharedRoomId: opts.sharedRoomId,
+        },
+      ],
+    },
+    agent: null,
+    user: { displayName: '前台', email: 'a@ftm.local' },
+    payments: [],
+    refunds: [],
+    costItems: [],
+    passengers: [
+      {
+        id: opts.passengerId,
+        fullName: '乘客',
+        chineseName: '乘客',
+        lastName: null,
+        firstName: null,
+        gender: 'M',
+        dateOfBirth: D('1990-01-01'),
+        passengerType: 'ADULT',
+        nationality: 'CN',
+        documentType: 'PASSPORT',
+        documentNumber: `D-${opts.passengerId}`,
+        passportIssueDate: null,
+        passportIssuePlace: null,
+        passportIssueCountry: 'CHN',
+        passportExpiry: null,
+        placeOfBirth: null,
+      },
+    ],
+    items: [
+      {
+        id: 'item-hotel',
+        kind: 'HOTEL',
+        flightCabin: null,
+        hotelRoomTypeId: 'hrt-shared',
+        amount: 0,
+        metadata: null,
+        flightSchedule: null,
+        hotelCheckIn: D(opts.checkIn),
+        hotelRoomType: { hotelId: opts.hotelId, name: '大床房', hotel: { name: opts.hotelName } },
+        visa: null,
+        fulfillmentTasks: [],
+      },
+    ],
+  } as unknown as OrderForMasterExport;
+}
+
+describe('orderToMasterRows — 跨单分房（§九验收反例 11）', () => {
+  it('两张单共用同一 RoomNumberer 时，共享房两侧印同一个房号（不再各订单从 1 自编号）', () => {
+    const numberer = new RoomNumberer();
+    const orderA = fixtureSharedRoomOrder({
+      id: 'ord-A',
+      orderNumber: 'FTM_A',
+      passengerId: 'pa',
+      groupId: 'gA',
+      sharedRoomId: 'sr1',
+      roomFraction: 1,
+      hotelId: 'hotel-x',
+      hotelName: '合住酒店',
+      checkIn: '2026-08-10',
+    });
+    const orderB = fixtureSharedRoomOrder({
+      id: 'ord-B',
+      orderNumber: 'FTM_B',
+      passengerId: 'pb',
+      groupId: 'gB',
+      sharedRoomId: 'sr1',
+      roomFraction: 0,
+      hotelId: 'hotel-x',
+      hotelName: '合住酒店',
+      checkIn: '2026-08-10',
+    });
+    const [rowA] = orderToMasterRows(orderA, new Map(), numberer);
+    const [rowB] = orderToMasterRows(orderB, new Map(), numberer);
+    expect(rowA.distribution).toBe('房1·合住');
+    expect(rowB.distribution).toBe('房1·合住'); // 同一个房号，不是各自从 1 重新编号
+  });
+
+  it('两张不共用 numberer 的独立调用（缺省新建）仍各自从 1 起——不传就是旧行为', () => {
+    const orderA = fixtureSharedRoomOrder({
+      id: 'ord-A',
+      orderNumber: 'FTM_A',
+      passengerId: 'pa',
+      groupId: 'gA',
+      sharedRoomId: 'sr1',
+      roomFraction: 1,
+      hotelId: 'hotel-x',
+      hotelName: '合住酒店',
+      checkIn: '2026-08-10',
+    });
+    const [rowA] = orderToMasterRows(orderA);
+    expect(rowA.distribution).toBe('房1·合住');
+  });
+
+  it('内部视角（forAgent=false）备注带对方单号；代理视角（forAgent=true）只写中性文案', () => {
+    const numberer = new RoomNumberer();
+    const lookup = new Map([['sr1', ['FTM_A', 'FTM_B']]]);
+    const orderA = fixtureSharedRoomOrder({
+      id: 'ord-A',
+      orderNumber: 'FTM_A',
+      passengerId: 'pa',
+      groupId: 'gA',
+      sharedRoomId: 'sr1',
+      roomFraction: 1,
+      hotelId: 'hotel-x',
+      hotelName: '合住酒店',
+      checkIn: '2026-08-10',
+    });
+    const [internalRow] = orderToMasterRows(orderA, new Map(), numberer, lookup, false);
+    expect(internalRow.notes).toContain('与 FTM_B 合住');
+
+    const [agentRow] = orderToMasterRows(orderA, new Map(), new RoomNumberer(), lookup, true);
+    expect(agentRow.notes).toContain('与他单合住');
+    expect(agentRow.notes).not.toContain('FTM_B');
   });
 });

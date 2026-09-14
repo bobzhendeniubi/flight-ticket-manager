@@ -23,6 +23,7 @@ import {
   parseRoomGroups,
   type RoomNumberEntry,
 } from './orders.export-room-allocation.js';
+import { roomIdentityKey } from './room-identity.js';
 import { nameWithTitle } from './orders.export-templates.js';
 import { formatOrderLegStatus, isReturnCurrentlyReleased } from './orders.leg-status.js';
 
@@ -240,8 +241,11 @@ function computeRoomColumns(
       const placement = describeRoomItem(it);
       const checkInStr = fmtDate(it.hotelCheckIn);
       const fkHotelName = placement.hotelName;
+      // 共享组一律取 FK 酒店名（同分房表导出 resolveExportHotelName 的例外，§九）
       const hotelName =
-        attributed && !placement.pending ? fkHotelName : group?.hotelName || fkHotelName;
+        group?.sharedRoomId || (attributed && !placement.pending)
+          ? fkHotelName
+          : group?.hotelName || fkHotelName;
       const capacity = placement.capacity && placement.capacity > 0 ? placement.capacity : 2;
 
       // 三态口径同分房表：人工分房酒店名与 FK 关联酒店不一致 → 归属不确定，"—"；
@@ -256,9 +260,11 @@ function computeRoomColumns(
       const list = byDate.get(checkInStr) ?? [];
       list.push({
         passengerId: p.id,
+        hotelId: placement.hotelId,
         hotelName,
-        groupId: group?.id ?? null,
-        isHalf: !!group && group.roomFraction === 0.5,
+        identityKey: group ? roomIdentityKey(group, order.id) : null,
+        // 共享房组恒不标 (½)：两侧份额可能不对称，但物理是同一间房（§九）
+        isHalf: !!group && !group.sharedRoomId && group.roomFraction === 0.5,
         capacity,
         gender: p.gender ?? null,
         roomOrder: 0,

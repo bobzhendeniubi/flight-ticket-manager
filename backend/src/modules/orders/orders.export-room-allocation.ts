@@ -35,6 +35,13 @@ import { earliestFlightDepartureLocalDate } from './pnr-export.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { businessDateTimeSec } from '../../lib/business-time.js';
 import {
+  roomIdentityKey,
+  roomNumberScopeKey,
+  RoomNumberer,
+  loadSharedRoomPartnerLookup,
+  sharedRoomPartnerNote,
+} from './room-identity.js';
+import {
   PENDING_PLACEMENT_ROOM_TYPE,
   isBundleLikeHotelText,
   resolveRoomGroupPlacement,
@@ -146,6 +153,13 @@ export interface RoomGroup {
    * 区间/余量以归属行为准（correlateItem 按 id 精确对行）；缺省 = 旧数据，走文本匹配兜底。
    */
   orderItemId?: string;
+  /**
+   * 跨单分房镜像字段（服务端写入，客户端不可控——见 orders.routes.ts 的 room-assignment
+   * reconcile）。带此字段 = 本组与另一张单的某个房组共享同一间物理房，真值在 SharedRoom /
+   * SharedRoomMember 表；导出层的跨单房间身份、房号编号、酒店名归属都以它为准，
+   * 见 room-identity.ts 的 roomIdentityKey。
+   */
+  sharedRoomId?: string;
 }
 
 function fmtDate(d: Date | null | undefined): string {
@@ -259,12 +273,18 @@ export function parseRoomGroups(roomAssignment: unknown): RoomGroup[] {
  *   3. 例外：房组文本明显是套餐名（含「N天N晚」）→ 以归属行落位 attributedHotelName（其次
  *      fallbackHotelName）为准，见函数内注释。
  * group.hotelName 仅用 trim 判空（判它到底填没填），采用时用原值。
+ *
+ * 例外（跨单分房，§九）：group 带 sharedRoomId 时一律不认 group.hotelName 文本——共享房
+ * 两侧各自的房组是各自建组时留下的文本，可能一侧换过酒店没同步、一侧是旧值，任由文本各显示
+ * 各的会让两张单印出两家不同的酒店。共享组统一取 FK 酒店名（归属行优先，即 attributedHotelName——
+ * 共享成员必须归属真实酒店行，§四），两侧因此显示同一家。
  */
 export function resolveExportHotelName(
   group: RoomGroup | undefined,
   fallbackHotelName: string,
   attributedHotelName?: string | null,
 ): string {
+  if (group?.sharedRoomId) return attributedHotelName?.trim() || fallbackHotelName;
   const fromRoomControl = group?.hotelName;
   if (!fromRoomControl || !fromRoomControl.trim()) return fallbackHotelName;
   // 例外：房组文本明显是**套餐名**（含「N天N晚」）—— 那不是房控排的酒店，是早期分房弹窗把套餐行
@@ -339,10 +359,24 @@ export interface RoomAllocationSheet {
  * 见 orders.export.ts 的「房号」列）。
  */
 export interface RoomNumberEntry {
+  /**
+   * 编号作用域用的真实酒店 id；未落位（星级随机档待落位）没有 hotelId 传 null——
+   * roomNumberScopeKey 会用 hotelName 兜底出一个隔离作用域，不会与任何真实酒店混。
+   * hotelName 从这里起只做展示，不再参与编号/分桶（§九，房组人工填的酒店名可能是
+   * 换酒店前的旧文本，drift 不该影响房号是否合桶）。
+   */
+  hotelId: string | null;
   hotelName: string;
-  /** 人工分房组 id；未分房为 null（同 id 同房间）。*/
-  groupId: string | null;
-  /** 半间/拼房组（roomFraction === 0.5）→ 房号标 (½)。*/
+  /**
+   * 跨单房间身份（room-identity.ts 的 roomIdentityKey：共享房恒定用 sharedRoomId，
+   * 普通房组退回 `${orderId}:${groupId}`）；未分房为 null（走性别+容量打包）。
+   */
+  identityKey: string | null;
+  /**
+   * 半间/拼房组（roomFraction === 0.5）→ 房号标 (½)。共享房组恒为 false——
+   * 共享房两侧份额可能不对称（1+0、0.5+0.5、甚至 0），但物理是同一间房，
+   * 不能因为本单这一侧的份额印出不同的房号后缀（§九）。
+   */
   isHalf: boolean;
   /** 该乘客所在房型容量（用于未分房乘客按容量打包；缺省 2）。*/
   capacity: number;
@@ -457,19 +491,24 @@ export function isAttributedTo(
  * 把占房订单行展开为按入住日期分 sheet 的行集合（纯函数，便于单测）。
  *
  * 行排序：按归属酒店名（roomGroup.hotelName 优先）zh-CN 排序，再按房间号 —— 同房乘客相邻。
- * 房间号分配（per 入住日期 × 酒店）：
- *   - 已分房：同一 roomGroup.id 共用一个房号（半间/拼房组房号标 "房N(½)"）。
+ * 房间号分配（per 入住日期 × hotelId）：
+ *   - 已分房：同一跨单房间身份（roomIdentityKey）共用一个房号（半间/拼房组房号标 "房N(½)"；
+ *     共享房组不管份额是 1/0.5/0 都不标这个后缀，两侧印同一个 "房N"，见 §九）。
  *   - 未分房：按房型容量顺序打包（每满一间开下一间），房号续在已分房之后。
  *
  * 乘客 ↔ item correlate（见 correlateItem）：一位乘客恰好产出一行，不做 item × 乘客笛卡尔积。
  *
  * tripStats：「飞行次数」列的档案快照（由 loadExportTripStats 批量拉好后传入——本函数是纯函数，
  * 绝不在行循环里逐个查库）。缺省空 Map = 该列全部留空。
+ * sharedRoomPartnerLookup：共享房 id → 全部成员单号（loadSharedRoomPartnerLookup 批量拉好后
+ * 传入，本函数同样不查库）。备注列据此拼「与 FTM… 合住」（本导出 ADMIN/STAFF only，见路由，
+ * 一律带对方单号——代理侧中性文案在 §十 serializeRoomGroupsFor，不走这个函数）。
  */
 export function buildRoomAllocationSheets(
   items: RoomItemForExport[],
   remainingLookup: Map<string, string> = new Map(),
   tripStats: TripStatsMap = new Map(),
+  sharedRoomPartnerLookup: ReadonlyMap<string, readonly string[]> = new Map(),
 ): RoomAllocationSheet[] {
   // 先按订单分组占房 item（同订单可能有多条，需要整单一起 correlate 乘客归属）
   const itemsByOrder = new Map<string, AllocatableItem[]>();
@@ -525,8 +564,12 @@ export function buildRoomAllocationSheets(
       const placement = describeRoomItem(it);
       const checkInStr = fmtDate(it.hotelCheckIn);
       const fkHotelName = placement.hotelName;
+      // 共享组一律取 FK 酒店名（同 resolveExportHotelName 的例外，§九）：两侧房组各自的
+      // hotelName 文本可能是换酒店前的旧值、一侧没同步，不能任由文本分歧显示成两家酒店。
       const hotelName =
-        attributed && !placement.pending ? fkHotelName : group?.hotelName || fkHotelName;
+        group?.sharedRoomId || (attributed && !placement.pending)
+          ? fkHotelName
+          : group?.hotelName || fkHotelName;
       // 房型容量（未分房乘客打包用）；fixture/缺数据/未落位随机档回落 2 人/间
       const capacity = placement.capacity && placement.capacity > 0 ? placement.capacity : 2;
       const travelDates = flightDates.length > 0 ? flightDates.join(' / ') : checkInStr;
@@ -538,10 +581,15 @@ export function buildRoomAllocationSheets(
         assignedRoomType ||
         placement.bedType ||
         (placement.pending ? PENDING_PLACEMENT_ROOM_TYPE : '');
-      const isHalf = !!group && group.roomFraction === 0.5;
-      // 半间/拼房标记：roomFraction === 0.5 时在备注里点出（整间/缺省不标）
+      // 半间/拼房标记：共享房组恒不标（两侧份额可能不对称，但物理是同一间房，见 §九）；
+      // 普通房组 roomFraction === 0.5 才标。
+      const isHalf = !!group && !group.sharedRoomId && group.roomFraction === 0.5;
       const halfRoomNote = isHalf ? '半间/拼房' : '';
-      const notes = [group?.notes, order.notes, halfRoomNote].filter(Boolean).join(' / ');
+      // 跨单合住备注（内部导出一律带对方单号，见 buildRoomAllocationSheets JSDoc）
+      const sharedNote = group?.sharedRoomId
+        ? sharedRoomPartnerNote(group.sharedRoomId, order.orderNumber, sharedRoomPartnerLookup)
+        : '';
+      const notes = [group?.notes, order.notes, halfRoomNote, sharedNote].filter(Boolean).join(' / ');
 
       // 当日余房：分房组人工填的酒店名与 correlate 到的 item FK 关联酒店不一致时，
       // 无法确定该按哪家酒店的余量算——绝不瞎标，直接 "—"（见文件顶部 JSDoc 归属优先级说明）。
@@ -577,8 +625,9 @@ export function buildRoomAllocationSheets(
 
       const list = byDate.get(checkInStr) ?? [];
       list.push({
+        hotelId: placement.hotelId,
         hotelName,
-        groupId: group?.id ?? null,
+        identityKey: group ? roomIdentityKey(group, order.id) : null,
         isHalf,
         capacity,
         gender: p.gender ?? null,
@@ -624,57 +673,50 @@ function packGenderKeyOf(gender: string | null): PackGenderKey {
 
 /**
  * 给同一入住日期内的乘客分配房间号（per 酒店，按取数顺序）。就地写回 entry.roomOrder。
- *   - 已分房：同 groupId 共用一个房号（首次出现时分配）——人工分房结果不受性别分组影响。
+ *   - 已分房：同 identityKey 共用一个房号（首次出现时分配）——共享房两侧各自的房组换算出
+ *     同一个 identityKey（room-identity.ts 的 roomIdentityKey），因此印同一个房号；
+ *     人工分房结果不受性别分组影响。
  *   - 未分房：按性别分组分别打包——M 一组、F 一组各自按容量打包（每满 capacity 人开下一间），
  *     性别未知/X 保守视同"潜在异性"，各自单间不与任何人拼房；异性不能拼同一物理房间，
  *     口径与销控物理房间一致（见 hotel-control.service.ts computePhysicalUsed 的 JSDoc）。
  *     未分房房号续在已分房之后。
+ * 编号作用域按真实 hotelId（entry.hotelName 只做展示，不参与分桶——见 RoomNumberEntry JSDoc）。
  * 导出供整班机订单导出（orders.export.ts）复用——同一套打包口径，不各自实现。
  */
 export function assignRoomNumbers(entries: RoomNumberEntry[]): void {
-  // 每个酒店各自的分配状态；未分房乘客按性别分组各自维护「当前开放房间」
-  const perHotel = new Map<
-    string,
-    {
-      next: number;
-      groupRoom: Map<string, number>;
-      openRoomByGender: Map<PackGenderKey, { room: number; left: number }>;
-    }
-  >();
+  const numberer = new RoomNumberer();
+  // 未分房乘客按性别分组各自维护「当前开放房间」（per 作用域，next() 与 numberFor() 共用计数器）
+  const openRoomByScope = new Map<string, Map<PackGenderKey, { room: number; left: number }>>();
 
   for (const e of entries) {
-    let st = perHotel.get(e.hotelName);
-    if (!st) {
-      st = { next: 1, groupRoom: new Map(), openRoomByGender: new Map() };
-      perHotel.set(e.hotelName, st);
-    }
+    const scope = roomNumberScopeKey(e.hotelId, e.hotelName);
 
-    if (e.groupId) {
-      // 已分房：同组复用房号；首次出现分配新号
-      let room = st.groupRoom.get(e.groupId);
-      if (room === undefined) {
-        room = st.next++;
-        st.groupRoom.set(e.groupId, room);
-      }
-      e.roomOrder = room;
+    if (e.identityKey) {
+      // 已分房：同 identityKey 复用房号；首次出现分配新号
+      e.roomOrder = numberer.numberFor(scope, e.identityKey);
       continue;
     }
 
     const genderKey = packGenderKeyOf(e.gender);
     if (genderKey === 'U') {
       // 性别未知/X：不与任何人拼房，各自单间
-      e.roomOrder = st.next++;
+      e.roomOrder = numberer.next(scope);
       continue;
     }
 
     // 未分房（性别已知）：按容量打包到该性别当前开放房间；满则开新房
-    let open = st.openRoomByGender.get(genderKey);
+    let openByGender = openRoomByScope.get(scope);
+    if (!openByGender) {
+      openByGender = new Map();
+      openRoomByScope.set(scope, openByGender);
+    }
+    let open = openByGender.get(genderKey);
     if (!open || open.left <= 0) {
-      open = { room: st.next++, left: e.capacity };
+      open = { room: numberer.next(scope), left: e.capacity };
     }
     e.roomOrder = open.room;
     open.left -= 1;
-    st.openRoomByGender.set(genderKey, open);
+    openByGender.set(genderKey, open);
   }
 }
 
@@ -891,7 +933,15 @@ async function buildWorkbookFromItems(
     items.flatMap((it) => it.order.passengers),
     client,
   );
-  const sheets = buildRoomAllocationSheets(items, remainingLookup, tripStats);
+  // 跨单合住备注：批量拉出本次导出涉及的全部共享房各自的成员单号（无 N+1）。
+  const sharedRoomIds = new Set<string>();
+  for (const it of items) {
+    for (const g of parseRoomGroups(it.order.roomAssignment)) {
+      if (g.sharedRoomId) sharedRoomIds.add(g.sharedRoomId);
+    }
+  }
+  const sharedRoomPartnerLookup = await loadSharedRoomPartnerLookup(sharedRoomIds, client);
+  const sheets = buildRoomAllocationSheets(items, remainingLookup, tripStats, sharedRoomPartnerLookup);
 
   const wb = new ExcelJS.Workbook();
   wb.creator = '分房表导出';
