@@ -211,6 +211,7 @@ import { heldSeatsForCabin } from '../hold-orders/held-seats.js';
 // 「回程已释放」提醒的 ruleKey 构造收敛在提醒规则那边：作废时要把这两条待办一起关掉，
 // 在这里照抄一遍拼接格式，改键时必然漏一处、待办就永远关不掉。
 import { noShowReleasedReminderRuleKeys } from '../reminders/reminders.rules.js';
+import { serializeRoomGroupsFor } from './room-group-dto.js';
 import type {
   BatchCreateOrdersBody,
   BatchPriceAdjustmentBody,
@@ -26097,6 +26098,9 @@ interface OrderLike {
   items: Array<{ unitPrice: Prisma.Decimal; amount: Prisma.Decimal } & Record<string, unknown>>;
   // 可选嵌套代理（含余额 Decimal + 结算模式）；不同 include 下可能不带或带 null
   agent?: ({ prepaymentBalance?: Prisma.Decimal | null } & Record<string, unknown>) | null;
+  // 拼房分配 JSON（{ roomGroups: [...] }，跨单分房落地后可能带 sharedRoomId 镜像字段）。
+  // 对外角色一律经 serializeRoomGroupsFor 剥离，见 serializeOrder 下方 roomAssignment 覆盖。
+  roomAssignment?: unknown;
   // ── 对外脱敏（redactForExternal）会剥离的内部字段（均可选：不同 include/select 下形状不同）──
   //   内部备注 + 结构化四栏备注 + 出纳期望到账 + 售后审计流水 + 接单运营 + 运营待办。
   //   声明为可选是为了让 serializeOrder 能安全读取并按角色覆盖（listOrders/getOrder 都联查了这些）。
@@ -26716,6 +26720,11 @@ const REDACTED_ITEM_METADATA_KEYS: readonly string[] = [
   // ── 拆单留痕（都指向**另一张单**上的行，对外一律不认）────────────────────────
   'splitPairKey', // 住宿行劈半的配对键 = `<源行 id>:<拆单令牌>`：泄露源行 id 与内部拆单令牌
   'splitFromItemId', // 这条行是从哪条源行拆出来的（源行可能在代理看不见的另一张单上）
+  // 跨单分房共享房 id（§十）：目前只写在 roomAssignment.roomGroups[]，不在 item.metadata——
+  // 这里防御性登记只为了「万一以后哪个入口手滑把它落到 metadata 上」也不会漏剥，
+  // 与 splitPairKey 同一类（都指向另一张单，都不该对外）。roomAssignment 本身的剥离见
+  // serializeOrder 的 roomAssignment 覆盖（走 serializeRoomGroupsFor，不靠这份黑名单）。
+  'sharedRoomId',
   // ── 换人重算结算价（SWAP_REPRICE 行）：整段是我方同业价口径 ──────────────────
   // 基准价 / 重取价 / 日历档次晚数与每人立减 —— 代理凭这几个数能把我方结算价日历反推出来。
   // 行金额本身对外仍可见（这笔钱确实调了他的应收），只是「这个价怎么来的」不外露。
@@ -26979,6 +26988,14 @@ export function serializeOrder<T extends OrderLike>(
     // 物化列本身只服务内部列表筛选与导出，对外角色（AGENT/CUSTOMER）一律不下发。
     // hasReturnLeg 是客户自己也知道的行程事实（买没买回程），照常透出，两者不是一回事。
     legFlag: redact ? undefined : (order as { legFlag?: unknown }).legFlag,
+    // 跨单分房（§十）：内部角色（redact=false）原样透传（RoomingEditor 等后台组件要读
+    // sharedRoomId 判定「已与他单合住并锁定」）；对外角色剥成中性 DTO——不下发 sharedRoomId
+    // 本身、splitPairKey、hotelName 等内部字段，只留 isShared 布尔（不暴露对方是哪张单）。
+    // fail-closed：ctx.role 缺失时 serializeRoomGroupsFor 内部按外部角色处理，但这里外层仍以
+    // redact 为准——ADMIN/STAFF 走内部分支从不传 redact:true，不会因为漏传 role 被误剥。
+    roomAssignment: redact
+      ? serializeRoomGroupsFor(ctx.role, order.roomAssignment)
+      : order.roomAssignment,
     settlementLocked: order.settlementLocked ?? false,
     // 锁定时间/操作人仅内部可见（对代理 redact），条件透传保持与 Prisma payload 类型兼容
     settlementLockedAt: redact ? undefined : (order.settlementLockedAt ?? null),

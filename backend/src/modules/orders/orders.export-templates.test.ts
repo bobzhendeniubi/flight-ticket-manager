@@ -1682,6 +1682,89 @@ describe('代理导出（agentScope 非空）— 三模板按共享脱敏政策�
         expect(row1).toContain(h);
       }
     });
+
+    // ── 跨单分房备注（§十验收反例 9）：内部导出带对方单号，代理导出只写中性文案 ──────
+    describe('跨单分房备注', () => {
+      function fakeClientWithSharedRoom(
+        orders: OrderForTemplateExport[],
+        partnerRows: Array<{ sharedRoomId: string; order: { orderNumber: string } }>,
+      ): PrismaClient {
+        return {
+          order: {
+            findMany: vi.fn(async (args?: { where?: Record<string, unknown> }) =>
+              args?.where?.passengers ? [] : orders,
+            ),
+          },
+          sharedRoomMember: { findMany: vi.fn().mockResolvedValue(partnerRows) },
+          legacyTicket: { findMany: vi.fn().mockResolvedValue([]) },
+          travelerProfile: {
+            count: vi.fn().mockResolvedValue(42),
+            aggregate: vi.fn().mockResolvedValue({ _max: { refreshedAt: new Date() } }),
+            findMany: vi.fn().mockResolvedValue([]),
+          },
+          travelerBenefitRedemption: { groupBy: vi.fn().mockResolvedValue([]) },
+        } as unknown as PrismaClient;
+      }
+
+      function orderWithSharedRoom(): OrderForTemplateExport {
+        const o = fixtureRoundTrip();
+        (o as unknown as { roomAssignment: unknown }).roomAssignment = {
+          roomGroups: [
+            {
+              id: 'g1',
+              hotelName: '岘港四星',
+              roomType: '三床房',
+              passengerIds: ['p1'],
+              roomFraction: 1,
+              sharedRoomId: 'sr1',
+              notes: '靠窗',
+            },
+          ],
+        };
+        return o;
+      }
+
+      async function loadFullSheet(
+        client: PrismaClient,
+        agentScope: string[] | null,
+      ): Promise<ExcelJS.Worksheet> {
+        const buf = await buildOrderTemplateExportWorkbook(
+          { template: 'full' } as Parameters<typeof buildOrderTemplateExportWorkbook>[0],
+          client,
+          { agentScope },
+        );
+        const wb = new ExcelJS.Workbook();
+        await wb.xlsx.load(buf as unknown as Parameters<typeof wb.xlsx.load>[0]);
+        const ws = wb.getWorksheet('全岗可用');
+        if (!ws) throw new Error('全岗可用 sheet 不存在');
+        return ws;
+      }
+
+      it('内部导出（agentScope=null）：备注带「与 FTM_PARTNER 合住」，对方单号从 sharedRoomMember 查', async () => {
+        const client = fakeClientWithSharedRoom(
+          [orderWithSharedRoom()],
+          [
+            { sharedRoomId: 'sr1', order: { orderNumber: 'ACOAZR' } }, // 本单
+            { sharedRoomId: 'sr1', order: { orderNumber: 'FTM_PARTNER' } },
+          ],
+        );
+        const ws = await loadFullSheet(client, null);
+        const headers = rowText(ws, 1);
+        const dataRow = rowText(ws, 3);
+        expect(dataRow[headers.indexOf('备注')]).toContain('与 FTM_PARTNER 合住');
+      });
+
+      it('代理导出（agentScope 非空）：备注只写「与他单合住」，不含对方单号，也不含 sharedRoomId', async () => {
+        const client = fakeClientWithSharedRoom([orderWithSharedRoom()], []);
+        const ws = await loadFullSheet(client, ['agent-1']);
+        const headers = rowText(ws, 1);
+        const dataRow = rowText(ws, 3);
+        const notes = dataRow[headers.indexOf('备注')];
+        expect(notes).toContain('与他单合住');
+        expect(notes).not.toContain('FTM_PARTNER');
+        expect(notes).not.toContain('sr1');
+      });
+    });
   });
 
   describe('《票务专用》ticketing', () => {
