@@ -23,6 +23,7 @@ import { OrderItemKind, OrderStatus, Prisma, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { saveSharedRooms } from './hotel-control.shared-rooms.js';
 import { getHotelNightlyRemaining } from './hotel-control.service.js';
+import { serializeRoomGroupsFor } from '../orders/room-group-dto.js';
 
 const CHECK_IN = '2026-10-01';
 const CHECK_OUT = '2026-10-03';
@@ -1348,5 +1349,70 @@ describe('saveSharedRooms · 真 DB E2E · 工作台重存保留本单房组备�
     const afterGroup = afterGroups.find((g) => g.orderItemId === orderA.items[0].id);
     expect(afterGroup).toBeDefined();
     expect(afterGroup!.notes).toBe('A 单本地备注：靠窗'); // 没有被工作台重存清掉
+  });
+});
+
+/**
+ * astra B1：房组 id 曾经编码成 `shared:<sharedRoomId>:<orderItemId>` /
+ * `plain:<sharedRoomId>:<orderItemId>`，代理/客户视角的 serializeRoomGroupsFor 只挑字段
+ * 不改值，原样把这个 id 透传出去——等于把内部共享房 id 泄露给代理。用 saveSharedRooms
+ * 真正落库产出的形状（不是手搭的干净 fixture）过一遍脱敏函数，断言整份响应的 JSON
+ * 字符串里不包含 sharedRoomId 的真实值，而不只是检查某个字段不存在。
+ */
+describe('saveSharedRooms · 真 DB E2E · 房组 id 不泄露 sharedRoomId（astra B1）', () => {
+  afterEach(() => flushFireAndForgetAudit());
+
+  it('落库产出的房组 id 不含 sharedRoomId 原文；AGENT 视角整份 JSON 也不含', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    const created = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const sharedRoomId = created.rooms[0].sharedRoomId;
+
+    const refreshedA = await prisma.order.findUniqueOrThrow({ where: { id: orderA.id } });
+    const groupsA = (refreshedA.roomAssignment as { roomGroups: Array<Record<string, unknown>> }).roomGroups;
+    const groupA = groupsA.find((g) => g.orderItemId === orderA.items[0].id);
+    expect(groupA).toBeDefined();
+    expect(String(groupA!.id)).not.toContain(sharedRoomId); // id 本身不含 sharedRoomId 原文
+    expect(String(groupA!.id)).not.toMatch(/^shared:|^plain:/); // 也不是旧式编码前缀
+
+    const agentView = serializeRoomGroupsFor(UserRole.AGENT, refreshedA.roomAssignment) as {
+      roomGroups: Array<{ id: string; isShared: boolean }>;
+    };
+    // 用真实落库形状过一遍脱敏函数，断言整份响应 JSON 字符串不含 sharedRoomId 真实值
+    // （不是只检查某个字段不存在——那种检查法查不出「值被塞进另一个字段」这种泄露）。
+    expect(JSON.stringify(agentView)).not.toContain(sharedRoomId);
+    const agentGroup = agentView.roomGroups.find((g) => g.id === groupA!.id);
+    expect(agentGroup?.isShared).toBe(true); // 布尔标记仍然正确，只是不带具体是哪间
   });
 });

@@ -666,6 +666,16 @@ async function saveSharedRoomsInner(
     // 只能是「保留」，不存在「省略=不动、空串=清空」的二义性（那是单单编辑器端点的语义，
     // 那边已经用 `g.notes ?? old?.notes` 正确处理，见 orders.routes.ts）。
     const preservedGroupNotes = new Map<string, string>();
+    // 房组 id 服务端生成、不编码关系（astra B1）：老数据的 id 是 `shared:<sharedRoomId>:
+    // <orderItemId>` / `plain:<sharedRoomId>:<orderItemId>`，原样透传给代理/客户视角
+    // （room-group-dto.ts 的 serializeRoomGroupsFor 只挑字段不改值）就等于把内部共享房 id
+    // 泄露出去。新组的 id 一律用不含任何关系信息的随机 id；重建同一间房时尽量沿用它
+    // 上一次的（非旧式编码）随机 id 保持稳定，避免前端正开着的编辑器因 id 突变而对不上号；
+    // 旧式编码的 id 一律不沿用，逼着它在下一次触及时换成新的随机 id（相当于惰性迁移）。
+    const preservedGroupIds = new Map<string, string>();
+    const LEGACY_ENCODED_ID_PREFIXES = ['shared:', 'plain:'];
+    const isLegacyEncodedId = (id: string): boolean =>
+      LEGACY_ENCODED_ID_PREFIXES.some((prefix) => id.startsWith(prefix));
     const newGroupsByOrder = new Map<string, Array<Record<string, unknown>>>();
     for (const [orderId, order] of orders) {
       const groups = parseRoomGroups(order.roomAssignment);
@@ -676,6 +686,9 @@ async function saveSharedRoomsInner(
           const itemId = groupOrderItemId(g);
           if (itemId != null && typeof g.notes === 'string' && g.notes.length > 0) {
             preservedGroupNotes.set(`${sid}:${orderId}:${itemId}`, g.notes);
+          }
+          if (itemId != null && typeof g.id === 'string' && g.id.length > 0 && !isLegacyEncodedId(g.id)) {
+            preservedGroupIds.set(`${sid}:${orderId}:${itemId}`, g.id);
           }
           return false; // 本次改动的共享房，整体重建
         }
@@ -714,9 +727,14 @@ async function saveSharedRoomsInner(
       }
       for (const entry of byOrderItem.values()) {
         const arr = newGroupsByOrder.get(entry.orderId) ?? [];
-        const preservedNotes = preservedGroupNotes.get(`${roomId}:${entry.orderId}:${entry.orderItemId}`);
+        const preserveKey = `${roomId}:${entry.orderId}:${entry.orderItemId}`;
+        const preservedNotes = preservedGroupNotes.get(preserveKey);
+        // 房组 id 不编码 sharedRoomId（astra B1）：解散后退回普通组的 id 不能再用
+        // `plain:${roomId}:...`——roomId 就是被解散的那间共享房 id，原样保留反而是
+        // 「解散了但 id 还认得出是哪间共享房」，泄露面不会因为组变普通了就消失。
+        const groupId = preservedGroupIds.get(preserveKey) ?? randomUUID();
         arr.push({
-          id: `plain:${roomId}:${entry.orderItemId}`,
+          id: groupId,
           hotelName: '',
           roomType: '',
           passengerIds: entry.passengerIds,
@@ -748,11 +766,16 @@ async function saveSharedRoomsInner(
       for (const g of room.groups) {
         const arr = newGroupsByOrder.get(g.orderId) ?? [];
         // 更新既有房（room.sharedRoomId 有值）时，sharedRoomId 与旧组相同，按
-        // (sharedRoomId, orderId, orderItemId) 能查到旧 notes 原样带回来；新建房
-        // 的 sharedRoomId 是刚生成的随机 id，查不到旧记录也就没有可保留的 notes。
-        const preservedNotes = preservedGroupNotes.get(`${sharedRoomId}:${g.orderId}:${g.orderItemId}`);
+        // (sharedRoomId, orderId, orderItemId) 能查到旧 notes / id 原样带回来；新建房
+        // 的 sharedRoomId 是刚生成的随机 id，查不到旧记录，两者都从零生成/留空。
+        const preserveKey = `${sharedRoomId}:${g.orderId}:${g.orderItemId}`;
+        const preservedNotes = preservedGroupNotes.get(preserveKey);
+        // 房组 id 服务端生成、不编码 sharedRoomId（astra B1）：这里不再用
+        // `shared:${sharedRoomId}:...` 拼 id——那等于把内部共享房 id 原样嵌进一个
+        // 对外可见的字段，AGENT/CUSTOMER 视角（room-group-dto.ts）会原样把它传出去。
+        const groupId = preservedGroupIds.get(preserveKey) ?? randomUUID();
         arr.push({
-          id: `shared:${sharedRoomId}:${g.orderItemId}`,
+          id: groupId,
           hotelName: '',
           roomType: roomTypeCache.get(room.hotelRoomTypeId)?.name ?? '',
           passengerIds: g.passengerIds,

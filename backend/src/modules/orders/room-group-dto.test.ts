@@ -96,4 +96,22 @@ describe('serializeRoomGroupsFor — AGENT/CUSTOMER 剥离', () => {
     expect(serializeRoomGroupsFor(UserRole.ADMIN, null)).toBeNull();
     expect(serializeRoomGroupsFor(UserRole.ADMIN, undefined)).toBeUndefined();
   });
+
+  /**
+   * astra B1：房组 id 曾经真实落库成 `shared:<sharedRoomId>:<orderItemId>` 的形状——这个
+   * 函数按字段选择性透传，不解析/改写 id 的内容，所以「id 本身不能带敏感信息」是**写入方**
+   * （hotel-control.shared-rooms.ts 的 saveSharedRooms）的职责，不是这层 DTO 的职责：DTO
+   * 猜不出一个字符串 id 里有没有夹带 sharedRoomId，硬要在这里扫描/改写反而会把 AGENT 单单
+   * 分房编辑器回传的 id 和服务端锁后现状的 id 对不上（reconcile 靠 id 相等匹配旧组）。
+   * 写入方已经改成生成不含任何关系信息的随机 id（并有存量迁移脚本
+   * rewrite-shared-room-group-ids.ts），端到端验证见
+   * hotel-control.shared-rooms.integration.test.ts 的 astra B1 用例：真正调用
+   * saveSharedRooms 产出的 id 过一遍这个函数，断言整份响应不含 sharedRoomId 原文。
+   */
+  it('原样透传 id 字段——不解析/改写其内容（id 是否携带敏感信息由写入方负责）', () => {
+    const result = serializeRoomGroupsFor(UserRole.AGENT, roomAssignment) as {
+      roomGroups: Array<{ id: string }>;
+    };
+    expect(result.roomGroups[0]!.id).toBe('g1');
+  });
 });
