@@ -861,6 +861,13 @@ export function assignedRoomsForItem(
 export interface PhysicalOccupancyItem {
   /** 行 id（可选）：房组归属过滤的坐标系。调用方不带 id 时归属过滤自动退化为整单口径。*/
   id?: string;
+  /**
+   * 行所在酒店 id（可选）：`assertHotelFitAfterChange` 按它兜底过滤 `nextOrderItems`——
+   * 调用方本该逐酒店只传该酒店的行，但万一传了整单跨酒店的行（astra A11：单单保存曾经
+   * 把整单酒店行塞进每家酒店的 nextOrderItems），带了 hotelId 就能在闸内被自动剔除，
+   * 不至于让 A 酒店的前瞻算进 B 酒店的行。不带 hotelId 的行不过滤（兼容旧调用方）。
+   */
+  hotelId?: string;
   hotelCheckIn: Date | null;
   hotelCheckOut: Date | null;
   roomsBilled?: Prisma.Decimal | number | null;
@@ -1646,11 +1653,17 @@ export async function assertHotelFitAfterChange(
   );
 
   // after：受影响订单里，调用方给了新快照的用新快照；没给的（被动牵连、本酒店未变）沿用现状。
+  // 兜底过滤（astra A11）：带 hotelId 的行只在等于本次 hotelId 时才计入——调用方理应逐酒店
+  // 只传该酒店的行，但万一手滑把整单跨酒店的行都塞进 next（曾经的单单保存 bug），这里挡一道，
+  // 不让 A 酒店的前瞻算进 B 酒店的行；不带 hotelId 的行视为「调用方未升级」，原样放行。
   const afterAffectedItems: PhysicalOccupancyItem[] = [];
   for (const orderId of affectedSet) {
     const next = args.nextOrderItems?.get(orderId);
-    if (next) afterAffectedItems.push(...next);
-    else afterAffectedItems.push(...currentAffectedItems.filter((it) => it.order?.id === orderId));
+    if (next) {
+      afterAffectedItems.push(...next.filter((it) => it.hotelId == null || it.hotelId === hotelId));
+    } else {
+      afterAffectedItems.push(...currentAffectedItems.filter((it) => it.order?.id === orderId));
+    }
   }
 
   const sharedBefore = await computeSharedRoomPhysicalByDate(hotelId, nightDates, tx);
@@ -2856,13 +2869,38 @@ export async function getOccupyingOrders(
       }
     }
   }
-  // 去重物理房的「普通房组」分量：整单口径（assignedPhysicalRooms 已排除共享组），按订单缓存
-  // 避免同一订单的多行重复计算。
+  // 去重物理房的「普通房组」分量：**本次查询范围**（本酒店 + 该晚，`items` 已经这样过滤）内
+  // 该订单的行去重间数——不能用整单口径的 assignedPhysicalRooms（astra A11 第三部分）：
+  // 那会把该单在别的酒店 / 别的晚的房组也一并算进这一格，与「本酒店本晚」的下钻语义不符。
+  // 按订单缓存 itemIds + hotelName，避免同一订单的多行重复查询/计算。
+  const scopedItemIdsByOrder = new Map<string, Set<string>>();
+  const scopedHotelNameByOrder = new Map<string, string | null>();
+  for (const it of items) {
+    const oid = it.order.id;
+    let set = scopedItemIdsByOrder.get(oid);
+    if (!set) {
+      set = new Set();
+      scopedItemIdsByOrder.set(oid, set);
+    }
+    set.add(it.id);
+    if (!scopedHotelNameByOrder.has(oid)) {
+      scopedHotelNameByOrder.set(oid, it.hotelRoomType?.hotel?.name ?? null);
+    }
+  }
   const normalPhysicalByOrder = new Map<string, number>();
   const normalPhysicalRooms = (order: { id: string; roomAssignment: unknown }): number => {
     const cached = normalPhysicalByOrder.get(order.id);
     if (cached != null) return cached;
-    const val = assignedPhysicalRooms(order.roomAssignment) ?? 0;
+    const itemIds = scopedItemIdsByOrder.get(order.id) ?? new Set<string>();
+    const hotelName = scopedHotelNameByOrder.get(order.id) ?? null;
+    const groups = parseRoomGroups(order.roomAssignment);
+    const scopedGroups = (groups ?? []).filter((g) => {
+      const attributedId = groupOrderItemId(g);
+      return attributedId != null
+        ? itemIds.has(attributedId)
+        : hotelName != null && g.hotelName === hotelName;
+    });
+    const val = scopedGroups.length > 0 ? physicalRoomsOfGroups(scopedGroups, order.id) : 0;
     normalPhysicalByOrder.set(order.id, val);
     return val;
   };

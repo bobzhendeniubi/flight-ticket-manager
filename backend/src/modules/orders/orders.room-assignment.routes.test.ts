@@ -25,6 +25,8 @@ const prismaMock = vi.hoisted(() => {
       update: vi.fn().mockResolvedValue({}),
       aggregate: vi.fn().mockResolvedValue({ _sum: { roomsBilled: null } }),
     },
+    // §五闸（assertHotelFitAfterChange）读包房周期；缺省当「本酒店未纳管」（不拦截）。
+    hotelBlockPeriod: { findMany: vi.fn().mockResolvedValue([]) },
   };
   return {
     tx,
@@ -336,5 +338,88 @@ describe('PUT /orders/:id/room-assignment · 跨单分房 reconcile', () => {
     });
     expect(res.statusCode).toBe(400);
     expect(prismaMock.tx.order.update).not.toHaveBeenCalled();
+  });
+
+  /**
+   * astra A11：本单在两家酒店各有一条行，§五闸逐酒店调用 assertHotelFitAfterChange 时，
+   * H1 的 nextOrderItems 曾经被塞进整单（含 H2 那条行）的快照——H2 的房组也被算进 H1 的
+   * 前瞻，凭空多占一间。这里造一个只有 H1 纳管（block=1 间）、H2 不纳管的场景：只改 H1
+   * 自己那条行的分房（1 间），旧 bug 会把 H2 的 1 间也算进 H1（合计 2 间 > block 1 间）→ 400；
+   * 修复后 H1 前瞻只看自己的行（1 间 = block 1 间）→ 200。
+   */
+  it('本单跨两家酒店：H1 的前瞻不再把 H2 的行算进去（astra A11）', async () => {
+    const CHECK_IN = new Date('2026-06-01T00:00:00.000Z');
+    const CHECK_OUT = new Date('2026-06-02T00:00:00.000Z');
+    prismaMock.orderItem.count.mockResolvedValue(2); // itemA + itemB 归属校验通过
+    prismaMock.tx.order.findUnique.mockResolvedValue({ roomAssignment: null }); // 本单原先未分房
+
+    prismaMock.tx.orderItem.findMany.mockImplementation(async (args: { where?: Record<string, unknown> }) => {
+      const where = args.where ?? {};
+      if (where.orderId === 'o1') {
+        // §五闸的「本单在各酒店变更后的占房快照」源查询：本单在 H1、H2 各一条酒店行。
+        return [
+          {
+            id: 'itemA',
+            hotelCheckIn: CHECK_IN,
+            hotelCheckOut: CHECK_OUT,
+            metadata: null,
+            hotelRoomType: { hotelId: 'H1' },
+          },
+          {
+            id: 'itemB',
+            hotelCheckIn: CHECK_IN,
+            hotelCheckOut: CHECK_OUT,
+            metadata: null,
+            hotelRoomType: { hotelId: 'H2' },
+          },
+        ];
+      }
+      // assertHotelFitAfterChange 内部的 liveItems 查询，按 hotelRoomType.hotelId 区分酒店。
+      const hotelId = (where.hotelRoomType as { hotelId?: string } | undefined)?.hotelId;
+      if (hotelId === 'H1') {
+        return [
+          {
+            id: 'itemA',
+            hotelCheckIn: CHECK_IN,
+            hotelCheckOut: CHECK_OUT,
+            roomsBilled: null,
+            metadata: null,
+            hotelRoomType: { hotel: { name: 'H1 酒店' } },
+            order: { id: 'o1', roomAssignment: null, passengers: [] },
+          },
+        ];
+      }
+      if (hotelId === 'H2') {
+        return [
+          {
+            id: 'itemB',
+            hotelCheckIn: CHECK_IN,
+            hotelCheckOut: CHECK_OUT,
+            roomsBilled: null,
+            metadata: null,
+            hotelRoomType: { hotel: { name: 'H2 酒店' } },
+            order: { id: 'o1', roomAssignment: null, passengers: [] },
+          },
+        ];
+      }
+      return [];
+    });
+    prismaMock.tx.hotelBlockPeriod.findMany.mockImplementation(
+      async (args: { where?: Record<string, unknown> }) => {
+        if (args.where?.hotelId === 'H1') {
+          return [{ dateFrom: CHECK_IN, dateTo: CHECK_OUT, rooms: 1 }]; // H1 纳管，只有 1 间
+        }
+        return []; // H2 未纳管——不该拦，也不该被算进 H1
+      },
+    );
+
+    const res = await putStaff({
+      roomGroups: [
+        { id: 'gA', hotelName: 'H1 酒店', roomType: '标间', passengerIds: ['p1'], orderItemId: 'itemA' },
+        { id: 'gB', hotelName: 'H2 酒店', roomType: '标间', passengerIds: ['p2'], orderItemId: 'itemB' },
+      ],
+    });
+    expect(res.statusCode).toBe(200);
+    expect(prismaMock.tx.order.update).toHaveBeenCalled();
   });
 });

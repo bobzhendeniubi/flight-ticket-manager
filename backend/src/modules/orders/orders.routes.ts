@@ -1538,23 +1538,30 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       const hotelIds = new Set(
         hotelItems.map((it) => it.hotelRoomType?.hotelId).filter((v): v is string => !!v),
       );
-      const nextItemsAtHotel = new Map<string, PhysicalOccupancyItem[]>();
       const finalRoomAssignment = { roomGroups: finalGroups };
-      nextItemsAtHotel.set(
-        id,
-        hotelItems.map((it) => ({
-          id: it.id,
-          hotelCheckIn: it.hotelCheckIn,
-          hotelCheckOut: it.hotelCheckOut,
-          roomsBilled: null,
-          metadata: it.metadata,
-          order: { id, roomAssignment: finalRoomAssignment, passengers: [] },
-        })),
-      );
+      // ⚠ astra A11：nextOrderItems 必须逐酒店只传该酒店自己的行——曾经把整单（跨酒店）的行
+      // 一次性塞给每一家酒店，导致 A 酒店的前瞻把 B 酒店的行也算了进去，多酒店订单只改备注
+      // 都会被误判超卖。每次循环内重新按 hotelId 过滤 hotelItems，且每条行都带上 hotelId
+      // （assertHotelFitAfterChange 内部按它兜底过滤，双保险）。
       for (const hotelId of [...hotelIds].sort()) {
+        const itemsAtThisHotel = hotelItems.filter((it) => it.hotelRoomType?.hotelId === hotelId);
+        const nextItemsAtHotel = new Map<string, PhysicalOccupancyItem[]>([
+          [
+            id,
+            itemsAtThisHotel.map((it) => ({
+              id: it.id,
+              hotelId,
+              hotelCheckIn: it.hotelCheckIn,
+              hotelCheckOut: it.hotelCheckOut,
+              roomsBilled: null,
+              metadata: it.metadata,
+              order: { id, roomAssignment: finalRoomAssignment, passengers: [] },
+            })),
+          ],
+        ]);
         const nights = new Set<string>();
-        for (const it of hotelItems) {
-          if (it.hotelRoomType?.hotelId !== hotelId || !it.hotelCheckIn || !it.hotelCheckOut) continue;
+        for (const it of itemsAtThisHotel) {
+          if (!it.hotelCheckIn || !it.hotelCheckOut) continue;
           for (const d of buildStayNightDates(it.hotelCheckIn, it.hotelCheckOut)) nights.add(d);
         }
         await assertHotelFitAfterChange(tx, hotelId, [...nights].sort(), {

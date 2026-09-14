@@ -1467,10 +1467,30 @@ describe('getOccupyingOrders', () => {
       roomAssignment: roomAssignmentOf([1]), // 1 名乘客的普通房组 → 物理 1 间
       passengers: [{ documentNumber: 'E1', chineseName: '吴九', fullName: 'WU/JIU' }],
     };
+    // hotelRoomType.hotel.name 必须匹配 roomAssignmentOf 塞进 JSON 的 hotelName——真实查询里
+    // 两者本就是同一家酒店；本测试的普通房组没有 orderItemId 归属，全靠 hotelName 匹配落到
+    // 「本次查询范围」（astra A11 第三部分：physicalRoomsDeduped 只该算本酒店本晚的行）。
+    const hotelRoomType = { hotel: { name: '美溪海滩酒店' } };
     const client = occupantsClientWithShared(
       [
-        { id: 'item-1', roomsBilled: 1, metadata: null, hotelCheckIn: day(0), hotelCheckOut: day(1), order },
-        { id: 'item-2', roomsBilled: 0.5, metadata: null, hotelCheckIn: day(0), hotelCheckOut: day(1), order },
+        {
+          id: 'item-1',
+          roomsBilled: 1,
+          metadata: null,
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          hotelRoomType,
+          order,
+        },
+        {
+          id: 'item-2',
+          roomsBilled: 0.5,
+          metadata: null,
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          hotelRoomType,
+          order,
+        },
       ],
       [{ orderId: 'o11', sharedRoomId: 'sr9' }],
     );
