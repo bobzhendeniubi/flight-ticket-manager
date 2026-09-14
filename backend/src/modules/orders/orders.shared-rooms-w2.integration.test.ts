@@ -566,6 +566,126 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
     expect([saveOutcome.status, swapOutcome.status]).toContain('fulfilled');
   });
 
+  it('astra finding A14 反例：换酒店碰真正的共享成员锁冲突（不是无关的第三张单）——两者都不能死锁，最终状态自洽', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const { roomType: otherRoomType } = await (async () => {
+      const rt = await prisma.hotelRoomType.create({
+        data: {
+          hotelId: hotel.id,
+          name: uniq('Suite'),
+          capacity: 2,
+          maxAdults: 2,
+          maxChildren: 0,
+          basePrice: new Prisma.Decimal(900),
+        },
+      });
+      return { roomType: rt };
+    })();
+    // orderA / orderB 是共享房的**双方**——不是无关的第三张单：并发操作都会去锁同一个
+    // SharedRoom 行（saveSharedRooms 显式锁；swapItemHotel 触发 planUnbind 也锁同一行），
+    // 才是真正验证「加锁顺序不会互相等成死锁」的场景（旧测试的第三方单只碰包房周期锁，
+    // 碰不到 SharedRoom 行锁）。
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    const saved = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    // 并发 A：跨单分房工作台重存同一间共享房（改备注，成员不变）——会锁 SharedRoom 行。
+    const concurrentSave = saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        expectedVersions: { [saved.rooms[0].sharedRoomId]: saved.rooms[0].version },
+        rooms: [
+          {
+            sharedRoomId: saved.rooms[0].sharedRoomId,
+            hotelRoomTypeId: roomType.id,
+            notes: 'concurrent-note-real-member',
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    // 并发 B：orderB（真正的共享成员，0 份额那侧）换到同酒店另一房型——触发 planUnbind，
+    // 对同一个 SharedRoom 行 FOR UPDATE。
+    const concurrentSwap = service.swapItemHotel(
+      orderB.id,
+      orderB.items[0].id,
+      { newHotelRoomTypeId: otherRoomType.id, feeCny: 0 },
+      { userId: actor.userId, role: UserRole.ADMIN },
+    );
+
+    const [saveOutcome, swapOutcome] = await Promise.allSettled([concurrentSave, concurrentSwap]);
+    for (const outcome of [saveOutcome, swapOutcome]) {
+      if (outcome.status === 'rejected') {
+        expect(String(outcome.reason)).not.toMatch(/deadlock/i);
+      }
+    }
+    expect([saveOutcome.status, swapOutcome.status]).toContain('fulfilled');
+
+    // 最终状态自洽：不管谁先落地，orderB 这一行要么仍是共享成员（save 后写，swap 的
+    // 解绑输给了并发版本冲突而整体回滚），要么已解绑变普通房组（swap 后写）——不允许
+    // 出现「JSON 说已解绑、成员表却还在」或反过来的分叉态。
+    const memberRows = await prisma.sharedRoomMember.findMany({
+      where: { orderId: orderB.id, orderItemId: orderB.items[0].id },
+    });
+    const orderBAfter = await prisma.order.findUniqueOrThrow({
+      where: { id: orderB.id },
+      select: { roomAssignment: true },
+    });
+    const orderBGroup = (
+      orderBAfter.roomAssignment as { roomGroups: Array<Record<string, unknown>> }
+    ).roomGroups.find((g) => g.orderItemId === orderB.items[0].id);
+    const jsonSaysShared = typeof orderBGroup?.sharedRoomId === 'string';
+    expect(memberRows.length > 0).toBe(jsonSaysShared);
+  });
+
   it('入口 B（酒店改期）：共享行改期先解绑，新旧区间都过闸，物理口径 floor 回 1 间', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4, CHECK_IN, '2026-10-06');
