@@ -220,12 +220,13 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
 
   const canQuery = Boolean(hotelId && checkIn && checkOut && checkIn < checkOut);
 
+  // 注意：load 本身不清 saveErr/saveOk——保存成功后 handleSave 会调 load() 重拉落地状态，
+  // 若这里顺手清掉 saveOk，刚设好的「已保存」提示会在同一拍被冲掉，用户永远看不到。
+  // 清空交给下面「查询范围变化」的 effect 和手动「刷新」按钮各自负责。
   const load = useCallback(() => {
     if (!token || !canQuery) return;
     setLoading(true);
     setLoadErr(null);
-    setSaveErr(null);
-    setSaveOk(null);
     hotelControlOpsApi
       .getSharedRoomWorkbench(token, { hotelId, checkIn, checkOut })
       .then((data) => {
@@ -242,9 +243,19 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
       .finally(() => setLoading(false));
   }, [token, hotelId, checkIn, checkOut, canQuery]);
 
+  // 查询范围（酒店/入住/退房）变化才清掉旧的保存提示——load() 被 handleSave 复用时不清。
   useEffect(() => {
+    setSaveErr(null);
+    setSaveOk(null);
     load();
   }, [load]);
+
+  /** 手动点「刷新」（含 409 冲突提示里那个）：顺手清掉旧的保存提示，再重拉。 */
+  function handleManualRefresh(): void {
+    setSaveErr(null);
+    setSaveOk(null);
+    load();
+  }
 
   // ── 索引：乘客 → 所属订单；订单 id → 订单 ────────────────────────────────
   const orderById = useMemo(() => {
@@ -508,7 +519,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
             <label className="label">退房</label>
             <input type="date" className="input" value={checkOut} onChange={(e) => setCheckOut(e.target.value)} />
           </div>
-          <button type="button" className="btn-secondary" onClick={load} disabled={loading || !canQuery}>
+          <button type="button" className="btn-secondary" onClick={handleManualRefresh} disabled={loading || !canQuery}>
             <Icon name="refresh" /> {loading ? '加载中…' : '刷新'}
           </button>
           {!canQuery && <span className="text-xs text-amber-700">入住日须早于退房日</span>}
@@ -741,7 +752,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
             <div className="mb-2 flex flex-wrap items-center justify-between gap-2 rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">
               <span>{saveErr}</span>
               {isConflict && (
-                <button type="button" className="btn-secondary px-2 py-1 text-xs" onClick={load}>
+                <button type="button" className="btn-secondary px-2 py-1 text-xs" onClick={handleManualRefresh}>
                   <Icon name="refresh" /> 刷新
                 </button>
               )}
