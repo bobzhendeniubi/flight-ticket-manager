@@ -385,6 +385,14 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
     expect(Number(targetItems[0].roomsBilled)).toBe(0);
     expect(Number(targetItems[0].amount)).toBe(0);
     expect(targetItems[0].hotelCheckIn?.toISOString().slice(0, 10)).toBe(CHECK_IN);
+    // astra finding A8：承载行成本必须显式是 0（Prisma.Decimal），不能是 null——写 null 会被
+    // 财务报表的「snapshot 为 null 就回退按酒店实际房价现查现算」兜底，让这条本不占库存的
+    // ¥0 承载行凭空长出成本；也会被毛利明细的「totalCostCny 为 null = 缺成本」判成未知，
+    // 拖累整单毛利算不出来。
+    expect(targetItems[0].unitCostCny).not.toBeNull();
+    expect(Number(targetItems[0].unitCostCny)).toBe(0);
+    expect(targetItems[0].totalCostCny).not.toBeNull();
+    expect(Number(targetItems[0].totalCostCny)).toBe(0);
 
     // SharedRoomMember 真值已随人搬到新单新行。
     const p1Member = await prisma.sharedRoomMember.findFirstOrThrow({

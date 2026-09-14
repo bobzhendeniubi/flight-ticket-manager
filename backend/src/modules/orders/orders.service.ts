@@ -18915,8 +18915,13 @@ export class OrderService {
                 quantity: src.quantity,
                 unitPrice: new Prisma.Decimal(0),
                 amount: new Prisma.Decimal(0),
-                unitCostCny: null,
-                totalCostCny: null,
+                // HIGH 修复（astra finding A8）：显式写 0，不写 null——null 会被财务报表
+                // （finances.service.ts 的 resolveHotelActualCostCny 系兜底）当成「缺成本
+                // 快照」回退去按酒店实际房价现查现算，让这条 ¥0 的纯承载行凭空长出成本。
+                // 该行不占实际酒店库存（是共享房去重后的镜像承载，物理已由 SharedRoom
+                // 计过一次），成本理应恒为 0。
+                unitCostCny: new Prisma.Decimal(0),
+                totalCostCny: new Prisma.Decimal(0),
                 hotelRoomTypeId: src.hotelRoomTypeId,
                 randomStarTier: src.randomStarTier,
                 hotelCheckIn: src.hotelCheckIn,
