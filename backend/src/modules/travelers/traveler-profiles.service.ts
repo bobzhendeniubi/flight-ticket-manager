@@ -122,13 +122,6 @@ function toProfileData(
   };
 }
 
-/** 证件号脱敏（前2后2）：E12345678 → E1*****78；过短(≤4)全打码。列表/导出用。 */
-function maskDocumentNumber(doc: string): string {
-  const d = (doc ?? '').trim();
-  if (d.length <= 4) return '*'.repeat(Math.max(d.length, 2));
-  return `${d.slice(0, 2)}${'*'.repeat(d.length - 4)}${d.slice(-2)}`;
-}
-
 export class TravelerProfilesService {
   /** 并发重建去重：同一时刻只跑一次全量重建 */
   private rebuildInFlight: Promise<{ built: number; removed: number }> | null = null;
@@ -181,13 +174,9 @@ export class TravelerProfilesService {
     const redeemedByProfile = await loadRedeemedTripsByProfile(rows.map((r) => r.id));
 
     return {
-      // N4（提案 §1.4 隐私口径，2026-07-17 收口）：列表/导出默认脱敏证件号（前2后2）。
-      // 前端 CSV 导出直接用列表数据 → 服务端一脱敏，导出自动是脱敏版，不再能批量导全号。
-      // 全号只在详情页（getDetail，逐人查看）与录单联想（suggest，定向回填）返回。
-      profiles: rows.map((r) => {
-        const p = withBenefitTotals(serializeProfile(r), redeemedByProfile);
-        return { ...p, documentNumber: maskDocumentNumber(p.documentNumber) };
-      }),
+      // 2026-09-14 拍板：档案列表/导出出证件全号（此前 07-17 起前2后2脱敏）。
+      // 后台是内部岗位在用，运营核对护照要看全号；订单列表 09-13 已改全号，这里跟齐。
+      profiles: rows.map((r) => withBenefitTotals(serializeProfile(r), redeemedByProfile)),
       pagination: { page: query.page, pageSize: query.pageSize, total },
       meta: {
         totalProfiles: stats._count._all,

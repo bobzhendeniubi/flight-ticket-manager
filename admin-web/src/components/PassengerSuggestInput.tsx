@@ -44,11 +44,6 @@ const BED_LABELS: Record<string, string> = {
   SHARE_OK: '可拼房',
 };
 
-/** 证件号打码展示：前 5 位 + ****（联想浮层里不整串裸奔） */
-function maskDocNumber(n: string): string {
-  return n.length > 5 ? `${n.slice(0, 5)}****` : n;
-}
-
 /** 距护照到期天数；无有效期返回 null */
 function passportExpiryDays(iso: string | null): number | null {
   if (!iso) return null;
@@ -63,7 +58,7 @@ interface SuggestionSubline {
 /** 候选第二行：证件 + 飞行次数 + 偏好段（没有的偏好不显示） */
 function suggestionSubline(s: TravelerProfileSuggestion): SuggestionSubline {
   const parts: string[] = [
-    `${DOC_LABELS[s.documentType] ?? s.documentType} ${maskDocNumber(s.documentNumber)}`,
+    `${DOC_LABELS[s.documentType] ?? s.documentType} ${s.documentNumber}`,
     `飞过 ${s.tripCount} 次`,
   ];
   if (s.prefCabin && s.prefCabin !== 'ECONOMY') parts.push(CABIN_LABELS[s.prefCabin] ?? s.prefCabin);
