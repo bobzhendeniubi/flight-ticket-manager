@@ -453,6 +453,78 @@ function isPendingSentinel(value: unknown): boolean {
   return !!value && typeof value === 'object' && (value as Record<string, unknown>).__pending === true;
 }
 
+/**
+ * 占位超过这个时长仍是 PENDING_SENTINEL → 视为孤儿占位（进程在占位后、写出真结果前崩溃，
+ * 没有走到 catch 里的清理逻辑），允许同一个 requestToken 被重新占用重跑（astra A12）。
+ * 10 分钟是「跨单分房这一次保存」正常耗时的极大冗余（正常应在秒级完成），不会误伤真正
+ * 还在处理中的请求；也不宜设得更短——太短会在偶发的慢查询/长事务窗口里出现两个进程
+ * 都判定「已超时」抢占同一个 token（虽然下面的按 id 精确删除保证了这种情况下只有一个能
+ * 抢占成功，另一个会拿到「仍在处理中」提示，不会双写）。
+ */
+const PENDING_STALE_TIMEOUT_MS = 10 * 60 * 1000;
+/** 幂等占位重新抢占的重试上限：初次尝试 + 抢占一次孤儿占位后的重试，两次封顶。 */
+const MAX_RESERVE_ATTEMPTS = 2;
+
+interface ReserveOutcome {
+  /** 非 null = 直接回放这个结果（同 token 同指纹的正常重放），调用方不必再跑业务逻辑。*/
+  replay: SaveSharedRoomsResult | null;
+}
+
+/**
+ * §六幂等占位（单独抽出便于说清楚每条分支）：requestToken 唯一，先占位再算——占位成功
+ * 就是「这次是第一次跑」，占位失败（唯一键冲突）说明已有记录，按指纹决定回放/冲突/抢占。
+ */
+async function reserveRequestOrReplay(
+  client: PrismaClient,
+  body: SaveSharedRoomsBody,
+  fingerprint: string,
+): Promise<ReserveOutcome> {
+  for (let attempt = 0; attempt < MAX_RESERVE_ATTEMPTS; attempt++) {
+    try {
+      await client.sharedRoomRequest.create({
+        data: { requestToken: body.requestToken, fingerprint, resultJson: PENDING_SENTINEL },
+      });
+      return { replay: null };
+    } catch (err) {
+      if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002')) throw err;
+
+      const existing = await client.sharedRoomRequest.findUnique({
+        where: { requestToken: body.requestToken },
+      });
+      if (!existing) {
+        // 刚才冲突时那一行还在、现在读又没了——多半是另一进程的失败清理正好插在中间。
+        // 不是我们能处理的稳定状态，回到循环顶部重新尝试占位（占位的 create 本身是原子的）。
+        continue;
+      }
+      if (existing.fingerprint !== fingerprint) {
+        throw new ConflictError('该请求编号已用于另一次不同的跨单分房保存，请刷新后重试');
+      }
+      if (!isPendingSentinel(existing.resultJson)) {
+        return { replay: existing.resultJson as unknown as SaveSharedRoomsResult };
+      }
+      // 走到这里：同 token 同指纹、且仍是 PENDING——上一次占位还没写出真结果。
+      const ageMs = Date.now() - existing.createdAt.getTime();
+      if (ageMs < PENDING_STALE_TIMEOUT_MS) {
+        // 大概率真的还在处理中（或极端竞态下清理没删干净）。不能当「已经成功」回放，
+        // 也不建议换新 token——换号只会让这个尚未结束的首次请求和新请求同时执行，
+        // 提示调用方稍后用同一个 token 重试才是安全的（astra A12）。
+        throw new ConflictError('该请求编号上一次保存尚未完成，请稍后使用同一请求编号重试');
+      }
+      // 超过孤儿占位超时——按 id 精确删除（不是按 requestToken，避免删掉别的进程
+      // 刚好在这一瞬间抢占成功后新建的行）。删到 0 行说明已经被别的进程抢先处理，
+      // 回落到「仍在处理中」提示；删到 1 行说明抢占成功，回到循环顶部重新占位。
+      const reclaimed = await client.sharedRoomRequest.deleteMany({
+        where: { requestToken: body.requestToken, id: existing.id },
+      });
+      if (reclaimed.count === 0) {
+        throw new ConflictError('该请求编号上一次保存尚未完成，请稍后使用同一请求编号重试');
+      }
+      // 抢占成功，continue 到循环顶部重新 create。
+    }
+  }
+  throw new ConflictError('该请求编号处理竞争过多，请刷新后重试');
+}
+
 export async function saveSharedRooms(
   body: SaveSharedRoomsBody,
   actor: AuditActor,
@@ -467,44 +539,17 @@ export async function saveSharedRooms(
     dissolve: body.dissolve,
   });
 
-  // ── 幂等：requestToken 唯一，先占位再算——占位成功才是「第一次」，占位失败读现存记录回放/冲突 ──
-  //
-  // 占位成功之后，本函数任何一步失败（400/409/其它异常）都必须把占位行删掉：否则占位行的
-  // resultJson 停在 PENDING_SENTINEL，下次同 token 同指纹重试会被 existing.fingerprint ===
-  // fingerprint 命中、直接回放一个「看起来成功但没有 rooms/dissolved」的假结果——前端按 200
-  // 处理，实际什么都没落库。见下方 try/finally：reserved 为 true 时，退出前若没有把
-  // resultJson 换成真结果，一律删掉占位行，让同 token 重试真正重新跑一遍。
-  let reserved = false;
-  try {
-    await client.sharedRoomRequest.create({
-      data: { requestToken: body.requestToken, fingerprint, resultJson: PENDING_SENTINEL },
-    });
-    reserved = true;
-  } catch (err) {
-    if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002') {
-      const existing = await client.sharedRoomRequest.findUnique({
-        where: { requestToken: body.requestToken },
-      });
-      if (existing && existing.fingerprint === fingerprint) {
-        if (isPendingSentinel(existing.resultJson)) {
-          // 上一次占位后还没写出真结果——可能仍在处理中，也可能失败后占位没删干净（极端竞态：
-          // 两个进程同时占位失败又同时想删）。不能当「已经成功」回放，请调用方换新 token 重试。
-          throw new ConflictError('该请求编号上一次保存尚未完成，请使用新的请求编号重试');
-        }
-        return existing.resultJson as unknown as SaveSharedRoomsResult;
-      }
-      throw new ConflictError('该请求编号已用于另一次不同的跨单分房保存，请刷新后重试');
-    }
-    throw err;
-  }
+  const reservation = await reserveRequestOrReplay(client, body, fingerprint);
+  if (reservation.replay) return reservation.replay;
 
+  // 占位成功之后，本函数任何一步失败（400/409/其它异常）都必须把占位行删掉：否则占位行的
+  // resultJson 停在 PENDING_SENTINEL，下次同 token 同指纹重试会被判定「仍在处理中」白等到
+  // 超时窗口，或者（改指纹）直接 409——都不是「重新跑一遍」。
   try {
     return await saveSharedRoomsInner(body, actor, client);
   } catch (err) {
-    if (reserved) {
-      // 最佳努力清理占位——删失败也不能吞掉原始错误，原始错误才是调用方需要看到的。
-      await client.sharedRoomRequest.delete({ where: { requestToken: body.requestToken } }).catch(() => {});
-    }
+    // 最佳努力清理占位——删失败也不能吞掉原始错误，原始错误才是调用方需要看到的。
+    await client.sharedRoomRequest.delete({ where: { requestToken: body.requestToken } }).catch(() => {});
     throw err;
   }
 }

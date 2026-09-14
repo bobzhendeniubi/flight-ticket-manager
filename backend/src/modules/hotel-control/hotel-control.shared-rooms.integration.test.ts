@@ -24,6 +24,7 @@ import { prisma } from '../../db/prisma.js';
 import { saveSharedRooms, getSharedRoomWorkbench } from './hotel-control.shared-rooms.js';
 import { getHotelNightlyRemaining } from './hotel-control.service.js';
 import { serializeRoomGroupsFor } from '../orders/room-group-dto.js';
+import { canonicalJson } from '../../lib/canonical-json.js';
 
 const CHECK_IN = '2026-10-01';
 const CHECK_OUT = '2026-10-03';
@@ -1677,5 +1678,140 @@ describe('saveSharedRooms · 真 DB E2E · 未变更的失效成员不阻断保�
         actor,
       ),
     ).rejects.toThrow(/不处于房控有效状态/);
+  });
+});
+
+/**
+ * astra A12：幂等占位在并发/崩溃窗口下的处理。
+ *   - 同 token 仍在处理中（占位新鲜）：提示词必须是「稍后用同一请求编号重试」，
+ *     不能建议换新 token——换号会让尚未结束的首次请求与新请求同时执行。
+ *   - 占位超过孤儿超时窗口（模拟进程在占位后、写出真结果前崩溃）：同一个 token
+ *     必须能被重新抢占、真正执行一遍，而不是永远卡在「上一次尚未完成」。
+ */
+describe('saveSharedRooms · 真 DB E2E · 幂等占位的并发/崩溃窗口（astra A12）', () => {
+  afterEach(() => flushFireAndForgetAudit());
+
+  it('同 token 占位新鲜（未超时）→ 409 提示重试同一 token，不建议换号', async () => {
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const token = requestToken();
+    const fingerprint = canonicalJson({
+      hotelId: hotel.id,
+      checkIn: CHECK_IN,
+      checkOut: CHECK_OUT,
+      expectedVersions: {},
+      rooms: [
+        {
+          hotelRoomTypeId: roomType.id,
+          groups: [
+            {
+              orderId: orderA.id,
+              orderItemId: orderA.items[0].id,
+              passengerIds: [orderA.passengers[0].id],
+              roomFraction: 1,
+            },
+          ],
+        },
+      ],
+      dissolve: [],
+    });
+    // 直接手搭一条「刚刚占位、还没写出真结果」的记录，模拟另一个请求正在处理中。
+    await prisma.sharedRoomRequest.create({
+      data: { requestToken: token, fingerprint, resultJson: { __pending: true } as unknown as Prisma.InputJsonValue },
+    });
+
+    const actor = await adminActor();
+    await expect(
+      saveSharedRooms(
+        {
+          hotelId: hotel.id,
+          checkIn: CHECK_IN,
+          checkOut: CHECK_OUT,
+          requestToken: token,
+          rooms: [
+            {
+              hotelRoomTypeId: roomType.id,
+              groups: [
+                {
+                  orderId: orderA.id,
+                  orderItemId: orderA.items[0].id,
+                  passengerIds: [orderA.passengers[0].id],
+                  roomFraction: 1,
+                },
+              ],
+            },
+          ],
+          dissolve: [],
+        },
+        actor,
+      ),
+    ).rejects.toThrow(/请稍后使用同一请求编号重试/);
+
+    // 占位行原样保留——没有被误删，也没有被写成真结果（不能让这次「以为在等」的调用
+    // 顺手把真正处理中的那次请求的占位破坏掉）。
+    const stillPending = await prisma.sharedRoomRequest.findUnique({ where: { requestToken: token } });
+    expect(stillPending).not.toBeNull();
+    expect(stillPending?.resultJson).toEqual({ __pending: true });
+  });
+
+  it('孤儿占位超过超时窗口 → 同一 token 可被重新抢占，真正执行一遍', async () => {
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const token = requestToken();
+    const payload = {
+      hotelId: hotel.id,
+      checkIn: CHECK_IN,
+      checkOut: CHECK_OUT,
+      requestToken: token,
+      rooms: [
+        {
+          hotelRoomTypeId: roomType.id,
+          groups: [
+            {
+              orderId: orderA.id,
+              orderItemId: orderA.items[0].id,
+              passengerIds: [orderA.passengers[0].id],
+              roomFraction: 1,
+            },
+            {
+              orderId: orderB.id,
+              orderItemId: orderB.items[0].id,
+              passengerIds: [orderB.passengers[0].id],
+              roomFraction: 0,
+            },
+          ],
+        },
+      ],
+      dissolve: [],
+    };
+    const fingerprint = canonicalJson({
+      hotelId: payload.hotelId,
+      checkIn: payload.checkIn,
+      checkOut: payload.checkOut,
+      expectedVersions: {},
+      rooms: payload.rooms,
+      dissolve: payload.dissolve,
+    });
+    // 手搭一条「11 分钟前占位、进程崩溃后再也没写出真结果」的孤儿占位——超过 10 分钟
+    // 的孤儿超时窗口。
+    await prisma.sharedRoomRequest.create({
+      data: {
+        requestToken: token,
+        fingerprint,
+        resultJson: { __pending: true } as unknown as Prisma.InputJsonValue,
+        createdAt: new Date(Date.now() - 11 * 60 * 1000),
+      },
+    });
+
+    const actor = await adminActor();
+    const result = await saveSharedRooms(payload, actor);
+    // 真正执行了一遍——不是回放一个空占位；两张单都落库到同一间共享房。
+    expect(result.rooms).toHaveLength(1);
+    const itemA = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderA.items[0].id } });
+    expect(Number(itemA.roomsBilled)).toBe(1);
+
+    const finalRow = await prisma.sharedRoomRequest.findUnique({ where: { requestToken: token } });
+    expect(finalRow?.resultJson).toEqual(result); // 占位已被换成真结果，供后续同 token 重放
   });
 });
