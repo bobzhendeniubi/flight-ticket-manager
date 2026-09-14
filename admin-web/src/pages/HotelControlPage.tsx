@@ -34,6 +34,7 @@ import {
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
 import { RoomingEditor, roomingHotelItemsFromOrder, type RoomingPassenger } from '../components/RoomingEditor';
+import { SharedRoomWorkbench, type SharedRoomWorkbenchSeed } from '../components/SharedRoomWorkbench';
 import { passengerDisplayName } from '../lib/passengerDisplayName';
 import { orderStatusBadgeClass, orderStatusLabel } from '../lib/orderStatus';
 import { HotelSwapModal } from '../components/HotelSwapModal';
@@ -158,6 +159,8 @@ export function HotelControlPage() {
   const [error, setError] = useState<string | null>(null);
   // 周期 CRUD 后 +1 触发销控板/远期重拉
   const [boardNonce, setBoardNonce] = useState(0);
+  // 跨单分房工作台；null = 关闭，非 null 时带默认酒店/入住/退房种子（可为空对象，工作台自兜底）
+  const [sharedWorkbenchSeed, setSharedWorkbenchSeed] = useState<SharedRoomWorkbenchSeed | null>(null);
   // 余量格点击下钻（某酒店/某星级随机池某晚，谁占的）；null = 抽屉关闭
   const [drill, setDrill] = useState<{
     hotelId: string;
@@ -239,7 +242,7 @@ export function HotelControlPage() {
       <BoardExport token={token} board={board} />
 
       {/* ── 订单分房（按订单号查 → 拖拽分房）────────────────────── */}
-      <RoomingSection token={token} board={board} />
+      <RoomingSection token={token} board={board} onOpenSharedRoomWorkbench={setSharedWorkbenchSeed} />
 
       {/* ── 随机档需求池：每日按缺口向地接加房 ─────────────────────── */}
       <RandomTierShortfallPanel token={token} />
@@ -472,6 +475,17 @@ export function HotelControlPage() {
           used={drill.used}
           onClose={() => setDrill(null)}
           onChanged={() => setBoardNonce((n) => n + 1)}
+          onOpenSharedRoomWorkbench={(seed) => setSharedWorkbenchSeed(seed)}
+        />
+      )}
+
+      {/* ── 跨单分房工作台（两张单合住一间房）──────────────────────── */}
+      {sharedWorkbenchSeed && (
+        <SharedRoomWorkbench
+          token={token}
+          seed={sharedWorkbenchSeed}
+          onClose={() => setSharedWorkbenchSeed(null)}
+          onSaved={() => setBoardNonce((n) => n + 1)}
         />
       )}
     </div>
@@ -489,6 +503,7 @@ function OccupantsDrawer({
   used,
   onClose,
   onChanged,
+  onOpenSharedRoomWorkbench,
 }: {
   token: string;
   hotelId: string;
@@ -501,6 +516,8 @@ function OccupantsDrawer({
   onClose: () => void;
   /** 换酒店成功后通知父级（触发销控板重拉）。 */
   onChanged?: () => void;
+  /** 打开跨单分房工作台，默认带本次下钻的酒店/入住/退房（退房=入住+1 晚）。 */
+  onOpenSharedRoomWorkbench: (seed: SharedRoomWorkbenchSeed) => void;
 }) {
   const dialogRef = useDialogA11y(onClose);
   const [occupants, setOccupants] = useState<HotelOccupant[] | null>(null);
@@ -554,6 +571,17 @@ function OccupantsDrawer({
               {hotelName} · {date}
             </h3>
             <p className="mt-1 text-xs text-ink-muted">{headerNote}</p>
+            {randomStarTier == null && (
+              <button
+                type="button"
+                className="btn-secondary mt-2 px-2 py-1 text-xs"
+                onClick={() =>
+                  onOpenSharedRoomWorkbench({ hotelId, checkIn: date, checkOut: nextDayStr(date) })
+                }
+              >
+                <Icon name="users" /> 跨单分房
+              </button>
+            )}
           </div>
           <button type="button" className="text-slate-400 hover:text-slate-700" onClick={onClose} aria-label="关闭酒店控制详情">
             <Icon name="close" />
@@ -990,7 +1018,16 @@ function candidateStay(order: OrderSummary): string {
 /** 候选订单一次最多列多少条（再多就让运营缩范围，避免一屏几百行）。 */
 const ROOMING_CANDIDATE_PAGE_SIZE = 20;
 
-function RoomingSection({ token, board }: { token: string; board: HotelControlBoard | null }) {
+function RoomingSection({
+  token,
+  board,
+  onOpenSharedRoomWorkbench,
+}: {
+  token: string;
+  board: HotelControlBoard | null;
+  /** 打开跨单分房工作台；种子对象可为空（工作台自兜底默认酒店/日期）。 */
+  onOpenSharedRoomWorkbench: (seed: SharedRoomWorkbenchSeed) => void;
+}) {
   // 找单条件：关键词（人名 / 订单号 / 联系人，走列表同款 search）+ 团期（出发日期区间）
   const [keyword, setKeyword] = useState('');
   const [travelFrom, setTravelFrom] = useState('');
@@ -1074,11 +1111,23 @@ function RoomingSection({ token, board }: { token: string; board: HotelControlBo
 
   return (
     <section className="card">
-      <h2 className="text-sm font-semibold text-ink">订单分房（拖拽）</h2>
-      <p className="mt-1 text-xs text-ink-muted">
-        按人名或订单号找单（可再加团期缩小范围），从候选里点一条，把出行人拖进房间决定谁和谁一起住。
-        保存写入该订单的分房表（分房表导出会读取）。
-      </p>
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <div>
+          <h2 className="text-sm font-semibold text-ink">订单分房（拖拽）</h2>
+          <p className="mt-1 text-xs text-ink-muted">
+            按人名或订单号找单（可再加团期缩小范围），从候选里点一条，把出行人拖进房间决定谁和谁一起住。
+            保存写入该订单的分房表（分房表导出会读取）。单单只能分房给本单出行人；两张单要合住一间房，
+            用右边的「跨单分房」。
+          </p>
+        </div>
+        <button
+          type="button"
+          className="btn-secondary shrink-0"
+          onClick={() => onOpenSharedRoomWorkbench({ hotelId, checkIn: stay?.checkIn, checkOut: stay?.checkOut })}
+        >
+          <Icon name="users" /> 跨单分房
+        </button>
+      </div>
 
       <div className="mt-3 flex flex-wrap items-end gap-2">
         <div className="grow sm:grow-0">
