@@ -753,4 +753,65 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
     });
     expect(members).toHaveLength(0);
   });
+
+  it('astra finding A2 反例：恢复时共享房一致（保留合住）不能被当成「凭空新增一间」拒掉——只有 1 间也该放行', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(1); // 该酒店整段只有 1 间包房
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    const saved = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    // 取消 orderA——orderB（0 份额）仍有效，共享房去重仍占 1 间（与验收反例 2 同一口径）。
+    await prisma.order.update({ where: { id: orderA.id }, data: { status: OrderStatus.CANCELLED } });
+    expect((await getHotelNightlyRemaining(hotel.id, [CHECK_IN])).physicalRemaining).toEqual([0]);
+
+    // 恢复 orderA：房间状态与日期都一致（未被动过）→ 应保留合住关系，物理占用仍是去重后
+    // 的 1 间（A、B 本就合住同一间），不该被老式「按份额直接前瞻加回一整间」误判成需要
+    // 2 间而拒绝——block 只有 1 间，若真被当成新增 1 间就会 400。
+    await expect(
+      service.restoreCancelledOrder(
+        orderA.id,
+        { requestToken: randomUUID(), allowOversell: false, allowFlownLegs: false },
+        { userId: actor.userId, role: UserRole.ADMIN },
+      ),
+    ).resolves.toBeDefined();
+
+    // 合住关系原样保留：orderA 仍是该共享房成员，没有被误判触发解绑。
+    const members = await prisma.sharedRoomMember.findMany({
+      where: { sharedRoomId: saved.rooms[0].sharedRoomId },
+    });
+    expect(members.map((m) => m.orderId).sort()).toEqual([orderA.id, orderB.id].sort());
+
+    // 恢复后物理占用仍是去重后的 1 间（不是被拆成两间）。
+    expect((await getHotelNightlyRemaining(hotel.id, [CHECK_IN])).physicalRemaining).toEqual([0]);
+  });
 });

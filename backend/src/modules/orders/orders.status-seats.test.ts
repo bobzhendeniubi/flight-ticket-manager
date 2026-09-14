@@ -729,7 +729,7 @@ describe('OrderService._updateStatusWithinTx · 退款申请即时释放与驳�
         false,
         [],
       ),
-    ).rejects.toThrow('房量已被售出，无法驳回退款申请，请协调换房或继续退款');
+    ).rejects.toThrow('房量已被售出，无法恢复占座，请协调换房或先取消/退款');
 
     expect(mockPrisma.$executeRaw).not.toHaveBeenCalled();
     expect(mockPrisma.refund.updateMany).not.toHaveBeenCalled();
