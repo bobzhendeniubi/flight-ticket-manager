@@ -309,6 +309,62 @@ describe('assertHotelFitAfterChange', () => {
     ).resolves.toEqual([]);
   });
 
+  // ── nextSharedRooms 覆盖项按 hotelId 过滤（跨批需求）──────────────────────────
+  it('覆盖项自带 hotelId：传了别家酒店的共享房不影响本酒店结果', async () => {
+    const { tx } = fakeTx({ rooms: 1 }); // h1 只有 1 间包房，当前没有其它占用
+    await expect(
+      assertHotelFitAfterChange(tx as unknown as TxArg, 'h1', [dayStr(0)], {
+        affectedOrderIds: ['orderA'],
+        nextSharedRooms: [
+          // 本酒店（h1）新建一间共享房，装得下（1 间 ≤ block 1 间）。
+          { checkIn: day(0), checkOut: day(1), activeMemberOrderIds: ['orderA'], hotelId: 'h1' },
+          // 别家酒店（h2）的共享房覆盖项——不该被算进 h1 的统计，否则会把这行的日期误加
+          // 进 h1 的逐晚累计，凭空多算 1 间导致本该放行的操作被误拒。
+          {
+            sharedRoomId: 'sr-other-hotel',
+            checkIn: day(0),
+            checkOut: day(1),
+            activeMemberOrderIds: ['orderC'],
+            hotelId: 'h2',
+          },
+        ],
+      }),
+    ).resolves.toEqual([]);
+  });
+
+  it('覆盖项没带 hotelId 但带 sharedRoomId：查库补齐真实归属，别家酒店的房仍不影响本酒店结果', async () => {
+    const calls: unknown[] = [];
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      hotelBlockPeriod: { findMany: vi.fn().mockResolvedValue([{ dateFrom: day(0), dateTo: day(2), rooms: 1 }]) },
+      orderItem: { findMany: vi.fn().mockResolvedValue([]) },
+      sharedRoom: {
+        findMany: vi.fn((args: { where?: Record<string, unknown> }) => {
+          calls.push(args);
+          // 查真实归属（按 id in [...] 查）：sr-mine 属于 h1，sr-other 属于 h2。
+          if (args.where?.id) {
+            return Promise.resolve([
+              { id: 'sr-mine', hotelId: 'h1' },
+              { id: 'sr-other', hotelId: 'h2' },
+            ]);
+          }
+          return Promise.resolve([]); // 「本酒店现存活跃共享房」查询：现状没有
+        }),
+      },
+    };
+    await expect(
+      assertHotelFitAfterChange(tx as unknown as TxArg, 'h1', [dayStr(0)], {
+        affectedOrderIds: ['orderA'],
+        nextSharedRooms: [
+          // 没带 hotelId，但 sharedRoomId 查出来真实属于 h1——应当计入。
+          { sharedRoomId: 'sr-mine', checkIn: day(0), checkOut: day(1), activeMemberOrderIds: ['orderA'] },
+          // 没带 hotelId，sharedRoomId 查出来真实属于 h2——不该计入 h1 的统计。
+          { sharedRoomId: 'sr-other', checkIn: day(0), checkOut: day(1), activeMemberOrderIds: ['orderC'] },
+        ],
+      }),
+    ).resolves.toEqual([]); // 只有 sr-mine 的 1 间计入，1 ≤ block 1，放行
+  });
+
   it('新建共享房把一个第三方订单的独立占房行合并进来 → 变更后物理从 2 降到 1，装得下', async () => {
     // 现状：两张订单各占普通房组 1 间（block=1，物理已超卖 2>1，仅靠 allowNonWorsening 才能放行改动）
     const { tx } = fakeTx({

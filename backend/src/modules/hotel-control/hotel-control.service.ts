@@ -1508,6 +1508,13 @@ export async function assertHotelPhysicalFitWithinTx(
  */
 export interface SharedRoomAfterState {
   sharedRoomId?: string;
+  /**
+   * 该房所属酒店 id（可选，跨批需求：函数内部按它过滤，只把本酒店的覆盖项计入本次
+   * gate）。不带这个字段时：有 sharedRoomId 就查库补齐真实归属；没有（全新建的房）
+   * 视为属于本次 gate 的 hotelId——调用方理应逐酒店只传该酒店的覆盖项，这里是兜底，
+   * 不能替代调用方自己按 hotelId 分组喂参数。
+   */
+  hotelId?: string;
   checkIn: Date;
   checkOut: Date;
   activeMemberOrderIds: readonly string[];
@@ -1565,14 +1572,51 @@ async function computeSharedRoomPhysicalAfterChange(
     }
   };
 
-  const overrideIds = new Set(
-    overrides.filter((o): o is SharedRoomAfterState & { sharedRoomId: string } => !!o.sharedRoomId).map((o) => o.sharedRoomId),
-  );
   const delegate = (
     client as unknown as {
-      sharedRoom?: { findMany: (args: unknown) => Promise<SharedRoomPhysicalRowWithId[]> };
+      sharedRoom?: {
+        findMany: (args: unknown) => Promise<SharedRoomPhysicalRowWithId[]>;
+      };
     }
   ).sharedRoom;
+
+  // 覆盖项按 hotelId 过滤（跨批需求）：调用方理应逐酒店只传该酒店的覆盖项，但一旦手滑
+  // 传错（如换酒店场景，被解绑房间其实属于原酒店而非目标酒店），不按 hotelId 过滤会把
+  // 别家酒店共享房的 checkIn/checkOut 误加进本次统计。覆盖项自带 hotelId 就直接比对；
+  // 没带的，有 sharedRoomId（改动既有房）就查库拿它的真实 hotelId；没有 sharedRoomId
+  // （全新建的房，库里还没有这行）视为属于本次 gate 的 hotelId——新房本就是为这次操作
+  // 的目标酒店建的，查无可查。查不到真实归属（脏数据）宁可漏算也不错算进本酒店。
+  const lookupIds = [
+    ...new Set(
+      overrides
+        .filter((o) => o.hotelId == null && !!o.sharedRoomId)
+        .map((o) => o.sharedRoomId as string),
+    ),
+  ];
+  const hotelIdByRoomId = new Map<string, string>();
+  if (lookupIds.length > 0 && delegate) {
+    const rows = (await (
+      delegate as unknown as {
+        findMany: (args: unknown) => Promise<Array<{ id: string; hotelId: string }>>;
+      }
+    ).findMany({
+      where: { id: { in: lookupIds } },
+      select: { id: true, hotelId: true },
+    })) as Array<{ id: string; hotelId: string }>;
+    for (const r of rows) hotelIdByRoomId.set(r.id, r.hotelId);
+  }
+  const belongsToThisHotel = (o: SharedRoomAfterState): boolean => {
+    if (o.hotelId != null) return o.hotelId === hotelId;
+    if (o.sharedRoomId) return hotelIdByRoomId.get(o.sharedRoomId) === hotelId;
+    return true; // 新建房间，没有可查的真实归属，按调用意图视为本酒店
+  };
+  const scopedOverrides = overrides.filter(belongsToThisHotel);
+
+  const overrideIds = new Set(
+    scopedOverrides
+      .filter((o): o is SharedRoomAfterState & { sharedRoomId: string } => !!o.sharedRoomId)
+      .map((o) => o.sharedRoomId),
+  );
   if (delegate) {
     const liveRows = await delegate.findMany({
       where: { hotelId, status: 'ACTIVE', checkIn: { lte: toD }, checkOut: { gt: fromD } },
@@ -1591,7 +1635,7 @@ async function computeSharedRoomPhysicalAfterChange(
       if (hasValidMember) add(row.checkIn, row.checkOut);
     }
   }
-  for (const o of overrides) {
+  for (const o of scopedOverrides) {
     if (o.activeMemberOrderIds.length > 0) add(o.checkIn, o.checkOut);
   }
   return out;
