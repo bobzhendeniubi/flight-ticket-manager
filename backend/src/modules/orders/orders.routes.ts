@@ -2841,7 +2841,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       },
       severity: 'WARNING',
     });
-    return { order };
+    return { order, warnings: audit.warnings };
   });
 
   // ── 售后改单：按房组拆分酒店行（ADMIN/STAFF）──

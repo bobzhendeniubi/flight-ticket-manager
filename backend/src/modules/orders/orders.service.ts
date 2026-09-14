@@ -15396,6 +15396,8 @@ export class OrderService {
       after: { checkIn: string; checkOut: string; nights: number };
       feeCny: number;
       untrackedNights: string[];
+      /** §八「解绑」提示（按 actor 角色生成，AGENT 版不含对方单号）；本行无共享成员时为空数组。 */
+      warnings: string[];
     };
   }> {
     // 权限口径与机票改期/换酒店一致：运营随时可改；代理只改自家（含下级）单、入住日未过。
@@ -15536,9 +15538,51 @@ export class OrderService {
         );
       }
 
+      // ── §八「酒店改期」：该行若有共享成员，先解绑（新旧日期不同，共享房 checkIn/checkOut
+      // 必须与全体成员的住宿区间一致——挪本行日期就等于让「这间房」的身份不再成立）──
+      const unbindResult = await unbindSharedRoomMembersForItem(tx, {
+        orderId,
+        orderItemId: item.id,
+        reason: '酒店改期解绑',
+      });
+      const hasSharedMembers = unbindResult.unbound.length > 0;
+      const unbindWarnings = formatUnbindWarning(
+        unbindResult.unbound,
+        actor.role === UserRole.AGENT ? 'agent' : 'internal',
+      );
+
       // ── 新区间余量闸（事务内互斥版）──
       let untrackedNights: string[] = [];
-      if (roomType) {
+      if (roomType && hasSharedMembers) {
+        // 共享行：解绑后份额可能是 0，不能再用 roomsBilled 当占用基数（astra 评审 finding 1/2）。
+        // 改用变更前后全量比较闸：本单在该酒店的全部行按新日期重算一遍，与该酒店其余存量比较。
+        await lockHotelBlockPeriodsWithinTx(tx, roomType.hotelId, nightDates);
+        const orderForGate = await tx.order.findUnique({
+          where: { id: orderId },
+          select: { roomAssignment: true },
+        });
+        const hotelItems = await tx.orderItem.findMany({
+          where: { orderId, hotelRoomType: { hotelId: roomType.hotelId } },
+          select: { id: true, hotelCheckIn: true, hotelCheckOut: true, metadata: true },
+        });
+        const nextItemsAtHotel: PhysicalOccupancyItem[] = hotelItems.map((it) => ({
+          id: it.id,
+          hotelCheckIn: it.id === item.id ? newCheckIn : it.hotelCheckIn,
+          hotelCheckOut: it.id === item.id ? newCheckOut : it.hotelCheckOut,
+          roomsBilled: null,
+          metadata: it.metadata,
+          order: { id: orderId, roomAssignment: orderForGate?.roomAssignment ?? null, passengers: [] },
+        }));
+        // 判定区间 = 旧区间 ∪ 新区间（旧区间的房要释放，新区间的房要占，两段都要过闸）。
+        const unionDates = [...new Set([...buildStayNightDates(item.hotelCheckIn!, item.hotelCheckOut!), ...nightDates])].sort();
+        await assertHotelFitAfterChange(tx, roomType.hotelId, unionDates, {
+          affectedOrderIds: [orderId],
+          nextOrderItems: new Map([[orderId, nextItemsAtHotel]]),
+          nextSharedRooms: [],
+          options: { allowNonWorsening: true },
+        });
+        untrackedNights = [...nightDates];
+      } else if (roomType) {
         // 先锁目标区间的包房周期行，判定与下方写日期落库之间不留窗口，
         // 否则两笔并发改期会各自读到「还剩 1 间」的旧快照双双通过。
         await lockHotelBlockPeriodsWithinTx(tx, roomType.hotelId, nightDates);
@@ -15623,7 +15667,7 @@ export class OrderService {
         });
       }
 
-      return { orderNumber: order.orderNumber, untrackedNights };
+      return { orderNumber: order.orderNumber, untrackedNights, unbindWarnings };
     });
 
     const finalOrder = await prisma.order.findUniqueOrThrow({
@@ -15641,6 +15685,7 @@ export class OrderService {
         after: { checkIn: input.newCheckIn, checkOut: input.newCheckOut, nights: newNights },
         feeCny,
         untrackedNights: scratch.untrackedNights,
+        warnings: scratch.unbindWarnings,
       },
     };
   }
