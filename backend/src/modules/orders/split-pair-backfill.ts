@@ -163,6 +163,10 @@ function isHalfCandidateGroup(group: BackfillRoomGroupView): boolean {
   const ids = group.passengerIds;
   if (!Array.isArray(ids) || ids.length === 0) return false;
   if (hasPairKey(group)) return false;
+  // 跨单分房（§八 E）：带 sharedRoomId 的组归 SharedRoomMember 表管，不吃 splitPairKey
+  // 配对——回填要是把两个不相干的共享组错配成一间，就是给它们建立第二套虚假关联。
+  const rec = group as Record<string, unknown>;
+  if (typeof rec.sharedRoomId === 'string' && rec.sharedRoomId.length > 0) return false;
   const fraction = group.roomFraction == null ? 1 : Number(group.roomFraction);
   return isHalfRoom(fraction);
 }

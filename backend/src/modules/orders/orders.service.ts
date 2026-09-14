@@ -17819,16 +17819,21 @@ export class OrderService {
     // no-show / 按人改期编排（autoSplitRoomGroups=true）则自动把混合房组按人劈成两个半组
     //（同酒店同房型同日期，房控把两个半间配回一间，房量不变）—— 那两条路径上运营
     // 根本没有「先去改分房」的机会，闸在那里只会变成死路。
+    // §八「拆单」：带 sharedRoomId 的共享组不吃这道闸（即便手工拆单）——共享组的成员本就
+    // 按乘客个体记在 SharedRoomMember 表上（不是运营手工圈出的不可再分的 JSON 盒子），
+    // 拆单按人搬本来就是这张表的天然语义，不需要运营先去分房里把人分开。
     const roomGroups = readRoomGroups(order.roomAssignment);
     let roomGroupConflict = false;
     for (const group of roomGroups) {
       const groupPax = group.passengerIds;
       if (groupPax.length === 0) continue;
+      const groupHasSharedRoomId =
+        typeof group.raw.sharedRoomId === 'string' && group.raw.sharedRoomId.length > 0;
       const movedInGroup = groupPax.filter((id) => movedIdSet.has(id));
       if (movedInGroup.length > 0 && movedInGroup.length < groupPax.length) {
         roomGroupConflict = true;
         const label = group.label ?? '未命名房组';
-        if (!autoSplitRoomGroups) {
+        if (!autoSplitRoomGroups && !groupHasSharedRoomId) {
           blockers.push(
             `房组「${label}」同时包含拆出与留下的乘客，请先在分房里把他们分到不同房组再拆单。`,
           );
@@ -18617,6 +18622,105 @@ export class OrderService {
       splitItemIdMap.set(item.id, createdRow.id);
     }
 
+    // ── 4b. 共享房成员随人搬（§八 E）：SharedRoomMember 是真值源（> 订单 JSON，见
+    // shared-room-unbind.ts 顶部注释），只搬步骤 6 的 JSON 镜像不够——这里把成员表也搬到
+    // 新单，否则真值与镜像立刻分叉。三种情况对应步骤 4 的三种搬移决策：
+    //   · 整行搬走（fullyMovedItemIds）→ 成员的 orderId 跟着行走到新单，orderItemId 不变；
+    //   · 行被拆成两半（splitItemIdMap）→ 成员改指到新单对应的那条新行；
+    //   · 行完全没动（典型：纯 0 份额的住宿行——moveHotel 对 roomsBilled<=0 直接返回
+    //     NONE，这条行的乘客却可能被拆走）→ 目标单没有承载行，按源行的酒店/房型/日期
+    //     新建一条 roomsBilled=本次搬走份额之和（可为 0）的 HOTEL 行承载住宿事实，
+    //     金额/成本恒 0（钱不动，源行分文未减）。Σ roomsBilled 必须守恒：源行是 NONE
+    //     （没被扣减）时，搬走份额只能是 0，否则就是凭空多造房间，fail-closed 拒绝。
+    // noneCarrierIdByItem 留给下面步骤 6 用（共享组的 JSON 归属也要跟着指到新承载行，
+    // 否则那条房组会撞进步骤 6 现成的「房组挂在留在原订单的酒店行上」400）。
+    const noneCarrierIdByItem = new Map<string, string>();
+    // 防御式：单测常用手搭的 mock tx（只 mock 用到的 delegate）没有 sharedRoomMember 时
+    // 回落「本次没有共享成员」而不是炸，同 shared-room-unbind.ts 的兜底哲学。
+    const sharedRoomMemberDelegate = (
+      tx as unknown as {
+        sharedRoomMember?: {
+          findMany: (args: unknown) => Promise<
+            Array<{ id: string; orderItemId: string; roomFraction: Prisma.Decimal }>
+          >;
+          updateMany: (args: unknown) => Promise<{ count: number }>;
+        };
+      }
+    ).sharedRoomMember;
+    const movedSharedMembers = sharedRoomMemberDelegate
+      ? await sharedRoomMemberDelegate.findMany({
+          where: { orderId, passengerId: { in: [...movedIdSet] } },
+          select: { id: true, orderItemId: true, roomFraction: true },
+        })
+      : [];
+    if (movedSharedMembers.length > 0 && sharedRoomMemberDelegate) {
+      const byItem = new Map<string, typeof movedSharedMembers>();
+      for (const m of movedSharedMembers) {
+        const arr = byItem.get(m.orderItemId) ?? [];
+        arr.push(m);
+        byItem.set(m.orderItemId, arr);
+      }
+      for (const [sourceItemId, members] of byItem) {
+        let newItemId: string;
+        if (fullyMovedItemIds.has(sourceItemId)) {
+          newItemId = sourceItemId; // 整行已随 orderId 改到 target.id，行 id 不变
+        } else if (splitItemIdMap.has(sourceItemId)) {
+          newItemId = splitItemIdMap.get(sourceItemId)!;
+        } else {
+          const movedFraction = round2(
+            members.reduce((s, m) => s + Number(m.roomFraction.toString()), 0),
+          );
+          if (movedFraction > 0) {
+            // 源行是 NONE（未被扣减任何份额）——若搬走份额 > 0，直接造出房间违反守恒，
+            // 说明这不是「纯 0 份额随人搬」场景，需要运营用 roomSplit 显式指定怎么分。
+            throw new BadRequestError(
+              `订单行 ${sourceItemId} 未随拆搬走计费房数，但其共享房成员的计费份额合计为 ` +
+                `${movedFraction} 间（非 0），无法自动承载——请用 roomSplit 显式指定该行搬走的间数`,
+            );
+          }
+          let carrierId = noneCarrierIdByItem.get(sourceItemId);
+          if (!carrierId) {
+            const src = order.items.find((it) => it.id === sourceItemId);
+            if (!src) {
+              throw new Error(
+                `拆单一致性断言失败：共享成员归属的订单行 ${sourceItemId} 不存在于源单快照（已回滚）`,
+              );
+            }
+            const created = await tx.orderItem.create({
+              data: {
+                orderId: target.id,
+                kind: OrderItemKind.HOTEL,
+                description: `${src.description}（跨单合住随人拆出）`,
+                quantity: src.quantity,
+                unitPrice: new Prisma.Decimal(0),
+                amount: new Prisma.Decimal(0),
+                unitCostCny: null,
+                totalCostCny: null,
+                hotelRoomTypeId: src.hotelRoomTypeId,
+                randomStarTier: src.randomStarTier,
+                hotelCheckIn: src.hotelCheckIn,
+                hotelCheckOut: src.hotelCheckOut,
+                roomsBilled: new Prisma.Decimal(movedFraction),
+                idempotencyKey: null,
+                metadata: {
+                  splitFromItemId: sourceItemId,
+                  sharedRoomCarrier: true,
+                } as Prisma.InputJsonValue,
+              },
+              select: { id: true },
+            });
+            carrierId = created.id;
+            noneCarrierIdByItem.set(sourceItemId, carrierId);
+          }
+          newItemId = carrierId;
+        }
+        await tx.sharedRoomMember.updateMany({
+          where: { id: { in: members.map((m) => m.id) } },
+          data: { orderId: target.id, orderItemId: newItemId },
+        });
+      }
+    }
+
     // ── 5. 物理移乘客（保 id，护照图/送签进度全跟走）──
     const movedPax = await tx.passenger.updateMany({
       where: { id: { in: [...movedIdSet] }, orderId },
@@ -18664,6 +18768,10 @@ export class OrderService {
           movedGroups.push(group.raw);
         } else if (splitItemIdMap.has(attributedTo)) {
           movedGroups.push({ ...group.raw, orderItemId: splitItemIdMap.get(attributedTo) });
+        } else if (noneCarrierIdByItem.has(attributedTo)) {
+          // 共享组：源行是 NONE（没被扣减任何计费房数），步骤 4b 已在新单建了承载行
+          // （roomsBilled = 搬走份额，可为 0）——房组的归属跟着指过去。
+          movedGroups.push({ ...group.raw, orderItemId: noneCarrierIdByItem.get(attributedTo) });
         } else {
           throw new BadRequestError(
             `房组「${group.label ?? '未命名房组'}」挂在留在原订单的酒店行上。` +
