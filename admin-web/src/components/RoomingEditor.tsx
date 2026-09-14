@@ -141,10 +141,18 @@ interface RoomBox {
   roomFraction: number;
   /** 归属的订单行 id；null = 不归属（旧口径）。seed 时保留既有归属不丢。 */
   orderItemId: string | null;
+  /**
+   * 跨单分房共享房 id；非 null = 该盒子与他单合住，锁定（乘客不可拖出/拖入、酒店名/
+   * 房型/份额/归属不可改、盒子不可删）——只能改备注。改动请去房控页「跨单分房」。
+   */
+  sharedRoomId: string | null;
+  /** 拆单半间配对键：原样透传，保存时回填进 RoomGroup，不因重新构造对象而丢失。 */
+  splitPairKey: string | null;
 }
 
 const FULL_ROOM = 1;
 const HALF_ROOM = 0.5;
+const SHARED_ROOM = 0;
 
 // ── 工具 ─────────────────────────────────────────────────────────────────
 function newId(): string {
@@ -174,20 +182,32 @@ function genderBadge(gender?: string | null): string | null {
   return null;
 }
 
+/** 份额规整到 {0, 0.5, 1}——0 只应来自共享组（主单让份），普通组异常值一律回落 1。 */
+function normalizeFraction(f: number | undefined, isShared: boolean): number {
+  if (isShared && f === SHARED_ROOM) return SHARED_ROOM;
+  if (f === HALF_ROOM) return HALF_ROOM;
+  return FULL_ROOM;
+}
+
 /** 把 initial RoomGroup[] 转编辑期盒子；缺省给一个空盒子。 */
 function seedBoxes(initial: RoomGroup[] | undefined): RoomBox[] {
   if (!initial || initial.length === 0) {
     return [emptyBox()];
   }
-  return initial.map((g) => ({
-    id: g.id || newId(),
-    roomType: g.roomType ?? '',
-    passengerIds: Array.isArray(g.passengerIds) ? [...g.passengerIds] : [],
-    notes: g.notes ?? '',
-    roomFraction: g.roomFraction === HALF_ROOM ? HALF_ROOM : FULL_ROOM,
-    // 既有归属（split-room-group / 上次保存写入）保留——重存分房不能把归属静默清掉
-    orderItemId: g.orderItemId ?? null,
-  }));
+  return initial.map((g) => {
+    const sharedRoomId = g.sharedRoomId ?? null;
+    return {
+      id: g.id || newId(),
+      roomType: g.roomType ?? '',
+      passengerIds: Array.isArray(g.passengerIds) ? [...g.passengerIds] : [],
+      notes: g.notes ?? '',
+      roomFraction: normalizeFraction(g.roomFraction, sharedRoomId != null),
+      // 既有归属（split-room-group / 上次保存写入）保留——重存分房不能把归属静默清掉
+      orderItemId: g.orderItemId ?? null,
+      sharedRoomId,
+      splitPairKey: g.splitPairKey ?? null,
+    };
+  });
 }
 
 function emptyBox(): RoomBox {
@@ -198,7 +218,14 @@ function emptyBox(): RoomBox {
     notes: '',
     roomFraction: FULL_ROOM,
     orderItemId: null,
+    sharedRoomId: null,
+    splitPairKey: null,
   };
+}
+
+/** 带 sharedRoomId 的盒子与他单合住：锁定除备注外的全部字段（房控页「跨单分房」里调）。 */
+function isLockedBox(b: RoomBox): boolean {
+  return b.sharedRoomId != null;
 }
 
 /** 未落位行的房型文案（与后端 PENDING_PLACEMENT_ROOM_TYPE 同文案）。 */
@@ -301,8 +328,13 @@ export function RoomingEditor({
   const totalBeds = occupiedBoxes.reduce((sum, b) => sum + b.roomFraction, 0);
 
   // ── 移动出行人（统一入口：从任意来源移到目标盒子，或回池 target=null）──
+  // 锁定盒子（与他单合住）的乘客不可拖出，也不接受新乘客拖入——改动一律去房控页「跨单分房」。
   function movePassenger(passengerId: string, targetBoxId: string | null): void {
     setBoxes((prev) => {
+      const sourceBox = prev.find((b) => b.passengerIds.includes(passengerId));
+      if (sourceBox && isLockedBox(sourceBox)) return prev;
+      const targetBox = targetBoxId ? prev.find((b) => b.id === targetBoxId) : null;
+      if (targetBox && isLockedBox(targetBox)) return prev;
       // 先从所有盒子移除
       const stripped = prev.map((b) => ({ ...b, passengerIds: b.passengerIds.filter((id) => id !== passengerId) }));
       if (targetBoxId === null) return stripped; // 回池
@@ -344,22 +376,54 @@ export function RoomingEditor({
     setBoxes((prev) => [...prev, emptyBox()]);
   }
   function removeBox(boxId: string): void {
-    setBoxes((prev) => (prev.length <= 1 ? prev : prev.filter((b) => b.id !== boxId)));
+    // 锁定盒子（与他单合住）不可删除——组不可删，只能去房控页「跨单分房」解绑/解散。
+    setBoxes((prev) => {
+      const box = prev.find((b) => b.id === boxId);
+      if (!box || isLockedBox(box) || prev.length <= 1) return prev;
+      return prev.filter((b) => b.id !== boxId);
+    });
   }
   function toggleHalf(boxId: string): void {
     setBoxes((prev) =>
-      prev.map((b) => (b.id === boxId ? { ...b, roomFraction: b.roomFraction === HALF_ROOM ? FULL_ROOM : HALF_ROOM } : b)),
+      prev.map((b) =>
+        b.id === boxId && !isLockedBox(b)
+          ? { ...b, roomFraction: b.roomFraction === HALF_ROOM ? FULL_ROOM : HALF_ROOM }
+          : b,
+      ),
     );
   }
+  // 锁定盒子只能改 notes；其余字段（roomType/orderItemId）改动在 UI 上就不给入口，
+  // 这里再兜底一层，防止后续代码误调用 patchBox 悄悄改掉锁定字段。
   function patchBox(
     boxId: string,
     patch: Partial<Pick<RoomBox, 'roomType' | 'notes' | 'orderItemId'>>,
   ): void {
-    setBoxes((prev) => prev.map((b) => (b.id === boxId ? { ...b, ...patch } : b)));
+    setBoxes((prev) =>
+      prev.map((b) => {
+        if (b.id !== boxId) return b;
+        if (isLockedBox(b)) {
+          return 'notes' in patch ? { ...b, notes: patch.notes ?? b.notes } : b;
+        }
+        return { ...b, ...patch };
+      }),
+    );
   }
 
   // ── 保存 ───────────────────────────────────────────────────────────────
   async function handleSave(): Promise<void> {
+    setErr(null);
+    // 多条酒店行时，新建/未归属的房组必须先选归属行——不能悄悄落回「合并记首行」的旧口径。
+    // 带 sharedRoomId 的锁定盒子归属已固定，不受此闸限制。
+    if (showItemSelect) {
+      const missingAttribution = boxes.some(
+        (b) => b.passengerIds.length > 0 && !isLockedBox(b) && !b.orderItemId,
+      );
+      if (missingAttribution) {
+        setErr('本单有多条酒店行：请为每个房间选择「归属酒店行」后再保存');
+        return;
+      }
+    }
+
     const groups: RoomGroup[] = boxes
       .filter((b) => b.passengerIds.length > 0)
       .map((b) => {
@@ -379,12 +443,22 @@ export function RoomingEditor({
           roomType: b.roomType.trim(),
           passengerIds: b.passengerIds,
           ...(b.notes.trim() ? { notes: b.notes.trim() } : {}),
-          ...(b.roomFraction === HALF_ROOM ? { roomFraction: HALF_ROOM } : {}),
+          // 锁定盒子（与他单合住）的份额可能是 0（主单让份）——必须显式带上，不能让「缺省=1」
+          // 的兜底把它吃掉（服务端按 (roomFraction ?? 1) 比较新旧值判定是否改动了共享组）。
+          // 普通盒子维持旧口径：只在半间时才带字段，整间省略。
+          ...(isLockedBox(b)
+            ? { roomFraction: b.roomFraction }
+            : b.roomFraction === HALF_ROOM
+              ? { roomFraction: HALF_ROOM }
+              : {}),
           ...(orderItemId ? { orderItemId } : {}),
+          // 与他单合住的镜像键：服务端会忽略这两个字段（以锁后现状为准），但前端不能
+          // 主动丢——保存只提交可改字段，其余原样传回。
+          ...(b.sharedRoomId ? { sharedRoomId: b.sharedRoomId } : {}),
+          ...(b.splitPairKey ? { splitPairKey: b.splitPairKey } : {}),
         };
       });
     setSaving(true);
-    setErr(null);
     try {
       await onSave(groups);
     } catch (e: unknown) {
@@ -395,11 +469,25 @@ export function RoomingEditor({
   }
 
   // ── 渲染一枚出行人 chip ──────────────────────────────────────────────────
-  function PassengerChip({ p }: { p: RoomingPassenger }) {
+  // locked = 所在盒子与他单合住：不可拖动（改动请去房控页「跨单分房」）。
+  function PassengerChip({ p, locked }: { p: RoomingPassenger; locked?: boolean }) {
     const g = genderBadge(p.gender);
     // 中文名优先（运营分房时按中文名认人）；拼音全名不丢，进 tooltip 供对护照。
     const display = passengerDisplayName(p.name, p.chineseName);
     const latin = passengerNameTitle(p.name, p.chineseName);
+    if (locked) {
+      return (
+        <span
+          className="inline-flex select-none items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-sm text-ink-soft"
+          title={`${latin ? `${latin} · ` : ''}与他单合住，锁定，去房控页「跨单分房」调整`}
+        >
+          <span className="font-medium">{display || '—'}</span>
+          {g && (
+            <span className={`text-xs ${g === '男' ? 'text-brand-700' : 'text-rose-600'}`}>{g}</span>
+          )}
+        </span>
+      );
+    }
     return (
       <span
         draggable
@@ -486,104 +574,137 @@ export function RoomingEditor({
 
         {/* ── 右：房间盒子 ── */}
         <div className="space-y-3">
-          {boxes.map((b, idx) => (
-            <div
-              key={b.id}
-              onDragOver={(e) => e.preventDefault()}
-              onDrop={(e) => handleDropToBox(b.id, e)}
-              className="rounded-xl border border-slate-200 bg-surface p-3 shadow-sm transition hover:border-brand/30"
-            >
-              <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
-                <span className="flex flex-wrap items-center gap-2 text-sm font-medium text-ink">
-                  房间 {idx + 1}
-                  {(() => {
-                    // 已归属的盒子显示归属行的酒店名，其余沿用单一酒店名 prop
-                    const boxHotel =
-                      (b.orderItemId ? hotelItemById.get(b.orderItemId)?.hotelName : undefined) ??
-                      hotelName;
-                    return boxHotel ? (
-                      <span className="inline-flex items-center gap-1 text-xs font-normal text-ink-soft">
-                        <Icon name="hotel" /> {boxHotel}
+          {boxes.map((b, idx) => {
+            const locked = isLockedBox(b);
+            return (
+              <div
+                key={b.id}
+                onDragOver={(e) => e.preventDefault()}
+                onDrop={(e) => handleDropToBox(b.id, e)}
+                className={`rounded-xl border p-3 shadow-sm transition ${
+                  locked
+                    ? 'border-indigo-200 bg-indigo-50/40'
+                    : 'border-slate-200 bg-surface hover:border-brand/30'
+                }`}
+              >
+                <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
+                  <span className="flex flex-wrap items-center gap-2 text-sm font-medium text-ink">
+                    房间 {idx + 1}
+                    {(() => {
+                      // 已归属的盒子显示归属行的酒店名，其余沿用单一酒店名 prop
+                      const boxHotel =
+                        (b.orderItemId ? hotelItemById.get(b.orderItemId)?.hotelName : undefined) ??
+                        hotelName;
+                      return boxHotel ? (
+                        <span className="inline-flex items-center gap-1 text-xs font-normal text-ink-soft">
+                          <Icon name="hotel" /> {boxHotel}
+                        </span>
+                      ) : null;
+                    })()}
+                    <NightlyRemainingBadge data={nightlyRemaining} checkIn={checkIn} checkOut={checkOut} compact />
+                    {locked && (
+                      <span
+                        className="badge bg-indigo-100 text-indigo-700"
+                        title="该房间与他单合住，只能改备注；改动请去房控页「跨单分房」"
+                      >
+                        <Icon name="lock" /> 已与他单合住
                       </span>
-                    ) : null;
-                  })()}
-                  <NightlyRemainingBadge data={nightlyRemaining} checkIn={checkIn} checkOut={checkOut} compact />
-                  {b.roomFraction === HALF_ROOM && <span className="badge-warning">½ 半间</span>}
-                  <span className="text-xs font-normal text-ink-muted">{b.passengerIds.length} 人</span>
-                </span>
-                <div className="flex items-center gap-1.5">
-                  <button
-                    type="button"
-                    onClick={() => toggleHalf(b.id)}
-                    className={`rounded-md border px-2 py-1 text-xs transition ${
-                      b.roomFraction === HALF_ROOM
-                        ? 'border-amber-300 bg-amber-50 text-amber-700'
-                        : 'border-slate-200 bg-white text-ink-soft hover:bg-slate-50'
-                    }`}
-                  >
-                    半间(拼房)
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => removeBox(b.id)}
-                    disabled={boxes.length <= 1 || b.passengerIds.length > 0}
-                    className="btn-ghost-danger px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-40"
-                    title={b.passengerIds.length > 0 ? '先把人移走再删房间' : '删除空房间'}
-                  >
-                    删房间
-                  </button>
+                    )}
+                    {b.roomFraction === HALF_ROOM && <span className="badge-warning">½ 半间</span>}
+                    {locked && b.roomFraction === SHARED_ROOM && (
+                      <span className="badge-neutral" title="本单在这间房的计费份额为 0（让份给合住方）">
+                        计费 0 间
+                      </span>
+                    )}
+                    <span className="text-xs font-normal text-ink-muted">{b.passengerIds.length} 人</span>
+                  </span>
+                  {locked ? (
+                    <span className="text-xs text-indigo-700">想调整请去房控页「跨单分房」</span>
+                  ) : (
+                    <div className="flex items-center gap-1.5">
+                      <button
+                        type="button"
+                        onClick={() => toggleHalf(b.id)}
+                        className={`rounded-md border px-2 py-1 text-xs transition ${
+                          b.roomFraction === HALF_ROOM
+                            ? 'border-amber-300 bg-amber-50 text-amber-700'
+                            : 'border-slate-200 bg-white text-ink-soft hover:bg-slate-50'
+                        }`}
+                      >
+                        半间(拼房)
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => removeBox(b.id)}
+                        disabled={boxes.length <= 1 || b.passengerIds.length > 0}
+                        className="btn-ghost-danger px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-40"
+                        title={b.passengerIds.length > 0 ? '先把人移走再删房间' : '删除空房间'}
+                      >
+                        删房间
+                      </button>
+                    </div>
+                  )}
+                </div>
+
+                {/* 盒子里的出行人 chips（锁定盒子不可拖出） */}
+                <div className="min-h-[2.5rem] rounded-lg border border-dashed border-slate-200 bg-slate-50/50 p-2">
+                  {b.passengerIds.length === 0 ? (
+                    <div className="py-1 text-center text-xs text-ink-muted">把出行人拖到这里</div>
+                  ) : (
+                    <div className="flex flex-wrap gap-2">
+                      {b.passengerIds.map((id) => {
+                        const p = passengerById.get(id);
+                        if (!p) return null;
+                        return <PassengerChip key={id} p={p} locked={locked} />;
+                      })}
+                    </div>
+                  )}
+                </div>
+
+                {/* 归属酒店行（多酒店行时才出；选了才支持按组拆行/换酒店）——锁定盒子归属已固定，只读展示 */}
+                {locked ? (
+                  showItemSelect && (
+                    <div className="mt-2 text-xs text-ink-soft">
+                      归属：{(b.orderItemId && hotelItemById.get(b.orderItemId)?.label) || '（与他单合住，归属由跨单分房维护）'}
+                    </div>
+                  )
+                ) : (
+                  showItemSelect && (
+                    <select
+                      className="input mt-2 w-full py-1.5 text-sm"
+                      value={b.orderItemId ?? ''}
+                      onChange={(e) => patchBox(b.id, { orderItemId: e.target.value || null })}
+                      title="归属后房控/导出按该行计酒店与间数；「拆房组 → 按组换酒店」也需要归属"
+                    >
+                      <option value="">请选择归属酒店行（必选）</option>
+                      {hotelItems!.map((h) => (
+                        <option key={h.id} value={h.id}>
+                          归属：{h.label}
+                        </option>
+                      ))}
+                    </select>
+                  )
+                )}
+
+                {/* 房型 + 备注（锁定盒子房型只读，备注仍可改） */}
+                <div className="mt-2 grid gap-2 sm:grid-cols-2">
+                  <input
+                    className="input py-1.5 text-sm disabled:bg-slate-100 disabled:text-ink-muted"
+                    placeholder="房型（选填，如 大床房 / 双床房）"
+                    value={b.roomType}
+                    disabled={locked}
+                    onChange={(e) => patchBox(b.id, { roomType: e.target.value })}
+                  />
+                  <input
+                    className="input py-1.5 text-sm"
+                    placeholder="备注（选填，如「和某人不分开」）"
+                    value={b.notes}
+                    onChange={(e) => patchBox(b.id, { notes: e.target.value })}
+                  />
                 </div>
               </div>
-
-              {/* 盒子里的出行人 chips（可拖出） */}
-              <div className="min-h-[2.5rem] rounded-lg border border-dashed border-slate-200 bg-slate-50/50 p-2">
-                {b.passengerIds.length === 0 ? (
-                  <div className="py-1 text-center text-xs text-ink-muted">把出行人拖到这里</div>
-                ) : (
-                  <div className="flex flex-wrap gap-2">
-                    {b.passengerIds.map((id) => {
-                      const p = passengerById.get(id);
-                      if (!p) return null;
-                      return <PassengerChip key={id} p={p} />;
-                    })}
-                  </div>
-                )}
-              </div>
-
-              {/* 归属酒店行（多酒店行时才出；选了才支持按组拆行/换酒店） */}
-              {showItemSelect && (
-                <select
-                  className="input mt-2 w-full py-1.5 text-sm"
-                  value={b.orderItemId ?? ''}
-                  onChange={(e) => patchBox(b.id, { orderItemId: e.target.value || null })}
-                  title="归属后房控/导出按该行计酒店与间数；「拆房组 → 按组换酒店」也需要归属"
-                >
-                  <option value="">不归属（旧口径：合并记在首条酒店行）</option>
-                  {hotelItems!.map((h) => (
-                    <option key={h.id} value={h.id}>
-                      归属：{h.label}
-                    </option>
-                  ))}
-                </select>
-              )}
-
-              {/* 房型 + 备注 */}
-              <div className="mt-2 grid gap-2 sm:grid-cols-2">
-                <input
-                  className="input py-1.5 text-sm"
-                  placeholder="房型（选填，如 大床房 / 双床房）"
-                  value={b.roomType}
-                  onChange={(e) => patchBox(b.id, { roomType: e.target.value })}
-                />
-                <input
-                  className="input py-1.5 text-sm"
-                  placeholder="备注（选填，如「和某人不分开」）"
-                  value={b.notes}
-                  onChange={(e) => patchBox(b.id, { notes: e.target.value })}
-                />
-              </div>
-            </div>
-          ))}
+            );
+          })}
 
           <button type="button" onClick={addBox} className="btn-secondary w-full py-2 text-sm">
             + 加房间
