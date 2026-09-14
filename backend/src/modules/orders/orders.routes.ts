@@ -1444,24 +1444,18 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       }
     }
 
-    // 分房总间数（含 0.5 拼房）→ 写回酒店订单行的 roomsBilled，房控据此按真实间数计（如 7 人 3.5 间）。
-    // 用 ?? 而非 > 0 判断——显式 0（共享组让份）要原样保留，不能被兜底成 1。
-    const totalRooms = body.roomGroups.reduce((s, g) => s + (g.roomFraction ?? 1), 0);
-    const roomsByItem = new Map<string, number>();
-    let unattachedRooms = 0;
-    for (const g of body.roomGroups) {
-      const fraction = g.roomFraction ?? 1;
-      if (g.orderItemId) {
-        roomsByItem.set(g.orderItemId, (roomsByItem.get(g.orderItemId) ?? 0) + fraction);
-      } else {
-        unattachedRooms += fraction;
-      }
-    }
     const hotelItemCount = await prisma.orderItem.count({
       where: { orderId: id, hotelRoomTypeId: { not: null } },
     });
 
+    // totalRooms / roomsByItem / unattachedRooms 不能从请求原始 body.roomGroups 算——带
+    // sharedRoomId 的旧组、以及下面新增的「原样重存的 0 份额普通组」，最终写库的份额值以
+    // reconcile 后的 finalGroups（锁后现状）为准，不是客户端发来的那份（astra A5①，见
+    // reconcile 循环之后的重新计算）。这几个变量在事务内被赋值，事务外的 3 处用途
+    // （警示文案、审计 after）都在事务提交之后才读取。
     let prevRooms: number | null = null;
+    let totalRooms = 0;
+    let unattachedRooms = 0;
     await prisma.$transaction(async (tx) => {
       // ── 先锁 Order（§六「锁序先 Order 后酒店」）──────────────────────────
       // 读旧房组、判定共享组是否被非法改动、写新房组，全程持有本单的行锁——避免两个并发
@@ -1507,7 +1501,23 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         }
 
         if ((g.roomFraction ?? 1) === 0) {
-          throw new BadRequestError(`房间「${g.hotelName}·${g.roomType}」不与他单合住，roomFraction 不能为 0`);
+          // 普通组本不该是 0 份额——除非它就是解绑后留下的「与他单合住时计费 0 间」那条
+          // （§八：解绑后份额为 0 的普通组，钱不动，物理按 1 间计），锁后现状（old）的
+          // roomFraction 恰好也是 0。这种情况必须放行原样重存，否则运营连改个备注都会
+          // 触发这条本该拦截客户端伪造 0 的闸（astra A5③）。服务端以 old 为准、只接受
+          // notes 补丁，其它字段一律沿用旧值——不能借着「份额凑巧是 0」的窗口顺手把
+          // 归属/乘客/房型也改了，那些改动仍该走正常（非零）分房流程或跨单分房页面。
+          const oldFractionPlain = old?.roomFraction == null ? null : Number(old.roomFraction);
+          if (oldFractionPlain !== 0) {
+            throw new BadRequestError(
+              `房间「${g.hotelName}·${g.roomType}」不与他单合住，roomFraction 不能为 0`,
+            );
+          }
+          finalGroups.push({
+            ...old,
+            notes: g.notes ?? (old?.notes as string | undefined),
+          });
+          continue;
         }
         finalGroups.push({
           ...g,
@@ -1587,28 +1597,56 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         where: { id },
         data: { roomAssignment: finalRoomAssignment as unknown as object },
       });
-      // 先清空本单所有酒店行的 roomsBilled，避免多酒店行残留旧值导致房控按行 Σ 重复计数。
-      await tx.orderItem.updateMany({
-        where: { orderId: id, hotelRoomTypeId: { not: null } },
-        data: { roomsBilled: null },
-      });
-      // 带归属的间数落到各自行；无归属的间数落首个带房型的行（旧口径兜底）。
-      // 任何行合计为 0 → 保持 null（上面已清空），不留 0。Σ 各行 = totalRooms（间数守恒）。
+
+      // ── roomsBilled 回写：按 reconcile 后的 finalGroups 算，显式写 0，不写 null（astra
+      // A5①）。旧实现先把本单全部酒店行清成 null、再跳过 Σ<=0 的行不回写——单单改动一个
+      // 0 份额共享组的备注也会把该行的显式 0 变成 null，null 会重新激活别处的 metadata
+      // 兜底（见 hotel-control.shared-rooms.ts 同款教训）。
+      //
+      // 用 ?? 而非 > 0 判断份额——显式 0（共享组让份/解绑后留下的 0）要原样保留。
+      const roomsByItem = new Map<string, number>();
+      let unattachedRoomsInner = 0;
+      for (const g of finalGroups) {
+        const fraction = Number(g.roomFraction);
+        const value = Number.isFinite(fraction) ? fraction : 1;
+        const itemId = readGroupField(g, 'orderItemId');
+        if (itemId) {
+          roomsByItem.set(itemId, (roomsByItem.get(itemId) ?? 0) + value);
+        } else {
+          unattachedRoomsInner += value;
+        }
+      }
+      unattachedRooms = unattachedRoomsInner;
+
+      // 无归属的间数落首个带房型的行（旧口径兜底）。
       const writes = new Map(roomsByItem);
-      if (unattachedRooms > 0) {
+      let fallbackItemId: string | null = null;
+      if (unattachedRoomsInner > 0) {
         const hotelItem = await tx.orderItem.findFirst({
           where: { orderId: id, hotelRoomTypeId: { not: null } },
           orderBy: { createdAt: 'asc' },
           select: { id: true },
         });
         if (hotelItem) {
-          writes.set(hotelItem.id, (writes.get(hotelItem.id) ?? 0) + unattachedRooms);
+          fallbackItemId = hotelItem.id;
+          writes.set(hotelItem.id, (writes.get(hotelItem.id) ?? 0) + unattachedRoomsInner);
         }
       }
-      for (const [rowId, rooms] of writes) {
-        if (rooms <= 0) continue;
+      totalRooms = [...writes.values()].reduce((s, v) => s + v, 0);
+
+      // 显式回写的行 = 本次 finalGroups 引用到的行（含无归属兜底落到的首行）∪ 变更前旧
+      // groups 引用过的行——后者若这次不再被任何组引用（乘客/份额已经搬去挂在另一条行），
+      // 同样要显式写 0，不能让那条行的 roomsBilled 停在搬走前的旧值。变更前后都没有房组
+      // 引用过的行（从未分房，roomsBilled 是录单时算的）保持不动，不在这里触碰。
+      const oldItemIds = new Set(
+        oldGroups.map((g) => readGroupField(g, 'orderItemId')).filter((v): v is string => v != null),
+      );
+      const itemIdsToWrite = new Set<string>([...writes.keys(), ...oldItemIds]);
+      if (fallbackItemId) itemIdsToWrite.add(fallbackItemId);
+      for (const itemId of itemIdsToWrite) {
+        const rooms = Math.round((writes.get(itemId) ?? 0) * 2) / 2; // 0.5 网格对齐，消浮点尾数
         await tx.orderItem.update({
-          where: { id: rowId },
+          where: { id: itemId },
           data: { roomsBilled: rooms },
         });
       }

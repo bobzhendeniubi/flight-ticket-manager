@@ -341,6 +341,105 @@ describe('PUT /orders/:id/room-assignment · 跨单分房 reconcile', () => {
   });
 
   /**
+   * astra A5③：普通组本不该是 0 份额，除非它就是解绑后留下的「与他单合住时计费 0 间」那条
+   * （§八：解绑后 0 份额那张单钱不动）。服务端锁后现状（old）里这条组的 roomFraction 恰好
+   * 也是 0 时，必须放行原样重存——不能一律拒绝，否则运营连改个备注都会被拦。放行时以
+   * old 的字段为准（只接受 notes 补丁），客户端顺手夹带的归属/乘客/房型改动被忽略，不生效。
+   */
+  it('普通房组锁后现状就是 0 份额（解绑留下的）→ 放行原样重存，客户端夹带的其它字段改动被忽略', async () => {
+    prismaMock.orderItem.count.mockResolvedValue(1); // orderItemId 归属校验通过
+    prismaMock.tx.order.findUnique.mockResolvedValue({
+      roomAssignment: {
+        roomGroups: [
+          {
+            id: 'g1',
+            hotelName: '椰岛大酒店',
+            roomType: '双床',
+            passengerIds: ['p1'],
+            orderItemId: 'item1',
+            roomFraction: 0,
+          },
+        ],
+      },
+    });
+    const res = await putStaff({
+      roomGroups: [
+        {
+          id: 'g1',
+          hotelName: '换了个名字的酒店', // 客户端试图顺手改字段——应被忽略
+          roomType: '换了房型',
+          passengerIds: ['p1', 'p2'],
+          orderItemId: 'item1',
+          roomFraction: 0,
+          notes: '新备注',
+        },
+      ],
+    });
+    expect(res.statusCode).toBe(200);
+    const written = prismaMock.tx.order.update.mock.calls[0][0].data.roomAssignment;
+    // 归属/乘客/房型/酒店名沿用锁后现状（old），只有 notes 按请求更新。
+    expect(written.roomGroups[0]).toMatchObject({
+      hotelName: '椰岛大酒店',
+      roomType: '双床',
+      passengerIds: ['p1'],
+      orderItemId: 'item1',
+      roomFraction: 0,
+      notes: '新备注',
+    });
+    // roomsBilled 显式落库为 0（不是 null，也不是被跳过不写）。
+    const itemUpdateCalls = prismaMock.tx.orderItem.update.mock.calls;
+    const item1Call = itemUpdateCalls.find((c) => c[0].where.id === 'item1');
+    expect(item1Call).toBeDefined();
+    expect(item1Call![0].data.roomsBilled).toBe(0);
+  });
+
+  /**
+   * astra A5①：旧实现先把本单所有酒店行的 roomsBilled 清成 null、再跳过 Σ<=0 的行不回写——
+   * 一条行这次不再被任何房组引用（乘客/份额搬去挂在另一条行），本该显式写 0，旧实现却让它
+   * 停在 null（重新激活别处的 metadata 兜底）。这里造一个「行的房组本次被整体搬空」的场景。
+   */
+  it('一条酒店行本次不再被任何房组引用 → roomsBilled 显式写 0，不是 null（astra A5①）', async () => {
+    prismaMock.orderItem.count.mockResolvedValue(1); // 新房组归属 item2 的校验
+    prismaMock.tx.order.findUnique.mockResolvedValue({
+      roomAssignment: {
+        roomGroups: [
+          {
+            id: 'g-old',
+            hotelName: '椰岛大酒店',
+            roomType: '双床',
+            passengerIds: ['p1'],
+            orderItemId: 'item1',
+            roomFraction: 1,
+          },
+        ],
+      },
+    });
+    // 新 payload 完全不提 g-old / item1——乘客被整体搬到 item2 的新房组去了。
+    const res = await putStaff({
+      roomGroups: [
+        {
+          id: 'g-new',
+          hotelName: '椰岛大酒店',
+          roomType: '双床',
+          passengerIds: ['p1'],
+          orderItemId: 'item2',
+          roomFraction: 1,
+        },
+      ],
+    });
+    expect(res.statusCode).toBe(200);
+    const itemUpdateCalls = prismaMock.tx.orderItem.update.mock.calls;
+    const item1Call = itemUpdateCalls.find((c) => c[0].where.id === 'item1');
+    expect(item1Call).toBeDefined();
+    expect(item1Call![0].data.roomsBilled).toBe(0); // 显式 0，不是 null、也不是被跳过
+    const item2Call = itemUpdateCalls.find((c) => c[0].where.id === 'item2');
+    expect(item2Call).toBeDefined();
+    expect(item2Call![0].data.roomsBilled).toBe(1);
+    // 旧的「先 updateMany 清空全部行为 null」调用已被移除——不再无差别清空整单酒店行。
+    expect(prismaMock.tx.orderItem.updateMany).not.toHaveBeenCalled();
+  });
+
+  /**
    * astra A11：本单在两家酒店各有一条行，§五闸逐酒店调用 assertHotelFitAfterChange 时，
    * H1 的 nextOrderItems 曾经被塞进整单（含 H2 那条行）的快照——H2 的房组也被算进 H1 的
    * 前瞻，凭空多占一间。这里造一个只有 H1 纳管（block=1 间）、H2 不纳管的场景：只改 H1
