@@ -136,6 +136,7 @@ import {
   type SettlementDiscountHit,
 } from '../settlement-discounts/settlement-discounts.service.js';
 import {
+  assertHotelFitAfterChange,
   assertHotelPhysicalFit,
   assertHotelPhysicalFitWithinTx,
   assertRandomTierFit,
@@ -147,9 +148,14 @@ import {
   lockHotelBlockPeriodsWithinTx,
   randomStarTierLabel,
   type PhysicalFitViolation,
+  type PhysicalOccupancyItem,
   type ProspectiveOccupancy,
   type RandomTierFitViolation,
 } from '../hotel-control/hotel-control.service.js';
+import {
+  formatUnbindWarning,
+  unbindSharedRoomMembersForItem,
+} from '../hotel-control/shared-room-unbind.js';
 import {
   readRoomGroupArray,
   refreshRoomGroupsForItem,
@@ -14455,6 +14461,8 @@ export class OrderService {
       untrackedNights: string[];
       /** 非空 = 本次换酒店越过了「套餐档次 ↔ 酒店星级」闸（调用方据此另写一条 WARNING 审计）。 */
       starMismatchOverride: DesignatedHotelStarMismatchOverride | null;
+      /** §八「解绑」提示（按 actor 角色生成，AGENT 版不含对方单号）；本行无共享成员时为空数组。 */
+      warnings: string[];
     };
   }> {
     // 代理自助换酒店（出票前任意时候、自家含下级的单）：过售后自助闸（归属 + 状态）后放行；
@@ -14808,6 +14816,21 @@ export class OrderService {
         );
       }
 
+      // ── §八「换酒店」：该行若有共享成员，先解绑（钱不动，物理按普通房组 1 间计）──────
+      // 换房型 / 换酒店 / 随机档落位都会让「这间房」的身份不再成立（不同酒店或不同房型）。
+      // 解绑后份额不再能当占用基数（份额可能是 0——astra 评审 finding 1/2），下方改用
+      // §五闸（assertHotelFitAfterChange）判定目标酒店，不再走 roomsBilled 前瞻。
+      const unbindResult = await unbindSharedRoomMembersForItem(tx, {
+        orderId,
+        orderItemId: item.id,
+        reason: '换酒店解绑',
+      });
+      const hasSharedMembers = unbindResult.unbound.length > 0;
+      const unbindWarnings = formatUnbindWarning(
+        unbindResult.unbound,
+        actor.role === UserRole.AGENT ? 'agent' : 'internal',
+      );
+
       // ── 0b. 目标酒店逐晚房量前瞻闸（事务内互斥版）────────────────────────────
       // 物理房间口径（口径同下单闸 / 销控板看板）：把本单要挪进目标酒店的占房塞进目标酒店当晚的
       // 性别桶里重算物理间数 —— 床位口径看不见「异性不能拼一间」这一维。
@@ -14818,7 +14841,46 @@ export class OrderService {
       // 在目标酒店的占用是真实存量，必须照常计入（旧版 excludeOrderId 把整单排掉 → 放行超卖）。
       // 拼房单（roomsBilled=0.5）要按性别配对判定 → 取本单出行人性别（口径同房控 pickSoloGender）。
       let untrackedNights: string[] = [];
-      if (needsHotelFitCheck) {
+      if (hasSharedMembers && nightDates.length > 0) {
+        // 共享行：不用 roomsBilled 前瞻（可能是 0），改用变更前后全量比较闸——覆盖跨酒店
+        // 换酒店，也覆盖同酒店换房型（解绑本身就可能让本酒店物理间数从「去重 1 间」变回
+        // 「两边各 1 间」，同酒店不代表物理口径不变）。allowNonWorsening：只拦「比这次操作
+        // 前更差」的情形，不能让这条新增的闸把与本次操作无关的存量超卖也拦下来。
+        await lockHotelBlockPeriodsWithinTx(tx, newRoomType.hotelId, nightDates);
+        const orderForGate = await tx.order.findUnique({
+          where: { id: orderId },
+          select: { roomAssignment: true },
+        });
+        const otherItemsAtTarget = await tx.orderItem.findMany({
+          where: { orderId, id: { not: item.id }, hotelRoomType: { hotelId: newRoomType.hotelId } },
+          select: { id: true, hotelCheckIn: true, hotelCheckOut: true, metadata: true },
+        });
+        const nextItemsAtTarget: PhysicalOccupancyItem[] = [
+          ...otherItemsAtTarget.map((it) => ({
+            id: it.id,
+            hotelCheckIn: it.hotelCheckIn,
+            hotelCheckOut: it.hotelCheckOut,
+            roomsBilled: null,
+            metadata: it.metadata,
+            order: { id: orderId, roomAssignment: orderForGate?.roomAssignment ?? null, passengers: [] },
+          })),
+          {
+            id: item.id,
+            hotelCheckIn: item.hotelCheckIn,
+            hotelCheckOut: item.hotelCheckOut,
+            roomsBilled: null,
+            metadata: item.metadata,
+            order: { id: orderId, roomAssignment: orderForGate?.roomAssignment ?? null, passengers: [] },
+          },
+        ];
+        await assertHotelFitAfterChange(tx, newRoomType.hotelId, nightDates, {
+          affectedOrderIds: [orderId],
+          nextOrderItems: new Map([[orderId, nextItemsAtTarget]]),
+          nextSharedRooms: [],
+          options: { allowNonWorsening: true },
+        });
+        if (needsHotelFitCheck) untrackedNights = [...nightDates];
+      } else if (needsHotelFitCheck) {
         await lockHotelBlockPeriodsWithinTx(tx, newRoomType.hotelId, nightDates);
         const swapPassengers = await tx.passenger.findMany({
           where: { orderId },
@@ -14934,7 +14996,7 @@ export class OrderService {
         }
       }
 
-      return { orderNumber: order.orderNumber, untrackedNights };
+      return { orderNumber: order.orderNumber, untrackedNights, unbindWarnings };
     });
 
     // ── 返回值：与 getOrder 同款富联查，确保 hotelName/roomTypeName 立即正确 ──
@@ -15013,6 +15075,7 @@ export class OrderService {
         feeCny,
         untrackedNights: scratch.untrackedNights,
         starMismatchOverride,
+        warnings: scratch.unbindWarnings,
       },
     };
   }

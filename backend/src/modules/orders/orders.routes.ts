@@ -2804,7 +2804,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         severity: 'WARNING',
       });
     }
-    return { order };
+    return { order, warnings: audit.warnings };
   });
 
   // ── 售后改单：酒店改期（ADMIN/STAFF）──
