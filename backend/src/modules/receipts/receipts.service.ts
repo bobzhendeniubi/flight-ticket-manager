@@ -37,6 +37,7 @@ import { writeAudit } from '../../lib/audit.js';
 import { outstandingCommissionNetWithinTx, round2 } from '../../lib/commission-net.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { PaymentsService } from '../payments/payments.service.js';
+import { loadSplitOriginsByReceiptId } from '../payments/overpay-trail.js';
 import type {
   AllocateBatchInput,
   AllocateReceiptInput,
@@ -1649,9 +1650,16 @@ export class ReceiptsService {
       }
     }
 
-    const orderNoById = await loadOrderNumbers(
-      receipts.flatMap((r) => r.allocations.map((a) => a.orderId)),
+    // 水单毛额 / 本单入账 / 转池：超收拆分建的池子行反查它的源收款（载荷 overpaySplit.receiptId 指回来）。
+    // 出纳拿水单对系统：水单 2864 = 本单入账 2454 + 转池 410，核对表上三个数要并排摆着才对得上。
+    const splitOrigins = await loadSplitOriginsByReceiptId(
+      receipts.filter((r) => r.source === ReceiptSource.ORDER_OVERPAY),
     );
+    const orderNoById = await loadOrderNumbers([
+      ...receipts.flatMap((r) => r.allocations.map((a) => a.orderId)),
+      ...receipts.map((r) => r.orderHintId),
+      ...[...splitOrigins.values()].map((o) => o.orderId),
+    ]);
     const holdNoById = await loadHoldNos(
       receipts.flatMap((r) => r.holdAllocations.filter((a) => !a.reversedAt).map((a) => a.holdOrderId)),
     );
@@ -1713,11 +1721,25 @@ export class ReceiptsService {
       const allAllocDates = [...orderAllocs, ...holdAllocs].map((a) => a.createdAt.getTime());
       const amount = Number(r.amountCny);
       const allocated = Number(r.allocatedCny);
+      // 拆分行：毛额 = 当初录入的水单全额，本单入账 = 记进源订单的部分，转池 = 本进账额；
+      // 其余进账（客户上传 / 流水导入 / 整笔进池 / 多付处置）没有拆分，毛额即进账额、入账 0。
+      // 「源订单」= 这笔钱是在哪张单上录进来的（拆分/整笔进池/多付转池都指向那张单），不是"入账到"。
+      const origin = r.source === ReceiptSource.ORDER_OVERPAY ? splitOrigins.get(r.id) : undefined;
+      const creditedOrderId = origin?.orderId ?? r.orderHintId;
+      const grossCny = origin ? round2(origin.detail.receivedAmount) : amount;
+      const creditedCny = origin ? round2(origin.detail.creditedAmount) : 0;
       return {
         receivedAt: r.receivedAt,
         externalTxnId: r.externalTxnId,
         receiptNo: r.receiptNo,
         amountCny: amount,
+        grossCny,
+        sourceOrderNumber:
+          r.source === ReceiptSource.ORDER_OVERPAY && creditedOrderId
+            ? (orderNoById.get(creditedOrderId) ?? creditedOrderId.slice(0, 8))
+            : '',
+        creditedCny,
+        pooledCny: amount,
         methodLabel: METHOD_LABEL[r.method],
         sourceLabel: SOURCE_LABEL[r.source],
         statusLabel: STATUS_LABEL[r.status],

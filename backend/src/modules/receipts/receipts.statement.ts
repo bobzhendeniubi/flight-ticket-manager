@@ -429,6 +429,14 @@ export interface StatementExportEntry {
   externalTxnId: string | null;
   receiptNo: string;
   amountCny: number;
+  /** 水单毛额：超收拆分行 = 当初录入的到账全额；其他行 = 进账额。 */
+  grossCny: number;
+  /** 源订单号：这笔钱在哪张单上录进来（拆分 / 整笔进池 / 多付转池）；非订单超额行为空串。 */
+  sourceOrderNumber: string;
+  /** 本单入账：毛额里记进源订单的部分；非拆分行为 0。 */
+  creditedCny: number;
+  /** 转池金额：进挂账池的部分（= 进账额）。 */
+  pooledCny: number;
   methodLabel: string;
   sourceLabel: string;
   statusLabel: string;
@@ -453,6 +461,11 @@ const EXPORT_COLUMNS: Array<{ header: string; key: string; width: number }> = [
   { header: '交易流水号', key: 'externalTxnId', width: 28 },
   { header: '进账号', key: 'receiptNo', width: 24 },
   { header: '金额', key: 'amountCny', width: 12 },
+  // 出纳对水单三件套：毛额 = 本单入账 + 转池；非拆分行毛额即金额、入账 0（订单超额行带源订单号）。
+  { header: '水单毛额', key: 'grossCny', width: 12 },
+  { header: '源订单', key: 'sourceOrderNumber', width: 20 },
+  { header: '本单入账', key: 'creditedCny', width: 12 },
+  { header: '转池金额', key: 'pooledCny', width: 12 },
   { header: '收款方式', key: 'methodLabel', width: 10 },
   { header: '来源', key: 'sourceLabel', width: 12 },
   { header: '认款状态', key: 'statusLabel', width: 12 },
@@ -479,6 +492,10 @@ export function buildStatementExportWorkbook(entries: StatementExportEntry[]): E
       externalTxnId: e.externalTxnId ?? '',
       receiptNo: e.receiptNo,
       amountCny: e.amountCny,
+      grossCny: e.grossCny,
+      sourceOrderNumber: e.sourceOrderNumber,
+      creditedCny: e.creditedCny,
+      pooledCny: e.pooledCny,
       methodLabel: e.methodLabel,
       sourceLabel: e.sourceLabel,
       statusLabel: e.statusLabel,
@@ -490,7 +507,7 @@ export function buildStatementExportWorkbook(entries: StatementExportEntry[]): E
       payerNote: e.payerNote ?? '',
       refundNote: e.refundNote ?? '',
     });
-    for (const key of ['amountCny', 'allocatedCny', 'remainingCny']) {
+    for (const key of ['amountCny', 'grossCny', 'creditedCny', 'pooledCny', 'allocatedCny', 'remainingCny']) {
       row.getCell(key).numFmt = '0.00';
     }
   }

@@ -523,6 +523,10 @@ describe('buildStatementExportWorkbook', () => {
         externalTxnId: 'TXN001',
         receiptNo: 'RCP20260721ABC',
         amountCny: 300,
+        grossCny: 300,
+        sourceOrderNumber: '',
+        creditedCny: 0,
+        pooledCny: 300,
         methodLabel: '微信',
         sourceLabel: '流水导入',
         statusLabel: '已认款',
@@ -545,6 +549,10 @@ describe('buildStatementExportWorkbook', () => {
       '交易流水号',
       '进账号',
       '金额',
+      '水单毛额',
+      '源订单',
+      '本单入账',
+      '转池金额',
       '收款方式',
       '来源',
       '认款状态',
@@ -559,8 +567,10 @@ describe('buildStatementExportWorkbook', () => {
     const r2 = ws!.getRow(2);
     expect(r2.getCell(1).value).toBe('2026-07-21 23:20'); // 北京墙钟
     expect(r2.getCell(2).value).toBe('TXN001');
-    expect(r2.getCell(7).value).toBe('已认款');
-    expect(r2.getCell(10).value).toBe('FTM2026072100001 ¥300.00');
-    expect(r2.getCell(12).value).toBe('财务甲');
+    expect(r2.getCell(5).value).toBe(300); // 水单毛额（非拆分行 = 金额）
+    expect(r2.getCell(8).value).toBe(300); // 转池金额
+    expect(r2.getCell(11).value).toBe('已认款');
+    expect(r2.getCell(14).value).toBe('FTM2026072100001 ¥300.00');
+    expect(r2.getCell(16).value).toBe('财务甲');
   });
 });

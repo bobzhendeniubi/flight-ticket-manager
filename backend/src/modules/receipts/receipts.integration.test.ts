@@ -27,6 +27,7 @@ import {
 import { prisma } from '../../db/prisma.js';
 import { OrderService } from '../orders/orders.service.js';
 import { ReceiptsService } from './receipts.service.js';
+import { PaymentsService } from '../payments/payments.service.js';
 
 const receiptsService = new ReceiptsService();
 const orderService = new OrderService();
@@ -930,5 +931,58 @@ describe('公开上传付款凭证 · 门禁 + 仅声明不入账', () => {
     });
     const match = await orderService.lookupOrderForReceiptUpload(order.orderNumber, '13900139000');
     expect(match?.orderId).toBe(order.id);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('exportStatement · 水单毛额 / 入账订单 / 本单入账 / 转池金额', () => {
+  const paymentsService = new PaymentsService();
+
+  /** 按进账号取一行的几个单元格值。 */
+  function rowByReceiptNo(wb: Awaited<ReturnType<typeof receiptsService.exportStatement>>, receiptNo: string) {
+    const ws = wb.getWorksheet('流水核对表')!;
+    const hit: { row: Record<string, unknown> | null } = { row: null };
+    ws.eachRow((row, rowNumber) => {
+      if (rowNumber === 1) return;
+      if (row.getCell('receiptNo').value === receiptNo) {
+        hit.row = {
+          amountCny: row.getCell('amountCny').value,
+          grossCny: row.getCell('grossCny').value,
+          sourceOrderNumber: row.getCell('sourceOrderNumber').value,
+          creditedCny: row.getCell('creditedCny').value,
+          pooledCny: row.getCell('pooledCny').value,
+        };
+      }
+    });
+    return hit.row;
+  }
+  /** 只导当天（北京时）的进账：别把整个测试库的进账都翻一遍。 */
+  const todayBeijing = () => new Date(Date.now() + 8 * 3600 * 1000).toISOString().slice(0, 10);
+
+  it('超收拆分的池子行：毛额=录入全额、本单入账=记进源单部分、转池=进账额；普通进账毛额即金额', async () => {
+    const ADMIN = await createAdminActor();
+    const order = await createGuestOrder({ total: 2454 });
+    const res = await paymentsService.confirmManualPayment(
+      order.id,
+      { amount: 2864, method: PaymentMethod.BANK_CARD },
+      ADMIN,
+    );
+    const plain = await registerReceipt(500, ADMIN);
+
+    const wb = await receiptsService.exportStatement({ from: todayBeijing(), to: todayBeijing() });
+    expect(rowByReceiptNo(wb, res.overpaySplit!.receiptNo)).toEqual({
+      amountCny: 410,
+      grossCny: 2864,
+      sourceOrderNumber: order.orderNumber,
+      creditedCny: 2454,
+      pooledCny: 410,
+    });
+    expect(rowByReceiptNo(wb, plain.receiptNo)).toEqual({
+      amountCny: 500,
+      grossCny: 500,
+      sourceOrderNumber: '',
+      creditedCny: 0,
+      pooledCny: 500,
+    });
   });
 });
