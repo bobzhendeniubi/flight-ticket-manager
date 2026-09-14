@@ -1815,3 +1815,225 @@ describe('saveSharedRooms · 真 DB E2E · 幂等占位的并发/崩溃窗口（
     expect(finalRow?.resultJson).toEqual(result); // 占位已被换成真结果，供后续同 token 重放
   });
 });
+
+/**
+ * astra A6①：同一房内同一 (orderId, orderItemId) 出现多个 group → 400。
+ * `fractionByOrderItem.set` 是覆盖语义，重复键会让 Σ 校验只看到最后一份，但
+ * SharedRoomMember 落库是逐 group 处理，两份 passengerIds 都会建成员行——物理/计费
+ * 口径跟 Σ 校验看到的对不上。
+ */
+describe('saveSharedRooms · 真 DB E2E · 同房同订单行不许出现多个成员组（astra A6①）', () => {
+  afterEach(() => flushFireAndForgetAudit());
+
+  it('同一房间的 groups 里两条都指向同一 (orderId, orderItemId) → 400，不落库', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 2 });
+
+    await expect(
+      saveSharedRooms(
+        {
+          hotelId: hotel.id,
+          checkIn: CHECK_IN,
+          checkOut: CHECK_OUT,
+          requestToken: requestToken(),
+          rooms: [
+            {
+              hotelRoomTypeId: roomType.id,
+              groups: [
+                {
+                  orderId: orderA.id,
+                  orderItemId: orderA.items[0].id,
+                  passengerIds: [orderA.passengers[0].id],
+                  roomFraction: 0.5,
+                },
+                {
+                  // 同一 (orderId, orderItemId)，另一半乘客——本该合并成一组一次提交。
+                  orderId: orderA.id,
+                  orderItemId: orderA.items[0].id,
+                  passengerIds: [orderA.passengers[1].id],
+                  roomFraction: 0.5,
+                },
+              ],
+            },
+          ],
+          dissolve: [],
+        },
+        actor,
+      ),
+    ).rejects.toThrow(/出现了不止一个成员组/);
+
+    const untouched = await prisma.sharedRoom.findMany({ where: { hotelId: hotel.id } });
+    expect(untouched).toHaveLength(0); // 没有创建任何共享房
+    const item = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderA.items[0].id } });
+    expect(item.roomsBilled?.toString()).toBe('1'); // roomsBilled 原样未动
+  });
+});
+
+/**
+ * astra A6②：请求没列出的旧共享房里若含本次被拖走的乘客，要按乘客查出全部旧关系，
+ * 纳入锁集合与版本校验，删掉旧成员、旧房清空则 DISSOLVED（同时是 B2 的后端侧）。
+ */
+describe('saveSharedRooms · 真 DB E2E · 隐式触及旧共享房的清理（astra A6②）', () => {
+  afterEach(() => flushFireAndForgetAudit());
+
+  it('把乘客从未点名的旧共享房拽进新房：旧房只剩一人 → 摘除后自动 DISSOLVED', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderC = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    // 旧共享房 S：A + B。
+    const created = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const oldRoomId = created.rooms[0].sharedRoomId;
+
+    // 新请求：只提 A（拉进新房 S2，与 C 合住），完全不提 S / oldRoomId。
+    const result = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderC.id,
+                orderItemId: orderC.items[0].id,
+                passengerIds: [orderC.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    expect(result.rooms).toHaveLength(1);
+    expect(result.rooms[0].sharedRoomId).not.toBe(oldRoomId);
+
+    // 旧房：A 的成员行被摘除；B 是旧房唯一剩下的成员——不对，B 应该还在，A 被摘除后
+    // 旧房还剩 B 一人，不是空的，不该被解散。
+    const oldRoomAfter = await prisma.sharedRoom.findUniqueOrThrow({
+      where: { id: oldRoomId },
+      include: { members: true },
+    });
+    expect(oldRoomAfter.status).toBe('ACTIVE');
+    expect(oldRoomAfter.members).toHaveLength(1);
+    expect(oldRoomAfter.members[0]!.orderId).toBe(orderB.id);
+    expect(oldRoomAfter.version).toBe(2); // 解绑 A 也是一次成员变更，版本要涨
+
+    // A 的旧订单 JSON 不再挂着这间旧房。
+    const refreshedA = await prisma.order.findUniqueOrThrow({ where: { id: orderA.id } });
+    const groupsA = (refreshedA.roomAssignment as { roomGroups: Array<Record<string, unknown>> }).roomGroups;
+    expect(groupsA.every((g) => g.sharedRoomId !== oldRoomId)).toBe(true);
+  });
+
+  it('旧共享房只剩这一名乘客：拽走后旧房自动 DISSOLVED，不留零成员的幽灵房', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    // orderA 单独一人先占用一间共享房（份额 1，凑不出 Σ=1 就用这唯一一组，Σ 恰好为 1）。
+    const created = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const oldRoomId = created.rooms[0].sharedRoomId;
+
+    await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    const oldRoomAfter = await prisma.sharedRoom.findUniqueOrThrow({
+      where: { id: oldRoomId },
+      include: { members: true },
+    });
+    expect(oldRoomAfter.status).toBe('DISSOLVED');
+    expect(oldRoomAfter.members).toHaveLength(0);
+    expect(oldRoomAfter.version).toBe(2);
+  });
+});

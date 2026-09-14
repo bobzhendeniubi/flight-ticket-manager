@@ -585,10 +585,38 @@ async function saveSharedRoomsInner(
     }
   }
 
-  const touchedSharedRoomIds = new Set<string>([...roomIdsBeingSaved, ...dissolveSet]);
+  // rooms 与 dissolve 里客户端明确点名的共享房（过 expectedVersions CAS 的那批）。
+  const explicitTouchedSharedRoomIds = new Set<string>([...roomIdsBeingSaved, ...dissolveSet]);
   const initialOrderIds = new Set<string>(body.rooms.flatMap((r) => r.groups.map((g) => g.orderId)));
+  // 本次请求认领的全部乘客——用来发现「请求没提，但乘客正被从里面拽走」的旧共享房
+  // （astra A6②，下面在事务内按它查隐式触及的房间）。
+  const allRequestedPassengerIds = new Set<string>(
+    body.rooms.flatMap((r) => r.groups.flatMap((g) => g.passengerIds)),
+  );
 
   const result = await runWithLockSetRetry(() => client.$transaction(async (tx) => {
+    // 隐式触及的旧共享房（astra A6②）：请求没有点名它，但本次认领的某个乘客眼下正挂在
+    // 「本酒店本区间」的这间房里。不把它纳入锁与清理范围，会留下两个坑——
+    //   · 这个乘客在原订单 JSON 里的旧共享组会被下面 kept 过滤器正常收窄/丢弃（narrowing
+    //     分支不看 sid 是否在 touched 集合里），但 SharedRoomMember 表里对应的行永远不删，
+    //     变成指向「JSON 已经不认它」的孤儿引用，物理去重口径会一直把这个乘客算进旧房；
+    //   · 旧房的 version 永远不涨，membership 却在变，等于绕开了整套 CAS 协议。
+    // 只在「本酒店本区间」匹配的范围内找——乘客可能在别的酒店/别的行程也挂着别的共享房，
+    // 那些与本次请求无关，不该被牵连进来。
+    const implicitRoomIds = new Set<string>();
+    if (allRequestedPassengerIds.size > 0) {
+      const implicitMemberships = await tx.sharedRoomMember.findMany({
+        where: {
+          passengerId: { in: [...allRequestedPassengerIds] },
+          sharedRoomId: { notIn: [...explicitTouchedSharedRoomIds] },
+          sharedRoom: { hotelId: body.hotelId, checkIn: checkInD, checkOut: checkOutD, status: 'ACTIVE' },
+        },
+        select: { sharedRoomId: true },
+      });
+      for (const m of implicitMemberships) implicitRoomIds.add(m.sharedRoomId);
+    }
+    const touchedSharedRoomIds = new Set<string>([...explicitTouchedSharedRoomIds, ...implicitRoomIds]);
+
     const lockedOrderIds = await lockAffectedOrdersOnce(tx, initialOrderIds, touchedSharedRoomIds);
     const orders = await loadLockedOrders(tx, [...lockedOrderIds]);
 
@@ -609,6 +637,14 @@ async function saveSharedRoomsInner(
     for (const roomId of touchedSharedRoomIds) {
       const current = currentById.get(roomId);
       if (!current) throw new NotFoundError(`共享房 ${roomId} 不存在`);
+      if (implicitRoomIds.has(roomId)) {
+        // 隐式触及的房间（astra A6②）：客户端根本不知道它存在，不能要求 expectedVersions；
+        // 也不因为它并发被解散/挪了日期就报错整次保存——现状已经不是「活跃」就跳过它，
+        // 不勉强摘成员（下面落库段和上面 nextSharedRooms 都已按 currentById 的最新状态
+        // 决定是否还需要处理它）。这条房间不参与后面「不在 dissolve 里就要求 ACTIVE+
+        // 日期一致」的严格校验——那是给客户端明确点名要更新的房间用的。
+        continue;
+      }
       const expected = body.expectedVersions?.[roomId];
       if (expected == null || expected !== current.version) {
         throw new ConflictError('该房间已被他人修改，请刷新后重试');
@@ -700,6 +736,16 @@ async function saveSharedRoomsInner(
       const fractionByOrderItem = new Map<string, number>();
       let totalPassengers = 0;
       for (const g of room.groups) {
+        // 同一房内同一 (orderId, orderItemId) 出现多个 group → 400（astra A6①）：不规范化
+        // 合并——`fractionByOrderItem.set` 是覆盖语义，重复键悄悄丢弃前一份额，Σ 校验可能
+        // 侥幸算对，但下面 JSON 生成、SharedRoomMember 落库都是逐 group 处理，会把两份
+        // passengerIds 都建成成员行，物理/计费口径就此对不上 Σ 校验看到的那份。
+        const orderItemKey = `${g.orderId}:${g.orderItemId}`;
+        if (fractionByOrderItem.has(orderItemKey)) {
+          throw new BadRequestError(
+            `房间「${room.hotelRoomTypeId}」里订单行 ${g.orderItemId} 出现了不止一个成员组，请合并成一组再提交`,
+          );
+        }
         const order = orders.get(g.orderId);
         if (!order) {
           throw new BadRequestError(`订单 ${g.orderId} 不存在`);
@@ -961,6 +1007,39 @@ async function saveSharedRoomsInner(
         activeMemberOrderIds: activeOrderIds,
       });
     }
+    // 隐式触及旧房的「变更后」状态（astra A6②）：本次被认领走的乘客从这些房间的成员里
+    // 摘除，物理去重口径要跟着变——不摘的话前瞻闸看到的还是摘除前的旧成员集合，可能把
+    // 已经腾出来的物理间数误判成仍被占用。
+    const implicitRoomSurvivors = new Map<string, Set<string>>();
+    if (implicitRoomIds.size > 0) {
+      const implicitMembers = await tx.sharedRoomMember.findMany({
+        where: { sharedRoomId: { in: [...implicitRoomIds] } },
+        select: { sharedRoomId: true, orderId: true, passengerId: true },
+      });
+      for (const m of implicitMembers) {
+        if (seenPassengerIds.has(m.passengerId)) continue; // 本次被摘除，不算幸存
+        let set = implicitRoomSurvivors.get(m.sharedRoomId);
+        if (!set) {
+          set = new Set();
+          implicitRoomSurvivors.set(m.sharedRoomId, set);
+        }
+        set.add(m.orderId);
+      }
+      for (const roomId of implicitRoomIds) {
+        const current = currentById.get(roomId);
+        if (!current || current.status !== 'ACTIVE') continue; // 并发已不是活跃状态，不掺和
+        const survivorOrderIds = [...(implicitRoomSurvivors.get(roomId) ?? [])].filter((oid) => {
+          const o = orders.get(oid);
+          return !!o && o.deletedAt == null && COUNTED_STATUSES.includes(o.status);
+        });
+        nextSharedRooms.push({
+          sharedRoomId: roomId,
+          checkIn: current.checkIn,
+          checkOut: current.checkOut,
+          activeMemberOrderIds: survivorOrderIds,
+        });
+      }
+    }
 
     await assertHotelFitAfterChange(tx, body.hotelId, nightDates, {
       affectedOrderIds: [...orders.keys()],
@@ -985,6 +1064,31 @@ async function saveSharedRoomsInner(
         },
       });
       await tx.sharedRoomMember.deleteMany({ where: { sharedRoomId: roomId } });
+    }
+    // 隐式触及旧房的实际清理（astra A6②）：摘掉本次被认领走的乘客在这些房间里的成员行；
+    // 摘完如果这间房空了就顺手解散（不留一间零成员的幽灵 ACTIVE 房），否则只递增版本
+    // （membership 变了，版本就该跟着涨，即便这次不是客户端主动发起的更新）。这些房间
+    // 不出现在返回值 rooms/dissolved 列表里——它们是本次请求的副作用，不是主体。
+    for (const roomId of implicitRoomIds) {
+      const current = currentById.get(roomId);
+      if (!current || current.status !== 'ACTIVE') continue; // 并发已不是活跃状态，不掺和
+      await tx.sharedRoomMember.deleteMany({
+        where: { sharedRoomId: roomId, passengerId: { in: [...seenPassengerIds] } },
+      });
+      const remaining = await tx.sharedRoomMember.count({ where: { sharedRoomId: roomId } });
+      if (remaining === 0) {
+        await tx.sharedRoom.update({
+          where: { id: roomId },
+          data: {
+            status: 'DISSOLVED',
+            dissolvedAt: new Date(),
+            dissolvedReason: '成员全部转移到其它跨单分房请求',
+            version: { increment: 1 },
+          },
+        });
+      } else {
+        await tx.sharedRoom.update({ where: { id: roomId }, data: { version: { increment: 1 } } });
+      }
     }
     for (let roomIndex = 0; roomIndex < body.rooms.length; roomIndex++) {
       const room = body.rooms[roomIndex];
