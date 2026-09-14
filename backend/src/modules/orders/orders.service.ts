@@ -10679,6 +10679,7 @@ export class OrderService {
                 hotelCheckIn: true,
                 hotelCheckOut: true,
                 roomsBilled: true,
+                metadata: true,
               },
             })
           ) // 防御性复筛（与 where 同条件）：单测 mock 的 findMany 不认 where，会把机票行也吐回来
@@ -10687,19 +10688,24 @@ export class OrderService {
             // §八：平移前对全部有共享成员的酒店行解绑——共享房 checkIn/checkOut 必须与全体
             // 成员的住宿区间一致，平移日期就让「这间房」的身份不再成立。随机档行（无
             // hotelRoomTypeId）不会有共享成员（§三共享成员只能归属真实酒店行），跳过即可。
-            const unboundItemIds = new Set<string>();
+            //
+            // 两阶段（CRITICAL 修复 · astra finding A1/A2）：先只 planUnbind（只读，不落库），
+            // 闸判定用计划算出的 after 状态，通过后才统一 applyUnbindPlan——不能再用
+            // Math.max(1, roomsBilled) 塞进不理解共享去重的老式前瞻：一行可能同时承载两个
+            // 不同共享房的零份额组，「每行至少一间」会漏算成只加 1 间。
+            const plansByItemId = new Map<string, UnbindPlan>();
             for (const row of hotelRows) {
               if (!row.hotelRoomTypeId) continue;
-              const unbindResult = await unbindSharedRoomMembersForItem(tx, {
-                orderId,
-                orderItemId: row.id,
-                reason: '机票改期连带平移酒店日期解绑',
-              });
-              if (unbindResult.unbound.length === 0) continue;
-              unboundItemIds.add(row.id);
+              const plan = await planUnbind(tx, { orderId, orderItemId: row.id });
+              if (plan.changes.length === 0) continue;
+              plansByItemId.set(row.id, plan);
               sharedRoomWarnings.push(
                 ...formatUnbindWarning(
-                  unbindResult.unbound,
+                  plan.changes.map((c) => ({
+                    sharedRoomId: c.sharedRoomId,
+                    roomFraction: c.roomFraction,
+                    partnerOrderNumbers: c.partnerOrderNumbers,
+                  })),
                   actor.role === UserRole.AGENT ? 'agent' : 'internal',
                 ),
               );
@@ -10710,26 +10716,112 @@ export class OrderService {
               newCheckIn: shiftDay(row.hotelCheckIn!),
               newCheckOut: row.hotelCheckOut ? shiftDay(row.hotelCheckOut) : null,
             }));
-            // 新区间房量闸（与建单/改档同一对闸，自带同酒店/同档归并防「各判各的」漏判）：
-            // excludeOrderId 排除本单现占房 = 先释放旧区间，再按新区间前瞻判定。
-            // 刚解绑的行：份额可能是 0，不能再当占用基数（astra 评审 finding 1/2）——
-            // 解绑后物理按普通房组 1 间计，这里用 Math.max(1, …) 把它floor 回 1 间。
-            const prospectiveStays = shifted.map((s) => ({
-              hotelRoomTypeId: s.row.hotelRoomTypeId,
-              hotelCheckIn: s.newCheckIn,
-              hotelCheckOut: s.newCheckOut,
-              roomsBilled: unboundItemIds.has(s.row.id)
-                ? Math.max(1, s.row.roomsBilled == null ? 0 : Number(s.row.roomsBilled.toString()))
-                : s.row.roomsBilled == null
-                  ? null
-                  : Number(s.row.roomsBilled.toString()),
-              randomStarTier: s.row.randomStarTier,
-            }));
+
             const orderPassengers = await tx.passenger.findMany({
               where: { orderId },
               select: { gender: true },
             });
+
+            // 逐酒店分组：只要该酒店至少有一行触及共享成员，该酒店**全部**行都改走 §五闸
+            // ——不能按行拆到两套口径，否则 assertHotelFitAfterChange 的 nextOrderItems
+            // 是「给了就整单整酒店覆盖，没给的行才沿用现状」，遗漏同酒店的未触及行会把它
+            // 的占用算漏。真正没有任何行触及共享成员的酒店，才继续走老式 prospective-add。
+            const roomTypeIdsAll = [
+              ...new Set(
+                shifted
+                  .filter((s) => s.row.hotelRoomTypeId)
+                  .map((s) => s.row.hotelRoomTypeId as string),
+              ),
+            ];
+            const roomTypesAll =
+              roomTypeIdsAll.length > 0
+                ? await tx.hotelRoomType.findMany({
+                    where: { id: { in: roomTypeIdsAll } },
+                    select: { id: true, hotelId: true },
+                  })
+                : [];
+            const hotelIdByRoomType = new Map(roomTypesAll.map((rt) => [rt.id, rt.hotelId]));
+            const byHotel = new Map<string, typeof shifted>();
+            for (const s of shifted) {
+              if (!s.row.hotelRoomTypeId) continue;
+              const hotelId = hotelIdByRoomType.get(s.row.hotelRoomTypeId);
+              if (!hotelId) continue;
+              const list = byHotel.get(hotelId) ?? [];
+              list.push(s);
+              byHotel.set(hotelId, list);
+            }
+            const gatedHotelIds = new Set(
+              [...byHotel.entries()]
+                .filter(([, rows]) => rows.some((s) => plansByItemId.has(s.row.id)))
+                .map(([hotelId]) => hotelId),
+            );
+
             try {
+              if (gatedHotelIds.size > 0) {
+                const orderForGate = await tx.order.findUnique({
+                  where: { id: orderId },
+                  select: { roomAssignment: true },
+                });
+                for (const hotelId of gatedHotelIds) {
+                  const rows = byHotel.get(hotelId)!;
+                  const unionDates = [
+                    ...new Set(
+                      rows.flatMap((s) => [
+                        ...buildStayNightDates(
+                          s.row.hotelCheckIn!,
+                          s.row.hotelCheckOut ?? s.row.hotelCheckIn!,
+                        ),
+                        ...(s.newCheckOut ? buildStayNightDates(s.newCheckIn, s.newCheckOut) : []),
+                      ]),
+                    ),
+                  ].sort();
+                  await lockHotelBlockPeriodsWithinTx(tx, hotelId, unionDates);
+                  const nextItems: PhysicalOccupancyItem[] = rows.map((s) => {
+                    const plan = plansByItemId.get(s.row.id);
+                    const roomAssignment = plan?.nextRoomAssignment ?? orderForGate?.roomAssignment ?? null;
+                    return {
+                      id: s.row.id,
+                      hotelCheckIn: s.newCheckIn,
+                      hotelCheckOut: s.newCheckOut,
+                      roomsBilled: s.row.roomsBilled,
+                      metadata: s.row.metadata,
+                      order: { id: orderId, roomAssignment, passengers: orderPassengers },
+                    };
+                  });
+                  const nextSharedRooms: SharedRoomAfterState[] = rows.flatMap((s) => {
+                    const plan = plansByItemId.get(s.row.id);
+                    if (!plan) return [];
+                    return plan.changes.map((c) => ({
+                      sharedRoomId: c.sharedRoomId,
+                      checkIn: c.checkIn,
+                      checkOut: c.checkOut,
+                      activeMemberOrderIds: c.activeMemberOrderIdsAfter,
+                    }));
+                  });
+                  await assertHotelFitAfterChange(tx, hotelId, unionDates, {
+                    affectedOrderIds: [orderId],
+                    nextOrderItems: new Map([[orderId, nextItems]]),
+                    nextSharedRooms,
+                    options: { allowNonWorsening: true },
+                  });
+                }
+              }
+
+              // 未被 §五闸接管的行（所在酒店没有任何行触及共享成员；随机档行恒在此列，
+              // 共享成员只能归属真实酒店行）：仍走老式 prospective-add 前瞻——不再需要
+              // Math.max 兜底，触及共享成员的行已被上面接管，不会混进来。
+              const ungatedShifted = shifted.filter((s) => {
+                if (!s.row.hotelRoomTypeId) return true;
+                const hotelId = hotelIdByRoomType.get(s.row.hotelRoomTypeId);
+                return !hotelId || !gatedHotelIds.has(hotelId);
+              });
+              const prospectiveStays = ungatedShifted.map((s) => ({
+                hotelRoomTypeId: s.row.hotelRoomTypeId,
+                hotelCheckIn: s.newCheckIn,
+                hotelCheckOut: s.newCheckOut,
+                roomsBilled: s.row.roomsBilled == null ? null : Number(s.row.roomsBilled.toString()),
+                randomStarTier: s.row.randomStarTier,
+              }));
               await assertHotelStaysFitWithinTx(
                 tx,
                 prospectiveStays,
@@ -10750,6 +10842,10 @@ export class OrderService {
                 );
               }
               throw err;
+            }
+            // 全部涉及酒店都过闸后，才真正落库解绑（astra finding A1：落库必须在闸判定之后）。
+            for (const plan of plansByItemId.values()) {
+              await applyUnbindPlan(tx, plan, '机票改期连带平移酒店日期解绑');
             }
             for (const s of shifted) {
               const nights = s.newCheckOut
