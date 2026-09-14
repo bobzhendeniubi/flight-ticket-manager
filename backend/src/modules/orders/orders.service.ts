@@ -151,12 +151,17 @@ import {
   type PhysicalOccupancyItem,
   type ProspectiveOccupancy,
   type RandomTierFitViolation,
+  type SharedRoomAfterState,
 } from '../hotel-control/hotel-control.service.js';
 import {
+  applyUnbindPlan,
   formatUnbindWarning,
   hasSharedRoomMembers,
+  planRestoreSharedRoomReconciliation,
+  planUnbind,
   unbindInconsistentSharedRoomMembers,
   unbindSharedRoomMembersForItem,
+  type UnbindPlan,
 } from '../hotel-control/shared-room-unbind.js';
 import {
   readRoomGroupArray,
@@ -14908,18 +14913,51 @@ export class OrderService {
         );
       }
 
+      // ── 锁后重读本行（HIGH 修复 · astra finding A10）────────────────────────
+      // item/oldRoomType/newRoomType 及由此派生的 feeCny/swapCost/newDescription 全部算自
+      // 事务外的锁前快照；拿到 Order 锁之后，若该行已被并发操作换到别的酒店/房型/日期/份额，
+      // 或行已被删除，继续拿锁前快照写库就是用旧数据覆盖别人刚提交的结果。重读并核对关键
+      // 字段，任一不符 → 409，让调用方带最新数据重新发起（不在这里拼接差价/成本，那些数字
+      // 本就该配一次全新的报价）。
+      const lockedItem = await tx.orderItem.findUnique({
+        where: { id: item.id },
+        select: {
+          orderId: true,
+          hotelRoomTypeId: true,
+          hotelCheckIn: true,
+          hotelCheckOut: true,
+          roomsBilled: true,
+          randomStarTier: true,
+        },
+      });
+      if (
+        !lockedItem ||
+        lockedItem.orderId !== orderId ||
+        lockedItem.hotelRoomTypeId !== item.hotelRoomTypeId ||
+        lockedItem.randomStarTier !== item.randomStarTier ||
+        (lockedItem.hotelCheckIn?.getTime() ?? null) !== (item.hotelCheckIn?.getTime() ?? null) ||
+        (lockedItem.hotelCheckOut?.getTime() ?? null) !== (item.hotelCheckOut?.getTime() ?? null) ||
+        Number(lockedItem.roomsBilled ?? 1) !== Number(item.roomsBilled ?? 1)
+      ) {
+        throw new ConflictError('该行已被并发修改（酒店/日期/份额已变化），请刷新后重试换酒店');
+      }
+
       // ── §八「换酒店」：该行若有共享成员，先解绑（钱不动，物理按普通房组 1 间计）──────
       // 换房型 / 换酒店 / 随机档落位都会让「这间房」的身份不再成立（不同酒店或不同房型）。
       // 解绑后份额不再能当占用基数（份额可能是 0——astra 评审 finding 1/2），下方改用
       // §五闸（assertHotelFitAfterChange）判定目标酒店，不再走 roomsBilled 前瞻。
-      const unbindResult = await unbindSharedRoomMembersForItem(tx, {
-        orderId,
-        orderItemId: item.id,
-        reason: '换酒店解绑',
-      });
-      const hasSharedMembers = unbindResult.unbound.length > 0;
+      //
+      // 两阶段（CRITICAL 修复 · astra finding A1）：先只 planUnbind（只读、不落库），
+      // 用计划算出的「解绑后」状态喂 §五闸；闸读到的「变更前」因此仍是真正的旧快照
+      // （不会被「先解绑已落库」污染成虚高的存量）。闸通过后才 applyUnbindPlan 真正写库。
+      const unbindPlan = await planUnbind(tx, { orderId, orderItemId: item.id });
+      const hasSharedMembers = unbindPlan.changes.length > 0;
       const unbindWarnings = formatUnbindWarning(
-        unbindResult.unbound,
+        unbindPlan.changes.map((c) => ({
+          sharedRoomId: c.sharedRoomId,
+          roomFraction: c.roomFraction,
+          partnerOrderNumbers: c.partnerOrderNumbers,
+        })),
         actor.role === UserRole.AGENT ? 'agent' : 'internal',
       );
 
@@ -14939,10 +14977,10 @@ export class OrderService {
         // 「两边各 1 间」，同酒店不代表物理口径不变）。allowNonWorsening：只拦「比这次操作
         // 前更差」的情形，不能让这条新增的闸把与本次操作无关的存量超卖也拦下来。
         await lockHotelBlockPeriodsWithinTx(tx, newRoomType.hotelId, nightDates);
-        const orderForGate = await tx.order.findUnique({
-          where: { id: orderId },
-          select: { roomAssignment: true },
-        });
+        // 用 plan 算出的「解绑后」JSON（未落库）构造本单在目标酒店的 after 快照——不能再
+        // 去数据库重读 roomAssignment：解绑还没写库，读到的仍是带 sharedRoomId 的旧样子，
+        // 会被 groupSharedRoomId 判定为「仍是共享房组」而漏计成目标酒店的普通盒子。
+        const effectiveRoomAssignment = unbindPlan.nextRoomAssignment ?? order.roomAssignment ?? null;
         const otherItemsAtTarget = await tx.orderItem.findMany({
           where: { orderId, id: { not: item.id }, hotelRoomType: { hotelId: newRoomType.hotelId } },
           select: { id: true, hotelCheckIn: true, hotelCheckOut: true, metadata: true },
@@ -14954,7 +14992,7 @@ export class OrderService {
             hotelCheckOut: it.hotelCheckOut,
             roomsBilled: null,
             metadata: it.metadata,
-            order: { id: orderId, roomAssignment: orderForGate?.roomAssignment ?? null, passengers: [] },
+            order: { id: orderId, roomAssignment: effectiveRoomAssignment, passengers: [] },
           })),
           {
             id: item.id,
@@ -14962,15 +15000,33 @@ export class OrderService {
             hotelCheckOut: item.hotelCheckOut,
             roomsBilled: null,
             metadata: item.metadata,
-            order: { id: orderId, roomAssignment: orderForGate?.roomAssignment ?? null, passengers: [] },
+            order: { id: orderId, roomAssignment: effectiveRoomAssignment, passengers: [] },
           },
         ];
+        // 被解绑房间的跨单去重要不要喂进本次闸，取决于它是不是「本次被判定的目标酒店」
+        // 的房间——SharedRoom 只允许真实酒店真实房型成员，房间所属酒店 = 本行解绑前所在
+        // 酒店（oldRoomType.hotelId；isRandomPoolRow 不可能有共享成员，见闸内 hasSharedMembers
+        // 判定）。同酒店换房型时两者相同，必须把「该房间解绑后只剩其余成员」喂进去；
+        // 真正跨酒店换酒店时该房间属于**原**酒店，不属于本次判定的目标酒店，不能喂进去——
+        // assertHotelFitAfterChange 的 nextSharedRooms 不按 hotelId 过滤，喂错酒店的房间会
+        // 把它的 checkIn/checkOut 误加进目标酒店的逐晚累计。
+        const sameHotelSwap = oldRoomType != null && oldRoomType.hotelId === newRoomType.hotelId;
+        const nextSharedRooms: SharedRoomAfterState[] = sameHotelSwap
+          ? unbindPlan.changes.map((c) => ({
+              sharedRoomId: c.sharedRoomId,
+              checkIn: c.checkIn,
+              checkOut: c.checkOut,
+              activeMemberOrderIds: c.activeMemberOrderIdsAfter,
+            }))
+          : [];
         await assertHotelFitAfterChange(tx, newRoomType.hotelId, nightDates, {
           affectedOrderIds: [orderId],
           nextOrderItems: new Map([[orderId, nextItemsAtTarget]]),
-          nextSharedRooms: [],
+          nextSharedRooms,
           options: { allowNonWorsening: true },
         });
+        // 闸通过，现在才真正写库解绑——落库必须在闸判定之后（astra finding A1 的核心要求）。
+        await applyUnbindPlan(tx, unbindPlan, '换酒店解绑');
         if (needsHotelFitCheck) untrackedNights = [...nightDates];
       } else if (needsHotelFitCheck) {
         await lockHotelBlockPeriodsWithinTx(tx, newRoomType.hotelId, nightDates);
@@ -15003,6 +15059,10 @@ export class OrderService {
           // 整段查询范围内一条包房周期都没有 → 全部夜晚视为未管控（房控哲学：未配包房≠售罄）
           untrackedNights = [...nightDates];
         }
+      } else if (hasSharedMembers) {
+        // 退化情形：有共享成员但本行无有效住宿区间（理论上不可达——共享成员要求真实酒店
+        // 真实日期，见 §四），没有夜晚可过闸，直接落库解绑，与原「无条件立即解绑」行为一致。
+        await applyUnbindPlan(tx, unbindPlan, '换酒店解绑');
       }
 
       // ── 0. 减价不能把应付冲成负数（HIGH 修复）──
@@ -15637,6 +15697,7 @@ export class OrderService {
           adjustments: true,
           total: true,
           settlementLocked: true,
+          roomAssignment: true,
         },
       });
       if (!order) throw new NotFoundError('订单不存在');
@@ -15657,16 +15718,47 @@ export class OrderService {
         );
       }
 
+      // ── 锁后重读本行（HIGH 修复 · astra finding A10）────────────────────────
+      // item 及派生的 feeCny/newDescription 全算自事务外的锁前快照；拿到 Order 锁之后，
+      // 该行若已被并发操作改到别的酒店/房型/日期/份额，或已被删除，继续拿锁前快照写库
+      // 就是用旧数据覆盖别人刚提交的结果。重读并核对关键字段，任一不符 → 409。
+      const lockedItem = await tx.orderItem.findUnique({
+        where: { id: item.id },
+        select: {
+          orderId: true,
+          hotelRoomTypeId: true,
+          hotelCheckIn: true,
+          hotelCheckOut: true,
+          roomsBilled: true,
+          randomStarTier: true,
+        },
+      });
+      if (
+        !lockedItem ||
+        lockedItem.orderId !== orderId ||
+        lockedItem.hotelRoomTypeId !== item.hotelRoomTypeId ||
+        lockedItem.randomStarTier !== item.randomStarTier ||
+        (lockedItem.hotelCheckIn?.getTime() ?? null) !== (item.hotelCheckIn?.getTime() ?? null) ||
+        (lockedItem.hotelCheckOut?.getTime() ?? null) !== (item.hotelCheckOut?.getTime() ?? null) ||
+        Number(lockedItem.roomsBilled ?? 1) !== Number(item.roomsBilled ?? 1)
+      ) {
+        throw new ConflictError('该行已被并发修改（酒店/日期/份额已变化），请刷新后重试改期');
+      }
+
       // ── §八「酒店改期」：该行若有共享成员，先解绑（新旧日期不同，共享房 checkIn/checkOut
       // 必须与全体成员的住宿区间一致——挪本行日期就等于让「这间房」的身份不再成立）──
-      const unbindResult = await unbindSharedRoomMembersForItem(tx, {
-        orderId,
-        orderItemId: item.id,
-        reason: '酒店改期解绑',
-      });
-      const hasSharedMembers = unbindResult.unbound.length > 0;
+      //
+      // 两阶段（CRITICAL 修复 · astra finding A1，含「旧新区间重叠的夜晚」场景）：先只
+      // planUnbind（只读、不落库），闸判定用计划算出的 after 状态，通过后才 applyUnbindPlan——
+      // 与换酒店同一套道理，落库必须在闸之后。
+      const unbindPlan = await planUnbind(tx, { orderId, orderItemId: item.id });
+      const hasSharedMembers = unbindPlan.changes.length > 0;
       const unbindWarnings = formatUnbindWarning(
-        unbindResult.unbound,
+        unbindPlan.changes.map((c) => ({
+          sharedRoomId: c.sharedRoomId,
+          roomFraction: c.roomFraction,
+          partnerOrderNumbers: c.partnerOrderNumbers,
+        })),
         actor.role === UserRole.AGENT ? 'agent' : 'internal',
       );
 
@@ -15676,10 +15768,9 @@ export class OrderService {
         // 共享行：解绑后份额可能是 0，不能再用 roomsBilled 当占用基数（astra 评审 finding 1/2）。
         // 改用变更前后全量比较闸：本单在该酒店的全部行按新日期重算一遍，与该酒店其余存量比较。
         await lockHotelBlockPeriodsWithinTx(tx, roomType.hotelId, nightDates);
-        const orderForGate = await tx.order.findUnique({
-          where: { id: orderId },
-          select: { roomAssignment: true },
-        });
+        // 用 plan 算出的「解绑后」JSON（未落库）——解绑还没写库，直接重读 DB 会看到带
+        // sharedRoomId 的旧样子，被 groupSharedRoomId 判定成仍是共享房组而漏计成普通盒子。
+        const effectiveRoomAssignment = unbindPlan.nextRoomAssignment ?? order.roomAssignment ?? null;
         const hotelItems = await tx.orderItem.findMany({
           where: { orderId, hotelRoomType: { hotelId: roomType.hotelId } },
           select: { id: true, hotelCheckIn: true, hotelCheckOut: true, metadata: true },
@@ -15690,17 +15781,32 @@ export class OrderService {
           hotelCheckOut: it.id === item.id ? newCheckOut : it.hotelCheckOut,
           roomsBilled: null,
           metadata: it.metadata,
-          order: { id: orderId, roomAssignment: orderForGate?.roomAssignment ?? null, passengers: [] },
+          order: { id: orderId, roomAssignment: effectiveRoomAssignment, passengers: [] },
         }));
-        // 判定区间 = 旧区间 ∪ 新区间（旧区间的房要释放，新区间的房要占，两段都要过闸）。
+        // 判定区间 = 旧区间 ∪ 新区间（旧区间的房要释放，新区间的房要占，两段都要过闸；
+        // 旧新区间有重叠的夜晚同样落在 unionDates 里，一并判定，不特殊处理）。
         const unionDates = [...new Set([...buildStayNightDates(item.hotelCheckIn!, item.hotelCheckOut!), ...nightDates])].sort();
+        // 被解绑房间就是本行改期前所在的房间，改期不换酒店，房间所属酒店恒等于 roomType.hotelId
+        // ——与换酒店不同，这里不用按酒店过滤，全部解绑计划都属于本次判定的酒店。
+        const nextSharedRooms: SharedRoomAfterState[] = unbindPlan.changes.map((c) => ({
+          sharedRoomId: c.sharedRoomId,
+          checkIn: c.checkIn,
+          checkOut: c.checkOut,
+          activeMemberOrderIds: c.activeMemberOrderIdsAfter,
+        }));
         await assertHotelFitAfterChange(tx, roomType.hotelId, unionDates, {
           affectedOrderIds: [orderId],
           nextOrderItems: new Map([[orderId, nextItemsAtHotel]]),
-          nextSharedRooms: [],
+          nextSharedRooms,
           options: { allowNonWorsening: true },
         });
+        // 闸通过，现在才真正写库解绑（astra finding A1：落库必须在闸判定之后）。
+        await applyUnbindPlan(tx, unbindPlan, '酒店改期解绑');
         untrackedNights = [...nightDates];
+      } else if (hasSharedMembers) {
+        // 退化情形：有共享成员但本行没有可判定的酒店（roomType 缺失——理论上不可达，
+        // 共享成员要求真实房型），直接落库解绑，不做闸判定。
+        await applyUnbindPlan(tx, unbindPlan, '酒店改期解绑');
       } else if (roomType) {
         // 先锁目标区间的包房周期行，判定与下方写日期落库之间不留窗口，
         // 否则两笔并发改期会各自读到「还剩 1 间」的旧快照双双通过。

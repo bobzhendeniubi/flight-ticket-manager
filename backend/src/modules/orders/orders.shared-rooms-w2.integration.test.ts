@@ -242,6 +242,78 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
     expect((await getHotelNightlyRemaining(hotelNew.id, [CHECK_IN])).physicalRemaining).toEqual([1]);
   });
 
+  it('astra finding A1 反例：同酒店换房型触发解绑，只有 1 间时必须拒（先解绑再算 before 会把 1 间伪装成 2 间存量而放行）', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(1); // 该酒店整段只有 1 间包房
+    const otherRoomType = await prisma.hotelRoomType.create({
+      data: {
+        hotelId: hotel.id,
+        name: uniq('Suite'),
+        capacity: 2,
+        maxAdults: 2,
+        maxChildren: 0,
+        basePrice: new Prisma.Decimal(900),
+      },
+    });
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    // 换房型前：A/B 合住去重，该酒店物理只占 1 间（与 block=1 打平，没有余量）。
+    expect((await getHotelNightlyRemaining(hotel.id, [CHECK_IN])).physicalRemaining).toEqual([0]);
+
+    // B（0 份额那张）换到同酒店另一房型——解绑后 A 仍占 1 间（S 只剩 A），B 变普通房组
+    // 再占 1 间，该酒店真实需要 2 间，但只有 1 间包房 → 必须被拒，不能放行超卖。
+    await expect(
+      service.swapItemHotel(
+        orderB.id,
+        orderB.items[0].id,
+        { newHotelRoomTypeId: otherRoomType.id, feeCny: 0 },
+        { userId: actor.userId, role: UserRole.ADMIN },
+      ),
+    ).rejects.toThrow(/实际房间不足/);
+
+    // 闸没通过 → 解绑绝不能落库：orderB 仍是共享成员，房型也没变。
+    const stillMember = await prisma.sharedRoomMember.findMany({
+      where: { orderId: orderB.id, orderItemId: orderB.items[0].id },
+    });
+    expect(stillMember).toHaveLength(1);
+    const itemBAfter = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderB.items[0].id } });
+    expect(itemBAfter.hotelRoomTypeId).toBe(roomType.id);
+
+    // 物理占用维持原状（仍是打平的 1 间，没有被拒绝的操作污染）。
+    expect((await getHotelNightlyRemaining(hotel.id, [CHECK_IN])).physicalRemaining).toEqual([0]);
+  });
+
   it('验收反例 6：0 份额成员随拆单搬到新单——目标单建 ¥0 行承载，Σ roomsBilled 守恒', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4);

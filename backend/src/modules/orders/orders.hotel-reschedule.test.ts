@@ -252,6 +252,9 @@ function mountReschedule(
       }),
     },
     orderItem: {
+      // 锁后重读（astra finding A10）：直接转call同一个外层 mock——单测场景里锁前后数据
+      // 一致，重读应看到与调用方读到的完全相同的行，不应因为新增这道校验而误判 409。
+      findUnique: vi.fn(() => mockPrisma.orderItem.findUnique()),
       update: vi.fn(async (args: { data: Record<string, unknown> }) => {
         itemUpdates.push(args);
         return { id: 'item-1' };
