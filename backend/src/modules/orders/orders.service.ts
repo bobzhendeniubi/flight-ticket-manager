@@ -155,6 +155,7 @@ import {
 import {
   formatUnbindWarning,
   hasSharedRoomMembers,
+  unbindInconsistentSharedRoomMembers,
   unbindSharedRoomMembersForItem,
 } from '../hotel-control/shared-room-unbind.js';
 import {
@@ -5715,7 +5716,29 @@ export class OrderService {
         );
       }
 
+      // ── §八「恢复」：共享成员一致性校验——本单取消期间成员表原样保留（波 1 设计），
+      // 但共享房本身可能已被工作台解散、或与本单的酒店行日期不再一致（对方单改期等）。
+      // ACTIVE 且日期一致才保留合住关系；不一致就解绑 + 警告，不能静默把「合住」的假设
+      // 继续背下去（解绑后该行物理按普通房组 1 间计，见下方 stays 的 floor）。
+      const reconciled = await unbindInconsistentSharedRoomMembers(tx, {
+        orderId,
+        items: order.items
+          .filter(
+            (it): it is typeof it & { hotelCheckIn: Date; hotelCheckOut: Date } =>
+              (it.kind === OrderItemKind.HOTEL || it.kind === OrderItemKind.BUNDLE) &&
+              it.hotelRoomTypeId != null &&
+              it.hotelCheckIn != null &&
+              it.hotelCheckOut != null,
+          )
+          .map((it) => ({ id: it.id, hotelCheckIn: it.hotelCheckIn, hotelCheckOut: it.hotelCheckOut })),
+        reason: '恢复已取消订单时共享房状态不一致解绑',
+      });
+      const restoredUnboundItemIds = reconciled.unboundItemIds;
+      warnings.push(...formatUnbindWarning(reconciled.unbound, 'internal'));
+
       // ── 3. 酒店 / 随机档房量闸（建单同一把带行锁的事务内闸；订单仍是取消态，本单未计入占用）──
+      // 刚解绑的行：份额可能是 0，不能再当占用基数（astra 评审 finding 1/2）——
+      // 解绑后物理按普通房组 1 间计，这里用 Math.max(1, …) 把它 floor 回 1 间。
       const stays: ProspectiveHotelStay[] = order.items
         .filter(
           (it) =>
@@ -5727,7 +5750,11 @@ export class OrderService {
           hotelRoomTypeId: it.hotelRoomTypeId,
           hotelCheckIn: it.hotelCheckIn,
           hotelCheckOut: it.hotelCheckOut,
-          roomsBilled: it.roomsBilled != null ? Number(it.roomsBilled.toString()) : null,
+          roomsBilled: restoredUnboundItemIds.has(it.id)
+            ? Math.max(1, it.roomsBilled != null ? Number(it.roomsBilled.toString()) : 0)
+            : it.roomsBilled != null
+              ? Number(it.roomsBilled.toString())
+              : null,
           randomStarTier: it.randomStarTier,
         }));
       const hotelOversellCapRooms = await getHotelOversellCapRooms();
@@ -8493,6 +8520,26 @@ export class OrderService {
         await releaseSeat(item.flightScheduleId, item.flightCabin, split.sameCabin);
       }
     } else if (!wasHolding && isNewHolding) {
+      // ── §八「恢复」共用分支：驳回退款申请、管理员强制恢复都从这里重新计入占房 ──────
+      // （已取消订单恢复 restoreCancelledOrder 也会流经这里，但它在调用本方法之前已经自己
+      // 做过一遍同款一致性校验+解绑——这里对它而言是幂等重复：找不到要解绑的成员就是空转）。
+      // 共享成员表在取消/退款/软删期间原样保留（波 1 设计），但共享房本身可能已被工作台
+      // 解散、或与本单酒店行日期不再一致（对方单改期等）。ACTIVE 且日期一致才保留合住关系；
+      // 不一致就解绑（不静默把「合住」的假设继续背下去）。
+      await unbindInconsistentSharedRoomMembers(tx, {
+        orderId: id,
+        items: order.items
+          .filter(
+            (it): it is typeof it & { hotelCheckIn: Date; hotelCheckOut: Date } =>
+              (it.kind === OrderItemKind.HOTEL || it.kind === OrderItemKind.BUNDLE) &&
+              it.hotelRoomTypeId != null &&
+              it.hotelCheckIn != null &&
+              it.hotelCheckOut != null,
+          )
+          .map((it) => ({ id: it.id, hotelCheckIn: it.hotelCheckIn, hotelCheckOut: it.hotelCheckOut })),
+        reason: '恢复占座时共享房状态不一致解绑',
+      });
+
       // 驳回退款申请会同时恢复酒店/套餐占房。订单状态 CAS 已在上面完成，
       // 因而同一事务里的房控查询会把本单重新计入；任一受管控晚变成负余量就整单回滚，
       // 避免只回座位却静默恢复成超售房单。

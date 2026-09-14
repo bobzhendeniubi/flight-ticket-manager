@@ -147,6 +147,67 @@ export async function unbindSharedRoomMembersForItem(
 }
 
 /**
+ * §八「恢复」四路共用：本单某订单行若仍是共享成员，校验其共享房是否 ACTIVE 且
+ * checkIn/checkOut 与本行一致；不一致（房已被工作台解散、或与本行日期错位）就解绑。
+ * 一致则原样保留合住关系，不动。
+ *
+ * 防御式：mock tx 没有 sharedRoomMember/sharedRoom delegate 时整体跳过（不炸单测），
+ * 同 unbindSharedRoomMembersForItem。
+ */
+export async function unbindInconsistentSharedRoomMembers(
+  tx: Prisma.TransactionClient,
+  params: {
+    orderId: string;
+    items: ReadonlyArray<{ id: string; hotelCheckIn: Date; hotelCheckOut: Date }>;
+    reason: string;
+  },
+): Promise<{ unboundItemIds: Set<string>; unbound: UnboundSharedRoomInfo[] }> {
+  const memberDelegate = (
+    tx as unknown as {
+      sharedRoomMember?: { findMany: (args: unknown) => Promise<Array<{ sharedRoomId: string }>> };
+    }
+  ).sharedRoomMember;
+  const roomDelegate = (
+    tx as unknown as {
+      sharedRoom?: {
+        findUnique: (args: unknown) => Promise<{ status: string; checkIn: Date; checkOut: Date } | null>;
+      };
+    }
+  ).sharedRoom;
+  const unboundItemIds = new Set<string>();
+  const unbound: UnboundSharedRoomInfo[] = [];
+  if (!memberDelegate || !roomDelegate) return { unboundItemIds, unbound };
+
+  for (const item of params.items) {
+    const memberRooms = await memberDelegate.findMany({
+      where: { orderId: params.orderId, orderItemId: item.id },
+      select: { sharedRoomId: true },
+    });
+    for (const m of memberRooms) {
+      const room = await roomDelegate.findUnique({
+        where: { id: m.sharedRoomId },
+        select: { status: true, checkIn: true, checkOut: true },
+      });
+      const consistent =
+        room?.status === 'ACTIVE' &&
+        room.checkIn.getTime() === item.hotelCheckIn.getTime() &&
+        room.checkOut.getTime() === item.hotelCheckOut.getTime();
+      if (consistent) continue;
+      const r = await unbindSharedRoomMembersForItem(tx, {
+        orderId: params.orderId,
+        orderItemId: item.id,
+        reason: params.reason,
+      });
+      if (r.unbound.length > 0) {
+        unboundItemIds.add(item.id);
+        unbound.push(...r.unbound);
+      }
+    }
+  }
+  return { unboundItemIds, unbound };
+}
+
+/**
  * 该订单行当前是否有共享成员——只读判定，不解绑。给 §八「改单住/拼住、补单房差联动」
  * 一类必须直接拒绝（不能自动解绑）的入口用：`该行有共享成员 → 400「该行与他单合住，
  * 请先在跨单分房里解除合住」`。防御式同 unbindSharedRoomMembersForItem：mock tx 没有
