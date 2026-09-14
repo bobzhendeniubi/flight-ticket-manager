@@ -22,7 +22,7 @@ import {
 import { randomUUID } from 'node:crypto';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import type { AuditActor } from '../../lib/audit.js';
-import { writeAudit } from '../../lib/audit.js';
+import { writeAuditWithinTx } from '../../lib/audit.js';
 import { canonicalJson } from '../../lib/canonical-json.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import {
@@ -748,6 +748,18 @@ async function saveSharedRoomsInner(
     const LEGACY_ENCODED_ID_PREFIXES = ['shared:', 'plain:'];
     const isLegacyEncodedId = (id: string): boolean =>
       LEGACY_ENCODED_ID_PREFIXES.some((prefix) => id.startsWith(prefix));
+    // 审计 before 快照（astra A13）：下面的 kept 过滤器会**原地修改**旧 group 的
+    // passengerIds（`g.passengerIds = remaining`，见下）——`parseRoomGroups` 只是
+    // filter 出一个新数组，元素还是 `order.roomAssignment.roomGroups[]` 里的同一批
+    // 对象引用，原地改了就是真的改了 order.roomAssignment 本身。审计 before 如果直接
+    // 引用 order.roomAssignment，读到的会是「已经被本函数自己改过」的状态，不是这次
+    // 保存开始前的真实旧值。这里在任何原地修改发生之前先深拷贝一份，专供审计使用；
+    // 后面的业务逻辑（kept 计算、newGroupsByOrder）继续读/改 order.roomAssignment 本身，
+    // 互不干扰。
+    const beforeRoomAssignmentByOrder = new Map<string, unknown>();
+    for (const [orderId, order] of orders) {
+      beforeRoomAssignmentByOrder.set(orderId, structuredClone(order.roomAssignment));
+    }
     const newGroupsByOrder = new Map<string, Array<Record<string, unknown>>>();
     for (const [orderId, order] of orders) {
       const groups = parseRoomGroups(order.roomAssignment);
@@ -978,7 +990,10 @@ async function saveSharedRoomsInner(
       }
     }
 
-    // 每张受影响订单的审计负载（事务内收集，事务外才 writeAudit——审计不参与业务事务）。
+    // 每张受影响订单各写一条审计——用 writeAuditWithinTx，与本次业务写入同一个事务
+    // 一起成功、一起回滚（astra A13）：份额调整这类操作，审计本就该和它描述的落库
+    // 结果同生共死，不能是「业务成功了，进程在这之后崩溃或审计写失败，就再也没有
+    // 逐单审计」的 fire-and-forget（原实现在事务外才 void writeAudit(...)）。
     const orderAuditPayloads: OrderRoomAssignmentAuditPayload[] = [];
     for (const [orderId, groups] of newGroupsByOrder) {
       const order = orders.get(orderId);
@@ -1036,14 +1051,30 @@ async function saveSharedRoomsInner(
         coMemberOrderNumbersBySharedRoomId[sid] = otherOrders.map((o) => o.orderNumber);
       }
 
-      orderAuditPayloads.push({
+      const auditPayload: OrderRoomAssignmentAuditPayload = {
         orderId,
         orderNumber: order.orderNumber,
-        beforeRoomAssignment: order.roomAssignment,
+        // 用锁后读到、尚未被本函数任何逻辑原地修改过的深拷贝（astra A13），不是
+        // order.roomAssignment 本身——上面 kept 过滤器已经原地改过它的嵌套 group 对象。
+        beforeRoomAssignment: beforeRoomAssignmentByOrder.get(orderId) ?? null,
         beforeRoomsBilled: Object.fromEntries(order.items.map((it) => [it.id, it.roomsBilled])),
         afterRoomAssignment: { roomGroups: groups },
         afterRoomsBilled,
         sharedRooms: coMemberOrderNumbersBySharedRoomId,
+      };
+      orderAuditPayloads.push(auditPayload);
+      await writeAuditWithinTx(tx, {
+        actor,
+        action: 'UPDATE_ROOM_ASSIGNMENT',
+        targetType: 'ORDER',
+        targetId: auditPayload.orderId,
+        targetLabel: auditPayload.orderNumber,
+        before: { roomAssignment: auditPayload.beforeRoomAssignment, roomsBilled: auditPayload.beforeRoomsBilled },
+        after: {
+          roomAssignment: auditPayload.afterRoomAssignment,
+          roomsBilled: auditPayload.afterRoomsBilled,
+          sharedRooms: auditPayload.sharedRooms,
+        },
       });
     }
 
@@ -1057,43 +1088,26 @@ async function saveSharedRoomsInner(
       data: { resultJson: finalResult as unknown as Prisma.InputJsonValue },
     });
     // 主单：受影响订单里 id 最小的一个，给 SAVE_SHARED_ROOMS 总览审计条挂载（本条本身
-    // 只是「这次保存做了什么」的总览，逐单细节在上面 orderAuditPayloads 里）。
+    // 只是「这次保存做了什么」的总览，逐单细节在上面逐单审计里）。同样用 writeAuditWithinTx
+    // 与业务同事务提交（astra A13）。
     const primaryOrderId = [...orders.keys()].sort()[0] ?? null;
-    return { finalResult, orderAuditPayloads, primaryOrderId };
+    if (primaryOrderId) {
+      await writeAuditWithinTx(tx, {
+        actor,
+        action: 'SAVE_SHARED_ROOMS',
+        targetType: 'ORDER',
+        targetId: primaryOrderId,
+        targetLabel: `${body.hotelId} ${body.checkIn}→${body.checkOut}`,
+        after: {
+          rooms: finalResult.rooms,
+          dissolved: finalResult.dissolved,
+          requestToken: body.requestToken,
+          orderIds: orderAuditPayloads.map((p) => p.orderId),
+        },
+      });
+    }
+    return finalResult;
   }));
 
-  const { finalResult, orderAuditPayloads, primaryOrderId } = result;
-
-  for (const payload of orderAuditPayloads) {
-    void writeAudit({
-      actor,
-      action: 'UPDATE_ROOM_ASSIGNMENT',
-      targetType: 'ORDER',
-      targetId: payload.orderId,
-      targetLabel: payload.orderNumber,
-      before: { roomAssignment: payload.beforeRoomAssignment, roomsBilled: payload.beforeRoomsBilled },
-      after: {
-        roomAssignment: payload.afterRoomAssignment,
-        roomsBilled: payload.afterRoomsBilled,
-        sharedRooms: payload.sharedRooms,
-      },
-    });
-  }
-  if (primaryOrderId) {
-    void writeAudit({
-      actor,
-      action: 'SAVE_SHARED_ROOMS',
-      targetType: 'ORDER',
-      targetId: primaryOrderId,
-      targetLabel: `${body.hotelId} ${body.checkIn}→${body.checkOut}`,
-      after: {
-        rooms: finalResult.rooms,
-        dissolved: finalResult.dissolved,
-        requestToken: body.requestToken,
-        orderIds: orderAuditPayloads.map((p) => p.orderId),
-      },
-    });
-  }
-
-  return finalResult;
+  return result;
 }

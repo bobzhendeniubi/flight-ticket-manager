@@ -858,6 +858,82 @@ describe('saveSharedRooms · 真 DB E2E', () => {
     expect(overview?.targetType).toBe('ORDER'); // 不再是不贴切的 PRODUCT
     expect([orderA.id, orderB.id]).toContain(overview?.targetId);
   });
+
+  /**
+   * astra A13：kept 过滤器原地修改旧 group 的 passengerIds（一名乘客被拽进本次新建的
+   * 共享房，同房间里没被拽走的乘客留守，代码原地收窄 `g.passengerIds = remaining`）。
+   * 这个 group 对象是 order.roomAssignment.roomGroups[] 里的同一个引用，原地改了就是
+   * 真的改了 order.roomAssignment——如果审计 before 直接引用它，读到的会是「已经被
+   * 本函数自己改过」的状态，不是这次保存开始前的真实旧值（本例：before 应该还留着
+   * 两位乘客，不是被收窄成一位后的样子）。
+   */
+  it('审计 before 不受 kept 过滤器原地收窄乘客集合的影响——留着保存前的真实旧值', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    // orderA 已有一个装两位乘客的普通房组（不带 sharedRoomId，不属于本次 touched 共享房）。
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 2 });
+    const originalGroups = [
+      {
+        id: 'g-plain-both',
+        hotelName: '',
+        roomType: '',
+        passengerIds: [orderA.passengers[0].id, orderA.passengers[1].id],
+        orderItemId: orderA.items[0].id,
+        roomFraction: 1,
+      },
+    ];
+    await prisma.order.update({
+      where: { id: orderA.id },
+      data: { roomAssignment: { roomGroups: originalGroups } as unknown as Prisma.InputJsonValue },
+    });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    // 把 orderA 的第一位乘客拽进一间新的共享房——第二位乘客留守在原来的普通组，
+    // 触发 kept 过滤器的「盒子还有别人留守——原地收窄乘客集合」分支。
+    await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    await flushFireAndForgetAudit(); // 审计原先是 fire-and-forget，断言前先等它落定
+
+    const auditA = await prisma.auditLog.findFirst({
+      where: { action: 'UPDATE_ROOM_ASSIGNMENT', targetId: orderA.id },
+      orderBy: { createdAt: 'desc' },
+    });
+    expect(auditA).not.toBeNull();
+    const beforeA = auditA?.before as { roomAssignment: { roomGroups: Array<Record<string, unknown>> } };
+    const beforeGroup = beforeA.roomAssignment.roomGroups.find((g) => g.id === 'g-plain-both');
+    expect(beforeGroup).toBeDefined();
+    // 保存前的真实旧值：两位乘客都还在——不是被本函数自己原地改窄之后只剩一位的样子。
+    expect((beforeGroup!.passengerIds as string[]).sort()).toEqual(
+      [orderA.passengers[0].id, orderA.passengers[1].id].sort(),
+    );
+  });
 });
 
 /**
