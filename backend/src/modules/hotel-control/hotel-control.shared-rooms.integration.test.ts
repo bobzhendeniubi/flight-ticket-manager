@@ -1006,3 +1006,137 @@ describe('saveSharedRooms · 真 DB E2E · 已解散/跨日期房不能被保存
     ).rejects.toThrow(/同时出现在 rooms 与 dissolve/);
   });
 });
+
+/**
+ * astra A5②：readBillingFraction 曾经把「普通房组显式 0 份额」读成 1——解绑后留下的
+ * 「与他单合住、计费 0 间」的普通组，只要本单再触发一次 saveSharedRooms（哪怕是因为
+ * 同一订单的另一条行在这次请求里新加入了别的共享房），roomsBilled 就会被兜底改写成 1，
+ * 钱和物理口径就此对不上（解绑时明确承诺的「钱不动」被破坏）。
+ */
+describe('saveSharedRooms · 真 DB E2E · 普通组显式 0 份额重存不变 1（astra A5②）', () => {
+  afterEach(() => flushFireAndForgetAudit());
+
+  it('订单里一条行是已解绑的 0 份额普通组，同单另一条行本次加入新共享房 → 前者 roomsBilled 仍是 0', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await prisma.order.create({
+      data: {
+        orderNumber: uniq('ORD'),
+        status: OrderStatus.PAID,
+        subtotal: new Prisma.Decimal(2400),
+        total: new Prisma.Decimal(2400),
+        paidAmount: new Prisma.Decimal(2400),
+        contactName: 'Test User',
+        contactPhone: '13800138000',
+        items: {
+          create: [
+            {
+              kind: OrderItemKind.HOTEL,
+              description: '测试酒店 · 标准间 · 已解绑 0 份额行',
+              quantity: 2,
+              unitPrice: new Prisma.Decimal(600),
+              amount: new Prisma.Decimal(1200),
+              hotelRoomTypeId: roomType.id,
+              hotelCheckIn: new Date(`${CHECK_IN}T00:00:00.000Z`),
+              hotelCheckOut: new Date(`${CHECK_OUT}T00:00:00.000Z`),
+              roomsBilled: new Prisma.Decimal(0), // 解绑留下的计费 0 间
+            },
+            {
+              kind: OrderItemKind.HOTEL,
+              description: '测试酒店 · 标准间 · 本次要新加共享房的行',
+              quantity: 2,
+              unitPrice: new Prisma.Decimal(600),
+              amount: new Prisma.Decimal(1200),
+              hotelRoomTypeId: roomType.id,
+              hotelCheckIn: new Date(`${CHECK_IN}T00:00:00.000Z`),
+              hotelCheckOut: new Date(`${CHECK_OUT}T00:00:00.000Z`),
+              roomsBilled: null,
+            },
+          ],
+        },
+        passengers: {
+          create: [
+            {
+              fullName: 'PAX 1',
+              documentType: 'PASSPORT',
+              documentNumber: uniq('P'),
+              dateOfBirth: new Date('1990-01-01'),
+              nationality: 'CHN',
+            },
+            {
+              fullName: 'PAX 2',
+              documentType: 'PASSPORT',
+              documentNumber: uniq('P'),
+              dateOfBirth: new Date('1990-01-01'),
+              nationality: 'CHN',
+            },
+          ],
+        },
+      },
+      include: { items: true, passengers: true },
+    });
+    const unboundItemId = orderA.items[0].id;
+    const joiningItemId = orderA.items[1].id;
+
+    // 直接把「解绑后留下的普通 0 份额组」写进订单 JSON——不经由 shared-room-unbind（不在本批
+    // 修复范围内），只还原它落库后的形状：没有 sharedRoomId、roomFraction 显式为 0。
+    await prisma.order.update({
+      where: { id: orderA.id },
+      data: {
+        roomAssignment: {
+          roomGroups: [
+            {
+              id: `plain:${uniq('legacy-shared')}:${unboundItemId}`,
+              hotelName: '',
+              roomType: '',
+              passengerIds: [orderA.passengers[0].id],
+              orderItemId: unboundItemId,
+              roomFraction: 0,
+            },
+          ],
+        } as unknown as Prisma.InputJsonValue,
+      },
+    });
+
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: joiningItemId,
+                passengerIds: [orderA.passengers[1].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    const unboundItem = await prisma.orderItem.findUniqueOrThrow({ where: { id: unboundItemId } });
+    expect(Number(unboundItem.roomsBilled)).toBe(0); // 不是被兜底改回的 1
+
+    const refreshed = await prisma.order.findUniqueOrThrow({ where: { id: orderA.id } });
+    const groups = (refreshed.roomAssignment as { roomGroups: Array<Record<string, unknown>> }).roomGroups;
+    const unboundGroup = groups.find((g) => g.orderItemId === unboundItemId);
+    expect(unboundGroup).toBeDefined();
+    expect(Number(unboundGroup!.roomFraction)).toBe(0); // JSON 镜像里也仍是显式 0
+  });
+});

@@ -366,16 +366,17 @@ async function lockAffectedOrders(
 }
 
 /**
- * 房组的计费份额——**只对普通（非共享）房组**回落「缺省/非正数 → 1」（与
- * hotel-control.service 的 groupRoomFraction 同口径，旧客户端省略字段时的兼容行为）。
- * 共享房组的 0 是明确值（主单让份），不能被这条兜底吃掉，见 astra 评审 finding 1/3。
+ * 房组的计费份额——**只对缺省/非数字** 回落成整间 1（与 hotel-control.service 的
+ * groupRoomFraction 同口径，旧客户端省略字段时的兼容行为）。显式 0 一律原样保留为 0，
+ * 不分共享组还是普通组：共享组的 0 是主单让份的明确值；普通组的 0 是解绑后留下的
+ * 「与他单合住时计费 0 间」的历史值，重存时不能被这条兜底悄悄改回 1（astra A5②，
+ * 旧实现只对共享组放行显式 0，普通组的 `explicit > 0` 判断会把 0 吃成 1）。
  */
 function readBillingFraction(g: Record<string, unknown>): number {
   const n = Number(g.roomFraction);
   const explicit = Number.isFinite(n) ? n : null;
   if (groupSharedId(g) != null) return explicit ?? 0;
-  if (explicit != null && explicit > 0) return explicit;
-  return 1;
+  return explicit ?? 1;
 }
 
 /**
