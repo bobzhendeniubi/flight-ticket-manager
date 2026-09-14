@@ -2199,6 +2199,21 @@ export interface HotelControlAlerts {
     date: string; // YYYY-MM-DD（入住晚）
     sharedHalfCount: number; // 当晚拼房客总人数（触发条件是落单数 > 0）
   }>;
+  /**
+   * 共享房（跨单分房）里，唯一还占着物理房的成员全是 0 份额——即「掏钱那张单」被取消 /
+   * 退款 / 软删了，剩下白住的一方（§八「取消 / 退款 / 软删」）。物理口径仍占 1 间
+   * （不看份额，见 computeSharedRoomPhysicalByDate），但这是运营该去核对的异常状态：
+   * 白住方要不要补钱、还是该解绑腾出这间房。
+   */
+  sharedRoomOrphaned: Array<{
+    sharedRoomId: string;
+    hotelId: string;
+    hotelName: string;
+    checkIn: string; // YYYY-MM-DD
+    checkOut: string; // YYYY-MM-DD
+    /** 仍有效（占房）的成员所属单号，去重升序。 */
+    memberOrderNumbers: string[];
+  }>;
 }
 
 /** 富余提醒窗口（天）— 距今 3 天内还剩包房就该考虑退房了。*/
@@ -2360,7 +2375,71 @@ export async function getAlerts(
     });
   });
 
-  return { oversold, surplusSoon, overCapacitySchedules, sharedOddNear };
+  // ── 共享房「主单已取消」告警（§八「取消 / 退款 / 软删」）───────────────────────
+  // 窗口与销控板同一段 [today, to]：checkIn <= to 且 checkOut > today 才算与本次告警相关。
+  // 防御式：单测常用手搭的 mock client 没有 sharedRoom 时回落「本次没有共享房」，与
+  // computeSharedRoomPhysicalByDate 的兜底同哲学。
+  const sharedRoomOrphaned: HotelControlAlerts['sharedRoomOrphaned'] = [];
+  const sharedRoomDelegate = (
+    client as unknown as {
+      sharedRoom?: {
+        findMany: (args: unknown) => Promise<
+          Array<{
+            id: string;
+            hotelId: string;
+            hotel: { name: string } | null;
+            checkIn: Date;
+            checkOut: Date;
+            members: Array<{
+              roomFraction: Prisma.Decimal;
+              order: { orderNumber: string; status: OrderStatus; deletedAt: Date | null };
+            }>;
+          }>
+        >;
+      };
+    }
+  ).sharedRoom;
+  if (sharedRoomDelegate) {
+    const rooms = await sharedRoomDelegate.findMany({
+      where: {
+        status: 'ACTIVE',
+        checkIn: { lte: toDateOnly(to) },
+        checkOut: { gt: toDateOnly(today) },
+      },
+      select: {
+        id: true,
+        hotelId: true,
+        hotel: { select: { name: true } },
+        checkIn: true,
+        checkOut: true,
+        members: {
+          select: {
+            roomFraction: true,
+            order: { select: { orderNumber: true, status: true, deletedAt: true } },
+          },
+        },
+      },
+    });
+    for (const room of rooms) {
+      const activeMembers = room.members.filter(
+        (m) => m.order.deletedAt == null && COUNTED_STATUSES.includes(m.order.status),
+      );
+      // 无有效成员 = 该房这段已不计物理占用，不是「白住」异常，跳过。
+      if (activeMembers.length === 0) continue;
+      const allZero = activeMembers.every((m) => Number(m.roomFraction.toString()) === 0);
+      if (!allZero) continue;
+      sharedRoomOrphaned.push({
+        sharedRoomId: room.id,
+        hotelId: room.hotelId,
+        hotelName: room.hotel?.name ?? '',
+        checkIn: fmtDateOnly(room.checkIn),
+        checkOut: fmtDateOnly(room.checkOut),
+        memberOrderNumbers: [...new Set(activeMembers.map((m) => m.order.orderNumber))].sort(),
+      });
+    }
+  }
+
+  return { oversold, surplusSoon, overCapacitySchedules, sharedOddNear, sharedRoomOrphaned };
 }
 
 // ── 近期用房变更（读审计流，不新做事件系统）────────────────────────────────
