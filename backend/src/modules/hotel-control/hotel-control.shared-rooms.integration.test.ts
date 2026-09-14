@@ -1254,3 +1254,99 @@ describe('saveSharedRooms · 真 DB E2E · 普通组显式 0 份额重存不变 
     expect(Number(unboundGroup!.roomFraction)).toBe(0); // JSON 镜像里也仍是显式 0
   });
 });
+
+/**
+ * astra B7：工作台重存会清除本单房组备注。带 touched 共享键的旧组整体重建时，它在
+ * 订单 JSON 里自己的 notes（单单编辑器维护的本地备注）没有被搬进重建后的对象——运营
+ * 在单单分房编辑器里给某个房组写的备注，只要房控页跨单分房工作台对同一间房再保存一次
+ * （哪怕只是加了一位新成员，不碰原有成员），这条备注就会消失。
+ */
+describe('saveSharedRooms · 真 DB E2E · 工作台重存保留本单房组备注（astra B7）', () => {
+  afterEach(() => flushFireAndForgetAudit());
+
+  it('更新既有共享房（新增一名成员）→ 原成员那侧订单 JSON 里的 notes 原样保留', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    const created = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const sharedRoomId = created.rooms[0].sharedRoomId;
+
+    // 运营在单单分房编辑器里给 orderA 的这个共享房组写了一条本地备注（走 PUT
+    // /orders/:id/room-assignment，只改 notes，参见 orders.routes.ts reconcile 逻辑）。
+    const beforeNotesSave = await prisma.order.findUniqueOrThrow({ where: { id: orderA.id } });
+    const beforeGroups = (beforeNotesSave.roomAssignment as { roomGroups: Array<Record<string, unknown>> })
+      .roomGroups;
+    await prisma.order.update({
+      where: { id: orderA.id },
+      data: {
+        roomAssignment: {
+          roomGroups: beforeGroups.map((g) => ({ ...g, notes: 'A 单本地备注：靠窗' })),
+        } as unknown as Prisma.InputJsonValue,
+      },
+    });
+
+    // 房控工作台对同一间房再保存一次——新增 orderB 一名成员，orderA 那组的其它字段不变。
+    const updated = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        expectedVersions: { [sharedRoomId]: created.rooms[0].version },
+        rooms: [
+          {
+            sharedRoomId,
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    expect(updated.rooms[0].sharedRoomId).toBe(sharedRoomId);
+
+    const afterA = await prisma.order.findUniqueOrThrow({ where: { id: orderA.id } });
+    const afterGroups = (afterA.roomAssignment as { roomGroups: Array<Record<string, unknown>> }).roomGroups;
+    const afterGroup = afterGroups.find((g) => g.orderItemId === orderA.items[0].id);
+    expect(afterGroup).toBeDefined();
+    expect(afterGroup!.notes).toBe('A 单本地备注：靠窗'); // 没有被工作台重存清掉
+  });
+});

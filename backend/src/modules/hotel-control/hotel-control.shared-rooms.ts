@@ -657,13 +657,28 @@ async function saveSharedRoomsInner(
     // dissolveSet 复用函数顶部（pre-tx）算好的那份，不在这里重新 new Set——两处必须是
     // 同一个集合，否则上面 CAS 循环判过的「是否在本次 dissolve 里」和这里实际解散的
     // 集合就可能对不上（虽然目前两处输入相同不会真出岔子，但同一份数据只算一次更稳）。
+    // 本单房组备注（astra B7）：带 touched 共享键的旧组整体重建时，它在这张订单 JSON 里
+    // 自己的 notes（单单编辑器维护的本地备注，与 SharedRoom.notes 是两回事，见文件头
+    // 「待拍板口径」）会跟着旧对象一起被丢弃；工作台保存的 room.groups 里又没有承载
+    // 这个字段的位置（Σ份额=1 之类的服务端校验只关心 orderId/orderItemId/passengerIds/
+    // roomFraction）。保存前先把这些旧 notes 摘出来，按 (sharedRoomId, orderId,
+    // orderItemId) 存好，重建时原样写回去——工作台端点本就没有输入这个字段的地方，
+    // 只能是「保留」，不存在「省略=不动、空串=清空」的二义性（那是单单编辑器端点的语义，
+    // 那边已经用 `g.notes ?? old?.notes` 正确处理，见 orders.routes.ts）。
+    const preservedGroupNotes = new Map<string, string>();
     const newGroupsByOrder = new Map<string, Array<Record<string, unknown>>>();
     for (const [orderId, order] of orders) {
       const groups = parseRoomGroups(order.roomAssignment);
       // 保留：既不带 touched 共享键、也不含本次被吸收乘客的房组
       const kept = groups.filter((g) => {
         const sid = groupSharedId(g);
-        if (sid != null && touchedSharedRoomIds.has(sid)) return false; // 本次改动的共享房，整体重建
+        if (sid != null && touchedSharedRoomIds.has(sid)) {
+          const itemId = groupOrderItemId(g);
+          if (itemId != null && typeof g.notes === 'string' && g.notes.length > 0) {
+            preservedGroupNotes.set(`${sid}:${orderId}:${itemId}`, g.notes);
+          }
+          return false; // 本次改动的共享房，整体重建
+        }
         const ids = Array.isArray(g.passengerIds)
           ? (g.passengerIds as unknown[]).filter((v): v is string => typeof v === 'string')
           : [];
@@ -699,6 +714,7 @@ async function saveSharedRoomsInner(
       }
       for (const entry of byOrderItem.values()) {
         const arr = newGroupsByOrder.get(entry.orderId) ?? [];
+        const preservedNotes = preservedGroupNotes.get(`${roomId}:${entry.orderId}:${entry.orderItemId}`);
         arr.push({
           id: `plain:${roomId}:${entry.orderItemId}`,
           hotelName: '',
@@ -706,6 +722,7 @@ async function saveSharedRoomsInner(
           passengerIds: entry.passengerIds,
           orderItemId: entry.orderItemId,
           roomFraction: entry.fraction,
+          ...(preservedNotes != null ? { notes: preservedNotes } : {}),
         });
         newGroupsByOrder.set(entry.orderId, arr);
       }
@@ -730,6 +747,10 @@ async function saveSharedRoomsInner(
       const sharedRoomId = resolvedRoomIds[roomIndex];
       for (const g of room.groups) {
         const arr = newGroupsByOrder.get(g.orderId) ?? [];
+        // 更新既有房（room.sharedRoomId 有值）时，sharedRoomId 与旧组相同，按
+        // (sharedRoomId, orderId, orderItemId) 能查到旧 notes 原样带回来；新建房
+        // 的 sharedRoomId 是刚生成的随机 id，查不到旧记录也就没有可保留的 notes。
+        const preservedNotes = preservedGroupNotes.get(`${sharedRoomId}:${g.orderId}:${g.orderItemId}`);
         arr.push({
           id: `shared:${sharedRoomId}:${g.orderItemId}`,
           hotelName: '',
@@ -738,6 +759,7 @@ async function saveSharedRoomsInner(
           orderItemId: g.orderItemId,
           roomFraction: g.roomFraction,
           sharedRoomId,
+          ...(preservedNotes != null ? { notes: preservedNotes } : {}),
         });
         newGroupsByOrder.set(g.orderId, arr);
       }
