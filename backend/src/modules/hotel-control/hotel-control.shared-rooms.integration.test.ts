@@ -8,11 +8,17 @@
  *   8. 同 requestToken 重放同结果，改指纹 409；expectedVersions 过期 409
  *   7（简化版，两路交错）：跨单保存 vs 单单保存并发，断言无死锁、结果可解释
  *
+ * 另覆盖同批审过后追加的三个修复点：
+ *   - 幂等占位在失败路径上删干净：第一次 400 之后，同 token 重试必须真正重新跑一遍
+ *     （而不是把失败前留下的空占位当成功回放）。
+ *   - roomsBilled 回写覆盖「变更前有房组、变更后没有房组」的行（显式写 0），不留旧值。
+ *   - 每张涉及订单各写一条 UPDATE_ROOM_ASSIGNMENT 审计；SAVE_SHARED_ROOMS 总览条 targetType=ORDER。
+ *
  * 跑：
  *   1. docker compose -f docker-compose.test.yml up -d（或本机 Postgres 指到 TEST_DATABASE_URL）
  *   2. npm run test:integration
  */
-import { describe, it, expect } from 'vitest';
+import { describe, it, expect, afterEach } from 'vitest';
 import { OrderItemKind, OrderStatus, Prisma, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { saveSharedRooms } from './hotel-control.shared-rooms.js';
@@ -116,7 +122,21 @@ async function createOrderWithPassengers(opts: {
 
 const requestToken = () => uniq('req');
 
+/**
+ * saveSharedRooms 的审计写入是 fire-and-forget（`void writeAudit(...)`，不参与事务，见
+ * lib/audit.ts 的设计取舍），调用方拿到返回值时审计的 INSERT 可能还没提交。真库集成测试
+ * 断言审计内容、或紧跟着触发下一个测试的 TRUNCATE（会与还在飞行中的 INSERT 抢表锁，
+ * 偶发 40P01 死锁）时都要先让它们落定——给个短暂 sleep，比反复读表轮询更简单可靠。
+ */
+function flushFireAndForgetAudit(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 80));
+}
+
 describe('saveSharedRooms · 真 DB E2E', () => {
+  // 每个用例都可能触发 saveSharedRooms 内部的 fire-and-forget writeAudit；下一个用例的
+  // beforeEach（全表 TRUNCATE）紧跟着就来，给飞行中的 INSERT 一点时间落定，避免偶发死锁。
+  afterEach(() => flushFireAndForgetAudit());
+
   it('验收反例 1：三人合住 1+0（两单各出 1 位客人），房控物理只占 1 间，两单 roomsBilled 分别 1/0', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(1); // 只包 1 间——1+0 必须能放进去，1+1 装不下
@@ -649,5 +669,78 @@ describe('saveSharedRooms · 真 DB E2E', () => {
     const reloadedY = await prisma.orderItem.findUniqueOrThrow({ where: { id: itemY.id } });
     expect(Number(reloadedX.roomsBilled)).toBe(0); // 显式清零——不是残留的旧值 1，也不是 null
     expect(Number(reloadedY.roomsBilled)).toBe(1);
+  });
+
+  it('审计：每张涉及订单各写一条 UPDATE_ROOM_ASSIGNMENT（含 before/after roomsBilled 与同房单号）；总览条 targetType=ORDER', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    const result = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const sharedRoomId = result.rooms[0].sharedRoomId;
+    await flushFireAndForgetAudit(); // 审计是 fire-and-forget，断言前先等它落定
+
+    const auditA = await prisma.auditLog.findFirst({
+      where: { action: 'UPDATE_ROOM_ASSIGNMENT', targetId: orderA.id },
+      orderBy: { createdAt: 'desc' },
+    });
+    expect(auditA).not.toBeNull();
+    expect(auditA?.targetType).toBe('ORDER');
+    expect(auditA?.targetLabel).toBe(orderA.orderNumber);
+    const beforeA = auditA?.before as { roomAssignment: unknown; roomsBilled: Record<string, number | null> };
+    const afterA = auditA?.after as {
+      roomAssignment: unknown;
+      roomsBilled: Record<string, number>;
+      sharedRooms: Record<string, string[]>;
+    };
+    expect(beforeA.roomAssignment).toBeNull(); // 变更前本就没分过房
+    expect(afterA.roomsBilled[orderA.items[0].id]).toBe(1);
+    expect(afterA.sharedRooms[sharedRoomId]).toEqual([orderB.orderNumber]); // 同房其它订单号
+
+    const auditB = await prisma.auditLog.findFirst({
+      where: { action: 'UPDATE_ROOM_ASSIGNMENT', targetId: orderB.id },
+      orderBy: { createdAt: 'desc' },
+    });
+    expect(auditB).not.toBeNull();
+    const afterB = auditB?.after as { roomsBilled: Record<string, number>; sharedRooms: Record<string, string[]> };
+    expect(afterB.roomsBilled[orderB.items[0].id]).toBe(0);
+    expect(afterB.sharedRooms[sharedRoomId]).toEqual([orderA.orderNumber]);
+
+    const overview = await prisma.auditLog.findFirst({
+      where: { action: 'SAVE_SHARED_ROOMS' },
+      orderBy: { createdAt: 'desc' },
+    });
+    expect(overview).not.toBeNull();
+    expect(overview?.targetType).toBe('ORDER'); // 不再是不贴切的 PRODUCT
+    expect([orderA.id, orderB.id]).toContain(overview?.targetId);
   });
 });
