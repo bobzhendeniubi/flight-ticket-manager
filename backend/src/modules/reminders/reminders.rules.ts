@@ -326,6 +326,182 @@ function unassignedRoomPassengers(
   return passengers.filter((p) => p.documentNumber !== 'N/A' && !assignedIds.has(p.id));
 }
 
+/**
+ * 自动核销的留痕文案——reconcileRoomAssignmentReminders（B8）据此区分「条件自动解除」
+ * 与运营手工点掉（手工核销走 reminders.routes.ts 的 PATCH，resolvedNote 是运营自己填的
+ * 文本，几乎不可能恰好撞上这句）：只有带这句备注的已核销提醒才允许在条件复发时被重开，
+ * 人工核销/跳过的一律尊重运营判断，不重开。
+ */
+export const AUTO_RESOLVED_NOTE = '条件已解除';
+
+/**
+ * B8 上线日期：跨单分房「未分房/部分未分房」提醒状态机（重开 + 旧日期键清理）只对该日期
+ * （含）之后入住的单生效——部署当天如果对存量订单一视同仁地跑这套状态机，会把此前一直
+ * 卡在「PARTIAL 孤儿开着关不掉」或「曾经关过、现在该重开却重不开」状态的存量单一次性
+ * 全部翻出来，运营会看到一堆突然冒出来的待办。之前入住的单维持旧行为（仍然只由
+ * buildOrderCandidates + 下面的通用 resolvedRuleKeys 兜底关闭「已全部分好」的情形，
+ * 不做重开、不清理旧日期孤儿键）。
+ *
+ * 可用 ROOM_REMINDER_STATE_MACHINE_SINCE 环境变量覆盖（YYYY-MM-DD），部署前按实际情况调；
+ * 缺省值只是代码里的占位上线日，**部署前必须按当时日期重新确认**（见本批修复报告）。
+ */
+export const ROOM_REMINDER_STATE_MACHINE_SINCE =
+  process.env.ROOM_REMINDER_STATE_MACHINE_SINCE?.trim() || '2026-09-15';
+
+interface RoomAssignmentState {
+  key: string;
+  rule: 'ROOM_UNASSIGNED' | 'ROOM_PARTIALLY_UNASSIGNED';
+  title: string;
+  body: string;
+  priority: ReminderPriority;
+  /** 该状态对应的最早入住日（YYYY-MM-DD）——reconcileRoomAssignmentReminders 用它判定
+   * 是否落在 B8 状态机的上线窗口内，以及识别「入住日期变了、旧键该清」。*/
+  firstCheckIn: string;
+}
+
+/**
+ * 算出某订单「现在应该开哪个 ROOMASSIGN 提醒」（规则 8 与 B8 状态机共用同一份判定，见
+ * buildOrderCandidates 与 reconcileRoomAssignmentReminders 的调用点，两处不允许各写一遍）。
+ * roomAssignment === undefined（老调用方没取这个字段）或不在 3 天窗口内、或已全部分好
+ * → 返回 null（这单当前不该有任何 ROOMASSIGN 提醒）。
+ */
+function computeRoomAssignmentState(order: RuleOrder, today: string): RoomAssignmentState | null {
+  if (order.roomAssignment === undefined || !DEPARTURE_SOON_STATUSES.includes(order.status)) {
+    return null;
+  }
+  const checkIns = order.items
+    .filter((item): item is DepartureSourceItem & { hotelCheckIn: Date } => Boolean(item.hotelCheckIn))
+    .map((item) => item.hotelCheckIn.getTime());
+  if (checkIns.length === 0) return null;
+  const firstCheckIn = utcDateStr(new Date(Math.min(...checkIns)));
+  const daysToCheckIn = diffDays(today, firstCheckIn);
+  if (daysToCheckIn < 0 || daysToCheckIn > ROOM_UNASSIGNED_WINDOW_DAYS) return null;
+  const priority =
+    daysToCheckIn <= ROOM_UNASSIGNED_CRITICAL_DAYS ? ReminderPriority.CRITICAL : ReminderPriority.HIGH;
+  if (!hasRoomAssignment(order.roomAssignment)) {
+    return {
+      key: `ROOMASSIGN:${order.id}:${firstCheckIn}`,
+      rule: 'ROOM_UNASSIGNED',
+      title: `【临近入住未分房】${order.orderNumber} ${firstCheckIn}入住`,
+      body: `最早入住 ${firstCheckIn}，该单还没进分房表。请房控完成分房（随机档单需先落位到具体酒店）。`,
+      priority,
+      firstCheckIn,
+    };
+  }
+  const unassigned = unassignedRoomPassengers(order.roomAssignment, order.passengers);
+  if (unassigned.length === 0) return null;
+  return {
+    key: `ROOMASSIGN:${order.id}:${firstCheckIn}:PARTIAL`,
+    rule: 'ROOM_PARTIALLY_UNASSIGNED',
+    title: `【临近入住部分未分房】${order.orderNumber} ${firstCheckIn}入住`,
+    body: `最早入住 ${firstCheckIn}，该单已进分房表，但仍有 ${unassigned.length} 位出行人不在任何房组/共享房：${unassigned.map((p) => p.fullName).join('，')}。请房控补齐分房。`,
+    priority,
+    firstCheckIn,
+  };
+}
+
+/**
+ * B8：跨单分房「未分房/部分未分房」提醒的小状态机——按订单同步当前状态，处理规则原有的
+ * 通用创建/解除流程处理不了的三类情形：
+ *   1. 已有 PARTIAL 提醒，分房被整组清空 → 状态切成「整单未分房」，旧 PARTIAL 应该关闭
+ *      （通用解除只在"完全没有遗漏的人"时才关 PARTIAL，清空后 unassignedRoomPassengers
+ *      返回全部乘客，长度必然 > 0，永远关不掉——本函数直接按"当前该开的 key 是否与
+ *      这条一致"判断，不一致就关，不管是哪种不一致）。
+ *   2. 提醒曾经因条件解除被自动核销，条件后来又复发（如已分好房又被移出一人）——
+ *      ruleKey 建库唯一索引，"没有就建"的通用流程对已核销的同 key 无能为力（会被
+ *      skipDuplicates 悄悄吞掉，运营完全看不到），本函数识别自动核销（AUTO_RESOLVED_NOTE）
+ *      并显式重开；人工核销/跳过的尊重运营判断，不重开。
+ *   3. 入住日期改了，ruleKey 里的旧日期字段成孤儿，永远挂在待办列表——本函数用
+ *      ruleKey 前缀（不含日期）查出该订单全部 ROOMASSIGN 提醒，日期对不上当前值的关掉。
+ *
+ * 上线日期闸见 ROOM_REMINDER_STATE_MACHINE_SINCE：只对 firstCheckIn 落在窗口内的单跑，
+ * 不对现有 orders 逐单强制打开该状态机——早于上线日的单维持 generateRuleReminders 主流程
+ * 已有的行为（新建 + 通用解除），不重开、不清理旧日期键。
+ */
+async function reconcileRoomAssignmentReminders(
+  prisma: PrismaClient,
+  orders: readonly RuleOrder[],
+  today: string,
+  now: Date,
+): Promise<void> {
+  const ordersInScope = orders.filter((order) => order.roomAssignment !== undefined);
+  if (ordersInScope.length === 0) return;
+
+  const existing = await prisma.operationalReminder.findMany({
+    where: { ruleKey: { startsWith: 'ROOMASSIGN:' } },
+    select: { id: true, ruleKey: true, status: true, resolvedNote: true },
+  });
+  const existingByOrder = new Map<string, typeof existing>();
+  for (const row of existing) {
+    // ruleKey 形如 `ROOMASSIGN:{orderId}:{date}` 或 `...:PARTIAL`；orderId 在两个冒号之间。
+    const parts = row.ruleKey?.split(':') ?? [];
+    const orderId = parts[1];
+    if (!orderId) continue;
+    const list = existingByOrder.get(orderId) ?? [];
+    list.push(row);
+    existingByOrder.set(orderId, list);
+  }
+
+  const toClose: string[] = []; // reminder id
+  const toReopen: Array<{ id: string; state: RoomAssignmentState }> = [];
+  const toRefresh: Array<{ id: string; state: RoomAssignmentState }> = [];
+
+  for (const order of ordersInScope) {
+    const state = computeRoomAssignmentState(order, today);
+    // 上线日期闸：只有「当前该开的状态」落在窗口内才跑状态机；state 为 null（已全部分好/
+    // 不在 3 天窗口）时无法判定 firstCheckIn，退回只做"存在即关闭"的兜底（下面的孤儿清理
+    // 分支覆盖这种情况，不受日期闸限制——全部分好/超出窗口不该有任何 ROOMASSIGN 提醒，
+    // 关掉旧的不算「一次性翻出一大批新待办」，纯粹是清理，风险与通用解除流程等价）。
+    const inScope = state ? state.firstCheckIn >= ROOM_REMINDER_STATE_MACHINE_SINCE : true;
+
+    const rows = existingByOrder.get(order.id) ?? [];
+    for (const row of rows) {
+      const isDesired = state != null && row.ruleKey === state.key;
+      if (isDesired) continue; // 这条就是当前该开的那条，下面单独处理是否需要重开/刷新
+      if (!inScope) continue; // 不在窗口内的孤儿键维持旧行为，不主动清理
+      if (row.status === ReminderStatus.OPEN || row.status === ReminderStatus.IN_PROGRESS) {
+        toClose.push(row.id);
+      }
+    }
+
+    if (!state || !inScope) continue;
+    const matched = rows.find((row) => row.ruleKey === state.key);
+    if (!matched) continue; // 完全没有 → 交给通用创建流程去建，本函数不重复建
+    if (matched.status === ReminderStatus.OPEN || matched.status === ReminderStatus.IN_PROGRESS) {
+      toRefresh.push({ id: matched.id, state });
+    } else if (matched.resolvedNote === AUTO_RESOLVED_NOTE) {
+      toReopen.push({ id: matched.id, state });
+    }
+    // else：人工核销/跳过（resolvedNote 是别的内容）——尊重运营判断，不重开。
+  }
+
+  if (toClose.length > 0) {
+    await prisma.operationalReminder.updateMany({
+      where: { id: { in: toClose } },
+      data: { status: ReminderStatus.DONE, resolvedAt: now, resolvedNote: AUTO_RESOLVED_NOTE },
+    });
+  }
+  for (const { id, state } of toReopen) {
+    await prisma.operationalReminder.update({
+      where: { id },
+      data: {
+        status: ReminderStatus.OPEN,
+        resolvedAt: null,
+        resolvedNote: null,
+        title: state.title,
+        body: state.body,
+        priority: state.priority,
+      },
+    });
+  }
+  for (const { id, state } of toRefresh) {
+    await prisma.operationalReminder.update({
+      where: { id },
+      data: { title: state.title, body: state.body, priority: state.priority },
+    });
+  }
+}
+
 export interface RuleVisaTask {
   taskId: string;
   orderId: string;
@@ -444,48 +620,22 @@ export function buildOrderCandidates(order: RuleOrder, today: string): ReminderC
   }
 
   // 8) 分房提醒：有酒店入住、最早入住日 3 天内（含今天）、分房表还没分人。
-  //    roomAssignment === undefined 表示调用方没取这个字段（老口径）→ 不判，同规则 6 哲学。
   //    跨单分房落地后，「已分房」不再是全有全无：一张单可能只分了一部分人（其余人还没
   //    进任何房组/共享房）。两条子规则共用同一个窗口与 CRITICAL 判定，key 用后缀区分，
   //    互不覆盖——整单未分房时只报 ROOM_UNASSIGNED，不会同时又报一条部分未分房。
-  if (order.roomAssignment !== undefined && DEPARTURE_SOON_STATUSES.includes(order.status)) {
-    const checkIns = order.items
-      .filter((item): item is DepartureSourceItem & { hotelCheckIn: Date } =>
-        Boolean(item.hotelCheckIn),
-      )
-      .map((item) => item.hotelCheckIn.getTime());
-    if (checkIns.length > 0) {
-      const firstCheckIn = utcDateStr(new Date(Math.min(...checkIns)));
-      const daysToCheckIn = diffDays(today, firstCheckIn);
-      if (daysToCheckIn >= 0 && daysToCheckIn <= ROOM_UNASSIGNED_WINDOW_DAYS) {
-        const priority =
-          daysToCheckIn <= ROOM_UNASSIGNED_CRITICAL_DAYS ? ReminderPriority.CRITICAL : ReminderPriority.HIGH;
-        if (!hasRoomAssignment(order.roomAssignment)) {
-          out.push({
-            rule: 'ROOM_UNASSIGNED',
-            ruleKey: `ROOMASSIGN:${order.id}:${firstCheckIn}`,
-            orderId: order.id,
-            title: `【临近入住未分房】${order.orderNumber} ${firstCheckIn}入住`,
-            body: `最早入住 ${firstCheckIn}，该单还没进分房表。请房控完成分房（随机档单需先落位到具体酒店）。`,
-            priority,
-            dueAt: today,
-          });
-        } else {
-          const unassigned = unassignedRoomPassengers(order.roomAssignment, order.passengers);
-          if (unassigned.length > 0) {
-            out.push({
-              rule: 'ROOM_PARTIALLY_UNASSIGNED',
-              ruleKey: `ROOMASSIGN:${order.id}:${firstCheckIn}:PARTIAL`,
-              orderId: order.id,
-              title: `【临近入住部分未分房】${order.orderNumber} ${firstCheckIn}入住`,
-              body: `最早入住 ${firstCheckIn}，该单已进分房表，但仍有 ${unassigned.length} 位出行人不在任何房组/共享房：${unassigned.map((p) => p.fullName).join('，')}。请房控补齐分房。`,
-              priority,
-              dueAt: today,
-            });
-          }
-        }
-      }
-    }
+  //    判定逻辑抽到 computeRoomAssignmentState（B8）：reconcileRoomAssignmentReminders 的
+  //    状态机复用同一份口径，两处不允许各写一遍、日后改动只同步一处。
+  const roomState = computeRoomAssignmentState(order, today);
+  if (roomState) {
+    out.push({
+      rule: roomState.rule,
+      ruleKey: roomState.key,
+      orderId: order.id,
+      title: roomState.title,
+      body: roomState.body,
+      priority: roomState.priority,
+      dueAt: today,
+    });
   }
 
   return out;
@@ -826,7 +976,7 @@ async function closeResolvedRuleReminders(
   if (staleOpen.length === 0) return;
   await prisma.operationalReminder.updateMany({
     where: { id: { in: staleOpen.map((r) => r.id) } },
-    data: { status: ReminderStatus.DONE, resolvedAt: now, resolvedNote: '条件已解除' },
+    data: { status: ReminderStatus.DONE, resolvedAt: now, resolvedNote: AUTO_RESOLVED_NOTE },
   });
 }
 
@@ -1213,8 +1363,15 @@ export async function generateRuleReminders(
         const firstCheckIn = utcDateStr(new Date(Math.min(...checkIns)));
         if (hasRoomAssignment(order.roomAssignment)) {
           resolvedRuleKeys.push(`ROOMASSIGN:${order.id}:${firstCheckIn}`);
-        }
-        if (unassignedRoomPassengers(order.roomAssignment, order.passengers).length === 0) {
+          if (unassignedRoomPassengers(order.roomAssignment, order.passengers).length === 0) {
+            resolvedRuleKeys.push(`ROOMASSIGN:${order.id}:${firstCheckIn}:PARTIAL`);
+          }
+        } else {
+          // B8：分房被整组清空（从「部分未分房」退回「压根没有分房表」）——旧的 PARTIAL
+          // 语义不再成立（不是"有分房表但缺人"，是"没有分房表"），必须一并关闭，交给新生成
+          // 的 ROOM_UNASSIGNED 接手，否则 unassignedRoomPassengers 在没有分房表时会把
+          // 全部乘客都算作"未分房"，长度恒 > 0，PARTIAL 键永远进不了这个 resolvedRuleKeys、
+          // 永远关不掉（astra 评审 B8 finding）。
           resolvedRuleKeys.push(`ROOMASSIGN:${order.id}:${firstCheckIn}:PARTIAL`);
         }
       }
@@ -1230,6 +1387,10 @@ export async function generateRuleReminders(
     }
   }
   await closeResolvedRuleReminders(prisma, resolvedRuleKeys, now);
+  // B8：跨单分房未分房/部分未分房状态机——重开条件复发的自动核销提醒、清理入住日期改动
+  // 留下的孤儿键，见函数顶部 JSDoc。只对 orders（本轮已查出的订单，带 roomAssignment 字段）
+  // 里落在上线窗口内的单生效。
+  await reconcileRoomAssignmentReminders(prisma, orders, today, now);
 
   if (unique.length === 0) return { created: 0, skipped: 0, byRule: {} };
 
