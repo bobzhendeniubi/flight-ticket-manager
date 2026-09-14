@@ -654,10 +654,11 @@ function OccupantsDrawer({
           orderId={swapTarget.orderId}
           locateHint={{ hotelId, checkIn: swapTarget.checkIn, checkOut: swapTarget.checkOut, randomStarTier }}
           onClose={() => setSwapTarget(null)}
-          onSwapped={() => {
+          onSwapped={(_updated, warnings) => {
             setSwapTarget(null);
             loadOccupants(); // 抽屉：刷新占房列表
             onChanged?.(); // 板：通知父级重拉销控板
+            if (warnings && warnings.length > 0) alert(warnings.join('\n'));
           }}
         />
       )}

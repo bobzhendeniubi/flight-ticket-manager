@@ -5351,7 +5351,8 @@ export const api = {
     newScheduleId: string,
     opts: { allowDepartedTarget?: boolean; allowFlownSource?: boolean } = {},
   ) =>
-    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/correct-flight`, {
+    // warnings：见 swapItemHotel 同款注释（后端早已回传，B5 补前端类型 + 展示）。
+    apiFetch<{ order: OrderSummary; warnings: string[] }>(`/orders/${orderId}/correct-flight`, {
       method: 'POST',
       token,
       body: {
@@ -5379,7 +5380,17 @@ export const api = {
     apiFetch<{
       succeeded: number;
       failed: number;
-      results: Array<{ id: string; orderNumber?: string; ok: boolean; error?: string; notice?: string }>;
+      // warnings：逐单跨单分房自动解绑等提示（B5）。当前后端 /orders/batch-reschedule 路由
+      // 还把整个 audit（含 warnings）剥掉再回包（另一路修复批在补，字段名对齐 warnings）——
+      // 这里先把类型声明为可选，字段没到时前端只是不展示，不报错。
+      results: Array<{
+        id: string;
+        orderNumber?: string;
+        ok: boolean;
+        error?: string;
+        notice?: string;
+        warnings?: string[];
+      }>;
     }>('/orders/batch-reschedule', {
       method: 'POST',
       token,
@@ -5676,7 +5687,9 @@ export const api = {
       designatedHotelStarMismatchReason?: string;
     },
   ) =>
-    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/items/${itemId}/hotel`, {
+    // warnings：跨单分房自动解绑等售后副作用的按角色提示（后端 orders.routes.ts 已回
+    // { order, warnings: audit.warnings }，此前前端类型没声明，UI 也没展示——B5）。
+    apiFetch<{ order: OrderSummary; warnings: string[] }>(`/orders/${orderId}/items/${itemId}/hotel`, {
       method: 'PATCH',
       token,
       body,
@@ -5751,11 +5764,11 @@ export const api = {
       note?: string;
     },
   ) =>
-    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/items/${itemId}/hotel-reschedule`, {
-      method: 'PATCH',
-      token,
-      body,
-    }),
+    // warnings：见 swapItemHotel 同款注释（后端早已回传，B5 补前端类型 + 展示）。
+    apiFetch<{ order: OrderSummary; warnings: string[] }>(
+      `/orders/${orderId}/items/${itemId}/hotel-reschedule`,
+      { method: 'PATCH', token, body },
+    ),
 
   // 售后改单：套餐改档（ADMIN/STAFF）。把本单的套餐行换绑到另一张套餐（「档次」在数据模型上
   // 就是另一条 Bundle 记录），按新档重新计价，差额落一条调价行并写审计。
