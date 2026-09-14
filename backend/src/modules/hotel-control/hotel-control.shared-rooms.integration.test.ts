@@ -21,7 +21,7 @@
 import { describe, it, expect, afterEach } from 'vitest';
 import { OrderItemKind, OrderStatus, Prisma, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
-import { saveSharedRooms } from './hotel-control.shared-rooms.js';
+import { saveSharedRooms, getSharedRoomWorkbench } from './hotel-control.shared-rooms.js';
 import { getHotelNightlyRemaining } from './hotel-control.service.js';
 import { serializeRoomGroupsFor } from '../orders/room-group-dto.js';
 
@@ -1414,5 +1414,192 @@ describe('saveSharedRooms · 真 DB E2E · 房组 id 不泄露 sharedRoomId（as
     expect(JSON.stringify(agentView)).not.toContain(sharedRoomId);
     const agentGroup = agentView.roomGroups.find((g) => g.id === groupA!.id);
     expect(agentGroup?.isShared).toBe(true); // 布尔标记仍然正确，只是不带具体是哪间
+  });
+});
+
+/**
+ * astra B6：一间共享房含取消/软删成员，会阻断工作台保存其它房间。
+ *   - 读模型（getSharedRoomWorkbench）给每个成员带 orderStatus / isActive，前端据此
+ *     把历史成员标成只读，而不是像正常成员一样可拖拽/提交。
+ *   - 保存端点：本次「未变更」的成员放行订单有效状态校验（选定口径，见
+ *     hotel-control.shared-rooms.ts 里 isUnchangedMember 的 JSDoc）——同一间房只要
+ *     其它地方有改动（这里用「新增一名成员」模拟），历史失效成员原样带过去不应 400；
+ *     但如果连这个失效成员自己的份额/乘客也被改动，则仍按正常校验走（不能借失效
+ *     窗口把一个订单已取消的成员悄悄改成别的份额）。
+ */
+describe('saveSharedRooms · 真 DB E2E · 未变更的失效成员不阻断保存（astra B6）', () => {
+  afterEach(() => flushFireAndForgetAudit());
+
+  it('读模型：成员带 orderStatus / isActive，取消单的成员 isActive=false', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    // orderB 事后取消——共享房不因此改变物理占用口径（§四），但成员表原样留着。
+    await prisma.order.update({ where: { id: orderB.id }, data: { status: OrderStatus.CANCELLED } });
+
+    // 工作台读模型主查询按 COUNTED_STATUSES 过滤有效订单，但共享房返回的是**全部**
+    // 成员——orderB 虽然不在 workbench.orders 里，仍会出现在 sharedRooms[].members 里。
+    const workbench = await getSharedRoomWorkbench(hotel.id, CHECK_IN, CHECK_OUT);
+    expect(workbench.orders.map((o) => o.orderId)).not.toContain(orderB.id);
+    const room = workbench.sharedRooms[0];
+    expect(room).toBeDefined();
+    const memberA = room!.members.find((m) => m.orderId === orderA.id);
+    const memberB = room!.members.find((m) => m.orderId === orderB.id);
+    expect(memberA).toMatchObject({ orderStatus: 'PAID', isActive: true });
+    expect(memberB).toMatchObject({ orderStatus: 'CANCELLED', isActive: false });
+  });
+
+  it('未变更的失效成员原样带过去 → 放行；同一失效成员的份额被改动 → 仍 400', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderC = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    const created = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const sharedRoomId = created.rooms[0].sharedRoomId;
+    await prisma.order.update({ where: { id: orderB.id }, data: { status: OrderStatus.CANCELLED } });
+
+    // 未变更：orderB 的 (orderItemId, passengerIds, roomFraction) 原样带回来，
+    // 只是给房间新增一名 orderC 成员——不该因为 orderB 已取消而 400。
+    const resaved = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        expectedVersions: { [sharedRoomId]: created.rooms[0].version },
+        rooms: [
+          {
+            sharedRoomId,
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 0.5,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+              {
+                orderId: orderC.id,
+                orderItemId: orderC.items[0].id,
+                passengerIds: [orderC.passengers[0].id],
+                roomFraction: 0.5,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    expect(resaved.rooms[0].sharedRoomId).toBe(sharedRoomId);
+
+    // 现在改动 orderB 自己的份额（0 → 0.5，同时把它读的份额挪到别处凑 Σ=1）——
+    // 已取消订单的成员被真正改动，不能再借「未变更」放行。
+    await expect(
+      saveSharedRooms(
+        {
+          hotelId: hotel.id,
+          checkIn: CHECK_IN,
+          checkOut: CHECK_OUT,
+          requestToken: requestToken(),
+          expectedVersions: { [sharedRoomId]: resaved.rooms[0].version },
+          rooms: [
+            {
+              sharedRoomId,
+              hotelRoomTypeId: roomType.id,
+              groups: [
+                {
+                  orderId: orderA.id,
+                  orderItemId: orderA.items[0].id,
+                  passengerIds: [orderA.passengers[0].id],
+                  roomFraction: 0,
+                },
+                {
+                  orderId: orderB.id,
+                  orderItemId: orderB.items[0].id,
+                  passengerIds: [orderB.passengers[0].id],
+                  roomFraction: 0.5, // 改动了——不再是「未变更」
+                },
+                {
+                  orderId: orderC.id,
+                  orderItemId: orderC.items[0].id,
+                  passengerIds: [orderC.passengers[0].id],
+                  roomFraction: 0.5,
+                },
+              ],
+            },
+          ],
+          dissolve: [],
+        },
+        actor,
+      ),
+    ).rejects.toThrow(/不处于房控有效状态/);
   });
 });

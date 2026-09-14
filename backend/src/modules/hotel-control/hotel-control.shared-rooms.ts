@@ -92,6 +92,14 @@ export interface SharedRoomWorkbenchRoom {
     orderItemId: string;
     passengerId: string;
     roomFraction: number;
+    /** 该成员所属订单当前状态（astra B6：前端据此把已取消/软删的历史成员标成不可操作、
+     *  只读展示，而不是让运营对着一个看起来正常的姓名 chip 去拖拽/编辑却被后端 400）。*/
+    orderStatus: OrderStatus;
+    /** = 未软删 且 status ∈ COUNTED_STATUSES；与 hotel-control.service 的房控有效状态判定
+     *  同一把尺。false 的成员仍然「有份」（物理占用与计费份额都不受影响，见 §四/§八），
+     *  只是不能再作为「本次改动」的一部分被重新校验其订单有效性——原样重存时会走
+     *  isUnchangedMember 的放行分支。*/
+    isActive: boolean;
   }>;
 }
 
@@ -210,7 +218,17 @@ export async function getSharedRoomWorkbench(
       version: true,
       notes: true,
       members: {
-        select: { orderId: true, orderItemId: true, passengerId: true, roomFraction: true },
+        select: {
+          orderId: true,
+          orderItemId: true,
+          passengerId: true,
+          roomFraction: true,
+          // astra B6：成员所属订单的当前状态——工作台读模型本就查不到「订单池」以外的
+          // 单（getSharedRoomWorkbench 的主查询按 COUNTED_STATUSES 过滤），共享房的成员
+          // 却不受这道过滤限制，会带出已取消/软删的历史成员。前端需要这两个字段来把它们
+          // 标成只读，不能让运营对着一个看起来正常的姓名 chip 操作却被保存接口 400。
+          order: { select: { status: true, deletedAt: true } },
+        },
       },
     },
   });
@@ -230,6 +248,8 @@ export async function getSharedRoomWorkbench(
         orderItemId: m.orderItemId,
         passengerId: m.passengerId,
         roomFraction: Number(m.roomFraction.toString()),
+        orderStatus: m.order.status,
+        isActive: m.order.deletedAt == null && COUNTED_STATUSES.includes(m.order.status),
       })),
     })),
   };
@@ -572,6 +592,54 @@ async function saveSharedRoomsInner(
       }
     }
 
+    // ── 未变更成员放行（astra B6）：工作台读模型把共享房的全部成员原样列出，包括所属
+    // 订单已取消/软删的历史成员（那些成员在物理占用上仍然「有份」，见 §四「主单取消、
+    // 只剩 0 份额成员」）。前端把整间房原样提交回来（哪怕只是改了别的成员），若严格要求
+    // 每个成员所属订单都处于房控有效状态，这类历史成员会让整次保存 400——运营连房间里
+    // 别的正常改动都保存不了。做法：对「本次改动到的既有房间」，逐 (orderId, orderItemId)
+    // 比对——passengerIds 与 roomFraction 都和落库现状一模一样才算「未变更」，未变更的
+    // 成员放行订单有效状态校验（其余结构性校验——订单行归属/酒店/日期一致——仍然照做，
+    // 那些和订单是否取消无关）。新建房没有「落库现状」可比，不适用这条豁免。
+    //
+    // 选择记录（供前端修复批对齐）：这里选的是「未变更放行」，不是「未列出即不动」——
+    // 本函数的更新语义本就是「listed 决定最终成员」（deleteMany 后按 room.groups 重建），
+    // 若改成「未列出即不动」需要额外区分「乘客被移出」与「乘客只是没在这次 payload 里」，
+    // 与现有解绑/迁出逻辑（依赖「未出现 = 移出」判定 kept/丢弃）冲突面更大。
+    const currentMembersByRoom = new Map<
+      string,
+      Map<string, { passengerIds: Set<string>; fraction: number }>
+    >();
+    if (touchedSharedRoomIds.size > 0) {
+      const existingMembers = await tx.sharedRoomMember.findMany({
+        where: { sharedRoomId: { in: [...touchedSharedRoomIds] } },
+        select: { sharedRoomId: true, orderId: true, orderItemId: true, passengerId: true, roomFraction: true },
+      });
+      for (const m of existingMembers) {
+        let byItem = currentMembersByRoom.get(m.sharedRoomId);
+        if (!byItem) {
+          byItem = new Map();
+          currentMembersByRoom.set(m.sharedRoomId, byItem);
+        }
+        const itemKey = `${m.orderId}:${m.orderItemId}`;
+        let entry = byItem.get(itemKey);
+        if (!entry) {
+          entry = { passengerIds: new Set(), fraction: Number(m.roomFraction.toString()) };
+          byItem.set(itemKey, entry);
+        }
+        entry.passengerIds.add(m.passengerId);
+      }
+    }
+    const isUnchangedMember = (
+      sharedRoomId: string | undefined,
+      g: { orderId: string; orderItemId: string; passengerIds: readonly string[]; roomFraction: number },
+    ): boolean => {
+      if (!sharedRoomId) return false; // 新建房没有落库现状可比
+      const existing = currentMembersByRoom.get(sharedRoomId)?.get(`${g.orderId}:${g.orderItemId}`);
+      if (!existing || existing.fraction !== g.roomFraction) return false;
+      if (existing.passengerIds.size !== g.passengerIds.length) return false;
+      return g.passengerIds.every((pid) => existing.passengerIds.has(pid));
+    };
+
     // ── §七 400 语义校验 ──────────────────────────────────────────────────
     const seenPassengerIds = new Set<string>();
     const warnings: string[] = [];
@@ -588,7 +656,11 @@ async function saveSharedRoomsInner(
       let totalPassengers = 0;
       for (const g of room.groups) {
         const order = orders.get(g.orderId);
-        if (!order || order.deletedAt != null || !COUNTED_STATUSES.includes(order.status)) {
+        if (!order) {
+          throw new BadRequestError(`订单 ${g.orderId} 不存在`);
+        }
+        const invalidStatus = order.deletedAt != null || !COUNTED_STATUSES.includes(order.status);
+        if (invalidStatus && !isUnchangedMember(room.sharedRoomId, g)) {
           throw new BadRequestError(`订单 ${g.orderId} 不存在或不处于房控有效状态`);
         }
         const item = order.items.find((it) => it.id === g.orderItemId);
