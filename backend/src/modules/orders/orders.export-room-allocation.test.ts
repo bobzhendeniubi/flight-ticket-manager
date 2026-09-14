@@ -584,6 +584,44 @@ describe('buildRoomAllocationSheets 房间号 — 跨单分房（§九验收反�
     const [sheet] = buildRoomAllocationSheets(items);
     expect(sheet.rows[0]!.hotelType).toBe('真实酒店');
   });
+
+  it('拆单配对键（splitPairKey，非共享房）：两张单的两个半间导出印同一房号（§十三验收反例 10）', () => {
+    const items = [
+      sharedRoomItem({
+        orderId: 'ord-C',
+        orderNumber: 'FTM_C',
+        checkIn: '2026-09-04',
+        hotelId: 'hotel-split',
+        hotelName: '拆单酒店',
+        groupId: 'gC',
+        sharedRoomId: '', // 不是共享房——走 splitPairKey 分支
+        roomFraction: 0.5,
+        passengerIds: ['pc1'],
+      }),
+      sharedRoomItem({
+        orderId: 'ord-D',
+        orderNumber: 'FTM_D',
+        checkIn: '2026-09-04',
+        hotelId: 'hotel-split',
+        hotelName: '拆单酒店',
+        groupId: 'gD',
+        sharedRoomId: '',
+        roomFraction: 0.5,
+        passengerIds: ['pd1'],
+      }),
+    ];
+    // sharedRoomItem 固定写 sharedRoomId 字段；手动改成 splitPairKey，模拟拆单（非共享房）产出的两个半组
+    for (const it of items) {
+      const group = (it.order.roomAssignment as { roomGroups: Array<Record<string, unknown>> })
+        .roomGroups[0];
+      delete group.sharedRoomId;
+      group.splitPairKey = 'item-src:token-1';
+    }
+    const [sheet] = buildRoomAllocationSheets(items);
+    expect(sheet.rows).toHaveLength(2);
+    const roomNos = new Set(sheet.rows.map((r) => r.roomNo));
+    expect(roomNos.size).toBe(1); // 两个半间合成同一个房号
+  });
 });
 
 /**

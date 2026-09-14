@@ -160,6 +160,13 @@ export interface RoomGroup {
    * 见 room-identity.ts 的 roomIdentityKey。
    */
   sharedRoomId?: string;
+  /**
+   * 拆单配对键（orders.service.ts 拆单时写在两个半组上的 `<源行id>:<拆单令牌>`，本身
+   * 跨单唯一）。与 sharedRoomId 互斥（服务端约定共享组不写这个键）；导出层同样靠它把
+   * 拆单劈出的两个半间合成一个房号（见 room-identity.ts 的 roomIdentityKey，§十三验收
+   * 反例 10）。
+   */
+  splitPairKey?: string;
 }
 
 function fmtDate(d: Date | null | undefined): string {

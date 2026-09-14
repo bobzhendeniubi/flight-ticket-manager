@@ -31,6 +31,18 @@ describe('roomIdentityKey', () => {
     expect(roomIdentityKey({ id: 'g1', sharedRoomId: '' }, 'ord_a')).toBe('ord_a:g1');
     expect(roomIdentityKey({ id: 'g1', sharedRoomId: null }, 'ord_a')).toBe('ord_a:g1');
   });
+
+  it('拆单配对键（splitPairKey）：没有 sharedRoomId 时两个半组用它算出同一个身份（§十三验收反例 10）', () => {
+    const half1 = { id: 'g1', splitPairKey: 'item-x:token-1' };
+    const half2 = { id: 'g2', splitPairKey: 'item-x:token-1' };
+    expect(roomIdentityKey(half1, 'ord_a')).toBe('item-x:token-1');
+    expect(roomIdentityKey(half2, 'ord_b')).toBe('item-x:token-1');
+    expect(roomIdentityKey(half1, 'ord_a')).toBe(roomIdentityKey(half2, 'ord_b'));
+  });
+
+  it('sharedRoomId 优先于 splitPairKey（两者理论互斥，但顺序仍要明确）', () => {
+    expect(roomIdentityKey({ id: 'g1', sharedRoomId: 'sr1', splitPairKey: 'pk1' }, 'ord_a')).toBe('sr1');
+  });
 });
 
 describe('roomNumberScopeKey', () => {

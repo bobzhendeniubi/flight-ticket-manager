@@ -8,9 +8,13 @@
  *
  * 本文件是三处共用的唯一入口：
  *   - `roomIdentityKey`：房组的跨单身份——共享房恒定用 SharedRoom.id（服务端生成、写进两边
- *     订单 JSON 的 roomGroups[].sharedRoomId 镜像，真值见 hotel-control.shared-rooms.ts），
- *     普通房组退回 `${orderId}:${groupId}`（本地 id 只在本单内有意义，带上 orderId 避免
- *     跨单短随机串撞车）。
+ *     订单 JSON 的 roomGroups[].sharedRoomId 镜像，真值见 hotel-control.shared-rooms.ts）；
+ *     没有共享房 id 但带拆单配对键（splitPairKey，orders.service.ts 拆单时写在两个半组上的
+ *     `<源行id>:<拆单令牌>`，本身跨单唯一）时用它——两个半间导出编号也该合成一间，同物理
+ *     房间口径（hotel-control.service.ts 的 groupBucketKey，见 §十三验收反例 10）；
+ *     都没有才退回 `${orderId}:${groupId}`（本地 id 只在本单内有意义，带上 orderId 避免
+ *     跨单短随机串撞车）。共享房与拆单配对键互斥（服务端约定共享组不写 splitPairKey），
+ *     不会同时命中两条分支。
  *   - `roomNumberScopeKey`：编号作用域——真实酒店按 hotelId（不认名字文本，名字可能是换酒店前
  *     的旧值、房控手误，见 finding 10）；未落位的星级随机档没有 hotelId，用展示名兜底出一个
  *     隔离的作用域键（不会撞真实酒店的 hotelId）。入住日由调用方在此之外自行分桶
@@ -23,19 +27,22 @@
  */
 import type { PrismaClient } from '@prisma/client';
 
-/** roomIdentityKey 入参：房组的最小形状（跨单身份判定只看这两个字段）。*/
+/** roomIdentityKey 入参：房组的最小形状（跨单身份判定只看这三个字段）。*/
 export interface RoomIdentityGroup {
   id: string;
   sharedRoomId?: string | null;
+  /** 拆单配对键（`<源行id>:<拆单令牌>`）；两个半组写同一个值，本身已跨单唯一。*/
+  splitPairKey?: string | null;
 }
 
 /**
- * 房组的跨单房间身份：共享房恒定 id 优先，普通房组退回 `${orderId}:${groupId}`。
+ * 房组的跨单房间身份：共享房恒定 id 优先；没有共享房 id 但带拆单配对键（两个半间数出的
+ * 同一间房）用它——两者互斥，不会撞；都没有才退回 `${orderId}:${groupId}`。
  * 共享房两侧（哪怕一侧份额 0、hotelName 文本不同）算出的是同一个字符串——导出编号/去重的
  * 唯一依据，绝不用 hotelName 或本地 groupId 单独认同房。
  */
 export function roomIdentityKey(group: RoomIdentityGroup, orderId: string): string {
-  return group.sharedRoomId || `${orderId}:${group.id}`;
+  return group.sharedRoomId || group.splitPairKey || `${orderId}:${group.id}`;
 }
 
 /**
