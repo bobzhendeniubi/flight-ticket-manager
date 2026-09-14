@@ -154,6 +154,7 @@ import {
 } from '../hotel-control/hotel-control.service.js';
 import {
   formatUnbindWarning,
+  hasSharedRoomMembers,
   unbindSharedRoomMembersForItem,
 } from '../hotel-control/shared-room-unbind.js';
 import {
@@ -14167,6 +14168,12 @@ export class OrderService {
       if (bundleItem?.hotelCheckIn && formatDateOnly(bundleItem.hotelCheckIn) <= businessDateISO(new Date())) {
         throw new BadRequestError('入住日期已到/已过，单住/拼住请联系运营处理');
       }
+      // ── §八「改单住/拼住」：该行有共享成员 → 直接拒绝，不自动解绑（拍板 6）──────────
+      // 单住/拼住会改这一行的 roomsBilled；共享行的计费份额由跨单分房工作台统一维护，
+      // 这里悄悄改掉会让份额与工作台记录的口径对不上。
+      if (bundleItem && (await hasSharedRoomMembers(tx, orderId, bundleItem.id))) {
+        throw new BadRequestError('该行与他单合住，请先在跨单分房里解除合住再改单住/拼住');
+      }
 
       // ── 5. 单房差费率与晚数：建单快照优先（与建单同一份费率），晚数缺失回落住宿区间 ──
       const snapshot = bundleItem ? readJsonObject(readJsonObject(bundleItem.metadata).addOns) : {};
@@ -16505,6 +16512,12 @@ export class OrderService {
             },
           },
         });
+        // ── §八「补单房差联动」：该行有共享成员 → 直接拒绝，不自动解绑（拍板 6）──────────
+        // 与改单住/拼住同一道闸：联动会改这一行的 roomsBilled，共享行的计费份额由跨单
+        // 分房工作台统一维护，这里悄悄改掉会让份额与工作台记录的口径对不上。
+        if (bundleItem && (await hasSharedRoomMembers(tx, orderId, bundleItem.id))) {
+          throw new BadRequestError('该行与他单合住，请先在跨单分房里解除合住再补收单房差');
+        }
         if (bundleItem?.bundle) {
           const newSingleCount = await tx.passenger.count({
             where: { orderId, singleRoom: true },

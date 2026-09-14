@@ -147,6 +147,25 @@ export async function unbindSharedRoomMembersForItem(
 }
 
 /**
+ * 该订单行当前是否有共享成员——只读判定，不解绑。给 §八「改单住/拼住、补单房差联动」
+ * 一类必须直接拒绝（不能自动解绑）的入口用：`该行有共享成员 → 400「该行与他单合住，
+ * 请先在跨单分房里解除合住」`。防御式同 unbindSharedRoomMembersForItem：mock tx 没有
+ * sharedRoomMember delegate 时回落 false，不炸单测。
+ */
+export async function hasSharedRoomMembers(
+  tx: Prisma.TransactionClient,
+  orderId: string,
+  orderItemId: string,
+): Promise<boolean> {
+  const delegate = (
+    tx as unknown as { sharedRoomMember?: { count: (args: unknown) => Promise<number> } }
+  ).sharedRoomMember;
+  if (!delegate) return false;
+  const count = await delegate.count({ where: { orderId, orderItemId } });
+  return count > 0;
+}
+
+/**
  * §八「解绑」响应警告文案——两版（拍板 3）：内部版带对方单号，AGENT 版只说「已与他单合住」。
  */
 export function formatUnbindWarning(
