@@ -144,10 +144,20 @@ interface RoomBox {
   /**
    * 跨单分房共享房 id；非 null = 该盒子与他单合住，锁定（乘客不可拖出/拖入、酒店名/
    * 房型/份额/归属不可改、盒子不可删）——只能改备注。改动请去房控页「跨单分房」。
+   * ADMIN/STAFF 才拿得到这个字段（内部原始房组）；AGENT/CUSTOMER 拿到的是外部 DTO，
+   * 没有 sharedRoomId，只有下面的 isShared 布尔——锁定判定须两者都认，见 isLockedBox（B4）。
    */
   sharedRoomId: string | null;
+  /** 是否与他单合住（外部角色 DTO 专用字段，见 RoomGroup.isShared 注释）。 */
+  isShared: boolean;
   /** 拆单半间配对键：原样透传，保存时回填进 RoomGroup，不因重新构造对象而丢失。 */
   splitPairKey: string | null;
+  /**
+   * 锁定盒子的「原样值」快照——保存时对锁定组一律回填这份原始值，不用 hotelItems 归属推断
+   * 重新计算 hotelName/orderItemId（B4：内部共享组的 hotelName 落库常是空串，重新推断成
+   * 「归属行的酒店名」会与旧值不一致，触发服务端「只能改备注」闸 400）。非锁定盒子不使用。
+   */
+  lockedRaw: { hotelName: string; roomType: string; orderItemId: string | undefined } | null;
 }
 
 const FULL_ROOM = 1;
@@ -195,17 +205,24 @@ function seedBoxes(initial: RoomGroup[] | undefined): RoomBox[] {
     return [emptyBox()];
   }
   return initial.map((g) => {
+    const isShared = g.sharedRoomId != null || g.isShared === true;
     const sharedRoomId = g.sharedRoomId ?? null;
     return {
       id: g.id || newId(),
       roomType: g.roomType ?? '',
       passengerIds: Array.isArray(g.passengerIds) ? [...g.passengerIds] : [],
       notes: g.notes ?? '',
-      roomFraction: normalizeFraction(g.roomFraction, sharedRoomId != null),
+      roomFraction: normalizeFraction(g.roomFraction, isShared),
       // 既有归属（split-room-group / 上次保存写入）保留——重存分房不能把归属静默清掉
       orderItemId: g.orderItemId ?? null,
       sharedRoomId,
+      isShared,
       splitPairKey: g.splitPairKey ?? null,
+      // 锁定组的原样快照：hotelName 缺省 ''（外部 DTO 本就不带这个字段），保存时原封回填，
+      // 不重建、不裁剪、不重新推断（B4）。
+      lockedRaw: isShared
+        ? { hotelName: g.hotelName ?? '', roomType: g.roomType ?? '', orderItemId: g.orderItemId }
+        : null,
     };
   });
 }
@@ -219,13 +236,19 @@ function emptyBox(): RoomBox {
     roomFraction: FULL_ROOM,
     orderItemId: null,
     sharedRoomId: null,
+    isShared: false,
     splitPairKey: null,
+    lockedRaw: null,
   };
 }
 
-/** 带 sharedRoomId 的盒子与他单合住：锁定除备注外的全部字段（房控页「跨单分房」里调）。 */
+/**
+ * 该盒子是否与他单合住，锁定除备注外的全部字段（房控页「跨单分房」里调）：
+ * ADMIN/STAFF 认 sharedRoomId 本身，AGENT/CUSTOMER 的外部 DTO 没有这个字段、只给
+ * isShared 布尔——两者都要认，否则代理视角下共享组会被误判成普通组，锁定失效（B4）。
+ */
 function isLockedBox(b: RoomBox): boolean {
-  return b.sharedRoomId != null;
+  return b.sharedRoomId != null || b.isShared;
 }
 
 /** 未落位行的房型文案（与后端 PENDING_PLACEMENT_ROOM_TYPE 同文案）。 */
@@ -427,6 +450,28 @@ export function RoomingEditor({
     const groups: RoomGroup[] = boxes
       .filter((b) => b.passengerIds.length > 0)
       .map((b) => {
+        const locked = isLockedBox(b);
+        // 锁定盒子（与他单合住）：hotelName / roomType / orderItemId 原样回填 lockedRaw 快照，
+        // 不用 hotelItems 归属推断重建——内部共享组的落库 hotelName 常是空串，重新推断成
+        // 「归属行的酒店名」会与旧值不一致，触发服务端「这里只能改备注」闸 400（B4）。
+        if (locked) {
+          const raw = b.lockedRaw;
+          return {
+            id: b.id,
+            hotelName: raw?.hotelName ?? '',
+            roomType: raw?.roomType ?? b.roomType.trim(),
+            passengerIds: b.passengerIds,
+            // 备注显式传（含空串）：清空要能清掉，不能因为「省略=不动」的兜底语义而清不掉
+            // （与后端「空串清空、省略不动」对齐，见 RoomGroup.notes 注释）。
+            notes: b.notes.trim(),
+            // 份额可能是 0（主单让份）——必须显式带上，不能让「缺省=1」的兜底把它吃掉。
+            roomFraction: b.roomFraction,
+            ...(raw?.orderItemId ? { orderItemId: raw.orderItemId } : {}),
+            // 镜像键：服务端会忽略这两个字段（以锁后现状为准），但前端不能主动丢。
+            ...(b.sharedRoomId ? { sharedRoomId: b.sharedRoomId } : {}),
+            ...(b.splitPairKey ? { splitPairKey: b.splitPairKey } : {}),
+          };
+        }
         // 归属解析：传了酒店行清单 → 单条自动归属 / 多条按下拉；下拉里已不存在的旧归属
         // （行被删等异常）不透传，避免整次保存被服务端校验 400。
         // 未传清单（旧调用方）→ 保留既有归属原样透传，行为与现状一致。
@@ -442,19 +487,10 @@ export function RoomingEditor({
           hotelName: attributed?.hotelName ?? hotelName ?? '',
           roomType: b.roomType.trim(),
           passengerIds: b.passengerIds,
-          ...(b.notes.trim() ? { notes: b.notes.trim() } : {}),
-          // 锁定盒子（与他单合住）的份额可能是 0（主单让份）——必须显式带上，不能让「缺省=1」
-          // 的兜底把它吃掉（服务端按 (roomFraction ?? 1) 比较新旧值判定是否改动了共享组）。
+          notes: b.notes.trim(),
           // 普通盒子维持旧口径：只在半间时才带字段，整间省略。
-          ...(isLockedBox(b)
-            ? { roomFraction: b.roomFraction }
-            : b.roomFraction === HALF_ROOM
-              ? { roomFraction: HALF_ROOM }
-              : {}),
+          ...(b.roomFraction === HALF_ROOM ? { roomFraction: HALF_ROOM } : {}),
           ...(orderItemId ? { orderItemId } : {}),
-          // 与他单合住的镜像键：服务端会忽略这两个字段（以锁后现状为准），但前端不能
-          // 主动丢——保存只提交可改字段，其余原样传回。
-          ...(b.sharedRoomId ? { sharedRoomId: b.sharedRoomId } : {}),
           ...(b.splitPairKey ? { splitPairKey: b.splitPairKey } : {}),
         };
       });

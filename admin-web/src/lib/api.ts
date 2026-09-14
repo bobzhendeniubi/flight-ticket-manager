@@ -1521,6 +1521,13 @@ export interface RoomGroup {
    */
   sharedRoomId?: string;
   /**
+   * 是否与他单合住（对外角色 DTO 专用，见 room-group-dto.ts serializeRoomGroupsFor）：
+   * ADMIN/STAFF 拿到的是内部原始房组，认 sharedRoomId 本身；AGENT/CUSTOMER 拿到的是
+   * 剥掉 sharedRoomId 的外部 DTO，只给这个布尔——编辑器锁定判定须两者都认，否则代理
+   * 视角下共享组会被误判为普通组，锁定失效（B4）。
+   */
+  isShared?: boolean;
+  /**
    * 拆单半间配对键（服务端写入，只读）。编辑器重存分房时应原样透传，不能因重新构造
    * 房组对象而丢失（丢失会导致两个半间配不回一间）；服务端对旧组也会兜底搬运。
    */
