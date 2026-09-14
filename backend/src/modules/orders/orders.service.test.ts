@@ -94,6 +94,8 @@ const {
     // getOrder 的 loadBundleVisaStayDays 用它批量查套餐 VISA 组件的 stayDays（不 mock 时默认
     // undefined，调用即抛错——loadBundleVisaStayDays 有 try/catch best-effort 降级，不影响
     // 既有未涉及签证的测试；专门测 visa 板块的用例会显式 mock 这个方法）。
+    // getOrder 内部视角联查本单源出的挂账进账（挂账去向留痕）；这些用例没有，给空表。
+    receipt: { findMany: vi.fn().mockResolvedValue([]) },
     visa: {
       findMany: vi.fn(),
       // priceAndValidateItems 的 VISA 分支按产品查权威价 + 加急档位表（expressTiers）。

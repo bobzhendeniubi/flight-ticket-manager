@@ -1662,6 +1662,11 @@ export interface OrderSummary {
   agentSelfEdit?: { open: boolean; until: string | null; reason: string | null };
   // 订单详情(getOrder)带出的收款记录（列表不含，避免 proof 数据膨胀）
   payments?: OrderPayment[];
+  /**
+   * 本单源出、但没有收款行承接的挂账进账（本单应收已满整笔进池 / 旧的多付转池处置行）；
+   * 仅内部视角，getOrder 派生。收款区据此把「钱去了哪」永久摆出来。
+   */
+  overpayReceipts?: PoolTrail[];
   // 未经财务核实的已收金额（详情联查 payments 时后端派生；出票前提示用，仅内部角色下发）
   unverifiedPaidCny?: number;
   /**
@@ -2332,6 +2337,46 @@ export interface OrderPayment {
   transferredIn?: boolean;
   transferredToOrderNumber?: string | null;
   transferredFromOrderNumber?: string | null;
+  /**
+   * 超收拆分留痕（仅内部视角，getOrder 派生）：这笔收款只是水单毛额里记进本单的那部分，
+   * 其余转入挂账池；pool 带池子那笔的核销去向，核销完也一直留着——已付金额本身不动。
+   */
+  overpaySplit?: OverpaySplitTrail | null;
+  /** 「多付转挂账池」对冲行（负额）对应的池子去向（新数据才有；旧数据在 overpayReceipts 里）。 */
+  poolTrail?: PoolTrail | null;
+}
+
+/** 挂账进账的一条核销去向（订单 / 占位单）。 */
+export interface PoolAllocationTrail {
+  kind: 'ORDER' | 'HOLD';
+  orderNumber: string | null;
+  orderId: string | null;
+  holdOrderId: string | null;
+  amountCny: number;
+  allocatedAt: string;
+}
+
+/** 一笔挂账进账的完整去向：转池多少、还剩多少、核销到了谁、有没有退。 */
+export interface PoolTrail {
+  receiptId: string;
+  receiptNo: string;
+  pooledAmount: number;
+  receiptStatus: ReceiptStatus;
+  remainingCny: number;
+  refundNote: string | null;
+  receivedAt: string;
+  payerNote: string | null;
+  allocations: PoolAllocationTrail[];
+}
+
+/** 收款行上的拆分去向：水单毛额 / 本单入账 / 转池 + 池子那笔的去向。 */
+export interface OverpaySplitTrail {
+  receivedAmount: number;
+  creditedAmount: number;
+  pooledAmount: number;
+  receiptId: string;
+  receiptNo: string;
+  pool: PoolTrail | null;
 }
 
 // ── Audit / Customers / Travelers / Fulfillment ──────────────────────────
@@ -6800,7 +6845,7 @@ export const api = {
       { token },
     );
   },
-  // 流水核对表导出（xlsx；含认款状态/认到订单/认款人列）。返回 Blob 直接下载。
+  // 流水核对表导出（xlsx；含水单毛额/源订单/本单入账/转池金额 + 认款状态/认到订单/认款人列）。返回 Blob 直接下载。
   exportReceiptStatement: async (token: string, query?: { from?: string; to?: string }): Promise<Blob> => {
     const qs = new URLSearchParams();
     if (query?.from) qs.set('from', query.from);

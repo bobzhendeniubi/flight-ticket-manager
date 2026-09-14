@@ -1,6 +1,6 @@
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useSearchParams, useNavigate } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type RestoreCancelledOrderResult, type VoidReturnLegPreview, type OrderLegFlagFilter, type PublicLegStatus, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE, FLOWN_LEGS_CONFIRMATION_REQUIRED_CODE, flownLegsConfirmationDetails, TOKEN_PAYLOAD_MISMATCH_CODE, TOKEN_PAYLOAD_MISMATCH_HINT } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type PoolTrail, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type RestoreCancelledOrderResult, type VoidReturnLegPreview, type OrderLegFlagFilter, type PublicLegStatus, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE, FLOWN_LEGS_CONFIRMATION_REQUIRED_CODE, flownLegsConfirmationDetails, TOKEN_PAYLOAD_MISMATCH_CODE, TOKEN_PAYLOAD_MISMATCH_HINT } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -17712,6 +17712,43 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
 }
 
 // ── 确认收款（线下收款 → 标记已付 + 上传截图）────────────────────────
+/**
+ * 挂账去向文案：核销到哪几张单各多少 / 池内还剩多少 / 剩余已退款。
+ * 收款行的拆分留痕、多付转池对冲行、以及没有收款行承接的池子进账三处共用。
+ */
+function PoolTrailDestinations({ trail }: { trail: PoolTrail }) {
+  return (
+    <>
+      {trail.allocations.length > 0 && (
+        <span>
+          → 核销到{' '}
+          {trail.allocations.map((a, i) => (
+            <Fragment key={`${a.kind}-${a.orderId ?? a.holdOrderId ?? i}-${i}`}>
+              {i > 0 && '、'}
+              <span className="font-mono">
+                {a.orderNumber ?? (a.orderId ?? a.holdOrderId ?? '').slice(0, 8)}
+              </span>
+              {a.kind === 'HOLD' ? '（占位）' : ''} ¥{a.amountCny.toLocaleString()}
+            </Fragment>
+          ))}
+        </span>
+      )}
+      {trail.receiptStatus === 'REFUNDED' ? (
+        <span className="text-slate-500">
+          → 剩余已退款{trail.refundNote ? `（${trail.refundNote}）` : ''}
+        </span>
+      ) : trail.remainingCny > 0 ? (
+        <span className="text-amber-700">→ 池内待核销 ¥{trail.remainingCny.toLocaleString()}</span>
+      ) : null}
+    </>
+  );
+}
+
+const POOL_TRAIL_ROW_CLASS =
+  'mt-0.5 flex flex-wrap items-center gap-x-1.5 rounded bg-slate-50 px-2 py-1 text-[11px] text-slate-600';
+/** 收款行已冲销（撤销认款 / 原路退回）：去向留痕跟着划掉压淡，别让人当成钱还在。 */
+const POOL_TRAIL_ROW_REVERSED_CLASS = `${POOL_TRAIL_ROW_CLASS} text-slate-400 line-through`;
+
 function ConfirmPaymentSection({
   orderId,
   orderNumber,
@@ -17748,6 +17785,8 @@ function ConfirmPaymentSection({
   const askConfirm = useConfirm();
   const highRiskConfirmRef = useRef(false);
   const [payments, setPayments] = useState<OrderPayment[]>([]);
+  // 本单源出、没有收款行承接的挂账进账（整笔进池 / 旧多付转池）：与收款记录一起永久摆出去向。
+  const [overpayReceipts, setOverpayReceipts] = useState<PoolTrail[]>([]);
   const [paid, setPaid] = useState(paidAmount);
   // 预存抵扣本地副本（与 paid 同步随详情刷新更新）——尾款口径必须含它。
   const [prepaid, setPrepaid] = useState(prepaymentOffset);
@@ -17798,6 +17837,7 @@ function ConfirmPaymentSection({
       return false;
     }
     setPayments(r.order.payments ?? []);
+    setOverpayReceipts(r.order.overpayReceipts ?? []);
     setPaymentsLocked(r.order.paymentsLocked ?? false);
     const p = Number(r.order.paidAmount);
     setPaid(p);
@@ -17958,6 +17998,7 @@ function ConfirmPaymentSection({
       }
       const r = await api.getOrder(token, orderId);
       setPayments(r.order.payments ?? []);
+      setOverpayReceipts(r.order.overpayReceipts ?? []);
       // 拆分出的那笔挂账进账带本单 hint，刷新一下「疑似本单待核销」提示让它立刻可见（失败静默）。
       if (res.overpaySplit) {
         try {
@@ -18368,13 +18409,13 @@ function ConfirmPaymentSection({
         {payments.length > 0 && (
           <ul className="mt-2 space-y-1 border-t border-slate-100 pt-2">
             {payments.map((p) => (
-              <li
-                key={p.id}
-                className={`flex items-center gap-2 text-xs ${
-                  // 已冲销（撤销认款 / 迟到回调原路退回）：这笔钱不再计入本单实收，划掉以免被当成还在账上
-                  p.status === 'REFUNDED' ? 'text-slate-400 line-through' : 'text-slate-600'
-                }`}
-              >
+              <li key={p.id} className="text-xs">
+                <div
+                  className={`flex items-center gap-2 ${
+                    // 已冲销（撤销认款 / 迟到回调原路退回）：这笔钱不再计入本单实收，划掉以免被当成还在账上
+                    p.status === 'REFUNDED' ? 'text-slate-400 line-through' : 'text-slate-600'
+                  }`}
+                >
                 <span>{PAYMENT_METHOD_LABEL[p.method] ?? p.method}</span>
                 <span className="font-medium">¥{Number(p.amount).toLocaleString()}</span>
                 <span className="text-slate-400">{p.paidAt ? formatDateCn(p.paidAt) : ''}</span>
@@ -18491,6 +18532,62 @@ function ConfirmPaymentSection({
                     )
                   )}
                 </div>
+                </div>
+                {/* 超收拆分留痕（财务查账口径）：已付只计本单入账部分，这里永久显示水单毛额与拆分去向，
+                    池子那笔核销到了哪几张单也一直留着——出纳拿水单对系统靠的就是这一行。 */}
+                {p.overpaySplit && (
+                  <div
+                    className={p.status === 'REFUNDED' ? POOL_TRAIL_ROW_REVERSED_CLASS : POOL_TRAIL_ROW_CLASS}
+                    title="已付金额只计本单入账部分；这里是这笔水单的完整去向，核销后也一直保留"
+                  >
+                    <span className="font-medium text-slate-700">
+                      水单实收 ¥{p.overpaySplit.receivedAmount.toLocaleString()}
+                    </span>
+                    <span>→ 本单入账 ¥{p.overpaySplit.creditedAmount.toLocaleString()}</span>
+                    <span>
+                      → 转挂账池 ¥{p.overpaySplit.pooledAmount.toLocaleString()}（进账{' '}
+                      <span className="font-mono">{p.overpaySplit.receiptNo}</span>）
+                    </span>
+                    {p.overpaySplit.pool ? (
+                      <PoolTrailDestinations trail={p.overpaySplit.pool} />
+                    ) : (
+                      <span className="text-slate-400">（进账记录已不存在）</span>
+                    )}
+                  </div>
+                )}
+                {p.poolTrail && (
+                  <div
+                    className={p.status === 'REFUNDED' ? POOL_TRAIL_ROW_REVERSED_CLASS : POOL_TRAIL_ROW_CLASS}
+                    title="多付转入挂账池的那笔钱后来去了哪"
+                  >
+                    <span className="font-medium text-slate-700">
+                      转挂账池 ¥{p.poolTrail.pooledAmount.toLocaleString()}（进账{' '}
+                      <span className="font-mono">{p.poolTrail.receiptNo}</span>）
+                    </span>
+                    <PoolTrailDestinations trail={p.poolTrail} />
+                  </div>
+                )}
+              </li>
+            ))}
+          </ul>
+        )}
+
+        {/* 本单源出、没有收款行承接的挂账进账：本单应收已满整笔进池 / 旧的多付转池处置。
+            这些钱从没计入本单已付，但出纳对水单时要看到它去了哪。 */}
+        {overpayReceipts.length > 0 && (
+          <ul className="mt-1 space-y-1">
+            {overpayReceipts.map((r) => (
+              <li
+                key={r.receiptId}
+                className={POOL_TRAIL_ROW_CLASS}
+                title="本单源出的挂账进账（本单应收已满整笔进池，或多付转池），没有计入本单已付"
+              >
+                <span className="font-medium text-slate-700">转挂账池 ¥{r.pooledAmount.toLocaleString()}</span>
+                <span className="text-slate-400">{formatDateCn(r.receivedAt)}</span>
+                <span>
+                  （进账 <span className="font-mono">{r.receiptNo}</span>，未计入本单已付）
+                </span>
+                <PoolTrailDestinations trail={r} />
               </li>
             ))}
           </ul>

@@ -160,7 +160,7 @@ export function splitOverpayment(args: {
  * 挂到 externalTxnId 上后，同 key 重提会撞唯一索引，由 confirmManualPayment 顶部的回放分支接住。
  * 前缀与收单平台真实流水号不可能相同，不会污染流水导入的去重。
  */
-const OVERPAY_SPLIT_TXN_PREFIX = 'MANUAL-OVERPAY:';
+export const OVERPAY_SPLIT_TXN_PREFIX = 'MANUAL-OVERPAY:';
 export function overpaySplitExternalTxnId(idempotencyKey: string): string {
   return `${OVERPAY_SPLIT_TXN_PREFIX}${idempotencyKey}`;
 }
@@ -180,7 +180,7 @@ export interface OverpaySplitDetail {
 }
 
 /** 从 Payment.gatewayPayload 还原拆分明细（幂等回放用）；不是拆分单则 null。 */
-function readOverpaySplitFromPayload(payload: Prisma.JsonValue | null): OverpaySplitDetail | null {
+export function readOverpaySplitFromPayload(payload: Prisma.JsonValue | null): OverpaySplitDetail | null {
   if (typeof payload !== 'object' || payload === null || Array.isArray(payload)) return null;
   const raw = (payload as Record<string, unknown>).overpaySplit;
   if (typeof raw !== 'object' || raw === null || Array.isArray(raw)) return null;

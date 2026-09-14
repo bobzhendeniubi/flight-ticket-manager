@@ -25,6 +25,8 @@ const prismaMock = vi.hoisted(() => ({
   agent: { findUnique: vi.fn() },
   order: { findUnique: vi.fn() },
   visa: { findMany: vi.fn() },
+  // getOrder 内部视角会联查本单源出的挂账进账（挂账去向留痕）；这里没有，给空表。
+  receipt: { findMany: vi.fn().mockResolvedValue([]) },
   passenger: { findMany: vi.fn() },
   auditLog: { create: vi.fn().mockResolvedValue({}) },
   $queryRaw: vi.fn(),

@@ -160,6 +160,11 @@ import {
 import { env } from '../../config/env.js';
 import { PricingService } from '../pricing/pricing.service.js';
 import { createOpenReceiptWithinTx } from '../receipts/receipts.service.js';
+import {
+  loadOrderOverpayTrails,
+  type OverpaySplitTrail,
+  type PoolTrail,
+} from '../payments/overpay-trail.js';
 import { OPERATION_FEE_CNY_PER_ORDER } from './order-cost-items.service.js';
 import { bundleItemMetadataSchema } from './orders.schemas.js';
 import { derivePtcByAge, earliestFlightDeparture, earliestFlightDepartureLocalDate } from './pnr-export.js';
@@ -5235,10 +5240,31 @@ export class OrderService {
     const visaStayDaysById = await this.loadBundleVisaStayDays(order.items);
     // 按角色一次算好脱敏口径：ADMIN/STAFF 看全量（含护照大图）；AGENT/CUSTOMER 剥离内部字段 + 逐项拆价
     // （护照大图同口径剥离——响应瘦身 + 少暴露 PII，与既有 includePassportPhotos 行为一致）。
-    return serializeOrder(order, {
-      visaStayDaysById,
-      ...orderSerializeRoleCtx(requester.role),
+    const roleCtx = orderSerializeRoleCtx(requester.role);
+    const serialized = serializeOrder(order, { visaStayDaysById, ...roleCtx });
+    // 挂账去向（仅内部）：收款行永久带上「水单毛额 → 本单入账 → 转池 → 核销到哪几张单」，
+    // 核销完也不消失——出纳拿水单对系统靠的就是这一行（已付金额本身不动，见 overpay-trail.ts）。
+    // 对外角色（AGENT/CUSTOMER）连键都不下发：别的订单号不能露。两条分支用条件展开收成同一个
+    // 对象类型（可选键），调用方与测试不用面对联合类型。
+    const trails = roleCtx.redactForExternal
+      ? null
+      : await loadOrderOverpayTrails(order.id, order.payments ?? []);
+    // 收款行从原始 order.payments 重新序列化一遍（与 serializeOrder 同一函数、同一脱敏口径）：
+    // serializeOrder 的 payments 键是条件展开出来的，静态类型是「原始行 | 序列化行」联合，
+    // 直接在它上面追加字段会把联合类型一路传给调用方。
+    // 详情永远联查了 payments，这里作为必有键覆盖掉 serializeOrder 里那个条件展开的同名键。
+    const payments: OrderDetailPayment[] = (order.payments ?? []).map((p) => {
+      const base = serializePaymentRecord(p, { redactForExternal: roleCtx.redactForExternal });
+      return trails
+        ? {
+            ...base,
+            overpaySplit: trails.splitByPaymentId.get(p.id) ?? null,
+            poolTrail: trails.disposalByPaymentId.get(p.id) ?? null,
+          }
+        : base;
     });
+    const extras: OrderDetailExtras = trails ? { overpayReceipts: trails.overpayReceipts } : {};
+    return { ...serialized, payments, ...extras };
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -6044,6 +6070,8 @@ export class OrderService {
       method: PaymentMethod;
       disposal: 'AGENT_BALANCE' | 'RECEIPT_POOL';
       description: string;
+      /** RECEIPT_POOL 处置建的那笔挂账进账（留痕：详情页据此反查核销去向）。 */
+      poolReceipt?: { id: string; receiptNo: string };
     },
   ): Promise<void> {
     await tx.payment.create({
@@ -6061,6 +6089,9 @@ export class OrderService {
           amountCny: round2(input.amountCny),
           disposedAt: new Date().toISOString(),
           note: input.description,
+          ...(input.poolReceipt
+            ? { poolReceiptId: input.poolReceipt.id, poolReceiptNo: input.poolReceipt.receiptNo }
+            : {}),
         } as Prisma.InputJsonValue,
       },
     });
@@ -6401,15 +6432,6 @@ export class OrderService {
         where: { id: orderId },
         data: { paidAmount: new Prisma.Decimal(round2(paid - overpay)) },
       });
-      // R6：台账同步登记等额流出，否则订单再进一次 PAID 就会按 SUCCEEDED 合计把多付灌回（造币循环）。
-      await this._recordOverpayDisposalPayment(tx, {
-        orderId,
-        amountCny: overpay,
-        method,
-        disposal: 'RECEIPT_POOL',
-        description: `订单 ${order.orderNumber} 多付转入挂账池`,
-      });
-
       // 建一笔 OPEN 进账（挂账池），来源标记订单超额
       const receipt = await createOpenReceiptWithinTx(tx, {
         amountCny: overpay,
@@ -6418,6 +6440,17 @@ export class OrderService {
         payerNote: `订单超额 ${order.orderNumber}`,
         orderHintId: orderId,
         createdById: actor.userId,
+      });
+
+      // R6：台账同步登记等额流出，否则订单再进一次 PAID 就会按 SUCCEEDED 合计把多付灌回（造币循环）。
+      // 对冲行载荷埋进账 id：订单详情据此把「这笔多付转去了哪、后来核销到了谁」永久挂在这一行上。
+      await this._recordOverpayDisposalPayment(tx, {
+        orderId,
+        amountCny: overpay,
+        method,
+        disposal: 'RECEIPT_POOL',
+        description: `订单 ${order.orderNumber} 多付转入挂账池`,
+        poolReceipt: { id: receipt.id, receiptNo: receipt.receiptNo },
       });
 
       return {
@@ -26733,6 +26766,15 @@ function redactItemMetadataForExternal(metadata: unknown): unknown {
  *（AGENT / CUSTOMER，redactForExternal=true）一律不下发 —— 与 paymentsLockedBy 同档。
  */
 const RECONCILE_NOTE_PREFIX = '对账认领 ';
+/** 订单详情（getOrder）收款行 = 序列化收款记录 + 内部视角的挂账去向留痕（对外角色没有这两个键）。 */
+type OrderDetailPayment = ReturnType<typeof serializePaymentRecord> & {
+  overpaySplit?: OverpaySplitTrail | null;
+  poolTrail?: PoolTrail | null;
+};
+/** getOrder 在 serializeOrder 之上追加的键；显式标注，免得两条分支被推成联合类型。 */
+type OrderDetailExtras = {
+  overpayReceipts?: PoolTrail[];
+};
 function serializePaymentRecord(
   p: NonNullable<OrderLike['payments']>[number],
   opts: { redactForExternal: boolean },

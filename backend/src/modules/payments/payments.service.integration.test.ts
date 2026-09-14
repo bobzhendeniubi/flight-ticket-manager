@@ -17,6 +17,8 @@ import { describe, it, expect } from 'vitest';
 import { HoldOwnerType, OrderStatus, PaymentMethod, Prisma, ReceiptSource, ReceiptStatus, UserRole, PaymentStatus } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { PaymentsService } from './payments.service.js';
+import { OrderService } from '../orders/orders.service.js';
+import { ReceiptsService } from '../receipts/receipts.service.js';
 
 // ── Fixtures ──────────────────────────────────────────────────────────────
 async function createCustomer() {
@@ -1141,5 +1143,141 @@ describe('PaymentsService.transferManualPayment · 真 DB 守卫与对账联动'
     ).rejects.toThrow(/缺失、重复或金额不一致.*收款对账台/);
     expect((await prisma.payment.findUniqueOrThrow({ where: { id: payment.id } })).status).toBe(PaymentStatus.SUCCEEDED);
     expect(await prisma.payment.count({ where: { orderId: target.id } })).toBe(0);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('订单详情 · 挂账去向永久留痕（水单毛额 → 本单入账 → 转池 → 核销去向）', () => {
+  const service = new PaymentsService();
+  const receiptsService = new ReceiptsService();
+  const orderService = new OrderService();
+
+  /**
+   * 财务查账口径：水单 2864 录进来，本单应收 2454 记进本单、410 拆进挂账池，之后 410 核销到
+   * 另外两张单。已付金额必须仍是 2454（不能改成毛额），但收款行要永久带出整条去向——
+   * 此前池子那笔一核销完，本单就再也看不出这笔水单其实是 2864。
+   */
+  it('拆分收款行带毛额/本单入账/转池，池子核销到其他单后去向仍留在本单', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 2454);
+    const otherA = await createPendingOrder(customer.id, 156);
+    const otherB = await createPendingOrder(customer.id, 140);
+
+    const res = await service.confirmManualPayment(
+      order.id,
+      { amount: 2864, method: PaymentMethod.BANK_CARD },
+      ADMIN,
+    );
+    const receiptId = res.overpaySplit!.receiptId;
+    await receiptsService.allocate(receiptId, { orderId: otherA.id, amountCny: 156 }, ADMIN);
+    await receiptsService.allocate(receiptId, { orderId: otherB.id, amountCny: 140 }, ADMIN);
+
+    const detail = await orderService.getOrder(order.id, { ...ADMIN, actorType: 'USER' });
+    // 已付不动：只计本单入账部分
+    expect(Number(detail.paidAmount)).toBe(2454);
+    expect(detail.payments).toHaveLength(1);
+    const row = detail.payments![0];
+    expect(Number(row.amount)).toBe(2454);
+    // 收款行上的拆分去向
+    expect(row.overpaySplit).toMatchObject({
+      receivedAmount: 2864,
+      creditedAmount: 2454,
+      pooledAmount: 410,
+      receiptNo: res.overpaySplit!.receiptNo,
+    });
+    const pool = row.overpaySplit!.pool!;
+    expect(pool.pooledAmount).toBe(410);
+    expect(pool.allocations.map((a) => [a.orderNumber, a.amountCny])).toEqual([
+      [otherA.orderNumber, 156],
+      [otherB.orderNumber, 140],
+    ]);
+    expect(pool.remainingCny).toBe(114);
+    expect(pool.receiptStatus).toBe(ReceiptStatus.PARTIALLY_ALLOCATED);
+    // 池子那笔已被收款行承接，不再重复列到「无承接进账」里
+    expect(detail.overpayReceipts).toEqual([]);
+    expect(row.poolTrail).toBeNull();
+  });
+
+  it('本单应收已满、整笔进池（没有收款行承接）→ 详情 overpayReceipts 列出这笔钱的去向', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 1000);
+    const other = await createPendingOrder(customer.id, 300);
+    await service.confirmManualPayment(order.id, { amount: 1000, method: PaymentMethod.BANK_CARD }, ADMIN);
+    // 已收满再录 300：一分不进本单，整笔进池
+    const res = await service.confirmManualPayment(
+      order.id,
+      { amount: 300, method: PaymentMethod.WECHAT_PAY },
+      ADMIN,
+    );
+    expect(res.overpaySplit?.creditedAmount).toBe(0);
+    await receiptsService.allocate(res.overpaySplit!.receiptId, { orderId: other.id, amountCny: 300 }, ADMIN);
+
+    const detail = await orderService.getOrder(order.id, { ...ADMIN, actorType: 'USER' });
+    expect(Number(detail.paidAmount)).toBe(1000);
+    expect(detail.payments!.every((p) => p.overpaySplit === null)).toBe(true);
+    expect(detail.overpayReceipts).toHaveLength(1);
+    const trail = detail.overpayReceipts![0];
+    expect(trail.receiptNo).toBe(res.overpaySplit!.receiptNo);
+    expect(trail.pooledAmount).toBe(300);
+    expect(trail.remainingCny).toBe(0);
+    expect(trail.receiptStatus).toBe(ReceiptStatus.ALLOCATED);
+    expect(trail.allocations.map((a) => [a.orderNumber, a.amountCny])).toEqual([[other.orderNumber, 300]]);
+  });
+
+  it('多付转挂账池：对冲行带 poolTrail（进账号 + 核销去向），且不重复列进 overpayReceipts', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 1000);
+    const other = await createPendingOrder(customer.id, 300);
+    await service.confirmManualPayment(order.id, { amount: 1000, method: PaymentMethod.BANK_CARD }, ADMIN);
+    // 制造账面多付 300（改价后应收降了、或历史数据）：直接把 paidAmount 抬到 1300 并补一条实收行
+    await prisma.order.update({ where: { id: order.id }, data: { paidAmount: new Prisma.Decimal(1300) } });
+    await prisma.payment.create({
+      data: {
+        orderId: order.id,
+        method: PaymentMethod.WECHAT_PAY,
+        amount: new Prisma.Decimal(300),
+        status: PaymentStatus.SUCCEEDED,
+        paidAt: new Date(),
+        verifiedAt: new Date(),
+      },
+    });
+    const moved = await orderService.overpayToPool(order.id, ADMIN);
+    expect(moved.movedAmount).toBe(300);
+    await receiptsService.allocate(moved.receiptId, { orderId: other.id, amountCny: 300 }, ADMIN);
+
+    const detail = await orderService.getOrder(order.id, { ...ADMIN, actorType: 'USER' });
+    expect(Number(detail.paidAmount)).toBe(1000);
+    const disposalRow = detail.payments!.find((p) => Number(p.amount) === -300);
+    expect(disposalRow).toBeDefined();
+    expect(disposalRow!.poolTrail).toMatchObject({
+      receiptNo: moved.receiptNo,
+      pooledAmount: 300,
+      remainingCny: 0,
+      receiptStatus: ReceiptStatus.ALLOCATED,
+    });
+    expect(disposalRow!.poolTrail!.allocations.map((a) => [a.orderNumber, a.amountCny])).toEqual([
+      [other.orderNumber, 300],
+    ]);
+    // 已被对冲行承接的进账不再重复列到「无承接进账」里
+    expect(detail.overpayReceipts).toEqual([]);
+  });
+
+  it('对外视角（CUSTOMER）不下发挂账去向：别的订单号不能露给客户', async () => {
+    const ADMIN = await createAdminActor();
+    const customer = await createCustomer();
+    const order = await createPendingOrder(customer.id, 500);
+    await service.confirmManualPayment(order.id, { amount: 800, method: PaymentMethod.BANK_CARD }, ADMIN);
+
+    const detail = await orderService.getOrder(order.id, {
+      userId: customer.id,
+      role: UserRole.CUSTOMER,
+      actorType: 'USER',
+    });
+    expect('overpayReceipts' in detail).toBe(false);
+    expect(detail.payments).toHaveLength(1);
+    expect('overpaySplit' in detail.payments![0]).toBe(false);
   });
 });
