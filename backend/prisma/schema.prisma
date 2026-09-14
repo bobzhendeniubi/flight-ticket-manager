@@ -1164,6 +1164,7 @@ model Hotel {
 
   roomTypes    HotelRoomType[]
   blockPeriods HotelBlockPeriod[]
+  sharedRooms  SharedRoom[]
 
   @@index([cityCode])
 }
@@ -1228,6 +1229,7 @@ model HotelRoomType {
   bundles     Bundle[]
   // 按日期区间的净房价（周末/节假日/淡旺季浮动）；没被区间覆盖的日子用上面的缺省 costPriceCny
   costPeriods HotelRoomTypeCostPeriod[]
+  sharedRooms SharedRoom[]
 
   @@unique([hotelId, name])
 }
@@ -1268,6 +1270,81 @@ model HotelRoomInventory {
 
   @@unique([roomTypeId, date])
   @@index([date])
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// 跨单分房（共享房）—— 见 docs/跨单分房-需求方案.md v2。
+//
+// 三条独立口径（§四）：物理房身份（本表 + 成员去重逐晚计 1，与份额无关）、计费份额
+// （SharedRoomMember.roomFraction，Σ=1 硬校验）、住宿行归属（成员必须挂真实酒店行）。
+// Order.roomAssignment.roomGroups[] 里镜像 sharedRoomId 只作展示/每单视图，真值以
+// 本表 + SharedRoomMember 为准（服务端每次改成员表都同步重写涉及订单的 JSON）。
+// ─────────────────────────────────────────────────────────────────────────────
+enum SharedRoomStatus {
+  ACTIVE
+  DISSOLVED
+}
+
+model SharedRoom {
+  id              String           @id @default(cuid())
+  hotelId         String
+  hotelRoomTypeId String
+  // 房内所有成员的订单行入住区间必须与之一致（保存时校验，见 hotel-control.service）
+  checkIn         DateTime         @db.Date
+  checkOut        DateTime         @db.Date
+  status          SharedRoomStatus @default(ACTIVE)
+  // 每次变更 +1，CAS（expectedVersions）用
+  version         Int              @default(1)
+  notes           String? // 房控内部备注（不对代理/客户展示）
+  // 记录创建人 userId（非外键——审计走独立 AuditLog，这里只是留痕，避免为此牵连 User 关系图）
+  createdById     String?
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  dissolvedAt     DateTime?
+  dissolvedReason String?
+
+  hotel         Hotel              @relation(fields: [hotelId], references: [id])
+  hotelRoomType HotelRoomType      @relation(fields: [hotelRoomTypeId], references: [id])
+  members       SharedRoomMember[]
+
+  @@index([hotelId, checkIn, checkOut])
+  @@index([status])
+}
+
+/// 共享房成员：一个（订单，订单行，乘客）在该共享房里的计费份额（§三）。
+model SharedRoomMember {
+  id           String   @id @default(cuid())
+  sharedRoomId String
+  orderId      String
+  orderItemId  String
+  passengerId  String
+  // 计费份额：允许 0（Σ 份额=1 硬校验在保存时做，本列不加约束）；0.5 步进
+  roomFraction Decimal  @db.Decimal(4, 1)
+  createdAt    DateTime @default(now())
+  updatedAt    DateTime @updatedAt
+
+  sharedRoom SharedRoom @relation(fields: [sharedRoomId], references: [id], onDelete: Cascade)
+  order      Order      @relation(fields: [orderId], references: [id], onDelete: Cascade)
+  orderItem  OrderItem  @relation(fields: [orderItemId], references: [id], onDelete: Cascade)
+  passenger  Passenger  @relation(fields: [passengerId], references: [id], onDelete: Cascade)
+
+  @@unique([sharedRoomId, passengerId])
+  @@index([sharedRoomId])
+  @@index([orderId])
+  @@index([orderItemId])
+  @@index([passengerId])
+}
+
+/// 跨单分房保存的幂等记录（§六）：requestToken 唯一；同 token 同指纹回放 resultJson，
+/// 同 token 不同指纹 409（服务层判定，本表只存不比较）。
+model SharedRoomRequest {
+  id           String   @id @default(cuid())
+  requestToken String   @unique
+  fingerprint  String
+  resultJson   Json
+  createdAt    DateTime @default(now())
+
+  @@index([createdAt])
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -1777,6 +1854,7 @@ model Order {
   settlementRequests SettlementRequest[]
   bundleChangeRequests BundleChangeRequest[]
   orderChangeRequests  OrderChangeRequest[]
+  sharedRoomMembers    SharedRoomMember[]
 
   @@index([userId, createdAt])
   @@index([agentId, createdAt])
@@ -1841,6 +1919,7 @@ model OrderItem {
   bundle           Bundle?           @relation(fields: [bundleId], references: [id])
   passenger        Passenger?        @relation(fields: [passengerId], references: [id], onDelete: SetNull)
   fulfillmentTasks FulfillmentTask[]
+  sharedRoomMembers SharedRoomMember[]
 
   @@index([orderId])
   @@index([passengerId])
@@ -2007,6 +2086,7 @@ model Passenger {
   order Order @relation(fields: [orderId], references: [id], onDelete: Cascade)
   // 按乘客调价行（0722）：本乘客名下的价格调整 OrderItem（SetNull——清人不丢金额，只失归属）。
   adjustmentItems OrderItem[]
+  sharedRoomMemberships SharedRoomMember[]
 
   @@index([orderId])
 }
