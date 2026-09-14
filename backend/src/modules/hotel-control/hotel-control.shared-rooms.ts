@@ -464,10 +464,19 @@ async function saveSharedRoomsInner(
     throw new BadRequestError('占位酒店不参与跨单分房，请先把随机档落位到真实酒店');
   }
 
-  const touchedSharedRoomIds = new Set<string>([
-    ...body.rooms.map((r) => r.sharedRoomId).filter((v): v is string => !!v),
-    ...body.dissolve,
-  ]);
+  const roomIdsBeingSaved = new Set(
+    body.rooms.map((r) => r.sharedRoomId).filter((v): v is string => !!v),
+  );
+  const dissolveSet = new Set(body.dissolve);
+  // rooms 与 dissolve 不许重叠（astra A3）：同一请求里既要保留/更新一间房、又要解散它，
+  // 语义自相矛盾——不判的话哪一段先跑就决定了最终状态，是隐藏的执行顺序依赖。
+  for (const roomId of dissolveSet) {
+    if (roomIdsBeingSaved.has(roomId)) {
+      throw new BadRequestError(`共享房 ${roomId} 同时出现在 rooms 与 dissolve 中，一次请求只能二选一`);
+    }
+  }
+
+  const touchedSharedRoomIds = new Set<string>([...roomIdsBeingSaved, ...dissolveSet]);
   const initialOrderIds = new Set<string>(body.rooms.flatMap((r) => r.groups.map((g) => g.orderId)));
 
   const result = await client.$transaction(async (tx) => {
@@ -482,13 +491,32 @@ async function saveSharedRoomsInner(
     const currentById = new Map(currentSharedRooms.map((r) => [r.id, r]));
     for (const roomId of touchedSharedRoomIds) {
       const current = currentById.get(roomId);
-      if (!current) throw new NotFoundError(`共享房 ${roomId} 不存在或已被解散`);
+      if (!current) throw new NotFoundError(`共享房 ${roomId} 不存在`);
       const expected = body.expectedVersions?.[roomId];
       if (expected == null || expected !== current.version) {
         throw new ConflictError('该房间已被他人修改，请刷新后重试');
       }
       if (current.hotelId !== body.hotelId) {
         throw new BadRequestError(`共享房 ${roomId} 不属于本酒店`);
+      }
+      // 会被保留/更新的房间（不在本次 dissolve 列表里）：锁内强制校验 ACTIVE + 入住区间与
+      // 本次请求完全一致（astra A3）——否则「更新」一间已解散的房会把它悄悄复活成幽灵房
+      // （成员/JSON 重新写入，SharedRoom.status 却仍是 DISSOLVED，两套聚合口径都跳过它，
+      // 实际住宿计成 0）；或者把一间旧日期的房套用到新日期的订单行上，落库后房控仍按
+      // 旧日期计物理占用，逃过新日期那晚的前瞻闸。不一致一律拒绝，逼调用方新建 + 解散旧房，
+      // 而不是借「更新」悄悄挪日期/复活。
+      if (!dissolveSet.has(roomId)) {
+        if (current.status !== 'ACTIVE') {
+          throw new BadRequestError(`共享房 ${roomId} 已解散，不能更新，请新建一间房`);
+        }
+        if (
+          current.checkIn.getTime() !== checkInD.getTime() ||
+          current.checkOut.getTime() !== checkOutD.getTime()
+        ) {
+          throw new BadRequestError(
+            `共享房 ${roomId} 的入住区间与本次请求不一致，不能借更新挪动日期，请新建一间房后解散旧房`,
+          );
+        }
       }
     }
 
@@ -574,7 +602,9 @@ async function saveSharedRoomsInner(
     }
 
     // ── 计算变更后状态：每张受影响订单的新 roomGroups + 每张房的成员表覆盖 ──────
-    const dissolveSet = new Set(body.dissolve);
+    // dissolveSet 复用函数顶部（pre-tx）算好的那份，不在这里重新 new Set——两处必须是
+    // 同一个集合，否则上面 CAS 循环判过的「是否在本次 dissolve 里」和这里实际解散的
+    // 集合就可能对不上（虽然目前两处输入相同不会真出岔子，但同一份数据只算一次更稳）。
     const newGroupsByOrder = new Map<string, Array<Record<string, unknown>>>();
     for (const [orderId, order] of orders) {
       const groups = parseRoomGroups(order.roomAssignment);
@@ -718,7 +748,15 @@ async function saveSharedRoomsInner(
     for (const roomId of dissolveSet) {
       await tx.sharedRoom.update({
         where: { id: roomId },
-        data: { status: 'DISSOLVED', dissolvedAt: new Date(), dissolvedReason: '跨单分房工作台解散' },
+        // version 也要递增（astra A3）：解散同样是一次「变更」，不递增的话别处拿着解散前的
+        // 旧 expectedVersions 还能在 CAS 那一关侥幸对上号——虽然上面新增的 ACTIVE 校验已经会
+        // 拦下「更新一间已解散的房」，但版本本就该随每次状态变化单调递增，不留特例。
+        data: {
+          status: 'DISSOLVED',
+          dissolvedAt: new Date(),
+          dissolvedReason: '跨单分房工作台解散',
+          version: { increment: 1 },
+        },
       });
       await tx.sharedRoomMember.deleteMany({ where: { sharedRoomId: roomId } });
     }
@@ -731,6 +769,10 @@ async function saveSharedRoomsInner(
           data: {
             hotelRoomTypeId: room.hotelRoomTypeId,
             notes: room.notes ?? null,
+            // checkIn/checkOut 显式带上（虽然上面的 CAS 循环已经强制校验它们与本次请求一致，
+            // 这里再写一遍纯属防御：万一以后那道校验被改坏，落库这行仍然不会悄悄挪日期）。
+            checkIn: checkInD,
+            checkOut: checkOutD,
             version: { increment: 1 },
           },
           select: { id: true, version: true },
