@@ -15073,7 +15073,14 @@ export class OrderService {
       // 写的是「X星随机（待落位）」而不是占位酒店的字面名。
       const nextPlacement = resolveRoomGroupPlacement({ hotelRoomType: newRoomType });
       if (nextPlacement) {
-        const refreshed = refreshRoomGroupsForItem(order.roomAssignment, item.id, nextPlacement, {
+        // 共享行解绑（上面那步）已经改写过 order.roomAssignment——这里的 order 变量是解绑前
+        // 读的旧快照，直接拿它喂 refreshRoomGroupsForItem 会把解绑的结果覆盖回去（sharedRoomId
+        // 复活）。hasSharedMembers 时重新读一遍锁内现状，非共享行沿用旧快照（少一次查询）。
+        const currentRoomAssignment = hasSharedMembers
+          ? ((await tx.order.findUnique({ where: { id: orderId }, select: { roomAssignment: true } }))
+              ?.roomAssignment ?? null)
+          : order.roomAssignment;
+        const refreshed = refreshRoomGroupsForItem(currentRoomAssignment, item.id, nextPlacement, {
           legacyMatch: (g) =>
             oldRoomType != null &&
             g.hotelName === oldRoomType.hotel.name &&
