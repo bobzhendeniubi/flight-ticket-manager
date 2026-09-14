@@ -15302,13 +15302,23 @@ export class OrderService {
         throw new BadRequestError('该房组已归属其它订单行，不能从本行拆出');
       }
 
+      // §八「按房组拆行」：共享组允许 0 份额搬行（该行原是让份的一方），成本按份额比例——
+      // movedCost 公式（下方）本就是 srcTotalCost × movedHalf/srcHalf，0 份额自然算出 0 成本。
+      const targetSharedRoomId =
+        typeof target.sharedRoomId === 'string' && target.sharedRoomId.length > 0
+          ? target.sharedRoomId
+          : null;
+
       // ── 数量守卫（0.5 网格；Σ roomsBilled 守恒的前提）──
       const movedRaw = target.roomFraction == null ? 1 : Number(target.roomFraction);
-      if (!Number.isFinite(movedRaw) || movedRaw <= 0) {
+      if (!Number.isFinite(movedRaw) || movedRaw < 0) {
+        throw new BadRequestError('房组间数（roomFraction）无效，请先修正分房表');
+      }
+      if (movedRaw === 0 && !targetSharedRoomId) {
         throw new BadRequestError('房组间数（roomFraction）无效，请先修正分房表');
       }
       const movedHalf = Math.round(movedRaw * 2);
-      if (movedHalf <= 0 || Math.abs(movedRaw * 2 - movedHalf) > 1e-9) {
+      if (Math.abs(movedRaw * 2 - movedHalf) > 1e-9) {
         throw new BadRequestError('房组间数必须是 0.5 的整数倍');
       }
       const srcRooms = item.roomsBilled != null ? Number(item.roomsBilled) : null;
@@ -15372,6 +15382,16 @@ export class OrderService {
           totalCostCny: keptCost == null ? null : new Prisma.Decimal(keptCost),
         },
       });
+
+      // 目标组带 sharedRoomId：该房间的 SharedRoomMember.orderItemId 也要跟着从源行
+      // 改指到新行——不然成员表与下方即将写的房组 JSON（orderItemId 指向 created.id）
+      // 就对不上了（真值优先级 SharedRoomMember 表 > 订单 JSON，见 shared-room-unbind.ts）。
+      if (targetSharedRoomId) {
+        await tx.sharedRoomMember.updateMany({
+          where: { sharedRoomId: targetSharedRoomId, orderId, orderItemId: item.id },
+          data: { orderItemId: created.id },
+        });
+      }
 
       // ── 房组归属：目标组指到新行；其余无归属组回填为源行（本单从此每组有归属）──
       const newGroups = rawGroups.map((g) => {
