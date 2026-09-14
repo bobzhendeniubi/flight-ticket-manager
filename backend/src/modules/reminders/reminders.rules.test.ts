@@ -673,6 +673,102 @@ describe('ROOM_UNASSIGNED 分房提醒规则', () => {
   });
 });
 
+// ── 规则 8b：跨单分房落地后新增——部分未分房 ─────────────────────────────────
+describe('ROOM_PARTIALLY_UNASSIGNED 部分未分房提醒规则', () => {
+  const twoPax = [
+    { id: 'p1', fullName: '张三', passportExpiry: null },
+    { id: 'p2', fullName: '李四', passportExpiry: null },
+  ];
+
+  it('已分房但仍有人不在任何房组 → HIGH，点名遗漏乘客；ruleKey 按订单+首入住日+PARTIAL 后缀', () => {
+    const candidates = buildOrderCandidates(
+      fakeOrder({
+        items: [hotelItem('2026-07-12')],
+        roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] }, // 只分了 p1，p2 还没进房组
+        passengers: twoPax,
+      }),
+      TODAY,
+    ).filter((c) => c.rule === 'ROOM_PARTIALLY_UNASSIGNED');
+    expect(candidates).toHaveLength(1);
+    expect(candidates[0]).toMatchObject({
+      priority: ReminderPriority.HIGH,
+      ruleKey: 'ROOMASSIGN:ord_1:2026-07-12:PARTIAL',
+    });
+    expect(candidates[0]!.body).toContain('李四');
+    expect(candidates[0]!.body).not.toContain('张三'); // 已分房的人不点名
+  });
+
+  it('入住 1 天内升级 CRITICAL（与 ROOM_UNASSIGNED 同一套窗口/优先级判定）', () => {
+    const critical = buildOrderCandidates(
+      fakeOrder({
+        items: [hotelItem('2026-07-10')],
+        roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] },
+        passengers: twoPax,
+      }),
+      TODAY,
+    ).filter((c) => c.rule === 'ROOM_PARTIALLY_UNASSIGNED');
+    expect(critical[0]).toMatchObject({ priority: ReminderPriority.CRITICAL });
+  });
+
+  it('共享房组（带 sharedRoomId）的 passengerIds 一样算已覆盖——不用另查 SharedRoomMember', () => {
+    const fires = buildOrderCandidates(
+      fakeOrder({
+        items: [hotelItem('2026-07-12')],
+        roomAssignment: {
+          roomGroups: [
+            { passengerIds: ['p1'], sharedRoomId: 'sr1' },
+            { passengerIds: ['p2'] },
+          ],
+        },
+        passengers: twoPax,
+      }),
+      TODAY,
+    ).some((c) => c.rule === 'ROOM_PARTIALLY_UNASSIGNED');
+    expect(fires).toBe(false);
+  });
+
+  it('占位联系人（documentNumber=N/A）不算「该有房间的人」，不会被点名遗漏', () => {
+    const fires = buildOrderCandidates(
+      fakeOrder({
+        items: [hotelItem('2026-07-12')],
+        roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] },
+        passengers: [...twoPax, { id: 'p3', fullName: '占位联系人', passportExpiry: null, documentNumber: 'N/A' }],
+      }),
+      TODAY,
+    ).some((c) => c.rule === 'ROOM_PARTIALLY_UNASSIGNED');
+    // p2 仍未分房，规则本该触发——这条断言确认 p3（占位）不会让判定提前通过/也不会被误点名
+    expect(fires).toBe(true);
+  });
+
+  it('全员已分房 / 整单未分房（走 ROOM_UNASSIGNED）/ 入住超窗 / 老口径没取字段 → 不触发', () => {
+    const fires = (order: RuleOrder) =>
+      buildOrderCandidates(order, TODAY).some((c) => c.rule === 'ROOM_PARTIALLY_UNASSIGNED');
+    expect(
+      fires(
+        fakeOrder({
+          items: [hotelItem('2026-07-12')],
+          roomAssignment: { roomGroups: [{ passengerIds: ['p1', 'p2'] }] },
+          passengers: twoPax,
+        }),
+      ),
+    ).toBe(false);
+    // 整单一个人都没分：只报 ROOM_UNASSIGNED，不会同时又报一条部分未分房
+    expect(
+      fires(fakeOrder({ items: [hotelItem('2026-07-12')], roomAssignment: null, passengers: twoPax })),
+    ).toBe(false);
+    expect(
+      fires(
+        fakeOrder({
+          items: [hotelItem('2026-07-20')],
+          roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] },
+          passengers: twoPax,
+        }),
+      ),
+    ).toBe(false);
+    expect(fires(fakeOrder({ items: [hotelItem('2026-07-12')], passengers: twoPax }))).toBe(false);
+  });
+});
+
 // ── 规则 7：临近出发未送签 ───────────────────────────────────────────────────
 describe('VISA_NOT_SUBMITTED 送签提醒规则', () => {
   const base = {
@@ -869,6 +965,48 @@ describe('generateRuleReminders — 触发条件消失后自动核销（B-14/C-7
     await generateRuleReminders(mock, 'user_sys', NOW2);
 
     expect(rows.get('r1')).toMatchObject({ status: ReminderStatus.DONE });
+  });
+
+  it('ROOM_PARTIALLY_UNASSIGNED：遗漏的人补分房表后 → 存量 :PARTIAL 提醒自动核销（整单键不受影响）', async () => {
+    const order = baseOrder({
+      items: [hotelItem(departSoon2)],
+      // 补分之前只有 p1，:PARTIAL 提醒存量 OPEN；这一轮补齐了 p2，两个键都该解除
+      roomAssignment: { roomGroups: [{ passengerIds: ['p1', 'p2'] }] },
+      passengers: [
+        { id: 'p1', fullName: '张三', passportExpiry: null },
+        { id: 'p2', fullName: '李四', passportExpiry: null },
+      ],
+    });
+    const wholeKey = `ROOMASSIGN:ord_x:${departSoon2}`;
+    const partialKey = `ROOMASSIGN:ord_x:${departSoon2}:PARTIAL`;
+    const { mock, rows } = makeMockPrisma(order, [
+      { id: 'r1', ruleKey: wholeKey, status: ReminderStatus.OPEN },
+      { id: 'r2', ruleKey: partialKey, status: ReminderStatus.OPEN },
+    ]);
+
+    await generateRuleReminders(mock, 'user_sys', NOW2);
+
+    expect(rows.get('r1')).toMatchObject({ status: ReminderStatus.DONE });
+    expect(rows.get('r2')).toMatchObject({ status: ReminderStatus.DONE });
+  });
+
+  it('ROOM_PARTIALLY_UNASSIGNED：仍有人没补分房表 → :PARTIAL 提醒保持 OPEN，不误关', async () => {
+    const order = baseOrder({
+      items: [hotelItem(departSoon2)],
+      roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] }, // p2 还没分
+      passengers: [
+        { id: 'p1', fullName: '张三', passportExpiry: null },
+        { id: 'p2', fullName: '李四', passportExpiry: null },
+      ],
+    });
+    const partialKey = `ROOMASSIGN:ord_x:${departSoon2}:PARTIAL`;
+    const { mock, rows } = makeMockPrisma(order, [
+      { id: 'r2', ruleKey: partialKey, status: ReminderStatus.OPEN },
+    ]);
+
+    await generateRuleReminders(mock, 'user_sys', NOW2);
+
+    expect(rows.get('r2')).toMatchObject({ status: ReminderStatus.OPEN });
   });
 
   it('PASSPORT_EXPIRY：护照已续期（有效期覆盖到出发+6个月之后）→ 自动核销', async () => {

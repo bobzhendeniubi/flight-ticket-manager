@@ -227,6 +227,7 @@ export type RuleName =
   | 'TICKET_MISSING'
   | 'VISA_NOT_SUBMITTED'
   | 'ROOM_UNASSIGNED'
+  | 'ROOM_PARTIALLY_UNASSIGNED'
   | 'RECEIPT_UNVERIFIED'
   | 'RANDOM_TIER_SHORTFALL'
   | 'NO_SHOW_RETURN_RELEASED';
@@ -269,6 +270,12 @@ export interface RuleOrder {
     passportExpiry: Date | null;
     /** 票号；可选 = 老调用方不传时规则 6 不判该乘客（undefined ≠ 缺票号）。*/
     eticketNumber?: string | null;
+    /**
+     * 证件号；可选 = 老调用方不传时规则 8「部分未分房」不排除占位联系人（undefined ≠ 占位）。
+     * 'N/A' = 占位联系人（口径同 hotel-control getOccupyingOrders 的 passengerCount），不算
+     * 「该有房间的出行人」，不参与部分未分房判定。
+     */
+    documentNumber?: string | null;
   }[];
 }
 
@@ -284,6 +291,39 @@ export function hasRoomAssignment(roomAssignment: unknown): boolean {
     const ids = (g as { passengerIds?: unknown }).passengerIds;
     return Array.isArray(ids) && ids.length > 0;
   });
+}
+
+/**
+ * 分房表覆盖到的全部乘客 id（跨房组去重）。共享房组（带 sharedRoomId）的 passengerIds 由
+ * 服务端在每次改共享房成员表时同步重写进订单 JSON（§三真值优先级：成员表 > 订单 JSON），
+ * 所以这里不用另外查 SharedRoomMember 表——本单在共享房里的乘客已经在这个集合里。
+ * 形状不符返回空集合（同 hasRoomAssignment 的防御式解析）。
+ */
+function assignedPassengerIds(roomAssignment: unknown): Set<string> {
+  const out = new Set<string>();
+  if (!roomAssignment || typeof roomAssignment !== 'object') return out;
+  const groups = (roomAssignment as { roomGroups?: unknown }).roomGroups;
+  if (!Array.isArray(groups)) return out;
+  for (const g of groups) {
+    const ids = (g as { passengerIds?: unknown }).passengerIds;
+    if (!Array.isArray(ids)) continue;
+    for (const id of ids) {
+      if (typeof id === 'string' && id.length > 0) out.add(id);
+    }
+  }
+  return out;
+}
+
+/** 部分未分房判定所需的最小乘客形状（documentNumber='N/A' 占位联系人排除）。*/
+type RoomEligiblePassenger = { id: string; fullName: string; documentNumber?: string | null };
+
+/** order.passengers 里仍不在任何房组/共享房（`assignedPassengerIds`）里的、真正该有房间的人。*/
+function unassignedRoomPassengers(
+  roomAssignment: unknown,
+  passengers: readonly RoomEligiblePassenger[],
+): RoomEligiblePassenger[] {
+  const assignedIds = assignedPassengerIds(roomAssignment);
+  return passengers.filter((p) => p.documentNumber !== 'N/A' && !assignedIds.has(p.id));
 }
 
 export interface RuleVisaTask {
@@ -405,28 +445,45 @@ export function buildOrderCandidates(order: RuleOrder, today: string): ReminderC
 
   // 8) 分房提醒：有酒店入住、最早入住日 3 天内（含今天）、分房表还没分人。
   //    roomAssignment === undefined 表示调用方没取这个字段（老口径）→ 不判，同规则 6 哲学。
+  //    跨单分房落地后，「已分房」不再是全有全无：一张单可能只分了一部分人（其余人还没
+  //    进任何房组/共享房）。两条子规则共用同一个窗口与 CRITICAL 判定，key 用后缀区分，
+  //    互不覆盖——整单未分房时只报 ROOM_UNASSIGNED，不会同时又报一条部分未分房。
   if (order.roomAssignment !== undefined && DEPARTURE_SOON_STATUSES.includes(order.status)) {
     const checkIns = order.items
       .filter((item): item is DepartureSourceItem & { hotelCheckIn: Date } =>
         Boolean(item.hotelCheckIn),
       )
       .map((item) => item.hotelCheckIn.getTime());
-    if (checkIns.length > 0 && !hasRoomAssignment(order.roomAssignment)) {
+    if (checkIns.length > 0) {
       const firstCheckIn = utcDateStr(new Date(Math.min(...checkIns)));
       const daysToCheckIn = diffDays(today, firstCheckIn);
       if (daysToCheckIn >= 0 && daysToCheckIn <= ROOM_UNASSIGNED_WINDOW_DAYS) {
-        out.push({
-          rule: 'ROOM_UNASSIGNED',
-          ruleKey: `ROOMASSIGN:${order.id}:${firstCheckIn}`,
-          orderId: order.id,
-          title: `【临近入住未分房】${order.orderNumber} ${firstCheckIn}入住`,
-          body: `最早入住 ${firstCheckIn}，该单还没进分房表。请房控完成分房（随机档单需先落位到具体酒店）。`,
-          priority:
-            daysToCheckIn <= ROOM_UNASSIGNED_CRITICAL_DAYS
-              ? ReminderPriority.CRITICAL
-              : ReminderPriority.HIGH,
-          dueAt: today,
-        });
+        const priority =
+          daysToCheckIn <= ROOM_UNASSIGNED_CRITICAL_DAYS ? ReminderPriority.CRITICAL : ReminderPriority.HIGH;
+        if (!hasRoomAssignment(order.roomAssignment)) {
+          out.push({
+            rule: 'ROOM_UNASSIGNED',
+            ruleKey: `ROOMASSIGN:${order.id}:${firstCheckIn}`,
+            orderId: order.id,
+            title: `【临近入住未分房】${order.orderNumber} ${firstCheckIn}入住`,
+            body: `最早入住 ${firstCheckIn}，该单还没进分房表。请房控完成分房（随机档单需先落位到具体酒店）。`,
+            priority,
+            dueAt: today,
+          });
+        } else {
+          const unassigned = unassignedRoomPassengers(order.roomAssignment, order.passengers);
+          if (unassigned.length > 0) {
+            out.push({
+              rule: 'ROOM_PARTIALLY_UNASSIGNED',
+              ruleKey: `ROOMASSIGN:${order.id}:${firstCheckIn}:PARTIAL`,
+              orderId: order.id,
+              title: `【临近入住部分未分房】${order.orderNumber} ${firstCheckIn}入住`,
+              body: `最早入住 ${firstCheckIn}，该单已进分房表，但仍有 ${unassigned.length} 位出行人不在任何房组/共享房：${unassigned.map((p) => p.fullName).join('，')}。请房控补齐分房。`,
+              priority,
+              dueAt: today,
+            });
+          }
+        }
       }
     }
   }
@@ -820,7 +877,13 @@ export async function generateRuleReminders(
           },
         },
         passengers: {
-          select: { id: true, fullName: true, passportExpiry: true, eticketNumber: true },
+          select: {
+            id: true,
+            fullName: true,
+            passportExpiry: true,
+            eticketNumber: true,
+            documentNumber: true, // 规则 8「部分未分房」排除占位联系人（documentNumber='N/A'）
+          },
         },
       },
     }),
@@ -1138,15 +1201,22 @@ export async function generateRuleReminders(
       }
     }
     // 4) 房已分：roomAssignment === undefined 表示这一轮调用方没查这个字段（老口径），
-    //    不能当「未分房已解除」；只有明确查到且非空才算数。
+    //    不能当「未分房已解除」；只有明确查到且非空才算数。部分未分房（:PARTIAL）是独立
+    //    子键：已覆盖到全部该有房间的乘客才解除，与整单 ROOMASSIGN 键的解除条件不同一个
+    //    判据（整单键只要求「有分房表」，部分键要求「没有遗漏的人」）。
     if (order.roomAssignment !== undefined) {
       const checkIns = order.items
         .map((item) => item.hotelCheckIn)
         .filter((d): d is Date => d !== null)
         .map((d) => d.getTime());
-      if (checkIns.length > 0 && hasRoomAssignment(order.roomAssignment)) {
+      if (checkIns.length > 0) {
         const firstCheckIn = utcDateStr(new Date(Math.min(...checkIns)));
-        resolvedRuleKeys.push(`ROOMASSIGN:${order.id}:${firstCheckIn}`);
+        if (hasRoomAssignment(order.roomAssignment)) {
+          resolvedRuleKeys.push(`ROOMASSIGN:${order.id}:${firstCheckIn}`);
+        }
+        if (unassignedRoomPassengers(order.roomAssignment, order.passengers).length === 0) {
+          resolvedRuleKeys.push(`ROOMASSIGN:${order.id}:${firstCheckIn}:PARTIAL`);
+        }
       }
     }
   }
