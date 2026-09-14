@@ -274,7 +274,7 @@ describe('assertHotelFitAfterChange', () => {
       assertHotelFitAfterChange(tx as unknown as TxArg, 'h1', [dayStr(0)], {
         affectedOrderIds: ['orderA'],
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual([]);
     expect(tx.orderItem.findMany).not.toHaveBeenCalled();
   });
 
@@ -306,7 +306,63 @@ describe('assertHotelFitAfterChange', () => {
           { sharedRoomId: 'sr1', checkIn: day(0), checkOut: day(1), activeMemberOrderIds: ['orderA'] },
         ],
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual([]);
+  });
+
+  // ── nextSharedRooms 覆盖项按 hotelId 过滤（跨批需求）──────────────────────────
+  it('覆盖项自带 hotelId：传了别家酒店的共享房不影响本酒店结果', async () => {
+    const { tx } = fakeTx({ rooms: 1 }); // h1 只有 1 间包房，当前没有其它占用
+    await expect(
+      assertHotelFitAfterChange(tx as unknown as TxArg, 'h1', [dayStr(0)], {
+        affectedOrderIds: ['orderA'],
+        nextSharedRooms: [
+          // 本酒店（h1）新建一间共享房，装得下（1 间 ≤ block 1 间）。
+          { checkIn: day(0), checkOut: day(1), activeMemberOrderIds: ['orderA'], hotelId: 'h1' },
+          // 别家酒店（h2）的共享房覆盖项——不该被算进 h1 的统计，否则会把这行的日期误加
+          // 进 h1 的逐晚累计，凭空多算 1 间导致本该放行的操作被误拒。
+          {
+            sharedRoomId: 'sr-other-hotel',
+            checkIn: day(0),
+            checkOut: day(1),
+            activeMemberOrderIds: ['orderC'],
+            hotelId: 'h2',
+          },
+        ],
+      }),
+    ).resolves.toEqual([]);
+  });
+
+  it('覆盖项没带 hotelId 但带 sharedRoomId：查库补齐真实归属，别家酒店的房仍不影响本酒店结果', async () => {
+    const calls: unknown[] = [];
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      hotelBlockPeriod: { findMany: vi.fn().mockResolvedValue([{ dateFrom: day(0), dateTo: day(2), rooms: 1 }]) },
+      orderItem: { findMany: vi.fn().mockResolvedValue([]) },
+      sharedRoom: {
+        findMany: vi.fn((args: { where?: Record<string, unknown> }) => {
+          calls.push(args);
+          // 查真实归属（按 id in [...] 查）：sr-mine 属于 h1，sr-other 属于 h2。
+          if (args.where?.id) {
+            return Promise.resolve([
+              { id: 'sr-mine', hotelId: 'h1' },
+              { id: 'sr-other', hotelId: 'h2' },
+            ]);
+          }
+          return Promise.resolve([]); // 「本酒店现存活跃共享房」查询：现状没有
+        }),
+      },
+    };
+    await expect(
+      assertHotelFitAfterChange(tx as unknown as TxArg, 'h1', [dayStr(0)], {
+        affectedOrderIds: ['orderA'],
+        nextSharedRooms: [
+          // 没带 hotelId，但 sharedRoomId 查出来真实属于 h1——应当计入。
+          { sharedRoomId: 'sr-mine', checkIn: day(0), checkOut: day(1), activeMemberOrderIds: ['orderA'] },
+          // 没带 hotelId，sharedRoomId 查出来真实属于 h2——不该计入 h1 的统计。
+          { sharedRoomId: 'sr-other', checkIn: day(0), checkOut: day(1), activeMemberOrderIds: ['orderC'] },
+        ],
+      }),
+    ).resolves.toEqual([]); // 只有 sr-mine 的 1 间计入，1 ≤ block 1，放行
   });
 
   it('新建共享房把一个第三方订单的独立占房行合并进来 → 变更后物理从 2 降到 1，装得下', async () => {
@@ -347,7 +403,7 @@ describe('assertHotelFitAfterChange', () => {
         ],
         options: { allowNonWorsening: true },
       }),
-    ).resolves.toBeUndefined();
+    ).resolves.toEqual([]);
   });
 
   it('变更后比变更前更差（新增占用超出包房量）→ 抛错，不放行', async () => {
@@ -369,6 +425,151 @@ describe('assertHotelFitAfterChange', () => {
       assertHotelFitAfterChange(tx as unknown as TxArg, 'h1', [dayStr(0)], {
         affectedOrderIds: ['orderA'],
         // 本单变更后又新增一间不相干的普通占房行（模拟新增占用而非平移）
+        nextOrderItems: new Map([
+          [
+            'orderA',
+            [
+              {
+                id: 'itemA',
+                hotelCheckIn: day(0),
+                hotelCheckOut: day(1),
+                roomsBilled: 1,
+                metadata: null,
+                hotelRoomType: { hotel: { name: 'X酒店' } },
+                order: { id: 'orderA', roomAssignment: null, passengers: [{ gender: 'M' }] },
+              },
+              {
+                id: 'itemA2',
+                hotelCheckIn: day(0),
+                hotelCheckOut: day(1),
+                roomsBilled: 1,
+                metadata: null,
+                hotelRoomType: { hotel: { name: 'X酒店' } },
+                order: { id: 'orderA', roomAssignment: null, passengers: [{ gender: 'F' }] },
+              },
+            ],
+          ],
+        ]),
+      }),
+    ).rejects.toThrow(/房间不足/);
+  });
+
+  // ── maxOversellRooms：内部录单限额内超售放行（跨批需求，语义照抄 assertHotelPhysicalFit）──
+  it('maxOversellRooms：累计缺口 ≤ 上限 → 放行并返回被容忍的超卖明细（供调用方写 WARNING 审计）', async () => {
+    const { tx } = fakeTx({
+      rooms: 1,
+      liveItems: [
+        {
+          id: 'itemA',
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 1,
+          metadata: null,
+          hotelRoomType: { hotel: { name: 'X酒店' } },
+          order: { id: 'orderA', roomAssignment: null, passengers: [{ gender: 'M' }] },
+        },
+      ],
+    });
+    const tolerated = await assertHotelFitAfterChange(tx as unknown as TxArg, 'h1', [dayStr(0)], {
+      affectedOrderIds: ['orderA'],
+      // 变更后新增一间不相干的占房行——包房 1 间，变更后需 2 间，缺口 1 ≤ 上限 1。
+      nextOrderItems: new Map([
+        [
+          'orderA',
+          [
+            {
+              id: 'itemA',
+              hotelCheckIn: day(0),
+              hotelCheckOut: day(1),
+              roomsBilled: 1,
+              metadata: null,
+              hotelRoomType: { hotel: { name: 'X酒店' } },
+              order: { id: 'orderA', roomAssignment: null, passengers: [{ gender: 'M' }] },
+            },
+            {
+              id: 'itemA2',
+              hotelCheckIn: day(0),
+              hotelCheckOut: day(1),
+              roomsBilled: 1,
+              metadata: null,
+              hotelRoomType: { hotel: { name: 'X酒店' } },
+              order: { id: 'orderA', roomAssignment: null, passengers: [{ gender: 'F' }] },
+            },
+          ],
+        ],
+      ]),
+      options: { maxOversellRooms: 1 },
+    });
+    expect(tolerated).toHaveLength(1);
+    expect(tolerated[0]).toMatchObject({ date: dayStr(0), block: 1, physicalUsed: 2, shortfall: 1 });
+  });
+
+  it('maxOversellRooms：任一晚累计缺口超上限 → 仍拒，文案点名上限', async () => {
+    const { tx } = fakeTx({
+      rooms: 1,
+      liveItems: [
+        {
+          id: 'itemA',
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 1,
+          metadata: null,
+          hotelRoomType: { hotel: { name: 'X酒店' } },
+          order: { id: 'orderA', roomAssignment: null, passengers: [{ gender: 'M' }] },
+        },
+      ],
+    });
+    await expect(
+      assertHotelFitAfterChange(tx as unknown as TxArg, 'h1', [dayStr(0)], {
+        affectedOrderIds: ['orderA'],
+        nextOrderItems: new Map([
+          [
+            'orderA',
+            [
+              {
+                id: 'itemA',
+                hotelCheckIn: day(0),
+                hotelCheckOut: day(1),
+                roomsBilled: 1,
+                metadata: null,
+                hotelRoomType: { hotel: { name: 'X酒店' } },
+                order: { id: 'orderA', roomAssignment: null, passengers: [{ gender: 'M' }] },
+              },
+              {
+                id: 'itemA2',
+                hotelCheckIn: day(0),
+                hotelCheckOut: day(1),
+                roomsBilled: 1,
+                metadata: null,
+                hotelRoomType: { hotel: { name: 'X酒店' } },
+                order: { id: 'orderA', roomAssignment: null, passengers: [{ gender: 'F' }] },
+              },
+            ],
+          ],
+        ]),
+        options: { maxOversellRooms: 0 }, // 缺口 1 > 上限 0
+      }),
+    ).rejects.toThrow(/超售容忍上限 0 间/);
+  });
+
+  it('maxOversellRooms 缺省 → 缺口 1 间也硬拒，口子只对内部录单开', async () => {
+    const { tx } = fakeTx({
+      rooms: 1,
+      liveItems: [
+        {
+          id: 'itemA',
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 1,
+          metadata: null,
+          hotelRoomType: { hotel: { name: 'X酒店' } },
+          order: { id: 'orderA', roomAssignment: null, passengers: [{ gender: 'M' }] },
+        },
+      ],
+    });
+    await expect(
+      assertHotelFitAfterChange(tx as unknown as TxArg, 'h1', [dayStr(0)], {
+        affectedOrderIds: ['orderA'],
         nextOrderItems: new Map([
           [
             'orderA',

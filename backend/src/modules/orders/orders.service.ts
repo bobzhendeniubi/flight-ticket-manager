@@ -5754,6 +5754,11 @@ export class OrderService {
       });
       warnings.push(...formatUnbindWarning(reconciliationPlan.unbound, 'internal'));
 
+      // 提前到这里（跨批需求）：§五闸（下方 assertHotelFitAfterChange）与下面的老前瞻
+      // stays 闸原是同一份内部录单超售限额——之前 §五闸没接这个参数，共享触及行的恢复
+      // 比未触及行更严格（限额内也直接拒），此处补上让两条路径口径一致。
+      const hotelOversellCapRooms = await getHotelOversellCapRooms();
+
       // 被计划触及（保留合住 或 计划解绑）的行——这些行改走 §五闸；下方 stays 的老前瞻
       // 路径不理解跨单去重，必须排除，否则要么漏计（保留合住却没判容量）要么错判（解绑
       // 后瞎猜一个 floor 值）。
@@ -5826,7 +5831,9 @@ export class OrderService {
             affectedOrderIds: [orderId],
             nextOrderItems: new Map([[orderId, nextItems]]),
             nextSharedRooms,
-            options: { allowNonWorsening: true },
+            // maxOversellRooms（跨批需求）：与下方老前瞻 stays 闸用同一份内部录单限额，
+            // 恢复占座的共享触及行不该比未触及行更严格。
+            options: { allowNonWorsening: true, maxOversellRooms: hotelOversellCapRooms },
           });
         }
         // 全部涉及酒店都过闸后，才真正落库解绑（astra finding A1/A2：落库必须在闸判定之后）。
@@ -5853,7 +5860,7 @@ export class OrderService {
           roomsBilled: it.roomsBilled != null ? Number(it.roomsBilled.toString()) : null,
           randomStarTier: it.randomStarTier,
         }));
-      const hotelOversellCapRooms = await getHotelOversellCapRooms();
+      // hotelOversellCapRooms 已在本方法上面提前算好（供 §五闸复用），这里不再重复查询。
       const hotelOversold = await assertHotelStaysFitWithinTx(
         tx,
         stays,

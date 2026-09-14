@@ -1508,6 +1508,13 @@ export async function assertHotelPhysicalFitWithinTx(
  */
 export interface SharedRoomAfterState {
   sharedRoomId?: string;
+  /**
+   * 该房所属酒店 id（可选，跨批需求：函数内部按它过滤，只把本酒店的覆盖项计入本次
+   * gate）。不带这个字段时：有 sharedRoomId 就查库补齐真实归属；没有（全新建的房）
+   * 视为属于本次 gate 的 hotelId——调用方理应逐酒店只传该酒店的覆盖项，这里是兜底，
+   * 不能替代调用方自己按 hotelId 分组喂参数。
+   */
+  hotelId?: string;
   checkIn: Date;
   checkOut: Date;
   activeMemberOrderIds: readonly string[];
@@ -1527,6 +1534,12 @@ export interface AssertHotelFitAfterChangeArgs {
   options?: {
     /** 只拦「比改前更差」的操作——存量已超卖时运营补救不该被自己造成的存量超卖挡住。*/
     allowNonWorsening?: boolean;
+    /**
+     * 限额内超售放行（内部录单专用口子，语义照抄 assertHotelPhysicalFit.maxOversellRooms）：
+     * 每晚**累计**缺口 ≤ 此值时不抛错、把被容忍的超卖明细作为返回值交给调用方写 WARNING
+     * 审计；任一晚缺口超上限仍拒。缺省 = 硬闸（对外端点/散客必须缺省）。
+     */
+    maxOversellRooms?: number;
     buildMessage?: (violations: readonly PhysicalFitViolation[]) => string;
   };
 }
@@ -1559,14 +1572,51 @@ async function computeSharedRoomPhysicalAfterChange(
     }
   };
 
-  const overrideIds = new Set(
-    overrides.filter((o): o is SharedRoomAfterState & { sharedRoomId: string } => !!o.sharedRoomId).map((o) => o.sharedRoomId),
-  );
   const delegate = (
     client as unknown as {
-      sharedRoom?: { findMany: (args: unknown) => Promise<SharedRoomPhysicalRowWithId[]> };
+      sharedRoom?: {
+        findMany: (args: unknown) => Promise<SharedRoomPhysicalRowWithId[]>;
+      };
     }
   ).sharedRoom;
+
+  // 覆盖项按 hotelId 过滤（跨批需求）：调用方理应逐酒店只传该酒店的覆盖项，但一旦手滑
+  // 传错（如换酒店场景，被解绑房间其实属于原酒店而非目标酒店），不按 hotelId 过滤会把
+  // 别家酒店共享房的 checkIn/checkOut 误加进本次统计。覆盖项自带 hotelId 就直接比对；
+  // 没带的，有 sharedRoomId（改动既有房）就查库拿它的真实 hotelId；没有 sharedRoomId
+  // （全新建的房，库里还没有这行）视为属于本次 gate 的 hotelId——新房本就是为这次操作
+  // 的目标酒店建的，查无可查。查不到真实归属（脏数据）宁可漏算也不错算进本酒店。
+  const lookupIds = [
+    ...new Set(
+      overrides
+        .filter((o) => o.hotelId == null && !!o.sharedRoomId)
+        .map((o) => o.sharedRoomId as string),
+    ),
+  ];
+  const hotelIdByRoomId = new Map<string, string>();
+  if (lookupIds.length > 0 && delegate) {
+    const rows = (await (
+      delegate as unknown as {
+        findMany: (args: unknown) => Promise<Array<{ id: string; hotelId: string }>>;
+      }
+    ).findMany({
+      where: { id: { in: lookupIds } },
+      select: { id: true, hotelId: true },
+    })) as Array<{ id: string; hotelId: string }>;
+    for (const r of rows) hotelIdByRoomId.set(r.id, r.hotelId);
+  }
+  const belongsToThisHotel = (o: SharedRoomAfterState): boolean => {
+    if (o.hotelId != null) return o.hotelId === hotelId;
+    if (o.sharedRoomId) return hotelIdByRoomId.get(o.sharedRoomId) === hotelId;
+    return true; // 新建房间，没有可查的真实归属，按调用意图视为本酒店
+  };
+  const scopedOverrides = overrides.filter(belongsToThisHotel);
+
+  const overrideIds = new Set(
+    scopedOverrides
+      .filter((o): o is SharedRoomAfterState & { sharedRoomId: string } => !!o.sharedRoomId)
+      .map((o) => o.sharedRoomId),
+  );
   if (delegate) {
     const liveRows = await delegate.findMany({
       where: { hotelId, status: 'ACTIVE', checkIn: { lte: toD }, checkOut: { gt: fromD } },
@@ -1585,7 +1635,7 @@ async function computeSharedRoomPhysicalAfterChange(
       if (hasValidMember) add(row.checkIn, row.checkOut);
     }
   }
-  for (const o of overrides) {
+  for (const o of scopedOverrides) {
     if (o.activeMemberOrderIds.length > 0) add(o.checkIn, o.checkOut);
   }
   return out;
@@ -1605,14 +1655,18 @@ async function computeSharedRoomPhysicalAfterChange(
  *      assertHotelPhysicalFitWithinTx 的按酒店循环用法一致）。
  *
  * 该酒店本区间没有任何包房周期 → 未纳管，不拦（房控哲学：未配包房 ≠ 售罄）。
+ *
+ * @returns 被 `options.maxOversellRooms` 容忍的超卖明细（未开豁免、未超卖、或被
+ *   `allowNonWorsening` 放行 → 空数组）。调用方拿非空返回值写 WARNING 审计，语义与
+ *   `assertHotelPhysicalFit` 完全一致。
  */
 export async function assertHotelFitAfterChange(
   tx: Prisma.TransactionClient,
   hotelId: string,
   nightDates: readonly string[],
   args: AssertHotelFitAfterChangeArgs,
-): Promise<void> {
-  if (nightDates.length === 0) return;
+): Promise<PhysicalFitViolation[]> {
+  if (nightDates.length === 0) return [];
   await lockHotelBlockPeriodsWithinTx(tx, hotelId, nightDates);
 
   const fromD = toDateOnly(nightDates[0]);
@@ -1621,7 +1675,7 @@ export async function assertHotelFitAfterChange(
     where: { hotelId, dateFrom: { lte: toD }, dateTo: { gte: fromD } },
     select: { dateFrom: true, dateTo: true, rooms: true },
   });
-  if (periods.length === 0) return;
+  if (periods.length === 0) return [];
   const block = expandBlockByDate(periods, nightDates);
 
   const affectedSet = new Set(args.affectedOrderIds);
@@ -1694,16 +1748,27 @@ export async function assertHotelFitAfterChange(
       });
     }
   });
-  if (violations.length === 0) return;
+  if (violations.length === 0) return [];
   if (
     args.options?.allowNonWorsening &&
     violations.every((v) => physicalAfter[v.index] <= physicalBefore[v.index])
   ) {
-    return;
+    return [];
+  }
+  // 限额内超售放行（内部录单口子，语义照抄 assertHotelPhysicalFit.maxOversellRooms）：
+  // 每晚累计缺口都在上限内才放行——任一晚超限仍拒（防手滑一次打穿）。
+  if (
+    args.options?.maxOversellRooms != null &&
+    violations.every((v) => v.shortfall <= args.options!.maxOversellRooms!)
+  ) {
+    return violations;
   }
   const message = args.options?.buildMessage
     ? args.options.buildMessage(violations)
-    : `酒店实际房间不足（${violations[0].date} 包房 ${violations[0].block} 间，本次操作后需 ${violations[0].physicalUsed} 间）`;
+    : `酒店实际房间不足（${violations[0].date} 包房 ${violations[0].block} 间，本次操作后需 ${violations[0].physicalUsed} 间）` +
+      (args.options?.maxOversellRooms != null
+        ? `，缺口已超出超售容忍上限 ${args.options.maxOversellRooms} 间`
+        : '');
   throw new BadRequestError(message);
 }
 
