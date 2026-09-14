@@ -757,7 +757,13 @@ function groupRoomFraction(g: Record<string, unknown>): number {
  *     据此配回一间（不看性别、不看房型：夫妻拼房被拆开正是「一男一女各半间」）；
  *   · 其余按房型 —— 同酒店同房型同日期的半间两两成一间。
  */
-function groupBucketKey(g: Record<string, unknown>): string {
+/**
+ * @param orderId 桶键作用域——普通盒子（box:）必须按订单加前缀，否则两张不同单各自的
+ *   本地 group.id（或无 id 时按乘客名单派生的 key）撞车会被当成同一个桶合并求和，
+ *   跨单少算物理间数（astra A 路 finding 4：A/B 两单各出 0.5，本应各占 1 间共 2 间，
+ *   被合桶成 1.0 → ceil 成 1 间）。拆单配对键（pair:）不受影响，本就该跨单合桶。
+ */
+function groupBucketKey(g: Record<string, unknown>, orderId: string): string {
   const pair = g.splitPairKey;
   if (typeof pair === 'string' && pair.length > 0) return `pair:${pair}`;
   // ⚠ 无配对键时**每个盒子自成一桶**，绝不按房型合桶。
@@ -766,12 +772,12 @@ function groupBucketKey(g: Record<string, unknown>): string {
   // 而地接那边实际要给两张单各留一间 —— 房量凭空少算一间，等于超卖。
   // 各占一间是最保守口径，也与「数盒子」的历史行为一致（ceil(0.5) = 1）。
   const id = typeof g.id === 'string' && g.id.length > 0 ? g.id : null;
-  if (id) return `box:${id}`;
+  if (id) return `box:${orderId}:${id}`;
   // 缺 id 的老数据用乘客名单派生：同一盒子每次算出来都一样，不同盒子必然不同。
   const ids = Array.isArray(g.passengerIds)
     ? g.passengerIds.filter((v): v is string => typeof v === 'string')
     : [];
-  return `box:pax:${[...ids].sort().join('|')}`;
+  return `box:${orderId}:pax:${[...ids].sort().join('|')}`;
 }
 
 /** 0.5 网格对齐后向上取整（消除浮点尾数，避免 1.0000001 被算成 2 间）。*/
@@ -783,12 +789,15 @@ function ceilHalfGrid(fraction: number): number {
  * 一批房组 → 物理间数（整单 / 单行口径）：按桶求和 roomFraction 再各自向上取整。
  * 只数有出行人的盒子；空盒子不占房。
  */
-function physicalRoomsOfGroups(groups: ReadonlyArray<Record<string, unknown>>): number {
+function physicalRoomsOfGroups(
+  groups: ReadonlyArray<Record<string, unknown>>,
+  orderId: string,
+): number {
   const byBucket = new Map<string, number>();
   for (const g of groups) {
     if (!groupHasPassengers(g)) continue;
     if (groupSharedRoomId(g) != null) continue; // 共享房另计，见 computeSharedRoomPhysicalByDate
-    const key = groupBucketKey(g);
+    const key = groupBucketKey(g, orderId);
     byBucket.set(key, (byBucket.get(key) ?? 0) + groupRoomFraction(g));
   }
   let rooms = 0;
@@ -814,7 +823,9 @@ function physicalRoomsOfGroups(groups: ReadonlyArray<Record<string, unknown>>): 
 export function assignedPhysicalRooms(roomAssignment: unknown): number | null {
   const groups = parseRoomGroups(roomAssignment);
   if (!groups) return null;
-  const rooms = physicalRoomsOfGroups(groups);
+  // 单次调用只处理一张订单自己的 roomGroups，桶不会与别的订单合并求和——桶键的 orderId
+  // 前缀只在跨订单聚合（expandAssignedPhysicalByDate）时才需要真实值区分作用域，这里传常量即可。
+  const rooms = physicalRoomsOfGroups(groups, '__single_order__');
   return rooms > 0 ? rooms : null;
 }
 
@@ -842,6 +853,7 @@ export function assignedRoomsForItem(
         groupOrderItemId(g) === itemId ||
         (groupOrderItemId(g) == null && hotelName != null && g.hotelName === hotelName),
     ),
+    '__single_order__',
   );
 }
 
@@ -912,13 +924,20 @@ export function expandAssignedPhysicalByDate<T extends PhysicalOccupancyItem>(
       if (checkIn <= dates[i] && dates[i] < checkOut) covered[i] = true;
     }
   };
-  /** 房组按桶汇总 roomFraction（只数有出行人的盒子）。*/
-  const fractionByBucket = (groups: ReadonlyArray<Record<string, unknown>>): Map<string, number> => {
+  /**
+   * 房组按桶汇总 roomFraction（只数有出行人的盒子）。`orderId` 是桶键作用域——这里
+   * 的 items 横跨多张订单（同一酒店同一晚的全部占房行），必须按订单给 box: 桶加前缀，
+   * 否则两张不同单各自的本地 group.id 撞车会被合并求和，凭空少算物理间数（astra A4）。
+   */
+  const fractionByBucket = (
+    groups: ReadonlyArray<Record<string, unknown>>,
+    orderId: string,
+  ): Map<string, number> => {
     const out = new Map<string, number>();
     for (const g of groups) {
       if (!groupHasPassengers(g)) continue;
       if (groupSharedRoomId(g) != null) continue; // 共享房另计，见 computeSharedRoomPhysicalByDate
-      const key = groupBucketKey(g);
+      const key = groupBucketKey(g, orderId);
       out.set(key, (out.get(key) ?? 0) + groupRoomFraction(g));
     }
     return out;
@@ -951,7 +970,7 @@ export function expandAssignedPhysicalByDate<T extends PhysicalOccupancyItem>(
 
     if (!hasAttribution || batchItemIds.size === 0) {
       // 整单口径（现行为）：整单房组按桶求和 × 区间并集；全盒子无人 → 性别推算 fallback。
-      const buckets = fractionByBucket(groups);
+      const buckets = fractionByBucket(groups, key);
       if (buckets.size === 0) {
         fallbackItems.push(it);
         return;
@@ -961,7 +980,10 @@ export function expandAssignedPhysicalByDate<T extends PhysicalOccupancyItem>(
     }
 
     // 归属口径：orderItemId == 本行的组按本行区间逐晚直计
-    const own = fractionByBucket(groups.filter((g) => groupOrderItemId(g) === it.id));
+    const own = fractionByBucket(
+      groups.filter((g) => groupOrderItemId(g) === it.id),
+      key,
+    );
     if (own.size > 0) {
       const checkIn = fmtDateOnly(it.hotelCheckIn);
       const checkOut = fmtDateOnly(it.hotelCheckOut);
@@ -978,6 +1000,7 @@ export function expandAssignedPhysicalByDate<T extends PhysicalOccupancyItem>(
         ? new Map<string, number>()
         : fractionByBucket(
             groups.filter((g) => groupOrderItemId(g) == null && g.hotelName === hotelName),
+            key,
           );
     if (unattributed.size > 0) {
       dedupe(namedByOrder, key, unattributed, it.hotelCheckIn, it.hotelCheckOut);

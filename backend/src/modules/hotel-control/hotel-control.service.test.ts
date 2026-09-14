@@ -806,6 +806,65 @@ describe('expandAssignedPhysicalByDate · roomFraction 求和再取整（拆单�
     expect(after.assignedPhysical).toEqual([1, 0]);
   });
 
+  it('跨单同名本地 id 不合桶（astra A4）：两普通组 + 一对拆单半间 + 一间共享房 = 4 间，不是 3', () => {
+    // 反例还原评审表格：同酒店同晚——
+    //   · 订单 A / B 各有一个叫 "local" 的普通盒子，各 0.5 份额（本应各占 1 间，合计 2 间）；
+    //   · 订单 C / D 是一对拆单半间（同 splitPairKey，本该合成 1 间——拆单配对键必须继续跨单合桶）；
+    //   · 一间共享房另计 1 间（这里只测 expandAssignedPhysicalByDate 的普通房组分量，共享房走
+    //     computeSharedRoomPhysicalByDate，两者相加由 computePhysicalUsedForItems 完成，不在本测试内）。
+    // 旧实现的桶键是 `box:${id}`（不带 orderId），A/B 两个同名 "local" 盒子会被合并求和成
+    // 0.5+0.5=1.0 → ceil 成 1 间，四项合计被算成 3 间而非 4 间。
+    const items = [
+      {
+        hotelCheckIn: day(0),
+        hotelCheckOut: day(1),
+        roomsBilled: 0.5,
+        order: {
+          id: 'orderA',
+          roomAssignment: fractionAssignment([{ id: 'local', fraction: 0.5 }]),
+          passengers: [],
+        },
+      },
+      {
+        hotelCheckIn: day(0),
+        hotelCheckOut: day(1),
+        roomsBilled: 0.5,
+        order: {
+          id: 'orderB',
+          roomAssignment: fractionAssignment([{ id: 'local', fraction: 0.5 }]),
+          passengers: [],
+        },
+      },
+      {
+        hotelCheckIn: day(0),
+        hotelCheckOut: day(1),
+        roomsBilled: 0.5,
+        order: {
+          id: 'orderC',
+          roomAssignment: fractionAssignment([
+            { id: 'g-split-1', fraction: 0.5, splitPairKey: 'pair:cd' },
+          ]),
+          passengers: [],
+        },
+      },
+      {
+        hotelCheckIn: day(0),
+        hotelCheckOut: day(1),
+        roomsBilled: 0.5,
+        order: {
+          id: 'orderD',
+          roomAssignment: fractionAssignment([
+            { id: 'g-split-2', fraction: 0.5, splitPairKey: 'pair:cd' },
+          ]),
+          passengers: [],
+        },
+      },
+    ];
+    const res = expandAssignedPhysicalByDate(items, dates);
+    // orderA(1) + orderB(1) + 拆单配对 C/D 合成 1 间 = 3 间（普通房组分量；共享房另计，不在此列）
+    expect(res.assignedPhysical).toEqual([3, 0]);
+  });
+
   it('夫妻拼房被拆开（一男一女各半间，同 splitPairKey）→ 仍是 1 间（配对键不看性别）', () => {
     const res = expandAssignedPhysicalByDate(
       [
