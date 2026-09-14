@@ -14,6 +14,7 @@ import {
   assignedPhysicalRooms,
   expandAssignedPhysicalByDate,
   getHotelNightlyRemaining,
+  assertHotelFitAfterChange,
 } from './hotel-control.service.js';
 import { businessDateISO } from '../../lib/business-time.js';
 
@@ -237,5 +238,163 @@ describe('getHotelNightlyRemaining：普通房组 JSON + 共享房去重口径�
     expect(res.hasBlock).toBe(true);
     // 物理：5 间包房 − 1 间共享房占用 = 4（不是 3，即不是把两单各算 1 间）
     expect(res.physicalRemaining).toEqual([4]);
+  });
+});
+
+// ── assertHotelFitAfterChange（§五 变更前后全量比较闸）──────────────────────
+describe('assertHotelFitAfterChange', () => {
+  type TxArg = Parameters<typeof assertHotelFitAfterChange>[0];
+
+  /** 假 tx：block=rooms 间；liveItems=本酒店当前全部有效占房行；sharedRooms=当前共享房。*/
+  function fakeTx(opts: { rooms: number; liveItems?: unknown[]; sharedRooms?: unknown[] }) {
+    const calls: Array<{ sql: string; values: unknown[] }> = [];
+    const tx = {
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
+        calls.push({ sql: strings.join('?'), values });
+        return Promise.resolve([]);
+      }),
+      hotelBlockPeriod: {
+        findMany: vi
+          .fn()
+          .mockResolvedValue([{ dateFrom: day(0), dateTo: day(2), rooms: opts.rooms }]),
+      },
+      orderItem: { findMany: vi.fn().mockResolvedValue(opts.liveItems ?? []) },
+      sharedRoom: { findMany: vi.fn().mockResolvedValue(opts.sharedRooms ?? []) },
+    };
+    return { tx, calls };
+  }
+
+  it('无包房周期（未纳管）→ 不查占房、直接放行', async () => {
+    const tx = {
+      $queryRaw: vi.fn().mockResolvedValue([]),
+      hotelBlockPeriod: { findMany: vi.fn().mockResolvedValue([]) },
+      orderItem: { findMany: vi.fn() },
+    };
+    await expect(
+      assertHotelFitAfterChange(tx as unknown as TxArg, 'h1', [dayStr(0)], {
+        affectedOrderIds: ['orderA'],
+      }),
+    ).resolves.toBeUndefined();
+    expect(tx.orderItem.findMany).not.toHaveBeenCalled();
+  });
+
+  it('判定前先加锁包房周期行（与 assertHotelPhysicalFitWithinTx 同一把锁）', async () => {
+    const { tx, calls } = fakeTx({ rooms: 5 });
+    await assertHotelFitAfterChange(tx as unknown as TxArg, 'h1', [dayStr(0)], {
+      affectedOrderIds: ['orderA'],
+    });
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    expect(calls[0].sql).toContain('FOR UPDATE');
+  });
+
+  it('受影响订单撤掉一个共享成员（份额→0 但仍是成员）不影响物理——共享房仍占 1 间，装得下就放行', async () => {
+    const { tx } = fakeTx({
+      rooms: 1,
+      sharedRooms: [
+        {
+          id: 'sr1',
+          checkIn: day(0),
+          checkOut: day(1),
+          members: [{ order: { status: 'PAID', deletedAt: null } }],
+        },
+      ],
+    });
+    await expect(
+      assertHotelFitAfterChange(tx as unknown as TxArg, 'h1', [dayStr(0)], {
+        affectedOrderIds: ['orderA'],
+        nextSharedRooms: [
+          { sharedRoomId: 'sr1', checkIn: day(0), checkOut: day(1), activeMemberOrderIds: ['orderA'] },
+        ],
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it('新建共享房把一个第三方订单的独立占房行合并进来 → 变更后物理从 2 降到 1，装得下', async () => {
+    // 现状：两张订单各占普通房组 1 间（block=1，物理已超卖 2>1，仅靠 allowNonWorsening 才能放行改动）
+    const { tx } = fakeTx({
+      rooms: 1,
+      liveItems: [
+        {
+          id: 'itemA',
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 1,
+          metadata: null,
+          hotelRoomType: { hotel: { name: 'X酒店' } },
+          order: { id: 'orderA', roomAssignment: null, passengers: [{ gender: 'M' }] },
+        },
+        {
+          id: 'itemB',
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 1,
+          metadata: null,
+          hotelRoomType: { hotel: { name: 'X酒店' } },
+          order: { id: 'orderB', roomAssignment: null, passengers: [{ gender: 'M' }] },
+        },
+      ],
+    });
+    await expect(
+      assertHotelFitAfterChange(tx as unknown as TxArg, 'h1', [dayStr(0)], {
+        affectedOrderIds: ['orderA', 'orderB'],
+        // 两单在本酒店变更后都不再有独立占房行——都并进新共享房
+        nextOrderItems: new Map([
+          ['orderA', []],
+          ['orderB', []],
+        ]),
+        nextSharedRooms: [
+          { checkIn: day(0), checkOut: day(1), activeMemberOrderIds: ['orderA', 'orderB'] },
+        ],
+        options: { allowNonWorsening: true },
+      }),
+    ).resolves.toBeUndefined();
+  });
+
+  it('变更后比变更前更差（新增占用超出包房量）→ 抛错，不放行', async () => {
+    const { tx } = fakeTx({
+      rooms: 1,
+      liveItems: [
+        {
+          id: 'itemA',
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 1,
+          metadata: null,
+          hotelRoomType: { hotel: { name: 'X酒店' } },
+          order: { id: 'orderA', roomAssignment: null, passengers: [{ gender: 'M' }] },
+        },
+      ],
+    });
+    await expect(
+      assertHotelFitAfterChange(tx as unknown as TxArg, 'h1', [dayStr(0)], {
+        affectedOrderIds: ['orderA'],
+        // 本单变更后又新增一间不相干的普通占房行（模拟新增占用而非平移）
+        nextOrderItems: new Map([
+          [
+            'orderA',
+            [
+              {
+                id: 'itemA',
+                hotelCheckIn: day(0),
+                hotelCheckOut: day(1),
+                roomsBilled: 1,
+                metadata: null,
+                hotelRoomType: { hotel: { name: 'X酒店' } },
+                order: { id: 'orderA', roomAssignment: null, passengers: [{ gender: 'M' }] },
+              },
+              {
+                id: 'itemA2',
+                hotelCheckIn: day(0),
+                hotelCheckOut: day(1),
+                roomsBilled: 1,
+                metadata: null,
+                hotelRoomType: { hotel: { name: 'X酒店' } },
+                order: { id: 'orderA', roomAssignment: null, passengers: [{ gender: 'F' }] },
+              },
+            ],
+          ],
+        ]),
+      }),
+    ).rejects.toThrow(/房间不足/);
   });
 });

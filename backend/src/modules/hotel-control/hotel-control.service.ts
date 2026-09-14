@@ -1469,6 +1469,208 @@ export async function assertHotelPhysicalFitWithinTx(
   return assertHotelPhysicalFit(hotelId, nightDates, prospective, opts, tx);
 }
 
+// ── 跨单分房（共享房）变更前后全量比较闸（§五）────────────────────────────────
+/**
+ * 一间共享房「变更后」的状态（跨单分房保存 / 波 2 售后入口的解绑都用它描述结果）。
+ *   sharedRoomId 缺省 = 本次新建的房间（尚未落库，仅存在于这次请求里）；
+ *   activeMemberOrderIds 由调用方在锁后现状里筛好（deletedAt=null 且 status ∈ COUNTED_STATUSES
+ *   的成员订单 id，去重）——空数组 = 变更后无有效成员（相当于解散 / 全员失效），物理占用记 0。
+ */
+export interface SharedRoomAfterState {
+  sharedRoomId?: string;
+  checkIn: Date;
+  checkOut: Date;
+  activeMemberOrderIds: readonly string[];
+}
+
+export interface AssertHotelFitAfterChangeArgs {
+  /** 受影响订单集合：请求里的订单 ∪ 触及的共享房的全部成员订单（§六步骤 1）。*/
+  affectedOrderIds: readonly string[];
+  /**
+   * 受影响订单在**本酒店**变更后的占房行快照——只需给出会变化的订单；没给的订单
+   * （比如只是被动牵连的共享房成员单，本单在本酒店的行并未改动）沿用锁后现状。
+   * 传空数组 = 该订单在本酒店变更后不再有任何占房行（整行搬走/解绑到别的酒店）。
+   */
+  nextOrderItems?: ReadonlyMap<string, ReadonlyArray<PhysicalOccupancyItem>>;
+  /** 触及的共享房变更后状态（新建 + 改动成员 + 解散均在此列出）；未列出的共享房维持 DB 现状不变。*/
+  nextSharedRooms?: ReadonlyArray<SharedRoomAfterState>;
+  options?: {
+    /** 只拦「比改前更差」的操作——存量已超卖时运营补救不该被自己造成的存量超卖挡住。*/
+    allowNonWorsening?: boolean;
+    buildMessage?: (violations: readonly PhysicalFitViolation[]) => string;
+  };
+}
+
+/** computeSharedRoomPhysicalByDate 的行形状 + id（覆盖判定要按 id 摘掉被改动的房）。*/
+interface SharedRoomPhysicalRowWithId extends SharedRoomPhysicalRow {
+  id: string;
+}
+
+/**
+ * 共享房「变更后」逐晚去重物理间数：以当前 DB 状态为基础，凡 id 出现在 overrides 里的房间
+ * 按 override 的 checkIn/checkOut/activeMemberOrderIds 重算，未出现的维持 DB 现状；
+ * 没有 sharedRoomId（新建）的 override 直接按其值追加。
+ */
+async function computeSharedRoomPhysicalAfterChange(
+  hotelId: string,
+  dates: readonly string[],
+  overrides: ReadonlyArray<SharedRoomAfterState>,
+  client: HotelControlDbClient,
+): Promise<number[]> {
+  const out = new Array<number>(dates.length).fill(0);
+  if (dates.length === 0) return out;
+  const fromD = toDateOnly(dates[0]);
+  const toD = toDateOnly(dates[dates.length - 1]);
+  const add = (checkIn: Date, checkOut: Date): void => {
+    const ci = fmtDateOnly(checkIn);
+    const co = fmtDateOnly(checkOut);
+    for (let i = 0; i < dates.length; i++) {
+      if (ci <= dates[i] && dates[i] < co) out[i] += 1;
+    }
+  };
+
+  const overrideIds = new Set(
+    overrides.filter((o): o is SharedRoomAfterState & { sharedRoomId: string } => !!o.sharedRoomId).map((o) => o.sharedRoomId),
+  );
+  const delegate = (
+    client as unknown as {
+      sharedRoom?: { findMany: (args: unknown) => Promise<SharedRoomPhysicalRowWithId[]> };
+    }
+  ).sharedRoom;
+  if (delegate) {
+    const liveRows = await delegate.findMany({
+      where: { hotelId, status: 'ACTIVE', checkIn: { lte: toD }, checkOut: { gt: fromD } },
+      select: {
+        id: true,
+        checkIn: true,
+        checkOut: true,
+        members: { select: { order: { select: { status: true, deletedAt: true } } } },
+      },
+    });
+    for (const row of liveRows) {
+      if (overrideIds.has(row.id)) continue; // 被 override 接管，下面按新状态算
+      const hasValidMember = row.members.some(
+        (m) => m.order.deletedAt == null && COUNTED_STATUSES.includes(m.order.status),
+      );
+      if (hasValidMember) add(row.checkIn, row.checkOut);
+    }
+  }
+  for (const o of overrides) {
+    if (o.activeMemberOrderIds.length > 0) add(o.checkIn, o.checkOut);
+  }
+  return out;
+}
+
+/**
+ * 跨单分房专用闸（§五）：在同一把事务锁内，比较「受影响订单变更前」与「变更后」的
+ * 完整物理占用快照——不是排除本单再加回来的残缺基线，而是两套快照各自跑一遍
+ * 完全相同的聚合器（computePhysicalUsedForItems，含共享房去重）。
+ *
+ * 用法（调用方必须满足，否则判定不准）：
+ *   1. 在 `prisma.$transaction(async (tx) => { … })` 里调用，把 `tx` 传进来；
+ *   2. `affectedOrderIds` 必须包含请求订单 ∪ 触及的共享房的全部成员订单（不能只传请求里的
+ *      两张单——遗漏会导致 otherItems 里混进即将变化的行，before/after 都用旧值，判定失真）；
+ *   3. 调用它之后、同一事务内完成落库（成员表 / 订单 JSON / roomsBilled），事务提交前不释放锁；
+ *   4. 只读该酒店本区间——多酒店场景调用方按 hotelId 分组、每组各调用一次（与现有
+ *      assertHotelPhysicalFitWithinTx 的按酒店循环用法一致）。
+ *
+ * 该酒店本区间没有任何包房周期 → 未纳管，不拦（房控哲学：未配包房 ≠ 售罄）。
+ */
+export async function assertHotelFitAfterChange(
+  tx: Prisma.TransactionClient,
+  hotelId: string,
+  nightDates: readonly string[],
+  args: AssertHotelFitAfterChangeArgs,
+): Promise<void> {
+  if (nightDates.length === 0) return;
+  await lockHotelBlockPeriodsWithinTx(tx, hotelId, nightDates);
+
+  const fromD = toDateOnly(nightDates[0]);
+  const toD = toDateOnly(nightDates[nightDates.length - 1]);
+  const periods = await tx.hotelBlockPeriod.findMany({
+    where: { hotelId, dateFrom: { lte: toD }, dateTo: { gte: fromD } },
+    select: { dateFrom: true, dateTo: true, rooms: true },
+  });
+  if (periods.length === 0) return;
+  const block = expandBlockByDate(periods, nightDates);
+
+  const affectedSet = new Set(args.affectedOrderIds);
+  const liveItems = await tx.orderItem.findMany({
+    where: {
+      hotelRoomTypeId: { not: null },
+      hotelRoomType: { hotelId },
+      hotelCheckIn: { lte: toD },
+      hotelCheckOut: { gt: fromD },
+      order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
+    },
+    select: {
+      id: true,
+      hotelCheckIn: true,
+      hotelCheckOut: true,
+      roomsBilled: true,
+      metadata: true,
+      hotelRoomType: { select: { hotel: { select: { name: true } } } },
+      order: {
+        select: { id: true, roomAssignment: true, passengers: { select: { gender: true } } },
+      },
+    },
+  });
+  const otherItems: PhysicalOccupancyItem[] = liveItems.filter(
+    (it) => !affectedSet.has(it.order?.id ?? '__none__'),
+  );
+  const currentAffectedItems: PhysicalOccupancyItem[] = liveItems.filter((it) =>
+    affectedSet.has(it.order?.id ?? '__none__'),
+  );
+
+  // after：受影响订单里，调用方给了新快照的用新快照；没给的（被动牵连、本酒店未变）沿用现状。
+  const afterAffectedItems: PhysicalOccupancyItem[] = [];
+  for (const orderId of affectedSet) {
+    const next = args.nextOrderItems?.get(orderId);
+    if (next) afterAffectedItems.push(...next);
+    else afterAffectedItems.push(...currentAffectedItems.filter((it) => it.order?.id === orderId));
+  }
+
+  const sharedBefore = await computeSharedRoomPhysicalByDate(hotelId, nightDates, tx);
+  const sharedAfter = await computeSharedRoomPhysicalAfterChange(
+    hotelId,
+    nightDates,
+    args.nextSharedRooms ?? [],
+    tx,
+  );
+
+  const physicalBefore = computePhysicalUsedForItems(liveItems, nightDates, null, sharedBefore);
+  const physicalAfter = computePhysicalUsedForItems(
+    [...otherItems, ...afterAffectedItems],
+    nightDates,
+    null,
+    sharedAfter,
+  );
+
+  const violations: PhysicalFitViolation[] = [];
+  nightDates.forEach((date, i) => {
+    if (block[i] > 0 && block[i] - physicalAfter[i] < 0) {
+      violations.push({
+        index: i,
+        date,
+        block: block[i],
+        physicalUsed: physicalAfter[i],
+        shortfall: round2(physicalAfter[i] - block[i]),
+      });
+    }
+  });
+  if (violations.length === 0) return;
+  if (
+    args.options?.allowNonWorsening &&
+    violations.every((v) => physicalAfter[v.index] <= physicalBefore[v.index])
+  ) {
+    return;
+  }
+  const message = args.options?.buildMessage
+    ? args.options.buildMessage(violations)
+    : `酒店实际房间不足（${violations[0].date} 包房 ${violations[0].block} 间，本次操作后需 ${violations[0].physicalUsed} 间）`;
+  throw new BadRequestError(message);
+}
+
 // ── 随机档聚合余量（派生视图；下单闸 + 销控板共用同一公式）─────────────────
 /**
  * 某个随机档在给定夜晚集合上的聚合余量（口径见本文件「星级随机档」小节）：
