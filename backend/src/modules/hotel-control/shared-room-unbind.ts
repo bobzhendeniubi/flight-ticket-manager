@@ -60,7 +60,19 @@ export async function unbindSharedRoomMembersForItem(
   params: { orderId: string; orderItemId: string; reason: string },
 ): Promise<{ unbound: UnboundSharedRoomInfo[] }> {
   const { orderId, orderItemId, reason } = params;
-  const owned = await tx.sharedRoomMember.findMany({
+  // 防御式：单测常用手搭的 mock tx（只 mock 用到的 delegate）没有 sharedRoomMember 时回落
+  // 「本次没有共享成员」而不是炸——与 computeSharedRoomPhysicalByDate 的 sharedRoom 兜底同哲学。
+  const delegate = (
+    tx as unknown as {
+      sharedRoomMember?: {
+        findMany: (args: unknown) => Promise<
+          Array<{ sharedRoomId: string; roomFraction: Prisma.Decimal }>
+        >;
+      };
+    }
+  ).sharedRoomMember;
+  if (!delegate) return { unbound: [] };
+  const owned = await delegate.findMany({
     where: { orderId, orderItemId },
     select: { sharedRoomId: true, roomFraction: true },
   });

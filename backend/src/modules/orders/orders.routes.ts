@@ -2315,7 +2315,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       },
       severity: 'WARNING',
     });
-    return { order };
+    return { order, warnings: audit.warnings };
   });
 
   // ── 航班纠错（ADMIN/STAFF 任意时候；AGENT 限下单当天自家单）──
@@ -2369,7 +2369,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       },
       severity: 'WARNING',
     });
-    return { order };
+    return { order, warnings: audit.warnings };
   });
 
   // ── 售后改单：升舱（ADMIN/STAFF）──

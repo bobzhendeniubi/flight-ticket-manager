@@ -10020,6 +10020,12 @@ export class OrderService {
         fromCheckOut: string | null;
         toCheckOut: string | null;
       }>;
+      /**
+       * §八「解绑」提示：随出发日平移酒店日期时，被平移的行若有共享成员会先解绑
+       * （§五中「机票改期连带平移酒店日期」一行），按 actor 角色生成文案；无共享成员平移
+       * 或本次未平移酒店日期 = 空数组。
+       */
+      warnings: string[];
     };
   }> {
     // 代理自助纠错（correctFlightSchedule）已在上游过完归属 + 下单当天窗口闸，从此处放行；
@@ -10435,6 +10441,9 @@ export class OrderService {
         fromCheckOut: string | null;
         toCheckOut: string | null;
       }> = [];
+      // §八「机票改期连带平移酒店日期」：被平移的行若有共享成员，解绑警告收集到这里
+      // （批量改班次 / 纠错平移复用同一个函数，警告随各自的 audit.warnings 一并带出）。
+      const sharedRoomWarnings: string[] = [];
       if (scheduleChanged) {
         await tx.passenger.updateMany({
           where: { orderId },
@@ -10514,6 +10523,26 @@ export class OrderService {
           ) // 防御性复筛（与 where 同条件）：单测 mock 的 findMany 不认 where，会把机票行也吐回来
             .filter((r) => r.hotelCheckIn && (r.hotelRoomTypeId || r.randomStarTier != null));
           if (hotelRows.length > 0) {
+            // §八：平移前对全部有共享成员的酒店行解绑——共享房 checkIn/checkOut 必须与全体
+            // 成员的住宿区间一致，平移日期就让「这间房」的身份不再成立。随机档行（无
+            // hotelRoomTypeId）不会有共享成员（§三共享成员只能归属真实酒店行），跳过即可。
+            const unboundItemIds = new Set<string>();
+            for (const row of hotelRows) {
+              if (!row.hotelRoomTypeId) continue;
+              const unbindResult = await unbindSharedRoomMembersForItem(tx, {
+                orderId,
+                orderItemId: row.id,
+                reason: '机票改期连带平移酒店日期解绑',
+              });
+              if (unbindResult.unbound.length === 0) continue;
+              unboundItemIds.add(row.id);
+              sharedRoomWarnings.push(
+                ...formatUnbindWarning(
+                  unbindResult.unbound,
+                  actor.role === UserRole.AGENT ? 'agent' : 'internal',
+                ),
+              );
+            }
             const shiftDay = (d: Date): Date => new Date(d.getTime() + deltaDays * 24 * 60 * 60 * 1000);
             const shifted = hotelRows.map((row) => ({
               row,
@@ -10522,11 +10551,17 @@ export class OrderService {
             }));
             // 新区间房量闸（与建单/改档同一对闸，自带同酒店/同档归并防「各判各的」漏判）：
             // excludeOrderId 排除本单现占房 = 先释放旧区间，再按新区间前瞻判定。
+            // 刚解绑的行：份额可能是 0，不能再当占用基数（astra 评审 finding 1/2）——
+            // 解绑后物理按普通房组 1 间计，这里用 Math.max(1, …) 把它floor 回 1 间。
             const prospectiveStays = shifted.map((s) => ({
               hotelRoomTypeId: s.row.hotelRoomTypeId,
               hotelCheckIn: s.newCheckIn,
               hotelCheckOut: s.newCheckOut,
-              roomsBilled: s.row.roomsBilled == null ? null : Number(s.row.roomsBilled.toString()),
+              roomsBilled: unboundItemIds.has(s.row.id)
+                ? Math.max(1, s.row.roomsBilled == null ? 0 : Number(s.row.roomsBilled.toString()))
+                : s.row.roomsBilled == null
+                  ? null
+                  : Number(s.row.roomsBilled.toString()),
               randomStarTier: s.row.randomStarTier,
             }));
             const orderPassengers = await tx.passenger.findMany({
@@ -10702,6 +10737,7 @@ export class OrderService {
         hotelDateSync,
         departedTargetAllowed,
         flownSourceAllowed,
+        sharedRoomWarnings,
       };
     });
 
@@ -10743,6 +10779,7 @@ export class OrderService {
           departedTargetAllowed: scratch.departedTargetAllowed,
           flownSourceAllowed: scratch.flownSourceAllowed,
           hotelDateSync: scratch.hotelDateSync,
+          warnings: scratch.sharedRoomWarnings,
         },
       };
     } catch (err) {
