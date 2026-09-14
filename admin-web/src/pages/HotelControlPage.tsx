@@ -33,7 +33,7 @@ import {
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
-import { RoomingEditor, type RoomingPassenger } from '../components/RoomingEditor';
+import { RoomingEditor, roomingHotelItemsFromOrder, type RoomingPassenger } from '../components/RoomingEditor';
 import { passengerDisplayName } from '../lib/passengerDisplayName';
 import { orderStatusBadgeClass, orderStatusLabel } from '../lib/orderStatus';
 import { HotelSwapModal } from '../components/HotelSwapModal';
@@ -1196,6 +1196,7 @@ function RoomingSection({ token, board }: { token: string; board: HotelControlBo
                 passengers={roomingPassengers}
                 initial={order.roomAssignment?.roomGroups}
                 hotelName={seedHotelName ?? undefined}
+                hotelItems={roomingHotelItemsFromOrder(order.items ?? [])}
                 hotelId={hotelId}
                 checkIn={stay?.checkIn}
                 checkOut={stay?.checkOut}
