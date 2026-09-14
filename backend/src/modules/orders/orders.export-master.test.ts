@@ -2024,7 +2024,15 @@ describe('orderToMasterRows — 跨单分房（§九验收反例 11）', () => {
 
   it('内部视角（forAgent=false）备注带对方单号；代理视角（forAgent=true）只写中性文案', () => {
     const numberer = new RoomNumberer();
-    const lookup = new Map([['sr1', ['FTM_A', 'FTM_B']]]);
+    const lookup = new Map([
+      [
+        'sr1',
+        [
+          { orderNumber: 'FTM_A', cancelled: false },
+          { orderNumber: 'FTM_B', cancelled: false },
+        ],
+      ],
+    ]);
     const orderA = fixtureSharedRoomOrder({
       id: 'ord-A',
       orderNumber: 'FTM_A',

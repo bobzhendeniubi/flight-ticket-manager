@@ -43,6 +43,7 @@ import {
   loadSharedRoomPartnerLookup,
   sharedRoomPartnerNote,
   AGENT_SHARED_ROOM_NOTE,
+  type SharedRoomPartnerInfo,
 } from './room-identity.js';
 import { resolveRoomGroupPlacement } from './room-group-placement.js';
 import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats.js';
@@ -950,7 +951,7 @@ export function orderToFullRows(
   ctx: OrderContext,
   tripStats: TripStatsMap = new Map(),
   /** §九/§十共享房伙伴单号查找表（loadSharedRoomPartnerLookup 批量拉好后传入）。*/
-  sharedRoomPartnerLookup: ReadonlyMap<string, readonly string[]> = new Map(),
+  sharedRoomPartnerLookup: ReadonlyMap<string, readonly SharedRoomPartnerInfo[]> = new Map(),
   /** true = 代理导出：共享房备注用中性文案，不带对方单号（§十拍板 3）。*/
   forAgent = false,
 ): Omit<FullRow, 'seq'>[] {
@@ -1387,7 +1388,7 @@ export async function buildOrderTemplateExportWorkbook(
           }
           return loadSharedRoomPartnerLookup(sharedRoomIds, client);
         })()
-      : new Map<string, string[]>();
+      : new Map<string, SharedRoomPartnerInfo[]>();
 
   const wb = new ExcelJS.Workbook();
   wb.creator = `Citur Travel · 订单导出（${ORDER_TEMPLATE_LABEL[query.template]}）`;

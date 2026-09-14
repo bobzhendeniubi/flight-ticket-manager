@@ -18,10 +18,12 @@ import {
   ApiError,
   hotelControlOpsApi,
   type Hotel,
+  type OrderStatus,
   type SaveSharedRoomsBody,
   type SharedRoomWorkbench as SharedRoomWorkbenchData,
   type SharedRoomWorkbenchOrder,
   type SharedRoomWorkbenchPassenger,
+  type SharedRoomWorkbenchRoomMember,
 } from '../lib/api';
 import { Icon } from './Icon';
 import { useDialogA11y } from './Modal';
@@ -66,6 +68,79 @@ function copyText(text: string): void {
   }
 }
 
+/**
+ * 房控有效订单状态（B6）——镜像后端 hotel-control.service.ts 的 COUNTED_STATUSES：退款
+ * 申请中及以后的订单已释放占房，不计入分房。工作台读模型的订单池本就只含这些状态的订单
+ * （getSharedRoomWorkbench 的 items 查询同一个 where），这里复刻一份仅用于兜底判定成员
+ * 有效性（见 memberIsActive），不是引入新口径。
+ */
+const HOTEL_COUNTED_STATUSES: OrderStatus[] = [
+  'PENDING_PAYMENT',
+  'PAID',
+  'PROCESSING',
+  'TICKETED',
+  'COMPLETED',
+  'CHANGE_REQUESTED',
+  'CHANGED',
+];
+
+/**
+ * 判断某位共享房成员当前是否仍处于有效状态订单（B6 对接点）。优先信后端给的 isActive /
+ * orderStatus 字段；还没落地时（当前后端）按「所属订单是否出现在本次工作台的有效订单池」
+ * 兜底——订单池本就只含 COUNTED_STATUSES，不在池子里 = 订单已失效（取消/退款/软删等），
+ * 不能「查不到就当有效」（那样等于放行已失效成员一起提交）。
+ */
+function memberIsActive(
+  m: Pick<SharedRoomWorkbenchRoomMember, 'orderId' | 'isActive' | 'orderStatus'>,
+  validOrderIds: ReadonlySet<string>,
+): boolean {
+  if (typeof m.isActive === 'boolean') return m.isActive;
+  if (m.orderStatus) return HOTEL_COUNTED_STATUSES.includes(m.orderStatus);
+  return validOrderIds.has(m.orderId);
+}
+
+/** 共享房成员列表 → 按「来源订单 + 订单行」重新分组（seedDraftRooms 与「原始态」对比复用）。 */
+function groupsFromMembers(members: SharedRoomWorkbenchRoomMember[]): DraftGroup[] {
+  const byKey = new Map<string, DraftGroup>();
+  for (const m of members) {
+    const key = `${m.orderId}:${m.orderItemId}`;
+    const existing = byKey.get(key);
+    if (existing) {
+      existing.passengerIds.push(m.passengerId);
+    } else {
+      byKey.set(key, {
+        orderId: m.orderId,
+        orderItemId: m.orderItemId,
+        orderNumber: '',
+        passengerIds: [m.passengerId],
+        roomFraction: m.roomFraction,
+      });
+    }
+  }
+  return [...byKey.values()];
+}
+
+/** 剔除已失效成员（B6）；某个来源组的乘客被剔光则整组一并丢弃。 */
+function stripInvalidMembers(groups: DraftGroup[], invalidIds: ReadonlySet<string>): DraftGroup[] {
+  return groups
+    .map((g) => ({ ...g, passengerIds: g.passengerIds.filter((id) => !invalidIds.has(id)) }))
+    .filter((g) => g.passengerIds.length > 0);
+}
+
+/** 规范化序列化一组 DraftGroup，用于「本次改动前后是否相同」的字符串比较（顺序无关）。 */
+function serializeGroups(groups: DraftGroup[]): string {
+  return JSON.stringify(
+    groups
+      .map((g) => ({
+        orderId: g.orderId,
+        orderItemId: g.orderItemId,
+        roomFraction: g.roomFraction,
+        passengerIds: [...g.passengerIds].sort(),
+      }))
+      .sort((a, b) => `${a.orderId}:${a.orderItemId}`.localeCompare(`${b.orderId}:${b.orderItemId}`)),
+  );
+}
+
 // ── 草稿态类型（编辑期内存态，保存时按后端形状收敛）──────────────────────────
 interface DraftGroup {
   orderId: string;
@@ -89,32 +164,19 @@ interface DraftRoom {
 /** 把工作台读模型的既有共享房，摊开成编辑期草稿（成员按「来源订单+订单行」重新分组）。 */
 function seedDraftRooms(data: SharedRoomWorkbenchData): DraftRoom[] {
   const orderNumberById = new Map(data.orders.map((o) => [o.orderId, o.orderNumber]));
-  return data.sharedRooms.map((r) => {
-    const byKey = new Map<string, DraftGroup>();
-    for (const m of r.members) {
-      const key = `${m.orderId}:${m.orderItemId}`;
-      const existing = byKey.get(key);
-      if (existing) {
-        existing.passengerIds.push(m.passengerId);
-      } else {
-        byKey.set(key, {
-          orderId: m.orderId,
-          orderItemId: m.orderItemId,
-          orderNumber: orderNumberById.get(m.orderId) ?? m.orderId,
-          passengerIds: [m.passengerId],
-          roomFraction: m.roomFraction,
-        });
-      }
-    }
-    return {
-      draftId: r.sharedRoomId,
-      sharedRoomId: r.sharedRoomId,
-      version: r.version,
-      hotelRoomTypeId: r.hotelRoomTypeId,
-      notes: r.notes ?? '',
-      groups: [...byKey.values()],
-    };
-  });
+  return data.sharedRooms.map((r) => ({
+    draftId: r.sharedRoomId,
+    sharedRoomId: r.sharedRoomId,
+    version: r.version,
+    hotelRoomTypeId: r.hotelRoomTypeId,
+    notes: r.notes ?? '',
+    // groupsFromMembers 不知道订单号（只按 members 的 orderId/orderItemId 分组），这里补上
+    // 展示用的 orderNumber——不参与保存 payload，也不参与 B2/B6 的「原始态」diff 比较。
+    groups: groupsFromMembers(r.members).map((g) => ({
+      ...g,
+      orderNumber: orderNumberById.get(g.orderId) ?? g.orderId,
+    })),
+  }));
 }
 
 export interface SharedRoomWorkbenchSeed {
@@ -276,6 +338,31 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     return s;
   }, [rooms]);
 
+  // ── 已失效成员（B6）：既有共享房里成员所属订单已取消/退款/软删等——订单不在本次工作台
+  // 有效订单池（wb.orders）里，本身也就查不到姓名/性别（读模型的 members[] 只给 id，不带
+  // 快照姓名）。只在既有共享房（wb.sharedRooms）里找，新建房间的成员必然来自当前有效池。
+  const invalidPassengerIds = useMemo(() => {
+    const validOrderIds = new Set((wb?.orders ?? []).map((o) => o.orderId));
+    const s = new Set<string>();
+    for (const r of wb?.sharedRooms ?? []) {
+      for (const m of r.members) {
+        if (!memberIsActive(m, validOrderIds)) s.add(m.passengerId);
+      }
+    }
+    return s;
+  }, [wb]);
+  const invalidMemberInfo = useMemo(() => {
+    const m = new Map<string, { orderId: string; orderStatus?: OrderStatus }>();
+    for (const r of wb?.sharedRooms ?? []) {
+      for (const mem of r.members) {
+        if (invalidPassengerIds.has(mem.passengerId)) {
+          m.set(mem.passengerId, { orderId: mem.orderId, orderStatus: mem.orderStatus });
+        }
+      }
+    }
+    return m;
+  }, [wb, invalidPassengerIds]);
+
   function resolveOrderItemId(orderId: string): string | null {
     const order = orderById.get(orderId);
     if (!order || order.items.length === 0) return null;
@@ -380,12 +467,22 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     );
   }
 
+  /**
+   * 房间统计——一律按剔除已失效成员（B6）后的「净成员」算 Σ份额/人数/异性混拼/超容量，
+   * 这套数字与保存时实际提交的内容一致；raw 组里仍可能有失效成员（用于下面渲染灰色 chip
+   * 和展示「含 N 名已失效成员」提示，不参与任何校验）。
+   */
   function roomStats(r: DraftRoom) {
+    const activeGroups = stripInvalidMembers(r.groups, invalidPassengerIds);
     const roomType = roomTypeOptions.find((rt) => rt.id === r.hotelRoomTypeId);
-    const totalFraction = roundHalf(r.groups.reduce((s, g) => s + g.roomFraction, 0));
-    const totalPax = r.groups.reduce((s, g) => s + g.passengerIds.length, 0);
+    const totalFraction = roundHalf(activeGroups.reduce((s, g) => s + g.roomFraction, 0));
+    const totalPax = activeGroups.reduce((s, g) => s + g.passengerIds.length, 0);
+    const invalidPax = r.groups.reduce(
+      (s, g) => s + g.passengerIds.filter((id) => invalidPassengerIds.has(id)).length,
+      0,
+    );
     const genders = new Set<string>();
-    for (const g of r.groups) {
+    for (const g of activeGroups) {
       for (const pid of g.passengerIds) {
         const gd = passengerIndex.get(pid)?.passenger.gender;
         if (gd === 'M' || gd === 'F') genders.add(gd);
@@ -393,8 +490,10 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     }
     return {
       roomType,
+      activeGroups,
       totalFraction,
       totalPax,
+      invalidPax,
       mixedGender: genders.size > 1,
       overCapacity: !!roomType && roomType.capacity > 0 && totalPax > roomType.capacity,
     };
@@ -406,28 +505,60 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     setSaveErr(null);
     setSaveOk(null);
 
-    const roomsToSave = rooms.filter((r) => r.groups.length > 0);
-    for (const r of roomsToSave) {
-      if (!r.hotelRoomTypeId) {
+    // 既有共享房：先剔除已失效成员（B6），再与「本次加载时的净成员」对比——没变化（房型/
+    // 备注也没改）就不重新提交，避免把「历史上就含已失效成员、本次根本没碰过」的房间也扫
+    // 进 payload 触发后端拒绝。净成员被清空的（拖空 / 全部迁出 / 只剩失效成员）且确实动过
+    // → 视同解散，折进 dissolve（B2：「全部拖回池也算变更」）。新建房间没有「原始态」可比，
+    // 有净成员就直接提交，没有就跳过（用户建了空房又没填人，等同没建）。
+    const dissolveMap = new Map(dissolvedVersions);
+    const roomsToSave: Array<{ room: DraftRoom; groups: DraftGroup[] }> = [];
+    for (const r of rooms) {
+      const activeGroups = stripInvalidMembers(r.groups, invalidPassengerIds);
+      if (!r.sharedRoomId) {
+        if (activeGroups.length > 0) roomsToSave.push({ room: r, groups: activeGroups });
+        continue;
+      }
+      if (dissolveMap.has(r.sharedRoomId)) continue; // 已被「解散整间」按钮显式标记
+
+      const seedRoom = wb.sharedRooms.find((sr) => sr.sharedRoomId === r.sharedRoomId);
+      const originalActive = seedRoom
+        ? stripInvalidMembers(groupsFromMembers(seedRoom.members), invalidPassengerIds)
+        : [];
+      const metaChanged = seedRoom
+        ? seedRoom.hotelRoomTypeId !== r.hotelRoomTypeId || (seedRoom.notes ?? '') !== r.notes.trim()
+        : true;
+      const membersChanged = serializeGroups(originalActive) !== serializeGroups(activeGroups);
+      if (!metaChanged && !membersChanged) continue; // 本次没碰过，不重提交
+
+      if (activeGroups.length === 0) {
+        dissolveMap.set(r.sharedRoomId, r.version ?? 0);
+        continue;
+      }
+      roomsToSave.push({ room: r, groups: activeGroups });
+    }
+
+    for (const { room, groups } of roomsToSave) {
+      if (!room.hotelRoomTypeId) {
         setSaveErr('每间房都要先选房型再保存');
         return;
       }
-      const stats = roomStats(r);
-      if (stats.totalFraction !== 1) {
+      const totalFraction = roundHalf(groups.reduce((s, g) => s + g.roomFraction, 0));
+      if (totalFraction !== 1) {
+        const roomType = roomTypeOptions.find((rt) => rt.id === room.hotelRoomTypeId);
         setSaveErr(
-          `房间「${stats.roomType?.name ?? r.hotelRoomTypeId}」的计费份额合计须为 1，当前为 ${stats.totalFraction}`,
+          `房间「${roomType?.name ?? room.hotelRoomTypeId}」的计费份额合计须为 1，当前为 ${totalFraction}`,
         );
         return;
       }
     }
-    if (roomsToSave.length === 0 && dissolvedVersions.size === 0) {
+    if (roomsToSave.length === 0 && dissolveMap.size === 0) {
       setSaveErr('还没有任何改动');
       return;
     }
 
     const expectedVersions: Record<string, number> = {};
-    for (const r of roomsToSave) if (r.sharedRoomId) expectedVersions[r.sharedRoomId] = r.version ?? 0;
-    for (const [id, v] of dissolvedVersions) expectedVersions[id] = v;
+    for (const { room } of roomsToSave) if (room.sharedRoomId) expectedVersions[room.sharedRoomId] = room.version ?? 0;
+    for (const [id, v] of dissolveMap) expectedVersions[id] = v;
 
     const body: SaveSharedRoomsBody = {
       hotelId: wb.hotelId,
@@ -435,18 +566,18 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
       checkOut: wb.checkOut,
       requestToken: newId(),
       expectedVersions,
-      rooms: roomsToSave.map((r) => ({
-        ...(r.sharedRoomId ? { sharedRoomId: r.sharedRoomId } : {}),
-        hotelRoomTypeId: r.hotelRoomTypeId,
-        ...(r.notes.trim() ? { notes: r.notes.trim() } : {}),
-        groups: r.groups.map((g) => ({
+      rooms: roomsToSave.map(({ room, groups }) => ({
+        ...(room.sharedRoomId ? { sharedRoomId: room.sharedRoomId } : {}),
+        hotelRoomTypeId: room.hotelRoomTypeId,
+        ...(room.notes.trim() ? { notes: room.notes.trim() } : {}),
+        groups: groups.map((g) => ({
           orderId: g.orderId,
           orderItemId: g.orderItemId,
           passengerIds: g.passengerIds,
           roomFraction: g.roomFraction,
         })),
       })),
-      dissolve: [...dissolvedVersions.keys()],
+      dissolve: [...dissolveMap.keys()],
     };
 
     setSaving(true);
@@ -609,7 +740,9 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
               <div className="space-y-3">
                 {rooms.map((r) => {
                   const stats = roomStats(r);
-                  const fractionBad = r.groups.length > 0 && stats.totalFraction !== 1;
+                  // 用净成员（剔除已失效）判定份额是否异常——只剩已失效成员时不报「份额应为1」，
+                  // 那种情况保存时会自动折成解散，不需要用户先凑份额。
+                  const fractionBad = stats.activeGroups.length > 0 && stats.totalFraction !== 1;
                   return (
                     <div
                       key={r.draftId}
@@ -641,6 +774,14 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                           {stats.overCapacity && (
                             <span className="badge-warning" title="人数超房型容量，仅提示不拦截">
                               超容量
+                            </span>
+                          )}
+                          {stats.invalidPax > 0 && (
+                            <span
+                              className="badge bg-slate-100 text-ink-muted"
+                              title="该成员所属订单已不是有效状态（取消/退款/软删等），保存时会自动从本间房剔除，不会提交"
+                            >
+                              含 {stats.invalidPax} 名已失效成员
                             </span>
                           )}
                         </span>
@@ -705,22 +846,41 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                               <div className="flex flex-wrap gap-1">
                                 {g.passengerIds.map((pid) => {
                                   const p = passengerIndex.get(pid)?.passenger;
-                                  if (!p) return null;
-                                  const display = passengerDisplayName(p.fullName, p.chineseName);
-                                  return (
-                                    <span
-                                      key={pid}
-                                      draggable
-                                      onDragStart={(e) => {
-                                        e.dataTransfer.setData('text/plain', pid);
-                                        e.dataTransfer.effectAllowed = 'move';
-                                      }}
-                                      className="inline-flex cursor-grab select-none items-center rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-xs text-ink active:cursor-grabbing"
-                                      title="拖出可退回乘客池或移到别的房间"
-                                    >
-                                      {display || '—'}
-                                    </span>
-                                  );
+                                  if (p) {
+                                    const display = passengerDisplayName(p.fullName, p.chineseName);
+                                    return (
+                                      <span
+                                        key={pid}
+                                        draggable
+                                        onDragStart={(e) => {
+                                          e.dataTransfer.setData('text/plain', pid);
+                                          e.dataTransfer.effectAllowed = 'move';
+                                        }}
+                                        className="inline-flex cursor-grab select-none items-center rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-xs text-ink active:cursor-grabbing"
+                                        title="拖出可退回乘客池或移到别的房间"
+                                      >
+                                        {display || '—'}
+                                      </span>
+                                    );
+                                  }
+                                  // 已失效成员（B6）：所属订单已取消/退款/软删，读模型里连姓名都查不到
+                                  // （members[] 只给 id）——灰色只读 chip 标出状态，不可拖动，保存时自动剔除。
+                                  if (invalidPassengerIds.has(pid)) {
+                                    const info = invalidMemberInfo.get(pid);
+                                    const statusLabel = info?.orderStatus
+                                      ? orderStatusLabel(info.orderStatus)
+                                      : '已失效';
+                                    return (
+                                      <span
+                                        key={pid}
+                                        className="inline-flex select-none items-center gap-1 rounded border border-slate-200 bg-slate-100 px-1.5 py-0.5 text-xs text-ink-muted"
+                                        title={`所属订单当前状态：${statusLabel}——保存时自动从本间房剔除，不会提交`}
+                                      >
+                                        已失效 · {statusLabel}
+                                      </span>
+                                    );
+                                  }
+                                  return null;
                                 })}
                               </div>
                             </div>

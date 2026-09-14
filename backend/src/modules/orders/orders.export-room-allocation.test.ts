@@ -556,7 +556,15 @@ describe('buildRoomAllocationSheets 房间号 — 跨单分房（§九验收反�
         passengerIds: ['pb2'],
       }),
     ];
-    const lookup = new Map([['sr2', ['FTM_A', 'FTM_B']]]);
+    const lookup = new Map([
+      [
+        'sr2',
+        [
+          { orderNumber: 'FTM_A', cancelled: false },
+          { orderNumber: 'FTM_B', cancelled: false },
+        ],
+      ],
+    ]);
     const [sheet] = buildRoomAllocationSheets(items, new Map(), new Map(), lookup);
     const rowA = sheet.rows.find((r) => r.documentNumber === 'Xpa2')!;
     const rowB = sheet.rows.find((r) => r.documentNumber === 'Xpb2')!;

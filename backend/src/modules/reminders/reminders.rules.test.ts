@@ -12,6 +12,7 @@ import { OrderStatus, Prisma, ReminderPriority, ReminderStatus, type PrismaClien
 import {
   addDaysUtc,
   addMonthsUtc,
+  AUTO_RESOLVED_NOTE,
   buildNoShowReturnReleasedCandidates,
   buildOrderCandidates,
   buildHoldInstallmentCandidates,
@@ -25,6 +26,7 @@ import {
   formatAmount,
   generateRuleReminders,
   hasRoomAssignment,
+  ROOM_REMINDER_STATE_MACHINE_SINCE,
   utcDateStr,
   type RuleOrder,
   type RuleReleasedReturnLeg,
@@ -1358,5 +1360,214 @@ describe('generateRuleReminders — 规则 11 单独取数，不动其它规则�
     const third = await generateRuleReminders(departed.mock, 'user_sys', NOW);
     expect(third).toMatchObject({ created: 0, skipped: 1 });
     expect(departed.store.get(RELEASED_KEY)).toBe('SKIPPED');
+  });
+});
+
+// ── B8：跨单分房「未分房/部分未分房」提醒状态机 ─────────────────────────────
+describe('B8：跨单分房分房提醒状态机（重开 / 旧日期键清理 / 上线日期闸）', () => {
+  interface FakeReminderRow {
+    id: string;
+    ruleKey: string;
+    status: ReminderStatus;
+    resolvedNote: string | null;
+  }
+
+  /** 支持 ruleKey.in / ruleKey.startsWith 两种查法（通用创建流程用 in，B8 状态机用 startsWith）。*/
+  function makeMock(order: RuleOrder, preexisting: FakeReminderRow[]) {
+    const rows = new Map(preexisting.map((r) => [r.id, { ...r }]));
+    let seq = 0;
+    const mock = {
+      order: { findMany: vi.fn(async () => [order]) },
+      fulfillmentTask: { findMany: vi.fn(async () => []) },
+      holdOrder: { findMany: vi.fn(async () => []) },
+      operationalReminder: {
+        findMany: vi.fn(
+          async (args: {
+            where: {
+              ruleKey?: { in?: string[]; startsWith?: string };
+              status?: { in: ReminderStatus[] };
+            };
+          }) => {
+            const where = args.where;
+            let list = [...rows.values()];
+            if (where.ruleKey?.in) {
+              const keys = where.ruleKey.in;
+              list = list.filter((r) => keys.includes(r.ruleKey));
+            }
+            if (where.ruleKey?.startsWith) {
+              const prefix = where.ruleKey.startsWith;
+              list = list.filter((r) => r.ruleKey.startsWith(prefix));
+            }
+            if (where.status?.in) {
+              const statuses = where.status.in;
+              list = list.filter((r) => statuses.includes(r.status));
+            }
+            return list.map((r) => ({ ...r }));
+          },
+        ),
+        createMany: vi.fn(
+          async (args: { data: Array<{ ruleKey: string }>; skipDuplicates?: boolean }) => {
+            let count = 0;
+            for (const d of args.data) {
+              seq += 1;
+              rows.set(`new_${seq}`, {
+                id: `new_${seq}`,
+                ruleKey: d.ruleKey,
+                status: ReminderStatus.OPEN,
+                resolvedNote: null,
+              });
+              count += 1;
+            }
+            return { count };
+          },
+        ),
+        updateMany: vi.fn(
+          async (args: {
+            where: { id: { in: string[] } };
+            data: { status: ReminderStatus; resolvedNote?: string | null };
+          }) => {
+            let count = 0;
+            for (const id of args.where.id.in) {
+              const row = rows.get(id);
+              if (row) {
+                Object.assign(row, args.data);
+                count += 1;
+              }
+            }
+            return { count };
+          },
+        ),
+        update: vi.fn(
+          async (args: { where: { id: string }; data: Partial<FakeReminderRow> }) => {
+            const row = rows.get(args.where.id);
+            if (row) Object.assign(row, args.data);
+            return row;
+          },
+        ),
+      },
+    };
+    return { mock: mock as unknown as PrismaClient, rows };
+  }
+
+  // 上线窗口内：入住日选在 ROOM_REMINDER_STATE_MACHINE_SINCE 之后一天。
+  const inScopeCheckIn = addDaysUtc(ROOM_REMINDER_STATE_MACHINE_SINCE, 1);
+  const NOW_IN_SCOPE = new Date(`${addDaysUtc(inScopeCheckIn, -1)}T06:00:00Z`); // 距入住 1 天
+
+  it('已有 PARTIAL 提醒，分房被整组清空 → 旧 PARTIAL 关闭（不再永远挂着）', async () => {
+    const order = fakeOrder({
+      items: [hotelItem(inScopeCheckIn)],
+      passengers: [
+        { id: 'p1', fullName: '张三', passportExpiry: null, documentNumber: 'E1' },
+        { id: 'p2', fullName: '李四', passportExpiry: null, documentNumber: 'E2' },
+      ],
+      // 整组清空：roomGroups 存在但没有任何成员 —— hasRoomAssignment 判定为「未分房」。
+      roomAssignment: { roomGroups: [] },
+    });
+    const partialKey = `ROOMASSIGN:ord_1:${inScopeCheckIn}:PARTIAL`;
+    const { mock, rows } = makeMock(order, [
+      { id: 'r1', ruleKey: partialKey, status: ReminderStatus.OPEN, resolvedNote: null },
+    ]);
+
+    await generateRuleReminders(mock, 'user_sys', NOW_IN_SCOPE);
+
+    expect(rows.get('r1')?.status).toBe(ReminderStatus.DONE);
+  });
+
+  it('自动核销后条件复发（重新缺人）→ 重开旧提醒，不建重复行', async () => {
+    const order = fakeOrder({
+      items: [hotelItem(inScopeCheckIn)],
+      passengers: [
+        { id: 'p1', fullName: '张三', passportExpiry: null, documentNumber: 'E1' },
+        { id: 'p2', fullName: '李四', passportExpiry: null, documentNumber: 'E2' },
+      ],
+      // 现状：只有 p1 在房组里，p2 又被移出——PARTIAL 状态复发。
+      roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] },
+    });
+    const partialKey = `ROOMASSIGN:ord_1:${inScopeCheckIn}:PARTIAL`;
+    const { mock, rows } = makeMock(order, [
+      {
+        id: 'r1',
+        ruleKey: partialKey,
+        status: ReminderStatus.DONE,
+        resolvedNote: AUTO_RESOLVED_NOTE, // 上一轮「全分好了」自动核销
+      },
+    ]);
+
+    await generateRuleReminders(mock, 'user_sys', NOW_IN_SCOPE);
+
+    expect(rows.get('r1')?.status).toBe(ReminderStatus.OPEN);
+    expect(rows.get('r1')?.resolvedNote).toBeNull();
+    // 没有为同一个 ruleKey 建第二条（唯一索引本来就不允许，这里断言状态机没有尝试建重复行）。
+    expect([...rows.values()].filter((r) => r.ruleKey === partialKey)).toHaveLength(1);
+  });
+
+  it('人工核销/跳过的提醒——条件复发也不重开，尊重运营判断', async () => {
+    const order = fakeOrder({
+      items: [hotelItem(inScopeCheckIn)],
+      passengers: [
+        { id: 'p1', fullName: '张三', passportExpiry: null, documentNumber: 'E1' },
+        { id: 'p2', fullName: '李四', passportExpiry: null, documentNumber: 'E2' },
+      ],
+      roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] },
+    });
+    const partialKey = `ROOMASSIGN:ord_1:${inScopeCheckIn}:PARTIAL`;
+    const { mock, rows } = makeMock(order, [
+      {
+        id: 'r1',
+        ruleKey: partialKey,
+        status: ReminderStatus.SKIPPED,
+        resolvedNote: '运营已知情，暂不处理', // 人工核销/跳过，不是自动核销
+      },
+    ]);
+
+    await generateRuleReminders(mock, 'user_sys', NOW_IN_SCOPE);
+
+    expect(rows.get('r1')?.status).toBe(ReminderStatus.SKIPPED);
+    expect(rows.get('r1')?.resolvedNote).toBe('运营已知情，暂不处理');
+  });
+
+  it('入住日期改了——旧日期键关闭，不再永远挂着孤儿提醒', async () => {
+    const newCheckIn = addDaysUtc(inScopeCheckIn, 1);
+    // 「压根没有分房表」触发 ROOM_UNASSIGNED（整单未分房），用旧日期的 ROOMASSIGN 整单键
+    // 模拟改期前留下的孤儿提醒。
+    const order = fakeOrder({
+      items: [hotelItem(newCheckIn)], // 改期后的新入住日
+      passengers: [{ id: 'p1', fullName: '张三', passportExpiry: null, documentNumber: 'E1' }],
+      roomAssignment: { roomGroups: [] },
+    });
+    const staleKey = `ROOMASSIGN:ord_1:${inScopeCheckIn}`; // 改期前的旧日期键
+    const { mock, rows } = makeMock(order, [
+      { id: 'r1', ruleKey: staleKey, status: ReminderStatus.OPEN, resolvedNote: null },
+    ]);
+
+    await generateRuleReminders(mock, 'user_sys', NOW_IN_SCOPE);
+
+    expect(rows.get('r1')?.status).toBe(ReminderStatus.DONE);
+    // 新日期键应该被通用创建流程建出来。
+    const newRow = [...rows.values()].find((r) => r.ruleKey === `ROOMASSIGN:ord_1:${newCheckIn}`);
+    expect(newRow?.status).toBe(ReminderStatus.OPEN);
+  });
+
+  it('上线日期闸：入住日在 ROOM_REMINDER_STATE_MACHINE_SINCE 之前——不重开，维持旧行为', async () => {
+    // TODAY（2026-07-09）远早于状态机上线日，用它模拟「存量单」。
+    const beforeCutoverCheckIn = addDaysUtc(TODAY, 1);
+    const order = fakeOrder({
+      items: [hotelItem(beforeCutoverCheckIn)],
+      passengers: [
+        { id: 'p1', fullName: '张三', passportExpiry: null, documentNumber: 'E1' },
+        { id: 'p2', fullName: '李四', passportExpiry: null, documentNumber: 'E2' },
+      ],
+      roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] }, // PARTIAL 复发
+    });
+    const partialKey = `ROOMASSIGN:ord_1:${beforeCutoverCheckIn}:PARTIAL`;
+    const { mock, rows } = makeMock(order, [
+      { id: 'r1', ruleKey: partialKey, status: ReminderStatus.DONE, resolvedNote: AUTO_RESOLVED_NOTE },
+    ]);
+
+    await generateRuleReminders(mock, 'user_sys', new Date(`${TODAY}T06:00:00Z`));
+
+    // 上线日期闸生效：不重开，维持存量单的旧行为（等运营在待办列表里手动处理，或等它下次
+    // 自然进入通用创建流程——通用流程同样因为 ruleKey 已存在而不会重建）。
+    expect(rows.get('r1')?.status).toBe(ReminderStatus.DONE);
   });
 });

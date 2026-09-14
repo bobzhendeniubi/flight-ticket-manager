@@ -521,6 +521,8 @@ function OccupantsDrawer({
 }) {
   const dialogRef = useDialogA11y(onClose);
   const [occupants, setOccupants] = useState<HotelOccupant[] | null>(null);
+  // 三列口径说明（B9：后端 OCCUPYING_ORDERS_DETAIL_NOTE，随 occupants 一起回）。
+  const [occupantsDetailNote, setOccupantsDetailNote] = useState<string | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [copiedId, setCopiedId] = useState<string | null>(null);
   // 正在换酒店的占房行（null = 未打开换酒店弹窗）
@@ -534,7 +536,10 @@ function OccupantsDrawer({
         token,
         randomStarTier != null ? { randomStarTier, date } : { hotelId, date },
       )
-      .then((r) => setOccupants(r.occupants))
+      .then((r) => {
+        setOccupants(r.occupants);
+        setOccupantsDetailNote(r.detailNote);
+      })
       .catch((e: unknown) => setErr(e instanceof ApiError ? e.message : '占房订单加载失败'));
   }, [token, hotelId, randomStarTier, date]);
 
@@ -597,6 +602,12 @@ function OccupantsDrawer({
             <div className="py-6 text-center text-sm text-ink-muted">该晚无占房订单</div>
           ) : (
             <ul className="space-y-2">
+              {/* 跨单分房三列口径说明（B9）：只在本次列表里有单参与共享房时才提示，避免无关噪音。 */}
+              {occupantsDetailNote && occupants.some((o) => o.sharedRoomCount > 0) && (
+                <li className="rounded-lg bg-indigo-50 px-3 py-2 text-[11px] leading-relaxed text-indigo-700">
+                  {occupantsDetailNote}
+                </li>
+              )}
               {occupants.map((o, i) => (
                 <li
                   key={`${o.orderId}-${i}`}
@@ -609,6 +620,12 @@ function OccupantsDrawer({
                   <div className="mt-1 text-ink-soft">
                     {o.contactName} · {o.passengerCount} 人 · {o.rooms} 间
                   </div>
+                  {o.sharedRoomCount > 0 && (
+                    <div className="mt-1 text-xs text-indigo-700" title={occupantsDetailNote ?? undefined}>
+                      <Icon name="users" /> 跨单合住 {o.sharedRoomCount} 间 · 本单计费份额{' '}
+                      {o.billedRoomFraction} · 去重物理房 {o.physicalRoomsDeduped}
+                    </div>
+                  )}
                   {o.passengerNames.length > 0 ? (
                     <div className="mt-1.5 flex flex-wrap gap-1">
                       {o.passengerNames.map((name, ni) => (
@@ -654,10 +671,11 @@ function OccupantsDrawer({
           orderId={swapTarget.orderId}
           locateHint={{ hotelId, checkIn: swapTarget.checkIn, checkOut: swapTarget.checkOut, randomStarTier }}
           onClose={() => setSwapTarget(null)}
-          onSwapped={() => {
+          onSwapped={(_updated, warnings) => {
             setSwapTarget(null);
             loadOccupants(); // 抽屉：刷新占房列表
             onChanged?.(); // 板：通知父级重拉销控板
+            if (warnings && warnings.length > 0) alert(warnings.join('\n'));
           }}
         />
       )}
@@ -1497,18 +1515,20 @@ function AlertsBanner({ token }: { token: string }) {
   }, [token]);
 
   const sharedOddNear = alerts ? readSharedOddNear(alerts) : [];
+  const sharedRoomOrphaned = alerts?.sharedRoomOrphaned ?? [];
   const total = alerts
     ? alerts.oversold.length +
       alerts.surplusSoon.length +
       alerts.overCapacitySchedules.length +
-      sharedOddNear.length
+      sharedOddNear.length +
+      sharedRoomOrphaned.length
     : 0;
 
   return (
     <section className="card">
       <div className="flex items-center justify-between">
         <h2 className="flex items-center gap-2 text-sm font-semibold text-ink">
-          提醒线（超卖加房 / 富余退房 / 班次超开票上限 / 拼房落单）
+          提醒线（超卖加房 / 富余退房 / 班次超开票上限 / 拼房落单 / 合住方已取消）
           {alerts != null && total > 0 && (
             <span className="badge-danger">{total}</span>
           )}
@@ -1567,6 +1587,18 @@ function AlertsBanner({ token }: { token: string }) {
                   <span className="inline-flex items-center gap-1 font-semibold"><Icon name="alert" /> 拼房落单</span> {a.hotelName}{' '}
                   {fmtMonthDay(a.date)} 有 {a.sharedHalfCount} 位拼房客临近出发仍未配对（异性不能拼一间）·
                   补单房差或另配
+                </div>
+              ))}
+              {sharedRoomOrphaned.map((a, i) => (
+                <div
+                  key={`sro-${i}`}
+                  className="rounded-lg border border-indigo-200 bg-indigo-50 px-3 py-2 text-sm text-indigo-700"
+                >
+                  <span className="inline-flex items-center gap-1 font-semibold">
+                    <Icon name="alert" /> 合住方已取消
+                  </span>{' '}
+                  {a.hotelName} {a.checkIn}~{a.checkOut} · 剩 {a.memberOrderNumbers.join('、') || '—'}{' '}
+                  白住一间（掏钱一方已取消/退款/软删）· 核对要不要补钱或解绑腾房
                 </div>
               ))}
             </>

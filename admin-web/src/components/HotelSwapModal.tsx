@@ -69,8 +69,11 @@ export interface HotelSwapModalProps {
    */
   hideFee?: boolean;
   onClose: () => void;
-  /** 换酒店成功后回传更新后的整单；关闭 + 刷新由调用方决定。 */
-  onSwapped: (order: OrderSummary) => void;
+  /**
+   * 换酒店成功后回传更新后的整单；关闭 + 刷新由调用方决定。
+   * warnings：跨单分房自动解绑等售后副作用的按角色提示（B5），无则空数组/undefined。
+   */
+  onSwapped: (order: OrderSummary, warnings?: string[]) => void;
 }
 
 /** 'YYYY-MM-DDTHH:mm:ss.sssZ' → 'YYYY-MM-DD'（防御式截断；已是纯日期时原样返回）。 */
@@ -272,7 +275,7 @@ export function HotelSwapModal({ orderId, item, locateHint, hideFee, onClose, on
         note: feeNote.trim() || undefined,
         designatedHotelStarMismatchReason: trimmedStarMismatchReason || undefined,
       });
-      onSwapped(res.order);
+      onSwapped(res.order, res.warnings);
     } catch (e: unknown) {
       // 命中「套餐档次与酒店星级不符」那道闸：亮出放行原因输入，让运营补填后原样重提
       // （代理自助服务端是硬拒，给输入框只会让人白填一遍）。

@@ -2495,9 +2495,17 @@ export function OrdersPage() {
         succeeded: res.succeeded,
         failed: res.failed,
         failures: res.results.filter((r) => !r.ok).map((r) => ({ id: r.id, error: r.error })),
+        // notice（回包异常已生效提示）与 warnings（跨单分房自动解绑等提示，B5；当前后端
+        // /orders/batch-reschedule 还没把它透出来，字段没到时 r.warnings 是 undefined，
+        // 这里就是空数组，不影响展示）合并成同一条列表，复用 BulkResultPanel 的展示。
         notices: res.results
-          .filter((r) => r.ok && r.notice)
-          .map((r) => ({ id: r.id, message: r.notice as string })),
+          .filter((r) => r.ok)
+          .flatMap((r) => {
+            const items: Array<{ id: string; message: string }> = [];
+            if (r.notice) items.push({ id: r.id, message: r.notice });
+            for (const w of r.warnings ?? []) items.push({ id: r.id, message: w });
+            return items;
+          }),
       });
       bumpSeats();
       if (res.failed === 0) {
@@ -8522,9 +8530,10 @@ function OrderItemRow({
           isCorrection={rescheduleMode === 'CORRECTION'}
           onChanged={onChanged}
           onCancel={() => setRescheduleMode('NONE')}
-          onSaved={(updated) => {
+          onSaved={(updated, warnings) => {
             setRescheduleMode('NONE');
             onOrderUpdated?.(updated);
+            if (warnings && warnings.length > 0) alert(warnings.join('\n'));
           }}
           onRefreshOnly={(updated) => {
             onOrderUpdated?.(updated);
@@ -8592,9 +8601,10 @@ function OrderItemRow({
           orderId={orderId}
           item={item}
           onCancel={() => setReschedulingHotel(false)}
-          onSaved={(updated) => {
+          onSaved={(updated, warnings) => {
             setReschedulingHotel(false);
             onOrderUpdated?.(updated);
+            if (warnings && warnings.length > 0) alert(warnings.join('\n'));
           }}
         />
       )}
@@ -8626,9 +8636,11 @@ function OrderItemRow({
           }}
           hideFee={role === 'AGENT'}
           onClose={() => setSwappingHotel(false)}
-          onSwapped={(updated) => {
+          onSwapped={(updated, warnings) => {
             setSwappingHotel(false);
             onOrderUpdated?.(updated);
+            // 跨单分房自动解绑等提示（B5）：弹窗关闭前让用户看到，不能悄悄丢在响应体里。
+            if (warnings && warnings.length > 0) alert(warnings.join('\n'));
           }}
         />
       )}
@@ -9129,7 +9141,11 @@ function RescheduleForm({
   /** 勾了部分人拆出新单后，用它让列表刷出新单那一行（源单本身走 onSaved/onRefreshOnly） */
   onChanged?: () => void;
   onCancel: () => void;
-  onSaved: (order: OrderSummary) => void;
+  /**
+   * warnings：仅纠错口径（isCorrection）会带——跨单分房自动解绑等售后副作用的按角色提示
+   * （B5）；普通改期口径（reschedulePassengers）当前不回这个字段，恒为 undefined。
+   */
+  onSaved: (order: OrderSummary, warnings?: string[]) => void;
   /** 已拆单但改期未成功：只刷新源单数据，不关闭表单（红字提示要留着让运营看见新单号） */
   onRefreshOnly?: (order: OrderSummary) => void;
 }) {
@@ -9215,7 +9231,7 @@ function RescheduleForm({
           allowDepartedTarget,
           allowFlownSource,
         });
-        onSaved(res.order);
+        onSaved(res.order, res.warnings);
       } catch (e) {
         // 后端 400（如「本单含套餐立减…」）原样展示。
         setErr(e instanceof ApiError ? e.message : '改航班失败');
@@ -10951,7 +10967,8 @@ function HotelRescheduleForm({
   orderId: string;
   item: OrderItem;
   onCancel: () => void;
-  onSaved: (order: OrderSummary) => void;
+  /** warnings：跨单分房自动解绑等售后副作用的按角色提示（B5），无则空数组/undefined。 */
+  onSaved: (order: OrderSummary, warnings?: string[]) => void;
 }) {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
@@ -11007,7 +11024,7 @@ function HotelRescheduleForm({
         feeLabel: feeCny != null && feeCny !== 0 ? '酒店改期差价' : undefined,
         note: note.trim() || undefined,
       });
-      onSaved(res.order);
+      onSaved(res.order, res.warnings);
     } catch (e: unknown) {
       setErr(e instanceof ApiError ? e.message : '酒店改期失败');
     } finally {

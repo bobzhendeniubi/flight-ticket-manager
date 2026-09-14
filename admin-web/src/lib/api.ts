@@ -1521,6 +1521,13 @@ export interface RoomGroup {
    */
   sharedRoomId?: string;
   /**
+   * 是否与他单合住（对外角色 DTO 专用，见 room-group-dto.ts serializeRoomGroupsFor）：
+   * ADMIN/STAFF 拿到的是内部原始房组，认 sharedRoomId 本身；AGENT/CUSTOMER 拿到的是
+   * 剥掉 sharedRoomId 的外部 DTO，只给这个布尔——编辑器锁定判定须两者都认，否则代理
+   * 视角下共享组会被误判为普通组，锁定失效（B4）。
+   */
+  isShared?: boolean;
+  /**
    * 拆单半间配对键（服务端写入，只读）。编辑器重存分房时应原样透传，不能因重新构造
    * 房组对象而丢失（丢失会导致两个半间配不回一间）；服务端对旧组也会兜底搬运。
    */
@@ -3331,6 +3338,19 @@ export interface HotelControlAlerts {
     noShowOversoldSeats?: number;
     /** 后端拼好的补充说明（如「（其中 N 座为 no-show 恢复超售，已审计放行）」），无则空串。 */
     note?: string;
+  }>;
+  /**
+   * 跨单分房（§十一）：共享房里唯一还占着物理房的成员全是 0 份额——掏钱那张单被取消/
+   * 退款/软删了，剩下白住的一方。物理口径仍占 1 间，但这是运营该核对的异常状态。
+   */
+  sharedRoomOrphaned: Array<{
+    sharedRoomId: string;
+    hotelId: string;
+    hotelName: string;
+    checkIn: string; // YYYY-MM-DD
+    checkOut: string; // YYYY-MM-DD
+    /** 仍有效（占房）的成员所属单号，去重升序。 */
+    memberOrderNumbers: string[];
   }>;
 }
 
@@ -5344,7 +5364,8 @@ export const api = {
     newScheduleId: string,
     opts: { allowDepartedTarget?: boolean; allowFlownSource?: boolean } = {},
   ) =>
-    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/correct-flight`, {
+    // warnings：见 swapItemHotel 同款注释（后端早已回传，B5 补前端类型 + 展示）。
+    apiFetch<{ order: OrderSummary; warnings: string[] }>(`/orders/${orderId}/correct-flight`, {
       method: 'POST',
       token,
       body: {
@@ -5372,7 +5393,17 @@ export const api = {
     apiFetch<{
       succeeded: number;
       failed: number;
-      results: Array<{ id: string; orderNumber?: string; ok: boolean; error?: string; notice?: string }>;
+      // warnings：逐单跨单分房自动解绑等提示（B5）。当前后端 /orders/batch-reschedule 路由
+      // 还把整个 audit（含 warnings）剥掉再回包（另一路修复批在补，字段名对齐 warnings）——
+      // 这里先把类型声明为可选，字段没到时前端只是不展示，不报错。
+      results: Array<{
+        id: string;
+        orderNumber?: string;
+        ok: boolean;
+        error?: string;
+        notice?: string;
+        warnings?: string[];
+      }>;
     }>('/orders/batch-reschedule', {
       method: 'POST',
       token,
@@ -5669,7 +5700,9 @@ export const api = {
       designatedHotelStarMismatchReason?: string;
     },
   ) =>
-    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/items/${itemId}/hotel`, {
+    // warnings：跨单分房自动解绑等售后副作用的按角色提示（后端 orders.routes.ts 已回
+    // { order, warnings: audit.warnings }，此前前端类型没声明，UI 也没展示——B5）。
+    apiFetch<{ order: OrderSummary; warnings: string[] }>(`/orders/${orderId}/items/${itemId}/hotel`, {
       method: 'PATCH',
       token,
       body,
@@ -5744,11 +5777,11 @@ export const api = {
       note?: string;
     },
   ) =>
-    apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/items/${itemId}/hotel-reschedule`, {
-      method: 'PATCH',
-      token,
-      body,
-    }),
+    // warnings：见 swapItemHotel 同款注释（后端早已回传，B5 补前端类型 + 展示）。
+    apiFetch<{ order: OrderSummary; warnings: string[] }>(
+      `/orders/${orderId}/items/${itemId}/hotel-reschedule`,
+      { method: 'PATCH', token, body },
+    ),
 
   // 售后改单：套餐改档（ADMIN/STAFF）。把本单的套餐行换绑到另一张套餐（「档次」在数据模型上
   // 就是另一条 Bundle 记录），按新档重新计价，差额落一条调价行并写审计。
@@ -7478,6 +7511,16 @@ export interface HotelOccupant {
   checkIn: string; // YYYY-MM-DD（该行入住日）
   checkOut: string; // YYYY-MM-DD（该行退房日）
   agentName: string; // 无代理 = '直客'
+  /**
+   * 跨单分房下钻三列（§十一，B9）：口径互不相同，按订单展示（同订单多行会重复出现同一个
+   * 数字），不可跨单直接相加去凑总物理房间数——完整口径说明见同响应的 detailNote。
+   */
+  /** 本次查询 scope（酒店 + 该晚）内参与的 ACTIVE 共享房去重数。 */
+  sharedRoomCount: number;
+  /** 本次查询 scope 内、本晚所有占房行 roomsBilled 之和（含普通房组份额与共享成员份额）。 */
+  billedRoomFraction: number;
+  /** 去重物理房：整单普通房组去重间数 + 参与共享房数（去重不看份额）。 */
+  physicalRoomsDeduped: number;
 }
 
 /** GET /hotel-control/nightly-remaining —— 入住区间逐晚余量（原始数组，未汇总；由调用方按需汇总展示）。 */
@@ -7543,7 +7586,8 @@ export const hotelControlOpsApi = {
       params.randomStarTier != null
         ? `randomStarTier=${params.randomStarTier}`
         : `hotelId=${encodeURIComponent(params.hotelId ?? '')}`;
-    return apiFetch<{ occupants: HotelOccupant[] }>(
+    // detailNote：三列口径说明（后端 OCCUPYING_ORDERS_DETAIL_NOTE，B9 前端补展示）。
+    return apiFetch<{ occupants: HotelOccupant[]; detailNote: string }>(
       `/hotel-control/occupants?${scope}&date=${encodeURIComponent(params.date)}`,
       { token },
     );
@@ -7622,6 +7666,14 @@ export interface SharedRoomWorkbenchRoomMember {
   orderItemId: string;
   passengerId: string;
   roomFraction: number;
+  /**
+   * 该成员当前是否仍处于有效状态订单（B6 对接点）。读模型目前只按订单池（COUNTED_STATUSES）
+   * 过滤 `orders[]`，共享房 `members[]` 本身不带这两个字段——先声明为可选，字段到位前前端按
+   * 「成员所属订单是否出现在 orders[] 池」兜底判定（见 SharedRoomWorkbench.tsx memberIsActive）。
+   */
+  isActive?: boolean;
+  /** 该成员所属订单的当前状态（便于前端展示「已取消」等具体原因，不必只知道 true/false）。 */
+  orderStatus?: OrderStatus;
 }
 
 export interface SharedRoomWorkbenchRoom {

@@ -23,7 +23,14 @@ import {
   parseRoomGroups,
   type RoomNumberEntry,
 } from './orders.export-room-allocation.js';
-import { roomIdentityKey } from './room-identity.js';
+import {
+  roomIdentityKey,
+  roomIdentitySortKey,
+  scopedIdentityMapKey,
+  buildIdentityNumberMap,
+  buildVerifiedSplitPairKeys,
+  roomNumberScopeKey,
+} from './room-identity.js';
 import { nameWithTitle } from './orders.export-templates.js';
 import { formatOrderLegStatus, isReturnCurrentlyReleased } from './orders.leg-status.js';
 
@@ -219,6 +226,11 @@ const NO_HOTEL_ROOM_COLUMNS: RoomColumnValues = { roomNo: '', dailyRemaining: '�
 function computeRoomColumns(
   orders: readonly OrderForExport[],
   remainingLookup: Map<string, string>,
+  /**
+   * A4 安全闸：splitPairKey 只有在这个集合里才会被信任用来跨单合号（buildVerifiedSplitPairKeys
+   * 批量核验好后传入）；缺省 = 不做核验，照旧信任（单测场景）。
+   */
+  verifiedSplitPairKeys?: ReadonlySet<string>,
 ): Map<string, RoomColumnValues> {
   interface Entry extends RoomNumberEntry {
     passengerId: string;
@@ -257,12 +269,15 @@ function computeRoomColumns(
           ? remainingLookup.get(`${placement.hotelId}|${checkInStr}`) ?? '—'
           : '—';
 
+      const identityKey = group ? roomIdentityKey(group, order.id, verifiedSplitPairKeys) : null;
       const list = byDate.get(checkInStr) ?? [];
       list.push({
         passengerId: p.id,
         hotelId: placement.hotelId,
         hotelName,
-        identityKey: group ? roomIdentityKey(group, order.id) : null,
+        identityKey,
+        // B10：排序键只在已分房时用得上，见下方 assignRoomNumbers 前的确定性编号映射构建。
+        identitySortKey: group && identityKey ? roomIdentitySortKey(group, identityKey, order.orderNumber) : null,
         // 共享房组恒不标 (½)：两侧份额可能不对称，但物理是同一间房（§九）
         isHalf: !!group && !group.sharedRoomId && group.roomFraction === 0.5,
         capacity,
@@ -274,9 +289,23 @@ function computeRoomColumns(
     }
   }
 
+  // B10：本函数已经把整批订单的全部房组身份收集在 byDate 里——就地按确定性规则建一份
+  // 「scope+identityKey → 房号」映射（与分房表/全岗总表跑同一套 room-identity.ts 纯函数，
+  // 对同一批身份必然算出同一份结果），不依赖本次查询把哪些订单先摆出来。
+  const presortedIdentityNumbers = buildIdentityNumberMap(
+    Array.from(byDate.values())
+      .flat()
+      .filter((e): e is typeof e & { identityKey: string } => e.identityKey != null)
+      .map((e) => ({
+        scope: roomNumberScopeKey(e.hotelId, e.hotelName),
+        identityKey: e.identityKey,
+        sortKey: e.identitySortKey ?? e.identityKey,
+      })),
+  );
+
   const result = new Map<string, RoomColumnValues>();
   for (const entries of byDate.values()) {
-    assignRoomNumbers(entries);
+    assignRoomNumbers(entries, presortedIdentityNumbers);
     for (const e of entries) {
       result.set(e.passengerId, {
         roomNo: formatRoomNo(e.roomOrder, e.isHalf),
@@ -513,7 +542,15 @@ export async function buildOrdersBySchedule(
   // 再跨订单统一分配房号（同酒店同入住日一起编号/打包）。
   const occupancyItems = orders.flatMap((o) => o.items.filter(isOccupancyItem));
   const remainingLookup = await buildDailyRemainingLookup(occupancyItems, client);
-  const roomColumns = computeRoomColumns(orders, remainingLookup);
+  // A4：splitPairKey 跨单合号安全闸——先批量核验本次导出涉及的全部拆单配对键，只有真的
+  // 对应同一次拆单（见 OrderSplitRecord）才允许合号，否则退回 orderId:groupId。
+  const verifiedSplitPairKeys = await buildVerifiedSplitPairKeys(
+    orders.flatMap((order) =>
+      parseRoomGroups(order.roomAssignment).map((g) => ({ orderId: order.id, splitPairKey: g.splitPairKey })),
+    ),
+    client,
+  );
+  const roomColumns = computeRoomColumns(orders, remainingLookup, verifiedSplitPairKeys);
 
   const rows: OrderRow[] = [];
   for (const o of orders) {

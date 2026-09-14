@@ -36,10 +36,16 @@ import { localDateISO } from '../../lib/flight-time.js';
 import { businessDateTimeSec } from '../../lib/business-time.js';
 import {
   roomIdentityKey,
+  roomIdentitySortKey,
+  scopedIdentityMapKey,
+  buildIdentityNumberMap,
+  buildVerifiedSplitPairKeys,
   roomNumberScopeKey,
   RoomNumberer,
   loadSharedRoomPartnerLookup,
   sharedRoomPartnerNote,
+  type IdentityNumberEntry,
+  type SharedRoomPartnerInfo,
 } from './room-identity.js';
 import {
   PENDING_PLACEMENT_ROOM_TYPE,
@@ -380,6 +386,12 @@ export interface RoomNumberEntry {
    */
   identityKey: string | null;
   /**
+   * B10：identityKey 的确定性排序键（room-identity.ts 的 roomIdentitySortKey）——
+   * assignRoomNumbers 在没收到外部预建映射时，用它给「首次遇见」编号前先排序，不再依赖
+   * entries 数组的给定顺序。identityKey 为 null（未分房）不需要。
+   */
+  identitySortKey?: string | null;
+  /**
    * 半间/拼房组（roomFraction === 0.5）→ 房号标 (½)。共享房组恒为 false——
    * 共享房两侧份额可能不对称（1+0、0.5+0.5、甚至 0），但物理是同一间房，
    * 不能因为本单这一侧的份额印出不同的房号后缀（§九）。
@@ -515,7 +527,12 @@ export function buildRoomAllocationSheets(
   items: RoomItemForExport[],
   remainingLookup: Map<string, string> = new Map(),
   tripStats: TripStatsMap = new Map(),
-  sharedRoomPartnerLookup: ReadonlyMap<string, readonly string[]> = new Map(),
+  sharedRoomPartnerLookup: ReadonlyMap<string, readonly SharedRoomPartnerInfo[]> = new Map(),
+  /**
+   * A4 安全闸：splitPairKey 只有在这个集合里才会被信任用来跨单合号（buildVerifiedSplitPairKeys
+   * 批量核验好后传入，调用方需要先查库，本函数不碰 DB）；缺省 = 不做核验，照旧信任（单测场景）。
+   */
+  verifiedSplitPairKeys?: ReadonlySet<string>,
 ): RoomAllocationSheet[] {
   // 先按订单分组占房 item（同订单可能有多条，需要整单一起 correlate 乘客归属）
   const itemsByOrder = new Map<string, AllocatableItem[]>();
@@ -630,11 +647,15 @@ export function buildRoomAllocationSheets(
         dailyRemaining,
       };
 
+      const identityKey = group ? roomIdentityKey(group, order.id, verifiedSplitPairKeys) : null;
       const list = byDate.get(checkInStr) ?? [];
       list.push({
         hotelId: placement.hotelId,
         hotelName,
-        identityKey: group ? roomIdentityKey(group, order.id) : null,
+        identityKey,
+        // B10：排序键只在已分房时用得上（assignRoomNumbers 据此建确定性编号映射，不依赖
+        // entries 数组本身的遍历顺序）。
+        identitySortKey: group && identityKey ? roomIdentitySortKey(group, identityKey, order.orderNumber) : null,
         isHalf,
         capacity,
         gender: p.gender ?? null,
@@ -645,10 +666,25 @@ export function buildRoomAllocationSheets(
     }
   }
 
+  // B10：本函数已经把整批订单的全部房组身份收集在 byDate 里——就地按确定性规则建一份
+  // 「scope+identityKey → 房号」映射，不必等外部调用方另起一次遍历。三处导出（分房表/
+  // 整班机/全岗总表）各自跑这同一套 room-identity.ts 纯函数，对同一批身份必然算出同一份
+  // 结果，不需要显式共享同一个 Map 实例。
+  const presortedIdentityNumbers = buildIdentityNumberMap(
+    Array.from(byDate.values())
+      .flat()
+      .filter((e): e is typeof e & { identityKey: string } => e.identityKey != null)
+      .map((e) => ({
+        scope: roomNumberScopeKey(e.hotelId, e.hotelName),
+        identityKey: e.identityKey,
+        sortKey: e.identitySortKey ?? e.identityKey,
+      })),
+  );
+
   return Array.from(byDate.entries())
     .sort(([a], [b]) => a.localeCompare(b))
     .map(([date, entries]) => {
-      assignRoomNumbers(entries);
+      assignRoomNumbers(entries, presortedIdentityNumbers);
       // 行序 = 录入时间倒序（0830 公测反馈，对齐旧系统导出：新录的单在最上面）。
       // enteredAt 是 'YYYY-MM-DD HH:mm:ss' 定长格式，字符串比较即时间比较。
       // 同一订单的乘客 enteredAt 相同 → 自然相邻；并列再按酒店名（zh-CN）→ 房间号兜底定序。
@@ -689,9 +725,30 @@ function packGenderKeyOf(gender: string | null): PackGenderKey {
  *     未分房房号续在已分房之后。
  * 编号作用域按真实 hotelId（entry.hotelName 只做展示，不参与分桶——见 RoomNumberEntry JSDoc）。
  * 导出供整班机订单导出（orders.export.ts）复用——同一套打包口径，不各自实现。
+ *
+ * @param presortedIdentityNumbers B10：外部预建的「scope+identityKey → 房号」映射
+ *   （room-identity.ts buildIdentityNumberMap，按确定性排序统一编号，不依赖本次遍历顺序）。
+ *   命中的身份直接用这个号，不再走「首次遇见分配」——三处导出（分房表/整班机/全岗总表）
+ *   对同一批身份传同一份映射，就必然算出同一份房号。**缺省 = 旧行为**（无预建映射时按
+ *   entries 给定顺序「首次遇见」分配，单测 / 未接入预扫描的调用方不受影响）。
  */
-export function assignRoomNumbers(entries: RoomNumberEntry[]): void {
+export function assignRoomNumbers(
+  entries: RoomNumberEntry[],
+  presortedIdentityNumbers?: ReadonlyMap<string, number>,
+): void {
   const numberer = new RoomNumberer();
+  if (presortedIdentityNumbers) {
+    // 预建映射占了每个 scope 的 1..N 号——未分房续编号（next()）不能从 1 重开，否则会撞进
+    // 已经用掉的号。
+    const maxByScope = new Map<string, number>();
+    for (const e of entries) {
+      if (!e.identityKey) continue;
+      const scope = roomNumberScopeKey(e.hotelId, e.hotelName);
+      const no = presortedIdentityNumbers.get(scopedIdentityMapKey(scope, e.identityKey));
+      if (no != null) maxByScope.set(scope, Math.max(maxByScope.get(scope) ?? 0, no));
+    }
+    for (const [scope, max] of maxByScope) numberer.prime(scope, max);
+  }
   // 未分房乘客按性别分组各自维护「当前开放房间」（per 作用域，next() 与 numberFor() 共用计数器）
   const openRoomByScope = new Map<string, Map<PackGenderKey, { room: number; left: number }>>();
 
@@ -699,8 +756,10 @@ export function assignRoomNumbers(entries: RoomNumberEntry[]): void {
     const scope = roomNumberScopeKey(e.hotelId, e.hotelName);
 
     if (e.identityKey) {
-      // 已分房：同 identityKey 复用房号；首次出现分配新号
-      e.roomOrder = numberer.numberFor(scope, e.identityKey);
+      // 预建映射命中优先；没命中（映射没传，或该身份不在这次预扫描范围内的防御性回落）
+      // 才退回「首次遇见分配」。
+      const preNumber = presortedIdentityNumbers?.get(scopedIdentityMapKey(scope, e.identityKey));
+      e.roomOrder = preNumber ?? numberer.numberFor(scope, e.identityKey);
       continue;
     }
 
@@ -948,7 +1007,21 @@ async function buildWorkbookFromItems(
     }
   }
   const sharedRoomPartnerLookup = await loadSharedRoomPartnerLookup(sharedRoomIds, client);
-  const sheets = buildRoomAllocationSheets(items, remainingLookup, tripStats, sharedRoomPartnerLookup);
+  // A4：splitPairKey 跨单合号安全闸——先批量核验本次导出涉及的全部拆单配对键，只有真的
+  // 对应同一次拆单（见 OrderSplitRecord）才允许合号，否则退回 orderId:groupId。
+  const verifiedSplitPairKeys = await buildVerifiedSplitPairKeys(
+    items.flatMap((it) =>
+      parseRoomGroups(it.order.roomAssignment).map((g) => ({ orderId: it.order.id, splitPairKey: g.splitPairKey })),
+    ),
+    client,
+  );
+  const sheets = buildRoomAllocationSheets(
+    items,
+    remainingLookup,
+    tripStats,
+    sharedRoomPartnerLookup,
+    verifiedSplitPairKeys,
+  );
 
   const wb = new ExcelJS.Workbook();
   wb.creator = '分房表导出';
