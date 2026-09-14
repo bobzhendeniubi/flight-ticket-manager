@@ -7750,6 +7750,9 @@ export class OrderService {
       ok: boolean;
       error?: string;
       notice?: string;
+      /** §八「解绑」提示（按角色生成文案）——逐单带回，不随 audit 一起被路由层裁掉
+       * （astra finding B5：批量改班次完成解绑，响应此前却无逐单警告）。无解绑 = 空数组。 */
+      warnings: string[];
       audit?: {
         orderNumber: string;
         orderItemId: string;
@@ -7774,6 +7777,7 @@ export class OrderService {
       ok: boolean;
       error?: string;
       notice?: string;
+      warnings: string[];
       audit?: {
         orderNumber: string;
         orderItemId: string;
@@ -7810,7 +7814,7 @@ export class OrderService {
           actor,
         );
         const orderNumber = (order as unknown as { orderNumber?: string }).orderNumber;
-        results.push({ id, orderNumber, ok: true, audit });
+        results.push({ id, orderNumber, ok: true, warnings: audit.warnings, audit });
         succeeded += 1;
       } catch (err) {
         const message = err instanceof Error ? err.message : '未知错误';
@@ -7836,6 +7840,9 @@ export class OrderService {
                 orderNumber: currentItem.order.orderNumber,
                 ok: true,
                 notice: '已生效（回包异常）',
+                // 回读分支拿不到原始事务内算出的 warnings（事务已回滚/连接已断），
+                // 缺省空数组——不臆造，也不让整条回读因此失败。
+                warnings: [],
                 audit: {
                   orderNumber: currentItem.order.orderNumber,
                   orderItemId: context.orderItemId,
@@ -7857,7 +7864,7 @@ export class OrderService {
           }
         }
         if (!recovered) {
-          results.push({ id, ok: false, error: message });
+          results.push({ id, ok: false, error: message, warnings: [] });
           failed += 1;
         }
       }

@@ -51,7 +51,11 @@ function input(orderIds: string[], leg: BatchInput['leg'], allowTicketed = false
   };
 }
 
-function successfulReschedule(orderId: string, orderItemId: string): RescheduleResult {
+function successfulReschedule(
+  orderId: string,
+  orderItemId: string,
+  warnings: string[] = [],
+): RescheduleResult {
   return {
     order: { orderNumber: `FT-${orderId}` } as RescheduleResult['order'],
     audit: {
@@ -65,6 +69,8 @@ function successfulReschedule(orderId: string, orderItemId: string): RescheduleR
       toDeparture: new Date('2026-08-26T01:00:00.000Z'),
       feeCny: 0,
       statusChanged: false,
+      hotelDateSync: [],
+      warnings,
     },
   };
 }
@@ -223,10 +229,30 @@ describe('OrderService.batchReschedule', () => {
 
     expect(result).toMatchObject({ succeeded: 1, failed: 1 });
     expect(result.results).toEqual([
-      { id: 'sold-out', ok: false, error: '目标班次余位不足' },
+      { id: 'sold-out', ok: false, error: '目标班次余位不足', warnings: [] },
       expect.objectContaining({ id: 'available', ok: true }),
     ]);
     expect(reschedule).toHaveBeenCalledTimes(2);
+  });
+
+  it('astra finding B5：单条改期解绑产生的 warnings 逐单带回，不随 audit 一起被裁掉', async () => {
+    mockPrisma.order.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) =>
+      orderRecord(
+        where.id,
+        OrderStatus.PAID,
+        [flightItem(`${where.id}-item`, `${where.id}-schedule`, '2026-08-25T01:00:00.000Z')],
+      ),
+    );
+    const sharedWarning = '该房组原与 FT-shared 合住、计费 0 间，解绑后物理占 1 间，金额未重算。';
+    vi.spyOn(service, 'rescheduleOrderItem').mockImplementation(async (orderId, item) =>
+      successfulReschedule(orderId, item.orderItemId, orderId === 'shared' ? [sharedWarning] : []),
+    );
+
+    const result = await service.batchReschedule(input(['shared', 'plain'], 'OUTBOUND'), ACTOR);
+
+    // 逐单 warnings 是顶层字段（不嵌在 audit 里）——路由层裁掉 audit 时不会连坐裁掉它。
+    expect(result.results.find((r) => r.id === 'shared')).toMatchObject({ warnings: [sharedWarning] });
+    expect(result.results.find((r) => r.id === 'plain')).toMatchObject({ warnings: [] });
   });
 
   it('往返订单改去程只取第 1 段，改回程只取第 2 段', async () => {
