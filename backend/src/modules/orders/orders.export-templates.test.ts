@@ -1687,7 +1687,10 @@ describe('代理导出（agentScope 非空）— 三模板按共享脱敏政策�
     describe('跨单分房备注', () => {
       function fakeClientWithSharedRoom(
         orders: OrderForTemplateExport[],
-        partnerRows: Array<{ sharedRoomId: string; order: { orderNumber: string } }>,
+        partnerRows: Array<{
+          sharedRoomId: string;
+          order: { orderNumber: string; status?: string; deletedAt?: Date | null };
+        }>,
       ): PrismaClient {
         return {
           order: {
@@ -1744,8 +1747,8 @@ describe('代理导出（agentScope 非空）— 三模板按共享脱敏政策�
         const client = fakeClientWithSharedRoom(
           [orderWithSharedRoom()],
           [
-            { sharedRoomId: 'sr1', order: { orderNumber: 'ACOAZR' } }, // 本单
-            { sharedRoomId: 'sr1', order: { orderNumber: 'FTM_PARTNER' } },
+            { sharedRoomId: 'sr1', order: { orderNumber: 'ACOAZR', status: 'PAID', deletedAt: null } }, // 本单
+            { sharedRoomId: 'sr1', order: { orderNumber: 'FTM_PARTNER', status: 'PAID', deletedAt: null } },
           ],
         );
         const ws = await loadFullSheet(client, null);

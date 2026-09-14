@@ -5,6 +5,10 @@ import { describe, it, expect, vi } from 'vitest';
 import type { PrismaClient } from '@prisma/client';
 import {
   roomIdentityKey,
+  buildVerifiedSplitPairKeys,
+  roomIdentitySortKey,
+  scopedIdentityMapKey,
+  buildIdentityNumberMap,
   roomNumberScopeKey,
   RoomNumberer,
   loadSharedRoomPartnerLookup,
@@ -32,7 +36,7 @@ describe('roomIdentityKey', () => {
     expect(roomIdentityKey({ id: 'g1', sharedRoomId: null }, 'ord_a')).toBe('ord_a:g1');
   });
 
-  it('拆单配对键（splitPairKey）：没有 sharedRoomId 时两个半组用它算出同一个身份（§十三验收反例 10）', () => {
+  it('拆单配对键（splitPairKey）：不传核验集时保持旧行为——没有 sharedRoomId 时两个半组用它算出同一个身份（§十三验收反例 10）', () => {
     const half1 = { id: 'g1', splitPairKey: 'item-x:token-1' };
     const half2 = { id: 'g2', splitPairKey: 'item-x:token-1' };
     expect(roomIdentityKey(half1, 'ord_a')).toBe('item-x:token-1');
@@ -43,6 +47,99 @@ describe('roomIdentityKey', () => {
   it('sharedRoomId 优先于 splitPairKey（两者理论互斥，但顺序仍要明确）', () => {
     expect(roomIdentityKey({ id: 'g1', sharedRoomId: 'sr1', splitPairKey: 'pk1' }, 'ord_a')).toBe('sr1');
   });
+
+  it('A4：给了核验集且 splitPairKey 在集合里——照常合号', () => {
+    const half1 = { id: 'g1', splitPairKey: 'item-x:token-1' };
+    const half2 = { id: 'g2', splitPairKey: 'item-x:token-1' };
+    const verified = new Set(['item-x:token-1']);
+    expect(roomIdentityKey(half1, 'ord_a', verified)).toBe('item-x:token-1');
+    expect(roomIdentityKey(half2, 'ord_b', verified)).toBe('item-x:token-1');
+  });
+
+  it('A4：给了核验集但 splitPairKey 不在集合里——退回 orderId:groupId，不跨单合号', () => {
+    const half1 = { id: 'g1', splitPairKey: 'item-x:token-1' };
+    const half2 = { id: 'g2', splitPairKey: 'item-x:token-1' };
+    const verified = new Set<string>(); // 空集合：谁都没核验通过
+    expect(roomIdentityKey(half1, 'ord_a', verified)).toBe('ord_a:g1');
+    expect(roomIdentityKey(half2, 'ord_b', verified)).toBe('ord_b:g2');
+    expect(roomIdentityKey(half1, 'ord_a', verified)).not.toBe(roomIdentityKey(half2, 'ord_b', verified));
+  });
+});
+
+describe('buildVerifiedSplitPairKeys', () => {
+  it('同一个 splitPairKey 出现在同一条 OrderSplitRecord 的 source/target 二元组里——判定可信', async () => {
+    const client = {
+      orderSplitRecord: {
+        findMany: vi.fn().mockResolvedValue([
+          { sourceOrderId: 'ord_a', targetOrderId: 'ord_b', requestToken: 'token-1' },
+        ]),
+      },
+    } as unknown as PrismaClient;
+    const verified = await buildVerifiedSplitPairKeys(
+      [
+        { orderId: 'ord_a', splitPairKey: 'item-x:token-1' },
+        { orderId: 'ord_b', splitPairKey: 'item-x:token-1' },
+      ],
+      client,
+    );
+    expect(verified.has('item-x:token-1')).toBe(true);
+  });
+
+  it('撞键但不是同一条拆单记录——不可信，导出侧应退回 orderId:groupId（A4 核心反例）', async () => {
+    // ord_a 与 ord_c 两张不相关订单，各自被别的拆单记录关联，却恰好复用了同一个
+    // splitPairKey 字面值（legacy 数据 / baseId+requestToken 撞车）。
+    const client = {
+      orderSplitRecord: {
+        findMany: vi.fn().mockResolvedValue([
+          { sourceOrderId: 'ord_a', targetOrderId: 'ord_b', requestToken: 'token-1' },
+        ]),
+      },
+    } as unknown as PrismaClient;
+    const verified = await buildVerifiedSplitPairKeys(
+      [
+        { orderId: 'ord_a', splitPairKey: 'item-x:token-1' },
+        { orderId: 'ord_c', splitPairKey: 'item-x:token-1' }, // ord_c 不在 ord_a/ord_b 的拆单记录里
+      ],
+      client,
+    );
+    expect(verified.has('item-x:token-1')).toBe(false);
+  });
+
+  it('单订单内部出现同一个 splitPairKey——不跨单，无需查表即可信', async () => {
+    const findMany = vi.fn().mockResolvedValue([]);
+    const client = { orderSplitRecord: { findMany } } as unknown as PrismaClient;
+    const verified = await buildVerifiedSplitPairKeys(
+      [
+        { orderId: 'ord_a', splitPairKey: 'pax:p1|p2:token-1' },
+        { orderId: 'ord_a', splitPairKey: 'pax:p1|p2:token-1' },
+      ],
+      client,
+    );
+    expect(verified.has('pax:p1|p2:token-1')).toBe(true);
+  });
+
+  it('没有 orderSplitRecord 匹配——不可信', async () => {
+    const client = {
+      orderSplitRecord: { findMany: vi.fn().mockResolvedValue([]) },
+    } as unknown as PrismaClient;
+    const verified = await buildVerifiedSplitPairKeys(
+      [
+        { orderId: 'ord_a', splitPairKey: 'item-x:token-1' },
+        { orderId: 'ord_b', splitPairKey: 'item-x:token-1' },
+      ],
+      client,
+    );
+    expect(verified.has('item-x:token-1')).toBe(false);
+  });
+
+  it('空输入不查库，直接返回空集合', async () => {
+    const findMany = vi.fn();
+    const verified = await buildVerifiedSplitPairKeys([], {
+      orderSplitRecord: { findMany },
+    } as unknown as PrismaClient);
+    expect(verified.size).toBe(0);
+    expect(findMany).not.toHaveBeenCalled();
+  });
 });
 
 describe('roomNumberScopeKey', () => {
@@ -51,6 +148,90 @@ describe('roomNumberScopeKey', () => {
     expect(roomNumberScopeKey(null, '4星随机（待落位）')).toBe('pending:4星随机（待落位）');
     // 万一某个真实 hotelId 字面上恰好等于某个展示名（几乎不可能，但兜底验证前缀隔离生效）
     expect(roomNumberScopeKey('4星随机（待落位）', 'x')).not.toBe(roomNumberScopeKey(null, '4星随机（待落位）'));
+  });
+});
+
+describe('roomIdentitySortKey + buildIdentityNumberMap（B10）', () => {
+  it('共享房排在普通房组之前，各自内部按规则升序，不依赖遍历顺序', () => {
+    const sharedB = { id: 'gb', sharedRoomId: 'sr_b' };
+    const sharedA = { id: 'ga', sharedRoomId: 'sr_a' };
+    const plainB = { id: 'gp2' };
+    const plainA = { id: 'gp1' };
+    const entries = [
+      // 故意用「逆序」喂入：sortKey 与喂入顺序无关，编号只看排序结果。
+      {
+        scope: 'hotel:h1',
+        identityKey: roomIdentityKey(sharedB, 'ord_b'),
+        sortKey: roomIdentitySortKey(sharedB, 'sr_b', 'FTM_B'),
+      },
+      {
+        scope: 'hotel:h1',
+        identityKey: roomIdentityKey(sharedA, 'ord_a'),
+        sortKey: roomIdentitySortKey(sharedA, 'sr_a', 'FTM_A'),
+      },
+      {
+        scope: 'hotel:h1',
+        identityKey: roomIdentityKey(plainB, 'ord_z'),
+        sortKey: roomIdentitySortKey(plainB, 'ord_z:gp2', 'FTM_Z'),
+      },
+      {
+        scope: 'hotel:h1',
+        identityKey: roomIdentityKey(plainA, 'ord_y'),
+        sortKey: roomIdentitySortKey(plainA, 'ord_y:gp1', 'FTM_Y'),
+      },
+    ];
+    const map = buildIdentityNumberMap(entries);
+    expect(map.get(scopedIdentityMapKey('hotel:h1', 'sr_a'))).toBe(1);
+    expect(map.get(scopedIdentityMapKey('hotel:h1', 'sr_b'))).toBe(2);
+    expect(map.get(scopedIdentityMapKey('hotel:h1', 'ord_y:gp1'))).toBe(3);
+    expect(map.get(scopedIdentityMapKey('hotel:h1', 'ord_z:gp2'))).toBe(4);
+  });
+
+  it('跨导出断言：两套完全不同的遍历/喂入顺序算出同一份「身份→房号」映射', () => {
+    const sharedA = { id: 'ga', sharedRoomId: 'sr_a' };
+    const sharedB = { id: 'gb', sharedRoomId: 'sr_b' };
+    const plain = { id: 'gp1' };
+    const build = (order: Array<'sr_a' | 'sr_b' | 'plain'>) =>
+      buildIdentityNumberMap(
+        order.map((kind) => {
+          if (kind === 'sr_a') {
+            return {
+              scope: 'hotel:h1',
+              identityKey: 'sr_a',
+              sortKey: roomIdentitySortKey(sharedA, 'sr_a', 'FTM_A'),
+            };
+          }
+          if (kind === 'sr_b') {
+            return {
+              scope: 'hotel:h1',
+              identityKey: 'sr_b',
+              sortKey: roomIdentitySortKey(sharedB, 'sr_b', 'FTM_B'),
+            };
+          }
+          return {
+            scope: 'hotel:h1',
+            identityKey: 'ord_c:gp1',
+            sortKey: roomIdentitySortKey(plain, 'ord_c:gp1', 'FTM_C'),
+          };
+        }),
+      );
+    // “整班机”式升序遍历 vs “全岗总表”式降序遍历——喂入顺序完全相反。
+    const ascending = build(['sr_a', 'sr_b', 'plain']);
+    const descending = build(['plain', 'sr_b', 'sr_a']);
+    for (const key of ['sr_a', 'sr_b', 'ord_c:gp1']) {
+      expect(ascending.get(scopedIdentityMapKey('hotel:h1', key))).toBe(
+        descending.get(scopedIdentityMapKey('hotel:h1', key)),
+      );
+    }
+  });
+
+  it('不同 scope 各自独立编号，互不影响', () => {
+    const map = buildIdentityNumberMap([
+      { scope: 'hotel:h1', identityKey: 'sr_1', sortKey: '0:sr_1' },
+      { scope: 'hotel:h2', identityKey: 'sr_1', sortKey: '0:sr_1' },
+    ]);
+    expect(map.get(scopedIdentityMapKey('hotel:h1', 'sr_1'))).toBe(1);
+    expect(map.get(scopedIdentityMapKey('hotel:h2', 'sr_1'))).toBe(1);
   });
 });
 
@@ -76,23 +257,52 @@ describe('RoomNumberer', () => {
     expect(n.numberFor('hotel:h1', 'sr_2')).toBe(3);
     expect(n.next('hotel:h1')).toBe(4);
   });
+
+  it('prime()：把计数器下限抬到 floor，未分房续编号不与外部预建号相撞（B10）', () => {
+    const n = new RoomNumberer();
+    n.prime('hotel:h1', 3); // 假设外部预建号已经用掉了 1..3
+    expect(n.next('hotel:h1')).toBe(4);
+  });
+
+  it('prime()：不会把已经领先的计数器往回拨', () => {
+    const n = new RoomNumberer();
+    expect(n.next('hotel:h1')).toBe(1);
+    expect(n.next('hotel:h1')).toBe(2);
+    n.prime('hotel:h1', 1); // floor 低于当前计数器，不生效
+    expect(n.next('hotel:h1')).toBe(3);
+  });
 });
 
 describe('loadSharedRoomPartnerLookup', () => {
-  it('按 sharedRoomId 分组，去重同一订单的多个成员', async () => {
+  it('按 sharedRoomId 分组，去重同一订单的多个成员，附带失效状态（B11）', async () => {
     const client = {
       sharedRoomMember: {
         findMany: vi.fn().mockResolvedValue([
-          { sharedRoomId: 'sr_1', order: { orderNumber: 'FTM_A' } },
-          { sharedRoomId: 'sr_1', order: { orderNumber: 'FTM_A' } }, // 同订单第二位成员，去重
-          { sharedRoomId: 'sr_1', order: { orderNumber: 'FTM_B' } },
-          { sharedRoomId: 'sr_2', order: { orderNumber: 'FTM_C' } },
+          {
+            sharedRoomId: 'sr_1',
+            order: { orderNumber: 'FTM_A', status: 'PAID', deletedAt: null },
+          },
+          {
+            sharedRoomId: 'sr_1',
+            order: { orderNumber: 'FTM_A', status: 'PAID', deletedAt: null },
+          }, // 同订单第二位成员，去重
+          {
+            sharedRoomId: 'sr_1',
+            order: { orderNumber: 'FTM_B', status: 'CANCELLED', deletedAt: null },
+          },
+          {
+            sharedRoomId: 'sr_2',
+            order: { orderNumber: 'FTM_C', status: 'PAID', deletedAt: new Date('2026-01-01') },
+          },
         ]),
       },
     } as unknown as PrismaClient;
     const lookup = await loadSharedRoomPartnerLookup(['sr_1', 'sr_2'], client);
-    expect(lookup.get('sr_1')).toEqual(['FTM_A', 'FTM_B']);
-    expect(lookup.get('sr_2')).toEqual(['FTM_C']);
+    expect(lookup.get('sr_1')).toEqual([
+      { orderNumber: 'FTM_A', cancelled: false },
+      { orderNumber: 'FTM_B', cancelled: true }, // CANCELLED 状态
+    ]);
+    expect(lookup.get('sr_2')).toEqual([{ orderNumber: 'FTM_C', cancelled: true }]); // 软删
 
     const where = (
       (client as unknown as { sharedRoomMember: { findMany: ReturnType<typeof vi.fn> } }).sharedRoomMember
@@ -113,18 +323,48 @@ describe('loadSharedRoomPartnerLookup', () => {
 });
 
 describe('sharedRoomPartnerNote', () => {
-  it('排除本单单号，单一伙伴 → 「与 FTM… 合住」', () => {
-    const lookup = new Map([['sr_1', ['FTM_A', 'FTM_B']]]);
+  it('排除本单单号，单一伙伴（有效）→ 「与 FTM… 合住」', () => {
+    const lookup = new Map([
+      [
+        'sr_1',
+        [
+          { orderNumber: 'FTM_A', cancelled: false },
+          { orderNumber: 'FTM_B', cancelled: false },
+        ],
+      ],
+    ]);
     expect(sharedRoomPartnerNote('sr_1', 'FTM_A', lookup)).toBe('与 FTM_B 合住');
   });
 
   it('三人间跨两张单：多个伙伴用「、」连接', () => {
-    const lookup = new Map([['sr_1', ['FTM_A', 'FTM_B', 'FTM_C']]]);
+    const lookup = new Map([
+      [
+        'sr_1',
+        [
+          { orderNumber: 'FTM_A', cancelled: false },
+          { orderNumber: 'FTM_B', cancelled: false },
+          { orderNumber: 'FTM_C', cancelled: false },
+        ],
+      ],
+    ]);
     expect(sharedRoomPartnerNote('sr_1', 'FTM_A', lookup)).toBe('与 FTM_B、FTM_C 合住');
   });
 
+  it('B11：伙伴已失效——单独标注「（已取消）」', () => {
+    const lookup = new Map([
+      [
+        'sr_1',
+        [
+          { orderNumber: 'FTM_A', cancelled: false },
+          { orderNumber: 'FTM_B', cancelled: true },
+        ],
+      ],
+    ]);
+    expect(sharedRoomPartnerNote('sr_1', 'FTM_A', lookup)).toBe('与 FTM_B（已取消） 合住');
+  });
+
   it('查不到伙伴（异常态）→ 空串，不编造', () => {
-    const lookup = new Map<string, string[]>();
+    const lookup = new Map<string, Array<{ orderNumber: string; cancelled: boolean }>>();
     expect(sharedRoomPartnerNote('sr_missing', 'FTM_A', lookup)).toBe('');
   });
 

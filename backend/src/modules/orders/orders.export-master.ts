@@ -36,14 +36,21 @@ import {
   attributedRoomGroupHotelName,
   parseRoomGroups,
   resolveExportHotelName,
+  type RoomGroup,
 } from './orders.export-room-allocation.js';
 import {
   roomIdentityKey,
+  roomIdentitySortKey,
+  scopedIdentityMapKey,
+  buildIdentityNumberMap,
+  buildVerifiedSplitPairKeys,
   roomNumberScopeKey,
   RoomNumberer,
   loadSharedRoomPartnerLookup,
   sharedRoomPartnerNote,
   AGENT_SHARED_ROOM_NOTE,
+  type IdentityNumberEntry,
+  type SharedRoomPartnerInfo,
 } from './room-identity.js';
 import { resolveRoomGroupPlacement } from './room-group-placement.js';
 import {
@@ -486,6 +493,23 @@ export {
   bootstrapTripCountProfilesIfEmpty,
 } from './orders.export-trip-stats.js';
 
+/**
+ * 房组的编号作用域（§九/B10）：归属行（group.orderItemId 精确对行）的真实 hotelId + 入住日；
+ * 不认房组自己的 hotelName 文本（人工填的可能是换酒店前的旧值）。旧数据没有归属时 hotelId
+ * 为 null，roomNumberScopeKey 用房组自己的 hotelName 兜底出一个隔离作用域，编号仍然稳定，
+ * 只是不能跨那条没归属的旧组去对齐另外两个导出的房号。
+ *
+ * orderToMasterRows 逐乘客用它算 scope；buildMasterExportWorkbook 的预扫描（B10：预建
+ * 「身份→房号」映射）也要用它——两处必须算出同一个 scope 字符串，presortedIdentityNumbers
+ * 才能对上号，所以抽成这一个函数，不允许两处各写一遍、日后改动只同步一处。
+ */
+function roomGroupScope(order: Pick<OrderForMasterExport, 'items'>, group: RoomGroup | undefined): string {
+  const attributedItem = group?.orderItemId
+    ? order.items.find((it) => it.id === group.orderItemId)
+    : undefined;
+  return `${roomNumberScopeKey(attributedItem?.hotelRoomType?.hotelId ?? null, group?.hotelName ?? '')}|${attributedItem?.hotelCheckIn ? fmtDate(attributedItem.hotelCheckIn) : ''}`;
+}
+
 // ── 订单 → 每位乘客一行 ─────────────────────────────────────────────────────
 /**
  * 把一张订单展开成 N 行（每位乘客一行），字段尽量填满系统真实存有的数据。
@@ -501,9 +525,22 @@ export function orderToMasterRows(
    */
   roomNumberer: RoomNumberer = new RoomNumberer(),
   /** §九共享房伙伴单号查找表（loadSharedRoomPartnerLookup 批量拉好后传入）。*/
-  sharedRoomPartnerLookup: ReadonlyMap<string, readonly string[]> = new Map(),
+  sharedRoomPartnerLookup: ReadonlyMap<string, readonly SharedRoomPartnerInfo[]> = new Map(),
   /** true = 代理视角：共享房备注用中性文案，不带对方单号（§十拍板 3）。*/
   forAgent = false,
+  /**
+   * A4 安全闸：splitPairKey 只有在这个集合里才会被信任用来跨单合号（buildVerifiedSplitPairKeys
+   * 批量核验好后传入）；缺省 = 不做核验，照旧信任（单测/单张订单场景用）。
+   */
+  verifiedSplitPairKeys?: ReadonlySet<string>,
+  /**
+   * B10：三个导出共用的预建「scope+identityKey → 房号」映射（buildIdentityNumberMap 批量建好
+   * 后传入，调用方在整批订单循环外建一次）；命中时优先于 roomNumberer 的「首次遇见分配」，
+   * 保证共享房两侧不管落在哪张订单、不管这批订单在本次导出里的遍历顺序，都印同一个房号，
+   * 且与其余两个导出（分房表/整班机，同样消费这份映射的产出）对齐。缺省 = 退回旧行为
+   * （roomNumberer 首次遇见分配），单测/单张订单场景不受影响。
+   */
+  presortedIdentityNumbers?: ReadonlyMap<string, number>,
 ): Omit<MasterRow, 'seq'>[] {
   const paxCount = Math.max(1, order.passengers.length);
 
@@ -710,14 +747,14 @@ export function orderToMasterRows(
     // 不认房组自己的 hotelName 文本（§九，与分房表/整班机导出同一把尺）。旧数据没有归属
     // 时 hotelId 为 null，roomNumberScopeKey 用 hotelName 兜底出一个隔离作用域，
     // 编号仍然稳定，只是不能跨那条没归属的旧组去对齐另外两个导出的房号。
-    const attributedItem = group?.orderItemId
-      ? order.items.find((it) => it.id === group.orderItemId)
-      : undefined;
-    const scope = `${roomNumberScopeKey(attributedItem?.hotelRoomType?.hotelId ?? null, group?.hotelName ?? '')}|${attributedItem?.hotelCheckIn ? fmtDate(attributedItem.hotelCheckIn) : ''}`;
+    const scope = roomGroupScope(order, group);
 
     let distribution: string;
     if (group) {
-      const no = roomNumberer.numberFor(scope, roomIdentityKey(group, order.id));
+      // A4：splitPairKey 合号先过核验闸；B10：预建映射命中优先于 roomNumberer 首次遇见分配。
+      const identityKey = roomIdentityKey(group, order.id, verifiedSplitPairKeys);
+      const preNumber = presortedIdentityNumbers?.get(scopedIdentityMapKey(scope, identityKey));
+      const no = preNumber ?? roomNumberer.numberFor(scope, identityKey);
       // 共享房不分「拼房/整间」——两侧份额可能不对称（1+0、0.5+0.5…），物理是同一间房，
       // 统一标「合住」，不因份额差异印不同后缀（§九）。
       const share = group.sharedRoomId ? '合住' : group.roomFraction === 0.5 ? '拼房' : '整间';
@@ -863,7 +900,38 @@ export async function buildMasterExportWorkbook(
     }
   }
   const sharedRoomPartnerLookup = await loadSharedRoomPartnerLookup(sharedRoomIds, client);
+
+  // A4：splitPairKey 跨单合号安全闸——先批量核验本次导出涉及的全部拆单配对键，
+  // 只有真的对应同一次拆单（见 OrderSplitRecord）才允许合号，否则退回 orderId:groupId。
+  const verifiedSplitPairKeys = await buildVerifiedSplitPairKeys(
+    orders.flatMap((order) =>
+      parseRoomGroups(order.roomAssignment).map((g) => ({ orderId: order.id, splitPairKey: g.splitPairKey })),
+    ),
+    client,
+  );
+
+  // B10：预建「scope+identityKey → 房号」映射——按确定性排序统一编号，不依赖本次查询把哪些
+  // 订单先摆出来（本表 orderBy createdAt desc，与分房表/整班机导出的遍历顺序不同，旧口径
+  // 「谁先遍历到就编几号」会让同一批身份在三个导出里编出不同房号）。
+  const identityEntries: IdentityNumberEntry[] = [];
+  for (const order of orders) {
+    for (const g of parseRoomGroups(order.roomAssignment)) {
+      const scope = roomGroupScope(order, g);
+      const identityKey = roomIdentityKey(g, order.id, verifiedSplitPairKeys);
+      identityEntries.push({ scope, identityKey, sortKey: roomIdentitySortKey(g, identityKey, order.orderNumber) });
+    }
+  }
+  const presortedIdentityNumbers = buildIdentityNumberMap(identityEntries);
+  // roomNumberer 仍然保留，作为映射没覆盖到的边缘情况（理论不该发生：预扫描与正式渲染走
+  // 同一套 order/group 数据）的防御性回落；prime 各 scope 计数器，避免它的号与预建号相撞。
   const roomNumberer = new RoomNumberer();
+  const maxPresortedByScope = new Map<string, number>();
+  for (const e of identityEntries) {
+    const no = presortedIdentityNumbers.get(scopedIdentityMapKey(e.scope, e.identityKey));
+    if (no != null) maxPresortedByScope.set(e.scope, Math.max(maxPresortedByScope.get(e.scope) ?? 0, no));
+  }
+  for (const [scope, max] of maxPresortedByScope) roomNumberer.prime(scope, max);
+
   const forAgent = role === 'agent';
 
   const cols = visibleColumns(role);
@@ -898,7 +966,15 @@ export async function buildMasterExportWorkbook(
   let seq = 0;
   for (const order of orders) {
     if (order.passengers.length === 0) continue;
-    for (const row of orderToMasterRows(order, tripStats, roomNumberer, sharedRoomPartnerLookup, forAgent)) {
+    for (const row of orderToMasterRows(
+      order,
+      tripStats,
+      roomNumberer,
+      sharedRoomPartnerLookup,
+      forAgent,
+      verifiedSplitPairKeys,
+      presortedIdentityNumbers,
+    )) {
       seq += 1;
       // key-based addRow 只取可见列对应的 key，多余字段忽略 —— role 裁列天然生效
       ws.addRow({ seq, ...row });
