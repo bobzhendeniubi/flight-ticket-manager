@@ -3339,6 +3339,19 @@ export interface HotelControlAlerts {
     /** 后端拼好的补充说明（如「（其中 N 座为 no-show 恢复超售，已审计放行）」），无则空串。 */
     note?: string;
   }>;
+  /**
+   * 跨单分房（§十一）：共享房里唯一还占着物理房的成员全是 0 份额——掏钱那张单被取消/
+   * 退款/软删了，剩下白住的一方。物理口径仍占 1 间，但这是运营该核对的异常状态。
+   */
+  sharedRoomOrphaned: Array<{
+    sharedRoomId: string;
+    hotelId: string;
+    hotelName: string;
+    checkIn: string; // YYYY-MM-DD
+    checkOut: string; // YYYY-MM-DD
+    /** 仍有效（占房）的成员所属单号，去重升序。 */
+    memberOrderNumbers: string[];
+  }>;
 }
 
 /** GET /hotel-control/recent-changes — 近期用房变更（读审计流：调整分房/换酒店/补房差/改期） */
@@ -7498,6 +7511,16 @@ export interface HotelOccupant {
   checkIn: string; // YYYY-MM-DD（该行入住日）
   checkOut: string; // YYYY-MM-DD（该行退房日）
   agentName: string; // 无代理 = '直客'
+  /**
+   * 跨单分房下钻三列（§十一，B9）：口径互不相同，按订单展示（同订单多行会重复出现同一个
+   * 数字），不可跨单直接相加去凑总物理房间数——完整口径说明见同响应的 detailNote。
+   */
+  /** 本次查询 scope（酒店 + 该晚）内参与的 ACTIVE 共享房去重数。 */
+  sharedRoomCount: number;
+  /** 本次查询 scope 内、本晚所有占房行 roomsBilled 之和（含普通房组份额与共享成员份额）。 */
+  billedRoomFraction: number;
+  /** 去重物理房：整单普通房组去重间数 + 参与共享房数（去重不看份额）。 */
+  physicalRoomsDeduped: number;
 }
 
 /** GET /hotel-control/nightly-remaining —— 入住区间逐晚余量（原始数组，未汇总；由调用方按需汇总展示）。 */
@@ -7563,7 +7586,8 @@ export const hotelControlOpsApi = {
       params.randomStarTier != null
         ? `randomStarTier=${params.randomStarTier}`
         : `hotelId=${encodeURIComponent(params.hotelId ?? '')}`;
-    return apiFetch<{ occupants: HotelOccupant[] }>(
+    // detailNote：三列口径说明（后端 OCCUPYING_ORDERS_DETAIL_NOTE，B9 前端补展示）。
+    return apiFetch<{ occupants: HotelOccupant[]; detailNote: string }>(
       `/hotel-control/occupants?${scope}&date=${encodeURIComponent(params.date)}`,
       { token },
     );
