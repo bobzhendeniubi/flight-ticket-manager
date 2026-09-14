@@ -1951,6 +1951,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     return {
       succeeded: result.succeeded,
       failed: result.failed,
+      // astra finding B5：解绑 warnings 此前留在 audit 里，audit 整个被裁掉后逐单警告
+      // 也跟着消失——warnings 是独立顶层字段（service 层已从 audit.warnings 提到这里），
+      // 裁 audit 时显式保留它，不能连坐。
       results: result.results.map(({ audit: _audit, ...publicResult }) => publicResult),
     };
   });

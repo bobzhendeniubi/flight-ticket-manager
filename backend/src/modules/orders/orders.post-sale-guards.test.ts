@@ -172,6 +172,8 @@ describe('swapItemHotel · 有效订单守卫 + 订单行锁', () => {
         update: vi.fn(),
       },
       orderItem: {
+        // 锁后重读（astra finding A10）：转call同一个外层 mock，单测场景锁前后数据一致。
+        findUnique: vi.fn(() => mockPrisma.orderItem.findUnique()),
         update: vi.fn(async () => {
           callTrace.push('UPDATE_ITEM');
           return { id: 'item-1' };

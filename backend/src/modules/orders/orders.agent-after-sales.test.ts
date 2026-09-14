@@ -364,7 +364,11 @@ describe('swapItemHotel · 代理系统差价', () => {
         }),
         update: vi.fn().mockResolvedValue({}),
       },
-      orderItem: { update: vi.fn().mockResolvedValue({}) },
+      orderItem: {
+        // 锁后重读（astra finding A10）：转call同一个外层 mock，单测场景锁前后数据一致。
+        findUnique: vi.fn(() => mockPrisma.orderItem.findUnique()),
+        update: vi.fn().mockResolvedValue({}),
+      },
     };
     mockPrisma.$transaction.mockImplementation(async (fn: (t: unknown) => unknown) => fn(tx));
     return tx;
