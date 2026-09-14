@@ -1197,6 +1197,9 @@ describe('getOccupyingOrders', () => {
         checkIn: dayStr(0),
         checkOut: dayStr(2),
         agentName: '成都国旅',
+        sharedRoomCount: 0,
+        billedRoomFraction: 1,
+        physicalRoomsDeduped: 0,
       },
     ]);
   });
@@ -1343,6 +1346,138 @@ describe('getOccupyingOrders', () => {
     // B 店行：组都归属在 A 行 / 名字也不匹配 → 0（真实占房就是 0，不能显示整单数）
     const atB = await getOccupyingOrders('h2', dayStr(0), occupantsClient([rowB]));
     expect(atB[0]!.rooms).toBe(0);
+  });
+
+  // ── §十一 下钻新增三列 ──────────────────────────────────────────────────
+  function occupantsClientWithShared(items: unknown[], sharedMembers: unknown[]): PrismaClient {
+    return {
+      orderItem: { findMany: vi.fn().mockResolvedValue(items) },
+      sharedRoomMember: { findMany: vi.fn().mockResolvedValue(sharedMembers) },
+    } as unknown as PrismaClient;
+  }
+
+  it('参与共享房数按 sharedRoomId 去重；去重物理房 = 普通房组去重间数 + 共享房数；计费份额取行级 roomsBilled 之和', async () => {
+    const client = occupantsClientWithShared(
+      [
+        {
+          roomsBilled: 1,
+          metadata: null,
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          order: {
+            id: 'o10',
+            orderNumber: 'ST-0010',
+            status: 'PAID',
+            contactName: '周八',
+            agent: null,
+            roomAssignment: null, // 该单没有普通房组，全部占用来自共享房
+            passengers: [{ documentNumber: 'E1', chineseName: '周八', fullName: 'ZHOU/BA' }],
+          },
+        },
+      ],
+      [
+        // 两位乘客各占一个成员位，但同属一间共享房 → 去重后 1
+        { orderId: 'o10', sharedRoomId: 'sr1' },
+        { orderId: 'o10', sharedRoomId: 'sr1' },
+        // 另一间共享房
+        { orderId: 'o10', sharedRoomId: 'sr2' },
+      ],
+    );
+    const occupants = await getOccupyingOrders('h1', dayStr(0), client);
+    expect(occupants[0]!.sharedRoomCount).toBe(2); // sr1 + sr2 去重
+    expect(occupants[0]!.billedRoomFraction).toBe(1); // 行级 roomsBilled 之和
+    expect(occupants[0]!.physicalRoomsDeduped).toBe(2); // 普通房组 0（无 roomAssignment）+ 共享 2
+
+    const findMany = (client as unknown as { sharedRoomMember: { findMany: ReturnType<typeof vi.fn> } })
+      .sharedRoomMember.findMany;
+    const where = findMany.mock.calls[0][0].where;
+    expect(where.orderId).toEqual({ in: ['o10'] });
+    expect(where.sharedRoom.hotelId).toBe('h1');
+    expect(where.sharedRoom.status).toBe('ACTIVE');
+    expect(where.sharedRoom.checkIn).toEqual({ lte: day(0) });
+    expect(where.sharedRoom.checkOut).toEqual({ gt: day(0) });
+  });
+
+  it('计费份额累加同订单在本次结果集里的多行；去重物理房叠加普通房组的整单去重间数', async () => {
+    const order = {
+      id: 'o11',
+      orderNumber: 'ST-0011',
+      status: 'PAID',
+      contactName: '吴九',
+      agent: null,
+      roomAssignment: roomAssignmentOf([1]), // 1 名乘客的普通房组 → 物理 1 间
+      passengers: [{ documentNumber: 'E1', chineseName: '吴九', fullName: 'WU/JIU' }],
+    };
+    const client = occupantsClientWithShared(
+      [
+        { id: 'item-1', roomsBilled: 1, metadata: null, hotelCheckIn: day(0), hotelCheckOut: day(1), order },
+        { id: 'item-2', roomsBilled: 0.5, metadata: null, hotelCheckIn: day(0), hotelCheckOut: day(1), order },
+      ],
+      [{ orderId: 'o11', sharedRoomId: 'sr9' }],
+    );
+    const occupants = await getOccupyingOrders('h1', dayStr(0), client);
+    expect(occupants).toHaveLength(2);
+    // 两行都是同一订单：三列按整单口径重复展示同一个数字
+    for (const row of occupants) {
+      expect(row.sharedRoomCount).toBe(1);
+      expect(row.billedRoomFraction).toBe(1.5); // 1 + 0.5
+      expect(row.physicalRoomsDeduped).toBe(2); // 普通房组 1 + 共享 1
+    }
+  });
+
+  it('随机档作用域没有 hotelId：即使 client 带 sharedRoomMember 委托也不查，三列恒为共享 0', async () => {
+    const client = occupantsClientWithShared(
+      [
+        {
+          roomsBilled: 1,
+          metadata: null,
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          order: {
+            id: 'o12',
+            orderNumber: 'ST-0012',
+            status: 'PAID',
+            contactName: '郑十',
+            agent: null,
+            roomAssignment: null,
+            passengers: [{ documentNumber: 'E1', chineseName: '郑十', fullName: 'ZHENG/SHI' }],
+          },
+        },
+      ],
+      [{ orderId: 'o12', sharedRoomId: 'sr1' }],
+    );
+    const occupants = await getOccupyingOrders({ randomStarTier: 4 }, dayStr(0), client);
+    expect(occupants[0]!.sharedRoomCount).toBe(0);
+    expect(occupants[0]!.physicalRoomsDeduped).toBe(0);
+    const findMany = (client as unknown as { sharedRoomMember: { findMany: ReturnType<typeof vi.fn> } })
+      .sharedRoomMember.findMany;
+    expect(findMany).not.toHaveBeenCalled();
+  });
+
+  it('client 没有 sharedRoomMember 委托（旧单测 mock）：防御式回落三列为 0/普通口径，不抛错', async () => {
+    // occupantsClient（不带 sharedRoomMember）是本文件其它用例的既有 helper；
+    // 这里显式覆盖，确认新逻辑在缺委托时不炸。
+    const client = occupantsClient([
+      {
+        roomsBilled: 1,
+        metadata: null,
+        hotelCheckIn: day(0),
+        hotelCheckOut: day(1),
+        order: {
+          id: 'o13',
+          orderNumber: 'ST-0013',
+          status: 'PAID',
+          contactName: '钱十一',
+          agent: null,
+          roomAssignment: null,
+          passengers: [{ documentNumber: 'E1', chineseName: '钱十一', fullName: 'QIAN/SHIYI' }],
+        },
+      },
+    ]);
+    const occupants = await getOccupyingOrders('h1', dayStr(0), client);
+    expect(occupants[0]!.sharedRoomCount).toBe(0);
+    expect(occupants[0]!.billedRoomFraction).toBe(1);
+    expect(occupants[0]!.physicalRoomsDeduped).toBe(0);
   });
 });
 

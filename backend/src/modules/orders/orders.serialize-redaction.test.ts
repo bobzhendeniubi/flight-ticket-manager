@@ -692,6 +692,109 @@ describe('serializeOrder · legFlag 物化列', () => {
 });
 
 // ══════════════════════════════════════════════════════════════════════════
+// 跨单分房 roomAssignment（§十，验收反例 9）：ADMIN/STAFF 原样透传（含 sharedRoomId /
+// splitPairKey / hotelName），AGENT/CUSTOMER 经 serializeRoomGroupsFor 剥成中性 DTO——
+// 不下发 sharedRoomId 本身、splitPairKey，也不暴露对方单号；只留 isShared 布尔。
+// ══════════════════════════════════════════════════════════════════════════
+describe('serializeOrder · roomAssignment 跨单分房脱敏', () => {
+  const orderWithSharedRoom = () => ({
+    ...buildOrder(),
+    roomAssignment: {
+      roomGroups: [
+        {
+          id: 'g1',
+          hotelName: '合住酒店',
+          roomType: '大床房',
+          passengerIds: ['p1'],
+          roomFraction: 1,
+          orderItemId: 'item-hotel',
+          sharedRoomId: 'sr1',
+          notes: '靠窗',
+          splitPairKey: 'item-hotel:token-abc',
+        },
+      ],
+    },
+  });
+
+  it('ADMIN / STAFF：roomAssignment 原样透传，含 sharedRoomId / splitPairKey / hotelName', () => {
+    for (const role of [UserRole.ADMIN, UserRole.STAFF]) {
+      const out = serializeOrder(orderWithSharedRoom() as never, orderSerializeRoleCtx(role)) as Record<
+        string,
+        any
+      >;
+      const group = out.roomAssignment.roomGroups[0];
+      expect(group.sharedRoomId).toBe('sr1');
+      expect(group.splitPairKey).toBe('item-hotel:token-abc');
+      expect(group.hotelName).toBe('合住酒店');
+    }
+  });
+
+  it('AGENT / CUSTOMER：roomAssignment 剥成中性 DTO，不含 sharedRoomId / splitPairKey / orderItemId / hotelName，也没有对方单号', () => {
+    for (const role of [UserRole.AGENT, UserRole.CUSTOMER]) {
+      const out = serializeOrder(orderWithSharedRoom() as never, orderSerializeRoleCtx(role)) as Record<
+        string,
+        any
+      >;
+      const group = out.roomAssignment.roomGroups[0];
+      expect(group).toEqual({
+        id: 'g1',
+        roomType: '大床房',
+        passengerIds: ['p1'],
+        roomFraction: 1,
+        isShared: true,
+        notes: '靠窗',
+      });
+      const serialized = JSON.stringify(out.roomAssignment);
+      expect(serialized).not.toContain('sr1');
+      expect(serialized).not.toContain('splitPairKey');
+      expect(serialized).not.toContain('token-abc');
+      expect(serialized).not.toContain('item-hotel');
+      // 不出现任何看起来像另一张单单号的字符串（本测试数据里没有真实单号，仅确认没有额外字段泄露）
+      expect(Object.keys(group).sort()).toEqual(
+        ['id', 'isShared', 'notes', 'passengerIds', 'roomFraction', 'roomType'].sort(),
+      );
+    }
+  });
+
+  it('未共享的普通房组：AGENT 视角 isShared=false，其余字段照常', () => {
+    const order = {
+      ...buildOrder(),
+      roomAssignment: {
+        roomGroups: [
+          { id: 'g2', hotelName: '普通酒店', roomType: '双床房', passengerIds: ['p1'], notes: null },
+        ],
+      },
+    };
+    const out = serializeOrder(order as never, orderSerializeRoleCtx(UserRole.AGENT)) as Record<
+      string,
+      any
+    >;
+    expect(out.roomAssignment.roomGroups[0]).toEqual({
+      id: 'g2',
+      roomType: '双床房',
+      passengerIds: ['p1'],
+      roomFraction: 1,
+      isShared: false,
+      notes: '',
+    });
+  });
+
+  it('roomAssignment 为 null：AGENT 视角回落 { roomGroups: [] }，ADMIN 视角保持 null', () => {
+    const order = { ...buildOrder(), roomAssignment: null };
+    const agentOut = serializeOrder(order as never, orderSerializeRoleCtx(UserRole.AGENT)) as Record<
+      string,
+      any
+    >;
+    expect(agentOut.roomAssignment).toEqual({ roomGroups: [] });
+    const adminOut = serializeOrder(order as never, orderSerializeRoleCtx(UserRole.ADMIN)) as Record<
+      string,
+      any
+    >;
+    expect(adminOut.roomAssignment).toBeNull();
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
 // 对外中性航段状态 publicLegStatus：
 //   前缀剥掉 + 快照黑名单之后，被释放的回程行在前台只剩光杆名字（无班次→无日期无航班号），
 //   客人会以为系统坏了。对外视角补一个中性枚举让前端能落一句买家口吻的说明；

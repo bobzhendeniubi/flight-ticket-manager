@@ -37,6 +37,14 @@ import {
   parseRoomGroups,
   resolveExportHotelName,
 } from './orders.export-room-allocation.js';
+import {
+  roomIdentityKey,
+  roomNumberScopeKey,
+  RoomNumberer,
+  loadSharedRoomPartnerLookup,
+  sharedRoomPartnerNote,
+  AGENT_SHARED_ROOM_NOTE,
+} from './room-identity.js';
 import { resolveRoomGroupPlacement } from './room-group-placement.js';
 import {
   nameWithTitle,
@@ -433,8 +441,14 @@ export const MASTER_EXPORT_INCLUDE = {
         },
       },
       // randomTierPlaceholder：房型挂在随机档占位酒店上 = 未落位，「酒店中文名称」按「X星随机（待落位）」出
+      // hotelId：§九房号编号作用域用真实酒店 id（不认房组自己的 hotelName 文本），
+      // 与 orders.export-room-allocation.ts 的 ROOM_ITEM_INCLUDE 同一口径。
       hotelRoomType: {
-        select: { name: true, hotel: { select: { name: true, randomTierPlaceholder: true } } },
+        select: {
+          hotelId: true,
+          name: true,
+          hotel: { select: { name: true, randomTierPlaceholder: true } },
+        },
       },
       visa: { select: { visaName: true, visaType: true, supplier: true } },
       // 套餐(BUNDLE)行关联的套餐定义：取 items JSON 以捞出签证组件的挂牌价（qty×unitPrice）。
@@ -480,6 +494,16 @@ export {
 export function orderToMasterRows(
   order: OrderForMasterExport,
   tripStats: TripStatsMap = new Map(),
+  /**
+   * §九跨单房号编号器：调用方（buildMasterExportWorkbook）在整批订单循环外创建一个实例
+   * 传进来，让共享房两侧算出同一个房号，且房号不再各订单从 1 重开（astra 评审 finding 10）。
+   * 缺省新建一个——单测/单张订单场景退化成「这张订单内从 1 开始编号」，行为与改前一致。
+   */
+  roomNumberer: RoomNumberer = new RoomNumberer(),
+  /** §九共享房伙伴单号查找表（loadSharedRoomPartnerLookup 批量拉好后传入）。*/
+  sharedRoomPartnerLookup: ReadonlyMap<string, readonly string[]> = new Map(),
+  /** true = 代理视角：共享房备注用中性文案，不带对方单号（§十拍板 3）。*/
+  forAgent = false,
 ): Omit<MasterRow, 'seq'>[] {
   const paxCount = Math.max(1, order.passengers.length);
 
@@ -680,30 +704,38 @@ export function orderToMasterRows(
   // 只认 kind==='HOTEL' 会让套餐单永远不显示"未分房"。分房情况据此对未分房乘客回落"未分房"。
   const hasHotel = order.items.some((it) => it.hotelRoomTypeId);
 
-  // 分房情况（每位乘客各算）：分了房 → "房N·拼房/整间"；未分房但有酒店 → "未分房"；无酒店 → ""
-  let roomSeq = 0;
-  const groupRoomNo = new Map<string, number>();
-
   return order.passengers.map<Omit<MasterRow, 'seq'>>((p) => {
     const group = roomGroups.find((g) => g.passengerIds.includes(p.id));
+    // 归属行（group.orderItemId 精确对行）：编号作用域取它的真实 hotelId + 入住日，
+    // 不认房组自己的 hotelName 文本（§九，与分房表/整班机导出同一把尺）。旧数据没有归属
+    // 时 hotelId 为 null，roomNumberScopeKey 用 hotelName 兜底出一个隔离作用域，
+    // 编号仍然稳定，只是不能跨那条没归属的旧组去对齐另外两个导出的房号。
+    const attributedItem = group?.orderItemId
+      ? order.items.find((it) => it.id === group.orderItemId)
+      : undefined;
+    const scope = `${roomNumberScopeKey(attributedItem?.hotelRoomType?.hotelId ?? null, group?.hotelName ?? '')}|${attributedItem?.hotelCheckIn ? fmtDate(attributedItem.hotelCheckIn) : ''}`;
+
     let distribution: string;
     if (group) {
-      let no = groupRoomNo.get(group.id);
-      if (no === undefined) {
-        no = ++roomSeq;
-        groupRoomNo.set(group.id, no);
-      }
-      const share = group.roomFraction === 0.5 ? '拼房' : '整间';
+      const no = roomNumberer.numberFor(scope, roomIdentityKey(group, order.id));
+      // 共享房不分「拼房/整间」——两侧份额可能不对称（1+0、0.5+0.5…），物理是同一间房，
+      // 统一标「合住」，不因份额差异印不同后缀（§九）。
+      const share = group.sharedRoomId ? '合住' : group.roomFraction === 0.5 ? '拼房' : '整间';
       distribution = `房${no}·${share}`;
     } else {
       distribution = hasHotel ? '未分房' : '';
     }
 
-    // 备注叠加乘客分房组备注（酒店/房型/组备注）
+    // 备注叠加乘客分房组备注（酒店/房型/组备注）+ 跨单合住备注（内部带对方单号/代理中性文案）
     const groupInfo = group
       ? [group.hotelName, group.roomType, group.notes].filter(Boolean).join(' / ')
       : '';
-    const notes = [baseNotes, groupInfo].filter(Boolean).join(' / ');
+    const sharedNote = group?.sharedRoomId
+      ? forAgent
+        ? AGENT_SHARED_ROOM_NOTE
+        : sharedRoomPartnerNote(group.sharedRoomId, order.orderNumber, sharedRoomPartnerLookup)
+      : '';
+    const notes = [baseNotes, groupInfo, sharedNote].filter(Boolean).join(' / ');
 
     // 飞行次数 / 在订未飞 / 可用次数：按本乘客证件号取常旅客档案的快照（每人各不相同）。
     // 匹配不到档案（新客/证件号对不上）→ 三项都留空，不臆造 0（0 会被读成"从没飞过"的结论）。
@@ -821,6 +853,19 @@ export async function buildMasterExportWorkbook(
   const allPassengers = orders.flatMap((o) => o.passengers);
   const { tripStats, oldestRefreshedAt } = await loadExportTripStats(allPassengers, client);
 
+  // §九跨单房号：批量拉出本次导出涉及的全部共享房各自的成员单号（无 N+1）；
+  // RoomNumberer 在整批订单循环外建一个实例，传给每次 orderToMasterRows 调用——
+  // 共享房两侧不管落在哪张订单，都从同一个编号器取号，不会各订单各编各的。
+  const sharedRoomIds = new Set<string>();
+  for (const order of orders) {
+    for (const g of parseRoomGroups(order.roomAssignment)) {
+      if (g.sharedRoomId) sharedRoomIds.add(g.sharedRoomId);
+    }
+  }
+  const sharedRoomPartnerLookup = await loadSharedRoomPartnerLookup(sharedRoomIds, client);
+  const roomNumberer = new RoomNumberer();
+  const forAgent = role === 'agent';
+
   const cols = visibleColumns(role);
 
   const wb = new ExcelJS.Workbook();
@@ -853,7 +898,7 @@ export async function buildMasterExportWorkbook(
   let seq = 0;
   for (const order of orders) {
     if (order.passengers.length === 0) continue;
-    for (const row of orderToMasterRows(order, tripStats)) {
+    for (const row of orderToMasterRows(order, tripStats, roomNumberer, sharedRoomPartnerLookup, forAgent)) {
       seq += 1;
       // key-based addRow 只取可见列对应的 key，多余字段忽略 —— role 裁列天然生效
       ws.addRow({ seq, ...row });

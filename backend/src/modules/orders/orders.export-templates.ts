@@ -39,6 +39,11 @@ import {
   parseRoomGroups,
   resolveExportHotelName,
 } from './orders.export-room-allocation.js';
+import {
+  loadSharedRoomPartnerLookup,
+  sharedRoomPartnerNote,
+  AGENT_SHARED_ROOM_NOTE,
+} from './room-identity.js';
 import { resolveRoomGroupPlacement } from './room-group-placement.js';
 import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats.js';
 import type { TripStatsMap } from './orders.export-trip-stats.js';
@@ -944,6 +949,10 @@ export function orderToFullRows(
   order: OrderForTemplateExport,
   ctx: OrderContext,
   tripStats: TripStatsMap = new Map(),
+  /** §九/§十共享房伙伴单号查找表（loadSharedRoomPartnerLookup 批量拉好后传入）。*/
+  sharedRoomPartnerLookup: ReadonlyMap<string, readonly string[]> = new Map(),
+  /** true = 代理导出：共享房备注用中性文案，不带对方单号（§十拍板 3）。*/
+  forAgent = false,
 ): Omit<FullRow, 'seq'>[] {
   // 乘客姓名列称谓统一 MR/MS（不分年龄，0723 票务口径）。
   const departureDate = earliestFlightDeparture(order.items);
@@ -1019,7 +1028,13 @@ export function orderToFullRows(
     const groupInfo = group
       ? [group.hotelName, group.roomType, group.notes].filter(Boolean).join(' / ')
       : '';
-    const notes = [baseNotes, groupInfo].filter(Boolean).join(' / ');
+    // 跨单合住备注：内部导出带对方单号，代理导出只写中性文案（§十拍板 3）
+    const sharedNote = group?.sharedRoomId
+      ? forAgent
+        ? AGENT_SHARED_ROOM_NOTE
+        : sharedRoomPartnerNote(group.sharedRoomId, order.orderNumber, sharedRoomPartnerLookup)
+      : '';
+    const notes = [baseNotes, groupInfo, sharedNote].filter(Boolean).join(' / ');
 
     return {
     isOriginalOrder: '',
@@ -1358,6 +1373,22 @@ export async function buildOrderTemplateExportWorkbook(
       : { tripStats: new Map() as TripStatsMap, oldestRefreshedAt: null };
   const { tripStats, oldestRefreshedAt } = tripStatsLookup;
 
+  // §九/§十跨单合住备注：只有《全岗可用》的备注列会拼房组信息，只在 full 时才批量拉伙伴单号
+  // （代理导出也要拉——中性文案不需要对方单号，但仍要知道「是不是共享房」，isShared 判定
+  // 只看 group.sharedRoomId 本身，不依赖这份 lookup；lookup 只在内部视角生成「与 FTM… 合住」时用）。
+  const sharedRoomPartnerLookup =
+    query.template === 'full' && !isAgentExport
+      ? await (async () => {
+          const sharedRoomIds = new Set<string>();
+          for (const order of orders) {
+            for (const g of parseRoomGroups(order.roomAssignment)) {
+              if (g.sharedRoomId) sharedRoomIds.add(g.sharedRoomId);
+            }
+          }
+          return loadSharedRoomPartnerLookup(sharedRoomIds, client);
+        })()
+      : new Map<string, string[]>();
+
   const wb = new ExcelJS.Workbook();
   wb.creator = `Citur Travel · 订单导出（${ORDER_TEMPLATE_LABEL[query.template]}）`;
   wb.created = new Date();
@@ -1392,7 +1423,7 @@ export async function buildOrderTemplateExportWorkbook(
     // agentScope 非空 = 代理在导自己的单 → 「航段状态」置空（超售口径不外流，见 buildOrderContext）。
     const ctx = buildOrderContext(order, { redactLegStatus: opts?.agentScope != null });
     if (query.template === 'full') {
-      for (const row of orderToFullRows(order, ctx, tripStats)) {
+      for (const row of orderToFullRows(order, ctx, tripStats, sharedRoomPartnerLookup, isAgentExport)) {
         seq += 1;
         ws.addRow({ seq, ...row });
       }

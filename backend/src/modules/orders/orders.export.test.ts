@@ -443,6 +443,53 @@ describe('buildOrdersBySchedule · 房号 / 当日余房（房控核对列，口
     expect(cell(header, dataRows[0], '房号')).toBe('房1');
     expect(cell(header, dataRows[0], '当日余房')).toBe('—');
   });
+
+  it('跨单分房（§九验收反例 11）：共享房两侧不同单，同酒店同入住日印同一房号，不因份额标 (½)', async () => {
+    const h3Item = () =>
+      hotelItem({ hotelId: 'h3', hotelName: '合住酒店', roomTypeName: '大床房', capacity: 2, checkIn: '2026-06-10' });
+    const client = fakeClient([
+      order('ORD-SR-A', [h3Item()], {
+        id: 'ord-sr-a',
+        passengers: [passenger('psa1')],
+        roomAssignment: {
+          roomGroups: [
+            {
+              id: 'gA',
+              hotelName: '合住酒店',
+              roomType: '大床房',
+              passengerIds: ['psa1'],
+              roomFraction: 1,
+              sharedRoomId: 'sr1',
+            },
+          ],
+        },
+      }),
+      order('ORD-SR-B', [h3Item()], {
+        id: 'ord-sr-b',
+        passengers: [passenger('psb1')],
+        roomAssignment: {
+          roomGroups: [
+            {
+              id: 'gB',
+              hotelName: '合住酒店',
+              roomType: '大床房',
+              passengerIds: ['psb1'],
+              roomFraction: 0,
+              sharedRoomId: 'sr1',
+            },
+          ],
+        },
+      }),
+    ]);
+
+    const buf = await buildOrdersBySchedule('sched-1', client);
+    const { header, dataRows } = await parseSheet(buf);
+
+    expect(dataRows).toHaveLength(2);
+    const roomNos = dataRows.map((r) => cell(header, r, '房号'));
+    expect(roomNos[0]).toBe(roomNos[1]); // 同一个房号
+    expect(roomNos[0]).not.toContain('½'); // 不因一侧份额 0 印半间后缀
+  });
 });
 
 describe('buildOrdersBySchedule · 星级随机未落位行（口径对齐分房表导出）', () => {
