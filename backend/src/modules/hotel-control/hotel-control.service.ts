@@ -1527,6 +1527,12 @@ export interface AssertHotelFitAfterChangeArgs {
   options?: {
     /** 只拦「比改前更差」的操作——存量已超卖时运营补救不该被自己造成的存量超卖挡住。*/
     allowNonWorsening?: boolean;
+    /**
+     * 限额内超售放行（内部录单专用口子，语义照抄 assertHotelPhysicalFit.maxOversellRooms）：
+     * 每晚**累计**缺口 ≤ 此值时不抛错、把被容忍的超卖明细作为返回值交给调用方写 WARNING
+     * 审计；任一晚缺口超上限仍拒。缺省 = 硬闸（对外端点/散客必须缺省）。
+     */
+    maxOversellRooms?: number;
     buildMessage?: (violations: readonly PhysicalFitViolation[]) => string;
   };
 }
@@ -1605,14 +1611,18 @@ async function computeSharedRoomPhysicalAfterChange(
  *      assertHotelPhysicalFitWithinTx 的按酒店循环用法一致）。
  *
  * 该酒店本区间没有任何包房周期 → 未纳管，不拦（房控哲学：未配包房 ≠ 售罄）。
+ *
+ * @returns 被 `options.maxOversellRooms` 容忍的超卖明细（未开豁免、未超卖、或被
+ *   `allowNonWorsening` 放行 → 空数组）。调用方拿非空返回值写 WARNING 审计，语义与
+ *   `assertHotelPhysicalFit` 完全一致。
  */
 export async function assertHotelFitAfterChange(
   tx: Prisma.TransactionClient,
   hotelId: string,
   nightDates: readonly string[],
   args: AssertHotelFitAfterChangeArgs,
-): Promise<void> {
-  if (nightDates.length === 0) return;
+): Promise<PhysicalFitViolation[]> {
+  if (nightDates.length === 0) return [];
   await lockHotelBlockPeriodsWithinTx(tx, hotelId, nightDates);
 
   const fromD = toDateOnly(nightDates[0]);
@@ -1621,7 +1631,7 @@ export async function assertHotelFitAfterChange(
     where: { hotelId, dateFrom: { lte: toD }, dateTo: { gte: fromD } },
     select: { dateFrom: true, dateTo: true, rooms: true },
   });
-  if (periods.length === 0) return;
+  if (periods.length === 0) return [];
   const block = expandBlockByDate(periods, nightDates);
 
   const affectedSet = new Set(args.affectedOrderIds);
@@ -1694,16 +1704,27 @@ export async function assertHotelFitAfterChange(
       });
     }
   });
-  if (violations.length === 0) return;
+  if (violations.length === 0) return [];
   if (
     args.options?.allowNonWorsening &&
     violations.every((v) => physicalAfter[v.index] <= physicalBefore[v.index])
   ) {
-    return;
+    return [];
+  }
+  // 限额内超售放行（内部录单口子，语义照抄 assertHotelPhysicalFit.maxOversellRooms）：
+  // 每晚累计缺口都在上限内才放行——任一晚超限仍拒（防手滑一次打穿）。
+  if (
+    args.options?.maxOversellRooms != null &&
+    violations.every((v) => v.shortfall <= args.options!.maxOversellRooms!)
+  ) {
+    return violations;
   }
   const message = args.options?.buildMessage
     ? args.options.buildMessage(violations)
-    : `酒店实际房间不足（${violations[0].date} 包房 ${violations[0].block} 间，本次操作后需 ${violations[0].physicalUsed} 间）`;
+    : `酒店实际房间不足（${violations[0].date} 包房 ${violations[0].block} 间，本次操作后需 ${violations[0].physicalUsed} 间）` +
+      (args.options?.maxOversellRooms != null
+        ? `，缺口已超出超售容忍上限 ${args.options.maxOversellRooms} 间`
+        : '');
   throw new BadRequestError(message);
 }
 
