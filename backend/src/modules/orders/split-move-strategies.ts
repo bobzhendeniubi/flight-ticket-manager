@@ -464,6 +464,73 @@ export function deriveRoomsToMove(srcRooms: number, ctx: SplitContext): number {
   return clamp(movedHalf, 0, srcHalf) / 2;
 }
 
+// ── 共享房组的混合拆分（§八「拆单」，与 moveHotel/splitPairKeyOf 是两条不同的路）───────
+/** `splitMixedSharedRoomGroup` 的产出：两侧 JSON 房组 + 各自的份额（调用方要拿这两个
+ * 份额去同步写 SharedRoomMember.roomFraction——JSON 与成员表是两份镜像，缺一步就会分叉，
+ * 见函数头注释）。*/
+export interface SharedRoomGroupSplit {
+  kept: Record<string, unknown>;
+  moved: Record<string, unknown>;
+  keptFraction: number;
+  movedFraction: number;
+}
+
+/**
+ * 混合共享房组拆分（HIGH 修复 · astra finding A7 ②③）：一个共享房组同时含拆出与留下的
+ * 乘客时，**不**走通用的 `splitMixedRoomGroup`（那是给普通房组设计的：按人头比例强制
+ * 劈半、写 `splitPairKey` 供房控把两个半间配回一间）。共享组的物理去重从来不靠 JSON
+ * 配对键——靠的是 SharedRoom/SharedRoomMember 表本身（见 hotel-control.service.ts 的
+ * computeSharedRoomPhysicalByDate），硬套配对键机制只会把两个本不相关的普通房组撞车拼
+ * 成一间（finding ④ 的成因）；按人头比例强劈份额也不对——移出的人可能正是「让份」的
+ * 一方，按人头分反而凭空造出份额。
+ *
+ * 口径：份额默认整块留在源单（keptFraction = 原值，movedFraction = 0）——移出方不显式
+ * 要求就不占任何份额；运营可在 `roomSplit` 里对该房组归属的订单行显式指定移出方带走
+ * 多少（`explicitMovedFraction`，同一份 roomSplit 输入，同一套 0.5 网格单位）。
+ * sharedRoomId 原样保留在两侧（两个 JSON 房组仍是**同一间**共享房的两份镜像，物理占用
+ * 继续由 SharedRoom 表去重，不因为分处两张订单而变成两间）；不写 splitPairKey，
+ * 也**清掉**源房组上可能带着的旧 splitPairKey（防御式，同 shared-room-unbind.ts 的
+ * stripSharedRoomId）。
+ *
+ * ⚠ 只算出「应该是什么样」，不写库：调用方（executeSplitWithinTx）还要把 keptFraction /
+ * movedFraction 同步写回两侧的 SharedRoomMember.roomFraction（该表按 (sharedRoomId,
+ * passengerId) 各自成行，"都写这个数" 是既有约定——见 hotel-control.shared-rooms.ts
+ * 头注释），否则真值表还留着拆分前的合并份额，按 (orderId, orderItemId) 去重求和会把同一
+ * 间房的份额算成两份（例如原值 1 拆成两个 0.5，若成员表不同步仍各自读到 1，Σ 变成 2）。
+ */
+export function splitMixedSharedRoomGroup(
+  group: { raw: Record<string, unknown>; passengerIds: string[] },
+  movedIdSet: ReadonlySet<string>,
+  explicitMovedFraction: number | null,
+): SharedRoomGroupSplit {
+  const movedIds = group.passengerIds.filter((id) => movedIdSet.has(id));
+  const keptIds = group.passengerIds.filter((id) => !movedIdSet.has(id));
+  const rawFraction = group.raw.roomFraction == null ? 1 : Number(group.raw.roomFraction);
+  const srcFraction = Number.isFinite(rawFraction) ? rawFraction : 1;
+  // 移出方默认 0（份额留源单）；显式指定时夹在 [0, 源份额] 内，绝不因指定值离谱而
+  // 造出负份额（fail-closed 由调用方在落库前再断言一次 Σ 守恒）。
+  const movedFraction =
+    explicitMovedFraction == null
+      ? 0
+      : clamp(roundHalfGrid(explicitMovedFraction), 0, Math.max(0, srcFraction));
+  const keptFraction = roundHalfGrid(Math.max(0, srcFraction - movedFraction));
+  const baseId =
+    typeof group.raw.id === 'string' && group.raw.id
+      ? group.raw.id
+      : `pax:${[...group.passengerIds].sort().join('|')}`;
+  // 不用解构剔除 splitPairKey（避免 lint 对未使用变量的噪音），显式过滤重建。
+  const restRaw: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(group.raw)) {
+    if (k !== 'splitPairKey') restRaw[k] = v;
+  }
+  return {
+    kept: { ...restRaw, passengerIds: keptIds, roomFraction: keptFraction },
+    moved: { ...restRaw, id: `${baseId}-split`, passengerIds: movedIds, roomFraction: movedFraction },
+    keptFraction,
+    movedFraction,
+  };
+}
+
 // ── 策略 3：套餐行（BUNDLE）────────────────────────────────────────────────
 /**
  * 套餐行 quantity 恒为 1（份数，不是人数），amount 是「整团地面价 + 加项 + 指定酒店加价 +

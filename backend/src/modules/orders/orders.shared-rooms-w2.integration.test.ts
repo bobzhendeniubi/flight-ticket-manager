@@ -704,6 +704,74 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
     expect(member.orderItemId).not.toBe(audit.fromItemId);
   });
 
+  it('astra finding A7 ⑤ 反例：源行总计费房数为 0 的共享组仍允许按房组拆行（旧闸把 0 间源行一律拒了）', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    // orderA 整行 roomsBilled=0（纯粹的让份行，真实占房在共享房另一侧的 orderB 上）；
+    // totalCostCny 给一个非零存量值，专门验证 0 份额搬行不会拿它去做比例除法（除零）。
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    await prisma.orderItem.update({
+      where: { id: orderA.items[0].id },
+      data: { roomsBilled: new Prisma.Decimal(0), totalCostCny: new Prisma.Decimal(500) },
+    });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    const saved = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const reloaded = await prisma.order.findUniqueOrThrow({
+      where: { id: orderA.id },
+      select: { roomAssignment: true },
+    });
+    const sharedGroup = (
+      reloaded.roomAssignment as { roomGroups: Array<{ id: string; sharedRoomId?: string }> }
+    ).roomGroups.find((g) => g.sharedRoomId === saved.rooms[0].sharedRoomId);
+    expect(sharedGroup).toBeDefined();
+
+    // 旧闸「源行未记录计费房数（roomsBilled≤0）」会在这里直接拒掉；共享组应当放行。
+    const { audit } = await service.splitHotelItemByRoomGroup(
+      orderA.id,
+      orderA.items[0].id,
+      { roomGroupId: sharedGroup!.id },
+      { userId: actor.userId, role: UserRole.ADMIN },
+    );
+    expect(audit.after.fromRoomsBilled).toBe(0);
+    expect(audit.after.newRoomsBilled).toBe(0);
+    expect(audit.after.newTotalCostCny).toBe(0); // 0 份额成本恒为 0（不除零、不报错）
+
+    const member = await prisma.sharedRoomMember.findFirstOrThrow({
+      where: { passengerId: orderA.passengers[0].id },
+    });
+    expect(member.orderId).toBe(orderA.id);
+    expect(member.orderItemId).toBe(audit.newItemId);
+  });
+
   it('入口 H（恢复）：共享房已被解散后恢复取消单，一致性校验触发解绑 + 警告', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4);
@@ -821,5 +889,175 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
 
     // 恢复后物理占用仍是去重后的 1 间（不是被拆成两间）。
     expect((await getHotelNightlyRemaining(hotel.id, [CHECK_IN])).physicalRemaining).toEqual([0]);
+  });
+
+  it('astra finding A7 ①②③④ 反例：混合共享房组手工拆单——份额留源单、不写 splitPairKey、成员表不翻倍', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    // orderA：2 位乘客（p1 拆出、p2 留守）共用同一个 0 份额共享房组——多人 0 份额房组
+    // 本身就是 finding ① 要放行的场景（旧闸把它当「脏数据」拒在拆单门外）。
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 2 });
+    const [p1, p2] = orderA.passengers;
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    const saved = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [p1.id, p2.id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const sharedRoomId = saved.rooms[0].sharedRoomId!;
+    const versionBefore = (
+      await prisma.sharedRoom.findUniqueOrThrow({ where: { id: sharedRoomId }, select: { version: true } })
+    ).version;
+
+    // 手工拆单（不传 autoSplitRoomGroups）：只拆出 p1，留下 p2——闸 15 对普通房组会拒绝
+    // 「同时含拆出与留下的乘客」，但共享组不吃这道闸；旧的「脏数据」检查（0 份额房组住了
+    // 2 人）也不该拦下这个合法的共享组。
+    const result = await service.splitOrder(
+      orderA.id,
+      { passengerIds: [p1.id], requestToken: splitToken('a7') },
+      actor,
+    );
+
+    // 房组 JSON：两侧都保留 sharedRoomId、都不带 splitPairKey（astra finding ②④）。
+    const [sourceOrder, targetOrder] = await Promise.all([
+      prisma.order.findUniqueOrThrow({ where: { id: orderA.id }, select: { roomAssignment: true } }),
+      prisma.order.findUniqueOrThrow({ where: { id: result.targetOrderId }, select: { roomAssignment: true } }),
+    ]);
+    const sourceGroups = (sourceOrder.roomAssignment as { roomGroups: Array<Record<string, unknown>> })
+      .roomGroups;
+    const targetGroups = (targetOrder.roomAssignment as { roomGroups: Array<Record<string, unknown>> })
+      .roomGroups;
+    const keptGroup = sourceGroups.find((g) => g.sharedRoomId === sharedRoomId);
+    const movedGroup = targetGroups.find((g) => g.sharedRoomId === sharedRoomId);
+    expect(keptGroup).toBeDefined();
+    expect(movedGroup).toBeDefined();
+    expect(keptGroup?.splitPairKey).toBeUndefined();
+    expect(movedGroup?.splitPairKey).toBeUndefined();
+    // 份额默认整块留源单：p2（留守）那一侧保留原份额 0，p1（拆出）那一侧份额也是 0——
+    // 本例份额本就是 0，用另一条断言（下面 SharedRoomMember 汇总）证明「不是按人头强劈」。
+    expect(keptGroup?.roomFraction).toBe(0);
+    expect(movedGroup?.roomFraction).toBe(0);
+
+    // SharedRoomMember 真值表同步更新，且按 (orderId, orderItemId) 去重求和后份额守恒
+    // （astra finding ③：旧代码只搬 orderId/orderItemId 不改 roomFraction，两侧各自
+    // 还留着拆分前的合并值，去重求和会翻倍）。
+    const members = await prisma.sharedRoomMember.findMany({
+      where: { sharedRoomId },
+      select: { orderId: true, orderItemId: true, passengerId: true, roomFraction: true },
+    });
+    const p1Member = members.find((m) => m.passengerId === p1.id)!;
+    const p2Member = members.find((m) => m.passengerId === p2.id)!;
+    expect(p1Member.orderId).toBe(result.targetOrderId); // p1 真已随人搬到新单
+    expect(p2Member.orderId).toBe(orderA.id); // p2 留守原单
+    // 只看 orderA 这一侧拆出来的两个 (orderId, orderItemId) 组合（orderB 的成员未受本次
+    // 拆单影响，混进整间的求和会掩盖本例本就是 0 的事实——非零场景见下一条用例）。
+    const p1p2Fraction = Number(p1Member.roomFraction) + Number(p2Member.roomFraction);
+    expect(p1p2Fraction).toBe(0); // 本例份额本就是 0：翻倍的话仍是 0，用下面非零场景再钉一遍
+
+    // SharedRoom.version 递增（astra finding ②：份额变了要体现在 CAS 版本上）。
+    const versionAfter = (
+      await prisma.sharedRoom.findUniqueOrThrow({ where: { id: sharedRoomId }, select: { version: true } })
+    ).version;
+    expect(versionAfter).toBeGreaterThan(versionBefore);
+  });
+
+  it('astra finding A7 ③ 反例（非零份额）：混合共享组拆分后份额按 (orderId,orderItemId) 去重求和必须等于拆分前，不能翻倍', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    // orderA：2 位乘客共享同一个房组，roomFraction=1（真实付钱占房的一侧）；p1 拆出、p2 留守。
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 2 });
+    const [p1, p2] = orderA.passengers;
+    await prisma.orderItem.update({
+      where: { id: orderA.items[0].id },
+      data: { roomsBilled: new Prisma.Decimal(1) },
+    });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    await prisma.orderItem.update({
+      where: { id: orderB.items[0].id },
+      data: { roomsBilled: new Prisma.Decimal(0) },
+    });
+
+    const saved = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [p1.id, p2.id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const sharedRoomId = saved.rooms[0].sharedRoomId!;
+
+    const result = await service.splitOrder(
+      orderA.id,
+      { passengerIds: [p1.id], requestToken: splitToken('a7v2') },
+      actor,
+    );
+
+    // 份额默认整块留源单：p2 侧仍是 1，p1（拆出）侧是 0——不是按人头强劈成 0.5/0.5。
+    const members = await prisma.sharedRoomMember.findMany({
+      where: { sharedRoomId },
+      select: { orderId: true, orderItemId: true, passengerId: true, roomFraction: true },
+    });
+    const p1Member = members.find((m) => m.passengerId === p1.id)!;
+    const p2Member = members.find((m) => m.passengerId === p2.id)!;
+    expect(Number(p2Member.roomFraction)).toBe(1);
+    expect(Number(p1Member.roomFraction)).toBe(0);
+    expect(p1Member.orderId).toBe(result.targetOrderId);
+    expect(p1Member.orderId).not.toBe(p2Member.orderId);
+
+    // 按 (orderId, orderItemId) 去重求和 = 1（拆分前后守恒）——旧代码两侧各自保留原值 1，
+    // 去重求和会是 2（翻倍）。
+    const byOrderItem = new Map<string, number>();
+    for (const m of members) {
+      byOrderItem.set(`${m.orderId}:${m.orderItemId}`, Number(m.roomFraction));
+    }
+    const totalFraction = [...byOrderItem.values()].reduce((s, v) => s + v, 0);
+    expect(totalFraction).toBe(1);
   });
 });

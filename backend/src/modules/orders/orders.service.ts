@@ -97,6 +97,7 @@ import {
   readUpgradeCount,
   resolveUpgradeToMove,
   roundHalfGrid,
+  splitMixedSharedRoomGroup,
   type SplitContext,
   type SplitItemView,
   type SplitMove,
@@ -15600,25 +15601,36 @@ export class OrderService {
         throw new BadRequestError('房组间数必须是 0.5 的整数倍');
       }
       const srcRooms = item.roomsBilled != null ? Number(item.roomsBilled) : null;
-      if (srcRooms == null || srcRooms <= 0) {
+      // HIGH 修复（astra finding A7 ⑤）：共享组允许源行总份额为 0（该行本就是纯粹的
+      // 0 份额承载/让份行——真正付钱占房的份额在共享房的另一侧）。非共享组维持原闸：
+      // roomsBilled ≤ 0 大概率是分房表没保存过，拒绝提示去先保存。
+      if (srcRooms == null || (srcRooms <= 0 && !targetSharedRoomId)) {
         throw new BadRequestError('源行未记录计费房数（roomsBilled），请先保存分房表再拆分');
+      }
+      if (srcRooms < 0) {
+        throw new BadRequestError('源行计费房数无效，请先修正分房表');
       }
       const srcHalf = Math.round(srcRooms * 2);
       if (Math.abs(srcRooms * 2 - srcHalf) > 1e-9) {
         throw new BadRequestError('源行计费房数不是 0.5 的整数倍，请先核对分房表');
       }
-      if (movedHalf === srcHalf) {
+      // srcHalf===0（共享组 0/0）时「已占满 / 无需拆分」这句提示不成立——0 份额搬行本就是
+      // 合法操作（把这一份共享成员单独挪到新行，供后续换酒店/换房型等入口继续处理）。
+      if (srcHalf > 0 && movedHalf === srcHalf) {
         throw new BadRequestError('该房组已占满源行全部房数，无需拆分 —— 直接对源行换酒店即可');
       }
       if (movedHalf > srcHalf) {
         throw new BadRequestError('该房组间数超过源行计费房数，无法拆分，请先核对分房表');
       }
       const moved = movedHalf / 2;
-      const remaining = (srcHalf - movedHalf) / 2; // > 0（movedHalf < srcHalf）
+      const remaining = (srcHalf - movedHalf) / 2; // srcHalf===0 时恒为 0（0/0 搬行）
 
       // ── 成本按间数比例挪（Σ 守恒）；钱（amount）全留源行 ──
+      // srcHalf===0 时按比例分摊会除零：0 份额搬行的成本恒为 0（§八：0 份额成本按份额比例，
+      // 0 份额自然是 0），不用比例公式。
       const srcTotalCost = item.totalCostCny != null ? Number(item.totalCostCny.toString()) : null;
-      const movedCost = srcTotalCost == null ? null : round2((srcTotalCost * movedHalf) / srcHalf);
+      const movedCost =
+        srcTotalCost == null ? null : srcHalf === 0 ? 0 : round2((srcTotalCost * movedHalf) / srcHalf);
       const keptCost = srcTotalCost == null || movedCost == null ? null : round2(srcTotalCost - movedCost);
 
       // 套餐行拆出来的住宿行：单价必须一并归 0（钱全留在套餐行上）。
@@ -18165,9 +18177,12 @@ export class OrderService {
         }
         // 脏数据闸：0.5 间的房组里住着 2 位以上客人 —— 劈半后必有一侧落到 0 间却还住着人，
         // 房控从此少算一间。这是分房表本身填错了，系统不替它猜。
+        // HIGH 修复（astra finding A7 ①）：共享组不吃这条闸——共享组的 roomFraction 是本单
+        // 在跨单去重的共享房里认领的份额，与「本组住了几个人」无关也不该相等（真正付钱占房
+        // 的份额可能在共享房另一侧的别的订单上），多人 0/0.5 共享组是合法数据，不是脏数据。
         const rawFraction = group.raw.roomFraction == null ? 1 : Number(group.raw.roomFraction);
         const groupHalves = Number.isFinite(rawFraction) ? Math.round(rawFraction * 2) : 2;
-        if (groupHalves < 2 && groupPax.length >= 2) {
+        if (!groupHasSharedRoomId && groupHalves < 2 && groupPax.length >= 2) {
           blockers.push(
             `房组「${label}」记着 ${rawFraction} 间却住了 ${groupPax.length} 位客人（分房表数据有误）：` +
               '拆开后会有一侧住着人却占 0 间房。请先在分房里把这一组的间数改对，或拆成两个房组，再拆单。',
@@ -18946,6 +18961,64 @@ export class OrderService {
       splitItemIdMap.set(item.id, createdRow.id);
     }
 
+    // ── 4a-pre. 预判混合共享房组的拆分方案（HIGH 修复 · astra finding A7 ③）──────────
+    // 必须在 4b 之前算好：4b 的「源行是 NONE、搬走份额只能是 0」守恒闸原先直接拿
+    // SharedRoomMember 表里**拆分前**的原始 roomFraction 求和当"搬走份额"——一个混合共享
+    // 房组（部分乘客拆出、部分留守）按 §八「份额默认留源单」新口径，移出方的份额本该
+    // 归 0（除非 roomSplit 显式指定），但那笔判断在这里还看不到，闸只会拿到"拆分前的
+    // 合计"，把本该放行的 0 份额移出误判成非零而拒绝。这里提前把每个混合共享组的 kept/
+    // moved 份额算好（与步骤 6 用的是同一个纯函数），4b 与 6 都直接查这张表，不重复算、
+    // 也不会因为两处各自计算而出现口径分叉。
+    // 用房组的原始 JS 对象引用（group.raw）当 key：`order.roomAssignment` 在 4a-pre 与
+    // 步骤 6 之间不会被重新赋值/重新解析（4b 只改 SharedRoomMember/OrderItem 表，
+    // 步骤 5 只改 Passenger 表），两次 readRoomGroups 拿到的是同一批底层对象，按引用能
+    // 精确对上，不用另造一套稳定 id。
+    const mixedSharedGroupPlanByGroup = new Map<
+      Record<string, unknown>,
+      {
+        sharedRoomId: string;
+        keptPassengerIds: string[];
+        movedPassengerIds: string[];
+        keptFraction: number;
+        movedFraction: number;
+        kept: Record<string, unknown>;
+        moved: Record<string, unknown>;
+      }
+    >();
+    const postSplitFractionByPassenger = new Map<string, number>();
+    for (const group of readRoomGroups(order.roomAssignment)) {
+      if (group.passengerIds.length === 0) continue;
+      const groupSharedRoomId =
+        typeof group.raw.sharedRoomId === 'string' && group.raw.sharedRoomId.length > 0
+          ? group.raw.sharedRoomId
+          : null;
+      if (!groupSharedRoomId) continue;
+      const movedInGroup = group.passengerIds.filter((id) => movedIdSet.has(id));
+      if (movedInGroup.length === 0 || movedInGroup.length === group.passengerIds.length) {
+        continue; // 整组留守 / 整组拆出：份额跟着整组走，不用重算，也不进「混合」计划表。
+      }
+      const keptInGroup = group.passengerIds.filter((id) => !movedIdSet.has(id));
+      const attributedItemId =
+        typeof group.raw.orderItemId === 'string' && group.raw.orderItemId.length > 0
+          ? group.raw.orderItemId
+          : null;
+      const explicitMovedFraction = attributedItemId
+        ? (roomSplitByItem.get(attributedItemId) ?? null)
+        : null;
+      const halves = splitMixedSharedRoomGroup(group, movedIdSet, explicitMovedFraction);
+      mixedSharedGroupPlanByGroup.set(group.raw, {
+        sharedRoomId: groupSharedRoomId,
+        keptPassengerIds: keptInGroup,
+        movedPassengerIds: movedInGroup,
+        keptFraction: halves.keptFraction,
+        movedFraction: halves.movedFraction,
+        kept: halves.kept,
+        moved: halves.moved,
+      });
+      for (const pid of keptInGroup) postSplitFractionByPassenger.set(pid, halves.keptFraction);
+      for (const pid of movedInGroup) postSplitFractionByPassenger.set(pid, halves.movedFraction);
+    }
+
     // ── 4b. 共享房成员随人搬（§八 E）：SharedRoomMember 是真值源（> 订单 JSON，见
     // shared-room-unbind.ts 顶部注释），只搬步骤 6 的 JSON 镜像不够——这里把成员表也搬到
     // 新单，否则真值与镜像立刻分叉。三种情况对应步骤 4 的三种搬移决策：
@@ -18965,7 +19038,7 @@ export class OrderService {
       tx as unknown as {
         sharedRoomMember?: {
           findMany: (args: unknown) => Promise<
-            Array<{ id: string; orderItemId: string; roomFraction: Prisma.Decimal }>
+            Array<{ id: string; orderItemId: string; passengerId: string; roomFraction: Prisma.Decimal }>
           >;
           updateMany: (args: unknown) => Promise<{ count: number }>;
         };
@@ -18974,7 +19047,7 @@ export class OrderService {
     const movedSharedMembers = sharedRoomMemberDelegate
       ? await sharedRoomMemberDelegate.findMany({
           where: { orderId, passengerId: { in: [...movedIdSet] } },
-          select: { id: true, orderItemId: true, roomFraction: true },
+          select: { id: true, orderItemId: true, passengerId: true, roomFraction: true },
         })
       : [];
     if (movedSharedMembers.length > 0 && sharedRoomMemberDelegate) {
@@ -18991,8 +19064,14 @@ export class OrderService {
         } else if (splitItemIdMap.has(sourceItemId)) {
           newItemId = splitItemIdMap.get(sourceItemId)!;
         } else {
+          // 混合共享组的移出方按新口径默认 0（份额留源单），不能拿「拆分前」的原始值
+          // 求和——那是 4a-pre 已经算好的 postSplitFractionByPassenger；不在表里的成员
+          // （整组随人一起走 / 非共享）沿用其自身存量 roomFraction，行为不变。
           const movedFraction = round2(
-            members.reduce((s, m) => s + Number(m.roomFraction.toString()), 0),
+            members.reduce(
+              (s, m) => s + (postSplitFractionByPassenger.get(m.passengerId) ?? Number(m.roomFraction.toString())),
+              0,
+            ),
           );
           if (movedFraction > 0) {
             // 源行是 NONE（未被扣减任何份额）——若搬走份额 > 0，直接造出房间违反守恒，
@@ -19063,6 +19142,14 @@ export class OrderService {
     // 混合房组（一半走一半留）：手工拆单已被闸 15 拒在门外；编排路径（autoSplitRoomGroups）
     // 在这里按人劈成两个半组 —— 同酒店、同房型、同日期，两组 roomFraction 之和恒等于原组，
     // 房控把两个半间配回一间，房量分毫不动。
+    //
+    // 共享组（带 sharedRoomId）不吃上面这套普通房组的劈半逻辑（HIGH 修复 · astra finding
+    // A7 ②③）：复用 4a-pre 已经算好的 mixedSharedGroupPlanByGroup（份额默认留源单，
+    // roomSplit 可对该组归属的订单行显式指定移出方带走多少；不写 splitPairKey）——不在
+    // 这里重新调用 splitMixedSharedRoomGroup，两处各自算一遍容易在极端输入下算出不一致
+    // 的份额（哪怕是同一个纯函数，也不该有两份调用点）。两侧份额之前已经算好，这里只
+    // 同步写回 SharedRoomMember.roomFraction（下面按 sharedRoomId 落库）——否则真值表
+    // 仍是拆分前的合并份额，按 (orderId, orderItemId) 去重求和会把同一间房的份额算成两份。
     const rawRoomAssignment = order.roomAssignment;
     const roomGroups = readRoomGroups(rawRoomAssignment).flatMap((group) => {
       if (group.passengerIds.length === 0) return [group];
@@ -19070,12 +19157,43 @@ export class OrderService {
       if (movedInGroup.length === 0 || movedInGroup.length === group.passengerIds.length) {
         return [group];
       }
+      const keptInGroup = group.passengerIds.filter((id) => !movedIdSet.has(id));
+      const sharedPlan = mixedSharedGroupPlanByGroup.get(group.raw);
+      if (sharedPlan) {
+        return [
+          { ...group, raw: sharedPlan.kept, passengerIds: keptInGroup },
+          { ...group, raw: sharedPlan.moved, passengerIds: movedInGroup },
+        ];
+      }
       const halves = splitMixedRoomGroup(group, movedIdSet, input.requestToken);
       return [
-        { ...group, raw: halves.kept, passengerIds: group.passengerIds.filter((id) => !movedIdSet.has(id)) },
+        { ...group, raw: halves.kept, passengerIds: keptInGroup },
         { ...group, raw: halves.moved, passengerIds: movedInGroup },
       ];
     });
+    if (mixedSharedGroupPlanByGroup.size > 0 && sharedRoomMemberDelegate) {
+      const touchedSharedRoomIds = new Set<string>();
+      for (const split of mixedSharedGroupPlanByGroup.values()) {
+        touchedSharedRoomIds.add(split.sharedRoomId);
+        if (split.keptPassengerIds.length > 0) {
+          await sharedRoomMemberDelegate.updateMany({
+            where: { sharedRoomId: split.sharedRoomId, passengerId: { in: split.keptPassengerIds } },
+            data: { roomFraction: new Prisma.Decimal(split.keptFraction) },
+          });
+        }
+        if (split.movedPassengerIds.length > 0) {
+          await sharedRoomMemberDelegate.updateMany({
+            where: { sharedRoomId: split.sharedRoomId, passengerId: { in: split.movedPassengerIds } },
+            data: { roomFraction: new Prisma.Decimal(split.movedFraction) },
+          });
+        }
+      }
+      // SharedRoom.version +1（astra finding A7 ②）：成员份额变了，与跨单分房工作台
+      // 保存的 CAS 协议同一套语义——version 是"这间房的成员/份额有没有变过"的信号。
+      for (const sharedRoomId of touchedSharedRoomIds) {
+        await tx.sharedRoom.update({ where: { id: sharedRoomId }, data: { version: { increment: 1 } } });
+      }
+    }
     let sourceRoomAssignmentUpdate: Prisma.InputJsonValue | undefined;
     let targetRoomAssignment: Prisma.InputJsonValue | undefined;
     if (roomGroups.length > 0) {

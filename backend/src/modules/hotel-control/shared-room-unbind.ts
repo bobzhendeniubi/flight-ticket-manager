@@ -79,10 +79,19 @@ function groupSharedRoomId(g: RoomGroupRecord): string | null {
 }
 
 /** 去掉 roomGroups 单个房组上的 sharedRoomId 键，其余键原样保留（不用解构避免 lint 噪音）。*/
+/**
+ * 去掉 roomGroups 单个房组上的 sharedRoomId 键，其余键原样保留（不用解构避免 lint 噪音）。
+ * 同时清掉 splitPairKey（HIGH 修复 · astra finding A7 ④）：共享组本不该带这个键（拆单对
+ * 共享组走独立拆分计划，不写 splitPairKey——见 split-move-strategies.ts 的
+ * splitMixedSharedRoomGroup），但存量脏数据或其它路径万一误写了，解绑后这两个变回普通
+ * 房组的半组若恰好共用同一个 splitPairKey，会被 hotel-control.service.ts 的
+ * groupBucketKey（配对键优先于房型分桶）错误拼回一间——两个本不相关的普通房组凭空少算
+ * 一间。解绑时一并清掉，绝不让这个键带着走。
+ */
 function stripSharedRoomId(g: RoomGroupRecord): RoomGroupRecord {
   const rest: RoomGroupRecord = {};
   for (const [k, v] of Object.entries(g)) {
-    if (k !== 'sharedRoomId') rest[k] = v;
+    if (k !== 'sharedRoomId' && k !== 'splitPairKey') rest[k] = v;
   }
   return rest;
 }
