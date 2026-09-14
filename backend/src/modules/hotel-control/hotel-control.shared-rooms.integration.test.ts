@@ -508,6 +508,120 @@ describe('saveSharedRooms · 真 DB E2E', () => {
     expect(Number(itemB.roomsBilled)).toBe(0);
   });
 
+  /**
+   * astra A9 死锁反例：S 原有 A、B 两位成员。两个并发请求各自只保留一人再提交同一间 S——
+   * 甲只保留 A（B 在锁集合扩大时被发现，纳入甲的锁定订单集合），乙只保留 B（对称）。
+   * 旧实现「锁后发现集合扩大就在同一事务里继续补锁新订单」：甲先锁 A 再想锁 B、乙先锁 B
+   * 再想锁 A，会互相等待对方已持有的锁，形成教科书式死锁环。
+   *
+   * 新实现锁集合扩大就整个事务回滚重开，从不在持有的锁上叠加新锁——两个请求会在
+   * SharedRoom 的行锁上正常排队串行，不会死锁；因为两者都指望同一个 expectedVersions，
+   * 后提交的那个必然撞版本冲突（409），不会出现 Postgres deadlock_detected 异常，
+   * 也不会两个都挂起。
+   */
+  it('并发（astra A9）：两个请求各自只保留 S 的一名成员，交错提交不死锁，恰好一个成功一个 409', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    const created = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const sharedRoomId = created.rooms[0].sharedRoomId;
+    const expectedVersion = created.rooms[0].version;
+
+    // 甲：只保留 A（份额补到 1，让 Σ=1 校验通过）。请求本身只列出 A，S 的成员 B 靠
+    // lockAffectedOrdersOnce 在锁前的候选读里主动摸出来，不需要请求显式提它。
+    const reqA = saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        expectedVersions: { [sharedRoomId]: expectedVersion },
+        rooms: [
+          {
+            sharedRoomId,
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    // 乙：只保留 B（对称）。
+    const reqB = saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        expectedVersions: { [sharedRoomId]: expectedVersion },
+        rooms: [
+          {
+            sharedRoomId,
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 1,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    const outcomes = await Promise.allSettled([reqA, reqB]);
+    const fulfilled = outcomes.filter((o) => o.status === 'fulfilled');
+    const rejected = outcomes.filter((o) => o.status === 'rejected');
+    // 恰好一个成功、一个因版本已变而 409——不是两个都成功（互相覆盖），
+    // 也不是两个都挂起/抛出与死锁相关的异常。
+    expect(fulfilled).toHaveLength(1);
+    expect(rejected).toHaveLength(1);
+    const rejection = rejected[0] as PromiseRejectedResult;
+    expect(String(rejection.reason)).toMatch(/已被他人修改/);
+  });
+
   it('幂等占位不留假成功：第一次因订单非有效状态 400 后，同 token 重试真正重新跑一遍并按当前数据给结果', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4);

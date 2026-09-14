@@ -337,32 +337,75 @@ async function loadLockedOrders(
 }
 
 /**
- * §六步骤 1-3：候选订单集合 → 按 id 升序锁 → 重读成员表发现集合扩大则重试（≤3 次）。
- * 返回最终锁定的订单 id 集合。
+ * §六步骤 3 的重试信号（astra A9）：锁后重读成员表发现候选订单集合比锁住的还大，绝不能在
+ * 已持有的锁之上再对新出现的订单补锁——两个事务各自持有一部分候选、又都在等对方已经
+ * 锁住的那部分，是标准的死锁成环写法。正确做法是让整个事务回滚重开，锁全部释放后，
+ * 下一次尝试用刷新后的候选集合重新按 id 升序锁一遍。这个专用错误类型只用来传递「请
+ * 整个事务重来」这个信号，不代表业务失败。
  */
-async function lockAffectedOrders(
+class SharedRoomLockSetExpandedError extends Error {
+  constructor() {
+    super('共享房锁集合在加锁过程中扩大，需整个事务重试');
+    this.name = 'SharedRoomLockSetExpandedError';
+  }
+}
+
+/**
+ * §六步骤 1-3（单次尝试，事务内不自行重试）：候选订单集合（初始订单 ∪ 触及共享房当前的
+ * 成员订单）→ 按 id 升序逐个 `SELECT … FOR UPDATE` → 锁后重读成员表核实集合没有扩大。
+ * 扩大了就抛 SharedRoomLockSetExpandedError，交给外层 runWithLockSetRetry 整个事务重开，
+ * 而不是在这次事务里继续对新出现的订单补锁。
+ */
+async function lockAffectedOrdersOnce(
   tx: Prisma.TransactionClient,
   initialOrderIds: ReadonlySet<string>,
   touchedSharedRoomIds: ReadonlySet<string>,
 ): Promise<Set<string>> {
-  let locked = new Set<string>();
-  let candidate = new Set(initialOrderIds);
-  for (let attempt = 0; attempt < MAX_LOCK_RETRIES; attempt++) {
-    for (const orderId of [...candidate].sort()) {
-      await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
-    }
-    locked = candidate;
-    if (touchedSharedRoomIds.size === 0) return locked;
+  const candidate = new Set(initialOrderIds);
+  if (touchedSharedRoomIds.size > 0) {
     const members = await tx.sharedRoomMember.findMany({
       where: { sharedRoomId: { in: [...touchedSharedRoomIds] } },
       select: { orderId: true },
     });
-    const expanded = new Set(locked);
-    for (const m of members) expanded.add(m.orderId);
-    if (expanded.size === locked.size) return locked; // 没有新订单浮现，锁住的就是最终集合
-    candidate = expanded; // 集合扩大——回去补锁新出现的订单（不持大 id 锁再补小 id：整批重新按升序锁一遍）
+    for (const m of members) candidate.add(m.orderId);
   }
-  return locked;
+  for (const orderId of [...candidate].sort()) {
+    await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+  }
+  if (touchedSharedRoomIds.size > 0) {
+    const membersAfterLock = await tx.sharedRoomMember.findMany({
+      where: { sharedRoomId: { in: [...touchedSharedRoomIds] } },
+      select: { orderId: true },
+    });
+    for (const m of membersAfterLock) {
+      if (!candidate.has(m.orderId)) throw new SharedRoomLockSetExpandedError();
+    }
+  }
+  return candidate;
+}
+
+/**
+ * 跑一次可能因「锁集合扩大」而需要整个事务重开的操作，最多重试 MAX_LOCK_RETRIES 次
+ * （astra A9）。重试耗尽仍不稳定 → 409，绝不允许在这种状态下继续提交（“重试耗尽还直接
+ * 返回”是原实现的另一个问题：locked 拿到手就返回，从没真正跑满 3 次判定过稳定与否）。
+ */
+async function runWithLockSetRetry<T>(fn: () => Promise<T>): Promise<T> {
+  for (let attempt = 1; attempt <= MAX_LOCK_RETRIES; attempt++) {
+    try {
+      return await fn();
+    } catch (err) {
+      const isLastAttempt = attempt >= MAX_LOCK_RETRIES;
+      if (err instanceof SharedRoomLockSetExpandedError) {
+        if (isLastAttempt) {
+          throw new ConflictError('跨单分房涉及的订单集合在保存过程中持续变化，请刷新后重试');
+        }
+        continue;
+      }
+      throw err;
+    }
+  }
+  /* istanbul ignore next -- 上面循环要么 return 要么 throw，这里纯粹满足 TS 控制流分析 */
+  throw new ConflictError('跨单分房涉及的订单集合在保存过程中持续变化，请刷新后重试');
 }
 
 /**
@@ -480,9 +523,17 @@ async function saveSharedRoomsInner(
   const touchedSharedRoomIds = new Set<string>([...roomIdsBeingSaved, ...dissolveSet]);
   const initialOrderIds = new Set<string>(body.rooms.flatMap((r) => r.groups.map((g) => g.orderId)));
 
-  const result = await client.$transaction(async (tx) => {
-    const lockedOrderIds = await lockAffectedOrders(tx, initialOrderIds, touchedSharedRoomIds);
+  const result = await runWithLockSetRetry(() => client.$transaction(async (tx) => {
+    const lockedOrderIds = await lockAffectedOrdersOnce(tx, initialOrderIds, touchedSharedRoomIds);
     const orders = await loadLockedOrders(tx, [...lockedOrderIds]);
+
+    // 订单集合稳定后，按 SharedRoom id 升序显式锁共享房行（astra A9：原实现直到落库段的
+    // UPDATE 才隐式锁住 SharedRoom，CAS 版本判定发生在锁之前，两个并发请求能同时读到
+    // 「版本对得上」再各自提交）。全局加锁顺序固定为 Order（已锁）→ SharedRoom（这里）→
+    // 酒店包房周期（assertHotelFitAfterChange 内部最后才锁），三层各自升序，不交叉等待。
+    for (const roomId of [...touchedSharedRoomIds].sort()) {
+      await tx.$queryRaw`SELECT id FROM "SharedRoom" WHERE id = ${roomId} FOR UPDATE`;
+    }
 
     // ── expectedVersions CAS：先于业务校验判——版本对不上就是「这把牌已经不是你看到的那把」──
     const currentSharedRooms = await tx.sharedRoom.findMany({
@@ -892,7 +943,7 @@ async function saveSharedRoomsInner(
     // 只是「这次保存做了什么」的总览，逐单细节在上面 orderAuditPayloads 里）。
     const primaryOrderId = [...orders.keys()].sort()[0] ?? null;
     return { finalResult, orderAuditPayloads, primaryOrderId };
-  });
+  }));
 
   const { finalResult, orderAuditPayloads, primaryOrderId } = result;
 
