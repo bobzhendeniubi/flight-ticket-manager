@@ -15355,9 +15355,12 @@ export class OrderService {
         // 的房间——SharedRoom 只允许真实酒店真实房型成员，房间所属酒店 = 本行解绑前所在
         // 酒店（oldRoomType.hotelId；isRandomPoolRow 不可能有共享成员，见闸内 hasSharedMembers
         // 判定）。同酒店换房型时两者相同，必须把「该房间解绑后只剩其余成员」喂进去；
-        // 真正跨酒店换酒店时该房间属于**原**酒店，不属于本次判定的目标酒店，不能喂进去——
-        // assertHotelFitAfterChange 的 nextSharedRooms 不按 hotelId 过滤，喂错酒店的房间会
-        // 把它的 checkIn/checkOut 误加进目标酒店的逐晚累计。
+        // 真正跨酒店换酒店时该房间属于**原**酒店，不属于本次判定的目标酒店，不能喂进去。
+        // （L3 更正：assertHotelFitAfterChange 的 nextSharedRooms 现在**会**按 hotelId
+        // 过滤——见 computeSharedRoomPhysicalAfterChange 的 belongsToThisHotel，查到别家
+        // 酒店的覆盖项会被静默丢弃。但这里仍然自己按 sameHotelSwap 显式收窄，不依赖那道
+        // 过滤兜底：这条覆盖项没带 hotelId 字段，belongsToThisHotel 得现查一次库才能过滤，
+        // 调用方能提前算好就不该指望被调用方帮忙纠正。）
         const sameHotelSwap = oldRoomType != null && oldRoomType.hotelId === newRoomType.hotelId;
         const nextSharedRooms: SharedRoomAfterState[] = sameHotelSwap
           ? unbindPlan.changes.map((c) => ({

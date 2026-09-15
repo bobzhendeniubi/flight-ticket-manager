@@ -1753,12 +1753,20 @@ async function computeSharedRoomPhysicalAfterChange(
     const dbHotelId = hotelIdByRoomId.get(o.sharedRoomId);
     // 库里查不到 = 待创建（astra N1）：不能当「不属于本酒店」处理，否则会把一间刚决定
     // 新建、马上要占用物理房间的共享房整间从前瞻闸里过滤掉。
-    // 库里查到、但归属的是别家酒店：维持原有的静默过滤（不是 astra 建议的抛错）——
-    // 这条分支是「换酒店」等场景下调用方按跨批需求刻意依赖的行为（见上面 lookupIds
-    // 的既有注释与本文件同 describe 块里那条更早的测试：调用方允许把两家酒店的覆盖项
-    // 混在一起传，靠这里查库过滤而不必自己先按酒店分组），改成抛错会让那类合法调用
-    // 直接 400。真正的数据/调用异常应在调用方自己的 hotelId 归属校验里挡（跨单分房
-    // 保存端已经这样做——见 hotel-control.shared-rooms.ts 的 CAS 校验），这里不重复收紧。
+    // 库里查到、但归属的是别家酒店：维持静默过滤（不抛错）。独立复核过（跨单分房终审
+    // A 路第三节）：这不是「换酒店」等场景真正依赖的行为——逐个查过生产调用方
+    // （swapItemHotel 跨酒店时显式传 []、rescheduleItemHotel 改期不换酒店房间恒属本酒店、
+    // 机票平移与恢复都已按酒店分组），没有一条生产路径靠这条静默过滤才对。真正依赖它的
+    // 只有单测里「调用方允许把两家酒店的覆盖项混在一起传」那条 tolerant 调用契约。抛错
+    // 会把这条宽松契约变成 breaking；保留静默过滤 + 下面这行 WARN 留痕，让「调用方喂错
+    // 酒店」这种真 bug 能在日志里被看见，而不是完全无声无息。
+    if (dbHotelId !== undefined && dbHotelId !== hotelId) {
+      console.warn('[hotel-control] shared room override belongs to a different hotel, dropped', {
+        sharedRoomId: o.sharedRoomId,
+        expectedHotelId: hotelId,
+        actualHotelId: dbHotelId,
+      });
+    }
     return dbHotelId === undefined || dbHotelId === hotelId;
   };
   const scopedOverrides = overrides.filter(belongsToThisHotel);
