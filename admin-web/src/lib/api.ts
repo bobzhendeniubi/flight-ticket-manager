@@ -3963,6 +3963,12 @@ export interface ReschedulePassengersResult {
   order: OrderSummary;
   newOrder: OrderSummary | null;
   splitPerformed: boolean;
+  /**
+   * 跨单分房自动解绑等提示（B5）。后端当前把它嵌在 audit.reschedule.warnings 里，顶层
+   * 还没提上来（另一路修复批在补，字段名对齐 warnings）——这里先声明为可选，字段没到时
+   * 前端只是不展示，不报错，同 batchRescheduleOrders().results[].warnings 同款兜底。
+   */
+  warnings?: string[];
 }
 
 // ── 取消航段（ADMIN/STAFF）───────────────────────────────────────────────
