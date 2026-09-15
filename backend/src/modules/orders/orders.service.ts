@@ -143,6 +143,8 @@ import {
   assertRandomTierFit,
   assertRandomTierFitWithinTx,
   checkHotelPhysicalFit,
+  floorProspectiveOccupancyByAssignedRooms,
+  floorZeroRoomsBilledByAssignedRooms,
   getHotelNightlyRemaining,
   getHotelOversellCapRooms,
   getRandomTierAggregate,
@@ -5902,7 +5904,15 @@ export class OrderService {
           hotelRoomTypeId: it.hotelRoomTypeId,
           hotelCheckIn: it.hotelCheckIn,
           hotelCheckOut: it.hotelCheckOut,
-          roomsBilled: it.roomsBilled != null ? Number(it.roomsBilled.toString()) : null,
+          // C1 修复：这些行都是「未触及」共享成员的行（gatedHotelIdSet 已把触及行整间酒店
+          // 挪去 §五闸），但仍可能挂着更早一次解绑留下的「显式 0 份额」普通房组——原样
+          // 传 0 给这条老前瞻闸会译成 0 间物理需求，用当前分房表兜底。
+          roomsBilled: floorZeroRoomsBilledByAssignedRooms(
+            it.roomsBilled != null ? Number(it.roomsBilled.toString()) : null,
+            order.roomAssignment,
+            it.id,
+            null,
+          ),
           randomStarTier: it.randomStarTier,
         }));
       // hotelOversellCapRooms 已在本方法上面提前算好（供 §五闸复用），这里不再重复查询。
@@ -10879,12 +10889,16 @@ export class OrderService {
             // 以不同顺序锁同一批酒店造成死锁。
             const gatedHotelIdsSorted = [...gatedHotelIds].sort();
 
+            // C1 修复：未被 §五闸接管的行也可能挂着更早一次解绑留下的「显式 0 份额」普通
+            // 房组（该行所在酒店本次没有任何行触及共享成员，才会落到 ungatedShifted）——
+            // 老式 prospective-add 前瞻需要分房表兜底，因此这里无条件取一次 roomAssignment，
+            // 不再只在 gatedHotelIds 非空时才查。
+            const orderForGate = await tx.order.findUnique({
+              where: { id: orderId },
+              select: { roomAssignment: true },
+            });
             try {
               if (gatedHotelIds.size > 0) {
-                const orderForGate = await tx.order.findUnique({
-                  where: { id: orderId },
-                  select: { roomAssignment: true },
-                });
                 for (const hotelId of gatedHotelIdsSorted) {
                   const rows = byHotel.get(hotelId)!;
                   const unionDates = [
@@ -10943,7 +10957,14 @@ export class OrderService {
                 hotelRoomTypeId: s.row.hotelRoomTypeId,
                 hotelCheckIn: s.newCheckIn,
                 hotelCheckOut: s.newCheckOut,
-                roomsBilled: s.row.roomsBilled == null ? null : Number(s.row.roomsBilled.toString()),
+                // C1 修复：显式 0 份额（更早一次解绑留下的）要用当前分房表兜底，
+                // 绝不让它在平移后的新区间按 0 间放行。
+                roomsBilled: floorZeroRoomsBilledByAssignedRooms(
+                  s.row.roomsBilled == null ? null : Number(s.row.roomsBilled.toString()),
+                  orderForGate?.roomAssignment ?? null,
+                  s.row.id,
+                  null,
+                ),
                 randomStarTier: s.row.randomStarTier,
               }));
               await assertHotelStaysFitWithinTx(
@@ -15369,13 +15390,23 @@ export class OrderService {
           where: { orderId },
           select: { gender: true },
         });
-        const fit = await checkHotelPhysicalFit(
-          newRoomType.hotelId,
-          nightDates,
+        // C1 修复：本行若挂着解绑留下的「显式 0 份额」普通房组（hasSharedMembers 已是
+        // false，说明没有活跃的 SharedRoomMember 了，但订单 JSON 里的普通组可能仍是
+        // roomFraction:0），toProspectiveOccupancy 会把它译成 0 间物理需求；用当前分房表
+        // 兜底，绝不让「显式 0」在目标酒店按 0 间放行。
+        const swapProspective = floorProspectiveOccupancyByAssignedRooms(
           toProspectiveOccupancy(
             roomsBilled,
             swapPassengers.map((p) => ({ gender: p.gender ?? undefined })),
           ),
+          order.roomAssignment,
+          item.id,
+          oldRoomType?.hotel.name ?? null,
+        );
+        const fit = await checkHotelPhysicalFit(
+          newRoomType.hotelId,
+          nightDates,
+          swapProspective,
           { excludeOrderItemIds: [item.id] },
           tx,
         );
@@ -16165,13 +16196,22 @@ export class OrderService {
           where: { orderId },
           select: { gender: true },
         });
-        const fit = await checkHotelPhysicalFit(
-          roomType.hotelId,
-          nightDates,
+        // C1 修复：本行可能挂着解绑留下的「显式 0 份额」普通房组（hasSharedMembers 已是
+        // false），toProspectiveOccupancy 会把它译成 0 间物理需求；用当前分房表兜底，
+        // 绝不让「显式 0」在新区间按 0 间放行。
+        const rescheduleProspective = floorProspectiveOccupancyByAssignedRooms(
           toProspectiveOccupancy(
             roomsBilled,
             orderPassengers.map((p) => ({ gender: p.gender ?? undefined })),
           ),
+          order.roomAssignment,
+          item.id,
+          null,
+        );
+        const fit = await checkHotelPhysicalFit(
+          roomType.hotelId,
+          nightDates,
+          rescheduleProspective,
           // 只排本行 = 「先释放本行旧区间」；随后把本行房量按新区间加回去（prospective）。
           // 不能整单排除：同单同酒店的另一段住宿是真实存量，整单排掉等于把它当空房、放行超卖
           //（换酒店已按行排除，这里跟进）。

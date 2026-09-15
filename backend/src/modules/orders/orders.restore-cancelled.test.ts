@@ -65,6 +65,8 @@ const { mockPrisma, hotelControlMocks, queueMocks } = vi.hoisted(() => ({
     getRandomTierAggregate: vi.fn(),
     lockHotelBlockPeriodsWithinTx: vi.fn(),
     randomStarTierLabel: vi.fn(),
+    // C1 修复引入：这些用例不测 0 份额兜底，透传即可（与修复前「不介入」的行为一致）。
+    floorZeroRoomsBilledByAssignedRooms: vi.fn((roomsBilled: unknown) => roomsBilled),
   },
   queueMocks: {
     scheduleSeatHoldRelease: vi.fn(),

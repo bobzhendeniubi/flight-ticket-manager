@@ -857,6 +857,49 @@ export function assignedRoomsForItem(
   );
 }
 
+/**
+ * C1 修复（跨单分房终审 A 路 · CRITICAL）：老式 `roomsBilled` 前瞻闸的输入翻译
+ * （toProspectiveOccupancy）只认计费份额——解绑留下的「显式 0 份额」普通房组会被它译成
+ * 「0 间物理需求」，但该行只要在分房表里挂着归属房组，物理口径就是 1 间（与
+ * assignedRoomsForItem / groupRoomFraction 对 `n<=0` 的兜底一致，见 §四「物理按普通房组
+ * 1 间计」）。四条老式前瞻闸（换酒店 / 酒店改期 / 恢复 / 机票改期平移）在喂
+ * toProspectiveOccupancy 之前统一过一遍这个函数兜底，绝不让「显式 0」塌成「0 间物理需求」
+ * 而放行超卖。
+ *
+ * 只在 toProspectiveOccupancy 算出「全零」（wholeRooms=0 且无拼房 solo）时才介入——
+ * 0.5 间的真实拼房行情形（solos 非空）不受影响，照旧走性别配对逻辑。
+ */
+export function floorProspectiveOccupancyByAssignedRooms(
+  prospective: ProspectiveOccupancy,
+  roomAssignment: unknown,
+  itemId: string,
+  hotelName: string | null,
+): ProspectiveOccupancy {
+  if (prospective.wholeRooms > 0 || prospective.solos.length > 0) return prospective;
+  const assigned = assignedRoomsForItem(roomAssignment, itemId, hotelName);
+  if (assigned == null || assigned <= 0) return prospective;
+  return { wholeRooms: assigned, solos: [] };
+}
+
+/**
+ * C1 修复的另一半：部分老式前瞻闸（恢复、机票改期平移酒店日期）不直接调用
+ * toProspectiveOccupancy，而是把 `roomsBilled` 数字塞进 `ProspectiveHotelStay[]`
+ * 交给 `assertHotelStaysFitWithinTx` 按酒店归并后再统一翻译。归并入口拿不到单行的
+ * `itemId`/`roomAssignment` 语境，只能在**喂给它之前**对每行的 `roomsBilled` 做同样的兜底：
+ * 只有显式 0（不是 null——null 走既有 `?? 1` 缺省，不受影响）且该行分房表仍有归属房组时，
+ * 才把 0 提到 `assignedRoomsForItem` 算出的物理间数；0.5 等真实拼房份额原样放行。
+ */
+export function floorZeroRoomsBilledByAssignedRooms(
+  roomsBilled: number | null | undefined,
+  roomAssignment: unknown,
+  itemId: string,
+  hotelName: string | null,
+): number | null | undefined {
+  if (roomsBilled !== 0) return roomsBilled;
+  const assigned = assignedRoomsForItem(roomAssignment, itemId, hotelName);
+  return assigned != null && assigned > 0 ? assigned : roomsBilled;
+}
+
 /** 占房行（物理口径拆分用）：订单级分房表 + 拼房性别 fallback 所需字段。*/
 export interface PhysicalOccupancyItem {
   /** 行 id（可选）：房组归属过滤的坐标系。调用方不带 id 时归属过滤自动退化为整单口径。*/
