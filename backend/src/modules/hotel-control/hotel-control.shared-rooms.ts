@@ -469,7 +469,7 @@ export function readBillingFraction(g: Record<string, unknown>): number {
  * 所以用一个真结果永远不会长这样的形状（finalResult 恒有 rooms/dissolved/warnings 三个键，
  * 从不带 __pending）来判定「这行是不是还没跑完」。
  */
-const PENDING_SENTINEL = { __pending: true } as const;
+export const PENDING_SENTINEL = { __pending: true } as const;
 function isPendingSentinel(value: unknown): boolean {
   return !!value && typeof value === 'object' && (value as Record<string, unknown>).__pending === true;
 }
@@ -486,26 +486,36 @@ const PENDING_STALE_TIMEOUT_MS = 10 * 60 * 1000;
 /** 幂等占位重新抢占的重试上限：初次尝试 + 抢占一次孤儿占位后的重试，两次封顶。 */
 const MAX_RESERVE_ATTEMPTS = 2;
 
-interface ReserveOutcome {
+/** 导出仅供单测直接驱动 CAS 分支（astra N10），不是给业务调用方用的公共 API。*/
+export interface ReserveOutcome {
   /** 非 null = 直接回放这个结果（同 token 同指纹的正常重放），调用方不必再跑业务逻辑。*/
   replay: SaveSharedRoomsResult | null;
+  /**
+   * 非 null = 这次调用真正拿到的占位行主键（cuid，与 requestToken 分离，见 astra N10）。
+   * `replay` 非 null 时恒为 null——回放路径没有新占位，不该有所有权可言。业务写入完成后
+   * 的最终结果写入、以及失败时的占位清理，都必须绑定这个 id，不能再用 requestToken：
+   * requestToken 在「孤儿占位被抢占」后会指向一张全新的行（新 id），旧持有者若还在用
+   * requestToken 做条件，就会误伤新占位的行。
+   */
+  reservationId: string | null;
 }
 
 /**
  * §六幂等占位（单独抽出便于说清楚每条分支）：requestToken 唯一，先占位再算——占位成功
  * 就是「这次是第一次跑」，占位失败（唯一键冲突）说明已有记录，按指纹决定回放/冲突/抢占。
  */
-async function reserveRequestOrReplay(
+export async function reserveRequestOrReplay(
   client: PrismaClient,
   body: SaveSharedRoomsBody,
   fingerprint: string,
 ): Promise<ReserveOutcome> {
   for (let attempt = 0; attempt < MAX_RESERVE_ATTEMPTS; attempt++) {
     try {
-      await client.sharedRoomRequest.create({
+      const created = await client.sharedRoomRequest.create({
         data: { requestToken: body.requestToken, fingerprint, resultJson: PENDING_SENTINEL },
+        select: { id: true },
       });
-      return { replay: null };
+      return { replay: null, reservationId: created.id };
     } catch (err) {
       if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002')) throw err;
 
@@ -521,7 +531,7 @@ async function reserveRequestOrReplay(
         throw new ConflictError('该请求编号已用于另一次不同的跨单分房保存，请刷新后重试');
       }
       if (!isPendingSentinel(existing.resultJson)) {
-        return { replay: existing.resultJson as unknown as SaveSharedRoomsResult };
+        return { replay: existing.resultJson as unknown as SaveSharedRoomsResult, reservationId: null };
       }
       // 走到这里：同 token 同指纹、且仍是 PENDING——上一次占位还没写出真结果。
       const ageMs = Date.now() - existing.createdAt.getTime();
@@ -531,11 +541,20 @@ async function reserveRequestOrReplay(
         // 提示调用方稍后用同一个 token 重试才是安全的（astra A12）。
         throw new ConflictError('该请求编号上一次保存尚未完成，请稍后使用同一请求编号重试');
       }
-      // 超过孤儿占位超时——按 id 精确删除（不是按 requestToken，避免删掉别的进程
-      // 刚好在这一瞬间抢占成功后新建的行）。删到 0 行说明已经被别的进程抢先处理，
-      // 回落到「仍在处理中」提示；删到 1 行说明抢占成功，回到循环顶部重新占位。
+      // 超过孤儿占位超时——按 id + 仍为 PENDING 的条件 CAS 删除（astra N10 回归）：只按
+      // requestToken + id 删不够——如果就在我们读到 existing 之后、真正执行删除之前，
+      // 它原来的持有者（其实没死，只是慢）刚好写完真结果，这一行的 resultJson 已经从
+      // PENDING_SENTINEL 变成真正的业务结果，此时按 id 删还是会把这个「刚成功」的记录删掉，
+      // 原持有者的完整占位历史凭空消失。加上 `resultJson: { equals: PENDING_SENTINEL }`
+      // 让这次删除成为一次条件 CAS：仍是 PENDING 才真的删得掉；已经被原持有者写完的情况下，
+      // 删除影响 0 行，回落到下面的「仍在处理中」提示，调用方用同一个 token 再试一次就能
+      // 读到原持有者的真实结果。
       const reclaimed = await client.sharedRoomRequest.deleteMany({
-        where: { requestToken: body.requestToken, id: existing.id },
+        where: {
+          requestToken: body.requestToken,
+          id: existing.id,
+          resultJson: { equals: PENDING_SENTINEL },
+        },
       });
       if (reclaimed.count === 0) {
         throw new ConflictError('该请求编号上一次保存尚未完成，请稍后使用同一请求编号重试');
@@ -562,15 +581,22 @@ export async function saveSharedRooms(
 
   const reservation = await reserveRequestOrReplay(client, body, fingerprint);
   if (reservation.replay) return reservation.replay;
+  // reservation.replay 为 null 时 reserveRequestOrReplay 恒返回非 null 的 reservationId
+  // （见 ReserveOutcome 的接口注释）——两者互斥，这里非空断言反映的是该函数自身的契约，
+  // 不是绕过类型检查。
+  const reservationId = reservation.reservationId!;
 
   // 占位成功之后，本函数任何一步失败（400/409/其它异常）都必须把占位行删掉：否则占位行的
   // resultJson 停在 PENDING_SENTINEL，下次同 token 同指纹重试会被判定「仍在处理中」白等到
-  // 超时窗口，或者（改指纹）直接 409——都不是「重新跑一遍」。
+  // 超时窗口，或者（改指纹）直接 409——都不是「重新跑一遍」。按 id（不是 requestToken）
+  // 删除（astra N10）：如果这次占位已经被别的进程判定超时、抢占并重建（新 id、同
+  // requestToken），按 requestToken 删会误删新占位的行；按自己的 id 删，抢占已发生时
+  // 这里天然影响 0 行，不会牵连无关的新占位。
   try {
-    return await saveSharedRoomsInner(body, actor, client);
+    return await saveSharedRoomsInner(body, actor, client, reservationId);
   } catch (err) {
     // 最佳努力清理占位——删失败也不能吞掉原始错误，原始错误才是调用方需要看到的。
-    await client.sharedRoomRequest.delete({ where: { requestToken: body.requestToken } }).catch(() => {});
+    await client.sharedRoomRequest.deleteMany({ where: { id: reservationId } }).catch(() => {});
     throw err;
   }
 }
@@ -579,6 +605,7 @@ async function saveSharedRoomsInner(
   body: SaveSharedRoomsBody,
   actor: AuditActor,
   client: PrismaClient,
+  reservationId: string,
 ): Promise<SaveSharedRoomsResult> {
   const checkInD = new Date(`${body.checkIn}T00:00:00.000Z`);
   const checkOutD = new Date(`${body.checkOut}T00:00:00.000Z`);
@@ -1263,10 +1290,26 @@ async function saveSharedRoomsInner(
       dissolved: [...dissolveSet],
       warnings,
     };
-    await tx.sharedRoomRequest.update({
-      where: { requestToken: body.requestToken },
-      data: { resultJson: finalResult as unknown as Prisma.InputJsonValue },
-    });
+    // 按占位行的主键 id 写最终结果，不是 requestToken（astra N10）：如果这次执行已经被
+    // 判定超时、占位被回收（见 reserveRequestOrReplay 的 CAS 回收），本次持有的
+    // reservationId 这一刻在库里已经不存在了——`update` 会抛 P2025（记录不存在），让
+    // 整个事务连同上面已经写好的成员表 / 订单 JSON / roomsBilled 一起回滚，不会把一个
+    // 「已被判定为过期」的执行结果当成功提交（过期执行者不得提交业务结果）。按
+    // requestToken 更新则做不到这一点：抢占后同一个 requestToken 指向一张新 id 的行，
+    // 过期的这次执行仍能匹配上、把自己的（可能是旧的/错的）结果写进新占位里，污染新执行。
+    try {
+      await tx.sharedRoomRequest.update({
+        where: { id: reservationId },
+        data: { resultJson: finalResult as unknown as Prisma.InputJsonValue },
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
+        throw new ConflictError(
+          '本次跨单分房保存的请求编号占位已被判定超时并回收，本次提交作废，请刷新后使用新的请求编号重试',
+        );
+      }
+      throw err;
+    }
     // 主单：受影响订单里 id 最小的一个，给 SAVE_SHARED_ROOMS 总览审计条挂载（本条本身
     // 只是「这次保存做了什么」的总览，逐单细节在上面逐单审计里）。同样用 writeAuditWithinTx
     // 与业务同事务提交（astra A13）。
