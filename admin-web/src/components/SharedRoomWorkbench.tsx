@@ -120,13 +120,6 @@ function groupsFromMembers(members: SharedRoomWorkbenchRoomMember[]): DraftGroup
   return [...byKey.values()];
 }
 
-/** 剔除已失效成员（B6）；某个来源组的乘客被剔光则整组一并丢弃。 */
-function stripInvalidMembers(groups: DraftGroup[], invalidIds: ReadonlySet<string>): DraftGroup[] {
-  return groups
-    .map((g) => ({ ...g, passengerIds: g.passengerIds.filter((id) => !invalidIds.has(id)) }))
-    .filter((g) => g.passengerIds.length > 0);
-}
-
 /** 规范化序列化一组 DraftGroup，用于「本次改动前后是否相同」的字符串比较（顺序无关）。 */
 function serializeGroups(groups: DraftGroup[]): string {
   return JSON.stringify(
@@ -339,8 +332,10 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
   }, [rooms]);
 
   // ── 已失效成员（B6）：既有共享房里成员所属订单已取消/退款/软删等——订单不在本次工作台
-  // 有效订单池（wb.orders）里，本身也就查不到姓名/性别（读模型的 members[] 只给 id，不带
-  // 快照姓名）。只在既有共享房（wb.sharedRooms）里找，新建房间的成员必然来自当前有效池。
+  // 有效订单池（wb.orders）里，性别（passengerIndex 只索引有效池里的乘客）查不到；姓名/
+  // 单号/状态服务端直接给（见 SharedRoomWorkbenchRoomMember：name/chineseName/orderNumber/
+  // orderStatus），不必绕回订单池。只在既有共享房（wb.sharedRooms）里找，新建房间的成员
+  // 必然来自当前有效池。
   const invalidPassengerIds = useMemo(() => {
     const validOrderIds = new Set((wb?.orders ?? []).map((o) => o.orderId));
     const s = new Set<string>();
@@ -352,11 +347,20 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     return s;
   }, [wb]);
   const invalidMemberInfo = useMemo(() => {
-    const m = new Map<string, { orderId: string; orderStatus?: OrderStatus }>();
+    const m = new Map<
+      string,
+      { orderId: string; orderStatus: OrderStatus; orderNumber: string; chineseName: string | null; name: string }
+    >();
     for (const r of wb?.sharedRooms ?? []) {
       for (const mem of r.members) {
         if (invalidPassengerIds.has(mem.passengerId)) {
-          m.set(mem.passengerId, { orderId: mem.orderId, orderStatus: mem.orderStatus });
+          m.set(mem.passengerId, {
+            orderId: mem.orderId,
+            orderStatus: mem.orderStatus,
+            orderNumber: mem.orderNumber,
+            chineseName: mem.chineseName,
+            name: mem.name,
+          });
         }
       }
     }
@@ -468,21 +472,22 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
   }
 
   /**
-   * 房间统计——一律按剔除已失效成员（B6）后的「净成员」算 Σ份额/人数/异性混拼/超容量，
-   * 这套数字与保存时实际提交的内容一致；raw 组里仍可能有失效成员（用于下面渲染灰色 chip
-   * 和展示「含 N 名已失效成员」提示，不参与任何校验）。
+   * 房间统计——按 r.groups 全量（含失效成员）算 Σ份额/人数/异性混拼/超容量（N5）：失效
+   * 成员在没有被显式移除前，本就会原样回传参与保存，这套数字必须和保存时实际提交的内容
+   * 一致，不能只按「净成员」算——否则前端会在 Σ 应为 1 的地方看见一个和后端口径对不上
+   * 的数字，甚至拦下一次后端本会放行的保存（见 handleSave 同款口径）。invalidPax 单独
+   * 算出来只用于下面渲染「含 N 名已失效成员」提示，不再从 Σ/人数里剔除。
    */
   function roomStats(r: DraftRoom) {
-    const activeGroups = stripInvalidMembers(r.groups, invalidPassengerIds);
     const roomType = roomTypeOptions.find((rt) => rt.id === r.hotelRoomTypeId);
-    const totalFraction = roundHalf(activeGroups.reduce((s, g) => s + g.roomFraction, 0));
-    const totalPax = activeGroups.reduce((s, g) => s + g.passengerIds.length, 0);
+    const totalFraction = roundHalf(r.groups.reduce((s, g) => s + g.roomFraction, 0));
+    const totalPax = r.groups.reduce((s, g) => s + g.passengerIds.length, 0);
     const invalidPax = r.groups.reduce(
       (s, g) => s + g.passengerIds.filter((id) => invalidPassengerIds.has(id)).length,
       0,
     );
     const genders = new Set<string>();
-    for (const g of activeGroups) {
+    for (const g of r.groups) {
       for (const pid of g.passengerIds) {
         const gd = passengerIndex.get(pid)?.passenger.gender;
         if (gd === 'M' || gd === 'F') genders.add(gd);
@@ -490,7 +495,6 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     }
     return {
       roomType,
-      activeGroups,
       totalFraction,
       totalPax,
       invalidPax,
@@ -499,42 +503,63 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     };
   }
 
+  /** 显式「移除失效成员」（N5）：只有点了这个按钮，失效成员才真正从本间房剔除——否则
+   *  一律原样回传，不因为「只改了备注/别的成员」而被悄悄带走。群组被移空则整组丢弃。 */
+  function removeInvalidMember(draftId: string, orderId: string, orderItemId: string, passengerId: string): void {
+    setRooms((prev) =>
+      prev.map((r) =>
+        r.draftId !== draftId
+          ? r
+          : {
+              ...r,
+              groups: r.groups
+                .map((g) =>
+                  g.orderId === orderId && g.orderItemId === orderItemId
+                    ? { ...g, passengerIds: g.passengerIds.filter((id) => id !== passengerId) }
+                    : g,
+                )
+                .filter((g) => g.passengerIds.length > 0),
+            },
+      ),
+    );
+  }
+
   // ── 保存 ───────────────────────────────────────────────────────────────
   async function handleSave(): Promise<void> {
     if (!wb) return;
     setSaveErr(null);
     setSaveOk(null);
 
-    // 既有共享房：先剔除已失效成员（B6），再与「本次加载时的净成员」对比——没变化（房型/
-    // 备注也没改）就不重新提交，避免把「历史上就含已失效成员、本次根本没碰过」的房间也扫
-    // 进 payload 触发后端拒绝。净成员被清空的（拖空 / 全部迁出 / 只剩失效成员）且确实动过
-    // → 视同解散，折进 dissolve（B2：「全部拖回池也算变更」）。新建房间没有「原始态」可比，
-    // 有净成员就直接提交，没有就跳过（用户建了空房又没填人，等同没建）。
+    // 既有共享房：与「本次加载时的落库成员」原样对比（N5：不再先剔除失效成员再比较）——
+    // 没变化（房型/备注也没改）就不重新提交，避免把「历史上就含失效成员、本次根本没碰过」
+    // 的房间也扫进 payload。失效成员在没被 removeInvalidMember 显式移除前，作为普通成员
+    // 参与这次比较和提交——服务端「提交集合即最终集合」，前端不能借着展示层的「失效」判定
+    // 悄悄把人从提交集合里拿掉，那等于替运营做了一次没人点过的删除。真正清空的（拖空 /
+    // 全部迁出 / 显式移除到空）且确实动过 → 视同解散，折进 dissolve（B2：「全部拖回池也算
+    // 变更」）。新建房间没有「原始态」可比，有成员就直接提交，没有就跳过（用户建了空房又
+    // 没填人，等同没建；新建房只能来自乘客池拖拽，池子本就不含失效成员，无需过滤）。
     const dissolveMap = new Map(dissolvedVersions);
     const roomsToSave: Array<{ room: DraftRoom; groups: DraftGroup[] }> = [];
     for (const r of rooms) {
-      const activeGroups = stripInvalidMembers(r.groups, invalidPassengerIds);
       if (!r.sharedRoomId) {
-        if (activeGroups.length > 0) roomsToSave.push({ room: r, groups: activeGroups });
+        if (r.groups.length > 0) roomsToSave.push({ room: r, groups: r.groups });
         continue;
       }
       if (dissolveMap.has(r.sharedRoomId)) continue; // 已被「解散整间」按钮显式标记
 
       const seedRoom = wb.sharedRooms.find((sr) => sr.sharedRoomId === r.sharedRoomId);
-      const originalActive = seedRoom
-        ? stripInvalidMembers(groupsFromMembers(seedRoom.members), invalidPassengerIds)
-        : [];
+      const originalGroups = seedRoom ? groupsFromMembers(seedRoom.members) : [];
       const metaChanged = seedRoom
         ? seedRoom.hotelRoomTypeId !== r.hotelRoomTypeId || (seedRoom.notes ?? '') !== r.notes.trim()
         : true;
-      const membersChanged = serializeGroups(originalActive) !== serializeGroups(activeGroups);
-      if (!metaChanged && !membersChanged) continue; // 本次没碰过，不重提交
+      const membersChanged = serializeGroups(originalGroups) !== serializeGroups(r.groups);
+      if (!metaChanged && !membersChanged) continue; // 本次没碰过（含失效成员在内），不重提交
 
-      if (activeGroups.length === 0) {
+      if (r.groups.length === 0) {
         dissolveMap.set(r.sharedRoomId, r.version ?? 0);
         continue;
       }
-      roomsToSave.push({ room: r, groups: activeGroups });
+      roomsToSave.push({ room: r, groups: r.groups });
     }
 
     for (const { room, groups } of roomsToSave) {
@@ -542,6 +567,8 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
         setSaveErr('每间房都要先选房型再保存');
         return;
       }
+      // Σ 按提交集合全量算（含未显式移除的失效成员），与后端 Σ份额=1 硬校验同一把尺
+      // （N5）——不能只按「活跃成员」算，否则会在后端本会放行的地方被前端自己拦下。
       const totalFraction = roundHalf(groups.reduce((s, g) => s + g.roomFraction, 0));
       if (totalFraction !== 1) {
         const roomType = roomTypeOptions.find((rt) => rt.id === room.hotelRoomTypeId);
@@ -740,9 +767,9 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
               <div className="space-y-3">
                 {rooms.map((r) => {
                   const stats = roomStats(r);
-                  // 用净成员（剔除已失效）判定份额是否异常——只剩已失效成员时不报「份额应为1」，
-                  // 那种情况保存时会自动折成解散，不需要用户先凑份额。
-                  const fractionBad = stats.activeGroups.length > 0 && stats.totalFraction !== 1;
+                  // Σ 按全量成员算（含未显式移除的失效成员，N5），与提交口径一致；
+                  // 房间彻底没有任何成员（含失效）时不报，那种情况保存时会折成解散。
+                  const fractionBad = r.groups.length > 0 && stats.totalFraction !== 1;
                   return (
                     <div
                       key={r.draftId}
@@ -779,7 +806,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                           {stats.invalidPax > 0 && (
                             <span
                               className="badge bg-slate-100 text-ink-muted"
-                              title="该成员所属订单已不是有效状态（取消/退款/软删等），保存时会自动从本间房剔除，不会提交"
+                              title="该成员所属订单已不是有效状态（取消/退款/软删等）——保存时原样保留计费，不会自动剔除；如需真正移除，点灰色 chip 上的 ×"
                             >
                               含 {stats.invalidPax} 名已失效成员
                             </span>
@@ -863,20 +890,31 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                                       </span>
                                     );
                                   }
-                                  // 已失效成员（B6）：所属订单已取消/退款/软删，读模型里连姓名都查不到
-                                  // （members[] 只给 id）——灰色只读 chip 标出状态，不可拖动，保存时自动剔除。
+                                  // 已失效成员（B6）：所属订单已取消/退款/软删——不可拖动，灰色只读 chip
+                                  // 标出人名 · 单号 · 状态（服务端 members[] 直接给，见 N5）；保存时原样
+                                  // 保留计费，不自动剔除，只有点 × 显式移除才真正从本间房拿掉这个人。
                                   if (invalidPassengerIds.has(pid)) {
                                     const info = invalidMemberInfo.get(pid);
-                                    const statusLabel = info?.orderStatus
-                                      ? orderStatusLabel(info.orderStatus)
-                                      : '已失效';
+                                    const statusLabel = info ? orderStatusLabel(info.orderStatus) : '已失效';
+                                    const display = info ? passengerDisplayName(info.name, info.chineseName) : '—';
                                     return (
                                       <span
                                         key={pid}
                                         className="inline-flex select-none items-center gap-1 rounded border border-slate-200 bg-slate-100 px-1.5 py-0.5 text-xs text-ink-muted"
-                                        title={`所属订单当前状态：${statusLabel}——保存时自动从本间房剔除，不会提交`}
+                                        title={`${info?.orderNumber ?? ''} · 所属订单当前状态：${statusLabel}——保存时原样保留计费，点 × 才真正移除`}
                                       >
-                                        已失效 · {statusLabel}
+                                        {display} · {statusLabel}
+                                        {info?.orderNumber && (
+                                          <span className="font-mono text-[10px]">（{info.orderNumber}）</span>
+                                        )}
+                                        <button
+                                          type="button"
+                                          className="ml-0.5 rounded px-1 text-ink-muted hover:bg-rose-100 hover:text-rose-700"
+                                          title="移除失效成员：真正从本间房剔除（需保存生效）"
+                                          onClick={() => removeInvalidMember(r.draftId, g.orderId, g.orderItemId, pid)}
+                                        >
+                                          ×
+                                        </button>
                                       </span>
                                     );
                                   }

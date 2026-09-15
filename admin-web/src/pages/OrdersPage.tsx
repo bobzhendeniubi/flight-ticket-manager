@@ -9268,7 +9268,10 @@ function RescheduleForm({
         alert(`已拆出新单 ${res.newOrder.orderNumber} 并改期`);
         onChanged?.();
       }
-      onSaved(res.order);
+      // 跨单分房自动解绑等提示（B5）：普通按人/全员改期此前只取 res.order，
+      // warnings 留在响应体里没人读，运营看不到解绑提示。字段没到（老后端）时
+      // res.warnings 是 undefined，onSaved 内部按空数组处理，不影响展示。
+      onSaved(res.order, res.warnings);
     } catch (e) {
       const splitInfo = reschedulePassengersSplitFailure(e);
       if (splitInfo) {

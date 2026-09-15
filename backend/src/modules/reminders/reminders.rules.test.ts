@@ -632,39 +632,51 @@ describe('TICKET_MISSING 出票提醒规则', () => {
 });
 
 // ── 规则 8：临近入住未分房 ───────────────────────────────────────────────────
+// 分房提醒（规则 8 与 8b）的候选生成本身也受 ROOM_REMINDER_STATE_MACHINE_SINCE 上线日期闸
+// 限制（B8 二次修复，见 buildOrderCandidates）——不能沿用文件级 TODAY（2026-07-09，早于默认
+// 闸值 2026-09-15），否则这里测的候选生成逻辑全部会被闸掉、断言不到任何候选。改用相对 SINCE
+// 的本地「今天」与入住日，天数偏移与原测试保持一致（3 天窗口边界=HIGH，1 天内=CRITICAL，
+// 11 天=超窗不触发）。
+const ROOM_TODAY = ROOM_REMINDER_STATE_MACHINE_SINCE;
+const roomCheckInHigh = addDaysUtc(ROOM_TODAY, 3);
+const roomCheckInCritical = addDaysUtc(ROOM_TODAY, 1);
+const roomCheckInOverWindow = addDaysUtc(ROOM_TODAY, 11);
+
 describe('ROOM_UNASSIGNED 分房提醒规则', () => {
   it('最早入住 3 天内 + 分房表空 → HIGH；1 天内升级 CRITICAL；ruleKey 按订单+首入住日', () => {
     const high = buildOrderCandidates(
-      fakeOrder({ items: [hotelItem('2026-07-12')], roomAssignment: null }),
-      TODAY,
+      fakeOrder({ items: [hotelItem(roomCheckInHigh)], roomAssignment: null }),
+      ROOM_TODAY,
     ).filter((c) => c.rule === 'ROOM_UNASSIGNED');
     expect(high).toHaveLength(1);
     expect(high[0]).toMatchObject({
       priority: ReminderPriority.HIGH,
-      ruleKey: 'ROOMASSIGN:ord_1:2026-07-12',
+      ruleKey: `ROOMASSIGN:ord_1:${roomCheckInHigh}`,
     });
 
     const critical = buildOrderCandidates(
-      fakeOrder({ items: [hotelItem('2026-07-10')], roomAssignment: null }),
-      TODAY,
+      fakeOrder({ items: [hotelItem(roomCheckInCritical)], roomAssignment: null }),
+      ROOM_TODAY,
     ).filter((c) => c.rule === 'ROOM_UNASSIGNED');
     expect(critical[0]).toMatchObject({ priority: ReminderPriority.CRITICAL });
   });
 
   it('已分房 / 入住超窗 / 无酒店行 / 老口径没取字段 → 不触发', () => {
     const fires = (order: RuleOrder) =>
-      buildOrderCandidates(order, TODAY).some((c) => c.rule === 'ROOM_UNASSIGNED');
+      buildOrderCandidates(order, ROOM_TODAY).some((c) => c.rule === 'ROOM_UNASSIGNED');
     expect(
       fires(
         fakeOrder({
-          items: [hotelItem('2026-07-12')],
+          items: [hotelItem(roomCheckInHigh)],
           roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] },
         }),
       ),
     ).toBe(false);
-    expect(fires(fakeOrder({ items: [hotelItem('2026-07-20')], roomAssignment: null }))).toBe(false);
-    expect(fires(fakeOrder({ items: [flightItem('2026-07-12T02:00:00Z')], roomAssignment: null }))).toBe(false);
-    expect(fires(fakeOrder({ items: [hotelItem('2026-07-12')] }))).toBe(false);
+    expect(fires(fakeOrder({ items: [hotelItem(roomCheckInOverWindow)], roomAssignment: null }))).toBe(false);
+    expect(
+      fires(fakeOrder({ items: [flightItem(`${roomCheckInHigh}T02:00:00Z`)], roomAssignment: null })),
+    ).toBe(false);
+    expect(fires(fakeOrder({ items: [hotelItem(roomCheckInHigh)] }))).toBe(false);
   });
 
   it('hasRoomAssignment：空表 / 全空组视同未分房', () => {
@@ -685,16 +697,16 @@ describe('ROOM_PARTIALLY_UNASSIGNED 部分未分房提醒规则', () => {
   it('已分房但仍有人不在任何房组 → HIGH，点名遗漏乘客；ruleKey 按订单+首入住日+PARTIAL 后缀', () => {
     const candidates = buildOrderCandidates(
       fakeOrder({
-        items: [hotelItem('2026-07-12')],
+        items: [hotelItem(roomCheckInHigh)],
         roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] }, // 只分了 p1，p2 还没进房组
         passengers: twoPax,
       }),
-      TODAY,
+      ROOM_TODAY,
     ).filter((c) => c.rule === 'ROOM_PARTIALLY_UNASSIGNED');
     expect(candidates).toHaveLength(1);
     expect(candidates[0]).toMatchObject({
       priority: ReminderPriority.HIGH,
-      ruleKey: 'ROOMASSIGN:ord_1:2026-07-12:PARTIAL',
+      ruleKey: `ROOMASSIGN:ord_1:${roomCheckInHigh}:PARTIAL`,
     });
     expect(candidates[0]!.body).toContain('李四');
     expect(candidates[0]!.body).not.toContain('张三'); // 已分房的人不点名
@@ -703,11 +715,11 @@ describe('ROOM_PARTIALLY_UNASSIGNED 部分未分房提醒规则', () => {
   it('入住 1 天内升级 CRITICAL（与 ROOM_UNASSIGNED 同一套窗口/优先级判定）', () => {
     const critical = buildOrderCandidates(
       fakeOrder({
-        items: [hotelItem('2026-07-10')],
+        items: [hotelItem(roomCheckInCritical)],
         roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] },
         passengers: twoPax,
       }),
-      TODAY,
+      ROOM_TODAY,
     ).filter((c) => c.rule === 'ROOM_PARTIALLY_UNASSIGNED');
     expect(critical[0]).toMatchObject({ priority: ReminderPriority.CRITICAL });
   });
@@ -715,7 +727,7 @@ describe('ROOM_PARTIALLY_UNASSIGNED 部分未分房提醒规则', () => {
   it('共享房组（带 sharedRoomId）的 passengerIds 一样算已覆盖——不用另查 SharedRoomMember', () => {
     const fires = buildOrderCandidates(
       fakeOrder({
-        items: [hotelItem('2026-07-12')],
+        items: [hotelItem(roomCheckInHigh)],
         roomAssignment: {
           roomGroups: [
             { passengerIds: ['p1'], sharedRoomId: 'sr1' },
@@ -724,7 +736,7 @@ describe('ROOM_PARTIALLY_UNASSIGNED 部分未分房提醒规则', () => {
         },
         passengers: twoPax,
       }),
-      TODAY,
+      ROOM_TODAY,
     ).some((c) => c.rule === 'ROOM_PARTIALLY_UNASSIGNED');
     expect(fires).toBe(false);
   });
@@ -732,11 +744,11 @@ describe('ROOM_PARTIALLY_UNASSIGNED 部分未分房提醒规则', () => {
   it('占位联系人（documentNumber=N/A）不算「该有房间的人」，不会被点名遗漏', () => {
     const fires = buildOrderCandidates(
       fakeOrder({
-        items: [hotelItem('2026-07-12')],
+        items: [hotelItem(roomCheckInHigh)],
         roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] },
         passengers: [...twoPax, { id: 'p3', fullName: '占位联系人', passportExpiry: null, documentNumber: 'N/A' }],
       }),
-      TODAY,
+      ROOM_TODAY,
     ).some((c) => c.rule === 'ROOM_PARTIALLY_UNASSIGNED');
     // p2 仍未分房，规则本该触发——这条断言确认 p3（占位）不会让判定提前通过/也不会被误点名
     expect(fires).toBe(true);
@@ -744,11 +756,11 @@ describe('ROOM_PARTIALLY_UNASSIGNED 部分未分房提醒规则', () => {
 
   it('全员已分房 / 整单未分房（走 ROOM_UNASSIGNED）/ 入住超窗 / 老口径没取字段 → 不触发', () => {
     const fires = (order: RuleOrder) =>
-      buildOrderCandidates(order, TODAY).some((c) => c.rule === 'ROOM_PARTIALLY_UNASSIGNED');
+      buildOrderCandidates(order, ROOM_TODAY).some((c) => c.rule === 'ROOM_PARTIALLY_UNASSIGNED');
     expect(
       fires(
         fakeOrder({
-          items: [hotelItem('2026-07-12')],
+          items: [hotelItem(roomCheckInHigh)],
           roomAssignment: { roomGroups: [{ passengerIds: ['p1', 'p2'] }] },
           passengers: twoPax,
         }),
@@ -756,18 +768,18 @@ describe('ROOM_PARTIALLY_UNASSIGNED 部分未分房提醒规则', () => {
     ).toBe(false);
     // 整单一个人都没分：只报 ROOM_UNASSIGNED，不会同时又报一条部分未分房
     expect(
-      fires(fakeOrder({ items: [hotelItem('2026-07-12')], roomAssignment: null, passengers: twoPax })),
+      fires(fakeOrder({ items: [hotelItem(roomCheckInHigh)], roomAssignment: null, passengers: twoPax })),
     ).toBe(false);
     expect(
       fires(
         fakeOrder({
-          items: [hotelItem('2026-07-20')],
+          items: [hotelItem(roomCheckInOverWindow)],
           roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] },
           passengers: twoPax,
         }),
       ),
     ).toBe(false);
-    expect(fires(fakeOrder({ items: [hotelItem('2026-07-12')], passengers: twoPax }))).toBe(false);
+    expect(fires(fakeOrder({ items: [hotelItem(roomCheckInHigh)], passengers: twoPax }))).toBe(false);
   });
 });
 
@@ -1372,12 +1384,31 @@ describe('B8：跨单分房分房提醒状态机（重开 / 旧日期键清理 /
     resolvedNote: string | null;
   }
 
-  /** 支持 ruleKey.in / ruleKey.startsWith 两种查法（通用创建流程用 in，B8 状态机用 startsWith）。*/
-  function makeMock(order: RuleOrder, preexisting: FakeReminderRow[]) {
+  /**
+   * 支持 ruleKey.in / ruleKey.startsWith 两种查法（通用创建流程用 in，B8 状态机用
+   * startsWith）。order 传 null 模拟「本轮主扫描一个在途单都没查到」（如唯一一单已取消，
+   * 被 SCAN_STATUSES 过滤剔除）；cancelledOrDeletedOrderIds 模拟情形 4 的清理查询
+   * （`order.findMany({ where: { id: { in }, OR: [...] } })`）命中的订单 id 白名单——
+   * 按调用方是否传了 where.id.in 区分这条查询和主扫描查询，不去抠 OR 条件本身的语义。
+   */
+  function makeMock(
+    order: RuleOrder | null,
+    preexisting: FakeReminderRow[],
+    opts: { cancelledOrDeletedOrderIds?: string[] } = {},
+  ) {
     const rows = new Map(preexisting.map((r) => [r.id, { ...r }]));
+    const cancelledOrDeletedIds = new Set(opts.cancelledOrDeletedOrderIds ?? []);
     let seq = 0;
     const mock = {
-      order: { findMany: vi.fn(async () => [order]) },
+      order: {
+        findMany: vi.fn(async (args?: { where?: { id?: { in?: string[] } } }) => {
+          const idIn = args?.where?.id?.in;
+          if (idIn) {
+            return idIn.filter((id) => cancelledOrDeletedIds.has(id)).map((id) => ({ id }));
+          }
+          return order ? [order] : [];
+        }),
+      },
       fulfillmentTask: { findMany: vi.fn(async () => []) },
       holdOrder: { findMany: vi.fn(async () => []) },
       operationalReminder: {
@@ -1569,5 +1600,86 @@ describe('B8：跨单分房分房提醒状态机（重开 / 旧日期键清理 /
     // 上线日期闸生效：不重开，维持存量单的旧行为（等运营在待办列表里手动处理，或等它下次
     // 自然进入通用创建流程——通用流程同样因为 ruleKey 已存在而不会重建）。
     expect(rows.get('r1')?.status).toBe(ReminderStatus.DONE);
+  });
+
+  it('上线日期闸：入住日在 SINCE 之前——新建也被拦下，不止拦重开（B8 二次修复）', async () => {
+    // 从未存在过的 ROOMASSIGN ruleKey（没有任何 preexisting 行）——通用创建流程本会把它
+    // 当全新候选建出来，必须靠 buildOrderCandidates 自己按 SINCE 过滤才能拦住。用「不欠
+    // 尾款、没有机票段」把其它规则（BALANCE_DUE 等）都关掉，只留 ROOM_UNASSIGNED 一条
+    // 候选可能触发，断言才干净。
+    const beforeCutoverCheckIn = addDaysUtc(TODAY, 1);
+    const order = fakeOrder({
+      items: [hotelItem(beforeCutoverCheckIn)],
+      passengers: [{ id: 'p1', fullName: '张三', passportExpiry: null, documentNumber: 'E1' }],
+      paidAmount: new Prisma.Decimal('5000'), // 付清，不触发 BALANCE_DUE
+      roomAssignment: null, // 压根没有分房表 → 满足条件的话该触发 ROOM_UNASSIGNED
+    });
+    const { mock, rows } = makeMock(order, []);
+
+    await generateRuleReminders(mock, 'user_sys', new Date(`${TODAY}T06:00:00Z`));
+
+    expect([...rows.values()].some((r) => r.ruleKey.startsWith('ROOMASSIGN:'))).toBe(false);
+  });
+
+  it('上线日期闸：入住日在 SINCE（含）之后——新建正常', async () => {
+    const order = fakeOrder({
+      items: [hotelItem(inScopeCheckIn)],
+      passengers: [{ id: 'p1', fullName: '张三', passportExpiry: null, documentNumber: 'E1' }],
+      paidAmount: new Prisma.Decimal('5000'),
+      roomAssignment: null,
+    });
+    const { mock, rows } = makeMock(order, []);
+
+    await generateRuleReminders(mock, 'user_sys', NOW_IN_SCOPE);
+
+    const created = [...rows.values()].find((r) => r.ruleKey === `ROOMASSIGN:ord_1:${inScopeCheckIn}`);
+    expect(created?.status).toBe(ReminderStatus.OPEN);
+  });
+
+  it('取消单的旧 ROOMASSIGN 提醒（整单键 + :PARTIAL）被状态机关闭（B8 二次修复）', async () => {
+    // 本轮主扫描只查到另一张仍在途、已全部分好房的单（ord_1，不该产生任何新候选）——
+    // existing 里还挂着一张已取消订单（ord_cancelled）以前开的 OPEN/IN_PROGRESS 提醒，
+    // 它压根不在这轮 orders 里，情形 1–3 的循环访问不到它，必须靠情形 4 的单独清理
+    // 查询关掉。
+    const order = fakeOrder({
+      items: [hotelItem(inScopeCheckIn)],
+      passengers: [{ id: 'p1', fullName: '张三', passportExpiry: null, documentNumber: 'E1' }],
+      roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] }, // 已分好，本身不产生候选
+    });
+    const wholeKey = `ROOMASSIGN:ord_cancelled:${inScopeCheckIn}`;
+    const partialKey = `ROOMASSIGN:ord_cancelled:${inScopeCheckIn}:PARTIAL`;
+    const { mock, rows } = makeMock(
+      order,
+      [
+        { id: 'r1', ruleKey: wholeKey, status: ReminderStatus.OPEN, resolvedNote: null },
+        { id: 'r2', ruleKey: partialKey, status: ReminderStatus.IN_PROGRESS, resolvedNote: null },
+      ],
+      { cancelledOrDeletedOrderIds: ['ord_cancelled'] },
+    );
+
+    await generateRuleReminders(mock, 'user_sys', NOW_IN_SCOPE);
+
+    expect(rows.get('r1')?.status).toBe(ReminderStatus.DONE);
+    expect(rows.get('r2')?.status).toBe(ReminderStatus.DONE);
+  });
+
+  it('existing 里有别的订单缺席的旧提醒，但它不在取消/软删白名单里——维持原状（不误关）', async () => {
+    // 对照组：同样「这轮 orders 里没有它」，但 order.findMany 的清理查询判它不是取消/
+    // 软删（比如恰好是本轮分页/并发缺席）——不该被一并关掉，只有真正取消/软删才关。
+    const order = fakeOrder({
+      items: [hotelItem(inScopeCheckIn)],
+      passengers: [{ id: 'p1', fullName: '张三', passportExpiry: null, documentNumber: 'E1' }],
+      roomAssignment: { roomGroups: [{ passengerIds: ['p1'] }] },
+    });
+    const wholeKey = `ROOMASSIGN:ord_other:${inScopeCheckIn}`;
+    const { mock, rows } = makeMock(
+      order,
+      [{ id: 'r1', ruleKey: wholeKey, status: ReminderStatus.OPEN, resolvedNote: null }],
+      { cancelledOrDeletedOrderIds: [] }, // 白名单不含 ord_other
+    );
+
+    await generateRuleReminders(mock, 'user_sys', NOW_IN_SCOPE);
+
+    expect(rows.get('r1')?.status).toBe(ReminderStatus.OPEN);
   });
 });

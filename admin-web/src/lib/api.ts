@@ -1506,7 +1506,10 @@ export interface RoomGroup {
   notes?: string;
   /**
    * 占房间数：整间=1（缺省），拼房半间=0.5。例：7人3.5间。
-   * 允许 0——仅限跨单分房的共享组（该组带 sharedRoomId 时，主单让份场景）；普通组传 0 服务端 400。
+   * 允许 0：跨单分房的共享组（带 sharedRoomId，主单让份场景）本就可以是 0；普通组新建/
+   * 改成 0 服务端仍 400，但落库现状已经是 0 的普通组（解绑/解散共享房后留下的「计费 0
+   * 间」）原样重存会放行——服务端只接受与旧值一致的 0，不认客户端凭空提交的 0（N4，
+   * 见 orders.routes.ts room-assignment 里 `roomFraction ?? 1) === 0` 分支）。
    */
   roomFraction?: number;
   /**
@@ -3960,6 +3963,12 @@ export interface ReschedulePassengersResult {
   order: OrderSummary;
   newOrder: OrderSummary | null;
   splitPerformed: boolean;
+  /**
+   * 跨单分房自动解绑等提示（B5）。后端当前把它嵌在 audit.reschedule.warnings 里，顶层
+   * 还没提上来（另一路修复批在补，字段名对齐 warnings）——这里先声明为可选，字段没到时
+   * 前端只是不展示，不报错，同 batchRescheduleOrders().results[].warnings 同款兜底。
+   */
+  warnings?: string[];
 }
 
 // ── 取消航段（ADMIN/STAFF）───────────────────────────────────────────────
@@ -7667,13 +7676,18 @@ export interface SharedRoomWorkbenchRoomMember {
   passengerId: string;
   roomFraction: number;
   /**
-   * 该成员当前是否仍处于有效状态订单（B6 对接点）。读模型目前只按订单池（COUNTED_STATUSES）
-   * 过滤 `orders[]`，共享房 `members[]` 本身不带这两个字段——先声明为可选，字段到位前前端按
-   * 「成员所属订单是否出现在 orders[] 池」兜底判定（见 SharedRoomWorkbench.tsx memberIsActive）。
+   * 该成员当前是否仍处于有效状态订单（B6 对接点）。= 未软删 且 status ∈ COUNTED_STATUSES，
+   * 与 hotel-control.service 的房控有效状态判定同一把尺，服务端总是给（见
+   * hotel-control.shared-rooms.ts getSharedRoomWorkbench）。
    */
-  isActive?: boolean;
+  isActive: boolean;
   /** 该成员所属订单的当前状态（便于前端展示「已取消」等具体原因，不必只知道 true/false）。 */
-  orderStatus?: OrderStatus;
+  orderStatus: OrderStatus;
+  /** 该成员所属订单号（灰色只读 chip 显示「哪张单」）。 */
+  orderNumber: string;
+  /** 姓名快照：失效（已取消/软删订单）的成员也查得到，chip 才能显示人名而不是空白。 */
+  chineseName: string | null;
+  name: string;
 }
 
 export interface SharedRoomWorkbenchRoom {

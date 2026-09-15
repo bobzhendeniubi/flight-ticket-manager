@@ -335,12 +335,17 @@ function unassignedRoomPassengers(
 export const AUTO_RESOLVED_NOTE = '条件已解除';
 
 /**
- * B8 上线日期：跨单分房「未分房/部分未分房」提醒状态机（重开 + 旧日期键清理）只对该日期
- * （含）之后入住的单生效——部署当天如果对存量订单一视同仁地跑这套状态机，会把此前一直
- * 卡在「PARTIAL 孤儿开着关不掉」或「曾经关过、现在该重开却重不开」状态的存量单一次性
- * 全部翻出来，运营会看到一堆突然冒出来的待办。之前入住的单维持旧行为（仍然只由
- * buildOrderCandidates + 下面的通用 resolvedRuleKeys 兜底关闭「已全部分好」的情形，
- * 不做重开、不清理旧日期孤儿键）。
+ * B8 上线日期：跨单分房「未分房/部分未分房」提醒（新建 + 重开 + 旧日期键清理）只对该
+ * 日期（含）之后入住的单生效——部署当天如果对存量订单一视同仁地打开这套逻辑，会把此前
+ * 一直卡在「PARTIAL 孤儿开着关不掉」「曾经关过、现在该重开却重不开」状态的存量单、以及
+ * 从未生成过 ROOMASSIGN 提醒的存量在途单，一次性全部翻出来，运营会看到一堆突然冒出来的
+ * 待办。这个闸同时管两处（不允许只管一处、另一处漏判——见 astra 复审 B8 finding）：
+ *   - buildOrderCandidates：只对落在窗口内的单把 ROOMASSIGN 候选喂给「不存在就新建」的
+ *     通用创建流程；
+ *   - reconcileRoomAssignmentReminders：只对落在窗口内的单跑重开/刷新/孤儿日期键清理。
+ * 之前入住的单维持「旧行为」——只由下面的通用 resolvedRuleKeys 兜底关闭「已全部分好」
+ * 的情形，不新建、不重开、不清理旧日期孤儿键（这三件事都要求订单落在窗口内才做）。
+ * 订单已取消/软删的旧提醒清理不受这个闸限制，见 reconcileRoomAssignmentReminders 末尾。
  *
  * 可用 ROOM_REMINDER_STATE_MACHINE_SINCE 环境变量覆盖（YYYY-MM-DD），部署前按实际情况调；
  * 缺省值只是代码里的占位上线日，**部署前必须按当时日期重新确认**（见本批修复报告）。
@@ -402,7 +407,7 @@ function computeRoomAssignmentState(order: RuleOrder, today: string): RoomAssign
 
 /**
  * B8：跨单分房「未分房/部分未分房」提醒的小状态机——按订单同步当前状态，处理规则原有的
- * 通用创建/解除流程处理不了的三类情形：
+ * 通用创建/解除流程处理不了的四类情形：
  *   1. 已有 PARTIAL 提醒，分房被整组清空 → 状态切成「整单未分房」，旧 PARTIAL 应该关闭
  *      （通用解除只在"完全没有遗漏的人"时才关 PARTIAL，清空后 unassignedRoomPassengers
  *      返回全部乘客，长度必然 > 0，永远关不掉——本函数直接按"当前该开的 key 是否与
@@ -413,10 +418,16 @@ function computeRoomAssignmentState(order: RuleOrder, today: string): RoomAssign
  *      并显式重开；人工核销/跳过的尊重运营判断，不重开。
  *   3. 入住日期改了，ruleKey 里的旧日期字段成孤儿，永远挂在待办列表——本函数用
  *      ruleKey 前缀（不含日期）查出该订单全部 ROOMASSIGN 提醒，日期对不上当前值的关掉。
+ *   4. 订单已取消或软删——这类单从一开始就不在 generateRuleReminders 主扫描的 orders
+ *      里（按 SCAN_STATUSES 过滤，不含 CANCELLED；deletedAt 必须为 null），上面 1–3
+ *      三类判定全部依赖「订单在 ordersInScope 里」，永远访问不到这类单，旧的 OPEN/
+ *      IN_PROGRESS ROOMASSIGN 提醒会一直挂着。本函数末尾单独查一次这类订单，关掉。
  *
- * 上线日期闸见 ROOM_REMINDER_STATE_MACHINE_SINCE：只对 firstCheckIn 落在窗口内的单跑，
- * 不对现有 orders 逐单强制打开该状态机——早于上线日的单维持 generateRuleReminders 主流程
- * 已有的行为（新建 + 通用解除），不重开、不清理旧日期键。
+ * 上线日期闸见 ROOM_REMINDER_STATE_MACHINE_SINCE：情形 1–3 只对 firstCheckIn 落在窗口内
+ * 的单跑，不对现有 orders 逐单强制打开——早于上线日的单维持 generateRuleReminders 主流程
+ * 已有的行为（只由通用 resolvedRuleKeys 兜底关闭「已全部分好」的情形），不重开、不清理
+ * 旧日期键；buildOrderCandidates 那边同一个 SINCE 也拦住了这类单的「新建」。情形 4（取消/
+ * 软删清理）不受这个闸限制——理由与孤儿日期键清理一致：纯粹清理，不会一次性翻出新待办。
  */
 async function reconcileRoomAssignmentReminders(
   prisma: PrismaClient,
@@ -425,6 +436,10 @@ async function reconcileRoomAssignmentReminders(
   now: Date,
 ): Promise<void> {
   const ordersInScope = orders.filter((order) => order.roomAssignment !== undefined);
+  // 老调用方（roomAssignment 字段整批都没取）没有任何东西可同步，包括情形 4——没有
+  // ordersInScope 就没有 inScopeOrderIds，无从判断 existing 里哪些订单「已经不在本轮批次
+  // 里」，索性提前退出，不发多余的 DB 查询（真实生产环境 orders 查询本就总是带上这个
+  // 字段，这条早退实际只对旧调用方/未来若有调用方省略该字段时生效）。
   if (ordersInScope.length === 0) return;
 
   const existing = await prisma.operationalReminder.findMany({
@@ -473,6 +488,30 @@ async function reconcileRoomAssignmentReminders(
       toReopen.push({ id: matched.id, state });
     }
     // else：人工核销/跳过（resolvedNote 是别的内容）——尊重运营判断，不重开。
+  }
+
+  // ── 情形 4：取消/软删订单的旧提醒清理（B8 二次修复）──────────────────────
+  // 这类单从一开始就不在 ordersInScope 里（generateRuleReminders 主扫描按 SCAN_STATUSES
+  // 过滤，不含 CANCELLED；deletedAt 必须为 null），上面的循环访问不到——单独查一次「existing
+  // 里出现过、但这轮主扫描没扫到」的那批订单，命中已取消/软删的就关掉，不受 inScope/SINCE
+  // 限制（与孤儿日期键清理同一个「纯粹清理，风险与通用解除流程等价」的理由）。
+  const inScopeOrderIds = new Set(ordersInScope.map((order) => order.id));
+  const outOfScopeOrderIds = [...existingByOrder.keys()].filter((id) => !inScopeOrderIds.has(id));
+  if (outOfScopeOrderIds.length > 0) {
+    const cancelledOrDeleted = await prisma.order.findMany({
+      where: {
+        id: { in: outOfScopeOrderIds },
+        OR: [{ deletedAt: { not: null } }, { status: OrderStatus.CANCELLED }],
+      },
+      select: { id: true },
+    });
+    for (const { id } of cancelledOrDeleted) {
+      for (const row of existingByOrder.get(id) ?? []) {
+        if (row.status === ReminderStatus.OPEN || row.status === ReminderStatus.IN_PROGRESS) {
+          toClose.push(row.id);
+        }
+      }
+    }
   }
 
   if (toClose.length > 0) {
@@ -625,8 +664,17 @@ export function buildOrderCandidates(order: RuleOrder, today: string): ReminderC
   //    互不覆盖——整单未分房时只报 ROOM_UNASSIGNED，不会同时又报一条部分未分房。
   //    判定逻辑抽到 computeRoomAssignmentState（B8）：reconcileRoomAssignmentReminders 的
   //    状态机复用同一份口径，两处不允许各写一遍、日后改动只同步一处。
+  //
+  //    上线日期闸（B8 二次修复）：只对 firstCheckIn ≥ ROOM_REMINDER_STATE_MACHINE_SINCE
+  //    的单生成新候选——本函数的输出只喂给「不存在同 ruleKey 就新建」那条通用创建流程
+  //    （generateRuleReminders 的 fresh/createMany），不影响已存在提醒的重开/刷新（那部分
+  //    完全是 reconcileRoomAssignmentReminders 的职责，它自己也按同一个 SINCE 判 inScope）。
+  //    原先只在 reconcileRoomAssignmentReminders 里判 SINCE，这里不判——上线当天全部存量
+  //    在途单只要落在 3 天窗口内就会各自新建一条从未存在过的 ROOMASSIGN/:PARTIAL 提醒，
+  //    等于对存量单一次性开闸，与「上线日期闸只是为了不让运营一天看到一堆突然冒出的待办」
+  //    的设计初衷矛盾（astra 复审 B8 finding）。
   const roomState = computeRoomAssignmentState(order, today);
-  if (roomState) {
+  if (roomState && roomState.firstCheckIn >= ROOM_REMINDER_STATE_MACHINE_SINCE) {
     out.push({
       rule: roomState.rule,
       ruleKey: roomState.key,
