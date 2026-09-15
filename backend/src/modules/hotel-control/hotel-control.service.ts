@@ -1469,6 +1469,55 @@ export async function lockHotelBlockPeriodsWithinTx(
 }
 
 /**
+ * 恢复路径专用的酒店库存互斥（astra N4 锁侧）：按酒店 id 升序逐个锁该酒店**全部**包房
+ * 周期行；这家酒店完全没有配置任何包房周期（未纳管）时退化为
+ * `pg_advisory_xact_lock(hashtext(hotelId))`，方案 §六步骤 4 明文写的兜底。
+ *
+ * 与 `lockHotelBlockPeriodsWithinTx` 的区别：
+ *   · 不按日期区间过滤，锁该酒店的全部周期行——一次恢复可能牵涉该酒店多段互不相邻的
+ *     日期，调用方在锁到手之后再各自重读容量判定；提前按某一段区间收窄反而可能漏锁到
+ *     另一段日期正被别的并发恢复请求压着的周期行。
+ *   · 无周期时会退化为 advisory lock；`lockHotelBlockPeriodsWithinTx` 不会——那个函数
+ *     背后的两个既有调用方（`assertHotelPhysicalFitWithinTx` / `assertHotelFitAfterChange`）
+ *     在「无周期＝未纳管，不拦」时会直接整段跳过后续判定，届时加不加锁都不影响结果，
+ *     不必为它们改变行为；但恢复路径的容量判定目前是调用方自己另外实现的
+ *     `assertRestoreHotelCapacity`（不经过这两个函数），在拿到锁之前不知道这家酒店
+ *     最终算不算「未纳管」，所以本函数统一兜底加锁，把「要不要真正判定容量」的决定权
+ *     留给调用方在锁到手之后自己做。
+ *
+ * 用法同 `lockHotelBlockPeriodsWithinTx`：必须在调用方事务内调用，随后在同一事务里完成
+ * 恢复判定与落库，不得提前释放锁。
+ *
+ * @param hotelIds 本次恢复涉及的全部酒店 id（可以有重复，内部会去重）——调用方负责收集
+ *   全部受影响酒店，遗漏一个就等于那家酒店没有互斥，见 astra N4：两张不同的纯酒店
+ *   取消单同时强制恢复，各自在事务内看到「自己占 1、对方仍取消」，容量 1 时能同时提交。
+ */
+export async function lockHotelInventoryForUpdate(
+  tx: Prisma.TransactionClient,
+  hotelIds: readonly string[],
+): Promise<void> {
+  const sortedHotelIds = [...new Set(hotelIds)].sort();
+  for (const hotelId of sortedHotelIds) {
+    const lockedPeriods = await tx.$queryRaw<Array<{ id: string }>>`
+      SELECT id FROM "HotelBlockPeriod"
+      WHERE "hotelId" = ${hotelId}
+      ORDER BY id
+      FOR UPDATE
+    `;
+    if (lockedPeriods.length === 0) {
+      // 没有包房周期行可锁——退化为 advisory lock，否则两个都判定「这家酒店未纳管」的
+      // 并发恢复请求永远不会在这里排队，各自读到对方提交前的旧快照（astra N4）。
+      // hashtext 返回 int4，pg_advisory_xact_lock 的 bigint 重载会做隐式提升，写法上
+      // 不需要显式 cast。用 $executeRaw 而不是 $queryRaw——pg_advisory_xact_lock 返回
+      // void，Prisma 的 $queryRaw 结果集反序列化不认识 void 列类型，会直接抛
+      // 「Failed to deserialize column of type 'void'」，$executeRaw 只关心受影响行数，
+      // 不尝试解析返回列。
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${hotelId}))`;
+    }
+  }
+}
+
+/**
  * `assertHotelPhysicalFit` 的**事务内互斥**变体：先锁该酒店该区间的包房周期行，
  * 再在同一事务里跑一遍完全相同的前瞻闸判定。
  *
