@@ -553,7 +553,12 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
         ? seedRoom.hotelRoomTypeId !== r.hotelRoomTypeId || (seedRoom.notes ?? '') !== r.notes.trim()
         : true;
       const membersChanged = serializeGroups(originalGroups) !== serializeGroups(r.groups);
-      if (!metaChanged && !membersChanged) continue; // 本次没碰过（含失效成员在内），不重提交
+      // L2：正常代码路径不会留下零成员的 ACTIVE 共享房（后端解散时自动 DISSOLVED），只有
+      // 直接改库才会造出这种脏数据——但一旦出现，「本次没碰过就不重提交」这条闸会连它一起
+      // 挡住：原始态与本次都是空成员，metaChanged/membersChanged 双 false，永远进不到下面
+      // 的折叠解散分支，运营点「保存」也救不了它，只能再点一次显式的「解散整间」按钮才行。
+      // 零成员房不受这条「未改动」豁免——不管碰没碰过，都该走到下面折叠成 dissolve。
+      if (!metaChanged && !membersChanged && r.groups.length > 0) continue; // 本次没碰过（含失效成员在内）且非空，不重提交
 
       if (r.groups.length === 0) {
         dissolveMap.set(r.sharedRoomId, r.version ?? 0);
