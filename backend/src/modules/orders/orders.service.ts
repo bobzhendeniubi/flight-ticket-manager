@@ -19314,6 +19314,9 @@ export class OrderService {
     const noneCarrierIdByItem = new Map<string, string>();
     // 防御式：单测常用手搭的 mock tx（只 mock 用到的 delegate）没有 sharedRoomMember 时
     // 回落「本次没有共享成员」而不是炸，同 shared-room-unbind.ts 的兜底哲学。
+    // ⚠ L5：生产 tx 必有 sharedRoomMember delegate，这条回落只为迁就 mock 单测——拆单
+    // 4b 若在生产环境悄悄回落成「没有共享成员」，会漏搬共享成员的表记录（JSON 与
+    // SharedRoomMember 表脱钩），同属「库存/合住闸拿不到数据就假装无事」的危险方向。
     const sharedRoomMemberDelegate = (
       tx as unknown as {
         sharedRoomMember?: {

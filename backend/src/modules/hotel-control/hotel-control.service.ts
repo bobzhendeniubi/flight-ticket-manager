@@ -1106,6 +1106,10 @@ export async function computeSharedRoomPhysicalByDate(
 
   // 防御式：单测常用手搭的 mock client（只 mock 用到的 delegate），没有 sharedRoom 时
   // 回落「本次没有共享房」而不是炸——与 getHotelOversellCapRooms 的 systemSetting 兜底同哲学。
+  // ⚠ L5：生产环境的 PrismaClient / tx 必有 sharedRoom delegate，这条回落只为迁就 mock
+  // 单测而存在——真上生产永远不会触发。物理房间库存闸「拿不到数据就当 0 间」是最危险的
+  // 失败方向（少算占用 → 放行超卖，比拿不到数据就拒绝更糟）；长期应把单测改用真库或完整
+  // 替身，让生产客户端缺 delegate 时直接抛错，而不是继续依赖这条静默兜底。
   const delegate = (
     client as unknown as {
       sharedRoom?: { findMany: (args: unknown) => Promise<SharedRoomPhysicalRow[]> };
@@ -1776,6 +1780,9 @@ async function computeSharedRoomPhysicalAfterChange(
       .filter((o): o is SharedRoomAfterState & { sharedRoomId: string } => !!o.sharedRoomId)
       .map((o) => o.sharedRoomId),
   );
+  // ⚠ L5：同上——生产 client 必有 sharedRoom delegate，`if (delegate)` 只为迁就 mock
+  // 单测；delegate 缺失时这里跳过查询等于把全部既有共享房当 0 间，是本函数里另一处
+  //「拿不到数据就回落成 0」的危险方向，长期同样该改成生产端直接抛错。
   if (delegate) {
     const liveRows = await delegate.findMany({
       where: { hotelId, status: 'ACTIVE', checkIn: { lte: toD }, checkOut: { gt: fromD } },
