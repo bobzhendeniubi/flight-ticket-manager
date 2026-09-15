@@ -1427,6 +1427,83 @@ describe('saveSharedRooms · 真 DB E2E · 工作台重存保留本单房组备�
     expect(afterGroup).toBeDefined();
     expect(afterGroup!.notes).toBe('A 单本地备注：靠窗'); // 没有被工作台重存清掉
   });
+
+  it('M6 反例：既有房重提时漏掉一名成员的 group → 静默移除该成员，但必须进 warnings 说明', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    const created = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const sharedRoomId = created.rooms[0].sharedRoomId;
+
+    // 客户端（前端漏渲染 / 手滑）重提这间房时只带了 A 的 group，完全没提 B——按端点既有
+    // 语义（listed 决定最终成员）B 会被摘出去，Σ=1 校验也照样能过（只看 A 那组）。
+    // 这本是合法操作，但必须让运营看得见「B 被顺手移除了」。
+    const updated = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        expectedVersions: { [sharedRoomId]: created.rooms[0].version },
+        rooms: [
+          {
+            sharedRoomId,
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    expect(updated.rooms[0].sharedRoomId).toBe(sharedRoomId);
+    expect(
+      updated.warnings.some(
+        (w) => w.includes(sharedRoomId) && w.includes('移除') && w.includes(orderB.orderNumber),
+      ),
+    ).toBe(true);
+
+    // B 确实被移除（既有行为不变，本条只补 warning）。
+    const remainingMembers = await prisma.sharedRoomMember.findMany({ where: { sharedRoomId } });
+    expect(remainingMembers.map((m) => m.orderId)).toEqual([orderA.id]);
+  });
 });
 
 /**

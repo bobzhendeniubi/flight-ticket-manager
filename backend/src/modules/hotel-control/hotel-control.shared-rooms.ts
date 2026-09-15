@@ -1324,6 +1324,33 @@ async function saveSharedRoomsInner(
           select: { id: true, version: true },
         });
         savedRooms.push({ sharedRoomId: updated.id, version: updated.version });
+        // M6 修复：本函数的更新语义是「listed 决定最终成员」（下面 deleteMany 后按
+        // room.groups 重建）——客户端提交一间既有房时若漏掉某个成员的 group（不管是手滑
+        // 还是前端渲染漏了），这个人会被静默摘出成员表、不报错也不 warning，运营完全看
+        // 不出这次保存"顺手"把谁踢出去了。落库前比一次「现状成员 − 本次 listed 成员」，
+        // 差集非空就进 warnings，把「移除」变成看得见的事实（不阻断——这本就是端点的
+        // 合法语义，只是不能悄无声息）。
+        const listedPassengerIds = new Set(room.groups.flatMap((g) => g.passengerIds));
+        const removedByOrderId = new Map<string, number>();
+        for (const [itemKey, entry] of currentMembersByRoom.get(sharedRoomId) ?? []) {
+          const ownerOrderId = itemKey.split(':')[0];
+          if (!ownerOrderId) continue; // 防御：key 格式不对就跳过，不该发生
+          for (const pid of entry.passengerIds) {
+            if (listedPassengerIds.has(pid)) continue;
+            removedByOrderId.set(ownerOrderId, (removedByOrderId.get(ownerOrderId) ?? 0) + 1);
+          }
+        }
+        if (removedByOrderId.size > 0) {
+          const removedCount = [...removedByOrderId.values()].reduce((s, n) => s + n, 0);
+          const removedOrderNumbers = [...removedByOrderId.keys()]
+            .map((oid) => orders.get(oid)?.orderNumber)
+            .filter((v): v is string => !!v)
+            .sort();
+          warnings.push(
+            `已从共享房 ${sharedRoomId} 移除 ${removedCount} 名成员：${removedOrderNumbers.join('、') || '未知订单'}` +
+              '（本次保存未列出，按当前语义视为移出，请确认）。',
+          );
+        }
         await tx.sharedRoomMember.deleteMany({ where: { sharedRoomId } });
       } else {
         const created = await tx.sharedRoom.create({
