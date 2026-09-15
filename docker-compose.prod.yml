@@ -86,6 +86,8 @@ services:
       JWT_REFRESH_TTL: ${JWT_REFRESH_TTL:-604800}
       CORS_ORIGINS: ${CORS_ORIGINS:-https://sales.citur.com,https://admin.citur.com}
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # 跨单分房：部分未分房提醒状态机的启用日期（部署当日，YYYY-MM-DD），见 infra/README-environments.md
+      ROOM_REMINDER_STATE_MACHINE_SINCE: ${ROOM_REMINDER_STATE_MACHINE_SINCE:-}
       # 必须显式设置（生产 sandbox 等于公开伪造支付接口，拒绝默认值）
       PAYMENT_MODE: ${PAYMENT_MODE:?must set PAYMENT_MODE (live|sandbox — live for production)}
       APP_PUBLIC_URL: ${APP_PUBLIC_URL:?must set APP_PUBLIC_URL for payment webhooks (e.g. https://api.citur.com)}
@@ -141,6 +143,8 @@ services:
       DATABASE_URL: postgresql://ftm:${POSTGRES_PASSWORD}@postgres:5432/ftm?schema=public
       REDIS_URL: redis://redis:6379
       LOG_LEVEL: ${LOG_LEVEL:-info}
+      # 跨单分房：部分未分房提醒状态机的启用日期（部署当日，YYYY-MM-DD），见 infra/README-environments.md
+      ROOM_REMINDER_STATE_MACHINE_SINCE: ${ROOM_REMINDER_STATE_MACHINE_SINCE:-}
       # 中央 env validator 也对 worker 生效，下面这些是它强制要求的（即使 worker 不直接用 JWT/CORS）
       CORS_ORIGINS: ${CORS_ORIGINS}
       JWT_ACCESS_SECRET: ${JWT_ACCESS_SECRET}
