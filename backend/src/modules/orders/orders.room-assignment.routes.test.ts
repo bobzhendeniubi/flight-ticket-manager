@@ -388,6 +388,21 @@ describe('PUT /orders/:id/room-assignment · 跨单分房 reconcile', () => {
   });
 
   /**
+   * 房型在分房编辑器里是选填字段（RoomingEditor.tsx 输入框写着「选填」），存量大量
+   * roomGroups 的 roomType 就是空串。普通组的硬校验只该拒「没传这个字段」（undefined），
+   * 不该把「传了空串」也当成缺失一起拒了——否则日常保存分房会整批 400。
+   */
+  it('普通房组 roomType 传空串 → 200，不是 400', async () => {
+    prismaMock.tx.order.findUnique.mockResolvedValue({ roomAssignment: null });
+    const res = await putStaff({
+      roomGroups: [{ id: 'g1', hotelName: '椰岛大酒店', roomType: '', passengerIds: ['p1'] }],
+    });
+    expect(res.statusCode).toBe(200);
+    const written = prismaMock.tx.order.update.mock.calls[0][0].data.roomAssignment;
+    expect(written.roomGroups[0]).toMatchObject({ hotelName: '椰岛大酒店', roomType: '' });
+  });
+
+  /**
    * astra A5③：普通组本不该是 0 份额，除非它就是解绑后留下的「与他单合住时计费 0 间」那条
    * （§八：解绑后 0 份额那张单钱不动）。服务端锁后现状（old）里这条组的 roomFraction 恰好
    * 也是 0 时，必须放行原样重存——不能一律拒绝，否则运营连改个备注都会被拦。放行时以

@@ -1543,7 +1543,9 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         // 放行锁定共享组的省略字段），这里补回硬校验——普通组不享受那条豁免，仍然必须
         // 显式带上这两个字段，不能悄悄把 undefined 写进 roomAssignment JSON（会破坏
         // physicalRoomsOfGroups 等依赖 hotelName 兜底匹配的下游读取）。
-        if (!g.hotelName || !g.roomType) {
+        // 房型在分房编辑器里是选填字段（RoomingEditor.tsx 输入框写着「选填」），空串是
+        // 合法的既有数据形状：只拒「没传这个字段」，不拒「传了空串」。
+        if (typeof g.hotelName !== 'string' || typeof g.roomType !== 'string') {
           throw new BadRequestError('普通房组必须提供 hotelName 与 roomType');
         }
         finalGroups.push({
