@@ -1,0 +1,196 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>跨单分房操作说明 — 世途旅行·运营控制台</title>
+<style>
+  :root{
+    --indigo:#4F46E5; --indigo-dark:#4338CA; --indigo-50:#EEF2FF;
+    --ink:#0F172A; --ink-soft:#334155; --muted:#64748B;
+    --bg:#F1F5F9; --card:#FFFFFF; --line:#E2E8F0;
+    --amber-bg:#FFFBEB; --amber-line:#FDE68A;
+    --green:#059669; --green-bg:#ECFDF5;
+    --red-bg:#FEF2F2;
+    --blue-bg:#EFF6FF;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:'Inter','PingFang SC','Hiragino Sans GB','Microsoft YaHei',system-ui,-apple-system,sans-serif;color:var(--ink-soft);background:var(--bg);line-height:1.85;font-size:15px}
+  .page{max-width:900px;margin:0 auto;background:var(--card);padding:40px 44px 72px;box-shadow:0 0 24px rgba(15,23,42,.06)}
+  h1,h2,h3{color:var(--ink);line-height:1.35}
+  h1{font-size:26px;margin:0 0 6px}
+  h2{font-size:20px;margin:40px 0 12px;padding:10px 14px;background:var(--indigo-50);border-left:5px solid var(--indigo);border-radius:0 8px 8px 0}
+  h3{font-size:16.5px;margin:24px 0 8px;color:var(--indigo-dark)}
+  p{margin:10px 0}
+  .sub{color:var(--muted);font-size:13.5px;margin:0 0 4px}
+  .cover{border-bottom:3px solid var(--indigo);padding-bottom:18px;margin-bottom:22px}
+  .cover .brand{display:inline-block;background:var(--indigo);color:#fff;font-weight:700;font-size:13px;padding:3px 12px;border-radius:999px;letter-spacing:.5px;margin-bottom:10px}
+  .lead{background:var(--indigo-50);border-radius:10px;padding:14px 18px;margin:16px 0 8px;color:var(--ink);font-size:15.5px}
+  .shot{margin:14px 0 4px;border:1px solid var(--line);border-radius:10px;overflow:hidden;background:#fff}
+  .shot img{display:block;width:100%;height:auto}
+  .shot.narrow{max-width:560px}
+  .cap{color:var(--muted);font-size:13px;margin:4px 0 16px;text-align:center}
+  .tip,.info,.warn,.danger{border-radius:10px;padding:12px 16px;margin:14px 0}
+  .tip{background:var(--green-bg);border:1px solid #A7F3D0}
+  .info{background:var(--blue-bg);border:1px solid #BFDBFE}
+  .warn{background:var(--amber-bg);border:1px solid var(--amber-line)}
+  .danger{background:var(--red-bg);border:1px solid #FECACA}
+  table{border-collapse:collapse;width:100%;margin:12px 0;font-size:14px}
+  table.doc th,table.doc td{border:1px solid var(--line);padding:8px 10px;text-align:left;vertical-align:top}
+  table.doc th{background:#F8FAFC;color:var(--ink)}
+  ol.steps{padding-left:22px}
+  ol.steps li{margin:8px 0}
+  ul.plain{padding-left:22px}
+  ul.plain li{margin:6px 0}
+  .toc{background:#F8FAFC;border:1px solid var(--line);border-radius:10px;padding:12px 18px 12px 34px;margin:14px 0 6px}
+  .toc li{margin:3px 0}
+  code{background:#F1F5F9;border-radius:4px;padding:1px 6px;font-size:13px;color:var(--indigo-dark)}
+  .missing{background:#F8FAFC;border:1px dashed var(--muted);border-radius:10px;padding:10px 14px;margin:10px 0;font-size:13.5px;color:var(--muted)}
+</style>
+</head>
+<body>
+<div class="page">
+
+<div class="cover">
+  <span class="brand">运营控制台 · 房控岗</span>
+  <h1>跨单分房操作说明</h1>
+  <p class="sub">两张订单合住一间房 · 三人间怎么处理 · 分房表当真值 · 房控 / 运营 · 2026-09-14</p>
+</div>
+
+<div class="lead">
+以前系统里的"房间"只能装本单的人，两张不同订单的客人要合住一间、或者三个人挤一间，都只能各自在自己单里备注一句、房控自己心里数着。现在有了「跨单分房」：把这间房在系统里立成真的，两张单的人一起进去，分房表、销控板、导出都认这个真值，不用再靠备注人工对。这份说明给房控岗和运营看，讲清楚在哪操作、怎么操作、几条要注意的规则。
+</div>
+
+<ol class="toc">
+  <li><a href="#s1">一、这是什么，解决什么问题</a></li>
+  <li><a href="#s2">二、入口在哪</a></li>
+  <li><a href="#s3">三、操作步骤</a></li>
+  <li><a href="#s4">四、几条要记住的规则</a></li>
+  <li><a href="#s5">五、单单分房编辑器里的变化</a></li>
+  <li><a href="#s6">六、导出：房号怎么印</a></li>
+  <li><a href="#s7">七、常见问题 Q&amp;A</a></li>
+  <li><a href="#s8">八、本次同步上线的相关变化</a></li>
+</ol>
+
+<h2 id="s1">一、这是什么，解决什么问题</h2>
+<p>
+两张不同订单的客人要合住一间房——最常见的是拼房：各自下的单，酒店那边是一间房两个人。以前系统里的"分房表"是挂在每张订单自己身上的，一个房间盒子只能装本单的人，两张单永远分不到一间去，房控只能靠备注手工记，导出的时候房号也对不上。三人间同理：本质就是"一张单的人 + 另一张单的人凑一间"，不是房型问题。
+</p>
+<p>
+现在「跨单分房」把这间房在系统里立成一个独立的真值（内部叫"共享房"）：房控在工作台里把两张单（或更多）的人一起拖进同一个房间盒子，保存后这间房就是真的了——<strong>房控物理房怎么算、导出印几号房，都按它来</strong>，不用再靠备注对。三个人合住一间房，就是往一个房间盒子里拖三个人，系统按份额分摊房费和物理间数，不用凑"三分之一间"这种算法。
+</p>
+<div class="info">钱不会因为这次改动自动变化：谁多摊、谁少摊房费，是运营在工作台里手动定的"份额"，系统不替你算账、也不自动改结算价（见§四）。</div>
+
+<h2 id="s2">二、入口在哪</h2>
+<p>「跨单分房」一共两个入口，打开的是同一个工作台：</p>
+<ol class="steps">
+  <li><strong>房控页 →「订单分房（拖拽）」卡片</strong>：卡片右上角有「跨单分房」按钮，点开工作台默认带当前正在看的这张订单的酒店和入住区间。</li>
+  <li><strong>销控板占房下钻</strong>：在房控页的酒店/日期矩阵里点某天某酒店的「余量」格子，弹出的占房抽屉里同样有「跨单分房」按钮，默认带这家酒店、这一天入住的区间。</li>
+</ol>
+<div class="shot"><img src="shots-2026-09-14-跨单分房/01-房控入口-跨单分房按钮.png"></div>
+<p class="cap">入口一：房控页「订单分房（拖拽）」卡片右上角的「跨单分房」按钮</p>
+<div class="shot"><img src="shots-2026-09-14-跨单分房/02-占房下钻-入口与三列口径.png"></div>
+<p class="cap">入口二：点销控板某天某酒店的余量格，抽屉里也有「跨单分房」按钮；下面已经合住的订单会多显示一行"跨单合住 X 间 · 本单计费份额 X · 去重物理房 X"（三个数口径不同，见下方提示条，不能互相加减）</p>
+
+<h2 id="s3">三、操作步骤</h2>
+<ol class="steps">
+  <li>打开「跨单分房」工作台，顶部选<strong>酒店</strong>、<strong>入住</strong>、<strong>退房</strong>三个条件（从入口带入的会自动填好，也可以自己改），点「刷新」拉数据。</li>
+  <li>工作台分两栏：左边是<strong>跨订单乘客池</strong>——这家酒店这个入住区间里，所有还没作废的订单的出行人，按订单分组列出来；右边是<strong>房间盒子</strong>——已经存在的共享房、以及可以新建的空房间。</li>
+  <li>把左边池子里的人<strong>拖进</strong>右边的房间盒子，一个盒子可以装来自不同订单的人。盒子里的人还是按"来源订单"分组显示，方便看清楚谁是谁的。</li>
+  <li>每个来源订单在这间房里有一个<strong>计费份额</strong>：默认第一张拖进来的单是 1（这张单掏钱），后面拖进来的单是 0（跟着住不额外收房费）。份额用房间盒子里的 <code>−</code> / <code>＋</code> 按钮调，每次 0.5 步进（比如两张单各半间就都改成 0.5）。<strong>保存时系统会校验：一间房里所有份额加起来必须等于 1</strong>，凑不齐会提示「计费份额合计须为 X，当前为 Y」并拦住保存。</li>
+  <li>三人间就是把三个人拖进同一个盒子：比如一张单 1 人、另一张单 2 人，份额可以是 1 + 0（第一张单出钱），也可以按实际约定改成别的比例，只要合计是 1。房型如果限 2 人、你拖进了 3 个人，系统只会在房间标题上标一个「超容量」提示，<strong>不会拦你保存</strong>——酒店那边给的是加床还是家庭房，运营自己判断，系统不替你决定对不对。</li>
+  <li>每个房间盒子下面有一个「备注」输入框，可以写房控自己的备注（比如"加床"）。</li>
+  <li>都拖好之后点右下角「保存」。保存成功会提示"已保存 · N 间房"；如果这期间别人也改过同一间房，会提示「该房间已被他人修改，请刷新」，点旁边的「刷新」重新拉一次最新状态再改。</li>
+  <li>保存之后，销控板的「物理房间」行和占房下钻抽屉会立刻反映新的分房结果：下钻抽屉里每张涉及跨单合住的订单会多一行"跨单合住 X 间 · 本单计费份额 X · 去重物理房 X"——这三个数口径不一样，<strong>不能直接拿来加减凑总数</strong>，本晚这家酒店的物理房间合计以销控板本身的"物理房间"行为准。</li>
+</ol>
+
+<div class="shot"><img src="shots-2026-09-14-跨单分房/04-工作台-乘客池与房间盒子.png"></div>
+<p class="cap">跨单分房工作台：左边跨订单乘客池（按订单分组），右边房间盒子（图中第一间房已经是 FTM2026090281026 与 FTM2026090771942 两张单合住）</p>
+
+<div class="shot narrow"><img src="shots-2026-09-14-跨单分房/05-工作台-三人间份额与超容量.png"></div>
+<p class="cap">三人合住一间房：份额 1 + 0（第一张单出钱），房型限 2 人但拖进了 3 个人，标「超容量」提示（仅提示，不拦保存）</p>
+
+<div class="warn">
+<strong>份额合计校验：</strong>如果手滑把某间房的份额调乱了（比如变成 1 + 0.5 = 1.5），点「保存」时不会真的提交，会先在原地报错「房间「标准房」的计费份额合计须为 1，当前为 1.5」，把份额改回合计等于 1 再保存即可。
+</div>
+<div class="shot narrow"><img src="shots-2026-09-14-跨单分房/06-工作台-份额合计校验提示.png"></div>
+<p class="cap">份额合计不等于 1 时点保存的提示</p>
+
+<h2 id="s4">四、几条要记住的规则</h2>
+<ol class="steps">
+<li><strong>钱不自动重算。</strong>份额定好之后，系统不会自己去改结算价：份额是 0 的那张单如果本来就该少收钱，需要运营手动走「改结算价」把差额调过去；系统只保证"这间房算谁的、算几间"这件事，不替你算钱。</li>
+<li><strong>换酒店、改期、改档会自动解绑，并且会提示你。</strong>如果一张单的某个酒店行已经在跟别的单合住，这时候你去给这行换酒店、改入住日期、或者改套餐档次，系统会自动把这行从共享房里解绑（变回这张单自己的普通房间），不会拦你操作，但会弹提示告诉你"这里原来是跟别的单合住的，现在已经解开"。解绑之后如果这张单原来份额是 0，钱还是不会跟着自动变，需要你自己看要不要补结算价。</li>
+<li><strong>已经合住的行，不能直接改单住/拼住，也不能直接补单房差。</strong>要改这类操作，得先在跨单分房工作台里把这一行从共享房里解绑（或者整间解散），解绑之后再回订单详情去改单住、拼住或补房差。系统会用文字告诉你"该行与他单合住，请先在跨单分房里解除合住再改"。</li>
+<li><strong>旧订单要拉进共享房，得先把分房表里的房组都"认领"到具体的酒店行上。</strong>老单子如果分房表里的房间组没选归属的酒店行（这种情况在分房编辑器里能看到），跨单分房工作台会把这张单的人标成"锁定"、拖不进去，并提示「房组归属不完整，请先在分房编辑器给全部房组补齐归属订单行，才能拉进共享房」。回订单的分房编辑器里把归属选好、保存一次，就能正常拖进跨单分房了。</li>
+<li><strong>一方取消之后，房间不会自动腾出来。</strong>合住的两方里，如果掏钱那一方后来取消或者退款了，系统不会自动把这间房算成空的——物理房间数还是按 1 间占用算，房控页的「提醒线」会给一条「合住方已取消」的提示，列出还剩下谁在住，提醒房控去核对这间房要不要补钱、或者干脆解绑腾出来卖给别人。</li>
+<li><strong>代理看不到对方的单号。</strong>代理登录看自己的订单，如果这行房间是跟别的单合住的，代理只会看到"已与他单合住"这样一句话，看不到对方是哪张单、也拿不到对方的任何信息，保护双方隐私。</li>
+</ol>
+
+<h2 id="s5">五、单单分房编辑器里的变化</h2>
+<p>
+从订单详情或者房控页「订单分房（拖拽）」进单张订单的分房编辑器，如果这张单的某个房间组已经在跨单分房里跟别的单合住了，这个房间盒子会带一个 <strong>🔒已与他单合住</strong> 的锁标签，锁定之后<strong>只能改这间房的备注</strong>——乘客拖不出来、也拖不进新的人，房型、归属都改不了，页面上也会提示"想调整请去房控页「跨单分房」"。想动这些内容，回跨单分房工作台去改。
+</p>
+<div class="shot"><img src="shots-2026-09-14-跨单分房/07-单单编辑器-已与他单合住.png"></div>
+<p class="cap">单单分房编辑器：与他单合住的房间组带锁标签，只能改备注；下方还有份额为 0 的说明</p>
+
+<h2 id="s6">六、导出：房号怎么印</h2>
+<p>
+分房表导出、整班机导出、全岗总表——这三个导出现在共用同一套房间编号：<strong>同一间共享房，不管哪一方份额多少，三份表印出来都是同一个房号</strong>，不会因为一方份额是 0 或者 0.5 就印出不一样的后缀。备注列会自动写上"与 FTM… 合住"，把合住对方的单号列出来（代理侧导出不写对方单号，只写"与他单合住"）。
+</p>
+<p>下面是测试站真实导出的「分房表」（成都格式 xlsx，明月酒店 2026-09-08 入住那天的 sheet）里，跟前面工作台截图对应的两行——注意 <code>房间号</code> 都是「房1」，来自两张不同的订单：</p>
+<table class="doc">
+<tr><th>代理机构</th><th>中文名称</th><th>房型</th><th>房间号</th><th>备注（节选）</th></tr>
+<tr><td>世途9</td><td>刘家宝</td><td>标准房</td><td>房1</td><td>单住，加钱指定明月酒店，自备签证 / <strong>与 FTM2026090281026 合住</strong></td></tr>
+<tr><td>天盈</td><td>彭丹</td><td>标准房</td><td>房1</td><td>彭丹 常学彬 彭梓宸 常莎莎//四星双床2间 4人自备签证 加钱指定明月 / <strong>与 FTM2026090771942 合住</strong></td></tr>
+<tr><td>天盈</td><td>常学彬</td><td>标准房</td><td>房1</td><td>同上 / <strong>与 FTM2026090771942 合住</strong></td></tr>
+</table>
+<p class="cap">刘家宝所在订单（FTM2026090771942）与彭丹/常学彬所在订单（FTM2026090281026）合住一间房，导出后房号统一印「房1」，备注互相标注对方单号——这正是前面工作台截图里那间份额 1+0 的房间</p>
+<div class="info">彭梓宸、常莎莎是同一张订单（FTM2026090281026）在另一个普通房间（房2）里，没有跟别的单合住，所以备注里没有"合住"字样——跟工作台截图里"房间 2"（份额 1，没有共享）对应得上。</div>
+
+<h2 id="s7">七、常见问题 Q&amp;A</h2>
+<table class="doc">
+<tr><th>问题</th><th>怎么办</th></tr>
+<tr>
+  <td>保存时提示"该房间已被他人修改，请刷新"</td>
+  <td>说明你打开工作台之后，另一个人也保存过同一间房。点提示旁边的「刷新」按钮重新拉一次最新状态，之前的拖拽改动会丢，需要照最新状态重新拖一次再保存。</td>
+</tr>
+<tr>
+  <td>保存时提示"计费份额合计须为 1，当前为 X"</td>
+  <td>把这间房里各订单的份额用 <code>−</code>/<code>＋</code> 调整，合计凑到 1 再保存（比如 0.5+0.5、1+0，或者三方 0.5+0.5+0 之类，只要加起来等于 1）。</td>
+</tr>
+<tr>
+  <td>某张单的人在池子里显示"锁定"，拖不进房间</td>
+  <td>这张单的分房表里有房间组还没选"归属酒店行"。先去这张单的分房编辑器，把所有房间组都指定好归属的酒店行并保存，回到跨单分房工作台刷新一下就能拖了。</td>
+</tr>
+<tr>
+  <td>想把已经合住的一间房拆散，各自单住</td>
+  <td>回到跨单分房工作台，找到这间共享房，点右上角「解散整间」。解散之后每张单的人各自变回自己单里的普通房间组，计费份额、房型都保留在各自单上，需要再手动调整。</td>
+</tr>
+<tr>
+  <td>三人间到底怎么处理</td>
+  <td>正常拖：把三个人（不管来自几张单）拖进同一个房间盒子，份额合计等于 1 即可保存；房型如果限 2 人会提示「超容量」，不影响保存，酒店那边是不是真的能加床、要不要另收加床费，运营自己判断和沟通。</td>
+</tr>
+<tr>
+  <td>换了酒店/改了期之后，原来合住的份额去哪了</td>
+  <td>系统会自动把这一行从共享房解绑，变回这张单自己的普通房间组（计费份额跟着这行走，不会凭空消失），并弹提示告诉你已经解绑。共享房里剩下的其他单不受影响，除非解绑之后房间只剩这一方，那就自动整间解散。</td>
+</tr>
+</table>
+
+<div class="missing">
+以下两类场景本说明按规格要求覆盖，但测试库目前没有能触发的真实数据，截图从缺，效果以文字为准：
+<ul class="plain">
+<li>「保存冲突」的 409 提示（"该房间已被他人修改"）——需要两个人同时改同一间房才能真实触发，测试库单人操作复现不了，实际提示文案见上方 Q&amp;A 第一条。</li>
+<li>房控页「提醒线」里的「合住方已取消」——测试库当前没有"掏钱一方已取消、对方仍在住"的存量数据，效果见§四第 5 条的文字说明。</li>
+</ul>
+</div>
+
+<h2 id="s8">八、本次同步上线的相关变化</h2>
+<ul class="plain">
+<li><strong>普通房组不再跨单同名合桶。</strong>以前系统里如果两张不同订单的房间组"酒店名+房型+日期"完全一样，统计的时候可能被当成一桶合并计数；现在普通房组严格按各自订单单独计数，真正要合住必须走「跨单分房」显式指定，不再"看着像"就合并。</li>
+<li><strong>提醒线新增"部分未分房"。</strong>如果一张订单已经有酒店行，但里面还有乘客一个房间组都没进（既没进普通房组，也没进共享房），提醒中心会提示出来，方便房控收尾。</li>
+<li><strong>房控提醒线新增"合住方已取消"。</strong>见§四第 5 条：掏钱一方取消/退款之后，共享房不会自动腾空，会在这里提示核对。</li>
+</ul>
+
+</div>
+</body>
+</html>
