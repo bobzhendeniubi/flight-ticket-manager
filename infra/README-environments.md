@@ -35,6 +35,19 @@
 上一版镜像变成 `<none>` 但磁盘还占着，backend+worker 各约 1GB。2026-08-24 曾因此
 累积到 38G、磁盘 74%。
 
+### 部署前必设：跨单分房提醒上线日期闸
+
+`ROOM_REMINDER_STATE_MACHINE_SINCE`（`.env.prod` / `.env.staging`）**每次部署跨单分房相关
+改动都必须显式设成部署当日**（`YYYY-MM-DD`），不能留代码默认值：
+
+- 缺省值是代码里的占位上线日（`backend/src/modules/reminders/reminders.rules.ts`），部署日
+  只要晚于它，「未分房/部分未分房」提醒的新建/重开/孤儿清理这道闸就退化成 no-op——存量
+  订单会被一视同仁地打开，一次性把此前一直卡住的待办全翻出来炸给运营。
+- 设成未来日期又会反向误伤：这道闸同时管着既有的 `ROOM_UNASSIGNED` 规则，会把一条现在
+  正常工作的「临近入住未分房」提醒一起静默关掉。
+- 两个 env 样例文件（`docs/env.prod.example`、`infra/env.staging.example`）都留了这一项，
+  部署前照抄模板改日期，别漏。
+
 ## 让测试环境跑别的分支
 
 测试目录是独立 checkout，想验哪个分支就切哪个：
