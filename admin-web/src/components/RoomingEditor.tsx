@@ -219,7 +219,10 @@ function seedBoxes(initial: RoomGroup[] | undefined): RoomBox[] {
       passengerIds: Array.isArray(g.passengerIds) ? [...g.passengerIds] : [],
       notes: g.notes ?? '',
       roomFraction: normalizeFraction(g.roomFraction),
-      // 既有归属（split-room-group / 上次保存写入）保留——重存分房不能把归属静默清掉
+      // 既有归属（split-room-group / 上次保存写入）保留——重存分房不能把归属静默清掉。
+      // astra B 路终审 M2：外部 DTO（AGENT/CUSTOMER，room-group-dto.ts）现在也带
+      // orderItemId 了（本单自己的行 id，无跨单信息）——这行本来就是按 g.orderItemId
+      // 原样 seed，之前代理这里恒为 null 纯粹是后端没给这个字段，不是这里的逻辑缺陷。
       orderItemId: g.orderItemId ?? null,
       sharedRoomId,
       isShared,

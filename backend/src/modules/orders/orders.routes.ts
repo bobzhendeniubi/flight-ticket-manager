@@ -1577,6 +1577,10 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         }
         finalGroups.push({
           ...g,
+          // M2：代理外部 DTO（ExternalRoomGroup）现在把本单的 orderItemId 带回来了，但
+          // 省略仍是合法输入（旧调用方 / 单酒店行订单前端可能不传）——省略时按锁后旧组
+          // 兜底，不能让归属悄悄写成 undefined（多酒店行订单会因此丢挂到哪条行）。
+          orderItemId: g.orderItemId ?? (old ? (readGroupField(old, 'orderItemId') ?? undefined) : undefined),
           ...(oldSplitPairKey ? { splitPairKey: oldSplitPairKey } : {}),
         });
       }

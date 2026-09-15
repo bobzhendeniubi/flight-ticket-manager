@@ -403,6 +403,66 @@ describe('PUT /orders/:id/room-assignment · 跨单分房 reconcile', () => {
   });
 
   /**
+   * astra B 路终审 M2：代理外部 DTO（ExternalRoomGroup）现在把本单的 orderItemId 带回来
+   * 了，但省略仍是合法输入（老调用方 / 前端在单酒店行订单时可能压根不传）。普通组分支
+   * 之前落库用的是客户端原样 `{...g}`，省略即真丢——多酒店行订单代理重存一次分房，归属
+   * 就可能被写成 undefined。改成省略时按锁后旧组兜底，归属不丢。
+   */
+  it('普通房组省略 orderItemId → 按锁后旧组兜底，归属不丢', async () => {
+    prismaMock.tx.order.findUnique.mockResolvedValue({
+      roomAssignment: {
+        roomGroups: [
+          {
+            id: 'g1',
+            hotelName: '椰岛大酒店',
+            roomType: '双床',
+            passengerIds: ['p1'],
+            orderItemId: 'item1',
+          },
+        ],
+      },
+    });
+    const res = await putStaff({
+      // 客户端（AGENT 外部 DTO 的老调用方）没传 orderItemId
+      roomGroups: [{ id: 'g1', hotelName: '椰岛大酒店', roomType: '双床', passengerIds: ['p1'] }],
+    });
+    expect(res.statusCode).toBe(200);
+    const written = prismaMock.tx.order.update.mock.calls[0][0].data.roomAssignment;
+    expect(written.roomGroups[0].orderItemId).toBe('item1');
+  });
+
+  it('普通房组显式传 orderItemId → 以客户端新值为准（不被旧值覆盖）', async () => {
+    prismaMock.orderItem.count.mockResolvedValue(1); // orderItemId 归属校验通过
+    prismaMock.tx.order.findUnique.mockResolvedValue({
+      roomAssignment: {
+        roomGroups: [
+          {
+            id: 'g1',
+            hotelName: '椰岛大酒店',
+            roomType: '双床',
+            passengerIds: ['p1'],
+            orderItemId: 'item1',
+          },
+        ],
+      },
+    });
+    const res = await putStaff({
+      roomGroups: [
+        {
+          id: 'g1',
+          hotelName: '椰岛大酒店',
+          roomType: '双床',
+          passengerIds: ['p1'],
+          orderItemId: 'item2',
+        },
+      ],
+    });
+    expect(res.statusCode).toBe(200);
+    const written = prismaMock.tx.order.update.mock.calls[0][0].data.roomAssignment;
+    expect(written.roomGroups[0].orderItemId).toBe('item2');
+  });
+
+  /**
    * M1：reconcile 前没有房组 id 去重时，同一 id 重复出现会被按旧组命中两次、原样各 push
    * 一份进 finalGroups——物理份额（按 sharedRoomId 去重）仍是 1 间，但 roomsByItem 按
    * orderItemId 累加 roomFraction，该行 roomsBilled 就从 1 翻成 2。改成在 reconcile 之前

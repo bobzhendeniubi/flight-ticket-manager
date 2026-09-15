@@ -31,6 +31,13 @@ export interface ExternalRoomGroup {
   isShared: boolean;
   /** 本单房组备注（房控填的自由文本；不含服务端生成的「与 FTM… 合住」内部文案）。*/
   notes: string;
+  /**
+   * 房组归属的本单订单行 id（astra B 路终审 M2）——只是「这个房组挂在本单哪一条酒店/套餐
+   * 行下」，不含任何跨单信息（不是共享房 id、不指向对方单号），泄露面为零。缺失该字段
+   * 会让多酒店行订单的代理重存分房时丢归属：外部 DTO 原本没有 orderItemId，代理只能在
+   * 下拉里盲选，容易改挂错行。省略（未归属 / 老数据没有该字段）时不返回这个键。
+   */
+  orderItemId?: string;
 }
 
 /** 防御式解析 roomAssignment.roomGroups；形状不符返回空数组，不抛错。*/
@@ -55,8 +62,9 @@ export function serializeRoomGroupsFor(
   if (role === UserRole.ADMIN || role === UserRole.STAFF) return roomAssignment;
   const groups = parseGroupsLoose(roomAssignment);
   return {
-    roomGroups: groups.map(
-      (g): ExternalRoomGroup => ({
+    roomGroups: groups.map((g): ExternalRoomGroup => {
+      const orderItemId = typeof g.orderItemId === 'string' ? g.orderItemId : undefined;
+      return {
         id: typeof g.id === 'string' ? g.id : '',
         roomType: typeof g.roomType === 'string' ? g.roomType : '',
         passengerIds: Array.isArray(g.passengerIds)
@@ -65,7 +73,8 @@ export function serializeRoomGroupsFor(
         roomFraction: typeof g.roomFraction === 'number' ? g.roomFraction : 1,
         isShared: typeof g.sharedRoomId === 'string' && g.sharedRoomId.length > 0,
         notes: typeof g.notes === 'string' ? g.notes : '',
-      }),
-    ),
+        ...(orderItemId !== undefined ? { orderItemId } : {}),
+      };
+    }),
   };
 }

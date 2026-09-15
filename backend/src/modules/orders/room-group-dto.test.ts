@@ -39,12 +39,14 @@ describe('serializeRoomGroupsFor — ADMIN/STAFF 原样透传', () => {
 });
 
 describe('serializeRoomGroupsFor — AGENT/CUSTOMER 剥离', () => {
-  it('AGENT：只保留 id/roomType/passengerIds/roomFraction/isShared/notes，不含 sharedRoomId/splitPairKey/hotelName/orderItemId', () => {
+  it('AGENT：只保留 id/roomType/passengerIds/roomFraction/isShared/notes/orderItemId，不含 sharedRoomId/splitPairKey/hotelName', () => {
     const result = serializeRoomGroupsFor(UserRole.AGENT, roomAssignment) as {
       roomGroups: Array<Record<string, unknown>>;
     };
     expect(result.roomGroups).toHaveLength(2);
     const [g1, g2] = result.roomGroups;
+    // astra B 路终审 M2：orderItemId 是本单自己的行 id，不含跨单信息，泄露面为零——
+    // 加回外部 DTO，代理重存多酒店行订单的普通组时才不会丢归属。
     expect(g1).toEqual({
       id: 'g1',
       roomType: '大床房',
@@ -52,12 +54,12 @@ describe('serializeRoomGroupsFor — AGENT/CUSTOMER 剥离', () => {
       roomFraction: 1,
       isShared: true,
       notes: '靠窗',
+      orderItemId: 'item-1',
     });
     expect(g1).not.toHaveProperty('sharedRoomId');
     expect(g1).not.toHaveProperty('splitPairKey');
     expect(g1).not.toHaveProperty('hotelName');
-    expect(g1).not.toHaveProperty('orderItemId');
-    // g2 未共享、缺省份额 1、notes 非字符串（null）回落空串
+    // g2 未共享、缺省份额 1、notes 非字符串（null）回落空串、没有 orderItemId（fixture 没给）
     expect(g2).toEqual({
       id: 'g2',
       roomType: '双床房',
@@ -66,6 +68,7 @@ describe('serializeRoomGroupsFor — AGENT/CUSTOMER 剥离', () => {
       isShared: false,
       notes: '',
     });
+    expect(g2).not.toHaveProperty('orderItemId');
   });
 
   it('CUSTOMER：同 AGENT 一样剥离', () => {

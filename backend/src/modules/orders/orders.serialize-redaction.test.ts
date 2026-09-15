@@ -729,7 +729,7 @@ describe('serializeOrder · roomAssignment 跨单分房脱敏', () => {
     }
   });
 
-  it('AGENT / CUSTOMER：roomAssignment 剥成中性 DTO，不含 sharedRoomId / splitPairKey / orderItemId / hotelName，也没有对方单号', () => {
+  it('AGENT / CUSTOMER：roomAssignment 剥成中性 DTO，不含 sharedRoomId / splitPairKey / hotelName，也没有对方单号；orderItemId 保留（本单自己的行 id，泄露面为零，astra B 路终审 M2）', () => {
     for (const role of [UserRole.AGENT, UserRole.CUSTOMER]) {
       const out = serializeOrder(orderWithSharedRoom() as never, orderSerializeRoleCtx(role)) as Record<
         string,
@@ -743,15 +743,18 @@ describe('serializeOrder · roomAssignment 跨单分房脱敏', () => {
         roomFraction: 1,
         isShared: true,
         notes: '靠窗',
+        orderItemId: 'item-hotel',
       });
       const serialized = JSON.stringify(out.roomAssignment);
       expect(serialized).not.toContain('sr1');
       expect(serialized).not.toContain('splitPairKey');
+      // splitPairKey 的值本身（'item-hotel:token-abc'）才是要挡住的敏感串；只要 token 后缀
+      // 不出现就说明整个字段被剥掉了，不能笼统断言不含 'item-hotel'——那个子串现在合法地
+      // 以 orderItemId 的身份出现（M2：本单自己的行 id，不含跨单信息）。
       expect(serialized).not.toContain('token-abc');
-      expect(serialized).not.toContain('item-hotel');
       // 不出现任何看起来像另一张单单号的字符串（本测试数据里没有真实单号，仅确认没有额外字段泄露）
       expect(Object.keys(group).sort()).toEqual(
-        ['id', 'isShared', 'notes', 'passengerIds', 'roomFraction', 'roomType'].sort(),
+        ['id', 'isShared', 'notes', 'orderItemId', 'passengerIds', 'roomFraction', 'roomType'].sort(),
       );
     }
   });
