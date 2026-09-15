@@ -19132,29 +19132,43 @@ export class OrderService {
           totalCount: number;
         }>
       >();
+      // M4 修复：本行若同时挂着普通房组（无 sharedRoomId）与共享组，下面「行级注入」不能
+      // 无条件用共享计划的合计覆盖 roomSplitByItem——那个数只汇总了共享组的份额，会把
+      // 运营为普通组显式填的 roomSplit（或普通组自己那部分该占的搬走量）整个吞掉、
+      // 且不给任何提示。先记下每个订单行是否还挂着有乘客的普通组，供下面判定用。
+      const plainGroupItemIds = new Set<string>();
       for (const group of readRoomGroups(order.roomAssignment)) {
         if (group.passengerIds.length === 0) continue;
         const groupSharedRoomId =
           typeof group.raw.sharedRoomId === 'string' && group.raw.sharedRoomId.length > 0
             ? group.raw.sharedRoomId
             : null;
-        if (!groupSharedRoomId) continue;
+        if (groupSharedRoomId) {
+          const attributedItemId =
+            typeof group.raw.orderItemId === 'string' && group.raw.orderItemId.length > 0
+              ? group.raw.orderItemId
+              : null;
+          if (!attributedItemId) continue; // §三强制归属，无归属的共享组理论不可达，跳过不参与行级推算
+          const movedCount = group.passengerIds.filter((id) => movedIdSet.has(id)).length;
+          const rawFraction = group.raw.roomFraction == null ? 1 : Number(group.raw.roomFraction);
+          const list = sharedGroupsByItemId.get(attributedItemId) ?? [];
+          list.push({
+            group,
+            sharedRoomId: groupSharedRoomId,
+            srcFraction: Number.isFinite(rawFraction) ? rawFraction : 1,
+            movedCount,
+            totalCount: group.passengerIds.length,
+          });
+          sharedGroupsByItemId.set(attributedItemId, list);
+          continue;
+        }
+        // 普通组：记下它归属的行（无归属的老数据按 hotelName 兜底的场景不在本次修复范围，
+        // 这里只看显式 orderItemId——共享组一律要求强制归属，混合场景下普通组通常也已归属）。
         const attributedItemId =
           typeof group.raw.orderItemId === 'string' && group.raw.orderItemId.length > 0
             ? group.raw.orderItemId
             : null;
-        if (!attributedItemId) continue; // §三强制归属，无归属的共享组理论不可达，跳过不参与行级推算
-        const movedCount = group.passengerIds.filter((id) => movedIdSet.has(id)).length;
-        const rawFraction = group.raw.roomFraction == null ? 1 : Number(group.raw.roomFraction);
-        const list = sharedGroupsByItemId.get(attributedItemId) ?? [];
-        list.push({
-          group,
-          sharedRoomId: groupSharedRoomId,
-          srcFraction: Number.isFinite(rawFraction) ? rawFraction : 1,
-          movedCount,
-          totalCount: group.passengerIds.length,
-        });
-        sharedGroupsByItemId.set(attributedItemId, list);
+        if (attributedItemId) plainGroupItemIds.add(attributedItemId);
       }
 
       for (const [itemId, groups] of sharedGroupsByItemId) {
@@ -19196,8 +19210,19 @@ export class OrderService {
           for (const pid of movedInGroup) postSplitFractionByPassenger.set(pid, halves.movedFraction);
           totalMovedFraction = round2(totalMovedFraction + halves.movedFraction);
         }
+        // M4 修复：本行若还挂着有乘客的普通房组，共享计划的合计不等于「这一行总共要搬走
+        // 几间」——普通组那部分该搬多少，系统没法安全代answer（会覆盖运营的显式输入或
+        // 默认派生值）。fail-closed：拒绝并说明原因，逼运营先把房组理清楚，不悄悄猜。
+        if (plainGroupItemIds.has(itemId)) {
+          throw new BadRequestError(
+            `订单行 ${itemId} 同时挂着普通房组与共享房组，系统无法安全推算该行的拆分间数` +
+              '（会覆盖普通房组那部分应搬走的间数）。请先在跨单分房工作台把普通房组挪到别的' +
+              '订单行，或把两者都并入同一间共享房，再拆单。',
+          );
+        }
         // 行级注入：用共享计划算出的总量覆盖 roomSplitByItem——moveHotel 读的就是这个
-        // Map，行级搬走间数从此与共享计划强制对齐（不再各算各的）。
+        // Map，行级搬走间数从此与共享计划强制对齐（不再各算各的）。本行全部房组都是共享组
+        // 时才安全覆盖（上面已排除混了普通组的情形）。
         roomSplitByItem.set(itemId, totalMovedFraction);
       }
     }

@@ -729,6 +729,88 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
     expect((await getHotelNightlyRemaining(hotel.id, [CHECK_IN])).physicalRemaining).toEqual([3]); // block=4-1
   });
 
+  it('M4 反例：本行同时挂普通房组与共享房组时拆单 fail-closed 拒绝，不静默覆盖普通组的搬走间数', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    // orderA 两位乘客同挂在 itemA 上：p2 走普通房组（0.5 间，不受本次拆单影响，留守）；
+    // p1 是共享成员（0.5 间，本次要被拆走）——一条行同时有普通房 + 共享房（§三 允许）。
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 2 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    await prisma.order.update({
+      where: { id: orderA.id },
+      data: {
+        roomAssignment: {
+          roomGroups: [
+            {
+              id: 'plain-1',
+              hotelName: '',
+              roomType: '',
+              passengerIds: [orderA.passengers[1].id],
+              orderItemId: orderA.items[0].id,
+              roomFraction: 0.5,
+            },
+          ],
+        },
+      },
+    });
+
+    await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0.5,
+              },
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 0.5,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const itemABefore = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderA.items[0].id } });
+    expect(Number(itemABefore.roomsBilled)).toBe(1); // 0.5（普通组 p2）+ 0.5（共享组 p1）
+
+    // 把 p1（共享成员）单独拆出去：itemA 同时挂着普通组（p2）与共享组（p1），系统不该
+    // 悄悄用共享计划的合计（0.5）覆盖 roomSplitByItem——那样会把普通组 p2 那部分该占的
+    // 搬走量（本例应为 0，p2 没动）算漏或算错，且运营毫无察觉。必须 fail-closed 拒绝。
+    await expect(
+      service.splitOrder(
+        orderA.id,
+        {
+          passengerIds: [orderA.passengers[0].id],
+          requestToken: splitToken('m4'),
+          autoSplitRoomGroups: true,
+        },
+        actor,
+      ),
+    ).rejects.toThrow(/同时挂着普通房组与共享房组/);
+
+    // 拒绝后不能有任何落库：itemA 原样不动，p1 仍是共享成员、仍在源单。
+    const itemAAfter = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderA.items[0].id } });
+    expect(Number(itemAAfter.roomsBilled)).toBe(1);
+    const p1Member = await prisma.sharedRoomMember.findFirstOrThrow({
+      where: { passengerId: orderA.passengers[0].id },
+    });
+    expect(p1Member.orderId).toBe(orderA.id);
+    expect(p1Member.orderItemId).toBe(orderA.items[0].id);
+  });
+
   it('验收反例 12：改单住 / 补单房差在共享行被拒（400，指向跨单分房解除合住）', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4);
