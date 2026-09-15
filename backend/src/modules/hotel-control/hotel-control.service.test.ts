@@ -1993,13 +1993,16 @@ describe('lockHotelInventoryForUpdate', () => {
   }
 
   type InventoryTxArg = Parameters<typeof lockHotelInventoryForUpdate>[0];
+  // N5 修复：range 是必填参数——固定一段测试用日期区间，不影响假 tx 的行为（假 tx 不按
+  // 日期过滤返回值，只按 hotelId 分桶），只用来验证 SQL 里确实带了日期过滤条件。
+  const testRange = { from: '2026-10-01', to: '2026-10-03' };
 
   it('每家酒店都有包房周期 → 只锁周期行，不触发 advisory lock，按酒店 id 升序', async () => {
     const { tx, queryCalls, executeCalls } = fakeInventoryTx({
       h2: [{ id: 'p2' }],
       h1: [{ id: 'p1' }],
     });
-    await lockHotelInventoryForUpdate(tx as unknown as InventoryTxArg, ['h2', 'h1']);
+    await lockHotelInventoryForUpdate(tx as unknown as InventoryTxArg, ['h2', 'h1'], testRange);
     expect(tx.$queryRaw).toHaveBeenCalledTimes(2); // 每家酒店各一次周期锁
     expect(executeCalls).toHaveLength(0); // 都有周期，不需要 advisory lock 兜底
     // 按 id 升序：h1 先于 h2，与调用方传参顺序（h2, h1）无关——避免两个事务以不同顺序锁
@@ -2009,12 +2012,15 @@ describe('lockHotelInventoryForUpdate', () => {
     for (const call of queryCalls) {
       expect(call.sql).toContain('"HotelBlockPeriod"');
       expect(call.sql).toContain('FOR UPDATE');
+      // N5：锁范围收窄——SQL 带日期区间过滤，不再锁该酒店全部历史/未来周期行。
+      expect(call.sql).toContain('"dateFrom"');
+      expect(call.sql).toContain('"dateTo"');
     }
   });
 
   it('astra N4：酒店没有任何包房周期（未纳管）→ 退化为 pg_advisory_xact_lock 兜底（走 $executeRaw）', async () => {
     const { tx, queryCalls, executeCalls } = fakeInventoryTx({}); // h1 查周期行返回空
-    await lockHotelInventoryForUpdate(tx as unknown as InventoryTxArg, ['h1']);
+    await lockHotelInventoryForUpdate(tx as unknown as InventoryTxArg, ['h1'], testRange);
     expect(tx.$queryRaw).toHaveBeenCalledTimes(1); // 周期锁（0 行）
     expect(tx.$executeRaw).toHaveBeenCalledTimes(1); // advisory lock 兜底
     expect(queryCalls[0]!.sql).toContain('"HotelBlockPeriod"');
@@ -2025,13 +2031,13 @@ describe('lockHotelInventoryForUpdate', () => {
 
   it('重复的 hotelId 只锁一次', async () => {
     const { tx } = fakeInventoryTx({ h1: [{ id: 'p1' }] });
-    await lockHotelInventoryForUpdate(tx as unknown as InventoryTxArg, ['h1', 'h1', 'h1']);
+    await lockHotelInventoryForUpdate(tx as unknown as InventoryTxArg, ['h1', 'h1', 'h1'], testRange);
     expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
   });
 
   it('空 hotelIds → 不发任何锁', async () => {
     const { tx } = fakeInventoryTx({});
-    await lockHotelInventoryForUpdate(tx as unknown as InventoryTxArg, []);
+    await lockHotelInventoryForUpdate(tx as unknown as InventoryTxArg, [], testRange);
     expect(tx.$queryRaw).not.toHaveBeenCalled();
   });
 });
@@ -2041,13 +2047,15 @@ describe('lockHotelInventoryForUpdate', () => {
 describe('lockRandomTierInventoryForUpdate', () => {
   /**
    * 假 tx：`hotel.findMany` 按档次返回该档次的真酒店 id 列表；`$queryRaw` 记录「锁包房
-   * 周期行」那次查询，返回值由 periodRowsByTier 决定；`$executeRaw` 单独记录 advisory
-   * lock（同 lockHotelInventoryForUpdate 的测试套路，两者调用序列分开断言）。
+   * 周期行」那次查询，返回值由 periodRowsByHotelId 决定（N5 修复后改成按 hotelId 逐店
+   * 查询，不再是一条跨店 IN 查询——测试口径随之改成按 hotelId 分桶，与
+   * lockHotelInventoryForUpdate 的假 tx 同形）；`$executeRaw` 单独记录 advisory lock。
    */
   function fakeRandomTierTx(
     hotelIdsByTier: Record<number, string[]>,
-    periodRowsByTier: Record<number, Array<{ id: string }>>,
+    periodRowsByHotelId: Record<string, Array<{ id: string }>>,
   ) {
+    const queryCalls: Array<{ sql: string; values: unknown[] }> = [];
     const executeCalls: Array<{ sql: string; values: unknown[] }> = [];
     const tx = {
       hotel: {
@@ -2055,33 +2063,44 @@ describe('lockRandomTierInventoryForUpdate', () => {
           Promise.resolve((hotelIdsByTier[where.starRating] ?? []).map((id) => ({ id }))),
         ),
       },
-      $queryRaw: vi.fn((strings: TemplateStringsArray, ..._values: unknown[]) => {
-        // 简化：本测试每次调用只涉及一个档次，用最近一次 hotel.findMany 的入参反查 tier。
-        const lastCall = (tx.hotel.findMany as ReturnType<typeof vi.fn>).mock.calls.at(-1);
-        const tier = lastCall?.[0]?.where?.starRating as number;
-        return Promise.resolve(periodRowsByTier[tier] ?? []);
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
+        const sql = strings.join('?');
+        queryCalls.push({ sql, values });
+        const hotelId = values[0] as string;
+        return Promise.resolve(periodRowsByHotelId[hotelId] ?? []);
       }),
       $executeRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
         executeCalls.push({ sql: strings.join('?'), values });
         return Promise.resolve(1);
       }),
     };
-    return { tx, executeCalls };
+    return { tx, queryCalls, executeCalls };
   }
 
   type RandomTierTxArg = Parameters<typeof lockRandomTierInventoryForUpdate>[0];
+  const testRange = { from: '2026-10-01', to: '2026-10-03' };
 
-  it('档次下的真酒店都有包房周期 → 只锁周期行，不触发 advisory lock', async () => {
-    const { tx, executeCalls } = fakeRandomTierTx({ 3: ['h1', 'h2'] }, { 3: [{ id: 'p1' }] });
-    await lockRandomTierInventoryForUpdate(tx as unknown as RandomTierTxArg, [3]);
+  it('档次下的真酒店都有包房周期 → 按 hotelId 升序逐店锁周期行，不触发 advisory lock', async () => {
+    const { tx, queryCalls, executeCalls } = fakeRandomTierTx(
+      { 3: ['h2', 'h1'] },
+      { h1: [{ id: 'p1' }], h2: [{ id: 'p2' }] },
+    );
+    await lockRandomTierInventoryForUpdate(tx as unknown as RandomTierTxArg, [3], testRange);
     expect(tx.hotel.findMany).toHaveBeenCalledTimes(1);
-    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+    // N5：不再是一条跨店 IN 语句，改成逐店各发一条——与 lockHotelInventoryForUpdate 同形。
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(2);
+    expect(queryCalls[0]!.values[0]).toBe('h1'); // 按 hotelId 升序，与单店变体一致
+    expect(queryCalls[1]!.values[0]).toBe('h2');
+    for (const call of queryCalls) {
+      expect(call.sql).toContain('"dateFrom"');
+      expect(call.sql).toContain('"dateTo"');
+    }
     expect(executeCalls).toHaveLength(0);
   });
 
   it('档次下没有任何真酒店（未纳管）→ 退化为 pg_advisory_xact_lock 兜底', async () => {
     const { tx, executeCalls } = fakeRandomTierTx({}, {}); // 4 星查不到任何真酒店
-    await lockRandomTierInventoryForUpdate(tx as unknown as RandomTierTxArg, [4]);
+    await lockRandomTierInventoryForUpdate(tx as unknown as RandomTierTxArg, [4], testRange);
     expect(tx.hotel.findMany).toHaveBeenCalledTimes(1);
     expect(tx.$queryRaw).not.toHaveBeenCalled(); // 没有酒店，连包房周期查询都不用发
     expect(tx.$executeRaw).toHaveBeenCalledTimes(1);
@@ -2092,19 +2111,19 @@ describe('lockRandomTierInventoryForUpdate', () => {
 
   it('档次下有真酒店但都没配包房周期 → 同样退化为 advisory lock 兜底', async () => {
     const { tx, executeCalls } = fakeRandomTierTx({ 3: ['h1'] }, {}); // h1 查周期返回空
-    await lockRandomTierInventoryForUpdate(tx as unknown as RandomTierTxArg, [3]);
+    await lockRandomTierInventoryForUpdate(tx as unknown as RandomTierTxArg, [3], testRange);
     expect(tx.$queryRaw).toHaveBeenCalledTimes(1); // 周期锁（0 行）
     expect(tx.$executeRaw).toHaveBeenCalledTimes(1);
     expect(executeCalls[0]!.values[0]).toBe('random-tier:3');
   });
 
   it('重复的 tier 只处理一次；空 tiers → 不发任何锁', async () => {
-    const { tx: tx1 } = fakeRandomTierTx({ 3: ['h1'] }, { 3: [{ id: 'p1' }] });
-    await lockRandomTierInventoryForUpdate(tx1 as unknown as RandomTierTxArg, [3, 3, 3]);
+    const { tx: tx1 } = fakeRandomTierTx({ 3: ['h1'] }, { h1: [{ id: 'p1' }] });
+    await lockRandomTierInventoryForUpdate(tx1 as unknown as RandomTierTxArg, [3, 3, 3], testRange);
     expect(tx1.hotel.findMany).toHaveBeenCalledTimes(1);
 
     const { tx: tx2 } = fakeRandomTierTx({}, {});
-    await lockRandomTierInventoryForUpdate(tx2 as unknown as RandomTierTxArg, []);
+    await lockRandomTierInventoryForUpdate(tx2 as unknown as RandomTierTxArg, [], testRange);
     expect(tx2.hotel.findMany).not.toHaveBeenCalled();
   });
 });

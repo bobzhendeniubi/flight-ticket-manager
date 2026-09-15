@@ -1516,14 +1516,12 @@ export async function lockHotelBlockPeriodsWithinTx(
 }
 
 /**
- * 恢复路径专用的酒店库存互斥（astra N4 锁侧）：按酒店 id 升序逐个锁该酒店**全部**包房
- * 周期行；这家酒店完全没有配置任何包房周期（未纳管）时退化为
- * `pg_advisory_xact_lock(hashtext(hotelId))`，方案 §六步骤 4 明文写的兜底。
+ * 恢复路径专用的酒店库存互斥（astra N4 锁侧）：按酒店 id 升序逐个锁该酒店在
+ * `range` 覆盖区间内的包房周期行；这家酒店在这段区间完全没有配置任何包房周期
+ * （未纳管）时退化为 `pg_advisory_xact_lock(hashtext(hotelId))`，方案 §六步骤 4
+ * 明文写的兜底。
  *
  * 与 `lockHotelBlockPeriodsWithinTx` 的区别：
- *   · 不按日期区间过滤，锁该酒店的全部周期行——一次恢复可能牵涉该酒店多段互不相邻的
- *     日期，调用方在锁到手之后再各自重读容量判定；提前按某一段区间收窄反而可能漏锁到
- *     另一段日期正被别的并发恢复请求压着的周期行。
  *   · 无周期时会退化为 advisory lock；`lockHotelBlockPeriodsWithinTx` 不会——那个函数
  *     背后的两个既有调用方（`assertHotelPhysicalFitWithinTx` / `assertHotelFitAfterChange`）
  *     在「无周期＝未纳管，不拦」时会直接整段跳过后续判定，届时加不加锁都不影响结果，
@@ -1532,22 +1530,33 @@ export async function lockHotelBlockPeriodsWithinTx(
  *     最终算不算「未纳管」，所以本函数统一兜底加锁，把「要不要真正判定容量」的决定权
  *     留给调用方在锁到手之后自己做。
  *
+ * N5 修复：`range` 此前不存在——旧实现锁该酒店**全部**历史/未来包房周期行，一次恢复的
+ * 争用面会覆盖该酒店与本次完全无关的日期（线上一个酒店可能有几十条周期行），把交互
+ * 路径上的争用面显著放大。`range` 收窄成本次恢复涉及日期的并集（调用方把这批订单里
+ * 全部住宿行的 checkIn~checkOut 取 min/max），只锁与这段区间有交集的周期行——不会漏锁：
+ * 调用方传入的是「本次恢复」这一批订单自己的日期并集，不是某一行单独收窄，故不存在
+ * 「漏锁到另一段被别的并发请求压着的周期行」的问题（那段日期本就不在本次恢复范围内）。
+ *
  * 用法同 `lockHotelBlockPeriodsWithinTx`：必须在调用方事务内调用，随后在同一事务里完成
  * 恢复判定与落库，不得提前释放锁。
  *
  * @param hotelIds 本次恢复涉及的全部酒店 id（可以有重复，内部会去重）——调用方负责收集
  *   全部受影响酒店，遗漏一个就等于那家酒店没有互斥，见 astra N4：两张不同的纯酒店
  *   取消单同时强制恢复，各自在事务内看到「自己占 1、对方仍取消」，容量 1 时能同时提交。
+ * @param range 本次恢复涉及的日期并集（`dateOnly` 格式字符串），`from`/`to` 均含边界。
  */
 export async function lockHotelInventoryForUpdate(
   tx: Prisma.TransactionClient,
   hotelIds: readonly string[],
+  range: { from: string; to: string },
 ): Promise<void> {
+  const fromD = toDateOnly(range.from);
+  const toD = toDateOnly(range.to);
   const sortedHotelIds = [...new Set(hotelIds)].sort();
   for (const hotelId of sortedHotelIds) {
     const lockedPeriods = await tx.$queryRaw<Array<{ id: string }>>`
       SELECT id FROM "HotelBlockPeriod"
-      WHERE "hotelId" = ${hotelId}
+      WHERE "hotelId" = ${hotelId} AND "dateFrom" <= ${toD} AND "dateTo" >= ${fromD}
       ORDER BY id
       FOR UPDATE
     `;
@@ -1565,25 +1574,31 @@ export async function lockHotelInventoryForUpdate(
 }
 
 /**
- * `lockHotelInventoryForUpdate` 的随机档变体（M5 修复）：按档次升序逐个锁该档次全部真
- * 酒店（同星级、非国际五星、非占位）的全部包房周期行；该档次完全没有任何真酒店配置
- * 包房周期时（未纳管）退化为 `pg_advisory_xact_lock(hashtext('random-tier:' || tier))`。
+ * `lockHotelInventoryForUpdate` 的随机档变体（M5 修复）：按档次升序、档内按酒店 id
+ * 升序逐店锁该档次全部真酒店（同星级、非国际五星、非占位）在 `range` 覆盖区间内的
+ * 包房周期行；该档次完全没有任何真酒店在这段区间配置包房周期时（未纳管）退化为
+ * `pg_advisory_xact_lock(hashtext('random-tier:' || tier))`。
  *
- * 与 `lockRandomTierBlockPeriodsWithinTx` 的区别同 `lockHotelInventoryForUpdate` 之于
- * `lockHotelBlockPeriodsWithinTx`：不按日期区间过滤（锁该档次全部周期行，恢复路径一次
- * 可能牵涉多段互不相邻的日期），且无周期时会退化为 advisory lock 兜底——恢复路径的
- * 容量判定是调用方自己实现的 `assertRestoreHotelCapacity`，在锁到手之前不知道这个档次
- * 最终算不算「未纳管」。
+ * N5 修复：`range` 参数同 `lockHotelInventoryForUpdate`——不再锁该档次全部历史/未来
+ * 周期行，只锁本次恢复涉及日期并集覆盖的部分。另把原先「一条 `hotelId IN (...)` 语句
+ * 跨店拿锁」改成「按 hotelId 升序逐店各发一条 `FOR UPDATE`」——与 `lockHotelInventoryForUpdate`
+ * 同形：两个函数现在用同一种「逐店按 id 升序加锁」的顺序，消掉两者原本可能以不同顺序
+ * 锁同一批酒店而成环死锁的窗口（IN 语句里数据库按行物理顺序而非 hotelId 排序加锁，
+ * 与逐店函数的加锁顺序不保证一致）。
  *
  * advisory lock 的 key 加了 `random-tier:` 前缀，与 `lockHotelInventoryForUpdate` 用
  * 真实 hotelId 做 key 的命名空间区分开，避免档次数字巧合撞上某个 hotelId 的哈希。
  *
  * @param tiers 本次恢复涉及的全部随机档档次（可以有重复，内部会去重）。
+ * @param range 本次恢复涉及的日期并集（`dateOnly` 格式字符串），`from`/`to` 均含边界。
  */
 export async function lockRandomTierInventoryForUpdate(
   tx: Prisma.TransactionClient,
   tiers: readonly number[],
+  range: { from: string; to: string },
 ): Promise<void> {
+  const fromD = toDateOnly(range.from);
+  const toD = toDateOnly(range.to);
   const sortedTiers = [...new Set(tiers)].sort((a, b) => a - b);
   for (const tier of sortedTiers) {
     const hotels = await tx.hotel.findMany({
@@ -1592,14 +1607,14 @@ export async function lockRandomTierInventoryForUpdate(
     });
     const hotelIds = hotels.map((h) => h.id).sort();
     let lockedAny = false;
-    if (hotelIds.length > 0) {
+    for (const hotelId of hotelIds) {
       const lockedPeriods = await tx.$queryRaw<Array<{ id: string }>>`
         SELECT id FROM "HotelBlockPeriod"
-        WHERE "hotelId" IN (${Prisma.join(hotelIds)})
+        WHERE "hotelId" = ${hotelId} AND "dateFrom" <= ${toD} AND "dateTo" >= ${fromD}
         ORDER BY id
         FOR UPDATE
       `;
-      lockedAny = lockedPeriods.length > 0;
+      if (lockedPeriods.length > 0) lockedAny = true;
     }
     if (!lockedAny) {
       await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'random-tier:' + String(tier)}))`;

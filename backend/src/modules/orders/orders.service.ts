@@ -9253,8 +9253,20 @@ export class OrderService {
     // 涉及的酒店（内部按 hotelId 升序），再锁全部涉及的随机档（内部按档次升序）——与
     // 之前 lockScopes 排序结果一致（'hotel' 固定排在 'random' 前），不会与其它并发事务
     // 以不同顺序锁同一批作用域而成环死锁。
-    await lockHotelInventoryForUpdate(tx, [...hotelScopeNightDates.keys()]);
-    await lockRandomTierInventoryForUpdate(tx, [...randomTierScopeNightDates.keys()]);
+    // N5 修复：两个锁函数都要求传本次恢复涉及日期的并集（min~max）——不再锁该酒店/该
+    // 档次全部历史/未来周期行，把交互路径上的争用面收窄回「这次恢复实际会碰到的日期」。
+    const allLockNightDates = [
+      ...[...hotelScopeNightDates.values()].flatMap((set) => [...set]),
+      ...[...randomTierScopeNightDates.values()].flatMap((set) => [...set]),
+    ].sort();
+    if (allLockNightDates.length > 0) {
+      const lockRange = {
+        from: allLockNightDates[0]!,
+        to: allLockNightDates[allLockNightDates.length - 1]!,
+      };
+      await lockHotelInventoryForUpdate(tx, [...hotelScopeNightDates.keys()], lockRange);
+      await lockRandomTierInventoryForUpdate(tx, [...randomTierScopeNightDates.keys()], lockRange);
+    }
 
     const shortage = (result: { remaining: number[]; block: number[]; hasBlock: boolean }): boolean =>
       result.hasBlock &&
