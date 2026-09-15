@@ -276,6 +276,13 @@ export interface SaveSharedRoomsResult {
   rooms: Array<{ sharedRoomId: string; version: number }>;
   dissolved: string[];
   warnings: string[];
+  /**
+   * N6：本次触及「Σ有效份额=0」（原计费方已迁出、剩下的都是留守成员）的共享房 id
+   * （显式重提 H1④ + 隐式触及旧房两条路径都会进这个集合）——供前端把这几间房在
+   * 工作台里标红，不用再从 warnings 的自然语言文案里反查是哪几间房。空数组=本次
+   * 保存没有碰到任何孤儿房。
+   */
+  orphanedSharedRoomIds: string[];
 }
 
 /**
@@ -1498,6 +1505,7 @@ async function saveSharedRoomsInner(
       rooms: savedRooms,
       dissolved: [...dissolveSet],
       warnings,
+      orphanedSharedRoomIds: [...orphanedLeftoverRoomIds],
     };
     // 按占位行的主键 id 写最终结果，不是 requestToken（astra N10）：如果这次执行已经被
     // 判定超时、占位被回收（见 reserveRequestOrReplay 的 CAS 回收），本次持有的

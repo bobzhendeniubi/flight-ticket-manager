@@ -272,6 +272,9 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
   const [saving, setSaving] = useState(false);
   const [saveErr, setSaveErr] = useState<string | null>(null);
   const [saveOk, setSaveOk] = useState<string | null>(null);
+  // N6：上一次保存命中的孤儿房（Σ有效份额=0，原计费方已迁出）id 集合，供下面渲染标红——
+  // load() 重拉工作台会清空，只在「刚保存完」这一刻提醒运营去看。
+  const [orphanedRoomIds, setOrphanedRoomIds] = useState<Set<string>>(new Set());
 
   const canQuery = Boolean(hotelId && checkIn && checkOut && checkIn < checkOut);
 
@@ -302,6 +305,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
   useEffect(() => {
     setSaveErr(null);
     setSaveOk(null);
+    setOrphanedRoomIds(new Set());
     load();
   }, [load]);
 
@@ -309,6 +313,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
   function handleManualRefresh(): void {
     setSaveErr(null);
     setSaveOk(null);
+    setOrphanedRoomIds(new Set());
     load();
   }
 
@@ -529,6 +534,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     if (!wb) return;
     setSaveErr(null);
     setSaveOk(null);
+    setOrphanedRoomIds(new Set());
 
     // 既有共享房：与「本次加载时的落库成员」原样对比（N5：不再先剔除失效成员再比较）——
     // 没变化（房型/备注也没改）就不重新提交，避免把「历史上就含失效成员、本次根本没碰过」
@@ -627,6 +633,10 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
         `已保存 · ${result.rooms.length} 间房${result.dissolved.length ? ` · 解散 ${result.dissolved.length} 间` : ''}` +
           (result.warnings.length ? ` · ${result.warnings.join('；')}` : ''),
       );
+      // N6：把本次命中的孤儿房 id 记下来，下面渲染时标红——load() 重拉工作台会拿到
+      // 新的 draftId，不能只留着旧的 sharedRoomId 集合空等，故这里先设、下面按
+      // sharedRoomId（跨重拉稳定）比对。
+      setOrphanedRoomIds(new Set(result.orphanedSharedRoomIds));
       onSaved?.();
       load(); // 重拉落地状态（新版本号），继续编辑
     } catch (e: unknown) {
@@ -783,12 +793,17 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                   // Σ 按全量成员算（含未显式移除的失效成员，N5），与提交口径一致；
                   // 房间彻底没有任何成员（含失效）时不报，那种情况保存时会折成解散。
                   const fractionBad = r.groups.length > 0 && stats.totalFraction !== 1;
+                  // N6：上一次保存命中的孤儿房（原计费方已迁出，Σ=0）——按 sharedRoomId
+                  // 标红，比从 warnings 文案里正则反查稳定。
+                  const isOrphaned = !!r.sharedRoomId && orphanedRoomIds.has(r.sharedRoomId);
                   return (
                     <div
                       key={r.draftId}
                       onDragOver={(e) => e.preventDefault()}
                       onDrop={(e) => handleDropToRoom(r.draftId, e)}
-                      className="rounded-xl border border-slate-200 bg-surface p-3 shadow-sm transition hover:border-brand/30"
+                      className={`rounded-xl border p-3 shadow-sm transition hover:border-brand/30 ${
+                        isOrphaned ? 'border-rose-300 bg-rose-50' : 'border-slate-200 bg-surface'
+                      }`}
                     >
                       <div className="mb-2 flex flex-wrap items-center justify-between gap-2">
                         <span className="flex flex-wrap items-center gap-2 text-sm font-medium text-ink">
@@ -799,6 +814,14 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                             </span>
                           ) : (
                             <span className="badge-neutral">新建</span>
+                          )}
+                          {isOrphaned && (
+                            <span
+                              className="badge bg-rose-100 text-rose-700"
+                              title="原计费方已迁出，剩余成员计费 0 间，物理仍占用，金额未重算"
+                            >
+                              孤儿房
+                            </span>
                           )}
                           <span className="text-xs font-normal text-ink-muted">{stats.totalPax} 人</span>
                           <span

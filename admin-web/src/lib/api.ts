@@ -7735,6 +7735,9 @@ export interface SaveSharedRoomsResult {
   rooms: Array<{ sharedRoomId: string; version: number }>;
   dissolved: string[];
   warnings: string[];
+  /** N6：本次触及「Σ有效份额=0」（原计费方已迁出、剩下的都是留守成员）的共享房 id，
+   *  供工作台把这几间房标红——不用再从 warnings 的自然语言文案里反查是哪几间房。 */
+  orphanedSharedRoomIds: string[];
 }
 
 // ── 结算价 / 议价申请（代理对自家单：锁价前自己改立即生效，锁价后走「提交申请 → 运营确认」）── 独立命名空间，

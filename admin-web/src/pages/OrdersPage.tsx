@@ -2502,7 +2502,10 @@ export function OrdersPage() {
           .flatMap((r) => {
             const items: Array<{ id: string; message: string }> = [];
             if (r.notice) items.push({ id: r.id, message: r.notice });
-            for (const w of r.warnings) items.push({ id: r.id, message: w });
+            // N6：类型上 warnings 是非可选 string[]（后端恒返回），但类型只是编译期承诺——
+            // 真实响应一旦对不上（老版本后端 / 中间代理裁字段），`for...of undefined` 会
+            // 直接炸掉整个批量结果面板。这层 `?? []` 防御性价比极高，删得不值当，加回来。
+            for (const w of r.warnings ?? []) items.push({ id: r.id, message: w });
             return items;
           }),
       });

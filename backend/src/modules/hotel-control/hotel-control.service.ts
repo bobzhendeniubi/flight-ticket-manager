@@ -1780,6 +1780,11 @@ async function computeSharedRoomPhysicalAfterChange(
     // 会把这条宽松契约变成 breaking；保留静默过滤 + 下面这行 WARN 留痕，让「调用方喂错
     // 酒店」这种真 bug 能在日志里被看见，而不是完全无声无息。
     if (dbHotelId !== undefined && dbHotelId !== hotelId) {
+      // N6：这里没有 Fastify request/app 实例可注入（纯服务层函数，不是路由处理器），
+      // 仓库里同样深度的服务函数一律用 console.warn/console.error 打 `[module]` 前缀 +
+      // 结构化字段留痕（如 products.service.ts / settlement-discounts.service.ts /
+      // orders.service.ts 的多处 console.error/warn），不是这里新引入的孤例——沿用同一
+      // 惯例，带 `[hotel-control]` 前缀与结构化字段，容器日志按前缀过滤即可定位。
       console.warn('[hotel-control] shared room override belongs to a different hotel, dropped', {
         sharedRoomId: o.sharedRoomId,
         expectedHotelId: hotelId,
