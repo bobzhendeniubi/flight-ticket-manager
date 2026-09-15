@@ -444,17 +444,23 @@ async function runWithLockSetRetry<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * 房组的计费份额——**只对缺省/非数字** 回落成整间 1（与 hotel-control.service 的
- * groupRoomFraction 同口径，旧客户端省略字段时的兼容行为）。显式 0 一律原样保留为 0，
- * 不分共享组还是普通组：共享组的 0 是主单让份的明确值；普通组的 0 是解绑后留下的
- * 「与他单合住时计费 0 间」的历史值，重存时不能被这条兜底悄悄改回 1（astra A5②，
- * 旧实现只对共享组放行显式 0，普通组的 `explicit > 0` 判断会把 0 吃成 1）。
+ * 房组的计费份额——**只对 nullish（null / 省略）** 回落成缺省值（共享组缺省 0、普通组
+ * 缺省 1，与 hotel-control.service 的 groupRoomFraction 同口径，旧客户端省略字段时的
+ * 兼容行为）。显式数值（含 0）一律原样保留，不分共享组还是普通组：共享组的显式 0 是主单
+ * 让份的明确值；普通组的显式 0 是解绑后留下的「与他单合住时计费 0 间」的历史值，重存时
+ * 不能被这条兜底悄悄改回 1（astra A5②）。
+ *
+ * astra N12（回归）：曾经先 `Number(g.roomFraction)` 再判断——`Number(null) === 0` 与
+ * `Number(0) === 0` 无法区分，普通组的 `roomFraction: null`（真正「没有显式值」的历史
+ * 数据）会被这条兜底误判成「显式 0」，读出 0 而不是缺省的 1。必须先看原始值是不是
+ * nullish，再决定要不要 `Number()` 转换。
  */
-function readBillingFraction(g: Record<string, unknown>): number {
-  const n = Number(g.roomFraction);
-  const explicit = Number.isFinite(n) ? n : null;
-  if (groupSharedId(g) != null) return explicit ?? 0;
-  return explicit ?? 1;
+export function readBillingFraction(g: Record<string, unknown>): number {
+  const raw = g.roomFraction;
+  const fallback = groupSharedId(g) != null ? 0 : 1;
+  if (raw === null || raw === undefined) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 /**
