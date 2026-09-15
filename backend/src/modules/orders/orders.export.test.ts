@@ -161,10 +161,19 @@ function order(
   };
 }
 
-/** 假 client：findMany 直接返回预置订单。*/
-function fakeClient(orders: Array<Record<string, unknown>>) {
+/**
+ * 假 client：findMany 直接返回预置订单。
+ * sharedRoomMembers（B11）：跨单分房备注要批量查 loadSharedRoomPartnerLookup
+ * （client.sharedRoomMember.findMany）——本批订单没有 sharedRoomId 时该函数直接空转返回，
+ * 不会摸这张表，缺省 [] 对现有全部用例都是安全的；涉及共享房的用例按需传入。
+ */
+function fakeClient(
+  orders: Array<Record<string, unknown>>,
+  sharedRoomMembers: Array<Record<string, unknown>> = [],
+) {
   return {
     order: { findMany: vi.fn(async () => orders) },
+    sharedRoomMember: { findMany: vi.fn(async () => sharedRoomMembers) },
   } as never;
 }
 
@@ -489,6 +498,48 @@ describe('buildOrdersBySchedule · 房号 / 当日余房（房控核对列，口
     const roomNos = dataRows.map((r) => cell(header, r, '房号'));
     expect(roomNos[0]).toBe(roomNos[1]); // 同一个房号
     expect(roomNos[0]).not.toContain('½'); // 不因一侧份额 0 印半间后缀
+  });
+
+  it('astra B 路 finding B11：备注列叠加跨单合住伙伴单号，合住方已取消另标注', async () => {
+    const h4Item = () =>
+      hotelItem({ hotelId: 'h4', hotelName: '合住酒店二', roomTypeName: '大床房', capacity: 2, checkIn: '2026-06-10' });
+    const client = fakeClient(
+      [
+        order('ORD-SR-NOTE-A', [h4Item()], {
+          id: 'ord-sr-note-a',
+          notes: '客人指定靠窗',
+          passengers: [passenger('psna1')],
+          roomAssignment: {
+            roomGroups: [
+              {
+                id: 'gA',
+                hotelName: '合住酒店二',
+                roomType: '大床房',
+                passengerIds: ['psna1'],
+                roomFraction: 1,
+                sharedRoomId: 'sr2',
+              },
+            ],
+          },
+        }),
+      ],
+      // sr2 的完整成员表（含本单 + 一个有效伙伴 + 一个已取消伙伴）——批量查询不受本次
+      // 导出的 orders 批次限制，伙伴单可能压根不在本班次上。
+      [
+        { sharedRoomId: 'sr2', order: { orderNumber: 'ORD-SR-NOTE-A', status: 'PAID', deletedAt: null } },
+        { sharedRoomId: 'sr2', order: { orderNumber: 'ORD-SR-NOTE-B', status: 'PAID', deletedAt: null } },
+        { sharedRoomId: 'sr2', order: { orderNumber: 'ORD-SR-NOTE-C', status: 'CANCELLED', deletedAt: null } },
+      ],
+    );
+
+    const buf = await buildOrdersBySchedule('sched-1', client);
+    const { header, dataRows } = await parseSheet(buf);
+
+    expect(dataRows).toHaveLength(1);
+    const notes = cell(header, dataRows[0], '备注');
+    // 原有 order.notes 与跨单合住备注叠加（' / ' 连接），不是互相覆盖。
+    expect(notes).toContain('客人指定靠窗');
+    expect(notes).toContain('与 ORD-SR-NOTE-B、ORD-SR-NOTE-C（已取消） 合住');
   });
 });
 

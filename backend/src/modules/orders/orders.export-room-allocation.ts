@@ -381,6 +381,14 @@ export interface RoomNumberEntry {
   hotelId: string | null;
   hotelName: string;
   /**
+   * 入住日（YYYY-MM-DD）——编号作用域的一部分（astra finding N11）：roomNumberScopeKey
+   * 的 checkInDate 必填参数直接读它。调用方按入住日分桶调用 assignRoomNumbers（本文件与
+   * orders.export.ts 都是逐日期取一批 entries），这里仍要求每条 entry 自带日期，不依赖
+   * 「同一次调用内所有 entry 日期相同」这个隐含假设——显式传比隐含假设更不容易在未来的
+   * 重构里悄悄破坏。
+   */
+  checkIn: string;
+  /**
    * 跨单房间身份（room-identity.ts 的 roomIdentityKey：共享房恒定用 sharedRoomId，
    * 普通房组退回 `${orderId}:${groupId}`）；未分房为 null（走性别+容量打包）。
    */
@@ -652,6 +660,7 @@ export function buildRoomAllocationSheets(
       list.push({
         hotelId: placement.hotelId,
         hotelName,
+        checkIn: checkInStr,
         identityKey,
         // B10：排序键只在已分房时用得上（assignRoomNumbers 据此建确定性编号映射，不依赖
         // entries 数组本身的遍历顺序）。
@@ -675,7 +684,7 @@ export function buildRoomAllocationSheets(
       .flat()
       .filter((e): e is typeof e & { identityKey: string } => e.identityKey != null)
       .map((e) => ({
-        scope: roomNumberScopeKey(e.hotelId, e.hotelName),
+        scope: roomNumberScopeKey(e.hotelId, e.hotelName, e.checkIn),
         identityKey: e.identityKey,
         sortKey: e.identitySortKey ?? e.identityKey,
       })),
@@ -743,7 +752,7 @@ export function assignRoomNumbers(
     const maxByScope = new Map<string, number>();
     for (const e of entries) {
       if (!e.identityKey) continue;
-      const scope = roomNumberScopeKey(e.hotelId, e.hotelName);
+      const scope = roomNumberScopeKey(e.hotelId, e.hotelName, e.checkIn);
       const no = presortedIdentityNumbers.get(scopedIdentityMapKey(scope, e.identityKey));
       if (no != null) maxByScope.set(scope, Math.max(maxByScope.get(scope) ?? 0, no));
     }
@@ -753,7 +762,7 @@ export function assignRoomNumbers(
   const openRoomByScope = new Map<string, Map<PackGenderKey, { room: number; left: number }>>();
 
   for (const e of entries) {
-    const scope = roomNumberScopeKey(e.hotelId, e.hotelName);
+    const scope = roomNumberScopeKey(e.hotelId, e.hotelName, e.checkIn);
 
     if (e.identityKey) {
       // 预建映射命中优先；没命中（映射没传，或该身份不在这次预扫描范围内的防御性回落）

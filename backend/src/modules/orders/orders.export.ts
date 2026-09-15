@@ -30,6 +30,8 @@ import {
   buildIdentityNumberMap,
   buildVerifiedSplitPairKeys,
   roomNumberScopeKey,
+  loadSharedRoomPartnerLookup,
+  sharedRoomPartnerNote,
 } from './room-identity.js';
 import { nameWithTitle } from './orders.export-templates.js';
 import { formatOrderLegStatus, isReturnCurrentlyReleased } from './orders.leg-status.js';
@@ -275,6 +277,7 @@ function computeRoomColumns(
         passengerId: p.id,
         hotelId: placement.hotelId,
         hotelName,
+        checkIn: checkInStr,
         identityKey,
         // B10：排序键只在已分房时用得上，见下方 assignRoomNumbers 前的确定性编号映射构建。
         identitySortKey: group && identityKey ? roomIdentitySortKey(group, identityKey, order.orderNumber) : null,
@@ -297,7 +300,7 @@ function computeRoomColumns(
       .flat()
       .filter((e): e is typeof e & { identityKey: string } => e.identityKey != null)
       .map((e) => ({
-        scope: roomNumberScopeKey(e.hotelId, e.hotelName),
+        scope: roomNumberScopeKey(e.hotelId, e.hotelName, e.checkIn),
         identityKey: e.identityKey,
         sortKey: e.identitySortKey ?? e.identityKey,
       })),
@@ -320,6 +323,13 @@ function computeRoomColumns(
 function orderToRows(
   order: OrderForExport,
   roomColumns: Map<string, RoomColumnValues>,
+  /**
+   * §九跨单合住备注（B11 修复 · astra B 路遗漏）：本导出此前只写 order.notes，没有像
+   * 分房表 / 全岗总表那样叠加「与 FTM… 合住」——本导出 ADMIN/STAFF only（见
+   * orders.routes.ts 的 /export-by-schedule 路由鉴权），恒用内部版（带对方单号与「已取消」
+   * 标注），不需要 forAgent 分支。loadSharedRoomPartnerLookup 批量拉好后传入（无 N+1）。
+   */
+  sharedRoomPartnerLookup: Awaited<ReturnType<typeof loadSharedRoomPartnerLookup>>,
 ): OrderRow[] {
   // ── 航班信息（可能去程+回程多段）──
   // 按起飞时间升序排序后再拼路线/航班号串：订单行是录入顺序，
@@ -474,7 +484,12 @@ function orderToRows(
       transferInfo: transferParts.join(' + '),
       orderTotal,
       recordedAt,
-      notes: order.notes ?? '',
+      // B11：叠加跨单合住备注（内部版，带对方单号；合住方已取消/退款/软删另标「（已取消）」，
+      // 口径与分房表 buildRoomAllocationSheets / 全岗总表 orderToMasterRows 一致，共用
+      // sharedRoomPartnerNote，不各写一份）。
+      notes: [order.notes, group?.sharedRoomId ? sharedRoomPartnerNote(group.sharedRoomId, order.orderNumber, sharedRoomPartnerLookup) : '']
+        .filter(Boolean)
+        .join(' / '),
       ...(roomColumns.get(p.id) ?? NO_HOTEL_ROOM_COLUMNS),
     };
   });
@@ -552,10 +567,20 @@ export async function buildOrdersBySchedule(
   );
   const roomColumns = computeRoomColumns(orders, remainingLookup, verifiedSplitPairKeys);
 
+  // B11：批量拉出本次导出涉及的全部共享房各自的成员单号（无 N+1），口径同分房表 /
+  // 全岗总表——三个导出共用同一个 loadSharedRoomPartnerLookup + sharedRoomPartnerNote。
+  const sharedRoomIds = new Set<string>();
+  for (const order of orders) {
+    for (const g of parseRoomGroups(order.roomAssignment)) {
+      if (g.sharedRoomId) sharedRoomIds.add(g.sharedRoomId);
+    }
+  }
+  const sharedRoomPartnerLookup = await loadSharedRoomPartnerLookup(sharedRoomIds, client);
+
   const rows: OrderRow[] = [];
   for (const o of orders) {
     if (o.passengers.length === 0) continue;
-    rows.push(...orderToRows(o, roomColumns));
+    rows.push(...orderToRows(o, roomColumns, sharedRoomPartnerLookup));
   }
 
   // 本班实际乘客数 = 所有 SEAT_HOLDING 订单的乘客行数（即已展开的 rows 数量）

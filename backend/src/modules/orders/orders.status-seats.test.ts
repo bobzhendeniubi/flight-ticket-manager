@@ -69,6 +69,10 @@ vi.mock('../hotel-control/hotel-control.service.js', () => ({
   getHotelNightlyRemaining: mockGetHotelNightlyRemaining,
   getRandomTierAggregate: vi.fn(),
   randomStarTierLabel: vi.fn(),
+  // N4 修复：assertRestoreHotelCapacity 读余量前先加锁——桩与真模块导出对齐，
+  // 少一个键会在强制恢复/驳回回座路径炸成 "not a function"。
+  lockHotelBlockPeriodsWithinTx: vi.fn(),
+  lockRandomTierBlockPeriodsWithinTx: vi.fn(),
 }));
 
 import {

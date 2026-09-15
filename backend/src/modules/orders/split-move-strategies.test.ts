@@ -55,6 +55,7 @@ function ctx(over: Partial<SplitContext> = {}): SplitContext {
     keptUpgradeReturn: 0,
     autoDeriveRooms: true,
     splitPairToken: '',
+    sharedRoomItemIds: new Set(),
     ...over,
   };
 }

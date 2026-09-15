@@ -147,6 +147,7 @@ import {
   getHotelOversellCapRooms,
   getRandomTierAggregate,
   lockHotelBlockPeriodsWithinTx,
+  lockRandomTierBlockPeriodsWithinTx,
   randomStarTierLabel,
   type PhysicalFitViolation,
   type PhysicalOccupancyItem,
@@ -160,9 +161,10 @@ import {
   hasSharedRoomMembers,
   planRestoreSharedRoomReconciliation,
   planUnbind,
+  planUnbindMany,
   unbindInconsistentSharedRoomMembers,
   unbindSharedRoomMembersForItem,
-  type UnbindPlan,
+  type PlannedSharedRoomChange,
 } from '../hotel-control/shared-room-unbind.js';
 import {
   readRoomGroupArray,
@@ -1913,6 +1915,13 @@ type RescheduleCommittedContext = {
   newScheduleId: string;
   newCabin: import('@prisma/client').CabinClass;
   statusChanged: boolean;
+  /**
+   * 共享房解绑警告（B5 修复 · astra B 路遗漏）：事务提交时一并落进 scratch，
+   * 批量改班次「已生效但回包异常」的恢复分支能直接原样带出，不用缺省成空数组——
+   * 那份注释是错的：警告本就随事务一起提交、随 scratch 一起存进 WeakMap，
+   * 不是「事务已回滚/连接已断」才拿不到的东西。
+   */
+  sharedRoomWarnings: string[];
 };
 
 const rescheduleCommittedContexts = new WeakMap<object, RescheduleCommittedContext>();
@@ -5759,33 +5768,57 @@ export class OrderService {
       // 比未触及行更严格（限额内也直接拒），此处补上让两条路径口径一致。
       const hotelOversellCapRooms = await getHotelOversellCapRooms();
 
-      // 被计划触及（保留合住 或 计划解绑）的行——这些行改走 §五闸；下方 stays 的老前瞻
-      // 路径不理解跨单去重，必须排除，否则要么漏计（保留合住却没判容量）要么错判（解绑
-      // 后瞎猜一个 floor 值）。
+      // 被计划触及（保留合住 或 计划解绑）的行——这些行所在的**整间酒店**改走 §五闸；
+      // 下方 stays 的老前瞻路径不理解跨单去重，必须整间酒店排除（不能只排除触及的那几
+      // 行），否则两道闸各自看不到对方要新增的占用，分别都放行、合计却超限（CRITICAL
+      // 修复 · astra finding N3：同晚容量 1、容忍 0，共享触及行与未触及行分别需要 1 间，
+      // 两道闸各自看到「需求 1」都通过，最终实际需求 2）。
       const touchedItemIds = new Set<string>([
         ...reconciliationPlan.kept.map((k) => k.orderItemId),
-        ...reconciliationPlan.unboundPlans.map((p) => p.orderItemId),
+        ...reconciliationPlan.unboundItemIds,
       ]);
-      const unboundPlanByItemId = new Map(reconciliationPlan.unboundPlans.map((p) => [p.orderItemId, p]));
+      // N2 修复：不再是「每行各一份计划」的 Map，改成一份覆盖全部待解绑行的合成计划——
+      // 这里按行取回自己那部分 changes，nextRoomAssignment 全部行共用同一份（已经把这批
+      // 行的共享键一次性剥完，不存在「取哪一份」的问题）。
+      const unboundPlan = reconciliationPlan.unboundPlan;
+      // N3：容量闸按酒店合并的返回值——非空即容忍超售明细，随审计/响应一并带出。
+      const restoreSharedGateOversold: HotelStayOversellRecord[] = [];
+
+      // 全部住宿行先按酒店分组（不止触及的行）——同一晚容量闸只能对同一家酒店判一次，
+      // 该酒店只要有任一行触及共享成员，这家酒店本单**全部**住宿行都必须一起喂给 §五闸，
+      // 未触及的行不能被漏算，也不能被下面的老前瞻路径重复算一遍（无论 touchedItemIds
+      // 是否为空都要算，下面 §3 的 stays 老前瞻要用 gatedHotelIds 排除整间酒店）。
+      const roomTypeIds = [...new Set(hotelBearingItems.map((it) => it.hotelRoomTypeId as string))];
+      const roomTypes =
+        roomTypeIds.length > 0
+          ? await tx.hotelRoomType.findMany({
+              where: { id: { in: roomTypeIds } },
+              select: { id: true, hotelId: true },
+            })
+          : [];
+      const hotelIdByRoomType = new Map(roomTypes.map((rt) => [rt.id, rt.hotelId]));
+      const itemsByHotelAll = new Map<string, typeof hotelBearingItems>();
+      for (const it of hotelBearingItems) {
+        const hotelId = hotelIdByRoomType.get(it.hotelRoomTypeId as string);
+        if (!hotelId) continue; // 房型数据异常（理论不可达：建单闸已保证 hotelRoomTypeId 有效）
+        const list = itemsByHotelAll.get(hotelId) ?? [];
+        list.push(it);
+        itemsByHotelAll.set(hotelId, list);
+      }
+      const gatedHotelIdSet = new Set(
+        [...itemsByHotelAll.entries()]
+          .filter(([, items]) => items.some((it) => touchedItemIds.has(it.id)))
+          .map(([hotelId]) => hotelId),
+      );
+      // N4：按酒店 id 升序排序再逐个加锁（Set 保持插入顺序，插入顺序取决于
+      // hotelBearingItems 的行顺序，两笔并发恢复各自的行顺序不保证一致）——统一升序锁，
+      // 避免恢复 X（先锁 H1 后 H2）与恢复 Y（先锁 H2 后 H1）互相等待成环死锁。
+      const gatedHotelIdsSorted = [...gatedHotelIdSet].sort();
 
       if (touchedItemIds.size > 0) {
-        const touchedItems = hotelBearingItems.filter((it) => touchedItemIds.has(it.id));
-        const roomTypeIds = [...new Set(touchedItems.map((it) => it.hotelRoomTypeId as string))];
-        const roomTypes = await tx.hotelRoomType.findMany({
-          where: { id: { in: roomTypeIds } },
-          select: { id: true, hotelId: true },
-        });
-        const hotelIdByRoomType = new Map(roomTypes.map((rt) => [rt.id, rt.hotelId]));
-        const itemsByHotel = new Map<string, typeof touchedItems>();
-        for (const it of touchedItems) {
-          const hotelId = hotelIdByRoomType.get(it.hotelRoomTypeId as string);
-          if (!hotelId) continue; // 房型数据异常（理论不可达：建单闸已保证 hotelRoomTypeId 有效）
-          const list = itemsByHotel.get(hotelId) ?? [];
-          list.push(it);
-          itemsByHotel.set(hotelId, list);
-        }
         const restorePassengers = order.passengers.map((p) => ({ gender: p.gender }));
-        for (const [hotelId, items] of itemsByHotel) {
+        for (const hotelId of gatedHotelIdsSorted) {
+          const items = itemsByHotelAll.get(hotelId)!; // 该酒店本单**全部**住宿行，不只是触及的
           const hotelNightDates = [
             ...new Set(items.flatMap((it) => buildStayNightDates(it.hotelCheckIn, it.hotelCheckOut))),
           ].sort();
@@ -5796,8 +5829,10 @@ export class OrderService {
           // sharedRoomId 没变，走 nextSharedRooms 那一路去重）；计划解绑的行用 plan 算出的
           // 「解绑后」JSON（未落库，不能直接重读 DB）。
           const nextItems: PhysicalOccupancyItem[] = items.map((it) => {
-            const plan = unboundPlanByItemId.get(it.id);
-            const roomAssignment = plan?.nextRoomAssignment ?? order.roomAssignment ?? null;
+            const itemHasUnbindChanges = (unboundPlan?.changesByItemId.get(it.id)?.length ?? 0) > 0;
+            const roomAssignment = itemHasUnbindChanges
+              ? unboundPlan!.nextRoomAssignment ?? order.roomAssignment ?? null
+              : order.roomAssignment ?? null;
             return {
               id: it.id,
               hotelCheckIn: it.hotelCheckIn,
@@ -5816,18 +5851,16 @@ export class OrderService {
                 checkOut: k.checkOut,
                 activeMemberOrderIds: k.activeMemberOrderIdsAfter,
               })),
-            ...reconciliationPlan.unboundPlans
-              .filter((p) => items.some((it) => it.id === p.orderItemId))
-              .flatMap((p) =>
-                p.changes.map((c) => ({
-                  sharedRoomId: c.sharedRoomId,
-                  checkIn: c.checkIn,
-                  checkOut: c.checkOut,
-                  activeMemberOrderIds: c.activeMemberOrderIdsAfter,
-                })),
-              ),
+            ...items.flatMap((it) =>
+              (unboundPlan?.changesByItemId.get(it.id) ?? []).map((c) => ({
+                sharedRoomId: c.sharedRoomId,
+                checkIn: c.checkIn,
+                checkOut: c.checkOut,
+                activeMemberOrderIds: c.activeMemberOrderIdsAfter,
+              })),
+            ),
           ];
-          await assertHotelFitAfterChange(tx, hotelId, hotelNightDates, {
+          const gateViolations = await assertHotelFitAfterChange(tx, hotelId, hotelNightDates, {
             affectedOrderIds: [orderId],
             nextOrderItems: new Map([[orderId, nextItems]]),
             nextSharedRooms,
@@ -5835,24 +5868,36 @@ export class OrderService {
             // 恢复占座的共享触及行不该比未触及行更严格。
             options: { allowNonWorsening: true, maxOversellRooms: hotelOversellCapRooms },
           });
+          // N3：捕获容忍超售明细，不再丢弃——与下方 stays 闸的 hotelOversold 合并返回，
+          // 审计 hotelOversold 字段要能看到共享触及酒店的容忍明细，不能只有未触及酒店的。
+          if (gateViolations.length > 0) {
+            restoreSharedGateOversold.push({ hotelId, violations: gateViolations });
+          }
         }
         // 全部涉及酒店都过闸后，才真正落库解绑（astra finding A1/A2：落库必须在闸判定之后）。
-        for (const plan of reconciliationPlan.unboundPlans) {
-          await applyUnbindPlan(tx, plan, '恢复已取消订单时共享房状态不一致解绑');
+        // N2：一份合成计划，一次 applyUnbindPlan——不再是逐份顺序应用互相覆盖。
+        if (unboundPlan) {
+          await applyUnbindPlan(tx, unboundPlan, '恢复已取消订单时共享房状态不一致解绑');
         }
       }
 
       // ── 3. 酒店 / 随机档房量闸（建单同一把带行锁的事务内闸；订单仍是取消态，本单未计入占用）──
-      // 被 §五闸接管的行（touchedItemIds）不再进这条老前瞻路径——它按份额直接前瞻，
-      // 不理解共享房跨单去重。随机档行永远不带共享成员（共享房只认真实房型），不受影响。
+      // 被 §五闸接管的酒店（gatedHotelIds）整间排除、不再进这条老前瞻路径（N3）——不能只
+      // 排除触及的那几行：同酒店未触及的行如果仍走这条不理解共享房去重的老前瞻，会与上面
+      // §五闸各自独立判定、互相看不到对方要新增的占用，合计可能超限。随机档行（无
+      // hotelRoomTypeId）恒不在 gatedHotelIds 里（共享房只认真实房型），不受影响。
       const stays: ProspectiveHotelStay[] = order.items
-        .filter(
-          (it) =>
-            (it.kind === OrderItemKind.HOTEL || it.kind === OrderItemKind.BUNDLE) &&
-            it.hotelCheckIn != null &&
-            it.hotelCheckOut != null &&
-            !touchedItemIds.has(it.id),
-        )
+        .filter((it) => {
+          if (
+            !(it.kind === OrderItemKind.HOTEL || it.kind === OrderItemKind.BUNDLE) ||
+            it.hotelCheckIn == null ||
+            it.hotelCheckOut == null
+          ) {
+            return false;
+          }
+          const hotelId = it.hotelRoomTypeId ? hotelIdByRoomType.get(it.hotelRoomTypeId) : undefined;
+          return !hotelId || !gatedHotelIdSet.has(hotelId);
+        })
         .map((it) => ({
           hotelRoomTypeId: it.hotelRoomTypeId,
           hotelCheckIn: it.hotelCheckIn,
@@ -5861,12 +5906,16 @@ export class OrderService {
           randomStarTier: it.randomStarTier,
         }));
       // hotelOversellCapRooms 已在本方法上面提前算好（供 §五闸复用），这里不再重复查询。
-      const hotelOversold = await assertHotelStaysFitWithinTx(
-        tx,
-        stays,
-        order.passengers.map((p) => ({ gender: p.gender ?? undefined })),
-        { maxOversellRooms: hotelOversellCapRooms },
-      );
+      // N3：与 §五闸（restoreSharedGateOversold）的容忍明细合并，不再只汇报老前瞻这一路。
+      const hotelOversold = [
+        ...restoreSharedGateOversold,
+        ...(await assertHotelStaysFitWithinTx(
+          tx,
+          stays,
+          order.passengers.map((p) => ({ gender: p.gender ?? undefined })),
+          { maxOversellRooms: hotelOversellCapRooms },
+        )),
+      ];
       const randomTierOversold = await assertRandomTierStaysFitWithinTx(tx, stays, {
         maxOversellRooms: RANDOM_TIER_INTERNAL_NO_CAP,
       });
@@ -7848,9 +7897,12 @@ export class OrderService {
                 orderNumber: currentItem.order.orderNumber,
                 ok: true,
                 notice: '已生效（回包异常）',
-                // 回读分支拿不到原始事务内算出的 warnings（事务已回滚/连接已断），
-                // 缺省空数组——不臆造，也不让整条回读因此失败。
-                warnings: [],
+                // B5 修复：事务提交时 scratch（= context）已经把 sharedRoomWarnings 带出来了，
+                // 不是「事务已回滚/连接已断才拿不到」——原样带出，不能再缺省成空数组静默吞掉
+                // 共享房解绑警告（运营会看不到「该房组原与他单合住」之类的提示）。
+                // `?? []` 只防御老单测 mock 没给这个字段（本身该有）时不要把 undefined 塞进
+                // 响应数组，不是「正常情况下会缺失」的语义。
+                warnings: context.sharedRoomWarnings ?? [],
                 audit: {
                   orderNumber: currentItem.order.orderNumber,
                   orderItemId: context.orderItemId,
@@ -9158,6 +9210,49 @@ export class OrderService {
           })
         : [];
     const roomTypeById = new Map(roomTypes.map((roomType) => [roomType.id, roomType]));
+
+    // N4 修复（CRITICAL）：先统一按「作用域类型 + 作用域 id」升序对全部涉及的酒店 /
+    // 随机档加锁，再读余量判定——原实现读之前完全没有加锁，两张不同订单各自强制恢复、
+    // 各自在事务内看到「自己占 1、对方仍取消」的旧快照，容量 1 时可以同时通过（Order
+    // 行锁不能让不同订单互斥）。行锁必须先于读发生；且跨酒店/随机档的加锁顺序必须
+    // 全局一致（不能按本单行顺序逐个现锁现读），否则两笔并发恢复各自以不同顺序锁不同
+    // 酒店仍可能相互等待成环死锁。
+    const hotelScopeNightDates = new Map<string, Set<string>>();
+    const randomTierScopeNightDates = new Map<number, Set<string>>();
+    for (const item of hotelRows) {
+      const nightDates = buildStayNightDates(item.hotelCheckIn!, item.hotelCheckOut!);
+      if (nightDates.length === 0) continue;
+      const roomType = item.hotelRoomTypeId ? roomTypeById.get(item.hotelRoomTypeId) : undefined;
+      const randomTier = item.randomStarTier ?? roomType?.hotel.randomTierPlaceholder ?? null;
+      if (randomTier != null) {
+        const set = randomTierScopeNightDates.get(randomTier) ?? new Set<string>();
+        for (const d of nightDates) set.add(d);
+        randomTierScopeNightDates.set(randomTier, set);
+      } else if (roomType) {
+        const set = hotelScopeNightDates.get(roomType.hotelId) ?? new Set<string>();
+        for (const d of nightDates) set.add(d);
+        hotelScopeNightDates.set(roomType.hotelId, set);
+      }
+    }
+    type RestoreLockScope = { kind: 'hotel'; id: string } | { kind: 'random'; id: number };
+    const lockScopes: RestoreLockScope[] = [
+      ...[...hotelScopeNightDates.keys()].map((id): RestoreLockScope => ({ kind: 'hotel', id })),
+      ...[...randomTierScopeNightDates.keys()].map((id): RestoreLockScope => ({ kind: 'random', id })),
+    ].sort((a, b) => {
+      if (a.kind !== b.kind) return a.kind < b.kind ? -1 : 1; // 'hotel' 固定排在 'random' 前
+      return String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0;
+    });
+    for (const scope of lockScopes) {
+      if (scope.kind === 'hotel') {
+        await lockHotelBlockPeriodsWithinTx(tx, scope.id, [...hotelScopeNightDates.get(scope.id)!].sort());
+      } else {
+        await lockRandomTierBlockPeriodsWithinTx(
+          tx,
+          scope.id,
+          [...randomTierScopeNightDates.get(scope.id)!].sort(),
+        );
+      }
+    }
 
     const shortage = (result: { remaining: number[]; block: number[]; hasBlock: boolean }): boolean =>
       result.hasBlock &&
@@ -10708,22 +10803,32 @@ export class OrderService {
             // 闸判定用计划算出的 after 状态，通过后才统一 applyUnbindPlan——不能再用
             // Math.max(1, roomsBilled) 塞进不理解共享去重的老式前瞻：一行可能同时承载两个
             // 不同共享房的零份额组，「每行至少一间」会漏算成只加 1 间。
-            const plansByItemId = new Map<string, UnbindPlan>();
-            for (const row of hotelRows) {
-              if (!row.hotelRoomTypeId) continue;
-              const plan = await planUnbind(tx, { orderId, orderItemId: row.id });
-              if (plan.changes.length === 0) continue;
-              plansByItemId.set(row.id, plan);
-              sharedRoomWarnings.push(
-                ...formatUnbindWarning(
-                  plan.changes.map((c) => ({
-                    sharedRoomId: c.sharedRoomId,
-                    roomFraction: c.roomFraction,
-                    partnerOrderNumbers: c.partnerOrderNumbers,
-                  })),
-                  actor.role === UserRole.AGENT ? 'agent' : 'internal',
-                ),
-              );
+            // N2 修复：全部触及行一次性合成一份计划（planUnbindMany），不再逐行各调
+            // planUnbind 再各自记进 Map——那样多行会各自从同一份原始 JSON 出发，后应用的
+            // 计划把先解绑行的共享键写回来。
+            const unbindCandidateItemIds = hotelRows
+              .filter((row) => row.hotelRoomTypeId)
+              .map((row) => row.id);
+            const combinedUnbindPlan =
+              unbindCandidateItemIds.length > 0
+                ? await planUnbindMany(tx, { orderId, orderItemIds: unbindCandidateItemIds })
+                : null;
+            const plansByItemId = new Map<string, PlannedSharedRoomChange[]>();
+            if (combinedUnbindPlan) {
+              for (const [itemId, itemChanges] of combinedUnbindPlan.changesByItemId) {
+                if (itemChanges.length === 0) continue;
+                plansByItemId.set(itemId, itemChanges);
+                sharedRoomWarnings.push(
+                  ...formatUnbindWarning(
+                    itemChanges.map((c) => ({
+                      sharedRoomId: c.sharedRoomId,
+                      roomFraction: c.roomFraction,
+                      partnerOrderNumbers: c.partnerOrderNumbers,
+                    })),
+                    actor.role === UserRole.AGENT ? 'agent' : 'internal',
+                  ),
+                );
+              }
             }
             const shiftDay = (d: Date): Date => new Date(d.getTime() + deltaDays * 24 * 60 * 60 * 1000);
             const shifted = hotelRows.map((row) => ({
@@ -10770,6 +10875,9 @@ export class OrderService {
                 .filter(([, rows]) => rows.some((s) => plansByItemId.has(s.row.id)))
                 .map(([hotelId]) => hotelId),
             );
+            // N4：升序遍历再加锁——与 restoreCancelledOrder 同款理由，避免两笔并发改期各自
+            // 以不同顺序锁同一批酒店造成死锁。
+            const gatedHotelIdsSorted = [...gatedHotelIds].sort();
 
             try {
               if (gatedHotelIds.size > 0) {
@@ -10777,7 +10885,7 @@ export class OrderService {
                   where: { id: orderId },
                   select: { roomAssignment: true },
                 });
-                for (const hotelId of gatedHotelIds) {
+                for (const hotelId of gatedHotelIdsSorted) {
                   const rows = byHotel.get(hotelId)!;
                   const unionDates = [
                     ...new Set(
@@ -10792,8 +10900,11 @@ export class OrderService {
                   ].sort();
                   await lockHotelBlockPeriodsWithinTx(tx, hotelId, unionDates);
                   const nextItems: PhysicalOccupancyItem[] = rows.map((s) => {
-                    const plan = plansByItemId.get(s.row.id);
-                    const roomAssignment = plan?.nextRoomAssignment ?? orderForGate?.roomAssignment ?? null;
+                    // combinedUnbindPlan.nextRoomAssignment 是这批行合成的**一份**最终 JSON
+                    // （N2）：只要本行有变更就用它，不必也不能按行各取一份。
+                    const roomAssignment = plansByItemId.has(s.row.id)
+                      ? combinedUnbindPlan!.nextRoomAssignment ?? orderForGate?.roomAssignment ?? null
+                      : orderForGate?.roomAssignment ?? null;
                     return {
                       id: s.row.id,
                       hotelCheckIn: s.newCheckIn,
@@ -10803,16 +10914,14 @@ export class OrderService {
                       order: { id: orderId, roomAssignment, passengers: orderPassengers },
                     };
                   });
-                  const nextSharedRooms: SharedRoomAfterState[] = rows.flatMap((s) => {
-                    const plan = plansByItemId.get(s.row.id);
-                    if (!plan) return [];
-                    return plan.changes.map((c) => ({
+                  const nextSharedRooms: SharedRoomAfterState[] = rows.flatMap((s) =>
+                    (plansByItemId.get(s.row.id) ?? []).map((c) => ({
                       sharedRoomId: c.sharedRoomId,
                       checkIn: c.checkIn,
                       checkOut: c.checkOut,
                       activeMemberOrderIds: c.activeMemberOrderIdsAfter,
-                    }));
-                  });
+                    })),
+                  );
                   await assertHotelFitAfterChange(tx, hotelId, unionDates, {
                     affectedOrderIds: [orderId],
                     nextOrderItems: new Map([[orderId, nextItems]]),
@@ -10859,8 +10968,9 @@ export class OrderService {
               throw err;
             }
             // 全部涉及酒店都过闸后，才真正落库解绑（astra finding A1：落库必须在闸判定之后）。
-            for (const plan of plansByItemId.values()) {
-              await applyUnbindPlan(tx, plan, '机票改期连带平移酒店日期解绑');
+            // N2：一份合成计划，一次 applyUnbindPlan——不再是逐行 Map 顺序应用互相覆盖。
+            if (combinedUnbindPlan && combinedUnbindPlan.changes.length > 0) {
+              await applyUnbindPlan(tx, combinedUnbindPlan, '机票改期连带平移酒店日期解绑');
             }
             for (const s of shifted) {
               const nights = s.newCheckOut
@@ -15146,6 +15256,12 @@ export class OrderService {
           hotelCheckOut: true,
           roomsBilled: true,
           randomStarTier: true,
+          // N8 修复：报价依赖字段也要纳入锁后版本校验——差价（feeCny/selfServiceFee）
+          // 与成本快照全部算自锁前的 item.unitPrice；换酒店与「改结算价」并发时，锁后
+          // 现有字段（酒店/日期/份额）都没变，仍会用锁前的旧单价算出一笔错误差价
+          // （代理改期先读旧价，运营改结算价先提交，代理拿到锁后所有比较字段相同，
+          // 仍按旧价计差价）。
+          unitPrice: true,
         },
       });
       if (
@@ -15155,9 +15271,10 @@ export class OrderService {
         lockedItem.randomStarTier !== item.randomStarTier ||
         (lockedItem.hotelCheckIn?.getTime() ?? null) !== (item.hotelCheckIn?.getTime() ?? null) ||
         (lockedItem.hotelCheckOut?.getTime() ?? null) !== (item.hotelCheckOut?.getTime() ?? null) ||
-        Number(lockedItem.roomsBilled ?? 1) !== Number(item.roomsBilled ?? 1)
+        Number(lockedItem.roomsBilled ?? 1) !== Number(item.roomsBilled ?? 1) ||
+        Number(lockedItem.unitPrice) !== Number(item.unitPrice)
       ) {
-        throw new ConflictError('该行已被并发修改（酒店/日期/份额已变化），请刷新后重试换酒店');
+        throw new ConflictError('该行已被并发修改（酒店/日期/份额/单价已变化），请刷新后重试换酒店');
       }
 
       // ── §八「换酒店」：该行若有共享成员，先解绑（钱不动，物理按普通房组 1 间计）──────
@@ -15960,6 +16077,9 @@ export class OrderService {
           hotelCheckOut: true,
           roomsBilled: true,
           randomStarTier: true,
+          // N8 修复：报价依赖字段也要纳入锁后版本校验，同 swapItemHotel——差价算自锁前的
+          // item.unitPrice，锁后其它字段都没变时仍可能用旧单价算出一笔错误差价。
+          unitPrice: true,
         },
       });
       if (
@@ -15969,9 +16089,10 @@ export class OrderService {
         lockedItem.randomStarTier !== item.randomStarTier ||
         (lockedItem.hotelCheckIn?.getTime() ?? null) !== (item.hotelCheckIn?.getTime() ?? null) ||
         (lockedItem.hotelCheckOut?.getTime() ?? null) !== (item.hotelCheckOut?.getTime() ?? null) ||
-        Number(lockedItem.roomsBilled ?? 1) !== Number(item.roomsBilled ?? 1)
+        Number(lockedItem.roomsBilled ?? 1) !== Number(item.roomsBilled ?? 1) ||
+        Number(lockedItem.unitPrice) !== Number(item.unitPrice)
       ) {
-        throw new ConflictError('该行已被并发修改（酒店/日期/份额已变化），请刷新后重试改期');
+        throw new ConflictError('该行已被并发修改（酒店/日期/份额/单价已变化），请刷新后重试改期');
       }
 
       // ── §八「酒店改期」：该行若有共享成员，先解绑（新旧日期不同，共享房 checkIn/checkOut
@@ -18732,6 +18853,23 @@ export class OrderService {
       roomSplitByItem.set(entry.itemId, roundHalfGrid(entry.roomsBilledToMove));
     }
 
+    // 2a'. 挂着共享房组（带 sharedRoomId）的订单行 id 集合（HIGH 修复 · astra finding N6）：
+    // moveHotel 据此跳过 splitPairKey（共享房不吃配对键机制，见 SplitContext 字段注释）；
+    // 下面「3c. 共享房组分配计划」也据此推算行级搬走间数。整单一次性算好，全程复用。
+    const sharedRoomItemIds = new Set<string>();
+    for (const group of readRoomGroups(order.roomAssignment)) {
+      const groupSharedRoomId =
+        typeof group.raw.sharedRoomId === 'string' && group.raw.sharedRoomId.length > 0
+          ? group.raw.sharedRoomId
+          : null;
+      if (!groupSharedRoomId) continue;
+      const attributedItemId =
+        typeof group.raw.orderItemId === 'string' && group.raw.orderItemId.length > 0
+          ? group.raw.orderItemId
+          : null;
+      if (attributedItemId) sharedRoomItemIds.add(attributedItemId);
+    }
+
     // 2b. upgradeSplit：**一行一腿**（entry.toMove 直接给这一行搬几个升舱位）。
     //     旧形状（outboundToMove / returnToMove 两个字段一起发）继续兼容：按该行实际归属的
     //     航段取对应字段。航段判定走 determineFlightLegItems（按班次出发时刻），不再数下标 ——
@@ -18754,6 +18892,7 @@ export class OrderService {
       keptUpgradeOutbound: 0,
       keptUpgradeReturn: 0,
       splitPairToken: input.requestToken,
+      sharedRoomItemIds,
     });
     for (const entry of input.upgradeSplit ?? []) {
       if (upgradeSplitByItem.has(entry.itemId)) {
@@ -18828,6 +18967,7 @@ export class OrderService {
       keptUpgradeReturn,
       // 住宿行被劈成两个半间时，两侧写同一个配对键 —— 房控据此把跨单的两个半间配回一间。
       splitPairToken: input.requestToken,
+      sharedRoomItemIds,
     });
 
     // ── 3. 建新单：抄转正建单的事务内建单法，但**不重新定价不扣座**（行是搬/拆来的）──
@@ -18890,6 +19030,128 @@ export class OrderService {
       },
       select: { id: true, orderNumber: true },
     });
+
+    // ── 3c. 共享房组分配计划（CRITICAL 修复 · astra finding N6）───────────────────────
+    // 必须在步骤 4（按行搬/拆）之前算好，且步骤 4 读的 roomSplitByItem 必须由这份计划
+    // 反哺——原实现顺序反了：步骤 4 先用完全不理解共享房的 moveHotel（显式 roomSplit 或
+    // 按人头 auto-derive）独立拆行落库，共享组的 kept/moved 份额要到（原来排在步骤 4
+    // **之后**的）4a-pre 才另算一遍。两套独立算法在混合共享组场景可以算出完全不一致的
+    // 结果：两人共享组份额 1，自动拆走一人，行级被 moveHotel 按人头 auto-derive 成
+    // 0.5/0.5，共享份额却按「默认留源」算成 1/0——行级 roomsBilled 与共享 JSON/成员表
+    // 从此对不上。
+    //
+    // 改法：先扫一遍本单全部共享房组，按归属行（orderItemId）聚合成「整组留守 / 整组
+    // 拆出 / 混合」三态，混合态复用 splitMixedSharedRoomGroup（与步骤 6 同一个纯函数，
+    // 只调一次，计划存进 mixedSharedGroupPlanByGroup 给步骤 4b/6 复用，不重复算出现口径
+    // 分叉）；再按行汇总出「这一行总共要搬走几间」，回写进 roomSplitByItem——moveHotel
+    // 读的就是这个 Map，行级搬走间数从此与共享计划强制对齐，不再是两条各算各的算法。
+    //
+    // 一行两个混合共享组同时需要显式份额时 fail-closed 拒绝：roomSplit 的形状是「一行
+    // 一个数」，没法分别指定给行上的两个组，硬要各自套用同一个数会把它重复消费两次
+    // （两组共搬的份额之和超过整行实际搬走的间数）——运营应先在分房编辑器把这些组理清楚
+    // （挪到不同行）再拆单，不能让系统悄悄猜一个分配方案。
+    //
+    // 用房组的原始 JS 对象引用（group.raw）当 key：`order.roomAssignment` 在本步骤与
+    // 步骤 6 之间不会被重新赋值/重新解析（4b 只改 SharedRoomMember/OrderItem 表，
+    // 步骤 5 只改 Passenger 表），两次 readRoomGroups 拿到的是同一批底层对象，按引用能
+    // 精确对上，不用另造一套稳定 id。
+    const mixedSharedGroupPlanByGroup = new Map<
+      Record<string, unknown>,
+      {
+        sharedRoomId: string;
+        keptPassengerIds: string[];
+        movedPassengerIds: string[];
+        keptFraction: number;
+        movedFraction: number;
+        kept: Record<string, unknown>;
+        moved: Record<string, unknown>;
+      }
+    >();
+    const postSplitFractionByPassenger = new Map<string, number>();
+    // N6：整组随人搬去新单的共享房 id——成员表的 orderId/orderItemId 归属确实变了
+    // （步骤 4b 会把这些成员整体改指到新单），CAS 版本必须跟着涨，不能只在 mixed 分支涨
+    // （见下方版本递增点，与 mixedSharedGroupPlanByGroup 涉及的房间合并处理）。
+    const wholeMovedSharedRoomIds = new Set<string>();
+    {
+      const sharedGroupsByItemId = new Map<
+        string,
+        Array<{
+          group: ReturnType<typeof readRoomGroups>[number];
+          sharedRoomId: string;
+          srcFraction: number;
+          movedCount: number;
+          totalCount: number;
+        }>
+      >();
+      for (const group of readRoomGroups(order.roomAssignment)) {
+        if (group.passengerIds.length === 0) continue;
+        const groupSharedRoomId =
+          typeof group.raw.sharedRoomId === 'string' && group.raw.sharedRoomId.length > 0
+            ? group.raw.sharedRoomId
+            : null;
+        if (!groupSharedRoomId) continue;
+        const attributedItemId =
+          typeof group.raw.orderItemId === 'string' && group.raw.orderItemId.length > 0
+            ? group.raw.orderItemId
+            : null;
+        if (!attributedItemId) continue; // §三强制归属，无归属的共享组理论不可达，跳过不参与行级推算
+        const movedCount = group.passengerIds.filter((id) => movedIdSet.has(id)).length;
+        const rawFraction = group.raw.roomFraction == null ? 1 : Number(group.raw.roomFraction);
+        const list = sharedGroupsByItemId.get(attributedItemId) ?? [];
+        list.push({
+          group,
+          sharedRoomId: groupSharedRoomId,
+          srcFraction: Number.isFinite(rawFraction) ? rawFraction : 1,
+          movedCount,
+          totalCount: group.passengerIds.length,
+        });
+        sharedGroupsByItemId.set(attributedItemId, list);
+      }
+
+      for (const [itemId, groups] of sharedGroupsByItemId) {
+        const touchedGroups = groups.filter((g) => g.movedCount > 0);
+        if (touchedGroups.length === 0) continue; // 本行全部共享组整组留守，不影响行级搬走量
+
+        const mixedGroups = touchedGroups.filter((g) => g.movedCount < g.totalCount);
+        if (mixedGroups.length > 1) {
+          throw new BadRequestError(
+            `订单行 ${itemId} 同时挂了 ${mixedGroups.length} 个需要部分拆分的共享房组，` +
+              '请先在跨单分房工作台把这些房组分到不同订单行，再拆单。',
+          );
+        }
+
+        let totalMovedFraction = 0;
+        for (const entry of touchedGroups) {
+          const { group, sharedRoomId, srcFraction, movedCount, totalCount } = entry;
+          if (movedCount === totalCount) {
+            // 整组拆出：全部份额随行搬走，不用调用拆分函数。
+            totalMovedFraction = round2(totalMovedFraction + srcFraction);
+            wholeMovedSharedRoomIds.add(sharedRoomId);
+            continue;
+          }
+          // 混合（本行至多一个，上面已保证）：读该行显式 roomSplit 当移出方份额。
+          const movedInGroup = group.passengerIds.filter((id) => movedIdSet.has(id));
+          const keptInGroup = group.passengerIds.filter((id) => !movedIdSet.has(id));
+          const explicitMovedFraction = roomSplitByItem.get(itemId) ?? null;
+          const halves = splitMixedSharedRoomGroup(group, movedIdSet, explicitMovedFraction);
+          mixedSharedGroupPlanByGroup.set(group.raw, {
+            sharedRoomId,
+            keptPassengerIds: keptInGroup,
+            movedPassengerIds: movedInGroup,
+            keptFraction: halves.keptFraction,
+            movedFraction: halves.movedFraction,
+            kept: halves.kept,
+            moved: halves.moved,
+          });
+          for (const pid of keptInGroup) postSplitFractionByPassenger.set(pid, halves.keptFraction);
+          for (const pid of movedInGroup) postSplitFractionByPassenger.set(pid, halves.movedFraction);
+          totalMovedFraction = round2(totalMovedFraction + halves.movedFraction);
+        }
+        // 行级注入：用共享计划算出的总量覆盖 roomSplitByItem——moveHotel 读的就是这个
+        // Map，行级搬走间数从此与共享计划强制对齐（不再各算各的）。
+        roomSplitByItem.set(itemId, totalMovedFraction);
+      }
+    }
 
     // ── 4. 按行搬/拆（unitPrice 全冻结；口径全在 split-move-strategies，内核只管落库）──
     // 拆前逐班次舱位数量账 + 升舱位账 + 房数账 + 成本账（守恒断言基准）。
@@ -18966,64 +19228,6 @@ export class OrderService {
         select: { id: true },
       });
       splitItemIdMap.set(item.id, createdRow.id);
-    }
-
-    // ── 4a-pre. 预判混合共享房组的拆分方案（HIGH 修复 · astra finding A7 ③）──────────
-    // 必须在 4b 之前算好：4b 的「源行是 NONE、搬走份额只能是 0」守恒闸原先直接拿
-    // SharedRoomMember 表里**拆分前**的原始 roomFraction 求和当"搬走份额"——一个混合共享
-    // 房组（部分乘客拆出、部分留守）按 §八「份额默认留源单」新口径，移出方的份额本该
-    // 归 0（除非 roomSplit 显式指定），但那笔判断在这里还看不到，闸只会拿到"拆分前的
-    // 合计"，把本该放行的 0 份额移出误判成非零而拒绝。这里提前把每个混合共享组的 kept/
-    // moved 份额算好（与步骤 6 用的是同一个纯函数），4b 与 6 都直接查这张表，不重复算、
-    // 也不会因为两处各自计算而出现口径分叉。
-    // 用房组的原始 JS 对象引用（group.raw）当 key：`order.roomAssignment` 在 4a-pre 与
-    // 步骤 6 之间不会被重新赋值/重新解析（4b 只改 SharedRoomMember/OrderItem 表，
-    // 步骤 5 只改 Passenger 表），两次 readRoomGroups 拿到的是同一批底层对象，按引用能
-    // 精确对上，不用另造一套稳定 id。
-    const mixedSharedGroupPlanByGroup = new Map<
-      Record<string, unknown>,
-      {
-        sharedRoomId: string;
-        keptPassengerIds: string[];
-        movedPassengerIds: string[];
-        keptFraction: number;
-        movedFraction: number;
-        kept: Record<string, unknown>;
-        moved: Record<string, unknown>;
-      }
-    >();
-    const postSplitFractionByPassenger = new Map<string, number>();
-    for (const group of readRoomGroups(order.roomAssignment)) {
-      if (group.passengerIds.length === 0) continue;
-      const groupSharedRoomId =
-        typeof group.raw.sharedRoomId === 'string' && group.raw.sharedRoomId.length > 0
-          ? group.raw.sharedRoomId
-          : null;
-      if (!groupSharedRoomId) continue;
-      const movedInGroup = group.passengerIds.filter((id) => movedIdSet.has(id));
-      if (movedInGroup.length === 0 || movedInGroup.length === group.passengerIds.length) {
-        continue; // 整组留守 / 整组拆出：份额跟着整组走，不用重算，也不进「混合」计划表。
-      }
-      const keptInGroup = group.passengerIds.filter((id) => !movedIdSet.has(id));
-      const attributedItemId =
-        typeof group.raw.orderItemId === 'string' && group.raw.orderItemId.length > 0
-          ? group.raw.orderItemId
-          : null;
-      const explicitMovedFraction = attributedItemId
-        ? (roomSplitByItem.get(attributedItemId) ?? null)
-        : null;
-      const halves = splitMixedSharedRoomGroup(group, movedIdSet, explicitMovedFraction);
-      mixedSharedGroupPlanByGroup.set(group.raw, {
-        sharedRoomId: groupSharedRoomId,
-        keptPassengerIds: keptInGroup,
-        movedPassengerIds: movedInGroup,
-        keptFraction: halves.keptFraction,
-        movedFraction: halves.movedFraction,
-        kept: halves.kept,
-        moved: halves.moved,
-      });
-      for (const pid of keptInGroup) postSplitFractionByPassenger.set(pid, halves.keptFraction);
-      for (const pid of movedInGroup) postSplitFractionByPassenger.set(pid, halves.movedFraction);
     }
 
     // ── 4b. 共享房成员随人搬（§八 E）：SharedRoomMember 是真值源（> 订单 JSON，见
@@ -19172,14 +19376,20 @@ export class OrderService {
           { ...group, raw: sharedPlan.moved, passengerIds: movedInGroup },
         ];
       }
-      const halves = splitMixedRoomGroup(group, movedIdSet, input.requestToken);
+      const halves = splitMixedRoomGroup(group, movedIdSet, orderId, input.requestToken);
       return [
         { ...group, raw: halves.kept, passengerIds: keptInGroup },
         { ...group, raw: halves.moved, passengerIds: movedInGroup },
       ];
     });
-    if (mixedSharedGroupPlanByGroup.size > 0 && sharedRoomMemberDelegate) {
-      const touchedSharedRoomIds = new Set<string>();
+    if ((mixedSharedGroupPlanByGroup.size > 0 || wholeMovedSharedRoomIds.size > 0) && sharedRoomMemberDelegate) {
+      // N6：版本递增覆盖两类真正改变了这间房状态的场景——不再只认 mixed 分支：
+      //   · mixed（份额变了）：份额重写进 SharedRoomMember.roomFraction；
+      //   · 整组随人搬（wholeMovedSharedRoomIds）：份额没变，但成员的 orderId/orderItemId
+      //     已在步骤 4b 改指到新单——这间房「谁是成员、挂在哪张单上」变了，CAS 语义上
+      //     同样是「这间房被改过」，version 必须跟着涨（原实现只在 mixed 分支涨，整组
+      //     迁移的情形漏了，见 astra B 路 finding N9 尾注）。
+      const touchedSharedRoomIds = new Set<string>(wholeMovedSharedRoomIds);
       for (const split of mixedSharedGroupPlanByGroup.values()) {
         touchedSharedRoomIds.add(split.sharedRoomId);
         if (split.keptPassengerIds.length > 0) {
@@ -19195,8 +19405,9 @@ export class OrderService {
           });
         }
       }
-      // SharedRoom.version +1（astra finding A7 ②）：成员份额变了，与跨单分房工作台
-      // 保存的 CAS 协议同一套语义——version 是"这间房的成员/份额有没有变过"的信号。
+      // SharedRoom.version +1（astra finding A7 ②，整组迁移场景 · astra N6）：成员份额
+      // 或成员归属变了，与跨单分房工作台保存的 CAS 协议同一套语义——version 是"这间房的
+      // 成员/份额有没有变过"的信号。
       for (const sharedRoomId of touchedSharedRoomIds) {
         await tx.sharedRoom.update({ where: { id: sharedRoomId }, data: { version: { increment: 1 } } });
       }
@@ -24253,8 +24464,9 @@ function buildSplitSuggestionContext(input: {
     movedUpgradeReturn: 0,
     keptUpgradeOutbound: 0,
     keptUpgradeReturn: 0,
-    // 预检不落库 → 不写住宿行配对键（那是执行段的事）。
+    // 预检不落库 → 不写住宿行配对键（那是执行段的事），共享房集合同理留空。
     splitPairToken: '',
+    sharedRoomItemIds: new Set(),
   });
 }
 
@@ -24272,6 +24484,8 @@ function buildSplitContext(input: {
   keptUpgradeReturn: number;
   /** 住宿行劈半时两侧共用的配对键令牌（= requestToken）；预检建议上下文传空串。 */
   splitPairToken: string;
+  /** N6：挂着共享房组的订单行 id 集合——moveHotel 据此跳过 splitPairKey。 */
+  sharedRoomItemIds: ReadonlySet<string>;
 }): SplitContext {
   const { occupancy } = input;
   return {
@@ -24294,6 +24508,7 @@ function buildSplitContext(input: {
     keptUpgradeReturn: input.keptUpgradeReturn,
     autoDeriveRooms: input.autoDeriveRooms,
     splitPairToken: input.splitPairToken,
+    sharedRoomItemIds: input.sharedRoomItemIds,
   };
 }
 
@@ -24352,6 +24567,7 @@ function collectSplitUpgradeItems(
 function splitMixedRoomGroup(
   group: { raw: Record<string, unknown>; passengerIds: string[] },
   movedIdSet: ReadonlySet<string>,
+  sourceOrderId: string,
   pairToken: string,
 ): { kept: Record<string, unknown>; moved: Record<string, unknown> } {
   const movedIds = group.passengerIds.filter((id) => movedIdSet.has(id));
@@ -24369,9 +24585,17 @@ function splitMixedRoomGroup(
     typeof group.raw.id === 'string' && group.raw.id
       ? group.raw.id
       : `pax:${[...group.passengerIds].sort().join('|')}`;
-  // 配对键：两个半组写同一个 key，房控按 key 把它们配回一间（不看性别 —— 夫妻拼房
-  // 被拆开后正是「一男一女各半间」，按性别配对会算成两间）。
-  const splitPairKey = `${baseId}:${pairToken}`;
+  // 配对键（HIGH 修复 · astra finding N7）：`sp2:` 前缀 + 源单 id + baseId + 拆单令牌——
+  // 旧格式只有 `${baseId}:${token}` 两段，baseId 可能是前端本地生成的房组 id（不保证全局
+  // 唯一）、token 也只在 (源单, token) 二元组内做幂等去重（不同源单可以复用同一个
+  // token）。两者都可能撞，旧的核验（buildVerifiedSplitPairKeys）按 token 把所有共享该
+  // token 的拆单记录的 source/target 并成一个集合来判定「可信」，若两个独立拆分各自复用
+  // 了同一个 token、又恰好撞上相同的 baseId，会被误判成「同一次拆单」。加上源单 id 前缀后，
+  // `sp2:<sourceOrderId>:<baseId>` 前两段唯一对应 OrderSplitRecord 的
+  // `@@unique([sourceOrderId, requestToken])`，核验函数据此按**单条记录**校验（见
+  // room-identity.ts），不再按 token 取并集。存量旧格式 key（无 sp2: 前缀）不回填，
+  // 核验函数对旧格式仍走原并集逻辑（已知的历史遗留，见报告）。
+  const splitPairKey = `sp2:${sourceOrderId}:${baseId}:${pairToken}`;
   return {
     kept: { ...group.raw, passengerIds: keptIds, roomFraction: keptHalf / 2, splitPairKey },
     moved: {
@@ -27550,14 +27774,41 @@ const REDACTED_ITEM_METADATA_KEYS: readonly string[] = [
 //    它们普遍带原价、成本、政策报价、班次 id 与内部操作人，随 `...i` 展开就会整段下发给代理。
 
 /**
+ * `splitRoomGroup.roomGroupId`（按房组拆行留痕，见 `splitHotelItemByRoomGroup`）对外脱敏
+ * （HIGH 修复 · astra B 路 finding N1）：存量数据可能是跨单分房迁移前的老式编码房组 id
+ * `shared:<共享键>:<行 id>`——新写入点房组 id 已经是随机 uuid（B1 已解决），但迁移脚本
+ * `rewrite-shared-room-group-ids.ts` 只改 `Order.roomAssignment`，不碰这份 metadata 历史
+ * 副本，旧编码会原样留在这里，随 `...i` 展开随订单详情/列表/售后响应一起下发给代理。
+ * `roomGroupId` 对外没有业务意义（纯内部溯源用），整键剥掉；`fromItemId`/`at`/`note`
+ * 指向本单自己的行/时间戳，不含跨单信息，保留。
+ */
+function redactSplitRoomGroupForExternal(value: unknown): unknown {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) return value;
+  const rest: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (k === 'roomGroupId') continue;
+    rest[k] = v;
+  }
+  return rest;
+}
+
+/**
  * 对外脱敏：从订单行 metadata 剥离计价键，保留非价格业务键。
  * metadata 为空 / 非对象 → 原样返回（不强行造对象）。
+ *
+ * `splitRoomGroup` 不能像其它键一样整键透传或整键剥除——它不在黑名单里（`fromItemId`/
+ * `at`/`note` 对外本就该看见，标注这行是从哪条本单行拆出来的），但其 `roomGroupId`
+ * 子字段可能携带跨单分房的历史编码密钥，必须单独递归处理（见上）。
  */
 function redactItemMetadataForExternal(metadata: unknown): unknown {
   if (metadata == null || typeof metadata !== 'object' || Array.isArray(metadata)) return metadata;
   const rest: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(metadata as Record<string, unknown>)) {
     if (REDACTED_ITEM_METADATA_KEYS.includes(key)) continue;
+    if (key === 'splitRoomGroup') {
+      rest[key] = redactSplitRoomGroupForExternal(value);
+      continue;
+    }
     rest[key] = value;
   }
   return rest;

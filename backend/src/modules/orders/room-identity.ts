@@ -11,18 +11,23 @@
  *     订单 JSON 的 roomGroups[].sharedRoomId 镜像，真值见 hotel-control.shared-rooms.ts）；
  *     没有共享房 id 但带拆单配对键（splitPairKey，orders.service.ts 拆单时写在两个半组上的
  *     `<源行id>:<拆单令牌>`）时用它——两个半间导出编号也该合成一间，同物理房间口径。
- *     **splitPairKey 本身不保证跨单唯一**（astra A 路 finding 4/§十三验收反例 10 的后续复审）：
- *     它是「本地房组 id + 拆单令牌」拼出来的，拆单令牌只在 (源单, 令牌) 二元组内做幂等去重
- *     （orders.service.ts splitOrder 的回放检查），不同源单复用同一个令牌、又撞上相同的本地
- *     房组 id（legacy 数据 / 批量脚本更容易撞），三个导出会把两张不相关订单的半间错误合成
- *     一间。`buildVerifiedSplitPairKeys` 用 OrderSplitRecord（真实拆单关系表）批量核验：
- *     只有当出现同一个 splitPairKey 的全部订单，确实都落在同一条 (sourceOrderId,
- *     requestToken) 拆单记录的 source/target 二元组里，才认定这是「真的同一次拆单产生的
- *     两个半间」；核验集缺省（调用方没传）时保持旧行为（信任 splitPairKey，供纯函数单测用，
- *     不查库）——生产调用点必须传核验集，否则退回 `${orderId}:${groupId}`。
+ *     **存量 splitPairKey（旧格式 `<baseId>:<拆单令牌>`）不保证跨单唯一**（astra A 路
+ *     finding 4/§十三验收反例 10 的后续复审）：baseId 可能是本地房组 id（不保证全局唯一），
+ *     拆单令牌只在 (源单, 令牌) 二元组内做幂等去重，不同源单复用同一个令牌、又撞上相同的
+ *     baseId（legacy 数据 / 批量脚本更容易撞），三个导出会把两张不相关订单的半间错误合成
+ *     一间。**新格式**（HIGH 修复 · astra finding N7）`sp2:<sourceOrderId>:<baseId>:
+ *     <拆单令牌>`（orders.service.ts splitMixedRoomGroup 写入）把源单 id 直接编进 key，
+ *     天然对应 OrderSplitRecord 的 `@@unique([sourceOrderId, requestToken])`，不再需要
+ *     baseId 全局唯一这个假设。`buildVerifiedSplitPairKeys` 用 OrderSplitRecord（真实拆单
+ *     关系表）批量核验：新格式按**单条拆分记录**精确核验（sourceOrderId+token 唯一定位
+ *     一条记录，出现该 key 的订单必须恰为该记录的 source/target 二元组）；旧格式沿用原按
+ *     token 取并集的核验（已知的较弱口径，存量数据不回填新格式）。核验集缺省（调用方没传）
+ *     时保持旧行为（信任 splitPairKey，供纯函数单测用，不查库）——生产调用点必须传核验集，
+ *     否则退回 `${orderId}:${groupId}`。
  *   - `roomNumberScopeKey`：编号作用域——真实酒店按 hotelId（不认名字文本，名字可能是换酒店前
  *     的旧值、房控手误）；未落位的星级随机档没有 hotelId，用展示名兜底出一个隔离的作用域键
- *     （不会撞真实酒店的 hotelId）。入住日由调用方在此之外自行分桶。
+ *     （不会撞真实酒店的 hotelId）。入住日是**必填**参数（astra finding N11）：三处导出
+ *     必须拼进同一个作用域字符串，不能各自决定「要不要带日期」。
  *   - `roomIdentitySortKey` / `buildIdentityNumberMap`：B10——三个导出各自的遍历顺序不同
  *     （查询排序方向、乘客展开顺序都不一样），旧口径「谁先遍历到就发哪个号」会让同一批身份
  *     在不同导出里编出不同房号（哪怕单份导出内部自洽）。改为按确定性规则排序后统一编号：
@@ -105,40 +110,97 @@ export async function buildVerifiedSplitPairKeys(
   const verified = new Set<string>();
   if (orderIdsByKey.size === 0) return verified;
 
-  const tokens = new Set<string>();
+  // HIGH 修复（astra finding N7）：新格式 `sp2:<sourceOrderId>:<baseId>:<token>`
+  // （orders.service.ts splitMixedRoomGroup 写入）按**单条拆分关系**核验——解析出
+  // sourceOrderId + token，精确查 (sourceOrderId, requestToken) 这一条 OrderSplitRecord
+  // （= 唯一索引 @@unique([sourceOrderId, requestToken])），可信集合就是那一条记录的
+  // {sourceOrderId, targetOrderId} 二元组，不再像旧实现那样把所有共享同一个 token 的
+  // 拆分记录的 source/target 并成一个大集合——两个各自复用同一 token 的独立拆分，即使
+  // 观测到的订单都落在这个并集里，也不代表它们是同一次拆分（原碰撞仍会通过）。
+  //
+  // sourceOrderId 用第一个冒号定位（位置固定，即便 baseId 内部含冒号也不影响：baseId
+  // 只在 "sp2:" 与 token 之间，两头都按位置切，不需要 baseId 本身无冒号）；token 用最后
+  // 一个冒号定位（token 本身不含冒号，同旧格式的既有假设）。
+  const sp2Parsed = new Map<string, { sourceOrderId: string; token: string }>();
+  // 旧格式（无 sp2: 前缀）：沿用原按 token 取并集的校验——存量数据不回填新格式
+  // （见 splitMixedRoomGroup 头注释），核验仍是已知的较弱口径。
+  const legacyTokens = new Set<string>();
+
   for (const key of orderIdsByKey.keys()) {
-    const idx = key.lastIndexOf(':');
-    if (idx > 0) tokens.add(key.slice(idx + 1));
+    if (key.startsWith('sp2:')) {
+      const rest = key.slice(4);
+      const firstColon = rest.indexOf(':');
+      if (firstColon <= 0) continue; // 形状不符（不可信，留在 verified 之外，退回 orderId:groupId）
+      const sourceOrderId = rest.slice(0, firstColon);
+      const afterSource = rest.slice(firstColon + 1);
+      const lastColon = afterSource.lastIndexOf(':');
+      if (lastColon <= 0) continue;
+      const token = afterSource.slice(lastColon + 1);
+      if (!sourceOrderId || !token) continue;
+      sp2Parsed.set(key, { sourceOrderId, token });
+    } else {
+      const idx = key.lastIndexOf(':');
+      if (idx > 0) legacyTokens.add(key.slice(idx + 1));
+    }
   }
 
-  const records =
-    tokens.size > 0
-      ? await client.orderSplitRecord.findMany({
-          where: { requestToken: { in: [...tokens] } },
-          select: { sourceOrderId: true, targetOrderId: true, requestToken: true },
-        })
-      : [];
-  const legitOrderIdsByToken = new Map<string, Set<string>>();
-  for (const r of records) {
-    let set = legitOrderIdsByToken.get(r.requestToken);
-    if (!set) {
-      set = new Set();
-      legitOrderIdsByToken.set(r.requestToken, set);
+  if (sp2Parsed.size > 0) {
+    const pairs = new Map<string, { sourceOrderId: string; requestToken: string }>();
+    for (const p of sp2Parsed.values()) {
+      pairs.set(`${p.sourceOrderId} ${p.token}`, { sourceOrderId: p.sourceOrderId, requestToken: p.token });
     }
-    set.add(r.sourceOrderId);
-    set.add(r.targetOrderId);
+    const records = await client.orderSplitRecord.findMany({
+      where: {
+        OR: [...pairs.values()].map((p) => ({ sourceOrderId: p.sourceOrderId, requestToken: p.requestToken })),
+      },
+      select: { sourceOrderId: true, targetOrderId: true, requestToken: true },
+    });
+    const recordByPair = new Map<string, { sourceOrderId: string; targetOrderId: string }>();
+    for (const r of records) {
+      recordByPair.set(`${r.sourceOrderId} ${r.requestToken}`, r);
+    }
+    for (const [key, parsed] of sp2Parsed) {
+      const orderIds = orderIdsByKey.get(key)!;
+      if (orderIds.size <= 1) {
+        verified.add(key); // 单订单内部撞键，不跨单，没有泄露风险
+        continue;
+      }
+      const record = recordByPair.get(`${parsed.sourceOrderId} ${parsed.token}`);
+      if (record) {
+        const legit = new Set([record.sourceOrderId, record.targetOrderId]);
+        if ([...orderIds].every((id) => legit.has(id))) verified.add(key);
+      }
+    }
   }
 
-  for (const [key, orderIds] of orderIdsByKey) {
-    if (orderIds.size <= 1) {
-      verified.add(key); // 单订单内部撞键，不跨单，没有泄露风险
-      continue;
+  if (legacyTokens.size > 0) {
+    const legacyRecords = await client.orderSplitRecord.findMany({
+      where: { requestToken: { in: [...legacyTokens] } },
+      select: { sourceOrderId: true, targetOrderId: true, requestToken: true },
+    });
+    const legitOrderIdsByToken = new Map<string, Set<string>>();
+    for (const r of legacyRecords) {
+      let set = legitOrderIdsByToken.get(r.requestToken);
+      if (!set) {
+        set = new Set();
+        legitOrderIdsByToken.set(r.requestToken, set);
+      }
+      set.add(r.sourceOrderId);
+      set.add(r.targetOrderId);
     }
-    const idx = key.lastIndexOf(':');
-    const token = idx > 0 ? key.slice(idx + 1) : '';
-    const legit = legitOrderIdsByToken.get(token);
-    if (legit && [...orderIds].every((id) => legit.has(id))) verified.add(key);
+    for (const [key, orderIds] of orderIdsByKey) {
+      if (key.startsWith('sp2:')) continue; // 上面已处理
+      if (orderIds.size <= 1) {
+        verified.add(key);
+        continue;
+      }
+      const idx = key.lastIndexOf(':');
+      const token = idx > 0 ? key.slice(idx + 1) : '';
+      const legit = legitOrderIdsByToken.get(token);
+      if (legit && [...orderIds].every((id) => legit.has(id))) verified.add(key);
+    }
   }
+
   return verified;
 }
 
@@ -146,9 +208,21 @@ export async function buildVerifiedSplitPairKeys(
  * 房号编号作用域键：真实酒店按 hotelId；未落位（随机档待落位）没有 hotelId，
  * 用调用方传入的展示名（如「4星随机（待落位）」）兜底出一个隔离作用域——
  * 加 `pending:` 前缀避免与任何真实 hotelId 字符串巧合相撞。
+ *
+ * MEDIUM 修复（astra finding N11）：作用域必须带入住日，`checkInDate` 是**必填**参数——
+ * 原先分房表 orders.export-room-allocation.ts / 整班机 orders.export.ts 的作用域只有
+ * 酒店（不认日期），全岗总表 orders.export-master.ts 却另外手工拼了一段
+ * `${roomNumberScopeKey(...)}|${date}`。三处对「同一间房」算出的作用域字符串不一致：
+ * 同一家酒店不同入住日的两批客人，分房表/整班机会被合并进同一个编号序列连续发号，
+ * 全岗总表却按日期分开各自从 1 发号——跨导出对同一批身份对不上号。改成必填参数后，
+ * 编译期就不允许任何调用点漏传日期，三处只能算出同一个字符串。
  */
-export function roomNumberScopeKey(hotelId: string | null, pendingScopeLabel: string): string {
-  return hotelId ? `hotel:${hotelId}` : `pending:${pendingScopeLabel}`;
+export function roomNumberScopeKey(
+  hotelId: string | null,
+  pendingScopeLabel: string,
+  checkInDate: string,
+): string {
+  return `${hotelId ? `hotel:${hotelId}` : `pending:${pendingScopeLabel}`}|${checkInDate}`;
 }
 
 /**
@@ -185,16 +259,24 @@ export interface IdentityNumberEntry {
  * B10：按 scope 分桶，桶内全部去重后的 identityKey 按 sortKey 升序统一编号（1 起）——
  * 不依赖调用方遍历这些身份的顺序。三个导出对同一批身份用这份映射，就必然算出同一个
  * 「身份→房号」结果，不再因为查询排序方向、乘客展开顺序不同而把两间共享房的号印反。
+ *
+ * MEDIUM 修复（astra finding N11）：同一 identityKey 的候选 sortKey 取**最小值**，不是
+ * 「首次遇见」那一条——拆单产生的两个半间（identityKey = splitPairKey）两侧各自算出的
+ * sortKey 不同（roomIdentitySortKey 用 `${orderNumber}:${groupId}`，两侧订单号不同），
+ * 原实现只认遍历到的第一条，调用方换一种遍历顺序（查询排序方向、Prisma include 顺序）
+ * 就会选中不同的那条候选 sortKey，进而改变这个身份在全局排序里的相对位置，把两间房的
+ * 编号印反。取全部候选的最小值是与遍历顺序无关的规范值，任何遍历顺序都收敛到同一个结果。
  */
 export function buildIdentityNumberMap(entries: Iterable<IdentityNumberEntry>): Map<string, number> {
-  const byScope = new Map<string, Map<string, string>>(); // scope -> identityKey -> sortKey
+  const byScope = new Map<string, Map<string, string>>(); // scope -> identityKey -> 最小 sortKey
   for (const e of entries) {
     let idMap = byScope.get(e.scope);
     if (!idMap) {
       idMap = new Map();
       byScope.set(e.scope, idMap);
     }
-    if (!idMap.has(e.identityKey)) idMap.set(e.identityKey, e.sortKey);
+    const existing = idMap.get(e.identityKey);
+    if (existing == null || e.sortKey < existing) idMap.set(e.identityKey, e.sortKey);
   }
   const result = new Map<string, number>();
   for (const [scope, idMap] of byScope) {

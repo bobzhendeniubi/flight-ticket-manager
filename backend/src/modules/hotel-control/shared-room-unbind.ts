@@ -64,12 +64,34 @@ export interface PlannedSharedRoomChange {
   activeMemberOrderIdsAfter: string[];
 }
 
-/** `planUnbind` 的产出：只读计算结果，尚未写库。*/
+/**
+ * `planUnbindMany` / `planUnbind` 的产出：只读计算结果，尚未写库。
+ *
+ * ── 多行合成（CRITICAL 修复 · astra finding N2）──────────────────────────────
+ * 原来一份计划只装一行（`orderItemId` 单数），多行解绑时调用方对每行各调一次 `planUnbind`，
+ * 每次都从同一份**原始** `roomAssignment` 出发算 `nextRoomAssignment`（整单快照），再逐份
+ * **整份覆盖**写回。计划一删 I1 的共享键、计划二仍带着未删的 I1（它是从原始快照算的）
+ * 只删 I2 的共享键——按顺序应用后，先写的 I1 又被后写的计划的「整单快照」写回来，但
+ * I1 的 SharedRoomMember 已经真删了：JSON 与成员表从此不一致，房控少算。
+ *
+ * 改为：`orderItemIds` 装本次参与解绑的全部行，`nextRoomAssignment` 一次性合成、只读一次
+ * `order.roomAssignment` 快照、一遍 map 里把这批行的共享键全部剥掉——不存在「计划二覆盖
+ * 计划一」的先后问题，因为从头到尾只有一份计划、一次落库。`changesByItemId` 供调用方
+ * 按行取回自己那部分变更（构造 §五闸 `nextOrderItems`/`nextSharedRooms`、警告文案）；
+ * `changes` 是扁平汇总，供不关心行归属、只要「这次一共动了哪些共享房」的调用点用
+ * （一间房可能被这批行中的不止一行命中，`changes` 会有对应的多条，`applyUnbindPlan`
+ * 按 `sharedRoomId` 去重后才做房间侧的 DISSOLVED/version+1，不会因此重复递增）。
+ */
 export interface UnbindPlan {
   orderId: string;
-  orderItemId: string;
+  /** 参与本次解绑的全部行（单行调用时长度为 1）。*/
+  orderItemIds: string[];
+  /** 按行分组的变更——调用方按行构造 nextItems / nextSharedRooms / 警告文案时用这个。*/
+  changesByItemId: Map<string, PlannedSharedRoomChange[]>;
+  /** 全部行变更的扁平汇总（不去重；同一 sharedRoomId 若被多行命中会出现多条，见上）。*/
   changes: PlannedSharedRoomChange[];
-  /** 该订单 `roomAssignment` JSON 解绑后的样子；`null` = 该行本不在任何共享房，JSON 不用改。*/
+  /** 该订单 `roomAssignment` JSON 解绑后的样子（覆盖 `orderItemIds` 全部行）；
+   *  `null` = 这批行没有一行在任何共享房里，JSON 不用改。*/
   nextRoomAssignment: unknown | null;
 }
 
@@ -140,36 +162,61 @@ function sharedRoomDelegate(
 }
 
 /**
- * 只读第一阶段：算出「把该订单行在全部共享房里解绑」会变成什么样，**不写库**。
+ * 只读第一阶段：算出「把这批订单行在全部共享房里解绑」会变成什么样，**不写库**。
  * 仍会对涉及的 SharedRoom 行加 `FOR UPDATE`（读+锁不改变可读到的值，只是防止并发覆盖
  * 这份计划——与调用方随后即将进行的 §五闸判定、以及最终 `applyUnbindPlan` 之间不能有
  * 窗口被别的事务抢先改掉）。
  *
- * 该行本不在任何共享房 → 返回 `changes: []`、`nextRoomAssignment: null`，调用方无需先
+ * `orderItemIds` 可以是同一订单的多行——一次调用只读一次 `order.roomAssignment`，合成
+ * 一份覆盖这批行的最终 JSON（CRITICAL 修复 · astra finding N2：不能逐行各调一次
+ * `planUnbind` 再顺序 `applyUnbindPlan`，那样后应用的计划会把先解绑行的共享键写回来）。
+ *
+ * 这批行都不在任何共享房 → 返回 `changes: []`、`nextRoomAssignment: null`，调用方无需先
  * 探测再决定是否调用。
  */
-export async function planUnbind(
+export async function planUnbindMany(
   tx: Prisma.TransactionClient,
-  params: { orderId: string; orderItemId: string },
+  params: { orderId: string; orderItemIds: readonly string[] },
 ): Promise<UnbindPlan> {
-  const { orderId, orderItemId } = params;
-  const empty: UnbindPlan = { orderId, orderItemId, changes: [], nextRoomAssignment: null };
+  const { orderId } = params;
+  const orderItemIds = [...new Set(params.orderItemIds)];
+  const empty: UnbindPlan = {
+    orderId,
+    orderItemIds,
+    changesByItemId: new Map(),
+    changes: [],
+    nextRoomAssignment: null,
+  };
+  if (orderItemIds.length === 0) return empty;
 
   // 防御式：单测常用手搭的 mock tx（只 mock 用到的 delegate）没有 sharedRoomMember 时回落
   // 「本次没有共享成员」而不是炸——与 computeSharedRoomPhysicalByDate 的 sharedRoom 兜底同哲学。
   const memberDelegate = sharedRoomMemberDelegate(tx);
   if (!memberDelegate) return empty;
+  const itemIdSet = new Set(orderItemIds);
   const owned = await memberDelegate.findMany({
-    where: { orderId, orderItemId },
-    select: { sharedRoomId: true, roomFraction: true },
+    where: { orderId, orderItemId: { in: orderItemIds } },
+    select: { sharedRoomId: true, orderItemId: true, roomFraction: true },
   });
   if (owned.length === 0) return empty;
 
-  const sharedRoomIds = [...new Set(owned.map((m) => m.sharedRoomId))].sort();
-  const fractionByRoom = new Map(
-    owned.map((m) => [m.sharedRoomId, Number(m.roomFraction.toString())]),
-  );
+  // 按共享房聚合「这批行里，哪些行命中了这间房」——一间房理论上可能同时被这批行中的
+  // 不止一行命中（同订单两条酒店行凑巧都在同一间共享房，§三未禁止），remainingAfter
+  // 必须一次性把这批行全部排除，不能只排除其中一行、算出偏高的 remainingMemberCount。
+  const itemIdsByRoom = new Map<string, Set<string>>();
+  const fractionByRoomAndItem = new Map<string, number>();
+  for (const m of owned) {
+    const set = itemIdsByRoom.get(m.sharedRoomId) ?? new Set<string>();
+    set.add(m.orderItemId);
+    itemIdsByRoom.set(m.sharedRoomId, set);
+    const key = `${m.sharedRoomId}:${m.orderItemId}`;
+    // 同一 (行, 房间) 组合理论上也可能有多个成员行（多名乘客同挂一行——正常建单不会，
+    // 但不排除脏数据），累加而不是覆盖，避免 fractionByRoom 只留下最后一条成员的份额。
+    fractionByRoomAndItem.set(key, (fractionByRoomAndItem.get(key) ?? 0) + Number(m.roomFraction.toString()));
+  }
+  const sharedRoomIds = [...itemIdsByRoom.keys()].sort();
 
+  const changesByItemId = new Map<string, PlannedSharedRoomChange[]>();
   const changes: PlannedSharedRoomChange[] = [];
   for (const sharedRoomId of sharedRoomIds) {
     // 锁这间共享房：与跨单分房工作台保存、其它入口的并发解绑互斥（§六同款「先锁再读再写」）。
@@ -186,8 +233,9 @@ export async function planUnbind(
         order: { select: { orderNumber: true, status: true, deletedAt: true } },
       },
     });
+    const removedItemIds = itemIdsByRoom.get(sharedRoomId)!;
     const remainingAfter = allMembers.filter(
-      (m) => !(m.orderId === orderId && m.orderItemId === orderItemId),
+      (m) => !(m.orderId === orderId && removedItemIds.has(m.orderItemId)),
     );
     const partnerOrderNumbers = [
       ...new Set(remainingAfter.map((m) => m.order.orderNumber)),
@@ -200,32 +248,41 @@ export async function planUnbind(
       ),
     ];
 
-    changes.push({
-      sharedRoomId,
-      roomFraction: fractionByRoom.get(sharedRoomId) ?? 0,
-      partnerOrderNumbers,
-      // room 理论上不会为空（刚在同事务里查到过成员）；防御式兜底日期无从推断时给 epoch，
-      // 调用方按「无有效成员」处理（activeMemberOrderIdsAfter 为空时该晚区间不参与去重加成）。
-      checkIn: room?.checkIn ?? new Date(0),
-      checkOut: room?.checkOut ?? new Date(0),
-      remainingMemberCount: remainingAfter.length,
-      activeMemberOrderIdsAfter,
-    });
+    for (const orderItemId of removedItemIds) {
+      const change: PlannedSharedRoomChange = {
+        sharedRoomId,
+        roomFraction: fractionByRoomAndItem.get(`${sharedRoomId}:${orderItemId}`) ?? 0,
+        partnerOrderNumbers,
+        // room 理论上不会为空（刚在同事务里查到过成员）；防御式兜底日期无从推断时给 epoch，
+        // 调用方按「无有效成员」处理（activeMemberOrderIdsAfter 为空时该晚区间不参与去重加成）。
+        checkIn: room?.checkIn ?? new Date(0),
+        checkOut: room?.checkOut ?? new Date(0),
+        remainingMemberCount: remainingAfter.length,
+        activeMemberOrderIdsAfter,
+      };
+      changes.push(change);
+      const list = changesByItemId.get(orderItemId) ?? [];
+      list.push(change);
+      changesByItemId.set(orderItemId, list);
+    }
   }
 
-  // 订单 JSON：把本行在这些共享房的房组去掉 sharedRoomId（变回普通房组），其余字段原样保留。
+  // 订单 JSON：一次性把这批行在这些共享房的房组全部去掉 sharedRoomId（变回普通房组，
+  // 其余字段原样保留）——只读一次 order.roomAssignment，一遍 map 里处理全部行，不会有
+  // 「后一份计划从旧快照出发、覆盖掉前一份计划已经做的修改」的问题（N2）。
   const order = await tx.order.findUnique({ where: { id: orderId }, select: { roomAssignment: true } });
   const groups = readRoomGroupArray(order?.roomAssignment);
   let nextRoomAssignment: unknown | null = null;
   if (groups) {
-    const touchedIds = new Set(sharedRoomIds);
+    const touchedRoomIds = new Set(sharedRoomIds);
     let changed = false;
     const nextGroups = groups.map((g) => {
       if (g == null || typeof g !== 'object' || Array.isArray(g)) return g;
       const rec = g as RoomGroupRecord;
-      if (roomGroupItemId(rec) !== orderItemId) return g;
+      const gItemId = roomGroupItemId(rec);
+      if (gItemId == null || !itemIdSet.has(gItemId)) return g;
       const sid = groupSharedRoomId(rec);
-      if (sid == null || !touchedIds.has(sid)) return g;
+      if (sid == null || !touchedRoomIds.has(sid)) return g;
       changed = true;
       return stripSharedRoomId(rec);
     });
@@ -237,14 +294,28 @@ export async function planUnbind(
     }
   }
 
-  return { orderId, orderItemId, changes, nextRoomAssignment };
+  return { orderId, orderItemIds, changesByItemId, changes, nextRoomAssignment };
+}
+
+/** 单行版 `planUnbindMany`——多数调用点只解绑一行，保留这个简写入口。*/
+export async function planUnbind(
+  tx: Prisma.TransactionClient,
+  params: { orderId: string; orderItemId: string },
+): Promise<UnbindPlan> {
+  return planUnbindMany(tx, { orderId: params.orderId, orderItemIds: [params.orderItemId] });
 }
 
 /**
- * 第二阶段：按 `planUnbind` 算出的计划真正写库——删成员、房间 DISSOLVED/version+1、
- * 订单 JSON 去掉 sharedRoomId。计划里 `changes` 为空则直接返回、不碰数据库。
+ * 第二阶段：按 `planUnbindMany` / `planUnbind` 算出的计划真正写库——删成员、房间
+ * DISSOLVED/version+1、订单 JSON 去掉 sharedRoomId。计划里 `changes` 为空则直接返回、
+ * 不碰数据库。
  *
- * ⚠ 计划与写库之间不能有别的事务插进来改同一批 SharedRoom 行——`planUnbind` 已经在
+ * 多行合成计划（N2）：`changesByItemId` 按行删各自的 SharedRoomMember；房间侧的
+ * DISSOLVED/version+1 按 `sharedRoomId` 去重后只做一次——一间房可能被这批行中的不止
+ * 一行命中，`plan.changes` 里会有同一 `sharedRoomId` 的多条（`remainingMemberCount`
+ * 每条都相同，任取一条即可），不去重会对同一间房重复 DISSOLVED / 多递增 version。
+ *
+ * ⚠ 计划与写库之间不能有别的事务插进来改同一批 SharedRoom 行——`planUnbindMany` 已经在
  * 同一事务里锁住了它们，调用方只要不提前提交事务就是安全的。
  */
 export async function applyUnbindPlan(
@@ -254,10 +325,22 @@ export async function applyUnbindPlan(
 ): Promise<{ unbound: UnboundSharedRoomInfo[] }> {
   if (plan.changes.length === 0) return { unbound: [] };
 
-  for (const change of plan.changes) {
+  for (const orderItemId of plan.orderItemIds) {
+    const itemChanges = plan.changesByItemId.get(orderItemId);
+    if (!itemChanges || itemChanges.length === 0) continue;
     await tx.sharedRoomMember.deleteMany({
-      where: { sharedRoomId: change.sharedRoomId, orderId: plan.orderId, orderItemId: plan.orderItemId },
+      where: {
+        orderId: plan.orderId,
+        orderItemId,
+        sharedRoomId: { in: itemChanges.map((c) => c.sharedRoomId) },
+      },
     });
+  }
+
+  const roomSideEffectDone = new Set<string>();
+  for (const change of plan.changes) {
+    if (roomSideEffectDone.has(change.sharedRoomId)) continue;
+    roomSideEffectDone.add(change.sharedRoomId);
     if (change.remainingMemberCount === 0) {
       await tx.sharedRoom.update({
         where: { id: change.sharedRoomId },
@@ -333,15 +416,29 @@ export async function getSharedRoomStatesForItem(
   });
   if (owned.length === 0) return [];
 
-  const out: SharedRoomStateForItem[] = [];
+  // 按共享房去重（CRITICAL 修复 · astra finding N3）：SharedRoomMember 是按乘客建行的
+  // （@@unique([sharedRoomId, passengerId])），本行若有不止一名乘客同挂进同一间共享房，
+  // `owned` 会有同一 sharedRoomId 的多条记录——不去重会让调用方（
+  // planRestoreSharedRoomReconciliation 的 `kept`）对同一间房生成两条相同的覆盖项，
+  // 喂进 §五闸后一间房被当成两间物理房，放行本该被拦的超卖。份额按行内多名乘客累加，
+  // 代表「本行」在这间房里的总计费份额。
+  const fractionByRoom = new Map<string, number>();
   for (const m of owned) {
+    fractionByRoom.set(
+      m.sharedRoomId,
+      (fractionByRoom.get(m.sharedRoomId) ?? 0) + Number(m.roomFraction.toString()),
+    );
+  }
+
+  const out: SharedRoomStateForItem[] = [];
+  for (const sharedRoomId of fractionByRoom.keys()) {
     const room = await sharedRoomDelegate(tx)?.findUnique({
-      where: { id: m.sharedRoomId },
+      where: { id: sharedRoomId },
       select: { id: true, status: true, checkIn: true, checkOut: true },
     });
     if (!room) continue;
     const allMembers = await memberDelegate.findMany({
-      where: { sharedRoomId: m.sharedRoomId },
+      where: { sharedRoomId },
       select: { orderId: true, order: { select: { status: true, deletedAt: true } } },
     });
     const activeMemberOrderIds = [
@@ -352,11 +449,11 @@ export async function getSharedRoomStatesForItem(
       ),
     ];
     out.push({
-      sharedRoomId: m.sharedRoomId,
+      sharedRoomId,
       status: room.status,
       checkIn: room.checkIn,
       checkOut: room.checkOut,
-      roomFraction: Number(m.roomFraction.toString()),
+      roomFraction: fractionByRoom.get(sharedRoomId) ?? 0,
       activeMemberOrderIds,
     });
   }
@@ -452,9 +549,16 @@ export interface RestoreReconciliationPlan {
     /** 保留 + 本单恢复后，该房间应有的有效成员订单 id（已含本单 orderId，去重）。*/
     activeMemberOrderIdsAfter: string[];
   }>;
-  /** 不一致、需要解绑的行的解绑计划——闸通过后逐个 applyUnbindPlan。*/
-  unboundPlans: UnbindPlan[];
-  /** unboundPlans 汇总的警告用数据（内部/代理文案由 formatUnbindWarning 生成）。*/
+  /**
+   * 不一致、需要解绑的全部行合成的**一份**解绑计划——闸通过后一次 `applyUnbindPlan`。
+   *
+   * N2 修复：原来每行不一致各自 `planUnbind` 一份、存进数组，调用方逐份顺序
+   * `applyUnbindPlan`——每份都从同一份原始 JSON 出发，后应用的会把先解绑行的共享键
+   * 写回来。改成不一致的行一次性交给 `planUnbindMany`，只出一份计划、一次落库。
+   * `null` = 没有行需要解绑。
+   */
+  unboundPlan: UnbindPlan | null;
+  /** unboundPlan 汇总的警告用数据（内部/代理文案由 formatUnbindWarning 生成）。*/
   unbound: UnboundSharedRoomInfo[];
   unboundItemIds: Set<string>;
 }
@@ -467,10 +571,10 @@ export async function planRestoreSharedRoomReconciliation(
   },
 ): Promise<RestoreReconciliationPlan> {
   const kept: RestoreReconciliationPlan['kept'] = [];
-  const unboundPlans: UnbindPlan[] = [];
-  const unbound: UnboundSharedRoomInfo[] = [];
-  const unboundItemIds = new Set<string>();
+  const inconsistentItemIds: string[] = [];
 
+  // 第一遍：只读判「一致可保留」还是「不一致需解绑」，不产生任何解绑计划——判定纯粹依赖
+  // SharedRoomMember/SharedRoom 现状，与后面怎么合成解绑计划无关，两件事解耦开。
   for (const item of params.items) {
     const states = await getSharedRoomStatesForItem(tx, params.orderId, item.id);
     if (states.length === 0) continue;
@@ -490,24 +594,31 @@ export async function planRestoreSharedRoomReconciliation(
           activeMemberOrderIdsAfter: [...new Set([...s.activeMemberOrderIds, params.orderId])],
         });
       }
-      continue;
-    }
-    // 任一间不一致 → 整行解绑（与 unbindInconsistentSharedRoomMembers 同粒度）。
-    const plan = await planUnbind(tx, { orderId: params.orderId, orderItemId: item.id });
-    if (plan.changes.length > 0) {
-      unboundPlans.push(plan);
-      unboundItemIds.add(item.id);
-      unbound.push(
-        ...plan.changes.map((c) => ({
-          sharedRoomId: c.sharedRoomId,
-          roomFraction: c.roomFraction,
-          partnerOrderNumbers: c.partnerOrderNumbers,
-        })),
-      );
+    } else {
+      // 任一间不一致 → 整行解绑（与 unbindInconsistentSharedRoomMembers 同粒度）。
+      inconsistentItemIds.push(item.id);
     }
   }
 
-  return { kept, unboundPlans, unbound, unboundItemIds };
+  // 第二遍：不一致的行一次性合成一份计划（N2）——不是逐行各出一份再顺序应用。
+  let unboundPlan: UnbindPlan | null = null;
+  let unbound: UnboundSharedRoomInfo[] = [];
+  if (inconsistentItemIds.length > 0) {
+    const plan = await planUnbindMany(tx, { orderId: params.orderId, orderItemIds: inconsistentItemIds });
+    if (plan.changes.length > 0) {
+      unboundPlan = plan;
+      unbound = plan.changes.map((c) => ({
+        sharedRoomId: c.sharedRoomId,
+        roomFraction: c.roomFraction,
+        partnerOrderNumbers: c.partnerOrderNumbers,
+      }));
+    }
+  }
+  const unboundItemIds = new Set(
+    unboundPlan ? inconsistentItemIds.filter((id) => (unboundPlan!.changesByItemId.get(id)?.length ?? 0) > 0) : [],
+  );
+
+  return { kept, unboundPlan, unbound, unboundItemIds };
 }
 
 /**

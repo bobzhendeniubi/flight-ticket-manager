@@ -140,14 +140,95 @@ describe('buildVerifiedSplitPairKeys', () => {
     expect(verified.size).toBe(0);
     expect(findMany).not.toHaveBeenCalled();
   });
+
+  // ── astra finding N7：sp2: 新格式按单条拆分记录核验，不再按 token 取并集 ────────────
+  it('N7 正例：sp2 格式——source/target 恰为对应记录二元组，判定可信', async () => {
+    const client = {
+      orderSplitRecord: {
+        findMany: vi.fn().mockResolvedValue([
+          { sourceOrderId: 'ord_a', targetOrderId: 'ord_b', requestToken: 'token-1' },
+        ]),
+      },
+    } as unknown as PrismaClient;
+    const verified = await buildVerifiedSplitPairKeys(
+      [
+        { orderId: 'ord_a', splitPairKey: 'sp2:ord_a:item-x:token-1' },
+        { orderId: 'ord_b', splitPairKey: 'sp2:ord_a:item-x:token-1' },
+      ],
+      client,
+    );
+    expect(verified.has('sp2:ord_a:item-x:token-1')).toBe(true);
+  });
+
+  it('N7 反例：两组独立拆分复用同一个 token——sp2 按单条记录精确核验，不再像旧的 token 并集判定那样被误判为可信', async () => {
+    // ord_a→ord_b 与 ord_c→ord_d 是两次完全不相关的拆分，只是碰巧复用了同一个
+    // requestToken（token 只在 (源单, token) 内做幂等去重，不同源单本就允许复用）。
+    // 这里模拟 ord_c 的条目错误地携带了 ord_a 那条拆分的 splitPairKey 字面值
+    // （legacy 数据 / 拼接错误的极端场景）——旧实现按 token 取并集会把 ord_a/ord_b/
+    // ord_c/ord_d 全部并进 legit 集合，ord_c 恰好也在集合里，被误判为「同一次拆分」；
+    // sp2 精确核验只认 sourceOrderId=ord_a、token=token-1 对应的那一条记录
+    // {ord_a, ord_b}，ord_c 不在其中，必须判为不可信。
+    const client = {
+      orderSplitRecord: {
+        findMany: vi.fn().mockResolvedValue([
+          { sourceOrderId: 'ord_a', targetOrderId: 'ord_b', requestToken: 'token-1' },
+          { sourceOrderId: 'ord_c', targetOrderId: 'ord_d', requestToken: 'token-1' },
+        ]),
+      },
+    } as unknown as PrismaClient;
+    const verified = await buildVerifiedSplitPairKeys(
+      [
+        { orderId: 'ord_a', splitPairKey: 'sp2:ord_a:item-x:token-1' },
+        { orderId: 'ord_c', splitPairKey: 'sp2:ord_a:item-x:token-1' }, // 错误挪用 ord_a 的 key
+      ],
+      client,
+    );
+    expect(verified.has('sp2:ord_a:item-x:token-1')).toBe(false);
+    // 只查了这一条 (sourceOrderId, requestToken) 组合，不是不加区分地按 token 广查。
+    expect(client.orderSplitRecord.findMany).toHaveBeenCalledWith({
+      where: { OR: [{ sourceOrderId: 'ord_a', requestToken: 'token-1' }] },
+      select: { sourceOrderId: true, targetOrderId: true, requestToken: true },
+    });
+  });
+
+  it('N7：sp2 与旧格式混用互不干扰——各走各的核验路径', async () => {
+    const client = {
+      orderSplitRecord: {
+        findMany: vi.fn().mockResolvedValue([
+          { sourceOrderId: 'ord_a', targetOrderId: 'ord_b', requestToken: 'token-1' },
+        ]),
+      },
+    } as unknown as PrismaClient;
+    const verified = await buildVerifiedSplitPairKeys(
+      [
+        { orderId: 'ord_a', splitPairKey: 'sp2:ord_a:item-x:token-1' },
+        { orderId: 'ord_b', splitPairKey: 'sp2:ord_a:item-x:token-1' },
+        { orderId: 'ord_a', splitPairKey: 'legacy-item:token-1' },
+        { orderId: 'ord_b', splitPairKey: 'legacy-item:token-1' },
+      ],
+      client,
+    );
+    expect(verified.has('sp2:ord_a:item-x:token-1')).toBe(true);
+    expect(verified.has('legacy-item:token-1')).toBe(true);
+  });
 });
 
 describe('roomNumberScopeKey', () => {
   it('真实酒店按 hotelId；未落位按展示名兜底，两者不会撞', () => {
-    expect(roomNumberScopeKey('hotel_1', '4星随机（待落位）')).toBe('hotel:hotel_1');
-    expect(roomNumberScopeKey(null, '4星随机（待落位）')).toBe('pending:4星随机（待落位）');
+    expect(roomNumberScopeKey('hotel_1', '4星随机（待落位）', '2026-10-01')).toBe('hotel:hotel_1|2026-10-01');
+    expect(roomNumberScopeKey(null, '4星随机（待落位）', '2026-10-01')).toBe(
+      'pending:4星随机（待落位）|2026-10-01',
+    );
     // 万一某个真实 hotelId 字面上恰好等于某个展示名（几乎不可能，但兜底验证前缀隔离生效）
-    expect(roomNumberScopeKey('4星随机（待落位）', 'x')).not.toBe(roomNumberScopeKey(null, '4星随机（待落位）'));
+    expect(roomNumberScopeKey('4星随机（待落位）', 'x', '2026-10-01')).not.toBe(
+      roomNumberScopeKey(null, '4星随机（待落位）', '2026-10-01'),
+    );
+  });
+
+  it('N11：入住日是作用域的一部分——同一酒店不同入住日不合并进同一个编号序列', () => {
+    expect(roomNumberScopeKey('hotel_1', '', '2026-10-01')).not.toBe(
+      roomNumberScopeKey('hotel_1', '', '2026-10-02'),
+    );
   });
 });
 
@@ -232,6 +313,38 @@ describe('roomIdentitySortKey + buildIdentityNumberMap（B10）', () => {
     ]);
     expect(map.get(scopedIdentityMapKey('hotel:h1', 'sr_1'))).toBe(1);
     expect(map.get(scopedIdentityMapKey('hotel:h2', 'sr_1'))).toBe(1);
+  });
+
+  it('astra finding N11 反例：同一 identityKey 的两条候选 sortKey（拆单两侧订单号不同）取最小值，不随遍历顺序把两间房的编号印反', () => {
+    // 拆单产生的两个半间共用同一个 identityKey（splitPairKey = 'pair-1'），但源单/新单
+    // 订单号不同，roomIdentitySortKey 算出的 sortKey 也不同（1:<orderNumber>:<groupId>）。
+    // 'other-1' 是另一个独立身份，订单号排在这两者之间——谁被选中当 pair-1 的代表
+    // sortKey，直接决定 pair-1 排在 other-1 前面还是后面。
+    const pairSideSource = { id: 'pair-1' }; // 源单 FTM_2000（排最前）
+    const pairSideTarget = { id: 'pair-1' }; // 新单 FTM_9000（排最后）
+    const other = { id: 'gp-other' }; // FTM_5000（排中间）
+
+    const entriesAscending = [
+      { scope: 'hotel:h1', identityKey: 'pair-1', sortKey: roomIdentitySortKey(pairSideSource, 'pair-1', 'FTM_2000') },
+      { scope: 'hotel:h1', identityKey: 'other-1', sortKey: roomIdentitySortKey(other, 'other-1', 'FTM_5000') },
+      { scope: 'hotel:h1', identityKey: 'pair-1', sortKey: roomIdentitySortKey(pairSideTarget, 'pair-1', 'FTM_9000') },
+    ];
+    // 反过来喂：先遇到新单那一侧（FTM_9000），源单那一侧（FTM_2000）最后才出现。
+    const entriesDescending = [
+      { scope: 'hotel:h1', identityKey: 'pair-1', sortKey: roomIdentitySortKey(pairSideTarget, 'pair-1', 'FTM_9000') },
+      { scope: 'hotel:h1', identityKey: 'other-1', sortKey: roomIdentitySortKey(other, 'other-1', 'FTM_5000') },
+      { scope: 'hotel:h1', identityKey: 'pair-1', sortKey: roomIdentitySortKey(pairSideSource, 'pair-1', 'FTM_2000') },
+    ];
+
+    const mapAscending = buildIdentityNumberMap(entriesAscending);
+    const mapDescending = buildIdentityNumberMap(entriesDescending);
+
+    // 两种遍历顺序必须算出同一份结果：pair-1（源单号 2000，字典序最小）排第 1，
+    // other-1（5000）排第 2——不因为先遇到哪一侧就把两者的相对顺序印反。
+    for (const map of [mapAscending, mapDescending]) {
+      expect(map.get(scopedIdentityMapKey('hotel:h1', 'pair-1'))).toBe(1);
+      expect(map.get(scopedIdentityMapKey('hotel:h1', 'other-1'))).toBe(2);
+    }
   });
 });
 
