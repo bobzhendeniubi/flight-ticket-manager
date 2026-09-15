@@ -7676,13 +7676,18 @@ export interface SharedRoomWorkbenchRoomMember {
   passengerId: string;
   roomFraction: number;
   /**
-   * 该成员当前是否仍处于有效状态订单（B6 对接点）。读模型目前只按订单池（COUNTED_STATUSES）
-   * 过滤 `orders[]`，共享房 `members[]` 本身不带这两个字段——先声明为可选，字段到位前前端按
-   * 「成员所属订单是否出现在 orders[] 池」兜底判定（见 SharedRoomWorkbench.tsx memberIsActive）。
+   * 该成员当前是否仍处于有效状态订单（B6 对接点）。= 未软删 且 status ∈ COUNTED_STATUSES，
+   * 与 hotel-control.service 的房控有效状态判定同一把尺，服务端总是给（见
+   * hotel-control.shared-rooms.ts getSharedRoomWorkbench）。
    */
-  isActive?: boolean;
+  isActive: boolean;
   /** 该成员所属订单的当前状态（便于前端展示「已取消」等具体原因，不必只知道 true/false）。 */
-  orderStatus?: OrderStatus;
+  orderStatus: OrderStatus;
+  /** 该成员所属订单号（灰色只读 chip 显示「哪张单」）。 */
+  orderNumber: string;
+  /** 姓名快照：失效（已取消/软删订单）的成员也查得到，chip 才能显示人名而不是空白。 */
+  chineseName: string | null;
+  name: string;
 }
 
 export interface SharedRoomWorkbenchRoom {
