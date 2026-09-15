@@ -21,6 +21,7 @@ import { OrderItemKind, OrderStatus, Prisma, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { saveSharedRooms } from '../hotel-control/hotel-control.shared-rooms.js';
 import { getAlerts, getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
+import { applyUnbindPlan, planUnbindMany } from '../hotel-control/shared-room-unbind.js';
 import { readRoomGroupArray, roomGroupItemId } from './room-group-placement.js';
 import { OrderService } from './orders.service.js';
 
@@ -1177,6 +1178,117 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
     const orderAfter = await prisma.order.findUnique({ where: { id: orderX.id }, select: { status: true } });
     expect(orderAfter?.status).toBe(OrderStatus.CANCELLED);
     expect((await getHotelNightlyRemaining(hotel.id, [CHECK_IN])).physicalRemaining).toEqual([1]);
+  });
+
+  it('astra finding N4 反例①：两张纯酒店取消单同时强制恢复到已支付，容量 1 时不能同时通过（强制恢复缺库存互斥）', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(1); // 该酒店整段只有 1 间包房
+    // 两张互不相关的纯酒店取消单——都不参与共享房，专测 assertRestoreHotelCapacity
+    // 读余量前有没有先加锁（Order 行锁不能让不同订单互斥，必须是酒店库存自己的锁）。
+    const orderX = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderY = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    await prisma.order.update({ where: { id: orderX.id }, data: { status: OrderStatus.CANCELLED } });
+    await prisma.order.update({ where: { id: orderY.id }, data: { status: OrderStatus.CANCELLED } });
+    expect((await getHotelNightlyRemaining(hotel.id, [CHECK_IN])).physicalRemaining).toEqual([1]);
+
+    // 并发强制恢复（ADMIN force，CANCELLED→PAID）：容量只有 1 间，两张单都要求恢复占座，
+    // 必须有且只有一张成功——不能各自在事务内看到「自己占 1、对方仍取消」的旧快照双双通过。
+    const [outcomeX, outcomeY] = await Promise.allSettled([
+      service.updateStatus(orderX.id, OrderStatus.PAID, { userId: actor.userId, role: UserRole.ADMIN }, '并发强制恢复测试', true),
+      service.updateStatus(orderY.id, OrderStatus.PAID, { userId: actor.userId, role: UserRole.ADMIN }, '并发强制恢复测试', true),
+    ]);
+    for (const outcome of [outcomeX, outcomeY]) {
+      if (outcome.status === 'rejected') {
+        expect(String(outcome.reason)).not.toMatch(/deadlock/i);
+      }
+    }
+    const fulfilledCount = [outcomeX, outcomeY].filter((o) => o.status === 'fulfilled').length;
+    expect(fulfilledCount).toBe(1);
+
+    // 物理占用维持打平的 1 间（没有被两笔恢复叠加占成 2 间）。
+    expect((await getHotelNightlyRemaining(hotel.id, [CHECK_IN])).physicalRemaining).toEqual([0]);
+  });
+
+  it('astra finding N4 反例②：两张单各自触及同两间共享房但顺序相反，合成解绑并发不死锁、最终状态自洽', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+
+    // orderA / orderB 各两条行，分别是 R1、R2 两间共享房的成员——A 在 R1 份额 1、R2 份额 0；
+    // B 在 R1 份额 0、R2 份额 1。两边各自要解绑自己的两条行时，若不统一按房 id 排序加锁，
+    // A 可能先锁 R1 再锁 R2，B 可能先锁 R2 再锁 R1，互相等待成环。
+    const orderA = await createOrderWithTwoHotelItems({ roomTypeIdA: roomType.id, roomTypeIdB: roomType.id });
+    const orderB = await createOrderWithTwoHotelItems({ roomTypeIdA: roomType.id, roomTypeIdB: roomType.id });
+    const [itemA1, itemA2] = orderA.items;
+    const [itemB1, itemB2] = orderB.items;
+
+    const savedR1 = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              { orderId: orderA.id, orderItemId: itemA1.id, passengerIds: [orderA.passengers[0].id], roomFraction: 1 },
+              { orderId: orderB.id, orderItemId: itemB1.id, passengerIds: [orderB.passengers[0].id], roomFraction: 0 },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const savedR2 = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              { orderId: orderB.id, orderItemId: itemB2.id, passengerIds: [orderB.passengers[1].id], roomFraction: 1 },
+              { orderId: orderA.id, orderItemId: itemA2.id, passengerIds: [orderA.passengers[1].id], roomFraction: 0 },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    // 并发：A 一次性合成解绑自己两条行（在 R1、R2 里的成员）；B 同时也一次性合成解绑自己
+    // 两条行——两边都会摸到同一对 SharedRoom 行，谁先谁后由数据库锁裁决，但绝不能死锁。
+    const unbindAndApply = async (orderId: string, orderItemIds: string[]): Promise<void> => {
+      await prisma.$transaction(async (tx) => {
+        const plan = await planUnbindMany(tx, { orderId, orderItemIds });
+        await applyUnbindPlan(tx, plan, 'N4 并发解绑锁序测试');
+      });
+    };
+    const [outcomeA, outcomeB] = await Promise.allSettled([
+      unbindAndApply(orderA.id, [itemA1.id, itemA2.id]),
+      unbindAndApply(orderB.id, [itemB1.id, itemB2.id]),
+    ]);
+    for (const outcome of [outcomeA, outcomeB]) {
+      expect(outcome.status).toBe('fulfilled');
+      if (outcome.status === 'rejected') {
+        expect(String(outcome.reason)).not.toMatch(/deadlock/i);
+      }
+    }
+
+    // 最终状态自洽：两边全部解绑，两间房都清空 → DISSOLVED；两单的成员记录都已清空。
+    const remainingMembers = await prisma.sharedRoomMember.findMany({
+      where: { orderId: { in: [orderA.id, orderB.id] } },
+    });
+    expect(remainingMembers).toHaveLength(0);
+    const roomsAfter = await prisma.sharedRoom.findMany({
+      where: { id: { in: [savedR1.rooms[0].sharedRoomId, savedR2.rooms[0].sharedRoomId] } },
+      select: { status: true },
+    });
+    expect(roomsAfter.every((r) => r.status === 'DISSOLVED')).toBe(true);
   });
 
   it('astra finding A2 反例：恢复时共享房一致（保留合住）不能被当成「凭空新增一间」拒掉——只有 1 间也该放行', async () => {

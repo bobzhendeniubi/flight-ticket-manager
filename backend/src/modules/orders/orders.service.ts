@@ -147,6 +147,7 @@ import {
   getHotelOversellCapRooms,
   getRandomTierAggregate,
   lockHotelBlockPeriodsWithinTx,
+  lockRandomTierBlockPeriodsWithinTx,
   randomStarTierLabel,
   type PhysicalFitViolation,
   type PhysicalOccupancyItem,
@@ -5797,15 +5798,19 @@ export class OrderService {
         list.push(it);
         itemsByHotelAll.set(hotelId, list);
       }
-      const gatedHotelIds = new Set(
+      const gatedHotelIdSet = new Set(
         [...itemsByHotelAll.entries()]
           .filter(([, items]) => items.some((it) => touchedItemIds.has(it.id)))
           .map(([hotelId]) => hotelId),
       );
+      // N4：按酒店 id 升序排序再逐个加锁（Set 保持插入顺序，插入顺序取决于
+      // hotelBearingItems 的行顺序，两笔并发恢复各自的行顺序不保证一致）——统一升序锁，
+      // 避免恢复 X（先锁 H1 后 H2）与恢复 Y（先锁 H2 后 H1）互相等待成环死锁。
+      const gatedHotelIdsSorted = [...gatedHotelIdSet].sort();
 
       if (touchedItemIds.size > 0) {
         const restorePassengers = order.passengers.map((p) => ({ gender: p.gender }));
-        for (const hotelId of gatedHotelIds) {
+        for (const hotelId of gatedHotelIdsSorted) {
           const items = itemsByHotelAll.get(hotelId)!; // 该酒店本单**全部**住宿行，不只是触及的
           const hotelNightDates = [
             ...new Set(items.flatMap((it) => buildStayNightDates(it.hotelCheckIn, it.hotelCheckOut))),
@@ -5884,7 +5889,7 @@ export class OrderService {
             return false;
           }
           const hotelId = it.hotelRoomTypeId ? hotelIdByRoomType.get(it.hotelRoomTypeId) : undefined;
-          return !hotelId || !gatedHotelIds.has(hotelId);
+          return !hotelId || !gatedHotelIdSet.has(hotelId);
         })
         .map((it) => ({
           hotelRoomTypeId: it.hotelRoomTypeId,
@@ -9196,6 +9201,49 @@ export class OrderService {
         : [];
     const roomTypeById = new Map(roomTypes.map((roomType) => [roomType.id, roomType]));
 
+    // N4 修复（CRITICAL）：先统一按「作用域类型 + 作用域 id」升序对全部涉及的酒店 /
+    // 随机档加锁，再读余量判定——原实现读之前完全没有加锁，两张不同订单各自强制恢复、
+    // 各自在事务内看到「自己占 1、对方仍取消」的旧快照，容量 1 时可以同时通过（Order
+    // 行锁不能让不同订单互斥）。行锁必须先于读发生；且跨酒店/随机档的加锁顺序必须
+    // 全局一致（不能按本单行顺序逐个现锁现读），否则两笔并发恢复各自以不同顺序锁不同
+    // 酒店仍可能相互等待成环死锁。
+    const hotelScopeNightDates = new Map<string, Set<string>>();
+    const randomTierScopeNightDates = new Map<number, Set<string>>();
+    for (const item of hotelRows) {
+      const nightDates = buildStayNightDates(item.hotelCheckIn!, item.hotelCheckOut!);
+      if (nightDates.length === 0) continue;
+      const roomType = item.hotelRoomTypeId ? roomTypeById.get(item.hotelRoomTypeId) : undefined;
+      const randomTier = item.randomStarTier ?? roomType?.hotel.randomTierPlaceholder ?? null;
+      if (randomTier != null) {
+        const set = randomTierScopeNightDates.get(randomTier) ?? new Set<string>();
+        for (const d of nightDates) set.add(d);
+        randomTierScopeNightDates.set(randomTier, set);
+      } else if (roomType) {
+        const set = hotelScopeNightDates.get(roomType.hotelId) ?? new Set<string>();
+        for (const d of nightDates) set.add(d);
+        hotelScopeNightDates.set(roomType.hotelId, set);
+      }
+    }
+    type RestoreLockScope = { kind: 'hotel'; id: string } | { kind: 'random'; id: number };
+    const lockScopes: RestoreLockScope[] = [
+      ...[...hotelScopeNightDates.keys()].map((id): RestoreLockScope => ({ kind: 'hotel', id })),
+      ...[...randomTierScopeNightDates.keys()].map((id): RestoreLockScope => ({ kind: 'random', id })),
+    ].sort((a, b) => {
+      if (a.kind !== b.kind) return a.kind < b.kind ? -1 : 1; // 'hotel' 固定排在 'random' 前
+      return String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0;
+    });
+    for (const scope of lockScopes) {
+      if (scope.kind === 'hotel') {
+        await lockHotelBlockPeriodsWithinTx(tx, scope.id, [...hotelScopeNightDates.get(scope.id)!].sort());
+      } else {
+        await lockRandomTierBlockPeriodsWithinTx(
+          tx,
+          scope.id,
+          [...randomTierScopeNightDates.get(scope.id)!].sort(),
+        );
+      }
+    }
+
     const shortage = (result: { remaining: number[]; block: number[]; hasBlock: boolean }): boolean =>
       result.hasBlock &&
       result.remaining.some((remaining, index) => (result.block[index] ?? 0) > 0 && remaining < 0);
@@ -10817,6 +10865,9 @@ export class OrderService {
                 .filter(([, rows]) => rows.some((s) => plansByItemId.has(s.row.id)))
                 .map(([hotelId]) => hotelId),
             );
+            // N4：升序遍历再加锁——与 restoreCancelledOrder 同款理由，避免两笔并发改期各自
+            // 以不同顺序锁同一批酒店造成死锁。
+            const gatedHotelIdsSorted = [...gatedHotelIds].sort();
 
             try {
               if (gatedHotelIds.size > 0) {
@@ -10824,7 +10875,7 @@ export class OrderService {
                   where: { id: orderId },
                   select: { roomAssignment: true },
                 });
-                for (const hotelId of gatedHotelIds) {
+                for (const hotelId of gatedHotelIdsSorted) {
                   const rows = byHotel.get(hotelId)!;
                   const unionDates = [
                     ...new Set(
