@@ -539,10 +539,10 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     // 变更」）。新建房间没有「原始态」可比，有成员就直接提交，没有就跳过（用户建了空房又
     // 没填人，等同没建；新建房只能来自乘客池拖拽，池子本就不含失效成员，无需过滤）。
     const dissolveMap = new Map(dissolvedVersions);
-    const roomsToSave: Array<{ room: DraftRoom; groups: DraftGroup[] }> = [];
+    const roomsToSave: Array<{ room: DraftRoom; groups: DraftGroup[]; membersUnchanged: boolean }> = [];
     for (const r of rooms) {
       if (!r.sharedRoomId) {
-        if (r.groups.length > 0) roomsToSave.push({ room: r, groups: r.groups });
+        if (r.groups.length > 0) roomsToSave.push({ room: r, groups: r.groups, membersUnchanged: false });
         continue;
       }
       if (dissolveMap.has(r.sharedRoomId)) continue; // 已被「解散整间」按钮显式标记
@@ -564,10 +564,10 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
         dissolveMap.set(r.sharedRoomId, r.version ?? 0);
         continue;
       }
-      roomsToSave.push({ room: r, groups: r.groups });
+      roomsToSave.push({ room: r, groups: r.groups, membersUnchanged: !membersChanged });
     }
 
-    for (const { room, groups } of roomsToSave) {
+    for (const { room, groups, membersUnchanged } of roomsToSave) {
       if (!room.hotelRoomTypeId) {
         setSaveErr('每间房都要先选房型再保存');
         return;
@@ -576,11 +576,19 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
       // （N5）——不能只按「活跃成员」算，否则会在后端本会放行的地方被前端自己拦下。
       const totalFraction = roundHalf(groups.reduce((s, g) => s + g.roomFraction, 0));
       if (totalFraction !== 1) {
-        const roomType = roomTypeOptions.find((rt) => rt.id === room.hotelRoomTypeId);
-        setSaveErr(
-          `房间「${roomType?.name ?? room.hotelRoomTypeId}」的计费份额合计须为 1，当前为 ${totalFraction}`,
-        );
-        return;
+        // N3：与后端 H1④ 对齐——既有房 Σ=0 且本房全部成员（份额、成员集合）与落库现状
+        // 完全一致（membersUnchanged，本次只是改了房型/备注等元信息，不是新增/改动
+        // 成员）→ 放行提交，成功后把后端返回的 warning（「原计费方已迁出」提示）展示给
+        // 运营；其余情形（Σ 是其它非 1 值、或成员真有改动）维持前端硬闸，不发请求。
+        // 不能一边后端放行一边前端硬拦——这条分支此前从 UI 永远走不到。
+        const isLeftoverOnlyResubmit = totalFraction === 0 && !!room.sharedRoomId && membersUnchanged;
+        if (!isLeftoverOnlyResubmit) {
+          const roomType = roomTypeOptions.find((rt) => rt.id === room.hotelRoomTypeId);
+          setSaveErr(
+            `房间「${roomType?.name ?? room.hotelRoomTypeId}」的计费份额合计须为 1，当前为 ${totalFraction}`,
+          );
+          return;
+        }
       }
     }
     if (roomsToSave.length === 0 && dissolveMap.size === 0) {
