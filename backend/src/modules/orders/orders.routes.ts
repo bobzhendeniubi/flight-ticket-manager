@@ -23,6 +23,7 @@ import {
   assertHotelFitAfterChange,
   type PhysicalOccupancyItem,
 } from '../hotel-control/hotel-control.service.js';
+import { readBillingFraction } from '../hotel-control/hotel-control.shared-rooms.js';
 import {
   batchCreateOrdersBodySchema,
   batchRescheduleBodySchema,
@@ -1658,8 +1659,10 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       const roomsByItem = new Map<string, number>();
       let unattachedRoomsInner = 0;
       for (const g of finalGroups) {
-        const fraction = Number(g.roomFraction);
-        const value = Number.isFinite(fraction) ? fraction : 1;
+        // astra N12 的孪生：直接复用 readBillingFraction，别再自己写一遍
+        // Number(g.roomFraction) —— 那样 null 会被读成 0，与共享组「nullish → 1，显式 0
+        // → 0」的口径不一致（两份实现迟早漂移）。
+        const value = readBillingFraction(g);
         const itemId = readGroupField(g, 'orderItemId');
         if (itemId) {
           roomsByItem.set(itemId, (roomsByItem.get(itemId) ?? 0) + value);
