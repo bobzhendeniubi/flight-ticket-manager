@@ -1258,7 +1258,9 @@ describe('getOccupyingOrders', () => {
         agentName: '成都国旅',
         sharedRoomCount: 0,
         billedRoomFraction: 1,
-        physicalRoomsDeduped: 0,
+        // 订单完全没有分房表（roomAssignment 字段缺省）→ 回落该行 itemRoomCount
+        // （roomsBilled=1），不是硬 0（astra A11 余项；与上面 rooms:1 同一口径）。
+        physicalRoomsDeduped: 1,
       },
     ]);
   });
@@ -1527,7 +1529,9 @@ describe('getOccupyingOrders', () => {
     );
     const occupants = await getOccupyingOrders({ randomStarTier: 4 }, dayStr(0), client);
     expect(occupants[0]!.sharedRoomCount).toBe(0);
-    expect(occupants[0]!.physicalRoomsDeduped).toBe(0);
+    // 随机档作用域下共享房恒 0，普通房组也没有分房表（roomAssignment: null）→ 回落该行
+    // itemRoomCount（roomsBilled=1），不是硬 0（astra A11 余项）。
+    expect(occupants[0]!.physicalRoomsDeduped).toBe(1);
     const findMany = (client as unknown as { sharedRoomMember: { findMany: ReturnType<typeof vi.fn> } })
       .sharedRoomMember.findMany;
     expect(findMany).not.toHaveBeenCalled();
@@ -1556,7 +1560,9 @@ describe('getOccupyingOrders', () => {
     const occupants = await getOccupyingOrders('h1', dayStr(0), client);
     expect(occupants[0]!.sharedRoomCount).toBe(0);
     expect(occupants[0]!.billedRoomFraction).toBe(1);
-    expect(occupants[0]!.physicalRoomsDeduped).toBe(0);
+    // 没有共享房归属、也没有分房表（roomAssignment: null）→ 回落该行 itemRoomCount
+    // （roomsBilled=1），不是硬 0（astra A11 余项）。
+    expect(occupants[0]!.physicalRoomsDeduped).toBe(1);
   });
 });
 

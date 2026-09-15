@@ -2968,19 +2968,29 @@ export async function getOccupyingOrders(
       scopedHotelNameByOrder.set(oid, it.hotelRoomType?.hotel?.name ?? null);
     }
   }
-  const normalPhysicalByOrder = new Map<string, number>();
-  const normalPhysicalRooms = (order: { id: string; roomAssignment: unknown }): number => {
-    const cached = normalPhysicalByOrder.get(order.id);
-    if (cached != null) return cached;
+  // astra A11 余项：订单**完全没有**分房表（从未分房，`groups.length === 0`）时不能按普通
+  // 口径算 0 间——那会让「真占了房但还没走分房编辑器」的行在下钻里凭空消失。用 null 区分
+  // 「无分房表可算」与「有分房表、但本行没匹配到任何盒子（真的是 0）」，前者由下面调用处
+  // 回落到该行自己的 itemRoomCount（roomsBilled/metadata 口径），后者维持 0。
+  const normalPhysicalByOrder = new Map<string, number | null>();
+  const normalPhysicalRooms = (order: { id: string; roomAssignment: unknown }): number | null => {
+    if (normalPhysicalByOrder.has(order.id)) return normalPhysicalByOrder.get(order.id)!;
+    const groups = parseRoomGroups(order.roomAssignment);
+    if (groups == null) {
+      // 订单完全没有分房表——不是「有分房表但这行没匹配到盒子」的 0，是「这套口径根本
+      // 没法判定」，调用处回落到该行自己的 itemRoomCount（astra A11 余项）。
+      normalPhysicalByOrder.set(order.id, null);
+      return null;
+    }
     const itemIds = scopedItemIdsByOrder.get(order.id) ?? new Set<string>();
     const hotelName = scopedHotelNameByOrder.get(order.id) ?? null;
-    const groups = parseRoomGroups(order.roomAssignment);
-    const scopedGroups = (groups ?? []).filter((g) => {
+    const scopedGroups = groups.filter((g) => {
       const attributedId = groupOrderItemId(g);
       return attributedId != null
         ? itemIds.has(attributedId)
         : hotelName != null && g.hotelName === hotelName;
     });
+    // 订单确实有分房表，只是这一行没匹配到任何盒子——维持 0（不是「无法判定」）。
     const val = scopedGroups.length > 0 ? physicalRoomsOfGroups(scopedGroups, order.id) : 0;
     normalPhysicalByOrder.set(order.id, val);
     return val;
@@ -3015,7 +3025,16 @@ export async function getOccupyingOrders(
         agentName: it.order.agent?.companyName ?? '直客',
         sharedRoomCount,
         billedRoomFraction: billedByOrder.get(it.order.id) ?? 0,
-        physicalRoomsDeduped: round2(normalPhysicalRooms(it.order) + sharedRoomCount),
+        // astra A11 余项：订单没有分房表时 normalPhysicalRooms 返回 null（不是 0），
+        // 回落到该行自己的 itemRoomCount（roomsBilled/metadata 口径），不能让「从未
+        // 走过分房编辑器」的行在下钻里凭空显示 0 间。只在该单本晚也没有任何共享房归属
+        // （sharedRoomCount === 0）时才回落——已参与共享房的订单，它的 roomsBilled 记的
+        // 是共享房里的计费份额，不是另一间独立物理房，itemRoomCount 在这里回落会与
+        // sharedRoomCount 重复计数（普通 0 + 共享 N 已经是这单在本晚的完整占用）。
+        physicalRoomsDeduped: round2(
+          (normalPhysicalRooms(it.order) ?? (sharedRoomCount === 0 ? itemRoomCount(it) : 0)) +
+            sharedRoomCount,
+        ),
       };
     });
 }
