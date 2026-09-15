@@ -1469,6 +1469,55 @@ export async function lockHotelBlockPeriodsWithinTx(
 }
 
 /**
+ * 恢复路径专用的酒店库存互斥（astra N4 锁侧）：按酒店 id 升序逐个锁该酒店**全部**包房
+ * 周期行；这家酒店完全没有配置任何包房周期（未纳管）时退化为
+ * `pg_advisory_xact_lock(hashtext(hotelId))`，方案 §六步骤 4 明文写的兜底。
+ *
+ * 与 `lockHotelBlockPeriodsWithinTx` 的区别：
+ *   · 不按日期区间过滤，锁该酒店的全部周期行——一次恢复可能牵涉该酒店多段互不相邻的
+ *     日期，调用方在锁到手之后再各自重读容量判定；提前按某一段区间收窄反而可能漏锁到
+ *     另一段日期正被别的并发恢复请求压着的周期行。
+ *   · 无周期时会退化为 advisory lock；`lockHotelBlockPeriodsWithinTx` 不会——那个函数
+ *     背后的两个既有调用方（`assertHotelPhysicalFitWithinTx` / `assertHotelFitAfterChange`）
+ *     在「无周期＝未纳管，不拦」时会直接整段跳过后续判定，届时加不加锁都不影响结果，
+ *     不必为它们改变行为；但恢复路径的容量判定目前是调用方自己另外实现的
+ *     `assertRestoreHotelCapacity`（不经过这两个函数），在拿到锁之前不知道这家酒店
+ *     最终算不算「未纳管」，所以本函数统一兜底加锁，把「要不要真正判定容量」的决定权
+ *     留给调用方在锁到手之后自己做。
+ *
+ * 用法同 `lockHotelBlockPeriodsWithinTx`：必须在调用方事务内调用，随后在同一事务里完成
+ * 恢复判定与落库，不得提前释放锁。
+ *
+ * @param hotelIds 本次恢复涉及的全部酒店 id（可以有重复，内部会去重）——调用方负责收集
+ *   全部受影响酒店，遗漏一个就等于那家酒店没有互斥，见 astra N4：两张不同的纯酒店
+ *   取消单同时强制恢复，各自在事务内看到「自己占 1、对方仍取消」，容量 1 时能同时提交。
+ */
+export async function lockHotelInventoryForUpdate(
+  tx: Prisma.TransactionClient,
+  hotelIds: readonly string[],
+): Promise<void> {
+  const sortedHotelIds = [...new Set(hotelIds)].sort();
+  for (const hotelId of sortedHotelIds) {
+    const lockedPeriods = await tx.$queryRaw<Array<{ id: string }>>`
+      SELECT id FROM "HotelBlockPeriod"
+      WHERE "hotelId" = ${hotelId}
+      ORDER BY id
+      FOR UPDATE
+    `;
+    if (lockedPeriods.length === 0) {
+      // 没有包房周期行可锁——退化为 advisory lock，否则两个都判定「这家酒店未纳管」的
+      // 并发恢复请求永远不会在这里排队，各自读到对方提交前的旧快照（astra N4）。
+      // hashtext 返回 int4，pg_advisory_xact_lock 的 bigint 重载会做隐式提升，写法上
+      // 不需要显式 cast。用 $executeRaw 而不是 $queryRaw——pg_advisory_xact_lock 返回
+      // void，Prisma 的 $queryRaw 结果集反序列化不认识 void 列类型，会直接抛
+      // 「Failed to deserialize column of type 'void'」，$executeRaw 只关心受影响行数，
+      // 不尝试解析返回列。
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${hotelId}))`;
+    }
+  }
+}
+
+/**
  * `assertHotelPhysicalFit` 的**事务内互斥**变体：先锁该酒店该区间的包房周期行，
  * 再在同一事务里跑一遍完全相同的前瞻闸判定。
  *
@@ -1583,9 +1632,16 @@ async function computeSharedRoomPhysicalAfterChange(
   // 覆盖项按 hotelId 过滤（跨批需求）：调用方理应逐酒店只传该酒店的覆盖项，但一旦手滑
   // 传错（如换酒店场景，被解绑房间其实属于原酒店而非目标酒店），不按 hotelId 过滤会把
   // 别家酒店共享房的 checkIn/checkOut 误加进本次统计。覆盖项自带 hotelId 就直接比对；
-  // 没带的，有 sharedRoomId（改动既有房）就查库拿它的真实 hotelId；没有 sharedRoomId
-  // （全新建的房，库里还没有这行）视为属于本次 gate 的 hotelId——新房本就是为这次操作
-  // 的目标酒店建的，查无可查。查不到真实归属（脏数据）宁可漏算也不错算进本酒店。
+  // 没带的，有 sharedRoomId 就查库拿它的真实 hotelId：
+  //   · 查到、且跟本次 hotelId 不一致——维持原有的静默过滤（不算进本次 gate），这是
+  //     「换酒店」等场景下调用方按跨批需求刻意依赖的行为，见下面 belongsToThisHotel；
+  //   · 查不到（astra N1，回归）——不能当「不属于本酒店」处理：新建的共享房在调用方
+  //     落库前就已经生成 sharedRoomId 塞进覆盖项（订单 JSON 镜像与真正建表要用同一个
+  //     id，见 hotel-control.shared-rooms.ts 的 resolvedRoomIds），这个 id 此刻在库里
+  //     本来就查不到，「查不到」在这里恰恰是「待创建」的正常信号，不是「不属于本酒店」
+  //     的信号——旧实现把两者混为一谈，会把一间刚决定新建、马上要占用物理房间的共享房
+  //     整间从前瞻闸里过滤掉（复现：同一个新房覆盖项，不带 hotelId 时算作 0 间，带上
+  //     正确 hotelId 才算 1 间）。
   const lookupIds = [
     ...new Set(
       overrides
@@ -1607,8 +1663,17 @@ async function computeSharedRoomPhysicalAfterChange(
   }
   const belongsToThisHotel = (o: SharedRoomAfterState): boolean => {
     if (o.hotelId != null) return o.hotelId === hotelId;
-    if (o.sharedRoomId) return hotelIdByRoomId.get(o.sharedRoomId) === hotelId;
-    return true; // 新建房间，没有可查的真实归属，按调用意图视为本酒店
+    if (!o.sharedRoomId) return true; // 全新建、连 id 都没预生成的房间——没有可查的真实归属，按调用意图视为本酒店
+    const dbHotelId = hotelIdByRoomId.get(o.sharedRoomId);
+    // 库里查不到 = 待创建（astra N1）：不能当「不属于本酒店」处理，否则会把一间刚决定
+    // 新建、马上要占用物理房间的共享房整间从前瞻闸里过滤掉。
+    // 库里查到、但归属的是别家酒店：维持原有的静默过滤（不是 astra 建议的抛错）——
+    // 这条分支是「换酒店」等场景下调用方按跨批需求刻意依赖的行为（见上面 lookupIds
+    // 的既有注释与本文件同 describe 块里那条更早的测试：调用方允许把两家酒店的覆盖项
+    // 混在一起传，靠这里查库过滤而不必自己先按酒店分组），改成抛错会让那类合法调用
+    // 直接 400。真正的数据/调用异常应在调用方自己的 hotelId 归属校验里挡（跨单分房
+    // 保存端已经这样做——见 hotel-control.shared-rooms.ts 的 CAS 校验），这里不重复收紧。
+    return dbHotelId === undefined || dbHotelId === hotelId;
   };
   const scopedOverrides = overrides.filter(belongsToThisHotel);
 
@@ -1656,9 +1721,13 @@ async function computeSharedRoomPhysicalAfterChange(
  *
  * 该酒店本区间没有任何包房周期 → 未纳管，不拦（房控哲学：未配包房 ≠ 售罄）。
  *
- * @returns 被 `options.maxOversellRooms` 容忍的超卖明细（未开豁免、未超卖、或被
- *   `allowNonWorsening` 放行 → 空数组）。调用方拿非空返回值写 WARNING 审计，语义与
- *   `assertHotelPhysicalFit` 完全一致。
+ * @returns 被 `options.maxOversellRooms` 容忍的超卖明细（`PhysicalFitViolation[]`，形状
+ *   与 `assertHotelPhysicalFit`/`assertHotelPhysicalFitWithinTx` 完全一致、稳定导出，
+ *   调用方可以放心解构）：未开 `maxOversellRooms` 豁免、未超卖、或被 `allowNonWorsening`
+ *   放行 → 空数组。**调用方必须接住这个返回值并在非空时写 WARNING 审计**（astra N3：
+ *   `restoreCancelledOrder` 曾经调用了这个函数却把返回值直接丢在语句里没有变量接收，
+ *   容忍超卖这件事本该留痕却完全没有痕迹）——不能像那样 `await assertHotelFitAfterChange(...)`
+ *   把结果扔掉；也不能只在某些调用点接、某些不接，语义应统一。
  */
 export async function assertHotelFitAfterChange(
   tx: Prisma.TransactionClient,
@@ -2952,19 +3021,29 @@ export async function getOccupyingOrders(
       scopedHotelNameByOrder.set(oid, it.hotelRoomType?.hotel?.name ?? null);
     }
   }
-  const normalPhysicalByOrder = new Map<string, number>();
-  const normalPhysicalRooms = (order: { id: string; roomAssignment: unknown }): number => {
-    const cached = normalPhysicalByOrder.get(order.id);
-    if (cached != null) return cached;
+  // astra A11 余项：订单**完全没有**分房表（从未分房，`groups.length === 0`）时不能按普通
+  // 口径算 0 间——那会让「真占了房但还没走分房编辑器」的行在下钻里凭空消失。用 null 区分
+  // 「无分房表可算」与「有分房表、但本行没匹配到任何盒子（真的是 0）」，前者由下面调用处
+  // 回落到该行自己的 itemRoomCount（roomsBilled/metadata 口径），后者维持 0。
+  const normalPhysicalByOrder = new Map<string, number | null>();
+  const normalPhysicalRooms = (order: { id: string; roomAssignment: unknown }): number | null => {
+    if (normalPhysicalByOrder.has(order.id)) return normalPhysicalByOrder.get(order.id)!;
+    const groups = parseRoomGroups(order.roomAssignment);
+    if (groups == null) {
+      // 订单完全没有分房表——不是「有分房表但这行没匹配到盒子」的 0，是「这套口径根本
+      // 没法判定」，调用处回落到该行自己的 itemRoomCount（astra A11 余项）。
+      normalPhysicalByOrder.set(order.id, null);
+      return null;
+    }
     const itemIds = scopedItemIdsByOrder.get(order.id) ?? new Set<string>();
     const hotelName = scopedHotelNameByOrder.get(order.id) ?? null;
-    const groups = parseRoomGroups(order.roomAssignment);
-    const scopedGroups = (groups ?? []).filter((g) => {
+    const scopedGroups = groups.filter((g) => {
       const attributedId = groupOrderItemId(g);
       return attributedId != null
         ? itemIds.has(attributedId)
         : hotelName != null && g.hotelName === hotelName;
     });
+    // 订单确实有分房表，只是这一行没匹配到任何盒子——维持 0（不是「无法判定」）。
     const val = scopedGroups.length > 0 ? physicalRoomsOfGroups(scopedGroups, order.id) : 0;
     normalPhysicalByOrder.set(order.id, val);
     return val;
@@ -2999,7 +3078,16 @@ export async function getOccupyingOrders(
         agentName: it.order.agent?.companyName ?? '直客',
         sharedRoomCount,
         billedRoomFraction: billedByOrder.get(it.order.id) ?? 0,
-        physicalRoomsDeduped: round2(normalPhysicalRooms(it.order) + sharedRoomCount),
+        // astra A11 余项：订单没有分房表时 normalPhysicalRooms 返回 null（不是 0），
+        // 回落到该行自己的 itemRoomCount（roomsBilled/metadata 口径），不能让「从未
+        // 走过分房编辑器」的行在下钻里凭空显示 0 间。只在该单本晚也没有任何共享房归属
+        // （sharedRoomCount === 0）时才回落——已参与共享房的订单，它的 roomsBilled 记的
+        // 是共享房里的计费份额，不是另一间独立物理房，itemRoomCount 在这里回落会与
+        // sharedRoomCount 重复计数（普通 0 + 共享 N 已经是这单在本晚的完整占用）。
+        physicalRoomsDeduped: round2(
+          (normalPhysicalRooms(it.order) ?? (sharedRoomCount === 0 ? itemRoomCount(it) : 0)) +
+            sharedRoomCount,
+        ),
       };
     });
 }

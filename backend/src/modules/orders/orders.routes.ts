@@ -1376,8 +1376,12 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         roomGroups: z.array(
           z.object({
             id: z.string(),
-            hotelName: z.string(),
-            roomType: z.string(),
+            // astra B4：与他单合住（带 sharedRoomId）的房组只允许改 notes，代理拿到的外部
+            // DTO（room-group-dto.ts 的 ExternalRoomGroup）本就不含 hotelName，不该强制要求
+            // 这类锁定组的前端把它凭空编出来再原样回传——真正的普通组仍在下面 reconcile 里
+            // 显式校验这两个字段非空，不靠 zod 层的必填兜底。
+            hotelName: z.string().optional(),
+            roomType: z.string().optional(),
             passengerIds: z.array(z.string()),
             notes: z.string().optional(),
             // 半间/拼房：0.5 = 占半间（与他人拼），默认 1 间。Σ roomFraction = 该单实际占房间数。
@@ -1480,17 +1484,33 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         const oldSplitPairKey = old ? readGroupField(old, 'splitPairKey') : null;
 
         if (oldSharedRoomId) {
+          // astra B4：与他单合住的房组只许改 notes，其它字段一律以锁后现状（old）为准——
+          // 但「一律以旧值为准」不等于「客户端必须原样回传旧值，传漏了就当作改动」。
+          // 代理拿到的外部 DTO（room-group-dto.ts 的 ExternalRoomGroup）本就不含
+          // orderItemId、hotelName；前端保存一次「只改备注」的编辑时，没有值的字段很可能
+          // 干脆不出现在 payload 里（不是显式传了不一样的值）。旧实现把「省略」和「显式传
+          // 了别的值」同等对待——`g.orderItemId ?? null` 把 undefined 也读成 null 再跟
+          // old 比，省略等于「显式改成 null」，锁定组一有归属就会被误判成「被改动」直接
+          // 400，代理连改个备注都做不到。
+          //
+          // 修法：仅当客户端**显式提供**了该字段（不是 undefined）时才纳入比较；省略的
+          // 字段视为「不比较」，最终落库仍然一律用 old 的值（下面 finalGroups.push 的
+          // `...old` 没变）——省略不会让任何字段被悄悄改掉，只是不会因为「没传」而拒绝
+          // 这次保存。passengerIds 不在此列：它是 schema 里的必填字段，代理外部 DTO 也
+          // 带着本单当前成员，理应原样回传，客户端传的乘客集合与旧值不同仍然要拒绝。
           const samePax =
             JSON.stringify([...g.passengerIds].sort()) ===
             JSON.stringify([...((old?.passengerIds as string[] | undefined) ?? [])].sort());
-          const sameOrderItem = (g.orderItemId ?? null) === (readGroupField(old, 'orderItemId') ?? null);
-          const sameHotelName = g.hotelName === (old?.hotelName ?? '');
-          const sameRoomType = g.roomType === (old?.roomType ?? '');
+          const sameOrderItem =
+            g.orderItemId === undefined ||
+            g.orderItemId === (readGroupField(old, 'orderItemId') ?? undefined);
+          const sameHotelName = g.hotelName === undefined || g.hotelName === (old?.hotelName ?? '');
+          const sameRoomType = g.roomType === undefined || g.roomType === (old?.roomType ?? '');
           const oldFraction = old?.roomFraction == null ? 1 : Number(old.roomFraction);
-          const sameFraction = (g.roomFraction ?? 1) === oldFraction;
+          const sameFraction = g.roomFraction === undefined || g.roomFraction === oldFraction;
           if (!samePax || !sameOrderItem || !sameHotelName || !sameRoomType || !sameFraction) {
             throw new BadRequestError(
-              `房间「${g.hotelName}·${g.roomType}」与他单合住，请在房控页「跨单分房」里调整（这里只能改备注）`,
+              `房间「${g.hotelName ?? old?.hotelName ?? ''}·${g.roomType ?? old?.roomType ?? ''}」与他单合住，请在房控页「跨单分房」里调整（这里只能改备注）`,
             );
           }
           finalGroups.push({
@@ -1510,7 +1530,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           const oldFractionPlain = old?.roomFraction == null ? null : Number(old.roomFraction);
           if (oldFractionPlain !== 0) {
             throw new BadRequestError(
-              `房间「${g.hotelName}·${g.roomType}」不与他单合住，roomFraction 不能为 0`,
+              `房间「${g.hotelName ?? ''}·${g.roomType ?? ''}」不与他单合住，roomFraction 不能为 0`,
             );
           }
           finalGroups.push({
@@ -1518,6 +1538,13 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
             notes: g.notes ?? (old?.notes as string | undefined),
           });
           continue;
+        }
+        // 真正的普通组：hotelName / roomType 在 zod 层已经放宽成 optional（astra B4 是为了
+        // 放行锁定共享组的省略字段），这里补回硬校验——普通组不享受那条豁免，仍然必须
+        // 显式带上这两个字段，不能悄悄把 undefined 写进 roomAssignment JSON（会破坏
+        // physicalRoomsOfGroups 等依赖 hotelName 兜底匹配的下游读取）。
+        if (!g.hotelName || !g.roomType) {
+          throw new BadRequestError('普通房组必须提供 hotelName 与 roomType');
         }
         finalGroups.push({
           ...g,

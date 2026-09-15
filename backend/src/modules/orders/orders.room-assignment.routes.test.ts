@@ -276,6 +276,53 @@ describe('PUT /orders/:id/room-assignment · 跨单分房 reconcile', () => {
     expect(written.roomGroups[0]).toMatchObject({ sharedRoomId: 'sr1', notes: '新备注', roomFraction: 0 });
   });
 
+  /**
+   * astra B4：代理拿到的外部 DTO（room-group-dto.ts 的 ExternalRoomGroup）本就不含
+   * orderItemId / hotelName，前端保存一次「只改备注」的编辑时这些字段很可能干脆不出现在
+   * payload 里——不是显式传了不一样的值。旧实现把「省略」等同于「显式改成别的值」，锁定
+   * 组一有归属/酒店名就会被误判成「被改动」，代理连改个备注都做不到。
+   */
+  it('astra B4：AGENT 只带 id + passengerIds + notes（省略 orderItemId/hotelName/roomType/roomFraction）保存共享组 → 200 且只改备注', async () => {
+    prismaMock.agent.findUnique.mockResolvedValue({ id: 'ag-1', isActive: true });
+    serviceMocks.getOrder.mockResolvedValue({ id: 'o1' });
+    prismaMock.tx.order.findUnique.mockResolvedValue({
+      roomAssignment: {
+        roomGroups: [
+          {
+            id: 'g1',
+            hotelName: '椰岛大酒店',
+            roomType: '双床',
+            passengerIds: ['p1'],
+            roomFraction: 0.5,
+            orderItemId: 'item1',
+            sharedRoomId: 'sr1',
+            notes: '旧备注',
+          },
+        ],
+      },
+    });
+    const res = await app.inject({
+      method: 'PUT',
+      url: '/orders/o1/room-assignment',
+      headers: { authorization: `Bearer ${app.jwt.sign({ sub: 'u-AGENT', role: UserRole.AGENT })}` },
+      // 外部 DTO（ExternalRoomGroup）本就没有 orderItemId / hotelName；这里连 roomType /
+      // roomFraction 也一并省略，只有 schema 硬性要求的 id + passengerIds，外加要改的 notes。
+      payload: { roomGroups: [{ id: 'g1', passengerIds: ['p1'], notes: '代理改的备注' }] },
+    });
+    expect(res.statusCode).toBe(200);
+    const written = prismaMock.tx.order.update.mock.calls[0][0].data.roomAssignment;
+    // 锁定组的其它字段一律沿用锁后现状（old），只有 notes 按请求更新——省略不代表被清空
+    // 或被拒绝，也不会让 hotelName/roomType/orderItemId/roomFraction 变成 undefined。
+    expect(written.roomGroups[0]).toMatchObject({
+      sharedRoomId: 'sr1',
+      hotelName: '椰岛大酒店',
+      roomType: '双床',
+      orderItemId: 'item1',
+      roomFraction: 0.5,
+      notes: '代理改的备注',
+    });
+  });
+
   it('带 sharedRoomId 的房组改乘客 → 400，不落库', async () => {
     prismaMock.tx.order.findUnique.mockResolvedValue({
       roomAssignment: {

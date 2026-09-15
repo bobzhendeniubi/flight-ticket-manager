@@ -444,17 +444,23 @@ async function runWithLockSetRetry<T>(fn: () => Promise<T>): Promise<T> {
 }
 
 /**
- * 房组的计费份额——**只对缺省/非数字** 回落成整间 1（与 hotel-control.service 的
- * groupRoomFraction 同口径，旧客户端省略字段时的兼容行为）。显式 0 一律原样保留为 0，
- * 不分共享组还是普通组：共享组的 0 是主单让份的明确值；普通组的 0 是解绑后留下的
- * 「与他单合住时计费 0 间」的历史值，重存时不能被这条兜底悄悄改回 1（astra A5②，
- * 旧实现只对共享组放行显式 0，普通组的 `explicit > 0` 判断会把 0 吃成 1）。
+ * 房组的计费份额——**只对 nullish（null / 省略）** 回落成缺省值（共享组缺省 0、普通组
+ * 缺省 1，与 hotel-control.service 的 groupRoomFraction 同口径，旧客户端省略字段时的
+ * 兼容行为）。显式数值（含 0）一律原样保留，不分共享组还是普通组：共享组的显式 0 是主单
+ * 让份的明确值；普通组的显式 0 是解绑后留下的「与他单合住时计费 0 间」的历史值，重存时
+ * 不能被这条兜底悄悄改回 1（astra A5②）。
+ *
+ * astra N12（回归）：曾经先 `Number(g.roomFraction)` 再判断——`Number(null) === 0` 与
+ * `Number(0) === 0` 无法区分，普通组的 `roomFraction: null`（真正「没有显式值」的历史
+ * 数据）会被这条兜底误判成「显式 0」，读出 0 而不是缺省的 1。必须先看原始值是不是
+ * nullish，再决定要不要 `Number()` 转换。
  */
-function readBillingFraction(g: Record<string, unknown>): number {
-  const n = Number(g.roomFraction);
-  const explicit = Number.isFinite(n) ? n : null;
-  if (groupSharedId(g) != null) return explicit ?? 0;
-  return explicit ?? 1;
+export function readBillingFraction(g: Record<string, unknown>): number {
+  const raw = g.roomFraction;
+  const fallback = groupSharedId(g) != null ? 0 : 1;
+  if (raw === null || raw === undefined) return fallback;
+  const n = Number(raw);
+  return Number.isFinite(n) ? n : fallback;
 }
 
 /**
@@ -463,7 +469,7 @@ function readBillingFraction(g: Record<string, unknown>): number {
  * 所以用一个真结果永远不会长这样的形状（finalResult 恒有 rooms/dissolved/warnings 三个键，
  * 从不带 __pending）来判定「这行是不是还没跑完」。
  */
-const PENDING_SENTINEL = { __pending: true } as const;
+export const PENDING_SENTINEL = { __pending: true } as const;
 function isPendingSentinel(value: unknown): boolean {
   return !!value && typeof value === 'object' && (value as Record<string, unknown>).__pending === true;
 }
@@ -480,26 +486,36 @@ const PENDING_STALE_TIMEOUT_MS = 10 * 60 * 1000;
 /** 幂等占位重新抢占的重试上限：初次尝试 + 抢占一次孤儿占位后的重试，两次封顶。 */
 const MAX_RESERVE_ATTEMPTS = 2;
 
-interface ReserveOutcome {
+/** 导出仅供单测直接驱动 CAS 分支（astra N10），不是给业务调用方用的公共 API。*/
+export interface ReserveOutcome {
   /** 非 null = 直接回放这个结果（同 token 同指纹的正常重放），调用方不必再跑业务逻辑。*/
   replay: SaveSharedRoomsResult | null;
+  /**
+   * 非 null = 这次调用真正拿到的占位行主键（cuid，与 requestToken 分离，见 astra N10）。
+   * `replay` 非 null 时恒为 null——回放路径没有新占位，不该有所有权可言。业务写入完成后
+   * 的最终结果写入、以及失败时的占位清理，都必须绑定这个 id，不能再用 requestToken：
+   * requestToken 在「孤儿占位被抢占」后会指向一张全新的行（新 id），旧持有者若还在用
+   * requestToken 做条件，就会误伤新占位的行。
+   */
+  reservationId: string | null;
 }
 
 /**
  * §六幂等占位（单独抽出便于说清楚每条分支）：requestToken 唯一，先占位再算——占位成功
  * 就是「这次是第一次跑」，占位失败（唯一键冲突）说明已有记录，按指纹决定回放/冲突/抢占。
  */
-async function reserveRequestOrReplay(
+export async function reserveRequestOrReplay(
   client: PrismaClient,
   body: SaveSharedRoomsBody,
   fingerprint: string,
 ): Promise<ReserveOutcome> {
   for (let attempt = 0; attempt < MAX_RESERVE_ATTEMPTS; attempt++) {
     try {
-      await client.sharedRoomRequest.create({
+      const created = await client.sharedRoomRequest.create({
         data: { requestToken: body.requestToken, fingerprint, resultJson: PENDING_SENTINEL },
+        select: { id: true },
       });
-      return { replay: null };
+      return { replay: null, reservationId: created.id };
     } catch (err) {
       if (!(err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2002')) throw err;
 
@@ -515,7 +531,7 @@ async function reserveRequestOrReplay(
         throw new ConflictError('该请求编号已用于另一次不同的跨单分房保存，请刷新后重试');
       }
       if (!isPendingSentinel(existing.resultJson)) {
-        return { replay: existing.resultJson as unknown as SaveSharedRoomsResult };
+        return { replay: existing.resultJson as unknown as SaveSharedRoomsResult, reservationId: null };
       }
       // 走到这里：同 token 同指纹、且仍是 PENDING——上一次占位还没写出真结果。
       const ageMs = Date.now() - existing.createdAt.getTime();
@@ -525,11 +541,20 @@ async function reserveRequestOrReplay(
         // 提示调用方稍后用同一个 token 重试才是安全的（astra A12）。
         throw new ConflictError('该请求编号上一次保存尚未完成，请稍后使用同一请求编号重试');
       }
-      // 超过孤儿占位超时——按 id 精确删除（不是按 requestToken，避免删掉别的进程
-      // 刚好在这一瞬间抢占成功后新建的行）。删到 0 行说明已经被别的进程抢先处理，
-      // 回落到「仍在处理中」提示；删到 1 行说明抢占成功，回到循环顶部重新占位。
+      // 超过孤儿占位超时——按 id + 仍为 PENDING 的条件 CAS 删除（astra N10 回归）：只按
+      // requestToken + id 删不够——如果就在我们读到 existing 之后、真正执行删除之前，
+      // 它原来的持有者（其实没死，只是慢）刚好写完真结果，这一行的 resultJson 已经从
+      // PENDING_SENTINEL 变成真正的业务结果，此时按 id 删还是会把这个「刚成功」的记录删掉，
+      // 原持有者的完整占位历史凭空消失。加上 `resultJson: { equals: PENDING_SENTINEL }`
+      // 让这次删除成为一次条件 CAS：仍是 PENDING 才真的删得掉；已经被原持有者写完的情况下，
+      // 删除影响 0 行，回落到下面的「仍在处理中」提示，调用方用同一个 token 再试一次就能
+      // 读到原持有者的真实结果。
       const reclaimed = await client.sharedRoomRequest.deleteMany({
-        where: { requestToken: body.requestToken, id: existing.id },
+        where: {
+          requestToken: body.requestToken,
+          id: existing.id,
+          resultJson: { equals: PENDING_SENTINEL },
+        },
       });
       if (reclaimed.count === 0) {
         throw new ConflictError('该请求编号上一次保存尚未完成，请稍后使用同一请求编号重试');
@@ -556,15 +581,22 @@ export async function saveSharedRooms(
 
   const reservation = await reserveRequestOrReplay(client, body, fingerprint);
   if (reservation.replay) return reservation.replay;
+  // reservation.replay 为 null 时 reserveRequestOrReplay 恒返回非 null 的 reservationId
+  // （见 ReserveOutcome 的接口注释）——两者互斥，这里非空断言反映的是该函数自身的契约，
+  // 不是绕过类型检查。
+  const reservationId = reservation.reservationId!;
 
   // 占位成功之后，本函数任何一步失败（400/409/其它异常）都必须把占位行删掉：否则占位行的
   // resultJson 停在 PENDING_SENTINEL，下次同 token 同指纹重试会被判定「仍在处理中」白等到
-  // 超时窗口，或者（改指纹）直接 409——都不是「重新跑一遍」。
+  // 超时窗口，或者（改指纹）直接 409——都不是「重新跑一遍」。按 id（不是 requestToken）
+  // 删除（astra N10）：如果这次占位已经被别的进程判定超时、抢占并重建（新 id、同
+  // requestToken），按 requestToken 删会误删新占位的行；按自己的 id 删，抢占已发生时
+  // 这里天然影响 0 行，不会牵连无关的新占位。
   try {
-    return await saveSharedRoomsInner(body, actor, client);
+    return await saveSharedRoomsInner(body, actor, client, reservationId);
   } catch (err) {
     // 最佳努力清理占位——删失败也不能吞掉原始错误，原始错误才是调用方需要看到的。
-    await client.sharedRoomRequest.delete({ where: { requestToken: body.requestToken } }).catch(() => {});
+    await client.sharedRoomRequest.deleteMany({ where: { id: reservationId } }).catch(() => {});
     throw err;
   }
 }
@@ -573,6 +605,7 @@ async function saveSharedRoomsInner(
   body: SaveSharedRoomsBody,
   actor: AuditActor,
   client: PrismaClient,
+  reservationId: string,
 ): Promise<SaveSharedRoomsResult> {
   const checkInD = new Date(`${body.checkIn}T00:00:00.000Z`);
   const checkOutD = new Date(`${body.checkOut}T00:00:00.000Z`);
@@ -618,6 +651,14 @@ async function saveSharedRoomsInner(
     //   · 旧房的 version 永远不涨，membership 却在变，等于绕开了整套 CAS 协议。
     // 只在「本酒店本区间」匹配的范围内找——乘客可能在别的酒店/别的行程也挂着别的共享房，
     // 那些与本次请求无关，不该被牵连进来。
+    //
+    // 这一步查询发生在任何锁之前，结果只是「候选」，不是定论（astra N5：下面锁完之后会
+    // 重新核实一遍，见 lockAffectedOrdersOnce 调用之后的复查）——**不要**在这里改成先给
+    // initialOrderIds 加锁再查：两个并发请求各自只锁自己请求里明确点名的那部分订单、彼此
+    // 顺序不一致时，会与下面按统一排序锁完整候选集合的做法相冲突，人为制造出锁序不一致的
+    // 死锁（试过，真会死锁：见集成测试「并发交错提交不死锁」）。全局锁序必须只有一处
+    // 决定——按 lockAffectedOrdersOnce 内部「候选集合排序后逐个锁」这一处，不能在它之前
+    // 再插一次单独排序的锁。
     const implicitRoomIds = new Set<string>();
     if (allRequestedPassengerIds.size > 0) {
       const implicitMemberships = await tx.sharedRoomMember.findMany({
@@ -633,6 +674,35 @@ async function saveSharedRoomsInner(
     const touchedSharedRoomIds = new Set<string>([...explicitTouchedSharedRoomIds, ...implicitRoomIds]);
 
     const lockedOrderIds = await lockAffectedOrdersOnce(tx, initialOrderIds, touchedSharedRoomIds);
+
+    // 锁后重新发现隐式房（astra N5 回归修复）：上面那次查询是锁前的候选，
+    // lockAffectedOrdersOnce 内部只核实「已经发现的 touchedSharedRoomIds 里成员有没有
+    // 变多」，从来不会发现「一开始就没发现的房间」——如果就在上面查完之后、这里锁到之前，
+    // 本次认领的乘客被另一个并发请求挪去了一间我们完全没发现的第三间房，我们既不会锁那
+    // 间房、也不会在下面清理它对这些乘客的成员表引用，留下孤儿引用。
+    //
+    // 现在锁已经拿到手：lockedOrderIds ⊇ initialOrderIds，这些乘客全部归属
+    // initialOrderIds 里的订单（body.rooms 的 g.orderId），而任何想把这些乘客挪进/挪出
+    // 一间共享房的并发写入，同样要把这些订单纳入它自己的 initialOrderIds、同样要走这个
+    // 函数、同样要先抢到这些订单的 Order 锁——换句话说，我们锁住这些订单的那一刻起，这些
+    // 乘客的共享房归属就已经冻结了。这里用锁后的最新状态重新查一遍隐式房，只在真发现了
+    // 锁前那次查询没有覆盖到的新房间时才抛 SharedRoomLockSetExpandedError 交给外层整个
+    // 事务重试（该房间下一轮会被正确纳入 touched 并锁上）；查询本身很轻，允许每次都重查，
+    // 不必用「变了没有」的增量判断去省这一次查询。
+    if (allRequestedPassengerIds.size > 0) {
+      const recheckedMemberships = await tx.sharedRoomMember.findMany({
+        where: {
+          passengerId: { in: [...allRequestedPassengerIds] },
+          sharedRoomId: { notIn: [...explicitTouchedSharedRoomIds] },
+          sharedRoom: { hotelId: body.hotelId, checkIn: checkInD, checkOut: checkOutD, status: 'ACTIVE' },
+        },
+        select: { sharedRoomId: true },
+      });
+      for (const m of recheckedMemberships) {
+        if (!implicitRoomIds.has(m.sharedRoomId)) throw new SharedRoomLockSetExpandedError();
+      }
+    }
+
     const orders = await loadLockedOrders(tx, [...lockedOrderIds]);
 
     // 订单集合稳定后，按 SharedRoom id 升序显式锁共享房行（astra A9：原实现直到落库段的
@@ -916,6 +986,16 @@ async function saveSharedRoomsInner(
         if (!byOrderItem.has(key)) byOrderItem.set(key, entry);
       }
       for (const entry of byOrderItem.values()) {
+        // 只承接本次没有被其它目标房认领走的成员（astra B-N2，回归修复）：解散 S 的同时
+        // 把 S 的某个成员重新分到本次请求里另一间房 T（body.rooms 里某个 group 认领了
+        // 同一个乘客），下面「新建/更新的共享房」那一段会给这个乘客在同一 (orderId,
+        // orderItemId) 上再追加一个指向 T 的共享组——如果这里不过滤，这个乘客会同时落在
+        // 一个普通组（这里退回的）和一个共享组（T 的）里，两边的 roomFraction 在下面
+        // roomsBilled 回写时按 orderItemId 累加，行级计费份额直接翻倍。反例：A 原在 S
+        // （fraction 1），S 被解散同时 A 被拖进 T（fraction 1）——A 最终应该只在 T，
+        // roomsBilled 仍是 1，不是 2。
+        const survivors = entry.passengerIds.filter((pid) => !seenPassengerIds.has(pid));
+        if (survivors.length === 0) continue; // 这一行的乘客全部被本次请求重新认领，不留普通组残留
         const arr = newGroupsByOrder.get(entry.orderId) ?? [];
         const preserveKey = `${roomId}:${entry.orderId}:${entry.orderItemId}`;
         const preservedNotes = preservedGroupNotes.get(preserveKey);
@@ -927,12 +1007,55 @@ async function saveSharedRoomsInner(
           id: groupId,
           hotelName: '',
           roomType: '',
-          passengerIds: entry.passengerIds,
+          passengerIds: survivors,
           orderItemId: entry.orderItemId,
-          roomFraction: entry.fraction,
+          roomFraction: entry.fraction, // 保留原份额，不重新分配（部分乘客被认领走不重算剩余份额）
           ...(preservedNotes != null ? { notes: preservedNotes } : {}),
         });
         newGroupsByOrder.set(entry.orderId, arr);
+      }
+    }
+    // 隐式触及旧共享房的留守成员镜像重建（astra N5，回归修复）：上面的 kept 过滤器只要
+    // sid 在 touchedSharedRoomIds 里就整体丢弃这个订单在这间房的旧 JSON 组——隐式房同样
+    // 在 touchedSharedRoomIds 里（本函数顶部并入的），所以隐式房里「没有被本次请求认领走」
+    // 的其它订单（比如反例里的 B：S 有 A、B，只把 A 拖进新房且请求不列 S）的旧组同样被
+    // 丢弃，但它们在 SharedRoomMember 表里仍然是这间房的成员——下面落库段对隐式房的清理
+    // 只摘除 seenPassengerIds 认领走的那些人，B 不在其中，不会被摘。旧实现到这里就结束了，
+    // 从未把 B 的组重新写回 newGroupsByOrder：JSON 侧 B 的这间房凭空消失，紧接着的
+    // roomsBilled 回写只看 newGroupsByOrder 里还有没有 B 这一行的组引用，查不到就显式写
+    // 0，把 B 在这间房的计费份额也一起清没了。
+    //
+    // 用 currentMembersByRoom（锁后落库现状，上面已按 touchedSharedRoomIds 查过）逐
+    // (orderId, orderItemId) 重建：排除本次被认领走的乘客（seenPassengerIds），剩余乘客
+    // 非空才重建、原样保留原份额与原 notes/id——这只是把「继续留守这间房」的事实原样写回
+    // JSON，不是一次业务改动，不重算 Σ=1（保留其份额，不重新分配，见方案 §五「解绑」的
+    // 份额处理原则）。如果某个 (orderId, orderItemId) 的乘客本次全部被认领走就不重建，
+    // 与下面落库段「隐式房清空后自动 DISSOLVED」判断依据一致（都是「排除
+    // seenPassengerIds 之后还有没有人」），两处不会出现「JSON 说有房、DB 说已解散」的
+    // 不一致。
+    for (const roomId of implicitRoomIds) {
+      const membersByItem = currentMembersByRoom.get(roomId);
+      if (!membersByItem) continue;
+      for (const [itemKey, entry] of membersByItem) {
+        const survivors = [...entry.passengerIds].filter((pid) => !seenPassengerIds.has(pid));
+        if (survivors.length === 0) continue; // 这一行的乘客本次全部被认领走，不重建
+        const [survivorOrderId, survivorItemId] = itemKey.split(':');
+        if (!survivorOrderId || !survivorItemId) continue; // 防御：key 格式不对就跳过，不该发生
+        const arr = newGroupsByOrder.get(survivorOrderId) ?? [];
+        const preserveKey = `${roomId}:${survivorOrderId}:${survivorItemId}`;
+        const preservedNotes = preservedGroupNotes.get(preserveKey);
+        const groupId = preservedGroupIds.get(preserveKey) ?? randomUUID();
+        arr.push({
+          id: groupId,
+          hotelName: '',
+          roomType: '',
+          passengerIds: survivors,
+          orderItemId: survivorItemId,
+          roomFraction: entry.fraction,
+          sharedRoomId: roomId,
+          ...(preservedNotes != null ? { notes: preservedNotes } : {}),
+        });
+        newGroupsByOrder.set(survivorOrderId, arr);
       }
     }
     // 新建/更新的共享房：给每个 group 所在订单追加一个共享房组。
@@ -994,10 +1117,18 @@ async function saveSharedRoomsInner(
         }));
       nextOrderItems.set(orderId, itemsAtHotel);
     }
+    // hotelId 全部显式带上（astra N1）：新建房的 sharedRoomId 是刚生成、还没落库的随机
+    // id，被 assertHotelFitAfterChange 内部的 hotelId 兜底过滤查库时天然查不到——不带
+    // hotelId 会让「查不到归属」与「不属于本酒店」这两种不同的信号被同一个 false 混淆，
+    // 一间即将新建、马上要占用物理房间的共享房会被整间从前瞻闸的统计里过滤掉，前瞻算出
+    // 的物理间数比实际提交后少一间。本端点单次请求只服务一个 body.hotelId（已在函数顶部
+    // 校验过是真实酒店、非占位），三类覆盖项（解散、新建/更新、隐式旧房）一律显式带上它，
+    // 不依赖被调用方按 sharedRoomId 查库兜底。
     const nextSharedRooms: SharedRoomAfterState[] = [];
     for (const roomId of dissolveSet) {
       nextSharedRooms.push({
         sharedRoomId: roomId,
+        hotelId: body.hotelId,
         checkIn: checkInD,
         checkOut: checkOutD,
         activeMemberOrderIds: [],
@@ -1017,6 +1148,7 @@ async function saveSharedRoomsInner(
       ];
       nextSharedRooms.push({
         sharedRoomId: resolvedRoomIds[roomIndex], // 新房也带上——与订单 JSON/落库用的是同一个 id
+        hotelId: body.hotelId,
         checkIn: checkInD,
         checkOut: checkOutD,
         activeMemberOrderIds: activeOrderIds,
@@ -1049,6 +1181,7 @@ async function saveSharedRoomsInner(
         });
         nextSharedRooms.push({
           sharedRoomId: roomId,
+          hotelId: body.hotelId,
           checkIn: current.checkIn,
           checkOut: current.checkOut,
           activeMemberOrderIds: survivorOrderIds,
@@ -1247,10 +1380,26 @@ async function saveSharedRoomsInner(
       dissolved: [...dissolveSet],
       warnings,
     };
-    await tx.sharedRoomRequest.update({
-      where: { requestToken: body.requestToken },
-      data: { resultJson: finalResult as unknown as Prisma.InputJsonValue },
-    });
+    // 按占位行的主键 id 写最终结果，不是 requestToken（astra N10）：如果这次执行已经被
+    // 判定超时、占位被回收（见 reserveRequestOrReplay 的 CAS 回收），本次持有的
+    // reservationId 这一刻在库里已经不存在了——`update` 会抛 P2025（记录不存在），让
+    // 整个事务连同上面已经写好的成员表 / 订单 JSON / roomsBilled 一起回滚，不会把一个
+    // 「已被判定为过期」的执行结果当成功提交（过期执行者不得提交业务结果）。按
+    // requestToken 更新则做不到这一点：抢占后同一个 requestToken 指向一张新 id 的行，
+    // 过期的这次执行仍能匹配上、把自己的（可能是旧的/错的）结果写进新占位里，污染新执行。
+    try {
+      await tx.sharedRoomRequest.update({
+        where: { id: reservationId },
+        data: { resultJson: finalResult as unknown as Prisma.InputJsonValue },
+      });
+    } catch (err) {
+      if (err instanceof Prisma.PrismaClientKnownRequestError && err.code === 'P2025') {
+        throw new ConflictError(
+          '本次跨单分房保存的请求编号占位已被判定超时并回收，本次提交作废，请刷新后使用新的请求编号重试',
+        );
+      }
+      throw err;
+    }
     // 主单：受影响订单里 id 最小的一个，给 SAVE_SHARED_ROOMS 总览审计条挂载（本条本身
     // 只是「这次保存做了什么」的总览，逐单细节在上面逐单审计里）。同样用 writeAuditWithinTx
     // 与业务同事务提交（astra A13）。

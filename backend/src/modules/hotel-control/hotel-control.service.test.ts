@@ -45,6 +45,7 @@ import {
   assertHotelPhysicalFit,
   assertHotelPhysicalFitWithinTx,
   lockHotelBlockPeriodsWithinTx,
+  lockHotelInventoryForUpdate,
   getHotelOversellCapRooms,
   getRandomTierAggregate,
   assertRandomTierFit,
@@ -1258,7 +1259,9 @@ describe('getOccupyingOrders', () => {
         agentName: '成都国旅',
         sharedRoomCount: 0,
         billedRoomFraction: 1,
-        physicalRoomsDeduped: 0,
+        // 订单完全没有分房表（roomAssignment 字段缺省）→ 回落该行 itemRoomCount
+        // （roomsBilled=1），不是硬 0（astra A11 余项；与上面 rooms:1 同一口径）。
+        physicalRoomsDeduped: 1,
       },
     ]);
   });
@@ -1527,7 +1530,9 @@ describe('getOccupyingOrders', () => {
     );
     const occupants = await getOccupyingOrders({ randomStarTier: 4 }, dayStr(0), client);
     expect(occupants[0]!.sharedRoomCount).toBe(0);
-    expect(occupants[0]!.physicalRoomsDeduped).toBe(0);
+    // 随机档作用域下共享房恒 0，普通房组也没有分房表（roomAssignment: null）→ 回落该行
+    // itemRoomCount（roomsBilled=1），不是硬 0（astra A11 余项）。
+    expect(occupants[0]!.physicalRoomsDeduped).toBe(1);
     const findMany = (client as unknown as { sharedRoomMember: { findMany: ReturnType<typeof vi.fn> } })
       .sharedRoomMember.findMany;
     expect(findMany).not.toHaveBeenCalled();
@@ -1556,7 +1561,9 @@ describe('getOccupyingOrders', () => {
     const occupants = await getOccupyingOrders('h1', dayStr(0), client);
     expect(occupants[0]!.sharedRoomCount).toBe(0);
     expect(occupants[0]!.billedRoomFraction).toBe(1);
-    expect(occupants[0]!.physicalRoomsDeduped).toBe(0);
+    // 没有共享房归属、也没有分房表（roomAssignment: null）→ 回落该行 itemRoomCount
+    // （roomsBilled=1），不是硬 0（astra A11 余项）。
+    expect(occupants[0]!.physicalRoomsDeduped).toBe(1);
   });
 });
 
@@ -1954,6 +1961,76 @@ describe('assertHotelPhysicalFitWithinTx（事务内加锁版前瞻闸）', () =
     await expect(
       lockHotelBlockPeriodsWithinTx(tx as unknown as TxArg, 'h1', []),
     ).resolves.toBeUndefined();
+    expect(tx.$queryRaw).not.toHaveBeenCalled();
+  });
+});
+
+// ── lockHotelInventoryForUpdate（astra N4 锁侧：恢复路径专用的酒店库存互斥）─────────
+describe('lockHotelInventoryForUpdate', () => {
+  /**
+   * 假 tx：`$queryRaw` 记录「锁包房周期行」那次查询，返回值由 periodRowsByHotelId 决定
+   * （模拟有/无周期两种情况）；`$executeRaw` 单独记录——advisory lock 用的是 $executeRaw
+   * 不是 $queryRaw（pg_advisory_xact_lock 返回 void，$queryRaw 反序列化不认识 void 列，
+   * 真库会直接抛错，见 lockHotelInventoryForUpdate 的实现注释），两者调用序列分开断言。
+   */
+  function fakeInventoryTx(periodRowsByHotelId: Record<string, Array<{ id: string }>>) {
+    const queryCalls: Array<{ sql: string; values: unknown[] }> = [];
+    const executeCalls: Array<{ sql: string; values: unknown[] }> = [];
+    const tx = {
+      $queryRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
+        const sql = strings.join('?');
+        queryCalls.push({ sql, values });
+        const hotelId = values[0] as string;
+        return Promise.resolve(periodRowsByHotelId[hotelId] ?? []);
+      }),
+      $executeRaw: vi.fn((strings: TemplateStringsArray, ...values: unknown[]) => {
+        executeCalls.push({ sql: strings.join('?'), values });
+        return Promise.resolve(1);
+      }),
+    };
+    return { tx, queryCalls, executeCalls };
+  }
+
+  type InventoryTxArg = Parameters<typeof lockHotelInventoryForUpdate>[0];
+
+  it('每家酒店都有包房周期 → 只锁周期行，不触发 advisory lock，按酒店 id 升序', async () => {
+    const { tx, queryCalls, executeCalls } = fakeInventoryTx({
+      h2: [{ id: 'p2' }],
+      h1: [{ id: 'p1' }],
+    });
+    await lockHotelInventoryForUpdate(tx as unknown as InventoryTxArg, ['h2', 'h1']);
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(2); // 每家酒店各一次周期锁
+    expect(executeCalls).toHaveLength(0); // 都有周期，不需要 advisory lock 兜底
+    // 按 id 升序：h1 先于 h2，与调用方传参顺序（h2, h1）无关——避免两个事务以不同顺序锁
+    // 同一批酒店造成死锁。
+    expect(queryCalls[0]!.values[0]).toBe('h1');
+    expect(queryCalls[1]!.values[0]).toBe('h2');
+    for (const call of queryCalls) {
+      expect(call.sql).toContain('"HotelBlockPeriod"');
+      expect(call.sql).toContain('FOR UPDATE');
+    }
+  });
+
+  it('astra N4：酒店没有任何包房周期（未纳管）→ 退化为 pg_advisory_xact_lock 兜底（走 $executeRaw）', async () => {
+    const { tx, queryCalls, executeCalls } = fakeInventoryTx({}); // h1 查周期行返回空
+    await lockHotelInventoryForUpdate(tx as unknown as InventoryTxArg, ['h1']);
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1); // 周期锁（0 行）
+    expect(tx.$executeRaw).toHaveBeenCalledTimes(1); // advisory lock 兜底
+    expect(queryCalls[0]!.sql).toContain('"HotelBlockPeriod"');
+    expect(executeCalls[0]!.sql).toContain('pg_advisory_xact_lock');
+    expect(executeCalls[0]!.sql).toContain('hashtext');
+    expect(executeCalls[0]!.values[0]).toBe('h1');
+  });
+
+  it('重复的 hotelId 只锁一次', async () => {
+    const { tx } = fakeInventoryTx({ h1: [{ id: 'p1' }] });
+    await lockHotelInventoryForUpdate(tx as unknown as InventoryTxArg, ['h1', 'h1', 'h1']);
+    expect(tx.$queryRaw).toHaveBeenCalledTimes(1);
+  });
+
+  it('空 hotelIds → 不发任何锁', async () => {
+    const { tx } = fakeInventoryTx({});
+    await lockHotelInventoryForUpdate(tx as unknown as InventoryTxArg, []);
     expect(tx.$queryRaw).not.toHaveBeenCalled();
   });
 });

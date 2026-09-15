@@ -1968,6 +1968,18 @@ describe('saveSharedRooms · 真 DB E2E · 隐式触及旧共享房的清理（a
     const refreshedA = await prisma.order.findUniqueOrThrow({ where: { id: orderA.id } });
     const groupsA = (refreshedA.roomAssignment as { roomGroups: Array<Record<string, unknown>> }).roomGroups;
     expect(groupsA.every((g) => g.sharedRoomId !== oldRoomId)).toBe(true);
+
+    // astra N5（回归修复）反例：B 完全没被这次请求提及，留守旧房——它的 JSON 镜像组
+    // 必须原样重建（不能因为旧房被 touched 就整体丢弃），份额保持原值（0），roomsBilled
+    // 不能被清成 0（旧实现会把 B 这一行在这间房的组搬空，roomsBilled 显式回写成 0）。
+    const refreshedB = await prisma.order.findUniqueOrThrow({ where: { id: orderB.id } });
+    const groupsB = (refreshedB.roomAssignment as { roomGroups: Array<Record<string, unknown>> }).roomGroups;
+    const bGroupInOldRoom = groupsB.find((g) => g.sharedRoomId === oldRoomId);
+    expect(bGroupInOldRoom).toBeDefined();
+    expect(bGroupInOldRoom?.passengerIds).toEqual([orderB.passengers[0].id]);
+    expect(bGroupInOldRoom?.roomFraction).toBe(0); // 保留原份额，不重新分配
+    const bItemAfter = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderB.items[0].id } });
+    expect(Number(bItemAfter.roomsBilled)).toBe(0); // 与 JSON 组的 roomFraction 口径一致，不是被清空
   });
 
   it('旧共享房只剩这一名乘客：拽走后旧房自动 DISSOLVED，不留零成员的幽灵房', async () => {
@@ -2039,5 +2051,87 @@ describe('saveSharedRooms · 真 DB E2E · 隐式触及旧共享房的清理（a
     expect(oldRoomAfter.status).toBe('DISSOLVED');
     expect(oldRoomAfter.members).toHaveLength(0);
     expect(oldRoomAfter.version).toBe(2);
+  });
+});
+
+/**
+ * astra B-N2：显式解散 S 并把它的成员在同一请求里迁进新房 T 时，解散分支曾经无条件把
+ * S 的全部成员退回普通组、新建分支又给同一个 (orderId, orderItemId) 追加一个指向 T
+ * 的共享组——同一名乘客同时落在一个普通组和一个共享组里，roomsBilled 按 orderItemId
+ * 累加两边的 roomFraction，行级计费份额直接翻倍。
+ */
+describe('saveSharedRooms · 真 DB E2E · 显式解散并同时迁入新房不重复计费（astra B-N2）', () => {
+  afterEach(() => flushFireAndForgetAudit());
+
+  it('S 被 dissolve 的同时，S 的乘客被拖进新房 T → 最终只在 T，roomsBilled 不翻倍', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    // 先建共享房 S：A 单独一人，份额 1。
+    const created = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const oldRoomId = created.rooms[0].sharedRoomId;
+
+    // 同一请求：dissolve 掉 S，同时把 A 拖进一间新房 T（份额仍是 1）。
+    const result = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        expectedVersions: { [oldRoomId]: 1 },
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+            ],
+          },
+        ],
+        dissolve: [oldRoomId],
+      },
+      actor,
+    );
+    expect(result.dissolved).toEqual([oldRoomId]);
+    const newRoomId = result.rooms[0]!.sharedRoomId;
+    expect(newRoomId).not.toBe(oldRoomId);
+
+    // A 的订单 JSON 只有一个组（指向新房 T），不是「一个普通组 + 一个共享组」。
+    const refreshedA = await prisma.order.findUniqueOrThrow({ where: { id: orderA.id } });
+    const groupsA = (refreshedA.roomAssignment as { roomGroups: Array<Record<string, unknown>> }).roomGroups;
+    const groupsForItem = groupsA.filter((g) => g.orderItemId === orderA.items[0].id);
+    expect(groupsForItem).toHaveLength(1);
+    expect(groupsForItem[0]!.sharedRoomId).toBe(newRoomId);
+
+    // roomsBilled 仍是 1，不是 1（普通组）+ 1（共享组）= 2。
+    const itemAfter = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderA.items[0].id } });
+    expect(Number(itemAfter.roomsBilled)).toBe(1);
   });
 });
