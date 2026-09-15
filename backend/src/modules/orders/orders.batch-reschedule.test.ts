@@ -169,6 +169,42 @@ describe('OrderService.batchReschedule', () => {
     });
   });
 
+  it('astra finding B5 遗漏②：事务已提交但回包异常时，共享房解绑 warnings 原样带出，不缺省成空数组', async () => {
+    const sharedWarning = '该房组原与 FT-partner 合住、计费 0 间，解绑后物理占 1 间，金额未重算。';
+    mockPrisma.$transaction.mockReset().mockResolvedValue({
+      orderItemId: 'item-1',
+      oldScheduleId: 'schedule-old',
+      oldCabin: CabinClass.ECONOMY,
+      newScheduleId: 'schedule-new',
+      newCabin: CabinClass.ECONOMY,
+      statusChanged: false,
+      // 事务提交时已经算出的共享房解绑警告——回包异常前就已经落在 scratch 里了，
+      // 不是「事务已回滚/连接已断」才拿不到的东西（旧实现的注释是错的）。
+      sharedRoomWarnings: [sharedWarning],
+    });
+    mockPrisma.flightSchedule.findUnique.mockReset().mockResolvedValue({
+      departureTime: new Date('2026-08-25T01:00:00.000Z'),
+    });
+    mockPrisma.order.findUniqueOrThrow.mockReset().mockRejectedValue(Object.freeze(new Error('回包序列化失败')));
+    mockPrisma.orderItem.findUnique.mockReset();
+    mockPrisma.orderItem.findUnique.mockResolvedValue({
+      orderId: 'committed',
+      flightScheduleId: 'schedule-new',
+      flightCabin: CabinClass.ECONOMY,
+      order: { orderNumber: 'FT-committed' },
+    });
+
+    const result = await service.batchReschedule(input(['committed'], 'OUTBOUND'), ACTOR);
+
+    expect(result).toMatchObject({ succeeded: 1, failed: 0 });
+    expect(result.results[0]).toMatchObject({
+      id: 'committed',
+      ok: true,
+      notice: '已生效（回包异常）',
+      warnings: [sharedWarning],
+    });
+  });
+
   it('事务已提交但回读班次不匹配：仍记为失败', async () => {
     mockPrisma.$transaction.mockReset().mockResolvedValue({
       orderItemId: 'item-1',

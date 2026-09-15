@@ -1915,6 +1915,13 @@ type RescheduleCommittedContext = {
   newScheduleId: string;
   newCabin: import('@prisma/client').CabinClass;
   statusChanged: boolean;
+  /**
+   * 共享房解绑警告（B5 修复 · astra B 路遗漏）：事务提交时一并落进 scratch，
+   * 批量改班次「已生效但回包异常」的恢复分支能直接原样带出，不用缺省成空数组——
+   * 那份注释是错的：警告本就随事务一起提交、随 scratch 一起存进 WeakMap，
+   * 不是「事务已回滚/连接已断」才拿不到的东西。
+   */
+  sharedRoomWarnings: string[];
 };
 
 const rescheduleCommittedContexts = new WeakMap<object, RescheduleCommittedContext>();
@@ -7890,9 +7897,12 @@ export class OrderService {
                 orderNumber: currentItem.order.orderNumber,
                 ok: true,
                 notice: '已生效（回包异常）',
-                // 回读分支拿不到原始事务内算出的 warnings（事务已回滚/连接已断），
-                // 缺省空数组——不臆造，也不让整条回读因此失败。
-                warnings: [],
+                // B5 修复：事务提交时 scratch（= context）已经把 sharedRoomWarnings 带出来了，
+                // 不是「事务已回滚/连接已断才拿不到」——原样带出，不能再缺省成空数组静默吞掉
+                // 共享房解绑警告（运营会看不到「该房组原与他单合住」之类的提示）。
+                // `?? []` 只防御老单测 mock 没给这个字段（本身该有）时不要把 undefined 塞进
+                // 响应数组，不是「正常情况下会缺失」的语义。
+                warnings: context.sharedRoomWarnings ?? [],
                 audit: {
                   orderNumber: currentItem.order.orderNumber,
                   orderItemId: context.orderItemId,

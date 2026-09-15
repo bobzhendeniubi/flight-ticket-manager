@@ -3538,6 +3538,10 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       newOrder: result.newOrder,
       splitPerformed: result.splitPerformed,
       audit: result.audit,
+      // B5 修复（astra B 路遗漏）：共享房解绑警告原本只留在 audit.reschedule.warnings，
+      // 前端改期成功后只读顶层 warnings（同换酒店/酒店改期/纠错入口口径一致），提到顶层
+      // 才会真的弹给操作人看——留在 audit 里等于运营永远看不到「该房组原与他单合住」提示。
+      warnings: result.audit.reschedule?.warnings ?? [],
     };
   });
 
