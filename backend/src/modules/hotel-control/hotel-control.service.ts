@@ -1583,9 +1583,16 @@ async function computeSharedRoomPhysicalAfterChange(
   // 覆盖项按 hotelId 过滤（跨批需求）：调用方理应逐酒店只传该酒店的覆盖项，但一旦手滑
   // 传错（如换酒店场景，被解绑房间其实属于原酒店而非目标酒店），不按 hotelId 过滤会把
   // 别家酒店共享房的 checkIn/checkOut 误加进本次统计。覆盖项自带 hotelId 就直接比对；
-  // 没带的，有 sharedRoomId（改动既有房）就查库拿它的真实 hotelId；没有 sharedRoomId
-  // （全新建的房，库里还没有这行）视为属于本次 gate 的 hotelId——新房本就是为这次操作
-  // 的目标酒店建的，查无可查。查不到真实归属（脏数据）宁可漏算也不错算进本酒店。
+  // 没带的，有 sharedRoomId 就查库拿它的真实 hotelId：
+  //   · 查到、且跟本次 hotelId 不一致——维持原有的静默过滤（不算进本次 gate），这是
+  //     「换酒店」等场景下调用方按跨批需求刻意依赖的行为，见下面 belongsToThisHotel；
+  //   · 查不到（astra N1，回归）——不能当「不属于本酒店」处理：新建的共享房在调用方
+  //     落库前就已经生成 sharedRoomId 塞进覆盖项（订单 JSON 镜像与真正建表要用同一个
+  //     id，见 hotel-control.shared-rooms.ts 的 resolvedRoomIds），这个 id 此刻在库里
+  //     本来就查不到，「查不到」在这里恰恰是「待创建」的正常信号，不是「不属于本酒店」
+  //     的信号——旧实现把两者混为一谈，会把一间刚决定新建、马上要占用物理房间的共享房
+  //     整间从前瞻闸里过滤掉（复现：同一个新房覆盖项，不带 hotelId 时算作 0 间，带上
+  //     正确 hotelId 才算 1 间）。
   const lookupIds = [
     ...new Set(
       overrides
@@ -1607,8 +1614,17 @@ async function computeSharedRoomPhysicalAfterChange(
   }
   const belongsToThisHotel = (o: SharedRoomAfterState): boolean => {
     if (o.hotelId != null) return o.hotelId === hotelId;
-    if (o.sharedRoomId) return hotelIdByRoomId.get(o.sharedRoomId) === hotelId;
-    return true; // 新建房间，没有可查的真实归属，按调用意图视为本酒店
+    if (!o.sharedRoomId) return true; // 全新建、连 id 都没预生成的房间——没有可查的真实归属，按调用意图视为本酒店
+    const dbHotelId = hotelIdByRoomId.get(o.sharedRoomId);
+    // 库里查不到 = 待创建（astra N1）：不能当「不属于本酒店」处理，否则会把一间刚决定
+    // 新建、马上要占用物理房间的共享房整间从前瞻闸里过滤掉。
+    // 库里查到、但归属的是别家酒店：维持原有的静默过滤（不是 astra 建议的抛错）——
+    // 这条分支是「换酒店」等场景下调用方按跨批需求刻意依赖的行为（见上面 lookupIds
+    // 的既有注释与本文件同 describe 块里那条更早的测试：调用方允许把两家酒店的覆盖项
+    // 混在一起传，靠这里查库过滤而不必自己先按酒店分组），改成抛错会让那类合法调用
+    // 直接 400。真正的数据/调用异常应在调用方自己的 hotelId 归属校验里挡（跨单分房
+    // 保存端已经这样做——见 hotel-control.shared-rooms.ts 的 CAS 校验），这里不重复收紧。
+    return dbHotelId === undefined || dbHotelId === hotelId;
   };
   const scopedOverrides = overrides.filter(belongsToThisHotel);
 

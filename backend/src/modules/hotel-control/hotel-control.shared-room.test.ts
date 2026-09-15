@@ -365,6 +365,43 @@ describe('assertHotelFitAfterChange', () => {
     ).resolves.toEqual([]); // 只有 sr-mine 的 1 间计入，1 ≤ block 1，放行
   });
 
+  // ── astra N1（回归）：新建共享房预生成的 sharedRoomId 库里查不到 = 待创建，不是「不属于
+  // 本酒店」——不能被 hotelId 兜底过滤悄悄漏计 ──────────────────────────────────────
+  it('astra N1：新房覆盖项带预生成 sharedRoomId 但库里还查不到——按待创建计入本酒店，不被漏计', async () => {
+    // 包房 1 间；已有另一张不受影响的订单占了 1 间普通房——单看这行已经打平 block。
+    const { tx } = fakeTx({
+      rooms: 1,
+      liveItems: [
+        {
+          id: 'itemOther',
+          hotelCheckIn: day(0),
+          hotelCheckOut: day(1),
+          roomsBilled: 1,
+          metadata: null,
+          hotelRoomType: { hotel: { name: 'X酒店' } },
+          order: { id: 'orderOther', roomAssignment: null, passengers: [{ gender: 'M' }] },
+        },
+      ],
+    });
+    // orderA 本次要新建一间共享房——sharedRoomId 是调用方（saveSharedRooms 的
+    // resolvedRoomIds）预先生成、这次请求结束前才会真正落库的随机 id，此刻查库必然查不到。
+    // 不带 hotelId 模拟旧调用方漏传的场景：修复前，被查不到归属的 hotelId 过滤器悄悄
+    // 排除，闸内只看到 otherItems 的 1 间，装得下；修复后应正确算上这间新房，1+1=2 超限。
+    await expect(
+      assertHotelFitAfterChange(tx as unknown as TxArg, 'h1', [dayStr(0)], {
+        affectedOrderIds: ['orderA'],
+        nextSharedRooms: [
+          {
+            sharedRoomId: 'new-room-pending-creation',
+            checkIn: day(0),
+            checkOut: day(1),
+            activeMemberOrderIds: ['orderA'],
+          },
+        ],
+      }),
+    ).rejects.toThrow(/房间不足/);
+  });
+
   it('新建共享房把一个第三方订单的独立占房行合并进来 → 变更后物理从 2 降到 1，装得下', async () => {
     // 现状：两张订单各占普通房组 1 间（block=1，物理已超卖 2>1，仅靠 allowNonWorsening 才能放行改动）
     const { tx } = fakeTx({

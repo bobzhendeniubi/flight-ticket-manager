@@ -1000,10 +1000,18 @@ async function saveSharedRoomsInner(
         }));
       nextOrderItems.set(orderId, itemsAtHotel);
     }
+    // hotelId 全部显式带上（astra N1）：新建房的 sharedRoomId 是刚生成、还没落库的随机
+    // id，被 assertHotelFitAfterChange 内部的 hotelId 兜底过滤查库时天然查不到——不带
+    // hotelId 会让「查不到归属」与「不属于本酒店」这两种不同的信号被同一个 false 混淆，
+    // 一间即将新建、马上要占用物理房间的共享房会被整间从前瞻闸的统计里过滤掉，前瞻算出
+    // 的物理间数比实际提交后少一间。本端点单次请求只服务一个 body.hotelId（已在函数顶部
+    // 校验过是真实酒店、非占位），三类覆盖项（解散、新建/更新、隐式旧房）一律显式带上它，
+    // 不依赖被调用方按 sharedRoomId 查库兜底。
     const nextSharedRooms: SharedRoomAfterState[] = [];
     for (const roomId of dissolveSet) {
       nextSharedRooms.push({
         sharedRoomId: roomId,
+        hotelId: body.hotelId,
         checkIn: checkInD,
         checkOut: checkOutD,
         activeMemberOrderIds: [],
@@ -1023,6 +1031,7 @@ async function saveSharedRoomsInner(
       ];
       nextSharedRooms.push({
         sharedRoomId: resolvedRoomIds[roomIndex], // 新房也带上——与订单 JSON/落库用的是同一个 id
+        hotelId: body.hotelId,
         checkIn: checkInD,
         checkOut: checkOutD,
         activeMemberOrderIds: activeOrderIds,
@@ -1055,6 +1064,7 @@ async function saveSharedRoomsInner(
         });
         nextSharedRooms.push({
           sharedRoomId: roomId,
+          hotelId: body.hotelId,
           checkIn: current.checkIn,
           checkOut: current.checkOut,
           activeMemberOrderIds: survivorOrderIds,
