@@ -403,6 +403,36 @@ describe('PUT /orders/:id/room-assignment · 跨单分房 reconcile', () => {
   });
 
   /**
+   * M1：reconcile 前没有房组 id 去重时，同一 id 重复出现会被按旧组命中两次、原样各 push
+   * 一份进 finalGroups——物理份额（按 sharedRoomId 去重）仍是 1 间，但 roomsByItem 按
+   * orderItemId 累加 roomFraction，该行 roomsBilled 就从 1 翻成 2。改成在 reconcile 之前
+   * 就拒绝重复 id，不落库。
+   */
+  it('重复提交同一房组 id → 400，不落库，roomsBilled 不会翻倍', async () => {
+    prismaMock.tx.order.findUnique.mockResolvedValue({ roomAssignment: null });
+    const res = await putStaff({
+      roomGroups: [
+        { id: 'g1', hotelName: '椰岛大酒店', roomType: '双床', passengerIds: ['p1'] },
+        { id: 'g1', hotelName: '椰岛大酒店', roomType: '双床', passengerIds: ['p1'] },
+      ],
+    });
+    expect(res.statusCode).toBe(400);
+    expect(prismaMock.tx.order.update).not.toHaveBeenCalled();
+  });
+
+  it('同一乘客出现在多个房组 → 400，不落库', async () => {
+    prismaMock.tx.order.findUnique.mockResolvedValue({ roomAssignment: null });
+    const res = await putStaff({
+      roomGroups: [
+        { id: 'g1', hotelName: '椰岛大酒店', roomType: '双床', passengerIds: ['p1'] },
+        { id: 'g2', hotelName: '椰岛大酒店', roomType: '大床', passengerIds: ['p1'] },
+      ],
+    });
+    expect(res.statusCode).toBe(400);
+    expect(prismaMock.tx.order.update).not.toHaveBeenCalled();
+  });
+
+  /**
    * astra A5③：普通组本不该是 0 份额，除非它就是解绑后留下的「与他单合住时计费 0 间」那条
    * （§八：解绑后 0 份额那张单钱不动）。服务端锁后现状（old）里这条组的 roomFraction 恰好
    * 也是 0 时，必须放行原样重存——不能一律拒绝，否则运营连改个备注都会被拦。放行时以

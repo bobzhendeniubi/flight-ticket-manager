@@ -1397,6 +1397,28 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         ),
       })
       .parse(req.body);
+
+    // M1：reconcile 前去重——房组 id 重复会让下面按 id 查旧组命中两次、都原样 push 进
+    // finalGroups，物理份额（按 sharedRoomId 去重）仍是 1 间，但 roomsByItem 按行累加
+    // roomFraction 会把该行 roomsBilled 算成 2，计费口径当场分叉。同一乘客出现在多个
+    // 房组同理违反「同一乘客同一入住区间只能在一个房组」的口径（需求方案 §九）。
+    {
+      const seenGroupIds = new Set<string>();
+      const seenPassengerIds = new Set<string>();
+      for (const g of body.roomGroups) {
+        if (seenGroupIds.has(g.id)) {
+          throw new BadRequestError(`房组 id ${g.id} 在本次请求里出现了不止一次`);
+        }
+        seenGroupIds.add(g.id);
+        for (const pid of g.passengerIds) {
+          if (seenPassengerIds.has(pid)) {
+            throw new BadRequestError(`乘客 ${pid} 在本次请求里出现了不止一个房组`);
+          }
+          seenPassengerIds.add(pid);
+        }
+      }
+    }
+
     const before = await prisma.order.findUnique({
       where: { id },
       select: { orderNumber: true, roomAssignment: true },
