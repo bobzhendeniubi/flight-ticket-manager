@@ -2318,33 +2318,39 @@ describe('saveSharedRooms · 真 DB E2E · 隐式触及旧共享房的清理（a
     // 是漏列。isUnchangedMember 对「列出来的」B 仍然成立（B 没变），若只按「列出来的都没
     // 改」判定，会把这次漏列误判成 H1④ 的留守重提而放行，现场把 A 从成员表摘出去（A 那份
     // 真占用、真计费的份额从此在共享房里凭空消失）。必须仍走 Σ≠1 的硬闸，不给出路。
-    await expect(
-      saveSharedRooms(
-        {
-          hotelId: hotel.id,
-          checkIn: CHECK_IN,
-          checkOut: CHECK_OUT,
-          requestToken: requestToken(),
-          expectedVersions: { [roomId]: sBefore.version },
-          rooms: [
-            {
-              sharedRoomId: roomId,
-              hotelRoomTypeId: roomType.id,
-              groups: [
-                {
-                  orderId: orderB.id,
-                  orderItemId: orderB.items[0].id,
-                  passengerIds: [orderB.passengers[0].id],
-                  roomFraction: 0,
-                },
-              ],
-            },
-          ],
-          dissolve: [],
-        },
-        actor,
-      ),
-    ).rejects.toThrow(/计费份额合计须为 1/);
+    const rejectionErr = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        expectedVersions: { [roomId]: sBefore.version },
+        rooms: [
+          {
+            sharedRoomId: roomId,
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    ).catch((e: unknown) => e);
+    // P4 修复（批 10）：漏列成员的 400 文案不再是「计费份额合计须为 1」那句指错方向的
+    // 通用文案——现在指出真实原因（漏列）并报出漏列的单号（orderA），房型也换成名字
+    // （不用正则拼接单号/房型名——两者都是运行时生成的字符串，直接子串匹配更稳）。
+    expect(rejectionErr).toBeInstanceOf(Error);
+    const rejectionMessage = (rejectionErr as Error).message;
+    expect(rejectionMessage).toContain(`房间「${roomType.name}」`);
+    expect(rejectionMessage).toContain('漏列了当前在住的计费方');
+    expect(rejectionMessage).toContain(orderA.orderNumber);
 
     // 拒绝后不能有任何副作用：A 仍是成员，份额仍是 1；成员数仍是 2。
     const sAfter = await prisma.sharedRoom.findUniqueOrThrow({

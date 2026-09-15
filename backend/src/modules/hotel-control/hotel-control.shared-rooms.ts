@@ -850,7 +850,7 @@ async function saveSharedRoomsInner(
     for (const room of body.rooms) {
       const roomType = await tx.hotelRoomType.findUnique({
         where: { id: room.hotelRoomTypeId },
-        select: { id: true, hotelId: true, capacity: true },
+        select: { id: true, hotelId: true, capacity: true, name: true },
       });
       if (!roomType || roomType.hotelId !== body.hotelId) {
         throw new BadRequestError('房型不存在或不属于本酒店');
@@ -938,12 +938,23 @@ async function saveSharedRoomsInner(
         const currentByRoom = room.sharedRoomId != null ? currentMembersByRoom.get(room.sharedRoomId) : undefined;
         const listedItemKeys = new Set(room.groups.map((g) => `${g.orderId}:${g.orderItemId}`));
         const listedPassengerIds = new Set(room.groups.flatMap((g) => g.passengerIds));
-        const coversAllCurrentMembers =
-          currentByRoom == null ||
-          ([...currentByRoom.keys()].every((key) => listedItemKeys.has(key)) &&
-            [...currentByRoom.values()]
-              .flatMap((v) => [...v.passengerIds])
-              .every((pid) => listedPassengerIds.has(pid)));
+        // P4 修复（批 10）：一次遍历同时算出「是否覆盖全部现存成员」与「哪些订单被漏列」——
+        // 键（orderId:orderItemId）没被列出、或键被列出但漏了其中某个乘客，都算这张订单
+        // 未被覆盖，进 uncoveredOrderIds（供下面 400 文案报出具体单号）。currentByRoom
+        // 为空（新建房 / 从未落库过）时循环不执行，uncoveredOrderIds 恒空，
+        // coversAllCurrentMembers=true——与原先「currentByRoom == null → true」的
+        // fail-open 语义一致。
+        const uncoveredOrderIds = new Set<string>();
+        if (currentByRoom) {
+          for (const [key, entry] of currentByRoom) {
+            const keyCovered = listedItemKeys.has(key);
+            const allPassengersCovered = [...entry.passengerIds].every((pid) => listedPassengerIds.has(pid));
+            if (!keyCovered || !allPassengersCovered) {
+              uncoveredOrderIds.add(key.split(':')[0]!);
+            }
+          }
+        }
+        const coversAllCurrentMembers = uncoveredOrderIds.size === 0;
         const isLeftoverOnlyResubmit =
           room.sharedRoomId != null &&
           totalFraction === 0 &&
@@ -951,7 +962,20 @@ async function saveSharedRoomsInner(
           room.groups.every((g) => isUnchangedMember(room.sharedRoomId, g)) &&
           coversAllCurrentMembers;
         if (!isLeftoverOnlyResubmit) {
-          throw new BadRequestError(`房间「${room.hotelRoomTypeId}」的计费份额合计须为 1，当前为 ${totalFraction}`);
+          // P4 修复：区分两种 400 原因，不再共用一句指向错方向的文案——
+          // ①漏列了落库现状的计费方：真实原因是「漏列」，不是「份额算错」，报出具体单号，
+          // 直调 API 或翻日志排查的人一眼能看出该补哪几张单；
+          // ②其余情形（Σ 是其它非 1 值、或列出的成员真有改动）：维持原「份额合计须为 1」
+          // 文案，但把 hotelRoomTypeId（一串 id，对人不可读）换成房型名。
+          if (!coversAllCurrentMembers) {
+            const missingOrderNumbers = [...uncoveredOrderIds]
+              .map((oid) => orders.get(oid)?.orderNumber ?? oid)
+              .sort();
+            throw new BadRequestError(
+              `房间「${roomType.name}」漏列了当前在住的计费方：${missingOrderNumbers.join('、')}，请把他们一并列入本次提交再保存`,
+            );
+          }
+          throw new BadRequestError(`房间「${roomType.name}」的计费份额合计须为 1，当前为 ${totalFraction}`);
         }
         orphanedLeftoverRoomIds.add(room.sharedRoomId!);
         const survivorOrderIds = [...new Set(room.groups.map((g) => g.orderId))];
