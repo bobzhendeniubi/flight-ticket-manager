@@ -587,8 +587,15 @@ export function moveBundle(item: SplitItemView, ctx: SplitContext): SplitMove {
     keptRooms,
   });
   // 住宿盖章两侧都留了半间 → 写配对键，房控把两个半间配回一间（口径同 moveHotel）。
+  // L2 修复：挂共享组的行不写 splitPairKey（与 moveHotel :417 对齐）——共享组的物理
+  // 去重从来不靠 JSON 配对键，靠 SharedRoom 表；混进配对键机制会被 groupBucketKey
+  // （配对键优先于房型分桶）抢走判定权，把共享组当普通房组误合桶。
   const pairKey =
-    movedRooms != null && keptRooms != null && movedRooms > 0 && keptRooms > 0
+    !ctx.sharedRoomItemIds.has(item.id) &&
+    movedRooms != null &&
+    keptRooms != null &&
+    movedRooms > 0 &&
+    keptRooms > 0
       ? splitPairKeyOf(item.id, ctx)
       : null;
 
