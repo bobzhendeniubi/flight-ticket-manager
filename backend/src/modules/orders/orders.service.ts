@@ -15836,6 +15836,15 @@ export class OrderService {
           where: { sharedRoomId: targetSharedRoomId, orderId, orderItemId: item.id },
           data: { orderItemId: created.id },
         });
+        // M2 修复：成员归属改指到新行也是一次「变更」，version 必须跟着涨（与拆单 N6
+        // 「成员份额或成员归属变了，version 必须跟着涨」同一条不变量，见下方
+        // wholeMovedSharedRoomIds 的版本递增）。不涨的话，工作台先打开拿到旧 version，
+        // 运营在订单页按房组拆行改指了成员归属，工作台再保存时 expectedVersions 仍对得上
+        // （CAS 形同虚设），会按旧 orderItemId 重建成员，把刚拆行的结果悄悄改回去。
+        await tx.sharedRoom.update({
+          where: { id: targetSharedRoomId },
+          data: { version: { increment: 1 } },
+        });
       }
 
       // ── 房组归属：目标组指到新行；其余无归属组回填为源行（本单从此每组有归属）──

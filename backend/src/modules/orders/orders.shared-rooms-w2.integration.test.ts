@@ -1139,6 +1139,13 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
     expect(member.orderId).toBe(orderA.id); // 拆行不跨单，仍是同一张单
     expect(member.orderItemId).toBe(audit.newItemId); // 但已改指到新拆出的行
     expect(member.orderItemId).not.toBe(audit.fromItemId);
+
+    // M2 修复：成员归属改指到新行也是一次「变更」，SharedRoom.version 必须跟着涨——
+    // 不涨的话工作台拿着旧 version 仍能过 CAS，把刚拆行的结果悄悄改回去。
+    const sharedRoomAfter = await prisma.sharedRoom.findUniqueOrThrow({
+      where: { id: saved.rooms[0].sharedRoomId },
+    });
+    expect(sharedRoomAfter.version).toBeGreaterThan(saved.rooms[0].version);
   });
 
   it('astra finding A7 ⑤ 反例：源行总计费房数为 0 的共享组仍允许按房组拆行（旧闸把 0 间源行一律拒了）', async () => {
