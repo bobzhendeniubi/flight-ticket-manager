@@ -82,6 +82,19 @@ describe('computeSharedRoomPhysicalByDate（共享房逐晚去重物理间数）
     expect(out).toEqual([0, 0]);
   });
 
+  it('L5 修复（批 10）：生产环境（NODE_ENV=production）缺 sharedRoom delegate → 直接抛错，不回落成 0', async () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      const client = {} as unknown as PrismaClient;
+      await expect(computeSharedRoomPhysicalByDate('h1', [dayStr(0)], client)).rejects.toThrow(
+        'sharedRoom delegate missing on production client',
+      );
+    } finally {
+      process.env.NODE_ENV = originalNodeEnv;
+    }
+  });
+
   it('空 dates → 空数组，不查库', async () => {
     const findMany = vi.fn();
     const client = { sharedRoom: { findMany } } as unknown as PrismaClient;
@@ -634,5 +647,28 @@ describe('assertHotelFitAfterChange', () => {
         ]),
       }),
     ).rejects.toThrow(/房间不足/);
+  });
+
+  it('L5 修复（批 10）：生产环境（NODE_ENV=production）+ tx 没有 sharedRoom delegate → 直接抛错，不回落', async () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      // 有包房周期（不走「未纳管直接放行」早退），tx 里故意不搭 sharedRoom delegate——
+      // 模拟生产客户端初始化坏了的场景。
+      const tx = {
+        $queryRaw: vi.fn().mockResolvedValue([]),
+        hotelBlockPeriod: {
+          findMany: vi.fn().mockResolvedValue([{ dateFrom: day(0), dateTo: day(2), rooms: 5 }]),
+        },
+        orderItem: { findMany: vi.fn().mockResolvedValue([]) },
+      };
+      await expect(
+        assertHotelFitAfterChange(tx as unknown as TxArg, 'h1', [dayStr(0)], {
+          affectedOrderIds: ['orderA'],
+        }),
+      ).rejects.toThrow('sharedRoom delegate missing on production client');
+    } finally {
+      process.env.NODE_ENV = originalNodeEnv;
+    }
   });
 });

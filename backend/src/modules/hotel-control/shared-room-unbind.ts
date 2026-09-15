@@ -126,15 +126,26 @@ type SharedRoomMemberRow = {
   order: { orderNumber: string; status: OrderStatus; deletedAt: Date | null };
 };
 
-/** `planUnbind` / `getSharedRoomStatesForItem` 共用的 mock-safe delegate 取值。*/
+/**
+ * `planUnbind` / `getSharedRoomStatesForItem` 共用的 mock-safe delegate 取值。
+ *
+ * L5 修复（批 10）：生产 tx 必有 sharedRoomMember delegate——缺失只可能是客户端初始化
+ * 坏了，不该悄悄回落成「没有共享成员」（那会让本该触发的解绑/§五闸判定悄悄被跳过，
+ * 属于「库存/合住闸拿不到数据就假装无事」的危险方向），直接抛错。非生产环境（单测常用
+ * 手搭 mock tx）维持原回落，调用方各自的 `if (!memberDelegate) return ...` 分支不变。
+ */
 function sharedRoomMemberDelegate(
   tx: Prisma.TransactionClient,
 ): { findMany: (args: unknown) => Promise<SharedRoomMemberRow[]> } | undefined {
-  return (
+  const delegate = (
     tx as unknown as {
       sharedRoomMember?: { findMany: (args: unknown) => Promise<SharedRoomMemberRow[]> };
     }
   ).sharedRoomMember;
+  if (!delegate && process.env.NODE_ENV === 'production') {
+    throw new Error('sharedRoom delegate missing on production client');
+  }
+  return delegate;
 }
 
 function sharedRoomDelegate(
@@ -191,10 +202,8 @@ export async function planUnbindMany(
 
   // 防御式：单测常用手搭的 mock tx（只 mock 用到的 delegate）没有 sharedRoomMember 时回落
   // 「本次没有共享成员」而不是炸——与 computeSharedRoomPhysicalByDate 的 sharedRoom 兜底同哲学。
-  // ⚠ L5：生产 tx 必有 sharedRoomMember delegate，这条回落只为迁就 mock 单测。这里回落成
-  // 「没有共享成员」意味着解绑计划直接判空——不会主动放行超卖，但会让本该触发的解绑/
-  // §五闸判定悄悄被跳过，同属「库存/合住闸拿不到数据就假装无事」的危险方向，不该长期
-  // 依赖；生产客户端缺 delegate 时理应直接抛错。
+  // L5 已在 sharedRoomMemberDelegate 内部统一守过（生产缺 delegate 直接抛错）——这里的
+  // `if (!memberDelegate)` 只是非生产环境（mock tx）的回落分支。
   const memberDelegate = sharedRoomMemberDelegate(tx);
   if (!memberDelegate) return empty;
   const itemIdSet = new Set(orderItemIds);

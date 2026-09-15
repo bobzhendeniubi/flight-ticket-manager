@@ -1106,16 +1106,21 @@ export async function computeSharedRoomPhysicalByDate(
 
   // 防御式：单测常用手搭的 mock client（只 mock 用到的 delegate），没有 sharedRoom 时
   // 回落「本次没有共享房」而不是炸——与 getHotelOversellCapRooms 的 systemSetting 兜底同哲学。
-  // ⚠ L5：生产环境的 PrismaClient / tx 必有 sharedRoom delegate，这条回落只为迁就 mock
-  // 单测而存在——真上生产永远不会触发。物理房间库存闸「拿不到数据就当 0 间」是最危险的
-  // 失败方向（少算占用 → 放行超卖，比拿不到数据就拒绝更糟）；长期应把单测改用真库或完整
-  // 替身，让生产客户端缺 delegate 时直接抛错，而不是继续依赖这条静默兜底。
+  // L5 修复（批 10）：物理房间库存闸「拿不到数据就当 0 间」是最危险的失败方向（少算占用
+  // → 放行超卖），生产环境的 PrismaClient / tx 必有 sharedRoom delegate——缺失只可能是
+  // 客户端初始化坏了，不该悄悄回落，直接抛错。非生产环境（单测常用手搭 mock client）
+  // 维持原回落，不强制所有单测都换真库/完整替身。
   const delegate = (
     client as unknown as {
       sharedRoom?: { findMany: (args: unknown) => Promise<SharedRoomPhysicalRow[]> };
     }
   ).sharedRoom;
-  if (!delegate) return out;
+  if (!delegate) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('sharedRoom delegate missing on production client');
+    }
+    return out;
+  }
 
   const rooms = await delegate.findMany({
     where: {
@@ -1780,6 +1785,13 @@ async function computeSharedRoomPhysicalAfterChange(
       };
     }
   ).sharedRoom;
+  // L5 修复（批 10）：这个 delegate 下面被两处「delegate 缺失时悄悄回落」的分支复用
+  // （换酒店覆盖项的 hotelId 反查、以及下方主查询本身）——生产客户端必有 sharedRoom
+  // delegate，缺失只可能是客户端初始化坏了，统一在这里守一次，两处回落都不该在生产触发。
+  // 非生产环境（单测常用手搭 mock client）维持原回落。
+  if (!delegate && process.env.NODE_ENV === 'production') {
+    throw new Error('sharedRoom delegate missing on production client');
+  }
 
   // 覆盖项按 hotelId 过滤（跨批需求）：调用方理应逐酒店只传该酒店的覆盖项，但一旦手滑
   // 传错（如换酒店场景，被解绑房间其实属于原酒店而非目标酒店），不按 hotelId 过滤会把
@@ -1847,9 +1859,9 @@ async function computeSharedRoomPhysicalAfterChange(
       .filter((o): o is SharedRoomAfterState & { sharedRoomId: string } => !!o.sharedRoomId)
       .map((o) => o.sharedRoomId),
   );
-  // ⚠ L5：同上——生产 client 必有 sharedRoom delegate，`if (delegate)` 只为迁就 mock
-  // 单测；delegate 缺失时这里跳过查询等于把全部既有共享房当 0 间，是本函数里另一处
-  //「拿不到数据就回落成 0」的危险方向，长期同样该改成生产端直接抛错。
+  // L5 已在上面 delegate 声明处统一守过（生产缺 delegate 直接抛错）——这里的
+  // `if (delegate)` 只是非生产环境（mock client）的回落分支，delegate 缺失时跳过查询等于
+  // 把全部既有共享房当 0 间，仅在单测语境下可接受。
   if (delegate) {
     const liveRows = await delegate.findMany({
       where: { hotelId, status: 'ACTIVE', checkIn: { lte: toD }, checkOut: { gt: fromD } },

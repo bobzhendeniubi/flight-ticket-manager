@@ -2480,3 +2480,28 @@ describe('拆单 · 换人之后（排除条目 + 按人重算行）', () => {
     expect(movedReprice).toBe(false);
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════════
+describe('拆单 4b · L5 修复（批 10）：sharedRoomMember delegate 生产环境守卫', () => {
+  it('生产环境（NODE_ENV=production）缺 sharedRoomMember delegate → 抛错回滚，不悄悄漏搬共享成员', async () => {
+    // 本文件全篇的 mockTx 从未搭过 sharedRoomMember delegate（拆单 4b 的共享成员搬移
+    // 在这里因此一直走非生产回落分支）——这条用例把 NODE_ENV 切到 production，钉住
+    // 「生产客户端缺这个 delegate 必须直接抛错，不能悄悄回落成没有共享成员」。
+    const originalNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      armExecute({
+        order: baseOrder(),
+        targetItemsSum: 1000,
+        sourceItemsSum: 1000,
+        finalSource: { total: 1000, paidAmount: 0 },
+        finalTarget: { total: 1000, paidAmount: 500 },
+      });
+      await expect(
+        service.splitOrder('o1', { passengerIds: ['p1'], requestToken: TOKEN }, admin),
+      ).rejects.toThrow('sharedRoom delegate missing on production client');
+    } finally {
+      process.env.NODE_ENV = originalNodeEnv;
+    }
+  });
+});
