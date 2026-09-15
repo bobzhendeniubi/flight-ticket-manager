@@ -1648,4 +1648,83 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
       ),
     ).rejects.toThrow(/同时挂了.*个需要部分拆分的共享房组/);
   });
+
+  // A14 余项：隐式迁出场景下，留守方（未被本次请求提及的成员）订单 JSON 目前**确实**会被
+  // 连带清空（与 astra B 路 finding N3「隐式迁出只删除被搬成员，但删掉了全部留守方镜像」
+  // 一致）——这是 hotel-control.shared-rooms.ts 内部逻辑的 bug，该源文件本批修复范围不
+  // 包含（修复批 4 并行在改），这里只补一条断言把这个已知缺陷钉死成可执行的回归测试。
+  // 用 it.fails 标记「预期失败」：批 4 落地修复后，这条测试会转为意外通过（vitest 报
+  // "expected test to fail but it passed"），到时候把 it.fails 改回普通 it 即可。
+  it.fails('A14 余项反例：隐式迁出——留守方（未被本次请求提及的成员）订单 JSON 应仍正确挂着旧房，不该被清理逻辑连带清空（已知缺陷，待批 4 修复）', async () => {
+    // 复现口径同 hotel-control.shared-rooms.integration.test.ts 的「astra A6②」用例
+    // （那个文件是 hotel-control.shared-rooms.ts 的专属测试，本批修复范围不包含该源文件，
+    // 断言放在这里，只调用 saveSharedRooms 这个公开函数，不改动它的实现或测试）：
+    // 旧共享房 S 有 A、B 两位成员；新请求只提 A（把 A 拉进新房 S2，完全不提 B / 旧房 S）。
+    // A 被隐式解除旧房关联是预期行为，但 B（留守方，压根没出现在这次请求里）的订单 JSON
+    // 必须原样保留对旧房 S 的引用——不能因为清理 A 的挂靠关系而被连带清空。
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderC = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    const created = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              { orderId: orderA.id, orderItemId: orderA.items[0].id, passengerIds: [orderA.passengers[0].id], roomFraction: 1 },
+              { orderId: orderB.id, orderItemId: orderB.items[0].id, passengerIds: [orderB.passengers[0].id], roomFraction: 0 },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const oldRoomId = created.rooms[0].sharedRoomId;
+
+    // 新请求：只提 A（拉进新房，与 C 合住），完全不提 B / 旧房。
+    await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              { orderId: orderA.id, orderItemId: orderA.items[0].id, passengerIds: [orderA.passengers[0].id], roomFraction: 1 },
+              { orderId: orderC.id, orderItemId: orderC.items[0].id, passengerIds: [orderC.passengers[0].id], roomFraction: 0 },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    // 成员表：B 仍是旧房唯一成员（旧房没被清空，不该解散）。
+    const oldRoomAfter = await prisma.sharedRoom.findUniqueOrThrow({
+      where: { id: oldRoomId },
+      include: { members: true },
+    });
+    expect(oldRoomAfter.status).toBe('ACTIVE');
+    expect(oldRoomAfter.members.map((m) => m.orderId)).toEqual([orderB.id]);
+
+    // 留守方 JSON：B 的房组仍正确挂着旧房 sharedRoomId、乘客名单原样保留。
+    const refreshedB = await prisma.order.findUniqueOrThrow({ where: { id: orderB.id } });
+    const groupsB = readRoomGroupArray(refreshedB.roomAssignment) ?? [];
+    const bGroup = groupsB.find(
+      (g) => (g as { sharedRoomId?: string }).sharedRoomId === oldRoomId,
+    ) as Record<string, unknown> | undefined;
+    expect(bGroup, 'B 的房组 JSON 应仍挂着旧房 sharedRoomId，不能被隐式清理连带清空').toBeDefined();
+    expect(bGroup?.passengerIds).toEqual([orderB.passengers[0].id]);
+  });
 });
