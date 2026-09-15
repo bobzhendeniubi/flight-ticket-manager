@@ -222,7 +222,9 @@ export function HotelControlPage() {
       {/* ── 提醒线横幅（超卖加房 / 富余退房 / 班次超开票上限）────────── */}
       <RecentChangesPanel token={token} />
 
-      <AlertsBanner token={token} />
+      {/* boardNonce（B9）：跨单分房工作台保存后只 bump 这个计数器，提醒线原来只按 token
+          拉一次，看不到刚保存的解绑/拆分/孤儿共享房——带上它才会跟着重新取数。 */}
+      <AlertsBanner token={token} boardNonce={boardNonce} />
 
       {error && (
         <div className="rounded-lg border border-rose-200 bg-rose-50 px-4 py-3 text-sm text-rose-700">
@@ -476,6 +478,10 @@ export function HotelControlPage() {
           onClose={() => setDrill(null)}
           onChanged={() => setBoardNonce((n) => n + 1)}
           onOpenSharedRoomWorkbench={(seed) => setSharedWorkbenchSeed(seed)}
+          // boardNonce（B9）：下钻抽屉可能在跨单分房工作台之下同时打开着——工作台保存
+          // 只 bump 了这个计数器，抽屉自己的取数只按 hotelId/date 等身份键缓存，看不到
+          // 刚保存的解绑/拆分。带上它，工作台一保存，抽屉里的占房清单也跟着重新拉。
+          boardNonce={boardNonce}
         />
       )}
 
@@ -504,6 +510,7 @@ function OccupantsDrawer({
   onClose,
   onChanged,
   onOpenSharedRoomWorkbench,
+  boardNonce,
 }: {
   token: string;
   hotelId: string;
@@ -518,6 +525,12 @@ function OccupantsDrawer({
   onChanged?: () => void;
   /** 打开跨单分房工作台，默认带本次下钻的酒店/入住/退房（退房=入住+1 晚）。 */
   onOpenSharedRoomWorkbench: (seed: SharedRoomWorkbenchSeed) => void;
+  /**
+   * 父级 boardNonce（B9）：本抽屉可能在跨单分房工作台之下同时打开着，工作台保存只 bump
+   * 了父级这个计数器，本抽屉自己按 hotelId/randomStarTier/date 缓存的取数看不到刚保存的
+   * 解绑/拆分——带上它加进 loadOccupants 的依赖，工作台一保存，占房清单跟着重新拉。
+   */
+  boardNonce?: number;
 }) {
   const dialogRef = useDialogA11y(onClose);
   const [occupants, setOccupants] = useState<HotelOccupant[] | null>(null);
@@ -541,7 +554,7 @@ function OccupantsDrawer({
         setOccupantsDetailNote(r.detailNote);
       })
       .catch((e: unknown) => setErr(e instanceof ApiError ? e.message : '占房订单加载失败'));
-  }, [token, hotelId, randomStarTier, date]);
+  }, [token, hotelId, randomStarTier, date, boardNonce]);
 
   useEffect(() => {
     setOccupants(null);
@@ -1493,11 +1506,14 @@ function RecentChangesPanel({ token }: { token: string }) {
   );
 }
 
-function AlertsBanner({ token }: { token: string }) {
+function AlertsBanner({ token, boardNonce }: { token: string; boardNonce?: number }) {
   const [alerts, setAlerts] = useState<HotelControlAlerts | null>(null);
   const [err, setErr] = useState<string | null>(null);
   const [open, setOpen] = useState(true);
 
+  // boardNonce（B9）：只按 token 拉一次时，跨单分房工作台保存后（解绑/拆分/孤儿共享房）
+  // 这个横幅还停在旧数据——带上父级的 boardNonce，跟包房周期 CRUD、换酒店等其它「有变更
+  // 就重拉」的入口同一套触发机制。
   useEffect(() => {
     if (!token) return;
     let cancelled = false;
@@ -1512,7 +1528,7 @@ function AlertsBanner({ token }: { token: string }) {
     return () => {
       cancelled = true;
     };
-  }, [token]);
+  }, [token, boardNonce]);
 
   const sharedOddNear = alerts ? readSharedOddNear(alerts) : [];
   const sharedRoomOrphaned = alerts?.sharedRoomOrphaned ?? [];
