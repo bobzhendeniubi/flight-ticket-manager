@@ -160,9 +160,10 @@ import {
   hasSharedRoomMembers,
   planRestoreSharedRoomReconciliation,
   planUnbind,
+  planUnbindMany,
   unbindInconsistentSharedRoomMembers,
   unbindSharedRoomMembersForItem,
-  type UnbindPlan,
+  type PlannedSharedRoomChange,
 } from '../hotel-control/shared-room-unbind.js';
 import {
   readRoomGroupArray,
@@ -5764,9 +5765,12 @@ export class OrderService {
       // 后瞎猜一个 floor 值）。
       const touchedItemIds = new Set<string>([
         ...reconciliationPlan.kept.map((k) => k.orderItemId),
-        ...reconciliationPlan.unboundPlans.map((p) => p.orderItemId),
+        ...reconciliationPlan.unboundItemIds,
       ]);
-      const unboundPlanByItemId = new Map(reconciliationPlan.unboundPlans.map((p) => [p.orderItemId, p]));
+      // N2 修复：不再是「每行各一份计划」的 Map，改成一份覆盖全部待解绑行的合成计划——
+      // 这里按行取回自己那部分 changes，nextRoomAssignment 全部行共用同一份（已经把这批
+      // 行的共享键一次性剥完，不存在「取哪一份」的问题）。
+      const unboundPlan = reconciliationPlan.unboundPlan;
 
       if (touchedItemIds.size > 0) {
         const touchedItems = hotelBearingItems.filter((it) => touchedItemIds.has(it.id));
@@ -5796,8 +5800,10 @@ export class OrderService {
           // sharedRoomId 没变，走 nextSharedRooms 那一路去重）；计划解绑的行用 plan 算出的
           // 「解绑后」JSON（未落库，不能直接重读 DB）。
           const nextItems: PhysicalOccupancyItem[] = items.map((it) => {
-            const plan = unboundPlanByItemId.get(it.id);
-            const roomAssignment = plan?.nextRoomAssignment ?? order.roomAssignment ?? null;
+            const itemHasUnbindChanges = (unboundPlan?.changesByItemId.get(it.id)?.length ?? 0) > 0;
+            const roomAssignment = itemHasUnbindChanges
+              ? unboundPlan!.nextRoomAssignment ?? order.roomAssignment ?? null
+              : order.roomAssignment ?? null;
             return {
               id: it.id,
               hotelCheckIn: it.hotelCheckIn,
@@ -5816,16 +5822,14 @@ export class OrderService {
                 checkOut: k.checkOut,
                 activeMemberOrderIds: k.activeMemberOrderIdsAfter,
               })),
-            ...reconciliationPlan.unboundPlans
-              .filter((p) => items.some((it) => it.id === p.orderItemId))
-              .flatMap((p) =>
-                p.changes.map((c) => ({
-                  sharedRoomId: c.sharedRoomId,
-                  checkIn: c.checkIn,
-                  checkOut: c.checkOut,
-                  activeMemberOrderIds: c.activeMemberOrderIdsAfter,
-                })),
-              ),
+            ...items.flatMap((it) =>
+              (unboundPlan?.changesByItemId.get(it.id) ?? []).map((c) => ({
+                sharedRoomId: c.sharedRoomId,
+                checkIn: c.checkIn,
+                checkOut: c.checkOut,
+                activeMemberOrderIds: c.activeMemberOrderIdsAfter,
+              })),
+            ),
           ];
           await assertHotelFitAfterChange(tx, hotelId, hotelNightDates, {
             affectedOrderIds: [orderId],
@@ -5837,8 +5841,9 @@ export class OrderService {
           });
         }
         // 全部涉及酒店都过闸后，才真正落库解绑（astra finding A1/A2：落库必须在闸判定之后）。
-        for (const plan of reconciliationPlan.unboundPlans) {
-          await applyUnbindPlan(tx, plan, '恢复已取消订单时共享房状态不一致解绑');
+        // N2：一份合成计划，一次 applyUnbindPlan——不再是逐份顺序应用互相覆盖。
+        if (unboundPlan) {
+          await applyUnbindPlan(tx, unboundPlan, '恢复已取消订单时共享房状态不一致解绑');
         }
       }
 
@@ -10708,22 +10713,32 @@ export class OrderService {
             // 闸判定用计划算出的 after 状态，通过后才统一 applyUnbindPlan——不能再用
             // Math.max(1, roomsBilled) 塞进不理解共享去重的老式前瞻：一行可能同时承载两个
             // 不同共享房的零份额组，「每行至少一间」会漏算成只加 1 间。
-            const plansByItemId = new Map<string, UnbindPlan>();
-            for (const row of hotelRows) {
-              if (!row.hotelRoomTypeId) continue;
-              const plan = await planUnbind(tx, { orderId, orderItemId: row.id });
-              if (plan.changes.length === 0) continue;
-              plansByItemId.set(row.id, plan);
-              sharedRoomWarnings.push(
-                ...formatUnbindWarning(
-                  plan.changes.map((c) => ({
-                    sharedRoomId: c.sharedRoomId,
-                    roomFraction: c.roomFraction,
-                    partnerOrderNumbers: c.partnerOrderNumbers,
-                  })),
-                  actor.role === UserRole.AGENT ? 'agent' : 'internal',
-                ),
-              );
+            // N2 修复：全部触及行一次性合成一份计划（planUnbindMany），不再逐行各调
+            // planUnbind 再各自记进 Map——那样多行会各自从同一份原始 JSON 出发，后应用的
+            // 计划把先解绑行的共享键写回来。
+            const unbindCandidateItemIds = hotelRows
+              .filter((row) => row.hotelRoomTypeId)
+              .map((row) => row.id);
+            const combinedUnbindPlan =
+              unbindCandidateItemIds.length > 0
+                ? await planUnbindMany(tx, { orderId, orderItemIds: unbindCandidateItemIds })
+                : null;
+            const plansByItemId = new Map<string, PlannedSharedRoomChange[]>();
+            if (combinedUnbindPlan) {
+              for (const [itemId, itemChanges] of combinedUnbindPlan.changesByItemId) {
+                if (itemChanges.length === 0) continue;
+                plansByItemId.set(itemId, itemChanges);
+                sharedRoomWarnings.push(
+                  ...formatUnbindWarning(
+                    itemChanges.map((c) => ({
+                      sharedRoomId: c.sharedRoomId,
+                      roomFraction: c.roomFraction,
+                      partnerOrderNumbers: c.partnerOrderNumbers,
+                    })),
+                    actor.role === UserRole.AGENT ? 'agent' : 'internal',
+                  ),
+                );
+              }
             }
             const shiftDay = (d: Date): Date => new Date(d.getTime() + deltaDays * 24 * 60 * 60 * 1000);
             const shifted = hotelRows.map((row) => ({
@@ -10792,8 +10807,11 @@ export class OrderService {
                   ].sort();
                   await lockHotelBlockPeriodsWithinTx(tx, hotelId, unionDates);
                   const nextItems: PhysicalOccupancyItem[] = rows.map((s) => {
-                    const plan = plansByItemId.get(s.row.id);
-                    const roomAssignment = plan?.nextRoomAssignment ?? orderForGate?.roomAssignment ?? null;
+                    // combinedUnbindPlan.nextRoomAssignment 是这批行合成的**一份**最终 JSON
+                    // （N2）：只要本行有变更就用它，不必也不能按行各取一份。
+                    const roomAssignment = plansByItemId.has(s.row.id)
+                      ? combinedUnbindPlan!.nextRoomAssignment ?? orderForGate?.roomAssignment ?? null
+                      : orderForGate?.roomAssignment ?? null;
                     return {
                       id: s.row.id,
                       hotelCheckIn: s.newCheckIn,
@@ -10803,16 +10821,14 @@ export class OrderService {
                       order: { id: orderId, roomAssignment, passengers: orderPassengers },
                     };
                   });
-                  const nextSharedRooms: SharedRoomAfterState[] = rows.flatMap((s) => {
-                    const plan = plansByItemId.get(s.row.id);
-                    if (!plan) return [];
-                    return plan.changes.map((c) => ({
+                  const nextSharedRooms: SharedRoomAfterState[] = rows.flatMap((s) =>
+                    (plansByItemId.get(s.row.id) ?? []).map((c) => ({
                       sharedRoomId: c.sharedRoomId,
                       checkIn: c.checkIn,
                       checkOut: c.checkOut,
                       activeMemberOrderIds: c.activeMemberOrderIdsAfter,
-                    }));
-                  });
+                    })),
+                  );
                   await assertHotelFitAfterChange(tx, hotelId, unionDates, {
                     affectedOrderIds: [orderId],
                     nextOrderItems: new Map([[orderId, nextItems]]),
@@ -10859,8 +10875,9 @@ export class OrderService {
               throw err;
             }
             // 全部涉及酒店都过闸后，才真正落库解绑（astra finding A1：落库必须在闸判定之后）。
-            for (const plan of plansByItemId.values()) {
-              await applyUnbindPlan(tx, plan, '机票改期连带平移酒店日期解绑');
+            // N2：一份合成计划，一次 applyUnbindPlan——不再是逐行 Map 顺序应用互相覆盖。
+            if (combinedUnbindPlan && combinedUnbindPlan.changes.length > 0) {
+              await applyUnbindPlan(tx, combinedUnbindPlan, '机票改期连带平移酒店日期解绑');
             }
             for (const s of shifted) {
               const nights = s.newCheckOut

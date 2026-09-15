@@ -21,6 +21,7 @@ import { OrderItemKind, OrderStatus, Prisma, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { saveSharedRooms } from '../hotel-control/hotel-control.shared-rooms.js';
 import { getAlerts, getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
+import { readRoomGroupArray, roomGroupItemId } from './room-group-placement.js';
 import { OrderService } from './orders.service.js';
 
 const service = new OrderService();
@@ -109,6 +110,56 @@ async function createOrderWithPassengers(opts: {
       },
       passengers: {
         create: Array.from({ length: opts.passengerCount }, (_, i) => ({
+          fullName: `PAX ${i + 1}`,
+          lastName: 'PAX',
+          firstName: String(i + 1),
+          documentType: 'PASSPORT' as const,
+          documentNumber: uniq('P'),
+          dateOfBirth: new Date('1990-01-01'),
+          nationality: 'CHN',
+        })),
+      },
+    },
+    include: { items: true, passengers: true },
+  });
+}
+
+/**
+ * 建一个 PAID 订单，含 2 条 HOTEL 行（各自不同房型）+ 2 位乘客——N2 反例需要「同一订单
+ * 两条行分别合住在两间不同共享房」，`createOrderWithPassengers` 只建 1 条行不够用。
+ */
+async function createOrderWithTwoHotelItems(opts: {
+  roomTypeIdA: string;
+  roomTypeIdB: string;
+  checkIn?: string;
+  checkOut?: string;
+}) {
+  const checkIn = opts.checkIn ?? CHECK_IN;
+  const checkOut = opts.checkOut ?? CHECK_OUT;
+  return prisma.order.create({
+    data: {
+      orderNumber: uniq('ORD'),
+      status: OrderStatus.PAID,
+      subtotal: new Prisma.Decimal(2400),
+      total: new Prisma.Decimal(2400),
+      paidAmount: new Prisma.Decimal(2400),
+      contactName: 'Test User',
+      contactPhone: '13800138000',
+      items: {
+        create: [opts.roomTypeIdA, opts.roomTypeIdB].map((roomTypeId) => ({
+          kind: OrderItemKind.HOTEL,
+          description: `测试酒店 · 标准间 · ${checkIn}~${checkOut} · 2晚 × 1间`,
+          quantity: 2,
+          unitPrice: new Prisma.Decimal(600),
+          amount: new Prisma.Decimal(1200),
+          hotelRoomTypeId: roomTypeId,
+          hotelCheckIn: new Date(`${checkIn}T00:00:00.000Z`),
+          hotelCheckOut: new Date(`${checkOut}T00:00:00.000Z`),
+          roomsBilled: new Prisma.Decimal(1),
+        })),
+      },
+      passengers: {
+        create: Array.from({ length: 2 }, (_, i) => ({
           fullName: `PAX ${i + 1}`,
           lastName: 'PAX',
           firstName: String(i + 1),
@@ -948,6 +999,107 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
       where: { orderId: orderA.id, orderItemId: orderA.items[0].id },
     });
     expect(members).toHaveLength(0);
+  });
+
+  it('astra finding N2 反例：恢复时两条行同时不一致需整单解绑——合成后的 JSON 两个共享键都要没了，不能一份计划把另一份覆盖回来', async () => {
+    const actor = await adminActor();
+    const { hotel: hotelA, roomType: roomTypeA } = await createHotelWithRoomType(4);
+    const { hotel: hotelB, roomType: roomTypeB } = await createHotelWithRoomType(4);
+    // orderX 两条行 I1/I2，分别与 orderP1（房 R1）、orderP2（房 R2）合住——两间不同的共享房。
+    const orderX = await createOrderWithTwoHotelItems({
+      roomTypeIdA: roomTypeA.id,
+      roomTypeIdB: roomTypeB.id,
+    });
+    const orderP1 = await createOrderWithPassengers({ roomTypeId: roomTypeA.id, passengerCount: 1 });
+    const orderP2 = await createOrderWithPassengers({ roomTypeId: roomTypeB.id, passengerCount: 1 });
+    const [itemI1, itemI2] = orderX.items;
+
+    const savedR1 = await saveSharedRooms(
+      {
+        hotelId: hotelA.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomTypeA.id,
+            groups: [
+              { orderId: orderX.id, orderItemId: itemI1.id, passengerIds: [orderX.passengers[0].id], roomFraction: 1 },
+              { orderId: orderP1.id, orderItemId: orderP1.items[0].id, passengerIds: [orderP1.passengers[0].id], roomFraction: 0 },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const savedR2 = await saveSharedRooms(
+      {
+        hotelId: hotelB.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomTypeB.id,
+            groups: [
+              { orderId: orderX.id, orderItemId: itemI2.id, passengerIds: [orderX.passengers[1].id], roomFraction: 1 },
+              { orderId: orderP2.id, orderItemId: orderP2.items[0].id, passengerIds: [orderP2.passengers[0].id], roomFraction: 0 },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const sharedRoomId1 = savedR1.rooms[0].sharedRoomId;
+    const sharedRoomId2 = savedR2.rooms[0].sharedRoomId;
+
+    // orderX 的 roomAssignment JSON 此时两条行都带着各自的 sharedRoomId。
+    const before = await prisma.order.findUnique({ where: { id: orderX.id }, select: { roomAssignment: true } });
+    const beforeGroups = readRoomGroupArray(before?.roomAssignment) ?? [];
+    const beforeSids = new Set(
+      beforeGroups.map((g) => (g as { sharedRoomId?: string }).sharedRoomId).filter(Boolean),
+    );
+    expect(beforeSids.has(sharedRoomId1)).toBe(true);
+    expect(beforeSids.has(sharedRoomId2)).toBe(true);
+
+    // 取消 orderX，随后两间共享房都被工作台解散——恢复时 I1、I2 两条行**同时**不一致，
+    // 必须整单一次性解绑，不能分两份计划先后落库。
+    await prisma.order.update({ where: { id: orderX.id }, data: { status: OrderStatus.CANCELLED } });
+    await prisma.sharedRoom.update({
+      where: { id: sharedRoomId1 },
+      data: { status: 'DISSOLVED', dissolvedAt: new Date(), dissolvedReason: 'test-dissolve' },
+    });
+    await prisma.sharedRoom.update({
+      where: { id: sharedRoomId2 },
+      data: { status: 'DISSOLVED', dissolvedAt: new Date(), dissolvedReason: 'test-dissolve' },
+    });
+
+    await service.restoreCancelledOrder(
+      orderX.id,
+      { requestToken: randomUUID(), allowOversell: false, allowFlownLegs: false },
+      { userId: actor.userId, role: UserRole.ADMIN },
+    );
+
+    // 成员表：两条行在各自房间的成员都已删除。
+    const remainingMembers = await prisma.sharedRoomMember.findMany({
+      where: { orderId: orderX.id },
+    });
+    expect(remainingMembers).toHaveLength(0);
+
+    // JSON：N2 的核心断言——两个共享键必须**都**没了。旧实现会因为「计划二从原始快照
+    // 出发、只删自己那个键」把先解绑行的键写回来，这里只会剩 0 个或 1 个被剥掉。
+    const after = await prisma.order.findUnique({ where: { id: orderX.id }, select: { roomAssignment: true } });
+    const afterGroups = readRoomGroupArray(after?.roomAssignment) ?? [];
+    const groupI1 = afterGroups.find((g) => roomGroupItemId(g) === itemI1.id) as
+      | { sharedRoomId?: string }
+      | undefined;
+    const groupI2 = afterGroups.find((g) => roomGroupItemId(g) === itemI2.id) as
+      | { sharedRoomId?: string }
+      | undefined;
+    expect(groupI1?.sharedRoomId).toBeUndefined();
+    expect(groupI2?.sharedRoomId).toBeUndefined();
   });
 
   it('astra finding A2 反例：恢复时共享房一致（保留合住）不能被当成「凭空新增一间」拒掉——只有 1 间也该放行', async () => {
