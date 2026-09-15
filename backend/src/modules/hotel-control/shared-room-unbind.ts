@@ -639,6 +639,11 @@ export async function planRestoreSharedRoomReconciliation(
  * 一类必须直接拒绝（不能自动解绑）的入口用：`该行有共享成员 → 400「该行与他单合住，
  * 请先在跨单分房里解除合住」`。防御式同 unbindSharedRoomMembersForItem：mock tx 没有
  * sharedRoomMember delegate 时回落 false，不炸单测。
+ *
+ * L5 修复（批 10）：生产 tx 必有 sharedRoomMember delegate——缺失只可能是客户端初始化
+ * 坏了，不该悄悄回落成 false（那会让本该拒绝的「该行与他单合住」判定悄悄放行，属于
+ * 「合住闸拿不到数据就假装无事」的危险方向），直接抛错。非生产环境（单测常用手搭
+ * mock tx）维持原回落。
  */
 export async function hasSharedRoomMembers(
   tx: Prisma.TransactionClient,
@@ -648,7 +653,12 @@ export async function hasSharedRoomMembers(
   const delegate = (
     tx as unknown as { sharedRoomMember?: { count: (args: unknown) => Promise<number> } }
   ).sharedRoomMember;
-  if (!delegate) return false;
+  if (!delegate) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('sharedRoom delegate missing on production client');
+    }
+    return false;
+  }
   const count = await delegate.count({ where: { orderId, orderItemId } });
   return count > 0;
 }

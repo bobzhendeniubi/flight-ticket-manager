@@ -6,11 +6,12 @@
  * 手搭 mock tx）维持原回落，不强制所有单测都换真库/完整替身。
  *
  * planUnbindMany / getSharedRoomStatesForItem 共用同一个内部 sharedRoomMemberDelegate
- * 取值 helper，两个公开入口各起一条用例，覆盖两处调用点。
+ * 取值 helper，两个公开入口各起一条用例，覆盖两处调用点。hasSharedRoomMembers 是第三处
+ * 独立的（未经共用 helper 的）内联 delegate 判定，单独起一组用例。
  */
 import { describe, expect, it } from 'vitest';
 import type { Prisma } from '@prisma/client';
-import { getSharedRoomStatesForItem, planUnbindMany } from './shared-room-unbind.js';
+import { getSharedRoomStatesForItem, hasSharedRoomMembers, planUnbindMany } from './shared-room-unbind.js';
 
 /** 不搭 sharedRoomMember delegate 的最小假 tx——模拟生产客户端初始化坏了的场景。 */
 const txWithoutDelegate = {} as unknown as Prisma.TransactionClient;
@@ -61,6 +62,29 @@ describe('sharedRoomMemberDelegate 生产环境守卫（L5）', () => {
     try {
       const states = await getSharedRoomStatesForItem(txWithoutDelegate, 'order-1', 'item-1');
       expect(states).toEqual([]);
+    } finally {
+      process.env.NODE_ENV = originalNodeEnv;
+    }
+  });
+
+  it('hasSharedRoomMembers：生产环境缺 delegate → 抛错，不回落成 false', async () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'production';
+    try {
+      await expect(hasSharedRoomMembers(txWithoutDelegate, 'order-1', 'item-1')).rejects.toThrow(
+        'sharedRoom delegate missing on production client',
+      );
+    } finally {
+      process.env.NODE_ENV = originalNodeEnv;
+    }
+  });
+
+  it('hasSharedRoomMembers：非生产环境缺 delegate → 维持回落成 false，不抛错', async () => {
+    const originalNodeEnv = process.env.NODE_ENV;
+    process.env.NODE_ENV = 'test';
+    try {
+      const has = await hasSharedRoomMembers(txWithoutDelegate, 'order-1', 'item-1');
+      expect(has).toBe(false);
     } finally {
       process.env.NODE_ENV = originalNodeEnv;
     }
