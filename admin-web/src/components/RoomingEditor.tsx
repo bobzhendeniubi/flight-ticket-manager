@@ -192,9 +192,15 @@ function genderBadge(gender?: string | null): string | null {
   return null;
 }
 
-/** 份额规整到 {0, 0.5, 1}——0 只应来自共享组（主单让份），普通组异常值一律回落 1。 */
-function normalizeFraction(f: number | undefined, isShared: boolean): number {
-  if (isShared && f === SHARED_ROOM) return SHARED_ROOM;
+/**
+ * 份额规整到 {0, 0.5, 1}——三态原样保留，非法值（既非 0/0.5/1 的脏数据）才回落 1。
+ * 0 不再按 isShared 强制改写：普通组的 0 是解绑/解散留下的「计费 0 间」（N4），编辑器
+ * 重新打开必须原样保留，不能因为「普通组不该是 0」的旧假设把它悄悄改成 1——那会导致
+ * 保存时把服务端已经接受的 0 悄悄涨回 1（普通组没有任何入口能手动把份额改成 0，所以
+ * 这里读到的 0 只可能来自 seed，不存在「用户瞎填 0」的风险）。
+ */
+function normalizeFraction(f: number | undefined): number {
+  if (f === SHARED_ROOM) return SHARED_ROOM;
   if (f === HALF_ROOM) return HALF_ROOM;
   return FULL_ROOM;
 }
@@ -212,7 +218,7 @@ function seedBoxes(initial: RoomGroup[] | undefined): RoomBox[] {
       roomType: g.roomType ?? '',
       passengerIds: Array.isArray(g.passengerIds) ? [...g.passengerIds] : [],
       notes: g.notes ?? '',
-      roomFraction: normalizeFraction(g.roomFraction, isShared),
+      roomFraction: normalizeFraction(g.roomFraction),
       // 既有归属（split-room-group / 上次保存写入）保留——重存分房不能把归属静默清掉
       orderItemId: g.orderItemId ?? null,
       sharedRoomId,
@@ -354,8 +360,12 @@ export function RoomingEditor({
   // 锁定盒子（与他单合住）的乘客不可拖出，也不接受新乘客拖入——改动一律去房控页「跨单分房」。
   function movePassenger(passengerId: string, targetBoxId: string | null): void {
     setBoxes((prev) => {
-      const sourceBox = prev.find((b) => b.passengerIds.includes(passengerId));
-      if (sourceBox && isLockedBox(sourceBox)) return prev;
+      // 正常数据下一名乘客只会出现在 0/1 个来源盒子；但 N2（后端解散重复归属回归）能造出
+      // 同一乘客同时挂在普通组和共享组两个盒子的脏状态——只查 .find() 首个来源盒子会漏查
+      // 到第二个，若第二个恰好是锁定的共享组，:362 原来的「从所有盒子移除」就会连锁定组
+      // 也一起改了。这里改成检查该乘客所在的每一个盒子，任一锁定即整体拒绝这次移动。
+      const sourceBoxes = prev.filter((b) => b.passengerIds.includes(passengerId));
+      if (sourceBoxes.some(isLockedBox)) return prev;
       const targetBox = targetBoxId ? prev.find((b) => b.id === targetBoxId) : null;
       if (targetBox && isLockedBox(targetBox)) return prev;
       // 先从所有盒子移除
@@ -488,8 +498,13 @@ export function RoomingEditor({
           roomType: b.roomType.trim(),
           passengerIds: b.passengerIds,
           notes: b.notes.trim(),
-          // 普通盒子维持旧口径：只在半间时才带字段，整间省略。
-          ...(b.roomFraction === HALF_ROOM ? { roomFraction: HALF_ROOM } : {}),
+          // 普通盒子维持旧口径：整间（默认值 1）省略字段；半间、以及 0（解绑遗留的
+          // 「计费 0 间」，见 normalizeFraction 注释）都必须显式带上——省略 0 会被服务端
+          // `g.roomFraction ?? 1` 的缺省兜底悄悄涨回 1，进不去后端「原有普通 0 份额
+          // 保留」那条分支（N4）。
+          ...(b.roomFraction === HALF_ROOM || b.roomFraction === SHARED_ROOM
+            ? { roomFraction: b.roomFraction }
+            : {}),
           ...(orderItemId ? { orderItemId } : {}),
           ...(b.splitPairKey ? { splitPairKey: b.splitPairKey } : {}),
         };
@@ -650,6 +665,14 @@ export function RoomingEditor({
                     {locked && b.roomFraction === SHARED_ROOM && (
                       <span className="badge-neutral" title="本单在这间房的计费份额为 0（让份给合住方）">
                         计费 0 间
+                      </span>
+                    )}
+                    {!locked && b.roomFraction === SHARED_ROOM && (
+                      <span
+                        className="badge-neutral"
+                        title="解绑/解散跨单分房后留下的计费份额，重存分房不会改动它——如需恢复整间/半间计费，请改结算价通道"
+                      >
+                        计费 0 间（解绑遗留）
                       </span>
                     )}
                     <span className="text-xs font-normal text-ink-muted">{b.passengerIds.length} 人</span>

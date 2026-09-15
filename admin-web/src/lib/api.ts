@@ -1506,7 +1506,10 @@ export interface RoomGroup {
   notes?: string;
   /**
    * 占房间数：整间=1（缺省），拼房半间=0.5。例：7人3.5间。
-   * 允许 0——仅限跨单分房的共享组（该组带 sharedRoomId 时，主单让份场景）；普通组传 0 服务端 400。
+   * 允许 0：跨单分房的共享组（带 sharedRoomId，主单让份场景）本就可以是 0；普通组新建/
+   * 改成 0 服务端仍 400，但落库现状已经是 0 的普通组（解绑/解散共享房后留下的「计费 0
+   * 间」）原样重存会放行——服务端只接受与旧值一致的 0，不认客户端凭空提交的 0（N4，
+   * 见 orders.routes.ts room-assignment 里 `roomFraction ?? 1) === 0` 分支）。
    */
   roomFraction?: number;
   /**
