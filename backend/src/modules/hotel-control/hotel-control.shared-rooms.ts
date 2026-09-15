@@ -544,7 +544,21 @@ export async function reserveRequestOrReplay(
         throw new ConflictError('该请求编号已用于另一次不同的跨单分房保存，请刷新后重试');
       }
       if (!isPendingSentinel(existing.resultJson)) {
-        return { replay: existing.resultJson as unknown as SaveSharedRoomsResult, reservationId: null };
+        // P2 修复（批 10）：部署前（本字段引入之前）写入的占位行 resultJson 不带
+        // orphanedSharedRoomIds/warnings/dissolved——直接强转成 SaveSharedRoomsResult
+        // 类型在撒谎，前端 `new Set(undefined)` 虽不会真炸，但把「类型说非空、实际是
+        // undefined」这个窗口在幂等保留期内一直留着不对。逐字段 `?? []` 兜底，只影响
+        // 部署前写入、且仍在幂等窗口内被回放的极少数占位行。
+        const replayed = existing.resultJson as unknown as Partial<SaveSharedRoomsResult>;
+        return {
+          replay: {
+            rooms: replayed.rooms ?? [],
+            dissolved: replayed.dissolved ?? [],
+            warnings: replayed.warnings ?? [],
+            orphanedSharedRoomIds: replayed.orphanedSharedRoomIds ?? [],
+          },
+          reservationId: null,
+        };
       }
       // 走到这里：同 token 同指纹、且仍是 PENDING——上一次占位还没写出真结果。
       const ageMs = Date.now() - existing.createdAt.getTime();

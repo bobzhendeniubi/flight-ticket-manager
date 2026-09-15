@@ -2030,6 +2030,9 @@ describe('saveSharedRooms · 真 DB E2E · 隐式触及旧共享房的清理（a
     // 这不该悄无声息：响应 warnings 必须明示，orderB 的逐单审计 after 也要带同一条提示
     // （不止响应这一处，翻旧账也要看得到），不能像旧实现那样连一句提示都没有。
     expect(result.warnings.some((w) => w.includes(oldRoomId) && w.includes('原计费方已迁出'))).toBe(true);
+    // P2（批 10）：orphanedSharedRoomIds 此前没有任何测试断言过内容——只断响应字段确实
+    // 含这间孤儿房（隐式留守路径，见 hotel-control.shared-rooms.ts:1136 一带）。
+    expect(result.orphanedSharedRoomIds).toEqual([oldRoomId]);
     const auditB = await prisma.auditLog.findFirst({
       where: { action: 'UPDATE_ROOM_ASSIGNMENT', targetId: orderB.id },
       orderBy: { createdAt: 'desc' },
@@ -2150,6 +2153,9 @@ describe('saveSharedRooms · 真 DB E2E · 隐式触及旧共享房的清理（a
     expect(
       resubmit.warnings.some((w) => w.includes(oldRoomId) && w.includes('原计费方已迁出')),
     ).toBe(true);
+    // P2（批 10）：显式重提路径（hotel-control.shared-rooms.ts:942 一带）同样要断
+    // orphanedSharedRoomIds 的内容，不止隐式留守那一条路径。
+    expect(resubmit.orphanedSharedRoomIds).toEqual([oldRoomId]);
 
     const sAfter = await prisma.sharedRoom.findUniqueOrThrow({
       where: { id: oldRoomId },

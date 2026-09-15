@@ -44,7 +44,7 @@ describe('reserveRequestOrReplay（astra N10）', () => {
   });
 
   it('同 token 同指纹、已有真结果 → 回放，reservationId 为 null（回放路径没有新占位）', async () => {
-    const realResult = { rooms: [], dissolved: [], warnings: [] };
+    const realResult = { rooms: [], dissolved: [], warnings: [], orphanedSharedRoomIds: [] };
     const client = {
       sharedRoomRequest: {
         create: vi.fn().mockRejectedValue(p2002()),
@@ -58,6 +58,33 @@ describe('reserveRequestOrReplay（astra N10）', () => {
     } as unknown as PrismaClient;
     const result = await reserveRequestOrReplay(client, body, 'fp-1');
     expect(result).toEqual({ replay: realResult, reservationId: null });
+  });
+
+  it('P2 修复（批 10）：部署前写入的占位行 resultJson 不带 orphanedSharedRoomIds/warnings/dissolved → 回放时逐字段兜底成 []，类型不撒谎', async () => {
+    // 模拟批 9 之前（orphanedSharedRoomIds 字段引入前）写入的真结果——只有 rooms，
+    // 其它三个字段在那个年代的代码里根本不存在。
+    const legacyResult = { rooms: [{ sharedRoomId: 'sr-1', version: 3 }] };
+    const client = {
+      sharedRoomRequest: {
+        create: vi.fn().mockRejectedValue(p2002()),
+        findUnique: vi.fn().mockResolvedValue({
+          id: 'old-legacy',
+          fingerprint: 'fp-1',
+          resultJson: legacyResult,
+          createdAt: new Date(),
+        }),
+      },
+    } as unknown as PrismaClient;
+    const result = await reserveRequestOrReplay(client, body, 'fp-1');
+    expect(result).toEqual({
+      replay: {
+        rooms: [{ sharedRoomId: 'sr-1', version: 3 }],
+        dissolved: [],
+        warnings: [],
+        orphanedSharedRoomIds: [],
+      },
+      reservationId: null,
+    });
   });
 
   it('astra N10（核心反例）：孤儿占位回收的删除条件必须带「仍是 pending」的 CAS，不能只按 id', async () => {
