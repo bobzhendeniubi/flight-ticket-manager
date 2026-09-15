@@ -149,7 +149,9 @@ import {
   getHotelOversellCapRooms,
   getRandomTierAggregate,
   lockHotelBlockPeriodsWithinTx,
+  lockHotelInventoryForUpdate,
   lockRandomTierBlockPeriodsWithinTx,
+  lockRandomTierInventoryForUpdate,
   randomStarTierLabel,
   type PhysicalFitViolation,
   type PhysicalOccupancyItem,
@@ -9244,25 +9246,15 @@ export class OrderService {
         hotelScopeNightDates.set(roomType.hotelId, set);
       }
     }
-    type RestoreLockScope = { kind: 'hotel'; id: string } | { kind: 'random'; id: number };
-    const lockScopes: RestoreLockScope[] = [
-      ...[...hotelScopeNightDates.keys()].map((id): RestoreLockScope => ({ kind: 'hotel', id })),
-      ...[...randomTierScopeNightDates.keys()].map((id): RestoreLockScope => ({ kind: 'random', id })),
-    ].sort((a, b) => {
-      if (a.kind !== b.kind) return a.kind < b.kind ? -1 : 1; // 'hotel' 固定排在 'random' 前
-      return String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0;
-    });
-    for (const scope of lockScopes) {
-      if (scope.kind === 'hotel') {
-        await lockHotelBlockPeriodsWithinTx(tx, scope.id, [...hotelScopeNightDates.get(scope.id)!].sort());
-      } else {
-        await lockRandomTierBlockPeriodsWithinTx(
-          tx,
-          scope.id,
-          [...randomTierScopeNightDates.get(scope.id)!].sort(),
-        );
-      }
-    }
+    // M5 修复：改用 lockHotelInventoryForUpdate / lockRandomTierInventoryForUpdate——
+    // 与原先手工调用 lockHotelBlockPeriodsWithinTx / lockRandomTierBlockPeriodsWithinTx
+    // 的区别在于「该酒店/该档次完全没有配置包房周期」时不再什么都不锁，而是退化为
+    // advisory lock 兜底（方案 §六步骤 4 明文写的要求）。全局加锁顺序不变：先锁完全部
+    // 涉及的酒店（内部按 hotelId 升序），再锁全部涉及的随机档（内部按档次升序）——与
+    // 之前 lockScopes 排序结果一致（'hotel' 固定排在 'random' 前），不会与其它并发事务
+    // 以不同顺序锁同一批作用域而成环死锁。
+    await lockHotelInventoryForUpdate(tx, [...hotelScopeNightDates.keys()]);
+    await lockRandomTierInventoryForUpdate(tx, [...randomTierScopeNightDates.keys()]);
 
     const shortage = (result: { remaining: number[]; block: number[]; hasBlock: boolean }): boolean =>
       result.hasBlock &&

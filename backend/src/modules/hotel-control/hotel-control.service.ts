@@ -1561,6 +1561,49 @@ export async function lockHotelInventoryForUpdate(
 }
 
 /**
+ * `lockHotelInventoryForUpdate` 的随机档变体（M5 修复）：按档次升序逐个锁该档次全部真
+ * 酒店（同星级、非国际五星、非占位）的全部包房周期行；该档次完全没有任何真酒店配置
+ * 包房周期时（未纳管）退化为 `pg_advisory_xact_lock(hashtext('random-tier:' || tier))`。
+ *
+ * 与 `lockRandomTierBlockPeriodsWithinTx` 的区别同 `lockHotelInventoryForUpdate` 之于
+ * `lockHotelBlockPeriodsWithinTx`：不按日期区间过滤（锁该档次全部周期行，恢复路径一次
+ * 可能牵涉多段互不相邻的日期），且无周期时会退化为 advisory lock 兜底——恢复路径的
+ * 容量判定是调用方自己实现的 `assertRestoreHotelCapacity`，在锁到手之前不知道这个档次
+ * 最终算不算「未纳管」。
+ *
+ * advisory lock 的 key 加了 `random-tier:` 前缀，与 `lockHotelInventoryForUpdate` 用
+ * 真实 hotelId 做 key 的命名空间区分开，避免档次数字巧合撞上某个 hotelId 的哈希。
+ *
+ * @param tiers 本次恢复涉及的全部随机档档次（可以有重复，内部会去重）。
+ */
+export async function lockRandomTierInventoryForUpdate(
+  tx: Prisma.TransactionClient,
+  tiers: readonly number[],
+): Promise<void> {
+  const sortedTiers = [...new Set(tiers)].sort((a, b) => a - b);
+  for (const tier of sortedTiers) {
+    const hotels = await tx.hotel.findMany({
+      where: { starRating: tier, intlFiveStar: false, randomTierPlaceholder: null },
+      select: { id: true },
+    });
+    const hotelIds = hotels.map((h) => h.id).sort();
+    let lockedAny = false;
+    if (hotelIds.length > 0) {
+      const lockedPeriods = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "HotelBlockPeriod"
+        WHERE "hotelId" IN (${Prisma.join(hotelIds)})
+        ORDER BY id
+        FOR UPDATE
+      `;
+      lockedAny = lockedPeriods.length > 0;
+    }
+    if (!lockedAny) {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'random-tier:' + String(tier)}))`;
+    }
+  }
+}
+
+/**
  * `assertHotelPhysicalFit` 的**事务内互斥**变体：先锁该酒店该区间的包房周期行，
  * 再在同一事务里跑一遍完全相同的前瞻闸判定。
  *

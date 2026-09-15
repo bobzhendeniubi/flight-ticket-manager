@@ -67,6 +67,10 @@ const { mockPrisma, hotelControlMocks, queueMocks } = vi.hoisted(() => ({
     randomStarTierLabel: vi.fn(),
     // C1 修复引入：这些用例不测 0 份额兜底，透传即可（与修复前「不介入」的行为一致）。
     floorZeroRoomsBilledByAssignedRooms: vi.fn((roomsBilled: unknown) => roomsBilled),
+    // M5 修复引入：assertRestoreHotelCapacity 改用这两个函数加锁（advisory lock 兜底
+    // 随之生效）——桩与真模块导出对齐，少一个键会炸成 "not a function"。
+    lockHotelInventoryForUpdate: vi.fn(),
+    lockRandomTierInventoryForUpdate: vi.fn(),
   },
   queueMocks: {
     scheduleSeatHoldRelease: vi.fn(),

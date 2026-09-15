@@ -73,6 +73,10 @@ vi.mock('../hotel-control/hotel-control.service.js', () => ({
   // 少一个键会在强制恢复/驳回回座路径炸成 "not a function"。
   lockHotelBlockPeriodsWithinTx: vi.fn(),
   lockRandomTierBlockPeriodsWithinTx: vi.fn(),
+  // M5 修复：assertRestoreHotelCapacity 改用这两个函数加锁（advisory lock 兜底随之
+  // 生效）——桩与真模块导出对齐，同上少一个键会炸成 "not a function"。
+  lockHotelInventoryForUpdate: vi.fn(),
+  lockRandomTierInventoryForUpdate: vi.fn(),
 }));
 
 import {
