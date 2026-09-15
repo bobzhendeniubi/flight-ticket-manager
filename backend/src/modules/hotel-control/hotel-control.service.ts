@@ -1672,9 +1672,13 @@ async function computeSharedRoomPhysicalAfterChange(
  *
  * 该酒店本区间没有任何包房周期 → 未纳管，不拦（房控哲学：未配包房 ≠ 售罄）。
  *
- * @returns 被 `options.maxOversellRooms` 容忍的超卖明细（未开豁免、未超卖、或被
- *   `allowNonWorsening` 放行 → 空数组）。调用方拿非空返回值写 WARNING 审计，语义与
- *   `assertHotelPhysicalFit` 完全一致。
+ * @returns 被 `options.maxOversellRooms` 容忍的超卖明细（`PhysicalFitViolation[]`，形状
+ *   与 `assertHotelPhysicalFit`/`assertHotelPhysicalFitWithinTx` 完全一致、稳定导出，
+ *   调用方可以放心解构）：未开 `maxOversellRooms` 豁免、未超卖、或被 `allowNonWorsening`
+ *   放行 → 空数组。**调用方必须接住这个返回值并在非空时写 WARNING 审计**（astra N3：
+ *   `restoreCancelledOrder` 曾经调用了这个函数却把返回值直接丢在语句里没有变量接收，
+ *   容忍超卖这件事本该留痕却完全没有痕迹）——不能像那样 `await assertHotelFitAfterChange(...)`
+ *   把结果扔掉；也不能只在某些调用点接、某些不接，语义应统一。
  */
 export async function assertHotelFitAfterChange(
   tx: Prisma.TransactionClient,
