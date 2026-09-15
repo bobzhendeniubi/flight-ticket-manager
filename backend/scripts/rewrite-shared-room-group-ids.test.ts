@@ -1,11 +1,15 @@
 /**
- * rewrite-shared-room-group-ids 单元测试（astra N9 回归修复）。
+ * rewrite-shared-room-group-ids 单元测试（astra N9 回归修复 + astra B-N1 脚本扩面）。
  *
- * 反例：旧实现全表扫描后，`--apply` 无条件把整份 roomAssignment 覆盖成
+ * N9 反例：旧实现全表扫描后，`--apply` 无条件把整份 roomAssignment 覆盖成
  * `{ roomGroups: newGroups }`——① 用的是扫描时的旧快照，脚本运行期间业务侧对同一张单
  * 的并发改动会被整份覆盖悄悄冲掉；② 丢弃 roomGroups 之外的其它顶层字段。
  * 修复后逐单一个独立事务：锁行、基于锁后最新状态重判、只替换命中的旧式编码 id、
- * 保留其它顶层字段、审计写入同事务。
+ * 保留其它字段、审计写入同事务。
+ *
+ * B-N1 反例：脚本原本只改 `Order.roomAssignment`，`OrderItem.metadata.splitRoomGroup.
+ * roomGroupId` 里还存着旧式编码 id（按房组拆行时留下的历史 breadcrumb）。脚本要同时
+ * 重写这处载体，同一事务、同样锁后重读，dry-run 也要列出命中数。
  */
 import { describe, it, expect, vi } from 'vitest';
 import type { PrismaClient } from '@prisma/client';
@@ -17,18 +21,36 @@ interface FakeOrderRow {
   roomAssignment: unknown;
 }
 
+interface FakeItemRow {
+  id: string;
+  orderId: string;
+  metadata: unknown;
+}
+
 /**
- * 假 client：`order.findMany` 提供「扫描阶段」看到的快照；`freshByOrderId` 提供
- * `$transaction` 内部 `order.findUnique` 应该读到的「锁后最新状态」——两者可以不同，
- * 用来模拟脚本运行期间的并发写入。省略 `freshByOrderId` 里的某个 id = 模拟订单已被删除
- * （`findUnique` 返回 null）。
+ * 假 client：
+ *   - `scanRows` / `scanItemRows`：扫描阶段看到的快照（`client.order.findMany` /
+ *     `client.orderItem.findMany`）；
+ *   - `freshByOrderId`：`$transaction` 内部 `tx.order.findUnique` 应该读到的「锁后最新
+ *     roomAssignment」，省略某 id = 该单未变，沿用 scanRows；显式给 null = 订单已被删除；
+ *   - `freshItemsByOrderId`：`tx.orderItem.findMany` 应该读到的「锁后最新该单全部行
+ *     metadata」，省略某 id = 该单的行未变，沿用 scanItemRows 里属于它的行。
+ * 两组「扫描快照 / 锁后最新」可以不同，用来模拟脚本运行期间的并发写入。
  */
-function fakeClient(
-  scanRows: FakeOrderRow[],
-  freshByOrderId: Record<string, FakeOrderRow | null> = {},
-) {
-  const updateCalls: Array<{ id: string; roomAssignment: unknown }> = [];
-  const auditCalls: Array<{ tx: boolean; entry: Record<string, unknown> }> = [];
+function fakeClient(opts: {
+  scanRows?: FakeOrderRow[];
+  scanItemRows?: FakeItemRow[];
+  freshByOrderId?: Record<string, FakeOrderRow | null>;
+  freshItemsByOrderId?: Record<string, FakeItemRow[]>;
+}) {
+  const scanRows = opts.scanRows ?? [];
+  const scanItemRows = opts.scanItemRows ?? [];
+  const freshByOrderId = opts.freshByOrderId ?? {};
+  const freshItemsByOrderId = opts.freshItemsByOrderId ?? {};
+
+  const orderUpdateCalls: Array<{ id: string; roomAssignment: unknown }> = [];
+  const itemUpdateCalls: Array<{ id: string; metadata: unknown }> = [];
+  const auditCalls: Array<{ entry: Record<string, unknown> }> = [];
 
   const tx = {
     $queryRaw: vi.fn().mockResolvedValue([]),
@@ -38,13 +60,25 @@ function fakeClient(
         return Promise.resolve(fresh ?? null);
       }),
       update: vi.fn(({ where, data }: { where: { id: string }; data: { roomAssignment: unknown } }) => {
-        updateCalls.push({ id: where.id, roomAssignment: data.roomAssignment });
+        orderUpdateCalls.push({ id: where.id, roomAssignment: data.roomAssignment });
+        return Promise.resolve({ id: where.id });
+      }),
+    },
+    orderItem: {
+      findMany: vi.fn(({ where }: { where: { orderId: string } }) => {
+        const fresh = where.orderId in freshItemsByOrderId
+          ? freshItemsByOrderId[where.orderId]
+          : scanItemRows.filter((r) => r.orderId === where.orderId);
+        return Promise.resolve(fresh ?? []);
+      }),
+      update: vi.fn(({ where, data }: { where: { id: string }; data: { metadata: unknown } }) => {
+        itemUpdateCalls.push({ id: where.id, metadata: data.metadata });
         return Promise.resolve({ id: where.id });
       }),
     },
     auditLog: {
       create: vi.fn((args: { data: Record<string, unknown> }) => {
-        auditCalls.push({ tx: true, entry: args.data });
+        auditCalls.push({ entry: args.data });
         return Promise.resolve({});
       }),
     },
@@ -54,26 +88,31 @@ function fakeClient(
     order: {
       findMany: vi.fn().mockResolvedValue(scanRows),
     },
+    orderItem: {
+      findMany: vi.fn().mockResolvedValue(scanItemRows),
+    },
     $transaction: vi.fn((cb: (tx: unknown) => Promise<unknown>) => cb(tx)),
   } as unknown as PrismaClient;
 
-  return { client, updateCalls, auditCalls, tx };
+  return { client, orderUpdateCalls, itemUpdateCalls, auditCalls, tx };
 }
 
 describe('rewriteSharedRoomGroupIds（astra N9）', () => {
   it('dry-run：只预览不加锁、不写库、不产生审计', async () => {
-    const { client, updateCalls } = fakeClient([
-      {
-        id: 'o1',
-        orderNumber: 'ST-0001',
-        roomAssignment: { roomGroups: [{ id: 'shared:sr1:item-a', passengerIds: ['p1'] }] },
-      },
-    ]);
+    const { client, orderUpdateCalls } = fakeClient({
+      scanRows: [
+        {
+          id: 'o1',
+          orderNumber: 'ST-0001',
+          roomAssignment: { roomGroups: [{ id: 'shared:sr1:item-a', passengerIds: ['p1'] }] },
+        },
+      ],
+    });
     const result = await rewriteSharedRoomGroupIds(client, { apply: false });
     expect(result.scannedOrders).toBe(1);
     expect(result.candidateGroups).toBe(1);
     expect(result.rewrittenOrders).toBe(0);
-    expect(updateCalls).toHaveLength(0);
+    expect(orderUpdateCalls).toHaveLength(0);
     expect((client as unknown as { $transaction: ReturnType<typeof vi.fn> }).$transaction).not.toHaveBeenCalled();
   });
 
@@ -86,13 +125,13 @@ describe('rewriteSharedRoomGroupIds（astra N9）', () => {
         roomGroups: [{ id: 'shared:sr1:item-a', passengerIds: ['p1'] }],
       },
     };
-    const { client, updateCalls, auditCalls } = fakeClient([scanRow]);
+    const { client, orderUpdateCalls, auditCalls } = fakeClient({ scanRows: [scanRow] });
     const result = await rewriteSharedRoomGroupIds(client, { apply: true });
 
     expect(result.rewrittenOrders).toBe(1);
     expect(result.rewrittenGroups).toBe(1);
-    expect(updateCalls).toHaveLength(1);
-    const written = updateCalls[0]!.roomAssignment as { note?: string; roomGroups: Array<{ id: string }> };
+    expect(orderUpdateCalls).toHaveLength(1);
+    const written = orderUpdateCalls[0]!.roomAssignment as { note?: string; roomGroups: Array<{ id: string }> };
     // 旧实现只写 `{ roomGroups: newGroups }`，note 字段会消失——修复后必须保留。
     expect(written.note).toBe('这是 roomAssignment 顶层的另一个字段，不该被脚本丢弃');
     expect(written.roomGroups).toHaveLength(1);
@@ -128,12 +167,12 @@ describe('rewriteSharedRoomGroupIds（astra N9）', () => {
         ],
       },
     };
-    const { client, updateCalls } = fakeClient([staleSnapshot], { o1: freshState });
+    const { client, orderUpdateCalls } = fakeClient({ scanRows: [staleSnapshot], freshByOrderId: { o1: freshState } });
     const result = await rewriteSharedRoomGroupIds(client, { apply: true });
 
     expect(result.rewrittenOrders).toBe(1);
     expect(result.rewrittenGroups).toBe(1); // 只有 item-a 那一个仍是旧式编码
-    const written = updateCalls[0]!.roomAssignment as { roomGroups: Array<{ id: string; passengerIds: string[] }> };
+    const written = orderUpdateCalls[0]!.roomAssignment as { roomGroups: Array<{ id: string; passengerIds: string[] }> };
     expect(written.roomGroups).toHaveLength(2);
     // plain:sr1:item-b（旧快照里的）不应该出现——它已经不在锁后最新状态里了。
     expect(written.roomGroups.some((g) => g.id === 'plain:sr1:item-b')).toBe(false);
@@ -148,9 +187,92 @@ describe('rewriteSharedRoomGroupIds（astra N9）', () => {
       roomAssignment: { roomGroups: [{ id: 'shared:sr1:item-a', passengerIds: ['p1'] }] },
     };
     // 锁后重读：订单已被删除。
-    const { client, updateCalls } = fakeClient([scanRow], { o1: null });
+    const { client, orderUpdateCalls } = fakeClient({ scanRows: [scanRow], freshByOrderId: { o1: null } });
     const result = await rewriteSharedRoomGroupIds(client, { apply: true });
     expect(result.rewrittenOrders).toBe(0);
-    expect(updateCalls).toHaveLength(0);
+    expect(orderUpdateCalls).toHaveLength(0);
+  });
+});
+
+describe('rewriteSharedRoomGroupIds（astra B-N1：OrderItem.metadata.splitRoomGroup.roomGroupId）', () => {
+  it('dry-run 也要列出行 metadata 里的旧式编码命中数', async () => {
+    const { client } = fakeClient({
+      scanRows: [{ id: 'o1', orderNumber: 'ST-0001', roomAssignment: null }],
+      scanItemRows: [
+        {
+          id: 'item-b',
+          orderId: 'o1',
+          metadata: { splitRoomGroup: { fromItemId: 'item-a', roomGroupId: 'shared:sr1:item-a' } },
+        },
+      ],
+    });
+    const result = await rewriteSharedRoomGroupIds(client, { apply: false });
+    expect(result.candidateItemMetadata).toBe(1);
+    expect(result.rewrittenItemMetadata).toBe(0);
+  });
+
+  it('astra B-N1：改写行 metadata 的 roomGroupId，保留 metadata 里其它字段（fromItemId / note / at）', async () => {
+    const scanItem: FakeItemRow = {
+      id: 'item-b',
+      orderId: 'o1',
+      metadata: {
+        splitRoomGroup: { fromItemId: 'item-a', roomGroupId: 'plain:sr1:item-a', at: '2026-09-01T00:00:00.000Z' },
+        note: '这是 metadata 顶层的另一个字段，不该被丢弃',
+      },
+    };
+    const { client, itemUpdateCalls, auditCalls } = fakeClient({
+      scanRows: [{ id: 'o1', orderNumber: 'ST-0001', roomAssignment: null }],
+      scanItemRows: [scanItem],
+    });
+    const result = await rewriteSharedRoomGroupIds(client, { apply: true });
+
+    expect(result.rewrittenOrders).toBe(1);
+    expect(result.rewrittenGroups).toBe(0); // 这次命中的不是 roomGroups
+    expect(result.rewrittenItemMetadata).toBe(1);
+    expect(itemUpdateCalls).toHaveLength(1);
+    const written = itemUpdateCalls[0]!.metadata as {
+      note?: string;
+      splitRoomGroup: { fromItemId: string; roomGroupId: string; at: string };
+    };
+    expect(written.note).toBe('这是 metadata 顶层的另一个字段，不该被丢弃');
+    expect(written.splitRoomGroup.fromItemId).toBe('item-a'); // 其它子字段原样保留
+    expect(written.splitRoomGroup.at).toBe('2026-09-01T00:00:00.000Z');
+    expect(written.splitRoomGroup.roomGroupId).not.toBe('plain:sr1:item-a'); // 已换新
+    expect(written.splitRoomGroup.roomGroupId).not.toMatch(/^shared:|^plain:/);
+    expect(auditCalls).toHaveLength(1); // 同一事务、同一条审计（roomGroups 与行 metadata 合并一条）
+  });
+
+  it('astra B-N1：roomAssignment 干净但行 metadata 有旧式编码——仍会被扫到并改写', async () => {
+    const { client, orderUpdateCalls, itemUpdateCalls } = fakeClient({
+      scanRows: [{ id: 'o1', orderNumber: 'ST-0001', roomAssignment: { roomGroups: [{ id: 'clean-id' }] } }],
+      scanItemRows: [
+        {
+          id: 'item-b',
+          orderId: 'o1',
+          metadata: { splitRoomGroup: { fromItemId: 'item-a', roomGroupId: 'shared:sr1:item-a' } },
+        },
+      ],
+    });
+    const result = await rewriteSharedRoomGroupIds(client, { apply: true });
+    expect(result.rewrittenOrders).toBe(1);
+    expect(result.rewrittenGroups).toBe(0);
+    expect(result.rewrittenItemMetadata).toBe(1);
+    expect(orderUpdateCalls).toHaveLength(0); // roomAssignment 本就干净，不该被改写
+    expect(itemUpdateCalls).toHaveLength(1);
+  });
+
+  it('锁后重读该单全部行都不再有旧式编码 metadata（并发已处理）→ 跳过，不写库', async () => {
+    const { client, itemUpdateCalls } = fakeClient({
+      scanRows: [{ id: 'o1', orderNumber: 'ST-0001', roomAssignment: null }],
+      scanItemRows: [
+        { id: 'item-b', orderId: 'o1', metadata: { splitRoomGroup: { roomGroupId: 'shared:sr1:item-a' } } },
+      ],
+      freshItemsByOrderId: {
+        o1: [{ id: 'item-b', orderId: 'o1', metadata: { splitRoomGroup: { roomGroupId: 'already-new-id' } } }],
+      },
+    });
+    const result = await rewriteSharedRoomGroupIds(client, { apply: true });
+    expect(result.rewrittenOrders).toBe(0);
+    expect(itemUpdateCalls).toHaveLength(0);
   });
 });
