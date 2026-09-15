@@ -63,8 +63,11 @@ vi.mock('../hotel-control/hotel-control.service.js', () => ({
   randomStarTierLabel: vi.fn(),
   // M5 修复：assertRestoreHotelCapacity 改用这两个函数加锁——桩与真模块导出对齐，
   // 少一个键会炸成 "not a function"。
+  // P1 修复（批 10）：lockRandomTierInventoryForUpdate 已拆成 resolveRandomTierHotelEntries
+  // + lockUnmanagedRandomTiers，同样是桩，与真模块导出对齐。
   lockHotelInventoryForUpdate: vi.fn(),
-  lockRandomTierInventoryForUpdate: vi.fn(),
+  resolveRandomTierHotelEntries: vi.fn().mockResolvedValue({ entries: [], unmanagedTiers: [] }),
+  lockUnmanagedRandomTiers: vi.fn(),
 }));
 
 import { OrderService, type OrderRequester } from './orders.service.js';

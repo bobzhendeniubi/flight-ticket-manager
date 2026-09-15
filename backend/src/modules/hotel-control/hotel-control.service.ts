@@ -1516,7 +1516,7 @@ export async function lockHotelBlockPeriodsWithinTx(
 }
 
 /**
- * 恢复路径专用的酒店库存互斥（astra N4 锁侧）：按酒店 id 升序逐个锁该酒店在
+ * 恢复路径专用的酒店库存互斥（astra N4 锁侧）：按酒店 id 升序逐个锁该酒店在其各自
  * `range` 覆盖区间内的包房周期行；这家酒店在这段区间完全没有配置任何包房周期
  * （未纳管）时退化为 `pg_advisory_xact_lock(hashtext(hotelId))`，方案 §六步骤 4
  * 明文写的兜底。
@@ -1532,31 +1532,58 @@ export async function lockHotelBlockPeriodsWithinTx(
  *
  * N5 修复：`range` 此前不存在——旧实现锁该酒店**全部**历史/未来包房周期行，一次恢复的
  * 争用面会覆盖该酒店与本次完全无关的日期（线上一个酒店可能有几十条周期行），把交互
- * 路径上的争用面显著放大。`range` 收窄成本次恢复涉及日期的并集（调用方把这批订单里
- * 全部住宿行的 checkIn~checkOut 取 min/max），只锁与这段区间有交集的周期行——不会漏锁：
- * 调用方传入的是「本次恢复」这一批订单自己的日期并集，不是某一行单独收窄，故不存在
- * 「漏锁到另一段被别的并发请求压着的周期行」的问题（那段日期本就不在本次恢复范围内）。
+ * 路径上的争用面显著放大。
+ *
+ * P1 修复（批 10 · sol 终审复核 2）：入参从「一批 hotelId + 一个全局 range」改成
+ * 「每个 hotelId 各自的 range」——N5 当时把 range 收窄成了「本次恢复涉及的全部住宿行」
+ * 的跨酒店、跨档次全局并集，一张单若同时含相隔很远的两段住宿（如 1 月的酒店行 +
+ * 12 月的随机档行），range 就是这一整年，仍然把与某家酒店本次完全无关的日期一起锁了。
+ * 现在调用方按各自 scope（某家酒店 / 某个随机档解析出的真酒店）传各自的日期并集，
+ * 真正收窄到「这次恢复实际会碰到的日期」。同一 hotelId 出现多条 entry（例如既是
+ * 某行直接预订的酒店、又是另一个随机档解析出的真酒店）时按并集（min~max）合并成
+ * 一次锁，不会因为分两次锁同一家酒店而在函数内部自己形成等待。
+ *
+ * P1 修复同时把随机档相并入本函数：调用方现在负责把 tiers 解析成真实 hotelId
+ * （见 `resolveRandomTierHotelEntries`）后与 hotel-scope 的 hotelId 一起传进来，
+ * 在同一相里统一按 hotelId 升序锁完——消掉了旧版「先锁完全部酒店相、再锁完全部随机档相」
+ * 这个两相顺序可能与随机档解析出的真酒店重叠、被另一并发事务以不同相序锁同一家酒店
+ * 而成环死锁的窗口。只有「档次下确实一家真酒店都没有」的兜底 advisory lock 还在
+ * `lockUnmanagedRandomTiers` 里，且约定必须在本函数**之后**调用——那批 key 与任何
+ * hotelId 都不会撞（真实 hotelId 是 cuid，不等于 `random-tier:` 前缀字符串），两相之间
+ * 没有共享资源，属于「资源分区 + 固定相序」的经典死锁免疫结构，不会重新引入成环。
  *
  * 用法同 `lockHotelBlockPeriodsWithinTx`：必须在调用方事务内调用，随后在同一事务里完成
  * 恢复判定与落库，不得提前释放锁。
  *
- * @param hotelIds 本次恢复涉及的全部酒店 id（可以有重复，内部会去重）——调用方负责收集
- *   全部受影响酒店，遗漏一个就等于那家酒店没有互斥，见 astra N4：两张不同的纯酒店
- *   取消单同时强制恢复，各自在事务内看到「自己占 1、对方仍取消」，容量 1 时能同时提交。
- * @param range 本次恢复涉及的日期并集（`dateOnly` 格式字符串），`from`/`to` 均含边界。
+ * @param entries 本次恢复涉及的每个 hotelId 及其各自日期并集（`dateOnly` 格式字符串，
+ *   `from`/`to` 均含边界）——调用方负责收集全部受影响酒店，遗漏一个就等于那家酒店
+ *   没有互斥，见 astra N4：两张不同的纯酒店取消单同时强制恢复，各自在事务内看到
+ *   「自己占 1、对方仍取消」，容量 1 时能同时提交。
  */
 export async function lockHotelInventoryForUpdate(
   tx: Prisma.TransactionClient,
-  hotelIds: readonly string[],
-  range: { from: string; to: string },
+  entries: ReadonlyArray<{ hotelId: string; range: { from: string; to: string } }>,
 ): Promise<void> {
-  const fromD = toDateOnly(range.from);
-  const toD = toDateOnly(range.to);
-  const sortedHotelIds = [...new Set(hotelIds)].sort();
+  // 同一 hotelId 可能出现多条 entry（hotel-scope 直接预订 + 随机档解析出的真酒店）——
+  // 合并成并集（min~max）后只锁一次，避免函数内部对同一家酒店发两次锁。
+  const mergedRangeByHotelId = new Map<string, { from: Date; to: Date }>();
+  for (const entry of entries) {
+    const fromD = toDateOnly(entry.range.from);
+    const toD = toDateOnly(entry.range.to);
+    const existing = mergedRangeByHotelId.get(entry.hotelId);
+    mergedRangeByHotelId.set(
+      entry.hotelId,
+      existing
+        ? { from: fromD < existing.from ? fromD : existing.from, to: toD > existing.to ? toD : existing.to }
+        : { from: fromD, to: toD },
+    );
+  }
+  const sortedHotelIds = [...mergedRangeByHotelId.keys()].sort();
   for (const hotelId of sortedHotelIds) {
+    const range = mergedRangeByHotelId.get(hotelId)!;
     const lockedPeriods = await tx.$queryRaw<Array<{ id: string }>>`
       SELECT id FROM "HotelBlockPeriod"
-      WHERE "hotelId" = ${hotelId} AND "dateFrom" <= ${toD} AND "dateTo" >= ${fromD}
+      WHERE "hotelId" = ${hotelId} AND "dateFrom" <= ${range.to} AND "dateTo" >= ${range.from}
       ORDER BY id
       FOR UPDATE
     `;
@@ -1574,51 +1601,71 @@ export async function lockHotelInventoryForUpdate(
 }
 
 /**
- * `lockHotelInventoryForUpdate` 的随机档变体（M5 修复）：按档次升序、档内按酒店 id
- * 升序逐店锁该档次全部真酒店（同星级、非国际五星、非占位）在 `range` 覆盖区间内的
- * 包房周期行；该档次完全没有任何真酒店在这段区间配置包房周期时（未纳管）退化为
- * `pg_advisory_xact_lock(hashtext('random-tier:' || tier))`。
+ * 把随机档档次解析成该档次全部真酒店（同星级、非国际五星、非占位）的 hotelId + 各自
+ * 日期区间，供 `lockHotelInventoryForUpdate` 与 hotel-scope 的 hotelId 合并成一相
+ * 一起锁（P1 修复，批 10）；档次下查不到任何真酒店的（未纳管）单独收集进
+ * `unmanagedTiers`，交给 `lockUnmanagedRandomTiers` 兜底。
  *
- * N5 修复：`range` 参数同 `lockHotelInventoryForUpdate`——不再锁该档次全部历史/未来
- * 周期行，只锁本次恢复涉及日期并集覆盖的部分。另把原先「一条 `hotelId IN (...)` 语句
- * 跨店拿锁」改成「按 hotelId 升序逐店各发一条 `FOR UPDATE`」——与 `lockHotelInventoryForUpdate`
- * 同形：两个函数现在用同一种「逐店按 id 升序加锁」的顺序，消掉两者原本可能以不同顺序
- * 锁同一批酒店而成环死锁的窗口（IN 语句里数据库按行物理顺序而非 hotelId 排序加锁，
- * 与逐店函数的加锁顺序不保证一致）。
+ * 一次查询解析全部传入档次（`starRating: { in: tiers }`），不再按档次逐条查
+ * `hotel.findMany`——纯粹是把原先 `lockRandomTierInventoryForUpdate` 里的循环合并成
+ * 一条查询，不改变解析口径。
+ *
+ * @param tierRanges 本次恢复涉及的每个随机档档次及其各自日期并集。
+ */
+export async function resolveRandomTierHotelEntries(
+  tx: Prisma.TransactionClient,
+  tierRanges: ReadonlyMap<number, { from: string; to: string }>,
+): Promise<{
+  entries: Array<{ hotelId: string; range: { from: string; to: string } }>;
+  unmanagedTiers: number[];
+}> {
+  const tiers = [...tierRanges.keys()];
+  if (tiers.length === 0) return { entries: [], unmanagedTiers: [] };
+  const hotels = await tx.hotel.findMany({
+    where: { starRating: { in: tiers }, intlFiveStar: false, randomTierPlaceholder: null },
+    select: { id: true, starRating: true },
+  });
+  const hotelIdsByTier = new Map<number, string[]>();
+  for (const hotel of hotels) {
+    const list = hotelIdsByTier.get(hotel.starRating) ?? [];
+    list.push(hotel.id);
+    hotelIdsByTier.set(hotel.starRating, list);
+  }
+  const entries: Array<{ hotelId: string; range: { from: string; to: string } }> = [];
+  const unmanagedTiers: number[] = [];
+  for (const tier of tiers) {
+    const range = tierRanges.get(tier)!;
+    const hotelIds = hotelIdsByTier.get(tier) ?? [];
+    if (hotelIds.length === 0) {
+      unmanagedTiers.push(tier);
+      continue;
+    }
+    for (const hotelId of hotelIds) entries.push({ hotelId, range });
+  }
+  return { entries, unmanagedTiers };
+}
+
+/**
+ * `resolveRandomTierHotelEntries` 挑出的「档次下确实一家真酒店都没有」（未纳管）兜底
+ * ——按档次升序逐个 `pg_advisory_xact_lock(hashtext('random-tier:' || tier))`。
+ *
+ * ⚠ 必须在 `lockHotelInventoryForUpdate` **之后**调用，且两者要在同一事务内：这批
+ * advisory key 与任何 hotelId 都不会撞（真实 hotelId 是 cuid，不等于 `random-tier:`
+ * 前缀字符串），两相之间没有共享资源，「先锁完 hotelId 相、再锁这批 tier 相」是全部
+ * 并发事务共用的固定相序，不会与 hotelId 相互相等成环（P1 修复，批 10）。
  *
  * advisory lock 的 key 加了 `random-tier:` 前缀，与 `lockHotelInventoryForUpdate` 用
  * 真实 hotelId 做 key 的命名空间区分开，避免档次数字巧合撞上某个 hotelId 的哈希。
  *
- * @param tiers 本次恢复涉及的全部随机档档次（可以有重复，内部会去重）。
- * @param range 本次恢复涉及的日期并集（`dateOnly` 格式字符串），`from`/`to` 均含边界。
+ * @param tiers 本次恢复涉及、且解析不出任何真酒店的随机档档次（可以有重复，内部会去重）。
  */
-export async function lockRandomTierInventoryForUpdate(
+export async function lockUnmanagedRandomTiers(
   tx: Prisma.TransactionClient,
   tiers: readonly number[],
-  range: { from: string; to: string },
 ): Promise<void> {
-  const fromD = toDateOnly(range.from);
-  const toD = toDateOnly(range.to);
   const sortedTiers = [...new Set(tiers)].sort((a, b) => a - b);
   for (const tier of sortedTiers) {
-    const hotels = await tx.hotel.findMany({
-      where: { starRating: tier, intlFiveStar: false, randomTierPlaceholder: null },
-      select: { id: true },
-    });
-    const hotelIds = hotels.map((h) => h.id).sort();
-    let lockedAny = false;
-    for (const hotelId of hotelIds) {
-      const lockedPeriods = await tx.$queryRaw<Array<{ id: string }>>`
-        SELECT id FROM "HotelBlockPeriod"
-        WHERE "hotelId" = ${hotelId} AND "dateFrom" <= ${toD} AND "dateTo" >= ${fromD}
-        ORDER BY id
-        FOR UPDATE
-      `;
-      if (lockedPeriods.length > 0) lockedAny = true;
-    }
-    if (!lockedAny) {
-      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'random-tier:' + String(tier)}))`;
-    }
+    await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'random-tier:' + String(tier)}))`;
   }
 }
 

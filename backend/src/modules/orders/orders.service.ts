@@ -151,8 +151,9 @@ import {
   lockHotelBlockPeriodsWithinTx,
   lockHotelInventoryForUpdate,
   lockRandomTierBlockPeriodsWithinTx,
-  lockRandomTierInventoryForUpdate,
+  lockUnmanagedRandomTiers,
   randomStarTierLabel,
+  resolveRandomTierHotelEntries,
   type PhysicalFitViolation,
   type PhysicalOccupancyItem,
   type ProspectiveOccupancy,
@@ -9246,26 +9247,36 @@ export class OrderService {
         hotelScopeNightDates.set(roomType.hotelId, set);
       }
     }
-    // M5 修复：改用 lockHotelInventoryForUpdate / lockRandomTierInventoryForUpdate——
+    // M5 修复：改用 lockHotelInventoryForUpdate / resolveRandomTierHotelEntries——
     // 与原先手工调用 lockHotelBlockPeriodsWithinTx / lockRandomTierBlockPeriodsWithinTx
     // 的区别在于「该酒店/该档次完全没有配置包房周期」时不再什么都不锁，而是退化为
-    // advisory lock 兜底（方案 §六步骤 4 明文写的要求）。全局加锁顺序不变：先锁完全部
-    // 涉及的酒店（内部按 hotelId 升序），再锁全部涉及的随机档（内部按档次升序）——与
-    // 之前 lockScopes 排序结果一致（'hotel' 固定排在 'random' 前），不会与其它并发事务
-    // 以不同顺序锁同一批作用域而成环死锁。
-    // N5 修复：两个锁函数都要求传本次恢复涉及日期的并集（min~max）——不再锁该酒店/该
-    // 档次全部历史/未来周期行，把交互路径上的争用面收窄回「这次恢复实际会碰到的日期」。
-    const allLockNightDates = [
-      ...[...hotelScopeNightDates.values()].flatMap((set) => [...set]),
-      ...[...randomTierScopeNightDates.values()].flatMap((set) => [...set]),
-    ].sort();
-    if (allLockNightDates.length > 0) {
-      const lockRange = {
-        from: allLockNightDates[0]!,
-        to: allLockNightDates[allLockNightDates.length - 1]!,
-      };
-      await lockHotelInventoryForUpdate(tx, [...hotelScopeNightDates.keys()], lockRange);
-      await lockRandomTierInventoryForUpdate(tx, [...randomTierScopeNightDates.keys()], lockRange);
+    // advisory lock 兜底（方案 §六步骤 4 明文写的要求）。
+    // P1 修复（批 10 · sol 终审复核 2）：不再把全部 scope 的日期拍平成一个全局 range
+    // 传给两个分开调用的锁函数——那样 range 会被跨酒店、跨档次的日期并集撑成一年，
+    // 且「先锁完酒店相、再锁完随机档相」两相顺序在随机档解析出的真酒店与 hotel-scope
+    // 直接预订的酒店重叠时可能被另一并发事务以不同相序锁同一家酒店而成环死锁。现在
+    // 每个 scope 各自算 min~max（不再拍平混算），随机档先解析成真实 hotelId 后与
+    // hotel-scope 的 hotelId 合并，一相内按 hotelId 升序一次性交给
+    // lockHotelInventoryForUpdate 锁完；只有档次下解析不出任何真酒店的才走
+    // lockUnmanagedRandomTiers 兜底，且约定在 hotelId 相**之后**调用（两者之间没有
+    // 共享资源，见该函数头注释的论证，不会重新引入成环）。
+    const hotelEntries: Array<{ hotelId: string; range: { from: string; to: string } }> = [];
+    for (const [hotelId, dates] of hotelScopeNightDates) {
+      const sorted = [...dates].sort();
+      hotelEntries.push({ hotelId, range: { from: sorted[0]!, to: sorted[sorted.length - 1]! } });
+    }
+    const tierRanges = new Map<number, { from: string; to: string }>();
+    for (const [tier, dates] of randomTierScopeNightDates) {
+      const sorted = [...dates].sort();
+      tierRanges.set(tier, { from: sorted[0]!, to: sorted[sorted.length - 1]! });
+    }
+    if (hotelEntries.length > 0 || tierRanges.size > 0) {
+      const { entries: tierHotelEntries, unmanagedTiers } = await resolveRandomTierHotelEntries(
+        tx,
+        tierRanges,
+      );
+      await lockHotelInventoryForUpdate(tx, [...hotelEntries, ...tierHotelEntries]);
+      await lockUnmanagedRandomTiers(tx, unmanagedTiers);
     }
 
     const shortage = (result: { remaining: number[]; block: number[]; hasBlock: boolean }): boolean =>

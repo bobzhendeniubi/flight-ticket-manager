@@ -17,7 +17,7 @@
 import { describe, it, expect, vi, beforeEach } from 'vitest';
 import { CabinClass, FulfillmentStatus, OrderStatus, UserRole } from '@prisma/client';
 
-const { mockPrisma, mockGetHotelNightlyRemaining } = vi.hoisted(() => ({
+const { mockPrisma, mockGetHotelNightlyRemaining, mockResolveRandomTierHotelEntries } = vi.hoisted(() => ({
   mockPrisma: {
     order: {
       findUnique: vi.fn(),
@@ -53,6 +53,11 @@ const { mockPrisma, mockGetHotelNightlyRemaining } = vi.hoisted(() => ({
     $queryRaw: vi.fn(),
   },
   mockGetHotelNightlyRemaining: vi.fn(),
+  // P1 修复（批 10）：resolveRandomTierHotelEntries 的返回值会被真代码解构
+  // （{ entries, unmanagedTiers }），vi.resetAllMocks() 每条用例前都会把 mockResolvedValue
+  // 清空——挂在 vi.hoisted 里是为了能在各 describe 自己的 beforeEach / 用例里按需重新
+  // mockResolvedValueOnce，而不是被 vi.mock 工厂里写死的一次性返回值在 reset 后失效。
+  mockResolveRandomTierHotelEntries: vi.fn(),
 }));
 // _updateStatusWithinTx 直接传 tx 参数，这里的 mockTx 即传入的事务句柄（同一批 vi.fn()）。
 const mockTx = mockPrisma;
@@ -75,8 +80,12 @@ vi.mock('../hotel-control/hotel-control.service.js', () => ({
   lockRandomTierBlockPeriodsWithinTx: vi.fn(),
   // M5 修复：assertRestoreHotelCapacity 改用这两个函数加锁（advisory lock 兜底随之
   // 生效）——桩与真模块导出对齐，同上少一个键会炸成 "not a function"。
+  // P1 修复（批 10）：lockRandomTierInventoryForUpdate 已拆成 resolveRandomTierHotelEntries
+  // + lockUnmanagedRandomTiers——同样是桩，resolveRandomTierHotelEntries 默认返回空结果，
+  // 不影响这些测试原本对 lockHotelInventoryForUpdate/容量判定本身的断言。
   lockHotelInventoryForUpdate: vi.fn(),
-  lockRandomTierInventoryForUpdate: vi.fn(),
+  resolveRandomTierHotelEntries: mockResolveRandomTierHotelEntries,
+  lockUnmanagedRandomTiers: vi.fn(),
 }));
 
 import {
@@ -719,6 +728,8 @@ describe('OrderService._updateStatusWithinTx · 退款申请即时释放与驳�
     mockPrisma.hotelRoomType.findMany.mockResolvedValueOnce([
       { id: 'room-type-1', hotelId: 'hotel-1', hotel: { randomTierPlaceholder: null } },
     ]);
+    // P1（批 10）：这单纯是 hotel-scope（无随机档行），随机档相解析结果恒空。
+    mockResolveRandomTierHotelEntries.mockResolvedValueOnce({ entries: [], unmanagedTiers: [] });
     mockGetHotelNightlyRemaining.mockResolvedValueOnce({
       remaining: [-1],
       block: [1],

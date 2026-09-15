@@ -69,8 +69,11 @@ const { mockPrisma, hotelControlMocks, queueMocks } = vi.hoisted(() => ({
     floorZeroRoomsBilledByAssignedRooms: vi.fn((roomsBilled: unknown) => roomsBilled),
     // M5 修复引入：assertRestoreHotelCapacity 改用这两个函数加锁（advisory lock 兜底
     // 随之生效）——桩与真模块导出对齐，少一个键会炸成 "not a function"。
+    // P1 修复（批 10）：lockRandomTierInventoryForUpdate 已拆成 resolveRandomTierHotelEntries
+    // + lockUnmanagedRandomTiers，同样是桩，与真模块导出对齐。
     lockHotelInventoryForUpdate: vi.fn(),
-    lockRandomTierInventoryForUpdate: vi.fn(),
+    resolveRandomTierHotelEntries: vi.fn().mockResolvedValue({ entries: [], unmanagedTiers: [] }),
+    lockUnmanagedRandomTiers: vi.fn(),
   },
   queueMocks: {
     scheduleSeatHoldRelease: vi.fn(),
@@ -204,6 +207,13 @@ function mount(order = buildOrder(), opts: { ownerRole?: UserRole | null } = {})
   hotelControlMocks.getHotelOversellCapRooms.mockResolvedValue(3);
   hotelControlMocks.assertHotelPhysicalFitWithinTx.mockResolvedValue([]);
   hotelControlMocks.assertRandomTierFitWithinTx.mockResolvedValue([]);
+  // P1 修复（批 10）：assertRestoreHotelCapacity 会解构 resolveRandomTierHotelEntries 的
+  // 返回值（{ entries, unmanagedTiers }）——默认无随机档行时也恒会被调用一次（见调用点），
+  // 不给默认值会在有酒店行的用例里炸成 "Cannot destructure … of undefined"。
+  hotelControlMocks.resolveRandomTierHotelEntries.mockResolvedValue({
+    entries: [],
+    unmanagedTiers: [],
+  });
 }
 
 /** $executeRaw 是 tagged template：calls[i] = [strings, ...values]；占座 SQL 的第一个插值就是 qty。 */
