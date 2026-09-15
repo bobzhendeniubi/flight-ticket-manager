@@ -180,6 +180,14 @@ export interface SplitContext {
    * 建议值上下文（预检回显）传空串 = 不写配对键（预检不落库）。
    */
   splitPairToken: string;
+  /**
+   * 本单挂着共享房组（§三，带 sharedRoomId）的订单行 id 集合（HIGH 修复 · astra finding
+   * N6）：这些行的物理去重已经由 SharedRoom/SharedRoomMember 表接管
+   * （computeSharedRoomPhysicalByDate），不该再写 `splitPairKey`——那是给**普通**房组用的
+   * 「跨单两个半间配回一间」机制，两套配对逻辑一起生效会互相打架（`groupBucketKey` 优先
+   * 认 splitPairKey，普通房组拆分口径反而抢了共享房组的桶）。见 §八「不写 splitPairKey」。
+   */
+  sharedRoomItemIds: ReadonlySet<string>;
 }
 
 /**
@@ -403,7 +411,10 @@ export function moveHotel(item: SplitItemView, ctx: SplitContext): SplitMove {
   const movedCost = srcCost == null ? null : round2((srcCost * moveHalf) / srcHalf);
   const keptCost = srcCost == null || movedCost == null ? null : round2(srcCost - movedCost);
   // 配对键：两侧写同一个 key，房控把跨单的两个半间配回一间（不看性别）。
-  const pairKey = splitPairKeyOf(item.id, ctx);
+  // N6：本行挂着共享房组时不写——共享房的物理去重已经由 SharedRoom 表接管，配对键
+  // 机制是给普通房组用的，两套一起生效会在 hotel-control.service.ts 的 groupBucketKey
+  // 里打架（配对键优先于房型分桶，会把共享房组错误拼进普通拆单的配对桶）。
+  const pairKey = ctx.sharedRoomItemIds.has(item.id) ? null : splitPairKeyOf(item.id, ctx);
   return {
     mode: 'SPLIT',
     keep: {

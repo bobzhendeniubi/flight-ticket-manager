@@ -1521,4 +1521,131 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
     const totalFraction = [...byOrderItem.values()].reduce((s, v) => s + v, 0);
     expect(totalFraction).toBe(1);
   });
+
+  it('astra finding N6 反例①：自动拆单场景，行级 roomsBilled 必须跟共享计划对齐，不能按人头独立 auto-derive', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    // orderA：2 位乘客共享同一间共享房，份额 1（真实付钱占房）；p1 拆出、p2 留守。
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 2 });
+    const [p1, p2] = orderA.passengers;
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    await prisma.orderItem.update({
+      where: { id: orderB.items[0].id },
+      data: { roomsBilled: new Prisma.Decimal(0) },
+    });
+
+    await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              { orderId: orderA.id, orderItemId: orderA.items[0].id, passengerIds: [p1.id, p2.id], roomFraction: 1 },
+              { orderId: orderB.id, orderItemId: orderB.items[0].id, passengerIds: [orderB.passengers[0].id], roomFraction: 0 },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    // 自动拆单（no-show / 按人改期编排走的路径）：不显式传 roomSplit，房数交给系统自动派生。
+    // 旧实现的 moveHotel 完全不理解共享房，按占座人头 auto-derive（2 人拆 1 人 = 半间/半间）；
+    // 共享份额则按「默认留源单」算出 1/0——两套独立算法算出互相矛盾的结果。
+    const result = await service.splitOrder(
+      orderA.id,
+      { passengerIds: [p1.id], requestToken: splitToken('n6a'), autoSplitRoomGroups: true },
+      actor,
+    );
+
+    // 源行（orderA 留守）roomsBilled 必须保持 1（跟共享份额「留守方拿满份额」一致），
+    // 不能被 auto-derive 按人头砍成 0.5——那样源单凭空少收半间房的账。
+    const keptItem = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderA.items[0].id } });
+    expect(Number(keptItem.roomsBilled)).toBe(1);
+
+    // 目标单（p1 拆出那侧）份额是 0——不该新建一条 roomsBilled=0.5 的行（那会凭空多算
+    // 半间物理房：这间房物理上还是同一间，去重仍应只计 1 间）。份额为 0 的搬人事实由
+    // 步骤 4b 的 ¥0 承载行记录（roomsBilled=0），不是一条真占了 0.5 间的行。
+    const targetItems = await prisma.orderItem.findMany({
+      where: { orderId: result.targetOrderId, kind: 'HOTEL' },
+    });
+    for (const it of targetItems) {
+      expect(Number(it.roomsBilled ?? 0)).toBe(0);
+    }
+
+    // 共享成员份额与房组 JSON 仍是 1/0（默认留源单，未被本次修复动过口径）。
+    const sharedRoomId = (
+      await prisma.sharedRoomMember.findFirstOrThrow({ where: { orderId: orderA.id }, select: { sharedRoomId: true } })
+    ).sharedRoomId;
+    const members = await prisma.sharedRoomMember.findMany({
+      where: { sharedRoomId },
+      select: { orderId: true, passengerId: true, roomFraction: true },
+    });
+    const p1Member = members.find((m) => m.passengerId === p1.id)!;
+    const p2Member = members.find((m) => m.passengerId === p2.id)!;
+    expect(Number(p2Member.roomFraction)).toBe(1);
+    expect(Number(p1Member.roomFraction)).toBe(0);
+    expect(p1Member.orderId).toBe(result.targetOrderId);
+  });
+
+  it('astra finding N6 反例②：一行两个混合共享组同时需要显式份额时 fail-closed 拒绝，不静默重复消费 roomSplit', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    // orderA 一条酒店行（roomsBilled=2）挂两个不同的共享房 R1、R2，各自 2 位乘客——
+    // 一行同时属于多个共享房是 §三允许的建模。p1（R1）、p3（R2）各自拆出，p2、p4 留守，
+    // 两个组同时变成「混合」，都需要知道「这行搬走多少」才能算份额——但 roomSplit
+    // 的形状是一行一个数，没法分别指定给两个组。
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 4 });
+    const [p1, p2, p3, p4] = orderA.passengers;
+    await prisma.orderItem.update({
+      where: { id: orderA.items[0].id },
+      data: { roomsBilled: new Prisma.Decimal(2) },
+    });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderC = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              { orderId: orderA.id, orderItemId: orderA.items[0].id, passengerIds: [p1.id, p2.id], roomFraction: 1 },
+              { orderId: orderB.id, orderItemId: orderB.items[0].id, passengerIds: [orderB.passengers[0].id], roomFraction: 0 },
+            ],
+          },
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              { orderId: orderA.id, orderItemId: orderA.items[0].id, passengerIds: [p3.id, p4.id], roomFraction: 1 },
+              { orderId: orderC.id, orderItemId: orderC.items[0].id, passengerIds: [orderC.passengers[0].id], roomFraction: 0 },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    await expect(
+      service.splitOrder(
+        orderA.id,
+        {
+          passengerIds: [p1.id, p3.id],
+          requestToken: splitToken('n6b'),
+          roomSplit: [{ itemId: orderA.items[0].id, roomsBilledToMove: 1 }],
+        },
+        actor,
+      ),
+    ).rejects.toThrow(/同时挂了.*个需要部分拆分的共享房组/);
+  });
 });

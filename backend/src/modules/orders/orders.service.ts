@@ -18842,6 +18842,23 @@ export class OrderService {
       roomSplitByItem.set(entry.itemId, roundHalfGrid(entry.roomsBilledToMove));
     }
 
+    // 2a'. 挂着共享房组（带 sharedRoomId）的订单行 id 集合（HIGH 修复 · astra finding N6）：
+    // moveHotel 据此跳过 splitPairKey（共享房不吃配对键机制，见 SplitContext 字段注释）；
+    // 下面「3c. 共享房组分配计划」也据此推算行级搬走间数。整单一次性算好，全程复用。
+    const sharedRoomItemIds = new Set<string>();
+    for (const group of readRoomGroups(order.roomAssignment)) {
+      const groupSharedRoomId =
+        typeof group.raw.sharedRoomId === 'string' && group.raw.sharedRoomId.length > 0
+          ? group.raw.sharedRoomId
+          : null;
+      if (!groupSharedRoomId) continue;
+      const attributedItemId =
+        typeof group.raw.orderItemId === 'string' && group.raw.orderItemId.length > 0
+          ? group.raw.orderItemId
+          : null;
+      if (attributedItemId) sharedRoomItemIds.add(attributedItemId);
+    }
+
     // 2b. upgradeSplit：**一行一腿**（entry.toMove 直接给这一行搬几个升舱位）。
     //     旧形状（outboundToMove / returnToMove 两个字段一起发）继续兼容：按该行实际归属的
     //     航段取对应字段。航段判定走 determineFlightLegItems（按班次出发时刻），不再数下标 ——
@@ -18864,6 +18881,7 @@ export class OrderService {
       keptUpgradeOutbound: 0,
       keptUpgradeReturn: 0,
       splitPairToken: input.requestToken,
+      sharedRoomItemIds,
     });
     for (const entry of input.upgradeSplit ?? []) {
       if (upgradeSplitByItem.has(entry.itemId)) {
@@ -18938,6 +18956,7 @@ export class OrderService {
       keptUpgradeReturn,
       // 住宿行被劈成两个半间时，两侧写同一个配对键 —— 房控据此把跨单的两个半间配回一间。
       splitPairToken: input.requestToken,
+      sharedRoomItemIds,
     });
 
     // ── 3. 建新单：抄转正建单的事务内建单法，但**不重新定价不扣座**（行是搬/拆来的）──
@@ -19000,6 +19019,128 @@ export class OrderService {
       },
       select: { id: true, orderNumber: true },
     });
+
+    // ── 3c. 共享房组分配计划（CRITICAL 修复 · astra finding N6）───────────────────────
+    // 必须在步骤 4（按行搬/拆）之前算好，且步骤 4 读的 roomSplitByItem 必须由这份计划
+    // 反哺——原实现顺序反了：步骤 4 先用完全不理解共享房的 moveHotel（显式 roomSplit 或
+    // 按人头 auto-derive）独立拆行落库，共享组的 kept/moved 份额要到（原来排在步骤 4
+    // **之后**的）4a-pre 才另算一遍。两套独立算法在混合共享组场景可以算出完全不一致的
+    // 结果：两人共享组份额 1，自动拆走一人，行级被 moveHotel 按人头 auto-derive 成
+    // 0.5/0.5，共享份额却按「默认留源」算成 1/0——行级 roomsBilled 与共享 JSON/成员表
+    // 从此对不上。
+    //
+    // 改法：先扫一遍本单全部共享房组，按归属行（orderItemId）聚合成「整组留守 / 整组
+    // 拆出 / 混合」三态，混合态复用 splitMixedSharedRoomGroup（与步骤 6 同一个纯函数，
+    // 只调一次，计划存进 mixedSharedGroupPlanByGroup 给步骤 4b/6 复用，不重复算出现口径
+    // 分叉）；再按行汇总出「这一行总共要搬走几间」，回写进 roomSplitByItem——moveHotel
+    // 读的就是这个 Map，行级搬走间数从此与共享计划强制对齐，不再是两条各算各的算法。
+    //
+    // 一行两个混合共享组同时需要显式份额时 fail-closed 拒绝：roomSplit 的形状是「一行
+    // 一个数」，没法分别指定给行上的两个组，硬要各自套用同一个数会把它重复消费两次
+    // （两组共搬的份额之和超过整行实际搬走的间数）——运营应先在分房编辑器把这些组理清楚
+    // （挪到不同行）再拆单，不能让系统悄悄猜一个分配方案。
+    //
+    // 用房组的原始 JS 对象引用（group.raw）当 key：`order.roomAssignment` 在本步骤与
+    // 步骤 6 之间不会被重新赋值/重新解析（4b 只改 SharedRoomMember/OrderItem 表，
+    // 步骤 5 只改 Passenger 表），两次 readRoomGroups 拿到的是同一批底层对象，按引用能
+    // 精确对上，不用另造一套稳定 id。
+    const mixedSharedGroupPlanByGroup = new Map<
+      Record<string, unknown>,
+      {
+        sharedRoomId: string;
+        keptPassengerIds: string[];
+        movedPassengerIds: string[];
+        keptFraction: number;
+        movedFraction: number;
+        kept: Record<string, unknown>;
+        moved: Record<string, unknown>;
+      }
+    >();
+    const postSplitFractionByPassenger = new Map<string, number>();
+    // N6：整组随人搬去新单的共享房 id——成员表的 orderId/orderItemId 归属确实变了
+    // （步骤 4b 会把这些成员整体改指到新单），CAS 版本必须跟着涨，不能只在 mixed 分支涨
+    // （见下方版本递增点，与 mixedSharedGroupPlanByGroup 涉及的房间合并处理）。
+    const wholeMovedSharedRoomIds = new Set<string>();
+    {
+      const sharedGroupsByItemId = new Map<
+        string,
+        Array<{
+          group: ReturnType<typeof readRoomGroups>[number];
+          sharedRoomId: string;
+          srcFraction: number;
+          movedCount: number;
+          totalCount: number;
+        }>
+      >();
+      for (const group of readRoomGroups(order.roomAssignment)) {
+        if (group.passengerIds.length === 0) continue;
+        const groupSharedRoomId =
+          typeof group.raw.sharedRoomId === 'string' && group.raw.sharedRoomId.length > 0
+            ? group.raw.sharedRoomId
+            : null;
+        if (!groupSharedRoomId) continue;
+        const attributedItemId =
+          typeof group.raw.orderItemId === 'string' && group.raw.orderItemId.length > 0
+            ? group.raw.orderItemId
+            : null;
+        if (!attributedItemId) continue; // §三强制归属，无归属的共享组理论不可达，跳过不参与行级推算
+        const movedCount = group.passengerIds.filter((id) => movedIdSet.has(id)).length;
+        const rawFraction = group.raw.roomFraction == null ? 1 : Number(group.raw.roomFraction);
+        const list = sharedGroupsByItemId.get(attributedItemId) ?? [];
+        list.push({
+          group,
+          sharedRoomId: groupSharedRoomId,
+          srcFraction: Number.isFinite(rawFraction) ? rawFraction : 1,
+          movedCount,
+          totalCount: group.passengerIds.length,
+        });
+        sharedGroupsByItemId.set(attributedItemId, list);
+      }
+
+      for (const [itemId, groups] of sharedGroupsByItemId) {
+        const touchedGroups = groups.filter((g) => g.movedCount > 0);
+        if (touchedGroups.length === 0) continue; // 本行全部共享组整组留守，不影响行级搬走量
+
+        const mixedGroups = touchedGroups.filter((g) => g.movedCount < g.totalCount);
+        if (mixedGroups.length > 1) {
+          throw new BadRequestError(
+            `订单行 ${itemId} 同时挂了 ${mixedGroups.length} 个需要部分拆分的共享房组，` +
+              '请先在跨单分房工作台把这些房组分到不同订单行，再拆单。',
+          );
+        }
+
+        let totalMovedFraction = 0;
+        for (const entry of touchedGroups) {
+          const { group, sharedRoomId, srcFraction, movedCount, totalCount } = entry;
+          if (movedCount === totalCount) {
+            // 整组拆出：全部份额随行搬走，不用调用拆分函数。
+            totalMovedFraction = round2(totalMovedFraction + srcFraction);
+            wholeMovedSharedRoomIds.add(sharedRoomId);
+            continue;
+          }
+          // 混合（本行至多一个，上面已保证）：读该行显式 roomSplit 当移出方份额。
+          const movedInGroup = group.passengerIds.filter((id) => movedIdSet.has(id));
+          const keptInGroup = group.passengerIds.filter((id) => !movedIdSet.has(id));
+          const explicitMovedFraction = roomSplitByItem.get(itemId) ?? null;
+          const halves = splitMixedSharedRoomGroup(group, movedIdSet, explicitMovedFraction);
+          mixedSharedGroupPlanByGroup.set(group.raw, {
+            sharedRoomId,
+            keptPassengerIds: keptInGroup,
+            movedPassengerIds: movedInGroup,
+            keptFraction: halves.keptFraction,
+            movedFraction: halves.movedFraction,
+            kept: halves.kept,
+            moved: halves.moved,
+          });
+          for (const pid of keptInGroup) postSplitFractionByPassenger.set(pid, halves.keptFraction);
+          for (const pid of movedInGroup) postSplitFractionByPassenger.set(pid, halves.movedFraction);
+          totalMovedFraction = round2(totalMovedFraction + halves.movedFraction);
+        }
+        // 行级注入：用共享计划算出的总量覆盖 roomSplitByItem——moveHotel 读的就是这个
+        // Map，行级搬走间数从此与共享计划强制对齐（不再各算各的）。
+        roomSplitByItem.set(itemId, totalMovedFraction);
+      }
+    }
 
     // ── 4. 按行搬/拆（unitPrice 全冻结；口径全在 split-move-strategies，内核只管落库）──
     // 拆前逐班次舱位数量账 + 升舱位账 + 房数账 + 成本账（守恒断言基准）。
@@ -19076,64 +19217,6 @@ export class OrderService {
         select: { id: true },
       });
       splitItemIdMap.set(item.id, createdRow.id);
-    }
-
-    // ── 4a-pre. 预判混合共享房组的拆分方案（HIGH 修复 · astra finding A7 ③）──────────
-    // 必须在 4b 之前算好：4b 的「源行是 NONE、搬走份额只能是 0」守恒闸原先直接拿
-    // SharedRoomMember 表里**拆分前**的原始 roomFraction 求和当"搬走份额"——一个混合共享
-    // 房组（部分乘客拆出、部分留守）按 §八「份额默认留源单」新口径，移出方的份额本该
-    // 归 0（除非 roomSplit 显式指定），但那笔判断在这里还看不到，闸只会拿到"拆分前的
-    // 合计"，把本该放行的 0 份额移出误判成非零而拒绝。这里提前把每个混合共享组的 kept/
-    // moved 份额算好（与步骤 6 用的是同一个纯函数），4b 与 6 都直接查这张表，不重复算、
-    // 也不会因为两处各自计算而出现口径分叉。
-    // 用房组的原始 JS 对象引用（group.raw）当 key：`order.roomAssignment` 在 4a-pre 与
-    // 步骤 6 之间不会被重新赋值/重新解析（4b 只改 SharedRoomMember/OrderItem 表，
-    // 步骤 5 只改 Passenger 表），两次 readRoomGroups 拿到的是同一批底层对象，按引用能
-    // 精确对上，不用另造一套稳定 id。
-    const mixedSharedGroupPlanByGroup = new Map<
-      Record<string, unknown>,
-      {
-        sharedRoomId: string;
-        keptPassengerIds: string[];
-        movedPassengerIds: string[];
-        keptFraction: number;
-        movedFraction: number;
-        kept: Record<string, unknown>;
-        moved: Record<string, unknown>;
-      }
-    >();
-    const postSplitFractionByPassenger = new Map<string, number>();
-    for (const group of readRoomGroups(order.roomAssignment)) {
-      if (group.passengerIds.length === 0) continue;
-      const groupSharedRoomId =
-        typeof group.raw.sharedRoomId === 'string' && group.raw.sharedRoomId.length > 0
-          ? group.raw.sharedRoomId
-          : null;
-      if (!groupSharedRoomId) continue;
-      const movedInGroup = group.passengerIds.filter((id) => movedIdSet.has(id));
-      if (movedInGroup.length === 0 || movedInGroup.length === group.passengerIds.length) {
-        continue; // 整组留守 / 整组拆出：份额跟着整组走，不用重算，也不进「混合」计划表。
-      }
-      const keptInGroup = group.passengerIds.filter((id) => !movedIdSet.has(id));
-      const attributedItemId =
-        typeof group.raw.orderItemId === 'string' && group.raw.orderItemId.length > 0
-          ? group.raw.orderItemId
-          : null;
-      const explicitMovedFraction = attributedItemId
-        ? (roomSplitByItem.get(attributedItemId) ?? null)
-        : null;
-      const halves = splitMixedSharedRoomGroup(group, movedIdSet, explicitMovedFraction);
-      mixedSharedGroupPlanByGroup.set(group.raw, {
-        sharedRoomId: groupSharedRoomId,
-        keptPassengerIds: keptInGroup,
-        movedPassengerIds: movedInGroup,
-        keptFraction: halves.keptFraction,
-        movedFraction: halves.movedFraction,
-        kept: halves.kept,
-        moved: halves.moved,
-      });
-      for (const pid of keptInGroup) postSplitFractionByPassenger.set(pid, halves.keptFraction);
-      for (const pid of movedInGroup) postSplitFractionByPassenger.set(pid, halves.movedFraction);
     }
 
     // ── 4b. 共享房成员随人搬（§八 E）：SharedRoomMember 是真值源（> 订单 JSON，见
@@ -19288,8 +19371,14 @@ export class OrderService {
         { ...group, raw: halves.moved, passengerIds: movedInGroup },
       ];
     });
-    if (mixedSharedGroupPlanByGroup.size > 0 && sharedRoomMemberDelegate) {
-      const touchedSharedRoomIds = new Set<string>();
+    if ((mixedSharedGroupPlanByGroup.size > 0 || wholeMovedSharedRoomIds.size > 0) && sharedRoomMemberDelegate) {
+      // N6：版本递增覆盖两类真正改变了这间房状态的场景——不再只认 mixed 分支：
+      //   · mixed（份额变了）：份额重写进 SharedRoomMember.roomFraction；
+      //   · 整组随人搬（wholeMovedSharedRoomIds）：份额没变，但成员的 orderId/orderItemId
+      //     已在步骤 4b 改指到新单——这间房「谁是成员、挂在哪张单上」变了，CAS 语义上
+      //     同样是「这间房被改过」，version 必须跟着涨（原实现只在 mixed 分支涨，整组
+      //     迁移的情形漏了，见 astra B 路 finding N9 尾注）。
+      const touchedSharedRoomIds = new Set<string>(wholeMovedSharedRoomIds);
       for (const split of mixedSharedGroupPlanByGroup.values()) {
         touchedSharedRoomIds.add(split.sharedRoomId);
         if (split.keptPassengerIds.length > 0) {
@@ -19305,8 +19394,9 @@ export class OrderService {
           });
         }
       }
-      // SharedRoom.version +1（astra finding A7 ②）：成员份额变了，与跨单分房工作台
-      // 保存的 CAS 协议同一套语义——version 是"这间房的成员/份额有没有变过"的信号。
+      // SharedRoom.version +1（astra finding A7 ②，整组迁移场景 · astra N6）：成员份额
+      // 或成员归属变了，与跨单分房工作台保存的 CAS 协议同一套语义——version 是"这间房的
+      // 成员/份额有没有变过"的信号。
       for (const sharedRoomId of touchedSharedRoomIds) {
         await tx.sharedRoom.update({ where: { id: sharedRoomId }, data: { version: { increment: 1 } } });
       }
@@ -24363,8 +24453,9 @@ function buildSplitSuggestionContext(input: {
     movedUpgradeReturn: 0,
     keptUpgradeOutbound: 0,
     keptUpgradeReturn: 0,
-    // 预检不落库 → 不写住宿行配对键（那是执行段的事）。
+    // 预检不落库 → 不写住宿行配对键（那是执行段的事），共享房集合同理留空。
     splitPairToken: '',
+    sharedRoomItemIds: new Set(),
   });
 }
 
@@ -24382,6 +24473,8 @@ function buildSplitContext(input: {
   keptUpgradeReturn: number;
   /** 住宿行劈半时两侧共用的配对键令牌（= requestToken）；预检建议上下文传空串。 */
   splitPairToken: string;
+  /** N6：挂着共享房组的订单行 id 集合——moveHotel 据此跳过 splitPairKey。 */
+  sharedRoomItemIds: ReadonlySet<string>;
 }): SplitContext {
   const { occupancy } = input;
   return {
@@ -24404,6 +24497,7 @@ function buildSplitContext(input: {
     keptUpgradeReturn: input.keptUpgradeReturn,
     autoDeriveRooms: input.autoDeriveRooms,
     splitPairToken: input.splitPairToken,
+    sharedRoomItemIds: input.sharedRoomItemIds,
   };
 }
 
