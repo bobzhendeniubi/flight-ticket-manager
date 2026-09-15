@@ -706,7 +706,7 @@ describe('OrderService.rescheduleOrderItem · 真 DB E2E', () => {
         { orderItemId: orderA.items[0].id, newScheduleId: to2.schedule.id },
         actor,
       ),
-    ).rejects.toThrow();
+    ).rejects.toThrow(/实际房间不足/);
 
     // 拒绝后不能错误落库：hotelItemA 仍在第一次改期后的区间（9/1），机票也仍是 to1。
     const finalHotelItem = await prisma.orderItem.findUniqueOrThrow({ where: { id: hotelItemA.id } });

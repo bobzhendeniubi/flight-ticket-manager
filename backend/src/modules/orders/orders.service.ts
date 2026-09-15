@@ -14462,8 +14462,9 @@ export class OrderService {
           outboundInvoiced: boolean;
           returnInvoiced: boolean;
           systemInvoiced: boolean;
+          roomAssignment: Prisma.JsonValue;
         }>
-      >`SELECT id, "orderNumber", status, "deletedAt", adjustments, "settlementLocked", "outboundInvoiced", "returnInvoiced", "systemInvoiced" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      >`SELECT id, "orderNumber", status, "deletedAt", adjustments, "settlementLocked", "outboundInvoiced", "returnInvoiced", "systemInvoiced", "roomAssignment" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
       const order = orderRows[0];
       if (!order) throw new NotFoundError('订单不存在');
 
@@ -14627,6 +14628,7 @@ export class OrderService {
             const siblingStays = await tx.orderItem.findMany({
               where: { orderId, id: { not: bundleItem.id } },
               select: {
+                id: true,
                 hotelRoomTypeId: true,
                 hotelCheckIn: true,
                 hotelCheckOut: true,
@@ -14646,7 +14648,14 @@ export class OrderService {
                 hotelRoomTypeId: it.hotelRoomTypeId,
                 hotelCheckIn: it.hotelCheckIn,
                 hotelCheckOut: it.hotelCheckOut,
-                roomsBilled: it.roomsBilled == null ? null : Number(it.roomsBilled.toString()),
+                // N1 修复（C1 同类缺陷）：解绑留下的显式 0 份额普通房组不能按 0 间放行，
+                // 与换酒店 / 酒店改期 / 恢复 / 机票平移同一把 floor 兜底。
+                roomsBilled: floorZeroRoomsBilledByAssignedRooms(
+                  it.roomsBilled == null ? null : Number(it.roomsBilled.toString()),
+                  order.roomAssignment,
+                  it.id,
+                  null,
+                ),
                 randomStarTier: it.randomStarTier,
               })),
             ];
@@ -16995,6 +17004,7 @@ export class OrderService {
           paidAmount: true,
           adjustments: true,
           settlementLocked: true,
+          roomAssignment: true,
           items: { select: { id: true, kind: true, amount: true } },
         },
       });
@@ -17118,6 +17128,7 @@ export class OrderService {
               const siblingStays = await tx.orderItem.findMany({
                 where: { orderId, id: { not: bundleItem.id } },
                 select: {
+                  id: true,
                   hotelRoomTypeId: true,
                   hotelCheckIn: true,
                   hotelCheckOut: true,
@@ -17137,7 +17148,14 @@ export class OrderService {
                   hotelRoomTypeId: it.hotelRoomTypeId,
                   hotelCheckIn: it.hotelCheckIn,
                   hotelCheckOut: it.hotelCheckOut,
-                  roomsBilled: it.roomsBilled == null ? null : Number(it.roomsBilled.toString()),
+                  // N1 修复（C1 同类缺陷）：解绑留下的显式 0 份额普通房组不能按 0 间放行，
+                  // 与换酒店 / 酒店改期 / 恢复 / 机票平移同一把 floor 兜底。
+                  roomsBilled: floorZeroRoomsBilledByAssignedRooms(
+                    it.roomsBilled == null ? null : Number(it.roomsBilled.toString()),
+                    order.roomAssignment,
+                    it.id,
+                    null,
+                  ),
                   randomStarTier: it.randomStarTier,
                 })),
               ];
@@ -17780,6 +17798,11 @@ export class OrderService {
       // 两道闸互补：真酒店走物理房间闸，未落位随机档走同星级聚合闸，各自跳过不归自己管的行。
       // 补回来的那几行都是未落位行（真酒店行早被上面的已落位闸拒在门外），按床位口径合计，
       // 与它们留在库里被算作存量占房时的口径一致。
+      // N1 附注：这里的 roomsBilled 没有套 floorZeroRoomsBilledByAssignedRooms（与
+      // setPassengerSingleRoom / addRoomSupplement 不同）——不是漏了，是不可达：能落到这里
+      // 的前提是本单任一酒店/套餐行已落真实酒店（resolveChangeableBundleRow 的 settled 闸），
+      // 而解绑留下的 0 份额行只会出现在挂了共享成员的单上，那种单在改档最前面已经被整体拒绝
+      // （§三：共享成员必须挂真实酒店行）。靠 settled 闸兜住，不需要重复兜底。
       const prospectiveStays: ProspectiveHotelStay[] = [
         {
           hotelRoomTypeId: priced.hotelStamp?.hotelRoomTypeId ?? null,

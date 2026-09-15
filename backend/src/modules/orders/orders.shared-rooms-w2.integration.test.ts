@@ -552,11 +552,223 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
         { requestToken: randomUUID(), allowOversell: false, allowFlownLegs: false },
         { userId: actor.userId, role: UserRole.ADMIN },
       ),
-    ).rejects.toThrow();
+    ).rejects.toThrow(/实际房间不足/);
 
     // 拒绝后订单仍是取消态。
     const orderBAfter = await prisma.order.findUniqueOrThrow({ where: { id: orderB.id } });
     expect(orderBAfter.status).toBe(OrderStatus.CANCELLED);
+  });
+
+  it('N1 反例（改单住）：同单两行同酒店同区间，其中一行是解绑留下的 0 份额普通组，另一行改单住抬房必须按 1 间占用判定，不能放行超卖', async () => {
+    const actor = await adminActor();
+    const { hotel: hotelOld, roomType: roomTypeOld } = await createHotelWithRoomType(1);
+    const { hotel: hotelMid, roomType: roomTypeMid } = await createHotelWithRoomType(2); // 目标酒店只有 2 间
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomTypeOld.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomTypeOld.id, passengerCount: 1 });
+    // 强制零容忍超售，让老式前瞻闸的判定结果直接体现为拒绝/放行（不被默认容忍额度掩盖）。
+    await prisma.systemSetting.upsert({
+      where: { key: 'hotelMaxOversellRooms' },
+      update: { value: '0' },
+      create: { key: 'hotelMaxOversellRooms', value: '0' },
+    });
+
+    await saveSharedRooms(
+      {
+        hotelId: hotelOld.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomTypeOld.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    // 换酒店（0 份额方 orderB）：hotelOld → hotelMid，解绑后留下「显式 0 份额」的普通房组，
+    // 物理 floor 回 1 间（hotelMid 2 间余量绰绰有余，这次换酒店本身不该被拒）。
+    await service.swapItemHotel(
+      orderB.id,
+      orderB.items[0].id,
+      { newHotelRoomTypeId: roomTypeMid.id, feeCny: 0 },
+      { userId: actor.userId, role: UserRole.ADMIN },
+    );
+    const leftoverItem = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderB.items[0].id } });
+    expect(Number(leftoverItem.roomsBilled)).toBe(0); // 钱不动，仍显式 0
+
+    // orderB 补录第二条行：同酒店（hotelMid）同区间的 BUNDLE 行，2 名成人拼住 1 间（未落 singleRoom）。
+    const bundle = await prisma.bundle.create({
+      data: { name: uniq('Bundle'), items: [] as Prisma.InputJsonValue, hotelRoomTypeId: roomTypeMid.id },
+    });
+    const bundleItem = await prisma.orderItem.create({
+      data: {
+        orderId: orderB.id,
+        kind: OrderItemKind.BUNDLE,
+        description: '测试套餐 · 拼住',
+        quantity: 1,
+        unitPrice: new Prisma.Decimal(600),
+        amount: new Prisma.Decimal(600),
+        bundleId: bundle.id,
+        hotelRoomTypeId: roomTypeMid.id,
+        hotelCheckIn: new Date(`${CHECK_IN}T00:00:00.000Z`),
+        hotelCheckOut: new Date(`${CHECK_OUT}T00:00:00.000Z`),
+        roomsBilled: new Prisma.Decimal(1),
+        metadata: { adultCount: 2, childCount: 0 } as Prisma.InputJsonValue,
+      },
+    });
+    // BUNDLE 行的 2 名成人只在 metadata.adultCount 里显式计数（不落乘客归属），与
+    // leftoverItem 挂的那位乘客（orderB.passengers[0]）各自独立，互不影响。
+    const bundlePax2 = await prisma.passenger.create({
+      data: {
+        orderId: orderB.id,
+        fullName: 'PAX EXTRA',
+        lastName: 'PAX',
+        firstName: 'EXTRA',
+        documentType: 'PASSPORT',
+        documentNumber: uniq('P'),
+        dateOfBirth: new Date('1990-01-01'),
+        nationality: 'CHN',
+      },
+    });
+
+    // N1 反例：改单住把 bundleItem 从 1 间抬到 2 间。修复前老式前瞻闸把 leftoverItem 的显式 0
+    // 份额当成 0 间物理需求，抬房前瞻只算 2(bundleItem) + 0(leftoverItem) = 2 间 ≤ block(2) →
+    // 误判放行；修复后 leftoverItem 按分房表 floor 回 1 间，前瞻算 2 + 1 = 3 间 > block(2)，
+    // 必须拒绝，不能造成确定性超卖。
+    await expect(
+      service.setPassengerSingleRoom(
+        orderB.id,
+        bundlePax2.id,
+        { singleRoom: true },
+        { userId: actor.userId, role: UserRole.ADMIN },
+      ),
+    ).rejects.toThrow(/实际房间不足/);
+
+    // 拒绝后不能错误落库：bundleItem 仍是 1 间，乘客仍未标单住。
+    const bundleItemAfter = await prisma.orderItem.findUniqueOrThrow({ where: { id: bundleItem.id } });
+    expect(Number(bundleItemAfter.roomsBilled)).toBe(1);
+    const paxAfter = await prisma.passenger.findUniqueOrThrow({ where: { id: bundlePax2.id } });
+    expect(paxAfter.singleRoom).toBe(false);
+  });
+
+  it('N1 反例（补房差）：同单两行同酒店同区间，其中一行是解绑留下的 0 份额普通组，另一行补收单房差抬房必须按 1 间占用判定，不能放行超卖', async () => {
+    const actor = await adminActor();
+    const { hotel: hotelOld, roomType: roomTypeOld } = await createHotelWithRoomType(1);
+    const { hotel: hotelMid, roomType: roomTypeMid } = await createHotelWithRoomType(2); // 目标酒店只有 2 间
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomTypeOld.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomTypeOld.id, passengerCount: 1 });
+    // 强制零容忍超售，让老式前瞻闸的判定结果直接体现为拒绝/放行（不被默认容忍额度掩盖）。
+    await prisma.systemSetting.upsert({
+      where: { key: 'hotelMaxOversellRooms' },
+      update: { value: '0' },
+      create: { key: 'hotelMaxOversellRooms', value: '0' },
+    });
+
+    await saveSharedRooms(
+      {
+        hotelId: hotelOld.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomTypeOld.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    await service.swapItemHotel(
+      orderB.id,
+      orderB.items[0].id,
+      { newHotelRoomTypeId: roomTypeMid.id, feeCny: 0 },
+      { userId: actor.userId, role: UserRole.ADMIN },
+    );
+    const leftoverItem = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderB.items[0].id } });
+    expect(Number(leftoverItem.roomsBilled)).toBe(0);
+
+    const bundle = await prisma.bundle.create({
+      data: { name: uniq('Bundle'), items: [] as Prisma.InputJsonValue, hotelRoomTypeId: roomTypeMid.id },
+    });
+    const bundleItem = await prisma.orderItem.create({
+      data: {
+        orderId: orderB.id,
+        kind: OrderItemKind.BUNDLE,
+        description: '测试套餐 · 拼住',
+        quantity: 1,
+        unitPrice: new Prisma.Decimal(600),
+        amount: new Prisma.Decimal(600),
+        bundleId: bundle.id,
+        hotelRoomTypeId: roomTypeMid.id,
+        hotelCheckIn: new Date(`${CHECK_IN}T00:00:00.000Z`),
+        hotelCheckOut: new Date(`${CHECK_OUT}T00:00:00.000Z`),
+        roomsBilled: new Prisma.Decimal(1),
+        metadata: { adultCount: 2, childCount: 0 } as Prisma.InputJsonValue,
+      },
+    });
+    const bundlePax2 = await prisma.passenger.create({
+      data: {
+        orderId: orderB.id,
+        fullName: 'PAX EXTRA',
+        lastName: 'PAX',
+        firstName: 'EXTRA',
+        documentType: 'PASSPORT',
+        documentNumber: uniq('P'),
+        dateOfBirth: new Date('1990-01-01'),
+        nationality: 'CHN',
+      },
+    });
+
+    // N1 反例（补房差路径）：与改单住同一把闸、同一处漏洞，验证 addRoomSupplement 的
+    // 「单人入住联动」抬房同样必须按 floor 后的 1 间判定并拒绝。
+    await expect(
+      service.addRoomSupplement(
+        orderB.id,
+        { perNightCny: 100, nights: 2, passengerId: bundlePax2.id },
+        { userId: actor.userId, role: UserRole.ADMIN },
+      ),
+    ).rejects.toThrow(/实际房间不足/);
+
+    const bundleItemAfter = await prisma.orderItem.findUniqueOrThrow({ where: { id: bundleItem.id } });
+    expect(Number(bundleItemAfter.roomsBilled)).toBe(1);
+    const paxAfter = await prisma.passenger.findUniqueOrThrow({ where: { id: bundlePax2.id } });
+    expect(paxAfter.singleRoom).toBe(false);
+    // 拒绝后不能有钱的副作用：没有新增 FEE 行。
+    const feeItems = await prisma.orderItem.findMany({ where: { orderId: orderB.id, kind: OrderItemKind.FEE } });
+    expect(feeItems).toHaveLength(0);
   });
 
   it('astra finding A1 反例：同酒店换房型触发解绑，只有 1 间时必须拒（先解绑再算 before 会把 1 间伪装成 2 间存量而放行）', async () => {
