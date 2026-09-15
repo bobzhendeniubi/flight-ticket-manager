@@ -26,7 +26,8 @@
  *     否则退回 `${orderId}:${groupId}`。
  *   - `roomNumberScopeKey`：编号作用域——真实酒店按 hotelId（不认名字文本，名字可能是换酒店前
  *     的旧值、房控手误）；未落位的星级随机档没有 hotelId，用展示名兜底出一个隔离的作用域键
- *     （不会撞真实酒店的 hotelId）。入住日由调用方在此之外自行分桶。
+ *     （不会撞真实酒店的 hotelId）。入住日是**必填**参数（astra finding N11）：三处导出
+ *     必须拼进同一个作用域字符串，不能各自决定「要不要带日期」。
  *   - `roomIdentitySortKey` / `buildIdentityNumberMap`：B10——三个导出各自的遍历顺序不同
  *     （查询排序方向、乘客展开顺序都不一样），旧口径「谁先遍历到就发哪个号」会让同一批身份
  *     在不同导出里编出不同房号（哪怕单份导出内部自洽）。改为按确定性规则排序后统一编号：
@@ -207,9 +208,21 @@ export async function buildVerifiedSplitPairKeys(
  * 房号编号作用域键：真实酒店按 hotelId；未落位（随机档待落位）没有 hotelId，
  * 用调用方传入的展示名（如「4星随机（待落位）」）兜底出一个隔离作用域——
  * 加 `pending:` 前缀避免与任何真实 hotelId 字符串巧合相撞。
+ *
+ * MEDIUM 修复（astra finding N11）：作用域必须带入住日，`checkInDate` 是**必填**参数——
+ * 原先分房表 orders.export-room-allocation.ts / 整班机 orders.export.ts 的作用域只有
+ * 酒店（不认日期），全岗总表 orders.export-master.ts 却另外手工拼了一段
+ * `${roomNumberScopeKey(...)}|${date}`。三处对「同一间房」算出的作用域字符串不一致：
+ * 同一家酒店不同入住日的两批客人，分房表/整班机会被合并进同一个编号序列连续发号，
+ * 全岗总表却按日期分开各自从 1 发号——跨导出对同一批身份对不上号。改成必填参数后，
+ * 编译期就不允许任何调用点漏传日期，三处只能算出同一个字符串。
  */
-export function roomNumberScopeKey(hotelId: string | null, pendingScopeLabel: string): string {
-  return hotelId ? `hotel:${hotelId}` : `pending:${pendingScopeLabel}`;
+export function roomNumberScopeKey(
+  hotelId: string | null,
+  pendingScopeLabel: string,
+  checkInDate: string,
+): string {
+  return `${hotelId ? `hotel:${hotelId}` : `pending:${pendingScopeLabel}`}|${checkInDate}`;
 }
 
 /**
@@ -246,16 +259,24 @@ export interface IdentityNumberEntry {
  * B10：按 scope 分桶，桶内全部去重后的 identityKey 按 sortKey 升序统一编号（1 起）——
  * 不依赖调用方遍历这些身份的顺序。三个导出对同一批身份用这份映射，就必然算出同一个
  * 「身份→房号」结果，不再因为查询排序方向、乘客展开顺序不同而把两间共享房的号印反。
+ *
+ * MEDIUM 修复（astra finding N11）：同一 identityKey 的候选 sortKey 取**最小值**，不是
+ * 「首次遇见」那一条——拆单产生的两个半间（identityKey = splitPairKey）两侧各自算出的
+ * sortKey 不同（roomIdentitySortKey 用 `${orderNumber}:${groupId}`，两侧订单号不同），
+ * 原实现只认遍历到的第一条，调用方换一种遍历顺序（查询排序方向、Prisma include 顺序）
+ * 就会选中不同的那条候选 sortKey，进而改变这个身份在全局排序里的相对位置，把两间房的
+ * 编号印反。取全部候选的最小值是与遍历顺序无关的规范值，任何遍历顺序都收敛到同一个结果。
  */
 export function buildIdentityNumberMap(entries: Iterable<IdentityNumberEntry>): Map<string, number> {
-  const byScope = new Map<string, Map<string, string>>(); // scope -> identityKey -> sortKey
+  const byScope = new Map<string, Map<string, string>>(); // scope -> identityKey -> 最小 sortKey
   for (const e of entries) {
     let idMap = byScope.get(e.scope);
     if (!idMap) {
       idMap = new Map();
       byScope.set(e.scope, idMap);
     }
-    if (!idMap.has(e.identityKey)) idMap.set(e.identityKey, e.sortKey);
+    const existing = idMap.get(e.identityKey);
+    if (existing == null || e.sortKey < existing) idMap.set(e.identityKey, e.sortKey);
   }
   const result = new Map<string, number>();
   for (const [scope, idMap] of byScope) {

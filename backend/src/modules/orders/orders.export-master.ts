@@ -507,7 +507,11 @@ function roomGroupScope(order: Pick<OrderForMasterExport, 'items'>, group: RoomG
   const attributedItem = group?.orderItemId
     ? order.items.find((it) => it.id === group.orderItemId)
     : undefined;
-  return `${roomNumberScopeKey(attributedItem?.hotelRoomType?.hotelId ?? null, group?.hotelName ?? '')}|${attributedItem?.hotelCheckIn ? fmtDate(attributedItem.hotelCheckIn) : ''}`;
+  return roomNumberScopeKey(
+    attributedItem?.hotelRoomType?.hotelId ?? null,
+    group?.hotelName ?? '',
+    attributedItem?.hotelCheckIn ? fmtDate(attributedItem.hotelCheckIn) : '',
+  );
 }
 
 // ── 订单 → 每位乘客一行 ─────────────────────────────────────────────────────

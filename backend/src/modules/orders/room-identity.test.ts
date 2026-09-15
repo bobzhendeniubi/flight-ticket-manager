@@ -215,10 +215,20 @@ describe('buildVerifiedSplitPairKeys', () => {
 
 describe('roomNumberScopeKey', () => {
   it('真实酒店按 hotelId；未落位按展示名兜底，两者不会撞', () => {
-    expect(roomNumberScopeKey('hotel_1', '4星随机（待落位）')).toBe('hotel:hotel_1');
-    expect(roomNumberScopeKey(null, '4星随机（待落位）')).toBe('pending:4星随机（待落位）');
+    expect(roomNumberScopeKey('hotel_1', '4星随机（待落位）', '2026-10-01')).toBe('hotel:hotel_1|2026-10-01');
+    expect(roomNumberScopeKey(null, '4星随机（待落位）', '2026-10-01')).toBe(
+      'pending:4星随机（待落位）|2026-10-01',
+    );
     // 万一某个真实 hotelId 字面上恰好等于某个展示名（几乎不可能，但兜底验证前缀隔离生效）
-    expect(roomNumberScopeKey('4星随机（待落位）', 'x')).not.toBe(roomNumberScopeKey(null, '4星随机（待落位）'));
+    expect(roomNumberScopeKey('4星随机（待落位）', 'x', '2026-10-01')).not.toBe(
+      roomNumberScopeKey(null, '4星随机（待落位）', '2026-10-01'),
+    );
+  });
+
+  it('N11：入住日是作用域的一部分——同一酒店不同入住日不合并进同一个编号序列', () => {
+    expect(roomNumberScopeKey('hotel_1', '', '2026-10-01')).not.toBe(
+      roomNumberScopeKey('hotel_1', '', '2026-10-02'),
+    );
   });
 });
 
@@ -303,6 +313,38 @@ describe('roomIdentitySortKey + buildIdentityNumberMap（B10）', () => {
     ]);
     expect(map.get(scopedIdentityMapKey('hotel:h1', 'sr_1'))).toBe(1);
     expect(map.get(scopedIdentityMapKey('hotel:h2', 'sr_1'))).toBe(1);
+  });
+
+  it('astra finding N11 反例：同一 identityKey 的两条候选 sortKey（拆单两侧订单号不同）取最小值，不随遍历顺序把两间房的编号印反', () => {
+    // 拆单产生的两个半间共用同一个 identityKey（splitPairKey = 'pair-1'），但源单/新单
+    // 订单号不同，roomIdentitySortKey 算出的 sortKey 也不同（1:<orderNumber>:<groupId>）。
+    // 'other-1' 是另一个独立身份，订单号排在这两者之间——谁被选中当 pair-1 的代表
+    // sortKey，直接决定 pair-1 排在 other-1 前面还是后面。
+    const pairSideSource = { id: 'pair-1' }; // 源单 FTM_2000（排最前）
+    const pairSideTarget = { id: 'pair-1' }; // 新单 FTM_9000（排最后）
+    const other = { id: 'gp-other' }; // FTM_5000（排中间）
+
+    const entriesAscending = [
+      { scope: 'hotel:h1', identityKey: 'pair-1', sortKey: roomIdentitySortKey(pairSideSource, 'pair-1', 'FTM_2000') },
+      { scope: 'hotel:h1', identityKey: 'other-1', sortKey: roomIdentitySortKey(other, 'other-1', 'FTM_5000') },
+      { scope: 'hotel:h1', identityKey: 'pair-1', sortKey: roomIdentitySortKey(pairSideTarget, 'pair-1', 'FTM_9000') },
+    ];
+    // 反过来喂：先遇到新单那一侧（FTM_9000），源单那一侧（FTM_2000）最后才出现。
+    const entriesDescending = [
+      { scope: 'hotel:h1', identityKey: 'pair-1', sortKey: roomIdentitySortKey(pairSideTarget, 'pair-1', 'FTM_9000') },
+      { scope: 'hotel:h1', identityKey: 'other-1', sortKey: roomIdentitySortKey(other, 'other-1', 'FTM_5000') },
+      { scope: 'hotel:h1', identityKey: 'pair-1', sortKey: roomIdentitySortKey(pairSideSource, 'pair-1', 'FTM_2000') },
+    ];
+
+    const mapAscending = buildIdentityNumberMap(entriesAscending);
+    const mapDescending = buildIdentityNumberMap(entriesDescending);
+
+    // 两种遍历顺序必须算出同一份结果：pair-1（源单号 2000，字典序最小）排第 1，
+    // other-1（5000）排第 2——不因为先遇到哪一侧就把两者的相对顺序印反。
+    for (const map of [mapAscending, mapDescending]) {
+      expect(map.get(scopedIdentityMapKey('hotel:h1', 'pair-1'))).toBe(1);
+      expect(map.get(scopedIdentityMapKey('hotel:h1', 'other-1'))).toBe(2);
+    }
   });
 });
 

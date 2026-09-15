@@ -277,6 +277,7 @@ function computeRoomColumns(
         passengerId: p.id,
         hotelId: placement.hotelId,
         hotelName,
+        checkIn: checkInStr,
         identityKey,
         // B10：排序键只在已分房时用得上，见下方 assignRoomNumbers 前的确定性编号映射构建。
         identitySortKey: group && identityKey ? roomIdentitySortKey(group, identityKey, order.orderNumber) : null,
@@ -299,7 +300,7 @@ function computeRoomColumns(
       .flat()
       .filter((e): e is typeof e & { identityKey: string } => e.identityKey != null)
       .map((e) => ({
-        scope: roomNumberScopeKey(e.hotelId, e.hotelName),
+        scope: roomNumberScopeKey(e.hotelId, e.hotelName, e.checkIn),
         identityKey: e.identityKey,
         sortKey: e.identitySortKey ?? e.identityKey,
       })),
