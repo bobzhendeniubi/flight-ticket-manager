@@ -909,11 +909,26 @@ async function saveSharedRoomsInner(
         // 运营手上拿到的就是这间房的当前真实状态，硬拒没有可操作的出路（把它拖进 dissolve
         // 也不对——房间物理仍在占用，见下方 orphanedLeftoverRoomIds 的 warning）。其余情形
         // （Σ 是其它非 1 值、或有改动）一律照旧硬闸。
+        // N2 修复：isUnchangedMember 只管「列出来的组没改」，不管「有没有漏列」——请求体
+        // 只列一部分现存成员时，`every` 对列出的子集仍然成立，会把「原样交回」误判成立，
+        // 现场把没列出的计费方从成员表里摘掉（份额从 1 悄悄变没）。这里再加一道「本次列出
+        // 的成员必须覆盖落库现状该房的全部成员」——键集合（orderId:orderItemId）与乘客
+        // 集合都要被完全覆盖，有漏列就仍然走 Σ≠1 的硬闸。
+        const currentByRoom = room.sharedRoomId != null ? currentMembersByRoom.get(room.sharedRoomId) : undefined;
+        const listedItemKeys = new Set(room.groups.map((g) => `${g.orderId}:${g.orderItemId}`));
+        const listedPassengerIds = new Set(room.groups.flatMap((g) => g.passengerIds));
+        const coversAllCurrentMembers =
+          currentByRoom == null ||
+          ([...currentByRoom.keys()].every((key) => listedItemKeys.has(key)) &&
+            [...currentByRoom.values()]
+              .flatMap((v) => [...v.passengerIds])
+              .every((pid) => listedPassengerIds.has(pid)));
         const isLeftoverOnlyResubmit =
           room.sharedRoomId != null &&
           totalFraction === 0 &&
           room.groups.length > 0 &&
-          room.groups.every((g) => isUnchangedMember(room.sharedRoomId, g));
+          room.groups.every((g) => isUnchangedMember(room.sharedRoomId, g)) &&
+          coversAllCurrentMembers;
         if (!isLeftoverOnlyResubmit) {
           throw new BadRequestError(`房间「${room.hotelRoomTypeId}」的计费份额合计须为 1，当前为 ${totalFraction}`);
         }

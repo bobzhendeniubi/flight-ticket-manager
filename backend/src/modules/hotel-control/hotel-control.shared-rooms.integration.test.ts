@@ -2160,6 +2160,88 @@ describe('saveSharedRooms · 真 DB E2E · 隐式触及旧共享房的清理（a
     expect(sAfter.members[0]!.orderId).toBe(orderB.id);
   });
 
+  it('N2 反例：既有房 Σ=0 但请求漏列了落库现状的另一名计费方 → 仍是 400，不能把漏列的一方悄悄摘出成员表', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    // 落库现状：S = A(份额 1) + B(份额 0)——拍板 5(b) 默认形态（原计费方已迁出，B 留守）。
+    const created = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const roomId = created.rooms[0].sharedRoomId;
+    const sBefore = await prisma.sharedRoom.findUniqueOrThrow({ where: { id: roomId } });
+
+    // 把 S 列进 body.rooms 重提，但 groups 只写 B(0)，漏列 A(1)——不是「原样交回」既成事实，
+    // 是漏列。isUnchangedMember 对「列出来的」B 仍然成立（B 没变），若只按「列出来的都没
+    // 改」判定，会把这次漏列误判成 H1④ 的留守重提而放行，现场把 A 从成员表摘出去（A 那份
+    // 真占用、真计费的份额从此在共享房里凭空消失）。必须仍走 Σ≠1 的硬闸，不给出路。
+    await expect(
+      saveSharedRooms(
+        {
+          hotelId: hotel.id,
+          checkIn: CHECK_IN,
+          checkOut: CHECK_OUT,
+          requestToken: requestToken(),
+          expectedVersions: { [roomId]: sBefore.version },
+          rooms: [
+            {
+              sharedRoomId: roomId,
+              hotelRoomTypeId: roomType.id,
+              groups: [
+                {
+                  orderId: orderB.id,
+                  orderItemId: orderB.items[0].id,
+                  passengerIds: [orderB.passengers[0].id],
+                  roomFraction: 0,
+                },
+              ],
+            },
+          ],
+          dissolve: [],
+        },
+        actor,
+      ),
+    ).rejects.toThrow(/计费份额合计须为 1/);
+
+    // 拒绝后不能有任何副作用：A 仍是成员，份额仍是 1；成员数仍是 2。
+    const sAfter = await prisma.sharedRoom.findUniqueOrThrow({
+      where: { id: roomId },
+      include: { members: true },
+    });
+    expect(sAfter.members).toHaveLength(2);
+    const aMember = sAfter.members.find((m) => m.orderId === orderA.id);
+    expect(aMember).toBeDefined();
+    expect(Number(aMember!.roomFraction)).toBe(1);
+  });
+
   it('旧共享房只剩这一名乘客：拽走后旧房自动 DISSOLVED，不留零成员的幽灵房', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4);
