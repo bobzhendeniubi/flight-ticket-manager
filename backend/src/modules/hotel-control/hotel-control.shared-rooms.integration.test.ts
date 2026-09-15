@@ -2166,6 +2166,115 @@ describe('saveSharedRooms · 真 DB E2E · 隐式触及旧共享房的清理（a
     expect(sAfter.members[0]!.orderId).toBe(orderB.id);
   });
 
+  it('P3 正向用例：Σ=0 且成员与现状完全一致的既有房原样重提 → 200 + warning + orphanedSharedRoomIds 含该房（钉住 isLeftoverOnlyResubmit 契约，独立于 H1④ 的完整叙事用例）', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderPayer = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderLeftover = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderElsewhere = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    // 步骤①：正常建房 S = 计费方(1) + 留守方(0)——新建房不能直接 Σ=0（isLeftoverOnlyResubmit
+    // 要求 sharedRoomId 非空，新建请求恒 sharedRoomId=null），必须先有这个落库现状。
+    const created = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderPayer.id,
+                orderItemId: orderPayer.items[0].id,
+                passengerIds: [orderPayer.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderLeftover.id,
+                orderItemId: orderLeftover.items[0].id,
+                passengerIds: [orderLeftover.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const roomId = created.rooms[0].sharedRoomId;
+
+    // 步骤②：隐式把计费方挪去另一间房（不点名 S）——S 落库只剩留守方，Σ=0（当前测试的
+    // 「落库现状」由这一步产生，不是手造）。
+    await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderPayer.id,
+                orderItemId: orderPayer.items[0].id,
+                passengerIds: [orderPayer.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderElsewhere.id,
+                orderItemId: orderElsewhere.items[0].id,
+                passengerIds: [orderElsewhere.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const seed = await prisma.sharedRoom.findUniqueOrThrow({ where: { id: roomId } });
+
+    // 步骤③：本用例真正要钉住的契约——把 S 原样重提（成员、份额与落库现状完全一致）
+    // → 不是 400，是 200 + warning + orphanedSharedRoomIds 含 S。
+    const resubmit = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        expectedVersions: { [roomId]: seed.version },
+        rooms: [
+          {
+            sharedRoomId: roomId,
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderLeftover.id,
+                orderItemId: orderLeftover.items[0].id,
+                passengerIds: [orderLeftover.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    // 版本号本身不是这条用例要钉住的契约（重提交是否物理重写、是否涨版本号是实现细节）——
+    // 只断言真正对外承诺的三件事：还是这间房、warning 提示、orphanedSharedRoomIds 含它。
+    expect(resubmit.rooms).toHaveLength(1);
+    expect(resubmit.rooms[0]!.sharedRoomId).toBe(roomId);
+    expect(resubmit.warnings.some((w) => w.includes(roomId) && w.includes('原计费方已迁出'))).toBe(true);
+    expect(resubmit.orphanedSharedRoomIds).toEqual([roomId]);
+  });
+
   it('N2 反例：既有房 Σ=0 但请求漏列了落库现状的另一名计费方 → 仍是 400，不能把漏列的一方悄悄摘出成员表', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4);

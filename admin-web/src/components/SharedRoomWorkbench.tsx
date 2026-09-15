@@ -29,6 +29,12 @@ import { Icon } from './Icon';
 import { useDialogA11y } from './Modal';
 import { orderStatusBadgeClass, orderStatusLabel } from '../lib/orderStatus';
 import { passengerDisplayName, passengerNameTitle } from '../lib/passengerDisplayName';
+import {
+  groupsFromMembers,
+  isLeftoverOnlyRoom,
+  serializeGroups,
+  type SharedRoomRuleSeedRoom,
+} from '../lib/shared-room-rules';
 
 const HALF_STEP = 0.5;
 
@@ -99,40 +105,9 @@ function memberIsActive(
   return validOrderIds.has(m.orderId);
 }
 
-/** 共享房成员列表 → 按「来源订单 + 订单行」重新分组（seedDraftRooms 与「原始态」对比复用）。 */
-function groupsFromMembers(members: SharedRoomWorkbenchRoomMember[]): DraftGroup[] {
-  const byKey = new Map<string, DraftGroup>();
-  for (const m of members) {
-    const key = `${m.orderId}:${m.orderItemId}`;
-    const existing = byKey.get(key);
-    if (existing) {
-      existing.passengerIds.push(m.passengerId);
-    } else {
-      byKey.set(key, {
-        orderId: m.orderId,
-        orderItemId: m.orderItemId,
-        orderNumber: '',
-        passengerIds: [m.passengerId],
-        roomFraction: m.roomFraction,
-      });
-    }
-  }
-  return [...byKey.values()];
-}
-
-/** 规范化序列化一组 DraftGroup，用于「本次改动前后是否相同」的字符串比较（顺序无关）。 */
-function serializeGroups(groups: DraftGroup[]): string {
-  return JSON.stringify(
-    groups
-      .map((g) => ({
-        orderId: g.orderId,
-        orderItemId: g.orderItemId,
-        roomFraction: g.roomFraction,
-        passengerIds: [...g.passengerIds].sort(),
-      }))
-      .sort((a, b) => `${a.orderId}:${a.orderItemId}`.localeCompare(`${b.orderId}:${b.orderItemId}`)),
-  );
-}
+// groupsFromMembers / serializeGroups：P3 修复（批 10）已抽到 '../lib/shared-room-rules'
+// 作为纯函数（与后端 isLeftoverOnlyResubmit 同一份契约，双端各自可测），此处不再本地重复
+// 定义——上方 import 已引入同名函数。
 
 // ── 草稿态类型（编辑期内存态，保存时按后端形状收敛）──────────────────────────
 interface DraftGroup {
@@ -165,9 +140,12 @@ function seedDraftRooms(data: SharedRoomWorkbenchData): DraftRoom[] {
     notes: r.notes ?? '',
     // groupsFromMembers 不知道订单号（只按 members 的 orderId/orderItemId 分组），这里补上
     // 展示用的 orderNumber——不参与保存 payload，也不参与 B2/B6 的「原始态」diff 比较。
+    // passengerIds 显式拷贝成可变数组：lib 版 groupsFromMembers 返回 readonly 数组
+    // （纯函数契约的一部分），DraftGroup 的编辑态需要可变数组。
     groups: groupsFromMembers(r.members).map((g) => ({
       ...g,
       orderNumber: orderNumberById.get(g.orderId) ?? g.orderId,
+      passengerIds: [...g.passengerIds],
     })),
   }));
 }
@@ -545,10 +523,14 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     // 变更」）。新建房间没有「原始态」可比，有成员就直接提交，没有就跳过（用户建了空房又
     // 没填人，等同没建；新建房只能来自乘客池拖拽，池子本就不含失效成员，无需过滤）。
     const dissolveMap = new Map(dissolvedVersions);
-    const roomsToSave: Array<{ room: DraftRoom; groups: DraftGroup[]; membersUnchanged: boolean }> = [];
+    const roomsToSave: Array<{
+      room: DraftRoom;
+      groups: DraftGroup[];
+      seedRoom: SharedRoomRuleSeedRoom | undefined;
+    }> = [];
     for (const r of rooms) {
       if (!r.sharedRoomId) {
-        if (r.groups.length > 0) roomsToSave.push({ room: r, groups: r.groups, membersUnchanged: false });
+        if (r.groups.length > 0) roomsToSave.push({ room: r, groups: r.groups, seedRoom: undefined });
         continue;
       }
       if (dissolveMap.has(r.sharedRoomId)) continue; // 已被「解散整间」按钮显式标记
@@ -570,10 +552,10 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
         dissolveMap.set(r.sharedRoomId, r.version ?? 0);
         continue;
       }
-      roomsToSave.push({ room: r, groups: r.groups, membersUnchanged: !membersChanged });
+      roomsToSave.push({ room: r, groups: r.groups, seedRoom });
     }
 
-    for (const { room, groups, membersUnchanged } of roomsToSave) {
+    for (const { room, groups, seedRoom } of roomsToSave) {
       if (!room.hotelRoomTypeId) {
         setSaveErr('每间房都要先选房型再保存');
         return;
@@ -583,11 +565,13 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
       const totalFraction = roundHalf(groups.reduce((s, g) => s + g.roomFraction, 0));
       if (totalFraction !== 1) {
         // N3：与后端 H1④ 对齐——既有房 Σ=0 且本房全部成员（份额、成员集合）与落库现状
-        // 完全一致（membersUnchanged，本次只是改了房型/备注等元信息，不是新增/改动
-        // 成员）→ 放行提交，成功后把后端返回的 warning（「原计费方已迁出」提示）展示给
-        // 运营；其余情形（Σ 是其它非 1 值、或成员真有改动）维持前端硬闸，不发请求。
-        // 不能一边后端放行一边前端硬拦——这条分支此前从 UI 永远走不到。
-        const isLeftoverOnlyResubmit = totalFraction === 0 && !!room.sharedRoomId && membersUnchanged;
+        // 完全一致（本次只是改了房型/备注等元信息，不是新增/改动成员）→ 放行提交，成功后
+        // 把后端返回的 warning（「原计费方已迁出」提示）展示给运营；其余情形（Σ 是其它
+        // 非 1 值、或成员真有改动）维持前端硬闸，不发请求。不能一边后端放行一边前端硬拦——
+        // 这条分支此前从 UI 永远走不到。P3（批 10）：判定逻辑抽成纯函数 isLeftoverOnlyRoom
+        // （'../lib/shared-room-rules'），与后端 isLeftoverOnlyResubmit 同一份契约、双端
+        // 各自可测，不再各写一遍。
+        const isLeftoverOnlyResubmit = isLeftoverOnlyRoom(seedRoom, { sharedRoomId: room.sharedRoomId, groups });
         if (!isLeftoverOnlyResubmit) {
           const roomType = roomTypeOptions.find((rt) => rt.id === room.hotelRoomTypeId);
           setSaveErr(
