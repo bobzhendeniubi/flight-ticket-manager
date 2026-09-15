@@ -212,6 +212,10 @@ function hotelItem(over: Record<string, unknown> = {}) {
     hotelCheckIn: new Date('2026-09-01T00:00:00.000Z'),
     hotelCheckOut: new Date('2026-09-03T00:00:00.000Z'),
     roomsBilled: new Prisma.Decimal(1),
+    // N8：锁后重读把 unitPrice 也纳入版本校验（报价依赖字段）——必须给一个真实存在的值，
+    // 不能留空：OrderItem.unitPrice 在 schema 里是非空列，undefined 会被 Number() 强转成
+    // NaN，NaN !== NaN 恒真，会让锁后校验对每条正常用例都误判 409。
+    unitPrice: new Prisma.Decimal(800),
     ...over,
   };
 }
@@ -431,6 +435,36 @@ describe('rescheduleItemHotel · 有效订单守卫', () => {
     ).rejects.toThrow('订单在回收站（已软删），不可改期；如需操作请先恢复');
     expect(tx.orderItem.update).not.toHaveBeenCalled();
     expect(tx.order.update).not.toHaveBeenCalled();
+  });
+});
+
+describe('rescheduleItemHotel · 锁后单价校验（astra finding N8）', () => {
+  it('锁前读到的单价与锁后重读不一致（并发改结算价先提交）→ 409，不按旧价落一笔错误差价', async () => {
+    // 锁前（事务外）读到 unitPrice=800；锁后重读（事务内，转 call 同一个外层 mock）读到
+    // unitPrice=1000——模拟「代理改期先读旧价，运营改结算价先提交」：锁后其它字段
+    // （酒店/日期/份额）都没变，唯独单价变了，旧实现的锁后校验漏了这个字段，会照样按
+    // 锁前的旧单价把改期算出来，用旧数据覆盖刚提交的结算价。
+    mockPrisma.orderItem.findUnique
+      .mockResolvedValueOnce(hotelItem({ unitPrice: new Prisma.Decimal(800) }))
+      .mockResolvedValueOnce(hotelItem({ unitPrice: new Prisma.Decimal(1000) }));
+    const { tx } = mountReschedule({});
+
+    await expect(
+      service.rescheduleItemHotel('ord-1', 'item-1', { ...NEW_STAY }, ADMIN),
+    ).rejects.toThrow(/已被并发修改.*单价已变化|请刷新后重试改期/);
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+    expect(tx.order.update).not.toHaveBeenCalled();
+  });
+
+  it('锁前锁后单价一致 → 正常放行（不误伤没有并发冲突的正常改期）', async () => {
+    mockPrisma.orderItem.findUnique.mockResolvedValue(hotelItem({ unitPrice: new Prisma.Decimal(800) }));
+    const { tx } = mountReschedule({});
+
+    await service
+      .rescheduleItemHotel('ord-1', 'item-1', { ...NEW_STAY }, ADMIN)
+      .catch(() => undefined);
+
+    expect(tx.orderItem.update).toHaveBeenCalled();
   });
 });
 

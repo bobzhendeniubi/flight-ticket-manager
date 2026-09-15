@@ -15256,6 +15256,12 @@ export class OrderService {
           hotelCheckOut: true,
           roomsBilled: true,
           randomStarTier: true,
+          // N8 修复：报价依赖字段也要纳入锁后版本校验——差价（feeCny/selfServiceFee）
+          // 与成本快照全部算自锁前的 item.unitPrice；换酒店与「改结算价」并发时，锁后
+          // 现有字段（酒店/日期/份额）都没变，仍会用锁前的旧单价算出一笔错误差价
+          // （代理改期先读旧价，运营改结算价先提交，代理拿到锁后所有比较字段相同，
+          // 仍按旧价计差价）。
+          unitPrice: true,
         },
       });
       if (
@@ -15265,9 +15271,10 @@ export class OrderService {
         lockedItem.randomStarTier !== item.randomStarTier ||
         (lockedItem.hotelCheckIn?.getTime() ?? null) !== (item.hotelCheckIn?.getTime() ?? null) ||
         (lockedItem.hotelCheckOut?.getTime() ?? null) !== (item.hotelCheckOut?.getTime() ?? null) ||
-        Number(lockedItem.roomsBilled ?? 1) !== Number(item.roomsBilled ?? 1)
+        Number(lockedItem.roomsBilled ?? 1) !== Number(item.roomsBilled ?? 1) ||
+        Number(lockedItem.unitPrice) !== Number(item.unitPrice)
       ) {
-        throw new ConflictError('该行已被并发修改（酒店/日期/份额已变化），请刷新后重试换酒店');
+        throw new ConflictError('该行已被并发修改（酒店/日期/份额/单价已变化），请刷新后重试换酒店');
       }
 
       // ── §八「换酒店」：该行若有共享成员，先解绑（钱不动，物理按普通房组 1 间计）──────
@@ -16070,6 +16077,9 @@ export class OrderService {
           hotelCheckOut: true,
           roomsBilled: true,
           randomStarTier: true,
+          // N8 修复：报价依赖字段也要纳入锁后版本校验，同 swapItemHotel——差价算自锁前的
+          // item.unitPrice，锁后其它字段都没变时仍可能用旧单价算出一笔错误差价。
+          unitPrice: true,
         },
       });
       if (
@@ -16079,9 +16089,10 @@ export class OrderService {
         lockedItem.randomStarTier !== item.randomStarTier ||
         (lockedItem.hotelCheckIn?.getTime() ?? null) !== (item.hotelCheckIn?.getTime() ?? null) ||
         (lockedItem.hotelCheckOut?.getTime() ?? null) !== (item.hotelCheckOut?.getTime() ?? null) ||
-        Number(lockedItem.roomsBilled ?? 1) !== Number(item.roomsBilled ?? 1)
+        Number(lockedItem.roomsBilled ?? 1) !== Number(item.roomsBilled ?? 1) ||
+        Number(lockedItem.unitPrice) !== Number(item.unitPrice)
       ) {
-        throw new ConflictError('该行已被并发修改（酒店/日期/份额已变化），请刷新后重试改期');
+        throw new ConflictError('该行已被并发修改（酒店/日期/份额/单价已变化），请刷新后重试改期');
       }
 
       // ── §八「酒店改期」：该行若有共享成员，先解绑（新旧日期不同，共享房 checkIn/checkOut

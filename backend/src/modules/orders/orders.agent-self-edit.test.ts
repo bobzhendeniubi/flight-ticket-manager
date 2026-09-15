@@ -520,6 +520,9 @@ describe('swapItemHotel · 自助差价', () => {
       hotelCheckIn: new Date('2026-10-01T00:00:00.000Z'),
       hotelCheckOut: new Date('2026-10-03T00:00:00.000Z'),
       roomsBilled: 1,
+      // N8：锁后重读把 unitPrice 纳入版本校验，缺这个字段会被 Number(undefined) 强转成
+      // NaN，NaN !== NaN 恒真，让每次调用都误判成「被并发改过」。
+      unitPrice: dec(500),
       unitCostCny: null,
       totalCostCny: null,
     });

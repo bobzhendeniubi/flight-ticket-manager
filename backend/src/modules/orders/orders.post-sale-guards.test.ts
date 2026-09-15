@@ -134,6 +134,9 @@ describe('swapItemHotel · 有效订单守卫 + 订单行锁', () => {
       hotelCheckIn: new Date('2026-09-01T00:00:00.000Z'),
       hotelCheckOut: new Date('2026-09-03T00:00:00.000Z'),
       roomsBilled: new Prisma.Decimal(1),
+      // N8：锁后重读把 unitPrice 纳入版本校验，缺这个字段会被 Number(undefined) 强转成
+      // NaN，NaN !== NaN 恒真，让每次调用都误判成「被并发改过」。
+      unitPrice: new Prisma.Decimal(500),
       unitCostCny: null,
       totalCostCny: null,
     });
@@ -245,6 +248,50 @@ describe('swapItemHotel · 有效订单守卫 + 订单行锁', () => {
       }),
     );
     expect(callTrace[0]).toBe('LOCK_ORDER');
+  });
+
+  it('astra finding N8：锁前读到的单价与锁后重读不一致（并发改结算价先提交）→ 409，不按旧价落错差价', async () => {
+    const tx = mountSwapHotel({ status: 'PAID' });
+    // mountSwapHotel 已经配好一份持久 mock；这里覆盖前两次调用（锁前 + 锁后重读）分别
+    // 给出不同的 unitPrice，模拟「换酒店先读旧价，运营改结算价先提交」——锁后其它字段
+    // （酒店/日期/份额）都没变，唯独单价变了。
+    mockPrisma.orderItem.findUnique
+      .mockResolvedValueOnce({
+        id: 'item-1',
+        orderId: 'ord-1',
+        kind: OrderItemKind.HOTEL,
+        description: '明月酒店 · 标准间',
+        quantity: 2,
+        hotelRoomTypeId: 'rt-old',
+        randomStarTier: null,
+        hotelCheckIn: new Date('2026-09-01T00:00:00.000Z'),
+        hotelCheckOut: new Date('2026-09-03T00:00:00.000Z'),
+        roomsBilled: new Prisma.Decimal(1),
+        unitPrice: new Prisma.Decimal(500),
+        unitCostCny: null,
+        totalCostCny: null,
+      })
+      .mockResolvedValueOnce({
+        id: 'item-1',
+        orderId: 'ord-1',
+        kind: OrderItemKind.HOTEL,
+        description: '明月酒店 · 标准间',
+        quantity: 2,
+        hotelRoomTypeId: 'rt-old',
+        randomStarTier: null,
+        hotelCheckIn: new Date('2026-09-01T00:00:00.000Z'),
+        hotelCheckOut: new Date('2026-09-03T00:00:00.000Z'),
+        roomsBilled: new Prisma.Decimal(1),
+        unitPrice: new Prisma.Decimal(650), // 并发改结算价已先提交
+        unitCostCny: null,
+        totalCostCny: null,
+      });
+
+    await expect(
+      service.swapItemHotel('ord-1', 'item-1', { newHotelRoomTypeId: 'rt-new' } as never, ADMIN),
+    ).rejects.toThrow(/已被并发修改.*单价已变化|请刷新后重试换酒店/);
+    expect(tx.orderItem.update).not.toHaveBeenCalled();
+    expect(tx.order.update).not.toHaveBeenCalled();
   });
 });
 
