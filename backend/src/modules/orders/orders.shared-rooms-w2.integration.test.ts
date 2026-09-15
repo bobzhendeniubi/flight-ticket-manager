@@ -1105,7 +1105,10 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
 
   it('astra finding N3 反例：恢复时共享触及行与未触及行分别过闸，各自看到「需求 1」都通过，合计却超限', async () => {
     const actor = await adminActor();
-    const { hotel, roomType } = await createHotelWithRoomType(1); // 该酒店整段只有 1 间包房
+    // 先给 2 间包房：建共享房时 I1 共享 1 间 + I2 普通 1 间 = 2 间才建得起来（批 4 修好
+    // 「新建共享房覆盖项漏计」后，保存端会如实算出 2 间）；取消后再把包房缩到 1 间，制造
+    // 「恢复需要 2 间、只剩 1 间」的合计超限场景。
+    const { hotel, roomType } = await createHotelWithRoomType(2);
     // 关闭超售容忍（默认 env 缺省 3 间会把 1 间的差额悄悄放行掉，测不出两道闸各自独立
     // 判定的问题）——房控页可调的 SystemSetting，测试库每个用例前都会被清空。
     await prisma.systemSetting.create({ data: { key: 'hotelMaxOversellRooms', value: '0' } });
@@ -1160,6 +1163,8 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
 
     // 取消 orderX：该酒店此刻没有任何其它有效订单，物理占用为 0（两条行都不计入）。
     await prisma.order.update({ where: { id: orderX.id }, data: { status: OrderStatus.CANCELLED } });
+    // 取消后把包房缩到 1 间：此刻没有任何有效订单占房，余量 = 1。
+    await prisma.hotelBlockPeriod.updateMany({ where: { hotelId: hotel.id }, data: { rooms: 1 } });
     expect((await getHotelNightlyRemaining(hotel.id, [CHECK_IN])).physicalRemaining).toEqual([1]);
 
     // 恢复：I1（共享，触及）与 I2（普通，未触及）各自需要 1 间，只有 1 间包房，合计需要
@@ -1653,9 +1658,8 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
   // 连带清空（与 astra B 路 finding N3「隐式迁出只删除被搬成员，但删掉了全部留守方镜像」
   // 一致）——这是 hotel-control.shared-rooms.ts 内部逻辑的 bug，该源文件本批修复范围不
   // 包含（修复批 4 并行在改），这里只补一条断言把这个已知缺陷钉死成可执行的回归测试。
-  // 用 it.fails 标记「预期失败」：批 4 落地修复后，这条测试会转为意外通过（vitest 报
-  // "expected test to fail but it passed"），到时候把 it.fails 改回普通 it 即可。
-  it.fails('A14 余项反例：隐式迁出——留守方（未被本次请求提及的成员）订单 JSON 应仍正确挂着旧房，不该被清理逻辑连带清空（已知缺陷，待批 4 修复）', async () => {
+  // 批 4 已修复隐式旧房留守成员的镜像重建，这条从「钉缺陷的 it.fails」改回普通断言。
+  it('A14 余项反例：隐式迁出——留守方（未被本次请求提及的成员）订单 JSON 应仍正确挂着旧房，不该被清理逻辑连带清空（已知缺陷，待批 4 修复）', async () => {
     // 复现口径同 hotel-control.shared-rooms.integration.test.ts 的「astra A6②」用例
     // （那个文件是 hotel-control.shared-rooms.ts 的专属测试，本批修复范围不包含该源文件，
     // 断言放在这里，只调用 saveSharedRooms 这个公开函数，不改动它的实现或测试）：
