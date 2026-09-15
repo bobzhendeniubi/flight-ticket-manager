@@ -140,6 +140,77 @@ describe('buildVerifiedSplitPairKeys', () => {
     expect(verified.size).toBe(0);
     expect(findMany).not.toHaveBeenCalled();
   });
+
+  // ── astra finding N7：sp2: 新格式按单条拆分记录核验，不再按 token 取并集 ────────────
+  it('N7 正例：sp2 格式——source/target 恰为对应记录二元组，判定可信', async () => {
+    const client = {
+      orderSplitRecord: {
+        findMany: vi.fn().mockResolvedValue([
+          { sourceOrderId: 'ord_a', targetOrderId: 'ord_b', requestToken: 'token-1' },
+        ]),
+      },
+    } as unknown as PrismaClient;
+    const verified = await buildVerifiedSplitPairKeys(
+      [
+        { orderId: 'ord_a', splitPairKey: 'sp2:ord_a:item-x:token-1' },
+        { orderId: 'ord_b', splitPairKey: 'sp2:ord_a:item-x:token-1' },
+      ],
+      client,
+    );
+    expect(verified.has('sp2:ord_a:item-x:token-1')).toBe(true);
+  });
+
+  it('N7 反例：两组独立拆分复用同一个 token——sp2 按单条记录精确核验，不再像旧的 token 并集判定那样被误判为可信', async () => {
+    // ord_a→ord_b 与 ord_c→ord_d 是两次完全不相关的拆分，只是碰巧复用了同一个
+    // requestToken（token 只在 (源单, token) 内做幂等去重，不同源单本就允许复用）。
+    // 这里模拟 ord_c 的条目错误地携带了 ord_a 那条拆分的 splitPairKey 字面值
+    // （legacy 数据 / 拼接错误的极端场景）——旧实现按 token 取并集会把 ord_a/ord_b/
+    // ord_c/ord_d 全部并进 legit 集合，ord_c 恰好也在集合里，被误判为「同一次拆分」；
+    // sp2 精确核验只认 sourceOrderId=ord_a、token=token-1 对应的那一条记录
+    // {ord_a, ord_b}，ord_c 不在其中，必须判为不可信。
+    const client = {
+      orderSplitRecord: {
+        findMany: vi.fn().mockResolvedValue([
+          { sourceOrderId: 'ord_a', targetOrderId: 'ord_b', requestToken: 'token-1' },
+          { sourceOrderId: 'ord_c', targetOrderId: 'ord_d', requestToken: 'token-1' },
+        ]),
+      },
+    } as unknown as PrismaClient;
+    const verified = await buildVerifiedSplitPairKeys(
+      [
+        { orderId: 'ord_a', splitPairKey: 'sp2:ord_a:item-x:token-1' },
+        { orderId: 'ord_c', splitPairKey: 'sp2:ord_a:item-x:token-1' }, // 错误挪用 ord_a 的 key
+      ],
+      client,
+    );
+    expect(verified.has('sp2:ord_a:item-x:token-1')).toBe(false);
+    // 只查了这一条 (sourceOrderId, requestToken) 组合，不是不加区分地按 token 广查。
+    expect(client.orderSplitRecord.findMany).toHaveBeenCalledWith({
+      where: { OR: [{ sourceOrderId: 'ord_a', requestToken: 'token-1' }] },
+      select: { sourceOrderId: true, targetOrderId: true, requestToken: true },
+    });
+  });
+
+  it('N7：sp2 与旧格式混用互不干扰——各走各的核验路径', async () => {
+    const client = {
+      orderSplitRecord: {
+        findMany: vi.fn().mockResolvedValue([
+          { sourceOrderId: 'ord_a', targetOrderId: 'ord_b', requestToken: 'token-1' },
+        ]),
+      },
+    } as unknown as PrismaClient;
+    const verified = await buildVerifiedSplitPairKeys(
+      [
+        { orderId: 'ord_a', splitPairKey: 'sp2:ord_a:item-x:token-1' },
+        { orderId: 'ord_b', splitPairKey: 'sp2:ord_a:item-x:token-1' },
+        { orderId: 'ord_a', splitPairKey: 'legacy-item:token-1' },
+        { orderId: 'ord_b', splitPairKey: 'legacy-item:token-1' },
+      ],
+      client,
+    );
+    expect(verified.has('sp2:ord_a:item-x:token-1')).toBe(true);
+    expect(verified.has('legacy-item:token-1')).toBe(true);
+  });
 });
 
 describe('roomNumberScopeKey', () => {

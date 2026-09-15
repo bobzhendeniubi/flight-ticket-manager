@@ -11,15 +11,19 @@
  *     订单 JSON 的 roomGroups[].sharedRoomId 镜像，真值见 hotel-control.shared-rooms.ts）；
  *     没有共享房 id 但带拆单配对键（splitPairKey，orders.service.ts 拆单时写在两个半组上的
  *     `<源行id>:<拆单令牌>`）时用它——两个半间导出编号也该合成一间，同物理房间口径。
- *     **splitPairKey 本身不保证跨单唯一**（astra A 路 finding 4/§十三验收反例 10 的后续复审）：
- *     它是「本地房组 id + 拆单令牌」拼出来的，拆单令牌只在 (源单, 令牌) 二元组内做幂等去重
- *     （orders.service.ts splitOrder 的回放检查），不同源单复用同一个令牌、又撞上相同的本地
- *     房组 id（legacy 数据 / 批量脚本更容易撞），三个导出会把两张不相关订单的半间错误合成
- *     一间。`buildVerifiedSplitPairKeys` 用 OrderSplitRecord（真实拆单关系表）批量核验：
- *     只有当出现同一个 splitPairKey 的全部订单，确实都落在同一条 (sourceOrderId,
- *     requestToken) 拆单记录的 source/target 二元组里，才认定这是「真的同一次拆单产生的
- *     两个半间」；核验集缺省（调用方没传）时保持旧行为（信任 splitPairKey，供纯函数单测用，
- *     不查库）——生产调用点必须传核验集，否则退回 `${orderId}:${groupId}`。
+ *     **存量 splitPairKey（旧格式 `<baseId>:<拆单令牌>`）不保证跨单唯一**（astra A 路
+ *     finding 4/§十三验收反例 10 的后续复审）：baseId 可能是本地房组 id（不保证全局唯一），
+ *     拆单令牌只在 (源单, 令牌) 二元组内做幂等去重，不同源单复用同一个令牌、又撞上相同的
+ *     baseId（legacy 数据 / 批量脚本更容易撞），三个导出会把两张不相关订单的半间错误合成
+ *     一间。**新格式**（HIGH 修复 · astra finding N7）`sp2:<sourceOrderId>:<baseId>:
+ *     <拆单令牌>`（orders.service.ts splitMixedRoomGroup 写入）把源单 id 直接编进 key，
+ *     天然对应 OrderSplitRecord 的 `@@unique([sourceOrderId, requestToken])`，不再需要
+ *     baseId 全局唯一这个假设。`buildVerifiedSplitPairKeys` 用 OrderSplitRecord（真实拆单
+ *     关系表）批量核验：新格式按**单条拆分记录**精确核验（sourceOrderId+token 唯一定位
+ *     一条记录，出现该 key 的订单必须恰为该记录的 source/target 二元组）；旧格式沿用原按
+ *     token 取并集的核验（已知的较弱口径，存量数据不回填新格式）。核验集缺省（调用方没传）
+ *     时保持旧行为（信任 splitPairKey，供纯函数单测用，不查库）——生产调用点必须传核验集，
+ *     否则退回 `${orderId}:${groupId}`。
  *   - `roomNumberScopeKey`：编号作用域——真实酒店按 hotelId（不认名字文本，名字可能是换酒店前
  *     的旧值、房控手误）；未落位的星级随机档没有 hotelId，用展示名兜底出一个隔离的作用域键
  *     （不会撞真实酒店的 hotelId）。入住日由调用方在此之外自行分桶。
@@ -105,40 +109,97 @@ export async function buildVerifiedSplitPairKeys(
   const verified = new Set<string>();
   if (orderIdsByKey.size === 0) return verified;
 
-  const tokens = new Set<string>();
+  // HIGH 修复（astra finding N7）：新格式 `sp2:<sourceOrderId>:<baseId>:<token>`
+  // （orders.service.ts splitMixedRoomGroup 写入）按**单条拆分关系**核验——解析出
+  // sourceOrderId + token，精确查 (sourceOrderId, requestToken) 这一条 OrderSplitRecord
+  // （= 唯一索引 @@unique([sourceOrderId, requestToken])），可信集合就是那一条记录的
+  // {sourceOrderId, targetOrderId} 二元组，不再像旧实现那样把所有共享同一个 token 的
+  // 拆分记录的 source/target 并成一个大集合——两个各自复用同一 token 的独立拆分，即使
+  // 观测到的订单都落在这个并集里，也不代表它们是同一次拆分（原碰撞仍会通过）。
+  //
+  // sourceOrderId 用第一个冒号定位（位置固定，即便 baseId 内部含冒号也不影响：baseId
+  // 只在 "sp2:" 与 token 之间，两头都按位置切，不需要 baseId 本身无冒号）；token 用最后
+  // 一个冒号定位（token 本身不含冒号，同旧格式的既有假设）。
+  const sp2Parsed = new Map<string, { sourceOrderId: string; token: string }>();
+  // 旧格式（无 sp2: 前缀）：沿用原按 token 取并集的校验——存量数据不回填新格式
+  // （见 splitMixedRoomGroup 头注释），核验仍是已知的较弱口径。
+  const legacyTokens = new Set<string>();
+
   for (const key of orderIdsByKey.keys()) {
-    const idx = key.lastIndexOf(':');
-    if (idx > 0) tokens.add(key.slice(idx + 1));
+    if (key.startsWith('sp2:')) {
+      const rest = key.slice(4);
+      const firstColon = rest.indexOf(':');
+      if (firstColon <= 0) continue; // 形状不符（不可信，留在 verified 之外，退回 orderId:groupId）
+      const sourceOrderId = rest.slice(0, firstColon);
+      const afterSource = rest.slice(firstColon + 1);
+      const lastColon = afterSource.lastIndexOf(':');
+      if (lastColon <= 0) continue;
+      const token = afterSource.slice(lastColon + 1);
+      if (!sourceOrderId || !token) continue;
+      sp2Parsed.set(key, { sourceOrderId, token });
+    } else {
+      const idx = key.lastIndexOf(':');
+      if (idx > 0) legacyTokens.add(key.slice(idx + 1));
+    }
   }
 
-  const records =
-    tokens.size > 0
-      ? await client.orderSplitRecord.findMany({
-          where: { requestToken: { in: [...tokens] } },
-          select: { sourceOrderId: true, targetOrderId: true, requestToken: true },
-        })
-      : [];
-  const legitOrderIdsByToken = new Map<string, Set<string>>();
-  for (const r of records) {
-    let set = legitOrderIdsByToken.get(r.requestToken);
-    if (!set) {
-      set = new Set();
-      legitOrderIdsByToken.set(r.requestToken, set);
+  if (sp2Parsed.size > 0) {
+    const pairs = new Map<string, { sourceOrderId: string; requestToken: string }>();
+    for (const p of sp2Parsed.values()) {
+      pairs.set(`${p.sourceOrderId} ${p.token}`, { sourceOrderId: p.sourceOrderId, requestToken: p.token });
     }
-    set.add(r.sourceOrderId);
-    set.add(r.targetOrderId);
+    const records = await client.orderSplitRecord.findMany({
+      where: {
+        OR: [...pairs.values()].map((p) => ({ sourceOrderId: p.sourceOrderId, requestToken: p.requestToken })),
+      },
+      select: { sourceOrderId: true, targetOrderId: true, requestToken: true },
+    });
+    const recordByPair = new Map<string, { sourceOrderId: string; targetOrderId: string }>();
+    for (const r of records) {
+      recordByPair.set(`${r.sourceOrderId} ${r.requestToken}`, r);
+    }
+    for (const [key, parsed] of sp2Parsed) {
+      const orderIds = orderIdsByKey.get(key)!;
+      if (orderIds.size <= 1) {
+        verified.add(key); // 单订单内部撞键，不跨单，没有泄露风险
+        continue;
+      }
+      const record = recordByPair.get(`${parsed.sourceOrderId} ${parsed.token}`);
+      if (record) {
+        const legit = new Set([record.sourceOrderId, record.targetOrderId]);
+        if ([...orderIds].every((id) => legit.has(id))) verified.add(key);
+      }
+    }
   }
 
-  for (const [key, orderIds] of orderIdsByKey) {
-    if (orderIds.size <= 1) {
-      verified.add(key); // 单订单内部撞键，不跨单，没有泄露风险
-      continue;
+  if (legacyTokens.size > 0) {
+    const legacyRecords = await client.orderSplitRecord.findMany({
+      where: { requestToken: { in: [...legacyTokens] } },
+      select: { sourceOrderId: true, targetOrderId: true, requestToken: true },
+    });
+    const legitOrderIdsByToken = new Map<string, Set<string>>();
+    for (const r of legacyRecords) {
+      let set = legitOrderIdsByToken.get(r.requestToken);
+      if (!set) {
+        set = new Set();
+        legitOrderIdsByToken.set(r.requestToken, set);
+      }
+      set.add(r.sourceOrderId);
+      set.add(r.targetOrderId);
     }
-    const idx = key.lastIndexOf(':');
-    const token = idx > 0 ? key.slice(idx + 1) : '';
-    const legit = legitOrderIdsByToken.get(token);
-    if (legit && [...orderIds].every((id) => legit.has(id))) verified.add(key);
+    for (const [key, orderIds] of orderIdsByKey) {
+      if (key.startsWith('sp2:')) continue; // 上面已处理
+      if (orderIds.size <= 1) {
+        verified.add(key);
+        continue;
+      }
+      const idx = key.lastIndexOf(':');
+      const token = idx > 0 ? key.slice(idx + 1) : '';
+      const legit = legitOrderIdsByToken.get(token);
+      if (legit && [...orderIds].every((id) => legit.has(id))) verified.add(key);
+    }
   }
+
   return verified;
 }
 

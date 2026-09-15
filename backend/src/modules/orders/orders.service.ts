@@ -19365,7 +19365,7 @@ export class OrderService {
           { ...group, raw: sharedPlan.moved, passengerIds: movedInGroup },
         ];
       }
-      const halves = splitMixedRoomGroup(group, movedIdSet, input.requestToken);
+      const halves = splitMixedRoomGroup(group, movedIdSet, orderId, input.requestToken);
       return [
         { ...group, raw: halves.kept, passengerIds: keptInGroup },
         { ...group, raw: halves.moved, passengerIds: movedInGroup },
@@ -24556,6 +24556,7 @@ function collectSplitUpgradeItems(
 function splitMixedRoomGroup(
   group: { raw: Record<string, unknown>; passengerIds: string[] },
   movedIdSet: ReadonlySet<string>,
+  sourceOrderId: string,
   pairToken: string,
 ): { kept: Record<string, unknown>; moved: Record<string, unknown> } {
   const movedIds = group.passengerIds.filter((id) => movedIdSet.has(id));
@@ -24573,9 +24574,17 @@ function splitMixedRoomGroup(
     typeof group.raw.id === 'string' && group.raw.id
       ? group.raw.id
       : `pax:${[...group.passengerIds].sort().join('|')}`;
-  // 配对键：两个半组写同一个 key，房控按 key 把它们配回一间（不看性别 —— 夫妻拼房
-  // 被拆开后正是「一男一女各半间」，按性别配对会算成两间）。
-  const splitPairKey = `${baseId}:${pairToken}`;
+  // 配对键（HIGH 修复 · astra finding N7）：`sp2:` 前缀 + 源单 id + baseId + 拆单令牌——
+  // 旧格式只有 `${baseId}:${token}` 两段，baseId 可能是前端本地生成的房组 id（不保证全局
+  // 唯一）、token 也只在 (源单, token) 二元组内做幂等去重（不同源单可以复用同一个
+  // token）。两者都可能撞，旧的核验（buildVerifiedSplitPairKeys）按 token 把所有共享该
+  // token 的拆单记录的 source/target 并成一个集合来判定「可信」，若两个独立拆分各自复用
+  // 了同一个 token、又恰好撞上相同的 baseId，会被误判成「同一次拆单」。加上源单 id 前缀后，
+  // `sp2:<sourceOrderId>:<baseId>` 前两段唯一对应 OrderSplitRecord 的
+  // `@@unique([sourceOrderId, requestToken])`，核验函数据此按**单条记录**校验（见
+  // room-identity.ts），不再按 token 取并集。存量旧格式 key（无 sp2: 前缀）不回填，
+  // 核验函数对旧格式仍走原并集逻辑（已知的历史遗留，见报告）。
+  const splitPairKey = `sp2:${sourceOrderId}:${baseId}:${pairToken}`;
   return {
     kept: { ...group.raw, passengerIds: keptIds, roomFraction: keptHalf / 2, splitPairKey },
     moved: {
