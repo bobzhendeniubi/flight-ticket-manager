@@ -5760,9 +5760,11 @@ export class OrderService {
       // 比未触及行更严格（限额内也直接拒），此处补上让两条路径口径一致。
       const hotelOversellCapRooms = await getHotelOversellCapRooms();
 
-      // 被计划触及（保留合住 或 计划解绑）的行——这些行改走 §五闸；下方 stays 的老前瞻
-      // 路径不理解跨单去重，必须排除，否则要么漏计（保留合住却没判容量）要么错判（解绑
-      // 后瞎猜一个 floor 值）。
+      // 被计划触及（保留合住 或 计划解绑）的行——这些行所在的**整间酒店**改走 §五闸；
+      // 下方 stays 的老前瞻路径不理解跨单去重，必须整间酒店排除（不能只排除触及的那几
+      // 行），否则两道闸各自看不到对方要新增的占用，分别都放行、合计却超限（CRITICAL
+      // 修复 · astra finding N3：同晚容量 1、容忍 0，共享触及行与未触及行分别需要 1 间，
+      // 两道闸各自看到「需求 1」都通过，最终实际需求 2）。
       const touchedItemIds = new Set<string>([
         ...reconciliationPlan.kept.map((k) => k.orderItemId),
         ...reconciliationPlan.unboundItemIds,
@@ -5771,25 +5773,40 @@ export class OrderService {
       // 这里按行取回自己那部分 changes，nextRoomAssignment 全部行共用同一份（已经把这批
       // 行的共享键一次性剥完，不存在「取哪一份」的问题）。
       const unboundPlan = reconciliationPlan.unboundPlan;
+      // N3：容量闸按酒店合并的返回值——非空即容忍超售明细，随审计/响应一并带出。
+      const restoreSharedGateOversold: HotelStayOversellRecord[] = [];
+
+      // 全部住宿行先按酒店分组（不止触及的行）——同一晚容量闸只能对同一家酒店判一次，
+      // 该酒店只要有任一行触及共享成员，这家酒店本单**全部**住宿行都必须一起喂给 §五闸，
+      // 未触及的行不能被漏算，也不能被下面的老前瞻路径重复算一遍（无论 touchedItemIds
+      // 是否为空都要算，下面 §3 的 stays 老前瞻要用 gatedHotelIds 排除整间酒店）。
+      const roomTypeIds = [...new Set(hotelBearingItems.map((it) => it.hotelRoomTypeId as string))];
+      const roomTypes =
+        roomTypeIds.length > 0
+          ? await tx.hotelRoomType.findMany({
+              where: { id: { in: roomTypeIds } },
+              select: { id: true, hotelId: true },
+            })
+          : [];
+      const hotelIdByRoomType = new Map(roomTypes.map((rt) => [rt.id, rt.hotelId]));
+      const itemsByHotelAll = new Map<string, typeof hotelBearingItems>();
+      for (const it of hotelBearingItems) {
+        const hotelId = hotelIdByRoomType.get(it.hotelRoomTypeId as string);
+        if (!hotelId) continue; // 房型数据异常（理论不可达：建单闸已保证 hotelRoomTypeId 有效）
+        const list = itemsByHotelAll.get(hotelId) ?? [];
+        list.push(it);
+        itemsByHotelAll.set(hotelId, list);
+      }
+      const gatedHotelIds = new Set(
+        [...itemsByHotelAll.entries()]
+          .filter(([, items]) => items.some((it) => touchedItemIds.has(it.id)))
+          .map(([hotelId]) => hotelId),
+      );
 
       if (touchedItemIds.size > 0) {
-        const touchedItems = hotelBearingItems.filter((it) => touchedItemIds.has(it.id));
-        const roomTypeIds = [...new Set(touchedItems.map((it) => it.hotelRoomTypeId as string))];
-        const roomTypes = await tx.hotelRoomType.findMany({
-          where: { id: { in: roomTypeIds } },
-          select: { id: true, hotelId: true },
-        });
-        const hotelIdByRoomType = new Map(roomTypes.map((rt) => [rt.id, rt.hotelId]));
-        const itemsByHotel = new Map<string, typeof touchedItems>();
-        for (const it of touchedItems) {
-          const hotelId = hotelIdByRoomType.get(it.hotelRoomTypeId as string);
-          if (!hotelId) continue; // 房型数据异常（理论不可达：建单闸已保证 hotelRoomTypeId 有效）
-          const list = itemsByHotel.get(hotelId) ?? [];
-          list.push(it);
-          itemsByHotel.set(hotelId, list);
-        }
         const restorePassengers = order.passengers.map((p) => ({ gender: p.gender }));
-        for (const [hotelId, items] of itemsByHotel) {
+        for (const hotelId of gatedHotelIds) {
+          const items = itemsByHotelAll.get(hotelId)!; // 该酒店本单**全部**住宿行，不只是触及的
           const hotelNightDates = [
             ...new Set(items.flatMap((it) => buildStayNightDates(it.hotelCheckIn, it.hotelCheckOut))),
           ].sort();
@@ -5831,7 +5848,7 @@ export class OrderService {
               })),
             ),
           ];
-          await assertHotelFitAfterChange(tx, hotelId, hotelNightDates, {
+          const gateViolations = await assertHotelFitAfterChange(tx, hotelId, hotelNightDates, {
             affectedOrderIds: [orderId],
             nextOrderItems: new Map([[orderId, nextItems]]),
             nextSharedRooms,
@@ -5839,6 +5856,11 @@ export class OrderService {
             // 恢复占座的共享触及行不该比未触及行更严格。
             options: { allowNonWorsening: true, maxOversellRooms: hotelOversellCapRooms },
           });
+          // N3：捕获容忍超售明细，不再丢弃——与下方 stays 闸的 hotelOversold 合并返回，
+          // 审计 hotelOversold 字段要能看到共享触及酒店的容忍明细，不能只有未触及酒店的。
+          if (gateViolations.length > 0) {
+            restoreSharedGateOversold.push({ hotelId, violations: gateViolations });
+          }
         }
         // 全部涉及酒店都过闸后，才真正落库解绑（astra finding A1/A2：落库必须在闸判定之后）。
         // N2：一份合成计划，一次 applyUnbindPlan——不再是逐份顺序应用互相覆盖。
@@ -5848,16 +5870,22 @@ export class OrderService {
       }
 
       // ── 3. 酒店 / 随机档房量闸（建单同一把带行锁的事务内闸；订单仍是取消态，本单未计入占用）──
-      // 被 §五闸接管的行（touchedItemIds）不再进这条老前瞻路径——它按份额直接前瞻，
-      // 不理解共享房跨单去重。随机档行永远不带共享成员（共享房只认真实房型），不受影响。
+      // 被 §五闸接管的酒店（gatedHotelIds）整间排除、不再进这条老前瞻路径（N3）——不能只
+      // 排除触及的那几行：同酒店未触及的行如果仍走这条不理解共享房去重的老前瞻，会与上面
+      // §五闸各自独立判定、互相看不到对方要新增的占用，合计可能超限。随机档行（无
+      // hotelRoomTypeId）恒不在 gatedHotelIds 里（共享房只认真实房型），不受影响。
       const stays: ProspectiveHotelStay[] = order.items
-        .filter(
-          (it) =>
-            (it.kind === OrderItemKind.HOTEL || it.kind === OrderItemKind.BUNDLE) &&
-            it.hotelCheckIn != null &&
-            it.hotelCheckOut != null &&
-            !touchedItemIds.has(it.id),
-        )
+        .filter((it) => {
+          if (
+            !(it.kind === OrderItemKind.HOTEL || it.kind === OrderItemKind.BUNDLE) ||
+            it.hotelCheckIn == null ||
+            it.hotelCheckOut == null
+          ) {
+            return false;
+          }
+          const hotelId = it.hotelRoomTypeId ? hotelIdByRoomType.get(it.hotelRoomTypeId) : undefined;
+          return !hotelId || !gatedHotelIds.has(hotelId);
+        })
         .map((it) => ({
           hotelRoomTypeId: it.hotelRoomTypeId,
           hotelCheckIn: it.hotelCheckIn,
@@ -5866,12 +5894,16 @@ export class OrderService {
           randomStarTier: it.randomStarTier,
         }));
       // hotelOversellCapRooms 已在本方法上面提前算好（供 §五闸复用），这里不再重复查询。
-      const hotelOversold = await assertHotelStaysFitWithinTx(
-        tx,
-        stays,
-        order.passengers.map((p) => ({ gender: p.gender ?? undefined })),
-        { maxOversellRooms: hotelOversellCapRooms },
-      );
+      // N3：与 §五闸（restoreSharedGateOversold）的容忍明细合并，不再只汇报老前瞻这一路。
+      const hotelOversold = [
+        ...restoreSharedGateOversold,
+        ...(await assertHotelStaysFitWithinTx(
+          tx,
+          stays,
+          order.passengers.map((p) => ({ gender: p.gender ?? undefined })),
+          { maxOversellRooms: hotelOversellCapRooms },
+        )),
+      ];
       const randomTierOversold = await assertRandomTierStaysFitWithinTx(tx, stays, {
         maxOversellRooms: RANDOM_TIER_INTERNAL_NO_CAP,
       });

@@ -1102,6 +1102,83 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
     expect(groupI2?.sharedRoomId).toBeUndefined();
   });
 
+  it('astra finding N3 反例：恢复时共享触及行与未触及行分别过闸，各自看到「需求 1」都通过，合计却超限', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(1); // 该酒店整段只有 1 间包房
+    // 关闭超售容忍（默认 env 缺省 3 间会把 1 间的差额悄悄放行掉，测不出两道闸各自独立
+    // 判定的问题）——房控页可调的 SystemSetting，测试库每个用例前都会被清空。
+    await prisma.systemSetting.create({ data: { key: 'hotelMaxOversellRooms', value: '0' } });
+
+    // orderX 两条行都在这唯一 1 间包房的酒店：I1 合住进共享房 R（唯一成员，恢复时一致
+    // 可保留）；I2 是普通房组，从未参与共享。
+    const orderX = await createOrderWithTwoHotelItems({
+      roomTypeIdA: roomType.id,
+      roomTypeIdB: roomType.id,
+    });
+    const [itemI1, itemI2] = orderX.items;
+
+    // I2 先落一个普通（非共享）房组，归属写清楚——跨单分房要求「首次拉进共享房时，该单
+    // 全部已有房组必须补齐 orderItemId」，此处模拟这张单一直有分房表、只是 I2 从未参与
+    // 共享（真实场景：分房编辑器手工归过位）。不给 I2 补这一组的话，I1 一旦有了共享房，
+    // I2 会因为「本单存在权威分房表却没有它的组」被 hotel-control.service.ts 判成显式
+    // 0 间（防双算的既有口径，不在本次修复范围），测不出两道闸各自独立判定的问题。
+    await prisma.order.update({
+      where: { id: orderX.id },
+      data: {
+        roomAssignment: {
+          roomGroups: [
+            {
+              id: 'plain-i2',
+              orderItemId: itemI2.id,
+              passengerIds: [orderX.passengers[1].id],
+              roomFraction: 1,
+            },
+          ],
+        },
+      },
+    });
+
+    await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              { orderId: orderX.id, orderItemId: itemI1.id, passengerIds: [orderX.passengers[0].id], roomFraction: 1 },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    // 取消 orderX：该酒店此刻没有任何其它有效订单，物理占用为 0（两条行都不计入）。
+    await prisma.order.update({ where: { id: orderX.id }, data: { status: OrderStatus.CANCELLED } });
+    expect((await getHotelNightlyRemaining(hotel.id, [CHECK_IN])).physicalRemaining).toEqual([1]);
+
+    // 恢复：I1（共享，触及）与 I2（普通，未触及）各自需要 1 间，只有 1 间包房，合计需要
+    // 2 间——必须整单一起过一次闸才能发现「合计超限」，不能拆成两道各自独立判定的闸
+    // （旧实现里两道闸各自看到「基线 0 + 自己的 1」都在 1 间以内，各自放行，最终却需要
+    // 2 间）。
+    await expect(
+      service.restoreCancelledOrder(
+        orderX.id,
+        { requestToken: randomUUID(), allowOversell: false, allowFlownLegs: false },
+        { userId: actor.userId, role: UserRole.ADMIN },
+      ),
+    ).rejects.toThrow(/实际房间不足/);
+
+    // 闸没通过 → 整单不落地：订单仍是取消态，物理占用维持 0（没有被部分写入污染）。
+    const orderAfter = await prisma.order.findUnique({ where: { id: orderX.id }, select: { status: true } });
+    expect(orderAfter?.status).toBe(OrderStatus.CANCELLED);
+    expect((await getHotelNightlyRemaining(hotel.id, [CHECK_IN])).physicalRemaining).toEqual([1]);
+  });
+
   it('astra finding A2 反例：恢复时共享房一致（保留合住）不能被当成「凭空新增一间」拒掉——只有 1 间也该放行', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(1); // 该酒店整段只有 1 间包房

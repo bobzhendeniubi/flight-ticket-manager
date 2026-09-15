@@ -416,15 +416,29 @@ export async function getSharedRoomStatesForItem(
   });
   if (owned.length === 0) return [];
 
-  const out: SharedRoomStateForItem[] = [];
+  // 按共享房去重（CRITICAL 修复 · astra finding N3）：SharedRoomMember 是按乘客建行的
+  // （@@unique([sharedRoomId, passengerId])），本行若有不止一名乘客同挂进同一间共享房，
+  // `owned` 会有同一 sharedRoomId 的多条记录——不去重会让调用方（
+  // planRestoreSharedRoomReconciliation 的 `kept`）对同一间房生成两条相同的覆盖项，
+  // 喂进 §五闸后一间房被当成两间物理房，放行本该被拦的超卖。份额按行内多名乘客累加，
+  // 代表「本行」在这间房里的总计费份额。
+  const fractionByRoom = new Map<string, number>();
   for (const m of owned) {
+    fractionByRoom.set(
+      m.sharedRoomId,
+      (fractionByRoom.get(m.sharedRoomId) ?? 0) + Number(m.roomFraction.toString()),
+    );
+  }
+
+  const out: SharedRoomStateForItem[] = [];
+  for (const sharedRoomId of fractionByRoom.keys()) {
     const room = await sharedRoomDelegate(tx)?.findUnique({
-      where: { id: m.sharedRoomId },
+      where: { id: sharedRoomId },
       select: { id: true, status: true, checkIn: true, checkOut: true },
     });
     if (!room) continue;
     const allMembers = await memberDelegate.findMany({
-      where: { sharedRoomId: m.sharedRoomId },
+      where: { sharedRoomId },
       select: { orderId: true, order: { select: { status: true, deletedAt: true } } },
     });
     const activeMemberOrderIds = [
@@ -435,11 +449,11 @@ export async function getSharedRoomStatesForItem(
       ),
     ];
     out.push({
-      sharedRoomId: m.sharedRoomId,
+      sharedRoomId,
       status: room.status,
       checkIn: room.checkIn,
       checkOut: room.checkOut,
-      roomFraction: Number(m.roomFraction.toString()),
+      roomFraction: fractionByRoom.get(sharedRoomId) ?? 0,
       activeMemberOrderIds,
     });
   }
