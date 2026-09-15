@@ -613,4 +613,26 @@ describe('PUT /orders/:id/room-assignment · 跨单分房 reconcile', () => {
     expect(res.statusCode).toBe(200);
     expect(prismaMock.tx.order.update).toHaveBeenCalled();
   });
+
+  /**
+   * 审计 after 必须与实际落库的 roomAssignment 同源（与 before 对称），不能记客户端发来的
+   * 原始 body——普通房组分支同样可能让二者不同：客户端可以夹带一个未声明的多余字段
+   * （zod 已剥离），或者（更典型地）多个普通组一起提交时，写库顺序/去重后的房组数组
+   * 形状本就和 body.roomGroups 不是同一个对象引用。用「reconcile 后写库的那份」与
+   * writeAudit 收到的 after.roomAssignment 做同一性断言，锁死这条同源关系。
+   */
+  it('审计 after.roomAssignment 记 reconcile 后落库的 finalGroups，不是客户端原始 body', async () => {
+    prismaMock.tx.order.findUnique.mockResolvedValue({ roomAssignment: null });
+    const res = await putStaff({
+      roomGroups: [{ id: 'g1', hotelName: '椰岛大酒店', roomType: '双床', passengerIds: ['p1'] }],
+    });
+    expect(res.statusCode).toBe(200);
+    const written = prismaMock.tx.order.update.mock.calls[0][0].data.roomAssignment;
+    const auditCall = (writeAudit as unknown as { mock: { calls: unknown[][] } }).mock.calls.find(
+      (c) => (c[0] as { action?: string }).action === 'UPDATE_ROOM_ASSIGNMENT',
+    );
+    expect(auditCall).toBeDefined();
+    const after = (auditCall![0] as { after: { roomAssignment: unknown } }).after;
+    expect(after.roomAssignment).toEqual(written);
+  });
 });

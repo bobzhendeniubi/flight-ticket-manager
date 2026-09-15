@@ -1483,6 +1483,10 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
     let prevRooms: number | null = null;
     let totalRooms = 0;
     let unattachedRooms = 0;
+    // 审计 after 必须与实际落库的 roomAssignment 同源（与 before 对称）——带 sharedRoomId
+    // 的旧组只许改 notes，其它字段服务端以锁后现状为准，客户端发来的原始 body 未必等于
+    // reconcile 后真正写库的那份 JSON。
+    let finalRoomAssignmentForAudit: { roomGroups: Array<Record<string, unknown>> } | null = null;
     await prisma.$transaction(async (tx) => {
       // ── 先锁 Order（§六「锁序先 Order 后酒店」）──────────────────────────
       // 读旧房组、判定共享组是否被非法改动、写新房组，全程持有本单的行锁——避免两个并发
@@ -1601,6 +1605,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         hotelItems.map((it) => it.hotelRoomType?.hotelId).filter((v): v is string => !!v),
       );
       const finalRoomAssignment = { roomGroups: finalGroups };
+      finalRoomAssignmentForAudit = finalRoomAssignment;
       // ⚠ astra A11：nextOrderItems 必须逐酒店只传该酒店自己的行——曾经把整单（跨酒店）的行
       // 一次性塞给每一家酒店，导致 A 酒店的前瞻把 B 酒店的行也算了进去，多酒店订单只改备注
       // 都会被误判超卖。每次循环内重新按 hotelId 过滤 hotelItems，且每条行都带上 hotelId
@@ -1726,7 +1731,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       targetId: id,
       targetLabel: before.orderNumber,
       before: { roomAssignment: before.roomAssignment, roomsBilled: prevRooms },
-      after: { roomAssignment: body, roomsBilled: totalRooms, warnings },
+      after: { roomAssignment: finalRoomAssignmentForAudit, roomsBilled: totalRooms, warnings },
     });
     return { ok: true, warnings };
   });
