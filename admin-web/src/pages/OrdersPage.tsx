@@ -2495,15 +2495,14 @@ export function OrdersPage() {
         succeeded: res.succeeded,
         failed: res.failed,
         failures: res.results.filter((r) => !r.ok).map((r) => ({ id: r.id, error: r.error })),
-        // notice（回包异常已生效提示）与 warnings（跨单分房自动解绑等提示，B5；当前后端
-        // /orders/batch-reschedule 还没把它透出来，字段没到时 r.warnings 是 undefined，
-        // 这里就是空数组，不影响展示）合并成同一条列表，复用 BulkResultPanel 的展示。
+        // notice（回包异常已生效提示）与 warnings（跨单分房自动解绑等提示，B5；后端恒返回
+        // 该字段，无提示为空数组）合并成同一条列表，复用 BulkResultPanel 的展示。
         notices: res.results
           .filter((r) => r.ok)
           .flatMap((r) => {
             const items: Array<{ id: string; message: string }> = [];
             if (r.notice) items.push({ id: r.id, message: r.notice });
-            for (const w of r.warnings ?? []) items.push({ id: r.id, message: w });
+            for (const w of r.warnings) items.push({ id: r.id, message: w });
             return items;
           }),
       });
@@ -9142,8 +9141,9 @@ function RescheduleForm({
   onChanged?: () => void;
   onCancel: () => void;
   /**
-   * warnings：仅纠错口径（isCorrection）会带——跨单分房自动解绑等售后副作用的按角色提示
-   * （B5）；普通改期口径（reschedulePassengers）当前不回这个字段，恒为 undefined。
+   * warnings：跨单分房自动解绑等售后副作用的按角色提示（B5）——纠错口径
+   * （correctFlightSchedule）与普通改期口径（reschedulePassengers）后端都恒返回该字段
+   * （无提示为空数组）；这里仍留可选，只是为了兜住老调用方/异常路径没传的情况。
    */
   onSaved: (order: OrderSummary, warnings?: string[]) => void;
   /** 已拆单但改期未成功：只刷新源单数据，不关闭表单（红字提示要留着让运营看见新单号） */

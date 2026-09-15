@@ -3963,12 +3963,8 @@ export interface ReschedulePassengersResult {
   order: OrderSummary;
   newOrder: OrderSummary | null;
   splitPerformed: boolean;
-  /**
-   * 跨单分房自动解绑等提示（B5）。后端当前把它嵌在 audit.reschedule.warnings 里，顶层
-   * 还没提上来（另一路修复批在补，字段名对齐 warnings）——这里先声明为可选，字段没到时
-   * 前端只是不展示，不报错，同 batchRescheduleOrders().results[].warnings 同款兜底。
-   */
-  warnings?: string[];
+  /** 跨单分房自动解绑等提示（B5）：后端已从 audit.reschedule.warnings 提到顶层，恒返回（无提示为空数组）。 */
+  warnings: string[];
 }
 
 // ── 取消航段（ADMIN/STAFF）───────────────────────────────────────────────
@@ -5402,16 +5398,16 @@ export const api = {
     apiFetch<{
       succeeded: number;
       failed: number;
-      // warnings：逐单跨单分房自动解绑等提示（B5）。当前后端 /orders/batch-reschedule 路由
-      // 还把整个 audit（含 warnings）剥掉再回包（另一路修复批在补，字段名对齐 warnings）——
-      // 这里先把类型声明为可选，字段没到时前端只是不展示，不报错。
+      // warnings：逐单跨单分房自动解绑等提示（B5）。/orders/batch-reschedule 路由裁掉 audit
+      // 时显式保留了这个字段（audit.warnings 已提到 result 顶层），每条结果恒返回（无提示为
+      // 空数组，包括失败的那条）。
       results: Array<{
         id: string;
         orderNumber?: string;
         ok: boolean;
         error?: string;
         notice?: string;
-        warnings?: string[];
+        warnings: string[];
       }>;
     }>('/orders/batch-reschedule', {
       method: 'POST',
