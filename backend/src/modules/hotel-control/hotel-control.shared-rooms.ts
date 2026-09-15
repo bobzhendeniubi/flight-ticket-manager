@@ -986,6 +986,16 @@ async function saveSharedRoomsInner(
         if (!byOrderItem.has(key)) byOrderItem.set(key, entry);
       }
       for (const entry of byOrderItem.values()) {
+        // 只承接本次没有被其它目标房认领走的成员（astra B-N2，回归修复）：解散 S 的同时
+        // 把 S 的某个成员重新分到本次请求里另一间房 T（body.rooms 里某个 group 认领了
+        // 同一个乘客），下面「新建/更新的共享房」那一段会给这个乘客在同一 (orderId,
+        // orderItemId) 上再追加一个指向 T 的共享组——如果这里不过滤，这个乘客会同时落在
+        // 一个普通组（这里退回的）和一个共享组（T 的）里，两边的 roomFraction 在下面
+        // roomsBilled 回写时按 orderItemId 累加，行级计费份额直接翻倍。反例：A 原在 S
+        // （fraction 1），S 被解散同时 A 被拖进 T（fraction 1）——A 最终应该只在 T，
+        // roomsBilled 仍是 1，不是 2。
+        const survivors = entry.passengerIds.filter((pid) => !seenPassengerIds.has(pid));
+        if (survivors.length === 0) continue; // 这一行的乘客全部被本次请求重新认领，不留普通组残留
         const arr = newGroupsByOrder.get(entry.orderId) ?? [];
         const preserveKey = `${roomId}:${entry.orderId}:${entry.orderItemId}`;
         const preservedNotes = preservedGroupNotes.get(preserveKey);
@@ -997,9 +1007,9 @@ async function saveSharedRoomsInner(
           id: groupId,
           hotelName: '',
           roomType: '',
-          passengerIds: entry.passengerIds,
+          passengerIds: survivors,
           orderItemId: entry.orderItemId,
-          roomFraction: entry.fraction,
+          roomFraction: entry.fraction, // 保留原份额，不重新分配（部分乘客被认领走不重算剩余份额）
           ...(preservedNotes != null ? { notes: preservedNotes } : {}),
         });
         newGroupsByOrder.set(entry.orderId, arr);
