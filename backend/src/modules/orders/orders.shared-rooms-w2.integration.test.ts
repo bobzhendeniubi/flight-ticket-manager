@@ -1622,6 +1622,78 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
     expect((await getHotelNightlyRemaining(hotel.id, [CHECK_IN])).physicalRemaining).toEqual([0]);
   });
 
+  it('M1 反例：同一单两条行挂同一间共享房，恢复时覆盖项按 sharedRoomId 去重，物理 1 间不被误判成 2 间而拒', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(1); // 该酒店整段只有 1 间包房
+    // 同一张单两条酒店行（§三 未禁止），各出 0.5 份额，一起合住同一间共享房。
+    const orderX = await createOrderWithTwoHotelItems({
+      roomTypeIdA: roomType.id,
+      roomTypeIdB: roomType.id,
+    });
+
+    const saved = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderX.id,
+                orderItemId: orderX.items[0].id,
+                passengerIds: [orderX.passengers[0].id],
+                roomFraction: 0.5,
+              },
+              {
+                orderId: orderX.id,
+                orderItemId: orderX.items[1].id,
+                passengerIds: [orderX.passengers[1].id],
+                roomFraction: 0.5,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    await prisma.order.update({ where: { id: orderX.id }, data: { status: OrderStatus.CANCELLED } });
+
+    // 强制零容忍超售：默认超售容忍额度（env 缺省 3 间）会把「误算成 2 间、block 只有 1
+    // 间」的 1 间缺口悄悄吃掉不报错，掩盖这条反例要测的东西——必须零容忍才能让重复覆盖项
+    // 的 bug 如实体现为拒绝。
+    await prisma.systemSetting.upsert({
+      where: { key: 'hotelMaxOversellRooms' },
+      update: { value: '0' },
+      create: { key: 'hotelMaxOversellRooms', value: '0' },
+    });
+
+    // 恢复时两条行都仍一致（保留合住），reconciliationPlan.kept 会按行各生成一条覆盖项——
+    // 同一间共享房因此被喂两条。旧实现逐条 add() 会把这间房算成 2 间，block 只有 1 间会
+    // 被误拒；修复后按 sharedRoomId 去重只算 1 间，理应成功。
+    await expect(
+      service.restoreCancelledOrder(
+        orderX.id,
+        { requestToken: randomUUID(), allowOversell: false, allowFlownLegs: false },
+        { userId: actor.userId, role: UserRole.ADMIN },
+      ),
+    ).resolves.toBeDefined();
+
+    // 两条行仍是同一间共享房的成员，没有被误判触发解绑。
+    const members = await prisma.sharedRoomMember.findMany({
+      where: { sharedRoomId: saved.rooms[0].sharedRoomId },
+    });
+    expect(members.map((m) => m.orderItemId).sort()).toEqual(
+      [orderX.items[0].id, orderX.items[1].id].sort(),
+    );
+    // 恢复后物理占用仍是去重后的 1 间（不是被误算成两间）。
+    expect((await getHotelNightlyRemaining(hotel.id, [CHECK_IN])).physicalRemaining).toEqual([0]);
+  });
+
   it('astra finding A7 ①②③④ 反例：混合共享房组手工拆单——份额留源单、不写 splitPairKey、成员表不翻倍', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4);

@@ -1743,7 +1743,41 @@ async function computeSharedRoomPhysicalAfterChange(
       if (hasValidMember) add(row.checkIn, row.checkOut);
     }
   }
+  // M1 修复：调用方可能对同一间共享房喂进不止一条覆盖项——例如恢复路径按订单行
+  // flatMap（`orders.service.ts` 的 `nextSharedRooms`），同一张单两条酒店行同时挂在
+  // 同一间共享房时会各自 push 一条。astra N3 的修复只解决了「同一 item 内多名乘客生成
+  // 多条」，跨 item 没去重：逐条 add() 会把这间房的物理占用算两次，`allowNonWorsening`
+  // 下可能把本该放行的操作误判成「变差」而拒绝，或吃掉一份不该吃的超售容忍额度。
+  // 这是聚合器自己的不变量，不该指望每个调用方各自记得去重——在这里按 sharedRoomId
+  // 做最后一道合并（没有 sharedRoomId 的全新建房间各自独立，不参与合并）；同一间房的两条
+  // 覆盖项 checkIn/checkOut 不一致说明调用方逻辑有误，直接抛错而不是悄悄各信一半。
+  const mergedBySharedRoomId = new Map<string, SharedRoomAfterState>();
+  const standaloneOverrides: SharedRoomAfterState[] = [];
   for (const o of scopedOverrides) {
+    if (!o.sharedRoomId) {
+      standaloneOverrides.push(o);
+      continue;
+    }
+    const existing = mergedBySharedRoomId.get(o.sharedRoomId);
+    if (!existing) {
+      mergedBySharedRoomId.set(o.sharedRoomId, o);
+      continue;
+    }
+    if (
+      existing.checkIn.getTime() !== o.checkIn.getTime() ||
+      existing.checkOut.getTime() !== o.checkOut.getTime()
+    ) {
+      throw new Error(
+        `共享房 ${o.sharedRoomId} 的覆盖项入住/退房区间不一致（${fmtDateOnly(existing.checkIn)}~${fmtDateOnly(existing.checkOut)} vs ${fmtDateOnly(o.checkIn)}~${fmtDateOnly(o.checkOut)}），调用方逻辑有误`,
+      );
+    }
+    mergedBySharedRoomId.set(o.sharedRoomId, {
+      ...existing,
+      activeMemberOrderIds: [...new Set([...existing.activeMemberOrderIds, ...o.activeMemberOrderIds])],
+    });
+  }
+  const dedupedOverrides = [...mergedBySharedRoomId.values(), ...standaloneOverrides];
+  for (const o of dedupedOverrides) {
     if (o.activeMemberOrderIds.length > 0) add(o.checkIn, o.checkOut);
   }
   return out;
