@@ -22,7 +22,7 @@ import { describe, it, expect, afterEach } from 'vitest';
 import { OrderItemKind, OrderStatus, Prisma, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { saveSharedRooms, getSharedRoomWorkbench } from './hotel-control.shared-rooms.js';
-import { getHotelNightlyRemaining } from './hotel-control.service.js';
+import { getHotelNightlyRemaining, getAlerts } from './hotel-control.service.js';
 import { serializeRoomGroupsFor } from '../orders/room-group-dto.js';
 import { canonicalJson } from '../../lib/canonical-json.js';
 
@@ -1980,6 +1980,139 @@ describe('saveSharedRooms · 真 DB E2E · 隐式触及旧共享房的清理（a
     expect(bGroupInOldRoom?.roomFraction).toBe(0); // 保留原份额，不重新分配
     const bItemAfter = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderB.items[0].id } });
     expect(Number(bItemAfter.roomsBilled)).toBe(0); // 与 JSON 组的 roomFraction 口径一致，不是被清空
+
+    // H1 修复：旧房 S 摘除 A 之后只剩 B 一人、份额合计仍是 0（原计费方 A 已迁出）——
+    // 这不该悄无声息：响应 warnings 必须明示，orderB 的逐单审计 after 也要带同一条提示
+    // （不止响应这一处，翻旧账也要看得到），不能像旧实现那样连一句提示都没有。
+    expect(result.warnings.some((w) => w.includes(oldRoomId) && w.includes('原计费方已迁出'))).toBe(true);
+    const auditB = await prisma.auditLog.findFirst({
+      where: { action: 'UPDATE_ROOM_ASSIGNMENT', targetId: orderB.id },
+      orderBy: { createdAt: 'desc' },
+    });
+    expect(auditB).not.toBeNull();
+    const afterB = auditB?.after as { orphanedSharedRoomWarnings?: string[] };
+    expect(afterB.orphanedSharedRoomWarnings?.some((w) => w.includes(oldRoomId))).toBe(true);
+
+    // 房控看板：这间房 ACTIVE 且唯一有效成员份额为 0，getAlerts 的 sharedRoomOrphaned
+    // 必须能看到它（H1③，不依赖「主单被取消」这个更窄的成因）。
+    const alerts = await getAlerts(30);
+    const orphanAlert = alerts.sharedRoomOrphaned.find((o) => o.sharedRoomId === oldRoomId);
+    expect(orphanAlert).toBeDefined();
+    expect(orphanAlert?.memberOrderNumbers).toEqual([orderB.orderNumber]);
+  });
+
+  it('H1④ 反例：既有房 Σ份额=0 且原样重提（只是留守成员，不是新增/改动）→ 放行 + warning，不是 400', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderC = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    // 旧共享房 S：A(1) + B(0)。
+    const created = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const oldRoomId = created.rooms[0].sharedRoomId;
+
+    // 隐式挪走 A（新请求只提 A 拉进新房，不点名 S）——S 落库只剩 B、Σ=0。
+    await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderC.id,
+                orderItemId: orderC.items[0].id,
+                passengerIds: [orderC.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    const sBefore = await prisma.sharedRoom.findUniqueOrThrow({ where: { id: oldRoomId } });
+    expect(sBefore.status).toBe('ACTIVE'); // 仍剩 B 一人，不会被自动解散
+
+    // 前端（或运营）把 S 明确列进 body.rooms 原样重提（只有 B，roomFraction 仍是 0，
+    // 与落库现状完全一致——不是新增/改动）：H1④ 要求放行，不是 Σ≠1 的 400。
+    const resubmit = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        expectedVersions: { [oldRoomId]: sBefore.version },
+        rooms: [
+          {
+            sharedRoomId: oldRoomId,
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    expect(resubmit.rooms[0].sharedRoomId).toBe(oldRoomId);
+    expect(
+      resubmit.warnings.some((w) => w.includes(oldRoomId) && w.includes('原计费方已迁出')),
+    ).toBe(true);
+
+    const sAfter = await prisma.sharedRoom.findUniqueOrThrow({
+      where: { id: oldRoomId },
+      include: { members: true },
+    });
+    expect(sAfter.status).toBe('ACTIVE');
+    expect(sAfter.members).toHaveLength(1);
+    expect(sAfter.members[0]!.orderId).toBe(orderB.id);
   });
 
   it('旧共享房只剩这一名乘客：拽走后旧房自动 DISSOLVED，不留零成员的幽灵房', async () => {

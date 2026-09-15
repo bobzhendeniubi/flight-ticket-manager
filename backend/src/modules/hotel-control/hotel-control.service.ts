@@ -2413,10 +2413,12 @@ export interface HotelControlAlerts {
     sharedHalfCount: number; // 当晚拼房客总人数（触发条件是落单数 > 0）
   }>;
   /**
-   * 共享房（跨单分房）里，唯一还占着物理房的成员全是 0 份额——即「掏钱那张单」被取消 /
-   * 退款 / 软删了，剩下白住的一方（§八「取消 / 退款 / 软删」）。物理口径仍占 1 间
-   * （不看份额，见 computeSharedRoomPhysicalByDate），但这是运营该去核对的异常状态：
-   * 白住方要不要补钱、还是该解绑腾出这间房。
+   * 共享房（跨单分房）ACTIVE 且有效成员的计费份额合计为 0——不只是「掏钱那张单」被取消 /
+   * 退款 / 软删了（§八「取消 / 退款 / 软删」），也覆盖 H1 口径：原计费方被工作台改指到
+   * 别的房间、旧房只剩 0 份额成员留守（跨单分房保存时已给 warning + 审计，这里是常态化
+   * 的看板兜底，不依赖运营记得当时那条 warning）。物理口径仍占 1 间（不看份额，见
+   * computeSharedRoomPhysicalByDate），但这是运营该去核对的异常状态：白住方要不要补钱、
+   * 还是该解绑腾出这间房。
    */
   sharedRoomOrphaned: Array<{
     sharedRoomId: string;
@@ -2588,7 +2590,7 @@ export async function getAlerts(
     });
   });
 
-  // ── 共享房「主单已取消」告警（§八「取消 / 退款 / 软删」）───────────────────────
+  // ── 共享房「Σ有效份额=0」告警（H1；覆盖 §八「取消 / 退款 / 软删」与隐式迁出留守两种成因）──
   // 窗口与销控板同一段 [today, to]：checkIn <= to 且 checkOut > today 才算与本次告警相关。
   // 防御式：单测常用手搭的 mock client 没有 sharedRoom 时回落「本次没有共享房」，与
   // computeSharedRoomPhysicalByDate 的兜底同哲学。
