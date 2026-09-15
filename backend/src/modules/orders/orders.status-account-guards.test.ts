@@ -61,6 +61,10 @@ vi.mock('../hotel-control/hotel-control.service.js', () => ({
   getRandomTierAggregate: vi.fn(),
   lockHotelBlockPeriodsWithinTx: vi.fn(),
   randomStarTierLabel: vi.fn(),
+  // M5 修复：assertRestoreHotelCapacity 改用这两个函数加锁——桩与真模块导出对齐，
+  // 少一个键会炸成 "not a function"。
+  lockHotelInventoryForUpdate: vi.fn(),
+  lockRandomTierInventoryForUpdate: vi.fn(),
 }));
 
 import { OrderService, type OrderRequester } from './orders.service.js';

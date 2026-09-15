@@ -191,6 +191,10 @@ export async function planUnbindMany(
 
   // 防御式：单测常用手搭的 mock tx（只 mock 用到的 delegate）没有 sharedRoomMember 时回落
   // 「本次没有共享成员」而不是炸——与 computeSharedRoomPhysicalByDate 的 sharedRoom 兜底同哲学。
+  // ⚠ L5：生产 tx 必有 sharedRoomMember delegate，这条回落只为迁就 mock 单测。这里回落成
+  // 「没有共享成员」意味着解绑计划直接判空——不会主动放行超卖，但会让本该触发的解绑/
+  // §五闸判定悄悄被跳过，同属「库存/合住闸拿不到数据就假装无事」的危险方向，不该长期
+  // 依赖；生产客户端缺 delegate 时理应直接抛错。
   const memberDelegate = sharedRoomMemberDelegate(tx);
   if (!memberDelegate) return empty;
   const itemIdSet = new Set(orderItemIds);

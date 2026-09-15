@@ -546,6 +546,175 @@ describe('OrderService.rescheduleOrderItem · 真 DB E2E', () => {
     expect((await getHotelNightlyRemaining(hotel.id, ['2026-09-05'])).physicalRemaining).toEqual([0]);
   });
 
+  it('C1 反例：机票改期连带平移酒店日期二次触发，解绑留下的 0 份额普通组必须按 1 间占用判定，不能放行到已订满的新区间', async () => {
+    const actor = await adminActor();
+    const from = await createScheduleWithSeats({ cabin: CabinClass.ECONOMY, departureHoursFromNow: 300 });
+    const to1 = await createScheduleWithSeats({ cabin: CabinClass.ECONOMY, departureHoursFromNow: 204 }); // -4 天
+    const to2 = await createScheduleWithSeats({ cabin: CabinClass.ECONOMY, departureHoursFromNow: 108 }); // 再 -4 天
+
+    const hotel = await prisma.hotel.create({
+      data: { name: uniq('测试酒店'), cityCode: 'DAD', address: 'Test Rd 1', starRating: 4, isActive: true },
+    });
+    const roomType = await prisma.hotelRoomType.create({
+      data: { hotelId: hotel.id, name: '标准房', capacity: 2, basePrice: new Prisma.Decimal(500) },
+    });
+    // 单一宽区间覆盖三段目标日期，每晚 1 间（口径同上一条 astra A1/A2 用例）。
+    await prisma.hotelBlockPeriod.create({
+      data: {
+        hotelId: hotel.id,
+        dateFrom: new Date('2026-08-01T00:00:00.000Z'),
+        dateTo: new Date('2026-09-30T00:00:00.000Z'),
+        rooms: 1,
+      },
+    });
+
+    const orderA = await createPaidFlightOrder({ scheduleId: from.schedule.id, cabin: CabinClass.ECONOMY });
+    const hotelItemA = await prisma.orderItem.create({
+      data: {
+        orderId: orderA.id,
+        kind: OrderItemKind.HOTEL,
+        description: `${hotel.name} · 标准房 · 2026-09-05~2026-09-06 · 1晚 × 1间`,
+        quantity: 1,
+        unitPrice: new Prisma.Decimal(500),
+        amount: new Prisma.Decimal(500),
+        hotelRoomTypeId: roomType.id,
+        hotelCheckIn: new Date('2026-09-05T00:00:00.000Z'),
+        hotelCheckOut: new Date('2026-09-06T00:00:00.000Z'),
+        roomsBilled: new Prisma.Decimal(0), // 0 份额——真正付钱占房的是 orderB
+      },
+    });
+    const orderB = await prisma.order.create({
+      data: {
+        orderNumber: uniq('ORD'),
+        status: OrderStatus.PAID,
+        subtotal: new Prisma.Decimal(500),
+        total: new Prisma.Decimal(500),
+        paidAmount: new Prisma.Decimal(500),
+        contactName: 'Test User B',
+        contactPhone: '13900139000',
+        items: {
+          create: [
+            {
+              kind: OrderItemKind.HOTEL,
+              description: `${hotel.name} · 标准房 · 2026-09-05~2026-09-06 · 1晚 × 1间`,
+              quantity: 1,
+              unitPrice: new Prisma.Decimal(500),
+              amount: new Prisma.Decimal(500),
+              hotelRoomTypeId: roomType.id,
+              hotelCheckIn: new Date('2026-09-05T00:00:00.000Z'),
+              hotelCheckOut: new Date('2026-09-06T00:00:00.000Z'),
+              roomsBilled: new Prisma.Decimal(1),
+            },
+          ],
+        },
+        passengers: {
+          create: [
+            {
+              fullName: 'LI SI',
+              lastName: 'LI',
+              firstName: 'SI',
+              documentType: 'PASSPORT',
+              documentNumber: uniq('P'),
+              dateOfBirth: new Date('1990-01-01'),
+              nationality: 'CHN',
+            },
+          ],
+        },
+      },
+      include: { items: true, passengers: true },
+    });
+
+    const { saveSharedRooms } = await import('../hotel-control/hotel-control.shared-rooms.js');
+    await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: '2026-09-05',
+        checkOut: '2026-09-06',
+        requestToken: uniq('req'),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderA.id,
+                orderItemId: hotelItemA.id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    // 第一次机票改期（-4 天）：orderA 的 0 份额行解绑后 floor 回 1 间落到新区间（9/1），
+    // orderB 仍占旧区间（9/5）——两段各 1 间，均打平，理应成功（同上一条 astra 用例）。
+    await service.rescheduleOrderItem(
+      orderA.id,
+      { orderItemId: orderA.items[0].id, newScheduleId: to1.schedule.id },
+      actor,
+    );
+    const afterFirst = await prisma.orderItem.findUniqueOrThrow({ where: { id: hotelItemA.id } });
+    expect(afterFirst.hotelCheckIn).toEqual(new Date('2026-09-01T00:00:00.000Z'));
+    const stillMemberA = await prisma.sharedRoomMember.findMany({
+      where: { orderId: orderA.id, orderItemId: hotelItemA.id },
+    });
+    expect(stillMemberA).toHaveLength(0); // 已解绑，不再是共享成员
+
+    // 目标区间（8/28~8/29）唯一的 1 间被另一张不相干的单订满。
+    await prisma.order.create({
+      data: {
+        orderNumber: uniq('ORD'),
+        status: OrderStatus.PAID,
+        subtotal: new Prisma.Decimal(500),
+        total: new Prisma.Decimal(500),
+        paidAmount: new Prisma.Decimal(500),
+        contactName: 'Test User C',
+        contactPhone: '13700137000',
+        items: {
+          create: [
+            {
+              kind: OrderItemKind.HOTEL,
+              description: `${hotel.name} · 标准房 · 2026-08-28~2026-08-29 · 1晚 × 1间`,
+              quantity: 1,
+              unitPrice: new Prisma.Decimal(500),
+              amount: new Prisma.Decimal(500),
+              hotelRoomTypeId: roomType.id,
+              hotelCheckIn: new Date('2026-08-28T00:00:00.000Z'),
+              hotelCheckOut: new Date('2026-08-29T00:00:00.000Z'),
+              roomsBilled: new Prisma.Decimal(1),
+            },
+          ],
+        },
+      },
+    });
+
+    // C1 反例：第二次机票改期（再 -4 天）触发平移，此时 orderA 这一行已没有活跃
+    // SharedRoomMember，落到老式 prospective-add 前瞻（ungatedShifted）——显式 0 若被译成
+    // 0 间需求，会对目标区间已订满视而不见、放行确定性超卖；修复后必须按 1 间占用判定并拒绝。
+    await expect(
+      service.rescheduleOrderItem(
+        orderA.id,
+        { orderItemId: orderA.items[0].id, newScheduleId: to2.schedule.id },
+        actor,
+      ),
+    ).rejects.toThrow();
+
+    // 拒绝后不能错误落库：hotelItemA 仍在第一次改期后的区间（9/1），机票也仍是 to1。
+    const finalHotelItem = await prisma.orderItem.findUniqueOrThrow({ where: { id: hotelItemA.id } });
+    expect(finalHotelItem.hotelCheckIn).toEqual(new Date('2026-09-01T00:00:00.000Z'));
+    const finalFlightItem = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderA.items[0].id } });
+    expect(finalFlightItem.flightScheduleId).toBe(to1.schedule.id);
+  });
+
   it('改期到「售罄」新班次 → 抛错 AND 旧座保持原样（无泄漏、无超售）', async () => {
     const actor = await adminActor();
     const from = await createScheduleWithSeats({ cabin: CabinClass.ECONOMY, capacity: 50, sold: 1 });

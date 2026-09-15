@@ -294,6 +294,12 @@ interface OrderRoomAssignmentAuditPayload {
   afterRoomsBilled: Record<string, number>;
   /** sharedRoomId → 同房其它订单号（本单参与的每一间共享房各一条）。*/
   sharedRooms: Record<string, string[]>;
+  /**
+   * H1 修复：本单本次受「共享房 Σ有效份额=0」影响的提示（②——逐单审计 after 带这条，
+   * 不止响应 warnings 一处）。没有命中时不带这个字段（避免给绝大多数正常保存的审计记录
+   * 添噪音）。
+   */
+  orphanedSharedRoomWarnings?: string[];
 }
 
 /** 一次事务内的订单快照（锁后重读）。*/
@@ -809,6 +815,17 @@ async function saveSharedRoomsInner(
     // ── §七 400 语义校验 ──────────────────────────────────────────────────
     const seenPassengerIds = new Set<string>();
     const warnings: string[] = [];
+    // H1 修复：一间共享房「Σ有效份额=0」（原计费方已迁出，剩下的都是 0 份额留守成员，物理
+    // 仍占 1 间、金额未重算）——既有房显式重提的情形（④，下面 Σ=1 校验里判定）与隐式触及
+    // 旧房的情形（下面留守镜像重建之后判定）都会往这两个集合里记，最后统一转成 warnings
+    // 并附到相关订单的审计 after 里（②），不再悄无声息。
+    const orphanedLeftoverRoomIds = new Set<string>();
+    const orphanWarningsByOrderId = new Map<string, string[]>();
+    const pushOrphanWarning = (sharedRoomId: string, survivorOrderNumbers: readonly string[]): void => {
+      const who = survivorOrderNumbers.length > 0 ? survivorOrderNumbers.join('、') : '剩余成员';
+      const message = `共享房 ${sharedRoomId} 原计费方已迁出，${who} 计费 0 间，物理仍占 1 间，金额未重算。`;
+      warnings.push(message);
+    };
     for (const room of body.rooms) {
       const roomType = await tx.hotelRoomType.findUnique({
         where: { id: room.hotelRoomTypeId },
@@ -886,7 +903,34 @@ async function saveSharedRoomsInner(
         [...fractionByOrderItem.values()].reduce((s, f) => s + f, 0),
       );
       if (totalFraction !== 1) {
-        throw new BadRequestError(`房间「${room.hotelRoomTypeId}」的计费份额合计须为 1，当前为 ${totalFraction}`);
+        // H1 修复 · 拍板 5(b)④：既有房（room.sharedRoomId 有值）若 Σ份额=0 且本次提交的
+        // 每个成员组都与落库现状一模一样（isUnchangedMember——不是新增/改动，只是把「原计费
+        // 方已迁出、剩下的都是 0 份额留守成员」这个既成事实原样交回来），不当 400 拦：
+        // 运营手上拿到的就是这间房的当前真实状态，硬拒没有可操作的出路（把它拖进 dissolve
+        // 也不对——房间物理仍在占用，见下方 orphanedLeftoverRoomIds 的 warning）。其余情形
+        // （Σ 是其它非 1 值、或有改动）一律照旧硬闸。
+        const isLeftoverOnlyResubmit =
+          room.sharedRoomId != null &&
+          totalFraction === 0 &&
+          room.groups.length > 0 &&
+          room.groups.every((g) => isUnchangedMember(room.sharedRoomId, g));
+        if (!isLeftoverOnlyResubmit) {
+          throw new BadRequestError(`房间「${room.hotelRoomTypeId}」的计费份额合计须为 1，当前为 ${totalFraction}`);
+        }
+        orphanedLeftoverRoomIds.add(room.sharedRoomId!);
+        const survivorOrderIds = [...new Set(room.groups.map((g) => g.orderId))];
+        const survivorOrderNumbers = survivorOrderIds
+          .map((oid) => orders.get(oid)?.orderNumber)
+          .filter((v): v is string => !!v)
+          .sort();
+        pushOrphanWarning(room.sharedRoomId!, survivorOrderNumbers);
+        for (const oid of survivorOrderIds) {
+          const list = orphanWarningsByOrderId.get(oid) ?? [];
+          list.push(
+            `共享房 ${room.sharedRoomId!} 原计费方已迁出，本单剩余计费 0 间，物理仍占 1 间，金额未重算。`,
+          );
+          orphanWarningsByOrderId.set(oid, list);
+        }
       }
       if (roomType.capacity > 0 && totalPassengers > roomType.capacity) {
         warnings.push(
@@ -1036,11 +1080,20 @@ async function saveSharedRoomsInner(
     for (const roomId of implicitRoomIds) {
       const membersByItem = currentMembersByRoom.get(roomId);
       if (!membersByItem) continue;
+      // H1 修复：这间房本次没被点名，只是被动留守——统计留守方的 Σ份额，摘完之后如果这
+      // 间房仍有留守成员但份额合计是 0（原计费方被这次请求拖进了别的房），物理仍占 1 间、
+      // 却没有任何人计费，必须提示（①②），不能像旧实现那样悄无声息。
+      let survivorTotalFraction = 0;
+      let hasSurvivors = false;
+      const survivorOrderIdsForRoom = new Set<string>();
       for (const [itemKey, entry] of membersByItem) {
         const survivors = [...entry.passengerIds].filter((pid) => !seenPassengerIds.has(pid));
         if (survivors.length === 0) continue; // 这一行的乘客本次全部被认领走，不重建
         const [survivorOrderId, survivorItemId] = itemKey.split(':');
         if (!survivorOrderId || !survivorItemId) continue; // 防御：key 格式不对就跳过，不该发生
+        hasSurvivors = true;
+        survivorTotalFraction = roundFraction(survivorTotalFraction + entry.fraction);
+        survivorOrderIdsForRoom.add(survivorOrderId);
         const arr = newGroupsByOrder.get(survivorOrderId) ?? [];
         const preserveKey = `${roomId}:${survivorOrderId}:${survivorItemId}`;
         const preservedNotes = preservedGroupNotes.get(preserveKey);
@@ -1056,6 +1109,21 @@ async function saveSharedRoomsInner(
           ...(preservedNotes != null ? { notes: preservedNotes } : {}),
         });
         newGroupsByOrder.set(survivorOrderId, arr);
+      }
+      if (hasSurvivors && survivorTotalFraction === 0) {
+        orphanedLeftoverRoomIds.add(roomId);
+        const survivorOrderNumbers = [...survivorOrderIdsForRoom]
+          .map((oid) => orders.get(oid)?.orderNumber)
+          .filter((v): v is string => !!v)
+          .sort();
+        pushOrphanWarning(roomId, survivorOrderNumbers);
+        for (const oid of survivorOrderIdsForRoom) {
+          const list = orphanWarningsByOrderId.get(oid) ?? [];
+          list.push(
+            `共享房 ${roomId} 原计费方已迁出，本单剩余计费 0 间，物理仍占 1 间，金额未重算。`,
+          );
+          orphanWarningsByOrderId.set(oid, list);
+        }
       }
     }
     // 新建/更新的共享房：给每个 group 所在订单追加一个共享房组。
@@ -1256,6 +1324,33 @@ async function saveSharedRoomsInner(
           select: { id: true, version: true },
         });
         savedRooms.push({ sharedRoomId: updated.id, version: updated.version });
+        // M6 修复：本函数的更新语义是「listed 决定最终成员」（下面 deleteMany 后按
+        // room.groups 重建）——客户端提交一间既有房时若漏掉某个成员的 group（不管是手滑
+        // 还是前端渲染漏了），这个人会被静默摘出成员表、不报错也不 warning，运营完全看
+        // 不出这次保存"顺手"把谁踢出去了。落库前比一次「现状成员 − 本次 listed 成员」，
+        // 差集非空就进 warnings，把「移除」变成看得见的事实（不阻断——这本就是端点的
+        // 合法语义，只是不能悄无声息）。
+        const listedPassengerIds = new Set(room.groups.flatMap((g) => g.passengerIds));
+        const removedByOrderId = new Map<string, number>();
+        for (const [itemKey, entry] of currentMembersByRoom.get(sharedRoomId) ?? []) {
+          const ownerOrderId = itemKey.split(':')[0];
+          if (!ownerOrderId) continue; // 防御：key 格式不对就跳过，不该发生
+          for (const pid of entry.passengerIds) {
+            if (listedPassengerIds.has(pid)) continue;
+            removedByOrderId.set(ownerOrderId, (removedByOrderId.get(ownerOrderId) ?? 0) + 1);
+          }
+        }
+        if (removedByOrderId.size > 0) {
+          const removedCount = [...removedByOrderId.values()].reduce((s, n) => s + n, 0);
+          const removedOrderNumbers = [...removedByOrderId.keys()]
+            .map((oid) => orders.get(oid)?.orderNumber)
+            .filter((v): v is string => !!v)
+            .sort();
+          warnings.push(
+            `已从共享房 ${sharedRoomId} 移除 ${removedCount} 名成员：${removedOrderNumbers.join('、') || '未知订单'}` +
+              '（本次保存未列出，按当前语义视为移出，请确认）。',
+          );
+        }
         await tx.sharedRoomMember.deleteMany({ where: { sharedRoomId } });
       } else {
         const created = await tx.sharedRoom.create({
@@ -1348,6 +1443,7 @@ async function saveSharedRoomsInner(
         coMemberOrderNumbersBySharedRoomId[sid] = otherOrders.map((o) => o.orderNumber);
       }
 
+      const orphanWarningsForOrder = orphanWarningsByOrderId.get(orderId);
       const auditPayload: OrderRoomAssignmentAuditPayload = {
         orderId,
         orderNumber: order.orderNumber,
@@ -1358,6 +1454,11 @@ async function saveSharedRoomsInner(
         afterRoomAssignment: { roomGroups: groups },
         afterRoomsBilled,
         sharedRooms: coMemberOrderNumbersBySharedRoomId,
+        // H1 修复（②）：本单若受共享房 Σ份额=0 影响，逐单审计 after 也带这条，不止响应
+        // warnings 一处——事后查审计的人不该只能靠翻当时的接口响应才看得到。
+        ...(orphanWarningsForOrder && orphanWarningsForOrder.length > 0
+          ? { orphanedSharedRoomWarnings: orphanWarningsForOrder }
+          : {}),
       };
       orderAuditPayloads.push(auditPayload);
       await writeAuditWithinTx(tx, {
@@ -1371,6 +1472,9 @@ async function saveSharedRoomsInner(
           roomAssignment: auditPayload.afterRoomAssignment,
           roomsBilled: auditPayload.afterRoomsBilled,
           sharedRooms: auditPayload.sharedRooms,
+          ...(auditPayload.orphanedSharedRoomWarnings
+            ? { orphanedSharedRoomWarnings: auditPayload.orphanedSharedRoomWarnings }
+            : {}),
         },
       });
     }

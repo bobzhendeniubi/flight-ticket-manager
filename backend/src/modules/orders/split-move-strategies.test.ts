@@ -634,6 +634,49 @@ describe('住宿行劈半 · 配对键（房控据此把跨单的两个半间配
     expect(plan.keep.metadata).toBeUndefined();
     expect((plan.move.metadata as Record<string, unknown>).splitPairKey).toBeUndefined();
   });
+
+  // L2 修复：moveBundle 与 moveHotel 口径对齐——挂共享组的行不写 splitPairKey。
+  const bundleRowForPairKey = () =>
+    item({
+      id: 'ib',
+      kind: OrderItemKind.BUNDLE,
+      quantity: 1,
+      unitPrice: 8000,
+      amount: 30000,
+      totalCostCny: 21000,
+      roomsBilled: 2,
+      metadata: { roomsNeeded: 2, adultCount: 3, pax: 3 },
+    });
+  const bundlePairCtx = (over: Partial<SplitContext> = {}) =>
+    ctx({
+      movedOccupancy: occ(0, 1),
+      keptOccupancy: occ(2),
+      splitPairToken: 'tok-b',
+      ...over,
+    });
+
+  it('套餐住宿行两侧都留半间 → 写同一个 splitPairKey（口径同 moveHotel）', () => {
+    const plan = moveBundle(bundleRowForPairKey(), bundlePairCtx());
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    expect(plan.move.roomsBilled).toBeGreaterThan(0);
+    expect(plan.keep.roomsBilled).toBeGreaterThan(0);
+    expect((plan.keep.metadata as Record<string, unknown>).splitPairKey).toBe('ib:tok-b');
+    expect((plan.move.metadata as Record<string, unknown>).splitPairKey).toBe('ib:tok-b');
+  });
+
+  it('L2 反例：套餐住宿行挂共享组（sharedRoomItemIds 命中）→ 不写 splitPairKey', () => {
+    const plan = moveBundle(
+      bundleRowForPairKey(),
+      bundlePairCtx({ sharedRoomItemIds: new Set(['ib']) }),
+    );
+    if (plan.mode !== 'SPLIT') throw new Error('expected SPLIT');
+    // 两侧仍各留半间（份额账不受影响，只是不该再写配对键）——共享组的物理去重
+    // 靠 SharedRoom 表，不靠 JSON 配对键。
+    expect(plan.move.roomsBilled).toBeGreaterThan(0);
+    expect(plan.keep.roomsBilled).toBeGreaterThan(0);
+    expect((plan.keep.metadata as Record<string, unknown>).splitPairKey).toBeUndefined();
+    expect((plan.move.metadata as Record<string, unknown>).splitPairKey).toBeUndefined();
+  });
 });
 
 // ══════════════════════════════════════════════════════════════════════════

@@ -157,6 +157,9 @@ vi.mock('../hotel-control/hotel-control.service.js', () => ({
   assertRandomTierFit: mockAssertRandomTierFit,
   // 超售容忍上限：这些用例只关心立减/结算护栏，上限给 env 缺省同款常数即可
   getHotelOversellCapRooms: async () => 3,
+  // C1 修复引入：这些用例不测 0 份额兜底，透传即可（与修复前「不介入」的行为一致）。
+  floorProspectiveOccupancyByAssignedRooms: (prospective: unknown) => prospective,
+  floorZeroRoomsBilledByAssignedRooms: (roomsBilled: unknown) => roomsBilled,
 }));
 
 vi.mock('../../queues/queue.js', () => ({

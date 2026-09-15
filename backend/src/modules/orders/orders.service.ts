@@ -143,11 +143,15 @@ import {
   assertRandomTierFit,
   assertRandomTierFitWithinTx,
   checkHotelPhysicalFit,
+  floorProspectiveOccupancyByAssignedRooms,
+  floorZeroRoomsBilledByAssignedRooms,
   getHotelNightlyRemaining,
   getHotelOversellCapRooms,
   getRandomTierAggregate,
   lockHotelBlockPeriodsWithinTx,
+  lockHotelInventoryForUpdate,
   lockRandomTierBlockPeriodsWithinTx,
+  lockRandomTierInventoryForUpdate,
   randomStarTierLabel,
   type PhysicalFitViolation,
   type PhysicalOccupancyItem,
@@ -5902,7 +5906,15 @@ export class OrderService {
           hotelRoomTypeId: it.hotelRoomTypeId,
           hotelCheckIn: it.hotelCheckIn,
           hotelCheckOut: it.hotelCheckOut,
-          roomsBilled: it.roomsBilled != null ? Number(it.roomsBilled.toString()) : null,
+          // C1 修复：这些行都是「未触及」共享成员的行（gatedHotelIdSet 已把触及行整间酒店
+          // 挪去 §五闸），但仍可能挂着更早一次解绑留下的「显式 0 份额」普通房组——原样
+          // 传 0 给这条老前瞻闸会译成 0 间物理需求，用当前分房表兜底。
+          roomsBilled: floorZeroRoomsBilledByAssignedRooms(
+            it.roomsBilled != null ? Number(it.roomsBilled.toString()) : null,
+            order.roomAssignment,
+            it.id,
+            null,
+          ),
           randomStarTier: it.randomStarTier,
         }));
       // hotelOversellCapRooms 已在本方法上面提前算好（供 §五闸复用），这里不再重复查询。
@@ -9234,25 +9246,15 @@ export class OrderService {
         hotelScopeNightDates.set(roomType.hotelId, set);
       }
     }
-    type RestoreLockScope = { kind: 'hotel'; id: string } | { kind: 'random'; id: number };
-    const lockScopes: RestoreLockScope[] = [
-      ...[...hotelScopeNightDates.keys()].map((id): RestoreLockScope => ({ kind: 'hotel', id })),
-      ...[...randomTierScopeNightDates.keys()].map((id): RestoreLockScope => ({ kind: 'random', id })),
-    ].sort((a, b) => {
-      if (a.kind !== b.kind) return a.kind < b.kind ? -1 : 1; // 'hotel' 固定排在 'random' 前
-      return String(a.id) < String(b.id) ? -1 : String(a.id) > String(b.id) ? 1 : 0;
-    });
-    for (const scope of lockScopes) {
-      if (scope.kind === 'hotel') {
-        await lockHotelBlockPeriodsWithinTx(tx, scope.id, [...hotelScopeNightDates.get(scope.id)!].sort());
-      } else {
-        await lockRandomTierBlockPeriodsWithinTx(
-          tx,
-          scope.id,
-          [...randomTierScopeNightDates.get(scope.id)!].sort(),
-        );
-      }
-    }
+    // M5 修复：改用 lockHotelInventoryForUpdate / lockRandomTierInventoryForUpdate——
+    // 与原先手工调用 lockHotelBlockPeriodsWithinTx / lockRandomTierBlockPeriodsWithinTx
+    // 的区别在于「该酒店/该档次完全没有配置包房周期」时不再什么都不锁，而是退化为
+    // advisory lock 兜底（方案 §六步骤 4 明文写的要求）。全局加锁顺序不变：先锁完全部
+    // 涉及的酒店（内部按 hotelId 升序），再锁全部涉及的随机档（内部按档次升序）——与
+    // 之前 lockScopes 排序结果一致（'hotel' 固定排在 'random' 前），不会与其它并发事务
+    // 以不同顺序锁同一批作用域而成环死锁。
+    await lockHotelInventoryForUpdate(tx, [...hotelScopeNightDates.keys()]);
+    await lockRandomTierInventoryForUpdate(tx, [...randomTierScopeNightDates.keys()]);
 
     const shortage = (result: { remaining: number[]; block: number[]; hasBlock: boolean }): boolean =>
       result.hasBlock &&
@@ -10879,12 +10881,16 @@ export class OrderService {
             // 以不同顺序锁同一批酒店造成死锁。
             const gatedHotelIdsSorted = [...gatedHotelIds].sort();
 
+            // C1 修复：未被 §五闸接管的行也可能挂着更早一次解绑留下的「显式 0 份额」普通
+            // 房组（该行所在酒店本次没有任何行触及共享成员，才会落到 ungatedShifted）——
+            // 老式 prospective-add 前瞻需要分房表兜底，因此这里无条件取一次 roomAssignment，
+            // 不再只在 gatedHotelIds 非空时才查。
+            const orderForGate = await tx.order.findUnique({
+              where: { id: orderId },
+              select: { roomAssignment: true },
+            });
             try {
               if (gatedHotelIds.size > 0) {
-                const orderForGate = await tx.order.findUnique({
-                  where: { id: orderId },
-                  select: { roomAssignment: true },
-                });
                 for (const hotelId of gatedHotelIdsSorted) {
                   const rows = byHotel.get(hotelId)!;
                   const unionDates = [
@@ -10943,7 +10949,14 @@ export class OrderService {
                 hotelRoomTypeId: s.row.hotelRoomTypeId,
                 hotelCheckIn: s.newCheckIn,
                 hotelCheckOut: s.newCheckOut,
-                roomsBilled: s.row.roomsBilled == null ? null : Number(s.row.roomsBilled.toString()),
+                // C1 修复：显式 0 份额（更早一次解绑留下的）要用当前分房表兜底，
+                // 绝不让它在平移后的新区间按 0 间放行。
+                roomsBilled: floorZeroRoomsBilledByAssignedRooms(
+                  s.row.roomsBilled == null ? null : Number(s.row.roomsBilled.toString()),
+                  orderForGate?.roomAssignment ?? null,
+                  s.row.id,
+                  null,
+                ),
                 randomStarTier: s.row.randomStarTier,
               }));
               await assertHotelStaysFitWithinTx(
@@ -15342,9 +15355,12 @@ export class OrderService {
         // 的房间——SharedRoom 只允许真实酒店真实房型成员，房间所属酒店 = 本行解绑前所在
         // 酒店（oldRoomType.hotelId；isRandomPoolRow 不可能有共享成员，见闸内 hasSharedMembers
         // 判定）。同酒店换房型时两者相同，必须把「该房间解绑后只剩其余成员」喂进去；
-        // 真正跨酒店换酒店时该房间属于**原**酒店，不属于本次判定的目标酒店，不能喂进去——
-        // assertHotelFitAfterChange 的 nextSharedRooms 不按 hotelId 过滤，喂错酒店的房间会
-        // 把它的 checkIn/checkOut 误加进目标酒店的逐晚累计。
+        // 真正跨酒店换酒店时该房间属于**原**酒店，不属于本次判定的目标酒店，不能喂进去。
+        // （L3 更正：assertHotelFitAfterChange 的 nextSharedRooms 现在**会**按 hotelId
+        // 过滤——见 computeSharedRoomPhysicalAfterChange 的 belongsToThisHotel，查到别家
+        // 酒店的覆盖项会被静默丢弃。但这里仍然自己按 sameHotelSwap 显式收窄，不依赖那道
+        // 过滤兜底：这条覆盖项没带 hotelId 字段，belongsToThisHotel 得现查一次库才能过滤，
+        // 调用方能提前算好就不该指望被调用方帮忙纠正。）
         const sameHotelSwap = oldRoomType != null && oldRoomType.hotelId === newRoomType.hotelId;
         const nextSharedRooms: SharedRoomAfterState[] = sameHotelSwap
           ? unbindPlan.changes.map((c) => ({
@@ -15369,13 +15385,23 @@ export class OrderService {
           where: { orderId },
           select: { gender: true },
         });
-        const fit = await checkHotelPhysicalFit(
-          newRoomType.hotelId,
-          nightDates,
+        // C1 修复：本行若挂着解绑留下的「显式 0 份额」普通房组（hasSharedMembers 已是
+        // false，说明没有活跃的 SharedRoomMember 了，但订单 JSON 里的普通组可能仍是
+        // roomFraction:0），toProspectiveOccupancy 会把它译成 0 间物理需求；用当前分房表
+        // 兜底，绝不让「显式 0」在目标酒店按 0 间放行。
+        const swapProspective = floorProspectiveOccupancyByAssignedRooms(
           toProspectiveOccupancy(
             roomsBilled,
             swapPassengers.map((p) => ({ gender: p.gender ?? undefined })),
           ),
+          order.roomAssignment,
+          item.id,
+          oldRoomType?.hotel.name ?? null,
+        );
+        const fit = await checkHotelPhysicalFit(
+          newRoomType.hotelId,
+          nightDates,
+          swapProspective,
           { excludeOrderItemIds: [item.id] },
           tx,
         );
@@ -15805,6 +15831,15 @@ export class OrderService {
           where: { sharedRoomId: targetSharedRoomId, orderId, orderItemId: item.id },
           data: { orderItemId: created.id },
         });
+        // M2 修复：成员归属改指到新行也是一次「变更」，version 必须跟着涨（与拆单 N6
+        // 「成员份额或成员归属变了，version 必须跟着涨」同一条不变量，见下方
+        // wholeMovedSharedRoomIds 的版本递增）。不涨的话，工作台先打开拿到旧 version，
+        // 运营在订单页按房组拆行改指了成员归属，工作台再保存时 expectedVersions 仍对得上
+        // （CAS 形同虚设），会按旧 orderItemId 重建成员，把刚拆行的结果悄悄改回去。
+        await tx.sharedRoom.update({
+          where: { id: targetSharedRoomId },
+          data: { version: { increment: 1 } },
+        });
       }
 
       // ── 房组归属：目标组指到新行；其余无归属组回填为源行（本单从此每组有归属）──
@@ -16165,13 +16200,22 @@ export class OrderService {
           where: { orderId },
           select: { gender: true },
         });
-        const fit = await checkHotelPhysicalFit(
-          roomType.hotelId,
-          nightDates,
+        // C1 修复：本行可能挂着解绑留下的「显式 0 份额」普通房组（hasSharedMembers 已是
+        // false），toProspectiveOccupancy 会把它译成 0 间物理需求；用当前分房表兜底，
+        // 绝不让「显式 0」在新区间按 0 间放行。
+        const rescheduleProspective = floorProspectiveOccupancyByAssignedRooms(
           toProspectiveOccupancy(
             roomsBilled,
             orderPassengers.map((p) => ({ gender: p.gender ?? undefined })),
           ),
+          order.roomAssignment,
+          item.id,
+          null,
+        );
+        const fit = await checkHotelPhysicalFit(
+          roomType.hotelId,
+          nightDates,
+          rescheduleProspective,
           // 只排本行 = 「先释放本行旧区间」；随后把本行房量按新区间加回去（prospective）。
           // 不能整单排除：同单同酒店的另一段住宿是真实存量，整单排掉等于把它当空房、放行超卖
           //（换酒店已按行排除，这里跟进）。
@@ -19083,29 +19127,43 @@ export class OrderService {
           totalCount: number;
         }>
       >();
+      // M4 修复：本行若同时挂着普通房组（无 sharedRoomId）与共享组，下面「行级注入」不能
+      // 无条件用共享计划的合计覆盖 roomSplitByItem——那个数只汇总了共享组的份额，会把
+      // 运营为普通组显式填的 roomSplit（或普通组自己那部分该占的搬走量）整个吞掉、
+      // 且不给任何提示。先记下每个订单行是否还挂着有乘客的普通组，供下面判定用。
+      const plainGroupItemIds = new Set<string>();
       for (const group of readRoomGroups(order.roomAssignment)) {
         if (group.passengerIds.length === 0) continue;
         const groupSharedRoomId =
           typeof group.raw.sharedRoomId === 'string' && group.raw.sharedRoomId.length > 0
             ? group.raw.sharedRoomId
             : null;
-        if (!groupSharedRoomId) continue;
+        if (groupSharedRoomId) {
+          const attributedItemId =
+            typeof group.raw.orderItemId === 'string' && group.raw.orderItemId.length > 0
+              ? group.raw.orderItemId
+              : null;
+          if (!attributedItemId) continue; // §三强制归属，无归属的共享组理论不可达，跳过不参与行级推算
+          const movedCount = group.passengerIds.filter((id) => movedIdSet.has(id)).length;
+          const rawFraction = group.raw.roomFraction == null ? 1 : Number(group.raw.roomFraction);
+          const list = sharedGroupsByItemId.get(attributedItemId) ?? [];
+          list.push({
+            group,
+            sharedRoomId: groupSharedRoomId,
+            srcFraction: Number.isFinite(rawFraction) ? rawFraction : 1,
+            movedCount,
+            totalCount: group.passengerIds.length,
+          });
+          sharedGroupsByItemId.set(attributedItemId, list);
+          continue;
+        }
+        // 普通组：记下它归属的行（无归属的老数据按 hotelName 兜底的场景不在本次修复范围，
+        // 这里只看显式 orderItemId——共享组一律要求强制归属，混合场景下普通组通常也已归属）。
         const attributedItemId =
           typeof group.raw.orderItemId === 'string' && group.raw.orderItemId.length > 0
             ? group.raw.orderItemId
             : null;
-        if (!attributedItemId) continue; // §三强制归属，无归属的共享组理论不可达，跳过不参与行级推算
-        const movedCount = group.passengerIds.filter((id) => movedIdSet.has(id)).length;
-        const rawFraction = group.raw.roomFraction == null ? 1 : Number(group.raw.roomFraction);
-        const list = sharedGroupsByItemId.get(attributedItemId) ?? [];
-        list.push({
-          group,
-          sharedRoomId: groupSharedRoomId,
-          srcFraction: Number.isFinite(rawFraction) ? rawFraction : 1,
-          movedCount,
-          totalCount: group.passengerIds.length,
-        });
-        sharedGroupsByItemId.set(attributedItemId, list);
+        if (attributedItemId) plainGroupItemIds.add(attributedItemId);
       }
 
       for (const [itemId, groups] of sharedGroupsByItemId) {
@@ -19147,8 +19205,19 @@ export class OrderService {
           for (const pid of movedInGroup) postSplitFractionByPassenger.set(pid, halves.movedFraction);
           totalMovedFraction = round2(totalMovedFraction + halves.movedFraction);
         }
+        // M4 修复：本行若还挂着有乘客的普通房组，共享计划的合计不等于「这一行总共要搬走
+        // 几间」——普通组那部分该搬多少，系统没法安全代answer（会覆盖运营的显式输入或
+        // 默认派生值）。fail-closed：拒绝并说明原因，逼运营先把房组理清楚，不悄悄猜。
+        if (plainGroupItemIds.has(itemId)) {
+          throw new BadRequestError(
+            `订单行 ${itemId} 同时挂着普通房组与共享房组，系统无法安全推算该行的拆分间数` +
+              '（会覆盖普通房组那部分应搬走的间数）。请先在跨单分房工作台把普通房组挪到别的' +
+              '订单行，或把两者都并入同一间共享房，再拆单。',
+          );
+        }
         // 行级注入：用共享计划算出的总量覆盖 roomSplitByItem——moveHotel 读的就是这个
-        // Map，行级搬走间数从此与共享计划强制对齐（不再各算各的）。
+        // Map，行级搬走间数从此与共享计划强制对齐（不再各算各的）。本行全部房组都是共享组
+        // 时才安全覆盖（上面已排除混了普通组的情形）。
         roomSplitByItem.set(itemId, totalMovedFraction);
       }
     }
@@ -19245,6 +19314,9 @@ export class OrderService {
     const noneCarrierIdByItem = new Map<string, string>();
     // 防御式：单测常用手搭的 mock tx（只 mock 用到的 delegate）没有 sharedRoomMember 时
     // 回落「本次没有共享成员」而不是炸，同 shared-room-unbind.ts 的兜底哲学。
+    // ⚠ L5：生产 tx 必有 sharedRoomMember delegate，这条回落只为迁就 mock 单测——拆单
+    // 4b 若在生产环境悄悄回落成「没有共享成员」，会漏搬共享成员的表记录（JSON 与
+    // SharedRoomMember 表脱钩），同属「库存/合住闸拿不到数据就假装无事」的危险方向。
     const sharedRoomMemberDelegate = (
       tx as unknown as {
         sharedRoomMember?: {

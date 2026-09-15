@@ -857,6 +857,49 @@ export function assignedRoomsForItem(
   );
 }
 
+/**
+ * C1 修复（跨单分房终审 A 路 · CRITICAL）：老式 `roomsBilled` 前瞻闸的输入翻译
+ * （toProspectiveOccupancy）只认计费份额——解绑留下的「显式 0 份额」普通房组会被它译成
+ * 「0 间物理需求」，但该行只要在分房表里挂着归属房组，物理口径就是 1 间（与
+ * assignedRoomsForItem / groupRoomFraction 对 `n<=0` 的兜底一致，见 §四「物理按普通房组
+ * 1 间计」）。四条老式前瞻闸（换酒店 / 酒店改期 / 恢复 / 机票改期平移）在喂
+ * toProspectiveOccupancy 之前统一过一遍这个函数兜底，绝不让「显式 0」塌成「0 间物理需求」
+ * 而放行超卖。
+ *
+ * 只在 toProspectiveOccupancy 算出「全零」（wholeRooms=0 且无拼房 solo）时才介入——
+ * 0.5 间的真实拼房行情形（solos 非空）不受影响，照旧走性别配对逻辑。
+ */
+export function floorProspectiveOccupancyByAssignedRooms(
+  prospective: ProspectiveOccupancy,
+  roomAssignment: unknown,
+  itemId: string,
+  hotelName: string | null,
+): ProspectiveOccupancy {
+  if (prospective.wholeRooms > 0 || prospective.solos.length > 0) return prospective;
+  const assigned = assignedRoomsForItem(roomAssignment, itemId, hotelName);
+  if (assigned == null || assigned <= 0) return prospective;
+  return { wholeRooms: assigned, solos: [] };
+}
+
+/**
+ * C1 修复的另一半：部分老式前瞻闸（恢复、机票改期平移酒店日期）不直接调用
+ * toProspectiveOccupancy，而是把 `roomsBilled` 数字塞进 `ProspectiveHotelStay[]`
+ * 交给 `assertHotelStaysFitWithinTx` 按酒店归并后再统一翻译。归并入口拿不到单行的
+ * `itemId`/`roomAssignment` 语境，只能在**喂给它之前**对每行的 `roomsBilled` 做同样的兜底：
+ * 只有显式 0（不是 null——null 走既有 `?? 1` 缺省，不受影响）且该行分房表仍有归属房组时，
+ * 才把 0 提到 `assignedRoomsForItem` 算出的物理间数；0.5 等真实拼房份额原样放行。
+ */
+export function floorZeroRoomsBilledByAssignedRooms(
+  roomsBilled: number | null | undefined,
+  roomAssignment: unknown,
+  itemId: string,
+  hotelName: string | null,
+): number | null | undefined {
+  if (roomsBilled !== 0) return roomsBilled;
+  const assigned = assignedRoomsForItem(roomAssignment, itemId, hotelName);
+  return assigned != null && assigned > 0 ? assigned : roomsBilled;
+}
+
 /** 占房行（物理口径拆分用）：订单级分房表 + 拼房性别 fallback 所需字段。*/
 export interface PhysicalOccupancyItem {
   /** 行 id（可选）：房组归属过滤的坐标系。调用方不带 id 时归属过滤自动退化为整单口径。*/
@@ -1063,6 +1106,10 @@ export async function computeSharedRoomPhysicalByDate(
 
   // 防御式：单测常用手搭的 mock client（只 mock 用到的 delegate），没有 sharedRoom 时
   // 回落「本次没有共享房」而不是炸——与 getHotelOversellCapRooms 的 systemSetting 兜底同哲学。
+  // ⚠ L5：生产环境的 PrismaClient / tx 必有 sharedRoom delegate，这条回落只为迁就 mock
+  // 单测而存在——真上生产永远不会触发。物理房间库存闸「拿不到数据就当 0 间」是最危险的
+  // 失败方向（少算占用 → 放行超卖，比拿不到数据就拒绝更糟）；长期应把单测改用真库或完整
+  // 替身，让生产客户端缺 delegate 时直接抛错，而不是继续依赖这条静默兜底。
   const delegate = (
     client as unknown as {
       sharedRoom?: { findMany: (args: unknown) => Promise<SharedRoomPhysicalRow[]> };
@@ -1518,6 +1565,49 @@ export async function lockHotelInventoryForUpdate(
 }
 
 /**
+ * `lockHotelInventoryForUpdate` 的随机档变体（M5 修复）：按档次升序逐个锁该档次全部真
+ * 酒店（同星级、非国际五星、非占位）的全部包房周期行；该档次完全没有任何真酒店配置
+ * 包房周期时（未纳管）退化为 `pg_advisory_xact_lock(hashtext('random-tier:' || tier))`。
+ *
+ * 与 `lockRandomTierBlockPeriodsWithinTx` 的区别同 `lockHotelInventoryForUpdate` 之于
+ * `lockHotelBlockPeriodsWithinTx`：不按日期区间过滤（锁该档次全部周期行，恢复路径一次
+ * 可能牵涉多段互不相邻的日期），且无周期时会退化为 advisory lock 兜底——恢复路径的
+ * 容量判定是调用方自己实现的 `assertRestoreHotelCapacity`，在锁到手之前不知道这个档次
+ * 最终算不算「未纳管」。
+ *
+ * advisory lock 的 key 加了 `random-tier:` 前缀，与 `lockHotelInventoryForUpdate` 用
+ * 真实 hotelId 做 key 的命名空间区分开，避免档次数字巧合撞上某个 hotelId 的哈希。
+ *
+ * @param tiers 本次恢复涉及的全部随机档档次（可以有重复，内部会去重）。
+ */
+export async function lockRandomTierInventoryForUpdate(
+  tx: Prisma.TransactionClient,
+  tiers: readonly number[],
+): Promise<void> {
+  const sortedTiers = [...new Set(tiers)].sort((a, b) => a - b);
+  for (const tier of sortedTiers) {
+    const hotels = await tx.hotel.findMany({
+      where: { starRating: tier, intlFiveStar: false, randomTierPlaceholder: null },
+      select: { id: true },
+    });
+    const hotelIds = hotels.map((h) => h.id).sort();
+    let lockedAny = false;
+    if (hotelIds.length > 0) {
+      const lockedPeriods = await tx.$queryRaw<Array<{ id: string }>>`
+        SELECT id FROM "HotelBlockPeriod"
+        WHERE "hotelId" IN (${Prisma.join(hotelIds)})
+        ORDER BY id
+        FOR UPDATE
+      `;
+      lockedAny = lockedPeriods.length > 0;
+    }
+    if (!lockedAny) {
+      await tx.$executeRaw`SELECT pg_advisory_xact_lock(hashtext(${'random-tier:' + String(tier)}))`;
+    }
+  }
+}
+
+/**
  * `assertHotelPhysicalFit` 的**事务内互斥**变体：先锁该酒店该区间的包房周期行，
  * 再在同一事务里跑一遍完全相同的前瞻闸判定。
  *
@@ -1667,12 +1757,20 @@ async function computeSharedRoomPhysicalAfterChange(
     const dbHotelId = hotelIdByRoomId.get(o.sharedRoomId);
     // 库里查不到 = 待创建（astra N1）：不能当「不属于本酒店」处理，否则会把一间刚决定
     // 新建、马上要占用物理房间的共享房整间从前瞻闸里过滤掉。
-    // 库里查到、但归属的是别家酒店：维持原有的静默过滤（不是 astra 建议的抛错）——
-    // 这条分支是「换酒店」等场景下调用方按跨批需求刻意依赖的行为（见上面 lookupIds
-    // 的既有注释与本文件同 describe 块里那条更早的测试：调用方允许把两家酒店的覆盖项
-    // 混在一起传，靠这里查库过滤而不必自己先按酒店分组），改成抛错会让那类合法调用
-    // 直接 400。真正的数据/调用异常应在调用方自己的 hotelId 归属校验里挡（跨单分房
-    // 保存端已经这样做——见 hotel-control.shared-rooms.ts 的 CAS 校验），这里不重复收紧。
+    // 库里查到、但归属的是别家酒店：维持静默过滤（不抛错）。独立复核过（跨单分房终审
+    // A 路第三节）：这不是「换酒店」等场景真正依赖的行为——逐个查过生产调用方
+    // （swapItemHotel 跨酒店时显式传 []、rescheduleItemHotel 改期不换酒店房间恒属本酒店、
+    // 机票平移与恢复都已按酒店分组），没有一条生产路径靠这条静默过滤才对。真正依赖它的
+    // 只有单测里「调用方允许把两家酒店的覆盖项混在一起传」那条 tolerant 调用契约。抛错
+    // 会把这条宽松契约变成 breaking；保留静默过滤 + 下面这行 WARN 留痕，让「调用方喂错
+    // 酒店」这种真 bug 能在日志里被看见，而不是完全无声无息。
+    if (dbHotelId !== undefined && dbHotelId !== hotelId) {
+      console.warn('[hotel-control] shared room override belongs to a different hotel, dropped', {
+        sharedRoomId: o.sharedRoomId,
+        expectedHotelId: hotelId,
+        actualHotelId: dbHotelId,
+      });
+    }
     return dbHotelId === undefined || dbHotelId === hotelId;
   };
   const scopedOverrides = overrides.filter(belongsToThisHotel);
@@ -1682,6 +1780,9 @@ async function computeSharedRoomPhysicalAfterChange(
       .filter((o): o is SharedRoomAfterState & { sharedRoomId: string } => !!o.sharedRoomId)
       .map((o) => o.sharedRoomId),
   );
+  // ⚠ L5：同上——生产 client 必有 sharedRoom delegate，`if (delegate)` 只为迁就 mock
+  // 单测；delegate 缺失时这里跳过查询等于把全部既有共享房当 0 间，是本函数里另一处
+  //「拿不到数据就回落成 0」的危险方向，长期同样该改成生产端直接抛错。
   if (delegate) {
     const liveRows = await delegate.findMany({
       where: { hotelId, status: 'ACTIVE', checkIn: { lte: toD }, checkOut: { gt: fromD } },
@@ -1700,7 +1801,41 @@ async function computeSharedRoomPhysicalAfterChange(
       if (hasValidMember) add(row.checkIn, row.checkOut);
     }
   }
+  // M1 修复：调用方可能对同一间共享房喂进不止一条覆盖项——例如恢复路径按订单行
+  // flatMap（`orders.service.ts` 的 `nextSharedRooms`），同一张单两条酒店行同时挂在
+  // 同一间共享房时会各自 push 一条。astra N3 的修复只解决了「同一 item 内多名乘客生成
+  // 多条」，跨 item 没去重：逐条 add() 会把这间房的物理占用算两次，`allowNonWorsening`
+  // 下可能把本该放行的操作误判成「变差」而拒绝，或吃掉一份不该吃的超售容忍额度。
+  // 这是聚合器自己的不变量，不该指望每个调用方各自记得去重——在这里按 sharedRoomId
+  // 做最后一道合并（没有 sharedRoomId 的全新建房间各自独立，不参与合并）；同一间房的两条
+  // 覆盖项 checkIn/checkOut 不一致说明调用方逻辑有误，直接抛错而不是悄悄各信一半。
+  const mergedBySharedRoomId = new Map<string, SharedRoomAfterState>();
+  const standaloneOverrides: SharedRoomAfterState[] = [];
   for (const o of scopedOverrides) {
+    if (!o.sharedRoomId) {
+      standaloneOverrides.push(o);
+      continue;
+    }
+    const existing = mergedBySharedRoomId.get(o.sharedRoomId);
+    if (!existing) {
+      mergedBySharedRoomId.set(o.sharedRoomId, o);
+      continue;
+    }
+    if (
+      existing.checkIn.getTime() !== o.checkIn.getTime() ||
+      existing.checkOut.getTime() !== o.checkOut.getTime()
+    ) {
+      throw new Error(
+        `共享房 ${o.sharedRoomId} 的覆盖项入住/退房区间不一致（${fmtDateOnly(existing.checkIn)}~${fmtDateOnly(existing.checkOut)} vs ${fmtDateOnly(o.checkIn)}~${fmtDateOnly(o.checkOut)}），调用方逻辑有误`,
+      );
+    }
+    mergedBySharedRoomId.set(o.sharedRoomId, {
+      ...existing,
+      activeMemberOrderIds: [...new Set([...existing.activeMemberOrderIds, ...o.activeMemberOrderIds])],
+    });
+  }
+  const dedupedOverrides = [...mergedBySharedRoomId.values(), ...standaloneOverrides];
+  for (const o of dedupedOverrides) {
     if (o.activeMemberOrderIds.length > 0) add(o.checkIn, o.checkOut);
   }
   return out;
@@ -2370,10 +2505,12 @@ export interface HotelControlAlerts {
     sharedHalfCount: number; // 当晚拼房客总人数（触发条件是落单数 > 0）
   }>;
   /**
-   * 共享房（跨单分房）里，唯一还占着物理房的成员全是 0 份额——即「掏钱那张单」被取消 /
-   * 退款 / 软删了，剩下白住的一方（§八「取消 / 退款 / 软删」）。物理口径仍占 1 间
-   * （不看份额，见 computeSharedRoomPhysicalByDate），但这是运营该去核对的异常状态：
-   * 白住方要不要补钱、还是该解绑腾出这间房。
+   * 共享房（跨单分房）ACTIVE 且有效成员的计费份额合计为 0——不只是「掏钱那张单」被取消 /
+   * 退款 / 软删了（§八「取消 / 退款 / 软删」），也覆盖 H1 口径：原计费方被工作台改指到
+   * 别的房间、旧房只剩 0 份额成员留守（跨单分房保存时已给 warning + 审计，这里是常态化
+   * 的看板兜底，不依赖运营记得当时那条 warning）。物理口径仍占 1 间（不看份额，见
+   * computeSharedRoomPhysicalByDate），但这是运营该去核对的异常状态：白住方要不要补钱、
+   * 还是该解绑腾出这间房。
    */
   sharedRoomOrphaned: Array<{
     sharedRoomId: string;
@@ -2545,7 +2682,7 @@ export async function getAlerts(
     });
   });
 
-  // ── 共享房「主单已取消」告警（§八「取消 / 退款 / 软删」）───────────────────────
+  // ── 共享房「Σ有效份额=0」告警（H1；覆盖 §八「取消 / 退款 / 软删」与隐式迁出留守两种成因）──
   // 窗口与销控板同一段 [today, to]：checkIn <= to 且 checkOut > today 才算与本次告警相关。
   // 防御式：单测常用手搭的 mock client 没有 sharedRoom 时回落「本次没有共享房」，与
   // computeSharedRoomPhysicalByDate 的兜底同哲学。

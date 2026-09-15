@@ -18,11 +18,11 @@
  *   1. docker compose -f docker-compose.test.yml up -d（或本机 Postgres 指到 TEST_DATABASE_URL）
  *   2. npm run test:integration
  */
-import { describe, it, expect, afterEach } from 'vitest';
+import { describe, it, expect } from 'vitest';
 import { OrderItemKind, OrderStatus, Prisma, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { saveSharedRooms, getSharedRoomWorkbench } from './hotel-control.shared-rooms.js';
-import { getHotelNightlyRemaining } from './hotel-control.service.js';
+import { getHotelNightlyRemaining, getAlerts } from './hotel-control.service.js';
 import { serializeRoomGroupsFor } from '../orders/room-group-dto.js';
 import { canonicalJson } from '../../lib/canonical-json.js';
 
@@ -124,21 +124,7 @@ async function createOrderWithPassengers(opts: {
 
 const requestToken = () => uniq('req');
 
-/**
- * saveSharedRooms 的审计写入是 fire-and-forget（`void writeAudit(...)`，不参与事务，见
- * lib/audit.ts 的设计取舍），调用方拿到返回值时审计的 INSERT 可能还没提交。真库集成测试
- * 断言审计内容、或紧跟着触发下一个测试的 TRUNCATE（会与还在飞行中的 INSERT 抢表锁，
- * 偶发 40P01 死锁）时都要先让它们落定——给个短暂 sleep，比反复读表轮询更简单可靠。
- */
-function flushFireAndForgetAudit(): Promise<void> {
-  return new Promise((resolve) => setTimeout(resolve, 80));
-}
-
 describe('saveSharedRooms · 真 DB E2E', () => {
-  // 每个用例都可能触发 saveSharedRooms 内部的 fire-and-forget writeAudit；下一个用例的
-  // beforeEach（全表 TRUNCATE）紧跟着就来，给飞行中的 INSERT 一点时间落定，避免偶发死锁。
-  afterEach(() => flushFireAndForgetAudit());
-
   it('验收反例 1：三人合住 1+0（两单各出 1 位客人），房控物理只占 1 间，两单 roomsBilled 分别 1/0', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(1); // 只包 1 间——1+0 必须能放进去，1+1 装不下
@@ -823,7 +809,6 @@ describe('saveSharedRooms · 真 DB E2E', () => {
       actor,
     );
     const sharedRoomId = result.rooms[0].sharedRoomId;
-    await flushFireAndForgetAudit(); // 审计是 fire-and-forget，断言前先等它落定
 
     const auditA = await prisma.auditLog.findFirst({
       where: { action: 'UPDATE_ROOM_ASSIGNMENT', targetId: orderA.id },
@@ -920,7 +905,6 @@ describe('saveSharedRooms · 真 DB E2E', () => {
       },
       actor,
     );
-    await flushFireAndForgetAudit(); // 审计原先是 fire-and-forget，断言前先等它落定
 
     const auditA = await prisma.auditLog.findFirst({
       where: { action: 'UPDATE_ROOM_ASSIGNMENT', targetId: orderA.id },
@@ -947,8 +931,6 @@ describe('saveSharedRooms · 真 DB E2E', () => {
  *   - 同一 sharedRoomId 不能同时出现在 rooms 与 dissolve 里。
  */
 describe('saveSharedRooms · 真 DB E2E · 已解散/跨日期房不能被保存复活（astra A3）', () => {
-  afterEach(() => flushFireAndForgetAudit());
-
   it('解散后再拿同一 sharedRoomId 当「更新」提交 → 400，不落库、不复活', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4);
@@ -1206,8 +1188,6 @@ describe('saveSharedRooms · 真 DB E2E · 已解散/跨日期房不能被保存
  * 钱和物理口径就此对不上（解绑时明确承诺的「钱不动」被破坏）。
  */
 describe('saveSharedRooms · 真 DB E2E · 普通组显式 0 份额重存不变 1（astra A5②）', () => {
-  afterEach(() => flushFireAndForgetAudit());
-
   it('订单里一条行是已解绑的 0 份额普通组，同单另一条行本次加入新共享房 → 前者 roomsBilled 仍是 0', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4);
@@ -1340,8 +1320,6 @@ describe('saveSharedRooms · 真 DB E2E · 普通组显式 0 份额重存不变 
  * （哪怕只是加了一位新成员，不碰原有成员），这条备注就会消失。
  */
 describe('saveSharedRooms · 真 DB E2E · 工作台重存保留本单房组备注（astra B7）', () => {
-  afterEach(() => flushFireAndForgetAudit());
-
   it('更新既有共享房（新增一名成员）→ 原成员那侧订单 JSON 里的 notes 原样保留', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4);
@@ -1427,6 +1405,83 @@ describe('saveSharedRooms · 真 DB E2E · 工作台重存保留本单房组备�
     expect(afterGroup).toBeDefined();
     expect(afterGroup!.notes).toBe('A 单本地备注：靠窗'); // 没有被工作台重存清掉
   });
+
+  it('M6 反例：既有房重提时漏掉一名成员的 group → 静默移除该成员，但必须进 warnings 说明', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    const created = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const sharedRoomId = created.rooms[0].sharedRoomId;
+
+    // 客户端（前端漏渲染 / 手滑）重提这间房时只带了 A 的 group，完全没提 B——按端点既有
+    // 语义（listed 决定最终成员）B 会被摘出去，Σ=1 校验也照样能过（只看 A 那组）。
+    // 这本是合法操作，但必须让运营看得见「B 被顺手移除了」。
+    const updated = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        expectedVersions: { [sharedRoomId]: created.rooms[0].version },
+        rooms: [
+          {
+            sharedRoomId,
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    expect(updated.rooms[0].sharedRoomId).toBe(sharedRoomId);
+    expect(
+      updated.warnings.some(
+        (w) => w.includes(sharedRoomId) && w.includes('移除') && w.includes(orderB.orderNumber),
+      ),
+    ).toBe(true);
+
+    // B 确实被移除（既有行为不变，本条只补 warning）。
+    const remainingMembers = await prisma.sharedRoomMember.findMany({ where: { sharedRoomId } });
+    expect(remainingMembers.map((m) => m.orderId)).toEqual([orderA.id]);
+  });
 });
 
 /**
@@ -1437,8 +1492,6 @@ describe('saveSharedRooms · 真 DB E2E · 工作台重存保留本单房组备�
  * 字符串里不包含 sharedRoomId 的真实值，而不只是检查某个字段不存在。
  */
 describe('saveSharedRooms · 真 DB E2E · 房组 id 不泄露 sharedRoomId（astra B1）', () => {
-  afterEach(() => flushFireAndForgetAudit());
-
   it('落库产出的房组 id 不含 sharedRoomId 原文；AGENT 视角整份 JSON 也不含', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4);
@@ -1505,8 +1558,6 @@ describe('saveSharedRooms · 真 DB E2E · 房组 id 不泄露 sharedRoomId（as
  *     窗口把一个订单已取消的成员悄悄改成别的份额）。
  */
 describe('saveSharedRooms · 真 DB E2E · 未变更的失效成员不阻断保存（astra B6）', () => {
-  afterEach(() => flushFireAndForgetAudit());
-
   it('读模型：成员带 orderStatus / isActive / orderNumber / 姓名快照，取消单的成员 isActive=false 且姓名不为空', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4);
@@ -1693,8 +1744,6 @@ describe('saveSharedRooms · 真 DB E2E · 未变更的失效成员不阻断保�
  *     必须能被重新抢占、真正执行一遍，而不是永远卡在「上一次尚未完成」。
  */
 describe('saveSharedRooms · 真 DB E2E · 幂等占位的并发/崩溃窗口（astra A12）', () => {
-  afterEach(() => flushFireAndForgetAudit());
-
   it('同 token 占位新鲜（未超时）→ 409 提示重试同一 token，不建议换号', async () => {
     const { hotel, roomType } = await createHotelWithRoomType(4);
     const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
@@ -1827,8 +1876,6 @@ describe('saveSharedRooms · 真 DB E2E · 幂等占位的并发/崩溃窗口（
  * 口径跟 Σ 校验看到的对不上。
  */
 describe('saveSharedRooms · 真 DB E2E · 同房同订单行不许出现多个成员组（astra A6①）', () => {
-  afterEach(() => flushFireAndForgetAudit());
-
   it('同一房间的 groups 里两条都指向同一 (orderId, orderItemId) → 400，不落库', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4);
@@ -1879,8 +1926,6 @@ describe('saveSharedRooms · 真 DB E2E · 同房同订单行不许出现多个�
  * 纳入锁集合与版本校验，删掉旧成员、旧房清空则 DISSOLVED（同时是 B2 的后端侧）。
  */
 describe('saveSharedRooms · 真 DB E2E · 隐式触及旧共享房的清理（astra A6②）', () => {
-  afterEach(() => flushFireAndForgetAudit());
-
   it('把乘客从未点名的旧共享房拽进新房：旧房只剩一人 → 摘除后自动 DISSOLVED', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4);
@@ -1980,6 +2025,139 @@ describe('saveSharedRooms · 真 DB E2E · 隐式触及旧共享房的清理（a
     expect(bGroupInOldRoom?.roomFraction).toBe(0); // 保留原份额，不重新分配
     const bItemAfter = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderB.items[0].id } });
     expect(Number(bItemAfter.roomsBilled)).toBe(0); // 与 JSON 组的 roomFraction 口径一致，不是被清空
+
+    // H1 修复：旧房 S 摘除 A 之后只剩 B 一人、份额合计仍是 0（原计费方 A 已迁出）——
+    // 这不该悄无声息：响应 warnings 必须明示，orderB 的逐单审计 after 也要带同一条提示
+    // （不止响应这一处，翻旧账也要看得到），不能像旧实现那样连一句提示都没有。
+    expect(result.warnings.some((w) => w.includes(oldRoomId) && w.includes('原计费方已迁出'))).toBe(true);
+    const auditB = await prisma.auditLog.findFirst({
+      where: { action: 'UPDATE_ROOM_ASSIGNMENT', targetId: orderB.id },
+      orderBy: { createdAt: 'desc' },
+    });
+    expect(auditB).not.toBeNull();
+    const afterB = auditB?.after as { orphanedSharedRoomWarnings?: string[] };
+    expect(afterB.orphanedSharedRoomWarnings?.some((w) => w.includes(oldRoomId))).toBe(true);
+
+    // 房控看板：这间房 ACTIVE 且唯一有效成员份额为 0，getAlerts 的 sharedRoomOrphaned
+    // 必须能看到它（H1③，不依赖「主单被取消」这个更窄的成因）。
+    const alerts = await getAlerts(30);
+    const orphanAlert = alerts.sharedRoomOrphaned.find((o) => o.sharedRoomId === oldRoomId);
+    expect(orphanAlert).toBeDefined();
+    expect(orphanAlert?.memberOrderNumbers).toEqual([orderB.orderNumber]);
+  });
+
+  it('H1④ 反例：既有房 Σ份额=0 且原样重提（只是留守成员，不是新增/改动）→ 放行 + warning，不是 400', async () => {
+    const actor = await adminActor();
+    const { hotel, roomType } = await createHotelWithRoomType(4);
+    const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+    const orderC = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
+
+    // 旧共享房 S：A(1) + B(0)。
+    const created = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    const oldRoomId = created.rooms[0].sharedRoomId;
+
+    // 隐式挪走 A（新请求只提 A 拉进新房，不点名 S）——S 落库只剩 B、Σ=0。
+    await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          {
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderA.id,
+                orderItemId: orderA.items[0].id,
+                passengerIds: [orderA.passengers[0].id],
+                roomFraction: 1,
+              },
+              {
+                orderId: orderC.id,
+                orderItemId: orderC.items[0].id,
+                passengerIds: [orderC.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+
+    const sBefore = await prisma.sharedRoom.findUniqueOrThrow({ where: { id: oldRoomId } });
+    expect(sBefore.status).toBe('ACTIVE'); // 仍剩 B 一人，不会被自动解散
+
+    // 前端（或运营）把 S 明确列进 body.rooms 原样重提（只有 B，roomFraction 仍是 0，
+    // 与落库现状完全一致——不是新增/改动）：H1④ 要求放行，不是 Σ≠1 的 400。
+    const resubmit = await saveSharedRooms(
+      {
+        hotelId: hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        expectedVersions: { [oldRoomId]: sBefore.version },
+        rooms: [
+          {
+            sharedRoomId: oldRoomId,
+            hotelRoomTypeId: roomType.id,
+            groups: [
+              {
+                orderId: orderB.id,
+                orderItemId: orderB.items[0].id,
+                passengerIds: [orderB.passengers[0].id],
+                roomFraction: 0,
+              },
+            ],
+          },
+        ],
+        dissolve: [],
+      },
+      actor,
+    );
+    expect(resubmit.rooms[0].sharedRoomId).toBe(oldRoomId);
+    expect(
+      resubmit.warnings.some((w) => w.includes(oldRoomId) && w.includes('原计费方已迁出')),
+    ).toBe(true);
+
+    const sAfter = await prisma.sharedRoom.findUniqueOrThrow({
+      where: { id: oldRoomId },
+      include: { members: true },
+    });
+    expect(sAfter.status).toBe('ACTIVE');
+    expect(sAfter.members).toHaveLength(1);
+    expect(sAfter.members[0]!.orderId).toBe(orderB.id);
   });
 
   it('旧共享房只剩这一名乘客：拽走后旧房自动 DISSOLVED，不留零成员的幽灵房', async () => {
@@ -2061,8 +2239,6 @@ describe('saveSharedRooms · 真 DB E2E · 隐式触及旧共享房的清理（a
  * 累加两边的 roomFraction，行级计费份额直接翻倍。
  */
 describe('saveSharedRooms · 真 DB E2E · 显式解散并同时迁入新房不重复计费（astra B-N2）', () => {
-  afterEach(() => flushFireAndForgetAudit());
-
   it('S 被 dissolve 的同时，S 的乘客被拖进新房 T → 最终只在 T，roomsBilled 不翻倍', async () => {
     const actor = await adminActor();
     const { hotel, roomType } = await createHotelWithRoomType(4);
