@@ -514,6 +514,33 @@ function roomGroupScope(order: Pick<OrderForMasterExport, 'items'>, group: RoomG
   );
 }
 
+/**
+ * B10 预扫描：把已取到的订单集合展开成「scope+identityKey+sortKey」条目，喂给
+ * buildIdentityNumberMap 统一编号。抽成纯函数（不碰 DB，client 早已在调用方把
+ * verifiedSplitPairKeys 算好传进来）——便于单测直接验证 M3-3：零乘客房组不该占号，
+ * 否则全岗总表的号会比分房表/整班机导出（两者都是逐乘客收集，空组天然不产出条目）
+ * 整体多算 1，跨导出「同一房号」的承诺就此落空。
+ */
+export function buildMasterIdentityEntries(
+  orders: readonly Pick<OrderForMasterExport, 'id' | 'orderNumber' | 'items' | 'roomAssignment'>[],
+  verifiedSplitPairKeys: Set<string>,
+): IdentityNumberEntry[] {
+  const identityEntries: IdentityNumberEntry[] = [];
+  for (const order of orders) {
+    for (const g of parseRoomGroups(order.roomAssignment)) {
+      // M3-3：另两个导出（分房表 orders.export-room-allocation.ts、整班机
+      // orders.export.ts）是逐乘客收集房号身份的，零乘客房组天然不会产出条目；这里是逐
+      // 房组扫描，得显式过滤，否则一个排序靠前的空组会占掉一个号，让本表号比另两表整体
+      // 多算 1（跨导出「同一房号」的承诺就此落空）。
+      if (g.passengerIds.length === 0) continue;
+      const scope = roomGroupScope(order, g);
+      const identityKey = roomIdentityKey(g, order.id, verifiedSplitPairKeys);
+      identityEntries.push({ scope, identityKey, sortKey: roomIdentitySortKey(g, identityKey, order.orderNumber) });
+    }
+  }
+  return identityEntries;
+}
+
 // ── 订单 → 每位乘客一行 ─────────────────────────────────────────────────────
 /**
  * 把一张订单展开成 N 行（每位乘客一行），字段尽量填满系统真实存有的数据。
@@ -917,14 +944,7 @@ export async function buildMasterExportWorkbook(
   // B10：预建「scope+identityKey → 房号」映射——按确定性排序统一编号，不依赖本次查询把哪些
   // 订单先摆出来（本表 orderBy createdAt desc，与分房表/整班机导出的遍历顺序不同，旧口径
   // 「谁先遍历到就编几号」会让同一批身份在三个导出里编出不同房号）。
-  const identityEntries: IdentityNumberEntry[] = [];
-  for (const order of orders) {
-    for (const g of parseRoomGroups(order.roomAssignment)) {
-      const scope = roomGroupScope(order, g);
-      const identityKey = roomIdentityKey(g, order.id, verifiedSplitPairKeys);
-      identityEntries.push({ scope, identityKey, sortKey: roomIdentitySortKey(g, identityKey, order.orderNumber) });
-    }
-  }
+  const identityEntries = buildMasterIdentityEntries(orders, verifiedSplitPairKeys);
   const presortedIdentityNumbers = buildIdentityNumberMap(identityEntries);
   // roomNumberer 仍然保留，作为映射没覆盖到的边缘情况（理论不该发生：预扫描与正式渲染走
   // 同一套 order/group 数据）的防御性回落；prime 各 scope 计数器，避免它的号与预建号相撞。

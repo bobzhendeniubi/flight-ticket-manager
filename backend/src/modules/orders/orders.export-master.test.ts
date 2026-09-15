@@ -20,6 +20,7 @@ import {
   bootstrapTripCountProfilesIfEmpty,
   visibleColumns,
   masterExportFilename,
+  buildMasterIdentityEntries,
   type OrderForMasterExport,
   type TripStatsMap,
 } from './orders.export-master.js';
@@ -28,7 +29,7 @@ import { AGENT_HIDDEN_EXPORT_KEYS } from './orders.export-templates.js';
 import { filterExportOrdersByDepartDate } from './orders.export-depart-filter.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 import { SNAPSHOT_STALE_MS } from '../travelers/traveler-profiles.service.js';
-import { RoomNumberer } from './room-identity.js';
+import { RoomNumberer, buildIdentityNumberMap, scopedIdentityMapKey } from './room-identity.js';
 
 const D = (s: string): Date => new Date(`${s}T00:00:00.000Z`);
 
@@ -2050,5 +2051,48 @@ describe('orderToMasterRows — 跨单分房（§九验收反例 11）', () => {
     const [agentRow] = orderToMasterRows(orderA, new Map(), new RoomNumberer(), lookup, true);
     expect(agentRow.notes).toContain('与他单合住');
     expect(agentRow.notes).not.toContain('FTM_B');
+  });
+});
+
+describe('buildMasterIdentityEntries（M3-3：零乘客房组不占号）', () => {
+  it('排序靠前的空组不产出条目、不占号——真实房组编号是 1，不是被空组挤到 2', () => {
+    const order = {
+      id: 'o1',
+      orderNumber: 'FTM_1',
+      items: [],
+      roomAssignment: {
+        roomGroups: [
+          // 空组（id 字母序排在真实组之前）：另两个导出（分房表/整班机）是逐乘客收集的，
+          // 天然不会给这种组产出条目；全岗总表是逐房组扫描，之前没有这层过滤，会把它也
+          // 编进去，占掉真实组本该拿到的 1 号。
+          { id: 'g0', hotelName: 'X酒店', roomType: '', passengerIds: [] },
+          { id: 'g1', hotelName: 'X酒店', roomType: '', passengerIds: ['p1'] },
+        ],
+      },
+    } as unknown as OrderForMasterExport;
+
+    const entries = buildMasterIdentityEntries([order], new Set());
+    // 空组被过滤——不产出条目，与另两个导出的天然行为对齐
+    expect(entries).toHaveLength(1);
+
+    const numbers = buildIdentityNumberMap(entries);
+    // 未归属房组落 pending scope（roomNumberScopeKey 用 group.hotelName 兜底）
+    const scope = 'pending:X酒店|';
+    expect(numbers.get(scopedIdentityMapKey(scope, 'o1:g1'))).toBe(1);
+  });
+
+  it('空组之外没有真实房组时，整个 scope 不产出任何号', () => {
+    const order = {
+      id: 'o1',
+      orderNumber: 'FTM_1',
+      items: [],
+      roomAssignment: {
+        roomGroups: [{ id: 'g0', hotelName: 'X酒店', roomType: '', passengerIds: [] }],
+      },
+    } as unknown as OrderForMasterExport;
+
+    const entries = buildMasterIdentityEntries([order], new Set());
+    expect(entries).toHaveLength(0);
+    expect(buildIdentityNumberMap(entries).size).toBe(0);
   });
 });
