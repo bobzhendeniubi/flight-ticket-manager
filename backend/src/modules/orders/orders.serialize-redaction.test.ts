@@ -966,3 +966,59 @@ describe('serializeOrder · 对外中性航段状态 publicLegStatus', () => {
     });
   });
 });
+
+/**
+ * astra B 路 finding N1（HIGH）：按房组拆行留痕 `metadata.splitRoomGroup.roomGroupId`
+ * 存量数据可能是跨单分房迁移前的老式编码房组 id `shared:<共享键>:<行id>`——迁移脚本只
+ * 改 Order.roomAssignment，不碰这份 metadata 历史副本；对外角色脱敏此前只按顶层黑名单
+ * 过滤键名，没有递归处理 splitRoomGroup 这个嵌套对象，旧编码原样随订单详情/列表/售后
+ * 响应下发给代理。用**完整外部订单响应序列化成字符串**断言不含共享键值——只测
+ * serializeRoomGroupsFor 测不出这条泄露路径（它管的是 roomAssignment，不是 item.metadata）。
+ */
+describe('serializeOrder · splitRoomGroup.roomGroupId 脱敏（astra B 路 N1）', () => {
+  const LEGACY_SHARED_SECRET = 'SHARED_SECRET_SORTED_MUST_NOT_LEAK';
+  const legacyRoomGroupId = `shared:${LEGACY_SHARED_SECRET}:item-source-id`;
+
+  function buildOrderWithSplitRoomGroup() {
+    return {
+      ...buildOrder(),
+      items: [
+        {
+          ...buildOrder().items[0],
+          metadata: {
+            ...buildOrder().items[0].metadata,
+            splitRoomGroup: {
+              fromItemId: 'item-source-id',
+              roomGroupId: legacyRoomGroupId,
+              at: '2026-09-01T00:00:00.000Z',
+            },
+          },
+        },
+        buildOrder().items[1],
+      ],
+    };
+  }
+
+  it('AGENT/CUSTOMER 视角：roomGroupId 整键剥掉，fromItemId/at 保留；完整响应字符串里不残留共享键值', () => {
+    const order = buildOrderWithSplitRoomGroup();
+    for (const role of [UserRole.AGENT, UserRole.CUSTOMER]) {
+      const out = serializeOrder(order, orderSerializeRoleCtx(role)) as Record<string, any>;
+      expect(out.items[0].metadata.splitRoomGroup.roomGroupId, role).toBeUndefined();
+      expect(out.items[0].metadata.splitRoomGroup.fromItemId, role).toBe('item-source-id');
+      expect(out.items[0].metadata.splitRoomGroup.at, role).toBe('2026-09-01T00:00:00.000Z');
+      // 反向确认：不能只查 roomGroupId 这一个字段——万一序列化链路上别的地方还留了一份
+      // 副本，这里才是真正兜底的断言。
+      const dumped = JSON.stringify(out);
+      expect(dumped, role).not.toContain(LEGACY_SHARED_SECRET);
+      expect(dumped, role).not.toContain(legacyRoomGroupId);
+    }
+  });
+
+  it('ADMIN/STAFF 视角：roomGroupId 原样保留（内部溯源仍要看得到，不是全局屏蔽这个字段）', () => {
+    const order = buildOrderWithSplitRoomGroup();
+    for (const role of [UserRole.ADMIN, UserRole.STAFF]) {
+      const out = serializeOrder(order, orderSerializeRoleCtx(role)) as Record<string, any>;
+      expect(out.items[0].metadata.splitRoomGroup.roomGroupId, role).toBe(legacyRoomGroupId);
+    }
+  });
+});

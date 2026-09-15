@@ -27650,14 +27650,41 @@ const REDACTED_ITEM_METADATA_KEYS: readonly string[] = [
 //    它们普遍带原价、成本、政策报价、班次 id 与内部操作人，随 `...i` 展开就会整段下发给代理。
 
 /**
+ * `splitRoomGroup.roomGroupId`（按房组拆行留痕，见 `splitHotelItemByRoomGroup`）对外脱敏
+ * （HIGH 修复 · astra B 路 finding N1）：存量数据可能是跨单分房迁移前的老式编码房组 id
+ * `shared:<共享键>:<行 id>`——新写入点房组 id 已经是随机 uuid（B1 已解决），但迁移脚本
+ * `rewrite-shared-room-group-ids.ts` 只改 `Order.roomAssignment`，不碰这份 metadata 历史
+ * 副本，旧编码会原样留在这里，随 `...i` 展开随订单详情/列表/售后响应一起下发给代理。
+ * `roomGroupId` 对外没有业务意义（纯内部溯源用），整键剥掉；`fromItemId`/`at`/`note`
+ * 指向本单自己的行/时间戳，不含跨单信息，保留。
+ */
+function redactSplitRoomGroupForExternal(value: unknown): unknown {
+  if (value == null || typeof value !== 'object' || Array.isArray(value)) return value;
+  const rest: Record<string, unknown> = {};
+  for (const [k, v] of Object.entries(value as Record<string, unknown>)) {
+    if (k === 'roomGroupId') continue;
+    rest[k] = v;
+  }
+  return rest;
+}
+
+/**
  * 对外脱敏：从订单行 metadata 剥离计价键，保留非价格业务键。
  * metadata 为空 / 非对象 → 原样返回（不强行造对象）。
+ *
+ * `splitRoomGroup` 不能像其它键一样整键透传或整键剥除——它不在黑名单里（`fromItemId`/
+ * `at`/`note` 对外本就该看见，标注这行是从哪条本单行拆出来的），但其 `roomGroupId`
+ * 子字段可能携带跨单分房的历史编码密钥，必须单独递归处理（见上）。
  */
 function redactItemMetadataForExternal(metadata: unknown): unknown {
   if (metadata == null || typeof metadata !== 'object' || Array.isArray(metadata)) return metadata;
   const rest: Record<string, unknown> = {};
   for (const [key, value] of Object.entries(metadata as Record<string, unknown>)) {
     if (REDACTED_ITEM_METADATA_KEYS.includes(key)) continue;
+    if (key === 'splitRoomGroup') {
+      rest[key] = redactSplitRoomGroupForExternal(value);
+      continue;
+    }
     rest[key] = value;
   }
   return rest;
