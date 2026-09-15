@@ -651,6 +651,14 @@ async function saveSharedRoomsInner(
     //   · 旧房的 version 永远不涨，membership 却在变，等于绕开了整套 CAS 协议。
     // 只在「本酒店本区间」匹配的范围内找——乘客可能在别的酒店/别的行程也挂着别的共享房，
     // 那些与本次请求无关，不该被牵连进来。
+    //
+    // 这一步查询发生在任何锁之前，结果只是「候选」，不是定论（astra N5：下面锁完之后会
+    // 重新核实一遍，见 lockAffectedOrdersOnce 调用之后的复查）——**不要**在这里改成先给
+    // initialOrderIds 加锁再查：两个并发请求各自只锁自己请求里明确点名的那部分订单、彼此
+    // 顺序不一致时，会与下面按统一排序锁完整候选集合的做法相冲突，人为制造出锁序不一致的
+    // 死锁（试过，真会死锁：见集成测试「并发交错提交不死锁」）。全局锁序必须只有一处
+    // 决定——按 lockAffectedOrdersOnce 内部「候选集合排序后逐个锁」这一处，不能在它之前
+    // 再插一次单独排序的锁。
     const implicitRoomIds = new Set<string>();
     if (allRequestedPassengerIds.size > 0) {
       const implicitMemberships = await tx.sharedRoomMember.findMany({
@@ -666,6 +674,35 @@ async function saveSharedRoomsInner(
     const touchedSharedRoomIds = new Set<string>([...explicitTouchedSharedRoomIds, ...implicitRoomIds]);
 
     const lockedOrderIds = await lockAffectedOrdersOnce(tx, initialOrderIds, touchedSharedRoomIds);
+
+    // 锁后重新发现隐式房（astra N5 回归修复）：上面那次查询是锁前的候选，
+    // lockAffectedOrdersOnce 内部只核实「已经发现的 touchedSharedRoomIds 里成员有没有
+    // 变多」，从来不会发现「一开始就没发现的房间」——如果就在上面查完之后、这里锁到之前，
+    // 本次认领的乘客被另一个并发请求挪去了一间我们完全没发现的第三间房，我们既不会锁那
+    // 间房、也不会在下面清理它对这些乘客的成员表引用，留下孤儿引用。
+    //
+    // 现在锁已经拿到手：lockedOrderIds ⊇ initialOrderIds，这些乘客全部归属
+    // initialOrderIds 里的订单（body.rooms 的 g.orderId），而任何想把这些乘客挪进/挪出
+    // 一间共享房的并发写入，同样要把这些订单纳入它自己的 initialOrderIds、同样要走这个
+    // 函数、同样要先抢到这些订单的 Order 锁——换句话说，我们锁住这些订单的那一刻起，这些
+    // 乘客的共享房归属就已经冻结了。这里用锁后的最新状态重新查一遍隐式房，只在真发现了
+    // 锁前那次查询没有覆盖到的新房间时才抛 SharedRoomLockSetExpandedError 交给外层整个
+    // 事务重试（该房间下一轮会被正确纳入 touched 并锁上）；查询本身很轻，允许每次都重查，
+    // 不必用「变了没有」的增量判断去省这一次查询。
+    if (allRequestedPassengerIds.size > 0) {
+      const recheckedMemberships = await tx.sharedRoomMember.findMany({
+        where: {
+          passengerId: { in: [...allRequestedPassengerIds] },
+          sharedRoomId: { notIn: [...explicitTouchedSharedRoomIds] },
+          sharedRoom: { hotelId: body.hotelId, checkIn: checkInD, checkOut: checkOutD, status: 'ACTIVE' },
+        },
+        select: { sharedRoomId: true },
+      });
+      for (const m of recheckedMemberships) {
+        if (!implicitRoomIds.has(m.sharedRoomId)) throw new SharedRoomLockSetExpandedError();
+      }
+    }
+
     const orders = await loadLockedOrders(tx, [...lockedOrderIds]);
 
     // 订单集合稳定后，按 SharedRoom id 升序显式锁共享房行（astra A9：原实现直到落库段的
@@ -966,6 +1003,49 @@ async function saveSharedRoomsInner(
           ...(preservedNotes != null ? { notes: preservedNotes } : {}),
         });
         newGroupsByOrder.set(entry.orderId, arr);
+      }
+    }
+    // 隐式触及旧共享房的留守成员镜像重建（astra N5，回归修复）：上面的 kept 过滤器只要
+    // sid 在 touchedSharedRoomIds 里就整体丢弃这个订单在这间房的旧 JSON 组——隐式房同样
+    // 在 touchedSharedRoomIds 里（本函数顶部并入的），所以隐式房里「没有被本次请求认领走」
+    // 的其它订单（比如反例里的 B：S 有 A、B，只把 A 拖进新房且请求不列 S）的旧组同样被
+    // 丢弃，但它们在 SharedRoomMember 表里仍然是这间房的成员——下面落库段对隐式房的清理
+    // 只摘除 seenPassengerIds 认领走的那些人，B 不在其中，不会被摘。旧实现到这里就结束了，
+    // 从未把 B 的组重新写回 newGroupsByOrder：JSON 侧 B 的这间房凭空消失，紧接着的
+    // roomsBilled 回写只看 newGroupsByOrder 里还有没有 B 这一行的组引用，查不到就显式写
+    // 0，把 B 在这间房的计费份额也一起清没了。
+    //
+    // 用 currentMembersByRoom（锁后落库现状，上面已按 touchedSharedRoomIds 查过）逐
+    // (orderId, orderItemId) 重建：排除本次被认领走的乘客（seenPassengerIds），剩余乘客
+    // 非空才重建、原样保留原份额与原 notes/id——这只是把「继续留守这间房」的事实原样写回
+    // JSON，不是一次业务改动，不重算 Σ=1（保留其份额，不重新分配，见方案 §五「解绑」的
+    // 份额处理原则）。如果某个 (orderId, orderItemId) 的乘客本次全部被认领走就不重建，
+    // 与下面落库段「隐式房清空后自动 DISSOLVED」判断依据一致（都是「排除
+    // seenPassengerIds 之后还有没有人」），两处不会出现「JSON 说有房、DB 说已解散」的
+    // 不一致。
+    for (const roomId of implicitRoomIds) {
+      const membersByItem = currentMembersByRoom.get(roomId);
+      if (!membersByItem) continue;
+      for (const [itemKey, entry] of membersByItem) {
+        const survivors = [...entry.passengerIds].filter((pid) => !seenPassengerIds.has(pid));
+        if (survivors.length === 0) continue; // 这一行的乘客本次全部被认领走，不重建
+        const [survivorOrderId, survivorItemId] = itemKey.split(':');
+        if (!survivorOrderId || !survivorItemId) continue; // 防御：key 格式不对就跳过，不该发生
+        const arr = newGroupsByOrder.get(survivorOrderId) ?? [];
+        const preserveKey = `${roomId}:${survivorOrderId}:${survivorItemId}`;
+        const preservedNotes = preservedGroupNotes.get(preserveKey);
+        const groupId = preservedGroupIds.get(preserveKey) ?? randomUUID();
+        arr.push({
+          id: groupId,
+          hotelName: '',
+          roomType: '',
+          passengerIds: survivors,
+          orderItemId: survivorItemId,
+          roomFraction: entry.fraction,
+          sharedRoomId: roomId,
+          ...(preservedNotes != null ? { notes: preservedNotes } : {}),
+        });
+        newGroupsByOrder.set(survivorOrderId, arr);
       }
     }
     // 新建/更新的共享房：给每个 group 所在订单追加一个共享房组。

@@ -1968,6 +1968,18 @@ describe('saveSharedRooms · 真 DB E2E · 隐式触及旧共享房的清理（a
     const refreshedA = await prisma.order.findUniqueOrThrow({ where: { id: orderA.id } });
     const groupsA = (refreshedA.roomAssignment as { roomGroups: Array<Record<string, unknown>> }).roomGroups;
     expect(groupsA.every((g) => g.sharedRoomId !== oldRoomId)).toBe(true);
+
+    // astra N5（回归修复）反例：B 完全没被这次请求提及，留守旧房——它的 JSON 镜像组
+    // 必须原样重建（不能因为旧房被 touched 就整体丢弃），份额保持原值（0），roomsBilled
+    // 不能被清成 0（旧实现会把 B 这一行在这间房的组搬空，roomsBilled 显式回写成 0）。
+    const refreshedB = await prisma.order.findUniqueOrThrow({ where: { id: orderB.id } });
+    const groupsB = (refreshedB.roomAssignment as { roomGroups: Array<Record<string, unknown>> }).roomGroups;
+    const bGroupInOldRoom = groupsB.find((g) => g.sharedRoomId === oldRoomId);
+    expect(bGroupInOldRoom).toBeDefined();
+    expect(bGroupInOldRoom?.passengerIds).toEqual([orderB.passengers[0].id]);
+    expect(bGroupInOldRoom?.roomFraction).toBe(0); // 保留原份额，不重新分配
+    const bItemAfter = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderB.items[0].id } });
+    expect(Number(bItemAfter.roomsBilled)).toBe(0); // 与 JSON 组的 roomFraction 口径一致，不是被清空
   });
 
   it('旧共享房只剩这一名乘客：拽走后旧房自动 DISSOLVED，不留零成员的幽灵房', async () => {
