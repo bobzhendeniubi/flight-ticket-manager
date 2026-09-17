@@ -168,6 +168,30 @@ export async function scheduleSeatReclaimScan(): Promise<void> {
   });
 }
 
+// ── RefreshToken 过期行清理（refresh-token-prune，每天一次）──
+// 登录 / 刷新轮换只增不删，实测库过期行占七成；样板同上面的每小时扫描，只是周期改成 24 小时。
+// 删什么、留多久见 modules/auth/refresh-token-prune.ts。
+export interface RefreshTokenPruneJobData {
+  requestedAt?: string;
+}
+
+export const refreshTokenPruneQueue = new Queue<RefreshTokenPruneJobData>('refresh-token-prune', {
+  connection: bullRedis,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 5000 },
+    removeOnComplete: { age: 7 * 24 * 3600 },
+    removeOnFail: { age: 30 * 24 * 3600 },
+  },
+});
+
+export async function scheduleRefreshTokenPrune(): Promise<void> {
+  await refreshTokenPruneQueue.add('prune-refresh-tokens', {}, {
+    jobId: 'refresh-token-prune-daily',
+    repeat: { every: 24 * 60 * 60 * 1000 },
+  });
+}
+
 /**
  * 创建锁位时排队：delay 毫秒后若锁仍 ACTIVE 则标 EXPIRED（座位自动回归可售）。
  * jobId 用 `seatlock-<lockId>`，方便下单消费 / 手动释放时 remove() 取消。
@@ -230,6 +254,7 @@ export async function closeQueues(): Promise<void> {
     holdOverdueQueue.close(),
     noShowVoidQueue.close(),
     seatReclaimQueue.close(),
+    refreshTokenPruneQueue.close(),
     fulfillmentQueueEvents.close(),
   ]);
   await bullRedis.quit();

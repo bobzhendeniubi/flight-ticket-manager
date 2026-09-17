@@ -41,6 +41,7 @@ import { heldSeatsForSeatClass } from '../modules/hold-orders/held-seats.js';
 import { markOverdueHolds } from '../modules/hold-orders/hold-overdue.js';
 import { voidDepartedReleasedReturnLegs } from '../modules/orders/no-show-void.js';
 import { SeatAllocationService } from '../modules/seat-allocation/seat-allocation.service.js';
+import { pruneExpiredRefreshTokens } from '../modules/auth/refresh-token-prune.js';
 
 /**
  * 超时释放某订单占用的座位——套餐升舱拆座感知 + 下限钳制在 0（MEDIUM 修复）。
@@ -509,6 +510,43 @@ void (async () => {
   }
 })();
 
+// RefreshToken 过期行清理（每天一次）：登录 / 刷新轮换只增不删，过期行从没清过。
+// 样板照抄 seat-reclaim：全库一条 deleteMany，concurrency 1；queue.ts 侧的
+// scheduleRefreshTokenPrune 按名字动态导入自注册（测试环境 mock 掉 queue 时静默跳过）。
+interface RefreshTokenPruneJobData {
+  requestedAt?: string;
+}
+
+const refreshTokenPruneWorker = new Worker<RefreshTokenPruneJobData>(
+  'refresh-token-prune',
+  async () => {
+    const deleted = await pruneExpiredRefreshTokens();
+    // eslint-disable-next-line no-console
+    console.log(`[worker:refresh-token-prune] ✓ 清理过期 refresh token ${deleted} 行`);
+    return { deleted };
+  },
+  { connection: bullRedis, concurrency: 1 },
+);
+
+refreshTokenPruneWorker.on('failed', (job, err) => {
+  // eslint-disable-next-line no-console
+  console.error(`[worker:refresh-token-prune] ✗ job ${job?.id} failed:`, err.message);
+});
+
+void (async () => {
+  try {
+    const module = await import('./queue.js');
+    const scheduleRefreshTokenPrune = (
+      module as unknown as { scheduleRefreshTokenPrune?: () => Promise<void> }
+    ).scheduleRefreshTokenPrune;
+    if (typeof scheduleRefreshTokenPrune !== 'function') return;
+    await scheduleRefreshTokenPrune();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[worker:refresh-token-prune] failed to register repeatable scan:', err);
+  }
+})();
+
 seatLockWorker.on('failed', (job, err) => {
   // eslint-disable-next-line no-console
   console.error(`[worker:seat-lock] ✗ job ${job?.id} failed:`, err.message);
@@ -594,6 +632,7 @@ async function shutdown() {
     holdOverdueWorker.close(),
     noShowVoidWorker.close(),
     seatReclaimWorker.close(),
+    refreshTokenPruneWorker.close(),
     notificationWorker.close(),
   ]);
   await closeMailer();
