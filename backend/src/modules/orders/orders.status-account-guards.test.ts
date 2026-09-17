@@ -40,7 +40,7 @@ const { mockPrisma } = vi.hoisted(() => ({
     commissionRecord: { findFirst: vi.fn(), create: vi.fn(), findMany: vi.fn(), update: vi.fn() },
     auditLog: { create: vi.fn() },
     agent: { findUnique: vi.fn() },
-    commissionRule: { findMany: vi.fn() },
+    commissionRule: { findMany: vi.fn(), findFirst: vi.fn() },
     prepaymentTransaction: { findMany: vi.fn(), create: vi.fn() },
     $executeRaw: vi.fn(),
     $queryRaw: vi.fn(),

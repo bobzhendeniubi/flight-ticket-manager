@@ -54,7 +54,7 @@ const { mockPrisma, mockWriteAudit } = vi.hoisted(() => ({
     prepaymentTransaction: { findMany: vi.fn() },
     auditLog: { create: vi.fn() },
     agent: { findUnique: vi.fn() },
-    commissionRule: { findMany: vi.fn() },
+    commissionRule: { findMany: vi.fn(), findFirst: vi.fn() },
     $executeRaw: vi.fn(),
     $queryRaw: vi.fn(),
   },
@@ -268,6 +268,8 @@ function commonBeforeEach() {
   mockPrisma.$queryRaw.mockResolvedValue([]);
   mockPrisma.agent.findUnique.mockResolvedValue({ parentAgentId: null }); // 默认单级代理
   mockPrisma.prepaymentTransaction.findMany.mockResolvedValue([]); // 无余额抵扣流水
+  // 默认「费率表非空」= 佣金引擎已启用；只有专门测引擎未启用的用例才把它改成 null
+  mockPrisma.commissionRule.findFirst.mockResolvedValue({ id: 'rule_any' });
   mockWriteAudit.mockResolvedValue(undefined);
 }
 
@@ -496,11 +498,27 @@ describe('createCommissionsForOrder · 零计提落审计（可见性）', () =>
     vi.useRealTimers();
   });
 
+  it('费率表整张为空（引擎未启用）→ 不落 COMMISSION_ACCRUAL_EMPTY，免得逐单刷屏', async () => {
+    // 实测上线以来 0 条费率，每张代理单付款都刷一条 WARNING（14 天 859 条），把真正的警告淹掉。
+    // 引擎没启用时零计提是常态，不是异常。
+    arrangePaidTransition([bundleRow(450), flightRow('leg-out', '2026-09-10T02:00:00.000Z', 1000)]);
+    mockPrisma.commissionRule.findMany.mockImplementation(ruleStore([]));
+    mockPrisma.commissionRule.findFirst.mockResolvedValue(null); // 整张表空
+
+    await runPaidTransition();
+
+    expect(mockPrisma.commissionRecord.create).not.toHaveBeenCalled();
+    expect(mockPrisma.commissionRule.findFirst).toHaveBeenCalledTimes(1);
+    expect(mockWriteAudit).not.toHaveBeenCalled();
+  });
+
   it('代理单一条规则都没命中 → 落 WARNING 审计，带上订单号/代理/出发日/涉及档位', async () => {
     // 费率没配（新代理 / 新产品档）是最常见的零计提原因。旧实现静默返回：零日志、零审计、
     // 零告警，财务事后无从发现「这单为什么没佣金」。
     arrangePaidTransition([bundleRow(450), flightRow('leg-out', '2026-09-10T02:00:00.000Z', 1000)]);
-    mockPrisma.commissionRule.findMany.mockImplementation(ruleStore([])); // 一条规则都没配
+    // 本单链路上一条规则都没配；费率表本身不空（commonBeforeEach 默认 = 别的代理配过、引擎已启用），
+    // 此时零计提才值得财务去查。
+    mockPrisma.commissionRule.findMany.mockImplementation(ruleStore([]));
 
     await runPaidTransition();
 

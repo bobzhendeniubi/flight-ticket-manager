@@ -34,7 +34,7 @@ const { mockPrisma } = vi.hoisted(() => ({
     // 不给出 auditLog 桩，写审计会在 writeAudit 内部抛错被吞掉并刷 console.error。
     auditLog: { create: vi.fn() },
     agent: { findUnique: vi.fn() },
-    commissionRule: { findMany: vi.fn() },
+    commissionRule: { findMany: vi.fn(), findFirst: vi.fn() },
     $executeRaw: vi.fn(),
     $queryRaw: vi.fn(),
   },

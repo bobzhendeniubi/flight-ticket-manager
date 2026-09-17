@@ -49,7 +49,7 @@ const { mockPrisma, hotelControlMocks, queueMocks } = vi.hoisted(() => ({
     user: { findUnique: vi.fn() },
     passenger: { findMany: vi.fn() },
     agent: { findUnique: vi.fn() },
-    commissionRule: { findMany: vi.fn() },
+    commissionRule: { findMany: vi.fn(), findFirst: vi.fn() },
     $executeRaw: vi.fn(),
     $queryRaw: vi.fn(),
     $transaction: vi.fn(),

@@ -29171,6 +29171,11 @@ async function createCommissionsForOrder(
   // （只有 CRITICAL 才上抛），故审计失败绝不会影响计提本身。用 void 不 await，不让审计的
   // 网络往返把事务多按住一个 RTT。
   if (createdCount === 0 && options?.emitEmptyAccrualAudit !== false) {
+    // 费率表整张为空 = 佣金引擎还没启用。这时每张代理单都会走到这里，逐单落 WARNING 只会把审计
+    // 日志淹掉（上线以来 0 条费率、14 天刷了 859 条），财务也不会去查「这单为什么没佣金」。
+    // 只在至少配过一条费率（引擎已在用）时才提示，让这条警告回到它的本意：某个代理 / 某档没配。
+    const engineConfigured = await tx.commissionRule.findFirst({ select: { id: true } });
+    if (!engineConfigured) return;
     void writeAudit({
       actor: { role: 'SYSTEM' },
       action: 'COMMISSION_ACCRUAL_EMPTY',

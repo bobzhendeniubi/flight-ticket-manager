@@ -46,7 +46,7 @@ const { mockPrisma, mockGetHotelNightlyRemaining, mockResolveRandomTierHotelEntr
     // 不给出 auditLog 桩，写审计会在 writeAudit 内部抛错被吞掉并刷 console.error。
     auditLog: { create: vi.fn() },
     agent: { findUnique: vi.fn() },
-    commissionRule: { findMany: vi.fn() },
+    commissionRule: { findMany: vi.fn(), findFirst: vi.fn() },
     $executeRaw: vi.fn(),
     // R5：转 PAID 分支对 Order 行 FOR UPDATE 读最新 paidAmount。mock 返回 []（无 DB）→ 代码回退到
     // findUnique 读到的 order.paidAmount，与旧口径完全一致（真 DB FOR UPDATE 主路径由集成测试覆盖）。
