@@ -2643,7 +2643,7 @@ model LegacyReceipt {
   @@index([receivedAt])
 }
 
-/// 订单号发号计数器：一行 = 一个北京业务日，nextSeq = 该日已发出的最大序号（单号 = FTM + 业务日 + 5 位序号）。
+/// 订单号发号计数器：一行 = 一个北京业务日，nextSeq = 该日已发出的最大序号（单号 = FTM + 业务日 + 序号经固定置换后的 5 位）。
 /// 只由 modules/orders/order-number.ts 用 INSERT … ON CONFLICT DO UPDATE … RETURNING 原子自增，别处不要直接写。
 model OrderNumberCounter {
   businessDate DateTime @id @db.Date
