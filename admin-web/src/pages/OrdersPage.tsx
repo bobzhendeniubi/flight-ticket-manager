@@ -1065,6 +1065,7 @@ function TravelerTripsMiniBadge({
   tripsStatus?: TravelerTripsLookupStatus;
 }) {
   const title = '可用 = 已飞 − 已核销；在订未飞不计入可用';
+  if (tripsStatus === 'forbidden') return null;
   if (tripsStatus === 'loading') {
     return <span className="text-[10px] text-ink-soft">次数查询中…</span>;
   }
@@ -11820,7 +11821,8 @@ function travelerDocKey(documentType: DocumentType, documentNumber: string): str
 }
 
 /** useTravelerTripsByDoc 的请求状态：idle=还没查（没证件可查）；查询中/失败要跟「查到了但是无档案」分开显示。 */
-type TravelerTripsLookupStatus = 'idle' | 'loading' | 'error' | 'ready';
+/** forbidden = 当前角色无权查（代理），与「没查到」区分开：子行不渲染徽章，而不是显示「无记录」。 */
+type TravelerTripsLookupStatus = 'idle' | 'loading' | 'error' | 'ready' | 'forbidden';
 
 // 运营原话：「可用次数应该是飞行次数和在订未飞相加」；老板拍板先只把三个数摆到界面上，
 // 系统「可用」口径不动（可用=已飞−已核销，核销闸仍按它拦）——「在订未飞」是否计入可用，
@@ -11870,6 +11872,10 @@ function useTravelerTripsByDoc(
   passengers: OrderSummary['passengers'],
 ): { rows: Map<string, TravelerProfileLookupRow>; status: TravelerTripsLookupStatus } {
   const token = useAuth((s) => s.tokens)?.accessToken ?? '';
+  // 常旅客台账接口只放行 ADMIN/STAFF（后端 requireRole）：代理账号打过去必 403，
+  // 曾经每开一张单都白打一次再静默降级。改为按角色直接不发请求，代理侧与「没建档」同样不显示徽章。
+  const role = useAuth((s) => s.user?.role);
+  const canLookupTravelers = role === 'ADMIN' || role === 'STAFF';
   const [rows, setRows] = useState<Map<string, TravelerProfileLookupRow>>(new Map());
   const [status, setStatus] = useState<TravelerTripsLookupStatus>('idle');
 
@@ -11887,9 +11893,9 @@ function useTravelerTripsByDoc(
   const docsKey = docs.map((d) => travelerDocKey(d.documentType, d.documentNumber)).join(',');
 
   useEffect(() => {
-    if (!token || docs.length === 0) {
+    if (!token || docs.length === 0 || !canLookupTravelers) {
       setRows(new Map());
-      setStatus('idle');
+      setStatus(token && docs.length > 0 && !canLookupTravelers ? 'forbidden' : 'idle');
       return;
     }
     let cancelled = false;
@@ -11911,7 +11917,7 @@ function useTravelerTripsByDoc(
     };
     // docsKey 已完整表达 docs 内容
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [token, docsKey]);
+  }, [token, docsKey, canLookupTravelers]);
 
   return { rows, status };
 }
@@ -12072,6 +12078,8 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
   // 复用已有 audit 数据源，无需后端改动；按 before.passengerId 归到各乘客卡下方。
   // listAuditLogs 的 action 过滤一次只认一个值，两种动作分两次拉，前端合并按时间倒序。
   const token = useAuth((s) => s.tokens)?.accessToken ?? '';
+  // 审计接口只放行 ADMIN/STAFF：代理账号按角色直接落「无权查看」，不再每开一张单打两次必 403 的请求。
+  const canReadAudit = useAuth((s) => s.user?.role === 'ADMIN' || s.user?.role === 'STAFF');
   const [swapHistory, setSwapHistory] = useState<PassengerHistoryEntry[]>([]);
   // 两个 action 的审计查询都 403（AGENT 角色——审计接口仅内部岗可读）时置 true，面板换成提示文案。
   const [swapHistoryForbidden, setSwapHistoryForbidden] = useState(false);
@@ -12086,6 +12094,11 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
   }, []);
   useEffect(() => {
     if (!token) return;
+    if (!canReadAudit) {
+      setSwapHistory([]);
+      setSwapHistoryForbidden(true);
+      return;
+    }
     let cancelled = false;
     // 两个 action 分开查，各自成败独立：一个 403/失败不该拖累另一个已经查到的数据。
     Promise.allSettled([
@@ -12119,7 +12132,7 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
     return () => {
       cancelled = true;
     };
-  }, [token, order.id, historyReloadKey]);
+  }, [token, canReadAudit, order.id, historyReloadKey]);
 
   // 按乘客净调价（0722）：读订单调价差额行，给每张乘客卡挂一个醒目净额小标（如「调整 +200」）。
   const adjustmentByPassenger = useMemo(
