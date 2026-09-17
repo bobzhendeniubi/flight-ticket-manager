@@ -38,8 +38,9 @@ import {
   type SettlementTier,
   UserRole,
 } from '@prisma/client';
-import { randomInt, randomUUID } from 'node:crypto';
+import { randomUUID } from 'node:crypto';
 import { prisma } from '../../db/prisma.js';
+import { generateOrderNumber } from './order-number.js';
 import {
   AppError,
   BadRequestError,
@@ -2204,7 +2205,7 @@ export class OrderService {
       throw new DuplicatePassengerError(`以下乘客证件号已在同航班的有效订单中，不能重复下单：${detail}`, { conflicts: conflictList });
     }
 
-    const orderNumber = await generateOrderNumber();
+    const orderNumber = await generateOrderNumber(tx);
     const contactName = input.contactName?.trim() || '系统录入';
     const contactPhone = input.contactPhone?.trim() || '-';
     const duplicateNote = conflictList.length > 0
@@ -2714,7 +2715,7 @@ export class OrderService {
       throw new BadRequestError('优惠金额超过订单应收，请核对');
     }
 
-    // 生成订单号（有极小概率撞 unique，重试 3 次）
+    // 生成订单号：按业务日计数器发号（见 order-number.ts），并发不撞，不需要重试。
     const orderNumber = await generateOrderNumber();
 
     // 事务：原子扣座位（CAS 防超卖）→ 写订单 → 写事件 → 消费本人锁位
@@ -18687,8 +18688,8 @@ export class OrderService {
     const replay = await this.findSplitReplay(orderId, input.requestToken);
     if (replay) return replay;
 
-    // 订单号撞号（P2002）重试环 ≤3 次：Postgres 里语句失败会废掉整个事务，
-    // 所以重试必须在事务外整体重来（每轮换一个新订单号），不能在事务内捕获后继续。
+    // 订单号由业务日计数器发号（order-number.ts），正常不会撞；这个 ≤3 次重试环只作兜底。
+    // Postgres 里语句失败会废掉整个事务，所以撞了必须在事务外整体重来（每轮换一个新号），不能在事务内捕获后继续。
     let lastError: unknown = null;
     for (let attempt = 0; attempt < 3; attempt++) {
       const targetOrderNumber = await generateOrderNumber();
@@ -27219,17 +27220,6 @@ export function passengerToData(
     visaExempt: p.visaExempt ?? false,
     singleRoom: p.singleRoom ?? false,
   };
-}
-
-/**
- * FTMYYYYMMDD + 5 位随机 — 每天 10 万空间，撞号概率极低。
- * 真撞了也只会在 $transaction 里 P2002 抛出，上层可以重试；MVP 阶段不做自动重试。
- */
-async function generateOrderNumber(): Promise<string> {
-  // 单号里的日期按北京业务日（不是 UTC）：凌晨 0-8 点下的单，UTC 日历还停在前一天。
-  const [yyyy, mm, dd] = businessDateISO(new Date()).split('-');
-  const suffix = String(randomInt(10000, 99999));
-  return `FTM${yyyy}${mm}${dd}${suffix}`;
 }
 
 // 注意：list() 和 get() 的 passengers select 不同，所以 serialize 用宽松类型

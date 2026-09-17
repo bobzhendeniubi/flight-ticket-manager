@@ -41,6 +41,12 @@ mockPrisma.$transaction.mockImplementation(
 
 vi.mock('../../db/prisma.js', () => ({ prisma: mockPrisma }));
 
+// 订单号发号器走真库计数器（INSERT … ON CONFLICT DO UPDATE），这里的 prisma 是 mock → 换成内存连号。
+vi.mock('./order-number.js', () => {
+  let seq = 0;
+  return { generateOrderNumber: async () => `FTM20260917${String(++seq).padStart(5, '0')}` };
+});
+
 // mock queue，避免 createOrder 事务后 import 真连 Redis
 vi.mock('../../queues/queue.js', () => ({
   scheduleSeatHoldRelease: vi.fn(),
