@@ -6,14 +6,17 @@
  *   (b) 不同业务日各自从序号 1 起。
  *   (c) 在事务里发号、事务回滚 → 序号不烧掉。
  *   (d) 候选号撞上存量单（切换当天的旧随机号）→ 顺延到下一个序号。
+ *   (e) 占位转正建单在调用方事务里发号：事务回滚后计数器没被动过（证明走的是 tx 不是全局 prisma）。
  *
  * 跑：
  *   1. docker compose -f docker-compose.test.yml up -d
  *   2. npm run test:integration
  */
 import { describe, it, expect } from 'vitest';
-import { OrderStatus, Prisma } from '@prisma/client';
+import { CabinClass, HoldOwnerType, OrderStatus, Prisma, UserRole } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
+import { businessDateISO } from '../../lib/business-time.js';
+import { OrderService } from './orders.service.js';
 import { generateOrderNumber, permuteSeq } from './order-number.js';
 
 const NOON_0917 = new Date('2026-09-17T04:00:00Z'); // 北京 12:00
@@ -63,5 +66,87 @@ describe('generateOrderNumber（真 DB）', () => {
     expect(await generateOrderNumber(prisma, NOON_0917)).toBe(numberFor('20260917', 2));
     const counter = await prisma.orderNumberCounter.findMany();
     expect(counter.map((c) => c.nextSeq)).toEqual([2]);
+  });
+});
+
+describe('占位转正建单在调用方事务里发号（真 DB）', () => {
+  const service = new OrderService();
+
+  async function holdFixture() {
+    const user = await prisma.user.create({
+      data: { email: `hold-${Date.now()}-${Math.random().toString(36).slice(2, 7)}@test.com`, role: UserRole.STAFF },
+    });
+    const flight = await prisma.flight.create({
+      data: { flightNumber: `TEST${Math.floor(Math.random() * 10000)}`, originCode: 'MFM', destinationCode: 'DAD', isActive: true },
+    });
+    const departureTime = new Date(Date.now() + 100 * 3600 * 1000);
+    const schedule = await prisma.flightSchedule.create({
+      data: {
+        flightId: flight.id,
+        departureTime,
+        arrivalTime: new Date(departureTime.getTime() + 90 * 60 * 1000),
+        departureTz: 'Asia/Macau',
+        arrivalTz: 'Asia/Ho_Chi_Minh',
+        isActive: true,
+      },
+    });
+    const seatClass = await prisma.flightSeatClass.create({
+      data: { scheduleId: schedule.id, cabin: CabinClass.ECONOMY, capacity: 5, basePrice: new Prisma.Decimal(1000) },
+    });
+    const hold = await prisma.holdOrder.create({
+      data: {
+        holdNo: `H${Date.now()}${Math.random().toString(36).slice(2, 6).toUpperCase()}`,
+        flightScheduleId: schedule.id,
+        seatClassId: seatClass.id,
+        ownerType: HoldOwnerType.CUSTOMER,
+        seats: 2,
+        perSeatPriceCny: 1000,
+        createdById: user.id,
+      },
+    });
+    return { user, schedule, hold };
+  }
+
+  function conversionInput(fx: Awaited<ReturnType<typeof holdFixture>>, tag: string) {
+    return {
+      holdOrderId: fx.hold.id,
+      holdNo: fx.hold.holdNo,
+      flightScheduleId: fx.schedule.id,
+      cabin: CabinClass.ECONOMY,
+      quantity: 1,
+      unitPriceCny: 1000,
+      passengers: [
+        {
+          fullName: `HOLD PAX ${tag}`,
+          documentType: 'PASSPORT' as const,
+          documentNumber: `HP${tag}${Date.now()}`,
+          dateOfBirth: '1990-01-01',
+          nationality: 'CN',
+          passengerType: 'ADULT' as const,
+        },
+      ],
+      contactName: '转正测试',
+      contactPhone: '13800138000',
+      actorUserId: fx.user.id,
+    };
+  }
+
+  it('(e) 事务回滚 → 计数器没被动过；提交 → 单号是当天序号 1 的置换值', async () => {
+    const fx = await holdFixture();
+    await expect(
+      prisma.$transaction(async (tx) => {
+        await service.createHoldConversionOrderWithinTx(tx, conversionInput(fx, 'A'));
+        throw new Error('rollback');
+      }),
+    ).rejects.toThrow('rollback');
+    // 走的是 tx：发号随事务一起回滚，计数器一行都没有。走全局 prisma 的话这里会留下 nextSeq=1。
+    expect(await prisma.orderNumberCounter.findMany()).toEqual([]);
+
+    const created = await prisma.$transaction((tx) =>
+      service.createHoldConversionOrderWithinTx(tx, conversionInput(fx, 'B')),
+    );
+    const today = businessDateISO(new Date()).replaceAll('-', '');
+    expect(created.order.orderNumber).toBe(numberFor(today, 1));
+    expect(await prisma.orderNumberCounter.findMany()).toMatchObject([{ nextSeq: 1 }]);
   });
 });
