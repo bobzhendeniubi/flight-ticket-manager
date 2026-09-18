@@ -5,7 +5,8 @@
  *   - 命中 canonical 档案：直接返回快照值 + 权益台账合计
  *   - 命中指针行（已被合并）：解析到主档案取值，documentType/documentNumber 保持请求原值
  *   - 主档案被删导致断链：停在指针行本身兜底，不抛错
- *   - 没有档案的证件走现算兜底：合计 = 新系统已飞 + 老系统历史，hasProfile=false
+ *   - 没有档案但新系统有订单的证件：现算后当场建档（upsert 快照行），返回 hasProfile=true + 新 id
+ *   - 只有老系统历史、新系统没订单的证件：仍走现算兜底，hasProfile=false，不建档
  *   - 占位出行人（N/A）现算也不给条目
  *   - availableTrips 可为负，不截断
  *   - 空数组直接返回 []，不查库
@@ -18,6 +19,10 @@ import { lookupTravelerProfilesBodySchema } from './travelers.schemas.js';
 
 const prismaMock = vi.hoisted(() => ({
   travelerProfile: {
+    findMany: vi.fn(),
+    upsert: vi.fn(),
+  },
+  savedPassenger: {
     findMany: vi.fn(),
   },
   travelerBenefitRedemption: {
@@ -75,6 +80,15 @@ beforeEach(() => {
   prismaMock.travelerBenefitRedemption.groupBy.mockResolvedValue([]);
   prismaMock.order.findMany.mockResolvedValue([]);
   prismaMock.legacyTicket.findMany.mockResolvedValue([]);
+  prismaMock.savedPassenger.findMany.mockResolvedValue([]);
+  // 当场建档的 upsert：回显 create 数据 + 一个新 id，模拟数据库落行
+  prismaMock.travelerProfile.upsert.mockImplementation(async (args: { create: Record<string, unknown> }) => ({
+    id: 'filed-new',
+    travelerNo: 999,
+    notes: null,
+    mergedIntoId: null,
+    ...args.create,
+  }));
 });
 
 /** 现算兜底用的最小订单行（orderSelect 形状）：一位乘客 + 一条已起飞的去程 */
@@ -170,7 +184,7 @@ describe('lookupByDocuments：命中 canonical 档案', () => {
     expect(prismaMock.travelerBenefitRedemption.groupBy).toHaveBeenCalledTimes(1);
   });
 
-  it('没有档案的证件走现算兜底：合计 = 新系统已飞 + 老系统历史，不是只有老系统那一半', async () => {
+  it('没有档案但新系统有订单：现算后当场建档，合计 = 新系统已飞 + 老系统历史，返回新档案 id', async () => {
     const svc = new TravelerProfilesService();
     prismaMock.travelerProfile.findMany.mockResolvedValueOnce([
       profileRow({ id: 'p1', documentNumber: 'E11111111' }),
@@ -193,10 +207,39 @@ describe('lookupByDocuments：命中 canonical 档案', () => {
     expect(results).toHaveLength(2);
     const live = results.find((r) => r.documentNumber === 'NEW-CLIENT')!;
     expect(live.tripCount).toBe(4); // 新系统 2 + 老系统 2
-    expect(live.hasProfile).toBe(false);
-    expect(live.profileId).toBe('');
+    expect(live.hasProfile).toBe(true);
+    expect(live.profileId).toBe('filed-new');
+    expect(live.travelerNo).not.toBe('未建档');
     expect(live.redeemedTrips).toBe(0);
     expect(live.availableTrips).toBe(4);
+    // 建档只 upsert 这一个人，且落的是含老系统次数的合计（与全量重建同口径）
+    expect(prismaMock.travelerProfile.upsert).toHaveBeenCalledTimes(1);
+    const upsertArgs = prismaMock.travelerProfile.upsert.mock.calls[0][0];
+    expect(upsertArgs.where).toEqual({
+      documentType_documentNumber: { documentType: DocumentType.PASSPORT, documentNumber: 'NEW-CLIENT' },
+    });
+    expect(upsertArgs.create.tripCount).toBe(4);
+    expect(upsertArgs.create.legacyTripCount).toBe(2);
+    expect(upsertArgs.update).not.toHaveProperty('notes');
+    expect(upsertArgs.update).not.toHaveProperty('travelerNo');
+    expect(upsertArgs.update).not.toHaveProperty('mergedIntoId');
+  });
+
+  it('只有老系统历史、新系统没订单：仍走现算兜底，不建档（详情抽屉要从订单重算）', async () => {
+    const svc = new TravelerProfilesService();
+    prismaMock.travelerProfile.findMany.mockResolvedValueOnce([]);
+    prismaMock.legacyTicket.findMany.mockResolvedValueOnce([
+      { documentNumberNorm: 'OLD-ONLY', outboundDate: new Date('2019-05-01T00:00:00.000Z') },
+    ]);
+
+    const results = await svc.lookupByDocuments([
+      { documentType: DocumentType.PASSPORT, documentNumber: 'OLD-ONLY' },
+    ]);
+
+    expect(results[0].hasProfile).toBe(false);
+    expect(results[0].profileId).toBe('');
+    expect(results[0].tripCount).toBe(1);
+    expect(prismaMock.travelerProfile.upsert).not.toHaveBeenCalled();
   });
 
   it('兜底路径同样做 ±1 天活体去重：老系统重录的那趟不重复计', async () => {

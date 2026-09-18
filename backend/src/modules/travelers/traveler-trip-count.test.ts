@@ -100,7 +100,7 @@ describe('computeCombinedTripCounts 合计口径', () => {
       [legacyRow('E12345678', '2019-05-01T00:00:00.000Z')],
     );
     const counts = await computeCombinedTripCounts([doc('E12345678')], client, NOW);
-    expect(counts.get(docKey('PASSPORT', 'E12345678'))).toEqual({
+    expect(counts.get(docKey('PASSPORT', 'E12345678'))).toMatchObject({
       tripCount: 3, // 新系统 2 + 老系统 1
       pendingTripCount: 0,
     });
@@ -112,7 +112,7 @@ describe('computeCombinedTripCounts 合计口径', () => {
       [legacyRow('OLD-ONLY', '2018-01-01T00:00:00.000Z'), legacyRow('OLD-ONLY', null)],
     );
     const counts = await computeCombinedTripCounts([doc('OLD-ONLY')], client, NOW);
-    expect(counts.get(docKey('PASSPORT', 'OLD-ONLY'))).toEqual({
+    expect(counts.get(docKey('PASSPORT', 'OLD-ONLY'))).toMatchObject({
       tripCount: 2,
       pendingTripCount: 0,
     });
@@ -121,7 +121,7 @@ describe('computeCombinedTripCounts 合计口径', () => {
   it('未起飞的单进在订未飞，不进飞行次数', async () => {
     const { client } = fakeClient([orderRow('E12345678', '2026-09-01T02:00:00.000Z')], []);
     const counts = await computeCombinedTripCounts([doc('E12345678')], client, NOW);
-    expect(counts.get(docKey('PASSPORT', 'E12345678'))).toEqual({
+    expect(counts.get(docKey('PASSPORT', 'E12345678'))).toMatchObject({
       tripCount: 0,
       pendingTripCount: 1,
     });
@@ -212,7 +212,7 @@ describe('computeCombinedTripCounts no-show 口径', () => {
       [],
     );
     const counts = await computeCombinedTripCounts([doc('E12345678')], client, NOW);
-    expect(counts.get(docKey('PASSPORT', 'E12345678'))).toEqual({
+    expect(counts.get(docKey('PASSPORT', 'E12345678'))).toMatchObject({
       tripCount: 0,
       pendingTripCount: 0,
     });
@@ -252,7 +252,7 @@ describe('computeCombinedTripCounts no-show 口径', () => {
       ],
     );
     const counts = await computeCombinedTripCounts([doc('E12345678')], client, NOW);
-    expect(counts.get(docKey('PASSPORT', 'E12345678'))).toEqual({
+    expect(counts.get(docKey('PASSPORT', 'E12345678'))).toMatchObject({
       tripCount: 1, // 新系统 1（4 月那张）+ 老系统 0（两张都被去重）
       pendingTripCount: 0,
     });
@@ -264,7 +264,7 @@ describe('computeCombinedTripCounts no-show 口径', () => {
       [],
     );
     const counts = await computeCombinedTripCounts([doc('E12345678')], client, NOW);
-    expect(counts.get(docKey('PASSPORT', 'E12345678'))).toEqual({
+    expect(counts.get(docKey('PASSPORT', 'E12345678'))).toMatchObject({
       tripCount: 0,
       pendingTripCount: 0,
     });
@@ -276,5 +276,21 @@ describe('computeCombinedTripCounts no-show 口径', () => {
     const { client } = fakeClient(rows, []);
     const counts = await computeCombinedTripCounts([doc('E12345678')], client, NOW);
     expect(counts.get(docKey('PASSPORT', 'E12345678'))?.tripCount).toBe(1);
+  });
+});
+
+describe('computeCombinedTripCounts 附带聚合（供 lookup 未命中时当场建档）', () => {
+  it('新系统有订单 → 带 aggregate 与老系统次数；只有老系统 → aggregate 为 undefined', async () => {
+    const { client } = fakeClient(
+      [orderRow('E12345678', '2026-03-01T02:00:00.000Z')],
+      [legacyRow('OLD-ONLY', '2019-05-01T00:00:00.000Z')],
+    );
+    const counts = await computeCombinedTripCounts([doc('E12345678'), doc('OLD-ONLY')], client, NOW);
+    const filed = counts.get(docKey('PASSPORT', 'E12345678'))!;
+    expect(filed.aggregate?.documentNumber).toBe('E12345678');
+    expect(filed.legacyTripCount).toBe(0);
+    const oldOnly = counts.get(docKey('PASSPORT', 'OLD-ONLY'))!;
+    expect(oldOnly.aggregate).toBeUndefined();
+    expect(oldOnly.legacyTripCount).toBe(1);
   });
 });

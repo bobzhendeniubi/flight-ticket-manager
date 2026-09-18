@@ -500,10 +500,41 @@ export class TravelerProfilesService {
       ? await computeCombinedTripCounts(missing)
       : new Map();
 
+    // 查不到就当场建档（2026-09-18）：快照每 6 小时才全量重建一次，刚录的单在重建前点「查看旅客档案」
+    // 会落到「没有这个证件号的档案」。现算路径本来就已经把这个人的订单聚合好了（computed.aggregate），
+    // 直接 upsert 成快照行返回 id，抽屉就能打开；成本只是未命中时多一条 upsert，不用再扫订单。
+    // 只有老系统历史、新系统没订单的人建不出档案（详情抽屉要从订单重算），仍按现算兜底返回。
+    const filedByKey = new Map<string, ProfileRow>();
+    await Promise.all(
+      missing.map(async (doc) => {
+        const key = docKey(doc.documentType, doc.documentNumber);
+        const live = computed.get(key);
+        if (!live?.aggregate) return;
+        const row = await this.fileProfileFromAggregate(live.aggregate, live.legacyTripCount);
+        filedByKey.set(key, row);
+      }),
+    );
+
     const results: TravelerLookupResult[] = [];
     for (const doc of documents) {
       const key = docKey(doc.documentType, doc.documentNumber);
       const hit = hitByKey.get(key);
+      const filed = filedByKey.get(key);
+      if (!hit && filed) {
+        // 刚建的档案还没有权益台账，可用 = 合计
+        results.push({
+          documentType: doc.documentType,
+          documentNumber: doc.documentNumber,
+          profileId: filed.id,
+          travelerNo: formatTravelerNo(filed.travelerNo),
+          hasProfile: true,
+          tripCount: filed.tripCount,
+          pendingTripCount: filed.pendingTripCount,
+          redeemedTrips: 0,
+          availableTrips: filed.tripCount,
+        });
+        continue;
+      }
       if (!hit) {
         const live = computed.get(key);
         if (!live) continue; // 占位出行人 / 空证件号：现算也不给条目
@@ -668,6 +699,25 @@ export class TravelerProfilesService {
   }
 
   // ── private ──
+
+  /**
+   * 按一份聚合当场建（或刷新）一条快照行：lookup 未命中时用。
+   * 与全量重建同一份 toProfileData；update 不含 notes / travelerNo / mergedIntoId，
+   * 并发两次 lookup 同时建同一个人也只是各 upsert 一次同一行。
+   */
+  private async fileProfileFromAggregate(
+    agg: TravelerAggregate,
+    legacyTripCount: number,
+  ): Promise<ProfileRow> {
+    const identity: DocPair = { documentType: agg.documentType, documentNumber: agg.documentNumber };
+    const linkedUserId = await this.resolveLinkedUser(identity.documentType, identity.documentNumber);
+    const data = { ...toProfileData(agg, legacyTripCount, linkedUserId), ...identity };
+    return prisma.travelerProfile.upsert({
+      where: { documentType_documentNumber: identity },
+      create: data,
+      update: data,
+    });
+  }
 
   /** 单档案序列化 + 权益台账合计（availableTrips 可为负，不截断） */
   private async attachBenefitTotals(row: ProfileRow) {

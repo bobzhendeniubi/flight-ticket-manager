@@ -318,6 +318,13 @@ export interface CombinedTripCount {
   tripCount: number;
   /** 在订未飞（新系统口径；老系统已封笔，没有未来的单）。 */
   pendingTripCount: number;
+  /**
+   * 新系统聚合（有有效订单才有；只有老系统历史的人为 undefined）。
+   * 现算时顺手带出来，lookup 未命中档案时可以直接拿它当场建档，不用再查一遍订单。
+   */
+  aggregate?: TravelerAggregate;
+  /** 老系统历史次数（已做 ±1 天活体去重），建档时与聚合一起落快照。 */
+  legacyTripCount: number;
 }
 
 /** 现算兜底要用到的两张表；注入以便单测用假 client 驱动。 */
@@ -380,15 +387,15 @@ export async function computeCombinedTripCounts(
   return new Map(
     [...wanted.keys()].map((key) => {
       const aggregate = aggregates.get(key);
+      const legacyTripCount = legacyCounts.get(key) ?? 0;
       return [
         key,
         {
           // 新系统那半边照样真算（没有订单才是 0），再走唯一的加法 helper 并上老系统。
-          tripCount: addLegacyTripCount(
-            { tripCount: aggregate?.tripCount ?? 0 },
-            legacyCounts.get(key) ?? 0,
-          ),
+          tripCount: addLegacyTripCount({ tripCount: aggregate?.tripCount ?? 0 }, legacyTripCount),
           pendingTripCount: aggregate?.pendingTripCount ?? 0,
+          aggregate,
+          legacyTripCount,
         },
       ];
     }),
