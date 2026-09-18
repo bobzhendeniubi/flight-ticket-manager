@@ -182,6 +182,9 @@ describe('代理自助改单路由', () => {
       noteVisa: null,
       notePayment: null,
       noteSpecial: null,
+      // 备注结构化（2026-09-17）：审计 before 要读得到这两列的旧值
+      separatePnr: false,
+      sameHotelWith: null,
       status: 'PAID',
       deletedAt: null,
       passengers: [{ visaExempt: false }],
@@ -268,6 +271,62 @@ describe('代理自助改单路由', () => {
         { userId: 'u-STAFF', role: UserRole.STAFF, agentId: undefined },
         { withOrder: false, noteData: { internalNotes: '运营口径' } },
       );
+      expect(prismaMock.order.update).not.toHaveBeenCalled();
+    });
+
+    // ── 备注结构化（2026-09-17）：单独编码 / 同酒店在改备注弹窗里改 ────────────
+    it('运营改单独编码 / 同酒店 → 一条 update 落库，审计 before/after 带上两列', async () => {
+      const res = await call('PATCH', '/orders/o1/notes', UserRole.STAFF, {
+        separatePnr: true,
+        sameHotelWith: '和王五同一个酒店',
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(prismaMock.order.update).toHaveBeenCalledWith({
+        where: { id: 'o1' },
+        data: { separatePnr: true, sameHotelWith: '和王五同一个酒店' },
+      });
+      expect(writeAudit).toHaveBeenCalledWith(
+        expect.objectContaining({
+          action: 'UPDATE_ORDER_NOTES',
+          before: expect.objectContaining({ separatePnr: false, sameHotelWith: null }),
+          after: expect.objectContaining({
+            separatePnr: true,
+            sameHotelWith: '和王五同一个酒店',
+          }),
+        }),
+      );
+    });
+
+    it('同酒店安排置 null → 显式写空（填过的安排要能清掉）', async () => {
+      const res = await call('PATCH', '/orders/o1/notes', UserRole.STAFF, {
+        sameHotelWith: null,
+      });
+
+      expect(res.statusCode).toBe(200);
+      expect(prismaMock.order.update).toHaveBeenCalledWith({
+        where: { id: 'o1' },
+        data: { sameHotelWith: null },
+      });
+    });
+
+    it('代理夹带单独编码 → 403（自助口子只开了 visaStatus，新字段不该悄悄把它撑大）', async () => {
+      const res = await call('PATCH', '/orders/o1/notes', UserRole.AGENT, {
+        visaStatus: VisaRequirement.NEEDED,
+        separatePnr: true,
+      });
+
+      expect(res.statusCode).toBe(403);
+      expect(serviceMocks.setOrderVisaStatus).not.toHaveBeenCalled();
+      expect(prismaMock.order.update).not.toHaveBeenCalled();
+    });
+
+    it('同酒店安排超过 120 字 → 400（schema 闸，不落库）', async () => {
+      const res = await call('PATCH', '/orders/o1/notes', UserRole.STAFF, {
+        sameHotelWith: '和'.repeat(121),
+      });
+
+      expect(res.statusCode).toBe(400);
       expect(prismaMock.order.update).not.toHaveBeenCalled();
     });
 

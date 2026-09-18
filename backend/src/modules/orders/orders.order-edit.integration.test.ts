@@ -972,6 +972,57 @@ describe('OrderService.swapPassenger · 真 DB E2E', () => {
     expect(reloaded.adjustmentCny).toBe(0); // 无费用
   });
 
+  // ── 备注结构化（2026-09-17）：兑换升舱不跟着座位走 ──────────────────────────
+  it('真换人（证件号变了）→ 兑换升舱与说明清回「不兑换」，不留给新出行人', async () => {
+    const actor = await adminActor();
+    const from = await createScheduleWithSeats({ sold: 1 });
+    const order = await createPaidFlightOrder({
+      scheduleId: from.schedule.id,
+      cabin: CabinClass.ECONOMY,
+    });
+    // 原出行人用自己攒的常旅客次数换了回程商务舱
+    await prisma.passenger.update({
+      where: { id: order.passengers[0].id },
+      data: { upgradeRedeemLeg: 'RETURN', upgradeRedeemNote: '用本人的次数' },
+    });
+
+    await service.swapPassenger(
+      order.id,
+      order.passengers[0].id,
+      {
+        fullName: 'ZHAO LEI',
+        documentNumber: 'E66666666',
+        nationality: 'CHN',
+        passportExpiry: '2035-01-01',
+      },
+      actor,
+    );
+
+    // 次数是「某一位常旅客」的，换了人这笔兑换就不成立；留着会让票务拿别人的次数去升舱。
+    const px = await prisma.passenger.findUniqueOrThrow({ where: { id: order.passengers[0].id } });
+    expect(px.upgradeRedeemLeg).toBe('NONE');
+    expect(px.upgradeRedeemNote).toBeNull();
+  });
+
+  it('改错别字（证件号没变）→ 兑换升舱原样保留（这不是换人）', async () => {
+    const actor = await adminActor();
+    const from = await createScheduleWithSeats({ sold: 1 });
+    const order = await createPaidFlightOrder({
+      scheduleId: from.schedule.id,
+      cabin: CabinClass.ECONOMY,
+    });
+    await prisma.passenger.update({
+      where: { id: order.passengers[0].id },
+      data: { upgradeRedeemLeg: 'BOTH', upgradeRedeemNote: '用本人的次数' },
+    });
+
+    await service.swapPassenger(order.id, order.passengers[0].id, { fullName: 'ZHAO LEI' }, actor);
+
+    const px = await prisma.passenger.findUniqueOrThrow({ where: { id: order.passengers[0].id } });
+    expect(px.upgradeRedeemLeg).toBe('BOTH');
+    expect(px.upgradeRedeemNote).toBe('用本人的次数');
+  });
+
   it('非 ADMIN/STAFF 调用换人 → 拒绝', async () => {
     const customer = await createUser(UserRole.CUSTOMER);
     const from = await createScheduleWithSeats({ sold: 1 });

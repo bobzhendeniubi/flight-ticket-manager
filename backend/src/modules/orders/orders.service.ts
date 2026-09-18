@@ -36,6 +36,7 @@ import {
   SeatLockStatus,
   SettlementRequestStatus,
   type SettlementTier,
+  UpgradeRedeemLeg,
   UserRole,
 } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
@@ -866,6 +867,14 @@ const CORRECTABLE_IDENTITY_FIELDS = [
   'passportIssueDate',
   'passengerType',
 ] as const;
+
+/**
+ * 订正通道里「不是身份、只是偏好」的三项（备注结构化 2026-09-17）：床型与兑换升舱。
+ * 与 CORRECTABLE_IDENTITY_FIELDS 分开列，是因为身份字段那份还被「伪装换人」的历史判定
+ * 当作判据（priorFields）读；偏好项改多少次都与换人无关，混进去只会把口径搅浑。
+ * 审计 before/after 两份一起算 —— 运营在同一个弹窗里改的，流水上就该在同一条里看见。
+ */
+const CORRECTABLE_PREFERENCE_FIELDS = ['bedPref', 'upgradeRedeemLeg', 'upgradeRedeemNote'] as const;
 
 /**
  * 「票面身份里的姓名」三件套：订正通道判「这次动没动名字」「历史上动没动名字」都只认这三个。
@@ -2851,6 +2860,9 @@ export class OrderService {
           noteVisa: body.noteVisa ?? null,
           notePayment: body.notePayment ?? null,
           noteSpecial: body.noteSpecial ?? null,
+          // 备注结构化：单独编码出票 / 同酒店安排（不传 = 与改造前一致的空口径）
+          separatePnr: body.separatePnr ?? false,
+          sameHotelWith: body.sameHotelWith ?? null,
           items: {
             create: pricedItems.map((p) => ({
               kind: p.kind,
@@ -5108,6 +5120,10 @@ export class OrderService {
               passportExpiry: true,
               visaExempt: true,
               singleRoom: true,
+              // 备注结构化：床型 / 兑换升舱与「单住」「自备签」并排做 chip
+              bedPref: true,
+              upgradeRedeemLeg: true,
+              upgradeRedeemNote: true,
               visaSubmissionStatus: true,
               pnr: true,
               eticketNumber: true,
@@ -7189,6 +7205,9 @@ export class OrderService {
             noteHotel: body.noteHotel,
             noteVisa: body.noteVisa,
             notePayment: body.notePayment,
+            // 备注结构化：表头勾的「单独编码」「同酒店」整批共用，逐张子单各写一份
+            separatePnr: body.separatePnr,
+            sameHotelWith: body.sameHotelWith,
             // 团期备注同时写入结构化「特殊」栏
             noteSpecial: mergedNoteSpecial,
             // 整批归属代理（ADMIN/STAFF 录单）；AGENT 自助仍归属本人。
@@ -9477,6 +9496,11 @@ export class OrderService {
     if (input.passportIssueCountry !== undefined) { data.passportIssueCountry = input.passportIssueCountry; changedFields.push('passportIssueCountry'); }
     if (input.passportIssuePlace !== undefined) { data.passportIssuePlace = input.passportIssuePlace; changedFields.push('passportIssuePlace'); }
     if (input.passportPhotoUrl !== undefined) { data.passportPhotoUrl = input.passportPhotoUrl; changedFields.push('passportPhotoUrl'); }
+    // 备注结构化（床型 / 兑换升舱）：不上票面、不进定价，与身份字段同一条通道落库即可。
+    // 这三项显式允许置空（清回「不限」「不兑换」），故不套「undefined 即不动」之外的额外判空。
+    if (input.bedPref !== undefined) { data.bedPref = input.bedPref; changedFields.push('bedPref'); }
+    if (input.upgradeRedeemLeg !== undefined) { data.upgradeRedeemLeg = input.upgradeRedeemLeg; changedFields.push('upgradeRedeemLeg'); }
+    if (input.upgradeRedeemNote !== undefined) { data.upgradeRedeemNote = input.upgradeRedeemNote; changedFields.push('upgradeRedeemNote'); }
 
     const updated = await prisma.passenger.update({ where: { id: passengerId }, data });
     return {
@@ -11834,10 +11858,19 @@ export class OrderService {
         //   · visaExempt=false → 新人默认「随套餐办签」，不会被签证台漏掉（旧人自备签的 true 绝不继承）。
         //   · singleRoom=false → 新人默认「拼房」（业务默认；房控按新人重新分房）。
         //   · title=null / passengerType=ADULT（schema 默认）→ 敬称/乘客类型随人走，不继承旧人。
+        //   · bedPref **刻意不清**（备注结构化 2026-09-17 复核确认）：床型跟房不跟人 —— 这间房
+        //     当初按大床/双床订下去，换谁来住房型都不会变，清掉只会让分房岗白填一次。
+        //     与同段清洗的 singleRoom 不冲突：单住是「占几间房、按人收房差」的钱口径，
+        //     跟的是人；床型是这间房长什么样，跟的是房。两者一清一留，是两回事。
         if (data.visaExempt === undefined) data.visaExempt = false;
         if (data.singleRoom === undefined) data.singleRoom = false;
         if (data.title === undefined) data.title = null;
         if (data.passengerType === undefined) data.passengerType = PassengerType.ADULT;
+        // 兑换升舱（备注结构化 2026-09-17）无条件清回「不兑换」：它用的是**某一位**常旅客
+        // 攒的次数，换了人这笔兑换就不成立（换人 schema 也不收这两个键，没有「带了新值」一说）。
+        // 留着的后果是票务照着旧说明给新出行人升舱，拿别人的次数去换 —— 钱与次数两头都对不上账。
+        data.upgradeRedeemLeg = UpgradeRedeemLeg.NONE;
+        data.upgradeRedeemNote = null;
         // 说明：nationality 是必填非空列，无法「置空」；请求带了新值即用新值（上面已赋），
         // 未带时只能保留旧值（不猜默认国籍——猜错会污染出票/签证）。彻底根治需 schema 层在真换人时
         // 强制 nationality，留待拥有 orders.schemas.ts 的下一棒收口。
@@ -13615,6 +13648,10 @@ export class OrderService {
       nationality?: string;
       passportExpiry?: string;
       passportIssueDate?: string;
+      // 备注结构化（床型 / 兑换升舱）：可空 = 清回「不限」「不兑换」
+      bedPref?: string | null;
+      upgradeRedeemLeg?: UpgradeRedeemLeg;
+      upgradeRedeemNote?: string | null;
     },
     requester: OrderRequester,
   ): Promise<{
@@ -13688,6 +13725,10 @@ export class OrderService {
           passengerType: true,
           passportExpiry: true,
           passportIssueDate: true,
+          // 备注结构化三项：审计 before/after 要对着旧值比，故一并读出来。
+          bedPref: true,
+          upgradeRedeemLeg: true,
+          upgradeRedeemNote: true,
           // 旧身份留痕：姓名/证件号真改了才追加一段（见下方写入前那段）。
           formerIdentities: true,
           // 票务现势：代理订正闸要读（已订座/已出票的人不给代理改票面身份）。
@@ -13886,6 +13927,11 @@ export class OrderService {
       if (input.passportIssueDate !== undefined) {
         data.passportIssueDate = new Date(input.passportIssueDate);
       }
+      // 备注结构化（床型 / 兑换升舱）：既不是票面身份也不进定价，上面那几道身份闸
+      //（改动幅度 / 伪装换人 / 已出票 / 已开票）都不该拦它们，故只在这里映射、不参与判定。
+      if (input.bedPref !== undefined) data.bedPref = input.bedPref;
+      if (input.upgradeRedeemLeg !== undefined) data.upgradeRedeemLeg = input.upgradeRedeemLeg;
+      if (input.upgradeRedeemNote !== undefined) data.upgradeRedeemNote = input.upgradeRedeemNote;
 
       // 出行人类型服务端权威重派生 —— 与换人 1b2 同一口径（建单 passengerToData 也走它）。
       // 回退口径：已有的旧类型 > 兜底成人（同一人只是订正生日，不该把儿童/婴儿丢回成人）。
@@ -13957,7 +14003,7 @@ export class OrderService {
       // 日期按 UTC 切片（同 buildSwapBeforeSnapshot 口径）：这些是「日期本身」，折时区会推后一天。
       const asText = (v: unknown): string | null =>
         v == null ? null : v instanceof Date ? v.toISOString().slice(0, 10) : String(v);
-      for (const field of CORRECTABLE_IDENTITY_FIELDS) {
+      for (const field of [...CORRECTABLE_IDENTITY_FIELDS, ...CORRECTABLE_PREFERENCE_FIELDS]) {
         const oldValue = asText((passenger as Record<string, unknown>)[field]);
         const newValue = asText((updated as unknown as Record<string, unknown>)[field]);
         if (oldValue === newValue) continue;
@@ -27215,6 +27261,9 @@ export function passengerToData(
     needsWheelchair: p.needsWheelchair ?? false,
     needsInfantBassinet: p.needsInfantBassinet ?? false,
     bedPref: p.bedPref ?? null,
+    // 兑换升舱（备注结构化）：不传即「不兑换」，与改造前写在备注里的存量等价。
+    upgradeRedeemLeg: p.upgradeRedeemLeg ?? UpgradeRedeemLeg.NONE,
+    upgradeRedeemNote: p.upgradeRedeemNote ?? null,
     passportPhotoUrl: p.passportPhotoUrl ?? null,
     // 套餐乘客级选项（购物车模式）：缺省 false = 随套餐办签 + 拼房（与旧行为一致）。
     visaExempt: p.visaExempt ?? false,

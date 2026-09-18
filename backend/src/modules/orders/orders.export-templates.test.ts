@@ -38,14 +38,15 @@ import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 const D = (s: string): Date => new Date(s.length <= 10 ? `${s}T00:00:00.000Z` : `${s}Z`);
 
 /**
- * 《全岗可用》模版 57 列表头（叶子列；末尾三列并入「订单成本」分组）。
+ * 《全岗可用》模版 59 列表头（叶子列；末尾三列并入「订单成本」分组）。
  * 定金组四列已移除：系统无定金模型，四列恒空，且现行模版本身已删除该组。
  * 「纯拼音名」为旧模版之外新增：无 MR/MS 称谓的 LAST/FIRST，财务对数/名单匹配用。
  * 「订单状态」为新增：中文标签，数据岗筛选用，紧邻开票/签证状态列。
  * 「航段状态」为新增：no-show / 回程释放·恢复·作废，紧跟「订单类型」（同属行程口径列）。
+ * 「单独编码」「兑换升舱」为备注结构化（2026-09-17）新增：紧挨备注列——这两项原本就写在备注里。
  */
 const FULL_HEADERS = [
-  '序号', '是否是原订单', '代理机构', '备注', '酒店类型', '中文名称', '乘客姓名',
+  '序号', '是否是原订单', '代理机构', '备注', '单独编码', '兑换升舱', '酒店类型', '中文名称', '乘客姓名',
   '纯拼音名', '飞行次数', '出发(往返)日期', '航班号', '订单类型', '航段状态',
   '结算价格', '结算价到账金额', '结算价到账时间',
   '结算价到账渠道', '尾款金额', '单房差', '单房差到账金额', '签证金额', '签证到账金额',
@@ -56,9 +57,12 @@ const FULL_HEADERS = [
   '临时', '成本类型', '子类型', '金额',
 ];
 
-/** 旧《票务专用》模版 27 列表头 = 代理 + 备注 + 航司 PNR 25 列。*/
+/**
+ * 《票务专用》模版 29 列表头 = 代理 + 备注 + 备注结构化两列 + 航司 PNR 25 列。
+ * PNR 25 列仍是交给航司的标准格式，整块连续不动；新两列插在它之前。
+ */
 const OLD_TICKETING_HEADERS = [
-  '代理', '备注', 'Last Name', 'First Name and Middle Name', 'Title', 'PTC', 'Gender',
+  '代理', '备注', '单独编码', '兑换升舱', 'Last Name', 'First Name and Middle Name', 'Title', 'PTC', 'Gender',
   'Date of Birth', 'Passport Last Name', 'Passport First Name', 'Passport Number',
   'Passport Nationality', 'Passport Issue Country', 'Passport Expiry Date', 'Visa Number',
   'Visa Type', 'Visa Issue Date', 'Place of Birth', 'Visa Place of Issue',
@@ -229,8 +233,8 @@ function fixtureRoundTrip(): OrderForTemplateExport {
   } as unknown as OrderForTemplateExport;
 }
 
-describe('《全岗可用》full 模版 — 列定义对齐 57 列', () => {
-  it('FULL_COLUMNS 列名列序与模版 57 列完全一致', () => {
+describe('《全岗可用》full 模版 — 列定义对齐 59 列', () => {
+  it('FULL_COLUMNS 列名列序与模版 59 列完全一致', () => {
     expect(FULL_COLUMNS.map((c) => c.header)).toEqual(FULL_HEADERS);
   });
 
@@ -311,6 +315,26 @@ describe('《全岗可用》full 模版 — 逐列取值/格式', () => {
     const [row] = orderToFullRows(o, buildOrderContext(o));
 
     expect(row.settleReceivedAt).toBe('2026-07-09 04:30:15');
+  });
+
+  describe('备注结构化两列（2026-09-17）', () => {
+    it('单独编码按单（逐行重复）、兑换升舱按人', () => {
+      const o = fixtureRoundTrip();
+      o.separatePnr = true;
+      o.passengers[0].upgradeRedeemLeg = 'BOTH';
+      o.passengers[0].upgradeRedeemNote = '用同行人的次数';
+      const [a, b] = orderToFullRows(o, buildOrderContext(o));
+
+      expect(a.separatePnr).toBe('是');
+      expect(b.separatePnr).toBe('是');
+      expect(a.upgradeRedeem).toBe('往返 · 用同行人的次数');
+      expect(b.upgradeRedeem).toBe('');
+    });
+
+    it('存量单两列留空（不写「否」）', () => {
+      expect(r1.separatePnr).toBe('');
+      expect(r1.upgradeRedeem).toBe('');
+    });
   });
 
   it('乘客类型/性别/证件类型：按旧模版原样枚举/代码', () => {
@@ -691,8 +715,8 @@ describe('《全岗可用》full 模版 — 代理预付款抵扣（prepaymentOf
   });
 });
 
-describe('《票务专用》ticketing 模版 — 27 列 + 格式', () => {
-  it('TICKETING_COLUMNS 列名列序与旧模版 27 列完全一致', () => {
+describe('《票务专用》ticketing 模版 — 29 列 + 格式', () => {
+  it('TICKETING_COLUMNS 列名列序与旧模版 29 列完全一致', () => {
     expect(TICKETING_COLUMNS.map((c) => c.header)).toEqual(OLD_TICKETING_HEADERS);
   });
 
@@ -700,6 +724,22 @@ describe('《票务专用》ticketing 模版 — 27 列 + 格式', () => {
   const ctx = buildOrderContext(order);
   const rows = orderToTicketingRows(order, ctx);
   const [r1, r2] = rows;
+
+  it('备注结构化两列（2026-09-17）：票务不必再从备注文本里认「单独编码 / 升哪一程」', () => {
+    const o = fixtureRoundTrip();
+    o.separatePnr = true;
+    o.passengers[0].upgradeRedeemLeg = 'OUTBOUND';
+    o.passengers[0].upgradeRedeemNote = '用同行人的次数';
+    const [a, b] = orderToTicketingRows(o, buildOrderContext(o));
+
+    expect(a.separatePnr).toBe('是');
+    expect(a.upgradeRedeem).toBe('去程 · 用同行人的次数');
+    // 同单另一位没兑换 → 留空（兑换是按人的事）
+    expect(b.upgradeRedeem).toBe('');
+    // 存量单两列都留空
+    expect(r1.separatePnr).toBe('');
+    expect(r1.upgradeRedeem).toBe('');
+  });
 
   it('Title/PTC/Gender：MR / ADT / M（CHD 儿童）', () => {
     expect(r1.title).toBe('MR');
@@ -970,7 +1010,7 @@ describe('《票务专用》ticketing 工作簿 — 朴素样式对齐原版样�
     return headers;
   }
 
-  it('表头 27 列，列名列序与原版样例完全一致', async () => {
+  it('表头 29 列，列名列序与原版样例完全一致', async () => {
     const ws = await loadTicketingSheet();
     expect(headerRow(ws)).toEqual(OLD_TICKETING_HEADERS);
   });
@@ -1509,8 +1549,8 @@ describe('航段状态列 — 《全岗可用》与《签证专用》', () => {
     expect(rows.every((r) => r.legStatus === '去程未登机 / 回程座位已释放')).toBe(true);
   });
 
-  it('《票务专用》27 列航司格式一格不动：不加航段状态列', () => {
-    expect(TICKETING_COLUMNS).toHaveLength(27);
+  it('《票务专用》29 列航司格式一格不动：不加航段状态列', () => {
+    expect(TICKETING_COLUMNS).toHaveLength(29);
     expect(TICKETING_COLUMNS.map((c) => c.header)).not.toContain('航段状态');
   });
 
@@ -1651,7 +1691,7 @@ describe('代理导出（agentScope 非空）— 三模板按共享脱敏政策�
       ]) {
         expect(headers).toContain(h);
       }
-      // 57 列裁掉 19 列（PII 10 + 内部人员 2 + 供应商/成本 5 + 内部指标 2）
+      // 59 列裁掉 19 列（PII 10 + 内部人员 2 + 供应商/成本 5 + 内部指标 2）
       expect(headers).toHaveLength(FULL_COLUMNS.length - 19);
     });
 
@@ -1671,7 +1711,7 @@ describe('代理导出（agentScope 非空）— 三模板按共享脱敏政策�
       expect(first[headers.length - 1] ?? '').toBe('');
     });
 
-    it('内部导出（agentScope=null）一列不少：57 列俱在，「订单成本」分组表头照旧', async () => {
+    it('内部导出（agentScope=null）一列不少：59 列俱在，「订单成本」分组表头照旧', async () => {
       const ws = await loadSheet('full', null);
       const row1 = rowText(ws, 1);
       const row2 = rowText(ws, 2);
@@ -1800,6 +1840,9 @@ describe('代理导出（agentScope 非空）— 三模板按共享脱敏政策�
       expect(headers).toEqual([
         '代理',
         '备注',
+        // 备注结构化两列既非身份也非我方成本口径，代理视角照常保留（原本就写在代理看得到的备注里）
+        '单独编码',
+        '兑换升舱',
         'Last Name',
         'First Name and Middle Name',
         'Title',
@@ -1817,7 +1860,7 @@ describe('代理导出（agentScope 非空）— 三模板按共享脱敏政策�
       expect(first.join('|')).not.toContain('EN7208993');
     });
 
-    it('内部导出（agentScope=null）一列不少：27 列航司格式原样', async () => {
+    it('内部导出（agentScope=null）一列不少：29 列航司格式原样', async () => {
       const headers = rowText(await loadSheet('ticketing', null));
       expect(headers).toEqual(OLD_TICKETING_HEADERS);
     });

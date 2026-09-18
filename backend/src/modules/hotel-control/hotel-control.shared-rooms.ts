@@ -76,6 +76,8 @@ export interface SharedRoomWorkbenchOrder {
   orderNumber: string;
   status: OrderStatus;
   agentId: string | null;
+  /** 同酒店安排（Order.sameHotelWith，备注结构化）：拉人进共享房前要看见这单的同住诉求。*/
+  sameHotelWith: string | null;
   passengers: SharedRoomWorkbenchPassenger[];
   items: SharedRoomWorkbenchOrderItem[];
   /** 本单在本酒店本区间的房组是否已全部补齐 orderItemId 归属（§三：未补齐不能拉进共享房）。*/
@@ -169,6 +171,7 @@ export async function getSharedRoomWorkbench(
           orderNumber: true,
           status: true,
           agentId: true,
+          sameHotelWith: true, // 同酒店安排（备注结构化）：工作台拉人时要看见
           roomAssignment: true,
           passengers: {
             select: { id: true, fullName: true, chineseName: true, gender: true },
@@ -191,6 +194,7 @@ export async function getSharedRoomWorkbench(
         orderNumber: order.orderNumber,
         status: order.status,
         agentId: order.agentId,
+        sameHotelWith: order.sameHotelWith ?? null,
         passengers: order.passengers.map((p) => ({
           id: p.id,
           fullName: p.fullName,

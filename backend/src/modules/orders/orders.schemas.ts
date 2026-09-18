@@ -8,6 +8,7 @@ import {
   OrderStatus,
   PassengerType,
   PaymentMethod,
+  UpgradeRedeemLeg,
   UserRole,
   VisaRequirement,
 } from '@prisma/client';
@@ -141,12 +142,21 @@ export type OrderPriceAdjustmentBody = z.infer<typeof orderPriceAdjustmentBodySc
 // ── 订单级签证状态 + 结构化备注四栏（录单/编辑共用）─────────────────────────
 // 全部 optional：老客户端不传则字段留空，与旧行为一致。每栏限 ~300 字。
 const STRUCTURED_NOTE_MAX = 300;
+// 同酒店安排：自由文本（人名或单号），一行写得下即可，故比四栏备注短得多。
+const SAME_HOTEL_WITH_MAX = 120;
+// 兑换升舱说明：如「用同行人的次数」「经济舱第一排」，一句话的长度。
+const UPGRADE_REDEEM_NOTE_MAX = 80;
 export const orderStructuredNotesShape = {
   visaStatus: z.nativeEnum(VisaRequirement).optional(),
   noteHotel: z.string().max(STRUCTURED_NOTE_MAX).optional(),
   noteVisa: z.string().max(STRUCTURED_NOTE_MAX).optional(),
   notePayment: z.string().max(STRUCTURED_NOTE_MAX).optional(),
   noteSpecial: z.string().max(STRUCTURED_NOTE_MAX).optional(),
+  // ── 备注结构化（2026-09-17）：从自由备注里拎出来的两个订单级勾选项 ──────────
+  // 放进这把伞 = 建单 / 批量建单 / 改备注三处同时认，不必各写各的（口径不会分叉）。
+  // 两项都不参与定价，故无任何审批闸；nullable 是为了让界面能把填过的值清空回「没这回事」。
+  separatePnr: z.boolean().optional(),
+  sameHotelWith: z.string().max(SAME_HOTEL_WITH_MAX).nullable().optional(),
 } as const;
 
 // 可选字符串字段的姓名规范化 transform：undefined 原样透传，避免把「不传该字段」误变成空字符串。
@@ -260,6 +270,9 @@ export const passengerInputSchema = z.object({
   needsWheelchair: z.boolean().optional(),
   needsInfantBassinet: z.boolean().optional(),
   bedPref: z.enum(['SINGLE', 'DOUBLE', 'TWIN', 'SHARE_OK']).optional(),
+  // 兑换升舱（备注结构化）：升哪一程 + 用谁的次数。不进 quote，纯票务执行口径。
+  upgradeRedeemLeg: z.nativeEnum(UpgradeRedeemLeg).optional(),
+  upgradeRedeemNote: z.string().max(UPGRADE_REDEEM_NOTE_MAX).optional(),
   // 护照图 data-URL；3MB 上限让单张超大图快速失败（清晰报错，而非整请求 413 黑盒）
   passportPhotoUrl: z.string().url().max(3_000_000, '护照图过大，请压缩后重试').optional(),
 
@@ -335,6 +348,12 @@ export const selfUpdatePassengerBodySchema = z
     passportIssuePlace: z.string().max(120).optional(),
     // 护照图 data-URL；3MB 上限与下单口径一致（超大图快速失败，而非整请求 413 黑盒）
     passportPhotoUrl: z.string().url().max(3_000_000, '护照图过大，请压缩后重试').optional(),
+    // ── 备注结构化（2026-09-17）：床型 / 兑换升舱代理也能自助改 ────────────────
+    // 与身份字段不同，这三项不上票面、不进定价、不影响任何结算，改了没有钱的后果，
+    // 所以走补录同一条通道即可，不设审批窗口。
+    bedPref: z.enum(['SINGLE', 'DOUBLE', 'TWIN', 'SHARE_OK']).nullable().optional(),
+    upgradeRedeemLeg: z.nativeEnum(UpgradeRedeemLeg).optional(),
+    upgradeRedeemNote: z.string().max(UPGRADE_REDEEM_NOTE_MAX).nullable().optional(),
   })
   .strict()
   .refine((v) => Object.values(v).some((x) => x !== undefined), {
@@ -1395,6 +1414,13 @@ export const correctPassengerBodySchema = z
     nationality: z.string().length(2).transform((v) => v.toUpperCase()).optional(),
     passportExpiry: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     passportIssueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
+    // ── 备注结构化（2026-09-17）：床型 / 兑换升舱在订正弹窗里也能改 ────────────
+    // 这三项既不是票面身份、也不进定价，所以不触发订正通道的任何一道身份闸
+    //（改动幅度、伪装换人、已出票/已开票），只跟着走同一份审计 before/after。
+    // nullable：录错了要能清回「不限 / 不兑换」，而不是只能越填越多。
+    bedPref: z.enum(['SINGLE', 'DOUBLE', 'TWIN', 'SHARE_OK']).nullable().optional(),
+    upgradeRedeemLeg: z.nativeEnum(UpgradeRedeemLeg).optional(),
+    upgradeRedeemNote: z.string().max(UPGRADE_REDEEM_NOTE_MAX).nullable().optional(),
   })
   .strict()
   .refine(
@@ -1408,7 +1434,10 @@ export const correctPassengerBodySchema = z
       b.gender !== undefined ||
       b.nationality !== undefined ||
       b.passportExpiry !== undefined ||
-      b.passportIssueDate !== undefined,
+      b.passportIssueDate !== undefined ||
+      b.bedPref !== undefined ||
+      b.upgradeRedeemLeg !== undefined ||
+      b.upgradeRedeemNote !== undefined,
     { message: '请至少提供一个需要订正的字段' },
   );
 export type CorrectPassengerBody = z.infer<typeof correctPassengerBodySchema>;

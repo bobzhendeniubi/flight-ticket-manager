@@ -44,6 +44,10 @@ function buildOrder() {
     noteSpecial: '特殊内部口径',
     expectedAmountCny: dec(1000),
     expectedAmountLocked: true,
+    // 备注结构化（2026-09-17）：单独编码 / 同酒店**不是**内部口径 —— 代理自己录单时就能填，
+    // 对外角色照常下发（下面「AGENT/CUSTOMER 视角」用例里有专门断言）。
+    separatePnr: true,
+    sameHotelWith: '和王五同一个酒店',
     adjustments: [{ type: 'RESCHEDULE_FEE', amountCny: 100, by: 'user_ops_1' }],
     claimedById: 'user_ops_1',
     claimedBy: { id: 'user_ops_1', displayName: '内部运营', email: 'ops@example.com' },
@@ -62,6 +66,10 @@ function buildOrder() {
         passengerType: 'ADULT',
         documentNumber: 'E12345678',
         passportPhotoUrl: 'data:image/png;base64,AAAA',
+        // 备注结构化：床型 / 兑换升舱按人，序列化原样透出（乘客卡片与列表子行做 chip）
+        bedPref: 'DOUBLE',
+        upgradeRedeemLeg: 'RETURN',
+        upgradeRedeemNote: '用同行人的次数',
       },
     ],
     items: [
@@ -347,6 +355,39 @@ describe('serializeOrder · AGENT/CUSTOMER 视角（脱敏）', () => {
 });
 
 // ── B2：派生结清口径纳入 prepaymentOffset（与 reports/reminders/导出全局清账公式一字一致）──
+describe('serializeOrder · 备注结构化四项（2026-09-17）', () => {
+  it('内部角色原样透出（订单级两项 + 乘客级三项）', () => {
+    const out = serializeOrder(buildOrder() as never, orderSerializeRoleCtx(UserRole.ADMIN)) as {
+      separatePnr: boolean;
+      sameHotelWith: string | null;
+      passengers: Array<Record<string, unknown>>;
+    };
+    expect(out.separatePnr).toBe(true);
+    expect(out.sameHotelWith).toBe('和王五同一个酒店');
+    expect(out.passengers[0]).toMatchObject({
+      bedPref: 'DOUBLE',
+      upgradeRedeemLeg: 'RETURN',
+      upgradeRedeemNote: '用同行人的次数',
+    });
+  });
+
+  it('对外角色也照常下发 —— 这四项不是我方内部口径，代理录单时自己就能填', () => {
+    for (const role of [UserRole.AGENT, UserRole.CUSTOMER]) {
+      const out = serializeOrder(buildOrder() as never, orderSerializeRoleCtx(role)) as {
+        separatePnr: boolean;
+        sameHotelWith: string | null;
+        internalNotes?: unknown;
+        passengers: Array<Record<string, unknown>>;
+      };
+      expect(out.separatePnr).toBe(true);
+      expect(out.sameHotelWith).toBe('和王五同一个酒店');
+      expect(out.passengers[0]).toMatchObject({ bedPref: 'DOUBLE', upgradeRedeemLeg: 'RETURN' });
+      // 同一次序列化里，真正的内部口径仍旧被剥（确认脱敏本身没被这次改动放松）
+      expect(out.internalNotes).toBeUndefined();
+    }
+  });
+});
+
 describe('serializeOrder · balanceDue 纳入 prepaymentOffset', () => {
   it('尾款 = total + adjustmentCny − paidAmount − prepaymentOffset（含改期费与预存抵扣）', () => {
     const out = serializeOrder(

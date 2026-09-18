@@ -247,6 +247,36 @@ describe('orderToMasterRows', () => {
     expect(rows).toHaveLength(2);
   });
 
+  describe('备注结构化四列（2026-09-17）', () => {
+    it('床型 / 兑换升舱按人，同酒店 / 单独编码按单（整单一个值，逐行重复）', () => {
+      const order = fixtureRoundTripBundle();
+      order.separatePnr = true;
+      order.sameHotelWith = '和王五同一个酒店';
+      order.passengers[0].bedPref = 'DOUBLE';
+      order.passengers[0].upgradeRedeemLeg = 'RETURN';
+      order.passengers[0].upgradeRedeemNote = '用同行人的次数';
+      order.passengers[1].bedPref = 'TWIN';
+
+      const [r1, r2] = orderToMasterRows(order);
+      expect(r1.bedPref).toBe('大床');
+      expect(r2.bedPref).toBe('双床');
+      expect(r1.upgradeRedeem).toBe('回程 · 用同行人的次数');
+      expect(r2.upgradeRedeem).toBe('');
+      for (const r of [r1, r2]) {
+        expect(r.separatePnr).toBe('是');
+        expect(r.sameHotelWith).toBe('和王五同一个酒店');
+      }
+    });
+
+    it('存量单（四项全空）四列一律留空，不编造「否」「不限」', () => {
+      const [r1] = orderToMasterRows(fixtureRoundTripBundle());
+      expect(r1.bedPref).toBe('');
+      expect(r1.sameHotelWith).toBe('');
+      expect(r1.separatePnr).toBe('');
+      expect(r1.upgradeRedeem).toBe('');
+    });
+  });
+
   it('关键列填满：酒店中文名、结算价格、航班/日期、护照签发地回落、分房情况、订单成本', () => {
     const [r1, r2] = orderToMasterRows(fixtureRoundTripBundle());
 

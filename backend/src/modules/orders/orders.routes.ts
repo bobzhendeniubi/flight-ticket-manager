@@ -1766,7 +1766,10 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       body.noteHotel !== undefined ||
       body.noteVisa !== undefined ||
       body.notePayment !== undefined ||
-      body.noteSpecial !== undefined;
+      body.noteSpecial !== undefined ||
+      // 备注结构化（2026-09-17）：单独编码 / 同酒店与四栏备注同级，都是运营口径。
+      body.separatePnr !== undefined ||
+      body.sameHotelWith !== undefined;
     // ── 代理自助改签证状态（下单当天、自家单）──────────────────────────────
     // 代理动的 ops-only 字段**只能**是 visaStatus 这一个，且只能落在
     // 「需要签证 / 电子签 / 不需要签证」三档里；带上任何别的内部字段仍旧 403（口径不变）。
@@ -1779,7 +1782,11 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       body.noteHotel === undefined &&
       body.noteVisa === undefined &&
       body.notePayment === undefined &&
-      body.noteSpecial === undefined;
+      body.noteSpecial === undefined &&
+      // 代理自助通道只认 visaStatus 一个键：带上新两项即不再是「只改签证状态」，
+      // 照旧落到下面的 ops-only 403（新字段不该悄悄扩大这条窄通道）。
+      body.separatePnr === undefined &&
+      body.sameHotelWith === undefined;
     if (agentVisaOnly && body.visaStatus === VisaRequirement.HAS_VISA) {
       return reply.status(403).send({ error: '已签证状态由签证岗确认，代理不可自行设置' });
     }
@@ -1803,6 +1810,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         noteVisa: true,
         notePayment: true,
         noteSpecial: true,
+        separatePnr: true,
+        sameHotelWith: true,
       },
     });
     if (!before) return reply.status(404).send({ error: '订单不存在' });
@@ -1814,6 +1823,10 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       ...(body.noteVisa !== undefined && { noteVisa: body.noteVisa }),
       ...(body.notePayment !== undefined && { notePayment: body.notePayment }),
       ...(body.noteSpecial !== undefined && { noteSpecial: body.noteSpecial }),
+      // 备注结构化（2026-09-17）。sameHotelWith 显式收 null —— 清空「和某某同酒店」这条安排，
+      // 判的是 undefined（没传）而不是真值，否则清空请求会被当成「没改」静默丢掉。
+      ...(body.separatePnr !== undefined && { separatePnr: body.separatePnr }),
+      ...(body.sameHotelWith !== undefined && { sameHotelWith: body.sameHotelWith }),
     };
 
     // ── 签证状态 + 备注四栏：同一条 UPDATE、同一个事务（矛盾闸与签证任务同步都在里头）──
@@ -1848,6 +1861,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         noteVisa: before.noteVisa,
         notePayment: before.notePayment,
         noteSpecial: before.noteSpecial,
+        separatePnr: before.separatePnr,
+        sameHotelWith: before.sameHotelWith,
       },
       after: body,
     });

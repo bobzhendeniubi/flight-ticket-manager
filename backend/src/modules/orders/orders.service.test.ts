@@ -3666,6 +3666,10 @@ describe('correctPassenger · 订正证件资料', () => {
       conflicts?: Array<{ order: { orderNumber: string } }>;
       /** 同一订单内已有相同证件号的另一位出行人（passenger.findFirst 的返回）。 */
       sameOrderDup?: { id: string } | null;
+      /** 备注结构化三项的旧值（默认：床型未填、不兑换升舱）。 */
+      bedPref?: string | null;
+      upgradeRedeemLeg?: string;
+      upgradeRedeemNote?: string | null;
     } = {},
   ) {
     const passengerRow = {
@@ -3682,6 +3686,10 @@ describe('correctPassenger · 订正证件资料', () => {
       passengerType: 'ADULT',
       passportExpiry: new Date('2035-06-30'),
       passportIssueDate: new Date('2025-06-30'),
+      // 备注结构化三项（2026-09-17）：订正通道也改这几项，审计 before 要读得到旧值
+      bedPref: opts.bedPref ?? null,
+      upgradeRedeemLeg: opts.upgradeRedeemLeg ?? 'NONE',
+      upgradeRedeemNote: opts.upgradeRedeemNote ?? null,
       pnr: opts.pnr ?? null,
       eticketNumber: opts.eticketNumber ?? null,
     };
@@ -3821,6 +3829,51 @@ describe('correctPassenger · 订正证件资料', () => {
 
     const data = mockPrisma.passenger.update.mock.calls[0][0].data;
     expect(data.formerIdentities).toBe('ZHANG/SAN 张三 E12345Q78');
+  });
+
+  // ── 备注结构化（2026-09-17）：床型 / 兑换升舱在订正弹窗里改 ──────────────────
+  it('只改床型 / 兑换升舱 → 原样落库，且不留旧身份段（没丢任何搜得到的值）', async () => {
+    const service = new OrderService();
+    armCorrectMocks();
+
+    await service.correctPassenger(
+      'ord1',
+      'px1',
+      { bedPref: 'TWIN', upgradeRedeemLeg: 'RETURN', upgradeRedeemNote: '用同行人的次数' },
+      OPS,
+    );
+
+    const data = mockPrisma.passenger.update.mock.calls[0][0].data;
+    expect(data).toEqual({
+      bedPref: 'TWIN',
+      upgradeRedeemLeg: 'RETURN',
+      upgradeRedeemNote: '用同行人的次数',
+    });
+  });
+
+  it('审计 before/after 带上这三项的变化（changedFields 与身份字段同一份流水）', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ bedPref: 'DOUBLE' });
+
+    const { audit } = await service.correctPassenger(
+      'ord1',
+      'px1',
+      { bedPref: 'TWIN', upgradeRedeemLeg: 'BOTH' },
+      OPS,
+    );
+
+    expect(audit.changedFields).toEqual(['bedPref', 'upgradeRedeemLeg']);
+    expect(audit.before).toMatchObject({ bedPref: 'DOUBLE', upgradeRedeemLeg: 'NONE' });
+    expect(audit.after).toMatchObject({ bedPref: 'TWIN', upgradeRedeemLeg: 'BOTH' });
+  });
+
+  it('已出票的单改床型 → 放行（不上票面、不进定价，身份闸不该拦它）', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ invoiced: true, pnr: 'ABC123', eticketNumber: '784-1234567890' });
+
+    await service.correctPassenger('ord1', 'px1', { bedPref: 'DOUBLE' }, OPS);
+
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
   });
 
   it('订正后的证件号已在同班次的有效订单里占座 → 拒（同一人不能占两份座）', async () => {
@@ -6407,6 +6460,60 @@ describe('OrderService.createOrder · settlement discount guardrails', () => {
   beforeEach(() => {
     vi.clearAllMocks();
     prepareCreateMocks();
+  });
+
+  // ── 备注结构化（2026-09-17）：建单把四项一并落库 ─────────────────────────────
+  // 本组只关心「四项有没有原样落进 order.create 的 data」，故把与之无关的班次查询
+  //（出行人类型权威派生用）显式按空结果armed，不依赖别的 describe 留下的 mock 现场。
+  it('建单落订单级 separatePnr / sameHotelWith 与乘客级床型 / 兑换升舱', async () => {
+    mockPrisma.flightSchedule.findMany.mockResolvedValue([]);
+    const service = prepareService();
+    const body = {
+      ...bundleBody,
+      separatePnr: true,
+      sameHotelWith: '和王五同一个酒店',
+      passengers: [
+        {
+          ...bundleBody.passengers[0],
+          bedPref: 'DOUBLE',
+          upgradeRedeemLeg: 'RETURN',
+          upgradeRedeemNote: '用同行人的次数',
+        },
+      ],
+    };
+
+    // 与本组其余用例同一个请求者（代理单跳过散客 RETAIL 立减那条支路，
+    // 那条与备注结构化毫无关系，不值得为它多铺一层 mock）。
+    await service.createOrder(body as never, { userId: 'agent-user', role: 'AGENT', agentId: 'agent-a' });
+
+    const data = (mockPrisma.order.create.mock.calls[0][0] as {
+      data: { separatePnr: boolean; sameHotelWith: string | null; passengers: { create: unknown[] } };
+    }).data;
+    expect(data.separatePnr).toBe(true);
+    expect(data.sameHotelWith).toBe('和王五同一个酒店');
+    expect(data.passengers.create[0]).toMatchObject({
+      bedPref: 'DOUBLE',
+      upgradeRedeemLeg: 'RETURN',
+      upgradeRedeemNote: '用同行人的次数',
+    });
+  });
+
+  it('不传四项 → 落 false / null / NONE（存量与旧客户端口径不变）', async () => {
+    mockPrisma.flightSchedule.findMany.mockResolvedValue([]);
+    const service = prepareService();
+
+    await service.createOrder(bundleBody as never, { userId: 'agent-user', role: 'AGENT', agentId: 'agent-a' });
+
+    const data = (mockPrisma.order.create.mock.calls[0][0] as {
+      data: { separatePnr: boolean; sameHotelWith: string | null; passengers: { create: unknown[] } };
+    }).data;
+    expect(data.separatePnr).toBe(false);
+    expect(data.sameHotelWith).toBeNull();
+    expect(data.passengers.create[0]).toMatchObject({
+      bedPref: null,
+      upgradeRedeemLeg: 'NONE',
+      upgradeRedeemNote: null,
+    });
   });
 
   it('代理命中日历+规则 → 生成含 bundleId/ruleId 快照的立减行、结算总价扣减并写审计', async () => {

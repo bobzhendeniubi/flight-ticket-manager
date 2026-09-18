@@ -1253,6 +1253,8 @@ describe('getOccupyingOrders', () => {
         orderNumber: 'ST-0001',
         status: 'PAID',
         contactName: '张三',
+        // 同酒店安排（备注结构化）：这张 fixture 没填 → null（房控面板不显示提示）
+        sameHotelWith: null,
         passengerCount: 2,
         passengerNames: ['张三', 'LI/SI'],
         rooms: 1,

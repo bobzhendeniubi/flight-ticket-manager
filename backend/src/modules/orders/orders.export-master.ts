@@ -62,6 +62,9 @@ import {
   perPaxSingleRoomDiffByPassenger,
   allPassengersVisaExempt,
   pnrName,
+  bedPrefCell,
+  separatePnrCell,
+  upgradeRedeemCell,
   AGENT_HIDDEN_EXPORT_KEYS,
 } from './orders.export-templates.js';
 import { appendHoldOrderSheet, loadHoldExportRows } from './orders.export-hold-orders.js';
@@ -179,6 +182,11 @@ function fmtDepartDate(d: Date | null | undefined, tz: string | null | undefined
 export interface MasterRow {
   seq: number;
   agency: string;
+  // ── 备注结构化（2026-09-17）：四项从自由备注里拎出来，放在备注列前 ────────────
+  bedPref: string; // 床型（按乘客）：大床 / 双床 / 留空
+  sameHotelWith: string; // 同酒店安排（订单级自由文本）
+  separatePnr: string; // 单独编码出票（订单级）：是 / 留空
+  upgradeRedeem: string; // 兑换升舱（按乘客）：去程/回程/往返 + 说明
   notes: string;
   hotelName: string; // 酒店中文名称（乘客行级）：优先分房组实际酒店（房控），回退订单项 hotelRoomType.hotel.name 去重
   chineseName: string;
@@ -254,6 +262,11 @@ interface MasterColumn {
 const MASTER_COLUMNS: MasterColumn[] = [
   { header: '序号', key: 'seq', width: 6 },
   { header: '代理机构', key: 'agency', width: 16 },
+  // 四列排在备注之前：它们原本就写在备注里，先看结构化的、再看剩下的自由文本。
+  { header: '床型', key: 'bedPref', width: 8 },
+  { header: '同酒店', key: 'sameHotelWith', width: 18 },
+  { header: '单独编码', key: 'separatePnr', width: 10 },
+  { header: '兑换升舱', key: 'upgradeRedeem', width: 18 },
   { header: '备注', key: 'notes', width: 22 },
   { header: '酒店中文名称', key: 'hotelName', width: 20, roles: ['all', 'visa'] },
   { header: '乘客中文名', key: 'chineseName', width: 12 },
@@ -813,6 +826,11 @@ export function orderToMasterRows(
 
     return {
       agency,
+      // 床型 / 兑换升舱按人；同酒店 / 单独编码是订单级（整单一个值，逐行重复）。
+      bedPref: bedPrefCell(p.bedPref),
+      sameHotelWith: order.sameHotelWith ?? '',
+      separatePnr: separatePnrCell(order.separatePnr),
+      upgradeRedeem: upgradeRedeemCell(p),
       notes,
       // 酒店中文名称（乘客行级，0722 财务反馈）：优先该乘客分房组的实际酒店（房控排房结果），
       // 无分房组 → 回退订单项口径 hotelNamesFallback（现状值），绝不留空；房组文本是套餐名残留时

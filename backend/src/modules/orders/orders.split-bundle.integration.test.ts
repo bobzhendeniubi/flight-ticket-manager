@@ -556,6 +556,32 @@ describe('套餐单拆单 · 七条守恒（真 DB）', () => {
     expect(tgt.paymentsLockedBy).toBe(actor.userId);
   });
 
+  // ── 备注结构化（2026-09-17）：拆单是物理搬乘客行，偏好项必须跟着人走 ────────────
+  it('床型 / 兑换升舱跟着被拆出的乘客搬到新单（拆单不是重新录一个人）', async () => {
+    const actor = await adminActor();
+    const { order, p2 } = await createBundleOrder();
+    await prisma.passenger.update({
+      where: { id: p2.id },
+      data: {
+        bedPref: 'TWIN',
+        upgradeRedeemLeg: 'RETURN',
+        upgradeRedeemNote: '用本人的次数',
+      },
+    });
+
+    const result = await service.splitOrder(
+      order.id,
+      { passengerIds: [p2.id], requestToken: token('b-notes'), autoSplitRoomGroups: true },
+      actor,
+    );
+
+    const moved = await prisma.passenger.findUniqueOrThrow({ where: { id: p2.id } });
+    expect(moved.orderId).toBe(result.targetOrderId);
+    expect(moved.bedPref).toBe('TWIN');
+    expect(moved.upgradeRedeemLeg).toBe('RETURN');
+    expect(moved.upgradeRedeemNote).toBe('用本人的次数');
+  });
+
   it('售后费按份额分摊：Σ adjustmentCny 与 Σ 应收都不变', async () => {
     const actor = await adminActor();
     const { order, p2 } = await createBundleOrder();

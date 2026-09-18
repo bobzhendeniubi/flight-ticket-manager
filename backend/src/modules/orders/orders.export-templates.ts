@@ -1,8 +1,9 @@
 /**
  * 三模板筛选导出 — 与订单列表共用筛选条件（buildOrderFilterWhere），一行/乘客。
  *
- *   full      《全岗可用》56 列 — 运营/财务/签证全岗位通用台账（53 列旧模版 + 纯拼音名 + 签证公司 + 订单状态）
- *   ticketing 《票务专用》27 列 — 代理+备注 + 航司 PNR 提交 25 列（仅含机票的订单）
+ *   full      《全岗可用》58 列 — 运营/财务/签证全岗位通用台账（53 列旧模版 + 纯拼音名 + 签证公司 + 订单状态
+ *             + 备注结构化两列「单独编码 / 兑换升舱」）
+ *   ticketing 《票务专用》29 列 — 代理+备注+单独编码+兑换升舱 + 航司 PNR 提交 25 列（仅含机票的订单）
  *   visa      《签证专用》21 列 — 越南签证申请表抬头（含越文表头，含签证公司列）
  *
  * 注意：系统暂无数据的列（单房差/抵扣人员等）保留表头、内容留空，
@@ -561,6 +562,50 @@ export function fmtDateDMYDash(d: Date | null | undefined): string {
   return `${String(d.getUTCDate()).padStart(2, '0')}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${d.getUTCFullYear()}`;
 }
 
+// ── 备注结构化（2026-09-17）四列的单元格口径 ────────────────────────────────
+// 分房表、《全岗可用》/《票务专用》模板、全岗总表三处都要出这几列。渲染只写这一份，
+// 免得「大床」在一张表里写成「大床」、另一张写成 DOUBLE——同一个字段两种写法，
+// 运营对表时无从判断是不是同一回事。
+
+/**
+ * 床型列：只出运营真会填的两档；SINGLE/SHARE_OK 等历史值与空值一律留空（不编造）。
+ * Passenger.bedPref 是自由 String? 列（不是枚举），库里可能躺着任何字符串 —— 故用等值比较
+ * 逐档认，认不出就留空，不做「查表 + 取到什么算什么」。
+ */
+export function bedPrefCell(bedPref: string | null | undefined): string {
+  if (bedPref === 'DOUBLE') return '大床';
+  if (bedPref === 'TWIN') return '双床';
+  return '';
+}
+
+/** 单独编码列：勾了出「是」，没勾留空（不写「否」——整列「否」读起来像是逐单确认过）。*/
+export function separatePnrCell(separatePnr: boolean | null | undefined): string {
+  return separatePnr === true ? '是' : '';
+}
+
+// Map 而不是对象字面量：对象查表会连原型链一起查，库里存进 'toString' / 'constructor'
+// 这类字符串时能取到一个**函数**，于是这一格渲染成 `function toString() ... · 说明`。
+// Map 只认自己装进去的键，认不出就是 undefined → 留空，与其它三列「认不出不编造」同一口径。
+const UPGRADE_REDEEM_LEG_LABEL = new Map<string, string>([
+  ['OUTBOUND', '去程'],
+  ['RETURN', '回程'],
+  ['BOTH', '往返'],
+]);
+
+/**
+ * 兑换升舱列：「去程 / 回程 / 往返」+ 说明，如「回程 · 用同行人的次数」。
+ * NONE / 缺省留空；只填了说明没选航段的（历史脏数据）同样留空——票务要的是「升哪一程」，
+ * 光有一句说明落不了地，出一半反而误导。
+ */
+export function upgradeRedeemCell(
+  p: { upgradeRedeemLeg?: string | null; upgradeRedeemNote?: string | null },
+): string {
+  const leg = UPGRADE_REDEEM_LEG_LABEL.get(p.upgradeRedeemLeg ?? '');
+  if (!leg) return '';
+  const note = (p.upgradeRedeemNote ?? '').trim();
+  return note ? `${leg} · ${note}` : leg;
+}
+
 /**
  * 乘客姓名 LASTNAME/FIRSTNAME（与 orders.export.ts 同款拆分）。
  * 拆分字段里可能残留护照逗号格式（源 fullName "WEI, HAIYANG" 按空白拆名时逗号会留在姓里 →
@@ -792,7 +837,7 @@ export function buildOrderContext(
 }
 
 // ── 模板一：《全岗可用》56 列（旧模版 53 列同名同序 + 「纯拼音名」+「签证公司」+「订单状态」）──────
-// 头部两行：0..49 列为单行表头（纵向合并两行）；末尾「订单成本」为分组表头，
+// 头部两行：成本三列之前的全部列为单行表头（纵向合并两行）；末尾「订单成本」为分组表头，
 // 跨「成本类型/子类型/金额」三子列（横向合并首行）。系统暂无数据的列一律留空，绝不编造。
 // 定金组四列（定金/到账金额/到账时间/到账渠道）已移除：系统无定金模型，四列恒空，
 // 且现行模版本身已删除该组。收款一律走 paidAmount + 收款流水。
@@ -801,6 +846,8 @@ interface FullRow {
   isOriginalOrder: string; // 是否是原订单 — 暂无对应字段，留空
   agency: string; // 代理机构
   notes: string; // 备注
+  separatePnr: string; // 单独编码（订单级：是 / 留空）
+  upgradeRedeem: string; // 兑换升舱（按乘客：去程/回程/往返 + 说明）
   hotelInfo: string; // 酒店类型（仅酒店名，0901 运营反馈不拼房型）
   chineseName: string; // 中文名称
   passengerName: string; // 乘客姓名 LAST/FIRST + 称谓（航司口径）
@@ -873,6 +920,9 @@ export const FULL_COLUMNS: Array<{
   { header: '是否是原订单', key: 'isOriginalOrder', width: 12 },
   { header: '代理机构', key: 'agency', width: 16 },
   { header: '备注', key: 'notes', width: 22 },
+  // 备注结构化：从自由备注里拎出来的两项，紧挨备注列（票务原来就在这一列里找它们）
+  { header: '单独编码', key: 'separatePnr', width: 10 },
+  { header: '兑换升舱', key: 'upgradeRedeem', width: 20 },
   { header: '酒店类型', key: 'hotelInfo', width: 24 },
   { header: '中文名称', key: 'chineseName', width: 12 },
   { header: '乘客姓名', key: 'passengerName', width: 18 },
@@ -1041,6 +1091,9 @@ export function orderToFullRows(
     isOriginalOrder: '',
     agency: ctx.agency,
     notes,
+    // 单独编码是订单级（整单一个值，逐行重复）；兑换升舱按人各不相同。
+    separatePnr: separatePnrCell(order.separatePnr),
+    upgradeRedeem: upgradeRedeemCell(p),
     // 酒店类型（乘客行级，0722 财务反馈；0901 运营反馈只出酒店名不拼房型）：
     // 优先该乘客分房组的实际酒店（房控排房结果），无分房组 → 回退订单项口径 ctx.hotelInfo
     // （现状值），绝不留空；房组文本是套餐名残留时按归属行落位出（见 resolveExportHotelName）。
@@ -1160,11 +1213,14 @@ function applyFullHeader(
 }
 
 // ── 模板二：《票务专用》27 列 = 代理 + 备注 + 航司 PNR 25 列 ───────────────
-type TicketingRow = { agency: string; notes: string } & PnrRow;
+type TicketingRow = { agency: string; notes: string; separatePnr: string; upgradeRedeem: string } & PnrRow;
 
+// 新两列插在「备注」之后、PNR 25 列之前：PNR 那一段是交给航司的标准格式，整块保持连续。
 export const TICKETING_COLUMNS: Array<{ header: string; key: keyof TicketingRow; width: number }> = [
   { header: '代理', key: 'agency', width: 16 },
   { header: '备注', key: 'notes', width: 20 },
+  { header: '单独编码', key: 'separatePnr', width: 10 },
+  { header: '兑换升舱', key: 'upgradeRedeem', width: 20 },
   ...PNR_COLUMNS.map((c) => ({ header: c.header, key: c.key as keyof TicketingRow, width: 18 })),
 ];
 
@@ -1174,6 +1230,9 @@ export function orderToTicketingRows(order: OrderForTemplateExport, ctx: OrderCo
   return order.passengers.map<TicketingRow>((p) => ({
     agency: ctx.agency,
     notes: ctx.notes,
+    // 票务原来靠读备注判断「这单要不要单独编码」「升哪一程」，现在两列直接给到。
+    separatePnr: separatePnrCell(order.separatePnr),
+    upgradeRedeem: upgradeRedeemCell(p),
     ...passengerToRow(p, departureDate),
   }));
 }

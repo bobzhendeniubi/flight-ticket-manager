@@ -3094,6 +3094,12 @@ export interface HotelOccupantDto {
   orderNumber: string;
   status: OrderStatus;
   contactName: string;
+  /**
+   * 同酒店安排（Order.sameHotelWith，备注结构化 2026-09-17）：要和谁 / 哪张单住同一家。
+   * 房控在随机档缺口面板与换酒店弹窗里落位时必须看见它——此前只写在自由备注里，
+   * 下钻列表看不到，落位时把本该同住的两拨人分到了两家酒店。没填 = null。
+   */
+  sameHotelWith: string | null;
   /** 该订单出行人数（占位联系人 documentNumber='N/A' 不计，口径同前台分房池） */
   passengerCount: number;
   /**
@@ -3168,6 +3174,7 @@ export async function getOccupyingOrders(
           orderNumber: true,
           status: true,
           contactName: true,
+          sameHotelWith: true, // 同酒店安排（备注结构化）：落位时要看见
           roomAssignment: true, // 权威分房表——间数展示优先按「有乘客的房间盒子数」
           agent: { select: { companyName: true } },
           passengers: { select: { documentNumber: true, chineseName: true, fullName: true } },
@@ -3275,6 +3282,7 @@ export async function getOccupyingOrders(
         orderNumber: it.order.orderNumber,
         status: it.order.status,
         contactName: it.order.contactName,
+        sameHotelWith: it.order.sameHotelWith ?? null,
         passengerCount: it.order.passengers.filter((p) => p.documentNumber !== 'N/A').length,
         passengerNames: it.order.passengers
           .filter((p) => p.documentNumber !== 'N/A')

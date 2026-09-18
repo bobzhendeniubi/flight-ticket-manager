@@ -134,6 +134,30 @@ function fixtureItems(): RoomItemForExport[] {
   ] as unknown as RoomItemForExport[];
 }
 
+describe('备注结构化两列（2026-09-17）· 分房表', () => {
+  it('床型按人出中文，同酒店按单（整单一个值，逐行重复）', () => {
+    const items = fixtureItems();
+    const o1 = items[0].order as unknown as {
+      sameHotelWith: string | null;
+      passengers: Array<{ bedPref: string | null }>;
+    };
+    o1.sameHotelWith = '和王五同一个酒店';
+    o1.passengers[0].bedPref = 'DOUBLE';
+    o1.passengers[1].bedPref = 'TWIN';
+
+    const rows = buildRoomAllocationSheets(items)[0].rows;
+    expect(rows.map((r) => r.bedPref)).toEqual(['大床', '双床']);
+    for (const r of rows) expect(r.sameHotelWith).toBe('和王五同一个酒店');
+  });
+
+  it('存量单（两项都没填）两列留空 —— 分房岗一眼看出「没提要求」而不是「不限」', () => {
+    // O2（第二个 sheet）fixture 里 bedPref=null、sameHotelWith 未设
+    const rows = buildRoomAllocationSheets(fixtureItems())[1].rows;
+    expect(rows[0].bedPref).toBe('');
+    expect(rows[0].sameHotelWith).toBe('');
+  });
+});
+
 describe('buildRoomAllocationSheets', () => {
   it('按入住日期分 sheet（名 M-D、升序），同录入时间并列回落酒店名排序、per-sheet 编号', () => {
     const sheets = buildRoomAllocationSheets(fixtureItems());
@@ -322,12 +346,15 @@ describe('飞行次数 = 常旅客档案快照（与全岗总表/《全岗可用
 });
 
 describe('COLUMNS 列序（对齐旧系统 0713 房控反馈）', () => {
-  it('旧系统 16 列原序 + 当前系统特有 3 列（房间号/升级原因/当日余房）追加末位', () => {
+  it('旧系统 16 列原序（含备注结构化插入的床型/同酒店）+ 当前系统特有 3 列（房间号/升级原因/当日余房）追加末位', () => {
     expect(COLUMNS.map((c) => c.header)).toEqual([
       '序号',
       '代理机构',
       '备注',
       '酒店类型',
+      // 备注结构化（2026-09-17）：床型 / 同酒店紧挨酒店类型——分房岗原本要从备注列里读它们
+      '床型',
+      '同酒店',
       '中文名称',
       '乘客姓名',
       '飞行次数',

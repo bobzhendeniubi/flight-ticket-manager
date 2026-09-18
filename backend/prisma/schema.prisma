@@ -1742,6 +1742,18 @@ enum OrderLegFlag {
   OUTBOUND_VOIDED
 }
 
+/// 兑换升舱（常旅客满次数换商务舱）作用在哪一程 —— 此前只写在自由备注里，票务靠人眼看。
+///   NONE      不兑换（默认，存量与旧客户端天然回落到这一档）
+///   OUTBOUND  只去程升舱
+///   RETURN    只回程升舱
+///   BOTH      去回程都升舱
+enum UpgradeRedeemLeg {
+  NONE
+  OUTBOUND
+  RETURN
+  BOTH
+}
+
 model Order {
   id                   String           @id @default(cuid())
   orderNumber          String           @unique // human-friendly, e.g., "FTM2026041400001"
@@ -1804,6 +1816,11 @@ model Order {
   noteVisa             String? // 签证
   notePayment          String? // 付款
   noteSpecial          String? // 特殊
+  // 备注结构化（2026-09-17）：备注里高频出现、下游要靠人眼看的两项做成字段。
+  //   separatePnr   = 本单单独编码出票，不与他单合并 PNR（此前只在 OTA 名单文本里出现，票务靠看备注判断）
+  //   sameHotelWith = 要和谁 / 哪张单住同一家酒店。做文本不做关联：写的多是人名，对方可能还没录单，房控按名搜即可。
+  separatePnr          Boolean          @default(false)
+  sameHotelWith        String?
   // 防漏单：哪位运营接的单 + 接单时间
   claimedById          String?
   claimedAt            DateTime?
@@ -2064,6 +2081,13 @@ model Passenger {
   needsInfantBassinet Boolean @default(false)
   // 拼房用 — 客人偏好：SINGLE/DOUBLE/TWIN/SHARE_OK
   bedPref             String?
+  // 兑换升舱（2026-09-17 备注结构化）：常旅客满次数换商务舱是按人、按航段的事，此前只写在
+  // 自由备注里，票务要靠人眼挑「升哪一程、用谁的次数」。
+  //   upgradeRedeemLeg  = 升哪一程（@default(NONE) → 存量与旧客户端天然回落「不兑换」）
+  //   upgradeRedeemNote = 兑换说明（如「用同行人的次数」「经济舱第一排」），≤80 字
+  // 不进定价：升舱的钱仍走既有加项 / 调价通道，这两列只承载票务执行口径。
+  upgradeRedeemLeg    UpgradeRedeemLeg @default(NONE)
+  upgradeRedeemNote   String?
 
   // ── 套餐乘客级选项（购物车模式：同一订单每人各选自己的住宿方式 + 签证；价差全部系统算）──
   //   visaExempt = 客人自备签证（无需送签）：签证台按此过滤掉该乘客，套餐价按人扣减 selfVisaDeductCny。

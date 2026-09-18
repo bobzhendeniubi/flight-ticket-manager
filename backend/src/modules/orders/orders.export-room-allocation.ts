@@ -27,7 +27,12 @@ import { OrderStatus, OrderItemKind } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { BadRequestError } from '../../lib/errors.js';
 import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
-import { fmtDateDMYDash, pnrName, perPaxSettlementByPassenger } from './orders.export-templates.js';
+import {
+  bedPrefCell,
+  fmtDateDMYDash,
+  pnrName,
+  perPaxSettlementByPassenger,
+} from './orders.export-templates.js';
 import { spreadableAdjustmentCny } from './per-pax-share.js';
 import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats.js';
 import type { TripStatsMap } from './orders.export-trip-stats.js';
@@ -75,6 +80,9 @@ export interface RoomAllocationRow {
   notes: string;
   // 现状拼法：酒店名 · 房型名（口径缓办，维持不动）；未落位的星级随机行 = 「X星随机（待落位）」
   hotelType: string;
+  // ── 备注结构化（2026-09-17）：分房岗原来从备注文本里读这两项 ──────────────
+  bedPref: string; // 床型（按乘客）：大床 / 双床 / 留空
+  sameHotelWith: string; // 同酒店安排（订单级自由文本）：要和谁 / 哪张单同住一家
   chineseName: string;
   pnrName: string;
   /**
@@ -105,7 +113,8 @@ export interface RoomAllocationRow {
 }
 
 /**
- * 列序对齐旧系统（0713 房控反馈 W5）：前 16 列 = 旧系统原序；
+ * 列序对齐旧系统（0713 房控反馈 W5）：旧系统原序在前（其中「床型 / 同酒店」是备注结构化
+ * 2026-09-17 插在「酒店类型」之后的两列——分房岗原本就要从备注里读它们）；
  * 后 3 列（房间号/升级原因/当日余房）= 当前系统特有列，追加在旧表末位之后。
  * 导出为便于测试直接断言列序，无其他消费方引用。
  */
@@ -119,6 +128,9 @@ export const COLUMNS: Array<{
   { header: '代理机构', key: 'agency', width: 16 },
   { header: '备注', key: 'notes', width: 24 },
   { header: '酒店类型', key: 'hotelType', width: 26 },
+  // 紧挨「酒店类型」：落位与分房时要一眼看到床型与同酒店诉求，不必再翻备注列
+  { header: '床型', key: 'bedPref', width: 8 },
+  { header: '同酒店', key: 'sameHotelWith', width: 20 },
   { header: '中文名称', key: 'chineseName', width: 12 },
   { header: '乘客姓名', key: 'pnrName', width: 20 },
   {
@@ -639,6 +651,9 @@ export function buildRoomAllocationSheets(
         // 酒店类型列只出酒店名（0901 运营反馈）；未落位时 hotelName 本身就是
         // 「X星随机（待落位）」，房型另走独立的「房型」列（roomType，见下）。
         hotelType: hotelName,
+        // 床型按人，同酒店按单（整单一个值，逐行重复）
+        bedPref: bedPrefCell(p.bedPref),
+        sameHotelWith: order.sameHotelWith ?? '',
         chineseName: resolveChineseName(p),
         pnrName: pnrName(p),
         flightCount: flightCountCell(p, tripStats),
