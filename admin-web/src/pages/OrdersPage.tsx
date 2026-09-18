@@ -1,5 +1,5 @@
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { useSearchParams, useNavigate } from 'react-router-dom';
+import { Link, useSearchParams, useNavigate } from 'react-router-dom';
 import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type PoolTrail, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type RestoreCancelledOrderResult, type VoidReturnLegPreview, type OrderLegFlagFilter, type PublicLegStatus, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE, FLOWN_LEGS_CONFIRMATION_REQUIRED_CODE, flownLegsConfirmationDetails, TOKEN_PAYLOAD_MISMATCH_CODE, TOKEN_PAYLOAD_MISMATCH_HINT } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
@@ -32,6 +32,7 @@ import {
   type RoomingPassenger,
 } from '../components/RoomingEditor';
 import { passengerDisplayName } from '../lib/passengerDisplayName';
+import { travelerProfileLinkProps, TRAVELER_PROFILE_LINK_TITLE } from '../lib/travelerProfileLink';
 import { HotelSwapModal } from '../components/HotelSwapModal';
 import { SplitOrderModal } from '../components/SplitOrderModal';
 import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
@@ -1010,6 +1011,7 @@ const PassengerSubRow = memo(function PassengerSubRow({
   index,
   colSpan,
   orderHasVisaTask,
+  canOpenProfile,
   tripsRow,
   tripsStatus,
 }: {
@@ -1018,6 +1020,8 @@ const PassengerSubRow = memo(function PassengerSubRow({
   colSpan: number;
   /** 本单是否真有签证任务：无签证的单不给每人挂送签进度徽章。 */
   orderHasVisaTask: boolean;
+  /** 姓名是否链到旅客档案：档案接口只放行 ADMIN/STAFF，代理侧保持纯文本。 */
+  canOpenProfile: boolean;
   /** 常旅客次数档案（按证件批量查，展开时按需拉；查不到档案就是 undefined）。 */
   tripsRow?: TravelerProfileLookupRow;
   /** 本次批量查询状态：展开态才会发起请求，查询中/失败都要跟「无记录」区分开。 */
@@ -1025,13 +1029,34 @@ const PassengerSubRow = memo(function PassengerSubRow({
 }) {
   const displayName = p.chineseName?.trim() || p.fullName;
   const submission = p.visaSubmissionStatus ?? 'PENDING';
+  // 档案链接：批量查次数已经带回 profileId 就按 id 直达，否则把证件号走 Link state
+  // 交给档案页解析（证件号不进地址栏）。两条路都不额外发请求。
+  const profileLink = canOpenProfile
+    ? travelerProfileLinkProps({
+        profileId: tripsRow?.profileId,
+        documentType: p.documentType,
+        documentNumber: p.documentNumber,
+      })
+    : null;
   return (
     <tr className="bg-slate-50">
       <td colSpan={colSpan} className="!py-1.5 pl-16">
         <div className="flex flex-wrap items-baseline gap-x-2.5 gap-y-0.5 text-[11px] leading-snug">
           <span className="nums w-4 shrink-0 text-ink-muted">{index + 1}</span>
-          {/* 姓名只作锚点：告诉运营这一行的徽标是谁的；身份字段见内容列的平铺行。 */}
-          <span className="font-medium text-ink">{displayName}</span>
+          {/* 姓名只作锚点：告诉运营这一行的徽标是谁的；身份字段见内容列的平铺行。
+              运营/管理员点姓名直接进旅客档案（飞过几次、买过什么）。 */}
+          {profileLink ? (
+            <Link
+              className="font-medium text-ink hover:underline"
+              to={profileLink.to}
+              state={profileLink.state}
+              title={TRAVELER_PROFILE_LINK_TITLE}
+            >
+              {displayName}
+            </Link>
+          ) : (
+            <span className="font-medium text-ink">{displayName}</span>
+          )}
           {displayName !== p.fullName ? <span className="text-ink-soft">{p.fullName}</span> : null}
           {/* 签证：自备签乘客不进送签流程，只标「自备签」；其余仅在本单
               有签证任务时按送签进度标（无签证的单不挂进度徽章） */}
@@ -4515,12 +4540,30 @@ export function OrdersPage() {
                             const p = order.passengers[i];
                             const s = passengerPassportSummary(p);
                             const settlementCny = perPax?.get(p.id);
+                            // 平铺行这里没有档案 id（列表不为拼链接多发请求），证件号走 Link state
+                            const profileLink = isOps
+                              ? travelerProfileLinkProps({
+                                  documentType: p.documentType,
+                                  documentNumber: p.documentNumber,
+                                })
+                              : null;
                             return (
                               <div
                                 key={p.id}
                                 className={`flex flex-wrap items-baseline gap-x-1 ${i === hitIdx ? 'text-brand' : 'text-ink'}`}
                               >
-                                <span className="font-semibold">{s.nameLine}</span>
+                                {profileLink ? (
+                                  <Link
+                                    className="font-semibold hover:underline"
+                                    to={profileLink.to}
+                                    state={profileLink.state}
+                                    title={TRAVELER_PROFILE_LINK_TITLE}
+                                  >
+                                    {s.nameLine}
+                                  </Link>
+                                ) : (
+                                  <span className="font-semibold">{s.nameLine}</span>
+                                )}
                                 {s.typeMark ? (
                                   <span className="text-[10px] font-normal text-ink-soft">{s.typeMark}</span>
                                 ) : null}
@@ -4855,6 +4898,7 @@ export function OrdersPage() {
                           index={pIdx}
                           colSpan={tableColSpan}
                           orderHasVisaTask={orderHasVisaTask}
+                          canOpenProfile={isOps}
                           tripsRow={tripsRow}
                           tripsStatus={expandedTripsStatus}
                         />
@@ -11997,6 +12041,8 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
   // 建单后按人改自备签（专用端点，非换人通道）：仅内部可编辑角色可见（AGENT 不给）。
   const role = useAuth((s) => s.user?.role);
   const canToggleVisaExempt = role === 'ADMIN' || role === 'STAFF';
+  // 旅客档案接口只放行 ADMIN/STAFF：代理侧姓名保持纯文本，不给一个必然 403 的链接
+  const canOpenProfile = role === 'ADMIN' || role === 'STAFF';
   const confirm = useConfirm();
   const [visaExemptBusyId, setVisaExemptBusyId] = useState<string | null>(null);
   const [visaExemptErr, setVisaExemptErr] = useState<string | null>(null);
@@ -12190,6 +12236,14 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
             : undefined;
           const legacyHistory = docNo ? legacyByDoc.get(docNo.toUpperCase()) : undefined;
           const legacyRemaining = legacyHistory ? legacyHistory.total - legacyHistory.superseded : 0;
+          // 旅客档案入口：命中档案按 id 直达，否则证件号走 Link state；证件号也没有就保持纯文本
+          const profileLink = canOpenProfile
+            ? travelerProfileLinkProps({
+                profileId: tripsRow?.profileId,
+                documentType: p.documentType,
+                documentNumber: p.documentNumber,
+              })
+            : null;
           if (visaEditId === p.id) {
             return (
               <li key={p.id} className="rounded-md border border-sky-300 bg-sky-50/50 p-3">
@@ -12236,7 +12290,20 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
               <div className="flex items-start justify-between gap-2">
                 <div className="flex-1">
                   <div className="font-medium text-slate-900">
-                    <span className="font-mono tracking-wide">{toSlashName(p)}</span>
+                    {/* 姓名点进旅客档案（飞过几次、买过什么）；档案接口只放行 ADMIN/STAFF，
+                        代理侧保持纯文本。批量查次数命中档案就按 id 直达，否则按证件号解析。 */}
+                    {profileLink ? (
+                      <Link
+                        className="font-mono tracking-wide hover:underline"
+                        to={profileLink.to}
+                        state={profileLink.state}
+                        title={TRAVELER_PROFILE_LINK_TITLE}
+                      >
+                        {toSlashName(p)}
+                      </Link>
+                    ) : (
+                      <span className="font-mono tracking-wide">{toSlashName(p)}</span>
+                    )}
                     {p.chineseName && <span className="ml-2 font-normal text-slate-600">{p.chineseName}</span>}
                     <span className="ml-2 text-xs font-normal text-slate-500">{genderLabel(p.gender)}</span>
                     {/* 常旅客次数（查不到档案就不显示，不占位） */}

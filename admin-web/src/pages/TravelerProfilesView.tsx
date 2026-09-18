@@ -5,11 +5,12 @@
  * 飞过几次、什么时候飞、人均消费、住过什么酒店、床型/餐食/轮椅等偏好、同行人。
  * 详情抽屉实时从订单重算（永远准确）；列表快照过期由后端自动后台重建。
  */
-import { useEffect, useMemo, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { Link, useLocation, useNavigate, useSearchParams } from 'react-router-dom';
 import {
   api,
   ApiError,
+  type DocumentType,
   type ListTravelerProfilesResult,
   type TravelerBenefitRedemption,
   type TravelerProfile,
@@ -17,6 +18,8 @@ import {
   type TravelerProfileTrip,
   type LegacyPassengerHistory,
 } from '../lib/api';
+import { bedPrefLabel, upgradeRedeemLegLabel } from '../components/PassengerPrefChips';
+import type { TravelerProfileLinkState } from '../lib/travelerProfileLink';
 import { exportToCSV } from '../lib/csvExport';
 import { formatDateTimeSecCn } from '../lib/datetime';
 import { useAuth } from '../stores/auth';
@@ -55,6 +58,14 @@ const DEFAULT_REDEEM_TRIPS = 5;
 
 /** 可用次数为负的说明：不是算错，是订单退改把已飞次数拉回来了 */
 const NEGATIVE_AVAILABLE_HINT = '订单退改导致已飞次数回落，非系统算错';
+
+/** 证件类型白名单：Link state 带来的 docType 只认这两个，其余一律按护照处理 */
+const DOC_TYPES: readonly DocumentType[] = ['PASSPORT', 'ID_CARD'];
+
+function parseDocType(raw: string | null): DocumentType {
+  const v = (raw ?? '').trim().toUpperCase() as DocumentType;
+  return DOC_TYPES.includes(v) ? v : 'PASSPORT';
+}
 
 type SortKey = 'lastTripAt' | 'nextTripAt' | 'tripCount' | 'totalSpendCny';
 
@@ -100,6 +111,72 @@ export function TravelerProfilesView() {
   const [selectedId, setSelectedId] = useState<string | null>(null);
   const [rebuilding, setRebuilding] = useState(false);
   const [reloadNonce, setReloadNonce] = useState(0);
+  // 深链承接（订单页点乘客姓名跳进来）：
+  //   · ?profile=<档案 id> 直接开抽屉（档案 id 不敏感，留在地址栏里可分享可刷新）；
+  //   · 证件号走 Link state（不进地址栏，见 lib/travelerProfileLink）：先解析成档案 id，
+  //     解析不到就把证件号填进搜索框 + 给一句提示。刷新后 state 丢失，回到普通列表。
+  const [searchParams] = useSearchParams();
+  const location = useLocation();
+  const navigate = useNavigate();
+  const profileParam = searchParams.get('profile')?.trim() ?? '';
+  const linkState = location.state as TravelerProfileLinkState | null;
+  const docFromState = linkState?.doc?.trim() ?? '';
+  const docTypeFromState = linkState?.docType ?? null;
+  const [docLookupHint, setDocLookupHint] = useState<string | null>(null);
+
+  /**
+   * 抹掉深链上下文（?profile= 参数 + Link state）。
+   * 抽屉关掉后要抹：否则返回/刷新会把抽屉再弹一次；证件号解析完（命中与否）也要抹：
+   * 否则来回导航会二次触发解析，把运营在搜索框里改过的字又冲掉。
+   */
+  const clearLinkContext = useCallback(() => {
+    if (!searchParams.has('profile') && location.state == null) return;
+    const next = new URLSearchParams(searchParams);
+    next.delete('profile'); // 其余筛选参数原样保留
+    const qs = next.toString();
+    navigate(`${location.pathname}${qs ? `?${qs}` : ''}`, { replace: true, state: null });
+  }, [searchParams, location.pathname, location.state, navigate]);
+  // 解析回调里要用最新的清理函数，但它不能进 effect 依赖（依赖一变就会重发一次解析请求）
+  const clearLinkContextRef = useRef(clearLinkContext);
+  clearLinkContextRef.current = clearLinkContext;
+
+  useEffect(() => {
+    if (!profileParam) return;
+    setSelectedId(profileParam);
+    setDocLookupHint(null);
+  }, [profileParam]);
+
+  useEffect(() => {
+    const token = tokens?.accessToken;
+    // profile 优先：两个都给时不多打一次解析请求
+    if (!token || !docFromState || profileParam) return;
+    let cancelled = false;
+    setDocLookupHint(null);
+    api
+      .lookupTravelerProfiles(token, [
+        { documentType: parseDocType(docTypeFromState), documentNumber: docFromState },
+      ])
+      .then((r) => {
+        if (cancelled) return;
+        // 没建档的证件号后端会给一行现算兜底（profileId 为空串），那种不算命中
+        const hit = r.results.find((x) => x.profileId);
+        if (hit) setSelectedId(hit.profileId);
+        else {
+          setSearch(docFromState);
+          setDocLookupHint('没有这个证件号的档案');
+        }
+        clearLinkContextRef.current();
+      })
+      .catch(() => {
+        if (cancelled) return;
+        setSearch(docFromState);
+        setDocLookupHint('档案查询失败，已把证件号填进搜索框');
+        clearLinkContextRef.current();
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [tokens?.accessToken, docFromState, docTypeFromState, profileParam]);
 
   useEffect(() => {
     const t = window.setTimeout(() => setDebouncedSearch(search.trim()), 300);
@@ -233,8 +310,12 @@ export function TravelerProfilesView() {
               className="input"
               placeholder="如 CHAN / 陈文豪 / E1234"
               value={search}
-              onChange={(e) => setSearch(e.target.value)}
+              onChange={(e) => {
+                setSearch(e.target.value);
+                setDocLookupHint(null);
+              }}
             />
+            {docLookupHint && <p className="mt-1 text-xs text-amber-600">{docLookupHint}</p>}
           </div>
           <div>
             <label className="label text-xs">排序</label>
@@ -386,13 +467,18 @@ export function TravelerProfilesView() {
       {selectedId && (
         <ProfileDrawer
           profileId={selectedId}
-          onClose={() => setSelectedId(null)}
+          onClose={() => {
+            setSelectedId(null);
+            clearLinkContext();
+          }}
           onMerged={() => {
             setSelectedId(null);
+            clearLinkContext();
             setReloadNonce((n) => n + 1);
           }}
           onSearchCompanion={(doc) => {
             setSelectedId(null);
+            clearLinkContext();
             setSearch(doc);
           }}
         />
@@ -407,6 +493,38 @@ function Kpi({ label, value, sub }: { label: string; value: string; sub: string 
       <p className="stat-label">{label}</p>
       <p className="stat-value">{value}</p>
       <p className="mt-0.5 text-xs text-ink-muted">{sub}</p>
+    </div>
+  );
+}
+
+/**
+ * 出行记录的「买了什么」小徽标：整单产品（套餐 / 星级 / 有没有签证）+ 这位客人自己的选项
+ * （单住·床型·自备签·兑换升舱）。缺省值一律不渲染，不留「—」占位。
+ */
+function TripProductChips({ trip }: { trip: TravelerProfileTrip }) {
+  const chips: Array<{ key: string; label: string; title?: string }> = [];
+  if (trip.bundleName) chips.push({ key: 'bundle', label: trip.bundleName, title: '套餐' });
+  if (trip.hotelTier) chips.push({ key: 'tier', label: `${trip.hotelTier}星酒店` });
+  // 单住/拼房只在真订了住宿时才有意义（纯机票单不提）
+  const hasStay = trip.hotels.length > 0 || !!trip.bundleName || trip.hotelTier != null;
+  if (hasStay && trip.singleRoom !== undefined) {
+    chips.push({ key: 'room', label: trip.singleRoom ? '单住' : '拼房' });
+  }
+  const bed = bedPrefLabel(trip.bedPref);
+  if (bed) chips.push({ key: 'bed', label: bed, title: '床型' });
+  if (trip.visaExempt) chips.push({ key: 'visa', label: '签证：自备签' });
+  else if (trip.hasVisaProduct) chips.push({ key: 'visa', label: '签证：随单办签' });
+  const leg = upgradeRedeemLegLabel(trip.upgradeRedeemLeg);
+  if (leg) chips.push({ key: 'upgrade', label: `兑换升舱 ${leg}` });
+  if (chips.length === 0) return null;
+  return (
+    <div className="mt-1 flex flex-wrap gap-1">
+      {chips.map((c) => (
+        <span key={c.key} className="badge-neutral max-w-[14rem]" title={c.title ?? c.label}>
+          {/* 套餐名可能很长：内层 truncate（.badge 是 inline-flex，省略号要落在 flex item 上） */}
+          <span className="truncate">{c.label}</span>
+        </span>
+      ))}
     </div>
   );
 }
@@ -719,6 +837,8 @@ function ProfileDrawer({
                         <span>同行 {t.paxCount} 人</span>
                         <span>人均 {fmtCny(t.spendShareCny)}</span>
                       </div>
+                      {/* 买了什么：套餐 / 星级 / 单住 / 床型 / 签证 / 兑换升舱，缺的不占位 */}
+                      <TripProductChips trip={t} />
                       {t.hotels.map((h, i) => (
                         <div key={i} className="mt-1 text-slate-500">
                           <Icon name="hotel" /> {h.hotelName}

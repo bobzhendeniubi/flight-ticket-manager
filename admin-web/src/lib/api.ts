@@ -2579,6 +2579,22 @@ export interface TravelerProfileTrip {
   departed?: boolean;
   /** 去程 no-show（未登机）；后端新字段，老快照可能缺省。 */
   noShow?: boolean;
+  // ── 买了什么（整单口径）：后端新字段，详情实时重算必有，老响应可能缺省 ──
+  /** 套餐名（BUNDLE 行描述）；非套餐单为 null。 */
+  bundleName?: string | null;
+  /** 住宿星级：具体酒店星级优先，其次随机档星级；没订住宿为 null。 */
+  hotelTier?: number | null;
+  /** 这一单我方代办签证（独立签证行，或含签证的套餐）。 */
+  hasVisaProduct?: boolean;
+  // ── 这位客人自己在该单选了什么（同一单里逐人可不同）──
+  /** 本人单人入住。 */
+  singleRoom?: boolean;
+  /** 本人床型（DOUBLE / TWIN）。 */
+  bedPref?: string | null;
+  /** 本人自备签证。 */
+  visaExempt?: boolean;
+  /** 本人兑换升舱的航段；NONE / null = 不兑换。 */
+  upgradeRedeemLeg?: UpgradeRedeemLeg | null;
 }
 
 export interface ListTravelerProfilesResult {
