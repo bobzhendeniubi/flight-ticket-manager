@@ -93,6 +93,11 @@ fi
 # 两套环境共用一个 docker 守护进程，这里清的是全机的，不分环境。
 echo "▶ 清理悬空镜像…"
 docker image prune -f 2>&1 | tail -1
+# 构建缓存也要清：每次 build 留下的中间层不属于任何镜像，image prune 碰不到它，
+# 2026-09-18 两天 6 次发版就堆到 23.7G（盘 63%→73%）。只留 24 小时内的，
+# 当天多次发版仍能命中缓存，隔天的整层重建也就多花一两分钟。
+echo "▶ 清理构建缓存（>24h）…"
+docker builder prune -f --filter until=24h 2>&1 | tail -1
 df -h / | awk 'NR==2 {print "  磁盘 "$3" 已用 / "$4" 可用 ("$5")"}'
 
 echo "✓ 完成"
