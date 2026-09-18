@@ -43,12 +43,16 @@ function orderRow(
         bedPref: null,
         needsWheelchair: false,
         singleRoom: false,
+        visaExempt: false,
+        upgradeRedeemLeg: 'NONE',
       },
     ],
     items: [
       {
         kind: 'FLIGHT',
+        bundle: null,
         flightCabin: null,
+        randomStarTier: null,
         hotelCheckIn: null,
         hotelCheckOut: null,
         // 打标不动 flightScheduleId（那趟航班真飞了），痕迹只在 metadata 上
@@ -58,6 +62,7 @@ function orderRow(
           flight: { flightNumber: 'QH9588', originCode: 'MFM', destinationCode: 'DAD' },
         },
         hotelRoomType: null,
+        fulfillmentTasks: [],
       },
     ],
   };

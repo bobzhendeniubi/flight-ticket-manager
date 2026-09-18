@@ -219,12 +219,16 @@ describe('TravelerProfilesService.getDetail', () => {
             bedPref: null,
             needsWheelchair: false,
             singleRoom: false,
+            visaExempt: false,
+            upgradeRedeemLeg: 'NONE',
           },
         ],
         items: [
           {
             kind: OrderItemKind.FLIGHT,
+            bundle: null,
             flightCabin: CabinClass.ECONOMY,
+            randomStarTier: null,
             hotelCheckIn: null,
             hotelCheckOut: null,
             flightSchedule: {
@@ -232,6 +236,7 @@ describe('TravelerProfilesService.getDetail', () => {
               flight: { flightNumber: 'FTM1', originCode: 'MFM', destinationCode: 'DAD' },
             },
             hotelRoomType: null,
+            fulfillmentTasks: [],
           },
         ],
       },

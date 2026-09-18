@@ -12,6 +12,7 @@ import { describe, it, expect } from 'vitest';
 import {
   buildTravelerAggregates,
   docKey,
+  personalizeTrip,
   type AggOrder,
   type AggPassenger,
 } from './traveler-profiles.aggregate.js';
@@ -32,6 +33,8 @@ function pax(over: Partial<AggPassenger> & { documentNumber: string }): AggPasse
     bedPref: null,
     needsWheelchair: false,
     singleRoom: false,
+    visaExempt: false,
+    upgradeRedeemLeg: 'NONE',
     ...over,
   };
 }
@@ -54,6 +57,7 @@ function flightItem(
 ) {
   return {
     kind: 'FLIGHT' as const,
+    bundleName: null,
     flightCabin: extra?.cabin ?? ('ECONOMY' as const),
     departureTime: new Date(departISO),
     flightNumber: 'VJ2621',
@@ -61,15 +65,25 @@ function flightItem(
     destinationCode: 'DAD',
     hotelName: null,
     roomTypeName: null,
+    hotelStarRating: null,
+    randomStarTier: null,
     hotelCheckIn: null,
     hotelCheckOut: null,
     noShow: extra?.noShow ?? false,
+    hasVisaTask: false,
   };
 }
 
-function hotelItem(name: string, checkInISO: string, checkOutISO: string, roomType = 'Deluxe King') {
+function hotelItem(
+  name: string,
+  checkInISO: string,
+  checkOutISO: string,
+  roomType = 'Deluxe King',
+  starRating: number | null = null,
+) {
   return {
     kind: 'HOTEL' as const,
+    bundleName: null,
     flightCabin: null,
     departureTime: null,
     flightNumber: null,
@@ -77,10 +91,49 @@ function hotelItem(name: string, checkInISO: string, checkOutISO: string, roomTy
     destinationCode: null,
     hotelName: name,
     roomTypeName: roomType,
+    hotelStarRating: starRating,
+    randomStarTier: null,
     hotelCheckIn: new Date(checkInISO),
     hotelCheckOut: new Date(checkOutISO),
     noShow: false,
+    hasVisaTask: false,
   };
+}
+
+/** 星级随机档占用行：还没落到具体酒店，只有星级 */
+function randomTierHotelItem(tier: number, checkInISO: string, checkOutISO: string) {
+  return {
+    ...hotelItem('', checkInISO, checkOutISO),
+    hotelName: null,
+    roomTypeName: null,
+    randomStarTier: tier,
+  };
+}
+
+/** 套餐行：bundleName 来自 bundleId 关系的产品名；hasVisaTask 标记本单已建签证任务 */
+function bundleItem(name: string, opts?: { hasVisaTask?: boolean }) {
+  return {
+    kind: 'BUNDLE' as const,
+    bundleName: name,
+    flightCabin: null,
+    departureTime: null,
+    flightNumber: null,
+    originCode: null,
+    destinationCode: null,
+    hotelName: null,
+    roomTypeName: null,
+    hotelStarRating: null,
+    randomStarTier: null,
+    hotelCheckIn: null,
+    hotelCheckOut: null,
+    noShow: false,
+    hasVisaTask: opts?.hasVisaTask ?? false,
+  };
+}
+
+/** 独立签证行 */
+function visaItem() {
+  return { ...bundleItem('越南电子签'), bundleName: null, kind: 'VISA' as const };
 }
 
 const KEY = docKey('PASSPORT', 'E12345678');
@@ -727,5 +780,214 @@ describe('no-show：去程未登机的单不算飞过一次', () => {
     expect(trip.departed).toBe(true); // 那趟航班真飞了
     expect(trip.noShow).toBe(true); // 但客人没登机
     expect(trip.flown).toBe(false); // 所以不算飞过
+  });
+});
+
+describe('出行记录「买了什么」：整单产品 + 逐人选项', () => {
+  const OTHER_KEY = docKey('PASSPORT', 'E87654321');
+
+  it('套餐名取 BUNDLE 行描述；纯机票单为 null', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'b1',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [bundleItem('岘港 5 日自由行'), flightItem('2026-03-01T02:00:00Z')],
+      }),
+      order({
+        id: 'f1',
+        createdAt: new Date('2026-02-01T00:00:00Z'),
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-04-01T02:00:00Z')],
+      }),
+    ];
+    const trips = buildTravelerAggregates(orders, NOW).get(KEY)!.trips;
+    expect(trips.find((t) => t.orderId === 'b1')!.bundleName).toBe('岘港 5 日自由行');
+    expect(trips.find((t) => t.orderId === 'f1')!.bundleName).toBeNull();
+  });
+
+  it('住宿星级：具体酒店的星级优先于随机档星级；都没有为 null', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'real-hotel',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [
+          flightItem('2026-03-01T02:00:00Z'),
+          hotelItem('Melia Danang', '2026-03-01', '2026-03-04', 'Deluxe King', 5),
+        ],
+      }),
+      order({
+        id: 'random-tier',
+        createdAt: new Date('2026-02-01T00:00:00Z'),
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [
+          flightItem('2026-04-01T02:00:00Z'),
+          randomTierHotelItem(4, '2026-04-01', '2026-04-04'),
+        ],
+      }),
+      order({
+        id: 'flight-only',
+        createdAt: new Date('2026-01-15T00:00:00Z'),
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-05-01T02:00:00Z')],
+      }),
+    ];
+    const trips = buildTravelerAggregates(orders, NOW).get(KEY)!.trips;
+    expect(trips.find((t) => t.orderId === 'real-hotel')!.hotelTier).toBe(5);
+    expect(trips.find((t) => t.orderId === 'random-tier')!.hotelTier).toBe(4);
+    expect(trips.find((t) => t.orderId === 'flight-only')!.hotelTier).toBeNull();
+  });
+
+  it('一单订了两家不同星级的酒店 → 不给星级（宁可不显示，也不随手挑一行）', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'mixed-stars',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [
+          flightItem('2026-03-01T02:00:00Z'),
+          hotelItem('Melia Danang', '2026-03-01', '2026-03-03', 'Deluxe King', 5),
+          hotelItem('Muong Thanh', '2026-03-03', '2026-03-05', 'Superior Twin', 4),
+        ],
+      }),
+    ];
+    expect(buildTravelerAggregates(orders, NOW).get(KEY)!.trips[0].hotelTier).toBeNull();
+  });
+
+  it('同星级的多家酒店（换店/分段住）仍给星级', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'same-stars',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [
+          flightItem('2026-03-01T02:00:00Z'),
+          hotelItem('Melia Danang', '2026-03-01', '2026-03-03', 'Deluxe King', 4),
+          hotelItem('Muong Thanh', '2026-03-03', '2026-03-05', 'Superior Twin', 4),
+        ],
+      }),
+    ];
+    expect(buildTravelerAggregates(orders, NOW).get(KEY)!.trips[0].hotelTier).toBe(4);
+  });
+
+  it('两个不同星级的随机档占用行同样不给星级', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'mixed-random',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [
+          flightItem('2026-03-01T02:00:00Z'),
+          randomTierHotelItem(3, '2026-03-01', '2026-03-03'),
+          randomTierHotelItem(4, '2026-03-03', '2026-03-05'),
+        ],
+      }),
+    ];
+    expect(buildTravelerAggregates(orders, NOW).get(KEY)!.trips[0].hotelTier).toBeNull();
+  });
+
+  it('hasVisaProduct：独立签证行或含签证任务的套餐都算；纯机票单不算', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'visa-item',
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-03-01T02:00:00Z'), visaItem()],
+      }),
+      order({
+        id: 'bundle-visa',
+        createdAt: new Date('2026-02-01T00:00:00Z'),
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [bundleItem('岘港 5 日自由行', { hasVisaTask: true })],
+      }),
+      order({
+        id: 'no-visa',
+        createdAt: new Date('2026-01-15T00:00:00Z'),
+        passengers: [pax({ documentNumber: 'E12345678' })],
+        items: [flightItem('2026-05-01T02:00:00Z')],
+      }),
+    ];
+    const trips = buildTravelerAggregates(orders, NOW).get(KEY)!.trips;
+    expect(trips.find((t) => t.orderId === 'visa-item')!.hasVisaProduct).toBe(true);
+    expect(trips.find((t) => t.orderId === 'bundle-visa')!.hasVisaProduct).toBe(true);
+    expect(trips.find((t) => t.orderId === 'no-visa')!.hasVisaProduct).toBe(false);
+  });
+
+  it('同一单里两位客人各自的单住/自备签/床型/兑换升舱互不串行', () => {
+    const orders: AggOrder[] = [
+      order({
+        id: 'shared',
+        passengers: [
+          pax({
+            documentNumber: 'E12345678',
+            singleRoom: true,
+            visaExempt: true,
+            bedPref: 'DOUBLE',
+            upgradeRedeemLeg: 'BOTH',
+          }),
+          pax({ documentNumber: 'E87654321', bedPref: 'TWIN' }),
+        ],
+        items: [
+          bundleItem('岘港 5 日自由行', { hasVisaTask: true }),
+          flightItem('2026-03-01T02:00:00Z'),
+        ],
+      }),
+    ];
+    const aggregates = buildTravelerAggregates(orders, NOW);
+    const mine = aggregates.get(KEY)!.trips[0];
+    const theirs = aggregates.get(OTHER_KEY)!.trips[0];
+
+    expect(mine.singleRoom).toBe(true);
+    expect(mine.visaExempt).toBe(true);
+    expect(mine.bedPref).toBe('DOUBLE');
+    expect(mine.upgradeRedeemLeg).toBe('BOTH');
+
+    expect(theirs.singleRoom).toBe(false);
+    expect(theirs.visaExempt).toBe(false);
+    expect(theirs.bedPref).toBe('TWIN');
+    expect(theirs.upgradeRedeemLeg).toBe('NONE'); // 产品默认值，不是 null
+
+    // 整单口径的那一半两人一致
+    expect(mine.bundleName).toBe(theirs.bundleName);
+    expect(mine.hasVisaProduct).toBe(true);
+    expect(theirs.hasVisaProduct).toBe(true);
+  });
+});
+
+describe('personalizeTrip', () => {
+  const baseOrder = order({
+    id: 'p1',
+    passengers: [pax({ documentNumber: 'E12345678' })],
+    items: [bundleItem('岘港 5 日自由行'), flightItem('2026-03-01T02:00:00Z')],
+  });
+  const summary = buildTravelerAggregates([baseOrder], NOW).get(KEY)!.trips[0];
+
+  it('不兑换升舱在库里是 NONE（不是 null），原样带出给前端判空', () => {
+    const trip = personalizeTrip(summary, pax({ documentNumber: 'E12345678' }));
+    expect(trip.upgradeRedeemLeg).toBe('NONE');
+  });
+
+  it('逐人字段照抄该乘机人行，整单字段不动，且不改原摘要对象', () => {
+    const trip = personalizeTrip(
+      summary,
+      pax({
+        documentNumber: 'E12345678',
+        singleRoom: true,
+        bedPref: 'TWIN',
+        visaExempt: true,
+        upgradeRedeemLeg: 'RETURN',
+      }),
+    );
+    expect(trip.singleRoom).toBe(true);
+    expect(trip.bedPref).toBe('TWIN');
+    expect(trip.visaExempt).toBe(true);
+    expect(trip.upgradeRedeemLeg).toBe('RETURN');
+    expect(trip.bundleName).toBe('岘港 5 日自由行');
+    expect(trip.orderNumber).toBe(summary.orderNumber);
+    // 同一份整单摘要被同单多位旅客共用，绝不能被某个人的选项就地改掉
+    expect(summary.singleRoom).toBe(false);
+  });
+
+  it('缺省的 upgradeRedeemLeg（老夹具/老数据）归一成 null', () => {
+    const trip = personalizeTrip(
+      summary,
+      pax({ documentNumber: 'E12345678', upgradeRedeemLeg: null }),
+    );
+    expect(trip.upgradeRedeemLeg).toBeNull();
   });
 });

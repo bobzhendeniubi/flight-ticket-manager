@@ -13,7 +13,14 @@
  * 独立成文件（而非留在 traveler-profiles.service.ts）的原因：导出侧要用这份口径，而 service
  * 又是导出侧的下游（TravelerProfilesService/SNAPSHOT_STALE_MS），共用核心留在 service 里会成环。
  */
-import { OrderStatus, Prisma, type DocumentType, type PrismaClient } from '@prisma/client';
+import {
+  FulfillmentStatus,
+  FulfillmentType,
+  OrderStatus,
+  Prisma,
+  type DocumentType,
+  type PrismaClient,
+} from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { businessDateISO } from '../../lib/business-time.js';
 import {
@@ -62,14 +69,25 @@ export const orderSelect = {
       bedPref: true,
       needsWheelchair: true,
       singleRoom: true,
+      // 档案「出行记录」要按人显示这一单他自己选了什么（同一单里两位客人可以不一样）
+      visaExempt: true,
+      upgradeRedeemLeg: true,
     },
   },
   items: {
+    // 派生「买了什么」要按固定顺序扫订单行（同星级多行时取哪一行都一样，但顺序不定的话
+    // 一旦数据有歧义结果就会在两次查询间跳来跳去）—— 建行顺序即业务顺序。
+    orderBy: { createdAt: 'asc' as const },
     select: {
       kind: true,
+      // 套餐名走 bundleId 关系取产品名（description 会被换酒店/补房差等流程改写，
+      // 而且每行都选一遍字符串没必要 —— 只有 BUNDLE 行上这个关系非空）
+      bundle: { select: { name: true } },
       flightCabin: true,
       hotelCheckIn: true,
       hotelCheckOut: true,
+      // 随机档占用行（还没落到具体酒店）的星级，与具体酒店的 starRating 同语义
+      randomStarTier: true,
       // 去程「未登机」标就住在这里（metadata.noShow）；飞行次数要认它，
       // 判据走 orders.leg-status 的 hasNoShowMark（与航段状态派生/legFlag 同一份口径）。
       metadata: true,
@@ -79,7 +97,16 @@ export const orderSelect = {
           flight: { select: { flightNumber: true, originCode: true, destinationCode: true } },
         },
       },
-      hotelRoomType: { select: { name: true, hotel: { select: { name: true } } } },
+      hotelRoomType: {
+        select: { name: true, hotel: { select: { name: true, starRating: true } } },
+      },
+      // 「我方有没有替这单办签证」：套餐里的签证是组件级的，光看订单行推不出来
+      // （还得查套餐组件），而签证任务在建单时就已按同一口径建好 —— 直接读任务，
+      // 与签证台同源。CANCELLED 的不算（单取消 / 改全员自备签后任务会被终态化）。
+      fulfillmentTasks: {
+        where: { type: FulfillmentType.VISA_APPLICATION },
+        select: { status: true },
+      },
     },
   },
 } satisfies Prisma.OrderSelect;
@@ -93,9 +120,15 @@ export function toAggOrder(o: OrderRow): AggOrder {
     status: o.status,
     createdAt: o.createdAt,
     paidAmountCny: Number(o.paidAmount),
-    passengers: o.passengers,
+    passengers: o.passengers.map((p) => ({
+      ...p,
+      // 存量行在库里有默认值，这里的兜底只为老快照/夹具缺列时不把 undefined 带进聚合
+      visaExempt: p.visaExempt ?? false,
+      upgradeRedeemLeg: p.upgradeRedeemLeg ?? null,
+    })),
     items: o.items.map((i) => ({
       kind: i.kind,
+      bundleName: i.bundle?.name ?? null,
       flightCabin: i.flightCabin,
       departureTime: i.flightSchedule?.departureTime ?? null,
       flightNumber: i.flightSchedule?.flight.flightNumber ?? null,
@@ -103,9 +136,15 @@ export function toAggOrder(o: OrderRow): AggOrder {
       destinationCode: i.flightSchedule?.flight.destinationCode ?? null,
       hotelName: i.hotelRoomType?.hotel.name ?? null,
       roomTypeName: i.hotelRoomType?.name ?? null,
+      hotelStarRating: i.hotelRoomType?.hotel.starRating ?? null,
+      randomStarTier: i.randomStarTier ?? null,
       hotelCheckIn: i.hotelCheckIn,
       hotelCheckOut: i.hotelCheckOut,
       noShow: hasNoShowMark(i.metadata),
+      // 未取消的签证任务 = 这单我方在代办签证（含套餐里含签证的情形）
+      hasVisaTask: (i.fulfillmentTasks ?? []).some(
+        (t) => t.status !== FulfillmentStatus.CANCELLED,
+      ),
     })),
   };
 }

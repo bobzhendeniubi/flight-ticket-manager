@@ -99,12 +99,16 @@ function flownOrderRow(documentNumber: string, departureTime: Date) {
         bedPref: null,
         needsWheelchair: false,
         singleRoom: false,
+        visaExempt: false,
+        upgradeRedeemLeg: 'NONE',
       },
     ],
     items: [
       {
         kind: 'FLIGHT',
+        bundle: null,
         flightCabin: null,
+        randomStarTier: null,
         hotelCheckIn: null,
         hotelCheckOut: null,
         flightSchedule: {
@@ -112,6 +116,7 @@ function flownOrderRow(documentNumber: string, departureTime: Date) {
           flight: { flightNumber: 'QH9588', originCode: 'MFM', destinationCode: 'DAD' },
         },
         hotelRoomType: null,
+        fulfillmentTasks: [],
       },
     ],
   };

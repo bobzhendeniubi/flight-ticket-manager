@@ -18,8 +18,8 @@
  *   - 人均消费 = 订单实付 ÷ 乘机人数，平摊（含儿童/婴儿）。
  *   - 偏好取最近值（床型/餐食/单住）或众数（舱位）；轮椅任一次为真即真。
  */
-import { OrderStatus } from '@prisma/client';
-import type { CabinClass, DocumentType, Gender, OrderItemKind } from '@prisma/client';
+import { OrderItemKind, OrderStatus } from '@prisma/client';
+import type { CabinClass, DocumentType, Gender, UpgradeRedeemLeg } from '@prisma/client';
 
 // ── 输入形状（service 从 prisma 查询后映射；测试直接构造）──
 
@@ -36,10 +36,16 @@ export interface AggPassenger {
   bedPref: string | null;
   needsWheelchair: boolean;
   singleRoom: boolean;
+  /** 本人自备签证（这一单里逐人可不同）。 */
+  visaExempt: boolean;
+  /** 本人用常旅客次数兑换升舱的航段；NONE / null = 不兑换。 */
+  upgradeRedeemLeg: UpgradeRedeemLeg | null;
 }
 
 export interface AggOrderItem {
   kind: OrderItemKind;
+  /** 套餐产品名（BUNDLE 行经 bundleId 取 Bundle.name）；其余行为 null。 */
+  bundleName: string | null;
   flightCabin: CabinClass | null;
   departureTime: Date | null; // flightSchedule.departureTime（UTC）
   flightNumber: string | null;
@@ -47,8 +53,17 @@ export interface AggOrderItem {
   destinationCode: string | null;
   hotelName: string | null; // hotelRoomType.hotel.name
   roomTypeName: string | null; // hotelRoomType.name
+  /** 具体酒店的星级（hotelRoomType.hotel.starRating）；非酒店行为 null。 */
+  hotelStarRating: number | null;
+  /** 星级随机档占用行的星级（还没落到具体酒店）；非随机档行为 null。 */
+  randomStarTier: number | null;
   hotelCheckIn: Date | null;
   hotelCheckOut: Date | null;
+  /**
+   * 本订单行上挂着未取消的签证履约任务 = 我方在替这单办签证。
+   * 套餐里的签证是组件级的，订单行本身推不出来，故直接认任务（口径与签证台同源）。
+   */
+  hasVisaTask: boolean;
   /**
    * 该航段行是否被打了「未登机」标（订单行 metadata.noShow 存在即为真）。
    * 打标只发生在去程行，班次本身不动（那趟航班真飞了，得留在航段统计里），
@@ -84,7 +99,11 @@ export interface Companion {
   tripsTogether: number;
 }
 
-export interface TripSummary {
+/**
+ * 单张订单的行程摘要里**整单口径**的那一半（对同单每位乘机人都一样）。
+ * 逐人不同的那一半见 TripSummary 下半段，由 personalizeTrip 按各自的乘机人行补上。
+ */
+export interface OrderTripSummary {
   orderId: string;
   orderNumber: string;
   status: OrderStatus;
@@ -105,6 +124,28 @@ export interface TripSummary {
   noShow: boolean;
   /** 真飞过：去程已起飞 且 没被打未登机标。飞行次数只数这个。 */
   flown: boolean;
+  /** 套餐名（BUNDLE 行的 description）；非套餐单为 null。 */
+  bundleName: string | null;
+  /** 住宿星级：具体酒店的星级优先，其次随机档星级；没订住宿为 null。 */
+  hotelTier: number | null;
+  /** 这一单我方代办签证（含 VISA 订单行、或套餐里含签证 → 已建签证任务）。 */
+  hasVisaProduct: boolean;
+}
+
+/**
+ * 某位旅客在某张订单上的行程摘要 = 整单口径 + 他自己那一行的选项。
+ * 同一单里两位客人可以一个单住一个拼房、一个自备签一个随单办签，
+ * 档案「出行记录」要显示的是**这位客人自己**买了什么。
+ */
+export interface TripSummary extends OrderTripSummary {
+  /** 本人在这一单是否单人入住。 */
+  singleRoom: boolean;
+  /** 本人在这一单的床型（DOUBLE / TWIN；未填为 null）。 */
+  bedPref: string | null;
+  /** 本人在这一单自备签证。 */
+  visaExempt: boolean;
+  /** 本人在这一单兑换升舱的航段；NONE / null = 不兑换。 */
+  upgradeRedeemLeg: UpgradeRedeemLeg | null;
 }
 
 export interface TravelerAggregate {
@@ -202,6 +243,11 @@ function round2(n: number): number {
   return Math.round(n * 100) / 100;
 }
 
+/** 订单行上的星级去重（丢掉空值）；结果恰好一个才敢当作「这一单的住宿星级」。 */
+function distinctTiers(values: ReadonlyArray<number | null>): number[] {
+  return [...new Set(values.filter((v): v is number => v !== null))];
+}
+
 /**
  * 单张订单的行程摘要（对每位乘机人相同；spendShare 已是人均）。
  *
@@ -212,7 +258,7 @@ function round2(n: number): number {
  *   - 回程若被恢复、客人真飞了回程，仍按整单不计一次：飞行次数是权益核销的分母，
  *     一张单最多换一次额度，去程没登机就不该拿到这次额度（业务已拍板）。
  */
-function summarizeOrder(order: AggOrder, now: Date): TripSummary {
+function summarizeOrder(order: AggOrder, now: Date): OrderTripSummary {
   const flightItems = order.items
     .filter((i): i is AggOrderItem & { departureTime: Date } => i.departureTime !== null)
     .sort((a, b) => a.departureTime.getTime() - b.departureTime.getTime());
@@ -230,6 +276,19 @@ function summarizeOrder(order: AggOrder, now: Date): TripSummary {
   const paxCount = Math.max(1, order.passengers.length);
   const departed = depart !== null && depart.departureTime <= now;
   const noShow = depart?.noShow ?? false;
+  // 买了什么：套餐名取 BUNDLE 行的产品名；住宿星级先认具体酒店，再退回随机档。
+  // 一单订了两家不同星级的酒店时**不给星级**（null）：随手挑一行显示等于告诉运营
+  // 一个不完整的事实，宁可不显示这枚徽标。
+  const bundleName =
+    order.items.find((i) => i.kind === OrderItemKind.BUNDLE)?.bundleName ?? null;
+  const hotelStars = distinctTiers(order.items.map((i) => i.hotelStarRating));
+  const tiers = hotelStars.length
+    ? hotelStars
+    : distinctTiers(order.items.map((i) => i.randomStarTier));
+  const hotelTier = tiers.length === 1 ? tiers[0] : null;
+  const hasVisaProduct = order.items.some(
+    (i) => i.kind === OrderItemKind.VISA || i.hasVisaTask,
+  );
   return {
     orderId: order.id,
     orderNumber: order.orderNumber,
@@ -248,6 +307,23 @@ function summarizeOrder(order: AggOrder, now: Date): TripSummary {
     departed,
     noShow,
     flown: departed && !noShow,
+    bundleName,
+    hotelTier,
+    hasVisaProduct,
+  };
+}
+
+/**
+ * 整单摘要 + 这位乘机人自己的选项 → 该旅客的行程条目（不改原对象，返回新对象）。
+ * 同一单被多位旅客共用一份整单摘要，逐人差异只在这一层叠加。
+ */
+export function personalizeTrip(summary: OrderTripSummary, passenger: AggPassenger): TripSummary {
+  return {
+    ...summary,
+    singleRoom: passenger.singleRoom,
+    bedPref: passenger.bedPref,
+    visaExempt: passenger.visaExempt,
+    upgradeRedeemLeg: passenger.upgradeRedeemLeg ?? null,
   };
 }
 
@@ -267,7 +343,7 @@ export function buildTravelerAggregates(
   now: Date,
   aliasMap?: Map<string, string>,
 ): Map<string, TravelerAggregate> {
-  const summaries = new Map<string, TripSummary>();
+  const summaries = new Map<string, OrderTripSummary>();
   for (const o of orders) summaries.set(o.id, summarizeOrder(o, now));
 
   interface Acc {
@@ -281,7 +357,8 @@ export function buildTravelerAggregates(
     wheelchair: boolean;
     cabinVotes: Map<CabinClass, number>;
     companionOrders: Map<string, { p: AggPassenger; count: number; at: Date }>;
-    orders: AggOrder[];
+    /** 订单 + **这位旅客自己**在该单的乘机人行（逐人选项要按这一行算，不能按整单） */
+    orders: Array<{ order: AggOrder; passenger: AggPassenger }>;
   }
   const byDoc = new Map<string, Acc>();
 
@@ -316,7 +393,7 @@ export function buildTravelerAggregates(
         };
         byDoc.set(key, acc);
       }
-      acc.orders.push(order);
+      acc.orders.push({ order, passenger: p });
       if (order.createdAt >= acc.latestOrderAt) {
         acc.latestOrderAt = order.createdAt;
         acc.latest = p;
@@ -362,7 +439,7 @@ export function buildTravelerAggregates(
   const result = new Map<string, TravelerAggregate>();
   for (const [key, acc] of byDoc) {
     const trips = acc.orders
-      .map((o) => summaries.get(o.id)!)
+      .map(({ order, passenger }) => personalizeTrip(summaries.get(order.id)!, passenger))
       .sort((a, b) => (b.departAt?.getTime() ?? 0) - (a.departAt?.getTime() ?? 0));
 
     // 飞行次数 / 在订未飞：含待支付单（在订就是在订，飞过就是飞过）
