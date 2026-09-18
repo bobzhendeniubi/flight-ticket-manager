@@ -52,6 +52,18 @@
  *    **每位乘客**的备注（note），供批量建单页面回填到该乘客的个别备注。多位乘客共用同一段航班/价格/编码时可
  *    正确共享。
  *
+ * ── 结构化备注词（大床 / 双床 / 单住 / 自备签 / 单独编码）───────────────────
+ *  名单里这几个词以前只能靠人眼在备注里找，现在解析成字段回填到批量建单表格：
+ *    · 大床 → bedPref DOUBLE；双床 → TWIN（同一行两者都有时取靠前的）
+ *    · 单住 → singleRoom；自备签 / 自备签证 → visaExempt
+ *    · 单独编码 → 订单级 separatePnr（原来写进每位乘客备注的行为保留不动）
+ *  归属：词写在某位乘客自己那一行（编号单行式）→ 只归这一位；写成独立一行 → 归**最近解析出的
+ *  那位乘客**（冒号式的段内行、编号式乘客行的下一行都算）；只有出现在第一位乘客**之前**的
+ *  表头区独立行才归整批全员。同一归属被写了两种床型时保留第一处并提醒，绝不静默覆盖。
+ *  备注词混在其它文字里（「备注：单住 靠窗」）一律不猜、不勾，按行号点名提醒手动核对。
+ *  每识别到一项追加一条提醒（「已按名单勾选：大床 ×3，请核对」；单住/自备签这两项动钱，
+ *  整批勾给全员时写成「已按名单给全部 N 位勾选：自备签，请核对」），落位不对一眼看得出来。
+ *
  * ── 解析失败绝不静默丢人 ─────────────────────────────────────────────────
  *  每段/每字段问题写入 warnings（含「第 N 位乘客(姓名)」定位），不完整的乘客仍会返回（供前端表格里人工补全）。
  *
@@ -96,6 +108,12 @@ export interface ParsedOtaPassenger {
   note?: string;
   /** 订座编码（PNR）：全篇恰好识别到一个编码 token 时全员同值（一码多人）；多个/没有则不设。 */
   pnr?: string;
+  /** 床型：名单里的「大床 / 双床」（同一行同时出现两者时取靠前的那个）；未写则不设 = 不限。 */
+  bedPref?: 'DOUBLE' | 'TWIN';
+  /** 单住：名单里的「单住」；未写则不设。 */
+  singleRoom?: boolean;
+  /** 自备签：名单里的「自备签 / 自备签证」；未写则不设。 */
+  visaExempt?: boolean;
 }
 
 export interface OtaRosterParseResult {
@@ -111,6 +129,11 @@ export interface OtaRosterParseResult {
    * 供上层与代理登记的名单格式做防呆比对（比不出来就不比，不误报）。
    */
   passengerFormat?: 'COLON_MULTILINE' | 'INLINE_NUMBERED';
+  /**
+   * 单独编码出票（订单级）：名单里出现「单独编码」即置 true。
+   * 该词同时仍按原样写进每位乘客的备注（票务的老习惯，不动），这里只是多给一个结构化开关。
+   */
+  separatePnr?: boolean;
   /** 解析提醒（定位到段 / 字段），前端原样展示；绝不静默丢人。 */
   warnings: string[];
 }
@@ -431,6 +454,55 @@ function detectBookingCodeNote(line: string): string | null {
   return null;
 }
 
+/**
+ * 名单里的结构化备注词（运营/票务确认做成勾选项后会填）：
+ *   大床 / 双床 → 床型；单住 → 单住；自备签 / 自备签证 → 自备签；单独编码 → 订单级单独编码出票。
+ * 纯识别，不消费行——同一行既可能只有这些词，也可能跟在乘客行/编码行后面。
+ */
+interface RosterPrefTokens {
+  bedPref?: 'DOUBLE' | 'TWIN';
+  singleRoom?: boolean;
+  visaExempt?: boolean;
+  separatePnr?: boolean;
+}
+
+function detectPrefTokens(line: string): RosterPrefTokens {
+  const out: RosterPrefTokens = {};
+  // 一行里同时写了「大床」和「双床」时取靠前的那个：名单常写成「大床优先，没有就双床」。
+  const doubleAt = line.indexOf('大床');
+  const twinAt = line.indexOf('双床');
+  if (doubleAt >= 0 && (twinAt < 0 || doubleAt < twinAt)) out.bedPref = 'DOUBLE';
+  else if (twinAt >= 0) out.bedPref = 'TWIN';
+  if (line.includes('单住')) out.singleRoom = true;
+  if (line.includes('自备签')) out.visaExempt = true; // 「自备签证」是它的超集，一并命中
+  if (line.includes('单独编码')) out.separatePnr = true;
+  return out;
+}
+
+/** 该行是否带有乘客级的结构化备注词（订单级的「单独编码」不算——它不落到某个人头上）。 */
+function hasPassengerPrefs(prefs: RosterPrefTokens): boolean {
+  return prefs.bedPref !== undefined || prefs.singleRoom === true || prefs.visaExempt === true;
+}
+
+/**
+ * 整行是否**只有**结构化备注词（可带「房型: / 要求:」这类短标签与顿号/斜杠等分隔符）。
+ * 只有这种行才被当作独立的备注词行消费掉；「姓名 男 护照号 … 大床」这类乘客行不会命中，
+ * 仍交给乘客行分支解析，词本身由该分支单独落到那位乘客身上。
+ */
+function isPurePrefLine(line: string): boolean {
+  const colon = line.lastIndexOf(':');
+  let body = line;
+  if (colon > 0) {
+    const key = line.slice(0, colon);
+    // 标签须短且不含数字（「房型: / 备注: / 要求:」），避免把字段行/价格行误判成备注词行
+    if (key.length <= 6 && !/\d/.test(key)) body = line.slice(colon + 1);
+  }
+  const rest = body
+    .replace(/大床|双床|单住|自备签证|自备签|单独编码/g, '')
+    .replace(/[\s、,，/／+＋|·和及]/g, '');
+  return rest === '';
+}
+
 /** 把两个日期按「生日 ≤ 今年 < 有效期」的合理性分配为 dob/expiry；判断不出合理顺序时保留原书写顺序。 */
 function assignDobAndExpiry(dates: string[]): { dob?: string; expiry?: string } {
   if (dates.length === 0) return {};
@@ -562,7 +634,11 @@ function applyField(px: WorkPassenger, key: string, value: string, dmy = false):
 export function parseOtaRoster(text: string, opts?: ParseOtaRosterOptions): OtaRosterParseResult {
   const dmy = opts?.dateOrder === 'DMY';
   const warnings: string[] = [];
-  const rawLines = text.split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+  // 带上原文行号（空行剔除前的行号）：备注词混着别的字时要按行点名，运营才找得到是哪一行。
+  const rawLines = text
+    .split(/\r?\n/)
+    .map((l, i) => ({ raw: l.trim(), lineNo: i + 1 }))
+    .filter((l) => l.raw !== '');
   if (rawLines.length === 0) {
     return { passengers: [], warnings: ['粘贴内容为空'] };
   }
@@ -573,6 +649,15 @@ export function parseOtaRoster(text: string, opts?: ParseOtaRosterOptions): OtaR
   const passengers: WorkPassenger[] = [];
   const bookingCodeNotes: string[] = [];
   let current: WorkPassenger | null = null;
+  // 订单级「单独编码出票」：全篇出现一次就置位（与它写进每人备注的老行为并存）。
+  let separatePnr = false;
+  // 表头区（第一位乘客出现**之前**）的结构化备注词 → 归全员。乘客出现之后的备注词行一律
+  // 归「最近解析出的那位乘客」，不再算整批——名单里「某人下面写一行大床」是最常见的写法。
+  const blockPrefs: RosterPrefTokens = {};
+  // 床型在同一归属上被写了两种（大床 + 双床）：保留第一处，另发提醒，不猜也不静默覆盖。
+  let bedPrefConflict = false;
+  // 备注词混在其它文字里（如「备注：单住 靠窗」）：不猜，按行点名提醒运营手动核对。
+  const mixedPrefLines: Array<{ lineNo: number; tokens: string }> = [];
   // 乘客格式计数：冒号多行（乘机人：段式）vs 编号单行——供 passengerFormat 判定。
   let colonStyleCount = 0;
   let inlineStyleCount = 0;
@@ -582,8 +667,33 @@ export function parseOtaRoster(text: string, opts?: ParseOtaRosterOptions): OtaR
     current = null;
   };
 
-  for (const raw of rawLines) {
+  /**
+   * 备注词行的归属：
+   *   · 正处在某位乘客的冒号段落里（current）→ 那一位；
+   *   · 否则若前面已经解析出过乘客 → 最近的那一位（编号单行式「乘客行 + 下一行写大床」）；
+   *   · 都没有（还没出现任何乘客，即表头区）→ 整批，finalize 时补给全员。
+   */
+  const prefTarget = (): WorkPassenger | null =>
+    current ?? (passengers.length > 0 ? passengers[passengers.length - 1] : null);
+
+  /** 把乘客级备注词落到指定乘客；target 为空 = 落到整批。床型冲突一律保留第一处。 */
+  const applyPassengerPrefs = (prefs: RosterPrefTokens, target: WorkPassenger | null): void => {
+    const sink = target ?? blockPrefs;
+    if (prefs.bedPref !== undefined) {
+      if (sink.bedPref === undefined) sink.bedPref = prefs.bedPref;
+      else if (sink.bedPref !== prefs.bedPref) bedPrefConflict = true; // 保留第一处，只提醒
+    }
+    if (prefs.singleRoom) sink.singleRoom = true;
+    if (prefs.visaExempt) sink.visaExempt = true;
+  };
+
+  for (const { raw, lineNo } of rawLines) {
     const line = normalize(raw);
+
+    // 结构化备注词先做一次纯识别（不消费行）：「单独编码」是订单级，出现在哪儿都算数；
+    // 乘客级三项（床型/单住/自备签）稍后按它所在的行归属落位。
+    const prefs = detectPrefTokens(line);
+    if (prefs.separatePnr) separatePnr = true;
 
     // 结算价行（可能出现在任意位置，通常末行）
     if (/结算价/.test(line)) {
@@ -622,7 +732,27 @@ export function parseOtaRoster(text: string, opts?: ParseOtaRosterOptions): OtaR
     const codeNote = detectBookingCodeNote(line);
     if (codeNote) {
       bookingCodeNotes.push(codeNote);
+      // 「单独编码 大床」这类编码词与备注词同行的写法：编码照旧进备注，备注词一并按归属落位。
+      if (hasPassengerPrefs(prefs)) applyPassengerPrefs(prefs, prefTarget());
       continue;
+    }
+
+    if (hasPassengerPrefs(prefs)) {
+      // 整行只有备注词（可带「房型:」这类短标签）→ 按归属落位并吃掉这一行。
+      if (isPurePrefLine(line)) {
+        applyPassengerPrefs(prefs, prefTarget());
+        continue;
+      }
+      // 不是纯备注词行：可能是乘客行本身（词写在本人那一行末尾，交给下面的乘客分支落位），
+      // 也可能是混着其它文字的自由写法（「备注：单住 靠窗」）——后者不猜、不勾，按行点名提醒。
+      if (!NAME_KEY.test(line) && parseLoosePassengerLine(line, dmy) === null) {
+        const tokens = [
+          prefs.bedPref === 'DOUBLE' ? '大床' : prefs.bedPref === 'TWIN' ? '双床' : null,
+          prefs.singleRoom ? '单住' : null,
+          prefs.visaExempt ? '自备签' : null,
+        ].filter((t): t is string => t !== null);
+        if (tokens.length > 0) mixedPrefLines.push({ lineNo, tokens: tokens.join('、') });
+      }
     }
 
     // 乘客段起始（姓名键，格式二：乘机人:/乘客:/旅客:/姓名: 前缀）
@@ -647,6 +777,8 @@ export function parseOtaRoster(text: string, opts?: ParseOtaRosterOptions): OtaR
     const looseP = parseLoosePassengerLine(line, dmy);
     if (looseP) {
       pushCurrent();
+      // 词就写在这位乘客自己那一行 → 只归这一位（编号单行式常见：「… 2034-7-8 大床 单住」）。
+      if (hasPassengerPrefs(prefs)) applyPassengerPrefs(prefs, looseP);
       passengers.push(looseP);
       inlineStyleCount += 1;
       continue;
@@ -705,6 +837,46 @@ export function parseOtaRoster(text: string, opts?: ParseOtaRosterOptions): OtaR
     } else {
       warnings.push(`识别到订座编码信息「${noteJoined}」，已写入每位乘客备注，请核对`);
     }
+  }
+
+  // 表头区的结构化备注词 → 补给每位乘客（已按乘客归属落过位的不覆盖：个别写法优先）。
+  if (hasPassengerPrefs(blockPrefs)) {
+    passengers.forEach((px) => {
+      if (blockPrefs.bedPref !== undefined && px.bedPref === undefined) px.bedPref = blockPrefs.bedPref;
+      if (blockPrefs.singleRoom && px.singleRoom === undefined) px.singleRoom = true;
+      if (blockPrefs.visaExempt && px.visaExempt === undefined) px.visaExempt = true;
+    });
+  }
+
+  // 「已按名单勾选」提醒：每识别到一项报一条，勾错/落位错一眼看得出来。
+  // 单住 / 自备签这两项**动钱**（单房差、签证减免），整批一次性勾给全员时必须把「全部 N 位」
+  // 说出来——只报个数字看不出是「名单里点名了 N 个人」还是「一句话把 N 个人全勾了」。
+  const countBy = (pred: (px: WorkPassenger) => boolean): number => passengers.filter(pred).length;
+  const total = passengers.length;
+  const bedDoubleCount = countBy((px) => px.bedPref === 'DOUBLE');
+  const bedTwinCount = countBy((px) => px.bedPref === 'TWIN');
+  const singleRoomCount = countBy((px) => px.singleRoom === true);
+  const visaExemptCount = countBy((px) => px.visaExempt === true);
+  if (bedDoubleCount > 0) warnings.push(`已按名单勾选：大床 ×${bedDoubleCount}，请核对`);
+  if (bedTwinCount > 0) warnings.push(`已按名单勾选：双床 ×${bedTwinCount}，请核对`);
+  if (bedPrefConflict) warnings.push('名单里床型写了两种（大床/双床），已按第一处勾选，请核对');
+  if (singleRoomCount > 0) {
+    warnings.push(
+      blockPrefs.singleRoom
+        ? `已按名单给全部 ${total} 位勾选：单住，请核对`
+        : `已按名单勾选：单住 ×${singleRoomCount}，请核对`,
+    );
+  }
+  if (visaExemptCount > 0) {
+    warnings.push(
+      blockPrefs.visaExempt
+        ? `已按名单给全部 ${total} 位勾选：自备签，请核对`
+        : `已按名单勾选：自备签 ×${visaExemptCount}，请核对`,
+    );
+  }
+  if (separatePnr) warnings.push('已按名单勾选：单独编码出票，请核对');
+  for (const m of mixedPrefLines) {
+    warnings.push(`第 ${m.lineNo} 行含「${m.tokens}」但混有其它文字，未自动勾选，请手动核对`);
   }
 
   // 航段校验
@@ -772,5 +944,13 @@ export function parseOtaRoster(text: string, opts?: ParseOtaRosterOptions): OtaR
         ? ('INLINE_NUMBERED' as const)
         : undefined;
 
-  return { flight, passengers, settlementUnitPriceCny, settlementCount, passengerFormat, warnings };
+  return {
+    flight,
+    passengers,
+    settlementUnitPriceCny,
+    settlementCount,
+    passengerFormat,
+    ...(separatePnr ? { separatePnr: true } : {}),
+    warnings,
+  };
 }

@@ -633,6 +633,13 @@ function OccupantsDrawer({
                   <div className="mt-1 text-ink-soft">
                     {o.contactName} · {o.passengerCount} 人 · {o.rooms} 间
                   </div>
+                  {/* 同酒店安排（备注结构化）：落位/换店前先看见这单点名要和谁住一起。
+                      后端未下发或未填时整行不渲染。 */}
+                  {o.sameHotelWith?.trim() && (
+                    <div className="mt-1 text-xs text-emerald-700" title={`同酒店安排：${o.sameHotelWith}`}>
+                      <Icon name="hotel" /> 同酒店：{o.sameHotelWith}
+                    </div>
+                  )}
                   {o.sharedRoomCount > 0 && (
                     <div className="mt-1 text-xs text-indigo-700" title={occupantsDetailNote ?? undefined}>
                       <Icon name="users" /> 跨单合住 {o.sharedRoomCount} 间 · 本单计费份额{' '}

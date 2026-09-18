@@ -36,7 +36,14 @@ import { HotelSwapModal } from '../components/HotelSwapModal';
 import { SplitOrderModal } from '../components/SplitOrderModal';
 import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
 import { ProofImageViewer } from '../components/ProofImageViewer';
+import {
+  BED_PREF_OPTIONS,
+  OrderNoteFlagChips,
+  PassengerPrefChips,
+  UPGRADE_REDEEM_LEG_OPTIONS,
+} from '../components/PassengerPrefChips';
 import type { RoomGroup, Receipt, DocumentType, TravelerProfileLookupRow, BatchConfirmResultItem } from '../lib/api';
+import type { BedPref, UpgradeRedeemLeg } from '../lib/api';
 import {
   settlementRequestsApi,
   type SettlementRequest,
@@ -992,7 +999,7 @@ function SwapFeeOptionsSetting({ token }: { token: string }) {
  * 勾选/悬浮这类跟乘客无关的页面状态变化本会把这些行全部重渲一遍。
  * 入参全是标量 + 乘客对象本身（不传整份 Set / 回调），引用不变就跳过重渲。
  *
- * 只放**内容列平铺行里没有的**信息：签证（自备签 / 送签进度）、单住、PNR、票号、
+ * 只放**内容列平铺行里没有的**信息：签证（自备签 / 送签进度）、单住、床型、兑换升舱、PNR、票号、
  * 常旅客次数。身份信息（性别/生日/国籍/证件号/护照有效期）已经在内容列一人一行摆出来了，
  * 子行不再重复一遍——此前前 3 位乘客在两个地方各出现一次，看着像重复数据。
  * 常旅客次数留在子行是因为它要按证件另发一次批量查询，只在展开时才拉，不能挪到默认平铺行。
@@ -1042,6 +1049,12 @@ const PassengerSubRow = memo(function PassengerSubRow({
               单住
             </span>
           ) : null}
+          {/* 备注结构化：床型 / 兑换升舱（都没有就整体不渲染，不占位） */}
+          <PassengerPrefChips
+            bedPref={p.bedPref}
+            upgradeRedeemLeg={p.upgradeRedeemLeg}
+            upgradeRedeemNote={p.upgradeRedeemNote}
+          />
           {p.pnr ? <span className="font-mono tabular-nums text-ink-soft">PNR {p.pnr}</span> : null}
           {p.eticketNumber ? (
             <span className="font-mono tabular-nums text-ink-soft">票号 {p.eticketNumber}</span>
@@ -4585,6 +4598,13 @@ export function OrdersPage() {
                     {/* 备注（运营原话：把备注也放到内容里面）：六栏（备注/内部/酒店/签证/款项/特殊）
                         各取首行拼一行，行内截断，悬浮看分段全文。原先它挤在「客户 / 代理」列第四行，
                         既占宽又只看得到两栏。 */}
+                    {/* 备注结构化的订单级两项（单独编码 / 同酒店）：跟备注汇总摆在同一块地方，
+                        票务和房控扫列表就能看见，不用点进详情。都没有则整行不渲染。 */}
+                    {(order.separatePnr || order.sameHotelWith) && (
+                      <div className="mt-0.5 flex flex-wrap items-center gap-1">
+                        <OrderNoteFlagChips separatePnr={order.separatePnr} sameHotelWith={order.sameHotelWith} />
+                      </div>
+                    )}
                     {(() => {
                       const np = deriveNotesSummary(order);
                       return np ? (
@@ -6136,6 +6156,7 @@ function OrderDrawer({
                           agentSelfEditOpen={o.agentSelfEdit?.open === true}
                           agentRescheduleOpen={role === 'AGENT' && agentRescheduleClosedReason(o) == null}
                           agentHotelOpsOpen={role === 'AGENT' && agentHotelOpsOpen(o)}
+                          sameHotelWith={o.sameHotelWith}
                         />
                       ))}
                     </ul>
@@ -6162,6 +6183,7 @@ function OrderDrawer({
                     agentSelfEditOpen={o.agentSelfEdit?.open === true}
                     agentRescheduleOpen={role === 'AGENT' && agentRescheduleClosedReason(o) == null}
                     agentHotelOpsOpen={role === 'AGENT' && agentHotelOpsOpen(o)}
+                    sameHotelWith={o.sameHotelWith}
                   />
                 ))}
               </ul>
@@ -8105,6 +8127,7 @@ function OrderItemRow({
   agentSelfEditOpen,
   agentRescheduleOpen,
   agentHotelOpsOpen,
+  sameHotelWith,
 }: {
   orderId: string;
   item: OrderItem;
@@ -8134,6 +8157,8 @@ function OrderItemRow({
   agentRescheduleOpen?: boolean;
   /** 代理住宿类售后自助（换酒店 / 酒店改期）：订单活着且未完成时为 true，只对 role===AGENT 生效 */
   agentHotelOpsOpen?: boolean;
+  /** 本单「同酒店安排」（备注结构化）：换酒店弹窗据此提示，别把点名同住的客人换散。 */
+  sameHotelWith?: string | null;
 }) {
   const role = useAuth((st) => st.user?.role);
   // 代理自助纠错：仅本单下单当天窗口内（后端 agentSelfEdit.open）——改航班/升舱两个入口，
@@ -8637,6 +8662,7 @@ function OrderItemRow({
             hotelName: item.hotelName,
             roomTypeName: item.roomTypeName,
           }}
+          sameHotelWith={sameHotelWith}
           hideFee={role === 'AGENT'}
           onClose={() => setSwappingHotel(false)}
           onSwapped={(updated, warnings) => {
@@ -12232,6 +12258,13 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                     {p.visaExempt && (
                       <span className="ml-2 rounded bg-sky-50 px-1.5 py-0.5 text-[10px] font-medium text-sky-700 ring-1 ring-sky-200">自备签</span>
                     )}
+                    {/* 备注结构化：床型 / 兑换升舱（兑换说明进悬浮） */}
+                    <PassengerPrefChips
+                      bedPref={p.bedPref}
+                      upgradeRedeemLeg={p.upgradeRedeemLeg}
+                      upgradeRedeemNote={p.upgradeRedeemNote}
+                      inline
+                    />
                     {/* 按乘客净调价小标（0722）：正=补收（琥珀）、负=优惠（绿）；0 不显示。 */}
                     {adjNet !== 0 && (
                       <span
@@ -12635,6 +12668,14 @@ function PassengerEditForm({
   const [nationality, setNationality] = useState(passenger.nationality ?? '');
   // 新出行人敬称（仅换人通道有这个键；留空 = 不带，服务端按「不继承旧人」清空）。
   const [title, setTitle] = useState('');
+  // 备注结构化三项（改信息通道可改；不进定价、不清护照/签证）。'' = 不限 / 不兑换。
+  const [bedPref, setBedPref] = useState<'' | BedPref>(
+    passenger.bedPref === 'DOUBLE' || passenger.bedPref === 'TWIN' ? passenger.bedPref : '',
+  );
+  const [upgradeRedeemLeg, setUpgradeRedeemLeg] = useState<UpgradeRedeemLeg>(
+    passenger.upgradeRedeemLeg ?? 'NONE',
+  );
+  const [upgradeRedeemNote, setUpgradeRedeemNote] = useState(passenger.upgradeRedeemNote ?? '');
   const [resetInvoice, setResetInvoice] = useState(false);
   const [resetVisa, setResetVisa] = useState(false);
   const [feeCny, setFeeCny] = useState<number | null>(null);
@@ -12902,6 +12943,9 @@ function PassengerEditForm({
         nationality?: string;
         passportExpiry?: string;
         passportIssueDate?: string;
+        bedPref?: BedPref | null;
+        upgradeRedeemLeg?: UpgradeRedeemLeg;
+        upgradeRedeemNote?: string | null;
       } = { mode: 'CORRECTION' };
 
       const diffText = (oldRaw: string | null | undefined, newRaw: string, apply: (v: string) => void) => {
@@ -12935,6 +12979,18 @@ function PassengerEditForm({
       }
 
       if (passportIssueDate) body.passportIssueDate = passportIssueDate;
+
+      // 备注结构化三项：与上面的姓名/证件不同口径——这三项**允许清空**（改回「不限 / 不兑换」
+      // 是正常操作，不是误清资料），所以走各自的 diff，清空发 null / 'NONE'，不计入 hasCleared。
+      const oldBedPref = passenger.bedPref === 'DOUBLE' || passenger.bedPref === 'TWIN' ? passenger.bedPref : '';
+      if (oldBedPref !== bedPref) body.bedPref = bedPref === '' ? null : bedPref;
+      const oldLeg = passenger.upgradeRedeemLeg ?? 'NONE';
+      if (oldLeg !== upgradeRedeemLeg) body.upgradeRedeemLeg = upgradeRedeemLeg;
+      // 不兑换时说明没有意义，一并清掉，免得留一句对不上航段的旧说明。
+      const nextRedeemNote = upgradeRedeemLeg === 'NONE' ? '' : upgradeRedeemNote.trim();
+      if (nextRedeemNote !== (passenger.upgradeRedeemNote ?? '').trim()) {
+        body.upgradeRedeemNote = nextRedeemNote || null;
+      }
 
       if (hasCleared) {
         setErr('改信息不支持清空字段，留空表示不改；要清除请用「换人」');
@@ -13191,6 +13247,52 @@ function PassengerEditForm({
           )}
         </label>
       </div>
+
+      {/* 改信息专属 · 备注结构化三项：床型 / 兑换升舱 / 兑换说明。
+          都不进定价、不清护照与签证，所以放在改信息通道里随手就能改；换人通道不放，
+          新出行人的这几项由换人后在本处或订单详情另行录入。 */}
+      {mode === 'CORRECTION' && (
+        <div className="space-y-1.5 rounded border border-slate-200 bg-white p-2">
+          <div className="grid grid-cols-2 gap-2">
+            <label className="block">
+              <span className="text-slate-500">床型</span>
+              <select
+                className={inputCls}
+                value={bedPref}
+                onChange={(e) => setBedPref(e.target.value as '' | BedPref)}
+              >
+                {BED_PREF_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+            </label>
+            <label className="block">
+              <span className="text-slate-500">兑换升舱</span>
+              <select
+                className={inputCls}
+                value={upgradeRedeemLeg}
+                onChange={(e) => setUpgradeRedeemLeg(e.target.value as UpgradeRedeemLeg)}
+              >
+                {UPGRADE_REDEEM_LEG_OPTIONS.map((o) => (
+                  <option key={o.value} value={o.value}>{o.label}</option>
+                ))}
+              </select>
+            </label>
+          </div>
+          {upgradeRedeemLeg !== 'NONE' && (
+            <label className="block">
+              <span className="text-slate-500">兑换说明（选填）</span>
+              <input
+                className={inputCls}
+                maxLength={80}
+                value={upgradeRedeemNote}
+                onChange={(e) => setUpgradeRedeemNote(e.target.value)}
+                placeholder="如：用同行人的次数 / 经济舱第一排"
+              />
+            </label>
+          )}
+        </div>
+      )}
 
       {/* 换人专属：新出行人的敬称 + 自备签/单住的默认口径提示。
           敬称随请求一起提交；自备签/单住不在这里改——真换人时服务端一律把新人回落成
@@ -14602,6 +14704,9 @@ function NotesSection({
     notePayment: order.notePayment ?? '',
     noteSpecial: order.noteSpecial ?? '',
   });
+  // 备注结构化的订单级两项（与四栏同一条 PATCH 通道，同属内部口径 → 只对运营开放）。
+  const [separatePnr, setSeparatePnr] = useState(order.separatePnr === true);
+  const [sameHotelWith, setSameHotelWith] = useState(order.sameHotelWith ?? '');
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
@@ -14621,7 +14726,9 @@ function NotesSection({
         structured.noteHotel !== (order.noteHotel ?? '') ||
         structured.noteVisa !== (order.noteVisa ?? '') ||
         structured.notePayment !== (order.notePayment ?? '') ||
-        structured.noteSpecial !== (order.noteSpecial ?? ''))) ||
+        structured.noteSpecial !== (order.noteSpecial ?? '') ||
+        separatePnr !== (order.separatePnr === true) ||
+        sameHotelWith !== (order.sameHotelWith ?? ''))) ||
     (agentSelfEditOpen && visaStatus !== (order.visaStatus ?? 'NOT_NEEDED'));
 
   // 上报给抽屉壳，供关闭前的未保存改动拦截使用；卸载时归零，避免残留 true 挡住下次打开的关闭。
@@ -14647,6 +14754,9 @@ function NotesSection({
       if (structured.noteVisa !== (order.noteVisa ?? '')) body.noteVisa = structured.noteVisa;
       if (structured.notePayment !== (order.notePayment ?? '')) body.notePayment = structured.notePayment;
       if (structured.noteSpecial !== (order.noteSpecial ?? '')) body.noteSpecial = structured.noteSpecial;
+      // 备注结构化订单级两项：同样只发真改过的（不传 = 不动，别拿旧快照盲覆盖并发同事的写入）。
+      if (separatePnr !== (order.separatePnr === true)) body.separatePnr = separatePnr;
+      if (sameHotelWith !== (order.sameHotelWith ?? '')) body.sameHotelWith = sameHotelWith;
     } else if (agentSelfEditOpen && visaStatus !== (order.visaStatus ?? 'NOT_NEEDED')) {
       // 代理自助窗口内只发 visaStatus 这一个字段：后端对 AGENT 只放行三档
       // （NEEDED/E_VISA/NOT_NEEDED），选项本身已不出现「已签证」，不会送出后端会 403 的值。
@@ -14669,6 +14779,8 @@ function NotesSection({
         notePayment: r.order.notePayment ?? '',
         noteSpecial: r.order.noteSpecial ?? '',
       });
+      setSeparatePnr(r.order.separatePnr === true);
+      setSameHotelWith(r.order.sameHotelWith ?? '');
       // 冒泡给抽屉 → 同步 hydrated + 列表行，让其它区块与列表跟着刷新。
       onOrderUpdated?.(r.order);
       setSaved(true);
@@ -14693,6 +14805,8 @@ function NotesSection({
             {VISA_STATUS_LABEL[visaStatus]}
           </span>
         )}
+        {/* 备注结构化的订单级两项：代理只读（下方输入框只对运营渲染），这里两边都看得见。 */}
+        <OrderNoteFlagChips separatePnr={order.separatePnr} sameHotelWith={order.sameHotelWith} />
       </div>
       <div className="mt-2 space-y-2">
         {canEditInternal && (
@@ -14748,6 +14862,31 @@ function NotesSection({
               />
             </div>
           ))}
+        {/* 备注结构化的订单级两项：以前写在自由备注里，票务靠看备注判断是否单独出票、
+            房控靠看备注落位。都不影响价格。 */}
+        {canEditInternal && (
+          <>
+            <label className="flex items-center gap-2 text-xs text-slate-600">
+              <input
+                type="checkbox"
+                className="h-3.5 w-3.5 rounded border-slate-300 text-brand focus:ring-brand"
+                checked={separatePnr}
+                onChange={(e) => setSeparatePnr(e.target.checked)}
+              />
+              单独编码出票（本单乘客单独编码，不与他单合并）
+            </label>
+            <div>
+              <label className="text-xs text-slate-500">同酒店安排</label>
+              <input
+                className="mt-1 w-full rounded-md border border-slate-300 px-2 py-1.5 text-xs"
+                value={sameHotelWith}
+                maxLength={120}
+                onChange={(e) => setSameHotelWith(e.target.value)}
+                placeholder="要和谁 / 哪张单住同一家酒店"
+              />
+            </div>
+          </>
+        )}
         <div>
           <label className="text-xs text-slate-500">客户备注（客户可见）</label>
           <textarea
@@ -14939,6 +15078,13 @@ interface BatchRow {
   visaExemptAuto?: boolean;
   singleRoom?: boolean;
   businessUpgrade?: boolean;
+  // ── 备注结构化（名单解析可回填；都不进定价）──────────────────────────
+  /** 床型：大床 / 双床；缺省 = 不限。 */
+  bedPref?: BedPref;
+  /** 兑换升舱（用常旅客次数换商务舱的航段）；缺省 = 不兑换。 */
+  upgradeRedeemLeg?: UpgradeRedeemLeg;
+  /** 兑换说明（≤80）。 */
+  upgradeRedeemNote?: string;
   /** 行级指定酒店（前端展示选择）；提交只发送解析后的房型 id。 */
   designatedHotelId?: string;
   designatedHotelRoomTypeId?: string;
@@ -15162,6 +15308,10 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [productType]);
   const [noteHotel, setNoteHotel] = useState('');
+  // 备注结构化的订单级两项（整批共用，写入每张子单；都不进定价）。
+  // separatePnr 可由名单解析回填（名单里写了「单独编码」），同酒店安排只手填。
+  const [separatePnr, setSeparatePnr] = useState(false);
+  const [sameHotelWith, setSameHotelWith] = useState('');
 
   // 整批签证「不需要 / 已签证」→ 乘客行自备签的联动（与单笔录单 SingleOrderModal 同口径）。
   // 套餐含签证组件时，订单级「不需要」压不掉商品级涉签——只有乘客级 visaExempt 才能免建签证任务；
@@ -15182,6 +15332,36 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
 
   // ── 名单 ──────────────────────────────────────────────────────────────────
   const [rows, setRows] = useState<BatchRow[]>([{ fullName: '', documentNumber: '', dateOfBirth: '', nationality: 'CN' }]);
+  /**
+   * 乘客级选项列（自备签 / 单住 / 升舱）在机票批里的一次性开关（latch）。
+   * 机票批本来不显示这列，但 OTA 名单里写「自备签」的很常见——解析器认出来后必须让运营
+   * 看得见那个勾并能改。这里用 latch 而不是「当前还有没有行勾着」来判断：后者在取消最后
+   * 一个勾的瞬间会把整列连同勾一起收走，运营再也点不回来（想改回自备签只能重粘名单）。
+   * 一旦因名单出现过就常驻到本次弹窗结束。单住 / 升舱仍由套餐费率各自把关，机票批不出现。
+   */
+  const [batchPaxOptionColLatched, setBatchPaxOptionColLatched] = useState(false);
+  const showBatchPaxOptionCol = productType === 'BUNDLE' || batchPaxOptionColLatched;
+  useEffect(() => {
+    if (!batchPaxOptionColLatched && rows.some((r) => r.visaExempt === true)) {
+      setBatchPaxOptionColLatched(true);
+    }
+  }, [rows, batchPaxOptionColLatched]);
+  /**
+   * 床型列：与单笔录单同口径——有住宿才谈床型，批量里只有套餐批带住宿。
+   * 机票批默认不显示；但名单里写了「大床 / 双床」时同样 latch 出来（理由同上：解析出来的值
+   * 不能变成看不见也改不了的隐形状态）。
+   */
+  const [batchBedPrefColLatched, setBatchBedPrefColLatched] = useState(false);
+  const showBatchBedPrefCol = productType === 'BUNDLE' || batchBedPrefColLatched;
+  useEffect(() => {
+    if (!batchBedPrefColLatched && rows.some((r) => r.bedPref !== undefined)) {
+      setBatchBedPrefColLatched(true);
+    }
+  }, [rows, batchBedPrefColLatched]);
+  // 兑换升舱列：有机票行才谈升舱。批量现有三种产品（单程 / 往返 / 套餐）都含机票，所以当前
+  // 恒显；写成按产品类型判定而不是写死 true，将来若加了不含机票的批量产品会自动收起来。
+  const showBatchUpgradeRedeemCol =
+    productType === 'FLIGHT_ONEWAY' || productType === 'FLIGHT_ROUNDTRIP' || productType === 'BUNDLE';
   // 并发 OCR 读最新行快照用（setRow 同步写入，避免批量识别时读到陈旧的渲染闭包）。
   const rowsRef = useRef<BatchRow[]>(rows);
   const batchVisaExemptScopeShownRef = useRef(productType === 'BUNDLE');
@@ -15226,28 +15406,43 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
   // 需签档下点名提示自备签乘客：
   //   · 全员自备签 = **硬拦**（blocking）：琥珀软提示拦不住，仍有整批带着「需要签证 + 全员自备签」
   //     提交成功，签证台看不见 → 漏签。这一档不让过。
-  //   · 部分自备签（混合）是正式支持的能力，只点名提示，不拦。
+  //   · 部分自备签（混合）：套餐批照旧只点名提示、不拦（既有能力，不动）。
+  //     其余产品类型一律**硬拦** —— 批量是「每位一单」，任何一行自备签都会独自变成一张
+  //     「全单自备签 + 需要签证」的子单，后端逐单判矛盾会把那些行全拒掉，且报错文案是按
+  //     整单口径写的，落到一人一单上根本看不懂。与其让整批在服务端炸一半，不如提交前说清楚。
   //   · 空名单不拦：一位有效乘客都还没填时不成立（selfVisaRows 为空直接返回 null）。
   const batchVisaContradiction = useMemo<{ text: string; blocking: boolean } | null>(() => {
-    if (productType !== 'BUNDLE' || (visaStatus !== 'NEEDED' && visaStatus !== 'E_VISA')) return null;
+    if (visaStatus !== 'NEEDED' && visaStatus !== 'E_VISA') return null;
     const valid = rows
       .map((row, index) => ({ row, index }))
       .filter(({ row }) => row.fullName.trim());
     const selfVisaRows = valid.filter(({ row }) => row.visaExempt === true);
     if (selfVisaRows.length === 0) return null;
+    // 「改回」的说法跟着产品类型走：套餐批是「随套餐」，机票批没有套餐可随，叫「随单办签」。
+    const followLabel = productType === 'BUNDLE' ? '随套餐' : '随单办签';
     if (selfVisaRows.length === valid.length) {
       return {
         text:
           '签证状态选了「需要」，但全部出行人都是「自备签」——这批单不会生成签证任务、不会进签证台。' +
-          '要我方送签请把至少一位出行人改回「随套餐」；' +
+          `要我方送签请把至少一位出行人改回「${followLabel}」；` +
           '确实全员自备签请把签证状态改成「不需要」或「已签证」。',
         blocking: true,
       };
     }
     const names = selfVisaRows.map(({ row, index }) => row.fullName.trim() || `第${index + 1}位`).join('、');
+    if (productType === 'BUNDLE') {
+      return {
+        text: `注意：以下出行人已标「自备签」，不会进入签证台：${names}。若需我方送签请改回「${followLabel}」。`,
+        blocking: false,
+      };
+    }
     return {
-      text: `注意：以下出行人已标「自备签」，不会进入签证台：${names}。若需我方送签请改回「随套餐」。`,
-      blocking: false,
+      text:
+        `签证状态选了「需要」，但以下出行人是「自备签」：${names}。` +
+        '批量是每位一单，这些人各自的那张单就是「全单自备签」，提交会被逐单拒绝。' +
+        `要我方送签请把他们改回「${followLabel}」；` +
+        '这些人确实自备签请把签证状态改成「不需要」或「已签证」，或把他们从本批名单里去掉单独录。',
+      blocking: true,
     };
   }, [productType, rows, visaStatus]);
   const batchVisaSubmitBlocked = batchVisaContradiction?.blocking === true;
@@ -16179,9 +16374,17 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
           passportExpiry: p.passportExpiry,
           pnr: p.pnr, // 唯一编码 token → 全员同 PNR（一码多人）
           note: p.note,
+          // 备注结构化：名单里写了大床/双床/单住/自备签就直接勾上（解析器已按段落归属落位），
+          // 每一项都带一条「已按名单勾选…请核对」的提醒，落位不对一眼看得出来。
+          bedPref: p.bedPref,
+          singleRoom: p.singleRoom,
+          visaExempt: p.visaExempt,
         }))),
       );
     }
+
+    // 名单里写了「单独编码」→ 整批勾上「单独编码出票」（该词仍照旧写进每位乘客备注）。
+    if (result.separatePnr) setSeparatePnr(true);
 
     // 结算单价预填（仅 ADMIN/STAFF 可见/可用该字段）
     if (isOps && result.settlementUnitPriceCny !== undefined) {
@@ -16372,7 +16575,8 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     setErr(null);
     if (validRows.length === 0) { setErr('至少要有一位完整乘客（姓名 + 护照号 + 出生日期）'); return; }
 
-    // 需要签证 + 全员自备签 = 整批永远进不了签证台，硬拦（按钮也已禁用，这里兜住程序化提交）。
+    // 需要签证 × 自备签的矛盾档（套餐批=全员自备签；其余产品=只要有自备签行，因为每位一单）：
+    // 放过去要么整批漏签、要么被后端逐单拒。硬拦（按钮也已禁用，这里兜住程序化提交）。
     if (batchVisaSubmitBlocked && batchVisaContradiction) {
       setErr(batchVisaContradiction.text);
       return;
@@ -16514,6 +16718,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
       // 签证状态（订单级，写入每张子单）+ 酒店备注（选填，写入每张子单）。
       visaStatus,
       noteHotel: noteHotel.trim() || undefined,
+      // 备注结构化的订单级两项（写入每张子单；都不进定价）：勾了/填了才发。
+      ...(separatePnr ? { separatePnr: true } : {}),
+      ...(sameHotelWith.trim() ? { sameHotelWith: sameHotelWith.trim() } : {}),
       // 归属代理（ADMIN/STAFF 代为录单；直客留空）。非 ops 不发。
       ...(isOps && agentId ? { agentId } : {}),
       passengers: validRows.map((r) => ({
@@ -16535,7 +16742,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
         ...(r.pnr?.trim() ? { pnr: r.pnr.trim().toUpperCase() } : {}),
         // 表格导入解析层已按「出生日期 + 出发日」派生（有值才带；缺省回落后端 schema 默认成人）。
         ...(r.passengerType ? { passengerType: r.passengerType } : {}),
-        ...(productType === 'BUNDLE' && r.visaExempt === true ? { visaExempt: true } : {}),
+        // 自备签是**乘客级事实**（决定这个人进不进签证台），不是套餐定价概念——机票批同样要发：
+        // OTA 名单里「自备签」写得最多，解析器认出来后若因产品类型被丢掉，整批人照样挂进签证台。
+        ...(r.visaExempt === true ? { visaExempt: true } : {}),
         ...(productType === 'BUNDLE' && canOfferBundleSingle && r.singleRoom === true ? { singleRoom: true } : {}),
         ...(productType === 'BUNDLE' && canOfferBundleBusiness && r.businessUpgrade === true ? { businessUpgrade: true } : {}),
         ...(productType === 'BUNDLE' && r.designatedHotelRoomTypeId
@@ -16543,6 +16752,15 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
           : {}),
         // 本人议价（选填）：有值才带，留空由后端沿用整批价。
         ...(perPaxPriceFor(r) !== undefined ? { settlementPriceCny: perPaxPriceFor(r) } : {}),
+        // 备注结构化（乘客级，不进定价）：与产品类型无关，机票批同样要带——
+        // 名单里的「大床 / 兑换往返」正是票务与房控要的那两项。
+        ...(r.bedPref ? { bedPref: r.bedPref } : {}),
+        ...(r.upgradeRedeemLeg && r.upgradeRedeemLeg !== 'NONE'
+          ? {
+              upgradeRedeemLeg: r.upgradeRedeemLeg,
+              ...(r.upgradeRedeemNote?.trim() ? { upgradeRedeemNote: r.upgradeRedeemNote.trim() } : {}),
+            }
+          : {}),
         note: r.note?.trim() || undefined,
       })),
       ...(teamPrice !== undefined
@@ -16950,7 +17168,19 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                 </div>
               </div>
               <div className="scrollbar-visible max-h-60 overflow-x-auto overflow-y-auto rounded-md border border-slate-200">
-                <table className={`${productType === 'BUNDLE' ? (canEnterPerPaxSettlementPrice ? 'min-w-[1300px]' : 'min-w-[1160px]') : canEnterPerPaxSettlementPrice ? 'min-w-[1170px]' : 'min-w-[1030px]'} w-full text-sm`}>
+                {/* 最小宽度按实际显示的列累加：基础列 + 床型(88) + 兑换升舱(130) + 乘客级选项(130)，
+                    否则窄屏下新列会把备注/OCR 挤没。 */}
+                <table
+                  className="w-full text-sm"
+                  style={{
+                    minWidth:
+                      (productType === 'BUNDLE' ? 1030 : 900) +
+                      (canEnterPerPaxSettlementPrice ? 140 : 0) +
+                      (showBatchPaxOptionCol ? 130 : 0) +
+                      (showBatchBedPrefCol ? 88 : 0) +
+                      (showBatchUpgradeRedeemCol ? 130 : 0),
+                  }}
+                >
                   <thead className="sticky top-0 bg-slate-50 text-xs text-slate-500">
                     <tr>
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">姓名</th>
@@ -16961,11 +17191,20 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">
                         护照有效期 <span className="text-rose-500">*必填</span>
                       </th>
-                      {productType === 'BUNDLE' && (
-                        <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">住法 / 签证 / 升舱</th>
+                      {showBatchPaxOptionCol && (
+                        <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">
+                          {productType === 'BUNDLE' ? '住法 / 签证 / 升舱' : '签证'}
+                        </th>
                       )}
                       {productType === 'BUNDLE' && (
                         <th className="min-w-[120px] whitespace-nowrap px-2 py-1.5 text-left font-normal">指定酒店</th>
+                      )}
+                      {/* 备注结构化两列：床型跟住宿走（套餐批 / 名单写过才出），兑换升舱跟机票走（恒出）。 */}
+                      {showBatchBedPrefCol && (
+                        <th className="min-w-[88px] whitespace-nowrap px-2 py-1.5 text-left font-normal">床型</th>
+                      )}
+                      {showBatchUpgradeRedeemCol && (
+                        <th className="min-w-[130px] whitespace-nowrap px-2 py-1.5 text-left font-normal">兑换升舱</th>
                       )}
                       {canEnterPerPaxSettlementPrice && (
                         <th className="min-w-[140px] whitespace-nowrap px-2 py-1.5 text-left font-normal">
@@ -17110,7 +17349,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                             );
                           })()}
                         </td>
-                        {productType === 'BUNDLE' && (
+                        {showBatchPaxOptionCol && (
                           <td className="px-2 py-1 align-top">
                             <div className="space-y-0.5 text-[11px] text-slate-600">
                               <label className="flex items-center gap-1 whitespace-nowrap">
@@ -17204,6 +17443,45 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                                 </span>
                               );
                             })()}
+                          </td>
+                        )}
+                        {/* 备注结构化 · 床型（不限 / 大床 / 双床）：只记偏好，不进定价。 */}
+                        {showBatchBedPrefCol && (
+                          <td className="px-2 py-1 align-top">
+                            <select
+                              className="w-full rounded border border-slate-300 px-1.5 py-1 text-xs"
+                              value={r.bedPref ?? ''}
+                              onChange={(e) =>
+                                setRow(i, { bedPref: (e.target.value || undefined) as BedPref | undefined })
+                              }
+                            >
+                              {BED_PREF_OPTIONS.map((o) => (
+                                <option key={o.value} value={o.value}>{o.label}</option>
+                              ))}
+                            </select>
+                          </td>
+                        )}
+                        {/* 备注结构化 · 兑换升舱（用常旅客次数换商务舱的航段 + 说明）：不进定价。 */}
+                        {showBatchUpgradeRedeemCol && (
+                          <td className="px-2 py-1 align-top">
+                            <select
+                              className="w-full rounded border border-slate-300 px-1.5 py-1 text-xs"
+                              value={r.upgradeRedeemLeg ?? 'NONE'}
+                              onChange={(e) => setRow(i, { upgradeRedeemLeg: e.target.value as UpgradeRedeemLeg })}
+                            >
+                              {UPGRADE_REDEEM_LEG_OPTIONS.map((o) => (
+                                <option key={o.value} value={o.value}>{o.label}</option>
+                              ))}
+                            </select>
+                            {r.upgradeRedeemLeg && r.upgradeRedeemLeg !== 'NONE' && (
+                              <input
+                                className="mt-1 w-full rounded border border-slate-300 px-1.5 py-1 text-xs"
+                                maxLength={80}
+                                placeholder="说明（选填）"
+                                value={r.upgradeRedeemNote ?? ''}
+                                onChange={(e) => setRow(i, { upgradeRedeemNote: e.target.value })}
+                              />
+                            )}
                           </td>
                         )}
                         {canEnterPerPaxSettlementPrice && (
@@ -17311,7 +17589,9 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
                       </tr>
                       {reviewHint && (
                         <tr className="border-t-0">
-                          <td colSpan={(productType === 'BUNDLE' ? 10 : 9) + (canEnterPerPaxSettlementPrice ? 1 : 0)} className={`${ocrErrorHint ? 'bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200' : 'bg-amber-50 text-amber-700'} px-2 py-1 text-[11px]`}>
+                          {/* 固定 9 列（姓名/护照号/性别/国籍/生日/有效期 + 备注 + OCR + 删除）
+                              ＋ 指定酒店（套餐）＋ 乘客级选项 ＋ 床型 ＋ 兑换升舱 ＋ 结算价/人，各自按显示与否计入。 */}
+                          <td colSpan={9 + (productType === 'BUNDLE' ? 1 : 0) + (showBatchPaxOptionCol ? 1 : 0) + (showBatchBedPrefCol ? 1 : 0) + (showBatchUpgradeRedeemCol ? 1 : 0) + (canEnterPerPaxSettlementPrice ? 1 : 0)} className={`${ocrErrorHint ? 'bg-rose-50 text-rose-700 ring-1 ring-inset ring-rose-200' : 'bg-amber-50 text-amber-700'} px-2 py-1 text-[11px]`}>
                             <Icon name="alert" /> {reviewHint}
                           </td>
                         </tr>
@@ -17591,6 +17871,27 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
               <label className="text-xs text-slate-500">
                 酒店情况（选填，写入每单）
                 <input className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm" value={noteHotel} onChange={(e) => setNoteHotel(e.target.value)} maxLength={300} placeholder="全团共用；如有个别差异请在名单备注里说明" />
+              </label>
+              {/* 备注结构化的订单级两项（整批共用，写入每张子单）：都不影响价格。
+                  名单里写了「单独编码」时，粘贴导入会自动勾上下面这个框。 */}
+              <label className="flex items-center gap-2 self-end text-xs text-slate-600">
+                <input
+                  type="checkbox"
+                  className="h-3.5 w-3.5 rounded border-slate-300 text-brand focus:ring-brand"
+                  checked={separatePnr}
+                  onChange={(e) => setSeparatePnr(e.target.checked)}
+                />
+                单独编码出票（写入每单）
+              </label>
+              <label className="text-xs text-slate-500">
+                同酒店安排（选填，写入每单）
+                <input
+                  className="mt-1 block w-full rounded-md border border-slate-300 px-2 py-1.5 text-sm"
+                  value={sameHotelWith}
+                  onChange={(e) => setSameHotelWith(e.target.value)}
+                  maxLength={120}
+                  placeholder="要和谁 / 哪张单住同一家酒店"
+                />
               </label>
               <label className="text-xs text-slate-500">
                 签证状态（写入每单）

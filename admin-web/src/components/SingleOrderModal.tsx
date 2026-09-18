@@ -24,6 +24,7 @@ import {
   type AdminSchedule,
   type AgentListItem,
   type AiOcrPassportResult,
+  type BedPref,
   type Bundle,
   type CabinClass,
   type CreateOrderInput,
@@ -39,6 +40,7 @@ import {
   type SettlementTier,
   type Transfer,
   type TravelerProfileSuggestion,
+  type UpgradeRedeemLeg,
   type Visa,
   type VisaStatusInput,
   PRICE_ADJUSTMENT_REASON_LABEL,
@@ -56,6 +58,7 @@ import {
   type RoomingPassenger,
 } from './RoomingEditor';
 import { SearchSelect, type SearchSelectOption } from './SearchSelect';
+import { BED_PREF_OPTIONS, UPGRADE_REDEEM_LEG_OPTIONS } from './PassengerPrefChips';
 import { useDialogA11y } from './Modal';
 import {
   addDays,
@@ -140,6 +143,13 @@ interface PassengerRow {
   visaExemptAuto?: boolean;
   /** 单住（不拼房，按人收单房差）。缺省 false = 拼房。 */
   singleRoom?: boolean;
+  // ── 备注结构化（都不进定价，不参与试算指纹）────────────────────────────
+  /** 床型：大床 / 双床；缺省 = 不限。有酒店/套餐行时才露出。 */
+  bedPref?: BedPref;
+  /** 兑换升舱（用常旅客次数换商务舱的航段）；缺省 = 不兑换。有机票行时才露出。 */
+  upgradeRedeemLeg?: UpgradeRedeemLeg;
+  /** 兑换说明（≤80，如「用同行人的次数」）。 */
+  upgradeRedeemNote?: string;
   /**
    * 每人结算价（CNY；仅「按人填结算价」模式使用，随有效出行人同序提交为
    * perPassengerSettlementCny）。挂在乘客行上而非独立数组：增删乘客行时价格跟人走，
@@ -338,6 +348,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   const [noteVisa, setNoteVisa] = useState('');
   const [notePayment, setNotePayment] = useState('');
   const [noteSpecial, setNoteSpecial] = useState('');
+  // 备注结构化的订单级两项（都不进定价）：单独编码出票（有机票行时露出）、同酒店安排（有酒店/套餐行时露出）。
+  const [separatePnr, setSeparatePnr] = useState(false);
+  const [sameHotelWith, setSameHotelWith] = useState('');
   const [passengers, setPassengers] = useState<PassengerRow[]>([emptyPassenger()]);
   // 最新乘客快照（ref）：批量并发 OCR 时，handleOcrFile 的「护照图上限」要读实时状态，
   // 不能用渲染闭包里的 passengers（并发 worker 之间会读到陈旧值，导致少计/超计）。
@@ -773,6 +786,10 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
   //   含签证组件的套餐即使没配减免额，整单选「不需要」也必须能落到乘客级 visaExempt，
   //   否则订单照样生成签证任务、签证台挂一条「待处理」（公测反馈）。
   const showRoomingCol = isBundleOrder;
+  // 备注结构化的露出条件（纯展示开关，与定价无关）：
+  //   床型 = 有酒店行或套餐行（套餐必含住宿）；兑换升舱 = 有机票行或套餐行（套餐必含机票）。
+  const showBedPrefCol = isBundleOrder || blockKinds.includes('HOTEL');
+  const showUpgradeRedeemCol = isBundleOrder || blockKinds.includes('FLIGHT');
   const bundleHasVisaComponent = !!bundle?.items?.some((it) => it.kind === 'VISA');
   // 含签证产品区块的单（纯签证单、机票+签证混挂…）同样要能逐位选「随单办签 / 自备签」：
   // 自备签是**乘客级**事实，决定这个人进不进签证台；此前只有套餐单给得出这个口子，
@@ -1558,6 +1575,14 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
         : showVisaExemptCol
           ? { visaExempt: !!p.visaExempt }
           : {}),
+      // 备注结构化（不进定价）：只在对应字段露出过时才发，没露出就别替用户凭空写值。
+      ...(showBedPrefCol && p.bedPref ? { bedPref: p.bedPref } : {}),
+      ...(showUpgradeRedeemCol && p.upgradeRedeemLeg && p.upgradeRedeemLeg !== 'NONE'
+        ? {
+            upgradeRedeemLeg: p.upgradeRedeemLeg,
+            ...(p.upgradeRedeemNote?.trim() ? { upgradeRedeemNote: p.upgradeRedeemNote.trim() } : {}),
+          }
+        : {}),
     }));
     // 纯酒店/接送且未填出行人：后端 passengers 至少 1 条，用联系人（或录入人）占位一位出行人。
     if (passengerPayload.length === 0) {
@@ -1581,6 +1606,9 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
       noteVisa: noteVisa.trim() || undefined,
       notePayment: notePayment.trim() || undefined,
       noteSpecial: noteSpecial.trim() || undefined,
+      // 备注结构化（订单级，不进定价）：勾了才发，未露出的那一项不发。
+      ...(showUpgradeRedeemCol && separatePnr ? { separatePnr: true } : {}),
+      ...(showBedPrefCol && sameHotelWith.trim() ? { sameHotelWith: sameHotelWith.trim() } : {}),
       idempotencyKey: idemKey,
       ...(agentId ? { agentId } : {}),
       ...(hasValidAdjustment
@@ -1758,6 +1786,8 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
     setNoteVisa('');
     setNotePayment('');
     setNoteSpecial('');
+    setSeparatePnr(false);
+    setSameHotelWith('');
     // 单住 / 自备签是乘客级标记，随 setPassengers([emptyPassenger()]) 一并复位（无独立状态）。
     // 清掉上一单的调价（避免误带到下一单）；系统价随产品状态复位后由 effect 自动重算。
     setAdjustAmount(null);
@@ -2331,6 +2361,30 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                   特殊要求（选填）
                   <input className={inputCls} value={noteSpecial} maxLength={300} onChange={(e) => setNoteSpecial(e.target.value)} />
                 </label>
+                {/* 备注结构化的订单级两项：以前写在自由备注里，票务/房控靠人眼找。都不进定价。 */}
+                {showUpgradeRedeemCol && (
+                  <label className="flex items-center gap-2 self-end text-xs text-slate-600">
+                    <input
+                      type="checkbox"
+                      className="h-3.5 w-3.5 rounded border-slate-300 text-brand focus:ring-brand"
+                      checked={separatePnr}
+                      onChange={(e) => setSeparatePnr(e.target.checked)}
+                    />
+                    单独编码出票（本单乘客单独编码，不与他单合并）
+                  </label>
+                )}
+                {showBedPrefCol && (
+                  <label className="text-xs text-slate-500">
+                    同酒店安排（选填）
+                    <input
+                      className={inputCls}
+                      value={sameHotelWith}
+                      maxLength={120}
+                      placeholder="要和谁 / 哪张单住同一家酒店"
+                      onChange={(e) => setSameHotelWith(e.target.value)}
+                    />
+                  </label>
+                )}
               </div>
               <p className="mt-2 text-[11px] text-slate-400">
                 默认按本单产品：含签证 / 套餐默认「需要」，只有机票 / 酒店 / 接送默认「不需要」；增删产品后若未手动改过本下拉会自动跟随新默认值，手动选过则不再自动改。
@@ -2617,6 +2671,52 @@ export function SingleOrderModal({ onClose, onCreated }: SingleOrderModalProps) 
                         </label>
                         {/* 签证出签日/生效日/有效期不在此处录入：这三项是签证岗出签后才拿得到的信息，
                             录单时无法预先知道（票务岗反馈：录单时不需要），改由签证台在出签后补录。 */}
+
+                        {/* 备注结构化 · 床型（有酒店/套餐行时）：只记偏好，不进定价。 */}
+                        {showBedPrefCol && (
+                          <label className={paxLabelCls}>
+                            床型
+                            <select
+                              className={`${paxInputCls} border-slate-300`}
+                              value={p.bedPref ?? ''}
+                              onChange={(e) =>
+                                setPassenger(i, { bedPref: (e.target.value || undefined) as BedPref | undefined })
+                              }
+                            >
+                              {BED_PREF_OPTIONS.map((o) => (
+                                <option key={o.value} value={o.value}>{o.label}</option>
+                              ))}
+                            </select>
+                          </label>
+                        )}
+
+                        {/* 备注结构化 · 兑换升舱（有机票行时）：用常旅客次数换商务舱，哪一程 + 说明。不进定价。 */}
+                        {showUpgradeRedeemCol && (
+                          <label className={paxLabelCls}>
+                            兑换升舱
+                            <select
+                              className={`${paxInputCls} border-slate-300`}
+                              value={p.upgradeRedeemLeg ?? 'NONE'}
+                              onChange={(e) =>
+                                setPassenger(i, { upgradeRedeemLeg: e.target.value as UpgradeRedeemLeg })
+                              }
+                            >
+                              {UPGRADE_REDEEM_LEG_OPTIONS.map((o) => (
+                                <option key={o.value} value={o.value}>{o.label}</option>
+                              ))}
+                            </select>
+                            {p.upgradeRedeemLeg && p.upgradeRedeemLeg !== 'NONE' && (
+                              <input
+                                type="text"
+                                className={`${paxInputCls} mt-1 border-slate-300`}
+                                maxLength={80}
+                                placeholder="说明（选填）：如用同行人的次数"
+                                value={p.upgradeRedeemNote ?? ''}
+                                onChange={(e) => setPassenger(i, { upgradeRedeemNote: e.target.value })}
+                              />
+                            )}
+                          </label>
+                        )}
 
                         {/* 套餐乘客级：住法（拼房默认/单住）+ 本人构成小字（能算则显示） */}
                         {showRoomingCol && (

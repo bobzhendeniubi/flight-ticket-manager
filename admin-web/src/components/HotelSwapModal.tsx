@@ -64,6 +64,11 @@ export interface HotelSwapModalProps {
    */
   locateHint?: { hotelId: string; checkIn: string; checkOut: string; randomStarTier?: RandomStarTier | null };
   /**
+   * 该单的「同酒店安排」（备注结构化）：换酒店前要能看见这单说过要和谁住一起，
+   * 否则换完就把人拆散了。item 入口由调用方带进来；locateHint 入口本就要拉整单详情，自取。
+   */
+  sameHotelWith?: string | null;
+  /**
    * 代理自助纠错入口传 true：隐藏「加/减价」选填区——服务端对 AGENT 自助换酒店本就忽略
    * fee（0/omit），界面不给这个口子，避免代理以为填了差价会生效。
    */
@@ -94,7 +99,15 @@ function nightlyPriceLabel(basePrice: string): string {
   return Number.isFinite(n) ? String(n) : basePrice;
 }
 
-export function HotelSwapModal({ orderId, item, locateHint, hideFee, onClose, onSwapped }: HotelSwapModalProps) {
+export function HotelSwapModal({
+  orderId,
+  item,
+  locateHint,
+  hideFee,
+  sameHotelWith,
+  onClose,
+  onSwapped,
+}: HotelSwapModalProps) {
   const dialogRef = useDialogA11y(onClose);
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
@@ -105,6 +118,9 @@ export function HotelSwapModal({ orderId, item, locateHint, hideFee, onClose, on
 
   // ── 定位具体订单行（仅 locateHint 入口需要；item 入口直接已知）──
   const [resolvedItem, setResolvedItem] = useState<HotelSwapItemHint | null>(item ?? null);
+  // 「同酒店安排」：优先用调用方传进来的；locateHint 入口没有，就从下面那次整单详情里自取。
+  const [fetchedSameHotelWith, setFetchedSameHotelWith] = useState<string | null>(null);
+  const sameHotelNote = (sameHotelWith ?? fetchedSameHotelWith)?.trim() || '';
   const [candidates, setCandidates] = useState<HotelSwapItemHint[] | null>(null); // 命中 >1 条时给操作员选
   const [locating, setLocating] = useState(Boolean(locateHint && !item));
 
@@ -159,6 +175,8 @@ export function HotelSwapModal({ orderId, item, locateHint, hideFee, onClose, on
       .getOrder(token, orderId)
       .then((r) => {
         if (cancelled) return;
+        // 老后端不下发该字段时是 undefined → 存 null，界面按「没写」处理，不显示空提示。
+        setFetchedSameHotelWith(r.order.sameHotelWith ?? null);
         const matches = (r.order.items ?? []).filter((it) => {
           if (dateOnly(it.hotelCheckIn) !== locateHint.checkIn || dateOnly(it.hotelCheckOut) !== locateHint.checkOut)
             return false;
@@ -313,6 +331,13 @@ export function HotelSwapModal({ orderId, item, locateHint, hideFee, onClose, on
           <div className="rounded-lg bg-brand-50 px-3 py-2.5 text-xs leading-relaxed text-brand-700">
             客人价格不变，仅更换入住酒店；如需向客人加收/退差价再填写下方金额。
           </div>
+
+          {/* 同酒店安排（备注结构化）：这单点名要和谁住一起，换店前先看见，别把人换散了。 */}
+          {sameHotelNote && (
+            <div className="rounded-lg bg-emerald-50 px-3 py-2 text-xs leading-relaxed text-emerald-800">
+              同酒店：{sameHotelNote}
+            </div>
+          )}
 
           {loadError && <div className="rounded-lg bg-rose-50 px-3 py-2 text-sm text-rose-700">{loadError}</div>}
 

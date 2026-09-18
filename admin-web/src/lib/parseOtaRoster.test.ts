@@ -242,3 +242,308 @@ describe('散行乘客 · 未映射 3 位码误判国籍（0905 运营反馈：Z
     });
   });
 });
+
+describe('结构化备注词（大床 / 双床 / 单住 / 自备签 / 单独编码）', () => {
+  it('乘客之后的独立备注词行 → 归最近解析出的那位乘客，不再撒给全员', () => {
+    // Arrange —— 编号单行式：两位乘客，末尾单独写一行「大床」
+    const roster = [
+      '1 TEST/DELTA 男 普通 护照 EA0000011 中国大陆 1990-01-02 2030-03-04',
+      '2 TEST/DELTATWO 女 普通 护照 EA0000012 中国大陆 1992-05-06 2031-07-08',
+      'QH9588 DAD MFM 2026-10-01',
+      '大床',
+    ].join('\n');
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert —— 只落到最近的那一位（第一位不受影响）
+    expect(r.passengers).toHaveLength(2);
+    expect(r.passengers[0].bedPref).toBeUndefined();
+    expect(r.passengers[1].bedPref).toBe('DOUBLE');
+    expect(r.warnings).toContain('已按名单勾选：大床 ×1，请核对');
+  });
+
+  it('编号单行式：紧跟在某位乘客行下面的备注词行归那一位，不串到下一位', () => {
+    // Arrange
+    const roster = [
+      'QH9588 DAD MFM 2026-10-01',
+      '1 TEST/MIKE 男 普通 护照 EA0000031 中国大陆 1990-01-02 2030-03-04',
+      '大床',
+      '2 TEST/MIKETWO 女 普通 护照 EA0000032 中国大陆 1992-05-06 2031-07-08',
+      '双床',
+    ].join('\n');
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert
+    expect(r.passengers).toHaveLength(2);
+    expect(r.passengers[0]).toMatchObject({ fullName: 'TEST/MIKE', bedPref: 'DOUBLE' });
+    expect(r.passengers[1]).toMatchObject({ fullName: 'TEST/MIKETWO', bedPref: 'TWIN' });
+    // 两位各写各的，不算冲突
+    expect(r.warnings.some((w) => w.includes('床型写了两种'))).toBe(false);
+  });
+
+  it('表头区（第一位乘客之前）的备注词行 → 归全员', () => {
+    // Arrange
+    const roster = [
+      'QH9588 DAD MFM 2026-10-01',
+      '大床',
+      '1 TEST/NOVEM 男 普通 护照 EA0000033 中国大陆 1990-01-02 2030-03-04',
+      '2 TEST/NOVEMTWO 女 普通 护照 EA0000034 中国大陆 1992-05-06 2031-07-08',
+    ].join('\n');
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert
+    expect(r.passengers).toHaveLength(2);
+    expect(r.passengers.every((p) => p.bedPref === 'DOUBLE')).toBe(true);
+    expect(r.warnings).toContain('已按名单勾选：大床 ×2，请核对');
+  });
+
+  it('表头区写了两种床型 → 保留第一处并提醒，不被后一处覆盖', () => {
+    // Arrange
+    const roster = [
+      'QH9588 DAD MFM 2026-10-01',
+      '大床',
+      '双床',
+      '1 TEST/OSCAR 男 普通 护照 EA0000035 中国大陆 1990-01-02 2030-03-04',
+      '2 TEST/OSCARTWO 女 普通 护照 EA0000036 中国大陆 1992-05-06 2031-07-08',
+    ].join('\n');
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert —— 第一处（大床）胜出，两位都是大床，另发冲突提醒
+    expect(r.passengers.every((p) => p.bedPref === 'DOUBLE')).toBe(true);
+    expect(r.warnings).toContain('名单里床型写了两种（大床/双床），已按第一处勾选，请核对');
+    expect(r.warnings).toContain('已按名单勾选：大床 ×2，请核对');
+    expect(r.warnings.some((w) => w.includes('双床 ×'))).toBe(false);
+  });
+
+  it('同一位乘客被写了两种床型 → 同样保留第一处并提醒', () => {
+    // Arrange
+    const roster = [
+      'QH9588 DAD MFM 2026-10-01',
+      '1 TEST/PAPA 男 普通 护照 EA0000037 中国大陆 1990-01-02 2030-03-04',
+      '大床',
+      '双床',
+    ].join('\n');
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert
+    expect(r.passengers[0].bedPref).toBe('DOUBLE');
+    expect(r.warnings).toContain('名单里床型写了两种（大床/双床），已按第一处勾选，请核对');
+  });
+
+  it('单住 / 自备签整批勾给全员时，提醒必须点明「全部 N 位」（这两项动钱）', () => {
+    // Arrange —— 表头区写「单住、自备签」，会落到全部 2 位
+    const roster = [
+      'QH9588 DAD MFM 2026-10-01',
+      '单住、自备签',
+      '1 TEST/QUEBEC 男 普通 护照 EA0000038 中国大陆 1990-01-02 2030-03-04',
+      '2 TEST/QUEBECTWO 女 普通 护照 EA0000039 中国大陆 1992-05-06 2031-07-08',
+    ].join('\n');
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert
+    expect(r.passengers.every((p) => p.singleRoom === true && p.visaExempt === true)).toBe(true);
+    expect(r.warnings).toContain('已按名单给全部 2 位勾选：单住，请核对');
+    expect(r.warnings).toContain('已按名单给全部 2 位勾选：自备签，请核对');
+    // 逐人口径的「×N」写法不应同时出现，避免两种说法打架
+    expect(r.warnings.some((w) => w.includes('单住 ×'))).toBe(false);
+    expect(r.warnings.some((w) => w.includes('自备签 ×'))).toBe(false);
+  });
+
+  it('点名到某位的单住 / 自备签仍用「×N」口径，不说「全部」', () => {
+    // Arrange
+    const roster = [
+      'QH9588 DAD MFM 2026-10-01',
+      '1 TEST/ROMEO 男 普通 护照 EA0000040 中国大陆 1990-01-02 2030-03-04 自备签',
+      '2 TEST/ROMEOTWO 女 普通 护照 EA0000041 中国大陆 1992-05-06 2031-07-08',
+    ].join('\n');
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert
+    expect(r.passengers[0].visaExempt).toBe(true);
+    expect(r.passengers[1].visaExempt).toBeUndefined();
+    expect(r.warnings).toContain('已按名单勾选：自备签 ×1，请核对');
+    expect(r.warnings.some((w) => w.includes('全部'))).toBe(false);
+  });
+
+  it('备注词混着其它文字（备注：单住 靠窗）→ 不勾选，按原文行号点名提醒', () => {
+    // Arrange
+    const roster = [
+      'QH9588 DAD MFM 2026-10-01',
+      '1 TEST/SIERRA 男 普通 护照 EA0000042 中国大陆 1990-01-02 2030-03-04',
+      '备注：单住 靠窗',
+    ].join('\n');
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert
+    expect(r.passengers[0].singleRoom).toBeUndefined();
+    expect(r.warnings).toContain('第 3 行含「单住」但混有其它文字，未自动勾选，请手动核对');
+    expect(r.warnings.some((w) => w.includes('已按名单勾选：单住'))).toBe(false);
+  });
+
+  it('混合写法的行号按原文算（空行不改变行号）', () => {
+    // Arrange —— 第 2 行是空行，混合写法落在第 4 行
+    const roster = [
+      'QH9588 DAD MFM 2026-10-01',
+      '',
+      '1 TEST/TANGO 男 普通 护照 EA0000043 中国大陆 1990-01-02 2030-03-04',
+      '大床 靠窗',
+    ].join('\n');
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert
+    expect(r.warnings).toContain('第 4 行含「大床」但混有其它文字，未自动勾选，请手动核对');
+  });
+
+  it('乘客行末尾带备注词不算「混有其它文字」，照常落到本人', () => {
+    // Arrange
+    const roster = [
+      'QH9588 DAD MFM 2026-10-01',
+      '1 TEST/UNIFORM 男 普通 护照 EA0000044 中国大陆 1990-01-02 2030-03-04 大床',
+    ].join('\n');
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert
+    expect(r.passengers[0].bedPref).toBe('DOUBLE');
+    expect(r.warnings.some((w) => w.includes('混有其它文字'))).toBe(false);
+  });
+
+  it('双床 → TWIN', () => {
+    const r = parseOtaRoster(
+      'QH9588 DAD-MFM 2026-10-01\nTEST/ECHO 男 普通 EA0000013 中国大陆 1990-01-02 2030-03-04\n双床',
+    );
+    expect(r.passengers[0].bedPref).toBe('TWIN');
+    expect(r.warnings).toContain('已按名单勾选：双床 ×1，请核对');
+  });
+
+  it('同一行同时写了大床与双床 → 取靠前的那个', () => {
+    const r = parseOtaRoster(
+      'QH9588 DAD-MFM 2026-10-01\nTEST/ECHOTWO 男 普通 EA0000014 中国大陆 1990-01-02 2030-03-04\n大床/双床',
+    );
+    expect(r.passengers[0].bedPref).toBe('DOUBLE');
+  });
+
+  it('单住 → singleRoom；自备签 / 自备签证 → visaExempt', () => {
+    // Arrange
+    const roster = [
+      'QH9588 DAD-MFM 2026-10-01',
+      'TEST/FOXTROT 女 普通 EA0000015 中国大陆 1988-02-03 2032-04-05',
+      '单住、自备签证',
+    ].join('\n');
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert
+    expect(r.passengers[0]).toMatchObject({ singleRoom: true, visaExempt: true });
+    expect(r.warnings).toContain('已按名单勾选：单住 ×1，请核对');
+    expect(r.warnings).toContain('已按名单勾选：自备签 ×1，请核对');
+  });
+
+  it('词写在乘客自己那一行（编号单行式）→ 只归这一位，另一位不受影响', () => {
+    // Arrange
+    const roster = [
+      '1 TEST/GOLF 男 普通 护照 EA0000016 中国大陆 1990-01-02 2030-03-04 大床 单住',
+      '2 TEST/GOLFTWO 女 普通 护照 EA0000017 中国大陆 1992-05-06 2031-07-08',
+      'QH9588 DAD MFM 2026-10-01',
+    ].join('\n');
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert
+    expect(r.passengers).toHaveLength(2);
+    expect(r.passengers[0]).toMatchObject({ fullName: 'TEST/GOLF', bedPref: 'DOUBLE', singleRoom: true });
+    expect(r.passengers[1].bedPref).toBeUndefined();
+    expect(r.passengers[1].singleRoom).toBeUndefined();
+    expect(r.warnings).toContain('已按名单勾选：大床 ×1，请核对');
+  });
+
+  it('词独立成行但处在某位乘客的段落内（冒号多行式）→ 归那一位，后一位不受影响', () => {
+    // Arrange
+    const roster = [
+      'QH9589 MFM-DAD 2026-10-02',
+      '乘机人：TEST/HOTEL',
+      '性别：男',
+      '出生年月：1985-10-30',
+      '护照：EA0000018',
+      '有效期：2033-02-16',
+      '大床',
+      '乘机人：TEST/HOTELTWO',
+      '性别：女',
+      '出生年月：1990-01-02',
+      '护照：EA0000019',
+      '有效期：2032-05-06',
+    ].join('\n');
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert
+    expect(r.passengers).toHaveLength(2);
+    expect(r.passengers[0]).toMatchObject({ fullName: 'TEST/HOTEL', bedPref: 'DOUBLE' });
+    expect(r.passengers[1].bedPref).toBeUndefined();
+  });
+
+  it('带短标签的备注词行（房型：大床）同样识别', () => {
+    const r = parseOtaRoster(
+      'QH9588 DAD-MFM 2026-10-01\nTEST/INDIA 男 普通 EA0000020 中国大陆 1990-01-02 2030-03-04\n房型：大床',
+    );
+    expect(r.passengers[0].bedPref).toBe('DOUBLE');
+  });
+
+  it('单独编码 → 订单级 separatePnr，且仍照旧写进每位乘客备注', () => {
+    // Arrange
+    const roster = [
+      '1 TEST/JULIET 男 普通 护照 EA0000021 中国大陆 1990-01-02 2030-03-04',
+      '2 TEST/JULIETTWO 女 普通 护照 EA0000022 中国大陆 1992-05-06 2031-07-08',
+      'QH9588 DAD MFM 2026-10-01',
+      '单独编码',
+    ].join('\n');
+
+    // Act
+    const r = parseOtaRoster(roster);
+
+    // Assert
+    expect(r.separatePnr).toBe(true);
+    expect(r.passengers.every((p) => (p.note ?? '').includes('单独编码'))).toBe(true);
+    expect(r.warnings).toContain('已按名单勾选：单独编码出票，请核对');
+  });
+
+  it('「价格 + 单独编码」同行：价格照常识别，separatePnr 同样置位', () => {
+    const r = parseOtaRoster(
+      '1 TEST/KILO 男 普通 护照 EA0000023 中国大陆 1990-01-02 2030-03-04\nQH9588 DAD MFM 2026-10-01\n1030 单独编码',
+    );
+    expect(r.settlementUnitPriceCny).toBe(1030);
+    expect(r.separatePnr).toBe(true);
+  });
+
+  it('名单里没有这些词时不置任何字段、不发「已按名单勾选」提醒', () => {
+    const r = parseOtaRoster(
+      'QH9588 DAD-MFM 2026-10-01\nTEST/LIMA 男 普通 EA0000024 中国大陆 1990-01-02 2030-03-04',
+    );
+    expect(r.separatePnr).toBeUndefined();
+    expect(r.passengers[0].bedPref).toBeUndefined();
+    expect(r.passengers[0].singleRoom).toBeUndefined();
+    expect(r.passengers[0].visaExempt).toBeUndefined();
+    expect(r.warnings.some((w) => w.includes('已按名单勾选'))).toBe(false);
+  });
+});

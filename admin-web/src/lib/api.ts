@@ -496,6 +496,12 @@ export interface BatchOrderPassenger {
    * ——服务端 createOrder 仍会按出生日期 + 航班出发日权威兜底重派生，此处只是不丢入口层已有的判断。
    */
   passengerType?: PassengerType;
+  /** 床型偏好：大床 / 双床；null 或缺省 = 不限。名单解析「大床 / 双床」回填，不进定价。 */
+  bedPref?: BedPref | null;
+  /** 兑换升舱：用常旅客次数换商务舱的航段。缺省 NONE。不进定价。 */
+  upgradeRedeemLeg?: UpgradeRedeemLeg;
+  /** 兑换说明（≤80）。不进定价。 */
+  upgradeRedeemNote?: string | null;
 }
 // 批量创单 body 同样支持整批共用的签证状态 + 结构化备注四栏（后端 batchCreateOrdersBodySchema
 // 直接 spread 了 orderStructuredNotesShape，写入每张子单）——与 CreateOrderInput 同款 extends。
@@ -656,6 +662,15 @@ export interface BatchCreateOrdersResult {
 // ── 单笔录单（按产品类型）—— 与 backend createOrderBodySchema / orderItemInputSchema 对齐 ──
 // 所有行都带 description + quantity（int 1..20）；HOTEL/VISA/TRANSFER/BUNDLE 的 unitPrice 仅占位，
 // 服务端会按产品权威重算价格（HOTEL/VISA/TRANSFER 后端定价；BUNDLE/FLIGHT 后端重算）。
+/**
+ * 床型偏好（备注结构化：名单里高频出现的「大床 / 双床」做成字段）。
+ * 读回时可能是历史遗留值（SINGLE / SHARE_OK），展示侧按「不限」处理，不要当成枚举穷举。
+ */
+export type BedPref = 'DOUBLE' | 'TWIN';
+
+/** 兑换升舱：用常旅客次数换商务舱的航段。NONE = 不兑换（后端默认值）。 */
+export type UpgradeRedeemLeg = 'NONE' | 'OUTBOUND' | 'RETURN' | 'BOTH';
+
 export interface OrderPassengerInput {
   fullName: string;
   documentNumber: string;
@@ -684,6 +699,12 @@ export interface OrderPassengerInput {
   visaExempt?: boolean;
   /** 套餐乘客级选项：单住（不拼房，按人收单房差）。缺省 false = 拼房。 */
   singleRoom?: boolean;
+  /** 床型偏好：大床 / 双床；null 或缺省 = 不限。不进定价。 */
+  bedPref?: BedPref | null;
+  /** 兑换升舱：用常旅客次数换商务舱的航段。缺省 NONE。不进定价。 */
+  upgradeRedeemLeg?: UpgradeRedeemLeg;
+  /** 兑换说明（≤80，如「用同行人的次数」）。不进定价。 */
+  upgradeRedeemNote?: string | null;
 }
 
 interface OrderItemBase {
@@ -776,6 +797,13 @@ export interface OrderStructuredNotes {
   notePayment?: string;
   /** 特殊要求 */
   noteSpecial?: string;
+  /**
+   * 单独编码出票（本单乘客单独编码，不与他单合并 PNR）。缺省 = 不改（PATCH）/ false（建单）。
+   * 与下面的同酒店安排同属「备注结构化」：原本写在自由备注里，票务/房控靠人眼看。不进定价。
+   */
+  separatePnr?: boolean;
+  /** 同酒店安排（≤120 自由文本：要和谁 / 哪张单住同一家酒店）。不做订单关联，不进定价。 */
+  sameHotelWith?: string;
 }
 
 // 录单调价/加项（仅 ADMIN/STAFF 录单）：在系统权威价上手工加减一笔金额 + 原因。
@@ -1415,6 +1443,13 @@ export interface OrderPassenger {
   visaExempt?: boolean | null;
   /** 单住（不拼房，按人收单房差） */
   singleRoom?: boolean | null;
+  /**
+   * 兑换升舱：用常旅客次数换商务舱的航段（NONE = 不兑换）。旧后端/窄接口未下发时缺省，
+   * 展示侧按 NONE 处理。
+   */
+  upgradeRedeemLeg?: UpgradeRedeemLeg | null;
+  /** 兑换说明（≤80，如「用同行人的次数」）；chip 悬浮展示。 */
+  upgradeRedeemNote?: string | null;
 }
 
 export type ReminderStatus = 'OPEN' | 'IN_PROGRESS' | 'DONE' | 'SKIPPED';
@@ -1672,6 +1707,10 @@ export interface OrderSummary {
   noteVisa?: string | null;
   notePayment?: string | null;
   noteSpecial?: string | null;
+  /** 单独编码出票（票务据此判断是否单独出票）。旧后端/窄接口未下发时缺省，按 false 处理。 */
+  separatePnr?: boolean | null;
+  /** 同酒店安排（自由文本；房控/分房据此落位）。未填 = null。 */
+  sameHotelWith?: string | null;
   claimedById?: string | null;
   claimedAt?: string | null;
   claimedBy?: { id: string; displayName: string | null; email: string | null } | null;
@@ -5567,6 +5606,13 @@ export const api = {
       feeCny?: number;
       feeLabel?: string;
       note?: string;
+      /**
+       * 备注结构化三项（改信息通道可改；不影响定价，不清护照/签证）。
+       * null = 清空该项（床型回「不限」/ 兑换说明清空）；不传 = 不动。
+       */
+      bedPref?: BedPref | null;
+      upgradeRedeemLeg?: UpgradeRedeemLeg;
+      upgradeRedeemNote?: string | null;
     },
   ) =>
     apiFetch<{ order: OrderSummary }>(`/orders/${orderId}/passengers/${passengerId}`, {
@@ -7526,6 +7572,11 @@ export interface HotelOccupant {
   billedRoomFraction: number;
   /** 去重物理房：整单普通房组去重间数 + 参与共享房数（去重不看份额）。 */
   physicalRoomsDeduped: number;
+  /**
+   * 该单的「同酒店安排」（备注结构化，自由文本）：房控落位前要看见这单点名要和谁住一起。
+   * 旧后端/未填时缺省 —— 消费方按「没写」处理，不要凭空显示空提示。
+   */
+  sameHotelWith?: string | null;
 }
 
 /** GET /hotel-control/nightly-remaining —— 入住区间逐晚余量（原始数组，未汇总；由调用方按需汇总展示）。 */
