@@ -9,6 +9,7 @@
  *   5. HOLD_INSTALLMENT_DUE 占位单收款期：截止前三天提醒，逾期标红
  *   10. RANDOM_TIER_SHORTFALL 随机档缺口：未来 7 天需向地接加房
  *   11. NO_SHOW_RETURN_RELEASED 回程已释放待跟进：去程 no-show 后回程座位已放回库存，待确认是否恢复
+ *   12. UPGRADE_REDEEM_PENDING 次数升级待核销：标了兑换升舱的乘客那一程已起飞，档案里却没扣次数
  *
  * 各规则与「自备签证」（Passenger.visaExempt=true：客人自行办妥签证，无需送签）的口径：
  *   - 规则 4 签证缺件：按签证台同口径排除自备签乘客（visaExempt=true）——客人自备签证
@@ -38,6 +39,7 @@ import {
   ReminderStatus,
   HoldOrderStatus,
   HoldInstallmentStatus,
+  UpgradeRedeemLeg,
   VisaSubmissionStatus,
   type PrismaClient,
 } from '@prisma/client';
@@ -89,6 +91,14 @@ const RETURN_RELEASED_STATUSES: OrderStatus[] = [
 ];
 
 /** 规则 1–3 一次查询覆盖的状态并集 */
+/**
+ * 规则 12 次数升级待核销：本规则天生在**起飞之后**才触发，那时订单常常已经 COMPLETED，
+ * 沿用 SCAN_STATUSES（排除 COMPLETED）等于把最该扣次数的单全漏掉 —— 与规则 11 同一个道理，
+ * 故同样含 COMPLETED，只排掉取消/退款/失败族。PENDING_PAYMENT 也在内：升舱兑换扣的是
+ * 常旅客次数，不是钱，尾款收没收齐与该不该核销无关。
+ */
+const UPGRADE_REDEEM_STATUSES: OrderStatus[] = [...RETURN_RELEASED_STATUSES];
+
 const SCAN_STATUSES: OrderStatus[] = [
   ...new Set([...BALANCE_DUE_STATUSES, ...PASSPORT_ACTIVE_STATUSES]),
 ];
@@ -230,7 +240,8 @@ export type RuleName =
   | 'ROOM_PARTIALLY_UNASSIGNED'
   | 'RECEIPT_UNVERIFIED'
   | 'RANDOM_TIER_SHORTFALL'
-  | 'NO_SHOW_RETURN_RELEASED';
+  | 'NO_SHOW_RETURN_RELEASED'
+  | 'UPGRADE_REDEEM_PENDING';
 
 export interface ReminderCandidate {
   rule: RuleName;
@@ -971,6 +982,130 @@ export function buildNoShowReturnReleasedCandidates(
   ];
 }
 
+// ── 规则 12：次数升级待核销 ─────────────────────────────────────────────────
+//
+// 「次数升级」（Passenger.upgradeRedeemLeg）只是录单时打的执行标签，票务据此给这一程
+// 排商务舱；真正扣常旅客次数的是权益核销台账（TravelerBenefitRedemption）。两边此前零
+// 交叉：标了升舱、飞完了，却没人去档案里扣一次，可用次数虚高，客人等于白拿一次额度。
+// 这条规则就是那座桥 —— 可用次数口径不动（仍是「已飞 − 已核销」），只在该扣没扣时喊一声。
+
+/** 兑换航段 → 中文（与前端 PassengerPrefChips 的标签一字不差）。 */
+const UPGRADE_REDEEM_LEG_LABEL: Record<string, string> = {
+  [UpgradeRedeemLeg.OUTBOUND]: '去程',
+  [UpgradeRedeemLeg.RETURN]: '回程',
+  [UpgradeRedeemLeg.BOTH]: '往返',
+};
+
+/** 证件号没匹配到常旅客档案时，ruleKey 末段的占位值（前端据此不渲染「去核销」链接）。 */
+export const UPGRADE_REDEEM_NO_PROFILE = 'NOPROFILE';
+
+/**
+ * 规则 12 的 ruleKey：`UPGRADEREDEEM:{乘客id}:{该程起飞日}:{档案id|NOPROFILE}`。
+ *
+ * 末段带档案 id 是为了让前端从待办列表直接跳到该乘客的常旅客档案 —— OperationalReminder
+ * 没有 payload 列（全表只有 title/body/orderId/ruleKey 这几样），ruleKey 是唯一能把「跳哪去」
+ * 带到前端的字段，后端自己也已经在按同样方式解析 ROOMASSIGN 键里的 orderId。
+ *
+ * 匹配不到档案时落 NOPROFILE：提醒照发（该扣的次数不会因为查不到档案就不用扣了），
+ * 只是没有直达链接。等档案建起来（全量重建或从订单点乘客名当场建档）之后这一轮会
+ * 生成带档案 id 的新键，同时把 NOPROFILE 那条丢进 resolvedRuleKeys 自动核销，不会两条并挂。
+ */
+export function upgradeRedeemRuleKey(
+  passengerId: string,
+  legDate: string,
+  profileId: string | null,
+): string {
+  return `UPGRADEREDEEM:${passengerId}:${legDate}:${profileId ?? UPGRADE_REDEEM_NO_PROFILE}`;
+}
+
+/** 规则 12 的输入：一位标了次数升级的乘客 + 他所在订单的机票航段快照。 */
+export interface RuleUpgradeRedeemPassenger {
+  passengerId: string;
+  fullName: string;
+  orderId: string;
+  orderNumber: string;
+  upgradeRedeemLeg: UpgradeRedeemLeg;
+  /** 本单全部有班次的机票行（顺序随意，函数内按起飞时间排）。 */
+  flights: ReadonlyArray<{
+    departureTime: Date;
+    departureTz: string | null;
+    flightNumber: string | null;
+  }>;
+  /** 解析到的主档案 id；null = 该证件号没匹配到常旅客档案。 */
+  profileId: string | null;
+  /** 该程起飞日之后档案上已有正数核销流水（true = 已扣过，不再提醒）。 */
+  redeemedAfterLeg: boolean;
+}
+
+/** 标了次数升级的那一程（去程/回程）的班次快照。 */
+export interface UpgradeRedeemLegRef {
+  departureTime: Date;
+  /** 起飞当地日期 YYYY-MM-DD（口径同 deriveDepartureDate）。 */
+  legDate: string;
+  flightNumber: string | null;
+  /** 录单标的是哪一程（去程/回程/往返）——文案里如实复述运营填的那一档。 */
+  legLabel: string;
+}
+
+/**
+ * 「标的那一程」是哪一段：去程 = 最早起飞的机票行，回程 = 第二段
+ * （口径与旅客档案 summarizeOrder 同源，全站只留一套「哪段是回程」的判法）。
+ * 双程（BOTH）按**回程**判 —— 两程都要升舱时，回程飞完这一单才算走完，
+ * 早在去程就催核销会把「人还在境外、回程可能改期/不飞」的单提前催一遍。
+ * 目标航段不存在（单程单标了回程、回程被释放导致班次为空）→ 返回 null，不提醒。
+ */
+export function resolveUpgradeRedeemLeg(
+  pax: Pick<RuleUpgradeRedeemPassenger, 'upgradeRedeemLeg' | 'flights'>,
+): UpgradeRedeemLegRef | null {
+  const legLabel = UPGRADE_REDEEM_LEG_LABEL[pax.upgradeRedeemLeg];
+  if (!legLabel) return null; // NONE / 未知值
+  const sorted = [...pax.flights].sort(
+    (a, b) => a.departureTime.getTime() - b.departureTime.getTime(),
+  );
+  const target = pax.upgradeRedeemLeg === UpgradeRedeemLeg.OUTBOUND ? sorted[0] : sorted[1];
+  if (!target) return null;
+  return {
+    departureTime: target.departureTime,
+    legDate: dateInTz(target.departureTime, target.departureTz),
+    flightNumber: target.flightNumber,
+    legLabel,
+  };
+}
+
+/**
+ * 规则 12：标了次数升级的那一程已起飞、档案里却还没扣次数 → 提醒去核销。
+ * 起飞前不提醒（还没飞成，扣了要冲正）；已核销不提醒（redeemedAfterLeg 由调用方按台账判定）。
+ */
+export function buildUpgradeRedeemCandidates(
+  pax: RuleUpgradeRedeemPassenger,
+  today: string,
+  now: Date,
+): ReminderCandidate[] {
+  const leg = resolveUpgradeRedeemLeg(pax);
+  if (!leg) return [];
+  // 起飞那一刻起算（与规则 11 的 departed 判定同口径：含正点起飞的那一秒）
+  if (leg.departureTime.getTime() > now.getTime()) return [];
+  if (pax.redeemedAfterLeg) return [];
+  const flightLabel = leg.flightNumber ?? '航班未知';
+  const missingProfileHint = pax.profileId
+    ? ''
+    : '（未按该乘客证件号匹配到常旅客档案：请从订单详情点乘客姓名进档案页，查不到会当场建档）';
+  return [
+    {
+      rule: 'UPGRADE_REDEEM_PENDING',
+      ruleKey: upgradeRedeemRuleKey(pax.passengerId, leg.legDate, pax.profileId),
+      orderId: pax.orderId,
+      title: `【次数升级待核销】${pax.orderNumber} ${pax.fullName} ${flightLabel} ${leg.legDate}`,
+      body:
+        `${pax.fullName} 在本单标了次数升级（${leg.legLabel}），${flightLabel} ${leg.legDate} 已起飞，` +
+        `常旅客档案里还没有这一程之后的核销流水。可用次数不会自动扣（口径＝已飞 − 已核销），` +
+        `请到常旅客档案「核销权益」扣减一次。${missingProfileHint}`,
+      priority: ReminderPriority.HIGH,
+      dueAt: today,
+    },
+  ];
+}
+
 /** 规则 5：占位单收款期截止提醒；日期口径与 dueDate（建单时已按起飞地折算）一致。 */
 export function buildHoldInstallmentCandidates(hold: RuleHoldOrder, today: string): ReminderCandidate[] {
   const activeStatuses: HoldOrderStatus[] = [HoldOrderStatus.PENDING, HoldOrderStatus.HOLDING, HoldOrderStatus.OVERDUE];
@@ -1359,6 +1494,203 @@ export async function generateRuleReminders(
     }
   }
 
+  // ── 规则 12：次数升级待核销（乘客级；范围 = 标了 upgradeRedeemLeg 的乘客）──────
+  // 单独取数，不放宽上面订单查询的状态集：本规则要覆盖 COMPLETED 单（起飞后才触发），
+  // 而主扫描的 SCAN_STATUSES 刻意排除 COMPLETED —— 放宽它会把其余十一条规则的扫描面
+  // 一起撑开。命中面只有真的标过次数升级的那几位乘客，量级很小。
+  // 三个 delegate 都按防御式取（旧测试 mock 没有它们时整条规则跳过），同 holdOrder 哲学。
+  const upgradeResolvedKeys: string[] = [];
+  const upgradePassengerDelegate = (
+    prisma as unknown as {
+      passenger?: {
+        findMany?: (args: unknown) => Promise<
+          Array<{
+            id: string;
+            fullName: string;
+            orderId: string;
+            documentType: string;
+            documentNumber: string;
+            upgradeRedeemLeg: UpgradeRedeemLeg;
+            order: {
+              orderNumber: string;
+              items: Array<{
+                flightSchedule: {
+                  departureTime: Date;
+                  departureTz: string | null;
+                  flight: { flightNumber: string | null } | null;
+                } | null;
+              }>;
+            } | null;
+          }>
+        >;
+      };
+    }
+  ).passenger;
+  const travelerProfileDelegate = (
+    prisma as unknown as {
+      travelerProfile?: {
+        findMany?: (args: unknown) => Promise<
+          Array<{ id: string; documentType: string; documentNumber: string; mergedIntoId: string | null }>
+        >;
+      };
+    }
+  ).travelerProfile;
+  const redemptionDelegate = (
+    prisma as unknown as {
+      travelerBenefitRedemption?: {
+        findMany?: (args: unknown) => Promise<Array<{ profileId: string; createdAt: Date }>>;
+      };
+    }
+  ).travelerBenefitRedemption;
+  if (
+    typeof upgradePassengerDelegate?.findMany === 'function' &&
+    typeof travelerProfileDelegate?.findMany === 'function' &&
+    typeof redemptionDelegate?.findMany === 'function'
+  ) {
+    const marked = await upgradePassengerDelegate.findMany({
+      where: {
+        upgradeRedeemLeg: { not: UpgradeRedeemLeg.NONE },
+        order: { deletedAt: null, status: { in: UPGRADE_REDEEM_STATUSES } },
+      },
+      select: {
+        id: true,
+        fullName: true,
+        orderId: true,
+        documentType: true,
+        documentNumber: true,
+        upgradeRedeemLeg: true,
+        order: {
+          select: {
+            orderNumber: true,
+            items: {
+              where: { flightScheduleId: { not: null } },
+              select: {
+                flightSchedule: {
+                  select: {
+                    departureTime: true,
+                    departureTz: true,
+                    flight: { select: { flightNumber: true } },
+                  },
+                },
+              },
+            },
+          },
+        },
+      },
+    });
+
+    // 只留「标的那一程已经起飞」的人：没起飞的不催（扣早了要冲正），
+    // 目标航段不存在（单程单标了回程 / 回程已释放）的同样跳过。
+    const departedLegs = marked
+      .map((row) => {
+        const flights = (row.order?.items ?? [])
+          .map((item) => item.flightSchedule)
+          .filter((sc): sc is NonNullable<typeof sc> => sc != null)
+          .map((sc) => ({
+            departureTime: sc.departureTime,
+            departureTz: sc.departureTz,
+            flightNumber: sc.flight?.flightNumber ?? null,
+          }));
+        const leg = resolveUpgradeRedeemLeg({ upgradeRedeemLeg: row.upgradeRedeemLeg, flights });
+        return leg && leg.departureTime.getTime() <= now.getTime()
+          ? { row, flights, leg }
+          : null;
+      })
+      .filter((entry): entry is NonNullable<typeof entry> => entry !== null);
+
+    if (departedLegs.length > 0) {
+      // 证件号 → 主档案 id。口径照抄 travelers 的 lookupByDocuments：trim + 忽略大小写
+      //（档案列存的是乘客行原始写法，录入时大小写/空格出入不该让链接静默落空），
+      // mergedIntoId 保证最多一跳（merge 只允许并入 canonical 行），故直接取它当主档案 id。
+      const docPairs = new Map<string, { documentType: string; documentNumber: string }>();
+      for (const { row } of departedLegs) {
+        const doc = (row.documentNumber ?? '').trim();
+        // 占位出行人（N/A / 空证件号）不是真人，没有也不该有档案
+        if (doc === '' || doc.toUpperCase() === 'N/A') continue;
+        docPairs.set(`${row.documentType}|${doc.toUpperCase()}`, {
+          documentType: row.documentType,
+          documentNumber: doc,
+        });
+      }
+      const profileRows =
+        docPairs.size === 0
+          ? []
+          : await travelerProfileDelegate.findMany({
+              where: {
+                OR: [...docPairs.values()].map((d) => ({
+                  documentType: d.documentType,
+                  documentNumber: {
+                    equals: d.documentNumber,
+                    mode: Prisma.QueryMode.insensitive,
+                  },
+                })),
+              },
+              select: { id: true, documentType: true, documentNumber: true, mergedIntoId: true },
+            });
+      const masterIdByDoc = new Map<string, string>();
+      for (const row of profileRows) {
+        masterIdByDoc.set(
+          `${row.documentType}|${(row.documentNumber ?? '').trim().toUpperCase()}`,
+          row.mergedIntoId ?? row.id,
+        );
+      }
+
+      // 这一程起飞之后的正数核销流水（负数是冲正，不算「已扣过」）。
+      // 台账不挂订单号，只能按时间判：下界取该程起飞当地日的零点（宽松一档，
+      // 当天早上先核销、晚上才起飞的也认），故同一位客人短期内飞两趟都标了升舱时，
+      // 一次核销可能把两条都判成已核销 —— 台账无单据关联，这是已知近似（见报告遗留风险）。
+      const masterIds = [...new Set(masterIdByDoc.values())];
+      const redemptions =
+        masterIds.length === 0
+          ? []
+          : await redemptionDelegate.findMany({
+              where: { profileId: { in: masterIds }, tripsUsed: { gt: 0 } },
+              select: { profileId: true, createdAt: true },
+            });
+      const redeemedAtByProfile = new Map<string, Date[]>();
+      for (const r of redemptions) {
+        const list = redeemedAtByProfile.get(r.profileId) ?? [];
+        list.push(r.createdAt);
+        redeemedAtByProfile.set(r.profileId, list);
+      }
+
+      for (const { row, flights, leg } of departedLegs) {
+        const doc = (row.documentNumber ?? '').trim();
+        const profileId = masterIdByDoc.get(`${row.documentType}|${doc.toUpperCase()}`) ?? null;
+        const legStart = Date.parse(`${leg.legDate}T00:00:00Z`);
+        const redeemedAfterLeg = (redeemedAtByProfile.get(profileId ?? '') ?? []).some(
+          (at) => at.getTime() >= legStart,
+        );
+        candidates.push(
+          ...buildUpgradeRedeemCandidates(
+            {
+              passengerId: row.id,
+              fullName: row.fullName,
+              orderId: row.orderId,
+              orderNumber: row.order?.orderNumber ?? '',
+              upgradeRedeemLeg: row.upgradeRedeemLeg,
+              flights,
+              profileId,
+              redeemedAfterLeg,
+            },
+            today,
+            now,
+          ),
+        );
+        if (redeemedAfterLeg) {
+          // 已经扣过了：两种键（带档案 id / NOPROFILE）都关掉，存量提醒不留尾巴
+          upgradeResolvedKeys.push(
+            upgradeRedeemRuleKey(row.id, leg.legDate, profileId),
+            upgradeRedeemRuleKey(row.id, leg.legDate, null),
+          );
+        } else if (profileId) {
+          // 这轮匹配上了档案：关掉上一轮「没匹配到档案」时落的那条，同一件事不挂两条
+          upgradeResolvedKeys.push(upgradeRedeemRuleKey(row.id, leg.legDate, null));
+        }
+      }
+    }
+  }
+
   // 批内去重（同一 ruleKey 只留第一条）
   const byKey = new Map<string, ReminderCandidate>();
   for (const c of candidates) {
@@ -1434,6 +1766,8 @@ export async function generateRuleReminders(
       if (visaDeparture) resolvedRuleKeys.push(`VISASUBMIT:${orderId}:${visaDeparture}`);
     }
   }
+  // 6) 规则 12：已核销 / 档案后来建起来了（见上方 upgradeResolvedKeys 的两种情形）
+  resolvedRuleKeys.push(...upgradeResolvedKeys);
   await closeResolvedRuleReminders(prisma, resolvedRuleKeys, now);
   // B8：跨单分房未分房/部分未分房状态机——重开条件复发的自动核销提醒、清理入住日期改动
   // 留下的孤儿键，见函数顶部 JSDoc。只对 orders（本轮已查出的订单，带 roomAssignment 字段）

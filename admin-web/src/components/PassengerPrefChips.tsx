@@ -8,7 +8,10 @@
  * 床型=青、兑换=紫、单独编码=品牌靛蓝、同酒店=翠绿。缺省/未知值一律不渲染，不占位。
  */
 
+import { Link } from 'react-router-dom';
 import type { UpgradeRedeemLeg } from '../lib/api';
+import { TRAVELER_PROFILE_LINK_TITLE, travelerProfileLinkProps } from '../lib/travelerProfileLink';
+import { useAuth } from '../stores/auth';
 
 // 标签表用 Map：这些值来自后端 / 老数据，不是受控枚举。用普通对象查表时，
 // 'constructor'、'toString' 这类原型链上的键会查出函数并被渲染成 chip 文字。
@@ -58,6 +61,14 @@ export interface PassengerPrefChipsProps {
   upgradeRedeemNote?: string | null;
   /** 详情乘客卡片里徽标是行内接排的，需要左外边距；列表子行用 flex gap，不需要。 */
   inline?: boolean;
+  /**
+   * 「去核销」直达链接的三选一入口（口径同 travelerProfileLinkProps：档案 id 优先，
+   * 否则用证件号走 Link state 不进地址栏）。三个都没传 → 只出徽标，不出链接：
+   * 兑换升舱只是录单标签，真正扣次数的是常旅客档案的权益核销台账，两边此前零交叉。
+   */
+  profileId?: string | null;
+  documentType?: string | null;
+  documentNumber?: string | null;
 }
 
 /** 乘客级徽标：床型 + 兑换升舱。两项都没有时整体不渲染（返回 null，不留空白）。 */
@@ -66,9 +77,18 @@ export function PassengerPrefChips({
   upgradeRedeemLeg,
   upgradeRedeemNote,
   inline = false,
+  profileId,
+  documentType,
+  documentNumber,
 }: PassengerPrefChipsProps) {
+  // 核销是内部台账操作，代理看不到也点不了（后端 /profiles/:id/redemptions 同样只认 ADMIN/STAFF）
+  const role = useAuth((s) => s.user?.role);
   const bed = bedPrefLabel(bedPref);
   const leg = upgradeRedeemLegLabel(upgradeRedeemLeg);
+  const redeemLink =
+    leg && (role === 'ADMIN' || role === 'STAFF')
+      ? travelerProfileLinkProps({ profileId, documentType, documentNumber })
+      : null;
   if (!bed && !leg) return null;
   const spacing = inline ? 'ml-2 ' : '';
   const note = upgradeRedeemNote?.trim();
@@ -86,6 +106,16 @@ export function PassengerPrefChips({
         >
           兑换·{leg}
         </span>
+      )}
+      {leg && redeemLink && (
+        <Link
+          to={redeemLink.to}
+          state={redeemLink.state}
+          className={`${spacing}${CHIP_BASE} bg-white text-violet-700 underline decoration-dotted ring-violet-200 hover:bg-violet-50`}
+          title={`去常旅客档案核销这次兑换（可用次数不会自动扣）· ${TRAVELER_PROFILE_LINK_TITLE}`}
+        >
+          去核销
+        </Link>
       )}
     </>
   );

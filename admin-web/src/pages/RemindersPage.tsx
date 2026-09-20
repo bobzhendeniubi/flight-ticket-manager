@@ -7,6 +7,7 @@
  * - 行操作：认领 / 完成 / 跳过（填原因）/ 释放
  */
 import { useEffect, useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import {
   api,
   ApiError,
@@ -16,6 +17,7 @@ import {
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { Icon } from '../components/Icon';
+import { TRAVELER_PROFILE_LINK_TITLE } from '../lib/travelerProfileLink';
 
 const PAGE_SIZE = 20;
 
@@ -57,11 +59,32 @@ const RULE_LABEL: Record<string, string> = {
   TICKET_MISSING: '临近出发未出票',
   VISA_NOT_SUBMITTED: '临近出发未送签',
   ROOM_UNASSIGNED: '临近入住未分房',
+  ROOM_PARTIALLY_UNASSIGNED: '临近入住部分未分房',
   RECEIPT_UNVERIFIED: '到账待核实',
+  RANDOM_TIER_SHORTFALL: '随机档缺口需加房',
+  NO_SHOW_RETURN_RELEASED: '回程已释放待跟进',
+  UPGRADE_REDEEM_PENDING: '次数升级待核销',
 };
 
 function ruleLabel(key: string): string {
   return RULE_LABEL[key] ?? key;
+}
+
+/**
+ * 「次数升级待核销」的档案直达链接。
+ *
+ * OperationalReminder 没有 payload 列，后端把档案 id 放在 ruleKey 末段
+ * （`UPGRADEREDEEM:{乘客id}:{起飞日}:{档案id|NOPROFILE}`，见 reminders.rules.ts 的
+ * upgradeRedeemRuleKey）。匹配不到档案时是 NOPROFILE —— 那种提醒照常显示，只是没有直达链接，
+ * 正文里写了怎么先建档。
+ */
+const UPGRADE_REDEEM_PREFIX = 'UPGRADEREDEEM:';
+const NO_PROFILE = 'NOPROFILE';
+
+function upgradeRedeemProfileId(ruleKey: string | null | undefined): string | null {
+  if (!ruleKey || !ruleKey.startsWith(UPGRADE_REDEEM_PREFIX)) return null;
+  const profileId = ruleKey.split(':')[3] ?? '';
+  return profileId && profileId !== NO_PROFILE ? profileId : null;
 }
 
 function todayYmd(): string {
@@ -381,6 +404,7 @@ export function RemindersPage() {
                 const isOpenLike = r.status === 'OPEN' || r.status === 'IN_PROGRESS';
                 const overdue = isOpenLike && r.dueAt !== null && ymd(r.dueAt) < today;
                 const rowBusy = busyId === r.id;
+                const redeemProfileId = upgradeRedeemProfileId(r.ruleKey);
                 return (
                   <tr key={r.id}>
                     <td>
@@ -392,6 +416,15 @@ export function RemindersPage() {
                           {r.title}
                         </span>
                         {r.ruleKey && <span className="badge-neutral shrink-0">自动</span>}
+                        {redeemProfileId && (
+                          <Link
+                            to={`/travelers?profile=${encodeURIComponent(redeemProfileId)}`}
+                            className="shrink-0 text-xs text-brand-700 underline decoration-dotted"
+                            title={`去常旅客档案「核销权益」扣一次 · ${TRAVELER_PROFILE_LINK_TITLE}`}
+                          >
+                            去核销
+                          </Link>
+                        )}
                       </div>
                     </td>
                     <td className="nums">{r.order?.orderNumber ?? '—'}</td>

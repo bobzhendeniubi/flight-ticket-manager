@@ -1084,6 +1084,8 @@ const PassengerSubRow = memo(function PassengerSubRow({
             bedPref={p.bedPref}
             upgradeRedeemLeg={p.upgradeRedeemLeg}
             upgradeRedeemNote={p.upgradeRedeemNote}
+            documentType={p.documentType}
+            documentNumber={p.documentNumber}
           />
           {p.pnr ? <span className="font-mono tabular-nums text-ink-soft">PNR {p.pnr}</span> : null}
           {p.eticketNumber ? (
@@ -12335,6 +12337,8 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                       bedPref={p.bedPref}
                       upgradeRedeemLeg={p.upgradeRedeemLeg}
                       upgradeRedeemNote={p.upgradeRedeemNote}
+                      documentType={p.documentType}
+                      documentNumber={p.documentNumber}
                       inline
                     />
                     {/* 按乘客净调价小标（0722）：正=补收（琥珀）、负=优惠（绿）；0 不显示。 */}
