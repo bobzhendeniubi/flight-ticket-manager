@@ -4271,6 +4271,61 @@ describe('correctPassenger · 订正证件资料', () => {
 
     expect(mockPrisma.passenger.update.mock.calls[0][0].data.documentNumber).toBe('E12345078');
   });
+
+  // ── 姓/名 拼出来与全名不一致（2026-09 数据质量提示）：拍板口径=不拒绝，只留 WARNING 审计 ──
+  it('姓/名 拼出来与全名不一致 → 不拒绝、正常写库，只多记一条 WARNING 审计（PASSENGER_NAME_MISMATCH）', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ fullName: 'ZHU/RUILAN', lastName: 'ZHU', firstName: 'RUILAN' });
+    mockPrisma.auditLog.create.mockClear();
+
+    await service.correctPassenger(
+      'ord1',
+      'px1',
+      { lastName: 'ZHU', firstName: 'RUIIAN', fullName: 'ZHU/RUILAN' },
+      OPS,
+    );
+
+    // 不拦截：三个字段正常落库
+    expect(mockPrisma.passenger.update).toHaveBeenCalledTimes(1);
+    // 只多留痕，不影响主流程结果
+    expect(mockPrisma.auditLog.create).toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({
+          action: 'PASSENGER_NAME_MISMATCH',
+          targetType: 'TRAVELER',
+          targetId: 'px1',
+          severity: 'WARNING',
+          after: expect.objectContaining({
+            orderId: 'ord1',
+            passengerId: 'px1',
+            lastName: 'ZHU',
+            firstName: 'RUIIAN',
+            fullName: 'ZHU/RUILAN',
+            composedFullName: 'ZHU/RUIIAN',
+          }),
+        }),
+      }),
+    );
+  });
+
+  it('姓/名 拼出来与全名一致 → 不写 PASSENGER_NAME_MISMATCH 审计', async () => {
+    const service = new OrderService();
+    armCorrectMocks({ fullName: 'ZHU/RUILAN', lastName: 'ZHU', firstName: 'RUILAN' });
+    mockPrisma.auditLog.create.mockClear();
+
+    await service.correctPassenger(
+      'ord1',
+      'px1',
+      { lastName: 'ZHU', firstName: 'RUILAN', fullName: 'ZHU/RUILAN' },
+      OPS,
+    );
+
+    expect(mockPrisma.auditLog.create).not.toHaveBeenCalledWith(
+      expect.objectContaining({
+        data: expect.objectContaining({ action: 'PASSENGER_NAME_MISMATCH' }),
+      }),
+    );
+  });
 });
 
 // ── swapPassenger · 代理换人（2026-09 起对代理开放，运营事后复核）──────────────

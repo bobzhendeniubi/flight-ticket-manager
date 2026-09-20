@@ -68,3 +68,30 @@ export function composePassengerFullName(
   if (f) return f;
   return null;
 }
+
+/**
+ * 从完整姓名反推 { lastName, firstName }（与 backend/src/lib/passenger-name.ts 同一口径）。
+ *
+ * 口径：**斜线优先，其次空格**。
+ *  - `ZHANG/SAN`      → last=`ZHANG`, first=`SAN`（航司标准 LAST/FIRST）
+ *  - `VAN DER/PIET`   → last=`VAN DER`, first=`PIET`（斜线才是分隔符，空格不是）
+ *  - `WANG LIANBO`    → last=`WANG`, first=`LIANBO`（无斜线才按首个空格拆）
+ *  - `MADONNA`        → last=`MADONNA`, first=`''`（拆不出就不编造）
+ */
+export function splitPassengerFullName(full?: string | null): {
+  lastName: string;
+  firstName: string;
+} {
+  const s = (full ?? '').trim();
+  if (!s) return { lastName: '', firstName: '' };
+
+  const slash = s.indexOf('/');
+  if (slash > 0) {
+    const last = s.slice(0, slash).trim();
+    const first = s.slice(slash + 1).trim();
+    if (last && first) return { lastName: last, firstName: first };
+  }
+
+  const [head, ...rest] = s.split(/\s+/);
+  return { lastName: head ?? '', firstName: rest.join(' ') };
+}

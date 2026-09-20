@@ -2010,6 +2010,27 @@ function chinesePassengerNameKey(value?: string | null): string | null {
   return s || null;
 }
 
+/**
+ * 姓/名 拼出来与全名对不上（换人/改信息通道的数据质量提示，2026-09）——
+ * 只在**三者都传**时才判定（三者都传才有「拼出来」这回事，缺一项不算）；姓/名各自已在
+ * schema 层规范化，这里再规范化一次全名做同口径比较即可，不重复处理姓/名。
+ * 拍板口径：不拦截——存量里多段姓氏 / 逗号写法等合法不规则姓名很常见，只做提示 + WARNING
+ * 审计留痕，不做 400 硬拦。返回 null 表示一致或数据不全，不参与比对。
+ */
+function detectPassengerNameMismatch(input: {
+  lastName?: string;
+  firstName?: string;
+  fullName?: string;
+}): { composedFullName: string; fullName: string } | null {
+  if (input.lastName === undefined || input.firstName === undefined || input.fullName === undefined) {
+    return null;
+  }
+  const composed = composePassengerFullName(input.lastName, input.firstName);
+  const normalizedFullName = normalizePassengerFullName(input.fullName);
+  if (!composed || composed === normalizedFullName) return null;
+  return { composedFullName: composed, fullName: normalizedFullName };
+}
+
 /** 强录留痕的一行订单备注（无冲突 → null，调用方据此决定加不加这一行）。 */
 function duplicateForceNoteFor(
   conflicts: DuplicatePassengerConflict[],
@@ -11793,6 +11814,28 @@ export class OrderService {
       if (input.visaExempt !== undefined) data.visaExempt = input.visaExempt;
       if (input.singleRoom !== undefined) data.singleRoom = input.singleRoom;
 
+      // ── 姓/名 拼出来与全名对不上：不拒绝（存量有合法不规则姓名），只记 WARNING 审计留痕，
+      //    方便以后清查（票务/签证包按姓/名出，订单列表按全名显示，两边对不上会错名开票）。
+      const nameMismatch = detectPassengerNameMismatch(input);
+      if (nameMismatch) {
+        await writeAuditWithinTx(tx, {
+          actor: { userId: actor.userId, role: actor.role },
+          action: 'PASSENGER_NAME_MISMATCH',
+          targetType: AuditTargetType.TRAVELER,
+          targetId: passengerId,
+          targetLabel: `${passenger.fullName ?? ''} · 换人姓/名拼出来与全名不一致`,
+          after: {
+            orderId,
+            passengerId,
+            lastName: input.lastName,
+            firstName: input.firstName,
+            fullName: nameMismatch.fullName,
+            composedFullName: nameMismatch.composedFullName,
+          },
+          severity: AuditSeverity.WARNING,
+        });
+      }
+
       // ── 1b. 换人检测：证件号变化 = 真换人（非改错别字）→ 清除旧出行人残留的
       //        生日 / 护照 / 签证 / 出生地 / 票号 / 乘客级选项，避免新出行人套用前一个人的证件与状态。
       //        「除非请求同时提供了新值」：上面已按 input 赋过新值的字段（chineseName / gender /
@@ -13932,6 +13975,28 @@ export class OrderService {
       if (input.bedPref !== undefined) data.bedPref = input.bedPref;
       if (input.upgradeRedeemLeg !== undefined) data.upgradeRedeemLeg = input.upgradeRedeemLeg;
       if (input.upgradeRedeemNote !== undefined) data.upgradeRedeemNote = input.upgradeRedeemNote;
+
+      // ── 姓/名 拼出来与全名对不上：不拒绝（存量有合法不规则姓名），只记 WARNING 审计留痕，
+      //    方便以后清查（票务/签证包按姓/名出，订单列表按全名显示，两边对不上会错名开票）。
+      const nameMismatch = detectPassengerNameMismatch(input);
+      if (nameMismatch) {
+        await writeAuditWithinTx(tx, {
+          actor: { userId: requester.userId, role: requester.role },
+          action: 'PASSENGER_NAME_MISMATCH',
+          targetType: AuditTargetType.TRAVELER,
+          targetId: passengerId,
+          targetLabel: `${passenger.fullName ?? ''} · 改信息姓/名拼出来与全名不一致`,
+          after: {
+            orderId,
+            passengerId,
+            lastName: input.lastName,
+            firstName: input.firstName,
+            fullName: nameMismatch.fullName,
+            composedFullName: nameMismatch.composedFullName,
+          },
+          severity: AuditSeverity.WARNING,
+        });
+      }
 
       // 出行人类型服务端权威重派生 —— 与换人 1b2 同一口径（建单 passengerToData 也走它）。
       // 回退口径：已有的旧类型 > 兜底成人（同一人只是订正生日，不该把儿童/婴儿丢回成人）。

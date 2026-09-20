@@ -32,6 +32,11 @@ import {
   type RoomingPassenger,
 } from '../components/RoomingEditor';
 import { passengerDisplayName } from '../lib/passengerDisplayName';
+import {
+  composePassengerFullName,
+  normalizePassengerFullName,
+  splitPassengerFullName,
+} from '../lib/passengerName';
 import { travelerProfileLinkProps, TRAVELER_PROFILE_LINK_TITLE } from '../lib/travelerProfileLink';
 import { HotelSwapModal } from '../components/HotelSwapModal';
 import { SplitOrderModal } from '../components/SplitOrderModal';
@@ -12750,6 +12755,23 @@ function PassengerEditForm({
   const [submitting, setSubmitting] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
+  // 姓/名 拼出来与全名对不上的数据质量提示（不拦截，见 detectPassengerNameMismatch 同款口径）：
+  // 只在姓、名都填了才判定——缺一项谈不上「拼出来」；全名留空也不判（此时没有可比对的权威值）。
+  // 票务/签证包出单按姓/名拼接、订单列表按全名显示，两边一旦不一致，导出的姓名会跟系统里看到的对不上。
+  const nameMismatch = useMemo(() => {
+    const l = lastName.trim();
+    const f = firstName.trim();
+    const full = fullName.trim();
+    if (!l || !f || !full) return null;
+    const composed = composePassengerFullName(l, f);
+    const normalizedFull = normalizePassengerFullName(full);
+    if (!composed || composed === normalizedFull) return null;
+    return { composed, normalizedFull };
+  }, [lastName, firstName, fullName]);
+  const nameMismatchWarningText = nameMismatch
+    ? `姓/名拼出来是 ${nameMismatch.composed}，与全名「${nameMismatch.normalizedFull}」不一致；票务、签证包按姓/名出，订单列表按全名显示。`
+    : '';
+
   // 换人费标准（预填选项，如 [450, 550]）：ADMIN 在「换人费标准」里配，这里只读取。
   // 加载完成前用固定默认兜底，避免请求慢时快捷选项一闪而空。
   const [feeOptions, setFeeOptions] = useState<number[]>([450, 550]);
@@ -13071,7 +13093,9 @@ function PassengerEditForm({
       highRiskConfirmRef.current = true;
       if (!(await confirm({
         title: '确认保存出行人信息修正？',
-        body: '不会清除护照照片和签证信息。',
+        body: nameMismatchWarningText
+          ? `不会清除护照照片和签证信息。${nameMismatchWarningText}确认要保持这个不一致继续保存吗？`
+          : '不会清除护照照片和签证信息。',
       }))) {
         highRiskConfirmRef.current = false;
         return;
@@ -13110,11 +13134,12 @@ function PassengerEditForm({
           ? swapRepriceDeltaText(swapPreview.basisCny ?? swapPreview.oldShareCny, swapPreview.newSettlementCny, swapPreview.diffCny)
           : null;
       const diffText = swapDeltaText ? `，${swapDeltaText}` : '';
+      const mismatchSuffix = nameMismatchWarningText ? ` ${nameMismatchWarningText}` : '';
       if (!(await confirm({
         title: '确认换人？',
         body: isAgentUser
-          ? `证件号已变更，原出行人的护照/签证信息（护照照片、签发地、有效期、签证号等）将被清除，仅保留本次填写的新值。系统将自动重置签证进度，${feeText}${diffText}。此操作会记入审计。`
-          : `证件号已变更，原出行人的护照/签证信息（护照照片、签发地、有效期、签证号等）将被清除，仅保留本次填写的新值。${feeText}${diffText}。此操作会记入审计。`,
+          ? `证件号已变更，原出行人的护照/签证信息（护照照片、签发地、有效期、签证号等）将被清除，仅保留本次填写的新值。系统将自动重置签证进度，${feeText}${diffText}。此操作会记入审计。${mismatchSuffix}`
+          : `证件号已变更，原出行人的护照/签证信息（护照照片、签发地、有效期、签证号等）将被清除，仅保留本次填写的新值。${feeText}${diffText}。此操作会记入审计。${mismatchSuffix}`,
         tone: 'danger',
       }))) {
         highRiskConfirmRef.current = false;
@@ -13124,8 +13149,8 @@ function PassengerEditForm({
       if (!(await confirm({
         title: '确认保存出行人改动？',
         body: isAgentUser
-          ? '此操作会记入审计。'
-          : '如勾选了重置开票/签证将清除对应状态。',
+          ? `此操作会记入审计。${nameMismatchWarningText}`
+          : `如勾选了重置开票/签证将清除对应状态。${nameMismatchWarningText}`,
         tone: 'danger',
       }))) {
         highRiskConfirmRef.current = false;
@@ -13243,18 +13268,59 @@ function PassengerEditForm({
       <div className="grid grid-cols-2 gap-2">
         <label className="block">
           <span className="text-slate-500">姓（Last）</span>
-          <input className={inputCls} value={lastName} onChange={(e) => setLastName(e.target.value)} />
+          <input
+            className={`${inputCls} ${nameMismatch ? 'border-amber-400' : ''}`}
+            value={lastName}
+            onChange={(e) => setLastName(e.target.value)}
+          />
         </label>
         <label className="block">
           <span className="text-slate-500">名（First）</span>
-          <input className={inputCls} value={firstName} onChange={(e) => setFirstName(e.target.value)} />
+          <input
+            className={`${inputCls} ${nameMismatch ? 'border-amber-400' : ''}`}
+            value={firstName}
+            onChange={(e) => setFirstName(e.target.value)}
+          />
         </label>
       </div>
 
       <label className="block">
         <span className="text-slate-500">全名</span>
-        <input className={inputCls} value={fullName} onChange={(e) => setFullName(e.target.value)} placeholder="如未拆姓/名可直接填全名" />
+        <input
+          className={`${inputCls} ${nameMismatch ? 'border-amber-400' : ''}`}
+          value={fullName}
+          onChange={(e) => setFullName(e.target.value)}
+          placeholder="如未拆姓/名可直接填全名"
+        />
       </label>
+
+      {/* 姓/名 拼出来与全名对不上：不拦截（存量有合法不规则姓名），只提示 + 保存前二次确认——
+          票务/签证包按姓/名出，订单列表按全名显示，两边不一致会导致导出的姓名与系统里看到的对不上。 */}
+      {nameMismatch && (
+        <div className="space-y-1 rounded border border-amber-300 bg-amber-50 p-2 text-[11px] text-amber-800">
+          <p>{nameMismatchWarningText}</p>
+          <div className="flex flex-wrap gap-1.5">
+            <button
+              type="button"
+              className="rounded border border-amber-400 bg-white px-2 py-0.5 font-medium text-amber-700 hover:bg-amber-100"
+              onClick={() => setFullName(nameMismatch.composed)}
+            >
+              按姓/名同步全名
+            </button>
+            <button
+              type="button"
+              className="rounded border border-amber-400 bg-white px-2 py-0.5 font-medium text-amber-700 hover:bg-amber-100"
+              onClick={() => {
+                const { lastName: splitLast, firstName: splitFirst } = splitPassengerFullName(fullName);
+                setLastName(splitLast);
+                setFirstName(splitFirst);
+              }}
+            >
+              按全名拆回姓/名
+            </button>
+          </div>
+        </div>
+      )}
 
       <label className="block">
         <span className="text-slate-500">中文姓名（选填）</span>
