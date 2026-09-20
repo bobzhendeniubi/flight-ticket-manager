@@ -27,6 +27,7 @@ import {
   type OrderForTemplateExport,
 } from './orders.export-templates.js';
 import { extFromUrl, fetchPhoto, sanitize } from './passport-zip.js';
+import { fetchOrdersInChunks } from './orders.export-fetch.js';
 
 /** 签证名单口径：退款申请中的订单已释放应出行名单，不再导出。*/
 const COUNTED_STATUSES: OrderStatus[] = [
@@ -122,7 +123,9 @@ export async function queryOrdersByIdsForVisa(
   client: PrismaClient = defaultPrisma,
 ): Promise<OrderForTemplateExport[]> {
   if (orderIds.length === 0) return [];
-  return (await client.order.findMany({
+  // 与三模板/全岗总表同款分批取数（见 orders.export-fetch.ts）：复用的是同一份七层嵌套
+  // include，勾选一整月的单同样会撞 napi 单字符串上限，一并收口。
+  return await fetchOrdersInChunks<OrderForTemplateExport>(client, {
     where: {
       deletedAt: null, // 排除已软删订单
       id: { in: orderIds },
@@ -155,7 +158,7 @@ export async function queryOrdersByIdsForVisa(
         },
       },
     },
-  })) as OrderForTemplateExport[];
+  });
 }
 
 /**

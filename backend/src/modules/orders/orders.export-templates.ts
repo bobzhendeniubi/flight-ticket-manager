@@ -33,6 +33,7 @@ import {
 // groupPassengerAdjustments：按乘客调价分组的唯一口径（与订单详情页金额明细同源）。
 import { GUEST_RECORDED_BY_LABEL, groupPassengerAdjustments } from './orders.service.js';
 import { buildExportOrderWhere, filterExportOrders } from './orders.export-selection.js';
+import { fetchOrdersInChunks } from './orders.export-fetch.js';
 import { formatOrderLegStatus } from './orders.leg-status.js';
 import { determineFlightLegs } from './ticketing-cap.js';
 import {
@@ -1385,7 +1386,9 @@ export async function buildOrderTemplateExportWorkbook(
         : undefined,
   });
 
-  const fetched = (await client.order.findMany({
+  // 分批取数（见 orders.export-fetch.ts）：整月的七层嵌套结果一次裸查会撞 napi 单字符串
+  // 上限、整个导出 500。where / orderBy / include 与原来一字不差。
+  const fetched = await fetchOrdersInChunks<OrderForTemplateExport>(client, {
     where,
     // 名单按录入倒序（最新录入在最上），对标旧系统
     orderBy: { createdAt: 'desc' },
@@ -1412,7 +1415,7 @@ export async function buildOrderTemplateExportWorkbook(
         },
       },
     },
-  })) as OrderForTemplateExport[];
+  });
 
   // 内存精筛（出行/返程/航班日期、航班号×日期绑定、单程/往返）—— 取数 where 的日期条件
   // 故意宽召回（±1 天），加上「关联行 ≥ 2 条」Prisma 表达不了，都在这里按与列表 listOrders

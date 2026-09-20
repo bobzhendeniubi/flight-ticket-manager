@@ -38,6 +38,26 @@ import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 const D = (s: string): Date => new Date(s.length <= 10 ? `${s}T00:00:00.000Z` : `${s}Z`);
 
 /**
+ * 假 client 的 order.findMany —— 按 where 形态分流三种调用（缺一种分批取数就取不回单）：
+ *   1) 盘点 id：导出筛选 where + select:{id}，分批取数的第一步 → 返回全量 orders；
+ *   2) 按 id 取实体：where.id.in 是某一批 id，分批取数的第二步 → 只返回该批命中的 orders；
+ *   3) 飞行次数现算兜底：where.passengers.some → 交给 onLiveFallback（缺省空）。
+ * 第 2 种按 id 真过滤（不是无脑返回全量），分批与重排口径才真的被测到。
+ */
+function fakeOrderFindMany(
+  orders: OrderForTemplateExport[],
+  onLiveFallback: () => unknown[] = () => [],
+): ReturnType<typeof vi.fn> {
+  return vi.fn(async (args?: { where?: Record<string, unknown> }) => {
+    const where = args?.where ?? {};
+    if (where.passengers) return onLiveFallback();
+    const idIn = (where.id as { in?: string[] } | undefined)?.in;
+    if (idIn) return orders.filter((o) => idIn.includes(o.id));
+    return orders;
+  });
+}
+
+/**
  * 《全岗可用》模版 59 列表头（叶子列；末尾三列并入「订单成本」分组）。
  * 定金组四列已移除：系统无定金模型，四列恒空，且现行模版本身已删除该组。
  * 「纯拼音名」为旧模版之外新增：无 MR/MS 称谓的 LAST/FIRST，财务对数/名单匹配用。
@@ -989,7 +1009,7 @@ describe('《签证专用》visa 行 — 签证公司列', () => {
 // 与样例一致，本批只去掉加粗/底色/居中换行等装饰；《签证专用》表头样式不受影响。
 describe('《票务专用》ticketing 工作簿 — 朴素样式对齐原版样例', () => {
   function fakeClient(orders: OrderForTemplateExport[]): PrismaClient {
-    return { order: { findMany: vi.fn().mockResolvedValue(orders) } } as unknown as PrismaClient;
+    return { order: { findMany: fakeOrderFindMany(orders) } } as unknown as PrismaClient;
   }
 
   async function loadTicketingSheet(): Promise<ExcelJS.Worksheet> {
@@ -1106,9 +1126,7 @@ describe('buildOrderTemplateExportWorkbook 飞行次数取数', () => {
     legacyFindMany: ReturnType<typeof vi.fn>;
   } {
     const profileFindMany = vi.fn().mockResolvedValue(profiles);
-    const orderFindMany = vi.fn(async (args?: { where?: Record<string, unknown> }) =>
-      args?.where?.passengers ? live.orders ?? [] : orders,
-    );
+    const orderFindMany = fakeOrderFindMany(orders, () => live.orders ?? []);
     const legacyFindMany = vi.fn().mockResolvedValue(live.tickets ?? []);
     const client = {
       order: { findMany: orderFindMany },
@@ -1169,8 +1187,19 @@ describe('buildOrderTemplateExportWorkbook 飞行次数取数', () => {
     expect(profileFindMany).toHaveBeenCalledTimes(1);
     const or = profileFindMany.mock.calls[0][0].where.OR as { documentNumber: { equals: string } }[];
     expect(or.map((c) => c.documentNumber.equals).sort()).toEqual(['E87654321', 'EN7208993']);
-    // 两位乘客都没档案 → 现算兜底也是批量：导出自己的取数 1 次 + 兜底订单查询 1 次
-    expect(orderFindMany).toHaveBeenCalledTimes(2);
+    // 两位乘客都没档案 → 现算兜底也是批量。order.findMany 的每次调用逐形态锁死，
+    // 保证「不随乘客数增长」：导出取数 = 盘点 id 1 次 + 分批取实体 1 次（单张单 = 单批），
+    // 加上现算兜底 1 次，一共 3 次；绝不是一行一查。
+    const wheres = orderFindMany.mock.calls.map(
+      (call: unknown[]) => (call[0] as { where?: Record<string, unknown> }).where ?? {},
+    );
+    expect(wheres).toHaveLength(3);
+    // 盘点 id：导出筛选本身，既不带 passengers 也不带 id.in
+    expect(wheres.filter((w) => !w.passengers && !w.id)).toHaveLength(1);
+    // 分批取实体：按 id 切片，单张单只切出一批
+    expect(wheres.filter((w) => (w.id as { in?: string[] } | undefined)?.in)).toHaveLength(1);
+    // 飞行次数现算兜底
+    expect(wheres.filter((w) => w.passengers)).toHaveLength(1);
     expect(legacyFindMany).toHaveBeenCalledTimes(1);
   });
 
@@ -1189,7 +1218,7 @@ describe('buildOrderTemplateExportWorkbook 飞行次数取数', () => {
 // 取数 where 宽召回会把它带进「07-14」的窗口（返程段命中），导出层须按整单出发日剔除。
 describe('buildOrderTemplateExportWorkbook 出发日精确细筛', () => {
   function fakeClient(orders: OrderForTemplateExport[]): PrismaClient {
-    return { order: { findMany: vi.fn().mockResolvedValue(orders) } } as unknown as PrismaClient;
+    return { order: { findMany: fakeOrderFindMany(orders) } } as unknown as PrismaClient;
   }
 
   /** 加载 xlsx，返回指定 sheet 的数据行数（扣除表头）。*/
@@ -1592,9 +1621,7 @@ describe('代理导出（agentScope 非空）— 三模板按共享脱敏政策�
   function fakeClient(orders: OrderForTemplateExport[]): PrismaClient {
     return {
       order: {
-        findMany: vi.fn(async (args?: { where?: Record<string, unknown> }) =>
-          args?.where?.passengers ? [] : orders,
-        ),
+        findMany: fakeOrderFindMany(orders),
       },
       legacyTicket: { findMany: vi.fn().mockResolvedValue([]) },
       travelerProfile: {
@@ -1734,9 +1761,7 @@ describe('代理导出（agentScope 非空）— 三模板按共享脱敏政策�
       ): PrismaClient {
         return {
           order: {
-            findMany: vi.fn(async (args?: { where?: Record<string, unknown> }) =>
-              args?.where?.passengers ? [] : orders,
-            ),
+            findMany: fakeOrderFindMany(orders),
           },
           sharedRoomMember: { findMany: vi.fn().mockResolvedValue(partnerRows) },
           legacyTicket: { findMany: vi.fn().mockResolvedValue([]) },

@@ -21,6 +21,7 @@ import {
   type OrderListFilters,
 } from './orders.service.js';
 import { earliestFlightDeparture } from './pnr-export.js';
+import { fetchOrdersInChunks } from './orders.export-fetch.js';
 
 /** 运营进单统计：退款申请中的订单已释放库存，不再计入。*/
 const COUNTED_STATUSES: OrderStatus[] = [
@@ -177,7 +178,9 @@ export async function buildIntakeExportWorkbook(
   and.push({ status: { in: COUNTED_STATUSES } });
   where.AND = and;
 
-  const orders = (await client.order.findMany({
+  // 与三模板/全岗总表同款分批取数（见 orders.export-fetch.ts）：本表 include 较浅，
+  // 但同样是「一次裸查整月」的形态，一并收口，不再有第二处会撞 napi 上限的取数。
+  const orders = await fetchOrdersInChunks<OrderForIntakeExport>(client, {
     where: applyExportAgentScope(where, opts?.agentScope),
     include: {
       passengers: { select: { id: true } },
@@ -192,7 +195,7 @@ export async function buildIntakeExportWorkbook(
         },
       },
     },
-  })) as OrderForIntakeExport[];
+  });
 
   const rows = aggregateIntakeRows(orders);
 

@@ -28,6 +28,7 @@ import { businessDateTime } from '../../lib/business-time.js';
 import type { PrismaClient } from '@prisma/client';
 import { Prisma } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import { fetchOrdersInChunks } from './orders.export-fetch.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats.js';
 import type { TripStatsMap } from './orders.export-trip-stats.js';
@@ -921,11 +922,13 @@ export async function buildMasterExportWorkbook(
     { agentScope: opts?.agentScope },
   );
 
-  const fetched = (await client.order.findMany({
+  // 分批取数（见 orders.export-fetch.ts）：整月的七层嵌套结果一次裸查会撞 napi 单字符串
+  // 上限、整个导出 500。where / orderBy / include 与原来一字不差。
+  const fetched = await fetchOrdersInChunks<OrderForMasterExport>(client, {
     where,
     orderBy: { createdAt: 'desc' },
     include: MASTER_EXPORT_INCLUDE,
-  })) as OrderForMasterExport[];
+  });
 
   // 内存精筛（出行/返程/航班日期、航班号×日期绑定、单程/往返）—— 取数 where 的日期条件
   // 故意宽召回（±1 天 + 命中任意航段/入住日），会把返程日或邻日落在窗口内、但整单出发日

@@ -329,19 +329,35 @@ describe('buildVisaBundleXlsx — 签证岗样表排版（列头/边框/斑马�
 
 describe('queryOrdersByIdsForVisa — 按 id 选单', () => {
   it('按订单 id 列表取单，软删排除；状态过滤不在这里做', async () => {
-    const findMany = vi.fn().mockResolvedValue([]);
+    // 取数是分批的（orders.export-fetch.ts）：第一步只盘点 id，第二步按 id 切片取实体。
+    // 筛选口径（软删排除 / 不加 status）落在第一步，所以断言认准第一步那次调用。
+    const findMany = vi.fn(async (args?: { where?: { id?: { in?: string[] } } }) =>
+      args?.where?.id?.in?.map((id) => ({ id })) ?? [],
+    );
     const client = { order: { findMany } } as unknown as Parameters<
       typeof queryOrdersByIdsForVisa
     >[1];
 
     await queryOrdersByIdsForVisa(['id_a', 'id_b'], client);
 
-    expect(findMany).toHaveBeenCalledTimes(1);
-    const arg = findMany.mock.calls[0][0];
-    expect(arg.where.id.in).toEqual(['id_a', 'id_b']);
-    expect(arg.where.deletedAt).toBeNull();
+    // 盘点 id 1 次 + 取实体 1 次（两张单 = 单批）
+    expect(findMany).toHaveBeenCalledTimes(2);
+    interface FindManyCall {
+      where: { id: { in: string[] }; deletedAt?: Date | null; status?: unknown };
+      select?: Record<string, boolean>;
+      include?: Record<string, unknown>;
+    }
+    const calls = findMany.mock.calls.map((c) => c[0] as FindManyCall);
+    const idPass = calls[0] as FindManyCall;
+    const entityPass = calls[1] as FindManyCall;
+    expect(idPass.where.id.in).toEqual(['id_a', 'id_b']);
+    expect(idPass.where.deletedAt).toBeNull();
     // 状态过滤放到 partitionOrdersForVisa（名单/护照包共用），这里不加 status 条件（否则不合格单查不回来）
-    expect(arg.where.status).toBeUndefined();
+    expect(idPass.where.status).toBeUndefined();
+    expect(idPass.select).toEqual({ id: true });
+    // 第二步只按 id 取，带回完整 include（签证名单要用到乘客/行项/履约任务）
+    expect(entityPass.where.id.in).toEqual(['id_a', 'id_b']);
+    expect(entityPass.include?.passengers).toBe(true);
   });
 
   it('空 id 列表 → 短路，不查库', async () => {
