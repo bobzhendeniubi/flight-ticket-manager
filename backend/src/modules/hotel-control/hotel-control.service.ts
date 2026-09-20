@@ -179,7 +179,7 @@ export type RoomScope = { hotelId: string } | { randomStarTier: number };
  * 万一出现两列都有值的异常行，两边都把它算成具体酒店的占房，不会被重复计两次。
  * 具体酒店作用域天然不会命中占位酒店 —— 占位酒店不作为酒店组出现在销控板上。
  */
-function scopeItemWhere(scope: RoomScope): Prisma.OrderItemWhereInput {
+export function scopeItemWhere(scope: RoomScope): Prisma.OrderItemWhereInput {
   return 'hotelId' in scope
     ? { hotelRoomTypeId: { not: null }, hotelRoomType: { hotelId: scope.hotelId } }
     : {
@@ -1094,11 +1094,22 @@ interface SharedRoomPhysicalRow {
   members: Array<{ order: { status: OrderStatus; deletedAt: Date | null } }>;
 }
 
+/**
+ * 共享房表的作用域过滤（与 RoomScope 同形）：酒店房按 hotelId；档次房（2026-09-20 起，
+ * 随机档未落位的单跨单合住）按 randomStarTier。两种形态在表里互斥（迁移 CHECK 约束），
+ * 一个作用域永远只命中自己那一类，不会把档次房算进某家酒店、也不会把酒店房算进随机池。
+ */
+export function sharedRoomScopeWhere(scope: RoomScope): { hotelId: string } | { randomStarTier: number } {
+  return 'hotelId' in scope ? { hotelId: scope.hotelId } : { randomStarTier: scope.randomStarTier };
+}
+
 export async function computeSharedRoomPhysicalByDate(
-  hotelId: string,
+  scope: string | RoomScope,
   dates: readonly string[],
   client: HotelControlDbClient = defaultPrisma,
 ): Promise<number[]> {
+  // 兼容既有按 hotelId 字符串调用；随机档传 { randomStarTier }（档次房去重口径与酒店房完全一样）。
+  const roomScope: RoomScope = typeof scope === 'string' ? { hotelId: scope } : scope;
   const out = new Array<number>(dates.length).fill(0);
   if (dates.length === 0) return out;
   const fromD = toDateOnly(dates[0]);
@@ -1124,7 +1135,7 @@ export async function computeSharedRoomPhysicalByDate(
 
   const rooms = await delegate.findMany({
     where: {
-      hotelId,
+      ...sharedRoomScopeWhere(roomScope),
       status: 'ACTIVE',
       checkIn: { lte: toD },
       checkOut: { gt: fromD },
@@ -1141,17 +1152,90 @@ export async function computeSharedRoomPhysicalByDate(
   });
 
   for (const room of rooms) {
-    const hasValidMember = room.members.some(
-      (m) => m.order.deletedAt == null && COUNTED_STATUSES.includes(m.order.status),
-    );
-    if (!hasValidMember) continue;
-    const checkIn = fmtDateOnly(room.checkIn);
-    const checkOut = fmtDateOnly(room.checkOut);
-    for (let i = 0; i < dates.length; i++) {
-      if (checkIn <= dates[i] && dates[i] < checkOut) out[i] += 1;
-    }
+    if (!sharedRoomHasValidMember(room)) continue;
+    addNights(out, dates, room.checkIn, room.checkOut);
   }
   return out;
+}
+
+/** 共享房某段是否计物理占用：至少一名成员所属订单处于房控有效状态且未软删（§四）。*/
+function sharedRoomHasValidMember(room: SharedRoomPhysicalRow): boolean {
+  return room.members.some((m) => m.order.deletedAt == null && COUNTED_STATUSES.includes(m.order.status));
+}
+
+/** 把 [checkIn, checkOut) 覆盖到的每一晚 +1（半开区间，与 expandUsedByDate 同口径）。*/
+function addNights(out: number[], dates: readonly string[], checkInD: Date, checkOutD: Date): void {
+  const checkIn = fmtDateOnly(checkInD);
+  const checkOut = fmtDateOnly(checkOutD);
+  for (let i = 0; i < dates.length; i++) {
+    if (checkIn <= dates[i] && dates[i] < checkOut) out[i] += 1;
+  }
+}
+
+/**
+ * 销控板一次性拉全范围内的 ACTIVE 共享房，按作用域分桶后的逐晚去重物理间数：
+ * `byHotelId`（酒店房）与 `byTier`（档次房）。口径与 computeSharedRoomPhysicalByDate 完全一致，
+ * 只是一次查询喂整块看板，不逐酒店/逐档次各查一遍。
+ *
+ * 缺 sharedRoom delegate 的回落哲学同 computeSharedRoomPhysicalByDate（生产抛错、单测 mock 回落空桶）。
+ */
+export interface SharedRoomPhysicalBuckets {
+  byHotelId: Map<string, number[]>;
+  byTier: Map<number, number[]>;
+}
+
+export async function computeSharedRoomPhysicalBuckets(
+  dates: readonly string[],
+  client: HotelControlDbClient = defaultPrisma,
+): Promise<SharedRoomPhysicalBuckets> {
+  const buckets: SharedRoomPhysicalBuckets = { byHotelId: new Map(), byTier: new Map() };
+  if (dates.length === 0) return buckets;
+  const fromD = toDateOnly(dates[0]);
+  const toD = toDateOnly(dates[dates.length - 1]);
+  const delegate = (
+    client as unknown as {
+      sharedRoom?: {
+        findMany: (
+          args: unknown,
+        ) => Promise<Array<SharedRoomPhysicalRow & { hotelId: string | null; randomStarTier: number | null }>>;
+      };
+    }
+  ).sharedRoom;
+  if (!delegate) {
+    if (process.env.NODE_ENV === 'production') {
+      throw new Error('sharedRoom delegate missing on production client');
+    }
+    return buckets;
+  }
+  const rooms = await delegate.findMany({
+    where: { status: 'ACTIVE', checkIn: { lte: toD }, checkOut: { gt: fromD } },
+    select: {
+      hotelId: true,
+      randomStarTier: true,
+      checkIn: true,
+      checkOut: true,
+      members: { select: { order: { select: { status: true, deletedAt: true } } } },
+    },
+  });
+  for (const room of rooms) {
+    if (!sharedRoomHasValidMember(room)) continue;
+    if (room.hotelId != null) {
+      let arr = buckets.byHotelId.get(room.hotelId);
+      if (!arr) {
+        arr = new Array<number>(dates.length).fill(0);
+        buckets.byHotelId.set(room.hotelId, arr);
+      }
+      addNights(arr, dates, room.checkIn, room.checkOut);
+    } else if (room.randomStarTier != null) {
+      let arr = buckets.byTier.get(room.randomStarTier);
+      if (!arr) {
+        arr = new Array<number>(dates.length).fill(0);
+        buckets.byTier.set(room.randomStarTier, arr);
+      }
+      addNights(arr, dates, room.checkIn, room.checkOut);
+    }
+  }
+  return buckets;
 }
 
 /**
@@ -1813,16 +1897,18 @@ async function computeSharedRoomPhysicalAfterChange(
         .map((o) => o.sharedRoomId as string),
     ),
   ];
-  const hotelIdByRoomId = new Map<string, string>();
+  // hotelId 可空（档次房，2026-09-20 起）：查到 null 就是「不属于任何酒店」，与本次 hotelId
+  // 天然不等 → 下面 belongsToThisHotel 静默过滤掉，不会把档次房算进某家酒店的前瞻。
+  const hotelIdByRoomId = new Map<string, string | null>();
   if (lookupIds.length > 0 && delegate) {
     const rows = (await (
       delegate as unknown as {
-        findMany: (args: unknown) => Promise<Array<{ id: string; hotelId: string }>>;
+        findMany: (args: unknown) => Promise<Array<{ id: string; hotelId: string | null }>>;
       }
     ).findMany({
       where: { id: { in: lookupIds } },
       select: { id: true, hotelId: true },
-    })) as Array<{ id: string; hotelId: string }>;
+    })) as Array<{ id: string; hotelId: string | null }>;
     for (const r of rows) hotelIdByRoomId.set(r.id, r.hotelId);
   }
   const belongsToThisHotel = (o: SharedRoomAfterState): boolean => {
@@ -2205,6 +2291,66 @@ export async function assertRandomTierFit(
 }
 
 /**
+ * 随机档「变更前后」床位口径闸（跨单分房档次房保存专用，2026-09-20）。
+ *
+ * 随机池的占用口径是**床位/计费口径**：pendingUsed = Σ 未落位行的 roomsBilled（见
+ * getRandomTierAggregate / expandUsedByDate → itemRoomCount），不是共享房去重的物理口径。
+ * 档次共享房保存时 Σ份额=1 硬校验保证一间档次房的成员行 roomsBilled 合计恒为 1——
+ * 三张单合一间档次房在池里只占 1 间，与真酒店共享房在池 hotelUsed 项里的表现完全一致。
+ *
+ * 这里判的是「本次保存把受影响行的 roomsBilled 从旧值改成新值」之后，逐晚累计增量
+ * （delta = Σ新 − Σ旧）是否还装得下：delta ≤ 0 的夜晚永远放行（allowNonWorsening 同款
+ * 哲学——不能让与本次无关的存量超卖挡住运营的补救）；delta > 0 且该档 hasBlock 时按
+ * `remaining − delta < 0` 拒绝；整段没有包房（hasBlock=false）视为未纳管，不拦。
+ *
+ * 必须在事务里调用：先锁该档全部真酒店的包房周期行（lockRandomTierBlockPeriodsWithinTx），
+ * 再在同一事务里读聚合——与 assertHotelFitAfterChange 的锁序一致（Order → SharedRoom → 周期）。
+ */
+export interface RandomTierBilledDelta {
+  hotelCheckIn: Date | null;
+  hotelCheckOut: Date | null;
+  /** 该行 roomsBilled 变更后 − 变更前（床位口径，可为 0.5 步进的正负数）。*/
+  delta: number;
+}
+
+export async function assertRandomTierFitAfterChange(
+  tx: Prisma.TransactionClient,
+  tier: number,
+  nightDates: readonly string[],
+  args: { billedDeltas: readonly RandomTierBilledDelta[] },
+): Promise<void> {
+  if (nightDates.length === 0) return;
+  const deltaByNight = new Array<number>(nightDates.length).fill(0);
+  for (const d of args.billedDeltas) {
+    if (!d.hotelCheckIn || !d.hotelCheckOut || d.delta === 0) continue;
+    const checkIn = fmtDateOnly(d.hotelCheckIn);
+    const checkOut = fmtDateOnly(d.hotelCheckOut);
+    for (let i = 0; i < nightDates.length; i++) {
+      if (checkIn <= nightDates[i] && nightDates[i] < checkOut) deltaByNight[i] += d.delta;
+    }
+  }
+  const rounded = deltaByNight.map(round2);
+  if (rounded.every((v) => v <= 0)) return; // 没有任何一晚变差，不必锁周期、不必读聚合
+
+  await lockRandomTierBlockPeriodsWithinTx(tx, tier, nightDates);
+  const agg = await getRandomTierAggregate(tier, nightDates, {}, tx);
+  if (!agg.hasBlock) return; // 未纳入管控（房控哲学：未配包房 ≠ 售罄）
+  for (let i = 0; i < nightDates.length; i++) {
+    const delta = rounded[i];
+    if (delta <= 0) continue;
+    const block = agg.block[i] ?? 0;
+    if (block <= 0) continue; // 该晚未被任何周期覆盖 → 视为未管控
+    const remaining = agg.remaining[i] ?? 0;
+    const after = round2(remaining - delta);
+    if (after < 0) {
+      throw new BadRequestError(
+        `${randomStarTierLabel(tier)}余量不足（${nightDates[i]} 同星级酒店合计余量 ${remaining} 间，本次分房后需再占 ${delta} 间）`,
+      );
+    }
+  }
+}
+
+/**
  * 把「该随机档全部真酒店、覆盖 nightDates 区间」的包房周期行 `SELECT … FOR UPDATE`。
  * 是 `lockHotelBlockPeriodsWithinTx` 的聚合档版本 —— 随机档没有自己的周期表，它的库存
  * 由同星级真酒店（`randomTierOfHotel` 判定，排除国际五星与占位酒店）的周期聚合而来，
@@ -2421,10 +2567,16 @@ export async function getBoard(
     });
   }
 
-  /** 一组周期 + 占房行 → 销控板的一套逐日数列（酒店组与聚合组共用，不出现第二本账）。*/
+  // 共享房（跨单分房）逐晚去重物理间数，按酒店 / 档次分桶一次算好：带 sharedRoomId 的房组在
+  // expandAssignedPhysicalByDate 里一律跳过（见 groupSharedRoomId），不在这里补上，物理口径
+  // 就会把合住的房整间漏掉——酒店房漏在酒店行，档次房漏在随机池行，两边同一把尺补齐。
+  const sharedBuckets = await computeSharedRoomPhysicalBuckets(dates, client);
+
+  /** 一组周期 + 占房行（+ 该作用域的共享房去重物理量）→ 销控板的一套逐日数列（酒店组与聚合组共用，不出现第二本账）。*/
   const buildRows = (
     groupPeriods: typeof periods,
     groupItems: typeof items,
+    sharedPhysical: readonly number[] | undefined,
   ): HotelControlBoard['hotels'][number]['rows'] => {
     const block = expandBlockByDate(groupPeriods, dates);
     const used = expandUsedByDate(groupItems, dates);
@@ -2442,7 +2594,7 @@ export async function getBoard(
     // 物理房间口径（内存推导，无额外查库）：分房表直计 + 拆单配对 + fallback 性别推算
     const fallbackPhysical = computePhysicalUsed(expandUsedByDate(remainingItems, dates), buckets);
     const physicalUsed = fallbackPhysical.map((v, i) =>
-      round2(v + assignedPhysical[i] + pairedPhysical[i]),
+      round2(v + assignedPhysical[i] + pairedPhysical[i] + (sharedPhysical?.[i] ?? 0)),
     );
     return {
       block,
@@ -2467,7 +2619,7 @@ export async function getBoard(
         hotelName,
         randomStarTier: null as number | null,
         unitPrice: latestPriced ? round2(dec(latestPriced.unitPrice)!) : null,
-        rows: buildRows(groupPeriods, groupItems),
+        rows: buildRows(groupPeriods, groupItems, sharedBuckets.byHotelId.get(hotelId)),
         /** 该酒店归属的随机档（仅供下面聚合，不进对外 DTO）。*/
         randomTier,
       };
@@ -2507,7 +2659,9 @@ export async function getBoard(
     .sort((a, b) => a - b)
     .map((tier) => {
       const tierHotels = hotelGroups.filter((h) => h.randomTier === tier);
-      const pendingRows = buildRows([], pendingByTier.get(tier) ?? []);
+      // 档次房（随机档未落位的跨单合住）：成员行的 JSON 共享组被 expandAssignedPhysicalByDate
+      // 跳过，物理口径靠这里按档次分桶的去重量补回来（一间档次房恒 1 间，不看份额）。
+      const pendingRows = buildRows([], pendingByTier.get(tier) ?? [], sharedBuckets.byTier.get(tier));
       const sumAt = (pick: (h: (typeof tierHotels)[number]) => number[]) => (i: number) =>
         tierHotels.reduce((sum, h) => sum + (pick(h)[i] ?? 0), 0);
       const blockAt = sumAt((h) => h.rows.block);
@@ -2593,7 +2747,11 @@ export interface HotelControlAlerts {
    */
   sharedRoomOrphaned: Array<{
     sharedRoomId: string;
-    hotelId: string;
+    /** 酒店房的酒店 id；档次房（随机档待落位的跨单合住）为 null，此时看 randomStarTier。*/
+    hotelId: string | null;
+    /** 档次房的档次；酒店房为 null。*/
+    randomStarTier: number | null;
+    /** 酒店名；档次房给「X星随机」。*/
     hotelName: string;
     checkIn: string; // YYYY-MM-DD
     checkOut: string; // YYYY-MM-DD
@@ -2772,7 +2930,8 @@ export async function getAlerts(
         findMany: (args: unknown) => Promise<
           Array<{
             id: string;
-            hotelId: string;
+            hotelId: string | null;
+            randomStarTier: number | null;
             hotel: { name: string } | null;
             checkIn: Date;
             checkOut: Date;
@@ -2795,6 +2954,7 @@ export async function getAlerts(
       select: {
         id: true,
         hotelId: true,
+        randomStarTier: true,
         hotel: { select: { name: true } },
         checkIn: true,
         checkOut: true,
@@ -2817,7 +2977,9 @@ export async function getAlerts(
       sharedRoomOrphaned.push({
         sharedRoomId: room.id,
         hotelId: room.hotelId,
-        hotelName: room.hotel?.name ?? '',
+        randomStarTier: room.randomStarTier,
+        hotelName:
+          room.hotel?.name ?? (room.randomStarTier != null ? randomStarTierLabel(room.randomStarTier) : ''),
         checkIn: fmtDateOnly(room.checkIn),
         checkOut: fmtDateOnly(room.checkOut),
         memberOrderNumbers: [...new Set(activeMembers.map((m) => m.order.orderNumber))].sort(),
@@ -3118,9 +3280,9 @@ export interface HotelOccupantDto {
   checkOut: string; // YYYY-MM-DD（该行退房日）
   agentName: string; // 无代理 = '直客'
   /**
-   * 跨单分房下钻（§十一）：该单在本次查询 scope（酒店 + 该晚）内参与的 ACTIVE 共享房去重数
-   * （SharedRoomMember 按 sharedRoomId 去重；仅 hotelId 作用域有意义，随机档恒为 0——共享房
-   * 只允许真实酒店真实房型）。同一订单在本次结果里出现多行时，三列取的是**整单**口径，
+   * 跨单分房下钻（§十一）：该单在本次查询 scope（酒店或随机档 + 该晚）内参与的 ACTIVE 共享房
+   * 去重数（SharedRoomMember 按 sharedRoomId 去重；酒店作用域数酒店房，随机档作用域数档次房——
+   * 2026-09-20 起随机档未落位的单也能跨单合住）。同一订单在本次结果里出现多行时，三列取的是**整单**口径，
    * 每行重复展示同一个数字（与 rooms 逐行不同）。
    */
   sharedRoomCount: number;
@@ -3189,12 +3351,13 @@ export async function getOccupyingOrders(
   for (const it of items) {
     billedByOrder.set(it.order.id, round2((billedByOrder.get(it.order.id) ?? 0) + itemRoomCount(it)));
   }
-  // 参与共享房数：查 SharedRoomMember，按 (hotelId, ACTIVE, checkIn<=该晚<checkOut) 过滤，
-  // 只对 hotelId 作用域有意义（随机档/占位酒店不接受共享房，见 §四）。防御式：单测常用只 mock
-  // orderItem 的 client，没有 sharedRoomMember 委托时按「本环境不支持共享房」回落 0（同
-  // computeSharedRoomPhysicalByDate 的兜底哲学），不抛错。
+  // 参与共享房数：查 SharedRoomMember，按 (作用域, ACTIVE, checkIn<=该晚<checkOut) 过滤——
+  // 酒店作用域按 hotelId 命中酒店房，随机档作用域按 randomStarTier 命中档次房（2026-09-20 起
+  // 随机档未落位的单也能跨单合住）。防御式：单测常用只 mock orderItem 的 client，没有
+  // sharedRoomMember 委托时按「本环境不支持共享房」回落 0（同 computeSharedRoomPhysicalByDate
+  // 的兜底哲学），不抛错。
   const sharedRoomsByOrder = new Map<string, Set<string>>();
-  if ('hotelId' in roomScope) {
+  {
     const delegate = (
       client as unknown as {
         sharedRoomMember?: {
@@ -3208,7 +3371,7 @@ export async function getOccupyingOrders(
         where: {
           orderId: { in: orderIds },
           sharedRoom: {
-            hotelId: roomScope.hotelId,
+            ...sharedRoomScopeWhere(roomScope),
             status: 'ACTIVE',
             checkIn: { lte: d },
             checkOut: { gt: d },

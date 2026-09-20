@@ -17,8 +17,13 @@ import {
   api,
   ApiError,
   hotelControlOpsApi,
+  poolOptionValue,
+  poolTierFromOptionValue,
+  randomStarTierLabel,
+  RANDOM_STAR_TIERS,
   type Hotel,
   type OrderStatus,
+  type RandomStarTier,
   type SaveSharedRoomsBody,
   type SharedRoomWorkbench as SharedRoomWorkbenchData,
   type SharedRoomWorkbenchOrder,
@@ -37,6 +42,8 @@ import {
 } from '../lib/shared-room-rules';
 
 const HALF_STEP = 0.5;
+/** 档次房（随机档待落位）的容量提示阈值——镜像后端 TIER_ROOM_DEFAULT_CAPACITY，落位后按真实房型容量。 */
+const TIER_ROOM_DEFAULT_CAPACITY = 2;
 
 // ── 工具 ─────────────────────────────────────────────────────────────────
 function newId(): string {
@@ -136,7 +143,7 @@ function seedDraftRooms(data: SharedRoomWorkbenchData): DraftRoom[] {
     draftId: r.sharedRoomId,
     sharedRoomId: r.sharedRoomId,
     version: r.version,
-    hotelRoomTypeId: r.hotelRoomTypeId,
+    hotelRoomTypeId: r.hotelRoomTypeId ?? '', // 档次房没有房型（null）→ 空串，保存时不带这个字段
     notes: r.notes ?? '',
     // groupsFromMembers 不知道订单号（只按 members 的 orderId/orderItemId 分组），这里补上
     // 展示用的 orderNumber——不参与保存 payload，也不参与 B2/B6 的「原始态」diff 比较。
@@ -152,6 +159,8 @@ function seedDraftRooms(data: SharedRoomWorkbenchData): DraftRoom[] {
 
 export interface SharedRoomWorkbenchSeed {
   hotelId?: string;
+  /** 非空 = 打开随机池作用域（档次房：随机档待落位的单跨单合住），优先于 hotelId。 */
+  randomStarTier?: RandomStarTier;
   /** YYYY-MM-DD */
   checkIn?: string;
   /** YYYY-MM-DD */
@@ -224,22 +233,39 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     };
   }, [token]);
 
-  const [hotelId, setHotelId] = useState<string>(seed?.hotelId ?? '');
+  // 作用域：真实酒店 id，或随机池哨兵值 poolOptionValue(tier)（与录单酒店下拉同一套哨兵）——
+  // 酒店房 vs 档次房二选一，与后端 workbench/save 的 hotelId | randomStarTier 一一对应。
+  const [scopeValue, setScopeValue] = useState<string>(
+    seed?.randomStarTier != null ? poolOptionValue(seed.randomStarTier) : (seed?.hotelId ?? ''),
+  );
+  const randomStarTier = poolTierFromOptionValue(scopeValue);
+  const isTierMode = randomStarTier != null;
+  const hotelId = isTierMode ? '' : scopeValue;
   const [checkIn, setCheckIn] = useState<string>(seed?.checkIn ?? todayStr());
   const [checkOut, setCheckOut] = useState<string>(seed?.checkOut ?? plusDaysStr(checkIn, 1));
+  // 缺口 B：左侧乘客池按姓名/中文名/订单号客户端过滤——纯前端筛选，不改后端查询范围。
+  const [poolQuery, setPoolQuery] = useState('');
 
-  // 酒店清单到货后，若还没选酒店，用 seed 命中的那家或第一家兜底。
+  // 酒店清单到货后，若还没选作用域，用 seed 命中的那家或第一家兜底（随机池种子在初值里已选中）。
   useEffect(() => {
-    if (hotelId || hotels.length === 0) return;
+    if (scopeValue || hotels.length === 0) return;
     const fromSeed = seed?.hotelId && hotels.some((h) => h.id === seed.hotelId) ? seed.hotelId : null;
-    setHotelId(fromSeed ?? hotels[0].id);
+    setScopeValue(fromSeed ?? hotels[0].id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [hotels]);
 
+  // 档次房没有房型可选（随机档还没落位），房型下拉为空；落位走「整房落位」。
   const roomTypeOptions = useMemo(
-    () => hotels.find((h) => h.id === hotelId)?.roomTypes ?? [],
-    [hotels, hotelId],
+    () => (isTierMode ? [] : (hotels.find((h) => h.id === hotelId)?.roomTypes ?? [])),
+    [hotels, hotelId, isTierMode],
   );
+  // 整房落位面板：只对已保存的档次房开放；目标只能是星级不低于档次的真实酒店（后端同样校验）。
+  const placementHotels = useMemo(
+    () => (isTierMode ? hotels.filter((h) => h.starRating >= randomStarTier) : []),
+    [hotels, isTierMode, randomStarTier],
+  );
+  const [placing, setPlacing] = useState<{ draftId: string; hotelId: string; hotelRoomTypeId: string } | null>(null);
+  const [placingBusy, setPlacingBusy] = useState(false);
 
   const [wb, setWb] = useState<SharedRoomWorkbenchData | null>(null);
   const [rooms, setRooms] = useState<DraftRoom[]>([]);
@@ -254,7 +280,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
   // load() 重拉工作台会清空，只在「刚保存完」这一刻提醒运营去看。
   const [orphanedRoomIds, setOrphanedRoomIds] = useState<Set<string>>(new Set());
 
-  const canQuery = Boolean(hotelId && checkIn && checkOut && checkIn < checkOut);
+  const canQuery = Boolean(scopeValue && checkIn && checkOut && checkIn < checkOut);
 
   // 注意：load 本身不清 saveErr/saveOk——保存成功后 handleSave 会调 load() 重拉落地状态，
   // 若这里顺手清掉 saveOk，刚设好的「已保存」提示会在同一拍被冲掉，用户永远看不到。
@@ -264,12 +290,17 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     setLoading(true);
     setLoadErr(null);
     hotelControlOpsApi
-      .getSharedRoomWorkbench(token, { hotelId, checkIn, checkOut })
+      .getSharedRoomWorkbench(token, {
+        ...(randomStarTier != null ? { randomStarTier } : { hotelId }),
+        checkIn,
+        checkOut,
+      })
       .then((data) => {
         setWb(data);
         setRooms(seedDraftRooms(data));
         setDissolvedVersions(new Map());
         setOrderItemChoice({});
+        setPlacing(null);
       })
       .catch((e: unknown) => {
         setWb(null);
@@ -277,13 +308,15 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
         setLoadErr(e instanceof ApiError ? e.message : '工作台加载失败');
       })
       .finally(() => setLoading(false));
-  }, [token, hotelId, checkIn, checkOut, canQuery]);
+  }, [token, hotelId, randomStarTier, checkIn, checkOut, canQuery]);
 
-  // 查询范围（酒店/入住/退房）变化才清掉旧的保存提示——load() 被 handleSave 复用时不清。
+  // 查询范围（酒店/入住/退房）变化才清掉旧的保存提示与乘客池搜索——load() 被 handleSave
+  // 复用时不清（否则刚保存完成功提示、以及运营正在用的搜索词会被这次重拉悄悄冲掉）。
   useEffect(() => {
     setSaveErr(null);
     setSaveOk(null);
     setOrphanedRoomIds(new Set());
+    setPoolQuery('');
     load();
   }, [load]);
 
@@ -476,14 +509,51 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
         if (gd === 'M' || gd === 'F') genders.add(gd);
       }
     }
+    // 档次房没有房型：按缺省 2 人/间提示（与后端 TIER_ROOM_DEFAULT_CAPACITY 同口径，不拦截）
+    const capacity = roomType ? roomType.capacity : isTierMode ? TIER_ROOM_DEFAULT_CAPACITY : 0;
     return {
       roomType,
       totalFraction,
       totalPax,
       invalidPax,
       mixedGender: genders.size > 1,
-      overCapacity: !!roomType && roomType.capacity > 0 && totalPax > roomType.capacity,
+      overCapacity: capacity > 0 && totalPax > capacity,
     };
+  }
+
+  /** 该草稿房与加载时的落库状态是否一致（未改动）——整房落位前要求先保存改动。 */
+  function isRoomDirty(r: DraftRoom): boolean {
+    if (!wb || !r.sharedRoomId) return true;
+    const seedRoom = wb.sharedRooms.find((sr) => sr.sharedRoomId === r.sharedRoomId);
+    if (!seedRoom) return true;
+    if ((seedRoom.notes ?? '') !== r.notes.trim()) return true;
+    return serializeGroups(groupsFromMembers(seedRoom.members)) !== serializeGroups(r.groups);
+  }
+
+  // ── 整房落位（档次房 → 酒店房）：选真实酒店 + 房型，全部成员一起落位，共享房原地转酒店房 ──
+  async function handlePlace(r: DraftRoom): Promise<void> {
+    if (!placing || placing.draftId !== r.draftId || !r.sharedRoomId || !placing.hotelRoomTypeId) return;
+    setSaveErr(null);
+    setSaveOk(null);
+    setPlacingBusy(true);
+    try {
+      const result = await hotelControlOpsApi.placeSharedRoom(token, r.sharedRoomId, {
+        hotelRoomTypeId: placing.hotelRoomTypeId,
+        expectedVersion: r.version ?? 0,
+      });
+      setSaveOk(
+        `已整房落位到 ${result.hotelName} · ${result.roomTypeName}（${result.placedItems.length} 张单）` +
+          (result.warnings.length ? ` · ${result.warnings.join('；')}` : '') +
+          '。这间房已转为酒店房，请切到该酒店作用域继续查看。',
+      );
+      setPlacing(null);
+      onSaved?.();
+      load();
+    } catch (e: unknown) {
+      setSaveErr(e instanceof ApiError ? e.message : '整房落位失败');
+    } finally {
+      setPlacingBusy(false);
+    }
   }
 
   /** 显式「移除失效成员」（N5）：只有点了这个按钮，失效成员才真正从本间房剔除——否则
@@ -538,7 +608,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
       const seedRoom = wb.sharedRooms.find((sr) => sr.sharedRoomId === r.sharedRoomId);
       const originalGroups = seedRoom ? groupsFromMembers(seedRoom.members) : [];
       const metaChanged = seedRoom
-        ? seedRoom.hotelRoomTypeId !== r.hotelRoomTypeId || (seedRoom.notes ?? '') !== r.notes.trim()
+        ? (seedRoom.hotelRoomTypeId ?? '') !== r.hotelRoomTypeId || (seedRoom.notes ?? '') !== r.notes.trim()
         : true;
       const membersChanged = serializeGroups(originalGroups) !== serializeGroups(r.groups);
       // L2：正常代码路径不会留下零成员的 ACTIVE 共享房（后端解散时自动 DISSOLVED），只有
@@ -556,7 +626,8 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     }
 
     for (const { room, groups, seedRoom } of roomsToSave) {
-      if (!room.hotelRoomTypeId) {
+      // 档次房没有房型（随机档还没落位），只有酒店房才要求先选房型。
+      if (!isTierMode && !room.hotelRoomTypeId) {
         setSaveErr('每间房都要先选房型再保存');
         return;
       }
@@ -574,9 +645,8 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
         const isLeftoverOnlyResubmit = isLeftoverOnlyRoom(seedRoom, { sharedRoomId: room.sharedRoomId, groups });
         if (!isLeftoverOnlyResubmit) {
           const roomType = roomTypeOptions.find((rt) => rt.id === room.hotelRoomTypeId);
-          setSaveErr(
-            `房间「${roomType?.name ?? room.hotelRoomTypeId}」的计费份额合计须为 1，当前为 ${totalFraction}`,
-          );
+          const roomLabel = isTierMode ? randomStarTierLabel(randomStarTier) : (roomType?.name ?? room.hotelRoomTypeId);
+          setSaveErr(`房间「${roomLabel}」的计费份额合计须为 1，当前为 ${totalFraction}`);
           return;
         }
       }
@@ -591,14 +661,17 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     for (const [id, v] of dissolveMap) expectedVersions[id] = v;
 
     const body: SaveSharedRoomsBody = {
-      hotelId: wb.hotelId,
+      // 作用域二选一：档次房带 randomStarTier（房间不带房型）；酒店房带 hotelId + 每间房型。
+      ...(wb.randomStarTier != null
+        ? { randomStarTier: wb.randomStarTier as RandomStarTier }
+        : { hotelId: wb.hotelId ?? hotelId }),
       checkIn: wb.checkIn,
       checkOut: wb.checkOut,
       requestToken: newId(),
       expectedVersions,
       rooms: roomsToSave.map(({ room, groups }) => ({
         ...(room.sharedRoomId ? { sharedRoomId: room.sharedRoomId } : {}),
-        hotelRoomTypeId: room.hotelRoomTypeId,
+        ...(wb.randomStarTier != null ? {} : { hotelRoomTypeId: room.hotelRoomTypeId }),
         ...(room.notes.trim() ? { notes: room.notes.trim() } : {}),
         groups: groups.map((g) => ({
           orderId: g.orderId,
@@ -633,6 +706,21 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
 
   const isConflict = saveErr != null && saveErr.includes('已被他人修改');
   const poolOrders = wb?.orders ?? [];
+  // 缺口 B：姓名/中文名/订单号任一命中即保留整张单（不拆单只显示命中的乘客，保持订单
+  // 分组完整，方便一起拖）；不区分大小写；不改后端查询范围，纯客户端过滤已加载的池子。
+  const trimmedPoolQuery = poolQuery.trim().toLowerCase();
+  const filteredPoolOrders = useMemo(() => {
+    if (!trimmedPoolQuery) return poolOrders;
+    return poolOrders.filter((order) => {
+      if (order.orderNumber.toLowerCase().includes(trimmedPoolQuery)) return true;
+      return order.passengers.some((p) => {
+        const fullName = p.fullName?.toLowerCase() ?? '';
+        const chineseName = p.chineseName?.toLowerCase() ?? '';
+        return fullName.includes(trimmedPoolQuery) || chineseName.includes(trimmedPoolQuery);
+      });
+    });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [poolOrders, trimmedPoolQuery]);
 
   return (
     <div
@@ -666,14 +754,24 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
         {/* ── 查询条件：酒店 + 入住 + 退房 ── */}
         <div className="flex flex-wrap items-end gap-2 border-b border-slate-200 bg-slate-50/60 px-5 py-3">
           <div>
-            <label className="label">酒店</label>
-            <select className="input sm:w-56" value={hotelId} onChange={(e) => setHotelId(e.target.value)}>
-              {hotels.length === 0 && <option value="">加载中…</option>}
-              {hotels.map((h) => (
-                <option key={h.id} value={h.id}>
-                  {h.name}
-                </option>
-              ))}
+            <label className="label">酒店 / 随机池</label>
+            <select className="input sm:w-56" value={scopeValue} onChange={(e) => setScopeValue(e.target.value)}>
+              {hotels.length === 0 && !isTierMode && <option value="">加载中…</option>}
+              {/* 档次房：随机档还没落位的单按档次合住，落位后整房转到真实酒店（2026-09-20 拍板） */}
+              <optgroup label="星级随机池（待落位）">
+                {RANDOM_STAR_TIERS.map((t) => (
+                  <option key={t} value={poolOptionValue(t)}>
+                    {randomStarTierLabel(t)}池（待落位）
+                  </option>
+                ))}
+              </optgroup>
+              <optgroup label="酒店">
+                {hotels.map((h) => (
+                  <option key={h.id} value={h.id}>
+                    {h.name}
+                  </option>
+                ))}
+              </optgroup>
             </select>
           </div>
           <div>
@@ -688,7 +786,18 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
             <Icon name="refresh" /> {loading ? '加载中…' : '刷新'}
           </button>
           {!canQuery && <span className="text-xs text-amber-700">入住日须早于退房日</span>}
-          <span className="ml-auto text-xs text-ink-muted">切酒店/日期会丢弃当前未保存的改动</span>
+          <span className="ml-auto text-xs text-ink-muted">切酒店（或随机池）/日期会丢弃当前未保存的改动</span>
+        </div>
+
+        {/* ── 缺口 B：乘客池搜索——按姓名/中文名/订单号过滤左侧乘客池，纯前端不改查询范围 ── */}
+        <div className="border-b border-slate-200 px-5 py-2">
+          <input
+            type="text"
+            className="input w-full sm:w-72"
+            placeholder="搜乘客姓名 / 中文名 / 订单号"
+            value={poolQuery}
+            onChange={(e) => setPoolQuery(e.target.value)}
+          />
         </div>
 
         {/* ── 主体：左池右盒子 ── */}
@@ -697,7 +806,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
           {loading && !wb && <div className="py-8 text-center text-sm text-ink-muted">加载中…</div>}
           {!loading && wb && poolOrders.length === 0 && rooms.length === 0 && (
             <div className="py-10 text-center text-sm text-ink-muted">
-              该酒店该入住区间暂无有效订单，也没有既有共享房。
+              {isTierMode ? '该随机池' : '该酒店'}该入住区间暂无有效订单，也没有既有共享房。
             </div>
           )}
 
@@ -711,12 +820,16 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
               >
                 <div className="mb-1 flex items-center justify-between">
                   <span className="text-xs font-medium uppercase tracking-wide text-ink-muted">跨订单乘客池</span>
-                  <span className="badge-neutral">{poolOrders.length} 单</span>
+                  <span className="badge-neutral">
+                    {trimmedPoolQuery ? `${filteredPoolOrders.length}/${poolOrders.length}` : poolOrders.length} 单
+                  </span>
                 </div>
                 {poolOrders.length === 0 ? (
                   <div className="py-6 text-center text-xs text-ink-muted">本区间没有可分房的订单</div>
+                ) : filteredPoolOrders.length === 0 ? (
+                  <div className="py-6 text-center text-xs text-ink-muted">没有匹配「{poolQuery.trim()}」的乘客或订单</div>
                 ) : (
-                  poolOrders.map((order) => {
+                  filteredPoolOrders.map((order) => {
                     const remaining = order.passengers.filter((p) => !assignedIds.has(p.id));
                     return (
                       <div key={order.orderId} className="rounded-lg border border-slate-200 bg-white p-2">
@@ -849,19 +962,100 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                         )}
                       </div>
 
-                      <select
-                        className="input w-full py-1.5 text-sm"
-                        value={r.hotelRoomTypeId}
-                        onChange={(e) => patchRoom(r.draftId, { hotelRoomTypeId: e.target.value })}
-                      >
-                        <option value="">选房型</option>
-                        {roomTypeOptions.map((rt) => (
-                          <option key={rt.id} value={rt.id}>
-                            {rt.name}
-                            {rt.capacity > 0 ? `（限 ${rt.capacity} 人）` : ''}
-                          </option>
-                        ))}
-                      </select>
+                      {isTierMode ? (
+                        <div className="flex flex-wrap items-center justify-between gap-2 rounded-lg border border-amber-200 bg-amber-50 px-2 py-1.5 text-xs text-amber-800">
+                          <span>
+                            {randomStarTierLabel(randomStarTier)}（待落位）· 按 {TIER_ROOM_DEFAULT_CAPACITY} 人/间提示，落位后按真实房型
+                          </span>
+                          {r.sharedRoomId && (
+                            <button
+                              type="button"
+                              className="btn-secondary px-2 py-0.5 text-xs disabled:cursor-not-allowed disabled:opacity-40"
+                              disabled={isRoomDirty(r) || saving || placingBusy}
+                              title={
+                                isRoomDirty(r)
+                                  ? '本间房有未保存的改动，先保存再整房落位'
+                                  : '全部成员一起落到同一家真实酒店同一房型，共享房原地转为酒店房（不解绑，份额不动，差价须为 0）'
+                              }
+                              onClick={() =>
+                                setPlacing((cur) =>
+                                  cur?.draftId === r.draftId ? null : { draftId: r.draftId, hotelId: '', hotelRoomTypeId: '' },
+                                )
+                              }
+                            >
+                              <Icon name="hotel" /> 整房落位
+                            </button>
+                          )}
+                        </div>
+                      ) : (
+                        <select
+                          className="input w-full py-1.5 text-sm"
+                          value={r.hotelRoomTypeId}
+                          onChange={(e) => patchRoom(r.draftId, { hotelRoomTypeId: e.target.value })}
+                        >
+                          <option value="">选房型</option>
+                          {roomTypeOptions.map((rt) => (
+                            <option key={rt.id} value={rt.id}>
+                              {rt.name}
+                              {rt.capacity > 0 ? `（限 ${rt.capacity} 人）` : ''}
+                            </option>
+                          ))}
+                        </select>
+                      )}
+
+                      {/* ── 整房落位面板（档次房专用）：选真实酒店 → 房型 → 确认 ── */}
+                      {isTierMode && placing?.draftId === r.draftId && (
+                        <div className="mt-2 space-y-2 rounded-lg border border-indigo-200 bg-indigo-50/60 p-2">
+                          <div className="text-xs text-indigo-800">
+                            整房落位：{r.groups.length} 张单的成员一起落到同一间房；目标酒店有指定酒店加价、或套餐档次与酒店星级不符时会整体拒绝并列出是谁。
+                          </div>
+                          <div className="flex flex-wrap items-end gap-2">
+                            <div className="grow">
+                              <label className="label">目标酒店（≥ {randomStarTier} 星）</label>
+                              <select
+                                className="input w-full py-1 text-sm"
+                                value={placing.hotelId}
+                                onChange={(e) => setPlacing({ draftId: r.draftId, hotelId: e.target.value, hotelRoomTypeId: '' })}
+                              >
+                                <option value="">选酒店</option>
+                                {placementHotels.map((h) => (
+                                  <option key={h.id} value={h.id}>
+                                    {h.name}（{h.starRating} 星{h.designationSurchargeCnyPerPerson > 0 ? ` · 指定加价 ¥${h.designationSurchargeCnyPerPerson}/人` : ''}）
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                            <div className="grow">
+                              <label className="label">房型</label>
+                              <select
+                                className="input w-full py-1 text-sm"
+                                value={placing.hotelRoomTypeId}
+                                disabled={!placing.hotelId}
+                                onChange={(e) => setPlacing({ ...placing, hotelRoomTypeId: e.target.value })}
+                              >
+                                <option value="">选房型</option>
+                                {(hotels.find((h) => h.id === placing.hotelId)?.roomTypes ?? []).map((rt) => (
+                                  <option key={rt.id} value={rt.id}>
+                                    {rt.name}
+                                    {rt.capacity > 0 ? `（限 ${rt.capacity} 人）` : ''}
+                                  </option>
+                                ))}
+                              </select>
+                            </div>
+                            <button
+                              type="button"
+                              className="btn-primary px-3 py-1 text-xs"
+                              disabled={!placing.hotelRoomTypeId || placingBusy}
+                              onClick={() => void handlePlace(r)}
+                            >
+                              {placingBusy ? '落位中…' : '确认整房落位'}
+                            </button>
+                            <button type="button" className="btn-ghost px-2 py-1 text-xs" onClick={() => setPlacing(null)} disabled={placingBusy}>
+                              取消
+                            </button>
+                          </div>
+                        </div>
+                      )}
 
                       {/* 成员按来源单分组 */}
                       <div className="mt-2 min-h-[2.5rem] space-y-1.5 rounded-lg border border-dashed border-slate-200 bg-slate-50/50 p-2">

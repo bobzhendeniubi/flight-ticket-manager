@@ -1287,8 +1287,14 @@ enum SharedRoomStatus {
 
 model SharedRoom {
   id              String           @id @default(cuid())
-  hotelId         String
-  hotelRoomTypeId String
+  // 两种形态，二选一（迁移里的 CHECK 约束兜底，服务端保存时也校验）：
+  //   · 酒店房：hotelId + hotelRoomTypeId 非空，randomStarTier 为空——成员都是已落位到这家真酒店的行；
+  //   · 档次房（2026-09-20 起）：hotelId / hotelRoomTypeId 为空，randomStarTier 非空——成员都是该档
+  //     未落位的随机行（OrderItem.randomStarTier 命中，或房型挂在该档占位酒店上），先合住再整房落位。
+  //     整房落位（shared-room-placement.ts）把它原地转成酒店房：写 hotelId/hotelRoomTypeId、清 randomStarTier。
+  hotelId         String?
+  hotelRoomTypeId String?
+  randomStarTier  Int?
   // 房内所有成员的订单行入住区间必须与之一致（保存时校验，见 hotel-control.service）
   checkIn         DateTime         @db.Date
   checkOut        DateTime         @db.Date
@@ -1303,11 +1309,14 @@ model SharedRoom {
   dissolvedAt     DateTime?
   dissolvedReason String?
 
-  hotel         Hotel              @relation(fields: [hotelId], references: [id])
-  hotelRoomType HotelRoomType      @relation(fields: [hotelRoomTypeId], references: [id])
+  // onDelete: Restrict 显式写出：可空关系 Prisma 缺省会改成 SET NULL，那会在删酒店/房型时把
+  // 一间酒店房悄悄变成「三列全空」的非法行（违反迁移 CHECK 约束）。保持 v1 的 RESTRICT 不动。
+  hotel         Hotel?             @relation(fields: [hotelId], references: [id], onDelete: Restrict)
+  hotelRoomType HotelRoomType?     @relation(fields: [hotelRoomTypeId], references: [id], onDelete: Restrict)
   members       SharedRoomMember[]
 
   @@index([hotelId, checkIn, checkOut])
+  @@index([randomStarTier, checkIn, checkOut])
   @@index([status])
 }
 

@@ -1511,7 +1511,7 @@ describe('getOccupyingOrders', () => {
     }
   });
 
-  it('随机档作用域没有 hotelId：即使 client 带 sharedRoomMember 委托也不查，三列恒为共享 0', async () => {
+  it('随机档作用域（2026-09-20 档次房）：按 randomStarTier 查档次房成员，参与共享房数计入、物理去重不再回落行级间数', async () => {
     const client = occupantsClientWithShared(
       [
         {
@@ -1533,13 +1533,17 @@ describe('getOccupyingOrders', () => {
       [{ orderId: 'o12', sharedRoomId: 'sr1' }],
     );
     const occupants = await getOccupyingOrders({ randomStarTier: 4 }, dayStr(0), client);
-    expect(occupants[0]!.sharedRoomCount).toBe(0);
-    // 随机档作用域下共享房恒 0，普通房组也没有分房表（roomAssignment: null）→ 回落该行
-    // itemRoomCount（roomsBilled=1），不是硬 0（astra A11 余项）。
+    expect(occupants[0]!.sharedRoomCount).toBe(1);
+    // 已参与档次房的订单：roomsBilled 记的是共享房里的计费份额，不是另一间独立物理房——
+    // 普通口径没有分房表（roomAssignment: null）也不回落 itemRoomCount，物理去重 = 0 + 共享 1。
     expect(occupants[0]!.physicalRoomsDeduped).toBe(1);
     const findMany = (client as unknown as { sharedRoomMember: { findMany: ReturnType<typeof vi.fn> } })
       .sharedRoomMember.findMany;
-    expect(findMany).not.toHaveBeenCalled();
+    expect(findMany).toHaveBeenCalledTimes(1);
+    const where = (findMany.mock.calls[0]![0] as { where: { sharedRoom: Record<string, unknown> } }).where;
+    // 作用域按档次查档次房（sharedRoomScopeWhere），不带 hotelId
+    expect(where.sharedRoom.randomStarTier).toBe(4);
+    expect(where.sharedRoom).not.toHaveProperty('hotelId');
   });
 
   it('client 没有 sharedRoomMember 委托（旧单测 mock）：防御式回落三列为 0/普通口径，不抛错', async () => {

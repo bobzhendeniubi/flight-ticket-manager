@@ -12,7 +12,7 @@
  * 口径：余量 = 包房（切房）− 用房（占房订单）；余量<0 红、=0 黄。
  */
 import { Fragment, useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Link } from 'react-router-dom';
+import { Link, useSearchParams } from 'react-router-dom';
 import { Icon } from '../components/Icon';
 import { businessTzParts, formatInBusinessTz } from '../lib/datetime';
 import {
@@ -30,6 +30,7 @@ import {
   type HotelOccupant,
   type OrderSummary,
   type RoomGroup,
+  RANDOM_STAR_TIERS,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { NumberInput } from '../components/NumberInput';
@@ -107,6 +108,32 @@ function nextDayStr(d: string): string {
 }
 
 /**
+ * 跨单分房工作台按「精确匹配 hotelCheckIn/hotelCheckOut」查询（见后端
+ * getSharedRoomWorkbench），下钻抽屉这一格只是「入住日+1 晚」的种子猜测——住多晚的单
+ * 种子区间对不上真实订单行区间，工作台会误判「暂无有效订单」（坑 A）。这里改用抽屉已经
+ * 拉到的占房清单（每行自带真实 checkIn/checkOut）取众数区间兜底；同一格里的单理论上多数
+ * 同区间，个别混住其它区间的单不受影响——工作台加载后入住/退房两个日期框仍可手改。
+ */
+function modeStayRange(occupants: readonly { checkIn: string; checkOut: string }[]): { checkIn: string; checkOut: string } | null {
+  if (occupants.length === 0) return null;
+  const counts = new Map<string, number>();
+  for (const o of occupants) {
+    const key = `${o.checkIn}|${o.checkOut}`;
+    counts.set(key, (counts.get(key) ?? 0) + 1);
+  }
+  let bestKey = '';
+  let bestCount = -1;
+  for (const [key, count] of counts) {
+    if (count > bestCount) {
+      bestKey = key;
+      bestCount = count;
+    }
+  }
+  const [checkIn, checkOut] = bestKey.split('|');
+  return { checkIn, checkOut };
+}
+
+/**
  * 拼房客（0.5 半间）逐日附加口径 + 物理房间口径 — 后端 board.hotels[].rows 新增（附加字段，向后兼容）。
  * api.ts 的 HotelControlBoardHotel.rows 尚未声明这些列，这里按可选读取，缺省即降级不显示。
  * 异性不能拼一间：physicalUsed = ceil(男/2) + ceil(女/2) + 未知 + 整间预订数；
@@ -150,6 +177,7 @@ const STICKY_COL2 = 'sticky left-[11rem] z-10 min-w-[3.5rem] bg-white';
 export function HotelControlPage() {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
+  const [searchParams, setSearchParams] = useSearchParams();
 
   const [from, setFrom] = useState<string>(todayStr());
   const [to, setTo] = useState<string>(plusDaysStr(30));
@@ -171,6 +199,31 @@ export function HotelControlPage() {
     block: number;
     used: number;
   } | null>(null);
+
+  // 死胡同 C：分房编辑器（RoomingEditor）锁定房组的指路链接跳到本页并带
+  // ?sharedRoom=1&hotelId=…&checkIn=…&checkOut=…，这里读到就自动开工作台（种子结构见
+  // SharedRoomWorkbenchSeed，字段都可选，工作台自己兜底）。读完随手把这几个一次性 query
+  // 摘掉，避免刷新/前进后退重复触发、也不让地址栏长期挂着这次跳转的痕迹。
+  useEffect(() => {
+    if (searchParams.get('sharedRoom') !== '1') return;
+    // 作用域二选一：randomStarTier（档次房，随机档待落位的单跨单合住）优先于 hotelId。
+    const tierParam = Number(searchParams.get('randomStarTier'));
+    const randomStarTier = RANDOM_STAR_TIERS.includes(tierParam as RandomStarTier) ? (tierParam as RandomStarTier) : undefined;
+    setSharedWorkbenchSeed({
+      hotelId: randomStarTier != null ? undefined : (searchParams.get('hotelId') ?? undefined),
+      randomStarTier,
+      checkIn: searchParams.get('checkIn') ?? undefined,
+      checkOut: searchParams.get('checkOut') ?? undefined,
+    });
+    const next = new URLSearchParams(searchParams);
+    next.delete('sharedRoom');
+    next.delete('hotelId');
+    next.delete('randomStarTier');
+    next.delete('checkIn');
+    next.delete('checkOut');
+    setSearchParams(next, { replace: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [searchParams]);
 
   useEffect(() => {
     if (!token || !from || !to || from > to) return;
@@ -589,17 +642,22 @@ function OccupantsDrawer({
               {hotelName} · {date}
             </h3>
             <p className="mt-1 text-xs text-ink-muted">{headerNote}</p>
-            {randomStarTier == null && (
-              <button
-                type="button"
-                className="btn-secondary mt-2 px-2 py-1 text-xs"
-                onClick={() =>
-                  onOpenSharedRoomWorkbench({ hotelId, checkIn: date, checkOut: nextDayStr(date) })
-                }
-              >
-                <Icon name="users" /> 跨单分房
-              </button>
-            )}
+            <button
+              type="button"
+              className="btn-secondary mt-2 px-2 py-1 text-xs"
+              onClick={() => {
+                // 坑 A：种子优先取本格占房清单里真实的众数区间（工作台按精确匹配查询，
+                // 猜错区间=池子空）；抽屉还没拉到 occupants（理论上不会，见下方 fallback）
+                // 时退回「入住日+1 晚」旧猜法，工作台里仍可手改日期。
+                // 随机池格子（randomStarTier 非空）带档次种子——档次房（随机档待落位的单跨单合住）。
+                const seedRange = modeStayRange(occupants ?? []) ?? { checkIn: date, checkOut: nextDayStr(date) };
+                onOpenSharedRoomWorkbench(
+                  randomStarTier != null ? { randomStarTier, ...seedRange } : { hotelId, ...seedRange },
+                );
+              }}
+            >
+              <Icon name="users" /> 跨单分房
+            </button>
           </div>
           <button type="button" className="text-slate-400 hover:text-slate-700" onClick={onClose} aria-label="关闭酒店控制详情">
             <Icon name="close" />

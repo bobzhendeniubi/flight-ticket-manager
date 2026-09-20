@@ -156,12 +156,17 @@ export const nightlyRemainingQuerySchema = z
 export type NightlyRemainingQuery = z.infer<typeof nightlyRemainingQuerySchema>;
 
 // ── 跨单分房工作台（§七）────────────────────────────────────────────────
+// 作用域 hotelId | randomStarTier 二选一（口径同 occupantsQuerySchema）：酒店房 vs 档次房
+// （2026-09-20 起随机档未落位的单也能跨单合住，先合住再整房落位）。
+const SHARED_ROOM_SCOPE_MESSAGE = '请指定一家酒店，或指定一个星级随机档';
 export const sharedRoomWorkbenchQuerySchema = z
   .object({
-    hotelId: z.string().min(1),
+    hotelId: z.string().min(1).optional(),
+    randomStarTier: z.coerce.number().int().pipe(randomStarTierSchema).optional(),
     checkIn: dateStr,
     checkOut: dateStr,
   })
+  .refine((q) => !!q.hotelId !== (q.randomStarTier != null), { message: SHARED_ROOM_SCOPE_MESSAGE })
   .refine((q) => q.checkIn < q.checkOut, { message: '入住日必须早于退房日' });
 export type SharedRoomWorkbenchQuery = z.infer<typeof sharedRoomWorkbenchQuerySchema>;
 
@@ -176,20 +181,55 @@ const sharedRoomGroupInputSchema = z.object({
 const sharedRoomInputSchema = z.object({
   // 缺省 = 新建（服务端生成 id）；非空 = 改动既有共享房（需过 expectedVersions CAS）。
   sharedRoomId: z.string().min(1).optional(),
-  hotelRoomTypeId: z.string().min(1),
+  // 酒店房必填；档次房（body.randomStarTier 模式）必须省略——随机档还没有房型可指（下面 superRefine 判）。
+  hotelRoomTypeId: z.string().min(1).optional(),
   notes: z.string().max(500).optional(),
   groups: z.array(sharedRoomGroupInputSchema).min(1, '房间至少要有一组成员'),
 });
 
-export const saveSharedRoomsBodySchema = z.object({
-  hotelId: z.string().min(1),
-  checkIn: dateStr,
-  checkOut: dateStr,
-  requestToken: z.string().min(1).max(200),
-  // 版本 CAS：key = sharedRoomId，只需对本次改动到的既有房间给出期望版本。
-  expectedVersions: z.record(z.string(), z.number().int().min(1)).optional(),
-  rooms: z.array(sharedRoomInputSchema).default([]),
-  // 要整间解散的共享房 id（成员清空、状态 DISSOLVED；对应订单房组退回普通房组）。
-  dissolve: z.array(z.string().min(1)).default([]),
-});
+export const saveSharedRoomsBodySchema = z
+  .object({
+    hotelId: z.string().min(1).optional(),
+    randomStarTier: randomStarTierSchema.optional(),
+    checkIn: dateStr,
+    checkOut: dateStr,
+    requestToken: z.string().min(1).max(200),
+    // 版本 CAS：key = sharedRoomId，只需对本次改动到的既有房间给出期望版本。
+    expectedVersions: z.record(z.string(), z.number().int().min(1)).optional(),
+    rooms: z.array(sharedRoomInputSchema).default([]),
+    // 要整间解散的共享房 id（成员清空、状态 DISSOLVED；对应订单房组退回普通房组）。
+    dissolve: z.array(z.string().min(1)).default([]),
+  })
+  .superRefine((b, ctx) => {
+    const isTierMode = b.randomStarTier != null;
+    if (!!b.hotelId === isTierMode) {
+      ctx.addIssue({ code: z.ZodIssueCode.custom, message: SHARED_ROOM_SCOPE_MESSAGE, path: ['hotelId'] });
+      return;
+    }
+    b.rooms.forEach((room, index) => {
+      if (isTierMode && room.hotelRoomTypeId != null) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: '档次房（随机档待落位）不能指定房型，请用「整房落位」落到真实酒店后再选房型',
+          path: ['rooms', index, 'hotelRoomTypeId'],
+        });
+      }
+      if (!isTierMode && !room.hotelRoomTypeId) {
+        ctx.addIssue({
+          code: z.ZodIssueCode.custom,
+          message: '酒店房必须指定房型',
+          path: ['rooms', index, 'hotelRoomTypeId'],
+        });
+      }
+    });
+  });
 export type SaveSharedRoomsBody = z.infer<typeof saveSharedRoomsBodySchema>;
+
+// ── 档次共享房整房落位（POST /hotel-control/shared-rooms/:id/place）──────────
+// 把一间档次房的全部成员行一起落到同一家真实酒店的同一房型，共享房原地转成酒店房（不解绑）。
+export const placeSharedRoomBodySchema = z.object({
+  hotelRoomTypeId: z.string().min(1),
+  // 版本 CAS：与工作台读到的 version 不一致 → 409（别人刚改过这间房）。
+  expectedVersion: z.number().int().min(1),
+});
+export type PlaceSharedRoomBody = z.infer<typeof placeSharedRoomBodySchema>;

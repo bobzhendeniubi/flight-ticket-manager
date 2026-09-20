@@ -11,10 +11,12 @@
  * 保存：onSave 只收「至少 1 名出行人」的盒子，按 RoomGroup 形状回传。
  */
 import { useMemo, useState } from 'react';
+import { Link } from 'react-router-dom';
 import type { HotelAvailabilityTier, HotelNightlyRemainingResult, RoomGroup } from '../lib/api';
 import { randomStarTierLabel } from '../lib/api';
 import { Icon } from './Icon';
 import { passengerDisplayName, passengerNameTitle } from '../lib/passengerDisplayName';
+import { useAuth } from '../stores/auth';
 
 // ── 类型 ─────────────────────────────────────────────────────────────────
 export interface RoomingPassenger {
@@ -34,6 +36,8 @@ export interface RoomingHotelItemOption {
   label: string;
   /** 该行酒店中文名（保存时作为归属组的 hotelName） */
   hotelName: string;
+  /** 未落位随机档的档次（形态①/②）；已落位真酒店为 null——锁定组指路链接据此带 randomStarTier 而不是 hotelId。 */
+  pendingTier?: number | null;
 }
 
 interface RoomingEditorProps {
@@ -315,7 +319,7 @@ export function roomingHotelItemsFromOrder(
       ]
         .filter((s): s is string => !!s)
         .join(' · ');
-      return { id: it.id, label, hotelName: itemHotelName };
+      return { id: it.id, label, hotelName: itemHotelName, pendingTier };
     });
 }
 
@@ -326,6 +330,7 @@ export function RoomingEditor({
   hotelName,
   hotelItems,
   hotelTier,
+  hotelId,
   checkIn,
   checkOut,
   nightlyRemaining,
@@ -337,6 +342,11 @@ export function RoomingEditor({
   const [err, setErr] = useState<string | null>(null);
   // 当前被拖动的出行人 id（HTML5 dataTransfer 兜底用 state，避免某些浏览器读不到）
   const [dragId, setDragId] = useState<string | null>(null);
+  // 死胡同 C：锁定房组的指路文案要按角色分叉——ADMIN/STAFF 给可点链接直达房控页跨单
+  // 分房工作台，AGENT 没有房控菜单（见 Layout.tsx 路由表），给个不可点的联系运营提示。
+  // 直接读现成的 useAuth 全局 store（不新增状态），与 Layout.tsx 的角色判定同一份真值。
+  const viewerRole = useAuth((s) => s.user?.role);
+  const canOpenSharedRoomWorkbench = viewerRole === 'ADMIN' || viewerRole === 'STAFF';
 
   const passengerById = useMemo(() => {
     const m = new Map<string, RoomingPassenger>();
@@ -407,6 +417,18 @@ export function RoomingEditor({
   }, [hotelItems]);
   const soleHotelItem = hotelItems && hotelItems.length === 1 ? hotelItems[0] : null;
   const showItemSelect = (hotelItems?.length ?? 0) > 1;
+  // 深链目标：/hotel-control 自己读到 sharedRoom=1 会自动开工作台（seed 字段都可选，
+  // 工作台自己兜底缺省值）——checkIn/checkOut 是本编辑器当前这个酒店行的区间；作用域按该
+  // 盒子归属行判：未落位随机档（档次房）带 randomStarTier，已落位真酒店带 hotelId。
+  function sharedRoomWorkbenchHrefFor(box: RoomBox): string {
+    const params = new URLSearchParams({ sharedRoom: '1' });
+    const pendingTier = box.orderItemId ? (hotelItemById.get(box.orderItemId)?.pendingTier ?? null) : null;
+    if (pendingTier != null) params.set('randomStarTier', String(pendingTier));
+    else if (hotelId) params.set('hotelId', hotelId);
+    if (checkIn) params.set('checkIn', dateOnly(checkIn));
+    if (checkOut) params.set('checkOut', dateOnly(checkOut));
+    return `/hotel-control?${params.toString()}`;
+  }
 
   function addBox(): void {
     setBoxes((prev) => [...prev, emptyBox()]);
@@ -533,7 +555,9 @@ export function RoomingEditor({
       return (
         <span
           className="inline-flex select-none items-center gap-1.5 rounded-lg border border-slate-200 bg-slate-50 px-2.5 py-1 text-sm text-ink-soft"
-          title={`${latin ? `${latin} · ` : ''}与他单合住，锁定，去房控页「跨单分房」调整`}
+          title={`${latin ? `${latin} · ` : ''}与他单合住，锁定${
+            canOpenSharedRoomWorkbench ? '，去房控页「跨单分房」调整' : '，共享房由运营统一调整'
+          }`}
         >
           <span className="font-medium">{display || '—'}</span>
           {g && (
@@ -659,7 +683,11 @@ export function RoomingEditor({
                     {locked && (
                       <span
                         className="badge bg-indigo-100 text-indigo-700"
-                        title="该房间与他单合住，只能改备注；改动请去房控页「跨单分房」"
+                        title={
+                          canOpenSharedRoomWorkbench
+                            ? '该房间与他单合住，只能改备注；改动请去房控页「跨单分房」'
+                            : '该房间与他单合住，只能改备注；共享房由运营统一调整'
+                        }
                       >
                         <Icon name="lock" /> 已与他单合住
                       </span>
@@ -681,7 +709,17 @@ export function RoomingEditor({
                     <span className="text-xs font-normal text-ink-muted">{b.passengerIds.length} 人</span>
                   </span>
                   {locked ? (
-                    <span className="text-xs text-indigo-700">想调整请去房控页「跨单分房」</span>
+                    canOpenSharedRoomWorkbench ? (
+                      <Link
+                        to={sharedRoomWorkbenchHrefFor(b)}
+                        className="text-xs font-medium text-indigo-700 underline hover:text-indigo-900"
+                        title="跳到房控页，自动带出这家酒店（或随机池）这个入住区间的跨单分房工作台"
+                      >
+                        想调整请去房控页「跨单分房」→
+                      </Link>
+                    ) : (
+                      <span className="text-xs text-indigo-700">共享房由运营统一调整，如需变动请联系运营</span>
+                    )
                   ) : (
                     <div className="flex items-center gap-1.5">
                       <button

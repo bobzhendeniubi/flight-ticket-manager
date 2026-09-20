@@ -28,12 +28,48 @@ import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.
 import {
   COUNTED_STATUSES,
   assertHotelFitAfterChange,
+  assertRandomTierFitAfterChange,
+  itemRoomCount,
+  randomStarTierLabel,
+  scopeItemWhere,
+  sharedRoomScopeWhere,
   type PhysicalOccupancyItem,
+  type RandomTierBilledDelta,
+  type RoomScope,
   type SharedRoomAfterState,
 } from './hotel-control.service.js';
+import { PENDING_PLACEMENT_ROOM_TYPE } from '../orders/room-group-placement.js';
 import type { SaveSharedRoomsBody } from './hotel-control.schemas.js';
 
 const MAX_LOCK_RETRIES = 3;
+
+/**
+ * 档次房（随机档待落位）的容量提示阈值：随机档没有房型可读容量，人数超过这个数只 warning
+ * （与酒店房「人数超房型 capacity 只 warning」同款语义，不拦截）。落位后按真实房型容量提示。
+ */
+export const TIER_ROOM_DEFAULT_CAPACITY = 2;
+
+/** 共享房作用域（与 hotel-control.service 的 RoomScope 同形）：酒店房 vs 档次房。*/
+export type SharedRoomScope = RoomScope;
+
+/** 作用域的展示名：酒店房给 hotelId（调用方自行查名），档次房给「X星随机」。*/
+function scopeLabel(scope: SharedRoomScope): string {
+  return 'hotelId' in scope ? scope.hotelId : randomStarTierLabel(scope.randomStarTier);
+}
+
+/**
+ * 订单行的「未落位档次」：形态①（无房型 + randomStarTier）取行上的档次；形态②（房型挂在
+ * 占位酒店上）取该占位酒店的 randomTierPlaceholder；已落位真酒店的行 → null。
+ * 与 hotel-control.service 的 scopeItemWhere 两种形态一一对应。
+ */
+export function itemPendingTier(item: {
+  hotelRoomTypeId: string | null;
+  randomStarTier: number | null;
+  placeholderTier: number | null;
+}): number | null {
+  if (item.hotelRoomTypeId == null) return item.randomStarTier;
+  return item.placeholderTier;
+}
 
 /** [checkIn, checkOut) 逐晚 YYYY-MM-DD（date-only 字符串算术，避免时区漂移）。*/
 function expandNights(checkIn: string, checkOut: string): string[] {
@@ -63,8 +99,12 @@ export interface SharedRoomWorkbenchPassenger {
 
 export interface SharedRoomWorkbenchOrderItem {
   id: string;
+  /** 已落位行的房型 id；形态①随机行为空串（没有房型）。*/
   hotelRoomTypeId: string;
+  /** 已落位 = 房型名；未落位 = 「X星随机（待落位）」。*/
   roomTypeName: string;
+  /** 未落位档次（形态①取行上 randomStarTier，形态②取占位酒店档次）；已落位真酒店为 null。*/
+  randomStarTier: number | null;
   roomsBilled: number | null;
   /** 当前所在位置：null=未分房；普通房组给 groupId；共享房给 sharedRoomId。*/
   currentGroupId: string | null;
@@ -86,7 +126,11 @@ export interface SharedRoomWorkbenchOrder {
 
 export interface SharedRoomWorkbenchRoom {
   sharedRoomId: string;
-  hotelRoomTypeId: string;
+  /** 酒店房的酒店 / 房型；档次房两者为 null，看 randomStarTier。*/
+  hotelId: string | null;
+  hotelRoomTypeId: string | null;
+  /** 档次房的档次；酒店房为 null。*/
+  randomStarTier: number | null;
   version: number;
   notes: string | null;
   members: Array<{
@@ -114,7 +158,10 @@ export interface SharedRoomWorkbenchRoom {
 }
 
 export interface SharedRoomWorkbench {
-  hotelId: string;
+  /** 酒店作用域给酒店 id；随机档作用域为 null。*/
+  hotelId: string | null;
+  /** 随机档作用域给档次；酒店作用域为 null。*/
+  randomStarTier: number | null;
   checkIn: string;
   checkOut: string;
   orders: SharedRoomWorkbenchOrder[];
@@ -142,21 +189,26 @@ function parseRoomGroups(roomAssignment: unknown): Array<Record<string, unknown>
 }
 
 /**
- * 跨单分房工作台读模型：本酒店本入住区间（精确匹配 checkIn/checkOut）内全部有效订单
+ * 跨单分房工作台读模型：本作用域本入住区间（精确匹配 checkIn/checkOut）内全部有效订单
  * 的乘客与酒店行、以及本区间既有的共享房列表。ADMIN/STAFF 用，供前端建工作台 UI（波 4）。
+ *
+ * 作用域二选一：酒店（候选 = 房型挂在该酒店的行）或随机档（候选 = 形态①
+ * `hotelRoomTypeId=null + randomStarTier=tier` ∪ 形态② 房型挂在该档占位酒店上的行——
+ * 与销控板随机池行、占房下钻同一份 scopeItemWhere）。
  */
 export async function getSharedRoomWorkbench(
-  hotelId: string,
+  scope: string | SharedRoomScope,
   checkIn: string,
   checkOut: string,
   client: PrismaClient = defaultPrisma,
 ): Promise<SharedRoomWorkbench> {
+  const roomScope: SharedRoomScope = typeof scope === 'string' ? { hotelId: scope } : scope;
   const checkInD = new Date(`${checkIn}T00:00:00.000Z`);
   const checkOutD = new Date(`${checkOut}T00:00:00.000Z`);
 
   const items = await client.orderItem.findMany({
     where: {
-      hotelRoomType: { hotelId },
+      ...scopeItemWhere(roomScope),
       hotelCheckIn: checkInD,
       hotelCheckOut: checkOutD,
       order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
@@ -164,7 +216,10 @@ export async function getSharedRoomWorkbench(
     select: {
       id: true,
       roomsBilled: true,
-      hotelRoomType: { select: { id: true, name: true } },
+      randomStarTier: true,
+      hotelRoomType: {
+        select: { id: true, name: true, hotel: { select: { randomTierPlaceholder: true } } },
+      },
       order: {
         select: {
           id: true,
@@ -212,10 +267,20 @@ export async function getSharedRoomWorkbench(
     const own = groups.filter((g) => groupOrderItemId(g) === it.id);
     const sharedGroup = own.find((g) => groupSharedId(g) != null);
     const plainGroup = own.find((g) => groupSharedId(g) == null);
+    const pendingTier = itemPendingTier({
+      hotelRoomTypeId: it.hotelRoomType?.id ?? null,
+      randomStarTier: it.randomStarTier,
+      placeholderTier: it.hotelRoomType?.hotel?.randomTierPlaceholder ?? null,
+    });
     entry.items.push({
       id: it.id,
       hotelRoomTypeId: it.hotelRoomType?.id ?? '',
-      roomTypeName: it.hotelRoomType?.name ?? '',
+      // 未落位行的房型名统一按「X星随机（待落位）」出（与导出 / 列表同口径），不印占位酒店的房型名。
+      roomTypeName:
+        pendingTier != null
+          ? `${randomStarTierLabel(pendingTier)}（${PENDING_PLACEMENT_ROOM_TYPE}）`
+          : (it.hotelRoomType?.name ?? ''),
+      randomStarTier: pendingTier,
       roomsBilled: it.roomsBilled == null ? null : Number(it.roomsBilled.toString()),
       currentGroupId: plainGroup ? groupId(plainGroup) : null,
       currentSharedRoomId: sharedGroup ? groupSharedId(sharedGroup) : null,
@@ -223,10 +288,12 @@ export async function getSharedRoomWorkbench(
   }
 
   const sharedRoomRows = await client.sharedRoom.findMany({
-    where: { hotelId, checkIn: checkInD, checkOut: checkOutD, status: 'ACTIVE' },
+    where: { ...sharedRoomScopeWhere(roomScope), checkIn: checkInD, checkOut: checkOutD, status: 'ACTIVE' },
     select: {
       id: true,
+      hotelId: true,
       hotelRoomTypeId: true,
+      randomStarTier: true,
       version: true,
       notes: true,
       members: {
@@ -250,13 +317,16 @@ export async function getSharedRoomWorkbench(
   });
 
   return {
-    hotelId,
+    hotelId: 'hotelId' in roomScope ? roomScope.hotelId : null,
+    randomStarTier: 'randomStarTier' in roomScope ? roomScope.randomStarTier : null,
     checkIn,
     checkOut,
     orders: [...ordersById.values()],
     sharedRooms: sharedRoomRows.map((r) => ({
       sharedRoomId: r.id,
+      hotelId: r.hotelId,
       hotelRoomTypeId: r.hotelRoomTypeId,
+      randomStarTier: r.randomStarTier,
       version: r.version,
       notes: r.notes,
       members: r.members.map((m) => ({
@@ -329,6 +399,8 @@ interface LockedOrderRow {
     hotelCheckOut: Date | null;
     hotelId: string | null;
     randomStarTier: number | null;
+    /** 房型所挂酒店的 randomTierPlaceholder（形态②伪落位行的档次）；真酒店 / 无房型为 null。*/
+    placeholderTier: number | null;
     metadata: unknown;
     /** 落库前的 roomsBilled 快照（审计 before 用）。*/
     roomsBilled: number | null;
@@ -358,7 +430,7 @@ async function loadLockedOrders(
           randomStarTier: true,
           metadata: true,
           roomsBilled: true,
-          hotelRoomType: { select: { hotelId: true } },
+          hotelRoomType: { select: { hotelId: true, hotel: { select: { randomTierPlaceholder: true } } } },
         },
       },
     },
@@ -380,6 +452,7 @@ async function loadLockedOrders(
         hotelCheckOut: it.hotelCheckOut,
         hotelId: it.hotelRoomType?.hotelId ?? null,
         randomStarTier: it.randomStarTier,
+        placeholderTier: it.hotelRoomType?.hotel?.randomTierPlaceholder ?? null,
         metadata: it.metadata,
         roomsBilled: it.roomsBilled == null ? null : Number(it.roomsBilled.toString()),
       })),
@@ -478,6 +551,38 @@ export function readBillingFraction(g: Record<string, unknown>): number {
   if (raw === null || raw === undefined) return fallback;
   const n = Number(raw);
   return Number.isFinite(n) ? n : fallback;
+}
+
+/**
+ * 一张订单变更后的行级 roomsBilled（纯函数，闸前算、落库时写）：
+ * 按 orderItemId 去重后求和（同一行若被拆成多个 group——正常只会有一个普通组 + 至多多个
+ * 共享组，见 §三「一条酒店行可能同时有普通房和多个共享房」——按行累加）。
+ *
+ * 显式回写的行 = 本次新 groups 引用到的行 ∪ 变更前旧 groups 引用过的行。前者按新值写
+ * （哪怕算出 0 也写 0，不留 null——null 会重新激活 metadata 兜底）；后者若这次不再被
+ * 任何组引用（乘客被整体搬去挂在另一条行的房组/共享房），同样要显式写 0——否则那条行
+ * 的乘客已经没有任何房组承载，roomsBilled 却还停在搬走前的旧值，两本账对不上。
+ * 变更前后都没有房组引用过的行（从未分房，roomsBilled 是录单时算的）不在返回值里，保持不动。
+ *
+ * 随机池口径正是靠它成立：池占用 = Σ 未落位行 roomsBilled（床位口径），Σ份额=1 硬校验之下，
+ * 一间档次房的成员行合计恒为 1，「三张单合一间档次房」在池里只占 1 间。
+ */
+export function planRoomsBilledAfter(
+  oldGroups: ReadonlyArray<Record<string, unknown>>,
+  newGroups: ReadonlyArray<Record<string, unknown>>,
+): Record<string, number> {
+  const roomsByItemId = new Map<string, number>();
+  for (const g of newGroups) {
+    const itemId = groupOrderItemId(g);
+    if (!itemId) continue;
+    roomsByItemId.set(itemId, (roomsByItemId.get(itemId) ?? 0) + readBillingFraction(g));
+  }
+  const oldItemIds = new Set(oldGroups.map((g) => groupOrderItemId(g)).filter((v): v is string => v != null));
+  const out: Record<string, number> = {};
+  for (const itemId of new Set<string>([...roomsByItemId.keys(), ...oldItemIds])) {
+    out[itemId] = roundFraction(roomsByItemId.get(itemId) ?? 0);
+  }
+  return out;
 }
 
 /**
@@ -601,8 +706,10 @@ export async function saveSharedRooms(
   actor: AuditActor,
   client: PrismaClient = defaultPrisma,
 ): Promise<SaveSharedRoomsResult> {
+  // 指纹：酒店房保持与档次房上线前**完全相同**的键集合（部署窗口内仍在幂等保留期的旧占位行
+  // 才能继续按指纹回放 / 判冲突）；只有档次房才多带 randomStarTier 这一键。
   const fingerprint = canonicalJson({
-    hotelId: body.hotelId,
+    ...(body.hotelId != null ? { hotelId: body.hotelId } : { randomStarTier: body.randomStarTier }),
     checkIn: body.checkIn,
     checkOut: body.checkOut,
     expectedVersions: body.expectedVersions ?? {},
@@ -643,13 +750,25 @@ async function saveSharedRoomsInner(
   const nightDates = expandNights(body.checkIn, body.checkOut);
   if (nightDates.length === 0) throw new BadRequestError('入住日必须早于退房日');
 
-  const hotel = await client.hotel.findUnique({
-    where: { id: body.hotelId },
-    select: { id: true, randomTierPlaceholder: true },
-  });
-  if (!hotel) throw new NotFoundError('酒店不存在');
-  if (hotel.randomTierPlaceholder != null) {
-    throw new BadRequestError('占位酒店不参与跨单分房，请先把随机档落位到真实酒店');
+  // 作用域：酒店房（hotelId）或档次房（randomStarTier），二选一由 schema 保证。
+  // 档次房 2026-09-20 起开放：随机档还没落位的单先在池里合住，落位走「整房落位」整间转酒店房。
+  const isTierMode = body.randomStarTier != null;
+  const scope: SharedRoomScope = isTierMode
+    ? { randomStarTier: body.randomStarTier! }
+    : { hotelId: body.hotelId! };
+  const scopeWhere = sharedRoomScopeWhere(scope);
+  const hotelId = body.hotelId ?? null;
+  const tier = body.randomStarTier ?? null;
+
+  if (hotelId != null) {
+    const hotel = await client.hotel.findUnique({
+      where: { id: hotelId },
+      select: { id: true, randomTierPlaceholder: true },
+    });
+    if (!hotel) throw new NotFoundError('酒店不存在');
+    if (hotel.randomTierPlaceholder != null) {
+      throw new BadRequestError('占位酒店不是真实酒店，随机档合住请选「X星随机池」作用域');
+    }
   }
 
   const roomIdsBeingSaved = new Set(
@@ -696,7 +815,7 @@ async function saveSharedRoomsInner(
         where: {
           passengerId: { in: [...allRequestedPassengerIds] },
           sharedRoomId: { notIn: [...explicitTouchedSharedRoomIds] },
-          sharedRoom: { hotelId: body.hotelId, checkIn: checkInD, checkOut: checkOutD, status: 'ACTIVE' },
+          sharedRoom: { ...scopeWhere, checkIn: checkInD, checkOut: checkOutD, status: 'ACTIVE' },
         },
         select: { sharedRoomId: true },
       });
@@ -725,7 +844,7 @@ async function saveSharedRoomsInner(
         where: {
           passengerId: { in: [...allRequestedPassengerIds] },
           sharedRoomId: { notIn: [...explicitTouchedSharedRoomIds] },
-          sharedRoom: { hotelId: body.hotelId, checkIn: checkInD, checkOut: checkOutD, status: 'ACTIVE' },
+          sharedRoom: { ...scopeWhere, checkIn: checkInD, checkOut: checkOutD, status: 'ACTIVE' },
         },
         select: { sharedRoomId: true },
       });
@@ -747,7 +866,7 @@ async function saveSharedRoomsInner(
     // ── expectedVersions CAS：先于业务校验判——版本对不上就是「这把牌已经不是你看到的那把」──
     const currentSharedRooms = await tx.sharedRoom.findMany({
       where: { id: { in: [...touchedSharedRoomIds] } },
-      select: { id: true, version: true, hotelId: true, checkIn: true, checkOut: true, status: true },
+      select: { id: true, version: true, hotelId: true, randomStarTier: true, checkIn: true, checkOut: true, status: true },
     });
     const currentById = new Map(currentSharedRooms.map((r) => [r.id, r]));
     for (const roomId of touchedSharedRoomIds) {
@@ -765,8 +884,11 @@ async function saveSharedRoomsInner(
       if (expected == null || expected !== current.version) {
         throw new ConflictError('该房间已被他人修改，请刷新后重试');
       }
-      if (current.hotelId !== body.hotelId) {
-        throw new BadRequestError(`共享房 ${roomId} 不属于本酒店`);
+      // 作用域一致：酒店房对 hotelId，档次房对 randomStarTier。已整房落位的档次房此时
+      // randomStarTier 已清空、hotelId 已写——用旧的档次作用域再来「更新」它会在这里被拒。
+      const scopeMatches = isTierMode ? current.randomStarTier === tier : current.hotelId === hotelId;
+      if (!scopeMatches) {
+        throw new BadRequestError(`共享房 ${roomId} 不属于本${isTierMode ? '随机档' : '酒店'}`);
       }
       // 会被保留/更新的房间（不在本次 dissolve 列表里）：锁内强制校验 ACTIVE + 入住区间与
       // 本次请求完全一致（astra A3）——否则「更新」一间已解散的房会把它悄悄复活成幽灵房
@@ -852,13 +974,19 @@ async function saveSharedRoomsInner(
       warnings.push(message);
     };
     for (const room of body.rooms) {
-      const roomType = await tx.hotelRoomType.findUnique({
-        where: { id: room.hotelRoomTypeId },
-        select: { id: true, hotelId: true, capacity: true, name: true },
-      });
-      if (!roomType || roomType.hotelId !== body.hotelId) {
-        throw new BadRequestError('房型不存在或不属于本酒店');
+      // 酒店房：房型必须属于本酒店；档次房：没有房型（schema 已禁止传），容量按缺省阈值提示。
+      let roomType: { id: string; hotelId: string; capacity: number; name: string } | null = null;
+      if (!isTierMode) {
+        roomType = await tx.hotelRoomType.findUnique({
+          where: { id: room.hotelRoomTypeId! },
+          select: { id: true, hotelId: true, capacity: true, name: true },
+        });
+        if (!roomType || roomType.hotelId !== hotelId) {
+          throw new BadRequestError('房型不存在或不属于本酒店');
+        }
       }
+      const roomLabel = roomType ? roomType.name : randomStarTierLabel(tier!);
+      const roomCapacity = roomType ? roomType.capacity : TIER_ROOM_DEFAULT_CAPACITY;
       // Σ份额=1（按 orderId+orderItemId 去重——同一 group 内的多名乘客共享同一份额值，不重复求和）
       const fractionByOrderItem = new Map<string, number>();
       let totalPassengers = 0;
@@ -870,7 +998,7 @@ async function saveSharedRoomsInner(
         const orderItemKey = `${g.orderId}:${g.orderItemId}`;
         if (fractionByOrderItem.has(orderItemKey)) {
           throw new BadRequestError(
-            `房间「${room.hotelRoomTypeId}」里订单行 ${g.orderItemId} 出现了不止一个成员组，请合并成一组再提交`,
+            `房间「${roomLabel}」里订单行 ${g.orderItemId} 出现了不止一个成员组，请合并成一组再提交`,
           );
         }
         const order = orders.get(g.orderId);
@@ -882,18 +1010,35 @@ async function saveSharedRoomsInner(
           throw new BadRequestError(`订单 ${g.orderId} 不存在或不处于房控有效状态`);
         }
         const item = order.items.find((it) => it.id === g.orderItemId);
-        if (
-          !item ||
-          item.hotelRoomTypeId == null ||
-          (item.kind !== OrderItemKind.HOTEL && item.kind !== OrderItemKind.BUNDLE)
-        ) {
+        if (!item || (item.kind !== OrderItemKind.HOTEL && item.kind !== OrderItemKind.BUNDLE)) {
           throw new BadRequestError(`订单行 ${g.orderItemId} 不是本单的酒店/套餐行`);
         }
-        if (item.hotelId !== body.hotelId) {
-          throw new BadRequestError(`订单行 ${g.orderItemId} 不属于本酒店`);
-        }
-        if (item.randomStarTier != null) {
-          throw new BadRequestError(`订单行 ${g.orderItemId} 是未落位的随机档，不能跨单分房`);
+        // 不许跨模式混入：酒店房里混进未落位随机行 400；档次房里混进已落位真酒店行 400。
+        const itemTier = itemPendingTier(item);
+        if (isTierMode) {
+          if (itemTier == null) {
+            throw new BadRequestError(
+              `订单行 ${g.orderItemId} 已落位到真实酒店，不能分进${randomStarTierLabel(tier!)}的档次房，请在该酒店的跨单分房里操作`,
+            );
+          }
+          if (itemTier !== tier) {
+            throw new BadRequestError(
+              `订单行 ${g.orderItemId} 是${randomStarTierLabel(itemTier)}，不属于${randomStarTierLabel(tier!)}`,
+            );
+          }
+        } else {
+          // 先判随机档（形态①没有房型，不能被下面「不是酒店行」的泛化文案吞掉）
+          if (itemTier != null) {
+            throw new BadRequestError(
+              `订单行 ${g.orderItemId} 是未落位的随机档，请在「${randomStarTierLabel(itemTier)}池」作用域里跨单分房`,
+            );
+          }
+          if (item.hotelRoomTypeId == null) {
+            throw new BadRequestError(`订单行 ${g.orderItemId} 不是本单的酒店/套餐行`);
+          }
+          if (item.hotelId !== hotelId) {
+            throw new BadRequestError(`订单行 ${g.orderItemId} 不属于本酒店`);
+          }
         }
         if (
           !item.hotelCheckIn ||
@@ -976,10 +1121,10 @@ async function saveSharedRoomsInner(
               .map((oid) => orders.get(oid)?.orderNumber ?? oid)
               .sort();
             throw new BadRequestError(
-              `房间「${roomType.name}」漏列了当前在住的计费方：${missingOrderNumbers.join('、')}，请把他们一并列入本次提交再保存`,
+              `房间「${roomLabel}」漏列了当前在住的计费方：${missingOrderNumbers.join('、')}，请把他们一并列入本次提交再保存`,
             );
           }
-          throw new BadRequestError(`房间「${roomType.name}」的计费份额合计须为 1，当前为 ${totalFraction}`);
+          throw new BadRequestError(`房间「${roomLabel}」的计费份额合计须为 1，当前为 ${totalFraction}`);
         }
         orphanedLeftoverRoomIds.add(room.sharedRoomId!);
         const survivorOrderIds = [...new Set(room.groups.map((g) => g.orderId))];
@@ -996,9 +1141,11 @@ async function saveSharedRoomsInner(
           orphanWarningsByOrderId.set(oid, list);
         }
       }
-      if (roomType.capacity > 0 && totalPassengers > roomType.capacity) {
+      if (roomCapacity > 0 && totalPassengers > roomCapacity) {
         warnings.push(
-          `房型容量 ${roomType.capacity} 人，本次分入 ${totalPassengers} 人，超出容量提示（不拦截）`,
+          roomType
+            ? `房型容量 ${roomCapacity} 人，本次分入 ${totalPassengers} 人，超出容量提示（不拦截）`
+            : `档次房按 ${roomCapacity} 人/间提示，本次分入 ${totalPassengers} 人，超出容量提示（不拦截，落位后按真实房型容量）`,
         );
       }
     }
@@ -1200,13 +1347,19 @@ async function saveSharedRoomsInner(
     const roomTypeCache = new Map<string, { name: string }>();
     for (let roomIndex = 0; roomIndex < body.rooms.length; roomIndex++) {
       const room = body.rooms[roomIndex];
-      if (!roomTypeCache.has(room.hotelRoomTypeId)) {
+      // 房组文本：酒店房写房型名；档次房写「待落位」（与 room-group-placement 未落位口径一致，
+      // 酒店格由导出/编辑器按行上的档次派生成「X星随机（待落位）」）。
+      if (room.hotelRoomTypeId != null && !roomTypeCache.has(room.hotelRoomTypeId)) {
         const rt = await tx.hotelRoomType.findUnique({
           where: { id: room.hotelRoomTypeId },
           select: { name: true },
         });
         roomTypeCache.set(room.hotelRoomTypeId, { name: rt?.name ?? '' });
       }
+      const groupRoomTypeText =
+        room.hotelRoomTypeId != null
+          ? (roomTypeCache.get(room.hotelRoomTypeId)?.name ?? '')
+          : PENDING_PLACEMENT_ROOM_TYPE;
       const sharedRoomId = resolvedRoomIds[roomIndex];
       for (const g of room.groups) {
         const arr = newGroupsByOrder.get(g.orderId) ?? [];
@@ -1222,7 +1375,7 @@ async function saveSharedRoomsInner(
         arr.push({
           id: groupId,
           hotelName: '',
-          roomType: roomTypeCache.get(room.hotelRoomTypeId)?.name ?? '',
+          roomType: groupRoomTypeText,
           passengerIds: g.passengerIds,
           orderItemId: g.orderItemId,
           roomFraction: g.roomFraction,
@@ -1233,12 +1386,41 @@ async function saveSharedRoomsInner(
       }
     }
 
+    // ── 行级 roomsBilled 变更后的值（纯函数，先算好；两处用：随机档闸的增量、落库回写）──
+    const plannedRoomsBilledByOrder = new Map<string, Record<string, number>>();
+    for (const [orderId, order] of orders) {
+      plannedRoomsBilledByOrder.set(
+        orderId,
+        planRoomsBilledAfter(parseRoomGroups(order.roomAssignment), newGroupsByOrder.get(orderId) ?? []),
+      );
+    }
+
+    if (isTierMode) {
+      // ── 随机档闸：池是床位/计费口径（Σ roomsBilled），Σ份额=1 已保证一间档次房恒占 1 间；
+      // 这里只判受影响行 roomsBilled 的逐晚增量装不装得下（口径与文案见
+      // assertRandomTierFitAfterChange）。只算本档未落位的行——别的酒店 / 别的档的行不在本闸范围。
+      const billedDeltas: RandomTierBilledDelta[] = [];
+      for (const [orderId, order] of orders) {
+        const planned = plannedRoomsBilledByOrder.get(orderId) ?? {};
+        for (const [itemId, after] of Object.entries(planned)) {
+          const item = order.items.find((it) => it.id === itemId);
+          if (!item || itemPendingTier(item) !== tier) continue;
+          const before = itemRoomCount({ roomsBilled: item.roomsBilled, metadata: item.metadata });
+          billedDeltas.push({
+            hotelCheckIn: item.hotelCheckIn,
+            hotelCheckOut: item.hotelCheckOut,
+            delta: roundFraction(after - before),
+          });
+        }
+      }
+      await assertRandomTierFitAfterChange(tx, tier!, nightDates, { billedDeltas });
+    } else {
     // ── §五闸：受影响订单在本酒店变更后的占房快照 + 共享房变更后状态 ─────────
     const nextOrderItems = new Map<string, PhysicalOccupancyItem[]>();
     for (const [orderId, order] of orders) {
       const newGroups = newGroupsByOrder.get(orderId) ?? [];
       const itemsAtHotel: PhysicalOccupancyItem[] = order.items
-        .filter((it) => it.hotelId === body.hotelId)
+        .filter((it) => it.hotelId === hotelId)
         .map((it) => ({
           id: it.id,
           hotelCheckIn: it.hotelCheckIn,
@@ -1260,7 +1442,7 @@ async function saveSharedRoomsInner(
     for (const roomId of dissolveSet) {
       nextSharedRooms.push({
         sharedRoomId: roomId,
-        hotelId: body.hotelId,
+        hotelId: hotelId!,
         checkIn: checkInD,
         checkOut: checkOutD,
         activeMemberOrderIds: [],
@@ -1280,7 +1462,7 @@ async function saveSharedRoomsInner(
       ];
       nextSharedRooms.push({
         sharedRoomId: resolvedRoomIds[roomIndex], // 新房也带上——与订单 JSON/落库用的是同一个 id
-        hotelId: body.hotelId,
+        hotelId: hotelId!,
         checkIn: checkInD,
         checkOut: checkOutD,
         activeMemberOrderIds: activeOrderIds,
@@ -1313,7 +1495,7 @@ async function saveSharedRoomsInner(
         });
         nextSharedRooms.push({
           sharedRoomId: roomId,
-          hotelId: body.hotelId,
+          hotelId: hotelId!,
           checkIn: current.checkIn,
           checkOut: current.checkOut,
           activeMemberOrderIds: survivorOrderIds,
@@ -1321,12 +1503,13 @@ async function saveSharedRoomsInner(
       }
     }
 
-    await assertHotelFitAfterChange(tx, body.hotelId, nightDates, {
+    await assertHotelFitAfterChange(tx, hotelId!, nightDates, {
       affectedOrderIds: [...orders.keys()],
       nextOrderItems,
       nextSharedRooms,
       options: { allowNonWorsening: true },
     });
+    }
 
     // ── 落库：SharedRoom / SharedRoomMember / 订单 JSON / roomsBilled ────────
     const savedRooms: Array<{ sharedRoomId: string; version: number }> = [];
@@ -1377,7 +1560,8 @@ async function saveSharedRoomsInner(
         const updated = await tx.sharedRoom.update({
           where: { id: sharedRoomId },
           data: {
-            hotelRoomTypeId: room.hotelRoomTypeId,
+            // 档次房没有房型（schema 已禁止传），不动这一列；作用域一致性在上面 CAS 段已判。
+            ...(room.hotelRoomTypeId != null ? { hotelRoomTypeId: room.hotelRoomTypeId } : {}),
             notes: room.notes ?? null,
             // checkIn/checkOut 显式带上（虽然上面的 CAS 循环已经强制校验它们与本次请求一致，
             // 这里再写一遍纯属防御：万一以后那道校验被改坏，落库这行仍然不会悄悄挪日期）。
@@ -1420,8 +1604,10 @@ async function saveSharedRoomsInner(
         const created = await tx.sharedRoom.create({
           data: {
             id: sharedRoomId, // 显式传 id，覆盖 @default(cuid())——必须等于上面 JSON 里已经写的值
-            hotelId: body.hotelId,
-            hotelRoomTypeId: room.hotelRoomTypeId,
+            // 酒店房 / 档次房二选一（迁移 CHECK 约束兜底）
+            hotelId,
+            hotelRoomTypeId: room.hotelRoomTypeId ?? null,
+            randomStarTier: tier,
             checkIn: checkInD,
             checkOut: checkOutD,
             notes: room.notes ?? null,
@@ -1458,28 +1644,9 @@ async function saveSharedRoomsInner(
         where: { id: orderId },
         data: { roomAssignment: { roomGroups: groups } as unknown as object },
       });
-      // roomsBilled：按 orderItemId 去重后求和（同一行若被拆成多个 group——正常只会有一个
-      // 普通组 + 至多多个共享组，见 §三「一条酒店行可能同时有普通房和多个共享房」——按行累加）。
-      const roomsByItemId = new Map<string, number>();
-      for (const g of groups) {
-        const itemId = groupOrderItemId(g);
-        if (!itemId) continue;
-        roomsByItemId.set(itemId, (roomsByItemId.get(itemId) ?? 0) + readBillingFraction(g));
-      }
-      // 显式回写的行 = 本次新 groups 引用到的行 ∪ 变更前旧 groups 引用过的行。前者按新值写
-      // （哪怕算出 0 也写 0，不留 null——null 会重新激活 metadata 兜底）；后者若这次不再被
-      // 任何组引用（乘客被整体搬去挂在另一条行的房组/共享房），同样要显式写 0——否则那条行
-      // 的乘客已经没有任何房组承载，roomsBilled 却还停在搬走前的旧值，两本账对不上。
-      // 变更前后都没有房组引用过的行（从未分房，roomsBilled 是录单时算的）保持不动。
-      const oldGroupsForOrder = parseRoomGroups(order.roomAssignment);
-      const oldItemIds = new Set(
-        oldGroupsForOrder.map((g) => groupOrderItemId(g)).filter((v): v is string => v != null),
-      );
-      const itemIdsToWrite = new Set<string>([...roomsByItemId.keys(), ...oldItemIds]);
-      const afterRoomsBilled: Record<string, number> = {};
-      for (const itemId of itemIdsToWrite) {
-        const rooms = roundFraction(roomsByItemId.get(itemId) ?? 0);
-        afterRoomsBilled[itemId] = rooms;
+      // roomsBilled：闸前用 planRoomsBilledAfter 算好的行级新值（口径见该函数注释），这里只落库。
+      const afterRoomsBilled = plannedRoomsBilledByOrder.get(orderId) ?? {};
+      for (const [itemId, rooms] of Object.entries(afterRoomsBilled)) {
         await tx.orderItem.update({
           where: { id: itemId },
           data: { roomsBilled: new Prisma.Decimal(rooms) },
@@ -1579,7 +1746,7 @@ async function saveSharedRoomsInner(
         action: 'SAVE_SHARED_ROOMS',
         targetType: 'ORDER',
         targetId: primaryOrderId,
-        targetLabel: `${body.hotelId} ${body.checkIn}→${body.checkOut}`,
+        targetLabel: `${scopeLabel(scope)} ${body.checkIn}→${body.checkOut}`,
         after: {
           rooms: finalResult.rooms,
           dissolved: finalResult.dissolved,

@@ -3403,7 +3403,11 @@ export interface HotelControlAlerts {
    */
   sharedRoomOrphaned: Array<{
     sharedRoomId: string;
-    hotelId: string;
+    /** 酒店房的酒店 id；档次房为 null（看 randomStarTier）。 */
+    hotelId: string | null;
+    /** 档次房的档次；酒店房为 null。 */
+    randomStarTier: number | null;
+    /** 酒店名；档次房给「X星随机」。 */
     hotelName: string;
     checkIn: string; // YYYY-MM-DD
     checkOut: string; // YYYY-MM-DD
@@ -7682,12 +7686,18 @@ export const hotelControlOpsApi = {
    */
   getSharedRoomWorkbench: (
     token: string,
-    params: { hotelId: string; checkIn: string; checkOut: string },
-  ) =>
-    apiFetch<SharedRoomWorkbench>(
-      `/hotel-control/shared-rooms/workbench?hotelId=${encodeURIComponent(params.hotelId)}&checkIn=${encodeURIComponent(params.checkIn)}&checkOut=${encodeURIComponent(params.checkOut)}`,
+    params: { hotelId?: string; randomStarTier?: RandomStarTier; checkIn: string; checkOut: string },
+  ) => {
+    // 作用域二选一：酒店房按 hotelId；档次房（随机档待落位的单跨单合住）按 randomStarTier。
+    const scope =
+      params.randomStarTier != null
+        ? `randomStarTier=${params.randomStarTier}`
+        : `hotelId=${encodeURIComponent(params.hotelId ?? '')}`;
+    return apiFetch<SharedRoomWorkbench>(
+      `/hotel-control/shared-rooms/workbench?${scope}&checkIn=${encodeURIComponent(params.checkIn)}&checkOut=${encodeURIComponent(params.checkOut)}`,
       { token },
-    ),
+    );
+  },
 
   /**
    * 跨单分房保存：新建/改动共享房（Σ份额须=1，服务端 400）+ 整间解散。ADMIN/STAFF only。
@@ -7697,6 +7707,18 @@ export const hotelControlOpsApi = {
    */
   saveSharedRooms: (token: string, body: SaveSharedRoomsBody) =>
     apiFetch<SaveSharedRoomsResult>('/hotel-control/shared-rooms', { method: 'PUT', token, body }),
+
+  /**
+   * 档次共享房整房落位：全部成员行一起落到同一家真实酒店同一房型，共享房原地转酒店房（不解绑）。
+   * 差价须为 0（目标酒店有指定酒店加价 / 套餐档次与星级不符 → 400 列出是谁）；版本不符 409。
+   * 对应 backend/src/modules/hotel-control/shared-room-placement.ts placeSharedRoom。
+   */
+  placeSharedRoom: (token: string, sharedRoomId: string, body: PlaceSharedRoomBody) =>
+    apiFetch<PlaceSharedRoomResult>(`/hotel-control/shared-rooms/${encodeURIComponent(sharedRoomId)}/place`, {
+      method: 'POST',
+      token,
+      body,
+    }),
 };
 
 // ── 跨单分房工作台类型（§七，v2 方案）── 字段与形状照抄后端实现（真值以代码为准）：
@@ -7711,8 +7733,12 @@ export interface SharedRoomWorkbenchPassenger {
 
 export interface SharedRoomWorkbenchOrderItem {
   id: string;
+  /** 已落位行的房型 id；无房型的随机行为空串。 */
   hotelRoomTypeId: string;
+  /** 已落位 = 房型名；未落位 = 「X星随机（待落位）」。 */
   roomTypeName: string;
+  /** 未落位档次（随机档作用域下恒非空）；已落位真酒店为 null。 */
+  randomStarTier: number | null;
   roomsBilled: number | null;
   /** 当前所在位置：null=未分房；普通房组给 groupId；共享房给 sharedRoomId。 */
   currentGroupId: string | null;
@@ -7755,14 +7781,21 @@ export interface SharedRoomWorkbenchRoomMember {
 
 export interface SharedRoomWorkbenchRoom {
   sharedRoomId: string;
-  hotelRoomTypeId: string;
+  /** 酒店房的酒店 / 房型；档次房两者为 null，看 randomStarTier。 */
+  hotelId: string | null;
+  hotelRoomTypeId: string | null;
+  /** 档次房的档次；酒店房为 null。 */
+  randomStarTier: number | null;
   version: number;
   notes: string | null;
   members: SharedRoomWorkbenchRoomMember[];
 }
 
 export interface SharedRoomWorkbench {
-  hotelId: string;
+  /** 酒店作用域给酒店 id；随机档作用域为 null。 */
+  hotelId: string | null;
+  /** 随机档作用域给档次；酒店作用域为 null。 */
+  randomStarTier: number | null;
   checkIn: string;
   checkOut: string;
   orders: SharedRoomWorkbenchOrder[];
@@ -7781,13 +7814,16 @@ export interface SaveSharedRoomGroupInput {
 export interface SaveSharedRoomInput {
   /** 缺省 = 新建（服务端生成 id）；非空 = 改动既有共享房（须在 expectedVersions 给出期望版本）。 */
   sharedRoomId?: string;
-  hotelRoomTypeId: string;
+  /** 酒店房必填；档次房（body.randomStarTier）必须省略。 */
+  hotelRoomTypeId?: string;
   notes?: string;
   groups: SaveSharedRoomGroupInput[];
 }
 
 export interface SaveSharedRoomsBody {
-  hotelId: string;
+  /** 作用域二选一：酒店房给 hotelId，档次房给 randomStarTier。 */
+  hotelId?: string;
+  randomStarTier?: RandomStarTier;
   checkIn: string;
   checkOut: string;
   requestToken: string;
@@ -7805,6 +7841,24 @@ export interface SaveSharedRoomsResult {
   /** N6：本次触及「Σ有效份额=0」（原计费方已迁出、剩下的都是留守成员）的共享房 id，
    *  供工作台把这几间房标红——不用再从 warnings 的自然语言文案里反查是哪几间房。 */
   orphanedSharedRoomIds: string[];
+}
+
+/** POST /hotel-control/shared-rooms/:id/place 请求体。 */
+export interface PlaceSharedRoomBody {
+  hotelRoomTypeId: string;
+  /** 工作台读到的版本；不一致 409。 */
+  expectedVersion: number;
+}
+
+export interface PlaceSharedRoomResult {
+  sharedRoomId: string;
+  version: number;
+  hotelId: string;
+  hotelRoomTypeId: string;
+  hotelName: string;
+  roomTypeName: string;
+  placedItems: Array<{ orderId: string; orderNumber: string; orderItemId: string }>;
+  warnings: string[];
 }
 
 // ── 结算价 / 议价申请（代理对自家单：锁价前自己改立即生效，锁价后走「提交申请 → 运营确认」）── 独立命名空间，

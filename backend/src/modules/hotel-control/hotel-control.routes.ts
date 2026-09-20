@@ -44,6 +44,7 @@ import {
   recentChangesQuerySchema,
   randomTierShortfallQuerySchema,
   updateBlockPeriodBodySchema,
+  placeSharedRoomBodySchema,
 } from './hotel-control.schemas.js';
 import {
   createBlockPeriod,
@@ -65,6 +66,7 @@ import {
 } from './hotel-control.service.js';
 import { getRandomTierShortfall } from './hotel-control.shortfall.js';
 import { getSharedRoomWorkbench, saveSharedRooms } from './hotel-control.shared-rooms.js';
+import { placeSharedRoom } from './shared-room-placement.js';
 import {
   sharedRoomWorkbenchQuerySchema,
   saveSharedRoomsBodySchema,
@@ -345,14 +347,23 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
   });
 
   // ── 跨单分房工作台（§七）：ADMIN/STAFF only，代理不开放 ───────────────────
+  // 作用域 hotelId | randomStarTier 二选一（schema refine 保证）：酒店房 vs 档次房。
   app.get('/shared-rooms/workbench', requireStaff, async (req) => {
     const q = sharedRoomWorkbenchQuerySchema.parse(req.query);
-    return getSharedRoomWorkbench(q.hotelId, q.checkIn, q.checkOut);
+    const scope = q.hotelId ? { hotelId: q.hotelId } : { randomStarTier: q.randomStarTier! };
+    return getSharedRoomWorkbench(scope, q.checkIn, q.checkOut);
   });
 
   app.put('/shared-rooms', requireStaff, async (req) => {
     const body = saveSharedRoomsBodySchema.parse(req.body);
     const result = await saveSharedRooms(body, actorFromRequest(req));
     return result;
+  });
+
+  // ── 档次共享房整房落位：全部成员行一起落到同一家真实酒店同一房型，共享房原地转酒店房 ──
+  app.post('/shared-rooms/:id/place', requireStaff, async (req) => {
+    const { id } = req.params as { id: string };
+    const body = placeSharedRoomBodySchema.parse(req.body);
+    return placeSharedRoom(id, body, actorFromRequest(req));
   });
 };
