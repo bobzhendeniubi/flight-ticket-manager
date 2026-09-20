@@ -539,3 +539,104 @@ describe('OrderService.createOrder · 套餐(机票航段 + 地面行) · 真 DB
     expect(Number(bundleItem!.amount)).toBeGreaterThan(0);
   });
 });
+
+// ══════════════════════════════════════════════════════════════════════════
+// (d) 代理自助结算价 · 批量创单（2026-09-20 与单张录单同口径）
+//     · 归属服务端强制取本人（无视 body.agentId）
+//     · 逐人价 / 整批价一律走子单「本单结算总价」差额留痕（机票行仍是系统价）
+//     · 差额超上限 → 该子单 400、不扣座
+// ══════════════════════════════════════════════════════════════════════════
+async function createAgentRequester(): Promise<{ requester: OrderRequester; agentId: string }> {
+  const u = await createUser(UserRole.AGENT);
+  const agent = await prisma.agent.create({
+    data: { userId: u.id, contactName: '测试代理', contactPhone: '13800138000' },
+  });
+  return { requester: { userId: u.id, role: UserRole.AGENT, agentId: agent.id }, agentId: agent.id };
+}
+
+describe('OrderService.batchCreateOrders · AGENT 代理自助结算价 · 真 DB E2E', () => {
+  it('逐人价 + 整批价 → 落自家单（无视 body.agentId）、机票行仍系统价、差额落 SETTLEMENT 行、审计带 selfService', async () => {
+    const own = await createAgentRequester();
+    const other = await createAgentRequester();
+    const outbound = await createSchedule({ capacity: 50, sold: 0, basePrice: 1000 });
+
+    const result = await service.batchCreateOrders(
+      {
+        productType: 'FLIGHT_ONEWAY',
+        outboundScheduleId: outbound.id,
+        flightCabin: CabinClass.ECONOMY,
+        description: 'MFM→DAD 单程',
+        // 传别家 agentId：服务端必须无视，归属仍是本人
+        agentId: other.agentId,
+        settlementPriceCny: 1100,
+        passengers: [{ ...passenger(51), settlementPriceCny: 1200 }, passenger(52)],
+      },
+      own.requester,
+    );
+
+    expect(result.failureCount).toBe(0);
+    expect(result.successCount).toBe(2);
+    expect(await soldEconomy(outbound.id)).toBe(2);
+
+    const first = await prisma.order.findUniqueOrThrow({
+      where: { id: result.results[0].orderId! },
+      include: { items: true },
+    });
+    const second = await prisma.order.findUniqueOrThrow({
+      where: { id: result.results[1].orderId! },
+      include: { items: true },
+    });
+    // 归属强制本人，不是 body 里的别家
+    expect(first.agentId).toBe(own.agentId);
+    expect(second.agentId).toBe(own.agentId);
+    // 本人填的 > 整批填的
+    expect(Number(first.total)).toBe(1200);
+    expect(Number(second.total)).toBe(1100);
+    // 机票行仍是系统价（没被覆盖），差额落结算价差额行（正差额 = FEE 行，metadata.reasonCode=SETTLEMENT）
+    const isSettlementDiffLine = (it: { metadata: unknown }) =>
+      typeof it.metadata === 'object' &&
+      it.metadata !== null &&
+      (it.metadata as { reasonCode?: unknown }).reasonCode === 'SETTLEMENT';
+    const firstFlight = first.items.find((it) => it.kind === OrderItemKind.FLIGHT);
+    expect(firstFlight).toBeTruthy();
+    expect(Number(firstFlight!.unitPrice)).toBe(1000);
+    expect(firstFlight!.metadata).not.toMatchObject({ priceOverride: 'TEAM_SETTLEMENT' });
+    const firstSettlement = first.items.find(isSettlementDiffLine);
+    expect(firstSettlement).toBeTruthy();
+    expect(firstSettlement!.kind).toBe(OrderItemKind.FEE);
+    expect(Number(firstSettlement!.amount)).toBe(200);
+    expect(firstSettlement!.metadata).toMatchObject({ authoritativeTotalCny: 1000, settlementTotalCny: 1200 });
+    const secondSettlement = second.items.find(isSettlementDiffLine);
+    expect(secondSettlement).toBeTruthy();
+    expect(Number(secondSettlement!.amount)).toBe(100);
+
+    // 审计：与单张录单同一 action，selfService 标记代理自填
+    const audit = await prisma.auditLog.findFirst({
+      where: { action: 'APPLY_SETTLEMENT_TOTAL', targetId: first.id },
+    });
+    expect(audit).toBeTruthy();
+    expect(audit!.actorUserId).toBe(own.requester.userId);
+    expect(audit!.after).toMatchObject({ settlementTotalCny: 1200, diffCny: 200, selfService: true });
+  });
+
+  it('结算价与系统价差额超上限 → 该子单失败（400 文案），不扣座', async () => {
+    const own = await createAgentRequester();
+    const outbound = await createSchedule({ capacity: 50, sold: 0, basePrice: 150_000 });
+
+    const result = await service.batchCreateOrders(
+      {
+        productType: 'FLIGHT_ONEWAY',
+        outboundScheduleId: outbound.id,
+        flightCabin: CabinClass.ECONOMY,
+        description: 'MFM→DAD 单程',
+        passengers: [{ ...passenger(53), settlementPriceCny: 1 }],
+      },
+      own.requester,
+    );
+
+    expect(result.successCount).toBe(0);
+    expect(result.failureCount).toBe(1);
+    expect(result.results[0].error).toContain('超出调价上限');
+    expect(await soldEconomy(outbound.id)).toBe(0);
+  });
+});

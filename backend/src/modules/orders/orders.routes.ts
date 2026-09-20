@@ -302,9 +302,12 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
       if (hasAnySettlementPrice && hasDiscount) {
         return reply.status(400).send({ error: '优惠与团队议价结算价二选一' });
       }
-      // 团队议价结算价覆盖机票价：仅 ADMIN/STAFF 可用（AGENT 自助批量建单不得改价）。
+      // 结算价通道（整批价 / 逐人价）：ADMIN/STAFF = 团队议价；AGENT = 代理自助结算价（2026-09-20
+      // 拍板，与单张录单同口径：只落自家单、走差额留痕，服务端 batchCreateOrders → createOrder 收口）；
+      // 其余身份 403。
       const isOps = req.user.role === UserRole.ADMIN || req.user.role === UserRole.STAFF;
-      if (hasAnySettlementPrice && !isOps) {
+      const isAgent = req.user.role === UserRole.AGENT;
+      if (hasAnySettlementPrice && !isOps && !isAgent) {
         return reply.status(403).send({ error: '仅运营/管理员可指定团队议价结算价' });
       }
       // OTA 手动结算单价：仅 ADMIN/STAFF 可用（AGENT 自助批量建单不得手动定价）。

@@ -318,19 +318,33 @@ describe('batchCreateOrders · 逐人结算价（passengers[].settlementPriceCny
     expect(capturedTotals()).toEqual([3200, undefined]);
   });
 
-  it('套餐批量：AGENT 携带逐人结算价同样 BadRequestError 且未触库', async () => {
-    const createSpy = vi.spyOn(service as never, 'createOrder');
+  it('套餐批量：AGENT 自填逐人结算价 → 走子单「本单结算总价」差额通道，不盖机票行价；留空的乘客照旧走日历', async () => {
+    const { captured, capturedTotals } = wireCapture();
+    wireBundleLegs();
 
-    await expect(
-      service.batchCreateOrders(bundleBody([pax('WU/FEILAI', 'EB9452866', 3200)]), {
-        userId: 'u-agent',
-        role: 'AGENT',
-        agentId: 'agent-1',
-      } as never),
-    ).rejects.toThrow('无权指定团队议价结算价');
+    const res = await service.batchCreateOrders(
+      bundleBody([pax('WU/FEILAI', 'EB9452866', 3200), pax('LI/MING', 'EB9452867')]),
+      { userId: 'u-agent', role: 'AGENT', agentId: 'agent-1' } as never,
+    );
 
-    expect(mockPrisma.user.findUnique).not.toHaveBeenCalled();
-    expect(createSpy).not.toHaveBeenCalled();
+    expect(res.successCount).toBe(2);
+    expect(captured()).toEqual([undefined, undefined]);
+    expect(capturedTotals()).toEqual([3200, undefined]);
+  });
+
+  it('套餐批量：AGENT 填整批结算价 → 每张子单都落「本单结算总价」（一人一单即整单价），绝不走 flightSettlementPriceCny', async () => {
+    const { captured, capturedTotals } = wireCapture();
+    wireBundleLegs();
+
+    const res = await service.batchCreateOrders(
+      { ...bundleBody([pax('WU/FEILAI', 'EB9452866'), pax('LI/MING', 'EB9452867', 3000)]), settlementPriceCny: 3600 } as BatchCreateOrdersBody,
+      { userId: 'u-agent', role: 'AGENT', agentId: 'agent-1' } as never,
+    );
+
+    expect(res.successCount).toBe(2);
+    expect(captured()).toEqual([undefined, undefined]);
+    // 本人填的 > 整批填的
+    expect(capturedTotals()).toEqual([3600, 3000]);
   });
 
   it('套餐批量：逐人结算价与批量优惠互斥，且未触库', async () => {
@@ -347,7 +361,71 @@ describe('batchCreateOrders · 逐人结算价（passengers[].settlementPriceCny
     expect(mockPrisma.user.findUnique).not.toHaveBeenCalled();
   });
 
-  it('AGENT 携带逐人结算价 → BadRequestError（路由层 403 的服务端双保险），且未触库', async () => {
+  it('机票批量：AGENT 自填逐人 / 整批结算价 → 只走「本单结算总价」差额通道（本人填的 > 整批填的），不盖机票行价', async () => {
+    const { captured, capturedTotals } = wireCapture();
+
+    const res = await service.batchCreateOrders(
+      baseBody({
+        settlementPriceCny: 3600,
+        passengers: [pax('WU/FEILAI', 'EB9452866', 3200), pax('LI/MING', 'EB9452867')],
+      } as Partial<BatchCreateOrdersBody>),
+      { userId: 'u-agent', role: 'AGENT', agentId: 'a1' } as never,
+    );
+
+    expect(res.successCount).toBe(2);
+    // 代理绝不走 flightSettlementPriceCny（那条短路动态定价，createOrder 对 AGENT 一律拒）
+    expect(captured()).toEqual([undefined, undefined]);
+    expect(capturedTotals()).toEqual([3200, 3600]);
+  });
+
+  it('机票批量：AGENT 逐人 / 整批都留空 → 不带任何结算价通道（照旧结算价日历 / 动态定价）', async () => {
+    const { captured, capturedTotals } = wireCapture();
+
+    await service.batchCreateOrders(
+      baseBody({ passengers: [pax('WU/FEILAI', 'EB9452866')] } as Partial<BatchCreateOrdersBody>),
+      { userId: 'u-agent', role: 'AGENT', agentId: 'a1' } as never,
+    );
+
+    expect(captured()).toEqual([undefined]);
+    expect(capturedTotals()).toEqual([undefined]);
+  });
+
+  it('AGENT 传了别家 agentId 也照传给 createOrder（归属由 resolveOrderAgentId 无视 body.agentId 强制取本人）', async () => {
+    vi.spyOn(service as never, 'assertNoDuplicatePassengersOnFlights').mockResolvedValue(undefined as never);
+    const capturedAgentIds: Array<string | undefined> = [];
+    vi.spyOn(service as never, 'createOrder').mockImplementation((async (body: { agentId?: string }) => {
+      capturedAgentIds.push(body.agentId);
+      return { id: 'o-1', orderNumber: 'N-1' };
+    }) as never);
+
+    await service.batchCreateOrders(
+      baseBody({
+        agentId: 'agent-other',
+        passengers: [pax('WU/FEILAI', 'EB9452866', 3200)],
+      } as Partial<BatchCreateOrdersBody>),
+      { userId: 'u-agent', role: 'AGENT', agentId: 'a1' } as never,
+    );
+
+    // 批量层不改写 agentId；真归属在 createOrder → resolveOrderAgentId（AGENT 分支返回 requester.agentId，
+    // 已有单测覆盖），真 DB 全链路见 orders.batch-settlement.integration.test.ts。
+    expect(capturedAgentIds).toEqual(['agent-other']);
+  });
+
+  it('AGENT 账号没有代理档案（agentId 缺失）却带结算价 → BadRequestError，且未触库', async () => {
+    const createSpy = vi.spyOn(service as never, 'createOrder');
+
+    await expect(
+      service.batchCreateOrders(
+        baseBody({ passengers: [pax('WU/FEILAI', 'EB9452866', 3200)] } as Partial<BatchCreateOrdersBody>),
+        { userId: 'u-agent', role: 'AGENT' } as never,
+      ),
+    ).rejects.toThrow('代理账号未绑定代理档案，无法自填结算价');
+
+    expect(mockPrisma.user.findUnique).not.toHaveBeenCalled();
+    expect(createSpy).not.toHaveBeenCalled();
+  });
+
+  it('CUSTOMER 携带逐人结算价 → BadRequestError（路由层 403 的服务端双保险），且未触库', async () => {
     const createSpy = vi.spyOn(service as never, 'createOrder');
 
     await expect(
@@ -355,9 +433,26 @@ describe('batchCreateOrders · 逐人结算价（passengers[].settlementPriceCny
         baseBody({
           passengers: [pax('WU/FEILAI', 'EB9452866', 3200)],
         } as Partial<BatchCreateOrdersBody>),
-        { userId: 'u-agent', role: 'AGENT', agentId: 'a1' } as never,
+        { userId: 'u-cust', role: 'CUSTOMER' } as never,
       ),
     ).rejects.toThrow('无权指定团队议价结算价');
+
+    expect(mockPrisma.user.findUnique).not.toHaveBeenCalled();
+    expect(createSpy).not.toHaveBeenCalled();
+  });
+
+  it('AGENT 带 OTA 手动结算单价 → 仍拒（manualUnitPriceCny 只给运营，代理放开的只是结算价），且未触库', async () => {
+    const createSpy = vi.spyOn(service as never, 'createOrder');
+
+    await expect(
+      service.batchCreateOrders(
+        baseBody({
+          manualUnitPriceCny: 1000,
+          passengers: [pax('WU/FEILAI', 'EB9452866')],
+        } as Partial<BatchCreateOrdersBody>),
+        { userId: 'u-agent', role: 'AGENT', agentId: 'a1' } as never,
+      ),
+    ).rejects.toThrow('无权手动录入结算单价');
 
     expect(mockPrisma.user.findUnique).not.toHaveBeenCalled();
     expect(createSpy).not.toHaveBeenCalled();

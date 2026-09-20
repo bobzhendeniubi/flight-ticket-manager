@@ -2360,7 +2360,8 @@ export class OrderService {
     // 取本人，改的只可能是自家这一单的应收。只放开「结算总价 / 每人结算价」两个通道：
     //   · priceAdjustment 是运营的手工调价/加项通道（原因码语义、可与日历价叠加），仍仅 ADMIN/STAFF；
     //   · flightSettlementPriceCny 直接覆盖机票行单价、短路动态定价，代理可传 0 零元买票并真实扣座，
-    //     绝不放开（与 /orders/batch 的 settlementPriceCny 同口径，那条批量通道也照旧只给运营）。
+    //     绝不放开（/orders/batch 对 AGENT 的结算价一律改走本函数的 settlementTotalCny 通道，见
+    //     batchCreateOrders；运营的批量团队议价才走 flightSettlementPriceCny）。
     if (
       body.priceAdjustment ||
       body.settlementTotalCny !== undefined ||
@@ -6959,13 +6960,24 @@ export class OrderService {
     if (body.manualUnitPriceCny !== undefined && hasPerPaxSettlementPrice) {
       throw new BadRequestError('结算单价与团队议价结算价二选一，请勿同时填写');
     }
-    // 逐人结算价同样只给运营（服务端按认证身份判，不信前端；与路由层 403 双保险）。
-    if (
-      hasPerPaxSettlementPrice &&
-      requester.role !== UserRole.ADMIN &&
-      requester.role !== UserRole.STAFF
-    ) {
+    // 结算价通道（整批 settlementPriceCny / 逐人 passengers[].settlementPriceCny）的身份闸
+    // （服务端按认证身份判，不信前端；与路由层 403 双保险）：
+    //   · ADMIN/STAFF：团队议价，照旧走机票行覆盖价 / 本单结算总价两条通道（见下方逐单分流）；
+    //   · AGENT：代理自助结算价（2026-09-20 拍板，与单张录单 0903 口径同源）——只准落**自家**单
+    //     （归属由 createOrder → resolveOrderAgentId 无视 body.agentId 强制取本人），且只走
+    //     createOrder 的 settlementTotalCny 差额留痕通道（差额上限 ±PRICE_ADJUSTMENT_CAP_CNY、
+    //     审计 APPLY_SETTLEMENT_TOTAL 带 selfService），绝不走 flightSettlementPriceCny 覆盖机票行价
+    //     （那条会短路动态定价、可传 0 零元买票，createOrder 对 AGENT 一律拒）；
+    //   · 其余身份一律 400。
+    const isOpsRequester = requester.role === UserRole.ADMIN || requester.role === UserRole.STAFF;
+    const isAgentRequester = requester.role === UserRole.AGENT;
+    if (hasAnySettlementPrice && !isOpsRequester && !isAgentRequester) {
       throw new BadRequestError('无权指定团队议价结算价');
+    }
+    // 代理自助结算价的前提是「自家单」：登录代理没有代理档案（agentId 缺失）就没有「自家」可归属，
+    // 这批单会落成直客单——不许在直客单上自填结算价。
+    if (hasAnySettlementPrice && isAgentRequester && !requester.agentId) {
+      throw new BadRequestError('代理账号未绑定代理档案，无法自填结算价');
     }
     // OTA 手动结算单价权限（服务端按认证身份判，不信前端；与 createOrder 的 priceAdjustment 同口径）：
     // 仅 ADMIN/STAFF 可用，散客/AGENT 携带一律 400。放在最顶端（早于任何 prisma 调用）→ 未触库即拒。
@@ -7212,6 +7224,11 @@ export class OrderService {
           };
         }
 
+        // 代理自助结算价：本人填的 > 整批填的 > 留空（undefined）。非 AGENT 一律 undefined（不走这条）。
+        const agentSelfSettlementTotalCny = isAgentRequester
+          ? passenger.settlementPriceCny ?? body.settlementPriceCny
+          : undefined;
+
         const order = await this.createOrder(
           {
             // 联系人=本单乘客（body 显式传联系人则整批统一用它；录入人仅兜底）。
@@ -7233,7 +7250,13 @@ export class OrderService {
             noteSpecial: mergedNoteSpecial,
             // 整批归属代理（ADMIN/STAFF 录单）；AGENT 自助仍归属本人。
             agentId: body.agentId,
-            // 团队议价结算价（仅 ADMIN/STAFF，路由层已断言）按产品类型分流到单笔录单已有的两条通道：
+            // 结算价按身份 × 产品类型分流到单笔录单已有的通道（身份闸在本函数顶端已断言）：
+            // ── AGENT（代理自助结算价）：机票批与套餐批同一条通道 ──
+            //   一人一单，「本人填的 > 整批填的」就是这张子单的整单成交价 → createOrder 的
+            //   settlementTotalCny：按「结算价 − 权威合计」生成 SETTLEMENT 差额行留痕（差额上限、
+            //   selfService 审计都在 createOrder 内），系统价照算不被绕过；两者都留空 → 照旧走
+            //   结算价日历 / 动态定价。绝不给 AGENT 走 flightSettlementPriceCny（createOrder 会拒）。
+            // ── ADMIN/STAFF（团队议价）──
             //   · 机票批量：覆盖机票行动态价（flightSettlementPriceCny）。优先用该乘客自己填的结算价
             //     （名单行级议价），留空才沿用整批价；两者都留空 → undefined，照旧走结算价日历 / 动态
             //     定价。口径完全同源，一批单里「价格来源」列不会分叉。
@@ -7241,17 +7264,21 @@ export class OrderService {
             //     指定酒店加价的整单成交价）→ createOrder 按「结算价 − 权威合计」生成 SETTLEMENT 差额行
             //     留痕，手工价优先于结算价日历；留空照旧按日历自动取价。整批 settlementPriceCny 对套餐
             //     子单维持原状（只盖机票航段行）。
-            ...(isBundle
-              ? {
-                  flightSettlementPriceCny: body.settlementPriceCny,
-                  ...(passenger.settlementPriceCny !== undefined
-                    ? { settlementTotalCny: passenger.settlementPriceCny }
-                    : {}),
-                }
-              : {
-                  flightSettlementPriceCny:
-                    passenger.settlementPriceCny ?? body.settlementPriceCny,
-                }),
+            ...(isAgentRequester
+              ? agentSelfSettlementTotalCny !== undefined
+                ? { settlementTotalCny: agentSelfSettlementTotalCny }
+                : {}
+              : isBundle
+                ? {
+                    flightSettlementPriceCny: body.settlementPriceCny,
+                    ...(passenger.settlementPriceCny !== undefined
+                      ? { settlementTotalCny: passenger.settlementPriceCny }
+                      : {}),
+                  }
+                : {
+                    flightSettlementPriceCny:
+                      passenger.settlementPriceCny ?? body.settlementPriceCny,
+                  }),
             // OTA 手动结算单价 → 差额调整行（每单一致；createOrder 再按身份复核权限 + 审计落库）。
             priceAdjustment: manualPriceAdjustment ?? discountAdjustment,
             // 透传重复乘客强录 flag（createOrder 内再按身份收口 + 逐单审计/备注留痕）。

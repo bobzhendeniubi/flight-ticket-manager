@@ -1050,7 +1050,9 @@ export const batchCreateOrdersPassengerInputSchema = batchPassengerInputSchema.e
   //   · 套餐批量：一人一单，这个价就是该子单的「本单结算总价」（含单房差/升舱/指定酒店加价的整单
   //     成交价），走 createOrder 的 settlementTotalCny → SETTLEMENT 差额行留痕，手工价优先于结算价
   //     日历；留空照旧按日历自动取价。
-  // 仅 ADMIN/STAFF 生效（路由层 403 早拦 + 服务端按认证身份 400，见 batchCreateOrders）。
+  // 身份：ADMIN/STAFF 按上述两条通道分流；AGENT（代理自助结算价，2026-09-20 与单张录单同口径）
+  // 机票批 / 套餐批一律只走子单「本单结算总价」差额留痕通道、只落自家单；其余身份路由层 403 +
+  // 服务端 400（见 batchCreateOrders）。
   settlementPriceCny: z
     .number()
     .min(0, '结算价不能为负')
@@ -1097,8 +1099,11 @@ export const batchCreateOrdersBodySchema = z
     ...orderStructuredNotesShape,
     // 运营批量录单时整批归属的代理（仅 ADMIN/STAFF 生效）
     agentId: z.string().optional(),
-    // 团队议价结算价（CNY，每位出行人）。仅 ADMIN/STAFF 生效（路由层断言）。
-    // 仅对 FLIGHT 行生效（BUNDLE 套餐走 bundleItemSchema 的 server-priced 逻辑）。
+    // 团队议价结算价（CNY，每位出行人整程价）。
+    //   · ADMIN/STAFF：覆盖机票行权威价（仅对 FLIGHT 行生效；BUNDLE 套餐走 bundleItemSchema 的
+    //     server-priced 逻辑）。
+    //   · AGENT（代理自助结算价，2026-09-20）：不覆盖机票行价，改作每张子单的「本单结算总价」
+    //     走差额留痕通道（见 batchCreateOrders），只落自家单。其余身份路由层 403。
     settlementPriceCny: z
       .number()
       .min(0, '结算价不能为负')

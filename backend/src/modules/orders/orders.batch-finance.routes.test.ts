@@ -245,14 +245,59 @@ describe('批量收款锁 / 批量调价路由', () => {
     ...(settlementPriceCny === undefined ? {} : { settlementPriceCny }),
   });
 
-  it('AGENT 在名单里填逐人结算价 → 403，不进服务', async () => {
+  it('AGENT 在名单里填逐人结算价 → 放行进服务（代理自助结算价，2026-09-20 与单张录单同口径）', async () => {
+    batchCreateOrdersMock.mockResolvedValue({ successCount: 1, failureCount: 0, results: [] });
     const res = await post(
       '/orders/batch',
       tokenFor('agent-1', UserRole.AGENT),
       batchCreateBody([batchPax(3200)]),
     );
+    expect(res.statusCode).toBe(201);
+    expect(batchCreateOrdersMock).toHaveBeenCalledTimes(1);
+    // 归属收口不在路由层：requester 只带登录身份，agentId 由服务端 resolveOrderAgentId 强制取本人。
+    expect(batchCreateOrdersMock.mock.calls[0][1]).toMatchObject({ userId: 'agent-1', role: UserRole.AGENT });
+  });
+
+  it('AGENT 填整批结算价 → 同样放行进服务', async () => {
+    batchCreateOrdersMock.mockResolvedValue({ successCount: 1, failureCount: 0, results: [] });
+    const res = await post(
+      '/orders/batch',
+      tokenFor('agent-1', UserRole.AGENT),
+      { ...batchCreateBody([batchPax()]), settlementPriceCny: 3600 },
+    );
+    expect(res.statusCode).toBe(201);
+    expect(batchCreateOrdersMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('AGENT 带 OTA 手动结算单价 manualUnitPriceCny → 403，不进服务（只给运营）', async () => {
+    const res = await post(
+      '/orders/batch',
+      tokenFor('agent-1', UserRole.AGENT),
+      { ...batchCreateBody([batchPax()]), manualUnitPriceCny: 1000 },
+    );
     expect(res.statusCode).toBe(403);
-    expect(res.json()).toEqual({ error: '仅运营/管理员可指定团队议价结算价' });
+    expect(res.json()).toEqual({ error: '仅运营/管理员可手动录入结算单价' });
+    expect(batchCreateOrdersMock).not.toHaveBeenCalled();
+  });
+
+  it('AGENT 带批量优惠 discountPerPersonCny → 403，不进服务（只给运营）', async () => {
+    const res = await post(
+      '/orders/batch',
+      tokenFor('agent-1', UserRole.AGENT),
+      { ...batchCreateBody([batchPax()]), discountPerPersonCny: 50 },
+    );
+    expect(res.statusCode).toBe(403);
+    expect(res.json()).toEqual({ error: '仅运营/管理员可录入优惠' });
+    expect(batchCreateOrdersMock).not.toHaveBeenCalled();
+  });
+
+  it('CUSTOMER 在名单里填逐人结算价 → 403，不进服务', async () => {
+    const res = await post(
+      '/orders/batch',
+      tokenFor('cust-1', UserRole.CUSTOMER),
+      batchCreateBody([batchPax(3200)]),
+    );
+    expect(res.statusCode).toBe(403);
     expect(batchCreateOrdersMock).not.toHaveBeenCalled();
   });
 
