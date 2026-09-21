@@ -176,13 +176,16 @@ interface SharedRoomWorkbenchProps {
   onSaved?: () => void;
 }
 
-// ── 一枚出行人 chip（池子里）── locked：房组归属不完整，不可拖 ──────────────
+// ── 一枚出行人 chip（池子里）── locked：房组归属不完整，不可拖；frozen：整房落位请求进行中，
+// 全工作台暂停编辑，不可拖（与 locked 分开传，文案不同：这不是数据问题，落位一结束就能拖）──
 function PoolPassengerChip({
   p,
   locked,
+  frozen,
 }: {
   p: SharedRoomWorkbenchPassenger;
   locked: boolean;
+  frozen?: boolean;
 }) {
   const g = genderBadge(p.gender);
   const display = passengerDisplayName(p.fullName, p.chineseName);
@@ -194,6 +197,17 @@ function PoolPassengerChip({
         title="房组归属不完整，请先在分房编辑器补归属后再拖入共享房"
       >
         {display || '—'}
+      </span>
+    );
+  }
+  if (frozen) {
+    return (
+      <span
+        className="inline-flex select-none items-center gap-1 rounded-md border border-slate-200 bg-slate-100 px-2 py-0.5 text-xs text-ink-muted opacity-60"
+        title="整房落位处理中，请稍候再拖动"
+      >
+        <span className="font-medium">{display || '—'}</span>
+        {g && <span className={g === '男' ? 'text-brand-700' : 'text-rose-600'}>{g}</span>}
       </span>
     );
   }
@@ -391,7 +405,9 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
   }
 
   // ── 移动出行人：池 ↔ 盒子、盒子 ↔ 盒子；归属不完整的单一律拒绝拖入共享房 ──
+  // 整房落位请求进行中（placingBusy）一律冻结成员移动，避免落位途中改动了它正提交的成员集合。
   function movePassengerToRoom(passengerId: string, targetDraftId: string | null): void {
+    if (placingBusy) return;
     const loc = passengerIndex.get(passengerId);
     if (!loc) return;
     const order = orderById.get(loc.orderId);
@@ -453,24 +469,29 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
 
   // ── 房间盒子增删（新建可直接删；既有共享房用「解散」）──────────────────────
   function addRoom(): void {
+    if (placingBusy) return;
     setRooms((prev) => [
       ...prev,
       { draftId: newId(), sharedRoomId: null, version: null, hotelRoomTypeId: roomTypeOptions[0]?.id ?? '', notes: '', groups: [] },
     ]);
   }
   function removeNewRoom(draftId: string): void {
+    if (placingBusy) return;
     setRooms((prev) => prev.filter((r) => !(r.draftId === draftId && r.sharedRoomId == null)));
   }
   function dissolveRoom(draftId: string): void {
+    if (placingBusy) return;
     const room = rooms.find((r) => r.draftId === draftId);
     if (!room || room.sharedRoomId == null) return;
     setDissolvedVersions((dv) => new Map(dv).set(room.sharedRoomId as string, room.version ?? 0));
     setRooms((prev) => prev.filter((r) => r.draftId !== draftId));
   }
   function patchRoom(draftId: string, patch: Partial<Pick<DraftRoom, 'hotelRoomTypeId' | 'notes'>>): void {
+    if (placingBusy) return;
     setRooms((prev) => prev.map((r) => (r.draftId === draftId ? { ...r, ...patch } : r)));
   }
   function stepFraction(draftId: string, orderId: string, orderItemId: string, delta: number): void {
+    if (placingBusy) return;
     setRooms((prev) =>
       prev.map((r) =>
         r.draftId !== draftId
@@ -530,9 +551,29 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     return serializeGroups(groupsFromMembers(seedRoom.members)) !== serializeGroups(r.groups);
   }
 
+  /**
+   * 整个工作台（不只是打开面板的这一间房）是否有未保存改动——复用 isRoomDirty 同一把尺逐间
+   * 房过一遍，外加「解散整间」待提交这种不体现在 rooms[] 里的草稿态。整房落位成功后会用
+   * load() 把落地结果整体铺回 rooms，铺之前如果还有任何未保存改动（哪怕是别的房间的），都会
+   * 被这次重拉悄悄冲掉——所以必须按整个工作台校验，不能只看被点开面板的那一间房。空的「新建」
+   * 房（没拖过人）不算改动，与 handleSave 判定新建房是否要提交的口径一致。
+   */
+  function isWorkbenchDirty(): boolean {
+    if (dissolvedVersions.size > 0) return true;
+    return rooms.some((r) => (r.sharedRoomId ? isRoomDirty(r) : r.groups.length > 0));
+  }
+
+  const WORKBENCH_DIRTY_HINT = '工作台有未保存的改动，请先保存分房再落位';
+
   // ── 整房落位（档次房 → 酒店房）：选真实酒店 + 房型，全部成员一起落位，共享房原地转酒店房 ──
   async function handlePlace(r: DraftRoom): Promise<void> {
     if (!placing || placing.draftId !== r.draftId || !r.sharedRoomId || !placing.hotelRoomTypeId) return;
+    if (isWorkbenchDirty()) {
+      // 二次防线：确认按钮已按同一判定置灰，这里再拦一次——防止面板打开后台面状态变脏、
+      // 按钮还没来得及重渲染这一帧被点中（例如快速连击）。
+      setSaveErr(WORKBENCH_DIRTY_HINT);
+      return;
+    }
     setSaveErr(null);
     setSaveOk(null);
     setPlacingBusy(true);
@@ -548,6 +589,11 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
       );
       setPlacing(null);
       onSaved?.();
+      // 防御性断言：落位请求期间已冻结全部编辑入口，正常路径这里不该再看到脏状态；真出现
+      // 只打日志不拦截——真值仍以 load() 重拉的落地结果为准（组件顶部注释同一条纪律）。
+      if (isWorkbenchDirty()) {
+        console.error('[SharedRoomWorkbench] 整房落位成功后仍检测到未保存改动，冻结逻辑可能被绕过');
+      }
       load();
     } catch (e: unknown) {
       setSaveErr(e instanceof ApiError ? e.message : '整房落位失败');
@@ -559,6 +605,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
   /** 显式「移除失效成员」（N5）：只有点了这个按钮，失效成员才真正从本间房剔除——否则
    *  一律原样回传，不因为「只改了备注/别的成员」而被悄悄带走。群组被移空则整组丢弃。 */
   function removeInvalidMember(draftId: string, orderId: string, orderItemId: string, passengerId: string): void {
+    if (placingBusy) return;
     setRooms((prev) =>
       prev.map((r) =>
         r.draftId !== draftId
@@ -873,7 +920,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                         ) : (
                           <div className="flex flex-wrap gap-1.5">
                             {remaining.map((p) => (
-                              <PoolPassengerChip key={p.id} p={p} locked={!order.fullyAttributed} />
+                              <PoolPassengerChip key={p.id} p={p} locked={!order.fullyAttributed} frozen={placingBusy} />
                             ))}
                           </div>
                         )}
@@ -946,7 +993,13 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                           )}
                         </span>
                         {r.sharedRoomId ? (
-                          <button type="button" className="btn-ghost-danger px-2 py-1 text-xs" onClick={() => dissolveRoom(r.draftId)}>
+                          <button
+                            type="button"
+                            className="btn-ghost-danger px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-40"
+                            onClick={() => dissolveRoom(r.draftId)}
+                            disabled={placingBusy}
+                            title={placingBusy ? '整房落位处理中，请稍候' : undefined}
+                          >
                             解散整间
                           </button>
                         ) : (
@@ -954,8 +1007,8 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                             type="button"
                             className="btn-ghost-danger px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-40"
                             onClick={() => removeNewRoom(r.draftId)}
-                            disabled={r.groups.length > 0}
-                            title={r.groups.length > 0 ? '先把人移出去再删' : '删除空房间'}
+                            disabled={r.groups.length > 0 || placingBusy}
+                            title={placingBusy ? '整房落位处理中，请稍候' : r.groups.length > 0 ? '先把人移出去再删' : '删除空房间'}
                           >
                             删除
                           </button>
@@ -1003,12 +1056,20 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                         </select>
                       )}
 
-                      {/* ── 整房落位面板（档次房专用）：选真实酒店 → 房型 → 确认 ── */}
+                      {/* ── 整房落位面板（档次房专用）：选真实酒店 → 房型 → 确认 ──
+                          面板打开期间工作台若变脏（本间或别的房间被继续编辑），不自动关闭
+                          面板（避免运营选好的酒店/房型被无声收走、以为自己点空了又重选一遍），
+                          改为把确认按钮直接置灰 + 顶部亮出提示，逼着先处理脏改动再落位。 */}
                       {isTierMode && placing?.draftId === r.draftId && (
                         <div className="mt-2 space-y-2 rounded-lg border border-indigo-200 bg-indigo-50/60 p-2">
                           <div className="text-xs text-indigo-800">
                             整房落位：{r.groups.length} 张单的成员一起落到同一间房；目标酒店有指定酒店加价、或套餐档次与酒店星级不符时会整体拒绝并列出是谁。
                           </div>
+                          {isWorkbenchDirty() && (
+                            <div className="rounded border border-amber-300 bg-amber-50 px-2 py-1 text-xs font-medium text-amber-800">
+                              {WORKBENCH_DIRTY_HINT}
+                            </div>
+                          )}
                           <div className="flex flex-wrap items-end gap-2">
                             <div className="grow">
                               <label className="label">目标酒店（≥ {randomStarTier} 星）</label>
@@ -1044,8 +1105,9 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                             </div>
                             <button
                               type="button"
-                              className="btn-primary px-3 py-1 text-xs"
-                              disabled={!placing.hotelRoomTypeId || placingBusy}
+                              className="btn-primary px-3 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-40"
+                              disabled={!placing.hotelRoomTypeId || placingBusy || isWorkbenchDirty()}
+                              title={isWorkbenchDirty() ? WORKBENCH_DIRTY_HINT : undefined}
                               onClick={() => void handlePlace(r)}
                             >
                               {placingBusy ? '落位中…' : '确认整房落位'}
@@ -1069,7 +1131,9 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                                 <div className="flex items-center gap-1">
                                   <button
                                     type="button"
-                                    className="rounded border border-slate-200 px-1.5 text-xs text-ink-soft hover:bg-slate-50"
+                                    className="rounded border border-slate-200 px-1.5 text-xs text-ink-soft hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                                    disabled={placingBusy}
+                                    title={placingBusy ? '整房落位处理中，请稍候' : undefined}
                                     onClick={() => stepFraction(r.draftId, g.orderId, g.orderItemId, -HALF_STEP)}
                                   >
                                     −
@@ -1077,7 +1141,9 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                                   <span className="w-8 text-center text-xs font-medium text-ink">{g.roomFraction}</span>
                                   <button
                                     type="button"
-                                    className="rounded border border-slate-200 px-1.5 text-xs text-ink-soft hover:bg-slate-50"
+                                    className="rounded border border-slate-200 px-1.5 text-xs text-ink-soft hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
+                                    disabled={placingBusy}
+                                    title={placingBusy ? '整房落位处理中，请稍候' : undefined}
                                     onClick={() => stepFraction(r.draftId, g.orderId, g.orderItemId, HALF_STEP)}
                                   >
                                     ＋
@@ -1092,13 +1158,16 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                                     return (
                                       <span
                                         key={pid}
-                                        draggable
+                                        draggable={!placingBusy}
                                         onDragStart={(e) => {
+                                          if (placingBusy) return;
                                           e.dataTransfer.setData('text/plain', pid);
                                           e.dataTransfer.effectAllowed = 'move';
                                         }}
-                                        className="inline-flex cursor-grab select-none items-center rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-xs text-ink active:cursor-grabbing"
-                                        title="拖出可退回乘客池或移到别的房间"
+                                        className={`inline-flex select-none items-center rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-xs text-ink ${
+                                          placingBusy ? 'cursor-not-allowed opacity-60' : 'cursor-grab active:cursor-grabbing'
+                                        }`}
+                                        title={placingBusy ? '整房落位处理中，请稍候再拖动' : '拖出可退回乘客池或移到别的房间'}
                                       >
                                         {display || '—'}
                                       </span>
@@ -1123,8 +1192,9 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                                         )}
                                         <button
                                           type="button"
-                                          className="ml-0.5 rounded px-1 text-ink-muted hover:bg-rose-100 hover:text-rose-700"
-                                          title="移除失效成员：真正从本间房剔除（需保存生效）"
+                                          className="ml-0.5 rounded px-1 text-ink-muted hover:bg-rose-100 hover:text-rose-700 disabled:cursor-not-allowed disabled:opacity-40"
+                                          title={placingBusy ? '整房落位处理中，请稍候' : '移除失效成员：真正从本间房剔除（需保存生效）'}
+                                          disabled={placingBusy}
                                           onClick={() => removeInvalidMember(r.draftId, g.orderId, g.orderItemId, pid)}
                                         >
                                           ×
@@ -1141,16 +1211,23 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                       </div>
 
                       <input
-                        className="input mt-2 w-full py-1.5 text-sm"
+                        className="input mt-2 w-full py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-60"
                         placeholder="备注（选填）"
                         value={r.notes}
+                        disabled={placingBusy}
                         onChange={(e) => patchRoom(r.draftId, { notes: e.target.value })}
                       />
                     </div>
                   );
                 })}
 
-                <button type="button" onClick={addRoom} className="btn-secondary w-full py-2 text-sm">
+                <button
+                  type="button"
+                  onClick={addRoom}
+                  className="btn-secondary w-full py-2 text-sm disabled:cursor-not-allowed disabled:opacity-40"
+                  disabled={placingBusy}
+                  title={placingBusy ? '整房落位处理中，请稍候' : undefined}
+                >
                   <Icon name="plus" /> 新建共享房
                 </button>
               </div>
@@ -1175,7 +1252,13 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
             <button type="button" className="btn-ghost text-sm" onClick={onClose} disabled={saving}>
               关闭
             </button>
-            <button type="button" className="btn-primary text-sm" onClick={() => void handleSave()} disabled={saving || loading || !wb}>
+            <button
+              type="button"
+              className="btn-primary text-sm disabled:cursor-not-allowed disabled:opacity-40"
+              onClick={() => void handleSave()}
+              disabled={saving || loading || !wb || placingBusy}
+              title={placingBusy ? '整房落位处理中，请稍候' : undefined}
+            >
               {saving ? '保存中…' : '保存'}
             </button>
           </div>
