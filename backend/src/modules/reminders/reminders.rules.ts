@@ -1486,6 +1486,11 @@ export async function generateRuleReminders(
   // 旧格式键这四类，本轮根本算不出那把旧键），改成反过来扫库里仍活着的本规则提醒，与本轮
   // 候选集逐一核对。与分房状态机一样放在 createMany 之前：关的是「已经不该挂」的条，新条
   // 本轮建不上下一轮也会补，不会出现「旧的关了、新的永远没建」。
+  // **顺序是硬要求**：这一步还负责把自动核销过的同键条重开（复审 N1），必须跑在下面那次
+  // existing 查重之前——重开在前、查重在后，重开出来的那条会被 existingKeys 认出来，既不
+  // 重复建也不漏建；反过来（查重在前）会先按 DONE 行过滤掉候选，再重开，还是那把键，
+  // 只是白跑一轮。下面的 existing 查重刻意**不带 status**：DONE 行同样要挡住 createMany，
+  // 不然 ruleKey 唯一索引会让 createMany 静默吞掉（skipDuplicates），运营什么都看不到。
   await reconcileUpgradeRedeemReminders(prisma, upgradeScan, now);
 
   if (unique.length === 0) return { created: 0, skipped: 0, byRule: {} };

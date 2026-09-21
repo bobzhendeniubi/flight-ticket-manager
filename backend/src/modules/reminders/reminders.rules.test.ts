@@ -1881,6 +1881,11 @@ describe('generateRuleReminders — 规则 12 取数、时区、档案链与收�
     ruleKey: string;
     status: ReminderStatus;
     resolvedNote?: string | null;
+    title?: string;
+    body?: string;
+    priority?: string;
+    dueAt?: Date | null;
+    resolvedAt?: Date | null;
   }
 
   function markedRow(overrides: Record<string, unknown> = {}) {
@@ -1911,7 +1916,7 @@ describe('generateRuleReminders — 规则 12 取数、时区、档案链与收�
   function makePrisma(opts: {
     passengers?: Array<Record<string, unknown>>;
     profiles?: Array<{ id: string; documentType: string; documentNumber: string; mergedIntoId: string | null }>;
-    redemptions?: Array<{ profileId: string; createdAt: Date }>;
+    redemptions?: Array<{ profileId: string; tripsUsed: number; createdAt: Date }>;
     preexisting?: ReminderRow[];
     /** 模拟并发：reconcile 读出存量之后、写回之前，运营手工处理掉某一条 */
     manualResolveAfterScan?: { id: string; status: ReminderStatus; resolvedNote: string };
@@ -1963,14 +1968,22 @@ describe('generateRuleReminders — 规则 12 取数、时区、档案链与收�
           async (args: {
             where: {
               ruleKey?: { in?: string[]; startsWith?: string };
-              status?: { in: ReminderStatus[] };
+              status?: ReminderStatus | { in: ReminderStatus[] };
+              resolvedNote?: { in: string[] };
             };
           }) => {
-            const statusIn = args.where.status?.in;
+            // 真 SQL 的 status 既可能是标量也可能是 IN，两种都要照做
+            const statusOk = (row: ReminderRow) => {
+              const s = args.where.status;
+              if (s === undefined) return true;
+              return typeof s === 'string' ? row.status === s : s.in.includes(row.status);
+            };
+            const noteOk = (row: ReminderRow) =>
+              !args.where.resolvedNote || args.where.resolvedNote.in.includes(row.resolvedNote ?? '');
             const prefix = args.where.ruleKey?.startsWith;
             if (prefix) {
               const matched = [...rows.values()].filter(
-                (r) => r.ruleKey.startsWith(prefix) && (!statusIn || statusIn.includes(r.status)),
+                (r) => r.ruleKey.startsWith(prefix) && statusOk(r) && noteOk(r),
               );
               // 读出之后、写回之前运营手工处理（F8 交错执行）
               const manual = opts.manualResolveAfterScan;
@@ -1981,43 +1994,90 @@ describe('generateRuleReminders — 规则 12 取数、时区、档案链与收�
                   row.resolvedNote = manual.resolvedNote;
                 }
               }
-              return matched.map((r) => ({ id: r.id, ruleKey: r.ruleKey }));
+              return matched.map((r) => ({
+                id: r.id,
+                ruleKey: r.ruleKey,
+                title: r.title ?? '',
+                body: r.body ?? '',
+              }));
             }
             const keyIn = args.where.ruleKey?.in;
             if (keyIn) {
               const matched = [...rows.values()].filter(
-                (r) => keyIn.includes(r.ruleKey) && (!statusIn || statusIn.includes(r.status)),
+                (r) => keyIn.includes(r.ruleKey) && statusOk(r) && noteOk(r),
               );
-              return statusIn
+              // 带条件的是收敛的重开查询，返回行本身；不带条件的是 createMany 前的查重，
+              // 它刻意不看 status（DONE 行同样要挡住 createMany），还要算上本轮已建的键
+              return args.where.status || args.where.resolvedNote
                 ? matched
                 : [...matched, ...keyIn.filter((k) => store.has(k)).map((ruleKey) => ({ ruleKey }))];
             }
             return [];
           },
         ),
-        createMany: vi.fn(async (args: { data: Array<{ ruleKey: string }> }) => {
-          let count = 0;
-          for (const row of args.data) {
-            if (!store.has(row.ruleKey)) {
-              store.add(row.ruleKey);
-              count += 1;
-            }
-          }
-          return { count };
-        }),
-        updateMany: vi.fn(
+        // 建出来的条也落进 rows：ruleKey 唯一索引在真库里是硬约束，多轮调用的回归用例
+        // （自动核销 → 条件复发 → 重开）全靠 rows 判「是不是还只有那一条」。
+        createMany: vi.fn(
           async (args: {
-            where: { id: { in: string[] }; status?: { in: ReminderStatus[] } };
-            data: { status: ReminderStatus; resolvedNote?: string };
+            data: Array<{
+              ruleKey: string;
+              title: string;
+              body: string;
+              priority: string;
+              dueAt: Date;
+            }>;
           }) => {
             let count = 0;
-            for (const id of args.where.id.in) {
+            for (const row of args.data) {
+              const exists =
+                store.has(row.ruleKey) || [...rows.values()].some((r) => r.ruleKey === row.ruleKey);
+              if (exists) continue; // skipDuplicates
+              store.add(row.ruleKey);
+              const id = `rem_new_${rows.size + 1}`;
+              rows.set(id, {
+                id,
+                ruleKey: row.ruleKey,
+                status: ReminderStatus.OPEN,
+                resolvedNote: null,
+                resolvedAt: null,
+                title: row.title,
+                body: row.body,
+                priority: row.priority,
+                dueAt: row.dueAt,
+              });
+              count += 1;
+            }
+            return { count };
+          },
+        ),
+        updateMany: vi.fn(
+          async (args: {
+            where: {
+              id: string | { in: string[] };
+              status?: ReminderStatus | { in: ReminderStatus[] };
+              resolvedNote?: { in: string[] };
+            };
+            data: Partial<ReminderRow>;
+          }) => {
+            const ids = typeof args.where.id === 'string' ? [args.where.id] : args.where.id.in;
+            let count = 0;
+            for (const id of ids) {
               const row = rows.get(id);
               if (!row) continue;
-              // 真 SQL 的 WHERE 会把状态条件一起带上——mock 必须照做，否则测不出覆盖人工结论
-              if (args.where.status && !args.where.status.in.includes(row.status)) continue;
-              row.status = args.data.status;
-              if (args.data.resolvedNote !== undefined) row.resolvedNote = args.data.resolvedNote;
+              // 真 SQL 的 WHERE 会把状态/备注条件一起带上——mock 必须照做，
+              // 否则测不出「不覆盖人工结论」
+              const s = args.where.status;
+              if (s !== undefined) {
+                const ok = typeof s === 'string' ? row.status === s : s.in.includes(row.status);
+                if (!ok) continue;
+              }
+              if (
+                args.where.resolvedNote &&
+                !args.where.resolvedNote.in.includes(row.resolvedNote ?? '')
+              ) {
+                continue;
+              }
+              Object.assign(row, args.data);
               count += 1;
             }
             return { count };
@@ -2045,7 +2105,7 @@ describe('generateRuleReminders — 规则 12 取数、时区、档案链与收�
         { id: 'prof_b', documentType: 'PASSPORT', documentNumber: 'E20000000', mergedIntoId: 'prof_c' },
         { id: 'prof_c', documentType: 'PASSPORT', documentNumber: 'E30000000', mergedIntoId: null },
       ],
-      redemptions: [{ profileId: 'prof_c', createdAt: new Date('2026-07-08T09:00:00Z') }],
+      redemptions: [{ profileId: 'prof_c', tripsUsed: 1, createdAt: new Date('2026-07-08T09:00:00Z') }],
     });
     const result = await generateRuleReminders(mock, 'user_sys', NOW12);
     expect(raw.travelerBenefitRedemption.findMany.mock.calls[0][0].where.profileId.in).toEqual(['prof_c']);
@@ -2056,7 +2116,7 @@ describe('generateRuleReminders — 规则 12 取数、时区、档案链与收�
   it('F5｜北京 07:00 核销、10:00 起飞 → 算已核销，不生成（下界按 departureTz 折）', async () => {
     // 起飞：北京 2026-07-08 10:00 = 02:00Z；核销：北京 07:00 = 2026-07-07T23:00Z
     const { mock } = makePrisma({
-      redemptions: [{ profileId: 'prof_master', createdAt: new Date('2026-07-07T23:00:00Z') }],
+      redemptions: [{ profileId: 'prof_master', tripsUsed: 1, createdAt: new Date('2026-07-07T23:00:00Z') }],
     });
     const result = await generateRuleReminders(mock, 'user_sys', NOW12);
     expect(result.byRule.UPGRADE_REDEEM_PENDING).toBeUndefined();
@@ -2065,7 +2125,7 @@ describe('generateRuleReminders — 规则 12 取数、时区、档案链与收�
   it('F5｜起飞前一天北京 23:00 的核销（当地零点之前）不算这一程 → 照常生成', async () => {
     // 北京 2026-07-07 23:00 = 2026-07-07T15:00Z，早于起飞当地日零点 2026-07-07T16:00Z
     const { mock, store } = makePrisma({
-      redemptions: [{ profileId: 'prof_master', createdAt: new Date('2026-07-07T15:00:00Z') }],
+      redemptions: [{ profileId: 'prof_master', tripsUsed: 1, createdAt: new Date('2026-07-07T15:00:00Z') }],
     });
     await generateRuleReminders(mock, 'user_sys', NOW12);
     expect([...store]).toContain('UPGRADEREDEEM:pax_1:item_out');
@@ -2093,7 +2153,7 @@ describe('generateRuleReminders — 规则 12 取数、时区、档案链与收�
 
   it('F4｜已核销 → 不生成，且存量待办自动核销（备注写明已核销）', async () => {
     const { mock, rows } = makePrisma({
-      redemptions: [{ profileId: 'prof_master', createdAt: new Date('2026-07-08T12:00:00Z') }],
+      redemptions: [{ profileId: 'prof_master', tripsUsed: 1, createdAt: new Date('2026-07-08T12:00:00Z') }],
       preexisting: [{ id: 'rem_1', ruleKey: 'UPGRADEREDEEM:pax_1:item_out', status: ReminderStatus.OPEN }],
     });
     const result = await generateRuleReminders(mock, 'user_sys', NOW12);
@@ -2190,5 +2250,168 @@ describe('generateRuleReminders — 规则 12 取数、时区、档案链与收�
     await generateRuleReminders(mock, 'user_sys', NOW12);
     expect(rows.get('rem_1')!.status).toBe(ReminderStatus.DONE);
     expect(rows.get('rem_1')!.resolvedNote).toContain('尚未起飞');
+  });
+
+  // ── N1：自动核销之后条件复发 → 同键重开（稳定键 + ruleKey 唯一索引 + 查重不带 status
+  //    三者叠加，不重开就等于这把键永久失声）。三条真实路径各一条回归，都是原地不换键。
+  //    每条都跑完整的「建 → 自动核销 → 条件复发」三轮，收尾断言 rows.size===1：重开的是
+  //    原来那条，不是又建了一条新的。
+
+  /** 只有一段机票行的乘客快照（行 id / 起飞时刻 / 航班号可变，用来模拟原地改期）。 */
+  function markedWithLeg(itemId: string, departureTime: Date, flightNumber = 'QH9588') {
+    return markedRow({
+      order: {
+        orderNumber: 'FTM2026070900001',
+        items: [
+          {
+            id: itemId,
+            flightSchedule: { departureTime, departureTz: 'Asia/Shanghai', flight: { flightNumber } },
+          },
+        ],
+      },
+    });
+  }
+
+  it('N1①｜已飞航段改期到未来（自动核销）→ 新日期也飞完 → 同键重开，只有一条', async () => {
+    const passengers = [markedWithLeg('item_out', new Date('2026-07-08T02:00:00Z'))];
+    const { mock, rows } = makePrisma({ passengers });
+
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect(rows.size).toBe(1);
+    const id = [...rows.keys()][0];
+    expect(rows.get(id)!.status).toBe(ReminderStatus.OPEN);
+
+    // 原地改期到未来：rescheduleOrderItem 对机票行是 update，行 id 不变 → 键不变
+    passengers[0] = markedWithLeg('item_out', new Date('2026-07-20T02:00:00Z'));
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect(rows.get(id)!.status).toBe(ReminderStatus.DONE);
+    expect(rows.get(id)!.resolvedNote).toContain('尚未起飞');
+
+    // 新日期飞完 —— 这时候必须重新喊一声，否则可用次数虚高没人知道
+    await generateRuleReminders(mock, 'user_sys', new Date('2026-07-21T06:00:00Z'));
+    expect(rows.size).toBe(1);
+    expect(rows.get(id)!.status).toBe(ReminderStatus.OPEN);
+    expect(rows.get(id)!.resolvedNote).toBeNull();
+    expect(rows.get(id)!.resolvedAt).toBeNull();
+    // 重开顺带刷成现势文案（新起飞日）
+    expect(rows.get(id)!.title).toContain('2026-07-20');
+  });
+
+  it('N1②｜订单取消（自动核销）→ 恢复占位 → 同键重开，只有一条', async () => {
+    const marked = markedWithLeg('item_out', new Date('2026-07-08T02:00:00Z'));
+    const passengers: Array<Record<string, unknown>> = [marked];
+    const { mock, rows } = makePrisma({ passengers });
+
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    const id = [...rows.keys()][0];
+    expect(rows.get(id)!.status).toBe(ReminderStatus.OPEN);
+
+    // 取消：订单状态出了扫描集，本轮扫不到这位乘客
+    passengers.length = 0;
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect(rows.get(id)!.status).toBe(ReminderStatus.DONE);
+    expect(rows.get(id)!.resolvedNote).toContain('已取消');
+
+    // restore-cancelled 恢复占位：同一位乘客、同一行，键一模一样
+    passengers.push(marked);
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect(rows.size).toBe(1);
+    expect(rows.get(id)!.status).toBe(ReminderStatus.OPEN);
+    expect(rows.get(id)!.resolvedNote).toBeNull();
+  });
+
+  it('N1③｜台账已核销（自动核销）→ 财务冲正（追加负数补偿行）→ 同键重开，只有一条', async () => {
+    // 台账 append-only：冲正不动原行，另追加一条 tripsUsed = −原值 的补偿行
+    //（traveler-benefits.service.ts 的 reverse()），时间戳是冲正那一刻，同样落在起飞之后。
+    const redemptions: Array<{ profileId: string; tripsUsed: number; createdAt: Date }> = [];
+    const { mock, rows } = makePrisma({ redemptions });
+
+    // 第一轮：这一程之后台账上还没有流水 → 建出提醒
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    const id = [...rows.keys()][0];
+    expect(rows.get(id)!.status).toBe(ReminderStatus.OPEN);
+
+    // 运营去档案里扣了一次 → 净额 +1 → 自动核销
+    redemptions.push({
+      profileId: 'prof_master',
+      tripsUsed: 1,
+      createdAt: new Date('2026-07-08T12:00:00Z'),
+    });
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect(rows.get(id)!.status).toBe(ReminderStatus.DONE);
+    expect(rows.get(id)!.resolvedNote).toContain('已核销');
+
+    // 财务冲正：原行原样留着，追加负数补偿行 → 净额回到 0 → 这一程又变回「该扣没扣」
+    redemptions.push({
+      profileId: 'prof_master',
+      tripsUsed: -1,
+      createdAt: new Date('2026-07-09T03:00:00Z'),
+    });
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect(rows.size).toBe(1);
+    expect(rows.get(id)!.status).toBe(ReminderStatus.OPEN);
+    expect(rows.get(id)!.resolvedNote).toBeNull();
+  });
+
+  it('净额口径｜正 1 + 负 1 + 又正 1 → 仍算已核销，不再催', async () => {
+    // 冲正之后重新扣了一次（改正档位/金额后重核销）：净额 +1，不该再喊
+    const { mock, store } = makePrisma({
+      redemptions: [
+        { profileId: 'prof_master', tripsUsed: 1, createdAt: new Date('2026-07-08T12:00:00Z') },
+        { profileId: 'prof_master', tripsUsed: -1, createdAt: new Date('2026-07-09T03:00:00Z') },
+        { profileId: 'prof_master', tripsUsed: 1, createdAt: new Date('2026-07-09T04:00:00Z') },
+      ],
+    });
+    const result = await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect(result.byRule.UPGRADE_REDEEM_PENDING).toBeUndefined();
+    expect([...store]).toEqual([]);
+  });
+
+  it('净额口径｜取数不再按 tripsUsed > 0 过滤（负数补偿行必须一起查出来）', async () => {
+    const { mock, raw } = makePrisma();
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    const args = raw.travelerBenefitRedemption.findMany.mock.calls[0][0] as unknown as {
+      where: Record<string, unknown>;
+      select: Record<string, boolean>;
+    };
+    expect(args.where.tripsUsed).toBeUndefined();
+    expect(args.select.tripsUsed).toBe(true);
+  });
+
+  it('N1｜人工核销（备注是运营自己写的）→ 条件仍在也不重开，且不重复建', async () => {
+    const { mock, rows, store } = makePrisma({
+      preexisting: [
+        {
+          id: 'rem_1',
+          ruleKey: 'UPGRADEREDEEM:pax_1:item_out',
+          status: ReminderStatus.DONE,
+          resolvedNote: '这次跟客人说好不扣次数，已和财务确认',
+        },
+      ],
+    });
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect(rows.size).toBe(1);
+    expect(rows.get('rem_1')!.status).toBe(ReminderStatus.DONE);
+    expect(rows.get('rem_1')!.resolvedNote).toBe('这次跟客人说好不扣次数，已和财务确认');
+    expect([...store]).toEqual([]); // 唯一索引挡住，也没有悄悄建出第二条
+  });
+
+  it('N2｜航段原地改期到另一个已飞日期 → OPEN 条的标题/正文就地刷新（键不变）', async () => {
+    const passengers = [markedWithLeg('item_out', new Date('2026-07-08T02:00:00Z'), 'QH9588')];
+    const { mock, rows } = makePrisma({ passengers });
+
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    const id = [...rows.keys()][0];
+    expect(rows.get(id)!.title).toContain('QH9588');
+    expect(rows.get(id)!.title).toContain('2026-07-08');
+
+    // 同一行换了班次和日期（仍在过去）→ 键相同，文案必须跟着走
+    passengers[0] = markedWithLeg('item_out', new Date('2026-07-06T02:00:00Z'), 'QH9999');
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect(rows.size).toBe(1);
+    expect(rows.get(id)!.status).toBe(ReminderStatus.OPEN);
+    expect(rows.get(id)!.title).toContain('QH9999');
+    expect(rows.get(id)!.title).toContain('2026-07-06');
+    expect(rows.get(id)!.body).toContain('QH9999');
   });
 });

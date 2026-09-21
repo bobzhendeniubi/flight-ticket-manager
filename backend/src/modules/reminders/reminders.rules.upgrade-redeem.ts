@@ -72,7 +72,11 @@ export interface RuleUpgradeRedeemPassenger {
   }>;
   /** 解析到的主档案 id；null = 该证件号没匹配到常旅客档案（只影响正文提示，不进 ruleKey）。 */
   profileId: string | null;
-  /** 该程起飞日之后档案上已有正数核销流水（true = 已扣过，不再提醒）。 */
+  /**
+   * 该程起飞日之后档案上的核销流水**净额** > 0（true = 已扣过，不再提醒）。
+   * 净额而不是「有没有正数流水」：台账 append-only，冲正是追加一条负数补偿行，
+   * 见 collectUpgradeRedeemCandidates 里的取数注释。
+   */
   redeemedAfterLeg: boolean;
 }
 
@@ -296,6 +300,21 @@ const STALE_NOTE_NOT_DEPARTED =
 const STALE_NOTE_GONE = '次数升级标记已撤销，或订单已取消/删除，本条自动核销。';
 const STALE_NOTE_LEGACY = '待办键已升级为「乘客＋航段」的稳定键，本条由新待办接手，自动核销。';
 
+/**
+ * 全部「自动核销」留痕文案（口径同规则 8 状态机的 AUTO_RESOLVED_NOTE）：只有带这几句备注的
+ * 已核销条，才允许在条件复发时被重开。
+ *
+ * 运营手工完成/跳过走 reminders.routes.ts 的 PATCH，resolvedNote 是他自己填的文本，几乎不可能
+ * 恰好撞上这几句——人工结论一律尊重，不重开。
+ */
+const UPGRADE_REDEEM_AUTO_NOTES: readonly string[] = [
+  STALE_NOTE_SUPERSEDED,
+  STALE_NOTE_REDEEMED,
+  STALE_NOTE_NOT_DEPARTED,
+  STALE_NOTE_GONE,
+  STALE_NOTE_LEGACY,
+];
+
 const UPGRADE_REDEEM_SCAN_SKIPPED: UpgradeRedeemScan = {
   ran: false,
   candidates: [],
@@ -330,7 +349,9 @@ interface UpgradeRedeemDelegates {
   };
   travelerProfile?: { findMany?: (args: unknown) => Promise<UpgradeRedeemProfileRef[]> };
   travelerBenefitRedemption?: {
-    findMany?: (args: unknown) => Promise<Array<{ profileId: string; createdAt: Date }>>;
+    findMany?: (args: unknown) => Promise<
+      Array<{ profileId: string; tripsUsed: number; createdAt: Date }>
+    >;
   };
 }
 
@@ -438,30 +459,41 @@ export async function collectUpgradeRedeemCandidates(
     ...docPairs.values(),
   ]);
 
-  // 这一程起飞之后的正数核销流水（负数是冲正，不算「已扣过」）。同一位客人短期内飞两趟
-  // 都标了升舱时，一次核销可能把两条都判成已核销 —— 台账无单据关联，已知近似（见遗留风险）。
+  // 这一程起飞之后的核销流水**净额**（sum(tripsUsed) > 0 = 已扣过）。
+  //
+  // 口径与全站可用次数同源 —— traveler-benefits.service.ts 的 loadRedeemedTripsByProfile
+  // 与核销时的可用次数校验，都是不加过滤的 `_sum: { tripsUsed }`。这里**不能**只筛 > 0：
+  // 台账是 append-only，录错走冲正（reverse()），原行一个字不动，另追加一条
+  // tripsUsed = −原值 的补偿行，时间戳是冲正那一刻（晚于原行，同样落在起飞之后）。
+  // 只看正数流水的话，「核销过 → 冲正」之后这一程仍被判成已核销，规则 12 对它永远不再吭声，
+  // 可用次数虚高照样没人知道 —— 正是本规则存在的那个洞。净额算法下两行自然抵消。
+  //
+  // 已知近似（台账不挂订单号，只能按时间判归属，见遗留风险）：同一位客人短期内飞两趟都标了
+  // 升舱时，一次核销可能把两程都判成已核销；反过来，起飞后冲正一笔**更早那一程**的核销，
+  // 也会把本程的净额压回 0、重新催一次。两种都是宁可多问一句，不会少扣。
   const masterIds = [...new Set(masterIdByDoc.values())];
   const redemptions =
     masterIds.length === 0
       ? []
       : await redemptionDelegate.findMany({
-          where: { profileId: { in: masterIds }, tripsUsed: { gt: 0 } },
-          select: { profileId: true, createdAt: true },
+          where: { profileId: { in: masterIds } },
+          select: { profileId: true, tripsUsed: true, createdAt: true },
         });
-  const redeemedAtByProfile = new Map<string, Date[]>();
+  const redeemedRowsByProfile = new Map<string, Array<{ tripsUsed: number; createdAt: Date }>>();
   for (const r of redemptions) {
-    const list = redeemedAtByProfile.get(r.profileId) ?? [];
-    list.push(r.createdAt);
-    redeemedAtByProfile.set(r.profileId, list);
+    const list = redeemedRowsByProfile.get(r.profileId) ?? [];
+    list.push({ tripsUsed: r.tripsUsed, createdAt: r.createdAt });
+    redeemedRowsByProfile.set(r.profileId, list);
   }
 
   for (const { row, flights, leg } of departedLegs) {
     const doc = realDocumentNumber(row.documentNumber);
     const profileId = doc ? (masterIdByDoc.get(docKey(row.documentType, doc)) ?? null) : null;
     const legStart = upgradeRedeemLegStartMs(leg);
-    const redeemedAfterLeg = (redeemedAtByProfile.get(profileId ?? '') ?? []).some(
-      (at) => at.getTime() >= legStart,
-    );
+    const netRedeemedAfterLeg = (redeemedRowsByProfile.get(profileId ?? '') ?? [])
+      .filter((r) => r.createdAt.getTime() >= legStart)
+      .reduce((sum, r) => sum + r.tripsUsed, 0);
+    const redeemedAfterLeg = netRedeemedAfterLeg > 0;
     const built = buildUpgradeRedeemCandidates(
       {
         passengerId: row.id,
@@ -502,6 +534,26 @@ export async function collectUpgradeRedeemCandidates(
  *
  * ran=false（三个 delegate 不全，整条规则这一轮没跑）时**什么都不做** —— 否则会把全库
  * 旧条按「不在候选集里」一把关掉。
+ *
+ * 三条支路（关 / 重开 / 刷新），后两条是第二轮复审 N1、N2 的修复：
+ *
+ *  - **关**：库里仍活着、却不在本轮候选集里的条，按留痕文案自动核销（原有行为）。
+ *  - **重开（N1）**：稳定键 + `ruleKey @unique` + 「查重不带 status」三者叠加，意味着一把键
+ *    被自动核销过一次之后，同键再次需要提醒时会被 `generateRuleReminders` 的 existingKeys
+ *    过滤掉，createMany 建不出来 —— 规则 12 就此**永久**失声。三条真实路径都是原地不换键：
+ *    ①已飞航段被改期到未来（rescheduleOrderItem 原地 update，行 id 不变）→ 本轮按
+ *    「尚未起飞」核销 → 新日期飞完还是这把键；②订单取消 → 按「已取消」核销 → 恢复占位后
+ *    还是这把键；③台账已核销 → 按「已核销」核销 → 财务冲正（负 tripsUsed）后还是这把键。
+ *    所以本轮候选命中的键，若库里那条是**自动**核销的（备注 ∈ UPGRADE_REDEEM_AUTO_NOTES），
+ *    就地重开并刷成现势文案；人工完成/跳过（备注是运营自己写的）一律不动。
+ *  - **刷新（N2）**：命中键且仍 OPEN/IN_PROGRESS 的条，标题/正文与本轮候选不一致就更新
+ *    （航段原地改期到另一个已飞日期 → 键不变、文案里的航班号/日期却是旧值）。
+ *
+ * 三条支路的写入都把状态条件重复进 where（读出来之后、写回之前运营可能刚手工处理完，
+ * 只按 id 写会覆盖人工结论，astra 评审 F8），重开那条还额外带上 `resolvedNote in 自动文案`。
+ *
+ * 必须在 generateRuleReminders 的 createMany **之前**调用：重开在前、查重在后，重开出来的
+ * 那条正好被 existingKeys 认出来，既不会重复建，也不会漏建。
  */
 export async function reconcileUpgradeRedeemReminders(
   prisma: PrismaClient,
@@ -509,16 +561,26 @@ export async function reconcileUpgradeRedeemReminders(
   now: Date,
 ): Promise<void> {
   if (!scan.ran) return;
+  const candidateByKey = new Map(scan.candidates.map((c) => [c.ruleKey, c]));
   const active = await prisma.operationalReminder.findMany({
     where: {
       ruleKey: { startsWith: UPGRADE_REDEEM_RULE_PREFIX },
       status: { in: [ReminderStatus.OPEN, ReminderStatus.IN_PROGRESS] },
     },
-    select: { id: true, ruleKey: true },
+    select: { id: true, ruleKey: true, title: true, body: true },
   });
   const idsByNote = new Map<string, string[]>();
+  const toRefresh: Array<{ id: string; title: string; body: string }> = [];
   for (const row of active) {
-    if (!row.ruleKey || scan.desiredKeys.has(row.ruleKey)) continue;
+    if (!row.ruleKey) continue;
+    if (scan.desiredKeys.has(row.ruleKey)) {
+      // N2：键相同、文案过期（改期到另一个已飞日期/换班次）→ 就地刷新，不换键重发。
+      const candidate = candidateByKey.get(row.ruleKey);
+      if (candidate && (candidate.title !== row.title || candidate.body !== row.body)) {
+        toRefresh.push({ id: row.id, title: candidate.title, body: candidate.body });
+      }
+      continue;
+    }
     const parsed = parseUpgradeRedeemRuleKey(row.ruleKey);
     const note = parsed?.legacy
       ? STALE_NOTE_LEGACY
@@ -527,12 +589,55 @@ export async function reconcileUpgradeRedeemReminders(
     list.push(row.id);
     idsByNote.set(note, list);
   }
+
+  // N1：本轮候选命中、库里却是「自动核销」状态的条——条件又复发了，重开。
+  const desired = [...scan.desiredKeys];
+  const reopenRows =
+    desired.length === 0
+      ? []
+      : await prisma.operationalReminder.findMany({
+          where: {
+            ruleKey: { in: desired },
+            status: ReminderStatus.DONE,
+            resolvedNote: { in: [...UPGRADE_REDEEM_AUTO_NOTES] },
+          },
+          select: { id: true, ruleKey: true },
+        });
+
   for (const [note, ids] of idsByNote) {
     await prisma.operationalReminder.updateMany({
       // 第二次写入重复一遍状态条件：读出来之后、更新之前运营可能已经手工完成/跳过并写了
       // 备注，只按 id 更新会把人工结论覆盖掉（astra 评审 F8）。
       where: { id: { in: ids }, status: { in: [ReminderStatus.OPEN, ReminderStatus.IN_PROGRESS] } },
       data: { status: ReminderStatus.DONE, resolvedAt: now, resolvedNote: note },
+    });
+  }
+  for (const row of toRefresh) {
+    await prisma.operationalReminder.updateMany({
+      where: { id: row.id, status: { in: [ReminderStatus.OPEN, ReminderStatus.IN_PROGRESS] } },
+      data: { title: row.title, body: row.body },
+    });
+  }
+  for (const row of reopenRows) {
+    const candidate = row.ruleKey ? candidateByKey.get(row.ruleKey) : undefined;
+    if (!candidate) continue;
+    await prisma.operationalReminder.updateMany({
+      // 状态 + 备注一起进 where：读出来之后运营可能刚手工重开/改判，人工结论优先。
+      where: {
+        id: row.id,
+        status: ReminderStatus.DONE,
+        resolvedNote: { in: [...UPGRADE_REDEEM_AUTO_NOTES] },
+      },
+      data: {
+        status: ReminderStatus.OPEN,
+        resolvedAt: null,
+        resolvedNote: null,
+        title: candidate.title,
+        body: candidate.body,
+        priority: candidate.priority,
+        // YYYY-MM-DD → UTC 零点，@db.Date 落库口径与 createMany 一致
+        dueAt: new Date(`${candidate.dueAt}T00:00:00Z`),
+      },
     });
   }
 }
