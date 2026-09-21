@@ -26,9 +26,9 @@ import { writeAuditWithinTx } from '../../lib/audit.js';
 import { canonicalJson } from '../../lib/canonical-json.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import {
-  COUNTED_STATUSES,
   assertHotelFitAfterChange,
   assertRandomTierFitAfterChange,
+  countedOrderWhere,
   isCountedOrder,
   itemRoomCount,
   randomStarTierLabel,
@@ -213,7 +213,7 @@ export async function getSharedRoomWorkbench(
       ...scopeItemWhere(roomScope),
       hotelCheckIn: checkInD,
       hotelCheckOut: checkOutD,
-      order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
+      order: countedOrderWhere(),
     },
     select: {
       id: true,

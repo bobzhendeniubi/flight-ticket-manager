@@ -23,6 +23,20 @@ vi.mock('./ticketing-cap.js', () => ({
 const nightlyByHotel = vi.hoisted(
   () => new Map<string, { hasBlock: boolean; block?: number; physicalRemaining?: number }>(),
 );
+// COUNTED_STATUSES / isCountedOrder / countedOrderWhere：与真实实现同一份值——
+// room-identity.js（本文件测试的 orders.export.js 经由它拿共享房伙伴失效状态）现在直接引用
+// 这三个导出，mock 工厂缺了会让那条链路拿到 undefined（2026-09-20 复审 N6 收口）。
+// vi.mock 工厂会被提升到文件最顶部，引用的外部变量必须用 vi.hoisted 一并提升，否则是
+// 「在初始化前访问」的暂时性死区错误（本行是二次踩坑修复）。
+const COUNTED_STATUSES = vi.hoisted(() => [
+  'PENDING_PAYMENT',
+  'PAID',
+  'PROCESSING',
+  'TICKETED',
+  'COMPLETED',
+  'CHANGE_REQUESTED',
+  'CHANGED',
+]);
 vi.mock('../hotel-control/hotel-control.service.js', () => ({
   getHotelNightlyRemaining: vi.fn(async (hotelId: string, dates: readonly string[]) => {
     const cfg = nightlyByHotel.get(hotelId);
@@ -37,6 +51,10 @@ vi.mock('../hotel-control/hotel-control.service.js', () => ({
       physicalRemaining: dates.map(() => cfg.physicalRemaining ?? 0),
     };
   }),
+  COUNTED_STATUSES,
+  isCountedOrder: (order: { deletedAt: Date | null; status: string }) =>
+    order.deletedAt == null && COUNTED_STATUSES.includes(order.status),
+  countedOrderWhere: () => ({ deletedAt: null, status: { in: [...COUNTED_STATUSES] } }),
 }));
 
 import { buildOrdersBySchedule } from './orders.export.js';

@@ -233,6 +233,58 @@ describe('F1 · 整房落位：成员住宿行必须只承载本共享房', () =
     expect(await computeSharedRoomPhysicalByDate(target.hotel.id, NIGHTS)).toEqual([0, 0]);
   });
 
+  it('N3：同一住宿行上还挂着一个无归属（orderItemId 为空）的随机占位房组（旧数据/手改 JSON）→ 400，落库不动', async () => {
+    // 只取 roomGroupItemId(g) === it.id 的房组做行独占校验，会漏掉这类孤儿房组
+    // （2026-09-20 第二轮复审 N3）：它既不算「本行归属」也不会在落位后被刷新，
+    // 得靠校验里把「本单无归属且 hotelName 是本档随机文案」的组一并计入 plainGroupCount 挡住。
+    const actor = await adminActor();
+    const target = await createRealHotel(2, { starRating: 5 });
+    const a = await createOrder({ randomStarTier: TIER, passengerCount: 2 });
+    const b = await createOrder({ randomStarTier: TIER, passengerCount: 1 });
+    const saved = await saveSharedRooms(
+      {
+        randomStarTier: TIER,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [{ groups: [group(a, 1, 0), group(b, 0)] }],
+        dissolve: [],
+      },
+      actor,
+    );
+    const s1 = saved.rooms[0]!;
+    // 手改 JSON：追加一个孤儿房组，文本与本档随机占位文案一致，但不带 orderItemId 归属。
+    const orderA = await prisma.order.findUniqueOrThrow({ where: { id: a.id } });
+    const groupsA = (orderA.roomAssignment as { roomGroups: Array<Record<string, unknown>> }).roomGroups;
+    await prisma.order.update({
+      where: { id: a.id },
+      data: {
+        roomAssignment: {
+          roomGroups: [
+            ...groupsA,
+            {
+              id: uniq('g'),
+              hotelName: '四星随机（待落位）',
+              roomType: '待落位',
+              passengerIds: [a.passengers[1]!.id],
+              orderItemId: null,
+              roomFraction: 1,
+            },
+          ],
+        } as unknown as Prisma.InputJsonValue,
+      },
+    });
+
+    await expect(
+      placeSharedRoom(s1.sharedRoomId, { hotelRoomTypeId: target.roomType.id, expectedVersion: s1.version }, actor),
+    ).rejects.toThrow(new RegExp(`${a.orderNumber}.*还承载 1 个普通房组`));
+    const room = await prisma.sharedRoom.findUniqueOrThrow({ where: { id: s1.sharedRoomId } });
+    expect(room.randomStarTier).toBe(TIER);
+    expect(room.version).toBe(s1.version);
+    expect((await prisma.orderItem.findUniqueOrThrow({ where: { id: a.items[0]!.id } })).hotelRoomTypeId).toBeNull();
+    expect(await computeSharedRoomPhysicalByDate(target.hotel.id, NIGHTS)).toEqual([0, 0]);
+  });
+
   it('回归：每位成员的住宿行只承载本房 → 整房落位照常成功，目标酒店物理占 1 间', async () => {
     const actor = await adminActor();
     const target = await createRealHotel(1, { starRating: 5 });

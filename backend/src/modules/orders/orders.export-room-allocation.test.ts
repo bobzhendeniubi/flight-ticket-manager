@@ -15,8 +15,26 @@ vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 // 当日余房取数（buildDailyRemainingLookup）委托 getHotelNightlyRemaining —— mock 掉，
 // 单测只关心「拿到 physicalRemaining/remaining 后怎么选」，不重复覆盖房控内部查库逻辑
 // （房控自己的 getHotelNightlyRemaining 单测见 hotel-control.service.test.ts）。
+// COUNTED_STATUSES / isCountedOrder / countedOrderWhere：与真实实现同一份值——room-identity.js
+// （本文件测试的 orders.export-room-allocation.js 经由它拿共享房伙伴失效状态）现在直接引用
+// 这三个导出，mock 工厂缺了会让那条链路拿到 undefined（2026-09-20 复审 N6 收口）。
+// vi.mock 工厂会被提升到文件最顶部，引用的外部变量必须用 vi.hoisted 一并提升，否则是
+// 「在初始化前访问」的暂时性死区错误（本行是二次踩坑修复）。
+const COUNTED_STATUSES = vi.hoisted(() => [
+  'PENDING_PAYMENT',
+  'PAID',
+  'PROCESSING',
+  'TICKETED',
+  'COMPLETED',
+  'CHANGE_REQUESTED',
+  'CHANGED',
+]);
 vi.mock('../hotel-control/hotel-control.service.js', () => ({
   getHotelNightlyRemaining: vi.fn(),
+  COUNTED_STATUSES,
+  isCountedOrder: (order: { deletedAt: Date | null; status: string }) =>
+    order.deletedAt == null && COUNTED_STATUSES.includes(order.status),
+  countedOrderWhere: () => ({ deletedAt: null, status: { in: [...COUNTED_STATUSES] } }),
 }));
 
 import type { PrismaClient } from '@prisma/client';

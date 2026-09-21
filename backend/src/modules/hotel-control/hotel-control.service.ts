@@ -394,7 +394,7 @@ async function computeHotelOversellAfterPeriodChange(
       hotelRoomType: { hotelId },
       hotelCheckIn: { lte: toD },
       hotelCheckOut: { gt: fromD },
-      order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
+      order: countedOrderWhere(),
     },
     select: {
       // id + 酒店名：房组归属过滤（expandAssignedPhysicalByDate）的坐标系
@@ -1329,7 +1329,7 @@ export async function getHotelNightlyRemaining(
       hotelRoomType: { hotelId },
       hotelCheckIn: { lte: toD },
       hotelCheckOut: { gt: fromD },
-      order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
+      order: countedOrderWhere(),
     },
     select: {
       // id + 酒店名：房组归属过滤（expandAssignedPhysicalByDate）的坐标系
@@ -1488,8 +1488,7 @@ export async function checkHotelPhysicalFit(
       hotelCheckIn: { lte: toD },
       hotelCheckOut: { gt: fromD },
       order: {
-        deletedAt: null,
-        status: { in: COUNTED_STATUSES },
+        ...countedOrderWhere(),
         ...(opts.excludeOrderId ? { id: { not: opts.excludeOrderId } } : {}),
       },
     },
@@ -2069,7 +2068,7 @@ export async function assertHotelFitAfterChange(
       hotelRoomType: { hotelId },
       hotelCheckIn: { lte: toD },
       hotelCheckOut: { gt: fromD },
-      order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
+      order: countedOrderWhere(),
     },
     select: {
       id: true,
@@ -2529,7 +2528,7 @@ export async function getBoard(
       OR: [{ hotelRoomTypeId: { not: null } }, { randomStarTier: { not: null } }],
       hotelCheckIn: { lte: toD },
       hotelCheckOut: { gt: fromD },
-      order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
+      order: countedOrderWhere(),
     },
     select: {
       // id：房组归属过滤（expandAssignedPhysicalByDate）的坐标系；酒店名已在 hotelRoomType 里
@@ -2894,7 +2893,7 @@ export async function getAlerts(
             // 这里**不需要**再排 returnVoidedFinal：作废/再释放过的行 flightScheduleId 已置空，
             // 上面的 `flightScheduleId in 本批班次` 天然把它们挡在外面。本口径要的正是
             // 「此刻真的占在这一班上的超售座」，而不是历史上恢复过几座。
-            order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
+            order: countedOrderWhere(),
           },
           select: { flightScheduleId: true, metadata: true },
         });
@@ -3335,7 +3334,7 @@ export async function getOccupyingOrders(
       ...scopeItemWhere(roomScope),
       hotelCheckIn: { lte: d },
       hotelCheckOut: { gt: d },
-      order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
+      order: countedOrderWhere(),
     },
     orderBy: { hotelCheckIn: 'asc' },
     select: {

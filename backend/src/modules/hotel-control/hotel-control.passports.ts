@@ -31,7 +31,7 @@ import { OrderItemKind, type PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { businessDateISO, businessDateTimeSec } from '../../lib/business-time.js';
 import { sanitize, extFromUrl, fetchPhoto, fmtDepartureLocalDate } from '../orders/passport-zip.js';
-import { COUNTED_STATUSES } from './hotel-control.service.js';
+import { countedOrderWhere } from './hotel-control.service.js';
 
 /** 打包用的最小乘客形态（只取护照打包/命名所需字段）。*/
 export interface PassportPassenger {
@@ -163,7 +163,7 @@ export async function collectHotelPassportGroups(
       hotelRoomTypeId: { not: null },
       hotelRoomType: { hotelId: args.hotelId },
       hotelCheckIn: { gte: fromD, lte: toD },
-      order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
+      order: countedOrderWhere(),
     },
     orderBy: { createdAt: 'asc' },
     include: {
@@ -234,7 +234,7 @@ export async function collectPassportGroupsByNames(
 
   const passengers = await client.passenger.findMany({
     where: {
-      order: { deletedAt: null, status: { in: COUNTED_STATUSES } },
+      order: countedOrderWhere(),
       OR: uniqueNames.map((name) => ({
         OR: [{ fullName: { equals: name, mode: 'insensitive' } }, { chineseName: name }],
       })),

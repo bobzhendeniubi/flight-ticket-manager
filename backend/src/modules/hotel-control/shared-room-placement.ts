@@ -43,6 +43,7 @@ import {
   withHotelCostSource,
 } from '../orders/orders.service.js';
 import {
+  randomStarTierLabel as pendingPlacementLabel,
   readRoomGroupArray,
   refreshRoomGroupsForItem,
   resolveRoomGroupPlacement,
@@ -341,12 +342,31 @@ export async function placeSharedRoom(
     // 本房 1 间——另一间共享房的成员 / 主档 / 订单行随即不一致。完整做法是按本房成员拆出住宿行
     // 再迁（份额 / 成本 / 成员引用同步），本次不做。校验在锁后现状上做（与 CAS 同处，避免
     // TOCTOU）：订单 JSON（归属本行的房组）与成员表（同行挂着的其它活跃共享房）取并集。
+    // 无归属（orderItemId 空）的房组不天然属于任何一行，但若其 hotelName 恰好是本档的随机占位
+    // 文案（旧数据 / 手改 JSON 留下的、事实上就是这行落位前的自己），也当成「本行还承载着别的
+    // 房组」一并拒绝——不然它既不参与行独占校验，落位后也没人去刷新它（2026-09-20 复审 N3）。
+    // 注意：这里必须用 room-group-placement.ts 的 randomStarTierLabel（别名 pendingPlacementLabel，
+    // 落「X星随机（待落位）」的全文案，写进房组 JSON 的正是这个函数）——不是同名从
+    // hotel-control.service.ts 引入的短展示名「X星随机」（用户提示语用的那个，两者故意不同，
+    // 混用会导致文本比对永远不命中）。
+    const pendingGroupLabel = pendingPlacementLabel(tier);
     const lineConflicts: string[] = [];
     for (const it of items) {
-      const ownGroups = (readRoomGroupArray(it.roomAssignment) ?? [])
+      const allGroups = readRoomGroupArray(it.roomAssignment) ?? [];
+      const ownGroups = allGroups
         .filter((g) => roomGroupItemId(g) === it.id)
         .map((g) => g as Record<string, unknown>);
-      const plainGroupCount = ownGroups.filter((g) => groupSharedId(g) == null).length;
+      const orphanPendingGroups = allGroups
+        .filter(
+          (g): g is Record<string, unknown> =>
+            g != null &&
+            typeof g === 'object' &&
+            !Array.isArray(g) &&
+            roomGroupItemId(g) == null &&
+            (g as Record<string, unknown>).hotelName === pendingGroupLabel,
+        );
+      const plainGroupCount =
+        ownGroups.filter((g) => groupSharedId(g) == null).length + orphanPendingGroups.length;
       const otherSharedRoomIds = new Set<string>(
         ownGroups.map((g) => groupSharedId(g)).filter((sid): sid is string => sid != null && sid !== room.id),
       );
@@ -514,9 +534,15 @@ export async function placeSharedRoom(
       placedItems.push({ orderId: it.orderId, orderNumber: it.orderNumber, orderItemId: it.id });
 
       // 分房表里归属本行的房组 → 改名到新酒店 + 新房型（共享组 sharedRoomId 原样保留，不解绑）。
+      // legacyMatch 与换酒店 / 套餐改档同款口径（orders.service.ts 换酒店、套餐改档两处）：本行没有
+      // 任何归属组时，才对「无归属 + hotelName 恰好是落位前的随机占位文案」的房组做旧文本匹配——
+      // 行独占校验已经把这类房组算进 plainGroupCount 挡在前面，这里只是同一口径的兜底，不指望它
+      // 成为常态路径（2026-09-20 复审 N3）。
       if (placement) {
         const current = roomAssignmentPatches.get(it.orderId) ?? it.roomAssignment;
-        const refreshed = refreshRoomGroupsForItem(current, it.id, placement);
+        const refreshed = refreshRoomGroupsForItem(current, it.id, placement, {
+          legacyMatch: (g) => g.hotelName === pendingGroupLabel,
+        });
         if (refreshed.changed) roomAssignmentPatches.set(it.orderId, refreshed.roomAssignment);
       }
     }
@@ -545,6 +571,8 @@ export async function placeSharedRoom(
     });
 
     // ── 审计：逐单一条 SWAP_ORDER_ITEM_HOTEL（房控「近期用房变更」按这个动作读）+ 总览一条 ──
+    // 审计用短展示名「X星随机」（hotel-control.service.ts 的 randomStarTierLabel），不是上面
+    // 行独占校验/legacyMatch 用来比对房组 JSON 文本的 pendingGroupLabel（带「（待落位）」后缀）。
     const beforeLabel = randomStarTierLabel(tier);
     for (const it of items) {
       await writeAuditWithinTx(tx, {

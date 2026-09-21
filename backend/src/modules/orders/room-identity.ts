@@ -42,7 +42,8 @@
  *     备注要点对方单号，从 SharedRoomMember 查（不能从订单 JSON 猜——JSON 只镜像本单）；
  *     B11 起附带伙伴订单的失效状态（取消/退款/软删），内部备注据此标注「（已取消）」。
  */
-import { OrderStatus, type PrismaClient } from '@prisma/client';
+import type { PrismaClient } from '@prisma/client';
+import { isCountedOrder } from '../hotel-control/hotel-control.service.js';
 
 /** roomIdentityKey 入参：房组的最小形状（跨单身份判定只看这三个字段）。*/
 export interface RoomIdentityGroup {
@@ -323,17 +324,9 @@ export class RoomNumberer {
   }
 }
 
-/** 房控有效订单状态——镜像 hotel-control.service.ts 的 COUNTED_STATUSES（B11 用于判定
- * 共享房伙伴订单是否已失效）；两处含义相同，各自独立维护，改动需同步。*/
-const PARTNER_ACTIVE_STATUSES: ReadonlySet<OrderStatus> = new Set([
-  OrderStatus.PENDING_PAYMENT,
-  OrderStatus.PAID,
-  OrderStatus.PROCESSING,
-  OrderStatus.TICKETED,
-  OrderStatus.COMPLETED,
-  OrderStatus.CHANGE_REQUESTED,
-  OrderStatus.CHANGED,
-]);
+// 房控有效订单判定（B11 用于判断共享房伙伴订单是否已失效）直接引用 hotel-control.service.ts
+// 的 isCountedOrder —— 曾经在这里手抄一份 COUNTED_STATUSES 镜像，两处各自维护迟早会漂
+// （2026-09-20 复审 N6）。
 
 export interface SharedRoomPartnerInfo {
   orderNumber: string;
@@ -367,7 +360,7 @@ export async function loadSharedRoomPartnerLookup(
   for (const row of rows) {
     const list = out.get(row.sharedRoomId) ?? [];
     if (!list.some((p) => p.orderNumber === row.order.orderNumber)) {
-      const cancelled = row.order.deletedAt != null || !PARTNER_ACTIVE_STATUSES.has(row.order.status);
+      const cancelled = !isCountedOrder(row.order);
       list.push({ orderNumber: row.order.orderNumber, cancelled });
     }
     out.set(row.sharedRoomId, list);
