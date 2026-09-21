@@ -28,6 +28,10 @@ import {
   workOrderSummaryQuerySchema,
 } from './reminders.schemas.js';
 import { generateRuleReminders } from './reminders.rules.js';
+import {
+  parseUpgradeRedeemRuleKey,
+  resolveRedeemProfileIdsByPassenger,
+} from './reminders.rules.upgrade-redeem.js';
 
 export const reminderRoutes: FastifyPluginAsync = async (app) => {
   const requireOps = {
@@ -65,7 +69,29 @@ export const reminderRoutes: FastifyPluginAsync = async (app) => {
       prisma.operationalReminder.count({ where }),
     ]);
 
-    return { reminders: rows, pagination: { page: q.page, pageSize: q.pageSize, total } };
+    // 「次数升级待核销」的档案直达目标：ruleKey 里只有稳定的乘客 id（档案 id 会因建档/合并
+    // 变来变去，进了键就等于同一件事随时换身份，见 upgradeRedeemRuleKey），跳转目标改成
+    // 读的时候按乘客证件号现算成**当前**主档案 id。本页没有这类待办时不发这两次查询。
+    const redeemPassengerIds = [
+      ...new Set(
+        rows
+          .map((r) => parseUpgradeRedeemRuleKey(r.ruleKey)?.passengerId)
+          .filter((id): id is string => Boolean(id)),
+      ),
+    ];
+    const redeemProfileIds = await resolveRedeemProfileIdsByPassenger(prisma, redeemPassengerIds);
+
+    return {
+      reminders: rows.map((r) => {
+        const passengerId = parseUpgradeRedeemRuleKey(r.ruleKey)?.passengerId;
+        return {
+          ...r,
+          // 非规则 12 的行恒为 null；查不到档案的也是 null（前端据此不渲染「去核销」链接）
+          redeemProfileId: passengerId ? (redeemProfileIds.get(passengerId) ?? null) : null,
+        };
+      }),
+      pagination: { page: q.page, pageSize: q.pageSize, total },
+    };
   });
 
   // 出票工单角标（顶栏轮询）——no-show 释放回程「撤名单」/回程恢复「重新上名单」/航段作废

@@ -73,18 +73,16 @@ function ruleLabel(key: string): string {
 /**
  * 「次数升级待核销」的档案直达链接。
  *
- * OperationalReminder 没有 payload 列，后端把档案 id 放在 ruleKey 末段
- * （`UPGRADEREDEEM:{乘客id}:{起飞日}:{档案id|NOPROFILE}`，见 reminders.rules.ts 的
- * upgradeRedeemRuleKey）。匹配不到档案时是 NOPROFILE —— 那种提醒照常显示，只是没有直达链接，
- * 正文里写了怎么先建档。
+ * 档案 id 以前放在 ruleKey 末段，但档案会因「先没档案后建档」「档案连续合并」变来变去，
+ * 键里带着它等于同一件事随时换身份（旧条永久挂在待办列表）。现在 ruleKey 只放稳定的
+ * 「乘客 + 航段」，列表接口按乘客证件号现算出**当前**主档案 id，随行返回 redeemProfileId
+ * （见 backend reminders.routes.ts）。查不到档案时为 null —— 那种提醒照常显示，只是没有
+ * 直达链接，正文里写了怎么先建档。
  */
-const UPGRADE_REDEEM_PREFIX = 'UPGRADEREDEEM:';
-const NO_PROFILE = 'NOPROFILE';
-
-function upgradeRedeemProfileId(ruleKey: string | null | undefined): string | null {
-  if (!ruleKey || !ruleKey.startsWith(UPGRADE_REDEEM_PREFIX)) return null;
-  const profileId = ruleKey.split(':')[3] ?? '';
-  return profileId && profileId !== NO_PROFILE ? profileId : null;
+function upgradeRedeemProfileId(reminder: OperationalReminder): string | null {
+  // redeemProfileId 是列表接口的派生字段（不在 OperationalReminder 的公共类型里）
+  const profileId = (reminder as { redeemProfileId?: string | null }).redeemProfileId;
+  return profileId?.trim() ? profileId : null;
 }
 
 function todayYmd(): string {
@@ -404,7 +402,7 @@ export function RemindersPage() {
                 const isOpenLike = r.status === 'OPEN' || r.status === 'IN_PROGRESS';
                 const overdue = isOpenLike && r.dueAt !== null && ymd(r.dueAt) < today;
                 const rowBusy = busyId === r.id;
-                const redeemProfileId = upgradeRedeemProfileId(r.ruleKey);
+                const redeemProfileId = upgradeRedeemProfileId(r);
                 return (
                   <tr key={r.id}>
                     <td>

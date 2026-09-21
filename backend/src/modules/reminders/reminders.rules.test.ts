@@ -28,6 +28,8 @@ import {
   generateRuleReminders,
   hasRoomAssignment,
   ROOM_REMINDER_STATE_MACHINE_SINCE,
+  resolveProfileMasterId,
+  upgradeRedeemLegStartMs,
   upgradeRedeemRuleKey,
   utcDateStr,
   type RuleOrder,
@@ -861,8 +863,12 @@ describe('generateRuleReminders — 触发条件消失后自动核销（B-14/C-7
   function makeMockPrisma(
     order: Record<string, unknown> | null,
     preexisting: Array<{ id: string; ruleKey: string; status: ReminderStatus }>,
+    /** 模拟并发：自动核销读出存量之后、写回之前，运营手工处理掉某一条 */
+    manualResolveAfterScan?: { id: string; status: ReminderStatus; resolvedNote: string },
   ) {
-    const rows = new Map(preexisting.map((r) => [r.id, { ...r }]));
+    const rows = new Map<string, { id: string; ruleKey: string; status: ReminderStatus; resolvedNote?: string }>(
+      preexisting.map((r) => [r.id, { ...r }]),
+    );
     const mock = {
       order: { findMany: vi.fn(async () => (order ? [order] : [])) },
       fulfillmentTask: { findMany: vi.fn(async () => []) },
@@ -874,24 +880,34 @@ describe('generateRuleReminders — 触发条件消失后自动核销（B-14/C-7
           }) => {
             const ruleKeyIn = args.where.ruleKey?.in ?? [];
             const statusIn = args.where.status?.in;
-            return [...rows.values()].filter(
+            const matched = [...rows.values()].filter(
               (r) => ruleKeyIn.includes(r.ruleKey) && (!statusIn || statusIn.includes(r.status)),
             );
+            if (manualResolveAfterScan && statusIn) {
+              const row = rows.get(manualResolveAfterScan.id);
+              if (row) {
+                row.status = manualResolveAfterScan.status;
+                row.resolvedNote = manualResolveAfterScan.resolvedNote;
+              }
+            }
+            return matched;
           },
         ),
         createMany: vi.fn(async () => ({ count: 0 })),
         updateMany: vi.fn(
           async (args: {
-            where: { id: { in: string[] } };
+            where: { id: { in: string[] }; status?: { in: ReminderStatus[] } };
             data: { status: ReminderStatus; resolvedNote?: string };
           }) => {
             let count = 0;
             for (const id of args.where.id.in) {
               const row = rows.get(id);
-              if (row) {
-                row.status = args.data.status;
-                count += 1;
-              }
+              if (!row) continue;
+              // 真 SQL 的 WHERE 会把状态条件一起带上——mock 必须照做，否则测不出覆盖人工结论
+              if (args.where.status && !args.where.status.in.includes(row.status)) continue;
+              row.status = args.data.status;
+              if (args.data.resolvedNote !== undefined) row.resolvedNote = args.data.resolvedNote;
+              count += 1;
             }
             return { count };
           },
@@ -927,6 +943,23 @@ describe('generateRuleReminders — 触发条件消失后自动核销（B-14/C-7
     await generateRuleReminders(mock, 'user_sys', NOW2);
 
     expect(rows.get('r1')).toMatchObject({ status: ReminderStatus.DONE });
+  });
+
+  it('F8｜读出存量后运营手工完成 → 自动核销不覆盖人工结论（id + status 原子更新，全规则共用）', async () => {
+    const order = baseOrder({ paidAmount: new Prisma.Decimal('5000') }); // 付清 → 本该自动核销
+    const ruleKey = `BALANCE:ord_x:${departSoon2}`;
+    const { mock, rows } = makeMockPrisma(
+      order,
+      [{ id: 'r1', ruleKey, status: ReminderStatus.OPEN }],
+      { id: 'r1', status: ReminderStatus.SKIPPED, resolvedNote: '客人改走公司月结，不用催' },
+    );
+
+    await generateRuleReminders(mock, 'user_sys', NOW2);
+
+    expect(rows.get('r1')).toMatchObject({
+      status: ReminderStatus.SKIPPED,
+      resolvedNote: '客人改走公司月结，不用催',
+    });
   });
 
   it('尾款仍未付清 → 存量提醒保持 OPEN，不误关', async () => {
@@ -1687,13 +1720,18 @@ describe('B8：跨单分房分房提醒状态机（重开 / 旧日期键清理 /
   });
 });
 
-
 // ── 规则 12：次数升级待核销 ─────────────────────────────────────────────────
+
 describe('UPGRADE_REDEEM_PENDING 次数升级待核销', () => {
   const NOW12 = new Date('2026-07-09T06:00:00Z');
 
-  function leg(departISO: string, flightNumber: string | null = 'QH9588') {
-    return { departureTime: new Date(departISO), departureTz: 'Asia/Shanghai', flightNumber };
+  function leg(
+    itemId: string,
+    departISO: string,
+    flightNumber: string | null = 'QH9588',
+    tz: string | null = 'Asia/Shanghai',
+  ) {
+    return { itemId, departureTime: new Date(departISO), departureTz: tz, flightNumber };
   }
 
   function markedPax(overrides: Partial<RuleUpgradeRedeemPassenger> = {}): RuleUpgradeRedeemPassenger {
@@ -1703,7 +1741,7 @@ describe('UPGRADE_REDEEM_PENDING 次数升级待核销', () => {
       orderId: 'ord_1',
       orderNumber: 'FTM2026070900001',
       upgradeRedeemLeg: 'OUTBOUND',
-      flights: [leg('2026-07-08T02:00:00Z')],
+      flights: [leg('item_out', '2026-07-08T02:00:00Z')],
       profileId: 'prof_1',
       redeemedAfterLeg: false,
       ...overrides,
@@ -1712,23 +1750,24 @@ describe('UPGRADE_REDEEM_PENDING 次数升级待核销', () => {
 
   it('那一程还没起飞 → 不生成（扣早了要冲正）', () => {
     const out = buildUpgradeRedeemCandidates(
-      markedPax({ flights: [leg('2026-07-15T02:00:00Z')] }),
+      markedPax({ flights: [leg('item_out', '2026-07-15T02:00:00Z')] }),
       TODAY,
       NOW12,
     );
     expect(out).toHaveLength(0);
   });
 
-  it('那一程已起飞且档案上没有这程之后的核销 → 生成一条，key 带档案 id 供前端直达', () => {
+  it('那一程已起飞且档案上没有这程之后的核销 → 生成一条，key = 乘客 + 航段行（不含日期/档案 id）', () => {
     const out = buildUpgradeRedeemCandidates(markedPax(), TODAY, NOW12);
     expect(out).toHaveLength(1);
     expect(out[0]).toMatchObject({
       rule: 'UPGRADE_REDEEM_PENDING',
-      ruleKey: 'UPGRADEREDEEM:pax_1:2026-07-08:prof_1',
+      ruleKey: 'UPGRADEREDEEM:pax_1:item_out',
       orderId: 'ord_1',
       priority: ReminderPriority.HIGH,
       dueAt: TODAY,
     });
+    expect(out[0].ruleKey).toBe(upgradeRedeemRuleKey('pax_1', 'item_out'));
     expect(out[0].title).toContain('次数升级待核销');
     expect(out[0].title).toContain('张三');
     expect(out[0].title).toContain('QH9588');
@@ -1736,105 +1775,222 @@ describe('UPGRADE_REDEEM_PENDING 次数升级待核销', () => {
     expect(out[0].body).toContain('去程');
   });
 
+  it('档案 id 不进 ruleKey：建档前后同一把键，只有正文提示不同', () => {
+    const withProfile = buildUpgradeRedeemCandidates(markedPax(), TODAY, NOW12);
+    const without = buildUpgradeRedeemCandidates(markedPax({ profileId: null }), TODAY, NOW12);
+    expect(without[0].ruleKey).toBe(withProfile[0].ruleKey);
+    expect(without[0].body).toContain('建档');
+    expect(withProfile[0].body).not.toContain('建档');
+  });
+
   it('这一程之后已经核销过 → 不再提醒', () => {
     const out = buildUpgradeRedeemCandidates(markedPax({ redeemedAfterLeg: true }), TODAY, NOW12);
     expect(out).toHaveLength(0);
   });
 
-  it('双程（BOTH）按回程判：去程飞了回程没飞不催，回程飞完才催，日期取回程', () => {
+  it('双程（BOTH）按回程判：去程飞了回程没飞不催，回程飞完才催，key/文案取回程那一行', () => {
     const both = markedPax({
       upgradeRedeemLeg: 'BOTH',
-      flights: [leg('2026-07-05T02:00:00Z', 'QH9588'), leg('2026-07-12T02:00:00Z', 'QH9589')],
+      flights: [
+        leg('item_out', '2026-07-05T02:00:00Z', 'QH9588'),
+        leg('item_ret', '2026-07-12T02:00:00Z', 'QH9589'),
+      ],
     });
-    // 去程已飞、回程未飞 → 不催
     expect(buildUpgradeRedeemCandidates(both, TODAY, NOW12)).toHaveLength(0);
-    // 回程也飞完 → 催，且 key/文案按回程那一段
     const after = buildUpgradeRedeemCandidates(both, '2026-07-13', new Date('2026-07-13T06:00:00Z'));
     expect(after).toHaveLength(1);
-    expect(after[0].ruleKey).toBe('UPGRADEREDEEM:pax_1:2026-07-12:prof_1');
+    expect(after[0].ruleKey).toBe('UPGRADEREDEEM:pax_1:item_ret');
     expect(after[0].title).toContain('QH9589');
     expect(after[0].body).toContain('往返');
   });
 
   it('标了回程却只有单程航段（或回程已释放）→ 目标航段不存在，不提醒', () => {
     const out = buildUpgradeRedeemCandidates(
-      markedPax({ upgradeRedeemLeg: 'RETURN', flights: [leg('2026-07-08T02:00:00Z')] }),
+      markedPax({ upgradeRedeemLeg: 'RETURN', flights: [leg('item_out', '2026-07-08T02:00:00Z')] }),
       TODAY,
       NOW12,
     );
     expect(out).toHaveLength(0);
   });
 
-  it('证件号没匹配到档案 → 提醒照发，key 落 NOPROFILE 且正文给出建档指引', () => {
-    const out = buildUpgradeRedeemCandidates(markedPax({ profileId: null }), TODAY, NOW12);
-    expect(out).toHaveLength(1);
-    expect(out[0].ruleKey).toBe('UPGRADEREDEEM:pax_1:2026-07-08:NOPROFILE');
-    expect(out[0].body).toContain('建档');
-    expect(upgradeRedeemRuleKey('pax_1', '2026-07-08', null)).toBe(out[0].ruleKey);
-  });
-
-  it('NONE / 航班时区口径：不兑换的乘客永远不进这条规则', () => {
+  it('NONE：不兑换的乘客永远不进这条规则', () => {
     expect(buildUpgradeRedeemCandidates(markedPax({ upgradeRedeemLeg: 'NONE' }), TODAY, NOW12)).toHaveLength(0);
   });
 });
 
-describe('generateRuleReminders — 规则 12 取数与自动核销', () => {
+describe('upgradeRedeemLegStartMs 核销时间下界按起飞地时区折（F5）', () => {
+  it('北京：当地零点 = 前一天 16:00Z，北京 07:00 核销落在下界之后（不再误催）', () => {
+    const start = upgradeRedeemLegStartMs({ legDate: '2026-09-20', departureTz: 'Asia/Shanghai' });
+    expect(new Date(start).toISOString()).toBe('2026-09-19T16:00:00.000Z');
+    // 北京 2026-09-20 07:00 = 2026-09-19T23:00Z，在下界之后 → 算「这一程之后已核销」
+    expect(Date.parse('2026-09-19T23:00:00Z') >= start).toBe(true);
+    // 前一天北京 23:00 = 2026-09-20T15:00Z 之前，仍在下界之前 → 不算
+    expect(Date.parse('2026-09-19T15:00:00Z') >= start).toBe(false);
+  });
+
+  it('越南（UTC+7）：当地零点 = 前一天 17:00Z', () => {
+    const start = upgradeRedeemLegStartMs({ legDate: '2026-09-20', departureTz: 'Asia/Ho_Chi_Minh' });
+    expect(new Date(start).toISOString()).toBe('2026-09-19T17:00:00.000Z');
+  });
+
+  it('tz 为空 / 不识别 → 回退 UTC 零点（与 flight-time 其它函数同一个回退口径）', () => {
+    expect(new Date(upgradeRedeemLegStartMs({ legDate: '2026-09-20', departureTz: null })).toISOString()).toBe(
+      '2026-09-20T00:00:00.000Z',
+    );
+    expect(new Date(upgradeRedeemLegStartMs({ legDate: '2026-09-20', departureTz: 'UTC' })).toISOString()).toBe(
+      '2026-09-20T00:00:00.000Z',
+    );
+  });
+});
+
+describe('resolveProfileMasterId 沿合并链解析主档案（F6）', () => {
+  function ref(id: string, mergedIntoId: string | null) {
+    return { id, documentType: 'PASSPORT', documentNumber: id.toUpperCase(), mergedIntoId };
+  }
+
+  it('A→B→C 连续合并 → 解析到 C（只跳一次会停在 B，永远查错档案）', () => {
+    const byId = new Map([
+      ['a', ref('a', 'b')],
+      ['b', ref('b', 'c')],
+      ['c', ref('c', null)],
+    ]);
+    expect(resolveProfileMasterId('a', byId)).toBe('c');
+    expect(resolveProfileMasterId('b', byId)).toBe('c');
+    expect(resolveProfileMasterId('c', byId)).toBe('c');
+  });
+
+  it('环（脏数据）→ 就地停，不死循环', () => {
+    const byId = new Map([
+      ['a', ref('a', 'b')],
+      ['b', ref('b', 'a')],
+    ]);
+    expect(resolveProfileMasterId('a', byId)).toBe('b');
+  });
+
+  it('下一跳没加载进内存 → 用那个指针目标 id（外键保证它存在）', () => {
+    const byId = new Map([['a', ref('a', 'b')]]);
+    expect(resolveProfileMasterId('a', byId)).toBe('b');
+  });
+});
+
+describe('generateRuleReminders — 规则 12 取数、时区、档案链与收敛', () => {
   const NOW12 = new Date('2026-07-09T06:00:00Z');
 
+  interface ReminderRow {
+    id: string;
+    ruleKey: string;
+    status: ReminderStatus;
+    resolvedNote?: string | null;
+  }
+
+  function markedRow(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'pax_1',
+      fullName: '张三',
+      orderId: 'ord_1',
+      documentType: 'PASSPORT',
+      documentNumber: ' e12345678 ',
+      upgradeRedeemLeg: 'OUTBOUND',
+      order: {
+        orderNumber: 'FTM2026070900001',
+        items: [
+          {
+            id: 'item_out',
+            flightSchedule: {
+              departureTime: new Date('2026-07-08T02:00:00Z'),
+              departureTz: 'Asia/Shanghai',
+              flight: { flightNumber: 'QH9588' },
+            },
+          },
+        ],
+      },
+      ...overrides,
+    };
+  }
+
   function makePrisma(opts: {
+    passengers?: Array<Record<string, unknown>>;
     profiles?: Array<{ id: string; documentType: string; documentNumber: string; mergedIntoId: string | null }>;
     redemptions?: Array<{ profileId: string; createdAt: Date }>;
-    preexisting?: Array<{ id: string; ruleKey: string; status: ReminderStatus }>;
+    preexisting?: ReminderRow[];
+    /** 模拟并发：reconcile 读出存量之后、写回之前，运营手工处理掉某一条 */
+    manualResolveAfterScan?: { id: string; status: ReminderStatus; resolvedNote: string };
   } = {}) {
     const store = new Set<string>();
-    const rows = new Map((opts.preexisting ?? []).map((r) => [r.id, { ...r }]));
+    const rows = new Map<string, ReminderRow>((opts.preexisting ?? []).map((r) => [r.id, { ...r }]));
+    const profiles = opts.profiles ?? [
+      { id: 'prof_ptr', documentType: 'PASSPORT', documentNumber: 'E12345678', mergedIntoId: 'prof_master' },
+      { id: 'prof_master', documentType: 'PASSPORT', documentNumber: 'E20000000', mergedIntoId: null },
+    ];
     const mock = {
       order: { findMany: vi.fn(async () => []) },
       fulfillmentTask: { findMany: vi.fn(async () => []) },
       holdOrder: { findMany: vi.fn(async () => []) },
       passenger: {
-        findMany: vi.fn(async () => [
-          {
-            id: 'pax_1',
-            fullName: '张三',
-            orderId: 'ord_1',
-            documentType: 'PASSPORT',
-            documentNumber: ' e12345678 ',
-            upgradeRedeemLeg: 'OUTBOUND',
-            order: {
-              orderNumber: 'FTM2026070900001',
-              items: [
-                {
-                  flightSchedule: {
-                    departureTime: new Date('2026-07-08T02:00:00Z'),
-                    departureTz: 'Asia/Shanghai',
-                    flight: { flightNumber: 'QH9588' },
-                  },
-                },
-              ],
-            },
-          },
-        ]),
+        findMany: vi.fn(async (args: { where: { id?: { in: string[] } } }) => {
+          const list = opts.passengers ?? [markedRow()];
+          const idIn = args.where?.id?.in;
+          return idIn ? list.filter((p) => idIn.includes(p.id as string)) : list;
+        }),
       },
       travelerProfile: {
-        findMany: vi.fn(async () =>
-          opts.profiles ?? [
-            { id: 'prof_ptr', documentType: 'PASSPORT', documentNumber: 'E12345678', mergedIntoId: 'prof_master' },
-          ],
+        findMany: vi.fn(
+          async (args: {
+            where: {
+              id?: { in: string[] };
+              OR?: Array<{ documentType: string; documentNumber: { equals: string } }>;
+            };
+          }) => {
+            if (args.where.id?.in) {
+              const wanted = args.where.id.in;
+              return profiles.filter((p) => wanted.includes(p.id));
+            }
+            const wantedDocs = (args.where.OR ?? []).map(
+              (o) => `${o.documentType}|${o.documentNumber.equals.trim().toUpperCase()}`,
+            );
+            return profiles.filter((p) =>
+              wantedDocs.includes(`${p.documentType}|${p.documentNumber.trim().toUpperCase()}`),
+            );
+          },
         ),
       },
-      travelerBenefitRedemption: { findMany: vi.fn(async () => opts.redemptions ?? []) },
+      travelerBenefitRedemption: {
+        // 带上 args 形参，好让 mock.calls[0][0] 有类型（断言查的是哪些 profileId）
+        findMany: vi.fn(async (_args: { where: { profileId: { in: string[] } } }) => opts.redemptions ?? []),
+      },
       operationalReminder: {
         findMany: vi.fn(
-          async (args: { where: { ruleKey?: { in?: string[]; startsWith?: string }; status?: { in: ReminderStatus[] } } }) => {
+          async (args: {
+            where: {
+              ruleKey?: { in?: string[]; startsWith?: string };
+              status?: { in: ReminderStatus[] };
+            };
+          }) => {
+            const statusIn = args.where.status?.in;
+            const prefix = args.where.ruleKey?.startsWith;
+            if (prefix) {
+              const matched = [...rows.values()].filter(
+                (r) => r.ruleKey.startsWith(prefix) && (!statusIn || statusIn.includes(r.status)),
+              );
+              // 读出之后、写回之前运营手工处理（F8 交错执行）
+              const manual = opts.manualResolveAfterScan;
+              if (manual) {
+                const row = rows.get(manual.id);
+                if (row) {
+                  row.status = manual.status;
+                  row.resolvedNote = manual.resolvedNote;
+                }
+              }
+              return matched.map((r) => ({ id: r.id, ruleKey: r.ruleKey }));
+            }
             const keyIn = args.where.ruleKey?.in;
             if (keyIn) {
-              const statusIn = args.where.status?.in;
               const matched = [...rows.values()].filter(
                 (r) => keyIn.includes(r.ruleKey) && (!statusIn || statusIn.includes(r.status)),
               );
-              // 幂等查重那一次只关心 ruleKey（不带 status 条件）
-              return statusIn ? matched : [...matched, ...keyIn.filter((k) => store.has(k)).map((ruleKey) => ({ ruleKey }))];
+              return statusIn
+                ? matched
+                : [...matched, ...keyIn.filter((k) => store.has(k)).map((ruleKey) => ({ ruleKey }))];
             }
             return [];
           },
@@ -1849,85 +2005,190 @@ describe('generateRuleReminders — 规则 12 取数与自动核销', () => {
           }
           return { count };
         }),
-        updateMany: vi.fn(async (args: { where: { id: { in: string[] } }; data: { status: ReminderStatus } }) => {
-          let count = 0;
-          for (const id of args.where.id.in) {
-            const row = rows.get(id);
-            if (row) {
+        updateMany: vi.fn(
+          async (args: {
+            where: { id: { in: string[] }; status?: { in: ReminderStatus[] } };
+            data: { status: ReminderStatus; resolvedNote?: string };
+          }) => {
+            let count = 0;
+            for (const id of args.where.id.in) {
+              const row = rows.get(id);
+              if (!row) continue;
+              // 真 SQL 的 WHERE 会把状态条件一起带上——mock 必须照做，否则测不出覆盖人工结论
+              if (args.where.status && !args.where.status.in.includes(row.status)) continue;
               row.status = args.data.status;
+              if (args.data.resolvedNote !== undefined) row.resolvedNote = args.data.resolvedNote;
               count += 1;
             }
-          }
-          return { count };
-        }),
+            return { count };
+          },
+        ),
       },
     };
     return { mock: mock as unknown as PrismaClient, raw: mock, store, rows };
   }
 
-  it('标了次数升级且已起飞 → 生成一条；证件号大小写/空格不影响匹配，指针档案解析到主档案', async () => {
+  it('标了次数升级且已起飞 → 生成一条稳定键；证件号大小写/空格不影响匹配', async () => {
     const { mock, raw, store } = makePrisma();
     const result = await generateRuleReminders(mock, 'user_sys', NOW12);
     expect(result).toMatchObject({ created: 1, byRule: { UPGRADE_REDEEM_PENDING: 1 } });
-    expect([...store]).toContain('UPGRADEREDEEM:pax_1:2026-07-08:prof_master');
+    expect([...store]).toEqual(['UPGRADEREDEEM:pax_1:item_out']);
     // 只查标过次数升级的乘客，且状态集含 COMPLETED（起飞后订单常已完结）
-    const where = (raw.passenger.findMany.mock.calls[0][0] as { where: { order: { status: { in: string[] } } } }).where;
-    expect(where.order.status.in).toContain('COMPLETED');
+    const where = raw.passenger.findMany.mock.calls[0][0] as { where: { order: { status: { in: string[] } } } };
+    expect(where.where.order.status.in).toContain('COMPLETED');
   });
 
-  it('这一程起飞之后已有正数核销 → 不生成，并自动核销存量提醒（含 NOPROFILE 那条）', async () => {
+  it('F6｜档案 A→B→C 连续合并 → 按最终主档案 C 查核销台账（只跳一跳会永远误催）', async () => {
+    const { mock, raw } = makePrisma({
+      profiles: [
+        { id: 'prof_a', documentType: 'PASSPORT', documentNumber: 'E12345678', mergedIntoId: 'prof_b' },
+        { id: 'prof_b', documentType: 'PASSPORT', documentNumber: 'E20000000', mergedIntoId: 'prof_c' },
+        { id: 'prof_c', documentType: 'PASSPORT', documentNumber: 'E30000000', mergedIntoId: null },
+      ],
+      redemptions: [{ profileId: 'prof_c', createdAt: new Date('2026-07-08T09:00:00Z') }],
+    });
+    const result = await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect(raw.travelerBenefitRedemption.findMany.mock.calls[0][0].where.profileId.in).toEqual(['prof_c']);
+    // C 上已有这一程之后的核销 → 不再催
+    expect(result.byRule.UPGRADE_REDEEM_PENDING).toBeUndefined();
+  });
+
+  it('F5｜北京 07:00 核销、10:00 起飞 → 算已核销，不生成（下界按 departureTz 折）', async () => {
+    // 起飞：北京 2026-07-08 10:00 = 02:00Z；核销：北京 07:00 = 2026-07-07T23:00Z
+    const { mock } = makePrisma({
+      redemptions: [{ profileId: 'prof_master', createdAt: new Date('2026-07-07T23:00:00Z') }],
+    });
+    const result = await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect(result.byRule.UPGRADE_REDEEM_PENDING).toBeUndefined();
+  });
+
+  it('F5｜起飞前一天北京 23:00 的核销（当地零点之前）不算这一程 → 照常生成', async () => {
+    // 北京 2026-07-07 23:00 = 2026-07-07T15:00Z，早于起飞当地日零点 2026-07-07T16:00Z
+    const { mock, store } = makePrisma({
+      redemptions: [{ profileId: 'prof_master', createdAt: new Date('2026-07-07T15:00:00Z') }],
+    });
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect([...store]).toContain('UPGRADEREDEEM:pax_1:item_out');
+  });
+
+  it('F4｜撤销次数升级标记 / 订单取消 → 本轮扫不到这位乘客，旧待办自动核销', async () => {
+    const { mock, rows } = makePrisma({
+      passengers: [],
+      preexisting: [{ id: 'rem_1', ruleKey: 'UPGRADEREDEEM:pax_1:item_out', status: ReminderStatus.OPEN }],
+    });
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect(rows.get('rem_1')!.status).toBe(ReminderStatus.DONE);
+    expect(rows.get('rem_1')!.resolvedNote).toContain('标记已撤销');
+  });
+
+  it('F4｜改期换了航段行 → 旧行的待办自动核销，新行的键接手', async () => {
+    const { mock, rows, store } = makePrisma({
+      preexisting: [{ id: 'rem_old', ruleKey: 'UPGRADEREDEEM:pax_1:item_old', status: ReminderStatus.OPEN }],
+    });
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect(rows.get('rem_old')!.status).toBe(ReminderStatus.DONE);
+    expect(rows.get('rem_old')!.resolvedNote).toContain('航段已变更');
+    expect([...store]).toContain('UPGRADEREDEEM:pax_1:item_out');
+  });
+
+  it('F4｜已核销 → 不生成，且存量待办自动核销（备注写明已核销）', async () => {
     const { mock, rows } = makePrisma({
       redemptions: [{ profileId: 'prof_master', createdAt: new Date('2026-07-08T12:00:00Z') }],
-      preexisting: [
-        { id: 'rem_1', ruleKey: 'UPGRADEREDEEM:pax_1:2026-07-08:prof_master', status: ReminderStatus.OPEN },
-        { id: 'rem_2', ruleKey: 'UPGRADEREDEEM:pax_1:2026-07-08:NOPROFILE', status: ReminderStatus.OPEN },
-      ],
+      preexisting: [{ id: 'rem_1', ruleKey: 'UPGRADEREDEEM:pax_1:item_out', status: ReminderStatus.OPEN }],
     });
     const result = await generateRuleReminders(mock, 'user_sys', NOW12);
     expect(result.byRule.UPGRADE_REDEEM_PENDING).toBeUndefined();
     expect(rows.get('rem_1')!.status).toBe(ReminderStatus.DONE);
-    expect(rows.get('rem_2')!.status).toBe(ReminderStatus.DONE);
+    expect(rows.get('rem_1')!.resolvedNote).toContain('已核销');
   });
 
-  it('档案后来建起来了 → 新键接手，旧的 NOPROFILE 那条自动核销，同一件事不挂两条', async () => {
+  it('F4｜旧格式键（带起飞日 + 档案 id）→ 一并收敛，新键接手', async () => {
     const { mock, rows, store } = makePrisma({
       preexisting: [
-        { id: 'rem_old', ruleKey: 'UPGRADEREDEEM:pax_1:2026-07-08:NOPROFILE', status: ReminderStatus.OPEN },
+        { id: 'rem_legacy', ruleKey: 'UPGRADEREDEEM:pax_1:2026-07-08:prof_master', status: ReminderStatus.OPEN },
+        { id: 'rem_noprof', ruleKey: 'UPGRADEREDEEM:pax_1:2026-07-08:NOPROFILE', status: ReminderStatus.IN_PROGRESS },
       ],
     });
     await generateRuleReminders(mock, 'user_sys', NOW12);
-    expect([...store]).toContain('UPGRADEREDEEM:pax_1:2026-07-08:prof_master');
-    expect(rows.get('rem_old')!.status).toBe(ReminderStatus.DONE);
+    expect(rows.get('rem_legacy')!.status).toBe(ReminderStatus.DONE);
+    expect(rows.get('rem_noprof')!.status).toBe(ReminderStatus.DONE);
+    expect(rows.get('rem_legacy')!.resolvedNote).toContain('键已升级');
+    expect([...store]).toContain('UPGRADEREDEEM:pax_1:item_out');
   });
 
-  it('起飞前不生成任何东西', async () => {
-    const { mock, raw } = makePrisma();
-    raw.passenger.findMany = vi.fn(async () => [
-      {
-        id: 'pax_1',
-        fullName: '张三',
-        orderId: 'ord_1',
-        documentType: 'PASSPORT',
-        documentNumber: 'E12345678',
-        upgradeRedeemLeg: 'OUTBOUND',
-        order: {
-          orderNumber: 'FTM2026070900001',
-          items: [
-            {
-              flightSchedule: {
-                departureTime: new Date('2026-07-20T02:00:00Z'),
-                departureTz: 'Asia/Shanghai',
-                flight: { flightNumber: 'QH9588' },
-              },
-            },
-          ],
-        },
+  it('F8｜读出存量后运营手工跳过 → 自动核销不覆盖人工结论（id + status 原子更新）', async () => {
+    const { mock, rows } = makePrisma({
+      passengers: [],
+      preexisting: [{ id: 'rem_1', ruleKey: 'UPGRADEREDEEM:pax_1:item_out', status: ReminderStatus.OPEN }],
+      manualResolveAfterScan: {
+        id: 'rem_1',
+        status: ReminderStatus.SKIPPED,
+        resolvedNote: '客人这次不扣次数，已和财务确认',
       },
-    ]);
+    });
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect(rows.get('rem_1')!.status).toBe(ReminderStatus.SKIPPED);
+    expect(rows.get('rem_1')!.resolvedNote).toBe('客人这次不扣次数，已和财务确认');
+  });
+
+  it('本规则这一轮没跑（delegate 不全）→ 收敛整个跳过，不误关存量', async () => {
+    const { mock, raw, rows } = makePrisma({
+      preexisting: [{ id: 'rem_1', ruleKey: 'UPGRADEREDEEM:pax_1:item_out', status: ReminderStatus.OPEN }],
+    });
+    delete (raw as { travelerBenefitRedemption?: unknown }).travelerBenefitRedemption;
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect(rows.get('rem_1')!.status).toBe(ReminderStatus.OPEN);
+  });
+
+  it('起飞前不生成任何东西，也不去查档案/台账', async () => {
+    const { mock, raw } = makePrisma({
+      passengers: [
+        markedRow({
+          order: {
+            orderNumber: 'FTM2026070900001',
+            items: [
+              {
+                id: 'item_out',
+                flightSchedule: {
+                  departureTime: new Date('2026-07-20T02:00:00Z'),
+                  departureTz: 'Asia/Shanghai',
+                  flight: { flightNumber: 'QH9588' },
+                },
+              },
+            ],
+          },
+        }),
+      ],
+    });
     const result = await generateRuleReminders(mock, 'user_sys', NOW12);
     expect(result).toMatchObject({ created: 0 });
-    // 没有需要判定的人时不必去查档案/台账
     expect(raw.travelerProfile.findMany).not.toHaveBeenCalled();
     expect(raw.travelerBenefitRedemption.findMany).not.toHaveBeenCalled();
+  });
+
+  it('起飞前的那条：上一轮留下的旧待办这一轮就被收敛掉（不永久挂着）', async () => {
+    const { mock, rows } = makePrisma({
+      passengers: [
+        markedRow({
+          order: {
+            orderNumber: 'FTM2026070900001',
+            items: [
+              {
+                id: 'item_out',
+                flightSchedule: {
+                  departureTime: new Date('2026-07-20T02:00:00Z'),
+                  departureTz: 'Asia/Shanghai',
+                  flight: { flightNumber: 'QH9588' },
+                },
+              },
+            ],
+          },
+        }),
+      ],
+      preexisting: [{ id: 'rem_1', ruleKey: 'UPGRADEREDEEM:pax_1:item_out', status: ReminderStatus.OPEN }],
+    });
+    await generateRuleReminders(mock, 'user_sys', NOW12);
+    expect(rows.get('rem_1')!.status).toBe(ReminderStatus.DONE);
+    expect(rows.get('rem_1')!.resolvedNote).toContain('尚未起飞');
   });
 });

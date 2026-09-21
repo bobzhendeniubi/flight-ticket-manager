@@ -13,6 +13,9 @@ import { ReminderPriority, ReminderStatus, StaffRole, UserRole } from '@prisma/c
 
 const prismaMock = vi.hoisted(() => ({
   user: { findUnique: vi.fn() },
+  // 规则 12「去核销」直达目标：列表接口按乘客证件号现算主档案 id（见 redeemProfileId）
+  passenger: { findMany: vi.fn() },
+  travelerProfile: { findMany: vi.fn() },
   operationalReminder: {
     count: vi.fn(),
     findMany: vi.fn(),
@@ -216,5 +219,92 @@ describe('GET /reminders/work-orders/summary', () => {
     expect(res.statusCode).toBe(200);
     const body = res.json();
     expect(body).toMatchObject({ open: 0, inProgress: 0, latestAt: null, items: [] });
+  });
+});
+
+describe('GET /reminders — 「次数升级待核销」的档案直达目标 redeemProfileId', () => {
+  let app: FastifyInstance;
+
+  beforeAll(async () => {
+    app = Fastify({ logger: false });
+    await app.register(authPlugin);
+    registerErrorHandler(app);
+    await app.register(reminderRoutes, { prefix: '/reminders' });
+    await app.ready();
+  });
+
+  afterAll(async () => app.close());
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    prismaMock.$transaction.mockImplementation((ops: Promise<unknown>[]) => Promise.all(ops));
+    prismaMock.user.findUnique.mockResolvedValue({
+      disabledAt: null,
+      authVersion: 0,
+      mustChangePassword: false,
+      staffRole: StaffRole.TICKETING,
+      agentProfile: null,
+    });
+  });
+
+  function listRow(overrides: Record<string, unknown> = {}) {
+    return {
+      id: 'rem-1',
+      orderId: 'order-1',
+      ruleKey: 'UPGRADEREDEEM:pax_1:item_out',
+      title: '【次数升级待核销】FTM2026070900001 张三 QH9588 2026-07-08',
+      body: null,
+      status: ReminderStatus.OPEN,
+      priority: ReminderPriority.HIGH,
+      dueAt: new Date('2026-07-09T00:00:00Z'),
+      createdAt: new Date('2026-07-09T06:00:00Z'),
+      ...overrides,
+    };
+  }
+
+  it('规则 12 的行带上当前主档案 id（档案已合并 A→B 时给 B），其它行为 null', async () => {
+    prismaMock.operationalReminder.findMany.mockResolvedValueOnce([
+      listRow(),
+      listRow({ id: 'rem-2', ruleKey: null, title: '手工待办' }),
+    ]);
+    prismaMock.operationalReminder.count.mockResolvedValueOnce(2);
+    prismaMock.passenger.findMany.mockResolvedValueOnce([
+      { id: 'pax_1', documentType: 'PASSPORT', documentNumber: 'E12345678' },
+    ]);
+    prismaMock.travelerProfile.findMany
+      // 第一次按证件号查：命中的是已被并掉的指针行
+      .mockResolvedValueOnce([
+        { id: 'prof_a', documentType: 'PASSPORT', documentNumber: 'E12345678', mergedIntoId: 'prof_b' },
+      ])
+      // 第二次按 id 补齐链上的主档案
+      .mockResolvedValueOnce([
+        { id: 'prof_b', documentType: 'PASSPORT', documentNumber: 'E20000000', mergedIntoId: null },
+      ]);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/reminders',
+      headers: { authorization: `Bearer ${app.jwt.sign({ sub: 'staff-1', role: UserRole.STAFF })}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    const body = res.json();
+    expect(body.reminders[0].redeemProfileId).toBe('prof_b');
+    expect(body.reminders[1].redeemProfileId).toBeNull();
+  });
+
+  it('本页没有规则 12 的行 → 不发乘客/档案查询', async () => {
+    prismaMock.operationalReminder.findMany.mockResolvedValueOnce([listRow({ ruleKey: null })]);
+    prismaMock.operationalReminder.count.mockResolvedValueOnce(1);
+
+    const res = await app.inject({
+      method: 'GET',
+      url: '/reminders',
+      headers: { authorization: `Bearer ${app.jwt.sign({ sub: 'staff-1', role: UserRole.STAFF })}` },
+    });
+
+    expect(res.statusCode).toBe(200);
+    expect(prismaMock.passenger.findMany).not.toHaveBeenCalled();
+    expect(prismaMock.travelerProfile.findMany).not.toHaveBeenCalled();
   });
 });
