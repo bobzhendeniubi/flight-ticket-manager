@@ -17,7 +17,12 @@
  *
  * 单个成员单独走「换酒店」（不走整房落位）→ 维持既有「自动解绑 + 警告」，本模块不干预。
  *
- * 锁序与跨单分房保存一致：Order（按 id 升序）→ SharedRoom → 目标酒店包房周期
+ * 住宿行 ≠ 物理房间（2026-09-20 评审 F1）：整房落位落的是**整条住宿行**——行上若还挂着本房
+ * 以外的房组（普通房组 / 另一间共享房），会被一起迁走却只转本房主档。短修：锁后校验、命中 400，
+ * 出路是先用「拆房组」把别的房组拆成独立住宿行；按本房成员拆行再迁的完整方案不在本模块。
+ *
+ * 锁序与跨单分房保存一致：Order（按 id 升序；本房成员单 ∪ 同住宿行其它共享房的成员单）→
+ * SharedRoom（按 id 升序；本房 ∪ 同住宿行其它共享房）→ 目标酒店包房周期
  * （assertHotelFitAfterChange 内部最后才锁）。
  */
 import { OrderItemKind, Prisma, type OrderStatus, type PrismaClient, type SettlementTier } from '@prisma/client';
@@ -37,16 +42,21 @@ import {
   isSettlementTierStarMismatch,
   withHotelCostSource,
 } from '../orders/orders.service.js';
-import { refreshRoomGroupsForItem, resolveRoomGroupPlacement } from '../orders/room-group-placement.js';
 import {
-  COUNTED_STATUSES,
+  readRoomGroupArray,
+  refreshRoomGroupsForItem,
+  resolveRoomGroupPlacement,
+  roomGroupItemId,
+} from '../orders/room-group-placement.js';
+import {
   assertHotelFitAfterChange,
+  isCountedOrder,
   randomStarTierLabel,
   type PhysicalOccupancyItem,
   type SharedRoomAfterState,
 } from './hotel-control.service.js';
 import type { PlaceSharedRoomBody } from './hotel-control.schemas.js';
-import { itemPendingTier } from './hotel-control.shared-rooms.js';
+import { groupSharedId, itemPendingTier } from './hotel-control.shared-rooms.js';
 
 export interface PlaceSharedRoomResult {
   sharedRoomId: string;
@@ -99,25 +109,76 @@ interface MemberItemRow {
   seatPax: number;
 }
 
+/**
+ * 「同住宿行的其它共享房」：本房成员行（orderItemId）上还挂着的其它活跃共享房，及这些房的
+ * 全部成员订单。成员表是真值（订单 JSON 里的 sharedRoomId 只是镜像，下面行独占校验里两边取并集）。
+ * 锁前用它扩大候选锁集合（Order ∪ SharedRoom）；锁后再查一次核实集合没有扩大（§六步骤 3 同款）。
+ */
+interface SiblingSharedRooms {
+  roomIds: string[];
+  orderIds: string[];
+  /** orderItemId → 该行上挂着的其它活跃共享房 id。*/
+  byItemId: ReadonlyMap<string, ReadonlySet<string>>;
+}
+
+async function loadSiblingSharedRooms(
+  db: Pick<Prisma.TransactionClient, 'sharedRoomMember'>,
+  sharedRoomId: string,
+  itemIds: readonly string[],
+): Promise<SiblingSharedRooms> {
+  const empty: SiblingSharedRooms = { roomIds: [], orderIds: [], byItemId: new Map() };
+  if (itemIds.length === 0) return empty;
+  const onSameItems = await db.sharedRoomMember.findMany({
+    where: {
+      orderItemId: { in: [...itemIds] },
+      sharedRoomId: { not: sharedRoomId },
+      sharedRoom: { status: 'ACTIVE' },
+    },
+    select: { sharedRoomId: true, orderItemId: true },
+  });
+  if (onSameItems.length === 0) return empty;
+  const byItemId = new Map<string, Set<string>>();
+  for (const m of onSameItems) {
+    const set = byItemId.get(m.orderItemId) ?? new Set<string>();
+    set.add(m.sharedRoomId);
+    byItemId.set(m.orderItemId, set);
+  }
+  const roomIds = [...new Set(onSameItems.map((m) => m.sharedRoomId))].sort();
+  const members = await db.sharedRoomMember.findMany({
+    where: { sharedRoomId: { in: roomIds } },
+    select: { orderId: true },
+  });
+  return { roomIds, orderIds: [...new Set(members.map((m) => m.orderId))].sort(), byItemId };
+}
+
 export async function placeSharedRoom(
   sharedRoomId: string,
   body: PlaceSharedRoomBody,
   actor: AuditActor,
   client: PrismaClient = defaultPrisma,
 ): Promise<PlaceSharedRoomResult> {
-  // 锁前候选：成员订单集合（锁后复核，扩大则 409 让调用方刷新重试——整房落位不是高频操作，不做自动重试）
+  // 锁前候选：本房成员订单 ∪ 同住宿行其它共享房及其成员订单（锁后复核，扩大则 409 让调用方
+  // 刷新重试——整房落位不是高频操作，不做自动重试）
   const preRoom = await client.sharedRoom.findUnique({
     where: { id: sharedRoomId },
-    select: { id: true, members: { select: { orderId: true } } },
+    select: { id: true, members: { select: { orderId: true, orderItemId: true } } },
   });
   if (!preRoom) throw new NotFoundError('共享房不存在');
-  const candidateOrderIds = [...new Set(preRoom.members.map((m) => m.orderId))].sort();
+  const preSiblings = await loadSiblingSharedRooms(client, sharedRoomId, [
+    ...new Set(preRoom.members.map((m) => m.orderItemId)),
+  ]);
+  const candidateOrderIds = [
+    ...new Set([...preRoom.members.map((m) => m.orderId), ...preSiblings.orderIds]),
+  ].sort();
+  const candidateRoomIds = [...new Set([sharedRoomId, ...preSiblings.roomIds])].sort();
 
   return client.$transaction(async (tx) => {
     for (const orderId of candidateOrderIds) {
       await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
     }
-    await tx.$queryRaw`SELECT id FROM "SharedRoom" WHERE id = ${sharedRoomId} FOR UPDATE`;
+    for (const roomId of candidateRoomIds) {
+      await tx.$queryRaw`SELECT id FROM "SharedRoom" WHERE id = ${roomId} FOR UPDATE`;
+    }
 
     const room = await tx.sharedRoom.findUnique({
       where: { id: sharedRoomId },
@@ -147,6 +208,15 @@ export async function placeSharedRoom(
       throw new ConflictError('共享房成员在落位过程中发生变化，请刷新后重试');
     }
     const memberItemIds = [...new Set(room.members.map((m) => m.orderItemId))];
+    // 锁后复核「同住宿行的其它共享房」（与上面成员订单集合的复核同款）：只有锁前发现的房间 /
+    // 订单在锁集合里，锁后多出来的没被锁住、读到的不是稳定快照 → 409 让调用方刷新重试。
+    const siblings = await loadSiblingSharedRooms(tx, room.id, memberItemIds);
+    if (
+      siblings.roomIds.some((rid) => !candidateRoomIds.includes(rid)) ||
+      siblings.orderIds.some((oid) => !candidateOrderIds.includes(oid))
+    ) {
+      throw new ConflictError('共享房成员的住宿行在落位过程中发生变化，请刷新后重试');
+    }
 
     // ── 目标房型：真实酒店、在架、星级不低于档次 ────────────────────────────
     const newRoomType = await tx.hotelRoomType.findUnique({
@@ -265,6 +335,36 @@ export async function placeSharedRoom(
       throw new BadRequestError(`整房落位未执行：${failures.join('；')}`);
     }
 
+    // ── 住宿行 ≠ 物理房间：每位成员的住宿行必须只承载本共享房（短修：拒绝，不拆行）────────
+    // 下面的落库是「整条住宿行落到目标房型」：行上若还挂着别的房组（普通房组 / 另一间共享房），
+    // 它们会一起被迁走、房组文本一起刷成目标酒店，但只有本房主档转酒店房、目标物理占用也只计
+    // 本房 1 间——另一间共享房的成员 / 主档 / 订单行随即不一致。完整做法是按本房成员拆出住宿行
+    // 再迁（份额 / 成本 / 成员引用同步），本次不做。校验在锁后现状上做（与 CAS 同处，避免
+    // TOCTOU）：订单 JSON（归属本行的房组）与成员表（同行挂着的其它活跃共享房）取并集。
+    const lineConflicts: string[] = [];
+    for (const it of items) {
+      const ownGroups = (readRoomGroupArray(it.roomAssignment) ?? [])
+        .filter((g) => roomGroupItemId(g) === it.id)
+        .map((g) => g as Record<string, unknown>);
+      const plainGroupCount = ownGroups.filter((g) => groupSharedId(g) == null).length;
+      const otherSharedRoomIds = new Set<string>(
+        ownGroups.map((g) => groupSharedId(g)).filter((sid): sid is string => sid != null && sid !== room.id),
+      );
+      for (const sid of siblings.byItemId.get(it.id) ?? []) otherSharedRoomIds.add(sid);
+      if (plainGroupCount === 0 && otherSharedRoomIds.size === 0) continue;
+      const carried = [
+        ...(plainGroupCount > 0 ? [`${plainGroupCount} 个普通房组`] : []),
+        ...(otherSharedRoomIds.size > 0 ? [`${otherSharedRoomIds.size} 间其它共享房`] : []),
+      ].join('、');
+      lineConflicts.push(`${it.orderNumber} 的住宿行「${it.description}」还承载 ${carried}`);
+    }
+    if (lineConflicts.length > 0) {
+      throw new BadRequestError(
+        `整房落位未执行：${lineConflicts.join('；')}。整房落位会把整条住宿行连同上面的全部房组一起迁到目标酒店，` +
+          '请先在该单金额明细里对这条住宿行用「拆房组」，把本房以外的房组拆成独立住宿行，再回来整房落位',
+      );
+    }
+
     // ── 差价必须为 0：指定酒店加价 / 套餐档次与酒店星级不符 → 整体拒绝并列出是谁 ──────
     // 同档落位不产生售后费（差价固定 0，不写 adjustments）；目标酒店若有指定酒店加价，
     // 按录单口径每人都该补钱——整房落位不替运营做这个定价决定，请走单单换酒店手填差价。
@@ -335,7 +435,7 @@ export async function placeSharedRoom(
     const activeMemberOrderIds = [
       ...new Set(
         items
-          .filter((it) => it.orderDeletedAt == null && COUNTED_STATUSES.includes(it.orderStatus))
+          .filter((it) => isCountedOrder({ deletedAt: it.orderDeletedAt, status: it.orderStatus }))
           .map((it) => it.orderId),
       ),
     ];

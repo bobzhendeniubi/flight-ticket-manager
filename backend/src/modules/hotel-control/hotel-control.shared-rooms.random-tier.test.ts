@@ -12,7 +12,7 @@
  * 跨模式混入 400 / 整房落位 / 解绑矩阵走真库集成测试（*.random-tier.integration.test.ts）。
  */
 import { describe, it, expect, vi } from 'vitest';
-import type { Prisma, PrismaClient } from '@prisma/client';
+import { OrderStatus, type Prisma, type PrismaClient } from '@prisma/client';
 import {
   saveSharedRoomsBodySchema,
   sharedRoomWorkbenchQuerySchema,
@@ -25,9 +25,12 @@ import {
   TIER_ROOM_DEFAULT_CAPACITY,
 } from './hotel-control.shared-rooms.js';
 import {
+  COUNTED_STATUSES,
   assertRandomTierFitAfterChange,
   computeSharedRoomPhysicalBuckets,
   computeSharedRoomPhysicalByDate,
+  countedOrderWhere,
+  isCountedOrder,
 } from './hotel-control.service.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -356,5 +359,33 @@ describe('getSharedRoomWorkbench · 随机档作用域', () => {
     expect(wb.randomStarTier).toBeNull();
     const itemWhere = (orderItemFindMany.mock.calls[0]![0] as { where: Record<string, unknown> }).where;
     expect(itemWhere.hotelRoomType).toEqual({ hotelId: 'h1' });
+  });
+});
+
+describe('房控有效订单唯一谓词：isCountedOrder ⇔ countedOrderWhere（2026-09-20 评审 F2 口径收口）', () => {
+  it('对全部 OrderStatus × 软删两态，内存谓词与 where 子句语义逐一相等', () => {
+    const where = countedOrderWhere();
+    expect(where.deletedAt).toBeNull();
+    expect(where.status.in).toEqual(COUNTED_STATUSES);
+    for (const status of Object.values(OrderStatus)) {
+      for (const deletedAt of [null, new Date('2026-09-20T00:00:00.000Z')]) {
+        const byWhere = deletedAt === null && where.status.in.includes(status);
+        expect(isCountedOrder({ status, deletedAt })).toBe(byWhere);
+      }
+    }
+  });
+
+  it('已取消 / 退款中 不计；待支付 / 已支付 计；软删一律不计', () => {
+    expect(isCountedOrder({ status: OrderStatus.CANCELLED, deletedAt: null })).toBe(false);
+    expect(isCountedOrder({ status: OrderStatus.REFUND_REQUESTED, deletedAt: null })).toBe(false);
+    expect(isCountedOrder({ status: OrderStatus.PENDING_PAYMENT, deletedAt: null })).toBe(true);
+    expect(isCountedOrder({ status: OrderStatus.PAID, deletedAt: null })).toBe(true);
+    expect(isCountedOrder({ status: OrderStatus.PAID, deletedAt: new Date() })).toBe(false);
+  });
+
+  it('countedOrderWhere 每次返回新对象：调用方 spread / 改写不会污染下一次', () => {
+    const a = countedOrderWhere();
+    a.status.in.pop();
+    expect(countedOrderWhere().status.in).toEqual(COUNTED_STATUSES);
   });
 });

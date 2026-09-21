@@ -82,6 +82,21 @@ export const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.CHANGED,
 ];
 
+/**
+ * 房控有效订单的**唯一**谓词：未软删 且 status ∈ COUNTED_STATUSES。
+ * 池聚合 / 物理占用 / 前瞻闸的增量 / 共享房有效成员判定都必须用同一把尺——「前瞻闸必须与
+ * 实际占用同口径」：增量侧把已取消订单的 roomsBilled 变化算进去、聚合侧根本不数它，就是
+ * 口径分叉（2026-09-20 评审 F2）。内存判定用 isCountedOrder()，查库用 countedOrderWhere()。
+ */
+export function isCountedOrder(order: { deletedAt: Date | null; status: OrderStatus }): boolean {
+  return order.deletedAt == null && COUNTED_STATUSES.includes(order.status);
+}
+
+/** 同一谓词的 Prisma where 形态（Order 关联条件）。每次返回新对象，调用方可放心 spread / 扩展。*/
+export function countedOrderWhere(): { deletedAt: null; status: { in: OrderStatus[] } } {
+  return { deletedAt: null, status: { in: [...COUNTED_STATUSES] } };
+}
+
 /** 销控板最长跨度（天）—— 超出按 from 起截断。*/
 const MAX_BOARD_DAYS = 120;
 
@@ -1160,7 +1175,7 @@ export async function computeSharedRoomPhysicalByDate(
 
 /** 共享房某段是否计物理占用：至少一名成员所属订单处于房控有效状态且未软删（§四）。*/
 function sharedRoomHasValidMember(room: SharedRoomPhysicalRow): boolean {
-  return room.members.some((m) => m.order.deletedAt == null && COUNTED_STATUSES.includes(m.order.status));
+  return room.members.some((m) => isCountedOrder(m.order));
 }
 
 /** 把 [checkIn, checkOut) 覆盖到的每一晚 +1（半开区间，与 expandUsedByDate 同口径）。*/
@@ -1961,7 +1976,7 @@ async function computeSharedRoomPhysicalAfterChange(
     for (const row of liveRows) {
       if (overrideIds.has(row.id)) continue; // 被 override 接管，下面按新状态算
       const hasValidMember = row.members.some(
-        (m) => m.order.deletedAt == null && COUNTED_STATUSES.includes(m.order.status),
+        (m) => isCountedOrder(m.order),
       );
       if (hasValidMember) add(row.checkIn, row.checkOut);
     }
@@ -2187,9 +2202,10 @@ export async function getRandomTierAggregate(
   });
   const hotelIds = hotels.map((h) => h.id);
 
+  // 房控有效订单唯一谓词（countedOrderWhere ⇔ isCountedOrder）：跨单分房保存算增量用的是
+  // 同一谓词的内存形态，两边永远同口径。
   const orderWhere = {
-    deletedAt: null,
-    status: { in: COUNTED_STATUSES },
+    ...countedOrderWhere(),
     ...(opts.excludeOrderId ? { id: { not: opts.excludeOrderId } } : {}),
   };
   const nightWhere = { hotelCheckIn: { lte: toD }, hotelCheckOut: { gt: fromD } };
@@ -2968,7 +2984,7 @@ export async function getAlerts(
     });
     for (const room of rooms) {
       const activeMembers = room.members.filter(
-        (m) => m.order.deletedAt == null && COUNTED_STATUSES.includes(m.order.status),
+        (m) => isCountedOrder(m.order),
       );
       // 无有效成员 = 该房这段已不计物理占用，不是「白住」异常，跳过。
       if (activeMembers.length === 0) continue;

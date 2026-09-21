@@ -29,6 +29,7 @@ import {
   COUNTED_STATUSES,
   assertHotelFitAfterChange,
   assertRandomTierFitAfterChange,
+  isCountedOrder,
   itemRoomCount,
   randomStarTierLabel,
   scopeItemWhere,
@@ -168,8 +169,9 @@ export interface SharedRoomWorkbench {
   sharedRooms: SharedRoomWorkbenchRoom[];
 }
 
-/** 房组是否带 sharedRoomId 镜像字段（订单 JSON 侧判定，与 hotel-control.service 的口径一致）。*/
-function groupSharedId(g: Record<string, unknown>): string | null {
+/** 房组是否带 sharedRoomId 镜像字段（订单 JSON 侧判定，与 hotel-control.service 的口径一致）。
+ *  export：整房落位的「住宿行只承载本房」校验复用同一读法（shared-room-placement.ts）。*/
+export function groupSharedId(g: Record<string, unknown>): string | null {
   const v = g.sharedRoomId;
   return typeof v === 'string' && v.length > 0 ? v : null;
 }
@@ -335,7 +337,7 @@ export async function getSharedRoomWorkbench(
         passengerId: m.passengerId,
         roomFraction: Number(m.roomFraction.toString()),
         orderStatus: m.order.status,
-        isActive: m.order.deletedAt == null && COUNTED_STATUSES.includes(m.order.status),
+        isActive: isCountedOrder(m.order),
         orderNumber: m.order.orderNumber,
         chineseName: m.passenger.chineseName,
         name: m.passenger.fullName,
@@ -1005,7 +1007,7 @@ async function saveSharedRoomsInner(
         if (!order) {
           throw new BadRequestError(`订单 ${g.orderId} 不存在`);
         }
-        const invalidStatus = order.deletedAt != null || !COUNTED_STATUSES.includes(order.status);
+        const invalidStatus = !isCountedOrder(order);
         if (invalidStatus && !isUnchangedMember(room.sharedRoomId, g)) {
           throw new BadRequestError(`订单 ${g.orderId} 不存在或不处于房控有效状态`);
         }
@@ -1401,6 +1403,11 @@ async function saveSharedRoomsInner(
       // assertRandomTierFitAfterChange）。只算本档未落位的行——别的酒店 / 别的档的行不在本闸范围。
       const billedDeltas: RandomTierBilledDelta[] = [];
       for (const [orderId, order] of orders) {
+        // 与 getRandomTierAggregate 同口径（isCountedOrder）：池聚合根本不数已取消 / 软删的订单，
+        // 它的行 roomsBilled 从 1 变 0 不是「释放」——记成 −1 会抵掉别单的 +1，让真实新增占用
+        // 跳过锁周期与库存查询直接落库（2026-09-20 评审 F2：取消计费方后转让份额、池已满仍放行）。
+        // 失效单只能是「未变更成员」或「被移出」（上面 invalidStatus 校验已拦下新增），两种都不计。
+        if (!isCountedOrder(order)) continue;
         const planned = plannedRoomsBilledByOrder.get(orderId) ?? {};
         for (const [itemId, after] of Object.entries(planned)) {
           const item = order.items.find((it) => it.id === itemId);
@@ -1419,16 +1426,21 @@ async function saveSharedRoomsInner(
     const nextOrderItems = new Map<string, PhysicalOccupancyItem[]>();
     for (const [orderId, order] of orders) {
       const newGroups = newGroupsByOrder.get(orderId) ?? [];
-      const itemsAtHotel: PhysicalOccupancyItem[] = order.items
-        .filter((it) => it.hotelId === hotelId)
-        .map((it) => ({
-          id: it.id,
-          hotelCheckIn: it.hotelCheckIn,
-          hotelCheckOut: it.hotelCheckOut,
-          roomsBilled: null, // 物理口径按新 roomGroups JSON 直计，不看 roomsBilled 快照
-          metadata: it.metadata,
-          order: { id: orderId, roomAssignment: { roomGroups: newGroups }, passengers: [] },
-        }));
+      // 变更前快照（assertHotelFitAfterChange 的 liveItems）只含房控有效订单；变更后同口径——
+      // 已取消 / 软删的成员单给空数组（= 变更后在本酒店没有占房行），否则它的行只出现在变更后
+      // 一侧、被当成凭空新增的 1 间（误拒方向；与随机池那条是同一个口径分叉，2026-09-20 F2）。
+      const itemsAtHotel: PhysicalOccupancyItem[] = isCountedOrder(order)
+        ? order.items
+            .filter((it) => it.hotelId === hotelId)
+            .map((it) => ({
+              id: it.id,
+              hotelCheckIn: it.hotelCheckIn,
+              hotelCheckOut: it.hotelCheckOut,
+              roomsBilled: null, // 物理口径按新 roomGroups JSON 直计，不看 roomsBilled 快照
+              metadata: it.metadata,
+              order: { id: orderId, roomAssignment: { roomGroups: newGroups }, passengers: [] },
+            }))
+        : [];
       nextOrderItems.set(orderId, itemsAtHotel);
     }
     // hotelId 全部显式带上（astra N1）：新建房的 sharedRoomId 是刚生成、还没落库的随机
@@ -1456,7 +1468,7 @@ async function saveSharedRoomsInner(
             .map((g) => g.orderId)
             .filter((oid) => {
               const o = orders.get(oid);
-              return !!o && o.deletedAt == null && COUNTED_STATUSES.includes(o.status);
+              return !!o && isCountedOrder(o);
             }),
         ),
       ];
@@ -1491,7 +1503,7 @@ async function saveSharedRoomsInner(
         if (!current || current.status !== 'ACTIVE') continue; // 并发已不是活跃状态，不掺和
         const survivorOrderIds = [...(implicitRoomSurvivors.get(roomId) ?? [])].filter((oid) => {
           const o = orders.get(oid);
-          return !!o && o.deletedAt == null && COUNTED_STATUSES.includes(o.status);
+          return !!o && isCountedOrder(o);
         });
         nextSharedRooms.push({
           sharedRoomId: roomId,

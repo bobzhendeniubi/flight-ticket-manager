@@ -33,7 +33,7 @@
  * 约束的路径）继续用一次调用完成解绑。
  */
 import type { OrderStatus, Prisma, SharedRoomStatus } from '@prisma/client';
-import { COUNTED_STATUSES } from './hotel-control.service.js';
+import { isCountedOrder } from './hotel-control.service.js';
 import {
   readRoomGroupArray,
   roomGroupItemId,
@@ -256,7 +256,7 @@ export async function planUnbindMany(
     const activeMemberOrderIdsAfter = [
       ...new Set(
         remainingAfter
-          .filter((m) => m.order.deletedAt == null && COUNTED_STATUSES.includes(m.order.status))
+          .filter((m) => isCountedOrder(m.order))
           .map((m) => m.orderId),
       ),
     ];
@@ -457,7 +457,7 @@ export async function getSharedRoomStatesForItem(
     const activeMemberOrderIds = [
       ...new Set(
         allMembers
-          .filter((x) => x.order.deletedAt == null && COUNTED_STATUSES.includes(x.order.status))
+          .filter((x) => isCountedOrder(x.order))
           .map((x) => x.orderId),
       ),
     ];
