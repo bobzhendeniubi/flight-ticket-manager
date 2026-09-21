@@ -44,6 +44,7 @@ import {
 } from '../orders/orders.service.js';
 import {
   randomStarTierLabel as pendingPlacementLabel,
+  randomStarTierShortLabel as pendingPlacementShortLabel,
   readRoomGroupArray,
   refreshRoomGroupsForItem,
   resolveRoomGroupPlacement,
@@ -350,6 +351,9 @@ export async function placeSharedRoom(
     // hotel-control.service.ts 引入的短展示名「X星随机」（用户提示语用的那个，两者故意不同，
     // 混用会导致文本比对永远不命中）。
     const pendingGroupLabel = pendingPlacementLabel(tier);
+    // 存量房组还有落位名改造前写的短文案「X星随机」（无「（待落位）」后缀），一并认（复审 R4）。
+    const pendingGroupLabels = new Set([pendingGroupLabel, pendingPlacementShortLabel(tier)]);
+    const isOrphanPendingName = (v: unknown) => typeof v === 'string' && pendingGroupLabels.has(v);
     const lineConflicts: string[] = [];
     for (const it of items) {
       const allGroups = readRoomGroupArray(it.roomAssignment) ?? [];
@@ -363,7 +367,7 @@ export async function placeSharedRoom(
             typeof g === 'object' &&
             !Array.isArray(g) &&
             roomGroupItemId(g) == null &&
-            (g as Record<string, unknown>).hotelName === pendingGroupLabel,
+            isOrphanPendingName((g as Record<string, unknown>).hotelName),
         );
       const plainGroupCount =
         ownGroups.filter((g) => groupSharedId(g) == null).length + orphanPendingGroups.length;
@@ -541,7 +545,7 @@ export async function placeSharedRoom(
       if (placement) {
         const current = roomAssignmentPatches.get(it.orderId) ?? it.roomAssignment;
         const refreshed = refreshRoomGroupsForItem(current, it.id, placement, {
-          legacyMatch: (g) => g.hotelName === pendingGroupLabel,
+          legacyMatch: (g) => isOrphanPendingName(g.hotelName),
         });
         if (refreshed.changed) roomAssignmentPatches.set(it.orderId, refreshed.roomAssignment);
       }

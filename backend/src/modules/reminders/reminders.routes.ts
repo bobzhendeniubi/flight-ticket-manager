@@ -252,12 +252,15 @@ export const reminderRoutes: FastifyPluginAsync = async (app) => {
   app.post('/:id/resolve', requireOps, async (req) => {
     const { id } = req.params as { id: string };
     const body = resolveReminderSchema.parse(req.body);
+    // 只对仍活跃的条生效：行已被自动核销（或别人处理过）时，运营那份旧列表点「完成」不应
+    // 把自动核销备注原样留在库里——否则条件复发时会被规则重开当成自动条（复审 R3）。
+    // 备注显式落 null，而不是 undefined 保留旧值。
     const updated = await prisma.operationalReminder.update({
-      where: { id },
+      where: { id, status: { in: [ReminderStatus.OPEN, ReminderStatus.IN_PROGRESS] } },
       data: {
         status: body.status === 'DONE' ? ReminderStatus.DONE : ReminderStatus.SKIPPED,
         resolvedAt: new Date(),
-        resolvedNote: body.resolvedNote,
+        resolvedNote: body.resolvedNote ?? null,
       },
     });
     void writeAudit({

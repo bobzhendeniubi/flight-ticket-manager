@@ -632,6 +632,9 @@ export async function reconcileUpgradeRedeemReminders(
         status: ReminderStatus.OPEN,
         resolvedAt: null,
         resolvedNote: null,
+        // 重开 = 一条全新的待办：原认领人一并清掉，否则会出现「OPEN 但带认领人」的半状态，
+        // 别人在列表里认领不了、只有原认领人能动（复审 R1）。
+        claimedById: null,
         title: candidate.title,
         body: candidate.body,
         priority: candidate.priority,

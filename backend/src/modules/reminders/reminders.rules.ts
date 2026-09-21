@@ -543,6 +543,8 @@ async function reconcileRoomAssignmentReminders(
         status: ReminderStatus.OPEN,
         resolvedAt: null,
         resolvedNote: null,
+        // 与规则 12 同口径：重开清认领人，避免「OPEN 但带认领人」的半状态。
+        claimedById: null,
         title: state.title,
         body: state.body,
         priority: state.priority,
