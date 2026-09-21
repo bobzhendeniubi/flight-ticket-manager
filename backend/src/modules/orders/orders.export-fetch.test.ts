@@ -16,23 +16,43 @@ interface FakeOrder {
   label: string;
 }
 
+/** 第二步的 where 形态：`{ AND: [原 where, { id: { in: [...] } }] }`。*/
+interface FetchCond {
+  id?: { in?: string[] };
+  agentId?: { in?: string[] };
+  deletedAt?: null;
+}
+type FetchWhere = { AND?: FetchCond[] };
+
+/** 从一次 findMany 调用里取出这批的 id 列表；盘点那一次返回 undefined。*/
+function sliceOf(args?: { where?: FetchWhere }): string[] | undefined {
+  return args?.where?.AND?.find((c) => c.id?.in != null)?.id?.in;
+}
+
 /**
  * 假 client：按 where 形态分流，完整模拟真实 Prisma 的两种调用。
- *   - 无 id.in（盘点 id）→ 按 createdAt 倒序返回全部 { id }；
- *   - 有 id.in（取实体）→ 只返回该批 id 的实体，且**故意打乱顺序**（真实数据库对
- *     `id in (...)` 不保证顺序），用来验证 helper 自己重排。
+ *   - where 里没有 id.in（盘点 id）→ 按 createdAt 倒序返回全部 { id }；
+ *   - where 是 `AND: [原 where, { id: { in } }]`（取实体）→ 只返回该批 id 的实体，且
+ *     **故意打乱顺序**（真实数据库对 `id in (...)` 不保证顺序），用来验证 helper 自己重排。
  */
 function fakeClient(rows: FakeOrder[]): {
   client: PrismaClient;
   findMany: ReturnType<typeof vi.fn>;
 } {
   const byCreatedDesc = [...rows].sort((a, b) => b.createdAt.getTime() - a.createdAt.getTime());
-  const findMany = vi.fn(async (args?: { where?: { id?: { in?: string[] } } }) => {
-    const idIn = args?.where?.id?.in;
+  const findMany = vi.fn(async (args?: { where?: FetchWhere }) => {
+    const idIn = sliceOf(args);
     if (!idIn) return byCreatedDesc.map((r) => ({ id: r.id }));
     return byCreatedDesc.filter((r) => idIn.includes(r.id)).reverse(); // 乱序返回
   });
   return { client: { order: { findMany } } as unknown as PrismaClient, findMany };
+}
+
+/** 各批实际取了哪些 id（按调用顺序），盘点那一次不计入。*/
+function chunkIds(findMany: ReturnType<typeof vi.fn>): string[][] {
+  return findMany.mock.calls
+    .map((c) => sliceOf(c[0] as { where?: FetchWhere }))
+    .filter((ids): ids is string[] => ids != null);
 }
 
 /** 生成 n 条订单，createdAt 递减 → 倒序即 o1, o2, … on。*/
@@ -70,11 +90,7 @@ describe('fetchOrdersInChunks — 切片边界', () => {
     const out = await fetchOrdersInChunks<FakeOrder>(client, ARGS, 3);
     expect(out.map((o) => o.id)).toEqual(['o1', 'o2', 'o3', 'o4', 'o5', 'o6']);
     expect(findMany).toHaveBeenCalledTimes(3); // 盘点 1 + 取实体 2
-    const chunkSizes = findMany.mock.calls
-      .map((c) => (c[0] as { where: { id?: { in?: string[] } } }).where.id?.in)
-      .filter((ids): ids is string[] => ids != null)
-      .map((ids) => ids.length);
-    expect(chunkSizes).toEqual([3, 3]);
+    expect(chunkIds(findMany).map((ids) => ids.length)).toEqual([3, 3]);
   });
 
   it('有余数：7 条 / 每批 3 → 3 批（3+3+1），一条都不丢', async () => {
@@ -82,11 +98,7 @@ describe('fetchOrdersInChunks — 切片边界', () => {
     const out = await fetchOrdersInChunks<FakeOrder>(client, ARGS, 3);
     expect(out).toHaveLength(7);
     expect(out.map((o) => o.id)).toEqual(['o1', 'o2', 'o3', 'o4', 'o5', 'o6', 'o7']);
-    const chunkSizes = findMany.mock.calls
-      .map((c) => (c[0] as { where: { id?: { in?: string[] } } }).where.id?.in)
-      .filter((ids): ids is string[] => ids != null)
-      .map((ids) => ids.length);
-    expect(chunkSizes).toEqual([3, 3, 1]);
+    expect(chunkIds(findMany).map((ids) => ids.length)).toEqual([3, 3, 1]);
   });
 
   it('缺省批量 = ORDER_EXPORT_CHUNK_SIZE：正好 150 条仍是单批，151 条才切成两批', async () => {
@@ -142,8 +154,8 @@ describe('fetchOrdersInChunks — 保序', () => {
 
   it('两步之间订单消失 → 该单不出现在结果里，其余顺序不受影响（不留空洞）', async () => {
     const rows = makeOrders(5);
-    const findMany = vi.fn(async (args?: { where?: { id?: { in?: string[] } } }) => {
-      const idIn = args?.where?.id?.in;
+    const findMany = vi.fn(async (args?: { where?: FetchWhere }) => {
+      const idIn = sliceOf(args);
       if (!idIn) return rows.map((r) => ({ id: r.id }));
       // o3 在第二步被删掉了，取不回来
       return rows.filter((r) => idIn.includes(r.id) && r.id !== 'o3');
@@ -152,10 +164,44 @@ describe('fetchOrdersInChunks — 保序', () => {
     const out = await fetchOrdersInChunks<FakeOrder>(client, ARGS, 2);
     expect(out.map((o) => o.id)).toEqual(['o1', 'o2', 'o4', 'o5']);
   });
+
+  it('两步之间某单不再满足 where（被改归别家代理）→ 第二步就取不回来，不会混进结果', async () => {
+    // 代理 a1 在导自己的单：where 带 agentScope。假 client 会**真的**按 where 判读，
+    // 不是只看 id —— 第二步若丢了原条件，o3 就会被取回来导出去（越权）。
+    const rows = makeOrders(5);
+    const ownerOf = new Map(rows.map((r) => [r.id, 'a1']));
+    const scopedArgs = {
+      where: { deletedAt: null, agentId: { in: ['a1'] } },
+      orderBy: { createdAt: 'desc' },
+      include: { passengers: true },
+    } as unknown as Parameters<typeof fetchOrdersInChunks>[1];
+
+    const findMany = vi.fn(async (args?: { where?: FetchWhere }) => {
+      const idIn = sliceOf(args);
+      if (!idIn) return rows.map((r) => ({ id: r.id })); // 盘点时 5 张都还归 a1
+      // 盘点之后、取实体之前：o3 被改归 a2，从此不再命中 where。
+      ownerOf.set('o3', 'a2');
+      const scope = args?.where?.AND?.find((c) => c.agentId?.in != null)?.agentId?.in;
+      return rows.filter(
+        (r) => idIn.includes(r.id) && (scope == null || scope.includes(ownerOf.get(r.id) as string)),
+      );
+    });
+    const client = { order: { findMany } } as unknown as PrismaClient;
+    const out = await fetchOrdersInChunks<FakeOrder>(client, scopedArgs, 2);
+
+    expect(out.map((o) => o.id)).toEqual(['o1', 'o2', 'o4', 'o5']); // o3 消失，顺序不乱
+    // 每一批都带着原条件（agentScope），不是只按 id 取
+    for (const call of findMany.mock.calls.slice(1)) {
+      expect((call[0] as { where: FetchWhere }).where.AND).toContainEqual({
+        deletedAt: null,
+        agentId: { in: ['a1'] },
+      });
+    }
+  });
 });
 
 describe('fetchOrdersInChunks — 口径透传', () => {
-  it('where / orderBy 原样进盘点查询，include 原样进取实体查询', async () => {
+  it('where / orderBy 原样进盘点查询；取实体这步 where = 原条件 AND id in，include 原样', async () => {
     const { client, findMany } = fakeClient(makeOrders(2));
     await fetchOrdersInChunks<FakeOrder>(client, ARGS, 10);
 
@@ -165,9 +211,14 @@ describe('fetchOrdersInChunks — 口径透传', () => {
     expect(idPass.orderBy).toEqual({ createdAt: 'desc' });
     expect(idPass.select).toEqual({ id: true });
     expect(idPass.include).toBeUndefined();
-    // 取实体：只按 id 过滤 + 原样 include；不重复带 where（否则等于把筛选跑两遍）
-    expect(entityPass.where).toEqual({ id: { in: ['o1', 'o2'] } });
+    // 取实体：原条件与 id 切片取交集 —— 原条件里装着 agentScope / 软删 / 状态这些闸，
+    // 丢了它就等于放行两步之间发生的越权与状态变更（不是「把筛选跑两遍」的冗余）。
+    expect(entityPass.where).toEqual({
+      AND: [{ deletedAt: null }, { id: { in: ['o1', 'o2'] } }],
+    });
     expect(entityPass.include).toEqual({ passengers: true });
     expect(entityPass.select).toBeUndefined();
+    // 顺序不靠这一步：`id in` 的返回顺序由数据库决定，重排靠第一步的 id 顺序。
+    expect(entityPass.orderBy).toBeUndefined();
   });
 });

@@ -331,9 +331,16 @@ describe('queryOrdersByIdsForVisa — 按 id 选单', () => {
   it('按订单 id 列表取单，软删排除；状态过滤不在这里做', async () => {
     // 取数是分批的（orders.export-fetch.ts）：第一步只盘点 id，第二步按 id 切片取实体。
     // 筛选口径（软删排除 / 不加 status）落在第一步，所以断言认准第一步那次调用。
-    const findMany = vi.fn(async (args?: { where?: { id?: { in?: string[] } } }) =>
-      args?.where?.id?.in?.map((id) => ({ id })) ?? [],
-    );
+    // 第二步的 where 是「原条件 AND id in 这批」，id 切片在 AND 里；第一步在顶层。
+    interface WhereShape {
+      id?: { in?: string[] };
+      AND?: Array<{ id?: { in?: string[] } }>;
+    }
+    const findMany = vi.fn(async (args?: { where?: WhereShape }) => {
+      const where = args?.where;
+      const ids = where?.AND?.find((c) => c.id?.in != null)?.id?.in ?? where?.id?.in ?? [];
+      return ids.map((id) => ({ id }));
+    });
     const client = { order: { findMany } } as unknown as Parameters<
       typeof queryOrdersByIdsForVisa
     >[1];
@@ -343,20 +350,29 @@ describe('queryOrdersByIdsForVisa — 按 id 选单', () => {
     // 盘点 id 1 次 + 取实体 1 次（两张单 = 单批）
     expect(findMany).toHaveBeenCalledTimes(2);
     interface FindManyCall {
-      where: { id: { in: string[] }; deletedAt?: Date | null; status?: unknown };
+      where: {
+        id?: { in: string[] };
+        deletedAt?: Date | null;
+        status?: unknown;
+        AND?: Array<Record<string, unknown>>;
+      };
       select?: Record<string, boolean>;
       include?: Record<string, unknown>;
     }
     const calls = findMany.mock.calls.map((c) => c[0] as FindManyCall);
     const idPass = calls[0] as FindManyCall;
     const entityPass = calls[1] as FindManyCall;
-    expect(idPass.where.id.in).toEqual(['id_a', 'id_b']);
+    expect(idPass.where.id?.in).toEqual(['id_a', 'id_b']);
     expect(idPass.where.deletedAt).toBeNull();
     // 状态过滤放到 partitionOrdersForVisa（名单/护照包共用），这里不加 status 条件（否则不合格单查不回来）
     expect(idPass.where.status).toBeUndefined();
     expect(idPass.select).toEqual({ id: true });
-    // 第二步只按 id 取，带回完整 include（签证名单要用到乘客/行项/履约任务）
-    expect(entityPass.where.id.in).toEqual(['id_a', 'id_b']);
+    // 第二步 = 原条件 AND id in 这批，带回完整 include（签证名单要用到乘客/行项/履约任务）。
+    // 原条件（含软删闸）必须一起带着：只按 id 取的话，两步之间被软删的单还会被取回来。
+    expect(entityPass.where.AND).toEqual([
+      { deletedAt: null, id: { in: ['id_a', 'id_b'] } },
+      { id: { in: ['id_a', 'id_b'] } },
+    ]);
     expect(entityPass.include?.passengers).toBe(true);
   });
 

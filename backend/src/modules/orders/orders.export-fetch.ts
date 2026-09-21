@@ -11,6 +11,11 @@
  * 做法：先只取 id（一行一个短字符串，序列化压力可忽略）拿到**完整且保序**的集合，
  * 再按 id 切片把带 include 的实体分几次取回，最后按第一步的 id 顺序重排拼接。
  * 对调用方而言语义与一次裸查完全一致：同样的 where / orderBy / include，同样的顺序。
+ *
+ * 两步都带同一份 where（第二步 = `where AND id in (...)`），不是冗余：where 里装着
+ * 代理可见集合（agentScope）、软删闸、状态闸这些**权限与口径条件**，而取回后的内存精筛
+ * （filterExportOrders）只管日期与单程/往返，不复核归属。第二步若只按 id 取，两步之间
+ * 被改归别家代理 / 被取消 / 被软删的单就会照样取回来导出去。
  */
 import type { Prisma, PrismaClient } from '@prisma/client';
 
@@ -38,8 +43,9 @@ export interface OrderExportFetchArgs {
  * @param args      where / orderBy / include —— 与原裸查一字不差地透传
  * @param chunkSize 单批条数，缺省 ORDER_EXPORT_CHUNK_SIZE
  *
- * 注：两步之间若有订单被删，第二步取不回来，该单直接从结果里消失（不会留空洞）；
- * 导出是只读快照，这点漂移可以接受。
+ * 注：两步之间若有订单被改动到**不再命中 where**（被软删、被取消、被改归别家代理…），
+ * 第二步就取不回来，该单直接从结果里消失，其余各单的相对顺序不受影响（不会留空洞）。
+ * 这是有意的：宁可少一行，也不能把已经不该看见的单导出去。
  */
 export async function fetchOrdersInChunks<T>(
   client: PrismaClient,
@@ -60,11 +66,14 @@ export async function fetchOrdersInChunks<T>(
   if (ids.length === 0) return [];
 
   // 第二步：按 id 切片取回实体。每批各自是一份独立的小结果，不会撞 napi 上限。
+  // where 要**连同原条件一起带上**（AND 交集），不能只按 id 取：agentScope / 软删 / 状态
+  // 这些闸都在原 where 里，只按 id 取等于把两步之间发生的越权与状态变更全部放行。
+  // orderBy 这一步不带：`id in` 的返回顺序由数据库决定，反正第三步按第一步的 id 顺序重排。
   const byId = new Map<string, T>();
   for (let offset = 0; offset < ids.length; offset += chunkSize) {
     const slice = ids.slice(offset, offset + chunkSize);
     const rows = (await client.order.findMany({
-      where: { id: { in: slice } },
+      where: { AND: [args.where, { id: { in: slice } }] },
       include: args.include,
     })) as unknown as Array<T & { id: string }>;
     for (const row of rows) byId.set(row.id, row);

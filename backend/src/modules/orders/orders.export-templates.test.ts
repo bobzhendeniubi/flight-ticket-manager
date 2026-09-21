@@ -38,9 +38,26 @@ import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 const D = (s: string): Date => new Date(s.length <= 10 ? `${s}T00:00:00.000Z` : `${s}Z`);
 
 /**
+ * 从一次 findMany 的 where 里取出「这批的 id 列表」。
+ * 分批取数第二步的 where 是 `{ AND: [原 where, { id: { in: [...] } }] }` —— 原条件要一起带着
+ * （agentScope / 软删 / 状态都在里面），所以 id 切片藏在 AND 的末位，不在顶层。
+ * 勾选导出时顶层也可能有 id.in（那是筛选本身），两处都认。
+ */
+function sliceIdsFromWhere(where: Record<string, unknown>): string[] | undefined {
+  const and = where.AND;
+  if (Array.isArray(and)) {
+    for (let i = and.length - 1; i >= 0; i -= 1) {
+      const ids = (and[i] as { id?: { in?: string[] } } | undefined)?.id?.in;
+      if (ids) return ids;
+    }
+  }
+  return (where.id as { in?: string[] } | undefined)?.in;
+}
+
+/**
  * 假 client 的 order.findMany —— 按 where 形态分流三种调用（缺一种分批取数就取不回单）：
  *   1) 盘点 id：导出筛选 where + select:{id}，分批取数的第一步 → 返回全量 orders；
- *   2) 按 id 取实体：where.id.in 是某一批 id，分批取数的第二步 → 只返回该批命中的 orders；
+ *   2) 按 id 取实体：where 是「原条件 AND id in 某一批」，分批取数的第二步 → 只返回该批命中的；
  *   3) 飞行次数现算兜底：where.passengers.some → 交给 onLiveFallback（缺省空）。
  * 第 2 种按 id 真过滤（不是无脑返回全量），分批与重排口径才真的被测到。
  */
@@ -51,7 +68,7 @@ function fakeOrderFindMany(
   return vi.fn(async (args?: { where?: Record<string, unknown> }) => {
     const where = args?.where ?? {};
     if (where.passengers) return onLiveFallback();
-    const idIn = (where.id as { in?: string[] } | undefined)?.in;
+    const idIn = sliceIdsFromWhere(where);
     if (idIn) return orders.filter((o) => idIn.includes(o.id));
     return orders;
   });
@@ -1194,10 +1211,10 @@ describe('buildOrderTemplateExportWorkbook 飞行次数取数', () => {
       (call: unknown[]) => (call[0] as { where?: Record<string, unknown> }).where ?? {},
     );
     expect(wheres).toHaveLength(3);
-    // 盘点 id：导出筛选本身，既不带 passengers 也不带 id.in
-    expect(wheres.filter((w) => !w.passengers && !w.id)).toHaveLength(1);
-    // 分批取实体：按 id 切片，单张单只切出一批
-    expect(wheres.filter((w) => (w.id as { in?: string[] } | undefined)?.in)).toHaveLength(1);
+    // 盘点 id：导出筛选本身，既不带 passengers，也没有 id 切片
+    expect(wheres.filter((w) => !w.passengers && !sliceIdsFromWhere(w))).toHaveLength(1);
+    // 分批取实体：原条件 AND id 切片（切片在 AND 里，不在顶层），单张单只切出一批
+    expect(wheres.filter((w) => sliceIdsFromWhere(w))).toHaveLength(1);
     // 飞行次数现算兜底
     expect(wheres.filter((w) => w.passengers)).toHaveLength(1);
     expect(legacyFindMany).toHaveBeenCalledTimes(1);
