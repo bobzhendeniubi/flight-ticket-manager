@@ -547,6 +547,8 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     if (!wb || !r.sharedRoomId) return true;
     const seedRoom = wb.sharedRooms.find((sr) => sr.sharedRoomId === r.sharedRoomId);
     if (!seedRoom) return true;
+    // 与 handleSave 的 metaChanged 同一把尺：房型、备注、成员三者任一变了都算脏。
+    if ((seedRoom.hotelRoomTypeId ?? '') !== r.hotelRoomTypeId) return true;
     if ((seedRoom.notes ?? '') !== r.notes.trim()) return true;
     return serializeGroups(groupsFromMembers(seedRoom.members)) !== serializeGroups(r.groups);
   }
