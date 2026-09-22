@@ -133,7 +133,22 @@ interface DraftRoom {
   version: number | null;
   hotelRoomTypeId: string;
   notes: string;
+  /**
+   * 代理自助口径（2026-09-21）：服务端判定这间房含代理归属范围外的成员（运营安排的混合房）
+   * → 整间只读：不可拖入拖出 / 改份额 / 改房型备注 / 解散 / 落位，保存时一律跳过。
+   * ADMIN/STAFF 视图恒 false；新建房恒 false。
+   */
+  readOnly: boolean;
+  /** readOnly 房里被脱敏的范围外成员人数（显示「其他代理客人 ×N」）。 */
+  externalMemberCount: number;
   groups: DraftGroup[];
+}
+
+/** 服务端脱敏后的范围外成员占位键前缀（镜像后端 maskRoomForAgent 的 `external-<n>`）。 */
+const EXTERNAL_MEMBER_KEY_PREFIX = 'external-';
+const EXTERNAL_MEMBER_LABEL = '其他代理客人';
+function isExternalGroup(g: Pick<DraftGroup, 'orderId'>): boolean {
+  return g.orderId.startsWith(EXTERNAL_MEMBER_KEY_PREFIX);
 }
 
 /** 把工作台读模型的既有共享房，摊开成编辑期草稿（成员按「来源订单+订单行」重新分组）。 */
@@ -145,6 +160,9 @@ function seedDraftRooms(data: SharedRoomWorkbenchData): DraftRoom[] {
     version: r.version,
     hotelRoomTypeId: r.hotelRoomTypeId ?? '', // 档次房没有房型（null）→ 空串，保存时不带这个字段
     notes: r.notes ?? '',
+    // 旧后端不带这两个字段时按「可编辑 / 0」兜底——只影响部署窗口，且 ADMIN/STAFF 本就恒 false。
+    readOnly: r.readOnly === true,
+    externalMemberCount: r.externalMemberCount ?? 0,
     // groupsFromMembers 不知道订单号（只按 members 的 orderId/orderItemId 分组），这里补上
     // 展示用的 orderNumber——不参与保存 payload，也不参与 B2/B6 的「原始态」diff 比较。
     // passengerIds 显式拷贝成可变数组：lib 版 groupsFromMembers 返回 readonly 数组
@@ -161,6 +179,11 @@ export interface SharedRoomWorkbenchSeed {
   hotelId?: string;
   /** 非空 = 打开随机池作用域（档次房：随机档待落位的单跨单合住），优先于 hotelId。 */
   randomStarTier?: RandomStarTier;
+  /**
+   * 三选一的第三种：只有住宿行的房型 id、没有酒店 id 时（订单详情的分房盒子就地打开），
+   * 交给服务端反查酒店 / 档次；工作台加载成功后按响应把作用域落定。
+   */
+  hotelRoomTypeId?: string;
   /** YYYY-MM-DD */
   checkIn?: string;
   /** YYYY-MM-DD */
@@ -171,6 +194,12 @@ interface SharedRoomWorkbenchProps {
   token: string;
   /** 默认酒店/入住/退房——通常从销控板当前选中的酒店和日期带入；缺省当日起 1 晚。 */
   seed?: SharedRoomWorkbenchSeed;
+  /**
+   * 锁定作用域（代理自助拼房，2026-09-21）：隐藏酒店 / 随机池下拉与入住退房输入，工作台只在
+   * seed 给定的酒店（或档次）+ 日期范围内拼——代理只能在当前住宿行的范围内操作，搜索框保留。
+   * 归属范围本身由服务端按登录身份判定，这里只是把 UI 收窄。
+   */
+  lockScope?: boolean;
   onClose: () => void;
   /** 保存成功后通知父级（房控页据此重拉销控板）。 */
   onSaved?: () => void;
@@ -228,8 +257,14 @@ function PoolPassengerChip({
 }
 
 // ── 组件 ─────────────────────────────────────────────────────────────────
-export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoomWorkbenchProps) {
+export function SharedRoomWorkbench({ token, seed, lockScope = false, onClose, onSaved }: SharedRoomWorkbenchProps) {
   const dialogRef = useDialogA11y(onClose);
+  // 锁定作用域时查询参数只来自 seed（三选一），与下拉选中的 scopeValue 无关——scopeValue 只在
+  // 响应回来后被同步一次，用来驱动房型下拉 / 档次判定等派生态，不再反过来触发重拉。
+  const seedHotelId = seed?.hotelId;
+  const seedTier = seed?.randomStarTier;
+  const seedRoomTypeId = seed?.hotelRoomTypeId;
+  const hasLockedScope = Boolean(seedHotelId || seedTier != null || seedRoomTypeId);
 
   // 酒店清单（供选酒店下拉 + 各房型容量）——占位酒店不参与跨单分房（服务端同口径）。
   const [hotels, setHotels] = useState<Hotel[]>([]);
@@ -261,8 +296,9 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
   const [poolQuery, setPoolQuery] = useState('');
 
   // 酒店清单到货后，若还没选作用域，用 seed 命中的那家或第一家兜底（随机池种子在初值里已选中）。
+  // 锁定作用域时不做这个兜底：作用域由 seed（可能是待服务端反查的房型 id）决定，不能被「第一家酒店」顶掉。
   useEffect(() => {
-    if (scopeValue || hotels.length === 0) return;
+    if (lockScope || scopeValue || hotels.length === 0) return;
     const fromSeed = seed?.hotelId && hotels.some((h) => h.id === seed.hotelId) ? seed.hotelId : null;
     setScopeValue(fromSeed ?? hotels[0].id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -294,7 +330,9 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
   // load() 重拉工作台会清空，只在「刚保存完」这一刻提醒运营去看。
   const [orphanedRoomIds, setOrphanedRoomIds] = useState<Set<string>>(new Set());
 
-  const canQuery = Boolean(scopeValue && checkIn && checkOut && checkIn < checkOut);
+  const canQuery = Boolean((lockScope ? hasLockedScope : scopeValue) && checkIn && checkOut && checkIn < checkOut);
+  // 锁定作用域时 load 的依赖用常量占位：响应回来后同步 scopeValue 不会再触发一次重拉。
+  const scopeKey = lockScope ? 'locked' : scopeValue;
 
   // 注意：load 本身不清 saveErr/saveOk——保存成功后 handleSave 会调 load() 重拉落地状态，
   // 若这里顺手清掉 saveOk，刚设好的「已保存」提示会在同一拍被冲掉，用户永远看不到。
@@ -303,18 +341,29 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     if (!token || !canQuery) return;
     setLoading(true);
     setLoadErr(null);
+    const scopeParams = lockScope
+      ? seedTier != null
+        ? { randomStarTier: seedTier }
+        : seedRoomTypeId
+          ? { hotelRoomTypeId: seedRoomTypeId }
+          : { hotelId: seedHotelId ?? '' }
+      : poolTierFromOptionValue(scopeKey) != null
+        ? { randomStarTier: poolTierFromOptionValue(scopeKey) as RandomStarTier }
+        : { hotelId: scopeKey };
     hotelControlOpsApi
-      .getSharedRoomWorkbench(token, {
-        ...(randomStarTier != null ? { randomStarTier } : { hotelId }),
-        checkIn,
-        checkOut,
-      })
+      .getSharedRoomWorkbench(token, { ...scopeParams, checkIn, checkOut })
       .then((data) => {
         setWb(data);
         setRooms(seedDraftRooms(data));
         setDissolvedVersions(new Map());
         setOrderItemChoice({});
         setPlacing(null);
+        // 锁定作用域：按服务端落定的作用域同步下拉值（房型下拉 / 档次判定 / 落位候选都从它派生）。
+        if (lockScope) {
+          setScopeValue(
+            data.randomStarTier != null ? poolOptionValue(data.randomStarTier as RandomStarTier) : (data.hotelId ?? ''),
+          );
+        }
       })
       .catch((e: unknown) => {
         setWb(null);
@@ -322,7 +371,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
         setLoadErr(e instanceof ApiError ? e.message : '工作台加载失败');
       })
       .finally(() => setLoading(false));
-  }, [token, hotelId, randomStarTier, checkIn, checkOut, canQuery]);
+  }, [token, scopeKey, lockScope, seedHotelId, seedTier, seedRoomTypeId, checkIn, checkOut, canQuery]);
 
   // 查询范围（酒店/入住/退房）变化才清掉旧的保存提示与乘客池搜索——load() 被 handleSave
   // 复用时不清（否则刚保存完成功提示、以及运营正在用的搜索词会被这次重拉悄悄冲掉）。
@@ -413,6 +462,9 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     const order = orderById.get(loc.orderId);
     if (!order) return;
     if (targetDraftId != null && !order.fullyAttributed) return;
+    // 只读房（运营安排、含其他代理客人）：不能拖入，也不能把自家客人从里面拽走。
+    if (targetDraftId != null && rooms.some((r) => r.draftId === targetDraftId && r.readOnly)) return;
+    if (rooms.some((r) => r.readOnly && r.groups.some((g) => g.passengerIds.includes(passengerId)))) return;
     const orderItemId = targetDraftId != null ? resolveOrderItemId(loc.orderId) : null;
     if (targetDraftId != null && !orderItemId) return;
 
@@ -472,7 +524,16 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     if (placingBusy) return;
     setRooms((prev) => [
       ...prev,
-      { draftId: newId(), sharedRoomId: null, version: null, hotelRoomTypeId: roomTypeOptions[0]?.id ?? '', notes: '', groups: [] },
+      {
+        draftId: newId(),
+        sharedRoomId: null,
+        version: null,
+        hotelRoomTypeId: roomTypeOptions[0]?.id ?? '',
+        notes: '',
+        readOnly: false,
+        externalMemberCount: 0,
+        groups: [],
+      },
     ]);
   }
   function removeNewRoom(draftId: string): void {
@@ -482,19 +543,19 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
   function dissolveRoom(draftId: string): void {
     if (placingBusy) return;
     const room = rooms.find((r) => r.draftId === draftId);
-    if (!room || room.sharedRoomId == null) return;
+    if (!room || room.sharedRoomId == null || room.readOnly) return;
     setDissolvedVersions((dv) => new Map(dv).set(room.sharedRoomId as string, room.version ?? 0));
     setRooms((prev) => prev.filter((r) => r.draftId !== draftId));
   }
   function patchRoom(draftId: string, patch: Partial<Pick<DraftRoom, 'hotelRoomTypeId' | 'notes'>>): void {
     if (placingBusy) return;
-    setRooms((prev) => prev.map((r) => (r.draftId === draftId ? { ...r, ...patch } : r)));
+    setRooms((prev) => prev.map((r) => (r.draftId === draftId && !r.readOnly ? { ...r, ...patch } : r)));
   }
   function stepFraction(draftId: string, orderId: string, orderItemId: string, delta: number): void {
     if (placingBusy) return;
     setRooms((prev) =>
       prev.map((r) =>
-        r.draftId !== draftId
+        r.draftId !== draftId || r.readOnly
           ? r
           : {
               ...r,
@@ -544,6 +605,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
 
   /** 该草稿房与加载时的落库状态是否一致（未改动）——整房落位前要求先保存改动。 */
   function isRoomDirty(r: DraftRoom): boolean {
+    if (r.readOnly) return false; // 只读房没有任何可改入口，永远不算脏
     if (!wb || !r.sharedRoomId) return true;
     const seedRoom = wb.sharedRooms.find((sr) => sr.sharedRoomId === r.sharedRoomId);
     if (!seedRoom) return true;
@@ -610,7 +672,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
     if (placingBusy) return;
     setRooms((prev) =>
       prev.map((r) =>
-        r.draftId !== draftId
+        r.draftId !== draftId || r.readOnly
           ? r
           : {
               ...r,
@@ -648,6 +710,9 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
       seedRoom: SharedRoomRuleSeedRoom | undefined;
     }> = [];
     for (const r of rooms) {
+      // 只读房（运营安排、含其他代理客人）：UI 没有任何可改入口，也绝不进 payload——服务端对它
+      // 同样 403，这里提前跳过只是不让「整间原样交回」的比较逻辑有机会碰到脱敏后的占位成员。
+      if (r.readOnly) continue;
       if (!r.sharedRoomId) {
         if (r.groups.length > 0) roomsToSave.push({ room: r, groups: r.groups, seedRoom: undefined });
         continue;
@@ -800,7 +865,26 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
           </button>
         </div>
 
-        {/* ── 查询条件：酒店 + 入住 + 退房 ── */}
+        {/* ── 查询条件：酒店 + 入住 + 退房；锁定作用域（代理自助）时只展示、不可切 ── */}
+        {lockScope ? (
+          <div className="flex flex-wrap items-center gap-2 border-b border-slate-200 bg-slate-50/60 px-5 py-3 text-sm text-ink">
+            <Icon name="hotel" />
+            <span className="font-medium">
+              {isTierMode
+                ? `${randomStarTierLabel(randomStarTier)}池（待落位）`
+                : (hotels.find((h) => h.id === hotelId)?.name ?? (wb ? '当前酒店' : '加载中…'))}
+            </span>
+            <span className="text-ink-muted">
+              {checkIn} ~ {checkOut}
+            </span>
+            <button type="button" className="btn-secondary px-2 py-1 text-xs" onClick={handleManualRefresh} disabled={loading || !canQuery}>
+              <Icon name="refresh" /> {loading ? '加载中…' : '刷新'}
+            </button>
+            <span className="ml-auto text-xs text-ink-muted">
+              只能与自己名下（含下级代理）订单的客人拼房；含其他代理客人的房间由运营安排，只读
+            </span>
+          </div>
+        ) : (
         <div className="flex flex-wrap items-end gap-2 border-b border-slate-200 bg-slate-50/60 px-5 py-3">
           <div>
             <label className="label">酒店 / 随机池</label>
@@ -837,6 +921,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
           {!canQuery && <span className="text-xs text-amber-700">入住日须早于退房日</span>}
           <span className="ml-auto text-xs text-ink-muted">切酒店（或随机池）/日期会丢弃当前未保存的改动</span>
         </div>
+        )}
 
         {/* ── 缺口 B：乘客池搜索——按姓名/中文名/订单号过滤左侧乘客池，纯前端不改查询范围 ── */}
         <div className="border-b border-slate-200 px-5 py-2">
@@ -961,6 +1046,14 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                           ) : (
                             <span className="badge-neutral">新建</span>
                           )}
+                          {r.readOnly && (
+                            <span
+                              className="badge bg-amber-100 text-amber-800"
+                              title="这间房含其他代理的客人：成员 / 份额 / 备注 / 解散 / 落位都由运营调整，这里只读"
+                            >
+                              <Icon name="lock" /> 运营安排，含其他代理客人
+                            </span>
+                          )}
                           {isOrphaned && (
                             <span
                               className="badge bg-rose-100 text-rose-700"
@@ -999,8 +1092,10 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                             type="button"
                             className="btn-ghost-danger px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-40"
                             onClick={() => dissolveRoom(r.draftId)}
-                            disabled={placingBusy}
-                            title={placingBusy ? '整房落位处理中，请稍候' : undefined}
+                            disabled={placingBusy || r.readOnly}
+                            title={
+                              r.readOnly ? '含其他代理客人，只能由运营解散' : placingBusy ? '整房落位处理中，请稍候' : undefined
+                            }
                           >
                             解散整间
                           </button>
@@ -1022,7 +1117,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                           <span>
                             {randomStarTierLabel(randomStarTier)}（待落位）· 按 {TIER_ROOM_DEFAULT_CAPACITY} 人/间提示，落位后按真实房型
                           </span>
-                          {r.sharedRoomId && (
+                          {r.sharedRoomId && !r.readOnly && (
                             <button
                               type="button"
                               className="btn-secondary px-2 py-0.5 text-xs disabled:cursor-not-allowed disabled:opacity-40"
@@ -1044,8 +1139,9 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                         </div>
                       ) : (
                         <select
-                          className="input w-full py-1.5 text-sm"
+                          className="input w-full py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-60"
                           value={r.hotelRoomTypeId}
+                          disabled={r.readOnly}
                           onChange={(e) => patchRoom(r.draftId, { hotelRoomTypeId: e.target.value })}
                         >
                           <option value="">选房型</option>
@@ -1134,8 +1230,8 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                                   <button
                                     type="button"
                                     className="rounded border border-slate-200 px-1.5 text-xs text-ink-soft hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
-                                    disabled={placingBusy}
-                                    title={placingBusy ? '整房落位处理中，请稍候' : undefined}
+                                    disabled={placingBusy || r.readOnly}
+                                    title={r.readOnly ? '含其他代理客人，份额由运营调整' : placingBusy ? '整房落位处理中，请稍候' : undefined}
                                     onClick={() => stepFraction(r.draftId, g.orderId, g.orderItemId, -HALF_STEP)}
                                   >
                                     −
@@ -1144,8 +1240,8 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                                   <button
                                     type="button"
                                     className="rounded border border-slate-200 px-1.5 text-xs text-ink-soft hover:bg-slate-50 disabled:cursor-not-allowed disabled:opacity-40"
-                                    disabled={placingBusy}
-                                    title={placingBusy ? '整房落位处理中，请稍候' : undefined}
+                                    disabled={placingBusy || r.readOnly}
+                                    title={r.readOnly ? '含其他代理客人，份额由运营调整' : placingBusy ? '整房落位处理中，请稍候' : undefined}
                                     onClick={() => stepFraction(r.draftId, g.orderId, g.orderItemId, HALF_STEP)}
                                   >
                                     ＋
@@ -1153,23 +1249,39 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                                 </div>
                               </div>
                               <div className="flex flex-wrap gap-1">
-                                {g.passengerIds.map((pid) => {
+                                {/* 服务端脱敏的范围外成员（代理视角）：不露单号 / 姓名，只显示人数 */}
+                                {isExternalGroup(g) ? (
+                                  <span
+                                    className="inline-flex select-none items-center rounded border border-amber-200 bg-amber-50 px-1.5 py-0.5 text-xs text-amber-800"
+                                    title="其他代理的客人，由运营安排；单号与姓名不对代理显示"
+                                  >
+                                    {EXTERNAL_MEMBER_LABEL} ×{g.passengerIds.length}
+                                  </span>
+                                ) : null}
+                                {!isExternalGroup(g) && g.passengerIds.map((pid) => {
                                   const p = passengerIndex.get(pid)?.passenger;
                                   if (p) {
                                     const display = passengerDisplayName(p.fullName, p.chineseName);
+                                    const frozen = placingBusy || r.readOnly;
                                     return (
                                       <span
                                         key={pid}
-                                        draggable={!placingBusy}
+                                        draggable={!frozen}
                                         onDragStart={(e) => {
-                                          if (placingBusy) return;
+                                          if (frozen) return;
                                           e.dataTransfer.setData('text/plain', pid);
                                           e.dataTransfer.effectAllowed = 'move';
                                         }}
                                         className={`inline-flex select-none items-center rounded border border-slate-200 bg-slate-50 px-1.5 py-0.5 text-xs text-ink ${
-                                          placingBusy ? 'cursor-not-allowed opacity-60' : 'cursor-grab active:cursor-grabbing'
+                                          frozen ? 'cursor-not-allowed opacity-60' : 'cursor-grab active:cursor-grabbing'
                                         }`}
-                                        title={placingBusy ? '整房落位处理中，请稍候再拖动' : '拖出可退回乘客池或移到别的房间'}
+                                        title={
+                                          r.readOnly
+                                            ? '这间房含其他代理客人，成员由运营调整'
+                                            : placingBusy
+                                              ? '整房落位处理中，请稍候再拖动'
+                                              : '拖出可退回乘客池或移到别的房间'
+                                        }
                                       >
                                         {display || '—'}
                                       </span>
@@ -1216,7 +1328,7 @@ export function SharedRoomWorkbench({ token, seed, onClose, onSaved }: SharedRoo
                         className="input mt-2 w-full py-1.5 text-sm disabled:cursor-not-allowed disabled:opacity-60"
                         placeholder="备注（选填）"
                         value={r.notes}
-                        disabled={placingBusy}
+                        disabled={placingBusy || r.readOnly}
                         onChange={(e) => patchRoom(r.draftId, { notes: e.target.value })}
                       />
                     </div>

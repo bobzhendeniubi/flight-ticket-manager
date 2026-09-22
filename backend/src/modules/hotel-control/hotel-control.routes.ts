@@ -16,12 +16,19 @@
  *   GET    /hotel-control/export?from&to           房态导出（xlsx，销控矩阵原样导出）
  *   GET    /hotel-control/passports.zip?hotelId&from&to     按酒店导出护照 zip
  *   POST   /hotel-control/passports-by-names.zip    按姓名批量导出护照 zip（body { names: string[], from?, to? } —— from/to 为出发地本地日区间）
- *   GET    /hotel-control/shared-rooms/workbench?hotelId&checkIn&checkOut  跨单分房工作台读模型
+ *   GET    /hotel-control/shared-rooms/workbench?(hotelId|randomStarTier|hotelRoomTypeId)&checkIn&checkOut  跨单分房工作台读模型
  *   PUT    /hotel-control/shared-rooms              跨单分房保存（新建/改动/解散共享房，见 §七）
+ *   POST   /hotel-control/shared-rooms/:id/place    档次共享房整房落位
+ *
+ * 权限：除跨单分房三端点外一律 ADMIN/STAFF。跨单分房三端点 2026-09-21 起对 AGENT 开放自助
+ * （只能拼自家含下级名下的单；含别家客人的房只读）——归属范围只从登录身份解析，见
+ * resolveSharedRoomAgentScope，绝不从 query/body 读。
  */
 import type { FastifyPluginAsync } from 'fastify';
 import { UserRole } from '@prisma/client';
 import { actorFromRequest, writeAudit } from '../../lib/audit.js';
+import { getDescendantAgentIds } from '../../lib/agent-tree.js';
+import { ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import { buildHotelControlBoardWorkbook, hotelControlExportFilename } from './hotel-control.export.js';
 import {
   buildHotelPassportsZip,
@@ -65,7 +72,12 @@ import {
   OCCUPYING_ORDERS_DETAIL_NOTE,
 } from './hotel-control.service.js';
 import { getRandomTierShortfall } from './hotel-control.shortfall.js';
-import { getSharedRoomWorkbench, saveSharedRooms } from './hotel-control.shared-rooms.js';
+import {
+  getSharedRoomWorkbench,
+  saveSharedRooms,
+  type SharedRoomAgentScope,
+  type SharedRoomScope,
+} from './hotel-control.shared-rooms.js';
 import { placeSharedRoom } from './shared-room-placement.js';
 import {
   sharedRoomWorkbenchQuerySchema,
@@ -79,6 +91,45 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
   const requireStaff = {
     preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF)],
   };
+  // 跨单分房三端点专用（2026-09-21 代理自助拼房）；其余房控端点仍是 requireStaff。
+  const requireOpsOrAgent = {
+    preHandler: [app.authenticate, app.requireRole(UserRole.ADMIN, UserRole.STAFF, UserRole.AGENT)],
+  };
+
+  /**
+   * 代理归属范围——**只从登录身份解析**：AGENT → 自己 + 全部下级代理 id（lib/agent-tree 递归 CTE，
+   * 与订单列表 / 导出 / 客户管理同源）；ADMIN/STAFF → null（不设限）。绝不从 query/body 读任何
+   * 归属字段；AGENT 账号没有关联 Agent 档案 → 403（fail-closed）。
+   */
+  async function resolveSharedRoomAgentScope(req: {
+    user: { sub: string; role: UserRole };
+  }): Promise<SharedRoomAgentScope> {
+    if (req.user.role !== UserRole.AGENT) return null;
+    const agent = await prisma.agent.findUnique({ where: { userId: req.user.sub }, select: { id: true } });
+    if (!agent) throw new ForbiddenError('AGENT 账号没有关联 Agent 档案');
+    return new Set(await getDescendantAgentIds(agent.id));
+  }
+
+  /**
+   * 工作台作用域：hotelId / randomStarTier 直接用；hotelRoomTypeId 反查——真酒店房型 → 该酒店，
+   * 占位酒店房型 → 该档次随机池（代理从订单详情的分房盒子就地打开工作台时只有行上的房型 id）。
+   */
+  async function resolveWorkbenchScope(q: {
+    hotelId?: string;
+    randomStarTier?: number;
+    hotelRoomTypeId?: string;
+  }): Promise<SharedRoomScope> {
+    if (q.hotelId) return { hotelId: q.hotelId };
+    if (q.randomStarTier != null) return { randomStarTier: q.randomStarTier };
+    const roomType = await prisma.hotelRoomType.findUnique({
+      where: { id: q.hotelRoomTypeId! },
+      select: { hotelId: true, hotel: { select: { randomTierPlaceholder: true } } },
+    });
+    if (!roomType) throw new NotFoundError('房型不存在');
+    return roomType.hotel.randomTierPlaceholder != null
+      ? { randomStarTier: roomType.hotel.randomTierPlaceholder }
+      : { hotelId: roomType.hotelId };
+  }
 
   // ── 包房周期 CRUD ──────────────────────────────────────────────────────
   app.get('/block-periods', requireStaff, async (req) => {
@@ -346,24 +397,28 @@ export const hotelControlRoutes: FastifyPluginAsync = async (app) => {
       .send(buf);
   });
 
-  // ── 跨单分房工作台（§七）：ADMIN/STAFF only，代理不开放 ───────────────────
-  // 作用域 hotelId | randomStarTier 二选一（schema refine 保证）：酒店房 vs 档次房。
-  app.get('/shared-rooms/workbench', requireStaff, async (req) => {
+  // ── 跨单分房工作台（§七）：ADMIN/STAFF 全量；AGENT 自助（2026-09-21）只看自家含下级的单，
+  //    含别家客人的既有共享房整间 readOnly + 脱敏（service 侧按 agentScope 处理）────────────
+  // 作用域 hotelId | randomStarTier | hotelRoomTypeId 三选一（schema refine 保证）：酒店房 vs 档次房。
+  app.get('/shared-rooms/workbench', requireOpsOrAgent, async (req) => {
     const q = sharedRoomWorkbenchQuerySchema.parse(req.query);
-    const scope = q.hotelId ? { hotelId: q.hotelId } : { randomStarTier: q.randomStarTier! };
-    return getSharedRoomWorkbench(scope, q.checkIn, q.checkOut);
+    const [scope, agentScope] = await Promise.all([resolveWorkbenchScope(q), resolveSharedRoomAgentScope(req)]);
+    return getSharedRoomWorkbench(scope, q.checkIn, q.checkOut, undefined, { agentScope });
   });
 
-  app.put('/shared-rooms', requireStaff, async (req) => {
+  app.put('/shared-rooms', requireOpsOrAgent, async (req) => {
     const body = saveSharedRoomsBodySchema.parse(req.body);
-    const result = await saveSharedRooms(body, actorFromRequest(req));
+    const agentScope = await resolveSharedRoomAgentScope(req);
+    const result = await saveSharedRooms(body, actorFromRequest(req), undefined, { agentScope });
     return result;
   });
 
   // ── 档次共享房整房落位：全部成员行一起落到同一家真实酒店同一房型，共享房原地转酒店房 ──
-  app.post('/shared-rooms/:id/place', requireStaff, async (req) => {
+  // AGENT：房内成员必须全是自家的单（service 403），同档 / 星级 / 指定加价闸照旧。
+  app.post('/shared-rooms/:id/place', requireOpsOrAgent, async (req) => {
     const { id } = req.params as { id: string };
     const body = placeSharedRoomBodySchema.parse(req.body);
-    return placeSharedRoom(id, body, actorFromRequest(req));
+    const agentScope = await resolveSharedRoomAgentScope(req);
+    return placeSharedRoom(id, body, actorFromRequest(req), undefined, { agentScope });
   });
 };

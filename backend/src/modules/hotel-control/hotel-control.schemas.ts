@@ -156,17 +156,24 @@ export const nightlyRemainingQuerySchema = z
 export type NightlyRemainingQuery = z.infer<typeof nightlyRemainingQuerySchema>;
 
 // ── 跨单分房工作台（§七）────────────────────────────────────────────────
-// 作用域 hotelId | randomStarTier 二选一（口径同 occupantsQuerySchema）：酒店房 vs 档次房
+// 作用域 hotelId | randomStarTier | hotelRoomTypeId 三选一（口径同 occupantsQuerySchema）：酒店房 vs 档次房
 // （2026-09-20 起随机档未落位的单也能跨单合住，先合住再整房落位）。
-const SHARED_ROOM_SCOPE_MESSAGE = '请指定一家酒店，或指定一个星级随机档';
+// hotelRoomTypeId（2026-09-21 代理自助拼房）：订单详情只带行上的房型 id、不带酒店 id，代理从分房盒子
+// 就地打开工作台时用它让路由层反查作用域——真酒店房型 → 该酒店；占位酒店房型 → 该档次随机池。
+// 它只决定「看哪个酒店/哪个池」，不是权限输入；代理可见范围仍只由登录身份解析。
+const SHARED_ROOM_SCOPE_MESSAGE = '请指定一家酒店、一个星级随机档，或一条住宿行的房型';
 export const sharedRoomWorkbenchQuerySchema = z
   .object({
     hotelId: z.string().min(1).optional(),
     randomStarTier: z.coerce.number().int().pipe(randomStarTierSchema).optional(),
+    hotelRoomTypeId: z.string().min(1).optional(),
     checkIn: dateStr,
     checkOut: dateStr,
   })
-  .refine((q) => !!q.hotelId !== (q.randomStarTier != null), { message: SHARED_ROOM_SCOPE_MESSAGE })
+  .refine(
+    (q) => [!!q.hotelId, q.randomStarTier != null, !!q.hotelRoomTypeId].filter(Boolean).length === 1,
+    { message: SHARED_ROOM_SCOPE_MESSAGE },
+  )
   .refine((q) => q.checkIn < q.checkOut, { message: '入住日必须早于退房日' });
 export type SharedRoomWorkbenchQuery = z.infer<typeof sharedRoomWorkbenchQuerySchema>;
 

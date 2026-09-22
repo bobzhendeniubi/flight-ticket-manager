@@ -12,9 +12,10 @@
  */
 import { useMemo, useState } from 'react';
 import { Link } from 'react-router-dom';
-import type { HotelAvailabilityTier, HotelNightlyRemainingResult, RoomGroup } from '../lib/api';
+import type { HotelAvailabilityTier, HotelNightlyRemainingResult, RandomStarTier, RoomGroup } from '../lib/api';
 import { randomStarTierLabel } from '../lib/api';
 import { Icon } from './Icon';
+import { SharedRoomWorkbench, type SharedRoomWorkbenchSeed } from './SharedRoomWorkbench';
 import { passengerDisplayName, passengerNameTitle } from '../lib/passengerDisplayName';
 import { useAuth } from '../stores/auth';
 
@@ -38,6 +39,15 @@ export interface RoomingHotelItemOption {
   hotelName: string;
   /** 未落位随机档的档次（形态①/②）；已落位真酒店为 null——锁定组指路链接据此带 randomStarTier 而不是 hotelId。 */
   pendingTier?: number | null;
+  /**
+   * 跨单分房工作台的种子（2026-09-21 代理自助拼房）：订单详情只带行上的房型 id、不带酒店 id，
+   * 就地打开工作台时交给服务端反查酒店 / 档次；形态①随机行（无房型）给 randomStarTier。
+   * 入住 / 退房是该行的区间（YYYY-MM-DD）。都可选：旧调用方不传时只能走房控页深链。
+   */
+  hotelRoomTypeId?: string | null;
+  randomStarTier?: number | null;
+  checkIn?: string | null;
+  checkOut?: string | null;
 }
 
 interface RoomingEditorProps {
@@ -295,6 +305,8 @@ export function roomingHotelItemsFromOrder(
     hotelPendingTier?: number | null;
     roomTypeName?: string | null;
     hotelRoomTypeId?: string | null;
+    /** 形态①随机行（无房型）的档次；用作工作台种子，不影响展示名 / 归属名派生。 */
+    randomStarTier?: number | null;
     hotelCheckIn?: string | null;
     hotelCheckOut?: string | null;
   }>,
@@ -303,6 +315,14 @@ export function roomingHotelItemsFromOrder(
     .filter((it) => it.kind === 'HOTEL' || (it.kind === 'BUNDLE' && it.hotelRoomTypeId))
     .map((it) => {
       const pendingTier = it.hotelPendingTier ?? null;
+      // 工作台种子（只透传，不参与下面的展示名派生）：有房型给房型 id 让服务端反查；
+      // 形态①随机行没有房型，给行上的档次。
+      const seed = {
+        hotelRoomTypeId: it.hotelRoomTypeId ?? null,
+        randomStarTier: it.hotelRoomTypeId ? null : (it.randomStarTier ?? null),
+        checkIn: it.hotelCheckIn ? dateOnly(it.hotelCheckIn) : null,
+        checkOut: it.hotelCheckOut ? dateOnly(it.hotelCheckOut) : null,
+      };
       const descriptionHead = it.description.split(' · ')[0]?.trim() || '';
       const itemHotelName =
         pendingTier != null
@@ -319,7 +339,7 @@ export function roomingHotelItemsFromOrder(
       ]
         .filter((s): s is string => !!s)
         .join(' · ');
-      return { id: it.id, label, hotelName: itemHotelName, pendingTier };
+      return { id: it.id, label, hotelName: itemHotelName, pendingTier, ...seed };
     });
 }
 
@@ -347,6 +367,14 @@ export function RoomingEditor({
   // 直接读现成的 useAuth 全局 store（不新增状态），与 Layout.tsx 的角色判定同一份真值。
   const viewerRole = useAuth((s) => s.user?.role);
   const canOpenSharedRoomWorkbench = viewerRole === 'ADMIN' || viewerRole === 'STAFF';
+  // 代理自助拼房（2026-09-21 拍板）：AGENT 没有房控页，工作台就地弹在本编辑器里——作用域锁定为
+  // 当前住宿行的酒店（或档次）+ 入住退房；服务端只放自家含下级名下的单，含别家客人的房只读。
+  const isAgentViewer = viewerRole === 'AGENT';
+  const accessToken = useAuth((s) => s.tokens)?.accessToken ?? '';
+  const [agentWorkbenchSeed, setAgentWorkbenchSeed] = useState<SharedRoomWorkbenchSeed | null>(null);
+  // 工作台保存成功后本编辑器手里的房组已过期：再点「保存分房」会把旧房组盖回去，所以锁掉保存、
+  // 提示重新打开订单。父级（订单详情）不在本组件改动范围内，不能替它刷新。
+  const [sharedRoomsSavedExternally, setSharedRoomsSavedExternally] = useState(false);
 
   const passengerById = useMemo(() => {
     const m = new Map<string, RoomingPassenger>();
@@ -428,6 +456,23 @@ export function RoomingEditor({
     if (checkIn) params.set('checkIn', dateOnly(checkIn));
     if (checkOut) params.set('checkOut', dateOnly(checkOut));
     return `/hotel-control?${params.toString()}`;
+  }
+  /**
+   * 代理就地打开工作台的种子：按盒子归属行（≥2 条时按下拉选中的行；恰好 1 条自动归属；没有
+   * 归属行时回落到 props 的 hotelId / 区间）。作用域三选一——未落位档次 → randomStarTier；
+   * 已落位有房型 → hotelRoomTypeId（服务端反查酒店）；都没有 → hotelId。缺日期或缺作用域 → null，
+   * 按钮不出（代理只能在当前行的酒店 + 日期范围内拼，猜不出范围就不给入口）。
+   */
+  function agentWorkbenchSeedFor(box: RoomBox): SharedRoomWorkbenchSeed | null {
+    const item = box.orderItemId ? hotelItemById.get(box.orderItemId) : soleHotelItem;
+    const seedCheckIn = item?.checkIn ?? (checkIn ? dateOnly(checkIn) : null);
+    const seedCheckOut = item?.checkOut ?? (checkOut ? dateOnly(checkOut) : null);
+    if (!seedCheckIn || !seedCheckOut) return null;
+    const tier = item?.pendingTier ?? item?.randomStarTier ?? null;
+    if (tier != null) return { randomStarTier: tier as RandomStarTier, checkIn: seedCheckIn, checkOut: seedCheckOut };
+    if (item?.hotelRoomTypeId) return { hotelRoomTypeId: item.hotelRoomTypeId, checkIn: seedCheckIn, checkOut: seedCheckOut };
+    if (hotelId) return { hotelId, checkIn: seedCheckIn, checkOut: seedCheckOut };
+    return null;
   }
 
   function addBox(): void {
@@ -717,11 +762,39 @@ export function RoomingEditor({
                       >
                         想调整请去房控页「跨单分房」→
                       </Link>
+                    ) : isAgentViewer && agentWorkbenchSeedFor(b) ? (
+                      <button
+                        type="button"
+                        className="text-xs font-medium text-indigo-700 underline hover:text-indigo-900"
+                        onClick={() => setAgentWorkbenchSeed(agentWorkbenchSeedFor(b))}
+                        title="就地打开跨单分房：只能与自己名下（含下级代理）订单的客人拼；含其他代理客人的房间只读"
+                      >
+                        调整和我其它单的客人拼房 →
+                      </button>
                     ) : (
                       <span className="text-xs text-indigo-700">共享房由运营统一调整，如需变动请联系运营</span>
                     )
                   ) : (
                     <div className="flex items-center gap-1.5">
+                      {/* 跨单拼房入口（与锁定盒子的指路并列）：ADMIN/STAFF 深链房控页；AGENT 就地弹工作台 */}
+                      {canOpenSharedRoomWorkbench ? (
+                        <Link
+                          to={sharedRoomWorkbenchHrefFor(b)}
+                          className="text-xs text-indigo-700 underline hover:text-indigo-900"
+                          title="去房控页「跨单分房」，把别的订单的客人拼进这间房"
+                        >
+                          和别单客人拼房 →
+                        </Link>
+                      ) : isAgentViewer && agentWorkbenchSeedFor(b) ? (
+                        <button
+                          type="button"
+                          className="rounded-md border border-indigo-200 bg-indigo-50 px-2 py-1 text-xs text-indigo-700 transition hover:bg-indigo-100"
+                          onClick={() => setAgentWorkbenchSeed(agentWorkbenchSeedFor(b))}
+                          title="就地打开跨单分房：只能与自己名下（含下级代理）订单的客人拼这家酒店这个入住区间的房"
+                        >
+                          和我其它单的客人拼房
+                        </button>
+                      ) : null}
                       <button
                         type="button"
                         onClick={() => toggleHalf(b.id)}
@@ -812,14 +885,37 @@ export function RoomingEditor({
         </div>
       </div>
 
+      {sharedRoomsSavedExternally && (
+        <div className="rounded-lg border border-amber-200 bg-amber-50 px-3 py-2 text-sm text-amber-800">
+          跨单分房已保存。本页的房间数据已过期，为避免把旧分房盖回去，这里不再允许「保存分房」——请关闭后重新打开订单查看最新分房。
+        </div>
+      )}
+
       <div className="flex items-center justify-end gap-2 border-t border-slate-200 pt-3">
         <button type="button" className="btn-ghost text-sm" onClick={onClose} disabled={saving}>
-          取消
+          {sharedRoomsSavedExternally ? '关闭' : '取消'}
         </button>
-        <button type="button" className="btn-primary text-sm" onClick={handleSave} disabled={saving}>
+        <button
+          type="button"
+          className="btn-primary text-sm disabled:cursor-not-allowed disabled:opacity-40"
+          onClick={handleSave}
+          disabled={saving || sharedRoomsSavedExternally}
+          title={sharedRoomsSavedExternally ? '跨单分房已保存，本页数据已过期，请重新打开订单' : undefined}
+        >
           {saving ? '保存中…' : '保存分房'}
         </button>
       </div>
+
+      {/* 代理自助拼房：工作台就地弹出，作用域锁定当前住宿行的酒店（或档次）+ 入住退房 */}
+      {isAgentViewer && agentWorkbenchSeed && accessToken && (
+        <SharedRoomWorkbench
+          token={accessToken}
+          seed={agentWorkbenchSeed}
+          lockScope
+          onClose={() => setAgentWorkbenchSeed(null)}
+          onSaved={() => setSharedRoomsSavedExternally(true)}
+        />
+      )}
     </div>
   );
 }

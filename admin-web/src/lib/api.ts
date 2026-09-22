@@ -7681,18 +7681,29 @@ export const hotelControlOpsApi = {
 
   /**
    * 跨单分房工作台读模型：本酒店本入住区间（精确匹配 checkIn/checkOut）内全部有效订单
-   * 的乘客与酒店行 + 既有共享房列表。ADMIN/STAFF only，代理不开放。
+   * 的乘客与酒店行 + 既有共享房列表。ADMIN/STAFF 全量；AGENT（2026-09-21 起自助拼房）只看
+   * 自家含下级名下的单，含别家客人的既有共享房整间 readOnly + 脱敏（服务端按登录身份判定）。
    * 对应 backend/src/modules/hotel-control/hotel-control.shared-rooms.ts getSharedRoomWorkbench。
    */
   getSharedRoomWorkbench: (
     token: string,
-    params: { hotelId?: string; randomStarTier?: RandomStarTier; checkIn: string; checkOut: string },
+    params: {
+      hotelId?: string;
+      randomStarTier?: RandomStarTier;
+      /** 三选一的第三种：订单详情只有行上的房型 id、没有酒店 id，由服务端反查酒店 / 档次（代理从分房盒子就地打开用）。 */
+      hotelRoomTypeId?: string;
+      checkIn: string;
+      checkOut: string;
+    },
   ) => {
-    // 作用域二选一：酒店房按 hotelId；档次房（随机档待落位的单跨单合住）按 randomStarTier。
+    // 作用域三选一：酒店房按 hotelId；档次房（随机档待落位的单跨单合住）按 randomStarTier；
+    // 只有行上房型 id 时按 hotelRoomTypeId 让服务端反查。
     const scope =
       params.randomStarTier != null
         ? `randomStarTier=${params.randomStarTier}`
-        : `hotelId=${encodeURIComponent(params.hotelId ?? '')}`;
+        : params.hotelRoomTypeId
+          ? `hotelRoomTypeId=${encodeURIComponent(params.hotelRoomTypeId)}`
+          : `hotelId=${encodeURIComponent(params.hotelId ?? '')}`;
     return apiFetch<SharedRoomWorkbench>(
       `/hotel-control/shared-rooms/workbench?${scope}&checkIn=${encodeURIComponent(params.checkIn)}&checkOut=${encodeURIComponent(params.checkOut)}`,
       { token },
@@ -7700,7 +7711,9 @@ export const hotelControlOpsApi = {
   },
 
   /**
-   * 跨单分房保存：新建/改动共享房（Σ份额须=1，服务端 400）+ 整间解散。ADMIN/STAFF only。
+   * 跨单分房保存：新建/改动共享房（Σ份额须=1，服务端 400）+ 整间解散。ADMIN/STAFF 全量；
+   * AGENT（2026-09-21 起自助）只能点名自家含下级名下的单（越界 403「只能分配自己名下的订单」），
+   * 含别家客人的房不能改动 / 解散（403）。
    * requestToken 幂等（同 token 同指纹回放首次结果，同 token 不同指纹 409）；
    * expectedVersions 版本 CAS 不匹配 409「该房间已被他人修改，请刷新后重试」。
    * 对应 backend/src/modules/hotel-control/hotel-control.shared-rooms.ts saveSharedRooms。
@@ -7788,6 +7801,14 @@ export interface SharedRoomWorkbenchRoom {
   randomStarTier: number | null;
   version: number;
   notes: string | null;
+  /**
+   * 代理自助口径（2026-09-21）：整间房含代理归属范围外的成员（别家代理 / 直客）→ true，
+   * 前端整间锁定（不可拖入拖出 / 改份额 / 解散 / 落位），范围外成员单号与姓名脱敏为
+   * 「其他代理客人」。ADMIN/STAFF 视图恒 false。
+   */
+  readOnly: boolean;
+  /** readOnly 房里被脱敏的范围外成员人数（显示「其他代理客人 ×N」）；非 readOnly 恒 0。 */
+  externalMemberCount: number;
   members: SharedRoomWorkbenchRoomMember[];
 }
 

@@ -24,7 +24,7 @@ import { prisma as defaultPrisma } from '../../db/prisma.js';
 import type { AuditActor } from '../../lib/audit.js';
 import { writeAuditWithinTx } from '../../lib/audit.js';
 import { canonicalJson } from '../../lib/canonical-json.js';
-import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
+import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import {
   assertHotelFitAfterChange,
   assertRandomTierFitAfterChange,
@@ -56,6 +56,73 @@ export type SharedRoomScope = RoomScope;
 /** 作用域的展示名：酒店房给 hotelId（调用方自行查名），档次房给「X星随机」。*/
 function scopeLabel(scope: SharedRoomScope): string {
   return 'hotelId' in scope ? scope.hotelId : randomStarTierLabel(scope.randomStarTier);
+}
+
+// ── 代理自助拼房的归属范围（2026-09-21 拍板：代理可直接跨单分房，只能拼自家含下级名下的单）──
+
+/**
+ * 代理归属范围：AGENT = 自己 + 全部下级代理的 Agent id 集合；ADMIN/STAFF = null（不设限）。
+ * **只能由路由层从登录身份解析**（lib/agent-tree 的递归 CTE），任何从 query / body 读归属的
+ * 写法都是越权漏洞。AGENT 账号没有关联 Agent 档案 → 路由层直接 403，不会走到这里。
+ * 空集合（理论上不会出现）按 fail-closed 处理：什么都看不到、什么都改不了。
+ */
+export type SharedRoomAgentScope = ReadonlySet<string> | null;
+
+/** 代理越界点名别家订单（含查不到的订单——不向代理暴露别家订单是否存在）。*/
+export const AGENT_SCOPE_ORDER_FORBIDDEN = '只能分配自己名下的订单';
+/** 代理试图改动 / 解散含范围外成员的共享房（运营安排的房对代理只读）。*/
+export const AGENT_SCOPE_ROOM_FORBIDDEN = '该房间由运营安排、含其他代理客人，只能由运营调整';
+/** 代理试图整房落位含范围外成员的档次房。*/
+export const AGENT_SCOPE_PLACE_FORBIDDEN = '该房间含其他代理客人，整房落位只能由运营操作';
+/** 脱敏后的范围外成员展示名（单号与姓名都用它顶替）。*/
+export const EXTERNAL_MEMBER_LABEL = '其他代理客人';
+
+/** 订单是否在代理归属范围内；ADMIN/STAFF（scope=null）恒 true；直客单（agentId=null）对代理恒 false。*/
+export function isOrderWithinAgentScope(
+  order: { agentId: string | null },
+  scope: SharedRoomAgentScope,
+): boolean {
+  if (scope == null) return true;
+  return order.agentId != null && scope.has(order.agentId);
+}
+
+/**
+ * 请求点名的每张订单都必须在归属范围内，否则 403。查不到的订单同样 403（而不是让后面的
+ * 400「订单不存在」先报出来）：对代理而言「别家的单」和「不存在的单」必须长得一样。
+ */
+export function assertOrdersWithinAgentScope(
+  orderIds: Iterable<string>,
+  orders: ReadonlyMap<string, { agentId: string | null }>,
+  scope: SharedRoomAgentScope,
+  message: string = AGENT_SCOPE_ORDER_FORBIDDEN,
+): void {
+  if (scope == null) return;
+  for (const orderId of orderIds) {
+    const order = orders.get(orderId);
+    if (!order || !isOrderWithinAgentScope(order, scope)) throw new ForbiddenError(message);
+  }
+}
+
+/**
+ * 本次触及（显式点名 + 隐式牵连）的每一间共享房都不能含范围外成员——那是运营安排的房，
+ * 对代理整间只读：不能改成员 / 份额 / 备注，不能解散，也不能把自家客人从里面拽走。
+ */
+export function assertRoomsEditableWithinAgentScope(
+  memberAgentIdsByRoom: ReadonlyMap<string, ReadonlyArray<string | null>>,
+  scope: SharedRoomAgentScope,
+  message: string = AGENT_SCOPE_ROOM_FORBIDDEN,
+): void {
+  if (scope == null) return;
+  for (const agentIds of memberAgentIdsByRoom.values()) {
+    if (agentIds.some((agentId) => !isOrderWithinAgentScope({ agentId }, scope))) {
+      throw new ForbiddenError(message);
+    }
+  }
+}
+
+/** 落位 / 保存共用的选项（目前只有归属范围）。*/
+export interface SharedRoomActorOptions {
+  agentScope?: SharedRoomAgentScope;
 }
 
 /**
@@ -134,6 +201,14 @@ export interface SharedRoomWorkbenchRoom {
   randomStarTier: number | null;
   version: number;
   notes: string | null;
+  /**
+   * 代理自助口径（2026-09-21）：整间房含代理归属范围外的成员（别家代理 / 直客）→ true，
+   * 前端整间锁定（不可拖入拖出 / 改份额 / 解散 / 落位），范围外成员单号与姓名脱敏为
+   * 「其他代理客人」。ADMIN/STAFF 视图恒 false。
+   */
+  readOnly: boolean;
+  /** readOnly 房里被脱敏的范围外成员人数（前端显示「其他代理客人 ×N」）；非 readOnly 恒 0。*/
+  externalMemberCount: number;
   members: Array<{
     orderId: string;
     orderItemId: string;
@@ -197,14 +272,19 @@ function parseRoomGroups(roomAssignment: unknown): Array<Record<string, unknown>
  * 作用域二选一：酒店（候选 = 房型挂在该酒店的行）或随机档（候选 = 形态①
  * `hotelRoomTypeId=null + randomStarTier=tier` ∪ 形态② 房型挂在该档占位酒店上的行——
  * 与销控板随机池行、占房下钻同一份 scopeItemWhere）。
+ *
+ * 代理自助（2026-09-21，opts.agentScope 非空）：候选订单只取 `order.agentId ∈ scope` 的有效单；
+ * 既有共享房照常全部返回，但含范围外成员的整间标 readOnly，范围外成员脱敏（见 maskRoomForAgent）。
  */
 export async function getSharedRoomWorkbench(
   scope: string | SharedRoomScope,
   checkIn: string,
   checkOut: string,
   client: PrismaClient = defaultPrisma,
+  opts: SharedRoomActorOptions = {},
 ): Promise<SharedRoomWorkbench> {
   const roomScope: SharedRoomScope = typeof scope === 'string' ? { hotelId: scope } : scope;
+  const agentScope = opts.agentScope ?? null;
   const checkInD = new Date(`${checkIn}T00:00:00.000Z`);
   const checkOutD = new Date(`${checkOut}T00:00:00.000Z`);
 
@@ -213,7 +293,11 @@ export async function getSharedRoomWorkbench(
       ...scopeItemWhere(roomScope),
       hotelCheckIn: checkInD,
       hotelCheckOut: checkOutD,
-      order: countedOrderWhere(),
+      order: {
+        ...countedOrderWhere(),
+        // 代理只看自家（含下级）名下的单；空集合 → `in: []` 什么都不返回（fail-closed）。
+        ...(agentScope ? { agentId: { in: [...agentScope] } } : {}),
+      },
     },
     select: {
       id: true,
@@ -308,7 +392,8 @@ export async function getSharedRoomWorkbench(
           // 单（getSharedRoomWorkbench 的主查询按 COUNTED_STATUSES 过滤），共享房的成员
           // 却不受这道过滤限制，会带出已取消/软删的历史成员。前端需要这两个字段来把它们
           // 标成只读，不能让运营对着一个看起来正常的姓名 chip 操作却被保存接口 400。
-          order: { select: { status: true, deletedAt: true, orderNumber: true } },
+          // agentId：代理自助口径判 readOnly / 脱敏用（ADMIN/STAFF 路径读了不用）。
+          order: { select: { status: true, deletedAt: true, orderNumber: true, agentId: true } },
           // 姓名快照：直接走 SharedRoomMember → Passenger 的关系查（不经过按
           // COUNTED_STATUSES 过滤的订单池），失效订单的成员也查得到，灰色 chip 才有人名
           // 可显示，不是空白。
@@ -324,25 +409,79 @@ export async function getSharedRoomWorkbench(
     checkIn,
     checkOut,
     orders: [...ordersById.values()],
-    sharedRooms: sharedRoomRows.map((r) => ({
-      sharedRoomId: r.id,
-      hotelId: r.hotelId,
-      hotelRoomTypeId: r.hotelRoomTypeId,
-      randomStarTier: r.randomStarTier,
-      version: r.version,
-      notes: r.notes,
-      members: r.members.map((m) => ({
-        orderId: m.orderId,
-        orderItemId: m.orderItemId,
-        passengerId: m.passengerId,
-        roomFraction: Number(m.roomFraction.toString()),
-        orderStatus: m.order.status,
-        isActive: isCountedOrder(m.order),
-        orderNumber: m.order.orderNumber,
-        chineseName: m.passenger.chineseName,
-        name: m.passenger.fullName,
-      })),
-    })),
+    sharedRooms: sharedRoomRows.map((r) =>
+      maskRoomForAgent(
+        {
+          sharedRoomId: r.id,
+          hotelId: r.hotelId,
+          hotelRoomTypeId: r.hotelRoomTypeId,
+          randomStarTier: r.randomStarTier,
+          version: r.version,
+          notes: r.notes,
+          readOnly: false,
+          externalMemberCount: 0,
+          members: r.members.map((m) => ({
+            orderId: m.orderId,
+            orderItemId: m.orderItemId,
+            passengerId: m.passengerId,
+            roomFraction: Number(m.roomFraction.toString()),
+            orderStatus: m.order.status,
+            isActive: isCountedOrder(m.order),
+            orderNumber: m.order.orderNumber,
+            chineseName: m.passenger.chineseName,
+            name: m.passenger.fullName,
+          })),
+        },
+        r.members.map((m) => m.order.agentId),
+        agentScope,
+      ),
+    ),
+  };
+}
+
+/**
+ * 代理视角的共享房脱敏（2026-09-21）：房里只要有一个范围外成员（别家代理 / 直客），整间标
+ * readOnly，范围外成员的 orderId / orderItemId / passengerId 换成不含任何真实 id 的占位键
+ * （同一 (orderId, orderItemId) 的成员共用同一个占位键，前端按键分组后份额结构不变），单号与
+ * 姓名一律顶替成「其他代理客人」。范围内成员原样保留（都是自家的单）。
+ * ADMIN/STAFF（scope=null）直接原样返回。
+ * export 仅供单测直接驱动脱敏分支。
+ */
+export function maskRoomForAgent(
+  room: SharedRoomWorkbenchRoom,
+  memberAgentIds: ReadonlyArray<string | null>,
+  scope: SharedRoomAgentScope,
+): SharedRoomWorkbenchRoom {
+  if (scope == null) return room;
+  const external = room.members.map((_, i) => !isOrderWithinAgentScope({ agentId: memberAgentIds[i] ?? null }, scope));
+  if (!external.some(Boolean)) return room;
+  const externalKeyIndex = new Map<string, number>();
+  let externalPassengerSeq = 0;
+  const members = room.members.map((m, i) => {
+    if (!external[i]) return m;
+    const realKey = `${m.orderId}:${m.orderItemId}`;
+    let keyIndex = externalKeyIndex.get(realKey);
+    if (keyIndex == null) {
+      keyIndex = externalKeyIndex.size + 1;
+      externalKeyIndex.set(realKey, keyIndex);
+    }
+    externalPassengerSeq += 1;
+    const maskedKey = `external-${keyIndex}`;
+    return {
+      ...m,
+      orderId: maskedKey,
+      orderItemId: maskedKey,
+      passengerId: `${maskedKey}-p${externalPassengerSeq}`,
+      orderNumber: EXTERNAL_MEMBER_LABEL,
+      chineseName: null,
+      name: EXTERNAL_MEMBER_LABEL,
+    };
+  });
+  return {
+    ...room,
+    readOnly: true,
+    externalMemberCount: external.filter(Boolean).length,
+    members,
   };
 }
 
@@ -391,6 +530,8 @@ interface LockedOrderRow {
   orderNumber: string;
   status: OrderStatus;
   deletedAt: Date | null;
+  /** 归属代理（直客为 null）；代理自助口径的范围校验用，锁后读到的才是真值。*/
+  agentId: string | null;
   roomAssignment: unknown;
   passengerIds: Set<string>;
   items: Array<{
@@ -420,6 +561,7 @@ async function loadLockedOrders(
       orderNumber: true,
       status: true,
       deletedAt: true,
+      agentId: true,
       roomAssignment: true,
       passengers: { select: { id: true } },
       items: {
@@ -444,6 +586,7 @@ async function loadLockedOrders(
       orderNumber: r.orderNumber,
       status: r.status,
       deletedAt: r.deletedAt,
+      agentId: r.agentId,
       roomAssignment: r.roomAssignment,
       passengerIds: new Set(r.passengers.map((p) => p.id)),
       items: r.items.map((it) => ({
@@ -707,6 +850,7 @@ export async function saveSharedRooms(
   body: SaveSharedRoomsBody,
   actor: AuditActor,
   client: PrismaClient = defaultPrisma,
+  opts: SharedRoomActorOptions = {},
 ): Promise<SaveSharedRoomsResult> {
   // 指纹：酒店房保持与档次房上线前**完全相同**的键集合（部署窗口内仍在幂等保留期的旧占位行
   // 才能继续按指纹回放 / 判冲突）；只有档次房才多带 randomStarTier 这一键。
@@ -733,7 +877,7 @@ export async function saveSharedRooms(
   // requestToken），按 requestToken 删会误删新占位的行；按自己的 id 删，抢占已发生时
   // 这里天然影响 0 行，不会牵连无关的新占位。
   try {
-    return await saveSharedRoomsInner(body, actor, client, reservationId);
+    return await saveSharedRoomsInner(body, actor, client, reservationId, opts.agentScope ?? null);
   } catch (err) {
     // 最佳努力清理占位——删失败也不能吞掉原始错误，原始错误才是调用方需要看到的。
     await client.sharedRoomRequest.deleteMany({ where: { id: reservationId } }).catch(() => {});
@@ -746,6 +890,7 @@ async function saveSharedRoomsInner(
   actor: AuditActor,
   client: PrismaClient,
   reservationId: string,
+  agentScope: SharedRoomAgentScope,
 ): Promise<SaveSharedRoomsResult> {
   const checkInD = new Date(`${body.checkIn}T00:00:00.000Z`);
   const checkOutD = new Date(`${body.checkOut}T00:00:00.000Z`);
@@ -856,6 +1001,29 @@ async function saveSharedRoomsInner(
     }
 
     const orders = await loadLockedOrders(tx, [...lockedOrderIds]);
+
+    // ── 代理自助归属闸（2026-09-21）：锁后判、CAS 前判 ─────────────────────────
+    // 锁后判：归属（Order.agentId）以锁住之后读到的为准，不给「先查再锁」的窗口。
+    // CAS 前判：越界一律 403，不让后面的 404/409 先报出来向代理暴露别家房间是否存在、版本几何。
+    //   ① 点名的每张订单都必须在自家（含下级）范围内；
+    //   ② 本次触及的每一间共享房（显式点名的 rooms/dissolve + 乘客被拽走的隐式房）都不能含
+    //      范围外成员——运营安排的混合房对代理整间只读。
+    // ADMIN/STAFF（agentScope=null）两道闸都是空操作，行为与此前完全一致。
+    if (agentScope) {
+      assertOrdersWithinAgentScope(initialOrderIds, orders, agentScope);
+      if (touchedSharedRoomIds.size > 0) {
+        const touchedMembers = await tx.sharedRoomMember.findMany({
+          where: { sharedRoomId: { in: [...touchedSharedRoomIds] } },
+          select: { sharedRoomId: true, order: { select: { agentId: true } } },
+        });
+        const memberAgentIdsByRoom = new Map<string, Array<string | null>>();
+        for (const m of touchedMembers) {
+          const list = memberAgentIdsByRoom.get(m.sharedRoomId) ?? [];
+          memberAgentIdsByRoom.set(m.sharedRoomId, [...list, m.order.agentId]);
+        }
+        assertRoomsEditableWithinAgentScope(memberAgentIdsByRoom, agentScope);
+      }
+    }
 
     // 订单集合稳定后，按 SharedRoom id 升序显式锁共享房行（astra A9：原实现直到落库段的
     // UPDATE 才隐式锁住 SharedRoom，CAS 版本判定发生在锁之前，两个并发请求能同时读到
@@ -1718,6 +1886,8 @@ async function saveSharedRoomsInner(
           ...(auditPayload.orphanedSharedRoomWarnings
             ? { orphanedSharedRoomWarnings: auditPayload.orphanedSharedRoomWarnings }
             : {}),
+          // 代理自助拼房（不经运营）留痕，与代理自助改期 / 换酒店的审计同一个标记。
+          ...(agentScope ? { selfService: true } : {}),
         },
       });
     }
@@ -1764,6 +1934,7 @@ async function saveSharedRoomsInner(
           dissolved: finalResult.dissolved,
           requestToken: body.requestToken,
           orderIds: orderAuditPayloads.map((p) => p.orderId),
+          ...(agentScope ? { selfService: true } : {}),
         },
       });
     }

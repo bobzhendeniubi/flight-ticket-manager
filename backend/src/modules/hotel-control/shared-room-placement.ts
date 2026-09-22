@@ -58,7 +58,13 @@ import {
   type SharedRoomAfterState,
 } from './hotel-control.service.js';
 import type { PlaceSharedRoomBody } from './hotel-control.schemas.js';
-import { groupSharedId, itemPendingTier } from './hotel-control.shared-rooms.js';
+import {
+  AGENT_SCOPE_PLACE_FORBIDDEN,
+  assertOrdersWithinAgentScope,
+  groupSharedId,
+  itemPendingTier,
+  type SharedRoomActorOptions,
+} from './hotel-control.shared-rooms.js';
 
 export interface PlaceSharedRoomResult {
   sharedRoomId: string;
@@ -158,7 +164,10 @@ export async function placeSharedRoom(
   body: PlaceSharedRoomBody,
   actor: AuditActor,
   client: PrismaClient = defaultPrisma,
+  opts: SharedRoomActorOptions = {},
 ): Promise<PlaceSharedRoomResult> {
+  // 代理自助口径（2026-09-21）：只能由路由层从登录身份解析；ADMIN/STAFF 为 null。
+  const agentScope = opts.agentScope ?? null;
   // 锁前候选：本房成员订单 ∪ 同住宿行其它共享房及其成员订单（锁后复核，扩大则 409 让调用方
   // 刷新重试——整房落位不是高频操作，不做自动重试）
   const preRoom = await client.sharedRoom.findUnique({
@@ -208,6 +217,20 @@ export async function placeSharedRoom(
     if (memberOrderIds.length === 0) throw new BadRequestError('共享房没有成员，请先解散');
     if (memberOrderIds.some((oid) => !candidateOrderIds.includes(oid))) {
       throw new ConflictError('共享房成员在落位过程中发生变化，请刷新后重试');
+    }
+    // 代理自助归属闸（2026-09-21）：锁后判——房内每一张成员单都必须在自家（含下级）范围内，
+    // 含别家代理 / 直客的混合房只能由运营落位。同档 / 星级 / 指定加价闸在下面照旧，不因代理放宽。
+    if (agentScope) {
+      const memberOrders = await tx.order.findMany({
+        where: { id: { in: memberOrderIds } },
+        select: { id: true, agentId: true },
+      });
+      assertOrdersWithinAgentScope(
+        memberOrderIds,
+        new Map(memberOrders.map((o) => [o.id, { agentId: o.agentId }])),
+        agentScope,
+        AGENT_SCOPE_PLACE_FORBIDDEN,
+      );
     }
     const memberItemIds = [...new Set(room.members.map((m) => m.orderItemId))];
     // 锁后复核「同住宿行的其它共享房」（与上面成员订单集合的复核同款）：只有锁前发现的房间 /
@@ -600,6 +623,8 @@ export async function placeSharedRoom(
           feeCny: 0,
           sharedRoomId: room.id,
           source: 'SHARED_ROOM_PLACE',
+          // 代理自助落位（不经运营）留痕，与代理自助换酒店的审计同一个标记。
+          ...(agentScope ? { selfService: true } : {}),
         },
         severity: 'WARNING',
       });
@@ -618,6 +643,7 @@ export async function placeSharedRoom(
         version: updated.version,
         orderIds: memberOrderIds,
         orderItemIds: memberItemIds,
+        ...(agentScope ? { selfService: true } : {}),
       },
       severity: 'WARNING',
     });
