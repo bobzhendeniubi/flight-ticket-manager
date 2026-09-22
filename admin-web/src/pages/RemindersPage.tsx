@@ -79,8 +79,13 @@ function ruleLabel(key: string): string {
  * 「乘客 + 航段」，列表接口按乘客证件号现算出**当前**主档案 id，随行返回 redeemProfileId
  * （见 backend reminders.routes.ts）。查不到档案时为 null —— 那种提醒照常显示，只是没有
  * 直达链接，正文里写了怎么先建档。
+ *
+ * 必须先按 ruleKey 前缀认一遍：同一个 redeemProfileId 字段，列表接口对规则 13（可用次数为负，
+ * 键形如 `TRIPNEG:{档案id}`）也会回一个档案 id。不区分的话，负数提醒会挂上「去核销」——
+ * 那是叫运营去扣一次次数，方向正好反了（可用为负多半是退改把已飞次数拉回来，该去看原因）。
  */
 function upgradeRedeemProfileId(reminder: OperationalReminder): string | null {
+  if (!reminder.ruleKey?.trim().startsWith('UPGRADEREDEEM:')) return null;
   // redeemProfileId 是列表接口的派生字段（不在 OperationalReminder 的公共类型里）
   const profileId = (reminder as { redeemProfileId?: string | null }).redeemProfileId;
   return profileId?.trim() ? profileId : null;

@@ -74,7 +74,7 @@ export interface RuleUpgradeRedeemPassenger {
   profileId: string | null;
   /**
    * 这一程已核销（true = 已扣过，不再提醒）。判法见 isLegRedeemed：挂了本单的流水按单看净额 > 0，
-   * 没挂单号的退回「起飞日之后档案上的核销流水净额 > 0」。
+   * 一条挂本单的都没有时退回「起飞日之后、**没挂单号**的核销流水净额 > 0」（挂了别单的不替本单顶包）。
    * 净额而不是「有没有正数流水」：台账 append-only，冲正是追加一条负数补偿行，
    * 见 collectUpgradeRedeemCandidates 里的取数注释。
    */
@@ -368,7 +368,14 @@ export interface UpgradeRedeemLedgerRow {
  * 「这一程已核销」的判定（2026-09-21 升级）：
  *   1. 档案上有挂了**同一张订单**的流水 → 只看这些行的净额 > 0（挂单的绑定优先；被冲正就是没核销，
  *      **不再**退回时间窗，否则同人另一程的核销会把它误判成已核销）；
- *   2. 一条挂本单的都没有（存量没挂单号的核销）→ 退回起飞当地零点之后的净额 > 0 这套时间窗近似。
+ *   2. 一条挂本单的都没有（存量没挂单号的核销）→ 退回时间窗近似，但**只让没挂单号的行**参与
+ *      净额：起飞当地零点之后的 `orderId == null` 行加总 > 0 才算已核销。
+ *
+ * 第 2 步为什么要把「挂了别单」的行排除掉：那些行已经明确写着自己是为哪张单扣的，拿它们给本单
+ * 顶包就是张冠李戴 —— 同一位常旅客同期有 A、B 两张单都标了次数升级，运营规规矩矩给 B 挂单号核销，
+ * 本单 A 一条绑定行都没有、于是走时间窗，B 的那笔净额 > 0 就把 A 判成「已核销」：A 的待办从此
+ * 生不出来（或被收敛按「已核销」自动关掉），A 那一次额度白送。存量（谁都没挂单号）的老口径原样
+ * 保留，挂单号这件事只会让判定更准，不会让它更松。
  */
 export function isLegRedeemed(
   rows: ReadonlyArray<UpgradeRedeemLedgerRow>,
@@ -381,7 +388,7 @@ export function isLegRedeemed(
   }
   return (
     rows
-      .filter((r) => r.createdAt.getTime() >= legStartMs)
+      .filter((r) => r.orderId == null && r.createdAt.getTime() >= legStartMs)
       .reduce((sum, r) => sum + r.tripsUsed, 0) > 0
   );
 }
@@ -500,9 +507,11 @@ export async function collectUpgradeRedeemCandidates(
   // 可用次数虚高照样没人知道 —— 正是本规则存在的那个洞。净额算法下两行自然抵消。
   //
   // 2026-09-21 起核销可以挂订单号：挂了本单的流水按单判（净额 > 0），见 isLegRedeemed；
-  // 存量没挂单号的仍按时间窗近似 —— 已知近似：同一位客人短期内飞两趟都标了升舱时，一次核销
-  // 可能把两程都判成已核销；反过来，起飞后冲正一笔**更早那一程**的核销，也会把本程的净额
-  // 压回 0、重新催一次。两种都是宁可多问一句，不会少扣。挂了单号就没有这层歧义。
+  // 一条挂本单的都没有时退回时间窗，且只让**没挂单号**的存量行参与净额 —— 挂了别单的行已经
+  // 写明自己为哪张单扣，不给本单顶包。剩下的近似只落在「两张单都没挂单号」这种存量上：同一位
+  // 客人短期内飞两趟都标了升舱时，一次核销可能把两程都判成已核销；反过来，起飞后冲正一笔
+  // **更早那一程**的核销，也会把本程的净额压回 0、重新催一次。两种都是宁可多问一句，不会少扣。
+  // 核销时挂上单号就没有这层歧义。
   const masterIds = [...new Set(masterIdByDoc.values())];
   const redemptions =
     masterIds.length === 0
