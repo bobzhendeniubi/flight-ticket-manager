@@ -591,7 +591,7 @@ async function createSkippedReminder(
       createdById: input.createdById,
       title: `【核销未补回·请核对】${input.orderNumber} ${candidate.profile.fullName} ${candidate.tripsUsed} 次`,
       body:
-        `${input.reason}，该单挂的权益核销「${candidate.benefit}」（${candidate.tripsUsed} 次）**未**自动补回：` +
+        `${input.reason}，该单挂的权益核销「${candidate.benefit}」（${candidate.tripsUsed} 次）未自动补回：` +
         `旅客仍在同一拆单谱系的有效行程上（订单 ${input.carriedByOrderNumbers.join('、')}），` +
         `这次核销按那趟行程照常享受。请核对是否属实；若客人实际未出行，请到常旅客档案人工冲正。`,
       dueAt: new Date(`${businessDateISO(input.at)}T00:00:00Z`),

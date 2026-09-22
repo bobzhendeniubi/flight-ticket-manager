@@ -461,6 +461,8 @@ describe('autoReverseRedemptionsForOrderWithinTx · 取消 / 退款 / no-show �
       const out = await autoReverseRedemptionsForOrderWithinTx(tx, { ...INPUT, reason: '去程 no-show' });
 
       expect(out.map((r) => r.originalId)).toEqual(['r1']);
+      // 复审 M8：补回路径必须落一条冲正审计（不是「跳过」审计）
+      expect(auditActions(tx)).toEqual([BENEFIT_AUTO_REVERSED_AUDIT_ACTION]);
     });
 
     it('A→B→C 两跳拆单，P 在 C 已飞，取消 A → 不补回（N2：谱系传递闭包，不止一跳）', async () => {

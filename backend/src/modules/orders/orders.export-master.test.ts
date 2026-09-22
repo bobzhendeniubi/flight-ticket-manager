@@ -1217,6 +1217,7 @@ describe('bootstrapTripCountProfilesIfEmpty', () => {
     await bootstrapTripCountProfilesIfEmpty(2, client as never, rebuild);
 
     expect(countFn).toHaveBeenCalledTimes(1);
+    expect(aggregateFn).toHaveBeenCalledTimes(1);
     expect(aggregateFn).toHaveBeenCalledWith(
       expect.objectContaining({ where: { mergedIntoId: null }, _min: { refreshedAt: true } }),
     );
