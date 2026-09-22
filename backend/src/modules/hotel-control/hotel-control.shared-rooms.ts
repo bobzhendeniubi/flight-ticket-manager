@@ -106,6 +106,12 @@ export function assertOrdersWithinAgentScope(
 /**
  * 本次触及（显式点名 + 隐式牵连）的每一间共享房都不能含范围外成员——那是运营安排的房，
  * 对代理整间只读：不能改成员 / 份额 / 备注，不能解散，也不能把自家客人从里面拽走。
+ *
+ * 调用方须把本次触及的每一个房间 id 都作为 key 传进来（零成员房传空数组）——**零成员房
+ * 对代理没有「自家」可言，一律按别家房 403**，与 shared-room-placement.ts 的
+ * `placeSharedRoom` 同口径（2026-09-21 复审 N8/N9）：不然版本号猜中就能把自家成员塞进
+ * 一间空房并覆盖它的运营备注，且点名一个不存在的房间会先漏过这道闸，走到后面的 CAS/
+ * 存在性校验回 404 并回显房间 id，与 403 可被区分、探出房间是否存在。
  */
 export function assertRoomsEditableWithinAgentScope(
   memberAgentIdsByRoom: ReadonlyMap<string, ReadonlyArray<string | null>>,
@@ -114,7 +120,7 @@ export function assertRoomsEditableWithinAgentScope(
 ): void {
   if (scope == null) return;
   for (const agentIds of memberAgentIdsByRoom.values()) {
-    if (agentIds.some((agentId) => !isOrderWithinAgentScope({ agentId }, scope))) {
+    if (agentIds.length === 0 || agentIds.some((agentId) => !isOrderWithinAgentScope({ agentId }, scope))) {
       throw new ForbiddenError(message);
     }
   }
@@ -1033,7 +1039,12 @@ async function saveSharedRoomsInner(
           where: { sharedRoomId: { in: [...touchedSharedRoomIds] } },
           select: { sharedRoomId: true, order: { select: { agentId: true } } },
         });
-        const memberAgentIdsByRoom = new Map<string, Array<string | null>>();
+        // 每个触及的房间 id 先占位成空数组——包括查不到成员的（零成员房 / 压根不存在的房间
+        // id），让 assertRoomsEditableWithinAgentScope 把它们也按空数组一律 403（N8/N9），
+        // 不然它们不会出现在 touchedMembers 里、直接漏过这道闸。
+        const memberAgentIdsByRoom = new Map<string, Array<string | null>>(
+          [...touchedSharedRoomIds].map((roomId) => [roomId, []]),
+        );
         for (const m of touchedMembers) {
           const list = memberAgentIdsByRoom.get(m.sharedRoomId) ?? [];
           memberAgentIdsByRoom.set(m.sharedRoomId, [...list, m.order.agentId]);
@@ -1058,6 +1069,8 @@ async function saveSharedRoomsInner(
     const currentById = new Map(currentSharedRooms.map((r) => [r.id, r]));
     for (const roomId of touchedSharedRoomIds) {
       const current = currentById.get(roomId);
+      // 代理点名一个不存在的房间 id：上面的归属闸已经把它当零成员房 403 过了（N9），走不到
+      // 这里；这条 404 只留给 ADMIN/STAFF（agentScope=null 时上面那道闸整个跳过）。
       if (!current) throw new NotFoundError(`共享房 ${roomId} 不存在`);
       if (implicitRoomIds.has(roomId)) {
         // 隐式触及的房间（astra A6②）：客户端根本不知道它存在，不能要求 expectedVersions；

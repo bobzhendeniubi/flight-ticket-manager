@@ -145,6 +145,11 @@ describe('assertRoomsEditableWithinAgentScope', () => {
       ForbiddenError,
     );
   });
+  it('零成员房（空数组）→ 403，与 placeSharedRoom 同口径（2026-09-21 复审 N8）', () => {
+    expect(() => assertRoomsEditableWithinAgentScope(new Map([['sr-empty', []]]), SCOPE_A)).toThrow(
+      AGENT_SCOPE_ROOM_FORBIDDEN,
+    );
+  });
 });
 
 describe('maskRoomForAgent（readOnly 判定 + 脱敏）', () => {
@@ -415,6 +420,48 @@ describe('saveSharedRooms · 代理归属闸', () => {
           expectedVersions: { 'sr-mixed': 3 },
           rooms: [],
           dissolve: ['sr-mixed'],
+        },
+        actor,
+        client,
+        { agentScope: SCOPE_A },
+      ),
+    ).rejects.toThrow(AGENT_SCOPE_ROOM_FORBIDDEN);
+  });
+
+  it('触及一间零成员房（工作台已隐藏 / 版本号被猜中）→ 403，不再只靠后续 CAS 挡（2026-09-21 复审 N8）', async () => {
+    // roomMembers 不含 sr-empty 的任何成员行：闸门必须在到达 CAS/存在性校验之前就拦下，
+    // 不能指望「版本对不上」的 409 兜底——版本号猜中就绕过去了。
+    const { client } = saveClient({ orders: [], roomMembers: [] });
+    await expect(
+      saveSharedRooms(
+        {
+          hotelId: 'h1',
+          checkIn: CHECK_IN,
+          checkOut: CHECK_OUT,
+          requestToken: 'tok-empty',
+          expectedVersions: { 'sr-empty': 1 },
+          rooms: [],
+          dissolve: ['sr-empty'],
+        },
+        actor,
+        client,
+        { agentScope: SCOPE_A },
+      ),
+    ).rejects.toThrow(AGENT_SCOPE_ROOM_FORBIDDEN);
+  });
+
+  it('点名一个不存在的房间 id → 代理 403，不回显房间 id、也不是 404（2026-09-21 复审 N9）', async () => {
+    const { client } = saveClient({ orders: [], roomMembers: [] });
+    await expect(
+      saveSharedRooms(
+        {
+          hotelId: 'h1',
+          checkIn: CHECK_IN,
+          checkOut: CHECK_OUT,
+          requestToken: 'tok-missing',
+          expectedVersions: { 'sr-missing': 1 },
+          rooms: [],
+          dissolve: ['sr-missing'],
         },
         actor,
         client,

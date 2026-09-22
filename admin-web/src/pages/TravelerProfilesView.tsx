@@ -1061,7 +1061,7 @@ function RedemptionsSection({
     setInitialOrderMismatch(
       target
         ? `该单当前状态「${orderStatusLabel(target.status)}」，不能挂核销，请确认后手动选择其他单号`
-        : '没在本档案的出行记录里找到这张单，请手动选择或不挂单号提交',
+        : '这张单不在本档案的有效出行记录里（可能已取消 / 已退款），不能挂核销，请手动选择或不挂单号提交',
     );
   }, [initialOrderId, eligibleTrips, trips]);
 
