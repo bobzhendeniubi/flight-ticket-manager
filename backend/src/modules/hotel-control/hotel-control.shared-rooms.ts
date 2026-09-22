@@ -200,6 +200,7 @@ export interface SharedRoomWorkbenchRoom {
   /** 档次房的档次；酒店房为 null。*/
   randomStarTier: number | null;
   version: number;
+  /** 运营的自由文本备注；代理视角下 readOnly 房一律置 null（F4：里面常写别家客人姓名/单号/电话）。*/
   notes: string | null;
   /**
    * 代理自助口径（2026-09-21）：整间房含代理归属范围外的成员（别家代理 / 直客）→ true，
@@ -274,7 +275,8 @@ function parseRoomGroups(roomAssignment: unknown): Array<Record<string, unknown>
  * 与销控板随机池行、占房下钻同一份 scopeItemWhere）。
  *
  * 代理自助（2026-09-21，opts.agentScope 非空）：候选订单只取 `order.agentId ∈ scope` 的有效单；
- * 既有共享房照常全部返回，但含范围外成员的整间标 readOnly，范围外成员脱敏（见 maskRoomForAgent）。
+ * 既有共享房里**至少有一名自家成员**的才返回——混合房整间标 readOnly、范围外成员脱敏、运营
+ * 备注置空，纯别家房整间不返回（见 maskRoomForAgent）。
  */
 export async function getSharedRoomWorkbench(
   scope: string | SharedRoomScope,
@@ -409,41 +411,52 @@ export async function getSharedRoomWorkbench(
     checkIn,
     checkOut,
     orders: [...ordersById.values()],
-    sharedRooms: sharedRoomRows.map((r) =>
-      maskRoomForAgent(
-        {
-          sharedRoomId: r.id,
-          hotelId: r.hotelId,
-          hotelRoomTypeId: r.hotelRoomTypeId,
-          randomStarTier: r.randomStarTier,
-          version: r.version,
-          notes: r.notes,
-          readOnly: false,
-          externalMemberCount: 0,
-          members: r.members.map((m) => ({
-            orderId: m.orderId,
-            orderItemId: m.orderItemId,
-            passengerId: m.passengerId,
-            roomFraction: Number(m.roomFraction.toString()),
-            orderStatus: m.order.status,
-            isActive: isCountedOrder(m.order),
-            orderNumber: m.order.orderNumber,
-            chineseName: m.passenger.chineseName,
-            name: m.passenger.fullName,
-          })),
-        },
-        r.members.map((m) => m.order.agentId),
-        agentScope,
-      ),
-    ),
+    // 代理视角：maskRoomForAgent 返回 null 的是纯别家房，整间从列表里剔掉（F4）。
+    sharedRooms: sharedRoomRows
+      .map((r) =>
+        maskRoomForAgent(
+          {
+            sharedRoomId: r.id,
+            hotelId: r.hotelId,
+            hotelRoomTypeId: r.hotelRoomTypeId,
+            randomStarTier: r.randomStarTier,
+            version: r.version,
+            notes: r.notes,
+            readOnly: false,
+            externalMemberCount: 0,
+            members: r.members.map((m) => ({
+              orderId: m.orderId,
+              orderItemId: m.orderItemId,
+              passengerId: m.passengerId,
+              roomFraction: Number(m.roomFraction.toString()),
+              orderStatus: m.order.status,
+              isActive: isCountedOrder(m.order),
+              orderNumber: m.order.orderNumber,
+              chineseName: m.passenger.chineseName,
+              name: m.passenger.fullName,
+            })),
+          },
+          r.members.map((m) => m.order.agentId),
+          agentScope,
+        ),
+      )
+      .filter((r): r is SharedRoomWorkbenchRoom => r != null),
   };
 }
 
 /**
- * 代理视角的共享房脱敏（2026-09-21）：房里只要有一个范围外成员（别家代理 / 直客），整间标
- * readOnly，范围外成员的 orderId / orderItemId / passengerId 换成不含任何真实 id 的占位键
- * （同一 (orderId, orderItemId) 的成员共用同一个占位键，前端按键分组后份额结构不变），单号与
- * 姓名一律顶替成「其他代理客人」。范围内成员原样保留（都是自家的单）。
+ * 代理视角的共享房脱敏（2026-09-21；备注收口 2026-09-21 复审 F4）：
+ *
+ *   · **纯别家房**（一个范围内成员都没有，含零成员的空房）→ 返回 null，整间不出现在代理的
+ *     工作台里：代理既不能改它、也没有任何业务理由知道它存在（它的备注、人数、房型都是
+ *     别家客人的信息）。
+ *   · **混合房**（既有自家成员又有范围外成员）→ 整间标 readOnly；范围外成员的 orderId /
+ *     orderItemId / passengerId 换成不含任何真实 id 的占位键（同一 (orderId, orderItemId)
+ *     的成员共用同一个占位键，前端按键分组后份额结构不变），单号与姓名一律顶替成
+ *     「其他代理客人」；**notes 置 null**——那是运营的自由文本备注，里面常写别家客人的
+ *     姓名 / 单号 / 电话，不能随房一起发给代理。范围内成员原样保留（都是自家的单）。
+ *   · **纯自家房** → 原样返回（含 notes：整间房都是自家客人，备注写的就是自家的事）。
+ *
  * ADMIN/STAFF（scope=null）直接原样返回。
  * export 仅供单测直接驱动脱敏分支。
  */
@@ -451,9 +464,11 @@ export function maskRoomForAgent(
   room: SharedRoomWorkbenchRoom,
   memberAgentIds: ReadonlyArray<string | null>,
   scope: SharedRoomAgentScope,
-): SharedRoomWorkbenchRoom {
+): SharedRoomWorkbenchRoom | null {
   if (scope == null) return room;
   const external = room.members.map((_, i) => !isOrderWithinAgentScope({ agentId: memberAgentIds[i] ?? null }, scope));
+  // 一个自家成员都没有 → 纯别家房（或零成员的空房），整间不返回。
+  if (!external.includes(false)) return null;
   if (!external.some(Boolean)) return room;
   const externalKeyIndex = new Map<string, number>();
   let externalPassengerSeq = 0;
@@ -479,6 +494,8 @@ export function maskRoomForAgent(
   });
   return {
     ...room,
+    // 运营备注对代理一律不展示（F4）：自由文本里常写别家客人姓名 / 单号 / 电话。
+    notes: null,
     readOnly: true,
     externalMemberCount: external.filter(Boolean).length,
     members,

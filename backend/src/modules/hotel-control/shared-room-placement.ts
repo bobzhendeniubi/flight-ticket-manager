@@ -29,7 +29,7 @@ import { OrderItemKind, Prisma, type OrderStatus, type PrismaClient, type Settle
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import type { AuditActor } from '../../lib/audit.js';
 import { writeAuditWithinTx } from '../../lib/audit.js';
-import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
+import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '../../lib/errors.js';
 import {
   buildHotelCostSourceSnapshot,
   loadHotelCostFxRatesIfNeeded,
@@ -205,22 +205,18 @@ export async function placeSharedRoom(
       },
     });
     if (!room) throw new NotFoundError('共享房不存在');
-    if (room.version !== body.expectedVersion) {
-      throw new ConflictError('该房间已被他人修改，请刷新后重试');
-    }
-    if (room.status !== 'ACTIVE') throw new BadRequestError('共享房已解散，不能整房落位');
-    if (room.randomStarTier == null || room.hotelId != null) {
-      throw new BadRequestError('这间共享房已经是酒店房，不需要整房落位');
-    }
-    const tier = room.randomStarTier;
     const memberOrderIds = [...new Set(room.members.map((m) => m.orderId))].sort();
-    if (memberOrderIds.length === 0) throw new BadRequestError('共享房没有成员，请先解散');
-    if (memberOrderIds.some((oid) => !candidateOrderIds.includes(oid))) {
-      throw new ConflictError('共享房成员在落位过程中发生变化，请刷新后重试');
-    }
-    // 代理自助归属闸（2026-09-21）：锁后判——房内每一张成员单都必须在自家（含下级）范围内，
-    // 含别家代理 / 直客的混合房只能由运营落位。同档 / 星级 / 指定加价闸在下面照旧，不因代理放宽。
+
+    // ── 代理自助归属闸（2026-09-21；顺序收口 2026-09-21 复审 LOW）：锁后判、CAS 与业务状态判定之前判 ──
+    // 锁后判：归属（Order.agentId）以锁住之后读到的为准，不给「先查再锁」的窗口。
+    // CAS 前判：房内有别家代理 / 直客的单，对代理就是「不该碰的房」——无论他手上的版本号是新是旧、
+    // 房间是不是已解散，都该一律 403，而不是先被 409「已被他人修改」/400「已解散」挡回去：那样等于
+    // 拿别家房的版本号与状态回答代理的探测。与 saveSharedRooms 的两道闸（同样锁后、CAS 前）同口径。
+    // 同档 / 星级 / 指定加价闸在下面照旧，不因代理放宽。
     if (agentScope) {
+      // 零成员的房对代理没有「自家」可言，一律按别家房 403（不让 400「没有成员，请先解散」
+      // 这句业务文案把空房的存在告诉代理）。
+      if (memberOrderIds.length === 0) throw new ForbiddenError(AGENT_SCOPE_PLACE_FORBIDDEN);
       const memberOrders = await tx.order.findMany({
         where: { id: { in: memberOrderIds } },
         select: { id: true, agentId: true },
@@ -231,6 +227,19 @@ export async function placeSharedRoom(
         agentScope,
         AGENT_SCOPE_PLACE_FORBIDDEN,
       );
+    }
+
+    if (room.version !== body.expectedVersion) {
+      throw new ConflictError('该房间已被他人修改，请刷新后重试');
+    }
+    if (room.status !== 'ACTIVE') throw new BadRequestError('共享房已解散，不能整房落位');
+    if (room.randomStarTier == null || room.hotelId != null) {
+      throw new BadRequestError('这间共享房已经是酒店房，不需要整房落位');
+    }
+    const tier = room.randomStarTier;
+    if (memberOrderIds.length === 0) throw new BadRequestError('共享房没有成员，请先解散');
+    if (memberOrderIds.some((oid) => !candidateOrderIds.includes(oid))) {
+      throw new ConflictError('共享房成员在落位过程中发生变化，请刷新后重试');
     }
     const memberItemIds = [...new Set(room.members.map((m) => m.orderItemId))];
     // 锁后复核「同住宿行的其它共享房」（与上面成员订单集合的复核同款）：只有锁前发现的房间 /

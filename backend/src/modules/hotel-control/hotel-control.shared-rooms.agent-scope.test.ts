@@ -5,11 +5,12 @@
  *   - schema：工作台作用域 hotelId | randomStarTier | hotelRoomTypeId 三选一；
  *   - isOrderWithinAgentScope / assertOrdersWithinAgentScope / assertRoomsEditableWithinAgentScope：
  *     ADMIN/STAFF（scope=null）空操作；代理越界 403 文案；查不到的订单同样 403（不暴露存在性）；
- *   - maskRoomForAgent：含范围外成员 → 整间 readOnly + 范围外成员单号/姓名脱敏、占位键不含真实 id；
+ *   - maskRoomForAgent：含范围外成员 → 整间 readOnly + 范围外成员单号/姓名脱敏、占位键不含真实 id、
+ *     运营备注置空；纯别家房（一个自家成员都没有，含空房）→ 返回 null 整间不给代理看（F4）；
  *   - getSharedRoomWorkbench：agentScope 非空时候选订单 where 叠 agentId ∈ scope；共享房 readOnly 判定；
  *     ADMIN 路径（无 opts）where 不带 agentId、readOnly 恒 false（回归）；
  *   - saveSharedRooms：代理点名别家订单 → 403 且幂等占位行被清理；触及含范围外成员的房 → 403；
- *   - placeSharedRoom：房内含范围外成员 → 403。
+ *   - placeSharedRoom：房内含范围外成员 → 403；归属闸在 CAS 之前（旧版本 + 混合房仍 403 而非 409）。
  * 真库全链路（A/B 两代理 + 运营合住房 + 代理自己两单合住落位）见 *.agent-scope.integration.test.ts。
  */
 import { describe, it, expect, vi } from 'vitest';
@@ -50,19 +51,22 @@ function member(overrides: Partial<SharedRoomWorkbenchRoom['members'][number]>):
   };
 }
 
-function room(members: SharedRoomWorkbenchRoom['members']): SharedRoomWorkbenchRoom {
+function room(members: SharedRoomWorkbenchRoom['members'], notes: string | null = null): SharedRoomWorkbenchRoom {
   return {
     sharedRoomId: 'sr1',
     hotelId: 'h1',
     hotelRoomTypeId: 'rt1',
     randomStarTier: null,
     version: 1,
-    notes: null,
+    notes,
     readOnly: false,
     externalMemberCount: 0,
     members,
   };
 }
+
+/** 运营在共享房备注里写别家客人的自由文本（真实场景：姓名 / 单号 / 电话都可能出现）。*/
+const SENSITIVE_NOTES = '乙一 FTM-B 13800000000 要靠窗';
 
 describe('schema：工作台作用域三选一（新增 hotelRoomTypeId）', () => {
   const dates = { checkIn: CHECK_IN, checkOut: CHECK_OUT };
@@ -150,10 +154,14 @@ describe('maskRoomForAgent（readOnly 判定 + 脱敏）', () => {
   });
   it('全员自家 → 不脱敏、readOnly=false', () => {
     const r = room([member({}), member({ orderId: 'oA2', orderItemId: 'iA2', passengerId: 'pA2', roomFraction: 0 })]);
-    const out = maskRoomForAgent(r, ['agent-A', 'agent-A-child'], SCOPE_A);
+    const out = maskRoomForAgent(r, ['agent-A', 'agent-A-child'], SCOPE_A)!;
     expect(out.readOnly).toBe(false);
     expect(out.externalMemberCount).toBe(0);
     expect(out.members).toEqual(r.members);
+  });
+  it('全员自家 → 运营备注原样保留（整间都是自家客人）', () => {
+    const r = room([member({})], SENSITIVE_NOTES);
+    expect(maskRoomForAgent(r, ['agent-A'], SCOPE_A)!.notes).toBe(SENSITIVE_NOTES);
   });
   it('含别家成员 → 整间 readOnly；范围外成员单号/姓名顶替成「其他代理客人」，占位键不含真实 id；自家成员原样', () => {
     const r = room([
@@ -161,10 +169,12 @@ describe('maskRoomForAgent（readOnly 判定 + 脱敏）', () => {
       member({ orderId: 'oB', orderItemId: 'iB', passengerId: 'pB1', roomFraction: 0, orderNumber: 'FTM-B', name: 'B1', chineseName: '乙一' }),
       member({ orderId: 'oB', orderItemId: 'iB', passengerId: 'pB2', roomFraction: 0, orderNumber: 'FTM-B', name: 'B2', chineseName: '乙二' }),
       member({ orderId: 'oC', orderItemId: 'iC', passengerId: 'pC', roomFraction: 0, orderNumber: 'FTM-C', name: 'C', chineseName: null }),
-    ]);
-    const out = maskRoomForAgent(r, ['agent-A', 'agent-B', 'agent-B', null], SCOPE_A);
+    ], SENSITIVE_NOTES);
+    const out = maskRoomForAgent(r, ['agent-A', 'agent-B', 'agent-B', null], SCOPE_A)!;
     expect(out.readOnly).toBe(true);
     expect(out.externalMemberCount).toBe(3);
+    // F4：运营自由文本备注对代理一律不展示（里面常写别家客人姓名/单号/电话）
+    expect(out.notes).toBeNull();
     // 自家成员原样
     expect(out.members[0]).toEqual(r.members[0]);
     // 范围外成员脱敏
@@ -185,9 +195,24 @@ describe('maskRoomForAgent（readOnly 判定 + 脱敏）', () => {
     expect(out.members.map((m) => m.roomFraction)).toEqual([1, 0, 0, 0]);
     // 真实 id / 单号 / 姓名一个都不漏出去
     const json = JSON.stringify(out);
-    for (const secret of ['oB', 'iB', 'pB1', 'pB2', 'oC', 'iC', 'pC', 'FTM-B', 'FTM-C', 'B1', 'B2', '乙一', '乙二']) {
-      expect(json.includes(`"${secret}"`)).toBe(false);
+    for (const secret of ['oB', 'iB', 'pB1', 'pB2', 'oC', 'iC', 'pC', 'FTM-B', 'FTM-C', 'B1', 'B2', '乙一', '乙二', SENSITIVE_NOTES]) {
+      expect(json.includes(secret)).toBe(false);
     }
+  });
+  it('纯别家房（一个自家成员都没有）→ 返回 null，整间不给代理看（F4）', () => {
+    const r = room(
+      [
+        member({ orderId: 'oB', orderItemId: 'iB', passengerId: 'pB', orderNumber: 'FTM-B', name: 'B', chineseName: '乙' }),
+        member({ orderId: 'oC', orderItemId: 'iC', passengerId: 'pC', roomFraction: 0, orderNumber: 'FTM-C', name: 'C', chineseName: null }),
+      ],
+      SENSITIVE_NOTES,
+    );
+    expect(maskRoomForAgent(r, ['agent-B', null], SCOPE_A)).toBeNull();
+    // ADMIN/STAFF 不受影响
+    expect(maskRoomForAgent(r, ['agent-B', null], null)).toBe(r);
+  });
+  it('零成员的空房对代理同样不返回（没有自家成员）', () => {
+    expect(maskRoomForAgent(room([], SENSITIVE_NOTES), [], SCOPE_A)).toBeNull();
   });
 });
 
@@ -211,7 +236,7 @@ function workbenchClient() {
       hotelRoomTypeId: 'rt1',
       randomStarTier: null,
       version: 3,
-      notes: null,
+      notes: SENSITIVE_NOTES,
       members: [
         { orderId: 'oA', orderItemId: 'iA', passengerId: 'pA', roomFraction: 1, order: { status: 'PAID', deletedAt: null, orderNumber: 'FTM-A', agentId: 'agent-A' }, passenger: { fullName: 'A', chineseName: null } },
         { orderId: 'oB', orderItemId: 'iB', passengerId: 'pB', roomFraction: 0, order: { status: 'PAID', deletedAt: null, orderNumber: 'FTM-B', agentId: 'agent-B' }, passenger: { fullName: 'B', chineseName: '乙' } },
@@ -227,6 +252,18 @@ function workbenchClient() {
       members: [
         { orderId: 'oA', orderItemId: 'iA', passengerId: 'pA3', roomFraction: 1, order: { status: 'PAID', deletedAt: null, orderNumber: 'FTM-A', agentId: 'agent-A' }, passenger: { fullName: 'A3', chineseName: null } },
         { orderId: 'oA2', orderItemId: 'iA2', passengerId: 'pA4', roomFraction: 0, order: { status: 'PAID', deletedAt: null, orderNumber: 'FTM-A2', agentId: 'agent-A-child' }, passenger: { fullName: 'A4', chineseName: null } },
+      ],
+    },
+    {
+      // 纯别家房：A 的范围里一个成员都没有 → 对 A 整间不返回（F4）
+      id: 'sr-foreign',
+      hotelId: 'h1',
+      hotelRoomTypeId: 'rt1',
+      randomStarTier: null,
+      version: 7,
+      notes: SENSITIVE_NOTES,
+      members: [
+        { orderId: 'oB2', orderItemId: 'iB2', passengerId: 'pB2', roomFraction: 1, order: { status: 'PAID', deletedAt: null, orderNumber: 'FTM-B2', agentId: 'agent-B' }, passenger: { fullName: 'B2', chineseName: '乙二' } },
       ],
     },
   ]);
@@ -255,6 +292,14 @@ describe('getSharedRoomWorkbench · 代理归属范围', () => {
     expect(own.readOnly).toBe(false);
     expect(own.externalMemberCount).toBe(0);
     expect(own.members.map((m) => m.orderNumber)).toEqual(['FTM-A', 'FTM-A2']);
+
+    // F4：混合房的运营备注置空；纯别家房整间不返回；整份响应里不含别家备注/单号/姓名
+    expect(mixed.notes).toBeNull();
+    expect(wb.sharedRooms.map((r) => r.sharedRoomId)).toEqual(['sr-mixed', 'sr-own']);
+    const json = JSON.stringify(wb);
+    for (const secret of [SENSITIVE_NOTES, 'FTM-B2', 'oB2', 'iB2', '乙二', '乙']) {
+      expect(json.includes(secret)).toBe(false);
+    }
   });
 
   it('ADMIN 路径（无 opts）：where 不带 agentId，readOnly 恒 false，成员一个不脱敏（回归）', async () => {
@@ -266,6 +311,8 @@ describe('getSharedRoomWorkbench · 代理归属范围', () => {
       expect(r.readOnly).toBe(false);
       expect(r.externalMemberCount).toBe(0);
     }
+    expect(wb.sharedRooms.map((r) => r.sharedRoomId)).toEqual(['sr-mixed', 'sr-own', 'sr-foreign']);
+    expect(wb.sharedRooms[0]!.notes).toBe(SENSITIVE_NOTES);
     expect(wb.sharedRooms[0]!.members[1]!.orderNumber).toBe('FTM-B');
     expect(wb.sharedRooms[0]!.members[1]!.chineseName).toBe('乙');
   });
@@ -441,6 +488,34 @@ describe('placeSharedRoom · 代理归属闸', () => {
       placeSharedRoom('sr-tier', { hotelRoomTypeId: 'rt-real', expectedVersion: 2 }, actor, client, { agentScope: SCOPE_A }),
     ).rejects.toThrow(AGENT_SCOPE_PLACE_FORBIDDEN);
     expect(tx.hotelRoomType.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('旧版本 + 混合房 → 403（归属闸在 CAS 之前，不先报 409 暴露别家房的版本）', async () => {
+    const { client, tx } = placeClient({ oA: 'agent-A', oB: 'agent-B' });
+    await expect(
+      // expectedVersion 故意给过期值（落库现状是 2）：归属闸先判，仍然 403 而不是 409
+      placeSharedRoom('sr-tier', { hotelRoomTypeId: 'rt-real', expectedVersion: 1 }, actor, client, { agentScope: SCOPE_A }),
+    ).rejects.toThrow(AGENT_SCOPE_PLACE_FORBIDDEN);
+    expect(tx.hotelRoomType.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('零成员的房对代理 → 403（不用 400「没有成员，请先解散」暴露空房存在）', async () => {
+    const { client } = placeClient({});
+    await expect(
+      placeSharedRoom('sr-tier', { hotelRoomTypeId: 'rt-real', expectedVersion: 2 }, actor, client, { agentScope: SCOPE_A }),
+    ).rejects.toThrow(AGENT_SCOPE_PLACE_FORBIDDEN);
+  });
+
+  it('ADMIN 路径（无 opts）：旧版本仍然按 CAS 报 409（回归——归属闸前移不改运营口径）', async () => {
+    const { client } = placeClient({ oA: 'agent-A', oB: 'agent-B' });
+    await expect(
+      placeSharedRoom(
+        'sr-tier',
+        { hotelRoomTypeId: 'rt-real', expectedVersion: 1 },
+        { userId: 'u-admin', role: 'ADMIN' },
+        client,
+      ),
+    ).rejects.toThrow('该房间已被他人修改，请刷新后重试');
   });
 
   it('房内全是自家（含下级）成员 → 通过归属闸，走到目标房型校验（mock 里没有该房型 → 400）', async () => {

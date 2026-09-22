@@ -235,6 +235,47 @@ describe('代理自助拼房 · 工作台可见范围', () => {
     expect(mixedAdmin.externalMemberCount).toBe(0);
     expect(mixedAdmin.members.map((m) => m.orderNumber).sort()).toEqual([s.a1.orderNumber, s.b1.orderNumber].sort());
   });
+
+  it('运营备注：混合房对代理置空、纯别家房整间不返回；ADMIN 原样（F4）', async () => {
+    const s = await seedMixedScenario();
+    // 运营在备注里写了别家客人的姓名 / 单号（真实场景的自由文本）
+    const sensitive = `${s.b1.orderNumber} ${s.b1.passengers[0]!.fullName} 13800000000 要靠窗`;
+    await prisma.sharedRoom.update({ where: { id: s.mixedRoomId }, data: { notes: sensitive } });
+    // 纯别家房：只有直客单，A 的范围里一个成员都没有
+    const foreign = await saveSharedRooms(
+      {
+        hotelId: s.real.hotel.id,
+        checkIn: CHECK_IN,
+        checkOut: CHECK_OUT,
+        requestToken: requestToken(),
+        rooms: [
+          { hotelRoomTypeId: s.real.roomType.id, groups: [group(s.direct, 1)], notes: sensitive },
+        ],
+        dissolve: [],
+      },
+      s.admin,
+    );
+    const foreignRoomId = foreign.rooms[0]!.sharedRoomId;
+
+    const wbA = await getSharedRoomWorkbench({ hotelId: s.real.hotel.id }, CHECK_IN, CHECK_OUT, undefined, {
+      agentScope: await scopeOf(s.A.agentId),
+    });
+    const ids = wbA.sharedRooms.map((r) => r.sharedRoomId);
+    expect(ids).toContain(s.mixedRoomId);
+    expect(ids).not.toContain(foreignRoomId);
+    expect(wbA.sharedRooms.find((r) => r.sharedRoomId === s.mixedRoomId)!.notes).toBeNull();
+    const jsonA = JSON.stringify(wbA);
+    expect(jsonA.includes(sensitive)).toBe(false);
+    expect(jsonA.includes(s.b1.orderNumber)).toBe(false);
+    expect(jsonA.includes(s.direct.orderNumber)).toBe(false);
+
+    // ADMIN 回归：两间房都在，备注原样
+    const wbAdmin = await getSharedRoomWorkbench({ hotelId: s.real.hotel.id }, CHECK_IN, CHECK_OUT);
+    const adminIds = wbAdmin.sharedRooms.map((r) => r.sharedRoomId);
+    expect(adminIds).toContain(s.mixedRoomId);
+    expect(adminIds).toContain(foreignRoomId);
+    for (const r of wbAdmin.sharedRooms) expect(r.notes).toBe(sensitive);
+  });
 });
 
 describe('代理自助拼房 · 越界一律 403，库不动', () => {
