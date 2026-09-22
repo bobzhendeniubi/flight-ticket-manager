@@ -21,6 +21,7 @@ import {
 } from '../lib/api';
 import { bedPrefLabel, upgradeRedeemLegLabel } from '../components/PassengerPrefChips';
 import type { TravelerProfileLinkState } from '../lib/travelerProfileLink';
+import { orderStatusLabel } from '../lib/orderStatus';
 import { exportToCSV } from '../lib/csvExport';
 import { formatDateTimeSecCn } from '../lib/datetime';
 import { useAuth } from '../stores/auth';
@@ -162,7 +163,11 @@ export function TravelerProfilesView() {
   // 「去核销」深链带的单号：档案 id 已知走 ?orderId=（订单 id 不敏感），只有证件号时走 state（同 doc）。
   const orderIdParam = searchParams.get('orderId')?.trim() ?? '';
   const orderIdFromState = linkState?.orderId?.trim() ?? '';
-  const initialOrderId = orderIdParam || orderIdFromState || undefined;
+  // 命中的深链单号存成抽屉上下文 state（而非每次从 URL/Link state 现算）：证件号那条路径命中后
+  // 会立刻清掉 Link state 走异步档案解析，若还现算 orderIdFromState，解析回来时它已经被清空了
+  // （F7：抽屉展开时 initialOrderId 早变 undefined，自动预选失效）。关抽屉才清这份上下文。
+  const [drawerOrderId, setDrawerOrderId] = useState<string | undefined>(undefined);
+  const initialOrderId = drawerOrderId;
   const [docLookupHint, setDocLookupHint] = useState<string | null>(null);
 
   /**
@@ -185,7 +190,9 @@ export function TravelerProfilesView() {
   useEffect(() => {
     if (!profileParam) return;
     setSelectedId(profileParam);
+    setDrawerOrderId(orderIdParam || undefined);
     setDocLookupHint(null);
+    // eslint-disable-next-line react-hooks/exhaustive-deps -- orderIdParam 只在 profileParam 一起变化时才需要重算，同原逻辑
   }, [profileParam]);
 
   useEffect(() => {
@@ -202,8 +209,11 @@ export function TravelerProfilesView() {
         if (cancelled) return;
         // 没建档的证件号后端会给一行现算兜底（profileId 为空串），那种不算命中
         const hit = r.results.find((x) => x.profileId);
-        if (hit) setSelectedId(hit.profileId);
-        else {
+        if (hit) {
+          setSelectedId(hit.profileId);
+          // 命中当次就把单号定格进抽屉上下文——下一行清 Link state 之后 orderIdFromState 就读不到了
+          setDrawerOrderId(orderIdFromState || undefined);
+        } else {
           setSearch(docFromState);
           setDocLookupHint('没有这个证件号的档案');
         }
@@ -379,7 +389,7 @@ export function TravelerProfilesView() {
             <textarea
               className="input"
               rows={2}
-              placeholder={'如 CHAN / 陈文豪 / E1234\n可一次贴多个姓名/证件号，换行、逗号、空格分隔都行'}
+              placeholder={'如 CHAN / 陈文豪 / E1234\n可一次贴多个姓名/证件号，换行、逗号、空格分隔都行（一次最多 50 个）'}
               value={search}
               onChange={(e) => {
                 setSearch(e.target.value);
@@ -437,7 +447,7 @@ export function TravelerProfilesView() {
                     <td>
                       <button
                         className="font-medium text-ink hover:text-brand"
-                        onClick={() => setSelectedId(p.id)}
+                        onClick={() => { setSelectedId(p.id); setDrawerOrderId(undefined); }}
                       >
                         {p.fullName}
                       </button>
@@ -496,7 +506,7 @@ export function TravelerProfilesView() {
                     <td className="text-right">
                       <button
                         className="text-xs font-medium text-brand hover:text-brand-dark"
-                        onClick={() => setSelectedId(p.id)}
+                        onClick={() => { setSelectedId(p.id); setDrawerOrderId(undefined); }}
                       >
                         详情
                       </button>
@@ -541,15 +551,18 @@ export function TravelerProfilesView() {
           initialOrderId={initialOrderId}
           onClose={() => {
             setSelectedId(null);
+            setDrawerOrderId(undefined);
             clearLinkContext();
           }}
           onMerged={() => {
             setSelectedId(null);
+            setDrawerOrderId(undefined);
             clearLinkContext();
             setReloadNonce((n) => n + 1);
           }}
           onSearchCompanion={(doc) => {
             setSelectedId(null);
+            setDrawerOrderId(undefined);
             clearLinkContext();
             setSearch(doc);
           }}
@@ -997,7 +1010,7 @@ function RedemptionsSection({
   onChanged,
 }: {
   profile: TravelerProfile;
-  /** 档案出行记录：给「用于哪张单」下拉筛已付款且未飞的候选 */
+  /** 档案出行记录：给「用于哪张单」下拉筛已付款族（含已飞）的候选 */
   trips: TravelerProfileTrip[];
   redemptions: TravelerBenefitRedemption[];
   /** 从订单页/提醒中心「去核销」带过来的单号（可选）：打开时自动展开表单并预选（命中候选时） */
@@ -1016,6 +1029,8 @@ function RedemptionsSection({
   const [submitting, setSubmitting] = useState(false);
   const [reversingId, setReversingId] = useState<string | null>(null);
   const [opError, setOpError] = useState<string | null>(null);
+  // 深链目标单不在候选里时的原因提示（如「该单当前状态待支付，不能挂核销」），不静默退成不挂单
+  const [initialOrderMismatch, setInitialOrderMismatch] = useState<string | null>(null);
 
   // 已被冲正的原条目 id 集合（冲正条目的 reversalOfId 指回原条目）
   const reversedIds = useMemo(
@@ -1023,10 +1038,10 @@ function RedemptionsSection({
     [redemptions],
   );
 
-  // 「用于哪张单」候选：已付款（PAID_ORDER_STATUSES）且去程还没起飞（!flown）的出行记录。
-  // no-show 的行程 flown 也是 false——仍算「未飞」候选，运营自己判断挂不挂。
+  // 「用于哪张单」候选口径与后端挂单闸一致：已付款族（PAID_ORDER_STATUSES），不要求未飞——
+  // 起飞后才提醒去核销的规则会把已飞的单也带过来，候选里排掉它就永远选不中、只能不挂单提交。
   const eligibleTrips = useMemo(
-    () => trips.filter((t) => !t.flown && PAID_ORDER_STATUSES.has(t.status)),
+    () => trips.filter((t) => PAID_ORDER_STATUSES.has(t.status)),
     [trips],
   );
 
@@ -1038,8 +1053,17 @@ function RedemptionsSection({
     setFormOpen(true);
     if (eligibleTrips.some((t) => t.orderId === initialOrderId)) {
       setOrderId(initialOrderId);
+      setInitialOrderMismatch(null);
+      return;
     }
-  }, [initialOrderId, eligibleTrips]);
+    // 候选里没有这张单：说清原因（单存在但状态不对 / 单根本不在本档案名下），别让运营以为是自己没选
+    const target = trips.find((t) => t.orderId === initialOrderId);
+    setInitialOrderMismatch(
+      target
+        ? `该单当前状态「${orderStatusLabel(target.status)}」，不能挂核销，请确认后手动选择其他单号`
+        : '没在本档案的出行记录里找到这张单，请手动选择或不挂单号提交',
+    );
+  }, [initialOrderId, eligibleTrips, trips]);
 
   const resetForm = () => {
     setFormOpen(false);
@@ -1048,6 +1072,7 @@ function RedemptionsSection({
     setNote('');
     setOrderId('');
     setOpError(null);
+    setInitialOrderMismatch(null);
   };
 
   const submitRedeem = async () => {
@@ -1134,18 +1159,28 @@ function RedemptionsSection({
         <div className="mb-2 space-y-2 rounded border border-slate-200 p-3">
           <div>
             <label className="label text-xs">用于哪张单（选填）</label>
-            <select className="input text-sm" value={orderId} onChange={(e) => setOrderId(e.target.value)}>
+            <select
+              className="input text-sm"
+              value={orderId}
+              onChange={(e) => {
+                setOrderId(e.target.value);
+                setInitialOrderMismatch(null);
+              }}
+            >
               <option value="">不挂单号（存量 / 手动核销）</option>
               {eligibleTrips.map((t) => (
                 <option key={t.orderId} value={t.orderId}>
-                  {t.orderNumber} · 出发 {fmtDate(t.departAt)}
+                  {t.orderNumber} · {t.flown ? '已飞' : '未飞'} · 出发 {fmtDate(t.departAt)}
                   {t.flightNumbers.length > 0 ? ` · ${t.flightNumbers.join('/')}` : ''}
                 </option>
               ))}
             </select>
             <p className="mt-1 text-[10px] text-ink-muted">
-              只列已付款且还没起飞的订单；挂了单号后，这张单取消/退款会自动冲正这条核销。
+              只列已付款的订单（含已飞）；挂了单号后，这张单取消/退款会自动冲正这条核销。
             </p>
+            {initialOrderMismatch && (
+              <p className="mt-1 text-[10px] text-amber-600">{initialOrderMismatch}</p>
+            )}
           </div>
           <div className="grid grid-cols-3 gap-2">
             <div>

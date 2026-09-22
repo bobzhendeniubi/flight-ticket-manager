@@ -28,8 +28,33 @@ export type UpdateTravelerBody = z.infer<typeof updateTravelerBodySchema>;
 
 // ── 旅客档案（TravelerProfile，按证件号聚合的常旅客画像）──
 
+/**
+ * 多人搜索 term 分隔符，口径需与 traveler-profiles.service.ts 的 SEARCH_TERM_SPLIT_RE 保持一致。
+ * 这里只在 schema 层数一下 term 个数做上限校验，不在这里做真正的搜索过滤（那是 service 的事）；
+ * 特意不从 service.ts 引入函数——service.ts 会连带拉进 prisma/聚合等重依赖，schema 应保持轻量可单测。
+ */
+const SEARCH_TERM_SPLIT_RE = /[,，、;；\s]+/u;
+/** 一次搜索最多允许的 term 数：超出这个数基本是误粘/滥用，提前给清楚的中文提示 */
+const MAX_SEARCH_TERMS = 50;
+
+function countSearchTerms(raw: string): number {
+  return raw
+    .split(SEARCH_TERM_SPLIT_RE)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0).length;
+}
+
 export const listTravelerProfilesQuerySchema = z.object({
-  search: z.string().max(120).optional(), // 姓名/中文名/证件号
+  // 姓名/中文名/证件号，可一次贴多个（换行/逗号/分号分隔）。上限从 120 提到 2000——
+  // 13 个九位护照号加换行就有 129 字符，120 的老上限连正常多人搜索都装不下；
+  // 真正防滥用靠下面的 term 数上限，不是靠总字符数。
+  search: z
+    .string()
+    .max(2000)
+    .optional()
+    .refine((v) => !v || countSearchTerms(v) <= MAX_SEARCH_TERMS, {
+      message: `一次最多搜索 ${MAX_SEARCH_TERMS} 个姓名/证件号，请分批粘贴`,
+    }),
   sort: z.enum(['lastTripAt', 'nextTripAt', 'tripCount', 'totalSpendCny']).default('lastTripAt'),
   order: z.enum(['asc', 'desc']).default('desc'),
   minTrips: z.coerce.number().int().min(0).optional(),
