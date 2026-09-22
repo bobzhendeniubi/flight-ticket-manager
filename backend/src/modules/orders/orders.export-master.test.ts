@@ -13,6 +13,13 @@ import { describe, it, expect, vi } from 'vitest';
 
 // 模块链路（orders.export-master → orders.service）顶层引用 prisma —— mock 掉
 vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
+// 链解析必须走 travelers/traveler-profile-alias 的共享实现（不再各自实现一份）：包一层 spy 便于断言
+const { resolveMasterRefSpy } = vi.hoisted(() => ({ resolveMasterRefSpy: vi.fn() }));
+vi.mock('../travelers/traveler-profile-alias.js', async (importOriginal) => {
+  const mod = await importOriginal<typeof import('../travelers/traveler-profile-alias.js')>();
+  resolveMasterRefSpy.mockImplementation(mod.resolveMasterRef);
+  return { ...mod, resolveMasterRef: resolveMasterRefSpy };
+});
 
 import {
   orderToMasterRows,
@@ -1063,8 +1070,8 @@ describe('loadTripCountMap', () => {
     expect(redemptionCall.profileId.in).toEqual(['tp-master']);
   });
 
-  it('合并链（脏数据：指针→指针→主）→ 跟到最终主档案', async () => {
-    const { client } = fakeClient([
+  it('合并链 P1→P2→P3（两次合法合并）→ 跟到最终主档案；链解析走 travelers/traveler-profile-alias 的共享实现', async () => {
+    const { client, calls } = fakeClient([
       profile({ id: 'tp-a', documentNumber: 'E00000001', tripCount: 1, mergedIntoId: 'tp-b' }),
       profile({ id: 'tp-b', documentNumber: 'E00000002', tripCount: 3, mergedIntoId: 'tp-c' }),
       profile({ id: 'tp-c', documentNumber: 'E00000003', tripCount: 9 }),
@@ -1074,6 +1081,25 @@ describe('loadTripCountMap', () => {
       client as never,
     );
     expect(tripStats.get(docKey('PASSPORT', 'E00000001'))?.tripCount).toBe(9);
+    // 每跳一条 id in 补拉：证件查询 + 拉 tp-b + 拉 tp-c + 核销 groupBy
+    expect(calls).toHaveLength(4);
+    expect(resolveMasterRefSpy).toHaveBeenCalled();
+  });
+
+  it('合并链深于旧上限（5 跳）仍跟到最终主档案，不停在残值', async () => {
+    const { client } = fakeClient([
+      profile({ id: 'tp-1', documentNumber: 'E00000001', tripCount: 1, mergedIntoId: 'tp-2' }),
+      profile({ id: 'tp-2', documentNumber: 'E00000002', tripCount: 2, mergedIntoId: 'tp-3' }),
+      profile({ id: 'tp-3', documentNumber: 'E00000003', tripCount: 3, mergedIntoId: 'tp-4' }),
+      profile({ id: 'tp-4', documentNumber: 'E00000004', tripCount: 4, mergedIntoId: 'tp-5' }),
+      profile({ id: 'tp-5', documentNumber: 'E00000005', tripCount: 5, mergedIntoId: 'tp-6' }),
+      profile({ id: 'tp-6', documentNumber: 'E00000006', tripCount: 60 }),
+    ]);
+    const { tripStats } = await loadTripCountMap(
+      [{ documentType: 'PASSPORT', documentNumber: 'E00000001' }],
+      client as never,
+    );
+    expect(tripStats.get(docKey('PASSPORT', 'E00000001'))?.tripCount).toBe(60);
   });
 
   it('环（脏数据：a→b→a）→ 停在当前行，不死循环', async () => {
@@ -1176,6 +1202,10 @@ describe('bootstrapTripCountProfilesIfEmpty', () => {
 
     expect(countFn).toHaveBeenCalledTimes(1);
     expect(aggregateFn).toHaveBeenCalledTimes(1);
+    // 过期判定只看 canonical 行：指针行永远是旧值，不排除的话 _min 在重建后也不会前进
+    expect(aggregateFn).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { mergedIntoId: null }, _min: { refreshedAt: true } }),
+    );
     expect(rebuild).toHaveBeenCalledTimes(1);
   });
 
@@ -1187,7 +1217,9 @@ describe('bootstrapTripCountProfilesIfEmpty', () => {
     await bootstrapTripCountProfilesIfEmpty(2, client as never, rebuild);
 
     expect(countFn).toHaveBeenCalledTimes(1);
-    expect(aggregateFn).toHaveBeenCalledTimes(1);
+    expect(aggregateFn).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { mergedIntoId: null }, _min: { refreshedAt: true } }),
+    );
     expect(rebuild).not.toHaveBeenCalled();
   });
 

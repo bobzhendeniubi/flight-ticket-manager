@@ -9,15 +9,18 @@
  * 补偿行照抄 benefit / orderId）只有这一份口径，人工冲正（TravelerBenefitsService.reverse）
  * 与自动冲正必须长得一样；orders.service 只负责在状态机出口喊一声。
  *
- * 拆单：no-show / 取消常常先把几位客人拆到新单再操作，核销却挂在**源单**上。这里顺带认
- * 「源单上的核销 + 该档案的证件出现在本单乘客里」这一层（OrderSplitRecord 一跳），
- * 拆了两次以上的链不追（见遗留风险）。
+ * 拆单：no-show / 取消常常先把几位客人拆到新单再操作，核销却挂在**源单**上。候选因此包含
+ * 「本单的直接源单上挂的核销」，再按「该档案的证件出现在本单乘客里」收窄（留在源单上照常飞的
+ * 客人不连坐）。
  *
- * 冲正与否跟着**旅客当前承载的行程**走，不是只看核销挂的单号（评审 F1）：
- *   核销挂 A 的客人 P 被拆到 B，B 照常出行，之后运营取消 A 里留下的其他人 —— A 的核销
- *   全部冲正的话，P 行程没少却白拿回 N 次。所以每条候选先问一句「这个人（档案全部证件，
- *   合并链任意深度）此刻是否还在别的有效已付款单上有行程」：有 → 不冲正，只写一条 INFO 审计
- *   BENEFIT_REDEMPTION_AUTO_REVERSE_SKIPPED；没有 → 冲正。判定口径见 findCarriedOrderIdsByDoc。
+ * 冲正与否跟着**同一趟行程**走，不是只看核销挂的单号（评审 F1 / 第二轮 N1、N2）：
+ *   核销挂 A 的客人 P 被拆到 B（或再拆到 C），B / C 照常出行，之后运营取消 A 里留下的其他人 ——
+ *   A 的核销全部冲正的话，P 行程没少却白拿回 N 次。所以每条候选先问一句「这个人（档案全部证件，
+ *   合并链任意深度）是否还在**同一拆单谱系**的别的有效已付款单上」：有 → 不冲正，写 WARNING 审计
+ *   BENEFIT_REDEMPTION_AUTO_REVERSE_SKIPPED + 一条「请核对」待办；没有 → 冲正。
+ *   谱系 = 沿 OrderSplitRecord 源单↔目标单**双向传递闭包**（任意跳数）；谱系外的单一律不算 ——
+ *   客人另订的无关行程有自己的核销额度，这次核销对应的那趟行程没了就该补回，否则规则 12 在
+ *   那张无关单起飞后还会再催一次核销（双扣）。判定口径见 findCarriedOrderIdsByDoc。
  *
  * 并发：补偿行走 createMany(skipDuplicates) —— reversalOfId 唯一索引撞上人工冲正时
  * ON CONFLICT DO NOTHING，**不会**把整个取消事务打成 aborted（Postgres 里一条失败语句
@@ -49,10 +52,14 @@ export const BENEFIT_AUTO_REVERSAL_ACTOR_ID = 'system-benefit-auto-reversal';
 /** 自动冲正行的操作人姓名快照（产品里可见的文案）。 */
 export const BENEFIT_AUTO_REVERSAL_ACTOR_NAME = '系统自动';
 export const BENEFIT_AUTO_REVERSED_AUDIT_ACTION = 'BENEFIT_REDEMPTION_AUTO_REVERSED';
-/** 「核销挂的单已取消 / no-show，但旅客仍有有效行程，未补回」的 INFO 审计。 */
+/** 「核销挂的单已取消 / no-show，但旅客仍在同谱系行程上，未补回」的 WARNING 审计。 */
 export const BENEFIT_AUTO_REVERSE_SKIPPED_AUDIT_ACTION = 'BENEFIT_REDEMPTION_AUTO_REVERSE_SKIPPED';
 /** 自动冲正待办的 ruleKey 前缀：`BENEFITREV:{补偿行 id}`（一条补偿行一条待办，幂等）。 */
 export const BENEFIT_AUTO_REVERSAL_REMINDER_PREFIX = 'BENEFITREV:';
+/** 「未补回，请核对」待办的 ruleKey 前缀：`BENEFITSKIP:{核销行 id}`（一条核销行一条待办，幂等）。 */
+export const BENEFIT_AUTO_REVERSE_SKIPPED_REMINDER_PREFIX = 'BENEFITSKIP:';
+/** 谱系闭包最多追的跳数（每跳一条查询）；正常数据两三跳即止，这只是脏数据 / 极端链的兜底。 */
+const MAX_SPLIT_LINEAGE_HOPS = 16;
 
 export interface AutoReverseRedemptionsInput {
   /** 触发事件的那张单（取消 / 退款 / no-show 的目标单）。 */
@@ -124,6 +131,8 @@ interface AutoReverseDelegates {
 /** 「仍有有效行程」判定要读的订单形状（状态 + 乘客证件 + 航段班次时刻 / no-show 标）。 */
 type CarriedOrderRow = {
   id: string;
+  /** 老 mock 的假行可能没有单号：待办正文按 id 兜底。 */
+  orderNumber?: string;
   status: string;
   passengers: Array<{ documentType: string; documentNumber: string }>;
   items: Array<{
@@ -193,18 +202,20 @@ export async function autoReverseRedemptionsForOrderWithinTx(
     input.orderId,
     candidates,
     sourceOrderIds,
-    at,
   );
-  // 仍有有效行程的：不冲正，只留一条 INFO 审计（运营核对时能看到系统为什么没补回）
-  if (skipped.length > 0 && typeof delegates.auditLog?.create === 'function') {
-    for (const { candidate: row, carriedByOrderIds } of skipped) {
+  // 仍在同谱系行程上的：不冲正，写 WARNING 审计 + 一条「请核对」待办（第二轮 N3：只留 INFO 审计
+  // 运营在审计页默认筛不到、档案页也不展示，客人投诉才是唯一发现渠道）
+  for (const { candidate: row, carriedBy } of skipped) {
+    const carriedByOrderIds = carriedBy.map((o) => o.id);
+    const carriedByOrderNumbers = carriedBy.map((o) => o.orderNumber);
+    if (typeof delegates.auditLog?.create === 'function') {
       await writeAuditWithinTx(tx, {
         actor: { label: BENEFIT_AUTO_REVERSAL_ACTOR_NAME, role: 'SYSTEM' },
         action: BENEFIT_AUTO_REVERSE_SKIPPED_AUDIT_ACTION,
         targetType: AuditTargetType.TRAVELER,
         targetId: row.profileId,
         targetLabel: row.profile.fullName,
-        severity: AuditSeverity.INFO,
+        severity: AuditSeverity.WARNING,
         before: {
           redemptionId: row.id,
           tripsUsed: row.tripsUsed,
@@ -216,8 +227,20 @@ export async function autoReverseRedemptionsForOrderWithinTx(
           triggerOrderId: input.orderId,
           triggerOrderNumber: input.orderNumber,
           carriedByOrderIds,
-          note: '核销挂单已取消 / no-show，但旅客仍有有效行程，未补回',
+          carriedByOrderNumbers,
+          note: '核销挂单已取消 / no-show，但旅客仍在同谱系行程上，未补回',
         },
+      });
+    }
+    if (input.reminderCreatedById) {
+      await createSkippedReminder(delegates, {
+        createdById: input.reminderCreatedById,
+        orderId: input.orderId,
+        orderNumber: input.orderNumber,
+        reason: input.reason,
+        at,
+        candidate: row,
+        carriedByOrderNumbers,
       });
     }
   }
@@ -307,18 +330,22 @@ export async function autoReverseRedemptionsForOrderWithinTx(
   return results;
 }
 
-/** 候选 → 冲正 / 跳过（仍有有效行程，附承载行程的单号）。 */
+/** 承载着行程的那张单（审计记 id，待办正文记单号）。 */
+type CarriedOrder = { id: string; orderNumber: string };
+
+/** 候选 → 冲正 / 跳过（仍在同谱系行程上，附承载行程的单）。 */
 interface CandidateDecision {
   toReverse: RedemptionCandidate[];
-  skipped: Array<{ candidate: RedemptionCandidate; carriedByOrderIds: string[] }>;
+  skipped: Array<{ candidate: RedemptionCandidate; carriedBy: CarriedOrder[] }>;
 }
 
 /**
  * 两道收窄：
- *   1. 拆单一跳：挂在源单（拆单前）上的核销，只认「该档案的证件出现在本单乘客里」的那几条 ——
+ *   1. 拆单：挂在直接源单（拆单前）上的核销，只认「该档案的证件出现在本单乘客里」的那几条 ——
  *      留在源单上的客人照常飞，他们的核销不该被拆出去的那张单连坐；挂在本单上的直接进第二道。
- *   2. 仍有有效行程（评审 F1）：不论挂本单还是源单，该档案（全部证件）此刻若还在**别的**有效
- *      已付款单上承载着行程，就不冲正 —— 拆到 B 照常出行的客人，A 取消时不能给他补回次数。
+ *   2. 仍在同谱系行程上（评审 F1 / N1 / N2）：不论挂本单还是源单，该档案（全部证件）若还在
+ *      **同一拆单谱系**的别的有效已付款单上，就不冲正 —— 拆到 B / C 照常出行的客人，A 取消时
+ *      不能给他补回次数。直挂本单且本单没有任何拆单记录的候选，谱系为空 → 无条件冲正。
  * 档案证件 = 主档案本证 + 合并链上全部旧证（任意深度，防环），与 getDetail / resolveDocPairs 同一套解析。
  */
 async function decideCandidates(
@@ -326,7 +353,6 @@ async function decideCandidates(
   orderId: string,
   candidates: RedemptionCandidate[],
   sourceOrderIds: string[],
-  at: Date,
 ): Promise<CandidateDecision> {
   const docsByProfile = await loadCandidateDocs(delegates, candidates);
 
@@ -354,17 +380,22 @@ async function decideCandidates(
     narrowed,
     docsByProfile,
     sourceOrderIds,
-    at,
   );
   const toReverse: RedemptionCandidate[] = [];
   const skipped: CandidateDecision['skipped'] = [];
   for (const c of narrowed) {
-    const carried = new Set<string>();
+    const carried = new Map<string, CarriedOrder>();
     for (const d of docsByProfile.get(c.profileId) ?? []) {
-      for (const id of carriedByDoc.get(d) ?? []) carried.add(id);
+      for (const o of carriedByDoc.get(d) ?? []) carried.set(o.id, o);
     }
-    if (carried.size > 0) skipped.push({ candidate: c, carriedByOrderIds: [...carried].sort() });
-    else toReverse.push(c);
+    if (carried.size > 0) {
+      skipped.push({
+        candidate: c,
+        carriedBy: [...carried.values()].sort((a, b) => (a.id < b.id ? -1 : a.id > b.id ? 1 : 0)),
+      });
+    } else {
+      toReverse.push(c);
+    }
   }
   return { toReverse, skipped };
 }
@@ -410,16 +441,50 @@ async function loadCandidateDocs(
 }
 
 /**
- * 「仍有有效行程」的判定（评审 F1）：证件 key → 承载着行程的订单 id。
+ * 拆单谱系：从种子单出发，沿 OrderSplitRecord 源单↔目标单**双向**做传递闭包（BFS，每跳一条查询，
+ * 已访问集合防环）。A→B→C 两次拆分后，从 A / B / C 任一张出发都能拿到 {A, B, C}。
+ * 返回值含种子单本身；老 mock 没有 delegate 时只有种子。
+ */
+async function loadSplitLineage(
+  delegates: AutoReverseDelegates,
+  seedOrderIds: readonly string[],
+): Promise<Set<string>> {
+  const visited = new Set<string>(seedOrderIds);
+  if (typeof delegates.orderSplitRecord?.findMany !== 'function') return visited;
+  let frontier = [...visited];
+  for (let hop = 0; hop < MAX_SPLIT_LINEAGE_HOPS && frontier.length > 0; hop += 1) {
+    const edges =
+      (await delegates.orderSplitRecord.findMany({
+        where: {
+          OR: [{ sourceOrderId: { in: frontier } }, { targetOrderId: { in: frontier } }],
+        },
+        select: { sourceOrderId: true, targetOrderId: true },
+      })) ?? [];
+    const next: string[] = [];
+    for (const e of edges) {
+      for (const id of [e.sourceOrderId, e.targetOrderId]) {
+        if (!id || visited.has(id)) continue;
+        visited.add(id);
+        next.push(id);
+      }
+    }
+    frontier = next;
+  }
+  return visited;
+}
+
+/**
+ * 「仍在同谱系行程上」的判定（评审 F1 / 第二轮 N1、N2）：证件 key → 承载着行程的订单。
  *
- * 有效 = 未软删、状态在已付款在订集（countsAsPaidUpcoming：PAID/PROCESSING/TICKETED/COMPLETED/
- * CHANGE_REQUESTED/CHANGED，与可用次数口径同一份）、**不是触发单本身**（触发单正在落终态 /
- * 刚打了 no-show 标，事务内可能还没写回状态）。
- * 承载行程 = 满足其一：
- *   a. 去程尚未起飞（班次时刻 > 现在）且没打 no-show 标 —— 这次核销的额度会被那趟行程用掉；
- *   b. 该单与核销挂的单同属一条拆单链（源单 / 一跳目标单）且没打 no-show 标 —— 拆出去的那张单
- *      就是核销时的同一趟行程，哪怕已经飞了也是「行程没少」（评审的原始反例正是 B 已正常出行）。
- * 老 mock 没有 order delegate 时视为没有有效行程（行为同改造前，只影响 mock）。
+ * 谱系 = 触发单 + 候选挂的单 + 本单的直接源单，沿拆单记录双向传递闭包（loadSplitLineage）；
+ * **触发单本身除外**（它正在落终态 / 刚打了 no-show 标，事务内可能还没写回状态）。
+ * 承载 = 谱系内的单同时满足：未软删、状态在已付款在订集（countsAsPaidUpcoming：PAID/PROCESSING/
+ * TICKETED/COMPLETED/CHANGE_REQUESTED/CHANGED，与可用次数口径同一份）、该档案的证件在其乘客里、
+ * 去程没打 no-show 标 —— **已飞与否不看**：拆出去的那张单就是核销时的同一趟行程，飞了正说明
+ * 「行程没少」（评审的原始反例正是 B 已正常出行）。
+ * 谱系外的单一律不算：客人另订的无关行程有自己的核销额度，这次核销对应的行程没了就该补回。
+ * 谱系为空（直挂本单、从没拆过单）→ 不查订单，直接视为没有承载 → 无条件冲正。
+ * 老 mock 没有 order delegate 时同样视为没有承载（行为同改造前，只影响 mock）。
  */
 async function findCarriedOrderIdsByDoc(
   delegates: AutoReverseDelegates,
@@ -427,9 +492,8 @@ async function findCarriedOrderIdsByDoc(
   candidates: RedemptionCandidate[],
   docsByProfile: Map<string, Set<string>>,
   sourceOrderIds: string[],
-  at: Date,
-): Promise<Map<string, string[]>> {
-  const out = new Map<string, string[]>();
+): Promise<Map<string, CarriedOrder[]>> {
+  const out = new Map<string, CarriedOrder[]>();
   if (typeof delegates.order?.findMany !== 'function') return out;
 
   const docFilters: Array<{ documentType: string; documentNumber: string }> = [];
@@ -444,26 +508,17 @@ async function findCarriedOrderIdsByDoc(
   }
   if (docFilters.length === 0) return out;
 
-  // 拆单谱系一跳：本单的源单 + 候选挂的单 + 这些单拆出去的目标单。候选挂的单**包含本单**：
-  // 触发单 = A 本身时，从 A 拆出去的 B 正是「客人现在所在的同一趟行程」（评审的原始反例）。
-  const candidateOrderIds = [
-    ...new Set(candidates.map((c) => c.orderId).filter((id): id is string => !!id)),
-  ];
-  const lineage = new Set<string>([...sourceOrderIds, ...candidateOrderIds]);
-  if (candidateOrderIds.length > 0 && typeof delegates.orderSplitRecord?.findMany === 'function') {
-    const targets =
-      (await delegates.orderSplitRecord.findMany({
-        where: { sourceOrderId: { in: candidateOrderIds } },
-        select: { targetOrderId: true },
-      })) ?? [];
-    for (const t of targets) if (t.targetOrderId) lineage.add(t.targetOrderId);
-  }
+  const candidateOrderIds = candidates
+    .map((c) => c.orderId)
+    .filter((id): id is string => !!id);
+  const lineage = await loadSplitLineage(delegates, [orderId, ...sourceOrderIds, ...candidateOrderIds]);
   lineage.delete(orderId);
+  if (lineage.size === 0) return out;
 
   const rows =
     (await delegates.order.findMany({
       where: {
-        id: { not: orderId },
+        id: { in: [...lineage] },
         deletedAt: null,
         status: { notIn: EXCLUDED_ORDER_STATUSES },
         passengers: {
@@ -477,6 +532,7 @@ async function findCarriedOrderIdsByDoc(
       },
       select: {
         id: true,
+        orderNumber: true,
         status: true,
         passengers: { select: { documentType: true, documentNumber: true } },
         items: { select: { metadata: true, flightSchedule: { select: { departureTime: true } } } },
@@ -484,6 +540,7 @@ async function findCarriedOrderIdsByDoc(
     })) ?? [];
 
   for (const order of rows) {
+    if (order.id === orderId) continue; // 假 client 不吃 where 时的兜底：触发单永远不算承载
     if (!countsAsPaidUpcoming(order.status as Parameters<typeof countsAsPaidUpcoming>[0])) continue;
     const legs = order.items
       .filter((i): i is typeof i & { flightSchedule: { departureTime: Date } } =>
@@ -492,17 +549,57 @@ async function findCarriedOrderIdsByDoc(
       .sort((a, b) => a.flightSchedule.departureTime.getTime() - b.flightSchedule.departureTime.getTime());
     const outbound = legs[0] ?? null;
     if (!outbound || hasNoShowMark(outbound.metadata)) continue;
-    const unflown = outbound.flightSchedule.departureTime.getTime() > at.getTime();
-    if (!unflown && !lineage.has(order.id)) continue;
+    const carried: CarriedOrder = { id: order.id, orderNumber: order.orderNumber ?? order.id };
     for (const p of order.passengers) {
       const key = normDoc(p.documentType, p.documentNumber);
       if (!seenDoc.has(key)) continue;
       const list = out.get(key) ?? [];
-      list.push(order.id);
+      list.push(carried);
       out.set(key, list);
     }
   }
   return out;
+}
+
+/** 「未补回，请核对」待办：一条核销行一条，ruleKey 幂等（先查后建，事务内不能 create+catch）。 */
+async function createSkippedReminder(
+  delegates: AutoReverseDelegates,
+  input: {
+    createdById: string;
+    orderId: string;
+    orderNumber: string;
+    reason: string;
+    at: Date;
+    candidate: RedemptionCandidate;
+    carriedByOrderNumbers: string[];
+  },
+): Promise<void> {
+  const reminderDelegate = delegates.operationalReminder;
+  if (
+    typeof reminderDelegate?.findUnique !== 'function' ||
+    typeof reminderDelegate?.create !== 'function'
+  ) {
+    return;
+  }
+  const ruleKey = `${BENEFIT_AUTO_REVERSE_SKIPPED_REMINDER_PREFIX}${input.candidate.id}`;
+  const existing = await reminderDelegate.findUnique({ where: { ruleKey }, select: { id: true } });
+  if (existing) return;
+  const { candidate } = input;
+  await reminderDelegate.create({
+    data: {
+      orderId: input.orderId,
+      createdById: input.createdById,
+      title: `【核销未补回·请核对】${input.orderNumber} ${candidate.profile.fullName} ${candidate.tripsUsed} 次`,
+      body:
+        `${input.reason}，该单挂的权益核销「${candidate.benefit}」（${candidate.tripsUsed} 次）**未**自动补回：` +
+        `旅客仍在同一拆单谱系的有效行程上（订单 ${input.carriedByOrderNumbers.join('、')}），` +
+        `这次核销按那趟行程照常享受。请核对是否属实；若客人实际未出行，请到常旅客档案人工冲正。`,
+      dueAt: new Date(`${businessDateISO(input.at)}T00:00:00Z`),
+      priority: ReminderPriority.HIGH,
+      ruleKey,
+    },
+    select: { id: true },
+  });
 }
 
 /** 给运营的待办：一条补偿行一条，ruleKey 幂等（先查后建，事务内不能 create+catch）。 */

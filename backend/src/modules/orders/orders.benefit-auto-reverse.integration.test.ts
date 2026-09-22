@@ -11,10 +11,13 @@
  *      + 审计 BENEFIT_REDEMPTION_AUTO_REVERSED + 一条待办；档案可用次数回到 0（不是 −1）
  *   3. 幂等：同单再次落取消族终态不会二次冲正
  *   4. 挂待支付单被 400 REDEMPTION_ORDER_MISMATCH 拒绝，不写流水
- *   5. 拆单后取消源单不补回（客人在拆出去的单上照常出行；INFO 审计 SKIPPED）；再取消目标单才补回
+ *   5. 拆单后取消源单不补回（客人在拆出去的单上照常出行；WARNING 审计 SKIPPED + 请核对待办）；
+ *      再取消目标单才补回
  *   6. 拆单后取消目标单补回：核销挂源单、补偿行记触发单 = 目标单
  *   7. no-show 首次打标冲正（去程已关柜的已付款单）
  *   8. 恢复占位：按触发单找到「本单曾触发的冲正」提示（补偿行挂源单、触发单是目标单）
+ *   9. 直挂本单、没拆过单：客人另有无关的已付款未飞单 D → 取消照常补回（第二轮 N1：谱系外不算承载）
+ *  10. A→B→C 两跳拆单、P 在 C 已飞 → 取消 A 不补回（第二轮 N2：谱系传递闭包）
  *
  * 跑：
  *   1. docker compose -f ../docker-compose.test.yml up -d
@@ -32,6 +35,7 @@ import {
   BENEFIT_AUTO_REVERSAL_REMINDER_PREFIX,
   BENEFIT_AUTO_REVERSED_AUDIT_ACTION,
   BENEFIT_AUTO_REVERSE_SKIPPED_AUDIT_ACTION,
+  BENEFIT_AUTO_REVERSE_SKIPPED_REMINDER_PREFIX,
 } from '../travelers/traveler-benefits.auto-reverse.js';
 
 const orders = new OrderService();
@@ -121,16 +125,17 @@ async function createOrderFor(
   });
 }
 
-/** 两人已付款单（P + Q），一段未来去程 2 座 —— 拆单场景用。 */
-async function createTwoPaxOrder(docP: string, docQ: string) {
-  const schedule = await createSchedule(10 * 24, 2);
+/** 多人已付款单（按证件号列表建乘客），一段未来去程 N 座 —— 拆单场景用。 */
+async function createPaxOrder(docs: string[]) {
+  const schedule = await createSchedule(10 * 24, docs.length);
+  const total = 1000 * docs.length;
   return prisma.order.create({
     data: {
       orderNumber: uniq('TEST-BR2'),
       status: OrderStatus.PAID,
-      subtotal: new Prisma.Decimal(2000),
-      total: new Prisma.Decimal(2000),
-      paidAmount: new Prisma.Decimal(2000),
+      subtotal: new Prisma.Decimal(total),
+      total: new Prisma.Decimal(total),
+      paidAmount: new Prisma.Decimal(total),
       contactName: 'Test User',
       contactPhone: '13800138000',
       items: {
@@ -138,18 +143,38 @@ async function createTwoPaxOrder(docP: string, docQ: string) {
           {
             kind: OrderItemKind.FLIGHT,
             description: '去程（经济舱）',
-            quantity: 2,
+            quantity: docs.length,
             unitPrice: new Prisma.Decimal(1000),
-            amount: new Prisma.Decimal(2000),
-            totalCostCny: new Prisma.Decimal(600),
+            amount: new Prisma.Decimal(total),
+            totalCostCny: new Prisma.Decimal(300 * docs.length),
             flightScheduleId: schedule.id,
             flightCabin: CabinClass.ECONOMY,
           },
         ],
       },
-      passengers: { create: [passengerData('ZHANG SAN', docP), passengerData('LI SI', docQ)] },
+      passengers: {
+        create: docs.map((doc, i) => passengerData(i === 0 ? 'ZHANG SAN' : `PAX ${i}`, doc)),
+      },
     },
     include: { passengers: true },
+  });
+}
+
+/** 两人已付款单（P + Q）。 */
+async function createTwoPaxOrder(docP: string, docQ: string) {
+  return createPaxOrder([docP, docQ]);
+}
+
+/** 把一张单的去程班次改到过去（模拟「已飞」）；同谱系的单共用班次，一起变成已飞。 */
+async function markScheduleFlown(orderId: string, hoursAgo = 24) {
+  const item = await prisma.orderItem.findFirstOrThrow({
+    where: { orderId, flightScheduleId: { not: null } },
+    select: { flightScheduleId: true },
+  });
+  const departureTime = new Date(Date.now() - hoursAgo * 3600_000);
+  await prisma.flightSchedule.update({
+    where: { id: item.flightScheduleId! },
+    data: { departureTime, arrivalTime: new Date(departureTime.getTime() + 90 * 60 * 1000) },
   });
 }
 
@@ -271,7 +296,7 @@ describe('权益核销挂单 → 取消自动冲正（真 DB）', () => {
     expect(await ledgerOf(lookup.profileId)).toHaveLength(0);
   });
 
-  it('拆单后取消源单：P 在 B 上照常出行 → A 上的核销不补回（INFO 审计 SKIPPED）；再取消 B 才补回', async () => {
+  it('拆单后取消源单：P 在 B 上照常出行 → A 上的核销不补回（WARNING 审计 SKIPPED + 请核对待办）；再取消 B 才补回', async () => {
     const admin = await adminActor();
     const { orderA, orderBId, profileId, redemption } = await redeemThenSplitOut(admin);
     expect(redemption.orderId).toBe(orderA.id);
@@ -284,8 +309,18 @@ describe('权益核销挂单 → 取消自动冲正（真 DB）', () => {
       where: { action: BENEFIT_AUTO_REVERSE_SKIPPED_AUDIT_ACTION, targetId: profileId },
     });
     expect(skipped).toHaveLength(1);
-    expect(skipped[0].severity).toBe('INFO');
+    expect(skipped[0].severity).toBe('WARNING');
     expect(skipped[0].after).toMatchObject({ triggerOrderId: orderA.id, carriedByOrderIds: [orderBId] });
+    // 「未补回，请核对」待办：一条核销行一条（BENEFITSKIP:{核销行 id}），正文点名承载行程的 B 单号
+    const orderB = await prisma.order.findUniqueOrThrow({ where: { id: orderBId } });
+    const skipReminder = await prisma.operationalReminder.findUnique({
+      where: { ruleKey: `${BENEFIT_AUTO_REVERSE_SKIPPED_REMINDER_PREFIX}${redemption.id}` },
+    });
+    expect(skipReminder).not.toBeNull();
+    expect(skipReminder!.orderId).toBe(orderA.id);
+    expect(skipReminder!.createdById).toBe(admin.userId);
+    expect(skipReminder!.body).toContain(orderB.orderNumber);
+    expect(skipReminder!.body).toContain('请核对');
     expect(
       await prisma.auditLog.count({ where: { action: BENEFIT_AUTO_REVERSED_AUDIT_ACTION, targetId: profileId } }),
     ).toBe(0);
@@ -381,5 +416,96 @@ describe('权益核销挂单 → 取消自动冲正（真 DB）', () => {
     expect(audit.warnings.some((w) => w.includes('权益核销') && w.includes('不会自动再核销'))).toBe(true);
     // 恢复不自动再核销：台账不变
     expect(await ledgerOf(profileId)).toHaveLength(2);
+  });
+
+  it('直挂本单、没拆过单：客人另有无关的已付款未飞单 D → 取消照常补回（第二轮 N1）', async () => {
+    const admin = await adminActor();
+    const documentNumber = uniq('E');
+    const orderA = await createOrderFor(documentNumber);
+    const orderD = await createOrderFor(documentNumber); // 无关的下一趟，未飞已付
+    const [lookup] = await profiles.lookupByDocuments([{ documentType: 'PASSPORT', documentNumber }]);
+    expect(lookup).toMatchObject({ hasProfile: true, pendingPaidTripCount: 2, availableTrips: 2 });
+    const redeemed = await benefits.redeem(
+      lookup.profileId,
+      { tripsUsed: 1, benefit: '飞满 5 次兑换升舱', orderId: orderA.id },
+      { userId: admin.userId },
+    );
+
+    await orders.updateStatus(orderA.id, OrderStatus.CANCELLED, admin, '集成测试：取消 A', true);
+
+    // D 是谱系外的单：不算承载，A 上的核销照常补回；D 那趟行程的额度不被这次核销占掉
+    const ledger = await ledgerOf(lookup.profileId);
+    expect(ledger).toHaveLength(2);
+    expect(ledger.find((r) => r.tripsUsed < 0)).toMatchObject({
+      tripsUsed: -1,
+      reversalOfId: redeemed.redemption.id,
+      orderId: orderA.id,
+      triggeredByOrderId: orderA.id,
+      createdById: BENEFIT_AUTO_REVERSAL_ACTOR_ID,
+    });
+    expect(
+      await prisma.auditLog.count({ where: { action: BENEFIT_AUTO_REVERSE_SKIPPED_AUDIT_ACTION, targetId: lookup.profileId } }),
+    ).toBe(0);
+    expect(
+      await prisma.operationalReminder.findUnique({
+        where: { ruleKey: `${BENEFIT_AUTO_REVERSE_SKIPPED_REMINDER_PREFIX}${redeemed.redemption.id}` },
+      }),
+    ).toBeNull();
+    // 可用 = 已飞 0 + 已付款在订未飞 1（D）− 已核销 0 = 1
+    const detail = await profiles.getDetail(lookup.profileId);
+    expect(detail.profile).toMatchObject({ pendingPaidTripCount: 1, redeemedTrips: 0, availableTrips: 1 });
+    expect((await prisma.order.findUniqueOrThrow({ where: { id: orderD.id } })).status).toBe(OrderStatus.PAID);
+  });
+
+  it('A→B→C 两跳拆单、P 在 C 已飞 → 取消 A 不补回（第二轮 N2：谱系传递闭包，不止一跳）', async () => {
+    const admin = await adminActor();
+    const docP = uniq('E');
+    const docQ = uniq('E');
+    const docR = uniq('E');
+    const orderA = await createPaxOrder([docP, docQ, docR]);
+    const [lookupP] = await profiles.lookupByDocuments([{ documentType: 'PASSPORT', documentNumber: docP }]);
+    const redeemed = await benefits.redeem(
+      lookupP.profileId,
+      { tripsUsed: 1, benefit: '飞满 5 次兑换升舱', orderId: orderA.id },
+      { userId: admin.userId },
+    );
+    // A(P,Q,R) → B(P,Q) → C(P)：R 留 A，Q 留 B
+    const paxP = orderA.passengers.find((p) => p.documentNumber === docP)!;
+    const paxQ = orderA.passengers.find((p) => p.documentNumber === docQ)!;
+    const splitAB = await orders.splitOrder(
+      orderA.id,
+      { passengerIds: [paxP.id, paxQ.id], requestToken: randomUUID() },
+      { userId: admin.userId, role: UserRole.ADMIN },
+    );
+    const orderBId = splitAB.targetOrderId;
+    const paxPInB = await prisma.passenger.findFirstOrThrow({ where: { orderId: orderBId, documentNumber: docP } });
+    const splitBC = await orders.splitOrder(
+      orderBId,
+      { passengerIds: [paxPInB.id], requestToken: randomUUID() },
+      { userId: admin.userId, role: UserRole.ADMIN },
+    );
+    const orderCId = splitBC.targetOrderId;
+    // C 已正常出行（谱系共用班次，一起变已飞）
+    await markScheduleFlown(orderCId);
+
+    await orders.updateStatus(orderA.id, OrderStatus.CANCELLED, admin, '集成测试：取消 A', true);
+
+    // P 的行程由 C 承载（谱系 A→B→C，两跳）：不补回；B 上只剩 Q，不算 P 的承载
+    expect(await ledgerOf(lookupP.profileId)).toHaveLength(1);
+    const skipped = await prisma.auditLog.findMany({
+      where: { action: BENEFIT_AUTO_REVERSE_SKIPPED_AUDIT_ACTION, targetId: lookupP.profileId },
+    });
+    expect(skipped).toHaveLength(1);
+    expect(skipped[0].severity).toBe('WARNING');
+    expect(skipped[0].after).toMatchObject({ triggerOrderId: orderA.id, carriedByOrderIds: [orderCId] });
+    const orderC = await prisma.order.findUniqueOrThrow({ where: { id: orderCId } });
+    const skipReminder = await prisma.operationalReminder.findUnique({
+      where: { ruleKey: `${BENEFIT_AUTO_REVERSE_SKIPPED_REMINDER_PREFIX}${redeemed.redemption.id}` },
+    });
+    expect(skipReminder).not.toBeNull();
+    expect(skipReminder!.body).toContain(orderC.orderNumber);
+    // 可用 = 已飞 1（C）+ 已付款在订未飞 0 − 已核销 1 = 0，账实相符
+    const detail = await profiles.getDetail(lookupP.profileId);
+    expect(detail.profile).toMatchObject({ tripCount: 1, redeemedTrips: 1, availableTrips: 0 });
   });
 });

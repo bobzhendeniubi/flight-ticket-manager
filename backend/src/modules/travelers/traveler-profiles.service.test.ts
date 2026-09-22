@@ -4,7 +4,7 @@
  *   - 主证件与合并别名证件号按 norm 归拢且不重复计数；
  *   - 详情实时重算回写时，老系统次数仍并入 tripCount；无有效订单的保留档案也刷新次数。
  */
-import { beforeEach, describe, expect, it, vi } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { CabinClass, DocumentType, OrderItemKind, OrderStatus, Prisma } from '@prisma/client';
 
 const prismaMock = vi.hoisted(() => ({
@@ -29,6 +29,9 @@ import {
   addLegacyTripCount,
   loadLegacyTripCounts,
   parseTravelerSearchTerms,
+  REBUILD_RETRY_BACKOFF_MS,
+  resetRebuildStateForTests,
+  SNAPSHOT_STALE_MS,
   sumLegacyTripCounts,
   TravelerProfilesService,
 } from './traveler-profiles.service.js';
@@ -331,6 +334,126 @@ describe('TravelerProfilesService.rebuildAll', () => {
       where: { id: row.id },
       data: expect.objectContaining({ tripCount: 5, legacyTripCount: 2, refreshedAt: expect.any(Date) }),
     });
+  });
+});
+
+describe('TravelerProfilesService.ensureFresh（列表入口）', () => {
+  const baseQuery = { sort: 'lastTripAt' as const, order: 'desc' as const, page: 1, pageSize: 100 };
+  const NOW = new Date('2026-09-21T03:00:00.000Z').getTime();
+
+  beforeEach(() => {
+    resetRebuildStateForTests();
+    vi.useFakeTimers({ toFake: ['Date'], now: NOW });
+    prismaMock.travelerProfile.findMany.mockResolvedValue([]);
+    prismaMock.travelerProfile.count.mockResolvedValue(0);
+  });
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.restoreAllMocks();
+    resetRebuildStateForTests();
+  });
+
+  function staleAggregate() {
+    prismaMock.travelerProfile.aggregate.mockResolvedValue({
+      _count: { _all: 5 },
+      _sum: { tripCount: 50 },
+      _min: { refreshedAt: new Date(NOW - SNAPSHOT_STALE_MS - 60_000) },
+      _max: { refreshedAt: new Date(NOW) },
+    });
+  }
+
+  /** 后台重建走 void + catch：让被拒绝的 promise 的 catch 回调跑完再断言。 */
+  async function flushRejections() {
+    await Promise.resolve();
+    await Promise.resolve();
+    await Promise.resolve();
+  }
+
+  it('过期判定只看 canonical 行：aggregate 带 where mergedIntoId: null 与 _min(refreshedAt)', async () => {
+    prismaMock.travelerProfile.aggregate.mockResolvedValue({
+      _count: { _all: 5 },
+      _sum: { tripCount: 50 },
+      _min: { refreshedAt: new Date(NOW) },
+      _max: { refreshedAt: new Date(NOW) },
+    });
+
+    await new TravelerProfilesService().list({ ...baseQuery });
+
+    expect(prismaMock.travelerProfile.aggregate).toHaveBeenCalledWith(
+      expect.objectContaining({ where: { mergedIntoId: null }, _min: { refreshedAt: true } }),
+    );
+  });
+
+  /** 让真正的 rebuildAll（并发去重 + 成功解除退避）跑，只替换底下的全量重建。 */
+  function spyDoRebuild() {
+    return vi.spyOn(
+      TravelerProfilesService.prototype as unknown as { doRebuildAll: () => Promise<unknown> },
+      'doRebuildAll',
+    );
+  }
+
+  it('后台重建失败 → 写 error 日志，退避期内再访问不重试；退避期过后再试', async () => {
+    staleAggregate();
+    const rebuild = spyDoRebuild().mockRejectedValue(new Error('upsert 撞唯一约束'));
+    const consoleError = vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await new TravelerProfilesService().list({ ...baseQuery });
+    await flushRejections();
+    expect(rebuild).toHaveBeenCalledTimes(1);
+    expect(consoleError).toHaveBeenCalledTimes(1);
+    expect(String(consoleError.mock.calls[0][0])).toContain('重建失败');
+
+    // 退避期内（快照仍过期）：不再触发
+    vi.setSystemTime(NOW + REBUILD_RETRY_BACKOFF_MS - 1000);
+    await new TravelerProfilesService().list({ ...baseQuery });
+    await flushRejections();
+    expect(rebuild).toHaveBeenCalledTimes(1);
+
+    // 退避期过后：再试一次
+    vi.setSystemTime(NOW + REBUILD_RETRY_BACKOFF_MS + 1000);
+    await new TravelerProfilesService().list({ ...baseQuery });
+    await flushRejections();
+    expect(rebuild).toHaveBeenCalledTimes(2);
+  });
+
+  it('退避期内别的路径（导出同步重建）成功一次 → 解除退避，列表下次过期访问照常触发', async () => {
+    staleAggregate();
+    const rebuild = spyDoRebuild()
+      .mockRejectedValueOnce(new Error('boom'))
+      .mockResolvedValue({ built: 1, removed: 0 });
+    vi.spyOn(console, 'error').mockImplementation(() => {});
+
+    await new TravelerProfilesService().list({ ...baseQuery });
+    await flushRejections();
+    expect(rebuild).toHaveBeenCalledTimes(1);
+
+    // 退避期内导出路径直接调 rebuildAll（不吃退避）并成功
+    vi.setSystemTime(NOW + 1000);
+    await expect(new TravelerProfilesService().rebuildAll()).resolves.toEqual({ built: 1, removed: 0 });
+    expect(rebuild).toHaveBeenCalledTimes(2);
+
+    // 仍在原退避窗口内：因上一次成功已解除退避，列表访问照常触发
+    vi.setSystemTime(NOW + 2000);
+    await new TravelerProfilesService().list({ ...baseQuery });
+    await flushRejections();
+    expect(rebuild).toHaveBeenCalledTimes(3);
+  });
+
+  it('并发去重是模块级的：不同 service 实例（路由单例 vs 导出每次 new）共享同一次全量重建', async () => {
+    let finish!: (v: { built: number; removed: number }) => void;
+    const pending = new Promise<{ built: number; removed: number }>((r) => (finish = r));
+    const rebuild = spyDoRebuild().mockReturnValue(pending);
+
+    const fromRoute = new TravelerProfilesService().rebuildAll();
+    const fromExport = new TravelerProfilesService().rebuildAll();
+    expect(rebuild).toHaveBeenCalledTimes(1);
+
+    finish({ built: 3, removed: 0 });
+    await expect(fromRoute).resolves.toEqual({ built: 3, removed: 0 });
+    await expect(fromExport).resolves.toEqual({ built: 3, removed: 0 });
+    // 跑完后再来一次 → 新的一轮
+    await new TravelerProfilesService().rebuildAll();
+    expect(rebuild).toHaveBeenCalledTimes(2);
   });
 });
 

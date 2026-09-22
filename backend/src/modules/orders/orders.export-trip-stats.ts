@@ -42,6 +42,7 @@ import type { DocumentType, PrismaClient } from '@prisma/client';
 import { Prisma } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
+import { resolveMasterRef } from '../travelers/traveler-profile-alias.js';
 import { SNAPSHOT_STALE_MS, TravelerProfilesService } from '../travelers/traveler-profiles.service.js';
 import { computeCombinedTripCounts } from '../travelers/traveler-trip-count.js';
 import { computeAvailableTrips } from '../travelers/traveler-benefits.service.js';
@@ -72,7 +73,7 @@ export interface TripStatsPassenger {
   documentNumber: string;
 }
 
-/** mergedIntoId 指针链解析用的最小行。*/
+/** 导出取数用的档案行：alias 模块的 ProfileRef（链解析最小形状）+ 快照三列。*/
 interface ProfileRef {
   id: string;
   documentType: DocumentType;
@@ -85,21 +86,19 @@ interface ProfileRef {
   mergedIntoId: string | null;
 }
 
-/** 合并链最大跟随跳数：merge() 禁止并入指针行 → 数据上不该有链；给足冗余并防脏数据死循环。*/
-const MAX_MERGE_HOPS = 4;
-
 /**
  * 拉取本次导出全部乘客的常旅客档案 → docKey → { 飞行次数, 在订未飞, 可用次数 }。
  *
  * 无 N+1：先按 (证件类型,证件号) 组合一次 findMany（走 @@unique([documentType, documentNumber])），
  * 再对「命中的档案是指针行（mergedIntoId 非空）」的情况按 id 批量补拉主档案 —— 每一跳一条查询，
- * 实践中最多一跳（合并时禁止把档案并入指针行，链深恒为 1）。之后再加一条 groupBy 取回全部命中
- * 主档案的已核销次数合计（可用次数 = 飞行次数 − 已核销）。几百位乘客也只有 2~3 条查询。
+ * 跟到没有新的指针目标为止。之后再加一条 groupBy 取回全部命中主档案的已核销次数合计
+ *（可用次数 = 飞行次数 − 已核销）。几百位乘客也只有 2~3 条查询。
  *
  * mergedIntoId：合并过的档案 tripCount/pendingTripCount 累积在主档案上，指针行留的是合并前的
  * 残值 —— 直读源档案会少算；核销流水（TravelerBenefitRedemption）同理只挂在主档案上。命中
- * 指针行时沿链跟随到主档案取值（防环：记录已访问 id）。客人报旧护照号下的单，也能因此拿到
- * 归一后的真实数字。
+ * 指针行时沿链跟随到主档案取值，链解析用 travelers/traveler-profile-alias.ts 的 resolveMasterRef
+ *（全站唯一一份：链深不是常数，A→B 后再 B→C 两次合并都合法，见该文件头部）。客人报旧护照号
+ * 下的单，也能因此拿到归一后的真实数字。
  */
 export async function loadTripCountMap(
   passengers: readonly TripStatsPassenger[],
@@ -139,9 +138,10 @@ export async function loadTripCountMap(
     select,
   })) as ProfileRef[];
 
-  // 指针行 → 批量补拉主档案（按 id in，逐跳；命中即停）
+  // 指针行 → 批量补拉主档案（按 id in，逐跳直到没有新的指针目标）。必然终止：每一跳只要
+  // 还有没拉过的目标就至少多拉到一行，拉不到（断链）即停；环由「已在 byId 里的不再要」挡住。
   const byId = new Map<string, ProfileRef>(matched.map((r) => [r.id, r]));
-  for (let hop = 0; hop < MAX_MERGE_HOPS; hop += 1) {
+  for (;;) {
     const wanted = [...byId.values()]
       .map((r) => r.mergedIntoId)
       .filter((id): id is string => id !== null && !byId.has(id));
@@ -158,7 +158,7 @@ export async function loadTripCountMap(
   // 与 traveler-benefits.service.ts 的 loadRedeemedTripsByProfile 同口径，
   // 此处不复用该函数——它内部固定读默认 prisma，本函数需支持注入 client 以便单测。
   const masterIds = new Set<string>();
-  for (const row of matched) masterIds.add(resolveMaster(row, byId).id);
+  for (const row of matched) masterIds.add(resolveMasterRef(row, byId).id);
   let redeemedByProfile = new Map<string, number>();
   if (masterIds.size > 0) {
     // Prisma 5 的 groupBy 条件泛型在注入 PrismaClient 时会把可选 orderBy 推成错误的
@@ -181,7 +181,7 @@ export async function loadTripCountMap(
   const tripStats: TripStatsMap = new Map();
   let oldestRefreshedAt: Date | null = null;
   for (const row of matched) {
-    const master = resolveMaster(row, byId);
+    const master = resolveMasterRef(row, byId);
     const redeemedTrips = redeemedByProfile.get(master.id) ?? 0;
     const pendingPaidTripCount = master.pendingPaidTripCount ?? 0;
     tripStats.set(docKey(row.documentType, row.documentNumber), {
@@ -199,24 +199,6 @@ export async function loadTripCountMap(
     }
   }
   return { tripStats, oldestRefreshedAt };
-}
-
-/**
- * 沿 mergedIntoId 链解析到主档案。
- * 与 travelers/traveler-profiles.service.ts 的 resolveMasterRef 同款口径（该函数为模块私有、
- * 未导出，本文件不改 travelers/ 故就近实现）：断链（主档案被删）/ 环（脏数据）时停在当前行，
- * 不抛错不死循环 —— 脏数据只会让这一条取到残值，不拖垮整表导出。
- */
-function resolveMaster(start: ProfileRef, byId: Map<string, ProfileRef>): ProfileRef {
-  let current = start;
-  const seen = new Set<string>([current.id]);
-  while (current.mergedIntoId) {
-    const next = byId.get(current.mergedIntoId);
-    if (!next || seen.has(next.id)) break;
-    seen.add(next.id);
-    current = next;
-  }
-  return current;
 }
 
 /**

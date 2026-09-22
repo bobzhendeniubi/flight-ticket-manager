@@ -147,9 +147,28 @@ function toProfileData(
   };
 }
 
-export class TravelerProfilesService {
+/**
+ * 全量重建的共享状态 —— 模块级而非实例级：路由（travelers.routes 的单例）与导出
+ *（orders.export-trip-stats 每次 new 一个 service）必须共用同一份，否则两条路径可以并发跑两份
+ * 全量重建（结果一致但白耗一次，第二轮复审 N5）。
+ */
+const rebuildState: {
   /** 并发重建去重：同一时刻只跑一次全量重建 */
-  private rebuildInFlight: Promise<{ built: number; removed: number }> | null = null;
+  inFlight: Promise<{ built: number; removed: number }> | null;
+  /** 最近一次后台重建失败的时刻；REBUILD_RETRY_BACKOFF_MS 内不再自动触发（第二轮复审 N6） */
+  lastFailureAt: number | null;
+} = { inFlight: null, lastFailureAt: null };
+
+/** 后台重建失败后的退避：失败原因（脏数据撞唯一约束等）不会自己消失，每次列表访问都重跑只是空耗。 */
+export const REBUILD_RETRY_BACKOFF_MS = 10 * 60 * 1000;
+
+/** 仅供单测：清掉模块级的重建共享状态（并发去重 / 失败退避）。 */
+export function resetRebuildStateForTests(): void {
+  rebuildState.inFlight = null;
+  rebuildState.lastFailureAt = null;
+}
+
+export class TravelerProfilesService {
 
   async list(query: ListTravelerProfilesQuery) {
     await this.ensureFresh();
@@ -662,11 +681,16 @@ export class TravelerProfilesService {
    * 内部量级（包机生意，订单数千级）全量跑很快；并发调用共享同一次执行。
    */
   async rebuildAll(): Promise<{ built: number; removed: number }> {
-    if (this.rebuildInFlight) return this.rebuildInFlight;
-    this.rebuildInFlight = this.doRebuildAll().finally(() => {
-      this.rebuildInFlight = null;
-    });
-    return this.rebuildInFlight;
+    if (rebuildState.inFlight) return rebuildState.inFlight;
+    rebuildState.inFlight = this.doRebuildAll()
+      .then((result) => {
+        rebuildState.lastFailureAt = null; // 成功一次即解除退避
+        return result;
+      })
+      .finally(() => {
+        rebuildState.inFlight = null;
+      });
+    return rebuildState.inFlight;
   }
 
   private async doRebuildAll(): Promise<{ built: number; removed: number }> {
@@ -903,6 +927,9 @@ export class TravelerProfilesService {
    * 旧值会一直撑着 —— 批量迁移把全表打过期后（例如新增快照列、初值恒为 0）也就永远
    * 补不上。全量重建会把每一条 canonical 行都刷到同一时刻，所以 _min 在正常运行时就等于
    * 上次全量重建的时刻；指针行（mergedIntoId 非空）不参与重建、永远是旧值，必须排除。
+   *
+   * 后台重建失败时 _min 不会前进，若不退避，之后每次列表访问都会再起一次注定失败的全量重建：
+   * 记下失败时刻并写 error 日志，REBUILD_RETRY_BACKOFF_MS 内不再触发（本次读照常用旧快照）。
    */
   private async ensureFresh(): Promise<void> {
     const stats = await prisma.travelerProfile.aggregate({
@@ -916,11 +943,14 @@ export class TravelerProfilesService {
       return;
     }
     const oldest = stats._min.refreshedAt;
-    if (oldest && Date.now() - oldest.getTime() > SNAPSHOT_STALE_MS) {
-      void this.rebuildAll().catch(() => {
-        /* 后台重建失败不影响本次读；下次访问会再试 */
-      });
-    }
+    if (!oldest || Date.now() - oldest.getTime() <= SNAPSHOT_STALE_MS) return;
+    const { lastFailureAt } = rebuildState;
+    if (lastFailureAt !== null && Date.now() - lastFailureAt < REBUILD_RETRY_BACKOFF_MS) return;
+    void this.rebuildAll().catch((e: unknown) => {
+      // 后台重建失败不影响本次读（照常用旧快照）；退避期后再试
+      rebuildState.lastFailureAt = Date.now();
+      console.error('[travelers] 旅客档案快照后台重建失败，10 分钟内不再自动重试:', e);
+    });
   }
 }
 

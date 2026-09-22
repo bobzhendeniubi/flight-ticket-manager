@@ -7,9 +7,11 @@
  *   - 补偿行走 createMany(skipDuplicates)，被人工抢先冲正的行不进结果、不写审计
  *   - 审计 BENEFIT_REDEMPTION_AUTO_REVERSED（WARNING，target=档案）+ 一条给运营的待办（ruleKey 幂等）
  *   - 系统调用者（reminderCreatedById=null）只冲正 + 审计，不建待办
- *   - 拆单一跳：源单上的核销只在「该档案证件出现在本单乘客里」时连带冲正
- *   - 仍有有效行程（评审 F1）：档案还在别的已付款未飞单 / 拆单谱系已飞单上 → 不冲正，只写 INFO 审计；
- *     待支付单、打了 no-show 标的单、谱系外的历史已飞单都不算「仍有行程」；触发单本身不参与判定
+ *   - 拆单：直接源单上的核销只在「该档案证件出现在本单乘客里」时连带冲正
+ *   - 仍在同谱系行程上（评审 F1 / 第二轮 N1、N2）：档案还在拆单谱系（双向传递闭包，任意跳数）内的
+ *     别的已付款单上 → 不冲正，写 WARNING 审计 + 「请核对」待办（BENEFITSKIP:{核销行 id} 幂等）；
+ *     谱系外的单（哪怕未飞已付）、谱系内待支付 / 已取消 / 打了 no-show 标的单都不算承载；
+ *     直挂本单且没拆过单 → 不查订单直接冲正；触发单本身不参与判定
  *   - 合并链任意深度（评审 F2）：P1→P2→P3，单上乘客仍用 P1 旧证，核销挂在 P3 → 命中；链成环不死循环
  *   - 缺 delegate 的老 mock 直接跳过（返回空数组，不抛）
  */
@@ -22,6 +24,7 @@ import {
   BENEFIT_AUTO_REVERSED_AUDIT_ACTION,
   BENEFIT_AUTO_REVERSE_SKIPPED_AUDIT_ACTION,
   BENEFIT_AUTO_REVERSAL_REMINDER_PREFIX,
+  BENEFIT_AUTO_REVERSE_SKIPPED_REMINDER_PREFIX,
 } from './traveler-benefits.auto-reverse.js';
 
 const AT = new Date('2026-09-21T03:00:00.000Z');
@@ -53,6 +56,7 @@ function candidate(over: Partial<{
 
 type FakeOrder = {
   id: string;
+  orderNumber?: string;
   status: string;
   passengers: Array<{ documentType: string; documentNumber: string }>;
   items: Array<{ metadata: unknown; flightSchedule: { departureTime: Date } | null }>;
@@ -81,12 +85,14 @@ function order(over: {
 
 /**
  * 假 tx：candidates 是首次 findMany 的返回；written 是 createMany 之后按 reversalOfId 读回的行；
- * splitSources = 本单的源单；splitTargets = 拆单记录（候选挂的单 → 目标单）；orders = 「仍有有效行程」
- * 判定读到的别的订单。
+ * splitSources = 本单（triggerOrderId，默认 o1）的直接源单；splitTargets = 其余拆单记录（源单 → 目标单）；
+ * 两者合成一张边表，既回答「本单的源单」也回答谱系闭包的双向 OR 查询。orders = 「仍在同谱系行程上」
+ * 判定读到的订单（假 client 只吃 where.id.in，状态 / no-show / 证件由实现侧在内存里判）。
  */
 function fakeTx(opts: {
   candidates?: ReturnType<typeof candidate>[];
   written?: Array<{ id: string; reversalOfId: string }>;
+  triggerOrderId?: string;
   splitSources?: string[];
   splitTargets?: Array<{ sourceOrderId: string; targetOrderId: string }>;
   passengers?: Array<{ documentType: string; documentNumber: string }>;
@@ -97,6 +103,11 @@ function fakeTx(opts: {
   const candidates = opts.candidates ?? [];
   const written =
     opts.written ?? candidates.map((c) => ({ id: `rev-${c.id}`, reversalOfId: c.id }));
+  const trigger = opts.triggerOrderId ?? 'o1';
+  const edges = [
+    ...(opts.splitSources ?? []).map((id) => ({ sourceOrderId: id, targetOrderId: trigger })),
+    ...(opts.splitTargets ?? []),
+  ];
   const tx = {
     travelerBenefitRedemption: {
       findMany: vi
@@ -106,19 +117,37 @@ function fakeTx(opts: {
       createMany: vi.fn().mockResolvedValue({ count: written.length }),
     },
     orderSplitRecord: {
-      findMany: vi.fn(async (args: { where: { targetOrderId?: string; sourceOrderId?: { in: string[] } } }) => {
-        if (args.where.targetOrderId) {
-          return (opts.splitSources ?? []).map((id) => ({ sourceOrderId: id }));
-        }
-        const ids = new Set(args.where.sourceOrderId?.in ?? []);
-        return (opts.splitTargets ?? [])
-          .filter((r) => ids.has(r.sourceOrderId))
-          .map((r) => ({ targetOrderId: r.targetOrderId }));
-      }),
+      findMany: vi.fn(
+        async (args: {
+          where: {
+            targetOrderId?: string;
+            OR?: Array<{ sourceOrderId?: { in: string[] }; targetOrderId?: { in: string[] } }>;
+          };
+        }) => {
+          if (args.where.targetOrderId) {
+            return edges
+              .filter((e) => e.targetOrderId === args.where.targetOrderId)
+              .map((e) => ({ sourceOrderId: e.sourceOrderId }));
+          }
+          const ids = new Set<string>();
+          for (const clause of args.where.OR ?? []) {
+            for (const id of clause.sourceOrderId?.in ?? []) ids.add(id);
+            for (const id of clause.targetOrderId?.in ?? []) ids.add(id);
+          }
+          return edges.filter((e) => ids.has(e.sourceOrderId) || ids.has(e.targetOrderId));
+        },
+      ),
     },
     passenger: { findMany: vi.fn().mockResolvedValue(opts.passengers ?? []) },
     travelerProfile: { findMany: vi.fn().mockResolvedValue(opts.profiles ?? []) },
-    order: { findMany: vi.fn().mockResolvedValue(opts.orders ?? []) },
+    // 与真库同语义只吃 id in（谱系内的单）；状态 / no-show / 证件由实现侧在内存里判
+    order: {
+      findMany: vi.fn(async (args: { where?: { id?: { in?: string[] } } }) => {
+        const ids = args?.where?.id?.in;
+        const all = opts.orders ?? [];
+        return ids ? all.filter((o) => ids.includes(o.id)) : all;
+      }),
+    },
     auditLog: { create: vi.fn().mockResolvedValue({ id: 'a1' }) },
     operationalReminder: {
       findUnique: vi.fn().mockResolvedValue(opts.existingReminder ? { id: 'rem-existing' } : null),
@@ -322,59 +351,192 @@ describe('autoReverseRedemptionsForOrderWithinTx · 取消 / 退款 / no-show �
     expect(out.map((r) => r.originalId)).toEqual(['r1']);
   });
 
-  describe('仍有有效行程（评审 F1）：冲正跟着旅客当前承载的行程走', () => {
-    it('拆单后取消源单：被拆到 B 且 B 已正常出行的客人，A 上挂的核销**不补回**，只写 INFO 审计', async () => {
+  describe('仍在同谱系行程上（评审 F1 / 第二轮 N1、N2）：冲正跟着同一趟行程走', () => {
+    it('拆单后取消源单：被拆到 B 且 B 已正常出行的客人，A 上挂的核销**不补回**，写 WARNING 审计 + 请核对待办', async () => {
       // 触发单 = A（o1），P 的核销挂 A；P 已被拆到 B（谱系一跳），B 一天前飞了
       const tx = fakeTx({
         candidates: [candidate({ id: 'r1', profileId: 'p1', orderId: 'o1' })],
         splitTargets: [{ sourceOrderId: 'o1', targetOrderId: 'oB' }],
         profiles: [{ id: 'p1', mergedIntoId: null, documentType: 'PASSPORT', documentNumber: 'E12345678' }],
-        orders: [order({ id: 'oB', departsInDays: -1 })],
+        orders: [{ ...order({ id: 'oB', departsInDays: -1 }), orderNumber: 'FTM-B' }],
       });
 
       const out = await autoReverseRedemptionsForOrderWithinTx(tx, INPUT);
 
       expect(out).toEqual([]);
       expect(tx.travelerBenefitRedemption.createMany).not.toHaveBeenCalled();
-      expect(tx.operationalReminder.create).not.toHaveBeenCalled();
       expect(tx.auditLog.create).toHaveBeenCalledTimes(1);
       expect(tx.auditLog.create).toHaveBeenCalledWith({
         data: expect.objectContaining({
           action: BENEFIT_AUTO_REVERSE_SKIPPED_AUDIT_ACTION,
-          severity: 'INFO',
+          severity: 'WARNING',
           targetType: 'TRAVELER',
           targetId: 'p1',
           before: { redemptionId: 'r1', tripsUsed: 5, benefit: '飞满 5 次兑换升舱', orderId: 'o1' },
           after: expect.objectContaining({
             triggerOrderId: 'o1',
             carriedByOrderIds: ['oB'],
+            carriedByOrderNumbers: ['FTM-B'],
           }),
         }),
       });
-      // 谱系查询按候选挂的单找目标单
+      // 待办：一条核销行一条，ruleKey = BENEFITSKIP:{核销行 id}，正文点名承载行程的单号
+      expect(tx.operationalReminder.create).toHaveBeenCalledTimes(1);
+      expect(tx.operationalReminder.create).toHaveBeenCalledWith({
+        data: expect.objectContaining({
+          orderId: 'o1',
+          createdById: 'u-ops',
+          priority: 'HIGH',
+          ruleKey: `${BENEFIT_AUTO_REVERSE_SKIPPED_REMINDER_PREFIX}r1`,
+          title: '【核销未补回·请核对】FTM2026092100001 ZHANG SAN 5 次',
+        }),
+        select: { id: true },
+      });
+      const body = (tx.operationalReminder.create.mock.calls[0][0] as { data: { body: string } }).data.body;
+      expect(body).toContain('FTM-B');
+      expect(body).toContain('未');
+      expect(body).toContain('请核对');
+      // 谱系闭包按双向 OR 查（源单 in / 目标单 in），承载判定只查谱系内的单（排除触发单）
       expect(tx.orderSplitRecord.findMany).toHaveBeenCalledWith(
-        expect.objectContaining({ where: { sourceOrderId: { in: ['o1'] } } }),
+        expect.objectContaining({
+          where: { OR: [{ sourceOrderId: { in: ['o1'] } }, { targetOrderId: { in: ['o1'] } }] },
+        }),
+      );
+      expect(tx.order.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ id: { in: ['oB'] } }) }),
       );
     });
 
-    it('档案还在另一张已付款未飞单上 → 不冲正（那趟行程会用掉这次核销的额度）', async () => {
+    it('跳过待办幂等：同一核销行的待办已存在 → 不重复建；系统调用者只审计不建待办', async () => {
+      const mk = (over: { existingReminder?: boolean }) =>
+        fakeTx({
+          candidates: [candidate({ id: 'r1' })],
+          splitTargets: [{ sourceOrderId: 'o1', targetOrderId: 'oB' }],
+          profiles: [{ id: 'p1', mergedIntoId: null, documentType: 'PASSPORT', documentNumber: 'E12345678' }],
+          orders: [order({ id: 'oB', departsInDays: -1 })],
+          ...over,
+        });
+
+      const dup = mk({ existingReminder: true });
+      await autoReverseRedemptionsForOrderWithinTx(dup, INPUT);
+      expect(dup.operationalReminder.findUnique).toHaveBeenCalledWith({
+        where: { ruleKey: `${BENEFIT_AUTO_REVERSE_SKIPPED_REMINDER_PREFIX}r1` },
+        select: { id: true },
+      });
+      expect(dup.operationalReminder.create).not.toHaveBeenCalled();
+
+      const sys = mk({});
+      await autoReverseRedemptionsForOrderWithinTx(sys, { ...INPUT, reminderCreatedById: null });
+      expect(auditActions(sys)).toEqual([BENEFIT_AUTO_REVERSE_SKIPPED_AUDIT_ACTION]);
+      expect(sys.operationalReminder.findUnique).not.toHaveBeenCalled();
+      expect(sys.operationalReminder.create).not.toHaveBeenCalled();
+    });
+
+    it('直挂本单、从没拆过单：客人另有无关的已付款未飞单 D → 照常补回，不查订单（N1：谱系外的单不算承载）', async () => {
       const tx = fakeTx({
         candidates: [candidate({ id: 'r1' })],
         profiles: [{ id: 'p1', mergedIntoId: null, documentType: 'PASSPORT', documentNumber: 'E12345678' }],
-        orders: [order({ id: 'o-other', status: 'TICKETED', departsInDays: 20 })],
+        orders: [order({ id: 'oD', status: 'TICKETED', departsInDays: 20 })],
+      });
+
+      const out = await autoReverseRedemptionsForOrderWithinTx(tx, INPUT);
+
+      expect(out.map((r) => r.originalId)).toEqual(['r1']);
+      expect(auditActions(tx)).toEqual([BENEFIT_AUTO_REVERSED_AUDIT_ACTION]);
+      expect(tx.order.findMany).not.toHaveBeenCalled();
+      expect(tx.operationalReminder.create).toHaveBeenCalledWith(
+        expect.objectContaining({
+          data: expect.objectContaining({ ruleKey: `${BENEFIT_AUTO_REVERSAL_REMINDER_PREFIX}rev-r1` }),
+        }),
+      );
+    });
+
+    it('直挂本单、去程 no-show：客人另有无关未飞单 D → 同样补回', async () => {
+      const tx = fakeTx({
+        candidates: [candidate({ id: 'r1' })],
+        profiles: [{ id: 'p1', mergedIntoId: null, documentType: 'PASSPORT', documentNumber: 'E12345678' }],
+        orders: [order({ id: 'oD', departsInDays: 20 })],
+      });
+
+      const out = await autoReverseRedemptionsForOrderWithinTx(tx, { ...INPUT, reason: '去程 no-show' });
+
+      expect(out.map((r) => r.originalId)).toEqual(['r1']);
+    });
+
+    it('A→B→C 两跳拆单，P 在 C 已飞，取消 A → 不补回（N2：谱系传递闭包，不止一跳）', async () => {
+      const tx = fakeTx({
+        candidates: [candidate({ id: 'r1', orderId: 'o1' })],
+        splitTargets: [
+          { sourceOrderId: 'o1', targetOrderId: 'oB' },
+          { sourceOrderId: 'oB', targetOrderId: 'oC' },
+        ],
+        profiles: [{ id: 'p1', mergedIntoId: null, documentType: 'PASSPORT', documentNumber: 'E12345678' }],
+        // B 上留守的是别人（P 已再拆到 C）；C 一天前飞了
+        orders: [
+          order({ id: 'oB', documentNumber: 'E-OTHER', departsInDays: -1 }),
+          order({ id: 'oC', departsInDays: -1 }),
+        ],
       });
 
       const out = await autoReverseRedemptionsForOrderWithinTx(tx, INPUT);
 
       expect(out).toEqual([]);
       expect(auditActions(tx)).toEqual([BENEFIT_AUTO_REVERSE_SKIPPED_AUDIT_ACTION]);
+      const skippedAudit = tx.auditLog.create.mock.calls[0][0] as { data: { after: { carriedByOrderIds: string[] } } };
+      expect(skippedAudit.data.after.carriedByOrderIds).toEqual(['oC']);
+      // 闭包：第一跳从 {o1} 找到 oB，第二跳从 {oB} 找到 oC，第三跳 {oC} 无新边即止
+      expect(tx.orderSplitRecord.findMany).toHaveBeenCalledTimes(1 + 3);
+      expect(tx.order.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ id: { in: ['oB', 'oC'] } }) }),
+      );
     });
 
-    it('另一张单是待支付 → 不算有效行程，照常冲正', async () => {
+    it('A→B→C，核销挂 A，P 在 C 已飞，取消 B（P 的证件仍在 B 乘客里）→ 不补回（从触发单向上下游双向追）', async () => {
+      const tx = fakeTx({
+        triggerOrderId: 'oB',
+        splitSources: ['o1'],
+        splitTargets: [{ sourceOrderId: 'oB', targetOrderId: 'oC' }],
+        candidates: [candidate({ id: 'r1', orderId: 'o1' })],
+        passengers: [{ documentType: 'PASSPORT', documentNumber: 'E12345678' }],
+        profiles: [{ id: 'p1', mergedIntoId: null, documentType: 'PASSPORT', documentNumber: 'E12345678' }],
+        orders: [order({ id: 'oC', departsInDays: -1 })],
+      });
+
+      const out = await autoReverseRedemptionsForOrderWithinTx(tx, { ...INPUT, orderId: 'oB' });
+
+      expect(out).toEqual([]);
+      expect(auditActions(tx)).toEqual([BENEFIT_AUTO_REVERSE_SKIPPED_AUDIT_ACTION]);
+      expect(tx.order.findMany).toHaveBeenCalledWith(
+        expect.objectContaining({ where: expect.objectContaining({ id: { in: ['o1', 'oC'] } }) }),
+      );
+    });
+
+    it('谱系内的单是待支付 / 已取消 → 不算承载，照常冲正', async () => {
+      for (const status of ['PENDING_PAYMENT', 'CANCELLED']) {
+        const tx = fakeTx({
+          candidates: [candidate({ id: 'r1' })],
+          splitTargets: [{ sourceOrderId: 'o1', targetOrderId: 'oB' }],
+          profiles: [{ id: 'p1', mergedIntoId: null, documentType: 'PASSPORT', documentNumber: 'E12345678' }],
+          orders: [order({ id: 'oB', status, departsInDays: 20 })],
+        });
+
+        const out = await autoReverseRedemptionsForOrderWithinTx(tx, INPUT);
+
+        expect(out.map((r) => r.originalId)).toEqual(['r1']);
+        expect(auditActions(tx)).toEqual([BENEFIT_AUTO_REVERSED_AUDIT_ACTION]);
+      }
+    });
+
+    it('谱系外的历史已飞单 / 未飞单不算承载；谱系内的单打了 no-show 标也不算 → 照常冲正', async () => {
       const tx = fakeTx({
         candidates: [candidate({ id: 'r1' })],
+        splitTargets: [{ sourceOrderId: 'o1', targetOrderId: 'oB' }],
         profiles: [{ id: 'p1', mergedIntoId: null, documentType: 'PASSPORT', documentNumber: 'E12345678' }],
-        orders: [order({ id: 'o-other', status: 'PENDING_PAYMENT', departsInDays: 20 })],
+        orders: [
+          order({ id: 'o-history', departsInDays: -200 }),
+          order({ id: 'o-future', departsInDays: 30 }),
+          order({ id: 'oB', departsInDays: -1, noShow: true }),
+        ],
       });
 
       const out = await autoReverseRedemptionsForOrderWithinTx(tx, INPUT);
@@ -383,34 +545,22 @@ describe('autoReverseRedemptionsForOrderWithinTx · 取消 / 退款 / no-show �
       expect(auditActions(tx)).toEqual([BENEFIT_AUTO_REVERSED_AUDIT_ACTION]);
     });
 
-    it('谱系外的历史已飞单不算「仍有行程」→ 照常冲正；谱系内的单打了 no-show 标也不算', async () => {
+    it('触发单本身不参与判定（事务内它正在落终态 / 刚打标）：查询只取谱系内其余的单', async () => {
       const tx = fakeTx({
         candidates: [candidate({ id: 'r1' })],
         splitTargets: [{ sourceOrderId: 'o1', targetOrderId: 'oB' }],
         profiles: [{ id: 'p1', mergedIntoId: null, documentType: 'PASSPORT', documentNumber: 'E12345678' }],
-        orders: [
-          order({ id: 'o-history', departsInDays: -200 }),
-          order({ id: 'oB', departsInDays: -1, noShow: true }),
-        ],
+        // 触发单本身即便有 P 的行程也不算承载（查询按谱系 id in 取，本单不在其中）
+        orders: [order({ id: 'o1', departsInDays: 10 })],
       });
 
       const out = await autoReverseRedemptionsForOrderWithinTx(tx, INPUT);
 
       expect(out.map((r) => r.originalId)).toEqual(['r1']);
-    });
-
-    it('触发单本身不参与判定（事务内它正在落终态 / 刚打标）：查询排除本单', async () => {
-      const tx = fakeTx({
-        candidates: [candidate({ id: 'r1' })],
-        profiles: [{ id: 'p1', mergedIntoId: null, documentType: 'PASSPORT', documentNumber: 'E12345678' }],
-      });
-
-      await autoReverseRedemptionsForOrderWithinTx(tx, INPUT);
-
       expect(tx.order.findMany).toHaveBeenCalledWith(
         expect.objectContaining({
           where: expect.objectContaining({
-            id: { not: 'o1' },
+            id: { in: ['oB'] },
             deletedAt: null,
             passengers: {
               some: {
@@ -422,9 +572,10 @@ describe('autoReverseRedemptionsForOrderWithinTx · 取消 / 退款 / no-show �
       );
     });
 
-    it('有效行程按档案**全部证件**找：另一张单上用的是合并前的旧证 → 同样算仍有行程', async () => {
+    it('承载按档案**全部证件**找：谱系内另一张单上用的是合并前的旧证 → 同样算承载', async () => {
       const tx = fakeTx({
         candidates: [candidate({ id: 'r1', profileId: 'p-master', documentNumber: 'E-NEW' })],
+        splitTargets: [{ sourceOrderId: 'o1', targetOrderId: 'o-other' }],
         profiles: [
           { id: 'p-master', mergedIntoId: null, documentType: 'PASSPORT', documentNumber: 'E-NEW' },
           { id: 'p-old', mergedIntoId: 'p-master', documentType: 'PASSPORT', documentNumber: 'E-OLD' },
@@ -436,6 +587,24 @@ describe('autoReverseRedemptionsForOrderWithinTx · 取消 / 退款 / no-show �
 
       expect(out).toEqual([]);
       expect(auditActions(tx)).toEqual([BENEFIT_AUTO_REVERSE_SKIPPED_AUDIT_ACTION]);
+    });
+
+    it('谱系成环（脏数据 A→B、B→A）不死循环，闭包仍完整', async () => {
+      const tx = fakeTx({
+        candidates: [candidate({ id: 'r1' })],
+        splitTargets: [
+          { sourceOrderId: 'o1', targetOrderId: 'oB' },
+          { sourceOrderId: 'oB', targetOrderId: 'o1' },
+        ],
+        profiles: [{ id: 'p1', mergedIntoId: null, documentType: 'PASSPORT', documentNumber: 'E12345678' }],
+        orders: [order({ id: 'oB', departsInDays: -1 })],
+      });
+
+      const out = await autoReverseRedemptionsForOrderWithinTx(tx, INPUT);
+
+      expect(out).toEqual([]);
+      // 首次「本单的源单」查询已把 oB 当种子带进来；闭包第一跳无新单即止 → 共 2 条查询，不空转
+      expect(tx.orderSplitRecord.findMany).toHaveBeenCalledTimes(1 + 1);
     });
   });
 
