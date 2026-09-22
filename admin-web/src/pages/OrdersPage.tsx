@@ -1015,6 +1015,7 @@ const PassengerSubRow = memo(function PassengerSubRow({
   passenger: p,
   index,
   colSpan,
+  orderId,
   orderHasVisaTask,
   canOpenProfile,
   tripsRow,
@@ -1023,6 +1024,8 @@ const PassengerSubRow = memo(function PassengerSubRow({
   passenger: OrderSummary['passengers'][number];
   index: number;
   colSpan: number;
+  /** 本单 id：「去核销」直达链接带上，档案页打开后自动展开核销表单并预选这张单。 */
+  orderId: string;
   /** 本单是否真有签证任务：无签证的单不给每人挂送签进度徽章。 */
   orderHasVisaTask: boolean;
   /** 姓名是否链到旅客档案：档案接口只放行 ADMIN/STAFF，代理侧保持纯文本。 */
@@ -1086,6 +1089,7 @@ const PassengerSubRow = memo(function PassengerSubRow({
             upgradeRedeemNote={p.upgradeRedeemNote}
             documentType={p.documentType}
             documentNumber={p.documentNumber}
+            orderId={orderId}
           />
           {p.pnr ? <span className="font-mono tabular-nums text-ink-soft">PNR {p.pnr}</span> : null}
           {p.eticketNumber ? (
@@ -1109,7 +1113,8 @@ function TravelerTripsMiniBadge({
   tripsRow?: TravelerProfileLookupRow;
   tripsStatus?: TravelerTripsLookupStatus;
 }) {
-  const title = '可用 = 已飞 − 已核销；在订未飞不计入可用';
+  // 2026-09-21 口径改起：可用 = 已飞 + 已付未飞 − 已核销（后端算好的 availableTrips，前端不再自己拼）。
+  const title = '可用 = 已飞 + 已付未飞 − 已核销';
   if (tripsStatus === 'forbidden') return null;
   if (tripsStatus === 'loading') {
     return <span className="text-[10px] text-ink-soft">次数查询中…</span>;
@@ -1123,6 +1128,7 @@ function TravelerTripsMiniBadge({
   }
   const tripCount = tripsRow?.tripCount ?? 0;
   const pendingTripCount = tripsRow?.pendingTripCount ?? 0;
+  const pendingPaidTripCount = tripsRow?.pendingPaidTripCount ?? 0;
   const availableTrips = tripsRow?.availableTrips ?? 0;
   if (tripCount === 0 && pendingTripCount === 0 && availableTrips === 0) {
     return (
@@ -1139,7 +1145,7 @@ function TravelerTripsMiniBadge({
       className="nums rounded bg-slate-50 px-1.5 py-0.5 text-[10px] font-medium text-slate-600 ring-1 ring-slate-200"
       title={title}
     >
-      已飞 {tripCount} · 在订未飞 {pendingTripCount} · 可用 {availableTrips}
+      已飞 {tripCount} · 已付未飞 {pendingPaidTripCount} · 可用 {availableTrips}
     </span>
   );
 }
@@ -4904,6 +4910,7 @@ export function OrdersPage() {
                           passenger={p}
                           index={pIdx}
                           colSpan={tableColSpan}
+                          orderId={order.id}
                           orderHasVisaTask={orderHasVisaTask}
                           canOpenProfile={isOps}
                           tripsRow={tripsRow}
@@ -11901,15 +11908,14 @@ function travelerDocKey(documentType: DocumentType, documentNumber: string): str
 /** forbidden = 当前角色无权查（代理），与「没查到」区分开：子行不渲染徽章，而不是显示「无记录」。 */
 type TravelerTripsLookupStatus = 'idle' | 'loading' | 'error' | 'ready' | 'forbidden';
 
-// 运营原话：「可用次数应该是飞行次数和在订未飞相加」；老板拍板先只把三个数摆到界面上，
-// 系统「可用」口径不动（可用=已飞−已核销，核销闸仍按它拦）——「在订未飞」是否计入可用，
-// 待运营确认取消口径后再改，这里三个数并排给运营自己心算，不改系统计算结果。
+// 2026-09-21 拍板口径改起：可用 = 已飞 + 已付未飞 − 已核销（不再是恒等于已飞）；
+// 三个数摆到界面上给运营直接看，Z（可用）一律用后端算好的 availableTrips，前端不再自己拼。
 function PassengerTripsBadge({ row }: { row: TravelerProfileLookupRow }) {
   const hit = row.tripCount >= TRAVELER_BENEFIT_TRIP_THRESHOLD;
   const title =
-    `常旅客 ${row.travelerNo}：已飞 ${row.tripCount} 次 · 在订未飞 ${row.pendingTripCount} 次 · ` +
+    `常旅客 ${row.travelerNo}：已飞 ${row.tripCount} 次 · 已付未飞 ${row.pendingPaidTripCount} 次 · ` +
     `已核销 ${row.redeemedTrips} 次 · 可用 ${row.availableTrips} 次\n` +
-    `口径：可用 = 已飞 − 已核销；在订未飞不计入可用` +
+    `口径：可用 = 已飞 + 已付未飞 − 已核销` +
     (hit ? `\n已飞满 ${TRAVELER_BENEFIT_TRIP_THRESHOLD} 次，够航司权益门槛` : '');
   return (
     <span title={title} className="inline-flex items-center gap-1">
@@ -11925,7 +11931,7 @@ function PassengerTripsBadge({ row }: { row: TravelerProfileLookupRow }) {
       {/* 原来只在「可用≠已飞」时才单列在订未飞/可用（藏在 title 里），运营要求直接在界面上
           看到，不用悬浮也不用导出——三个数改成恒定并排显示。 */}
       <span className="rounded bg-slate-50 px-1.5 py-0.5 text-[10px] font-medium text-slate-600 ring-1 ring-slate-200">
-        在订未飞 {row.pendingTripCount}
+        已付未飞 {row.pendingPaidTripCount}
       </span>
       <span
         className={`rounded px-1.5 py-0.5 text-[10px] font-medium ring-1 ${
@@ -12339,6 +12345,7 @@ function PassengersSection({ order, onOrderUpdated }: { order: OrderSummary; onO
                       upgradeRedeemNote={p.upgradeRedeemNote}
                       documentType={p.documentType}
                       documentNumber={p.documentNumber}
+                      orderId={order.id}
                       inline
                     />
                     {/* 按乘客净调价小标（0722）：正=补收（琥珀）、负=优惠（绿）；0 不显示。 */}

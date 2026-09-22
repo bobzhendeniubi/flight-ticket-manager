@@ -991,3 +991,41 @@ describe('personalizeTrip', () => {
     expect(trip.upgradeRedeemLeg).toBeNull();
   });
 });
+
+describe('已付款在订未飞 pendingPaidTripCount（2026-09-21）', () => {
+  it('在订未飞按状态拆：已付款族计入 pendingPaidTripCount，待支付 / 退款申请中只进 pendingTripCount', () => {
+    const p = pax({ documentNumber: 'E12345678' });
+    const agg = buildTravelerAggregates(
+      [
+        order({ id: 'paid', status: 'PAID', passengers: [p], items: [flightItem('2026-08-01T00:00:00Z')] }),
+        order({ id: 'ticketed', status: 'TICKETED', passengers: [p], items: [flightItem('2026-08-02T00:00:00Z')] }),
+        order({ id: 'pending', status: 'PENDING_PAYMENT', passengers: [p], items: [flightItem('2026-08-03T00:00:00Z')] }),
+        order({ id: 'refund-req', status: 'REFUND_REQUESTED', passengers: [p], items: [flightItem('2026-08-04T00:00:00Z')] }),
+        order({ id: 'flown', status: 'COMPLETED', passengers: [p], items: [flightItem('2026-06-01T00:00:00Z')] }),
+      ],
+      NOW,
+    ).get(docKey('PASSPORT', 'E12345678'))!;
+    expect(agg.tripCount).toBe(1);
+    expect(agg.pendingTripCount).toBe(4);
+    expect(agg.pendingPaidTripCount).toBe(2);
+  });
+
+  it('no-show 单两边都不进已付款在订未飞', () => {
+    const p = pax({ documentNumber: 'E12345678' });
+    const agg = buildTravelerAggregates(
+      [order({ id: 'ns', status: 'PAID', passengers: [p], items: [flightItem('2026-08-01T00:00:00Z', { noShow: true })] })],
+      NOW,
+    ).get(docKey('PASSPORT', 'E12345678'))!;
+    expect(agg.pendingTripCount).toBe(0);
+    expect(agg.pendingPaidTripCount).toBe(0);
+  });
+
+  it('countsAsPaidUpcoming 与订单服务的「占座中」集合对表：占座中 − 待支付 = 已付款在订', async () => {
+    const { countsAsPaidUpcoming } = await import('./traveler-profiles.aggregate.js');
+    const { SEAT_HOLDING_STATUSES } = await import('../orders/orders.service.js');
+    const { OrderStatus } = await import('@prisma/client');
+    const expected = SEAT_HOLDING_STATUSES.filter((s) => s !== OrderStatus.PENDING_PAYMENT).sort();
+    const actual = Object.values(OrderStatus).filter((s) => countsAsPaidUpcoming(s)).sort();
+    expect(actual).toEqual(expected);
+  });
+});

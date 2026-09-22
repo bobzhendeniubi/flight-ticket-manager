@@ -73,7 +73,8 @@ export interface RuleUpgradeRedeemPassenger {
   /** 解析到的主档案 id；null = 该证件号没匹配到常旅客档案（只影响正文提示，不进 ruleKey）。 */
   profileId: string | null;
   /**
-   * 该程起飞日之后档案上的核销流水**净额** > 0（true = 已扣过，不再提醒）。
+   * 这一程已核销（true = 已扣过，不再提醒）。判法见 isLegRedeemed：挂了本单的流水按单看净额 > 0，
+   * 没挂单号的退回「起飞日之后档案上的核销流水净额 > 0」。
    * 净额而不是「有没有正数流水」：台账 append-only，冲正是追加一条负数补偿行，
    * 见 collectUpgradeRedeemCandidates 里的取数注释。
    */
@@ -167,8 +168,8 @@ export function buildUpgradeRedeemCandidates(
       title: `【次数升级待核销】${pax.orderNumber} ${pax.fullName} ${flightLabel} ${leg.legDate}`,
       body:
         `${pax.fullName} 在本单标了次数升级（${leg.legLabel}），${flightLabel} ${leg.legDate} 已起飞，` +
-        `常旅客档案里还没有这一程之后的核销流水。可用次数不会自动扣（口径＝已飞 − 已核销），` +
-        `请到常旅客档案「核销权益」扣减一次。${missingProfileHint}`,
+        `常旅客档案里还没有挂本单（或这一程之后）的核销流水。可用次数不会自动扣（口径＝已飞 + 已付款在订未飞 − 已核销），` +
+        `请到常旅客档案「核销权益」扣减一次，并挂上本单单号。${missingProfileHint}`,
       priority: ReminderPriority.HIGH,
       dueAt: today,
     },
@@ -350,9 +351,39 @@ interface UpgradeRedeemDelegates {
   travelerProfile?: { findMany?: (args: unknown) => Promise<UpgradeRedeemProfileRef[]> };
   travelerBenefitRedemption?: {
     findMany?: (args: unknown) => Promise<
-      Array<{ profileId: string; tripsUsed: number; createdAt: Date }>
+      Array<{ profileId: string; tripsUsed: number; createdAt: Date; orderId?: string | null }>
     >;
   };
+}
+
+/** 规则 12 判「这一程核销过没有」用到的台账行最小形状。 */
+export interface UpgradeRedeemLedgerRow {
+  tripsUsed: number;
+  createdAt: Date;
+  /** 2026-09-21 起核销可挂订单；老行 / 老 mock 没有这一列 → 按 null 处理。 */
+  orderId?: string | null;
+}
+
+/**
+ * 「这一程已核销」的判定（2026-09-21 升级）：
+ *   1. 档案上有挂了**同一张订单**的流水 → 只看这些行的净额 > 0（挂单的绑定优先；被冲正就是没核销，
+ *      **不再**退回时间窗，否则同人另一程的核销会把它误判成已核销）；
+ *   2. 一条挂本单的都没有（存量没挂单号的核销）→ 退回起飞当地零点之后的净额 > 0 这套时间窗近似。
+ */
+export function isLegRedeemed(
+  rows: ReadonlyArray<UpgradeRedeemLedgerRow>,
+  orderId: string,
+  legStartMs: number,
+): boolean {
+  const bound = rows.filter((r) => r.orderId != null && r.orderId === orderId);
+  if (bound.length > 0) {
+    return bound.reduce((sum, r) => sum + r.tripsUsed, 0) > 0;
+  }
+  return (
+    rows
+      .filter((r) => r.createdAt.getTime() >= legStartMs)
+      .reduce((sum, r) => sum + r.tripsUsed, 0) > 0
+  );
 }
 
 /**
@@ -468,21 +499,22 @@ export async function collectUpgradeRedeemCandidates(
   // 只看正数流水的话，「核销过 → 冲正」之后这一程仍被判成已核销，规则 12 对它永远不再吭声，
   // 可用次数虚高照样没人知道 —— 正是本规则存在的那个洞。净额算法下两行自然抵消。
   //
-  // 已知近似（台账不挂订单号，只能按时间判归属，见遗留风险）：同一位客人短期内飞两趟都标了
-  // 升舱时，一次核销可能把两程都判成已核销；反过来，起飞后冲正一笔**更早那一程**的核销，
-  // 也会把本程的净额压回 0、重新催一次。两种都是宁可多问一句，不会少扣。
+  // 2026-09-21 起核销可以挂订单号：挂了本单的流水按单判（净额 > 0），见 isLegRedeemed；
+  // 存量没挂单号的仍按时间窗近似 —— 已知近似：同一位客人短期内飞两趟都标了升舱时，一次核销
+  // 可能把两程都判成已核销；反过来，起飞后冲正一笔**更早那一程**的核销，也会把本程的净额
+  // 压回 0、重新催一次。两种都是宁可多问一句，不会少扣。挂了单号就没有这层歧义。
   const masterIds = [...new Set(masterIdByDoc.values())];
   const redemptions =
     masterIds.length === 0
       ? []
       : await redemptionDelegate.findMany({
           where: { profileId: { in: masterIds } },
-          select: { profileId: true, tripsUsed: true, createdAt: true },
+          select: { profileId: true, tripsUsed: true, createdAt: true, orderId: true },
         });
-  const redeemedRowsByProfile = new Map<string, Array<{ tripsUsed: number; createdAt: Date }>>();
+  const redeemedRowsByProfile = new Map<string, UpgradeRedeemLedgerRow[]>();
   for (const r of redemptions) {
     const list = redeemedRowsByProfile.get(r.profileId) ?? [];
-    list.push({ tripsUsed: r.tripsUsed, createdAt: r.createdAt });
+    list.push({ tripsUsed: r.tripsUsed, createdAt: r.createdAt, orderId: r.orderId ?? null });
     redeemedRowsByProfile.set(r.profileId, list);
   }
 
@@ -490,10 +522,11 @@ export async function collectUpgradeRedeemCandidates(
     const doc = realDocumentNumber(row.documentNumber);
     const profileId = doc ? (masterIdByDoc.get(docKey(row.documentType, doc)) ?? null) : null;
     const legStart = upgradeRedeemLegStartMs(leg);
-    const netRedeemedAfterLeg = (redeemedRowsByProfile.get(profileId ?? '') ?? [])
-      .filter((r) => r.createdAt.getTime() >= legStart)
-      .reduce((sum, r) => sum + r.tripsUsed, 0);
-    const redeemedAfterLeg = netRedeemedAfterLeg > 0;
+    const redeemedAfterLeg = isLegRedeemed(
+      redeemedRowsByProfile.get(profileId ?? '') ?? [],
+      row.orderId,
+      legStart,
+    );
     const built = buildUpgradeRedeemCandidates(
       {
         passengerId: row.id,

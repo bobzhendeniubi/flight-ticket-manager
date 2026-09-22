@@ -12,6 +12,7 @@ import {
   ApiError,
   type DocumentType,
   type ListTravelerProfilesResult,
+  type OrderStatus,
   type TravelerBenefitRedemption,
   type TravelerProfile,
   type TravelerProfileSuggestion,
@@ -59,6 +60,20 @@ const DEFAULT_REDEEM_TRIPS = 5;
 /** 可用次数为负的说明：不是算错，是订单退改把已飞次数拉回来了 */
 const NEGATIVE_AVAILABLE_HINT = '订单退改导致已飞次数回落，非系统算错';
 
+/**
+ * 核销表单「用于哪张单」下拉的候选口径：已付款（钱已经进来，不是待支付/超时/取消/退款）。
+ * trips（档案出行记录）本就只出有效订单（已排除草稿/超时/取消/失败/已退款），这里再收敛掉
+ * 待支付与退款申请中——两者都还不算「已付款且稳定」，不适合挂到一条即将扣次数的核销上。
+ */
+const PAID_ORDER_STATUSES = new Set<OrderStatus>([
+  'PAID',
+  'PROCESSING',
+  'TICKETED',
+  'COMPLETED',
+  'CHANGE_REQUESTED',
+  'CHANGED',
+]);
+
 /** 证件类型白名单：Link state 带来的 docType 只认这两个，其余一律按护照处理 */
 const DOC_TYPES: readonly DocumentType[] = ['PASSPORT', 'ID_CARD'];
 
@@ -98,6 +113,28 @@ function passportExpiryDays(iso: string | null): number | null {
   return Math.floor((new Date(iso).getTime() - Date.now()) / 86_400_000);
 }
 
+/**
+ * 多人搜索 term 分隔符：换行 / 英文逗号 / 中文逗号 / 顿号 / 英文分号 / 中文分号 / 空白。
+ * 口径与后端 traveler-profiles.service.ts 的 parseTravelerSearchTerms 一致——这里只用来给
+ * 已经查回来的结果按输入顺序重排，真正的搜索过滤仍然是后端做的。
+ */
+function parseSearchTermsClient(raw: string): string[] {
+  return raw
+    .split(/[,，、;；\s]+/u)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+/** 单个 term 是否命中这条档案（姓名 / 中文名 / 证件号，大小写不敏感），口径同后端。 */
+function profileMatchesSearchTerm(p: TravelerProfile, term: string): boolean {
+  const t = term.toLowerCase();
+  return (
+    p.fullName.toLowerCase().includes(t) ||
+    (p.chineseName?.toLowerCase().includes(t) ?? false) ||
+    p.documentNumber.toLowerCase().includes(t)
+  );
+}
+
 export function TravelerProfilesView() {
   const tokens = useAuth((s) => s.tokens);
   const [data, setData] = useState<ListTravelerProfilesResult | null>(null);
@@ -122,17 +159,22 @@ export function TravelerProfilesView() {
   const linkState = location.state as TravelerProfileLinkState | null;
   const docFromState = linkState?.doc?.trim() ?? '';
   const docTypeFromState = linkState?.docType ?? null;
+  // 「去核销」深链带的单号：档案 id 已知走 ?orderId=（订单 id 不敏感），只有证件号时走 state（同 doc）。
+  const orderIdParam = searchParams.get('orderId')?.trim() ?? '';
+  const orderIdFromState = linkState?.orderId?.trim() ?? '';
+  const initialOrderId = orderIdParam || orderIdFromState || undefined;
   const [docLookupHint, setDocLookupHint] = useState<string | null>(null);
 
   /**
-   * 抹掉深链上下文（?profile= 参数 + Link state）。
+   * 抹掉深链上下文（?profile=/?orderId= 参数 + Link state）。
    * 抽屉关掉后要抹：否则返回/刷新会把抽屉再弹一次；证件号解析完（命中与否）也要抹：
    * 否则来回导航会二次触发解析，把运营在搜索框里改过的字又冲掉。
    */
   const clearLinkContext = useCallback(() => {
-    if (!searchParams.has('profile') && location.state == null) return;
+    if (!searchParams.has('profile') && !searchParams.has('orderId') && location.state == null) return;
     const next = new URLSearchParams(searchParams);
     next.delete('profile'); // 其余筛选参数原样保留
+    next.delete('orderId');
     const qs = next.toString();
     navigate(`${location.pathname}${qs ? `?${qs}` : ''}`, { replace: true, state: null });
   }, [searchParams, location.pathname, location.state, navigate]);
@@ -215,7 +257,26 @@ export function TravelerProfilesView() {
     };
   }, [tokens?.accessToken, debouncedSearch, repeatOnly, sort, page, reloadNonce]);
 
-  const profiles = data?.profiles ?? [];
+  // 多人搜索（一次贴多个姓名/证件号）：按输入的 term 顺序把结果重排，命中同一 term 的相邻摆放，
+  // 方便运营对着自己贴的名单核对；单 term（没有分隔符）时数组长度 ≤1，原样透传，顺序不变。
+  const searchTerms = useMemo(() => parseSearchTermsClient(debouncedSearch), [debouncedSearch]);
+  const profiles = useMemo(() => {
+    const raw = data?.profiles ?? [];
+    if (searchTerms.length <= 1) return raw;
+    const placed = new Set<string>();
+    const ordered: TravelerProfile[] = [];
+    for (const term of searchTerms) {
+      for (const p of raw) {
+        if (placed.has(p.id) || !profileMatchesSearchTerm(p, term)) continue;
+        placed.add(p.id);
+        ordered.push(p);
+      }
+    }
+    for (const p of raw) {
+      if (!placed.has(p.id)) ordered.push(p);
+    }
+    return ordered;
+  }, [data, searchTerms]);
   const total = data?.pagination.total ?? 0;
   const pageCount = Math.max(1, Math.ceil(total / PAGE_SIZE));
 
@@ -292,6 +353,15 @@ export function TravelerProfilesView() {
         </section>
       )}
 
+      {/* 多人搜索一个都没命中的 term：贴了一串姓名/证件号进来，哪个没查到一眼看见，不用自己比对 */}
+      {Boolean(data?.unmatchedTerms.length) && (
+        <section className="card border border-amber-200 bg-amber-50">
+          <p className="text-sm text-amber-800">
+            没查到：{data!.unmatchedTerms.join('、')}
+          </p>
+        </section>
+      )}
+
       <section className="grid gap-3 md:grid-cols-3">
         <Kpi label="旅客总数" value={kpi.totalProfiles.toLocaleString()} sub="全量订单去重（含游客单）" />
         <Kpi label="累计飞行人次" value={kpi.totalTrips.toLocaleString()} sub="新系统已飞 + 老系统历史飞行" />
@@ -306,9 +376,10 @@ export function TravelerProfilesView() {
         <div className="grid gap-3 md:grid-cols-4">
           <div className="md:col-span-2">
             <label className="label text-xs">搜索（姓名 / 中文名 / 证件号）</label>
-            <input
+            <textarea
               className="input"
-              placeholder="如 CHAN / 陈文豪 / E1234"
+              rows={2}
+              placeholder={'如 CHAN / 陈文豪 / E1234\n可一次贴多个姓名/证件号，换行、逗号、空格分隔都行'}
               value={search}
               onChange={(e) => {
                 setSearch(e.target.value);
@@ -467,6 +538,7 @@ export function TravelerProfilesView() {
       {selectedId && (
         <ProfileDrawer
           profileId={selectedId}
+          initialOrderId={initialOrderId}
           onClose={() => {
             setSelectedId(null);
             clearLinkContext();
@@ -550,11 +622,14 @@ function PrefBadges({ profile }: { profile: TravelerProfile }) {
 
 function ProfileDrawer({
   profileId,
+  initialOrderId,
   onClose,
   onMerged,
   onSearchCompanion,
 }: {
   profileId: string;
+  /** 从「去核销」深链带过来的单号（可选），透传给核销表单自动展开+预选 */
+  initialOrderId?: string;
   onClose: () => void;
   /** 合并成功后回调（父组件关抽屉 + 刷新列表） */
   onMerged: () => void;
@@ -722,7 +797,9 @@ function ProfileDrawer({
               {/* 权益核销台账（只增不改：录错走冲正） */}
               <RedemptionsSection
                 profile={profile}
+                trips={trips}
                 redemptions={redemptions}
+                initialOrderId={initialOrderId}
                 onChanged={() => setDetailNonce((n) => n + 1)}
               />
 
@@ -914,11 +991,17 @@ function ProfileDrawer({
  */
 function RedemptionsSection({
   profile,
+  trips,
   redemptions,
+  initialOrderId,
   onChanged,
 }: {
   profile: TravelerProfile;
+  /** 档案出行记录：给「用于哪张单」下拉筛已付款且未飞的候选 */
+  trips: TravelerProfileTrip[];
   redemptions: TravelerBenefitRedemption[];
+  /** 从订单页/提醒中心「去核销」带过来的单号（可选）：打开时自动展开表单并预选（命中候选时） */
+  initialOrderId?: string;
   /** 台账有变动（核销 / 冲正成功）→ 让抽屉重拉详情 */
   onChanged: () => void;
 }) {
@@ -929,6 +1012,7 @@ function RedemptionsSection({
   const [tripsUsed, setTripsUsed] = useState(String(DEFAULT_REDEEM_TRIPS));
   const [benefit, setBenefit] = useState('');
   const [note, setNote] = useState('');
+  const [orderId, setOrderId] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [reversingId, setReversingId] = useState<string | null>(null);
   const [opError, setOpError] = useState<string | null>(null);
@@ -939,11 +1023,30 @@ function RedemptionsSection({
     [redemptions],
   );
 
+  // 「用于哪张单」候选：已付款（PAID_ORDER_STATUSES）且去程还没起飞（!flown）的出行记录。
+  // no-show 的行程 flown 也是 false——仍算「未飞」候选，运营自己判断挂不挂。
+  const eligibleTrips = useMemo(
+    () => trips.filter((t) => !t.flown && PAID_ORDER_STATUSES.has(t.status)),
+    [trips],
+  );
+
+  // 深链带 orderId 进来时：只在本档案第一次打开时应用一次，不跟着核销/冲正后的重拉反复触发。
+  const appliedInitialOrderIdRef = useRef(false);
+  useEffect(() => {
+    if (!initialOrderId || appliedInitialOrderIdRef.current) return;
+    appliedInitialOrderIdRef.current = true;
+    setFormOpen(true);
+    if (eligibleTrips.some((t) => t.orderId === initialOrderId)) {
+      setOrderId(initialOrderId);
+    }
+  }, [initialOrderId, eligibleTrips]);
+
   const resetForm = () => {
     setFormOpen(false);
     setTripsUsed(String(DEFAULT_REDEEM_TRIPS));
     setBenefit('');
     setNote('');
+    setOrderId('');
     setOpError(null);
   };
 
@@ -965,11 +1068,12 @@ function RedemptionsSection({
         tripsUsed: trips,
         benefit: benefit.trim(),
         note: note.trim() || undefined,
+        orderId: orderId || undefined,
       });
       resetForm();
       onChanged();
     } catch (e) {
-      // 可用次数不足等：后端 message 已是给操作人看的中文口径，原样展示
+      // 可用次数不足 / 挂错单（REDEMPTION_ORDER_MISMATCH）等：后端 message 已是给操作人看的中文口径，原样展示
       setOpError(e instanceof ApiError ? e.message : '核销失败');
     } finally {
       setSubmitting(false);
@@ -1023,11 +1127,26 @@ function RedemptionsSection({
         可用 <span className={profile.availableTrips < 0 ? 'font-medium text-red-600' : 'font-medium text-ink'}>
           {profile.availableTrips}
         </span>{' '}
-        次（已飞 {profile.tripCount} − 已核销 {profile.redeemedTrips}）。台账只增不改，录错请冲正。
+        次（已飞 {profile.tripCount} + 已付未飞 {profile.pendingPaidTripCount} − 已核销 {profile.redeemedTrips}）。台账只增不改，录错请冲正。
       </p>
 
       {formOpen && (
         <div className="mb-2 space-y-2 rounded border border-slate-200 p-3">
+          <div>
+            <label className="label text-xs">用于哪张单（选填）</label>
+            <select className="input text-sm" value={orderId} onChange={(e) => setOrderId(e.target.value)}>
+              <option value="">不挂单号（存量 / 手动核销）</option>
+              {eligibleTrips.map((t) => (
+                <option key={t.orderId} value={t.orderId}>
+                  {t.orderNumber} · 出发 {fmtDate(t.departAt)}
+                  {t.flightNumbers.length > 0 ? ` · ${t.flightNumbers.join('/')}` : ''}
+                </option>
+              ))}
+            </select>
+            <p className="mt-1 text-[10px] text-ink-muted">
+              只列已付款且还没起飞的订单；挂了单号后，这张单取消/退款会自动冲正这条核销。
+            </p>
+          </div>
           <div className="grid grid-cols-3 gap-2">
             <div>
               <label className="label text-xs">扣减次数</label>
@@ -1091,6 +1210,8 @@ function RedemptionsSection({
                   <span className="ml-2">{r.benefit}</span>
                   {isReversal && <span className="badge-neutral ml-2">冲正</span>}
                   {isReversed && <span className="badge-neutral ml-2">已冲正</span>}
+                  {/* 系统自动冲正：订单取消/退款联动生成，不是操作人手动点的「冲正」 */}
+                  {r.auto && <span className="badge-neutral ml-2">系统自动冲正</span>}
                 </div>
                 {!isReversal && !isReversed && (
                   <button
@@ -1106,6 +1227,13 @@ function RedemptionsSection({
                 {fmtDateTime(r.createdAt)}
                 {r.createdByName && ` · 经手 ${r.createdByName}`}
               </div>
+              {r.orderNumber && (
+                <div className="mt-0.5">
+                  <Link className="text-brand hover:text-brand-dark" to={`/orders?q=${encodeURIComponent(r.orderNumber)}`}>
+                    {r.orderNumber} →
+                  </Link>
+                </div>
+              )}
               {r.note && <div className="mt-0.5 flex items-center gap-1 text-slate-500"><Icon name="clipboard" /> {r.note}</div>}
             </li>
           );

@@ -9,9 +9,10 @@
  *   - 行程（trip）按订单计：一张含机票的订单 = 1 次行程，取最早起飞的航段为「去程」；
  *     tripCount 只数新系统去程已起飞**且客人真登机**的行程（「飞过多少次」）；老系统历史
  *     次数由 service 层按档案全部证件号批量查好后加到快照，不在本纯函数内访问数据库；
- *     pendingTripCount 只数去程未起飞的行程（「在订未飞多少次」）。
+ *     pendingTripCount 只数去程未起飞的行程（「在订未飞多少次」）；pendingPaidTripCount 是其中
+ *     状态已付款的那部分（2026-09-21 起进可用次数：可用 = 已飞 + 已付款在订未飞 − 已核销）。
  *   - no-show（去程被打了未登机标）的单既不算已飞、也不算在订未飞：飞行次数是权益核销的
- *     分母（可用次数 = 飞行次数 − 已核销），客人没飞却拿到一次额度等于白送。
+ *     分母，客人没飞却拿到一次额度等于白送。
  *   - 待支付单也进本聚合（后台单/代理单永不自动退位，待支付是能挂很久的正常业务状态），
  *     但只进「人存不存在 + 飞行次数」口径；订单数 / 累计消费 / 首次·末次出行这些已消费
  *     语义的字段只认已付款单，见 countsTowardSpend。
@@ -164,6 +165,12 @@ export interface TravelerAggregate {
    * 无航段单两边都不计；no-show 单同样两边都不计（既没飞成，也不再等一次未来的额度）。
    */
   pendingTripCount: number;
+  /**
+   * 已付款在订未飞：pendingTripCount 里订单状态属于「已付款且占座中」（countsAsPaidUpcoming）
+   * 的那部分。2026-09-21 拍板起进可用次数（可用 = 已飞 + 已付款在订未飞 − 已核销）；
+   * 待支付 / 占位单不算 —— 占位单不是 Order 行，天然不在本聚合里。
+   */
+  pendingPaidTripCount: number;
   /** 订单数：只数已付款单（待支付单不进已消费口径） */
   orderCount: number;
   /** 首次/末次出行：只数已付款单里已飞的行程（同上，已消费语义） */
@@ -201,6 +208,30 @@ const UNPAID_STATUSES: ReadonlySet<OrderStatus> = new Set<OrderStatus>([
  */
 export function countsTowardSpend(status: OrderStatus): boolean {
   return !UNPAID_STATUSES.has(status);
+}
+
+/**
+ * 「已付款且占座中」= 已付款（countsTowardSpend）∩ 占座中（orders.service 的 SEAT_HOLDING_STATUSES
+ * 去掉待支付）。这里不 import orders.service（模块环 + 纯函数不该拖整个订单服务），按值列出；
+ * 单测（traveler-profiles.aggregate.test.ts）与 SEAT_HOLDING_STATUSES 对表，两边漂移会被抓住。
+ *
+ * 退款申请中（REFUND_REQUESTED）虽还没退钱，但座位已释放、客人已表态不飞 —— 不算在订。
+ */
+const PAID_UPCOMING_STATUSES: ReadonlySet<OrderStatus> = new Set<OrderStatus>([
+  OrderStatus.PAID,
+  OrderStatus.PROCESSING,
+  OrderStatus.TICKETED,
+  OrderStatus.COMPLETED,
+  OrderStatus.CHANGE_REQUESTED,
+  OrderStatus.CHANGED,
+]);
+
+/**
+ * 「已付款在订未飞」的唯一状态判据（2026-09-21 拍板：这部分进可用次数，待支付不进）。
+ * 只判状态；「去程未起飞、未打 no-show 标」由聚合里的 upcoming 过滤负责。
+ */
+export function countsAsPaidUpcoming(status: OrderStatus): boolean {
+  return PAID_UPCOMING_STATUSES.has(status);
 }
 
 export function docKey(documentType: DocumentType, documentNumber: string): string {
@@ -447,6 +478,8 @@ export function buildTravelerAggregates(
     // no-show 单两边都不进：已经不算飞过，也不该退回「在订未飞」去等一次未来的额度
     // （极端情况——起飞前就先打了标——否则会被 departAt > now 捞进在订未飞）。
     const upcoming = trips.filter((t) => !t.flown && !t.noShow && t.departAt && t.departAt > now);
+    // 已付款在订未飞：同一批 upcoming 只多一道状态过滤（口径同源，不另算一遍）
+    const paidUpcoming = upcoming.filter((t) => countsAsPaidUpcoming(t.status));
     // 已消费口径：订单数 / 累计消费 / 首末次出行只认已付款单
     const paidTrips = trips.filter((t) => countsTowardSpend(t.status));
     const paidFlown = paidTrips.filter((t) => t.flown && t.departAt);
@@ -499,6 +532,7 @@ export function buildTravelerAggregates(
       passportExpiry: idDoc.passportExpiry,
       tripCount: flown.length,
       pendingTripCount: upcoming.length,
+      pendingPaidTripCount: paidUpcoming.length,
       orderCount: paidTrips.length,
       firstTripAt,
       lastTripAt,

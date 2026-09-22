@@ -116,7 +116,8 @@ export const travelerRoutes: FastifyPluginAsync = async (app) => {
 
   // ── 权益核销台账（append-only）：核销只增，录错走冲正，永不删改 ──
 
-  // 核销：tripsUsed 正整数，且不得超过当前可用次数（已飞 − 已核销净值）
+  // 核销：tripsUsed 正整数，且不得超过当前可用次数（已飞 + 已付款在订未飞 − 已核销净值）；
+  // 可选挂订单号（orderId），挂了的核销在该单取消 / 退款 / no-show 时由系统自动冲正
   app.post('/profiles/:id/redemptions', preStaff, async (req, reply) => {
     const { id } = req.params as { id: string };
     const body = createRedemptionBodySchema.parse(req.body);
@@ -132,6 +133,8 @@ export const travelerRoutes: FastifyPluginAsync = async (app) => {
         tripsUsed: result.redemption.tripsUsed,
         benefit: result.redemption.benefit,
         note: result.redemption.note,
+        orderId: result.redemption.orderId,
+        orderNumber: result.redemption.orderNumber,
       },
     });
     return reply.status(201).send({ redemption: result.redemption });

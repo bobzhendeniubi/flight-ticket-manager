@@ -234,6 +234,13 @@ import { heldSeatsForCabin } from '../hold-orders/held-seats.js';
 // 「回程已释放」提醒的 ruleKey 构造收敛在提醒规则那边：作废时要把这两条待办一起关掉，
 // 在这里照抄一遍拼接格式，改键时必然漏一处、待办就永远关不掉。
 import { noShowReleasedReminderRuleKeys } from '../reminders/reminders.rules.js';
+// 权益核销自动冲正（2026-09-21）：挂了单号的核销在取消族终态 / 去程 no-show 时由系统补回，
+// 写法与人工冲正同一份口径，本文件只在状态机出口与 no-show 打标处各喊一声。
+import {
+  autoReverseRedemptionsForOrderWithinTx,
+  BENEFIT_AUTO_REVERSAL_ACTOR_ID,
+  type AutoReversedRedemption,
+} from '../travelers/traveler-benefits.auto-reverse.js';
 import { serializeRoomGroupsFor } from './room-group-dto.js';
 import type {
   BatchCreateOrdersBody,
@@ -5756,6 +5763,22 @@ export class OrderService {
       }
 
       const warnings: string[] = [];
+      // 权益核销：取消时被系统自动冲正过的核销**不自动再核销**（2026-09-21 拍板），只提示。
+      // 老单测的 mock 没有这个 delegate 时跳过（真 client 永远有）。
+      const redemptionCountDelegate = (
+        tx as unknown as { travelerBenefitRedemption?: { count?: (args: unknown) => Promise<number> } }
+      ).travelerBenefitRedemption;
+      if (typeof redemptionCountDelegate?.count === 'function') {
+        const autoReversedCount = await redemptionCountDelegate.count({
+          where: { orderId, createdById: BENEFIT_AUTO_REVERSAL_ACTOR_ID },
+        });
+        if (autoReversedCount > 0) {
+          warnings.push(
+            `本单曾有 ${autoReversedCount} 条权益核销在取消时被系统自动冲正，恢复后不会自动再核销；` +
+              '需要请到常旅客档案重新核销。',
+          );
+        }
+      }
       if (returnStillReleased) {
         warnings.push(
           '回程航段仍处于「已释放」状态，本次恢复不会占回回程座位；客人若要回程，恢复后请再用「恢复回程」。',
@@ -9221,6 +9244,19 @@ export class OrderService {
           status: { in: [FulfillmentStatus.PENDING, FulfillmentStatus.IN_PROGRESS] },
         },
         data: { status: FulfillmentStatus.CANCELLED, completedAt: new Date() },
+      });
+
+      // 权益核销自动冲正（2026-09-21 拍板）：这张单不再算一次行程（取消族终态全在
+      // EXCLUDED_ORDER_STATUSES 里），挂在它上面的核销若不补回，客人档案的可用次数会凭空少一次。
+      // 触发集与履约终态化同一份 FULFILLMENT_TERMINATING_STATUSES（取消 / 退款 / 支付超时 / 失败）；
+      // REFUND_REQUESTED 只是释放座位、钱还没退，不在其中 —— 驳回退款回 PROCESSING 后行程照旧。
+      // 幂等：已冲正过的行不在候选集，同单反复取消不会二次补回。恢复占位（restoreCancelledOrder）
+      // 不自动再核销，只在响应 warnings 提示。系统调用者（超时 worker）不建待办（提单人要真实账号）。
+      await autoReverseRedemptionsForOrderWithinTx(tx, {
+        orderId: id,
+        orderNumber: order.orderNumber,
+        reason: `订单${zhStatus(toStatus)}`,
+        reminderCreatedById: isSystemActor ? null : requester.userId,
       });
     }
 
@@ -22276,6 +22312,7 @@ export class OrderService {
 
       // 再释放：去程 no-show 早已留过痕，本次只补一条释放流水，不再重复记一条 no-show。
       let log: Prisma.JsonValue = order.adjustments;
+      let benefitReversals: AutoReversedRedemption[] = [];
       if (!isRerelease) {
         log = appendAdjustment(log, {
           type: 'NO_SHOW_OUTBOUND',
@@ -22285,6 +22322,18 @@ export class OrderService {
           by: actor.userId,
           note: note ?? undefined,
         }) as Prisma.JsonValue;
+        // 权益核销自动冲正（2026-09-21 拍板）：去程打了 no-show 标这一单就不再算一次行程
+        //（飞行次数口径认 noShow 标，见 traveler-profiles.aggregate.ts），挂在它上面的核销要补回。
+        // 只在**首次**打标时做（再释放不是新的一次 no-show）；拆单后核销挂在源单上的情形由
+        // 该函数按「源单核销 + 本单乘客证件」一跳收窄。回程之后的作废（voidReleasedReturnLeg）
+        // 不再重复：那时行程早已在这里被判不计。
+        benefitReversals = await autoReverseRedemptionsForOrderWithinTx(tx, {
+          orderId: targetOrderId,
+          orderNumber: order.orderNumber,
+          reason: '去程 no-show',
+          reminderCreatedById: actor.userId,
+          at: now,
+        });
       }
       if (willRelease) {
         log = appendAdjustment(log as Prisma.JsonValue, {
@@ -22309,6 +22358,16 @@ export class OrderService {
         workOrderReminderId,
         split,
         replayed: false,
+        ...(benefitReversals.length > 0
+          ? {
+              benefitReversals: benefitReversals.map((r) => ({
+                profileId: r.profileId,
+                profileName: r.profileName,
+                tripsUsed: r.tripsUsed,
+                reversalId: r.reversalId,
+              })),
+            }
+          : {}),
       } satisfies NoShowAudit;
     });
   }
@@ -23840,6 +23899,13 @@ export interface NoShowAudit {
   split: { sourceOrderNumber: string; targetOrderNumber: string } | null;
   /** true = 同 requestToken 重试，本次没有任何写入（座位不会被二次释放）。 */
   replayed: boolean;
+  /** 首次打标时被系统自动冲正的权益核销（2026-09-21）；没有 / 回放时不带。 */
+  benefitReversals?: Array<{
+    profileId: string;
+    profileName: string;
+    tripsUsed: number;
+    reversalId: string;
+  }>;
 }
 
 /** POST /orders/:id/restore-return-leg/preview 的响应契约。 */

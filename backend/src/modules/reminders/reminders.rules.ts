@@ -54,6 +54,11 @@ import {
   collectUpgradeRedeemCandidates,
   reconcileUpgradeRedeemReminders,
 } from './reminders.rules.upgrade-redeem.js';
+// 规则 13（可用次数为负）同样拆在单独文件里，取数 + 收敛都在那边。
+import {
+  collectTripBalanceCandidates,
+  reconcileTripBalanceReminders,
+} from './reminders.rules.trip-balance.js';
 
 // ── 状态集合 ────────────────────────────────────────────────────────────────
 /** 催尾款：待付 + 已付未完结（这些状态还会收钱） */
@@ -245,7 +250,8 @@ export type RuleName =
   | 'RECEIPT_UNVERIFIED'
   | 'RANDOM_TIER_SHORTFALL'
   | 'NO_SHOW_RETURN_RELEASED'
-  | 'UPGRADE_REDEEM_PENDING';
+  | 'UPGRADE_REDEEM_PENDING'
+  | 'TRIP_BALANCE_NEGATIVE';
 
 export interface ReminderCandidate {
   rule: RuleName;
@@ -1404,6 +1410,12 @@ export async function generateRuleReminders(
   const upgradeScan = await collectUpgradeRedeemCandidates(prisma, UPGRADE_REDEEM_STATUSES, today, now);
   candidates.push(...upgradeScan.candidates);
 
+  // ── 规则 13：可用次数为负（档案级）───────────────────────────────────────────
+  // 可用 = 已飞 + 已付款在订未飞 − 已核销 < 0 = 账实不符（核销后订单退改 / 挂单号的自动冲正没覆盖到）。
+  // 取数 + 收敛在 reminders.rules.trip-balance.ts；转正后自动关，同键复发重开。
+  const tripBalanceScan = await collectTripBalanceCandidates(prisma, today);
+  candidates.push(...tripBalanceScan.candidates);
+
   // 批内去重（同一 ruleKey 只留第一条）
   const byKey = new Map<string, ReminderCandidate>();
   for (const c of candidates) {
@@ -1494,6 +1506,8 @@ export async function generateRuleReminders(
   // 只是白跑一轮。下面的 existing 查重刻意**不带 status**：DONE 行同样要挡住 createMany，
   // 不然 ruleKey 唯一索引会让 createMany 静默吞掉（skipDuplicates），运营什么都看不到。
   await reconcileUpgradeRedeemReminders(prisma, upgradeScan, now);
+  // 规则 13 收敛：同上，必须跑在下面的 existing 查重之前（重开在前、查重在后）。
+  await reconcileTripBalanceReminders(prisma, tripBalanceScan, now);
 
   if (unique.length === 0) return { created: 0, skipped: 0, byRule: {} };
 

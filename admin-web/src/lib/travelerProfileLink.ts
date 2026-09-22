@@ -15,6 +15,8 @@
 export interface TravelerProfileLinkState {
   doc: string;
   docType: string;
+  /** 从这张单点「去核销」进来时带上；档案页打开后自动展开核销表单并尝试预选这张单。 */
+  orderId?: string;
 }
 
 /** 直接摊给 <Link> 的属性。 */
@@ -23,17 +25,30 @@ export interface TravelerProfileLinkProps {
   state?: TravelerProfileLinkState;
 }
 
-/** 证件号也没有时返回 null —— 调用方据此渲染成纯文本，不给一个必然落空的链接。 */
+/**
+ * 证件号也没有时返回 null —— 调用方据此渲染成纯文本，不给一个必然落空的链接。
+ * orderId 可选：带上就是「去核销」场景——订单 id 不是敏感信息，档案 id 已知时直接拼进地址栏
+ * （同 profileId 的口径），只有证件号时随 Link state 一起带过去，不单独处理。
+ */
 export function travelerProfileLinkProps(params: {
   profileId?: string | null;
   documentType?: string | null;
   documentNumber?: string | null;
+  orderId?: string | null;
 }): TravelerProfileLinkProps | null {
   const profileId = params.profileId?.trim();
-  if (profileId) return { to: `/travelers?profile=${encodeURIComponent(profileId)}` };
+  const orderId = params.orderId?.trim();
+  if (profileId) {
+    const qs = new URLSearchParams({ profile: profileId });
+    if (orderId) qs.set('orderId', orderId);
+    return { to: `/travelers?${qs.toString()}` };
+  }
   const doc = params.documentNumber?.trim();
   if (!doc) return null;
-  return { to: '/travelers', state: { doc, docType: params.documentType?.trim() || 'PASSPORT' } };
+  return {
+    to: '/travelers',
+    state: { doc, docType: params.documentType?.trim() || 'PASSPORT', ...(orderId ? { orderId } : {}) },
+  };
 }
 
 /** 链接的悬浮说明，三处入口共用一句话。 */

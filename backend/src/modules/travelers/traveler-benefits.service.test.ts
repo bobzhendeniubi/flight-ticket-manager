@@ -20,6 +20,7 @@ const prismaMock = vi.hoisted(() => {
       groupBy: vi.fn(),
     },
     travelerProfile: { findUnique: vi.fn() },
+    order: { findUnique: vi.fn() },
     user: { findUnique: vi.fn() },
     // $transaction(fn) 直接以同一个 mock 作为 tx 执行回调（隔离级别参数在这里无意义）
     $transaction: vi.fn(async (fn: (tx: unknown) => unknown) => fn(mock)),
@@ -30,10 +31,13 @@ vi.mock('../../db/prisma.js', () => ({ prisma: prismaMock }));
 
 import { Prisma } from '@prisma/client';
 import {
+  computeAvailableTrips,
+  serializeRedemption,
   TravelerBenefitsService,
   withBenefitTotals,
   type RedemptionActor,
 } from './traveler-benefits.service.js';
+import { BENEFIT_AUTO_REVERSAL_ACTOR_ID } from './traveler-benefits.auto-reverse.js';
 import type { TravelerProfilesService } from './traveler-profiles.service.js';
 
 const ACTOR: RedemptionActor = { userId: 'u1' };
@@ -45,6 +49,7 @@ function redemptionRow(over: { id: string } & Partial<Record<string, unknown>>) 
     benefit: '航司权益兑换',
     note: null,
     reversalOfId: null,
+    orderId: null,
     createdById: 'u1',
     createdByName: '票务小组',
     createdAt: new Date('2026-08-24T09:15:00.000Z'),
@@ -52,18 +57,42 @@ function redemptionRow(over: { id: string } & Partial<Record<string, unknown>>) 
   };
 }
 
-/** 只桩出 benefits service 真正用到的两个方法：getDetail（实时重算取 tripCount）与 resolveMaster */
-function fakeProfiles(over?: { tripCount?: number; masterId?: string }) {
+/**
+ * 只桩出 benefits service 真正用到的三个方法：getDetail（实时重算取 tripCount）、resolveMaster、
+ * resolveDocPairs（挂单校验用的档案证件对）。
+ */
+function fakeProfiles(over?: { tripCount?: number; pendingPaidTripCount?: number; masterId?: string }) {
   const id = over?.masterId ?? 'p1';
-  // 真实流程里 getDetail 会把重算后的 tripCount 回写快照列，事务内重读读到的就是同一个值，
-  // 这里同步桩出 travelerProfile.findUnique 保持两处一致。
-  prismaMock.travelerProfile.findUnique.mockResolvedValue({ tripCount: over?.tripCount ?? 5 });
+  const tripCount = over?.tripCount ?? 5;
+  const pendingPaidTripCount = over?.pendingPaidTripCount ?? 0;
+  // 真实流程里 getDetail 会把重算后的 tripCount / pendingPaidTripCount 回写快照列，事务内重读读到的
+  // 就是同一个值，这里同步桩出 travelerProfile.findUnique 保持两处一致。
+  prismaMock.travelerProfile.findUnique.mockResolvedValue({ tripCount, pendingPaidTripCount });
   return {
     getDetail: vi.fn(async () => ({
-      profile: { id, fullName: 'ZHANG SAN', tripCount: over?.tripCount ?? 5 },
+      profile: { id, fullName: 'ZHANG SAN', tripCount, pendingPaidTripCount },
     })),
     resolveMaster: vi.fn(async () => ({ id, fullName: 'ZHANG SAN' })),
+    resolveDocPairs: vi.fn(async () => [
+      { documentType: 'PASSPORT', documentNumber: 'E12345678' },
+      { documentType: 'PASSPORT', documentNumber: 'OLD-E999' }, // 合并前的旧证
+    ]),
   } as unknown as TravelerProfilesService;
+}
+
+/** 挂单校验用的订单行（默认：已支付、未删、乘客证件命中档案主证）。 */
+function orderRow(over: Partial<{
+  status: string;
+  deletedAt: Date | null;
+  passengers: Array<{ documentType: string; documentNumber: string }>;
+}> = {}) {
+  return {
+    id: 'o1',
+    orderNumber: 'FTM2026092100001',
+    status: over.status ?? 'PAID',
+    deletedAt: over.deletedAt ?? null,
+    passengers: over.passengers ?? [{ documentType: 'PASSPORT', documentNumber: ' e12345678 ' }],
+  };
 }
 
 beforeEach(() => {
@@ -289,25 +318,186 @@ describe('冲正：只增补偿流水，一条核销最多冲一次', () => {
   });
 });
 
+describe('可用次数口径 computeAvailableTrips（2026-09-21：已飞 + 已付款在订未飞 − 已核销）', () => {
+  it('已飞 4 + 已付款在订未飞 1 − 已核销 0 = 5：第五次进单当场就能核销 5 次', () => {
+    expect(computeAvailableTrips({ tripCount: 4, pendingPaidTripCount: 1, redeemedTrips: 0 })).toBe(5);
+  });
+
+  it('待支付的在订单不计：pendingPaidTripCount 只收已付款那部分（调用方按聚合口径传入 0）', () => {
+    expect(computeAvailableTrips({ tripCount: 4, pendingPaidTripCount: 0, redeemedTrips: 0 })).toBe(4);
+  });
+
+  it('可为负，不截断', () => {
+    expect(computeAvailableTrips({ tripCount: 1, pendingPaidTripCount: 0, redeemedTrips: 4 })).toBe(-3);
+  });
+});
+
 describe('可用次数口径 withBenefitTotals', () => {
-  it('availableTrips = tripCount − 已核销净值', () => {
-    const out = withBenefitTotals({ id: 'p1', tripCount: 5 }, new Map([['p1', 3]]));
-    expect(out).toMatchObject({ redeemedTrips: 3, availableTrips: 2 });
+  it('availableTrips = tripCount + pendingPaidTripCount − 已核销净值', () => {
+    const out = withBenefitTotals(
+      { id: 'p1', tripCount: 5, pendingPaidTripCount: 1 },
+      new Map([['p1', 3]]),
+    );
+    expect(out).toMatchObject({ redeemedTrips: 3, availableTrips: 3 });
   });
 
   it('没有台账流水的档案按 0 核销处理', () => {
-    const out = withBenefitTotals({ id: 'p1', tripCount: 5 }, new Map());
+    const out = withBenefitTotals({ id: 'p1', tripCount: 5, pendingPaidTripCount: 0 }, new Map());
     expect(out).toMatchObject({ redeemedTrips: 0, availableTrips: 5 });
   });
 
   it('退单让已飞次数掉下来时 availableTrips 如实为负，不截断到 0', () => {
-    const out = withBenefitTotals({ id: 'p1', tripCount: 1 }, new Map([['p1', 4]]));
+    const out = withBenefitTotals(
+      { id: 'p1', tripCount: 1, pendingPaidTripCount: 0 },
+      new Map([['p1', 4]]),
+    );
     expect(out.availableTrips).toBe(-3);
   });
 
   it('冲正后净值回落，可用次数随之补回', () => {
     // 核销 3 + 冲正 -3 ⇒ groupBy sum = 0
-    const out = withBenefitTotals({ id: 'p1', tripCount: 5 }, new Map([['p1', 0]]));
+    const out = withBenefitTotals(
+      { id: 'p1', tripCount: 5, pendingPaidTripCount: 0 },
+      new Map([['p1', 0]]),
+    );
     expect(out).toMatchObject({ redeemedTrips: 0, availableTrips: 5 });
+  });
+});
+
+describe('核销闸按新口径放行：已飞 + 已付款在订未飞', () => {
+  it('已飞 4 + 已付款在订未飞 1，核销 5 次放行（旧口径会 400）', async () => {
+    const svc = new TravelerBenefitsService(fakeProfiles({ tripCount: 4, pendingPaidTripCount: 1 }));
+    prismaMock.travelerBenefitRedemption.aggregate.mockResolvedValue({ _sum: { tripsUsed: 0 } });
+    prismaMock.travelerBenefitRedemption.create.mockResolvedValue(redemptionRow({ id: 'r1', tripsUsed: 5 }));
+
+    await expect(
+      svc.redeem('p1', { tripsUsed: 5, benefit: '飞满 5 次兑换升舱' }, ACTOR),
+    ).resolves.toBeDefined();
+  });
+
+  it('已飞 4 + 已付款在订未飞 0（在订的是待支付单），核销 5 次仍拒', async () => {
+    const svc = new TravelerBenefitsService(fakeProfiles({ tripCount: 4, pendingPaidTripCount: 0 }));
+    prismaMock.travelerBenefitRedemption.aggregate.mockResolvedValue({ _sum: { tripsUsed: 0 } });
+
+    await expect(
+      svc.redeem('p1', { tripsUsed: 5, benefit: '飞满 5 次兑换升舱' }, ACTOR),
+    ).rejects.toThrow(/已付款在订未飞 0 次/);
+    expect(prismaMock.travelerBenefitRedemption.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('核销挂订单号（orderId）', () => {
+  beforeEach(() => {
+    prismaMock.travelerBenefitRedemption.aggregate.mockResolvedValue({ _sum: { tripsUsed: 0 } });
+    prismaMock.travelerBenefitRedemption.create.mockResolvedValue(
+      redemptionRow({ id: 'r1', orderId: 'o1', order: { orderNumber: 'FTM2026092100001' } }),
+    );
+  });
+
+  it('订单存在、未删、已付款、乘客证件命中档案（大小写/空格归一）→ 落 orderId，响应带回单号', async () => {
+    const svc = new TravelerBenefitsService(fakeProfiles({ tripCount: 5 }));
+    prismaMock.order.findUnique.mockResolvedValue(orderRow());
+
+    const res = await svc.redeem('p1', { tripsUsed: 1, benefit: '升舱', orderId: ' o1 ' }, ACTOR);
+
+    expect(prismaMock.travelerBenefitRedemption.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ orderId: 'o1' }) }),
+    );
+    expect(res.redemption).toMatchObject({ orderId: 'o1', orderNumber: 'FTM2026092100001', auto: false });
+  });
+
+  it('合并前的旧证出现在单上也算命中', async () => {
+    const svc = new TravelerBenefitsService(fakeProfiles({ tripCount: 5 }));
+    prismaMock.order.findUnique.mockResolvedValue(
+      orderRow({ passengers: [{ documentType: 'PASSPORT', documentNumber: 'old-e999' }] }),
+    );
+
+    await expect(svc.redeem('p1', { tripsUsed: 1, benefit: '升舱', orderId: 'o1' }, ACTOR)).resolves.toBeDefined();
+  });
+
+  it('订单不存在 → 400 REDEMPTION_ORDER_MISMATCH，不写流水', async () => {
+    const svc = new TravelerBenefitsService(fakeProfiles({ tripCount: 5 }));
+    prismaMock.order.findUnique.mockResolvedValue(null);
+
+    await expect(svc.redeem('p1', { tripsUsed: 1, benefit: '升舱', orderId: 'nope' }, ACTOR)).rejects.toMatchObject({
+      code: 'REDEMPTION_ORDER_MISMATCH',
+      statusCode: 400,
+      message: expect.stringContaining('找不到这张订单'),
+    });
+    expect(prismaMock.travelerBenefitRedemption.create).not.toHaveBeenCalled();
+  });
+
+  it('订单在回收站（软删）→ 400 REDEMPTION_ORDER_MISMATCH', async () => {
+    const svc = new TravelerBenefitsService(fakeProfiles({ tripCount: 5 }));
+    prismaMock.order.findUnique.mockResolvedValue(orderRow({ deletedAt: new Date() }));
+
+    await expect(svc.redeem('p1', { tripsUsed: 1, benefit: '升舱', orderId: 'o1' }, ACTOR)).rejects.toMatchObject({
+      code: 'REDEMPTION_ORDER_MISMATCH',
+      message: expect.stringContaining('回收站'),
+    });
+  });
+
+  it('订单待支付（未付款族）→ 400 REDEMPTION_ORDER_MISMATCH', async () => {
+    const svc = new TravelerBenefitsService(fakeProfiles({ tripCount: 5 }));
+    prismaMock.order.findUnique.mockResolvedValue(orderRow({ status: 'PENDING_PAYMENT' }));
+
+    await expect(svc.redeem('p1', { tripsUsed: 1, benefit: '升舱', orderId: 'o1' }, ACTOR)).rejects.toMatchObject({
+      code: 'REDEMPTION_ORDER_MISMATCH',
+      message: expect.stringContaining('不是已付款'),
+    });
+  });
+
+  it('单上乘客证件与档案不匹配 → 400 REDEMPTION_ORDER_MISMATCH', async () => {
+    const svc = new TravelerBenefitsService(fakeProfiles({ tripCount: 5 }));
+    prismaMock.order.findUnique.mockResolvedValue(
+      orderRow({ passengers: [{ documentType: 'PASSPORT', documentNumber: 'SOMEONE-ELSE' }] }),
+    );
+
+    await expect(svc.redeem('p1', { tripsUsed: 1, benefit: '升舱', orderId: 'o1' }, ACTOR)).rejects.toMatchObject({
+      code: 'REDEMPTION_ORDER_MISMATCH',
+      message: expect.stringContaining('没有本档案的证件号'),
+    });
+    expect(prismaMock.travelerBenefitRedemption.create).not.toHaveBeenCalled();
+  });
+
+  it('不挂单号时不查订单', async () => {
+    const svc = new TravelerBenefitsService(fakeProfiles({ tripCount: 5 }));
+    await svc.redeem('p1', { tripsUsed: 1, benefit: '升舱' }, ACTOR);
+    expect(prismaMock.order.findUnique).not.toHaveBeenCalled();
+  });
+
+  it('冲正照抄原行的 orderId', async () => {
+    const svc = new TravelerBenefitsService(fakeProfiles({ tripCount: 5 }));
+    prismaMock.travelerBenefitRedemption.findUnique
+      .mockResolvedValueOnce(redemptionRow({ id: 'r1', orderId: 'o1' }))
+      .mockResolvedValueOnce(null);
+    prismaMock.travelerBenefitRedemption.create.mockResolvedValue(
+      redemptionRow({ id: 'r2', tripsUsed: -3, reversalOfId: 'r1', orderId: 'o1' }),
+    );
+
+    await svc.reverse('p1', 'r1', null, ACTOR);
+
+    expect(prismaMock.travelerBenefitRedemption.create).toHaveBeenCalledWith(
+      expect.objectContaining({ data: expect.objectContaining({ reversalOfId: 'r1', orderId: 'o1' }) }),
+    );
+  });
+});
+
+describe('serializeRedemption 契约字段', () => {
+  it('带 orderId / orderNumber（联查）/ auto（系统自动冲正行）', () => {
+    const auto = serializeRedemption(
+      redemptionRow({
+        id: 'rev-1',
+        tripsUsed: -5,
+        reversalOfId: 'r1',
+        orderId: 'o1',
+        order: { orderNumber: 'FTM2026092100001' },
+        createdById: BENEFIT_AUTO_REVERSAL_ACTOR_ID,
+        createdByName: '系统自动',
+      }) as never,
+    );
+    expect(auto).toMatchObject({ orderId: 'o1', orderNumber: 'FTM2026092100001', auto: true });
+    const manual = serializeRedemption(redemptionRow({ id: 'r1' }) as never);
+    expect(manual).toMatchObject({ orderId: null, orderNumber: null, auto: false });
   });
 });

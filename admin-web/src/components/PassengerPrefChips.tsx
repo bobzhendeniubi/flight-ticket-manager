@@ -69,6 +69,8 @@ export interface PassengerPrefChipsProps {
   profileId?: string | null;
   documentType?: string | null;
   documentNumber?: string | null;
+  /** 当前订单 id（可选）：带上就是「从这张单去核销」——档案页打开后自动展开核销表单并预选这张单。 */
+  orderId?: string | null;
 }
 
 /** 乘客级徽标：床型 + 兑换升舱。两项都没有时整体不渲染（返回 null，不留空白）。 */
@@ -80,6 +82,7 @@ export function PassengerPrefChips({
   profileId,
   documentType,
   documentNumber,
+  orderId,
 }: PassengerPrefChipsProps) {
   // 核销是内部台账操作，代理看不到也点不了（后端 /profiles/:id/redemptions 同样只认 ADMIN/STAFF）
   const role = useAuth((s) => s.user?.role);
@@ -87,7 +90,7 @@ export function PassengerPrefChips({
   const leg = upgradeRedeemLegLabel(upgradeRedeemLeg);
   const redeemLink =
     leg && (role === 'ADMIN' || role === 'STAFF')
-      ? travelerProfileLinkProps({ profileId, documentType, documentNumber })
+      ? travelerProfileLinkProps({ profileId, documentType, documentNumber, orderId })
       : null;
   if (!bed && !leg) return null;
   const spacing = inline ? 'ml-2 ' : '';

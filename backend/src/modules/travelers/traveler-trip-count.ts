@@ -318,6 +318,8 @@ export interface CombinedTripCount {
   tripCount: number;
   /** 在订未飞（新系统口径；老系统已封笔，没有未来的单）。 */
   pendingTripCount: number;
+  /** 已付款在订未飞（pendingTripCount 里状态已付款的那部分；进可用次数，见 computeAvailableTrips）。 */
+  pendingPaidTripCount: number;
   /**
    * 新系统聚合（有有效订单才有；只有老系统历史的人为 undefined）。
    * 现算时顺手带出来，lookup 未命中档案时可以直接拿它当场建档，不用再查一遍订单。
@@ -394,6 +396,7 @@ export async function computeCombinedTripCounts(
           // 新系统那半边照样真算（没有订单才是 0），再走唯一的加法 helper 并上老系统。
           tripCount: addLegacyTripCount({ tripCount: aggregate?.tripCount ?? 0 }, legacyTripCount),
           pendingTripCount: aggregate?.pendingTripCount ?? 0,
+          pendingPaidTripCount: aggregate?.pendingPaidTripCount ?? 0,
           aggregate,
           legacyTripCount,
         },

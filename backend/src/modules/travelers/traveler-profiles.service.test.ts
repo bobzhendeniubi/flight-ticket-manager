@@ -14,16 +14,21 @@ const prismaMock = vi.hoisted(() => ({
     findMany: vi.fn(),
     update: vi.fn(),
     deleteMany: vi.fn(),
+    count: vi.fn(),
+    aggregate: vi.fn(),
   },
+  passenger: { findFirst: vi.fn() },
   order: { findMany: vi.fn() },
   savedPassenger: { findMany: vi.fn() },
   travelerBenefitRedemption: { groupBy: vi.fn(), findMany: vi.fn() },
+  $transaction: vi.fn(),
 }));
 vi.mock('../../db/prisma.js', () => ({ prisma: prismaMock }));
 
 import {
   addLegacyTripCount,
   loadLegacyTripCounts,
+  parseTravelerSearchTerms,
   sumLegacyTripCounts,
   TravelerProfilesService,
 } from './traveler-profiles.service.js';
@@ -34,6 +39,8 @@ beforeEach(() => {
   prismaMock.savedPassenger.findMany.mockResolvedValue([]);
   prismaMock.travelerBenefitRedemption.groupBy.mockResolvedValue([]);
   prismaMock.travelerBenefitRedemption.findMany.mockResolvedValue([]);
+  // list() 用数组形式的 $transaction（不是回调形式）：原样把每个 promise 跑完再收集结果。
+  prismaMock.$transaction.mockImplementation(async (ops: Promise<unknown>[]) => Promise.all(ops));
 });
 
 describe('loadLegacyTripCounts', () => {
@@ -324,5 +331,109 @@ describe('TravelerProfilesService.rebuildAll', () => {
       where: { id: row.id },
       data: expect.objectContaining({ tripCount: 5, legacyTripCount: 2, refreshedAt: expect.any(Date) }),
     });
+  });
+});
+
+describe('parseTravelerSearchTerms', () => {
+  it('按换行/逗号/顿号/分号/空格切分并过滤空 term', () => {
+    const raw = '张三, 李四\n王五、赵六；E1234  钱七';
+    expect(parseTravelerSearchTerms(raw)).toEqual(['张三', '李四', '王五', '赵六', 'E1234', '钱七']);
+  });
+
+  it('单个词没有分隔符时返回它自身这一个 term', () => {
+    expect(parseTravelerSearchTerms('张三')).toEqual(['张三']);
+  });
+
+  it('全是分隔符/空白时返回空数组', () => {
+    expect(parseTravelerSearchTerms('  , 、;\n')).toEqual([]);
+  });
+});
+
+describe('TravelerProfilesService.list 多人搜索', () => {
+  const baseQuery = { sort: 'lastTripAt' as const, order: 'desc' as const, page: 1, pageSize: 100 };
+
+  beforeEach(() => {
+    prismaMock.travelerProfile.aggregate.mockResolvedValue({
+      _count: { _all: 5 },
+      _sum: { tripCount: 50 },
+      _max: { refreshedAt: new Date() },
+    });
+    prismaMock.travelerProfile.findMany.mockResolvedValue([]);
+  });
+
+  it('单 term 时 where.OR 与改造前一致（姓名/中文名/证件号三个 contains）', async () => {
+    prismaMock.travelerProfile.count.mockResolvedValue(0);
+
+    await new TravelerProfilesService().list({ ...baseQuery, search: '张三' });
+
+    expect(prismaMock.travelerProfile.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          OR: [
+            { fullName: { contains: '张三', mode: 'insensitive' } },
+            { chineseName: { contains: '张三', mode: 'insensitive' } },
+            { documentNumber: { contains: '张三', mode: 'insensitive' } },
+          ],
+        }),
+      }),
+    );
+  });
+
+  it('多 term 时展开成整体 OR（每个 term 各三个字段）', async () => {
+    prismaMock.travelerProfile.count.mockResolvedValue(0);
+
+    await new TravelerProfilesService().list({ ...baseQuery, search: '张三,李四' });
+
+    expect(prismaMock.travelerProfile.findMany).toHaveBeenCalledWith(
+      expect.objectContaining({
+        where: expect.objectContaining({
+          OR: [
+            { fullName: { contains: '张三', mode: 'insensitive' } },
+            { chineseName: { contains: '张三', mode: 'insensitive' } },
+            { documentNumber: { contains: '张三', mode: 'insensitive' } },
+            { fullName: { contains: '李四', mode: 'insensitive' } },
+            { chineseName: { contains: '李四', mode: 'insensitive' } },
+            { documentNumber: { contains: '李四', mode: 'insensitive' } },
+          ],
+        }),
+      }),
+    );
+  });
+
+  it('返回 unmatchedTerms：一个都没命中的 term 会被列出来，命中的不会', async () => {
+    prismaMock.travelerProfile.count.mockImplementation(
+      async ({ where }: { where?: { OR?: Array<{ fullName?: { contains?: string } }> } }) => {
+        const or = where?.OR ?? [];
+        // 只有「按 term 单独 count」的调用带精确 3 项 OR；命中判定按 term 内容分支。
+        if (or.length === 3) {
+          const term = or[0]?.fullName?.contains;
+          return term === '张三' ? 1 : 0;
+        }
+        return 1; // 分页 total（整体 OR）不影响本测试断言
+      },
+    );
+
+    const result = await new TravelerProfilesService().list({ ...baseQuery, search: '张三,李四,  ,王五' });
+
+    expect(result.unmatchedTerms).toEqual(['李四', '王五']);
+  });
+
+  it('空 term（多余分隔符/空白）不进入搜索条件，也不出现在 unmatchedTerms', async () => {
+    prismaMock.travelerProfile.count.mockResolvedValue(0);
+
+    const result = await new TravelerProfilesService().list({ ...baseQuery, search: '  张三 ,, 、 ' });
+
+    expect(result.unmatchedTerms).toEqual(['张三']);
+    const call = prismaMock.travelerProfile.findMany.mock.calls[0][0] as { where: { OR?: unknown[] } };
+    expect(call.where.OR).toHaveLength(3);
+  });
+
+  it('没有搜索条件时不加 OR，也不产生 unmatchedTerms 相关的额外 count 调用', async () => {
+    const result = await new TravelerProfilesService().list({ ...baseQuery });
+
+    const call = prismaMock.travelerProfile.findMany.mock.calls[0][0] as { where: { OR?: unknown[] } };
+    expect(call.where.OR).toBeUndefined();
+    expect(result.unmatchedTerms).toEqual([]);
+    expect(prismaMock.travelerProfile.count).toHaveBeenCalledTimes(1); // 只有分页 total 这一次
   });
 });

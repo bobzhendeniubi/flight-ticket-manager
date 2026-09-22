@@ -936,11 +936,13 @@ describe('loadTripCountMap', () => {
     expect(tripStats.get(docKey('PASSPORT', 'E12345678'))).toEqual({
       tripCount: 7,
       pendingTripCount: 2,
-      availableTrips: 7, // 无核销流水 → 可用次数 = 飞行次数
+      pendingPaidTripCount: 0, // 夹具没这一列 → 按 0
+      availableTrips: 7, // 无核销流水、无已付款在订 → 可用次数 = 飞行次数
     });
     expect(tripStats.get(docKey('PASSPORT', 'E87654321'))).toEqual({
       tripCount: 1,
       pendingTripCount: 0,
+      pendingPaidTripCount: 0,
       availableTrips: 1,
     });
     // 无 N+1：两位乘客只有一条档案查询 + 一条核销 groupBy（无指针行 → 不需要补拉主档案）
@@ -960,6 +962,7 @@ describe('loadTripCountMap', () => {
     expect(tripStats.get(docKey('PASSPORT', 'e12345678'))).toEqual({
       tripCount: 7,
       pendingTripCount: 2,
+      pendingPaidTripCount: 0,
       availableTrips: 7,
     });
   });

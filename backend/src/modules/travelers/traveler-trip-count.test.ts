@@ -294,3 +294,30 @@ describe('computeCombinedTripCounts 附带聚合（供 lookup 未命中时当场
     expect(oldOnly.legacyTripCount).toBe(1);
   });
 });
+
+describe('已付款在订未飞 pendingPaidTripCount（2026-09-21：进可用次数的那部分）', () => {
+  it('在订未飞里只有已付款单计入 pendingPaidTripCount；待支付单只进 pendingTripCount', async () => {
+    const client = fakeClientForPaid([
+      orderRow('E12345678', '2026-08-01T00:00:00.000Z', 'PAID'), // 已付款、未飞
+      orderRow('E12345678', '2026-08-05T00:00:00.000Z', 'PENDING_PAYMENT'), // 待支付、未飞
+      orderRow('E12345678', '2026-06-01T00:00:00.000Z', 'COMPLETED'), // 已飞
+    ]);
+    const out = await computeCombinedTripCounts(
+      [{ documentType: DocumentType.PASSPORT, documentNumber: 'E12345678' }],
+      client,
+      NOW,
+    );
+    const row = out.get(docKey(DocumentType.PASSPORT, 'E12345678'))!;
+    expect(row.tripCount).toBe(1);
+    expect(row.pendingTripCount).toBe(2);
+    expect(row.pendingPaidTripCount).toBe(1);
+  });
+});
+
+/** 与文件上方同款的假 client（订单表按传入行返回、老系统表为空）。 */
+function fakeClientForPaid(rows: ReturnType<typeof orderRow>[]) {
+  return {
+    order: { findMany: vi.fn().mockResolvedValue(rows) },
+    legacyTicket: { findMany: vi.fn().mockResolvedValue([]) },
+  } as unknown as Parameters<typeof computeCombinedTripCounts>[1];
+}

@@ -30,6 +30,7 @@ import {
   type LegacyTripCountScope,
 } from './traveler-trip-count.js';
 import {
+  computeAvailableTrips,
   loadRedeemedTripsByProfile,
   loadRedemptions,
   withBenefitTotals,
@@ -52,6 +53,30 @@ export const SNAPSHOT_STALE_MS = 6 * 60 * 60 * 1000;
 /** 常旅客号展示格式：CT- + 6 位补零（服务端统一格式化，前端不拼） */
 export function formatTravelerNo(no: number): string {
   return `CT-${String(no).padStart(6, '0')}`;
+}
+
+/** 多人搜索的 term 分隔符：换行 / 英文逗号 / 中文逗号 / 顿号 / 英文分号 / 中文分号 / 空白 */
+const SEARCH_TERM_SPLIT_RE = /[,，、;；\s]+/u;
+
+/**
+ * 把一次贴进搜索框的原始字符串切成多个搜索 term（姓名/证件号）。
+ * 没有分隔符的普通输入切出来就是它自身这一个 term —— 单 term 场景行为不变。
+ * 全是分隔符/空白的输入返回空数组（等同于没有搜索条件）。
+ */
+export function parseTravelerSearchTerms(raw: string): string[] {
+  return raw
+    .split(SEARCH_TERM_SPLIT_RE)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+}
+
+/** 单个 term 的匹配口径（姓名 / 中文名 / 证件号 contains，大小写不敏感）——多 term 场景按 term 各生成一组再整体 OR。 */
+export function travelerSearchTermConditions(term: string): Prisma.TravelerProfileWhereInput[] {
+  return [
+    { fullName: { contains: term, mode: 'insensitive' } },
+    { chineseName: { contains: term, mode: 'insensitive' } },
+    { documentNumber: { contains: term, mode: 'insensitive' } },
+  ];
 }
 
 /** 档案合并解析用的最小行（全表小数据量，一次拉全量在内存里解析链） */
@@ -83,7 +108,10 @@ export interface TravelerLookupResult {
   hasProfile: boolean;
   tripCount: number;
   pendingTripCount: number;
+  /** 已付款在订未飞（进可用次数的那部分）。 */
+  pendingPaidTripCount: number;
   redeemedTrips: number;
+  /** 可用 = 已飞 + 已付款在订未飞 − 已核销（computeAvailableTrips）。 */
   availableTrips: number;
 }
 
@@ -105,6 +133,7 @@ function toProfileData(
     tripCount: addLegacyTripCount(agg, legacyTripCount),
     legacyTripCount,
     pendingTripCount: agg.pendingTripCount,
+    pendingPaidTripCount: agg.pendingPaidTripCount,
     orderCount: agg.orderCount,
     firstTripAt: agg.firstTripAt,
     lastTripAt: agg.lastTripAt,
@@ -136,12 +165,12 @@ export class TravelerProfilesService {
       mergedIntoId: null,
       documentNumber: { not: 'N/A' },
     };
-    if (query.search) {
-      where.OR = [
-        { fullName: { contains: query.search, mode: 'insensitive' } },
-        { chineseName: { contains: query.search, mode: 'insensitive' } },
-        { documentNumber: { contains: query.search, mode: 'insensitive' } },
-      ];
+    // 多人搜索：运营常把好几个姓名/证件号一次贴进来查，按换行/逗号/顿号/分号/空格切成
+    // 多个 term，每个 term 仍走原来的单值口径（姓名/中文名/证件号 contains），整体 OR 起来。
+    // 单 term（没有分隔符）时 searchTerms 长度为 1，where.OR 与改造前一字不差。
+    const searchTerms = query.search ? parseTravelerSearchTerms(query.search) : [];
+    if (searchTerms.length > 0) {
+      where.OR = searchTerms.flatMap((term) => travelerSearchTermConditions(term));
     }
     if (query.minTrips !== undefined) where.tripCount = { gte: query.minTrips };
 
@@ -173,6 +202,27 @@ export class TravelerProfilesService {
     // 权益台账合计：整页一次 groupBy（不是逐行查，避免 N+1）
     const redeemedByProfile = await loadRedeemedTripsByProfile(rows.map((r) => r.id));
 
+    // 多人搜索一个都没命中的 term：每个 term 单独 count 一次（同样排除合并指针行/占位档案），
+    // 前端顶部黄条直接列出来，不用运营自己肉眼比对贴进去的名单和结果。term 数通常是几个到
+    // 几十个人名，逐个 count 换取「哪个没查到」比整页翻找划算；单 term 时这里也照算，不特判。
+    const unmatchedTerms: string[] = [];
+    if (searchTerms.length > 0) {
+      const hitCounts = await Promise.all(
+        searchTerms.map((term) =>
+          prisma.travelerProfile.count({
+            where: {
+              mergedIntoId: null,
+              documentNumber: { not: 'N/A' },
+              OR: travelerSearchTermConditions(term),
+            },
+          }),
+        ),
+      );
+      searchTerms.forEach((term, i) => {
+        if (hitCounts[i] === 0) unmatchedTerms.push(term);
+      });
+    }
+
     return {
       // 2026-09-14 拍板：档案列表/导出出证件全号（此前 07-17 起前2后2脱敏）。
       // 后台是内部岗位在用，运营核对护照要看全号；订单列表 09-13 已改全号，这里跟齐。
@@ -183,6 +233,7 @@ export class TravelerProfilesService {
         totalTrips: stats._sum.tripCount ?? 0,
         refreshedAt: stats._max.refreshedAt,
       },
+      unmatchedTerms,
     };
   }
 
@@ -230,6 +281,11 @@ export class TravelerProfilesService {
         data: {
           tripCount: newSystemTripCount + legacyTripCount,
           legacyTripCount,
+          // 一张有效订单都不剩 → 在订未飞两项必然是 0；不清会让上一次快照的「已付款在订未飞」
+          // 继续进可用次数（订单取消后可用应回落，2026-09-21 口径把它算进可用后这就是钱）。
+          pendingTripCount: 0,
+          pendingPaidTripCount: 0,
+          nextTripAt: null,
           refreshedAt: now,
         },
       });
@@ -278,6 +334,23 @@ export class TravelerProfilesService {
     const master = await prisma.travelerProfile.findUnique({ where: { id: masterRef.id } });
     if (!master) throw new NotFoundError('旅客档案不存在');
     return master;
+  }
+
+  /**
+   * 主档案的全部证件对（本证 + 并入它的旧证）：核销挂单时比对「单上乘客是不是这个人」用。
+   * 传指针行 id 时先解析到主档案；沿链与 getDetail 同一套 buildAliasIndex，口径不分叉。
+   */
+  async resolveDocPairs(id: string): Promise<DocPair[]> {
+    const refs = await this.loadProfileRefs();
+    const ref = refs.get(id);
+    if (!ref) throw new NotFoundError('旅客档案不存在');
+    const master = resolveMasterRef(ref, refs);
+    const { docPairsByMasterId } = buildAliasIndex(refs);
+    return (
+      docPairsByMasterId.get(master.id) ?? [
+        { documentType: master.documentType, documentNumber: master.documentNumber },
+      ]
+    );
   }
 
   async updateNotes(id: string, notes: string | null) {
@@ -418,8 +491,13 @@ export class TravelerProfilesService {
         passportExpiry: p.passportExpiry,
         tripCount: p.tripCount,
         pendingTripCount: p.pendingTripCount,
+        pendingPaidTripCount: p.pendingPaidTripCount,
         redeemedTrips: redeemedByProfile.get(p.id) ?? 0,
-        availableTrips: p.tripCount - (redeemedByProfile.get(p.id) ?? 0),
+        availableTrips: computeAvailableTrips({
+          tripCount: p.tripCount,
+          pendingPaidTripCount: p.pendingPaidTripCount,
+          redeemedTrips: redeemedByProfile.get(p.id) ?? 0,
+        }),
         lastTripAt: p.lastTripAt,
         prefCabin: p.prefCabin,
         prefBed: p.prefBed,
@@ -521,7 +599,7 @@ export class TravelerProfilesService {
       const hit = hitByKey.get(key);
       const filed = filedByKey.get(key);
       if (!hit && filed) {
-        // 刚建的档案还没有权益台账，可用 = 合计
+        // 刚建的档案还没有权益台账，可用 = 已飞 + 已付款在订未飞
         results.push({
           documentType: doc.documentType,
           documentNumber: doc.documentNumber,
@@ -530,8 +608,13 @@ export class TravelerProfilesService {
           hasProfile: true,
           tripCount: filed.tripCount,
           pendingTripCount: filed.pendingTripCount,
+          pendingPaidTripCount: filed.pendingPaidTripCount,
           redeemedTrips: 0,
-          availableTrips: filed.tripCount,
+          availableTrips: computeAvailableTrips({
+            tripCount: filed.tripCount,
+            pendingPaidTripCount: filed.pendingPaidTripCount,
+            redeemedTrips: 0,
+          }),
         });
         continue;
       }
@@ -546,8 +629,13 @@ export class TravelerProfilesService {
           hasProfile: false,
           tripCount: live.tripCount,
           pendingTripCount: live.pendingTripCount,
+          pendingPaidTripCount: live.pendingPaidTripCount,
           redeemedTrips: 0,
-          availableTrips: live.tripCount,
+          availableTrips: computeAvailableTrips({
+            tripCount: live.tripCount,
+            pendingPaidTripCount: live.pendingPaidTripCount,
+            redeemedTrips: 0,
+          }),
         });
         continue;
       }
@@ -561,8 +649,13 @@ export class TravelerProfilesService {
         hasProfile: true,
         tripCount: master.tripCount,
         pendingTripCount: master.pendingTripCount,
+        pendingPaidTripCount: master.pendingPaidTripCount,
         redeemedTrips,
-        availableTrips: master.tripCount - redeemedTrips,
+        availableTrips: computeAvailableTrips({
+          tripCount: master.tripCount,
+          pendingPaidTripCount: master.pendingPaidTripCount,
+          redeemedTrips,
+        }),
       });
     }
     return results;
@@ -684,6 +777,10 @@ export class TravelerProfilesService {
         data: {
           tripCount: newSystemTripCount + legacyTripCount,
           legacyTripCount,
+          // 同 getDetail 的无有效订单分支：在订未飞两项归零，别让旧快照继续撑着可用次数
+          pendingTripCount: 0,
+          pendingPaidTripCount: 0,
+          nextTripAt: null,
           refreshedAt: now,
         },
       });
@@ -899,6 +996,7 @@ function serializeProfile(row: ProfileRow) {
     tripCount: row.tripCount,
     legacyTripCount: row.legacyTripCount,
     pendingTripCount: row.pendingTripCount,
+    pendingPaidTripCount: row.pendingPaidTripCount,
     orderCount: row.orderCount,
     firstTripAt: row.firstTripAt,
     lastTripAt: row.lastTripAt,

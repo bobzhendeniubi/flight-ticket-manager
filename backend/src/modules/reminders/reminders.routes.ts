@@ -32,6 +32,7 @@ import {
   parseUpgradeRedeemRuleKey,
   resolveRedeemProfileIdsByPassenger,
 } from './reminders.rules.upgrade-redeem.js';
+import { parseTripBalanceRuleKey } from './reminders.rules.trip-balance.js';
 
 export const reminderRoutes: FastifyPluginAsync = async (app) => {
   const requireOps = {
@@ -84,10 +85,14 @@ export const reminderRoutes: FastifyPluginAsync = async (app) => {
     return {
       reminders: rows.map((r) => {
         const passengerId = parseUpgradeRedeemRuleKey(r.ruleKey)?.passengerId;
+        // 规则 13（可用次数为负）的键本身就是档案 id（档案级、稳定），直接给直达目标
+        const tripBalanceProfileId = parseTripBalanceRuleKey(r.ruleKey)?.profileId ?? null;
         return {
           ...r,
-          // 非规则 12 的行恒为 null；查不到档案的也是 null（前端据此不渲染「去核销」链接）
-          redeemProfileId: passengerId ? (redeemProfileIds.get(passengerId) ?? null) : null,
+          // 非规则 12 / 13 的行恒为 null；查不到档案的也是 null（前端据此不渲染「去核销」链接）
+          redeemProfileId: passengerId
+            ? (redeemProfileIds.get(passengerId) ?? null)
+            : tripBalanceProfileId,
         };
       }),
       pagination: { page: q.page, pageSize: q.pageSize, total },

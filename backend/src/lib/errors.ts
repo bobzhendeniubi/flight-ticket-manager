@@ -46,6 +46,17 @@ export class PriceChangedError extends AppError {
   }
 }
 
+/**
+ * 权益核销挂的订单与档案对不上（订单不存在 / 已删 / 未付款 / 乘客证件与档案不匹配）。
+ * 稳定 code=REDEMPTION_ORDER_MISMATCH，前端据此把 message 原样提示到挂单输入框旁（不靠中文文案匹配）。
+ */
+export class RedemptionOrderMismatchError extends AppError {
+  constructor(message = '核销挂的订单与档案不匹配', details?: unknown) {
+    super(message, { statusCode: 400, code: 'REDEMPTION_ORDER_MISMATCH', details });
+    this.name = 'RedemptionOrderMismatchError';
+  }
+}
+
 export class UnauthorizedError extends AppError {
   constructor(message = 'Unauthorized') {
     super(message, { statusCode: 401, code: 'UNAUTHORIZED' });

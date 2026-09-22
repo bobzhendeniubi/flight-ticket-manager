@@ -17,7 +17,7 @@ import {
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { Icon } from '../components/Icon';
-import { TRAVELER_PROFILE_LINK_TITLE } from '../lib/travelerProfileLink';
+import { TRAVELER_PROFILE_LINK_TITLE, travelerProfileLinkProps } from '../lib/travelerProfileLink';
 
 const PAGE_SIZE = 20;
 
@@ -64,6 +64,7 @@ const RULE_LABEL: Record<string, string> = {
   RANDOM_TIER_SHORTFALL: '随机档缺口需加房',
   NO_SHOW_RETURN_RELEASED: '回程已释放待跟进',
   UPGRADE_REDEEM_PENDING: '次数升级待核销',
+  TRIP_BALANCE_NEGATIVE: '可用次数为负',
 };
 
 function ruleLabel(key: string): string {
@@ -83,6 +84,17 @@ function upgradeRedeemProfileId(reminder: OperationalReminder): string | null {
   // redeemProfileId 是列表接口的派生字段（不在 OperationalReminder 的公共类型里）
   const profileId = (reminder as { redeemProfileId?: string | null }).redeemProfileId;
   return profileId?.trim() ? profileId : null;
+}
+
+/**
+ * 「可用次数为负」的档案直达链接：ruleKey 固定形如 `TRIPNEG:{profileId}`（不随改名/改档变化，
+ * 直接取末段即可，不用像升级待核销那样现算）。格式不对就当没有，不强行拼一个假链接。
+ */
+function tripBalanceNegativeProfileId(reminder: OperationalReminder): string | null {
+  const key = reminder.ruleKey?.trim();
+  if (!key?.startsWith('TRIPNEG:')) return null;
+  const profileId = key.slice('TRIPNEG:'.length).trim();
+  return profileId || null;
 }
 
 function todayYmd(): string {
@@ -403,6 +415,15 @@ export function RemindersPage() {
                 const overdue = isOpenLike && r.dueAt !== null && ymd(r.dueAt) < today;
                 const rowBusy = busyId === r.id;
                 const redeemProfileId = upgradeRedeemProfileId(r);
+                // 「可用次数为负」也带档案直达，但不是「去核销」——只有升级待核销才是要去扣一次；
+                // 可用为负多半是退改把已飞次数拉回来了，链接是给运营去看一眼，不是去操作。
+                const balanceProfileId = redeemProfileId ? null : tripBalanceNegativeProfileId(r);
+                const directProfileId = redeemProfileId ?? balanceProfileId;
+                // 当前单号带过去：档案页打开后自动展开核销表单并预选这张单（只对「去核销」有意义，
+                // 「去看档案」场景同样带上无妨，档案页自己判断要不要用）。
+                const directLink = directProfileId
+                  ? travelerProfileLinkProps({ profileId: directProfileId, orderId: r.order?.id })
+                  : null;
                 return (
                   <tr key={r.id}>
                     <td>
@@ -414,13 +435,17 @@ export function RemindersPage() {
                           {r.title}
                         </span>
                         {r.ruleKey && <span className="badge-neutral shrink-0">自动</span>}
-                        {redeemProfileId && (
+                        {directLink && (
                           <Link
-                            to={`/travelers?profile=${encodeURIComponent(redeemProfileId)}`}
+                            to={directLink.to}
                             className="shrink-0 text-xs text-brand-700 underline decoration-dotted"
-                            title={`去常旅客档案「核销权益」扣一次 · ${TRAVELER_PROFILE_LINK_TITLE}`}
+                            title={
+                              redeemProfileId
+                                ? `去常旅客档案「核销权益」扣一次 · ${TRAVELER_PROFILE_LINK_TITLE}`
+                                : `去常旅客档案看可用次数为负的原因 · ${TRAVELER_PROFILE_LINK_TITLE}`
+                            }
                           >
-                            去核销
+                            {redeemProfileId ? '去核销' : '去看档案'}
                           </Link>
                         )}
                       </div>

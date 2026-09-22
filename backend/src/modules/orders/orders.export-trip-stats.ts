@@ -31,10 +31,12 @@
  *     109677 条历史票据）是秒级，挂在导出请求上可接受。
  *   - 在订未飞 = TravelerProfile.pendingTripCount（不含老系统未来日期未重录单；同一条快照重算链路回写）。
  *     现算兜底行同口径实时算（老系统已封笔，没有未来的单）。
- *   - 可用次数 = 飞行次数（含老系统历史飞行（已去重、退票不计））− 已核销权益次数（TravelerBenefitRedemption 流水 sum，
- *     核销/冲正同一档案），可为负——核销后订单又被退改导致已飞回落时如实透出，不截断也不臆造。
+ *   - 可用次数 = 飞行次数（含老系统历史飞行（已去重、退票不计））+ 已付款在订未飞（TravelerProfile.pendingPaidTripCount，
+ *     待支付 / 占位单不算）− 已核销权益次数（TravelerBenefitRedemption 流水 sum，核销/冲正同一档案）——
+ *     2026-09-21 拍板，唯一实现是 travelers/traveler-benefits.service.ts 的 computeAvailableTrips。
+ *     可为负——核销后订单又被退改导致已飞回落时如实透出，不截断也不臆造。
  *     核销流水挂在合并链的主档案上，取值前已沿 mergedIntoId 解析到主档案；
- *     现算兜底行还没有档案，核销流水挂不上去，故可用次数 = 飞行次数。
+ *     现算兜底行还没有档案，核销流水挂不上去，故可用次数 = 飞行次数 + 已付款在订未飞。
  */
 import type { DocumentType, PrismaClient } from '@prisma/client';
 import { Prisma } from '@prisma/client';
@@ -42,11 +44,14 @@ import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 import { SNAPSHOT_STALE_MS, TravelerProfilesService } from '../travelers/traveler-profiles.service.js';
 import { computeCombinedTripCounts } from '../travelers/traveler-trip-count.js';
+import { computeAvailableTrips } from '../travelers/traveler-benefits.service.js';
 
-/** 一位旅客的三项快照口径数字：合计飞行次数（含老系统）/ 在订未飞 / 可用次数（合计飞行−已核销，可为负）。*/
+/** 一位旅客的快照口径数字：合计飞行次数（含老系统）/ 在订未飞 / 已付款在订未飞 / 可用次数（可为负）。*/
 export interface TripStats {
   tripCount: number;
   pendingTripCount: number;
+  /** 已付款在订未飞（进可用次数的那部分）。 */
+  pendingPaidTripCount: number;
   availableTrips: number;
 }
 
@@ -74,6 +79,8 @@ interface ProfileRef {
   documentNumber: string;
   tripCount: number;
   pendingTripCount: number;
+  /** 老快照行 / 老测试夹具可能没有这一列，读取处按 0 兜底。 */
+  pendingPaidTripCount?: number | null;
   refreshedAt: Date;
   mergedIntoId: string | null;
 }
@@ -104,6 +111,7 @@ export async function loadTripCountMap(
     documentNumber: true,
     tripCount: true,
     pendingTripCount: true,
+    pendingPaidTripCount: true,
     refreshedAt: true,
     mergedIntoId: true,
   } as const;
@@ -175,10 +183,16 @@ export async function loadTripCountMap(
   for (const row of matched) {
     const master = resolveMaster(row, byId);
     const redeemedTrips = redeemedByProfile.get(master.id) ?? 0;
+    const pendingPaidTripCount = master.pendingPaidTripCount ?? 0;
     tripStats.set(docKey(row.documentType, row.documentNumber), {
       tripCount: master.tripCount,
       pendingTripCount: master.pendingTripCount,
-      availableTrips: master.tripCount - redeemedTrips,
+      pendingPaidTripCount,
+      availableTrips: computeAvailableTrips({
+        tripCount: master.tripCount,
+        pendingPaidTripCount,
+        redeemedTrips,
+      }),
     });
     if (!oldestRefreshedAt || master.refreshedAt < oldestRefreshedAt) {
       oldestRefreshedAt = master.refreshedAt;
@@ -283,7 +297,13 @@ async function fillMissingWithLiveCounts(
     tripStats.set(key, {
       tripCount: live.tripCount,
       pendingTripCount: live.pendingTripCount,
-      availableTrips: live.tripCount,
+      pendingPaidTripCount: live.pendingPaidTripCount,
+      // 没档案就没有核销流水：已核销按 0 走同一个口径函数
+      availableTrips: computeAvailableTrips({
+        tripCount: live.tripCount,
+        pendingPaidTripCount: live.pendingPaidTripCount,
+        redeemedTrips: 0,
+      }),
     });
   }
   return { tripStats, oldestRefreshedAt: fromSnapshot.oldestRefreshedAt };

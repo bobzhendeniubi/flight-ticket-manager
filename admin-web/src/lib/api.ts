@@ -2544,9 +2544,11 @@ export interface TravelerProfile {
   nextTripAt: string | null;
   /** 在订未飞：去程还没起飞的行程数（不计入新系统已飞部分；老系统未来日期未重录单也不计入） */
   pendingTripCount: number;
+  /** 在订未飞里已付款的部分（2026-09-21 口径改起后新增：可用次数按这部分计入，未付款的不算） */
+  pendingPaidTripCount: number;
   /** 已核销次数：本档案权益台账 sum(tripsUsed) 的净值（冲正条目已抵扣） */
   redeemedTrips: number;
-  /** 可用次数 = tripCount − redeemedTrips；退改让已飞次数回落时可能为负，后端如实返回不截断 */
+  /** 可用次数 = 已飞 + 已付款在订未飞 − 已核销（2026-09-21 起口径，后端算好直接用，前端不再自己拼） */
   availableTrips: number;
   totalSpendCny: string; // 人均平摊口径，两位小数字符串
   prefCabin: string | null;
@@ -2601,6 +2603,8 @@ export interface ListTravelerProfilesResult {
   profiles: TravelerProfile[];
   pagination: { page: number; pageSize: number; total: number };
   meta: { totalProfiles: number; totalTrips: number; refreshedAt: string | null };
+  /** 多人搜索（一次贴多个姓名/证件号）时一个都没命中的 term；单 term 搜索也如实返回（命中则为空数组）。 */
+  unmatchedTerms: string[];
 }
 
 /** 录单联想候选可整行回填的乘机人字段（后端提炼自最近一次乘机记录；整体可能为 null）。日期均为 ISO 字符串。 */
@@ -2641,9 +2645,11 @@ export interface TravelerProfileSuggestion {
   tripCount: number;
   /** 在订未飞次数（口径同 TravelerProfile.pendingTripCount） */
   pendingTripCount: number;
+  /** 在订未飞里已付款的部分（口径同 TravelerProfile.pendingPaidTripCount） */
+  pendingPaidTripCount: number;
   /** 已核销次数（权益台账净值） */
   redeemedTrips: number;
-  /** 可用次数 = tripCount − redeemedTrips，可能为负 */
+  /** 可用次数 = 已飞 + 已付款在订未飞 − 已核销，可能为负 */
   availableTrips: number;
   lastTripAt: string | null;
   prefCabin: string | null;
@@ -2669,6 +2675,11 @@ export interface TravelerBenefitRedemption {
   note: string | null;
   /** 非 null = 本条是冲正条目，指向被冲正的原条目 id */
   reversalOfId: string | null;
+  /** 这次核销挂的订单（2026-09-21 起可选）；挂了单号的核销会在该单取消/退款时自动冲正 */
+  orderId: string | null;
+  orderNumber: string | null;
+  /** true = 系统自动生成的冲正条目（订单取消/退款联动），不是操作人手动冲正 */
+  auto?: boolean;
   createdById: string;
   /** 操作人姓名快照（后端落库时写死，改名不回溯） */
   createdByName: string;
@@ -2683,6 +2694,7 @@ export interface TravelerProfileLookupRow {
   travelerNo: string;
   tripCount: number;
   pendingTripCount: number;
+  pendingPaidTripCount: number;
   redeemedTrips: number;
   availableTrips: number;
 }
@@ -6267,7 +6279,7 @@ export const api = {
   createTravelerRedemption: (
     token: string,
     id: string,
-    body: { tripsUsed: number; benefit: string; note?: string },
+    body: { tripsUsed: number; benefit: string; note?: string; orderId?: string },
   ) =>
     apiFetch<{ redemption: TravelerBenefitRedemption }>(`/travelers/profiles/${id}/redemptions`, {
       method: 'POST',

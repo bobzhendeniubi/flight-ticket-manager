@@ -201,9 +201,9 @@ export interface MasterRow {
   // 在订未飞（TravelerProfile.pendingTripCount 快照，同一条重算链路回写）：有去程航班且
   // 尚未起飞的有效订单数，不含老系统未来日期未重录单。快照没命中时同样现算。
   pendingTripCount: string;
-  // 可用次数 = 飞行次数（已飞）− 已核销权益次数（TravelerBenefitRedemption 流水 sum）。
-  // 可为负——核销后订单又被退改导致已飞回落时如实透出。
-  // 现算兜底行还没有档案，核销流水挂不上去，故可用次数 = 飞行次数。
+  // 可用次数 = 飞行次数（已飞）+ 已付款在订未飞 − 已核销权益次数（TravelerBenefitRedemption 流水 sum），
+  // 2026-09-21 拍板；唯一实现 computeAvailableTrips。可为负——核销后订单又被退改导致已飞回落时如实透出。
+  // 现算兜底行还没有档案，核销流水挂不上去，故可用次数 = 飞行次数 + 已付款在订未飞。
   availableTrips: string;
   travelDates: string; // 出发(往返)日期
   flightNumbers: string; // 航班号（去⇌回）
@@ -299,8 +299,8 @@ const MASTER_COLUMNS: MasterColumn[] = [
     key: 'availableTrips',
     width: 10,
     note:
-      '= 含老系统历史飞行（已去重、退票不计）的合计飞行次数 − 已核销权益次数；负数=核销后订单退改导致已飞回落，请到旅客档案页核对。\n' +
-      '还没建档的（刚下单的新客）按证件号实时算一份补上（没档案就没有核销流水，可用次数 = 飞行次数）。\n' +
+      '可用 = 已飞 + 已付款在订未飞 − 已核销（已飞含老系统历史飞行，已去重、退票不计；在订未飞只算已付款单，待支付/占位不算）；负数=核销后订单退改导致已飞回落，请到旅客档案页核对。\n' +
+      '还没建档的（刚下单的新客）按证件号实时算一份补上（没档案就没有核销流水，可用次数 = 已飞 + 已付款在订未飞）。\n' +
       '有档案的取旅客档案快照，非导出时实时重算。',
     roles: ['all', 'ticketing'],
   },

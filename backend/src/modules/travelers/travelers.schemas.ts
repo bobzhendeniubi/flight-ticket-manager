@@ -68,11 +68,13 @@ export type MergeTravelerProfileBody = z.infer<typeof mergeTravelerProfileBodySc
 
 // ── 权益核销台账（append-only，只增不改不删）──
 
-// 核销：tripsUsed 必须是正整数（扣减可用次数）；负数条目只能由冲正接口产生
+// 核销：tripsUsed 必须是正整数（扣减可用次数）；负数条目只能由冲正接口产生。
+// orderId 可选：挂上兑换的那张单，该单取消 / 退款 / no-show 时系统自动冲正（校验在 service）。
 export const createRedemptionBodySchema = z.object({
   tripsUsed: z.coerce.number().int().min(1).max(999),
   benefit: z.string().trim().min(1).max(200),
   note: z.string().max(500).optional(),
+  orderId: z.string().trim().min(1).max(64).optional(),
 });
 export type CreateRedemptionBody = z.infer<typeof createRedemptionBodySchema>;
 
