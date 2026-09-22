@@ -356,6 +356,7 @@ describe('TravelerProfilesService.list 多人搜索', () => {
     prismaMock.travelerProfile.aggregate.mockResolvedValue({
       _count: { _all: 5 },
       _sum: { tripCount: 50 },
+      _min: { refreshedAt: new Date() },
       _max: { refreshedAt: new Date() },
     });
     prismaMock.travelerProfile.findMany.mockResolvedValue([]);

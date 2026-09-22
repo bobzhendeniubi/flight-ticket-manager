@@ -14,6 +14,15 @@ CREATE INDEX "TravelerBenefitRedemption_orderId_idx" ON "TravelerBenefitRedempti
 ALTER TABLE "TravelerBenefitRedemption" ADD CONSTRAINT "TravelerBenefitRedemption_orderId_fkey"
   FOREIGN KEY ("orderId") REFERENCES "Order"("id") ON DELETE SET NULL ON UPDATE CASCADE;
 
--- 新列在快照重建前恒为 0（可用次数偏保守、不会多给）；把快照打成过期，
+-- AlterTable：自动冲正行记触发单（拆单后核销挂源单、触发单是目标单，恢复目标单时靠它找提示）
+ALTER TABLE "TravelerBenefitRedemption" ADD COLUMN "triggeredByOrderId" TEXT;
+
+-- CreateIndex
+CREATE INDEX "TravelerBenefitRedemption_triggeredByOrderId_idx" ON "TravelerBenefitRedemption"("triggeredByOrderId");
+
+-- 新列在快照重建前恒为 0（可用次数偏保守、不会多给）；把**全表**快照打成过期，
 -- 档案列表 / 导出下一次访问即触发全量重建把它填上（做法同 2026-08-31 老系统次数并档）。
+-- 过期判定看整表最旧一条 canonical 行（_min(refreshedAt)，见 TravelerProfilesService.ensureFresh
+-- 与 orders.export-trip-stats.bootstrapTripCountProfilesIfEmpty）：部署后先点开某一人的详情
+-- 只会刷新那一行，其余行仍是这里写的旧值，整表照样触发重建 —— 「下次访问即全量重建」才成立。
 UPDATE "TravelerProfile" SET "refreshedAt" = TIMESTAMP '2000-01-01 00:00:00';

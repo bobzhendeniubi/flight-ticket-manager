@@ -1245,7 +1245,7 @@ describe('buildRoomAllocationWorkbook 飞行次数取数', () => {
       // 新环境 / 快照过期才走的分支，见 orders.export-trip-stats.ts）
       travelerProfile: {
         count: vi.fn().mockResolvedValue(42),
-        aggregate: vi.fn().mockResolvedValue({ _max: { refreshedAt: new Date() } }),
+        aggregate: vi.fn().mockResolvedValue({ _min: { refreshedAt: new Date() } }),
         findMany: profileFindMany,
       },
       travelerBenefitRedemption: { groupBy: vi.fn().mockResolvedValue([]) },

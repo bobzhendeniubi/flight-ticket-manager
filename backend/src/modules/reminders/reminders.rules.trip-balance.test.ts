@@ -5,11 +5,14 @@
  *   - 可用 = 已飞 + 已付款在订未飞 − 已核销 < 0 才出候选；= 0 / > 0 不出
  *   - 正文带姓名与证件号、三项拆开；ruleKey = TRIPNEG:{档案 id}，HIGH，orderId 为 null
  *   - 取数：只查净核销 > 0 的档案（负数只可能出现在这些档案上），缺列按 0
+ *   - 判负前按活体订单现算（computeCombinedTripCounts 注入）：快照撑着的「已付款在订未飞」不作数，
+ *     证件覆盖合并链旧证并按档案相加；现算表不可用（老 mock）时退回快照
  *   - 收敛：转正自动关（status IN 原子更新）、复发重开自动核销的旧条、负得更多时就地刷新文案
  *   - delegate 不全 → ran=false，收敛整个跳过
  */
 import { describe, it, expect, vi } from 'vitest';
 import { ReminderStatus, type PrismaClient } from '@prisma/client';
+import type { CombinedTripCount } from '../travelers/traveler-trip-count.js';
 import {
   buildTripBalanceCandidates,
   collectTripBalanceCandidates,
@@ -123,6 +126,95 @@ describe('collectTripBalanceCandidates 取数', () => {
     const prisma = { travelerProfile: { findMany: vi.fn() } } as unknown as PrismaClient;
     const scan = await collectTripBalanceCandidates(prisma, TODAY);
     expect(scan).toEqual({ ran: false, candidates: [], desiredKeys: new Set() });
+  });
+
+  /**
+   * 带活体现算的假 prisma：travelerProfile.findMany 按入参分流（带 where 的是快照查询，
+   * 只带 select 的是链解析要的全表最小行）；order / legacyTicket 只要"存在"即可（现算本身走注入的 stub）。
+   */
+  function fakePrismaWithLive(opts: {
+    groups: Array<{ profileId: string; _sum: { tripsUsed: number | null } }>;
+    snapshots: Array<{ id: string; fullName: string; documentNumber: string; tripCount: number; pendingPaidTripCount: number | null }>;
+    refs: Array<{ id: string; documentType: string; documentNumber: string; mergedIntoId: string | null }>;
+  }) {
+    const p = {
+      travelerBenefitRedemption: { groupBy: vi.fn().mockResolvedValue(opts.groups) },
+      travelerProfile: {
+        findMany: vi.fn(async (args: { where?: unknown }) => (args.where ? opts.snapshots : opts.refs)),
+      },
+      order: { findMany: vi.fn() },
+      legacyTicket: { findMany: vi.fn() },
+    };
+    return p as unknown as PrismaClient & typeof p;
+  }
+
+  it('判负用活体现算：快照「已付款在订未飞 1」撑着可用 = 0，现算已回落到 0 → 可用 −1，出候选', async () => {
+    const prisma = fakePrismaWithLive({
+      groups: [{ profileId: 'neg', _sum: { tripsUsed: 6 } }],
+      snapshots: [{ id: 'neg', fullName: 'A', documentNumber: 'E1', tripCount: 5, pendingPaidTripCount: 1 }],
+      refs: [{ id: 'neg', documentType: 'PASSPORT', documentNumber: 'E1', mergedIntoId: null }],
+    });
+    const live = vi.fn(async () =>
+      new Map<string, CombinedTripCount>([
+        ['PASSPORT|E1', { tripCount: 5, pendingTripCount: 0, pendingPaidTripCount: 0, legacyTripCount: 0 }],
+      ]),
+    );
+
+    const scan = await collectTripBalanceCandidates(prisma, TODAY, { computeCombinedTripCounts: live });
+
+    expect(live).toHaveBeenCalledWith(
+      [{ documentType: 'PASSPORT', documentNumber: 'E1' }],
+      prisma,
+      expect.any(Date),
+    );
+    expect([...scan.desiredKeys]).toEqual(['TRIPNEG:neg']);
+    expect(scan.candidates[0].body).toContain('已飞 5 次 + 已付款在订未飞 0 次 − 已核销 6 次');
+  });
+
+  it('现算证件覆盖合并链旧证（P1→P2→主档案），各证件结果按档案相加', async () => {
+    const prisma = fakePrismaWithLive({
+      groups: [{ profileId: 'p3', _sum: { tripsUsed: 7 } }],
+      snapshots: [{ id: 'p3', fullName: 'A', documentNumber: 'E-P3', tripCount: 0, pendingPaidTripCount: 0 }],
+      refs: [
+        { id: 'p1', documentType: 'PASSPORT', documentNumber: 'E-P1', mergedIntoId: 'p2' },
+        { id: 'p2', documentType: 'PASSPORT', documentNumber: 'E-P2', mergedIntoId: 'p3' },
+        { id: 'p3', documentType: 'PASSPORT', documentNumber: 'E-P3', mergedIntoId: null },
+      ],
+    });
+    const live = vi.fn(async () =>
+      new Map<string, CombinedTripCount>([
+        ['PASSPORT|E-P1', { tripCount: 3, pendingTripCount: 0, pendingPaidTripCount: 0, legacyTripCount: 3 }],
+        ['PASSPORT|E-P2', { tripCount: 2, pendingTripCount: 0, pendingPaidTripCount: 0, legacyTripCount: 0 }],
+        ['PASSPORT|E-P3', { tripCount: 1, pendingTripCount: 1, pendingPaidTripCount: 0, legacyTripCount: 0 }],
+      ]),
+    );
+
+    const scan = await collectTripBalanceCandidates(prisma, TODAY, { computeCombinedTripCounts: live });
+
+    const askedDocs = (live.mock.calls[0] as unknown as [Array<{ documentNumber: string }>])[0]
+      .map((d) => d.documentNumber)
+      .sort();
+    expect(askedDocs).toEqual(['E-P1', 'E-P2', 'E-P3']);
+    // 3 + 2 + 1 = 6 已飞，已核销 7 → −1
+    expect(scan.candidates[0].title).toBe('【可用次数为负】A E-P3 可用 -1 次');
+  });
+
+  it('现算把可用拉回 ≥ 0 时不出候选（快照旧值为负也不喊）', async () => {
+    const prisma = fakePrismaWithLive({
+      groups: [{ profileId: 'ok', _sum: { tripsUsed: 2 } }],
+      snapshots: [{ id: 'ok', fullName: 'B', documentNumber: 'E2', tripCount: 0, pendingPaidTripCount: 0 }],
+      refs: [{ id: 'ok', documentType: 'PASSPORT', documentNumber: 'E2', mergedIntoId: null }],
+    });
+    const live = vi.fn(async () =>
+      new Map<string, CombinedTripCount>([
+        ['PASSPORT|E2', { tripCount: 2, pendingTripCount: 0, pendingPaidTripCount: 0, legacyTripCount: 0 }],
+      ]),
+    );
+
+    const scan = await collectTripBalanceCandidates(prisma, TODAY, { computeCombinedTripCounts: live });
+
+    expect(scan.ran).toBe(true);
+    expect(scan.candidates).toEqual([]);
   });
 });
 

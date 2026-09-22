@@ -222,8 +222,8 @@ function resolveMaster(start: ProfileRef, byId: Map<string, ProfileRef>): Profil
 /**
  * 首建 + 过期，双重兜底：若本次导出确实有乘客——
  *   - 快照表一条记录都没有（新环境 / 从没人开过档案页）→ 全量首建；
- *   - 快照表非空，但最新一条快照已超过 SNAPSHOT_STALE_MS（与档案页 ensureFresh 同一阈值，
- *     traveler-profiles.service.ts）→ 视为整表过期，同样重建。
+ *   - 快照表非空，但**最旧**一条 canonical 快照已超过 SNAPSHOT_STALE_MS（与档案页 ensureFresh
+ *     同一阈值与口径，traveler-profiles.service.ts）→ 视为整表过期，同样重建。
  * 两种情况下直接读 loadTripCountMap 都会取到错的数字（前者整列留空；后者是批量迁移强制
  * 打过期标记后的非空旧值，例如 2026-08-31 老系统历史飞行次数并档上线那次）。
  *
@@ -244,9 +244,15 @@ export async function bootstrapTripCountProfilesIfEmpty(
     await rebuild();
     return;
   }
-  const newest = await client.travelerProfile.aggregate({ _max: { refreshedAt: true } });
-  const newestRefreshedAt = newest._max.refreshedAt;
-  if (newestRefreshedAt && Date.now() - newestRefreshedAt.getTime() > SNAPSHOT_STALE_MS) {
+  // 「过期」看整表**最旧**的 canonical 快照（_min），与档案页 ensureFresh 同口径：详情页只回写
+  // 被点开的那一个人，按 _max 判断的话随便开一次详情整表就"新鲜"了，批量迁移打过期后其余
+  // 档案的旧值会一直撑着。指针行（mergedIntoId 非空）不参与重建、永远是旧值，必须排除。
+  const oldest = await client.travelerProfile.aggregate({
+    where: { mergedIntoId: null },
+    _min: { refreshedAt: true },
+  });
+  const oldestRefreshedAt = oldest._min.refreshedAt;
+  if (oldestRefreshedAt && Date.now() - oldestRefreshedAt.getTime() > SNAPSHOT_STALE_MS) {
     await rebuild();
   }
 }

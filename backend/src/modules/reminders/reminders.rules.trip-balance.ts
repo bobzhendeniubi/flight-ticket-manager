@@ -10,8 +10,20 @@
  * 都在这里，主文件只在 generateRuleReminders 里调 collect / reconcile 两个入口。
  * 只 `import type` 主文件的 ReminderCandidate（编译期擦除，不产生运行期循环依赖）。
  */
-import { ReminderPriority, ReminderStatus, type PrismaClient } from '@prisma/client';
+import { ReminderPriority, ReminderStatus, type DocumentType, type PrismaClient } from '@prisma/client';
 import { computeAvailableTrips } from '../travelers/traveler-benefits.service.js';
+import {
+  buildAliasIndex,
+  docPairsForProfile,
+  type DocPair,
+  type ProfileRef,
+} from '../travelers/traveler-profile-alias.js';
+import { docKey } from '../travelers/traveler-profiles.aggregate.js';
+import {
+  computeCombinedTripCounts,
+  type CombinedTripCount,
+  type TripCountPrismaClient,
+} from '../travelers/traveler-trip-count.js';
 import type { ReminderCandidate } from './reminders.rules.js';
 
 /** 本规则全部 ruleKey 的前缀（收敛扫描、列表接口识别都按它）。 */
@@ -113,19 +125,40 @@ interface TripBalanceDelegates {
       }>
     >;
   };
+  /** 现算要用的两张表；老 mock 没有它们时退回读快照（行为同改造前）。 */
+  order?: { findMany?: unknown };
+  legacyTicket?: { findMany?: unknown };
 }
+
+/** 现算入口可注入（单测用假实现驱动；生产恒为 computeCombinedTripCounts）。 */
+export interface TripBalanceLiveCountDeps {
+  computeCombinedTripCounts: (
+    documents: readonly DocPair[],
+    client: TripCountPrismaClient,
+    now: Date,
+  ) => Promise<Map<string, CombinedTripCount>>;
+}
+
+const DEFAULT_LIVE_DEPS: TripBalanceLiveCountDeps = { computeCombinedTripCounts };
 
 /**
  * 规则 13 取数（档案级）。
  *
  * 可用为负必然 已核销净额 > 已飞 + 已付款在订未飞 ≥ 0 ⇒ 只有净核销 > 0 的档案才可能为负：
  * 先一条 groupBy 取全部有正净额的档案，再按 id 拉快照（两条查询，与档案数无关）。
- * 快照是上次重建的值（档案页 / 导出会刷新）—— 本规则每天跑一次，读快照够用；
- * 详情页实时重算后的数字若与快照不同，下一轮自然收敛。
+ *
+ * 判负**不读快照**（评审 F5）：快照是上次重建 / 上次有人点开详情的值，核销之后订单取消了却
+ * 没人再开那个档案，快照里的「已付款在订未飞」会一直撑着，真实余额早已为负而规则读到 0。
+ * 所以扫描前对这一批档案按活体订单现算一份 tripCount / pendingPaidTripCount
+ * （computeCombinedTripCounts —— 与导出 / 录单徽章同一条现算路径，不另写加法），
+ * 证件覆盖主证 + 合并链全部旧证，按档案把各证件的结果相加。量级 = 有净核销的档案数，
+ * 查询数固定（一条档案表全量 + 现算内部两条批量），不随档案数增长。
+ * 现算只用于判负，不回写快照（快照的回写路径仍只有详情页 / 全量重建）。
  */
 export async function collectTripBalanceCandidates(
   prisma: PrismaClient,
   today: string,
+  deps: TripBalanceLiveCountDeps = DEFAULT_LIVE_DEPS,
 ): Promise<TripBalanceScan> {
   const delegates = prisma as unknown as TripBalanceDelegates;
   const redemptionDelegate = delegates.travelerBenefitRedemption;
@@ -162,14 +195,16 @@ export async function collectTripBalanceCandidates(
       pendingPaidTripCount: true,
     },
   });
+  const live = await recomputeLiveCounts(prisma, delegates, profiles.map((p) => p.id), deps);
   for (const p of profiles) {
+    const counts = live.get(p.id);
     const built = buildTripBalanceCandidates(
       {
         id: p.id,
         fullName: p.fullName,
         documentNumber: p.documentNumber,
-        tripCount: p.tripCount,
-        pendingPaidTripCount: p.pendingPaidTripCount ?? 0,
+        tripCount: counts ? counts.tripCount : p.tripCount,
+        pendingPaidTripCount: counts ? counts.pendingPaidTripCount : (p.pendingPaidTripCount ?? 0),
         redeemedTrips: redeemedByProfile.get(p.id) ?? 0,
       },
       today,
@@ -178,6 +213,68 @@ export async function collectTripBalanceCandidates(
     candidates.push(...built);
   }
   return { ran: true, candidates, desiredKeys };
+}
+
+/**
+ * 一批档案的活体次数：档案 id → { tripCount, pendingPaidTripCount }。
+ * 沿合并链取每个档案的全部证件（traveler-profile-alias.ts），一次 computeCombinedTripCounts
+ * 现算全部证件，再按档案把各证件的结果相加（一张单只挂一个证件，各证件的订单集互不重叠）。
+ * 档案表 / 订单表 / 老系统票表任一 delegate 不可用（老 mock）→ 返回空 Map，调用方退回快照。
+ */
+async function recomputeLiveCounts(
+  prisma: PrismaClient,
+  delegates: TripBalanceDelegates,
+  profileIds: string[],
+  deps: TripBalanceLiveCountDeps,
+): Promise<Map<string, { tripCount: number; pendingPaidTripCount: number }>> {
+  const out = new Map<string, { tripCount: number; pendingPaidTripCount: number }>();
+  if (
+    profileIds.length === 0 ||
+    typeof delegates.order?.findMany !== 'function' ||
+    typeof delegates.legacyTicket?.findMany !== 'function'
+  ) {
+    return out;
+  }
+  const refRows = (await (
+    delegates.travelerProfile!.findMany as (args: unknown) => Promise<unknown>
+  )({
+    select: { id: true, documentType: true, documentNumber: true, mergedIntoId: true },
+  })) as Array<{
+    id: string;
+    documentType: DocumentType;
+    documentNumber: string;
+    mergedIntoId: string | null;
+  }>;
+  const refs = new Map<string, ProfileRef>(refRows.map((r) => [r.id, r]));
+  const { docPairsByMasterId } = buildAliasIndex(refs);
+
+  const docsByProfile = new Map<string, DocPair[]>();
+  const allDocs = new Map<string, DocPair>();
+  for (const id of profileIds) {
+    const pairs = docPairsForProfile(id, refs, docPairsByMasterId);
+    if (!pairs) continue; // 档案已不存在：没有活体数可算，退回快照
+    docsByProfile.set(id, pairs);
+    for (const pair of pairs) allDocs.set(docKey(pair.documentType, pair.documentNumber), pair);
+  }
+  if (allDocs.size === 0) return out;
+
+  const computed = await deps.computeCombinedTripCounts(
+    [...allDocs.values()],
+    prisma as unknown as TripCountPrismaClient,
+    new Date(),
+  );
+  for (const [id, pairs] of docsByProfile) {
+    let tripCount = 0;
+    let pendingPaidTripCount = 0;
+    for (const pair of pairs) {
+      const c = computed.get(docKey(pair.documentType, pair.documentNumber));
+      if (!c) continue;
+      tripCount += c.tripCount;
+      pendingPaidTripCount += c.pendingPaidTripCount;
+    }
+    out.set(id, { tripCount, pendingPaidTripCount });
+  }
+  return out;
 }
 
 /**

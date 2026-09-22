@@ -1152,7 +1152,7 @@ describe('buildOrderTemplateExportWorkbook 飞行次数取数', () => {
       // 新环境 / 快照过期才走的分支，见 orders.export-trip-stats.ts）
       travelerProfile: {
         count: vi.fn().mockResolvedValue(42),
-        aggregate: vi.fn().mockResolvedValue({ _max: { refreshedAt: new Date() } }),
+        aggregate: vi.fn().mockResolvedValue({ _min: { refreshedAt: new Date() } }),
         findMany: profileFindMany,
       },
       travelerBenefitRedemption: { groupBy: vi.fn().mockResolvedValue([]) },
@@ -1643,7 +1643,7 @@ describe('代理导出（agentScope 非空）— 三模板按共享脱敏政策�
       legacyTicket: { findMany: vi.fn().mockResolvedValue([]) },
       travelerProfile: {
         count: vi.fn().mockResolvedValue(42),
-        aggregate: vi.fn().mockResolvedValue({ _max: { refreshedAt: new Date() } }),
+        aggregate: vi.fn().mockResolvedValue({ _min: { refreshedAt: new Date() } }),
         findMany: vi.fn().mockResolvedValue([]),
       },
       travelerBenefitRedemption: { groupBy: vi.fn().mockResolvedValue([]) },
@@ -1784,7 +1784,7 @@ describe('代理导出（agentScope 非空）— 三模板按共享脱敏政策�
           legacyTicket: { findMany: vi.fn().mockResolvedValue([]) },
           travelerProfile: {
             count: vi.fn().mockResolvedValue(42),
-            aggregate: vi.fn().mockResolvedValue({ _max: { refreshedAt: new Date() } }),
+            aggregate: vi.fn().mockResolvedValue({ _min: { refreshedAt: new Date() } }),
             findMany: vi.fn().mockResolvedValue([]),
           },
           travelerBenefitRedemption: { groupBy: vi.fn().mockResolvedValue([]) },

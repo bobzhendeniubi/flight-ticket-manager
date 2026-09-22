@@ -36,6 +36,13 @@ import {
   withBenefitTotals,
 } from './traveler-benefits.service.js';
 import type { ListTravelerProfilesQuery } from './travelers.schemas.js';
+import {
+  buildAliasIndex,
+  loadProfileRefs,
+  resolveMasterRef,
+  type DocPair,
+  type ProfileRef,
+} from './traveler-profile-alias.js';
 
 // 有效订单口径、老系统次数与「合计」加法都搬到了 traveler-trip-count.ts（导出侧也要用，
 // 留在本文件会成模块环）；这里原样再导出一次，历史调用方不必分叉。
@@ -79,19 +86,8 @@ export function travelerSearchTermConditions(term: string): Prisma.TravelerProfi
   ];
 }
 
-/** 档案合并解析用的最小行（全表小数据量，一次拉全量在内存里解析链） */
-interface ProfileRef {
-  id: string;
-  travelerNo: number;
-  documentType: DocumentType;
-  documentNumber: string;
-  mergedIntoId: string | null;
-}
-
-interface DocPair {
-  documentType: DocumentType;
-  documentNumber: string;
-}
+// ProfileRef / DocPair 与链解析（resolveMasterRef / buildAliasIndex）都在 traveler-profile-alias.ts：
+// 自动冲正与负数提醒也要按同一套链解析比对证件，留在本文件会成模块环。
 
 /** 现算兜底行的常旅客号占位：这人还没档案，别让界面显示一个不存在的 CT- 号。 */
 const UNFILED_TRAVELER_NO = '未建档';
@@ -822,18 +818,9 @@ export class TravelerProfilesService {
     return withBenefitTotals(serializeProfile(row), redeemedByProfile);
   }
 
-  /** 全表最小行（含指针行），供别名解析；内部量级（千级档案）一次拉全量可接受 */
+  /** 全表最小行（含指针行），供别名解析；实现在 traveler-profile-alias.ts（自动冲正/提醒同源）。 */
   private async loadProfileRefs(): Promise<Map<string, ProfileRef>> {
-    const rows = await prisma.travelerProfile.findMany({
-      select: {
-        id: true,
-        travelerNo: true,
-        documentType: true,
-        documentNumber: true,
-        mergedIntoId: true,
-      },
-    });
-    return new Map(rows.map((r) => [r.id, r]));
+    return loadProfileRefs(prisma);
   }
 
   /**
@@ -908,75 +895,33 @@ export class TravelerProfilesService {
     return distinct.length === 1 ? distinct[0] : null;
   }
 
-  /** 空表惰性 bootstrap（阻塞首个请求）；过期则后台重建（不阻塞） */
+  /**
+   * 空表惰性 bootstrap（阻塞首个请求）；过期则后台重建（不阻塞）。
+   *
+   * 「过期」看的是**整表最旧**的一条 canonical 快照（_min(refreshedAt)），不是最新的一条：
+   * 详情页只回写被点开的那一个人，若按 _max 判断，随便开一次详情整表就"新鲜"了，其余档案的
+   * 旧值会一直撑着 —— 批量迁移把全表打过期后（例如新增快照列、初值恒为 0）也就永远
+   * 补不上。全量重建会把每一条 canonical 行都刷到同一时刻，所以 _min 在正常运行时就等于
+   * 上次全量重建的时刻；指针行（mergedIntoId 非空）不参与重建、永远是旧值，必须排除。
+   */
   private async ensureFresh(): Promise<void> {
     const stats = await prisma.travelerProfile.aggregate({
+      where: { mergedIntoId: null },
       _count: { _all: true },
-      _max: { refreshedAt: true },
+      _min: { refreshedAt: true },
     });
     if (stats._count._all === 0) {
       const anyPassenger = await prisma.passenger.findFirst({ select: { id: true } });
       if (anyPassenger) await this.rebuildAll();
       return;
     }
-    const newest = stats._max.refreshedAt;
-    if (newest && Date.now() - newest.getTime() > SNAPSHOT_STALE_MS) {
+    const oldest = stats._min.refreshedAt;
+    if (oldest && Date.now() - oldest.getTime() > SNAPSHOT_STALE_MS) {
       void this.rebuildAll().catch(() => {
         /* 后台重建失败不影响本次读；下次访问会再试 */
       });
     }
   }
-}
-
-/**
- * 沿 mergedIntoId 链解析到最终主档案。
- * 数据上不该有链（合并时禁止把档案并进指针行），但解析要健壮：
- * 断链（主档案被删）/ 环（脏数据）时停在当前行，不抛错不死循环。
- */
-function resolveMasterRef(start: ProfileRef, byId: Map<string, ProfileRef>): ProfileRef {
-  let current = start;
-  const seen = new Set<string>([current.id]);
-  while (current.mergedIntoId) {
-    const next = byId.get(current.mergedIntoId);
-    if (!next || seen.has(next.id)) break;
-    seen.add(next.id);
-    current = next;
-  }
-  return current;
-}
-
-/**
- * 从指针行构建别名索引：
- *   aliasMap           — 旧证 docKey → 主档案 docKey（喂给聚合做归拢）
- *   docPairsByMasterId — 主档案 id → 全部证件对（本证 + 并入的旧证），查订单乘机人用
- */
-function buildAliasIndex(byId: Map<string, ProfileRef>): {
-  aliasMap: Map<string, string>;
-  docPairsByMasterId: Map<string, DocPair[]>;
-} {
-  const aliasMap = new Map<string, string>();
-  const docPairsByMasterId = new Map<string, DocPair[]>();
-  for (const ref of byId.values()) {
-    if (ref.mergedIntoId === null) {
-      docPairsByMasterId.set(ref.id, [
-        { documentType: ref.documentType, documentNumber: ref.documentNumber },
-      ]);
-    }
-  }
-  for (const ref of byId.values()) {
-    if (ref.mergedIntoId === null) continue;
-    const master = resolveMasterRef(ref, byId);
-    // 断链/环解析不到 canonical 行 → 该指针放弃归拢（只影响这一条，不拖垮整体）
-    if (master.id === ref.id || master.mergedIntoId !== null) continue;
-    aliasMap.set(
-      docKey(ref.documentType, ref.documentNumber),
-      docKey(master.documentType, master.documentNumber),
-    );
-    docPairsByMasterId
-      .get(master.id)!
-      .push({ documentType: ref.documentType, documentNumber: ref.documentNumber });
-  }
-  return { aliasMap, docPairsByMasterId };
 }
 
 type ProfileRow = Prisma.TravelerProfileGetPayload<Record<string, never>>;

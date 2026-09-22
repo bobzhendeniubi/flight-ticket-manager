@@ -213,6 +213,10 @@ model TravelerBenefitRedemption {
   reversalOfId  String?  @unique
   /// 本次核销对应的订单（2026-09-21 起可挂；冲正行照抄原行）。订单硬删时置空，台账行不动。
   orderId       String?
+  /// 系统自动冲正行专用：触发这次冲正的那张单（取消 / no-show 的目标单）。拆单后核销仍挂源单
+  /// （orderId = 源单），触发单是拆出去的目标单 —— 恢复目标单时要靠这一列找到「本单曾触发的冲正」。
+  /// 人工核销 / 人工冲正恒为空。不建外键：只用于恢复提示，订单硬删后留残值无害。
+  triggeredByOrderId String?
   createdById   String
   /// 操作人姓名快照：账号改名/停用后台账仍可读
   createdByName String
@@ -225,6 +229,7 @@ model TravelerBenefitRedemption {
 
   @@index([profileId])
   @@index([orderId])
+  @@index([triggeredByOrderId])
   @@index([createdAt])
 }
 

@@ -5764,13 +5764,18 @@ export class OrderService {
 
       const warnings: string[] = [];
       // 权益核销：取消时被系统自动冲正过的核销**不自动再核销**（2026-09-21 拍板），只提示。
+      // 按**触发单**找（triggeredByOrderId）：拆单后核销仍挂源单 A、触发冲正的是拆出去的 B，
+      // 恢复 B 时只按 orderId=B 查会漏提示；没记触发单的存量补偿行仍按挂的单号兜底。
       // 老单测的 mock 没有这个 delegate 时跳过（真 client 永远有）。
       const redemptionCountDelegate = (
         tx as unknown as { travelerBenefitRedemption?: { count?: (args: unknown) => Promise<number> } }
       ).travelerBenefitRedemption;
       if (typeof redemptionCountDelegate?.count === 'function') {
         const autoReversedCount = await redemptionCountDelegate.count({
-          where: { orderId, createdById: BENEFIT_AUTO_REVERSAL_ACTOR_ID },
+          where: {
+            createdById: BENEFIT_AUTO_REVERSAL_ACTOR_ID,
+            OR: [{ triggeredByOrderId: orderId }, { orderId, triggeredByOrderId: null }],
+          },
         });
         if (autoReversedCount > 0) {
           warnings.push(

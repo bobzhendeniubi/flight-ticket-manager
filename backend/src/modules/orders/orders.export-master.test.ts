@@ -1146,12 +1146,12 @@ describe('bootstrapTripCountProfilesIfEmpty', () => {
   const ONE_HOUR_MS = 60 * 60 * 1000;
 
   /**
-   * 假 client：count() 返回预置的快照条数；非空分支还会读 aggregate() 的最新 refreshedAt
-   * 判断是否过期，默认给一个刚刚重建过的新鲜时间戳（不触发）。
+   * 假 client：count() 返回预置的快照条数；非空分支还会读 aggregate() 的**最旧** canonical
+   * refreshedAt（_min，排除指针行）判断是否过期，默认给一个刚刚重建过的新鲜时间戳（不触发）。
    */
-  function fakeCountClient(count: number, newestRefreshedAt: Date = new Date()) {
+  function fakeCountClient(count: number, oldestRefreshedAt: Date = new Date()) {
     const countFn = vi.fn(async () => count);
-    const aggregateFn = vi.fn(async () => ({ _max: { refreshedAt: newestRefreshedAt } }));
+    const aggregateFn = vi.fn(async () => ({ _min: { refreshedAt: oldestRefreshedAt } }));
     const client = { travelerProfile: { count: countFn, aggregate: aggregateFn } };
     return { client, countFn, aggregateFn };
   }
