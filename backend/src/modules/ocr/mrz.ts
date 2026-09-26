@@ -35,6 +35,11 @@ export interface MrzResult {
   /** YYYY-MM-DD */
   expiryDate: string;
   checks: MrzChecks;
+  /**
+   * 第 1 行是否经过尾部填充符补齐 / 截断（见 normalizeLine1Fillers）。第 1 行没有校验位，
+   * 「姓名里漏抄一个字母」补齐后也长得完全合法——为 true 时姓名未经任何校验，调用方要提示核对。
+   */
+  line1Normalized: boolean;
 }
 
 /** 单字符的 MRZ 值：数字=本身、A-Z=10-35、'<'=0，其他=null（非法）。 */
@@ -142,7 +147,8 @@ function parseSex(c: string): string {
 export function parseTd3Mrz(line1Raw: string, line2Raw: string): MrzResult | null {
   if (typeof line1Raw !== 'string' || typeof line2Raw !== 'string') return null;
 
-  const line1 = normalizeLine1Fillers(line1Raw.trim().toUpperCase());
+  const line1Transcribed = line1Raw.trim().toUpperCase();
+  const line1 = normalizeLine1Fillers(line1Transcribed);
   const line2 = line2Raw.trim().toUpperCase();
 
   if (line1.length !== TD3_LINE_LENGTH || line2.length !== TD3_LINE_LENGTH) {
@@ -209,5 +215,6 @@ export function parseTd3Mrz(line1Raw: string, line2Raw: string): MrzResult | nul
     sex: parseSex(sexChar),
     expiryDate: expiryDate ?? '',
     checks,
+    line1Normalized: line1 !== line1Transcribed,
   };
 }

@@ -99,3 +99,11 @@ describe('parseTd3Mrz — 第 1 行尾部填充符数错的容错', () => {
     expect(parseTd3Mrz(SAMPLE_LINE1, SAMPLE_LINE2.slice(0, 43))).toBeNull();
   });
 });
+
+describe('parseTd3Mrz — line1Normalized 标记（第 1 行无校验位，补齐过要让调用方提示核对姓名）', () => {
+  it('第 1 行恰好 44 位 → false；补齐 / 截断过 → true', () => {
+    expect(parseTd3Mrz(SAMPLE_LINE1, SAMPLE_LINE2)!.line1Normalized).toBe(false);
+    expect(parseTd3Mrz(SAMPLE_LINE1.slice(0, 43), SAMPLE_LINE2)!.line1Normalized).toBe(true);
+    expect(parseTd3Mrz(SAMPLE_LINE1 + '<<', SAMPLE_LINE2)!.line1Normalized).toBe(true);
+  });
+});

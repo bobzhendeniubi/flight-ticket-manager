@@ -316,3 +316,74 @@ describe('applyOcrPostProcessing — 向后兼容 suggested 形状', () => {
     );
   });
 });
+
+// 机读区第 1 行（姓名）没有校验位：parseTd3Mrz 会把尾部填充符数错 1-3 个的第 1 行补齐 / 截断，
+// 但「姓名里漏抄一个字母」行尾同样是 '<'，补齐后长得完全合法——姓名必须提示核对，不能静默采用。
+describe('applyOcrPostProcessing — 机读区姓名没有校验位', () => {
+  const BASE = {
+    dateOfBirth: '1974-08-12',
+    gender: 'F',
+    documentNumber: 'L898902C3',
+    nationality: 'UTO',
+    passportExpiry: '2012-04-15',
+    mrzLine2: MRZ_LINE2,
+  };
+
+  it('第 1 行补齐过（名字漏抄一个字母）→ 姓、名都标黄，姓名取目视区，第 2 行照常校验', () => {
+    const result = applyOcrPostProcessing({
+      ...BASE,
+      lastName: 'ERIKSSON',
+      firstName: 'ANNA MARIA',
+      mrzLine1: 'P<UTOERIKSSON<<ANNA<MARI'.padEnd(43, '<'),
+    });
+    expect(result.verify.mrzValid).toBe(true);
+    expect(result.suggested.firstName).toBe('ANNA MARIA');
+    const fields = result.verify.reviewFields.map((r) => r.field);
+    expect(fields).toEqual(expect.arrayContaining(['lastName', 'firstName']));
+    expect(fields).not.toContain('documentNumber');
+    expect(result.verify.reviewFields.find((r) => r.field === 'firstName')!.reason).toContain('姓名');
+  });
+
+  it('第 1 行长度正确但目视区姓名与机读区字母不一致 → 该字段标黄', () => {
+    const result = applyOcrPostProcessing({
+      ...BASE,
+      lastName: 'ERIKSSON',
+      firstName: 'ANNA MARTA',
+      mrzLine1: MRZ_LINE1,
+    });
+    expect(result.verify.reviewFields.map((r) => r.field)).toEqual(['firstName']);
+  });
+
+  it('只差空格 / 连字符 / 逗号 → 不标黄', () => {
+    const result = applyOcrPostProcessing({
+      ...BASE,
+      lastName: 'ERIKSSON,',
+      firstName: 'ANNA-MARIA',
+      mrzLine1: MRZ_LINE1,
+    });
+    expect(result.verify.reviewFields).toEqual([]);
+  });
+
+  it('目视区给的是中文（没有拉丁字母）→ 不拿来比', () => {
+    const result = applyOcrPostProcessing({
+      ...BASE,
+      lastName: '埃里克松',
+      firstName: '安娜',
+      mrzLine1: MRZ_LINE1,
+    });
+    expect(result.verify.reviewFields).toEqual([]);
+  });
+});
+
+describe('applyOcrPostProcessing — 签发地点兜底（繁体机关名）', () => {
+  it.each(['香港特別行政區入境事務處', '中華人民共和國駐溫哥華總領事館', '駐某國大使館'])(
+    '%s → 不填入并提示手填',
+    (place) => {
+      const result = applyOcrPostProcessing({ passportIssuePlace: place });
+      expect(result.suggested.passportIssuePlace).toBeNull();
+      expect(result.verify.reviewFields.find((r) => r.field === 'passportIssuePlace')!.reason).toContain(
+        '签发机关',
+      );
+    },
+  );
+});

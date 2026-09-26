@@ -76,6 +76,7 @@ const REASON_MRZ_MISMATCH =
   'MRZ 与目视区不一致，已按机读区取值，请人工复核';
 const REASON_MRZ_UNVERIFIED = '机读区未能校验，请逐项人工核对';
 const REASON_LOW_CONFIDENCE = '识别置信度不足，请人工核对';
+const REASON_MRZ_NAME_UNVERIFIED = '机读区姓名行长度有误，姓名未经校验，请照护照核对';
 const REASON_ISSUE_PLACE_AUTHORITY = '疑似签发机关，未填入，请照护照「签发地点」栏手填';
 const REASON_ISSUE_PLACE_MULTI_LEVEL = '护照只印省份，结果带了下级地名，请核对';
 
@@ -87,7 +88,7 @@ const CONFIDENCE_THRESHOLD = 98;
  * 部门；签发地点栏只印地名，不会出现这些字。「公安」只认部 / 厅 / 局，不单认二字（有地名叫公安县）。
  */
 const ISSUING_AUTHORITY_PATTERN =
-  /管理局|公安部|公安厅|公安局|出入境|移民管理|入境事务|外交部|使馆|领事馆|ADMINISTRATION|MINISTRY|PUBLIC\s*SECURITY|IMMIGRATION|BUREAU|DEPARTMENT|EMBASSY|CONSULATE/i;
+  /管理局|公安部|公安厅|公安廳|公安局|出入境|移民管理|入境事务|入境事務|外交部|使馆|使館|领事馆|領事館|ADMINISTRATION|MINISTRY|PUBLIC\s*SECURITY|IMMIGRATION|BUREAU|DEPARTMENT|EMBASSY|CONSULATE/i;
 
 /** 中国护照签发地点栏的印刷格式「中文/拼音」（斜杠含全角）：取斜杠前的中文（与提示词口径一致）。 */
 const CN_BILINGUAL_PLACE_PATTERN = /^(\p{Script=Han}+)\s*[/／]\s*[A-Za-z][A-Za-z .'-]*$/u;
@@ -143,6 +144,16 @@ function checkIssuePlace(raw: string | null): IssuePlaceCheck {
     return { value, reason: REASON_ISSUE_PLACE_MULTI_LEVEL };
   }
   return { value, reason: null };
+}
+
+/**
+ * 目视区读到的拉丁字母姓名与机读区是否不一致：只比 A-Z 字母（空格、连字符、逗号在机读区都是 '<'）。
+ * 目视区没读到、或读到的不含拉丁字母（比如给了中文）→ 不比，返回 false。
+ */
+function latinNameDiffers(visual: string | null, mrzVal: string): boolean {
+  const letters = (s: string) => s.toUpperCase().replace(/[^A-Z]/g, '');
+  if (visual == null || letters(visual) === '') return false;
+  return letters(visual) !== letters(mrzVal);
 }
 
 /** 宽松比较两个值是否“不一致”（大写去空白后比较；null 视为与非 null 不一致）。 */
@@ -204,9 +215,28 @@ export function applyOcrPostProcessing(raw: RawOcrFields): PostProcessResult {
     passportExpiry = trimOrNull(mrz.expiryDate);
     gender = trimOrNull(mrz.sex);
     nationality = trimOrNull(mrz.nationality);
-    // 姓名以 MRZ 为准
-    lastName = trimOrNull(mrz.surname);
-    firstName = trimOrNull(mrz.givenNames);
+
+    // 姓名在第 1 行，第 1 行没有任何校验位（上面的校验只覆盖第 2 行）。
+    const names = [
+      { field: 'lastName', mrzVal: mrz.surname, llmVal: llmLastName },
+      { field: 'firstName', mrzVal: mrz.givenNames, llmVal: llmFirstName },
+    ];
+    if (mrz.line1Normalized) {
+      // 第 1 行是补齐 / 截断过填充符才能解析的：姓名里漏抄一个字母补齐后也完全合法，
+      // 不能静默采用——姓名回到目视区取值（与第 1 行无法解析时同口径），并提示核对。
+      lastName = llmLastName ?? trimOrNull(mrz.surname);
+      firstName = llmFirstName ?? trimOrNull(mrz.givenNames);
+      for (const n of names) reviewFields.push({ field: n.field, reason: REASON_MRZ_NAME_UNVERIFIED });
+    } else {
+      // 姓名以 MRZ 为准；目视区读到的拉丁字母姓名与之不一致时提示核对
+      lastName = trimOrNull(mrz.surname);
+      firstName = trimOrNull(mrz.givenNames);
+      for (const n of names) {
+        if (latinNameDiffers(n.llmVal, n.mrzVal)) {
+          reviewFields.push({ field: n.field, reason: REASON_MRZ_MISMATCH });
+        }
+      }
+    }
   } else {
     // MRZ 缺失或校验不过：全部机读字段进 review
     for (const field of [
