@@ -181,12 +181,60 @@ export interface SerializedLogError {
   type: string;
   code?: string;
   stack?: string;
+  /** Prisma 已知错误的 meta（字段名 / 约束名 / 模型名），值已脱敏截断 */
+  meta?: Record<string, string | number | boolean | string[]>;
 }
 
-/** 异常消息 → 日志里的 message（首个非空行、去令牌、遮证件号、≤200 字）。 */
+/** Prisma 客户端报错首行的固定形状；生产格式的真正原因在最后一行（中间是调用参数块）。 */
+const PRISMA_INVOCATION_HEADER = /^Invalid `[^`]+` invocation/;
+/** 看起来像调用参数 dump 的行（JSON 片段 / data URL）：取末行原因时一律不要。 */
+const ARGUMENT_DUMP_LINE = /^[{}[\]"'+]|base64/;
+const MAX_META_ENTRIES = 5;
+const MAX_META_TEXT_CHARS = 100;
+
+function lastNonEmptyLine(text: string): string {
+  const lines = text.split('\n').map((l) => l.trim()).filter((l) => l.length > 0);
+  return lines[lines.length - 1] ?? '';
+}
+
+/** 首个非空行；Prisma 调用报错再拼上末行的真正原因（只取原因行，参数块一行不要）。 */
+function messageHeadline(raw: string): string {
+  const first = firstNonEmptyLine(raw);
+  if (!PRISMA_INVOCATION_HEADER.test(first)) return first;
+  const reason = lastNonEmptyLine(raw);
+  if (reason === first || ARGUMENT_DUMP_LINE.test(reason)) return first;
+  return `${first} … ${reason}`;
+}
+
+/** 底层原因（fetch failed 的 ENOTFOUND 之类）：有错误码取错误码，否则取 cause 消息首行。 */
+function causeHint(err: Error): string | null {
+  const cause = (err as { cause?: unknown }).cause;
+  if (cause == null) return null;
+  const code = (cause as { code?: unknown }).code;
+  if (typeof code === 'string' && code.length > 0) return code;
+  return cause instanceof Error ? firstNonEmptyLine(cause.message ?? '') || null : null;
+}
+
+/** 异常消息 → 日志里的 message（首行 / Prisma 末行原因 / 底层原因 → 去令牌、遮证件号、≤200 字）。 */
 export function errorMessageForLog(err: unknown): string {
-  if (err instanceof Error) return sanitizeFailureMessage(err.message ?? '');
-  return sanitizeFailureMessage(String(err));
+  if (!(err instanceof Error)) return sanitizeFailureMessage(String(err));
+  const headline = messageHeadline(err.message ?? '');
+  const cause = causeHint(err);
+  return sanitizeLogText(cause ? `${headline}（cause: ${cause}）` : headline, FAILURE_MESSAGE_MAX_CHARS);
+}
+
+/** Prisma 已知错误的 meta 只留标量 / 字符串数组，逐个脱敏截断，最多 5 项（不整包原样进日志）。 */
+function summarizeMetaForLog(meta: unknown): SerializedLogError['meta'] | undefined {
+  if (typeof meta !== 'object' || meta === null || Array.isArray(meta)) return undefined;
+  const out: NonNullable<SerializedLogError['meta']> = {};
+  for (const [key, value] of Object.entries(meta).slice(0, MAX_META_ENTRIES)) {
+    if (typeof value === 'string') out[key] = sanitizeLogText(value, MAX_META_TEXT_CHARS);
+    else if (typeof value === 'number' || typeof value === 'boolean') out[key] = value;
+    else if (Array.isArray(value) && value.every((v) => typeof v === 'string')) {
+      out[key] = value.slice(0, MAX_META_ENTRIES).map((v) => sanitizeLogText(v, MAX_META_TEXT_CHARS));
+    }
+  }
+  return Object.keys(out).length > 0 ? out : undefined;
 }
 
 export function serializeErrorForLog(err: unknown): SerializedLogError {
@@ -197,9 +245,11 @@ export function serializeErrorForLog(err: unknown): SerializedLogError {
     .split('\n')
     .filter((line) => /^\s+at\s/.test(line))
     .slice(0, MAX_STACK_FRAMES);
+  const meta = summarizeMetaForLog((err as { meta?: unknown }).meta);
   return {
     type,
     ...(typeof rawCode === 'string' ? { code: rawCode } : {}),
+    ...(meta ? { meta } : {}),
     ...(frames.length > 0 ? { stack: [`${type}: ${errorMessageForLog(err)}`, ...frames].join('\n') } : {}),
   };
 }

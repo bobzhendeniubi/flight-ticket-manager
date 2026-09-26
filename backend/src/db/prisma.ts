@@ -1,13 +1,27 @@
 import { PrismaClient } from '@prisma/client';
+import pino from 'pino';
 import { env } from '../config/env.js';
+import { errorMessageForLog } from '../lib/request-failure-log.js';
 import { createImageBlobExtension } from './image-blob-extension.js';
 
-const prismaLogLevels =
-  env.NODE_ENV === 'development' ? (['warn', 'error'] as const) : (['error'] as const);
+/**
+ * Prisma 自己的日志改成事件、由这里记一行。默认的 console 输出会把整段报错原样打进容器日志——
+ * 校验错误还会渲染全部调用参数（证件号、姓名、整张护照照片的 base64）。这里只留首行 + 末行原因、
+ * 去令牌、遮证件号、≤200 字（与请求失败日志同一口径，见 lib/request-failure-log.ts）。
+ * 请求里的查询失败照旧由错误处理器按请求记失败日志；这一行兜住 worker / 定时任务里的查询失败。
+ * 级别与此前一致：开发环境 warn + error，其余只记 error。
+ */
+const prismaLog = pino({ name: 'prisma', level: env.NODE_ENV === 'development' ? 'warn' : 'error' });
 
 const baseClient = new PrismaClient({
-  log: [...prismaLogLevels],
+  log: [
+    { emit: 'event', level: 'error' },
+    { emit: 'event', level: 'warn' },
+  ],
 });
+// 挂在底层客户端上：经下面图片出库扩展执行的查询，报错事件同样由它发出（已实测）
+baseClient.$on('error', (e) => prismaLog.error({ target: e.target }, errorMessageForLog(new Error(e.message))));
+baseClient.$on('warn', (e) => prismaLog.warn({ target: e.target }, errorMessageForLog(new Error(e.message))));
 
 /**
  * 全站共用的客户端：挂了图片出库扩展（db/image-blob-extension.ts）——

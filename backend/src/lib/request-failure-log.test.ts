@@ -201,3 +201,43 @@ describe('extractErrorFromPayload · 路由直接 send 的错误体', () => {
     });
   });
 });
+
+// 生产（NODE_ENV=production）下 Prisma 5.22 的报错形状固定是「\nInvalid `x.y()` invocation:\n\n\n<原因>」，
+// 真正原因在最后一行；中间（校验错误）是整段调用参数，含证件号 / 照片——只能要首尾两行。
+describe('errorMessageForLog / serializeErrorForLog · Prisma 报错取到真正原因', () => {
+  it('事务超时：首行 + 末行原因都在', () => {
+    const err = new Error(
+      '\nInvalid `tx.order.update()` invocation:\n\n\nTransaction already closed: A query cannot be executed on an expired transaction. The timeout for this transaction was 5000 ms, however 5020 ms passed since the start of the transaction.',
+    );
+    const msg = errorMessageForLog(err);
+    expect(msg).toContain('Invalid `tx.order.update()` invocation');
+    expect(msg).toContain('The timeout for this transaction was 5000 ms');
+    expect(msg.length).toBeLessThanOrEqual(200);
+  });
+
+  it('校验错误：中间的参数块（证件号 / 照片）不进日志，只留首行与末行原因', () => {
+    const err = new Error(
+      '\nInvalid `prisma.passenger.update()` invocation:\n\n{\n  data: {\n    documentNumber: "E12345678",\n    passportPhotoUrl: "data:image/jpeg;base64,/9j/AAAA",\n+   nationality: String\n  }\n}\n\nArgument `nationality` is missing.',
+    );
+    const text = `${errorMessageForLog(err)} ${JSON.stringify(serializeErrorForLog(err))}`;
+    expect(errorMessageForLog(err)).toContain('Argument `nationality` is missing.');
+    expect(text).not.toContain('12345678');
+    expect(text).not.toContain('base64');
+  });
+
+  it('有 cause 时带上底层错误码（fetch failed 看得到 ENOTFOUND）', () => {
+    const cause = Object.assign(new Error('getaddrinfo ENOTFOUND dashscope.example'), { code: 'ENOTFOUND' });
+    expect(errorMessageForLog(new Error('fetch failed', { cause }))).toContain('ENOTFOUND');
+  });
+
+  it('Prisma 已知错误带 meta（字段名 / 约束名），值照样脱敏', () => {
+    const err = Object.assign(new Error('Unique constraint failed on the fields: (`orderNumber`)'), {
+      name: 'PrismaClientKnownRequestError',
+      code: 'P2002',
+      meta: { target: ['orderNumber'], modelName: 'Order', cause: 'Record E12345678 not found' },
+    });
+    const out = serializeErrorForLog(err);
+    expect(out.code).toBe('P2002');
+    expect(out.meta).toEqual({ target: ['orderNumber'], modelName: 'Order', cause: 'Record E****5678 not found' });
+  });
+});
