@@ -91,3 +91,17 @@ describe('sanitizeLogText', () => {
     expect(out.length).toBeLessThanOrEqual(16);
   });
 });
+
+// /client-errors 是匿名接口，message / stack 由外部任意构造：脱敏正则必须线性，不能被病态输入拖慢事件循环。
+describe('scrubSecrets · 病态输入不拖慢（正则线性）', () => {
+  it.each(['?', '#', '?a', '#a'])('64KB 的「%s」重复串在 200ms 内处理完', (unit) => {
+    const text = unit.repeat(Math.ceil(65536 / unit.length));
+    const started = performance.now();
+    sanitizeLogText(text, 4000);
+    expect(performance.now() - started).toBeLessThan(200);
+  });
+
+  it('一段文本里连着多个 ? 参数段，都被去掉', () => {
+    expect(scrubSecrets('GET /a?x=1?y=2 done')).toBe('GET /a done');
+  });
+});

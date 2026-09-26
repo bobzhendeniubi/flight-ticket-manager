@@ -27,10 +27,12 @@ export function firstNonEmptyLine(text: string): string {
 
 // Bearer 令牌、JWT 形态、带 `=` 的 query / hash 参数（`?token=…&page=2`、`#access_token=…`）。
 // query 段后面若紧跟调用栈的「:行:列」（`a.js?v=1:10:20`）则保留行列号，只去掉参数。
+// 参数段的字符集排除起始符本身（`?` / `#`）：否则一长串 `?` 或 `#`（/client-errors 是匿名接口，内容任意）
+// 会让每个起点都扫到末尾找 `=`，平方复杂度——64KB 要两秒多，卡住事件循环。遇到下一个 `?` 即另起一段。
 const BEARER_TOKEN = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
 const JWT_LIKE = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g;
-const QUERY_WITH_PARAMS = /\?[^\s"'<>#()]*?=[^\s"'<>#()]*?((?::\d+){1,2})?(?=[\s"'<>#()]|$)/g;
-const HASH_WITH_PARAMS = /#[^\s"'<>()]*=[^\s"'<>()]*/g;
+const QUERY_WITH_PARAMS = /\?[^\s"'<>#()?]*?=[^\s"'<>#()?]*?((?::\d+){1,2})?(?=[\s"'<>#()?]|$)/g;
+const HASH_WITH_PARAMS = /#[^\s"'<>()#]*=[^\s"'<>()]*/g;
 
 /** 抹掉自由文本里的令牌与 URL 参数（URL 本身与调用栈行列号保留，只去掉参数段）。 */
 export function scrubSecrets(text: string): string {
