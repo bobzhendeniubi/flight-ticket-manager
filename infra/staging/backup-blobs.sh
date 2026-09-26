@@ -29,13 +29,14 @@ SRC=$(docker volume inspect -f '{{.Mountpoint}}' "$VOLUME" 2>/dev/null) || {
 }
 
 mkdir -p "$BACKUP_DIR"
+# 先数卷里的：rsync 期间还可能有新上传落盘，rsync 之后再数会出现「备份 < 卷里」的假失败
+src_count=$(find "$SRC" -type f ! -name '*.tmp' ! -name '.probe.*' | wc -l)
 if ! rsync -a --exclude='*.tmp' --exclude='.probe.*' --exclude='.last-success' "$SRC/" "$BACKUP_DIR/"; then
   log "FAILED: rsync 退出非 0，未写 .last-success（看门狗第二天会因标记过旧报警）" >&2
   exit 1
 fi
 
-# 只增不删：备份里的文件数只会 ≥ 卷里的；反过来说明拷漏了
-src_count=$(find "$SRC" -type f ! -name '*.tmp' ! -name '.probe.*' | wc -l)
+# 只增不删：备份里的文件数只会 ≥ rsync 开始前卷里的；反过来说明拷漏了
 dst_count=$(find "$BACKUP_DIR" -type f ! -name '.last-success' | wc -l)
 if [ "$dst_count" -lt "$src_count" ]; then
   log "FAILED: 备份 $dst_count 个文件 < 卷里 $src_count 个，未写 .last-success" >&2

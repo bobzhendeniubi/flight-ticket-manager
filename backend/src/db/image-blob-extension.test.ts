@@ -77,6 +77,24 @@ describe('DMMF 守卫', () => {
     }
   });
 
+  it('能通向图片列、又有名为 data 的标量列的模型，不被任何对一关系指向（嵌套 update 信封判别的前提）', () => {
+    // rewriteUpdateEnvelope 靠「有没有 where / 目标模型有没有叫 data 的标量列」区分 `{ where?, data }` 信封与
+    // 对一关系直接写的数据对象。某模型若既有标量 data、又被对一关系指向、还能通向图片列，就可能把真实数据
+    // 当成信封（或反之）而漏转图片——改 schema 撞上这条时先回头改 image-blob-extension.ts。
+    const models = Prisma.dmmf.datamodel.models;
+    const risky = new Set(
+      models
+        .filter((m) => modelTouchesImages(m.name) && m.fields.some((f) => f.kind !== 'object' && f.name === 'data'))
+        .map((m) => m.name),
+    );
+    const offenders = models.flatMap((m) =>
+      m.fields
+        .filter((f) => f.kind === 'object' && !f.isList && risky.has(f.type))
+        .map((f) => `${m.name}.${f.name} → ${f.type}`),
+    );
+    expect(offenders).toEqual([]);
+  });
+
   it('modelTouchesImages：图片模型及能通向它们的模型 true；孤立模型 false', () => {
     expect(modelTouchesImages('Passenger')).toBe(true);
     expect(modelTouchesImages('Order')).toBe(true);

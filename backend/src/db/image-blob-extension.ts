@@ -17,6 +17,9 @@
  * 图片列名在全 schema 里唯一（image-blob-extension.test.ts 有守卫）。
  *
  * 失败口径与 image-ref.ts 一致：转不了保留原值、读不到保留引用并 WARN，绝不让业务写失败或 500。
+ *
+ * ⚠️ 图片列不能在 where 里按值比较：库里存的是引用，业务层读到的却是还原后的 data URL——拿读到的值做
+ * `where: { passportPhotoUrl: <dataURL> }`（比如自己写 CAS）会静默匹配 0 行。判有无用 null / '' 即可。
  */
 import { Prisma } from '@prisma/client';
 import { getBlobStore, type BlobStore } from '../lib/blob-store.js';
