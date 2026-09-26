@@ -42,6 +42,23 @@ function buildVersionPlugin(buildId: string): Plugin {
   };
 }
 
+/**
+ * 第三方依赖拆包：react / react-dom / 路由 / zustand 合成一个 vendor-react 块，只随依赖升级才变。
+ * 日常发版只改业务代码，这个块的文件名（内容哈希）不变，浏览器长缓存（max-age=1y, immutable）一直命中。
+ * 分组宁粗勿细：总是一起用到的依赖放一块，别拆出一地碎文件白白多出请求。
+ * tesseract.js 本来就是护照识别时才动态加载，保持 Rollup 自动拆出的独立块，不进首屏。
+ */
+const VENDOR_REACT_RE =
+  /[\\/]node_modules[\\/](?:react|react-dom|scheduler|react-router|react-router-dom|@remix-run[\\/]router|zustand)[\\/]/;
+
+function manualChunks(id: string): string | undefined {
+  if (VENDOR_REACT_RE.test(id)) return 'vendor-react';
+  // CommonJS 互操作帮助模块（react / react-dom 是 CJS 包，要靠它转 ESM）跟着 vendor 走：
+  // 留给 Rollup 自动安排可能落进入口块，变成 vendor 反过来依赖入口，入口一变 vendor 哈希也跟着变。
+  if (id.startsWith('\0') && id.includes('commonjsHelpers')) return 'vendor-react';
+  return undefined;
+}
+
 export default defineConfig(({ mode }) => {
   const env = loadEnv(mode, process.cwd(), '');
   const devProxyTarget = env.VITE_DEV_API_TARGET || 'http://localhost:4000';
@@ -55,6 +72,11 @@ export default defineConfig(({ mode }) => {
     plugins: [react(), buildVersionPlugin(buildId)],
     resolve: {
       alias: { '@': path.resolve(__dirname, 'src') },
+    },
+    build: {
+      rollupOptions: {
+        output: { manualChunks },
+      },
     },
     server: {
       port: devPort,
