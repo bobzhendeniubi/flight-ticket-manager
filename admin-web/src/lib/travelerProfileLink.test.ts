@@ -12,10 +12,11 @@ describe('travelerProfileLinkProps', () => {
     ).toEqual({ to: '/travelers?profile=p1' });
   });
 
-  it('档案 id 里的特殊字符做 URL 转义', () => {
-    expect(travelerProfileLinkProps({ profileId: 'a b/c' })).toEqual({
-      to: '/travelers?profile=a%20b%2Fc',
-    });
+  it('档案 id 里的特殊字符做 URL 转义，档案页按 searchParams 读回原值', () => {
+    const { to } = travelerProfileLinkProps({ profileId: 'a b/c' });
+    // 空格编码成 '+' 还是 '%20' 都合法，只钉「斜杠被转义、读回来还是原值」（档案页用 searchParams.get 读）
+    expect(to).not.toContain('b/c');
+    expect(new URL(to, 'http://x').searchParams.get('profile')).toBe('a b/c');
   });
 
   it('只有证件号时走 Link state —— 证件号绝不进地址栏', () => {
