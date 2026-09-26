@@ -27,6 +27,7 @@ import {
 } from '@prisma/client';
 import { randomBytes } from 'node:crypto';
 import { prisma } from '../../db/prisma.js';
+import { PAYMENT_PROOF_OMIT, RECEIPT_PROOF_OMIT } from '../../db/heavy-columns.js';
 import { BadRequestError, ConflictError, NotFoundError } from '../../lib/errors.js';
 import {
   FUNDS_CREDIT_BLOCKED_STATUSES,
@@ -607,10 +608,17 @@ export class ReceiptsService {
   // ════════════════════════════════════════════════════════════════════
   async ledger() {
     const RECENT_LIMIT = 300;
+    // 总账只出金额 / 单号 / 去向，不出凭证图：两边都不读凭证列（见 db/heavy-columns.ts）。
     const [receipts, payments] = await Promise.all([
-      prisma.receipt.findMany({ orderBy: { receivedAt: 'desc' }, take: RECENT_LIMIT, include: { allocations: true, holdAllocations: true } }),
+      prisma.receipt.findMany({
+        orderBy: { receivedAt: 'desc' },
+        take: RECENT_LIMIT,
+        omit: RECEIPT_PROOF_OMIT,
+        include: { allocations: true, holdAllocations: true },
+      }),
       prisma.payment.findMany({
         where: { status: 'SUCCEEDED' },
+        omit: PAYMENT_PROOF_OMIT,
         include: { order: { select: { orderNumber: true } } },
         orderBy: { createdAt: 'desc' },
         take: RECENT_LIMIT,
@@ -1631,11 +1639,16 @@ export class ReceiptsService {
     // 单页 1000 条循环取完；上限 50000 条纯属防失控（远超当前业务量），触顶报错而非截断。
     const EXPORT_PAGE = 1000;
     const EXPORT_HARD_CAP = 50_000;
-    type ReceiptWithAllocs = Prisma.ReceiptGetPayload<{ include: { allocations: true; holdAllocations: true } }>;
+    // 核对表不出凭证图：不读凭证列（全量翻页，带图时每页 1000 行最多几百 MB，见 db/heavy-columns.ts）。
+    type ReceiptWithAllocs = Prisma.ReceiptGetPayload<{
+      omit: typeof RECEIPT_PROOF_OMIT;
+      include: { allocations: true; holdAllocations: true };
+    }>;
     const receipts: ReceiptWithAllocs[] = [];
     for (;;) {
       const page = await prisma.receipt.findMany({
         where,
+        omit: RECEIPT_PROOF_OMIT,
         include: { allocations: true, holdAllocations: true },
         orderBy: [{ receivedAt: 'desc' }, { id: 'desc' }],
         skip: receipts.length,

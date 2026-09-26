@@ -19,6 +19,7 @@
  */
 import { Prisma, ReceiptSource, ReceiptStatus } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
+import { RECEIPT_PROOF_OMIT } from '../../db/heavy-columns.js';
 import { round2 } from '../../lib/commission-net.js';
 import {
   OVERPAY_SPLIT_TXN_PREFIX,
@@ -59,7 +60,11 @@ export interface OverpaySplitTrail extends OverpaySplitDetail {
   pool: PoolTrail | null;
 }
 
-type ReceiptRow = Prisma.ReceiptGetPayload<{ include: { allocations: true; holdAllocations: true } }>;
+// 去向留痕只用金额 / 单号 / 时间，不读凭证图列（见 db/heavy-columns.ts）。
+type ReceiptRow = Prisma.ReceiptGetPayload<{
+  omit: typeof RECEIPT_PROOF_OMIT;
+  include: { allocations: true; holdAllocations: true };
+}>;
 
 /** 从「多付转挂账池」处置行载荷里读它建的那笔进账 id（新数据才有；旧数据 null）。 */
 function readDisposalPoolReceiptId(payload: Prisma.JsonValue | null): string | null {
@@ -184,6 +189,7 @@ export async function loadOrderOverpayTrails(
         ...(referencedIds.length ? [{ id: { in: referencedIds } }] : []),
       ],
     },
+    omit: RECEIPT_PROOF_OMIT,
     include: {
       allocations: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] },
       holdAllocations: { orderBy: [{ createdAt: 'asc' }, { id: 'asc' }] },

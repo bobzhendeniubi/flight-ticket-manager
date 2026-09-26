@@ -91,6 +91,8 @@ import { buildOrdersBySchedule } from '../modules/orders/orders.export.js';
 import { queryOrdersByIdsForVisa } from '../modules/orders/orders.export-visa-bundle.js';
 import { exportMasterQuerySchema, exportTemplatesQuerySchema } from '../modules/orders/orders.schemas.js';
 import { buildFinanceExportWorkbook } from '../modules/finances/finances.export.js';
+import { ReceiptsService } from '../modules/receipts/receipts.service.js';
+import { loadOrderOverpayTrails } from '../modules/payments/overpay-trail.js';
 import { collectHotelPassportGroups } from '../modules/hotel-control/hotel-control.passports.js';
 import { FulfillmentService } from '../modules/fulfillment/fulfillment.service.js';
 
@@ -253,6 +255,27 @@ describe('导出不读图片大字段', () => {
     await buildFinanceExportWorkbook(month, client);
     const [orderQuery] = argsOf('order', 'findMany');
     expect(orderQuery?.include).toMatchObject({ passengers: PASSENGERS_WITHOUT_PHOTO });
+    expect(heavyReadsSoFar()).toEqual([]);
+  });
+});
+
+describe('对账不读凭证图', () => {
+  it('总账：进账与收款两边都不读凭证图', async () => {
+    await new ReceiptsService().ledger();
+    expect(argsOf('receipt', 'findMany')[0]).toMatchObject({ omit: RECEIPT_PROOF_OMIT });
+    expect(argsOf('payment', 'findMany')[0]).toMatchObject({ omit: PAYMENT_PROOF_OMIT });
+    expect(heavyReadsSoFar()).toEqual([]);
+  });
+
+  it('流水核对表导出：翻页取进账不读凭证图', async () => {
+    await new ReceiptsService().exportStatement({});
+    expect(argsOf('receipt', 'findMany')[0]).toMatchObject({ omit: RECEIPT_PROOF_OMIT });
+    expect(heavyReadsSoFar()).toEqual([]);
+  });
+
+  it('订单详情挂账去向：查池子进账不读凭证图', async () => {
+    await loadOrderOverpayTrails('o1', []);
+    expect(argsOf('receipt', 'findMany')[0]).toMatchObject({ omit: RECEIPT_PROOF_OMIT });
     expect(heavyReadsSoFar()).toEqual([]);
   });
 });
