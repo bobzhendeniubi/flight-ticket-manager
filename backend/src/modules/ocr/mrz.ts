@@ -106,6 +106,22 @@ function parseMrzDate(yymmdd: string, kind: 'birth' | 'expiry'): string | null {
   return `${year}-${mmStr}-${ddStr}`;
 }
 
+/** 第 1 行尾部填充符最多容忍数错几个（再多就不像是数错，而是抄漏了内容）。 */
+const LINE1_FILLER_TOLERANCE = 3;
+
+/**
+ * 第 1 行（类型 + 签发国 + 姓名）没有校验位，模型逐字抄写时常把尾部一长串填充符 '<' 数错一两个
+ * （合成图基准 12 次里 6 次抄成 43 位）。严格按 44 位判定会让整个机读区当作无法解析——第 2 行的
+ * 校验位白白不用，机读字段全部标黄。只在差异全是尾部填充符、且在容忍范围内时补齐 / 截断；
+ * 其余情况原样返回，交给后面的长度校验按无法解析处理。第 2 行有校验位，不做这种猜测。
+ */
+function normalizeLine1Fillers(line1: string): string {
+  const diff = line1.length - TD3_LINE_LENGTH;
+  if (diff === 0 || Math.abs(diff) > LINE1_FILLER_TOLERANCE) return line1;
+  if (diff < 0) return line1.endsWith('<') ? line1.padEnd(TD3_LINE_LENGTH, '<') : line1;
+  return /^<+$/.test(line1.slice(TD3_LINE_LENGTH)) ? line1.slice(0, TD3_LINE_LENGTH) : line1;
+}
+
 /** 把 MRZ 名字字段里的 '<' 转空格并折叠、trim。 */
 function cleanNamePart(part: string): string {
   return part.replace(/</g, ' ').replace(/\s+/g, ' ').trim();
@@ -126,7 +142,7 @@ function parseSex(c: string): string {
 export function parseTd3Mrz(line1Raw: string, line2Raw: string): MrzResult | null {
   if (typeof line1Raw !== 'string' || typeof line2Raw !== 'string') return null;
 
-  const line1 = line1Raw.trim().toUpperCase();
+  const line1 = normalizeLine1Fillers(line1Raw.trim().toUpperCase());
   const line2 = line2Raw.trim().toUpperCase();
 
   if (line1.length !== TD3_LINE_LENGTH || line2.length !== TD3_LINE_LENGTH) {

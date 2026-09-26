@@ -49,8 +49,8 @@ describe('parseTd3Mrz — ICAO 官方样例', () => {
 });
 
 describe('parseTd3Mrz — 容错', () => {
-  it('行长非 44 返回 null', () => {
-    expect(parseTd3Mrz(SAMPLE_LINE1.slice(0, 43), SAMPLE_LINE2)).toBeNull();
+  it('行长非 44 返回 null（第 1 行尾部填充符数错 1-3 个的容错见下方专门用例）', () => {
+    expect(parseTd3Mrz(SAMPLE_LINE1.slice(0, 40), SAMPLE_LINE2)).toBeNull();
     expect(parseTd3Mrz(SAMPLE_LINE1, SAMPLE_LINE2.slice(0, 40))).toBeNull();
   });
 
@@ -67,5 +67,35 @@ describe('parseTd3Mrz — 容错', () => {
   it('出生年两位 > 当前两位年 → 19xx', () => {
     const r = parseTd3Mrz(SAMPLE_LINE1, SAMPLE_LINE2);
     expect(r!.dateOfBirth.startsWith('19')).toBe(true);
+  });
+});
+
+// 第 1 行没有校验位，模型抄写时常把尾部填充符 '<' 数错一两个（合成图基准里 12 次有 6 次抄成 43 位），
+// 严格按 44 位判定会让整个机读区当作无法解析、第 2 行的校验位白白不用、机读字段全部标黄。
+describe('parseTd3Mrz — 第 1 行尾部填充符数错的容错', () => {
+  it('少一个尾部填充符（43 位）→ 补齐后照常解析，第 2 行校验位全过', () => {
+    const r = parseTd3Mrz(SAMPLE_LINE1.slice(0, 43), SAMPLE_LINE2);
+    expect(r).not.toBeNull();
+    expect(r!.valid).toBe(true);
+    expect(r!.surname).toBe('ERIKSSON');
+    expect(r!.givenNames).toBe('ANNA MARIA');
+  });
+
+  it('多三个尾部填充符（47 位）→ 截断后照常解析', () => {
+    const r = parseTd3Mrz(SAMPLE_LINE1 + '<<<', SAMPLE_LINE2);
+    expect(r?.valid).toBe(true);
+  });
+
+  it('差得太多（少 4 位）或缺的不是填充符（姓名被截断）→ 仍当作无法解析', () => {
+    expect(parseTd3Mrz(SAMPLE_LINE1.slice(0, 40), SAMPLE_LINE2)).toBeNull();
+    expect(parseTd3Mrz('P<UTOERIKSSON<<ANNA<MARI', SAMPLE_LINE2)).toBeNull();
+  });
+
+  it('多出来的不是填充符 → 仍当作无法解析', () => {
+    expect(parseTd3Mrz(SAMPLE_LINE1 + 'X', SAMPLE_LINE2)).toBeNull();
+  });
+
+  it('第 2 行有校验位，长度仍严格 44 位（不猜）', () => {
+    expect(parseTd3Mrz(SAMPLE_LINE1, SAMPLE_LINE2.slice(0, 43))).toBeNull();
   });
 });
