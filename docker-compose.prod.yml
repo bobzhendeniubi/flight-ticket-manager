@@ -82,6 +82,10 @@ services:
       interval: 10s
       timeout: 5s
       retries: 10
+    # 不设上限的 json-file 只有重建容器才清零（redis 不随发版重建，6 周攒了 15MB）
+    logging:
+      driver: "json-file"
+      options: { max-size: "20m", max-file: "3" }
 
   backend:
     build:
@@ -193,6 +197,10 @@ services:
     ports:
       # 默认 80 便于裸 IP 单机部署；上 Caddy/域名后设 SALES_WEB_BIND=127.0.0.1:8081 让出 80
       - "${SALES_WEB_BIND:-80}:80"
+    # nginx 访问日志：不设上限就一直涨到下次发版重建
+    logging:
+      driver: "json-file"
+      options: { max-size: "50m", max-file: "3" }
 
   admin-web:
     build:
@@ -207,6 +215,10 @@ services:
     ports:
       # 上 Caddy 后设 ADMIN_WEB_BIND=127.0.0.1:8080，只允许本机反代访问
       - "${ADMIN_WEB_BIND:-8080}:80"
+    # nginx 访问日志约 14MB/天：不设上限就一直涨到下次发版重建
+    logging:
+      driver: "json-file"
+      options: { max-size: "50m", max-file: "3" }
 
 volumes:
   postgres_data:
