@@ -48,7 +48,9 @@ if [ -z "$LATEST_REMOTE" ]; then
 fi
 
 echo "[backup-pull] $(date '+%F %T') 拉取 $(basename "$LATEST_REMOTE")（限速 ${BWLIMIT}KB/s）"
-rsync -a --partial --timeout=300 --bwlimit="$BWLIMIT" -e "$SSH_CMD" \
+# --partial-dir：中断时半截文件放进隐藏目录、下次续传；不能用 --partial——那样半截文件会以正式文件名
+# 留在本地，次日拉了新的一份后它看起来就像一份好备份，在这里躺满 30 天。
+rsync -a --partial-dir=.rsync-partial --timeout=300 --bwlimit="$BWLIMIT" -e "$SSH_CMD" \
   "$REMOTE:$LATEST_REMOTE" "$LOCAL_DIR/"
 
 # 完整性校验：解不开的备份 = 没备份。
@@ -76,10 +78,10 @@ LOCAL_BLOB_DIR="$LOCAL_DIR/blobs"
 BLOB_VERIFY_SAMPLE=20
 if $SSH_CMD "$REMOTE" "test -f $REMOTE_BLOB_DIR/.last-success"; then
   mkdir -p "$LOCAL_BLOB_DIR"
-  rsync -a --partial --timeout=300 --bwlimit="$BWLIMIT" --exclude='*.tmp' --exclude='.probe.*' \
+  rsync -a --partial-dir=.rsync-partial --timeout=300 --bwlimit="$BWLIMIT" --exclude='*.tmp' --exclude='.probe.*' \
     -e "$SSH_CMD" "$REMOTE:$REMOTE_BLOB_DIR/" "$LOCAL_BLOB_DIR/"
   remote_count=$($SSH_CMD "$REMOTE" "find $REMOTE_BLOB_DIR -type f ! -name '.*' | wc -l" | tr -d ' ')
-  local_count=$(find "$LOCAL_BLOB_DIR" -type f ! -name '.*' | wc -l | tr -d ' ')
+  local_count=$(find "$LOCAL_BLOB_DIR" -name .rsync-partial -prune -o -type f ! -name '.*' -print | wc -l | tr -d ' ')
   if [ "$local_count" -lt "$remote_count" ]; then
     notify_fail "附件没拉全：本地 $local_count 个 < 服务器 $remote_count 个"
     exit 1
@@ -88,7 +90,7 @@ if $SSH_CMD "$REMOTE" "test -f $REMOTE_BLOB_DIR/.last-success"; then
   bad=0
   while IFS= read -r f; do
     [ "$(shasum -a 256 "$f" | cut -d' ' -f1)" = "$(basename "$f")" ] || bad=$((bad + 1))
-  done < <(find "$LOCAL_BLOB_DIR" -type f ! -name '.*' | sort -R | head -n "$BLOB_VERIFY_SAMPLE")
+  done < <(find "$LOCAL_BLOB_DIR" -name .rsync-partial -prune -o -type f ! -name '.*' -print | sort -R | head -n "$BLOB_VERIFY_SAMPLE")
   if [ "$bad" -gt 0 ]; then
     notify_fail "附件抽样校验有 $bad 个文件内容与哈希不符"
     exit 1
@@ -98,6 +100,8 @@ else
   echo "[backup-pull] $(date '+%F %T') 服务器还没有附件备份（照片出库未上线），跳过"
 fi
 
+# 保留期清理也会顺带清掉 .rsync-partial 里超期的半截文件（-delete 隐含深度优先，-prune 在这里不生效，正好）
 find "$LOCAL_DIR" \( -name 'ftm_*.sql.gz' -o -name 'ftm_*.dump' \) -mtime +"$RETAIN_DAYS" -delete
-COUNT=$(find "$LOCAL_DIR" \( -name 'ftm_*.sql.gz' -o -name 'ftm_*.dump' \) | wc -l | tr -d ' ')
+# 份数只数正式快照：跳过 .rsync-partial（没拉完的半截文件，文件名与正式快照相同）
+COUNT=$(find "$LOCAL_DIR" -name .rsync-partial -prune -o \( -name 'ftm_*.sql.gz' -o -name 'ftm_*.dump' \) -print | wc -l | tr -d ' ')
 echo "[backup-pull] $(date '+%F %T') ok: $(basename "$LOCAL_FILE") ($(du -h "$LOCAL_FILE" | cut -f1))，本地共 $COUNT 份"
