@@ -483,16 +483,16 @@ describe('correctPassengerBodySchema', () => {
     ).toBe(false);
   });
 
-  it('国籍只认两位 ISO 码，且统一收成大写', () => {
-    const parsed = correctPassengerBodySchema.parse({ mode: 'CORRECTION', nationality: 'cn' });
-    expect(parsed.nationality).toBe('CN');
-    // 三位码 / 单字符都拒 —— 这一列只存两位码，写进去导出与送签层都查不到。
-    // （「中国」这类两字中文在 JS 里长度也是 2，length(2) 拦不住 —— 与补录 schema 同一个
-    //   历史口径，两条通道要放严得一起放严，这里不单独收紧免得两处漂移。）
-    for (const bad of ['CHN', 'C']) {
-      expect(
-        correctPassengerBodySchema.safeParse({ mode: 'CORRECTION', nationality: bad }).success,
-      ).toBe(false);
+  it('国籍入库一律是两位 ISO 大写码：三位码查表归一，非国家码拒', () => {
+    const parse = (nationality: string) =>
+      correctPassengerBodySchema.safeParse({ mode: 'CORRECTION', nationality });
+    // 这一列只存两位码（导出与送签层按两位码查表）。口径与建单 / 补录同一个 countryCodeSchema：
+    // 小写收成大写，OCR / MRZ 常见的三位码查表归一成两位——入库的永远是两位码。
+    expect(parse('cn').data?.nationality).toBe('CN');
+    expect(parse('CHN').data?.nationality).toBe('CN');
+    // 单字符、「中国」这类中文拒（旧的 length(2) 拦不住两字中文，这里一并堵上）
+    for (const bad of ['C', '中国']) {
+      expect(parse(bad).success).toBe(false);
     }
   });
 });

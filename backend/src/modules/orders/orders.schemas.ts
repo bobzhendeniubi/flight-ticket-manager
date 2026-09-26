@@ -341,10 +341,11 @@ export const selfUpdatePassengerBodySchema = z
     gender: z.enum(['M', 'F', 'X']).optional(),
     documentNumber: z.string().min(3).max(40).optional(),
     dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-    nationality: z.string().length(2).optional(),
+    // 国家码与建单同口径：2 / 3 位都收、统一归一成 2 位（OCR / MRZ 给的是 3 位，死卡 2 位会直接 400）
+    nationality: countryCodeSchema('国籍').optional(),
     passportExpiry: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     passportIssueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
-    passportIssueCountry: z.string().length(2).optional(),
+    passportIssueCountry: countryCodeSchema('护照签发国').optional(),
     passportIssuePlace: z.string().max(120).optional(),
     // 护照图 data-URL；3MB 上限与下单口径一致（超大图快速失败，而非整请求 413 黑盒）
     passportPhotoUrl: z.string().url().max(3_000_000, '护照图过大，请压缩后重试').optional(),
@@ -1320,7 +1321,8 @@ export const swapPassengerBodySchema = z
     // 国籍：换人时的新出行人国籍。证件号变化（= 真换人）时「建议必填」——新出行人不应沿用旧国籍。
     //   注：Zod superRefine 只能硬性 400，而「建议必填」是软约束（不改现有不传国籍即换人的行为、不误伤既有
     //   调用/测试），故此处不做条件强制；由前端在证件号变化时提示补录国籍（真正的硬校验留待后续按业务定夺）。
-    nationality: z.string().max(60).optional(),
+    // 格式与建单同口径：此前 max(60) 能把 CHN、「中国」原样写进只认 2 位码的列，导出 / 送签按 2 位码查表查不到。
+    nationality: countryCodeSchema('国籍').optional(),
     // 新出行人的护照有效期 / 签发日（YYYY-MM-DD，正则与建单 passengerInputSchema 同款）。
     //   证件号变化时 service 会清空旧人的这两项，本请求带的值即新人的值；未带有效期且本单
     //   「按人出行」→ service 400（见 swapPassengerBodySchema 上方口径说明）。
@@ -1413,10 +1415,10 @@ export const correctPassengerBodySchema = z
     documentNumber: z.string().min(3).max(40).optional(),
     dateOfBirth: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     gender: z.nativeEnum(Gender).optional(),
-    // 国籍：ISO-2 两位码（口径同 selfUpdatePassengerBodySchema）。此前的 max(60) 能把
-    // 「中国」「CHN」这类值原样写进只认两位码的列，导出/送签层再按 ISO-2 查表就查不到。
+    // 国籍：入库一律 ISO-2 两位码（口径同建单 / 补录）。此前的 max(60) 能把「中国」「CHN」这类值
+    // 原样写进只认两位码的列，导出/送签层再按 ISO-2 查表就查不到；3 位码（OCR / MRZ 常见）查表归一，
     // 大小写统一收在边界：cn → CN，免得同一个国籍在库里存成两种写法。
-    nationality: z.string().length(2).transform((v) => v.toUpperCase()).optional(),
+    nationality: countryCodeSchema('国籍').optional(),
     passportExpiry: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     passportIssueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),
     // ── 备注结构化（2026-09-17）：床型 / 兑换升舱在订正弹窗里也能改 ────────────

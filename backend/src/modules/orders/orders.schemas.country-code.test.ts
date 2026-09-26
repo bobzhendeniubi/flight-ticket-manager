@@ -2,7 +2,12 @@
 // 根因是 nationality / passportIssueCountry 原来是 z.string().length(2)，OTA 名单里常见的
 // 3 位护照 MRZ 码（CHN/VNM/USA…）整批被拒。这里验证 schema 层的归一 + 报错文案。
 import { describe, expect, it } from 'vitest';
-import { passengerInputSchema } from './orders.schemas.js';
+import {
+  correctPassengerBodySchema,
+  passengerInputSchema,
+  selfUpdatePassengerBodySchema,
+  swapPassengerBodySchema,
+} from './orders.schemas.js';
 
 const BASE_PASSENGER = {
   fullName: 'WU/FEILAI',
@@ -80,5 +85,39 @@ describe('passengerInputSchema · passportIssueCountry 国家码归一', () => {
     expect(() =>
       passengerInputSchema.parse({ ...BASE_PASSENGER, passportIssueCountry: 'XXX' }),
     ).toThrow(/护照签发国.*XXX.*未识别的 3 位国家/);
+  });
+});
+
+// 改乘客的三条通道（补录 / 订正 / 换人）写的是同一个 Passenger.nationality 列，口径必须与建单一致：
+// 此前补录、订正死卡 z.string().length(2)（OCR / MRZ 给的 CHN 直接 400），换人却是 max(60)
+// （CHN、中文原样入库，导出与送签按 2 位码查表查不到）。
+describe('改乘客三通道 · 国家码与建单同口径', () => {
+  it('补录：3 位码归一为 2 位（CHN→CN，签发国 mac→MO）', () => {
+    const body = selfUpdatePassengerBodySchema.parse({ nationality: 'CHN', passportIssueCountry: 'mac' });
+    expect(body.nationality).toBe('CN');
+    expect(body.passportIssueCountry).toBe('MO');
+  });
+
+  it('订正：3 位码归一、小写 2 位码归一为大写', () => {
+    expect(correctPassengerBodySchema.parse({ mode: 'CORRECTION', nationality: 'CHN' }).nationality).toBe('CN');
+    expect(correctPassengerBodySchema.parse({ mode: 'CORRECTION', nationality: 'vn' }).nationality).toBe('VN');
+  });
+
+  it('换人：3 位码归一，中文等非国家码不再原样入库', () => {
+    expect(swapPassengerBodySchema.parse({ mode: 'SWAP', nationality: 'VNM' }).nationality).toBe('VN');
+    expect(() => swapPassengerBodySchema.parse({ mode: 'SWAP', nationality: '中国' })).toThrow(
+      /国籍.*中国.*不是合法的国家码/,
+    );
+  });
+
+  it('三条通道对未识别的 3 位码都给出指明字段与值的中文错误', () => {
+    expect(() => selfUpdatePassengerBodySchema.parse({ nationality: 'ZZZ' })).toThrow(/国籍.*ZZZ.*未识别/);
+    expect(() => selfUpdatePassengerBodySchema.parse({ passportIssueCountry: 'ZZZ' })).toThrow(
+      /护照签发国.*ZZZ.*未识别/,
+    );
+    expect(() => correctPassengerBodySchema.parse({ mode: 'CORRECTION', nationality: 'ZZZ' })).toThrow(
+      /国籍.*ZZZ.*未识别/,
+    );
+    expect(() => swapPassengerBodySchema.parse({ mode: 'SWAP', nationality: 'ZZZ' })).toThrow(/国籍.*ZZZ.*未识别/);
   });
 });
