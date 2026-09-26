@@ -707,11 +707,14 @@ export class FulfillmentService {
       // 数百 MB 的响应体（读库 + 序列化 + 传输都被拖垮，签证台加载卡到分钟级）。
       // 这里改用原生 SQL 只在库内算出 hasPhoto（布尔），不把大字段拉到应用层；
       // 真图在用户展开某单时按 orderId 单独按需拉取（见 listPassengerPhotos）。
+      // 用 octet_length 而不是 length：UTF8 库里 length() 要把行外存储（TOAST）的整张图
+      // 读出来逐字数字符，一页几十上百张就是几十 MB 的库内 I/O；octet_length 只读长度头、
+      // 不碰图本身。两者对空串 / 非空串的判定完全一致（> 0 ⇔ 非空），口径不变。
       visaOrderIds.length
         ? prisma.$queryRaw<PassengerRow[]>(Prisma.sql`
             SELECT "orderId", "id", "fullName", "lastName", "firstName",
                    "chineseName", "gender"::text AS "gender", "documentNumber",
-                   ("passportPhotoUrl" IS NOT NULL AND length("passportPhotoUrl") > 0) AS "hasPhoto",
+                   ("passportPhotoUrl" IS NOT NULL AND octet_length("passportPhotoUrl") > 0) AS "hasPhoto",
                    to_char("passportExpiry", 'YYYY-MM-DD') AS "passportExpiry",
                    "visaSubmissionStatus"::text AS "visaSubmissionStatus"
             FROM "Passenger"
