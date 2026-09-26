@@ -12,6 +12,9 @@
  *  2. MRZ 缺失或校验位不过 → 全部机读字段进 reviewFields（逐项人工核对）。
  *  3. 非 MRZ 字段（chineseName/passportIssueDate/passportIssuePlace/
  *     placeOfBirth）：置信度 < 98 或缺失 → 进 reviewFields。
+ *  4. 签发地点兜底（见 checkIssuePlace）：含签发机关字样 → 不填入并提示手填；
+ *     「中文/拼音」原文 → 取斜杠前中文；「X省Y市」这类多级地名 → 保留但提示核对。
+ *     规则命中时不再叠加置信度提示（一个字段只给一条原因）。
  */
 import {
   composePassengerFullName,
@@ -73,8 +76,28 @@ const REASON_MRZ_MISMATCH =
   'MRZ 与目视区不一致，已按机读区取值，请人工复核';
 const REASON_MRZ_UNVERIFIED = '机读区未能校验，请逐项人工核对';
 const REASON_LOW_CONFIDENCE = '识别置信度不足，请人工核对';
+const REASON_ISSUE_PLACE_AUTHORITY = '疑似签发机关，未填入，请照护照「签发地点」栏手填';
+const REASON_ISSUE_PLACE_MULTI_LEVEL = '护照只印省份，结果带了下级地名，请核对';
 
 const CONFIDENCE_THRESHOLD = 98;
+
+/**
+ * 签发机关特征词：签发地点里出现即判定模型把「签发机关/Authority」栏填了进来。
+ * 中国护照的签发机关是出入境 / 移民管理部门（或驻外使领馆），外国护照多是外交部、移民局一类
+ * 部门；签发地点栏只印地名，不会出现这些字。「公安」只认部 / 厅 / 局，不单认二字（有地名叫公安县）。
+ */
+const ISSUING_AUTHORITY_PATTERN =
+  /管理局|公安部|公安厅|公安局|出入境|移民管理|入境事务|外交部|使馆|领事馆|ADMINISTRATION|MINISTRY|PUBLIC\s*SECURITY|IMMIGRATION|BUREAU|DEPARTMENT|EMBASSY|CONSULATE/i;
+
+/** 中国护照签发地点栏的印刷格式「中文/拼音」（斜杠含全角）：取斜杠前的中文（与提示词口径一致）。 */
+const CN_BILINGUAL_PLACE_PATTERN = /^(\p{Script=Han}+)\s*[/／]\s*[A-Za-z][A-Za-z .'-]*$/u;
+
+/**
+ * 多级地名：「省 / 自治区 / 市」后面还跟着字（如「X省Y市」「X市Y区」）。护照签发地点栏只印
+ * 省级名称、从不印到下一级，这种值多半是模型自行补全的（旧提示词里被照抄的示例就是这种格式）。
+ * 单级写法（「X省」「X市」）只是多了个后缀字，不拦。
+ */
+const MULTI_LEVEL_PLACE_PATTERN = /(省|自治区|市).+/;
 
 /**
  * 需要人工核对的非 MRZ 字段（按置信度判定）。
@@ -88,10 +111,38 @@ export const NON_MRZ_FIELDS = [
   'placeOfBirth',
 ] as const;
 
+type NonMrzField = (typeof NON_MRZ_FIELDS)[number];
+
 function trimOrNull(v: string | null | undefined): string | null {
   if (typeof v !== 'string') return v ?? null;
   const t = v.trim();
   return t === '' ? null : t;
+}
+
+interface IssuePlaceCheck {
+  value: string | null;
+  /** 规则命中时的核对原因；null = 规则放行（照常按置信度判定）。 */
+  reason: string | null;
+}
+
+/**
+ * 签发地点确定性兜底（提示词之外的第二道闸）：
+ *  - 含签发机关字样 → 不填入（null）并提示手填：错的机关名进了 PNR / 送签表，比空着更糟；
+ *  - 「中文/拼音」原文 → 取斜杠前中文（就是护照印的字，不算改值，不提示）；
+ *  - 「X省Y市」这类多级地名 → 保留原值，但提示核对。
+ */
+function checkIssuePlace(raw: string | null): IssuePlaceCheck {
+  // 模型偶尔给出非字符串（数字 / 对象）：不套规则，原样交给后续（与改前一致）
+  if (typeof raw !== 'string') return { value: raw, reason: null };
+  if (ISSUING_AUTHORITY_PATTERN.test(raw)) {
+    return { value: null, reason: REASON_ISSUE_PLACE_AUTHORITY };
+  }
+  const bilingual = CN_BILINGUAL_PLACE_PATTERN.exec(raw);
+  const value = bilingual ? bilingual[1] : raw;
+  if (MULTI_LEVEL_PLACE_PATTERN.test(value)) {
+    return { value, reason: REASON_ISSUE_PLACE_MULTI_LEVEL };
+  }
+  return { value, reason: null };
 }
 
 /** 宽松比较两个值是否“不一致”（大写去空白后比较；null 视为与非 null 不一致）。 */
@@ -181,16 +232,25 @@ export function applyOcrPostProcessing(raw: RawOcrFields): PostProcessResult {
     fullName = null;
   }
 
-  // 非 MRZ 字段置信度核对
+  // 非 MRZ 字段：规则判定的原因优先（更具体），否则按置信度核对。一个字段只给一条原因。
   const conf = raw.fieldConfidence ?? null;
-  const nonMrzValues: Record<(typeof NON_MRZ_FIELDS)[number], string | null> = {
+  const issuePlace = checkIssuePlace(trimOrNull(raw.passportIssuePlace));
+  const ruleReasons: Partial<Record<NonMrzField, string>> = issuePlace.reason
+    ? { passportIssuePlace: issuePlace.reason }
+    : {};
+  const nonMrzValues: Record<NonMrzField, string | null> = {
     chineseName: trimOrNull(raw.chineseName),
     passportIssueDate: trimOrNull(raw.passportIssueDate),
-    passportIssuePlace: trimOrNull(raw.passportIssuePlace),
+    passportIssuePlace: issuePlace.value,
     placeOfBirth: trimOrNull(raw.placeOfBirth),
   };
 
   for (const field of NON_MRZ_FIELDS) {
+    const ruleReason = ruleReasons[field];
+    if (ruleReason) {
+      reviewFields.push({ field, reason: ruleReason });
+      continue;
+    }
     const value = nonMrzValues[field];
     if (value == null) continue; // 无值无需核对（空字段本身已提示）
     const c = conf?.[field];

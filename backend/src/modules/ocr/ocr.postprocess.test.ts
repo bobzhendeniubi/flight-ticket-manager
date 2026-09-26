@@ -101,7 +101,7 @@ describe('applyOcrPostProcessing — 非 MRZ 字段置信度', () => {
   it('置信度 < 98 的非 MRZ 字段进 review', () => {
     const result = applyOcrPostProcessing({
       chineseName: '郑沁沁',
-      passportIssuePlace: '广东省广州市',
+      passportIssuePlace: '广东',
       mrzLine1: MRZ_LINE1,
       mrzLine2: MRZ_LINE2,
       fieldConfidence: { chineseName: 80, passportIssuePlace: 99 },
@@ -195,6 +195,102 @@ describe('applyOcrPostProcessing — fieldConfidence 只含非 MRZ 键（新提�
         (field) => ({ field, reason: '机读区未能校验，请逐项人工核对' }),
       ),
     );
+  });
+});
+
+describe('applyOcrPostProcessing — 签发地点兜底', () => {
+  // MRZ 校验通过且目视区一致：reviewFields 里只会剩签发地点相关的条目，便于逐条断言。
+  const CLEAN_INPUT = {
+    lastName: 'ERIKSSON',
+    firstName: 'ANNA MARIA',
+    dateOfBirth: '1974-08-12',
+    gender: 'F',
+    documentNumber: 'L898902C3',
+    nationality: 'UTO',
+    passportExpiry: '2012-04-15',
+    mrzLine1: MRZ_LINE1,
+    mrzLine2: MRZ_LINE2,
+  };
+  const run = (passportIssuePlace: string | null | undefined, confidence = 100) =>
+    applyOcrPostProcessing({
+      ...CLEAN_INPUT,
+      passportIssuePlace,
+      fieldConfidence: { passportIssuePlace: confidence },
+    });
+  const issuePlaceReviews = (result: ReturnType<typeof applyOcrPostProcessing>) =>
+    result.verify.reviewFields.filter((r) => r.field === 'passportIssuePlace');
+
+  it.each([
+    '中华人民共和国国家移民管理局',
+    '国家移民管理局',
+    '公安部出入境管理局',
+    'Exit & Entry Administration, Ministry of Public Security',
+    'National Immigration Administration, PRC',
+    'MINISTRY OF FOREIGN AFFAIRS',
+    '中华人民共和国驻胡志明市总领事馆',
+  ])('签发机关「%s」→ 不填入，并提示照签发地点栏手填', (value) => {
+    const result = run(value);
+    expect(result.suggested.passportIssuePlace).toBeNull();
+    const reviews = issuePlaceReviews(result);
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0].reason).toContain('签发机关');
+  });
+
+  it.each(['广东省广州市', '江西省南昌市', '北京市朝阳区', '广西壮族自治区南宁市'])(
+    '多级地名「%s」→ 保留原值，但提示核对',
+    (value) => {
+      const result = run(value);
+      expect(result.suggested.passportIssuePlace).toBe(value);
+      const reviews = issuePlaceReviews(result);
+      expect(reviews).toHaveLength(1);
+      expect(reviews[0].reason).toContain('只印省份');
+    },
+  );
+
+  it('多级地名且置信度也低 → 只给一条最具体的原因，不叠加', () => {
+    const reviews = issuePlaceReviews(run('广东省广州市', 50));
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0].reason).toContain('只印省份');
+  });
+
+  it.each(['江西', '广东', '内蒙古', '广东省', '北京市', '公安县'])(
+    '正常省份 / 单级写法「%s」→ 原样保留，不提示',
+    (value) => {
+      const result = run(value);
+      expect(result.suggested.passportIssuePlace).toBe(value);
+      expect(issuePlaceReviews(result)).toEqual([]);
+    },
+  );
+
+  it('正常省份但置信度不足 → 照旧按置信度提示', () => {
+    const result = run('江西', 90);
+    expect(result.suggested.passportIssuePlace).toBe('江西');
+    expect(issuePlaceReviews(result)).toEqual([
+      { field: 'passportIssuePlace', reason: '识别置信度不足，请人工核对' },
+    ]);
+  });
+
+  it.each([
+    ['广东/GUANGDONG', '广东'],
+    ['江西 / JIANGXI', '江西'],
+    ['内蒙古／NEI MONGOL', '内蒙古'],
+  ])('斜杠原文「%s」→ 取斜杠前中文「%s」，不提示', (value, expected) => {
+    const result = run(value);
+    expect(result.suggested.passportIssuePlace).toBe(expected);
+    expect(issuePlaceReviews(result)).toEqual([]);
+  });
+
+  it.each([null, undefined, '', '   '])('空值（%j）→ null，且不提示', (value) => {
+    const result = applyOcrPostProcessing({ ...CLEAN_INPUT, passportIssuePlace: value });
+    expect(result.suggested.passportIssuePlace).toBeNull();
+    expect(issuePlaceReviews(result)).toEqual([]);
+  });
+
+  it('签发地点规则不影响机读字段：MRZ 仍校验通过，也不多出机读字段的提示', () => {
+    const result = run('公安部出入境管理局');
+    expect(result.verify.mrzValid).toBe(true);
+    expect(result.suggested.documentNumber).toBe('L898902C3');
+    expect(result.verify.reviewFields.map((r) => r.field)).toEqual(['passportIssuePlace']);
   });
 });
 
