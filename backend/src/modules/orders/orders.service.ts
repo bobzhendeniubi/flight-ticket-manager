@@ -25936,18 +25936,27 @@ export function buildOrderFilterWhere(
   // 单词输入退化为原语义（fullName/chineseName 任一命中该词）。
   // 词数上限用 MAX_PASSENGER_NAME_TERMS（50）而非 search 的 5——运营反馈：一次要贴一整团
   // 几十人的名单，5 个名字卡不住整团人数；这里只在 passengers 一张表上 contains，代价可控。
+  //
+  // 查询形态：**每个词一个 passengers.some 子查询，词间 OR**（而不是一个子查询里 OR 全部词）。
+  // 两种写法命中的订单集合完全相同（「有乘客命中任一词」⇔「任一词有乘客命中」），但只有
+  // 逐词拆开，三个字以上的名字才能各自走乘客姓名的三元组索引：一个子查询里只要混进一个
+  // 两字名（抽不出三元组，只能整表扫），规划器就会把整团名字一起降级成整表扫、每行逐词比对。
   if (query.passengerName) {
     const terms = splitSearchTerms(query.passengerName, MAX_PASSENGER_NAME_TERMS);
-    where.passengers = {
-      some: {
-        OR: terms.flatMap((term) => [
-          { fullName: { contains: term, mode: 'insensitive' } },
-          { chineseName: { contains: term, mode: 'insensitive' } },
-          // 换人 / 订正之前的旧身份：贴一整团的老名单时，已经换过人的那几位同样要被认出来。
-          { formerIdentities: { contains: term, mode: 'insensitive' } },
-        ]),
-      },
-    };
+    andClauses.push({
+      OR: terms.map((term) => ({
+        passengers: {
+          some: {
+            OR: [
+              { fullName: { contains: term, mode: 'insensitive' } },
+              { chineseName: { contains: term, mode: 'insensitive' } },
+              // 换人 / 订正之前的旧身份：贴一整团的老名单时，已经换过人的那几位同样要被认出来。
+              { formerIdentities: { contains: term, mode: 'insensitive' } },
+            ],
+          },
+        },
+      })),
+    });
   }
   // 录入人员筛选（词间 OR）：匹配下单账号的显示名 / 邮箱 —— 与总表导出「录入人员」列同源，
   // 保证「列表筛到的 = 导出那列写的」。

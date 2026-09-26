@@ -8003,26 +8003,54 @@ describe('buildOrderFilterWhere · 搜索/乘客姓名含中文名（公测反�
 
   it('passengerName → fullName / chineseName / 旧身份任一命中', () => {
     const where = buildOrderFilterWhere({ passengerName: '李娜' });
-    expect(where.passengers).toEqual({
-      some: {
+    expect(where.AND).toEqual([
+      {
         OR: [
-          { fullName: { contains: '李娜', mode: 'insensitive' } },
-          { chineseName: { contains: '李娜', mode: 'insensitive' } },
-          // 换人/订正之前的旧身份：贴老名单时已换过人的那几位同样要被认出来。
-          { formerIdentities: { contains: '李娜', mode: 'insensitive' } },
+          {
+            passengers: {
+              some: {
+                OR: [
+                  { fullName: { contains: '李娜', mode: 'insensitive' } },
+                  { chineseName: { contains: '李娜', mode: 'insensitive' } },
+                  // 换人/订正之前的旧身份：贴老名单时已换过人的那几位同样要被认出来。
+                  { formerIdentities: { contains: '李娜', mode: 'insensitive' } },
+                ],
+              },
+            },
+          },
         ],
       },
-    });
+    ]);
   });
 
   it('passengerName 一次贴一整团（超过 search 的 5 词上限）：全部保留不截断', () => {
     // 运营反馈：姓名框要能一次贴几十人的名单，不能像 search 那样卡在 5 个词。
     const names = Array.from({ length: 30 }, (_, i) => `团员${i + 1}`);
     const where = buildOrderFilterWhere({ passengerName: names.join(' ') });
-    const or = (where.passengers as { some: { OR: unknown[] } }).some.OR;
-    // 30 个词 × 3 个字段（fullName/chineseName/formerIdentities）= 90 个候选
-    expect(or).toHaveLength(90);
-    expect(or).toContainEqual({ fullName: { contains: '团员30', mode: 'insensitive' } });
+    const [clause] = where.AND as Array<{
+      OR: Array<{ passengers: { some: { OR: unknown[] } } }>;
+    }>;
+    // 30 个词 → 30 个乘客子查询（词间 OR），每个子查询 3 个字段（fullName/chineseName/formerIdentities）
+    expect(clause.OR).toHaveLength(30);
+    for (const perTerm of clause.OR) expect(perTerm.passengers.some.OR).toHaveLength(3);
+    expect(clause.OR[29].passengers.some.OR).toContainEqual({
+      fullName: { contains: '团员30', mode: 'insensitive' },
+    });
+  });
+
+  it('passengerName 多词：每个词自成一个乘客子查询、词间 OR（与「一个子查询里 OR 全部词」命中同一批单）', () => {
+    // 逐词拆开是为了让三字以上的名字各自走姓名三元组索引，不被混进来的两字名拖成整表扫；
+    // 语义不变：「有乘客命中任一词」⇔「任一词有乘客命中」。
+    const where = buildOrderFilterWhere({ passengerName: '胡建平 李康，靳李近、谢八一' });
+    const [clause] = where.AND as Array<{
+      OR: Array<{ passengers: { some: { OR: Array<Record<string, { contains: string }>> } } }>;
+    }>;
+    const termsPerSubquery = clause.OR.map((c) => [
+      ...new Set(c.passengers.some.OR.map((branch) => Object.values(branch)[0].contains)),
+    ]);
+    expect(termsPerSubquery).toEqual([['胡建平'], ['李康'], ['靳李近'], ['谢八一']]);
+    // 不再在顶层挂 passengers（与其它 items / 渠道维度一样进 AND，互不覆盖）
+    expect(where.passengers).toBeUndefined();
   });
 
   it('recordedBy → 下单账号显示名/邮箱任一命中；普通人名不牵连游客单', () => {

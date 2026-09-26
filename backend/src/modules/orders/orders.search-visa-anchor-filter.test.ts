@@ -63,11 +63,15 @@ describe('buildSearchTermClause · 搜索吃产品名（订单项 description）
 
   it('「乘客姓名」贴名单筛选同样吃 formerIdentities（贴老名单能认出已换人的那几位）', () => {
     const where = buildOrderFilterWhere({ passengerName: '王小明 李四' });
-    const or = (where.passengers as { some: { OR: Array<Record<string, unknown>> } }).some.OR;
-    expect(or).toContainEqual({ formerIdentities: { contains: '王小明', mode: 'insensitive' } });
-    expect(or).toContainEqual({ formerIdentities: { contains: '李四', mode: 'insensitive' } });
+    // 每个词一个乘客子查询（词间 OR），见 buildOrderFilterWhere 的 passengerName 分支。
+    const [clause] = andClauses(where as Record<string, unknown>) as Array<{
+      OR: Array<{ passengers: { some: { OR: Array<Record<string, unknown>> } } }>;
+    }>;
+    const perTerm = clause.OR.map((c) => c.passengers.some.OR);
+    expect(perTerm[0]).toContainEqual({ formerIdentities: { contains: '王小明', mode: 'insensitive' } });
+    expect(perTerm[1]).toContainEqual({ formerIdentities: { contains: '李四', mode: 'insensitive' } });
     // 每个词三支（拼音名 / 中文名 / 旧身份）。
-    expect(or).toHaveLength(6);
+    expect(perTerm.map((or) => or.length)).toEqual([3, 3]);
   });
 
   it('多词搜索：每个词各自成一个 OR 块、词间 AND（产品名与乘客名可分别命中同一单）', () => {
