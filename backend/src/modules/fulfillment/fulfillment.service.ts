@@ -547,28 +547,37 @@ export class FulfillmentService {
     // 最早 VISA 行的预计出行日期（@db.Date，不折时区）
     const visaAnchorDay = Prisma.sql`to_char(v."visaIntendedDate", 'YYYY-MM-DD')`;
 
+    // 「每单最早一段 / 最早一行」先按订单 GROUP BY 一次算好再连回来，而不是每一行机票各跑一次
+    // 相关子查询取 MIN：后者近万行机票就是近万次子查询（本地 77ms；估算成本 17.6 万，已越过
+    // 线上 jit_above_cost=10 万的门槛，每次还要白搭 JIT 编译）。两种写法命中同一批订单：
+    // 都是「该行出发时刻 = 本单机票最早出发时刻」，并列最早的几行任一行落在区间内即命中。
+    // kind 用枚举直接比较（不转 text），机票行才能走 (kind, flightScheduleId) 索引。
     const rows = await prisma.$queryRaw<Array<{ orderId: string }>>(Prisma.sql`
       SELECT DISTINCT oi."orderId" AS "orderId"
       FROM "OrderItem" oi
       JOIN "FlightSchedule" fs ON fs."id" = oi."flightScheduleId"
-      WHERE oi."kind"::text = 'FLIGHT'
-        AND fs."departureTime" = (
-          SELECT MIN(fs2."departureTime")
-          FROM "OrderItem" oi2
-          JOIN "FlightSchedule" fs2 ON fs2."id" = oi2."flightScheduleId"
-          WHERE oi2."orderId" = oi."orderId" AND oi2."kind"::text = 'FLIGHT'
-        )
+      JOIN (
+        SELECT oi2."orderId", MIN(fs2."departureTime") AS "firstDeparture"
+        FROM "OrderItem" oi2
+        JOIN "FlightSchedule" fs2 ON fs2."id" = oi2."flightScheduleId"
+        WHERE oi2."kind" = 'FLIGHT'::"OrderItemKind"
+        GROUP BY oi2."orderId"
+      ) first_leg ON first_leg."orderId" = oi."orderId"
+        AND fs."departureTime" = first_leg."firstDeparture"
+      WHERE oi."kind" = 'FLIGHT'::"OrderItemKind"
         AND ${dayBounds(flightLocalDay)}
       UNION
       SELECT DISTINCT v."orderId" AS "orderId"
       FROM "OrderItem" v
-      WHERE v."kind"::text = 'VISA'
+      JOIN (
+        SELECT v2."orderId", MIN(v2."visaIntendedDate") AS "firstVisaDate"
+        FROM "OrderItem" v2
+        WHERE v2."kind" = 'VISA'::"OrderItemKind"
+        GROUP BY v2."orderId"
+      ) first_visa ON first_visa."orderId" = v."orderId"
+        AND v."visaIntendedDate" = first_visa."firstVisaDate"
+      WHERE v."kind" = 'VISA'::"OrderItemKind"
         AND v."visaIntendedDate" IS NOT NULL
-        AND v."visaIntendedDate" = (
-          SELECT MIN(v2."visaIntendedDate")
-          FROM "OrderItem" v2
-          WHERE v2."orderId" = v."orderId" AND v2."kind"::text = 'VISA'
-        )
         AND NOT EXISTS (
           SELECT 1 FROM "OrderItem" f
           WHERE f."orderId" = v."orderId"
