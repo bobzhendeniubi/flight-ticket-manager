@@ -76,8 +76,12 @@ const REASON_LOW_CONFIDENCE = '识别置信度不足，请人工核对';
 
 const CONFIDENCE_THRESHOLD = 98;
 
-/** 需要人工核对的非 MRZ 字段（按置信度判定）。 */
-const NON_MRZ_FIELDS = [
+/**
+ * 需要人工核对的非 MRZ 字段（按置信度判定）。
+ * 提示词的 fieldConfidence 只要这几个键（ocr.prompt.ts 由此生成）：MRZ 字段靠校验位验证、
+ * 从不看置信度，让模型给它们打分只是白白多吐 token。
+ */
+export const NON_MRZ_FIELDS = [
   'chineseName',
   'passportIssueDate',
   'passportIssuePlace',

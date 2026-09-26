@@ -1,3 +1,5 @@
+import { NON_MRZ_FIELDS } from './ocr.postprocess.js';
+
 /**
  * 护照 OCR 提示词（Qwen-VL，OpenAI 兼容 chat/completions：一条 user 消息 = 本提示词 + 护照图）。
  *
@@ -10,6 +12,13 @@
  *  2. **签发地点 ≠ 签发机关**。旧版把二者写成「签发地点/签发机关文本」，约 930 位被填成了机关名。
  *     签发地点会进 PNR 导出、全岗总表、送签 / 票务模板，必须是护照「签发地点」栏的原文。
  *  后处理（ocr.postprocess.ts）另有确定性兜底，不单靠提示词。
+ *
+ * 耗时几乎全花在模型逐 token 吐字上，所以输出越短越快：
+ *  - fieldConfidence 只要后处理真正用到的非 MRZ 字段（NON_MRZ_FIELDS）。旧版要全部字段，模型实际
+ *    吐 15~16 个键（连 MRZ 两行、甚至 fieldConfidence 自己都打分）；收窄后合成图基准
+ *    completion ≈377 → ≈265 token，平均耗时 7.7s → 5.7s。
+ *  - 不要改成「紧凑单行 JSON」：实测还能再省 ~65 token，但模型给的置信度整体下调
+ *    （中文姓名恒为 95，低于阈值 98），几乎每次都多一条标黄提示，得不偿失。
  */
 export const PASSPORT_OCR_PROMPT = [
   '你是护照 OCR 引擎。严格输出 JSON，不要任何注释或 markdown 代码块。',
@@ -26,7 +35,8 @@ export const PASSPORT_OCR_PROMPT = [
   'placeOfBirth 是「出生地点/Place of birth」这一栏印的文字，中国护照同样只输出斜杠前的中文。',
   '另外输出 mrzLine1、mrzLine2：护照底部机读区(MRZ)两行原文，逐字符抄录（含填充符 <，每行 44 字符），',
   '无法读到机读区则填 null。',
-  '再输出 fieldConfidence：一个对象，键为上述各字段名，值为 0-100 的整数识别置信度（越高越确信）。',
+  `再输出 fieldConfidence：一个对象，只含 ${NON_MRZ_FIELDS.join('、')} 这 ${NON_MRZ_FIELDS.length} 个键，`,
+  '值为 0-100 的整数识别置信度（越高越确信）；其它字段（含 MRZ 两行）不要给置信度。',
   '性别识别：优先读 MRZ 第二行第 21 位（M/F）；MRZ 缺失或模糊时读目视区「性别/Sex」栏（男/M→M，女/F→F）。',
   '找不到的字段填 null。优先用 MRZ 机读区提取机读字段，中文姓名/签发日期/签发地点/出生地用目视区。',
 ].join('');

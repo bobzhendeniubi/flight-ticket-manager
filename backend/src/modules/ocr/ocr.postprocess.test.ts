@@ -128,6 +128,74 @@ describe('applyOcrPostProcessing — 非 MRZ 字段置信度', () => {
       result.verify.reviewFields.some((r) => r.field === 'placeOfBirth'),
     ).toBe(true);
   });
+
+  it('fieldConfidence 只给了部分非 MRZ 键时，缺键且有值的字段仍进 review', () => {
+    const result = applyOcrPostProcessing({
+      chineseName: '测试样本',
+      passportIssueDate: '2020-01-02',
+      passportIssuePlace: '广东',
+      mrzLine1: MRZ_LINE1,
+      mrzLine2: MRZ_LINE2,
+      fieldConfidence: { chineseName: 100, passportIssueDate: 100, placeOfBirth: 100 },
+    });
+    const nonMrzReviews = result.verify.reviewFields.filter((r) =>
+      ['chineseName', 'passportIssueDate', 'passportIssuePlace', 'placeOfBirth'].includes(r.field),
+    );
+    expect(nonMrzReviews).toEqual([
+      { field: 'passportIssuePlace', reason: '识别置信度不足，请人工核对' },
+    ]);
+  });
+});
+
+describe('applyOcrPostProcessing — fieldConfidence 只含非 MRZ 键（新提示词的输出形状）', () => {
+  const CONF_4_KEYS = {
+    chineseName: 100,
+    passportIssueDate: 100,
+    passportIssuePlace: 100,
+    placeOfBirth: 100,
+  };
+  const NON_MRZ_VALUES = {
+    chineseName: '测试样本',
+    passportIssueDate: '2020-01-02',
+    passportIssuePlace: '广东',
+    placeOfBirth: '广东',
+  };
+
+  it('MRZ 校验通过且与目视区一致 → 无任何 review（机读字段不需要置信度）', () => {
+    const result = applyOcrPostProcessing({
+      lastName: 'ERIKSSON',
+      firstName: 'ANNA MARIA',
+      dateOfBirth: '1974-08-12',
+      gender: 'F',
+      documentNumber: 'L898902C3',
+      nationality: 'UTO',
+      passportExpiry: '2012-04-15',
+      ...NON_MRZ_VALUES,
+      mrzLine1: MRZ_LINE1,
+      mrzLine2: MRZ_LINE2,
+      fieldConfidence: CONF_4_KEYS,
+    });
+    expect(result.verify.mrzValid).toBe(true);
+    expect(result.verify.reviewFields).toEqual([]);
+  });
+
+  it('MRZ 缺失 → 仍是 5 个机读字段逐项核对，与置信度无关', () => {
+    const result = applyOcrPostProcessing({
+      documentNumber: 'E12345678',
+      dateOfBirth: '1990-01-01',
+      gender: 'M',
+      nationality: 'CHN',
+      passportExpiry: '2030-01-01',
+      ...NON_MRZ_VALUES,
+      fieldConfidence: CONF_4_KEYS,
+    });
+    expect(result.verify.mrzValid).toBe(false);
+    expect(result.verify.reviewFields).toEqual(
+      ['documentNumber', 'dateOfBirth', 'passportExpiry', 'gender', 'nationality'].map(
+        (field) => ({ field, reason: '机读区未能校验，请逐项人工核对' }),
+      ),
+    );
+  });
 });
 
 describe('applyOcrPostProcessing — 向后兼容 suggested 形状', () => {

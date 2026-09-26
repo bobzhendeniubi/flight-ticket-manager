@@ -1,4 +1,5 @@
 import { describe, it, expect } from 'vitest';
+import { NON_MRZ_FIELDS } from './ocr.postprocess.js';
 import { PASSPORT_OCR_PROMPT } from './ocr.prompt.js';
 
 // 省级行政区简称：提示词里出现任何一个都可能被模型当示例照抄（旧版示例地名被照抄过上千次）。
@@ -36,5 +37,25 @@ describe('护照 OCR 提示词 — 签发地点口径', () => {
 
   it('不再把签发地点与签发机关写成同一个字段', () => {
     expect(PASSPORT_OCR_PROMPT).not.toContain('签发地点/签发机关');
+  });
+});
+
+describe('护照 OCR 提示词 — fieldConfidence 只要后处理用到的非 MRZ 字段', () => {
+  const confidenceSentence = PASSPORT_OCR_PROMPT.match(/fieldConfidence：[^。]*。/)?.[0] ?? '';
+
+  it('逐个列出后处理要看置信度的字段', () => {
+    expect(confidenceSentence).not.toBe('');
+    for (const field of NON_MRZ_FIELDS) {
+      expect(confidenceSentence).toContain(field);
+    }
+  });
+
+  it('不要求机读字段与姓名等其它字段的置信度（输出越短越快）', () => {
+    const others = [
+      'lastName', 'firstName', 'fullName', 'documentNumber', 'dateOfBirth', 'gender',
+      'nationality', 'passportIssueCountry', 'passportExpiry', 'mrzLine1', 'mrzLine2',
+    ];
+    const hits = others.filter((f) => confidenceSentence.includes(f));
+    expect(hits).toEqual([]);
   });
 });
