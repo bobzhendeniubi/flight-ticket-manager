@@ -9,6 +9,7 @@
  */
 import { FulfillmentStatus, FulfillmentType } from '@prisma/client';
 import { prisma } from '../db/prisma.js';
+import { PASSENGERS_WITHOUT_PHOTO } from '../db/heavy-columns.js';
 import { renderItineraryPdf } from './itinerary-pdf.js';
 import { localDateTime } from './flight-time.js';
 import { sendMail } from './mailer.js';
@@ -38,7 +39,8 @@ export async function sendItineraryEmail(orderId: string): Promise<ItineraryResu
           fulfillmentTasks: true,
         },
       },
-      passengers: true,
+      // 行程单只印姓名 / 证件号 / PNR / 票号，不读护照照片（见 db/heavy-columns.ts）
+      passengers: PASSENGERS_WITHOUT_PHOTO,
     },
   });
   if (!order) return { status: 'no_email' }; // 订单不存在当作没邮箱处理（不该发生）

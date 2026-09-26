@@ -41,6 +41,7 @@ import {
 } from '@prisma/client';
 import { randomUUID } from 'node:crypto';
 import { prisma } from '../../db/prisma.js';
+import { PASSENGERS_WITHOUT_PHOTO } from '../../db/heavy-columns.js';
 import { generateOrderNumber } from './order-number.js';
 import {
   AppError,
@@ -9798,7 +9799,8 @@ export class OrderService {
       where: { id: orderId },
       include: {
         items: { include: { flightSchedule: { include: { flight: true } } } },
-        passengers: true,
+        // 行程单只印姓名 / 证件号 / PNR / 票号，不读护照照片（见 db/heavy-columns.ts）
+        passengers: PASSENGERS_WITHOUT_PHOTO,
       },
     });
     if (!order) throw new NotFoundError('订单不存在');

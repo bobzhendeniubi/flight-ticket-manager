@@ -90,9 +90,12 @@ import { buildRoomAllocationWorkbook } from '../modules/orders/orders.export-roo
 import { buildOrdersBySchedule } from '../modules/orders/orders.export.js';
 import { queryOrdersByIdsForVisa } from '../modules/orders/orders.export-visa-bundle.js';
 import { exportMasterQuerySchema, exportTemplatesQuerySchema } from '../modules/orders/orders.schemas.js';
+import { OrderService } from '../modules/orders/orders.service.js';
 import { buildFinanceExportWorkbook } from '../modules/finances/finances.export.js';
 import { ReceiptsService } from '../modules/receipts/receipts.service.js';
 import { loadOrderOverpayTrails } from '../modules/payments/overpay-trail.js';
+import { sendItineraryEmail } from '../lib/itinerary-email.js';
+import { TravelersService } from '../modules/travelers/travelers.service.js';
 import { collectHotelPassportGroups } from '../modules/hotel-control/hotel-control.passports.js';
 import { FulfillmentService } from '../modules/fulfillment/fulfillment.service.js';
 
@@ -276,6 +279,30 @@ describe('对账不读凭证图', () => {
   it('订单详情挂账去向：查池子进账不读凭证图', async () => {
     await loadOrderOverpayTrails('o1', []);
     expect(argsOf('receipt', 'findMany')[0]).toMatchObject({ omit: RECEIPT_PROOF_OMIT });
+    expect(heavyReadsSoFar()).toEqual([]);
+  });
+});
+
+describe('行程单 / 常旅客历史不读护照照片', () => {
+  it('行程单邮件与行程单下载：乘客不读护照照片', async () => {
+    await expect(sendItineraryEmail('o1')).resolves.toEqual({ status: 'no_email' });
+    await expect(
+      new OrderService().getOrderItineraryData('o1', { userId: 'u1', role: 'ADMIN' }),
+    ).rejects.toThrow('订单不存在');
+    const queries = argsOf('order', 'findUnique');
+    expect(queries).toHaveLength(2);
+    for (const q of queries) expect(q.include).toMatchObject({ passengers: PASSENGERS_WITHOUT_PHOTO });
+    expect(heavyReadsSoFar()).toEqual([]);
+  });
+
+  it('常旅客历史行程：按姓名 + 生日捞的每一趟乘客行都不读护照照片', async () => {
+    recorder.respondWith((call) =>
+      call.model === 'savedPassenger' && call.method === 'findUnique'
+        ? { id: 'sp1', userId: null, user: null, fullName: 'ZHANG SAN', dateOfBirth: new Date('1990-01-01') }
+        : undefined,
+    );
+    await new TravelersService().getById('sp1');
+    expect(argsOf('passenger', 'findMany')[0]).toMatchObject({ omit: PASSENGER_PHOTO_OMIT });
     expect(heavyReadsSoFar()).toEqual([]);
   });
 });

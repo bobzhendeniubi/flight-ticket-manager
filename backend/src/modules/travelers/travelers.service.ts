@@ -5,6 +5,7 @@
  */
 import { Prisma } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
+import { PASSENGER_PHOTO_OMIT } from '../../db/heavy-columns.js';
 import { NotFoundError } from '../../lib/errors.js';
 import type { CreateTravelerBody, ListTravelersQuery, UpdateTravelerBody } from './travelers.schemas.js';
 
@@ -81,13 +82,14 @@ export class TravelersService {
     });
     if (!r) throw new NotFoundError('旅客不存在');
 
-    // 匹配 Passenger 表找历史订单
+    // 匹配 Passenger 表找历史订单（常旅客每趟一行；只出单号 / PNR / 票号，不读护照照片）
     const passengers = await prisma.passenger.findMany({
       where: {
         fullName: r.fullName,
         dateOfBirth: r.dateOfBirth,
         ...(agentTreeIds ? { order: { agentId: { in: agentTreeIds } } } : {}),
       },
+      omit: PASSENGER_PHOTO_OMIT,
       include: { order: { select: { id: true, orderNumber: true, status: true, total: true, createdAt: true } } },
       orderBy: { createdAt: 'desc' },
     });
