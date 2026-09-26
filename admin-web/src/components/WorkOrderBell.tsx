@@ -28,6 +28,8 @@ import { useDocumentVisible } from '../hooks/useDocumentVisible';
 import { Icon } from './Icon';
 
 const POLL_INTERVAL_MS = 60_000;
+/** 标签页在后台、且没授权桌面通知时的轮询间隔（只剩标题前缀提醒，不必每分钟打）。 */
+const HIDDEN_POLL_INTERVAL_MS = 5 * 60_000;
 /** 下拉里「最近」的窗口：只是列表范围，未结数量由服务端的 open 给 */
 const RECENT_WINDOW_DAYS = 7;
 /** 键按用户分：`<前缀>.<userId>`，没拿到 userId 时退回 `anon`（登录前不会渲染本组件，兜底而已） */
@@ -114,14 +116,15 @@ export function WorkOrderBell() {
     }
   }, [token]);
 
-  // 标签页切到后台就别再打了：3.5 天日志里这一个端点占了全部请求的 29%，半夜也照打。
-  // visible 从 false 翻回 true 时这条 effect 会重新跑一遍——挂载时的 void load() 顺带
-  // 做到「切回可见立即刷新一次」，不需要另外记"刚刚是不是隐藏的"。
+  // 后台标签页不能停：标题前缀 (N) 和桌面通知本来就是给「人不在这个标签页」时用的（撤名单 / 退票有时效）。
+  // 授权了桌面通知 → 后台照旧按 60 秒；没授权 → 后台放慢到 5 分钟，只剩标题前缀提醒（3.5 天日志里这个
+  // 端点占全部请求 29%，半夜也照打）。visible 翻转时 effect 重跑：切回可见立即刷新一次，再回到 60 秒。
   const visible = useDocumentVisible();
   useEffect(() => {
-    if (!visible) return;
-    void load();
-    const id = window.setInterval(() => void load(), POLL_INTERVAL_MS);
+    const alertsInBackground = notificationsSupported() && Notification.permission === 'granted';
+    const interval = visible || alertsInBackground ? POLL_INTERVAL_MS : HIDDEN_POLL_INTERVAL_MS;
+    if (visible) void load();
+    const id = window.setInterval(() => void load(), interval);
     return () => window.clearInterval(id);
   }, [load, visible]);
 

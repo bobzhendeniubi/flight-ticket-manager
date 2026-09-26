@@ -703,6 +703,11 @@ function CreateHoldModal({
     [firstLeg?.scheduleId, firstLeg?.cabin, firstLeg?.price, seats, mode],
   );
   const debouncedPreviewDraft = useDebouncedValue(previewDraft, 400);
+  // 当前这份收款计划是按哪一版输入算出来的。只有它就是当前输入时才允许提交：防抖的 400ms 里、
+  // 请求途中，表格里还是上一版计划——此时提交会把旧计划（含手改过的截止日）当 installmentsOverride 带上去。
+  const [planDraft, setPlanDraft] = useState<typeof previewDraft | null>(null);
+  const planIsCurrent = planDraft !== null && planDraft === previewDraft;
+  const previewPending = previewDraft !== debouncedPreviewDraft;
   useEffect(() => {
     const { scheduleId, cabin, price, seats: draftSeats, mode: draftMode } = debouncedPreviewDraft;
     if (
@@ -717,6 +722,7 @@ function CreateHoldModal({
     ) {
       // 回到不完整中间态：清掉旧计划行，也别让上一轮的失败提示继续挂着。
       setPlanRows([]);
+      setPlanDraft(null);
       setFormError(null);
       return;
     }
@@ -725,8 +731,8 @@ function CreateHoldModal({
     setFormError(null);
     api.previewHoldPlan(tokens.accessToken, { flightScheduleId: scheduleId, cabin, seats: draftSeats, perSeatPriceCny: price, mode: draftMode })
       // 防抖后才真正发出的这个请求失败，才是用户该看到的错误——不会再被打字中间态刷屏。
-      .then((result) => { if (!cancelled) { setPlanRows(result.plan.installments); setDueDates({}); } })
-      .catch((err) => { if (!cancelled) { setPlanRows([]); setFormError(err instanceof Error ? err.message : '收款计划预览失败'); } })
+      .then((result) => { if (!cancelled) { setPlanRows(result.plan.installments); setDueDates({}); setPlanDraft(debouncedPreviewDraft); } })
+      .catch((err) => { if (!cancelled) { setPlanRows([]); setPlanDraft(null); setFormError(err instanceof Error ? err.message : '收款计划预览失败'); } })
       .finally(() => { if (!cancelled) setPlanLoading(false); });
     return () => { cancelled = true; };
   }, [tokens, debouncedPreviewDraft]);
@@ -747,6 +753,7 @@ function CreateHoldModal({
     seats >= 1 &&
     overbookedLegs.length === 0 &&
     !planLoading &&
+    planIsCurrent &&
     planRows.length > 0 &&
     (ownerType === 'AGENT' ? !!agentId : !!groupName.trim()) &&
     (ratio === '' || (ratio >= 0 && ratio <= 50)) &&
@@ -868,7 +875,7 @@ function CreateHoldModal({
 
           <div>
             <p className="label">收款计划预览（服务端计算{singleLeg ? '，截止日可手调' : '，多航段各段按同一套期次结构各算各的金额'}）</p>
-            {planLoading ? <p className="rounded bg-slate-50 px-3 py-2 text-sm text-ink-muted">计算收款计划…</p> : (
+            {planLoading || (previewPending && planRows.length > 0) ? <p className="rounded bg-slate-50 px-3 py-2 text-sm text-ink-muted">计算收款计划…</p> : (
               <div className="overflow-x-auto rounded border border-slate-200">
                 <table className="w-full text-xs">
                   <thead><tr className="bg-slate-50"><th className="px-2 py-1 text-left">期</th><th className="px-2 py-1 text-right">应收{singleLeg ? '' : '（第 1 段）'}</th><th className="px-2 py-1 text-left">截止</th></tr></thead>

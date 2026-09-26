@@ -1,5 +1,6 @@
-import { lazy, Suspense, type ComponentType, type ReactElement } from 'react';
+import { lazy, Suspense, useState, type ComponentType, type ReactElement } from 'react';
 import { claimChunkReload, isChunkLoadError, releaseChunkReload } from '../lib/chunkLoadRecovery';
+import { reportClientError } from '../lib/clientErrorReporter';
 
 /**
  * 路由页面懒加载：每个页面拆成独立的代码文件，第一次点进去才下载；首屏只下外壳 + 当前页面。
@@ -66,6 +67,9 @@ function recoverFromChunkError(error: unknown): Promise<PageModule> {
       window.setTimeout(() => resolve({ default: ChunkUpdateNotice }), RELOAD_GRACE_MS);
     });
   }
+  // 自动刷新一次仍拿不到页面代码：多半是某次发版丢了资产文件（或网络不通），报上来才看得见。
+  // 这类失败在这里就被接住，不会冒泡到全局 onerror；去重与会话上限由上报模块控制。
+  reportClientError(error);
   return Promise.resolve({ default: ChunkUpdateNotice });
 }
 
@@ -102,8 +106,10 @@ export function lazyPage(loader: () => Promise<ComponentType>): LazyPageComponen
   );
 
   function LazyPage(): ReactElement {
-    // 已下载过（预取命中 / 再次进入）就直接渲染，不经 Suspense，免得闪一下「加载中」
-    const Page = loaded;
+    // 已下载过（预取命中 / 再次进入）就直接渲染，不经 Suspense，免得闪一下「加载中」。
+    // 在这次挂载里固定下来：否则页面加载完后若因上层重渲染再跑一遍，会从 <LazyComponent/> 换成
+    // <Page/>——元素类型变了，整页重挂载、丢掉页面里的状态（正在填的表单等）。
+    const [Page] = useState<ComponentType | null>(() => loaded);
     return <Suspense fallback={<PageLoading />}>{Page ? <Page /> : <LazyComponent />}</Suspense>;
   }
 

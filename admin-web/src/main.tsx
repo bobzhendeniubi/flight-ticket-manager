@@ -1,4 +1,4 @@
-// 必须是第一个 import：先挂好前端报错上报，再求值业务模块
+// 必须是第一个 import：入口里最先挂好前端报错上报（覆盖范围见 clientErrorBootstrap.ts 头注释）
 import './lib/clientErrorBootstrap';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
