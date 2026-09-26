@@ -1,4 +1,5 @@
 import { Component, type ErrorInfo, type ReactNode } from 'react';
+import { reportClientError } from '../lib/clientErrorReporter';
 
 /**
  * 路由级错误边界 —— 任何页面渲染抛错时，显示可读的兜底卡片而不是整屏白屏。
@@ -28,8 +29,9 @@ export class ErrorBoundary extends Component<Props, State> {
   }
 
   componentDidCatch(error: Error, info: ErrorInfo) {
-    // 开发期留痕；生产可接入日志服务。
+    // 开发期留痕；同时上报后端（生产环境 React 不会把边界兜住的错误再抛给 window.onerror）。
     console.error('[ErrorBoundary]', error, info.componentStack);
+    reportClientError(error, { componentStack: info.componentStack });
   }
 
   render() {

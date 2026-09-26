@@ -1,3 +1,5 @@
+// 必须是第一个 import：先挂好前端报错上报，再求值业务模块
+import './lib/clientErrorBootstrap';
 import { StrictMode } from 'react';
 import { createRoot } from 'react-dom/client';
 import { BrowserRouter } from 'react-router-dom';

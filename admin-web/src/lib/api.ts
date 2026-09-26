@@ -5,7 +5,7 @@
  *   - 开发：默认 /api（vite-dev 代理到 http://localhost:4000）
  *   - 生产：VITE_API_BASE=https://api.citur.com（或 /api 走前端 nginx 反代）
  */
-const API_BASE: string = (import.meta.env?.VITE_API_BASE as string | undefined)?.trim() || '/api';
+export const API_BASE: string = (import.meta.env?.VITE_API_BASE as string | undefined)?.trim() || '/api';
 
 export interface ApiErrorBody {
   error: { code: string; message: string; details?: unknown };
