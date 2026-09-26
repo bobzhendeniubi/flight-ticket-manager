@@ -1973,6 +1973,8 @@ model OrderItem {
   // no-show 名单匹配、no-show 报表、回程起飞后自动作废扫描、房控超售告警、提醒规则 11
   // 全部按 (kind, flightScheduleId) 起手。没有它这几条路径一律全表扫 OrderItem。
   @@index([kind, flightScheduleId])
+  // 订单搜索框按产品名（行描述）模糊搜：ILIKE '%词%' 走 GIN 三元组索引（pg_trgm 扩展在迁移里建）。
+  @@index([description(ops: raw("gin_trgm_ops"))], type: Gin, map: "OrderItem_description_trgm_idx")
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -2142,6 +2144,12 @@ model Passenger {
   sharedRoomMemberships SharedRoomMember[]
 
   @@index([orderId])
+  // 订单列表「乘客姓名」贴名单 / 订单搜索框 / 签证台客人搜索都是 ILIKE '%词%'：
+  // 走 GIN 三元组索引（pg_trgm 扩展在迁移 20260925120000_trgm_search_indexes 里建）。
+  @@index([fullName(ops: raw("gin_trgm_ops"))], type: Gin, map: "Passenger_fullName_trgm_idx")
+  @@index([chineseName(ops: raw("gin_trgm_ops"))], type: Gin, map: "Passenger_chineseName_trgm_idx")
+  @@index([formerIdentities(ops: raw("gin_trgm_ops"))], type: Gin, map: "Passenger_formerIdentities_trgm_idx")
+  @@index([documentNumber(ops: raw("gin_trgm_ops"))], type: Gin, map: "Passenger_documentNumber_trgm_idx")
 }
 
 model OrderStatusEvent {
