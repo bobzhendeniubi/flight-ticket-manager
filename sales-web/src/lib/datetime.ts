@@ -87,21 +87,24 @@ export function formatDateCn(value: DateLike, fallback = EMPTY): string {
 
 /**
  * 系统时间戳 → 北京时间「YYYY-MM-DD」。
- * 定长、可直接字典序比较/排序，用于分组和 key，也用于「很久以前」的兜底展示。
+ * 定长、可直接字典序比较/排序，用于分组和 key；也是 businessToday() 的底层实现，
+ * 全站"出发日/入住日默认值"最终都靠它拼进 API query（/flights/search?date=…、
+ * /products/bundles/:id/sellable-dates?from=…&to=… 等）。
+ *
+ * 刻意不用 `Intl.DateTimeFormat('en-CA', {...}).format(d)` 取字符串：这个"用
+ * en-CA 骗出 YYYY-MM-DD"的常见写法依赖该 locale 的 ICU 数据，个别精简 ICU 的浏览器
+ * / 内嵌 WebView 遇到未加载的 locale 不会抛异常——而是**静默**退回设备自身 locale
+ * 格式化，try/catch 完全兜不住。英文 locale 设备上就会吐出「09/24/2026」而不是
+ * 「2026-09-24」，直接拼进上面那些 query 会 400（0924 实测踩过）。
+ * 改成与 BUSINESS_TZ 固定 +8、无夏令时这一事实配套的纯数值运算：只用
+ * getUTC 系列取值 + padStart 补零，不经任何 Intl 字符串格式化，不存在这一类 locale 漂移。
  */
 export function businessYmd(value: DateLike, fallback = ''): string {
   const d = toDate(value);
   if (!d) return fallback;
-  try {
-    return new Intl.DateTimeFormat('en-CA', {
-      timeZone: BUSINESS_TZ,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).format(d);
-  } catch {
-    return toBusinessWallClock(d).toISOString().slice(0, 10);
-  }
+  const t = toBusinessWallClock(d);
+  const pad = (n: number) => String(n).padStart(2, '0');
+  return `${t.getUTCFullYear()}-${pad(t.getUTCMonth() + 1)}-${pad(t.getUTCDate())}`;
 }
 
 /**
