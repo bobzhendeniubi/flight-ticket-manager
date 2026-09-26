@@ -32,6 +32,22 @@ services:
     image: postgres:16-alpine
     container_name: ftm-postgres-${STACK:-prod}
     restart: unless-stopped
+    # 慢查询可观测。改这段只对**重建后的** postgres 容器生效（几秒中断）；deploy.sh 带 --no-deps
+    # 不会顺带重建它，要按 docs/运维-监控与备份.md「pg_stat_statements」单独做。
+    #   shared_preload_libraries    预加载后 pg_stat_statements 视图才有数（扩展本身由 Prisma 迁移建）
+    #   pg_stat_statements.track    top = 只统计客户端直接发来的语句，函数内部语句不重复计
+    #   log_min_duration_statement  超过 1000ms 的语句写进 postgres 日志（下方 json-file 3×50m 轮转封顶）
+    #   log_parameter_max_length    0 = 慢日志不带参数值：护照照片 base64 / 证件号既不进日志，也撑不爆日志
+    command:
+      - postgres
+      - -c
+      - shared_preload_libraries=pg_stat_statements
+      - -c
+      - pg_stat_statements.track=top
+      - -c
+      - log_min_duration_statement=1000
+      - -c
+      - log_parameter_max_length=0
     environment:
       POSTGRES_USER: ftm
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?must set POSTGRES_PASSWORD}
