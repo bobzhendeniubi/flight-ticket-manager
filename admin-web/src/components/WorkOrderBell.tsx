@@ -24,6 +24,7 @@ import { useNavigate } from 'react-router-dom';
 import { api, type WorkOrderKind, type WorkOrderSummary } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { formatDateTimeCn } from '../lib/datetime';
+import { useDocumentVisible } from '../hooks/useDocumentVisible';
 import { Icon } from './Icon';
 
 const POLL_INTERVAL_MS = 60_000;
@@ -113,11 +114,16 @@ export function WorkOrderBell() {
     }
   }, [token]);
 
+  // 标签页切到后台就别再打了：3.5 天日志里这一个端点占了全部请求的 29%，半夜也照打。
+  // visible 从 false 翻回 true 时这条 effect 会重新跑一遍——挂载时的 void load() 顺带
+  // 做到「切回可见立即刷新一次」，不需要另外记"刚刚是不是隐藏的"。
+  const visible = useDocumentVisible();
   useEffect(() => {
+    if (!visible) return;
     void load();
     const id = window.setInterval(() => void load(), POLL_INTERVAL_MS);
     return () => window.clearInterval(id);
-  }, [load]);
+  }, [load, visible]);
 
   const latestAt = summary?.latestAt ?? null;
   const openCount = summary?.open ?? 0;

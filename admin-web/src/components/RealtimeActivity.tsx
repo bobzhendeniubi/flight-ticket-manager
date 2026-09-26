@@ -11,6 +11,7 @@ import { api, ApiError, type OrderSummary } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { orderStatusBadgeClass, orderStatusLabel } from '../lib/orderStatus';
 import { formatDateTimeSecCn } from '../lib/datetime';
+import { useDocumentVisible } from '../hooks/useDocumentVisible';
 import { Icon } from './Icon';
 
 const POLL_INTERVAL_MS = 15000;
@@ -43,13 +44,16 @@ export function RealtimeActivity() {
     }
   }, [tokens]);
 
-  useEffect(() => { load(); }, [load]);
-
+  // 标签页切到后台就别再打了（半夜也在照打，见 hooks/useDocumentVisible 的注释）；
+  // visible 从 false 翻回 true 时这条 effect 重新跑一遍，挂载/恢复时的 load() 顺带做到
+  // 「切回可见立即刷新一次」，手动暂停（paused）恢复时同样立即刷新一次，逻辑统一。
+  const visible = useDocumentVisible();
   useEffect(() => {
-    if (paused) return;
+    if (paused || !visible) return;
+    void load();
     const interval = setInterval(load, POLL_INTERVAL_MS);
     return () => clearInterval(interval);
-  }, [paused, load]);
+  }, [paused, visible, load]);
 
   // 每 5 秒强制重渲染让"X 分钟前"动起来
   useEffect(() => {
