@@ -4,6 +4,11 @@
 
 generator client {
   provider = "prisma-client-js"
+  // omitApi：查询级 `omit`（5.13 起预览、6.2 起 GA，语义不变）。批量读路径用它排除图片大字段
+  //（Passenger.passportPhotoUrl / Payment.proofUrl / Receipt.proofUrl，见 src/db/heavy-columns.ts），
+  // 只在查询上逐处写，**不用全局 omit**（PrismaClient 构造参数）——拆单 / 换人会把整行展开复制进新行，
+  // 全局 omit 会让照片被静默丢掉。
+  previewFeatures = ["omitApi"]
 }
 
 datasource db {
