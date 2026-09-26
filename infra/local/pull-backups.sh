@@ -51,13 +51,18 @@ echo "[backup-pull] $(date '+%F %T') 拉取 $(basename "$LATEST_REMOTE")（限�
 rsync -a --partial --timeout=300 --bwlimit="$BWLIMIT" -e "$SSH_CMD" \
   "$REMOTE:$LATEST_REMOTE" "$LOCAL_DIR/"
 
-# 完整性校验：解不开的备份 = 没备份
+# 完整性校验：解不开的备份 = 没备份。
+# .dump 光 pg_restore --list 不够（截掉 40% 的文件照样列得出目录），要像服务器端备份脚本一样
+# 再整份读一遍输出到 /dev/null；-f 只生成 SQL、不连数据库，本机角色权限不影响。
+verify_snapshot() {
+  case "$1" in
+    *.sql.gz) gunzip -t "$1" ;;
+    *.dump)   pg_restore --list "$1" >/dev/null && pg_restore -f /dev/null "$1" ;;
+    *)        return 1 ;;
+  esac
+}
 LOCAL_FILE="$LOCAL_DIR/$(basename "$LATEST_REMOTE")"
-case "$LOCAL_FILE" in
-  *.sql.gz) CHECK=(gunzip -t "$LOCAL_FILE") ;;
-  *.dump)   CHECK=(pg_restore --list "$LOCAL_FILE") ;;
-esac
-if ! "${CHECK[@]}" >/dev/null 2>&1; then
+if ! verify_snapshot "$LOCAL_FILE" >/dev/null 2>&1; then
   notify_fail "快照损坏或不完整：$(basename "$LOCAL_FILE")"
   exit 1
 fi
