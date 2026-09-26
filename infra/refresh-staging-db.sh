@@ -68,4 +68,18 @@ for t in '"Order"' '"Flight"' '"FlightSchedule"' '"User"'; do
   printf '  %s %-18s 实测 %-7s 测试 %s\n' "$flag" "$t" "$a" "$b"
 done
 
+# ── 图片 blob（护照照片 / 收款凭证字节）也要跟过去：库里只存 blob:sha256 引用，不拷 blob 测试站就全是裂图 ──
+# 实测卷 → 测试卷，rsync 只增不删（内容寻址，同 sha 同内容，多跑几次也不会坏）；对实测卷只读。
+SRC_VOL=ftm_blob_data
+DST_VOL=ftm-staging_blob_data
+echo "▶ 同步图片 blob（$SRC_VOL → $DST_VOL，只增不删）…"
+if src_mp=$(docker volume inspect -f '{{.Mountpoint}}' "$SRC_VOL" 2>/dev/null) \
+   && dst_mp=$(docker volume inspect -f '{{.Mountpoint}}' "$DST_VOL" 2>/dev/null); then
+  rsync -a --exclude='*.tmp' --exclude='.probe.*' "$src_mp/" "$dst_mp/"
+  echo "  测试卷现有 $(find "$dst_mp" -type f | wc -l) 个 blob（$(du -sh "$dst_mp" | cut -f1)）"
+else
+  echo "⚠ 图片 blob 卷缺失（$SRC_VOL 或 $DST_VOL 不存在），本次未同步：" >&2
+  echo "  测试库里的 blob 引用会读不到图。两套环境都用带 blob_data 卷的 compose 起过一次，再重跑本脚本。" >&2
+fi
+
 echo "✓ 完成。测试环境重启后生效：/opt/ftm-staging/infra/deploy.sh staging"

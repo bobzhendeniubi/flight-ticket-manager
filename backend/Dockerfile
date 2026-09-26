@@ -31,6 +31,11 @@ COPY --from=builder /app/backend/node_modules ./node_modules
 COPY --from=builder /app/backend/prisma ./prisma
 COPY --from=builder /app/backend/package.json ./package.json
 RUN chown -R ftm:ftm /app
+# 图片 blob 存储挂载点（docker-compose.prod.yml 把命名卷 blob_data 挂到这里；护照照片 / 收款凭证的
+# 字节存这、库里只留引用）。目录在镜像里预建并归 ftm：Docker 首次把**空的**命名卷挂上来时会沿用镜像里
+# 挂载点的属主 / 权限，运行用户 ftm（uid 1001）才写得进去；不预建的话卷是 root 的，写入会回退内联进库。
+RUN mkdir -p /data/blobs && chown -R ftm:ftm /data
+ENV BLOB_DIR=/data/blobs
 USER ftm
 EXPOSE 4000
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 CMD curl -fsS http://localhost:4000/readyz || exit 1

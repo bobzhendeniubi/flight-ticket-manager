@@ -133,9 +133,14 @@ services:
       OPENAI_API_KEY: ${OPENAI_API_KEY:-}
       OPENAI_MODEL: ${OPENAI_MODEL:-gpt-5-mini}
       OPENAI_BASE_URL: ${OPENAI_BASE_URL:-}
+      # ── 图片出库：护照照片 / 收款凭证的字节存本地卷，库里只留 blob 引用（见 docs/照片出库-方案与上线步骤.md）──
+      BLOB_DIR: /data/blobs
     volumes:
       # 证书/私钥 只读挂载（不写进镜像）
       - ./secrets:/secrets:ro
+      # 图片 blob 卷：backend 与 worker 共用同一个；命名卷按 compose 项目名隔离
+      # （实测 ftm_blob_data / 测试 ftm-staging_blob_data），备份见 infra/staging/backup-blobs.sh
+      - blob_data:/data/blobs
     # 启动前自动跑 migration
     command: >
       sh -c "npx prisma migrate deploy && node dist/index.js"
@@ -175,6 +180,11 @@ services:
       SANDBOX_WEBHOOK_SECRET: ${SANDBOX_WEBHOOK_SECRET:-sandbox-test-secret}
       # B-5：与 backend 保持一致——mock 履约默认关闭，生产环境不得开启（见上方 backend 服务同名变量的注释）。
       ENABLE_AUTO_FULFILLMENT: ${ENABLE_AUTO_FULFILLMENT:-false}
+      # ── 图片出库：与 backend 同一个 blob 卷；每日兜底清扫最多转多少行漏网的内联图（0 = 关）──
+      BLOB_DIR: /data/blobs
+      IMAGE_BLOB_SWEEP_LIMIT: ${IMAGE_BLOB_SWEEP_LIMIT:-200}
+    volumes:
+      - blob_data:/data/blobs
     command: ["node", "dist/queues/worker.js"]
     # worker 不开 HTTP，必须屏蔽镜像里 backend 的 HEALTHCHECK（curl :4000 永远失败）
     healthcheck:
@@ -223,3 +233,6 @@ services:
 volumes:
   postgres_data:
   redis_data:
+  # 图片 blob（护照照片 / 收款凭证字节，内容寻址、只增不删）。与 postgres_data 一样按项目名隔离；
+  # `down -v` 会连它一起删——备份在 /opt/ftm/backups/blobs（infra/staging/backup-blobs.sh）。
+  blob_data:

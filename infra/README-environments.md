@@ -13,7 +13,7 @@
 | 后台端口 | `127.0.0.1:8080` | `127.0.0.1:8180` |
 | 前台端口 | `127.0.0.1:8081` | `127.0.0.1:8181` |
 | 域名 | `admin/store/api.citurtravel.com` | `test-admin/test-store/test-api.citurtravel.com` |
-| 数据卷 | `ftm_postgres_data` / `ftm_redis_data` | `ftm-staging_postgres_data` / `ftm-staging_redis_data` |
+| 数据卷 | `ftm_postgres_data` / `ftm_redis_data` / `ftm_blob_data` | `ftm-staging_postgres_data` / `ftm-staging_redis_data` / `ftm-staging_blob_data` |
 
 **两套共用同一份 `docker-compose.prod.yml`**，靠 `STACK` + 端口变量 + compose 项目名区分。
 `STACK` 默认 `prod`，所以实测那套的命令和容器名跟拆分之前完全一样。
@@ -78,6 +78,21 @@ bash /opt/ftm/infra/refresh-staging-db.sh
 会拿真实联系方式往外发。脚本执行前会校验，配了就拒绝跑。
 
 想加脱敏，在脚本「灌入」之后插一段 UPDATE 打码即可。
+
+灌完库脚本会顺手把实测的图片 blob 卷 rsync 到测试卷（只增不删）——库里护照照片 / 收款凭证只存
+`blob:sha256` 引用，不拷 blob 测试站就全是裂图。两套都用带 `blob_data` 卷的 compose 起过之后才拷得动。
+
+## 图片 blob 卷与备份
+
+护照照片 / 收款凭证的字节不在库里，在 docker 命名卷 `ftm_blob_data`（容器内 `/data/blobs`，backend 与
+worker 共用），库里只留 `blob:sha256:…` 引用。**pg_dump 不含照片，「库备份 + blob 备份」才是一套完整备份**：
+
+```bash
+bash /opt/ftm/infra/staging/backup-blobs.sh      # rsync 卷 → /opt/ftm/backups/blobs（不带 --delete，只增不减）
+# crontab 每天 03:40（排在 03:30 的 backup-db.sh 之后），安装行见脚本末尾
+```
+
+`down -v` 会把卷一起删掉；恢复、存量回填、回滚步骤见 `docs/照片出库-方案与上线步骤.md`。
 
 ## 两套的密钥必须不同
 
