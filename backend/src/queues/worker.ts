@@ -42,6 +42,7 @@ import { markOverdueHolds } from '../modules/hold-orders/hold-overdue.js';
 import { voidDepartedReleasedReturnLegs } from '../modules/orders/no-show-void.js';
 import { SeatAllocationService } from '../modules/seat-allocation/seat-allocation.service.js';
 import { pruneExpiredRefreshTokens } from '../modules/auth/refresh-token-prune.js';
+import { backfillImageBlobs, formatBackfillSummary } from '../lib/image-blob-backfill.js';
 
 /**
  * 超时释放某订单占用的座位——套餐升舱拆座感知 + 下限钳制在 0（MEDIUM 修复）。
@@ -547,6 +548,57 @@ void (async () => {
   }
 })();
 
+// 图片出库每日兜底清扫：把漏网的内联 data URL（blob 目录当时不可写而回退内联的、raw SQL 写进来的）
+// 转成 blob 引用，每次最多 IMAGE_BLOB_SWEEP_LIMIT 行（0 = 关）。样板照抄 refresh-token-prune：
+// concurrency 1 + queue.ts 侧 scheduleImageBlobSweep 动态导入自注册。存量回填不靠它（走 CLI）。
+interface ImageBlobSweepJobData {
+  requestedAt?: string;
+}
+
+const imageBlobSweepWorker = new Worker<ImageBlobSweepJobData>(
+  'image-blob-sweep',
+  async () => {
+    const limit = env.IMAGE_BLOB_SWEEP_LIMIT ?? 0;
+    if (limit <= 0) {
+      // eslint-disable-next-line no-console
+      console.log('[worker:image-blob-sweep] ○ IMAGE_BLOB_SWEEP_LIMIT=0，跳过');
+      return { skipped: true, reason: 'disabled' };
+    }
+    const result = await backfillImageBlobs({
+      apply: true,
+      limit,
+      // eslint-disable-next-line no-console
+      log: (line) => console.log(`[worker:image-blob-sweep] ${line}`),
+    });
+    // eslint-disable-next-line no-console
+    console.log(`[worker:image-blob-sweep] ✓ ${formatBackfillSummary(result)}`);
+    return {
+      processed: result.processed,
+      converted: result.tables.reduce((sum, t) => sum + t.converted, 0),
+    };
+  },
+  { connection: bullRedis, concurrency: 1 },
+);
+
+imageBlobSweepWorker.on('failed', (job, err) => {
+  // eslint-disable-next-line no-console
+  console.error(`[worker:image-blob-sweep] ✗ job ${job?.id} failed:`, err.message);
+});
+
+void (async () => {
+  try {
+    const module = await import('./queue.js');
+    const scheduleImageBlobSweep = (
+      module as unknown as { scheduleImageBlobSweep?: () => Promise<void> }
+    ).scheduleImageBlobSweep;
+    if (typeof scheduleImageBlobSweep !== 'function') return;
+    await scheduleImageBlobSweep();
+  } catch (err) {
+    // eslint-disable-next-line no-console
+    console.error('[worker:image-blob-sweep] failed to register repeatable scan:', err);
+  }
+})();
+
 seatLockWorker.on('failed', (job, err) => {
   // eslint-disable-next-line no-console
   console.error(`[worker:seat-lock] ✗ job ${job?.id} failed:`, err.message);
@@ -633,6 +685,7 @@ async function shutdown() {
     noShowVoidWorker.close(),
     seatReclaimWorker.close(),
     refreshTokenPruneWorker.close(),
+    imageBlobSweepWorker.close(),
     notificationWorker.close(),
   ]);
   await closeMailer();

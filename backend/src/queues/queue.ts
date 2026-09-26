@@ -192,6 +192,31 @@ export async function scheduleRefreshTokenPrune(): Promise<void> {
   });
 }
 
+// ── 图片出库每日兜底清扫（image-blob-sweep，每天一次）──
+// 写入口的 Prisma 钩子已把新上传的护照照片 / 收款凭证直接落 blob（db/image-blob-extension.ts）；
+// 这条只捞漏网行——blob 目录当时不可写而回退内联落库的、raw SQL 写进来的——每次最多转
+// IMAGE_BLOB_SWEEP_LIMIT 行（0 = 关）。存量回填不靠它，走 dist/tools/backfill-image-blobs.js。
+export interface ImageBlobSweepJobData {
+  requestedAt?: string;
+}
+
+export const imageBlobSweepQueue = new Queue<ImageBlobSweepJobData>('image-blob-sweep', {
+  connection: bullRedis,
+  defaultJobOptions: {
+    attempts: 3,
+    backoff: { type: 'exponential', delay: 5000 },
+    removeOnComplete: { age: 7 * 24 * 3600 },
+    removeOnFail: { age: 30 * 24 * 3600 },
+  },
+});
+
+export async function scheduleImageBlobSweep(): Promise<void> {
+  await imageBlobSweepQueue.add('sweep-image-blobs', {}, {
+    jobId: 'image-blob-sweep-daily',
+    repeat: { every: 24 * 60 * 60 * 1000 },
+  });
+}
+
 /**
  * 创建锁位时排队：delay 毫秒后若锁仍 ACTIVE 则标 EXPIRED（座位自动回归可售）。
  * jobId 用 `seatlock-<lockId>`，方便下单消费 / 手动释放时 remove() 取消。
