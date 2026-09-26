@@ -365,8 +365,12 @@ check_disk() {
 }
 
 # 一个备份目标：「名称|目录|匹配,匹配|最长间隔小时|最小体积比例%」
+# 新鲜度看全部匹配文件（刚写完的恰恰说明备份在按时跑）；体积比较只看写完超过 BACKUP_SETTLE_SECONDS
+# 的文件，免得拿正在写的半截文件去比。附件目录只有一个每天重写的 .last-success：新鲜度若也跳过刚写的
+# 文件，重写后那几分钟就会误报「找不到」。
 check_backup_target() {
   local name dir patterns max_h min_pct pat f m s seen=" "
+  local latest="" latest_m=0 latest_s=0
   local newest="" newest_m=0 newest_s=0 prev="" prev_m=0 prev_s=0
   local -a pats
   IFS='|' read -r name dir patterns max_h min_pct <<<"$1"
@@ -378,6 +382,9 @@ check_backup_target() {
       seen+="$f "
       [ -f "$f" ] || continue
       m=$(stat -c %Y -- "$f") && s=$(stat -c %s -- "$f") || continue
+      if [ "$m" -gt "$latest_m" ]; then
+        latest=$f latest_m=$m latest_s=$s
+      fi
       [ $((NOW - m)) -ge "$BACKUP_SETTLE_SECONDS" ] || continue
       if [ "$m" -gt "$newest_m" ]; then
         prev=$newest prev_m=$newest_m prev_s=$newest_s
@@ -389,22 +396,24 @@ check_backup_target() {
   done
   shopt -u nullglob
 
-  if [ -z "$newest" ]; then
+  if [ -z "$latest" ]; then
     raise_alert "backup-age:$name" 严重 "$name 备份：$dir 下找不到任何 $patterns"
     return
   fi
-  local age=$((NOW - newest_m)) base
-  base=$(basename "$newest")
+  local age=$((NOW - latest_m)) base
+  base=$(basename "$latest")
   if [ "$age" -gt $((max_h * 3600)) ]; then
     raise_alert "backup-age:$name" 严重 "$name 备份已 $(human_duration "$age") 没更新（上限 $max_h 小时），最新一份 $base：查 backup.log 和 crontab"
   else
-    vlog "$name 备份最新 $base（$(human_duration "$age") 前，$(human_size "$newest_s")），正常"
+    vlog "$name 备份最新 $base（$(human_duration "$age") 前，$(human_size "$latest_s")），正常"
     clear_alert "backup-age:$name" "$name 备份恢复更新：$base"
   fi
+  # 体积：写完已稳定的最新两份才比（只有一份刚写完时先不判）
+  [ -n "$newest" ] || return
   if [ -n "$prev" ] && [ "${min_pct:-0}" -gt 0 ] && [ $((newest_s * 100)) -lt $((prev_s * min_pct)) ]; then
-    raise_alert "backup-size:$name" 警告 "$name 备份最新一份 $base 只有 $(human_size "$newest_s")，不到上一份 $(basename "$prev")（$(human_size "$prev_s")）的 ${min_pct}%：确认是不是导出不全"
+    raise_alert "backup-size:$name" 警告 "$name 备份最新一份 $(basename "$newest") 只有 $(human_size "$newest_s")，不到上一份 $(basename "$prev")（$(human_size "$prev_s")）的 ${min_pct}%：确认是不是导出不全"
   else
-    clear_alert "backup-size:$name" "$name 备份体积恢复正常：$base $(human_size "$newest_s")"
+    clear_alert "backup-size:$name" "$name 备份体积恢复正常：$(basename "$newest") $(human_size "$newest_s")"
   fi
 }
 
@@ -418,7 +427,9 @@ check_backups() {
 }
 
 inspect_container() {
-  dk inspect -f '{{.Id}}|{{.State.Status}}|{{.State.Restarting}}|{{.RestartCount}}|{{if .State.Health}}{{.State.Health.Status}}{{end}}|{{.State.ExitCode}}' "$1" 2>/dev/null
+  # 健康状态用 index 取：关了健康检查的容器（worker）State 里根本没有 Health 键，
+  # 写成 .State.Health 模板会直接报错「map has no entry for key」→ 被当成「容器不存在」误报严重告警。
+  dk inspect -f '{{.Id}}|{{.State.Status}}|{{.State.Restarting}}|{{.RestartCount}}|{{with index .State "Health"}}{{.Status}}{{end}}|{{.State.ExitCode}}' "$1" 2>/dev/null
 }
 
 # inspect 结果 → 问题描述（没问题输出空）
