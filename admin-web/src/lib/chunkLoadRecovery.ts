@@ -9,7 +9,8 @@
  * 口径：
  *   · 第一次失败 → 自动刷新；刷新前先在 sessionStorage 记下「这个构建为此刷新过」（先记后刷，防死循环）；
  *   · 刷新后同一构建仍失败 → 不再自动刷新，由页面显示「系统已更新，请刷新」提示，交给用户；
- *   · 之后只要有页面代码成功加载过，说明刷新已把页面救回来，清掉记号——下一次发版还能再自动刷新一次。
+ *   · 之后用户打开的页面成功加载，说明刷新已把页面救回来，清掉记号——下一次发版还能再自动刷新一次
+ *     （后台预取成功不算，见 components/LazyPage）。
  *
  * 这里只放纯逻辑（存储可注入，便于单测）；React 侧见 components/LazyPage.tsx。
  */
@@ -70,7 +71,7 @@ export function claimChunkReload(
   }
 }
 
-/** 页面代码成功加载过：清掉记号，下一次（比如又一次发版）遇到失败还能自动刷新一次。 */
+/** 用户打开的页面加载成功：清掉记号，下一次（比如又一次发版）遇到失败还能自动刷新一次。 */
 export function releaseChunkReload(storage: ReloadGuardStorage | null = sessionStorageOrNull()): void {
   try {
     storage?.removeItem(CHUNK_RELOAD_STORAGE_KEY);

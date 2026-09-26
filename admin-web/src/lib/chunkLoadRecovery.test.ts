@@ -91,7 +91,7 @@ describe('claimChunkReload / releaseChunkReload', () => {
     expect(claimChunkReload('build-b', storage)).toBe(false);
   });
 
-  it('页面代码成功加载过（release）→ 同一构建之后再失败又能自动刷新一次', () => {
+  it('用户打开的页面加载成功（release）→ 同一构建之后再失败又能自动刷新一次', () => {
     const storage = memoryStorage();
     expect(claimChunkReload('build-a', storage)).toBe(true);
     releaseChunkReload(storage);

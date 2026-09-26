@@ -82,7 +82,6 @@ export function lazyPage(loader: () => Promise<ComponentType>): LazyPageComponen
     pending ??= loader().then(
       (component) => {
         loaded = component;
-        releaseChunkReload();
         return component;
       },
       (error: unknown) => {
@@ -94,7 +93,12 @@ export function lazyPage(loader: () => Promise<ComponentType>): LazyPageComponen
   };
 
   const LazyComponent = lazy(() =>
-    load().then((component): PageModule => ({ default: component }), recoverFromChunkError),
+    load().then((component): PageModule => {
+      // 用户实际打开的页面加载成功，说明（如有）上次自动刷新已把页面救回来，清掉防循环记号。
+      // 后台预取成功不算：否则停在「系统已更新」提示上时，预取一成功就清掉记号，再手动刷新会多刷一轮。
+      releaseChunkReload();
+      return { default: component };
+    }, recoverFromChunkError),
   );
 
   function LazyPage(): ReactElement {
