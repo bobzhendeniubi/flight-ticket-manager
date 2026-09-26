@@ -31,7 +31,7 @@ interface SeatClassStub {
 // businessPriceLinked / businessUpgradeCnyPerLeg 挂在 schedule.flight 上（calculatePrice 从这里取）。
 function wireSeatClasses(
   seatClasses: SeatClassStub[],
-  flight: { businessPriceLinked: boolean; businessUpgradeCnyPerLeg: number },
+  flight: { businessPriceLinked: boolean; businessUpgradeCnyPerLeg: number; flightNumber?: string },
 ): void {
   prismaMock.flightSeatClass.findFirst.mockImplementation(
     async ({ where, include }: { where: { cabin: string }; include?: unknown }) => {
@@ -155,5 +155,41 @@ describe('PricingService.calculatePrice · 商务舱价格联动经济舱', () =
     const res = await new PricingService().calculatePrice(SCHEDULE_ID, 'ECONOMY', 1);
     expect(res.averageUnitPrice).toBe(1200);
     expect(res.businessLinked).toBeUndefined();
+  });
+});
+
+describe('PricingService.calculatePrice · 余票不足报错指明是哪一程', () => {
+  // 往返 / 多段报价时，只说「ECONOMY 余票仅 0 张」看不出是去程还是回程不够座；
+  // 带上航班号与出发地当地日期，录单的人一眼能定位，失败日志也能按航班统计售罄后仍有人要订。
+  it('售罄：前缀带航班号与当地出发日', async () => {
+    wireSeatClasses([{ cabin: 'ECONOMY', capacity: 10, sold: 10, basePrice: 1000 }], {
+      businessPriceLinked: false,
+      businessUpgradeCnyPerLeg: 0,
+      flightNumber: 'QH9589',
+    });
+    await expect(new PricingService().calculatePrice(SCHEDULE_ID, 'ECONOMY', 2)).rejects.toThrow(
+      'QH9589（08-10 出发）ECONOMY 余票仅 0 张，不够 2 张。已售罄。',
+    );
+  });
+
+  it('余票不够但未售罄：照旧给出最多可购张数', async () => {
+    wireSeatClasses([{ cabin: 'ECONOMY', capacity: 10, sold: 9, basePrice: 1000 }], {
+      businessPriceLinked: false,
+      businessUpgradeCnyPerLeg: 0,
+      flightNumber: 'QH9588',
+    });
+    await expect(new PricingService().calculatePrice(SCHEDULE_ID, 'ECONOMY', 3)).rejects.toThrow(
+      'QH9588（08-10 出发）ECONOMY 余票仅 1 张，不够 3 张。最多可购 1 张。',
+    );
+  });
+
+  it('取不到航班号时退回原文案，不拼出半截前缀', async () => {
+    wireSeatClasses([{ cabin: 'ECONOMY', capacity: 10, sold: 10, basePrice: 1000 }], {
+      businessPriceLinked: false,
+      businessUpgradeCnyPerLeg: 0,
+    });
+    await expect(new PricingService().calculatePrice(SCHEDULE_ID, 'ECONOMY', 1)).rejects.toThrow(
+      /^ECONOMY 余票仅 0 张，不够 1 张。已售罄。$/,
+    );
   });
 });

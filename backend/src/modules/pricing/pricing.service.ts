@@ -12,8 +12,26 @@
 import { CabinClass } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { BadRequestError, NotFoundError } from '../../lib/errors.js';
+import { localDateISO } from '../../lib/flight-time.js';
 import { computeLadderBreakdown } from './pricing.calc.js';
 import { parseFareBuckets } from './pricing.schemas.js';
+
+/**
+ * 余票不足报错的前缀「QH9589（08-10 出发）」：往返 / 多段报价时只说「余票仅 0 张」看不出是哪一程；
+ * 带上航班号与出发地当地日期，录单的人一眼能定位，失败日志也能按航班统计售罄后仍有人要订的量。
+ * 取不到航班号就不加前缀（沿用原文案）。
+ */
+function soldOutLegLabel(
+  schedule:
+    | { departureTime?: Date | null; departureTz?: string | null; flight?: { flightNumber?: string | null } | null }
+    | null
+    | undefined,
+): string {
+  const flightNumber = schedule?.flight?.flightNumber;
+  if (!flightNumber) return '';
+  if (!schedule?.departureTime) return `${flightNumber} `;
+  return `${flightNumber}（${localDateISO(schedule.departureTime, schedule.departureTz).slice(5)} 出发）`;
+}
 
 // ── 返回类型 ──────────────────────────────────────────────────────
 export interface SeatBreakdown {
@@ -81,7 +99,7 @@ export class PricingService {
     const available = capacity - sold;
     if (seatDemand > available) {
       throw new BadRequestError(
-        `${cabin} 余票仅 ${available} 张，不够 ${seatDemand} 张。` +
+        `${soldOutLegLabel(seatClass.schedule)}${cabin} 余票仅 ${available} 张，不够 ${seatDemand} 张。` +
           (available > 0 ? `最多可购 ${available} 张。` : '已售罄。'),
       );
     }
