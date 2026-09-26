@@ -122,20 +122,12 @@ admin.citur.com {
 
 ## 备份 / 恢复
 
-### 每日自动备份
-
-```bash
-# crontab -e  (宿主机)
-0 3 * * * docker exec ftm-postgres-prod pg_dump -U ftm ftm | gzip > /opt/ftm-backups/ftm-$(date +\%Y\%m\%d).sql.gz && find /opt/ftm-backups -mtime +30 -delete
-```
-
-### 恢复
-```bash
-zcat /opt/ftm-backups/ftm-20260501.sql.gz | docker exec -i ftm-postgres-prod psql -U ftm ftm
-```
+每日快照（`infra/staging/backup-db.sh`，`pg_dump -Fc` + 通读校验，保留 14 天）、恢复步骤
+（能覆盖有数据的库）、演练记录、看门狗与慢查询统计，统一见 **`docs/运维-监控与备份.md`**。
+这里原先那两条命令（`/opt/ftm-backups` 路径、`zcat | psql` 灌进有数据的库）早已不适用，已删。
 
 ### Redis 持久化
-已开启 `appendonly yes` + 512MB LRU，重启不丢任务队列。
+已开启 `appendonly yes`，512MB 上限 + `noeviction`（BullMQ 要求，驱逐会悄悄丢延迟任务），重启不丢任务队列。
 
 ## 安全检查清单
 
