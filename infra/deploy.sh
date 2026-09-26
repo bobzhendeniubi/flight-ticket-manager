@@ -57,6 +57,17 @@ if [ "$ENVIRONMENT" = "prod" ] && [ -t 0 ]; then
   case "$ans" in y|Y) ;; *) echo "已取消"; exit 1 ;; esac
 fi
 
+# 发版期间暂停看门狗自愈：backend 容器起来先跑 prisma migrate deploy，迁移偏慢时看门狗探活两次失败
+# 就会 docker restart backend——迁移被中途杀掉会留下失败记录（P3009），之后 backend 起不来。
+# 标记是全机共用的（发测试栈时实测的自愈也会暂停几分钟）；原本就挂着（别人在维护）则不接管、不摘。
+PAUSE_FLAG=/opt/ftm/.watchdog.pause
+if [ -e "$PAUSE_FLAG" ]; then
+  echo "  看门狗维护标记本来就挂着，发完不摘"
+else
+  touch "$PAUSE_FLAG"
+  trap 'rm -f "$PAUSE_FLAG"' EXIT
+fi
+
 echo "▶ 拉代码…"
 git pull --ff-only
 
