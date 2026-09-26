@@ -5137,7 +5137,10 @@ export class OrderService {
   async listOrders(query: ListOrdersQuery, requester: OrderRequester) {
     const where = await this.resolveListOrdersWhere(query, requester);
 
-    const [rows, total] = await prisma.$transaction([
+    // 取数与计数并发跑（各占一条连接），而不是塞进同一个批量事务里串行：两条都要把筛选
+    // 整个评估一遍（乘客名 / 搜索词的子查询），串行就是两倍等待。批量事务默认读已提交，
+    // 两条语句本来就各取各的快照，并不比并发多一分一致性。
+    const [rows, total] = await Promise.all([
       prisma.order.findMany({
         where,
         include: {
