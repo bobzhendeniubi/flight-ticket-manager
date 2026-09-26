@@ -1,40 +1,50 @@
 import { useEffect } from 'react';
 import { Navigate, Route, Routes } from 'react-router-dom';
 import { Layout } from './components/Layout';
+import { lazyPage, whenIdle } from './components/LazyPage';
+// 登录页保持同步加载：未登录时的首屏、体积很小，懒加载反而多一次往返、多闪一下「加载中」。
 import { LoginPage } from './pages/LoginPage';
-import { DashboardPage } from './pages/DashboardPage';
-import { OrdersPage } from './pages/OrdersPage';
-import { FlightsPage } from './pages/FlightsPage';
-import { SeatStatsPage } from './pages/SeatStatsPage';
-import { SeatAllocationPage } from './pages/SeatAllocationPage';
-import { HoldOrdersPage } from './pages/HoldOrdersPage';
-import { ProductsPage } from './pages/ProductsPage';
-import { AgentsPage } from './pages/AgentsPage';
-import { AgentBalancePage } from './pages/AgentBalancePage';
-import { CustomersPage } from './pages/CustomersPage';
-import { TravelersPage } from './pages/TravelersPage';
-import { AuditLogsPage } from './pages/AuditLogsPage';
-import { StaffRolesPage } from './pages/StaffRolesPage';
-import { ChangePasswordPage } from './pages/ChangePasswordPage';
-import { SettlementsPage } from './pages/SettlementsPage';
-import { SettlementRatesPage } from './pages/SettlementRatesPage';
-import { SettlementDiscountsPage } from './pages/SettlementDiscountsPage';
-import { CancellationPoliciesPage } from './pages/CancellationPoliciesPage';
-import { FinancesPage } from './pages/FinancesPage';
-import { ReconciliationPage } from './pages/ReconciliationPage';
-import { HotelControlPage } from './pages/HotelControlPage';
-import { VisaDeskPage } from './pages/VisaDeskPage';
-import { AiOcrSettingsPage } from './pages/AiOcrSettingsPage';
-import { RemindersPage } from './pages/RemindersPage';
-import { NoShowBatchPage } from './pages/NoShowBatchPage';
-import { NoShowReportPage } from './pages/NoShowReportPage';
-import { ReportsPage } from './pages/ReportsPage';
-import { FulfillmentBoardPage } from './pages/FulfillmentBoardPage';
-import { MarketingPage } from './pages/MarketingPage';
-import { LegacyArchivePage } from './pages/LegacyArchivePage';
 import { useAuth } from './stores/auth';
 import { isAccessTokenFresh } from './lib/token';
 import { ConfirmProvider } from './components/ConfirmDialog';
+
+// 其余页面按路由懒加载：各自打成独立文件，进哪个页面才下载哪个（失败兜底见 components/LazyPage）。
+// 订单页同样懒加载——它一个就占原先整包的四分之一，放进入口会让每次发版都整块重下；
+// 改为有会话后空闲预取（见下方 App 里的 whenIdle），从仪表盘点进订单基本不用等。
+const DashboardPage = lazyPage(() => import('./pages/DashboardPage').then((m) => m.DashboardPage));
+const OrdersPage = lazyPage(() => import('./pages/OrdersPage').then((m) => m.OrdersPage));
+const FlightsPage = lazyPage(() => import('./pages/FlightsPage').then((m) => m.FlightsPage));
+const SeatStatsPage = lazyPage(() => import('./pages/SeatStatsPage').then((m) => m.SeatStatsPage));
+const SeatAllocationPage = lazyPage(() => import('./pages/SeatAllocationPage').then((m) => m.SeatAllocationPage));
+const HoldOrdersPage = lazyPage(() => import('./pages/HoldOrdersPage').then((m) => m.HoldOrdersPage));
+const ProductsPage = lazyPage(() => import('./pages/ProductsPage').then((m) => m.ProductsPage));
+const AgentsPage = lazyPage(() => import('./pages/AgentsPage').then((m) => m.AgentsPage));
+const AgentBalancePage = lazyPage(() => import('./pages/AgentBalancePage').then((m) => m.AgentBalancePage));
+const CustomersPage = lazyPage(() => import('./pages/CustomersPage').then((m) => m.CustomersPage));
+const TravelersPage = lazyPage(() => import('./pages/TravelersPage').then((m) => m.TravelersPage));
+const AuditLogsPage = lazyPage(() => import('./pages/AuditLogsPage').then((m) => m.AuditLogsPage));
+const StaffRolesPage = lazyPage(() => import('./pages/StaffRolesPage').then((m) => m.StaffRolesPage));
+const ChangePasswordPage = lazyPage(() => import('./pages/ChangePasswordPage').then((m) => m.ChangePasswordPage));
+const SettlementsPage = lazyPage(() => import('./pages/SettlementsPage').then((m) => m.SettlementsPage));
+const SettlementRatesPage = lazyPage(() => import('./pages/SettlementRatesPage').then((m) => m.SettlementRatesPage));
+const SettlementDiscountsPage = lazyPage(() =>
+  import('./pages/SettlementDiscountsPage').then((m) => m.SettlementDiscountsPage),
+);
+const CancellationPoliciesPage = lazyPage(() =>
+  import('./pages/CancellationPoliciesPage').then((m) => m.CancellationPoliciesPage),
+);
+const FinancesPage = lazyPage(() => import('./pages/FinancesPage').then((m) => m.FinancesPage));
+const ReconciliationPage = lazyPage(() => import('./pages/ReconciliationPage').then((m) => m.ReconciliationPage));
+const HotelControlPage = lazyPage(() => import('./pages/HotelControlPage').then((m) => m.HotelControlPage));
+const VisaDeskPage = lazyPage(() => import('./pages/VisaDeskPage').then((m) => m.VisaDeskPage));
+const AiOcrSettingsPage = lazyPage(() => import('./pages/AiOcrSettingsPage').then((m) => m.AiOcrSettingsPage));
+const RemindersPage = lazyPage(() => import('./pages/RemindersPage').then((m) => m.RemindersPage));
+const NoShowBatchPage = lazyPage(() => import('./pages/NoShowBatchPage').then((m) => m.NoShowBatchPage));
+const NoShowReportPage = lazyPage(() => import('./pages/NoShowReportPage').then((m) => m.NoShowReportPage));
+const ReportsPage = lazyPage(() => import('./pages/ReportsPage').then((m) => m.ReportsPage));
+const FulfillmentBoardPage = lazyPage(() => import('./pages/FulfillmentBoardPage').then((m) => m.FulfillmentBoardPage));
+const MarketingPage = lazyPage(() => import('./pages/MarketingPage').then((m) => m.MarketingPage));
+const LegacyArchivePage = lazyPage(() => import('./pages/LegacyArchivePage').then((m) => m.LegacyArchivePage));
 
 // AGENT 可访问的页面集合（其他页面默认 ADMIN/STAFF 专属）
 // 真实 RBAC 仍由后端 requireRole 兜底 —— 前端只做导航 UX
@@ -127,6 +137,13 @@ export function App() {
       document.removeEventListener('visibilitychange', onVisible);
     };
   }, [hasSession, refreshSession]);
+
+  // 订单页是绝大多数人的落地页：有会话后（含刚登录成功）趁空闲先把它的代码下好，
+  // 从仪表盘点进订单不用再等下载。已经在订单页时与路由共用同一次下载，不会重复请求。
+  useEffect(() => {
+    if (!hasSession) return;
+    return whenIdle(OrdersPage.preload);
+  }, [hasSession]);
 
   return (
     <ConfirmProvider>
