@@ -69,15 +69,22 @@ export function useBuildVersionCheck(): UseBuildVersionCheckResult {
     const handleFocus = () => {
       if (Date.now() - lastCheckedAtRef.current >= MIN_CHECK_INTERVAL_MS) void checkVersion();
     };
+    // 按需加载的代码文件没拿到（Vite 在动态 import 失败时派发 vite:preloadError）多半是刚发过版、
+    // 旧文件已被替换：立即查一次版本（不受 30s 节流），让下面的横幅马上出来，不必等下一轮 5 分钟轮询。
+    // 这里只提示、不强刷——页面里的按需加载（如护照识别）失败时强刷会丢掉正在填的表单；
+    // 路由页面整页加载失败的自动刷新由 components/LazyPage 负责，全站仍只有这一条横幅。
+    const handlePreloadError = () => void checkVersion();
 
     document.addEventListener('visibilitychange', handleVisibility);
     window.addEventListener('focus', handleFocus);
+    window.addEventListener('vite:preloadError', handlePreloadError);
 
     return () => {
       mountedRef.current = false;
       window.clearInterval(timer);
       document.removeEventListener('visibilitychange', handleVisibility);
       window.removeEventListener('focus', handleFocus);
+      window.removeEventListener('vite:preloadError', handlePreloadError);
     };
   }, [checkVersion]);
 
