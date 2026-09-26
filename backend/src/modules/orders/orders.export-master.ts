@@ -28,6 +28,7 @@ import { businessDateTime } from '../../lib/business-time.js';
 import type { PrismaClient } from '@prisma/client';
 import { Prisma } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import { PASSENGERS_WITHOUT_PHOTO, PAYMENTS_WITHOUT_PROOF } from '../../db/heavy-columns.js';
 import { fetchOrdersInChunks } from './orders.export-fetch.js';
 import { docKey } from '../travelers/traveler-profiles.aggregate.js';
 import { flightCountCell, loadExportTripStats } from './orders.export-trip-stats.js';
@@ -446,12 +447,16 @@ export function visibleColumns(role: MasterExportRole): MasterColumn[] {
 }
 
 // ── 取数形态 ────────────────────────────────────────────────────────────────
-/** Prisma include（取数 + 测试类型共享）。*/
+/**
+ * Prisma include（取数 + 测试类型共享）。
+ * 乘客 / 收款取全部列、唯独不读护照照片与收款凭证图（本表没有一列用到图，整月导出不再把
+ * 几百 MB 的 data URL 读回 Node，见 db/heavy-columns.ts）。
+ */
 export const MASTER_EXPORT_INCLUDE = {
   agent: { select: { companyName: true, contactName: true } },
   user: { select: { displayName: true, email: true } },
-  passengers: true,
-  payments: true,
+  passengers: PASSENGERS_WITHOUT_PHOTO,
+  payments: PAYMENTS_WITHOUT_PROOF,
   refunds: true,
   costItems: true,
   items: {

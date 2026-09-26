@@ -11,6 +11,7 @@ import { businessDateTime } from '../../lib/business-time.js';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import { PASSENGERS_WITHOUT_PHOTO } from '../../db/heavy-columns.js';
 import { toAlpha3 } from './nationality.js';
 import { countIssuedPassengers, getScheduleSeatCapacity } from './ticketing-cap.js';
 import {
@@ -168,7 +169,7 @@ function fmtDepartDate(d: Date | null | undefined, tz: string | null | undefined
 type OrderForExport = Prisma.OrderGetPayload<{
   include: {
     agent: { select: { companyName: true; contactName: true } };
-    passengers: true;
+    passengers: typeof PASSENGERS_WITHOUT_PHOTO;
     items: {
       include: {
         flightSchedule: {
@@ -527,7 +528,8 @@ export async function buildOrdersBySchedule(
     orderBy: { createdAt: 'asc' },
     include: {
       agent: { select: { companyName: true, contactName: true } },
-      passengers: true,
+      // 不读护照照片：本表没有一列用到图（见 db/heavy-columns.ts）
+      passengers: PASSENGERS_WITHOUT_PHOTO,
       items: {
         include: {
           flightSchedule: {

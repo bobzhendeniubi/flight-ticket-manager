@@ -84,7 +84,13 @@ import {
   RECEIPT_PROOF_OMIT,
   heavyColumnReads,
 } from './heavy-columns.js';
+import { buildMasterExportWorkbook } from '../modules/orders/orders.export-master.js';
+import { buildOrderTemplateExportWorkbook } from '../modules/orders/orders.export-templates.js';
+import { buildRoomAllocationWorkbook } from '../modules/orders/orders.export-room-allocation.js';
+import { buildOrdersBySchedule } from '../modules/orders/orders.export.js';
 import { queryOrdersByIdsForVisa } from '../modules/orders/orders.export-visa-bundle.js';
+import { exportMasterQuerySchema, exportTemplatesQuerySchema } from '../modules/orders/orders.schemas.js';
+import { buildFinanceExportWorkbook } from '../modules/finances/finances.export.js';
 import { collectHotelPassportGroups } from '../modules/hotel-control/hotel-control.passports.js';
 import { FulfillmentService } from '../modules/fulfillment/fulfillment.service.js';
 
@@ -113,6 +119,13 @@ function heavyReadsSoFar(): string[] {
   return recorder.calls
     .filter((c) => ROW_RETURNING_METHODS.has(c.method))
     .flatMap((c) => heavyColumnReads(modelOf(c.model), c.args).map((p) => `${c.model}.${c.method}: ${p}`));
+}
+
+/** 取某个委托某个方法的全部调用参数（断言「那条查询确实发出去了」用，免得断言空转）。*/
+function argsOf(model: string, method: string): Array<Record<string, unknown>> {
+  return recorder.calls
+    .filter((c) => c.model === model && c.method === method)
+    .map((c) => (c.args ?? {}) as Record<string, unknown>);
 }
 
 /** 分批取数第一步只取 id：给一张单，让第二步（带 include 的实体查询）真的发出去。*/
@@ -186,6 +199,61 @@ describe('heavyColumnReads — 口径', () => {
     ).toEqual([]);
     // 收款整行 + 其订单整行：订单本身没有图片列，只算收款那一列
     expect(heavyColumnReads('Payment', { include: { order: true } })).toEqual(['proofUrl']);
+  });
+});
+
+// ── 2. 不需要字节的读路径 ─────────────────────────────────────────────────────
+describe('导出不读图片大字段', () => {
+  const month = { from: '2026-08-25', to: '2026-09-24' };
+
+  it('全岗总表：分批取实体那一步乘客 / 收款都 omit 掉图片列，整轮查询一列图都不读', async () => {
+    recorder.respondWith(answerOrderIdPass);
+    await buildMasterExportWorkbook(exportMasterQuerySchema.parse({ ...month, role: 'all' }), client, {
+      agentScope: null,
+    });
+    const entityPass = argsOf('order', 'findMany').find((a) => a.include);
+    expect(entityPass?.include).toMatchObject({
+      passengers: PASSENGERS_WITHOUT_PHOTO,
+      payments: PAYMENTS_WITHOUT_PROOF,
+    });
+    expect(heavyReadsSoFar()).toEqual([]);
+  });
+
+  it.each(['full', 'ticketing', 'visa'] as const)('三模板《%s》：同上', async (template) => {
+    recorder.respondWith(answerOrderIdPass);
+    await buildOrderTemplateExportWorkbook(exportTemplatesQuerySchema.parse({ ...month, template }), client, {
+      agentScope: null,
+    });
+    const entityPass = argsOf('order', 'findMany').find((a) => a.include);
+    expect(entityPass?.include).toMatchObject({
+      passengers: PASSENGERS_WITHOUT_PHOTO,
+      payments: PAYMENTS_WITHOUT_PROOF,
+    });
+    expect(heavyReadsSoFar()).toEqual([]);
+  });
+
+  it.each([
+    ['入住日区间', { from: '2026-10-01', to: '2026-10-14' }],
+    ['出发日', { departDate: '2026-10-10' }],
+  ] as const)('分房表（%s）：占房行联查订单时乘客不读护照照片', async (_label, params) => {
+    await buildRoomAllocationWorkbook(params, client);
+    const [itemQuery] = argsOf('orderItem', 'findMany');
+    expect(itemQuery?.include).toMatchObject({ order: { include: { passengers: PASSENGERS_WITHOUT_PHOTO } } });
+    expect(heavyReadsSoFar()).toEqual([]);
+  });
+
+  it('整班机导出：乘客不读护照照片', async () => {
+    await buildOrdersBySchedule('sched-1', client);
+    const entityQuery = argsOf('order', 'findMany').find((a) => a.include);
+    expect(entityQuery?.include).toMatchObject({ passengers: PASSENGERS_WITHOUT_PHOTO });
+    expect(heavyReadsSoFar()).toEqual([]);
+  });
+
+  it('财务明细导出：乘客不读护照照片', async () => {
+    await buildFinanceExportWorkbook(month, client);
+    const [orderQuery] = argsOf('order', 'findMany');
+    expect(orderQuery?.include).toMatchObject({ passengers: PASSENGERS_WITHOUT_PHOTO });
+    expect(heavyReadsSoFar()).toEqual([]);
   });
 });
 

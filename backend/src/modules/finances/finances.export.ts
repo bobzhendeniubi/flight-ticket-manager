@@ -25,6 +25,7 @@ import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import { PASSENGERS_WITHOUT_PHOTO } from '../../db/heavy-columns.js';
 import {
   findMatchedPeriod,
   loadPeriodsByFlightIds,
@@ -193,7 +194,7 @@ function fmtDate(d: Date | null | undefined): string {
 type OrderForExport = Prisma.OrderGetPayload<{
   include: {
     agent: { select: { companyName: true; contactName: true } };
-    passengers: true;
+    passengers: typeof PASSENGERS_WITHOUT_PHOTO;
     costItems: { select: { category: true; amountCny: true } };
     refunds: { select: { amount: true } };
     items: {
@@ -498,7 +499,8 @@ export async function buildFinanceExportWorkbook(
     orderBy: { createdAt: 'asc' },
     include: {
       agent: { select: { companyName: true, contactName: true } },
-      passengers: true,
+      // 不读护照照片：本表没有一列用到图，整段区间一次取回（未分批），带图最容易撞 napi 上限
+      passengers: PASSENGERS_WITHOUT_PHOTO,
       costItems: { select: { category: true, amountCny: true } },
       // 清账口径要扣已完成退款——只取 COMPLETED，在途退款钱还没出去，扣了会误判成已退完
       refunds: { where: { status: 'COMPLETED' }, select: { amount: true } },

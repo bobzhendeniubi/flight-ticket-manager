@@ -8,6 +8,7 @@ import ExcelJS from 'exceljs';
 import { businessDateISO } from '../../lib/business-time.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import type { Passenger } from '@prisma/client';
+import type { PassengerWithoutPhoto } from '../../db/heavy-columns.js';
 import { toAlpha3 } from './nationality.js';
 import { splitPassengerFullName } from '../../lib/passenger-name.js';
 
@@ -207,7 +208,8 @@ export const PNR_COLUMNS: Array<{ header: string; key: keyof PnrRow }> = [
   { header: 'Address Zip Code', key: 'addressZip' },
 ];
 
-export function passengerToRow(p: Passenger, departureDate?: Date | null): PnrRow {
+// 收参不要求护照照片列（本函数从不读图）：三模板《票务专用》取数已 omit 掉照片（db/heavy-columns.ts）。
+export function passengerToRow(p: PassengerWithoutPhoto, departureDate?: Date | null): PnrRow {
   // 优先用拆分字段；姓名缺失（含空串，`||` 语义）兜底按 fullName 拆分——支持空格或斜线：
   // OCR/OTA/老数据常见 "CHEN/HAOLIANG" 斜线格式，若只按空格切，整串会掉进 Last Name。
   const { lastName: autoLast, firstName: autoFirst } = splitPassengerFullName(p.fullName);

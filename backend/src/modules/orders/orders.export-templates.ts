@@ -14,11 +14,12 @@
 import ExcelJS from 'exceljs';
 import { localDateISO } from '../../lib/flight-time.js';
 import { businessDateISO, businessDateTimeSec } from '../../lib/business-time.js';
-import type { Prisma, PrismaClient, VisaRequirement } from '@prisma/client';
+import type { Passenger, Payment, Prisma, PrismaClient, VisaRequirement } from '@prisma/client';
 import { OrderItemKind, OrderStatus } from '@prisma/client';
 // 订单级「明确不需要我方代办（NOT_NEEDED / HAS_VISA）」的唯一判定口径，与建签证任务共用。
 import { orderVisaStatusExplicitlyNotNeeded } from './visa-need.js';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import { PASSENGERS_WITHOUT_PHOTO, PAYMENTS_WITHOUT_PROOF } from '../../db/heavy-columns.js';
 // 「结算价格」按人取值的权威口径：每人份额端口（详见 perPaxSettlementByPassenger）。
 import { computePerPaxShares, spreadableAdjustmentCny } from './per-pax-share.js';
 import type { BundleItemJson } from '../../lib/json-types.js';
@@ -661,32 +662,46 @@ function deriveTitleByAge(dob: Date | null, gender: string | null, departDate: D
 }
 
 // ── 取数 ────────────────────────────────────────────────────────────────
-export type OrderForTemplateExport = Prisma.OrderGetPayload<{
-  include: {
-    agent: { select: { companyName: true; contactName: true } };
-    user: { select: { displayName: true; email: true } };
-    passengers: true;
-    payments: true;
-    refunds: true;
-    items: {
-      include: {
-        flightSchedule: {
-          include: {
-            flight: { select: { flightNumber: true; originCode: true; destinationCode: true } };
-          };
-        };
-        hotelRoomType: {
-          select: { name: true; hotel: { select: { name: true; code: true; randomTierPlaceholder: true } } };
-        };
-        visa: { select: { code: true; visaName: true; visaType: true; supplier: true } };
-        transfer: { select: { code: true } };
-        bundle: { select: { code: true; items: true } };
-        // visaSupplier：本次实际送签的签证公司（「签证公司」列优先取它，见 visaSupplierOf）
-        fulfillmentTasks: { select: { type: true; status: true; visaSupplier: true } };
-      };
-    };
-  };
-}>;
+/**
+ * 三模板取数 include —— 取数与 OrderForTemplateRows 类型共用这一份（此前类型与取数各写一遍）。
+ * 乘客 / 收款取全部列、唯独不读护照照片与收款凭证图：三个模板没有一列用到图，整月导出不再把
+ * 几百 MB 的 data URL 读回 Node（见 db/heavy-columns.ts）。
+ */
+export const TEMPLATE_EXPORT_INCLUDE = {
+  agent: { select: { companyName: true, contactName: true } },
+  user: { select: { displayName: true, email: true } },
+  passengers: PASSENGERS_WITHOUT_PHOTO,
+  payments: PAYMENTS_WITHOUT_PROOF,
+  refunds: true,
+  items: {
+    include: {
+      flightSchedule: {
+        include: { flight: { select: { flightNumber: true, originCode: true, destinationCode: true } } },
+      },
+      // randomTierPlaceholder：房型挂在随机档占位酒店上 = 未落位，「酒店类型」按「X星随机（待落位）」出
+      hotelRoomType: {
+        select: { name: true, hotel: { select: { name: true, code: true, randomTierPlaceholder: true } } },
+      },
+      visa: { select: { code: true, visaName: true, visaType: true, supplier: true } },
+      transfer: { select: { code: true } },
+      bundle: { select: { code: true, items: true } },
+      // visaSupplier：本次实际送签的签证公司（「签证公司」列优先取它，见 visaSupplierOf）
+      fulfillmentTasks: { select: { type: true, status: true, visaSupplier: true } },
+    },
+  },
+} satisfies Prisma.OrderInclude;
+
+/** 三模板行渲染所需的订单形态（不含图片大字段）；各行渲染函数都按它收参。*/
+export type OrderForTemplateRows = Prisma.OrderGetPayload<{ include: typeof TEMPLATE_EXPORT_INCLUDE }>;
+
+/**
+ * 同一形态、但乘客 / 收款带全部列（含护照照片 / 凭证图）—— 签证资料包（orders.export-visa-bundle.ts）
+ * 仍按它取数，护照包要照片字节。它是 OrderForTemplateRows 的超集，可直接喂给各行渲染函数。
+ */
+export type OrderForTemplateExport = Omit<OrderForTemplateRows, 'passengers' | 'payments'> & {
+  passengers: Passenger[];
+  payments: Payment[];
+};
 
 // ── 订单级共享派生（三个模板都用）─────────────────────────────────────────
 interface OrderContext {
@@ -736,7 +751,7 @@ interface OrderContext {
 }
 
 export function buildOrderContext(
-  order: OrderForTemplateExport,
+  order: OrderForTemplateRows,
   /**
    * 脱敏开关。`redactLegStatus` = 这是一次**代理导出**（路由解析出 agentScope 时为真）：
    * 「航段状态」会写成「回程已恢复（超售 2 座）」—— 超售是我方与航司之间的内部风控口径，
@@ -998,7 +1013,7 @@ const FULL_COST_GROUP_KEYS: ReadonlySet<string> = new Set(['costType', 'costSubT
  *                  纯函数，绝不在行循环里逐个查库）。缺省空 Map = 该列全部留空。
  */
 export function orderToFullRows(
-  order: OrderForTemplateExport,
+  order: OrderForTemplateRows,
   ctx: OrderContext,
   tripStats: TripStatsMap = new Map(),
   /** §九/§十共享房伙伴单号查找表（loadSharedRoomPartnerLookup 批量拉好后传入）。*/
@@ -1225,7 +1240,7 @@ export const TICKETING_COLUMNS: Array<{ header: string; key: keyof TicketingRow;
   ...PNR_COLUMNS.map((c) => ({ header: c.header, key: c.key as keyof TicketingRow, width: 18 })),
 ];
 
-export function orderToTicketingRows(order: OrderForTemplateExport, ctx: OrderContext): TicketingRow[] {
+export function orderToTicketingRows(order: OrderForTemplateRows, ctx: OrderContext): TicketingRow[] {
   // PTC 按「出发日 − 出生日期」自动推算 —— 取订单 FLIGHT 行里最早的出发时间（去程）。
   const departureDate = earliestFlightDeparture(order.items);
   return order.passengers.map<TicketingRow>((p) => ({
@@ -1296,7 +1311,7 @@ export const VISA_COLUMNS: Array<{ header: string; key: keyof VisaRow; width: nu
 //      行上，走这条也能出公司名。
 //   ② 任务没填才回落独立 VISA 行关联产品的 supplier（产品默认供应商），同样去重拼接；都没有则留空。
 // 《全岗可用》与《签证专用》共用取数点，与全岗总表（orders.export-master.ts）同一口径。
-export function visaSupplierOf(order: OrderForTemplateExport): string {
+export function visaSupplierOf(order: OrderForTemplateRows): string {
   const fromTasks = Array.from(
     new Set(
       order.items
@@ -1317,7 +1332,7 @@ export function visaSupplierOf(order: OrderForTemplateExport): string {
   ).join(', ');
 }
 
-export function orderToVisaRows(order: OrderForTemplateExport, ctx: OrderContext): Omit<VisaRow, 'stt'>[] {
+export function orderToVisaRows(order: OrderForTemplateRows, ctx: OrderContext): Omit<VisaRow, 'stt'>[] {
   const visaSupplier = visaSupplierOf(order);
   // 分房组（0722 财务反馈）：酒店类型列按乘客所在分房组的实际酒店取，与《全岗可用》同口径。
   const roomGroups = parseRoomGroups(order.roomAssignment);
@@ -1387,34 +1402,12 @@ export async function buildOrderTemplateExportWorkbook(
   });
 
   // 分批取数（见 orders.export-fetch.ts）：整月的七层嵌套结果一次裸查会撞 napi 单字符串
-  // 上限、整个导出 500。where / orderBy / include 与原来一字不差。
-  const fetched = await fetchOrdersInChunks<OrderForTemplateExport>(client, {
+  // 上限、整个导出 500。include 见 TEMPLATE_EXPORT_INCLUDE（不读图片大字段）。
+  const fetched = await fetchOrdersInChunks<OrderForTemplateRows>(client, {
     where,
     // 名单按录入倒序（最新录入在最上），对标旧系统
     orderBy: { createdAt: 'desc' },
-    include: {
-      agent: { select: { companyName: true, contactName: true } },
-      user: { select: { displayName: true, email: true } },
-      passengers: true,
-      payments: true,
-      refunds: true,
-      items: {
-        include: {
-          flightSchedule: {
-            include: { flight: { select: { flightNumber: true, originCode: true, destinationCode: true } } },
-          },
-          // randomTierPlaceholder：房型挂在随机档占位酒店上 = 未落位，「酒店类型」按「X星随机（待落位）」出
-          hotelRoomType: {
-            select: { name: true, hotel: { select: { name: true, code: true, randomTierPlaceholder: true } } },
-          },
-          visa: { select: { code: true, visaName: true, visaType: true, supplier: true } },
-          transfer: { select: { code: true } },
-          bundle: { select: { code: true, items: true } },
-          // visaSupplier：「签证公司」列优先取任务级实际送签公司（见 visaSupplierOf）
-          fulfillmentTasks: { select: { type: true, status: true, visaSupplier: true } },
-        },
-      },
-    },
+    include: TEMPLATE_EXPORT_INCLUDE,
   });
 
   // 内存精筛（出行/返程/航班日期、航班号×日期绑定、单程/往返）—— 取数 where 的日期条件

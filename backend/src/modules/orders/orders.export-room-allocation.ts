@@ -25,6 +25,7 @@ import ExcelJS from 'exceljs';
 import type { Prisma, PrismaClient } from '@prisma/client';
 import { OrderStatus, OrderItemKind } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
+import { PASSENGERS_WITHOUT_PHOTO } from '../../db/heavy-columns.js';
 import { BadRequestError } from '../../lib/errors.js';
 import { getHotelNightlyRemaining } from '../hotel-control/hotel-control.service.js';
 import {
@@ -354,7 +355,7 @@ export type RoomItemForExport = Prisma.OrderItemGetPayload<{
     order: {
       include: {
         agent: { select: { companyName: true; contactName: true } };
-        passengers: true;
+        passengers: typeof PASSENGERS_WITHOUT_PHOTO;
         items: {
           select: {
             id: true;
@@ -891,7 +892,8 @@ const ROOM_ITEM_INCLUDE = {
   order: {
     include: {
       agent: { select: { companyName: true, contactName: true } },
-      passengers: true,
+      // 不读护照照片（本表没有一列用到图）：一张单有几条占房行就会被联查几遍，照片最伤
+      passengers: PASSENGERS_WITHOUT_PHOTO,
       items: {
         select: {
           // id/amount/description/passengerId/metadata：结算价格按人（perPaxSettlementByPassenger）取数用
