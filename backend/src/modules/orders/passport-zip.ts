@@ -15,6 +15,7 @@ import JSZip from 'jszip';
 import { OrderItemKind, FulfillmentType, type Passenger } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { businessDateTimeSec } from '../../lib/business-time.js';
+import { localDateFormatter } from '../../lib/flight-time.js';
 import { extForImageMime, parseBlobRef, resolveImageBytes } from '../../lib/image-ref.js';
 
 export function sanitize(s: string): string {
@@ -27,17 +28,18 @@ export function fmtDate(d: Date | null | undefined): string {
   return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, '0')}-${String(d.getUTCDate()).padStart(2, '0')}`;
 }
 
-/** 按出发地 IANA 时区把出发时刻转成本地日 YYYY-MM-DD（tz 不识别时回退 UTC） */
+/**
+ * 按出发地 IANA 时区把出发时刻转成本地日 YYYY-MM-DD（tz 不识别时回退 UTC）。
+ * 格式化器按时区复用（lib/flight-time 的 localDateFormatter）——房控「近期用房变更」等处
+ * 一次要折上百个出发日，逐次现造格式化器是纯 CPU 浪费。
+ */
 export function fmtDepartureLocalDate(departure: Date | null, tz: string | null): string {
   if (!departure) return '';
   if (!tz) return fmtDate(departure);
+  const formatter = localDateFormatter(tz);
+  if (!formatter) return fmtDate(departure);
   try {
-    return new Intl.DateTimeFormat('en-CA', {
-      timeZone: tz,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).format(departure);
+    return formatter.format(departure);
   } catch {
     return fmtDate(departure);
   }

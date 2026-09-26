@@ -10,19 +10,77 @@
  * 落库前要按该班次自己的 tz 折回 UTC。
  */
 
+// ── 格式化器按时区复用 ─────────────────────────────────────────────────────
+// 带 timeZone 的 Intl.DateTimeFormat 每构造一次都要加载 ICU 时区数据（单次数十微秒），
+// 而订单列表序列化、出行日精筛、导出每一行都要折几次当地日 / 钟点——此前每次调用现造一个，
+// 实测一页 200 单的 serializeOrder 约 50ms，九成耗在构造格式化器上。
+// 格式化器本身不可变、无状态，复用与现造的输出逐字相同；时区串不识别时构造抛 RangeError，
+// 按 null 记住，调用方照旧走各自的 UTC 回退。缓存按时区串分键、设上限：时区只来自班次数据
+// 与业务常量，正常只有个位数，上限只防异常数据把缓存撑大（超限不再缓存，仍逐次构造）。
+const MAX_CACHED_TIME_ZONES = 64;
+
+function cachedFormatter(
+  cache: Map<string, Intl.DateTimeFormat | null>,
+  tz: string,
+  build: (tz: string) => Intl.DateTimeFormat,
+): Intl.DateTimeFormat | null {
+  const hit = cache.get(tz);
+  if (hit !== undefined) return hit;
+  let formatter: Intl.DateTimeFormat | null;
+  try {
+    formatter = build(tz);
+  } catch {
+    formatter = null;
+  }
+  if (cache.size < MAX_CACHED_TIME_ZONES) cache.set(tz, formatter);
+  return formatter;
+}
+
+const offsetFormatters = new Map<string, Intl.DateTimeFormat | null>();
+const localDateFormatters = new Map<string, Intl.DateTimeFormat | null>();
+
+function offsetFormatter(tz: string): Intl.DateTimeFormat | null {
+  return cachedFormatter(
+    offsetFormatters,
+    tz,
+    (timeZone) =>
+      new Intl.DateTimeFormat('en-US', {
+        timeZone,
+        hour12: false,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+        hour: '2-digit',
+        minute: '2-digit',
+        second: '2-digit',
+      }),
+  );
+}
+
+/**
+ * 「当地日 YYYY-MM-DD」格式化器（en-CA 年-月-日，按 tz 折算），按时区复用。
+ * tz 不识别 → null（调用方自行回退）。导出给同口径的其它模块共用，别再各自现造。
+ */
+export function localDateFormatter(tz: string): Intl.DateTimeFormat | null {
+  return cachedFormatter(
+    localDateFormatters,
+    tz,
+    (timeZone) =>
+      new Intl.DateTimeFormat('en-CA', {
+        timeZone,
+        year: 'numeric',
+        month: '2-digit',
+        day: '2-digit',
+      }),
+  );
+}
+
 /** 某个瞬间在指定 IANA 时区的 UTC 偏移（毫秒）。tz 不识别时回退 0（=按 UTC 处理）。 */
 function tzOffsetMs(at: Date, tz: string): number {
+  const formatter = offsetFormatter(tz);
+  if (!formatter) return 0;
   try {
-    const parts = new Intl.DateTimeFormat('en-US', {
-      timeZone: tz,
-      hour12: false,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-    }).formatToParts(at);
+    const parts = formatter.formatToParts(at);
     const get = (type: string) => Number(parts.find((p) => p.type === type)?.value ?? '0');
     // hour12:false 在部分引擎会把午夜给成 "24"，取模归一到 0。
     const asUtc = Date.UTC(
@@ -46,13 +104,10 @@ function tzOffsetMs(at: Date, tz: string): number {
  */
 export function localDateISO(d: Date, tz: string | null | undefined): string {
   if (!tz) return d.toISOString().slice(0, 10);
+  const formatter = localDateFormatter(tz);
+  if (!formatter) return d.toISOString().slice(0, 10);
   try {
-    return new Intl.DateTimeFormat('en-CA', {
-      timeZone: tz,
-      year: 'numeric',
-      month: '2-digit',
-      day: '2-digit',
-    }).format(d);
+    return formatter.format(d);
   } catch {
     return d.toISOString().slice(0, 10);
   }

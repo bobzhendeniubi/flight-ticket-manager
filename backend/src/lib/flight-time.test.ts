@@ -1,6 +1,12 @@
 import { describe, it, expect } from 'vitest';
 
-import { localDateISO, localHHMM, localDateTime, localToUtc } from './flight-time.js';
+import {
+  localDateFormatter,
+  localDateISO,
+  localHHMM,
+  localDateTime,
+  localToUtc,
+} from './flight-time.js';
 
 describe('flight-time · UTC → 当地钟点', () => {
   it('澳门 +8：08:40Z 的班次当地是 16:40（公测反馈里显示成 08:40 的那一条）', () => {
@@ -68,6 +74,64 @@ describe('flight-time · 当地钟点 → UTC（批量改时刻落库口径）',
   it('时刻串解析不出来 → 抛错，不静默落一个 Invalid Date 进库', () => {
     expect(() => localToUtc('2026-09-01', 'abc', 'Asia/Macau')).toThrow();
     expect(() => localToUtc('', '16:40', 'Asia/Macau')).toThrow();
+  });
+});
+
+describe('flight-time · 格式化器按时区复用（性能）不改变输出', () => {
+  it('同一时区复用同一个格式化器；不同时区互不串用', () => {
+    const macau = localDateFormatter('Asia/Macau');
+    expect(macau).not.toBeNull();
+    expect(localDateFormatter('Asia/Macau')).toBe(macau);
+    expect(localDateFormatter('Asia/Ho_Chi_Minh')).not.toBe(macau);
+  });
+
+  it('交替折算多个时区，结果与逐个现造格式化器逐字一致', () => {
+    const instants = [
+      '2026-09-01T15:59:59.000Z',
+      '2026-09-01T16:00:00.000Z',
+      '2026-09-01T16:59:59.000Z',
+      '2026-09-01T17:00:00.000Z',
+      '2026-12-31T23:30:00.000Z',
+    ].map((s) => new Date(s));
+    const zones = ['Asia/Macau', 'Asia/Ho_Chi_Minh', 'Asia/Shanghai', 'UTC'];
+    for (let round = 0; round < 2; round += 1) {
+      for (const d of instants) {
+        for (const tz of zones) {
+          const fresh = new Intl.DateTimeFormat('en-CA', {
+            timeZone: tz,
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+          }).format(d);
+          const freshParts = new Intl.DateTimeFormat('en-US', {
+            timeZone: tz,
+            hour12: false,
+            hour: '2-digit',
+            minute: '2-digit',
+          }).formatToParts(d);
+          const hh = Number(freshParts.find((p) => p.type === 'hour')!.value) % 24;
+          const mm = freshParts.find((p) => p.type === 'minute')!.value;
+          expect(localDateISO(d, tz)).toBe(fresh);
+          expect(localHHMM(d, tz)).toBe(`${String(hh).padStart(2, '0')}:${mm}`);
+        }
+      }
+    }
+  });
+
+  it('不识别的时区记成 null 后，再次调用仍回退 UTC、不抛错', () => {
+    const dep = new Date('2026-09-01T08:40:00.000Z');
+    expect(localDateFormatter('Not/AZone')).toBeNull();
+    for (let i = 0; i < 3; i += 1) {
+      expect(localDateISO(dep, 'Not/AZone')).toBe('2026-09-01');
+      expect(localHHMM(dep, 'Not/AZone')).toBe('08:40');
+    }
+    expect(localToUtc('2026-09-01', '16:40', 'Not/AZone').toISOString()).toBe(
+      '2026-09-01T16:40:00.000Z',
+    );
+  });
+
+  it('非法日期照旧抛 RangeError（与复用前一致，不被缓存吞掉）', () => {
+    expect(() => localDateISO(new Date(Number.NaN), 'Asia/Macau')).toThrow(RangeError);
   });
 });
 
