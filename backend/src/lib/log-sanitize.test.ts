@@ -56,6 +56,15 @@ describe('scrubSecrets', () => {
   it('不带 = 的问号不动（避免误伤正文里的问号）', () => {
     expect(scrubSecrets("Unexpected token '?'")).toBe("Unexpected token '?'");
   });
+
+  it('调用栈里带 query 的脚本地址：去掉参数、保留行列号', () => {
+    expect(scrubSecrets('    at f (https://admin.example.test/assets/a.js?v=1:10:20)')).toBe(
+      '    at f (https://admin.example.test/assets/a.js:10:20)',
+    );
+    expect(scrubSecrets('    at http://localhost:5174/src/App.tsx?t=1695000000:12:5')).toBe(
+      '    at http://localhost:5174/src/App.tsx:12:5',
+    );
+  });
 });
 
 describe('maskPersonalIdentifiers', () => {

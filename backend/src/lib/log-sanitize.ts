@@ -25,18 +25,19 @@ export function firstNonEmptyLine(text: string): string {
   return (line ?? '').trim();
 }
 
-// Bearer 令牌、JWT 形态、带 `=` 的 query / hash 参数（`?token=…&page=2`、`#access_token=…`）
+// Bearer 令牌、JWT 形态、带 `=` 的 query / hash 参数（`?token=…&page=2`、`#access_token=…`）。
+// query 段后面若紧跟调用栈的「:行:列」（`a.js?v=1:10:20`）则保留行列号，只去掉参数。
 const BEARER_TOKEN = /\bBearer\s+[A-Za-z0-9._~+/=-]+/gi;
 const JWT_LIKE = /\beyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+\.[A-Za-z0-9_-]*/g;
-const QUERY_WITH_PARAMS = /\?[^\s"'<>#]*=[^\s"'<>#]*/g;
-const HASH_WITH_PARAMS = /#[^\s"'<>]*=[^\s"'<>]*/g;
+const QUERY_WITH_PARAMS = /\?[^\s"'<>#()]*?=[^\s"'<>#()]*?((?::\d+){1,2})?(?=[\s"'<>#()]|$)/g;
+const HASH_WITH_PARAMS = /#[^\s"'<>()]*=[^\s"'<>()]*/g;
 
-/** 抹掉自由文本里的令牌与 URL 参数（URL 本身保留，只去掉参数段）。 */
+/** 抹掉自由文本里的令牌与 URL 参数（URL 本身与调用栈行列号保留，只去掉参数段）。 */
 export function scrubSecrets(text: string): string {
   return text
     .replace(BEARER_TOKEN, 'Bearer [redacted]')
     .replace(JWT_LIKE, '[jwt]')
-    .replace(QUERY_WITH_PARAMS, '')
+    .replace(QUERY_WITH_PARAMS, '$1')
     .replace(HASH_WITH_PARAMS, '');
 }
 
