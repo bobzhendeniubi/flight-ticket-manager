@@ -2785,6 +2785,45 @@ const SCHEDULE_ALERT_WINDOW_DAYS = 30;
 const SHARED_ODD_NEAR_DAYS = 7;
 
 /**
+ * 班次 → 计入口径乘客数，一条聚合查询算完。
+ *
+ * 此前逐班次各发一条 passenger.count（30 天窗口约 60 个班次 = 60 条带关系过滤的查询并发，
+ * 每条还要现规划一遍），会把连接池占满——房控页同时加载的销控板 / 远期视图 / 近期变更
+ * 全被排在后面一起变慢，仪表盘的提醒卡同理。
+ *
+ * 口径与逐班计数逐字一致：乘客所属订单未软删、状态 ∈ COUNTED_STATUSES，且该订单含该班次的
+ * FLIGHT 行。关系过滤 `items: { some }` 下同一订单在同一班次有多条 FLIGHT 行也只数一次人——
+ * 这里先把（班次, 订单）去重再连乘客，每位乘客只属于一张单，计数即与之相同；
+ * 一个乘客都没有的班次不出现在结果里，调用方按 0 处理。
+ *
+ * 班次 id 展开成 IN 列表而不是整个数组一个参数：数组参数在通用计划里行数只能按缺省估
+ * （实测估 192 行、实际 3900 行），会退化成逐行回表的嵌套循环；展开后按个数估，稳定走哈希连接。
+ */
+async function countSchedulePassengers(
+  client: PrismaClient,
+  scheduleIds: readonly string[],
+): Promise<Map<string, number>> {
+  const counts = new Map<string, number>();
+  if (scheduleIds.length === 0) return counts;
+  const rows = await client.$queryRaw<Array<{ scheduleId: string; paxCount: number }>>(Prisma.sql`
+    SELECT s."scheduleId", COUNT(p."id")::int AS "paxCount"
+    FROM (
+      SELECT DISTINCT oi."flightScheduleId" AS "scheduleId", oi."orderId"
+      FROM "OrderItem" oi
+      WHERE oi."kind" = 'FLIGHT'::"OrderItemKind"
+        AND oi."flightScheduleId" IN (${Prisma.join(scheduleIds)})
+    ) s
+    JOIN "Order" o ON o."id" = s."orderId"
+    JOIN "Passenger" p ON p."orderId" = o."id"
+    WHERE o."deletedAt" IS NULL
+      AND o."status" = ANY(${[...COUNTED_STATUSES]}::"OrderStatus"[])
+    GROUP BY s."scheduleId"
+  `);
+  for (const row of rows) counts.set(row.scheduleId, Number(row.paxCount));
+  return counts;
+}
+
+/**
  * 按需计算提醒线（无 cron）：
  *   - 超卖 / 富余直接复用销控板 getBoard 的展开结果，不重复口径；
  *   - 班次乘客数按导出同款 COUNTED_STATUSES 统计，对比 FlightSchedule.ticketingCap（默认 191）。
@@ -2866,18 +2905,9 @@ export async function getAlerts(
       flight: { select: { flightNumber: true } },
     },
   });
-  const paxCounts = await Promise.all(
-    schedules.map((s) =>
-      client.passenger.count({
-        where: {
-          order: {
-            deletedAt: null, // 排除已软删订单
-            status: { in: COUNTED_STATUSES },
-            items: { some: { kind: OrderItemKind.FLIGHT, flightScheduleId: s.id } },
-          },
-        },
-      }),
-    ),
+  const paxCountBySchedule = await countSchedulePassengers(
+    client,
+    schedules.map((s) => s.id),
   );
   // no-show 恢复超售：票务点「恢复回程」时余位不足、经人为确认直加 sold 的座数
   //（每一次都落了 CRITICAL 审计）。这部分超员是**已知且已批准**的，不该混在异常告警里，
@@ -2913,19 +2943,20 @@ export async function getAlerts(
   }
 
   const overCapacitySchedules: HotelControlAlerts['overCapacitySchedules'] = [];
-  schedules.forEach((s, i) => {
+  schedules.forEach((s) => {
     // 一个舱位都没配的班次 → 无库存可比，跳过（与 getScheduleSeatCapacity 同口径：
     // 这种班次本来就卖不出座，把上限当 0 会把它全部报成超员）。
     if (s.seatClasses.length === 0) return;
     const seatCapacity = s.seatClasses.reduce((sum, sc) => sum + sc.capacity, 0);
-    if (paxCounts[i] <= seatCapacity) return;
+    const paxCount = paxCountBySchedule.get(s.id) ?? 0;
+    if (paxCount <= seatCapacity) return;
     const noShowOversoldSeats = noShowOversoldBySchedule.get(s.id) ?? 0;
     // 超出量完全落在已审计放行的范围内 → 不报（这条不是异常，是批准过的动作）。
-    if (paxCounts[i] - seatCapacity <= noShowOversoldSeats) return;
+    if (paxCount - seatCapacity <= noShowOversoldSeats) return;
     overCapacitySchedules.push({
       flightNumber: s.flight.flightNumber,
       departureDate: fmtDateOnly(s.departureTime),
-      paxCount: paxCounts[i],
+      paxCount,
       noShowOversoldSeats,
       note:
         noShowOversoldSeats > 0

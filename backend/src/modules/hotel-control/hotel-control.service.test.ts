@@ -136,12 +136,10 @@ function fakeClient(opts: { paxCounts: number[]; restoredItems?: unknown[] }): P
         },
       ]),
     },
-    passenger: {
-      count: opts.paxCounts.reduce(
-        (fn, n) => fn.mockResolvedValueOnce(n),
-        vi.fn(),
-      ),
-    },
+    // 班次乘客数：一条聚合查询按班次分组返回（s1、s2 依次取 paxCounts[0]、[1]）
+    $queryRaw: vi.fn().mockResolvedValue(
+      ['s1', 's2'].map((scheduleId, i) => ({ scheduleId, paxCount: opts.paxCounts[i] })),
+    ),
   } as unknown as PrismaClient;
 }
 
@@ -189,6 +187,27 @@ describe('getAlerts', () => {
   it('乘客数恰好等于上限不报（> 才报）', async () => {
     const client = fakeClient({ paxCounts: [191, 191] });
     const alerts = await getAlerts(14, client);
+    expect(alerts.overCapacitySchedules).toEqual([]);
+  });
+
+  it('全部班次的乘客数一条聚合查询算完；查询结果里没有的班次按 0 人计', async () => {
+    const client = fakeClient({ paxCounts: [195, 100] });
+    const queryRaw = client.$queryRaw as unknown as ReturnType<typeof vi.fn>;
+    // 聚合结果只回 s1（s2 一个乘客都没有，GROUP BY 里不会出现）
+    queryRaw.mockResolvedValueOnce([{ scheduleId: 's1', paxCount: 195 }]);
+    const alerts = await getAlerts(14, client);
+    expect(queryRaw).toHaveBeenCalledTimes(1);
+    // 两个班次的 id 都在同一条查询的参数里（不是逐班发查询）
+    const sql = queryRaw.mock.calls[0][0] as { values: unknown[] };
+    expect(sql.values).toEqual(expect.arrayContaining(['s1', 's2']));
+    expect(alerts.overCapacitySchedules).toMatchObject([{ flightNumber: 'QH9589', paxCount: 195 }]);
+  });
+
+  it('窗口内没有班次 → 不发乘客数查询', async () => {
+    const client = fakeClient({ paxCounts: [] });
+    (client.flightSchedule.findMany as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
+    const alerts = await getAlerts(14, client);
+    expect(client.$queryRaw).not.toHaveBeenCalled();
     expect(alerts.overCapacitySchedules).toEqual([]);
   });
 
@@ -282,7 +301,7 @@ describe('getAlerts sharedOddNear（拼房落单临近推送）', () => {
       },
       orderItem: { findMany: vi.fn().mockResolvedValue(orderItems) },
       flightSchedule: { findMany: vi.fn().mockResolvedValue([]) },
-      passenger: { count: vi.fn().mockResolvedValue(0) },
+      $queryRaw: vi.fn().mockResolvedValue([]),
     } as unknown as PrismaClient;
   }
 
@@ -2545,7 +2564,7 @@ describe('星级随机档：销控板聚合组', () => {
         [pendingItem(3), pendingItem(3)],
       ),
       flightSchedule: { findMany: vi.fn().mockResolvedValue([]) },
-      passenger: { count: vi.fn() },
+      $queryRaw: vi.fn().mockResolvedValue([]),
     } as unknown as PrismaClient;
     const alerts = await getAlerts(2, client);
     const tierOversold = alerts.oversold.find((o) => o.hotelName === '三星随机')!;
