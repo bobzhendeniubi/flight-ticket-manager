@@ -5,6 +5,7 @@ import rateLimit from '@fastify/rate-limit';
 import sensible from '@fastify/sensible';
 import { randomUUID } from 'node:crypto';
 import { corsOrigins, env } from './config/env.js';
+import { TRUST_PROXY_HOPS } from './config/proxy.js';
 import { registerErrorHandler } from './plugins/error-handler.js';
 import { authPlugin } from './plugins/auth.js';
 import { healthRoutes } from './modules/health/health.routes.js';
@@ -73,11 +74,8 @@ export async function buildApp(): Promise<FastifyInstance> {
     },
     genReqId: (req) => (req.headers['x-request-id'] as string | undefined) ?? randomUUID(),
     disableRequestLogging: false,
-    // 只信任离我们最近的一跳反代（nginx）注入的 X-Forwarded-For；跳数必须与实际反代拓扑一致，
-    // 否则 req.ip 可能仍取到客户端可伪造的值。此前是 `true`（信任整条 XFF 链），
-    // 客户端随便追加一段自定义 XFF 就能让 req.ip 跟着变，从而绕过所有按 IP 限流
-    // （登录爆破、订单号枚举）。若未来在 nginx 前再加一层反代/CDN，这里要同步改成对应跳数。
-    trustProxy: 1,
+    // 只信任紧挨着 backend 的那一跳反代写进 X-Forwarded-For 的值；拓扑与前端 nginx 的配合见 config/proxy.ts
+    trustProxy: TRUST_PROXY_HOPS,
   });
 
   // Core plugins
