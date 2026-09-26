@@ -1,6 +1,21 @@
 import { defineConfig, loadEnv } from 'vite';
 import react from '@vitejs/plugin-react';
 import path from 'node:path';
+import { execSync } from 'node:child_process';
+
+/**
+ * 构建版本号（前端报错上报里的 buildVersion）：优先取 git short sha；
+ * Docker 多阶段构建的 builder 层没有 .git，取不到就退化用构建时间戳兜底（与 admin-web 同口径）。
+ */
+function resolveBuildId(): string {
+  try {
+    return execSync('git rev-parse --short HEAD', { stdio: ['ignore', 'pipe', 'ignore'] })
+      .toString()
+      .trim();
+  } catch {
+    return `ts-${Date.now()}`;
+  }
+}
 
 export default defineConfig(({ mode }) => {
   // 加载 .env / .env.development / .env.local 等，读取 VITE_* + 自定义前缀
@@ -9,6 +24,9 @@ export default defineConfig(({ mode }) => {
   const devPort = Number(env.VITE_DEV_PORT || 5173);
 
   return {
+    define: {
+      __APP_BUILD_ID__: JSON.stringify(resolveBuildId()),
+    },
     plugins: [react()],
     resolve: {
       alias: { '@': path.resolve(__dirname, 'src') },

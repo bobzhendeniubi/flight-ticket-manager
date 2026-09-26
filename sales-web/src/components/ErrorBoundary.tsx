@@ -7,6 +7,7 @@
  *   2. 清空购物车（localStorage ftm-cart）后刷新 —— 专治脏购物车数据
  */
 import { Component, type ErrorInfo, type ReactNode } from 'react';
+import { reportClientError } from '../lib/clientErrorReporter';
 
 interface ErrorBoundaryProps {
   children: ReactNode;
@@ -26,10 +27,12 @@ export class ErrorBoundary extends Component<ErrorBoundaryProps, ErrorBoundarySt
   }
 
   componentDidCatch(error: Error, info: ErrorInfo): void {
-    // 仅开发态输出，方便定位；生产路径不打 console（接监控时换上报）
+    // 仅开发态输出，方便定位；生产路径不打 console，改为上报后端
+    // （生产环境 React 不会把边界兜住的错误再抛给 window.onerror）
     if (import.meta.env.DEV) {
       console.error('[ErrorBoundary]', error, info.componentStack);
     }
+    reportClientError(error, { componentStack: info.componentStack });
   }
 
   private handleReload = (): void => {

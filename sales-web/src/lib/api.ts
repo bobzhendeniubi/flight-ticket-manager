@@ -7,7 +7,7 @@
  *
  * 运行时 env 不可用（静态 HTML 已编译）；若要切域名必须重新构建镜像。
  */
-const API_BASE: string = (import.meta.env?.VITE_API_BASE as string | undefined)?.trim() || '/api';
+export const API_BASE: string = (import.meta.env?.VITE_API_BASE as string | undefined)?.trim() || '/api';
 export interface ApiErrorBody {
   error: { code: string; message: string; details?: unknown };
 }
