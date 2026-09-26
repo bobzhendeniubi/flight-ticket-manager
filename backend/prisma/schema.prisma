@@ -2078,8 +2078,8 @@ model Passenger {
   // 只做搜索召回用（订单搜索 / 乘客姓名贴名单能搜到换前的人），不参与任何业务判定。
   formerIdentities     String?
   passportIssueDate    DateTime? @db.Date // 护照签发日期
-  passportIssueCountry String? // 颁发国 ISO-2，如 CHN
-  passportIssuePlace   String? // 护照签发地点（城市/机关文本，OCR 识别或手填，选填）
+  passportIssueCountry String? // 颁发国 ISO-2，如 CN
+  passportIssuePlace   String? // 护照「签发地点」栏原文（中国护照只印省份，取斜杠前中文；不是签发机关），OCR 识别或手填，选填
   passportExpiry       DateTime? @db.Date
 
   // ── 签证（已签发的，给出票/接送参考）──

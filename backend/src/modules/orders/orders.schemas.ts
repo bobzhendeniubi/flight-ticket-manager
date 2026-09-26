@@ -240,7 +240,7 @@ export const passengerInputSchema = z.object({
   chineseName: z.string().max(120).optional(),                                  // 中文姓名
   passportIssueDate: z.string().regex(/^\d{4}-\d{2}-\d{2}$/).optional(),       // 护照签发日期
   passportIssueCountry: countryCodeSchema('护照签发国').optional(),
-  passportIssuePlace: z.string().max(120).optional(),                          // 护照签发地点（城市/机关文本，OCR 或手填，选填）
+  passportIssuePlace: z.string().max(120).optional(),                          // 护照「签发地点」栏原文（不是签发机关），OCR 或手填，选填
   // 基座 schema 保持 optional：更新/补录路径（自助补录、换人等）复用同款字段规则，
   // 存量空值旧单必须还能继续编辑。**新建路径必填**，口径见
   // passengerInputWithRequiredExpirySchema（批量/OTA）与 refineRequiredPassportExpiry（下单端点）。

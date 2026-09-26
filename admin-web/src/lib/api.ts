@@ -685,7 +685,7 @@ export interface OrderPassengerInput {
   chineseName?: string;
   /** 护照签发日期 YYYY-MM-DD（可选；OCR 能识别时带出） */
   passportIssueDate?: string;
-  /** 护照签发地点（自由文本，城市/机关；可选；OCR 能识别时带出）。区别于 ISO-2 签发国。 */
+  /** 护照「签发地点」栏原文（中国护照为省份中文名；不是签发机关；可选；OCR 能识别时带出）。区别于 ISO-2 签发国。 */
   passportIssuePlace?: string;
   /** 护照有效期 YYYY-MM-DD（可选；OCR 能识别时带出） */
   passportExpiry?: string;
@@ -1410,7 +1410,7 @@ export interface OrderPassenger {
   /** 中文姓名（OCR 识别或手工填写） */
   chineseName?: string | null;
   passportIssueCountry?: string | null;
-  /** 护照签发地点（自由文本，城市/机关；区别于 ISO-2 签发国） */
+  /** 护照「签发地点」栏原文（中国护照为省份中文名；不是签发机关，也区别于 ISO-2 签发国） */
   passportIssuePlace?: string | null;
   passportExpiry?: string | null;
 
@@ -7382,7 +7382,7 @@ export interface AiOcrSuggested {
   nationality?: string;
   /** ISO-3 签发国 */
   passportIssueCountry?: string;
-  /** 护照签发地点（自由文本，城市/机关；区别于 ISO-2 签发国） */
+  /** 护照「签发地点」栏原文（中国护照为省份中文名；不是签发机关，也区别于 ISO-2 签发国） */
   passportIssuePlace?: string;
   passportExpiry?: string;    // YYYY-MM-DD
   /** 护照签发日期（可选字段）*/
