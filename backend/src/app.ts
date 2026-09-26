@@ -56,6 +56,7 @@ import { ocrRoutes } from './modules/ocr/ocr.routes.js';
 import { settingsRoutes } from './modules/settings/settings.routes.js';
 import { reportRoutes } from './modules/reports/reports.routes.js';
 import { legacyRoutes } from './modules/legacy/legacy.routes.js';
+import { clientErrorRoutes } from './modules/client-errors/client-errors.routes.js';
 import { redis } from './db/redis.js';
 
 export async function buildApp(): Promise<FastifyInstance> {
@@ -150,6 +151,8 @@ export async function buildApp(): Promise<FastifyInstance> {
   await app.register(settingsRoutes, { prefix: '/settings' });
   await app.register(reportRoutes, { prefix: '/reports' });
   await app.register(legacyRoutes, { prefix: '/legacy' });
+  // 前端报错上报（匿名、按 IP 限流、只落 warn 日志不入库）
+  await app.register(clientErrorRoutes, { prefix: '/client-errors' });
 
   // Root
   app.get('/', async () => ({
