@@ -60,9 +60,12 @@ describe('summarizeOcrError', () => {
     expect(out.errorSummary.length).toBeLessThanOrEqual(200);
   });
 
-  it('网络错误带上 cause code', () => {
+  it('网络错误带上 cause code；没有 code 时退回 cause 的消息', () => {
     const err = new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } });
     expect(summarizeOcrError(err, {})).toEqual({ errorKind: 'network', errorSummary: 'fetch failed (ECONNRESET)' });
+    const noCode = new TypeError('fetch failed', { cause: new Error('bad port') });
+    expect(summarizeOcrError(noCode, {})).toEqual({ errorKind: 'network', errorSummary: 'fetch failed (bad port)' });
+    expect(summarizeOcrError(new TypeError('fetch failed'), {}).errorSummary).toBe('fetch failed');
   });
 
   it('其它异常 → other', () => {

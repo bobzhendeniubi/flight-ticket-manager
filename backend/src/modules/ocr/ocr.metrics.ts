@@ -99,9 +99,15 @@ export function summarizeOcrError(
   const summary = sanitizeLogText(firstNonEmptyLine(errorMessage(err)), ERROR_SUMMARY_MAX_CHARS);
   if (trace.errorKind) return { errorKind: trace.errorKind, errorSummary: summary };
   if (name === 'TypeError' && /fetch failed/i.test(errorMessage(err))) {
-    const cause = (err as { cause?: { code?: unknown } }).cause;
-    const code = typeof cause?.code === 'string' ? cause.code : null;
-    return { errorKind: 'network', errorSummary: code ? `fetch failed (${code})` : 'fetch failed' };
+    // undici 把真实原因放在 cause 上：多数带 code（ENOTFOUND / ECONNREFUSED…），少数只有 message
+    const cause = (err as { cause?: { code?: unknown; message?: unknown } }).cause;
+    const detail =
+      typeof cause?.code === 'string'
+        ? cause.code
+        : typeof cause?.message === 'string' && cause.message
+          ? sanitizeLogText(firstNonEmptyLine(cause.message), 80)
+          : null;
+    return { errorKind: 'network', errorSummary: detail ? `fetch failed (${detail})` : 'fetch failed' };
   }
   return { errorKind: 'other', errorSummary: summary };
 }
