@@ -209,6 +209,7 @@ import {
   GUEST_RECORDED_BY_LABEL,
   resolveHasReturnLeg,
   splitSearchTerms,
+  canUseTrigramIndex,
   MAX_PASSENGER_NAME_TERMS,
   filterOrderIdsByDepartDate,
   deriveOrderReturnDate,
@@ -8038,19 +8039,52 @@ describe('buildOrderFilterWhere · 搜索/乘客姓名含中文名（公测反�
     });
   });
 
-  it('passengerName 多词：每个词自成一个乘客子查询、词间 OR（与「一个子查询里 OR 全部词」命中同一批单）', () => {
-    // 逐词拆开是为了让三字以上的名字各自走姓名三元组索引，不被混进来的两字名拖成整表扫；
-    // 语义不变：「有乘客命中任一词」⇔「任一词有乘客命中」。
-    const where = buildOrderFilterWhere({ passengerName: '胡建平 李康，靳李近、谢八一' });
+  // 每个乘客子查询里出现了哪些词（按出现顺序去重）
+  const termsPerPassengerSubquery = (where: ReturnType<typeof buildOrderFilterWhere>): string[][] => {
     const [clause] = where.AND as Array<{
       OR: Array<{ passengers: { some: { OR: Array<Record<string, { contains: string }>> } } }>;
     }>;
-    const termsPerSubquery = clause.OR.map((c) => [
+    return clause.OR.map((c) => [
       ...new Set(c.passengers.some.OR.map((branch) => Object.values(branch)[0].contains)),
     ]);
-    expect(termsPerSubquery).toEqual([['胡建平'], ['李康'], ['靳李近'], ['谢八一']]);
+  };
+
+  it('passengerName 多词：三字以上的名字每人一个乘客子查询、两字名合成一个，子查询间 OR（与「一个子查询里 OR 全部词」命中同一批单）', () => {
+    // 三字以上的名字逐个拆开，才能各自走姓名三元组索引，不被混进来的两字名拖成整表扫；
+    // 两字名抽不出三元组、横竖整表扫，合在一起只扫一遍。
+    // 语义不变：「有乘客命中任一词」⇔「任一词有乘客命中」，怎么分组都一样。
+    const where = buildOrderFilterWhere({ passengerName: '胡建平 李康，靳李近、谢八一 王五' });
+    expect(termsPerPassengerSubquery(where)).toEqual([['胡建平'], ['靳李近'], ['谢八一'], ['李康', '王五']]);
     // 不再在顶层挂 passengers（与其它 items / 渠道维度一样进 AND，互不覆盖）
     expect(where.passengers).toBeUndefined();
+  });
+
+  it('passengerName 全是两字名：一个乘客子查询，每个词三支字段都在', () => {
+    const where = buildOrderFilterWhere({ passengerName: '李康 王五 张三' });
+    expect(termsPerPassengerSubquery(where)).toEqual([['李康', '王五', '张三']]);
+    const [clause] = where.AND as Array<{ OR: Array<{ passengers: { some: { OR: unknown[] } } }> }>;
+    expect(clause.OR[0].passengers.some.OR).toEqual([
+      { fullName: { contains: '李康', mode: 'insensitive' } },
+      { chineseName: { contains: '李康', mode: 'insensitive' } },
+      { formerIdentities: { contains: '李康', mode: 'insensitive' } },
+      { fullName: { contains: '王五', mode: 'insensitive' } },
+      { chineseName: { contains: '王五', mode: 'insensitive' } },
+      { formerIdentities: { contains: '王五', mode: 'insensitive' } },
+      { fullName: { contains: '张三', mode: 'insensitive' } },
+      { chineseName: { contains: '张三', mode: 'insensitive' } },
+      { formerIdentities: { contains: '张三', mode: 'insensitive' } },
+    ]);
+  });
+
+  it('canUseTrigramIndex：有连续 3 个字母 / 数字（汉字算字母）才算能走三元组索引', () => {
+    expect(canUseTrigramIndex('胡建平')).toBe(true);
+    expect(canUseTrigramIndex('ZHANG')).toBe(true);
+    expect(canUseTrigramIndex('E12345678')).toBe(true);
+    expect(canUseTrigramIndex('团员1')).toBe(true);
+    expect(canUseTrigramIndex('李康')).toBe(false);
+    expect(canUseTrigramIndex('LI')).toBe(false);
+    // 标点隔开的零散字母凑不满连续 3 个，按短词处理
+    expect(canUseTrigramIndex('A.B.C')).toBe(false);
   });
 
   it('recordedBy → 下单账号显示名/邮箱任一命中；普通人名不牵连游客单', () => {

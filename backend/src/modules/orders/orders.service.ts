@@ -25596,6 +25596,15 @@ export function splitSearchTerms(search: string, limit: number = MAX_SEARCH_TERM
 }
 
 /**
+ * 这个词做「包含」匹配时能不能用上姓名三元组索引（pg_trgm）：按词里有没有连续 3 个及以上的
+ * 字母 / 数字（汉字算字母）判断。两字名这类「短词」抽不出三元组，只能整表扫。
+ * 只影响查询怎么拆，不影响命中结果。导出供单测使用。
+ */
+export function canUseTrigramIndex(term: string): boolean {
+  return /[\p{L}\p{N}]{3}/u.test(term);
+}
+
+/**
  * 单个搜索词 → OR 匹配块。字段口径：
  * - 订单号 / 联系人 / 联系电话（历史字段，保持原语义）；
  * - 乘客中/英文名（公测反馈：搜索框要能按乘客姓名搜到订单）；
@@ -25992,22 +26001,28 @@ export function buildOrderFilterWhere(
   // 词数上限用 MAX_PASSENGER_NAME_TERMS（50）而非 search 的 5——运营反馈：一次要贴一整团
   // 几十人的名单，5 个名字卡不住整团人数；这里只在 passengers 一张表上 contains，代价可控。
   //
-  // 查询形态：**每个词一个 passengers.some 子查询，词间 OR**（而不是一个子查询里 OR 全部词）。
-  // 两种写法命中的订单集合完全相同（「有乘客命中任一词」⇔「任一词有乘客命中」），但只有
-  // 逐词拆开，三个字以上的名字才能各自走乘客姓名的三元组索引：一个子查询里只要混进一个
-  // 两字名（抽不出三元组，只能整表扫），规划器就会把整团名字一起降级成整表扫、每行逐词比对。
+  // 查询形态：**能走三元组索引的词每词一个 passengers.some 子查询，其余短词合成一个子查询，
+  // 子查询之间 OR**。怎么分组命中的订单集合都完全相同（「有乘客命中任一词」⇔「任一词有乘客
+  // 命中」），分组只为性能：三个字以上的名字各自走乘客姓名的三元组索引——和两字名放进同一个
+  // 子查询的话，规划器会把整团名字一起降级成整表扫、每行逐词比对；两字名抽不出三元组，
+  // 本来就得整表扫，合成一个子查询只扫一遍，不必每个两字名各扫一遍。
   if (query.passengerName) {
     const terms = splitSearchTerms(query.passengerName, MAX_PASSENGER_NAME_TERMS);
+    const shortTerms = terms.filter((term) => !canUseTrigramIndex(term));
+    const groups = [
+      ...terms.filter(canUseTrigramIndex).map((term) => [term]),
+      ...(shortTerms.length > 0 ? [shortTerms] : []),
+    ];
     andClauses.push({
-      OR: terms.map((term) => ({
+      OR: groups.map((group) => ({
         passengers: {
           some: {
-            OR: [
-              { fullName: { contains: term, mode: 'insensitive' } },
-              { chineseName: { contains: term, mode: 'insensitive' } },
+            OR: group.flatMap((term) => [
+              { fullName: { contains: term, mode: 'insensitive' as const } },
+              { chineseName: { contains: term, mode: 'insensitive' as const } },
               // 换人 / 订正之前的旧身份：贴一整团的老名单时，已经换过人的那几位同样要被认出来。
-              { formerIdentities: { contains: term, mode: 'insensitive' } },
-            ],
+              { formerIdentities: { contains: term, mode: 'insensitive' as const } },
+            ]),
           },
         },
       })),
