@@ -61,7 +61,17 @@ echo "▶ 拉代码…"
 git pull --ff-only
 
 echo "▶ 构建并重启…"
-"${COMPOSE[@]}" up -d --build "${SERVICES[@]}"
+# 只动上面列的服务。postgres / redis 在跑就加 --no-deps：不加的话，compose 发现它们的编排配置
+# 变了（比如 postgres 加了启动参数）会在 up backend 时顺手重建它们 = 发版时数据库意外中断。
+# 数据层的配置变更按 docs/运维-监控与备份.md 找低峰单独做；它们没在跑（新机器 / 被 down 过）才一并拉起。
+UP_ARGS=(up -d --build)
+if [ -n "$("${COMPOSE[@]}" ps -q --status running postgres 2>/dev/null)" ] &&
+  [ -n "$("${COMPOSE[@]}" ps -q --status running redis 2>/dev/null)" ]; then
+  UP_ARGS+=(--no-deps)
+else
+  echo "  postgres / redis 没在跑，本次一并拉起"
+fi
+"${COMPOSE[@]}" "${UP_ARGS[@]}" "${SERVICES[@]}"
 
 echo "▶ 等待健康…"
 backend_healthy=false
@@ -99,5 +109,15 @@ docker image prune -f 2>&1 | tail -1
 echo "▶ 清理构建缓存（>24h）…"
 docker builder prune -f --filter until=24h 2>&1 | tail -1
 df -h / | awk 'NR==2 {print "  磁盘 "$3" 已用 / "$4" 可用 ("$5")"}'
+
+# 数据层有被 --no-deps 跳过的配置变更就提醒一句，免得改了参数却一直没生效
+for svc in postgres redis; do
+  want=$("${COMPOSE[@]}" config --hash "$svc" 2>/dev/null | awk '{print $2}' || true)
+  have=$(docker inspect -f '{{index .Config.Labels "com.docker.compose.config-hash"}}' \
+    "$("${COMPOSE[@]}" ps -q "$svc" 2>/dev/null || true)" 2>/dev/null || true)
+  if [ -n "$want" ] && [ -n "$have" ] && [ "$want" != "$have" ]; then
+    echo "⚠ $svc 的编排配置已变更、容器还是旧的（发版不重建数据层）：找低峰按 docs/运维-监控与备份.md 单独重建"
+  fi
+done
 
 echo "✓ 完成"
