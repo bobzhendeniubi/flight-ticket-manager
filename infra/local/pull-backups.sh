@@ -67,6 +67,37 @@ if ! verify_snapshot "$LOCAL_FILE" >/dev/null 2>&1; then
   exit 1
 fi
 
+# ── 附件（护照照片 / 收款凭证的字节）────────────────────────────────────────────
+# 照片出库后库快照里只剩 blob 引用，字节在服务器 /opt/ftm/backups/blobs（backup-blobs.sh 每天镜像）：
+# 库快照 + 附件镜像才是一套完整备份。内容寻址、只增不删 → 增量拉、不带 --delete，本地也永不删。
+# 服务器上还没有附件备份（照片出库未上线）就跳过，不算失败。
+REMOTE_BLOB_DIR="$REMOTE_DIR/blobs"
+LOCAL_BLOB_DIR="$LOCAL_DIR/blobs"
+BLOB_VERIFY_SAMPLE=20
+if $SSH_CMD "$REMOTE" "test -f $REMOTE_BLOB_DIR/.last-success"; then
+  mkdir -p "$LOCAL_BLOB_DIR"
+  rsync -a --partial --timeout=300 --bwlimit="$BWLIMIT" --exclude='*.tmp' --exclude='.probe.*' \
+    -e "$SSH_CMD" "$REMOTE:$REMOTE_BLOB_DIR/" "$LOCAL_BLOB_DIR/"
+  remote_count=$($SSH_CMD "$REMOTE" "find $REMOTE_BLOB_DIR -type f ! -name '.*' | wc -l" | tr -d ' ')
+  local_count=$(find "$LOCAL_BLOB_DIR" -type f ! -name '.*' | wc -l | tr -d ' ')
+  if [ "$local_count" -lt "$remote_count" ]; then
+    notify_fail "附件没拉全：本地 $local_count 个 < 服务器 $remote_count 个"
+    exit 1
+  fi
+  # 文件名就是内容的 sha256：抽样重算，对不上 = 拉坏了
+  bad=0
+  while IFS= read -r f; do
+    [ "$(shasum -a 256 "$f" | cut -d' ' -f1)" = "$(basename "$f")" ] || bad=$((bad + 1))
+  done < <(find "$LOCAL_BLOB_DIR" -type f ! -name '.*' | sort -R | head -n "$BLOB_VERIFY_SAMPLE")
+  if [ "$bad" -gt 0 ]; then
+    notify_fail "附件抽样校验有 $bad 个文件内容与哈希不符"
+    exit 1
+  fi
+  echo "[backup-pull] $(date '+%F %T') 附件 ok: $local_count 个文件（服务器 $remote_count）$(du -sh "$LOCAL_BLOB_DIR" | cut -f1)"
+else
+  echo "[backup-pull] $(date '+%F %T') 服务器还没有附件备份（照片出库未上线），跳过"
+fi
+
 find "$LOCAL_DIR" \( -name 'ftm_*.sql.gz' -o -name 'ftm_*.dump' \) -mtime +"$RETAIN_DAYS" -delete
 COUNT=$(find "$LOCAL_DIR" \( -name 'ftm_*.sql.gz' -o -name 'ftm_*.dump' \) | wc -l | tr -d ' ')
 echo "[backup-pull] $(date '+%F %T') ok: $(basename "$LOCAL_FILE") ($(du -h "$LOCAL_FILE" | cut -f1))，本地共 $COUNT 份"
