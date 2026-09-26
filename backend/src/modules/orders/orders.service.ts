@@ -4977,49 +4977,23 @@ export class OrderService {
     requester: OrderRequester,
   ): Promise<Prisma.OrderWhereInput> {
     // 代理不能按 legFlag 筛：那是内部航段口径，能筛就能反推（见 withoutAgentHiddenFilters）。
-    const where = buildOrderFilterWhere(
-      requester.role === 'AGENT' ? withoutAgentHiddenFilters(query) : query,
-    );
+    const filters = requester.role === 'AGENT' ? withoutAgentHiddenFilters(query) : query;
 
     // RBAC 过滤 — 先建基准可见集合，再按 query 过滤（但 query.agentId 不能覆盖可见集合）
-    if (requester.role === 'CUSTOMER') {
-      where.userId = requester.userId;
-    } else if (requester.role === 'AGENT') {
-      const visibleAgentIds = await this.getDescendantAgentIds(requester.agentId);
-      if (query.agentId) {
-        // agentId 过滤 — 必须在可见集合内才生效，否则 403（防横向越权）
-        if (!visibleAgentIds.includes(query.agentId)) {
-          throw new ForbiddenError('无权查看该代理的订单');
-        }
-        // where.agentId 已由 buildOrderFilterWhere 设为 query.agentId
-      } else {
-        where.agentId = { in: visibleAgentIds };
+    let visibleAgentIds: string[] | null = null;
+    if (requester.role === 'AGENT') {
+      visibleAgentIds = await this.getDescendantAgentIds(requester.agentId);
+      // agentId 过滤 — 必须在可见集合内才生效，否则 403（防横向越权）
+      if (query.agentId && !visibleAgentIds.includes(query.agentId)) {
+        throw new ForbiddenError('无权查看该代理的订单');
       }
     }
-    // ADMIN/STAFF: 无额外过滤；query.agentId（如有）已由 buildOrderFilterWhere 设置
-
-    if (query.claimedById) where.claimedById = query.claimedById;
-    if (query.unclaimedOnly) where.claimedById = null;
-
-    // 票务快捷导出面板的预览专用：与票务模板导出剔单同口径（EXPORT_RELEASED_STATUSES，
-    // 见 orders.export-selection.ts 的同名常量，这里不反向 import 以免与该文件的既有依赖方向
-    // 成环，两处状态集合需同步维护）。缺省/false 不加这条，列表默认行为不变。
-    if (query.excludeReleased) {
-      const releasedStatusGuard: Prisma.OrderWhereInput = {
-        status: {
-          notIn: [
-            OrderStatus.CANCELLED,
-            OrderStatus.REFUND_REQUESTED,
-            OrderStatus.REFUNDED,
-            OrderStatus.PAYMENT_TIMEOUT,
-            OrderStatus.FAILED,
-          ],
-        },
-      };
-      const and = Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : [];
-      and.push(releasedStatusGuard);
-      where.AND = and;
-    }
+    const where = this.scopeListOrdersWhere(
+      buildOrderFilterWhere(filters),
+      query,
+      requester,
+      visibleAgentIds,
+    );
 
     // 出行日期 / 返程日期精确细筛（两段式）：buildOrderFilterWhere 的 travelFrom/travelTo、
     // returnFrom/returnTo 都只做 ±1 天粗窗口（防 UTC/本地日边界漏单），会把「去程 7/10、回程
@@ -5096,9 +5070,67 @@ export class OrderService {
         );
         preciseIds = preciseIds.filter((id) => legBound.has(id));
       }
-      where.id = { in: preciseIds };
+      // 精筛命中集合是在上面**完整** where（含日期 / 航班号粗窗口）下圈出的候选里再收窄的，
+      // 且每条精筛都比对应的粗窗口更严（整单出发日落在区间 ⇒ 某个锚点落在 ±1 天窗口内；
+      // 航段绑定的航班号 ⇒ 订单含该航班号的机票行），所以分页 / 计数 / 统计只需「其余筛选 +
+      // id ∈ 命中集合」，粗窗口那几条 items 子查询不必再跑一遍——同一批数据上结果完全相同。
+      // 而它们留着有实害：「粗窗口子查询 + 几十上百个 id 的 IN 列表」在 Prisma 预编译语句
+      // 第 6 次执行起转通用计划时会退化成逐行回表的嵌套循环（实测 1.7ms → 28ms）。
+      const preciseWhere = this.scopeListOrdersWhere(
+        buildOrderFilterWhere(withoutTravelDateFilters(filters)),
+        query,
+        requester,
+        visibleAgentIds,
+      );
+      preciseWhere.id = { in: preciseIds };
+      return preciseWhere;
     }
 
+    return where;
+  }
+
+  /**
+   * 列表 where 的「谁能看 + 接单 + 预览剔单」三层叠加（resolveListOrdersWhere 专用；
+   * 在筛选 where 上原地叠加后返回同一对象）。
+   * @param visibleAgentIds AGENT 的可见代理集合（自己 + 下级）；其余角色传 null。
+   */
+  private scopeListOrdersWhere(
+    where: Prisma.OrderWhereInput,
+    query: ListOrdersQuery,
+    requester: OrderRequester,
+    visibleAgentIds: string[] | null,
+  ): Prisma.OrderWhereInput {
+    if (requester.role === 'CUSTOMER') {
+      where.userId = requester.userId;
+    } else if (requester.role === 'AGENT' && !query.agentId) {
+      // 点名了 agentId 时 where.agentId 已由 buildOrderFilterWhere 设为 query.agentId
+      //（越权与否已在调用方校验）；没点名则收口到可见集合。
+      where.agentId = { in: visibleAgentIds ?? [] };
+    }
+    // ADMIN/STAFF: 无额外过滤；query.agentId（如有）已由 buildOrderFilterWhere 设置
+
+    if (query.claimedById) where.claimedById = query.claimedById;
+    if (query.unclaimedOnly) where.claimedById = null;
+
+    // 票务快捷导出面板的预览专用：与票务模板导出剔单同口径（EXPORT_RELEASED_STATUSES，
+    // 见 orders.export-selection.ts 的同名常量，这里不反向 import 以免与该文件的既有依赖方向
+    // 成环，两处状态集合需同步维护）。缺省/false 不加这条，列表默认行为不变。
+    if (query.excludeReleased) {
+      const releasedStatusGuard: Prisma.OrderWhereInput = {
+        status: {
+          notIn: [
+            OrderStatus.CANCELLED,
+            OrderStatus.REFUND_REQUESTED,
+            OrderStatus.REFUNDED,
+            OrderStatus.PAYMENT_TIMEOUT,
+            OrderStatus.FAILED,
+          ],
+        },
+      };
+      const and = Array.isArray(where.AND) ? where.AND : where.AND ? [where.AND] : [];
+      and.push(releasedStatusGuard);
+      where.AND = and;
+    }
     return where;
   }
 
@@ -25660,6 +25692,26 @@ export function withoutAgentHiddenFilters<T extends OrderListFilters>(query: T):
   if (query.legFlag == null) return query;
   const next = { ...query };
   delete next.legFlag;
+  return next;
+}
+
+/**
+ * 去掉「出行 / 返程 / 航班日期 + 航班号」这几条粗窗口筛选，其余筛选原样保留。
+ *
+ * 只给列表的精筛路径用（resolveListOrdersWhere）：带日期维度时，命中集合已经在含粗窗口的
+ * 完整 where 下圈出、再在内存里按整单出发日 / 返程日 / 航段精筛过，精筛结论比粗窗口严，
+ * 分页与计数只需「其余筛选 + id ∈ 命中集合」，不必再让数据库把粗窗口的 items 子查询跑一遍。
+ * 航班号一并去掉：它与日期同给时由精筛按航段收口（航段是该航班号 ⇒ 订单含该航班号的机票行）。
+ */
+export function withoutTravelDateFilters<T extends OrderListFilters>(query: T): T {
+  const next = { ...query };
+  delete next.travelFrom;
+  delete next.travelTo;
+  delete next.returnFrom;
+  delete next.returnTo;
+  delete next.flightDateFrom;
+  delete next.flightDateTo;
+  delete next.flightNumber;
   return next;
 }
 

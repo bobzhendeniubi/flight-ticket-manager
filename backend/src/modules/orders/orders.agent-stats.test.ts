@@ -294,4 +294,45 @@ describe('OrderService.getAgentStats · 与列表同一份 where（筛选 + RBAC
     expect(mockPrisma.order.findMany).toHaveBeenCalledTimes(1);
     expect(lastGroupByWhere().id).toEqual({ in: ['o-hit'] });
   });
+
+  it('精筛之后只按「其余筛选 + RBAC + id ∈ 命中」聚合：粗窗口子查询在圈候选时跑过一次，不再重复', async () => {
+    mockPrisma.order.findMany.mockResolvedValue([
+      {
+        id: 'o-hit',
+        items: [
+          {
+            hotelCheckIn: null,
+            visaIntendedDate: null,
+            flightScheduleId: 'sch-1',
+            flightSchedule: {
+              departureTime: new Date('2026-09-03T01:00:00Z'),
+              departureTz: 'Asia/Macau',
+              flight: { flightNumber: 'QH9588' },
+            },
+          },
+        ],
+      },
+    ]);
+
+    await service.getAgentStats(
+      q({ travelFrom: '2026-09-03', travelTo: '2026-09-03', flightNumber: 'QH9588', kind: 'FLIGHT', passengerName: '王小明' }),
+      { userId: 'u-agent', role: 'AGENT', agentId: 'agt-self' },
+    );
+
+    // 圈候选：完整 where（粗窗口 + 航班号 + 其余筛选 + RBAC）
+    const candidateWhere = (mockPrisma.order.findMany.mock.calls[0]?.[0] as { where: Where }).where;
+    const candidateItems = (candidateWhere.AND ?? []).filter((c) => 'items' in c);
+    expect(candidateItems).toHaveLength(3); // kind + 出行日期粗窗口 + 航班号
+    expect(candidateWhere.agentId).toEqual({ in: ['agt-self', 'agt-child'] });
+
+    // 聚合：其余筛选与 RBAC 原样保留，粗窗口 / 航班号子查询不再带，改由 id ∈ 命中收口
+    const where = lastGroupByWhere();
+    expect(where.id).toEqual({ in: ['o-hit'] });
+    expect(where.deletedAt).toBeNull();
+    expect(where.agentId).toEqual({ in: ['agt-self', 'agt-child'] });
+    expect(where.AND).toContainEqual({ items: { some: { kind: 'FLIGHT' } } });
+    expect((where.AND ?? []).filter((c) => 'items' in c)).toHaveLength(1);
+    expect((where.AND ?? []).some((c) => JSON.stringify(c).includes('王小明'))).toBe(true);
+    expect(where.AND).toContainEqual({ status: { in: ['PAID', 'TICKETED', 'COMPLETED'] } });
+  });
 });
