@@ -604,6 +604,35 @@ export class FulfillmentService {
     };
   }
 
+  /**
+   * 送签人数统计（签证台对数条）：按**整个筛选范围**算（不是当前页），乘客级口径——
+   * 只数非自备签乘客（签证岗的数=要办的人，自备签的人不显示也不计入）。
+   * 「已送签人数」即签证岗线下送签总数，两边必须恒等（2026-08-30 拍板的对数恒等式）。
+   */
+  private async visaPassengerStats(
+    where: Prisma.FulfillmentTaskWhereInput,
+  ): Promise<{ pending: number; inProgress: number; confirmed: number }> {
+    const matchedTaskOrders = await prisma.fulfillmentTask.findMany({
+      where,
+      select: { orderItem: { select: { orderId: true } } },
+    });
+    const statOrderIds = [...new Set(matchedTaskOrders.map((t) => t.orderItem.orderId))];
+    const grouped = statOrderIds.length
+      ? await prisma.passenger.groupBy({
+          by: ['visaSubmissionStatus'],
+          where: { orderId: { in: statOrderIds }, visaExempt: false },
+          _count: { _all: true },
+        })
+      : [];
+    const countOf = (s: VisaSubmissionStatus) =>
+      grouped.find((g) => g.visaSubmissionStatus === s)?._count._all ?? 0;
+    return {
+      pending: countOf(VisaSubmissionStatus.PENDING),
+      inProgress: countOf(VisaSubmissionStatus.IN_PROGRESS),
+      confirmed: countOf(VisaSubmissionStatus.CONFIRMED),
+    };
+  }
+
   async list(query: ListFulfillmentQuery) {
     // 父订单已软删 / 落入取消族（见 COUNTED_STATUSES）时不进列表——
     // 签证台等运营看板不应残留已取消/已删订单的任务。
@@ -645,7 +674,10 @@ export class FulfillmentService {
     // 旧实现在每行 task 的 order include 里嵌套 passengers[] + 关系排序的最早机票子查询，
     // 一页 200 条会放大成 200× 相关子查询（Prisma 对「嵌套关系排序 + take」逐父发查询 = N+1），
     // 且非签证任务也会白拉整单乘客。现改为：主查询只取轻量标量，出发日 / 乘客各用 1 条批量查询按 orderId 合并。
-    const [rows, total] = await prisma.$transaction([
+    // 当前页、总数、送签人数统计三条彼此独立，并发跑（各占一条连接）：此前页与总数在同一个
+    // 批量事务里串行、统计又排在页数据全部取完之后，签证台耗时是三者之和。批量事务默认读已
+    // 提交，几条语句本来就各取各的快照，串行并不带来额外一致性。
+    const [rows, total, passengerStats] = await Promise.all([
       prisma.fulfillmentTask.findMany({
         where,
         include: {
@@ -678,6 +710,9 @@ export class FulfillmentService {
         skip: (query.page - 1) * query.pageSize,
       }),
       prisma.fulfillmentTask.count({ where }),
+      query.type === FulfillmentType.VISA_APPLICATION
+        ? this.visaPassengerStats(where)
+        : Promise.resolve(null),
     ]);
 
     // 本页涉及的订单集合（去重）——用于批量取乘客 + 最早出发日
@@ -786,32 +821,6 @@ export class FulfillmentService {
       if (row.visaIntendedDate && !visaAnchorByOrder.has(row.orderId)) {
         visaAnchorByOrder.set(row.orderId, row.visaIntendedDate.toISOString().slice(0, 10));
       }
-    }
-
-    // 送签人数统计（签证台对数条）：按**整个筛选范围**算（不是当前页），乘客级口径——
-    // 只数非自备签乘客（签证岗的数=要办的人，自备签的人不显示也不计入）。
-    // 「已送签人数」即签证岗线下送签总数，两边必须恒等（2026-08-30 拍板的对数恒等式）。
-    let passengerStats: { pending: number; inProgress: number; confirmed: number } | null = null;
-    if (query.type === FulfillmentType.VISA_APPLICATION) {
-      const matchedTaskOrders = await prisma.fulfillmentTask.findMany({
-        where,
-        select: { orderItem: { select: { orderId: true } } },
-      });
-      const statOrderIds = [...new Set(matchedTaskOrders.map((t) => t.orderItem.orderId))];
-      const grouped = statOrderIds.length
-        ? await prisma.passenger.groupBy({
-            by: ['visaSubmissionStatus'],
-            where: { orderId: { in: statOrderIds }, visaExempt: false },
-            _count: { _all: true },
-          })
-        : [];
-      const countOf = (s: VisaSubmissionStatus) =>
-        grouped.find((g) => g.visaSubmissionStatus === s)?._count._all ?? 0;
-      passengerStats = {
-        pending: countOf(VisaSubmissionStatus.PENDING),
-        inProgress: countOf(VisaSubmissionStatus.IN_PROGRESS),
-        confirmed: countOf(VisaSubmissionStatus.CONFIRMED),
-      };
     }
 
     return {
