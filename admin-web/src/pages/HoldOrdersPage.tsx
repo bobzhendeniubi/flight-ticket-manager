@@ -29,6 +29,7 @@ import { useAuth } from '../stores/auth';
 import { HOLD_STATUS_META, holdStatusBadgeClass, holdStatusLabel } from '../lib/orderStatus';
 import { useDialogA11y } from '../components/Modal';
 import { useConfirm } from '../components/ConfirmDialog';
+import { useDebouncedValue } from '../hooks/useDebouncedValue';
 
 const CABINS: CabinClass[] = ['ECONOMY', 'PREMIUM_ECONOMY', 'BUSINESS', 'FIRST'];
 /** 建单可选班次与默认筛选窗口都是「今天起 60 天」，与班次拉取的 horizon 一致。 */
@@ -686,17 +687,49 @@ function CreateHoldModal({
   const singleLeg = legs.length === 1;
   // 收款计划按第一段（通常是去程）生成；多航段时各段在服务端各自按同一套期次结构算钱，
   // 金额用各段自己的锁价。截止日只在单航段时开放手调，多航段建单后可在期表里逐单调整。
+  //
+  // 价格/座位数都是弹窗里直接打字调整的输入框，改一版前没有防抖：实测 6 分钟内连发 23 次
+  // 预览请求全 400（座位清空重打时 Number('') 会经过 0、价格打到一半可能带小数点，
+  // 这些中间态本来就不是合法请求体）。防抖 400ms 到停手才发；仍然明显不完整的中间态
+  // （没选定班次/价格非数或负数/座位非整数或 < 1）直接跳过，连请求都不发。
+  const previewDraft = useMemo(
+    () => ({
+      scheduleId: firstLeg?.scheduleId,
+      cabin: firstLeg?.cabin,
+      price: firstLeg?.price,
+      seats,
+      mode,
+    }),
+    [firstLeg?.scheduleId, firstLeg?.cabin, firstLeg?.price, seats, mode],
+  );
+  const debouncedPreviewDraft = useDebouncedValue(previewDraft, 400);
   useEffect(() => {
-    if (!tokens || !firstLeg?.scheduleId || seats < 1 || firstLeg.price < 0) return;
+    const { scheduleId, cabin, price, seats: draftSeats, mode: draftMode } = debouncedPreviewDraft;
+    if (
+      !tokens ||
+      !scheduleId ||
+      !cabin ||
+      price == null ||
+      !Number.isFinite(price) ||
+      price < 0 ||
+      !Number.isInteger(draftSeats) ||
+      draftSeats < 1
+    ) {
+      // 回到不完整中间态：清掉旧计划行，也别让上一轮的失败提示继续挂着。
+      setPlanRows([]);
+      setFormError(null);
+      return;
+    }
     let cancelled = false;
     setPlanLoading(true);
     setFormError(null);
-    api.previewHoldPlan(tokens.accessToken, { flightScheduleId: firstLeg.scheduleId, cabin: firstLeg.cabin, seats, perSeatPriceCny: firstLeg.price, mode })
+    api.previewHoldPlan(tokens.accessToken, { flightScheduleId: scheduleId, cabin, seats: draftSeats, perSeatPriceCny: price, mode: draftMode })
+      // 防抖后才真正发出的这个请求失败，才是用户该看到的错误——不会再被打字中间态刷屏。
       .then((result) => { if (!cancelled) { setPlanRows(result.plan.installments); setDueDates({}); } })
       .catch((err) => { if (!cancelled) { setPlanRows([]); setFormError(err instanceof Error ? err.message : '收款计划预览失败'); } })
       .finally(() => { if (!cancelled) setPlanLoading(false); });
     return () => { cancelled = true; };
-  }, [tokens, firstLeg?.scheduleId, firstLeg?.cabin, firstLeg?.price, seats, mode]);
+  }, [tokens, debouncedPreviewDraft]);
 
   const visibleRows = planRows.map((row) => ({ ...row, key: String(row.seq), dueDate: dueDates[String(row.seq)] ?? row.dueDate }));
   const nearDepartureLegs = legs.filter((leg) => {
