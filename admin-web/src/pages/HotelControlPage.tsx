@@ -177,6 +177,10 @@ const STICKY_COL2 = 'sticky left-[11rem] z-10 min-w-[3.5rem] bg-white';
 export function HotelControlPage() {
   const tokens = useAuth((s) => s.tokens);
   const token = tokens?.accessToken ?? '';
+  // 路由已用 <Protected adminOnly> 挡住 AGENT，这里的 /board /forward 只有 ADMIN/STAFF 打得通
+  // （见 hotel-control.routes.ts 的 requireStaff）。角色闸再加一层做兜底：万一路由改动疏漏，
+  // 或 access token 在角色变更（如代理转岗）后仍带旧 claim，也不至于打一个必 403 的请求。
+  const isOps = useAuth((s) => s.user?.role === 'ADMIN' || s.user?.role === 'STAFF');
   const [searchParams, setSearchParams] = useSearchParams();
 
   const [from, setFrom] = useState<string>(todayStr());
@@ -226,7 +230,7 @@ export function HotelControlPage() {
   }, [searchParams]);
 
   useEffect(() => {
-    if (!token || !from || !to || from > to) return;
+    if (!token || !isOps || !from || !to || from > to) return;
     let cancelled = false;
     setLoading(true);
     setError(null);
@@ -243,7 +247,7 @@ export function HotelControlPage() {
         if (!cancelled) setLoading(false);
       });
     return () => { cancelled = true; };
-  }, [token, from, to, boardNonce]);
+  }, [token, isOps, from, to, boardNonce]);
 
   return (
     <div className="space-y-6">

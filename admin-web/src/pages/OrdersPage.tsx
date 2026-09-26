@@ -15734,8 +15734,11 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
 
   // 机票结算价日历提示：选定航段后查每人日历价（只展示，不灌值）。查不到/出错静默留空——
   // 这只是给运营看的参考数，取价权威在服务端，前端拿不到也不影响建单。
+  // /flight-settlement-rates 后端只放行 ADMIN/STAFF（见 flight-settlement-rates.routes.ts）；
+  // 代理批量录单也会走到这个 modal（isAgentUser 结算价输入框对代理开放），选完航段必 403。
+  // 按角色直接不发请求，代理侧维持"日历未维护"的兜底文案（留空 = 按动态定价），不影响录单。
   useEffect(() => {
-    if (!token || selectedLegs.length === 0) {
+    if (!token || !isOps || selectedLegs.length === 0) {
       setFlightCalendarHint([]);
       return;
     }
@@ -15766,7 +15769,7 @@ function BatchCreateModal({ onClose, onCreated }: { onClose: () => void; onCreat
     return () => {
       cancelled = true;
     };
-  }, [token, selectedLegs]);
+  }, [token, isOps, selectedLegs]);
 
   // 日历每人价合计（往返 = 去程 + 回程）。任一航段没维护价 → null，服务端同样不会自动取价。
   const calendarTotalPerPax = useMemo(() => {
