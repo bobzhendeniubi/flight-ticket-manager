@@ -5,6 +5,7 @@ import { StaffRole, UserRole } from '@prisma/client';
 import { env } from '../config/env.js';
 import { AppError, ForbiddenError, UnauthorizedError } from '../lib/errors.js';
 import { hasFinanceAccess } from '../lib/finance-access.js';
+import { classifyJwtVerifyFailure, noteRequestFailure } from '../lib/request-failure-log.js';
 import { prisma } from '../db/prisma.js';
 
 export interface AccessTokenPayload {
@@ -106,7 +107,9 @@ export const authPlugin = fp(async function authPlugin(app: FastifyInstance) {
   app.decorate('authenticate', async function authenticate(req, _reply) {
     try {
       await req.jwtVerify();
-    } catch {
+    } catch (err) {
+      // 记下令牌问题分类（没带 / 过期 / 无效）：失败日志据此把正常续期流程降为 info，401 响应不变
+      noteRequestFailure(req, { authFailure: classifyJwtVerifyFailure(err) });
       throw new UnauthorizedError('Invalid or expired access token');
     }
     // 这些路由本就要求登录 → 停用账号的存量 token 硬拒绝（401）。
@@ -138,7 +141,8 @@ export const authPlugin = fp(async function authPlugin(app: FastifyInstance) {
     // jwtVerify() populates req.user on success.
     try {
       await req.jwtVerify();
-    } catch {
+    } catch (err) {
+      noteRequestFailure(req, { authFailure: classifyJwtVerifyFailure(err) });
       throw new UnauthorizedError('Invalid or expired access token');
     }
     // 口径：停用账号经 optionalAuthenticate = 降级为匿名，而非硬 401。
