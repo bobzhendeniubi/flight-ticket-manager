@@ -2495,6 +2495,123 @@ function buildDateRange(from: string, to: string): string[] {
   return dates;
 }
 
+/**
+ * 销控板的一条占房行。形状与原先 orderItem.findMany 的嵌套 select 逐字段相同，下游的分组 /
+ * 逐日展开 / 物理间数算法不用改一行。metadata 只带下游真正读的三个键（见 loadBoardItems）。
+ */
+export interface BoardOccupancyItem {
+  id: string;
+  hotelCheckIn: Date | null;
+  hotelCheckOut: Date | null;
+  roomsBilled: Prisma.Decimal | null;
+  metadata: { roomsNeeded: unknown; rooms: unknown; splitPairKey: unknown } | null;
+  randomStarTier: number | null;
+  hotelRoomType: {
+    hotelId: string;
+    hotel: {
+      name: string;
+      starRating: number;
+      intlFiveStar: boolean;
+      randomTierPlaceholder: number | null;
+    };
+  } | null;
+  order: {
+    id: string;
+    roomAssignment: Prisma.JsonValue;
+    passengers: Array<{ gender: Gender | null }>;
+  };
+}
+
+/** loadBoardItems 的原始行（列名即 SQL 别名）。单测按这个形状造数据。*/
+export interface BoardOccupancyRow {
+  id: string;
+  hotelCheckIn: Date | null;
+  hotelCheckOut: Date | null;
+  roomsBilled: Prisma.Decimal | null;
+  randomStarTier: number | null;
+  /** metadata 是不是 JSON 对象（非对象 / 空 → 下游一律当没填，与读整列时等价）。*/
+  metaIsObject: boolean | null;
+  metaRoomsNeeded: unknown;
+  metaRooms: unknown;
+  metaSplitPairKey: unknown;
+  rtHotelId: string | null;
+  hotelName: string | null;
+  starRating: number | null;
+  intlFiveStar: boolean | null;
+  randomTierPlaceholder: number | null;
+  orderId: string;
+  roomAssignment: Prisma.JsonValue;
+  /** 订单出行人性别，按行物理顺序（与原嵌套查询取回的顺序一致；拼房性别取第一位 M/F）。*/
+  genders: Array<string | null> | null;
+}
+
+/**
+ * 销控板占房行取数：一条 SQL 连出订单行 + 房型 / 酒店 + 订单分房表 + 出行人性别。
+ *
+ * 此前是 orderItem.findMany 的三层嵌套 select：Prisma 拆成 5 条查询，其中订单、乘客两条
+ * 各带上千个 id 的 IN 列表，每行还整列取回 metadata（套餐行近 1KB JSON）。销控板、远期视图、
+ * 提醒线三个接口都走这里，房控页一打开就是三遍。现在一条查询取完，metadata 只取下游
+ * 真正读的三个键：roomsNeeded / rooms（itemRoomCount 回落）与 splitPairKey（拆单配对）——
+ * 值原样是 JSON（数字仍是数字、字符串仍是字符串），非对象的 metadata 在下游本就等同没填。
+ */
+export async function loadBoardItems(
+  client: PrismaClient,
+  fromD: Date,
+  toD: Date,
+): Promise<BoardOccupancyItem[]> {
+  const rows = await client.$queryRaw<BoardOccupancyRow[]>(Prisma.sql`
+    SELECT oi."id", oi."hotelCheckIn", oi."hotelCheckOut", oi."roomsBilled", oi."randomStarTier",
+           jsonb_typeof(oi."metadata") = 'object' AS "metaIsObject",
+           oi."metadata" -> 'roomsNeeded' AS "metaRoomsNeeded",
+           oi."metadata" -> 'rooms' AS "metaRooms",
+           oi."metadata" -> 'splitPairKey' AS "metaSplitPairKey",
+           rt."hotelId" AS "rtHotelId", h."name" AS "hotelName", h."starRating",
+           h."intlFiveStar", h."randomTierPlaceholder",
+           o."id" AS "orderId", o."roomAssignment", g."genders"
+    FROM "OrderItem" oi
+    JOIN "Order" o ON o."id" = oi."orderId"
+    LEFT JOIN "HotelRoomType" rt ON rt."id" = oi."hotelRoomTypeId"
+    LEFT JOIN "Hotel" h ON h."id" = rt."hotelId"
+    LEFT JOIN LATERAL (
+      SELECT array_agg(p."gender"::text ORDER BY p."ctid") AS "genders"
+      FROM "Passenger" p
+      WHERE p."orderId" = o."id"
+    ) g ON true
+    WHERE (oi."hotelRoomTypeId" IS NOT NULL OR oi."randomStarTier" IS NOT NULL)
+      AND oi."hotelCheckIn" <= ${fmtDateOnly(toD)}::date
+      AND oi."hotelCheckOut" > ${fmtDateOnly(fromD)}::date
+      AND o."deletedAt" IS NULL
+      AND o."status" = ANY(${[...COUNTED_STATUSES]}::"OrderStatus"[])
+  `);
+  return rows.map((r) => ({
+    id: r.id,
+    hotelCheckIn: r.hotelCheckIn,
+    hotelCheckOut: r.hotelCheckOut,
+    roomsBilled: r.roomsBilled,
+    metadata: r.metaIsObject
+      ? { roomsNeeded: r.metaRoomsNeeded, rooms: r.metaRooms, splitPairKey: r.metaSplitPairKey }
+      : null,
+    randomStarTier: r.randomStarTier,
+    hotelRoomType:
+      r.rtHotelId == null
+        ? null
+        : {
+            hotelId: r.rtHotelId,
+            hotel: {
+              name: r.hotelName as string,
+              starRating: r.starRating as number,
+              intlFiveStar: r.intlFiveStar as boolean,
+              randomTierPlaceholder: r.randomTierPlaceholder,
+            },
+          },
+    order: {
+      id: r.orderId,
+      roomAssignment: r.roomAssignment,
+      passengers: (r.genders ?? []).map((gender) => ({ gender: gender as Gender | null })),
+    },
+  }));
+}
+
 export async function getBoard(
   range: { from: string; to: string },
   client: PrismaClient = defaultPrisma,
@@ -2520,45 +2637,10 @@ export async function getBoard(
     },
   });
 
-  // 占房订单行：一次 findMany 拉全范围内相关行，再在 JS 里按天展开（无逐日查询）
+  // 占房订单行：一条查询拉全范围内相关行，再在 JS 里按天展开（无逐日查询）
   // 入住区间 [checkIn, checkOut) 与 [from, to] 有交集 ⇔ checkIn <= to && checkOut > from
   // 两类占房行：盖了房型的（归具体酒店）+ 未落位随机单（randomStarTier 非空，归随机档聚合组）。
-  const items = await client.orderItem.findMany({
-    where: {
-      OR: [{ hotelRoomTypeId: { not: null } }, { randomStarTier: { not: null } }],
-      hotelCheckIn: { lte: toD },
-      hotelCheckOut: { gt: fromD },
-      order: countedOrderWhere(),
-    },
-    select: {
-      // id：房组归属过滤（expandAssignedPhysicalByDate）的坐标系；酒店名已在 hotelRoomType 里
-      id: true,
-      hotelCheckIn: true,
-      hotelCheckOut: true,
-      roomsBilled: true,
-      metadata: true,
-      randomStarTier: true,
-      hotelRoomType: {
-        select: {
-          hotelId: true,
-          hotel: {
-            select: {
-              name: true,
-              starRating: true,
-              intlFiveStar: true,
-              randomTierPlaceholder: true,
-            },
-          },
-        },
-      },
-      // roomAssignment = 权威分房表（优先直计物理间数，订单级去重需 id）；
-      // passengers.gender = fallback 拼房性别推算（异性不能拼一间）——拼房单恒为
-      // adultCount===1 的套餐单，取其出行人性别；批量随主查带回，不额外查库。
-      order: {
-        select: { id: true, roomAssignment: true, passengers: { select: { gender: true } } },
-      },
-    },
-  });
+  const items = await loadBoardItems(client, fromD, toD);
 
   // 具体酒店分组 = 有周期的 ∪ 有占房的。两类**一律跳过**（随机档已改为同星级酒店的派生聚合，
   // 再把它们的 rooms 计进来就是第二本账；数据保留供审计，读路径不认）：

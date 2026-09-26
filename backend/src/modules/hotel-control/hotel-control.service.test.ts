@@ -24,6 +24,7 @@ afterAll(() => vi.useRealTimers());
 
 import type { Gender, PrismaClient } from '@prisma/client';
 import { businessDateISO } from '../../lib/business-time.js';
+import type { BoardOccupancyRow } from './hotel-control.service.js';
 
 /** 拼房单出行人性别 fixture：单出行人套餐单的 order.passengers 形状（gender 明确类型，避免 string 收窄丢失）。*/
 const solo = (gender: Gender | null): { order: { passengers: { gender: Gender | null }[] } } => ({
@@ -79,6 +80,68 @@ const todayMs = new Date(`${todayStr}T00:00:00.000Z`).getTime();
 const day = (n: number): Date => new Date(todayMs + n * DAY_MS);
 const dayStr = (n: number): string => day(n).toISOString().slice(0, 10);
 
+/** 用例里按「订单行 + hotelRoomType.hotel + order.passengers + metadata」嵌套形状写的占房行 fixture。*/
+type BoardFixture = {
+  id?: string;
+  hotelCheckIn?: Date | null;
+  hotelCheckOut?: Date | null;
+  roomsBilled?: unknown;
+  randomStarTier?: number | null;
+  metadata?: unknown;
+  hotelRoomType?: {
+    hotelId: string;
+    hotel: {
+      name: string;
+      starRating?: number;
+      intlFiveStar?: boolean;
+      randomTierPlaceholder?: number | null;
+    };
+  } | null;
+  order?: {
+    id?: string;
+    roomAssignment?: unknown;
+    passengers?: Array<{ gender: Gender | null }>;
+  } | null;
+};
+
+/**
+ * 占房行 fixture → loadBoardItems 那条 SQL 的原始行（列别名形状），喂给 fake 的 $queryRaw。
+ * 缺省的字段原样缺省：与此前 fake 的 orderItem.findMany 直接回嵌套对象时，下游读到的值一致。
+ */
+function boardRows(items: unknown[]): BoardOccupancyRow[] {
+  return (items as BoardFixture[]).map((it) => {
+    const meta = it.metadata;
+    const metaIsObject = meta != null && typeof meta === 'object' && !Array.isArray(meta);
+    const m = (metaIsObject ? meta : {}) as Record<string, unknown>;
+    const hotel = it.hotelRoomType?.hotel;
+    return {
+      id: it.id,
+      hotelCheckIn: it.hotelCheckIn ?? null,
+      hotelCheckOut: it.hotelCheckOut ?? null,
+      roomsBilled: it.roomsBilled,
+      randomStarTier: it.randomStarTier ?? null,
+      metaIsObject,
+      metaRoomsNeeded: m.roomsNeeded,
+      metaRooms: m.rooms,
+      metaSplitPairKey: m.splitPairKey,
+      rtHotelId: it.hotelRoomType?.hotelId ?? null,
+      hotelName: hotel?.name ?? null,
+      starRating: hotel?.starRating ?? null,
+      intlFiveStar: hotel?.intlFiveStar ?? null,
+      randomTierPlaceholder: hotel?.randomTierPlaceholder ?? null,
+      orderId: it.order?.id,
+      roomAssignment: it.order?.roomAssignment,
+      genders: it.order?.passengers?.map((p) => p.gender) ?? null,
+    } as BoardOccupancyRow;
+  });
+}
+
+/** fake $queryRaw 收到的是 Prisma.sql 片段：按 SQL 文本分辨是哪条查询。*/
+function sqlText(sql: unknown): string {
+  return ((sql as { strings?: readonly string[] }).strings ?? []).join('?');
+}
+const isPaxCountQuery = (sql: unknown): boolean => sqlText(sql).includes('"paxCount"');
+
 /**
  * @param opts.restoredItems no-show 恢复超售的回程行（走 metadata path 过滤的那次查询）；
  *   缺省空数组 = 没有任何恢复超售，行为与旧版逐位一致。
@@ -98,24 +161,11 @@ function fakeClient(opts: { paxCounts: number[]; restoredItems?: unknown[] }): P
         },
       ]),
     },
-    // 占房：今晚 2 行 → used(today)=2 > block=1 → 超卖
-    // 带 metadata 过滤的那次查询是「no-show 恢复超售」取数，走另一条返回。
+    // 「no-show 恢复超售」取数（带 metadata path 过滤的那次 orderItem.findMany）。
     orderItem: {
       findMany: vi.fn(async (args: unknown) => {
         const where = (args as { where?: Record<string, unknown> }).where ?? {};
-        if (where.metadata) return opts.restoredItems ?? [];
-        return [
-        {
-          hotelCheckIn: day(0),
-          hotelCheckOut: day(1),
-          hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } },
-        },
-        {
-          hotelCheckIn: day(0),
-          hotelCheckOut: day(1),
-          hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } },
-        },
-        ];
+        return where.metadata ? (opts.restoredItems ?? []) : [];
       }),
     },
     flightSchedule: {
@@ -136,11 +186,35 @@ function fakeClient(opts: { paxCounts: number[]; restoredItems?: unknown[] }): P
         },
       ]),
     },
-    // 班次乘客数：一条聚合查询按班次分组返回（s1、s2 依次取 paxCounts[0]、[1]）
-    $queryRaw: vi.fn().mockResolvedValue(
-      ['s1', 's2'].map((scheduleId, i) => ({ scheduleId, paxCount: opts.paxCounts[i] })),
+    // 两条原生查询：
+    //   · 班次乘客数：一条聚合查询按班次分组返回（s1、s2 依次取 paxCounts[0]、[1]；
+    //     没给数的班次不出现在结果里，与 GROUP BY 查不到乘客时一致）；
+    //   · 销控板占房行：今晚 2 行 → used(today)=2 > block=1 → 超卖。
+    $queryRaw: vi.fn(async (sql: unknown) =>
+      isPaxCountQuery(sql)
+        ? ['s1', 's2'].flatMap((scheduleId, i) =>
+            opts.paxCounts[i] == null ? [] : [{ scheduleId, paxCount: opts.paxCounts[i] }],
+          )
+        : boardRows([
+            {
+              hotelCheckIn: day(0),
+              hotelCheckOut: day(1),
+              hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } },
+            },
+            {
+              hotelCheckIn: day(0),
+              hotelCheckOut: day(1),
+              hotelRoomType: { hotelId: 'h1', hotel: { name: '美溪海滩酒店' } },
+            },
+          ]),
     ),
   } as unknown as PrismaClient;
+}
+
+/** fake $queryRaw 里班次乘客数那条查询的调用记录。*/
+function paxCountCalls(client: PrismaClient): unknown[][] {
+  const queryRaw = client.$queryRaw as unknown as ReturnType<typeof vi.fn>;
+  return queryRaw.mock.calls.filter((call) => isPaxCountQuery(call[0]));
 }
 
 describe('getAlerts', () => {
@@ -191,14 +265,13 @@ describe('getAlerts', () => {
   });
 
   it('全部班次的乘客数一条聚合查询算完；查询结果里没有的班次按 0 人计', async () => {
-    const client = fakeClient({ paxCounts: [195, 100] });
-    const queryRaw = client.$queryRaw as unknown as ReturnType<typeof vi.fn>;
     // 聚合结果只回 s1（s2 一个乘客都没有，GROUP BY 里不会出现）
-    queryRaw.mockResolvedValueOnce([{ scheduleId: 's1', paxCount: 195 }]);
+    const client = fakeClient({ paxCounts: [195] });
     const alerts = await getAlerts(14, client);
-    expect(queryRaw).toHaveBeenCalledTimes(1);
+    const calls = paxCountCalls(client);
+    expect(calls).toHaveLength(1);
     // 两个班次的 id 都在同一条查询的参数里（不是逐班发查询）
-    const sql = queryRaw.mock.calls[0][0] as { values: unknown[] };
+    const sql = calls[0][0] as { values: unknown[] };
     expect(sql.values).toEqual(expect.arrayContaining(['s1', 's2']));
     expect(alerts.overCapacitySchedules).toMatchObject([{ flightNumber: 'QH9589', paxCount: 195 }]);
   });
@@ -207,7 +280,7 @@ describe('getAlerts', () => {
     const client = fakeClient({ paxCounts: [] });
     (client.flightSchedule.findMany as unknown as ReturnType<typeof vi.fn>).mockResolvedValueOnce([]);
     const alerts = await getAlerts(14, client);
-    expect(client.$queryRaw).not.toHaveBeenCalled();
+    expect(paxCountCalls(client)).toHaveLength(0);
     expect(alerts.overCapacitySchedules).toEqual([]);
   });
 
@@ -299,9 +372,9 @@ describe('getAlerts sharedOddNear（拼房落单临近推送）', () => {
           },
         ]),
       },
-      orderItem: { findMany: vi.fn().mockResolvedValue(orderItems) },
+      // 销控板占房行走 loadBoardItems（$queryRaw）；无班次 → 不发乘客数查询
+      $queryRaw: vi.fn().mockResolvedValue(boardRows(orderItems)),
       flightSchedule: { findMany: vi.fn().mockResolvedValue([]) },
-      $queryRaw: vi.fn().mockResolvedValue([]),
     } as unknown as PrismaClient;
   }
 
@@ -410,7 +483,7 @@ describe('getBoard sharedHalfCount / sharedUnpaired / sharedOdd', () => {
           },
         ]),
       },
-      orderItem: { findMany: vi.fn().mockResolvedValue(orderItems) },
+      $queryRaw: vi.fn().mockResolvedValue(boardRows(orderItems)),
     } as unknown as PrismaClient;
   }
 
@@ -494,7 +567,7 @@ describe('getBoard physicalUsed / physicalRemaining', () => {
           },
         ]),
       },
-      orderItem: { findMany: vi.fn().mockResolvedValue(orderItems) },
+      $queryRaw: vi.fn().mockResolvedValue(boardRows(orderItems)),
     } as unknown as PrismaClient;
   }
 
@@ -1065,7 +1138,7 @@ describe('getBoard 权威分房表优先（物理口径）', () => {
           },
         ]),
       },
-      orderItem: { findMany: vi.fn().mockResolvedValue(orderItems) },
+      $queryRaw: vi.fn().mockResolvedValue(boardRows(orderItems)),
     } as unknown as PrismaClient;
   }
 
@@ -2417,7 +2490,7 @@ describe('星级随机档：销控板聚合组', () => {
   function poolBoardClient(periods: unknown[], items: unknown[]): PrismaClient {
     return {
       hotelBlockPeriod: { findMany: vi.fn().mockResolvedValue(periods) },
-      orderItem: { findMany: vi.fn().mockResolvedValue(items) },
+      $queryRaw: vi.fn().mockResolvedValue(boardRows(items)),
     } as unknown as PrismaClient;
   }
   /** 具体酒店的包房周期 fixture（hotel 关联带星级，供聚合分组）。*/
@@ -2564,7 +2637,6 @@ describe('星级随机档：销控板聚合组', () => {
         [pendingItem(3), pendingItem(3)],
       ),
       flightSchedule: { findMany: vi.fn().mockResolvedValue([]) },
-      $queryRaw: vi.fn().mockResolvedValue([]),
     } as unknown as PrismaClient;
     const alerts = await getAlerts(2, client);
     const tierOversold = alerts.oversold.find((o) => o.hotelName === '三星随机')!;

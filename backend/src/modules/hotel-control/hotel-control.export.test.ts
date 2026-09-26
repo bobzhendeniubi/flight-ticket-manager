@@ -13,6 +13,7 @@ vi.mock('../../db/prisma.js', () => ({ prisma: {} }));
 import type { PrismaClient } from '@prisma/client';
 import ExcelJS from 'exceljs';
 import { buildHotelControlBoardWorkbook, hotelControlExportFilename } from './hotel-control.export.js';
+import type { BoardOccupancyRow } from './hotel-control.service.js';
 
 const DAY_MS = 24 * 60 * 60 * 1000;
 const todayStr = new Date().toISOString().slice(0, 10);
@@ -20,10 +21,44 @@ const todayMs = new Date(`${todayStr}T00:00:00.000Z`).getTime();
 const day = (n: number): Date => new Date(todayMs + n * DAY_MS);
 const dayStr = (n: number): string => day(n).toISOString().slice(0, 10);
 
+/**
+ * 占房行 fixture（订单行 + hotelRoomType.hotel + order.passengers 的嵌套形状）→ getBoard 取数那条
+ * 原生 SQL 的原始行（列别名形状，见 loadBoardItems）。缺省字段原样缺省。
+ */
+function boardRows(items: unknown[]): BoardOccupancyRow[] {
+  type Fixture = {
+    hotelCheckIn?: Date | null;
+    hotelCheckOut?: Date | null;
+    roomsBilled?: unknown;
+    randomStarTier?: number | null;
+    hotelRoomType?: {
+      hotelId: string;
+      hotel: { name: string; starRating?: number; intlFiveStar?: boolean; randomTierPlaceholder?: number | null };
+    } | null;
+    order?: { passengers?: Array<{ gender: string | null }> } | null;
+  };
+  return (items as Fixture[]).map((it) => {
+    const hotel = it.hotelRoomType?.hotel;
+    return {
+      hotelCheckIn: it.hotelCheckIn ?? null,
+      hotelCheckOut: it.hotelCheckOut ?? null,
+      roomsBilled: it.roomsBilled,
+      randomStarTier: it.randomStarTier ?? null,
+      metaIsObject: false,
+      rtHotelId: it.hotelRoomType?.hotelId ?? null,
+      hotelName: hotel?.name ?? null,
+      starRating: hotel?.starRating ?? null,
+      intlFiveStar: hotel?.intlFiveStar ?? null,
+      randomTierPlaceholder: hotel?.randomTierPlaceholder ?? null,
+      genders: it.order?.passengers?.map((p) => p.gender) ?? null,
+    } as BoardOccupancyRow;
+  });
+}
+
 function boardClient(orderItems: unknown[], periods: unknown[]): PrismaClient {
   return {
     hotelBlockPeriod: { findMany: vi.fn().mockResolvedValue(periods) },
-    orderItem: { findMany: vi.fn().mockResolvedValue(orderItems) },
+    $queryRaw: vi.fn().mockResolvedValue(boardRows(orderItems)),
   } as unknown as PrismaClient;
 }
 
