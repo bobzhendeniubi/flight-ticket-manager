@@ -1,7 +1,8 @@
 import { buildApp } from './app.js';
-import { env } from './config/env.js';
+import { blobDir, env } from './config/env.js';
 import { disconnectPrisma, prisma } from './db/prisma.js';
 import { disconnectRedis } from './db/redis.js';
+import { probeBlobDir } from './lib/blob-store.js';
 
 async function main() {
   const app = await buildApp();
@@ -59,6 +60,15 @@ async function main() {
       app.log.warn('AI 配置不一致：对话助手可用，但护照 OCR 和营销海报不可用');
     } else if (!chatConfigured && visionConfigured) {
       app.log.warn('AI 配置不一致：护照 OCR 和营销海报可用，但对话助手将使用本地 mock');
+    }
+
+    // 图片出库自检：blob 目录（BLOB_DIR）能不能写。不可写不阻断启动——写入口会回退内联落库
+    // 并逐次打 ERROR（lib/image-ref.ts），但要在启动日志里一眼看见，别等磁盘又满了才发现卷没挂上。
+    const blobProblem = await probeBlobDir();
+    if (blobProblem) {
+      app.log.error({ blobDir }, `🗂 图片 blob 目录不可写：${blobProblem} —— 新上传的护照照片/收款凭证会回退内联进库`);
+    } else {
+      app.log.info({ blobDir }, '🗂 图片 blob 目录可写');
     }
   } catch (err) {
     app.log.error({ err }, 'failed to start server');

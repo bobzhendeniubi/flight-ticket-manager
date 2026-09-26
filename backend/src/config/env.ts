@@ -1,4 +1,5 @@
 import 'dotenv/config';
+import path from 'node:path';
 import { z } from 'zod';
 
 const EnvSchema = z.object({
@@ -69,6 +70,21 @@ const EnvSchema = z.object({
   // ═══════════════════════════════════════════════════════════
   AWS_REGION: z.string().optional(),
   S3_BUCKET_UPLOADS: z.string().optional(),
+
+  // ═══════════════════════════════════════════════════════════
+  // 图片出库：护照照片 / 收款凭证的字节不再内联进 Postgres，而是按内容寻址存到本地磁盘，
+  // 库里只留 `blob:sha256:…` 短引用（见 lib/image-ref.ts、db/image-blob-extension.ts）。
+  //   BLOB_DIR  = 存储根目录。容器内默认 /data/blobs（docker-compose.prod.yml 挂命名卷，
+  //               backend 与 worker 共用同一卷）；本地开发默认 backend/var/blobs（已 gitignore）。
+  //   IMAGE_BLOB_SWEEP_LIMIT = worker 每日兜底清扫最多转换的行数（把漏网的内联 data URL 转成
+  //               引用），0 = 关闭。存量回填走 dist/tools/backfill-image-blobs.js，不靠这条。
+  // 空字符串（docker compose ${VAR:-} 默认值）当 undefined 处理后回退默认值。
+  // ═══════════════════════════════════════════════════════════
+  BLOB_DIR: z.preprocess(
+    (v) => (typeof v === 'string' && v.trim() === '' ? undefined : v),
+    z.string().min(1).optional(),
+  ),
+  IMAGE_BLOB_SWEEP_LIMIT: z.coerce.number().int().min(0).default(200),
 
   // ═══════════════════════════════════════════════════════════
   // AI 对话（OpenAI 兼容协议）—— 当前指向阿里云 DashScope / Qwen
@@ -231,6 +247,16 @@ if (paymentMode === 'live') {
     process.exit(1);
   }
 }
+
+/**
+ * 图片 blob 存储根目录（护照照片 / 收款凭证字节的落盘位置）。
+ * 生产容器默认 /data/blobs（Dockerfile 预建并归 ftm 用户，compose 挂命名卷）；
+ * 其余环境默认 backend/var/blobs（相对当前工作目录 —— `npm run dev` / vitest 的 cwd 都是 backend）。
+ * 集成测试在 setup 里把 BLOB_DIR 指到临时目录，不会写进这里。
+ */
+export const blobDir: string =
+  env.BLOB_DIR ??
+  (env.NODE_ENV === 'production' ? '/data/blobs' : path.resolve(process.cwd(), 'var', 'blobs'));
 
 /** 支付渠道配置便利访问器（adapter 用） */
 export const paymentConfig = {

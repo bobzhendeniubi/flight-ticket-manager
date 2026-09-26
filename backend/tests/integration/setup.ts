@@ -11,6 +11,9 @@
  *   - 不会碰 dev 库（端口 55432 != 5432，db ftm_test != ftm）
  */
 import { execSync } from 'node:child_process';
+import { mkdtempSync } from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 import { beforeAll, beforeEach } from 'vitest';
 
 const DEFAULT_TEST_URL =
@@ -20,6 +23,10 @@ const testDbUrl = process.env.TEST_DATABASE_URL ?? DEFAULT_TEST_URL;
 
 // 关键：把 DATABASE_URL 改到测试库（在 prisma client 第一次 import 之前）
 process.env.DATABASE_URL = testDbUrl;
+
+// 图片 blob 存储也指到一次性临时目录（同样要在 config/env 第一次 import 之前）：
+// 集成测试会真走「data URL → blob 引用」的写入钩子，不能把测试图写进 backend/var/blobs。
+process.env.BLOB_DIR ??= mkdtempSync(path.join(os.tmpdir(), 'ftm-blobs-integration-'));
 
 beforeAll(() => {
   console.log('[integration] Running prisma migrate deploy → test DB…');

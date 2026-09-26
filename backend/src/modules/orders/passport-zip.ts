@@ -15,7 +15,7 @@ import JSZip from 'jszip';
 import { OrderItemKind, FulfillmentType, type Passenger } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
 import { businessDateTimeSec } from '../../lib/business-time.js';
-import { fetchImageSafely } from '../../lib/safe-fetch.js';
+import { extForImageMime, parseBlobRef, resolveImageBytes } from '../../lib/image-ref.js';
 
 export function sanitize(s: string): string {
   return s.replace(/[\\/:*?"<>|\s]+/g, '_').slice(0, 80);
@@ -192,13 +192,17 @@ async function buildVisaSheetBuffer(passengers: Passenger[]): Promise<Buffer> {
 
 /**
  * 从图片来源推断文件扩展名（打包 zip 时用于命名）。
- *   - data URI（`data:image/<mime>;base64,...`，OCR/小程序直传常见落库形态）：
+ *   - blob 引用（`blob:sha256:<hex>;<mime>`，出库后的标准落库形态，见 lib/image-ref.ts）：
+ *     按引用里嗅探得到的 mime 映射扩展名。
+ *   - data URI（`data:image/<mime>;base64,...`，OCR/小程序直传的历史落库形态）：
  *     按 MIME type 映射扩展名——原实现只匹配 URL 路径后缀，data URI 没有路径后缀可匹配，
  *     导致 PNG/WEBP/GIF 图一律被误标成 .jpg（图内容与后缀不符，部分看图软件打不开）。
  *   - 普通 URL：维持原口径，按路径末尾扩展名匹配。
  *   - 都匹配不到：兜底 .jpg（沿用原有行为）。
  */
 export function extFromUrl(u: string): string {
+  const blobRef = parseBlobRef(u);
+  if (blobRef) return extForImageMime(blobRef.mime);
   const dataUriMatch = u.match(/^data:image\/([a-z0-9.+-]+)/i);
   if (dataUriMatch) {
     const mime = dataUriMatch[1].toLowerCase();
@@ -211,11 +215,13 @@ export function extFromUrl(u: string): string {
 }
 
 /**
- * 护照图抓取。委托给 SSRF 安全实现（data-URL 本地解码；远程仅 https 且拒私网/元数据；
- * 无重定向；字节封顶）。所有 ZIP 构建共用此出口。
+ * 护照图抓取。三种落库形态统一走 lib/image-ref.resolveImageBytes：
+ * blob 引用读本地 blob 存储；data-URL 本地解码；远程外链走 SSRF 安全实现（仅 https 且拒私网/
+ * 元数据；无重定向；字节封顶）。读不到一律 null（调用方记入缺图明细）。所有 ZIP 构建共用此出口。
  */
 export async function fetchPhoto(url: string): Promise<Buffer | null> {
-  return fetchImageSafely(url);
+  const resolved = await resolveImageBytes(url);
+  return resolved ? resolved.bytes : null;
 }
 
 /**
