@@ -14,6 +14,10 @@ import type { PrismaClient } from '@prisma/client';
 import { prisma as defaultPrisma } from '../../db/prisma.js';
 import { localDateISO } from '../../lib/flight-time.js';
 import { getOrderPnl, type DateRange, type OrderPnlRow } from './finances.service.js';
+import {
+  formatOrderSwapRecordCell,
+  loadSwapRecordsByPassenger,
+} from '../orders/orders.export-swap-records.js';
 
 const STATUS_LABEL: Record<string, string> = {
   PENDING_PAYMENT: '待支付',
@@ -46,6 +50,8 @@ interface OrderExportRow {
   refundType: string;
   swapFeeCny: number | '';
   replacementOrderNumber: string;
+  // 原地换人记录（本单全部乘客槽位合成一格；与「换人退款」的换人费不是一回事）。
+  swapRecords: string;
 }
 
 const COLUMNS: Array<{ header: string; key: keyof OrderExportRow; width: number }> = [
@@ -63,6 +69,7 @@ const COLUMNS: Array<{ header: string; key: keyof OrderExportRow; width: number 
   { header: '退款类型', key: 'refundType', width: 12 },
   { header: '换人费(元)', key: 'swapFeeCny', width: 12 },
   { header: '接手订单号', key: 'replacementOrderNumber', width: 20 },
+  { header: '换人记录', key: 'swapRecords', width: 40 },
 ];
 
 interface OrderMeta {
@@ -71,6 +78,8 @@ interface OrderMeta {
   swapRefundedAt: Date | null;
   swapFeeCny: number | null;
   swapReplacementOrderNumber: string | null;
+  /** 原地换人记录（已拼好的单元格文本，无换人 = 空串）。*/
+  swapRecords: string;
 }
 
 interface DepartureLeg {
@@ -104,6 +113,8 @@ async function loadOrderMeta(
       swapFeeCny: true,
       swapReplacementOrderNumber: true,
       agent: { select: { companyName: true, contactName: true } },
+      // 原地换人记录按乘客槽位归；中文名给最后一次换人补「新人中文名」。
+      passengers: { select: { id: true, chineseName: true } },
       items: {
         where: { kind: 'FLIGHT' },
         // departureTz 必须一起取：出发日期要按班次当地时区折，不能切 UTC 分量
@@ -111,6 +122,7 @@ async function loadOrderMeta(
       },
     },
   });
+  const swapRecordsByPassenger = await loadSwapRecordsByPassenger(orders, client);
   for (const o of orders) {
     const departs = o.items
       .map((it) => it.flightSchedule)
@@ -122,6 +134,10 @@ async function loadOrderMeta(
       swapRefundedAt: o.swapRefundedAt,
       swapFeeCny: o.swapFeeCny,
       swapReplacementOrderNumber: o.swapReplacementOrderNumber,
+      swapRecords: formatOrderSwapRecordCell(
+        o.passengers.map((p) => p.id),
+        swapRecordsByPassenger,
+      ),
     });
   }
   return map;
@@ -149,6 +165,7 @@ function toExportRow(pnl: OrderPnlRow, meta: OrderMeta | undefined): OrderExport
     refundType: refundType(pnl.status, meta?.swapRefundedAt ?? null),
     swapFeeCny: meta?.swapFeeCny ?? '',
     replacementOrderNumber: meta?.swapReplacementOrderNumber ?? '',
+    swapRecords: meta?.swapRecords ?? '',
   };
 }
 

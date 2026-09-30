@@ -42,6 +42,10 @@ import { netReceivedCny, sumCompletedRefundCny } from '../../lib/net-received.js
 import { businessDateTime } from '../../lib/business-time.js';
 // 签证成本口径与财务汇总共用同一函数，两处逐字一致（任务实际成本优先 → 产品主数据回退）
 import { visaItemCostCny } from './finances.service.js';
+import {
+  formatSwapRecordCell,
+  loadSwapRecordsByPassenger,
+} from '../orders/orders.export-swap-records.js';
 
 const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
@@ -123,6 +127,9 @@ interface FinanceRow {
   refundType: string;
   swapFeeCny: number | '';
   replacementOrderNumber: string;
+  // 原地换人记录（被换下去的人只在这里留名；与上面「换人退款」的换人费不是一回事），
+  // 拼装见 orders.export-swap-records.ts，由 buildFinanceExportWorkbook 按乘客槽位并进行。
+  swapRecords: string;
 }
 
 const COLUMNS: Array<{ header: string; key: keyof FinanceRow; width: number }> = [
@@ -169,6 +176,7 @@ const COLUMNS: Array<{ header: string; key: keyof FinanceRow; width: number }> =
   { header: '退款类型', key: 'refundType', width: 12 },
   { header: '换人费(元)', key: 'swapFeeCny', width: 12 },
   { header: '接手订单号', key: 'replacementOrderNumber', width: 20 },
+  { header: '换人记录', key: 'swapRecords', width: 36 },
 ];
 
 function dec(v: Prisma.Decimal | number | null | undefined): number {
@@ -227,7 +235,7 @@ function orderToRows(
   hotelPeriodsMap: HotelPeriodsMap = new Map(),
   hotelFxRates: HotelFxRates = undefined,
   transferFxRates: TransferFxRates = undefined,
-): FinanceRow[] {
+): Omit<FinanceRow, 'swapRecords'>[] {
   const paxCount = Math.max(1, order.passengers.length);
   // 需签乘客数（非自备签）—— 签证实际成本按此人均折算
   const visaPax = order.passengers.filter((p) => !p.visaExempt).length;
@@ -402,7 +410,7 @@ function orderToRows(
   const totalCostOrder =
     flightCostOrder + hotelCostCnyOrder + transferCostCnyOrder + visaCostCnyOrder;
 
-  const baseRows = order.passengers.map<FinanceRow>((p) => {
+  const baseRows = order.passengers.map<Omit<FinanceRow, 'swapRecords'>>((p) => {
     const unitCostTotal =
       flightCostPerSeat +
       airportTaxCny +
@@ -550,10 +558,17 @@ export async function buildFinanceExportWorkbook(
     client,
   );
 
+  // 原地换人记录：按乘客槽位一次批量取（换人审计 + 拆单祖先单），无 N+1。
+  const swapRecordsByPassenger = await loadSwapRecordsByPassenger(orders, client);
+
   const rows: FinanceRow[] = [];
   for (const o of orders) {
     if (o.passengers.length === 0) continue;
-    rows.push(...orderToRows(o, periodsMap, hotelPeriodsMap, hotelFxRates, transferFxRates));
+    // orderToRows 按 o.passengers 原序一人一行，下标对得上乘客槽位。
+    const orderRows = orderToRows(o, periodsMap, hotelPeriodsMap, hotelFxRates, transferFxRates);
+    orderRows.forEach((r, i) => {
+      rows.push({ ...r, swapRecords: formatSwapRecordCell(swapRecordsByPassenger.get(o.passengers[i].id)) });
+    });
   }
 
   const wb = new ExcelJS.Workbook();

@@ -78,6 +78,7 @@ import {
 } from './orders.export-selection.js';
 import { spreadableAdjustmentCny } from './per-pax-share.js';
 import { determineFlightLegs } from './ticketing-cap.js';
+import { formatSwapRecordCell, loadSwapRecordsByPassenger } from './orders.export-swap-records.js';
 import { formatOrderLegStatus } from './orders.leg-status.js';
 
 // ── 岗位视图 ──────────────────────────────────────────────────────────────
@@ -194,6 +195,10 @@ export interface MasterRow {
   chineseName: string;
   passengerName: string; // 拼音/PNR：LAST/FIRST + 称谓（航司口径）
   cleanName: string; // 纯拼音名 LAST/FIRST（无 MR/MS 称谓）— 财务对数/名单匹配用
+  // 换人记录（原地换人后旧人只剩这一列能对上账）：每次一段「MM-DD 原 X → 新 Y，换人费 ¥N」，
+  // 多次「；」连接。取数与拼装见 orders.export-swap-records.ts；不在 orderToMasterRows 里算
+  // （那是不碰 DB 的纯函数），由 buildMasterExportWorkbook 按乘客槽位批量取好后并进行。
+  swapRecords: string;
   // 常旅客合计飞行次数（TravelerProfile.tripCount 快照）：含老系统历史飞行（已去重、退票不计），
   // 按档案全部证件号归拢，只计去程已起飞的行程。
   // 每位乘客各不相同；与本单航段数无关。
@@ -274,6 +279,17 @@ const MASTER_COLUMNS: MasterColumn[] = [
   { header: '乘客中文名', key: 'chineseName', width: 12 },
   { header: '乘客拼音名', key: 'passengerName', width: 18 },
   { header: '纯拼音名', key: 'cleanName', width: 16 },
+  // 通用列（各岗位视图都给）：票务要知道这个位置换过人（重新出票），签证要知道重新送签，
+  // 对账要知道换人费算谁的。代理白名单也放行，理由见 AGENT_MASTER_ALLOWED_KEYS。
+  {
+    header: '换人记录',
+    key: 'swapRecords',
+    width: 36,
+    note:
+      '本行这位出行人所在位置的原地换人记录（被换下去的人不再占一行，只在这里留名）：\n' +
+      '每次一段「日期 原 旧人 → 新 新人，换人费 ¥N」，多次用「；」分隔，时间为北京时间。\n' +
+      '只换证件号记为「更换证件」；没换人但收了换人费记为「资料变更」。换人费已计入应收，不另收。',
+  },
   {
     header: '飞行次数',
     key: 'flightCount',
@@ -388,7 +404,7 @@ const MASTER_COLUMNS: MasterColumn[] = [
 
 /**
  * 代理视角的**白名单**（运营反馈 0903：代理导出的全岗总表只保留这 13 列，其余一律不给；
- * 0906 运营需求：在这基础上**加且只加**「护照号」「证件有效期」两列 → 15 列——代理导出
+ * 0906 运营需求：在这基础上**加且只加**「护照号」「证件有效期」两列 → 15 列（0930 再加「换人记录」→ 16 列）——代理导出
  * 只能导自家 + 下级的单，这两项本就是这些出行人交给代理、再由代理交给我方录入系统的，
  * 不算新泄露面。出生日期/性别/国籍/签发地等其余护照 PII 依旧不给，见下方
  * MASTER_AGENT_PASSPORT_ALLOW_KEYS 的放行范围说明。不带人名。
@@ -407,6 +423,9 @@ export const AGENT_MASTER_ALLOWED_KEYS: ReadonlySet<keyof MasterRow> = new Set<k
   'chineseName',
   'passengerName',
   'cleanName',
+  // 0930 加列：换人记录 —— 只有姓名（代理自家乘客，姓名本就在白名单里）+ 日期 + 换人费
+  //（代理自己被收的钱），不含证件号、经手人、备注等内部字段，不算新泄露面。
+  'swapRecords',
   'travelDates',
   'flightNumbers',
   'orderType',
@@ -435,7 +454,7 @@ export function visibleColumns(role: MasterExportRole): MasterColumn[] {
   if (role === 'all') return MASTER_COLUMNS;
   // 代理视角：先过共享脱敏黑名单（与三模板同一份口径，护照 PII / 内部人员 / 供应商成本 / 内部指标），
   // 但护照号/证件有效期两列本表单独放行（MASTER_AGENT_PASSPORT_ALLOW_KEYS，不改黑名单本身，
-  // 三模板不受影响）；再过本表专属白名单（运营拍板的 15 列）。两道都过才给——黑名单保证
+  // 三模板不受影响）；再过本表专属白名单（运营拍板的 15 列 + 0930 换人记录）。两道都过才给——黑名单保证
   // "敏感的一定没有"，白名单保证"没点名的一定没有"。
   if (role === 'agent') {
     const afterSharedBlacklist = MASTER_COLUMNS.filter(
@@ -591,7 +610,7 @@ export function orderToMasterRows(
    * （roomNumberer 首次遇见分配），单测/单张订单场景不受影响。
    */
   presortedIdentityNumbers?: ReadonlyMap<string, number>,
-): Omit<MasterRow, 'seq'>[] {
+): Omit<MasterRow, 'seq' | 'swapRecords'>[] {
   const paxCount = Math.max(1, order.passengers.length);
 
   // ── 航段（按出发时间排序）──
@@ -791,7 +810,7 @@ export function orderToMasterRows(
   // 只认 kind==='HOTEL' 会让套餐单永远不显示"未分房"。分房情况据此对未分房乘客回落"未分房"。
   const hasHotel = order.items.some((it) => it.hotelRoomTypeId);
 
-  return order.passengers.map<Omit<MasterRow, 'seq'>>((p) => {
+  return order.passengers.map<Omit<MasterRow, 'seq' | 'swapRecords'>>((p) => {
     const group = roomGroups.find((g) => g.passengerIds.includes(p.id));
     // 归属行（group.orderItemId 精确对行）：编号作用域取它的真实 hotelId + 入住日，
     // 不认房组自己的 hotelName 文本（§九，与分房表/整班机导出同一把尺）。旧数据没有归属
@@ -946,6 +965,8 @@ export async function buildMasterExportWorkbook(
   // 上次重建的快照，快照时间随表头批注一起标出，让读表的人知道这几列有多旧。
   const allPassengers = orders.flatMap((o) => o.passengers);
   const { tripStats, oldestRefreshedAt } = await loadExportTripStats(allPassengers, client);
+  // 换人记录：按乘客槽位一次批量取（换人审计 + 拆单祖先单），无 N+1。
+  const swapRecordsByPassenger = await loadSwapRecordsByPassenger(orders, client);
 
   // §九跨单房号：批量拉出本次导出涉及的全部共享房各自的成员单号（无 N+1）；
   // RoomNumberer 在整批订单循环外建一个实例，传给每次 orderToMasterRows 调用——
@@ -1016,7 +1037,7 @@ export async function buildMasterExportWorkbook(
   let seq = 0;
   for (const order of orders) {
     if (order.passengers.length === 0) continue;
-    for (const row of orderToMasterRows(
+    const rows = orderToMasterRows(
       order,
       tripStats,
       roomNumberer,
@@ -1024,11 +1045,14 @@ export async function buildMasterExportWorkbook(
       forAgent,
       verifiedSplitPairKeys,
       presortedIdentityNumbers,
-    )) {
+    );
+    // orderToMasterRows 按 order.passengers 原序一人一行，下标对得上乘客槽位。
+    rows.forEach((row, i) => {
       seq += 1;
+      const swapRecords = formatSwapRecordCell(swapRecordsByPassenger.get(order.passengers[i].id));
       // key-based addRow 只取可见列对应的 key，多余字段忽略 —— role 裁列天然生效
-      ws.addRow({ seq, ...row });
-    }
+      ws.addRow({ seq, ...row, swapRecords });
+    });
   }
 
   ws.views = [{ state: 'frozen', xSplit: 1, ySplit: 1 }];
