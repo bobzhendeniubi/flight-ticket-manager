@@ -89,6 +89,17 @@ describe('funds-guard · 处置闸 assertOrderAllowsFundsDisposal', () => {
     expect(() => assertOrderAcceptsFunds(live(OrderStatus.FAILED))).not.toThrow();
   });
 
+  it('已换人（SWAPPED）四道闸全放行：欠款照常收、再多付可转存、可撤销、可改换人费数字', () => {
+    expect(FUNDS_CREDIT_BLOCKED_STATUSES).not.toContain(OrderStatus.SWAPPED);
+    expect(FUNDS_DISPOSE_BLOCKED_STATUSES).not.toContain(OrderStatus.SWAPPED);
+    expect(FUNDS_REVERSAL_BLOCKED_STATUSES).not.toContain(OrderStatus.SWAPPED);
+    expect(PRICE_ADJUSTMENT_BLOCKED_STATUSES).not.toContain(OrderStatus.SWAPPED);
+    expect(() => assertOrderAcceptsFunds(live(OrderStatus.SWAPPED))).not.toThrow();
+    expect(() => assertOrderAllowsFundsDisposal(live(OrderStatus.SWAPPED), '测试')).not.toThrow();
+    expect(() => assertOrderAllowsFundsReversal(live(OrderStatus.SWAPPED), '撤销收款')).not.toThrow();
+    expect(() => assertOrderAllowsPriceAdjustment(live(OrderStatus.SWAPPED))).not.toThrow();
+  });
+
   it('拒绝对死单/软删单处置', () => {
     for (const s of FUNDS_DISPOSE_BLOCKED_STATUSES) {
       expect(() => assertOrderAllowsFundsDisposal(live(s), '测试')).toThrow(BadRequestError);

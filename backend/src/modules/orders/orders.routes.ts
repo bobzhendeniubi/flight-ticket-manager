@@ -70,6 +70,7 @@ import {
   voidReturnLegBodySchema,
   splitRoomGroupBodySchema,
   swapRefundBodySchema,
+  markSwappedBodySchema,
   updateSwapReplacementOrderBodySchema,
   swapFeeOptionsBodySchema,
   swapItemHotelBodySchema,
@@ -667,6 +668,50 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           refundAmountCny: result.refundAmountCny,
           replacementOrderNumber: result.order.swapReplacementOrderNumber ?? null,
           reason: body.reason,
+        },
+        severity: 'WARNING',
+      });
+
+      return result;
+    },
+  );
+
+  /**
+   * POST /orders/:id/mark-swapped
+   * 标记已换人（换人主路径）：应收收敛到换人费 → 多出的钱转代理余额/挂账池 → 状态落「已换人」并释放未飞航段。
+   * 与换人退款的区别：不退现金，钱留在系统里给新单抵扣。ADMIN/STAFF；代理走改单申请。
+   */
+  app.post(
+    '/:id/mark-swapped',
+    { preHandler: [app.authenticate] },
+    async (req) => {
+      const { id } = req.params as { id: string };
+      const body = markSwappedBodySchema.parse(req.body);
+      const requester = await buildRequester(req.user.sub, req.user.role);
+      const result = await service.markSwapped(id, body, requester);
+
+      void writeAudit({
+        actor: actorFromRequest(req),
+        action: 'MARK_ORDER_SWAPPED',
+        targetType: 'ORDER',
+        targetId: result.order.id,
+        targetLabel: result.order.orderNumber,
+        before: {
+          status: result.audit.fromStatus,
+          payableCny: result.audit.beforePayableCny,
+          netPaidCny: result.audit.netPaidCny,
+        },
+        after: {
+          status: 'SWAPPED',
+          swapFeeCny: result.audit.swapFeeCny,
+          adjustmentDeltaCny: result.audit.adjustmentDeltaCny,
+          adjustmentItemId: result.audit.adjustmentItemId,
+          disposal: result.audit.disposal,
+          outstandingCny: result.audit.outstandingCny,
+          replacementOrderNumber: result.audit.replacementOrderNumber,
+          flownLegs: result.audit.flownLegs,
+          releasedLegs: result.audit.releasedLegs,
+          note: result.audit.note,
         },
         severity: 'WARNING',
       });

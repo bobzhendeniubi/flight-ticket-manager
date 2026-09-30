@@ -98,7 +98,14 @@ const STATUS_LABEL: Record<OrderStatus, string> = {
   CHANGE_REQUESTED: '改签申请中',
   CHANGED: '已改签',
   FAILED: '出票失败',
+  SWAPPED: '已换人',
 };
+
+// 已换人（SWAPPED）刻意不进任何一道闸：
+//   · 收款闸放行 —— 换人费收不够时欠款留在单上，后续照常收；
+//   · 处置闸放行 —— 之后再有多付（如补收多了）仍要能转存代理余额/挂账池；
+//   · 撤销闸放行 —— 与取消族同理，撤销是把钱送回来源，公司总资金不变；
+//   · 调价闸放行 —— 与 CANCELLED 同理，运营事后改换人费数字只改应收、不动钱。
 
 export interface FundsGuardOrder {
   orderNumber: string;

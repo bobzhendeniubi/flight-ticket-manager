@@ -114,7 +114,8 @@ export interface AgentDebtRow {
 }
 
 // 计入营收的订单状态（与 finances.service.ts 一致）：
-// 排除 DRAFT/CANCELLED/PAYMENT_TIMEOUT/REFUNDED/FAILED
+// 排除 DRAFT/CANCELLED/PAYMENT_TIMEOUT/REFUNDED/FAILED。
+// SWAPPED（已换人）在内：应收已收敛为换人费，那是真实收入，与已取消单不同、不能从营收里蒸发。
 const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
   OrderStatus.PAID,
@@ -124,9 +125,11 @@ const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.REFUND_REQUESTED,
   OrderStatus.CHANGE_REQUESTED,
   OrderStatus.CHANGED,
+  OrderStatus.SWAPPED,
 ];
 
-// 应收口径的状态集（进行中六态；不含 COMPLETED / REFUND_REQUESTED）
+// 应收口径的状态集（进行中六态；不含 COMPLETED / REFUND_REQUESTED）。
+// SWAPPED 在内：换人费收不够时欠款留在单上照常催收，应收明细要看得见它。
 const RECEIVABLE_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
   OrderStatus.PAID,
@@ -134,6 +137,7 @@ const RECEIVABLE_STATUSES: OrderStatus[] = [
   OrderStatus.TICKETED,
   OrderStatus.CHANGE_REQUESTED,
   OrderStatus.CHANGED,
+  OrderStatus.SWAPPED,
 ];
 
 /** 应收明细最多返回的行数（summary 仍统计全量） */

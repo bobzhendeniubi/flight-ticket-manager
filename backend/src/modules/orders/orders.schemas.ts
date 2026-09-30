@@ -67,6 +67,9 @@ export const PRICE_ADJUSTMENT_REASON_ENDPOINT_ONLY = [
   // 的每人价，与他接手的那份旧份额之间的差额落成这一行（挂在该乘客名下，可正可负）。
   // **只能系统生成**，不进人工调价下拉。
   'SWAP_REPRICE',
+  // 换人费：「标记已换人」（POST /orders/:id/mark-swapped）把本单应收收敛到换人费时生成的
+  // 差额行（金额 = 换人费 − 原应收，通常为负）。**只能系统生成**，不进人工调价下拉。
+  'SWAP_FEE',
 ] as const;
 
 export type PriceAdjustmentReasonDisplay =
@@ -87,6 +90,7 @@ export const PRICE_ADJUSTMENT_REASON_LABEL: Record<PriceAdjustmentReasonDisplay,
   RETURN_LEG_CANCEL_FEE: '取消回程手续费',
   OUTBOUND_LEG_CANCEL_FEE: '取消去程手续费',
   SWAP_REPRICE: '换人重算结算价',
+  SWAP_FEE: '换人费',
 };
 
 // 调价金额校验（录单调价与「按乘客/整单事后调价」共用同一口径，避免两处漂移）：
@@ -908,6 +912,15 @@ export const updateSwapReplacementOrderBodySchema = z.object({
   replacementOrderNumber: z.string().trim().max(64).nullable(),
 });
 export type UpdateSwapReplacementOrderBody = z.infer<typeof updateSwapReplacementOrderBodySchema>;
+
+// 标记已换人（POST /orders/:id/mark-swapped）：换人费为 ≥0 的整数 CNY —— 与 Order.swapFeeCny（Int）
+// 及换人费标准档（swapFeeOptions，450/550 这类整数）同口径；0 = 一分不收（合法）。
+export const markSwappedBodySchema = z.object({
+  swapFeeCny: z.number().int().min(0).max(PRICE_ADJUSTMENT_CAP_CNY),
+  replacementOrderNumber: z.string().trim().max(64).optional(),
+  note: z.string().trim().max(500).optional(),
+});
+export type MarkSwappedBody = z.infer<typeof markSwappedBodySchema>;
 
 // ── 批量状态流转（ADMIN/STAFF）──────────────────────────────────────────
 export const batchUpdateStatusBodySchema = z.object({

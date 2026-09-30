@@ -252,6 +252,7 @@ import type {
   ChangeOrderBundleBody,
   CreateOrderBody,
   ListOrdersQuery,
+  MarkSwappedBody,
   OrderItemInput,
   OrderPriceAdjustmentBody,
   PassengerInput,
@@ -294,6 +295,7 @@ export const ORDER_STATUS_LABEL_ZH: Record<OrderStatus, string> = {
   CHANGE_REQUESTED: '改期申请中',
   CHANGED: '已改期',
   FAILED: '出票失败',
+  SWAPPED: '已换人',
 };
 const zhStatus = (s: OrderStatus): string => ORDER_STATUS_LABEL_ZH[s] ?? s;
 
@@ -316,7 +318,24 @@ export const ALLOWED_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   CHANGE_REQUESTED: ['CHANGED', 'PAID', 'PROCESSING', 'TICKETED', 'REFUND_REQUESTED'], // 驳回→PAID/PROCESSING，批准→CHANGED，已出票改签→TICKETED，取消→REFUND_REQUESTED
   CHANGED: ['PROCESSING', 'TICKETED', 'COMPLETED', 'REFUND_REQUESTED'], // 改签后继续出票流程或直接完结/退款
   FAILED: ['PROCESSING', 'REFUND_REQUESTED', 'CANCELLED'],
+  // 已换人：终态。本期不做「撤销已换人」；ADMIN force 的既有兜底照旧可用（force 拉回占座态会重新占座）。
+  // 进入这条边不在白名单里：只能经 markSwapped（via:'swap'）——它先把应收收敛到换人费、把多付
+  // 转存，再推状态；直接 PATCH /status（含 force）一律被 _updateStatusWithinTx 的账目闸拦下。
+  SWAPPED: [],
 };
+
+// 可标记「已换人」的来源状态（SWAP_ELIGIBLE）：占座中且钱账可处置的六态。
+//   · COMPLETED 不在内：已完成的单没有位子可让；
+//   · FAILED 不在内：出票失败单的钱走退款/重处理，不是换人；
+//   · 不因起飞而拦：已飞航段照 isLegAlreadyFlown 不退座，只释放未飞航段（全飞完由前端二次确认）。
+export const SWAP_ELIGIBLE_STATUSES: OrderStatus[] = [
+  'PENDING_PAYMENT',
+  'PAID',
+  'PROCESSING',
+  'TICKETED',
+  'CHANGE_REQUESTED',
+  'CHANGED',
+];
 
 // ════════════════════════════════════════════════════════════════════════════
 // 结算档次 ↔ 酒店星级：唯一权威映射
@@ -434,6 +453,8 @@ export const SEAT_RELEASING_STATUSES: OrderStatus[] = [
   'FAILED',
   'DRAFT',
   'REFUND_REQUESTED',
+  // 已换人：位子让给了新单，本单不再占座（未飞航段当场释放；已飞航段同取消口径不退）。
+  'SWAPPED',
 ];
 
 // 订单落「取消族」终态 → 履约任务应被终态化（CANCELLED），而非仅靠列表查询过滤隐藏。
@@ -446,6 +467,8 @@ export const FULFILLMENT_TERMINATING_STATUSES: OrderStatus[] = [
   'REFUNDED',
   'PAYMENT_TIMEOUT',
   'FAILED',
+  // 已换人：原客人不再出行，出票/送签/订房任务同取消口径终态化，权益核销同样自动冲正。
+  'SWAPPED',
 ];
 
 // ── 已取消单恢复（POST /orders/:id/restore-cancelled）────────────────────────────
@@ -485,14 +508,50 @@ export type RestoreLegRecord = {
   seatQuantity: number;
 };
 
+/** 标记已换人时逐航段的去向（审计 after 与响应 audit 同用）。 */
+export type MarkSwappedLegRecord = {
+  itemId: string;
+  itemLabel: string;
+  flightNumber: string;
+};
+
+/** 标记已换人的审计载荷（路由写 MARK_ORDER_SWAPPED 审计、前端弹结果都用它）。 */
+export interface MarkSwappedAudit {
+  orderNumber: string;
+  fromStatus: OrderStatus;
+  swapFeeCny: number;
+  /** 收敛前的应收（total + adjustmentCny）。 */
+  beforePayableCny: number;
+  /** 净收款（已付 − 已完成退款 + 预存抵扣）。 */
+  netPaidCny: number;
+  /** 调价行金额（换人费 − 原应收；0 = 没落行）。 */
+  adjustmentDeltaCny: number;
+  adjustmentItemId: string | null;
+  /** 多出款项去向：代理余额 / 挂账池；null = 没有多付。 */
+  disposal:
+    | { kind: 'AGENT_BALANCE'; amountCny: number; agentId: string; agentBalanceAfter: number }
+    | { kind: 'RECEIPT_POOL'; amountCny: number; receiptId: string; receiptNo: string }
+    | null;
+  /** 换人费 − 净收款 > 0 时的欠款（保留在单上照常收）。 */
+  outstandingCny: number;
+  replacementOrderNumber: string | null;
+  /** 已起飞航段（不退座）。 */
+  flownLegs: MarkSwappedLegRecord[];
+  /** 未起飞航段（本次释放座位）。 */
+  releasedLegs: MarkSwappedLegRecord[];
+  note: string | null;
+}
+
 /**
  * _updateStatusWithinTx 的内部调用选项——只给服务内部的编排函数用，绝不经路由透传：
  *   · via:'restore'：restoreCancelledOrder 专用，放行 CANCELLED/PAYMENT_TIMEOUT → PENDING_PAYMENT/PAID
  *     这条边，并把重新占座分支的「余位不足」从 400 换成可二次确认的 409（allowOversell 放行超售）。
+ *   · via:'swap'：markSwapped 专用，放行 SWAP_ELIGIBLE_STATUSES → SWAPPED 这条边；这也是进 SWAPPED
+ *     的**唯一**通道（普通 PATCH /status 与 admin force 都会被账目闸拦下）。
  *   · retakenSeatsOut：把占回的座位逐舱收集出来给审计用。
  */
 export interface UpdateStatusInternalOpts {
-  via?: 'restore';
+  via?: 'restore' | 'swap';
   allowOversell?: boolean;
   retakenSeatsOut?: RetakenSeatRecord[];
   /**
@@ -1964,6 +2023,8 @@ const AGENT_STATS_PAID_STATUSES: OrderStatus[] = [
   OrderStatus.PAID,
   OrderStatus.TICKETED,
   OrderStatus.COMPLETED,
+  // 已换人：本单应收已收敛为换人费，那笔钱是真实成交额（接手的新单另算自己的），不因换人蒸发。
+  OrderStatus.SWAPPED,
 ];
 
 /** 代理行查不到（已删/脏数据）时的兜底名，与前台列表同一标签，不静默丢掉这笔成交额。*/
@@ -5124,6 +5185,7 @@ export class OrderService {
             OrderStatus.REFUNDED,
             OrderStatus.PAYMENT_TIMEOUT,
             OrderStatus.FAILED,
+            OrderStatus.SWAPPED,
           ],
         },
       };
@@ -5420,6 +5482,11 @@ export class OrderService {
     // 双重保险：只有释放型状态才允许删（与守卫语义对称，防未来新增状态漏网）
     if (!SEAT_RELEASING_STATUSES.includes(order.status)) {
       throw new BadRequestError('该订单当前状态不允许删除');
+    }
+    // 已换人单虽已释放座位，但它的换人费是计入营收/报表的真实收入（与已取消单不同），
+    // 删了就从财务口径里消失；要抹掉换人费请走调价把应收改为 0，而不是删单。
+    if (order.status === OrderStatus.SWAPPED) {
+      throw new BadRequestError('已换人的订单是营收记录（换人费），不允许删除；如需修正换人费请走调价');
     }
 
     const refundedTotal = order.refunds.reduce((sum, r) => sum + Number(r.amount), 0);
@@ -6438,94 +6505,114 @@ export class OrderService {
       throw new ForbiddenError('仅运营/管理员可将多付存入代理余额');
     }
 
-    return prisma.$transaction(async (tx) => {
-      // FOR UPDATE 行锁：事务内读最新 paidAmount/total，避免与并发到账/抵扣用旧快照
-      const rows = await tx.$queryRaw<
-        Array<{
-          id: string;
-          orderNumber: string;
-          agentId: string | null;
-          total: Prisma.Decimal;
-          adjustmentCny: number;
-          paidAmount: Prisma.Decimal;
-          prepaymentOffset: Prisma.Decimal;
-          status: OrderStatus;
-          deletedAt: Date | null;
-          paymentsLocked: boolean;
-        }>
-      >`SELECT id, "orderNumber", "agentId", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status, "deletedAt", "paymentsLocked" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
-      const order = rows[0];
-      if (!order) throw new NotFoundError('订单不存在');
-      // 资金处置闸：死单/软删单不许再动钱（避免账实分叉）
-      assertOrderAllowsFundsDisposal(order, '将多付存入代理余额');
-      // 收款复核锁：锁定 = 冻结 paidAmount 的一切人工变动，多付转存也是在改 paidAmount（回压到 total），
-      // 与人工录收款同一把锁；对账认款（真钱到账）仍不受此锁约束。
-      assertPaymentsNotLocked(order, '将多付存入代理余额');
-      if (!order.agentId) throw new BadRequestError('该订单无归属代理，无法存入代理余额');
+    return prisma.$transaction((tx) => this._creditOverpayToAgentWithinTx(tx, orderId, actor));
+  }
 
-      const total = Number(order.total);
-      const paid = Number(order.paidAmount);
-      // 已完成退款必须先从 paidAmount 里扣掉再算多付：退款完成不减 paidAmount（REFUNDED 只翻 Refund 状态），
-      // 不扣就会把同一笔多付「先退给客户、再转存代理余额」取两次（公司净损失）。
-      const refunded = await sumCompletedRefundsWithinTx(tx, orderId);
-      // 多付 = 清账口径下的负尾款（含改期费/预存抵扣），与 serializeOrder.balanceDue<0 一字一致：
-      //   overpay = (paidAmount − 已退款) + prepaymentOffset − (total + adjustmentCny)
-      // 不能只按 paid−total，否则有改期费的单会把「还没收齐的改期费」误当多付存进代理余额。
-      const clearingPoint = round2(total + order.adjustmentCny - Number(order.prepaymentOffset));
-      const overpay = round2(paid - refunded - clearingPoint);
-      if (overpay <= 0) {
-        throw new BadRequestError('该订单没有多付金额（已付款扣除已退款 ≤ 应付），无可存入余额');
-      }
+  /**
+   * creditOverpayToAgent 的事务内核 —— 单独的「多付存入代理余额」端点与「标记已换人」
+   * （markSwapped：应收收敛到换人费后把多出的钱转存）共用。调用方负责包 $transaction 与鉴权。
+   * 闸门（处置闸 / 收款复核锁 / 无代理 / 无多付）全部留在这里，两条入口口径不分叉。
+   */
+  async _creditOverpayToAgentWithinTx(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    ok: true;
+    orderId: string;
+    orderNumber: string;
+    agentId: string;
+    creditedAmount: number;
+    newPaidAmount: number;
+    total: number;
+    agentBalanceAfter: number;
+  }> {
+    // FOR UPDATE 行锁：事务内读最新 paidAmount/total，避免与并发到账/抵扣用旧快照
+    const rows = await tx.$queryRaw<
+      Array<{
+        id: string;
+        orderNumber: string;
+        agentId: string | null;
+        total: Prisma.Decimal;
+        adjustmentCny: number;
+        paidAmount: Prisma.Decimal;
+        prepaymentOffset: Prisma.Decimal;
+        status: OrderStatus;
+        deletedAt: Date | null;
+        paymentsLocked: boolean;
+      }>
+    >`SELECT id, "orderNumber", "agentId", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status, "deletedAt", "paymentsLocked" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+    const order = rows[0];
+    if (!order) throw new NotFoundError('订单不存在');
+    // 资金处置闸：死单/软删单不许再动钱（避免账实分叉）
+    assertOrderAllowsFundsDisposal(order, '将多付存入代理余额');
+    // 收款复核锁：锁定 = 冻结 paidAmount 的一切人工变动，多付转存也是在改 paidAmount（回压到 total），
+    // 与人工录收款同一把锁；对账认款（真钱到账）仍不受此锁约束。
+    assertPaymentsNotLocked(order, '将多付存入代理余额');
+    if (!order.agentId) throw new BadRequestError('该订单无归属代理，无法存入代理余额');
 
-      // 代理余额行锁 + 事务内累加（与 settlements PAID 抵扣同一并发安全口径）
-      const agentRows = await tx.$queryRaw<Array<{ prepaymentBalance: Prisma.Decimal }>>`
-        SELECT "prepaymentBalance" FROM "Agent" WHERE id = ${order.agentId} FOR UPDATE
-      `;
-      if (!agentRows[0]) throw new NotFoundError('代理不存在');
-      const balanceAfter = round2(Number(agentRows[0].prepaymentBalance) + overpay);
+    const total = Number(order.total);
+    const paid = Number(order.paidAmount);
+    // 已完成退款必须先从 paidAmount 里扣掉再算多付：退款完成不减 paidAmount（REFUNDED 只翻 Refund 状态），
+    // 不扣就会把同一笔多付「先退给客户、再转存代理余额」取两次（公司净损失）。
+    const refunded = await sumCompletedRefundsWithinTx(tx, orderId);
+    // 多付 = 清账口径下的负尾款（含改期费/预存抵扣），与 serializeOrder.balanceDue<0 一字一致：
+    //   overpay = (paidAmount − 已退款) + prepaymentOffset − (total + adjustmentCny)
+    // 不能只按 paid−total，否则有改期费的单会把「还没收齐的改期费」误当多付存进代理余额。
+    const clearingPoint = round2(total + order.adjustmentCny - Number(order.prepaymentOffset));
+    const overpay = round2(paid - refunded - clearingPoint);
+    if (overpay <= 0) {
+      throw new BadRequestError('该订单没有多付金额（已付款扣除已退款 ≤ 应付），无可存入余额');
+    }
 
-      await tx.agent.update({
-        where: { id: order.agentId },
-        data: { prepaymentBalance: new Prisma.Decimal(balanceAfter) },
-      });
-      // 多付回压：paidAmount 只扣掉本次转存的 overpay（无退款时等于降回清账点，与旧行为一致）。
-      // 不直接写 clearingPoint：那样会把「已退款但仍留在 paidAmount 里」的部分也一并抹掉，
-      // 与系统其它处（退款不减 paidAmount）的口径冲突。
-      await tx.order.update({
-        where: { id: orderId },
-        data: { paidAmount: new Prisma.Decimal(round2(paid - overpay)) },
-      });
-      await tx.prepaymentTransaction.create({
-        data: {
-          agentId: order.agentId,
-          amount: new Prisma.Decimal(overpay), // 正数 = 入账
-          balanceAfter: new Prisma.Decimal(balanceAfter),
-          type: PrepaymentTxType.TOP_UP,
-          orderId,
-          description: `订单 ${order.orderNumber} 多付转存代理余额`,
-          createdById: actor.userId,
-        },
-      });
-      // R6：台账同步登记等额流出，否则订单再进一次 PAID 就会按 SUCCEEDED 合计把多付灌回（造币循环）。
-      await this._recordOverpayDisposalPayment(tx, {
-        orderId,
-        amountCny: overpay,
-        method: await this._latestInboundPaymentMethod(tx, orderId),
-        disposal: 'AGENT_BALANCE',
-        description: `订单 ${order.orderNumber} 多付转存代理余额`,
-      });
+    // 代理余额行锁 + 事务内累加（与 settlements PAID 抵扣同一并发安全口径）
+    const agentRows = await tx.$queryRaw<Array<{ prepaymentBalance: Prisma.Decimal }>>`
+      SELECT "prepaymentBalance" FROM "Agent" WHERE id = ${order.agentId} FOR UPDATE
+    `;
+    if (!agentRows[0]) throw new NotFoundError('代理不存在');
+    const balanceAfter = round2(Number(agentRows[0].prepaymentBalance) + overpay);
 
-      return {
-        ok: true as const,
-        orderId,
-        orderNumber: order.orderNumber,
-        agentId: order.agentId,
-        creditedAmount: overpay,
-        newPaidAmount: round2(paid - overpay),
-        total,
-        agentBalanceAfter: balanceAfter,
-      };
+    await tx.agent.update({
+      where: { id: order.agentId },
+      data: { prepaymentBalance: new Prisma.Decimal(balanceAfter) },
     });
+    // 多付回压：paidAmount 只扣掉本次转存的 overpay（无退款时等于降回清账点，与旧行为一致）。
+    // 不直接写 clearingPoint：那样会把「已退款但仍留在 paidAmount 里」的部分也一并抹掉，
+    // 与系统其它处（退款不减 paidAmount）的口径冲突。
+    await tx.order.update({
+      where: { id: orderId },
+      data: { paidAmount: new Prisma.Decimal(round2(paid - overpay)) },
+    });
+    await tx.prepaymentTransaction.create({
+      data: {
+        agentId: order.agentId,
+        amount: new Prisma.Decimal(overpay), // 正数 = 入账
+        balanceAfter: new Prisma.Decimal(balanceAfter),
+        type: PrepaymentTxType.TOP_UP,
+        orderId,
+        description: `订单 ${order.orderNumber} 多付转存代理余额`,
+        createdById: actor.userId,
+      },
+    });
+    // R6：台账同步登记等额流出，否则订单再进一次 PAID 就会按 SUCCEEDED 合计把多付灌回（造币循环）。
+    await this._recordOverpayDisposalPayment(tx, {
+      orderId,
+      amountCny: overpay,
+      method: await this._latestInboundPaymentMethod(tx, orderId),
+      disposal: 'AGENT_BALANCE',
+      description: `订单 ${order.orderNumber} 多付转存代理余额`,
+    });
+
+    return {
+      ok: true as const,
+      orderId,
+      orderNumber: order.orderNumber,
+      agentId: order.agentId,
+      creditedAmount: overpay,
+      newPaidAmount: round2(paid - overpay),
+      total,
+      agentBalanceAfter: balanceAfter,
+    };
   }
 
   /**
@@ -6703,69 +6790,88 @@ export class OrderService {
       throw new ForbiddenError('仅运营/管理员可将订单超额转入挂账池');
     }
 
-    return prisma.$transaction(async (tx) => {
-      // 订单行锁 + 事务内读最新 paidAmount/total（与并发到账/抵扣同一并发安全口径）
-      const rows = await tx.$queryRaw<
-        Array<{ id: string; orderNumber: string; total: Prisma.Decimal; adjustmentCny: number; paidAmount: Prisma.Decimal; prepaymentOffset: Prisma.Decimal; status: OrderStatus; deletedAt: Date | null; paymentsLocked: boolean }>
-      >`SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status, "deletedAt", "paymentsLocked" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
-      const order = rows[0];
-      if (!order) throw new NotFoundError('订单不存在');
-      // 资金处置闸：死单/软删单不许再动钱。
-      assertOrderAllowsFundsDisposal(order, '将多付转入挂账池');
-      // 收款复核锁：转挂账池会把 paidAmount 回压到 total，同样是人工改动已付款，受同一把锁。
-      assertPaymentsNotLocked(order, '将多付转入挂账池');
+    return prisma.$transaction((tx) => this._overpayToPoolWithinTx(tx, orderId, actor));
+  }
 
-      const total = Number(order.total);
-      const paid = Number(order.paidAmount);
-      // 已完成退款先扣（同 creditOverpayToAgent 口径），避免多付被退款+转挂账池取两次。
-      const refunded = await sumCompletedRefundsWithinTx(tx, orderId);
-      // 多付 = 清账口径下的负尾款（含改期费/预存抵扣），与 creditOverpayToAgent / serializeOrder.balanceDue<0 一字一致。
-      const clearingPoint = round2(total + order.adjustmentCny - Number(order.prepaymentOffset));
-      const overpay = round2(paid - refunded - clearingPoint);
-      if (overpay <= 0) {
-        throw new BadRequestError('该订单没有多付金额（已付款扣除已退款 ≤ 应付），无可转入挂账池');
-      }
+  /**
+   * overpayToPool 的事务内核 —— 单独的「多付转挂账池」端点与「标记已换人」（markSwapped，
+   * 直客单把多出的钱转池）共用。调用方负责包 $transaction 与鉴权；闸门全部留在这里。
+   */
+  async _overpayToPoolWithinTx(
+    tx: Prisma.TransactionClient,
+    orderId: string,
+    actor: { userId: string; role: UserRole },
+  ): Promise<{
+    ok: true;
+    orderId: string;
+    orderNumber: string;
+    movedAmount: number;
+    newPaidAmount: number;
+    total: number;
+    receiptId: string;
+    receiptNo: string;
+  }> {
+    // 订单行锁 + 事务内读最新 paidAmount/total（与并发到账/抵扣同一并发安全口径）
+    const rows = await tx.$queryRaw<
+      Array<{ id: string; orderNumber: string; total: Prisma.Decimal; adjustmentCny: number; paidAmount: Prisma.Decimal; prepaymentOffset: Prisma.Decimal; status: OrderStatus; deletedAt: Date | null; paymentsLocked: boolean }>
+    >`SELECT id, "orderNumber", total, "adjustmentCny", "paidAmount", "prepaymentOffset", status, "deletedAt", "paymentsLocked" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+    const order = rows[0];
+    if (!order) throw new NotFoundError('订单不存在');
+    // 资金处置闸：死单/软删单不许再动钱。
+    assertOrderAllowsFundsDisposal(order, '将多付转入挂账池');
+    // 收款复核锁：转挂账池会把 paidAmount 回压到 total，同样是人工改动已付款，受同一把锁。
+    assertPaymentsNotLocked(order, '将多付转入挂账池');
 
-      // method 兜底：取最近一笔**真实收款**的 method（排除负金额对冲行），否则 WECHAT_PAY
-      const method = await this._latestInboundPaymentMethod(tx, orderId);
+    const total = Number(order.total);
+    const paid = Number(order.paidAmount);
+    // 已完成退款先扣（同 creditOverpayToAgent 口径），避免多付被退款+转挂账池取两次。
+    const refunded = await sumCompletedRefundsWithinTx(tx, orderId);
+    // 多付 = 清账口径下的负尾款（含改期费/预存抵扣），与 creditOverpayToAgent / serializeOrder.balanceDue<0 一字一致。
+    const clearingPoint = round2(total + order.adjustmentCny - Number(order.prepaymentOffset));
+    const overpay = round2(paid - refunded - clearingPoint);
+    if (overpay <= 0) {
+      throw new BadRequestError('该订单没有多付金额（已付款扣除已退款 ≤ 应付），无可转入挂账池');
+    }
 
-      // 多付回压：paidAmount 只扣掉本次转出的 overpay（无退款时等于降回清账点，与旧行为一致）。
-      await tx.order.update({
-        where: { id: orderId },
-        data: { paidAmount: new Prisma.Decimal(round2(paid - overpay)) },
-      });
-      // 建一笔 OPEN 进账（挂账池），来源标记订单超额
-      const receipt = await createOpenReceiptWithinTx(tx, {
-        amountCny: overpay,
-        method,
-        source: ReceiptSource.ORDER_OVERPAY,
-        payerNote: `订单超额 ${order.orderNumber}`,
-        orderHintId: orderId,
-        createdById: actor.userId,
-      });
+    // method 兜底：取最近一笔**真实收款**的 method（排除负金额对冲行），否则 WECHAT_PAY
+    const method = await this._latestInboundPaymentMethod(tx, orderId);
 
-      // R6：台账同步登记等额流出，否则订单再进一次 PAID 就会按 SUCCEEDED 合计把多付灌回（造币循环）。
-      // 对冲行载荷埋进账 id：订单详情据此把「这笔多付转去了哪、后来核销到了谁」永久挂在这一行上。
-      await this._recordOverpayDisposalPayment(tx, {
-        orderId,
-        amountCny: overpay,
-        method,
-        disposal: 'RECEIPT_POOL',
-        description: `订单 ${order.orderNumber} 多付转入挂账池`,
-        poolReceipt: { id: receipt.id, receiptNo: receipt.receiptNo },
-      });
-
-      return {
-        ok: true as const,
-        orderId,
-        orderNumber: order.orderNumber,
-        movedAmount: overpay,
-        newPaidAmount: round2(paid - overpay),
-        total,
-        receiptId: receipt.id,
-        receiptNo: receipt.receiptNo,
-      };
+    // 多付回压：paidAmount 只扣掉本次转出的 overpay（无退款时等于降回清账点，与旧行为一致）。
+    await tx.order.update({
+      where: { id: orderId },
+      data: { paidAmount: new Prisma.Decimal(round2(paid - overpay)) },
     });
+    // 建一笔 OPEN 进账（挂账池），来源标记订单超额
+    const receipt = await createOpenReceiptWithinTx(tx, {
+      amountCny: overpay,
+      method,
+      source: ReceiptSource.ORDER_OVERPAY,
+      payerNote: `订单超额 ${order.orderNumber}`,
+      orderHintId: orderId,
+      createdById: actor.userId,
+    });
+
+    // R6：台账同步登记等额流出，否则订单再进一次 PAID 就会按 SUCCEEDED 合计把多付灌回（造币循环）。
+    // 对冲行载荷埋进账 id：订单详情据此把「这笔多付转去了哪、后来核销到了谁」永久挂在这一行上。
+    await this._recordOverpayDisposalPayment(tx, {
+      orderId,
+      amountCny: overpay,
+      method,
+      disposal: 'RECEIPT_POOL',
+      description: `订单 ${order.orderNumber} 多付转入挂账池`,
+      poolReceipt: { id: receipt.id, receiptNo: receipt.receiptNo },
+    });
+
+    return {
+      ok: true as const,
+      orderId,
+      orderNumber: order.orderNumber,
+      movedAmount: overpay,
+      newPaidAmount: round2(paid - overpay),
+      total,
+      receiptId: receipt.id,
+      receiptNo: receipt.receiptNo,
+    };
   }
 
   // ════════════════════════════════════════════════════════════════════
@@ -8464,7 +8570,26 @@ export class OrderService {
       opts?.via === 'restore' &&
       RESTORABLE_CANCELLED_STATUSES.includes(order.status) &&
       (toStatus === OrderStatus.PENDING_PAYMENT || toStatus === OrderStatus.PAID);
-    if (!allowed.includes(toStatus) && !isAdminForce && !isRestoreVia) {
+    // ── SWAPPED 账目闸（与 →REFUND_REQUESTED / →REFUNDED 的账目闸同构）───────────────
+    // 「已换人」不是一个可以手点的标签：它意味着应收已收敛到换人费、多付已转存代理余额/挂账池。
+    // 只翻状态不动钱，会留下一张「状态说只收换人费、应收却还是全价」的单——欠款凭空冒出来，
+    // 多付也没人处置。唯一正门是 markSwapped（via:'swap'），**admin force 同样拦**：
+    // force 是用来跳状态机的，不是用来跳账的。
+    const isSwapVia =
+      opts?.via === 'swap' &&
+      SWAP_ELIGIBLE_STATUSES.includes(order.status) &&
+      toStatus === OrderStatus.SWAPPED;
+    if (toStatus === OrderStatus.SWAPPED && !isSwapVia) {
+      throw new BadRequestError(
+        `订单 ${order.orderNumber} 不能直接置为「已换人」——那只会翻状态、不会把应收收敛到换人费，` +
+          `也不会把多付转存。请改用订单详情页 / 列表「改状态…」里的「已换人…」：` +
+          `系统会按换人费调价、把多出的钱转入代理余额或挂账池，再释放未飞航段的座位。` +
+          (SWAP_ELIGIBLE_STATUSES.includes(order.status)
+            ? ''
+            : `（当前状态「${zhStatus(order.status)}」本身也不可标记已换人）`),
+      );
+    }
+    if (!allowed.includes(toStatus) && !isAdminForce && !isRestoreVia && !isSwapVia) {
       // 高频误操作单独给指引：已收款的单不能一键取消——钱账要走退款通道，申请后机位立即释放。
       const cancelPaidHint =
         toStatus === 'CANCELLED' && allowed.includes('REFUND_REQUESTED')
@@ -10350,6 +10475,290 @@ export class OrderService {
       order: serializeOrder(result.order, orderSerializeRoleCtx(requester.role)),
       beforeReplacementOrderNumber: result.beforeReplacementOrderNumber,
       replacementOrderNumber: normalizedReplacementOrderNumber,
+    };
+  }
+
+  /**
+   * 标记已换人（POST /orders/:id/mark-swapped · ADMIN/STAFF）—— 换人的主路径（2026-09 运营口径）。
+   *
+   * 与「换人退款」（swapRefund：多出的钱退现金）的区别：这条路**钱留在系统里**——
+   * 原单只收换人费，多出的钱转进代理余额（代理单）或挂账池（直客单），运营再用它抵新单尾款；
+   * 收不够的照常当欠款催收。一个事务里依次：
+   *   a. 调价：加一条 SWAP_FEE 差额行把应收（total + adjustmentCny）收敛到换人费（复用事后调价内核，
+   *      结算价锁 / 调价资金闸同一套）；差额为 0 不留空行。换人费 0 = 一分不收（合法）。
+   *   b. 净收款 > 换人费 → 多出部分转存：代理单走 _creditOverpayToAgentWithinTx，直客单走
+   *      _overpayToPoolWithinTx（同一内核，收款复核锁在那里生效：锁着就拒，先解锁）；订单回压到恰好结清。
+   *      净收款 < 换人费 → 不动钱，欠款留在单上（应收 > 已收），后续照常收款。
+   *   c. 状态 → SWAPPED（via:'swap'，唯一正门）：与取消同一套释放副作用——未飞航段座位释放（已飞不退，
+   *      isLegAlreadyFlown 口径）、房控占房按状态集合自然退出、履约任务终态化、权益核销自动冲正、
+   *      代理佣金整单冲销（换人费不计佣，与换人退款口径一致）。
+   *   d. 写 swapFeeCny / swapReplacementOrderNumber（与换人退款共用字段；swapRefundedAt 不写——
+   *      那列的语义是「退过现金」，本路径没有退款）；接手单号填了就校验存在。
+   * 不做「撤销已换人」（本期不做）；ADMIN force 拉回占座态的既有兜底照旧。
+   */
+  async markSwapped(
+    orderId: string,
+    input: MarkSwappedBody,
+    requester: OrderRequester,
+  ): Promise<{
+    order: ReturnType<typeof serializeOrder>;
+    audit: MarkSwappedAudit;
+  }> {
+    if (requester.role !== UserRole.ADMIN && requester.role !== UserRole.STAFF) {
+      throw new ForbiddenError('仅运营/管理员可标记已换人');
+    }
+    if (!Number.isInteger(input.swapFeeCny) || input.swapFeeCny < 0) {
+      throw new BadRequestError('换人费必须是大于等于 0 的整数 CNY');
+    }
+    const swapFeeCny = input.swapFeeCny;
+    const note = input.note?.trim() || undefined;
+    const actor = { userId: requester.userId, role: requester.role };
+
+    const pendingFulfillmentTaskIds: string[] = [];
+    const releasedSeatClassIds: string[] = [];
+
+    const result = await prisma.$transaction(async (tx) => {
+      // 订单行锁先于一切金额读取与写入：避免并发收款/退款申请/调价看到同一笔旧净收款。
+      const lockedRows = await tx.$queryRaw<
+        Array<{
+          id: string;
+          orderNumber: string;
+          agentId: string | null;
+          status: OrderStatus;
+          deletedAt: Date | null;
+          total: Prisma.Decimal;
+          adjustmentCny: number;
+          paidAmount: Prisma.Decimal;
+          prepaymentOffset: Prisma.Decimal;
+          settlementLocked: boolean;
+          paymentsLocked: boolean;
+          internalNotes: string | null;
+        }>
+      >`
+        SELECT id, "orderNumber", "agentId", status, "deletedAt", total, "adjustmentCny", "paidAmount",
+               "prepaymentOffset", "settlementLocked", "paymentsLocked", "internalNotes"
+        FROM "Order"
+        WHERE id = ${orderId}
+        FOR UPDATE
+      `;
+      const locked = lockedRows[0];
+      if (!locked) throw new NotFoundError('订单不存在');
+      if (locked.deletedAt) {
+        throw new BadRequestError('订单在回收站（已软删），不可标记已换人；如需操作请先恢复');
+      }
+      if (!SWAP_ELIGIBLE_STATUSES.includes(locked.status)) {
+        throw new BadRequestError(
+          `订单当前状态「${zhStatus(locked.status)}」不可标记已换人，` +
+            `仅${SWAP_ELIGIBLE_STATUSES.map(zhStatus).join('/')}的订单可操作`,
+        );
+      }
+
+      // 进行中的退款（申请中/已批准/处理中）与换人互斥：应退额按申请那一刻的应收快照算，
+      // 这里一调价快照就错了；先把那条退款处理完（批准或驳回）再来。
+      const pendingRefund = await tx.refund.count({
+        where: {
+          orderId,
+          status: { in: [RefundStatus.REQUESTED, RefundStatus.APPROVED, RefundStatus.PROCESSING] },
+        },
+      });
+      if (pendingRefund > 0) {
+        throw new ConflictError('该订单已有待处理退款申请，请先处理完该退款申请再标记已换人');
+      }
+
+      // 锁的口径照抄现有通道：结算价锁 = 财务已按这个应收对过账，改应收先解锁（与事后调价同一句）；
+      // 收款复核锁只在「要动 paidAmount」（多付需转存）时生效，与多付转存端点同一把锁。
+      if (locked.settlementLocked) {
+        throw new ConflictError('结算价已锁定，请先解锁再标记已换人');
+      }
+
+      const refundedCny = await sumCompletedRefundsWithinTx(tx, orderId);
+      const paidCny = round2(Number(locked.paidAmount));
+      const prepaymentOffsetCny = round2(Number(locked.prepaymentOffset));
+      // 净收款 = 已付 − 已完成退款 + 预存抵扣（与多付转存内核的清账口径一字一致）。
+      const netPaidCny = round2(paidCny - refundedCny + prepaymentOffsetCny);
+      // 应收（清账口径）= total + adjustmentCny：改期费等售后费也在内，一并收敛到换人费。
+      const beforePayableCny = round2(Number(locked.total) + locked.adjustmentCny);
+      const overpayCny = Math.max(0, round2(netPaidCny - swapFeeCny));
+      const outstandingCny = Math.max(0, round2(swapFeeCny - netPaidCny));
+      if (overpayCny > 0) {
+        assertPaymentsNotLocked(locked, '标记已换人（多出的款项需转存）');
+      }
+
+      const replacementOrderNumber = input.replacementOrderNumber?.trim() || undefined;
+      if (replacementOrderNumber) {
+        const replacement = await tx.order.findUnique({
+          where: { orderNumber: replacementOrderNumber },
+          select: { id: true, deletedAt: true },
+        });
+        if (!replacement || replacement.deletedAt) {
+          throw new BadRequestError(
+            '填写的新订单号不存在，请核对；如果新单还没录，可以先留空，之后再补',
+          );
+        }
+        if (replacement.id === orderId) {
+          throw new BadRequestError('新订单号不能填本单自己');
+        }
+      }
+
+      // ── a. 调价：应收收敛到换人费（复用事后调价内核：锁价闸 / 资金闸 / 差额行 / 重算 total）──
+      const adjustmentDeltaCny = round2(swapFeeCny - beforePayableCny);
+      let adjustmentItemId: string | null = null;
+      if (adjustmentDeltaCny !== 0) {
+        const scratch = await this._addPriceAdjustmentWithinTx(
+          tx,
+          orderId,
+          {
+            amountCny: adjustmentDeltaCny,
+            reasonCode: 'SWAP_FEE',
+            reasonText: `应收由 ¥${beforePayableCny} 收敛为换人费 ¥${swapFeeCny}`,
+          },
+          actor,
+        );
+        adjustmentItemId = scratch.itemId;
+      }
+
+      // ── b. 多付转存：代理单进代理余额，直客单进挂账池（同一内核，订单回压到恰好结清）──
+      let disposal: MarkSwappedAudit['disposal'] = null;
+      if (overpayCny > 0) {
+        if (locked.agentId) {
+          const credited = await this._creditOverpayToAgentWithinTx(tx, orderId, actor);
+          disposal = {
+            kind: 'AGENT_BALANCE',
+            amountCny: credited.creditedAmount,
+            agentId: credited.agentId,
+            agentBalanceAfter: credited.agentBalanceAfter,
+          };
+        } else {
+          const moved = await this._overpayToPoolWithinTx(tx, orderId, actor);
+          disposal = {
+            kind: 'RECEIPT_POOL',
+            amountCny: moved.movedAmount,
+            receiptId: moved.receiptId,
+            receiptNo: moved.receiptNo,
+          };
+        }
+      }
+
+      // ── d. 换人标记（与换人退款共用两列；swapRefundedAt 不写）──
+      await tx.order.update({
+        where: { id: orderId },
+        data: {
+          swapFeeCny,
+          swapReplacementOrderNumber: replacementOrderNumber ?? null,
+        },
+      });
+
+      // 已飞/未飞航段清单（审计 + 响应）：与释放分支同一口径 isLegAlreadyFlown。
+      const legRows = await tx.orderItem.findMany({
+        where: { orderId, kind: OrderItemKind.FLIGHT, flightScheduleId: { not: null } },
+        select: {
+          id: true,
+          description: true,
+          flightScheduleId: true,
+          flightSchedule: { select: { departureTime: true, flight: { select: { flightNumber: true } } } },
+        },
+      });
+      const nowMs = Date.now();
+      const flownLegs: MarkSwappedLegRecord[] = [];
+      const releasedLegs: MarkSwappedLegRecord[] = [];
+      for (const leg of legRows) {
+        const rec: MarkSwappedLegRecord = {
+          itemId: leg.id,
+          itemLabel: leg.description,
+          flightNumber: leg.flightSchedule?.flight.flightNumber ?? '',
+        };
+        (isLegAlreadyFlown(leg, nowMs) ? flownLegs : releasedLegs).push(rec);
+      }
+
+      // ── c. 状态 → 已换人：与取消同一套释放副作用（座位 / 履约任务 / 核销冲正 / 佣金冲销）──
+      const statusReason =
+        `标记已换人（换人费 ¥${swapFeeCny}` +
+        `${replacementOrderNumber ? `，接手订单 ${replacementOrderNumber}` : ''}）${note ? `：${note}` : ''}`;
+      await this._updateStatusWithinTx(
+        tx,
+        orderId,
+        OrderStatus.SWAPPED,
+        requester,
+        statusReason,
+        pendingFulfillmentTaskIds,
+        undefined,
+        releasedSeatClassIds,
+        undefined,
+        { via: 'swap' },
+      );
+
+      const disposalLine =
+        disposal?.kind === 'AGENT_BALANCE'
+          ? `，多出 ¥${disposal.amountCny} 已存入代理余额`
+          : disposal?.kind === 'RECEIPT_POOL'
+            ? `，多出 ¥${disposal.amountCny} 已转入挂账池（${disposal.receiptNo}）`
+            : outstandingCny > 0
+              ? `，尚欠 ¥${outstandingCny}`
+              : '';
+      const noteLine =
+        `【已换人】${businessDateTime(new Date())} 换人费 ¥${swapFeeCny}（原应收 ¥${beforePayableCny}，净收 ¥${netPaidCny}）` +
+        `${disposalLine}${replacementOrderNumber ? `，接手订单 ${replacementOrderNumber}` : ''}` +
+        `${note ? `。备注：${note}` : ''}`;
+      const existingNotes = locked.internalNotes ?? '';
+      await tx.order.update({
+        where: { id: orderId },
+        data: { internalNotes: existingNotes.trim() ? `${existingNotes}\n${noteLine}` : noteLine },
+      });
+
+      const order = await tx.order.findUniqueOrThrow({
+        where: { id: orderId },
+        include: ORDER_FULL_INCLUDE,
+      });
+      const audit: MarkSwappedAudit = {
+        orderNumber: locked.orderNumber,
+        fromStatus: locked.status,
+        swapFeeCny,
+        beforePayableCny,
+        netPaidCny,
+        adjustmentDeltaCny,
+        adjustmentItemId,
+        disposal,
+        outstandingCny,
+        replacementOrderNumber: replacementOrderNumber ?? null,
+        flownLegs,
+        releasedLegs,
+        note: note ?? null,
+      };
+      return { order, audit };
+    });
+
+    // 事务提交后再入队 / 通知候补（与换人退款同一套善后）。
+    if (pendingFulfillmentTaskIds.length > 0 && process.env.ENABLE_AUTO_FULFILLMENT === 'true') {
+      const { fulfillmentQueue } = await import('../../queues/queue.js');
+      for (const taskId of pendingFulfillmentTaskIds) {
+        void fulfillmentQueue.add('auto-fulfill', { taskId }, { jobId: taskId, delay: 1000 }).catch((e) => {
+          // eslint-disable-next-line no-console
+          console.error('[orders] failed to enqueue fulfillment task:', e);
+        });
+      }
+    }
+    try {
+      const { cancelSeatHoldRelease } = await import('../../queues/queue.js');
+      await cancelSeatHoldRelease(orderId);
+    } catch (err) {
+      // eslint-disable-next-line no-console
+      console.error('[orders] failed to cancel seat-hold job for', orderId, err);
+    }
+    if (releasedSeatClassIds.length > 0) {
+      try {
+        const { enqueueWaitlistCheck } = await import('../../queues/queue.js');
+        await Promise.all(
+          [...new Set(releasedSeatClassIds)].map((seatClassId) => enqueueWaitlistCheck(seatClassId)),
+        );
+      } catch (err) {
+        // eslint-disable-next-line no-console
+        console.error('[orders] failed to enqueue waitlist-check for', orderId, err);
+      }
+    }
+
+    return {
+      order: serializeOrder(result.order, orderSerializeRoleCtx(requester.role)),
+      audit: result.audit,
     };
   }
 
@@ -17634,7 +18043,11 @@ export class OrderService {
   async _addPriceAdjustmentWithinTx(
     tx: Prisma.TransactionClient,
     orderId: string,
-    input: OrderPriceAdjustmentBody,
+    /**
+     * reasonCode 放宽到含 endpoint-only 码（SWAP_FEE 等）：标记已换人在事务内复用本内核把应收
+     * 收敛到换人费。HTTP 入口（orderPriceAdjustmentBodySchema）仍只认四类人工原因，运营下拉不变。
+     */
+    input: Omit<OrderPriceAdjustmentBody, 'reasonCode'> & { reasonCode: PriceAdjustmentReasonDisplay },
     actor: { userId: string; role: UserRole },
     /**
      * 批量按人调价（PER_PAX）传进来的单价注记，会原样进调整行描述（「每人 ¥700 × 2 人」）。

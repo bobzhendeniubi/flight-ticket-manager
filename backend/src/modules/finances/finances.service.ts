@@ -292,6 +292,8 @@ const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.REFUND_REQUESTED,
   OrderStatus.CHANGE_REQUESTED,
   OrderStatus.CHANGED,
+  // 已换人：应收已收敛为换人费（SWAP_FEE 差额行进了 total），是真实收入，按明细行正常展开。
+  OrderStatus.SWAPPED,
 ];
 
 function toDateOnlyUtc(s: string, endOfDay = false): Date {

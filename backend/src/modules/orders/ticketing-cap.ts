@@ -73,6 +73,7 @@ const STATUS_LABEL: Record<OrderStatus, string> = {
   COMPLETED: '已完成',
   PAYMENT_TIMEOUT: '支付超时',
   CANCELLED: '已取消',
+  SWAPPED: '已换人',
   REFUNDED: '已退款',
   REFUND_REQUESTED: '退款申请中',
   CHANGE_REQUESTED: '改签申请中',
