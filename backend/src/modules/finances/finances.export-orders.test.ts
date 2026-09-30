@@ -61,6 +61,7 @@ describe('buildFinanceExportByOrderWorkbook — 退款类型结构化列', () =>
             swapFeeCny: 450,
             swapReplacementOrderNumber: 'ORDER-NEW',
             agent: null,
+            passengers: [],
             items: [],
           },
           {
@@ -69,6 +70,7 @@ describe('buildFinanceExportByOrderWorkbook — 退款类型结构化列', () =>
             swapFeeCny: null,
             swapReplacementOrderNumber: null,
             agent: null,
+            passengers: [],
             items: [],
           },
         ]),
@@ -89,5 +91,74 @@ describe('buildFinanceExportByOrderWorkbook — 退款类型结构化列', () =>
     expect(ws.getRow(2).getCell(col('接手订单号')).value).toBe('ORDER-NEW');
     expect(ws.getRow(3).getCell(col('退款类型')).value).toBe('普通退款');
     expect(ws.getRow(3).getCell(col('换人费(元)')).value).toBe('');
+  });
+});
+
+describe('buildFinanceExportByOrderWorkbook — 原地换人记录列', () => {
+  it('一单多次换人合成一格，按时间先后用「；」分隔；取数带拆单祖先单', async () => {
+    getOrderPnlMock.mockResolvedValue([
+      {
+        orderId: 'order-c',
+        orderNumber: 'ORDER-C',
+        status: 'PAID',
+        contactName: '换人客户',
+        createdAt: '2026-01-05T00:00:00.000Z',
+        totalCny: 2000,
+        costCny: null,
+        grossMarginCny: null,
+        marginPct: null,
+        itemCount: 1,
+        missingCostItemCount: 1,
+      },
+    ]);
+    const auditFindMany = vi.fn().mockResolvedValue([
+      {
+        createdAt: new Date('2026-01-12T03:00:00.000Z'),
+        before: { passengerId: 'p2', fullName: 'LI/SI', documentNumber: 'E3' },
+        after: { fullName: 'WANG/WU', documentNumber: 'E4', feeCny: 0 },
+      },
+      {
+        createdAt: new Date('2026-01-10T03:00:00.000Z'),
+        before: { passengerId: 'p1', fullName: 'QIN/XUE', documentNumber: 'E1' },
+        after: { fullName: 'YANG/LIN', documentNumber: 'E2', feeCny: 450 },
+      },
+    ]);
+    const splitFindMany = vi
+      .fn()
+      .mockResolvedValueOnce([{ sourceOrderId: 'order-parent' }])
+      .mockResolvedValue([]);
+    const client = {
+      order: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: 'order-c',
+            swapRefundedAt: null,
+            swapFeeCny: null,
+            swapReplacementOrderNumber: null,
+            agent: null,
+            passengers: [
+              { id: 'p1', chineseName: '杨林' },
+              { id: 'p2', chineseName: null },
+            ],
+            items: [],
+          },
+        ]),
+      },
+      auditLog: { findMany: auditFindMany },
+      orderSplitRecord: { findMany: splitFindMany },
+    } as unknown as PrismaClient;
+
+    const ws = (await loadWorkbook(await buildFinanceExportByOrderWorkbook(RANGE, client))).getWorksheet(
+      '订单毛利',
+    )!;
+    const headers = ws.getRow(1).values as unknown[];
+    const col = headers.indexOf('换人记录');
+    expect(col).toBeGreaterThan(0);
+    expect(ws.getRow(2).getCell(col).value).toBe(
+      '01-10 原 QIN/XUE → 新 YANG/LIN 杨林，换人费 ¥450；01-12 原 LI/SI → 新 WANG/WU',
+    );
+    // 换人审计挂在换人当时的单上：拆单前的祖先单要一并查。
+    const where = auditFindMany.mock.calls[0][0].where as { targetId: { in: string[] } };
+    expect(where.targetId.in).toEqual(expect.arrayContaining(['order-c', 'order-parent']));
   });
 });

@@ -69,6 +69,7 @@ import { SUBMISSION_BADGE, SUBMISSION_LABEL } from '../lib/visaSubmission';
 import { useConfirm } from '../components/ConfirmDialog';
 import { Modal, useDialogA11y } from '../components/Modal';
 import { groupHotelsByBundleTier } from '../lib/settlement-tier';
+import { SWAP_LINKED_ADJUSTMENT_TYPES, swapAdjustmentTitle } from '../lib/swapFeeLine';
 import { ChangeRequestModal } from '../components/ChangeRequestModal';
 import { OrderChangeRequestsPanel } from '../components/OrderChangeRequestsPanel';
 import { BatchOrderChangeRequestModal } from '../components/BatchOrderChangeRequestModal';
@@ -11330,8 +11331,50 @@ const ZERO_AMOUNT_ADJUSTMENT_LABEL: Record<string, string> = {
   RETURN_LEG_VOIDED: '回程作废',
 };
 
+/**
+ * 售后费用区用的换人历史：只有本单确实有换人费/换人差价流水、且当前角色读得了审计（ADMIN/STAFF）
+ * 时才拉一次 SWAP_ORDER_PASSENGER 审计，其余情况不发请求。
+ * 拉失败不影响展示：swapAdjustmentTitle 对不上审计时退回「原 X，日期」，只是少了新人名字。
+ */
+function useSwapHistoryForAdjustments(
+  orderId: string,
+  adjustments: ReadonlyArray<{ type: string }>,
+): PassengerHistoryEntry[] {
+  const token = useAuth((s) => s.tokens)?.accessToken ?? '';
+  const canReadAudit = useAuth((s) => s.user?.role === 'ADMIN' || s.user?.role === 'STAFF');
+  const hasSwapMoney = adjustments.some((a) => SWAP_LINKED_ADJUSTMENT_TYPES.has(a.type));
+  const [history, setHistory] = useState<PassengerHistoryEntry[]>([]);
+  useEffect(() => {
+    if (!token || !canReadAudit || !hasSwapMoney) {
+      setHistory([]);
+      return;
+    }
+    let cancelled = false;
+    api
+      .listAuditLogs(token, {
+        targetType: 'ORDER',
+        targetId: orderId,
+        action: 'SWAP_ORDER_PASSENGER',
+        pageSize: 100,
+      })
+      .then((res) => {
+        if (!cancelled) setHistory(auditToPassengerHistory(res.logs));
+      })
+      .catch(() => {
+        // 与乘客卡换人历史同一处理：审计读失败就降级展示（换人费行只显示原乘客与日期），
+        // 金额与流水本身来自订单，不受影响。
+        if (!cancelled) setHistory([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [token, canReadAudit, hasSwapMoney, orderId]);
+  return history;
+}
+
 function AdjustmentsSection({ order }: { order: OrderSummary }) {
   const adjustments = order.adjustments ?? [];
+  const swapHistory = useSwapHistoryForAdjustments(order.id, adjustments);
   if (adjustments.length === 0) return null;
   return (
     <section>
@@ -11341,6 +11384,8 @@ function AdjustmentsSection({ order }: { order: OrderSummary }) {
           const amountCny = Number(a.amountCny);
           const sign = amountCny < 0 ? '-' : '+';
           const moneylessLabel = ZERO_AMOUNT_ADJUSTMENT_LABEL[a.type];
+          // 换人费 / 换人差价：单列一行写清「原 → 新，日期」（新人从换人审计对上，见 lib/swapFeeLine）。
+          const swapTitle = swapAdjustmentTitle(a, swapHistory);
           return (
             <li
               key={`${a.at}-${a.type}-${i}`}
@@ -11348,10 +11393,11 @@ function AdjustmentsSection({ order }: { order: OrderSummary }) {
             >
               <div className="flex-1">
                 <div className="text-ink">
-                  {moneylessLabel ?? a.label}
+                  {swapTitle ?? moneylessLabel ?? a.label}
                   {/* 换人差价/换人费等挂给被换人的条目：该乘客可能已因换人离开 order.passengers，
-                      靠 passengerName 快照标出「这笔算谁的」，不摊入同行人已在上方每人结算价脚注说明。 */}
-                  {a.passengerName && (
+                      靠 passengerName 快照标出「这笔算谁的」，不摊入同行人已在上方每人结算价脚注说明。
+                      换人费/换人差价的标题里已写了「原 X → 新 Y」，不再重复挂名。 */}
+                  {a.passengerName && swapTitle === null && (
                     <span className="ml-1.5 text-xs font-normal text-ink-muted">· {a.passengerName}</span>
                   )}
                 </div>

@@ -780,7 +780,7 @@ describe('visibleColumns（role 裁列）', () => {
     expect(headers).not.toContain('可用次数');
   });
 
-  it('agent（代理）= 运营拍板的 13 列白名单 + 0906 加列（护照号/证件有效期）共 15 列，且顺序与全岗序一致', () => {
+  it('agent（代理）= 运营拍板的 13 列白名单 + 0906 加列（护照号/证件有效期）+ 0930 加列（换人记录）共 16 列，且顺序与全岗序一致', () => {
     const headers = visibleColumns('agent').map((c) => c.header);
     expect(headers).toEqual([
       '序号',
@@ -790,6 +790,7 @@ describe('visibleColumns（role 裁列）', () => {
       '乘客中文名',
       '乘客拼音名',
       '纯拼音名',
+      '换人记录', // 0930 加列：只有自家乘客姓名 + 日期 + 换人费
       '出发(往返)日期',
       '航班号',
       '订单类型',
@@ -852,12 +853,13 @@ describe('visibleColumns（role 裁列）', () => {
     }
   });
 
-  it('所有视图都保留通用列（序号/代理机构/乘客中文名）；订单编号内部视图都有、代理白名单不含', () => {
+  it('所有视图都保留通用列（序号/代理机构/乘客中文名/换人记录）；订单编号内部视图都有、代理白名单不含', () => {
     for (const role of ['all', 'ticketing', 'visa', 'agent'] as const) {
       const headers = visibleColumns(role).map((c) => c.header);
       expect(headers).toContain('序号');
       expect(headers).toContain('代理机构');
       expect(headers).toContain('乘客中文名');
+      expect(headers).toContain('换人记录');
     }
     for (const role of ['all', 'ticketing', 'visa'] as const) {
       expect(visibleColumns(role).map((c) => c.header)).toContain('订单编号');

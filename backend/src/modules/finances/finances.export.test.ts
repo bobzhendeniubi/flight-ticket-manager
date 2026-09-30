@@ -71,10 +71,13 @@ function makeOrder(overrides: Partial<OrderFixture> & { orderNumber: string }): 
   };
 }
 
-function fakeClient(orders: OrderFixture[]): PrismaClient {
+function fakeClient(orders: OrderFixture[], swapAudits: unknown[] = []): PrismaClient {
   return {
     order: { findMany: vi.fn().mockResolvedValue(orders) },
     flightCostPeriod: { findMany: vi.fn().mockResolvedValue([]) },
+    // 换人记录列取数：换人审计 + 拆单祖先单（默认都没有）。
+    auditLog: { findMany: vi.fn().mockResolvedValue(swapAudits) },
+    orderSplitRecord: { findMany: vi.fn().mockResolvedValue([]) },
   } as unknown as PrismaClient;
 }
 
@@ -276,5 +279,35 @@ describe('buildFinanceExportWorkbook — 车费成本口径：录单快照优先
     const buf = await buildFinanceExportWorkbook(RANGE, fakeClient([order]));
     const ws = (await loadWorkbook(buf)).getWorksheet('财务核对收入明细')!;
     expect(ws.getRow(2).getCell(TRANSFER_COST_COL).value).toBe(200);
+  });
+});
+
+describe('buildFinanceExportWorkbook — 原地换人记录列', () => {
+  it('被换下去的人按乘客槽位写进「换人记录」，没换过人的乘客留空', async () => {
+    const order = makeOrder({
+      orderNumber: 'FTM0101',
+      passengers: [
+        { id: 'p1', fullName: 'YANG/LIN', lastName: 'YANG', firstName: 'LIN' },
+        { id: 'p2', fullName: 'LI/SI', lastName: 'LI', firstName: 'SI' },
+      ],
+    });
+    const client = fakeClient(
+      [order],
+      [
+        {
+          createdAt: new Date('2026-01-10T02:00:00.000Z'), // 北京时间 01-10
+          before: { passengerId: 'p1', fullName: 'QIN/XUE', documentNumber: 'E1', snapshot: { chineseName: '覃雪' } },
+          after: { fullName: 'YANG/LIN', documentNumber: 'E2', feeCny: 480 },
+        },
+      ],
+    );
+    const ws = (await loadWorkbook(await buildFinanceExportWorkbook(RANGE, client))).getWorksheet(
+      '财务核对收入明细',
+    )!;
+    const headers = ws.getRow(1).values as unknown[];
+    const col = headers.indexOf('换人记录');
+    expect(col).toBeGreaterThan(0);
+    expect(ws.getRow(2).getCell(col).value).toBe('01-10 原 QIN/XUE 覃雪 → 新 YANG/LIN，换人费 ¥480');
+    expect(ws.getRow(3).getCell(col).value).toBe('');
   });
 });
