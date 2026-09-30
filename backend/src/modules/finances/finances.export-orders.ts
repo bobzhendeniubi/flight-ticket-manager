@@ -24,6 +24,7 @@ const STATUS_LABEL: Record<string, string> = {
   REFUND_REQUESTED: '退款中',
   CHANGE_REQUESTED: '改期中',
   CHANGED: '已改期',
+  SWAPPED: '已换人',
 };
 
 const REFUND_FAMILY_STATUSES = new Set(['REFUND_REQUESTED', 'REFUNDED']);
@@ -129,6 +130,8 @@ async function loadOrderMeta(
 
 function refundType(status: string, swapRefundedAt: Date | null): string {
   if (swapRefundedAt) return '换人退款';
+  // 已换人：不退现金，多出的钱转代理余额/挂账池；同一列里与换人退款区分开。
+  if (status === 'SWAPPED') return '已换人';
   if (REFUND_FAMILY_STATUSES.has(status)) return '普通退款';
   return '';
 }

@@ -51,6 +51,19 @@ describe('buildFinanceExportByOrderWorkbook — 退款类型结构化列', () =>
         itemCount: 1,
         missingCostItemCount: 1,
       },
+      {
+        orderId: 'order-c',
+        orderNumber: 'ORDER-C',
+        status: 'SWAPPED',
+        contactName: '已换人客户',
+        createdAt: '2026-01-07T00:00:00.000Z',
+        totalCny: 1650,
+        costCny: null,
+        grossMarginCny: null,
+        marginPct: null,
+        itemCount: 1,
+        missingCostItemCount: 1,
+      },
     ]);
     const client = {
       order: {
@@ -68,6 +81,14 @@ describe('buildFinanceExportByOrderWorkbook — 退款类型结构化列', () =>
             swapRefundedAt: null,
             swapFeeCny: null,
             swapReplacementOrderNumber: null,
+            agent: null,
+            items: [],
+          },
+          {
+            id: 'order-c',
+            swapRefundedAt: null,
+            swapFeeCny: 1650,
+            swapReplacementOrderNumber: 'ORDER-NEW-2',
             agent: null,
             items: [],
           },
@@ -89,5 +110,10 @@ describe('buildFinanceExportByOrderWorkbook — 退款类型结构化列', () =>
     expect(ws.getRow(2).getCell(col('接手订单号')).value).toBe('ORDER-NEW');
     expect(ws.getRow(3).getCell(col('退款类型')).value).toBe('普通退款');
     expect(ws.getRow(3).getCell(col('换人费(元)')).value).toBe('');
+    // 已换人（不退现金、钱转代理余额/挂账池）：状态列与退款类型列都要能区分开，换人费/接手单号复用同两列。
+    expect(ws.getRow(4).getCell(col('订单状态')).value).toBe('已换人');
+    expect(ws.getRow(4).getCell(col('退款类型')).value).toBe('已换人');
+    expect(ws.getRow(4).getCell(col('换人费(元)')).value).toBe(1650);
+    expect(ws.getRow(4).getCell(col('接手订单号')).value).toBe('ORDER-NEW-2');
   });
 });

@@ -52,6 +52,8 @@ const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.REFUND_REQUESTED,
   OrderStatus.CHANGE_REQUESTED,
   OrderStatus.CHANGED,
+  // 已换人：换人费是真实收入，财务导出要能导出并统计它（与 finances.service 营收口径一致）。
+  OrderStatus.SWAPPED,
 ];
 
 const ORDER_KIND_LABEL: Record<string, string> = {
@@ -72,6 +74,7 @@ const STATUS_LABEL: Record<string, string> = {
   REFUND_REQUESTED: '退款中',
   CHANGE_REQUESTED: '改期中',
   CHANGED: '已改期',
+  SWAPPED: '已换人',
 };
 
 const REFUND_FAMILY_STATUSES: Set<OrderStatus> = new Set([
@@ -182,6 +185,8 @@ function round2(n: number): number {
 
 function refundType(status: OrderStatus, swapRefundedAt: Date | null): string {
   if (swapRefundedAt) return '换人退款';
+  // 已换人：不退现金，多出的钱转代理余额/挂账池；同一列里区分开，财务一眼看出走的是哪条路。
+  if (status === OrderStatus.SWAPPED) return '已换人';
   if (REFUND_FAMILY_STATUSES.has(status)) return '普通退款';
   return '';
 }

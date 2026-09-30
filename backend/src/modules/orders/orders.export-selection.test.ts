@@ -217,6 +217,7 @@ describe('buildExportOrderWhere · 取数 where', () => {
         'REFUNDED',
         'PAYMENT_TIMEOUT',
         'FAILED',
+        'SWAPPED',
       ]);
       expect(EXPORT_RELEASED_STATUSES).not.toContain('DRAFT');
       // 两套集合零交集 —— 同一张单只会出现在其中一个入口里，不会两边都导出来。
