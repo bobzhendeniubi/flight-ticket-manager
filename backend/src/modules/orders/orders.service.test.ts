@@ -6353,13 +6353,17 @@ describe('OrderService.rescheduleOrderItem · 酒店入住日期随出发日平�
     expect(hotelWrite?.data.hotelCheckIn).toEqual(new Date('2027-09-01T00:00:00.000Z'));
     expect(hotelWrite?.data.hotelCheckOut).toEqual(new Date('2027-09-02T00:00:00.000Z'));
     expect(hotelWrite?.data.description).toBe('海边酒店 · 标准房 · 2027-09-01~2027-09-02 · 1晚 × 1间');
+    expect(result.audit.hotelMode).toBe('SHIFT');
     expect(result.audit.hotelDateSync).toEqual([
       {
         orderItemId: 'hot1',
+        mode: 'SHIFT',
         fromCheckIn: '2027-09-05',
         toCheckIn: '2027-09-01',
         fromCheckOut: '2027-09-06',
         toCheckOut: '2027-09-02',
+        fromNights: 1,
+        toNights: 1,
       },
     ]);
   });

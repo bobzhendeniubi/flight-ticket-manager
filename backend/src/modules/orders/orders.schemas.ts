@@ -1254,6 +1254,16 @@ const rescheduleFeeSchema = z
   })
   .optional();
 
+// 改期时占房行（HOTEL / BUNDLE 盖章行）的住宿日期怎么跟：
+//   FOLLOW_TRIP  房跟着新行程走——入住/离店锚定到新去程/回程出发日（保留原来相对航段的偏移），
+//                晚数随之增减；不改档、不改套餐、行价冻结，唯一的价格变化是手填的改期差价。
+//   SHIFT        整体平移保晚数（缺省，= 既有行为：全单最早出发日平移 N 天，占房行同移 N 天）。
+//   KEEP         住宿日期原地不动。
+// 只有运营岗能选 FOLLOW_TRIP / KEEP（服务端按角色判）；代理售后入口根本不透传这个字段。
+export const RESCHEDULE_HOTEL_MODES = ['FOLLOW_TRIP', 'SHIFT', 'KEEP'] as const;
+export type RescheduleHotelMode = (typeof RESCHEDULE_HOTEL_MODES)[number];
+const rescheduleHotelModeSchema = z.enum(RESCHEDULE_HOTEL_MODES).optional();
+
 export const rescheduleOrderBodySchema = z.object({
   orderItemId: z.string().min(1, 'orderItemId 必填'),
   newScheduleId: z.string().min(1, 'newScheduleId 必填'),
@@ -1261,6 +1271,7 @@ export const rescheduleOrderBodySchema = z.object({
   feeCny: rescheduleFeeSchema, // 改期差价（CNY，整数，可正可负；0/缺省=不调整价格）
   feeLabel: z.string().max(120).optional(), // 自定义费用名（缺省"改期差价"）
   note: z.string().max(500).optional(),
+  hotelMode: rescheduleHotelModeSchema, // 住宿处理方式（缺省 SHIFT，见上）
   // 售后改期只认 allowDepartedTarget；allowFlownSource 在售后语义下服务端不放行（见上）。
   ...departedGuardFlagsSchema,
 });
@@ -2022,6 +2033,8 @@ export const reschedulePassengersBodySchema = z.object({
   feeLabel: z.string().max(120).optional(),
   // 与拆单 note 同上限（本字段同时带给拆单流水与改期流水）
   note: z.string().max(200).optional(),
+  // 住宿处理方式（缺省 SHIFT；与单条改期同一枚举，代理入口不透传）。
+  hotelMode: rescheduleHotelModeSchema,
   roomSplit: splitOrderBodySchema.shape.roomSplit,
   requestToken: z.string().min(8).max(64).uuid(),
   // 按人改期是售后语义：只认 allowDepartedTarget（拆单前就判目标已起飞）；allowFlownSource 不放行。
