@@ -17,6 +17,8 @@ export const ORDER_STATUS_META: Record<OrderStatus, { label: string; tone: 'neut
   CHANGE_REQUESTED: { label: '改期申请中', tone: 'warning' },
   CHANGED: { label: '已改期', tone: 'info' },
   FAILED: { label: '出票失败', tone: 'danger' },
+  // 已换人：位子让给了别人、本单只收换人费。琥珀色区别于已取消（红）与已退款（灰）——它有真实收入。
+  SWAPPED: { label: '已换人', tone: 'warning' },
 };
 
 export const HOLD_STATUS_META: Record<HoldOrderStatus, { label: string; tone: 'neutral' | 'info' | 'success' | 'warning' | 'danger' }> = {

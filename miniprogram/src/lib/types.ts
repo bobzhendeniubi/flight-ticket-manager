@@ -21,7 +21,8 @@ export type OrderStatus =
   | 'REFUNDED'
   | 'CHANGE_REQUESTED'
   | 'CHANGED'
-  | 'FAILED';
+  | 'FAILED'
+  | 'SWAPPED';
 
 /** 与后端 Prisma PaymentMethod 枚举对齐（backend/prisma/schema.prisma）；此前 CREDIT_CARD/PREPAYMENT 与后端不符，从未真正同步过 */
 export type PaymentMethod =

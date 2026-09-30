@@ -1283,7 +1283,9 @@ export type OrderStatus =
   | 'REFUNDED'
   | 'CHANGE_REQUESTED'
   | 'CHANGED'
-  | 'FAILED';
+  | 'FAILED'
+  // 已换人（终态）：应收收敛为换人费、多付转代理余额/挂账池、座位释放。只能经 markSwapped 进入。
+  | 'SWAPPED';
 
 export type OrderItemKind =
   | 'FLIGHT' | 'HOTEL' | 'TRANSFER' | 'VISA'
@@ -1390,6 +1392,33 @@ export type PublicLegStatus =
   | 'RETURN_CANCELLED'
   | 'OUTBOUND_CANCELLED'
   | 'OUTBOUND_NOT_BOARDED';
+
+/** 标记已换人的结果明细（后端 MarkSwappedAudit 同形；弹窗据此告诉运营钱去了哪、哪些航段退了座）。 */
+export interface MarkSwappedAudit {
+  orderNumber: string;
+  fromStatus: OrderStatus;
+  swapFeeCny: number;
+  /** 收敛前的应收（total + 售后费）。 */
+  beforePayableCny: number;
+  /** 净收款（已付 − 已完成退款 + 预存抵扣）。 */
+  netPaidCny: number;
+  /** 调价行金额（换人费 − 原应收；0 = 没落行）。 */
+  adjustmentDeltaCny: number;
+  adjustmentItemId: string | null;
+  /** 多出款项去向：代理余额 / 挂账池；null = 没有多付。 */
+  disposal:
+    | { kind: 'AGENT_BALANCE'; amountCny: number; agentId: string; agentBalanceAfter: number }
+    | { kind: 'RECEIPT_POOL'; amountCny: number; receiptId: string; receiptNo: string }
+    | null;
+  /** 换人费 − 净收款 > 0 时的欠款（留在单上照常收）。 */
+  outstandingCny: number;
+  replacementOrderNumber: string | null;
+  /** 已起飞航段（不退座）。 */
+  flownLegs: Array<{ itemId: string; itemLabel: string; flightNumber: string }>;
+  /** 未起飞航段（本次释放座位）。 */
+  releasedLegs: Array<{ itemId: string; itemLabel: string; flightNumber: string }>;
+  note: string | null;
+}
 
 export interface OrderPassenger {
   id: string;
@@ -4904,6 +4933,20 @@ export const api = {
       refundAmountCny: number;
       refundId: string;
     }>(`/orders/${id}/swap-refund`, { method: 'POST', token, body }),
+  /**
+   * 标记已换人（换人主路径）：应收收敛到换人费 → 多出的钱转代理余额（代理单）/挂账池（直客单）
+   * → 状态落「已换人」并释放未飞航段。与 swapRefund（退现金）互为两条路；ADMIN/STAFF。
+   */
+  markSwapped: (
+    token: string,
+    id: string,
+    body: { swapFeeCny: number; replacementOrderNumber?: string; note?: string },
+  ) =>
+    apiFetch<{ order: OrderSummary; audit: MarkSwappedAudit }>(`/orders/${id}/mark-swapped`, {
+      method: 'POST',
+      token,
+      body,
+    }),
   updateSwapReplacementOrderNumber: (
     token: string,
     id: string,

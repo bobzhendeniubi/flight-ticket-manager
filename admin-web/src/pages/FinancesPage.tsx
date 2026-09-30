@@ -65,6 +65,7 @@ const STATUS_LABEL: Record<string, string> = {
   CHANGE_REQUESTED: '改期中',
   CHANGED: '已改期',
   FAILED: '失败',
+  SWAPPED: '已换人',
 };
 
 // 订单项类型标签（覆盖收支明细里可能出现的全部 kind，含调价 FEE/DISCOUNT）

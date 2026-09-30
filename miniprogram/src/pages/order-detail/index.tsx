@@ -35,6 +35,7 @@ const STATUS_LABEL: Record<OrderStatus, { label: string; color: string }> = {
   CHANGE_REQUESTED: { label: '改签中', color: '#d97706' },
   CHANGED: { label: '已改签', color: '#16a34a' },
   FAILED: { label: '出票失败', color: '#dc2626' },
+  SWAPPED: { label: '已换人', color: '#6b7280' },
 };
 const STATUS_FALLBACK = { label: '未知状态', color: '#64748b' } as const;
 
