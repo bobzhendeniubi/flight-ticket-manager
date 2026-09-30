@@ -92,6 +92,11 @@ import {
 import type { LegStatusItemLike, PublicLegStatus } from './orders.leg-status.js';
 import { computePerPaxShares, spreadableAdjustmentCny } from './per-pax-share.js';
 import {
+  assessPaidDirectCancelWithinTx,
+  findPaidDirectCancelEligibleIds,
+  isPaidFamilyDirectCancelSource,
+} from './paid-direct-cancel.js';
+import {
   deriveRoomsToMove,
   isTerminalLegItem,
   movedUnitsFor,
@@ -5206,7 +5211,12 @@ export class OrderService {
     ]);
 
     // 对外脱敏口径按请求者角色一次算好（列表所有行同角色），AGENT/CUSTOMER 剥离内部字段 + 逐项拆价。
-    const serializeCtx = orderSerializeRoleCtx(requester.role);
+    // 已付款族「钱已撤干净」可直接取消：只有运营/管理员能做，只给他们算（代理/客户零查询）。
+    const isOpsRequester = requester.role === UserRole.ADMIN || requester.role === UserRole.STAFF;
+    const paidDirectCancelEligibleIds = isOpsRequester
+      ? await findPaidDirectCancelEligibleIds(prisma, rows)
+      : undefined;
+    const serializeCtx = { ...orderSerializeRoleCtx(requester.role), paidDirectCancelEligibleIds };
     return {
       // 显式包一层箭头函数——serializeOrder 现在带一个可选的第二参数（ctx），直接把它当
       // Array.map 回调传会让 map 的 index 顶进 ctx 位置（number 不是合法 ctx，TS 会报错，
@@ -5352,7 +5362,16 @@ export class OrderService {
     // 按角色一次算好脱敏口径：ADMIN/STAFF 看全量（含护照大图）；AGENT/CUSTOMER 剥离内部字段 + 逐项拆价
     // （护照大图同口径剥离——响应瘦身 + 少暴露 PII，与既有 includePassportPhotos 行为一致）。
     const roleCtx = orderSerializeRoleCtx(requester.role);
-    const serialized = serializeOrder(order, { visaStayDaysById, ...roleCtx });
+    // 已付款族「钱已撤干净」可直接取消：只给运营/管理员算（详情已联查 refunds，通常零额外查询）。
+    const isOpsRequester = requester.role === UserRole.ADMIN || requester.role === UserRole.STAFF;
+    const paidDirectCancelEligibleIds = isOpsRequester
+      ? await findPaidDirectCancelEligibleIds(prisma, [order])
+      : undefined;
+    const serialized = serializeOrder(order, {
+      visaStayDaysById,
+      ...roleCtx,
+      paidDirectCancelEligibleIds,
+    });
     // 挂账去向（仅内部）：收款行永久带上「水单毛额 → 本单入账 → 转池 → 核销到哪几张单」，
     // 核销完也不消失——出纳拿水单对系统靠的就是这一行（已付金额本身不动，见 overpay-trail.ts）。
     // 对外角色（AGENT/CUSTOMER）连键都不下发：别的订单号不能露。两条分支用条件展开收成同一个
@@ -8464,7 +8483,35 @@ export class OrderService {
       opts?.via === 'restore' &&
       RESTORABLE_CANCELLED_STATUSES.includes(order.status) &&
       (toStatus === OrderStatus.PENDING_PAYMENT || toStatus === OrderStatus.PAID);
-    if (!allowed.includes(toStatus) && !isAdminForce && !isRestoreVia) {
+    // 已付款族「钱已撤干净」直接取消（口径见 paid-direct-cancel.ts）：只对运营/管理员开放
+    //（代理/客户在 assertCanTransition 已被拦下）。先锁 Order 行再读 paidAmount，与人工收款 /
+    // 认款 / 余额抵扣（均先 FOR UPDATE 再累加）串行——否则并发进来的一笔到账会被旧快照放过去。
+    // 不满足就直接报具体原因（还剩多少钱 / 有进行中退款 / 余额抵扣未退回），不再落到通用提示。
+    let isPaidDirectCancel = false;
+    if (
+      toStatus === OrderStatus.CANCELLED &&
+      !allowed.includes(toStatus) &&
+      !isAdminForce &&
+      isPaidFamilyDirectCancelSource(order.status) &&
+      (requester.role === UserRole.ADMIN || requester.role === UserRole.STAFF)
+    ) {
+      const lockedRows = await tx.$queryRaw<
+        Array<{ paidAmount: Prisma.Decimal; prepaymentOffset: Prisma.Decimal }>
+      >`SELECT "paidAmount", "prepaymentOffset" FROM "Order" WHERE id = ${id} FOR UPDATE`;
+      const verdict = await assessPaidDirectCancelWithinTx(tx, {
+        id,
+        status: order.status,
+        paidAmount: lockedRows[0]?.paidAmount ?? order.paidAmount,
+        prepaymentOffset: lockedRows[0]?.prepaymentOffset ?? order.prepaymentOffset,
+      });
+      if (!verdict.ok) {
+        throw new BadRequestError(
+          `不允许从「${zhStatus(order.status)}」转移到「${zhStatus(toStatus)}」：${verdict.reason}`,
+        );
+      }
+      isPaidDirectCancel = true;
+    }
+    if (!allowed.includes(toStatus) && !isAdminForce && !isRestoreVia && !isPaidDirectCancel) {
       // 高频误操作单独给指引：已收款的单不能一键取消——钱账要走退款通道，申请后机位立即释放。
       const cancelPaidHint =
         toStatus === 'CANCELLED' && allowed.includes('REFUND_REQUESTED')
@@ -28354,6 +28401,13 @@ export function serializeOrder<T extends OrderLike>(
      * 目前仅代理自助改单窗口（agentSelfEdit）用它把客户视角整个略掉。缺省不传 = 照旧全给。
      */
     role?: UserRole;
+    /**
+     * 已付款族「钱已撤干净」可直接取消的订单 id（由 findPaidDirectCancelEligibleIds 批量算好）。
+     * 命中的单在 allowedTransitions 里附加「已取消」，前端「改状态」下拉自动出现。
+     * **缺省不传 = 不附加（fail-closed）**：判定要查退款/余额流水，窄调用方不必为此多查库，
+     * 真要取消时 _updateStatusWithinTx 会在锁内按同一口径复核。
+     */
+    paidDirectCancelEligibleIds?: ReadonlySet<string>;
   } = {},
 ) {
   const visaStayDaysById = ctx.visaStayDaysById ?? new Map<string, number | null>();
@@ -28404,7 +28458,12 @@ export function serializeOrder<T extends OrderLike>(
     //    抄的那份曾漂移（PAID/PROCESSING 少了 CHANGE_REQUESTED 等），把合法流转逼进 force 通道，
     //    污染成 FORCE_ORDER_STATUS + WARNING 审计记录，真正该警觉的强制被淹没。
     //    逐单下发（而非单独的 meta 接口）：天然跟随本单 status，不存在「元数据与单状态不同步」的窗口。
-    allowedTransitions: ALLOWED_TRANSITIONS[order.status] ?? [],
+    //    已付款族「钱已撤干净」的单额外附加「已取消」（按单判定，见 paid-direct-cancel.ts）。
+    allowedTransitions:
+      ctx.paidDirectCancelEligibleIds?.has(order.id) === true &&
+      isPaidFamilyDirectCancelSource(order.status)
+        ? [...(ALLOWED_TRANSITIONS[order.status] ?? []), OrderStatus.CANCELLED]
+        : (ALLOWED_TRANSITIONS[order.status] ?? []),
     // ── 代理自助改单窗口（下单当天可自助改班次/签证状态/酒店/升舱，次日起走改单申请）──
     //    **所有角色都下发**：代理端据此显示/隐藏自助入口与倒计时，运营端也要一眼看出
     //    「这单代理现在还能不能自己改」，否则运营接到电话得自己心算下单日期。

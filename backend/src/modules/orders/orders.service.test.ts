@@ -56,7 +56,10 @@ const {
       update: vi.fn(),
       count: vi.fn(async () => 0),
     },
-    refund: { create: vi.fn() },
+    // groupBy：列表/详情为「钱已撤干净直接取消」批量判定时按 (orderId, status) 聚合退款；默认无退款行。
+    refund: { create: vi.fn(), groupBy: vi.fn(async () => []) },
+    // 同一判定对「净收款 ≤ 0」的幸存行复核预存余额抵扣流水；默认无流水。
+    prepaymentTransaction: { findMany: vi.fn(async () => []) },
     user: {
       findUnique: vi.fn(),
     },
