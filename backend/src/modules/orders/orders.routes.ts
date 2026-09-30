@@ -2484,7 +2484,8 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
         // 「已起飞」两道闸的放行留痕（售后改期只可能是 allowDepartedTarget；源段出口不对售后开）。
         allowDepartedTarget: audit.departedTargetAllowed,
         flownSourceAllowed: audit.flownSourceAllowed,
-        // 酒店入住随出发日平移的同步明细（空数组 = 本次未平移/无酒店行）
+        // 住宿处理方式 + 占房行日期同步明细（空数组 = 本次未动住宿/无酒店行）
+        hotelMode: audit.hotelMode,
         hotelDateSync: audit.hotelDateSync,
       },
       severity: 'WARNING',
@@ -3650,6 +3651,7 @@ export const orderRoutes: FastifyPluginAsync = async (app) => {
           note: body.note,
           allowDepartedTarget: detail.departedTargetAllowed,
           flownSourceAllowed: detail.flownSourceAllowed,
+          hotelMode: detail.hotelMode,
           hotelDateSync: detail.hotelDateSync,
           // 按人改期专属：这次改的是从源单拆出来的新单
           splitFromOrderNumber: result.splitPerformed ? result.audit.orderNumber : null,

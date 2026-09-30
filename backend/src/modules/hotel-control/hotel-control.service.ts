@@ -3124,8 +3124,10 @@ export async function getAlerts(
  *   UPDATE_ROOM_ASSIGNMENT  调整分房（改 roomAssignment / 计费房数 → 直接影响「占」）
  *   SWAP_ORDER_ITEM_HOTEL   换酒店（改 hotelRoomTypeId → 换一家酒店占房）
  *   ADD_ROOM_SUPPLEMENT     补收单房差（房数/房态相关的售后补收）
- *   RESCHEDULE_ORDER_ITEM   改期（改航班班次/出发日）——不落 hotelCheckIn/hotelCheckOut，
- *                           不改变销控板占房数字口径，但会改变出行日期，房控需要能看到这单动了。
+ *   RESCHEDULE_ORDER_ITEM   改期（改航班班次/出发日）——占房行的 hotelCheckIn/hotelCheckOut 会随之
+ *                           同步（缺省整体平移保晚数；运营选「房跟着新行程走」时入住/离店锚定新
+ *                           去程/回程日、晚数增减；选「房不动」才不落日期），审计 after.hotelDateSync
+ *                           逐行记前后区间与晚数——销控板逐晚占房直接跟着变，房控必须看得见。
  *   RESCHEDULE_ORDER_ITEM_HOTEL  酒店改期（改 hotelCheckIn/hotelCheckOut → 占房整段从旧区间
  *                           挪到新区间）——直接改动销控板逐晚占房，房控必须看得见。
  * 五者 targetType 均为 ORDER、targetId=订单 id、targetLabel=订单号。

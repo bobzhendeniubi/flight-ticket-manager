@@ -235,6 +235,7 @@ import {
   POST_SALE_FEE_CAP_CNY,
   PRICE_ADJUSTMENT_CAP_CNY,
   PRICE_ADJUSTMENT_REASON_LABEL,
+  type RescheduleHotelMode,
 } from './orders.schemas.js';
 import { heldSeatsForCabin } from '../hold-orders/held-seats.js';
 // 「回程已释放」提醒的 ruleKey 构造收敛在提醒规则那边：作废时要把这两条待办一起关掉，
@@ -10896,6 +10897,16 @@ export class OrderService {
        * 源段起飞早于建单时间的纠错不需要这个旗子，自动放行。
        */
       allowFlownSource?: boolean;
+      /**
+       * 占房行的住宿日期怎么跟（缺省 SHIFT = 既有的「整体平移保晚数」）：
+       *   FOLLOW_TRIP  房跟着新行程走——入住/离店锚定到新去程/回程出发日、晚数随之增减
+       *                （planFollowTripHotelStay）；不改档、不改 bundleId、行价冻结，唯一的
+       *                价格变化是手填的 feeCny。单程单（无回程）退化为 SHIFT。
+       *   KEEP         住宿日期原地不动。
+       * 只有 ADMIN/STAFF 能选非缺省值（代理零元延住的口子不开：代理入口不透传，传了也 403）。
+       * 批量改航班 / 纠错 / 改单申请执行都不传 → 行为与改动前逐字一致。
+       */
+      hotelMode?: RescheduleHotelMode;
     },
     actor: { userId: string; role: UserRole },
   ): Promise<{
@@ -10921,13 +10932,22 @@ export class OrderService {
       departedTargetAllowed: boolean;
       /** 源段已起飞、靠纠错出口放行的口径（null = 源段未起飞，正常路径）。 */
       flownSourceAllowed: FlownSourceAllowance | null;
-      /** 随出发日平移自动同步的酒店行（未平移/无酒店行 = 空数组），日期为 YYYY-MM-DD。 */
+      /** 本次实际采用的住宿处理方式（缺省 SHIFT）。 */
+      hotelMode: RescheduleHotelMode;
+      /**
+       * 随改期自动同步的占房行（本次未动住宿/无酒店行 = 空数组），日期为 YYYY-MM-DD。
+       * mode = 该行实际走的口径（FOLLOW_TRIP 在单程单上退化为 SHIFT，此处如实记 SHIFT）；
+       * fromNights/toNights 按日期派生（无离店日期 = 0）。
+       */
       hotelDateSync: Array<{
         orderItemId: string;
+        mode: 'FOLLOW_TRIP' | 'SHIFT';
         fromCheckIn: string;
         toCheckIn: string;
         fromCheckOut: string | null;
         toCheckOut: string | null;
+        fromNights: number;
+        toNights: number;
       }>;
       /**
        * §八「解绑」提示：随出发日平移酒店日期时，被平移的行若有共享成员会先解绑
@@ -10950,6 +10970,17 @@ export class OrderService {
     }
     // 「真·代理售后」= 带售后旗子**且**操作人是代理：差价由系统算、请求体金额一律不认。
     const isAgentAfterSales = input.agentAfterSales === true && actor.role === UserRole.AGENT;
+    // 住宿处理方式：缺省 SHIFT（既有平移行为）。非缺省只认运营岗——FOLLOW_TRIP 会把晚数拉长而
+    // 行价冻结，交给代理就是零元延住；KEEP 同样是运营决定的房控口径。代理入口本来就不透传，
+    // 这里再按角色判一次（与 allowDepartedTarget 同款：请求体里有也不认）。
+    const hotelMode: RescheduleHotelMode = input.hotelMode ?? 'SHIFT';
+    if (
+      hotelMode !== 'SHIFT' &&
+      actor.role !== UserRole.ADMIN &&
+      actor.role !== UserRole.STAFF
+    ) {
+      throw new ForbiddenError('仅运营/管理员可选择改期时的住宿处理方式');
+    }
     // 改期差价可正可负（与换酒店差价 / 酒店改期差价同一 adjustmentCny 机制）：改到更便宜的班次
     // 本来就该退客人钱，旧版 Math.max(0, …) 把负数钳成 0，运营只能另开收款单反向操作。
     // 上限仍由 schema 的 ±POST_SALE_FEE_CAP_CNY 把关。
@@ -11345,10 +11376,13 @@ export class OrderService {
       // 幂等：updateMany + 定值写，重复改期不会出问题。
       const hotelDateSync: Array<{
         orderItemId: string;
+        mode: 'FOLLOW_TRIP' | 'SHIFT';
         fromCheckIn: string;
         toCheckIn: string;
         fromCheckOut: string | null;
         toCheckOut: string | null;
+        fromNights: number;
+        toNights: number;
       }> = [];
       // §八「机票改期连带平移酒店日期」：被平移的行若有共享成员，解绑警告收集到这里
       // （批量改班次 / 纠错平移复用同一个函数，警告随各自的 audit.warnings 一并带出）。
@@ -11385,12 +11419,17 @@ export class OrderService {
           await tx.order.update({ where: { id: orderId }, data: invoiceReset });
         }
 
-        // ── 3c. 酒店入住日期随出发日平移（0830 公测反馈）────────────────────────
+        // ── 3c. 占房行住宿日期随改期同步 ─────────────────────────────────────────
         // 改期只搬机票行，酒店行的 hotelCheckIn/hotelCheckOut 原地不动 → 分房表按入住日
-        // 归 sheet，客人仍挂在旧日期下（导旧日期有他、导新日期没他）。口径：整单「最早航段
-        // 的出发地当地日」平移了 N 天（≠0），同单全部占房行的入住/离店同步平移 N 天——
-        // 晚数不变、行价/间数一律冻结（与酒店改期的甲案同哲学，晚数没变也无差价可谈）。
-        // 只改回程不动最早出发日 → 不平移（离店是否顺延涉及晚数与差价，留给「酒店改期」人工办）。
+        // 归 sheet，客人仍挂在旧日期下（导旧日期有他、导新日期没他）。按 hotelMode 三种口径：
+        //   SHIFT（缺省，0830 公测反馈的既有行为）：整单「最早航段的出发地当地日」平移了 N 天
+        //     （≠0），同单全部占房行的入住/离店同步平移 N 天——晚数不变、行价/间数一律冻结
+        //     （与酒店改期的甲案同哲学，晚数没变也无差价可谈）。只改回程不动最早出发日 → 不平移。
+        //   FOLLOW_TRIP（运营需求：改期时「房是否一起变动」选是）：入住/离店分别锚定到新去程/
+        //     新回程的出发地当地日（保留该行原来相对航段的偏移，见 planFollowTripHotelStay），
+        //     晚数随之增减；不改档、不改 bundleId、行价冻结——唯一的价格变化是手填改期差价，
+        //     新增/减少的晚上按逐晚快照口径重打成本。单程单（无回程）退化为 SHIFT。
+        //   KEEP：住宿原地不动，整段跳过。
         // 新日期房量装不下 → 抛错整事务回滚，改期不成立（先协调房再改）。
         // 纠错入口（correction）同样适用：录错班次连带盖错的入住日期一并归位。
         const earliestLocalDate = (
@@ -11411,7 +11450,39 @@ export class OrderService {
                   (24 * 60 * 60 * 1000),
               )
             : 0;
-        if (deltaDays !== 0) {
+        // FOLLOW_TRIP 的锚点：改期前后的去程/回程出发地当地日（与建单盖章同一口径——
+        // resolveAuthoritativeBundleGoDates 取去程出发地当地日做入住、退房日对齐回程出发日）。
+        // 缺任一锚点（单程单）→ 退化为 SHIFT。
+        const legLocalDate = (
+          row: { flightSchedule: { departureTime: Date; departureTz?: string | null } | null } | null,
+        ): string | null =>
+          row?.flightSchedule?.departureTime
+            ? localDateISO(row.flightSchedule.departureTime, row.flightSchedule.departureTz)
+            : null;
+        const legsAfter = determineFlightLegItems(legItemsBefore);
+        const followAnchors =
+          hotelMode === 'FOLLOW_TRIP'
+            ? {
+                fromOutbound: legLocalDate(legsBefore.outbound),
+                fromReturn: legLocalDate(legsBefore.return),
+                toOutbound: legLocalDate(legsAfter.outbound),
+                toReturn: legLocalDate(legsAfter.return),
+              }
+            : null;
+        const followTrip: FollowTripAnchors | null =
+          followAnchors &&
+          followAnchors.fromOutbound &&
+          followAnchors.fromReturn &&
+          followAnchors.toOutbound &&
+          followAnchors.toReturn
+            ? {
+                fromOutbound: followAnchors.fromOutbound,
+                fromReturn: followAnchors.fromReturn,
+                toOutbound: followAnchors.toOutbound,
+                toReturn: followAnchors.toReturn,
+              }
+            : null;
+        if (hotelMode !== 'KEEP' && (deltaDays !== 0 || followTrip)) {
           const hotelRows = (
             await tx.orderItem.findMany({
               where: {
@@ -11421,21 +11492,60 @@ export class OrderService {
               },
               select: {
                 id: true,
+                kind: true,
                 description: true,
                 hotelRoomTypeId: true,
                 randomStarTier: true,
                 hotelCheckIn: true,
                 hotelCheckOut: true,
                 roomsBilled: true,
+                unitCostCny: true,
                 metadata: true,
               },
             })
           ) // 防御性复筛（与 where 同条件）：单测 mock 的 findMany 不认 where，会把机票行也吐回来
             .filter((r) => r.hotelCheckIn && (r.hotelRoomTypeId || r.randomStarTier != null));
-          if (hotelRows.length > 0) {
-            // §八：平移前对全部有共享成员的酒店行解绑——共享房 checkIn/checkOut 必须与全体
-            // 成员的住宿区间一致，平移日期就让「这间房」的身份不再成立。随机档行（无
+          // 逐行目标日期：FOLLOW_TRIP 按行程锚点重排（分段住只在两头伸缩），否则整体平移。
+          // shifted 收全部占房行（含没变的行）：下面 §五闸的 nextOrderItems 是「给了就整单整酒店覆盖」，
+          // 漏掉同酒店没变的行会把它的占用算漏；真正落库/解绑/审计只碰 changed 的行。
+          const shiftDay = (d: Date): Date => new Date(d.getTime() + deltaDays * 24 * 60 * 60 * 1000);
+          const followPlan = followTrip
+            ? new Map(
+                planFollowTripHotelStay(
+                  hotelRows.map((r) => ({ id: r.id, hotelCheckIn: r.hotelCheckIn!, hotelCheckOut: r.hotelCheckOut })),
+                  followTrip,
+                ).map((p) => [p.id, p] as const),
+              )
+            : null;
+          const shifted = hotelRows.map((row) => {
+            const planned = followPlan?.get(row.id);
+            const newCheckIn = planned ? planned.newCheckIn : shiftDay(row.hotelCheckIn!);
+            const newCheckOut = planned
+              ? planned.newCheckOut
+              : row.hotelCheckOut
+                ? shiftDay(row.hotelCheckOut)
+                : null;
+            const changed =
+              newCheckIn.getTime() !== row.hotelCheckIn!.getTime() ||
+              (newCheckOut?.getTime() ?? null) !== (row.hotelCheckOut?.getTime() ?? null);
+            return { row, newCheckIn, newCheckOut, changed, mode: (planned ? 'FOLLOW_TRIP' : 'SHIFT') as 'FOLLOW_TRIP' | 'SHIFT' };
+          });
+          // FOLLOW_TRIP 重排出来的区间必须合法（改期后回程早于去程之类的单，锚点会把离店排到入住
+          // 之前；超过住宿上限同理）——拒掉并指路另外两种口径，不能把一个非法区间写进房控。
+          for (const s of shifted) {
+            if (!s.changed || s.mode !== 'FOLLOW_TRIP' || !s.newCheckOut) continue;
+            if (buildStayNightDates(s.newCheckIn, s.newCheckOut).length === 0) {
+              throw new BadRequestError(
+                `按新行程重排后住宿区间无效（入住 ${formatDateOnly(s.newCheckIn)}、离店 ${formatDateOnly(s.newCheckOut)}），` +
+                  '请核对去程/回程日期，或改选「整体平移」/「房不动」。',
+              );
+            }
+          }
+          if (shifted.some((s) => s.changed)) {
+            // §八：改日期前对全部有共享成员的酒店行解绑——共享房 checkIn/checkOut 必须与全体
+            // 成员的住宿区间一致，改日期就让「这间房」的身份不再成立。随机档行（无
             // hotelRoomTypeId）不会有共享成员（§三共享成员只能归属真实酒店行），跳过即可。
+            // 只解绑本次日期真的变了的行（SHIFT 下全部行都变；FOLLOW_TRIP 分段住的中间行不变、不解绑）。
             //
             // 两阶段（CRITICAL 修复 · astra finding A1/A2）：先只 planUnbind（只读，不落库），
             // 闸判定用计划算出的 after 状态，通过后才统一 applyUnbindPlan——不能再用
@@ -11444,9 +11554,9 @@ export class OrderService {
             // N2 修复：全部触及行一次性合成一份计划（planUnbindMany），不再逐行各调
             // planUnbind 再各自记进 Map——那样多行会各自从同一份原始 JSON 出发，后应用的
             // 计划把先解绑行的共享键写回来。
-            const unbindCandidateItemIds = hotelRows
-              .filter((row) => row.hotelRoomTypeId)
-              .map((row) => row.id);
+            const unbindCandidateItemIds = shifted
+              .filter((s) => s.changed && s.row.hotelRoomTypeId)
+              .map((s) => s.row.id);
             const combinedUnbindPlan =
               unbindCandidateItemIds.length > 0
                 ? await planUnbindMany(tx, { orderId, orderItemIds: unbindCandidateItemIds })
@@ -11468,13 +11578,6 @@ export class OrderService {
                 );
               }
             }
-            const shiftDay = (d: Date): Date => new Date(d.getTime() + deltaDays * 24 * 60 * 60 * 1000);
-            const shifted = hotelRows.map((row) => ({
-              row,
-              newCheckIn: shiftDay(row.hotelCheckIn!),
-              newCheckOut: row.hotelCheckOut ? shiftDay(row.hotelCheckOut) : null,
-            }));
-
             const orderPassengers = await tx.passenger.findMany({
               where: { orderId },
               select: { gender: true },
@@ -11610,6 +11713,17 @@ export class OrderService {
               });
             } catch (err) {
               if (err instanceof BadRequestError) {
+                if (followTrip) {
+                  // 按新行程重排：报出重排后的区间与晚数，并指路另外两种口径（运营当场就能改选）。
+                  const first = shifted.find((s) => s.changed && s.mode === 'FOLLOW_TRIP');
+                  const range = first
+                    ? `入住 ${formatDateOnly(first.newCheckIn)}${first.newCheckOut ? ` 至 ${formatDateOnly(first.newCheckOut)}，共 ${buildStayNightDates(first.newCheckIn, first.newCheckOut).length} 晚` : ''}`
+                    : '';
+                  throw new BadRequestError(
+                    `改期需按新行程重排住宿（${range}），新日期房量不足，本次改期已整体取消：${err.message}。` +
+                      '可改选「整体平移（保持原晚数）」或「房不动」后再改期。',
+                  );
+                }
                 throw new BadRequestError(
                   `改期需同步酒店入住日期（随出发日平移 ${deltaDays > 0 ? '+' : ''}${deltaDays} 天），新日期房量不足，本次改期已整体取消：${err.message}`,
                 );
@@ -11622,32 +11736,68 @@ export class OrderService {
               await applyUnbindPlan(tx, combinedUnbindPlan, '机票改期连带平移酒店日期解绑');
             }
             for (const s of shifted) {
+              if (!s.changed) continue;
+              const fromNights = s.row.hotelCheckOut
+                ? buildStayNightDates(s.row.hotelCheckIn!, s.row.hotelCheckOut).length
+                : 0;
               const nights = s.newCheckOut
                 ? buildStayNightDates(s.newCheckIn, s.newCheckOut).length
                 : 0;
+              const isFollowTrip = s.mode === 'FOLLOW_TRIP';
+              // FOLLOW_TRIP：晚数变了，成本按实住晚数逐晚重打快照（单订酒店行按房型区间净房价；
+              // 随机档行按快照单价 × 新晚数；BUNDLE 行建单未快照酒店成本，原值不动）。
+              // SHIFT 晚数不变，成本照旧冻结（既有行为）。
+              const costPatch = isFollowTrip
+                ? await resnapshotHotelStayCost(tx, s.row, s.newCheckIn, s.newCheckOut)
+                : {};
+              // BUNDLE 行 metadata 里的 goDate/returnDate 是建单盖章用的出行日期：FOLLOW_TRIP 下
+              // 入住/离店已重排，两个日期一并跟上（只在原本就有该键时改，不给没有的行凭空加）。
+              const rowMeta = readJsonObject(s.row.metadata);
+              const bundleDatePatch: Record<string, unknown> =
+                isFollowTrip && s.row.kind === OrderItemKind.BUNDLE
+                  ? {
+                      ...(typeof rowMeta.goDate === 'string' ? { goDate: formatDateOnly(s.newCheckIn) } : {}),
+                      ...(typeof rowMeta.returnDate === 'string' && s.newCheckOut
+                        ? { returnDate: formatDateOnly(s.newCheckOut) }
+                        : {}),
+                    }
+                  : {};
+              const metaBase = costPatch.metadata ?? (Object.keys(bundleDatePatch).length > 0 ? rowMeta : null);
+              const nextMetadata =
+                metaBase != null ? ({ ...metaBase, ...bundleDatePatch } as Prisma.InputJsonValue) : undefined;
+              // description 里的日期/晚数段就地改写（自由文本无该段则原样保留）。
+              // FOLLOW_TRIP 下 BUNDLE 行不改写：套餐名里的「N天N晚」是档次名，改期不改档，
+              // 实住晚数由日期派生、各展示处按日期算（SHIFT 晚数没变，照旧走改写 = 恒等）。
+              const rewriteDescription =
+                s.newCheckOut != null && nights > 0 && !(isFollowTrip && s.row.kind === OrderItemKind.BUNDLE);
               await tx.orderItem.update({
                 where: { id: s.row.id },
                 data: {
                   hotelCheckIn: s.newCheckIn,
                   ...(s.newCheckOut ? { hotelCheckOut: s.newCheckOut } : {}),
-                  // description 里的日期/晚数段就地改写（自由文本无该段则原样保留）
-                  ...(s.newCheckOut && nights > 0
+                  ...(rewriteDescription
                     ? {
                         description: rewriteHotelStayDescription(s.row.description, {
                           checkIn: formatDateOnly(s.newCheckIn),
-                          checkOut: formatDateOnly(s.newCheckOut),
+                          checkOut: formatDateOnly(s.newCheckOut!),
                           nights,
                         }),
                       }
                     : {}),
+                  ...(costPatch.unitCostCny !== undefined ? { unitCostCny: costPatch.unitCostCny } : {}),
+                  ...(costPatch.totalCostCny !== undefined ? { totalCostCny: costPatch.totalCostCny } : {}),
+                  ...(nextMetadata !== undefined ? { metadata: nextMetadata } : {}),
                 },
               });
               hotelDateSync.push({
                 orderItemId: s.row.id,
+                mode: s.mode,
                 fromCheckIn: formatDateOnly(s.row.hotelCheckIn!),
                 toCheckIn: formatDateOnly(s.newCheckIn),
                 fromCheckOut: s.row.hotelCheckOut ? formatDateOnly(s.row.hotelCheckOut) : null,
                 toCheckOut: s.newCheckOut ? formatDateOnly(s.newCheckOut) : null,
+                fromNights,
+                toNights: nights,
               });
             }
           }
@@ -11765,6 +11915,7 @@ export class OrderService {
         newScheduleId,
         newCabin,
         statusChanged,
+        hotelMode,
         hotelDateSync,
         departedTargetAllowed,
         flownSourceAllowed,
@@ -11809,6 +11960,7 @@ export class OrderService {
           statusChanged: scratch.statusChanged,
           departedTargetAllowed: scratch.departedTargetAllowed,
           flownSourceAllowed: scratch.flownSourceAllowed,
+          hotelMode: scratch.hotelMode,
           hotelDateSync: scratch.hotelDateSync,
           warnings: scratch.sharedRoomWarnings,
         },
@@ -20891,6 +21043,8 @@ export class OrderService {
       requestToken: string;
       /** 目标班次已起飞也放行（事后补录）。只对 ADMIN/STAFF 生效（代理入口根本不透传）。 */
       allowDepartedTarget?: boolean;
+      /** 住宿处理方式（缺省 SHIFT）：原样透传给 rescheduleOrderItem，角色闸在那里判（代理入口不透传）。 */
+      hotelMode?: RescheduleHotelMode;
       /**
        * 内部专用旗子：**只**由 reschedulePassengersAsAgent 在过完「代理售后自助」闸后设置。
        * 拆单闸与改期闸据此对代理放行；差价由 rescheduleOrderItem 锁内按系统口径算，feeCny 不透传。
@@ -21099,6 +21253,7 @@ export class OrderService {
           // 幂等键：改期与流水同一事务提交，下次同 token 重试据此回放（上面 3a）。
           requestToken: input.requestToken,
           ...(input.allowDepartedTarget ? { allowDepartedTarget: true } : {}),
+          ...(input.hotelMode ? { hotelMode: input.hotelMode } : {}),
           ...(isAgentAfterSales ? { agentAfterSales: true } : {}),
         },
         actor,
@@ -21210,6 +21365,7 @@ export class OrderService {
             feeLabel: input.feeLabel,
             note: input.note,
             ...(input.allowDepartedTarget ? { allowDepartedTarget: true } : {}),
+            ...(input.hotelMode ? { hotelMode: input.hotelMode } : {}),
             ...(isAgentAfterSales ? { agentAfterSales: true } : {}),
           },
           actor,
@@ -24115,12 +24271,16 @@ function rescheduleAllFingerprint(input: {
   newScheduleId: string;
   newCabin?: CabinClass;
   feeCny?: number;
+  hotelMode?: RescheduleHotelMode;
 }): string {
   return legActionFingerprint({
     orderItemId: input.orderItemId ?? null,
     newScheduleId: input.newScheduleId,
     newCabin: input.newCabin ?? null,
     feeCny: Math.trunc(input.feeCny ?? 0),
+    // 住宿处理方式只在非缺省时进指纹：缺省 SHIFT 的指纹与加字段前逐字相同，
+    // 上线前发出的 token 重试仍能回放（否则老指纹缺这个键会被判成 TOKEN_PAYLOAD_MISMATCH）。
+    ...(input.hotelMode && input.hotelMode !== 'SHIFT' ? { hotelMode: input.hotelMode } : {}),
   });
 }
 
@@ -26675,6 +26835,148 @@ export function rewriteHotelStayDescription(
   return description
     .replace(/\d{4}-\d{2}-\d{2}\s*~\s*\d{4}-\d{2}-\d{2}/, `${stay.checkIn}~${stay.checkOut}`)
     .replace(/\d+(?:\.\d+)?\s*晚/, `${stay.nights}晚`);
+}
+
+// ── 改期「房跟着新行程走」（hotelMode=FOLLOW_TRIP）的住宿重排 ─────────────────────
+/** FOLLOW_TRIP 锚点：改期前后的去程/回程**出发地当地日**（YYYY-MM-DD，口径同建单盖章）。 */
+export interface FollowTripAnchors {
+  fromOutbound: string;
+  fromReturn: string;
+  toOutbound: string;
+  toReturn: string;
+}
+
+/** 两个 YYYY-MM-DD 之间的整天数（b − a）。 */
+function daysBetweenYmd(a: string, b: string): number {
+  return Math.round(
+    (new Date(`${b}T00:00:00.000Z`).getTime() - new Date(`${a}T00:00:00.000Z`).getTime()) / DAY_MS,
+  );
+}
+
+/**
+ * FOLLOW_TRIP 的逐行目标日期（纯函数，导出供单测；前端改期弹窗的预览按同一规则算，后端权威）。
+ *
+ * 整单占房窗口 = [最早入住, 最晚离店)：
+ *   · 入住 == 窗口起点的行 → 新入住 = 新去程日 + (窗口起点 − 原去程日)；
+ *   · 离店 == 窗口终点的行 → 新离店 = 新回程日 + (窗口终点 − 原回程日)；
+ *   · 其余边不动。
+ * 典型的单行整程住宿（入住 = 去程日、离店 = 回程日）偏移都是 0 → 入住 = 新去程日、离店 = 新回程日，
+ * 这正是运营要的「房跟着新行程走」。保留偏移是为了不打翻运营手工调过的入住日（如次日凌晨到达
+ * 才入住的单）；只在两头伸缩是为了分段住（两家酒店接力）的单不会被拉成两段整程重复占房。
+ */
+export function planFollowTripHotelStay(
+  rows: ReadonlyArray<{ id: string; hotelCheckIn: Date; hotelCheckOut: Date | null }>,
+  anchors: FollowTripAnchors,
+): Array<{ id: string; newCheckIn: Date; newCheckOut: Date | null }> {
+  if (rows.length === 0) return [];
+  const checkIns = rows.map((r) => formatDateOnly(r.hotelCheckIn)).sort();
+  const checkOuts = rows
+    .flatMap((r) => (r.hotelCheckOut ? [formatDateOnly(r.hotelCheckOut)] : []))
+    .sort();
+  const windowStart = checkIns[0]!;
+  const windowEnd = checkOuts.length > 0 ? checkOuts[checkOuts.length - 1]! : null;
+  const newWindowStart = addDaysToYmd(
+    anchors.toOutbound,
+    daysBetweenYmd(anchors.fromOutbound, windowStart),
+  );
+  const newWindowEnd =
+    windowEnd != null
+      ? addDaysToYmd(anchors.toReturn, daysBetweenYmd(anchors.fromReturn, windowEnd))
+      : null;
+  const toDate = (ymd: string): Date => new Date(`${ymd}T00:00:00.000Z`);
+  return rows.map((r) => {
+    const checkIn = formatDateOnly(r.hotelCheckIn);
+    const checkOut = r.hotelCheckOut ? formatDateOnly(r.hotelCheckOut) : null;
+    return {
+      id: r.id,
+      newCheckIn: checkIn === windowStart ? toDate(newWindowStart) : r.hotelCheckIn,
+      newCheckOut:
+        checkOut == null
+          ? null
+          : checkOut === windowEnd && newWindowEnd != null
+            ? toDate(newWindowEnd)
+            : r.hotelCheckOut,
+    };
+  });
+}
+
+/**
+ * FOLLOW_TRIP 改了晚数后重打占房行的成本快照（毛利真账：成本要跟实住晚数走）。
+ *   · 单订酒店行（HOTEL + hotelRoomTypeId）：按房型净房价区间逐晚取**新区间**的价（越南盾按当晚汇率折），
+ *     每间每晚 = 区间均价，总成本 = 均价 × 晚数 × 房数，价源写进 metadata.costSource——与换酒店
+ *     重打快照同一套函数（resolveHotelStayUnitCost / computeSwapHotelCostSnapshot / withHotelCostSource）。
+ *     房型没录成本 → 两栏写 null（真缺数据如实报缺，不落 0 虚高，与换酒店同口径）。
+ *   · 随机档行（HOTEL + randomStarTier、无房型）：建单按当晚切房单价快照了每间每晚成本，没有房型
+ *     可逐晚取价 → 保留单价，总成本按新晚数重算；从未快照过 → 不动。
+ *   · BUNDLE 行：建单未快照酒店成本（totalCostCny 语义是整包），不动。
+ * 返回要并进 orderItem.update 的补丁（键缺失 = 该栏不动）。
+ */
+async function resnapshotHotelStayCost(
+  tx: Prisma.TransactionClient,
+  row: {
+    kind: OrderItemKind;
+    hotelRoomTypeId: string | null;
+    roomsBilled: Prisma.Decimal | null;
+    unitCostCny: Prisma.Decimal | null;
+    metadata: Prisma.JsonValue | null;
+  },
+  newCheckIn: Date,
+  newCheckOut: Date | null,
+): Promise<{
+  unitCostCny?: number | null;
+  totalCostCny?: number | null;
+  metadata?: Record<string, unknown>;
+}> {
+  if (row.kind !== OrderItemKind.HOTEL || !newCheckOut) return {};
+  const nights = buildStayNightDates(newCheckIn, newCheckOut).length;
+  if (nights === 0) return {};
+  const rooms = row.roomsBilled != null ? Number(row.roomsBilled.toString()) : 1;
+  if (row.hotelRoomTypeId) {
+    const rt = await tx.hotelRoomType.findUnique({
+      where: { id: row.hotelRoomTypeId },
+      select: {
+        id: true,
+        costPriceCny: true,
+        costPriceVnd: true,
+        costFxName: true,
+        costPeriods: {
+          select: {
+            effectiveFrom: true,
+            effectiveTo: true,
+            costPriceCny: true,
+            costPriceVnd: true,
+            costFxName: true,
+          },
+        },
+      },
+    });
+    if (!rt) return {};
+    const unit = resolveHotelStayUnitCost({
+      periods: rt.costPeriods,
+      baseCostCny: rt.costPriceCny,
+      baseCostVnd: rt.costPriceVnd,
+      baseFxName: rt.costFxName,
+      fxRates: await loadHotelCostFxRatesIfNeeded(
+        { periodsMap: new Map([[rt.id, rt.costPeriods]]), bases: [rt] },
+        tx,
+      ),
+      checkIn: newCheckIn,
+      checkOut: newCheckOut,
+    });
+    const snap = computeSwapHotelCostSnapshot({ newCostPriceCny: unit.unitCostCny, nights, rooms });
+    const costSource = buildHotelCostSourceSnapshot(unit.detail);
+    return {
+      unitCostCny: snap.unitCostCny,
+      totalCostCny: snap.totalCostCny,
+      ...(costSource
+        ? { metadata: withHotelCostSource(readJsonObject(row.metadata), costSource) ?? {} }
+        : {}),
+    };
+  }
+  if (row.unitCostCny != null) {
+    return { totalCostCny: Math.round(Number(row.unitCostCny.toString()) * nights * rooms) };
+  }
+  return {};
 }
 
 // ── 事务内酒店房量闸（新增真实占房的写路径统一入口）─────────────────────────

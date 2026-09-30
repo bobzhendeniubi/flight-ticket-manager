@@ -391,14 +391,17 @@ describe('OrderService.rescheduleOrderItem · 真 DB E2E', () => {
     expect(Number(reloaded.amount)).toBe(500);
     expect(Number(reloaded.roomsBilled)).toBe(1);
 
-    // 审计留痕
+    // 审计留痕（缺省 SHIFT：晚数不变）
     expect(result.audit.hotelDateSync).toEqual([
       {
         orderItemId: hotelItem.id,
+        mode: 'SHIFT',
         fromCheckIn: '2026-09-05',
         toCheckIn: '2026-09-01',
         fromCheckOut: '2026-09-06',
         toCheckOut: '2026-09-02',
+        fromNights: 1,
+        toNights: 1,
       },
     ]);
   });

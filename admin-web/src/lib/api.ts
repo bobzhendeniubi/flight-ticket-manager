@@ -4059,12 +4059,43 @@ export interface SplitOrderExecResult {
 // ── 按人改期（reschedule-passengers；ADMIN/STAFF）───────────────────────────
 // 勾全员 = 整单改期（不拆，newOrder 为 null）；勾部分 = 先把勾选乘客拆成新单，
 // 再对新单改期，改期差价落新单（order 为改期后的源单，newOrder 为拆出的新单）。
+/**
+ * 改期时占房行的住宿处理方式（仅 ADMIN/STAFF 可选非缺省值；代理入口不透传）：
+ *   FOLLOW_TRIP  房跟着新行程走——入住/离店锚定新去程/回程日，晚数随之增减；不改档、行价冻结，
+ *                价格只加手填改期差价。
+ *   SHIFT        整体平移保晚数（缺省 = 既有行为）。
+ *   KEEP         住宿日期不动。
+ */
+export type RescheduleHotelMode = 'FOLLOW_TRIP' | 'SHIFT' | 'KEEP';
+
+/** 改期后端同步了哪些占房行的日期（audit.reschedule.hotelDateSync 逐行；日期 YYYY-MM-DD）。 */
+export interface RescheduleHotelDateSync {
+  orderItemId: string;
+  mode: 'FOLLOW_TRIP' | 'SHIFT';
+  fromCheckIn: string;
+  toCheckIn: string;
+  fromCheckOut: string | null;
+  toCheckOut: string | null;
+  fromNights: number;
+  toNights: number;
+}
+
 export interface ReschedulePassengersResult {
   order: OrderSummary;
   newOrder: OrderSummary | null;
   splitPerformed: boolean;
   /** 跨单分房自动解绑等提示（B5）：后端已从 audit.reschedule.warnings 提到顶层，恒返回（无提示为空数组）。 */
   warnings: string[];
+  /**
+   * 改期审计明细（后端原样透出）：只读 reschedule.hotelMode / hotelDateSync 用来提示「住宿改成了什么」。
+   * 老后端 / 回放跳过改期时可能缺省或为 null，消费方按「没同步」处理。
+   */
+  audit?: {
+    reschedule?: {
+      hotelMode?: RescheduleHotelMode;
+      hotelDateSync?: RescheduleHotelDateSync[];
+    } | null;
+  };
 }
 
 // ── 取消航段（ADMIN/STAFF）───────────────────────────────────────────────
@@ -5462,6 +5493,8 @@ export const api = {
       requestToken: string;
       /** 目标班次已起飞也放行（客人今天实际飞了那班，事后补录）。缺省 = 目标已起飞一律拒。 */
       allowDepartedTarget?: boolean;
+      /** 住宿处理方式（缺省 SHIFT = 整体平移保晚数）；只有运营岗传，代理传了后端 403。 */
+      hotelMode?: RescheduleHotelMode;
     },
   ) =>
     apiFetch<ReschedulePassengersResult>(`/orders/${orderId}/reschedule-passengers`, {
