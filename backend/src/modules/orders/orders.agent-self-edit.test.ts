@@ -52,6 +52,11 @@ const service = new OrderService();
 
 const dec = (n: number): Prisma.Decimal => new Prisma.Decimal(n);
 const DAY_MS = 24 * 60 * 60 * 1000;
+// 测试里的入住/起飞日一律取「今天起 30 天后」的 UTC 零点：写死日期会在那天之后变成
+// 「入住日期已过」而无故变红。
+const FUTURE_DAY0 = new Date(Math.floor(Date.now() / DAY_MS) * DAY_MS + 30 * DAY_MS);
+const futureDay = (offsetDays: number, hourUtc = 0): Date =>
+  new Date(FUTURE_DAY0.getTime() + offsetDays * DAY_MS + hourUtc * 60 * 60 * 1000);
 
 /** 各角色 actor（代理带 agentId —— 归属判定要用）。 */
 const ADMIN = { userId: 'u-admin', role: UserRole.ADMIN } as const;
@@ -252,7 +257,7 @@ describe('correctFlightSchedule', () => {
       fareBuckets: null,
       schedule: {
         departureTz: 'Asia/Shanghai',
-        departureTime: new Date('2026-10-01T02:00:00.000Z'),
+        departureTime: futureDay(0, 2),
         flight: { businessPriceLinked: false, businessUpgradeCnyPerLeg: 700 },
       },
     });
@@ -407,8 +412,8 @@ describe('swapItemHotel · 自助差价', () => {
       hotelRoomTypeId: 'rt-old',
       randomStarTier: null,
       bundleId: null,
-      hotelCheckIn: new Date('2026-10-01T00:00:00.000Z'),
-      hotelCheckOut: new Date('2026-10-03T00:00:00.000Z'),
+      hotelCheckIn: futureDay(0),
+      hotelCheckOut: futureDay(2),
       roomsBilled: 1,
       // 代理自助换酒店的系统差价基数：本行成交单价 vs 新房型挂牌价（下面 rt-new 同价 → 差价 0）。
       unitPrice: dec(500),
@@ -517,8 +522,8 @@ describe('swapItemHotel · 自助差价', () => {
       hotelRoomTypeId: 'rt-old',
       randomStarTier: null,
       bundleId: 'b1',
-      hotelCheckIn: new Date('2026-10-01T00:00:00.000Z'),
-      hotelCheckOut: new Date('2026-10-03T00:00:00.000Z'),
+      hotelCheckIn: futureDay(0),
+      hotelCheckOut: futureDay(2),
       roomsBilled: 1,
       // N8：锁后重读把 unitPrice 纳入版本校验，缺这个字段会被 Number(undefined) 强转成
       // NaN，NaN !== NaN 恒真，让每次调用都误判成「被并发改过」。
