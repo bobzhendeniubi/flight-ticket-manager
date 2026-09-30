@@ -27,8 +27,14 @@ import { OrderService } from './orders.service.js';
 
 const service = new OrderService();
 
-const CHECK_IN = '2026-10-01';
-const CHECK_OUT = '2026-10-03';
+// 入住日一律相对「今天起 20 天后（房控提醒只看未来 30 天）」：写死日期过了当天就会触发「入住日期已到/已过」而无故变红。
+// 各日期之间的间隔与原先写死的 10 月 / 11 月两组完全一致。
+const DAY_MS_W2 = 24 * 60 * 60 * 1000;
+const BASE_MS_W2 = Math.floor(Date.now() / DAY_MS_W2) * DAY_MS_W2 + 20 * DAY_MS_W2;
+const ymd = (offsetDays: number): string =>
+  new Date(BASE_MS_W2 + offsetDays * DAY_MS_W2).toISOString().slice(0, 10);
+const CHECK_IN = ymd(0);
+const CHECK_OUT = ymd(2);
 
 function uniq(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.random().toString(36).slice(2, 7)}`;
@@ -388,20 +394,20 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
       data: [
         {
           hotelId: hotel.id,
-          dateFrom: new Date('2026-11-01T00:00:00.000Z'),
-          dateTo: new Date('2026-11-03T00:00:00.000Z'),
+          dateFrom: new Date(`${ymd(31)}T00:00:00.000Z`),
+          dateTo: new Date(`${ymd(33)}T00:00:00.000Z`),
           rooms: 1,
         },
         {
           hotelId: hotel.id,
-          dateFrom: new Date('2026-11-05T00:00:00.000Z'),
-          dateTo: new Date('2026-11-07T00:00:00.000Z'),
+          dateFrom: new Date(`${ymd(35)}T00:00:00.000Z`),
+          dateTo: new Date(`${ymd(37)}T00:00:00.000Z`),
           rooms: 1,
         },
         {
           hotelId: hotel.id,
-          dateFrom: new Date('2026-11-10T00:00:00.000Z'),
-          dateTo: new Date('2026-11-12T00:00:00.000Z'),
+          dateFrom: new Date(`${ymd(40)}T00:00:00.000Z`),
+          dateTo: new Date(`${ymd(42)}T00:00:00.000Z`),
           rooms: 1,
         },
       ],
@@ -410,27 +416,27 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
     await createOrderWithPassengers({
       roomTypeId: roomType.id,
       passengerCount: 1,
-      checkIn: '2026-11-10',
-      checkOut: '2026-11-11',
+      checkIn: ymd(40),
+      checkOut: ymd(41),
     });
     const orderA = await createOrderWithPassengers({
       roomTypeId: roomType.id,
       passengerCount: 1,
-      checkIn: '2026-11-01',
-      checkOut: '2026-11-02',
+      checkIn: ymd(31),
+      checkOut: ymd(32),
     });
     const orderB = await createOrderWithPassengers({
       roomTypeId: roomType.id,
       passengerCount: 1,
-      checkIn: '2026-11-01',
-      checkOut: '2026-11-02',
+      checkIn: ymd(31),
+      checkOut: ymd(32),
     });
 
     await saveSharedRooms(
       {
         hotelId: hotel.id,
-        checkIn: '2026-11-01',
-        checkOut: '2026-11-02',
+        checkIn: ymd(31),
+        checkOut: ymd(32),
         requestToken: requestToken(),
         rooms: [
           {
@@ -460,7 +466,7 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
     await service.rescheduleItemHotel(
       orderB.id,
       orderB.items[0].id,
-      { newCheckIn: '2026-11-05', newCheckOut: '2026-11-06', feeCny: 0 },
+      { newCheckIn: ymd(35), newCheckOut: ymd(36), feeCny: 0 },
       { userId: actor.userId, role: UserRole.ADMIN },
     );
     const memberAfterFirst = await prisma.sharedRoomMember.findMany({
@@ -474,14 +480,14 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
       service.rescheduleItemHotel(
         orderB.id,
         orderB.items[0].id,
-        { newCheckIn: '2026-11-10', newCheckOut: '2026-11-11', feeCny: 0 },
+        { newCheckIn: ymd(40), newCheckOut: ymd(41), feeCny: 0 },
         { userId: actor.userId, role: UserRole.ADMIN },
       ),
     ).rejects.toThrow(/实际房间不足/);
 
     // 拒绝后不能错误落库：仍留在中转区间（11-05）。
     const itemFinal = await prisma.orderItem.findUniqueOrThrow({ where: { id: orderB.items[0].id } });
-    expect(itemFinal.hotelCheckIn).toEqual(new Date('2026-11-05T00:00:00.000Z'));
+    expect(itemFinal.hotelCheckIn).toEqual(new Date(`${ymd(35)}T00:00:00.000Z`));
   });
 
   it('C1 反例（恢复）：取消前留下的 0 份额普通组，恢复时必须按 1 间占用判定，不能对已被占满的酒店视而不见', async () => {
@@ -1299,7 +1305,7 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
 
   it('入口 B（酒店改期）：共享行改期先解绑，新旧区间都过闸，物理口径 floor 回 1 间', async () => {
     const actor = await adminActor();
-    const { hotel, roomType } = await createHotelWithRoomType(4, CHECK_IN, '2026-10-06');
+    const { hotel, roomType } = await createHotelWithRoomType(4, CHECK_IN, ymd(5));
     const orderA = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
     const orderB = await createOrderWithPassengers({ roomTypeId: roomType.id, passengerCount: 1 });
 
@@ -1333,8 +1339,8 @@ describe('跨单分房波 2 入口矩阵 · 真 DB E2E', () => {
       actor,
     );
 
-    const newCheckIn = '2026-10-04';
-    const newCheckOut = '2026-10-06';
+    const newCheckIn = ymd(3);
+    const newCheckOut = ymd(5);
     const { audit } = await service.rescheduleItemHotel(
       orderB.id,
       orderB.items[0].id,
