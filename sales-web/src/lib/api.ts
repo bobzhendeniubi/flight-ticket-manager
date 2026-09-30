@@ -310,7 +310,8 @@ export type OrderStatus =
   | 'REFUNDED'
   | 'CHANGE_REQUESTED'
   | 'CHANGED'
-  | 'FAILED';
+  | 'FAILED'
+  | 'SWAPPED';
 
 export type OrderItemKind =
   | 'FLIGHT'

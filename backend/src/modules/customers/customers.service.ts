@@ -14,6 +14,8 @@ const PAID_STATUSES: OrderStatus[] = [
   OrderStatus.PROCESSING,
   OrderStatus.TICKETED,
   OrderStatus.COMPLETED,
+  // 已换人：客人实际付的换人费计入累计消费。
+  OrderStatus.SWAPPED,
 ];
 
 export class CustomersService {

@@ -54,9 +54,20 @@ describe('状态机真源契约 · serializeOrder 下发的 allowedTransitions =
   });
 
   it('终态下发空集（前端据此说明「为何没有可用操作」，而不是渲染空白工具条）', () => {
-    for (const status of [OrderStatus.COMPLETED, OrderStatus.CANCELLED, OrderStatus.REFUNDED]) {
+    for (const status of [
+      OrderStatus.COMPLETED,
+      OrderStatus.CANCELLED,
+      OrderStatus.REFUNDED,
+      OrderStatus.SWAPPED,
+    ]) {
       const out = serializeOrder(buildOrder(status)) as Record<string, unknown>;
       expect(out.allowedTransitions).toEqual([]);
+    }
+  });
+
+  it('「已换人」不在任何状态的白名单里：进它只能走标记已换人端点（应收收敛 + 多付转存），不能手点', () => {
+    for (const status of ALL_STATUSES) {
+      expect(ALLOWED_TRANSITIONS[status]).not.toContain(OrderStatus.SWAPPED);
     }
   });
 

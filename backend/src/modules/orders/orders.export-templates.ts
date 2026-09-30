@@ -507,6 +507,7 @@ const ORDER_STATUS_LABEL: Record<string, string> = {
   CHANGE_REQUESTED: '改期中',
   CHANGED: '已改期',
   FAILED: '失败',
+  SWAPPED: '已换人',
 };
 
 const CABIN_LABEL: Record<string, string> = {

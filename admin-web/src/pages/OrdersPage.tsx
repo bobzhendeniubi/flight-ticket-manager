@@ -71,6 +71,7 @@ import { Modal, useDialogA11y } from '../components/Modal';
 import { groupHotelsByBundleTier } from '../lib/settlement-tier';
 import { SWAP_LINKED_ADJUSTMENT_TYPES, swapAdjustmentTitle } from '../lib/swapFeeLine';
 import { ChangeRequestModal } from '../components/ChangeRequestModal';
+import { MarkSwappedModal, MARK_SWAPPED_ELIGIBLE_STATUSES, markSwappedSummary } from '../components/MarkSwappedModal';
 import { OrderChangeRequestsPanel } from '../components/OrderChangeRequestsPanel';
 import { BatchOrderChangeRequestModal } from '../components/BatchOrderChangeRequestModal';
 import { OrderChangeRequestQueueModal } from '../components/OrderChangeRequestQueueModal';
@@ -93,7 +94,12 @@ const BULK_INVOICE_FLAG_OPTIONS: Array<{
 
 const FILTER_STATUSES: OrderStatus[] = [
   'PENDING_PAYMENT', 'PAID', 'PROCESSING', 'TICKETED', 'COMPLETED', 'CANCELLED', 'REFUND_REQUESTED',
+  'SWAPPED',
 ];
+
+// 列表「改状态…」下拉里的「已换人…」不是状态机流转（后端不让直接置 SWAPPED），而是打开标记已换人弹窗
+// 的哨兵值；与真实 OrderStatus 值区分开，避免被当成 toStatus 发出去。
+const MARK_SWAPPED_OPTION = '__MARK_SWAPPED__';
 
 // ── 状态机：标准流转允许的目标状态 ──────────────────────────────────────
 // 这里**不再手抄**后端的 ALLOWED_TRANSITIONS —— 手抄版漂移过四行（PAID/PROCESSING 少
@@ -124,6 +130,7 @@ const TRANSITION_LABEL: Record<OrderStatus, string> = {
   CHANGE_REQUESTED: '申请改期',
   CHANGED: '标记已改期',
   FAILED: '出票失败',
+  SWAPPED: '标记已换人',
 };
 
 // 来源状态相关的特殊文案（覆盖 TRANSITION_LABEL）。
@@ -321,6 +328,7 @@ const RELEASED_EXPORT_STATUSES: ReadonlySet<OrderStatus> = new Set<OrderStatus>(
   'REFUNDED',
   'PAYMENT_TIMEOUT',
   'FAILED',
+  'SWAPPED',
 ]);
 const BATCH_RESCHEDULE_ORDER_LIMIT = 500;
 // 批量锁收款 / 批量调价没有各自的后端条数上限（不像上面几个批量端点有 Zod .max()），
@@ -1196,6 +1204,8 @@ export function OrdersPage() {
   // 运营岗（ADMIN + STAFF）：批量工具条里绝大多数动作是运营权限，代理不该看见一排必然 403 的按钮。
   // 代理唯一能用的批量动作是「批量改备注」——后端 PATCH /orders/:id/notes 的 notes 字段对其放行。
   const isOps = user?.role === 'ADMIN' || user?.role === 'STAFF';
+  // 列表「改状态…」→「已换人…」选中的那张单（非空即开标记已换人弹窗）。
+  const [markSwappedTarget, setMarkSwappedTarget] = useState<OrderSummary | null>(null);
   // 深链承接：从签证台等页面带 ?q=订单号 跳入时用于填充搜索框并自动开详情抽屉
   const [searchParams] = useSearchParams();
   const legacyOrderId = searchParams.get('legacyOrderId')?.trim();
@@ -3046,9 +3056,11 @@ export function OrdersPage() {
                   status: orderStatusLabel(order.status),
                   refundType: order.swapRefundedAt
                     ? '换人退款'
-                    : REFUND_FAMILY_STATUSES.has(order.status)
-                      ? '普通退款'
-                      : '',
+                    : order.status === 'SWAPPED'
+                      ? '已换人'
+                      : REFUND_FAMILY_STATUSES.has(order.status)
+                        ? '普通退款'
+                        : '',
                   swapFeeCny: order.swapFeeCny ?? '',
                   replacementOrderNumber: order.swapReplacementOrderNumber ?? '',
                   createdAt: formatDateTimeSecCn(order.createdAt),
@@ -3837,7 +3849,7 @@ export function OrdersPage() {
                   不再是全枚举——选中的目标不一定对所选的每一单都合法，逐单容错见 applyBulkStatus。
                   强制模式（仅管理员可见，见下方勾选框）：保留全枚举，因为这条通道本就是要绕过状态机。 */}
               {(effectiveForceMode
-                ? (Object.keys(ORDER_STATUS_META) as OrderStatus[]).filter((s) => s !== 'TICKETED')
+                ? (Object.keys(ORDER_STATUS_META) as OrderStatus[]).filter((s) => s !== 'TICKETED' && s !== 'SWAPPED')
                 : bulkAllowedTargets
               ).map((s) => (
                 <option key={s} value={s}>{orderStatusLabel(s)}</option>
@@ -4855,6 +4867,15 @@ export function OrdersPage() {
                           换人
                         </span>
                       )}
+                      {/* 已换人（不退现金那条路）：状态徽标已写「已换人」，这里补换人费与接手单号。 */}
+                      {order.status === 'SWAPPED' && !order.swapRefundedAt && (
+                        <span
+                          className="badge-neutral text-[10px]"
+                          title={`换人费 ¥${order.swapFeeCny ?? 0}，接手订单${order.swapReplacementOrderNumber ? ` ${order.swapReplacementOrderNumber}` : ' 未填写'}`}
+                        >
+                          费 ¥{order.swapFeeCny ?? 0}
+                        </span>
+                      )}
                       {/* 收款已锁：只挡手工录收款，对账台认款/线上到账不受影响；仅运营可见（后端对代理脱敏该字段）。 */}
                       {isOps && order.paymentsLocked && (
                         <span className="badge-warning text-[10px]" title="收款已锁定，暂不能手工录收款">
@@ -4915,6 +4936,12 @@ export function OrdersPage() {
                         className="w-20 rounded-md border border-slate-200 bg-white px-1 py-1 text-[11px] text-ink-soft disabled:opacity-50"
                         value=""
                         onChange={(e) => {
+                          // 「已换人…」不是流转：走标记已换人弹窗（应收收敛 + 多付转存 + 释放座位）。
+                          if (e.target.value === MARK_SWAPPED_OPTION) {
+                            e.target.value = '';
+                            setMarkSwappedTarget(order);
+                            return;
+                          }
                           const next = e.target.value as OrderStatus;
                           if (!next) return;
                           const msg = effectiveForceMode
@@ -4968,13 +4995,17 @@ export function OrdersPage() {
                         <option value="">改状态…</option>
                         {/* 非强制模式：只列后端下发的合法流转（allowedNextOf，状态机真源），不再是
                             「除当前态外全枚举」——避免运营选到非法目标、失败提示还要劝人去勾「强制」。
-                            强制模式（仅管理员可见，见批量工具条的勾选框）：保留全枚举，这条通道本就是要绕过状态机。 */}
+                            强制模式（仅管理员可见，见批量工具条的勾选框）：保留全枚举，这条通道本就是要绕过状态机。
+                            「已换人」在两种模式下都不作为流转目标（后端账目闸会拒），只以「已换人…」入口开弹窗。 */}
                         {(effectiveForceMode
-                          ? (Object.keys(ORDER_STATUS_META) as OrderStatus[]).filter((s) => s !== order.status)
+                          ? (Object.keys(ORDER_STATUS_META) as OrderStatus[]).filter((s) => s !== order.status && s !== 'SWAPPED')
                           : allowedNextOf(order)
                         ).map((s) => (
                           <option key={s} value={s}>{orderStatusLabel(s)}</option>
                         ))}
+                        {isOps && !effectiveForceMode && MARK_SWAPPED_ELIGIBLE_STATUSES.has(order.status) && (
+                          <option value={MARK_SWAPPED_OPTION}>已换人…</option>
+                        )}
                       </select>
                       <button className="whitespace-nowrap text-xs font-medium text-brand hover:text-brand-dark" onClick={() => setSelected(order)}>
                         详情
@@ -5095,6 +5126,22 @@ export function OrdersPage() {
           onCreated={() => {
             setRefreshNonce((n) => n + 1);
             bumpSeats();
+          }}
+        />
+      )}
+
+      {isOps && (
+        <MarkSwappedModal
+          open={markSwappedTarget !== null}
+          order={markSwappedTarget}
+          token={tokens?.accessToken ?? ''}
+          onClose={() => setMarkSwappedTarget(null)}
+          onDone={(updated, audit) => {
+            setOrders((prev) => prev.map((o) => (o.id === updated.id ? updated : o)));
+            setSelected((prev) => (prev && prev.id === updated.id ? updated : prev));
+            // 未飞航段当场释放 → 广播座位变更。
+            bumpSeats();
+            window.alert(markSwappedSummary(audit));
           }}
         />
       )}
@@ -5518,6 +5565,8 @@ function OrderDrawer({
     return roundCny(paid - completedRefunds);
   }, [hydrated]);
   const [swapRefundOpen, setSwapRefundOpen] = useState(false);
+  // 标记已换人（换人主路径：钱留在系统里）弹窗；换人退款（退现金）弹窗保留但入口按钮已收起。
+  const [markSwappedOpen, setMarkSwappedOpen] = useState(false);
   const [swapFeeInput, setSwapFeeInput] = useState('');
   const [swapReplacementOrderNumber, setSwapReplacementOrderNumber] = useState('');
   const [swapRefundReason, setSwapRefundReason] = useState('');
@@ -5781,9 +5830,10 @@ function OrderDrawer({
   // 用未按角色收窄的 machineNext 判定：代理看到的空工具条是"这些流转不归你做"，不是"这单走到头了"。
   const isTerminal = machineNext.length === 0;
   // 管理员强制可选的「越过状态机」目标：所有其它状态里、不在标准流转内的（标准流转已经是普通按钮）。
+  // 「已换人」不进强制清单：后端账目闸连 force 都拦（只翻状态会留下应收没收敛的单），入口在付款情况卡。
   const forceTargets: OrderStatus[] = isAdmin
     ? (Object.keys(ORDER_STATUS_META) as OrderStatus[]).filter(
-        (s) => s !== o.status && !machineNext.includes(s),
+        (s) => s !== o.status && s !== 'SWAPPED' && !machineNext.includes(s),
       )
     : [];
 
@@ -5997,24 +6047,24 @@ function OrderDrawer({
             <div className="rounded-xl border border-slate-200 bg-slate-50/60 p-3">
               <div className="flex items-center justify-between gap-2">
                 <div className="text-xs font-semibold uppercase tracking-wide text-ink-muted">付款情况</div>
+                {/* 换人主路径 = 标记已换人（多出的钱转代理余额/挂账池抵新单）。原「换人退款」（退现金）
+                    按钮收起，端点与弹窗保留（swapRefundOpen）以备需要时恢复入口。 */}
                 {isOps && (
                   <button
                     type="button"
                     className="btn-danger px-2 py-1 text-xs disabled:cursor-not-allowed disabled:opacity-50"
-                    disabled={swapRefundDisabledReason !== null}
-                    title={swapRefundDisabledReason ?? '手填换人费并提交换人退款申请'}
-                    onClick={() => {
-                      setSwapFeeInput('');
-                      setSwapReplacementOrderNumber('');
-                      setSwapRefundReason('');
-                      setSwapRefundError(null);
-                      setSwapRefundOpen(true);
-                    }}
+                    disabled={!MARK_SWAPPED_ELIGIBLE_STATUSES.has(o.status)}
+                    title={
+                      MARK_SWAPPED_ELIGIBLE_STATUSES.has(o.status)
+                        ? '应收收敛为换人费，多出的钱存入代理余额/挂账池，释放未飞航段座位'
+                        : `订单「${orderStatusLabel(o.status)}」不可标记已换人`
+                    }
+                    onClick={() => setMarkSwappedOpen(true)}
                   >
-                    换人退款
+                    标记已换人
                   </button>
                 )}
-                {isOps && o.swapRefundedAt && (
+                {isOps && (o.swapRefundedAt || o.status === 'SWAPPED') && (
                   <button
                     type="button"
                     className="text-[11px] font-medium text-brand hover:text-brand-dark"
@@ -6072,6 +6122,20 @@ function OrderDrawer({
                 防止财务照应退合计全额打款、与系统自动回补重复退钱。 */}
             <RefundSplitCard order={o} />
           </section>
+
+          {isOps && (
+            <MarkSwappedModal
+              open={markSwappedOpen}
+              order={o}
+              token={token}
+              onClose={() => setMarkSwappedOpen(false)}
+              onDone={(updated, audit) => {
+                handleOrderUpdated(updated);
+                onChanged?.();
+                window.alert(markSwappedSummary(audit));
+              }}
+            />
+          )}
 
           {isOps && (
             <Modal

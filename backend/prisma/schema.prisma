@@ -1719,6 +1719,11 @@ enum OrderStatus {
   CHANGE_REQUESTED
   CHANGED
   FAILED
+  // 已换人（终态）：原客人的位子让给了别人，本单只收换人费（应收收敛到 swapFeeCny），
+  // 未飞航段座位/占房随之释放，多付部分转入代理余额或挂账池。只能经「标记已换人」端点进入
+  //（POST /orders/:id/mark-swapped），普通 PATCH /status 与 admin force 都进不来（账目闸）。
+  // 与「换人退款」（swapRefundedAt，退现金）的区别：这条路钱留在系统里给新单抵扣，不退现金。
+  SWAPPED
 }
 
 // 订单级签证状态（录单时选择）：不需要 / 需要 / 电子签 / 已签证
@@ -1828,11 +1833,13 @@ model Order {
   idempotencyKey       String?          @unique
   notes                String? // 客户填写的特殊说明（兼容保留：老的自由文本备注框）
   internalNotes        String? // 运营/客服内部备忘（客户看不到）
-  /// 换人退款标记：非空 = 这单是因为换人而退的（区别于客人自己要求的普通退票）
+  /// 换人退款标记：非空 = 这单是因为换人而退的（区别于客人自己要求的普通退票）。
+  /// 「已换人」（status=SWAPPED）那条路不写本列——它不退现金，时间以状态事件为准。
   swapRefundedAt             DateTime?
-  /// 本次换人费（CNY 整数）：从净收款里扣下、不退给客人的那部分
+  /// 本次换人费（CNY 整数）：换人退款 = 从净收款里扣下、不退给客人的那部分；
+  /// 已换人（SWAPPED）= 本单收敛后的应收（多付转代理余额/挂账池，欠款照常收）。
   swapFeeCny                 Int?
-  /// 接手这个位子的新订单号（选填，纯记录；不做外键，新单可能后补或被改）
+  /// 接手这个位子的新订单号（选填，纯记录；不做外键，新单可能后补或被改）；两条换人路共用。
   swapReplacementOrderNumber String?
   // 订单级签证状态（录单时选择）
   visaStatus           VisaRequirement?

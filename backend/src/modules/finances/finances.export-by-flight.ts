@@ -44,6 +44,8 @@ const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.REFUND_REQUESTED,
   OrderStatus.CHANGE_REQUESTED,
   OrderStatus.CHANGED,
+  // 已换人：换人费按该班次记收入（与财务汇总口径一致），成本随座位释放为 0。
+  OrderStatus.SWAPPED,
 ];
 
 interface FlightRow {

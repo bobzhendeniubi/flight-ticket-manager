@@ -30,6 +30,7 @@ const STATUS_LABEL: Record<OrderStatus, string> = {
   CHANGE_REQUESTED: '改签审核中',
   CHANGED: '已改签',
   FAILED: '失败',
+  SWAPPED: '已换人',
 };
 
 const STATUS_CLASS: Record<OrderStatus, string> = {
@@ -46,6 +47,7 @@ const STATUS_CLASS: Record<OrderStatus, string> = {
   CHANGE_REQUESTED: 'bg-amber-100 text-amber-800',
   CHANGED: 'bg-sky-100 text-sky-700',
   FAILED: 'bg-rose-100 text-rose-700',
+  SWAPPED: 'bg-slate-100 text-slate-600',
 };
 
 const KIND_ICON: Record<string, IconName> = {

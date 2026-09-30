@@ -74,6 +74,8 @@ export const EXPORT_RELEASED_STATUSES: OrderStatus[] = [
   OrderStatus.REFUNDED,
   OrderStatus.PAYMENT_TIMEOUT,
   OrderStatus.FAILED,
+  // 已换人：座位已让出，不进办事用的主导出；随取消/退款单一起走独立入口对账。
+  OrderStatus.SWAPPED,
 ];
 
 /**

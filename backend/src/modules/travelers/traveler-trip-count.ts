@@ -46,6 +46,8 @@ export const EXCLUDED_ORDER_STATUSES: OrderStatus[] = [
   OrderStatus.CANCELLED,
   OrderStatus.FAILED,
   OrderStatus.REFUNDED,
+  // 已换人：被换下去的人没飞这一趟（接手的人在自己的新单上计次）。
+  OrderStatus.SWAPPED,
 ];
 
 /** 聚合所需的订单形状（档案重建、详情重算、现算兜底共用同一份 select，口径不分叉）。 */

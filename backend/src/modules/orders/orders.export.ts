@@ -61,6 +61,7 @@ const STATUS_LABEL: Record<string, string> = {
   REFUND_REQUESTED: '退款中',
   CHANGE_REQUESTED: '改期中',
   CHANGED: '已改期',
+  SWAPPED: '已换人',
 };
 
 const GENDER_LABEL: Record<string, string> = { M: '男', F: '女', X: '其他' };

@@ -13,6 +13,8 @@ import { getAlerts } from '../hotel-control/hotel-control.service.js';
 
 const PAID_LIKE_STATUSES: OrderStatus[] = [
   'PAID', 'PROCESSING', 'TICKETED', 'COMPLETED', 'CHANGE_REQUESTED', 'CHANGED',
+  // 已换人：total 已收敛为换人费，那是真实营收，大盘照算。
+  'SWAPPED',
 ];
 
 export class DashboardService {

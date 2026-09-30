@@ -252,6 +252,7 @@ const ENUM_DICT: Record<string, string> = {
   CHANGE_REQUESTED: '改期申请中',
   CHANGED: '已改期',
   FAILED: '出票失败',
+  SWAPPED: '已换人',
   // SettlementStatus
   PENDING_APPROVAL: '待审批',
   APPROVED: '已核准',

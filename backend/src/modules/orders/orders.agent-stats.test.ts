@@ -178,7 +178,7 @@ describe('OrderService.getAgentStats · 已付款闸', () => {
   it('AND 里叠 status ∈ {PAID, TICKETED, COMPLETED}', async () => {
     await service.getAgentStats(q(), { userId: 'admin1', role: 'ADMIN' });
     expect(lastGroupByWhere().AND).toContainEqual({
-      status: { in: ['PAID', 'TICKETED', 'COMPLETED'] },
+      status: { in: ['PAID', 'TICKETED', 'COMPLETED', 'SWAPPED'] },
     });
   });
 
@@ -189,7 +189,7 @@ describe('OrderService.getAgentStats · 已付款闸', () => {
     });
     const where = lastGroupByWhere();
     expect(where.status).toBe('PENDING_PAYMENT');
-    expect(where.AND).toContainEqual({ status: { in: ['PAID', 'TICKETED', 'COMPLETED'] } });
+    expect(where.AND).toContainEqual({ status: { in: ['PAID', 'TICKETED', 'COMPLETED', 'SWAPPED'] } });
   });
 
   it('聚合走 groupBy(agentId) + 求和，不把订单拉进内存', async () => {
@@ -333,6 +333,6 @@ describe('OrderService.getAgentStats · 与列表同一份 where（筛选 + RBAC
     expect(where.AND).toContainEqual({ items: { some: { kind: 'FLIGHT' } } });
     expect((where.AND ?? []).filter((c) => 'items' in c)).toHaveLength(1);
     expect((where.AND ?? []).some((c) => JSON.stringify(c).includes('王小明'))).toBe(true);
-    expect(where.AND).toContainEqual({ status: { in: ['PAID', 'TICKETED', 'COMPLETED'] } });
+    expect(where.AND).toContainEqual({ status: { in: ['PAID', 'TICKETED', 'COMPLETED', 'SWAPPED'] } });
   });
 });
