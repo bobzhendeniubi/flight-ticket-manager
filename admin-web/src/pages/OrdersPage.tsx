@@ -11,6 +11,8 @@ import { AIRPORTS, formatLocalTime, localYmd } from '../lib/airports';
 import { businessTzParts, formatDateCn, formatDateTimeSecCn, formatInBusinessTz } from '../lib/datetime';
 import { NumberInput } from '../components/NumberInput';
 import { Icon, type IconName } from '../components/Icon';
+import { ColumnResizeHandle } from '../components/ColumnResizeHandle';
+import { useColumnWidths } from '../hooks/useColumnWidths';
 import { parseOtaRoster } from '../lib/parseOtaRoster';
 import { computePerPaxSettlement } from '../lib/perPaxSettlement';
 import { toOrdersExportFilter } from '../lib/api';
@@ -702,7 +704,11 @@ function deriveListPerPaxSettlement(o: OrderSummary): Map<string, number> | null
 // 不如让每个人自己收起用不上的列。勾选存本机 localStorage，不进后端、不影响别人。
 // 「内容」「操作」两列不可隐藏——前者是订单本体、后者是唯一入口，藏了这张表就没用了。
 // 只做显示/隐藏，不做拖拽排序：列序是全岗共识，人各拖一套反而没法互相对着屏幕说「第三列」。
+// 存储键按登录用户分（`ftm-orders-columns:<userId>`）：同一台电脑轮班换人登录时各记各的。
+// 旧版不分人的键只作迁移来源：新键还没有时读它一次，随后写进新键（旧键保留不删——
+// 同一台电脑上其他人第一次打开时也能继承原先的设置）。
 const ORDER_COLUMN_STORAGE_KEY = 'ftm-orders-columns';
+const orderColumnStorageKey = (userId: string) => `${ORDER_COLUMN_STORAGE_KEY}:${userId}`;
 const ORDER_COLUMNS = [
   { key: 'orderNumber', label: '订单号' },
   { key: 'customer', label: '客户 / 代理' },
@@ -722,10 +728,35 @@ const ALL_COLUMNS_VISIBLE: OrderColumnVisibility = Object.fromEntries(
 /** 不可隐藏的固定列数（勾选框 / 序号 / 内容 / 操作），用于空态行 colSpan。 */
 const ORDER_FIXED_COLUMN_COUNT = 4;
 
+// ── 列宽（表头拖柄调整，按人记住）───────────────────────────────────────
+// 可拖列 = 9 个可隐藏列 + 「内容」；勾选框 / 序号 / 操作三列宽度固定（操作列 sticky 右侧，
+// 宽度按里面的下拉+按钮定死，拖窄会把按钮挤出格子）。默认宽尽量贴近原先 auto 布局下的观感。
+const ORDER_COLUMN_WIDTH_STORAGE_KEY = 'ftm-orders-colwidths';
+type ResizableOrderColumnKey = OrderColumnKey | 'content';
+const ORDER_COLUMN_DEFAULT_WIDTHS: Readonly<Record<ResizableOrderColumnKey, number>> = {
+  orderNumber: 150,
+  customer: 160,
+  content: 600,
+  departDate: 140,
+  amount: 112,
+  balance: 104,
+  status: 104,
+  visa: 104,
+  invoice: 72,
+  createdAt: 124,
+};
+const ORDER_SELECT_COLUMN_WIDTH = 40;
+const ORDER_INDEX_COLUMN_WIDTH = 52;
+/** 操作列：px-2 + 改状态下拉 w-20 + 「详情」+（内部员工多一颗「删除」） */
+const ORDER_ACTION_COLUMN_WIDTH_WITH_DELETE = 216;
+const ORDER_ACTION_COLUMN_WIDTH = 136;
+
 /** 读本机列配置；缺字段按「显示」补全，解析失败/无 localStorage 时全显（永远不会把表读空）。 */
-function readColumnVisibility(): OrderColumnVisibility {
+function readColumnVisibility(storageKey: string): OrderColumnVisibility {
   try {
-    const raw = window.localStorage.getItem(ORDER_COLUMN_STORAGE_KEY);
+    // 新键（按人）优先；还没有时回退读一次旧版不分人的键（迁移），之后由写入 effect 落到新键。
+    const raw =
+      window.localStorage.getItem(storageKey) ?? window.localStorage.getItem(ORDER_COLUMN_STORAGE_KEY);
     if (!raw) return ALL_COLUMNS_VISIBLE;
     const parsed = JSON.parse(raw) as Record<string, unknown>;
     const next = { ...ALL_COLUMNS_VISIBLE };
@@ -1196,18 +1227,63 @@ export function OrdersPage() {
   const [pageSize, setPageSize] = useState<number>(DEFAULT_PAGE_SIZE);
   const [page, setPage] = useState(1);
   // 列显示配置（本机偏好，默认全显）+ 「列设置」弹层开关。
-  const [columnVisibility, setColumnVisibility] = useState<OrderColumnVisibility>(readColumnVisibility);
+  // 列显隐与列宽都按人记（受保护路由里 user 必在；兜底 anon 只为类型）。
+  const columnPrefsUserId = user?.id ?? 'anon';
+  const columnVisibilityKey = orderColumnStorageKey(columnPrefsUserId);
+  const [columnVisibility, setColumnVisibility] = useState<OrderColumnVisibility>(() =>
+    readColumnVisibility(columnVisibilityKey),
+  );
   const [showColumnPicker, setShowColumnPicker] = useState(false);
   useEffect(() => {
     try {
-      window.localStorage.setItem(ORDER_COLUMN_STORAGE_KEY, JSON.stringify(columnVisibility));
+      window.localStorage.setItem(columnVisibilityKey, JSON.stringify(columnVisibility));
     } catch {
       // 隐私模式/存储写满时静默降级：本次会话内配置仍生效，只是下次打开回到默认全显。
     }
-  }, [columnVisibility]);
+  }, [columnVisibilityKey, columnVisibility]);
   const visibleColumnCount = ORDER_COLUMNS.filter((c) => columnVisibility[c.key]).length;
   const hiddenColumnCount = ORDER_COLUMNS.length - visibleColumnCount;
   const tableColSpan = ORDER_FIXED_COLUMN_COUNT + visibleColumnCount;
+  // 列宽：表头右缘拖柄调整，拖动中只改内存、松手落盘；双击拖柄 / 列设置里可恢复默认。
+  const {
+    widths: columnWidths,
+    setWidth: setColumnWidth,
+    persist: persistColumnWidths,
+    resetWidth: resetColumnWidth,
+    resetAll: resetColumnWidths,
+  } = useColumnWidths<ResizableOrderColumnKey>(
+    `${ORDER_COLUMN_WIDTH_STORAGE_KEY}:${columnPrefsUserId}`,
+    ORDER_COLUMN_DEFAULT_WIDTHS,
+  );
+  const columnWidthsCustomized = (Object.keys(ORDER_COLUMN_DEFAULT_WIDTHS) as ResizableOrderColumnKey[]).some(
+    (k) => columnWidths[k] !== ORDER_COLUMN_DEFAULT_WIDTHS[k],
+  );
+  const actionColumnWidth = canManageDeleted ? ORDER_ACTION_COLUMN_WIDTH_WITH_DELETE : ORDER_ACTION_COLUMN_WIDTH;
+  // 按表头顺序排出当前可见的可拖列（colgroup 与表宽都按它算，和 <th> 顺序一一对应）。
+  const visibleResizableColumns = ORDER_COLUMNS.flatMap((c): ResizableOrderColumnKey[] => {
+    const cols: ResizableOrderColumnKey[] = columnVisibility[c.key] ? [c.key] : [];
+    // 「内容」不可隐藏，固定紧跟在「客户 / 代理」之后（与表头顺序一致）
+    return c.key === 'customer' ? [...cols, 'content'] : cols;
+  });
+  // 表宽 = 可见列宽之和（table-fixed 下列宽说了算；超出容器由外层 overflow-x-auto 横滑，操作列 sticky 右侧）。
+  const orderTableWidth =
+    ORDER_SELECT_COLUMN_WIDTH +
+    ORDER_INDEX_COLUMN_WIDTH +
+    visibleResizableColumns.reduce((sum, k) => sum + columnWidths[k], 0) +
+    actionColumnWidth;
+  /** 可拖列的表头：相对定位 + 文字截断 + 右缘拖柄。 */
+  const resizableHeader = (key: ResizableOrderColumnKey, label: string, align = 'text-left') => (
+    <th className={`relative truncate ${align}`} title={label}>
+      {label}
+      <ColumnResizeHandle
+        label={label}
+        width={columnWidths[key]}
+        onResize={(px) => setColumnWidth(key, px)}
+        onCommit={persistColumnWidths}
+        onReset={() => resetColumnWidth(key)}
+      />
+    </th>
+  );
   // 乘客明细展开（行内展开、按订单记忆）：一个开关管两件事——内容列把 8 人以上大团剩下的
   // 乘客也平铺出来，同时展开子行补签证进度/单住/PNR/票号/常旅客次数。证件号在内容列直接给全号。
   const [expandedPassengerOrderIds, setExpandedPassengerOrderIds] = useState<Set<string>>(new Set());
@@ -4350,7 +4426,7 @@ export function OrdersPage() {
                 className="rounded-md border border-slate-200 bg-white px-2 py-1 text-xs text-ink-soft hover:border-brand hover:text-brand"
                 aria-haspopup="true"
                 aria-expanded={showColumnPicker}
-                title="选择这台电脑上要显示哪些列（内容与操作列固定显示）"
+                title="选择要显示哪些列、恢复列宽（按登录账号记在这台电脑上；内容与操作列固定显示）"
                 onClick={() => setShowColumnPicker((v) => !v)}
               >
                 <Icon name="settings" size={14} /> 列设置
@@ -4396,6 +4472,16 @@ export function OrdersPage() {
                     >
                       恢复全部显示
                     </button>
+                    {/* 列宽靠表头右缘拖柄调（双击单列恢复）；这里一键全部复位 */}
+                    <button
+                      type="button"
+                      className="w-full rounded px-1 py-1 text-left text-xs text-brand hover:bg-brand-50 disabled:cursor-not-allowed disabled:text-slate-300"
+                      disabled={!columnWidthsCustomized}
+                      title="列宽可在表头右缘拖动调整，双击拖柄恢复单列"
+                      onClick={resetColumnWidths}
+                    >
+                      恢复默认列宽
+                    </button>
                   </div>
                 </>
               )}
@@ -4435,10 +4521,24 @@ export function OrdersPage() {
           </div>
         </div>
         <div className="overflow-x-auto">
-          <table className="table-admin">
+          {/* table-fixed + colgroup：列宽由 columnWidths 说了算（表头右缘可拖），表宽 = 可见列宽之和；
+              比容器宽时外层横滑，「操作」列 sticky 右侧照旧。除 sticky 的操作列外单元格一律
+              overflow-hidden，窄列截断而不是溢进隔壁列。 */}
+          <table
+            className="table-admin table-fixed [&_tbody_td:not(.sticky)]:overflow-hidden"
+            style={{ width: orderTableWidth }}
+          >
+            <colgroup>
+              <col style={{ width: ORDER_SELECT_COLUMN_WIDTH }} />
+              <col style={{ width: ORDER_INDEX_COLUMN_WIDTH }} />
+              {visibleResizableColumns.map((key) => (
+                <col key={key} style={{ width: columnWidths[key] }} />
+              ))}
+              <col style={{ width: actionColumnWidth }} />
+            </colgroup>
             <thead>
               <tr>
-                <th className="w-10 text-center">
+                <th className="text-center">
                   <input
                     type="checkbox"
                     className="accent-brand"
@@ -4449,17 +4549,17 @@ export function OrdersPage() {
                     onChange={toggleAllVisible}
                   />
                 </th>
-                <th className="w-12 text-center">序号</th>
-                {columnVisibility.orderNumber && <th className="text-left">订单号</th>}
-                {columnVisibility.customer && <th className="text-left">客户 / 代理</th>}
-                <th className="text-left">内容</th>
-                {columnVisibility.departDate && <th className="whitespace-nowrap text-left">出发日期</th>}
-                {columnVisibility.amount && <th className="text-right">金额</th>}
-                {columnVisibility.balance && <th className="text-center">尾款</th>}
-                {columnVisibility.status && <th className="text-center">状态</th>}
-                {columnVisibility.visa && <th className="text-center">签证</th>}
-                {columnVisibility.invoice && <th className="whitespace-nowrap text-center">开票</th>}
-                {columnVisibility.createdAt && <th className="whitespace-nowrap text-left">下单时间</th>}
+                <th className="whitespace-nowrap text-center">序号</th>
+                {columnVisibility.orderNumber && resizableHeader('orderNumber', '订单号')}
+                {columnVisibility.customer && resizableHeader('customer', '客户 / 代理')}
+                {resizableHeader('content', '内容')}
+                {columnVisibility.departDate && resizableHeader('departDate', '出发日期')}
+                {columnVisibility.amount && resizableHeader('amount', '金额', 'text-right')}
+                {columnVisibility.balance && resizableHeader('balance', '尾款', 'text-center')}
+                {columnVisibility.status && resizableHeader('status', '状态', 'text-center')}
+                {columnVisibility.visa && resizableHeader('visa', '签证', 'text-center')}
+                {columnVisibility.invoice && resizableHeader('invoice', '开票', 'text-center')}
+                {columnVisibility.createdAt && resizableHeader('createdAt', '下单时间')}
                 {/* 「操作」常驻右侧：列多时不用横滑到底才能点详情。
                     背景必须不透明（表头默认 bg-slate-50/70 半透，横滑时内容会透底）→ 用 ! 覆盖。
                     列本身收窄（见对应 tbody 单元格里的下拉/按钮收紧），避免撑宽整张表把「开票」
@@ -4488,7 +4588,7 @@ export function OrdersPage() {
                   <td className="text-xs">
                     <button
                       type="button"
-                      className="font-mono text-brand hover:text-brand-dark hover:underline"
+                      className="max-w-full truncate font-mono text-brand hover:text-brand-dark hover:underline"
                       onClick={() => setSelected(order)}
                       title="查看详情"
                     >
@@ -4498,18 +4598,17 @@ export function OrdersPage() {
                   )}
                   {columnVisibility.customer && (
                   <td>
-                    {/* 客户名 / 代理名都可能很长（尤其代理机构全称），加 max-width + truncate
-                        防止撑宽整表；悬浮看全文。 */}
+                    {/* 客户名 / 代理名都可能很长（尤其代理机构全称）：按列宽 truncate，悬浮看全文。
+                        列宽由表头拖柄决定（默认 160px，运营原话：代理那一列就可以窄点）——原先挂在这一列
+                        第四行的备注预览已经挪进「内容」列底部，这列只剩客户名/电话/代理名三行。 */}
                     {/* 客户名弱化（运营原话：主角是乘客和航班，不是客户/录单人）：
                         字重 font-medium→常规、颜色 text-ink→text-ink-soft，不再抢眼。 */}
-                    {/* 宽度 11rem→9rem（运营原话：代理那一列就可以窄点）——原先挂在这一列
-                        第四行的备注预览已经挪进「内容」列底部，这列只剩客户名/电话/代理名三行。 */}
-                    <div className="max-w-[9rem] truncate text-ink-soft" title={view.customerName}>
+                    <div className="max-w-full truncate text-ink-soft" title={view.customerName}>
                       {view.customerName}
                     </div>
-                    <div className="text-xs text-ink-muted">{order.contactPhone}</div>
+                    <div className="truncate text-xs text-ink-muted">{order.contactPhone}</div>
                     {view.agentName && (
-                      <div className="badge-info mt-0.5 max-w-[9rem] truncate" title={view.agentName}>
+                      <div className="badge-info mt-0.5 max-w-full truncate" title={view.agentName}>
                         {view.agentName}
                       </div>
                     )}
@@ -4548,7 +4647,7 @@ export function OrdersPage() {
                       // 每人结算价（票务反馈）：与详情「价格调整」区同一口径；算不出来就整列不显示。
                       const perPax = deriveListPerPaxSettlement(order);
                       return (
-                        <div className="max-w-2xl whitespace-normal break-words text-xs leading-snug">
+                        <div className="max-w-full whitespace-normal break-words text-xs leading-snug">
                           {shownIdx.map((i) => {
                             const p = order.passengers[i];
                             const s = passengerPassportSummary(p);
@@ -4608,7 +4707,7 @@ export function OrdersPage() {
                     {/* 航段状态短标（去程no-show / 回程已释放…）：订单级标记，不是航班日期/套餐
                         描述，运营没说不要，单独一行留着。 */}
                     {view.legNotice && (
-                      <div className="mt-0.5 max-w-2xl truncate text-[11px] text-ink-muted" title={view.legNotice}>
+                      <div className="mt-0.5 max-w-full truncate text-[11px] text-ink-muted" title={view.legNotice}>
                         {view.legNotice}
                       </div>
                     )}
@@ -4644,7 +4743,7 @@ export function OrdersPage() {
                       const hotelLine = deriveHotelLine(order);
                       return hotelLine ? (
                         <div
-                          className="mt-0.5 max-w-2xl truncate text-[11px] text-emerald-700"
+                          className="mt-0.5 max-w-full truncate text-[11px] text-emerald-700"
                           title={hotelLine}
                         >
                           <Icon name="hotel" size={12} /> {hotelLine}
@@ -4665,7 +4764,7 @@ export function OrdersPage() {
                       const np = deriveNotesSummary(order);
                       return np ? (
                         <div
-                          className="mt-0.5 max-w-2xl truncate text-[11px] text-amber-700"
+                          className="mt-0.5 max-w-full truncate text-[11px] text-amber-700"
                           title={np.fullText}
                         >
                           <Icon name="clipboard" /> {np.line}
@@ -4796,7 +4895,7 @@ export function OrdersPage() {
                   </td>
                   )}
                   {columnVisibility.createdAt && (
-                  <td className="whitespace-nowrap text-[11px] text-ink-muted">
+                  <td className="truncate text-[11px] text-ink-muted" title={formatOrderListTime(order.createdAt)}>
                     {formatOrderListTime(order.createdAt)}
                   </td>
                   )}
