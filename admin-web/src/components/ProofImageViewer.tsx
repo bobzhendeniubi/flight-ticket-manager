@@ -7,6 +7,7 @@
  * 「下载」按钮走 blob 落盘（data: 的 download 属性被浏览器允许，但 blob 更稳）。
  */
 import { useCallback, useEffect, useState } from 'react';
+import { useDialogA11y } from './Modal';
 
 interface ProofImageViewerProps {
   /** 图片地址（通常是 base64 data: URL，也兼容普通 http URL） */
@@ -33,14 +34,17 @@ export function ProofImageViewer({ src, alt, thumbClassName }: ProofImageViewerP
 
   const close = useCallback(() => setOpen(false), []);
 
-  // Esc 关闭
+  // Esc 关闭：走对话框栈。查看器常开在订单抽屉/批量弹窗里，外层用 useDialogA11y 注册了捕获阶段的全局 Esc
+  // （stopImmediatePropagation），自己挂的 window 监听收不到，Esc 会把外层整个关掉。
+  const dialogRef = useDialogA11y(close, open);
+
+  // 关闭后把焦点还给打开它的缩略图按钮
   useEffect(() => {
     if (!open) return;
-    function onKey(e: KeyboardEvent): void {
-      if (e.key === 'Escape') setOpen(false);
-    }
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    return () => {
+      if (opener && document.contains(opener)) opener.focus();
+    };
   }, [open]);
 
   // blob 方式落盘：dataURL → fetch → blob → objectURL → a.download → revoke
@@ -84,10 +88,12 @@ export function ProofImageViewer({ src, alt, thumbClassName }: ProofImageViewerP
 
       {open && (
         <div
-          className="fixed inset-0 z-[60] flex items-center justify-center p-4"
+          ref={dialogRef}
+          className="fixed inset-0 z-[60] flex items-center justify-center p-4 focus:outline-none"
           role="dialog"
           aria-modal="true"
           aria-label={alt}
+          tabIndex={-1}
         >
           <div className="absolute inset-0 bg-ink/70 animate-fade-in" onClick={close} aria-hidden />
           <div className="relative z-10 flex max-h-full w-full max-w-3xl flex-col">

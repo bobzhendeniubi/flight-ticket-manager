@@ -42,6 +42,7 @@ import { HotelSwapModal } from '../components/HotelSwapModal';
 import { SplitOrderModal } from '../components/SplitOrderModal';
 import { SearchSelect, type SearchSelectOption } from '../components/SearchSelect';
 import { ProofImageViewer } from '../components/ProofImageViewer';
+import { isInteractiveTarget } from '../lib/interactiveTarget';
 import {
   BED_PREF_OPTIONS,
   OrderNoteFlagChips,
@@ -12513,15 +12514,21 @@ function PassportLightbox({
   const [rotation, setRotation] = useState(0);
   const dragRef = useRef<{ startX: number; startY: number; baseX: number; baseY: number } | null>(null);
 
+  // 进对话框栈：外层订单抽屉也是用 useDialogA11y 注册的全局（捕获阶段）Esc，自己另挂 window 监听永远抢不过它，
+  // 按 Esc 会把整个抽屉关掉。入栈后栈顶是本查看器（它渲染在抽屉 DOM 内部），Esc 只关它。
+  const dialogRef = useDialogA11y(onClose);
+
+  // 关闭后把焦点还给打开它的缩略图；缩略图已不在文档里（列表刷新等）就放着，不去抢焦点。
   useEffect(() => {
-    function onKey(e: KeyboardEvent): void {
-      if (e.key === 'Escape') onClose();
-    }
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
+    const opener = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    return () => {
+      if (opener && document.contains(opener)) opener.focus();
+    };
+  }, []);
 
   function startDrag(e: React.PointerEvent<HTMLDivElement>): void {
+    // 按在按钮/下载链接上时交还给控件自己：preventDefault + capture 会把 click 改派给标题栏，按钮就全点不动了
+    if (isInteractiveTarget(e.target)) return;
     e.preventDefault();
     e.currentTarget.setPointerCapture(e.pointerId);
     dragRef.current = { startX: e.clientX, startY: e.clientY, baseX: pos.x, baseY: pos.y };
@@ -12532,6 +12539,8 @@ function PassportLightbox({
     setPos({ x: d.baseX + (e.clientX - d.startX), y: d.baseY + (e.clientY - d.startY) });
   }
   function endDrag(e: React.PointerEvent<HTMLDivElement>): void {
+    // 没进入拖动（按在按钮上）就没有 capture，不用释放
+    if (!dragRef.current) return;
     dragRef.current = null;
     e.currentTarget.releasePointerCapture(e.pointerId);
   }
@@ -12548,7 +12557,11 @@ function PassportLightbox({
 
   return (
     <div
-      className="fixed z-50 flex max-h-[82vh] w-[min(440px,88vw)] flex-col overflow-hidden rounded-lg border border-white/10 bg-slate-900/95 shadow-2xl"
+      ref={dialogRef}
+      role="dialog"
+      aria-label={title || '护照大图'}
+      tabIndex={-1}
+      className="fixed z-50 flex max-h-[82vh] w-[min(440px,88vw)] flex-col overflow-hidden rounded-lg border border-white/10 bg-slate-900/95 shadow-2xl focus:outline-none"
       style={{ left: pos.x, top: pos.y }}
     >
       {/* 拖动条：按住此处可把大图挪到任意位置，与左侧信息并排核对 */}
