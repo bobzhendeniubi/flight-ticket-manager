@@ -17767,8 +17767,12 @@ export class OrderService {
   //   a) 代理单 + 新套餐配了结算价日历键（档次 + 晚数）→ 走结算价日历：
   //      每人价（新档 × 新晚数 × 本单去程出发日）× 人数 + 加项净额 − 命中的代理立减；
   //      取不到当日价 → 拒单（口径同录单：宁可不改，也不按错价成交）。
+  //      日历价替换的只是「套餐块」（套餐行 + 机票行 + 结算价收敛/立减/历次改档差额行），
+  //      新应收 = 日历价 + Σ 单上另行补收/减免的额外行（sumBundleChangePreservedExtrasCny）。
   //   b) 其余 → 本地权威价管道：新套餐地面价 + 加项 + 操作费，再按新套餐 discountPct 打折；
   //      新应收 = 原应收 + （新套餐行价 − 旧套餐行价）。
+  //   两条通道同一语义：改档只动「套餐块」，与档次无关的补收杂费 / 补房差 / 升舱 / 补录地面项
+  //   等一分不动地带进新总额；任意次改档后总额恒等于「按当前档从头录单的应收 + 额外调价」。
   //
   // 硬边界（改档不碰的东西）：
   //   · 机票行 / 班次 / 座位一律不动 —— 改档不改航班，绝不在此触碰任何占座链路；
@@ -17931,6 +17935,9 @@ export class OrderService {
       const lockedTotalCny = Number(locked.total.toString());
       let pricingSource: 'SETTLEMENT_CALENDAR' | 'BUNDLE_PRICE' = 'BUNDLE_PRICE';
       let newTotalCny = round2(lockedTotalCny + (priced.amount - effectiveOldBundleCny));
+      // 日历通道留痕（非日历通道恒 null）：日历价 + 本单保留的额外调价合计，事后核对总额怎么来的。
+      let calendarTotalCny: number | null = null;
+      let preservedExtrasCny: number | null = null;
       if (
         locked.agentId &&
         newBundle.settlementTier != null &&
@@ -17968,10 +17975,17 @@ export class OrderService {
         if (calendarTotal <= 0) {
           throw new BadRequestError('按目标档次取价后的结算价异常（≤0），请检查结算价日历与立减规则');
         }
-        // 日历通道是**绝对**口径：日历价就是「本单最终收多少钱」（与录单的结算价收敛完全同源），
-        // 因此天然与改档次数无关，重复改档不会叠加差额。
+        // 日历价替换的只是「套餐块」：套餐行 + 机票行 + 建单结算价收敛行 + 自动立减行 + 历次改档
+        // 差额行（这几类加起来就是「本单按旧档从头录单的应收」）。单上另行补收/减免的钱——运营事后
+        // 补收的杂费、补房差、升舱差价、补录的地面项、拆单平账……——与档次无关，改档必须一分不动地
+        // 带进新总额；此前这里把日历价当整单最终应收，那些行全被差额行静默抵消（实测：补收 +¥990
+        // 杂费后改档，总额被砸回日历价，只好再手工补一条）。与非日历通道「只动套餐行那一块」同一语义。
+        // 差额行本身属于套餐块（bundleChange 标），所以 Σ 保留行不随改档变化，重复改档不叠加不漂移：
+        // 任意次改档后总额恒等于「按当前档从头录单的应收 + 额外调价」。
         pricingSource = 'SETTLEMENT_CALENDAR';
-        newTotalCny = calendarTotal;
+        calendarTotalCny = calendarTotal;
+        preservedExtrasCny = sumBundleChangePreservedExtrasCny(locked.items);
+        newTotalCny = round2(calendarTotal + preservedExtrasCny);
       }
 
       const diffCny = round2(newTotalCny - lockedTotalCny);
@@ -18107,6 +18121,9 @@ export class OrderService {
               toSettlementNights: newBundle.settlementNights ?? null,
               pricingSource,
               diffCny,
+              // 日历通道：新总额 = 日历价 + 保留的额外调价合计（非日历通道两者恒 null）。
+              calendarTotalCny,
+              preservedExtrasCny,
               reasonText: note,
               at: new Date().toISOString(),
               by: actor.userId,
@@ -25361,6 +25378,46 @@ export function sumBundleChangeDiffCny(
     const meta = it.metadata as { bundleChange?: unknown } | null;
     if (meta?.bundleChange !== true) return sum;
     return sum + Number(it.amount.toString());
+  }, 0);
+  return round2(total);
+}
+
+/**
+ * 日历通道改档要**原样保留**的「额外调价行」合计（CNY，正=补收、负=减免）。
+ *
+ * 结算价日历给的是「基础套餐（机票 + 住宿）每人同业价 × 人数 + 加项 − 立减」，它替换的只是
+ * 「套餐块」：套餐行、机票行、建单那条结算价收敛行（SETTLEMENT）、自动立减行、历次改档差额行，
+ * 以及建单收敛时已一并折进结算价的其它建单行（独立地面产品行、护照临期附加费——建单那一刻
+ * 它们就被 SETTLEMENT 差额行抵消进日历价了，改档不再另收）。
+ * 单上另行补收/减免的钱与档次无关，改档必须一分不动地带到新总额里，否则运营事后补收的杂费、
+ * 补房差、升舱差价、补录的地面项、拆单平账…全被「日历价 = 最终收多少」一句抹掉。
+ *
+ * 保留（extras）：
+ *   · FEE/DISCOUNT 且 metadata.priceAdjustment === true，**除去**套餐块三类
+ *     （settlementPrice / settlementDiscount / bundleChange === true）：人工调价四类
+ *     （补收杂费/优惠/变更改期费/其它）、补收单房差与单住拼住开关（ROOM_DIFF）、换人重算
+ *     （SWAP_REPRICE）、取消航段手续费、拆单平账（SPLIT）……
+ *   · UPGRADE_CHANGE：售后升舱差价行（升舱行随改档不动，响应 warnings 提示人工复核）；
+ *   · 事后补录的地面项（HOTEL / VISA，metadata.source === 'ORDER_GROUND_ITEM'）。
+ * 其余行一律视为套餐块，由日历价整体替换。**新增的售后记账行若要在改档时保留，须在此登记。**
+ * 导出供单测使用。
+ */
+export function sumBundleChangePreservedExtrasCny(
+  items: ReadonlyArray<{ kind: OrderItemKind; amount: Prisma.Decimal | number; metadata: unknown }>,
+): number {
+  const total = items.reduce((sum, it) => {
+    const meta = readJsonObject(it.metadata);
+    const amount = Number(it.amount.toString());
+    if (it.kind === OrderItemKind.UPGRADE_CHANGE) return sum + amount;
+    if (it.kind === OrderItemKind.HOTEL || it.kind === OrderItemKind.VISA) {
+      return meta.source === 'ORDER_GROUND_ITEM' ? sum + amount : sum;
+    }
+    if (it.kind !== OrderItemKind.FEE && it.kind !== OrderItemKind.DISCOUNT) return sum;
+    if (meta.priceAdjustment !== true) return sum;
+    if (meta.settlementPrice === true || meta.settlementDiscount === true || meta.bundleChange === true) {
+      return sum;
+    }
+    return sum + amount;
   }, 0);
   return round2(total);
 }
