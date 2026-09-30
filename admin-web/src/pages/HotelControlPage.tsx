@@ -695,6 +695,12 @@ function OccupantsDrawer({
                   <div className="mt-1 text-ink-soft">
                     {o.contactName} · {o.passengerCount} 人 · {o.rooms} 间
                   </div>
+                  {/* 实住区间按该行 hotelCheckIn/Out 派生（改期「房跟着新行程走」后套餐名仍是「2天1晚」，
+                      房控要看的是真住几晚） */}
+                  <div className="mt-0.5 text-xs text-ink-muted">
+                    入住 {o.checkIn} ~ 离店 {o.checkOut} · 实住{' '}
+                    {Math.max(0, Math.round((Date.parse(o.checkOut) - Date.parse(o.checkIn)) / 86_400_000))} 晚
+                  </div>
                   {/* 同酒店安排（备注结构化）：落位/换店前先看见这单点名要和谁住一起。
                       后端未下发或未填时整行不渲染。 */}
                   {o.sameHotelWith?.trim() && (

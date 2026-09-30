@@ -1,6 +1,6 @@
 import { Fragment, memo, useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { Link, useSearchParams, useNavigate } from 'react-router-dom';
-import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type PoolTrail, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type RestoreCancelledOrderResult, type VoidReturnLegPreview, type OrderLegFlagFilter, type PublicLegStatus, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE, FLOWN_LEGS_CONFIRMATION_REQUIRED_CODE, flownLegsConfirmationDetails, TOKEN_PAYLOAD_MISMATCH_CODE, TOKEN_PAYLOAD_MISMATCH_HINT } from '../lib/api';
+import { api, ApiError, duplicatePassengerConflictOrderNumbers, duplicateAmountDetails, reschedulePassengersSplitFailure, SETTLEMENT_MODE_LABEL, PRICE_ADJUSTMENT_REASON_OPTIONS, PRICE_ADJUSTMENT_REASON_LABEL, type PriceAdjustmentReason, type OrderSummary, type OrderItem, type OrderStatus, type FulfillmentTask, type FulfillmentStatus as ApiFfStatus, type AdminFlight, type AdminSchedule, type CabinClass, type BatchCreateOrdersResult, type InvoiceLeg, type PaymentMethod, type OrderPayment, type PoolTrail, type ListOrdersParams, type OrderExportTemplate, type SettlementMode, type VisaStatusInput, VISA_STATUS_LABEL, type BatchProductType, type Bundle, type DeletedOrderSummary, type AuditLog, type Visa, type Hotel, type QuoteOrderResult, type CreateOrderItemInput, type LegacyPassengerHistory, type PassengerType, type CancelLegPreview, type FlightLegSide, FLIGHT_LEG_ZH, type NoShowPreview, type RestoreReturnLegPreview, type RestoreCancelledOrderResult, type VoidReturnLegPreview, type OrderLegFlagFilter, type PublicLegStatus, splitBlockedReasons, splitDoneNoShowFailedOrderId, ACKNOWLEDGEMENT_REQUIRED_CODE, OVERSELL_CONFIRMATION_REQUIRED_CODE, OVERSELL_LIMIT_EXCEEDED_CODE, FLOWN_LEGS_CONFIRMATION_REQUIRED_CODE, flownLegsConfirmationDetails, TOKEN_PAYLOAD_MISMATCH_CODE, TOKEN_PAYLOAD_MISMATCH_HINT, type RescheduleHotelMode, type RescheduleHotelDateSync } from '../lib/api';
 import { useAuth } from '../stores/auth';
 import { useFlightSeats } from '../stores/flightSeats';
 import {
@@ -5296,11 +5296,32 @@ function roomingSummary(order: OrderSummary): string {
     .join('；');
 }
 
+/**
+ * 整单实住窗口（按占房行日期派生，不看套餐档次名）：入住 = 最早入住、离店 = 最晚离店、晚数 = 两者日差。
+ * HOTEL 行与盖了住宿章的 BUNDLE 行都算——改期「房跟着新行程走」后套餐名仍是「2天1晚」，
+ * 真实住几晚只有日期知道。无占房行返回 null。
+ */
+function deriveStayWindow(order: OrderSummary): { checkIn: string; checkOut: string | null; nights: number } | null {
+  const rows = (order.items ?? []).filter(
+    (it) => (it.kind === 'HOTEL' || it.kind === 'BUNDLE') && it.hotelCheckIn,
+  );
+  if (rows.length === 0) return null;
+  const checkIns = rows.map((it) => (it.hotelCheckIn ?? '').slice(0, 10)).sort();
+  const checkOuts = rows.flatMap((it) => (it.hotelCheckOut ? [it.hotelCheckOut.slice(0, 10)] : [])).sort();
+  const checkIn = checkIns[0];
+  const checkOut = checkOuts.length > 0 ? checkOuts[checkOuts.length - 1] : null;
+  const nights = checkOut ? (countNightsBetween(checkIn, checkOut) ?? 0) : 0;
+  return { checkIn, checkOut, nights };
+}
+
 // 推导住宿晚数（补收单房差表单的「晚数」默认值，可改）。
-// 优先 HOTEL 行 checkIn/checkOut 日差 → 回退任意行描述里的「N晚」→ 兜底 1。
+// 优先占房行 checkIn/checkOut 日差（HOTEL 行优先，其次盖了住宿章的 BUNDLE 行——改期后套餐名里的
+// 「N晚」是档次名，不是实住晚数）→ 回退任意行描述里的「N晚」→ 兜底 1。
 function deriveStayNights(order: OrderSummary): number {
   const items = order.items ?? [];
-  const hotel = items.find((it) => it.kind === 'HOTEL' && it.hotelCheckIn && it.hotelCheckOut);
+  const hotel =
+    items.find((it) => it.kind === 'HOTEL' && it.hotelCheckIn && it.hotelCheckOut) ??
+    items.find((it) => it.kind === 'BUNDLE' && it.hotelCheckIn && it.hotelCheckOut);
   if (hotel?.hotelCheckIn && hotel?.hotelCheckOut) {
     const nights = Math.round(
       (new Date(hotel.hotelCheckOut).getTime() - new Date(hotel.hotelCheckIn).getTime()) / 86_400_000,
@@ -5534,6 +5555,7 @@ function OrderDrawer({
 
   // #4/#5 分房：应分房未分房 → 显示「分房」按钮；已分房 → 摘要 + 「调整分房」。
   const hotelName = hotelNameFromOrder(o);
+  const stayWindow = deriveStayWindow(o);
   const needsRooming = orderNeedsRooming(o);
   const hasRooming = orderHasRooming(o);
   const [roomingOpen, setRoomingOpen] = useState(false);
@@ -5842,6 +5864,14 @@ function OrderDrawer({
                   </div>
                 </div>
                 <div className="mt-1.5 flex items-center gap-1 text-sm font-medium text-ink"><Icon name="hotel" /> {hotelName ?? '（未识别酒店名）'}</div>
+                {/* 实住窗口按占房行日期派生：改期「房跟着新行程走」后套餐名仍是「2天1晚」，这里才是真实住几晚 */}
+                {stayWindow && (
+                  <div className="mt-0.5 text-xs text-ink-soft">
+                    入住 {stayWindow.checkIn}
+                    {stayWindow.checkOut && ` ~ 离店 ${stayWindow.checkOut}`}
+                    {stayWindow.nights > 0 && ` · 实住 ${stayWindow.nights} 晚`}
+                  </div>
+                )}
                 <div className={`mt-0.5 text-xs ${hasRooming ? 'text-ink-soft' : 'text-amber-700'}`}>
                   {needsRooming && !hasRooming ? '应分房 · 尚未分房' : roomingSummary(o)}
                 </div>
@@ -6215,6 +6245,7 @@ function OrderDrawer({
                           agentRescheduleOpen={role === 'AGENT' && agentRescheduleClosedReason(o) == null}
                           agentHotelOpsOpen={role === 'AGENT' && agentHotelOpsOpen(o)}
                           sameHotelWith={o.sameHotelWith}
+                          orderItems={o.items ?? []}
                         />
                       ))}
                     </ul>
@@ -6242,6 +6273,7 @@ function OrderDrawer({
                     agentRescheduleOpen={role === 'AGENT' && agentRescheduleClosedReason(o) == null}
                     agentHotelOpsOpen={role === 'AGENT' && agentHotelOpsOpen(o)}
                     sameHotelWith={o.sameHotelWith}
+                    orderItems={o.items ?? []}
                   />
                 ))}
               </ul>
@@ -8186,6 +8218,7 @@ function OrderItemRow({
   agentRescheduleOpen,
   agentHotelOpsOpen,
   sameHotelWith,
+  orderItems,
 }: {
   orderId: string;
   item: OrderItem;
@@ -8217,6 +8250,8 @@ function OrderItemRow({
   agentHotelOpsOpen?: boolean;
   /** 本单「同酒店安排」（备注结构化）：换酒店弹窗据此提示，别把点名同住的客人换散。 */
   sameHotelWith?: string | null;
+  /** 本单全部订单行（改期弹窗据此找占房行与另一段航段，做「房是否一起变动」的预览）。 */
+  orderItems?: OrderItem[];
 }) {
   const role = useAuth((st) => st.user?.role);
   // 代理自助纠错：仅本单下单当天窗口内（后端 agentSelfEdit.open）——改航班/升舱两个入口，
@@ -8227,6 +8262,8 @@ function OrderItemRow({
   const canAgentHotelOps = role === 'AGENT' && Boolean(agentHotelOpsOpen);
   const [rescheduleMode, setRescheduleMode] = useState<'NONE' | 'RESCHEDULE' | 'CORRECTION'>('NONE');
   const rescheduling = rescheduleMode !== 'NONE';
+  // 改期成功后后端同步了住宿日期（hotelDateSync）→ 留一条可关闭的提示，运营看得见房改成了哪几晚。
+  const [hotelSyncNotice, setHotelSyncNotice] = useState<string | null>(null);
   const [editingPrice, setEditingPrice] = useState(false);
   const [swappingHotel, setSwappingHotel] = useState(false);
   const [reschedulingHotel, setReschedulingHotel] = useState(false);
@@ -8613,18 +8650,35 @@ function OrderItemRow({
           orderId={orderId}
           item={item}
           passengers={passengers ?? []}
+          orderItems={orderItems ?? []}
           isCorrection={rescheduleMode === 'CORRECTION'}
           onChanged={onChanged}
           onCancel={() => setRescheduleMode('NONE')}
-          onSaved={(updated, warnings) => {
+          onSaved={(updated, warnings, hotelNotice) => {
             setRescheduleMode('NONE');
             onOrderUpdated?.(updated);
+            if (hotelNotice) setHotelSyncNotice(hotelNotice);
             if (warnings && warnings.length > 0) alert(warnings.join('\n'));
           }}
           onRefreshOnly={(updated) => {
             onOrderUpdated?.(updated);
           }}
         />
+      )}
+      {hotelSyncNotice && (
+        <div className="mt-2 flex items-start justify-between gap-2 rounded-md border border-emerald-200 bg-emerald-50 px-2 py-1.5 text-xs leading-snug text-emerald-800">
+          <span>
+            <Icon name="hotel" /> {hotelSyncNotice}
+          </span>
+          <button
+            type="button"
+            className="shrink-0 font-medium text-emerald-700 hover:text-emerald-900"
+            onClick={() => setHotelSyncNotice(null)}
+            aria-label="关闭住宿变化提示"
+          >
+            知道了
+          </button>
+        </div>
       )}
       {legEntry && !legCancelled && cancelingLeg && (
         <CancelLegForm
@@ -9204,10 +9258,81 @@ function CabinUpgradePanel({
   );
 }
 
+/** YYYY-MM-DD 加 N 天（UTC date-only，与后端 addDaysToYmd 同口径）。 */
+function addDaysYmd(ymd: string, days: number): string {
+  return new Date(Date.parse(`${ymd}T00:00:00.000Z`) + days * 86_400_000).toISOString().slice(0, 10);
+}
+/** 两个 YYYY-MM-DD 的整天数差（b − a）。 */
+function daysBetweenYmd(a: string, b: string): number {
+  return Math.round((Date.parse(`${b}T00:00:00.000Z`) - Date.parse(`${a}T00:00:00.000Z`)) / 86_400_000);
+}
+
+/** 改期弹窗「房是否一起变动」的住宿预览（仅展示；后端 planFollowTripHotelStay 是权威，规则同源）。 */
+interface RescheduleStayPreview {
+  /** 当前整单占房窗口（最早入住 ~ 最晚离店）。 */
+  current: { checkIn: string; checkOut: string | null; nights: number };
+  /** 房跟着新行程走：入住/离店锚定新去程/回程日（保留原相对偏移）。null = 还没选新班次或单程单（退化为整体平移）。 */
+  followTrip: { checkIn: string; checkOut: string | null; nights: number } | null;
+  /** 整体平移保晚数（最早出发日平移了几天，住宿同移几天）。null = 还没选新班次。 */
+  shift: { checkIn: string; checkOut: string | null; nights: number } | null;
+}
+function previewRescheduleStay(
+  orderItems: OrderItem[],
+  changedItemId: string,
+  newLegDate: string | null,
+): RescheduleStayPreview | null {
+  const hotelRows = orderItems.filter((it) => (it.kind === 'HOTEL' || it.kind === 'BUNDLE') && it.hotelCheckIn);
+  if (hotelRows.length === 0) return null;
+  const checkIns = hotelRows.map((it) => (it.hotelCheckIn ?? '').slice(0, 10)).sort();
+  const checkOuts = hotelRows.flatMap((it) => (it.hotelCheckOut ? [it.hotelCheckOut.slice(0, 10)] : [])).sort();
+  const windowStart = checkIns[0];
+  const windowEnd = checkOuts.length > 0 ? checkOuts[checkOuts.length - 1] : null;
+  const nightsOf = (checkIn: string, checkOut: string | null) =>
+    checkOut ? (countNightsBetween(checkIn, checkOut) ?? 0) : 0;
+  const current = { checkIn: windowStart, checkOut: windowEnd, nights: nightsOf(windowStart, windowEnd) };
+  if (!newLegDate) return { current, followTrip: null, shift: null };
+  // 航段按当地出发日+时刻升序：第 1 段=去程、第 2 段=回程（与后端 determineFlightLegItems 同口径）。
+  type LegRow = { id: string; date: string; time: string };
+  const legs: LegRow[] = orderItems
+    .filter((it) => it.kind === 'FLIGHT' && it.flightScheduleId && it.departureDate)
+    .map((it) => ({ id: it.id, date: it.departureDate ?? '', time: it.departureTime ?? '' }));
+  const sortLegs = (rows: LegRow[]) =>
+    [...rows].sort((a, b) => `${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`) || a.id.localeCompare(b.id));
+  const before = sortLegs(legs);
+  const after = sortLegs(legs.map((l) => (l.id === changedItemId ? { ...l, date: newLegDate } : l)));
+  if (before.length === 0 || after.length === 0) return { current, followTrip: null, shift: null };
+  const delta = daysBetweenYmd(before[0].date, after[0].date);
+  const shift = {
+    checkIn: addDaysYmd(windowStart, delta),
+    checkOut: windowEnd ? addDaysYmd(windowEnd, delta) : null,
+    nights: current.nights,
+  };
+  if (before.length < 2 || after.length < 2) return { current, followTrip: null, shift };
+  const newStart = addDaysYmd(after[0].date, daysBetweenYmd(before[0].date, windowStart));
+  const newEnd = windowEnd ? addDaysYmd(after[1].date, daysBetweenYmd(before[1].date, windowEnd)) : null;
+  return { current, shift, followTrip: { checkIn: newStart, checkOut: newEnd, nights: nightsOf(newStart, newEnd) } };
+}
+
+/** 改期成功提示条文案：后端 hotelDateSync 逐行 → 「住宿已改为 09-21 至 09-23，共 2 晚」。无同步 → null。 */
+function formatHotelDateSyncNotice(syncs: RescheduleHotelDateSync[] | undefined, newOrderNumber?: string | null): string | null {
+  if (!syncs || syncs.length === 0) return null;
+  const md = (ymd: string) => ymd.slice(5);
+  const lines = syncs.map((s) =>
+    s.toCheckOut
+      ? `住宿已改为 ${md(s.toCheckIn)} 至 ${md(s.toCheckOut)}，共 ${s.toNights} 晚${
+          s.toNights !== s.fromNights ? `（原 ${s.fromNights} 晚）` : ''
+        }`
+      : `入住已改为 ${md(s.toCheckIn)}`,
+  );
+  const text = [...new Set(lines)].join('；');
+  return newOrderNumber ? `新单 ${newOrderNumber}：${text}` : text;
+}
+
 function RescheduleForm({
   orderId,
   item,
   passengers,
+  orderItems,
   isCorrection,
   onChanged,
   onCancel,
@@ -9219,6 +9344,8 @@ function RescheduleForm({
   /** 本单出行人（勾选改期对象）；≥2 人才展示勾选列表，默认全选=整单改期（不拆）。
    *  ticketed = 已出票（PNR/票号或开票位）：勾部分人时提示拆出后改期会作废原票 */
   passengers: Array<{ id: string; name: string; ticketed?: boolean }>;
+  /** 本单全部订单行：找占房行与另一段航段，做「房是否一起变动」的预览（缺省 = 没有住宿，不出选项）。 */
+  orderItems?: OrderItem[];
   /**
    * true = 纠错口径（POST /orders/:id/correct-flight）：不收改期费、价格不动、不支持按人拆单，
    * 表单只留「选航班/选新班次」两个字段。false/缺省 = 售后改期（PATCH reschedule-passengers），
@@ -9233,7 +9360,7 @@ function RescheduleForm({
    * （correctFlightSchedule）与普通改期口径（reschedulePassengers）后端都恒返回该字段
    * （无提示为空数组）；这里仍留可选，只是为了兜住老调用方/异常路径没传的情况。
    */
-  onSaved: (order: OrderSummary, warnings?: string[]) => void;
+  onSaved: (order: OrderSummary, warnings?: string[], hotelNotice?: string) => void;
   /** 已拆单但改期未成功：只刷新源单数据，不关闭表单（红字提示要留着让运营看见新单号） */
   onRefreshOnly?: (order: OrderSummary) => void;
 }) {
@@ -9245,6 +9372,9 @@ function RescheduleForm({
   const [flightId, setFlightId] = useState('');
   const [newScheduleId, setNewScheduleId] = useState('');
   const [newCabin, setNewCabin] = useState<CabinClass | ''>(item.flightCabin ?? '');
+  // 「房是否一起变动」：缺省「是，按新行程重排」（运营需求：改期费含房费，房自动跟着行程占）。
+  // 只有运营岗看得到/传得了；代理的售后改期入口后端不透传，走既有整体平移。
+  const [hotelMode, setHotelMode] = useState<RescheduleHotelMode>('FOLLOW_TRIP');
   const [feeCny, setFeeCny] = useState<number | null>(null);
   const [note, setNote] = useState('');
   const [submitting, setSubmitting] = useState(false);
@@ -9273,6 +9403,18 @@ function RescheduleForm({
 
   const selectedSchedule = schedules.find((s) => s.id === newScheduleId);
   const cabinOptions = selectedSchedule?.seatClasses ?? [];
+  // 住宿预览（仅运营的售后改期；纠错口径固定整体平移，代理入口后端不透传 hotelMode）：
+  // 新班次的当地出发日按 departureTz 折，与后端锚点同口径。
+  const stayPreview =
+    !isCorrection && isOps
+      ? previewRescheduleStay(
+          orderItems ?? [],
+          item.id,
+          selectedSchedule ? localYmd(selectedSchedule.departureTime, selectedSchedule.departureTz) : null,
+        )
+      : null;
+  // 实际提交的住宿处理方式：单程单选了「按新行程重排」后端会退化为整体平移，这里照传，由后端记账。
+  const effectiveHotelMode: RescheduleHotelMode | undefined = stayPreview ? hotelMode : undefined;
   // 选中的目标班次已起飞：只有运营勾了「显示已起飞班次（补录）」才可能选到，提交要带放行开关。
   const selectedIsDeparted = selectedSchedule ? isScheduleDeparted(selectedSchedule) : false;
   const allowDepartedTarget = isOps && showDepartedSchedules && selectedIsDeparted;
@@ -9334,7 +9476,19 @@ function RescheduleForm({
         '\n套餐单也能这么拆：金额按占座比例劈，住宿按人头搬，同房组会自动劈成两个半组（房控后续配回一间）。' +
         (hasTicketedPassenger ? `\n${TICKETED_RESCHEDULE_HINT}` : '')
       : isOps
-        ? '确认改期？座位会移动到新班次（新班次售罄会被拒绝）；出发日期变动时本单酒店入住/离店日期会同步平移（新日期房量不足会整体拒绝），如填了改期差价将计入订单应收（可正可负）。'
+        ? '确认改期？座位会移动到新班次（新班次售罄会被拒绝）；' +
+          (stayPreview
+            ? effectiveHotelMode === 'FOLLOW_TRIP'
+              ? `本单住宿按新行程重排${
+                  stayPreview.followTrip
+                    ? `（入住 ${stayPreview.followTrip.checkIn}${stayPreview.followTrip.checkOut ? ` 离店 ${stayPreview.followTrip.checkOut}，共 ${stayPreview.followTrip.nights} 晚` : ''}）`
+                    : '（单程单：按整体平移处理）'
+                }，不改档、不重算结算价，新日期房量不足会整体拒绝；`
+              : effectiveHotelMode === 'KEEP'
+                ? '本单住宿日期保持不动；'
+                : '出发日期变动时本单酒店入住/离店日期会同步平移（新日期房量不足会整体拒绝）；'
+            : '出发日期变动时本单酒店入住/离店日期会同步平移（新日期房量不足会整体拒绝）；') +
+          '如填了改期差价将计入订单应收（可正可负）。'
         : '确认改期？座位会移动到新班次（新班次售罄会被拒绝）；出发日期变动时本单酒店入住/离店日期会同步平移（新日期房量不足会整体拒绝）。差价按新旧班次的系统价自动计算并计入订单应收（改到便宜班次会退差）。';
     if (!confirm(confirmMsg + (allowDepartedTarget ? DEPARTED_TARGET_CONFIRM : ''))) return;
     setSubmitting(true);
@@ -9351,6 +9505,8 @@ function RescheduleForm({
         requestToken: requestTokenRef.current,
         // 目标班次已起飞的补录放行（只有勾了「显示已起飞班次」且选中的是已起飞班次才带）。
         ...(allowDepartedTarget ? { allowDepartedTarget: true } : {}),
+        // 「房是否一起变动」：只有运营岗、且本单有占房行时才带（代理入口后端不透传）。
+        ...(effectiveHotelMode ? { hotelMode: effectiveHotelMode } : {}),
       });
       if (res.splitPerformed && res.newOrder) {
         alert(`已拆出新单 ${res.newOrder.orderNumber} 并改期`);
@@ -9359,7 +9515,15 @@ function RescheduleForm({
       // 跨单分房自动解绑等提示（B5）：普通按人/全员改期此前只取 res.order，
       // warnings 留在响应体里没人读，运营看不到解绑提示。字段没到（老后端）时
       // res.warnings 是 undefined，onSaved 内部按空数组处理，不影响展示。
-      onSaved(res.order, res.warnings);
+      // 住宿同步明细（hotelDateSync）→ 提示条文案，让运营看见房改成了哪几晚。
+      onSaved(
+        res.order,
+        res.warnings,
+        formatHotelDateSyncNotice(
+          res.audit?.reschedule?.hotelDateSync,
+          res.splitPerformed ? res.newOrder?.orderNumber : null,
+        ) ?? undefined,
+      );
     } catch (e) {
       const splitInfo = reschedulePassengersSplitFailure(e);
       if (splitInfo) {
@@ -9557,6 +9721,84 @@ function RescheduleForm({
           差价由系统按新旧班次价格自动计算并计入订单应收（改到便宜班次会退差）；已出票的单请提交改单申请。
         </p>
       )}
+      {/* 房是否一起变动（运营需求：改期费含房费，房自动跟着新行程占；不改档、不重算结算价）。
+          只有运营岗、且本单有占房行时出现；代理入口后端不透传，看不到这组选项。 */}
+      {!isCorrection && isOps && stayPreview && (
+        <fieldset className="rounded border border-slate-200 bg-slate-50/60 p-2">
+          <legend className="px-1 text-slate-500">房是否一起变动</legend>
+          <p className="mb-1 text-[11px] leading-snug text-slate-500">
+            当前住宿 {stayPreview.current.checkIn}
+            {stayPreview.current.checkOut && ` ~ ${stayPreview.current.checkOut}`}
+            {stayPreview.current.nights > 0 && `，共 ${stayPreview.current.nights} 晚`}
+            。三种都不改档、不重算结算价；价格只加下面手填的改期差价。
+          </p>
+          <label className="flex cursor-pointer items-start gap-2 py-0.5">
+            <input
+              type="radio"
+              name={`reschedule-hotel-mode-${item.id}`}
+              className="mt-0.5 accent-brand"
+              checked={hotelMode === 'FOLLOW_TRIP'}
+              onChange={() => setHotelMode('FOLLOW_TRIP')}
+              disabled={submitting}
+            />
+            <span>
+              是，按新行程重排
+              <span className="ml-1 text-slate-500">
+                {stayPreview.followTrip
+                  ? `（入住 ${stayPreview.followTrip.checkIn}${
+                      stayPreview.followTrip.checkOut
+                        ? ` 离店 ${stayPreview.followTrip.checkOut}，共 ${stayPreview.followTrip.nights} 晚`
+                        : ''
+                    }）`
+                  : newScheduleId
+                    ? '（单程单：按整体平移处理）'
+                    : '（选好新班次后显示新入住/离店）'}
+              </span>
+            </span>
+          </label>
+          <label className="flex cursor-pointer items-start gap-2 py-0.5">
+            <input
+              type="radio"
+              name={`reschedule-hotel-mode-${item.id}`}
+              className="mt-0.5 accent-brand"
+              checked={hotelMode === 'SHIFT'}
+              onChange={() => setHotelMode('SHIFT')}
+              disabled={submitting}
+            />
+            <span>
+              整体平移（保持 {stayPreview.current.nights} 晚）
+              <span className="ml-1 text-slate-500">
+                {stayPreview.shift
+                  ? `（入住 ${stayPreview.shift.checkIn}${stayPreview.shift.checkOut ? ` 离店 ${stayPreview.shift.checkOut}` : ''}）`
+                  : ''}
+              </span>
+            </span>
+          </label>
+          <label className="flex cursor-pointer items-start gap-2 py-0.5">
+            <input
+              type="radio"
+              name={`reschedule-hotel-mode-${item.id}`}
+              className="mt-0.5 accent-brand"
+              checked={hotelMode === 'KEEP'}
+              onChange={() => setHotelMode('KEEP')}
+              disabled={submitting}
+            />
+            <span>
+              房不动
+              <span className="ml-1 text-slate-500">（住宿日期保持不变）</span>
+            </span>
+          </label>
+          {hotelMode === 'FOLLOW_TRIP' &&
+            stayPreview.followTrip &&
+            stayPreview.followTrip.checkOut &&
+            stayPreview.followTrip.nights <= 0 && (
+              <p className="mt-1 rounded bg-amber-50 px-2 py-1 text-[11px] leading-snug text-amber-800">
+                按新行程重排后离店不晚于入住，后端会拒绝；请改选「整体平移」或「房不动」。
+              </p>
+            )}
+        </fieldset>
+      )}
+
       {!isCorrection && isOps && (
         <label className="block">
           <span className="text-slate-500">改期差价（可负，¥）</span>
@@ -9568,6 +9810,9 @@ function RescheduleForm({
             placeholder="不调整价格则留空；新班次更便宜可填负数退差价"
             className="mt-0.5 w-full rounded border border-slate-300 px-2 py-1"
           />
+          <span className="mt-0.5 block text-[11px] leading-snug text-slate-500">
+            改期费含房费（住宿多住/少住的晚数不会自动计价）；填 0 或留空不加价。
+          </span>
         </label>
       )}
 
