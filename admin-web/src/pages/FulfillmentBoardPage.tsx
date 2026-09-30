@@ -16,6 +16,7 @@ import {
   type FulfillmentType,
 } from '../lib/api';
 import { useAuth } from '../stores/auth';
+import { contentMaxWidthClass, useLayoutChrome } from '../components/layoutChrome';
 
 // F-19：原来固定拉 200 条、四种状态混排 orderBy createdAt desc——CONFIRMED/FAILED 是终态、
 // 只增不减，日积月累会把真正卡着没处理的 PENDING/IN_PROGRESS 老任务挤出这 200 条窗口，
@@ -113,6 +114,8 @@ export function FulfillmentBoardPage() {
   const tokens = useAuth((s) => s.tokens);
   const user = useAuth((s) => s.user);
   const token = tokens?.accessToken ?? '';
+  // 底部批量条是 fixed 定位、脱离了内容区：左侧让位与宽度上限跟随外壳（侧栏 52/232 + 16 内边距）。
+  const { sidebarCollapsed, contentUnbounded } = useLayoutChrome();
 
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('');
   const [mineOnly, setMineOnly] = useState(false);
@@ -477,8 +480,12 @@ export function FulfillmentBoardPage() {
       )}
 
       {selectedIds.size > 0 && (
-        <div className="fixed inset-x-0 bottom-0 z-30 border-t border-slate-200 bg-surface/95 px-4 py-3 backdrop-blur lg:pl-[248px]">
-          <div className="mx-auto flex max-w-[1400px] flex-wrap items-center gap-3">
+        <div
+          className={`fixed inset-x-0 bottom-0 z-30 border-t border-slate-200 bg-surface/95 px-4 py-3 backdrop-blur ${
+            sidebarCollapsed ? 'lg:pl-[68px]' : 'lg:pl-[248px]'
+          }`}
+        >
+          <div className={`mx-auto flex ${contentMaxWidthClass(contentUnbounded)} flex-wrap items-center gap-3`}>
             <span className="text-sm font-medium text-ink">
               已选 <span className="nums">{selectedIds.size}</span> 项
             </span>

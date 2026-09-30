@@ -1,10 +1,11 @@
-import { useEffect, useRef, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import { Link, Navigate, NavLink, Outlet, useLocation, useNavigate } from 'react-router-dom';
 import { useAuth } from '../stores/auth';
 import { api, ApiError, AUTH_REFRESH_UNAVAILABLE_CODE } from '../lib/api';
 import { BuildVersionBanner } from './BuildVersionBanner';
 import { ErrorBoundary } from './ErrorBoundary';
 import { Icon } from './Icon';
+import { contentMaxWidthClass, isContentUnbounded, LayoutChromeContext } from './layoutChrome';
 import { useDialogA11y } from './Modal';
 import { WorkOrderBell } from './WorkOrderBell';
 
@@ -156,6 +157,14 @@ export function Layout() {
   // 切路由时收起抽屉（移动端）
   useEffect(() => { setDrawerOpen(false); }, [location.pathname]);
 
+  // 内容区宽度：侧栏收起 / 宽表页（订单管理）去掉 1400 上限，其余保持可读宽度（口径见 layoutChrome）。
+  const contentUnbounded = isContentUnbounded({ sidebarCollapsed: collapsed, pathname: location.pathname });
+  const contentWidthClass = contentMaxWidthClass(contentUnbounded);
+  const layoutChrome = useMemo(
+    () => ({ sidebarCollapsed: collapsed, contentUnbounded }),
+    [collapsed, contentUnbounded],
+  );
+
   if (user?.mustChangePassword && location.pathname !== '/change-password') {
     return <Navigate to="/change-password" replace />;
   }
@@ -247,7 +256,7 @@ export function Layout() {
       {/* ── 桌面端：固定左侧栏（≥1024px），可收成细条腾出屏宽 ── */}
       <aside
         id="app-sidebar"
-        className={`fixed inset-y-0 left-0 z-30 hidden flex-col border-r border-slate-200 bg-surface transition-[width] duration-200 lg:flex ${
+        className={`fixed inset-y-0 left-0 z-30 hidden flex-col border-r border-slate-200 bg-surface lg:flex ${
           collapsed ? 'w-[52px]' : 'w-[232px]'
         }`}
       >
@@ -336,9 +345,11 @@ export function Layout() {
         </div>
       )}
 
-      {/* ── 内容区（桌面端给侧栏让出宽度，随收起状态联动） ──── */}
+      {/* ── 内容区（桌面端给侧栏让出宽度，随收起状态联动） ────
+          不做宽度/内边距过渡：逐帧改 padding 会让订单表这类大表每帧整体重排，收起时反而卡顿；
+          侧栏与内容区同帧切换，不会出现一边在动一边已到位的错位。 */}
       <div
-        className={`flex min-h-screen flex-col transition-[padding] duration-200 ${
+        className={`flex min-h-screen flex-col ${
           collapsed ? 'lg:pl-[52px]' : 'lg:pl-[232px]'
         }`}
       >
@@ -393,15 +404,17 @@ export function Layout() {
         <BuildVersionBanner />
 
         <main className="flex-1">
-          <div className="mx-auto w-full max-w-[1400px] px-4 py-6 md:px-6 lg:px-8">
-            <ErrorBoundary resetKey={`${location.pathname}#${refreshTick}`}>
-              <Outlet key={`${location.pathname}#${refreshTick}`} />
-            </ErrorBoundary>
+          <div className={`mx-auto w-full ${contentWidthClass} px-4 py-6 md:px-6 lg:px-8`}>
+            <LayoutChromeContext.Provider value={layoutChrome}>
+              <ErrorBoundary resetKey={`${location.pathname}#${refreshTick}`}>
+                <Outlet key={`${location.pathname}#${refreshTick}`} />
+              </ErrorBoundary>
+            </LayoutChromeContext.Provider>
           </div>
         </main>
 
         <footer className="border-t border-slate-200 bg-surface text-xs text-ink-muted">
-          <div className="mx-auto flex max-w-[1400px] flex-col gap-1 px-4 py-3 sm:flex-row sm:items-center sm:justify-between md:px-6 lg:px-8">
+          <div className={`mx-auto flex ${contentWidthClass} flex-col gap-1 px-4 py-3 sm:flex-row sm:items-center sm:justify-between md:px-6 lg:px-8`}>
             <span>世途旅行后台 · © {new Date().getFullYear()}</span>
             <span>前台入口：<a className="text-brand hover:text-brand-dark" href="https://store.citurtravel.com" target="_blank" rel="noreferrer">store.citurtravel.com</a></span>
           </div>
