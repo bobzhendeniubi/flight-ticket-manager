@@ -392,7 +392,7 @@ describe('OrderService.rescheduleOrderItem · 真 DB E2E', () => {
     expect(Number(reloaded.roomsBilled)).toBe(1);
 
     // 审计留痕（缺省 SHIFT：晚数不变）
-    expect(result.audit.hotelDateSync).toEqual([
+    expect(result.audit.hotelDateSync).toMatchObject([
       {
         orderItemId: hotelItem.id,
         mode: 'SHIFT',
@@ -404,6 +404,10 @@ describe('OrderService.rescheduleOrderItem · 真 DB E2E', () => {
         toNights: 1,
       },
     ]);
+    // SHIFT 不重打成本：审计里的成本前后值相同
+    const [sync] = result.audit.hotelDateSync ?? [];
+    expect(sync?.toUnitCostCny).toEqual(sync?.fromUnitCostCny);
+    expect(sync?.toTotalCostCny).toEqual(sync?.fromTotalCostCny);
   });
 
   it('astra finding A1/A2 反例：机票改期连带平移酒店日期触发解绑，只有 1 间时必须拒（不能用 Math.max(1,…) 兜底放行超卖）', async () => {
