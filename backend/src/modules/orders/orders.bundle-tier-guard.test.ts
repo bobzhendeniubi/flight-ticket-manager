@@ -1176,6 +1176,40 @@ describe('changeOrderBundle · 套餐改档', () => {
       expect(localRes.audit.warnings).not.toContain(BUNDLE_CHANGE_SPLIT_BALANCE_WARNING);
     });
 
+    it('换人重算行归套餐块：2 人 1000/人建单、日历涨到 1100 后换人 +100，再改档（今天 1100/人）= 2200 不是 2300', async () => {
+      mountOrder({
+        agentId: 'ag-1',
+        total: new Prisma.Decimal(2100),
+        items: [
+          bundleItem({ bundleId: 'b-2n', amount: new Prisma.Decimal(2000) }),
+          plainAdjustmentItem(100, {
+            id: 'item-swap-reprice',
+            metadata: {
+              priceAdjustment: true,
+              reasonCode: 'SWAP_REPRICE',
+              swapReprice: true,
+              basisCny: 1000,
+              newSettlementCny: 1100,
+            },
+          }),
+        ],
+      });
+      mountCalendarBundles();
+      // 换人当天日历已涨到 1100/人，改档按今天的日历整单重取：2 人 × 1100 = 2200。
+      mockGetSettlementRate.mockResolvedValue({ pricePerPersonCny: 1100 });
+      const tx = mountTx(2200);
+
+      await service.changeOrderBundle('ord-1', { bundleId: 'b-3n' }, ADMIN).catch(() => undefined);
+
+      // 修前：2200 + 保留的 +100 = 2300 → 差额 +200（同一段涨价收两遍）；修后差额 = 2200 − 2100 = +100。
+      expect(diffRowOf(tx).data.amount).toEqual(new Prisma.Decimal(100));
+      const rowUpdate = tx.orderItem.update.mock.calls[0][0] as { data: Record<string, unknown> };
+      expect((rowUpdate.data.metadata as Record<string, unknown>).bundleChange).toMatchObject({
+        calendarTotalCny: 2200,
+        preservedExtrasCny: 0,
+      });
+    });
+
     it('非日历通道语义不变：并发调价 / 补收行由「原应收 + 套餐行差」天然带走', async () => {
       mountOrder({
         total: new Prisma.Decimal(4990),
@@ -1204,7 +1238,7 @@ describe('changeOrderBundle · 套餐改档', () => {
       metadata: Record<string, unknown> | null,
     ) => ({ kind, amount: new Prisma.Decimal(amountCny), metadata });
 
-    it('套餐块（机票/套餐/结算收敛/立减/改档差额/拆单平账/建单地面行/护照临期费）一律不计', () => {
+    it('套餐块（机票/套餐/结算收敛/立减/改档差额/拆单平账/换人重算/换人费/建单地面行/护照临期费）一律不计', () => {
       expect(
         sumBundleChangePreservedExtrasCny([
           row(OrderItemKind.FLIGHT, 800, null),
@@ -1216,6 +1250,9 @@ describe('changeOrderBundle · 套餐改档', () => {
           // 拆单平账行混着结算价份额，归套餐块（两侧各一条，正负都有）。
           row(OrderItemKind.FEE, 622, { priceAdjustment: true, reasonCode: 'SPLIT', splitFrom: 'A', splitTo: 'B' }),
           row(OrderItemKind.DISCOUNT, -622, { priceAdjustment: true, reasonCode: 'SPLIT', splitFrom: 'A', splitTo: 'B' }),
+          // 换人重算 = 同格日历价今昔差，改档按今天日历重取时已含；换人费是已换人终态（改档不可达）。
+          row(OrderItemKind.FEE, 100, { priceAdjustment: true, reasonCode: 'SWAP_REPRICE', swapReprice: true }),
+          row(OrderItemKind.DISCOUNT, -1500, { priceAdjustment: true, reasonCode: 'SWAP_FEE' }),
           // 建单时一起录的独立地面行（无事后补录标）与护照临期附加费（无 priceAdjustment 标）：
           // 建单收敛已把它们折进结算价，改档不再另收。
           row(OrderItemKind.VISA, 350, null),
@@ -1225,21 +1262,20 @@ describe('changeOrderBundle · 套餐改档', () => {
       ).toBe(0);
     });
 
-    it('额外行（人工调价/补房差/换人重算/取消航段费/升舱/补录地面项）逐条相加', () => {
+    it('额外行（人工调价/补房差/取消航段费/升舱/补录地面项）逐条相加', () => {
       expect(
         sumBundleChangePreservedExtrasCny([
           row(OrderItemKind.FEE, 990, { priceAdjustment: true, reasonCode: 'MISC_FEE' }),
           row(OrderItemKind.DISCOUNT, -50, { priceAdjustment: true, reasonCode: 'DISCOUNT' }),
           row(OrderItemKind.FEE, 100, { priceAdjustment: true, reasonCode: 'ROOM_DIFF' }),
           row(OrderItemKind.DISCOUNT, -100, { priceAdjustment: true, reasonCode: 'ROOM_DIFF' }),
-          row(OrderItemKind.FEE, 60, { priceAdjustment: true, reasonCode: 'SWAP_REPRICE', swapReprice: true }),
           row(OrderItemKind.FEE, 300, { priceAdjustment: true, reasonCode: 'RETURN_LEG_CANCEL_FEE', returnLegCancelFee: true }),
           row(OrderItemKind.FEE, 0.5, { priceAdjustment: true, reasonCode: 'OTHER', reasonText: '半元尾差' }),
           row(OrderItemKind.UPGRADE_CHANGE, 400, { source: 'CABIN_UPGRADE' }),
           row(OrderItemKind.HOTEL, 500, { source: 'ORDER_GROUND_ITEM' }),
           row(OrderItemKind.VISA, 350, { source: 'ORDER_GROUND_ITEM' }),
         ]),
-      ).toBe(2550.5);
+      ).toBe(2490.5);
     });
 
     it('hasSplitBalanceRows：只认 priceAdjustment + reasonCode SPLIT 的 FEE/DISCOUNT 行', () => {

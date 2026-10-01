@@ -26082,12 +26082,19 @@ export function sumBundleChangeDiffCny(
  *
  * 保留（extras）：
  *   · FEE/DISCOUNT 且 metadata.priceAdjustment === true，**除去**套餐块
- *     （settlementPrice / settlementDiscount / bundleChange === true / 拆单平账 SPLIT）：人工调价四类
- *     （补收杂费/优惠/变更改期费/其它）、补收单房差与单住拼住开关（ROOM_DIFF）、换人重算
- *     （SWAP_REPRICE）、取消航段手续费……
+ *     （settlementPrice / settlementDiscount / bundleChange === true / 拆单平账 SPLIT /
+ *       换人重算 SWAP_REPRICE / 换人费 SWAP_FEE）：人工调价四类（补收杂费/优惠/变更改期费/其它）、
+ *     补收单房差与单住拼住开关（ROOM_DIFF）、取消航段手续费……
  *   · UPGRADE_CHANGE：售后升舱差价行（升舱行随改档不动，响应 warnings 提示人工复核）；
  *   · 事后补录的地面项（HOTEL / VISA，metadata.source === 'ORDER_GROUND_ITEM'）。
  * 其余行一律视为套餐块，由日历价整体替换。**新增的售后记账行若要在改档时保留，须在此登记。**
+ *
+ * 换人重算行（SWAP_REPRICE）为什么归套餐块：它的语义是「同一格日历价的今昔差」——新出行人按换人当天
+ * 的日历重取每人价，与成交那天的份额之差。改档按**今天**的日历价整单重取，这段今昔差已经包含在新日历价里；
+ * 再保留一遍就是重复收（2 人 1000/人建单，日历涨到 1100 后换人 +100，再改档今天 1100/人应 = 2200 而非 2300）。
+ * 换人费行（SWAP_FEE）同理归套餐块：它把整单应收收敛成换人费，与档次无关；但「已换人」是终态、
+ * 不可改档（assertOrderChangeBundleAllowed 只放占座态），这条分支在改档里实际不可达，显式写出只为
+ * 口径完整、不留「新增原因码默认被保留」的口子。
  *
  * 拆单平账行（reasonCode SPLIT）为什么归套餐块：拆单时整单 SETTLEMENT 收敛行整条留源单，两侧各补一条
  * SPLIT 行把 total 收敛到按人份额——这条行里混着「结算价份额」（套餐块，必须被日历价替换）与「拆单前
@@ -26113,6 +26120,10 @@ export function sumBundleChangePreservedExtrasCny(
       return sum;
     }
     if (meta.reasonCode === 'SPLIT') return sum;
+    // 换人重算 = 同格日历价今昔差，今天的日历价已含；换人费（已换人终态，改档不可达）同归套餐块。
+    if (meta.reasonCode === 'SWAP_REPRICE' || meta.swapReprice === true || meta.reasonCode === 'SWAP_FEE') {
+      return sum;
+    }
     return sum + amount;
   }, 0);
   return round2(total);
