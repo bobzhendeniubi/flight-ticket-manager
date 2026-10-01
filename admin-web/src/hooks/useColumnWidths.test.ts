@@ -2,10 +2,65 @@ import { describe, expect, it } from 'vitest';
 import {
   clampColumnWidth,
   DEFAULT_MIN_COLUMN_WIDTH,
+  FLEX_COLUMN_WIDTH,
   MAX_COLUMN_WIDTH,
   parseStoredColumnWidths,
+  resolveFlexColumnWidth,
+  resolveTableWidth,
   serializeColumnWidths,
 } from './useColumnWidths';
+
+describe('resolveFlexColumnWidth', () => {
+  const base = { otherColumnsWidth: 1000, min: 280, max: 900, fallback: 360 };
+
+  it('吃掉容器剩余宽度', () => {
+    expect(resolveFlexColumnWidth({ ...base, containerWidth: 1600 })).toBe(600);
+  });
+
+  it('剩余太少时不低于下限（交给外层横滑）', () => {
+    expect(resolveFlexColumnWidth({ ...base, containerWidth: 1160 })).toBe(280);
+    expect(resolveFlexColumnWidth({ ...base, containerWidth: 800 })).toBe(280);
+  });
+
+  it('剩余太多时不超过上限', () => {
+    expect(resolveFlexColumnWidth({ ...base, containerWidth: 2560 })).toBe(900);
+  });
+
+  it('容器还没量到时用 fallback', () => {
+    expect(resolveFlexColumnWidth({ ...base, containerWidth: 0 })).toBe(360);
+    expect(resolveFlexColumnWidth({ ...base, containerWidth: Number.NaN })).toBe(360);
+  });
+
+  it('小数取整', () => {
+    expect(resolveFlexColumnWidth({ ...base, containerWidth: 1500.6 })).toBe(501);
+  });
+});
+
+describe('resolveTableWidth', () => {
+  it('列宽之和小于容器时铺满容器', () => {
+    expect(resolveTableWidth(1600, 1400)).toBe(1600);
+  });
+
+  it('列宽之和大于容器时按列宽撑开', () => {
+    expect(resolveTableWidth(1160, 1500)).toBe(1500);
+  });
+
+  it('容器未量到时按列宽', () => {
+    expect(resolveTableWidth(0, 1500)).toBe(1500);
+  });
+});
+
+describe('弹性列占位值', () => {
+  it('存储里拖过的值永远夹到 ≥ 最小宽，不会被误认成弹性', () => {
+    const defaults = { content: FLEX_COLUMN_WIDTH, customer: 112 };
+    expect(parseStoredColumnWidths('{"content":0}', defaults).content).toBe(DEFAULT_MIN_COLUMN_WIDTH);
+    expect(parseStoredColumnWidths(null, defaults).content).toBe(FLEX_COLUMN_WIDTH);
+  });
+
+  it('弹性列没拖过时不写进存储', () => {
+    expect(serializeColumnWidths({ content: FLEX_COLUMN_WIDTH, customer: 112 }, { content: FLEX_COLUMN_WIDTH, customer: 112 })).toBeNull();
+  });
+});
 
 const DEFAULTS = { orderNumber: 150, customer: 160, content: 560 } as const;
 
