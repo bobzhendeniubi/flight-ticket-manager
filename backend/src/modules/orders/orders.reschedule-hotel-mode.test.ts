@@ -274,6 +274,11 @@ describe('rescheduleOrderItem · hotelMode=FOLLOW_TRIP（房跟着新行程走�
         toCheckOut: '2027-09-23',
         fromNights: 1,
         toNights: 2,
+        // 成本前后值：夹具行没带 totalCostCny（null）→ 重打后 200；单价 100 → 100。
+        fromUnitCostCny: 100,
+        toUnitCostCny: 100,
+        fromTotalCostCny: null,
+        toTotalCostCny: 200,
       },
     ]);
   });

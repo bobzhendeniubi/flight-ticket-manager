@@ -233,6 +233,10 @@ describe('rescheduleOrderItem · hotelMode=FOLLOW_TRIP（真 DB）', () => {
         toCheckOut: checkOut,
         fromNights: 1,
         toNights: 2,
+        fromUnitCostCny: 300,
+        toUnitCostCny: 300,
+        fromTotalCostCny: 300,
+        toTotalCostCny: 600,
       },
     ]);
   });

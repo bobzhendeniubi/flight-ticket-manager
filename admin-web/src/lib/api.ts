@@ -4078,6 +4078,11 @@ export interface RescheduleHotelDateSync {
   toCheckOut: string | null;
   fromNights: number;
   toNights: number;
+  /** 行成本前后值（审计用；老后端缺省）。没重打快照的行 to = from，没录成本为 null。 */
+  fromUnitCostCny?: number | null;
+  toUnitCostCny?: number | null;
+  fromTotalCostCny?: number | null;
+  toTotalCostCny?: number | null;
 }
 
 export interface ReschedulePassengersResult {

@@ -10990,21 +10990,8 @@ export class OrderService {
       flownSourceAllowed: FlownSourceAllowance | null;
       /** 本次实际采用的住宿处理方式（缺省 SHIFT）。 */
       hotelMode: RescheduleHotelMode;
-      /**
-       * 随改期自动同步的占房行（本次未动住宿/无酒店行 = 空数组），日期为 YYYY-MM-DD。
-       * mode = 该行实际走的口径（FOLLOW_TRIP 在单程单上退化为 SHIFT，此处如实记 SHIFT）；
-       * fromNights/toNights 按日期派生（无离店日期 = 0）。
-       */
-      hotelDateSync: Array<{
-        orderItemId: string;
-        mode: 'FOLLOW_TRIP' | 'SHIFT';
-        fromCheckIn: string;
-        toCheckIn: string;
-        fromCheckOut: string | null;
-        toCheckOut: string | null;
-        fromNights: number;
-        toNights: number;
-      }>;
+      /** 随改期自动同步的占房行（本次未动住宿/无酒店行 = 空数组），字段见 RescheduleHotelDateSyncEntry。 */
+      hotelDateSync: RescheduleHotelDateSyncEntry[];
       /**
        * §八「解绑」提示：随出发日平移酒店日期时，被平移的行若有共享成员会先解绑
        * （§五中「机票改期连带平移酒店日期」一行），按 actor 角色生成文案；无共享成员平移
@@ -11433,16 +11420,7 @@ export class OrderService {
       // 只在真的换了班次时做（同班次改舱/无变化不动票）；纠错批量入口（correction）同样适用——
       // 那正是「录错班次」的场景，原票号更不该留。
       // 幂等：updateMany + 定值写，重复改期不会出问题。
-      const hotelDateSync: Array<{
-        orderItemId: string;
-        mode: 'FOLLOW_TRIP' | 'SHIFT';
-        fromCheckIn: string;
-        toCheckIn: string;
-        fromCheckOut: string | null;
-        toCheckOut: string | null;
-        fromNights: number;
-        toNights: number;
-      }> = [];
+      const hotelDateSync: RescheduleHotelDateSyncEntry[] = [];
       // §八「机票改期连带平移酒店日期」：被平移的行若有共享成员，解绑警告收集到这里
       // （批量改班次 / 纠错平移复用同一个函数，警告随各自的 audit.warnings 一并带出）。
       const sharedRoomWarnings: string[] = [];
@@ -11573,6 +11551,8 @@ export class OrderService {
                 hotelCheckOut: true,
                 roomsBilled: true,
                 unitCostCny: true,
+                // totalCostCny：审计逐行记成本前后值（FOLLOW_TRIP 重打快照时 unit/total 都会变）。
+                totalCostCny: true,
                 metadata: true,
               },
             })
@@ -11877,6 +11857,11 @@ export class OrderService {
                   ...(nextMetadata !== undefined ? { metadata: nextMetadata } : {}),
                 },
               });
+              // 成本前后值：SHIFT / 没重打快照的行 to = from（照抄，审计读起来不用猜「没写 = 没变」）。
+              const decimalToNumber = (v: Prisma.Decimal | number | null | undefined): number | null =>
+                v == null ? null : Number(v.toString());
+              const fromUnitCostCny = decimalToNumber(s.row.unitCostCny);
+              const fromTotalCostCny = decimalToNumber(s.row.totalCostCny);
               hotelDateSync.push({
                 orderItemId: s.row.id,
                 mode: s.mode,
@@ -11886,6 +11871,10 @@ export class OrderService {
                 toCheckOut: s.newCheckOut ? formatDateOnly(s.newCheckOut) : null,
                 fromNights,
                 toNights: nights,
+                fromUnitCostCny,
+                toUnitCostCny: costPatch.unitCostCny !== undefined ? costPatch.unitCostCny : fromUnitCostCny,
+                fromTotalCostCny,
+                toTotalCostCny: costPatch.totalCostCny !== undefined ? costPatch.totalCostCny : fromTotalCostCny,
               });
             }
           }
@@ -24601,13 +24590,14 @@ function readOrchestrationLeg(value: unknown): 'OUTBOUND' | 'RETURN' | null {
  * `leg` 是**派生记录**而不是入参：它由 orderItemId 在源单上推出来，留档只为了回放时
  * 源单已无该行还能定位航段（见 ORCHESTRATION_DERIVED_KEYS），因此不参与指纹比对。
  */
-function reschedulePassengersOrchestration(
+export function reschedulePassengersOrchestration(
   input: {
     orderItemId: string;
     newScheduleId: string;
     newCabin?: CabinClass;
     feeCny?: number;
     roomSplit?: Array<{ itemId: string; roomsBilledToMove: number }>;
+    hotelMode?: RescheduleHotelMode;
   },
   leg: 'OUTBOUND' | 'RETURN' | null,
 ): SplitOrchestrationSnapshot {
@@ -24617,6 +24607,10 @@ function reschedulePassengersOrchestration(
     newCabin: input.newCabin ?? null,
     feeCny: Math.trunc(input.feeCny ?? 0),
     leg,
+    // 住宿处理方式直接决定新单的住宿日期 / 晚数 / 成本：同 token 换 FOLLOW_TRIP↔KEEP 重发不能静默回放
+    // 上一轮。只在非缺省时入键（与 rescheduleAllFingerprint 同款）：缺省 SHIFT 的快照与加字段前逐字相同，
+    // 上线前发出的 token 重试仍能回放。
+    ...(input.hotelMode && input.hotelMode !== 'SHIFT' ? { hotelMode: input.hotelMode } : {}),
     roomSplit:
       input.roomSplit == null
         ? null
@@ -27017,6 +27011,27 @@ export function rewriteHotelStayDescription(
 }
 
 // ── 改期「房跟着新行程走」（hotelMode=FOLLOW_TRIP）的住宿重排 ─────────────────────
+/**
+ * 改期随手同步的一条占房行（audit.hotelDateSync 逐行；路由审计 after 与前端提示条都读它）。
+ * 日期 YYYY-MM-DD；mode = 该行实际走的口径（FOLLOW_TRIP 在单程单上退化为 SHIFT，此处如实记 SHIFT）；
+ * 晚数按日期派生（无离店日期 = 0）；成本四栏是行上 unitCostCny / totalCostCny 的前后值
+ * （没重打快照的行 to = from；没录成本为 null）。
+ */
+export interface RescheduleHotelDateSyncEntry {
+  orderItemId: string;
+  mode: 'FOLLOW_TRIP' | 'SHIFT';
+  fromCheckIn: string;
+  toCheckIn: string;
+  fromCheckOut: string | null;
+  toCheckOut: string | null;
+  fromNights: number;
+  toNights: number;
+  fromUnitCostCny: number | null;
+  toUnitCostCny: number | null;
+  fromTotalCostCny: number | null;
+  toTotalCostCny: number | null;
+}
+
 /** FOLLOW_TRIP 锚点：改期前后的去程/回程**出发地当地日**（YYYY-MM-DD，口径同建单盖章）。 */
 export interface FollowTripAnchors {
   fromOutbound: string;

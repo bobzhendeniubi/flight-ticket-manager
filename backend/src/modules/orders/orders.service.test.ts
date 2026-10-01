@@ -6367,6 +6367,11 @@ describe('OrderService.rescheduleOrderItem · 酒店入住日期随出发日平�
         toCheckOut: '2027-09-02',
         fromNights: 1,
         toNights: 1,
+        // SHIFT 不重打成本快照：四栏 to = from（夹具行没录成本 → 都是 null）。
+        fromUnitCostCny: null,
+        toUnitCostCny: null,
+        fromTotalCostCny: null,
+        toTotalCostCny: null,
       },
     ]);
   });
