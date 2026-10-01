@@ -2415,3 +2415,116 @@ describe('generateRuleReminders — 规则 12 取数、时区、档案链与收�
     expect(rows.get(id)!.body).toContain('QH9999');
   });
 });
+
+// ── 已换人（SWAPPED）：只进尾款催收；残留的履约类待办自动核销 ───────────────────
+describe('已换人单：只催尾款，不进履约类规则；残留的履约类待办自动核销', () => {
+  const NOW3 = new Date('2026-07-09T06:00:00Z');
+  const TODAY3 = businessDateISO(NOW3);
+  const departSoon3 = addDaysUtc(TODAY3, 2);
+
+  /** 已换人单：应收已收敛为换人费 1650、只收了 1000（欠 650）；明细/乘客都带着能触发履约类规则的条件。 */
+  function swappedOrder(overrides: Partial<RuleOrder> = {}): RuleOrder {
+    return fakeOrder({
+      id: 'ord_swapped',
+      orderNumber: 'FTM2026070900077',
+      status: OrderStatus.SWAPPED,
+      total: new Prisma.Decimal('1650'),
+      paidAmount: new Prisma.Decimal('1000'),
+      items: [flightItem(`${departSoon3}T02:00:00Z`), hotelItem(departSoon3)],
+      roomAssignment: null, // 明确没分房：非已换人单会触发规则 8
+      passengers: [
+        {
+          id: 'pax_sw',
+          fullName: '被换下的客人',
+          passportExpiry: new Date(`${addDaysUtc(TODAY3, 30)}T00:00:00Z`), // 非已换人单会触发规则 3
+          eticketNumber: '', // 非已换人单会触发规则 6
+          documentNumber: 'E1',
+        },
+      ],
+      ...overrides,
+    });
+  }
+
+  it('buildOrderCandidates：换人费没收够 → 只生成 BALANCE_DUE；出行/护照/未出票/分房一条都不生成', () => {
+    const candidates = buildOrderCandidates(swappedOrder(), TODAY3);
+    expect(candidates.map((c) => c.rule)).toEqual(['BALANCE_DUE']);
+    expect(candidates[0].title).toContain('尾款¥650');
+    expect(candidates[0].priority).toBe(ReminderPriority.CRITICAL); // 2 天内出发
+    // 对照：同一张单若还是已支付，履约类规则照常触发。
+    const paidRules = buildOrderCandidates(swappedOrder({ status: OrderStatus.PAID }), TODAY3).map((c) => c.rule);
+    expect(paidRules).toEqual(
+      expect.arrayContaining(['BALANCE_DUE', 'DEPARTURE_SOON', 'PASSPORT_EXPIRY', 'TICKET_MISSING']),
+    );
+  });
+
+  it('换人费已收齐 → 一条都不生成（已换人单不进任何履约类规则）', () => {
+    expect(buildOrderCandidates(swappedOrder({ paidAmount: new Prisma.Decimal('1650') }), TODAY3)).toEqual([]);
+  });
+
+  it('generateRuleReminders：残留的未出票/出行/护照/未送签待办自动 DONE；尾款没收够的 BALANCE 保持 OPEN；人工跳过的不覆盖', async () => {
+    const order = swappedOrder();
+    type Row = { id: string; ruleKey: string; status: ReminderStatus; resolvedNote: string | null };
+    const rows = new Map<string, Row>(
+      (
+        [
+          { id: 'r_ticket', ruleKey: `TICKET:ord_swapped:${departSoon3}`, status: ReminderStatus.OPEN, resolvedNote: null },
+          { id: 'r_depart', ruleKey: `DEPART:ord_swapped:${departSoon3}`, status: ReminderStatus.IN_PROGRESS, resolvedNote: null },
+          { id: 'r_ppexp', ruleKey: `PPEXP:pax_sw:${departSoon3}`, status: ReminderStatus.OPEN, resolvedNote: null },
+          { id: 'r_visa', ruleKey: `VISASUBMIT:ord_swapped:${departSoon3}`, status: ReminderStatus.OPEN, resolvedNote: null },
+          { id: 'r_balance', ruleKey: `BALANCE:ord_swapped:${departSoon3}`, status: ReminderStatus.OPEN, resolvedNote: null },
+          { id: 'r_skipped', ruleKey: 'TICKET:ord_swapped:2026-01-01', status: ReminderStatus.SKIPPED, resolvedNote: '人工跳过' },
+        ] as Row[]
+      ).map((r) => [r.id, r]),
+    );
+    const mock = {
+      order: {
+        // 主扫描 → 这张已换人单；情形 4 的清理查询（带 where.id.in）→ 空。
+        findMany: vi.fn(async (args?: { where?: { id?: { in?: string[] } } }) => (args?.where?.id?.in ? [] : [order])),
+      },
+      fulfillmentTask: { findMany: vi.fn(async () => []) },
+      holdOrder: { findMany: vi.fn(async () => []) },
+      operationalReminder: {
+        findMany: vi.fn(
+          async (args: {
+            where: { ruleKey?: { in?: string[]; startsWith?: string }; status?: { in: ReminderStatus[] } };
+          }) => {
+            let list = [...rows.values()];
+            const keyIn = args.where.ruleKey?.in;
+            const prefix = args.where.ruleKey?.startsWith;
+            const statusIn = args.where.status?.in;
+            if (keyIn) list = list.filter((r) => keyIn.includes(r.ruleKey));
+            if (prefix) list = list.filter((r) => r.ruleKey.startsWith(prefix));
+            if (statusIn) list = list.filter((r) => statusIn.includes(r.status));
+            return list.map((r) => ({ ...r }));
+          },
+        ),
+        updateMany: vi.fn(
+          async (args: {
+            where: { id: { in: string[] }; status?: { in: ReminderStatus[] } };
+            data: { status: ReminderStatus; resolvedNote?: string };
+          }) => {
+            let count = 0;
+            for (const id of args.where.id.in) {
+              const row = rows.get(id);
+              if (!row) continue;
+              if (args.where.status && !args.where.status.in.includes(row.status)) continue;
+              row.status = args.data.status;
+              if (args.data.resolvedNote !== undefined) row.resolvedNote = args.data.resolvedNote;
+              count += 1;
+            }
+            return { count };
+          },
+        ),
+        createMany: vi.fn(async () => ({ count: 0 })),
+      },
+    } as unknown as PrismaClient;
+
+    await generateRuleReminders(mock, 'user_sys', NOW3);
+
+    for (const id of ['r_ticket', 'r_depart', 'r_ppexp', 'r_visa']) {
+      expect(rows.get(id), id).toMatchObject({ status: ReminderStatus.DONE, resolvedNote: AUTO_RESOLVED_NOTE });
+    }
+    expect(rows.get('r_balance')?.status).toBe(ReminderStatus.OPEN);
+    expect(rows.get('r_skipped')?.status).toBe(ReminderStatus.SKIPPED);
+  });
+});

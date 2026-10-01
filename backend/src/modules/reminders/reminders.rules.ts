@@ -61,13 +61,28 @@ import {
 } from './reminders.rules.trip-balance.js';
 
 // ── 状态集合 ────────────────────────────────────────────────────────────────
-/** 催尾款：待付 + 已付未完结（这些状态还会收钱） */
+/**
+ * 催尾款：待付 + 已付未完结（这些状态还会收钱）。
+ * 已换人（SWAPPED）也在内：应收已收敛为换人费，没收够的部分照常是欠款、照常催；
+ * 它**只**进这条规则——出行 / 护照 / 未出票 / 分房等履约类规则各有自己的状态集合，都不含它。
+ * 本集合同时决定 SCAN_STATUSES（主扫描范围），所以已换人单会被扫到，并由 generateRuleReminders
+ * 的 resolvedRuleKeys 按 FULFILLMENT_RESOLVED_STATUSES 把它残留的履约类待办自动关掉。
+ */
 const BALANCE_DUE_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
   OrderStatus.PAID,
   OrderStatus.PROCESSING,
   OrderStatus.TICKETED,
+  OrderStatus.SWAPPED,
 ];
+/**
+ * 履约类提醒（未出票 / 出行提醒 / 护照有效期 / 未送签）在这些状态上自动解除：订单仍在扫描集里
+ *（要催尾款），但原客人不再出行，这些待办在本单上已站不住脚，由 generateRuleReminders 的
+ * resolvedRuleKeys 一次性关掉（接手的人在新单上重新生成）。分房提醒不走这里——
+ * computeRoomAssignmentState 的状态门让它为 null，reconcileRoomAssignmentReminders 据此关掉。
+ * 取消族不在此列：它们本就不在 SCAN_STATUSES 里，残留提醒走别的清理口径。
+ */
+const FULFILLMENT_RESOLVED_STATUSES: OrderStatus[] = [OrderStatus.SWAPPED];
 /** 出行提醒：PAID_LIKE 排除 COMPLETED（已完结不用再提醒出行） */
 const DEPARTURE_SOON_STATUSES: OrderStatus[] = [
   OrderStatus.PAID,
@@ -392,6 +407,8 @@ interface RoomAssignmentState {
  * → 返回 null（这单当前不该有任何 ROOMASSIGN 提醒）。
  */
 function computeRoomAssignmentState(order: RuleOrder, today: string): RoomAssignmentState | null {
+  // 状态门：不在 DEPARTURE_SOON_STATUSES 里的单（如已换人——原客人不再入住）返回 null，
+  // 既不生成新候选，也让 reconcileRoomAssignmentReminders 把它残留的 ROOMASSIGN 键关掉。
   if (order.roomAssignment === undefined || !DEPARTURE_SOON_STATUSES.includes(order.status)) {
     return null;
   }
@@ -514,15 +531,20 @@ async function reconcileRoomAssignmentReminders(
   // ── 情形 4：取消/软删订单的旧提醒清理（B8 二次修复）──────────────────────
   // 这类单从一开始就不在 ordersInScope 里（generateRuleReminders 主扫描按 SCAN_STATUSES
   // 过滤，不含 CANCELLED；deletedAt 必须为 null），上面的循环访问不到——单独查一次「existing
-  // 里出现过、但这轮主扫描没扫到」的那批订单，命中已取消/软删的就关掉，不受 inScope/SINCE
+  // 里出现过、但这轮主扫描没扫到」的那批订单，命中已取消/已换人/软删的就关掉，不受 inScope/SINCE
   // 限制（与孤儿日期键清理同一个「纯粹清理，风险与通用解除流程等价」的理由）。
+  // 已换人现在在 SCAN_STATUSES 里、正常走上面的主循环（状态门让 state 为 null → 关掉），这里再列
+  // 一遍是纵深防御：日后若有人把它从扫描集拿掉，残留的 ROOMASSIGN 键仍能被清。
   const inScopeOrderIds = new Set(ordersInScope.map((order) => order.id));
   const outOfScopeOrderIds = [...existingByOrder.keys()].filter((id) => !inScopeOrderIds.has(id));
   if (outOfScopeOrderIds.length > 0) {
     const cancelledOrDeleted = await prisma.order.findMany({
       where: {
         id: { in: outOfScopeOrderIds },
-        OR: [{ deletedAt: { not: null } }, { status: OrderStatus.CANCELLED }],
+        OR: [
+          { deletedAt: { not: null } },
+          { status: { in: [OrderStatus.CANCELLED, OrderStatus.SWAPPED] } },
+        ],
       },
       select: { id: true },
     });
@@ -1434,6 +1456,18 @@ export async function generateRuleReminders(
   for (const order of orders) {
     const departure = deriveDepartureDate(order.items);
     if (!departure) continue;
+    // 0) 已换人：原客人不再出行——未出票 / 出行提醒 / 护照有效期 / 未送签这些履约类待办在本单上
+    //    全部站不住脚，一律解除（接手的人在新单上重新生成）。尾款催收不在此列：换人费没收够照常催，
+    //    由下面 1) 按 balance 判；分房键由 reconcileRoomAssignmentReminders 按同一状态门关。
+    //    键里的出发日取当前明细（换人只释放座位、不改航段），与当初生成时一致。
+    if (FULFILLMENT_RESOLVED_STATUSES.includes(order.status)) {
+      resolvedRuleKeys.push(
+        `TICKET:${order.id}:${departure}`,
+        `DEPART:${order.id}:${departure}`,
+        `VISASUBMIT:${order.id}:${departure}`,
+      );
+      for (const pax of order.passengers) resolvedRuleKeys.push(`PPEXP:${pax.id}:${departure}`);
+    }
     // 1) 尾款已付：不看催收窗口是否还在——balance<=0 就该关，哪怕单子后来被改期到窗口外。
     if (!computeBalance(order).greaterThan(0)) {
       resolvedRuleKeys.push(`BALANCE:${order.id}:${departure}`);
