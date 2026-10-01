@@ -1333,10 +1333,12 @@ export interface OrderItem {
   // ── 行程单渲染字段（ADDITIVE；getOrder 联查后附加，未联查对应关系时为 null）──
   /** FLIGHT 行：航班号 */
   flightNumber?: string | null;
-  /** FLIGHT 行：出发日期（YYYY-MM-DD） */
+  /** FLIGHT 行：出发日期（YYYY-MM-DD，按出发地时区折） */
   departureDate?: string | null;
-  /** FLIGHT 行：出发时间（HH:MM） */
+  /** FLIGHT 行：出发时间（HH:MM，按出发地时区折） */
   departureTime?: string | null;
+  /** FLIGHT 行：出发 UTC 瞬间（ISO），排航段先后用（与后端 determineFlightLegItems 同口径）；老后端缺省 */
+  departureAt?: string | null;
   /** FLIGHT 行：到达时间（HH:MM） */
   arrivalTime?: string | null;
   /** FLIGHT 行：航线，如「MFM→DAD」 */

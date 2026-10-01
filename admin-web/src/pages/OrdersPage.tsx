@@ -8,6 +8,7 @@ import {
 } from '../lib/mockData';
 import { csvNumber, exportToCSV, localDateStamp } from '../lib/csvExport';
 import { AIRPORTS, formatLocalTime, localYmd } from '../lib/airports';
+import { countNightsBetween, previewRescheduleStay } from '../lib/reschedule-stay-preview';
 import { businessTzParts, formatDateCn, formatDateTimeSecCn, formatInBusinessTz } from '../lib/datetime';
 import { NumberInput } from '../components/NumberInput';
 import { Icon, type IconName } from '../components/Icon';
@@ -9464,61 +9465,6 @@ function CabinUpgradePanel({
   );
 }
 
-/** YYYY-MM-DD 加 N 天（UTC date-only，与后端 addDaysToYmd 同口径）。 */
-function addDaysYmd(ymd: string, days: number): string {
-  return new Date(Date.parse(`${ymd}T00:00:00.000Z`) + days * 86_400_000).toISOString().slice(0, 10);
-}
-/** 两个 YYYY-MM-DD 的整天数差（b − a）。 */
-function daysBetweenYmd(a: string, b: string): number {
-  return Math.round((Date.parse(`${b}T00:00:00.000Z`) - Date.parse(`${a}T00:00:00.000Z`)) / 86_400_000);
-}
-
-/** 改期弹窗「房是否一起变动」的住宿预览（仅展示；后端 planFollowTripHotelStay 是权威，规则同源）。 */
-interface RescheduleStayPreview {
-  /** 当前整单占房窗口（最早入住 ~ 最晚离店）。 */
-  current: { checkIn: string; checkOut: string | null; nights: number };
-  /** 房跟着新行程走：入住/离店锚定新去程/回程日（保留原相对偏移）。null = 还没选新班次或单程单（退化为整体平移）。 */
-  followTrip: { checkIn: string; checkOut: string | null; nights: number } | null;
-  /** 整体平移保晚数（最早出发日平移了几天，住宿同移几天）。null = 还没选新班次。 */
-  shift: { checkIn: string; checkOut: string | null; nights: number } | null;
-}
-function previewRescheduleStay(
-  orderItems: OrderItem[],
-  changedItemId: string,
-  newLegDate: string | null,
-): RescheduleStayPreview | null {
-  const hotelRows = orderItems.filter((it) => (it.kind === 'HOTEL' || it.kind === 'BUNDLE') && it.hotelCheckIn);
-  if (hotelRows.length === 0) return null;
-  const checkIns = hotelRows.map((it) => (it.hotelCheckIn ?? '').slice(0, 10)).sort();
-  const checkOuts = hotelRows.flatMap((it) => (it.hotelCheckOut ? [it.hotelCheckOut.slice(0, 10)] : [])).sort();
-  const windowStart = checkIns[0];
-  const windowEnd = checkOuts.length > 0 ? checkOuts[checkOuts.length - 1] : null;
-  const nightsOf = (checkIn: string, checkOut: string | null) =>
-    checkOut ? (countNightsBetween(checkIn, checkOut) ?? 0) : 0;
-  const current = { checkIn: windowStart, checkOut: windowEnd, nights: nightsOf(windowStart, windowEnd) };
-  if (!newLegDate) return { current, followTrip: null, shift: null };
-  // 航段按当地出发日+时刻升序：第 1 段=去程、第 2 段=回程（与后端 determineFlightLegItems 同口径）。
-  type LegRow = { id: string; date: string; time: string };
-  const legs: LegRow[] = orderItems
-    .filter((it) => it.kind === 'FLIGHT' && it.flightScheduleId && it.departureDate)
-    .map((it) => ({ id: it.id, date: it.departureDate ?? '', time: it.departureTime ?? '' }));
-  const sortLegs = (rows: LegRow[]) =>
-    [...rows].sort((a, b) => `${a.date} ${a.time}`.localeCompare(`${b.date} ${b.time}`) || a.id.localeCompare(b.id));
-  const before = sortLegs(legs);
-  const after = sortLegs(legs.map((l) => (l.id === changedItemId ? { ...l, date: newLegDate } : l)));
-  if (before.length === 0 || after.length === 0) return { current, followTrip: null, shift: null };
-  const delta = daysBetweenYmd(before[0].date, after[0].date);
-  const shift = {
-    checkIn: addDaysYmd(windowStart, delta),
-    checkOut: windowEnd ? addDaysYmd(windowEnd, delta) : null,
-    nights: current.nights,
-  };
-  if (before.length < 2 || after.length < 2) return { current, followTrip: null, shift };
-  const newStart = addDaysYmd(after[0].date, daysBetweenYmd(before[0].date, windowStart));
-  const newEnd = windowEnd ? addDaysYmd(after[1].date, daysBetweenYmd(before[1].date, windowEnd)) : null;
-  return { current, shift, followTrip: { checkIn: newStart, checkOut: newEnd, nights: nightsOf(newStart, newEnd) } };
-}
-
 /** 改期成功提示条文案：后端 hotelDateSync 逐行 → 「住宿已改为 09-21 至 09-23，共 2 晚」。无同步 → null。 */
 function formatHotelDateSyncNotice(syncs: RescheduleHotelDateSync[] | undefined, newOrderNumber?: string | null): string | null {
   if (!syncs || syncs.length === 0) return null;
@@ -9610,13 +9556,18 @@ function RescheduleForm({
   const selectedSchedule = schedules.find((s) => s.id === newScheduleId);
   const cabinOptions = selectedSchedule?.seatClasses ?? [];
   // 住宿预览（仅运营的售后改期；纠错口径固定整体平移，代理入口后端不透传 hotelMode）：
-  // 新班次的当地出发日按 departureTz 折，与后端锚点同口径。
+  // 新班次的当地出发日按 departureTz 折（锚点），UTC 瞬间用来排航段先后，两者都与后端同口径。
   const stayPreview =
     !isCorrection && isOps
       ? previewRescheduleStay(
           orderItems ?? [],
           item.id,
-          selectedSchedule ? localYmd(selectedSchedule.departureTime, selectedSchedule.departureTz) : null,
+          selectedSchedule
+            ? {
+                date: localYmd(selectedSchedule.departureTime, selectedSchedule.departureTz),
+                at: selectedSchedule.departureTime,
+              }
+            : null,
         )
       : null;
   // 实际提交的住宿处理方式：单程单选了「按新行程重排」后端会退化为整体平移，这里照传，由后端记账。
@@ -11656,15 +11607,6 @@ function HotelRescheduleForm({
       </div>
     </div>
   );
-}
-
-/** 两个 YYYY-MM-DD 之间的晚数；非法/退房不晚于入住 → null（调用方据此拦提交）。 */
-function countNightsBetween(checkIn: string, checkOut: string): number | null {
-  if (!/^\d{4}-\d{2}-\d{2}$/.test(checkIn) || !/^\d{4}-\d{2}-\d{2}$/.test(checkOut)) return null;
-  const start = Date.parse(`${checkIn}T00:00:00.000Z`);
-  const end = Date.parse(`${checkOut}T00:00:00.000Z`);
-  if (!Number.isFinite(start) || !Number.isFinite(end) || end <= start) return null;
-  return Math.round((end - start) / 86_400_000);
 }
 
 // ── 售后费用（改期费 / 换人费 / 换酒店差价）明细展示 ───────────────────────────────

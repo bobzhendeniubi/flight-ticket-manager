@@ -29053,6 +29053,8 @@ function itineraryFieldsForItem(
     // 出发日/时刻按出发地时区折算；到达时刻按到达地时区（跨时区航段两头不同）。
     departureDate: departureTime ? formatDateOnly(departureTime, flightSchedule?.departureTz) : null,
     departureTime: departureTime ? formatHHMM(departureTime, flightSchedule?.departureTz) : null,
+    // 出发 UTC 瞬间（ISO）：前端排航段先后用（与 determineFlightLegItems 同口径），不受当地日/时刻折算影响。
+    departureAt: departureTime ? departureTime.toISOString() : null,
     arrivalTime: arrivalTime ? formatHHMM(arrivalTime, flightSchedule?.arrivalTz) : null,
     route:
       flightSchedule?.flight?.originCode && flightSchedule?.flight?.destinationCode
