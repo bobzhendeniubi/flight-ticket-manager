@@ -42,8 +42,8 @@ import { netReceivedCny, sumCompletedRefundCny } from '../../lib/net-received.js
 import { businessDateTime } from '../../lib/business-time.js';
 // 签证成本口径与财务汇总共用同一函数，两处逐字一致（任务实际成本优先 → 产品主数据回退）
 import { visaItemCostCny } from './finances.service.js';
-// 已换人单成本一律按 0、人数不计被换下的人：与财务汇总 / 按航班导出共用同一判定。
-import { countedPassengerCount, isZeroCostOrder } from './order-cost-policy.js';
+// 已换人单成本一律按 0：与财务汇总 / 按航班导出共用同一判定；人数列照常显示，备注列打标注。
+import { isZeroCostOrder, swappedOutRowNote } from './order-cost-policy.js';
 import {
   formatSwapRecordCell,
   loadSwapRecordsByPassenger,
@@ -246,7 +246,10 @@ function orderToRows(
   const paxCount = Math.max(1, order.passengers.length);
   // 需签乘客数（非自备签）—— 签证实际成本按此人均折算
   const visaPax = order.passengers.filter((p) => !p.visaExempt).length;
-  // 已换人单：收入列照常（换人费已进 total），成本列一律 0、人数列 0（口径见 order-cost-policy.ts）。
+  // 已换人单：收入列照常（换人费已进 total），成本列一律 0（口径见 order-cost-policy.ts）；
+  // 人数列照常显示（财务拍板：数字列不动，便于求和对照），改在备注列打「已换人·被换下，
+  // 不计人次、不计成本」标注（swappedOutRowNote）。按航班导出的乘客数 / 需签乘客数是统计口径，
+  // 那边仍不计被换下的人。
   // 各段成本仍按明细算完，归零集中在落列那一处（zc）——成本列清单一眼看全，不散落在各段里。
   const zeroCost = isZeroCostOrder(order);
   const zc = (costCny: number): number => (zeroCost ? 0 : costCny);
@@ -444,7 +447,7 @@ function orderToRows(
       returnDate: departDates.length > 1 ? fmtDate(departDates[departDates.length - 1]) : '',
       flightNumbers: Array.from(new Set(flightNumbers)).join(' / '),
       orderType,
-      paxCount: countedPassengerCount(order),
+      paxCount: order.passengers.length,
       status: STATUS_LABEL[order.status] ?? order.status,
       settledStatus: settled,
       // 录入时间是「动作发生时刻」，按北京时间输出（容器 TZ 是 UTC，直接取 UTC 分量会少 8 小时）
@@ -476,7 +479,7 @@ function orderToRows(
       transferCost: 0,
       totalCost: 0,
       grossMargin: 0,
-      note: order.notes ?? '',
+      note: swappedOutRowNote(order),
       refundType: refundType(order.status, order.swapRefundedAt),
       swapFeeCny: order.swapFeeCny ?? '',
       replacementOrderNumber: order.swapReplacementOrderNumber ?? '',
