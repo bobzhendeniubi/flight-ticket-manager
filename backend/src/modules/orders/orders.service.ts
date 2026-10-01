@@ -6818,11 +6818,17 @@ export class OrderService {
   /**
    * overpayToPool 的事务内核 —— 单独的「多付转挂账池」端点与「标记已换人」（markSwapped，
    * 直客单把多出的钱转池）共用。调用方负责包 $transaction 与鉴权；闸门全部留在这里。
+   *
+   * hint（可选，只有标记已换人传）：进账的「疑似归属」覆写。默认进账指回本单
+   *（payerNote=「订单超额 X」、orderHintId=本单），对账台与订单详情据此提示「认领到本单」——
+   * 已换人单的多付不该再认回本单，而要认到接手的新单：有接手单号就指向新单，没有就只留文字
+   * 说明、orderHintId 置空。不传 = 端点既有行为，一字不变。
    */
   async _overpayToPoolWithinTx(
     tx: Prisma.TransactionClient,
     orderId: string,
     actor: { userId: string; role: UserRole },
+    hint?: { payerNote: string; orderHintId: string | null },
   ): Promise<{
     ok: true;
     orderId: string;
@@ -6868,8 +6874,8 @@ export class OrderService {
       amountCny: overpay,
       method,
       source: ReceiptSource.ORDER_OVERPAY,
-      payerNote: `订单超额 ${order.orderNumber}`,
-      orderHintId: orderId,
+      payerNote: hint ? hint.payerNote : `订单超额 ${order.orderNumber}`,
+      orderHintId: hint ? hint.orderHintId : orderId,
       createdById: actor.userId,
     });
 
@@ -10557,6 +10563,8 @@ export class OrderService {
    *      调价后断言「最终应收 === 换人费」，不等就整单回滚。差额为 0 不留空行。换人费 0 = 一分不收（合法）。
    *   b. 净收款 > 换人费 → 多出部分转存：代理单走 _creditOverpayToAgentWithinTx，直客单走
    *      _overpayToPoolWithinTx（同一内核，收款复核锁在那里生效：锁着就拒，先解锁）；订单回压到恰好结清。
+   *      直客单的挂账进账不指回本单：有接手单号 → orderHintId 指向新单；没有 → 只留备注、orderHintId 空
+   *     （对账台 / 订单详情的「认领到本单」按 orderHintId 找，指回本单会把钱认回已换人单）。
    *      净收款 < 换人费 → 不动钱，欠款留在单上（应收 > 已收），后续照常收款。
    *   c. 状态 → SWAPPED（via:'swap'，唯一正门）：与取消同一套释放副作用——未飞航段座位释放（已飞不退，
    *      isLegAlreadyFlown 口径）、房控占房按状态集合自然退出、履约任务终态化、权益核销自动冲正、
@@ -10653,6 +10661,8 @@ export class OrderService {
       }
 
       const replacementOrderNumber = input.replacementOrderNumber?.trim() || undefined;
+      // 接手单 id：直客单多付转池时挂账进账的「疑似归属」指向它（没填 = null，不指回本单）。
+      let replacementOrderId: string | null = null;
       if (replacementOrderNumber) {
         const replacement = await tx.order.findUnique({
           where: { orderNumber: replacementOrderNumber },
@@ -10666,6 +10676,7 @@ export class OrderService {
         if (replacement.id === orderId) {
           throw new BadRequestError('新订单号不能填本单自己');
         }
+        replacementOrderId = replacement.id;
       }
 
       // 应收基准 = Σ 明细行 + adjustmentCny（改期费等售后费也在内，一并收敛到换人费）。
@@ -10719,7 +10730,15 @@ export class OrderService {
             agentBalanceAfter: credited.agentBalanceAfter,
           };
         } else {
-          const moved = await this._overpayToPoolWithinTx(tx, orderId, actor);
+          // 进账的「疑似归属」不指回本单：对账台与订单详情的「认领到本单」提示都按 orderHintId 找，
+          // 指回已换人单会把这笔钱认回它。有接手单号就指向新单（新单详情直接提示认领）；没有就只留
+          // 文字、orderHintId 置空，等新单录好后在对账台按备注认领。
+          const moved = await this._overpayToPoolWithinTx(tx, orderId, actor, {
+            payerNote: replacementOrderNumber
+              ? `订单 ${locked.orderNumber} 已换人多付，请认领到接手订单 ${replacementOrderNumber}`
+              : `订单 ${locked.orderNumber} 已换人多付，请认领到接手的新单（新单号录入后再认领，不要认回原单）`,
+            orderHintId: replacementOrderId,
+          });
           disposal = {
             kind: 'RECEIPT_POOL',
             amountCny: moved.movedAmount,

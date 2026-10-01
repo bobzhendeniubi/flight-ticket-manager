@@ -26,6 +26,7 @@ const { mockPrisma, mockTx } = vi.hoisted(() => {
     orderItem: { findMany: vi.fn(), create: vi.fn() },
     orderStatusEvent: { create: vi.fn() },
     payment: { findFirst: vi.fn(), create: vi.fn(), updateMany: vi.fn(), aggregate: vi.fn() },
+    receipt: { create: vi.fn() },
   };
   return {
     mockTx: tx,
@@ -320,5 +321,59 @@ describe('已换人 = 真终态：任何来源为 SWAPPED 的状态流转一律�
     ).rejects.toThrow(/已换人单为终态；如需撤销请联系管理员走数据纠正/);
     expect(mockTx.order.updateMany).not.toHaveBeenCalled();
     expect(mockTx.orderStatusEvent.create).not.toHaveBeenCalled();
+  });
+});
+
+describe('_overpayToPoolWithinTx · 挂账进账的「疑似归属」（标记已换人专用 hint）', () => {
+  /** 直客单多付 550：FOR UPDATE 行 + 无已完成退款 + 最近一笔收款微信。 */
+  function arrangePoolOverpay() {
+    mockTx.$queryRaw.mockResolvedValueOnce([
+      {
+        id: 'order-a',
+        orderNumber: 'ORDER-A',
+        total: dec(450),
+        adjustmentCny: 0,
+        paidAmount: dec(1000),
+        prepaymentOffset: dec(0),
+        status: OrderStatus.PAID,
+        deletedAt: null,
+        paymentsLocked: false,
+      },
+    ]);
+    mockTx.payment.findFirst.mockResolvedValueOnce({ method: 'WECHAT_PAY' });
+    mockTx.receipt.create.mockResolvedValueOnce({ id: 'rcp-1', receiptNo: 'RCP1' });
+  }
+
+  it('不传 hint（独立「超额转入挂账池」端点）：进账照旧指回本单，备注「订单超额 X」', async () => {
+    arrangePoolOverpay();
+    await service._overpayToPoolWithinTx(mockTx as never, 'order-a', STAFF);
+    expect(mockTx.receipt.create).toHaveBeenCalledTimes(1);
+    expect(mockTx.receipt.create.mock.calls[0][0].data).toMatchObject({
+      orderHintId: 'order-a',
+      payerNote: '订单超额 ORDER-A',
+      source: 'ORDER_OVERPAY',
+    });
+  });
+
+  it('传 hint（标记已换人）：进账指向接手新单，备注写明认领去向；原单不再被提示「认领到本单」', async () => {
+    arrangePoolOverpay();
+    await service._overpayToPoolWithinTx(mockTx as never, 'order-a', STAFF, {
+      payerNote: '订单 ORDER-A 已换人多付，请认领到接手订单 ORDER-NEW',
+      orderHintId: 'order-new',
+    });
+    expect(mockTx.receipt.create.mock.calls[0][0].data).toMatchObject({
+      orderHintId: 'order-new',
+      payerNote: '订单 ORDER-A 已换人多付，请认领到接手订单 ORDER-NEW',
+    });
+  });
+
+  it('传 hint 但没有接手单号：orderHintId 置空（不指回原单），只留文字说明', async () => {
+    arrangePoolOverpay();
+    await service._overpayToPoolWithinTx(mockTx as never, 'order-a', STAFF, {
+      payerNote: '订单 ORDER-A 已换人多付，请认领到接手的新单（新单号录入后再认领，不要认回原单）',
+      orderHintId: null,
+    });
+    expect(mockTx.receipt.create.mock.calls[0][0].data).toMatchObject({ orderHintId: null });
+    expect(mockTx.receipt.create.mock.calls[0][0].data.payerNote).toMatch(/不要认回原单/);
   });
 });

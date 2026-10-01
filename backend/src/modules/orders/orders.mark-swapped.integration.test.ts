@@ -306,7 +306,7 @@ describe('OrderService.markSwapped · 真 DB E2E', () => {
     expect(seat.sold).toBe(1);
   });
 
-  it('直客单：已收 1000、换人费 450 → 多出 550 转挂账池（OPEN 进账，来源订单超额），订单结清', async () => {
+  it('直客单（没填接手单号）：已收 1000、换人费 450 → 多出 550 转挂账池；进账不指回原单，备注说明认领去向', async () => {
     const customer = await createUser(UserRole.CUSTOMER);
     const staff = await createUser(UserRole.STAFF);
     const { order } = await createPaidOrder({ userId: customer.id, totalCny: 1000, paidCny: 1000 });
@@ -315,17 +315,54 @@ describe('OrderService.markSwapped · 真 DB E2E', () => {
 
     expect(result.audit.disposal?.kind).toBe('RECEIPT_POOL');
     expect(result.audit.disposal?.amountCny).toBe(550);
-    const receipt = await prisma.receipt.findFirst({ where: { orderHintId: order.id } });
-    expect(receipt).not.toBeNull();
-    expect(receipt!.status).toBe(ReceiptStatus.OPEN);
-    expect(receipt!.source).toBe(ReceiptSource.ORDER_OVERPAY);
-    expect(Number(receipt!.amountCny)).toBe(550);
+    const receiptId = (result.audit.disposal as { receiptId: string }).receiptId;
+    const receipt = await prisma.receipt.findUniqueOrThrow({ where: { id: receiptId } });
+    expect(receipt.status).toBe(ReceiptStatus.OPEN);
+    expect(receipt.source).toBe(ReceiptSource.ORDER_OVERPAY);
+    expect(Number(receipt.amountCny)).toBe(550);
+    // 不设 orderHintId 指回原单：订单详情 / 对账台的「认领到本单」提示按它找，指回会把钱认回已换人单。
+    expect(receipt.orderHintId).toBeNull();
+    expect(receipt.payerNote).toContain(order.orderNumber);
+    expect(receipt.payerNote).toMatch(/已换人多付，请认领到接手的新单/);
+    expect(await prisma.receipt.count({ where: { orderHintId: order.id } })).toBe(0);
 
     const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
     expect(reloaded.status).toBe(OrderStatus.SWAPPED);
     expect(Number(reloaded.total)).toBe(450);
     expect(Number(reloaded.paidAmount)).toBe(450);
     expect(reloaded.swapFeeCny).toBe(450);
+  });
+
+  it('直客单（填了接手单号）：挂账进账的疑似归属指向接手新单，新单详情据此提示认领', async () => {
+    const customer = await createUser(UserRole.CUSTOMER);
+    const staff = await createUser(UserRole.STAFF);
+    const { order } = await createPaidOrder({ userId: customer.id, totalCny: 1000, paidCny: 1000 });
+    const replacement = await prisma.order.create({
+      data: {
+        orderNumber: `TEST-MS-NEW-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
+        userId: customer.id,
+        status: OrderStatus.PENDING_PAYMENT,
+        subtotal: new Prisma.Decimal(1000),
+        total: new Prisma.Decimal(1000),
+        contactName: '接手客户',
+        contactPhone: '13800138002',
+      },
+    });
+
+    const result = await service.markSwapped(
+      order.id,
+      { swapFeeCny: 450, replacementOrderNumber: replacement.orderNumber },
+      { userId: staff.id, role: UserRole.STAFF },
+    );
+
+    const receiptId = (result.audit.disposal as { receiptId: string }).receiptId;
+    const receipt = await prisma.receipt.findUniqueOrThrow({ where: { id: receiptId } });
+    expect(receipt.orderHintId).toBe(replacement.id);
+    expect(receipt.payerNote).toContain(`请认领到接手订单 ${replacement.orderNumber}`);
+    expect(await prisma.receipt.count({ where: { orderHintId: order.id } })).toBe(0);
+    // 钱只是挂在池里等认领：接手单一分没动。
+    const replacementAfter = await prisma.order.findUniqueOrThrow({ where: { id: replacement.id } });
+    expect(Number(replacementAfter.paidAmount)).toBe(0);
   });
 
   it('欠款：已收 1000、换人费 1650 → 不动钱，应收 1650 已收 1000，欠 650 留在单上', async () => {
