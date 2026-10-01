@@ -50,6 +50,14 @@ vi.spyOn(PricingService.prototype, 'calculatePrice').mockResolvedValue({
 } as unknown as Awaited<ReturnType<PricingService['calculatePrice']>>);
 import { BadRequestError, ForbiddenError } from '../../lib/errors.js';
 
+// 测试里的起飞/入住日一律相对「今天起 30 天后」的 UTC 零点：写死日期会在那天之后
+// 变成「该段已起飞」而无故变红。各日期间隔与原先写死的值一致。
+const TEST_DAY_MS = 24 * 60 * 60 * 1000;
+const TEST_DAY0_MS = Math.floor(Date.now() / TEST_DAY_MS) * TEST_DAY_MS + 30 * TEST_DAY_MS;
+const testDay = (offsetDays: number, hourUtc = 0): Date =>
+  new Date(TEST_DAY0_MS + offsetDays * TEST_DAY_MS + hourUtc * 60 * 60 * 1000);
+
+
 const service = new OrderService();
 const dec = (n: number): Prisma.Decimal => new Prisma.Decimal(n);
 const DAY_MS = 24 * 60 * 60 * 1000;
@@ -66,8 +74,8 @@ const CORRECTION_INPUT = {
   selfServiceCorrection: true,
 } as const;
 
-const OLD_DEPARTURE = new Date('2026-10-01T02:00:00.000Z');
-const NEW_DEPARTURE = new Date('2026-10-03T02:00:00.000Z'); // 当地日 +2 天 → 酒店要平移
+const OLD_DEPARTURE = testDay(0, 2);
+const NEW_DEPARTURE = testDay(2, 2); // 当地日 +2 天 → 酒店要平移
 
 /** 事务内调用留痕：证明「拒了就一个座都没搬」。 */
 const callTrace: string[] = [];
@@ -92,8 +100,8 @@ function mountReschedule(
           description: '四星随机 · 2 晚',
           hotelRoomTypeId: null,
           randomStarTier: 4,
-          hotelCheckIn: new Date('2026-10-01T00:00:00.000Z'),
-          hotelCheckOut: new Date('2026-10-03T00:00:00.000Z'),
+          hotelCheckIn: testDay(0),
+          hotelCheckOut: testDay(2),
           roomsBilled: null,
         },
       ]

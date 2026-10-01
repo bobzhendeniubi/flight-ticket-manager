@@ -46,6 +46,14 @@ import {
 import { PricingService } from '../pricing/pricing.service.js';
 import { BadRequestError, ConflictError, ForbiddenError } from '../../lib/errors.js';
 
+// 测试里的起飞/入住日一律相对「今天起 30 天后」的 UTC 零点：写死日期会在那天之后
+// 变成「该段已起飞」而无故变红。各日期间隔与原先写死的值一致。
+const TEST_DAY_MS = 24 * 60 * 60 * 1000;
+const TEST_DAY0_MS = Math.floor(Date.now() / TEST_DAY_MS) * TEST_DAY_MS + 30 * TEST_DAY_MS;
+const testDay = (offsetDays: number, hourUtc = 0): Date =>
+  new Date(TEST_DAY0_MS + offsetDays * TEST_DAY_MS + hourUtc * 60 * 60 * 1000);
+
+
 const service = new OrderService();
 const dec = (n: number): Prisma.Decimal => new Prisma.Decimal(n);
 
@@ -204,8 +212,8 @@ describe('rescheduleOrderItemAsAgent / reschedulePassengersAsAgent · 入口闸'
 
 // ── 3. 改期事务：代理售后差价在锁内按系统口径算 ───────────────────────────
 describe('rescheduleOrderItem · agentAfterSales 系统差价', () => {
-  const OLD_DEPARTURE = new Date('2026-10-01T02:00:00.000Z');
-  const NEW_DEPARTURE = new Date('2026-10-03T02:00:00.000Z');
+  const OLD_DEPARTURE = testDay(0, 2);
+  const NEW_DEPARTURE = testDay(2, 2);
 
   function mountReschedule(opts: { passengers?: Array<{ pnr?: string | null }> } = {}) {
     const passengers = (opts.passengers ?? [{ pnr: null }]).map((p) => ({
@@ -340,8 +348,8 @@ describe('rescheduleOrderItem · agentAfterSales 系统差价', () => {
 
 // ── 4. 换酒店：代理通道差价按系统口径算 ────────────────────────────────────
 describe('swapItemHotel · 代理系统差价', () => {
-  const FUTURE_IN = new Date('2026-12-01T00:00:00.000Z');
-  const FUTURE_OUT = new Date('2026-12-03T00:00:00.000Z');
+  const FUTURE_IN = testDay(61);
+  const FUTURE_OUT = testDay(63);
 
   function mountTx() {
     const tx = {
