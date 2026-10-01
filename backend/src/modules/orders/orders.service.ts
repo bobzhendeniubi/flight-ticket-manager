@@ -18650,8 +18650,9 @@ export class OrderService {
         }
         // 日历价替换的只是「套餐块」：套餐行 + 机票行 + 建单结算价收敛行 + 自动立减行 + 历次改档
         // 差额行（这几类加起来就是「本单按旧档从头录单的应收」）。单上另行补收/减免的钱——运营事后
-        // 补收的杂费、补房差、升舱差价、补录的地面项、拆单平账……——与档次无关，改档必须一分不动地
-        // 带进新总额；此前这里把日历价当整单最终应收，那些行全被差额行静默抵消（实测：补收 +¥990
+        // 补收的杂费、补房差、升舱差价、补录的地面项……——与档次无关，改档必须一分不动地
+        // 带进新总额（拆单平账行例外：它混着结算价份额，归套餐块，见 sumBundleChangePreservedExtrasCny）；
+        // 此前这里把日历价当整单最终应收，那些行全被差额行静默抵消（实测：补收 +¥990
         // 杂费后改档，总额被砸回日历价，只好再手工补一条）。与非日历通道「只动套餐行那一块」同一语义。
         // 差额行本身属于套餐块（bundleChange 标），所以 Σ 保留行不随改档变化，重复改档不叠加不漂移：
         // 任意次改档后总额恒等于「按当前档从头录单的应收 + 额外调价」。
@@ -18688,6 +18689,12 @@ export class OrderService {
       }
       if (rowMetadata.designatedHotel) {
         warnings.push('原「指定酒店」及其加价已随本次改档清除，请按新档次重新指定酒店');
+      }
+      // 拆单平账行归套餐块、被日历价整体替换（见 sumBundleChangePreservedExtrasCny）：平账行里若混着
+      // 拆单前整单补收的杂费份额，这里分不出来，只能提示运营核对。非日历通道是相对口径，平账行原样带走，
+      // 不存在这个问题，不冒提示。
+      if (pricingSource === 'SETTLEMENT_CALENDAR' && hasSplitBalanceRows(locked.items)) {
+        warnings.push(BUNDLE_CHANGE_SPLIT_BALANCE_WARNING);
       }
       if ((businessSplit.outbound ?? 0) > 0 || (businessSplit.return ?? 0) > 0) {
         warnings.push('本单含升舱，升舱行与占座一律未改动，请人工复核升舱差价是否仍适用新档次');
@@ -26071,16 +26078,23 @@ export function sumBundleChangeDiffCny(
  * 以及建单收敛时已一并折进结算价的其它建单行（独立地面产品行、护照临期附加费——建单那一刻
  * 它们就被 SETTLEMENT 差额行抵消进日历价了，改档不再另收）。
  * 单上另行补收/减免的钱与档次无关，改档必须一分不动地带到新总额里，否则运营事后补收的杂费、
- * 补房差、升舱差价、补录的地面项、拆单平账…全被「日历价 = 最终收多少」一句抹掉。
+ * 补房差、升舱差价、补录的地面项…全被「日历价 = 最终收多少」一句抹掉。
  *
  * 保留（extras）：
- *   · FEE/DISCOUNT 且 metadata.priceAdjustment === true，**除去**套餐块三类
- *     （settlementPrice / settlementDiscount / bundleChange === true）：人工调价四类
+ *   · FEE/DISCOUNT 且 metadata.priceAdjustment === true，**除去**套餐块
+ *     （settlementPrice / settlementDiscount / bundleChange === true / 拆单平账 SPLIT）：人工调价四类
  *     （补收杂费/优惠/变更改期费/其它）、补收单房差与单住拼住开关（ROOM_DIFF）、换人重算
- *     （SWAP_REPRICE）、取消航段手续费、拆单平账（SPLIT）……
+ *     （SWAP_REPRICE）、取消航段手续费……
  *   · UPGRADE_CHANGE：售后升舱差价行（升舱行随改档不动，响应 warnings 提示人工复核）；
  *   · 事后补录的地面项（HOTEL / VISA，metadata.source === 'ORDER_GROUND_ITEM'）。
  * 其余行一律视为套餐块，由日历价整体替换。**新增的售后记账行若要在改档时保留，须在此登记。**
+ *
+ * 拆单平账行（reasonCode SPLIT）为什么归套餐块：拆单时整单 SETTLEMENT 收敛行整条留源单，两侧各补一条
+ * SPLIT 行把 total 收敛到按人份额——这条行里混着「结算价份额」（套餐块，必须被日历价替换）与「拆单前
+ * 整单补收的杂费份额」（额外行，本该保留），凭 metadata 分不开。若当额外行保留，拆过单的代理单改档
+ * 会一侧少收、一侧多收同一个数（评审实测：2 人日历 1918/人拆 1 人后改档 2278/人，新单得 1656、
+ * 源单得 2900，应都是 2278）。归套餐块 = 回到拆单场景下修前的正确结果；拆单前的整单杂费份额由改档
+ * 响应 warnings 提示运营核对（见 hasSplitBalanceRows）。
  * 导出供单测使用。
  */
 export function sumBundleChangePreservedExtrasCny(
@@ -26098,10 +26112,30 @@ export function sumBundleChangePreservedExtrasCny(
     if (meta.settlementPrice === true || meta.settlementDiscount === true || meta.bundleChange === true) {
       return sum;
     }
+    if (meta.reasonCode === 'SPLIT') return sum;
     return sum + amount;
   }, 0);
   return round2(total);
 }
+
+/**
+ * 本单是否带拆单平账行（由拆单产生的新单 / 拆过单的源单都会有，见 createSplitBalanceItem）。
+ * 日历通道改档时据此提示运营：平账行被日历价整体替换，拆单前整单补收的杂费份额无法自动识别。
+ * 导出供单测使用。
+ */
+export function hasSplitBalanceRows(
+  items: ReadonlyArray<{ kind: OrderItemKind; metadata: unknown }>,
+): boolean {
+  return items.some((it) => {
+    if (it.kind !== OrderItemKind.FEE && it.kind !== OrderItemKind.DISCOUNT) return false;
+    const meta = readJsonObject(it.metadata);
+    return meta.priceAdjustment === true && meta.reasonCode === 'SPLIT';
+  });
+}
+
+/** 日历通道改档、单上有拆单平账行时的核对提示（文案固定，前端原样展示）。 */
+export const BUNDLE_CHANGE_SPLIT_BALANCE_WARNING =
+  '本单由拆单产生/拆过单，拆单前整单补收的杂费份额无法自动识别，改档后请核对应收';
 
 /**
  * 改档重新计价所需的套餐字段（与录单 priceAndValidateItems 的 BUNDLE 分支同一组，

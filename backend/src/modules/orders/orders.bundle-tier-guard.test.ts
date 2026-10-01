@@ -44,7 +44,9 @@ vi.mock('../settlement-discounts/settlement-discounts.service.js', () => ({
 }));
 
 import {
+  BUNDLE_CHANGE_SPLIT_BALANCE_WARNING,
   OrderService,
+  hasSplitBalanceRows,
   isSettlementTierStarMismatch,
   resolveHotelSettlementTier,
   sumBundleChangePreservedExtrasCny,
@@ -1074,6 +1076,106 @@ describe('changeOrderBundle · 套餐改档', () => {
       expect(diffRowOf(tx).data.amount).toEqual(new Prisma.Decimal(160));
     });
 
+    /** 终态回读要一份可序列化的最小订单（本批只看 warnings / diff）。 */
+    function mountFinalOrder(totalCny: number) {
+      mockPrisma.order.findUniqueOrThrow.mockResolvedValue({
+        id: 'ord-1',
+        orderNumber: 'FTM-0001',
+        status: 'PAID',
+        currency: 'CNY',
+        total: new Prisma.Decimal(totalCny),
+        subtotal: new Prisma.Decimal(totalCny),
+        taxesAndFees: new Prisma.Decimal(0),
+        discountTotal: new Prisma.Decimal(0),
+        paidAmount: new Prisma.Decimal(0),
+        prepaymentOffset: new Prisma.Decimal(0),
+        adjustmentCny: 0,
+        adjustments: [],
+        items: [],
+        passengers: [],
+        payments: [],
+        refunds: [],
+        statusEvents: [],
+        createdAt: new Date('2026-08-01T00:00:00.000Z'),
+        updatedAt: new Date('2026-08-01T00:00:00.000Z'),
+      });
+    }
+    /** 拆单平账行（源单 +622 / 新单 −622 这一对，见 createSplitBalanceItem）。 */
+    const splitBalanceItem = (amountCny: number) =>
+      plainAdjustmentItem(amountCny, {
+        id: `item-split-${amountCny}`,
+        metadata: { priceAdjustment: true, reasonCode: 'SPLIT', splitFrom: 'FTM-A', splitTo: 'FTM-B', shareCny: 1918 },
+      });
+
+    // 评审实测：2 人日历 1918/人（机票 800+1000、套餐 740、结算收敛 −1244 → 3836），拆 1 人后两侧各 1918：
+    //   源单 = 机票 1800 + 套餐 740 + 结算收敛 −1244（整条留源单）+ SPLIT +622；
+    //   新单 = 机票 1800 + 套餐 740 + SPLIT −622。
+    // 平账行若当额外行保留，改档 3天2晚（2278/人）后源单得 2900、新单得 1656；归套餐块后两侧都是 2278。
+    it('拆过单的源单改档（日历通道）：平账行归套餐块，新总额 = 2278 × 1 人，并提示核对拆单前杂费', async () => {
+      mountOrder({
+        agentId: 'ag-1',
+        total: new Prisma.Decimal(1918),
+        items: [
+          flightItem('item-out', 800),
+          flightItem('item-ret', 1000),
+          onePaxBundle('b-2n'),
+          settlementItem(-1244),
+          splitBalanceItem(622),
+        ],
+      });
+      mountCalendarBundles();
+      const tx = mountTx(2278);
+      mountFinalOrder(2278);
+
+      const res = await service.changeOrderBundle('ord-1', { bundleId: 'b-3n' }, ADMIN);
+
+      expect(diffRowOf(tx).data.amount).toEqual(new Prisma.Decimal(360));
+      const rowUpdate = tx.orderItem.update.mock.calls[0][0] as { data: Record<string, unknown> };
+      expect((rowUpdate.data.metadata as Record<string, unknown>).bundleChange).toMatchObject({
+        calendarTotalCny: 2278,
+        preservedExtrasCny: 0,
+      });
+      expect(res.audit.warnings).toContain(BUNDLE_CHANGE_SPLIT_BALANCE_WARNING);
+    });
+
+    it('拆单产生的新单改档（日历通道）：平账行 −622 同样不保留，新总额 = 2278 × 1 人', async () => {
+      mountOrder({
+        agentId: 'ag-1',
+        total: new Prisma.Decimal(1918),
+        items: [flightItem('item-out', 800), flightItem('item-ret', 1000), onePaxBundle('b-2n'), splitBalanceItem(-622)],
+      });
+      mountCalendarBundles();
+      const tx = mountTx(2278);
+      mountFinalOrder(2278);
+
+      const res = await service.changeOrderBundle('ord-1', { bundleId: 'b-3n' }, ADMIN);
+
+      // 修前：2278 + (−622) = 1656 → 差额 −262；修后差额 = 2278 − 1918 = +360。
+      expect(diffRowOf(tx).data.amount).toEqual(new Prisma.Decimal(360));
+      expect(res.audit.warnings).toContain(BUNDLE_CHANGE_SPLIT_BALANCE_WARNING);
+    });
+
+    it('没拆过单（无平账行）→ 不冒核对提示；非日历通道有平账行也不冒（相对口径原样带走）', async () => {
+      mountOrder({
+        agentId: 'ag-1',
+        total: new Prisma.Decimal(1918),
+        items: [flightItem('item-out', 800), flightItem('item-ret', 1000), onePaxBundle('b-2n'), settlementItem(-622)],
+      });
+      mountCalendarBundles();
+      mountTx(2278);
+      mountFinalOrder(2278);
+      const calendarRes = await service.changeOrderBundle('ord-1', { bundleId: 'b-3n' }, ADMIN);
+      expect(calendarRes.audit.warnings).not.toContain(BUNDLE_CHANGE_SPLIT_BALANCE_WARNING);
+
+      mountOrder({ total: new Prisma.Decimal(4622), items: [bundleItem(), splitBalanceItem(622)] });
+      mountNewBundle();
+      mountTx(5622);
+      mountFinalOrder(5622);
+      const localRes = await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF);
+      expect(localRes.audit.pricingSource).toBe('BUNDLE_PRICE');
+      expect(localRes.audit.warnings).not.toContain(BUNDLE_CHANGE_SPLIT_BALANCE_WARNING);
+    });
+
     it('非日历通道语义不变：并发调价 / 补收行由「原应收 + 套餐行差」天然带走', async () => {
       mountOrder({
         total: new Prisma.Decimal(4990),
@@ -1102,7 +1204,7 @@ describe('changeOrderBundle · 套餐改档', () => {
       metadata: Record<string, unknown> | null,
     ) => ({ kind, amount: new Prisma.Decimal(amountCny), metadata });
 
-    it('套餐块（机票/套餐/结算收敛/立减/改档差额/建单地面行/护照临期费）一律不计', () => {
+    it('套餐块（机票/套餐/结算收敛/立减/改档差额/拆单平账/建单地面行/护照临期费）一律不计', () => {
       expect(
         sumBundleChangePreservedExtrasCny([
           row(OrderItemKind.FLIGHT, 800, null),
@@ -1111,6 +1213,9 @@ describe('changeOrderBundle · 套餐改档', () => {
           row(OrderItemKind.FEE, 30, { priceAdjustment: true, reasonCode: 'SETTLEMENT', settlementPrice: true, perPassenger: true }),
           row(OrderItemKind.DISCOUNT, -200, { priceAdjustment: true, reasonCode: 'DISCOUNT', settlementDiscount: true }),
           row(OrderItemKind.FEE, 360, { priceAdjustment: true, bundleChange: true, reasonCode: 'SETTLEMENT' }),
+          // 拆单平账行混着结算价份额，归套餐块（两侧各一条，正负都有）。
+          row(OrderItemKind.FEE, 622, { priceAdjustment: true, reasonCode: 'SPLIT', splitFrom: 'A', splitTo: 'B' }),
+          row(OrderItemKind.DISCOUNT, -622, { priceAdjustment: true, reasonCode: 'SPLIT', splitFrom: 'A', splitTo: 'B' }),
           // 建单时一起录的独立地面行（无事后补录标）与护照临期附加费（无 priceAdjustment 标）：
           // 建单收敛已把它们折进结算价，改档不再另收。
           row(OrderItemKind.VISA, 350, null),
@@ -1120,7 +1225,7 @@ describe('changeOrderBundle · 套餐改档', () => {
       ).toBe(0);
     });
 
-    it('额外行（人工调价/补房差/换人重算/取消航段费/拆单平账/升舱/补录地面项）逐条相加', () => {
+    it('额外行（人工调价/补房差/换人重算/取消航段费/升舱/补录地面项）逐条相加', () => {
       expect(
         sumBundleChangePreservedExtrasCny([
           row(OrderItemKind.FEE, 990, { priceAdjustment: true, reasonCode: 'MISC_FEE' }),
@@ -1129,12 +1234,24 @@ describe('changeOrderBundle · 套餐改档', () => {
           row(OrderItemKind.DISCOUNT, -100, { priceAdjustment: true, reasonCode: 'ROOM_DIFF' }),
           row(OrderItemKind.FEE, 60, { priceAdjustment: true, reasonCode: 'SWAP_REPRICE', swapReprice: true }),
           row(OrderItemKind.FEE, 300, { priceAdjustment: true, reasonCode: 'RETURN_LEG_CANCEL_FEE', returnLegCancelFee: true }),
-          row(OrderItemKind.FEE, 0.5, { priceAdjustment: true, reasonCode: 'SPLIT' }),
+          row(OrderItemKind.FEE, 0.5, { priceAdjustment: true, reasonCode: 'OTHER', reasonText: '半元尾差' }),
           row(OrderItemKind.UPGRADE_CHANGE, 400, { source: 'CABIN_UPGRADE' }),
           row(OrderItemKind.HOTEL, 500, { source: 'ORDER_GROUND_ITEM' }),
           row(OrderItemKind.VISA, 350, { source: 'ORDER_GROUND_ITEM' }),
         ]),
       ).toBe(2550.5);
+    });
+
+    it('hasSplitBalanceRows：只认 priceAdjustment + reasonCode SPLIT 的 FEE/DISCOUNT 行', () => {
+      expect(hasSplitBalanceRows([row(OrderItemKind.FEE, 622, { priceAdjustment: true, reasonCode: 'SPLIT' })])).toBe(true);
+      expect(hasSplitBalanceRows([row(OrderItemKind.DISCOUNT, -1, { priceAdjustment: true, reasonCode: 'SPLIT' })])).toBe(true);
+      expect(
+        hasSplitBalanceRows([
+          row(OrderItemKind.FEE, 990, { priceAdjustment: true, reasonCode: 'MISC_FEE' }),
+          // 套餐行上拆单留下的 splitRoomGroup 留痕不是平账行。
+          row(OrderItemKind.BUNDLE, 740, { splitRoomGroup: { fromItemId: 'x' }, reasonCode: 'SPLIT' }),
+        ]),
+      ).toBe(false);
     });
 
     it('套餐行自己的 bundleChange 留痕是对象不是 true，不会被当成差额行；金额取整到分', () => {

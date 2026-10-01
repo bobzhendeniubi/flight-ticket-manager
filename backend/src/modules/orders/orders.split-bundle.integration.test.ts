@@ -30,10 +30,11 @@ import {
   PassengerType,
   Prisma,
   ProductKind,
+  SettlementTier,
   UserRole,
 } from '@prisma/client';
 import { prisma } from '../../db/prisma.js';
-import { OrderService } from './orders.service.js';
+import { BUNDLE_CHANGE_SPLIT_BALANCE_WARNING, OrderService } from './orders.service.js';
 
 const service = new OrderService();
 
@@ -58,6 +59,8 @@ async function createSchedule(opts: {
   hoursFromNow: number;
   economySold?: number;
   businessSold?: number;
+  /** 指定出发时刻（结算价日历按出发地当地日取价，日期要钉死）；缺省按 hoursFromNow 算。 */
+  departureTime?: Date;
 }) {
   const flight = await prisma.flight.create({
     data: {
@@ -67,7 +70,7 @@ async function createSchedule(opts: {
       isActive: true,
     },
   });
-  const departureTime = new Date(Date.now() + opts.hoursFromNow * 3600_000);
+  const departureTime = opts.departureTime ?? new Date(Date.now() + opts.hoursFromNow * 3600_000);
   return prisma.flightSchedule.create({
     data: {
       flightId: flight.id,
@@ -135,10 +138,15 @@ async function createBundle(opts: {
   nights: number;
   hotelRoomTypeId: string | null;
   unitPriceCny: number;
+  /** 配了结算价日历键（档次 + 晚数）的套餐：代理单改档走日历通道。 */
+  settlementTier?: SettlementTier;
+  settlementNights?: number;
 }) {
   return prisma.bundle.create({
     data: {
       name: uniq('Bundle'),
+      ...(opts.settlementTier ? { settlementTier: opts.settlementTier } : {}),
+      ...(opts.settlementNights != null ? { settlementNights: opts.settlementNights } : {}),
       items: [
         { kind: 'HOTEL', productName: '酒店', qty: opts.nights, unitPrice: opts.unitPriceCny },
       ] as Prisma.InputJsonValue,
@@ -822,6 +830,198 @@ describe('套餐单拆完之后改档 · 两侧各按各自人数算', () => {
       where: { orderId: result.targetOrderId, kind: OrderItemKind.BUNDLE },
     });
     expect(tgtBundleRows).toBe(1);
+  });
+});
+
+// ══════════════════════════════════════════════════════════════════════════
+// 评审实测（HIGH-1）：代理单走结算价日历改档，拆单平账行（SPLIT）里混着结算价份额，
+// 若被当「额外行」保留，拆过单的两侧改档会一侧少收、一侧多收同一个数。
+describe('代理单拆单后两侧改档 · 日历通道（真 DB）', () => {
+  const OUTBOUND_AT = new Date('2027-03-10T02:00:00.000Z'); // 澳门当地 03-10 10:00
+  const RETURN_AT = new Date('2027-03-11T02:00:00.000Z');
+  const DEPART_YMD = new Date('2027-03-10T00:00:00.000Z');
+
+  /** 2 人代理套餐单：机票 800+1000/人、套餐 740/人、结算收敛到日历价 1918/人 → 应收 3836。 */
+  async function createAgentCalendarOrder() {
+    const agentUser = await prisma.user.create({
+      data: { email: `${uniq('agent')}@test.com`, role: UserRole.AGENT },
+    });
+    const agent = await prisma.agent.create({
+      data: {
+        userId: agentUser.id,
+        companyName: uniq('Agent'),
+        contactName: '联系人',
+        contactPhone: '13900139000',
+        isActive: true,
+      },
+    });
+    await prisma.settlementRate.createMany({
+      data: [
+        { tier: SettlementTier.CITY_4STAR, nights: 1, departDate: DEPART_YMD, pricePerPersonCny: 1918 },
+        { tier: SettlementTier.CITY_4STAR, nights: 2, departDate: DEPART_YMD, pricePerPersonCny: 2278 },
+      ],
+    });
+    const roomType = await createPlaceholderRoomType();
+    const fromBundle = await createBundle({
+      nights: 1,
+      hotelRoomTypeId: roomType.id,
+      unitPriceCny: 740,
+      settlementTier: SettlementTier.CITY_4STAR,
+      settlementNights: 1,
+    });
+    const toBundle = await createBundle({
+      nights: 2,
+      hotelRoomTypeId: roomType.id,
+      unitPriceCny: 900,
+      settlementTier: SettlementTier.CITY_4STAR,
+      settlementNights: 2,
+    });
+    const outbound = await createSchedule({ hoursFromNow: 0, departureTime: OUTBOUND_AT, economySold: 2 });
+    const ret = await createSchedule({ hoursFromNow: 0, departureTime: RETURN_AT, economySold: 2 });
+    const addOns = {
+      singleCount: 0,
+      businessCount: 0,
+      businessCountOutbound: 0,
+      businessCountReturn: 0,
+      adultCount: 2,
+      childCount: 0,
+      infantCount: 0,
+      seatPax: 2,
+      headCount: 2,
+      rooms: 1,
+      nights: 1,
+      legs: 2,
+      singleSupplementCnyPerNight: 300,
+      businessUpgradeCnyPerLeg: 800,
+      childSeatDiscountCnyPerPerson: 500,
+      infantPriceCny: 0,
+      selfProvidedVisaCount: 0,
+      selfProvidedVisa: false,
+      selfVisaDeductCny: 400,
+      singleSupplementTotal: 0,
+      businessUpgradeTotal: 0,
+      childSeatDiscountTotal: 0,
+      infantPriceTotal: 0,
+      selfVisaDeductTotal: 0,
+      total: 0,
+    };
+    const order = await prisma.order.create({
+      data: {
+        orderNumber: uniq('TEST-SPLITCAL'),
+        status: OrderStatus.PAID,
+        agentId: agent.id,
+        subtotal: new Prisma.Decimal(3836),
+        total: new Prisma.Decimal(3836),
+        paidAmount: new Prisma.Decimal(3836),
+        contactName: 'AGENT CALENDAR SPLIT E2E',
+        contactPhone: '13800138000',
+        items: {
+          create: [
+            {
+              kind: OrderItemKind.BUNDLE,
+              description: '四星 2天1晚',
+              quantity: 1,
+              unitPrice: new Prisma.Decimal(740),
+              amount: new Prisma.Decimal(1480),
+              totalCostCny: new Prisma.Decimal(1000),
+              bundleId: fromBundle.id,
+              hotelRoomTypeId: roomType.id,
+              hotelCheckIn: new Date('2027-03-10'),
+              hotelCheckOut: new Date('2027-03-11'),
+              roomsBilled: new Prisma.Decimal(1),
+              metadata: { roomsNeeded: 1, addOns, goDate: '2027-03-10', returnDate: '2027-03-11' } as Prisma.InputJsonValue,
+            },
+            {
+              kind: OrderItemKind.FLIGHT,
+              description: '去程（经济舱）',
+              quantity: 2,
+              unitPrice: new Prisma.Decimal(800),
+              amount: new Prisma.Decimal(1600),
+              totalCostCny: new Prisma.Decimal(1200),
+              flightScheduleId: outbound.id,
+              flightCabin: CabinClass.ECONOMY,
+            },
+            {
+              kind: OrderItemKind.FLIGHT,
+              description: '回程（经济舱）',
+              quantity: 2,
+              unitPrice: new Prisma.Decimal(1000),
+              amount: new Prisma.Decimal(2000),
+              totalCostCny: new Prisma.Decimal(1400),
+              flightScheduleId: ret.id,
+              flightCabin: CabinClass.ECONOMY,
+            },
+            {
+              // 建单结算价收敛行：3836 − (1480 + 1600 + 2000) = −1244。
+              kind: OrderItemKind.DISCOUNT,
+              description: '价格调整：代理结算价（−¥1244）',
+              quantity: 1,
+              unitPrice: new Prisma.Decimal(-1244),
+              amount: new Prisma.Decimal(-1244),
+              totalCostCny: new Prisma.Decimal(0),
+              metadata: { priceAdjustment: true, reasonCode: 'SETTLEMENT', settlementPrice: true } as Prisma.InputJsonValue,
+            },
+          ],
+        },
+        passengers: { create: [passengerData(1), passengerData(2)] },
+      },
+      include: { items: true, passengers: true },
+    });
+    const bundleItem = order.items.find((it) => it.kind === OrderItemKind.BUNDLE)!;
+    const [p1, p2] = order.passengers;
+    await prisma.order.update({
+      where: { id: order.id },
+      data: {
+        roomAssignment: {
+          roomGroups: [
+            { id: 'g1', hotelName: '随机四星', roomType: '双床房', passengerIds: [p1.id, p2.id], roomFraction: 1, orderItemId: bundleItem.id },
+          ],
+        } as Prisma.InputJsonValue,
+      },
+    });
+    return { order, toBundle, p2 };
+  }
+
+  it('拆 1 人后源单与新单各改档 3天2晚：两侧总额都 = 2278 × 1 人，并提示核对拆单前杂费', async () => {
+    const actor = await adminActor();
+    const { order, toBundle, p2 } = await createAgentCalendarOrder();
+
+    const split = await service.splitOrder(
+      order.id,
+      { passengerIds: [p2.id], requestToken: token('cal1'), autoSplitRoomGroups: true },
+      actor,
+    );
+    // 拆后两侧各 1918（按人份额），且两侧都长出一条 SPLIT 平账行。
+    const [srcAfterSplit, tgtAfterSplit] = await Promise.all([
+      prisma.order.findUniqueOrThrow({ where: { id: order.id }, include: { items: true } }),
+      prisma.order.findUniqueOrThrow({ where: { id: split.targetOrderId }, include: { items: true } }),
+    ]);
+    expect(Number(srcAfterSplit.total)).toBe(1918);
+    expect(Number(tgtAfterSplit.total)).toBe(1918);
+    const isSplitRow = (it: { metadata: unknown }) =>
+      (it.metadata as { reasonCode?: string } | null)?.reasonCode === 'SPLIT';
+    expect(srcAfterSplit.items.some(isSplitRow)).toBe(true);
+    expect(tgtAfterSplit.items.some(isSplitRow)).toBe(true);
+
+    const srcChanged = await service.changeOrderBundle(order.id, { bundleId: toBundle.id }, actor);
+    const tgtChanged = await service.changeOrderBundle(split.targetOrderId, { bundleId: toBundle.id }, actor);
+
+    // 修前：源单 2278 + 622 = 2900、新单 2278 − 622 = 1656；修后两侧都是按新档从头录单的 2278。
+    expect(srcChanged.audit.pricingSource).toBe('SETTLEMENT_CALENDAR');
+    expect(tgtChanged.audit.pricingSource).toBe('SETTLEMENT_CALENDAR');
+    expect(Number(srcChanged.audit.after.total)).toBe(2278);
+    expect(Number(tgtChanged.audit.after.total)).toBe(2278);
+    expect(srcChanged.audit.diffCny).toBe(360);
+    expect(tgtChanged.audit.diffCny).toBe(360);
+    expect(srcChanged.audit.warnings).toContain(BUNDLE_CHANGE_SPLIT_BALANCE_WARNING);
+    expect(tgtChanged.audit.warnings).toContain(BUNDLE_CHANGE_SPLIT_BALANCE_WARNING);
+    // 库里的 total 与审计一致。
+    const [srcDb, tgtDb] = await Promise.all([
+      prisma.order.findUniqueOrThrow({ where: { id: order.id } }),
+      prisma.order.findUniqueOrThrow({ where: { id: split.targetOrderId } }),
+    ]);
+    expect(Number(srcDb.total)).toBe(2278);
+    expect(Number(tgtDb.total)).toBe(2278);
   });
 });
 
