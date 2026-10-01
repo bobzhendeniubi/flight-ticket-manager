@@ -3,7 +3,7 @@
  *
  * 覆盖：
  *   - 去程提前一天、回程不动 → 住宿多住一晚（入住提前、离店不动），行价冻结、成本按实住晚数重打快照，
- *     座位从旧班次搬到新班次。
+ *     座位从旧班次搬到新班次。夹具的住宿/包房日期跟着动态班次走（FOLLOW_TRIP 前置闸要求占房行落在原行程内）。
  *   - 新增的那一晚房量不足（包房 1 间、当晚已被另一单占满）→ 整单回滚：机票行仍在旧班次、座位数不动、
  *     住宿日期/成本一个字不改，错误文案指路「整体平移 / 房不动」。
  *
@@ -60,8 +60,25 @@ async function soldCount(scheduleId: string): Promise<number> {
   return sc.sold;
 }
 
-/** 一家酒店 + 标准房（净房价 ¥300/晚）+ 整月只配 1 间包房。 */
-async function createHotelWithOneRoom() {
+/** 班次出发时刻折成出发地（澳门）当地日 YYYY-MM-DD —— 与服务端 FOLLOW_TRIP 锚点同口径。 */
+function macauYmd(at: Date): string {
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Asia/Macau',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(at);
+}
+const ymdDate = (ymd: string): Date => new Date(`${ymd}T00:00:00.000Z`);
+const addDays = (ymd: string, days: number): string =>
+  new Date(ymdDate(ymd).getTime() + days * 86_400_000).toISOString().slice(0, 10);
+
+/**
+ * 一家酒店 + 标准房（净房价 ¥300/晚）+ 覆盖行程前后几天、只配 1 间的包房周期。
+ * 班次是「现在 + N 小时」动态建的，住宿与包房周期都要跟着班次日期走：FOLLOW_TRIP 要求占房行
+ * 落在原行程之内（行前一晚之类的附加住宿会被前置闸拒掉），夹具不能再写死 9/5~9/6。
+ */
+async function createHotelWithOneRoom(block: { fromYmd: string; toYmd: string }) {
   const hotel = await prisma.hotel.create({
     data: { name: uniq('测试酒店'), cityCode: 'DAD', address: 'Test Rd 1', starRating: 4, isActive: true },
   });
@@ -77,8 +94,8 @@ async function createHotelWithOneRoom() {
   await prisma.hotelBlockPeriod.create({
     data: {
       hotelId: hotel.id,
-      dateFrom: new Date('2026-09-01T00:00:00.000Z'),
-      dateTo: new Date('2026-09-30T00:00:00.000Z'),
+      dateFrom: ymdDate(block.fromYmd),
+      dateTo: ymdDate(block.toYmd),
       rooms: 1,
     },
   });
@@ -98,12 +115,14 @@ function passenger(name: string) {
   };
 }
 
-/** 往返 PAID 单：去程 + 回程各 1 座，酒店 9/5~9/6 一晚（成本快照 ¥300 × 1 晚）。 */
+/** 往返 PAID 单：去程 + 回程各 1 座，酒店入住 = 去程日、离店 = 回程日（一晚，成本快照 ¥300 × 1 晚）。 */
 async function createRoundTripOrderWithHotel(opts: {
   outboundScheduleId: string;
   returnScheduleId: string;
   hotelName: string;
   roomTypeId: string;
+  checkInYmd: string;
+  checkOutYmd: string;
 }) {
   return prisma.order.create({
     data: {
@@ -136,13 +155,13 @@ async function createRoundTripOrderWithHotel(opts: {
           },
           {
             kind: OrderItemKind.HOTEL,
-            description: `${opts.hotelName} · 标准房 · 2026-09-05~2026-09-06 · 1晚 × 1间`,
+            description: `${opts.hotelName} · 标准房 · ${opts.checkInYmd}~${opts.checkOutYmd} · 1晚 × 1间`,
             quantity: 1,
             unitPrice: new Prisma.Decimal(500),
             amount: new Prisma.Decimal(500),
             hotelRoomTypeId: opts.roomTypeId,
-            hotelCheckIn: new Date('2026-09-05T00:00:00.000Z'),
-            hotelCheckOut: new Date('2026-09-06T00:00:00.000Z'),
+            hotelCheckIn: ymdDate(opts.checkInYmd),
+            hotelCheckOut: ymdDate(opts.checkOutYmd),
             roomsBilled: new Prisma.Decimal(1),
             unitCostCny: new Prisma.Decimal(300),
             totalCostCny: new Prisma.Decimal(300),
@@ -156,17 +175,22 @@ async function createRoundTripOrderWithHotel(opts: {
 }
 
 describe('rescheduleOrderItem · hotelMode=FOLLOW_TRIP（真 DB）', () => {
-  it('去程提前一天、回程不动 → 住宿 9/4~9/6（1 晚 → 2 晚），行价冻结、成本重打为 ¥300 × 2 晚，座位搬到新班次', async () => {
+  it('去程提前一天、回程不动 → 住宿多住一晚（1 晚 → 2 晚），行价冻结、成本重打为 ¥300 × 2 晚，座位搬到新班次', async () => {
     const actor = await adminActor();
     const outbound = await createSchedule(300);
     const returnLeg = await createSchedule(324);
     const outboundEarlier = await createSchedule(276); // 比原去程早 24h → 出发地当地日 −1 天
-    const { hotel, roomType } = await createHotelWithOneRoom();
+    const checkIn = macauYmd(outbound.departureTime); // 原入住 = 去程日
+    const checkOut = macauYmd(returnLeg.departureTime); // 原离店 = 回程日（次日）
+    const newCheckIn = addDays(checkIn, -1);
+    const { hotel, roomType } = await createHotelWithOneRoom({ fromYmd: addDays(checkIn, -5), toYmd: addDays(checkOut, 5) });
     const order = await createRoundTripOrderWithHotel({
       outboundScheduleId: outbound.id,
       returnScheduleId: returnLeg.id,
       hotelName: hotel.name,
       roomTypeId: roomType.id,
+      checkInYmd: checkIn,
+      checkOutYmd: checkOut,
     });
     const outboundItem = order.items.find((it) => it.flightScheduleId === outbound.id)!;
     const hotelItem = order.items.find((it) => it.kind === OrderItemKind.HOTEL)!;
@@ -183,9 +207,9 @@ describe('rescheduleOrderItem · hotelMode=FOLLOW_TRIP（真 DB）', () => {
 
     // 住宿：入住提前一天、离店不动 → 2 晚；行价/间数冻结；成本按实住晚数重打快照
     const reloaded = await prisma.orderItem.findUniqueOrThrow({ where: { id: hotelItem.id } });
-    expect(reloaded.hotelCheckIn).toEqual(new Date('2026-09-04T00:00:00.000Z'));
-    expect(reloaded.hotelCheckOut).toEqual(new Date('2026-09-06T00:00:00.000Z'));
-    expect(reloaded.description).toBe(`${hotel.name} · 标准房 · 2026-09-04~2026-09-06 · 2晚 × 1间`);
+    expect(reloaded.hotelCheckIn).toEqual(ymdDate(newCheckIn));
+    expect(reloaded.hotelCheckOut).toEqual(ymdDate(checkOut));
+    expect(reloaded.description).toBe(`${hotel.name} · 标准房 · ${newCheckIn}~${checkOut} · 2晚 × 1间`);
     expect(Number(reloaded.amount)).toBe(500);
     expect(Number(reloaded.unitPrice)).toBe(500);
     expect(reloaded.quantity).toBe(1);
@@ -203,29 +227,34 @@ describe('rescheduleOrderItem · hotelMode=FOLLOW_TRIP（真 DB）', () => {
       {
         orderItemId: hotelItem.id,
         mode: 'FOLLOW_TRIP',
-        fromCheckIn: '2026-09-05',
-        toCheckIn: '2026-09-04',
-        fromCheckOut: '2026-09-06',
-        toCheckOut: '2026-09-06',
+        fromCheckIn: checkIn,
+        toCheckIn: newCheckIn,
+        fromCheckOut: checkOut,
+        toCheckOut: checkOut,
         fromNights: 1,
         toNights: 2,
       },
     ]);
   });
 
-  it('新增的那一晚房量不足（包房 1 间、9/4 已被另一单占满）→ 整单回滚：座位、机票行、住宿日期、成本全部不动', async () => {
+  it('新增的那一晚房量不足（包房 1 间、前一晚已被另一单占满）→ 整单回滚：座位、机票行、住宿日期、成本全部不动', async () => {
     const actor = await adminActor();
     const outbound = await createSchedule(300);
     const returnLeg = await createSchedule(324);
     const outboundEarlier = await createSchedule(276);
-    const { hotel, roomType } = await createHotelWithOneRoom();
+    const checkIn = macauYmd(outbound.departureTime);
+    const checkOut = macauYmd(returnLeg.departureTime);
+    const newCheckIn = addDays(checkIn, -1);
+    const { hotel, roomType } = await createHotelWithOneRoom({ fromYmd: addDays(checkIn, -5), toYmd: addDays(checkOut, 5) });
     const order = await createRoundTripOrderWithHotel({
       outboundScheduleId: outbound.id,
       returnScheduleId: returnLeg.id,
       hotelName: hotel.name,
       roomTypeId: roomType.id,
+      checkInYmd: checkIn,
+      checkOutYmd: checkOut,
     });
-    // 另一张纯酒店单把 9/4 那一晚唯一的一间占掉。
+    // 另一张纯酒店单把前一晚（新入住那晚）唯一的一间占掉。
     await prisma.order.create({
       data: {
         orderNumber: uniq('ORD'),
@@ -239,13 +268,13 @@ describe('rescheduleOrderItem · hotelMode=FOLLOW_TRIP（真 DB）', () => {
           create: [
             {
               kind: OrderItemKind.HOTEL,
-              description: `${hotel.name} · 标准房 · 2026-09-04~2026-09-05 · 1晚 × 1间`,
+              description: `${hotel.name} · 标准房 · ${newCheckIn}~${checkIn} · 1晚 × 1间`,
               quantity: 1,
               unitPrice: new Prisma.Decimal(500),
               amount: new Prisma.Decimal(500),
               hotelRoomTypeId: roomType.id,
-              hotelCheckIn: new Date('2026-09-04T00:00:00.000Z'),
-              hotelCheckOut: new Date('2026-09-05T00:00:00.000Z'),
+              hotelCheckIn: ymdDate(newCheckIn),
+              hotelCheckOut: ymdDate(checkIn),
               roomsBilled: new Prisma.Decimal(1),
             },
           ],
@@ -270,9 +299,9 @@ describe('rescheduleOrderItem · hotelMode=FOLLOW_TRIP（真 DB）', () => {
     const flightRow = await prisma.orderItem.findUniqueOrThrow({ where: { id: outboundItem.id } });
     expect(flightRow.flightScheduleId).toBe(outbound.id);
     const hotelRow = await prisma.orderItem.findUniqueOrThrow({ where: { id: hotelItem.id } });
-    expect(hotelRow.hotelCheckIn).toEqual(new Date('2026-09-05T00:00:00.000Z'));
-    expect(hotelRow.hotelCheckOut).toEqual(new Date('2026-09-06T00:00:00.000Z'));
+    expect(hotelRow.hotelCheckIn).toEqual(ymdDate(checkIn));
+    expect(hotelRow.hotelCheckOut).toEqual(ymdDate(checkOut));
     expect(Number(hotelRow.totalCostCny)).toBe(300);
-    expect(hotelRow.description).toBe(`${hotel.name} · 标准房 · 2026-09-05~2026-09-06 · 1晚 × 1间`);
+    expect(hotelRow.description).toBe(`${hotel.name} · 标准房 · ${checkIn}~${checkOut} · 1晚 × 1间`);
   });
 });

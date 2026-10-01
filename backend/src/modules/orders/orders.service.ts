@@ -11180,7 +11180,10 @@ export class OrderService {
         flightScheduleId: true,
         flightCabin: true,
         metadata: true,
-        flightSchedule: { select: { departureTime: true, departureTz: true } },
+        // flight.originCode：FOLLOW_TRIP 判「前两段同方向」用（同日同出发地）。
+        flightSchedule: {
+          select: { departureTime: true, departureTz: true, flight: { select: { originCode: true } } },
+        },
       } as const;
       const item = input.orderItemId
         ? await tx.orderItem.findUnique({ where: { id: input.orderItemId }, select: itemSelect })
@@ -11456,7 +11459,9 @@ export class OrderService {
           select: {
             id: true,
             flightScheduleId: true,
-            flightSchedule: { select: { departureTime: true, departureTz: true } },
+            flightSchedule: {
+              select: { departureTime: true, departureTz: true, flight: { select: { originCode: true } } },
+            },
           },
         });
         const rowsBefore = legItemsBefore.map((row) =>
@@ -11516,6 +11521,18 @@ export class OrderService {
             ? localDateISO(row.flightSchedule.departureTime, row.flightSchedule.departureTz)
             : null;
         const legsAfter = determineFlightLegItems(legItemsBefore);
+        // FOLLOW_TRIP 只在「恰好一去一回」的单上有定义：determineFlightLegItems 只认按时刻排序的前两段，
+        // 多于两条航段行 / 前两段同方向（同班次或同日同出发地）时「去程 / 回程」本身就判不准，
+        // 锚点一错整单住宿全排错。改期前后两份航段都查（改完的那一段可能恰好与另一段撞成同方向）。
+        if (hotelMode === 'FOLLOW_TRIP') {
+          const ambiguity =
+            describeFollowTripLegAmbiguity(rowsBefore) ?? describeFollowTripLegAmbiguity(legItemsBefore);
+          if (ambiguity) {
+            throw new BadRequestError(
+              `${ambiguity}，无法判定去程与回程，不能按新行程重排住宿；请选「整体平移」或「房不动」后再改期。`,
+            );
+          }
+        }
         const followAnchors =
           hotelMode === 'FOLLOW_TRIP'
             ? {
@@ -11561,6 +11578,21 @@ export class OrderService {
             })
           ) // 防御性复筛（与 where 同条件）：单测 mock 的 findMany 不认 where，会把机票行也吐回来
             .filter((r) => r.hotelCheckIn && (r.hotelRoomTypeId || r.randomStarTier != null));
+          // FOLLOW_TRIP 假定占房行首尾相接、整段落在原行程之内（planFollowTripHotelStay 只在窗口两头伸缩）。
+          // 行程外的附加住宿（补录的行前一晚 / 回程后多住）或各行之间有空档的单，两头伸缩会把它们
+          // 拉错位，直接拒掉指路另外两种口径——附加住宿请用酒店改期单独调。
+          if (followTrip) {
+            const gap = findFollowTripStayGap(
+              hotelRows.map((r) => ({ id: r.id, hotelCheckIn: r.hotelCheckIn!, hotelCheckOut: r.hotelCheckOut })),
+              followTrip,
+            );
+            if (gap) {
+              throw new BadRequestError(
+                `本单有行程外的附加住宿（${gap}），无法自动按新行程重排，` +
+                  '请选「整体平移」或「房不动」后再用酒店改期单独调整。',
+              );
+            }
+          }
           // 逐行目标日期：FOLLOW_TRIP 按行程锚点重排（分段住只在两头伸缩），否则整体平移。
           // shifted 收全部占房行（含没变的行）：下面 §五闸的 nextOrderItems 是「给了就整单整酒店覆盖」，
           // 漏掉同酒店没变的行会把它的占用算漏；真正落库/解绑/审计只碰 changed 的行。
@@ -27045,6 +27077,74 @@ export function planFollowTripHotelStay(
             : r.hotelCheckOut,
     };
   });
+}
+
+/**
+ * FOLLOW_TRIP 的航段前置闸：返回「为什么判不出去程/回程」的一句话，null = 恰好一去一回、可以重排。
+ *   · 有效航段（有班次、有出发时刻）多于两条；
+ *   · 恰好两条但同方向：同一班次，或同一出发地当地日 + 同一出发地（两头 originCode 都有才比）。
+ * 导出供单测使用。
+ */
+export function describeFollowTripLegAmbiguity(
+  rows: ReadonlyArray<{
+    flightScheduleId: string | null;
+    flightSchedule: {
+      departureTime: Date | string;
+      departureTz?: string | null;
+      flight?: { originCode?: string | null } | null;
+    } | null;
+  }>,
+): string | null {
+  const legs = rows.filter((r) => r.flightScheduleId && r.flightSchedule?.departureTime);
+  if (legs.length > 2) return `本单有 ${legs.length} 条航段行`;
+  if (legs.length < 2) return null;
+  const [a, b] = legs as [typeof legs[number], typeof legs[number]];
+  if (a.flightScheduleId === b.flightScheduleId) return '前两段航段是同一班次';
+  const dayOf = (r: typeof a): string =>
+    localDateISO(new Date(r.flightSchedule!.departureTime), r.flightSchedule!.departureTz);
+  const originA = a.flightSchedule?.flight?.originCode ?? null;
+  const originB = b.flightSchedule?.flight?.originCode ?? null;
+  if (originA && originB && originA === originB && dayOf(a) === dayOf(b)) {
+    return `前两段航段同方向（同日 ${dayOf(a)} 同出发地 ${originA}）`;
+  }
+  return null;
+}
+
+/**
+ * FOLLOW_TRIP 的住宿前置闸：占房行必须整段落在原行程之内且首尾相接，返回不满足的那一处（人话），
+ * null = 可以按新行程重排。
+ *   · 任一行入住早于原去程当地日 / 离店晚于原回程当地日 → 行程外的附加住宿；
+ *   · 按入住日排序后，下一行的入住晚于此前各行覆盖到的最晚离店 → 行与行之间有空档。
+ * 重叠（同一晚两家酒店各占一间）不算空档。无离店日期的行按只占入住当晚算。
+ * 导出供单测使用。
+ */
+export function findFollowTripStayGap(
+  rows: ReadonlyArray<{ id: string; hotelCheckIn: Date; hotelCheckOut: Date | null }>,
+  anchors: Pick<FollowTripAnchors, 'fromOutbound' | 'fromReturn'>,
+): string | null {
+  const stays = rows
+    .map((r) => ({
+      checkIn: formatDateOnly(r.hotelCheckIn),
+      checkOut: r.hotelCheckOut ? formatDateOnly(r.hotelCheckOut) : null,
+    }))
+    .sort((a, b) => a.checkIn.localeCompare(b.checkIn));
+  for (const s of stays) {
+    if (s.checkIn < anchors.fromOutbound) {
+      return `入住 ${s.checkIn} 早于原去程日 ${anchors.fromOutbound}`;
+    }
+    if (s.checkOut && s.checkOut > anchors.fromReturn) {
+      return `离店 ${s.checkOut} 晚于原回程日 ${anchors.fromReturn}`;
+    }
+  }
+  let coveredTo: string | null = null;
+  for (const s of stays) {
+    if (coveredTo != null && s.checkIn > coveredTo) {
+      return `${coveredTo} 离店与 ${s.checkIn} 入住之间不连续`;
+    }
+    const end = s.checkOut ?? addDaysToYmd(s.checkIn, 1);
+    if (coveredTo == null || end > coveredTo) coveredTo = end;
+  }
+  return null;
 }
 
 /**

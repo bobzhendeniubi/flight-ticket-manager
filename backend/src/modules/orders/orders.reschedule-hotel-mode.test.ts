@@ -52,7 +52,12 @@ vi.mock('../../queues/queue.js', () => ({
   scheduleSeatHoldRelease: vi.fn(),
 }));
 
-import { OrderService, planFollowTripHotelStay } from './orders.service.js';
+import {
+  OrderService,
+  describeFollowTripLegAmbiguity,
+  findFollowTripStayGap,
+  planFollowTripHotelStay,
+} from './orders.service.js';
 import { ForbiddenError } from '../../lib/errors.js';
 
 const ADMIN = { userId: 'admin1', role: 'ADMIN' } as const;
@@ -89,7 +94,13 @@ function fakeFullOrder() {
   };
 }
 
-type Leg = { id: string; scheduleId: string; departIso: string };
+type Leg = { id: string; scheduleId: string; departIso: string; originCode?: string };
+/** 班次快照：带 originCode 时挂 flight（FOLLOW_TRIP 判「同日同出发地」用）。 */
+const schedOf = (departIso: string, originCode?: string) => ({
+  departureTime: new Date(departIso),
+  departureTz: null,
+  ...(originCode ? { flight: { originCode } } : {}),
+});
 type HotelRow = {
   id: string;
   kind: 'HOTEL' | 'BUNDLE';
@@ -152,7 +163,7 @@ function mount(opts: {
     flightScheduleId: target.scheduleId,
     flightCabin: 'ECONOMY',
     metadata: {},
-    flightSchedule: { departureTime: new Date(target.departIso), departureTz: null },
+    flightSchedule: schedOf(target.departIso, target.originCode),
   });
   mockPrisma.orderItem.findMany.mockReset().mockImplementation(
     async (args: { where?: { kind?: string; hotelCheckIn?: unknown } }) => {
@@ -164,13 +175,13 @@ function mount(opts: {
               id: l.id,
               flightScheduleId: 'sched-new',
               metadata: {},
-              flightSchedule: { departureTime: new Date(opts.newDepartIso), departureTz: null },
+              flightSchedule: schedOf(opts.newDepartIso, l.originCode),
             }
           : {
               id: l.id,
               flightScheduleId: l.scheduleId,
               metadata: {},
-              flightSchedule: { departureTime: new Date(l.departIso), departureTz: null },
+              flightSchedule: schedOf(l.departIso, l.originCode),
             },
       );
     },
@@ -484,6 +495,201 @@ describe('rescheduleOrderItem · hotelMode=FOLLOW_TRIP（房跟着新行程走�
       ),
     ).rejects.toBeInstanceOf(ForbiddenError);
     expect(mockPrisma.$transaction).not.toHaveBeenCalled();
+  });
+});
+
+describe('rescheduleOrderItem · FOLLOW_TRIP 前置闸（航段判不出去回程 / 行程外附加住宿 → 400 指路）', () => {
+  const expectNoHotelWrite = () => expect(itemWrite('hot1')).toBeUndefined();
+
+  it('多于两条航段行 → 400「本单有 3 条航段行…请选整体平移或房不动」，住宿一个字段都不写', async () => {
+    const service = newService();
+    mount({
+      legsBefore: [
+        ...ROUND_TRIP,
+        { id: 'fl-extra', scheduleId: 'sched-extra', departIso: '2027-09-24T02:00:00.000Z' },
+      ],
+      targetItemId: 'fl-out',
+      newDepartIso: '2027-09-21T02:00:00.000Z',
+      hotelRows: [HOTEL_ROW()],
+    });
+
+    await expect(
+      service.rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'fl-out', newScheduleId: 'sched-new', hotelMode: 'FOLLOW_TRIP' },
+        ADMIN,
+      ),
+    ).rejects.toThrow(/本单有 3 条航段行.*无法判定去程与回程.*整体平移.*房不动/);
+    expectNoHotelWrite();
+  });
+
+  it('两段同日同出发地（同方向）→ 400；改期后才撞成同方向同样拒', async () => {
+    const service = newService();
+    // 改期前：去程 22 MFM、回程 23 DAD（正常）；把回程改到 22 日从 MFM 起飞 → 两段同日同出发地。
+    mount({
+      legsBefore: [
+        { id: 'fl-out', scheduleId: 'sched-out', departIso: '2027-09-22T02:00:00.000Z', originCode: 'MFM' },
+        { id: 'fl-ret', scheduleId: 'sched-ret', departIso: '2027-09-23T02:00:00.000Z', originCode: 'MFM' },
+      ],
+      targetItemId: 'fl-ret',
+      newDepartIso: '2027-09-22T10:00:00.000Z',
+      hotelRows: [HOTEL_ROW()],
+    });
+
+    await expect(
+      service.rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'fl-ret', newScheduleId: 'sched-new', hotelMode: 'FOLLOW_TRIP' },
+        ADMIN,
+      ),
+    ).rejects.toThrow(/同方向（同日 2027-09-22 同出发地 MFM）/);
+    expectNoHotelWrite();
+  });
+
+  it('同样三条航段行、缺省 SHIFT → 不受这道闸约束，照旧整体平移', async () => {
+    const service = newService();
+    mount({
+      legsBefore: [
+        ...ROUND_TRIP,
+        { id: 'fl-extra', scheduleId: 'sched-extra', departIso: '2027-09-24T02:00:00.000Z' },
+      ],
+      targetItemId: 'fl-out',
+      newDepartIso: '2027-09-21T02:00:00.000Z',
+      hotelRows: [HOTEL_ROW()],
+    });
+
+    const result = await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'fl-out', newScheduleId: 'sched-new' },
+      ADMIN,
+    );
+    expect(itemWrite('hot1')?.hotelCheckIn).toEqual(day('2027-09-21'));
+    expect(result.audit.hotelDateSync[0]).toMatchObject({ mode: 'SHIFT', fromNights: 1, toNights: 1 });
+  });
+
+  it('补录的行前一晚（入住早于原去程日）→ 400「行程外的附加住宿」，指路酒店改期单独调', async () => {
+    const service = newService();
+    mount({
+      legsBefore: ROUND_TRIP,
+      targetItemId: 'fl-out',
+      newDepartIso: '2027-09-21T02:00:00.000Z',
+      hotelRows: [
+        HOTEL_ROW(),
+        HOTEL_ROW({ id: 'hot0', hotelCheckIn: day('2027-09-21'), hotelCheckOut: day('2027-09-22') }),
+      ],
+    });
+
+    await expect(
+      service.rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'fl-out', newScheduleId: 'sched-new', hotelMode: 'FOLLOW_TRIP' },
+        ADMIN,
+      ),
+    ).rejects.toThrow(/行程外的附加住宿（入住 2027-09-21 早于原去程日 2027-09-22）.*酒店改期单独调整/);
+    expectNoHotelWrite();
+    expect(itemWrite('hot0')).toBeUndefined();
+  });
+
+  it('各占房行之间不连续（22~23 与 24~26 中间空一晚）→ 400', async () => {
+    const service = newService();
+    mount({
+      legsBefore: [
+        ROUND_TRIP[0],
+        { id: 'fl-ret', scheduleId: 'sched-ret', departIso: '2027-09-26T02:00:00.000Z' },
+      ],
+      targetItemId: 'fl-ret',
+      newDepartIso: '2027-09-27T02:00:00.000Z',
+      hotelRows: [
+        HOTEL_ROW(),
+        HOTEL_ROW({ id: 'hot2', hotelCheckIn: day('2027-09-24'), hotelCheckOut: day('2027-09-26') }),
+      ],
+    });
+
+    await expect(
+      service.rescheduleOrderItem(
+        'ord1',
+        { orderItemId: 'fl-ret', newScheduleId: 'sched-new', hotelMode: 'FOLLOW_TRIP' },
+        ADMIN,
+      ),
+    ).rejects.toThrow(/2027-09-23 离店与 2027-09-24 入住之间不连续/);
+    expectNoHotelWrite();
+  });
+
+  it('分段住首尾相接（22~23 + 23~25）→ 放行：回程 25 → 26 只拉长末段', async () => {
+    const service = newService();
+    mount({
+      legsBefore: [
+        ROUND_TRIP[0],
+        { id: 'fl-ret', scheduleId: 'sched-ret', departIso: '2027-09-25T02:00:00.000Z' },
+      ],
+      targetItemId: 'fl-ret',
+      newDepartIso: '2027-09-26T02:00:00.000Z',
+      hotelRows: [
+        HOTEL_ROW(),
+        HOTEL_ROW({
+          id: 'hot2',
+          description: '市区酒店 · 标准房 · 2027-09-23~2027-09-25 · 2晚 × 1间',
+          hotelCheckIn: day('2027-09-23'),
+          hotelCheckOut: day('2027-09-25'),
+        }),
+      ],
+    });
+
+    const result = await service.rescheduleOrderItem(
+      'ord1',
+      { orderItemId: 'fl-ret', newScheduleId: 'sched-new', hotelMode: 'FOLLOW_TRIP' },
+      ADMIN,
+    );
+    expect(itemWrite('hot1')).toBeUndefined();
+    expect(itemWrite('hot2')?.hotelCheckOut).toEqual(day('2027-09-26'));
+    expect(result.audit.hotelDateSync.map((s) => s.orderItemId)).toEqual(['hot2']);
+  });
+});
+
+describe('describeFollowTripLegAmbiguity / findFollowTripStayGap（纯函数）', () => {
+  const leg = (id: string, iso: string, origin?: string) => ({
+    flightScheduleId: id,
+    flightSchedule: { departureTime: new Date(iso), departureTz: 'Asia/Macau', ...(origin ? { flight: { originCode: origin } } : {}) },
+  });
+
+  it('恰好一去一回 → null；三条 → 条数；同班次 → 同一班次；同日同出发地 → 同方向；缺 originCode 不比方向', () => {
+    expect(describeFollowTripLegAmbiguity([leg('a', '2027-09-22T02:00:00Z', 'MFM'), leg('b', '2027-09-23T02:00:00Z', 'DAD')])).toBeNull();
+    expect(
+      describeFollowTripLegAmbiguity([leg('a', '2027-09-22T02:00:00Z'), leg('b', '2027-09-23T02:00:00Z'), leg('c', '2027-09-24T02:00:00Z')]),
+    ).toBe('本单有 3 条航段行');
+    expect(describeFollowTripLegAmbiguity([leg('a', '2027-09-22T02:00:00Z'), leg('a', '2027-09-22T02:00:00Z')])).toBe('前两段航段是同一班次');
+    expect(describeFollowTripLegAmbiguity([leg('a', '2027-09-22T02:00:00Z', 'MFM'), leg('b', '2027-09-22T10:00:00Z', 'MFM')])).toMatch(/同方向/);
+    // 同日但出发地不同（去 MFM→DAD、回 DAD→MFM 同一天）不是同方向；缺 originCode 时不比。
+    expect(describeFollowTripLegAmbiguity([leg('a', '2027-09-22T02:00:00Z', 'MFM'), leg('b', '2027-09-22T10:00:00Z', 'DAD')])).toBeNull();
+    expect(describeFollowTripLegAmbiguity([leg('a', '2027-09-22T02:00:00Z'), leg('b', '2027-09-22T10:00:00Z')])).toBeNull();
+    // 无班次的行（no-show 释放 / 取消航段）不算有效航段。
+    expect(
+      describeFollowTripLegAmbiguity([
+        leg('a', '2027-09-22T02:00:00Z'),
+        leg('b', '2027-09-23T02:00:00Z'),
+        { flightScheduleId: null, flightSchedule: null },
+      ]),
+    ).toBeNull();
+  });
+
+  it('住宿落在行程内且首尾相接（含重叠）→ null；行前一晚 / 回程后多住 / 中间空档 → 指出那一处', () => {
+    const anchors = { fromOutbound: '2027-09-22', fromReturn: '2027-09-25' };
+    const row = (id: string, ci: string, co: string | null) => ({ id, hotelCheckIn: day(ci), hotelCheckOut: co ? day(co) : null });
+    expect(findFollowTripStayGap([row('a', '2027-09-22', '2027-09-25')], anchors)).toBeNull();
+    expect(findFollowTripStayGap([row('a', '2027-09-22', '2027-09-23'), row('b', '2027-09-23', '2027-09-25')], anchors)).toBeNull();
+    // 同一晚两家酒店各占一间（重叠）不算空档；酒店比行程短（次日入住 / 提前离店）也放行。
+    expect(findFollowTripStayGap([row('a', '2027-09-22', '2027-09-24'), row('b', '2027-09-23', '2027-09-25')], anchors)).toBeNull();
+    expect(findFollowTripStayGap([row('a', '2027-09-23', '2027-09-24')], anchors)).toBeNull();
+    expect(findFollowTripStayGap([row('a', '2027-09-21', '2027-09-22'), row('b', '2027-09-22', '2027-09-25')], anchors)).toBe(
+      '入住 2027-09-21 早于原去程日 2027-09-22',
+    );
+    expect(findFollowTripStayGap([row('a', '2027-09-22', '2027-09-26')], anchors)).toBe('离店 2027-09-26 晚于原回程日 2027-09-25');
+    expect(findFollowTripStayGap([row('a', '2027-09-22', '2027-09-23'), row('b', '2027-09-24', '2027-09-25')], anchors)).toBe(
+      '2027-09-23 离店与 2027-09-24 入住之间不连续',
+    );
+    // 无离店日期的行按只占入住当晚算：22（1 晚）→ 23 入住接得上。
+    expect(findFollowTripStayGap([row('a', '2027-09-22', null), row('b', '2027-09-23', '2027-09-25')], anchors)).toBeNull();
+    expect(findFollowTripStayGap([], anchors)).toBeNull();
   });
 });
 
