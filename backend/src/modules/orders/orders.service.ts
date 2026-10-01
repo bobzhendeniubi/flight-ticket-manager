@@ -18512,7 +18512,8 @@ export class OrderService {
     if (!newBundle.isActive) throw new BadRequestError('目标套餐已下架');
     const oldBundle = await prisma.bundle.findUnique({
       where: { id: previewPick.bundleId },
-      select: { id: true, name: true, settlementTier: true, settlementNights: true },
+      // hotelNights / items：算旧档晚数（与改期延住后的实住晚数比对，见下方 warnings）。
+      select: { id: true, name: true, settlementTier: true, settlementNights: true, hotelNights: true, items: true },
     });
 
     // ── 1. 事务：锁 → 重读 → 计价 → 房量闸 → 换绑 + 差额行 + 总额收敛 + 签证任务对齐 ──
@@ -18701,6 +18702,34 @@ export class OrderService {
       }
       if (!priced.hotelStamp && newBundle.hotelRoomTypeId) {
         warnings.push('未能推导出新的住宿区间（缺出发日期），住宿日期未盖章，请人工补录');
+      }
+      // 改期「房跟着新行程走」延住/缩住过的单：套餐行实住晚数（按日期派生）≠ 旧档晚数。改档会用
+      // 出发日 + 新档晚数把住宿区间整体重盖（1b），延住的那几晚会被盖掉；而改期费里可能已经含了
+      // 房费，再按新档收一次就是重复。不拒绝（改档本身是运营要做的事），把两件事明明白白列出来核对。
+      const currentStayNights =
+        bundleRow.hotelCheckIn && bundleRow.hotelCheckOut
+          ? buildStayNightDates(bundleRow.hotelCheckIn, bundleRow.hotelCheckOut).length
+          : 0;
+      const oldTierNights = oldBundle
+        ? oldBundle.settlementNights ?? resolveBundleNights(oldBundle.items, oldBundle.hotelNights)
+        : null;
+      if (currentStayNights > 0 && oldTierNights != null && currentStayNights !== oldTierNights) {
+        const newRange = priced.hotelStamp
+          ? `${formatDateOnly(priced.hotelStamp.hotelCheckIn)}~${formatDateOnly(priced.hotelStamp.hotelCheckOut)}`
+          : departYmd
+            ? `${departYmd}~${addDaysToYmd(departYmd, priced.nights)}`
+            : '（缺出发日期，住宿区间未盖章）';
+        const rescheduleFees = readOrderAdjustments(locked.adjustments).filter(
+          (e) => e.type === 'RESCHEDULE_FEE' && Number.isFinite(Number(e.amountCny)),
+        );
+        const rescheduleFeeCny = round2(rescheduleFees.reduce((sum, e) => sum + Number(e.amountCny), 0));
+        warnings.push(
+          `本单套餐行当前实住 ${currentStayNights} 晚（${formatDateOnly(bundleRow.hotelCheckIn!)}~${formatDateOnly(bundleRow.hotelCheckOut!)}），` +
+            `与原档 ${oldTierNights} 晚不一致（曾按新行程重排住宿）：改档后将按新档 ${priced.nights} 晚重盖为 ${newRange}，请核对住宿日期。` +
+            (rescheduleFees.length > 0
+              ? `本单已收改期费 ${rescheduleFees.length} 笔合计 ¥${rescheduleFeeCny}，改期费里若已含房费，请核对是否重复收取。`
+              : '本单未记录改期费流水。'),
+        );
       }
       // 房量变化提示：改档按新档次的容量重算 roomsBilled（priced.rooms 按人头算整间），
       // 拆单/分房留下的半间会被这一步抹平 —— 房控板上的占用会跟着跳，房控得知道为什么。

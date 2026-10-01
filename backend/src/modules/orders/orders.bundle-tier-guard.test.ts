@@ -552,7 +552,7 @@ describe('changeOrderBundle · 套餐改档', () => {
         findUnique: vi.fn(async () => ({
           ...snapshot,
           subtotal: snapshot.total,
-          adjustments: [],
+          adjustments: snapshot.adjustments ?? [],
         })),
         update: vi.fn(async () => ({})),
       },
@@ -680,6 +680,46 @@ describe('changeOrderBundle · 套餐改档', () => {
     const res = await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF);
     return res.audit.warnings.join();
   };
+
+  it('改期延住后再改档：实住 3 晚 ≠ 旧档 2 晚 → warnings 列出重盖区间与已收改期费，不拒绝', async () => {
+    mountOrder({
+      // 曾按新行程重排延住一晚：09-01 ~ 09-04 实住 3 晚，旧档（b-3star）是 2 晚。
+      items: [bundleItem({ hotelCheckOut: new Date('2026-09-04T00:00:00.000Z') })],
+      adjustments: [
+        { type: 'RESCHEDULE_FEE', label: '改期差价', amountCny: 300, at: '2026-08-20T00:00:00.000Z', by: 'u1' },
+        { type: 'PRICE_ADJUSTMENT', label: '价格调整', amountCny: 50, at: '2026-08-21T00:00:00.000Z', by: 'u1' },
+        { type: 'RESCHEDULE_FEE', label: '改期差价', amountCny: 120, at: '2026-08-22T00:00:00.000Z', by: 'u1' },
+      ],
+    });
+    mountNewBundle();
+    const tx = mountTx(5000);
+    mockPrisma.order.findUniqueOrThrow.mockResolvedValue({
+      id: 'ord-1', orderNumber: 'FTM-0001', status: 'PAID', currency: 'CNY',
+      total: new Prisma.Decimal(5000), subtotal: new Prisma.Decimal(5000),
+      taxesAndFees: new Prisma.Decimal(0), discountTotal: new Prisma.Decimal(0),
+      paidAmount: new Prisma.Decimal(0), prepaymentOffset: new Prisma.Decimal(0),
+      adjustmentCny: 0, adjustments: [], items: [], passengers: [], payments: [], refunds: [], statusEvents: [],
+      createdAt: new Date('2026-08-01T00:00:00.000Z'), updatedAt: new Date('2026-08-01T00:00:00.000Z'),
+    });
+
+    const res = await service.changeOrderBundle('ord-1', { bundleId: 'b-4star' }, STAFF);
+
+    const text = res.audit.warnings.join('\n');
+    expect(text).toContain('当前实住 3 晚（2026-09-01~2026-09-04）');
+    expect(text).toContain('与原档 2 晚不一致');
+    // 新档不绑房型 → 区间按出发日（酒店入住日 09-01）+ 新档 2 晚推导。
+    expect(text).toContain('按新档 2 晚重盖为 2026-09-01~2026-09-03');
+    // 只汇总 RESCHEDULE_FEE：300 + 120，PRICE_ADJUSTMENT 那 50 不算。
+    expect(text).toContain('已收改期费 2 笔合计 ¥420');
+    expect(text).toContain('请核对是否重复收取');
+    // 不拒绝：改档照常落库。
+    expect(tx.orderItem.update).toHaveBeenCalled();
+    expect(tx.order.update).toHaveBeenCalled();
+  });
+
+  it('实住晚数与旧档一致 → 不冒延住核对提示', async () => {
+    expect(await warningsOf(1)).not.toContain('当前实住');
+  });
 
   it('改档抹平了拆单留下的半间 → 响应 warnings 提示房控核对房量（M5）', async () => {
     // 拆单后套餐行占 0.5 间；改档按新档容量重算成整间（2 人 → 1 间），房控板上的占用会跳。
