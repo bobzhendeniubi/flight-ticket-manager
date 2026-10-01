@@ -280,3 +280,45 @@ describe('账目闸：不能绕过端点直接把状态翻成「已换人」', (
     expect(mockTx.order.updateMany).not.toHaveBeenCalled();
   });
 });
+
+describe('已换人 = 真终态：任何来源为 SWAPPED 的状态流转一律拒绝（含 admin force / via:restore）', () => {
+  function swappedOrder() {
+    return {
+      id: 'order-a',
+      orderNumber: 'ORDER-A',
+      userId: null,
+      agentId: 'ag-1',
+      status: OrderStatus.SWAPPED,
+      deletedAt: null,
+      paidAmount: dec(1650),
+      adjustmentCny: 0,
+      items: [],
+    };
+  }
+
+  it.each([
+    ['拉回占座态 PAID（admin force）', OrderStatus.PAID, ADMIN, true, undefined],
+    ['拉到 CANCELLED（admin force）→ 换人费收入会从营收蒸发', OrderStatus.CANCELLED, ADMIN, true, undefined],
+    ['拉到 REFUNDED（admin force）', OrderStatus.REFUNDED, ADMIN, true, undefined],
+    ['运营不带 force 推 PROCESSING', OrderStatus.PROCESSING, STAFF, undefined, undefined],
+    ['内部 via:restore 恢复到待支付', OrderStatus.PENDING_PAYMENT, ADMIN, undefined, { via: 'restore' as const }],
+  ])('%s → 400「已换人单为终态」，不落任何状态/事件', async (_label, toStatus, who, force, opts) => {
+    mockTx.order.findUnique.mockResolvedValueOnce(swappedOrder());
+    await expect(
+      service._updateStatusWithinTx(
+        mockTx as never,
+        'order-a',
+        toStatus,
+        { ...who, actorType: 'USER' },
+        '试图撤销换人',
+        [],
+        force,
+        undefined,
+        undefined,
+        opts,
+      ),
+    ).rejects.toThrow(/已换人单为终态；如需撤销请联系管理员走数据纠正/);
+    expect(mockTx.order.updateMany).not.toHaveBeenCalled();
+    expect(mockTx.orderStatusEvent.create).not.toHaveBeenCalled();
+  });
+});

@@ -71,6 +71,12 @@ describe('状态机真源契约 · serializeOrder 下发的 allowedTransitions =
     }
   });
 
+  it('「已换人」是真终态：没有任何出边，前端据此不渲染改状态入口；admin force 也在服务层硬拒（见 orders.mark-swapped.test）', () => {
+    expect(ALLOWED_TRANSITIONS[OrderStatus.SWAPPED]).toEqual([]);
+    const out = serializeOrder(buildOrder(OrderStatus.SWAPPED)) as Record<string, unknown>;
+    expect(out.allowedTransitions).toEqual([]);
+  });
+
   it('下发的目标状态都是合法的 OrderStatus 值（不会下发前端认不出的字符串）', () => {
     for (const status of ALL_STATUSES) {
       for (const to of ALLOWED_TRANSITIONS[status]) {

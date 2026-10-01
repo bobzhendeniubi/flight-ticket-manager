@@ -324,7 +324,9 @@ export const ALLOWED_TRANSITIONS: Record<OrderStatus, OrderStatus[]> = {
   CHANGE_REQUESTED: ['CHANGED', 'PAID', 'PROCESSING', 'TICKETED', 'REFUND_REQUESTED'], // 驳回→PAID/PROCESSING，批准→CHANGED，已出票改签→TICKETED，取消→REFUND_REQUESTED
   CHANGED: ['PROCESSING', 'TICKETED', 'COMPLETED', 'REFUND_REQUESTED'], // 改签后继续出票流程或直接完结/退款
   FAILED: ['PROCESSING', 'REFUND_REQUESTED', 'CANCELLED'],
-  // 已换人：终态。本期不做「撤销已换人」；ADMIN force 的既有兜底照旧可用（force 拉回占座态会重新占座）。
+  // 已换人：**真终态**。本期不做「撤销已换人」；**ADMIN force 也不能**把它拉回占座态或拉到取消/退款族
+  //（_updateStatusWithinTx 开头的硬规则）：拉回占座会重新占座、钱却留在代理余额/挂账池；拉到取消族会让
+  // 换人费收入从营收蒸发。要撤销只能走数据纠正。
   // 进入这条边不在白名单里：只能经 markSwapped（via:'swap'）——它先把应收收敛到换人费、把多付
   // 转存，再推状态；直接 PATCH /status（含 force）一律被 _updateStatusWithinTx 的账目闸拦下。
   SWAPPED: [],
@@ -8579,6 +8581,17 @@ export class OrderService {
     if (order.deletedAt) {
       throw new BadRequestError('订单在回收站（已软删），不可做状态流转；如需操作请先恢复');
     }
+    // 硬规则（即使 admin force 也不许）：已换人（SWAPPED）是**真终态**，任何出边一律拒绝。
+    //   · 拉回占座态（PAID 等）会重新占座，但已转进代理余额 / 挂账池的钱不会跟着回来——订单又成了
+    //     「应收只剩换人费、位子却与接手新单双占」的半截单；
+    //   · 拉到 CANCELLED / REFUNDED 会让换人费这笔真实收入从营收口径里蒸发（取消族不计营收）。
+    //   要撤销换人只能走数据纠正（人工对账后逐笔回转），不给状态机留口子。restoreCancelledOrder 只认
+    //   CANCELLED / PAYMENT_TIMEOUT，这里对 via:'restore' 同样拒绝。放在角色判定之前：谁来都一样。
+    if (order.status === OrderStatus.SWAPPED) {
+      throw new BadRequestError(
+        `订单 ${order.orderNumber} 已换人单为终态；如需撤销请联系管理员走数据纠正`,
+      );
+    }
     await this.assertCanTransition(order, toStatus, requester);
 
     const allowed = ALLOWED_TRANSITIONS[order.status];
@@ -10550,7 +10563,8 @@ export class OrderService {
    *      代理佣金整单冲销（换人费不计佣，与换人退款口径一致）。
    *   d. 写 swapFeeCny / swapReplacementOrderNumber（与换人退款共用字段；swapRefundedAt 不写——
    *      那列的语义是「退过现金」，本路径没有退款）；接手单号填了就校验存在。
-   * 不做「撤销已换人」（本期不做）；ADMIN force 拉回占座态的既有兜底照旧。
+   * 不做「撤销已换人」（本期不做）；SWAPPED 是真终态，ADMIN force 同样不能把它拉走
+   *（_updateStatusWithinTx 开头的硬规则），要撤销走数据纠正。
    */
   async markSwapped(
     orderId: string,
