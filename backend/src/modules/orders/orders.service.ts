@@ -18,6 +18,7 @@ import {
   ReminderStatus,
   CabinClass,
   CommissionStatus,
+  type DocumentType,
   InvoiceStatus,
   OrderChangeRequestStatus,
   OrderItemKind,
@@ -246,9 +247,14 @@ import { noShowReleasedReminderRuleKeys } from '../reminders/reminders.rules.js'
 // 写法与人工冲正同一份口径，本文件只在状态机出口与 no-show 打标处各喊一声。
 import {
   autoReverseRedemptionsForOrderWithinTx,
+  autoReverseRedemptionsForSwappedOutPassengerWithinTx,
   BENEFIT_AUTO_REVERSAL_ACTOR_ID,
+  BENEFIT_SWAP_REVERSAL_REASON,
   type AutoReversedRedemption,
 } from '../travelers/traveler-benefits.auto-reverse.js';
+// 原地换人后刷新旧人 / 新人的旅客档案快照（可用次数 / 在订未飞尽快对上）：复用档案服务既有的
+// 「批量查次数（缺档现算建档）」与「详情实时重算并回写」两个入口，不另写一套重建。
+import { TravelerProfilesService } from '../travelers/traveler-profiles.service.js';
 import { serializeRoomGroupsFor } from './room-group-dto.js';
 import type {
   BatchCreateOrdersBody,
@@ -12441,6 +12447,17 @@ export class OrderService {
         } | null;
         /** 代理填的换人费不在配置档位里（运营复核时重点看这一笔）；运营/管理员不判。 */
         feeOffList?: boolean;
+        /** 真换人时：被换下者挂本单的权益核销被自动冲正的明细（空数组 = 他没有挂本单的核销）。 */
+        benefitReversals?: Array<{
+          profileId: string;
+          originalId: string;
+          reversalId: string;
+          tripsUsed: number;
+          benefit: string;
+          orderId: string;
+        }>;
+        /** 真换人时：旧人 / 新人档案快照是否已刷新成功（false = 刷新失败，等全量重建兜底）。 */
+        profilesRefreshed?: boolean;
       };
       resetInvoice: boolean;
       resetVisa: boolean;
@@ -12484,6 +12501,8 @@ export class OrderService {
       const orderRows = await tx.$queryRaw<
         Array<{
           id: string;
+          // 单号：权益核销自动冲正的补偿行 note / 待办正文要带（见下方「1c3」）。
+          orderNumber: string;
           adjustmentCny: number;
           adjustments: Prisma.JsonValue;
           status: OrderStatus;
@@ -12497,7 +12516,7 @@ export class OrderService {
           // 结算价锁：锁着的单不重算结算价（财务已按这个应收对过账），见下方「1f」。
           settlementLocked: boolean | null;
         }>
-      >`SELECT id, "adjustmentCny", adjustments, status, "deletedAt", "visaStatus", "outboundInvoiced", "returnInvoiced", "systemInvoiced", "settlementLocked" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
+      >`SELECT id, "orderNumber", "adjustmentCny", adjustments, status, "deletedAt", "visaStatus", "outboundInvoiced", "returnInvoiced", "systemInvoiced", "settlementLocked" FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
       const order = orderRows[0];
       if (!order) throw new NotFoundError('订单不存在');
 
@@ -12551,6 +12570,8 @@ export class OrderService {
           orderId: true,
           fullName: true,
           documentNumber: true,
+          // documentType：被换下者的权益核销按「证件类型 + 号码」定位档案（见下方「1c3」）。
+          documentType: true,
           visaExempt: true,
           passengerType: true,
           // pnr / eticketNumber：代理换人闸②要读（票务现势，见上方开票位那段口径说明）。
@@ -12859,6 +12880,34 @@ export class OrderService {
         }
       }
 
+      // ── 1c3. 真换人 → 被换下者挂在本单的权益核销自动冲正（2026-09-30 拍板）──────────
+      // 核销挂的是订单 + 档案（按证件归档）：换人把这条 Passenger 行覆盖成新人之后，旧人的核销
+      // 仍挂在这张单上 —— 旧人没出行却被扣掉次数（重建后可用可能为负）；反过来日后新人 no-show /
+      // 本单取消，冲回去的也是旧人的那条。所以在同一事务里按**换人前读到的旧证件**把属于他的核销
+      // 冲正（追加负数补偿行，口径与取消族 / no-show 同一份 settleDecision），同行人一条不碰；
+      // **不**自动替新人核销（新人要用权益，运营照常手动核销）。
+      // 只在证件号变化（documentChanged = 真换人）时跑：改拼写 / 补生日这类「同一个人」的小修不动核销。
+      // 放在 passenger.update 之后：「仍在同谱系行程上」那道判定读的是乘客名单现值，此刻旧证件
+      // 已不在本单上，本单不会把自己算成旧人的承载。
+      // 幂等：重试同一次换人时证件号已等于新值 → documentChanged=false 不触发；即便触发，
+      // 已冲正的行（reversedBy 非空）也不在候选集。
+      let benefitReversals: AutoReversedRedemption[] = [];
+      if (documentChanged) {
+        benefitReversals = await autoReverseRedemptionsForSwappedOutPassengerWithinTx(tx, {
+          orderId,
+          orderNumber: order.orderNumber,
+          reason: BENEFIT_SWAP_REVERSAL_REASON,
+          // 换人经办人恒为真实账号（ADMIN/STAFF/AGENT），待办提单人直接用他。
+          reminderCreatedById: actor.userId,
+          swappedOut: {
+            passengerId,
+            documentType: passenger.documentType,
+            documentNumber: passenger.documentNumber,
+            fullName: beforeIdentity.fullName,
+          },
+        });
+      }
+
       // ── 1d. 换人价回滚（自备签 true→false 时把旧客的自备签减免加回来）──────────────────
       // 证件变更会把 visaExempt 强制回落 false（新客进签证台随团办签，见上方 1b），但订单 BUNDLE 行
       // 仍扣着旧客的自备签减免 selfVisaDeductTotal → 新客要送签、钱却少收。这里按「每人自备签减免」把
@@ -13131,6 +13180,14 @@ export class OrderService {
         afterIdentity: afterPassenger,
         visaTasksReset,
         clearedProfile: documentChanged,
+        benefitReversals,
+        // 旧 / 新证件：事务外刷新两人的档案快照用（documentType 不随换人变）。
+        swapDocs: documentChanged
+          ? [
+              { documentType: passenger.documentType, documentNumber: passenger.documentNumber },
+              { documentType: passenger.documentType, documentNumber: afterPassenger.documentNumber },
+            ]
+          : null,
         // 佣金基数漂移（M2）：换人重算真的改了 total 且本单已计提佣金 → 事务外补一条 WARNING 审计。
         repriceCommissionCny: repricedSubtotalCny != null ? repriceCommissionCny : null,
         repricedTotalCny: repricedSubtotalCny,
@@ -13189,6 +13246,14 @@ export class OrderService {
             .catch(() => false)
         : false;
 
+    // ── 真换人 → 刷新旧人 / 新人的旅客档案快照（事务已提交后再算，读到的是换人后的名单）────
+    // 不刷的话要等 6 小时全量重建或有人打开详情：旧人的「已付款在订未飞」仍把这张单算在他头上、
+    // 新人则压根没有档案，核销台 / 列表的可用次数两边都是错的。刷新失败不拖垮换人（快照只是缓存，
+    // 订单才是真值），只在审计里记 profilesRefreshed=false 供排查。
+    const profilesRefreshed = result.swapDocs
+      ? await this.refreshTravelerProfilesAfterSwap(result.swapDocs)
+      : null;
+
     return {
       // 对外脱敏：换人的返回按操作者角色脱敏（ADMIN/STAFF 全量，其余剥离内部字段 + 逐项拆价）。
       order: serializeOrder(finalOrder, orderSerializeRoleCtx(actor.role)),
@@ -13201,6 +13266,20 @@ export class OrderService {
           documentNumber: result.afterIdentity.documentNumber,
           reprice: result.reprice ? { ...result.reprice, feeCny } : null,
           ...(feeOffList ? { feeOffList: true } : {}),
+          // 被换下者的权益核销自动冲正结果（只在真换人时出现；空数组 = 旧人没有挂本单的核销）。
+          ...(result.swapDocs
+            ? {
+                benefitReversals: result.benefitReversals.map((r) => ({
+                  profileId: r.profileId,
+                  originalId: r.originalId,
+                  reversalId: r.reversalId,
+                  tripsUsed: r.tripsUsed,
+                  benefit: r.benefit,
+                  orderId: r.orderId,
+                })),
+                profilesRefreshed: profilesRefreshed === true,
+              }
+            : {}),
         },
         // 记的是**实际生效**的口径（代理换人被强制成 resetVisa=true、费用名固定「换人费」），
         // 不是请求里写了什么 —— 审计要能解释账面为什么这样变。
@@ -13211,6 +13290,34 @@ export class OrderService {
         clearedProfile: result.clearedProfile,
       },
     };
+  }
+
+  /**
+   * 原地换人后刷新旧人与新人的旅客档案快照（事务外）。
+   *
+   * 复用档案服务两个既有入口、不另写重建：
+   *   1. lookupByDocuments —— 两个证件一起查；没档案的（通常是新人）当场按订单现算建档；
+   *   2. getDetail —— 对查到的每个档案实时从订单重算并回写快照（已飞 / 在订未飞 / 已付款在订未飞）。
+   * 快照只是缓存、订单才是真值：任何一步失败只记日志、返回 false，不让换人跟着失败。
+   * 老单测的 prisma mock 没有 travelerProfile delegate → 直接返回 false（口径同自动冲正的取数守卫）。
+   */
+  private async refreshTravelerProfilesAfterSwap(
+    docs: ReadonlyArray<{ documentType: DocumentType; documentNumber: string }>,
+  ): Promise<boolean> {
+    const delegate = (prisma as unknown as { travelerProfile?: { findMany?: unknown } }).travelerProfile;
+    if (typeof delegate?.findMany !== 'function') return false;
+    const targets = docs.filter((d) => (d.documentNumber ?? '').trim() !== '');
+    if (targets.length === 0) return true;
+    try {
+      const profiles = new TravelerProfilesService();
+      const hits = await profiles.lookupByDocuments(targets);
+      const profileIds = [...new Set(hits.filter((h) => h.hasProfile && h.profileId).map((h) => h.profileId))];
+      for (const profileId of profileIds) await profiles.getDetail(profileId);
+      return true;
+    } catch (err) {
+      console.error('[orders] failed to refresh traveler profiles after passenger swap', err);
+      return false;
+    }
   }
 
   /**

@@ -19,12 +19,14 @@ import { describe, it, expect, vi } from 'vitest';
 import type { Prisma } from '@prisma/client';
 import {
   autoReverseRedemptionsForOrderWithinTx,
+  autoReverseRedemptionsForSwappedOutPassengerWithinTx,
   BENEFIT_AUTO_REVERSAL_ACTOR_ID,
   BENEFIT_AUTO_REVERSAL_ACTOR_NAME,
   BENEFIT_AUTO_REVERSED_AUDIT_ACTION,
   BENEFIT_AUTO_REVERSE_SKIPPED_AUDIT_ACTION,
   BENEFIT_AUTO_REVERSAL_REMINDER_PREFIX,
   BENEFIT_AUTO_REVERSE_SKIPPED_REMINDER_PREFIX,
+  BENEFIT_SWAP_REVERSAL_REASON,
 } from './traveler-benefits.auto-reverse.js';
 
 const AT = new Date('2026-09-21T03:00:00.000Z');
@@ -649,5 +651,175 @@ describe('autoReverseRedemptionsForOrderWithinTx · 取消 / 退款 / no-show �
     const tx = { fulfillmentTask: { updateMany: vi.fn() } } as unknown as Prisma.TransactionClient;
 
     await expect(autoReverseRedemptionsForOrderWithinTx(tx, INPUT)).resolves.toEqual([]);
+  });
+});
+
+/**
+ * 原地换人：只冲**被换下那一位**的核销。换人是就地覆盖同一条 Passenger 行，调用时名单里已经是新人，
+ * 所以候选按换人前读到的旧证件收窄，不看乘客名单；同行人一条不碰；待办要说「新人请手动核销」。
+ */
+describe('autoReverseRedemptionsForSwappedOutPassengerWithinTx · 原地换人自动冲正', () => {
+  const SWAPPED_OUT = {
+    passengerId: 'pax-old',
+    documentType: 'PASSPORT',
+    documentNumber: 'E12345678',
+    fullName: 'ZHANG SAN',
+  };
+  const SWAP_INPUT = {
+    ...INPUT,
+    reason: BENEFIT_SWAP_REVERSAL_REASON,
+    swappedOut: SWAPPED_OUT,
+  };
+
+  it('本单上旧人与同行人各挂一条核销 → 只冲旧人的：补偿行 note 带「被换下」、审计 reason 为换人、待办让运营手动给新人核销', async () => {
+    const tx = fakeTx({
+      candidates: [
+        candidate({ id: 'r1', profileId: 'p1', tripsUsed: 1, documentNumber: 'E12345678' }),
+        candidate({ id: 'r2', profileId: 'p2', tripsUsed: 2, fullName: 'LI SI', documentNumber: 'E-OTHER' }),
+      ],
+      written: [{ id: 'rev-r1', reversalOfId: 'r1' }],
+      // 名单此刻已是新人：按名单根本找不到旧证件，证明收窄走的是被换下者的证件而不是名单。
+      passengers: [{ documentType: 'PASSPORT', documentNumber: 'E-NEW' }],
+    });
+
+    const out = await autoReverseRedemptionsForSwappedOutPassengerWithinTx(tx, SWAP_INPUT);
+
+    expect(out.map((r) => r.originalId)).toEqual(['r1']);
+    expect(tx.travelerBenefitRedemption.createMany).toHaveBeenCalledTimes(1);
+    expect(tx.travelerBenefitRedemption.createMany).toHaveBeenCalledWith({
+      data: [
+        {
+          profileId: 'p1',
+          tripsUsed: -1,
+          benefit: '飞满 5 次兑换升舱',
+          note: '原地换人自动冲正（订单 FTM2026092100001，被换下 ZHANG SAN），系统自动冲正',
+          reversalOfId: 'r1',
+          orderId: 'o1',
+          triggeredByOrderId: 'o1',
+          createdById: BENEFIT_AUTO_REVERSAL_ACTOR_ID,
+          createdByName: BENEFIT_AUTO_REVERSAL_ACTOR_NAME,
+          createdAt: AT,
+        },
+      ],
+      skipDuplicates: true,
+    });
+    // 不按名单收窄：passenger.findMany 根本不该被调
+    expect(tx.passenger.findMany).not.toHaveBeenCalled();
+
+    expect(auditActions(tx)).toEqual([BENEFIT_AUTO_REVERSED_AUDIT_ACTION]);
+    const audit = (tx.auditLog.create.mock.calls[0][0] as { data: { targetId: string; after: Record<string, unknown> } }).data;
+    expect(audit.targetId).toBe('p1');
+    expect(audit.after).toMatchObject({
+      reversalId: 'rev-r1',
+      reason: BENEFIT_SWAP_REVERSAL_REASON,
+      triggerOrderId: 'o1',
+      triggerPassengerId: 'pax-old',
+    });
+
+    expect(tx.operationalReminder.create).toHaveBeenCalledTimes(1);
+    const reminder = (tx.operationalReminder.create.mock.calls[0][0] as { data: { ruleKey: string; body: string; title: string } }).data;
+    expect(reminder.ruleKey).toBe(`${BENEFIT_AUTO_REVERSAL_REMINDER_PREFIX}rev-r1`);
+    expect(reminder.title).toContain('ZHANG SAN');
+    expect(reminder.body).toContain('ZHANG SAN 已被换下');
+    expect(reminder.body).toContain('手动核销');
+    expect(reminder.body).not.toContain('恢复占位');
+  });
+
+  it('拆单后再换人：核销挂直接源单、旧证件已不在本单名单 → 仍按被换下者证件命中并冲正（补偿行记触发单 = 本单）', async () => {
+    const tx = fakeTx({
+      splitSources: ['o-src'],
+      candidates: [candidate({ id: 'r1', profileId: 'p1', orderId: 'o-src', documentNumber: 'E12345678' })],
+      passengers: [{ documentType: 'PASSPORT', documentNumber: 'E-NEW' }],
+    });
+
+    const out = await autoReverseRedemptionsForSwappedOutPassengerWithinTx(tx, SWAP_INPUT);
+
+    expect(out).toHaveLength(1);
+    expect(out[0]).toMatchObject({ originalId: 'r1', orderId: 'o-src' });
+    const data = (tx.travelerBenefitRedemption.createMany.mock.calls[0][0] as { data: Array<Record<string, unknown>> }).data;
+    expect(data[0]).toMatchObject({ orderId: 'o-src', triggeredByOrderId: 'o1' });
+  });
+
+  it('被换下者的证件是档案合并链上的旧证（P1→P2→P3，核销挂主档案 P3）→ 照样命中', async () => {
+    const tx = fakeTx({
+      candidates: [candidate({ id: 'r1', profileId: 'p3', documentNumber: 'E-P3' })],
+      profiles: [
+        { id: 'p1', mergedIntoId: 'p2', documentType: 'PASSPORT', documentNumber: 'E12345678' },
+        { id: 'p2', mergedIntoId: 'p3', documentType: 'PASSPORT', documentNumber: 'E-P2' },
+        { id: 'p3', mergedIntoId: null, documentType: 'PASSPORT', documentNumber: 'E-P3' },
+      ],
+    });
+
+    const out = await autoReverseRedemptionsForSwappedOutPassengerWithinTx(tx, SWAP_INPUT);
+
+    expect(out.map((r) => r.originalId)).toEqual(['r1']);
+  });
+
+  it('证件大小写 / 首尾空格不同 → 归一后仍算同一个人', async () => {
+    const tx = fakeTx({
+      candidates: [candidate({ id: 'r1', documentNumber: 'e12345678' })],
+    });
+
+    const out = await autoReverseRedemptionsForSwappedOutPassengerWithinTx(tx, {
+      ...SWAP_INPUT,
+      swappedOut: { ...SWAPPED_OUT, documentNumber: ' E12345678 ' },
+    });
+
+    expect(out.map((r) => r.originalId)).toEqual(['r1']);
+  });
+
+  it('被换下者仍在同谱系别的有效已付款单上 → 不冲正：WARNING 审计 SKIPPED（带 triggerPassengerId）+ 请核对待办', async () => {
+    const tx = fakeTx({
+      splitSources: ['o-src'],
+      candidates: [candidate({ id: 'r1', orderId: 'o-src', documentNumber: 'E12345678' })],
+      // 旧人在源单 o-src 上照常出行（脏数据：同一个人同时在两张单上）
+      orders: [order({ id: 'o-src', documentNumber: 'E12345678' })],
+    });
+
+    const out = await autoReverseRedemptionsForSwappedOutPassengerWithinTx(tx, SWAP_INPUT);
+
+    expect(out).toEqual([]);
+    expect(tx.travelerBenefitRedemption.createMany).not.toHaveBeenCalled();
+    expect(auditActions(tx)).toEqual([BENEFIT_AUTO_REVERSE_SKIPPED_AUDIT_ACTION]);
+    const audit = (tx.auditLog.create.mock.calls[0][0] as { data: { after: Record<string, unknown> } }).data;
+    expect(audit.after).toMatchObject({
+      reason: BENEFIT_SWAP_REVERSAL_REASON,
+      triggerPassengerId: 'pax-old',
+      carriedByOrderIds: ['o-src'],
+      note: '出行人已被原地换下，但其档案仍在同谱系别的有效行程上，未补回',
+    });
+    const reminder = (tx.operationalReminder.create.mock.calls[0][0] as { data: { ruleKey: string } }).data;
+    expect(reminder.ruleKey).toBe(`${BENEFIT_AUTO_REVERSE_SKIPPED_REMINDER_PREFIX}r1`);
+  });
+
+  it('本单有核销但都不是被换下者的 → 一条不动、不写审计不建待办', async () => {
+    const tx = fakeTx({
+      candidates: [candidate({ id: 'r2', profileId: 'p2', documentNumber: 'E-OTHER' })],
+    });
+
+    const out = await autoReverseRedemptionsForSwappedOutPassengerWithinTx(tx, SWAP_INPUT);
+
+    expect(out).toEqual([]);
+    expect(tx.travelerBenefitRedemption.createMany).not.toHaveBeenCalled();
+    expect(tx.auditLog.create).not.toHaveBeenCalled();
+    expect(tx.operationalReminder.create).not.toHaveBeenCalled();
+  });
+
+  it('被换下者是空证件的占位出行人 → 没有档案可对，直接返回空且不查库', async () => {
+    const tx = fakeTx({ candidates: [candidate({ id: 'r1' })] });
+
+    const out = await autoReverseRedemptionsForSwappedOutPassengerWithinTx(tx, {
+      ...SWAP_INPUT,
+      swappedOut: { ...SWAPPED_OUT, documentNumber: '  ' },
+    });
+
+    expect(out).toEqual([]);
+    expect(tx.travelerBenefitRedemption.findMany).not.toHaveBeenCalled();
+  });
+
+  it('老 mock 缺 delegate → 整段跳过，返回空数组不抛', async () => {
+    const tx = { passenger: { update: vi.fn() } } as unknown as Prisma.TransactionClient;
+
+    await expect(autoReverseRedemptionsForSwappedOutPassengerWithinTx(tx, SWAP_INPUT)).resolves.toEqual([]);
   });
 });

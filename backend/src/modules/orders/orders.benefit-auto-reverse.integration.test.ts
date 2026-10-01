@@ -36,6 +36,7 @@ import {
   BENEFIT_AUTO_REVERSED_AUDIT_ACTION,
   BENEFIT_AUTO_REVERSE_SKIPPED_AUDIT_ACTION,
   BENEFIT_AUTO_REVERSE_SKIPPED_REMINDER_PREFIX,
+  BENEFIT_SWAP_REVERSAL_REASON,
 } from '../travelers/traveler-benefits.auto-reverse.js';
 
 const orders = new OrderService();
@@ -507,5 +508,144 @@ describe('权益核销挂单 → 取消自动冲正（真 DB）', () => {
     // 可用 = 已飞 1（C）+ 已付款在订未飞 0 − 已核销 1 = 0，账实相符
     const detail = await profiles.getDetail(lookupP.profileId);
     expect(detail.profile).toMatchObject({ tripCount: 1, redeemedTrips: 1, availableTrips: 0 });
+  });
+});
+
+/**
+ * 原地换人（swapPassenger）→ 被换下者的核销自动冲正（2026-09-30 拍板）。
+ *   11. 旧人挂本单核销 1 次 → 只改拼写不冲正 → 真换成新人：旧人核销被冲正（note / 审计 / 待办带换人口径）、
+ *       旧人档案已刷新可用回到 0、新人档案已建且没有任何核销；重试同一次换人不二次冲正
+ *   12. 拆单后再换人：核销挂源单 A、P 已拆到 B → 在 B 上把 P 换掉：A 上的核销补回（触发单 = B），留守的 A 不受影响
+ */
+describe('原地换人 → 被换下者核销自动冲正（真 DB）', () => {
+  const swapBy = (admin: OrderRequester) => ({ userId: admin.userId, role: admin.role });
+
+  it('旧人挂本单核销 1 次 → 改拼写不冲正 → 原地换成新人：旧人核销补回、可用回到 0，新人无核销；重试不二次冲正', async () => {
+    const admin = await adminActor();
+    const docOld = uniq('E');
+    const docNew = uniq('E');
+    const order = await createOrderFor(docOld);
+    const pax = await prisma.passenger.findFirstOrThrow({ where: { orderId: order.id } });
+    const [lookupOld] = await profiles.lookupByDocuments([{ documentType: 'PASSPORT', documentNumber: docOld }]);
+    expect(lookupOld).toMatchObject({ hasProfile: true, pendingPaidTripCount: 1, availableTrips: 1 });
+    const redeemed = await benefits.redeem(
+      lookupOld.profileId,
+      { tripsUsed: 1, benefit: '飞满 5 次兑换升舱', orderId: order.id },
+      { userId: admin.userId },
+    );
+    expect((await profiles.getDetail(lookupOld.profileId)).profile.availableTrips).toBe(0);
+
+    // 1. 只改拼写（证件号没变）= 同一个人的改信息，不是换人：核销一条不动
+    const typo = await orders.swapPassenger(order.id, pax.id, { fullName: 'ZHANG SAM' }, swapBy(admin));
+    expect(typo.audit.clearedProfile).toBe(false);
+    expect(typo.audit.after).not.toHaveProperty('benefitReversals');
+    expect(await ledgerOf(lookupOld.profileId)).toHaveLength(1);
+
+    // 2. 真换人（证件号变化；本单有机票行 → 必须带新人护照有效期）
+    const swapped = await orders.swapPassenger(
+      order.id,
+      pax.id,
+      { fullName: 'LI SI', documentNumber: docNew, passportExpiry: '2031-06-30', dateOfBirth: '1992-02-02' },
+      swapBy(admin),
+    );
+    expect(swapped.audit.clearedProfile).toBe(true);
+    expect(swapped.audit.after.profilesRefreshed).toBe(true);
+    expect(swapped.audit.after.benefitReversals).toHaveLength(1);
+    expect(swapped.audit.after.benefitReversals![0]).toMatchObject({
+      profileId: lookupOld.profileId,
+      originalId: redeemed.redemption.id,
+      tripsUsed: 1,
+      orderId: order.id,
+    });
+
+    const ledger = await ledgerOf(lookupOld.profileId);
+    expect(ledger).toHaveLength(2);
+    const reversal = ledger.find((r) => r.tripsUsed < 0)!;
+    expect(reversal).toMatchObject({
+      tripsUsed: -1,
+      benefit: '飞满 5 次兑换升舱',
+      reversalOfId: redeemed.redemption.id,
+      orderId: order.id,
+      triggeredByOrderId: order.id,
+      createdById: BENEFIT_AUTO_REVERSAL_ACTOR_ID,
+      createdByName: '系统自动',
+    });
+    expect(reversal.note).toContain(BENEFIT_SWAP_REVERSAL_REASON);
+    expect(reversal.note).toContain('被换下 ZHANG SAM');
+    expect(reversal.note).toContain(order.orderNumber);
+
+    const audits = await prisma.auditLog.findMany({
+      where: { action: BENEFIT_AUTO_REVERSED_AUDIT_ACTION, targetId: lookupOld.profileId },
+    });
+    expect(audits).toHaveLength(1);
+    expect(audits[0].severity).toBe('WARNING');
+    expect(audits[0].after).toMatchObject({
+      reversalId: reversal.id,
+      reason: BENEFIT_SWAP_REVERSAL_REASON,
+      triggerOrderId: order.id,
+      triggerPassengerId: pax.id,
+    });
+    const reminder = await prisma.operationalReminder.findUnique({
+      where: { ruleKey: `${BENEFIT_AUTO_REVERSAL_REMINDER_PREFIX}${reversal.id}` },
+    });
+    expect(reminder).not.toBeNull();
+    expect(reminder!.orderId).toBe(order.id);
+    expect(reminder!.createdById).toBe(admin.userId);
+    expect(reminder!.body).toContain('ZHANG SAM 已被换下');
+    expect(reminder!.body).toContain('手动核销');
+
+    // 旧人：档案快照已在换人响应前刷新（不等 6 小时重建）—— 这单不再算他的在订未飞，核销也补回 → 可用 0 而非 −1
+    const oldSnapshot = await prisma.travelerProfile.findUniqueOrThrow({ where: { id: lookupOld.profileId } });
+    expect(oldSnapshot).toMatchObject({ pendingTripCount: 0, pendingPaidTripCount: 0 });
+    const oldDetail = await profiles.getDetail(lookupOld.profileId);
+    expect(oldDetail.profile).toMatchObject({ pendingPaidTripCount: 0, redeemedTrips: 0, availableTrips: 0 });
+
+    // 新人：档案已建档、这单算他的已付款在订未飞；系统**不**替他核销，台账为空
+    const newSnapshot = await prisma.travelerProfile.findUnique({
+      where: { documentType_documentNumber: { documentType: 'PASSPORT', documentNumber: docNew } },
+    });
+    expect(newSnapshot).not.toBeNull();
+    expect(newSnapshot).toMatchObject({ pendingPaidTripCount: 1 });
+    const [lookupNew] = await profiles.lookupByDocuments([{ documentType: 'PASSPORT', documentNumber: docNew }]);
+    expect(lookupNew).toMatchObject({ hasProfile: true, pendingPaidTripCount: 1, redeemedTrips: 0, availableTrips: 1 });
+    expect(await ledgerOf(lookupNew.profileId)).toHaveLength(0);
+
+    // 3. 幂等：同一次换人重试（同一证件号）不是新的换人 → 不二次冲正
+    const retry = await orders.swapPassenger(
+      order.id,
+      pax.id,
+      { fullName: 'LI SI', documentNumber: docNew, passportExpiry: '2031-06-30' },
+      swapBy(admin),
+    );
+    expect(retry.audit.clearedProfile).toBe(false);
+    expect(await ledgerOf(lookupOld.profileId)).toHaveLength(2);
+    expect(await ledgerOf(lookupNew.profileId)).toHaveLength(0);
+  });
+
+  it('拆单后再换人：核销挂源单 A、P 已拆到 B → 在 B 上换掉 P：A 上的核销补回（触发单 = B），A 不受影响', async () => {
+    const admin = await adminActor();
+    const { orderA, orderBId, profileId, redemption } = await redeemThenSplitOut(admin);
+    const paxPInB = await prisma.passenger.findFirstOrThrow({ where: { orderId: orderBId } });
+
+    await orders.swapPassenger(
+      orderBId,
+      paxPInB.id,
+      { fullName: 'NEW ONE', documentNumber: uniq('E'), passportExpiry: '2031-06-30' },
+      swapBy(admin),
+    );
+
+    const ledger = await ledgerOf(profileId);
+    expect(ledger).toHaveLength(2);
+    expect(ledger.find((r) => r.tripsUsed < 0)).toMatchObject({
+      tripsUsed: -1,
+      reversalOfId: redemption.id,
+      orderId: orderA.id,
+      triggeredByOrderId: orderBId,
+      createdById: BENEFIT_AUTO_REVERSAL_ACTOR_ID,
+    });
+    // P 已不在谱系内任何一张单上：可用 = 0 + 0 − 0 = 0；留守 Q 的源单 A 仍是已付款
+    const detail = await profiles.getDetail(profileId);
+    expect(detail.profile).toMatchObject({ pendingPaidTripCount: 0, redeemedTrips: 0, availableTrips: 0 });
+    expect((await prisma.order.findUniqueOrThrow({ where: { id: orderA.id } })).status).toBe(OrderStatus.PAID);
   });
 });

@@ -1,7 +1,10 @@
 /**
  * 权益核销的**自动冲正**（2026-09-21 拍板）：挂了订单号的核销，在该单
  *   · 落取消族终态（订单状态机 _updateStatusWithinTx：取消 / 退款 / 支付超时 / 失败），或
- *   · 去程被标 no-show（_executeNoShow 首次打标）
+ *   · 去程被标 no-show（_executeNoShow 首次打标），或
+ *   · 某位出行人被**原地换人**换下（swapPassenger，证件号变化才算换人；2026-09-30 拍板）——
+ *     只冲**被换下那一位**的核销（按他的证件定位，别的同行人不连坐），新人要用权益照常由
+ *     运营手动核销，系统不自动替新人核销
  * 时，由系统在**同一事务内**给每条「正数且尚未被冲正」的核销行追加一条负数补偿行，
  * 并写审计 BENEFIT_REDEMPTION_AUTO_REVERSED + 一条给运营的待办（知会客人 / 恢复后重核销）。
  *
@@ -87,6 +90,27 @@ export interface AutoReversedRedemption {
   orderId: string;
 }
 
+/** 原地换人补偿行 / 审计里的原因文案（运营按它在审计页筛「换人引起的冲正」）。 */
+export const BENEFIT_SWAP_REVERSAL_REASON = '原地换人自动冲正';
+
+/**
+ * 被换下的出行人：原地换人是就地覆盖同一条 Passenger 行，调用时乘客名单里已经是新人，
+ * 所以这一位只能靠换人前读到的证件来定位（档案证件 = 主证 + 合并链旧证，任一命中即算他的）。
+ */
+export interface SwappedOutPassengerRef {
+  passengerId: string;
+  documentType: string;
+  documentNumber: string;
+  fullName: string;
+}
+
+export interface AutoReverseSwappedOutInput extends AutoReverseRedemptionsInput {
+  swappedOut: SwappedOutPassengerRef;
+}
+
+/** 触发源：取消族 / no-show 走订单口径；原地换人只认被换下那一位（待办与审计文案不同）。 */
+type ReversalTrigger = { kind: 'ORDER' } | { kind: 'SWAP'; swappedOut: SwappedOutPassengerRef };
+
 type RedemptionCandidate = {
   id: string;
   profileId: string;
@@ -155,21 +179,83 @@ export async function autoReverseRedemptionsForOrderWithinTx(
   input: AutoReverseRedemptionsInput,
 ): Promise<AutoReversedRedemption[]> {
   const delegates = tx as unknown as AutoReverseDelegates;
-  const redemptionDelegate = delegates.travelerBenefitRedemption;
-  if (
-    typeof redemptionDelegate?.findMany !== 'function' ||
-    typeof redemptionDelegate?.createMany !== 'function'
-  ) {
-    return [];
-  }
-  const at = input.at ?? new Date();
+  if (!hasRedemptionDelegates(delegates)) return [];
+  const loaded = await loadCandidates(delegates, input.orderId);
+  if (loaded.candidates.length === 0) return [];
 
+  const decision = await decideCandidates(
+    delegates,
+    input.orderId,
+    loaded.candidates,
+    loaded.sourceOrderIds,
+  );
+  return settleDecision(tx, delegates, input, decision, {
+    trigger: { kind: 'ORDER' },
+    note: `${input.reason}（订单 ${input.orderNumber}），系统自动冲正`,
+    skippedNote: '核销挂单已取消 / no-show，但旅客仍在同谱系行程上，未补回',
+  });
+}
+
+/**
+ * 原地换人：把**被换下那一位**挂在本单（及本单直接源单）上的核销自动冲正（2026-09-30 拍板）。
+ *
+ * 与订单口径的两处不同：
+ *   · 候选按**被换下者的证件**收窄，不按乘客名单 —— 换人是就地覆盖同一条 Passenger 行，调用时
+ *     名单里已经是新人；旧人只能靠换人前读到的证件定位。同行人的核销一条不碰。
+ *   · 待办文案不同：不是「恢复后重核销」，而是「新出行人要用权益请手动核销」—— 系统不替新人核销。
+ * 其余照抄：直接源单一跳（拆单后再换人，核销仍挂源单）、「仍在同谱系别的有效已付款单上则不冲正」
+ * （findCarriedOrderIdsByDoc；本单此刻已没有旧人的证件，不会把自己算成承载）、补偿行
+ * createMany(skipDuplicates) 幂等、审计 BENEFIT_REDEMPTION_AUTO_REVERSED（after.reason = 本常量、
+ * 带 triggerPassengerId）。
+ * 幂等：同一次换人重试时旧证件已不在单上（调用方按证件号变化判换人，不再触发），即便再调，
+ * 已冲正的行也不在候选集。
+ * 无法归属到人的核销不存在 —— 台账每条都挂档案（profileId）；只有「本单上别的档案」的核销，
+ * 它们不是被换下者的，按口径一律不动。
+ * 空证件（占位出行人）没有档案可对 → 直接返回空，不写任何东西。
+ */
+export async function autoReverseRedemptionsForSwappedOutPassengerWithinTx(
+  tx: Prisma.TransactionClient,
+  input: AutoReverseSwappedOutInput,
+): Promise<AutoReversedRedemption[]> {
+  const delegates = tx as unknown as AutoReverseDelegates;
+  if (!hasRedemptionDelegates(delegates)) return [];
+  if ((input.swappedOut.documentNumber ?? '').trim() === '') return [];
+  const loaded = await loadCandidates(delegates, input.orderId);
+  if (loaded.candidates.length === 0) return [];
+
+  const decision = await decideSwappedOutCandidates(
+    delegates,
+    input.orderId,
+    loaded.candidates,
+    loaded.sourceOrderIds,
+    input.swappedOut,
+  );
+  return settleDecision(tx, delegates, input, decision, {
+    trigger: { kind: 'SWAP', swappedOut: input.swappedOut },
+    note: `${input.reason}（订单 ${input.orderNumber}，被换下 ${input.swappedOut.fullName}），系统自动冲正`,
+    skippedNote: '出行人已被原地换下，但其档案仍在同谱系别的有效行程上，未补回',
+  });
+}
+
+function hasRedemptionDelegates(delegates: AutoReverseDelegates): boolean {
+  const redemptionDelegate = delegates.travelerBenefitRedemption;
+  return (
+    typeof redemptionDelegate?.findMany === 'function' &&
+    typeof redemptionDelegate?.createMany === 'function'
+  );
+}
+
+/** 候选集：本单 + 直接源单上「正数且未被冲正」的核销（两种触发源同一份取数）。 */
+async function loadCandidates(
+  delegates: AutoReverseDelegates,
+  orderId: string,
+): Promise<{ candidates: RedemptionCandidate[]; sourceOrderIds: string[] }> {
   // 拆单一跳：本单若是从某张源单拆出来的，源单上挂的核销也在候选里（下面再按证件收窄）。
   const splitDelegate = delegates.orderSplitRecord;
   const splitRows =
     typeof splitDelegate?.findMany === 'function'
       ? ((await splitDelegate.findMany({
-          where: { targetOrderId: input.orderId },
+          where: { targetOrderId: orderId },
           select: { sourceOrderId: true },
         })) ?? [])
       : [];
@@ -177,9 +263,9 @@ export async function autoReverseRedemptionsForOrderWithinTx(
     ...new Set(splitRows.map((r) => r.sourceOrderId).filter((id): id is string => !!id)),
   ];
 
-  const candidates = ((await redemptionDelegate.findMany({
+  const candidates = ((await delegates.travelerBenefitRedemption!.findMany!({
     where: {
-      orderId: { in: [input.orderId, ...sourceOrderIds] },
+      orderId: { in: [orderId, ...sourceOrderIds] },
       tripsUsed: { gt: 0 },
       reversedBy: null,
     },
@@ -195,14 +281,34 @@ export async function autoReverseRedemptionsForOrderWithinTx(
     },
     orderBy: { createdAt: 'asc' },
   })) ?? []) as RedemptionCandidate[];
-  if (candidates.length === 0) return [];
+  return { candidates, sourceOrderIds };
+}
 
-  const { toReverse, skipped } = await decideCandidates(
-    delegates,
-    input.orderId,
-    candidates,
-    sourceOrderIds,
-  );
+/** 落库阶段的文案 / 触发源（两种触发源只在这里分叉，台账写法完全一样）。 */
+interface SettleOptions {
+  trigger: ReversalTrigger;
+  /** 补偿行 note。 */
+  note: string;
+  /** 「未补回」WARNING 审计的 after.note。 */
+  skippedNote: string;
+}
+
+/**
+ * 按判定结果落库：跳过的写 WARNING 审计 + 「请核对」待办；要冲的追加补偿行 + 审计 + 待办。
+ * 返回真正落库的补偿行（被人工抢先冲正的不在其中）。
+ */
+async function settleDecision(
+  tx: Prisma.TransactionClient,
+  delegates: AutoReverseDelegates,
+  input: AutoReverseRedemptionsInput,
+  decision: CandidateDecision,
+  options: SettleOptions,
+): Promise<AutoReversedRedemption[]> {
+  const at = input.at ?? new Date();
+  const redemptionDelegate = delegates.travelerBenefitRedemption!;
+  const { toReverse, skipped } = decision;
+  const triggerPassengerId =
+    options.trigger.kind === 'SWAP' ? options.trigger.swappedOut.passengerId : undefined;
   // 仍在同谱系行程上的：不冲正，写 WARNING 审计 + 一条「请核对」待办（第二轮 N3：只留 INFO 审计
   // 运营在审计页默认筛不到、档案页也不展示，客人投诉才是唯一发现渠道）
   for (const { candidate: row, carriedBy } of skipped) {
@@ -228,7 +334,8 @@ export async function autoReverseRedemptionsForOrderWithinTx(
           triggerOrderNumber: input.orderNumber,
           carriedByOrderIds,
           carriedByOrderNumbers,
-          note: '核销挂单已取消 / no-show，但旅客仍在同谱系行程上，未补回',
+          note: options.skippedNote,
+          ...(triggerPassengerId ? { triggerPassengerId } : {}),
         },
       });
     }
@@ -246,8 +353,8 @@ export async function autoReverseRedemptionsForOrderWithinTx(
   }
   if (toReverse.length === 0) return [];
 
-  const note = `${input.reason}（订单 ${input.orderNumber}），系统自动冲正`;
-  await redemptionDelegate.createMany({
+  const { note } = options;
+  await redemptionDelegate.createMany!({
     data: toReverse.map((row) => ({
       profileId: row.profileId,
       tripsUsed: -row.tripsUsed,
@@ -265,7 +372,7 @@ export async function autoReverseRedemptionsForOrderWithinTx(
     skipDuplicates: true,
   });
   // createMany 不回 id：按 reversalOfId 读回真正落库的那几条（被人工抢先冲正的不在其中）
-  const written = ((await redemptionDelegate.findMany({
+  const written = ((await redemptionDelegate.findMany!({
     where: {
       reversalOfId: { in: toReverse.map((r) => r.id) },
       createdById: BENEFIT_AUTO_REVERSAL_ACTOR_ID,
@@ -312,6 +419,7 @@ export async function autoReverseRedemptionsForOrderWithinTx(
           reason: input.reason,
           triggerOrderId: input.orderId,
           triggerOrderNumber: input.orderNumber,
+          ...(triggerPassengerId ? { triggerPassengerId } : {}),
         },
       });
     }
@@ -324,6 +432,7 @@ export async function autoReverseRedemptionsForOrderWithinTx(
         reason: input.reason,
         at,
         reversal: result,
+        trigger: options.trigger,
       });
     }
   }
@@ -372,6 +481,35 @@ async function decideCandidates(
     });
     narrowed = [...direct, ...matched];
   }
+  return splitByCarried(delegates, orderId, narrowed, docsByProfile, sourceOrderIds);
+}
+
+/**
+ * 原地换人的收窄：只认「档案证件（主证 + 合并链旧证）命中被换下者证件」的候选 —— 不论挂本单
+ * 还是直接源单。不看乘客名单（名单此刻已是新人，旧证件必然不在里面）。
+ * 第二道「仍在同谱系行程上」照抄订单口径：被换下者若还在谱系内别的有效已付款单上，不冲正。
+ */
+async function decideSwappedOutCandidates(
+  delegates: AutoReverseDelegates,
+  orderId: string,
+  candidates: RedemptionCandidate[],
+  sourceOrderIds: string[],
+  swappedOut: SwappedOutPassengerRef,
+): Promise<CandidateDecision> {
+  const docsByProfile = await loadCandidateDocs(delegates, candidates);
+  const swappedOutKey = normDoc(swappedOut.documentType, swappedOut.documentNumber);
+  const narrowed = candidates.filter((c) => docsByProfile.get(c.profileId)?.has(swappedOutKey));
+  return splitByCarried(delegates, orderId, narrowed, docsByProfile, sourceOrderIds);
+}
+
+/** 第二道收窄：按「该档案是否仍在同谱系别的有效行程上」把候选分成冲正 / 跳过两堆。 */
+async function splitByCarried(
+  delegates: AutoReverseDelegates,
+  orderId: string,
+  narrowed: RedemptionCandidate[],
+  docsByProfile: Map<string, Set<string>>,
+  sourceOrderIds: string[],
+): Promise<CandidateDecision> {
   if (narrowed.length === 0) return { toReverse: [], skipped: [] };
 
   const carriedByDoc = await findCarriedOrderIdsByDoc(
@@ -612,6 +750,7 @@ async function createAutoReversalReminder(
     reason: string;
     at: Date;
     reversal: AutoReversedRedemption;
+    trigger: ReversalTrigger;
   },
 ): Promise<void> {
   const reminderDelegate = delegates.operationalReminder;
@@ -624,15 +763,22 @@ async function createAutoReversalReminder(
   const ruleKey = `${BENEFIT_AUTO_REVERSAL_REMINDER_PREFIX}${input.reversal.reversalId}`;
   const existing = await reminderDelegate.findUnique({ where: { ruleKey }, select: { id: true } });
   if (existing) return;
+  const { reversal } = input;
+  // 原地换人：被换下的人次数补回；新人要用权益**不**自动核销，待办要把这句话说给运营听。
+  const body =
+    input.trigger.kind === 'SWAP'
+      ? `${input.reason}：出行人 ${input.trigger.swappedOut.fullName} 已被换下，其挂在该单的权益核销` +
+        `「${reversal.benefit}」（${reversal.tripsUsed} 次）已由系统自动冲正，可用次数已补回。` +
+        `新出行人如需使用权益，请到常旅客档案手动核销（系统不会自动替新人核销）。`
+      : `${input.reason}，该单挂的权益核销「${reversal.benefit}」（${reversal.tripsUsed} 次）` +
+        `已由系统自动冲正，可用次数已补回。请知会客人；若这张单之后恢复占位，系统不会自动再核销，` +
+        `需要时请到常旅客档案重新核销。`;
   await reminderDelegate.create({
     data: {
       orderId: input.orderId,
       createdById: input.createdById,
-      title: `【核销已自动冲正】${input.orderNumber} ${input.reversal.profileName} 补回 ${input.reversal.tripsUsed} 次`,
-      body:
-        `${input.reason}，该单挂的权益核销「${input.reversal.benefit}」（${input.reversal.tripsUsed} 次）` +
-        `已由系统自动冲正，可用次数已补回。请知会客人；若这张单之后恢复占位，系统不会自动再核销，` +
-        `需要时请到常旅客档案重新核销。`,
+      title: `【核销已自动冲正】${input.orderNumber} ${reversal.profileName} 补回 ${reversal.tripsUsed} 次`,
+      body,
       dueAt: new Date(`${businessDateISO(input.at)}T00:00:00Z`),
       priority: ReminderPriority.HIGH,
       ruleKey,
