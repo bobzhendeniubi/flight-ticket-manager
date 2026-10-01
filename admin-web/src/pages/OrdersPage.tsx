@@ -754,7 +754,7 @@ const ORDER_COLUMN_WIDTH_STORAGE_KEY = 'ftm-orders-colwidths';
 type ResizableOrderColumnKey = OrderColumnKey | 'content';
 const ORDER_COLUMN_DEFAULT_WIDTHS: Readonly<Record<ResizableOrderColumnKey, number>> = {
   // 注：单元格 overflow-hidden 裁在内边距外沿，内容可以吃进左右各 12px 的内边距，下面按此收紧。
-  orderNumber: 128, // FTM + 13 位等宽字，实测 116
+  orderNumber: 144, // FTM + 13 位等宽字，实测 116 + 左右内边距 24；运营要求列表显示全号，不许截断
   customer: 104, // 11 位手机号实测 86；客户/代理名截断，悬浮看全文
   content: FLEX_COLUMN_WIDTH,
   departDate: 144, // 「去 QH9589 2026-09-30」实测 131
