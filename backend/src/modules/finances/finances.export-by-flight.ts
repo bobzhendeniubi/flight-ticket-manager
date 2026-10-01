@@ -9,6 +9,8 @@
  *   包机：FlightSchedule.charterCostCny ÷ totalSeats × soldSeats（已售座位占用）
  *   机场税/燃油/旺季/调整/折扣：cost.service.resolveScheduleCost 取生效值 × soldSeats
  *   房费/签证/车费/订单杂项：从落在该班次上的订单聚合 — 多腿订单按 legCount 平摊避免重复
+ *   已换人单：换人费照记该班次收入，房费/签证/车费/杂项一律不计（isZeroCostOrder）——位子和房
+ *   已由接手新单承担并计成本，再按被换下那单的明细算就是同一份成本算两遍；座位侧它已不在 sold 里。
  *
  * 行级派生：
  *   总成本(不含空座成本) = 上面汇总
@@ -34,6 +36,8 @@ import {
   resolveTransferUnitCost,
 } from './transfer-cost.service.js';
 import { visaItemCostCny } from './finances.service.js';
+// 已换人单成本一律按 0：与财务汇总 / 按乘客导出共用同一判定，不在这里另写状态集合。
+import { isZeroCostOrder } from './order-cost-policy.js';
 
 const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.PENDING_PAYMENT,
@@ -44,7 +48,7 @@ const COUNTED_STATUSES: OrderStatus[] = [
   OrderStatus.REFUND_REQUESTED,
   OrderStatus.CHANGE_REQUESTED,
   OrderStatus.CHANGED,
-  // 已换人：换人费按该班次记收入（与财务汇总口径一致），成本随座位释放为 0。
+  // 已换人：换人费按该班次记收入（与财务汇总口径一致）；成本在下方聚合时按 isZeroCostOrder 跳过。
   OrderStatus.SWAPPED,
 ];
 
@@ -274,6 +278,10 @@ export async function buildFinanceExportByFlightWorkbook(
       }
       flightRevenue += flightRevOrder;
       otherRevenue += otherRevOrder;
+
+      // 已换人单：收入记完就停——房费/签证/车费/杂项一律不计，需签乘客数也不再数被换下的人
+      //（口径见 order-cost-policy.ts）。
+      if (isZeroCostOrder(o)) continue;
 
       // 商品成本：按腿数平摊
       let hotelOrder = 0;

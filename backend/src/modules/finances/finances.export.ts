@@ -42,6 +42,8 @@ import { netReceivedCny, sumCompletedRefundCny } from '../../lib/net-received.js
 import { businessDateTime } from '../../lib/business-time.js';
 // 签证成本口径与财务汇总共用同一函数，两处逐字一致（任务实际成本优先 → 产品主数据回退）
 import { visaItemCostCny } from './finances.service.js';
+// 已换人单成本一律按 0、人数不计被换下的人：与财务汇总 / 按航班导出共用同一判定。
+import { countedPassengerCount, isZeroCostOrder } from './order-cost-policy.js';
 import {
   formatSwapRecordCell,
   loadSwapRecordsByPassenger,
@@ -244,6 +246,10 @@ function orderToRows(
   const paxCount = Math.max(1, order.passengers.length);
   // 需签乘客数（非自备签）—— 签证实际成本按此人均折算
   const visaPax = order.passengers.filter((p) => !p.visaExempt).length;
+  // 已换人单：收入列照常（换人费已进 total），成本列一律 0、人数列 0（口径见 order-cost-policy.ts）。
+  // 各段成本仍按明细算完，归零集中在落列那一处（zc）——成本列清单一眼看全，不散落在各段里。
+  const zeroCost = isZeroCostOrder(order);
+  const zc = (costCny: number): number => (zeroCost ? 0 : costCny);
 
   // ── 机票：包机单座分摊（charter / 总座位）+ 机场税 + 4 新成本字段，可能去程+回程多段 ──
   // 全部用 cost.service.resolveScheduleCost（override → period → null）取生效值
@@ -438,27 +444,27 @@ function orderToRows(
       returnDate: departDates.length > 1 ? fmtDate(departDates[departDates.length - 1]) : '',
       flightNumbers: Array.from(new Set(flightNumbers)).join(' / '),
       orderType,
-      paxCount,
+      paxCount: countedPassengerCount(order),
       status: STATUS_LABEL[order.status] ?? order.status,
       settledStatus: settled,
       // 录入时间是「动作发生时刻」，按北京时间输出（容器 TZ 是 UTC，直接取 UTC 分量会少 8 小时）
       recordedAt: businessDateTime(order.createdAt),
-      flightCostCny: round2(flightCostPerSeat),
-      airportTaxCny: round2(airportTaxCny),
-      peakSurchargeCny: round2(peakSurchargePerPax),
-      fuelCostCny: round2(fuelPerPax),
-      aircraftAdjustCny: round2(aircraftAdjustPerPax),
-      takeoffDiscountCny: round2(takeoffDiscountPerPax),
-      guideServiceCny: round2(guideServicePerPax),
-      otherOrderCostCny: round2(otherOrderCostPerPax),
+      flightCostCny: zc(round2(flightCostPerSeat)),
+      airportTaxCny: zc(round2(airportTaxCny)),
+      peakSurchargeCny: zc(round2(peakSurchargePerPax)),
+      fuelCostCny: zc(round2(fuelPerPax)),
+      aircraftAdjustCny: zc(round2(aircraftAdjustPerPax)),
+      takeoffDiscountCny: zc(round2(takeoffDiscountPerPax)),
+      guideServiceCny: zc(round2(guideServicePerPax)),
+      otherOrderCostCny: zc(round2(otherOrderCostPerPax)),
       hotelName,
       hotelNights,
-      hotelCostCny: round2(hotelPerPax),
-      transferCostCny: round2(transferPerPax),
-      visaCostCny: round2(visaCnyPerPax),
-      unitCostTotal: round2(unitCostTotal),
+      hotelCostCny: zc(round2(hotelPerPax)),
+      transferCostCny: zc(round2(transferPerPax)),
+      visaCostCny: zc(round2(visaCnyPerPax)),
+      unitCostTotal: zc(round2(unitCostTotal)),
       unitRevenue: round2(revenuePerPax),
-      unitProfit: round2(revenuePerPax - unitCostTotal),
+      unitProfit: round2(revenuePerPax - zc(unitCostTotal)),
       flightRevenue: 0,
       hotelRevenue: 0,
       visaRevenue: 0,
@@ -486,12 +492,12 @@ function orderToRows(
       visaRevenue: round2(visaRevenue),
       transferRevenue: round2(transferRevenue),
       totalRevenue: round2(totalRevenue),
-      flightCost: round2(flightCostOrder),
-      hotelCost: round2(hotelCostCnyOrder),
-      visaCost: round2(visaCostCnyOrder),
-      transferCost: round2(transferCostCnyOrder),
-      totalCost: round2(totalCostOrder),
-      grossMargin: round2(totalRevenue - totalCostOrder),
+      flightCost: zc(round2(flightCostOrder)),
+      hotelCost: zc(round2(hotelCostCnyOrder)),
+      visaCost: zc(round2(visaCostCnyOrder)),
+      transferCost: zc(round2(transferCostCnyOrder)),
+      totalCost: zc(round2(totalCostOrder)),
+      grossMargin: round2(totalRevenue - zc(totalCostOrder)),
     };
   }
 

@@ -180,6 +180,8 @@ interface CountedOrderItemFixture {
 
 interface CountedOrderFixture {
   id: string;
+  /** 订单状态；老 fixture 不带（查询侧已按 COUNTED_STATUSES 过滤，只有已换人成本口径要看它） */
+  status?: string;
   /** 车队越南盾回退实时折算的服务日回退层（无航段时按下单日）；老 fixture 不带 */
   createdAt?: Date;
   total: number;
@@ -892,5 +894,171 @@ describe('getOrderPnl — 机票实时成本与缺成本计数', () => {
     expect(row).toMatchObject({ costCny: null, grossMarginCny: null, missingCostItemCount: 1 });
     expect(client.flightSchedule.findMany).toHaveBeenCalledTimes(1);
     expect(client.flightCostPeriod.findMany).toHaveBeenCalledTimes(1);
+  });
+});
+
+// ── 已换人（SWAPPED）单：成本一律按 0（order-cost-policy），收入照常 ───────────────
+// 位子和房由接手新单承担并计成本，本单只剩换人费这笔收入；再按明细算就是同一份成本算两遍。
+describe('已换人单成本一律按 0 — 汇总 / 订单毛利 / 明细 / 月度趋势同一口径', () => {
+  it('getFinancesSummary：换人费计收入；酒店快照 / 签证任务 / 杂项成本全不计，也不算缺成本', async () => {
+    const client = fakeClient({
+      countedOrders: [
+        {
+          id: 'o-swapped',
+          status: 'SWAPPED',
+          total: 450,
+          passengers: [{ id: 'p1', visaExempt: false }],
+          costItems: [{ category: 'GUIDE_SERVICE', amountCny: 120 }],
+          items: [
+            hotelItem(300, 800),
+            // 签证任务填了人均成本：非已换人单会按 226.8 × 1 计；这里必须是 0
+            visaItem({ amount: 150, quantity: 1, taskUnitCostCny: 226.8 }),
+          ],
+        },
+        {
+          id: 'o-paid',
+          status: 'PAID',
+          total: 1000,
+          passengers: [{ id: 'p2', visaExempt: false }],
+          costItems: [{ category: 'GUIDE_SERVICE', amountCny: 100 }],
+          items: [hotelItem(1000, 600)],
+        },
+      ],
+    });
+    const summary = await getFinancesSummary(RANGE, client);
+
+    // 收入两单都算（300 + 150 + 1000）；成本只有已支付单的房费 600 + 导游 100。
+    expect(summary.revenueCny).toBe(1450);
+    expect(summary.revenueBreakdown.hotel).toBe(1300);
+    expect(summary.revenueBreakdown.visa).toBe(150);
+    expect(summary.costCny).toBe(600);
+    expect(summary.costBreakdown.hotel).toBe(600);
+    expect(summary.costBreakdown.visa).toBe(0);
+    expect(summary.costBreakdown.guideService).toBe(100);
+    expect(summary.missingCostItemCount).toBe(0);
+    expect(summary.grossMarginCny).toBe(850);
+    const hotel = summary.categories.find((c) => c.kind === 'HOTEL')!;
+    const visa = summary.categories.find((c) => c.kind === 'VISA')!;
+    expect(hotel).toMatchObject({ revenueCny: 1300, costCny: 600 });
+    expect(visa).toMatchObject({ revenueCny: 150, costCny: 0 });
+    expect(summary.orderCount).toBe(2);
+  });
+
+  it('getOrderPnl：已换人单成本 0、毛利 = 换人费、缺成本 0（机票实时成本 / 空快照都不看）；同班次的接手单照常算', async () => {
+    const client = {
+      order: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: 'o-swapped',
+            orderNumber: 'FTM-SWAPPED',
+            status: 'SWAPPED',
+            contactName: '被换下的客人',
+            total: 450,
+            createdAt: new Date('2026-07-22T00:00:00Z'),
+            items: [
+              { kind: 'FLIGHT', quantity: 1, totalCostCny: null, flightScheduleId: 's-out' },
+              { kind: 'HOTEL', quantity: 1, totalCostCny: null, flightScheduleId: null },
+            ],
+          },
+          {
+            id: 'o-paid',
+            orderNumber: 'FTM-PAID',
+            status: 'PAID',
+            contactName: '接手的客人',
+            total: 1000,
+            createdAt: new Date('2026-07-22T00:00:00Z'),
+            items: [{ kind: 'FLIGHT', quantity: 1, totalCostCny: null, flightScheduleId: 's-out' }],
+          },
+        ]),
+      },
+      flightSchedule: {
+        findMany: vi.fn().mockResolvedValue([
+          {
+            id: 's-out',
+            flightId: 'f-out',
+            departureTime: new Date('2026-07-22T00:00:00Z'),
+            departureTz: 'UTC',
+            charterCostCny: 1000,
+            airportTaxDepCny: null,
+            airportTaxArrCny: null,
+            fuelCostCny: null,
+            peakSurchargeCny: null,
+            aircraftAdjustCny: null,
+            takeoffDiscountCny: null,
+            seatClasses: [{ capacity: 10 }],
+          },
+        ]),
+      },
+      flightCostPeriod: { findMany: vi.fn().mockResolvedValue([]) },
+    } as unknown as PrismaClient;
+
+    const rows = await getOrderPnl({ from: '2026-07-22', to: '2026-07-22' }, 100, client);
+    const swapped = rows.find((r) => r.orderId === 'o-swapped')!;
+    const paid = rows.find((r) => r.orderId === 'o-paid')!;
+    expect(swapped).toMatchObject({
+      totalCny: 450,
+      costCny: 0,
+      grossMarginCny: 450,
+      marginPct: 1,
+      missingCostItemCount: 0,
+      itemCount: 2,
+    });
+    // 对照：接手单同一班次照常按实时成本算（包机 1000 ÷ 10 座 × 1）。
+    expect(paid).toMatchObject({ costCny: 100, grossMarginCny: 900, missingCostItemCount: 0 });
+  });
+
+  it('getOrderPnlDetail：已换人单每一行成本 0、杂项 0、毛利 = 换人费；行照列出不隐藏', async () => {
+    const order: DetailOrderFixture = {
+      id: 'o-swapped',
+      orderNumber: 'FTM-SWAPPED',
+      status: 'SWAPPED',
+      contactName: '被换下的客人',
+      total: 450,
+      createdAt: new Date('2026-07-22T02:00:00Z'),
+      agent: null,
+      costItems: [{ category: 'GUIDE_SERVICE', amountCny: 120, note: null }],
+      items: [
+        detailItem({ kind: 'HOTEL', description: '房费', amount: 3954, totalCostCny: 800 }),
+        detailItem({
+          kind: 'DISCOUNT',
+          description: '价格调整：换人费（−¥3504）',
+          amount: -3504,
+          totalCostCny: 0,
+          metadata: { priceAdjustment: true },
+        }),
+      ],
+    };
+    const detail = (await getOrderPnlDetail('o-swapped', detailClient(order)))!;
+    expect(detail.income.itemsSumCny).toBe(450);
+    expect(detail.cost.itemRows.map((r) => r.totalCostCny)).toEqual([0, 0]);
+    expect(detail.cost.miscRows).toEqual([expect.objectContaining({ category: 'GUIDE_SERVICE', amountCny: 0 })]);
+    expect(detail.cost).toMatchObject({
+      itemCostCny: 0,
+      miscCostCny: 0,
+      totalWithMiscCny: 0,
+      missingCostItemCount: 0,
+    });
+    expect(detail.grossMarginCny).toBe(450);
+    expect(detail.grossMarginWithMiscCny).toBe(450);
+    expect(detail.marginPct).toBe(1);
+  });
+
+  it('getMonthlyTrend：已换人单收入照计、成本 0 且不算缺，毛利不因它变「未知」', async () => {
+    const client = {
+      order: {
+        findMany: vi.fn(async () => [
+          { status: 'SWAPPED', items: [{ amount: 450, totalCostCny: null }] },
+          { status: 'PAID', items: [{ amount: 1000, totalCostCny: 600 }] },
+        ]),
+      },
+    } as unknown as PrismaClient;
+    const [point] = await getMonthlyTrend(1, client);
+    expect(point).toMatchObject({
+      revenueCny: 1450,
+      costCny: 600,
+      grossMarginCny: 850,
+      missingCostItemCount: 0,
+      orderCount: 2,
+    });
   });
 });

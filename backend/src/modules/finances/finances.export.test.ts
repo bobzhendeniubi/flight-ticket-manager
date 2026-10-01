@@ -311,3 +311,83 @@ describe('buildFinanceExportWorkbook — 原地换人记录列', () => {
     expect(ws.getRow(3).getCell(col).value).toBe('');
   });
 });
+
+// ── 已换人（SWAPPED）单：成本列一律 0、人数不计被换下的人；收入列照常（order-cost-policy）──
+describe('buildFinanceExportWorkbook — 已换人单成本按 0', () => {
+  /** 同一套明细：房费快照 800、导游服务费 200、两位乘客；只有状态与应收不同。 */
+  function orderWith(status: string, orderNumber: string, total: number): OrderFixture {
+    return makeOrder({
+      orderNumber,
+      status,
+      total,
+      paidAmount: total,
+      passengers: [
+        { id: `${orderNumber}-p1`, fullName: '张三', lastName: null, firstName: null },
+        { id: `${orderNumber}-p2`, fullName: '李四', lastName: null, firstName: null },
+      ],
+      costItems: [{ category: 'GUIDE_SERVICE', amountCny: 200 }],
+      items: [
+        {
+          kind: 'HOTEL',
+          amount: total,
+          quantity: 1,
+          totalCostCny: 800,
+          hotelCheckIn: null,
+          hotelCheckOut: null,
+          hotelRoomTypeId: null,
+          hotelRoomType: null,
+          randomStarTier: null,
+          flightSchedule: null,
+          visa: null,
+          transfer: null,
+          fulfillmentTasks: [],
+        },
+      ],
+    });
+  }
+
+  it('已换人行：成本列全 0、客单利润 = 客单收入、人数 0；对照的已支付单照常算成本', async () => {
+    const client = fakeClient([
+      orderWith('SWAPPED', 'FTMSWAP01', 450),
+      orderWith('PAID', 'FTMPAID01', 1000),
+    ]);
+    const ws = (await loadWorkbook(await buildFinanceExportWorkbook(RANGE, client))).getWorksheet(
+      '财务核对收入明细',
+    )!;
+    const headers = ws.getRow(1).values as unknown[];
+    const col = (header: string): number => {
+      const index = headers.indexOf(header);
+      expect(index).toBeGreaterThan(0);
+      return index;
+    };
+    const cell = (row: number, header: string) => ws.getRow(row).getCell(col(header)).value;
+
+    // 行 2/3 = 已换人单两位乘客；行 4/5 = 已支付单两位乘客（订单级合计只写在各自第一位乘客行）。
+    expect(cell(2, '订单状态')).toBe('已换人');
+    expect(cell(2, '人数')).toBe(0);
+    for (const header of [
+      '房费(RMB)',
+      '导游服务费(RMB)',
+      '杂项(赠送+手续费+操作费+其他)(RMB)',
+      '客单成本合计',
+      '酒店支出',
+      '总成本',
+    ]) {
+      expect(cell(2, header)).toBe(0);
+      expect(cell(3, header)).toBe(0);
+    }
+    expect(cell(2, '客单收入')).toBe(225);
+    expect(cell(2, '客单利润')).toBe(225);
+    expect(cell(2, '总收入')).toBe(450);
+    expect(cell(2, '毛利')).toBe(450);
+
+    expect(cell(4, '订单状态')).toBe('已支付');
+    expect(cell(4, '人数')).toBe(2);
+    expect(cell(4, '房费(RMB)')).toBe(400);
+    expect(cell(4, '导游服务费(RMB)')).toBe(100);
+    expect(cell(4, '客单成本合计')).toBe(500);
+    expect(cell(4, '酒店支出')).toBe(800);
+    expect(cell(4, '总成本')).toBe(1000);
+    expect(cell(4, '毛利')).toBe(0);
+  });
+});

@@ -36,6 +36,8 @@ import {
   resolveFlightItemCost,
   resolveScheduleCost,
 } from './finances.cost.service.js';
+// 已换人单成本一律按 0：汇总 / 毛利 / 趋势与三份导出共用同一判定，不在各处另写状态集合。
+import { isZeroCostOrder } from './order-cost-policy.js';
 
 export interface DateRange {
   /** ISO date 'YYYY-MM-DD'，包含 */
@@ -368,6 +370,8 @@ export async function getFinancesSummary(
     where: { deletedAt: null, createdAt: { gte: from, lte: to }, status: { in: COUNTED_STATUSES } },
     select: {
       id: true,
+      // 已换人单成本按 0 的判定要看状态（isZeroCostOrder）
+      status: true,
       total: true,
       // 车队越南盾回退实时折算时的服务日回退层：去程出发日 → 下单日
       createdAt: true,
@@ -458,11 +462,13 @@ export async function getFinancesSummary(
     const paxCount = Math.max(1, o.passengers.length);
     // 需签乘客数（非自备签）—— 签证实际成本按此人均折算
     const visaPax = o.passengers.filter((p) => !p.visaExempt).length;
+    // 已换人单：收入（换人费）照记，成本一律按 0 且不算缺成本（口径见 order-cost-policy.ts）。
+    const zeroCost = isZeroCostOrder(o);
 
     // 旧粗粒度 categoryMap（兼容老 UI）+ 总收入/成本
     for (const item of o.items) {
       const amt = dec(item.amount);
-      const c = item.totalCostCny == null ? null : dec(item.totalCostCny);
+      const c = zeroCost ? 0 : item.totalCostCny == null ? null : dec(item.totalCostCny);
       revenueCny += amt;
       if (c != null) costCny += c;
       else missingCostItemCount += 1;
@@ -504,17 +510,20 @@ export async function getFinancesSummary(
       // 该 leg 总成本各项 × paxCount
       const charterCost = perSeatCharter * paxCount;
       const taxCost = (taxDep + taxArr) * paxCount;
-      if (isOutbound) {
-        cost.outboundCharter += charterCost;
-        cost.outboundTax += taxCost;
-      } else {
-        cost.returnCharter += charterCost;
-        cost.returnTax += taxCost;
+      // 已换人单不计机票成本（座位已释放、由接手新单承担）；taxCost 仍留给下面的收入拆分用。
+      if (!zeroCost) {
+        if (isOutbound) {
+          cost.outboundCharter += charterCost;
+          cost.outboundTax += taxCost;
+        } else {
+          cost.returnCharter += charterCost;
+          cost.returnTax += taxCost;
+        }
+        cost.peakSurcharge += peak * paxCount;
+        cost.fuel += fuel * paxCount;
+        cost.aircraftAdjust += adj * paxCount;
+        cost.takeoffDiscount += disc * paxCount;
       }
-      cost.peakSurcharge += peak * paxCount;
-      cost.fuel += fuel * paxCount;
-      cost.aircraftAdjust += adj * paxCount;
-      cost.takeoffDiscount += disc * paxCount;
 
       // 收入：FLIGHT amount 按 leg 分（去程 / 返程）。机场税已含在票价 amt 里（无单独向客人收税的行），
       // 故把税从票款里"拆出来单列"，而非在 amt 之外再加一遍——否则 rev.total 会比顶部 KPI(revenueCny)
@@ -535,9 +544,11 @@ export async function getFinancesSummary(
       if (it.kind === 'FLIGHT') continue;
       const amt = dec(it.amount);
       const cSnap = it.totalCostCny == null ? null : dec(it.totalCostCny);
+      // 每个 case 先记收入，已换人单到此为止（成本一律 0），其余状态再往下算成本。
       switch (it.kind) {
         case 'HOTEL': {
           rev.hotel += amt;
+          if (zeroCost) break;
           // 优先用 snapshot；否则按晚取价（区间净房价优先，否则缺省 costPriceCny）累加 × quantity；
           // 无入住日期 → 缺省价 × 1 晚 × quantity（原口径）；任一晚取不到价 → 不计（真缺数据不虚构）。
           if (cSnap != null) cost.hotel += cSnap;
@@ -558,6 +569,7 @@ export async function getFinancesSummary(
         }
         case 'VISA': {
           rev.visa += amt;
+          if (zeroCost) break;
           // 签证成本口径（与 finances.export 共用 visaItemCostCny）：
           // 任务结构化人均成本优先 → 录单快照 → 产品主数据；均无则 0（缺成本）。
           const taskCny = decOrNull(it.fulfillmentTasks?.[0]?.visaUnitCostCny);
@@ -573,6 +585,7 @@ export async function getFinancesSummary(
         }
         case 'TRANSFER': {
           rev.transfer += amt;
+          if (zeroCost) break;
           // 优先用 snapshot；否则按产品现行结算价 × quantity（越南盾按服务日 = 去程出发日 → 下单日 生效的
           // VND 汇率行折人民币；缺汇率 / 没录成本 → 不计，真缺数据不虚构）。
           if (cSnap != null) cost.transfer += cSnap;
@@ -591,25 +604,25 @@ export async function getFinancesSummary(
         }
         case 'GUIDE':
           rev.guide += amt;
-          if (cSnap != null) cost.other += cSnap;
+          if (!zeroCost && cSnap != null) cost.other += cSnap;
           break;
         case 'UPGRADE_CHANGE':
           rev.upgradeChange += amt;
-          if (cSnap != null) cost.other += cSnap;
+          if (!zeroCost && cSnap != null) cost.other += cSnap;
           break;
         case 'OVERSALE':
           rev.oversale += amt;
-          if (cSnap != null) cost.other += cSnap;
+          if (!zeroCost && cSnap != null) cost.other += cSnap;
           break;
         default:
           // BUNDLE / INSURANCE / FEE / DISCOUNT
           rev.uncategorized += amt;
-          if (cSnap != null) cost.other += cSnap;
+          if (!zeroCost && cSnap != null) cost.other += cSnap;
       }
     }
 
-    // OrderCostItem 按 category 拆分
-    for (const ci of o.costItems) {
+    // OrderCostItem 按 category 拆分（已换人单的杂项成本同样按 0，不进任何一类）
+    for (const ci of zeroCost ? [] : o.costItems) {
       const a = dec(ci.amountCny);
       switch (ci.category) {
         case 'GUIDE_SERVICE': cost.guideService += a; break;
@@ -852,7 +865,8 @@ export async function getOrderPnl(
   return orders.map<OrderPnlRow>((o) => {
     let costSum = 0;
     let missing = 0;
-    for (const it of o.items) {
+    // 已换人单：成本一律按 0、不算缺成本（口径见 order-cost-policy.ts）——明细行一行不看。
+    for (const it of isZeroCostOrder(o) ? [] : o.items) {
       const cost =
         it.kind === 'FLIGHT'
           ? (() => {
@@ -974,11 +988,15 @@ export async function getOrderPnlDetail(
     ),
   );
   const periodsMap = await loadPeriodsByFlightIds(flightIds, client);
+  // 已换人单：每一行成本都按 0（行照列出，让人看得见有哪些明细、但一分成本不归本单），
+  // 杂项同样 0，不算缺成本（口径见 order-cost-policy.ts）。
+  const zeroCost = isZeroCostOrder(order);
   let itemCostSum = 0;
   let missing = 0;
   const costItemRows = order.items.map<OrderPnlDetailCostRow>((it) => {
-    const c =
-      it.kind === 'FLIGHT'
+    const c = zeroCost
+      ? 0
+      : it.kind === 'FLIGHT'
         ? it.flightSchedule == null
           ? null
           : resolveFlightItemCost(
@@ -1005,10 +1023,12 @@ export async function getOrderPnlDetail(
   const miscRows = order.costItems.map<OrderPnlDetailMiscRow>((ci) => ({
     label: ORDER_COST_CATEGORY_LABEL[ci.category] ?? ci.category,
     category: ci.category,
-    amountCny: round2(dec(ci.amountCny)),
+    amountCny: zeroCost ? 0 : round2(dec(ci.amountCny)),
     note: ci.note ?? null,
   }));
-  const miscCostCny = round2(order.costItems.reduce((a, ci) => a + dec(ci.amountCny), 0));
+  const miscCostCny = zeroCost
+    ? 0
+    : round2(order.costItems.reduce((a, ci) => a + dec(ci.amountCny), 0));
 
   const totalCny = round2(dec(order.total));
   const grossMarginCny = itemCostCny == null ? null : round2(totalCny - itemCostCny);
@@ -1072,15 +1092,18 @@ export async function getMonthlyTrend(
         createdAt: { gte: monthStart, lt: monthEnd },
         status: { in: COUNTED_STATUSES },
       },
-      select: { items: { select: { amount: true, totalCostCny: true } } },
+      select: { status: true, items: { select: { amount: true, totalCostCny: true } } },
     });
 
     let revenue = 0;
     let cost = 0;
     let missingCostItemCount = 0;
     for (const o of orders) {
+      // 已换人单：收入照计，成本一律 0 且不算缺（口径见 order-cost-policy.ts）。
+      const zeroCost = isZeroCostOrder(o);
       for (const it of o.items) {
         revenue += dec(it.amount);
+        if (zeroCost) continue;
         if (it.totalCostCny != null) cost += dec(it.totalCostCny);
         else missingCostItemCount += 1;
       }
