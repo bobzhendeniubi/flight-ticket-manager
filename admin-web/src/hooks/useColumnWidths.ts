@@ -60,6 +60,33 @@ export function serializeColumnWidths<K extends string>(
   return changed ? JSON.stringify(diff) : null;
 }
 
+/**
+ * 弹性列默认宽的占位值：defaults 里某列给 0，表示「用户没拖过 → 由调用方按容器宽自适应」。
+ * 存储里的值一律夹到 ≥ min，所以拖过的列永远不会等于 0；恢复默认（单列/全部）即回到弹性。
+ */
+export const FLEX_COLUMN_WIDTH = 0;
+
+/**
+ * 弹性列的有效宽：容器剩下的宽度（容器宽 − 其它可见列宽之和）夹在 [min, max] 里。
+ * 容器还没量到（≤0，首帧 / 测试环境无 ResizeObserver）时用 fallback，避免首屏闪成最窄。
+ */
+export function resolveFlexColumnWidth(opts: {
+  containerWidth: number;
+  otherColumnsWidth: number;
+  min: number;
+  max: number;
+  fallback: number;
+}): number {
+  const { containerWidth, otherColumnsWidth, min, max, fallback } = opts;
+  if (!Number.isFinite(containerWidth) || containerWidth <= 0) return fallback;
+  return Math.round(Math.min(max, Math.max(min, containerWidth - otherColumnsWidth)));
+}
+
+/** 表宽：至少铺满容器；各列之和更宽时按列宽撑开，交给外层横滑。 */
+export function resolveTableWidth(containerWidth: number, columnsWidth: number): number {
+  return Math.max(Number.isFinite(containerWidth) ? containerWidth : 0, columnsWidth);
+}
+
 function readColumnWidths<K extends string>(
   storageKey: string,
   defaults: ColumnWidths<K>,

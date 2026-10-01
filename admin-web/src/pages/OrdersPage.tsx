@@ -12,7 +12,12 @@ import { businessTzParts, formatDateCn, formatDateTimeSecCn, formatInBusinessTz 
 import { NumberInput } from '../components/NumberInput';
 import { Icon, type IconName } from '../components/Icon';
 import { ColumnResizeHandle } from '../components/ColumnResizeHandle';
-import { useColumnWidths } from '../hooks/useColumnWidths';
+import {
+  FLEX_COLUMN_WIDTH,
+  resolveFlexColumnWidth,
+  resolveTableWidth,
+  useColumnWidths,
+} from '../hooks/useColumnWidths';
 import { parseOtaRoster } from '../lib/parseOtaRoster';
 import { computePerPaxSettlement } from '../lib/perPaxSettlement';
 import { toOrdersExportFilter } from '../lib/api';
@@ -730,26 +735,35 @@ const ORDER_FIXED_COLUMN_COUNT = 4;
 
 // ── 列宽（表头拖柄调整，按人记住）───────────────────────────────────────
 // 可拖列 = 9 个可隐藏列 + 「内容」；勾选框 / 序号 / 操作三列宽度固定（操作列 sticky 右侧，
-// 宽度按里面的下拉+按钮定死，拖窄会把按钮挤出格子）。默认宽尽量贴近原先 auto 布局下的观感。
+// 宽度按里面的下拉+按钮定死，拖窄会把按钮挤出格子）。
+// 默认宽按单元格实测内容给、不留大白边：不换行的列（订单号 / 往返团期 / 开票三点 / 下单时间）
+// 给到刚好放下；能换行的列（客户名、金额「含售后」、尾款/状态/签证徽标）收窄，让字折行。
+// 「内容」默认是弹性列（FLEX_COLUMN_WIDTH）：没拖过时吃掉容器剩下的宽度（夹在 280–900），
+// 宽屏收起侧栏就自动变宽、窄屏也不至于把其它列全挤出视野；一旦拖过就按拖的值，恢复默认回到弹性。
 const ORDER_COLUMN_WIDTH_STORAGE_KEY = 'ftm-orders-colwidths';
 type ResizableOrderColumnKey = OrderColumnKey | 'content';
 const ORDER_COLUMN_DEFAULT_WIDTHS: Readonly<Record<ResizableOrderColumnKey, number>> = {
-  orderNumber: 150,
-  customer: 160,
-  content: 600,
-  departDate: 140,
-  amount: 112,
-  balance: 104,
-  status: 104,
-  visa: 104,
-  invoice: 72,
-  createdAt: 124,
+  // 注：单元格 overflow-hidden 裁在内边距外沿，内容可以吃进左右各 12px 的内边距，下面按此收紧。
+  orderNumber: 128, // FTM + 13 位等宽字，实测 116
+  customer: 104, // 11 位手机号实测 86；客户/代理名截断，悬浮看全文
+  content: FLEX_COLUMN_WIDTH,
+  departDate: 144, // 「去 QH9589 2026-09-30」实测 131
+  amount: 76, // 「¥12,345」实测 57，「含售后」折到下一行
+  balance: 80,
+  status: 72,
+  visa: 76,
+  invoice: 104, // 去/回/系 三个点实测 97，居中
+  createdAt: 80, // 「09/30 14:05」实测 67
 };
+const ORDER_CONTENT_FLEX_MIN = 280;
+const ORDER_CONTENT_FLEX_MAX = 900;
+/** 容器宽还没量到（首帧）时内容列先用这个宽度 */
+const ORDER_CONTENT_FLEX_FALLBACK = 360;
 const ORDER_SELECT_COLUMN_WIDTH = 40;
-const ORDER_INDEX_COLUMN_WIDTH = 52;
-/** 操作列：px-2 + 改状态下拉 w-20 + 「详情」+（内部员工多一颗「删除」） */
-const ORDER_ACTION_COLUMN_WIDTH_WITH_DELETE = 216;
-const ORDER_ACTION_COLUMN_WIDTH = 136;
+const ORDER_INDEX_COLUMN_WIDTH = 48;
+/** 操作列：px-2 + 改状态下拉 w-20 + 「详情」+（内部员工多一颗「删除」），按实测 206/126 留 2px 余量 */
+const ORDER_ACTION_COLUMN_WIDTH_WITH_DELETE = 208;
+const ORDER_ACTION_COLUMN_WIDTH = 128;
 
 /** 读本机列配置；缺字段按「显示」补全，解析失败/无 localStorage 时全显（永远不会把表读空）。 */
 function readColumnVisibility(storageKey: string): OrderColumnVisibility {
@@ -1265,19 +1279,46 @@ export function OrdersPage() {
     // 「内容」不可隐藏，固定紧跟在「客户 / 代理」之后（与表头顺序一致）
     return c.key === 'customer' ? [...cols, 'content'] : cols;
   });
-  // 表宽 = 可见列宽之和（table-fixed 下列宽说了算；超出容器由外层 overflow-x-auto 横滑，操作列 sticky 右侧）。
-  const orderTableWidth =
+  // 外层横滑容器的可视宽（ResizeObserver 跟踪：收起侧栏 / 拉窗口都会变）——「内容」弹性宽与表宽都按它算。
+  const [orderTableScroller, setOrderTableScroller] = useState<HTMLDivElement | null>(null);
+  const [orderTableContainerWidth, setOrderTableContainerWidth] = useState(0);
+  useEffect(() => {
+    if (!orderTableScroller) return;
+    const measure = () => setOrderTableContainerWidth(orderTableScroller.clientWidth);
+    measure();
+    if (typeof ResizeObserver === 'undefined') return;
+    const ro = new ResizeObserver(measure);
+    ro.observe(orderTableScroller);
+    return () => ro.disconnect();
+  }, [orderTableScroller]);
+  const otherColumnsWidth =
     ORDER_SELECT_COLUMN_WIDTH +
     ORDER_INDEX_COLUMN_WIDTH +
-    visibleResizableColumns.reduce((sum, k) => sum + columnWidths[k], 0) +
+    visibleResizableColumns.reduce((sum, k) => (k === 'content' ? sum : sum + columnWidths[k]), 0) +
     actionColumnWidth;
+  // 「内容」实际渲染宽：没拖过（仍是弹性占位值）→ 吃掉容器剩余宽；拖过 → 用拖的值。
+  const contentColumnWidth =
+    columnWidths.content === FLEX_COLUMN_WIDTH
+      ? resolveFlexColumnWidth({
+          containerWidth: orderTableContainerWidth,
+          otherColumnsWidth,
+          min: ORDER_CONTENT_FLEX_MIN,
+          max: ORDER_CONTENT_FLEX_MAX,
+          fallback: ORDER_CONTENT_FLEX_FALLBACK,
+        })
+      : columnWidths.content;
+  const renderedColumnWidth = (key: ResizableOrderColumnKey) =>
+    key === 'content' ? contentColumnWidth : columnWidths[key];
+  // 表宽 = max(容器宽, 各列之和)：列少时铺满不留白，列多时按列宽撑开、外层 overflow-x-auto 横滑，
+  // 操作列 sticky 右侧。
+  const orderTableWidth = resolveTableWidth(orderTableContainerWidth, otherColumnsWidth + contentColumnWidth);
   /** 可拖列的表头：相对定位 + 文字截断 + 右缘拖柄。 */
   const resizableHeader = (key: ResizableOrderColumnKey, label: string, align = 'text-left') => (
     <th className={`relative truncate ${align}`} title={label}>
       {label}
       <ColumnResizeHandle
         label={label}
-        width={columnWidths[key]}
+        width={renderedColumnWidth(key)}
         onResize={(px) => setColumnWidth(key, px)}
         onCommit={persistColumnWidths}
         onReset={() => resetColumnWidth(key)}
@@ -4520,10 +4561,10 @@ export function OrdersPage() {
             </button>
           </div>
         </div>
-        <div className="overflow-x-auto">
-          {/* table-fixed + colgroup：列宽由 columnWidths 说了算（表头右缘可拖），表宽 = 可见列宽之和；
-              比容器宽时外层横滑，「操作」列 sticky 右侧照旧。除 sticky 的操作列外单元格一律
-              overflow-hidden，窄列截断而不是溢进隔壁列。 */}
+        <div ref={setOrderTableScroller} className="overflow-x-auto">
+          {/* table-fixed + colgroup：列宽由 columnWidths 说了算（表头右缘可拖，「内容」没拖过时随容器自适应），
+              表宽 = max(容器宽, 各列之和)；比容器宽时外层横滑，「操作」列 sticky 右侧照旧。
+              除 sticky 的操作列外单元格一律 overflow-hidden，窄列截断而不是溢进隔壁列。 */}
           <table
             className="table-admin table-fixed [&_tbody_td:not(.sticky)]:overflow-hidden"
             style={{ width: orderTableWidth }}
@@ -4532,7 +4573,7 @@ export function OrdersPage() {
               <col style={{ width: ORDER_SELECT_COLUMN_WIDTH }} />
               <col style={{ width: ORDER_INDEX_COLUMN_WIDTH }} />
               {visibleResizableColumns.map((key) => (
-                <col key={key} style={{ width: columnWidths[key] }} />
+                <col key={key} style={{ width: renderedColumnWidth(key) }} />
               ))}
               <col style={{ width: actionColumnWidth }} />
             </colgroup>
@@ -4599,7 +4640,7 @@ export function OrdersPage() {
                   {columnVisibility.customer && (
                   <td>
                     {/* 客户名 / 代理名都可能很长（尤其代理机构全称）：按列宽 truncate，悬浮看全文。
-                        列宽由表头拖柄决定（默认 160px，运营原话：代理那一列就可以窄点）——原先挂在这一列
+                        列宽由表头拖柄决定（默认 112px，运营原话：代理那一列就可以窄点）——原先挂在这一列
                         第四行的备注预览已经挪进「内容」列底部，这列只剩客户名/电话/代理名三行。 */}
                     {/* 客户名弱化（运营原话：主角是乘客和航班，不是客户/录单人）：
                         字重 font-medium→常规、颜色 text-ink→text-ink-soft，不再抢眼。 */}
