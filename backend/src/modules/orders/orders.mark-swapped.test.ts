@@ -181,6 +181,48 @@ describe('markSwapped · 准入闸', () => {
   });
 });
 
+describe('markSwapped · 应收基准 = Σ 明细行 + adjustmentCny（不用 Order.total）', () => {
+  it('total 与明细行不一致：差额按 Σ 明细行算；调价后应收 ≠ 换人费 → 409 回滚，不转存多付', async () => {
+    // Order.total 落了 5000，明细行却是 2577 × 2 = 5154（历史脏数据 / 旧路径裸改过 total）。
+    // 旧实现按 total 算差额 = 1650 − 5000 = −3350，调价内核却按 Σ 明细行重算 total = 5154 − 3350 = 1804，
+    // 落库应收 1804 ≠ 换人费 1650，多出的 154 会被原样搬进代理余额。
+    mockTx.$queryRaw.mockResolvedValueOnce([lockedRow({ total: dec(5000), paidAmount: dec(5154) })]);
+    mockTx.orderItem.findMany.mockResolvedValueOnce([{ amount: dec(2577) }, { amount: dec(2577) }]);
+    // 模拟内核按「Σ 明细行 + 差额」之外的口径把 total 算歪（afterTotal 1804）：断言必须拦下并整单回滚。
+    const adjustSpy = vi
+      .spyOn(service, '_addPriceAdjustmentWithinTx')
+      .mockResolvedValue({ itemId: 'adj-1', afterTotal: '1804' } as never);
+    const creditSpy = vi.spyOn(service, '_creditOverpayToAgentWithinTx');
+
+    await expect(
+      service.markSwapped('order-a', { swapFeeCny: 1650 }, STAFF),
+    ).rejects.toMatchObject({ constructor: ConflictError, message: expect.stringMatching(/与换人费 ¥1650 不一致/) });
+
+    // 差额按 Σ 明细行（5154）算：1650 − 5154 = −3504，不是按 total 的 −3350。
+    expect(adjustSpy).toHaveBeenCalledTimes(1);
+    expect(adjustSpy.mock.calls[0][2]).toMatchObject({ amountCny: -3504, reasonCode: 'SWAP_FEE' });
+    // 断言在多付转存之前：一分钱没动。
+    expect(creditSpy).not.toHaveBeenCalled();
+    expect(mockTx.order.update).not.toHaveBeenCalled();
+    adjustSpy.mockRestore();
+    creditSpy.mockRestore();
+  });
+
+  it('差额为 0 但 total ≠ Σ 明细行：没有差额行去重算 total → 同样 409，不带着错账往下走', async () => {
+    // Σ 明细行 1650 == 换人费 → 差额 0、不落调价行；但 total 还是脏的 1500 → 应收 1500 ≠ 1650。
+    mockTx.$queryRaw.mockResolvedValueOnce([lockedRow({ total: dec(1500), paidAmount: dec(1650) })]);
+    mockTx.orderItem.findMany.mockResolvedValueOnce([{ amount: dec(1650) }]);
+    const adjustSpy = vi.spyOn(service, '_addPriceAdjustmentWithinTx');
+
+    await expect(
+      service.markSwapped('order-a', { swapFeeCny: 1650 }, STAFF),
+    ).rejects.toBeInstanceOf(ConflictError);
+    expect(adjustSpy).not.toHaveBeenCalled();
+    expect(mockTx.order.update).not.toHaveBeenCalled();
+    adjustSpy.mockRestore();
+  });
+});
+
 describe('账目闸：不能绕过端点直接把状态翻成「已换人」', () => {
   it('PATCH /status → SWAPPED（admin force）也被拦：只翻状态不会收敛应收、不会转存多付', async () => {
     mockTx.order.findUnique.mockResolvedValueOnce({

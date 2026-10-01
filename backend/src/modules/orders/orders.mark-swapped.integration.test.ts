@@ -90,18 +90,21 @@ async function createPaidOrder(input: {
   totalCny: number;
   paidCny: number;
   status?: OrderStatus;
+  /** 落库的 Order.total（默认 = 明细行合计 totalCny）；传一个不同的值模拟 total 与明细行脱节的脏单。 */
+  storedTotalCny?: number;
 }) {
   const flown = await createLeg(-48);
   const upcoming = await createLeg(100);
   const half = input.totalCny / 2;
+  const storedTotal = input.storedTotalCny ?? input.totalCny;
   const order = await prisma.order.create({
     data: {
       orderNumber: `TEST-MS-${Date.now()}-${Math.random().toString(36).slice(2, 6)}`,
       userId: input.userId,
       agentId: input.agentId,
       status: input.status ?? OrderStatus.PAID,
-      subtotal: new Prisma.Decimal(input.totalCny),
-      total: new Prisma.Decimal(input.totalCny),
+      subtotal: new Prisma.Decimal(storedTotal),
+      total: new Prisma.Decimal(storedTotal),
       paidAmount: new Prisma.Decimal(input.paidCny),
       contactName: '原订单客户',
       contactPhone: '13800138000',
@@ -256,6 +259,51 @@ describe('OrderService.markSwapped · 真 DB E2E', () => {
     // 接手单一分钱都没动。
     const replacementAfter = await prisma.order.findUniqueOrThrow({ where: { id: replacement.id } });
     expect(Number(replacementAfter.paidAmount)).toBe(0);
+  });
+
+  it('total 与明细行脱节（total 5000、明细 5154）：差额按明细行算，落库应收恰好 = 换人费，多付只转 3504', async () => {
+    // 旧实现按 total 算差额（1650 − 5000 = −3350），内核却按 Σ 明细行重算 total → 1804 ≠ 1650，
+    // 多出的 154 会被当成「应收」留在单上、代理余额只进 3350。现在以 Σ 明细行为基准，钱一分不错位。
+    const customer = await createUser(UserRole.CUSTOMER);
+    const staff = await createUser(UserRole.STAFF);
+    const { agent } = await createAgent();
+    const { order } = await createPaidOrder({
+      userId: customer.id,
+      agentId: agent.id,
+      totalCny: 5154,
+      storedTotalCny: 5000,
+      paidCny: 5154,
+    });
+
+    const result = await service.markSwapped(order.id, { swapFeeCny: 1650 }, { userId: staff.id, role: UserRole.STAFF });
+
+    expect(result.audit).toMatchObject({ beforePayableCny: 5154, adjustmentDeltaCny: -3504, outstandingCny: 0 });
+    expect(result.audit.disposal).toMatchObject({ kind: 'AGENT_BALANCE', amountCny: 3504 });
+    const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id }, include: { items: true } });
+    expect(Number(reloaded.total)).toBe(1650);
+    expect(Number(reloaded.paidAmount)).toBe(1650);
+    const feeRow = reloaded.items.find(
+      (it) => (it.metadata as { reasonCode?: string } | null)?.reasonCode === 'SWAP_FEE',
+    );
+    expect(Number(feeRow!.amount)).toBe(-3504);
+    const agentAfter = await prisma.agent.findUniqueOrThrow({ where: { id: agent.id } });
+    expect(Number(agentAfter.prepaymentBalance)).toBe(3504);
+  });
+
+  it('差额为 0 但 total 与明细行脱节：没有差额行去重算 total → 409 整单回滚，订单原样不动', async () => {
+    const customer = await createUser(UserRole.CUSTOMER);
+    const staff = await createUser(UserRole.STAFF);
+    const { order, upcoming } = await createPaidOrder({ userId: customer.id, totalCny: 1650, storedTotalCny: 1500, paidCny: 1650 });
+
+    await expect(
+      service.markSwapped(order.id, { swapFeeCny: 1650 }, { userId: staff.id, role: UserRole.STAFF }),
+    ).rejects.toBeInstanceOf(ConflictError);
+    const reloaded = await prisma.order.findUniqueOrThrow({ where: { id: order.id } });
+    expect(reloaded.status).toBe(OrderStatus.PAID);
+    expect(Number(reloaded.total)).toBe(1500);
+    expect(Number(reloaded.paidAmount)).toBe(1650);
+    const seat = await prisma.flightSeatClass.findUniqueOrThrow({ where: { id: upcoming.seatClass.id } });
+    expect(seat.sold).toBe(1);
   });
 
   it('直客单：已收 1000、换人费 450 → 多出 550 转挂账池（OPEN 进账，来源订单超额），订单结清', async () => {

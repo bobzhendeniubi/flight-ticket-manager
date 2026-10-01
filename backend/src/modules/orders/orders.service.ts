@@ -526,7 +526,7 @@ export interface MarkSwappedAudit {
   orderNumber: string;
   fromStatus: OrderStatus;
   swapFeeCny: number;
-  /** 收敛前的应收（total + adjustmentCny）。 */
+  /** 收敛前的应收（Σ 明细行 + adjustmentCny，与调价内核重算 total 的口径一致；刻意不用 Order.total）。 */
   beforePayableCny: number;
   /** 净收款（已付 − 已完成退款 + 预存抵扣）。 */
   netPaidCny: number;
@@ -10538,8 +10538,10 @@ export class OrderService {
    * 与「换人退款」（swapRefund：多出的钱退现金）的区别：这条路**钱留在系统里**——
    * 原单只收换人费，多出的钱转进代理余额（代理单）或挂账池（直客单），运营再用它抵新单尾款；
    * 收不够的照常当欠款催收。一个事务里依次：
-   *   a. 调价：加一条 SWAP_FEE 差额行把应收（total + adjustmentCny）收敛到换人费（复用事后调价内核，
-   *      结算价锁 / 调价资金闸同一套）；差额为 0 不留空行。换人费 0 = 一分不收（合法）。
+   *   a. 调价：加一条 SWAP_FEE 差额行把应收收敛到换人费（复用事后调价内核，结算价锁 / 调价资金闸
+   *      同一套）。应收基准 = Σ 明细行 + adjustmentCny——与内核重算 total 的口径一致，刻意不用
+   *      Order.total（它与 Σ 明细行一旦不一致，按它算差额会让落库应收 ≠ 换人费，差额被 b 搬进余额/池）；
+   *      调价后断言「最终应收 === 换人费」，不等就整单回滚。差额为 0 不留空行。换人费 0 = 一分不收（合法）。
    *   b. 净收款 > 换人费 → 多出部分转存：代理单走 _creditOverpayToAgentWithinTx，直客单走
    *      _overpayToPoolWithinTx（同一内核，收款复核锁在那里生效：锁着就拒，先解锁）；订单回压到恰好结清。
    *      净收款 < 换人费 → 不动钱，欠款留在单上（应收 > 已收），后续照常收款。
@@ -10630,8 +10632,6 @@ export class OrderService {
       const prepaymentOffsetCny = round2(Number(locked.prepaymentOffset));
       // 净收款 = 已付 − 已完成退款 + 预存抵扣（与多付转存内核的清账口径一字一致）。
       const netPaidCny = round2(paidCny - refundedCny + prepaymentOffsetCny);
-      // 应收（清账口径）= total + adjustmentCny：改期费等售后费也在内，一并收敛到换人费。
-      const beforePayableCny = round2(Number(locked.total) + locked.adjustmentCny);
       const overpayCny = Math.max(0, round2(netPaidCny - swapFeeCny));
       const outstandingCny = Math.max(0, round2(swapFeeCny - netPaidCny));
       if (overpayCny > 0) {
@@ -10654,9 +10654,19 @@ export class OrderService {
         }
       }
 
+      // 应收基准 = Σ 明细行 + adjustmentCny（改期费等售后费也在内，一并收敛到换人费）。
+      // 刻意不用 Order.total：调价内核（_addPriceAdjustmentWithinTx）落差额行后按「Σ 既有行 + 差额」重算
+      // total——若 total 与 Σ 明细行早已不一致（历史脏数据 / 旧路径裸改过 total），按 total 算差额会让落库
+      // 应收 ≠ 换人费，多出的差额再被下面的多付转存原样搬进代理余额 / 挂账池。行锁已持有，这里读的就是终值；
+      // 放在全部准入闸之后，闸没过就不多读一次明细。
+      const itemRows = await tx.orderItem.findMany({ where: { orderId }, select: { amount: true } });
+      const itemsSumCny = round2(itemRows.reduce((sum, it) => sum + Number(it.amount.toString()), 0));
+      const beforePayableCny = round2(itemsSumCny + locked.adjustmentCny);
+
       // ── a. 调价：应收收敛到换人费（复用事后调价内核：锁价闸 / 资金闸 / 差额行 / 重算 total）──
       const adjustmentDeltaCny = round2(swapFeeCny - beforePayableCny);
       let adjustmentItemId: string | null = null;
+      let afterTotalCny = round2(Number(locked.total));
       if (adjustmentDeltaCny !== 0) {
         const scratch = await this._addPriceAdjustmentWithinTx(
           tx,
@@ -10669,6 +10679,18 @@ export class OrderService {
           actor,
         );
         adjustmentItemId = scratch.itemId;
+        afterTotalCny = round2(Number(scratch.afterTotal));
+      }
+      // 断言：调价后的应收必须恰好等于换人费，否则整单回滚——下面的多付转存按 total 清账，差一分就会把
+      // 差额搬进代理余额 / 挂账池。差额为 0 却 total ≠ Σ 明细行（历史脏数据，没有差额行去重算 total）
+      // 同样在这里拦下，交人工先把金额核对一致，不带着错账往下走。
+      const afterPayableCny = round2(afterTotalCny + locked.adjustmentCny);
+      if (afterPayableCny !== swapFeeCny) {
+        throw new ConflictError(
+          `订单 ${locked.orderNumber} 调价后应收为 ¥${afterPayableCny}，与换人费 ¥${swapFeeCny} 不一致，已整单回滚。` +
+            `订单合计 ¥${round2(Number(locked.total))} 与明细行合计 ¥${itemsSumCny} 对不上，` +
+            `请先在订单详情核对金额（任意一笔事后调价会按明细行重算合计）后再标记已换人`,
+        );
       }
 
       // ── b. 多付转存：代理单进代理余额，直客单进挂账池（同一内核，订单回压到恰好结清）──
