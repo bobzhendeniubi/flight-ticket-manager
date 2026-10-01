@@ -134,6 +134,13 @@ describe('代理自助改结算价（真 DB）', () => {
     expect(item.orderId).toBe(order.id);
     expect(Number(item.amount)).toBe(-140);
     expect(item.description).toContain('代理自助改结算价');
+    // 身份标随行落库（套餐改档把它归套餐块；基础键 priceAdjustment / reasonCode 不被覆盖）。
+    expect(item.metadata).toMatchObject({
+      priceAdjustment: true,
+      reasonCode: 'DISCOUNT',
+      settlementRequest: true,
+      settlementRequestId: result.id,
+    });
   });
 
   it('(b2) 同一单并发提两次同样的自助改价 → 差额只落一次（真行锁串行化）', async () => {

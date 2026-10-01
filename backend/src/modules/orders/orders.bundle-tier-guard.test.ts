@@ -44,6 +44,11 @@ vi.mock('../settlement-discounts/settlement-discounts.service.js', () => ({
 }));
 
 import {
+  AGENT_SELF_SETTLEMENT_REASON_TEXT,
+  SETTLEMENT_REQUEST_REASON_TEXT,
+  isSettlementRequestAdjustment,
+} from './settlement-request-adjustment.js';
+import {
   BUNDLE_CHANGE_SPLIT_BALANCE_WARNING,
   OrderService,
   hasSplitBalanceRows,
@@ -1316,6 +1321,26 @@ describe('changeOrderBundle · 套餐改档', () => {
           row(OrderItemKind.VISA, 350, { source: 'ORDER_GROUND_ITEM' }),
         ]),
       ).toBe(2490.5);
+    });
+
+    it('议价申请差额行归套餐块：新行认 settlementRequest 标，存量行认服务端写死的 reasonText', () => {
+      expect(
+        sumBundleChangePreservedExtrasCny([
+          // 新行（运营确认 / 代理自助）：带身份标，reasonText 是什么都不看。
+          row(OrderItemKind.DISCOUNT, -700, { priceAdjustment: true, reasonCode: 'DISCOUNT', reasonText: SETTLEMENT_REQUEST_REASON_TEXT, settlementRequest: true, settlementRequestId: 'req-1' }),
+          row(OrderItemKind.FEE, 500, { priceAdjustment: true, reasonCode: 'MISC_FEE', reasonText: AGENT_SELF_SETTLEMENT_REASON_TEXT, settlementRequest: true, settlementRequestId: 'req-2' }),
+          // 存量行（本次改动前落的）：没有身份标，凭固定文案识别。
+          row(OrderItemKind.DISCOUNT, -300, { priceAdjustment: true, reasonCode: 'DISCOUNT', reasonText: SETTLEMENT_REQUEST_REASON_TEXT }),
+          row(OrderItemKind.FEE, 200, { priceAdjustment: true, reasonCode: 'MISC_FEE', reasonText: AGENT_SELF_SETTLEMENT_REASON_TEXT }),
+          // 同为 MISC_FEE 的人工补收杂费不受影响，照旧保留。
+          row(OrderItemKind.FEE, 990, { priceAdjustment: true, reasonCode: 'MISC_FEE', reasonText: '改期费' }),
+        ]),
+      ).toBe(990);
+      expect(isSettlementRequestAdjustment({ settlementRequest: true })).toBe(true);
+      expect(isSettlementRequestAdjustment({ reasonText: SETTLEMENT_REQUEST_REASON_TEXT })).toBe(true);
+      expect(isSettlementRequestAdjustment({ reasonText: AGENT_SELF_SETTLEMENT_REASON_TEXT })).toBe(true);
+      expect(isSettlementRequestAdjustment({ reasonText: '代理议价申请' })).toBe(false);
+      expect(isSettlementRequestAdjustment({})).toBe(false);
     });
 
     it('hasSplitBalanceRows：只认 priceAdjustment + reasonCode SPLIT 的 FEE/DISCOUNT 行', () => {

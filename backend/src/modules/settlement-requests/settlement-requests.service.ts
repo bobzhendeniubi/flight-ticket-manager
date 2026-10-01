@@ -34,6 +34,11 @@ import { BadRequestError, ConflictError, ForbiddenError, NotFoundError } from '.
 import { getDescendantAgentIds } from '../../lib/agent-tree.js';
 import { OrderService, SEAT_HOLDING_STATUSES } from '../orders/orders.service.js';
 import { PRICE_ADJUSTMENT_CAP_CNY } from '../orders/orders.schemas.js';
+import {
+  AGENT_SELF_SETTLEMENT_REASON_TEXT,
+  SETTLEMENT_REQUEST_REASON_TEXT,
+  settlementRequestAdjustmentMetadata,
+} from '../orders/settlement-request-adjustment.js';
 import type {
   CreateSettlementRequestBody,
   DecideSettlementRequestBody,
@@ -46,16 +51,12 @@ function round2(n: number): number {
 }
 
 /**
- * 确认时生成的差额行说明文本。固定文案，让订单详情那一行自己说清楚它是怎么来的：
- * 「价格调整：优惠（−¥500）：代理议价申请（运营确认）」。
+ * 差额行说明文本（固定文案，「价格调整：优惠（−¥500）：代理议价申请（运营确认）」/「…：代理自助改结算价」）。
+ * 常量本体挪到 orders/settlement-request-adjustment.ts —— 套餐改档分类要凭它识别存量差额行，而 orders.service
+ * 不能反向 import 本服务。这里原样再导出，既有调用方不变。
  */
-export const SETTLEMENT_REQUEST_REASON_TEXT = '代理议价申请（运营确认）';
+export { SETTLEMENT_REQUEST_REASON_TEXT, AGENT_SELF_SETTLEMENT_REASON_TEXT };
 
-/**
- * 自助直通生成的差额行说明文本。与上面那条固定文案分开，是为了在订单详情/导出里一眼分得清
- * 「运营确认过的议价」和「代理自己改的价」——两者钱一样动，追责路径不一样。
- */
-export const AGENT_SELF_SETTLEMENT_REASON_TEXT = '代理自助改结算价';
 
 /** 自助直通落库时给申请说明加的前缀（队列里一眼看出这条不是等运营处理的）。 */
 const AGENT_SELF_SETTLEMENT_NOTE_PREFIX = '代理自助';
@@ -374,6 +375,8 @@ export class SettlementRequestsService {
               ...(body.passengerId ? { passengerId: body.passengerId } : {}),
             },
             { userId: actor.userId, role: actor.role },
+            // 身份标：套餐改档把这条行归套餐块（谈定价是针对旧档谈的），并可回溯到申请。
+            { extraMetadata: settlementRequestAdjustmentMetadata(created.id) },
           );
           await tx.settlementRequest.update({
             where: { id: created.id },
@@ -621,6 +624,8 @@ export class SettlementRequestsService {
             ...(claim.passengerId ? { passengerId: claim.passengerId } : {}),
           },
           { userId: actor.userId, role: actor.role },
+          // 身份标：套餐改档把这条行归套餐块（谈定价是针对旧档谈的），并可回溯到申请。
+          { extraMetadata: settlementRequestAdjustmentMetadata(id) },
         );
         itemId = applied.audit.itemId;
         orderPayload = applied.order;

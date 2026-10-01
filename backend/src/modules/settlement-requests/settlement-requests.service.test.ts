@@ -213,7 +213,7 @@ describe('create() · 未锁价自助直通 / 锁价落 PENDING', () => {
     // 差额 = 12800 − 13500 = −700 → DISCOUNT。
     expect(applyWithinTx).toHaveBeenCalledTimes(1);
     expect(addPriceAdjustment).not.toHaveBeenCalled();
-    const [tx, orderId, adjustment, actor] = applyWithinTx.mock.calls[0];
+    const [tx, orderId, adjustment, actor, options] = applyWithinTx.mock.calls[0];
     expect(tx).toBe(mockPrisma);
     expect(orderId).toBe('order-1');
     expect(adjustment).toEqual({
@@ -222,6 +222,8 @@ describe('create() · 未锁价自助直通 / 锁价落 PENDING', () => {
       reasonText: AGENT_SELF_SETTLEMENT_REASON_TEXT,
     });
     expect(actor).toEqual({ userId: 'agent-user-1', role: UserRole.AGENT });
+    // 差额行带身份标：套餐改档据此把它归套餐块，并能回溯到这条申请。
+    expect(options).toEqual({ extraMetadata: { settlementRequest: true, settlementRequestId: 'req-1' } });
 
     // 生成的差额行 id 回写申请
     expect(mockPrisma.settlementRequest.update).toHaveBeenCalledWith({
@@ -527,7 +529,7 @@ describe('approve() · 钱只在这一步动，且只走既有调价通道', () 
 
     // 差额 = 12800 − 13500 = −700 → 负数走 DISCOUNT，说明文本固定
     expect(addPriceAdjustment).toHaveBeenCalledTimes(1);
-    const [orderId, adjustment, actor] = addPriceAdjustment.mock.calls[0];
+    const [orderId, adjustment, actor, options] = addPriceAdjustment.mock.calls[0];
     expect(orderId).toBe('order-1');
     expect(adjustment).toEqual({
       amountCny: -700,
@@ -535,6 +537,8 @@ describe('approve() · 钱只在这一步动，且只走既有调价通道', () 
       reasonText: SETTLEMENT_REQUEST_REASON_TEXT,
     });
     expect(actor).toEqual({ userId: 'admin-1', role: UserRole.ADMIN });
+    // 差额行带身份标：套餐改档据此把它归套餐块，并能回溯到这条申请。
+    expect(options).toEqual({ extraMetadata: { settlementRequest: true, settlementRequestId: 'req-1' } });
 
     // 生成的差额行 id 回写申请
     expect(mockPrisma.settlementRequest.update).toHaveBeenCalledWith({

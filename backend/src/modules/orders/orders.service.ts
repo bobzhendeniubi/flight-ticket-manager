@@ -121,6 +121,7 @@ import {
   sumCompletedRefundsWithinTx,
 } from '../../lib/funds-guard.js';
 import { resolveBundleNights } from '../products/bundle-nights.js';
+import { isSettlementRequestAdjustment } from './settlement-request-adjustment.js';
 import { parseVisaExpressTiers, type VisaExpressTier } from '../products/products.schemas.js';
 import { localDate } from '../finances/finances.cost.service.js';
 import {
@@ -18242,7 +18243,7 @@ export class OrderService {
      * **只给服务端内部路径用**：公开的 POST /orders/:id/price-adjustment 不接这个参数，
      * 代理直接打那个端点照旧 403。
      */
-    options?: { viaAgentSelfSettlement?: boolean },
+    options?: { viaAgentSelfSettlement?: boolean; extraMetadata?: Record<string, unknown> },
   ): Promise<{
     order: ReturnType<typeof serializeOrder>;
     audit: {
@@ -18269,7 +18270,13 @@ export class OrderService {
     // 事务内核抽到 _addPriceAdjustmentWithinTx：批量调价要在同一个事务里逐单复用同一套闸门与
     // 算账口径（锁价闸 / 资金闸 / 差额行 / 重算 total），口径只留一份，单单入口行为一字未改。
     const scratch = await prisma.$transaction((tx) =>
-      this._addPriceAdjustmentWithinTx(tx, orderId, input, actor),
+      this._addPriceAdjustmentWithinTx(
+        tx,
+        orderId,
+        input,
+        actor,
+        options?.extraMetadata ? { extraMetadata: options.extraMetadata } : undefined,
+      ),
     );
 
     const finalOrder = await prisma.order.findUniqueOrThrow({
@@ -18313,15 +18320,20 @@ export class OrderService {
      * 批量按人调价（PER_PAX）传进来的单价注记，会原样进调整行描述（「每人 ¥700 × 2 人」）。
      * 单单入口不传 → 行描述与此前逐字一致，不影响任何既有单据。
      */
-    options?: { unitNote?: string },
+    options?: { unitNote?: string; extraMetadata?: Record<string, unknown> },
   ) {
     const { amountCny, reasonCode, reasonText } = input;
-    const row = buildPriceAdjustmentItem({
+    const built = buildPriceAdjustmentItem({
       amountCny,
       reasonCode,
       reasonText,
       unitNote: options?.unitNote,
     });
+    // extraMetadata：调用方要并进差额行 metadata 的身份标（如议价申请的 settlementRequest 标），
+    // 不许覆盖 buildPriceAdjustmentItem 写的基础键（priceAdjustment / reasonCode / reasonText）。
+    const row = options?.extraMetadata
+      ? { ...built, metadata: { ...options.extraMetadata, ...built.metadata } }
+      : built;
     // 行锁：先锁订单行串行化并发调价，避免两个并发请求各读旧 items、各加一条差额行、
     // 各按「旧合计 + 一次差额」写 total → 丢失更新（两条行，total 只含一条）。
     await tx.$queryRaw`SELECT id FROM "Order" WHERE id = ${orderId} FOR UPDATE`;
@@ -26112,8 +26124,8 @@ export function sumBundleChangeDiffCny(
  * 保留（extras）：
  *   · FEE/DISCOUNT 且 metadata.priceAdjustment === true，**除去**套餐块
  *     （settlementPrice / settlementDiscount / bundleChange === true / 拆单平账 SPLIT /
- *       换人重算 SWAP_REPRICE / 换人费 SWAP_FEE）：人工调价四类（补收杂费/优惠/变更改期费/其它）、
- *     补收单房差与单住拼住开关（ROOM_DIFF）、取消航段手续费……
+ *       换人重算 SWAP_REPRICE / 换人费 SWAP_FEE / 议价申请差额行 isSettlementRequestAdjustment）：
+ *     人工调价四类（补收杂费/优惠/变更改期费/其它）、补收单房差与单住拼住开关（ROOM_DIFF）、取消航段手续费……
  *   · UPGRADE_CHANGE：售后升舱差价行（升舱行随改档不动，响应 warnings 提示人工复核）；
  *   · 事后补录的地面项（HOTEL / VISA，metadata.source === 'ORDER_GROUND_ITEM'）。
  * 其余行一律视为套餐块，由日历价整体替换。**新增的售后记账行若要在改档时保留，须在此登记。**
@@ -26131,6 +26143,10 @@ export function sumBundleChangeDiffCny(
  * 会一侧少收、一侧多收同一个数（评审实测：2 人日历 1918/人拆 1 人后改档 2278/人，新单得 1656、
  * 源单得 2900，应都是 2278）。归套餐块 = 回到拆单场景下修前的正确结果；拆单前的整单杂费份额由改档
  * 响应 warnings 提示运营核对（见 hasSplitBalanceRows）。
+ *
+ * 议价申请差额行（运营确认 / 代理自助直通，reasonCode 是 MISC_FEE/DISCOUNT）为什么归套餐块：它的语义是
+ * 「把应收收敛到谈定价」，谈定价是针对旧档谈的，结算价 = 本单最终收多少，改档后以新档日历价为准。
+ * 新行带 metadata.settlementRequest 标，存量行凭服务端写死的 reasonText 识别（见 settlement-request-adjustment.ts）。
  * 导出供单测使用。
  */
 export function sumBundleChangePreservedExtrasCny(
@@ -26153,6 +26169,8 @@ export function sumBundleChangePreservedExtrasCny(
     if (meta.reasonCode === 'SWAP_REPRICE' || meta.swapReprice === true || meta.reasonCode === 'SWAP_FEE') {
       return sum;
     }
+    // 议价申请差额行（运营确认 / 代理自助）：把应收收敛到针对旧档谈定的价，改档后以新档日历价为准。
+    if (isSettlementRequestAdjustment(meta)) return sum;
     return sum + amount;
   }, 0);
   return round2(total);
